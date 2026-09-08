@@ -171,7 +171,16 @@ const runBody = async (sub: Shell, fn: (sh: Shell) => Promise<unknown>): Promise
   return sub.status;
 };
 
-type Scope = Record<string, Var>;
+/** A lexical scope: a Map of name→Var with a parent link (dynamic scoping is a
+ *  parent chain). A Map keeps variable access monomorphic and fast, unlike a
+ *  prototype-object chain (which forces a megamorphic keyed load per access). */
+class Scope {
+  readonly vars = new Map<string, Var>();
+  parent: Scope | null;
+  constructor(parent: Scope | null = null) {
+    this.parent = parent;
+  }
+}
 type BashFunc = { __bashFunc: (sh: Shell) => Promise<void> };
 
 export class Shell {
@@ -242,7 +251,7 @@ export class Shell {
     if (this.readonlyHit) this.status = 1;
   }
 
-  private globalScope: Scope = Object.create(null) as Scope;
+  private globalScope: Scope = new Scope();
   private scope: Scope = this.globalScope;
   /** For `$SECONDS`: shell start time. */
   private startMs = Date.now();
@@ -290,7 +299,7 @@ export class Shell {
   private initSpecialVars(): void {
     const uid = typeof process.getuid === "function" ? process.getuid() : 0;
     const set = (n: string, v: string, exported = false): void => {
-      this.globalScope[n] = new Var(v, exported);
+      this.globalScope.vars.set(n, new Var(v, exported));
     };
     set("PWD", this.cwd, true); // bash keeps PWD exported and in sync with cwd
     set("PPID", String(process.ppid));
@@ -319,8 +328,9 @@ export class Shell {
   private rawLookup(name: string): Var | undefined {
     let s: Scope | null = this.scope;
     while (s !== null) {
-      if (Object.prototype.hasOwnProperty.call(s, name)) return s[name];
-      s = Object.getPrototypeOf(s) as Scope | null;
+      const v = s.vars.get(name);
+      if (v !== undefined) return v;
+      s = s.parent;
     }
     const dyn = this.dynamicSpecial(name);
     if (dyn !== undefined) return new Var(dyn);
@@ -402,8 +412,8 @@ export class Shell {
   private ownerScope(name: string): Scope | undefined {
     let s: Scope | null = this.scope;
     while (s !== null) {
-      if (Object.prototype.hasOwnProperty.call(s, name)) return s;
-      s = Object.getPrototypeOf(s) as Scope | null;
+      if (s.vars.has(name)) return s;
+      s = s.parent;
     }
     return undefined;
   }
@@ -415,7 +425,7 @@ export class Shell {
    *  undefined when the write went elsewhere (a nameref element, or was refused). */
   private assignVar(name: string, value: unknown): Var | undefined {
     if (value instanceof Var) {
-      this.scope[name] = value;
+      this.scope.vars.set(name, value);
       return value;
     }
     const r = this.resolveRef(name); // write through a nameref to its target
@@ -423,22 +433,22 @@ export class Shell {
     name = r.name;
     const s = String(value);
     const owner = this.ownerScope(name);
-    if (owner && owner[name]!.readonly) {
+    const existing = owner?.vars.get(name);
+    if (existing && existing.readonly) {
       this.io.err(`${this.name}: ${name}: readonly variable\n`);
       this.readonlyHit = true;
       return undefined;
     }
-    if (owner) {
-      const v = owner[name]!;
-      const cs = this.coerce(v, s);
-      if (v.assoc !== null) v.assoc.set("0", cs);
-      else if (v.arr !== null) v.arr.set(0, cs);
-      else v.value = cs;
-      v.unset = false;
-      return v;
+    if (existing) {
+      const cs = this.coerce(existing, s);
+      if (existing.assoc !== null) existing.assoc.set("0", cs);
+      else if (existing.arr !== null) existing.arr.set(0, cs);
+      else existing.value = cs;
+      existing.unset = false;
+      return existing;
     }
     const nv = new Var(s, process.env[name] !== undefined);
-    this.globalScope[name] = nv;
+    this.globalScope.vars.set(name, nv);
     return nv;
   }
 
@@ -518,8 +528,8 @@ export class Shell {
     const set = new Set<string>();
     let s: Scope | null = this.scope;
     while (s !== null) {
-      for (const k of Object.keys(s)) if (k.startsWith(prefix)) set.add(k);
-      s = Object.getPrototypeOf(s) as Scope | null;
+      for (const k of s.vars.keys()) if (k.startsWith(prefix)) set.add(k);
+      s = s.parent;
     }
     for (const k of Object.keys(process.env)) if (k.startsWith(prefix)) set.add(k);
     return [...set].sort();
@@ -530,9 +540,10 @@ export class Shell {
   /** Find/create a variable by its literal name (no nameref resolution). */
   private varForWriteRaw(name: string): Var {
     const owner = this.ownerScope(name);
-    if (owner) return owner[name]!;
+    const existing = owner?.vars.get(name);
+    if (existing) return existing;
     const v = new Var("", process.env[name] !== undefined);
-    this.globalScope[name] = v;
+    this.globalScope.vars.set(name, v);
     return v;
   }
   private varForWrite(name: string): Var {
@@ -770,12 +781,12 @@ export class Shell {
     name = this.deref(name); // `unset ref` removes the target, as in bash
     const owner = this.ownerScope(name);
     if (owner === undefined) return;
-    if (owner[name]!.readonly) {
+    if (owner.vars.get(name)!.readonly) {
       this.io.err(`${this.name}: unset: ${name}: cannot unset: readonly variable\n`);
       this.readonlyHit = true;
       return;
     }
-    delete owner[name];
+    owner.vars.delete(name);
   }
   /** `unset arr[i]` / `unset assoc[key]` — remove a single element. */
   unsetElem(name: string, sub: string): void {
@@ -799,13 +810,13 @@ export class Shell {
   local(name: string, value?: string): void {
     const v = new Var(value ?? "");
     if (value === undefined) v.unset = true; // `local x` declares but doesn't set
-    this.scope[name] = v;
+    this.scope.vars.set(name, v);
   }
   /** True if `name` is already a local in the current (innermost) scope — used
    *  by `local x+=v`, which appends to an existing local but starts fresh
    *  (ignoring any enclosing value) on the first `local` declaration. */
   isLocalOwn(name: string): boolean {
-    return Object.prototype.hasOwnProperty.call(this.scope, name);
+    return this.scope.vars.has(name);
   }
   /** `name+=v`: numeric add for integer vars, else string append. */
   appendVar(name: string, rhs: string): void {
@@ -824,8 +835,9 @@ export class Shell {
   exportVar(name: string): void {
     name = this.deref(name);
     const owner = this.ownerScope(name);
-    if (owner) owner[name]!.exported = true;
-    else this.globalScope[name] = new Var(process.env[name] ?? "", true);
+    const existing = owner?.vars.get(name);
+    if (existing) existing.exported = true;
+    else this.globalScope.vars.set(name, new Var(process.env[name] ?? "", true));
   }
   unsetFunc(name: string): void {
     delete this.functions[name];
@@ -840,14 +852,13 @@ export class Shell {
     const seen = new Set<string>();
     let s: Scope | null = this.scope;
     while (s !== null) {
-      for (const k of Object.getOwnPropertyNames(s)) {
+      for (const [k, v] of s.vars) {
         if (!seen.has(k)) {
           seen.add(k);
-          const v = s[k]!;
           if (v.exported) env[k] = v.value;
         }
       }
-      s = Object.getPrototypeOf(s) as Scope | null;
+      s = s.parent;
     }
     return { ...env, ...extra };
   }
@@ -1014,7 +1025,7 @@ export class Shell {
     const savedScope = this.scope;
     const savedPos = this.positional;
     const savedLoopDepth = this.loopDepth;
-    this.scope = Object.create(savedScope) as Scope;
+    this.scope = new Scope(savedScope);
     this.positional = args;
     this.loopDepth = 0; // break/continue in the function only see its own loops
     try {
@@ -1137,15 +1148,15 @@ export class Shell {
   async withEnv(assignments: Record<string, string>, fn: () => Promise<number>): Promise<number> {
     const saved: Array<[string, Var | undefined]> = [];
     for (const [k, v] of Object.entries(assignments)) {
-      saved.push([k, Object.prototype.hasOwnProperty.call(this.scope, k) ? this.scope[k] : undefined]);
-      this.scope[k] = new Var(v, true);
+      saved.push([k, this.scope.vars.get(k)]);
+      this.scope.vars.set(k, new Var(v, true));
     }
     try {
       return await fn();
     } finally {
       for (const [k, prev] of saved) {
-        if (prev === undefined) delete this.scope[k];
-        else this.scope[k] = prev;
+        if (prev === undefined) this.scope.vars.delete(k);
+        else this.scope.vars.set(k, prev);
       }
     }
   }
@@ -1309,14 +1320,11 @@ export class Shell {
   /* ---------------- subshells ---------------- */
 
   private snapshotVars(): Scope {
-    const flat: Scope = Object.create(null) as Scope;
-    const seen = new Set<string>();
+    const flat = new Scope();
     let s: Scope | null = this.scope;
     while (s !== null) {
-      for (const k of Object.getOwnPropertyNames(s)) {
-        if (!seen.has(k)) {
-          seen.add(k);
-          const v = s[k]!;
+      for (const [k, v] of s.vars) {
+        if (!flat.vars.has(k)) {
           const nv = new Var(v.value, v.exported);
           if (v.arr !== null) nv.arr = new Map(v.arr);
           if (v.assoc !== null) nv.assoc = new Map(v.assoc);
@@ -1326,10 +1334,10 @@ export class Shell {
           nv.readonly = v.readonly;
           nv.ref = v.ref;
           nv.unset = v.unset;
-          flat[k] = nv;
+          flat.vars.set(k, nv);
         }
       }
-      s = Object.getPrototypeOf(s) as Scope | null;
+      s = s.parent;
     }
     return flat;
   }
