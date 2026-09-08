@@ -16,6 +16,7 @@ import { CMD_INVERT_RETURN } from "../ast/nodes.mts";
 import { parse } from "../parser/parser.mts";
 import { parseWord } from "../parser/word.mts";
 import type { Param, WordPart } from "../parser/word.mts";
+import { braceExpand } from "../parser/brace.mts";
 import { globToRegExpSource } from "../runtime/glob.mts";
 
 export interface EmitOptions {
@@ -190,8 +191,11 @@ class Emitter {
       return assigns.map(([n, e]) => `${i}sh.env.${n} = ${e};`).join("\n");
     }
 
-    const argFrags = rest.slice(1).map((w) => this.word(w.text).code);
-    const npw = parseWord(rest[0]!.text);
+    const texts: string[] = [];
+    for (const w of rest) for (const t of braceExpand(w.text)) texts.push(t);
+    const nameText = texts[0]!;
+    const argFrags = texts.slice(1).map((t) => this.word(t).code);
+    const npw = parseWord(nameText);
     const literal =
       npw.parts.length === 1 && npw.parts[0]!.k === "lit" ? npw.parts[0]!.s : null;
 
@@ -200,7 +204,7 @@ class Emitter {
       const target = ident(literal) ? `sh.commands.${literal}` : `sh.commands[${JSON.stringify(literal)}]`;
       callInner = `${target}(${argFrags.join(", ")})`;
     } else {
-      const nameFrag = this.word(rest[0]!.text).code;
+      const nameFrag = this.word(nameText).code;
       callInner = `sh.exec(${[nameFrag, ...argFrags].join(", ")})`;
     }
 
@@ -272,7 +276,9 @@ class Emitter {
       }
       case "for": {
         const v = `__it${this.forId++}`;
-        const list = `[${cmd.words.map((w) => this.word(w.text).code).join(", ")}]`;
+        const listFrags: string[] = [];
+        for (const w of cmd.words) for (const t of braceExpand(w.text)) listFrags.push(this.word(t).code);
+        const list = `[${listFrags.join(", ")}]`;
         const setName = ident(cmd.name) ? `sh.env.${cmd.name}` : `sh.env[${JSON.stringify(cmd.name)}]`;
         return (
           `${i}for (const ${v} of ${list}) {\n` +

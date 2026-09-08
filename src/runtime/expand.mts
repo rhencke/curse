@@ -10,6 +10,7 @@ import type { Word } from "../ast/nodes.mts";
 import type { Shell } from "./shell.mts";
 import { parseWord } from "../parser/word.mts";
 import type { Param, WordPart } from "../parser/word.mts";
+import { braceExpand } from "../parser/brace.mts";
 import { evalArith } from "./arith.mts";
 import { replaceGlob, substr, trimPrefix, trimSuffix } from "./param.mts";
 
@@ -147,12 +148,16 @@ export const expandWord = async (shell: Shell, word: Word): Promise<string[]> =>
   return splitTaggedFields(chars, sp, anchored);
 };
 
-/** Expand several words, flattening the fields into a single argv list. */
+/** Expand several words (brace expansion first), flattening into an argv list. */
 export const expandWords = async (shell: Shell, words: Word[]): Promise<string[]> => {
   const argv: string[] = [];
-  for (const w of words) argv.push(...(await expandWord(shell, w)));
+  for (const w of words) {
+    for (const t of braceExpand(w.text)) argv.push(...(await expandWord(shell, makeWordLocal(t))));
+  }
   return argv;
 };
+
+const makeWordLocal = (text: string): Word => ({ text, flags: 0 });
 
 /** Expand text with no field splitting (assignment RHS, arithmetic operands). */
 export const expandNoSplit = async (shell: Shell, text: string): Promise<string> => {
