@@ -1390,6 +1390,10 @@ export class Shell {
     const len = lenExpr === "" ? undefined : Number(await this.arithValue(lenExpr));
     return pSubstr(v, off, len);
   }
+  /** `${v:off:len}` with offset/length already computed (compiled arith). */
+  substrN(v: string, off: bigint, len: bigint | null): string {
+    return pSubstr(v, Number(off), len === null ? undefined : Number(len));
+  }
   private async doSlice(list: string[], offExpr: string, lenExpr: string): Promise<string[]> {
     const off = Number(await this.arithValue(offExpr));
     const len = lenExpr === "" ? undefined : Number(await this.arithValue(lenExpr));

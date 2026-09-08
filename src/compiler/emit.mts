@@ -335,7 +335,14 @@ class Emitter {
       case "#": case "##": case "%": case "%%":
       case "/": case "//": case "/#": case "/%":
         return this.strOpExpr(prm, `String(${base})`, this.patArg(prm), arg2());
-      case ":": return `await sh.substr(String(${base}), ${J(prm.arg)}, ${J(prm.arg2)})`;
+      case ":": {
+        // Compile static offset/length arithmetic; fall back if either needs
+        // runtime `$`-expansion.
+        const offJS = arithToJS(prm.arg);
+        const lenJS = prm.arg2 === "" ? "null" : arithToJS(prm.arg2);
+        if (offJS !== null && lenJS !== null) return `sh.substrN(String(${base}), ${offJS}, ${lenJS})`;
+        return `await sh.substr(String(${base}), ${J(prm.arg)}, ${J(prm.arg2)})`;
+      }
       default: throw new Error(`parameter operator not supported: ${prm.op}`);
     }
   }
