@@ -24,3 +24,13 @@ Specifically:
 Because this project is a derivative work of GNU Bash, it is distributed
 under the same GPLv3+ license. The upstream bash source is kept locally in
 `reference/bash/` (gitignored) and is not redistributed here.
+
+## Conformance corpus from Oils (Oil shell)
+
+The spec-test conformance runner (`test/spec/`) exercises curse against the
+**Oils** spec tests (<https://oils.pub>, <https://github.com/oilshell/oil>),
+Copyright the Oils authors, licensed under the **Apache License 2.0** — which is
+compatible for inclusion in a GPLv3+ work. The tests themselves are **not**
+redistributed here; `test/spec/fetch.sh` downloads them into `reference/oil/`
+(gitignored). The runner compares curse's output to real bash (the oracle), so
+it uses the test snippets, not their per-shell expectation annotations.
