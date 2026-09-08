@@ -24,7 +24,7 @@ import { evalArith } from "./arith.mts";
 import { globExpand, globMatch, hasGlobMeta } from "./glob.mts";
 import {
   replaceGlob as pReplaceGlob, sliceArr as pSliceArr, substr as pSubstr,
-  trimPrefix as pTrimPrefix, trimSuffix as pTrimSuffix,
+  transform as pTransform, trimPrefix as pTrimPrefix, trimSuffix as pTrimSuffix,
 } from "./param.mts";
 import { builtins } from "./builtins.mts";
 import { ExitSignal, ReturnSignal, Var } from "./types.mts";
@@ -743,6 +743,10 @@ export class Shell {
     const off = Number(await this.arithValue(offExpr));
     const len = lenExpr === "" ? undefined : Number(await this.arithValue(lenExpr));
     return pSliceArr(list, off, len);
+  }
+  /** `${parameter@op}` transformation of a scalar value. */
+  transform(op: string, v: string): string {
+    return pTransform(op, v);
   }
   /** `${arr[@]:offset:length}` — slice an array's values. */
   async sliceArr(name: string, offExpr: string, lenExpr: string): Promise<string[]> {

@@ -12,7 +12,7 @@ import { parseWord } from "../parser/word.mts";
 import type { Param, ParsedWord, WordPart } from "../parser/word.mts";
 import { braceExpand } from "../parser/brace.mts";
 import { evalArith } from "./arith.mts";
-import { replaceGlob, substr, trimPrefix, trimSuffix } from "./param.mts";
+import { replaceGlob, substr, transform, trimPrefix, trimSuffix } from "./param.mts";
 import { ExitSignal } from "./types.mts";
 
 const isIFSWhitespace = (c: string): boolean => c === " " || c === "\t" || c === "\n";
@@ -67,6 +67,14 @@ const isSlice = (prm: Param): boolean =>
 const sliceValues = (shell: Shell, prm: Param): Promise<string[]> =>
   prm.special ? shell.slicePos(prm.arg, prm.arg2) : shell.sliceArr(prm.name, prm.arg, prm.arg2);
 
+/** `${x@op}` / `${arr[@]@op}` — is the operator a `@`-transform? */
+const isTransform = (prm: Param): boolean => prm.op.startsWith("@");
+/** Whether this param names a whole list (@/* subscript or special @/*). */
+const isList = (prm: Param): boolean =>
+  prm.sub === "@" || prm.sub === "*" || (prm.special && (prm.name === "@" || prm.name === "*"));
+const listValues = (shell: Shell, prm: Param): string[] =>
+  prm.special ? [...shell.positional] : shell.arrayValues(prm.name);
+
 const evalParam = async (shell: Shell, prm: Param): Promise<string> => {
   // ${!name[@]} / ${!name[*]} — array indices.
   if (prm.indices) return shell.arrayIndices(prm.name).join(" ");
@@ -74,6 +82,14 @@ const evalParam = async (shell: Shell, prm: Param): Promise<string> => {
   if (prm.indirect) return shell.indirect(prm.name);
   // ${arr[@]:off:len} / ${@:off:len} — slice a list; scalar contexts join it.
   if (isSlice(prm)) return (await sliceValues(shell, prm)).join(" ");
+  // ${x@op} / ${arr[@]@op} — transform (per element for lists).
+  if (isTransform(prm)) {
+    if (isList(prm)) return listValues(shell, prm).map((x) => transform(prm.op, x)).join(" ");
+    const base = prm.special
+      ? specialValue(shell, prm.name)
+      : prm.sub !== "" ? (await shell.elemGet(prm.name, prm.sub)) ?? "" : shell.getVar(prm.name) ?? "";
+    return transform(prm.op, base);
+  }
 
   // Resolve the referenced value (scalar, array element, or all elements).
   let rawVal: string | undefined;
@@ -176,6 +192,10 @@ export const expandWord = async (shell: Shell, word: Word): Promise<string[]> =>
       // "${arr[@]:i:n}" / "${@:i:n}" — sliced @ keeps each element as a field.
       if (isSlice(p) && (p.sub === "@" || (p.special && p.name === "@"))) {
         return sliceValues(shell, p);
+      }
+      // "${arr[@]@op}" / "${@@op}" — transform each element, one field each.
+      if (isTransform(p) && (p.sub === "@" || (p.special && p.name === "@"))) {
+        return listValues(shell, p).map((x) => transform(p.op, x));
       }
     }
   }

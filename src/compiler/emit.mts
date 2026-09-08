@@ -113,12 +113,27 @@ class Emitter {
       : `await sh.sliceArr(${J(prm.name)}, ${J(prm.arg)}, ${J(prm.arg2)})`;
   }
 
+  /** Whether this param names a whole list (@/* subscript or special @/*). */
+  private isList(prm: Param): boolean {
+    return prm.sub === "@" || prm.sub === "*" || (prm.special && (prm.name === "@" || prm.name === "*"));
+  }
+  /** A `string[]` expression for the param's values. */
+  private listExpr(prm: Param): string {
+    return prm.special ? "sh.positional" : `sh.arrayValues(${JSON.stringify(prm.name)})`;
+  }
+
   private paramExpr(prm: Param): string {
     const J = JSON.stringify;
     if (prm.indices) return `sh.arrayIndices(${J(prm.name)}).join(" ")`;
     if (prm.indirect) return `sh.indirect(${J(prm.name)})`;
     if (this.isSlice(prm)) return `(${this.sliceExpr(prm)}).join(" ")`;
     const base = this.valStr(prm);
+    if (prm.op.startsWith("@")) {
+      if (this.isList(prm)) {
+        return `${this.listExpr(prm)}.map((x) => sh.transform(${J(prm.op)}, x)).join(" ")`;
+      }
+      return `sh.transform(${J(prm.op)}, String(${base}))`;
+    }
     const arg = (): string => this.templateOf(parseWord(prm.arg).parts);
     const arg2 = (): string => this.templateOf(parseWord(prm.arg2).parts);
     if (prm.length) {
@@ -189,6 +204,10 @@ class Emitter {
       // "${arr[@]:i:n}" / "${@:i:n}" — sliced @ keeps each element as a field.
       if (this.isSlice(p.p) && (p.p.sub === "@" || (p.p.special && p.p.name === "@"))) {
         return this.sliceExpr(p.p);
+      }
+      // "${arr[@]@op}" / "${@@op}" — transform each element, one field each.
+      if (p.p.op.startsWith("@") && (p.p.sub === "@" || (p.p.special && p.p.name === "@"))) {
+        return `${this.listExpr(p.p)}.map((x) => sh.transform(${JSON.stringify(p.p.op)}, x))`;
       }
       if (p.p.op !== "") return null;
       if (p.p.special && p.p.name === "@") return "sh.positional";

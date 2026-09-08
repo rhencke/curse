@@ -49,6 +49,61 @@ export const substr = (v: string, offset: number, length: number | undefined): s
   return v.slice(start, start + length);
 };
 
+/** Quote a value so it can be read back in (bash's `${v@Q}`). Bash always
+ *  quotes: `$'…'` when there are control chars, otherwise single quotes. */
+const shellQuote = (v: string): string => {
+  if (/[\x00-\x1f\x7f]/.test(v)) {
+    let s = "$'";
+    for (const ch of v) {
+      const code = ch.charCodeAt(0);
+      if (ch === "\\") s += "\\\\";
+      else if (ch === "'") s += "\\'";
+      else if (ch === "\n") s += "\\n";
+      else if (ch === "\t") s += "\\t";
+      else if (ch === "\r") s += "\\r";
+      else if (code < 0x20 || code === 0x7f) s += "\\" + code.toString(8).padStart(3, "0");
+      else s += ch;
+    }
+    return s + "'";
+  }
+  return "'" + v.replace(/'/g, "'\\''") + "'";
+};
+
+/** Expand ANSI-C backslash escapes in a value (bash's `${v@E}`). */
+const expandEscapes = (v: string): string =>
+  v.replace(/\\(x[0-9A-Fa-f]{1,2}|[0-7]{1,3}|.)/g, (m, seq: string) => {
+    const c = seq[0]!;
+    switch (c) {
+      case "n": return "\n";
+      case "t": return "\t";
+      case "r": return "\r";
+      case "a": return "\x07";
+      case "b": return "\b";
+      case "f": return "\f";
+      case "v": return "\v";
+      case "e": case "E": return "\x1b";
+      case "\\": return "\\";
+      case "'": return "'";
+      case '"': return '"';
+      case "x": return String.fromCharCode(parseInt(seq.slice(1), 16));
+      default:
+        if (c >= "0" && c <= "7") return String.fromCharCode(parseInt(seq, 8) & 0xff);
+        return m;
+    }
+  });
+
+/** `${parameter@op}` transformations (Q quote, E escapes, L/U case, u title). */
+export const transform = (op: string, v: string): string => {
+  switch (op) {
+    case "@Q": return shellQuote(v);
+    case "@E": return expandEscapes(v);
+    case "@L": return v.toLowerCase();
+    case "@U": return v.toUpperCase();
+    case "@u": return v.length === 0 ? v : v[0]!.toUpperCase() + v.slice(1);
+    default: return v; // @P @A @a @K @k and unknowns: passthrough for now
+  }
+};
+
 /** `${arr[@]:offset:length}` / `${@:offset:length}` — slice a list (same rules). */
 export const sliceArr = (list: string[], offset: number, length: number | undefined): string[] => {
   const start = offset < 0 ? Math.max(list.length + offset, 0) : Math.min(offset, list.length);

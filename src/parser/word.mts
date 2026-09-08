@@ -445,6 +445,11 @@ function parseParam(inner: string): Param {
   if (rest === "") return p;
 
   const a = rest[0]!;
+  if (a === "@") {
+    // ${parameter@operator} transform: Q E P A K a k L U u (single letter).
+    p.op = "@" + (rest[1] ?? "");
+    return p;
+  }
   if (a === ":") {
     const b = rest[1];
     if (b === "-" || b === "=" || b === "+" || b === "?") {
