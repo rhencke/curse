@@ -512,7 +512,7 @@ class Parser {
     let fd: number;
     if (fdStr !== "") fd = parseInt(fdStr, 10);
     else if (op === "&>" || op === "&>>") fd = -1; // both stdout+stderr
-    else if (op === "<" || op === "<<<" || op === "<&") fd = 0;
+    else if (op === "<" || op === "<<<" || op === "<&" || op === "<>") fd = 0;
     else fd = 1;
 
     return { op, fd, target: makeWord(t.value) };

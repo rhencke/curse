@@ -903,6 +903,20 @@ export class Shell {
       }
       case "&>>": { const w = openFile("a"); writers[1] = w; writers[2] = w; break; }
       case "<": this.stdinData = readFileSync(resolve(this.cwd, target), "utf8"); break;
+      case "<>": {
+        // Open read/write, creating the file if absent (O_RDWR|O_CREAT).
+        const p = resolve(this.cwd, target);
+        try { closeSync(openSync(p, "a")); } catch { /* create failed */ }
+        if (r.fd === 0) {
+          this.stdinData = readFileSync(p, "utf8");
+        } else {
+          const fd = openSync(p, "r+");
+          toClose.push(fd);
+          let off = 0;
+          writers[r.fd] = (s: string) => { writeSync(fd, s, off); off += Buffer.byteLength(s); };
+        }
+        break;
+      }
       case "<<<": this.stdinData = target + "\n"; break;
       case "<<": case "<<-": this.stdinData = target; break;
       case ">&": case "<&": {

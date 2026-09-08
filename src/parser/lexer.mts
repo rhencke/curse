@@ -418,6 +418,9 @@ class Lexer {
       } else if (n === "&") {
         this.i++;
         op += "<&";
+      } else if (n === ">") {
+        this.i++;
+        op += "<>";
       } else {
         op += "<";
       }
