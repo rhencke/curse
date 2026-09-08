@@ -122,6 +122,29 @@ const arithToJS = (text: string): string | null => {
   return arithNodeJS(ast);
 };
 
+const CMP_JS: Record<string, string> = {
+  "<": "<", "<=": "<=", ">": ">", ">=": ">=", "==": "===", "!=": "!==",
+};
+
+/** Compile an arithmetic expression used as a boolean (a loop test / `(( ))`
+ *  truthiness) to a JS boolean, avoiding the `? 1n : 0n) !== 0n` round-trip when
+ *  the top node is already a comparison. Returns null to fall back. */
+const arithToJSBool = (text: string): string | null => {
+  if (text === "" || /[$`]/.test(text)) return null;
+  let ast: ArithNode;
+  try {
+    ast = parseArithAst(text);
+  } catch {
+    return null;
+  }
+  if (ast.t === "bin" && ast.op in CMP_JS) {
+    const l = arithNodeJS(ast.l), r = arithNodeJS(ast.r);
+    if (l !== null && r !== null) return `(${l}) ${CMP_JS[ast.op]} (${r})`;
+  }
+  const js = arithNodeJS(ast);
+  return js === null ? null : `(${js}) !== 0n`;
+};
+
 /** Compile-time glob pattern from a static (expansion-free) word: quoted or
  *  escaped characters are backslashed so they match literally. */
 const staticGlobPattern = (raw: string): string => {
@@ -757,12 +780,11 @@ class Emitter {
         // Compile each clause to native JS when possible (parsed once), else
         // fall back to the runtime string evaluator for the whole header.
         const ic = cmd.init === "" ? "" : arithToJS(cmd.init);
-        const tc = cmd.test === "" ? "true" : arithToJS(cmd.test);
+        const tc = cmd.test === "" ? "true" : arithToJSBool(cmd.test);
         const sc = cmd.step === "" ? "" : arithToJS(cmd.step);
         let header: string;
         if (ic !== null && tc !== null && sc !== null) {
-          const test = cmd.test === "" ? "true" : `(${tc}) !== 0n`;
-          header = `for (${ic}; ${test}; ${sc})`;
+          header = `for (${ic}; ${tc}; ${sc})`;
         } else {
           header =
             `for (await sh.arithRun(${JSON.stringify(cmd.init)}); ` +
