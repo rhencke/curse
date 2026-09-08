@@ -562,6 +562,9 @@ class Emitter {
           `${i}}`;
         if (cmd.alternate !== null) {
           out += ` else {\n` + this.command(cmd.alternate, ind + 1) + "\n" + `${i}}`;
+        } else {
+          // A false `if` with no else has exit status 0, not the test's status.
+          out += ` else {\n${pad(ind + 1)}sh.status = 0;\n${i}}`;
         }
         return out;
       }

@@ -369,6 +369,75 @@ const cd: Builtin = (shell, ...args) => {
   return 0;
 };
 
+/** umask as a 4-digit octal string, e.g. 0022. */
+const umaskOctal = (mask: number): string => "0" + mask.toString(8).padStart(3, "0");
+/** umask as symbolic *permissions* (the complement), e.g. u=rwx,g=rx,o=rx. */
+const umaskSymbolic = (mask: number): string => {
+  const allowed = ~mask & 0o777;
+  const cls = (bits: number): string =>
+    (bits & 4 ? "r" : "") + (bits & 2 ? "w" : "") + (bits & 1 ? "x" : "");
+  return `u=${cls((allowed >> 6) & 7)},g=${cls((allowed >> 3) & 7)},o=${cls(allowed & 7)}`;
+};
+/** Apply chmod-style symbolic clauses to the current umask; null if malformed. */
+const applyUmaskSymbolic = (mask: number, spec: string): number | null => {
+  let allowed = ~mask & 0o777; // symbolic mode describes permissions, not the mask
+  const shifts: Record<string, number> = { u: 6, g: 3, o: 0 };
+  for (const clause of spec.split(",")) {
+    const m = /^([ugoa]*)([-+=])([rwx]*)$/.exec(clause);
+    if (m === null) return null;
+    const who = m[1] === "" || m[1]!.includes("a") ? "ugo" : m[1]!;
+    const op = m[2]!;
+    const perm = (m[3]!.includes("r") ? 4 : 0) | (m[3]!.includes("w") ? 2 : 0) | (m[3]!.includes("x") ? 1 : 0);
+    for (const w of new Set(who)) {
+      const sh = shifts[w]!;
+      const old = (allowed >> sh) & 7;
+      const next = op === "+" ? old | perm : op === "-" ? old & ~perm : perm;
+      allowed = (allowed & ~(7 << sh)) | (next << sh);
+    }
+  }
+  return ~allowed & 0o777;
+};
+
+const umaskBuiltin: Builtin = (shell, ...args) => {
+  let symbolic = false;
+  let printForm = false;
+  const rest: string[] = [];
+  for (const a of args) {
+    if (a === "-S") symbolic = true;
+    else if (a === "-p") printForm = true;
+    else if (a === "--") continue;
+    else if (a.startsWith("-") && a !== "-") {
+      // A leading `-` is an option; anything but -S/-p is an invalid option
+      // (bash rejects `umask -rwx` with usage status 2, not as a clause).
+      shell.io.err(`umask: ${a}: invalid option\numask: usage: umask [-p] [-S] [mode]\n`);
+      return 2;
+    }
+    else rest.push(a);
+  }
+  const cur = process.umask();
+  if (rest.length === 0) {
+    const body = symbolic ? umaskSymbolic(cur) : umaskOctal(cur);
+    shell.io.out((printForm ? `umask ${symbolic ? "-S " : ""}` : "") + body + "\n");
+    return 0;
+  }
+  const spec = rest[0]!;
+  let mask: number;
+  if (/^[0-7]+$/.test(spec)) {
+    const v = parseInt(spec, 8);
+    if (v > 0o777) { shell.io.err(`umask: ${spec}: octal number out of range\n`); return 1; }
+    mask = v;
+  } else if (/^[0-9]+$/.test(spec)) {
+    shell.io.err(`umask: ${spec}: invalid octal number\n`);
+    return 1;
+  } else {
+    const applied = applyUmaskSymbolic(cur, spec);
+    if (applied === null) { shell.io.err(`umask: ${spec}: invalid symbolic mode operator\n`); return 1; }
+    mask = applied;
+  }
+  process.umask(mask);
+  return 0;
+};
+
 /** Home-relative tilde form for `dirs` (unless -l / long format). */
 const tildePath = (p: string, home: string | undefined): string => {
   if (home === undefined || home === "") return p;
@@ -1340,6 +1409,7 @@ export const builtins: Record<string, Builtin> = {
   dirs,
   pushd,
   popd,
+  umask: umaskBuiltin,
   export: exportBuiltin,
   local,
   unset,
