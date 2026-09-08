@@ -370,7 +370,13 @@ const cd: Builtin = (shell, ...args) => {
 };
 
 const exportBuiltin: Builtin = (shell, ...args) => {
-  for (const a of args) {
+  const nonFlag = args.filter((a) => !a.startsWith("-"));
+  // `export` / `export -p` (no names) lists all exported variables.
+  if (nonFlag.length === 0) {
+    for (const line of shell.declareLinesWhere((v) => v.exported)) shell.io.out(line + "\n");
+    return 0;
+  }
+  for (const a of nonFlag) {
     const eq = a.indexOf("=");
     if (eq >= 0) {
       shell.setVar(a.slice(0, eq), a.slice(eq + 1));
@@ -588,6 +594,11 @@ const parseDeclFlags = (args: string[]): { flags: DeclFlags; names: string[] } =
 };
 
 const declareBuiltin: Builtin = (shell, ...args) => {
+  // Bare `declare` lists every variable in `set` (name=value) form.
+  if (args.length === 0) {
+    for (const line of shell.varListing()) shell.io.out(line + "\n");
+    return 0;
+  }
   const dashFlags = args.filter((a) => a[0] === "-" || a[0] === "+");
   const opNames = (): string[] =>
     args.filter((a) => a[0] !== "-" && a[0] !== "+").map((a) => {
@@ -619,6 +630,15 @@ const declareBuiltin: Builtin = (shell, ...args) => {
       const eq = a.indexOf("=");
       return eq >= 0 ? a.slice(0, eq) : a;
     });
+    // `declare -p` with no names prints every variable in declare form.
+    if (targets.length === 0) {
+      for (const name of shell.matchNames("")) {
+        if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(name)) continue;
+        const line = shell.declareLine(name);
+        if (line !== null) shell.io.out(line + "\n");
+      }
+      return 0;
+    }
     let status = 0;
     for (const name of targets) {
       const line = shell.declareLine(name);
@@ -656,8 +676,13 @@ const declareBuiltin: Builtin = (shell, ...args) => {
 };
 
 const readonlyBuiltin: Builtin = (shell, ...args) => {
-  for (const a of args) {
-    if (a.startsWith("-")) continue;
+  const nonFlag = args.filter((a) => !a.startsWith("-"));
+  // `readonly` / `readonly -p` (no names) lists all readonly variables.
+  if (nonFlag.length === 0) {
+    for (const line of shell.declareLinesWhere((v) => v.readonly)) shell.io.out(line + "\n");
+    return 0;
+  }
+  for (const a of nonFlag) {
     const eq = a.indexOf("=");
     const name = eq >= 0 ? a.slice(0, eq) : a;
     if (eq >= 0) shell.setVar(name, a.slice(eq + 1));

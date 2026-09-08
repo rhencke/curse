@@ -401,8 +401,9 @@ export class Shell {
     const out: string[] = [];
     for (const name of this.matchNames("")) {
       if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(name)) continue;
-      const v = this.lookup(name);
-      if (v === undefined || v.unset || v.ref) continue;
+      const v = this.rawLookup(name);
+      if (v === undefined || v.unset) continue;
+      if (v.ref) { out.push(`${name}=${setQuote(v.value)}`); continue; } // nameref: shows its target
       if (v.assoc !== null) {
         const body = [...v.assoc.entries()].map(([k, val]) => `[${k}]=${declareQuote(val)}`).join(" ");
         out.push(`${name}=(${body})`);
@@ -413,6 +414,20 @@ export class Shell {
       } else {
         out.push(`${name}=${setQuote(v.value)}`);
       }
+    }
+    return out;
+  }
+
+  /** Visible variables whose box matches `pred`, as sorted `declare` lines —
+   *  backs `declare -p`, `readonly -p`, `export -p`. */
+  declareLinesWhere(pred: (v: Var) => boolean): string[] {
+    const out: string[] = [];
+    for (const name of this.matchNames("")) {
+      if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(name)) continue;
+      const v = this.rawLookup(name);
+      if (v === undefined || v.unset || !pred(v)) continue;
+      const line = this.declareLine(name);
+      if (line !== null) out.push(line);
     }
     return out;
   }

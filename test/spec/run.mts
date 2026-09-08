@@ -32,15 +32,22 @@ interface Case {
 const parseCases = (text: string): Case[] => {
   const cases: Case[] = [];
   let cur: { name: string; code: string[] } | null = null;
+  let inMeta = false; // once a `##` metadata line is seen, the rest of the case
   for (const line of text.split("\n")) {
     const m = /^#### (.*)/.exec(line);
     if (m) {
       if (cur) cases.push({ name: cur.name, code: cur.code.join("\n") });
       cur = { name: m[1]!, code: [] };
+      inMeta = false;
       continue;
     }
     if (cur === null) continue;
-    if (line === "##" || line.startsWith("## ")) continue; // spec annotation
+    // The Oil format puts all metadata (## STDOUT:, ## status:, expected output,
+    // ## END, …) after the code. A `##` line begins that block; everything from
+    // there to the next case is annotation, NOT code (so expected-output lines,
+    // which don't start with `##`, are never mistaken for code to run).
+    if (line === "##" || line.startsWith("## ")) { inMeta = true; continue; }
+    if (inMeta) continue;
     cur.code.push(line);
   }
   if (cur) cases.push({ name: cur.name, code: cur.code.join("\n") });
