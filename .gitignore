@@ -1,0 +1,12 @@
+# Local reference checkout of GNU bash (porting source + test suite).
+# Not committed: it's upstream GPLv3 source we derive from, kept locally.
+# Specific files we port/vendor are attributed in NOTICE.md.
+/reference/
+
+# Node
+node_modules/
+
+# Build / scratch output
+/dist/
+*.tsbuildinfo
+/.curse-out/
