@@ -512,6 +512,19 @@ export class Shell {
     const owner = this.ownerScope(name);
     if (owner) delete owner[name];
   }
+  /** `unset arr[i]` / `unset assoc[key]` — remove a single element. */
+  unsetElem(name: string, sub: string): void {
+    const v = this.lookup(name);
+    if (v === undefined) return;
+    if (v.assoc !== null) { v.assoc.delete(sub); return; }
+    if (v.arr !== null) {
+      const i = Number(evalArith(this, sub));
+      v.arr.delete(i < 0 ? this.maxIndex(v) + 1 + i : i);
+      return;
+    }
+    // A scalar's element 0 is the whole variable.
+    if (sub === "0" || sub === "@" || sub === "*") this.unsetVar(name);
+  }
   local(name: string, value?: string): void {
     this.scope[name] = new Var(value ?? "");
   }
@@ -1008,9 +1021,9 @@ export class Shell {
     return this.doSlice([this.name, ...this.positional], offExpr, lenExpr);
   }
 
-  /** `[[ ]]` unary test (used by generated code and the interpreter). */
-  /** `[[ -v x ]]` / `[[ -v arr[i] ]]` / `[[ -v arr[@] ]]` — is it set? */
-  private isSetV(arg: string): boolean {
+  /** `-v x` / `-v arr[i]` / `-v arr[@]` — is the variable/element set?
+   *  Shared by `[[ -v ]]`, the `test` builtin, and generated code. */
+  isSet(arg: string): boolean {
     const m = /^([A-Za-z_][A-Za-z0-9_]*)\[([\s\S]*)\]$/.exec(arg);
     if (m === null) return this.lookup(arg) !== undefined;
     const v = this.lookup(m[1]!);
@@ -1035,7 +1048,7 @@ export class Shell {
   condUnary(op: string, arg: string): boolean {
     if (op === "-z") return arg.length === 0;
     if (op === "-n") return arg.length > 0;
-    if (op === "-v") return this.isSetV(arg);
+    if (op === "-v") return this.isSet(arg);
     if (op === "-o") return false; // shopt option — unsupported
     const p = resolve(this.cwd, arg);
     let st: ReturnType<typeof statSync> | null = null;

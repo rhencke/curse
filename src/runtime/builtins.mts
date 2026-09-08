@@ -340,7 +340,11 @@ const unset: Builtin = (shell, ...args) => {
     if (a === "-f") mode = "f";
     else if (a === "-v") mode = "v";
     else if (mode === "f") shell.unsetFunc(a);
-    else shell.unsetVar(a);
+    else {
+      const m = /^([A-Za-z_][A-Za-z0-9_]*)\[([\s\S]*)\]$/.exec(a);
+      if (m) shell.unsetElem(m[1]!, m[2]!);
+      else shell.unsetVar(a);
+    }
   }
   return 0;
 };
@@ -945,7 +949,7 @@ const unaryTest = (op: string, arg: string, shell: Shell): boolean => {
   if (op === "-z") return arg.length === 0;
   if (op === "-n") return arg.length > 0;
   if (op === "-t") return false; // stdio is piped in this environment
-  if (op === "-v" || op === "-R") return shell.has(arg);
+  if (op === "-v" || op === "-R") return shell.isSet(arg);
   if (op === "-o") return false; // shell option — unsupported
   const p = resolve(shell.cwd, arg);
   const st = statOf(p);
