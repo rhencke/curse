@@ -102,6 +102,7 @@ class Emitter {
   private paramExpr(prm: Param): string {
     const J = JSON.stringify;
     if (prm.indices) return `sh.arrayIndices(${J(prm.name)}).join(" ")`;
+    if (prm.indirect) return `sh.indirect(${J(prm.name)})`;
     const base = this.valStr(prm);
     const arg = (): string => this.templateOf(parseWord(prm.arg).parts);
     const arg2 = (): string => this.templateOf(parseWord(prm.arg2).parts);
@@ -116,6 +117,8 @@ class Emitter {
       case "-": return `(sh.has(${J(prm.name)}) ? ${base} : ${arg()})`;
       case ":+": return `(String(${base}) ? ${arg()} : "")`;
       case "+": return `(sh.has(${J(prm.name)}) ? ${arg()} : "")`;
+      case ":?": return `(String(${base}) || sh.paramError(${J(prm.name)}, ${arg()}))`;
+      case "?": return `(sh.has(${J(prm.name)}) ? ${base} : sh.paramError(${J(prm.name)}, ${arg()}))`;
       case ":=": return `(String(${base}) || (sh.env.${prm.name} = ${arg()}))`;
       case "=": return `(sh.has(${J(prm.name)}) ? ${base} : (sh.env.${prm.name} = ${arg()}))`;
       case "#": return `sh.trimPrefix(String(${base}), ${arg()}, false)`;
@@ -423,20 +426,33 @@ class Emitter {
       case "case": {
         const id = this.caseId++;
         const subj = this.templateOf(parseWord(cmd.word.text).parts);
-        let chain = "";
-        cmd.clauses.forEach((clause, ci) => {
-          const cond = clause.patterns
-            .map((p) => this.matchExpr(`__case${id}`, p.text))
-            .join(" || ");
-          const body = clause.body
-            ? this.command(clause.body, ind + 2)
-            : `${pad(ind + 2)}sh.status = 0;`;
-          const block = `(${cond}) {\n${body}\n${pad(ind + 1)}}`;
-          chain += ci === 0 ? `${pad(ind + 1)}if ${block}` : ` else if ${block}`;
-        });
-        const head = `${pad(ind + 1)}const __case${id} = ${subj};\n${pad(ind + 1)}sh.status = 0;`;
-        const inner = chain === "" ? head : head + "\n" + chain;
-        return `${i}{\n${inner}\n${i}}`;
+        const j = pad(ind + 1);
+        const head = `${j}const __case${id} = ${subj};\n${j}sh.status = 0;`;
+        const condOf = (clause: (typeof cmd.clauses)[number]): string =>
+          clause.patterns.map((p) => this.matchExpr(`__case${id}`, p.text)).join(" || ");
+        const bodyOf = (clause: (typeof cmd.clauses)[number], d: number): string =>
+          clause.body ? this.command(clause.body, d) : `${pad(d)}sh.status = 0;`;
+
+        // Common case (all `;;`): a clean if / else-if chain.
+        if (cmd.clauses.every((c) => c.term === "break")) {
+          let chain = "";
+          cmd.clauses.forEach((clause, ci) => {
+            const block = `(${condOf(clause)}) {\n${bodyOf(clause, ind + 2)}\n${j}}`;
+            chain += ci === 0 ? `${j}if ${block}` : ` else if ${block}`;
+          });
+          return `${i}{\n${chain === "" ? head : head + "\n" + chain}\n${i}}`;
+        }
+
+        // With `;&` / `;;&`: a labeled block with a fall-through flag.
+        const k = pad(ind + 2);
+        let out = `${i}{\n${head}\n${j}__case${id}: {\n${k}let __fall${id} = false;\n`;
+        for (const clause of cmd.clauses) {
+          out += `${k}if (__fall${id} || (${condOf(clause)})) {\n${bodyOf(clause, ind + 3)}\n`;
+          if (clause.term === "break") out += `${pad(ind + 3)}break __case${id};\n`;
+          else out += `${pad(ind + 3)}__fall${id} = ${clause.term === "fall"};\n`;
+          out += `${k}}\n`;
+        }
+        return out + `${j}}\n${i}}`;
       }
       default: {
         const unhandled: never = cmd;

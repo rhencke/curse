@@ -62,6 +62,8 @@ const specialValue = (shell: Shell, name: string): string => {
 const evalParam = async (shell: Shell, prm: Param): Promise<string> => {
   // ${!name[@]} / ${!name[*]} — array indices.
   if (prm.indices) return shell.arrayIndices(prm.name).join(" ");
+  // ${!name} — indirect (value of the variable named by $name).
+  if (prm.indirect) return shell.indirect(prm.name);
 
   // Resolve the referenced value (scalar, array element, or all elements).
   let rawVal: string | undefined;
@@ -108,6 +110,8 @@ const evalParam = async (shell: Shell, prm: Param): Promise<string> => {
     case "-": return isSet ? val : await arg();
     case ":+": return val !== "" ? await arg() : "";
     case "+": return isSet ? await arg() : "";
+    case ":?": return val !== "" ? val : shell.paramError(prm.name, await arg());
+    case "?": return isSet ? val : shell.paramError(prm.name, await arg());
     case ":=": {
       if (val !== "") return val;
       const d = await arg();

@@ -306,6 +306,17 @@ export class Shell {
     }
   }
 
+  /** `${x:?msg}` / `${x?msg}`: report the error and exit. */
+  paramError(name: string, msg: string): never {
+    this.io.err(`${this.name}: ${name}: ${msg === "" ? "parameter null or not set" : msg}\n`);
+    throw new ExitSignal(1);
+  }
+
+  /** `${!name}`: the value of the variable named by `$name`. */
+  indirect(name: string): string {
+    return this.getVar(this.getVar(name) ?? "") ?? "";
+  }
+
   /** Read a plain `$name` reference, honoring `set -u` (used by generated code). */
   ref(name: string): string {
     const v = this.lookup(name);
@@ -1116,16 +1127,24 @@ export class Shell {
 
   private async execCase(cmd: CaseCommand): Promise<number> {
     const subject = await expandNoSplit(this, cmd.word.text);
+    this.status = 0;
+    let falling = false;
     for (const clause of cmd.clauses) {
-      for (const pat of clause.patterns) {
-        if (globMatch(subject, await expandNoSplit(this, pat.text))) {
-          this.status = clause.body ? await this.execute(clause.body) : 0;
-          return this.status;
+      let run = falling;
+      if (!run) {
+        for (const pat of clause.patterns) {
+          if (globMatch(subject, await expandNoSplit(this, pat.text))) {
+            run = true;
+            break;
+          }
         }
       }
+      if (!run) continue;
+      if (clause.body) this.status = await this.execute(clause.body);
+      if (clause.term === "break") return this.status;
+      falling = clause.term === "fall"; // ";&" runs the next body, ";;&" resumes testing
     }
-    this.status = 0;
-    return 0;
+    return this.status;
   }
 
   private async execArithFor(cmd: ArithForCommand): Promise<number> {

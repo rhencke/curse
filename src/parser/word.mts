@@ -15,6 +15,7 @@ export interface Param {
   special: boolean;
   length: boolean; // ${#name}
   indices: boolean; // ${!name[@]}
+  indirect: boolean; // ${!name}
   sub: string; // array subscript inside [ ] ("" if none)
   /** "" | :- - :+ + := = :? ? # ## % %% / // /# /% : (substring) */
   op: string;
@@ -33,6 +34,7 @@ const simpleParam = (name: string, special: boolean): Param => ({
   special,
   length: false,
   indices: false,
+  indirect: false,
   sub: "",
   op: "",
   arg: "",
@@ -378,13 +380,15 @@ function parseParam(inner: string): Param {
   let s = inner;
   let length = false;
   let indices = false;
+  let indirect = false;
+  let bang = false;
 
   // ${#name} is length; ${#} alone is the special parameter `#`.
   if (s[0] === "#" && s.length > 1) {
     length = true;
     s = s.slice(1);
   } else if (s[0] === "!" && s.length > 1) {
-    indices = true; // ${!name[@]} (or indirect — checked after the subscript)
+    bang = true; // ${!name[@]} indices, or ${!name} indirect — decided after subscript
     s = s.slice(1);
   }
 
@@ -427,13 +431,14 @@ function parseParam(inner: string): Param {
     }
   }
 
-  if (indices && sub !== "@" && sub !== "*") {
-    throw new Error("${!...} indirect expansion not implemented yet");
+  if (bang) {
+    if (sub === "@" || sub === "*") indices = true; // ${!arr[@]}
+    else indirect = true; // ${!name}
   }
 
   const rest = s.slice(i);
-  const p: Param = { name, special, length, indices, sub, op: "", arg: "", arg2: "" };
-  if (length || indices) {
+  const p: Param = { name, special, length, indices, indirect, sub, op: "", arg: "", arg2: "" };
+  if (length || indices || indirect) {
     if (rest !== "") throw new Error(`bad substitution: \${${inner}}`);
     return p;
   }
@@ -442,12 +447,11 @@ function parseParam(inner: string): Param {
   const a = rest[0]!;
   if (a === ":") {
     const b = rest[1];
-    if (b === "-" || b === "=" || b === "+") {
+    if (b === "-" || b === "=" || b === "+" || b === "?") {
       p.op = ":" + b;
       p.arg = rest.slice(2);
       return p;
     }
-    if (b === "?") throw new Error("${x:?...} not implemented yet");
     p.op = ":"; // substring ${name:offset[:length]}
     const spec = rest.slice(1);
     const ci = spec.indexOf(":");
@@ -459,12 +463,11 @@ function parseParam(inner: string): Param {
     }
     return p;
   }
-  if (a === "-" || a === "=" || a === "+") {
+  if (a === "-" || a === "=" || a === "+" || a === "?") {
     p.op = a;
     p.arg = rest.slice(1);
     return p;
   }
-  if (a === "?") throw new Error("${x?...} not implemented yet");
   if (a === "#") {
     p.op = rest[1] === "#" ? "##" : "#";
     p.arg = rest.slice(p.op.length);

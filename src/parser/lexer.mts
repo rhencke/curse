@@ -98,8 +98,16 @@ class Lexer {
     // Operators (M0 subset).
     if (c === ";") {
       if (this.at(1) === ";") {
+        if (this.at(2) === "&") {
+          this.i += 3;
+          return { type: "OP", value: ";;&", pos, line };
+        }
         this.i += 2;
         return { type: "OP", value: ";;", pos, line };
+      }
+      if (this.at(1) === "&") {
+        this.i += 2;
+        return { type: "OP", value: ";&", pos, line };
       }
       this.i++;
       return { type: "OP", value: ";", pos, line };

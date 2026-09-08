@@ -139,6 +139,8 @@ export interface ArithForCommand extends CommandBase {
 export interface CasePattern {
   patterns: Word[];
   body: Command | null;
+  /** clause terminator: ";;" break, ";&" fall through, ";;&" test next. */
+  term: "break" | "fall" | "test";
 }
 
 export interface CaseCommand extends CommandBase {

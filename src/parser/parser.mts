@@ -31,7 +31,7 @@ const FI: TermSet = { words: new Set(["fi"]) };
 const ELIF_ELSE_FI: TermSet = { words: new Set(["elif", "else", "fi"]) };
 const CLOSE_BRACE: TermSet = { words: new Set(["}"]) };
 const CLOSE_PAREN: TermSet = { ops: new Set([")"]) };
-const CASE_TERM: TermSet = { words: new Set(["esac"]), ops: new Set([";;"]) };
+const CASE_TERM: TermSet = { words: new Set(["esac"]), ops: new Set([";;", ";&", ";;&"]) };
 const TOP: TermSet = {};
 
 const RESERVED_MISPLACED = new Set([
@@ -388,13 +388,15 @@ class Parser {
       this.skipLinebreak();
 
       const body = this.atCaseClauseEnd() ? null : this.parseCompoundList(CASE_TERM);
-      clauses.push({ patterns, body });
-
-      if (this.peek().type === "OP" && this.peek().value === ";;") {
+      const tt = this.peek();
+      if (tt.type === "OP" && (tt.value === ";;" || tt.value === ";&" || tt.value === ";;&")) {
+        const term = tt.value === ";&" ? "fall" : tt.value === ";;&" ? "test" : "break";
         this.advance();
         this.skipLinebreak();
+        clauses.push({ patterns, body, term });
       } else {
-        break; // final clause may omit `;;`
+        clauses.push({ patterns, body, term: "break" });
+        break; // final clause may omit the terminator
       }
     }
     this.eatWord("esac");
@@ -415,7 +417,7 @@ class Parser {
     return (
       t.type === "EOF" ||
       (t.type === "WORD" && t.value === "esac") ||
-      (t.type === "OP" && t.value === ";;")
+      (t.type === "OP" && (t.value === ";;" || t.value === ";&" || t.value === ";;&"))
     );
   }
 
