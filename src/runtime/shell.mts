@@ -1249,6 +1249,22 @@ export class Shell {
     }
   }
 
+  /** `eval` / `source`: parse `src` and run it in THIS shell (shared scope),
+   *  letting return/exit/break propagate to the caller. This is the JIT path —
+   *  generated code reaches it through the eval/source builtins. */
+  async evalString(src: string): Promise<number> {
+    let cmd: Command | null;
+    try {
+      cmd = parse(src);
+    } catch (e) {
+      this.io.err(`${this.name}: ${errMsg(e)}\n`);
+      this.status = 2;
+      return 2;
+    }
+    if (cmd === null) return this.status;
+    return this.execute(cmd);
+  }
+
   async runString(src: string): Promise<number> {
     const cmd = parse(src);
     if (cmd === null) {

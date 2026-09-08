@@ -5,7 +5,7 @@
  * `unset -f` reveals it again). Called via the shell, never bound to `this`. */
 
 import { resolve } from "node:path";
-import { accessSync, constants, lstatSync, statSync } from "node:fs";
+import { accessSync, constants, lstatSync, readFileSync, statSync } from "node:fs";
 import type { Shell } from "./shell.mts";
 import { ExitSignal, LoopSignal, ReturnSignal } from "./types.mts";
 
@@ -295,6 +295,30 @@ const shift: Builtin = (shell, ...args) => {
   if (n < 0 || n > shell.positional.length) return 1;
   shell.positional = shell.positional.slice(n);
   return 0;
+};
+
+const evalBuiltin: Builtin = (shell, ...args) => shell.evalString(args.join(" "));
+
+const sourceBuiltin: Builtin = async (shell, ...args) => {
+  const file = args[0];
+  if (file === undefined) {
+    shell.io.err("source: filename argument required\n");
+    return 2;
+  }
+  let src: string;
+  try {
+    src = readFileSync(resolve(shell.cwd, file), "utf8");
+  } catch {
+    shell.io.err(`${shell.name}: ${file}: No such file or directory\n`);
+    return 1;
+  }
+  const saved = shell.positional;
+  if (args.length > 1) shell.positional = args.slice(1);
+  try {
+    return await shell.evalString(src);
+  } finally {
+    shell.positional = saved;
+  }
 };
 
 const letBuiltin: Builtin = async (shell, ...args) => {
@@ -961,6 +985,9 @@ export const builtins: Record<string, Builtin> = {
   return: returnBuiltin,
   exit: exitBuiltin,
   shift,
+  eval: evalBuiltin,
+  source: sourceBuiltin,
+  ".": sourceBuiltin,
   let: letBuiltin,
   break: breakBuiltin,
   continue: continueBuiltin,
