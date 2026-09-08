@@ -107,17 +107,42 @@ const extglobGroup = (pat: string, i: number, extglob: boolean): [string, number
   }
 };
 
+// Glob→regex translation is a pure function of (pattern, extglob), so memoize
+// it: a pattern reused across a loop is translated once instead of on every
+// match. Capped to bound memory if a program generates unboundedly many.
+const bodyCache = new Map<string, string>();
+const CACHE_CAP = 4096;
+
 /** Translate a glob pattern to a regular-expression body (no anchors). */
-export const globToRegExpBody = (pat: string, extglob = false): string =>
-  translate(pat, 0, extglob, false)[0];
+export const globToRegExpBody = (pat: string, extglob = false): string => {
+  const key = (extglob ? "1" : "0") + pat;
+  let body = bodyCache.get(key);
+  if (body === undefined) {
+    body = translate(pat, 0, extglob, false)[0];
+    if (bodyCache.size >= CACHE_CAP) bodyCache.clear();
+    bodyCache.set(key, body);
+  }
+  return body;
+};
 
 /** Anchored source (`^…$`) — inlined by the emitter as a `/…/s` literal for
  *  static patterns; used by the runtime for dynamic ones. */
 export const globToRegExpSource = (pat: string, extglob = false): string =>
   "^" + globToRegExpBody(pat, extglob) + "$";
 
-export const globMatch = (str: string, pattern: string, nocase = false, extglob = false): boolean =>
-  new RegExp(globToRegExpSource(pattern, extglob), nocase ? "si" : "s").test(str);
+// Compiled anchored matchers, likewise memoized by (flags, pattern).
+const reCache = new Map<string, RegExp>();
+
+export const globMatch = (str: string, pattern: string, nocase = false, extglob = false): boolean => {
+  const key = (nocase ? "i" : "") + (extglob ? "e" : "") + pattern;
+  let re = reCache.get(key);
+  if (re === undefined) {
+    re = new RegExp(globToRegExpSource(pattern, extglob), nocase ? "si" : "s");
+    if (reCache.size >= CACHE_CAP) reCache.clear();
+    reCache.set(key, re);
+  }
+  return re.test(str);
+};
 
 export const hasGlobMeta = (s: string): boolean => /[*?[]/.test(s);
 /** Does the word contain an extglob operator group `X(`? */
