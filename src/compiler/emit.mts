@@ -199,7 +199,13 @@ class Emitter {
       return `await sh.indirectExpand(${J(prm.name)}, ${prm.special}, ${J(prm.op)}, ${J(prm.arg)}, ${J(prm.arg2)}, ${prm.length})`;
     }
     if (this.isSlice(prm)) return `(${this.sliceExpr(prm)}).join(" ")`;
-    const base = this.valStr(prm);
+    // Value-using operators (substring, trim, replace, case, transform, length)
+    // must honor `set -u` on an unset var, unlike the alternation operators.
+    const valueUsing = !this.isList(prm) &&
+      (prm.length || prm.op === ":" || prm.op.startsWith("@") || isCaseOp(prm.op) || STR_OPS.has(prm.op));
+    const base = valueUsing
+      ? `(sh.assertSet(${J(prm.name)}, ${prm.special}), ${this.valStr(prm)})`
+      : this.valStr(prm);
     if (prm.op.startsWith("@")) {
       if (this.isList(prm)) {
         return `${this.listExpr(prm)}.map((x) => sh.transform(${J(prm.op)}, x)).join(" ")`;

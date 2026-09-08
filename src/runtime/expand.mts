@@ -174,8 +174,11 @@ export const evalParam = async (shell: Shell, prm: Param, quoted = false): Promi
   // `#`/`%`/`/` operands are quote-aware globs; the replacement stays literal.
   const pat = (): Promise<string> => shell.patExpand(prm.arg);
 
-  // set -u: a plain reference (or ${#x}) to an unset parameter is an error.
-  if (prm.op === "" && shell.opts.nounset) {
+  // set -u: referencing an unset parameter errors — for a plain `${x}`, `${#x}`,
+  // and the value-using operators (substring, trim, replace, case, transform),
+  // but NOT the `-`/`:-`/`+`/`:+`/`=`/`:=`/`?`/`:?` operators that handle unset.
+  const altOp = new Set(["-", ":-", "+", ":+", "=", ":=", "?", ":?"]);
+  if (shell.opts.nounset && !altOp.has(prm.op)) {
     const unbound = prm.special
       ? /^[0-9]+$/.test(prm.name) && Number(prm.name) > shell.positional.length
       : !isSet;

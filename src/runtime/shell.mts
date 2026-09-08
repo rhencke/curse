@@ -690,6 +690,18 @@ export class Shell {
     const ifs = this.getVar("IFS");
     return ifs === undefined ? " " : ifs === "" ? "" : ifs[0]!;
   }
+  /** Under `set -u`, throw the unbound-variable error if `name` is unset — used
+   *  by generated code before value-using operators (substring, trim, case, …). */
+  assertSet(name: string, special: boolean): void {
+    if (!this.opts.nounset) return;
+    const unbound = special
+      ? /^[0-9]+$/.test(name) && Number(name) > this.positional.length
+      : this.getVar(name) === undefined;
+    if (unbound) {
+      this.io.err(`${this.name}: ${name}: unbound variable\n`);
+      throw new ExitSignal(1);
+    }
+  }
   /** Read a plain `$name` reference, honoring `set -u` (used by generated code). */
   ref(name: string): string {
     const r = this.resolveRef(name);
