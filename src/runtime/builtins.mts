@@ -464,27 +464,98 @@ const wait: Builtin = async (shell, ...args) => {
   return status;
 };
 
-const read: Builtin = (shell, ...args) => {
-  const names = args.filter((a) => !a.startsWith("-"));
-  if (shell.stdinData === null || shell.stdinData === "") return 1;
-  const data = shell.stdinData;
-  const nl = data.indexOf("\n");
-  const line = nl >= 0 ? data.slice(0, nl) : data;
-  shell.stdinData = nl >= 0 ? data.slice(nl + 1) : "";
+/** Split a line into fields per IFS (bash's read splitting). `limit` caps the
+ *  field count — the last field keeps the raw remainder (trailing IFS
+ *  whitespace stripped); Infinity splits fully (for `read -a`). */
+const readFields = (line: string, ifs: string, limit: number): string[] => {
+  const ws = new Set<string>();
+  const sep = new Set<string>();
+  for (const c of ifs) (c === " " || c === "\t" || c === "\n" ? ws : sep).add(c);
+  const isWs = (c: string): boolean => ws.has(c);
+  const isSep = (c: string): boolean => sep.has(c);
+  const fields: string[] = [];
+  let i = 0;
+  while (i < line.length && isWs(line[i]!)) i++;
+  while (i < line.length) {
+    if (fields.length === limit - 1) {
+      let rest = line.slice(i);
+      while (rest.length > 0 && isWs(rest[rest.length - 1]!)) rest = rest.slice(0, -1);
+      fields.push(rest);
+      return fields;
+    }
+    let f = "";
+    while (i < line.length && !isWs(line[i]!) && !isSep(line[i]!)) f += line[i++];
+    fields.push(f);
+    while (i < line.length && isWs(line[i]!)) i++;
+    if (i < line.length && isSep(line[i]!)) {
+      i++;
+      while (i < line.length && isWs(line[i]!)) i++;
+    }
+  }
+  return fields;
+};
 
-  if (names.length === 0) {
+const read: Builtin = (shell, ...args) => {
+  let raw = false;
+  let arrayName: string | null = null;
+  let delim = "\n";
+  let nchars = -1;
+  let exactN = -1;
+  const names: string[] = [];
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i]!;
+    if (a === "-r") raw = true;
+    else if (a === "-s") continue; // silent: no tty here
+    else if (a === "-a") arrayName = args[++i] ?? "";
+    else if (a === "-d") { const d = args[++i] ?? ""; delim = d === "" ? "\0" : d[0]!; }
+    else if (a === "-n") nchars = toInt(args[++i] ?? "0");
+    else if (a === "-N") exactN = toInt(args[++i] ?? "0");
+    else if (a === "-p") shell.io.err(args[++i] ?? "");
+    else if (a === "-t" || a === "-u") i++; // timeout / fd: ignore + consume
+    else if (a.length > 1 && a[0] === "-") continue; // other flags: ignore
+    else names.push(a);
+  }
+
+  if (shell.stdinData === null || shell.stdinData === "") return 1;
+  let data = shell.stdinData;
+  let chunk: string;
+  let eof = false;
+  if (exactN >= 0) {
+    chunk = data.slice(0, exactN);
+    if (chunk.length < exactN) eof = true;
+    data = data.slice(chunk.length);
+  } else {
+    let end = data.indexOf(delim);
+    if (end < 0) { end = data.length; eof = true; }
+    const stop = nchars >= 0 && nchars < end ? nchars : end;
+    chunk = data.slice(0, stop);
+    data = stop === end && !eof ? data.slice(end + delim.length) : data.slice(stop);
+  }
+  shell.stdinData = data;
+
+  let line = chunk;
+  if (!raw) {
+    // Backslash escapes the next character (dropped when trailing).
+    let out = "";
+    for (let j = 0; j < line.length; j++) {
+      if (line[j] === "\\") { if (j + 1 < line.length) out += line[++j]; }
+      else out += line[j];
+    }
+    line = out;
+  }
+
+  const ifs = shell.getVar("IFS");
+  const ifsVal = ifs === undefined ? " \t\n" : ifs;
+
+  if (arrayName !== null) {
+    shell.setArray(arrayName, ifsVal === "" ? (line === "" ? [] : [line]) : readFields(line, ifsVal, Infinity));
+  } else if (names.length === 0) {
     shell.setVar("REPLY", line);
-    return 0;
+  } else {
+    const fields = ifsVal === "" ? [line] : readFields(line, ifsVal, names.length);
+    for (let idx = 0; idx < names.length; idx++) shell.setVar(names[idx]!, fields[idx] ?? "");
   }
-  const trimmed = line.replace(/^[ \t]+/, "");
-  const fields = trimmed === "" ? [] : trimmed.split(/[ \t]+/);
-  for (let idx = 0; idx < names.length; idx++) {
-    const value = idx < names.length - 1
-      ? fields[idx] ?? ""
-      : fields.slice(idx).join(" ").replace(/[ \t]+$/, "");
-    shell.setVar(names[idx]!, value);
-  }
-  return 0;
+  return eof ? 1 : 0;
 };
 
 const KEYWORDS = new Set([
