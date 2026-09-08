@@ -1419,52 +1419,73 @@ const binaryTest = (a: string, op: string, b: string): boolean => {
   }
 };
 
-const splitTop = (a: string[], sep: string): string[][] => {
-  const groups: string[][] = [];
-  let cur: string[] = [];
-  for (const x of a) {
-    if (x === sep) {
-      groups.push(cur);
-      cur = [];
-    } else {
-      cur.push(x);
-    }
-  }
-  groups.push(cur);
-  return groups;
-};
+const isBinop = (op: string | undefined): boolean => op !== undefined && BINARY.has(op);
 
-const evalTest = (a: string[], shell: Shell): boolean => {
-  // bash's argc-based rules (test.c) for 0–2 args, where an operator name can
-  // itself be an operand.
-  switch (a.length) {
-    case 0:
-      return false;
-    case 1:
-      return a[0]!.length > 0;
-    case 2:
-      if (a[0] === "!") return !(a[1]!.length > 0);
-      if (UNARY.has(a[0]!)) return unaryTest(a[0]!, a[1]!, shell);
-      throw new Error(`${a[0]}: unary operator expected`);
-  }
-  // 3+ args: `-a`/`-o` at the top level bind the whole expression.
-  if (a.includes("-a") || a.includes("-o")) {
-    return splitTop(a, "-o").some((orPart) =>
-      splitTop(orPart, "-a").every((andPart) => evalTest(andPart, shell)),
-    );
-  }
-  switch (a.length) {
-    case 3:
-      if (BINARY.has(a[1]!)) return binaryTest(a[0]!, a[1]!, a[2]!);
-      if (a[0] === "!") return !evalTest(a.slice(1), shell);
-      if (a[0] === "(" && a[2] === ")") return evalTest([a[1]!], shell);
-      throw new Error(`${a[1]}: binary operator expected`);
-    case 4:
-      if (a[0] === "!") return !evalTest(a.slice(1), shell);
-      if (a[0] === "(" && a[3] === ")") return evalTest(a.slice(1, 3), shell);
-      throw new Error("too many arguments");
-    default:
-      throw new Error("too many arguments");
+// bash's `test`/`[` grammar (test.c). Historical rules special-case 0–3 args,
+// where an operator name may itself be an operand (`test -o != --`); 4+ args go
+// through a recursive-descent parser in which `-a`/`-o` bind as AND/OR.
+const evalTest = (args: string[], shell: Shell): boolean => {
+  const one = (s: string): boolean => s.length > 0;
+  const two = (a: string[]): boolean => {
+    if (a[0] === "!") return !one(a[1]!);
+    if (UNARY.has(a[0]!)) return unaryTest(a[0]!, a[1]!, shell);
+    throw new Error(`${a[0]}: unary operator expected`);
+  };
+  const three = (a: string[]): boolean => {
+    if (isBinop(a[1])) return binaryTest(a[0]!, a[1]!, a[2]!);
+    if (a[1] === "-a") return one(a[0]!) && one(a[2]!);
+    if (a[1] === "-o") return one(a[0]!) || one(a[2]!);
+    if (a[0] === "!") return !two(a.slice(1));
+    if (a[0] === "(" && a[2] === ")") return one(a[1]!);
+    throw new Error(`${a[1]}: binary operator expected`);
+  };
+
+  // Recursive-descent parser for the general (4+ argument) form.
+  let pos = 0;
+  const orExpr = (): boolean => {
+    let v = andExpr();
+    while (pos < args.length && args[pos] === "-o") { pos++; const r = andExpr(); v = v || r; }
+    return v;
+  };
+  const andExpr = (): boolean => {
+    let v = term();
+    while (pos < args.length && args[pos] === "-a") { pos++; const r = term(); v = v && r; }
+    return v;
+  };
+  const term = (): boolean => {
+    if (pos >= args.length) throw new Error("argument expected");
+    if (args[pos] === "!") { pos++; return !term(); }
+    if (args[pos] === "(") {
+      pos++;
+      const v = orExpr();
+      if (args[pos] !== ")") throw new Error("`)' expected");
+      pos++;
+      return v;
+    }
+    const rem = args.length - pos;
+    if (rem >= 3 && isBinop(args[pos + 1])) {
+      const v = binaryTest(args[pos]!, args[pos + 1]!, args[pos + 2]!);
+      pos += 3;
+      return v;
+    }
+    if (rem >= 2 && UNARY.has(args[pos]!)) {
+      const v = unaryTest(args[pos]!, args[pos + 1]!, shell);
+      pos += 2;
+      return v;
+    }
+    return one(args[pos++]!);
+  };
+
+  switch (args.length) {
+    case 0: return false;
+    case 1: return one(args[0]!);
+    case 2: return two(args);
+    case 3: return three(args);
+    default: {
+      const v = orExpr();
+      if (pos !== args.length) throw new Error("too many arguments");
+      return v;
+    }
   }
 };
 
