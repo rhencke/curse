@@ -129,6 +129,8 @@ export const evalParam = async (shell: Shell, prm: Param, quoted = false): Promi
   if (isSlice(prm)) return (await sliceValues(shell, prm)).join(" ");
   // ${x@op} / ${arr[@]@op} — transform (per element for lists).
   if (isTransform(prm)) {
+    // ${var@a}: the variable's attribute letters (uses metadata, not the value).
+    if (prm.op === "@a") return shell.attrOf(prm.name);
     if (isList(prm)) return listValues(shell, prm).map((x) => transform(prm.op, x)).join(" ");
     const base = prm.special
       ? specialValue(shell, prm.name)

@@ -205,6 +205,8 @@ class Emitter {
       return `await sh.indirectExpand(${J(prm.name)}, ${prm.special}, ${J(prm.op)}, ${J(prm.arg)}, ${J(prm.arg2)}, ${prm.length})`;
     }
     if (this.isSlice(prm)) return `(${this.sliceExpr(prm)}).join(" ")`;
+    // ${var@a}: the variable's attribute letters (uses metadata, not the value).
+    if (prm.op === "@a") return `sh.attrOf(${J(prm.name)})`;
     // Value-using operators (substring, trim, replace, case, transform, length)
     // must honor `set -u` on an unset var, unlike the alternation operators.
     const valueUsing = !this.isList(prm) &&

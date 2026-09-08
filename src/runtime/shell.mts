@@ -65,6 +65,21 @@ const ASSIGN_BUILTINS = new Set(["declare", "typeset", "local", "export", "reado
 
 const errMsg = (e: unknown): string => (e instanceof Error ? e.message : String(e));
 
+/** A variable's attribute letters in bash's order (a A i l n r t u x), as used
+ *  by `declare -p` and the `${var@a}` transform. */
+const attrLetters = (v: Var): string => {
+  let f = "";
+  if (v.arr !== null) f += "a";
+  if (v.assoc !== null) f += "A";
+  if (v.integer) f += "i";
+  if (v.lower) f += "l";
+  if (v.ref) f += "n";
+  if (v.readonly) f += "r";
+  if (v.upper) f += "u";
+  if (v.exported) f += "x";
+  return f;
+};
+
 /** Temp files backing process substitutions, unlinked when the process exits. */
 let procSubSeq = 0;
 const procSubFiles: string[] = [];
@@ -359,6 +374,11 @@ export class Shell {
     const v = this.lookup(name);
     return v !== undefined && (v.arr !== null || v.assoc !== null);
   }
+  /** `${var@a}` — the variable's attribute letters (empty if unset/plain). */
+  attrOf(name: string): string {
+    const v = this.lookup(name);
+    return v === undefined ? "" : attrLetters(v);
+  }
   /** Write `base[sub]` synchronously (assoc key or arithmetic index) — used by
    *  namerefs and arithmetic array assignment. */
   setElemSync(base: string, sub: string, value: string): void {
@@ -508,15 +528,7 @@ export class Shell {
   declareLine(name: string): string | null {
     const v = this.rawLookup(name);
     if (v === undefined) return null;
-    let f = "";
-    if (v.arr !== null) f += "a";
-    if (v.assoc !== null) f += "A";
-    if (v.integer) f += "i";
-    if (v.lower) f += "l";
-    if (v.ref) f += "n";
-    if (v.readonly) f += "r";
-    if (v.upper) f += "u";
-    if (v.exported) f += "x";
+    const f = attrLetters(v);
     const attr = f === "" ? "--" : "-" + f;
     if (v.assoc !== null) {
       const body = [...v.assoc.entries()].map(([k, val]) => `[${k}]=${declareQuote(val)}`).join(" ");
