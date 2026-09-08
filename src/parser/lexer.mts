@@ -7,6 +7,8 @@
  * them do not terminate the word.
  */
 
+import { scanCmdSub } from "./scan.mts";
+
 export type TokenType = "WORD" | "OP" | "NEWLINE" | "ARITH" | "COND" | "REDIR" | "EOF";
 
 /** A here-document collected by the lexer; `body` is filled at end of line. */
@@ -223,7 +225,7 @@ class Lexer {
       if (c === undefined) break;
       // Process substitution `<(...)` / `>(...)` is part of the word.
       if ((c === "<" || c === ">") && this.at(1) === "(") {
-        buf += this.scanBalanced(c + "(", "(", ")", 1);
+        buf += this.scanCommandSub(2);
         continue;
       }
       // extglob group `?(…) *(…) +(…) @(…) !(…)` stays a single word.
@@ -270,7 +272,7 @@ class Lexer {
           continue;
         }
         if (nc === "(") {
-          buf += this.scanBalanced("$(", "(", ")", 1);
+          buf += this.scanCommandSub(2);
           continue;
         }
         if (nc === "{") {
@@ -358,7 +360,7 @@ class Lexer {
           continue;
         }
         if (nc === "(") {
-          buf += this.scanBalanced("$(", "(", ")", 1);
+          buf += this.scanCommandSub(2);
           continue;
         }
         if (nc === "{") {
@@ -514,6 +516,17 @@ class Lexer {
       if (c === "\n") this.line++;
       buf += c;
     }
+  }
+
+  /** Scan a command substitution / process substitution `…( … )`, whose body
+   *  starts `prefixLen` chars after the cursor. Case-pattern `)` aware. */
+  private scanCommandSub(prefixLen: number): string {
+    const end = scanCmdSub(this.s, this.i + prefixLen);
+    if (this.s[end] !== ")") throw new LexError("unterminated `$( ... )`");
+    for (let k = this.i; k <= end; k++) if (this.s[k] === "\n") this.line++;
+    const raw = this.s.slice(this.i, end + 1);
+    this.i = end + 1;
+    return raw;
   }
 
   /** Scan a balanced construct such as `$( ... )`, `${ ... }`, `$(( ... ))`.

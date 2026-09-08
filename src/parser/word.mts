@@ -9,6 +9,8 @@
  * a quoted context) is not subject to field splitting. Literal text never
  * splits. This is the M0–M1 subset of bash's expansion grammar. */
 
+import { scanCmdSub } from "./scan.mts";
+
 /** A parameter reference `$name` / `${...}`, with optional expansion operator. */
 export interface Param {
   name: string; // variable name, or a special/positional: ? $ # @ * 0-9
@@ -151,7 +153,7 @@ class WordParser {
       if ((c === "<" || c === ">") && this.at(1) === "(") {
         this.flushLit();
         this.i += 2; // past `<(` / `>(`
-        this.parts.push({ k: "procsub", dir: c, src: this.balanced(1, "(", ")") });
+        this.parts.push({ k: "procsub", dir: c, src: this.cmdSubSrc() });
         this.anchored = true;
         continue;
       }
@@ -340,7 +342,7 @@ class WordParser {
         return;
       }
       this.i += 2;
-      this.parts.push({ k: "cmdsub", src: this.balanced(1, "(", ")"), quoted });
+      this.parts.push({ k: "cmdsub", src: this.cmdSubSrc(), quoted });
       return;
     }
 
@@ -382,6 +384,16 @@ class WordParser {
   }
 
   /** Copy a balanced construct's inner text; `depth` opens already consumed. */
+  /** Extract a command-substitution body starting at the cursor (already past
+   *  `$(` / `<(` / `>(`), advancing past the terminating `)`. Case-aware. */
+  private cmdSubSrc(): string {
+    const end = scanCmdSub(this.t, this.i);
+    if (this.t[end] !== ")") throw new Error("unterminated `$( ... )`");
+    const src = this.t.slice(this.i, end);
+    this.i = end + 1;
+    return src;
+  }
+
   private balanced(depth: number, open: string, close: string): string {
     let buf = "";
     let d = depth;
