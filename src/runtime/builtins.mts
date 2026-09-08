@@ -11,63 +11,58 @@ import { ExitSignal, LoopSignal, ReturnSignal } from "./types.mts";
 
 export type Builtin = (shell: Shell, ...args: string[]) => number | Promise<number>;
 
+const isHexDigit = (ch: string | undefined): boolean =>
+  ch !== undefined && /[0-9a-fA-F]/.test(ch);
+const isOctDigit = (ch: string | undefined): boolean => ch !== undefined && ch >= "0" && ch <= "7";
+
+/** Decode one C-style backslash escape at `s[i]` (`s[i] === "\\"`). Returns the
+ *  decoded text, the index just past it, and whether it was `\c` (stop). When
+ *  `octalBare` (printf `%b` / a printf format string), `\NNN` without a leading
+ *  0 is octal too; `echo -e` requires the `\0NNN` form. */
+const decodeEscape = (
+  s: string, i: number, octalBare: boolean, cStop: boolean,
+): { text: string; next: number; stop: boolean } => {
+  const e = s[i + 1];
+  if (e === undefined) return { text: "\\", next: i + 1, stop: false };
+  let j = i + 2;
+  const simple: Record<string, string> = {
+    n: "\n", t: "\t", r: "\r", "\\": "\\", a: "\x07", b: "\b", f: "\f", v: "\v", e: "\x1b",
+  };
+  if (e in simple) return { text: simple[e]!, next: j, stop: false };
+  // `\c` ends output for echo -e and printf %b, but is literal in a printf format.
+  if (e === "c" && cStop) return { text: "", next: j, stop: true };
+  if (e === "0" || (octalBare && e >= "1" && e <= "7")) {
+    let oct = e === "0" ? "" : e;
+    while (oct.length < 3 && isOctDigit(s[j])) { oct += s[j]; j++; }
+    return { text: String.fromCharCode((oct === "" ? 0 : parseInt(oct, 8)) & 0xff), next: j, stop: false };
+  }
+  if (e === "x") {
+    let hex = "";
+    while (hex.length < 2 && isHexDigit(s[j])) { hex += s[j]; j++; }
+    if (hex === "") return { text: "\\x", next: j, stop: false };
+    return { text: String.fromCharCode(parseInt(hex, 16) & 0xff), next: j, stop: false };
+  }
+  if (e === "u" || e === "U") {
+    const max = e === "u" ? 4 : 8;
+    let hex = "";
+    while (hex.length < max && isHexDigit(s[j])) { hex += s[j]; j++; }
+    if (hex === "") return { text: "\\" + e, next: j, stop: false };
+    const cp = parseInt(hex, 16);
+    return { text: cp <= 0x10ffff ? String.fromCodePoint(cp) : "�", next: j, stop: false };
+  }
+  return { text: "\\" + e, next: j, stop: false };
+};
+
 /** Process C-style backslash escapes (for `echo -e`, `printf %b`). */
-const unescape = (s: string): { text: string; stop: boolean } => {
+const unescape = (s: string, octalBare = false): { text: string; stop: boolean } => {
   let out = "";
   let i = 0;
   while (i < s.length) {
-    const c = s[i]!;
-    if (c !== "\\" || i + 1 >= s.length) {
-      out += c;
-      i++;
-      continue;
-    }
-    const e = s[i + 1]!;
-    i += 2;
-    const isHex = (ch: string | undefined): boolean =>
-      ch !== undefined && /[0-9a-fA-F]/.test(ch);
-    switch (e) {
-      case "n": out += "\n"; break;
-      case "t": out += "\t"; break;
-      case "r": out += "\r"; break;
-      case "\\": out += "\\"; break;
-      case "a": out += "\x07"; break;
-      case "b": out += "\b"; break;
-      case "f": out += "\f"; break;
-      case "v": out += "\v"; break;
-      case "e": out += "\x1b"; break;
-      case "c": return { text: out, stop: true };
-      case "0": {
-        let oct = "";
-        while (oct.length < 3 && i < s.length && s[i]! >= "0" && s[i]! <= "7") {
-          oct += s[i];
-          i++;
-        }
-        out += String.fromCharCode(oct === "" ? 0 : parseInt(oct, 8) & 0xff);
-        break;
-      }
-      case "x": {
-        // \xHH: one or two hex digits -> a byte. Empty stays literal.
-        let hex = "";
-        while (hex.length < 2 && isHex(s[i])) { hex += s[i]; i++; }
-        if (hex === "") { out += "\\x"; break; }
-        out += String.fromCharCode(parseInt(hex, 16) & 0xff);
-        break;
-      }
-      case "u":
-      case "U": {
-        // \uHHHH (<=4) / \UHHHHHHHH (<=8): a Unicode code point. Empty stays literal.
-        const max = e === "u" ? 4 : 8;
-        let hex = "";
-        while (hex.length < max && isHex(s[i])) { hex += s[i]; i++; }
-        if (hex === "") { out += "\\" + e; break; }
-        const cp = parseInt(hex, 16);
-        out += cp <= 0x10ffff ? String.fromCodePoint(cp) : "�";
-        break;
-      }
-      default:
-        out += "\\" + e;
-    }
+    if (s[i] !== "\\") { out += s[i]; i++; continue; }
+    const r = decodeEscape(s, i, octalBare, true); // echo -e / %b: \c ends output
+    out += r.text;
+    i = r.next;
+    if (r.stop) return { text: out, stop: true };
   }
   return { text: out, stop: false };
 };
@@ -169,13 +164,16 @@ const printf: Builtin = async (shell, ...args) => {
   const nextArg = (): string => (vi < values.length ? values[vi++]! : "");
 
   let out = "";
+  let stopped = false; // a `\c` in the format string or a %b argument ends output
   const once = (): void => {
     let i = 0;
     while (i < fmt.length) {
+      if (stopped) return;
       const c = fmt[i]!;
       if (c === "\\") {
-        out += unescape(fmt.slice(i, i + 2)).text;
-        i += 2;
+        const r = decodeEscape(fmt, i, true, false); // format string: \c is literal
+        out += r.text;
+        i = r.next;
         continue;
       }
       if (c !== "%") {
@@ -261,7 +259,7 @@ const printf: Builtin = async (shell, ...args) => {
       };
       switch (conv) {
         case "s": out += format(nextArg(), false); break;
-        case "b": out += format(unescape(nextArg()).text, false); break;
+        case "b": { const r = unescape(nextArg(), true); out += format(r.text, false); if (r.stop) { stopped = true; return; } break; }
         case "d": case "i": { const n = s64(pfNum(shell, nextArg())); out += format(sign(n, String(n)), true); break; }
         case "u": out += format(String(pfNum(shell, nextArg()) & U64), true); break;
         case "x": out += format(alt("0x", (pfNum(shell, nextArg()) & U64).toString(16)), true); break;
@@ -287,8 +285,12 @@ const printf: Builtin = async (shell, ...args) => {
   };
 
   do {
+    const before = vi;
     once();
-  } while (vi < values.length);
+    // If the format consumed no arguments, don't reuse it (bash avoids the
+    // otherwise-infinite loop for e.g. `printf x y`).
+    if (vi === before) break;
+  } while (vi < values.length && !stopped);
 
   if (target !== null) {
     const m = /^([A-Za-z_][A-Za-z0-9_]*)\[([^\]]*)\]$/.exec(target);
