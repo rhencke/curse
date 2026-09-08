@@ -1139,7 +1139,12 @@ const command: Builtin = async (shell, ...args) => {
     let status = 0;
     for (const name of rest) {
       const kind = classify(shell, name);
-      if (kind === null) { status = 1; continue; }
+      if (kind === null) {
+        // command -V reports the failure; command -v is silent.
+        if (verbose === "V") shell.io.err(`${shell.name}: command: ${name}: not found\n`);
+        status = 1;
+        continue;
+      }
       if (verbose === "v") {
         shell.io.out((kind === "file" ? shell.lookupPath(name)! : name) + "\n");
       } else {
@@ -1159,6 +1164,7 @@ const command: Builtin = async (shell, ...args) => {
 };
 
 const builtinBuiltin: Builtin = async (shell, ...args) => {
+  if (args[0] === "--") args = args.slice(1);
   if (args.length === 0) return 0;
   return shell.runBuiltin(args[0]!, args.slice(1));
 };
