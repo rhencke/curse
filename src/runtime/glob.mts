@@ -228,3 +228,45 @@ export const globExpand = (
   walk(absolute ? 1 : 0, absolute ? "/" : "", absolute ? "/" : cwd);
   return out.sort();
 };
+
+/** Match a produced path against one GLOBIGNORE pattern component-wise, so a
+ *  `*`/`?`/`[…]` never crosses a `/` (bash matches the whole generated name). */
+const ignoreMatchOne = (path: string, pat: string, extglob: boolean): boolean => {
+  const pc = path.split("/");
+  const gc = pat.split("/");
+  return pc.length === gc.length && pc.every((c, i) => globMatch(c, gc[i]!, false, extglob));
+};
+
+/** Split a GLOBIGNORE value on `:`, but not on a colon inside a `[…]` bracket
+ *  expression (including a POSIX `[:class:]`) or after a backslash. */
+const splitIgnorePatterns = (s: string): string[] => {
+  const out: string[] = [];
+  let start = 0;
+  let i = 0;
+  while (i < s.length) {
+    const c = s[i]!;
+    if (c === "\\") { i += 2; continue; }
+    if (c === ":") { out.push(s.slice(start, i)); start = i + 1; i++; continue; }
+    if (c === "[") {
+      let j = i + 1;
+      if (s[j] === "!" || s[j] === "^") j++;
+      if (s[j] === "]") j++; // a leading `]` is a literal member
+      while (j < s.length && s[j] !== "]") {
+        if (s[j] === "[" && (s[j + 1] === ":" || s[j + 1] === "." || s[j + 1] === "=")) {
+          const close = s.indexOf(s[j + 1]! + "]", j + 2);
+          if (close >= 0) { j = close + 2; continue; }
+        }
+        j += s[j] === "\\" ? 2 : 1;
+      }
+      i = j < s.length ? j + 1 : j;
+      continue;
+    }
+    i++;
+  }
+  out.push(s.slice(start));
+  return out;
+};
+
+/** Whether `path` matches any pattern in a colon-separated GLOBIGNORE value. */
+export const globIgnored = (path: string, globignore: string, extglob = false): boolean =>
+  splitIgnorePatterns(globignore).some((pat) => pat !== "" && ignoreMatchOne(path, pat, extglob));

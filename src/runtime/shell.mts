@@ -21,7 +21,7 @@ import { parse } from "../parser/parser.mts";
 import { parseHeredoc } from "../parser/word.mts";
 import { evalParam, expandArith, expandAssign, expandNoSplit, expandParsed, expandWords, expandWordsAssign, splitTaggedFields } from "./expand.mts";
 import { evalArith } from "./arith.mts";
-import { globExpand, globMatch, hasExtglob, hasGlobMeta } from "./glob.mts";
+import { globExpand, globIgnored, globMatch, hasExtglob, hasGlobMeta } from "./glob.mts";
 import {
   changeCase as pChangeCase, replaceGlob as pReplaceGlob, sliceArr as pSliceArr,
   substr as pSubstr, transform as pTransform, trimPrefix as pTrimPrefix, trimSuffix as pTrimSuffix,
@@ -1263,10 +1263,16 @@ export class Shell {
   glob(fields: string[]): string[] {
     if (this.opts.noglob) return fields; // `set -f`: pathname expansion disabled
     const eg = this.shopts.extglob;
+    // GLOBIGNORE (set and non-null): matches are filtered against its patterns,
+    // and its presence enables dotglob so leading-dot names become candidates.
+    const giVar = this.lookup("GLOBIGNORE");
+    const gi = giVar !== undefined && !giVar.unset ? giVar.value : "";
+    const dot = this.shopts.dotglob || gi !== "";
     const out: string[] = [];
     for (const f of fields) {
       if (hasGlobMeta(f) || (eg && hasExtglob(f))) {
-        const m = globExpand(this.cwd, f, this.shopts.dotglob, this.shopts.globstar, eg);
+        let m = globExpand(this.cwd, f, dot, this.shopts.globstar, eg);
+        if (gi !== "") m = m.filter((p) => !globIgnored(p, gi, eg));
         if (m.length > 0) out.push(...m);
         else if (this.shopts.nullglob) continue; // drop patterns that match nothing
         else out.push(f);
