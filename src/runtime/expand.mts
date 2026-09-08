@@ -77,6 +77,22 @@ const isList = (prm: Param): boolean =>
 const listValues = (shell: Shell, prm: Param): string[] =>
   prm.special ? [...shell.positional] : shell.arrayValues(prm.name);
 
+/** `#`/`##`/`%`/`%%`/`/`/`//`/`/#`/`/%` — prefix/suffix/replace string ops. */
+const STR_OPS = new Set(["#", "##", "%", "%%", "/", "//", "/#", "/%"]);
+const applyStrOp = (op: string, v: string, pat: string, repl: string, extglob = false): string => {
+  switch (op) {
+    case "#": return trimPrefix(v, pat, false, extglob);
+    case "##": return trimPrefix(v, pat, true, extglob);
+    case "%": return trimSuffix(v, pat, false, extglob);
+    case "%%": return trimSuffix(v, pat, true, extglob);
+    case "/": return replaceGlob(v, pat, repl, false, "", extglob);
+    case "//": return replaceGlob(v, pat, repl, true, "", extglob);
+    case "/#": return replaceGlob(v, pat, repl, false, "#", extglob);
+    case "/%": return replaceGlob(v, pat, repl, false, "%", extglob);
+    default: return v;
+  }
+};
+
 const evalParam = async (shell: Shell, prm: Param): Promise<string> => {
   // ${!name[@]} / ${!name[*]} — array indices.
   if (prm.indices) return shell.arrayIndices(prm.name).join(" ");
@@ -98,6 +114,13 @@ const evalParam = async (shell: Shell, prm: Param): Promise<string> => {
   if (isCaseOp(prm.op) && isList(prm)) {
     const pat = await expandNoSplit(shell, prm.arg);
     return listValues(shell, prm).map((x) => changeCase(x, prm.op, pat)).join(" ");
+  }
+  // ${arr[@]#pat} / %pat / /pat/repl — string op applied to each element.
+  if (isList(prm) && STR_OPS.has(prm.op)) {
+    const pat = await expandNoSplit(shell, prm.arg);
+    const repl = prm.op[0] === "/" ? await expandNoSplit(shell, prm.arg2) : "";
+    const eg = shell.shopts.extglob;
+    return listValues(shell, prm).map((x) => applyStrOp(prm.op, x, pat, repl, eg)).join(" ");
   }
 
   // Resolve the referenced value (scalar, array element, or all elements).
@@ -213,6 +236,13 @@ export const expandWord = async (shell: Shell, word: Word): Promise<string[]> =>
       if (isCaseOp(p.op) && (p.sub === "@" || (p.special && p.name === "@"))) {
         const pat = await expandNoSplit(shell, p.arg);
         return listValues(shell, p).map((x) => changeCase(x, p.op, pat));
+      }
+      // "${arr[@]#pat}" etc. — string op on each element, one field each.
+      if (STR_OPS.has(p.op) && (p.sub === "@" || (p.special && p.name === "@"))) {
+        const pat = await expandNoSplit(shell, p.arg);
+        const repl = p.op[0] === "/" ? await expandNoSplit(shell, p.arg2) : "";
+        const eg = shell.shopts.extglob;
+        return listValues(shell, p).map((x) => applyStrOp(p.op, x, pat, repl, eg));
       }
     }
   }

@@ -31,6 +31,7 @@ const bump = (s: string): string => s.replace(/^(?=.)/gm, "  ");
 const ASSIGN = /^([A-Za-z_][A-Za-z0-9_]*)(\[([^\]]*)\])?(\+)?=([\s\S]*)$/;
 
 const isCaseOp = (op: string): boolean => op === "^" || op === "^^" || op === "," || op === ",,";
+const STR_OPS = new Set(["#", "##", "%", "%%", "/", "//", "/#", "/%"]);
 const ident = (s: string): boolean => /^[A-Za-z_][A-Za-z0-9_]*$/.test(s);
 const escTemplate = (s: string): string =>
   s.replace(/\\/g, "\\\\").replace(/`/g, "\\`").replace(/\$/g, "\\$");
@@ -123,6 +124,22 @@ class Emitter {
   private listExpr(prm: Param): string {
     return prm.special ? "sh.positional" : `sh.arrayValues(${JSON.stringify(prm.name)})`;
   }
+  /** A `#`/`%`/`/` string op applied to subject expression `subj`. */
+  private strOpExpr(prm: Param, subj: string): string {
+    const arg = this.templateOf(parseWord(prm.arg).parts);
+    const arg2 = this.templateOf(parseWord(prm.arg2).parts);
+    switch (prm.op) {
+      case "#": return `sh.trimPrefix(${subj}, ${arg}, false)`;
+      case "##": return `sh.trimPrefix(${subj}, ${arg}, true)`;
+      case "%": return `sh.trimSuffix(${subj}, ${arg}, false)`;
+      case "%%": return `sh.trimSuffix(${subj}, ${arg}, true)`;
+      case "/": return `sh.replaceGlob(${subj}, ${arg}, ${arg2}, false, "")`;
+      case "//": return `sh.replaceGlob(${subj}, ${arg}, ${arg2}, true, "")`;
+      case "/#": return `sh.replaceGlob(${subj}, ${arg}, ${arg2}, false, "#")`;
+      case "/%": return `sh.replaceGlob(${subj}, ${arg}, ${arg2}, false, "%")`;
+      default: return subj;
+    }
+  }
 
   private paramExpr(prm: Param): string {
     const J = JSON.stringify;
@@ -143,6 +160,10 @@ class Emitter {
         return `${this.listExpr(prm)}.map((x) => sh.changeCase(x, ${J(prm.op)}, ${pat})).join(" ")`;
       }
       return `sh.changeCase(String(${base}), ${J(prm.op)}, ${pat})`;
+    }
+    // ${arr[@]#pat} / %pat / /pat/repl — apply the string op to each element.
+    if (this.isList(prm) && STR_OPS.has(prm.op)) {
+      return `${this.listExpr(prm)}.map((x) => ${this.strOpExpr(prm, "x")}).join(" ")`;
     }
     const arg = (): string => this.templateOf(parseWord(prm.arg).parts);
     const arg2 = (): string => this.templateOf(parseWord(prm.arg2).parts);
@@ -225,6 +246,10 @@ class Emitter {
       // "${arr[@]@op}" / "${@@op}" — transform each element, one field each.
       if (p.p.op.startsWith("@") && (p.p.sub === "@" || (p.p.special && p.p.name === "@"))) {
         return `${this.listExpr(p.p)}.map((x) => sh.transform(${JSON.stringify(p.p.op)}, x))`;
+      }
+      // "${arr[@]#pat}" etc. — string op on each element, one field each.
+      if (STR_OPS.has(p.p.op) && (p.p.sub === "@" || (p.p.special && p.p.name === "@"))) {
+        return `${this.listExpr(p.p)}.map((x) => ${this.strOpExpr(p.p, "x")})`;
       }
       if (p.p.names === "@") return `sh.matchNames(${JSON.stringify(p.p.name)})`;
       // "${arr[@]^^}" etc. — case-modify each element, one field each.
