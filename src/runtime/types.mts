@@ -25,6 +25,11 @@ export class Var {
   /** Declared but unset (e.g. `local x`): occupies scope for shadowing, but
    *  reads as unset until a value is assigned. */
   unset = false;
+  /** Cached integer value of `value` for arithmetic reads: `iv` is valid only
+   *  while `ivStr === value`, so a plain-integer variable in an arith loop is
+   *  neither re-parsed nor round-tripped through a string. */
+  iv: bigint = 0n;
+  ivStr: string | null = null;
   constructor(value: string, exported = false) {
     this.value = value;
     this.exported = exported;

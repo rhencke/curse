@@ -332,6 +332,11 @@ export class Shell {
    *  a `base[subscript]` target (a nameref to an array element), reported via
    *  `sub`. */
   private resolveRef(name: string): { name: string; sub: string | null } {
+    // Fast path: the overwhelmingly common case is a plain (non-nameref)
+    // variable — one lookup, no cycle-guard Set allocation.
+    const first = this.rawLookup(name);
+    if (!(first && first.ref && first.value !== "")) return { name, sub: null };
+    // Nameref chain — guard against cycles.
     const seen = new Set<string>();
     let cur = name;
     for (;;) {
@@ -404,19 +409,24 @@ export class Shell {
   }
 
   private assign(name: string, value: unknown): void {
+    this.assignVar(name, value);
+  }
+  /** Core scalar write; returns the Var it wrote (for the arith cache), or
+   *  undefined when the write went elsewhere (a nameref element, or was refused). */
+  private assignVar(name: string, value: unknown): Var | undefined {
     if (value instanceof Var) {
       this.scope[name] = value;
-      return;
+      return value;
     }
     const r = this.resolveRef(name); // write through a nameref to its target
-    if (r.sub !== null) { this.setElemSync(r.name, r.sub, String(value)); return; }
+    if (r.sub !== null) { this.setElemSync(r.name, r.sub, String(value)); return undefined; }
     name = r.name;
     const s = String(value);
     const owner = this.ownerScope(name);
     if (owner && owner[name]!.readonly) {
       this.io.err(`${this.name}: ${name}: readonly variable\n`);
       this.readonlyHit = true;
-      return;
+      return undefined;
     }
     if (owner) {
       const v = owner[name]!;
@@ -425,9 +435,11 @@ export class Shell {
       else if (v.arr !== null) v.arr.set(0, cs);
       else v.value = cs;
       v.unset = false;
-    } else {
-      this.globalScope[name] = new Var(s, process.env[name] !== undefined);
+      return v;
     }
+    const nv = new Var(s, process.env[name] !== undefined);
+    this.globalScope[name] = nv;
+    return nv;
   }
 
   /** Apply a variable's attributes (-i/-l/-u) to a value being stored. */
@@ -937,25 +949,42 @@ export class Shell {
   /** Read a scalar as an arithmetic value (a variable's string is re-evaluated
    *  as arithmetic; empty/unset is 0). */
   aget(name: string): bigint {
+    const v = this.rawLookup(name);
+    if (v === undefined) return 0n;
+    if (v.ref && v.value !== "") return this.agetSlow(name); // nameref → full path
+    if (v.unset) return 0n;
+    const s = v.scalar();
+    if (s === v.ivStr) return v.iv; // cache hit: no re-parse, no string round-trip
+    if (s === "") return 0n;
+    const r = this.parseArithInt(s);
+    v.iv = r;
+    v.ivStr = s;
+    return r;
+  }
+  /** Nameref / element-nameref arithmetic read (rare; no scalar cache). */
+  private agetSlow(name: string): bigint {
     const raw = this.getVar(name);
-    if (raw === undefined) return 0n;
-    const t = raw.trim();
-    if (t === "") return 0n;
+    return raw === undefined || raw.trim() === "" ? 0n : this.parseArithInt(raw);
+  }
+  private parseArithInt(s: string): bigint {
+    const t = s.trim();
     // Fast path: a plain decimal integer (no leading-zero octal / 0x hex
-    // ambiguity) is the overwhelmingly common case — skip the arith re-parse.
+    // ambiguity) — a direct cast, skipping the full arithmetic re-parse.
     if (/^-?(0|[1-9][0-9]*)$/.test(t)) return arithWrap(BigInt(t));
-    return evalArith(this, raw);
+    return evalArith(this, s);
   }
   /** Assign a scalar arithmetic value; returns it (already wrapped by caller). */
   aset(name: string, v: bigint): bigint {
-    this.setVar(name, v.toString());
+    const str = v.toString();
+    const box = this.assignVar(name, str);
+    if (box !== undefined && box.value === str) { box.iv = v; box.ivStr = str; }
     return v;
   }
   /** `x++` / `++x` / `x--` / `--x` on a scalar; returns the pre/post value. */
   ainc(name: string, delta: bigint, post: boolean): bigint {
     const cur = this.aget(name);
     const nv = arithWrap(cur + delta);
-    this.setVar(name, nv.toString());
+    this.aset(name, nv);
     return post ? cur : nv;
   }
   adiv(l: bigint, r: bigint): bigint {
