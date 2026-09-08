@@ -80,7 +80,14 @@ const echo: Builtin = (shell, ...args) => {
   return 0;
 };
 
-const printf: Builtin = (shell, ...args) => {
+const printf: Builtin = async (shell, ...args) => {
+  // -v VAR: capture the output into a variable (or array element) instead
+  // of writing it to stdout.
+  let target: string | null = null;
+  if (args[0] === "-v") {
+    target = args[1] ?? "";
+    args = args.slice(2);
+  }
   if (args.length === 0) {
     shell.io.err("printf: usage: printf [-v var] format [arguments]\n");
     return 2;
@@ -111,11 +118,16 @@ const printf: Builtin = (shell, ...args) => {
         i = j + 1;
         continue;
       }
-      while (j < fmt.length && "-+ 0#".includes(fmt[j]!)) j++;
-      while (j < fmt.length && fmt[j]! >= "0" && fmt[j]! <= "9") j++;
+      let flags = "";
+      while (j < fmt.length && "-+ 0#".includes(fmt[j]!)) flags += fmt[j++]!;
+      let width = "";
+      while (j < fmt.length && fmt[j]! >= "0" && fmt[j]! <= "9") width += fmt[j++]!;
+      let prec = "";
+      let hasPrec = false;
       if (fmt[j] === ".") {
+        hasPrec = true;
         j++;
-        while (j < fmt.length && fmt[j]! >= "0" && fmt[j]! <= "9") j++;
+        while (j < fmt.length && fmt[j]! >= "0" && fmt[j]! <= "9") prec += fmt[j++]!;
       }
       const conv = fmt[j];
       if (conv === undefined) {
@@ -123,15 +135,46 @@ const printf: Builtin = (shell, ...args) => {
         i = fmt.length;
         break;
       }
+      // Apply precision (string truncation / numeric min-digits) then width
+      // padding (left `-`, zero `0`, else spaces), matching C printf.
+      const format = (s: string, numeric: boolean): string => {
+        if (hasPrec) {
+          const p = prec === "" ? 0 : parseInt(prec, 10);
+          if (numeric) {
+            const neg = s.startsWith("-") || s.startsWith("+") || s.startsWith(" ");
+            const sign = neg ? s[0]! : "";
+            let d = neg ? s.slice(1) : s;
+            while (d.length < p) d = "0" + d;
+            s = sign + d;
+          } else {
+            s = s.slice(0, p);
+          }
+        }
+        const w = width === "" ? 0 : parseInt(width, 10);
+        if (s.length >= w) return s;
+        const fill = w - s.length;
+        if (flags.includes("-")) return s + " ".repeat(fill);
+        if (flags.includes("0") && numeric && !hasPrec) {
+          const signed = s.startsWith("-") || s.startsWith("+") || s.startsWith(" ");
+          return signed ? s[0]! + "0".repeat(fill) + s.slice(1) : "0".repeat(fill) + s;
+        }
+        return " ".repeat(fill) + s;
+      };
+      const signed = (n: number): string => {
+        const s = String(n);
+        if (n >= 0 && flags.includes("+")) return "+" + s;
+        if (n >= 0 && flags.includes(" ")) return " " + s;
+        return s;
+      };
       switch (conv) {
-        case "s": out += nextArg(); break;
-        case "b": out += unescape(nextArg()).text; break;
-        case "d": case "i": out += String(toInt(nextArg())); break;
-        case "u": out += String(toInt(nextArg()) >>> 0); break;
-        case "x": out += (toInt(nextArg()) >>> 0).toString(16); break;
-        case "X": out += (toInt(nextArg()) >>> 0).toString(16).toUpperCase(); break;
-        case "o": out += (toInt(nextArg()) >>> 0).toString(8); break;
-        case "c": out += nextArg().slice(0, 1); break;
+        case "s": out += format(nextArg(), false); break;
+        case "b": out += format(unescape(nextArg()).text, false); break;
+        case "d": case "i": out += format(signed(toInt(nextArg())), true); break;
+        case "u": out += format(String(toInt(nextArg()) >>> 0), true); break;
+        case "x": out += format((toInt(nextArg()) >>> 0).toString(16), true); break;
+        case "X": out += format((toInt(nextArg()) >>> 0).toString(16).toUpperCase(), true); break;
+        case "o": out += format((toInt(nextArg()) >>> 0).toString(8), true); break;
+        case "c": out += format(nextArg().slice(0, 1), false); break;
         default: out += "%" + conv;
       }
       i = j + 1;
@@ -142,6 +185,12 @@ const printf: Builtin = (shell, ...args) => {
     once();
   } while (vi < values.length);
 
+  if (target !== null) {
+    const m = /^([A-Za-z_][A-Za-z0-9_]*)\[([^\]]*)\]$/.exec(target);
+    if (m) await shell.elemSet(m[1]!, m[2]!, out);
+    else shell.setVar(target, out);
+    return 0;
+  }
   shell.io.out(out);
   return 0;
 };
