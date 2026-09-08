@@ -667,18 +667,25 @@ const readonlyBuiltin: Builtin = (shell, ...args) => {
 };
 
 const setBuiltin: Builtin = (shell, ...args) => {
+  // `set` with no arguments lists all shell variables.
+  if (args.length === 0) {
+    for (const line of shell.varListing()) shell.io.out(line + "\n");
+    return 0;
+  }
   const opt = (name: string, on: boolean): void => {
     if (name === "errexit") shell.opts.errexit = on;
     else if (name === "nounset") shell.opts.nounset = on;
     else if (name === "xtrace") shell.opts.xtrace = on;
     else if (name === "pipefail") shell.opts.pipefail = on;
     else if (name === "noclobber") shell.opts.noclobber = on;
+    else if (name === "noglob") shell.opts.noglob = on;
   };
   const flag = (ch: string, on: boolean): void => {
     if (ch === "e") opt("errexit", on);
     else if (ch === "u") opt("nounset", on);
     else if (ch === "x") opt("xtrace", on);
     else if (ch === "C") opt("noclobber", on);
+    else if (ch === "f") opt("noglob", on);
   };
 
   let i = 0;
@@ -926,28 +933,56 @@ const builtinBuiltin: Builtin = async (shell, ...args) => {
 const shopt: Builtin = (shell, ...args) => {
   let mode: "s" | "u" | "" = "";
   let quiet = false;
+  let print = false;
+  let oflag = false; // -o: operate on `set -o` options, not shopt options
   const names: string[] = [];
   for (const a of args) {
     if (a === "-s") mode = "s";
     else if (a === "-u") mode = "u";
     else if (a === "-q") quiet = true;
-    else if (a === "-p" || a === "-o") continue; // -o (set-style) unsupported
+    else if (a === "-p") print = true;
+    else if (a === "-o") oflag = true;
+    else if (a.startsWith("-") && a.length > 1) continue;
     else names.push(a);
   }
-  const show = (n: string): void => {
-    if (!quiet) shell.io.out(`${n.padEnd(15)}\t${shell.shopts[n] ? "on" : "off"}\n`);
+  // `set -o` option namespace mapped onto shell.opts; unlisted ones are fixed.
+  const setOpts: Record<string, boolean> = {
+    braceexpand: true, emacs: false, errexit: shell.opts.errexit, errtrace: false,
+    functrace: false, hashall: true, histexpand: false, history: false,
+    ignoreeof: false, keyword: false, monitor: false, noclobber: shell.opts.noclobber,
+    noexec: false, noglob: shell.opts.noglob, notify: false, nounset: shell.opts.nounset,
+    onecmd: false, physical: false, pipefail: shell.opts.pipefail, posix: false,
+    verbose: false, vi: false, xtrace: shell.opts.xtrace,
   };
+  const setSetOpt = (n: string, on: boolean): void => {
+    if (n === "errexit") shell.opts.errexit = on;
+    else if (n === "nounset") shell.opts.nounset = on;
+    else if (n === "xtrace") shell.opts.xtrace = on;
+    else if (n === "pipefail") shell.opts.pipefail = on;
+    else if (n === "noclobber") shell.opts.noclobber = on;
+    else if (n === "noglob") shell.opts.noglob = on;
+  };
+  const state = (n: string): boolean | undefined => (oflag ? setOpts[n] : shell.shopts[n]);
+  const line = (n: string, on: boolean): string =>
+    print
+      ? oflag ? `set ${on ? "-" : "+"}o ${n}\n` : `shopt -${on ? "s" : "u"} ${n}\n`
+      : `${n.padEnd(15)}\t${on ? "on" : "off"}\n`;
+
   if (mode === "") {
-    // Query / print. `shopt` or `shopt -q` returns 0 iff all named are set.
-    const list = names.length > 0 ? names : Object.keys(shell.shopts).sort();
+    // Query / print. `shopt`/`shopt -q` returns 0 iff every named option is set.
+    const list = names.length > 0 ? names : Object.keys(oflag ? setOpts : shell.shopts).sort();
     let status = 0;
     for (const n of list) {
-      show(n);
-      if (!shell.shopts[n]) status = 1;
+      const on = state(n) ?? false;
+      if (!quiet) shell.io.out(line(n, on));
+      if (!on) status = 1;
     }
     return status;
   }
-  for (const n of names) shell.shopts[n] = mode === "s";
+  for (const n of names) {
+    if (oflag) setSetOpt(n, mode === "s");
+    else shell.shopts[n] = mode === "s";
+  }
   return 0;
 };
 

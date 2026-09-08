@@ -95,6 +95,28 @@ const declareQuote = (v: string): string => {
   return '"' + v.replace(/[\\"$`]/g, "\\$&") + '"';
 };
 
+/** Quote a value the way `set` (no args) prints it: bare when safe, `$'…'` for
+ *  control characters, otherwise single-quoted. */
+const setQuote = (v: string): string => {
+  if (v === "") return "";
+  if (/[\x00-\x1f\x7f]/.test(v)) {
+    let s = "$'";
+    for (const ch of v) {
+      const code = ch.charCodeAt(0);
+      if (ch === "\\") s += "\\\\";
+      else if (ch === "'") s += "\\'";
+      else if (ch === "\n") s += "\\n";
+      else if (ch === "\t") s += "\\t";
+      else if (ch === "\r") s += "\\r";
+      else if (code < 0x20 || code === 0x7f) s += "\\" + code.toString(8).padStart(3, "0");
+      else s += ch;
+    }
+    return s + "'";
+  }
+  if (/^[A-Za-z0-9_.,:/=@%+-]+$/.test(v)) return v;
+  return "'" + v.replace(/'/g, "'\\''") + "'";
+};
+
 /** Index just past the `$…` expansion at `i` (raw[i] === "$"), else `i`. */
 const expansionEnd = (raw: string, i: number): number => {
   const n = raw[i + 1];
@@ -169,7 +191,7 @@ export class Shell {
   private nextPid = 10000;
 
   /** `set` options. */
-  opts = { errexit: false, nounset: false, xtrace: false, pipefail: false, noclobber: false };
+  opts = { errexit: false, nounset: false, xtrace: false, pipefail: false, noclobber: false, noglob: false };
   /** Depth of errexit-suppressed contexts (conditions, `!`, `&&`/`||` non-final). */
   condDepth = 0;
   /** Enclosing loop nesting in the current function scope (0 outside any loop).
@@ -371,6 +393,28 @@ export class Shell {
     const v = this.rawLookup(r.name);
     if (v === undefined || v.unset) return undefined;
     return v.scalar();
+  }
+
+  /** `set` with no args: every visible variable as a sorted `name=value` line
+   *  (bash's quoting; arrays as `name=([i]="v" …)`). */
+  varListing(): string[] {
+    const out: string[] = [];
+    for (const name of this.matchNames("")) {
+      if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(name)) continue;
+      const v = this.lookup(name);
+      if (v === undefined || v.unset || v.ref) continue;
+      if (v.assoc !== null) {
+        const body = [...v.assoc.entries()].map(([k, val]) => `[${k}]=${declareQuote(val)}`).join(" ");
+        out.push(`${name}=(${body})`);
+      } else if (v.arr !== null) {
+        const body = [...v.arr.entries()].sort((a, b) => a[0] - b[0])
+          .map(([i, val]) => `[${i}]=${declareQuote(val)}`).join(" ");
+        out.push(`${name}=(${body})`);
+      } else {
+        out.push(`${name}=${setQuote(v.value)}`);
+      }
+    }
+    return out;
   }
 
   /** `${!prefix*}` / `${!prefix@}` — set variable names sharing a prefix. */
@@ -1105,6 +1149,7 @@ export class Shell {
    *  containing a glob metacharacter is replaced by its sorted matches, or kept
    *  literal if none match. Shared by interpreter and generated code. */
   glob(fields: string[]): string[] {
+    if (this.opts.noglob) return fields; // `set -f`: pathname expansion disabled
     const eg = this.shopts.extglob;
     const out: string[] = [];
     for (const f of fields) {
@@ -1357,10 +1402,12 @@ export class Shell {
   optionFlags(): string {
     let s = "";
     if (this.opts.errexit) s += "e";
+    if (this.opts.noglob) s += "f";
     s += "h";
     if (this.opts.nounset) s += "u";
     if (this.opts.xtrace) s += "x";
     s += "B";
+    if (this.opts.noclobber) s += "C";
     return s;
   }
 
