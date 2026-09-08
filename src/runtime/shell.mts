@@ -19,7 +19,7 @@ import type {
 import { CMD_INVERT_RETURN } from "../ast/nodes.mts";
 import { parse } from "../parser/parser.mts";
 import { parseHeredoc } from "../parser/word.mts";
-import { evalParam, expandArith, expandAssign, expandNoSplit, expandParsed, expandWords, splitTaggedFields } from "./expand.mts";
+import { evalParam, expandArith, expandAssign, expandNoSplit, expandParsed, expandWords, expandWordsAssign, splitTaggedFields } from "./expand.mts";
 import { evalArith } from "./arith.mts";
 import { globExpand, globMatch, hasExtglob, hasGlobMeta } from "./glob.mts";
 import {
@@ -59,6 +59,9 @@ interface RedirIO {
 
 /** An assignment word: name(1), optional `[sub(3)]`(2), optional `+`(4), value(5). */
 const ASSIGN = /^([A-Za-z_][A-Za-z0-9_]*)(\[([^\]]*)\])?(\+)?=([\s\S]*)$/;
+
+/** Builtins whose `name=value` operands are assignment words (RHS not split/globbed). */
+const ASSIGN_BUILTINS = new Set(["declare", "typeset", "local", "export", "readonly"]);
 
 const errMsg = (e: unknown): string => (e instanceof Error ? e.message : String(e));
 
@@ -1818,7 +1821,9 @@ export class Shell {
       return this.status;
     }
     const subBefore = this.subCount;
-    const argv = await expandWords(this, rest);
+    const argv = ASSIGN_BUILTINS.has(rest[0]!.text)
+      ? await expandWordsAssign(this, rest)
+      : await expandWords(this, rest);
     if (argv.length === 0) {
       // An empty command (every word expanded away) takes the status of the
       // last command substitution that ran during expansion, else 0 — but $?

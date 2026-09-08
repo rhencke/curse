@@ -311,6 +311,20 @@ export const expandWords = async (shell: Shell, words: Word[]): Promise<string[]
   return argv;
 };
 
+const ASSIGN_WORD = /^[A-Za-z_][A-Za-z0-9_]*(\[[^\]]*\])?\+?=/;
+/** Expand the words of an assignment-builtin command (declare/local/export/…):
+ *  a `name=value` operand is an assignment word (its RHS is not field-split or
+ *  globbed), while the command name, flags, and other args expand normally. */
+export const expandWordsAssign = async (shell: Shell, words: Word[]): Promise<string[]> => {
+  const argv: string[] = [];
+  for (let j = 0; j < words.length; j++) {
+    const w = words[j]!;
+    if (j > 0 && ASSIGN_WORD.test(w.text)) argv.push(await expandNoSplit(shell, w.text));
+    else for (const t of braceExpand(w.text)) argv.push(...(await expandWord(shell, makeWordLocal(t))));
+  }
+  return argv;
+};
+
 const makeWordLocal = (text: string): Word => ({ text, flags: 0 });
 
 /** Expand text with no field splitting (assignment RHS, arithmetic operands). */

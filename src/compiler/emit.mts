@@ -30,6 +30,9 @@ const bump = (s: string): string => s.replace(/^(?=.)/gm, "  ");
 /** An assignment word: name(1), optional `[sub(3)]`(2), optional `+`(4), value(5). */
 const ASSIGN = /^([A-Za-z_][A-Za-z0-9_]*)(\[([^\]]*)\])?(\+)?=([\s\S]*)$/;
 
+/** Builtins whose `name=value` operands are assignment words (RHS not split/globbed). */
+const ASSIGN_BUILTINS = new Set(["declare", "typeset", "local", "export", "readonly"]);
+
 const isCaseOp = (op: string): boolean => op === "^" || op === "^^" || op === "," || op === ",,";
 const STR_OPS = new Set(["#", "##", "%", "%%", "/", "//", "/#", "/%"]);
 
@@ -485,7 +488,11 @@ class Emitter {
     const texts: string[] = [];
     for (const w of rest) for (const t of braceExpand(w.text)) texts.push(t);
     const nameText = texts[0]!;
-    const argFrags = texts.slice(1).map((t) => this.word(t).code);
+    // For assignment builtins, a `name=value` operand is an assignment word: its
+    // RHS is not field-split or globbed (bash), so emit it as a scalar template.
+    const assignBuiltin = ASSIGN_BUILTINS.has(nameText);
+    const argFrags = texts.slice(1).map((t) =>
+      assignBuiltin && ASSIGN.test(t) ? this.templateOf(parseWord(t).parts) : this.word(t).code);
     const npw = parseWord(nameText);
     const literal =
       npw.parts.length === 1 && npw.parts[0]!.k === "lit" ? npw.parts[0]!.s : null;
