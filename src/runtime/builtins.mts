@@ -7,7 +7,7 @@
 import { resolve } from "node:path";
 import { accessSync, constants, lstatSync, statSync } from "node:fs";
 import type { Shell } from "./shell.mts";
-import { ExitSignal, ReturnSignal } from "./types.mts";
+import { ExitSignal, LoopSignal, ReturnSignal } from "./types.mts";
 
 export type Builtin = (shell: Shell, ...args: string[]) => number | Promise<number>;
 
@@ -270,6 +270,15 @@ const shift: Builtin = (shell, ...args) => {
   if (n < 0 || n > shell.positional.length) return 1;
   shell.positional = shell.positional.slice(n);
   return 0;
+};
+
+const breakBuiltin: Builtin = (shell, ...args) => {
+  if (shell.loopDepth <= 0) return 0; // no-op outside a loop (bash warns to stderr)
+  throw new LoopSignal("break", args.length > 0 ? Math.max(1, toInt(args[0]!)) : 1);
+};
+const continueBuiltin: Builtin = (shell, ...args) => {
+  if (shell.loopDepth <= 0) return 0;
+  throw new LoopSignal("continue", args.length > 0 ? Math.max(1, toInt(args[0]!)) : 1);
 };
 
 const getopts: Builtin = (shell, ...args) => {
@@ -815,6 +824,8 @@ export const builtins: Record<string, Builtin> = {
   return: returnBuiltin,
   exit: exitBuiltin,
   shift,
+  break: breakBuiltin,
+  continue: continueBuiltin,
   getopts,
   wait,
   set: setBuiltin,

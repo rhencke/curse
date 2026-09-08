@@ -27,7 +27,7 @@ import {
   substr as pSubstr, transform as pTransform, trimPrefix as pTrimPrefix, trimSuffix as pTrimSuffix,
 } from "./param.mts";
 import { builtins } from "./builtins.mts";
-import { ExitSignal, ReturnSignal, Var } from "./types.mts";
+import { ExitSignal, LoopSignal, ReturnSignal, Var } from "./types.mts";
 import type { IO } from "./types.mts";
 import { spawn } from "node:child_process";
 import {
@@ -38,7 +38,7 @@ import { join, resolve } from "node:path";
 import { tmpdir } from "node:os";
 
 export type { IO } from "./types.mts";
-export { ExitSignal, ReturnSignal, Var } from "./types.mts";
+export { ExitSignal, LoopSignal, ReturnSignal, Var } from "./types.mts";
 
 const defaultIO = (): IO => ({
   out: (s) => void process.stdout.write(s),
@@ -105,6 +105,7 @@ const runBody = async (sub: Shell, fn: (sh: Shell) => Promise<unknown>): Promise
     await fn(sub);
   } catch (e) {
     if (e instanceof ExitSignal) sub.status = e.code;
+    else if (e instanceof LoopSignal) { /* break/continue does not cross a subshell */ }
     else throw e;
   }
   return sub.status;
@@ -147,6 +148,9 @@ export class Shell {
   opts = { errexit: false, nounset: false, xtrace: false, pipefail: false };
   /** Depth of errexit-suppressed contexts (conditions, `!`, `&&`/`||` non-final). */
   condDepth = 0;
+  /** Enclosing loop nesting in the current function scope (0 outside any loop).
+   *  break/continue are a no-op unless this is positive; reset across functions. */
+  loopDepth = 0;
 
   private globalScope: Scope = Object.create(null) as Scope;
   private scope: Scope = this.globalScope;
@@ -575,16 +579,22 @@ export class Shell {
   private async invokeFunc(body: (sh: Shell) => Promise<void>, args: string[]): Promise<number> {
     const savedScope = this.scope;
     const savedPos = this.positional;
+    const savedLoopDepth = this.loopDepth;
     this.scope = Object.create(savedScope) as Scope;
     this.positional = args;
+    this.loopDepth = 0; // break/continue in the function only see its own loops
     try {
       await body(this);
     } catch (e) {
+      // ReturnSignal ends the function; a break/continue that reached here
+      // escaped its loops — swallow it rather than crossing the call boundary.
       if (e instanceof ReturnSignal) this.status = e.code;
+      else if (e instanceof LoopSignal) { /* no-op */ }
       else throw e;
     } finally {
       this.scope = savedScope;
       this.positional = savedPos;
+      this.loopDepth = savedLoopDepth;
     }
     return this.status;
   }
@@ -1143,6 +1153,7 @@ export class Shell {
         this.status = e.code;
         return e.code;
       }
+      if (e instanceof LoopSignal) return this.status; // break/continue outside a loop
       throw e;
     }
   }
@@ -1371,12 +1382,34 @@ export class Shell {
     return 0;
   }
 
+  /** Run a loop body once, consuming this level's share of a break/continue N.
+   *  Returns "break"/"continue" to act on here, or null to fall through. */
+  private async loopStep(body: Command): Promise<"break" | "continue" | null> {
+    try {
+      await this.execute(body);
+      return null;
+    } catch (e) {
+      if (e instanceof LoopSignal) {
+        if (--e.count > 0) throw e; // outer loop's turn
+        return e.kind;
+      }
+      throw e;
+    }
+  }
+
   private async execWhile(cmd: WhileCommand): Promise<number> {
     let last = 0;
-    for (;;) {
-      const s = await this.condition(cmd.test);
-      if (cmd.until ? s === 0 : s !== 0) break;
-      last = await this.execute(cmd.body);
+    this.loopDepth++;
+    try {
+      for (;;) {
+        const s = await this.condition(cmd.test);
+        if (cmd.until ? s === 0 : s !== 0) break;
+        const sig = await this.loopStep(cmd.body);
+        last = this.status;
+        if (sig === "break") break;
+      }
+    } finally {
+      this.loopDepth--;
     }
     this.status = last;
     return last;
@@ -1385,9 +1418,16 @@ export class Shell {
   private async execFor(cmd: ForCommand): Promise<number> {
     const items = await expandWords(this, cmd.words);
     let last = 0;
-    for (const item of items) {
-      this.setVar(cmd.name, item);
-      last = await this.execute(cmd.body);
+    this.loopDepth++;
+    try {
+      for (const item of items) {
+        this.setVar(cmd.name, item);
+        const sig = await this.loopStep(cmd.body);
+        last = this.status;
+        if (sig === "break") break;
+      }
+    } finally {
+      this.loopDepth--;
     }
     this.status = last;
     return last;
@@ -1436,17 +1476,23 @@ export class Shell {
 
   private async execArithFor(cmd: ArithForCommand): Promise<number> {
     let last = 0;
+    this.loopDepth++;
     try {
       await this.arithRun(cmd.init);
       for (;;) {
         if (!(await this.arithTest(cmd.test))) break;
-        last = await this.execute(cmd.body);
+        const sig = await this.loopStep(cmd.body);
+        last = this.status;
+        if (sig === "break") break;
         await this.arithRun(cmd.step);
       }
     } catch (e) {
+      if (e instanceof LoopSignal || e instanceof ReturnSignal || e instanceof ExitSignal) throw e;
       this.io.err(`${this.name}: ((: ${errMsg(e)}\n`);
       this.status = 1;
       return 1;
+    } finally {
+      this.loopDepth--;
     }
     this.status = last;
     return last;

@@ -51,3 +51,14 @@ export class ExitSignal {
     this.code = code;
   }
 }
+
+/** Thrown by `break`/`continue`; a loop consumes one level, rethrowing while
+ *  `count` (break N / continue N) remains above 1. */
+export class LoopSignal {
+  kind: "break" | "continue";
+  count: number;
+  constructor(kind: "break" | "continue", count: number) {
+    this.kind = kind;
+    this.count = count;
+  }
+}
