@@ -35,6 +35,7 @@ interface WordCode {
 
 class Emitter {
   private forId = 0;
+  private caseId = 0;
 
   /* ---------------- words ---------------- */
 
@@ -225,8 +226,28 @@ class Emitter {
         );
       case "arith":
         return `${i}await sh.arithCommand(${JSON.stringify(cmd.expression)});`;
-      default:
-        throw new Error(`command type \`${cmd.type}\` not supported yet`);
+      case "case": {
+        const id = this.caseId++;
+        const subj = this.templateOf(parseWord(cmd.word.text).parts);
+        let chain = "";
+        cmd.clauses.forEach((clause, ci) => {
+          const cond = clause.patterns
+            .map((p) => `sh.match(__case${id}, ${this.templateOf(parseWord(p.text).parts)})`)
+            .join(" || ");
+          const body = clause.body
+            ? this.command(clause.body, ind + 2)
+            : `${pad(ind + 2)}sh.status = 0;`;
+          const block = `(${cond}) {\n${body}\n${pad(ind + 1)}}`;
+          chain += ci === 0 ? `${pad(ind + 1)}if ${block}` : ` else if ${block}`;
+        });
+        const head = `${pad(ind + 1)}const __case${id} = ${subj};\n${pad(ind + 1)}sh.status = 0;`;
+        const inner = chain === "" ? head : head + "\n" + chain;
+        return `${i}{\n${inner}\n${i}}`;
+      }
+      default: {
+        const unhandled: never = cmd;
+        throw new Error(`unhandled command type: ${String(unhandled)}`);
+      }
     }
   }
 }

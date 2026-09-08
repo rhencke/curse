@@ -85,7 +85,10 @@ class Lexer {
 
     // Operators (M0 subset).
     if (c === ";") {
-      if (this.at(1) === ";") throw new LexError("`;;` (case) not supported yet");
+      if (this.at(1) === ";") {
+        this.i += 2;
+        return { type: "OP", value: ";;", pos, line };
+      }
       this.i++;
       return { type: "OP", value: ";", pos, line };
     }
@@ -101,7 +104,8 @@ class Lexer {
         this.i += 2;
         return { type: "OP", value: "||", pos, line };
       }
-      throw new LexError("pipelines `|` not supported yet (planned for M3)");
+      this.i++;
+      return { type: "OP", value: "|", pos, line };
     }
     if (c === "<" || c === ">") {
       throw new LexError(`redirection \`${c}\` not supported yet (planned for M3)`);

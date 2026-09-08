@@ -11,7 +11,7 @@
  * does; used elsewhere they are ordinary words. Pipelines, redirections, `&`,
  * and `case` arrive in later milestones. */
 
-import type { Command, Word } from "../ast/nodes.mts";
+import type { CasePattern, Command, Word } from "../ast/nodes.mts";
 import { CMD_INVERT_RETURN, connection, makeWord, simple } from "../ast/nodes.mts";
 import { tokenize } from "./lexer.mts";
 import type { Token } from "./lexer.mts";
@@ -30,6 +30,7 @@ const FI: TermSet = { words: new Set(["fi"]) };
 const ELIF_ELSE_FI: TermSet = { words: new Set(["elif", "else", "fi"]) };
 const CLOSE_BRACE: TermSet = { words: new Set(["}"]) };
 const CLOSE_PAREN: TermSet = { ops: new Set([")"]) };
+const CASE_TERM: TermSet = { words: new Set(["esac"]), ops: new Set([";;"]) };
 const TOP: TermSet = {};
 
 const RESERVED_MISPLACED = new Set([
@@ -123,6 +124,8 @@ class Parser {
         this.advance();
         this.skipLinebreak();
         left = connection(t.value, left, this.parseCommand());
+      } else if (t.type === "OP" && t.value === "|") {
+        throw new ParseError("pipelines `|` not supported yet (planned for M3)");
       } else {
         break;
       }
@@ -154,8 +157,7 @@ class Parser {
         case "until": return this.parseWhile(true);
         case "for": return this.parseFor();
         case "function": return this.parseFunctionKeyword();
-        case "case":
-          throw new ParseError("`case` not supported yet (planned for M1.5)");
+        case "case": return this.parseCase();
       }
       // name () compound   → function definition
       if (
@@ -294,6 +296,67 @@ class Parser {
     const body = this.parseCompoundList(DONE);
     this.eatWord("done");
     return { type: "for", name, words, body };
+  }
+
+  private parseCase(): Command {
+    this.eatWord("case");
+    const w = this.peek();
+    if (w.type !== "WORD") {
+      throw new ParseError(`case: expected a word (line ${w.line})`);
+    }
+    this.advance();
+    const word = makeWord(w.value);
+    this.skipLinebreak();
+    this.eatWord("in");
+    this.skipLinebreak();
+
+    const clauses: CasePattern[] = [];
+    while (!this.wordIs("esac")) {
+      if (this.peek().type === "OP" && this.peek().value === "(") this.advance();
+
+      const patterns: Word[] = [this.parseCasePattern()];
+      while (this.peek().type === "OP" && this.peek().value === "|") {
+        this.advance();
+        patterns.push(this.parseCasePattern());
+      }
+
+      const rp = this.peek();
+      if (!(rp.type === "OP" && rp.value === ")")) {
+        throw new ParseError(`case: expected \`)\` (line ${rp.line})`);
+      }
+      this.advance();
+      this.skipLinebreak();
+
+      const body = this.atCaseClauseEnd() ? null : this.parseCompoundList(CASE_TERM);
+      clauses.push({ patterns, body });
+
+      if (this.peek().type === "OP" && this.peek().value === ";;") {
+        this.advance();
+        this.skipLinebreak();
+      } else {
+        break; // final clause may omit `;;`
+      }
+    }
+    this.eatWord("esac");
+    return { type: "case", word, clauses };
+  }
+
+  private parseCasePattern(): Word {
+    const t = this.peek();
+    if (t.type !== "WORD") {
+      throw new ParseError(`case: expected a pattern (line ${t.line})`);
+    }
+    this.advance();
+    return makeWord(t.value);
+  }
+
+  private atCaseClauseEnd(): boolean {
+    const t = this.peek();
+    return (
+      t.type === "EOF" ||
+      (t.type === "WORD" && t.value === "esac") ||
+      (t.type === "OP" && t.value === ";;")
+    );
   }
 
   private parseSimple(): Command {

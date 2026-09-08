@@ -13,12 +13,13 @@
  * path) both drive this same surface, so their behaviour matches. */
 
 import type {
-  ArithForCommand, Command, ForCommand, FunctionDef, IfCommand, WhileCommand, Word,
+  ArithForCommand, CaseCommand, Command, ForCommand, FunctionDef, IfCommand, WhileCommand, Word,
 } from "../ast/nodes.mts";
 import { CMD_INVERT_RETURN } from "../ast/nodes.mts";
 import { parse } from "../parser/parser.mts";
 import { expandNoSplit, expandWords, splitTaggedFields } from "./expand.mts";
 import { evalArith } from "./arith.mts";
+import { globMatch } from "./glob.mts";
 import { builtins } from "./builtins.mts";
 import { ReturnSignal, Var } from "./types.mts";
 import type { IO } from "./types.mts";
@@ -371,6 +372,11 @@ export class Shell {
     return sub;
   }
 
+  /** Pattern match (used by generated `case`). */
+  match(subject: string, pattern: string): boolean {
+    return globMatch(subject, pattern);
+  }
+
   /** Apply `!` inversion in generated code. */
   invert(): void {
     this.status = this.status === 0 ? 1 : 0;
@@ -441,8 +447,13 @@ export class Shell {
       case "arith":
         status = await this.arithCommand(cmd.expression);
         break;
-      default:
-        throw new Error(`command type \`${cmd.type}\` not supported yet`);
+      case "case":
+        status = await this.execCase(cmd);
+        break;
+      default: {
+        const unhandled: never = cmd;
+        throw new Error(`unhandled command type: ${String(unhandled)}`);
+      }
     }
     if (cmd.flags !== undefined && (cmd.flags & CMD_INVERT_RETURN) !== 0) {
       status = status === 0 ? 1 : 0;
@@ -529,6 +540,20 @@ export class Shell {
     }
     this.status = last;
     return last;
+  }
+
+  private async execCase(cmd: CaseCommand): Promise<number> {
+    const subject = await expandNoSplit(this, cmd.word.text);
+    for (const clause of cmd.clauses) {
+      for (const pat of clause.patterns) {
+        if (globMatch(subject, await expandNoSplit(this, pat.text))) {
+          this.status = clause.body ? await this.execute(clause.body) : 0;
+          return this.status;
+        }
+      }
+    }
+    this.status = 0;
+    return 0;
   }
 
   private async execArithFor(cmd: ArithForCommand): Promise<number> {
