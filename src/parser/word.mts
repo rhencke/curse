@@ -67,12 +67,15 @@ class WordParser {
   private hasQuote = false;
   private readonly t: string;
   private readonly assignValue: boolean;
+  /** Arithmetic context: `<(`/`>(` are operators, not process substitutions. */
+  private readonly arith: boolean;
   /** In an assignment word, a tilde expands after `=` and each unquoted `:`. */
   private assign = false;
 
-  constructor(text: string, assignValue = false) {
+  constructor(text: string, assignValue = false, arith = false) {
     this.t = text;
     this.assignValue = assignValue;
+    this.arith = arith;
   }
 
   /** At an assignment tilde-prefix position: `~`, `~/`, or `~` before `:`/end
@@ -179,7 +182,8 @@ class WordParser {
         continue;
       }
       // Process substitution `<(cmds)` / `>(cmds)` -> a /dev-fd-like path.
-      if ((c === "<" || c === ">") && this.at(1) === "(") {
+      // (Not in arithmetic, where `<`/`>` are comparison operators.)
+      if (!this.arith && (c === "<" || c === ">") && this.at(1) === "(") {
         this.flushLit();
         this.i += 2; // past `<(` / `>(`
         this.parts.push({ k: "procsub", dir: c, src: this.cmdSubSrc() });
@@ -664,6 +668,11 @@ export const parseWord = (text: string, assignValue = false): ParsedWord =>
  *  inside `"…"`): `$`-expansions apply and backslash only escapes `$ \` \\`. */
 export const parseDquote = (text: string): ParsedWord =>
   new WordParser(text).parseDquoteAll();
+
+/** Parse an arithmetic expression for `$`-expansion, treating `<(`/`>(` as
+ *  operators rather than process substitutions. */
+export const parseArith = (text: string): ParsedWord =>
+  new WordParser(text, false, true).parse();
 
 /** Parse a here-document body: `$`-expanded (unquoted delimiter) or literal. */
 export const parseHeredoc = (text: string, expand: boolean): ParsedWord =>

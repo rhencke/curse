@@ -8,7 +8,7 @@
 
 import type { Word } from "../ast/nodes.mts";
 import type { Shell } from "./shell.mts";
-import { parseDquote, parseParam, parseWord } from "../parser/word.mts";
+import { parseArith, parseDquote, parseParam, parseWord } from "../parser/word.mts";
 import type { Param, ParsedWord, WordPart } from "../parser/word.mts";
 import { braceExpand } from "../parser/brace.mts";
 import { evalArith } from "./arith.mts";
@@ -233,7 +233,7 @@ export const evalParam = async (shell: Shell, prm: Param, quoted = false): Promi
 const partValue = async (shell: Shell, p: Exclude<WordPart, { k: "lit" }>): Promise<string> => {
   switch (p.k) {
     case "param": return evalParam(shell, p.p, p.quoted);
-    case "arith": return evalArith(shell, await expandNoSplit(shell, p.expr)).toString();
+    case "arith": return evalArith(shell, await expandArith(shell, p.expr)).toString();
     case "cmdsub": return shell.subSrc(p.src);
     case "procsub": return shell.procSub(p.dir, p.src);
   }
@@ -324,6 +324,12 @@ export const expandAssign = async (shell: Shell, text: string): Promise<string> 
 /** Expand text as double-quoted content (a `${x-default}` default within `"…"`). */
 export const expandDquote = async (shell: Shell, text: string): Promise<string> => {
   return expandParsed(shell, parseDquote(text));
+};
+
+/** Expand an arithmetic expression's `$`-substitutions ($x, $(...), ${...}),
+ *  leaving `<(`/`>(` as operators (not process substitutions). */
+export const expandArith = async (shell: Shell, text: string): Promise<string> => {
+  return expandParsed(shell, parseArith(text));
 };
 
 /** Concatenate an already-parsed word's parts into a single string (no split). */

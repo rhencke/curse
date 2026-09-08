@@ -19,7 +19,7 @@ import type {
 import { CMD_INVERT_RETURN } from "../ast/nodes.mts";
 import { parse } from "../parser/parser.mts";
 import { parseHeredoc } from "../parser/word.mts";
-import { evalParam, expandAssign, expandNoSplit, expandParsed, expandWords, splitTaggedFields } from "./expand.mts";
+import { evalParam, expandArith, expandAssign, expandNoSplit, expandParsed, expandWords, splitTaggedFields } from "./expand.mts";
 import { evalArith } from "./arith.mts";
 import { globExpand, globMatch, hasExtglob, hasGlobMeta } from "./glob.mts";
 import {
@@ -817,7 +817,7 @@ export class Shell {
   /* ---------------- arithmetic (shared with generated code) ---------------- */
 
   private async arithValue(expr: string): Promise<bigint> {
-    return evalArith(this, await expandNoSplit(this, expr));
+    return evalArith(this, await expandArith(this, expr));
   }
   /** `$(( expr ))` expansion → the value as a string. */
   async arithStr(expr: string): Promise<string> {
