@@ -922,6 +922,7 @@ export class Shell {
       code = await this.external(name, args, {});
     }
     this.status = code;
+    this.setArray("PIPESTATUS", [String(code)]); // a lone command is a 1-stage pipeline
     await this.afterCommand();
     return code;
   }
@@ -1517,6 +1518,7 @@ export class Shell {
     let input = this.stdinData;
     let status = 0;
     let lastNonZero = 0;
+    const statuses: number[] = [];
     for (let idx = 0; idx < stages.length; idx++) {
       const isLast = idx === stages.length - 1;
       const chunks: string[] = [];
@@ -1524,9 +1526,11 @@ export class Shell {
       const sub = this.cloneForSubshell(io);
       sub.stdinData = input;
       status = await runBody(sub, stages[idx]!);
+      statuses.push(status);
       if (status !== 0) lastNonZero = status;
       if (!isLast) input = chunks.join("");
     }
+    this.setArray("PIPESTATUS", statuses.map(String));
     this.status = this.opts.pipefail ? lastNonZero : status;
     await this.afterCommand();
     return this.status;
