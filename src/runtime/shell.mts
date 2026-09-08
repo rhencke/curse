@@ -23,7 +23,8 @@ import { expandNoSplit, expandParsed, expandWords, splitTaggedFields } from "./e
 import { evalArith } from "./arith.mts";
 import { globExpand, globMatch, hasGlobMeta } from "./glob.mts";
 import {
-  replaceGlob as pReplaceGlob, substr as pSubstr, trimPrefix as pTrimPrefix, trimSuffix as pTrimSuffix,
+  replaceGlob as pReplaceGlob, sliceArr as pSliceArr, substr as pSubstr,
+  trimPrefix as pTrimPrefix, trimSuffix as pTrimSuffix,
 } from "./param.mts";
 import { builtins } from "./builtins.mts";
 import { ExitSignal, ReturnSignal, Var } from "./types.mts";
@@ -708,6 +709,19 @@ export class Shell {
     const off = Number(await this.arithValue(offExpr));
     const len = lenExpr === "" ? undefined : Number(await this.arithValue(lenExpr));
     return pSubstr(v, off, len);
+  }
+  private async doSlice(list: string[], offExpr: string, lenExpr: string): Promise<string[]> {
+    const off = Number(await this.arithValue(offExpr));
+    const len = lenExpr === "" ? undefined : Number(await this.arithValue(lenExpr));
+    return pSliceArr(list, off, len);
+  }
+  /** `${arr[@]:offset:length}` — slice an array's values. */
+  async sliceArr(name: string, offExpr: string, lenExpr: string): Promise<string[]> {
+    return this.doSlice(this.arrayValues(name), offExpr, lenExpr);
+  }
+  /** `${@:offset:length}` — slice the positional params ([$0, $1, …]). */
+  async slicePos(offExpr: string, lenExpr: string): Promise<string[]> {
+    return this.doSlice([this.name, ...this.positional], offExpr, lenExpr);
   }
 
   /** `[[ ]]` unary test (used by generated code and the interpreter). */

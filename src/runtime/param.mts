@@ -48,3 +48,11 @@ export const substr = (v: string, offset: number, length: number | undefined): s
   if (length < 0) return v.slice(start, Math.max(v.length + length, start));
   return v.slice(start, start + length);
 };
+
+/** `${arr[@]:offset:length}` / `${@:offset:length}` — slice a list (same rules). */
+export const sliceArr = (list: string[], offset: number, length: number | undefined): string[] => {
+  const start = offset < 0 ? Math.max(list.length + offset, 0) : Math.min(offset, list.length);
+  if (length === undefined) return list.slice(start);
+  if (length < 0) return list.slice(start, Math.max(list.length + length, start));
+  return list.slice(start, start + length);
+};

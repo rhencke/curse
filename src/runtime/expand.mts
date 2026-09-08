@@ -59,11 +59,21 @@ const specialValue = (shell: Shell, name: string): string => {
   }
 };
 
+/** `${arr[@]:off:len}` / `${@:off:len}` — the `:` op applied to a whole list. */
+const isSlice = (prm: Param): boolean =>
+  prm.op === ":" &&
+  (prm.sub === "@" || prm.sub === "*" || (prm.special && (prm.name === "@" || prm.name === "*")));
+
+const sliceValues = (shell: Shell, prm: Param): Promise<string[]> =>
+  prm.special ? shell.slicePos(prm.arg, prm.arg2) : shell.sliceArr(prm.name, prm.arg, prm.arg2);
+
 const evalParam = async (shell: Shell, prm: Param): Promise<string> => {
   // ${!name[@]} / ${!name[*]} — array indices.
   if (prm.indices) return shell.arrayIndices(prm.name).join(" ");
   // ${!name} — indirect (value of the variable named by $name).
   if (prm.indirect) return shell.indirect(prm.name);
+  // ${arr[@]:off:len} / ${@:off:len} — slice a list; scalar contexts join it.
+  if (isSlice(prm)) return (await sliceValues(shell, prm)).join(" ");
 
   // Resolve the referenced value (scalar, array element, or all elements).
   let rawVal: string | undefined;
@@ -157,10 +167,16 @@ export const expandWord = async (shell: Shell, word: Word): Promise<string[]> =>
   // "$@" / $@ and "${arr[@]}" / ${arr[@]}: each element becomes its own field.
   if (pw.parts.length === 1) {
     const only = pw.parts[0]!;
-    if (only.k === "param" && only.p.op === "" && !only.p.length) {
+    if (only.k === "param") {
       const p = only.p;
-      if (p.special && p.name === "@") return [...shell.positional];
-      if (p.sub === "@") return p.indices ? shell.arrayIndices(p.name).map(String) : shell.arrayValues(p.name);
+      if (p.op === "" && !p.length) {
+        if (p.special && p.name === "@") return [...shell.positional];
+        if (p.sub === "@") return p.indices ? shell.arrayIndices(p.name).map(String) : shell.arrayValues(p.name);
+      }
+      // "${arr[@]:i:n}" / "${@:i:n}" — sliced @ keeps each element as a field.
+      if (isSlice(p) && (p.sub === "@" || (p.special && p.name === "@"))) {
+        return sliceValues(shell, p);
+      }
     }
   }
 

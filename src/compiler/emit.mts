@@ -99,10 +99,25 @@ class Emitter {
     return `sh.env.${prm.name}`;
   }
 
+  /** `${arr[@]:off:len}` / `${@:off:len}` — is the `:` op slicing a whole list? */
+  private isSlice(prm: Param): boolean {
+    return prm.op === ":" &&
+      (prm.sub === "@" || prm.sub === "*" || (prm.special && (prm.name === "@" || prm.name === "*")));
+  }
+
+  /** A `Promise<string[]>` expression for the sliced list. */
+  private sliceExpr(prm: Param): string {
+    const J = JSON.stringify;
+    return prm.special
+      ? `await sh.slicePos(${J(prm.arg)}, ${J(prm.arg2)})`
+      : `await sh.sliceArr(${J(prm.name)}, ${J(prm.arg)}, ${J(prm.arg2)})`;
+  }
+
   private paramExpr(prm: Param): string {
     const J = JSON.stringify;
     if (prm.indices) return `sh.arrayIndices(${J(prm.name)}).join(" ")`;
     if (prm.indirect) return `sh.indirect(${J(prm.name)})`;
+    if (this.isSlice(prm)) return `(${this.sliceExpr(prm)}).join(" ")`;
     const base = this.valStr(prm);
     const arg = (): string => this.templateOf(parseWord(prm.arg).parts);
     const arg2 = (): string => this.templateOf(parseWord(prm.arg2).parts);
@@ -170,7 +185,12 @@ class Emitter {
     // "$@"/$@ and "${arr[@]}"/${arr[@]}/${!arr[@]} each expand to separate
     // fields. ($* / ${arr[*]} are scalar joins and flow through the paths below.)
     const spreadCode = (p: WordPart): string | null => {
-      if (p.k !== "param" || p.p.op !== "" || p.p.length) return null;
+      if (p.k !== "param" || p.p.length) return null;
+      // "${arr[@]:i:n}" / "${@:i:n}" — sliced @ keeps each element as a field.
+      if (this.isSlice(p.p) && (p.p.sub === "@" || (p.p.special && p.p.name === "@"))) {
+        return this.sliceExpr(p.p);
+      }
+      if (p.p.op !== "") return null;
       if (p.p.special && p.p.name === "@") return "sh.positional";
       if (p.p.sub === "@") {
         return p.p.indices
