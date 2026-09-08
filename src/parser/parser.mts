@@ -48,6 +48,9 @@ class Parser {
   private peek(): Token {
     return this.toks[this.p] ?? { type: "EOF", value: "", pos: -1, line: -1 };
   }
+  private peekAt(k: number): Token {
+    return this.toks[this.p + k] ?? { type: "EOF", value: "", pos: -1, line: -1 };
+  }
   private advance(): Token {
     const t = this.peek();
     if (t.type !== "EOF") this.p++;
@@ -150,8 +153,17 @@ class Parser {
         case "while": return this.parseWhile(false);
         case "until": return this.parseWhile(true);
         case "for": return this.parseFor();
+        case "function": return this.parseFunctionKeyword();
         case "case":
           throw new ParseError("`case` not supported yet (planned for M1.5)");
+      }
+      // name () compound   → function definition
+      if (
+        isName(t.value) &&
+        this.peekAt(1).type === "OP" && this.peekAt(1).value === "(" &&
+        this.peekAt(2).type === "OP" && this.peekAt(2).value === ")"
+      ) {
+        return this.parseFunctionDef(t.value);
       }
       if (RESERVED_MISPLACED.has(t.value)) {
         throw new ParseError(`syntax error near \`${t.value}\` (line ${t.line})`);
@@ -178,6 +190,34 @@ class Parser {
     const body = this.parseCompoundList(CLOSE_BRACE);
     this.eatWord("}");
     return { type: "group", body };
+  }
+
+  // `name () compound-command`
+  private parseFunctionDef(name: string): Command {
+    this.advance(); // name
+    this.advance(); // (
+    this.advance(); // )
+    this.skipLinebreak();
+    return { type: "function", name, body: this.parseCommand() };
+  }
+
+  // `function name [()] compound-command`
+  private parseFunctionKeyword(): Command {
+    this.eatWord("function");
+    const nameTok = this.peek();
+    if (nameTok.type !== "WORD") {
+      throw new ParseError(`function: expected a name (line ${nameTok.line})`);
+    }
+    this.advance();
+    if (this.peek().type === "OP" && this.peek().value === "(") {
+      this.advance();
+      if (!(this.peek().type === "OP" && this.peek().value === ")")) {
+        throw new ParseError(`function ${nameTok.value}: expected \`)\` (line ${this.peek().line})`);
+      }
+      this.advance();
+    }
+    this.skipLinebreak();
+    return { type: "function", name: nameTok.value, body: this.parseCommand() };
   }
 
   private parseIf(): Command {

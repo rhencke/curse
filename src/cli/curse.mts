@@ -44,9 +44,10 @@ const readSource = (file: string | undefined): string => {
   }
 };
 
-const run = async (src: string, name: string): Promise<void> => {
+const run = async (src: string, name: string, positional: string[] = []): Promise<void> => {
   const sh = new Shell();
   sh.name = name;
+  sh.positional = positional;
   process.exitCode = await sh.runString(src);
 };
 
@@ -60,13 +61,13 @@ const main = async (): Promise<void> => {
   }
 
   if (sub === "-c") {
-    await run(args[1] ?? "", "curse");
+    await run(args[1] ?? "", args[2] ?? "curse", args.slice(3));
     return;
   }
 
   if (sub === "run") {
     const file = args[1];
-    await run(readSource(file), file ?? "curse");
+    await run(readSource(file), file ?? "curse", args.slice(2));
     return;
   }
 

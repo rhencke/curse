@@ -1,11 +1,15 @@
-/* Shell builtins — the M0 subset. Behaviour follows bash (GPLv3+; see
- * NOTICE.md). argv[0] is the builtin name; arguments begin at argv[1]. */
+/* Shell builtins. Behaviour follows bash (GPLv3+; see NOTICE.md).
+ *
+ * A builtin is `(shell, ...args) => status`. It is stored as the prototype of
+ * the command registry, so a bash function of the same name shadows it (and
+ * `unset -f` reveals it again). Called via the shell, never bound to `this`. */
 
 import { resolve } from "node:path";
 import { accessSync, constants, lstatSync, statSync } from "node:fs";
 import type { Shell } from "./shell.mts";
+import { ReturnSignal } from "./types.mts";
 
-export type Builtin = (argv: string[], shell: Shell) => number | Promise<number>;
+export type Builtin = (shell: Shell, ...args: string[]) => number | Promise<number>;
 
 /** Process C-style backslash escapes (for `echo -e`, `printf %b`). */
 const unescape = (s: string): { text: string; stop: boolean } => {
@@ -50,25 +54,23 @@ const unescape = (s: string): { text: string; stop: boolean } => {
 const toInt = (s: string): number => {
   const t = s.trim();
   if (t === "") return 0;
-  const n = t.startsWith("0x") || t.startsWith("0X")
-    ? parseInt(t, 16)
-    : parseInt(t, 10);
+  const n = t.startsWith("0x") || t.startsWith("0X") ? parseInt(t, 16) : parseInt(t, 10);
   return Number.isNaN(n) ? 0 : n;
 };
 
-const echo: Builtin = (argv, shell) => {
-  let args = argv.slice(1);
+const echo: Builtin = (shell, ...args) => {
+  let rest = args;
   let newline = true;
   let escapes = false;
-  while (args.length > 0 && /^-[neE]+$/.test(args[0]!)) {
-    for (const ch of args[0]!.slice(1)) {
+  while (rest.length > 0 && /^-[neE]+$/.test(rest[0]!)) {
+    for (const ch of rest[0]!.slice(1)) {
       if (ch === "n") newline = false;
       else if (ch === "e") escapes = true;
       else if (ch === "E") escapes = false;
     }
-    args = args.slice(1);
+    rest = rest.slice(1);
   }
-  let text = args.join(" ");
+  let text = rest.join(" ");
   if (escapes) {
     const r = unescape(text);
     text = r.text;
@@ -78,8 +80,7 @@ const echo: Builtin = (argv, shell) => {
   return 0;
 };
 
-const printf: Builtin = (argv, shell) => {
-  const args = argv.slice(1);
+const printf: Builtin = (shell, ...args) => {
   if (args.length === 0) {
     shell.io.err("printf: usage: printf [-v var] format [arguments]\n");
     return 2;
@@ -95,8 +96,7 @@ const printf: Builtin = (argv, shell) => {
     while (i < fmt.length) {
       const c = fmt[i]!;
       if (c === "\\") {
-        const r = unescape(fmt.slice(i, i + 2));
-        out += r.text;
+        out += unescape(fmt.slice(i, i + 2)).text;
         i += 2;
         continue;
       }
@@ -105,7 +105,6 @@ const printf: Builtin = (argv, shell) => {
         i++;
         continue;
       }
-      // %[flags][width][.prec]conv  — flags/width/prec parsed but mostly ignored in M0
       let j = i + 1;
       if (fmt[j] === "%") {
         out += "%";
@@ -147,13 +146,13 @@ const printf: Builtin = (argv, shell) => {
   return 0;
 };
 
-const pwd: Builtin = (_argv, shell) => {
+const pwd: Builtin = (shell) => {
   shell.io.out(shell.cwd + "\n");
   return 0;
 };
 
-const cd: Builtin = (argv, shell) => {
-  const target = argv[1] ?? shell.getVar("HOME") ?? "";
+const cd: Builtin = (shell, ...args) => {
+  const target = args[0] ?? shell.getVar("HOME") ?? "";
   if (target === "") {
     shell.io.err("cd: HOME not set\n");
     return 1;
@@ -173,23 +172,41 @@ const cd: Builtin = (argv, shell) => {
   return 0;
 };
 
-const exportBuiltin: Builtin = (argv, shell) => {
-  for (const a of argv.slice(1)) {
+const exportBuiltin: Builtin = (shell, ...args) => {
+  for (const a of args) {
     const eq = a.indexOf("=");
     if (eq >= 0) {
-      const name = a.slice(0, eq);
-      shell.setVar(name, a.slice(eq + 1));
-      shell.markExport(name);
+      shell.setVar(a.slice(0, eq), a.slice(eq + 1));
+      shell.exportVar(a.slice(0, eq));
     } else {
-      shell.markExport(a);
+      shell.exportVar(a);
     }
   }
   return 0;
 };
 
-const unset: Builtin = (argv, shell) => {
-  for (const a of argv.slice(1)) shell.unset(a);
+const local: Builtin = (shell, ...args) => {
+  for (const a of args) {
+    const eq = a.indexOf("=");
+    if (eq >= 0) shell.local(a.slice(0, eq), a.slice(eq + 1));
+    else shell.local(a);
+  }
   return 0;
+};
+
+const unset: Builtin = (shell, ...args) => {
+  let mode: "v" | "f" | "" = "";
+  for (const a of args) {
+    if (a === "-f") mode = "f";
+    else if (a === "-v") mode = "v";
+    else if (mode === "f") shell.unsetFunc(a);
+    else shell.unsetVar(a);
+  }
+  return 0;
+};
+
+const returnBuiltin: Builtin = (shell, ...args) => {
+  throw new ReturnSignal(args.length > 0 ? toInt(args[0]!) : shell.status);
 };
 
 /* ---- test / [ ---- */
@@ -287,27 +304,28 @@ const evalTest = (a: string[], shell: Shell): boolean => {
       if (a[0] === "(" && a[3] === ")") return evalTest(a.slice(1, 3), shell);
       break;
   }
-  // General case: OR of ANDs (no parentheses beyond the cases above).
   return splitTop(a, "-o").some((orPart) =>
     splitTop(orPart, "-a").every((andPart) => evalTest(andPart, shell)),
   );
 };
 
-const test: Builtin = (argv, shell) => {
-  let args = argv.slice(1);
-  if (argv[0] === "[") {
-    if (args[args.length - 1] !== "]") {
-      shell.io.err("[: missing `]'\n");
-      return 2;
-    }
-    args = args.slice(0, -1);
-  }
+const testImpl = (shell: Shell, args: string[]): number => {
   try {
     return evalTest(args, shell) ? 0 : 1;
   } catch (e) {
-    shell.io.err(`${argv[0]}: ${e instanceof Error ? e.message : String(e)}\n`);
+    shell.io.err(`test: ${e instanceof Error ? e.message : String(e)}\n`);
     return 2;
   }
+};
+
+const test: Builtin = (shell, ...args) => testImpl(shell, args);
+
+const bracket: Builtin = (shell, ...args) => {
+  if (args[args.length - 1] !== "]") {
+    shell.io.err("[: missing `]'\n");
+    return 2;
+  }
+  return testImpl(shell, args.slice(0, -1));
 };
 
 export const builtins: Record<string, Builtin> = {
@@ -319,7 +337,9 @@ export const builtins: Record<string, Builtin> = {
   pwd,
   cd,
   export: exportBuiltin,
+  local,
   unset,
+  return: returnBuiltin,
   test,
-  "[": test,
+  "[": bracket,
 };

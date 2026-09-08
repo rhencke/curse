@@ -10,12 +10,28 @@ The lexer/parser are ported from GNU bash's `parse.y`, the AST mirrors its
 
 ## How it's built
 
-- **Faithful runtime first.** `src/runtime/` is a bash runtime in TypeScript
-  (shell state, word expansion, builtins, process plumbing, and — later — the
-  AST interpreter). Both `curse run` and the generated `.mts` funnel through the
-  same primitives, so their behaviour matches.
-- **AOT is a lowering pass on top.** `src/compiler/` turns static structure into
-  native TypeScript control flow that calls the runtime.
+**Compiler first, interpreter only where bash forces it.** The AOT path emits
+real TypeScript that leans on JavaScript's own dynamism to model bash's:
+
+- **Commands are live bindings.** `sh.commands` is a `Proxy` whose prototype is
+  the builtins; a bash function compiles to `sh.commands.name = sh.func(...)`,
+  which *monkeypatches* the binding (and `unset -f` reveals the builtin again).
+  Unknown names fall through to external processes. Dispatch is a property
+  lookup, not a string switch.
+- **Assignment is property mutation:** `sh.env.name = \`world\``, with
+  `sh.env.name.exported = true` when needed. `sh.env` is a Proxy over a
+  **prototype-linked scope chain** — which is also exactly how `local` and
+  bash's dynamic scoping fall out (`Object.create(callerScope)`).
+- **Expansion compiles inline:** template literals for `"$x"`, `sh.fields`/`sh.S`
+  for word splitting, inline `sh.sub(async sh => …)` for `$(...)`. No raw bash
+  strings survive into the output.
+- **Control flow becomes native TS** (`if`, `for…of`, `for(;;)`); `sh.status`
+  carries `$?`.
+
+The interpreter (`src/runtime/shell.mts` `execute`) drives the *same* surface —
+`sh.commands`, `sh.env`, builtins — so it is the JIT/eval path (compile a string
+at runtime) and stays behaviourally identical to the compiled output.
+
 - **Async/await throughout** so pipelines, `&`, and streaming are correct.
 - **Zero-build.** Node 24's type-stripping runs the `.mts` sources *and* the
   generated output directly — `tsc` (v7) is only a type checker.
@@ -69,6 +85,11 @@ groups `{ }`, `!` negation, the `(( ))` command and `$(( ))` expansion (a
 64-bit BigInt evaluator with C precedence and recursive variable resolution),
 and the `test` / `[` builtin. Still open in M1: `case`/`esac` and `[[ ]]`.
 
+**Functions + scope (done).** `name() { … }` and `function name`, positional
+parameters (`$1`, `$#`, `$@`, `$*`), `local`, `return`, dynamic scoping, and
+redefining commands/builtins (monkeypatch) — all via the command-registry and
+scope model above.
+
 Every case passes through **both** the interpreter and the AOT output, matching
 bash on stdout and exit status.
 
@@ -77,8 +98,8 @@ bash on stdout and exit status.
 1. **M1 remainder**: `case`/`esac`, `[[ ]]`.
 2. **M2** words: full parameter expansion (`${x:-y}`, `${x#p}`, …), arrays,
    globbing, `$@`/`$*`, positional parameters, tilde/brace expansion.
-3. **M3** processes: pipelines, redirections/heredocs, `&` / `wait`, functions,
-   more builtins (`read`, `declare`, `local`, `set`, `trap`, `shift`, `return`).
+3. **M3** processes: pipelines, redirections/heredocs, `&` / `wait`, and more
+   builtins (`read`, `declare`, `set`, `trap`, `shift`, `command`/`builtin`).
 4. **M4** JIT: `eval` / `source "$x"` via the interpreter over the same AST.
 
 Long-term target: point bash's own `tests/run-all` at `curse` as `THIS_SH`.

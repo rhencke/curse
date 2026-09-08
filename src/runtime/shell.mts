@@ -1,74 +1,408 @@
-/* The bash runtime, in TypeScript. Holds shell state (variables, exit status,
- * cwd) and executes commands. Both the interpreter (`execute`, used by
- * `curse run` and — later — by `eval`/`source`) and the AOT-generated `.mts`
- * funnel through the same primitives, so their behaviour matches.
+/* The bash runtime, in TypeScript.
  *
- * M0: simple commands, `;` / `&&` / `||`, assignments, command substitution,
- * builtins, and external process spawning. */
+ * Design: lean on JavaScript's own dynamism to model bash's.
+ *  - Variables live as `Var` boxes on a prototype-linked scope chain, exposed
+ *    through the `sh.env` Proxy. `sh.env.x = "v"` is an assignment; dynamic
+ *    scoping (functions, `local`) is just `Object.create(callerScope)`.
+ *  - Commands are live bindings in the `sh.commands` Proxy: builtins are the
+ *    prototype, bash function definitions are own properties that shadow them,
+ *    and unknown names fall through to external processes. Defining `echo()`
+ *    is literally assigning a function onto the registry.
+ *
+ * The AOT-generated `.mts` and the interpreter (`execute`, for the JIT/eval
+ * path) both drive this same surface, so their behaviour matches. */
 
-import type { ArithForCommand, Command, ForCommand, IfCommand, WhileCommand } from "../ast/nodes.mts";
-import { CMD_INVERT_RETURN, makeWord } from "../ast/nodes.mts";
+import type {
+  ArithForCommand, Command, ForCommand, FunctionDef, IfCommand, WhileCommand, Word,
+} from "../ast/nodes.mts";
+import { CMD_INVERT_RETURN } from "../ast/nodes.mts";
 import { parse } from "../parser/parser.mts";
-import { expandNoSplit, expandWords } from "./expand.mts";
+import { expandNoSplit, expandWords, splitTaggedFields } from "./expand.mts";
 import { evalArith } from "./arith.mts";
 import { builtins } from "./builtins.mts";
+import { ReturnSignal, Var } from "./types.mts";
+import type { IO } from "./types.mts";
 import { spawn } from "node:child_process";
 
-const errMsg = (e: unknown): string => (e instanceof Error ? e.message : String(e));
-
-export interface IO {
-  out: (s: string) => void;
-  err: (s: string) => void;
-}
+export type { IO } from "./types.mts";
+export { ReturnSignal, Var } from "./types.mts";
 
 const defaultIO = (): IO => ({
   out: (s) => void process.stdout.write(s),
   err: (s) => void process.stderr.write(s),
 });
 
-const ASSIGN = /^([A-Za-z_][A-Za-z0-9_]*)=/;
+/** A value marked as subject to field splitting, for `sh.fields(...)`. */
+interface SplitMark {
+  v: string;
+}
+
+const errMsg = (e: unknown): string => (e instanceof Error ? e.message : String(e));
+
+type Scope = Record<string, Var>;
+type BashFunc = { __bashFunc: (sh: Shell) => Promise<void> };
 
 export class Shell {
-  vars = new Map<string, string>();
-  exported = new Set<string>();
-  status = 0;
-  cwd = process.cwd();
-  name = "curse";
   io: IO;
+  status = 0;
+  name = "curse";
+  cwd = process.cwd();
+  positional: string[] = [];
+
+  private globalScope: Scope = Object.create(null) as Scope;
+  private scope: Scope = this.globalScope;
+  private functions: Record<string, unknown> = Object.create(builtins) as Record<string, unknown>;
+
+  /** `sh.env.x` reads/writes variables over the dynamic scope chain. */
+  readonly env: Record<string, Var>;
+  /** `sh.commands.name(...args)` dispatches function → builtin → external. */
+  readonly commands: Record<string, (...args: string[]) => Promise<number>>;
 
   constructor(io?: IO) {
     this.io = io ?? defaultIO();
+
+    this.env = new Proxy(Object.create(null) as Record<string, Var>, {
+      get: (_t, p) => (typeof p === "string" ? this.lookup(p) ?? new Var("") : undefined),
+      set: (_t, p, v) => {
+        if (typeof p === "string") this.assign(p, v);
+        return true;
+      },
+      has: (_t, p) => typeof p === "string" && this.lookup(p) !== undefined,
+      deleteProperty: (_t, p) => {
+        if (typeof p === "string") this.unsetVar(p);
+        return true;
+      },
+    }) as Record<string, Var>;
+
+    this.commands = new Proxy(Object.create(null) as object, {
+      get: (_t, p) =>
+        typeof p === "string" ? (...args: string[]) => this.callByName(p, args) : undefined,
+      set: (_t, p, v) => {
+        if (typeof p === "string") this.functions[p] = v;
+        return true;
+      },
+      has: (_t, p) => typeof p === "string" && p in this.functions,
+      deleteProperty: (_t, p) => {
+        if (typeof p === "string") delete this.functions[p];
+        return true;
+      },
+    }) as Record<string, (...args: string[]) => Promise<number>>;
+  }
+
+  get pid(): number {
+    return process.pid;
+  }
+
+  /* ---------------- variables / scope ---------------- */
+
+  private lookup(name: string): Var | undefined {
+    let s: Scope | null = this.scope;
+    while (s !== null) {
+      if (Object.prototype.hasOwnProperty.call(s, name)) return s[name];
+      s = Object.getPrototypeOf(s) as Scope | null;
+    }
+    const e = process.env[name];
+    return e === undefined ? undefined : new Var(e, true);
+  }
+
+  private ownerScope(name: string): Scope | undefined {
+    let s: Scope | null = this.scope;
+    while (s !== null) {
+      if (Object.prototype.hasOwnProperty.call(s, name)) return s;
+      s = Object.getPrototypeOf(s) as Scope | null;
+    }
+    return undefined;
+  }
+
+  private assign(name: string, value: unknown): void {
+    if (value instanceof Var) {
+      this.scope[name] = value;
+      return;
+    }
+    const s = String(value);
+    const owner = this.ownerScope(name);
+    if (owner) {
+      owner[name]!.value = s;
+    } else {
+      this.globalScope[name] = new Var(s, process.env[name] !== undefined);
+    }
   }
 
   getVar(name: string): string | undefined {
-    const v = this.vars.get(name);
-    if (v !== undefined) return v;
-    return process.env[name];
+    return this.lookup(name)?.value;
   }
-
   setVar(name: string, value: string): void {
-    this.vars.set(name, value);
+    this.assign(name, value);
+  }
+  unsetVar(name: string): void {
+    const owner = this.ownerScope(name);
+    if (owner) delete owner[name];
+  }
+  local(name: string, value?: string): void {
+    this.scope[name] = new Var(value ?? "");
+  }
+  exportVar(name: string): void {
+    const owner = this.ownerScope(name);
+    if (owner) owner[name]!.exported = true;
+    else this.globalScope[name] = new Var(process.env[name] ?? "", true);
+  }
+  unsetFunc(name: string): void {
+    delete this.functions[name];
   }
 
-  markExport(name: string): void {
-    this.exported.add(name);
-  }
-
-  unset(name: string): void {
-    this.vars.delete(name);
-    this.exported.delete(name);
+  param(n: number): string {
+    return n <= 0 ? this.name : this.positional[n - 1] ?? "";
   }
 
   private childEnv(extra: Record<string, string>): NodeJS.ProcessEnv {
     const env: NodeJS.ProcessEnv = { ...process.env };
-    for (const n of this.exported) {
-      const v = this.vars.get(n);
-      if (v !== undefined) env[n] = v;
+    const seen = new Set<string>();
+    let s: Scope | null = this.scope;
+    while (s !== null) {
+      for (const k of Object.getOwnPropertyNames(s)) {
+        if (!seen.has(k)) {
+          seen.add(k);
+          const v = s[k]!;
+          if (v.exported) env[k] = v.value;
+        }
+      }
+      s = Object.getPrototypeOf(s) as Scope | null;
     }
     return { ...env, ...extra };
   }
 
-  /** Execute a parsed command tree, returning its exit status. */
+  /* ---------------- word helpers (used by generated code) ---------------- */
+
+  /** Mark a value as subject to field splitting inside `fields(...)`. */
+  S(v: unknown): SplitMark {
+    return { v: String(v) };
+  }
+
+  /** Assemble args from parts (strings = literal, S(...) = splittable). */
+  fields(...parts: Array<string | SplitMark>): string[] {
+    const chars: string[] = [];
+    const sp: boolean[] = [];
+    let anchored = false;
+    for (const p of parts) {
+      if (typeof p === "string") {
+        for (const c of p) {
+          chars.push(c);
+          sp.push(false);
+        }
+        anchored = true;
+      } else {
+        for (const c of p.v) {
+          chars.push(c);
+          sp.push(true);
+        }
+      }
+    }
+    return splitTaggedFields(chars, sp, anchored);
+  }
+
+  /** Command substitution (compiled): run body capturing stdout. */
+  async sub(fn: (sh: Shell) => Promise<void>): Promise<string> {
+    const chunks: string[] = [];
+    const subsh = this.cloneForSubshell({ out: (s) => void chunks.push(s), err: (s) => this.io.err(s) });
+    await fn(subsh);
+    this.status = subsh.status;
+    return chunks.join("").replace(/\n+$/, "");
+  }
+
+  /** Command substitution (interpreter): parse + run a source string. */
+  async subSrc(src: string): Promise<string> {
+    return this.sub(async (sh) => {
+      await sh.runString(src);
+    });
+  }
+
+  /* ---------------- arithmetic (shared with generated code) ---------------- */
+
+  private async arithValue(expr: string): Promise<bigint> {
+    return evalArith(this, await expandNoSplit(this, expr));
+  }
+  /** `$(( expr ))` expansion → the value as a string. */
+  async arithStr(expr: string): Promise<string> {
+    return (await this.arithValue(expr)).toString();
+  }
+  /** `(( expr ))` command → status 0 if non-zero, else 1. */
+  async arithCommand(expr: string): Promise<number> {
+    try {
+      this.status = (await this.arithValue(expr)) !== 0n ? 0 : 1;
+    } catch (e) {
+      this.io.err(`${this.name}: ((: ${expr}: ${errMsg(e)}\n`);
+      this.status = 1;
+    }
+    return this.status;
+  }
+  async arithRun(expr: string): Promise<void> {
+    if (expr !== "") await this.arithValue(expr);
+  }
+  async arithTest(expr: string): Promise<boolean> {
+    return expr === "" ? true : (await this.arithValue(expr)) !== 0n;
+  }
+
+  /* ---------------- command dispatch ---------------- */
+
+  /** Define a bash function body as a monkeypatchable command value. */
+  func(body: (sh: Shell) => Promise<void>): BashFunc {
+    return { __bashFunc: body };
+  }
+
+  private async invokeFunc(body: (sh: Shell) => Promise<void>, args: string[]): Promise<number> {
+    const savedScope = this.scope;
+    const savedPos = this.positional;
+    this.scope = Object.create(savedScope) as Scope;
+    this.positional = args;
+    try {
+      await body(this);
+    } catch (e) {
+      if (e instanceof ReturnSignal) this.status = e.code;
+      else throw e;
+    } finally {
+      this.scope = savedScope;
+      this.positional = savedPos;
+    }
+    return this.status;
+  }
+
+  /** Resolve and run a command by name (function → builtin → external). */
+  async callByName(name: string, args: string[]): Promise<number> {
+    const fn = this.functions[name];
+    let code: number;
+    if (fn && typeof fn === "object" && "__bashFunc" in fn) {
+      code = await this.invokeFunc((fn as BashFunc).__bashFunc, args);
+    } else if (typeof fn === "function") {
+      code = await (fn as (sh: Shell, ...a: string[]) => number | Promise<number>)(this, ...args);
+    } else {
+      code = await this.external(name, args, {});
+    }
+    this.status = code;
+    return code;
+  }
+
+  /** Dispatch when the command name itself came from an expansion. */
+  async exec(...fields: string[]): Promise<number> {
+    if (fields.length === 0) {
+      this.status = 0;
+      return 0;
+    }
+    return this.callByName(fields[0]!, fields.slice(1));
+  }
+
+  /** Run `fn` with temporary (exported) assignments, e.g. `FOO=bar cmd`. */
+  async withEnv(assignments: Record<string, string>, fn: () => Promise<number>): Promise<number> {
+    const saved: Array<[string, Var | undefined]> = [];
+    for (const [k, v] of Object.entries(assignments)) {
+      saved.push([k, Object.prototype.hasOwnProperty.call(this.scope, k) ? this.scope[k] : undefined]);
+      this.scope[k] = new Var(v, true);
+    }
+    try {
+      return await fn();
+    } finally {
+      for (const [k, prev] of saved) {
+        if (prev === undefined) delete this.scope[k];
+        else this.scope[k] = prev;
+      }
+    }
+  }
+
+  private external(name: string, args: string[], extraEnv: Record<string, string>): Promise<number> {
+    return new Promise<number>((resolvePromise) => {
+      let settled = false;
+      const done = (code: number): void => {
+        if (!settled) {
+          settled = true;
+          resolvePromise(code);
+        }
+      };
+      const child = spawn(name, args, {
+        cwd: this.cwd,
+        env: this.childEnv(extraEnv),
+        stdio: ["inherit", "pipe", "pipe"],
+      });
+      child.stdout?.on("data", (d: Buffer) => this.io.out(d.toString()));
+      child.stderr?.on("data", (d: Buffer) => this.io.err(d.toString()));
+      child.on("error", (err: NodeJS.ErrnoException) => {
+        if (err.code === "ENOENT") {
+          this.io.err(`${this.name}: ${name}: command not found\n`);
+          done(127);
+        } else if (err.code === "EACCES") {
+          this.io.err(`${this.name}: ${name}: Permission denied\n`);
+          done(126);
+        } else {
+          this.io.err(`${this.name}: ${name}: ${err.message}\n`);
+          done(127);
+        }
+      });
+      child.on("close", (code, signal) => done(signal ? 128 + 1 : code ?? 0));
+    });
+  }
+
+  /* ---------------- subshells ---------------- */
+
+  private snapshotVars(): Scope {
+    const flat: Scope = Object.create(null) as Scope;
+    const seen = new Set<string>();
+    let s: Scope | null = this.scope;
+    while (s !== null) {
+      for (const k of Object.getOwnPropertyNames(s)) {
+        if (!seen.has(k)) {
+          seen.add(k);
+          const v = s[k]!;
+          flat[k] = new Var(v.value, v.exported);
+        }
+      }
+      s = Object.getPrototypeOf(s) as Scope | null;
+    }
+    return flat;
+  }
+
+  private cloneForSubshell(io?: IO): Shell {
+    const sub = new Shell(io ?? this.io);
+    const vars = this.snapshotVars();
+    sub.globalScope = vars;
+    sub.scope = vars;
+    sub.functions = Object.create(this.functions) as Record<string, unknown>;
+    sub.positional = [...this.positional];
+    sub.status = this.status;
+    sub.name = this.name;
+    sub.cwd = this.cwd;
+    return sub;
+  }
+
+  /** Apply `!` inversion in generated code. */
+  invert(): void {
+    this.status = this.status === 0 ? 1 : 0;
+  }
+
+  /** Run a body in a subshell (used by generated subshells). */
+  async runSubshell(fn: (sh: Shell) => Promise<void>): Promise<number> {
+    const sub = this.cloneForSubshell();
+    await fn(sub);
+    this.status = sub.status;
+    return sub.status;
+  }
+
+  /* ---------------- interpreter (JIT / eval path) ---------------- */
+
+  async runString(src: string): Promise<number> {
+    const cmd = parse(src);
+    if (cmd === null) {
+      this.status = 0;
+      return 0;
+    }
+    try {
+      return await this.execute(cmd);
+    } catch (e) {
+      if (e instanceof ReturnSignal) {
+        this.status = e.code;
+        return e.code;
+      }
+      throw e;
+    }
+  }
+
   async execute(cmd: Command): Promise<number> {
     let status: number;
     switch (cmd.type) {
@@ -76,14 +410,22 @@ export class Shell {
         status = await this.execConnection(cmd.connector, cmd.first, cmd.second);
         break;
       case "simple":
-        status = await this.simpleRaw(cmd.words.map((w) => w.text));
+        status = await this.execSimple(cmd.words);
+        break;
+      case "function":
+        this.defineFunction(cmd);
+        status = 0;
+        this.status = 0;
         break;
       case "group":
         status = await this.execute(cmd.body);
         break;
-      case "subshell":
-        status = await this.execSubshell(cmd.body);
+      case "subshell": {
+        const sub = this.cloneForSubshell();
+        status = await sub.execute(cmd.body);
+        this.status = status;
         break;
+      }
       case "if":
         status = await this.execIf(cmd);
         break;
@@ -102,7 +444,6 @@ export class Shell {
       default:
         throw new Error(`command type \`${cmd.type}\` not supported yet`);
     }
-
     if (cmd.flags !== undefined && (cmd.flags & CMD_INVERT_RETURN) !== 0) {
       status = status === 0 ? 1 : 0;
       this.status = status;
@@ -110,11 +451,14 @@ export class Shell {
     return status;
   }
 
-  private async execConnection(
-    connector: string,
-    first: Command,
-    second: Command,
-  ): Promise<number> {
+  private defineFunction(cmd: FunctionDef): void {
+    const body = cmd.body;
+    this.functions[cmd.name] = this.func(async (sh) => {
+      await sh.execute(body);
+    });
+  }
+
+  private async execConnection(connector: string, first: Command, second: Command): Promise<number> {
     if (connector === ";") {
       await this.execute(first);
       return this.execute(second);
@@ -128,6 +472,34 @@ export class Shell {
       return s !== 0 ? this.execute(second) : s;
     }
     throw new Error(`connector \`${connector}\` not supported yet`);
+  }
+
+  private async execSimple(words: Word[]): Promise<number> {
+    const assigns: Array<[string, string]> = [];
+    let k = 0;
+    for (; k < words.length; k++) {
+      const m = /^([A-Za-z_][A-Za-z0-9_]*)=/.exec(words[k]!.text);
+      if (!m) break;
+      assigns.push([m[1]!, await expandNoSplit(this, words[k]!.text.slice(m[0].length))]);
+    }
+    const rest = words.slice(k);
+    if (rest.length === 0) {
+      for (const [n, v] of assigns) this.setVar(n, v);
+      this.status = 0;
+      return 0;
+    }
+    const argv = await expandWords(this, rest);
+    if (argv.length === 0) {
+      for (const [n, v] of assigns) this.setVar(n, v);
+      this.status = 0;
+      return 0;
+    }
+    if (assigns.length > 0) {
+      const env: Record<string, string> = {};
+      for (const [n, v] of assigns) env[n] = v;
+      return this.withEnv(env, () => this.callByName(argv[0]!, argv.slice(1)));
+    }
+    return this.callByName(argv[0]!, argv.slice(1));
   }
 
   private async execIf(cmd: IfCommand): Promise<number> {
@@ -175,193 +547,5 @@ export class Shell {
     }
     this.status = last;
     return last;
-  }
-
-  private async execSubshell(body: Command): Promise<number> {
-    const sub = this.cloneForSubshell();
-    const s = await sub.execute(body);
-    this.status = s;
-    return s;
-  }
-
-  private cloneForSubshell(): Shell {
-    const sub = new Shell(this.io);
-    sub.vars = new Map(this.vars);
-    sub.exported = new Set(this.exported);
-    sub.cwd = this.cwd;
-    sub.name = this.name;
-    sub.status = this.status;
-    return sub;
-  }
-
-  /* ---- arithmetic entry points (shared with generated code) ---- */
-
-  private async arithValue(expr: string): Promise<bigint> {
-    return evalArith(this, await expandNoSplit(this, expr));
-  }
-
-  /** `(( expr ))` command: status 0 if the value is non-zero, else 1. */
-  async arithCommand(expr: string): Promise<number> {
-    try {
-      this.status = (await this.arithValue(expr)) !== 0n ? 0 : 1;
-    } catch (e) {
-      this.io.err(`${this.name}: ((: ${expr}: ${errMsg(e)}\n`);
-      this.status = 1;
-    }
-    return this.status;
-  }
-
-  /** Evaluate for side effects (arith-for init/step); empty is a no-op. */
-  async arithRun(expr: string): Promise<void> {
-    if (expr !== "") await this.arithValue(expr);
-  }
-
-  /** Arith-for test: an empty test is always true. */
-  async arithTest(expr: string): Promise<boolean> {
-    if (expr === "") return true;
-    return (await this.arithValue(expr)) !== 0n;
-  }
-
-  /** Expand a word list to fields (used by generated `for` loops). */
-  async expandList(rawWords: string[]): Promise<string[]> {
-    return expandWords(this, rawWords.map((t) => makeWord(t)));
-  }
-
-  /** Run a body in a subshell (used by generated subshells). */
-  async runSubshell(fn: (sh: Shell) => Promise<void>): Promise<number> {
-    const sub = this.cloneForSubshell();
-    await fn(sub);
-    this.status = sub.status;
-    return sub.status;
-  }
-
-  /** Apply `!` inversion in generated code. */
-  invert(): void {
-    this.status = this.status === 0 ? 1 : 0;
-  }
-
-  /** Execute a simple command given the raw (unexpanded) word texts. This is the
-   *  single entry point shared by the interpreter and the AOT-generated code. */
-  async simpleRaw(rawWords: string[]): Promise<number> {
-    // Separate leading assignments (name=value) from the command + arguments.
-    const assigns: Array<[string, string]> = [];
-    let k = 0;
-    while (k < rawWords.length) {
-      const w = rawWords[k]!;
-      const m = ASSIGN.exec(w);
-      if (!m) break;
-      assigns.push([m[1]!, w.slice(m[0].length)]);
-      k++;
-    }
-    const rest = rawWords.slice(k);
-
-    if (rest.length === 0) {
-      // Assignment-only command: apply to the shell, no command run.
-      for (const [n, rhs] of assigns) this.setVar(n, await expandNoSplit(this, rhs));
-      this.status = 0;
-      return 0;
-    }
-
-    const argv = await expandWords(this, rest.map((t) => makeWord(t)));
-    if (argv.length === 0) {
-      for (const [n, rhs] of assigns) this.setVar(n, await expandNoSplit(this, rhs));
-      this.status = 0;
-      return 0;
-    }
-
-    const extraEnv: Record<string, string> = {};
-    for (const [n, rhs] of assigns) extraEnv[n] = await expandNoSplit(this, rhs);
-
-    const name = argv[0]!;
-    const bi = builtins[name];
-    let status: number;
-    if (bi) {
-      // Assignment prefix is visible to the builtin, then restored.
-      const saved: Array<[string, string | undefined]> = [];
-      for (const [n, v] of Object.entries(extraEnv)) {
-        saved.push([n, this.vars.get(n)]);
-        this.vars.set(n, v);
-      }
-      try {
-        status = await bi(argv, this);
-      } finally {
-        for (const [n, old] of saved) {
-          if (old === undefined) this.vars.delete(n);
-          else this.vars.set(n, old);
-        }
-      }
-    } else {
-      status = await this.spawnExternal(argv, extraEnv);
-    }
-
-    this.status = status;
-    return status;
-  }
-
-  private spawnExternal(argv: string[], extraEnv: Record<string, string>): Promise<number> {
-    const name = argv[0]!;
-    return new Promise<number>((resolvePromise) => {
-      let settled = false;
-      const done = (code: number): void => {
-        if (!settled) {
-          settled = true;
-          resolvePromise(code);
-        }
-      };
-
-      const child = spawn(name, argv.slice(1), {
-        cwd: this.cwd,
-        env: this.childEnv(extraEnv),
-        stdio: ["inherit", "pipe", "pipe"],
-      });
-
-      child.stdout?.on("data", (d: Buffer) => this.io.out(d.toString()));
-      child.stderr?.on("data", (d: Buffer) => this.io.err(d.toString()));
-
-      child.on("error", (err: NodeJS.ErrnoException) => {
-        if (err.code === "ENOENT") {
-          this.io.err(`${this.name}: ${name}: command not found\n`);
-          done(127);
-        } else if (err.code === "EACCES") {
-          this.io.err(`${this.name}: ${name}: Permission denied\n`);
-          done(126);
-        } else {
-          this.io.err(`${this.name}: ${name}: ${err.message}\n`);
-          done(127);
-        }
-      });
-
-      child.on("close", (code, signal) => {
-        if (signal) done(128 + 1);
-        else done(code ?? 0);
-      });
-    });
-  }
-
-  /** Parse and execute a source string (used by `curse run`, and later `eval`). */
-  async runString(src: string): Promise<number> {
-    const cmd = parse(src);
-    if (cmd === null) {
-      this.status = 0;
-      return 0;
-    }
-    return this.execute(cmd);
-  }
-
-  /** Run source in a capturing subshell for `$(...)`; returns stdout with
-   *  trailing newlines stripped. Variable changes do not leak out (subshell). */
-  async runCommandSub(src: string): Promise<string> {
-    const chunks: string[] = [];
-    const sub = new Shell({
-      out: (s) => void chunks.push(s),
-      err: (s) => this.io.err(s),
-    });
-    sub.vars = new Map(this.vars);
-    sub.exported = new Set(this.exported);
-    sub.cwd = this.cwd;
-    sub.name = this.name;
-    await sub.runString(src);
-    this.status = sub.status;
-    return chunks.join("").replace(/\n+$/, "");
   }
 }
