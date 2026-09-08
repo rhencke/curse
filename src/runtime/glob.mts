@@ -77,15 +77,15 @@ export const globToRegExpBody = (pat: string): string => {
  *  static patterns; used by the runtime for dynamic ones. */
 export const globToRegExpSource = (pat: string): string => "^" + globToRegExpBody(pat) + "$";
 
-export const globMatch = (str: string, pattern: string): boolean =>
-  new RegExp(globToRegExpSource(pattern), "s").test(str);
+export const globMatch = (str: string, pattern: string, nocase = false): boolean =>
+  new RegExp(globToRegExpSource(pattern), nocase ? "si" : "s").test(str);
 
 export const hasGlobMeta = (s: string): boolean => /[*?[]/.test(s);
 
 /** Pathname expansion: match `pattern` against the filesystem (relative to
  *  `cwd`), returning sorted matches (paths as written), or [] if none. Hidden
  *  files match only when the component starts with `.`. */
-export const globExpand = (cwd: string, pattern: string): string[] => {
+export const globExpand = (cwd: string, pattern: string, dotglob = false): string[] => {
   const comps = pattern.split("/");
   const absolute = pattern.startsWith("/");
   const out: string[] = [];
@@ -123,7 +123,7 @@ export const globExpand = (cwd: string, pattern: string): string[] => {
     }
     const re = new RegExp(globToRegExpSource(comp), "s");
     for (const e of entries.sort()) {
-      if (e.startsWith(".") && !comp.startsWith(".")) continue;
+      if (!dotglob && e.startsWith(".") && !comp.startsWith(".")) continue;
       if (!re.test(e)) continue;
       if (isLast) {
         out.push(joinPrefix(prefix, e));

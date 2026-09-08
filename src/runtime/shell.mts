@@ -132,6 +132,12 @@ export class Shell {
   traps: Record<string, string> = Object.create(null) as Record<string, string>;
   private ranExitTrap = false;
 
+  /** `shopt` toggles (all off by default, as in a non-interactive shell). */
+  shopts: Record<string, boolean> = {
+    nullglob: false, dotglob: false, nocasematch: false, failglob: false,
+    globstar: false, extglob: false, nocaseglob: false,
+  };
+
   /** Background jobs and `$!`. */
   lastBgPid = 0;
   private jobs: Array<{ pid: number; promise: Promise<number> }> = [];
@@ -848,8 +854,9 @@ export class Shell {
     const out: string[] = [];
     for (const f of fields) {
       if (hasGlobMeta(f)) {
-        const m = globExpand(this.cwd, f);
+        const m = globExpand(this.cwd, f, this.shopts.dotglob);
         if (m.length > 0) out.push(...m);
+        else if (this.shopts.nullglob) continue; // drop patterns that match nothing
         else out.push(f);
       } else {
         out.push(f);
@@ -860,7 +867,7 @@ export class Shell {
 
   /** Pattern match (used by generated `case` / `[[ == ]]` with dynamic patterns). */
   match(subject: string, pattern: string): boolean {
-    return globMatch(subject, pattern);
+    return globMatch(subject, pattern, this.shopts.nocasematch);
   }
 
   /** Whether a variable is set (used by generated `${x-…}` / `${x+…}`). */
@@ -966,8 +973,8 @@ export class Shell {
       }
     };
     switch (op) {
-      case "==": case "=": return globMatch(l, r);
-      case "!=": return !globMatch(l, r);
+      case "==": case "=": return globMatch(l, r, this.shopts.nocasematch);
+      case "!=": return !globMatch(l, r, this.shopts.nocasematch);
       case "<": return l < r;
       case ">": return l > r;
       case "-eq": return intOf(l) === intOf(r);
@@ -1413,7 +1420,7 @@ export class Shell {
       let run = falling;
       if (!run) {
         for (const pat of clause.patterns) {
-          if (globMatch(subject, await expandNoSplit(this, pat.text))) {
+          if (globMatch(subject, await expandNoSplit(this, pat.text), this.shopts.nocasematch)) {
             run = true;
             break;
           }

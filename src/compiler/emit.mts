@@ -268,7 +268,8 @@ class Emitter {
     if (pw.parts.every((p) => p.k === "lit")) {
       const lit = pw.parts.map((p) => (p.k === "lit" ? p.s : "")).join("");
       const src = globToRegExpSource(lit).replace(/\//g, "\\/");
-      return `/${src}/s.test(${subjectExpr})`;
+      // Fast inline regex, but defer to sh.match when nocasematch is on (runtime).
+      return `(sh.shopts.nocasematch ? sh.match(${subjectExpr}, ${JSON.stringify(lit)}) : /${src}/s.test(${subjectExpr}))`;
     }
     return `sh.match(${subjectExpr}, ${this.templateOf(pw.parts)})`;
   }

@@ -574,6 +574,34 @@ const builtinBuiltin: Builtin = async (shell, ...args) => {
   return shell.runBuiltin(args[0]!, args.slice(1));
 };
 
+const shopt: Builtin = (shell, ...args) => {
+  let mode: "s" | "u" | "" = "";
+  let quiet = false;
+  const names: string[] = [];
+  for (const a of args) {
+    if (a === "-s") mode = "s";
+    else if (a === "-u") mode = "u";
+    else if (a === "-q") quiet = true;
+    else if (a === "-p" || a === "-o") continue; // -o (set-style) unsupported
+    else names.push(a);
+  }
+  const show = (n: string): void => {
+    if (!quiet) shell.io.out(`${n.padEnd(15)}\t${shell.shopts[n] ? "on" : "off"}\n`);
+  };
+  if (mode === "") {
+    // Query / print. `shopt` or `shopt -q` returns 0 iff all named are set.
+    const list = names.length > 0 ? names : Object.keys(shell.shopts).sort();
+    let status = 0;
+    for (const n of list) {
+      show(n);
+      if (!shell.shopts[n]) status = 1;
+    }
+    return status;
+  }
+  for (const n of names) shell.shopts[n] = mode === "s";
+  return 0;
+};
+
 const signalName = (s: string): string => {
   const up = s.toUpperCase();
   if (up === "0") return "EXIT";
@@ -795,6 +823,7 @@ export const builtins: Record<string, Builtin> = {
   readonly: readonlyBuiltin,
   read,
   trap,
+  shopt,
   type,
   command,
   builtin: builtinBuiltin,
