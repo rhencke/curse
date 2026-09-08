@@ -13,6 +13,7 @@ import type { Param, ParsedWord, WordPart } from "../parser/word.mts";
 import { braceExpand } from "../parser/brace.mts";
 import { evalArith } from "./arith.mts";
 import { replaceGlob, substr, trimPrefix, trimSuffix } from "./param.mts";
+import { ExitSignal } from "./types.mts";
 
 const isIFSWhitespace = (c: string): boolean => c === " " || c === "\t" || c === "\n";
 
@@ -64,6 +65,17 @@ const evalParam = async (shell: Shell, prm: Param): Promise<string> => {
   const val = rawVal ?? "";
   const arg = (): Promise<string> => expandNoSplit(shell, prm.arg);
   const arg2 = (): Promise<string> => expandNoSplit(shell, prm.arg2);
+
+  // set -u: a plain reference (or ${#x}) to an unset parameter is an error.
+  if (prm.op === "" && shell.opts.nounset) {
+    const unbound = prm.special
+      ? /^[0-9]+$/.test(prm.name) && Number(prm.name) > shell.positional.length
+      : rawVal === undefined;
+    if (unbound) {
+      shell.io.err(`${shell.name}: ${prm.name}: unbound variable\n`);
+      throw new ExitSignal(1);
+    }
+  }
 
   if (prm.length) {
     if (prm.name === "@" || prm.name === "*" || prm.name === "#") {

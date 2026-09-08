@@ -85,6 +85,11 @@ export class Shell {
   private jobs: Array<{ pid: number; promise: Promise<number> }> = [];
   private nextPid = 10000;
 
+  /** `set` options. */
+  opts = { errexit: false, nounset: false, xtrace: false, pipefail: false };
+  /** Depth of errexit-suppressed contexts (conditions, `!`, `&&`/`||` non-final). */
+  condDepth = 0;
+
   private globalScope: Scope = Object.create(null) as Scope;
   private scope: Scope = this.globalScope;
   private functions: Record<string, unknown> = Object.create(builtins) as Record<string, unknown>;
@@ -166,6 +171,19 @@ export class Shell {
 
   getVar(name: string): string | undefined {
     return this.lookup(name)?.value;
+  }
+
+  /** Read a plain `$name` reference, honoring `set -u` (used by generated code). */
+  ref(name: string): string {
+    const v = this.lookup(name);
+    if (v === undefined) {
+      if (this.opts.nounset) {
+        this.io.err(`${this.name}: ${name}: unbound variable\n`);
+        throw new ExitSignal(1);
+      }
+      return "";
+    }
+    return v.value;
   }
   setVar(name: string, value: string): void {
     this.assign(name, value);
@@ -313,6 +331,7 @@ export class Shell {
       code = await this.external(name, args, {});
     }
     this.status = code;
+    this.checkErrexit();
     return code;
   }
 
@@ -485,7 +504,20 @@ export class Shell {
     sub.status = this.status;
     sub.name = this.name;
     sub.cwd = this.cwd;
+    sub.opts = { ...this.opts };
     return sub;
+  }
+
+  /** Enter an errexit-suppressed scope (conditions, `!`, `&&`/`||` non-final).
+   *  Used by generated code via `using _ = sh.suppress();` so the scope is
+   *  restored automatically at block exit (including on throw). */
+  suppress(): Disposable {
+    this.condDepth++;
+    return {
+      [Symbol.dispose]: () => {
+        this.condDepth--;
+      },
+    };
   }
 
   /** Pattern match (used by generated `case` / `[[ == ]]` with dynamic patterns). */
@@ -617,6 +649,7 @@ export class Shell {
   async pipeline(stages: Array<(sh: Shell) => Promise<unknown>>): Promise<number> {
     let input = this.stdinData;
     let status = 0;
+    let lastNonZero = 0;
     for (let idx = 0; idx < stages.length; idx++) {
       const isLast = idx === stages.length - 1;
       const chunks: string[] = [];
@@ -624,10 +657,12 @@ export class Shell {
       const sub = this.cloneForSubshell(io);
       sub.stdinData = input;
       status = await runBody(sub, stages[idx]!);
+      if (status !== 0) lastNonZero = status;
       if (!isLast) input = chunks.join("");
     }
-    this.status = status;
-    return status;
+    this.status = this.opts.pipefail ? lastNonZero : status;
+    this.checkErrexit();
+    return this.status;
   }
 
   /** Start a command in the background (a subshell); sets `$!`, returns 0. */
@@ -680,25 +715,41 @@ export class Shell {
   }
 
   async execute(cmd: Command): Promise<number> {
+    const invert = cmd.flags !== undefined && (cmd.flags & CMD_INVERT_RETURN) !== 0;
+    if (invert) this.condDepth++; // `! cmd` is exempt from errexit
     let status: number;
-    if (cmd.redirects !== undefined && cmd.redirects.length > 0) {
-      const reds: RedirIO[] = [];
-      for (const r of cmd.redirects) {
-        const target =
-          r.op === "<<" || r.op === "<<-"
-            ? await expandParsed(this, parseHeredoc(r.target.text, r.expand !== false))
-            : await expandNoSplit(this, r.target.text);
-        reds.push({ op: r.op, fd: r.fd, target });
+    try {
+      if (cmd.redirects !== undefined && cmd.redirects.length > 0) {
+        const reds: RedirIO[] = [];
+        for (const r of cmd.redirects) {
+          const target =
+            r.op === "<<" || r.op === "<<-"
+              ? await expandParsed(this, parseHeredoc(r.target.text, r.expand !== false))
+              : await expandNoSplit(this, r.target.text);
+          reds.push({ op: r.op, fd: r.fd, target });
+        }
+        status = await this.withRedirects(reds, () => this.dispatch(cmd));
+      } else {
+        status = await this.dispatch(cmd);
       }
-      status = await this.withRedirects(reds, () => this.dispatch(cmd));
-    } else {
-      status = await this.dispatch(cmd);
+    } finally {
+      if (invert) this.condDepth--;
     }
-    if (cmd.flags !== undefined && (cmd.flags & CMD_INVERT_RETURN) !== 0) {
+    if (invert) {
       status = status === 0 ? 1 : 0;
       this.status = status;
     }
     return status;
+  }
+
+  /** `set -e`: throw to exit when a command fails outside a suppressed context
+   *  (conditions, `!`, and the non-final operands of && / ||). Called at the
+   *  shared choke points (callByName, pipeline) so both the interpreter and the
+   *  AOT-generated code honor it. */
+  private checkErrexit(): void {
+    if (this.opts.errexit && this.status !== 0 && this.condDepth === 0) {
+      throw new ExitSignal(this.status);
+    }
   }
 
   private async dispatch(cmd: Command): Promise<number> {
@@ -775,11 +826,23 @@ export class Shell {
       return this.execute(second);
     }
     if (connector === "&&") {
-      const s = await this.execute(first);
+      this.condDepth++;
+      let s: number;
+      try {
+        s = await this.execute(first);
+      } finally {
+        this.condDepth--;
+      }
       return s === 0 ? this.execute(second) : s;
     }
     if (connector === "||") {
-      const s = await this.execute(first);
+      this.condDepth++;
+      let s: number;
+      try {
+        s = await this.execute(first);
+      } finally {
+        this.condDepth--;
+      }
       return s !== 0 ? this.execute(second) : s;
     }
     throw new Error(`connector \`${connector}\` not supported yet`);
@@ -805,6 +868,7 @@ export class Shell {
       this.status = 0;
       return 0;
     }
+    if (this.opts.xtrace) this.io.err("+ " + argv.join(" ") + "\n");
     if (assigns.length > 0) {
       const env: Record<string, string> = {};
       for (const [n, v] of assigns) env[n] = v;
@@ -813,8 +877,18 @@ export class Shell {
     return this.callByName(argv[0]!, argv.slice(1));
   }
 
+  /** Run a command as a condition: exempt from errexit. */
+  private async condition(cmd: Command): Promise<number> {
+    this.condDepth++;
+    try {
+      return await this.execute(cmd);
+    } finally {
+      this.condDepth--;
+    }
+  }
+
   private async execIf(cmd: IfCommand): Promise<number> {
-    if ((await this.execute(cmd.test)) === 0) return this.execute(cmd.consequent);
+    if ((await this.condition(cmd.test)) === 0) return this.execute(cmd.consequent);
     if (cmd.alternate !== null) return this.execute(cmd.alternate);
     this.status = 0;
     return 0;
@@ -823,7 +897,7 @@ export class Shell {
   private async execWhile(cmd: WhileCommand): Promise<number> {
     let last = 0;
     for (;;) {
-      const s = await this.execute(cmd.test);
+      const s = await this.condition(cmd.test);
       if (cmd.until ? s === 0 : s !== 0) break;
       last = await this.execute(cmd.body);
     }

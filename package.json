@@ -13,7 +13,7 @@
   },
   "scripts": {
     "typecheck": "tsc --noEmit",
-    "test": "node --test",
+    "test": "node --test 'test/**/*.test.mts'",
     "check": "npm run typecheck && npm run test",
     "spec": "node ./test/spec/run.mts",
     "curse": "node ./src/cli/curse.mts"

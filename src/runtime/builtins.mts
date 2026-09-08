@@ -220,6 +220,48 @@ const shift: Builtin = (shell, ...args) => {
   return 0;
 };
 
+const setBuiltin: Builtin = (shell, ...args) => {
+  const opt = (name: string, on: boolean): void => {
+    if (name === "errexit") shell.opts.errexit = on;
+    else if (name === "nounset") shell.opts.nounset = on;
+    else if (name === "xtrace") shell.opts.xtrace = on;
+    else if (name === "pipefail") shell.opts.pipefail = on;
+  };
+  const flag = (ch: string, on: boolean): void => {
+    if (ch === "e") opt("errexit", on);
+    else if (ch === "u") opt("nounset", on);
+    else if (ch === "x") opt("xtrace", on);
+  };
+
+  let i = 0;
+  let setPositional = false;
+  for (; i < args.length; i++) {
+    const a = args[i]!;
+    if (a === "--") {
+      i++;
+      setPositional = true;
+      break;
+    }
+    if (a === "-o" || a === "+o") {
+      const name = args[i + 1];
+      if (name !== undefined) {
+        opt(name, a === "-o");
+        i++;
+      }
+      continue;
+    }
+    if (a.length > 1 && (a[0] === "-" || a[0] === "+")) {
+      const on = a[0] === "-";
+      for (const ch of a.slice(1)) flag(ch, on);
+      continue;
+    }
+    break; // start of positional parameters
+  }
+  const rest = args.slice(i);
+  if (setPositional || rest.length > 0) shell.positional = rest;
+  return 0;
+};
+
 const wait: Builtin = async (shell, ...args) => {
   if (args.length === 0) {
     await shell.waitAll();
@@ -387,6 +429,7 @@ export const builtins: Record<string, Builtin> = {
   exit: exitBuiltin,
   shift,
   wait,
+  set: setBuiltin,
   read,
   test,
   "[": bracket,
