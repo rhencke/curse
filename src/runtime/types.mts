@@ -22,6 +22,9 @@ export class Var {
   readonly = false;
   /** declare -n: a nameref whose `value` holds the target variable's name. */
   ref = false;
+  /** Declared but unset (e.g. `local x`): occupies scope for shadowing, but
+   *  reads as unset until a value is assigned. */
+  unset = false;
   constructor(value: string, exported = false) {
     this.value = value;
     this.exported = exported;

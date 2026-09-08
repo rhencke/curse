@@ -279,6 +279,7 @@ export class Shell {
       if (v.assoc !== null) v.assoc.set("0", cs);
       else if (v.arr !== null) v.arr.set(0, cs);
       else v.value = cs;
+      v.unset = false;
     } else {
       this.globalScope[name] = new Var(s, process.env[name] !== undefined);
     }
@@ -311,7 +312,9 @@ export class Shell {
   }
 
   getVar(name: string): string | undefined {
-    return this.lookup(name)?.scalar();
+    const v = this.lookup(name);
+    if (v === undefined || v.unset) return undefined;
+    return v.scalar();
   }
 
   /** `${!prefix*}` / `${!prefix@}` — set variable names sharing a prefix. */
@@ -389,42 +392,46 @@ export class Shell {
   setArray(name: string, values: string[]): void {
     const v = this.varForWrite(name);
     v.arr = new Map();
+    v.unset = false;
     values.forEach((val, i) => v.arr!.set(i, val));
   }
   setElem(name: string, index: number, value: string): void {
-    const arr = this.toArray(this.varForWrite(name));
-    const i = index < 0 ? this.maxIndex(this.varForWrite(name)) + 1 + index : index;
+    const v = this.varForWrite(name);
+    v.unset = false;
+    const arr = this.toArray(v);
+    const i = index < 0 ? this.maxIndex(v) + 1 + index : index;
     arr.set(i < 0 ? 0 : i, value);
   }
   appendArray(name: string, values: string[]): void {
     const v = this.varForWrite(name);
+    v.unset = false;
     const arr = this.toArray(v);
     let next = this.maxIndex(v) + 1;
     for (const val of values) arr.set(next++, val);
   }
   arrayGet(name: string, index: number): string | undefined {
     const v = this.lookup(name);
-    if (!v) return undefined;
+    if (!v || v.unset) return undefined;
     if (v.arr === null) return index === 0 ? v.value : undefined;
     return v.arr.get(index < 0 ? this.maxIndex(v) + 1 + index : index);
   }
   arrayValues(name: string): string[] {
     const v = this.lookup(name);
-    if (!v) return [];
+    if (!v || v.unset) return [];
     if (v.assoc !== null) return [...v.assoc.values()];
     if (v.arr === null) return [v.value];
     return [...v.arr.entries()].sort((a, b) => a[0] - b[0]).map((e) => e[1]);
   }
   arrayIndices(name: string): string[] {
     const v = this.lookup(name);
-    if (!v) return [];
+    if (!v || v.unset) return [];
     if (v.assoc !== null) return [...v.assoc.keys()];
     if (v.arr === null) return ["0"];
     return [...v.arr.keys()].sort((a, b) => a - b).map(String);
   }
   arrayLen(name: string): number {
     const v = this.lookup(name);
-    if (!v) return 0;
+    if (!v || v.unset) return 0;
     if (v.assoc !== null) return v.assoc.size;
     return v.arr === null ? 1 : v.arr.size;
   }
@@ -466,6 +473,7 @@ export class Shell {
   }
   setArrayFields(name: string, fields: string[]): void {
     const v = this.varForWrite(name);
+    v.unset = false;
     if (v.assoc !== null) {
       v.assoc = new Map();
       this.fillAssoc(v.assoc, fields);
@@ -477,6 +485,7 @@ export class Shell {
   }
   appendArrayFields(name: string, fields: string[]): void {
     const v = this.varForWrite(name);
+    v.unset = false;
     if (v.assoc !== null) {
       this.fillAssoc(v.assoc, fields);
       return;
@@ -518,7 +527,7 @@ export class Shell {
   /** Read a plain `$name` reference, honoring `set -u` (used by generated code). */
   ref(name: string): string {
     const v = this.lookup(name);
-    if (v === undefined) {
+    if (v === undefined || v.unset) {
       if (this.opts.nounset) {
         this.io.err(`${this.name}: ${name}: unbound variable\n`);
         throw new ExitSignal(1);
@@ -555,7 +564,9 @@ export class Shell {
     if (sub === "0" || sub === "@" || sub === "*") this.unsetVar(name);
   }
   local(name: string, value?: string): void {
-    this.scope[name] = new Var(value ?? "");
+    const v = new Var(value ?? "");
+    if (value === undefined) v.unset = true; // `local x` declares but doesn't set
+    this.scope[name] = v;
   }
   /** `name+=v`: numeric add for integer vars, else string append. */
   appendVar(name: string, rhs: string): void {
@@ -975,6 +986,7 @@ export class Shell {
           nv.upper = v.upper;
           nv.readonly = v.readonly;
           nv.ref = v.ref;
+          nv.unset = v.unset;
           flat[k] = nv;
         }
       }
@@ -1036,7 +1048,8 @@ export class Shell {
 
   /** Whether a variable is set (used by generated `${x-…}` / `${x+…}`). */
   has(name: string): boolean {
-    return this.lookup(name) !== undefined;
+    const v = this.lookup(name);
+    return v !== undefined && !v.unset;
   }
 
   /* Parameter-expansion string ops (used by generated code). */
@@ -1080,9 +1093,9 @@ export class Shell {
    *  Shared by `[[ -v ]]`, the `test` builtin, and generated code. */
   isSet(arg: string): boolean {
     const m = /^([A-Za-z_][A-Za-z0-9_]*)\[([\s\S]*)\]$/.exec(arg);
-    if (m === null) return this.lookup(arg) !== undefined;
+    if (m === null) return this.has(arg);
     const v = this.lookup(m[1]!);
-    if (v === undefined) return false;
+    if (v === undefined || v.unset) return false;
     const sub = m[2]!;
     // For an associative array @/* are literal keys, not "any element".
     if (v.assoc !== null) return v.assoc.has(sub);
