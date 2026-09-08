@@ -7,7 +7,7 @@
  * them do not terminate the word.
  */
 
-export type TokenType = "WORD" | "OP" | "NEWLINE" | "EOF";
+export type TokenType = "WORD" | "OP" | "NEWLINE" | "ARITH" | "EOF";
 
 export interface Token {
   type: TokenType;
@@ -106,8 +106,16 @@ class Lexer {
     if (c === "<" || c === ">") {
       throw new LexError(`redirection \`${c}\` not supported yet (planned for M3)`);
     }
-    if (c === "(" || c === ")") {
-      throw new LexError(`\`${c}\` (subshell/group) not supported yet (planned for M1)`);
+    if (c === "(") {
+      if (this.at(1) === "(") {
+        return { type: "ARITH", value: this.scanArithCommand(), pos, line };
+      }
+      this.i++;
+      return { type: "OP", value: "(", pos, line };
+    }
+    if (c === ")") {
+      this.i++;
+      return { type: "OP", value: ")", pos, line };
     }
 
     // Otherwise, a word.
@@ -254,6 +262,34 @@ class Lexer {
       this.i++;
       if (c === "`") return buf;
       if (c === "\n") this.line++;
+    }
+  }
+
+  /** Scan a `(( ... ))` arithmetic command, returning the inner text (without
+   *  the surrounding `((` `))`). The body is captured raw so operators such as
+   *  `<`, `>`, `&` inside it are not seen by the shell tokenizer. */
+  private scanArithCommand(): string {
+    // this.at() === "(" && this.at(1) === "("
+    this.i += 2;
+    let opens = 2;
+    let buf = "";
+    for (;;) {
+      const c = this.at();
+      if (c === undefined) throw new LexError("unterminated `(( ))`");
+      this.i++;
+      if (c === "(") {
+        opens++;
+        buf += c;
+        continue;
+      }
+      if (c === ")") {
+        opens--;
+        if (opens >= 2) buf += c; // a nested inner paren
+        if (opens === 0) return buf;
+        continue;
+      }
+      if (c === "\n") this.line++;
+      buf += c;
     }
   }
 

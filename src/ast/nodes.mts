@@ -44,6 +44,9 @@ export interface Word {
 
 export const makeWord = (text: string, flags = 0): Word => ({ text, flags });
 
+/* CMD_* flags (command.h). Only the ones we honor so far. */
+export const CMD_INVERT_RETURN = 0x04;
+
 /* enum command_type (command.h). */
 export type Command =
   | ConnectionCommand
@@ -53,6 +56,8 @@ export type Command =
   | IfCommand
   | WhileCommand
   | ForCommand
+  | ArithForCommand
+  | ArithCommand
   | CaseCommand
   | FunctionDef;
 
@@ -109,6 +114,21 @@ export interface ForCommand extends CommandBase {
   type: "for";
   name: string;
   words: Word[]; // list to iterate; empty => "$@"
+  body: Command;
+}
+
+/** ARITH_COM (command.h): `(( expression ))`. */
+export interface ArithCommand extends CommandBase {
+  type: "arith";
+  expression: string; // raw arithmetic text (pre-expansion happens at runtime)
+}
+
+/** ARITH_FOR_COM (command.h): `for ((init; test; step)) do ... done`. */
+export interface ArithForCommand extends CommandBase {
+  type: "arith_for";
+  init: string;
+  test: string;
+  step: string;
   body: Command;
 }
 

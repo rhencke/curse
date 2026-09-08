@@ -2,7 +2,7 @@
  * NOTICE.md). argv[0] is the builtin name; arguments begin at argv[1]. */
 
 import { resolve } from "node:path";
-import { statSync } from "node:fs";
+import { accessSync, constants, lstatSync, statSync } from "node:fs";
 import type { Shell } from "./shell.mts";
 
 export type Builtin = (argv: string[], shell: Shell) => number | Promise<number>;
@@ -192,6 +192,124 @@ const unset: Builtin = (argv, shell) => {
   return 0;
 };
 
+/* ---- test / [ ---- */
+
+const statOf = (p: string) => {
+  try {
+    return statSync(p);
+  } catch {
+    return null;
+  }
+};
+const canAccess = (p: string, mode: number): boolean => {
+  try {
+    accessSync(p, mode);
+    return true;
+  } catch {
+    return false;
+  }
+};
+
+const UNARY = new Set(["-z", "-n", "-e", "-f", "-d", "-s", "-r", "-w", "-x", "-h", "-L"]);
+const BINARY = new Set(["=", "==", "!=", "<", ">", "-eq", "-ne", "-lt", "-le", "-gt", "-ge"]);
+
+const unaryTest = (op: string, arg: string, shell: Shell): boolean => {
+  if (op === "-z") return arg.length === 0;
+  if (op === "-n") return arg.length > 0;
+  const p = resolve(shell.cwd, arg);
+  switch (op) {
+    case "-e": return statOf(p) !== null;
+    case "-f": return statOf(p)?.isFile() ?? false;
+    case "-d": return statOf(p)?.isDirectory() ?? false;
+    case "-s": return (statOf(p)?.size ?? 0) > 0;
+    case "-r": return canAccess(p, constants.R_OK);
+    case "-w": return canAccess(p, constants.W_OK);
+    case "-x": return canAccess(p, constants.X_OK);
+    case "-h": case "-L":
+      try {
+        return lstatSync(p).isSymbolicLink();
+      } catch {
+        return false;
+      }
+    default:
+      throw new Error(`${op}: unary operator expected`);
+  }
+};
+
+const binaryTest = (a: string, op: string, b: string): boolean => {
+  switch (op) {
+    case "=": case "==": return a === b;
+    case "!=": return a !== b;
+    case "<": return a < b;
+    case ">": return a > b;
+    case "-eq": return toInt(a) === toInt(b);
+    case "-ne": return toInt(a) !== toInt(b);
+    case "-lt": return toInt(a) < toInt(b);
+    case "-le": return toInt(a) <= toInt(b);
+    case "-gt": return toInt(a) > toInt(b);
+    case "-ge": return toInt(a) >= toInt(b);
+    default: throw new Error(`${op}: binary operator expected`);
+  }
+};
+
+const splitTop = (a: string[], sep: string): string[][] => {
+  const groups: string[][] = [];
+  let cur: string[] = [];
+  for (const x of a) {
+    if (x === sep) {
+      groups.push(cur);
+      cur = [];
+    } else {
+      cur.push(x);
+    }
+  }
+  groups.push(cur);
+  return groups;
+};
+
+const evalTest = (a: string[], shell: Shell): boolean => {
+  switch (a.length) {
+    case 0:
+      return false;
+    case 1:
+      return a[0]!.length > 0;
+    case 2:
+      if (a[0] === "!") return !(a[1]!.length > 0);
+      if (UNARY.has(a[0]!)) return unaryTest(a[0]!, a[1]!, shell);
+      throw new Error(`${a[0]}: unary operator expected`);
+    case 3:
+      if (BINARY.has(a[1]!)) return binaryTest(a[0]!, a[1]!, a[2]!);
+      if (a[0] === "!") return !evalTest(a.slice(1), shell);
+      if (a[0] === "(" && a[2] === ")") return evalTest([a[1]!], shell);
+      throw new Error(`${a[1]}: binary operator expected`);
+    case 4:
+      if (a[0] === "!") return !evalTest(a.slice(1), shell);
+      if (a[0] === "(" && a[3] === ")") return evalTest(a.slice(1, 3), shell);
+      break;
+  }
+  // General case: OR of ANDs (no parentheses beyond the cases above).
+  return splitTop(a, "-o").some((orPart) =>
+    splitTop(orPart, "-a").every((andPart) => evalTest(andPart, shell)),
+  );
+};
+
+const test: Builtin = (argv, shell) => {
+  let args = argv.slice(1);
+  if (argv[0] === "[") {
+    if (args[args.length - 1] !== "]") {
+      shell.io.err("[: missing `]'\n");
+      return 2;
+    }
+    args = args.slice(0, -1);
+  }
+  try {
+    return evalTest(args, shell) ? 0 : 1;
+  } catch (e) {
+    shell.io.err(`${argv[0]}: ${e instanceof Error ? e.message : String(e)}\n`);
+    return 2;
+  }
+};
+
 export const builtins: Record<string, Builtin> = {
   ":": () => 0,
   true: () => 0,
@@ -202,4 +320,6 @@ export const builtins: Record<string, Builtin> = {
   cd,
   export: exportBuiltin,
   unset,
+  test,
+  "[": test,
 };

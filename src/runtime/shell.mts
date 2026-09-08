@@ -6,12 +6,15 @@
  * M0: simple commands, `;` / `&&` / `||`, assignments, command substitution,
  * builtins, and external process spawning. */
 
-import type { Command } from "../ast/nodes.mts";
-import { makeWord } from "../ast/nodes.mts";
+import type { ArithForCommand, Command, ForCommand, IfCommand, WhileCommand } from "../ast/nodes.mts";
+import { CMD_INVERT_RETURN, makeWord } from "../ast/nodes.mts";
 import { parse } from "../parser/parser.mts";
 import { expandNoSplit, expandWords } from "./expand.mts";
+import { evalArith } from "./arith.mts";
 import { builtins } from "./builtins.mts";
 import { spawn } from "node:child_process";
+
+const errMsg = (e: unknown): string => (e instanceof Error ? e.message : String(e));
 
 export interface IO {
   out: (s: string) => void;
@@ -67,27 +70,174 @@ export class Shell {
 
   /** Execute a parsed command tree, returning its exit status. */
   async execute(cmd: Command): Promise<number> {
+    let status: number;
     switch (cmd.type) {
-      case "connection": {
-        if (cmd.connector === ";") {
-          await this.execute(cmd.first);
-          return this.execute(cmd.second);
-        }
-        if (cmd.connector === "&&") {
-          const s = await this.execute(cmd.first);
-          return s === 0 ? this.execute(cmd.second) : s;
-        }
-        if (cmd.connector === "||") {
-          const s = await this.execute(cmd.first);
-          return s !== 0 ? this.execute(cmd.second) : s;
-        }
-        throw new Error(`connector \`${cmd.connector}\` not supported yet`);
-      }
+      case "connection":
+        status = await this.execConnection(cmd.connector, cmd.first, cmd.second);
+        break;
       case "simple":
-        return this.simpleRaw(cmd.words.map((w) => w.text));
+        status = await this.simpleRaw(cmd.words.map((w) => w.text));
+        break;
+      case "group":
+        status = await this.execute(cmd.body);
+        break;
+      case "subshell":
+        status = await this.execSubshell(cmd.body);
+        break;
+      case "if":
+        status = await this.execIf(cmd);
+        break;
+      case "while":
+        status = await this.execWhile(cmd);
+        break;
+      case "for":
+        status = await this.execFor(cmd);
+        break;
+      case "arith_for":
+        status = await this.execArithFor(cmd);
+        break;
+      case "arith":
+        status = await this.arithCommand(cmd.expression);
+        break;
       default:
         throw new Error(`command type \`${cmd.type}\` not supported yet`);
     }
+
+    if (cmd.flags !== undefined && (cmd.flags & CMD_INVERT_RETURN) !== 0) {
+      status = status === 0 ? 1 : 0;
+      this.status = status;
+    }
+    return status;
+  }
+
+  private async execConnection(
+    connector: string,
+    first: Command,
+    second: Command,
+  ): Promise<number> {
+    if (connector === ";") {
+      await this.execute(first);
+      return this.execute(second);
+    }
+    if (connector === "&&") {
+      const s = await this.execute(first);
+      return s === 0 ? this.execute(second) : s;
+    }
+    if (connector === "||") {
+      const s = await this.execute(first);
+      return s !== 0 ? this.execute(second) : s;
+    }
+    throw new Error(`connector \`${connector}\` not supported yet`);
+  }
+
+  private async execIf(cmd: IfCommand): Promise<number> {
+    if ((await this.execute(cmd.test)) === 0) return this.execute(cmd.consequent);
+    if (cmd.alternate !== null) return this.execute(cmd.alternate);
+    this.status = 0;
+    return 0;
+  }
+
+  private async execWhile(cmd: WhileCommand): Promise<number> {
+    let last = 0;
+    for (;;) {
+      const s = await this.execute(cmd.test);
+      if (cmd.until ? s === 0 : s !== 0) break;
+      last = await this.execute(cmd.body);
+    }
+    this.status = last;
+    return last;
+  }
+
+  private async execFor(cmd: ForCommand): Promise<number> {
+    const items = await expandWords(this, cmd.words);
+    let last = 0;
+    for (const item of items) {
+      this.setVar(cmd.name, item);
+      last = await this.execute(cmd.body);
+    }
+    this.status = last;
+    return last;
+  }
+
+  private async execArithFor(cmd: ArithForCommand): Promise<number> {
+    let last = 0;
+    try {
+      await this.arithRun(cmd.init);
+      for (;;) {
+        if (!(await this.arithTest(cmd.test))) break;
+        last = await this.execute(cmd.body);
+        await this.arithRun(cmd.step);
+      }
+    } catch (e) {
+      this.io.err(`${this.name}: ((: ${errMsg(e)}\n`);
+      this.status = 1;
+      return 1;
+    }
+    this.status = last;
+    return last;
+  }
+
+  private async execSubshell(body: Command): Promise<number> {
+    const sub = this.cloneForSubshell();
+    const s = await sub.execute(body);
+    this.status = s;
+    return s;
+  }
+
+  private cloneForSubshell(): Shell {
+    const sub = new Shell(this.io);
+    sub.vars = new Map(this.vars);
+    sub.exported = new Set(this.exported);
+    sub.cwd = this.cwd;
+    sub.name = this.name;
+    sub.status = this.status;
+    return sub;
+  }
+
+  /* ---- arithmetic entry points (shared with generated code) ---- */
+
+  private async arithValue(expr: string): Promise<bigint> {
+    return evalArith(this, await expandNoSplit(this, expr));
+  }
+
+  /** `(( expr ))` command: status 0 if the value is non-zero, else 1. */
+  async arithCommand(expr: string): Promise<number> {
+    try {
+      this.status = (await this.arithValue(expr)) !== 0n ? 0 : 1;
+    } catch (e) {
+      this.io.err(`${this.name}: ((: ${expr}: ${errMsg(e)}\n`);
+      this.status = 1;
+    }
+    return this.status;
+  }
+
+  /** Evaluate for side effects (arith-for init/step); empty is a no-op. */
+  async arithRun(expr: string): Promise<void> {
+    if (expr !== "") await this.arithValue(expr);
+  }
+
+  /** Arith-for test: an empty test is always true. */
+  async arithTest(expr: string): Promise<boolean> {
+    if (expr === "") return true;
+    return (await this.arithValue(expr)) !== 0n;
+  }
+
+  /** Expand a word list to fields (used by generated `for` loops). */
+  async expandList(rawWords: string[]): Promise<string[]> {
+    return expandWords(this, rawWords.map((t) => makeWord(t)));
+  }
+
+  /** Run a body in a subshell (used by generated subshells). */
+  async runSubshell(fn: (sh: Shell) => Promise<void>): Promise<number> {
+    const sub = this.cloneForSubshell();
+    await fn(sub);
+    this.status = sub.status;
+    return sub.status;
+  }
+
+  /** Apply `!` inversion in generated code. */
+  invert(): void {
+    this.status = this.status === 0 ? 1 : 0;
   }
 
   /** Execute a simple command given the raw (unexpanded) word texts. This is the

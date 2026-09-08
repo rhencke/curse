@@ -10,6 +10,7 @@
 
 import type { Word } from "../ast/nodes.mts";
 import type { Shell } from "./shell.mts";
+import { evalArith } from "./arith.mts";
 
 const isNameStart = (c: string): boolean =>
   (c >= "a" && c <= "z") || (c >= "A" && c <= "Z") || c === "_";
@@ -142,7 +143,30 @@ class Expander {
 
     if (n === "(") {
       if (this.at(2) === "(") {
-        throw new Error("arithmetic expansion `$(( ))` not implemented yet (planned for M1)");
+        // arithmetic expansion: $(( expr ))
+        this.i += 3; // past "$(("
+        let opens = 2;
+        let expr = "";
+        for (;;) {
+          const d = this.at();
+          if (d === undefined) throw new Error("unterminated `$(( ))`");
+          this.i++;
+          if (d === "(") {
+            opens++;
+            expr += d;
+            continue;
+          }
+          if (d === ")") {
+            opens--;
+            if (opens >= 2) expr += d;
+            if (opens === 0) break;
+            continue;
+          }
+          expr += d;
+        }
+        const pre = await expandNoSplit(this.shell, expr);
+        this.emit(evalArith(this.shell, pre).toString(), splittable);
+        return;
       }
       // command substitution: copy inner (balanced parens) then run it
       this.i += 2; // past "$("

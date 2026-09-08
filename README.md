@@ -60,17 +60,25 @@ reference/bash/ upstream bash 5.2.37 (gitignored) — porting source + test suit
 
 **M0 — foundation (done).** Simple commands, `;` / `&&` / `||`, assignments,
 `$var` / `${var}` / `$?`, single/double quotes + escapes, command substitution
-`$(...)`, field splitting on the default IFS, and a handful of builtins
-(`echo`, `printf`, `cd`, `pwd`, `export`, `unset`, `:`, `true`, `false`).
-Every case passes through both the interpreter and the AOT output, matching
+`$(...)`, field splitting on the default IFS, and core builtins (`echo`,
+`printf`, `cd`, `pwd`, `export`, `unset`, `:`, `true`, `false`).
+
+**M1 — control flow + arithmetic (mostly done).** `if`/`elif`/`else`,
+`while`/`until`, `for` (list form and C-style `for ((;;))`), subshells `( )`,
+groups `{ }`, `!` negation, the `(( ))` command and `$(( ))` expansion (a
+64-bit BigInt evaluator with C precedence and recursive variable resolution),
+and the `test` / `[` builtin. Still open in M1: `case`/`esac` and `[[ ]]`.
+
+Every case passes through **both** the interpreter and the AOT output, matching
 bash on stdout and exit status.
 
 ### Roadmap
 
-1. **M1** core language: `if` / `while` / `for` / `case`, `[[ ]]`, `(( ))`, `$(( ))`.
-2. **M2** words: full parameter expansion, arrays, globbing, `$@`/`$*`, positionals.
-3. **M3** processes: pipelines, redirections/heredocs, subshells, `&` / `wait`,
-   more builtins (`read`, `declare`, `local`, `set`, `trap`).
+1. **M1 remainder**: `case`/`esac`, `[[ ]]`.
+2. **M2** words: full parameter expansion (`${x:-y}`, `${x#p}`, …), arrays,
+   globbing, `$@`/`$*`, positional parameters, tilde/brace expansion.
+3. **M3** processes: pipelines, redirections/heredocs, `&` / `wait`, functions,
+   more builtins (`read`, `declare`, `local`, `set`, `trap`, `shift`, `return`).
 4. **M4** JIT: `eval` / `source "$x"` via the interpreter over the same AST.
 
 Long-term target: point bash's own `tests/run-all` at `curse` as `THIS_SH`.

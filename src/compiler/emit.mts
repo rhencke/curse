@@ -1,14 +1,13 @@
 /* AOT emitter: lower a command tree into a standalone `.mts` module.
  *
- * M0 lowers connection structure into native TypeScript control flow and
- * defers word-level semantics (expansion, splitting, quoting) to the runtime
- * via `sh.simpleRaw(rawWords)`. Later milestones push more into the emitted
- * code (literal argv, inlined arithmetic, etc.) for readability and speed.
- *
- * Every command leaves its exit status in `sh.status` (bash's `$?`), which is
- * how `&&` / `||` chain — exactly as the interpreter does. */
+ * Connection and compound structure become native TypeScript control flow;
+ * word-level semantics (expansion, splitting, quoting) and arithmetic are
+ * delegated to the runtime via `sh.*`. Every command leaves its status in
+ * `sh.status` (bash's `$?`), which is how `&&` / `||` / `if` / `while` chain —
+ * exactly as the interpreter does. */
 
 import type { Command } from "../ast/nodes.mts";
+import { CMD_INVERT_RETURN } from "../ast/nodes.mts";
 
 export interface EmitOptions {
   /** Import specifier (path or file: URL) for the runtime's `Shell`. */
@@ -16,38 +15,102 @@ export interface EmitOptions {
 }
 
 const pad = (n: number): string => "  ".repeat(n);
+const str = (s: string): string => JSON.stringify(s);
 
-const emitCommand = (cmd: Command, ind: number): string => {
-  switch (cmd.type) {
-    case "simple": {
-      const words = cmd.words.map((w) => JSON.stringify(w.text)).join(", ");
-      return `${pad(ind)}await sh.simpleRaw([${words}]);`;
+class Emitter {
+  private forId = 0;
+
+  command(cmd: Command, ind: number): string {
+    const base = this.base(cmd, ind);
+    if (cmd.flags !== undefined && (cmd.flags & CMD_INVERT_RETURN) !== 0) {
+      return base + "\n" + `${pad(ind)}sh.invert();`;
     }
-    case "connection": {
-      if (cmd.connector === ";") {
-        return emitCommand(cmd.first, ind) + "\n" + emitCommand(cmd.second, ind);
+    return base;
+  }
+
+  private base(cmd: Command, ind: number): string {
+    const i = pad(ind);
+    switch (cmd.type) {
+      case "simple": {
+        const words = cmd.words.map((w) => str(w.text)).join(", ");
+        return `${i}await sh.simpleRaw([${words}]);`;
       }
-      if (cmd.connector === "&&" || cmd.connector === "||") {
-        const test = cmd.connector === "&&" ? "=== 0" : "!== 0";
+      case "connection": {
+        if (cmd.connector === ";") {
+          return this.command(cmd.first, ind) + "\n" + this.command(cmd.second, ind);
+        }
+        if (cmd.connector === "&&" || cmd.connector === "||") {
+          const test = cmd.connector === "&&" ? "=== 0" : "!== 0";
+          return (
+            this.command(cmd.first, ind) + "\n" +
+            `${i}if (sh.status ${test}) {\n` +
+            this.command(cmd.second, ind + 1) + "\n" +
+            `${i}}`
+          );
+        }
+        throw new Error(`connector \`${cmd.connector}\` not supported yet`);
+      }
+      case "group":
+        return this.command(cmd.body, ind);
+      case "subshell":
         return (
-          emitCommand(cmd.first, ind) + "\n" +
-          `${pad(ind)}if (sh.status ${test}) {\n` +
-          emitCommand(cmd.second, ind + 1) + "\n" +
-          `${pad(ind)}}`
+          `${i}await sh.runSubshell(async (sh) => {\n` +
+          this.command(cmd.body, ind + 1) + "\n" +
+          `${i}});`
+        );
+      case "if": {
+        let out =
+          this.command(cmd.test, ind) + "\n" +
+          `${i}if (sh.status === 0) {\n` +
+          this.command(cmd.consequent, ind + 1) + "\n" +
+          `${i}}`;
+        if (cmd.alternate !== null) {
+          out += ` else {\n` + this.command(cmd.alternate, ind + 1) + "\n" + `${i}}`;
+        }
+        return out;
+      }
+      case "while": {
+        const brk = cmd.until ? "=== 0" : "!== 0";
+        return (
+          `${i}for (;;) {\n` +
+          this.command(cmd.test, ind + 1) + "\n" +
+          `${pad(ind + 1)}if (sh.status ${brk}) break;\n` +
+          this.command(cmd.body, ind + 1) + "\n" +
+          `${i}}`
         );
       }
-      throw new Error(`connector \`${cmd.connector}\` not supported yet`);
+      case "for": {
+        const v = `__it${this.forId++}`;
+        const words = cmd.words.map((w) => str(w.text)).join(", ");
+        return (
+          `${i}for (const ${v} of await sh.expandList([${words}])) {\n` +
+          `${pad(ind + 1)}sh.setVar(${str(cmd.name)}, ${v});\n` +
+          this.command(cmd.body, ind + 1) + "\n" +
+          `${i}}`
+        );
+      }
+      case "arith_for":
+        return (
+          `${i}await sh.arithRun(${str(cmd.init)});\n` +
+          `${i}for (;;) {\n` +
+          `${pad(ind + 1)}if (!(await sh.arithTest(${str(cmd.test)}))) break;\n` +
+          this.command(cmd.body, ind + 1) + "\n" +
+          `${pad(ind + 1)}await sh.arithRun(${str(cmd.step)});\n` +
+          `${i}}`
+        );
+      case "arith":
+        return `${i}await sh.arithCommand(${str(cmd.expression)});`;
+      default:
+        throw new Error(`command type \`${cmd.type}\` not supported yet`);
     }
-    default:
-      throw new Error(`command type \`${cmd.type}\` not supported yet`);
   }
-};
+}
 
 export const emit = (cmd: Command | null, opts: EmitOptions): string => {
-  const body = cmd === null ? "" : emitCommand(cmd, 0) + "\n";
+  const body = cmd === null ? "" : new Emitter().command(cmd, 0) + "\n";
   return (
     "// Generated by curse. Do not edit.\n" +
-    `import { Shell } from ${JSON.stringify(opts.runtimeSpecifier)};\n` +
+    `import { Shell } from ${str(opts.runtimeSpecifier)};\n` +
     "\n" +
     "const sh = new Shell();\n" +
     body +
