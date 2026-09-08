@@ -21,7 +21,7 @@ import { parse } from "../parser/parser.mts";
 import { parseHeredoc } from "../parser/word.mts";
 import { expandNoSplit, expandParsed, expandWords, splitTaggedFields } from "./expand.mts";
 import { evalArith } from "./arith.mts";
-import { globMatch } from "./glob.mts";
+import { globExpand, globMatch, hasGlobMeta } from "./glob.mts";
 import {
   replaceGlob as pReplaceGlob, substr as pSubstr, trimPrefix as pTrimPrefix, trimSuffix as pTrimSuffix,
 } from "./param.mts";
@@ -654,6 +654,23 @@ export class Shell {
         this.condDepth--;
       },
     };
+  }
+
+  /** Pathname expansion of already-split fields (unquoted words only): a field
+   *  containing a glob metacharacter is replaced by its sorted matches, or kept
+   *  literal if none match. Shared by interpreter and generated code. */
+  glob(fields: string[]): string[] {
+    const out: string[] = [];
+    for (const f of fields) {
+      if (hasGlobMeta(f)) {
+        const m = globExpand(this.cwd, f);
+        if (m.length > 0) out.push(...m);
+        else out.push(f);
+      } else {
+        out.push(f);
+      }
+    }
+    return out;
   }
 
   /** Pattern match (used by generated `case` / `[[ == ]]` with dynamic patterns). */

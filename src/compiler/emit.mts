@@ -183,9 +183,14 @@ class Emitter {
     // Mixed with other text: `@`/`[@]` flows through as a scalar join (valStr),
     // matching how the interpreter and `echo` render it.
 
-    const needsFields = pw.parts.some((p) => p.k !== "lit" && !p.quoted);
-    if (!needsFields) return { spread: false, code: this.templateOf(pw.parts) };
-    return { spread: true, code: `...sh.fields(${pw.parts.map((p) => this.fieldArg(p)).join(", ")})` };
+    const needsSplit = pw.parts.some((p) => p.k !== "lit" && !p.quoted);
+    const litMeta = pw.parts.some((p) => p.k === "lit" && /[*?[]/.test(p.s));
+    // An unquoted word may glob (any resulting metachar is active).
+    const globbable = !pw.hasQuote && (needsSplit || litMeta);
+
+    if (!needsSplit && !globbable) return { spread: false, code: this.templateOf(pw.parts) };
+    const fieldsExpr = `sh.fields(${pw.parts.map((p) => this.fieldArg(p)).join(", ")})`;
+    return { spread: true, code: globbable ? `...sh.glob(${fieldsExpr})` : `...${fieldsExpr}` };
   }
 
   /* ---------------- commands ---------------- */

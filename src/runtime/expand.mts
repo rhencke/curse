@@ -179,7 +179,8 @@ export const expandWord = async (shell: Shell, word: Word): Promise<string[]> =>
       sp.push(splittable);
     }
   }
-  return splitTaggedFields(chars, sp, anchored);
+  const fields = splitTaggedFields(chars, sp, anchored);
+  return pw.hasQuote ? fields : shell.glob(fields);
 };
 
 /** Expand several words (brace expansion first), flattening into an argv list. */

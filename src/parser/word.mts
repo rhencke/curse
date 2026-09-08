@@ -44,6 +44,8 @@ export interface ParsedWord {
   /** True if the word had any literal text or quotes — an empty expansion then
    *  still yields one (empty) field rather than zero. */
   anchored: boolean;
+  /** True if any quoting/escaping occurred — such a word is not glob-expanded. */
+  hasQuote: boolean;
 }
 
 const isNameStart = (c: string): boolean =>
@@ -55,6 +57,7 @@ class WordParser {
   private readonly parts: WordPart[] = [];
   private lit = "";
   private anchored = false;
+  private hasQuote = false;
   private readonly t: string;
 
   constructor(text: string) {
@@ -88,6 +91,7 @@ class WordParser {
       if (c === undefined) break;
 
       if (c === "\\") {
+        this.hasQuote = true;
         const nc = this.at(1);
         if (nc === undefined) {
           this.pushLit("\\");
@@ -101,6 +105,7 @@ class WordParser {
         continue;
       }
       if (c === "'") {
+        this.hasQuote = true;
         this.anchored = true;
         this.i++;
         for (;;) {
@@ -113,16 +118,19 @@ class WordParser {
         continue;
       }
       if (c === '"') {
+        this.hasQuote = true;
         this.scanDouble();
         continue;
       }
       if (c === "$") {
         const n = this.at(1);
         if (n === "'") {
+          this.hasQuote = true;
           this.ansiC(); // $'...' -> literal (C escapes decoded)
           continue;
         }
         if (n === '"') {
+          this.hasQuote = true;
           this.i++; // $"..." -> treat like "..."
           continue;
         }
@@ -134,7 +142,7 @@ class WordParser {
       this.i++;
     }
     this.flushLit();
-    return { parts: this.parts, anchored: this.anchored };
+    return { parts: this.parts, anchored: this.anchored, hasQuote: this.hasQuote };
   }
 
   /** Scan the whole input as double-quote-like content (for here-doc bodies):
@@ -166,7 +174,7 @@ class WordParser {
       this.i++;
     }
     this.flushLit();
-    return { parts: this.parts, anchored: true };
+    return { parts: this.parts, anchored: true, hasQuote: true };
   }
 
   /** Decode a `$'...'` ANSI-C string into literal text. */
@@ -491,4 +499,4 @@ export const parseWord = (text: string): ParsedWord => new WordParser(text).pars
 export const parseHeredoc = (text: string, expand: boolean): ParsedWord =>
   expand
     ? new WordParser(text).parseDquoteAll()
-    : { parts: text === "" ? [] : [{ k: "lit", s: text }], anchored: true };
+    : { parts: text === "" ? [] : [{ k: "lit", s: text }], anchored: true, hasQuote: true };
