@@ -389,12 +389,26 @@ class WordParser {
     if (n === "{") {
       this.i += 2;
       let inner = "";
+      let depth = 1;
       for (;;) {
         const d = this.at();
         if (d === undefined) throw new Error("unterminated `${ }`");
-        this.i++;
-        if (d === "}") break;
+        if (d === "\\") {
+          const nx = this.at(1);
+          // A backslash before `}` only protects it from closing the brace;
+          // drop it so the `}` is a literal in the operand.
+          inner += nx === "}" ? "}" : "\\" + (nx ?? "");
+          this.i += 2;
+          continue;
+        }
+        if (d === "'") { inner += this.rawSingle(); continue; }
+        if (d === '"') { inner += this.rawDouble(); continue; }
+        if (d === "`") { inner += this.rawBacktick(); continue; }
+        if (d === "$" && this.at(1) === "(") { this.i += 2; inner += "$(" + this.balanced(1, "(", ")") + ")"; continue; }
+        if (d === "$" && this.at(1) === "{") { depth++; inner += "${"; this.i += 2; continue; }
+        if (d === "}") { this.i++; if (--depth === 0) break; inner += "}"; continue; }
         inner += d;
+        this.i++;
       }
       this.parts.push({ k: "param", p: parseParam(inner), quoted });
       return;
