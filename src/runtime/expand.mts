@@ -8,7 +8,7 @@
 
 import type { Word } from "../ast/nodes.mts";
 import type { Shell } from "./shell.mts";
-import { parseParam, parseWord } from "../parser/word.mts";
+import { parseDquote, parseParam, parseWord } from "../parser/word.mts";
 import type { Param, ParsedWord, WordPart } from "../parser/word.mts";
 import { braceExpand } from "../parser/brace.mts";
 import { evalArith } from "./arith.mts";
@@ -108,7 +108,7 @@ const applyStrOp = (op: string, v: string, pat: string, repl: string, extglob = 
   }
 };
 
-export const evalParam = async (shell: Shell, prm: Param): Promise<string> => {
+export const evalParam = async (shell: Shell, prm: Param, quoted = false): Promise<string> => {
   // ${!name[@]} / ${!name[*]} — array indices.
   if (prm.indices) return shell.arrayIndices(prm.name).join(" ");
   // ${!prefix*} / ${!prefix@} — names of set variables sharing a prefix.
@@ -167,7 +167,9 @@ export const evalParam = async (shell: Shell, prm: Param): Promise<string> => {
     isSet = rawVal !== undefined;
   }
   const val = rawVal ?? "";
-  const arg = (): Promise<string> => expandNoSplit(shell, prm.arg);
+  // A default value (`${x-…}`) inside `"…"` uses double-quote backslash rules.
+  const arg = (): Promise<string> =>
+    quoted ? expandDquote(shell, prm.arg) : expandNoSplit(shell, prm.arg);
   const arg2 = (): Promise<string> => expandNoSplit(shell, prm.arg2);
   // `#`/`%`/`/` operands are quote-aware globs; the replacement stays literal.
   const pat = (): Promise<string> => shell.patExpand(prm.arg);
@@ -230,7 +232,7 @@ export const evalParam = async (shell: Shell, prm: Param): Promise<string> => {
 
 const partValue = async (shell: Shell, p: Exclude<WordPart, { k: "lit" }>): Promise<string> => {
   switch (p.k) {
-    case "param": return evalParam(shell, p.p);
+    case "param": return evalParam(shell, p.p, p.quoted);
     case "arith": return evalArith(shell, await expandNoSplit(shell, p.expr)).toString();
     case "cmdsub": return shell.subSrc(p.src);
     case "procsub": return shell.procSub(p.dir, p.src);
@@ -317,6 +319,11 @@ export const expandNoSplit = async (shell: Shell, text: string): Promise<string>
  *  after each `:` (bash's assignment tilde expansion). */
 export const expandAssign = async (shell: Shell, text: string): Promise<string> => {
   return expandParsed(shell, parseWord(text, true));
+};
+
+/** Expand text as double-quoted content (a `${x-default}` default within `"…"`). */
+export const expandDquote = async (shell: Shell, text: string): Promise<string> => {
+  return expandParsed(shell, parseDquote(text));
 };
 
 /** Concatenate an already-parsed word's parts into a single string (no split). */

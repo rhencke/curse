@@ -14,7 +14,7 @@
 import type { Command, CondExpr, FunctionDef, SimpleCommand, Word } from "../ast/nodes.mts";
 import { CMD_INVERT_RETURN } from "../ast/nodes.mts";
 import { parse } from "../parser/parser.mts";
-import { parseHeredoc, parseWord } from "../parser/word.mts";
+import { parseDquote, parseHeredoc, parseWord } from "../parser/word.mts";
 import type { Param, WordPart } from "../parser/word.mts";
 import { braceExpand } from "../parser/brace.mts";
 import { globToRegExpSource, hasExtglob } from "../runtime/glob.mts";
@@ -191,7 +191,7 @@ class Emitter {
     }
   }
 
-  private paramExpr(prm: Param): string {
+  private paramExpr(prm: Param, quoted = false): string {
     const J = JSON.stringify;
     if (prm.indices) return `sh.arrayIndices(${J(prm.name)}).join(" ")`;
     if (prm.names) return `sh.matchNames(${J(prm.name)}).join(" ")`;
@@ -217,7 +217,8 @@ class Emitter {
       const repl = this.templateOf(parseWord(prm.arg2).parts);
       return `await (async () => { const p = ${this.patArg(prm)}; const r = ${repl}; return ${this.listExpr(prm)}.map((x) => ${this.strOpExpr(prm, "x", "p", "r")}).join(" "); })()`;
     }
-    const arg = (): string => this.templateOf(parseWord(prm.arg).parts);
+    // A default value inside `"…"` follows double-quote backslash rules.
+    const arg = (): string => this.templateOf((quoted ? parseDquote(prm.arg) : parseWord(prm.arg)).parts);
     const arg2 = (): string => this.templateOf(parseWord(prm.arg2).parts);
     if (prm.length) {
       if (prm.name === "@" || prm.name === "*" || prm.name === "#") return "String(sh.positional.length)";
@@ -245,7 +246,7 @@ class Emitter {
   private valueExpr(p: Exclude<WordPart, { k: "lit" }>): string {
     switch (p.k) {
       case "param":
-        return this.paramExpr(p.p);
+        return this.paramExpr(p.p, p.quoted);
       case "arith":
         return `await sh.arithStr(${JSON.stringify(p.expr)})`;
       case "cmdsub": {

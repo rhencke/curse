@@ -660,6 +660,11 @@ export function parseParam(inner: string): Param {
 export const parseWord = (text: string, assignValue = false): ParsedWord =>
   new WordParser(text, assignValue).parse();
 
+/** Parse text as double-quoted content (for a `${x-default}` default that sits
+ *  inside `"…"`): `$`-expansions apply and backslash only escapes `$ \` \\`. */
+export const parseDquote = (text: string): ParsedWord =>
+  new WordParser(text).parseDquoteAll();
+
 /** Parse a here-document body: `$`-expanded (unquoted delimiter) or literal. */
 export const parseHeredoc = (text: string, expand: boolean): ParsedWord =>
   expand
