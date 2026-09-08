@@ -240,6 +240,18 @@ export class Shell {
     return this.lookup(name)?.scalar();
   }
 
+  /** `${!prefix*}` / `${!prefix@}` — set variable names sharing a prefix. */
+  matchNames(prefix: string): string[] {
+    const set = new Set<string>();
+    let s: Scope | null = this.scope;
+    while (s !== null) {
+      for (const k of Object.keys(s)) if (k.startsWith(prefix)) set.add(k);
+      s = Object.getPrototypeOf(s) as Scope | null;
+    }
+    for (const k of Object.keys(process.env)) if (k.startsWith(prefix)) set.add(k);
+    return [...set].sort();
+  }
+
   /* ---- indexed arrays ---- */
 
   private varForWrite(name: string): Var {

@@ -16,6 +16,7 @@ export interface Param {
   length: boolean; // ${#name}
   indices: boolean; // ${!name[@]}
   indirect: boolean; // ${!name}
+  names: string; // ${!prefix*}/${!prefix@} name matching: "" | "*" | "@"
   sub: string; // array subscript inside [ ] ("" if none)
   /** "" | :- - :+ + := = :? ? # ## % %% / // /# /% : (substring) */
   op: string;
@@ -35,6 +36,7 @@ const simpleParam = (name: string, special: boolean): Param => ({
   length: false,
   indices: false,
   indirect: false,
+  names: "",
   sub: "",
   op: "",
   arg: "",
@@ -431,14 +433,18 @@ function parseParam(inner: string): Param {
     }
   }
 
+  let names = "";
   if (bang) {
     if (sub === "@" || sub === "*") indices = true; // ${!arr[@]}
-    else indirect = true; // ${!name}
+    else if (sub === "" && (s[i] === "*" || s[i] === "@")) {
+      names = s[i]!; // ${!prefix*} / ${!prefix@} — name matching
+      i++;
+    } else indirect = true; // ${!name}
   }
 
   const rest = s.slice(i);
-  const p: Param = { name, special, length, indices, indirect, sub, op: "", arg: "", arg2: "" };
-  if (length || indices || indirect) {
+  const p: Param = { name, special, length, indices, indirect, names, sub, op: "", arg: "", arg2: "" };
+  if (length || indices || indirect || names !== "") {
     if (rest !== "") throw new Error(`bad substitution: \${${inner}}`);
     return p;
   }

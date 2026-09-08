@@ -125,6 +125,7 @@ class Emitter {
   private paramExpr(prm: Param): string {
     const J = JSON.stringify;
     if (prm.indices) return `sh.arrayIndices(${J(prm.name)}).join(" ")`;
+    if (prm.names) return `sh.matchNames(${J(prm.name)}).join(" ")`;
     if (prm.indirect) return `sh.indirect(${J(prm.name)})`;
     if (this.isSlice(prm)) return `(${this.sliceExpr(prm)}).join(" ")`;
     const base = this.valStr(prm);
@@ -209,6 +210,7 @@ class Emitter {
       if (p.p.op.startsWith("@") && (p.p.sub === "@" || (p.p.special && p.p.name === "@"))) {
         return `${this.listExpr(p.p)}.map((x) => sh.transform(${JSON.stringify(p.p.op)}, x))`;
       }
+      if (p.p.names === "@") return `sh.matchNames(${JSON.stringify(p.p.name)})`;
       if (p.p.op !== "") return null;
       if (p.p.special && p.p.name === "@") return "sh.positional";
       if (p.p.sub === "@") {

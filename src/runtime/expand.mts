@@ -78,6 +78,8 @@ const listValues = (shell: Shell, prm: Param): string[] =>
 const evalParam = async (shell: Shell, prm: Param): Promise<string> => {
   // ${!name[@]} / ${!name[*]} — array indices.
   if (prm.indices) return shell.arrayIndices(prm.name).join(" ");
+  // ${!prefix*} / ${!prefix@} — names of set variables sharing a prefix.
+  if (prm.names) return shell.matchNames(prm.name).join(" ");
   // ${!name} — indirect (value of the variable named by $name).
   if (prm.indirect) return shell.indirect(prm.name);
   // ${arr[@]:off:len} / ${@:off:len} — slice a list; scalar contexts join it.
@@ -186,6 +188,7 @@ export const expandWord = async (shell: Shell, word: Word): Promise<string[]> =>
     if (only.k === "param") {
       const p = only.p;
       if (p.op === "" && !p.length) {
+        if (p.names === "@") return shell.matchNames(p.name); // "${!prefix@}"
         if (p.special && p.name === "@") return [...shell.positional];
         if (p.sub === "@") return p.indices ? shell.arrayIndices(p.name).map(String) : shell.arrayValues(p.name);
       }
