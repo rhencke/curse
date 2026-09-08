@@ -193,6 +193,9 @@ class Parser {
     }
     if (t.type === "OP" && t.value === "(") return this.trailingRedirects(this.parseSubshell());
 
+    // A command may begin with a redirection (`<<EOF cat`, `>out echo hi`).
+    if (t.type === "REDIR") return this.parseSimple();
+
     if (t.type === "WORD") {
       switch (t.value) {
         case "{": return this.trailingRedirects(this.parseGroup());
