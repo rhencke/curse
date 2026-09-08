@@ -192,7 +192,9 @@ class Emitter {
     const J = JSON.stringify;
     if (prm.indices) return `sh.arrayIndices(${J(prm.name)}).join(" ")`;
     if (prm.names) return `sh.matchNames(${J(prm.name)}).join(" ")`;
-    if (prm.indirect) return `sh.indirect(${J(prm.name)})`;
+    if (prm.indirect) {
+      return `await sh.indirectExpand(${J(prm.name)}, ${prm.special}, ${J(prm.op)}, ${J(prm.arg)}, ${J(prm.arg2)}, ${prm.length})`;
+    }
     if (this.isSlice(prm)) return `(${this.sliceExpr(prm)}).join(" ")`;
     const base = this.valStr(prm);
     if (prm.op.startsWith("@")) {

@@ -483,7 +483,7 @@ const indexOfUnescaped = (s: string, ch: string): number => {
 };
 
 /** Parse the inside of `${ ... }` into a Param (name + optional operator). */
-function parseParam(inner: string): Param {
+export function parseParam(inner: string): Param {
   if (inner === "") throw new Error("bad substitution: ${}");
   let s = inner;
   let length = false;
@@ -550,7 +550,9 @@ function parseParam(inner: string): Param {
 
   const rest = s.slice(i);
   const p: Param = { name, special, length, indices, indirect, names, sub, op: "", arg: "", arg2: "" };
-  if (length || indices || indirect || names !== "") {
+  // ${#x}, ${!arr[@]}, ${!prefix*} take no operator; ${!ref OP} does (the
+  // operator applies to the variable the ref names).
+  if (length || indices || names !== "") {
     if (rest !== "") throw new Error(`bad substitution: \${${inner}}`);
     return p;
   }

@@ -19,7 +19,7 @@ import type {
 import { CMD_INVERT_RETURN } from "../ast/nodes.mts";
 import { parse } from "../parser/parser.mts";
 import { parseHeredoc } from "../parser/word.mts";
-import { expandNoSplit, expandParsed, expandWords, splitTaggedFields } from "./expand.mts";
+import { evalParam, expandNoSplit, expandParsed, expandWords, splitTaggedFields } from "./expand.mts";
 import { evalArith } from "./arith.mts";
 import { globExpand, globMatch, hasExtglob, hasGlobMeta } from "./glob.mts";
 import {
@@ -608,6 +608,15 @@ export class Shell {
   /** `${!name}`: the value of the variable named by `$name`. */
   indirect(name: string): string {
     return this.indirectValue(this.getVar(name) ?? "") ?? "";
+  }
+  /** Generated-code entry point for `${!ref …}` (indirect, possibly with an
+   *  operator). Rebuilds the Param and reuses the interpreter's expansion. */
+  indirectExpand(
+    name: string, special: boolean, op: string, arg: string, arg2: string, length: boolean,
+  ): Promise<string> {
+    return evalParam(this, {
+      name, special, length, indices: false, indirect: true, names: "", sub: "", op, arg, arg2,
+    });
   }
   /** Resolve a variable reference string (a name, or `name[subscript]`) to its
    *  value — the target of `${!ref}` / a nameref. */

@@ -8,7 +8,7 @@
 
 import type { Word } from "../ast/nodes.mts";
 import type { Shell } from "./shell.mts";
-import { parseWord } from "../parser/word.mts";
+import { parseParam, parseWord } from "../parser/word.mts";
 import type { Param, ParsedWord, WordPart } from "../parser/word.mts";
 import { braceExpand } from "../parser/brace.mts";
 import { evalArith } from "./arith.mts";
@@ -94,13 +94,23 @@ const applyStrOp = (op: string, v: string, pat: string, repl: string, extglob = 
   }
 };
 
-const evalParam = async (shell: Shell, prm: Param): Promise<string> => {
+export const evalParam = async (shell: Shell, prm: Param): Promise<string> => {
   // ${!name[@]} / ${!name[*]} — array indices.
   if (prm.indices) return shell.arrayIndices(prm.name).join(" ");
   // ${!prefix*} / ${!prefix@} — names of set variables sharing a prefix.
   if (prm.names) return shell.matchNames(prm.name).join(" ");
-  // ${!name} — indirect (value of the variable named by $name).
-  if (prm.indirect) return shell.indirect(prm.name);
+  // ${!ref} — indirect: the ref names another variable (possibly `arr[i]`, a
+  // positional like `1`, or a special like `?`). Any operator applies to that
+  // target, so re-parse the referenced name and evaluate it with the operator.
+  if (prm.indirect) {
+    const targetName = prm.special ? specialValue(shell, prm.name) : (shell.getVar(prm.name) ?? "");
+    if (targetName === "") {
+      // The ref itself is unset/empty: no target to expand.
+      const empty: Param = { ...prm, indirect: false, name: "", special: true, sub: "" };
+      return prm.op === "" && !prm.length ? "" : evalParam(shell, empty);
+    }
+    return evalParam(shell, { ...parseParam(targetName), op: prm.op, arg: prm.arg, arg2: prm.arg2, length: prm.length });
+  }
   // ${arr[@]:off:len} / ${@:off:len} — slice a list; scalar contexts join it.
   if (isSlice(prm)) return (await sliceValues(shell, prm)).join(" ");
   // ${x@op} / ${arr[@]@op} — transform (per element for lists).
