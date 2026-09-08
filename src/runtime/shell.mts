@@ -113,6 +113,10 @@ export class Shell {
   optsPos = 1;
   optsInd = 1;
 
+  /** trap handlers by normalized signal name (EXIT, INT, …). */
+  traps: Record<string, string> = Object.create(null) as Record<string, string>;
+  private ranExitTrap = false;
+
   /** Background jobs and `$!`. */
   lastBgPid = 0;
   private jobs: Array<{ pid: number; promise: Promise<number> }> = [];
@@ -957,6 +961,23 @@ export class Shell {
   }
 
   /* ---------------- interpreter (JIT / eval path) ---------------- */
+
+  /** Run the EXIT trap (once) as the shell exits. $? starts at the triggering
+   *  status and is preserved afterwards unless the handler runs `exit`. */
+  async runExitTrap(): Promise<void> {
+    const handler = this.traps["EXIT"];
+    if (handler === undefined || handler === "" || this.ranExitTrap) return;
+    this.ranExitTrap = true;
+    const saved = this.status;
+    try {
+      const cmd = parse(handler);
+      if (cmd !== null) await this.execute(cmd);
+      this.status = saved;
+    } catch (e) {
+      if (e instanceof ExitSignal || e instanceof ReturnSignal) this.status = e.code;
+      else throw e;
+    }
+  }
 
   async runString(src: string): Promise<number> {
     const cmd = parse(src);

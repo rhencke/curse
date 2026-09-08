@@ -449,6 +449,40 @@ const read: Builtin = (shell, ...args) => {
   return 0;
 };
 
+const signalName = (s: string): string => {
+  const up = s.toUpperCase();
+  if (up === "0") return "EXIT";
+  return up.startsWith("SIG") ? up.slice(3) : up;
+};
+
+const trap: Builtin = (shell, ...args) => {
+  const quote = (h: string): string => "'" + h.replace(/'/g, "'\\''") + "'";
+  const printTraps = (names: string[]): void => {
+    for (const n of names) {
+      const h = shell.traps[n];
+      if (h !== undefined) shell.io.out(`trap -- ${quote(h)} ${n}\n`);
+    }
+  };
+  // `trap` / `trap -p [sig...]`: print current handlers.
+  if (args.length === 0 || args[0] === "-p") {
+    const specs = args.slice(args[0] === "-p" ? 1 : 0);
+    printTraps(specs.length > 0 ? specs.map(signalName) : Object.keys(shell.traps));
+    return 0;
+  }
+  if (args[0] === "-l") return 0; // signal listing: not supported
+  let rest = args;
+  if (rest[0] === "--") rest = rest.slice(1);
+  const action = rest[0] ?? "";
+  const sigs = rest.slice(1);
+  // A bare number/name as the sole argument with no action resets nothing.
+  for (const s of sigs) {
+    const n = signalName(s);
+    if (action === "-") delete shell.traps[n];
+    else shell.traps[n] = action;
+  }
+  return 0;
+};
+
 const mapfile: Builtin = (shell, ...args) => {
   let strip = false;
   let delim = "\n";
@@ -635,6 +669,7 @@ export const builtins: Record<string, Builtin> = {
   typeset: declareBuiltin,
   readonly: readonlyBuiltin,
   read,
+  trap,
   mapfile,
   readarray: mapfile,
   test,

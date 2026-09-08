@@ -532,10 +532,12 @@ export const emit = (cmd: Command | null, opts: EmitOptions): string => {
     "const sh = new Shell();\n" +
     "try {\n" +
     body +
-    "  process.exitCode = sh.status;\n" +
     "} catch (e) {\n" +
-    "  if (e instanceof ExitSignal) process.exitCode = e.code;\n" +
+    "  if (e instanceof ExitSignal) sh.status = e.code;\n" +
     "  else throw e;\n" +
-    "}\n"
+    "} finally {\n" +
+    "  await sh.runExitTrap();\n" +
+    "}\n" +
+    "process.exitCode = sh.status;\n"
   );
 };

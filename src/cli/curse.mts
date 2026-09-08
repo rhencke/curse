@@ -48,7 +48,9 @@ const run = async (src: string, name: string, positional: string[] = []): Promis
   const sh = new Shell();
   sh.name = name;
   sh.positional = positional;
-  process.exitCode = await sh.runString(src);
+  sh.status = await sh.runString(src);
+  await sh.runExitTrap();
+  process.exitCode = sh.status;
 };
 
 const main = async (): Promise<void> => {
