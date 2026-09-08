@@ -1003,23 +1003,28 @@ export class Shell {
     return !v.ref && !v.readonly && !v.integer && !v.lower && !v.upper && v.arr === null && v.assoc === null;
   }
   private assignInt(name: string, v: bigint): void {
-    const r = this.resolveRef(name);
-    if (r.sub !== null) { this.setElemSync(r.name, r.sub, v.toString()); return; }
-    name = r.name;
-    const existing = this.scopeLookup(name);
-    if (existing) {
-      if (existing.readonly) {
+    // One scope lookup handles the common case (an existing non-nameref var):
+    // a nameref, or a not-yet-created var, takes the fuller path below.
+    const box = this.scopeLookup(name);
+    if (box !== undefined && !box.ref) {
+      if (box.readonly) {
         this.io.err(`${this.name}: ${name}: readonly variable\n`);
         this.readonlyHit = true;
         return;
       }
-      if (this.plainInt(existing)) { existing.setInt(v); existing.unset = false; return; }
+      if (this.plainInt(box)) { box.setInt(v); box.unset = false; return; }
       this.assignVar(name, v.toString()); // attribute/array: string coerce path
       return;
     }
-    const nv = new Var("", process.env[name] !== undefined);
-    nv.setInt(v);
-    this.globalScope.vars.set(name, nv);
+    const r = this.resolveRef(name);
+    if (r.sub !== null) { this.setElemSync(r.name, r.sub, v.toString()); return; }
+    if (box === undefined && r.name === name) {
+      const nv = new Var("", process.env[name] !== undefined);
+      nv.setInt(v);
+      this.globalScope.vars.set(name, nv);
+      return;
+    }
+    this.assignVar(r.name, v.toString());
   }
   /** `x++` / `++x` / `x--` / `--x` on a scalar; returns the pre/post value. */
   ainc(name: string, delta: bigint, post: boolean): bigint {
