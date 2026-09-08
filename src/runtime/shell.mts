@@ -198,7 +198,7 @@ export class Shell {
 
   /* ---------------- variables / scope ---------------- */
 
-  private lookup(name: string): Var | undefined {
+  private rawLookup(name: string): Var | undefined {
     let s: Scope | null = this.scope;
     while (s !== null) {
       if (Object.prototype.hasOwnProperty.call(s, name)) return s[name];
@@ -206,6 +206,25 @@ export class Shell {
     }
     const e = process.env[name];
     return e === undefined ? undefined : new Var(e, true);
+  }
+
+  /** Follow a nameref (declare -n) chain to the target variable name. */
+  private deref(name: string): string {
+    const seen = new Set<string>();
+    let cur = name;
+    for (;;) {
+      const v = this.rawLookup(cur);
+      if (v && v.ref && v.value !== "" && !seen.has(cur)) {
+        seen.add(cur);
+        cur = v.value;
+        continue;
+      }
+      return cur;
+    }
+  }
+
+  private lookup(name: string): Var | undefined {
+    return this.rawLookup(this.deref(name));
   }
 
   private ownerScope(name: string): Scope | undefined {
@@ -222,6 +241,7 @@ export class Shell {
       this.scope[name] = value;
       return;
     }
+    name = this.deref(name); // write through a nameref to its target
     const s = String(value);
     const owner = this.ownerScope(name);
     if (owner) {
@@ -279,12 +299,22 @@ export class Shell {
 
   /* ---- indexed arrays ---- */
 
-  private varForWrite(name: string): Var {
+  /** Find/create a variable by its literal name (no nameref resolution). */
+  private varForWriteRaw(name: string): Var {
     const owner = this.ownerScope(name);
     if (owner) return owner[name]!;
     const v = new Var("", process.env[name] !== undefined);
     this.globalScope[name] = v;
     return v;
+  }
+  private varForWrite(name: string): Var {
+    return this.varForWriteRaw(this.deref(name));
+  }
+  /** `declare -n name=target` — make `name` a nameref to `target`. */
+  setRef(name: string, target: string): void {
+    const v = this.varForWriteRaw(name);
+    v.ref = true;
+    if (target !== "") v.value = target;
   }
   private maxIndex(v: Var): number {
     let m = -1;
@@ -431,6 +461,7 @@ export class Shell {
     this.assign(name, value);
   }
   unsetVar(name: string): void {
+    name = this.deref(name); // `unset ref` removes the target, as in bash
     const owner = this.ownerScope(name);
     if (owner) delete owner[name];
   }
@@ -452,6 +483,7 @@ export class Shell {
     this.setVar(name, (this.getVar(name) ?? "") + rhs);
   }
   exportVar(name: string): void {
+    name = this.deref(name);
     const owner = this.ownerScope(name);
     if (owner) owner[name]!.exported = true;
     else this.globalScope[name] = new Var(process.env[name] ?? "", true);

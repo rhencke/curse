@@ -20,6 +20,8 @@ export class Var {
   lower = false;
   upper = false;
   readonly = false;
+  /** declare -n: a nameref whose `value` holds the target variable's name. */
+  ref = false;
   constructor(value: string, exported = false) {
     this.value = value;
     this.exported = exported;

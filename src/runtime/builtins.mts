@@ -240,6 +240,10 @@ const local: Builtin = (shell, ...args) => {
     const eq = n.indexOf("=");
     const name = eq >= 0 ? n.slice(0, eq) : n;
     shell.local(name);
+    if (flags.nameref) {
+      shell.setRef(name, eq >= 0 ? n.slice(eq + 1) : "");
+      continue;
+    }
     shell.setAttrs(name, flags);
     if (eq >= 0) shell.setVar(name, n.slice(eq + 1));
   }
@@ -363,9 +367,10 @@ interface DeclFlags {
   exported: boolean;
   array: boolean;
   assoc: boolean;
+  nameref: boolean;
 }
 const parseDeclFlags = (args: string[]): { flags: DeclFlags; names: string[] } => {
-  const flags: DeclFlags = { readonly: false, exported: false, array: false, assoc: false };
+  const flags: DeclFlags = { readonly: false, exported: false, array: false, assoc: false, nameref: false };
   const names: string[] = [];
   for (const a of args) {
     if (a.length > 1 && (a[0] === "-" || a[0] === "+")) {
@@ -378,6 +383,7 @@ const parseDeclFlags = (args: string[]): { flags: DeclFlags; names: string[] } =
         else if (ch === "x") flags.exported ||= on;
         else if (ch === "a") flags.array = true;
         else if (ch === "A") flags.assoc = true;
+        else if (ch === "n") flags.nameref = on;
       }
       continue;
     }
@@ -391,6 +397,10 @@ const declareBuiltin: Builtin = (shell, ...args) => {
   for (const n of names) {
     const eq = n.indexOf("=");
     const name = eq >= 0 ? n.slice(0, eq) : n;
+    if (flags.nameref) {
+      shell.setRef(name, eq >= 0 ? n.slice(eq + 1) : "");
+      continue;
+    }
     // Establish array/assoc shape before setAttrs, so an empty `declare -a x`
     // stays a 0-element array rather than a "" scalar.
     if (flags.assoc) shell.declareAssoc(name);
