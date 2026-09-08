@@ -962,10 +962,33 @@ export class Shell {
   }
 
   /** `[[ ]]` unary test (used by generated code and the interpreter). */
+  /** `[[ -v x ]]` / `[[ -v arr[i] ]]` / `[[ -v arr[@] ]]` — is it set? */
+  private isSetV(arg: string): boolean {
+    const m = /^([A-Za-z_][A-Za-z0-9_]*)\[([\s\S]*)\]$/.exec(arg);
+    if (m === null) return this.lookup(arg) !== undefined;
+    const v = this.lookup(m[1]!);
+    if (v === undefined) return false;
+    const sub = m[2]!;
+    // For an associative array @/* are literal keys, not "any element".
+    if (v.assoc !== null) return v.assoc.has(sub);
+    if (sub === "@" || sub === "*") {
+      if (v.arr !== null) return v.arr.size > 0;
+      return true; // a set scalar has element 0
+    }
+    let idx: number;
+    try {
+      idx = Number(evalArith(this, sub));
+    } catch {
+      return false;
+    }
+    if (v.arr !== null) return v.arr.has(idx < 0 ? this.maxIndex(v) + 1 + idx : idx);
+    return idx === 0; // a scalar is element 0
+  }
+
   condUnary(op: string, arg: string): boolean {
     if (op === "-z") return arg.length === 0;
     if (op === "-n") return arg.length > 0;
-    if (op === "-v") return this.lookup(arg) !== undefined;
+    if (op === "-v") return this.isSetV(arg);
     if (op === "-o") return false; // shopt option — unsupported
     const p = resolve(this.cwd, arg);
     let st: ReturnType<typeof statSync> | null = null;
