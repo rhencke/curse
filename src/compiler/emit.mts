@@ -514,9 +514,16 @@ class Emitter {
     const name = m[1]!;
     const hasSub = m[2] !== undefined;
     const append = m[4] === "+";
-    const rhs = this.templateOf(parseWord(m[5]!, true).parts);
+    const parts = parseWord(m[5]!, true).parts;
+    const rhs = this.templateOf(parts);
     const i = pad(ind);
     const J = JSON.stringify;
+    // `name=$(( expr ))`: assign the BigInt directly (keeps the arith cache warm
+    // and skips the stringify → Proxy-set → re-parse round-trip in hot loops).
+    if (!hasSub && !append && parts.length === 1 && parts[0]!.k === "arith") {
+      const js = arithToJS(parts[0]!.expr);
+      if (js !== null) return `${i}sh.aset(${J(name)}, ${js});`;
+    }
     if (hasSub) {
       const sub = J(m[3] ?? "");
       if (append) {
