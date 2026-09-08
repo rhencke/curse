@@ -269,6 +269,80 @@ const shift: Builtin = (shell, ...args) => {
   return 0;
 };
 
+const getopts: Builtin = (shell, ...args) => {
+  if (args.length < 2) {
+    shell.io.err("getopts: usage: getopts optstring name [arg ...]\n");
+    return 2;
+  }
+  const optstring = args[0]!;
+  const name = args[1]!;
+  const words = args.length > 2 ? args.slice(2) : shell.positional;
+  const silent = optstring.startsWith(":");
+  const errPrint = !silent && shell.getVar("OPTERR") !== "0";
+
+  let optind = toInt(shell.getVar("OPTIND") ?? "1");
+  if (optind < 1) optind = 1;
+  // An external `OPTIND=1` (reparse) restarts the per-word char scan.
+  if (optind !== shell.optsInd) shell.optsPos = 1;
+
+  const finish = (result: string, optarg: string | null): number => {
+    shell.setVar(name, result);
+    if (optarg === null) shell.unsetVar("OPTARG");
+    else shell.setVar("OPTARG", optarg);
+    shell.setVar("OPTIND", String(optind));
+    shell.optsInd = optind;
+    return 0;
+  };
+  const noMore = (): number => {
+    shell.optsPos = 1;
+    shell.setVar("OPTIND", String(optind));
+    shell.optsInd = optind;
+    shell.setVar(name, "?");
+    shell.unsetVar("OPTARG");
+    return 1;
+  };
+
+  for (;;) {
+    if (optind > words.length) return noMore();
+    const word = words[optind - 1]!;
+    if (shell.optsPos === 1) {
+      if (word === "" || word[0] !== "-" || word === "-") return noMore();
+      if (word === "--") { optind++; return noMore(); }
+    }
+    const c = word[shell.optsPos];
+    if (c === undefined) { optind++; shell.optsPos = 1; continue; }
+
+    const specIdx = c === ":" ? -1 : optstring.indexOf(c, silent ? 1 : 0);
+    if (specIdx < 0) {
+      // Unknown option letter; consume it and report `?`.
+      shell.optsPos++;
+      if (shell.optsPos >= word.length) { optind++; shell.optsPos = 1; }
+      if (errPrint) shell.io.err(`${shell.name}: illegal option -- ${c}\n`);
+      return finish("?", silent ? c! : null);
+    }
+    if (optstring[specIdx + 1] === ":") {
+      // Option takes an argument: rest of this word, else the next word.
+      const rest = word.slice(shell.optsPos + 1);
+      if (rest !== "") { optind++; shell.optsPos = 1; return finish(c!, rest); }
+      if (optind + 1 > words.length) {
+        optind++;
+        shell.optsPos = 1;
+        if (silent) return finish(":", c!);
+        if (errPrint) shell.io.err(`${shell.name}: option requires an argument -- ${c}\n`);
+        return finish("?", null);
+      }
+      const optarg = words[optind]!;
+      optind += 2;
+      shell.optsPos = 1;
+      return finish(c!, optarg);
+    }
+    // Simple flag.
+    shell.optsPos++;
+    if (shell.optsPos >= word.length) { optind++; shell.optsPos = 1; }
+    return finish(c!, null);
+  }
+};
+
 const declareBuiltin: Builtin = (shell, ...args) => {
   let makeArray = false;
   let makeAssoc = false;
@@ -508,6 +582,7 @@ export const builtins: Record<string, Builtin> = {
   return: returnBuiltin,
   exit: exitBuiltin,
   shift,
+  getopts,
   wait,
   set: setBuiltin,
   declare: declareBuiltin,

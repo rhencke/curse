@@ -108,6 +108,11 @@ export class Shell {
    *  to inherit. Read by the `read` builtin and passed to external stdin. */
   stdinData: string | null = null;
 
+  /** getopts scan state: char index within the current word (0 = the `-`),
+   *  and the OPTIND value we last wrote (to detect an external reset). */
+  optsPos = 1;
+  optsInd = 1;
+
   /** Background jobs and `$!`. */
   lastBgPid = 0;
   private jobs: Array<{ pid: number; promise: Promise<number> }> = [];
