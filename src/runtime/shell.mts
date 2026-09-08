@@ -513,6 +513,60 @@ export class Shell {
     return code;
   }
 
+  /* ---- introspection / dispatch (type, command, builtin) ---- */
+
+  /** A bash function is defined under this name (own property, not a builtin). */
+  hasFunction(name: string): boolean {
+    const f = this.functions[name];
+    return (
+      Object.prototype.hasOwnProperty.call(this.functions, name) &&
+      !!f && typeof f === "object" && "__bashFunc" in (f as object)
+    );
+  }
+  hasBuiltin(name: string): boolean {
+    return Object.prototype.hasOwnProperty.call(builtins, name);
+  }
+  /** Resolve `name` on PATH to an executable file path, or null. */
+  lookupPath(name: string): string | null {
+    const check = (p: string): boolean => {
+      try {
+        return statSync(p).isFile() && (accessSync(p, constants.X_OK), true);
+      } catch {
+        return false;
+      }
+    };
+    if (name.includes("/")) {
+      const p = resolve(this.cwd, name);
+      return check(p) ? name : null;
+    }
+    const path = this.getVar("PATH") ?? process.env["PATH"] ?? "";
+    for (const dir of path.split(":")) {
+      if (dir === "") continue;
+      const p = resolve(dir, name);
+      if (check(p)) return p;
+    }
+    return null;
+  }
+  /** Run a builtin directly, ignoring any shadowing function (`builtin`). */
+  async runBuiltin(name: string, args: string[]): Promise<number> {
+    const b = (builtins as Record<string, (sh: Shell, ...a: string[]) => number | Promise<number>>)[name];
+    if (b === undefined) {
+      this.io.err(`${this.name}: ${name}: not a shell builtin\n`);
+      this.status = 1;
+      return 1;
+    }
+    const code = await b(this, ...args);
+    this.status = code;
+    return code;
+  }
+  /** Run `name` bypassing functions: builtin, else external (`command`). */
+  async runBypassFunc(name: string, args: string[]): Promise<number> {
+    if (this.hasBuiltin(name)) return this.runBuiltin(name, args);
+    const code = await this.external(name, args, {});
+    this.status = code;
+    return code;
+  }
+
   /** Dispatch when the command name itself came from an expansion. */
   async exec(...fields: string[]): Promise<number> {
     if (fields.length === 0) {

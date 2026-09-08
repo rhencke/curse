@@ -449,6 +449,102 @@ const read: Builtin = (shell, ...args) => {
   return 0;
 };
 
+const KEYWORDS = new Set([
+  "if", "then", "else", "elif", "fi", "for", "while", "until", "do", "done",
+  "case", "esac", "function", "select", "time", "in", "{", "}", "!", "[[", "]]", "coproc",
+]);
+
+type Kind = "alias" | "keyword" | "function" | "builtin" | "file";
+const classify = (shell: Shell, name: string): Kind | null => {
+  if (KEYWORDS.has(name)) return "keyword";
+  if (shell.hasFunction(name)) return "function";
+  if (shell.hasBuiltin(name)) return "builtin";
+  if (shell.lookupPath(name) !== null) return "file";
+  return null;
+};
+
+const type: Builtin = (shell, ...args) => {
+  let mode: "t" | "p" | "P" | "" = "";
+  const names: string[] = [];
+  for (const a of args) {
+    if (a === "-t") mode = "t";
+    else if (a === "-p") mode = "p";
+    else if (a === "-P") mode = "P";
+    else if (a === "-a" || a === "-f") continue; // -a all / -f no-functions: ignore
+    else if (a === "--") continue;
+    else names.push(a);
+  }
+  let status = 0;
+  for (const name of names) {
+    const kind = classify(shell, name);
+    if (kind === null) {
+      shell.io.err(`${shell.name}: type: ${name}: not found\n`);
+      status = 1;
+      continue;
+    }
+    if (mode === "t") {
+      shell.io.out(kind + "\n");
+      continue;
+    }
+    if (mode === "p" || mode === "P") {
+      // -p prints a path only for files; -P forces a PATH search.
+      const path = kind === "file" || mode === "P" ? shell.lookupPath(name) : null;
+      if (path !== null) shell.io.out(path + "\n");
+      else if (mode === "P") status = 1;
+      continue;
+    }
+    switch (kind) {
+      case "keyword": shell.io.out(`${name} is a shell keyword\n`); break;
+      case "function": shell.io.out(`${name} is a function\n`); break;
+      case "builtin": shell.io.out(`${name} is a shell builtin\n`); break;
+      case "file": shell.io.out(`${name} is ${shell.lookupPath(name)}\n`); break;
+      case "alias": break;
+    }
+  }
+  return status;
+};
+
+const command: Builtin = async (shell, ...args) => {
+  let verbose: "v" | "V" | "" = "";
+  let i = 0;
+  for (; i < args.length; i++) {
+    const a = args[i]!;
+    if (a === "-v") verbose = "v";
+    else if (a === "-V") verbose = "V";
+    else if (a === "-p") continue; // default PATH: ignore
+    else if (a === "--") { i++; break; }
+    else if (a.length > 1 && a[0] === "-") continue;
+    else break;
+  }
+  const rest = args.slice(i);
+  if (verbose !== "") {
+    let status = 0;
+    for (const name of rest) {
+      const kind = classify(shell, name);
+      if (kind === null) { status = 1; continue; }
+      if (verbose === "v") {
+        shell.io.out((kind === "file" ? shell.lookupPath(name)! : name) + "\n");
+      } else {
+        switch (kind) {
+          case "keyword": shell.io.out(`${name} is a shell keyword\n`); break;
+          case "function": shell.io.out(`${name} is a function\n`); break;
+          case "builtin": shell.io.out(`${name} is a shell builtin\n`); break;
+          case "file": shell.io.out(`${name} is ${shell.lookupPath(name)}\n`); break;
+          case "alias": break;
+        }
+      }
+    }
+    return status;
+  }
+  if (rest.length === 0) return 0;
+  return shell.runBypassFunc(rest[0]!, rest.slice(1));
+};
+
+const builtinBuiltin: Builtin = async (shell, ...args) => {
+  if (args.length === 0) return 0;
+  return shell.runBuiltin(args[0]!, args.slice(1));
+};
+
 const signalName = (s: string): string => {
   const up = s.toUpperCase();
   if (up === "0") return "EXIT";
@@ -670,6 +766,9 @@ export const builtins: Record<string, Builtin> = {
   readonly: readonlyBuiltin,
   read,
   trap,
+  type,
+  command,
+  builtin: builtinBuiltin,
   mapfile,
   readarray: mapfile,
   test,
