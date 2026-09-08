@@ -277,7 +277,8 @@ class Emitter {
     return `${i}sh.env.${name} = ${rhs};`;
   }
 
-  private simpleCore(words: Word[], ind: number): string {
+  private simpleCore(cmd: SimpleCommand, ind: number): string {
+    const words = cmd.words;
     const i = pad(ind);
     const assignWords: string[] = [];
     let k = 0;
@@ -289,6 +290,22 @@ class Emitter {
 
     if (rest.length === 0) {
       return assignWords.map((w) => this.assignStmt(w, ind)).join("\n");
+    }
+
+    // `declare -a arr=(...)` / `local m=(...)` array-literal arguments.
+    let arrayStmts = "";
+    if (cmd.arrayArgs !== undefined && cmd.arrayArgs.length > 0) {
+      const isLocal = words[0]!.text === "local";
+      const isAssoc = words.some((w) => w.text === "-A");
+      for (const aa of cmd.arrayArgs) {
+        const nm = JSON.stringify(aa.name);
+        if (isLocal) arrayStmts += `${i}sh.local(${nm});\n`;
+        if (isAssoc) arrayStmts += `${i}sh.declareAssoc(${nm});\n`;
+        const frags: string[] = [];
+        for (const w of aa.elems) for (const t of braceExpand(w.text)) frags.push(this.word(t).code);
+        const fn = aa.append ? "appendArrayFields" : "setArrayFields";
+        arrayStmts += `${i}sh.${fn}(${nm}, [${frags.join(", ")}]);\n`;
+      }
     }
 
     const texts: string[] = [];
@@ -308,14 +325,14 @@ class Emitter {
       callInner = `sh.exec(${[nameFrag, ...argFrags].join(", ")})`;
     }
 
-    if (assignWords.length === 0) return `${i}await ${callInner};`;
+    if (assignWords.length === 0) return arrayStmts + `${i}await ${callInner};`;
     // Prefix env from plain name=value assignments.
     const env = assignWords
       .map((w) => ASSIGN.exec(w)!)
       .filter((m) => m[2] === undefined && m[4] === undefined)
       .map((m) => `${JSON.stringify(m[1])}: ${this.templateOf(parseWord(m[5]!).parts)}`)
       .join(", ");
-    return `${i}await sh.withEnv({ ${env} }, () => ${callInner});`;
+    return arrayStmts + `${i}await sh.withEnv({ ${env} }, () => ${callInner});`;
   }
 
   private functionDef(cmd: FunctionDef, ind: number): string {
@@ -332,7 +349,7 @@ class Emitter {
     const i = pad(ind);
     switch (cmd.type) {
       case "simple":
-        return this.simpleCore(cmd.words, ind);
+        return this.simpleCore(cmd, ind);
       case "function":
         return this.functionDef(cmd, ind);
       case "connection": {

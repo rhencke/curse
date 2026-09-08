@@ -13,7 +13,7 @@
  * path) both drive this same surface, so their behaviour matches. */
 
 import type {
-  ArithForCommand, CaseCommand, Command, CondCommand, CondExpr, ForCommand,
+  ArithForCommand, ArrayArg, CaseCommand, Command, CondCommand, CondExpr, ForCommand,
   FunctionDef, IfCommand, Redirect, SimpleCommand, WhileCommand, Word,
 } from "../ast/nodes.mts";
 import { CMD_INVERT_RETURN } from "../ast/nodes.mts";
@@ -923,7 +923,7 @@ export class Shell {
         status = await this.execConnection(cmd.connector, cmd.first, cmd.second);
         break;
       case "simple":
-        status = await this.execSimpleCore(cmd.words);
+        status = await this.execSimpleCore(cmd);
         break;
       case "pipeline": {
         const stages = cmd.stages;
@@ -1020,7 +1020,8 @@ export class Shell {
     throw new Error(`connector \`${connector}\` not supported yet`);
   }
 
-  private async execSimpleCore(words: Word[]): Promise<number> {
+  private async execSimpleCore(cmd: SimpleCommand): Promise<number> {
+    const words = cmd.words;
     const assignWords: string[] = [];
     let k = 0;
     for (; k < words.length; k++) {
@@ -1040,6 +1041,7 @@ export class Shell {
       this.status = 0;
       return 0;
     }
+    if (cmd.arrayArgs !== undefined) await this.applyArrayArgs(cmd.arrayArgs, argv);
     if (this.opts.xtrace) this.io.err("+ " + argv.join(" ") + "\n");
     if (assignWords.length > 0) {
       const env: Record<string, string> = {};
@@ -1050,6 +1052,19 @@ export class Shell {
       return this.withEnv(env, () => this.callByName(argv[0]!, argv.slice(1)));
     }
     return this.callByName(argv[0]!, argv.slice(1));
+  }
+
+  /** Apply `declare -a arr=(...)` / `local m=(...)` array-literal arguments. */
+  private async applyArrayArgs(args: ArrayArg[], argv: string[]): Promise<void> {
+    const isLocal = argv[0] === "local";
+    const isAssoc = argv.includes("-A");
+    for (const aa of args) {
+      if (isLocal) this.local(aa.name);
+      if (isAssoc) this.declareAssoc(aa.name);
+      const fields = await expandWords(this, aa.elems);
+      if (aa.append) this.appendArrayFields(aa.name, fields);
+      else this.setArrayFields(aa.name, fields);
+    }
   }
 
   /** Apply an assignment word: `name=v`, `name+=v`, `name[i]=v`, `name[i]+=v`. */

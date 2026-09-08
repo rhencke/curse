@@ -82,12 +82,22 @@ export interface BackgroundCommand extends CommandBase {
   command: Command;
 }
 
+/** A compound (array) assignment appearing as an argument to an assignment
+ *  builtin: `declare -a arr=(a b)`, `local m=(...)`. */
+export interface ArrayArg {
+  name: string;
+  append: boolean;
+  elems: Word[];
+}
+
 export interface SimpleCommand extends CommandBase {
   type: "simple";
   /** Assignments, command name, and arguments, in source order (faithful to
    *  SIMPLE_COM.words). Leading assignment words are separated at exec time. */
   words: Word[];
   redirects: Redirect[];
+  /** Array-literal arguments to an assignment builtin (declare/local/…). */
+  arrayArgs?: ArrayArg[];
 }
 
 export interface GroupCommand extends CommandBase {

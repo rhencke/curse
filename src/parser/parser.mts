@@ -11,7 +11,7 @@
  * does; used elsewhere they are ordinary words. Pipelines, redirections, `&`,
  * and `case` arrive in later milestones. */
 
-import type { CasePattern, Command, Redirect, Word } from "../ast/nodes.mts";
+import type { ArrayArg, CasePattern, Command, Redirect, Word } from "../ast/nodes.mts";
 import { CMD_INVERT_RETURN, connection, makeWord, simple } from "../ast/nodes.mts";
 import { tokenize } from "./lexer.mts";
 import type { Token } from "./lexer.mts";
@@ -37,6 +37,8 @@ const TOP: TermSet = {};
 const RESERVED_MISPLACED = new Set([
   "then", "else", "elif", "fi", "do", "done", "esac", "}",
 ]);
+
+const ASSIGN_BUILTINS = new Set(["declare", "typeset", "local", "export", "readonly"]);
 
 const isName = (s: string): boolean => /^[A-Za-z_][A-Za-z0-9_]*$/.test(s);
 
@@ -214,7 +216,8 @@ class Parser {
     throw new ParseError(`syntax error near \`${t.value || "<eof>"}\` (line ${t.line})`);
   }
 
-  private parseArrayAssign(): Command {
+  /** Parse `name=( ... )` / `name+=( ... )` starting at the `name=` word. */
+  private parseArrayLit(): { name: string; append: boolean; elems: Word[] } {
     const w = this.advance().value; // "name=" or "name+="
     const append = w.endsWith("+=");
     const name = w.slice(0, w.length - (append ? 2 : 1));
@@ -233,7 +236,11 @@ class Parser {
       }
     }
     this.advance(); // ")"
-    return { type: "array_assign", name, append, elems };
+    return { name, append, elems };
+  }
+
+  private parseArrayAssign(): Command {
+    return { type: "array_assign", ...this.parseArrayLit() };
   }
 
   private parseSubshell(): Command {
@@ -424,17 +431,33 @@ class Parser {
   private parseSimple(): Command {
     const words: Word[] = [];
     const redirects: Redirect[] = [];
+    const arrayArgs: ArrayArg[] = [];
     for (;;) {
       const t = this.peek();
-      if (t.type === "WORD") words.push(makeWord(this.advance().value));
-      else if (t.type === "REDIR") redirects.push(this.parseRedir());
-      else break;
+      if (t.type === "WORD") {
+        // `declare -a arr=(...)` etc.: array literal in an assignment builtin's args.
+        if (
+          words.length > 0 && ASSIGN_BUILTINS.has(words[0]!.text) &&
+          /^[A-Za-z_][A-Za-z0-9_]*\+?=$/.test(t.value) &&
+          this.peekAt(1).type === "OP" && this.peekAt(1).value === "("
+        ) {
+          arrayArgs.push(this.parseArrayLit());
+          continue;
+        }
+        words.push(makeWord(this.advance().value));
+      } else if (t.type === "REDIR") {
+        redirects.push(this.parseRedir());
+      } else {
+        break;
+      }
     }
-    if (words.length === 0 && redirects.length === 0) {
+    if (words.length === 0 && redirects.length === 0 && arrayArgs.length === 0) {
       const t = this.peek();
       throw new ParseError(`syntax error near \`${t.value || "<eof>"}\` (line ${t.line})`);
     }
-    return simple(words, redirects);
+    const cmd = simple(words, redirects);
+    if (arrayArgs.length > 0) cmd.arrayArgs = arrayArgs;
+    return cmd;
   }
 
   /** Attach any redirections that trail a compound command (e.g. `done > f`). */

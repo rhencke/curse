@@ -241,6 +241,16 @@ const declareBuiltin: Builtin = (shell, ...args) => {
   return 0;
 };
 
+const readonlyBuiltin: Builtin = (shell, ...args) => {
+  // We don't enforce read-only-ness; just perform the assignments.
+  for (const a of args) {
+    if (a.startsWith("-")) continue;
+    const eq = a.indexOf("=");
+    if (eq >= 0) shell.setVar(a.slice(0, eq), a.slice(eq + 1));
+  }
+  return 0;
+};
+
 const setBuiltin: Builtin = (shell, ...args) => {
   const opt = (name: string, on: boolean): void => {
     if (name === "errexit") shell.opts.errexit = on;
@@ -453,6 +463,7 @@ export const builtins: Record<string, Builtin> = {
   set: setBuiltin,
   declare: declareBuiltin,
   typeset: declareBuiltin,
+  readonly: readonlyBuiltin,
   read,
   test,
   "[": bracket,
