@@ -21,10 +21,10 @@ const wrap = (x: bigint): bigint => {
 /* ---------- tokenizer ---------- */
 
 type Tok =
-  | { k: "num"; v: bigint }
-  | { k: "name"; v: string }
-  | { k: "op"; v: string }
-  | { k: "eof" };
+  | { k: "num"; v: bigint; pos: number }
+  | { k: "name"; v: string; pos: number }
+  | { k: "op"; v: string; pos: number }
+  | { k: "eof"; pos: number };
 
 const OPS = [
   "<<=", ">>=", "**", "<<", ">>", "&&", "||", "==", "!=", "<=", ">=",
@@ -83,23 +83,23 @@ const tokenizeArith = (s: string): Tok[] => {
     if (isDigit(c)) {
       let j = i;
       while (j < s.length && /[0-9a-zA-Z_@#]/.test(s[j]!)) j++;
-      out.push({ k: "num", v: parseNumber(s.slice(i, j)) });
+      out.push({ k: "num", v: parseNumber(s.slice(i, j)), pos: i });
       i = j;
       continue;
     }
     if (isNameStart(c)) {
       let j = i;
       while (j < s.length && isNameChar(s[j]!)) j++;
-      out.push({ k: "name", v: s.slice(i, j) });
+      out.push({ k: "name", v: s.slice(i, j), pos: i });
       i = j;
       continue;
     }
     const op = OPS.find((o) => s.startsWith(o, i));
     if (op === undefined) throw new ArithError(`unexpected character \`${c}\``);
-    out.push({ k: "op", v: op });
+    out.push({ k: "op", v: op, pos: i });
     i += op.length;
   }
-  out.push({ k: "eof" });
+  out.push({ k: "eof", pos: s.length });
   return out;
 };
 
@@ -107,12 +107,12 @@ const tokenizeArith = (s: string): Tok[] => {
 
 type Node =
   | { t: "num"; v: bigint }
-  | { t: "var"; name: string; index?: Node }
+  | { t: "var"; name: string; index?: Node; rawIndex?: string }
   | { t: "unary"; op: string; e: Node }
-  | { t: "incr"; op: string; name: string; index?: Node; post: boolean }
+  | { t: "incr"; op: string; name: string; index?: Node; rawIndex?: string; post: boolean }
   | { t: "bin"; op: string; l: Node; r: Node }
   | { t: "logic"; op: string; l: Node; r: Node }
-  | { t: "assign"; op: string; name: string; index?: Node; e: Node }
+  | { t: "assign"; op: string; name: string; index?: Node; rawIndex?: string; e: Node }
   | { t: "ternary"; c: Node; a: Node; b: Node }
   | { t: "comma"; l: Node; r: Node };
 
@@ -123,12 +123,14 @@ const ASSIGN_OPS = new Set([
 class AParser {
   private p = 0;
   private readonly toks: Tok[];
-  constructor(toks: Tok[]) {
+  private readonly src: string;
+  constructor(toks: Tok[], src: string) {
     this.toks = toks;
+    this.src = src;
   }
 
   private peek(): Tok {
-    return this.toks[this.p] ?? { k: "eof" };
+    return this.toks[this.p] ?? { k: "eof", pos: this.src.length };
   }
   private next(): Tok {
     const t = this.peek();
@@ -156,17 +158,22 @@ class AParser {
     return l;
   }
 
-  /** Parse a name with an optional `[subscript]`, or null (restoring pos). */
-  private tryLvalue(): { name: string; index?: Node } | null {
+  /** Parse a name with an optional `[subscript]`, or null (restoring pos). Also
+   *  captures the subscript's raw source text, used verbatim as an associative
+   *  array key (bash does not arithmetic-evaluate assoc subscripts). */
+  private tryLvalue(): { name: string; index?: Node; rawIndex?: string } | null {
     const t = this.peek();
     if (t.k !== "name") return null;
     this.next();
     if (this.isOp("[")) {
       this.next();
+      const start = this.peek().pos;
       const index = this.parseComma();
-      if (!this.isOp("]")) throw new ArithError("expected `]`");
+      const close = this.peek();
+      if (close.k !== "op" || close.v !== "]") throw new ArithError("expected `]`");
+      const rawIndex = this.src.slice(start, close.pos).trim();
       this.next();
-      return { name: t.v, index };
+      return { name: t.v, index, rawIndex };
     }
     return { name: t.v };
   }
@@ -176,7 +183,7 @@ class AParser {
     const lv = this.tryLvalue();
     if (lv && this.peek().k === "op" && ASSIGN_OPS.has((this.peek() as { v: string }).v)) {
       const op = (this.next() as { v: string }).v;
-      return { t: "assign", op, name: lv.name, index: lv.index, e: this.parseAssign() };
+      return { t: "assign", op, name: lv.name, index: lv.index, rawIndex: lv.rawIndex, e: this.parseAssign() };
     }
     this.p = save; // not an assignment — reparse as an expression
     return this.parseTernary();
@@ -246,7 +253,7 @@ class AParser {
       this.next();
       const lv = this.tryLvalue();
       if (lv === null) throw new ArithError("expected variable after `" + t.v + "`");
-      return { t: "incr", op: t.v, name: lv.name, index: lv.index, post: false };
+      return { t: "incr", op: t.v, name: lv.name, index: lv.index, rawIndex: lv.rawIndex, post: false };
     }
     return this.parsePostfix();
   }
@@ -256,7 +263,7 @@ class AParser {
     const t = this.peek();
     if (e.t === "var" && t.k === "op" && (t.v === "++" || t.v === "--")) {
       this.next();
-      return { t: "incr", op: t.v, name: e.name, index: e.index, post: true };
+      return { t: "incr", op: t.v, name: e.name, index: e.index, rawIndex: e.rawIndex, post: true };
     }
     return e;
   }
@@ -273,10 +280,13 @@ class AParser {
     if (t.k === "name") {
       if (this.isOp("[")) {
         this.next();
+        const start = this.peek().pos;
         const index = this.parseComma();
-        if (!this.isOp("]")) throw new ArithError("expected `]`");
+        const close = this.peek();
+        if (close.k !== "op" || close.v !== "]") throw new ArithError("expected `]`");
+        const rawIndex = this.src.slice(start, close.pos).trim();
         this.next();
-        return { t: "var", name: t.v, index };
+        return { t: "var", name: t.v, index, rawIndex };
       }
       return { t: "var", name: t.v };
     }
@@ -286,19 +296,22 @@ class AParser {
 
 /* ---------- evaluation ---------- */
 
-const readVar = (shell: Shell, name: string, index: Node | undefined, depth: number): bigint => {
-  // The subscript is evaluated arithmetically; its string form is the assoc
-  // key or (parsed back to a number) the indexed slot — elemValueSync decides.
+/** The subscript key: an assoc array uses the raw source text verbatim
+ *  (`a[2+3]` -> key "2+3"); an indexed array evaluates it arithmetically. */
+const subKey = (shell: Shell, name: string, index: Node, rawIndex: string | undefined, depth: number): string =>
+  shell.isAssoc(name) ? rawIndex ?? "" : evalNode(shell, index, depth).toString();
+
+const readVar = (shell: Shell, name: string, index: Node | undefined, rawIndex: string | undefined, depth: number): bigint => {
   const raw = index === undefined
     ? shell.getVar(name)
-    : shell.elemValueSync(name, evalNode(shell, index, depth).toString());
+    : shell.elemValueSync(name, subKey(shell, name, index, rawIndex, depth));
   if (raw === undefined || raw.trim() === "") return 0n;
   return evalArith(shell, raw, depth + 1);
 };
 
-const writeVar = (shell: Shell, name: string, index: Node | undefined, value: bigint, depth: number): void => {
+const writeVar = (shell: Shell, name: string, index: Node | undefined, rawIndex: string | undefined, value: bigint, depth: number): void => {
   if (index === undefined) shell.setVar(name, value.toString());
-  else shell.setElemSync(name, evalNode(shell, index, depth).toString(), value.toString());
+  else shell.setElemSync(name, subKey(shell, name, index, rawIndex, depth), value.toString());
 };
 
 const evalNode = (shell: Shell, n: Node, depth: number): bigint => {
@@ -306,7 +319,7 @@ const evalNode = (shell: Shell, n: Node, depth: number): bigint => {
     case "num":
       return n.v;
     case "var":
-      return readVar(shell, n.name, n.index, depth);
+      return readVar(shell, n.name, n.index, n.rawIndex, depth);
     case "unary": {
       const e = evalNode(shell, n.e, depth);
       switch (n.op) {
@@ -317,9 +330,9 @@ const evalNode = (shell: Shell, n: Node, depth: number): bigint => {
       }
     }
     case "incr": {
-      const cur = readVar(shell, n.name, n.index, depth);
+      const cur = readVar(shell, n.name, n.index, n.rawIndex, depth);
       const nv = wrap(n.op === "++" ? cur + 1n : cur - 1n);
-      writeVar(shell, n.name, n.index, nv, depth);
+      writeVar(shell, n.name, n.index, n.rawIndex, nv, depth);
       return n.post ? cur : nv;
     }
     case "logic": {
@@ -335,10 +348,10 @@ const evalNode = (shell: Shell, n: Node, depth: number): bigint => {
       evalNode(shell, n.l, depth);
       return evalNode(shell, n.r, depth);
     case "assign": {
-      const cur = n.op === "=" ? 0n : readVar(shell, n.name, n.index, depth);
+      const cur = n.op === "=" ? 0n : readVar(shell, n.name, n.index, n.rawIndex, depth);
       const r = evalNode(shell, n.e, depth);
       const nv = wrap(n.op === "=" ? r : applyBin(n.op.slice(0, -1), cur, r));
-      writeVar(shell, n.name, n.index, nv, depth);
+      writeVar(shell, n.name, n.index, n.rawIndex, nv, depth);
       return nv;
     }
     case "bin":
@@ -371,6 +384,6 @@ const applyBin = (op: string, l: bigint, r: bigint): bigint => {
 
 export const evalArith = (shell: Shell, text: string, depth = 0): bigint => {
   if (depth > 64) throw new ArithError("expression recursion level exceeded (max: 64)");
-  const ast = new AParser(tokenizeArith(text)).parseTop();
+  const ast = new AParser(tokenizeArith(text), text).parseTop();
   return evalNode(shell, ast, depth);
 };

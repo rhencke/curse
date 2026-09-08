@@ -345,6 +345,11 @@ export class Shell {
     if (v.arr !== null) return this.arrayGet(base, Number(evalArith(this, sub)));
     return sub === "0" ? v.value : undefined; // scalar as element 0
   }
+  /** True if `name` is an associative array (arithmetic keys are literal). */
+  isAssoc(name: string): boolean {
+    const v = this.lookup(name);
+    return v !== undefined && v.assoc !== null;
+  }
   /** Write `base[sub]` synchronously (assoc key or arithmetic index) — used by
    *  namerefs and arithmetic array assignment. */
   setElemSync(base: string, sub: string, value: string): void {
