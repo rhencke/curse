@@ -126,13 +126,21 @@ const expandEscapes = (v: string): string =>
 export const changeCase = (v: string, op: string, pat: string): string => {
   const up = op[0] === "^";
   const all = op.length === 2;
-  const re = pat === "" ? null : new RegExp("^(?:" + globToRegExpBody(pat) + ")$", "s");
-  const hit = (ch: string): boolean => re === null || re.test(ch);
-  const conv = (ch: string): string => (up ? ch.toUpperCase() : ch.toLowerCase());
-  if (all) return [...v].map((ch) => (hit(ch) ? conv(ch) : ch)).join("");
+  // Fast path: no pattern means every candidate char converts, so use the
+  // native whole-string conversion (identical to mapping each code point) and
+  // skip the char-array spread/join.
+  if (pat === "") {
+    if (v === "") return v;
+    if (all) return up ? v.toUpperCase() : v.toLowerCase();
+    const c0 = up ? v[0]!.toUpperCase() : v[0]!.toLowerCase();
+    return c0 + v.slice(1);
+  }
+  const re = new RegExp("^(?:" + globToRegExpBody(pat) + ")$", "s");
+  const conv = (ch: string): string => (re.test(ch) ? (up ? ch.toUpperCase() : ch.toLowerCase()) : ch);
+  if (all) return [...v].map(conv).join("");
   if (v.length === 0) return v;
   const chars = [...v];
-  chars[0] = hit(chars[0]!) ? conv(chars[0]!) : chars[0]!;
+  chars[0] = conv(chars[0]!);
   return chars.join("");
 };
 
