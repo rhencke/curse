@@ -972,12 +972,12 @@ export class Shell {
     if (v === undefined) return 0n;
     if (v.ref && v.value !== "") return this.agetSlow(name); // nameref → full path
     if (v.unset) return 0n;
+    const c = v.intCache(); // fresh int, or a remembered parse: no re-parse
+    if (c !== null) return c;
     const s = v.scalar();
-    if (s === v.ivStr) return v.iv; // cache hit: no re-parse, no string round-trip
     if (s === "") return 0n;
     const r = this.parseArithInt(s);
-    v.iv = r;
-    v.ivStr = s;
+    v.cacheInt(s, r);
     return r;
   }
   /** Nameref / element-nameref arithmetic read (rare; no scalar cache). */
@@ -992,25 +992,45 @@ export class Shell {
     if (/^-?(0|[1-9][0-9]*)$/.test(t)) return arithWrap(BigInt(t));
     return evalArith(this, s);
   }
-  /** Assign a scalar arithmetic value; returns it (already wrapped by caller). */
+  /** Assign a scalar arithmetic value (stored lazily as a BigInt); returns it. */
   aset(name: string, v: bigint): bigint {
-    const str = v.toString();
-    const box = this.assignVar(name, str);
-    if (box !== undefined && box.value === str) { box.iv = v; box.ivStr = str; }
+    this.assignInt(name, v);
     return v;
+  }
+  /** True if `v` is a plain scalar whose value can be held as a lazy BigInt
+   *  (no nameref, readonly, attribute, or array shape forcing a string form). */
+  private plainInt(v: Var): boolean {
+    return !v.ref && !v.readonly && !v.integer && !v.lower && !v.upper && v.arr === null && v.assoc === null;
+  }
+  private assignInt(name: string, v: bigint): void {
+    const r = this.resolveRef(name);
+    if (r.sub !== null) { this.setElemSync(r.name, r.sub, v.toString()); return; }
+    name = r.name;
+    const existing = this.scopeLookup(name);
+    if (existing) {
+      if (existing.readonly) {
+        this.io.err(`${this.name}: ${name}: readonly variable\n`);
+        this.readonlyHit = true;
+        return;
+      }
+      if (this.plainInt(existing)) { existing.setInt(v); existing.unset = false; return; }
+      this.assignVar(name, v.toString()); // attribute/array: string coerce path
+      return;
+    }
+    const nv = new Var("", process.env[name] !== undefined);
+    nv.setInt(v);
+    this.globalScope.vars.set(name, nv);
   }
   /** `x++` / `++x` / `x--` / `--x` on a scalar; returns the pre/post value. */
   ainc(name: string, delta: bigint, post: boolean): bigint {
     // Fast path: an existing plain, writable scalar (the typical loop counter) —
-    // one scope lookup, then mutate the box in place (no read-then-write-through).
+    // one scope lookup, then mutate the box in place (lazy BigInt, no string).
     const v = this.scopeLookup(name);
-    if (v !== undefined && !v.ref && !v.readonly && !v.integer && v.arr === null && v.assoc === null) {
-      const cur = v.ivStr === v.value ? v.iv : v.value === "" ? 0n : this.parseArithInt(v.value);
+    if (v !== undefined && this.plainInt(v)) {
+      const c = v.intCache();
+      const cur = c !== null ? c : v.value === "" ? 0n : this.parseArithInt(v.value);
       const nv = arithWrap(cur + delta);
-      const str = nv.toString();
-      v.value = str;
-      v.iv = nv;
-      v.ivStr = str;
+      v.setInt(nv);
       v.unset = false;
       return post ? cur : nv;
     }

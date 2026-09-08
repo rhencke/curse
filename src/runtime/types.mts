@@ -9,7 +9,6 @@ export interface IO {
 /** A shell variable: a scalar value, or (when `arr` is set) an indexed array.
  *  Coerces to its string value — element 0 for an array, matching bash's `$arr`. */
 export class Var {
-  value: string;
   exported: boolean;
   /** Indexed-array elements (sparse), or null. */
   arr: Map<number, string> | null = null;
@@ -25,15 +24,53 @@ export class Var {
   /** Declared but unset (e.g. `local x`): occupies scope for shadowing, but
    *  reads as unset until a value is assigned. */
   unset = false;
-  /** Cached integer value of `value` for arithmetic reads: `iv` is valid only
-   *  while `ivStr === value`, so a plain-integer variable in an arith loop is
-   *  neither re-parsed nor round-tripped through a string. */
-  iv: bigint = 0n;
-  ivStr: string | null = null;
+
+  // Lazy value: a scalar's value is kept as a string (`_str`) or, after an
+  // arithmetic write, as a BigInt (`_iv` with `_fresh`) whose string form is
+  // only materialized when a string context reads it. `_ivStr` additionally
+  // caches the parse of a plain string value, so an arith loop neither
+  // re-parses nor round-trips its counter through a string each iteration.
+  private _str: string;
+  private _iv: bigint = 0n;
+  private _fresh = false;
+  private _ivStr: string | null = null;
+
   constructor(value: string, exported = false) {
-    this.value = value;
+    this._str = value;
     this.exported = exported;
   }
+
+  get value(): string {
+    if (this._fresh) {
+      this._str = this._iv.toString();
+      this._ivStr = this._str;
+      this._fresh = false;
+    }
+    return this._str;
+  }
+  set value(s: string) {
+    this._str = s;
+    this._fresh = false;
+    this._ivStr = null;
+  }
+
+  /** Arithmetic read: the cached integer when the current value is a fresh int
+   *  or a string whose parse we remembered, else null (the caller parses). */
+  intCache(): bigint | null {
+    if (this._fresh) return this._iv;
+    return this._ivStr !== null && this._ivStr === this._str ? this._iv : null;
+  }
+  /** Remember that string `s` parsed to integer `v` (arith read cache). */
+  cacheInt(s: string, v: bigint): void {
+    this._iv = v;
+    this._ivStr = s;
+  }
+  /** Arithmetic write: store the integer and defer its string form. */
+  setInt(v: bigint): void {
+    this._iv = v;
+    this._fresh = true;
+  }
+
   scalar(): string {
     if (this.assoc !== null) return this.assoc.get("0") ?? "";
     return this.arr !== null ? this.arr.get(0) ?? "" : this.value;
