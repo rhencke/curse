@@ -72,6 +72,13 @@ class WordParser {
   }
 
   parse(): ParsedWord {
+    // Leading unquoted tilde: `~` or `~/...` -> $HOME (result is not split).
+    if (this.t[0] === "~" && (this.t.length === 1 || this.t[1] === "/")) {
+      this.parts.push({ k: "param", p: simpleParam("HOME", false), quoted: true });
+      this.anchored = true;
+      this.i = 1;
+    }
+
     for (;;) {
       const c = this.at();
       if (c === undefined) break;
@@ -106,6 +113,15 @@ class WordParser {
         continue;
       }
       if (c === "$") {
+        const n = this.at(1);
+        if (n === "'") {
+          this.ansiC(); // $'...' -> literal (C escapes decoded)
+          continue;
+        }
+        if (n === '"') {
+          this.i++; // $"..." -> treat like "..."
+          continue;
+        }
         this.flushLit();
         this.dollar(false);
         continue;
@@ -115,6 +131,76 @@ class WordParser {
     }
     this.flushLit();
     return { parts: this.parts, anchored: this.anchored };
+  }
+
+  /** Decode a `$'...'` ANSI-C string into literal text. */
+  private ansiC(): void {
+    this.i += 2; // past $'
+    let out = "";
+    for (;;) {
+      const c = this.at();
+      if (c === undefined) throw new Error("unterminated $'...'");
+      this.i++;
+      if (c === "'") break;
+      if (c === "\\") {
+        out += this.ansiEscape();
+        continue;
+      }
+      out += c;
+    }
+    this.pushLit(out);
+  }
+
+  private ansiEscape(): string {
+    const c = this.at();
+    if (c === undefined) return "\\";
+    this.i++;
+    switch (c) {
+      case "n": return "\n";
+      case "t": return "\t";
+      case "r": return "\r";
+      case "\\": return "\\";
+      case "'": return "'";
+      case '"': return '"';
+      case "a": return "\x07";
+      case "b": return "\b";
+      case "f": return "\f";
+      case "v": return "\v";
+      case "e": case "E": return "\x1b";
+      case "x": {
+        let h = "";
+        while (h.length < 2 && this.at() !== undefined && /[0-9a-fA-F]/.test(this.at()!)) {
+          h += this.at();
+          this.i++;
+        }
+        return h === "" ? "x" : String.fromCharCode(parseInt(h, 16));
+      }
+      case "u": case "U": {
+        const max = c === "u" ? 4 : 8;
+        let h = "";
+        while (h.length < max && this.at() !== undefined && /[0-9a-fA-F]/.test(this.at()!)) {
+          h += this.at();
+          this.i++;
+        }
+        return h === "" ? c : String.fromCodePoint(parseInt(h, 16));
+      }
+      case "c": {
+        const n = this.at();
+        if (n === undefined) return "c";
+        this.i++;
+        return String.fromCharCode(n.toUpperCase().charCodeAt(0) & 0x1f);
+      }
+      default:
+        if (c >= "0" && c <= "7") {
+          let o = c;
+          while (o.length < 3 && this.at() !== undefined && this.at()! >= "0" && this.at()! <= "7") {
+            o += this.at();
+            this.i++;
+          }
+          return String.fromCharCode(parseInt(o, 8) & 0xff);
+        }
+        return "\\" + c;
+    }
   }
 
   private scanDouble(): void {

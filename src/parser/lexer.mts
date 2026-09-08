@@ -219,6 +219,10 @@ class Lexer {
           buf += this.scanBalanced("${", "{", "}", 1);
           continue;
         }
+        if (nc === "'") {
+          buf += this.scanAnsiC();
+          continue;
+        }
         buf += "$";
         this.i++;
         continue;
@@ -228,6 +232,27 @@ class Lexer {
       this.i++;
     }
     return buf;
+  }
+
+  /** Scan a `$'...'` ANSI-C string raw (respecting `\'`), keeping it intact for
+   *  the word parser to decode. */
+  private scanAnsiC(): string {
+    let buf = "$'";
+    this.i += 2;
+    for (;;) {
+      const c = this.at();
+      if (c === undefined) throw new LexError("unterminated $'...'");
+      if (c === "\\") {
+        const n = this.at(1);
+        buf += "\\" + (n ?? "");
+        this.i += n === undefined ? 1 : 2;
+        continue;
+      }
+      buf += c;
+      this.i++;
+      if (c === "'") return buf;
+      if (c === "\n") this.line++;
+    }
   }
 
   private scanSingle(): string {
