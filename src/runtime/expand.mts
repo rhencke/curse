@@ -15,34 +15,45 @@ import { evalArith } from "./arith.mts";
 import { changeCase, replaceGlob, substr, transform, trimPrefix, trimSuffix } from "./param.mts";
 import { ExitSignal } from "./types.mts";
 
-const isIFSWhitespace = (c: string): boolean => c === " " || c === "\t" || c === "\n";
+const isWsChar = (c: string): boolean => c === " " || c === "\t" || c === "\n";
 
-/** Split an assembled, per-character-tagged buffer into fields (default IFS). */
+/** Split an assembled, per-character-tagged buffer into fields on IFS (bash
+ *  rules): runs of IFS-whitespace delimit without empty fields, while each
+ *  IFS non-whitespace char is its own delimiter (so `a,,b` -> a, "", b), with
+ *  surrounding IFS-whitespace absorbed. `ifs` undefined means the default
+ *  ` \t\n`; a trailing delimiter yields no trailing empty field. */
 export const splitTaggedFields = (
   chars: string[],
   splittable: boolean[],
   anchored: boolean,
+  ifs?: string,
 ): string[] => {
-  if (chars.length === 0) return anchored ? [""] : [];
+  const IFS = ifs === undefined ? " \t\n" : ifs;
+  const ws = new Set<string>();
+  const nw = new Set<string>();
+  for (const c of IFS) (isWsChar(c) ? ws : nw).add(c);
+  const n = chars.length;
+  const isWs = (i: number): boolean => splittable[i]! && ws.has(chars[i]!);
+  const isNw = (i: number): boolean => splittable[i]! && nw.has(chars[i]!);
+
+  if (n === 0) return anchored ? [""] : [];
   const fields: string[] = [];
-  let cur = "";
-  let started = false;
   let i = 0;
-  while (i < chars.length) {
-    if (splittable[i] && isIFSWhitespace(chars[i]!)) {
-      if (started) {
-        fields.push(cur);
-        cur = "";
-        started = false;
-      }
-      while (i < chars.length && splittable[i] && isIFSWhitespace(chars[i]!)) i++;
-      continue;
+  while (i < n && isWs(i)) i++; // strip leading IFS whitespace
+  while (i < n) {
+    let field = "";
+    while (i < n && !isWs(i) && !isNw(i)) { field += chars[i]; i++; }
+    fields.push(field);
+    if (i >= n) break;
+    if (isNw(i)) {
+      i++; // a single non-whitespace delimiter, plus any trailing whitespace
+      while (i < n && isWs(i)) i++;
+    } else {
+      while (i < n && isWs(i)) i++; // a run of whitespace...
+      if (i < n && isNw(i)) { i++; while (i < n && isWs(i)) i++; } // ...may end at one non-ws delim
     }
-    cur += chars[i];
-    started = true;
-    i++;
+    if (i >= n) break; // trailing delimiter: no extra empty field
   }
-  if (started) fields.push(cur);
   if (fields.length === 0) return anchored ? [""] : [];
   return fields;
 };
@@ -282,7 +293,7 @@ export const expandWord = async (shell: Shell, word: Word): Promise<string[]> =>
       sp.push(splittable);
     }
   }
-  const fields = splitTaggedFields(chars, sp, anchored);
+  const fields = splitTaggedFields(chars, sp, anchored, shell.getVar("IFS"));
   return pw.hasQuote ? fields : shell.glob(fields);
 };
 

@@ -777,7 +777,7 @@ export class Shell {
         }
       }
     }
-    return splitTaggedFields(chars, sp, anchored);
+    return splitTaggedFields(chars, sp, anchored, this.getVar("IFS"));
   }
 
   /** Command substitution (compiled): run body capturing stdout. */
