@@ -315,7 +315,7 @@ class Emitter {
       }
       return `${i}await sh.elemSet(${J(name)}, ${sub}, ${rhs});`;
     }
-    if (append) return `${i}sh.env.${name} = String(sh.env.${name}) + ${rhs};`;
+    if (append) return `${i}sh.appendVar(${J(name)}, ${rhs});`;
     return `${i}sh.env.${name} = ${rhs};`;
   }
 

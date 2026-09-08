@@ -15,6 +15,11 @@ export class Var {
   arr: Map<number, string> | null = null;
   /** Associative-array elements (declare -A), or null. */
   assoc: Map<string, string> | null = null;
+  /** Attributes: -i evaluates arithmetic on assignment; -l/-u force case. */
+  integer = false;
+  lower = false;
+  upper = false;
+  readonly = false;
   constructor(value: string, exported = false) {
     this.value = value;
     this.exported = exported;

@@ -201,12 +201,39 @@ export class Shell {
     const owner = this.ownerScope(name);
     if (owner) {
       const v = owner[name]!;
-      if (v.assoc !== null) v.assoc.set("0", s);
-      else if (v.arr !== null) v.arr.set(0, s);
-      else v.value = s;
+      const cs = this.coerce(v, s);
+      if (v.assoc !== null) v.assoc.set("0", cs);
+      else if (v.arr !== null) v.arr.set(0, cs);
+      else v.value = cs;
     } else {
       this.globalScope[name] = new Var(s, process.env[name] !== undefined);
     }
+  }
+
+  /** Apply a variable's attributes (-i/-l/-u) to a value being stored. */
+  private coerce(v: Var, s: string): string {
+    let out = s;
+    if (v.integer) {
+      try {
+        out = String(evalArith(this, s));
+      } catch {
+        out = "0";
+      }
+    }
+    if (v.lower) out = out.toLowerCase();
+    else if (v.upper) out = out.toUpperCase();
+    return out;
+  }
+
+  /** Set declare/local attributes on a variable, creating it if needed.
+   *  Only future assignments are coerced — an existing value is left as-is
+   *  (bash does not re-evaluate on `declare -i name`). */
+  setAttrs(name: string, a: { integer?: boolean; lower?: boolean; upper?: boolean; readonly?: boolean }): void {
+    const v = this.varForWrite(name);
+    if (a.integer !== undefined) v.integer = a.integer;
+    if (a.lower !== undefined) { v.lower = a.lower; if (a.lower) v.upper = false; }
+    if (a.upper !== undefined) { v.upper = a.upper; if (a.upper) v.lower = false; }
+    if (a.readonly) v.readonly = true;
   }
 
   getVar(name: string): string | undefined {
@@ -372,6 +399,20 @@ export class Shell {
   }
   local(name: string, value?: string): void {
     this.scope[name] = new Var(value ?? "");
+  }
+  /** `name+=v`: numeric add for integer vars, else string append. */
+  appendVar(name: string, rhs: string): void {
+    const v = this.lookup(name);
+    if (v && v.integer) {
+      const cur = v.value === "" ? "0" : v.value;
+      try {
+        this.setVar(name, String(evalArith(this, `(${cur})+(${rhs})`)));
+      } catch {
+        this.setVar(name, cur);
+      }
+      return;
+    }
+    this.setVar(name, (this.getVar(name) ?? "") + rhs);
   }
   exportVar(name: string): void {
     const owner = this.ownerScope(name);
@@ -1251,7 +1292,7 @@ export class Shell {
       if (append) await this.elemSet(name, raw, ((await this.elemGet(name, raw)) ?? "") + value);
       else await this.elemSet(name, raw, value);
     } else if (append) {
-      this.setVar(name, (this.getVar(name) ?? "") + value);
+      this.appendVar(name, value);
     } else {
       this.setVar(name, value);
     }

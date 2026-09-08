@@ -235,10 +235,13 @@ const exportBuiltin: Builtin = (shell, ...args) => {
 };
 
 const local: Builtin = (shell, ...args) => {
-  for (const a of args) {
-    const eq = a.indexOf("=");
-    if (eq >= 0) shell.local(a.slice(0, eq), a.slice(eq + 1));
-    else shell.local(a);
+  const { flags, names } = parseDeclFlags(args);
+  for (const n of names) {
+    const eq = n.indexOf("=");
+    const name = eq >= 0 ? n.slice(0, eq) : n;
+    shell.local(name);
+    shell.setAttrs(name, flags);
+    if (eq >= 0) shell.setVar(name, n.slice(eq + 1));
   }
   return 0;
 };
@@ -343,23 +346,49 @@ const getopts: Builtin = (shell, ...args) => {
   }
 };
 
-const declareBuiltin: Builtin = (shell, ...args) => {
-  let makeArray = false;
-  let makeAssoc = false;
+interface DeclFlags {
+  integer?: boolean;
+  lower?: boolean;
+  upper?: boolean;
+  readonly: boolean;
+  exported: boolean;
+  array: boolean;
+  assoc: boolean;
+}
+const parseDeclFlags = (args: string[]): { flags: DeclFlags; names: string[] } => {
+  const flags: DeclFlags = { readonly: false, exported: false, array: false, assoc: false };
   const names: string[] = [];
   for (const a of args) {
-    if (a.startsWith("-") || a.startsWith("+")) {
-      if (a.includes("a")) makeArray = true;
-      if (a.includes("A")) makeAssoc = true;
+    if (a.length > 1 && (a[0] === "-" || a[0] === "+")) {
+      const on = a[0] === "-";
+      for (const ch of a.slice(1)) {
+        if (ch === "i") flags.integer = on;
+        else if (ch === "l") flags.lower = on;
+        else if (ch === "u") flags.upper = on;
+        else if (ch === "r") flags.readonly ||= on;
+        else if (ch === "x") flags.exported ||= on;
+        else if (ch === "a") flags.array = true;
+        else if (ch === "A") flags.assoc = true;
+      }
       continue;
     }
     names.push(a);
   }
+  return { flags, names };
+};
+
+const declareBuiltin: Builtin = (shell, ...args) => {
+  const { flags, names } = parseDeclFlags(args);
   for (const n of names) {
-    if (makeAssoc) shell.declareAssoc(n.includes("=") ? n.slice(0, n.indexOf("=")) : n);
     const eq = n.indexOf("=");
-    if (eq >= 0) shell.setVar(n.slice(0, eq), n.slice(eq + 1));
-    else if (makeArray && shell.arrayLen(n) === 0) shell.setArray(n, []);
+    const name = eq >= 0 ? n.slice(0, eq) : n;
+    // Establish array/assoc shape before setAttrs, so an empty `declare -a x`
+    // stays a 0-element array rather than a "" scalar.
+    if (flags.assoc) shell.declareAssoc(name);
+    else if (eq < 0 && flags.array && shell.arrayLen(name) === 0) shell.setArray(name, []);
+    shell.setAttrs(name, flags);
+    if (eq >= 0) shell.setVar(name, n.slice(eq + 1));
+    if (flags.exported) shell.exportVar(name);
   }
   return 0;
 };
