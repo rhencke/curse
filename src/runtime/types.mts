@@ -29,3 +29,11 @@ export class ReturnSignal {
     this.code = code;
   }
 }
+
+/** Thrown by the `exit` builtin, caught at the shell/subshell boundary. */
+export class ExitSignal {
+  code: number;
+  constructor(code: number) {
+    this.code = code;
+  }
+}

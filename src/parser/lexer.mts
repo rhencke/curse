@@ -105,7 +105,8 @@ class Lexer {
         }
         return { type: "REDIR", value: "&>", pos, line };
       }
-      throw new LexError("background `&` not supported yet (planned for M3)");
+      this.i++;
+      return { type: "OP", value: "&", pos, line };
     }
     if (c === "|") {
       if (this.at(1) === "|") {

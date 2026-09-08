@@ -25,7 +25,7 @@ import {
   replaceGlob as pReplaceGlob, substr as pSubstr, trimPrefix as pTrimPrefix, trimSuffix as pTrimSuffix,
 } from "./param.mts";
 import { builtins } from "./builtins.mts";
-import { ReturnSignal, Var } from "./types.mts";
+import { ExitSignal, ReturnSignal, Var } from "./types.mts";
 import type { IO } from "./types.mts";
 import { spawn } from "node:child_process";
 import {
@@ -34,7 +34,7 @@ import {
 import { resolve } from "node:path";
 
 export type { IO } from "./types.mts";
-export { ReturnSignal, Var } from "./types.mts";
+export { ExitSignal, ReturnSignal, Var } from "./types.mts";
 
 const defaultIO = (): IO => ({
   out: (s) => void process.stdout.write(s),
@@ -55,6 +55,17 @@ interface RedirIO {
 
 const errMsg = (e: unknown): string => (e instanceof Error ? e.message : String(e));
 
+/** Run a subshell body, turning `exit` into that subshell's status. */
+const runBody = async (sub: Shell, fn: (sh: Shell) => Promise<unknown>): Promise<number> => {
+  try {
+    await fn(sub);
+  } catch (e) {
+    if (e instanceof ExitSignal) sub.status = e.code;
+    else throw e;
+  }
+  return sub.status;
+};
+
 type Scope = Record<string, Var>;
 type BashFunc = { __bashFunc: (sh: Shell) => Promise<void> };
 
@@ -67,6 +78,11 @@ export class Shell {
   /** Redirected stdin for this command (file contents / here-string), or null
    *  to inherit. Read by the `read` builtin and passed to external stdin. */
   stdinData: string | null = null;
+
+  /** Background jobs and `$!`. */
+  lastBgPid = 0;
+  private jobs: Array<{ pid: number; promise: Promise<number> }> = [];
+  private nextPid = 10000;
 
   private globalScope: Scope = Object.create(null) as Scope;
   private scope: Scope = this.globalScope;
@@ -223,8 +239,7 @@ export class Shell {
   async sub(fn: (sh: Shell) => Promise<void>): Promise<string> {
     const chunks: string[] = [];
     const subsh = this.cloneForSubshell({ out: (s) => void chunks.push(s), err: (s) => this.io.err(s) });
-    await fn(subsh);
-    this.status = subsh.status;
+    this.status = await runBody(subsh, fn);
     return chunks.join("").replace(/\n+$/, "");
   }
 
@@ -606,20 +621,41 @@ export class Shell {
       const io: IO = isLast ? this.io : { out: (s) => void chunks.push(s), err: (s) => this.io.err(s) };
       const sub = this.cloneForSubshell(io);
       sub.stdinData = input;
-      await stages[idx]!(sub);
-      status = sub.status;
+      status = await runBody(sub, stages[idx]!);
       if (!isLast) input = chunks.join("");
     }
     this.status = status;
     return status;
   }
 
+  /** Start a command in the background (a subshell); sets `$!`, returns 0. */
+  background(fn: (sh: Shell) => Promise<unknown>): number {
+    const sub = this.cloneForSubshell();
+    const pid = ++this.nextPid;
+    this.lastBgPid = pid;
+    this.jobs.push({ pid, promise: runBody(sub, fn).catch(() => 1) });
+    this.status = 0;
+    return 0;
+  }
+
+  async waitAll(): Promise<void> {
+    const pending = this.jobs;
+    this.jobs = [];
+    await Promise.allSettled(pending.map((j) => j.promise));
+  }
+
+  async waitFor(pid: number): Promise<number> {
+    const idx = this.jobs.findIndex((j) => j.pid === pid);
+    if (idx < 0) return 127;
+    const [job] = this.jobs.splice(idx, 1);
+    return job!.promise;
+  }
+
   /** Run a body in a subshell (used by generated subshells). */
   async runSubshell(fn: (sh: Shell) => Promise<void>): Promise<number> {
     const sub = this.cloneForSubshell();
-    await fn(sub);
-    this.status = sub.status;
-    return sub.status;
+    this.status = await runBody(sub, fn);
+    return this.status;
   }
 
   /* ---------------- interpreter (JIT / eval path) ---------------- */
@@ -633,7 +669,7 @@ export class Shell {
     try {
       return await this.execute(cmd);
     } catch (e) {
-      if (e instanceof ReturnSignal) {
+      if (e instanceof ReturnSignal || e instanceof ExitSignal) {
         this.status = e.code;
         return e.code;
       }
@@ -673,6 +709,9 @@ export class Shell {
         status = await this.pipeline(stages.map((c) => (sh: Shell) => sh.execute(c)));
         break;
       }
+      case "background":
+        status = this.background((sh) => sh.execute(cmd.command));
+        break;
       case "function":
         this.defineFunction(cmd);
         status = 0;
@@ -682,8 +721,8 @@ export class Shell {
         status = await this.execute(cmd.body);
         break;
       case "subshell": {
-        const sub = this.cloneForSubshell();
-        status = await sub.execute(cmd.body);
+        const body = cmd.body;
+        status = await runBody(this.cloneForSubshell(), (sh) => sh.execute(body));
         this.status = status;
         break;
       }

@@ -101,20 +101,35 @@ class Parser {
   }
 
   /** A list of and_or commands, ended by EOF or one of `term`'s tokens. */
+  private isAmp(): boolean {
+    const t = this.peek();
+    return t.type === "OP" && t.value === "&";
+  }
+
   private parseCompoundList(term: TermSet): Command {
     this.skipSeparators();
     if (this.atTerminator(term)) {
       const t = this.peek();
       throw new ParseError(`syntax error near \`${t.value || "<eof>"}\` (line ${t.line})`);
     }
-    let cmd = this.parseAndOr();
+    let result: Command | null = null;
     for (;;) {
-      if (!this.isSeparator()) break;
-      this.skipSeparators();
+      let cmd = this.parseAndOr();
+      let hadSep = false;
+      if (this.isAmp()) {
+        this.advance();
+        cmd = { type: "background", command: cmd };
+        hadSep = true;
+      }
+      result = result === null ? cmd : connection(";", result, cmd);
+      while (this.isSeparator()) {
+        this.advance();
+        hadSep = true;
+      }
       if (this.atTerminator(term)) break;
-      cmd = connection(";", cmd, this.parseAndOr());
+      if (!hadSep) break;
     }
-    return cmd;
+    return result ?? { type: "simple", words: [], redirects: [] };
   }
 
   private parseAndOr(): Command {

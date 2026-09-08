@@ -7,7 +7,7 @@
 import { resolve } from "node:path";
 import { accessSync, constants, lstatSync, statSync } from "node:fs";
 import type { Shell } from "./shell.mts";
-import { ReturnSignal } from "./types.mts";
+import { ExitSignal, ReturnSignal } from "./types.mts";
 
 export type Builtin = (shell: Shell, ...args: string[]) => number | Promise<number>;
 
@@ -209,6 +209,27 @@ const returnBuiltin: Builtin = (shell, ...args) => {
   throw new ReturnSignal(args.length > 0 ? toInt(args[0]!) : shell.status);
 };
 
+const exitBuiltin: Builtin = (shell, ...args) => {
+  throw new ExitSignal(args.length > 0 ? toInt(args[0]!) : shell.status);
+};
+
+const shift: Builtin = (shell, ...args) => {
+  const n = args.length > 0 ? toInt(args[0]!) : 1;
+  if (n < 0 || n > shell.positional.length) return 1;
+  shell.positional = shell.positional.slice(n);
+  return 0;
+};
+
+const wait: Builtin = async (shell, ...args) => {
+  if (args.length === 0) {
+    await shell.waitAll();
+    return 0;
+  }
+  let status = 0;
+  for (const a of args) status = await shell.waitFor(toInt(a));
+  return status;
+};
+
 const read: Builtin = (shell, ...args) => {
   const names = args.filter((a) => !a.startsWith("-"));
   if (shell.stdinData === null || shell.stdinData === "") return 1;
@@ -363,6 +384,9 @@ export const builtins: Record<string, Builtin> = {
   local,
   unset,
   return: returnBuiltin,
+  exit: exitBuiltin,
+  shift,
+  wait,
   read,
   test,
   "[": bracket,

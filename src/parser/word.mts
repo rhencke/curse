@@ -270,7 +270,7 @@ class WordParser {
       return;
     }
 
-    if (n === "?" || n === "$" || n === "#" || n === "@" || n === "*" || (n >= "0" && n <= "9")) {
+    if (n === "?" || n === "$" || n === "#" || n === "@" || n === "*" || n === "!" || (n >= "0" && n <= "9")) {
       this.parts.push({ k: "param", p: simpleParam(n, true), quoted });
       this.i += 2;
       return;

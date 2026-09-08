@@ -36,6 +36,7 @@ export const CMD_INVERT_RETURN = 0x04;
 export type Command =
   | ConnectionCommand
   | PipelineCommand
+  | BackgroundCommand
   | SimpleCommand
   | GroupCommand
   | SubshellCommand
@@ -69,6 +70,12 @@ export interface ConnectionCommand extends CommandBase {
 export interface PipelineCommand extends CommandBase {
   type: "pipeline";
   stages: Command[];
+}
+
+/** `command &` — run in the background (a subshell), don't wait. */
+export interface BackgroundCommand extends CommandBase {
+  type: "background";
+  command: Command;
 }
 
 export interface SimpleCommand extends CommandBase {
