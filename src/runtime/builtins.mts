@@ -605,11 +605,13 @@ const setBuiltin: Builtin = (shell, ...args) => {
     else if (name === "nounset") shell.opts.nounset = on;
     else if (name === "xtrace") shell.opts.xtrace = on;
     else if (name === "pipefail") shell.opts.pipefail = on;
+    else if (name === "noclobber") shell.opts.noclobber = on;
   };
   const flag = (ch: string, on: boolean): void => {
     if (ch === "e") opt("errexit", on);
     else if (ch === "u") opt("nounset", on);
     else if (ch === "x") opt("xtrace", on);
+    else if (ch === "C") opt("noclobber", on);
   };
 
   let i = 0;

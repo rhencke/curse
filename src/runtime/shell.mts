@@ -168,7 +168,7 @@ export class Shell {
   private nextPid = 10000;
 
   /** `set` options. */
-  opts = { errexit: false, nounset: false, xtrace: false, pipefail: false };
+  opts = { errexit: false, nounset: false, xtrace: false, pipefail: false, noclobber: false };
   /** Depth of errexit-suppressed contexts (conditions, `!`, `&&`/`||` non-final). */
   condDepth = 0;
   /** Enclosing loop nesting in the current function scope (0 outside any loop).
@@ -836,7 +836,10 @@ export class Shell {
     const writers: Record<number, (s: string) => void> = { 1: savedOut, 2: savedErr };
     try {
       for (const r of redirects) {
-        this.applyRedirect(r, r.target, writers, toClose);
+        if (!this.applyRedirect(r, r.target, writers, toClose)) {
+          this.status = 1;
+          return 1; // redirect failed (noclobber): don't run the command
+        }
       }
       this.io = { out: writers[1] ?? savedOut, err: writers[2] ?? savedErr };
       return await run();
@@ -853,21 +856,39 @@ export class Shell {
     }
   }
 
+  /** Apply one redirection. Returns false (with a diagnostic) when it fails —
+   *  currently only a noclobber violation — so the command is not run. */
   private applyRedirect(
     r: RedirIO,
     target: string,
     writers: Record<number, (s: string) => void>,
     toClose: number[],
-  ): void {
+  ): boolean {
     const openFile = (flags: string): ((s: string) => void) => {
       const fd = openSync(resolve(this.cwd, target), flags);
       toClose.push(fd);
       return (s: string) => void writeSync(fd, s);
     };
+    // set -C: `>` / `&>` won't truncate an existing regular file (`>|` will).
+    const clobberBlocked = (): boolean => {
+      if (!this.opts.noclobber) return false;
+      try {
+        return statSync(resolve(this.cwd, target)).isFile();
+      } catch {
+        return false;
+      }
+    };
     switch (r.op) {
-      case ">": case ">|": writers[r.fd] = openFile("w"); break;
+      case ">":
+        if (clobberBlocked()) { this.io.err(`${this.name}: ${target}: cannot overwrite existing file\n`); return false; }
+        writers[r.fd] = openFile("w");
+        break;
+      case ">|": writers[r.fd] = openFile("w"); break;
       case ">>": writers[r.fd] = openFile("a"); break;
-      case "&>": { const w = openFile("w"); writers[1] = w; writers[2] = w; break; }
+      case "&>": {
+        if (clobberBlocked()) { this.io.err(`${this.name}: ${target}: cannot overwrite existing file\n`); return false; }
+        const w = openFile("w"); writers[1] = w; writers[2] = w; break;
+      }
       case "&>>": { const w = openFile("a"); writers[1] = w; writers[2] = w; break; }
       case "<": this.stdinData = readFileSync(resolve(this.cwd, target), "utf8"); break;
       case "<<<": this.stdinData = target + "\n"; break;
@@ -894,6 +915,7 @@ export class Shell {
       default:
         throw new Error(`redirection \`${r.op}\` not supported yet`);
     }
+    return true;
   }
 
   private external(name: string, args: string[], extraEnv: Record<string, string>): Promise<number> {
