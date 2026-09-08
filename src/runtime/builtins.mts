@@ -80,6 +80,26 @@ const echo: Builtin = (shell, ...args) => {
   return 0;
 };
 
+/** printf %q: quote a value so it can be reused as shell input. */
+const shellBackslashQuote = (v: string): string => {
+  if (v === "") return "''";
+  if (/[\x00-\x1f\x7f]/.test(v)) {
+    let s = "$'";
+    for (const ch of v) {
+      const code = ch.charCodeAt(0);
+      if (ch === "\\") s += "\\\\";
+      else if (ch === "'") s += "\\'";
+      else if (ch === "\n") s += "\\n";
+      else if (ch === "\t") s += "\\t";
+      else if (ch === "\r") s += "\\r";
+      else if (code < 0x20 || code === 0x7f) s += "\\" + code.toString(8).padStart(3, "0");
+      else s += ch;
+    }
+    return s + "'";
+  }
+  return v.replace(/[^A-Za-z0-9_@%+=:,./-]/g, "\\$&");
+};
+
 const printf: Builtin = async (shell, ...args) => {
   // -v VAR: capture the output into a variable (or array element) instead
   // of writing it to stdout.
@@ -175,6 +195,7 @@ const printf: Builtin = async (shell, ...args) => {
         case "X": out += format((toInt(nextArg()) >>> 0).toString(16).toUpperCase(), true); break;
         case "o": out += format((toInt(nextArg()) >>> 0).toString(8), true); break;
         case "c": out += format(nextArg().slice(0, 1), false); break;
+        case "q": out += format(shellBackslashQuote(nextArg()), false); break;
         default: out += "%" + conv;
       }
       i = j + 1;
