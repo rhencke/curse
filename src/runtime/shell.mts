@@ -734,6 +734,10 @@ export class Shell {
   hasBuiltin(name: string): boolean {
     return Object.prototype.hasOwnProperty.call(builtins, name);
   }
+  /** Names of defined shell functions, sorted (for `declare -F`). */
+  functionNames(): string[] {
+    return Object.keys(this.functions).filter((k) => this.hasFunction(k)).sort();
+  }
   /** Resolve `name` on PATH to an executable file path, or null. */
   lookupPath(name: string): string | null {
     const check = (p: string): boolean => {

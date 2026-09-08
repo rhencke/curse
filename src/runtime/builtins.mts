@@ -522,6 +522,31 @@ const parseDeclFlags = (args: string[]): { flags: DeclFlags; names: string[] } =
 };
 
 const declareBuiltin: Builtin = (shell, ...args) => {
+  const dashFlags = args.filter((a) => a[0] === "-" || a[0] === "+");
+  const opNames = (): string[] =>
+    args.filter((a) => a[0] !== "-" && a[0] !== "+").map((a) => {
+      const eq = a.indexOf("=");
+      return eq >= 0 ? a.slice(0, eq) : a;
+    });
+  // declare -F: list function names (or, with names, test each is a function).
+  if (dashFlags.some((f) => f[0] === "-" && f.includes("F"))) {
+    const names = opNames();
+    if (names.length === 0) {
+      for (const fn of shell.functionNames()) shell.io.out(`declare -f ${fn}\n`);
+      return 0;
+    }
+    let status = 0;
+    for (const n of names) {
+      if (shell.hasFunction(n)) shell.io.out(`${n}\n`);
+      else status = 1;
+    }
+    return status;
+  }
+  // declare -f: exit status reflects function existence (body printing TODO).
+  if (dashFlags.some((f) => f[0] === "-" && f.includes("f"))) {
+    const names = opNames();
+    return names.every((n) => shell.hasFunction(n)) ? 0 : 1;
+  }
   // declare -p [name...]: print definitions.
   if (args.includes("-p")) {
     const targets = args.filter((a) => a[0] !== "-" && a[0] !== "+").map((a) => {
