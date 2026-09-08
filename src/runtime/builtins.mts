@@ -209,6 +209,29 @@ const returnBuiltin: Builtin = (shell, ...args) => {
   throw new ReturnSignal(args.length > 0 ? toInt(args[0]!) : shell.status);
 };
 
+const read: Builtin = (shell, ...args) => {
+  const names = args.filter((a) => !a.startsWith("-"));
+  if (shell.stdinData === null || shell.stdinData === "") return 1;
+  const data = shell.stdinData;
+  const nl = data.indexOf("\n");
+  const line = nl >= 0 ? data.slice(0, nl) : data;
+  shell.stdinData = nl >= 0 ? data.slice(nl + 1) : "";
+
+  if (names.length === 0) {
+    shell.setVar("REPLY", line);
+    return 0;
+  }
+  const trimmed = line.replace(/^[ \t]+/, "");
+  const fields = trimmed === "" ? [] : trimmed.split(/[ \t]+/);
+  for (let idx = 0; idx < names.length; idx++) {
+    const value = idx < names.length - 1
+      ? fields[idx] ?? ""
+      : fields.slice(idx).join(" ").replace(/[ \t]+$/, "");
+    shell.setVar(names[idx]!, value);
+  }
+  return 0;
+};
+
 /* ---- test / [ ---- */
 
 const statOf = (p: string) => {
@@ -340,6 +363,7 @@ export const builtins: Record<string, Builtin> = {
   local,
   unset,
   return: returnBuiltin,
+  read,
   test,
   "[": bracket,
 };

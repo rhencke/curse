@@ -14,7 +14,7 @@
 
 import type {
   ArithForCommand, CaseCommand, Command, CondCommand, CondExpr, ForCommand,
-  FunctionDef, IfCommand, WhileCommand, Word,
+  FunctionDef, IfCommand, Redirect, SimpleCommand, WhileCommand, Word,
 } from "../ast/nodes.mts";
 import { CMD_INVERT_RETURN } from "../ast/nodes.mts";
 import { parse } from "../parser/parser.mts";
@@ -28,7 +28,9 @@ import { builtins } from "./builtins.mts";
 import { ReturnSignal, Var } from "./types.mts";
 import type { IO } from "./types.mts";
 import { spawn } from "node:child_process";
-import { accessSync, constants, lstatSync, statSync } from "node:fs";
+import {
+  accessSync, closeSync, constants, lstatSync, openSync, readFileSync, statSync, writeSync,
+} from "node:fs";
 import { resolve } from "node:path";
 
 export type { IO } from "./types.mts";
@@ -44,6 +46,13 @@ interface SplitMark {
   v: string;
 }
 
+/** A redirection with its target already expanded to a string. */
+interface RedirIO {
+  op: string;
+  fd: number;
+  target: string;
+}
+
 const errMsg = (e: unknown): string => (e instanceof Error ? e.message : String(e));
 
 type Scope = Record<string, Var>;
@@ -55,6 +64,9 @@ export class Shell {
   name = "curse";
   cwd = process.cwd();
   positional: string[] = [];
+  /** Redirected stdin for this command (file contents / here-string), or null
+   *  to inherit. Read by the `read` builtin and passed to external stdin. */
+  stdinData: string | null = null;
 
   private globalScope: Scope = Object.create(null) as Scope;
   private scope: Scope = this.globalScope;
@@ -314,6 +326,82 @@ export class Shell {
     }
   }
 
+  /* ---------------- redirections ---------------- */
+
+  /** Run `run` with the given redirections applied to this shell's io/stdin,
+   *  restoring afterwards. Targets are already-expanded strings (the compiler
+   *  expands inline; the interpreter expands before calling). Both builtins
+   *  (which write via io) and externals (whose piped output is forwarded to io)
+   *  are covered by this one model. */
+  async withRedirects(redirects: RedirIO[], run: () => Promise<number>): Promise<number> {
+    if (redirects.length === 0) return run();
+    const savedOut = this.io.out;
+    const savedErr = this.io.err;
+    const savedStdin = this.stdinData;
+    const toClose: number[] = [];
+    // fd -> writer; 1 and 2 start at the current io.
+    const writers: Record<number, (s: string) => void> = { 1: savedOut, 2: savedErr };
+    try {
+      for (const r of redirects) {
+        this.applyRedirect(r, r.target, writers, toClose);
+      }
+      this.io = { out: writers[1] ?? savedOut, err: writers[2] ?? savedErr };
+      return await run();
+    } finally {
+      this.io = { out: savedOut, err: savedErr };
+      this.stdinData = savedStdin;
+      for (const fd of toClose) {
+        try {
+          closeSync(fd);
+        } catch {
+          /* already closed */
+        }
+      }
+    }
+  }
+
+  private applyRedirect(
+    r: RedirIO,
+    target: string,
+    writers: Record<number, (s: string) => void>,
+    toClose: number[],
+  ): void {
+    const openFile = (flags: string): ((s: string) => void) => {
+      const fd = openSync(resolve(this.cwd, target), flags);
+      toClose.push(fd);
+      return (s: string) => void writeSync(fd, s);
+    };
+    switch (r.op) {
+      case ">": case ">|": writers[r.fd] = openFile("w"); break;
+      case ">>": writers[r.fd] = openFile("a"); break;
+      case "&>": { const w = openFile("w"); writers[1] = w; writers[2] = w; break; }
+      case "&>>": { const w = openFile("a"); writers[1] = w; writers[2] = w; break; }
+      case "<": this.stdinData = readFileSync(resolve(this.cwd, target), "utf8"); break;
+      case "<<<": this.stdinData = target + "\n"; break;
+      case ">&": case "<&": {
+        if (target === "-") {
+          writers[r.fd] = () => {};
+          break;
+        }
+        const t = parseInt(target, 10);
+        if (Number.isNaN(t)) {
+          if (r.op === ">&") {
+            const w = openFile("w");
+            writers[1] = w;
+            writers[2] = w;
+            break;
+          }
+          throw new Error(`${target}: ambiguous redirect`);
+        }
+        if (r.op === ">&") writers[r.fd] = writers[t] ?? (() => {});
+        // `<&` (dup input) is uncommon; left as inherit for now.
+        break;
+      }
+      default:
+        throw new Error(`redirection \`${r.op}\` not supported yet`);
+    }
+  }
+
   private external(name: string, args: string[], extraEnv: Record<string, string>): Promise<number> {
     return new Promise<number>((resolvePromise) => {
       let settled = false;
@@ -323,11 +411,16 @@ export class Shell {
           resolvePromise(code);
         }
       };
+      const stdin = this.stdinData;
       const child = spawn(name, args, {
         cwd: this.cwd,
         env: this.childEnv(extraEnv),
-        stdio: ["inherit", "pipe", "pipe"],
+        stdio: [stdin !== null ? "pipe" : "inherit", "pipe", "pipe"],
       });
+      if (stdin !== null && child.stdin) {
+        child.stdin.write(stdin);
+        child.stdin.end();
+      }
       child.stdout?.on("data", (d: Buffer) => this.io.out(d.toString()));
       child.stderr?.on("data", (d: Buffer) => this.io.err(d.toString()));
       child.on("error", (err: NodeJS.ErrnoException) => {
@@ -531,12 +624,30 @@ export class Shell {
 
   async execute(cmd: Command): Promise<number> {
     let status: number;
+    if (cmd.redirects !== undefined && cmd.redirects.length > 0) {
+      const reds: RedirIO[] = [];
+      for (const r of cmd.redirects) {
+        reds.push({ op: r.op, fd: r.fd, target: await expandNoSplit(this, r.target.text) });
+      }
+      status = await this.withRedirects(reds, () => this.dispatch(cmd));
+    } else {
+      status = await this.dispatch(cmd);
+    }
+    if (cmd.flags !== undefined && (cmd.flags & CMD_INVERT_RETURN) !== 0) {
+      status = status === 0 ? 1 : 0;
+      this.status = status;
+    }
+    return status;
+  }
+
+  private async dispatch(cmd: Command): Promise<number> {
+    let status: number;
     switch (cmd.type) {
       case "connection":
         status = await this.execConnection(cmd.connector, cmd.first, cmd.second);
         break;
       case "simple":
-        status = await this.execSimple(cmd.words);
+        status = await this.execSimpleCore(cmd.words);
         break;
       case "function":
         this.defineFunction(cmd);
@@ -579,10 +690,6 @@ export class Shell {
         throw new Error(`unhandled command type: ${String(unhandled)}`);
       }
     }
-    if (cmd.flags !== undefined && (cmd.flags & CMD_INVERT_RETURN) !== 0) {
-      status = status === 0 ? 1 : 0;
-      this.status = status;
-    }
     return status;
   }
 
@@ -609,7 +716,7 @@ export class Shell {
     throw new Error(`connector \`${connector}\` not supported yet`);
   }
 
-  private async execSimple(words: Word[]): Promise<number> {
+  private async execSimpleCore(words: Word[]): Promise<number> {
     const assigns: Array<[string, string]> = [];
     let k = 0;
     for (; k < words.length; k++) {

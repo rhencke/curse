@@ -11,7 +11,7 @@
  * does; used elsewhere they are ordinary words. Pipelines, redirections, `&`,
  * and `case` arrive in later milestones. */
 
-import type { CasePattern, Command, Word } from "../ast/nodes.mts";
+import type { CasePattern, Command, Redirect, Word } from "../ast/nodes.mts";
 import { CMD_INVERT_RETURN, connection, makeWord, simple } from "../ast/nodes.mts";
 import { tokenize } from "./lexer.mts";
 import type { Token } from "./lexer.mts";
@@ -152,17 +152,17 @@ class Parser {
       this.advance();
       return { type: "cond", expr: parseCond(t.value) };
     }
-    if (t.type === "OP" && t.value === "(") return this.parseSubshell();
+    if (t.type === "OP" && t.value === "(") return this.trailingRedirects(this.parseSubshell());
 
     if (t.type === "WORD") {
       switch (t.value) {
-        case "{": return this.parseGroup();
-        case "if": return this.parseIf();
-        case "while": return this.parseWhile(false);
-        case "until": return this.parseWhile(true);
-        case "for": return this.parseFor();
+        case "{": return this.trailingRedirects(this.parseGroup());
+        case "if": return this.trailingRedirects(this.parseIf());
+        case "while": return this.trailingRedirects(this.parseWhile(false));
+        case "until": return this.trailingRedirects(this.parseWhile(true));
+        case "for": return this.trailingRedirects(this.parseFor());
         case "function": return this.parseFunctionKeyword();
-        case "case": return this.parseCase();
+        case "case": return this.trailingRedirects(this.parseCase());
       }
       // name () compound   → function definition
       if (
@@ -366,14 +366,49 @@ class Parser {
 
   private parseSimple(): Command {
     const words: Word[] = [];
-    while (this.peek().type === "WORD") {
-      words.push(makeWord(this.advance().value));
+    const redirects: Redirect[] = [];
+    for (;;) {
+      const t = this.peek();
+      if (t.type === "WORD") words.push(makeWord(this.advance().value));
+      else if (t.type === "REDIR") redirects.push(this.parseRedir());
+      else break;
     }
-    if (words.length === 0) {
+    if (words.length === 0 && redirects.length === 0) {
       const t = this.peek();
       throw new ParseError(`syntax error near \`${t.value || "<eof>"}\` (line ${t.line})`);
     }
-    return simple(words);
+    return simple(words, redirects);
+  }
+
+  /** Attach any redirections that trail a compound command (e.g. `done > f`). */
+  private trailingRedirects(cmd: Command): Command {
+    const reds: Redirect[] = [];
+    while (this.peek().type === "REDIR") reds.push(this.parseRedir());
+    if (reds.length > 0) cmd.redirects = (cmd.redirects ?? []).concat(reds);
+    return cmd;
+  }
+
+  private parseRedir(): Redirect {
+    const tok = this.advance(); // REDIR
+    const m = /^(\d*)(.*)$/.exec(tok.value)!;
+    const fdStr = m[1]!;
+    const op = m[2]!;
+    if (op === "<<" || op === "<<-") {
+      throw new ParseError("here-documents `<<` not supported yet (planned)");
+    }
+    const t = this.peek();
+    if (t.type !== "WORD") {
+      throw new ParseError(`expected a redirection target (line ${t.line})`);
+    }
+    this.advance();
+
+    let fd: number;
+    if (fdStr !== "") fd = parseInt(fdStr, 10);
+    else if (op === "&>" || op === "&>>") fd = -1; // both stdout+stderr
+    else if (op === "<" || op === "<<<" || op === "<&") fd = 0;
+    else fd = 1;
+
+    return { op, fd, target: makeWord(t.value) };
   }
 }
 

@@ -11,7 +11,7 @@
  * Word structure comes from the shared parser (parser/word.mts), so the
  * compiled output and the interpreter agree. */
 
-import type { Command, CondExpr, FunctionDef, Word } from "../ast/nodes.mts";
+import type { Command, CondExpr, FunctionDef, SimpleCommand, Word } from "../ast/nodes.mts";
 import { CMD_INVERT_RETURN } from "../ast/nodes.mts";
 import { parse } from "../parser/parser.mts";
 import { parseWord } from "../parser/word.mts";
@@ -165,18 +165,28 @@ class Emitter {
   }
 
   command(cmd: Command, ind: number): string {
-    const base = this.base(cmd, ind);
-    if (cmd.flags !== undefined && (cmd.flags & CMD_INVERT_RETURN) !== 0) {
-      return base + "\n" + `${pad(ind)}sh.invert();`;
+    const reds = cmd.redirects;
+    let core: string;
+    if (reds !== undefined && reds.length > 0) {
+      const i = pad(ind);
+      const rd = reds
+        .map((r) => `{ op: ${JSON.stringify(r.op)}, fd: ${r.fd}, target: ${this.templateOf(parseWord(r.target.text).parts)} }`)
+        .join(", ");
+      core = `${i}await sh.withRedirects([${rd}], async () => {\n${this.base(cmd, ind + 1)}\n${i}});`;
+    } else {
+      core = this.base(cmd, ind);
     }
-    return base;
+    if (cmd.flags !== undefined && (cmd.flags & CMD_INVERT_RETURN) !== 0) {
+      return core + "\n" + `${pad(ind)}sh.invert();`;
+    }
+    return core;
   }
 
   private assignRHS(rhsText: string): string {
     return this.templateOf(parseWord(rhsText).parts);
   }
 
-  private simple(words: Word[], ind: number): string {
+  private simpleCore(words: Word[], ind: number): string {
     const i = pad(ind);
     const assigns: Array<[string, string]> = [];
     let k = 0;
@@ -227,7 +237,7 @@ class Emitter {
     const i = pad(ind);
     switch (cmd.type) {
       case "simple":
-        return this.simple(cmd.words, ind);
+        return this.simpleCore(cmd.words, ind);
       case "function":
         return this.functionDef(cmd, ind);
       case "connection": {

@@ -7,7 +7,7 @@
  * them do not terminate the word.
  */
 
-export type TokenType = "WORD" | "OP" | "NEWLINE" | "ARITH" | "COND" | "EOF";
+export type TokenType = "WORD" | "OP" | "NEWLINE" | "ARITH" | "COND" | "REDIR" | "EOF";
 
 export interface Token {
   type: TokenType;
@@ -97,6 +97,14 @@ class Lexer {
         this.i += 2;
         return { type: "OP", value: "&&", pos, line };
       }
+      if (this.at(1) === ">") {
+        this.i += 2;
+        if (this.at() === ">") {
+          this.i++;
+          return { type: "REDIR", value: "&>>", pos, line };
+        }
+        return { type: "REDIR", value: "&>", pos, line };
+      }
       throw new LexError("background `&` not supported yet (planned for M3)");
     }
     if (c === "|") {
@@ -108,7 +116,21 @@ class Lexer {
       return { type: "OP", value: "|", pos, line };
     }
     if (c === "<" || c === ">") {
-      throw new LexError(`redirection \`${c}\` not supported yet (planned for M3)`);
+      return this.readRedir("", pos, line);
+    }
+    // [n]< / [n]>  — a redirection with an explicit fd (digits, no space).
+    if (c >= "0" && c <= "9") {
+      let j = this.i;
+      let num = "";
+      while (this.s[j] !== undefined && this.s[j]! >= "0" && this.s[j]! <= "9") {
+        num += this.s[j];
+        j++;
+      }
+      const nx = this.s[j];
+      if (nx === "<" || nx === ">") {
+        this.i = j;
+        return this.readRedir(num, pos, line);
+      }
     }
     if (c === "(") {
       if (this.at(1) === "(") {
@@ -335,6 +357,36 @@ class Lexer {
       if (c === "`") return buf;
       if (c === "\n") this.line++;
     }
+  }
+
+  /** Read a redirection operator (the fd prefix already scanned into `fd`). */
+  private readRedir(fd: string, pos: number, line: number): Token {
+    const c = this.at();
+    let op = fd;
+    if (c === ">") {
+      this.i++;
+      const n = this.at();
+      if (n === ">") { this.i++; op += ">>"; }
+      else if (n === "&") { this.i++; op += ">&"; }
+      else if (n === "|") { this.i++; op += ">|"; }
+      else op += ">";
+    } else {
+      this.i++; // "<"
+      const n = this.at();
+      if (n === "<") {
+        this.i++;
+        const m = this.at();
+        if (m === "<") { this.i++; op += "<<<"; }
+        else if (m === "-") { this.i++; op += "<<-"; }
+        else op += "<<";
+      } else if (n === "&") {
+        this.i++;
+        op += "<&";
+      } else {
+        op += "<";
+      }
+    }
+    return { type: "REDIR", value: op, pos, line };
   }
 
   /** Scan a `(( ... ))` arithmetic command, returning the inner text (without

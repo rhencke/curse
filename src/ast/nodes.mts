@@ -9,29 +9,14 @@
  * fill them in rather than reshape the tree.
  */
 
-/* enum r_instruction (command.h) — redirection kinds. Subset for now. */
-export type RInstruction =
-  | "output" //            >
-  | "input" //             <
-  | "appending" //         >>
-  | "input_output" //      <>
-  | "output_force" //      >|
-  | "err_and_out" //       &>
-  | "append_err_and_out" // &>>
-  | "dup_input" //         <&n
-  | "dup_output" //        >&n
-  | "here_doc" //          <<
-  | "here_string" //       <<<
-  | "close"; //            <&-  >&-
-
+/* A redirection. `op` is the operator, `fd` the (left-hand) descriptor it acts
+ * on, and `target` the operand word (filename, dup target like "2"/"-", or the
+ * here-string / here-doc body). Mirrors bash's REDIRECT (command.h). */
 export interface Redirect {
-  instruction: RInstruction;
-  /** fd on the left of the operator (null = the default for the instruction). */
-  redirector: number | null;
-  /** filename word, or a target fd for dup/move, or null for close. */
-  target: Word | number | null;
-  hereDocEof?: string;
-  hereDocBody?: Word;
+  /** ">" ">>" "<" ">&" "<&" "&>" "&>>" "<<<" ">|" "<<" "<<-" */
+  op: string;
+  fd: number;
+  target: Word;
 }
 
 /* WORD_DESC (command.h). Faithful to bash: `text` is the raw token text with
