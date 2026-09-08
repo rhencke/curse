@@ -387,3 +387,12 @@ export const evalArith = (shell: Shell, text: string, depth = 0): bigint => {
   const ast = new AParser(tokenizeArith(text), text).parseTop();
   return evalNode(shell, ast, depth);
 };
+
+/** Parse an arithmetic expression to its AST (used by the emitter to compile
+ *  `$(( ))` / `(( ))` to native JS instead of runtime string evaluation). */
+export const parseArithAst = (text: string): ArithNode =>
+  new AParser(tokenizeArith(text), text).parseTop();
+
+export type ArithNode = Node;
+/** 64-bit two's-complement wrap, applied after each arithmetic operation. */
+export const arithWrap = wrap;

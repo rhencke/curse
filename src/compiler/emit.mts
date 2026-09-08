@@ -18,6 +18,8 @@ import { parseDquote, parseHeredoc, parseWord } from "../parser/word.mts";
 import type { Param, WordPart } from "../parser/word.mts";
 import { braceExpand } from "../parser/brace.mts";
 import { globToRegExpSource, hasExtglob } from "../runtime/glob.mts";
+import { parseArithAst } from "../runtime/arith.mts";
+import type { ArithNode } from "../runtime/arith.mts";
 
 export interface EmitOptions {
   /** Import specifier (path or file: URL) for the runtime's `Shell`. */
@@ -38,6 +40,87 @@ const ELEM_ASSIGN = /^\[.*\]\+?=/;
 
 const isCaseOp = (op: string): boolean => op === "^" || op === "^^" || op === "," || op === ",,";
 const STR_OPS = new Set(["#", "##", "%", "%%", "/", "//", "/#", "/%"]);
+
+/* ---- compile-time arithmetic: turn a `$(( ))` / `for (( ))` expression into
+   native-JS BigInt code (parsed once here) instead of re-parsing the string at
+   runtime. Returns null to fall back to the runtime evaluator for anything not
+   statically compilable (a `$`/backtick expansion, or an array subscript). ---- */
+
+const WRAP_BINOPS: Record<string, string> = {
+  "+": "+", "-": "-", "*": "*", "<<": "<<", ">>": ">>", "&": "&", "^": "^", "|": "|",
+};
+const CMP_BINOPS: Record<string, string> = { "<": "<", "<=": "<=", ">": ">", ">=": ">=" };
+
+const arithBinJS = (op: string, l: string, r: string): string | null => {
+  if (op in WRAP_BINOPS) return `sh.aw((${l}) ${WRAP_BINOPS[op]} (${r}))`;
+  if (op in CMP_BINOPS) return `((${l}) ${CMP_BINOPS[op]} (${r}) ? 1n : 0n)`;
+  if (op === "/") return `sh.adiv((${l}), (${r}))`;
+  if (op === "%") return `sh.amod((${l}), (${r}))`;
+  if (op === "**") return `sh.apow((${l}), (${r}))`;
+  if (op === "==") return `((${l}) === (${r}) ? 1n : 0n)`;
+  if (op === "!=") return `((${l}) !== (${r}) ? 1n : 0n)`;
+  return null;
+};
+
+const arithNodeJS = (n: ArithNode): string | null => {
+  const J = JSON.stringify;
+  switch (n.t) {
+    case "num":
+      return `${n.v}n`;
+    case "var":
+      return n.index !== undefined ? null : `sh.aget(${J(n.name)})`;
+    case "unary": {
+      const e = arithNodeJS(n.e);
+      if (e === null) return null;
+      if (n.op === "+") return `(${e})`;
+      if (n.op === "-") return `sh.aw(-(${e}))`;
+      if (n.op === "!") return `((${e}) === 0n ? 1n : 0n)`;
+      return `sh.aw(~(${e}))`; // "~"
+    }
+    case "incr":
+      return n.index !== undefined ? null
+        : `sh.ainc(${J(n.name)}, ${n.op === "++" ? "1n" : "-1n"}, ${n.post})`;
+    case "bin": {
+      const l = arithNodeJS(n.l), r = arithNodeJS(n.r);
+      return l === null || r === null ? null : arithBinJS(n.op, l, r);
+    }
+    case "logic": {
+      const l = arithNodeJS(n.l), r = arithNodeJS(n.r);
+      if (l === null || r === null) return null;
+      return `((${l}) !== 0n ${n.op} (${r}) !== 0n ? 1n : 0n)`;
+    }
+    case "ternary": {
+      const c = arithNodeJS(n.c), a = arithNodeJS(n.a), b = arithNodeJS(n.b);
+      return c === null || a === null || b === null ? null : `((${c}) !== 0n ? (${a}) : (${b}))`;
+    }
+    case "comma": {
+      const l = arithNodeJS(n.l), r = arithNodeJS(n.r);
+      return l === null || r === null ? null : `((${l}), (${r}))`;
+    }
+    case "assign": {
+      if (n.index !== undefined) return null;
+      const r = arithNodeJS(n.e);
+      if (r === null) return null;
+      const nm = J(n.name);
+      if (n.op === "=") return `sh.aset(${nm}, (${r}))`;
+      const combined = arithBinJS(n.op.slice(0, -1), `sh.aget(${nm})`, `(${r})`);
+      return combined === null ? null : `sh.aset(${nm}, ${combined})`;
+    }
+  }
+};
+
+/** Compile an arithmetic expression to a JS BigInt expression, or null if it
+ *  needs the runtime evaluator (empty, `$`/backtick expansion, or a subscript). */
+const arithToJS = (text: string): string | null => {
+  if (text === "" || /[$`]/.test(text)) return null;
+  let ast: ArithNode;
+  try {
+    ast = parseArithAst(text);
+  } catch {
+    return null;
+  }
+  return arithNodeJS(ast);
+};
 
 /** Compile-time glob pattern from a static (expansion-free) word: quoted or
  *  escaped characters are backslashed so they match literally. */
@@ -261,8 +344,10 @@ class Emitter {
     switch (p.k) {
       case "param":
         return this.paramExpr(p.p, p.quoted);
-      case "arith":
-        return `await sh.arithStr(${JSON.stringify(p.expr)})`;
+      case "arith": {
+        const js = arithToJS(p.expr);
+        return js !== null ? `String(${js})` : `await sh.arithStr(${JSON.stringify(p.expr)})`;
+      }
       case "cmdsub": {
         const sub = parse(p.src);
         const body = sub === null ? "" : this.command(sub, 0);
@@ -649,16 +734,28 @@ class Emitter {
           `${i}});`
         );
       }
-      case "arith_for":
+      case "arith_for": {
         // C-style header so a `continue` still runs the step then re-tests.
+        // Compile each clause to native JS when possible (parsed once), else
+        // fall back to the runtime string evaluator for the whole header.
+        const ic = cmd.init === "" ? "" : arithToJS(cmd.init);
+        const tc = cmd.test === "" ? "true" : arithToJS(cmd.test);
+        const sc = cmd.step === "" ? "" : arithToJS(cmd.step);
+        let header: string;
+        if (ic !== null && tc !== null && sc !== null) {
+          const test = cmd.test === "" ? "true" : `(${tc}) !== 0n`;
+          header = `for (${ic}; ${test}; ${sc})`;
+        } else {
+          header =
+            `for (await sh.arithRun(${JSON.stringify(cmd.init)}); ` +
+            `await sh.arithTest(${JSON.stringify(cmd.test)}); ` +
+            `await sh.arithRun(${JSON.stringify(cmd.step)}))`;
+        }
         return this.loopScope(
-          `${i}for (await sh.arithRun(${JSON.stringify(cmd.init)}); ` +
-          `await sh.arithTest(${JSON.stringify(cmd.test)}); ` +
-          `await sh.arithRun(${JSON.stringify(cmd.step)})) {\n` +
-          this.loopBody(cmd.body, ind + 1) + "\n" +
-          `${i}}`,
+          `${i}${header} {\n` + this.loopBody(cmd.body, ind + 1) + "\n" + `${i}}`,
           ind,
         );
+      }
       case "arith": {
         const s = `${i}await sh.arithCommand(${JSON.stringify(cmd.expression)});`;
         return this.guards ? s + `\n${i}await sh.afterCommand();` : s;

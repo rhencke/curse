@@ -20,7 +20,7 @@ import { CMD_INVERT_RETURN } from "../ast/nodes.mts";
 import { parse } from "../parser/parser.mts";
 import { parseHeredoc } from "../parser/word.mts";
 import { evalParam, expandArith, expandArrayElems, expandAssign, expandNoSplit, expandParsed, expandWords, expandWordsAssign, splitTaggedFields } from "./expand.mts";
-import { evalArith } from "./arith.mts";
+import { ArithError, arithWrap, evalArith } from "./arith.mts";
 import { globExpand, globIgnored, globMatch, hasExtglob, hasGlobMeta } from "./glob.mts";
 import {
   changeCase as pChangeCase, replaceGlob as pReplaceGlob, sliceArr as pSliceArr,
@@ -924,6 +924,51 @@ export class Shell {
   }
   async arithRun(expr: string): Promise<void> {
     if (expr !== "") await this.arithValue(expr);
+  }
+
+  /* Compiled-arithmetic primitives: the emitter turns a `$(( ))` / `(( ))`
+   * expression's AST into native-JS BigInt code that calls these, so the
+   * expression is parsed once (at transpile time) instead of on every run.
+   * Semantics mirror arith.mts's evalNode exactly. */
+  /** 64-bit two's-complement wrap. */
+  aw(v: bigint): bigint {
+    return arithWrap(v);
+  }
+  /** Read a scalar as an arithmetic value (a variable's string is re-evaluated
+   *  as arithmetic; empty/unset is 0). */
+  aget(name: string): bigint {
+    const raw = this.getVar(name);
+    if (raw === undefined) return 0n;
+    const t = raw.trim();
+    if (t === "") return 0n;
+    // Fast path: a plain decimal integer (no leading-zero octal / 0x hex
+    // ambiguity) is the overwhelmingly common case — skip the arith re-parse.
+    if (/^-?(0|[1-9][0-9]*)$/.test(t)) return arithWrap(BigInt(t));
+    return evalArith(this, raw);
+  }
+  /** Assign a scalar arithmetic value; returns it (already wrapped by caller). */
+  aset(name: string, v: bigint): bigint {
+    this.setVar(name, v.toString());
+    return v;
+  }
+  /** `x++` / `++x` / `x--` / `--x` on a scalar; returns the pre/post value. */
+  ainc(name: string, delta: bigint, post: boolean): bigint {
+    const cur = this.aget(name);
+    const nv = arithWrap(cur + delta);
+    this.setVar(name, nv.toString());
+    return post ? cur : nv;
+  }
+  adiv(l: bigint, r: bigint): bigint {
+    if (r === 0n) throw new ArithError("division by 0");
+    return arithWrap(l / r);
+  }
+  amod(l: bigint, r: bigint): bigint {
+    if (r === 0n) throw new ArithError("division by 0");
+    return arithWrap(l % r);
+  }
+  apow(l: bigint, r: bigint): bigint {
+    if (r < 0n) throw new ArithError("exponent less than 0");
+    return arithWrap(l ** r);
   }
   async arithTest(expr: string): Promise<boolean> {
     return expr === "" ? true : (await this.arithValue(expr)) !== 0n;

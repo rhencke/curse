@@ -13,3 +13,9 @@ node_modules/
 core
 core.*
 *.core
+
+# Benchmark: generated transpile output (bench/*.sh are the sources)
+/bench/*.mts
+
+# BFG Repo-Cleaner report
+/..bfg-report/
