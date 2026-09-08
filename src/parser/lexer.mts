@@ -517,7 +517,9 @@ class Lexer {
   }
 
   /** Scan a balanced construct such as `$( ... )`, `${ ... }`, `$(( ... ))`.
-   *  `prefix` is copied verbatim; then we balance `open`/`close` until depth 0. */
+   *  `prefix` is copied verbatim; then we balance `open`/`close` until depth 0.
+   *  Quotes, escapes, and nested substitutions are skipped so their `open`/
+   *  `close` characters (e.g. a `)` inside `$(echo ")")`) do not miscount. */
   private scanBalanced(prefix: string, open: string, close: string, closesNeeded: number): string {
     let buf = prefix;
     this.i += prefix.length;
@@ -525,6 +527,10 @@ class Lexer {
     for (;;) {
       const c = this.at();
       if (c === undefined) throw new LexError(`unterminated \`${prefix} ... ${close.repeat(closesNeeded)}\``);
+      if (c === "\\") { buf += this.rawEscape(); continue; }
+      if (c === "'") { buf += this.rawSingle(); continue; }
+      if (c === '"') { buf += this.rawDouble(); continue; }
+      if (c === "`") { buf += this.scanBacktick(); continue; }
       if (c === open) depth++;
       else if (c === close) {
         depth--;
@@ -535,6 +541,46 @@ class Lexer {
       }
       if (c === "\n") this.line++;
       buf += c;
+      this.i++;
+    }
+  }
+
+  /** Copy a backslash escape (`\` and the char after it), verbatim. */
+  private rawEscape(): string {
+    const n = this.at(1);
+    if (n === "\n") this.line++;
+    this.i += n === undefined ? 1 : 2;
+    return "\\" + (n ?? "");
+  }
+  /** Copy a single-quoted span `'…'` verbatim (single quotes never nest). */
+  private rawSingle(): string {
+    let s = "'";
+    this.i++;
+    for (;;) {
+      const c = this.at();
+      if (c === undefined) throw new LexError("unterminated '");
+      s += c;
+      this.i++;
+      if (c === "'") return s;
+      if (c === "\n") this.line++;
+    }
+  }
+  /** Copy a double-quoted span `"…"` verbatim, descending into nested `$(…)`,
+   *  `${…}`, `$((…))`, and backticks so their quotes/parens stay balanced. */
+  private rawDouble(): string {
+    let s = '"';
+    this.i++;
+    for (;;) {
+      const c = this.at();
+      if (c === undefined) throw new LexError('unterminated "');
+      if (c === "\\") { s += this.rawEscape(); continue; }
+      if (c === '"') { this.i++; return s + '"'; }
+      if (c === "`") { s += this.scanBacktick(); continue; }
+      if (c === "$" && this.at(1) === "(" && this.at(2) === "(") { s += this.scanBalanced("$((", "(", ")", 2); continue; }
+      if (c === "$" && this.at(1) === "(") { s += this.scanBalanced("$(", "(", ")", 1); continue; }
+      if (c === "$" && this.at(1) === "{") { s += this.scanBalanced("${", "{", "}", 1); continue; }
+      if (c === "\n") this.line++;
+      s += c;
       this.i++;
     }
   }

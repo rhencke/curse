@@ -388,6 +388,11 @@ class WordParser {
     for (;;) {
       const c = this.at();
       if (c === undefined) throw new Error(`unterminated \`${open.repeat(depth)} ${close.repeat(depth)}\``);
+      // Skip quotes/escapes/backticks so their open/close chars don't miscount.
+      if (c === "\\") { buf += this.rawEscape(); continue; }
+      if (c === "'") { buf += this.rawSingle(); continue; }
+      if (c === '"') { buf += this.rawDouble(); continue; }
+      if (c === "`") { buf += this.rawBacktick(); continue; }
       this.i++;
       if (c === open) {
         d++;
@@ -401,6 +406,55 @@ class WordParser {
         continue;
       }
       buf += c;
+    }
+  }
+
+  /** Copy a `\`-escape verbatim (used while scanning a balanced span). */
+  private rawEscape(): string {
+    const n = this.at(1);
+    this.i += n === undefined ? 1 : 2;
+    return "\\" + (n ?? "");
+  }
+  /** Copy a single-quoted span `'…'` verbatim. */
+  private rawSingle(): string {
+    let s = "'";
+    this.i++;
+    for (;;) {
+      const c = this.at();
+      if (c === undefined) throw new Error("unterminated '");
+      s += c;
+      this.i++;
+      if (c === "'") return s;
+    }
+  }
+  /** Copy a backquoted span verbatim, honoring `\`` escapes. */
+  private rawBacktick(): string {
+    let s = "`";
+    this.i++;
+    for (;;) {
+      const c = this.at();
+      if (c === undefined) throw new Error("unterminated `");
+      if (c === "\\") { s += this.rawEscape(); continue; }
+      s += c;
+      this.i++;
+      if (c === "`") return s;
+    }
+  }
+  /** Copy a double-quoted span `"…"` verbatim (to the next unescaped `"`),
+   *  descending into backticks so a `"` inside them doesn't end the span. The
+   *  lexer has already delimited the enclosing construct, so parens within the
+   *  span need only be skipped, not re-balanced. */
+  private rawDouble(): string {
+    let s = '"';
+    this.i++;
+    for (;;) {
+      const c = this.at();
+      if (c === undefined) throw new Error('unterminated "');
+      if (c === "\\") { s += this.rawEscape(); continue; }
+      if (c === '"') { this.i++; return s + '"'; }
+      if (c === "`") { s += this.rawBacktick(); continue; }
+      s += c;
+      this.i++;
     }
   }
 }
