@@ -221,12 +221,16 @@ class CondParser {
       return e;
     }
     const t = this.peek();
+    // An unquoted unary operator (`-z`, `-n`, …; a quoted `'-z'` keeps its
+    // quotes and isn't in UNARY) must be followed by a word operand — otherwise
+    // it's a syntax error in bash (`[[ -z ]]`, `[[ -z == foo ]]`).
     if (t.t === "word" && UNARY.has(t.v)) {
       const nxt = this.toks[this.p + 1];
       if (nxt && nxt.t === "word") {
         this.next();
         return { k: "unary", op: t.v, arg: this.expectWord() };
       }
+      throw new CondError("conditional: unary operator expected");
     }
     const left = this.expectWord();
     // Binary operators may be op tokens (== != = =~ < >) or word tokens (-eq …).

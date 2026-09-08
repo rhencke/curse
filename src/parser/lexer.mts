@@ -206,8 +206,11 @@ class Lexer {
         continue;
       }
       if (c === "]" && this.at(1) === "]") {
+        // `]]` closes after whitespace or a `)` (a metacharacter that ends the
+        // previous token), so `[[ (a == b)]]` is valid — but not after a plain
+        // word char, where bash folds `]]` into the token (`[[ 1 == 1]]` errors).
         const prev = buf.length > 0 ? buf[buf.length - 1]! : " ";
-        if (prev === " " || prev === "\t" || prev === "\n") {
+        if (prev === " " || prev === "\t" || prev === "\n" || prev === ")") {
           this.i += 2;
           return buf;
         }

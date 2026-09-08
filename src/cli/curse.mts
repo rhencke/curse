@@ -13,7 +13,9 @@ import { existsSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { Shell } from "../runtime/shell.mts";
-import { parse } from "../parser/parser.mts";
+import { parse, ParseError } from "../parser/parser.mts";
+import { CondError } from "../parser/cond.mts";
+import { LexError } from "../parser/lexer.mts";
 import { emit } from "../compiler/emit.mts";
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -103,4 +105,13 @@ const main = async (): Promise<void> => {
   die(`unknown command \`${sub}\``);
 };
 
-await main();
+try {
+  await main();
+} catch (e) {
+  // A syntax error (lexer/parser/conditional) exits with status 2, as bash does.
+  if (e instanceof ParseError || e instanceof CondError || e instanceof LexError) {
+    process.stderr.write(`curse: ${e.message}\n`);
+    process.exit(2);
+  }
+  throw e;
+}
