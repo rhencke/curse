@@ -489,7 +489,21 @@ export class Shell {
 
   /** `${!name}`: the value of the variable named by `$name`. */
   indirect(name: string): string {
-    return this.getVar(this.getVar(name) ?? "") ?? "";
+    return this.indirectValue(this.getVar(name) ?? "") ?? "";
+  }
+  /** Resolve a variable reference string (a name, or `name[subscript]`) to its
+   *  value — the target of `${!ref}` / a nameref. */
+  indirectValue(target: string): string | undefined {
+    if (target === "") return undefined;
+    const m = /^([A-Za-z_][A-Za-z0-9_]*)\[([\s\S]*)\]$/.exec(target);
+    if (m === null) return this.getVar(target);
+    const v = this.lookup(m[1]!);
+    if (v === undefined) return undefined;
+    const sub = m[2]!;
+    if (v.assoc !== null) return v.assoc.get(sub);
+    if (sub === "@" || sub === "*") return this.arrayValues(m[1]!).join(" ");
+    if (v.arr !== null) return this.arrayGet(m[1]!, Number(evalArith(this, sub)));
+    return sub === "0" ? v.value : undefined; // scalar as element 0
   }
 
   /** Read a plain `$name` reference, honoring `set -u` (used by generated code). */
