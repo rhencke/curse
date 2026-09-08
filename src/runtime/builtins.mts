@@ -1259,13 +1259,24 @@ const trap: Builtin = (shell, ...args) => {
   if (rest.length === 0) return 0;
   // When the first operand is itself a signal (or `-`), every operand is a
   // signal to reset (`trap EXIT`, `trap 0 INT`, `trap - INT TERM`).
-  if (rest[0] === "-" || isSignalSpec(rest[0]!)) {
-    for (const s of rest[0] === "-" ? rest.slice(1) : rest) delete shell.traps[signalName(s)];
-    return 0;
+  const reset = rest[0] === "-" || isSignalSpec(rest[0]!);
+  const sigs = reset ? (rest[0] === "-" ? rest.slice(1) : rest) : rest.slice(1);
+  if (!reset && sigs.length === 0) {
+    shell.io.err("trap: usage: trap [-lp] [[arg] signal_spec ...]\n");
+    return 2;
   }
-  const action = rest[0]!;
-  for (const s of rest.slice(1)) shell.traps[signalName(s)] = action;
-  return 0;
+  const action = reset ? "" : rest[0]!;
+  let status = 0;
+  for (const s of sigs) {
+    if (!isSignalSpec(s)) {
+      shell.io.err(`${shell.name}: trap: ${s}: invalid signal specification\n`);
+      status = 1;
+      continue;
+    }
+    if (reset) delete shell.traps[signalName(s)];
+    else shell.traps[signalName(s)] = action;
+  }
+  return status;
 };
 
 const mapfile: Builtin = (shell, ...args) => {

@@ -1223,6 +1223,8 @@ export class Shell {
     sub.dirStack = [...this.dirStack];
     sub.opts = { ...this.opts };
     sub.shopts = { ...this.shopts }; // a subshell inherits, but can't leak, shopt
+    // Trap settings are inherited (visible to `trap -p`); a subshell can't leak.
+    sub.traps = Object.assign(Object.create(null) as Record<string, string>, this.traps);
     return sub;
   }
 
