@@ -889,13 +889,21 @@ const signalName = (s: string): string => {
   if (up === "0") return "EXIT";
   return up.startsWith("SIG") ? up.slice(3) : up;
 };
+const SIGNALS = new Set([
+  "EXIT", "ERR", "DEBUG", "RETURN", "HUP", "INT", "QUIT", "ILL", "TRAP", "ABRT",
+  "BUS", "FPE", "KILL", "USR1", "SEGV", "USR2", "PIPE", "ALRM", "TERM", "CHLD",
+  "CONT", "STOP", "TSTP", "TTIN", "TTOU", "URG", "XCPU", "XFSZ", "VTALRM",
+  "PROF", "WINCH", "IO", "PWR", "SYS", "STKFLT",
+]);
+const isSignalSpec = (s: string): boolean => SIGNALS.has(signalName(s)) || /^[0-9]+$/.test(s);
 
 const trap: Builtin = (shell, ...args) => {
   const quote = (h: string): string => "'" + h.replace(/'/g, "'\\''") + "'";
+  const pseudo = new Set(["EXIT", "ERR", "DEBUG", "RETURN"]);
   const printTraps = (names: string[]): void => {
     for (const n of names) {
       const h = shell.traps[n];
-      if (h !== undefined) shell.io.out(`trap -- ${quote(h)} ${n}\n`);
+      if (h !== undefined) shell.io.out(`trap -- ${quote(h)} ${pseudo.has(n) ? n : "SIG" + n}\n`);
     }
   };
   // `trap` / `trap -p [sig...]`: print current handlers.
@@ -907,14 +915,15 @@ const trap: Builtin = (shell, ...args) => {
   if (args[0] === "-l") return 0; // signal listing: not supported
   let rest = args;
   if (rest[0] === "--") rest = rest.slice(1);
-  const action = rest[0] ?? "";
-  const sigs = rest.slice(1);
-  // A bare number/name as the sole argument with no action resets nothing.
-  for (const s of sigs) {
-    const n = signalName(s);
-    if (action === "-") delete shell.traps[n];
-    else shell.traps[n] = action;
+  if (rest.length === 0) return 0;
+  // When the first operand is itself a signal (or `-`), every operand is a
+  // signal to reset (`trap EXIT`, `trap 0 INT`, `trap - INT TERM`).
+  if (rest[0] === "-" || isSignalSpec(rest[0]!)) {
+    for (const s of rest[0] === "-" ? rest.slice(1) : rest) delete shell.traps[signalName(s)];
+    return 0;
   }
+  const action = rest[0]!;
+  for (const s of rest.slice(1)) shell.traps[signalName(s)] = action;
   return 0;
 };
 
