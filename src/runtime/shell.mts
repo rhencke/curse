@@ -855,6 +855,11 @@ export class Shell {
           const nv = new Var(v.value, v.exported);
           if (v.arr !== null) nv.arr = new Map(v.arr);
           if (v.assoc !== null) nv.assoc = new Map(v.assoc);
+          nv.integer = v.integer;
+          nv.lower = v.lower;
+          nv.upper = v.upper;
+          nv.readonly = v.readonly;
+          nv.ref = v.ref;
           flat[k] = nv;
         }
       }
@@ -874,6 +879,7 @@ export class Shell {
     sub.name = this.name;
     sub.cwd = this.cwd;
     sub.opts = { ...this.opts };
+    sub.shopts = { ...this.shopts }; // a subshell inherits, but can't leak, shopt
     return sub;
   }
 
