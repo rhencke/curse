@@ -99,10 +99,13 @@ const echo: Builtin = (shell, ...args) => {
 /** Parse a printf numeric argument (bash rules: leading ws, 0x/0 bases, 'c
  *  char code, 64-bit) into a BigInt; invalid -> 0 with a stderr diagnostic. */
 const U64 = (1n << 64n) - 1n;
-const s64 = (v: bigint): bigint => {
-  const m = v & U64;
-  return m >= 1n << 63n ? m - (1n << 64n) : m;
-};
+const S64MAX = (1n << 63n) - 1n;
+const S64MIN = -(1n << 63n);
+// bash's printf parses with strtoimax/strtoumax, which clamp on overflow rather
+// than wrap: %d/%i saturate to the signed 64-bit range; %u/%x/%X/%o saturate to
+// the unsigned max but wrap a negative input as two's complement.
+const clampS = (v: bigint): bigint => (v > S64MAX ? S64MAX : v < S64MIN ? S64MIN : v);
+const clampU = (v: bigint): bigint => (v < 0n ? v & U64 : v > U64 ? U64 : v);
 const pfNum = (shell: Shell, raw: string, onErr?: () => void): bigint => {
   const t = raw.replace(/^[ \t\n]+/, "");
   if (t === "") return 0n;
@@ -120,6 +123,13 @@ const pfNum = (shell: Shell, raw: string, onErr?: () => void): bigint => {
   if (/^0[xX]/.test(str)) val = BigInt(str);
   else if (/^0[0-7]+$/.test(str)) val = BigInt("0o" + str.slice(1));
   else val = BigInt(str);
+  // A valid numeric prefix followed by leftover characters (e.g. `3abc`,
+  // `64#a`, or a trailing space) is an error in bash, but the parsed value is
+  // still emitted.
+  if (m[0].length !== t.length) {
+    shell.io.err(`printf: ${raw}: value not completely converted\n`);
+    onErr?.();
+  }
   return neg ? -val : val;
 };
 const pfFloat = (raw: string): number => {
@@ -148,12 +158,13 @@ const shellBackslashQuote = (v: string): string => {
 };
 
 const printf: Builtin = async (shell, ...args) => {
-  // -v VAR: capture the output into a variable (or array element) instead
-  // of writing it to stdout.
+  // Options: `-v VAR` captures the output into a variable (or array element)
+  // instead of stdout; `--` ends option processing.
   let target: string | null = null;
-  if (args[0] === "-v") {
-    target = args[1] ?? "";
-    args = args.slice(2);
+  while (args.length > 0) {
+    if (args[0] === "-v" && args.length >= 2) { target = args[1]!; args = args.slice(2); continue; }
+    if (args[0] === "--") { args = args.slice(1); break; }
+    break;
   }
   if (args.length === 0) {
     shell.io.err("printf: usage: printf [-v var] format [arguments]\n");
@@ -256,21 +267,24 @@ const printf: Builtin = async (shell, ...args) => {
       };
       const gfmt = (n: number, upper: boolean): string => {
         const p = hasPrec ? (prec === "" ? 0 : parseInt(prec, 10)) || 1 : 6;
+        const alt = flags.includes("#");
         let s = n.toPrecision(p);
         if (s.includes("e")) s = s.replace(/e([+-])(\d)$/, "e$10$2");
-        else if (s.includes(".")) s = s.replace(/\.?0+$/, ""); // %g trims trailing zeros
+        // %g trims trailing zeros, but the `#` flag keeps them (and the point).
+        else if (!alt && s.includes(".")) s = s.replace(/\.?0+$/, "");
+        else if (alt && !s.includes(".")) s += ".";
         return upper ? s.toUpperCase() : s;
       };
       const num = (raw: string): bigint => pfNum(shell, raw, () => { status = 1; });
       switch (conv) {
         case "s": out += format(nextArg(), false); break;
         case "b": { const r = unescape(nextArg(), true); out += format(r.text, false); if (r.stop) { stopped = true; return; } break; }
-        case "d": case "i": { const n = s64(num(nextArg())); out += format(sign(n, String(n)), true); break; }
-        case "u": out += format(String(num(nextArg()) & U64), true); break;
-        case "x": out += format(alt("0x", (num(nextArg()) & U64).toString(16)), true); break;
-        case "X": out += format(alt("0X", (num(nextArg()) & U64).toString(16).toUpperCase()), true); break;
+        case "d": case "i": { const n = clampS(num(nextArg())); out += format(sign(n, String(n)), true); break; }
+        case "u": out += format(String(clampU(num(nextArg()))), true); break;
+        case "x": out += format(alt("0x", clampU(num(nextArg())).toString(16)), true); break;
+        case "X": out += format(alt("0X", clampU(num(nextArg())).toString(16).toUpperCase()), true); break;
         case "o": {
-          const s = (num(nextArg()) & U64).toString(8);
+          const s = clampU(num(nextArg())).toString(8);
           out += format(flags.includes("#") && s[0] !== "0" ? "0" + s : s, true);
           break;
         }
@@ -307,7 +321,11 @@ const printf: Builtin = async (shell, ...args) => {
   if (target !== null) {
     const m = /^([A-Za-z_][A-Za-z0-9_]*)\[([^\]]*)\]$/.exec(target);
     if (m) await shell.elemSet(m[1]!, m[2]!, out);
-    else shell.setVar(target, out);
+    else if (/^[A-Za-z_][A-Za-z0-9_]*$/.test(target)) shell.setVar(target, out);
+    else {
+      shell.io.err(`printf: \`${target}': not a valid identifier\n`);
+      return 2;
+    }
     return status;
   }
   shell.io.out(out);
