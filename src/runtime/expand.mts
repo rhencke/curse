@@ -165,6 +165,11 @@ export const evalParam = async (shell: Shell, prm: Param, quoted = false): Promi
   } else {
     rawVal = shell.getVar(prm.name);
     isSet = rawVal !== undefined;
+    // A plain `$a` on an array/assoc is `${a[0]}` / key "0": it counts as set
+    // only when that element exists (an empty array is unset for `${a-…}`).
+    if (isSet && shell.isArrayLike(prm.name)) {
+      isSet = shell.elemValueSync(prm.name, "0") !== undefined;
+    }
   }
   const val = rawVal ?? "";
   // A default value (`${x-…}`) inside `"…"` uses double-quote backslash rules.

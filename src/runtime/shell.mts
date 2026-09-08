@@ -354,6 +354,11 @@ export class Shell {
     const v = this.lookup(name);
     return v !== undefined && v.assoc !== null;
   }
+  /** True if `name` is an indexed or associative array (as opposed to a scalar). */
+  isArrayLike(name: string): boolean {
+    const v = this.lookup(name);
+    return v !== undefined && (v.arr !== null || v.assoc !== null);
+  }
   /** Write `base[sub]` synchronously (assoc key or arithmetic index) — used by
    *  namerefs and arithmetic array assignment. */
   setElemSync(base: string, sub: string, value: string): void {
@@ -553,10 +558,17 @@ export class Shell {
   }
   setElem(name: string, index: number, value: string): void {
     const v = this.varForWrite(name);
-    v.unset = false;
     const arr = this.toArray(v);
     const i = index < 0 ? this.maxIndex(v) + 1 + index : index;
-    arr.set(i < 0 ? 0 : i, value);
+    if (i < 0) {
+      // A negative index reaching before the start is a fatal bad subscript in
+      // bash (status 1, no assignment); reuse the assignment-rejected signal.
+      this.io.err(`${this.name}: ${name}[${index}]: bad array subscript\n`);
+      this.readonlyHit = true;
+      return;
+    }
+    v.unset = false;
+    arr.set(i, value);
   }
   appendArray(name: string, values: string[]): void {
     const v = this.varForWrite(name);
@@ -744,8 +756,14 @@ export class Shell {
     if (v === undefined) return;
     if (v.assoc !== null) { v.assoc.delete(sub); return; }
     if (v.arr !== null) {
-      const i = Number(evalArith(this, sub));
-      v.arr.delete(i < 0 ? this.maxIndex(v) + 1 + i : i);
+      const raw = Number(evalArith(this, sub));
+      const i = raw < 0 ? this.maxIndex(v) + 1 + raw : raw;
+      if (i < 0) {
+        this.io.err(`${this.name}: ${name}[${raw}]: bad array subscript\n`);
+        this.readonlyHit = true;
+        return;
+      }
+      v.arr.delete(i);
       return;
     }
     // A scalar's element 0 is the whole variable.
@@ -1291,7 +1309,10 @@ export class Shell {
   /** Whether a variable is set (used by generated `${x-…}` / `${x+…}`). */
   has(name: string): boolean {
     const v = this.lookup(name);
-    return v !== undefined && !v.unset;
+    if (v === undefined || v.unset) return false;
+    // `$a` on an array/assoc is `${a[0]}` / key "0": set only if it exists.
+    if (v.arr !== null || v.assoc !== null) return this.elemValueSync(name, "0") !== undefined;
+    return true;
   }
 
   /* Parameter-expansion string ops (used by generated code). */
