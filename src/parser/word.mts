@@ -9,12 +9,31 @@
  * a quoted context) is not subject to field splitting. Literal text never
  * splits. This is the M0–M1 subset of bash's expansion grammar. */
 
+/** A parameter reference `$name` / `${...}`, with optional expansion operator. */
+export interface Param {
+  name: string; // variable name, or a special/positional: ? $ # @ * 0-9
+  special: boolean;
+  length: boolean; // ${#name}
+  /** "" | :- - :+ + := = :? ? # ## % %% / // /# /% : (substring) */
+  op: string;
+  arg: string; // operand raw text (default / pattern / offset)
+  arg2: string; // replacement text, or substring length
+}
+
 export type WordPart =
   | { k: "lit"; s: string } // literal text (quote-removed); never splits
-  | { k: "var"; name: string; quoted: boolean } // $name / ${name}
-  | { k: "special"; name: string; quoted: boolean } // $? $$ $# $@ $* $0..$9
+  | { k: "param"; p: Param; quoted: boolean } // $name / ${...}
   | { k: "arith"; expr: string; quoted: boolean } // $(( expr ))
   | { k: "cmdsub"; src: string; quoted: boolean }; // $( cmds )
+
+const simpleParam = (name: string, special: boolean): Param => ({
+  name,
+  special,
+  length: false,
+  op: "",
+  arg: "",
+  arg2: "",
+});
 
 export interface ParsedWord {
   parts: WordPart[];
@@ -153,20 +172,20 @@ class WordParser {
 
     if (n === "{") {
       this.i += 2;
-      let name = "";
+      let inner = "";
       for (;;) {
         const d = this.at();
         if (d === undefined) throw new Error("unterminated `${ }`");
         this.i++;
         if (d === "}") break;
-        name += d;
+        inner += d;
       }
-      this.emitParam(name, quoted);
+      this.parts.push({ k: "param", p: parseParam(inner), quoted });
       return;
     }
 
     if (n === "?" || n === "$" || n === "#" || n === "@" || n === "*" || (n >= "0" && n <= "9")) {
-      this.parts.push({ k: "special", name: n, quoted });
+      this.parts.push({ k: "param", p: simpleParam(n, true), quoted });
       this.i += 2;
       return;
     }
@@ -180,28 +199,12 @@ class WordParser {
         name += d;
         this.i++;
       }
-      this.parts.push({ k: "var", name, quoted });
+      this.parts.push({ k: "param", p: simpleParam(name, false), quoted });
       return;
     }
 
     this.pushLit("$");
     this.i++;
-  }
-
-  private emitParam(name: string, quoted: boolean): void {
-    if (name === "") throw new Error("bad substitution: ${}");
-    if (
-      name.length === 1 &&
-      (name === "?" || name === "$" || name === "#" || name === "@" || name === "*" ||
-        (name >= "0" && name <= "9"))
-    ) {
-      this.parts.push({ k: "special", name, quoted });
-      return;
-    }
-    for (const ch of name) {
-      if (!isNameChar(ch)) throw new Error(`\${${name}}: operator not implemented yet`);
-    }
-    this.parts.push({ k: "var", name, quoted });
   }
 
   /** Copy a balanced construct's inner text; `depth` opens already consumed. */
@@ -226,6 +229,114 @@ class WordParser {
       buf += c;
     }
   }
+}
+
+const indexOfUnescaped = (s: string, ch: string): number => {
+  for (let i = 0; i < s.length; i++) {
+    if (s[i] === "\\") {
+      i++;
+      continue;
+    }
+    if (s[i] === ch) return i;
+  }
+  return -1;
+};
+
+/** Parse the inside of `${ ... }` into a Param (name + optional operator). */
+function parseParam(inner: string): Param {
+  if (inner === "") throw new Error("bad substitution: ${}");
+  let s = inner;
+  let length = false;
+
+  // ${#name} is length; ${#} alone is the special parameter `#`.
+  if (s[0] === "#" && s.length > 1) {
+    length = true;
+    s = s.slice(1);
+  }
+  if (s[0] === "!") throw new Error("${!...} indirect expansion not implemented yet");
+
+  let name = "";
+  let special = false;
+  let i = 0;
+  const c0 = s[0]!;
+  if (c0 === "@" || c0 === "*" || c0 === "#" || c0 === "?" || c0 === "$") {
+    name = c0;
+    special = true;
+    i = 1;
+  } else if (c0 >= "0" && c0 <= "9") {
+    while (i < s.length && s[i]! >= "0" && s[i]! <= "9") {
+      name += s[i];
+      i++;
+    }
+    special = true;
+  } else {
+    while (i < s.length && isNameChar(s[i]!)) {
+      name += s[i];
+      i++;
+    }
+  }
+  if (name === "") throw new Error(`bad substitution: \${${inner}}`);
+
+  const rest = s.slice(i);
+  const p: Param = { name, special, length, op: "", arg: "", arg2: "" };
+  if (length) {
+    if (rest !== "") throw new Error(`bad substitution: \${${inner}}`);
+    return p;
+  }
+  if (rest === "") return p;
+
+  const a = rest[0]!;
+  if (a === ":") {
+    const b = rest[1];
+    if (b === "-" || b === "=" || b === "+") {
+      p.op = ":" + b;
+      p.arg = rest.slice(2);
+      return p;
+    }
+    if (b === "?") throw new Error("${x:?...} not implemented yet");
+    p.op = ":"; // substring ${name:offset[:length]}
+    const spec = rest.slice(1);
+    const ci = spec.indexOf(":");
+    if (ci >= 0) {
+      p.arg = spec.slice(0, ci);
+      p.arg2 = spec.slice(ci + 1);
+    } else {
+      p.arg = spec;
+    }
+    return p;
+  }
+  if (a === "-" || a === "=" || a === "+") {
+    p.op = a;
+    p.arg = rest.slice(1);
+    return p;
+  }
+  if (a === "?") throw new Error("${x?...} not implemented yet");
+  if (a === "#") {
+    p.op = rest[1] === "#" ? "##" : "#";
+    p.arg = rest.slice(p.op.length);
+    return p;
+  }
+  if (a === "%") {
+    p.op = rest[1] === "%" ? "%%" : "%";
+    p.arg = rest.slice(p.op.length);
+    return p;
+  }
+  if (a === "/") {
+    let body = rest.slice(1);
+    p.op = "/";
+    if (body[0] === "/") { p.op = "//"; body = body.slice(1); }
+    else if (body[0] === "#") { p.op = "/#"; body = body.slice(1); }
+    else if (body[0] === "%") { p.op = "/%"; body = body.slice(1); }
+    const si = indexOfUnescaped(body, "/");
+    if (si >= 0) {
+      p.arg = body.slice(0, si);
+      p.arg2 = body.slice(si + 1);
+    } else {
+      p.arg = body;
+    }
+    return p;
+  }
+  throw new Error(`bad substitution: \${${inner}}`);
 }
 
 export const parseWord = (text: string): ParsedWord => new WordParser(text).parse();

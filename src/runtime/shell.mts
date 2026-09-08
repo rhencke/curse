@@ -21,6 +21,9 @@ import { parse } from "../parser/parser.mts";
 import { expandNoSplit, expandWords, splitTaggedFields } from "./expand.mts";
 import { evalArith } from "./arith.mts";
 import { globMatch } from "./glob.mts";
+import {
+  replaceGlob as pReplaceGlob, substr as pSubstr, trimPrefix as pTrimPrefix, trimSuffix as pTrimSuffix,
+} from "./param.mts";
 import { builtins } from "./builtins.mts";
 import { ReturnSignal, Var } from "./types.mts";
 import type { IO } from "./types.mts";
@@ -378,6 +381,27 @@ export class Shell {
   /** Pattern match (used by generated `case` / `[[ == ]]` with dynamic patterns). */
   match(subject: string, pattern: string): boolean {
     return globMatch(subject, pattern);
+  }
+
+  /** Whether a variable is set (used by generated `${x-…}` / `${x+…}`). */
+  has(name: string): boolean {
+    return this.lookup(name) !== undefined;
+  }
+
+  /* Parameter-expansion string ops (used by generated code). */
+  trimPrefix(v: string, pat: string, longest: boolean): string {
+    return pTrimPrefix(v, pat, longest);
+  }
+  trimSuffix(v: string, pat: string, longest: boolean): string {
+    return pTrimSuffix(v, pat, longest);
+  }
+  replaceGlob(v: string, pat: string, repl: string, all: boolean, anchor: string): string {
+    return pReplaceGlob(v, pat, repl, all, anchor);
+  }
+  async substr(v: string, offExpr: string, lenExpr: string): Promise<string> {
+    const off = Number(await this.arithValue(offExpr));
+    const len = lenExpr === "" ? undefined : Number(await this.arithValue(lenExpr));
+    return pSubstr(v, off, len);
   }
 
   /** `[[ ]]` unary test (used by generated code and the interpreter). */

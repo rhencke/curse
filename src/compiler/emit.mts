@@ -15,7 +15,7 @@ import type { Command, CondExpr, FunctionDef, Word } from "../ast/nodes.mts";
 import { CMD_INVERT_RETURN } from "../ast/nodes.mts";
 import { parse } from "../parser/parser.mts";
 import { parseWord } from "../parser/word.mts";
-import type { WordPart } from "../parser/word.mts";
+import type { Param, WordPart } from "../parser/word.mts";
 import { globToRegExpSource } from "../runtime/glob.mts";
 
 export interface EmitOptions {
@@ -40,19 +40,51 @@ class Emitter {
 
   /* ---------------- words ---------------- */
 
+  private specialExpr(name: string): string {
+    switch (name) {
+      case "?": return "String(sh.status)";
+      case "#": return "String(sh.positional.length)";
+      case "$": return "String(sh.pid)";
+      case "0": return "sh.name";
+      case "@": case "*": return 'sh.positional.join(" ")';
+      default: return `sh.param(${Number(name)})`;
+    }
+  }
+
+  private paramExpr(prm: Param): string {
+    const base = prm.special ? this.specialExpr(prm.name) : `sh.env.${prm.name}`;
+    const J = JSON.stringify;
+    const arg = (): string => this.templateOf(parseWord(prm.arg).parts);
+    const arg2 = (): string => this.templateOf(parseWord(prm.arg2).parts);
+    if (prm.length) {
+      if (prm.name === "@" || prm.name === "*" || prm.name === "#") return "String(sh.positional.length)";
+      return `String(${base}).length`;
+    }
+    switch (prm.op) {
+      case "": return base;
+      case ":-": return `(String(${base}) || ${arg()})`;
+      case "-": return `(sh.has(${J(prm.name)}) ? ${base} : ${arg()})`;
+      case ":+": return `(String(${base}) ? ${arg()} : "")`;
+      case "+": return `(sh.has(${J(prm.name)}) ? ${arg()} : "")`;
+      case ":=": return `(String(${base}) || (sh.env.${prm.name} = ${arg()}))`;
+      case "=": return `(sh.has(${J(prm.name)}) ? ${base} : (sh.env.${prm.name} = ${arg()}))`;
+      case "#": return `sh.trimPrefix(String(${base}), ${arg()}, false)`;
+      case "##": return `sh.trimPrefix(String(${base}), ${arg()}, true)`;
+      case "%": return `sh.trimSuffix(String(${base}), ${arg()}, false)`;
+      case "%%": return `sh.trimSuffix(String(${base}), ${arg()}, true)`;
+      case "/": return `sh.replaceGlob(String(${base}), ${arg()}, ${arg2()}, false, "")`;
+      case "//": return `sh.replaceGlob(String(${base}), ${arg()}, ${arg2()}, true, "")`;
+      case "/#": return `sh.replaceGlob(String(${base}), ${arg()}, ${arg2()}, false, "#")`;
+      case "/%": return `sh.replaceGlob(String(${base}), ${arg()}, ${arg2()}, false, "%")`;
+      case ":": return `await sh.substr(String(${base}), ${J(prm.arg)}, ${J(prm.arg2)})`;
+      default: throw new Error(`parameter operator not supported: ${prm.op}`);
+    }
+  }
+
   private valueExpr(p: Exclude<WordPart, { k: "lit" }>): string {
     switch (p.k) {
-      case "var":
-        return `sh.env.${p.name}`;
-      case "special":
-        switch (p.name) {
-          case "?": return "String(sh.status)";
-          case "#": return "String(sh.positional.length)";
-          case "$": return "String(sh.pid)";
-          case "0": return "sh.name";
-          case "@": case "*": return 'sh.positional.join(" ")';
-          default: return `sh.param(${Number(p.name)})`;
-        }
+      case "param":
+        return this.paramExpr(p.p);
       case "arith":
         return `await sh.arithStr(${JSON.stringify(p.expr)})`;
       case "cmdsub": {
@@ -84,10 +116,12 @@ class Emitter {
 
     // "$@" / $@ expands to each positional parameter as a separate field.
     // ($* is a scalar join and flows through the generic paths below.)
-    if (pw.parts.length === 1 && pw.parts[0]!.k === "special" && pw.parts[0]!.name === "@") {
+    const isAt = (p: WordPart): boolean =>
+      p.k === "param" && p.p.special && p.p.name === "@" && p.p.op === "" && !p.p.length;
+    if (pw.parts.length === 1 && isAt(pw.parts[0]!)) {
       return { spread: true, code: "...sh.positional" };
     }
-    if (pw.parts.some((p) => p.k === "special" && p.name === "@")) {
+    if (pw.parts.some(isAt)) {
       throw new Error('`$@` mixed with other text is not supported yet');
     }
 

@@ -9,8 +9,9 @@
 import type { Word } from "../ast/nodes.mts";
 import type { Shell } from "./shell.mts";
 import { parseWord } from "../parser/word.mts";
-import type { WordPart } from "../parser/word.mts";
+import type { Param, WordPart } from "../parser/word.mts";
 import { evalArith } from "./arith.mts";
+import { replaceGlob, substr, trimPrefix, trimSuffix } from "./param.mts";
 
 const isIFSWhitespace = (c: string): boolean => c === " " || c === "\t" || c === "\n";
 
@@ -55,10 +56,58 @@ const specialValue = (shell: Shell, name: string): string => {
   }
 };
 
+const evalParam = async (shell: Shell, prm: Param): Promise<string> => {
+  const rawVal = prm.special ? specialValue(shell, prm.name) : shell.getVar(prm.name);
+  const isSet = prm.special ? true : rawVal !== undefined;
+  const val = rawVal ?? "";
+  const arg = (): Promise<string> => expandNoSplit(shell, prm.arg);
+  const arg2 = (): Promise<string> => expandNoSplit(shell, prm.arg2);
+
+  if (prm.length) {
+    if (prm.name === "@" || prm.name === "*" || prm.name === "#") {
+      return String(shell.positional.length);
+    }
+    return String(val.length);
+  }
+  switch (prm.op) {
+    case "": return val;
+    case ":-": return val !== "" ? val : await arg();
+    case "-": return isSet ? val : await arg();
+    case ":+": return val !== "" ? await arg() : "";
+    case "+": return isSet ? await arg() : "";
+    case ":=": {
+      if (val !== "") return val;
+      const d = await arg();
+      shell.setVar(prm.name, d);
+      return d;
+    }
+    case "=": {
+      if (isSet) return val;
+      const d = await arg();
+      shell.setVar(prm.name, d);
+      return d;
+    }
+    case "#": return trimPrefix(val, await arg(), false);
+    case "##": return trimPrefix(val, await arg(), true);
+    case "%": return trimSuffix(val, await arg(), false);
+    case "%%": return trimSuffix(val, await arg(), true);
+    case "/": return replaceGlob(val, await arg(), await arg2(), false, "");
+    case "//": return replaceGlob(val, await arg(), await arg2(), true, "");
+    case "/#": return replaceGlob(val, await arg(), await arg2(), false, "#");
+    case "/%": return replaceGlob(val, await arg(), await arg2(), false, "%");
+    case ":": {
+      const off = Number(evalArith(shell, await arg()));
+      const len = prm.arg2 === "" ? undefined : Number(evalArith(shell, await arg2()));
+      return substr(val, off, len);
+    }
+    default:
+      throw new Error(`parameter operator not supported: ${prm.op}`);
+  }
+};
+
 const partValue = async (shell: Shell, p: Exclude<WordPart, { k: "lit" }>): Promise<string> => {
   switch (p.k) {
-    case "var": return shell.getVar(p.name) ?? "";
-    case "special": return specialValue(shell, p.name);
+    case "param": return evalParam(shell, p.p);
     case "arith": return evalArith(shell, await expandNoSplit(shell, p.expr)).toString();
     case "cmdsub": return shell.subSrc(p.src);
   }
@@ -71,7 +120,9 @@ export const expandWord = async (shell: Shell, word: Word): Promise<string[]> =>
   // "$@" / $@ : each positional parameter becomes its own field.
   if (pw.parts.length === 1) {
     const only = pw.parts[0]!;
-    if (only.k === "special" && only.name === "@") return [...shell.positional];
+    if (only.k === "param" && only.p.special && only.p.name === "@" && only.p.op === "" && !only.p.length) {
+      return [...shell.positional];
+    }
   }
 
   const chars: string[] = [];
