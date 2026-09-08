@@ -312,6 +312,21 @@ export const expandWords = async (shell: Shell, words: Word[]): Promise<string[]
 };
 
 const ASSIGN_WORD = /^[A-Za-z_][A-Za-z0-9_]*(\[[^\]]*\])?\+?=/;
+/** An array-literal element of the form `[subscript]=value` / `[subscript]+=value`. */
+const ELEM_ASSIGN = /^\[.*\]\+?=/;
+
+/** Expand the elements of a compound array assignment `name=( … )`. Plain words
+ *  are brace-expanded and field-split. In an associative array a `[key]=value`
+ *  element is an assignment word whose value is not brace-expanded or split
+ *  (bash); indexed arrays brace-expand every element uniformly. */
+export const expandArrayElems = async (shell: Shell, words: Word[], assoc: boolean): Promise<string[]> => {
+  const out: string[] = [];
+  for (const w of words) {
+    if (assoc && ELEM_ASSIGN.test(w.text)) out.push(await expandNoSplit(shell, w.text));
+    else for (const t of braceExpand(w.text)) out.push(...(await expandWord(shell, makeWordLocal(t))));
+  }
+  return out;
+};
 /** Expand the words of an assignment-builtin command (declare/local/export/…):
  *  a `name=value` operand is an assignment word (its RHS is not field-split or
  *  globbed), while the command name, flags, and other args expand normally. */

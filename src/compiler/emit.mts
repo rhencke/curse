@@ -33,6 +33,9 @@ const ASSIGN = /^([A-Za-z_][A-Za-z0-9_]*)(\[([^\]]*)\])?(\+)?=([\s\S]*)$/;
 /** Builtins whose `name=value` operands are assignment words (RHS not split/globbed). */
 const ASSIGN_BUILTINS = new Set(["declare", "typeset", "local", "export", "readonly"]);
 
+/** An array-literal element of the form `[subscript]=value` / `[subscript]+=value`. */
+const ELEM_ASSIGN = /^\[.*\]\+?=/;
+
 const isCaseOp = (op: string): boolean => op === "^" || op === "^^" || op === "," || op === ",,";
 const STR_OPS = new Set(["#", "##", "%", "%%", "/", "//", "/#", "/%"]);
 
@@ -431,6 +434,18 @@ class Emitter {
     return `${i}sh.env.${name} = ${rhs};`;
   }
 
+  /** Element fragments for a compound array assignment: a plain word is
+   *  brace-expanded and split/globbed, but a `[sub]=value` element is an
+   *  assignment word emitted as a single no-split/no-glob scalar template. */
+  private arrayElemFrags(elems: readonly Word[], assoc: boolean): string[] {
+    const frags: string[] = [];
+    for (const w of elems) {
+      if (assoc && ELEM_ASSIGN.test(w.text)) frags.push(this.templateOf(parseWord(w.text).parts));
+      else for (const t of braceExpand(w.text)) frags.push(this.word(t).code);
+    }
+    return frags;
+  }
+
   private simpleCore(cmd: SimpleCommand, ind: number): string {
     const words = cmd.words;
     const i = pad(ind);
@@ -476,8 +491,7 @@ class Emitter {
         const nm = JSON.stringify(aa.name);
         if (isLocal) arrayStmts += `${i}sh.local(${nm});\n`;
         if (isAssoc) arrayStmts += `${i}sh.declareAssoc(${nm});\n`;
-        const frags: string[] = [];
-        for (const w of aa.elems) for (const t of braceExpand(w.text)) frags.push(this.word(t).code);
+        const frags = this.arrayElemFrags(aa.elems, isAssoc);
         const fn = aa.append ? "appendArrayFields" : "setArrayFields";
         arrayStmts += `${i}sh.${fn}(${nm}, [${frags.join(", ")}]);\n`;
         if (Object.keys(attrs).length > 0) arrayStmts += `${i}sh.setAttrs(${nm}, ${JSON.stringify(attrs)});\n`;
@@ -652,8 +666,10 @@ class Emitter {
         return this.guards ? s + `\n${i}await sh.afterCommand();` : s;
       }
       case "array_assign": {
-        const frags: string[] = [];
-        for (const w of cmd.elems) for (const t of braceExpand(w.text)) frags.push(this.word(t).code);
+        // A standalone `name=( … )` can target a previously `declare -A`'d
+        // variable, whose assoc-ness isn't known here; default to indexed
+        // (brace-expand) — the interpreter resolves the assoc case at runtime.
+        const frags = this.arrayElemFrags(cmd.elems, false);
         const fn = cmd.append ? "appendArrayFields" : "setArrayFields";
         return `${i}sh.${fn}(${JSON.stringify(cmd.name)}, [${frags.join(", ")}]);`;
       }

@@ -19,7 +19,7 @@ import type {
 import { CMD_INVERT_RETURN } from "../ast/nodes.mts";
 import { parse } from "../parser/parser.mts";
 import { parseHeredoc } from "../parser/word.mts";
-import { evalParam, expandArith, expandAssign, expandNoSplit, expandParsed, expandWords, expandWordsAssign, splitTaggedFields } from "./expand.mts";
+import { evalParam, expandArith, expandArrayElems, expandAssign, expandNoSplit, expandParsed, expandWords, expandWordsAssign, splitTaggedFields } from "./expand.mts";
 import { evalArith } from "./arith.mts";
 import { globExpand, globIgnored, globMatch, hasExtglob, hasGlobMeta } from "./glob.mts";
 import {
@@ -1757,7 +1757,10 @@ export class Shell {
         await this.afterCommand();
         break;
       case "array_assign": {
-        const fields = await expandWords(this, cmd.elems);
+        // Assoc-ness of a standalone `name=( … )` isn't known statically, so
+        // stay indexed here for interp/AOT parity (the emitter does the same);
+        // the `declare -A name=( … )` form carries the flag and is handled below.
+        const fields = await expandArrayElems(this, cmd.elems, false);
         if (cmd.append) this.appendArrayFields(cmd.name, fields);
         else this.setArrayFields(cmd.name, fields);
         this.status = 0;
@@ -1881,7 +1884,7 @@ export class Shell {
     for (const aa of args) {
       if (isLocal) this.local(aa.name);
       if (isAssoc) this.declareAssoc(aa.name);
-      const fields = await expandWords(this, aa.elems);
+      const fields = await expandArrayElems(this, aa.elems, isAssoc);
       if (aa.append) this.appendArrayFields(aa.name, fields);
       else this.setArrayFields(aa.name, fields);
       this.setAttrs(aa.name, attrs);

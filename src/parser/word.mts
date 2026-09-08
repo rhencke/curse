@@ -116,9 +116,14 @@ class WordParser {
       this.tryTilde();
     } else if (am !== null) {
       this.assign = true;
-      this.pushLit(am[0]);
-      this.i = am[0].length;
-      this.tryTilde();
+      // A quoted subscript (`['a+1']=…`) must have its quotes removed, so let
+      // the main loop process the prefix rather than pushing it verbatim. The
+      // rare cost is no tilde expansion right after such an `=`.
+      if (!/['"\\]/.test(am[0])) {
+        this.pushLit(am[0]);
+        this.i = am[0].length;
+        this.tryTilde();
+      }
     } else if (this.t[0] === "~" && (this.t.length === 1 || this.t[1] === "/")) {
       this.parts.push({ k: "param", p: simpleParam("HOME", false), quoted: true });
       this.anchored = true;
