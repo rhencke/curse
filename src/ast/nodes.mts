@@ -50,6 +50,7 @@ export type Command =
   | ArithCommand
   | CaseCommand
   | CondCommand
+  | ArrayAssignCommand
   | FunctionDef;
 
 /** Connectors between commands. M0 implements ";", "&&", "||". */
@@ -144,6 +145,14 @@ export interface CaseCommand extends CommandBase {
   type: "case";
   word: Word;
   clauses: CasePattern[];
+}
+
+/** Array assignment: `name=(elems)` or `name+=(elems)`. */
+export interface ArrayAssignCommand extends CommandBase {
+  type: "array_assign";
+  name: string;
+  append: boolean;
+  elems: Word[];
 }
 
 /** A `[[ ... ]]` conditional expression tree (cf. COND_COM in command.h). */

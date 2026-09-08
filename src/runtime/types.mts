@@ -6,19 +6,25 @@ export interface IO {
   err: (s: string) => void;
 }
 
-/** A shell variable: a value plus attributes. Coerces to its string value. */
+/** A shell variable: a scalar value, or (when `arr` is set) an indexed array.
+ *  Coerces to its string value — element 0 for an array, matching bash's `$arr`. */
 export class Var {
   value: string;
   exported: boolean;
+  /** Indexed-array elements (sparse), or null for a plain scalar. */
+  arr: Map<number, string> | null = null;
   constructor(value: string, exported = false) {
     this.value = value;
     this.exported = exported;
   }
+  scalar(): string {
+    return this.arr !== null ? this.arr.get(0) ?? "" : this.value;
+  }
   toString(): string {
-    return this.value;
+    return this.scalar();
   }
   valueOf(): string {
-    return this.value;
+    return this.scalar();
   }
 }
 

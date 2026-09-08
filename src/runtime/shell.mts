@@ -54,6 +54,9 @@ interface RedirIO {
   target: string;
 }
 
+/** An assignment word: name(1), optional `[sub(3)]`(2), optional `+`(4), value(5). */
+const ASSIGN = /^([A-Za-z_][A-Za-z0-9_]*)(\[([^\]]*)\])?(\+)?=([\s\S]*)$/;
+
 const errMsg = (e: unknown): string => (e instanceof Error ? e.message : String(e));
 
 /** Run a subshell body, turning `exit` into that subshell's status. */
@@ -170,7 +173,94 @@ export class Shell {
   }
 
   getVar(name: string): string | undefined {
-    return this.lookup(name)?.value;
+    return this.lookup(name)?.scalar();
+  }
+
+  /* ---- indexed arrays ---- */
+
+  private varForWrite(name: string): Var {
+    const owner = this.ownerScope(name);
+    if (owner) return owner[name]!;
+    const v = new Var("", process.env[name] !== undefined);
+    this.globalScope[name] = v;
+    return v;
+  }
+  private maxIndex(v: Var): number {
+    let m = -1;
+    if (v.arr) for (const k of v.arr.keys()) if (k > m) m = k;
+    return m;
+  }
+  private toArray(v: Var): Map<number, string> {
+    if (v.arr === null) {
+      v.arr = new Map();
+      if (v.value !== "") v.arr.set(0, v.value);
+      v.value = "";
+    }
+    return v.arr;
+  }
+
+  setArray(name: string, values: string[]): void {
+    const v = this.varForWrite(name);
+    v.arr = new Map();
+    values.forEach((val, i) => v.arr!.set(i, val));
+  }
+  setElem(name: string, index: number, value: string): void {
+    const arr = this.toArray(this.varForWrite(name));
+    const i = index < 0 ? this.maxIndex(this.varForWrite(name)) + 1 + index : index;
+    arr.set(i < 0 ? 0 : i, value);
+  }
+  appendArray(name: string, values: string[]): void {
+    const v = this.varForWrite(name);
+    const arr = this.toArray(v);
+    let next = this.maxIndex(v) + 1;
+    for (const val of values) arr.set(next++, val);
+  }
+  arrayGet(name: string, index: number): string | undefined {
+    const v = this.lookup(name);
+    if (!v) return undefined;
+    if (v.arr === null) return index === 0 ? v.value : undefined;
+    return v.arr.get(index < 0 ? this.maxIndex(v) + 1 + index : index);
+  }
+  arrayValues(name: string): string[] {
+    const v = this.lookup(name);
+    if (!v) return [];
+    if (v.arr === null) return [v.value];
+    return [...v.arr.entries()].sort((a, b) => a[0] - b[0]).map((e) => e[1]);
+  }
+  arrayIndices(name: string): number[] {
+    const v = this.lookup(name);
+    if (!v) return [];
+    if (v.arr === null) return [0];
+    return [...v.arr.keys()].sort((a, b) => a - b);
+  }
+  arrayLen(name: string): number {
+    const v = this.lookup(name);
+    if (!v) return 0;
+    return v.arr === null ? 1 : v.arr.size;
+  }
+
+  private fillArray(arr: Map<number, string>, fields: string[], start: number): void {
+    let idx = start;
+    for (const f of fields) {
+      const m = /^\[([^\]]*)\]=([\s\S]*)$/.exec(f);
+      if (m) {
+        idx = Number(evalArith(this, m[1]!));
+        arr.set(idx, m[2]!);
+      } else {
+        arr.set(idx, f);
+      }
+      idx++;
+    }
+  }
+  setArrayFields(name: string, fields: string[]): void {
+    const v = this.varForWrite(name);
+    v.arr = new Map();
+    v.value = "";
+    this.fillArray(v.arr, fields, 0);
+  }
+  appendArrayFields(name: string, fields: string[]): void {
+    const v = this.varForWrite(name);
+    this.fillArray(this.toArray(v), fields, this.maxIndex(v) + 1);
   }
 
   /** Read a plain `$name` reference, honoring `set -u` (used by generated code). */
@@ -183,7 +273,7 @@ export class Shell {
       }
       return "";
     }
-    return v.value;
+    return v.scalar();
   }
   setVar(name: string, value: string): void {
     this.assign(name, value);
@@ -805,6 +895,14 @@ export class Shell {
         this.status = (await this.evalCond(cmd.expr)) ? 0 : 1;
         status = this.status;
         break;
+      case "array_assign": {
+        const fields = await expandWords(this, cmd.elems);
+        if (cmd.append) this.appendArrayFields(cmd.name, fields);
+        else this.setArrayFields(cmd.name, fields);
+        this.status = 0;
+        status = 0;
+        break;
+      }
       default: {
         const unhandled: never = cmd;
         throw new Error(`unhandled command type: ${String(unhandled)}`);
@@ -849,32 +947,52 @@ export class Shell {
   }
 
   private async execSimpleCore(words: Word[]): Promise<number> {
-    const assigns: Array<[string, string]> = [];
+    const assignWords: string[] = [];
     let k = 0;
     for (; k < words.length; k++) {
-      const m = /^([A-Za-z_][A-Za-z0-9_]*)=/.exec(words[k]!.text);
-      if (!m) break;
-      assigns.push([m[1]!, await expandNoSplit(this, words[k]!.text.slice(m[0].length))]);
+      if (ASSIGN.test(words[k]!.text)) assignWords.push(words[k]!.text);
+      else break;
     }
     const rest = words.slice(k);
+
     if (rest.length === 0) {
-      for (const [n, v] of assigns) this.setVar(n, v);
+      for (const wt of assignWords) await this.applyAssign(wt);
       this.status = 0;
       return 0;
     }
     const argv = await expandWords(this, rest);
     if (argv.length === 0) {
-      for (const [n, v] of assigns) this.setVar(n, v);
+      for (const wt of assignWords) await this.applyAssign(wt);
       this.status = 0;
       return 0;
     }
     if (this.opts.xtrace) this.io.err("+ " + argv.join(" ") + "\n");
-    if (assigns.length > 0) {
+    if (assignWords.length > 0) {
       const env: Record<string, string> = {};
-      for (const [n, v] of assigns) env[n] = v;
+      for (const wt of assignWords) {
+        const m = ASSIGN.exec(wt)!;
+        if (m[2] === undefined && m[4] === undefined) env[m[1]!] = await expandNoSplit(this, m[5]!);
+      }
       return this.withEnv(env, () => this.callByName(argv[0]!, argv.slice(1)));
     }
     return this.callByName(argv[0]!, argv.slice(1));
+  }
+
+  /** Apply an assignment word: `name=v`, `name+=v`, `name[i]=v`, `name[i]+=v`. */
+  private async applyAssign(text: string): Promise<void> {
+    const m = ASSIGN.exec(text)!;
+    const name = m[1]!;
+    const sub = m[3];
+    const append = m[4] === "+";
+    const value = await expandNoSplit(this, m[5]!);
+    if (m[2] !== undefined) {
+      const idx = Number(evalArith(this, await expandNoSplit(this, sub ?? "")));
+      this.setElem(name, idx, append ? (this.arrayGet(name, idx) ?? "") + value : value);
+    } else if (append) {
+      this.setVar(name, (this.getVar(name) ?? "") + value);
+    } else {
+      this.setVar(name, value);
+    }
   }
 
   /** Run a command as a condition: exempt from errexit. */

@@ -220,6 +220,24 @@ const shift: Builtin = (shell, ...args) => {
   return 0;
 };
 
+const declareBuiltin: Builtin = (shell, ...args) => {
+  let makeArray = false;
+  const names: string[] = [];
+  for (const a of args) {
+    if (a.startsWith("-") || a.startsWith("+")) {
+      if (a.includes("a")) makeArray = true;
+      continue;
+    }
+    names.push(a);
+  }
+  for (const n of names) {
+    const eq = n.indexOf("=");
+    if (eq >= 0) shell.setVar(n.slice(0, eq), n.slice(eq + 1));
+    else if (makeArray && shell.arrayLen(n) === 0) shell.setArray(n, []);
+  }
+  return 0;
+};
+
 const setBuiltin: Builtin = (shell, ...args) => {
   const opt = (name: string, on: boolean): void => {
     if (name === "errexit") shell.opts.errexit = on;
@@ -430,6 +448,8 @@ export const builtins: Record<string, Builtin> = {
   shift,
   wait,
   set: setBuiltin,
+  declare: declareBuiltin,
+  typeset: declareBuiltin,
   read,
   test,
   "[": bracket,

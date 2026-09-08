@@ -14,6 +14,8 @@ export interface Param {
   name: string; // variable name, or a special/positional: ? $ # @ * 0-9
   special: boolean;
   length: boolean; // ${#name}
+  indices: boolean; // ${!name[@]}
+  sub: string; // array subscript inside [ ] ("" if none)
   /** "" | :- - :+ + := = :? ? # ## % %% / // /# /% : (substring) */
   op: string;
   arg: string; // operand raw text (default / pattern / offset)
@@ -30,6 +32,8 @@ const simpleParam = (name: string, special: boolean): Param => ({
   name,
   special,
   length: false,
+  indices: false,
+  sub: "",
   op: "",
   arg: "",
   arg2: "",
@@ -365,13 +369,16 @@ function parseParam(inner: string): Param {
   if (inner === "") throw new Error("bad substitution: ${}");
   let s = inner;
   let length = false;
+  let indices = false;
 
   // ${#name} is length; ${#} alone is the special parameter `#`.
   if (s[0] === "#" && s.length > 1) {
     length = true;
     s = s.slice(1);
+  } else if (s[0] === "!" && s.length > 1) {
+    indices = true; // ${!name[@]} (or indirect — checked after the subscript)
+    s = s.slice(1);
   }
-  if (s[0] === "!") throw new Error("${!...} indirect expansion not implemented yet");
 
   let name = "";
   let special = false;
@@ -395,9 +402,30 @@ function parseParam(inner: string): Param {
   }
   if (name === "") throw new Error(`bad substitution: \${${inner}}`);
 
+  // Array subscript: ${name[sub]...}
+  let sub = "";
+  if (s[i] === "[") {
+    i++;
+    let depth = 1;
+    while (i < s.length && depth > 0) {
+      const c = s[i]!;
+      if (c === "[") depth++;
+      else if (c === "]" && --depth === 0) {
+        i++;
+        break;
+      }
+      sub += c;
+      i++;
+    }
+  }
+
+  if (indices && sub !== "@" && sub !== "*") {
+    throw new Error("${!...} indirect expansion not implemented yet");
+  }
+
   const rest = s.slice(i);
-  const p: Param = { name, special, length, op: "", arg: "", arg2: "" };
-  if (length) {
+  const p: Param = { name, special, length, indices, sub, op: "", arg: "", arg2: "" };
+  if (length || indices) {
     if (rest !== "") throw new Error(`bad substitution: \${${inner}}`);
     return p;
   }

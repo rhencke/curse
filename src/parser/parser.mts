@@ -198,6 +198,13 @@ class Parser {
       ) {
         return this.parseFunctionDef(t.value);
       }
+      // name=( ... )  /  name+=( ... )  → array assignment
+      if (
+        /^[A-Za-z_][A-Za-z0-9_]*\+?=$/.test(t.value) &&
+        this.peekAt(1).type === "OP" && this.peekAt(1).value === "("
+      ) {
+        return this.parseArrayAssign();
+      }
       if (RESERVED_MISPLACED.has(t.value)) {
         throw new ParseError(`syntax error near \`${t.value}\` (line ${t.line})`);
       }
@@ -205,6 +212,28 @@ class Parser {
     }
 
     throw new ParseError(`syntax error near \`${t.value || "<eof>"}\` (line ${t.line})`);
+  }
+
+  private parseArrayAssign(): Command {
+    const w = this.advance().value; // "name=" or "name+="
+    const append = w.endsWith("+=");
+    const name = w.slice(0, w.length - (append ? 2 : 1));
+    this.advance(); // "("
+    const elems: Word[] = [];
+    for (;;) {
+      const t = this.peek();
+      if (t.type === "OP" && t.value === ")") break;
+      if (t.type === "WORD") {
+        elems.push(makeWord(t.value));
+        this.advance();
+      } else if (t.type === "NEWLINE") {
+        this.advance(); // elements may span lines
+      } else {
+        throw new ParseError(`array assignment: unexpected \`${t.value || "<eof>"}\` (line ${t.line})`);
+      }
+    }
+    this.advance(); // ")"
+    return { type: "array_assign", name, append, elems };
   }
 
   private parseSubshell(): Command {

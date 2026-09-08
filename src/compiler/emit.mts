@@ -27,6 +27,8 @@ export interface EmitOptions {
 const pad = (n: number): string => "  ".repeat(n);
 /** Add one indent level to every non-empty line of an already-emitted block. */
 const bump = (s: string): string => s.replace(/^(?=.)/gm, "  ");
+/** An assignment word: name(1), optional `[sub(3)]`(2), optional `+`(4), value(5). */
+const ASSIGN = /^([A-Za-z_][A-Za-z0-9_]*)(\[([^\]]*)\])?(\+)?=([\s\S]*)$/;
 const ident = (s: string): boolean => /^[A-Za-z_][A-Za-z0-9_]*$/.test(s);
 const escTemplate = (s: string): string =>
   s.replace(/\\/g, "\\\\").replace(/`/g, "\\`").replace(/\$/g, "\\$");
@@ -52,7 +54,7 @@ const usesSet = (cmd: Command): boolean => {
     case "while": return usesSet(cmd.test) || usesSet(cmd.body);
     case "for": case "arith_for": case "function": return usesSet(cmd.body);
     case "case": return cmd.clauses.some((c) => c.body !== null && usesSet(c.body));
-    case "arith": case "cond": return false;
+    case "arith": case "cond": case "array_assign": return false;
   }
 };
 
@@ -84,17 +86,32 @@ class Emitter {
     }
   }
 
-  private paramExpr(prm: Param): string {
-    const base = prm.special ? this.specialExpr(prm.name) : `sh.env.${prm.name}`;
+  /** The value of a param reference as a string expression (scalar, array
+   *  element, or all elements joined). Not nounset-aware — plain `${x}` uses
+   *  sh.ref() below. */
+  private valStr(prm: Param): string {
     const J = JSON.stringify;
+    if (prm.special) return this.specialExpr(prm.name);
+    if (prm.sub === "@" || prm.sub === "*") return `sh.arrayValues(${J(prm.name)}).join(" ")`;
+    if (prm.sub !== "") {
+      return `(sh.arrayGet(${J(prm.name)}, Number(await sh.arithStr(${J(prm.sub)}))) ?? "")`;
+    }
+    return `sh.env.${prm.name}`;
+  }
+
+  private paramExpr(prm: Param): string {
+    const J = JSON.stringify;
+    if (prm.indices) return `sh.arrayIndices(${J(prm.name)}).join(" ")`;
+    const base = this.valStr(prm);
     const arg = (): string => this.templateOf(parseWord(prm.arg).parts);
     const arg2 = (): string => this.templateOf(parseWord(prm.arg2).parts);
     if (prm.length) {
       if (prm.name === "@" || prm.name === "*" || prm.name === "#") return "String(sh.positional.length)";
+      if (prm.sub === "@" || prm.sub === "*") return `String(sh.arrayLen(${J(prm.name)}))`;
       return `String(${base}).length`;
     }
     switch (prm.op) {
-      case "": return prm.special ? base : `sh.ref(${J(prm.name)})`;
+      case "": return prm.special || prm.sub !== "" ? base : `sh.ref(${J(prm.name)})`;
       case ":-": return `(String(${base}) || ${arg()})`;
       case "-": return `(sh.has(${J(prm.name)}) ? ${base} : ${arg()})`;
       case ":+": return `(String(${base}) ? ${arg()} : "")`;
@@ -147,16 +164,24 @@ class Emitter {
   private word(text: string): WordCode {
     const pw = parseWord(text);
 
-    // "$@" / $@ expands to each positional parameter as a separate field.
-    // ($* is a scalar join and flows through the generic paths below.)
-    const isAt = (p: WordPart): boolean =>
-      p.k === "param" && p.p.special && p.p.name === "@" && p.p.op === "" && !p.p.length;
-    if (pw.parts.length === 1 && isAt(pw.parts[0]!)) {
-      return { spread: true, code: "...sh.positional" };
+    // "$@"/$@ and "${arr[@]}"/${arr[@]}/${!arr[@]} each expand to separate
+    // fields. ($* / ${arr[*]} are scalar joins and flow through the paths below.)
+    const spreadCode = (p: WordPart): string | null => {
+      if (p.k !== "param" || p.p.op !== "" || p.p.length) return null;
+      if (p.p.special && p.p.name === "@") return "sh.positional";
+      if (p.p.sub === "@") {
+        return p.p.indices
+          ? `sh.arrayIndices(${JSON.stringify(p.p.name)}).map(String)`
+          : `sh.arrayValues(${JSON.stringify(p.p.name)})`;
+      }
+      return null;
+    };
+    if (pw.parts.length === 1) {
+      const c = spreadCode(pw.parts[0]!);
+      if (c !== null) return { spread: true, code: `...${c}` };
     }
-    if (pw.parts.some(isAt)) {
-      throw new Error('`$@` mixed with other text is not supported yet');
-    }
+    // Mixed with other text: `@`/`[@]` flows through as a scalar join (valStr),
+    // matching how the interpreter and `echo` render it.
 
     const needsFields = pw.parts.some((p) => p.k !== "lit" && !p.quoted);
     if (!needsFields) return { spread: false, code: this.templateOf(pw.parts) };
@@ -224,23 +249,38 @@ class Emitter {
     return core;
   }
 
-  private assignRHS(rhsText: string): string {
-    return this.templateOf(parseWord(rhsText).parts);
+  /** Emit a statement for an assignment word (name=, name+=, name[i]=, …). */
+  private assignStmt(text: string, ind: number): string {
+    const m = ASSIGN.exec(text)!;
+    const name = m[1]!;
+    const hasSub = m[2] !== undefined;
+    const append = m[4] === "+";
+    const rhs = this.templateOf(parseWord(m[5]!).parts);
+    const i = pad(ind);
+    const J = JSON.stringify;
+    if (hasSub) {
+      const idx = `Number(await sh.arithStr(${J(m[3] ?? "")}))`;
+      if (append) {
+        return `${i}{ const __i = ${idx}; sh.setElem(${J(name)}, __i, (sh.arrayGet(${J(name)}, __i) ?? "") + ${rhs}); }`;
+      }
+      return `${i}sh.setElem(${J(name)}, ${idx}, ${rhs});`;
+    }
+    if (append) return `${i}sh.env.${name} = String(sh.env.${name}) + ${rhs};`;
+    return `${i}sh.env.${name} = ${rhs};`;
   }
 
   private simpleCore(words: Word[], ind: number): string {
     const i = pad(ind);
-    const assigns: Array<[string, string]> = [];
+    const assignWords: string[] = [];
     let k = 0;
     for (; k < words.length; k++) {
-      const m = /^([A-Za-z_][A-Za-z0-9_]*)=/.exec(words[k]!.text);
-      if (!m) break;
-      assigns.push([m[1]!, this.assignRHS(words[k]!.text.slice(m[0].length))]);
+      if (ASSIGN.test(words[k]!.text)) assignWords.push(words[k]!.text);
+      else break;
     }
     const rest = words.slice(k);
 
     if (rest.length === 0) {
-      return assigns.map(([n, e]) => `${i}sh.env.${n} = ${e};`).join("\n");
+      return assignWords.map((w) => this.assignStmt(w, ind)).join("\n");
     }
 
     const texts: string[] = [];
@@ -260,9 +300,14 @@ class Emitter {
       callInner = `sh.exec(${[nameFrag, ...argFrags].join(", ")})`;
     }
 
-    if (assigns.length === 0) return `${i}await ${callInner};`;
-    const obj = "{ " + assigns.map(([n, e]) => `${JSON.stringify(n)}: ${e}`).join(", ") + " }";
-    return `${i}await sh.withEnv(${obj}, () => ${callInner});`;
+    if (assignWords.length === 0) return `${i}await ${callInner};`;
+    // Prefix env from plain name=value assignments.
+    const env = assignWords
+      .map((w) => ASSIGN.exec(w)!)
+      .filter((m) => m[2] === undefined && m[4] === undefined)
+      .map((m) => `${JSON.stringify(m[1])}: ${this.templateOf(parseWord(m[5]!).parts)}`)
+      .join(", ");
+    return `${i}await sh.withEnv({ ${env} }, () => ${callInner});`;
   }
 
   private functionDef(cmd: FunctionDef, ind: number): string {
@@ -364,6 +409,12 @@ class Emitter {
         return `${i}await sh.arithCommand(${JSON.stringify(cmd.expression)});`;
       case "cond":
         return `${i}sh.status = ${this.cond(cmd.expr)} ? 0 : 1;`;
+      case "array_assign": {
+        const frags: string[] = [];
+        for (const w of cmd.elems) for (const t of braceExpand(w.text)) frags.push(this.word(t).code);
+        const fn = cmd.append ? "appendArrayFields" : "setArrayFields";
+        return `${i}sh.${fn}(${JSON.stringify(cmd.name)}, [${frags.join(", ")}]);`;
+      }
       case "case": {
         const id = this.caseId++;
         const subj = this.templateOf(parseWord(cmd.word.text).parts);

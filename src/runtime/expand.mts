@@ -60,8 +60,28 @@ const specialValue = (shell: Shell, name: string): string => {
 };
 
 const evalParam = async (shell: Shell, prm: Param): Promise<string> => {
-  const rawVal = prm.special ? specialValue(shell, prm.name) : shell.getVar(prm.name);
-  const isSet = prm.special ? true : rawVal !== undefined;
+  // ${!name[@]} / ${!name[*]} — array indices.
+  if (prm.indices) return shell.arrayIndices(prm.name).join(" ");
+
+  // Resolve the referenced value (scalar, array element, or all elements).
+  let rawVal: string | undefined;
+  let isSet: boolean;
+  if (prm.special) {
+    rawVal = specialValue(shell, prm.name);
+    isSet = true;
+  } else if (prm.sub === "@" || prm.sub === "*") {
+    const vals = shell.arrayValues(prm.name);
+    if (prm.length) return String(vals.length); // ${#arr[@]}
+    rawVal = vals.join(" ");
+    isSet = vals.length > 0;
+  } else if (prm.sub !== "") {
+    const idx = Number(evalArith(shell, await expandNoSplit(shell, prm.sub)));
+    rawVal = shell.arrayGet(prm.name, idx);
+    isSet = rawVal !== undefined;
+  } else {
+    rawVal = shell.getVar(prm.name);
+    isSet = rawVal !== undefined;
+  }
   const val = rawVal ?? "";
   const arg = (): Promise<string> => expandNoSplit(shell, prm.arg);
   const arg2 = (): Promise<string> => expandNoSplit(shell, prm.arg2);
@@ -70,7 +90,7 @@ const evalParam = async (shell: Shell, prm: Param): Promise<string> => {
   if (prm.op === "" && shell.opts.nounset) {
     const unbound = prm.special
       ? /^[0-9]+$/.test(prm.name) && Number(prm.name) > shell.positional.length
-      : rawVal === undefined;
+      : !isSet;
     if (unbound) {
       shell.io.err(`${shell.name}: ${prm.name}: unbound variable\n`);
       throw new ExitSignal(1);
@@ -131,11 +151,13 @@ const partValue = async (shell: Shell, p: Exclude<WordPart, { k: "lit" }>): Prom
 export const expandWord = async (shell: Shell, word: Word): Promise<string[]> => {
   const pw = parseWord(word.text);
 
-  // "$@" / $@ : each positional parameter becomes its own field.
+  // "$@" / $@ and "${arr[@]}" / ${arr[@]}: each element becomes its own field.
   if (pw.parts.length === 1) {
     const only = pw.parts[0]!;
-    if (only.k === "param" && only.p.special && only.p.name === "@" && only.p.op === "" && !only.p.length) {
-      return [...shell.positional];
+    if (only.k === "param" && only.p.op === "" && !only.p.length) {
+      const p = only.p;
+      if (p.special && p.name === "@") return [...shell.positional];
+      if (p.sub === "@") return p.indices ? shell.arrayIndices(p.name).map(String) : shell.arrayValues(p.name);
     }
   }
 
