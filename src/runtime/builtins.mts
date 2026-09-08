@@ -24,6 +24,8 @@ const unescape = (s: string): { text: string; stop: boolean } => {
     }
     const e = s[i + 1]!;
     i += 2;
+    const isHex = (ch: string | undefined): boolean =>
+      ch !== undefined && /[0-9a-fA-F]/.test(ch);
     switch (e) {
       case "n": out += "\n"; break;
       case "t": out += "\t"; break;
@@ -41,7 +43,26 @@ const unescape = (s: string): { text: string; stop: boolean } => {
           oct += s[i];
           i++;
         }
-        out += String.fromCharCode(oct === "" ? 0 : parseInt(oct, 8));
+        out += String.fromCharCode(oct === "" ? 0 : parseInt(oct, 8) & 0xff);
+        break;
+      }
+      case "x": {
+        // \xHH: one or two hex digits -> a byte. Empty stays literal.
+        let hex = "";
+        while (hex.length < 2 && isHex(s[i])) { hex += s[i]; i++; }
+        if (hex === "") { out += "\\x"; break; }
+        out += String.fromCharCode(parseInt(hex, 16) & 0xff);
+        break;
+      }
+      case "u":
+      case "U": {
+        // \uHHHH (<=4) / \UHHHHHHHH (<=8): a Unicode code point. Empty stays literal.
+        const max = e === "u" ? 4 : 8;
+        let hex = "";
+        while (hex.length < max && isHex(s[i])) { hex += s[i]; i++; }
+        if (hex === "") { out += "\\" + e; break; }
+        const cp = parseInt(hex, 16);
+        out += cp <= 0x10ffff ? String.fromCodePoint(cp) : "�";
         break;
       }
       default:

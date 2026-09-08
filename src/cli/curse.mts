@@ -38,7 +38,8 @@ const die = (msg: string): never => {
 const readSource = (file: string | undefined): string => {
   if (file === undefined) die("missing file argument");
   try {
-    return readFileSync(file as string, "utf8");
+    // "-" means standard input (fd 0), matching the usual CLI convention.
+    return readFileSync(file === "-" ? 0 : (file as string), "utf8");
   } catch {
     return die(`${file}: cannot read file`);
   }
