@@ -854,7 +854,7 @@ export class Shell {
     const out: string[] = [];
     for (const f of fields) {
       if (hasGlobMeta(f)) {
-        const m = globExpand(this.cwd, f, this.shopts.dotglob);
+        const m = globExpand(this.cwd, f, this.shopts.dotglob, this.shopts.globstar);
         if (m.length > 0) out.push(...m);
         else if (this.shopts.nullglob) continue; // drop patterns that match nothing
         else out.push(f);
