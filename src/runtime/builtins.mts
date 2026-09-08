@@ -521,13 +521,12 @@ const exportBuiltin: Builtin = (shell, ...args) => {
     return 0;
   }
   for (const a of nonFlag) {
-    const eq = a.indexOf("=");
-    if (eq >= 0) {
-      shell.setVar(a.slice(0, eq), a.slice(eq + 1));
-      shell.exportVar(a.slice(0, eq));
-    } else {
-      shell.exportVar(a);
+    const { name, value, append } = splitNameVal(a);
+    if (value !== undefined) {
+      if (append) shell.appendVar(name, value);
+      else shell.setVar(name, value);
     }
+    shell.exportVar(name);
   }
   return 0;
 };
@@ -535,15 +534,17 @@ const exportBuiltin: Builtin = (shell, ...args) => {
 const local: Builtin = (shell, ...args) => {
   const { flags, names } = parseDeclFlags(args);
   for (const n of names) {
-    const eq = n.indexOf("=");
-    const name = eq >= 0 ? n.slice(0, eq) : n;
+    const { name, value, append } = splitNameVal(n);
+    // `local s+=x` appends to an existing local in this scope, but a first-time
+    // `local` starts empty (it does not inherit an enclosing value).
+    const inherited = append && shell.isLocalOwn(name) ? shell.getVar(name) ?? "" : "";
     shell.local(name);
     if (flags.nameref) {
-      shell.setRef(name, eq >= 0 ? n.slice(eq + 1) : "");
+      shell.setRef(name, value ?? "");
       continue;
     }
     shell.setAttrs(name, flags);
-    if (eq >= 0) shell.setVar(name, n.slice(eq + 1));
+    if (value !== undefined) shell.setVar(name, append ? inherited + value : value);
   }
   return 0;
 };
@@ -714,6 +715,16 @@ interface DeclFlags {
   assoc: boolean;
   nameref: boolean;
 }
+/** Split an assignment-builtin operand `name[+]=value` into its parts. */
+const splitNameVal = (n: string): { name: string; value: string | undefined; append: boolean } => {
+  const eq = n.indexOf("=");
+  if (eq < 0) return { name: n, value: undefined, append: false };
+  let name = n.slice(0, eq);
+  const append = name.endsWith("+");
+  if (append) name = name.slice(0, -1);
+  return { name, value: n.slice(eq + 1), append };
+};
+
 const parseDeclFlags = (args: string[]): { flags: DeclFlags; names: string[] } => {
   const flags: DeclFlags = { readonly: false, exported: false, array: false, assoc: false, nameref: false };
   const names: string[] = [];
@@ -798,21 +809,20 @@ const declareBuiltin: Builtin = (shell, ...args) => {
   const { flags, names } = parseDeclFlags(args);
   const clearRef = dashFlags.some((f) => f[0] === "+" && f.includes("n"));
   for (const n of names) {
-    const eq = n.indexOf("=");
-    const name = eq >= 0 ? n.slice(0, eq) : n;
+    const { name, value, append } = splitNameVal(n);
     if (clearRef) { shell.clearRef(name); continue; }
     if (flags.nameref) {
-      shell.setRef(name, eq >= 0 ? n.slice(eq + 1) : "");
+      shell.setRef(name, value ?? "");
       continue;
     }
     // Establish array/assoc shape before setAttrs, so an empty `declare -a x`
     // stays a 0-element array rather than a "" scalar.
     if (flags.assoc) shell.declareAssoc(name);
-    else if (eq < 0 && flags.array && shell.arrayLen(name) === 0) shell.setArray(name, []);
+    else if (value === undefined && flags.array && shell.arrayLen(name) === 0) shell.setArray(name, []);
     // Apply -i/-l/-u before the value (so it's coerced), but readonly after
     // (so this very assignment isn't rejected).
     shell.setAttrs(name, { ...flags, readonly: false });
-    if (eq >= 0) shell.setVar(name, n.slice(eq + 1));
+    if (value !== undefined) { if (append) shell.appendVar(name, value); else shell.setVar(name, value); }
     if (flags.readonly) shell.setAttrs(name, { readonly: true });
     if (flags.exported) shell.exportVar(name);
   }
@@ -827,9 +837,11 @@ const readonlyBuiltin: Builtin = (shell, ...args) => {
     return 0;
   }
   for (const a of nonFlag) {
-    const eq = a.indexOf("=");
-    const name = eq >= 0 ? a.slice(0, eq) : a;
-    if (eq >= 0) shell.setVar(name, a.slice(eq + 1));
+    const { name, value, append } = splitNameVal(a);
+    if (value !== undefined) {
+      if (append) shell.appendVar(name, value);
+      else shell.setVar(name, value);
+    }
     shell.setAttrs(name, { readonly: true });
   }
   return 0;

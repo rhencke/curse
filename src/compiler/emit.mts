@@ -491,6 +491,11 @@ class Emitter {
       callInner = `(sh.markSubs(), sh.exec(${[nameFrag, ...argFrags].join(", ")}))`;
     }
 
+    // `declare d=(…)` with no other operands is just the array assignment;
+    // don't call the builtin (its bare no-arg form would list everything).
+    if (cmd.arrayArgs !== undefined && cmd.arrayArgs.length > 0 && texts.length === 1) {
+      return arrayStmts + `${i}sh.status = 0;`;
+    }
     if (assignWords.length === 0) return arrayStmts + `${i}await ${callInner};`;
     // Prefix env from plain name=value assignments.
     const env = assignWords

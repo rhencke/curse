@@ -694,6 +694,12 @@ export class Shell {
     if (value === undefined) v.unset = true; // `local x` declares but doesn't set
     this.scope[name] = v;
   }
+  /** True if `name` is already a local in the current (innermost) scope — used
+   *  by `local x+=v`, which appends to an existing local but starts fresh
+   *  (ignoring any enclosing value) on the first `local` declaration. */
+  isLocalOwn(name: string): boolean {
+    return Object.prototype.hasOwnProperty.call(this.scope, name);
+  }
   /** `name+=v`: numeric add for integer vars, else string append. */
   appendVar(name: string, rhs: string): void {
     const v = this.lookup(name);
@@ -1745,6 +1751,12 @@ export class Shell {
       return this.status;
     }
     if (cmd.arrayArgs !== undefined) await this.applyArrayArgs(cmd.arrayArgs, argv);
+    // `declare d=(…)` / `local a=(…)` with no other operands is just the array
+    // assignment; don't fall through to the builtin's bare (no-arg) listing.
+    if (cmd.arrayArgs !== undefined && cmd.arrayArgs.length > 0 && argv.length === 1) {
+      this.status = 0;
+      return 0;
+    }
     if (this.opts.xtrace) this.io.err("+ " + argv.join(" ") + "\n");
     if (assignWords.length > 0) {
       const env: Record<string, string> = {};
