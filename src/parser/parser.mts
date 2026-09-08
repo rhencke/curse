@@ -15,6 +15,7 @@ import type { CasePattern, Command, Word } from "../ast/nodes.mts";
 import { CMD_INVERT_RETURN, connection, makeWord, simple } from "../ast/nodes.mts";
 import { tokenize } from "./lexer.mts";
 import type { Token } from "./lexer.mts";
+import { parseCond } from "./cond.mts";
 
 export class ParseError extends Error {}
 
@@ -146,6 +147,10 @@ class Parser {
     if (t.type === "ARITH") {
       this.advance();
       return { type: "arith", expression: t.value };
+    }
+    if (t.type === "COND") {
+      this.advance();
+      return { type: "cond", expr: parseCond(t.value) };
     }
     if (t.type === "OP" && t.value === "(") return this.parseSubshell();
 

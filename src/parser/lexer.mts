@@ -7,7 +7,7 @@
  * them do not terminate the word.
  */
 
-export type TokenType = "WORD" | "OP" | "NEWLINE" | "ARITH" | "EOF";
+export type TokenType = "WORD" | "OP" | "NEWLINE" | "ARITH" | "COND" | "EOF";
 
 export interface Token {
   type: TokenType;
@@ -122,8 +122,51 @@ class Lexer {
       return { type: "OP", value: ")", pos, line };
     }
 
+    // `[[ ... ]]` conditional (only when `[[` is followed by whitespace/EOL).
+    if (c === "[" && this.at(1) === "[") {
+      const after = this.at(2);
+      if (after === undefined || after === " " || after === "\t" || after === "\n") {
+        return { type: "COND", value: this.scanCond(), pos, line };
+      }
+    }
+
     // Otherwise, a word.
     return { type: "WORD", value: this.readWord(), pos, line };
+  }
+
+  /** Scan a `[[ ... ]]` body raw, returning the inner text. The closing `]]`
+   *  must be whitespace-delimited (as in valid scripts) and outside quotes. */
+  private scanCond(): string {
+    this.i += 2; // past "[["
+    let buf = "";
+    let quote: string | null = null;
+    for (;;) {
+      const c = this.at();
+      if (c === undefined) throw new LexError("unterminated `[[`");
+      if (quote !== null) {
+        buf += c;
+        this.i++;
+        if (c === quote) quote = null;
+        else if (c === "\n") this.line++;
+        continue;
+      }
+      if (c === "'" || c === '"') {
+        quote = c;
+        buf += c;
+        this.i++;
+        continue;
+      }
+      if (c === "]" && this.at(1) === "]") {
+        const prev = buf.length > 0 ? buf[buf.length - 1]! : " ";
+        if (prev === " " || prev === "\t" || prev === "\n") {
+          this.i += 2;
+          return buf;
+        }
+      }
+      if (c === "\n") this.line++;
+      buf += c;
+      this.i++;
+    }
   }
 
   private readWord(): string {

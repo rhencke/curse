@@ -5,7 +5,10 @@
 
 const escapeRe = (c: string): string => (/[.*+?^${}()|[\]\\]/.test(c) ? "\\" + c : c);
 
-const globToRegExp = (pat: string): RegExp => {
+/** Translate a glob pattern to an anchored regular-expression source string.
+ *  The AOT emitter inlines this at transpile time as a `/.../s` literal for
+ *  static patterns; the runtime uses it for dynamic ones. */
+export const globToRegExpSource = (pat: string): string => {
   let re = "^";
   let i = 0;
   while (i < pat.length) {
@@ -66,8 +69,8 @@ const globToRegExp = (pat: string): RegExp => {
     re += escapeRe(c);
     i++;
   }
-  return new RegExp(re + "$", "s");
+  return re + "$";
 };
 
 export const globMatch = (str: string, pattern: string): boolean =>
-  globToRegExp(pattern).test(str);
+  new RegExp(globToRegExpSource(pattern), "s").test(str);

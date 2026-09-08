@@ -59,6 +59,7 @@ export type Command =
   | ArithForCommand
   | ArithCommand
   | CaseCommand
+  | CondCommand
   | FunctionDef;
 
 /** Connectors between commands. M0 implements ";", "&&", "||". */
@@ -141,6 +142,20 @@ export interface CaseCommand extends CommandBase {
   type: "case";
   word: Word;
   clauses: CasePattern[];
+}
+
+/** A `[[ ... ]]` conditional expression tree (cf. COND_COM in command.h). */
+export type CondExpr =
+  | { k: "and"; l: CondExpr; r: CondExpr }
+  | { k: "or"; l: CondExpr; r: CondExpr }
+  | { k: "not"; e: CondExpr }
+  | { k: "unary"; op: string; arg: Word }
+  | { k: "binary"; op: string; l: Word; r: Word }
+  | { k: "word"; w: Word };
+
+export interface CondCommand extends CommandBase {
+  type: "cond";
+  expr: CondExpr;
 }
 
 export interface FunctionDef extends CommandBase {

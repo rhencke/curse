@@ -13,7 +13,8 @@
  * path) both drive this same surface, so their behaviour matches. */
 
 import type {
-  ArithForCommand, CaseCommand, Command, ForCommand, FunctionDef, IfCommand, WhileCommand, Word,
+  ArithForCommand, CaseCommand, Command, CondCommand, CondExpr, ForCommand,
+  FunctionDef, IfCommand, WhileCommand, Word,
 } from "../ast/nodes.mts";
 import { CMD_INVERT_RETURN } from "../ast/nodes.mts";
 import { parse } from "../parser/parser.mts";
@@ -24,6 +25,8 @@ import { builtins } from "./builtins.mts";
 import { ReturnSignal, Var } from "./types.mts";
 import type { IO } from "./types.mts";
 import { spawn } from "node:child_process";
+import { accessSync, constants, lstatSync, statSync } from "node:fs";
+import { resolve } from "node:path";
 
 export type { IO } from "./types.mts";
 export { ReturnSignal, Var } from "./types.mts";
@@ -372,9 +375,102 @@ export class Shell {
     return sub;
   }
 
-  /** Pattern match (used by generated `case`). */
+  /** Pattern match (used by generated `case` / `[[ == ]]` with dynamic patterns). */
   match(subject: string, pattern: string): boolean {
     return globMatch(subject, pattern);
+  }
+
+  /** `[[ ]]` unary test (used by generated code and the interpreter). */
+  condUnary(op: string, arg: string): boolean {
+    if (op === "-z") return arg.length === 0;
+    if (op === "-n") return arg.length > 0;
+    if (op === "-v") return this.lookup(arg) !== undefined;
+    if (op === "-o") return false; // shopt option — unsupported
+    const p = resolve(this.cwd, arg);
+    let st: ReturnType<typeof statSync> | null = null;
+    try {
+      st = statSync(p);
+    } catch {
+      st = null;
+    }
+    const access = (m: number): boolean => {
+      try {
+        accessSync(p, m);
+        return true;
+      } catch {
+        return false;
+      }
+    };
+    switch (op) {
+      case "-e": case "-a": return st !== null;
+      case "-f": return st?.isFile() ?? false;
+      case "-d": return st?.isDirectory() ?? false;
+      case "-s": return (st?.size ?? 0) > 0;
+      case "-r": return access(constants.R_OK);
+      case "-w": return access(constants.W_OK);
+      case "-x": return access(constants.X_OK);
+      case "-b": return st?.isBlockDevice() ?? false;
+      case "-c": return st?.isCharacterDevice() ?? false;
+      case "-p": return st?.isFIFO() ?? false;
+      case "-S": return st?.isSocket() ?? false;
+      case "-h": case "-L":
+        try {
+          return lstatSync(p).isSymbolicLink();
+        } catch {
+          return false;
+        }
+      default:
+        return false;
+    }
+  }
+
+  /** `[[ ]]` binary test (used by generated code and the interpreter). */
+  condBinary(l: string, op: string, r: string): boolean {
+    const intOf = (s: string): bigint => {
+      try {
+        return evalArith(this, s);
+      } catch {
+        return 0n;
+      }
+    };
+    const mtime = (s: string): number => {
+      try {
+        return statSync(resolve(this.cwd, s)).mtimeMs;
+      } catch {
+        return -Infinity;
+      }
+    };
+    switch (op) {
+      case "==": case "=": return globMatch(l, r);
+      case "!=": return !globMatch(l, r);
+      case "=~":
+        try {
+          return new RegExp(r).test(l);
+        } catch {
+          return false;
+        }
+      case "<": return l < r;
+      case ">": return l > r;
+      case "-eq": return intOf(l) === intOf(r);
+      case "-ne": return intOf(l) !== intOf(r);
+      case "-lt": return intOf(l) < intOf(r);
+      case "-le": return intOf(l) <= intOf(r);
+      case "-gt": return intOf(l) > intOf(r);
+      case "-ge": return intOf(l) >= intOf(r);
+      case "-nt": return mtime(l) > mtime(r);
+      case "-ot": return mtime(l) < mtime(r);
+      case "-ef": {
+        try {
+          const a = statSync(resolve(this.cwd, l));
+          const b = statSync(resolve(this.cwd, r));
+          return a.dev === b.dev && a.ino === b.ino;
+        } catch {
+          return false;
+        }
+      }
+      default:
+        return false;
+    }
   }
 
   /** Apply `!` inversion in generated code. */
@@ -449,6 +545,10 @@ export class Shell {
         break;
       case "case":
         status = await this.execCase(cmd);
+        break;
+      case "cond":
+        this.status = (await this.evalCond(cmd.expr)) ? 0 : 1;
+        status = this.status;
         break;
       default: {
         const unhandled: never = cmd;
@@ -540,6 +640,22 @@ export class Shell {
     }
     this.status = last;
     return last;
+  }
+
+  private async evalCond(e: CondExpr): Promise<boolean> {
+    switch (e.k) {
+      case "and": return (await this.evalCond(e.l)) && (await this.evalCond(e.r));
+      case "or": return (await this.evalCond(e.l)) || (await this.evalCond(e.r));
+      case "not": return !(await this.evalCond(e.e));
+      case "word": return (await expandNoSplit(this, e.w.text)) !== "";
+      case "unary": return this.condUnary(e.op, await expandNoSplit(this, e.arg.text));
+      case "binary":
+        return this.condBinary(
+          await expandNoSplit(this, e.l.text),
+          e.op,
+          await expandNoSplit(this, e.r.text),
+        );
+    }
   }
 
   private async execCase(cmd: CaseCommand): Promise<number> {

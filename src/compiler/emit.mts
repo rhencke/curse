@@ -11,11 +11,12 @@
  * Word structure comes from the shared parser (parser/word.mts), so the
  * compiled output and the interpreter agree. */
 
-import type { Command, FunctionDef, Word } from "../ast/nodes.mts";
+import type { Command, CondExpr, FunctionDef, Word } from "../ast/nodes.mts";
 import { CMD_INVERT_RETURN } from "../ast/nodes.mts";
 import { parse } from "../parser/parser.mts";
 import { parseWord } from "../parser/word.mts";
 import type { WordPart } from "../parser/word.mts";
+import { globToRegExpSource } from "../runtime/glob.mts";
 
 export interface EmitOptions {
   /** Import specifier (path or file: URL) for the runtime's `Shell`. */
@@ -96,6 +97,37 @@ class Emitter {
   }
 
   /* ---------------- commands ---------------- */
+
+  /** A boolean test of `subjectExpr` against a glob pattern word. Static
+   *  patterns compile to an inline regex literal; dynamic ones fall back to
+   *  the runtime matcher. */
+  private matchExpr(subjectExpr: string, patText: string): string {
+    const pw = parseWord(patText);
+    if (pw.parts.every((p) => p.k === "lit")) {
+      const lit = pw.parts.map((p) => (p.k === "lit" ? p.s : "")).join("");
+      const src = globToRegExpSource(lit).replace(/\//g, "\\/");
+      return `/${src}/s.test(${subjectExpr})`;
+    }
+    return `sh.match(${subjectExpr}, ${this.templateOf(pw.parts)})`;
+  }
+
+  private cond(e: CondExpr): string {
+    switch (e.k) {
+      case "and": return `(${this.cond(e.l)} && ${this.cond(e.r)})`;
+      case "or": return `(${this.cond(e.l)} || ${this.cond(e.r)})`;
+      case "not": return `(!${this.cond(e.e)})`;
+      case "word": return `(${this.templateOf(parseWord(e.w.text).parts)} !== "")`;
+      case "unary":
+        return `sh.condUnary(${JSON.stringify(e.op)}, ${this.templateOf(parseWord(e.arg.text).parts)})`;
+      case "binary": {
+        const l = this.templateOf(parseWord(e.l.text).parts);
+        if (e.op === "==" || e.op === "=") return this.matchExpr(l, e.r.text);
+        if (e.op === "!=") return `(!${this.matchExpr(l, e.r.text)})`;
+        const r = this.templateOf(parseWord(e.r.text).parts);
+        return `sh.condBinary(${l}, ${JSON.stringify(e.op)}, ${r})`;
+      }
+    }
+  }
 
   command(cmd: Command, ind: number): string {
     const base = this.base(cmd, ind);
@@ -226,13 +258,15 @@ class Emitter {
         );
       case "arith":
         return `${i}await sh.arithCommand(${JSON.stringify(cmd.expression)});`;
+      case "cond":
+        return `${i}sh.status = ${this.cond(cmd.expr)} ? 0 : 1;`;
       case "case": {
         const id = this.caseId++;
         const subj = this.templateOf(parseWord(cmd.word.text).parts);
         let chain = "";
         cmd.clauses.forEach((clause, ci) => {
           const cond = clause.patterns
-            .map((p) => `sh.match(__case${id}, ${this.templateOf(parseWord(p.text).parts)})`)
+            .map((p) => this.matchExpr(`__case${id}`, p.text))
             .join(" || ");
           const body = clause.body
             ? this.command(clause.body, ind + 2)
