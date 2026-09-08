@@ -1279,9 +1279,11 @@ export class Shell {
   private condPat(raw: string): Promise<string> {
     return this.condWalk(raw, (s) => s.replace(/[^A-Za-z0-9]/g, "\\$&"));
   }
-  /** Quote-aware glob match for `==`/`!=` and case, honouring nocasematch/extglob. */
-  async matchGlob(subject: string, rawPat: string): Promise<boolean> {
-    return globMatch(subject, await this.condPat(rawPat), this.shopts.nocasematch, this.shopts.extglob);
+  /** Quote-aware glob match for `==`/`!=` and case, honouring nocasematch.
+   *  `[[ ]]` always recognises extended patterns; `case`/globbing need the
+   *  extglob option, so callers pass the flag they want. */
+  async matchGlob(subject: string, rawPat: string, extglob = this.shopts.extglob): Promise<boolean> {
+    return globMatch(subject, await this.condPat(rawPat), this.shopts.nocasematch, extglob);
   }
 
   /** `$-` — the current single-letter option flags (bash order: e h u x B;
@@ -1738,8 +1740,8 @@ export class Shell {
         const l = await expandNoSplit(this, e.l.text);
         // `=~`/`==`/`!=` keep the RHS unexpanded so its quoting stays literal.
         if (e.op === "=~") return this.condMatch(l, e.r.text);
-        if (e.op === "==" || e.op === "=") return this.matchGlob(l, e.r.text);
-        if (e.op === "!=") return !(await this.matchGlob(l, e.r.text));
+        if (e.op === "==" || e.op === "=") return this.matchGlob(l, e.r.text, true);
+        if (e.op === "!=") return !(await this.matchGlob(l, e.r.text, true));
         return this.condBinary(l, e.op, await expandNoSplit(this, e.r.text));
       }
     }

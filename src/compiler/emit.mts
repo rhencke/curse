@@ -332,17 +332,20 @@ class Emitter {
    *  pattern (no expansions) compiles to an inline regex — quote-aware, so a
    *  quoted `*` matches literally — with a runtime fallback for nocasematch;
    *  extglob and dynamic patterns defer to sh.matchGlob (quote-aware). */
-  private matchExpr(subjectExpr: string, patText: string): string {
+  private matchExpr(subjectExpr: string, patText: string, forceExtglob = false): string {
     const pw = parseWord(patText);
     const dynamic = pw.parts.some((p) => p.k !== "lit");
+    const egArg = forceExtglob ? ", true" : "";
     if (!dynamic) {
       const pat = staticGlobPattern(patText);
-      if (!hasExtglob(pat)) {
-        const src = globToRegExpSource(pat).replace(/\//g, "\\/");
-        return `(sh.shopts.nocasematch ? await sh.matchGlob(${subjectExpr}, ${JSON.stringify(patText)}) : /${src}/s.test(${subjectExpr}))`;
+      // `[[ ]]` always recognises extended patterns, so a static extglob pattern
+      // can be inlined there; under `case` it depends on the runtime option.
+      if (forceExtglob || !hasExtglob(pat)) {
+        const src = globToRegExpSource(pat, forceExtglob).replace(/\//g, "\\/");
+        return `(sh.shopts.nocasematch ? await sh.matchGlob(${subjectExpr}, ${JSON.stringify(patText)}${egArg}) : /${src}/s.test(${subjectExpr}))`;
       }
     }
-    return `await sh.matchGlob(${subjectExpr}, ${JSON.stringify(patText)})`;
+    return `await sh.matchGlob(${subjectExpr}, ${JSON.stringify(patText)}${egArg})`;
   }
 
   private cond(e: CondExpr): string {
@@ -355,8 +358,8 @@ class Emitter {
         return `sh.condUnary(${JSON.stringify(e.op)}, ${this.templateOf(parseWord(e.arg.text).parts)})`;
       case "binary": {
         const l = this.templateOf(parseWord(e.l.text).parts);
-        if (e.op === "==" || e.op === "=") return this.matchExpr(l, e.r.text);
-        if (e.op === "!=") return `(!${this.matchExpr(l, e.r.text)})`;
+        if (e.op === "==" || e.op === "=") return this.matchExpr(l, e.r.text, true);
+        if (e.op === "!=") return `(!${this.matchExpr(l, e.r.text, true)})`;
         // `=~` keeps its RHS raw so condMatch applies regex-literal quoting and
         // sets BASH_REMATCH.
         if (e.op === "=~") return `(await sh.condMatch(${l}, ${JSON.stringify(e.r.text)}))`;

@@ -8,6 +8,24 @@ import { join } from "node:path";
 
 const escapeRe = (c: string): string => (/[.*+?^${}()|[\]\\]/.test(c) ? "\\" + c : c);
 
+/** POSIX character classes -> equivalent regex char-class body. Ranges use hex
+ *  escapes so the class-special chars `[ \ ] ^` need no further quoting. */
+const posixClass: Record<string, string> = {
+  alpha: "a-zA-Z",
+  alnum: "a-zA-Z0-9",
+  digit: "0-9",
+  xdigit: "0-9A-Fa-f",
+  upper: "A-Z",
+  lower: "a-z",
+  space: " \\t\\n\\r\\f\\v",
+  blank: " \\t",
+  cntrl: "\\x00-\\x1f\\x7f",
+  print: "\\x20-\\x7e",
+  graph: "\\x21-\\x7e",
+  punct: "!-/:-@\\x5b-\\x60{-~",
+  word: "0-9A-Za-z_",
+};
+
 /** Translate `pat[start..]` into a regex body. When `inGroup`, stop (without
  *  consuming) at a top-level `|` or `)`. Returns [regex, nextIndex]. */
 const translate = (pat: string, start: number, extglob: boolean, inGroup: boolean): [string, number] => {
@@ -38,6 +56,18 @@ const translate = (pat: string, start: number, extglob: boolean, inGroup: boolea
       if (pat[j] === "]") { cls += "\\]"; j++; }
       while (j < pat.length && pat[j] !== "]") {
         const ch = pat[j]!;
+        // POSIX class/collating/equivalence: [:name:] [.coll.] [=eq=]
+        if (ch === "[" && (pat[j + 1] === ":" || pat[j + 1] === "." || pat[j + 1] === "=")) {
+          const kind = pat[j + 1]!;
+          const close = pat.indexOf(kind + "]", j + 2);
+          if (close >= 0) {
+            const name = pat.slice(j + 2, close);
+            if (kind === ":") cls += posixClass[name] ?? "";
+            else cls += name.split("").map(escapeRe).join(""); // [.x.]/[=x=] -> the char(s)
+            j = close + 2;
+            continue;
+          }
+        }
         if (ch === "\\") { cls += "\\" + (pat[j + 1] ?? ""); j += 2; continue; }
         cls += ch === "^" || ch === "]" ? "\\" + ch : ch;
         j++;
