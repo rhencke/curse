@@ -1411,8 +1411,9 @@ export class Shell {
    *  shared choke points (callByName, pipeline) so both the interpreter and the
    *  AOT-generated code honor it. */
   /** After a command completes at the top level (not in a condition / `&&` /
-   *  `||` / `!`): a non-zero status fires the ERR trap, then errexit exits. */
-  private async afterCommand(): Promise<void> {
+   *  `||` / `!`): a non-zero status fires the ERR trap, then errexit exits.
+   *  Also called from generated code for subshell/arith/cond commands. */
+  async afterCommand(): Promise<void> {
     if (this.status === 0 || this.condDepth !== 0) return;
     const h = this.traps["ERR"];
     if (h !== undefined && h !== "" && !this.inErrTrap) {
@@ -1462,6 +1463,7 @@ export class Shell {
         const body = cmd.body;
         status = await runBody(this.cloneForSubshell(), (sh) => sh.execute(body));
         this.status = status;
+        await this.afterCommand();
         break;
       }
       case "if":
@@ -1481,6 +1483,7 @@ export class Shell {
         break;
       case "arith":
         status = await this.arithCommand(cmd.expression);
+        await this.afterCommand();
         break;
       case "case":
         status = await this.execCase(cmd);
@@ -1488,6 +1491,7 @@ export class Shell {
       case "cond":
         this.status = (await this.evalCond(cmd.expr)) ? 0 : 1;
         status = this.status;
+        await this.afterCommand();
         break;
       case "array_assign": {
         const fields = await expandWords(this, cmd.elems);

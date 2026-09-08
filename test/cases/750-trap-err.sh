@@ -20,6 +20,14 @@ echo "after and-final"
 # fires again in a ; list, and $? reflects the failing command
 false; echo "list continues"
 
+# a failing subshell and a false (( )) / [[ ]] fire ERR too
+(exit 7)
+echo "after subshell"
+(( 0 ))
+echo "after arith"
+[[ 1 == 2 ]]
+echo "after dbracket"
+
 # clearing ERR stops it
 trap - ERR
 false

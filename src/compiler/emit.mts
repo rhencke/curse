@@ -545,7 +545,8 @@ class Emitter {
         return (
           `${i}await sh.runSubshell(async (sh) => {\n` +
           this.command(cmd.body, ind + 1) + "\n" +
-          `${i}});`
+          `${i}});` +
+          (this.guards ? `\n${i}await sh.afterCommand();` : "")
         );
       case "if": {
         let out =
@@ -602,10 +603,14 @@ class Emitter {
           `${i}}`,
           ind,
         );
-      case "arith":
-        return `${i}await sh.arithCommand(${JSON.stringify(cmd.expression)});`;
-      case "cond":
-        return `${i}sh.status = ${this.cond(cmd.expr)} ? 0 : 1;`;
+      case "arith": {
+        const s = `${i}await sh.arithCommand(${JSON.stringify(cmd.expression)});`;
+        return this.guards ? s + `\n${i}await sh.afterCommand();` : s;
+      }
+      case "cond": {
+        const s = `${i}sh.status = ${this.cond(cmd.expr)} ? 0 : 1;`;
+        return this.guards ? s + `\n${i}await sh.afterCommand();` : s;
+      }
       case "array_assign": {
         const frags: string[] = [];
         for (const w of cmd.elems) for (const t of braceExpand(w.text)) frags.push(this.word(t).code);
