@@ -222,15 +222,18 @@ const shift: Builtin = (shell, ...args) => {
 
 const declareBuiltin: Builtin = (shell, ...args) => {
   let makeArray = false;
+  let makeAssoc = false;
   const names: string[] = [];
   for (const a of args) {
     if (a.startsWith("-") || a.startsWith("+")) {
       if (a.includes("a")) makeArray = true;
+      if (a.includes("A")) makeAssoc = true;
       continue;
     }
     names.push(a);
   }
   for (const n of names) {
+    if (makeAssoc) shell.declareAssoc(n.includes("=") ? n.slice(0, n.indexOf("=")) : n);
     const eq = n.indexOf("=");
     if (eq >= 0) shell.setVar(n.slice(0, eq), n.slice(eq + 1));
     else if (makeArray && shell.arrayLen(n) === 0) shell.setArray(n, []);

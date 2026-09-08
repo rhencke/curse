@@ -11,13 +11,16 @@ export interface IO {
 export class Var {
   value: string;
   exported: boolean;
-  /** Indexed-array elements (sparse), or null for a plain scalar. */
+  /** Indexed-array elements (sparse), or null. */
   arr: Map<number, string> | null = null;
+  /** Associative-array elements (declare -A), or null. */
+  assoc: Map<string, string> | null = null;
   constructor(value: string, exported = false) {
     this.value = value;
     this.exported = exported;
   }
   scalar(): string {
+    if (this.assoc !== null) return this.assoc.get("0") ?? "";
     return this.arr !== null ? this.arr.get(0) ?? "" : this.value;
   }
   toString(): string {

@@ -94,7 +94,7 @@ class Emitter {
     if (prm.special) return this.specialExpr(prm.name);
     if (prm.sub === "@" || prm.sub === "*") return `sh.arrayValues(${J(prm.name)}).join(" ")`;
     if (prm.sub !== "") {
-      return `(sh.arrayGet(${J(prm.name)}, Number(await sh.arithStr(${J(prm.sub)}))) ?? "")`;
+      return `((await sh.elemGet(${J(prm.name)}, ${J(prm.sub)})) ?? "")`;
     }
     return `sh.env.${prm.name}`;
   }
@@ -259,11 +259,11 @@ class Emitter {
     const i = pad(ind);
     const J = JSON.stringify;
     if (hasSub) {
-      const idx = `Number(await sh.arithStr(${J(m[3] ?? "")}))`;
+      const sub = J(m[3] ?? "");
       if (append) {
-        return `${i}{ const __i = ${idx}; sh.setElem(${J(name)}, __i, (sh.arrayGet(${J(name)}, __i) ?? "") + ${rhs}); }`;
+        return `${i}await sh.elemSet(${J(name)}, ${sub}, ((await sh.elemGet(${J(name)}, ${sub})) ?? "") + ${rhs});`;
       }
-      return `${i}sh.setElem(${J(name)}, ${idx}, ${rhs});`;
+      return `${i}await sh.elemSet(${J(name)}, ${sub}, ${rhs});`;
     }
     if (append) return `${i}sh.env.${name} = String(sh.env.${name}) + ${rhs};`;
     return `${i}sh.env.${name} = ${rhs};`;

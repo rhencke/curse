@@ -75,8 +75,7 @@ const evalParam = async (shell: Shell, prm: Param): Promise<string> => {
     rawVal = vals.join(" ");
     isSet = vals.length > 0;
   } else if (prm.sub !== "") {
-    const idx = Number(evalArith(shell, await expandNoSplit(shell, prm.sub)));
-    rawVal = shell.arrayGet(prm.name, idx);
+    rawVal = await shell.elemGet(prm.name, prm.sub);
     isSet = rawVal !== undefined;
   } else {
     rawVal = shell.getVar(prm.name);

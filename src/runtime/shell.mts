@@ -166,7 +166,10 @@ export class Shell {
     const s = String(value);
     const owner = this.ownerScope(name);
     if (owner) {
-      owner[name]!.value = s;
+      const v = owner[name]!;
+      if (v.assoc !== null) v.assoc.set("0", s);
+      else if (v.arr !== null) v.arr.set(0, s);
+      else v.value = s;
     } else {
       this.globalScope[name] = new Var(s, process.env[name] !== undefined);
     }
@@ -224,19 +227,44 @@ export class Shell {
   arrayValues(name: string): string[] {
     const v = this.lookup(name);
     if (!v) return [];
+    if (v.assoc !== null) return [...v.assoc.values()];
     if (v.arr === null) return [v.value];
     return [...v.arr.entries()].sort((a, b) => a[0] - b[0]).map((e) => e[1]);
   }
-  arrayIndices(name: string): number[] {
+  arrayIndices(name: string): string[] {
     const v = this.lookup(name);
     if (!v) return [];
-    if (v.arr === null) return [0];
-    return [...v.arr.keys()].sort((a, b) => a - b);
+    if (v.assoc !== null) return [...v.assoc.keys()];
+    if (v.arr === null) return ["0"];
+    return [...v.arr.keys()].sort((a, b) => a - b).map(String);
   }
   arrayLen(name: string): number {
     const v = this.lookup(name);
     if (!v) return 0;
+    if (v.assoc !== null) return v.assoc.size;
     return v.arr === null ? 1 : v.arr.size;
+  }
+
+  /** Mark a variable associative (declare -A). */
+  declareAssoc(name: string): void {
+    const v = this.varForWrite(name);
+    if (v.assoc === null) v.assoc = new Map();
+  }
+  /** Get an array/assoc element by raw subscript (arithmetic index, or string
+   *  key for an associative array). Shared by interpreter and generated code. */
+  async elemGet(name: string, subRaw: string): Promise<string | undefined> {
+    const v = this.lookup(name);
+    if (v && v.assoc !== null) return v.assoc.get(await expandNoSplit(this, subRaw));
+    return this.arrayGet(name, Number(evalArith(this, await expandNoSplit(this, subRaw))));
+  }
+  /** Set an array/assoc element by raw subscript. */
+  async elemSet(name: string, subRaw: string, value: string): Promise<void> {
+    const v = this.varForWrite(name);
+    if (v.assoc !== null) {
+      v.assoc.set(await expandNoSplit(this, subRaw), value);
+      return;
+    }
+    this.setElem(name, Number(evalArith(this, await expandNoSplit(this, subRaw))), value);
   }
 
   private fillArray(arr: Map<number, string>, fields: string[], start: number): void {
@@ -254,13 +282,28 @@ export class Shell {
   }
   setArrayFields(name: string, fields: string[]): void {
     const v = this.varForWrite(name);
+    if (v.assoc !== null) {
+      v.assoc = new Map();
+      this.fillAssoc(v.assoc, fields);
+      return;
+    }
     v.arr = new Map();
     v.value = "";
     this.fillArray(v.arr, fields, 0);
   }
   appendArrayFields(name: string, fields: string[]): void {
     const v = this.varForWrite(name);
+    if (v.assoc !== null) {
+      this.fillAssoc(v.assoc, fields);
+      return;
+    }
     this.fillArray(this.toArray(v), fields, this.maxIndex(v) + 1);
+  }
+  private fillAssoc(assoc: Map<string, string>, fields: string[]): void {
+    for (const f of fields) {
+      const m = /^\[([\s\S]*?)\]=([\s\S]*)$/.exec(f);
+      if (m) assoc.set(m[1]!, m[2]!);
+    }
   }
 
   /** Read a plain `$name` reference, honoring `set -u` (used by generated code). */
@@ -576,7 +619,10 @@ export class Shell {
         if (!seen.has(k)) {
           seen.add(k);
           const v = s[k]!;
-          flat[k] = new Var(v.value, v.exported);
+          const nv = new Var(v.value, v.exported);
+          if (v.arr !== null) nv.arr = new Map(v.arr);
+          if (v.assoc !== null) nv.assoc = new Map(v.assoc);
+          flat[k] = nv;
         }
       }
       s = Object.getPrototypeOf(s) as Scope | null;
@@ -986,8 +1032,9 @@ export class Shell {
     const append = m[4] === "+";
     const value = await expandNoSplit(this, m[5]!);
     if (m[2] !== undefined) {
-      const idx = Number(evalArith(this, await expandNoSplit(this, sub ?? "")));
-      this.setElem(name, idx, append ? (this.arrayGet(name, idx) ?? "") + value : value);
+      const raw = sub ?? "";
+      if (append) await this.elemSet(name, raw, ((await this.elemGet(name, raw)) ?? "") + value);
+      else await this.elemSet(name, raw, value);
     } else if (append) {
       this.setVar(name, (this.getVar(name) ?? "") + value);
     } else {
