@@ -167,19 +167,23 @@ class Emitter {
   private listExpr(prm: Param): string {
     return prm.special ? "sh.positional" : `sh.arrayValues(${JSON.stringify(prm.name)})`;
   }
-  /** A `#`/`%`/`/` string op applied to subject expression `subj`. */
-  private strOpExpr(prm: Param, subj: string): string {
-    const arg = this.templateOf(parseWord(prm.arg).parts);
-    const arg2 = this.templateOf(parseWord(prm.arg2).parts);
+  /** Quote-aware glob pattern from the operand's raw text (bash escapes quoted
+   *  metacharacters); resolved at runtime since it depends on the quoting. */
+  private patArg(prm: Param): string {
+    return `await sh.patExpand(${JSON.stringify(prm.arg)})`;
+  }
+  /** A `#`/`%`/`/` string op applied to `subj`, given pattern/replacement
+   *  expressions (hoisted by the caller so a list expands them once). */
+  private strOpExpr(prm: Param, subj: string, pat: string, repl: string): string {
     switch (prm.op) {
-      case "#": return `sh.trimPrefix(${subj}, ${arg}, false)`;
-      case "##": return `sh.trimPrefix(${subj}, ${arg}, true)`;
-      case "%": return `sh.trimSuffix(${subj}, ${arg}, false)`;
-      case "%%": return `sh.trimSuffix(${subj}, ${arg}, true)`;
-      case "/": return `sh.replaceGlob(${subj}, ${arg}, ${arg2}, false, "")`;
-      case "//": return `sh.replaceGlob(${subj}, ${arg}, ${arg2}, true, "")`;
-      case "/#": return `sh.replaceGlob(${subj}, ${arg}, ${arg2}, false, "#")`;
-      case "/%": return `sh.replaceGlob(${subj}, ${arg}, ${arg2}, false, "%")`;
+      case "#": return `sh.trimPrefix(${subj}, ${pat}, false)`;
+      case "##": return `sh.trimPrefix(${subj}, ${pat}, true)`;
+      case "%": return `sh.trimSuffix(${subj}, ${pat}, false)`;
+      case "%%": return `sh.trimSuffix(${subj}, ${pat}, true)`;
+      case "/": return `sh.replaceGlob(${subj}, ${pat}, ${repl}, false, "")`;
+      case "//": return `sh.replaceGlob(${subj}, ${pat}, ${repl}, true, "")`;
+      case "/#": return `sh.replaceGlob(${subj}, ${pat}, ${repl}, false, "#")`;
+      case "/%": return `sh.replaceGlob(${subj}, ${pat}, ${repl}, false, "%")`;
       default: return subj;
     }
   }
@@ -198,15 +202,15 @@ class Emitter {
       return `sh.transform(${J(prm.op)}, String(${base}))`;
     }
     if (isCaseOp(prm.op)) {
-      const pat = this.templateOf(parseWord(prm.arg).parts);
       if (this.isList(prm)) {
-        return `${this.listExpr(prm)}.map((x) => sh.changeCase(x, ${J(prm.op)}, ${pat})).join(" ")`;
+        return `await (async () => { const p = ${this.patArg(prm)}; return ${this.listExpr(prm)}.map((x) => sh.changeCase(x, ${J(prm.op)}, p)).join(" "); })()`;
       }
-      return `sh.changeCase(String(${base}), ${J(prm.op)}, ${pat})`;
+      return `sh.changeCase(String(${base}), ${J(prm.op)}, ${this.patArg(prm)})`;
     }
     // ${arr[@]#pat} / %pat / /pat/repl — apply the string op to each element.
     if (this.isList(prm) && STR_OPS.has(prm.op)) {
-      return `${this.listExpr(prm)}.map((x) => ${this.strOpExpr(prm, "x")}).join(" ")`;
+      const repl = this.templateOf(parseWord(prm.arg2).parts);
+      return `await (async () => { const p = ${this.patArg(prm)}; const r = ${repl}; return ${this.listExpr(prm)}.map((x) => ${this.strOpExpr(prm, "x", "p", "r")}).join(" "); })()`;
     }
     const arg = (): string => this.templateOf(parseWord(prm.arg).parts);
     const arg2 = (): string => this.templateOf(parseWord(prm.arg2).parts);
@@ -225,14 +229,9 @@ class Emitter {
       case "?": return `(sh.has(${J(prm.name)}) ? ${base} : sh.paramError(${J(prm.name)}, ${arg()}))`;
       case ":=": return `(String(${base}) || (sh.env.${prm.name} = ${arg()}))`;
       case "=": return `(sh.has(${J(prm.name)}) ? ${base} : (sh.env.${prm.name} = ${arg()}))`;
-      case "#": return `sh.trimPrefix(String(${base}), ${arg()}, false)`;
-      case "##": return `sh.trimPrefix(String(${base}), ${arg()}, true)`;
-      case "%": return `sh.trimSuffix(String(${base}), ${arg()}, false)`;
-      case "%%": return `sh.trimSuffix(String(${base}), ${arg()}, true)`;
-      case "/": return `sh.replaceGlob(String(${base}), ${arg()}, ${arg2()}, false, "")`;
-      case "//": return `sh.replaceGlob(String(${base}), ${arg()}, ${arg2()}, true, "")`;
-      case "/#": return `sh.replaceGlob(String(${base}), ${arg()}, ${arg2()}, false, "#")`;
-      case "/%": return `sh.replaceGlob(String(${base}), ${arg()}, ${arg2()}, false, "%")`;
+      case "#": case "##": case "%": case "%%":
+      case "/": case "//": case "/#": case "/%":
+        return this.strOpExpr(prm, `String(${base})`, this.patArg(prm), arg2());
       case ":": return `await sh.substr(String(${base}), ${J(prm.arg)}, ${J(prm.arg2)})`;
       default: throw new Error(`parameter operator not supported: ${prm.op}`);
     }
@@ -292,13 +291,13 @@ class Emitter {
       }
       // "${arr[@]#pat}" etc. — string op on each element, one field each.
       if (STR_OPS.has(p.p.op) && (p.p.sub === "@" || (p.p.special && p.p.name === "@"))) {
-        return `${this.listExpr(p.p)}.map((x) => ${this.strOpExpr(p.p, "x")})`;
+        const repl = this.templateOf(parseWord(p.p.arg2).parts);
+        return `(await (async () => { const p = ${this.patArg(p.p)}; const r = ${repl}; return ${this.listExpr(p.p)}.map((x) => ${this.strOpExpr(p.p, "x", "p", "r")}); })())`;
       }
       if (p.p.names === "@") return `sh.matchNames(${JSON.stringify(p.p.name)})`;
       // "${arr[@]^^}" etc. — case-modify each element, one field each.
       if (isCaseOp(p.p.op) && (p.p.sub === "@" || (p.p.special && p.p.name === "@"))) {
-        const pat = this.templateOf(parseWord(p.p.arg).parts);
-        return `${this.listExpr(p.p)}.map((x) => sh.changeCase(x, ${JSON.stringify(p.p.op)}, ${pat}))`;
+        return `(await (async () => { const p = ${this.patArg(p.p)}; return ${this.listExpr(p.p)}.map((x) => sh.changeCase(x, ${JSON.stringify(p.p.op)}, p)); })())`;
       }
       if (p.p.op !== "") return null;
       if (p.p.special && p.p.name === "@") return "sh.positional";

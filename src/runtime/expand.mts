@@ -113,12 +113,12 @@ const evalParam = async (shell: Shell, prm: Param): Promise<string> => {
   }
   // ${arr[@]^^} etc. — case-modify each element of a list.
   if (isCaseOp(prm.op) && isList(prm)) {
-    const pat = await expandNoSplit(shell, prm.arg);
+    const pat = await shell.patExpand(prm.arg);
     return listValues(shell, prm).map((x) => changeCase(x, prm.op, pat)).join(" ");
   }
   // ${arr[@]#pat} / %pat / /pat/repl — string op applied to each element.
   if (isList(prm) && STR_OPS.has(prm.op)) {
-    const pat = await expandNoSplit(shell, prm.arg);
+    const pat = await shell.patExpand(prm.arg);
     const repl = prm.op[0] === "/" ? await expandNoSplit(shell, prm.arg2) : "";
     const eg = shell.shopts.extglob;
     return listValues(shell, prm).map((x) => applyStrOp(prm.op, x, pat, repl, eg)).join(" ");
@@ -145,6 +145,8 @@ const evalParam = async (shell: Shell, prm: Param): Promise<string> => {
   const val = rawVal ?? "";
   const arg = (): Promise<string> => expandNoSplit(shell, prm.arg);
   const arg2 = (): Promise<string> => expandNoSplit(shell, prm.arg2);
+  // `#`/`%`/`/` operands are quote-aware globs; the replacement stays literal.
+  const pat = (): Promise<string> => shell.patExpand(prm.arg);
 
   // set -u: a plain reference (or ${#x}) to an unset parameter is an error.
   if (prm.op === "" && shell.opts.nounset) {
@@ -183,20 +185,20 @@ const evalParam = async (shell: Shell, prm: Param): Promise<string> => {
       shell.setVar(prm.name, d);
       return d;
     }
-    case "#": return trimPrefix(val, await arg(), false, shell.shopts.extglob);
-    case "##": return trimPrefix(val, await arg(), true, shell.shopts.extglob);
-    case "%": return trimSuffix(val, await arg(), false, shell.shopts.extglob);
-    case "%%": return trimSuffix(val, await arg(), true, shell.shopts.extglob);
-    case "/": return replaceGlob(val, await arg(), await arg2(), false, "", shell.shopts.extglob);
-    case "//": return replaceGlob(val, await arg(), await arg2(), true, "", shell.shopts.extglob);
-    case "/#": return replaceGlob(val, await arg(), await arg2(), false, "#", shell.shopts.extglob);
-    case "/%": return replaceGlob(val, await arg(), await arg2(), false, "%", shell.shopts.extglob);
+    case "#": return trimPrefix(val, await pat(), false, shell.shopts.extglob);
+    case "##": return trimPrefix(val, await pat(), true, shell.shopts.extglob);
+    case "%": return trimSuffix(val, await pat(), false, shell.shopts.extglob);
+    case "%%": return trimSuffix(val, await pat(), true, shell.shopts.extglob);
+    case "/": return replaceGlob(val, await pat(), await arg2(), false, "", shell.shopts.extglob);
+    case "//": return replaceGlob(val, await pat(), await arg2(), true, "", shell.shopts.extglob);
+    case "/#": return replaceGlob(val, await pat(), await arg2(), false, "#", shell.shopts.extglob);
+    case "/%": return replaceGlob(val, await pat(), await arg2(), false, "%", shell.shopts.extglob);
     case ":": {
       const off = Number(evalArith(shell, await arg()));
       const len = prm.arg2 === "" ? undefined : Number(evalArith(shell, await arg2()));
       return substr(val, off, len);
     }
-    case "^": case "^^": case ",": case ",,": return changeCase(val, prm.op, await arg());
+    case "^": case "^^": case ",": case ",,": return changeCase(val, prm.op, await pat());
     default:
       throw new Error(`parameter operator not supported: ${prm.op}`);
   }
@@ -235,12 +237,12 @@ export const expandWord = async (shell: Shell, word: Word): Promise<string[]> =>
       }
       // "${arr[@]^^}" etc. — case-modify each element, one field each.
       if (isCaseOp(p.op) && (p.sub === "@" || (p.special && p.name === "@"))) {
-        const pat = await expandNoSplit(shell, p.arg);
+        const pat = await shell.patExpand(p.arg);
         return listValues(shell, p).map((x) => changeCase(x, p.op, pat));
       }
       // "${arr[@]#pat}" etc. — string op on each element, one field each.
       if (STR_OPS.has(p.op) && (p.sub === "@" || (p.special && p.name === "@"))) {
-        const pat = await expandNoSplit(shell, p.arg);
+        const pat = await shell.patExpand(p.arg);
         const repl = p.op[0] === "/" ? await expandNoSplit(shell, p.arg2) : "";
         const eg = shell.shopts.extglob;
         return listValues(shell, p).map((x) => applyStrOp(p.op, x, pat, repl, eg));

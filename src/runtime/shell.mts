@@ -1274,16 +1274,17 @@ export class Shell {
   private condRegex(raw: string): Promise<string> {
     return this.condWalk(raw, (s) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"));
   }
-  /** `[[ x == pat ]]` / case pattern — build a glob pattern where quoted
-   *  metacharacters are backslash-escaped (so they match literally). */
-  private condPat(raw: string): Promise<string> {
+  /** `[[ x == pat ]]` / case / `${v/pat/…}` pattern — expand a word into a glob
+   *  pattern where quoted or backslash-escaped metacharacters are escaped (so
+   *  they match literally) while unquoted globs stay active, as bash does. */
+  patExpand(raw: string): Promise<string> {
     return this.condWalk(raw, (s) => s.replace(/[^A-Za-z0-9]/g, "\\$&"));
   }
   /** Quote-aware glob match for `==`/`!=` and case, honouring nocasematch.
    *  `[[ ]]` always recognises extended patterns; `case`/globbing need the
    *  extglob option, so callers pass the flag they want. */
   async matchGlob(subject: string, rawPat: string, extglob = this.shopts.extglob): Promise<boolean> {
-    return globMatch(subject, await this.condPat(rawPat), this.shopts.nocasematch, extglob);
+    return globMatch(subject, await this.patExpand(rawPat), this.shopts.nocasematch, extglob);
   }
 
   /** `$-` — the current single-letter option flags (bash order: e h u x B;

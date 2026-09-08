@@ -36,10 +36,38 @@ export const replaceGlob = (
   anchor: string,
   extglob = false,
 ): string => {
+  if (pat === "") {
+    // Empty pattern: bash inserts at the anchored position, else it is a no-op.
+    if (anchor === "#") return repl + v;
+    if (anchor === "%") return v + repl;
+    return v;
+  }
   const body = globToRegExpBody(pat, extglob);
   const src = anchor === "#" ? "^(?:" + body + ")" : anchor === "%" ? "(?:" + body + ")$" : "(?:" + body + ")";
-  const re = new RegExp(src, "s" + (all ? "g" : ""));
-  return v.replace(re, () => repl);
+  if (!all) {
+    const m = new RegExp(src, "s").exec(v);
+    return m === null ? v : v.slice(0, m.index) + repl + v.slice(m.index + m[0].length);
+  }
+  // Global: scan manually so we match bash — an empty match adjacent to the end
+  // of the previous match is skipped (so `${x//*/-}` yields one `-`, not two).
+  const re = new RegExp(src, "sg");
+  let out = "";
+  let pos = 0;
+  let prevEnd = -1;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(v)) !== null) {
+    const start = m.index;
+    if (m[0].length === 0) {
+      out += v.slice(pos, start) + (start === prevEnd ? "" : repl) + (start < v.length ? v[start] : "");
+      pos = re.lastIndex = start + 1;
+    } else {
+      out += v.slice(pos, start) + repl;
+      pos = re.lastIndex = start + m[0].length;
+    }
+    prevEnd = start + m[0].length;
+    if (start >= v.length) break;
+  }
+  return out + v.slice(pos);
 };
 
 /** `${v:offset}` / `${v:offset:length}` — bash substring (negatives from end). */
