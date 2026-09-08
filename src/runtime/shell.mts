@@ -155,6 +155,7 @@ export class Shell {
   /** trap handlers by normalized signal name (EXIT, INT, …). */
   traps: Record<string, string> = Object.create(null) as Record<string, string>;
   private ranExitTrap = false;
+  private inErrTrap = false;
 
   /** `shopt` toggles (all off by default, as in a non-interactive shell). */
   shopts: Record<string, boolean> = {
@@ -731,7 +732,7 @@ export class Shell {
       code = await this.external(name, args, {});
     }
     this.status = code;
-    this.checkErrexit();
+    await this.afterCommand();
     return code;
   }
 
@@ -1290,7 +1291,7 @@ export class Shell {
       if (!isLast) input = chunks.join("");
     }
     this.status = this.opts.pipefail ? lastNonZero : status;
-    this.checkErrexit();
+    await this.afterCommand();
     return this.status;
   }
 
@@ -1409,10 +1410,27 @@ export class Shell {
    *  (conditions, `!`, and the non-final operands of && / ||). Called at the
    *  shared choke points (callByName, pipeline) so both the interpreter and the
    *  AOT-generated code honor it. */
-  private checkErrexit(): void {
-    if (this.opts.errexit && this.status !== 0 && this.condDepth === 0) {
-      throw new ExitSignal(this.status);
+  /** After a command completes at the top level (not in a condition / `&&` /
+   *  `||` / `!`): a non-zero status fires the ERR trap, then errexit exits. */
+  private async afterCommand(): Promise<void> {
+    if (this.status === 0 || this.condDepth !== 0) return;
+    const h = this.traps["ERR"];
+    if (h !== undefined && h !== "" && !this.inErrTrap) {
+      this.inErrTrap = true;
+      const saved = this.status;
+      try {
+        const cmd = parse(h);
+        if (cmd !== null) await this.execute(cmd);
+      } catch (e) {
+        if (!(e instanceof ExitSignal || e instanceof ReturnSignal)) throw e;
+        this.status = e.code;
+        this.inErrTrap = false;
+        throw e;
+      }
+      this.status = saved; // the failing command's status is preserved
+      this.inErrTrap = false;
     }
+    if (this.opts.errexit) throw new ExitSignal(this.status);
   }
 
   private async dispatch(cmd: Command): Promise<number> {

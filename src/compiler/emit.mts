@@ -82,7 +82,13 @@ interface WordCode {
  *  skip the errexit `condDepth` guards and keep the output clean. */
 const usesSet = (cmd: Command): boolean => {
   switch (cmd.type) {
-    case "simple": return cmd.words.length > 0 && cmd.words[0]!.text === "set";
+    case "simple": {
+      // `set` (errexit) and trap/eval/source (which may install an ERR trap)
+      // all need the condDepth guards so failures in conditions/&&/|| are
+      // exempt from errexit and the ERR trap.
+      const w0 = cmd.words[0]?.text;
+      return w0 === "set" || w0 === "trap" || w0 === "eval" || w0 === "source" || w0 === ".";
+    }
     case "connection": return usesSet(cmd.first) || usesSet(cmd.second);
     case "pipeline": return cmd.stages.some(usesSet);
     case "background": return usesSet(cmd.command);
