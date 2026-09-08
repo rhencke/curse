@@ -118,15 +118,13 @@ class Parser {
   }
 
   private parseAndOr(): Command {
-    let left = this.parseCommand();
+    let left = this.parsePipeline();
     for (;;) {
       const t = this.peek();
       if (t.type === "OP" && (t.value === "&&" || t.value === "||")) {
         this.advance();
         this.skipLinebreak();
-        left = connection(t.value, left, this.parseCommand());
-      } else if (t.type === "OP" && t.value === "|") {
-        throw new ParseError("pipelines `|` not supported yet (planned for M3)");
+        left = connection(t.value, left, this.parsePipeline());
       } else {
         break;
       }
@@ -134,14 +132,27 @@ class Parser {
     return left;
   }
 
-  private parseCommand(): Command {
+  private parsePipeline(): Command {
+    let invert = false;
     if (this.wordIs("!")) {
       this.advance();
-      const inner = this.parseCommand();
-      inner.flags = (inner.flags ?? 0) ^ CMD_INVERT_RETURN;
-      return inner;
+      invert = true;
     }
+    let cmd = this.parseCommand();
+    if (this.peek().type === "OP" && this.peek().value === "|") {
+      const stages = [cmd];
+      while (this.peek().type === "OP" && this.peek().value === "|") {
+        this.advance();
+        this.skipLinebreak();
+        stages.push(this.parseCommand());
+      }
+      cmd = { type: "pipeline", stages };
+    }
+    if (invert) cmd.flags = (cmd.flags ?? 0) ^ CMD_INVERT_RETURN;
+    return cmd;
+  }
 
+  private parseCommand(): Command {
     const t = this.peek();
 
     if (t.type === "ARITH") {

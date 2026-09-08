@@ -255,6 +255,12 @@ class Emitter {
         }
         throw new Error(`connector \`${cmd.connector}\` not supported yet`);
       }
+      case "pipeline": {
+        const stages = cmd.stages
+          .map((c) => `async (sh) => {\n${this.command(c, ind + 2)}\n${pad(ind + 1)}}`)
+          .join(",\n" + pad(ind + 1));
+        return `${i}await sh.pipeline([\n${pad(ind + 1)}${stages},\n${i}]);`;
+      }
       case "group":
         return this.command(cmd.body, ind);
       case "subshell":

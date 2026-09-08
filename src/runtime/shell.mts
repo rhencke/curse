@@ -595,6 +595,25 @@ export class Shell {
     this.status = this.status === 0 ? 1 : 0;
   }
 
+  /** Run a pipeline: each stage in its own subshell, stdout wired to the next
+   *  stage's stdin (buffered). The pipeline's status is the last stage's. */
+  async pipeline(stages: Array<(sh: Shell) => Promise<unknown>>): Promise<number> {
+    let input = this.stdinData;
+    let status = 0;
+    for (let idx = 0; idx < stages.length; idx++) {
+      const isLast = idx === stages.length - 1;
+      const chunks: string[] = [];
+      const io: IO = isLast ? this.io : { out: (s) => void chunks.push(s), err: (s) => this.io.err(s) };
+      const sub = this.cloneForSubshell(io);
+      sub.stdinData = input;
+      await stages[idx]!(sub);
+      status = sub.status;
+      if (!isLast) input = chunks.join("");
+    }
+    this.status = status;
+    return status;
+  }
+
   /** Run a body in a subshell (used by generated subshells). */
   async runSubshell(fn: (sh: Shell) => Promise<void>): Promise<number> {
     const sub = this.cloneForSubshell();
@@ -649,6 +668,11 @@ export class Shell {
       case "simple":
         status = await this.execSimpleCore(cmd.words);
         break;
+      case "pipeline": {
+        const stages = cmd.stages;
+        status = await this.pipeline(stages.map((c) => (sh: Shell) => sh.execute(c)));
+        break;
+      }
       case "function":
         this.defineFunction(cmd);
         status = 0;

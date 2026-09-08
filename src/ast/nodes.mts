@@ -35,6 +35,7 @@ export const CMD_INVERT_RETURN = 0x04;
 /* enum command_type (command.h). */
 export type Command =
   | ConnectionCommand
+  | PipelineCommand
   | SimpleCommand
   | GroupCommand
   | SubshellCommand
@@ -62,6 +63,12 @@ export interface ConnectionCommand extends CommandBase {
   connector: Connector;
   first: Command;
   second: Command;
+}
+
+/** A pipeline `a | b | c`; each stage runs in its own subshell. */
+export interface PipelineCommand extends CommandBase {
+  type: "pipeline";
+  stages: Command[];
 }
 
 export interface SimpleCommand extends CommandBase {
