@@ -390,6 +390,22 @@ class Emitter {
     if (cmd.arrayArgs !== undefined && cmd.arrayArgs.length > 0) {
       const isLocal = words[0]!.text === "local";
       const isAssoc = words.some((w) => w.text === "-A");
+      // Attributes from the flags (declare -ai arr=(...)) apply to each array.
+      const attrs: Record<string, boolean> = {};
+      let exported = false;
+      for (const w of words.slice(1)) {
+        const t = w.text;
+        if (t.length > 1 && (t[0] === "-" || t[0] === "+")) {
+          const on = t[0] === "-";
+          for (const ch of t.slice(1)) {
+            if (ch === "i") attrs["integer"] = on;
+            else if (ch === "l") attrs["lower"] = on;
+            else if (ch === "u") attrs["upper"] = on;
+            else if (ch === "r") attrs["readonly"] = attrs["readonly"] || on;
+            else if (ch === "x") exported = exported || on;
+          }
+        }
+      }
       for (const aa of cmd.arrayArgs) {
         const nm = JSON.stringify(aa.name);
         if (isLocal) arrayStmts += `${i}sh.local(${nm});\n`;
@@ -398,6 +414,8 @@ class Emitter {
         for (const w of aa.elems) for (const t of braceExpand(w.text)) frags.push(this.word(t).code);
         const fn = aa.append ? "appendArrayFields" : "setArrayFields";
         arrayStmts += `${i}sh.${fn}(${nm}, [${frags.join(", ")}]);\n`;
+        if (Object.keys(attrs).length > 0) arrayStmts += `${i}sh.setAttrs(${nm}, ${JSON.stringify(attrs)});\n`;
+        if (exported) arrayStmts += `${i}sh.exportVar(${nm});\n`;
       }
     }
 

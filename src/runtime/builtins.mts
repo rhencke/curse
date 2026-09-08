@@ -410,6 +410,24 @@ const parseDeclFlags = (args: string[]): { flags: DeclFlags; names: string[] } =
 };
 
 const declareBuiltin: Builtin = (shell, ...args) => {
+  // declare -p [name...]: print definitions.
+  if (args.includes("-p")) {
+    const targets = args.filter((a) => a[0] !== "-" && a[0] !== "+").map((a) => {
+      const eq = a.indexOf("=");
+      return eq >= 0 ? a.slice(0, eq) : a;
+    });
+    let status = 0;
+    for (const name of targets) {
+      const line = shell.declareLine(name);
+      if (line === null) {
+        shell.io.err(`${shell.name}: declare: ${name}: not found\n`);
+        status = 1;
+      } else {
+        shell.io.out(line + "\n");
+      }
+    }
+    return status;
+  }
   const { flags, names } = parseDeclFlags(args);
   for (const n of names) {
     const eq = n.indexOf("=");

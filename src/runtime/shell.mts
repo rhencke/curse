@@ -75,6 +75,26 @@ process.on("exit", () => {
   }
 });
 
+/** Quote a value the way `declare -p` does: double quotes with `"$`\` and
+ *  backslash escaped, or a `$'…'` form when it holds control characters. */
+const declareQuote = (v: string): string => {
+  if (/[\x00-\x1f\x7f]/.test(v)) {
+    let s = "$'";
+    for (const ch of v) {
+      const code = ch.charCodeAt(0);
+      if (ch === "\\") s += "\\\\";
+      else if (ch === "'") s += "\\'";
+      else if (ch === "\n") s += "\\n";
+      else if (ch === "\t") s += "\\t";
+      else if (ch === "\r") s += "\\r";
+      else if (code < 0x20 || code === 0x7f) s += "\\" + code.toString(8).padStart(3, "0");
+      else s += ch;
+    }
+    return s + "'";
+  }
+  return '"' + v.replace(/[\\"$`]/g, "\\$&") + '"';
+};
+
 /** Index just past the `$…` expansion at `i` (raw[i] === "$"), else `i`. */
 const expansionEnd = (raw: string, i: number): number => {
   const n = raw[i + 1];
@@ -310,6 +330,33 @@ export class Shell {
   private varForWrite(name: string): Var {
     return this.varForWriteRaw(this.deref(name));
   }
+  /** `declare -p name` — reconstruct the variable's definition, or null if
+   *  it is unset. Attribute letters follow bash's order (a A i l n r t u x). */
+  declareLine(name: string): string | null {
+    const v = this.rawLookup(name);
+    if (v === undefined) return null;
+    let f = "";
+    if (v.arr !== null) f += "a";
+    if (v.assoc !== null) f += "A";
+    if (v.integer) f += "i";
+    if (v.lower) f += "l";
+    if (v.ref) f += "n";
+    if (v.readonly) f += "r";
+    if (v.upper) f += "u";
+    if (v.exported) f += "x";
+    const attr = f === "" ? "--" : "-" + f;
+    if (v.assoc !== null) {
+      const body = [...v.assoc.entries()].map(([k, val]) => `[${k}]=${declareQuote(val)}`).join(" ");
+      return `declare ${attr} ${name}=(${body}${v.assoc.size > 0 ? " " : ""})`;
+    }
+    if (v.arr !== null) {
+      const body = [...v.arr.entries()].sort((a, b) => a[0] - b[0])
+        .map(([i, val]) => `[${i}]=${declareQuote(val)}`).join(" ");
+      return `declare ${attr} ${name}=(${body})`;
+    }
+    return `declare ${attr} ${name}=${declareQuote(v.value)}`;
+  }
+
   /** `declare -n name=target` — make `name` a nameref to `target`. */
   setRef(name: string, target: string): void {
     const v = this.varForWriteRaw(name);
@@ -1402,13 +1449,30 @@ export class Shell {
   /** Apply `declare -a arr=(...)` / `local m=(...)` array-literal arguments. */
   private async applyArrayArgs(args: ArrayArg[], argv: string[]): Promise<void> {
     const isLocal = argv[0] === "local";
-    const isAssoc = argv.includes("-A");
+    let isAssoc = false;
+    const attrs: { integer?: boolean; lower?: boolean; upper?: boolean; readonly?: boolean } = {};
+    let exported = false;
+    for (const a of argv.slice(1)) {
+      if (a.length > 1 && (a[0] === "-" || a[0] === "+")) {
+        const on = a[0] === "-";
+        for (const ch of a.slice(1)) {
+          if (ch === "A") isAssoc = true;
+          else if (ch === "i") attrs.integer = on;
+          else if (ch === "l") attrs.lower = on;
+          else if (ch === "u") attrs.upper = on;
+          else if (ch === "r") attrs.readonly ||= on;
+          else if (ch === "x") exported = exported || on;
+        }
+      }
+    }
     for (const aa of args) {
       if (isLocal) this.local(aa.name);
       if (isAssoc) this.declareAssoc(aa.name);
       const fields = await expandWords(this, aa.elems);
       if (aa.append) this.appendArrayFields(aa.name, fields);
       else this.setArrayFields(aa.name, fields);
+      this.setAttrs(aa.name, attrs);
+      if (exported) this.exportVar(aa.name);
     }
   }
 
