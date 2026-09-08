@@ -32,6 +32,42 @@ const ASSIGN = /^([A-Za-z_][A-Za-z0-9_]*)(\[([^\]]*)\])?(\+)?=([\s\S]*)$/;
 
 const isCaseOp = (op: string): boolean => op === "^" || op === "^^" || op === "," || op === ",,";
 const STR_OPS = new Set(["#", "##", "%", "%%", "/", "//", "/#", "/%"]);
+
+/** Compile-time glob pattern from a static (expansion-free) word: quoted or
+ *  escaped characters are backslashed so they match literally. */
+const staticGlobPattern = (raw: string): string => {
+  const esc = (s: string): string => s.replace(/[^A-Za-z0-9]/g, "\\$&");
+  let out = "";
+  let i = 0;
+  while (i < raw.length) {
+    const c = raw[i]!;
+    if (c === "\\") {
+      const n = raw[i + 1];
+      if (n === undefined) { out += "\\\\"; i++; } else { out += esc(n); i += 2; }
+      continue;
+    }
+    if (c === "'") {
+      i++;
+      while (i < raw.length && raw[i] !== "'") out += esc(raw[i++]!);
+      i++;
+      continue;
+    }
+    if (c === '"') {
+      i++;
+      let seg = "";
+      while (i < raw.length && raw[i] !== '"') {
+        if (raw[i] === "\\" && i + 1 < raw.length) { seg += raw[i + 1]!; i += 2; continue; }
+        seg += raw[i++]!;
+      }
+      i++;
+      out += esc(seg);
+      continue;
+    }
+    out += c;
+    i++;
+  }
+  return out;
+};
 const ident = (s: string): boolean => /^[A-Za-z_][A-Za-z0-9_]*$/.test(s);
 const escTemplate = (s: string): string =>
   s.replace(/\\/g, "\\\\").replace(/`/g, "\\`").replace(/\$/g, "\\$");
@@ -285,20 +321,21 @@ class Emitter {
 
   /* ---------------- commands ---------------- */
 
-  /** A boolean test of `subjectExpr` against a glob pattern word. Static
-   *  patterns compile to an inline regex literal; dynamic ones fall back to
-   *  the runtime matcher. */
+  /** A boolean test of `subjectExpr` against a glob pattern word. A static
+   *  pattern (no expansions) compiles to an inline regex — quote-aware, so a
+   *  quoted `*` matches literally — with a runtime fallback for nocasematch;
+   *  extglob and dynamic patterns defer to sh.matchGlob (quote-aware). */
   private matchExpr(subjectExpr: string, patText: string): string {
     const pw = parseWord(patText);
-    if (pw.parts.every((p) => p.k === "lit")) {
-      const lit = pw.parts.map((p) => (p.k === "lit" ? p.s : "")).join("");
-      // extglob depends on a runtime shopt, so those patterns can't inline.
-      if (hasExtglob(lit)) return `sh.match(${subjectExpr}, ${JSON.stringify(lit)})`;
-      const src = globToRegExpSource(lit).replace(/\//g, "\\/");
-      // Fast inline regex, but defer to sh.match when nocasematch is on (runtime).
-      return `(sh.shopts.nocasematch ? sh.match(${subjectExpr}, ${JSON.stringify(lit)}) : /${src}/s.test(${subjectExpr}))`;
+    const dynamic = pw.parts.some((p) => p.k !== "lit");
+    if (!dynamic) {
+      const pat = staticGlobPattern(patText);
+      if (!hasExtglob(pat)) {
+        const src = globToRegExpSource(pat).replace(/\//g, "\\/");
+        return `(sh.shopts.nocasematch ? await sh.matchGlob(${subjectExpr}, ${JSON.stringify(patText)}) : /${src}/s.test(${subjectExpr}))`;
+      }
     }
-    return `sh.match(${subjectExpr}, ${this.templateOf(pw.parts)})`;
+    return `await sh.matchGlob(${subjectExpr}, ${JSON.stringify(patText)})`;
   }
 
   private cond(e: CondExpr): string {

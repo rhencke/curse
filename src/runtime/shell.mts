@@ -1136,20 +1136,22 @@ export class Shell {
   }
 
   /** Build a JS regex source from a `[[ =~ ]]` RHS word. */
-  private async condRegex(raw: string): Promise<string> {
-    const esc = (s: string): string => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-    let src = "";
+  /** Walk a `[[ ]]` RHS word: quoted/escaped spans are passed through `esc`
+   *  (making their metacharacters literal), unquoted text and expansions stay
+   *  active. Shared by `=~` (regex) and `==` (glob) matching. */
+  private async condWalk(raw: string, esc: (s: string) => string): Promise<string> {
+    let out = "";
     let i = 0;
     while (i < raw.length) {
       const c = raw[i]!;
       if (c === "\\") {
         const n = raw[i + 1];
-        if (n === undefined) { src += "\\\\"; i++; } else { src += esc(n); i += 2; }
+        if (n === undefined) { out += "\\\\"; i++; } else { out += esc(n); i += 2; }
         continue;
       }
       if (c === "'") {
         i++;
-        while (i < raw.length && raw[i] !== "'") { src += esc(raw[i]!); i++; }
+        while (i < raw.length && raw[i] !== "'") out += esc(raw[i++]!);
         i++;
         continue;
       }
@@ -1161,17 +1163,30 @@ export class Shell {
           seg += raw[i]!; i++;
         }
         i++;
-        src += esc(await expandNoSplit(this, seg));
+        out += esc(await expandNoSplit(this, seg));
         continue;
       }
       if (c === "$") {
         const end = expansionEnd(raw, i);
-        if (end > i) { src += await expandNoSplit(this, raw.slice(i, end)); i = end; continue; }
+        if (end > i) { out += await expandNoSplit(this, raw.slice(i, end)); i = end; continue; }
       }
-      src += c;
+      out += c;
       i++;
     }
-    return src;
+    return out;
+  }
+
+  private condRegex(raw: string): Promise<string> {
+    return this.condWalk(raw, (s) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"));
+  }
+  /** `[[ x == pat ]]` / case pattern — build a glob pattern where quoted
+   *  metacharacters are backslash-escaped (so they match literally). */
+  private condPat(raw: string): Promise<string> {
+    return this.condWalk(raw, (s) => s.replace(/[^A-Za-z0-9]/g, "\\$&"));
+  }
+  /** Quote-aware glob match for `==`/`!=` and case, honouring nocasematch/extglob. */
+  async matchGlob(subject: string, rawPat: string): Promise<boolean> {
+    return globMatch(subject, await this.condPat(rawPat), this.shopts.nocasematch, this.shopts.extglob);
   }
 
   /** Apply `!` inversion in generated code. */
@@ -1585,15 +1600,14 @@ export class Shell {
       case "not": return !(await this.evalCond(e.e));
       case "word": return (await expandNoSplit(this, e.w.text)) !== "";
       case "unary": return this.condUnary(e.op, await expandNoSplit(this, e.arg.text));
-      case "binary":
-        // `=~` keeps its RHS unexpanded: quoting there is regex-literal, and
-        // the match populates BASH_REMATCH.
-        if (e.op === "=~") return this.condMatch(await expandNoSplit(this, e.l.text), e.r.text);
-        return this.condBinary(
-          await expandNoSplit(this, e.l.text),
-          e.op,
-          await expandNoSplit(this, e.r.text),
-        );
+      case "binary": {
+        const l = await expandNoSplit(this, e.l.text);
+        // `=~`/`==`/`!=` keep the RHS unexpanded so its quoting stays literal.
+        if (e.op === "=~") return this.condMatch(l, e.r.text);
+        if (e.op === "==" || e.op === "=") return this.matchGlob(l, e.r.text);
+        if (e.op === "!=") return !(await this.matchGlob(l, e.r.text));
+        return this.condBinary(l, e.op, await expandNoSplit(this, e.r.text));
+      }
     }
   }
 
@@ -1605,7 +1619,7 @@ export class Shell {
       let run = falling;
       if (!run) {
         for (const pat of clause.patterns) {
-          if (globMatch(subject, await expandNoSplit(this, pat.text), this.shopts.nocasematch, this.shopts.extglob)) {
+          if (await this.matchGlob(subject, pat.text)) {
             run = true;
             break;
           }
