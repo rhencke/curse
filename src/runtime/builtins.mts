@@ -595,21 +595,48 @@ const shift: Builtin = (shell, ...args) => {
   return 0;
 };
 
-const evalBuiltin: Builtin = (shell, ...args) => shell.evalString(args.join(" "));
+const evalBuiltin: Builtin = (shell, ...args) => {
+  let i = 0;
+  for (; i < args.length; i++) {
+    const a = args[i]!;
+    if (a === "--") { i++; break; }
+    if (a === "-" || a[0] !== "-") break; // `-` and operands aren't options
+    shell.io.err(`eval: ${a}: invalid option\neval: usage: eval [arg ...]\n`);
+    return 2;
+  }
+  return shell.evalString(args.slice(i).join(" "));
+};
+
+/** Resolve a `source`/`.` filename: a name without `/` is searched along PATH
+ *  (regular files only, PATH before the current dir); otherwise cwd-relative. */
+const findSourceFile = (shell: Shell, file: string): string | null => {
+  const isFile = (p: string): boolean => {
+    try { return statSync(p).isFile(); } catch { return false; }
+  };
+  if (!file.includes("/")) {
+    for (const dir of (shell.getVar("PATH") ?? "").split(":")) {
+      if (dir === "") continue;
+      const p = resolve(shell.cwd, dir, file);
+      if (isFile(p)) return p;
+    }
+  }
+  const direct = resolve(shell.cwd, file);
+  return isFile(direct) ? direct : null;
+};
 
 const sourceBuiltin: Builtin = async (shell, ...args) => {
+  if (args[0] === "--") args = args.slice(1);
   const file = args[0];
   if (file === undefined) {
     shell.io.err("source: filename argument required\n");
     return 2;
   }
-  let src: string;
-  try {
-    src = readFileSync(resolve(shell.cwd, file), "utf8");
-  } catch {
+  const path = findSourceFile(shell, file);
+  if (path === null) {
     shell.io.err(`${shell.name}: ${file}: No such file or directory\n`);
     return 1;
   }
+  const src = readFileSync(path, "utf8");
   const saved = shell.positional;
   if (args.length > 1) shell.positional = args.slice(1);
   try {
