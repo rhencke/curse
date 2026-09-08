@@ -588,9 +588,11 @@ const declareBuiltin: Builtin = (shell, ...args) => {
     return status;
   }
   const { flags, names } = parseDeclFlags(args);
+  const clearRef = dashFlags.some((f) => f[0] === "+" && f.includes("n"));
   for (const n of names) {
     const eq = n.indexOf("=");
     const name = eq >= 0 ? n.slice(0, eq) : n;
+    if (clearRef) { shell.clearRef(name); continue; }
     if (flags.nameref) {
       shell.setRef(name, eq >= 0 ? n.slice(eq + 1) : "");
       continue;

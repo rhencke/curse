@@ -232,19 +232,50 @@ export class Shell {
     return e === undefined ? undefined : new Var(e, true);
   }
 
-  /** Follow a nameref (declare -n) chain to the target variable name. */
-  private deref(name: string): string {
+  /** Follow a nameref (declare -n) chain. The chain ends at a plain name, or at
+   *  a `base[subscript]` target (a nameref to an array element), reported via
+   *  `sub`. */
+  private resolveRef(name: string): { name: string; sub: string | null } {
     const seen = new Set<string>();
     let cur = name;
     for (;;) {
       const v = this.rawLookup(cur);
       if (v && v.ref && v.value !== "" && !seen.has(cur)) {
         seen.add(cur);
+        const m = /^([A-Za-z_][A-Za-z0-9_]*)\[([\s\S]*)\]$/.exec(v.value);
+        if (m) return { name: m[1]!, sub: m[2]! };
         cur = v.value;
         continue;
       }
-      return cur;
+      return { name: cur, sub: null };
     }
+  }
+  /** Follow a nameref chain to the target variable name (ignoring any element
+   *  subscript — callers that operate on the whole variable). */
+  private deref(name: string): string {
+    return this.resolveRef(name).name;
+  }
+  /** `typeset +n name` — drop the nameref attribute; the value it held (the
+   *  target's name) becomes the variable's plain value, as in bash. */
+  clearRef(name: string): void {
+    const v = this.rawLookup(name);
+    if (v) v.ref = false;
+  }
+  /** Read `base[sub]` synchronously (arithmetic index / assoc key / `@`/`*`),
+   *  shared by `${!ref}` and nameref-to-element resolution. */
+  private elemValueSync(base: string, sub: string): string | undefined {
+    const v = this.lookup(base);
+    if (v === undefined) return undefined;
+    if (v.assoc !== null) return v.assoc.get(sub);
+    if (sub === "@" || sub === "*") return this.arrayValues(base).join(" ");
+    if (v.arr !== null) return this.arrayGet(base, Number(evalArith(this, sub)));
+    return sub === "0" ? v.value : undefined; // scalar as element 0
+  }
+  /** Write `base[sub]` synchronously — used for assignment through a nameref. */
+  private setElemSync(base: string, sub: string, value: string): void {
+    const v = this.lookup(base);
+    if (v && v.assoc !== null) { this.varForWriteRaw(this.deref(base)).assoc!.set(sub, value); return; }
+    this.setElem(base, Number(evalArith(this, sub)), value);
   }
 
   private lookup(name: string): Var | undefined {
@@ -265,7 +296,9 @@ export class Shell {
       this.scope[name] = value;
       return;
     }
-    name = this.deref(name); // write through a nameref to its target
+    const r = this.resolveRef(name); // write through a nameref to its target
+    if (r.sub !== null) { this.setElemSync(r.name, r.sub, String(value)); return; }
+    name = r.name;
     const s = String(value);
     const owner = this.ownerScope(name);
     if (owner && owner[name]!.readonly) {
@@ -312,7 +345,9 @@ export class Shell {
   }
 
   getVar(name: string): string | undefined {
-    const v = this.lookup(name);
+    const r = this.resolveRef(name);
+    if (r.sub !== null) return this.elemValueSync(r.name, r.sub);
+    const v = this.rawLookup(r.name);
     if (v === undefined || v.unset) return undefined;
     return v.scalar();
   }
@@ -515,26 +550,26 @@ export class Shell {
     if (target === "") return undefined;
     const m = /^([A-Za-z_][A-Za-z0-9_]*)\[([\s\S]*)\]$/.exec(target);
     if (m === null) return this.getVar(target);
-    const v = this.lookup(m[1]!);
-    if (v === undefined) return undefined;
-    const sub = m[2]!;
-    if (v.assoc !== null) return v.assoc.get(sub);
-    if (sub === "@" || sub === "*") return this.arrayValues(m[1]!).join(" ");
-    if (v.arr !== null) return this.arrayGet(m[1]!, Number(evalArith(this, sub)));
-    return sub === "0" ? v.value : undefined; // scalar as element 0
+    return this.elemValueSync(m[1]!, m[2]!);
   }
 
   /** Read a plain `$name` reference, honoring `set -u` (used by generated code). */
   ref(name: string): string {
-    const v = this.lookup(name);
-    if (v === undefined || v.unset) {
+    const r = this.resolveRef(name);
+    const val = r.sub !== null
+      ? this.elemValueSync(r.name, r.sub)
+      : (() => {
+          const v = this.rawLookup(r.name);
+          return v === undefined || v.unset ? undefined : v.scalar();
+        })();
+    if (val === undefined) {
       if (this.opts.nounset) {
         this.io.err(`${this.name}: ${name}: unbound variable\n`);
         throw new ExitSignal(1);
       }
       return "";
     }
-    return v.scalar();
+    return val;
   }
   setVar(name: string, value: string): void {
     this.assign(name, value);
