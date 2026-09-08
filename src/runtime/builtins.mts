@@ -702,29 +702,42 @@ const read: Builtin = (shell, ...args) => {
   let data = shell.stdinData;
   let chunk: string;
   let eof = false;
+  let line: string;
   if (exactN >= 0) {
     chunk = data.slice(0, exactN);
     if (chunk.length < exactN) eof = true;
     data = data.slice(chunk.length);
-  } else {
+    line = chunk;
+  } else if (nchars >= 0 || raw) {
     let end = data.indexOf(delim);
     if (end < 0) { end = data.length; eof = true; }
     const stop = nchars >= 0 && nchars < end ? nchars : end;
     chunk = data.slice(0, stop);
     data = stop === end && !eof ? data.slice(end + delim.length) : data.slice(stop);
-  }
-  shell.stdinData = data;
-
-  let line = chunk;
-  if (!raw) {
-    // Backslash escapes the next character (dropped when trailing).
+    line = raw ? chunk : chunk.replace(/\\([\s\S])/g, "$1");
+  } else {
+    // Non-raw line read: a backslash escapes the next char; `\`+delimiter is a
+    // line continuation (both dropped, reading continues past the delimiter).
+    let k = 0;
     let out = "";
-    for (let j = 0; j < line.length; j++) {
-      if (line[j] === "\\") { if (j + 1 < line.length) out += line[++j]; }
-      else out += line[j];
+    for (;;) {
+      if (k >= data.length) { eof = true; break; }
+      const c = data[k]!;
+      if (c === "\\") {
+        const n = data[k + 1];
+        if (n === undefined) { k = data.length; eof = true; break; }
+        if (n !== "\n") out += n; // \<newline> is a line continuation (dropped)
+        k += 2;
+        continue;
+      }
+      if (data.startsWith(delim, k)) { k += delim.length; break; }
+      out += c;
+      k++;
     }
+    data = data.slice(k);
     line = out;
   }
+  shell.stdinData = data;
 
   const ifs = shell.getVar("IFS");
   const ifsVal = ifs === undefined ? " \t\n" : ifs;
