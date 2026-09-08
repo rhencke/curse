@@ -207,20 +207,22 @@ class Parser {
         case "function": return this.parseFunctionKeyword();
         case "case": return this.trailingRedirects(this.parseCase());
       }
-      // name () compound   → function definition
-      if (
-        isName(t.value) &&
-        this.peekAt(1).type === "OP" && this.peekAt(1).value === "(" &&
-        this.peekAt(2).type === "OP" && this.peekAt(2).value === ")"
-      ) {
-        return this.parseFunctionDef(t.value);
-      }
-      // name=( ... )  /  name+=( ... )  → array assignment
+      // name=( ... )  /  name+=( ... )  → array assignment. Checked before the
+      // function form so an empty array `a=()` isn't read as a function `a=`.
       if (
         /^[A-Za-z_][A-Za-z0-9_]*\+?=$/.test(t.value) &&
         this.peekAt(1).type === "OP" && this.peekAt(1).value === "("
       ) {
         return this.parseArrayAssign();
+      }
+      // name () compound   → function definition. bash accepts almost any word
+      // as the name (e.g. `foo-bar`, `pkg.install`), not just POSIX identifiers.
+      if (
+        !RESERVED_MISPLACED.has(t.value) &&
+        this.peekAt(1).type === "OP" && this.peekAt(1).value === "(" &&
+        this.peekAt(2).type === "OP" && this.peekAt(2).value === ")"
+      ) {
+        return this.parseFunctionDef(t.value);
       }
       if (RESERVED_MISPLACED.has(t.value)) {
         throw new ParseError(`syntax error near \`${t.value}\` (line ${t.line})`);
