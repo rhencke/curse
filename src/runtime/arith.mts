@@ -38,10 +38,15 @@ const isNameStart = (c: string): boolean =>
   (c >= "a" && c <= "z") || (c >= "A" && c <= "Z") || c === "_";
 const isNameChar = (c: string): boolean => isNameStart(c) || isDigit(c);
 
-const digitVal = (c: string): number => {
+/** Digit value for `base#digits`. For base ≤ 36 letters are case-insensitive
+ *  (a/A = 10..35); for larger bases bash uses a-z = 10..35, A-Z = 36..61,
+ *  @ = 62, _ = 63. */
+const digitVal = (c: string, base: number): number => {
   if (c >= "0" && c <= "9") return c.charCodeAt(0) - 48;
   if (c >= "a" && c <= "z") return c.charCodeAt(0) - 97 + 10;
-  if (c >= "A" && c <= "Z") return c.charCodeAt(0) - 65 + 10;
+  if (c >= "A" && c <= "Z") return c.charCodeAt(0) - 65 + (base <= 36 ? 10 : 36);
+  if (c === "@") return 62;
+  if (c === "_") return 63;
   return 99;
 };
 
@@ -54,7 +59,7 @@ const parseNumber = (tok: string): bigint => {
     }
     let v = 0n;
     for (const c of tok.slice(hash + 1)) {
-      const d = digitVal(c);
+      const d = digitVal(c, base);
       if (d >= base) throw new ArithError(`${tok}: value too great for base`);
       v = v * BigInt(base) + BigInt(d);
     }
