@@ -513,7 +513,16 @@ class Emitter {
       .filter((m) => m[2] === undefined && m[4] === undefined)
       .map((m) => `${JSON.stringify(m[1])}: ${this.templateOf(parseWord(m[5]!, true).parts)}`)
       .join(", ");
-    return arrayStmts + `${i}await sh.withEnv({ ${env} }, () => ${callInner});`;
+    // Expand the command words BEFORE applying the temporary env — bash expands
+    // args in the current environment, then sets the prefix assignments.
+    const argList = literal !== null ? argFrags : [this.word(nameText).code, ...argFrags];
+    const mark = literal !== null ? "" : "sh.markSubs(); ";
+    const call = literal !== null
+      ? `${ident(literal) ? `sh.commands.${literal}` : `sh.commands[${JSON.stringify(literal)}]`}(...__a)`
+      : "sh.exec(...__a)";
+    return arrayStmts +
+      `${i}await (async () => { ${mark}const __a = [${argList.join(", ")}]; ` +
+      `return sh.withEnv({ ${env} }, () => ${call}); })();`;
   }
 
   private functionDef(cmd: FunctionDef, ind: number): string {
