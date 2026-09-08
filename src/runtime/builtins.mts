@@ -449,6 +449,52 @@ const read: Builtin = (shell, ...args) => {
   return 0;
 };
 
+const mapfile: Builtin = (shell, ...args) => {
+  let strip = false;
+  let delim = "\n";
+  let count = 0; // 0 = read all
+  let skip = 0;
+  let origin = 0;
+  let haveOrigin = false;
+  let name = "MAPFILE";
+  let i = 0;
+  for (; i < args.length; i++) {
+    const a = args[i]!;
+    if (a === "-t") { strip = true; continue; }
+    if (a === "-d") { const d = args[++i] ?? ""; delim = d === "" ? "\0" : d[0]!; continue; }
+    if (a === "-n") { count = toInt(args[++i] ?? "0"); continue; }
+    if (a === "-s") { skip = toInt(args[++i] ?? "0"); continue; }
+    if (a === "-O") { origin = toInt(args[++i] ?? "0"); haveOrigin = true; continue; }
+    if (a === "-c" || a === "-C" || a === "-u") { i++; continue; } // consume + ignore
+    if (a.length > 1 && a[0] === "-") continue; // other flags: ignore
+    break; // first operand: the array name (options after it are ignored)
+  }
+  if (i < args.length) name = args[i]!;
+
+  const data = shell.stdinData ?? "";
+  shell.stdinData = "";
+  // Split into records that each still carry their trailing delimiter.
+  const records: string[] = [];
+  let start = 0;
+  let idx: number;
+  while ((idx = data.indexOf(delim, start)) >= 0) {
+    records.push(data.slice(start, idx + delim.length));
+    start = idx + delim.length;
+  }
+  if (start < data.length) records.push(data.slice(start));
+
+  let lines = records;
+  if (skip > 0) lines = lines.slice(skip);
+  if (count > 0) lines = lines.slice(0, count);
+  const values = strip
+    ? lines.map((r) => (r.endsWith(delim) ? r.slice(0, -delim.length) : r))
+    : lines;
+
+  if (haveOrigin) values.forEach((v, i) => shell.setElem(name, origin + i, v));
+  else shell.setArray(name, values);
+  return 0;
+};
+
 /* ---- test / [ ---- */
 
 const statOf = (p: string) => {
@@ -589,6 +635,8 @@ export const builtins: Record<string, Builtin> = {
   typeset: declareBuiltin,
   readonly: readonlyBuiltin,
   read,
+  mapfile,
+  readarray: mapfile,
   test,
   "[": bracket,
 };
