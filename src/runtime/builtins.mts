@@ -276,6 +276,23 @@ const shift: Builtin = (shell, ...args) => {
   return 0;
 };
 
+const letBuiltin: Builtin = async (shell, ...args) => {
+  if (args.length === 0) {
+    shell.io.err("let: expression expected\n");
+    return 1;
+  }
+  let nonzero = false;
+  for (const a of args) {
+    try {
+      nonzero = a.trim() !== "" && (await shell.arithTest(a));
+    } catch (e) {
+      shell.io.err(`let: ${a}: ${e instanceof Error ? e.message : String(e)}\n`);
+      return 1;
+    }
+  }
+  return nonzero ? 0 : 1;
+};
+
 const breakBuiltin: Builtin = (shell, ...args) => {
   if (shell.loopDepth <= 0) return 0; // no-op outside a loop (bash warns to stderr)
   throw new LoopSignal("break", args.length > 0 ? Math.max(1, toInt(args[0]!)) : 1);
@@ -905,6 +922,7 @@ export const builtins: Record<string, Builtin> = {
   return: returnBuiltin,
   exit: exitBuiltin,
   shift,
+  let: letBuiltin,
   break: breakBuiltin,
   continue: continueBuiltin,
   getopts,
