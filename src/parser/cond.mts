@@ -78,6 +78,42 @@ const tokenize = (s: string): Tok[] => {
     return w;
   };
 
+  // After `=~`, bash reads the RHS as one regex operand: unquoted `( )` and
+  // `[ ]` group (whitespace inside them is kept), and top-level whitespace or
+  // `&& || )` ends it. Metacharacters are not cond operators here.
+  const readRegex = (): string => {
+    let w = "";
+    let paren = 0;
+    let bracket = 0;
+    while (i < s.length) {
+      const d = s[i]!;
+      if (d === "'" || d === '"') {
+        w += d;
+        i++;
+        while (i < s.length && s[i] !== d) {
+          if (d === '"' && s[i] === "\\") { w += s[i++]; if (i < s.length) w += s[i++]; continue; }
+          w += s[i++];
+        }
+        if (i < s.length) w += s[i++];
+        continue;
+      }
+      if (d === "\\") { w += s[i++]; if (i < s.length) w += s[i++]; continue; }
+      if (paren === 0 && bracket === 0) {
+        if (isBlank(d)) break;
+        if (d === ")") break;
+        if (d === "&" && s[i + 1] === "&") break;
+        if (d === "|" && s[i + 1] === "|") break;
+      }
+      if (d === "(") paren++;
+      else if (d === ")" && paren > 0) paren--;
+      else if (d === "[") bracket++;
+      else if (d === "]" && bracket > 0) bracket--;
+      w += d;
+      i++;
+    }
+    return w;
+  };
+
   while (i < s.length) {
     const c = s[i]!;
     if (isBlank(c)) {
@@ -87,7 +123,14 @@ const tokenize = (s: string): Tok[] => {
     if (c === "&" && s[i + 1] === "&") { toks.push({ t: "op", v: "&&" }); i += 2; continue; }
     if (c === "|" && s[i + 1] === "|") { toks.push({ t: "op", v: "||" }); i += 2; continue; }
     if (c === "=" && s[i + 1] === "=") { toks.push({ t: "op", v: "==" }); i += 2; continue; }
-    if (c === "=" && s[i + 1] === "~") { toks.push({ t: "op", v: "=~" }); i += 2; continue; }
+    if (c === "=" && s[i + 1] === "~") {
+      toks.push({ t: "op", v: "=~" });
+      i += 2;
+      while (i < s.length && isBlank(s[i]!)) i++;
+      const rx = readRegex();
+      if (rx !== "") toks.push({ t: "word", v: rx });
+      continue;
+    }
     if (c === "=") { toks.push({ t: "op", v: "=" }); i++; continue; }
     if (c === "!" && s[i + 1] === "=") { toks.push({ t: "op", v: "!=" }); i += 2; continue; }
     if (c === "!") { toks.push({ t: "op", v: "!" }); i++; continue; }

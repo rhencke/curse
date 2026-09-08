@@ -60,6 +60,30 @@ const ASSIGN = /^([A-Za-z_][A-Za-z0-9_]*)(\[([^\]]*)\])?(\+)?=([\s\S]*)$/;
 
 const errMsg = (e: unknown): string => (e instanceof Error ? e.message : String(e));
 
+/** Index just past the `$…` expansion at `i` (raw[i] === "$"), else `i`. */
+const expansionEnd = (raw: string, i: number): number => {
+  const n = raw[i + 1];
+  if (n === undefined) return i;
+  if (n === "(" || n === "{") {
+    const open = n;
+    const close = open === "(" ? ")" : "}";
+    let depth = 0;
+    let j = i + 1;
+    for (; j < raw.length; j++) {
+      if (raw[j] === open) depth++;
+      else if (raw[j] === close && --depth === 0) return j + 1;
+    }
+    return raw.length; // unbalanced — consume the rest
+  }
+  if (/[A-Za-z_]/.test(n)) {
+    let j = i + 2;
+    while (j < raw.length && /[A-Za-z0-9_]/.test(raw[j]!)) j++;
+    return j;
+  }
+  if ("?@*#$!0123456789".includes(n)) return i + 2;
+  return i;
+};
+
 /** Run a subshell body, turning `exit` into that subshell's status. */
 const runBody = async (sub: Shell, fn: (sh: Shell) => Promise<unknown>): Promise<number> => {
   try {
@@ -787,12 +811,6 @@ export class Shell {
     switch (op) {
       case "==": case "=": return globMatch(l, r);
       case "!=": return !globMatch(l, r);
-      case "=~":
-        try {
-          return new RegExp(r).test(l);
-        } catch {
-          return false;
-        }
       case "<": return l < r;
       case ">": return l > r;
       case "-eq": return intOf(l) === intOf(r);
@@ -815,6 +833,62 @@ export class Shell {
       default:
         return false;
     }
+  }
+
+  /** `[[ str =~ re ]]` — match against an ERE and populate BASH_REMATCH.
+   *  `rawRhs` is the unexpanded RHS word: unquoted text and unquoted
+   *  expansions are regex; quoted/escaped portions match literally. */
+  async condMatch(subject: string, rawRhs: string): Promise<boolean> {
+    let re: RegExp;
+    try {
+      re = new RegExp(await this.condRegex(rawRhs));
+    } catch (e) {
+      this.io.err(`${this.name}: ${rawRhs}: ${errMsg(e)}\n`);
+      this.status = 2;
+      return false;
+    }
+    const m = re.exec(subject);
+    this.setArray("BASH_REMATCH", m === null ? [] : Array.from(m, (g) => g ?? ""));
+    return m !== null;
+  }
+
+  /** Build a JS regex source from a `[[ =~ ]]` RHS word. */
+  private async condRegex(raw: string): Promise<string> {
+    const esc = (s: string): string => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    let src = "";
+    let i = 0;
+    while (i < raw.length) {
+      const c = raw[i]!;
+      if (c === "\\") {
+        const n = raw[i + 1];
+        if (n === undefined) { src += "\\\\"; i++; } else { src += esc(n); i += 2; }
+        continue;
+      }
+      if (c === "'") {
+        i++;
+        while (i < raw.length && raw[i] !== "'") { src += esc(raw[i]!); i++; }
+        i++;
+        continue;
+      }
+      if (c === '"') {
+        i++;
+        let seg = "";
+        while (i < raw.length && raw[i] !== '"') {
+          if (raw[i] === "\\" && i + 1 < raw.length) { seg += raw[i]! + raw[i + 1]!; i += 2; continue; }
+          seg += raw[i]!; i++;
+        }
+        i++;
+        src += esc(await expandNoSplit(this, seg));
+        continue;
+      }
+      if (c === "$") {
+        const end = expansionEnd(raw, i);
+        if (end > i) { src += await expandNoSplit(this, raw.slice(i, end)); i = end; continue; }
+      }
+      src += c;
+      i++;
+    }
+    return src;
   }
 
   /** Apply `!` inversion in generated code. */
@@ -1146,6 +1220,9 @@ export class Shell {
       case "word": return (await expandNoSplit(this, e.w.text)) !== "";
       case "unary": return this.condUnary(e.op, await expandNoSplit(this, e.arg.text));
       case "binary":
+        // `=~` keeps its RHS unexpanded: quoting there is regex-literal, and
+        // the match populates BASH_REMATCH.
+        if (e.op === "=~") return this.condMatch(await expandNoSplit(this, e.l.text), e.r.text);
         return this.condBinary(
           await expandNoSplit(this, e.l.text),
           e.op,

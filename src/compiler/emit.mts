@@ -243,6 +243,9 @@ class Emitter {
         const l = this.templateOf(parseWord(e.l.text).parts);
         if (e.op === "==" || e.op === "=") return this.matchExpr(l, e.r.text);
         if (e.op === "!=") return `(!${this.matchExpr(l, e.r.text)})`;
+        // `=~` keeps its RHS raw so condMatch applies regex-literal quoting and
+        // sets BASH_REMATCH.
+        if (e.op === "=~") return `(await sh.condMatch(${l}, ${JSON.stringify(e.r.text)}))`;
         const r = this.templateOf(parseWord(e.r.text).parts);
         return `sh.condBinary(${l}, ${JSON.stringify(e.op)}, ${r})`;
       }
