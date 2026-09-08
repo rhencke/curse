@@ -28,7 +28,8 @@ export type WordPart =
   | { k: "lit"; s: string } // literal text (quote-removed); never splits
   | { k: "param"; p: Param; quoted: boolean } // $name / ${...}
   | { k: "arith"; expr: string; quoted: boolean } // $(( expr ))
-  | { k: "cmdsub"; src: string; quoted: boolean }; // $( cmds )
+  | { k: "cmdsub"; src: string; quoted: boolean } // $( cmds )
+  | { k: "procsub"; dir: string; src: string }; // <( cmds ) / >( cmds )
 
 const simpleParam = (name: string, special: boolean): Param => ({
   name,
@@ -140,6 +141,14 @@ class WordParser {
         }
         this.flushLit();
         this.dollar(false);
+        continue;
+      }
+      // Process substitution `<(cmds)` / `>(cmds)` -> a /dev-fd-like path.
+      if ((c === "<" || c === ">") && this.at(1) === "(") {
+        this.flushLit();
+        this.i += 2; // past `<(` / `>(`
+        this.parts.push({ k: "procsub", dir: c, src: this.balanced(1, "(", ")") });
+        this.anchored = true;
         continue;
       }
       this.pushLit(c);

@@ -176,6 +176,11 @@ class Emitter {
         const body = sub === null ? "" : this.command(sub, 0);
         return `await sh.sub(async (sh) => {\n${body}\n})`;
       }
+      case "procsub": {
+        const sub = parse(p.src);
+        const body = sub === null ? "" : this.command(sub, 0);
+        return `await sh.procSubFn(${JSON.stringify(p.dir)}, async (sh) => {\n${body}\n})`;
+      }
     }
   }
 
@@ -192,7 +197,9 @@ class Emitter {
   private fieldArg(p: WordPart): string {
     if (p.k === "lit") return JSON.stringify(p.s);
     const v = this.valueExpr(p);
-    return p.quoted ? "`${" + v + "}`" : `sh.S(${v})`;
+    // A process-sub path is a single token: never split or glob it.
+    if (p.k === "procsub" || p.quoted) return "`${" + v + "}`";
+    return `sh.S(${v})`;
   }
 
   private word(text: string): WordCode {
@@ -227,7 +234,7 @@ class Emitter {
     // Mixed with other text: `@`/`[@]` flows through as a scalar join (valStr),
     // matching how the interpreter and `echo` render it.
 
-    const needsSplit = pw.parts.some((p) => p.k !== "lit" && !p.quoted);
+    const needsSplit = pw.parts.some((p) => p.k !== "lit" && p.k !== "procsub" && !p.quoted);
     const litMeta = pw.parts.some((p) => p.k === "lit" && /[*?[]/.test(p.s));
     // An unquoted word may glob (any resulting metachar is active).
     const globbable = !pw.hasQuote && (needsSplit || litMeta);

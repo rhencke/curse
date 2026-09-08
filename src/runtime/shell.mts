@@ -31,9 +31,11 @@ import { ExitSignal, ReturnSignal, Var } from "./types.mts";
 import type { IO } from "./types.mts";
 import { spawn } from "node:child_process";
 import {
-  accessSync, closeSync, constants, lstatSync, openSync, readFileSync, statSync, writeSync,
+  accessSync, closeSync, constants, lstatSync, openSync, readFileSync, statSync, unlinkSync,
+  writeFileSync, writeSync,
 } from "node:fs";
-import { resolve } from "node:path";
+import { join, resolve } from "node:path";
+import { tmpdir } from "node:os";
 
 export type { IO } from "./types.mts";
 export { ExitSignal, ReturnSignal, Var } from "./types.mts";
@@ -59,6 +61,19 @@ interface RedirIO {
 const ASSIGN = /^([A-Za-z_][A-Za-z0-9_]*)(\[([^\]]*)\])?(\+)?=([\s\S]*)$/;
 
 const errMsg = (e: unknown): string => (e instanceof Error ? e.message : String(e));
+
+/** Temp files backing process substitutions, unlinked when the process exits. */
+let procSubSeq = 0;
+const procSubFiles: string[] = [];
+process.on("exit", () => {
+  for (const f of procSubFiles) {
+    try {
+      unlinkSync(f);
+    } catch {
+      /* already gone */
+    }
+  }
+});
 
 /** Index just past the `$…` expansion at `i` (raw[i] === "$"), else `i`. */
 const expansionEnd = (raw: string, i: number): number => {
@@ -496,6 +511,24 @@ export class Shell {
   /** Command substitution (interpreter): parse + run a source string. */
   async subSrc(src: string): Promise<string> {
     return this.sub(async (sh) => {
+      await sh.runString(src);
+    });
+  }
+
+  /** Process substitution: run `fn` in a subshell, capture its output to a
+   *  temp file, and return the path (`<(cmds)`). Does not affect `$?`. */
+  async procSubFn(dir: string, fn: (sh: Shell) => Promise<void>): Promise<string> {
+    const chunks: string[] = [];
+    const subsh = this.cloneForSubshell({ out: (s) => void chunks.push(s), err: (s) => this.io.err(s) });
+    await runBody(subsh, fn);
+    const file = join(tmpdir(), `curse-ps-${process.pid}-${procSubSeq++}`);
+    writeFileSync(file, dir === "<" ? chunks.join("") : "");
+    procSubFiles.push(file);
+    return file;
+  }
+  /** Process substitution (interpreter): parse + run a source string. */
+  procSub(dir: string, src: string): Promise<string> {
+    return this.procSubFn(dir, async (sh) => {
       await sh.runString(src);
     });
   }

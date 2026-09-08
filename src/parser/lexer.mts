@@ -136,6 +136,10 @@ class Lexer {
       this.i++;
       return { type: "OP", value: "|", pos, line };
     }
+    // Process substitution `<(cmds)` / `>(cmds)` is a word, not a redirection.
+    if ((c === "<" || c === ">") && this.at(1) === "(") {
+      return { type: "WORD", value: this.readWord(), pos, line };
+    }
     if (c === "<" || c === ">") {
       return this.readRedir("", pos, line);
     }
@@ -216,7 +220,13 @@ class Lexer {
     let buf = "";
     for (;;) {
       const c = this.at();
-      if (c === undefined || isMeta(c)) break;
+      if (c === undefined) break;
+      // Process substitution `<(...)` / `>(...)` is part of the word.
+      if ((c === "<" || c === ">") && this.at(1) === "(") {
+        buf += this.scanBalanced(c + "(", "(", ")", 1);
+        continue;
+      }
+      if (isMeta(c)) break;
 
       if (c === "\\") {
         const nc = this.at(1);

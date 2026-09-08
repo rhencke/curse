@@ -175,6 +175,7 @@ const partValue = async (shell: Shell, p: Exclude<WordPart, { k: "lit" }>): Prom
     case "param": return evalParam(shell, p.p);
     case "arith": return evalArith(shell, await expandNoSplit(shell, p.expr)).toString();
     case "cmdsub": return shell.subSrc(p.src);
+    case "procsub": return shell.procSub(p.dir, p.src);
   }
 };
 
@@ -216,7 +217,7 @@ export const expandWord = async (shell: Shell, word: Word): Promise<string[]> =>
       continue;
     }
     const val = await partValue(shell, p);
-    const splittable = !p.quoted;
+    const splittable = p.k !== "procsub" && !p.quoted;
     for (const c of val) {
       chars.push(c);
       sp.push(splittable);
