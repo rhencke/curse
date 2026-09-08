@@ -4,8 +4,8 @@
  * the command registry, so a bash function of the same name shadows it (and
  * `unset -f` reveals it again). Called via the shell, never bound to `this`. */
 
-import { resolve } from "node:path";
-import { accessSync, constants, lstatSync, readFileSync, statSync } from "node:fs";
+import { isAbsolute, resolve } from "node:path";
+import { accessSync, constants, lstatSync, readFileSync, realpathSync, statSync } from "node:fs";
 import type { Shell } from "./shell.mts";
 import { ExitSignal, LoopSignal, ReturnSignal } from "./types.mts";
 
@@ -300,29 +300,72 @@ const printf: Builtin = async (shell, ...args) => {
   return 0;
 };
 
-const pwd: Builtin = (shell) => {
-  shell.io.out(shell.cwd + "\n");
+const pwd: Builtin = (shell, ...args) => {
+  // pwd -P prints the physical path (symlinks resolved); -L (default) logical.
+  let dir = shell.cwd;
+  if (args.includes("-P")) {
+    try { dir = realpathSync(shell.cwd); } catch { /* keep logical */ }
+  }
+  shell.io.out(dir + "\n");
   return 0;
 };
 
 const cd: Builtin = (shell, ...args) => {
-  const target = args[0] ?? shell.getVar("HOME") ?? "";
-  if (target === "") {
-    shell.io.err("cd: HOME not set\n");
+  let physical = false;
+  let i = 0;
+  for (; i < args.length; i++) {
+    const a = args[i]!;
+    if (a === "--") { i++; break; }
+    if (a === "-L") physical = false;
+    else if (a === "-P") physical = true;
+    else break;
+  }
+  if (args.length - i > 1) {
+    shell.io.err("cd: too many arguments\n");
     return 1;
   }
-  const dest = resolve(shell.cwd, target);
-  try {
-    if (!statSync(dest).isDirectory()) {
-      shell.io.err(`cd: ${target}: Not a directory\n`);
-      return 1;
+  let target = args[i];
+  const oldpwd = shell.getVar("PWD") ?? shell.cwd;
+  let announce = false; // `cd -` and CDPATH hits echo the destination
+  if (target === undefined) {
+    target = shell.getVar("HOME");
+    if (target === undefined || target === "") { shell.io.err("cd: HOME not set\n"); return 1; }
+  } else if (target === "-") {
+    const old = shell.getVar("OLDPWD");
+    if (old === undefined) { shell.io.err("cd: OLDPWD not set\n"); return 1; }
+    target = old;
+    announce = true;
+  } else if (
+    !isAbsolute(target) && target !== "." && target !== ".." &&
+    !target.startsWith("./") && !target.startsWith("../")
+  ) {
+    // CDPATH: search each entry for the target directory.
+    const cdpath = shell.getVar("CDPATH");
+    if (cdpath !== undefined && cdpath !== "") {
+      for (const entry of cdpath.split(":")) {
+        const cand = resolve(shell.cwd, entry === "" ? "." : entry, target);
+        try {
+          if (statSync(cand).isDirectory()) { target = cand; announce = true; break; }
+        } catch { /* try next entry */ }
+      }
     }
+  }
+  // Existence check uses the raw (un-collapsed) path so a missing intermediate
+  // in `cd BAD/..` is caught, matching bash rather than Node's path collapsing.
+  const raw = isAbsolute(target) ? target : shell.cwd + "/" + target;
+  try {
+    if (!statSync(raw).isDirectory()) { shell.io.err(`cd: ${target}: Not a directory\n`); return 1; }
   } catch {
     shell.io.err(`cd: ${target}: No such file or directory\n`);
     return 1;
   }
+  const dest = physical ? realpathSync(raw) : resolve(shell.cwd, target);
   shell.cwd = dest;
+  if (announce) shell.io.out(dest + "\n");
+  shell.setVar("OLDPWD", oldpwd);
+  shell.exportVar("OLDPWD");
   shell.setVar("PWD", dest);
+  shell.exportVar("PWD");
   return 0;
 };
 
