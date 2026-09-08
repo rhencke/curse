@@ -287,16 +287,18 @@ class AParser {
 /* ---------- evaluation ---------- */
 
 const readVar = (shell: Shell, name: string, index: Node | undefined, depth: number): bigint => {
+  // The subscript is evaluated arithmetically; its string form is the assoc
+  // key or (parsed back to a number) the indexed slot — elemValueSync decides.
   const raw = index === undefined
     ? shell.getVar(name)
-    : shell.arrayGet(name, Number(evalNode(shell, index, depth)));
+    : shell.elemValueSync(name, evalNode(shell, index, depth).toString());
   if (raw === undefined || raw.trim() === "") return 0n;
   return evalArith(shell, raw, depth + 1);
 };
 
 const writeVar = (shell: Shell, name: string, index: Node | undefined, value: bigint, depth: number): void => {
   if (index === undefined) shell.setVar(name, value.toString());
-  else shell.setElem(name, Number(evalNode(shell, index, depth)), value.toString());
+  else shell.setElemSync(name, evalNode(shell, index, depth).toString(), value.toString());
 };
 
 const evalNode = (shell: Shell, n: Node, depth: number): bigint => {

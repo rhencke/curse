@@ -336,8 +336,8 @@ export class Shell {
     if (v) v.ref = false;
   }
   /** Read `base[sub]` synchronously (arithmetic index / assoc key / `@`/`*`),
-   *  shared by `${!ref}` and nameref-to-element resolution. */
-  private elemValueSync(base: string, sub: string): string | undefined {
+   *  shared by `${!ref}`, nameref resolution, and arithmetic array reads. */
+  elemValueSync(base: string, sub: string): string | undefined {
     const v = this.lookup(base);
     if (v === undefined) return undefined;
     if (v.assoc !== null) return v.assoc.get(sub);
@@ -345,8 +345,9 @@ export class Shell {
     if (v.arr !== null) return this.arrayGet(base, Number(evalArith(this, sub)));
     return sub === "0" ? v.value : undefined; // scalar as element 0
   }
-  /** Write `base[sub]` synchronously — used for assignment through a nameref. */
-  private setElemSync(base: string, sub: string, value: string): void {
+  /** Write `base[sub]` synchronously (assoc key or arithmetic index) — used by
+   *  namerefs and arithmetic array assignment. */
+  setElemSync(base: string, sub: string, value: string): void {
     const v = this.lookup(base);
     if (v && v.assoc !== null) { this.varForWriteRaw(this.deref(base)).assoc!.set(sub, value); return; }
     this.setElem(base, Number(evalArith(this, sub)), value);
@@ -639,9 +640,14 @@ export class Shell {
     this.fillArray(this.toArray(v), fields, this.maxIndex(v) + 1);
   }
   private fillAssoc(assoc: Map<string, string>, fields: string[]): void {
-    for (const f of fields) {
+    let i = 0;
+    while (i < fields.length) {
+      const f = fields[i]!;
       const m = /^\[([\s\S]*?)\]=([\s\S]*)$/.exec(f);
-      if (m) assoc.set(m[1]!, m[2]!);
+      if (m) { assoc.set(m[1]!, m[2]!); i++; continue; }
+      // A bare word is a key; the following word is its value (`(k1 v1 k2 v2)`).
+      assoc.set(f, fields[i + 1] ?? "");
+      i += 2;
     }
   }
 
