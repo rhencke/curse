@@ -150,6 +150,17 @@ class Parser {
   }
 
   private parsePipeline(): Command {
+    // `time [-p]` prefix: run the pipeline, timing to stderr (which we drop).
+    if (this.wordIs("time")) {
+      this.advance();
+      if (this.wordIs("-p")) this.advance();
+      const t = this.peek();
+      const startsCmd =
+        t.type === "WORD" || t.type === "ARITH" || t.type === "COND" ||
+        (t.type === "OP" && t.value === "(");
+      if (startsCmd) return this.parsePipeline();
+      return simple([makeWord(":")], []); // `time` alone times a null command
+    }
     let invert = false;
     if (this.wordIs("!")) {
       this.advance();
