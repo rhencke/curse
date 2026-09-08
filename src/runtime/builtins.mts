@@ -846,19 +846,31 @@ const declareBuiltin: Builtin = (shell, ...args) => {
     const names = opNames();
     return names.every((n) => shell.hasFunction(n)) ? 0 : 1;
   }
-  // declare -p [name...]: print definitions.
-  if (args.includes("-p")) {
+  // declare -p [name...]: print definitions (`p` may be bundled, e.g. -pa).
+  if (dashFlags.some((f) => f[0] === "-" && f.includes("p"))) {
     const targets = args.filter((a) => a[0] !== "-" && a[0] !== "+").map((a) => {
       const eq = a.indexOf("=");
       return eq >= 0 ? a.slice(0, eq) : a;
     });
-    // `declare -p` with no names prints every variable in declare form.
+    // `declare -p` with no names prints every variable in declare form; any
+    // attribute flags (declare -pa, -pA, -pi, -pr, …) restrict it to variables
+    // that carry all of those attributes.
     if (targets.length === 0) {
-      for (const name of shell.matchNames("")) {
-        if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(name)) continue;
-        const line = shell.declareLine(name);
-        if (line !== null) shell.io.out(line + "\n");
-      }
+      const letters = dashFlags
+        .filter((f) => f[0] === "-")
+        .flatMap((f) => [...f.slice(1)])
+        .filter((c) => "aAilurxn".includes(c));
+      const pred = (v: { arr: unknown; assoc: unknown; integer: boolean; lower: boolean; upper: boolean; readonly: boolean; exported: boolean; ref: boolean }): boolean =>
+        letters.every((c) =>
+          c === "a" ? v.arr !== null
+          : c === "A" ? v.assoc !== null
+          : c === "i" ? v.integer
+          : c === "l" ? v.lower
+          : c === "u" ? v.upper
+          : c === "r" ? v.readonly
+          : c === "x" ? v.exported
+          : v.ref);
+      for (const line of shell.declareLinesWhere(pred)) shell.io.out(line + "\n");
       return 0;
     }
     let status = 0;
@@ -875,8 +887,15 @@ const declareBuiltin: Builtin = (shell, ...args) => {
   }
   const { flags, names } = parseDeclFlags(args);
   const clearRef = dashFlags.some((f) => f[0] === "+" && f.includes("n"));
+  let status = 0;
   for (const n of names) {
     const { name, value, append } = splitNameVal(n);
+    // A target must be a valid identifier or an array-element reference.
+    if (!/^[A-Za-z_][A-Za-z0-9_]*(\[.*\])?$/.test(name)) {
+      shell.io.err(`${shell.name}: declare: \`${name}': not a valid identifier\n`);
+      status = 1;
+      continue;
+    }
     if (clearRef) { shell.clearRef(name); continue; }
     if (flags.nameref) {
       shell.setRef(name, value ?? "");
@@ -893,7 +912,7 @@ const declareBuiltin: Builtin = (shell, ...args) => {
     if (flags.readonly) shell.setAttrs(name, { readonly: true });
     if (flags.exported) shell.exportVar(name);
   }
-  return 0;
+  return status;
 };
 
 const readonlyBuiltin: Builtin = (shell, ...args) => {
