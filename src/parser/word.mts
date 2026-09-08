@@ -531,13 +531,25 @@ class WordParser {
   }
 }
 
+/** Find the first `ch` that isn't backslash-escaped or inside `'…'`/`"…"`.
+ *  Used to split a patsub `${v/pat/repl}` on its pattern/replacement `/`, which
+ *  bash does not do inside quotes (so `${x//'/'/c}` keeps the quoted slash). */
 const indexOfUnescaped = (s: string, ch: string): number => {
   for (let i = 0; i < s.length; i++) {
-    if (s[i] === "\\") {
-      i++;
+    const c = s[i];
+    if (c === "\\") { i++; continue; }
+    if (c === "'") {
+      const e = s.indexOf("'", i + 1);
+      if (e < 0) return -1; // unterminated: let the pattern parser report it
+      i = e;
       continue;
     }
-    if (s[i] === ch) return i;
+    if (c === '"') {
+      i++;
+      while (i < s.length && s[i] !== '"') i += s[i] === "\\" ? 2 : 1;
+      continue;
+    }
+    if (c === ch) return i;
   }
   return -1;
 };
@@ -666,10 +678,18 @@ export function parseParam(inner: string): Param {
   if (a === "/") {
     let body = rest.slice(1);
     p.op = "/";
+    let anchored = false;
     if (body[0] === "/") { p.op = "//"; body = body.slice(1); }
-    else if (body[0] === "#") { p.op = "/#"; body = body.slice(1); }
-    else if (body[0] === "%") { p.op = "/%"; body = body.slice(1); }
-    const si = indexOfUnescaped(body, "/");
+    else if (body[0] === "#") { p.op = "/#"; body = body.slice(1); anchored = true; }
+    else if (body[0] === "%") { p.op = "/%"; body = body.slice(1); anchored = true; }
+    let si = indexOfUnescaped(body, "/");
+    // A leading unquoted `/` in the pattern position is a literal pattern
+    // character, not the pat/repl delimiter (bash: `${x////c}` -> pat `/`,
+    // repl `c`). The anchored `/#`/`/%` forms keep an empty leading pattern.
+    if (si === 0 && !anchored) {
+      const next = indexOfUnescaped(body.slice(1), "/");
+      si = next < 0 ? -1 : next + 1;
+    }
     if (si >= 0) {
       p.arg = body.slice(0, si);
       p.arg2 = body.slice(si + 1);
