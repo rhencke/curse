@@ -14,7 +14,7 @@
 
 import type {
   ArithForCommand, ArrayArg, CaseCommand, Command, CondCommand, CondExpr, ForCommand,
-  FunctionDef, IfCommand, Redirect, SimpleCommand, WhileCommand, Word,
+  FunctionDef, IfCommand, Redirect, SelectCommand, SimpleCommand, WhileCommand, Word,
 } from "../ast/nodes.mts";
 import { CMD_INVERT_RETURN } from "../ast/nodes.mts";
 import { parse } from "../parser/parser.mts";
@@ -1236,6 +1236,9 @@ export class Shell {
       case "for":
         status = await this.execFor(cmd);
         break;
+      case "select":
+        status = await this.execSelect(cmd);
+        break;
       case "arith_for":
         status = await this.execArithFor(cmd);
         break;
@@ -1472,6 +1475,63 @@ export class Shell {
       falling = clause.term === "fall"; // ";&" runs the next body, ";;&" resumes testing
     }
     return this.status;
+  }
+
+  private async execSelect(cmd: SelectCommand): Promise<number> {
+    const items = await expandWords(this, cmd.words);
+    await this.runSelect(cmd.name, items, (sh) => sh.execute(cmd.body));
+    return this.status;
+  }
+
+  /** Read one line from stdin (like `read`), or null at EOF. */
+  private readInputLine(): string | null {
+    if (this.stdinData === null || this.stdinData === "") return null;
+    const data = this.stdinData;
+    const nl = data.indexOf("\n");
+    const line = nl >= 0 ? data.slice(0, nl) : data;
+    this.stdinData = nl >= 0 ? data.slice(nl + 1) : "";
+    return line;
+  }
+
+  /** The `select` loop, shared by the interpreter and generated code. The menu
+   *  and PS3 prompt go to stderr; REPLY holds the raw line, `name` the chosen
+   *  item (empty for an out-of-range choice). Ends on EOF or `break`. */
+  async runSelect(name: string, items: string[], runBody: (sh: Shell) => Promise<unknown>): Promise<void> {
+    this.loopDepth++;
+    let showMenu = true;
+    try {
+      for (;;) {
+        if (showMenu) {
+          for (let k = 0; k < items.length; k++) this.io.err(`${k + 1}) ${items[k]}\n`);
+        }
+        this.io.err(this.getVar("PS3") ?? "#? ");
+        const line = this.readInputLine();
+        if (line === null) {
+          this.io.out("\n"); // bash emits a newline to stdout on EOF
+          break;
+        }
+        this.setVar("REPLY", line);
+        if (line.trim() === "") {
+          showMenu = true;
+          continue;
+        }
+        showMenu = false;
+        const n = Number(line.trim());
+        this.setVar(name, Number.isInteger(n) && n >= 1 && n <= items.length ? items[n - 1]! : "");
+        try {
+          await runBody(this);
+        } catch (e) {
+          if (e instanceof LoopSignal) {
+            if (--e.count > 0) throw e;
+            if (e.kind === "break") break;
+            continue;
+          }
+          throw e;
+        }
+      }
+    } finally {
+      this.loopDepth--;
+    }
   }
 
   private async execArithFor(cmd: ArithForCommand): Promise<number> {

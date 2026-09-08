@@ -46,6 +46,7 @@ export type Command =
   | IfCommand
   | WhileCommand
   | ForCommand
+  | SelectCommand
   | ArithForCommand
   | ArithCommand
   | CaseCommand
@@ -128,6 +129,14 @@ export interface ForCommand extends CommandBase {
   type: "for";
   name: string;
   words: Word[]; // list to iterate; empty => "$@"
+  body: Command;
+}
+
+/** SELECT_COM (command.h): `select name [in words]; do ... done`. */
+export interface SelectCommand extends CommandBase {
+  type: "select";
+  name: string;
+  words: Word[];
   body: Command;
 }
 

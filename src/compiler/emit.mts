@@ -54,7 +54,7 @@ const usesSet = (cmd: Command): boolean => {
       return usesSet(cmd.test) || usesSet(cmd.consequent) ||
         (cmd.alternate !== null && usesSet(cmd.alternate));
     case "while": return usesSet(cmd.test) || usesSet(cmd.body);
-    case "for": case "arith_for": case "function": return usesSet(cmd.body);
+    case "for": case "select": case "arith_for": case "function": return usesSet(cmd.body);
     case "case": return cmd.clauses.some((c) => c.body !== null && usesSet(c.body));
     case "arith": case "cond": case "array_assign": return false;
   }
@@ -487,6 +487,15 @@ class Emitter {
           this.loopBody(cmd.body, ind + 1) + "\n" +
           `${i}}`,
           ind,
+        );
+      }
+      case "select": {
+        const listFrags: string[] = [];
+        for (const w of cmd.words) for (const t of braceExpand(w.text)) listFrags.push(this.word(t).code);
+        return (
+          `${i}await sh.runSelect(${JSON.stringify(cmd.name)}, [${listFrags.join(", ")}], async (sh) => {\n` +
+          this.command(cmd.body, ind + 1) + "\n" +
+          `${i}});`
         );
       }
       case "arith_for":

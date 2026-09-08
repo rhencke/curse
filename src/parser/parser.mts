@@ -189,6 +189,7 @@ class Parser {
         case "while": return this.trailingRedirects(this.parseWhile(false));
         case "until": return this.trailingRedirects(this.parseWhile(true));
         case "for": return this.trailingRedirects(this.parseFor());
+        case "select": return this.trailingRedirects(this.parseSelect());
         case "function": return this.parseFunctionKeyword();
         case "case": return this.trailingRedirects(this.parseCase());
       }
@@ -363,6 +364,29 @@ class Parser {
     const body = this.parseCompoundList(DONE);
     this.eatWord("done");
     return { type: "for", name, words, body };
+  }
+
+  private parseSelect(): Command {
+    this.eatWord("select");
+    const nameTok = this.peek();
+    if (nameTok.type !== "WORD" || !isName(nameTok.value)) {
+      throw new ParseError(`select: \`${nameTok.value || "<eof>"}\`: not a valid identifier (line ${nameTok.line})`);
+    }
+    this.advance();
+    const name = nameTok.value;
+
+    const words: Word[] = [];
+    if (this.wordIs("in")) {
+      this.advance();
+      while (this.peek().type === "WORD" && this.peek().value !== "do") {
+        words.push(makeWord(this.advance().value));
+      }
+    }
+    this.skipSeparators();
+    this.eatWord("do");
+    const body = this.parseCompoundList(DONE);
+    this.eatWord("done");
+    return { type: "select", name, words, body };
   }
 
   private parseCase(): Command {
