@@ -664,7 +664,9 @@ class Emitter {
         return this.guards ? s + `\n${i}await sh.afterCommand();` : s;
       }
       case "cond": {
-        const s = `${i}sh.status = ${this.cond(cmd.expr)} ? 0 : 1;`;
+        // condFatal is reset first; the cond expression may set it (an invalid
+        // `=~` regex), and condStatus then maps the result to 0/1 or 2.
+        const s = `${i}sh.condFatal = false;\n${i}sh.status = sh.condStatus(${this.cond(cmd.expr)});`;
         return this.guards ? s + `\n${i}await sh.afterCommand();` : s;
       }
       case "array_assign": {

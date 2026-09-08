@@ -182,8 +182,11 @@ class CondParser {
   }
   private expectWord(): Word {
     const t = this.next();
-    if (t.t !== "word") throw new CondError("conditional: expected an operand");
-    return makeWord(t.v);
+    if (t.t === "word") return makeWord(t.v);
+    // In operand position a bare `!` is a literal string; the negation operator
+    // is only recognized at the start of a term (`[[ '!' == ! ]]`).
+    if (t.t === "op" && t.v === "!") return makeWord("!");
+    throw new CondError("conditional: expected an operand");
   }
 
   parse(): CondExpr {

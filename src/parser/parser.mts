@@ -189,7 +189,7 @@ class Parser {
     }
     if (t.type === "COND") {
       this.advance();
-      return { type: "cond", expr: parseCond(t.value) };
+      return this.trailingRedirects({ type: "cond", expr: parseCond(t.value) });
     }
     if (t.type === "OP" && t.value === "(") return this.trailingRedirects(this.parseSubshell());
 

@@ -193,6 +193,9 @@ export class Shell {
   /** Set when an assignment/unset was refused because the target is readonly;
    *  the assignment/unset command turns this into exit status 1. */
   readonlyHit = false;
+  /** Set when a `[[ ]]` evaluation hit a fatal error (e.g. an invalid `=~`
+   *  regex); the conditional's status becomes 2 rather than the match result. */
+  condFatal = false;
 
   /** trap handlers by normalized signal name (EXIT, INT, …). */
   traps: Record<string, string> = Object.create(null) as Record<string, string>;
@@ -1432,6 +1435,11 @@ export class Shell {
   }
 
   /** `[[ ]]` binary test (used by generated code and the interpreter). */
+  /** Final status of a `[[ ]]`: 2 if the evaluation errored, else 0/1. */
+  condStatus(ok: boolean): number {
+    return this.condFatal ? 2 : ok ? 0 : 1;
+  }
+
   condBinary(l: string, op: string, r: string): boolean {
     const intOf = (s: string): bigint => {
       try {
@@ -1483,7 +1491,7 @@ export class Shell {
       re = new RegExp(await this.condRegex(rawRhs));
     } catch (e) {
       this.io.err(`${this.name}: ${rawRhs}: ${errMsg(e)}\n`);
-      this.status = 2;
+      this.condFatal = true;
       return false;
     }
     const m = re.exec(subject);
@@ -1495,9 +1503,15 @@ export class Shell {
   /** Walk a `[[ ]]` RHS word: quoted/escaped spans are passed through `esc`
    *  (making their metacharacters literal), unquoted text and expansions stay
    *  active. Shared by `=~` (regex) and `==` (glob) matching. */
-  private async condWalk(raw: string, esc: (s: string) => string): Promise<string> {
+  private async condWalk(raw: string, esc: (s: string) => string, tilde = false): Promise<string> {
     let out = "";
     let i = 0;
+    // A leading unquoted `~` / `~/…` in a `[[ ]]`, `case`, or `=~` pattern
+    // tilde-expands to $HOME as a literal (bash; not done for `${v#pat}` ops).
+    if (tilde && raw[0] === "~" && (raw.length === 1 || raw[1] === "/")) {
+      out += esc(this.getVar("HOME") ?? "");
+      i = 1;
+    }
     while (i < raw.length) {
       const c = raw[i]!;
       if (c === "\\") {
@@ -1533,19 +1547,19 @@ export class Shell {
   }
 
   private condRegex(raw: string): Promise<string> {
-    return this.condWalk(raw, (s) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"));
+    return this.condWalk(raw, (s) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), true);
   }
   /** `[[ x == pat ]]` / case / `${v/pat/…}` pattern — expand a word into a glob
    *  pattern where quoted or backslash-escaped metacharacters are escaped (so
    *  they match literally) while unquoted globs stay active, as bash does. */
-  patExpand(raw: string): Promise<string> {
-    return this.condWalk(raw, (s) => s.replace(/[^A-Za-z0-9]/g, "\\$&"));
+  patExpand(raw: string, tilde = false): Promise<string> {
+    return this.condWalk(raw, (s) => s.replace(/[^A-Za-z0-9]/g, "\\$&"), tilde);
   }
   /** Quote-aware glob match for `==`/`!=` and case, honouring nocasematch.
    *  `[[ ]]` always recognises extended patterns; `case`/globbing need the
    *  extglob option, so callers pass the flag they want. */
   async matchGlob(subject: string, rawPat: string, extglob = this.shopts.extglob): Promise<boolean> {
-    return globMatch(subject, await this.patExpand(rawPat), this.shopts.nocasematch, extglob);
+    return globMatch(subject, await this.patExpand(rawPat, true), this.shopts.nocasematch, extglob);
   }
 
   /** `$-` — the current single-letter option flags (bash order: e h u x B;
@@ -1785,7 +1799,8 @@ export class Shell {
         status = await this.execCase(cmd);
         break;
       case "cond":
-        this.status = (await this.evalCond(cmd.expr)) ? 0 : 1;
+        this.condFatal = false;
+        this.status = this.condStatus(await this.evalCond(cmd.expr));
         status = this.status;
         await this.afterCommand();
         break;
