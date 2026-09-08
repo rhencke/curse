@@ -924,6 +924,20 @@ export class Shell {
     }
     return null;
   }
+  /** Every executable named `name` found across PATH, in order (`type -a`). */
+  lookupAllPaths(name: string): string[] {
+    if (name.includes("/")) { const p = this.lookupPath(name); return p === null ? [] : [p]; }
+    const path = this.getVar("PATH") ?? process.env["PATH"] ?? "";
+    const out: string[] = [];
+    for (const dir of path.split(":")) {
+      if (dir === "") continue;
+      const p = resolve(dir, name);
+      try {
+        if (statSync(p).isFile()) { accessSync(p, constants.X_OK); out.push(p); }
+      } catch { /* not here */ }
+    }
+    return out;
+  }
   /** Run a builtin directly, ignoring any shadowing function (`builtin`). */
   async runBuiltin(name: string, args: string[]): Promise<number> {
     const b = (builtins as Record<string, (sh: Shell, ...a: string[]) => number | Promise<number>>)[name];

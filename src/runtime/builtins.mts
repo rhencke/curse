@@ -1030,42 +1030,53 @@ const classify = (shell: Shell, name: string): Kind | null => {
 };
 
 const type: Builtin = (shell, ...args) => {
-  let mode: "t" | "p" | "P" | "" = "";
+  let showType = false, pathOnly = false, forcePath = false, all = false, noFunc = false;
   const names: string[] = [];
   for (const a of args) {
-    if (a === "-t") mode = "t";
-    else if (a === "-p") mode = "p";
-    else if (a === "-P") mode = "P";
-    else if (a === "-a" || a === "-f") continue; // -a all / -f no-functions: ignore
-    else if (a === "--") continue;
-    else names.push(a);
+    if (a === "--") continue;
+    if (a.length > 1 && a[0] === "-") {
+      for (const ch of a.slice(1)) {
+        if (ch === "t") showType = true;
+        else if (ch === "p") pathOnly = true;
+        else if (ch === "P") { forcePath = true; pathOnly = true; }
+        else if (ch === "a") all = true;
+        else if (ch === "f") noFunc = true;
+      }
+      continue;
+    }
+    names.push(a);
   }
   let status = 0;
   for (const name of names) {
-    const kind = classify(shell, name);
-    if (kind === null) {
-      shell.io.err(`${shell.name}: type: ${name}: not found\n`);
+    const isFunc = !noFunc && shell.hasFunction(name);
+    const isKeyword = KEYWORDS.has(name);
+    const isBuiltin = !isFunc && shell.hasBuiltin(name);
+    const paths = forcePath || pathOnly || all ? shell.lookupAllPaths(name) : [];
+    const firstPath = paths[0] ?? (classify(shell, name) === "file" ? shell.lookupPath(name) : null);
+    const found = isFunc || isKeyword || isBuiltin || firstPath !== null || paths.length > 0;
+    if (!found) {
+      // bash prints the diagnostic only in long form (not with -t or -p/-P).
+      if (!showType && !pathOnly) shell.io.err(`${shell.name}: type: ${name}: not found\n`);
       status = 1;
       continue;
     }
-    if (mode === "t") {
-      shell.io.out(kind + "\n");
+    if (showType) {
+      // -t reports one word (function first, else keyword/builtin/file).
+      const t = isFunc ? "function" : isKeyword ? "keyword" : isBuiltin ? "builtin" : "file";
+      shell.io.out(t + "\n");
       continue;
     }
-    if (mode === "p" || mode === "P") {
-      // -p prints a path only for files; -P forces a PATH search.
-      const path = kind === "file" || mode === "P" ? shell.lookupPath(name) : null;
-      if (path !== null) shell.io.out(path + "\n");
-      else if (mode === "P") status = 1;
+    if (pathOnly) {
+      // -p/-P print only file paths (nothing for function/keyword/builtin).
+      for (const p of all ? paths : firstPath !== null ? [firstPath] : []) shell.io.out(p + "\n");
       continue;
     }
-    switch (kind) {
-      case "keyword": shell.io.out(`${name} is a shell keyword\n`); break;
-      case "function": shell.io.out(`${name} is a function\n`); break;
-      case "builtin": shell.io.out(`${name} is a shell builtin\n`); break;
-      case "file": shell.io.out(`${name} is ${shell.lookupPath(name)}\n`); break;
-      case "alias": break;
-    }
+    // Long form: list the first match, or (with -a) every match in order.
+    if (isFunc) shell.io.out(`${name} is a function\n`);
+    if (isKeyword && (all || !isFunc)) shell.io.out(`${name} is a shell keyword\n`);
+    if (isBuiltin && (all || (!isFunc && !isKeyword))) shell.io.out(`${name} is a shell builtin\n`);
+    if (all) for (const p of paths) shell.io.out(`${name} is ${p}\n`);
+    else if (!isFunc && !isKeyword && !isBuiltin && firstPath !== null) shell.io.out(`${name} is ${firstPath}\n`);
   }
   return status;
 };
