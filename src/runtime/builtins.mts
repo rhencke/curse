@@ -369,6 +369,81 @@ const cd: Builtin = (shell, ...args) => {
   return 0;
 };
 
+/** Home-relative tilde form for `dirs` (unless -l / long format). */
+const tildePath = (p: string, home: string | undefined): string => {
+  if (home === undefined || home === "") return p;
+  if (p === home) return "~";
+  if (p.startsWith(home + "/")) return "~" + p.slice(home.length);
+  return p;
+};
+/** Print the directory stack in the default (space-joined, tilde) format. */
+const printDirs = (shell: Shell): void => {
+  const home = shell.getVar("HOME");
+  shell.io.out([shell.cwd, ...shell.dirStack].map((p) => tildePath(p, home)).join(" ") + "\n");
+};
+
+const dirs: Builtin = (shell, ...args) => {
+  let long = false, perLine = false, verbose = false;
+  for (const a of args) {
+    if (a === "-c") { shell.dirStack = []; return 0; }
+    else if (a === "-l") long = true;
+    else if (a === "-p") perLine = true;
+    else if (a === "-v") verbose = true;
+    else if (a.startsWith("-")) { shell.io.err(`dirs: ${a}: invalid option\n`); return 2; }
+    else { shell.io.err(`dirs: ${a}: invalid argument\n`); return 2; }
+  }
+  const home = shell.getVar("HOME");
+  const full = [shell.cwd, ...shell.dirStack];
+  const fmt = (p: string): string => (long ? p : tildePath(p, home));
+  if (verbose) full.forEach((p, i) => shell.io.out(` ${i}  ${fmt(p)}\n`));
+  else if (perLine) for (const p of full) shell.io.out(fmt(p) + "\n");
+  else shell.io.out(full.map(fmt).join(" ") + "\n");
+  return 0;
+};
+
+const pushd: Builtin = (shell, ...args) => {
+  const dirArgs: string[] = [];
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i]!;
+    if (a === "--") { for (let j = i + 1; j < args.length; j++) dirArgs.push(args[j]!); break; }
+    if (a.startsWith("-") && a !== "-") {
+      shell.io.err(`pushd: ${a}: invalid option\npushd: usage: pushd [-n] [+N | -N | dir]\n`);
+      return 2;
+    }
+    dirArgs.push(a);
+  }
+  if (dirArgs.length > 1) { shell.io.err("pushd: too many arguments\n"); return 1; }
+  const dir = dirArgs[0];
+  if (dir === undefined) {
+    // No directory: swap the top two entries.
+    if (shell.dirStack.length === 0) { shell.io.err("pushd: no other directory\n"); return 1; }
+    const other = shell.dirStack[0]!;
+    shell.dirStack[0] = shell.cwd;
+    const rc = cd(shell, other) as number;
+    if (rc === 0) printDirs(shell);
+    return rc;
+  }
+  const prev = shell.cwd;
+  const rc = cd(shell, dir) as number;
+  if (rc !== 0) return rc;
+  shell.dirStack.unshift(prev);
+  printDirs(shell);
+  return 0;
+};
+
+const popd: Builtin = (shell, ...args) => {
+  for (const a of args) {
+    if (a === "--") continue;
+    shell.io.err(`popd: ${a}: invalid argument\npopd: usage: popd [-n] [+N | -N]\n`);
+    return 2;
+  }
+  if (shell.dirStack.length === 0) { shell.io.err("popd: directory stack empty\n"); return 1; }
+  const target = shell.dirStack.shift()!;
+  const rc = cd(shell, target) as number;
+  if (rc === 0) printDirs(shell);
+  return rc;
+};
+
 const exportBuiltin: Builtin = (shell, ...args) => {
   const nonFlag = args.filter((a) => !a.startsWith("-"));
   // `export` / `export -p` (no names) lists all exported variables.
@@ -1262,6 +1337,9 @@ export const builtins: Record<string, Builtin> = {
   printf,
   pwd,
   cd,
+  dirs,
+  pushd,
+  popd,
   export: exportBuiltin,
   local,
   unset,

@@ -161,6 +161,8 @@ export class Shell {
   status = 0;
   name = "curse";
   cwd = process.cwd();
+  /** Directory stack for pushd/popd/dirs; index 0 mirrors the current dir. */
+  dirStack: string[] = [];
   positional: string[] = [];
   /** Redirected stdin for this command (file contents / here-string), or null
    *  to inherit. Read by the `read` builtin and passed to external stdin. */
@@ -1152,6 +1154,7 @@ export class Shell {
     sub.status = this.status;
     sub.name = this.name;
     sub.cwd = this.cwd;
+    sub.dirStack = [...this.dirStack];
     sub.opts = { ...this.opts };
     sub.shopts = { ...this.shopts }; // a subshell inherits, but can't leak, shopt
     return sub;
