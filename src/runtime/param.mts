@@ -6,8 +6,8 @@
 import { globToRegExpBody, globToRegExpSource } from "./glob.mts";
 
 /** `${v#pat}` / `${v##pat}` — remove a matching prefix (shortest / longest). */
-export const trimPrefix = (v: string, pat: string, longest: boolean): string => {
-  const re = new RegExp(globToRegExpSource(pat), "s");
+export const trimPrefix = (v: string, pat: string, longest: boolean, extglob = false): string => {
+  const re = new RegExp(globToRegExpSource(pat, extglob), "s");
   if (longest) {
     for (let e = v.length; e >= 0; e--) if (re.test(v.slice(0, e))) return v.slice(e);
   } else {
@@ -17,8 +17,8 @@ export const trimPrefix = (v: string, pat: string, longest: boolean): string => 
 };
 
 /** `${v%pat}` / `${v%%pat}` — remove a matching suffix (shortest / longest). */
-export const trimSuffix = (v: string, pat: string, longest: boolean): string => {
-  const re = new RegExp(globToRegExpSource(pat), "s");
+export const trimSuffix = (v: string, pat: string, longest: boolean, extglob = false): string => {
+  const re = new RegExp(globToRegExpSource(pat, extglob), "s");
   if (longest) {
     for (let s = 0; s <= v.length; s++) if (re.test(v.slice(s))) return v.slice(0, s);
   } else {
@@ -34,8 +34,9 @@ export const replaceGlob = (
   repl: string,
   all: boolean,
   anchor: string,
+  extglob = false,
 ): string => {
-  const body = globToRegExpBody(pat);
+  const body = globToRegExpBody(pat, extglob);
   const src = anchor === "#" ? "^(?:" + body + ")" : anchor === "%" ? "(?:" + body + ")$" : "(?:" + body + ")";
   const re = new RegExp(src, "s" + (all ? "g" : ""));
   return v.replace(re, () => repl);

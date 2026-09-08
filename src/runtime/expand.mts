@@ -159,14 +159,14 @@ const evalParam = async (shell: Shell, prm: Param): Promise<string> => {
       shell.setVar(prm.name, d);
       return d;
     }
-    case "#": return trimPrefix(val, await arg(), false);
-    case "##": return trimPrefix(val, await arg(), true);
-    case "%": return trimSuffix(val, await arg(), false);
-    case "%%": return trimSuffix(val, await arg(), true);
-    case "/": return replaceGlob(val, await arg(), await arg2(), false, "");
-    case "//": return replaceGlob(val, await arg(), await arg2(), true, "");
-    case "/#": return replaceGlob(val, await arg(), await arg2(), false, "#");
-    case "/%": return replaceGlob(val, await arg(), await arg2(), false, "%");
+    case "#": return trimPrefix(val, await arg(), false, shell.shopts.extglob);
+    case "##": return trimPrefix(val, await arg(), true, shell.shopts.extglob);
+    case "%": return trimSuffix(val, await arg(), false, shell.shopts.extglob);
+    case "%%": return trimSuffix(val, await arg(), true, shell.shopts.extglob);
+    case "/": return replaceGlob(val, await arg(), await arg2(), false, "", shell.shopts.extglob);
+    case "//": return replaceGlob(val, await arg(), await arg2(), true, "", shell.shopts.extglob);
+    case "/#": return replaceGlob(val, await arg(), await arg2(), false, "#", shell.shopts.extglob);
+    case "/%": return replaceGlob(val, await arg(), await arg2(), false, "%", shell.shopts.extglob);
     case ":": {
       const off = Number(evalArith(shell, await arg()));
       const len = prm.arg2 === "" ? undefined : Number(evalArith(shell, await arg2()));

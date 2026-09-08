@@ -30,6 +30,19 @@ const tokenize = (s: string): Tok[] => {
     let w = "";
     while (i < s.length) {
       const d = s[i]!;
+      // extglob group `X(...)` stays part of the word (balanced parens).
+      if ((d === "?" || d === "*" || d === "+" || d === "@" || d === "!") && s[i + 1] === "(") {
+        let depth = 0;
+        w += s[i++]; // operator
+        do {
+          const ch = s[i]!;
+          if (ch === "(") depth++;
+          else if (ch === ")") depth--;
+          w += ch;
+          i++;
+        } while (i < s.length && depth > 0);
+        continue;
+      }
       if (BREAK.has(d)) break;
       if (d === "'") {
         w += d;
@@ -118,6 +131,11 @@ const tokenize = (s: string): Tok[] => {
     const c = s[i]!;
     if (isBlank(c)) {
       i++;
+      continue;
+    }
+    // extglob operand `X(...)` — read as a word (so `!(…)` isn't the `!` op).
+    if ((c === "?" || c === "*" || c === "+" || c === "@" || c === "!") && s[i + 1] === "(") {
+      toks.push({ t: "word", v: readWord() });
       continue;
     }
     if (c === "&" && s[i + 1] === "&") { toks.push({ t: "op", v: "&&" }); i += 2; continue; }

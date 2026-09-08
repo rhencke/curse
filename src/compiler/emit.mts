@@ -17,7 +17,7 @@ import { parse } from "../parser/parser.mts";
 import { parseHeredoc, parseWord } from "../parser/word.mts";
 import type { Param, WordPart } from "../parser/word.mts";
 import { braceExpand } from "../parser/brace.mts";
-import { globToRegExpSource } from "../runtime/glob.mts";
+import { globToRegExpSource, hasExtglob } from "../runtime/glob.mts";
 
 export interface EmitOptions {
   /** Import specifier (path or file: URL) for the runtime's `Shell`. */
@@ -267,6 +267,8 @@ class Emitter {
     const pw = parseWord(patText);
     if (pw.parts.every((p) => p.k === "lit")) {
       const lit = pw.parts.map((p) => (p.k === "lit" ? p.s : "")).join("");
+      // extglob depends on a runtime shopt, so those patterns can't inline.
+      if (hasExtglob(lit)) return `sh.match(${subjectExpr}, ${JSON.stringify(lit)})`;
       const src = globToRegExpSource(lit).replace(/\//g, "\\/");
       // Fast inline regex, but defer to sh.match when nocasematch is on (runtime).
       return `(sh.shopts.nocasematch ? sh.match(${subjectExpr}, ${JSON.stringify(lit)}) : /${src}/s.test(${subjectExpr}))`;

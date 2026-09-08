@@ -8,61 +8,41 @@ import { join } from "node:path";
 
 const escapeRe = (c: string): string => (/[.*+?^${}()|[\]\\]/.test(c) ? "\\" + c : c);
 
-/** Translate a glob pattern to a regular-expression body (no anchors). */
-export const globToRegExpBody = (pat: string): string => {
+/** Translate `pat[start..]` into a regex body. When `inGroup`, stop (without
+ *  consuming) at a top-level `|` or `)`. Returns [regex, nextIndex]. */
+const translate = (pat: string, start: number, extglob: boolean, inGroup: boolean): [string, number] => {
   let re = "";
-  let i = 0;
+  let i = start;
   while (i < pat.length) {
     const c = pat[i]!;
+    if (inGroup && (c === "|" || c === ")")) break;
     if (c === "\\") {
       const n = pat[i + 1];
-      if (n !== undefined) {
-        re += escapeRe(n);
-        i += 2;
-      } else {
-        re += "\\\\";
-        i++;
-      }
+      if (n !== undefined) { re += escapeRe(n); i += 2; } else { re += "\\\\"; i++; }
       continue;
     }
-    if (c === "*") {
-      re += ".*";
-      i++;
+    // extglob: ?(list) *(list) +(list) @(list) !(list)
+    if (extglob && (c === "?" || c === "*" || c === "+" || c === "@" || c === "!") && pat[i + 1] === "(") {
+      const [grp, next] = extglobGroup(pat, i, extglob);
+      re += grp;
+      i = next;
       continue;
     }
-    if (c === "?") {
-      re += ".";
-      i++;
-      continue;
-    }
+    if (c === "*") { re += ".*"; i++; continue; }
+    if (c === "?") { re += "."; i++; continue; }
     if (c === "[") {
       let j = i + 1;
       let neg = false;
-      if (pat[j] === "!" || pat[j] === "^") {
-        neg = true;
-        j++;
-      }
+      if (pat[j] === "!" || pat[j] === "^") { neg = true; j++; }
       let cls = "";
-      if (pat[j] === "]") {
-        cls += "\\]";
-        j++;
-      }
+      if (pat[j] === "]") { cls += "\\]"; j++; }
       while (j < pat.length && pat[j] !== "]") {
         const ch = pat[j]!;
-        if (ch === "\\") {
-          cls += "\\" + (pat[j + 1] ?? "");
-          j += 2;
-          continue;
-        }
+        if (ch === "\\") { cls += "\\" + (pat[j + 1] ?? ""); j += 2; continue; }
         cls += ch === "^" || ch === "]" ? "\\" + ch : ch;
         j++;
       }
-      if (j >= pat.length) {
-        // Unterminated '[' is a literal '['.
-        re += "\\[";
-        i++;
-        continue;
-      }
+      if (j >= pat.length) { re += "\\["; i++; continue; }
       re += "[" + (neg ? "^" : "") + cls + "]";
       i = j + 1;
       continue;
@@ -70,17 +50,48 @@ export const globToRegExpBody = (pat: string): string => {
     re += escapeRe(c);
     i++;
   }
-  return re;
+  return [re, i];
 };
+
+/** Translate an extglob group `X(a|b|...)` starting at the operator char. */
+const extglobGroup = (pat: string, i: number, extglob: boolean): [string, number] => {
+  const op = pat[i]!;
+  let j = i + 2; // past `X(`
+  const alts: string[] = [];
+  for (;;) {
+    const [sub, next] = translate(pat, j, extglob, true);
+    alts.push(sub);
+    j = next;
+    if (pat[j] === "|") { j++; continue; }
+    if (pat[j] === ")") { j++; break; }
+    return [escapeRe(op) + "\\(", i + 2]; // unterminated: literal fallback
+  }
+  const body = alts.join("|");
+  const grp = "(?:" + body + ")";
+  switch (op) {
+    case "?": return [grp + "?", j];
+    case "*": return [grp + "*", j];
+    case "+": return [grp + "+", j];
+    case "!": return ["(?!(?:" + body + ")$).*", j];
+    default: return [grp, j]; // @
+  }
+};
+
+/** Translate a glob pattern to a regular-expression body (no anchors). */
+export const globToRegExpBody = (pat: string, extglob = false): string =>
+  translate(pat, 0, extglob, false)[0];
 
 /** Anchored source (`^…$`) — inlined by the emitter as a `/…/s` literal for
  *  static patterns; used by the runtime for dynamic ones. */
-export const globToRegExpSource = (pat: string): string => "^" + globToRegExpBody(pat) + "$";
+export const globToRegExpSource = (pat: string, extglob = false): string =>
+  "^" + globToRegExpBody(pat, extglob) + "$";
 
-export const globMatch = (str: string, pattern: string, nocase = false): boolean =>
-  new RegExp(globToRegExpSource(pattern), nocase ? "si" : "s").test(str);
+export const globMatch = (str: string, pattern: string, nocase = false, extglob = false): boolean =>
+  new RegExp(globToRegExpSource(pattern, extglob), nocase ? "si" : "s").test(str);
 
 export const hasGlobMeta = (s: string): boolean => /[*?[]/.test(s);
+/** Does the word contain an extglob operator group `X(`? */
+export const hasExtglob = (s: string): boolean => /[?*+@!]\(/.test(s);
 
 /** Pathname expansion: match `pattern` against the filesystem (relative to
  *  `cwd`), returning sorted matches (paths as written), or [] if none. Hidden
@@ -90,6 +101,7 @@ export const globExpand = (
   pattern: string,
   dotglob = false,
   globstar = false,
+  extglob = false,
 ): string[] => {
   const comps = pattern.split("/");
   const absolute = pattern.startsWith("/");
@@ -150,7 +162,7 @@ export const globExpand = (
       }
       return;
     }
-    if (!hasGlobMeta(comp)) {
+    if (!hasGlobMeta(comp) && !(extglob && hasExtglob(comp))) {
       const nextFs = join(fsDir, comp);
       try {
         const st = statSync(nextFs);
@@ -167,7 +179,7 @@ export const globExpand = (
     } catch {
       return;
     }
-    const re = new RegExp(globToRegExpSource(comp), "s");
+    const re = new RegExp(globToRegExpSource(comp, extglob), "s");
     for (const e of entries.sort()) {
       if (!dotglob && e.startsWith(".") && !comp.startsWith(".")) continue;
       if (!re.test(e)) continue;

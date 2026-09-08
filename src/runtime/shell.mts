@@ -21,7 +21,7 @@ import { parse } from "../parser/parser.mts";
 import { parseHeredoc } from "../parser/word.mts";
 import { expandNoSplit, expandParsed, expandWords, splitTaggedFields } from "./expand.mts";
 import { evalArith } from "./arith.mts";
-import { globExpand, globMatch, hasGlobMeta } from "./glob.mts";
+import { globExpand, globMatch, hasExtglob, hasGlobMeta } from "./glob.mts";
 import {
   changeCase as pChangeCase, replaceGlob as pReplaceGlob, sliceArr as pSliceArr,
   substr as pSubstr, transform as pTransform, trimPrefix as pTrimPrefix, trimSuffix as pTrimSuffix,
@@ -861,10 +861,11 @@ export class Shell {
    *  containing a glob metacharacter is replaced by its sorted matches, or kept
    *  literal if none match. Shared by interpreter and generated code. */
   glob(fields: string[]): string[] {
+    const eg = this.shopts.extglob;
     const out: string[] = [];
     for (const f of fields) {
-      if (hasGlobMeta(f)) {
-        const m = globExpand(this.cwd, f, this.shopts.dotglob, this.shopts.globstar);
+      if (hasGlobMeta(f) || (eg && hasExtglob(f))) {
+        const m = globExpand(this.cwd, f, this.shopts.dotglob, this.shopts.globstar, eg);
         if (m.length > 0) out.push(...m);
         else if (this.shopts.nullglob) continue; // drop patterns that match nothing
         else out.push(f);
@@ -877,7 +878,7 @@ export class Shell {
 
   /** Pattern match (used by generated `case` / `[[ == ]]` with dynamic patterns). */
   match(subject: string, pattern: string): boolean {
-    return globMatch(subject, pattern, this.shopts.nocasematch);
+    return globMatch(subject, pattern, this.shopts.nocasematch, this.shopts.extglob);
   }
 
   /** Whether a variable is set (used by generated `${x-…}` / `${x+…}`). */
@@ -887,13 +888,13 @@ export class Shell {
 
   /* Parameter-expansion string ops (used by generated code). */
   trimPrefix(v: string, pat: string, longest: boolean): string {
-    return pTrimPrefix(v, pat, longest);
+    return pTrimPrefix(v, pat, longest, this.shopts.extglob);
   }
   trimSuffix(v: string, pat: string, longest: boolean): string {
-    return pTrimSuffix(v, pat, longest);
+    return pTrimSuffix(v, pat, longest, this.shopts.extglob);
   }
   replaceGlob(v: string, pat: string, repl: string, all: boolean, anchor: string): string {
-    return pReplaceGlob(v, pat, repl, all, anchor);
+    return pReplaceGlob(v, pat, repl, all, anchor, this.shopts.extglob);
   }
   async substr(v: string, offExpr: string, lenExpr: string): Promise<string> {
     const off = Number(await this.arithValue(offExpr));
@@ -983,8 +984,8 @@ export class Shell {
       }
     };
     switch (op) {
-      case "==": case "=": return globMatch(l, r, this.shopts.nocasematch);
-      case "!=": return !globMatch(l, r, this.shopts.nocasematch);
+      case "==": case "=": return globMatch(l, r, this.shopts.nocasematch, this.shopts.extglob);
+      case "!=": return !globMatch(l, r, this.shopts.nocasematch, this.shopts.extglob);
       case "<": return l < r;
       case ">": return l > r;
       case "-eq": return intOf(l) === intOf(r);
@@ -1463,7 +1464,7 @@ export class Shell {
       let run = falling;
       if (!run) {
         for (const pat of clause.patterns) {
-          if (globMatch(subject, await expandNoSplit(this, pat.text), this.shopts.nocasematch)) {
+          if (globMatch(subject, await expandNoSplit(this, pat.text), this.shopts.nocasematch, this.shopts.extglob)) {
             run = true;
             break;
           }

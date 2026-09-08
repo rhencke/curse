@@ -226,6 +226,11 @@ class Lexer {
         buf += this.scanBalanced(c + "(", "(", ")", 1);
         continue;
       }
+      // extglob group `?(…) *(…) +(…) @(…) !(…)` stays a single word.
+      if ((c === "?" || c === "*" || c === "+" || c === "@" || c === "!") && this.at(1) === "(") {
+        buf += this.scanBalanced(c + "(", "(", ")", 1);
+        continue;
+      }
       if (isMeta(c)) break;
 
       if (c === "\\") {
