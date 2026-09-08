@@ -679,6 +679,14 @@ const getopts: Builtin = (shell, ...args) => {
   }
   const optstring = args[0]!;
   const name = args[1]!;
+  // bash parses the option normally (advancing OPTIND/OPTARG) but fails the
+  // assignment — status 1 — if the destination isn't a valid identifier.
+  const validName = /^[A-Za-z_][A-Za-z0-9_]*$/.test(name);
+  const store = (result: string): boolean => {
+    if (validName) { shell.setVar(name, result); return true; }
+    shell.io.err(`${shell.name}: getopts: \`${name}': not a valid identifier\n`);
+    return false;
+  };
   const words = args.length > 2 ? args.slice(2) : shell.positional;
   const silent = optstring.startsWith(":");
   const errPrint = !silent && shell.getVar("OPTERR") !== "0";
@@ -689,18 +697,18 @@ const getopts: Builtin = (shell, ...args) => {
   if (optind !== shell.optsInd) shell.optsPos = 1;
 
   const finish = (result: string, optarg: string | null): number => {
-    shell.setVar(name, result);
+    const ok = store(result);
     if (optarg === null) shell.unsetVar("OPTARG");
     else shell.setVar("OPTARG", optarg);
     shell.setVar("OPTIND", String(optind));
     shell.optsInd = optind;
-    return 0;
+    return ok ? 0 : 1;
   };
   const noMore = (): number => {
     shell.optsPos = 1;
     shell.setVar("OPTIND", String(optind));
     shell.optsInd = optind;
-    shell.setVar(name, "?");
+    store("?");
     shell.unsetVar("OPTARG");
     return 1;
   };

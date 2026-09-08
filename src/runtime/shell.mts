@@ -278,6 +278,7 @@ export class Shell {
     set("OSTYPE", "linux-gnu");
     set("HOSTTYPE", "x86_64");
     set("MACHTYPE", "x86_64-pc-linux-gnu");
+    set("OPTIND", "1"); // getopts index starts at 1
   }
 
   /** Variables whose value is recomputed on each read (`$RANDOM`, `$SECONDS`),
