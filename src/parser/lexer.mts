@@ -279,6 +279,10 @@ class Lexer {
           buf += this.scanBalanced("${", "{", "}", 1);
           continue;
         }
+        if (nc === "[") { // $[expr] — deprecated synonym for $((expr))
+          buf += this.scanBalanced("$[", "[", "]", 1);
+          continue;
+        }
         if (nc === "'") {
           buf += this.scanAnsiC();
           continue;

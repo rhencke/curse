@@ -400,6 +400,12 @@ class WordParser {
       return;
     }
 
+    if (n === "[") { // $[expr] — deprecated synonym for $((expr))
+      this.i += 2;
+      this.parts.push({ k: "arith", expr: this.balanced(1, "[", "]"), quoted });
+      return;
+    }
+
     if (n === "?" || n === "$" || n === "#" || n === "@" || n === "*" || n === "!" || n === "-" || (n >= "0" && n <= "9")) {
       this.parts.push({ k: "param", p: simpleParam(n, true), quoted });
       this.i += 2;
