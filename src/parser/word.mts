@@ -267,8 +267,8 @@ class WordParser {
   /** Legacy `` `cmds` `` command substitution. Inside, a backslash escapes
    *  only `` ` ``, `$` and `\`; the unescaped text is the command source. */
   private backtick(quoted: boolean): void {
-    this.hasQuote = true;
-    this.anchored = true;
+    // `…` is exactly $(…): splits and globs like any command substitution, so
+    // it must not anchor the word or suppress globbing.
     this.i++; // opening backtick
     let src = "";
     for (;;) {

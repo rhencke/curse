@@ -428,12 +428,12 @@ class Emitter {
     const rest = words.slice(k);
 
     if (rest.length === 0) {
-      // status 0, unless a command sub in the RHS overrides it (via sh.sub) or
-      // a readonly target rejects the assignment.
+      // A pure assignment's status is 0, unless a RHS command sub ran (its
+      // status) or a readonly target rejected it; $? stays intact for the RHS.
       const i = pad(ind);
-      return `${i}sh.status = 0;\n${i}sh.readonlyHit = false;\n` +
+      return `${i}sh.beginAssign();\n` +
         assignWords.map((w) => this.assignStmt(w, ind)).join("\n") +
-        `\n${i}if (sh.readonlyHit) sh.status = 1;`;
+        `\n${i}sh.endAssign();`;
     }
 
     // `declare -a arr=(...)` / `local m=(...)` array-literal arguments.
@@ -484,7 +484,9 @@ class Emitter {
       callInner = `${target}(${argFrags.join(", ")})`;
     } else {
       const nameFrag = this.word(nameText).code;
-      callInner = `sh.exec(${[nameFrag, ...argFrags].join(", ")})`;
+      // markSubs() (via comma) snapshots the sub counter before the args run, so
+      // an empty expansion adopts the last command sub's status.
+      callInner = `(sh.markSubs(), sh.exec(${[nameFrag, ...argFrags].join(", ")}))`;
     }
 
     if (assignWords.length === 0) return arrayStmts + `${i}await ${callInner};`;

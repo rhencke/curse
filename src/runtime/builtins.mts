@@ -372,11 +372,12 @@ const unset: Builtin = (shell, ...args) => {
 };
 
 const returnBuiltin: Builtin = (shell, ...args) => {
-  throw new ReturnSignal(args.length > 0 ? toInt(args[0]!) : shell.status);
+  // Exit codes are a single byte: bash truncates mod 256 (so 257 -> 1, -1 -> 255).
+  throw new ReturnSignal(args.length > 0 ? toInt(args[0]!) & 0xff : shell.status);
 };
 
 const exitBuiltin: Builtin = (shell, ...args) => {
-  throw new ExitSignal(args.length > 0 ? toInt(args[0]!) : shell.status);
+  throw new ExitSignal(args.length > 0 ? toInt(args[0]!) & 0xff : shell.status);
 };
 
 const shift: Builtin = (shell, ...args) => {

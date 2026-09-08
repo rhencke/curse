@@ -175,6 +175,27 @@ export class Shell {
   /** Enclosing loop nesting in the current function scope (0 outside any loop).
    *  break/continue are a no-op unless this is positive; reset across functions. */
   loopDepth = 0;
+  /** Counts command substitutions run, so an empty command can detect whether
+   *  any ran during its expansion and adopt the last sub's status (bash). */
+  subCount = 0;
+  private subMarkCount = 0;
+  /** Snapshot subCount before a (possibly empty) dynamic command's args are
+   *  expanded, so `sh.exec` can tell whether a sub ran (see `exec`). */
+  markSubs(): void {
+    this.subMarkCount = this.subCount;
+  }
+  /** A pure assignment command (`x=1 y=$(cmd)`): start it. `$?` is left intact
+   *  so a RHS `$?` sees the previous command's status. */
+  beginAssign(): void {
+    this.subMarkCount = this.subCount;
+    this.readonlyHit = false;
+  }
+  /** Finish a pure assignment: its status is 0, unless a RHS command sub ran
+   *  (then that sub's status) or a readonly target rejected it. */
+  endAssign(): void {
+    if (this.subCount === this.subMarkCount) this.status = 0;
+    if (this.readonlyHit) this.status = 1;
+  }
 
   private globalScope: Scope = Object.create(null) as Scope;
   private scope: Scope = this.globalScope;
@@ -682,6 +703,7 @@ export class Shell {
     const chunks: string[] = [];
     const subsh = this.cloneForSubshell({ out: (s) => void chunks.push(s), err: (s) => this.io.err(s) });
     this.status = await runBody(subsh, fn);
+    this.subCount++;
     return chunks.join("").replace(/\n+$/, "");
   }
 
@@ -843,8 +865,10 @@ export class Shell {
   /** Dispatch when the command name itself came from an expansion. */
   async exec(...fields: string[]): Promise<number> {
     if (fields.length === 0) {
-      this.status = 0;
-      return 0;
+      // Empty command: keep the last command sub's status if one ran during the
+      // (now-complete) argument expansion, else 0 — mirroring the interpreter.
+      if (this.subCount === this.subMarkCount) this.status = 0;
+      return this.status;
     }
     return this.callByName(fields[0]!, fields.slice(1));
   }
@@ -980,6 +1004,12 @@ export class Shell {
   }
 
   private external(name: string, args: string[], extraEnv: Record<string, string>): Promise<number> {
+    // An empty command name (e.g. `''` or a var that expanded to nothing) is
+    // "command not found", not a spawn crash.
+    if (name === "") {
+      this.io.err(`${this.name}: ${name}: command not found\n`);
+      return Promise.resolve(127);
+    }
     return new Promise<number>((resolvePromise) => {
       let settled = false;
       const done = (code: number): void => {
@@ -1622,15 +1652,19 @@ export class Shell {
     if (rest.length === 0) {
       // A pure assignment's status is 0, unless a command sub in the RHS ran —
       // then it's that sub's status (bash) — or a readonly target rejected it.
-      this.status = 0;
-      this.readonlyHit = false;
+      // Apply first so a RHS `$?` still sees the previous command's status.
+      this.beginAssign();
       for (const wt of assignWords) await this.applyAssign(wt);
-      if (this.readonlyHit) this.status = 1;
+      this.endAssign();
       return this.status;
     }
+    const subBefore = this.subCount;
     const argv = await expandWords(this, rest);
     if (argv.length === 0) {
-      this.status = 0;
+      // An empty command (every word expanded away) takes the status of the
+      // last command substitution that ran during expansion, else 0 — but $?
+      // stays visible to that expansion, so only reset when no sub ran.
+      if (this.subCount === subBefore) this.status = 0;
       this.readonlyHit = false;
       for (const wt of assignWords) await this.applyAssign(wt);
       if (this.readonlyHit) this.status = 1;
