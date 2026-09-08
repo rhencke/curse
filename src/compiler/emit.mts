@@ -419,8 +419,12 @@ class Emitter {
     const rest = words.slice(k);
 
     if (rest.length === 0) {
-      // status 0, unless a command sub in the RHS overrides it (via sh.sub).
-      return `${pad(ind)}sh.status = 0;\n` + assignWords.map((w) => this.assignStmt(w, ind)).join("\n");
+      // status 0, unless a command sub in the RHS overrides it (via sh.sub) or
+      // a readonly target rejects the assignment.
+      const i = pad(ind);
+      return `${i}sh.status = 0;\n${i}sh.readonlyHit = false;\n` +
+        assignWords.map((w) => this.assignStmt(w, ind)).join("\n") +
+        `\n${i}if (sh.readonlyHit) sh.status = 1;`;
     }
 
     // `declare -a arr=(...)` / `local m=(...)` array-literal arguments.

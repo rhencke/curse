@@ -336,6 +336,7 @@ const local: Builtin = (shell, ...args) => {
 
 const unset: Builtin = (shell, ...args) => {
   let mode: "v" | "f" | "" = "";
+  shell.readonlyHit = false;
   for (const a of args) {
     if (a === "-f") mode = "f";
     else if (a === "-v") mode = "v";
@@ -346,7 +347,7 @@ const unset: Builtin = (shell, ...args) => {
       else shell.unsetVar(a);
     }
   }
-  return 0;
+  return shell.readonlyHit ? 1 : 0;
 };
 
 const returnBuiltin: Builtin = (shell, ...args) => {
@@ -577,19 +578,23 @@ const declareBuiltin: Builtin = (shell, ...args) => {
     // stays a 0-element array rather than a "" scalar.
     if (flags.assoc) shell.declareAssoc(name);
     else if (eq < 0 && flags.array && shell.arrayLen(name) === 0) shell.setArray(name, []);
-    shell.setAttrs(name, flags);
+    // Apply -i/-l/-u before the value (so it's coerced), but readonly after
+    // (so this very assignment isn't rejected).
+    shell.setAttrs(name, { ...flags, readonly: false });
     if (eq >= 0) shell.setVar(name, n.slice(eq + 1));
+    if (flags.readonly) shell.setAttrs(name, { readonly: true });
     if (flags.exported) shell.exportVar(name);
   }
   return 0;
 };
 
 const readonlyBuiltin: Builtin = (shell, ...args) => {
-  // We don't enforce read-only-ness; just perform the assignments.
   for (const a of args) {
     if (a.startsWith("-")) continue;
     const eq = a.indexOf("=");
-    if (eq >= 0) shell.setVar(a.slice(0, eq), a.slice(eq + 1));
+    const name = eq >= 0 ? a.slice(0, eq) : a;
+    if (eq >= 0) shell.setVar(name, a.slice(eq + 1));
+    shell.setAttrs(name, { readonly: true });
   }
   return 0;
 };

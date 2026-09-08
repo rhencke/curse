@@ -148,6 +148,9 @@ export class Shell {
    *  and the OPTIND value we last wrote (to detect an external reset). */
   optsPos = 1;
   optsInd = 1;
+  /** Set when an assignment/unset was refused because the target is readonly;
+   *  the assignment/unset command turns this into exit status 1. */
+  readonlyHit = false;
 
   /** trap handlers by normalized signal name (EXIT, INT, …). */
   traps: Record<string, string> = Object.create(null) as Record<string, string>;
@@ -264,6 +267,11 @@ export class Shell {
     name = this.deref(name); // write through a nameref to its target
     const s = String(value);
     const owner = this.ownerScope(name);
+    if (owner && owner[name]!.readonly) {
+      this.io.err(`${this.name}: ${name}: readonly variable\n`);
+      this.readonlyHit = true;
+      return;
+    }
     if (owner) {
       const v = owner[name]!;
       const cs = this.coerce(v, s);
@@ -524,7 +532,13 @@ export class Shell {
   unsetVar(name: string): void {
     name = this.deref(name); // `unset ref` removes the target, as in bash
     const owner = this.ownerScope(name);
-    if (owner) delete owner[name];
+    if (owner === undefined) return;
+    if (owner[name]!.readonly) {
+      this.io.err(`${this.name}: unset: ${name}: cannot unset: readonly variable\n`);
+      this.readonlyHit = true;
+      return;
+    }
+    delete owner[name];
   }
   /** `unset arr[i]` / `unset assoc[key]` — remove a single element. */
   unsetElem(name: string, sub: string): void {
@@ -1486,15 +1500,19 @@ export class Shell {
 
     if (rest.length === 0) {
       // A pure assignment's status is 0, unless a command sub in the RHS ran —
-      // then it's that sub's status (bash). sub() sets this.status as it runs.
+      // then it's that sub's status (bash) — or a readonly target rejected it.
       this.status = 0;
+      this.readonlyHit = false;
       for (const wt of assignWords) await this.applyAssign(wt);
+      if (this.readonlyHit) this.status = 1;
       return this.status;
     }
     const argv = await expandWords(this, rest);
     if (argv.length === 0) {
       this.status = 0;
+      this.readonlyHit = false;
       for (const wt of assignWords) await this.applyAssign(wt);
+      if (this.readonlyHit) this.status = 1;
       return this.status;
     }
     if (cmd.arrayArgs !== undefined) await this.applyArrayArgs(cmd.arrayArgs, argv);
