@@ -870,21 +870,41 @@ const canAccess = (p: string, mode: number): boolean => {
   }
 };
 
-const UNARY = new Set(["-z", "-n", "-e", "-f", "-d", "-s", "-r", "-w", "-x", "-h", "-L"]);
-const BINARY = new Set(["=", "==", "!=", "<", ">", "-eq", "-ne", "-lt", "-le", "-gt", "-ge"]);
+const UNARY = new Set([
+  "-z", "-n", "-e", "-a", "-f", "-d", "-s", "-r", "-w", "-x", "-h", "-L",
+  "-b", "-c", "-p", "-S", "-k", "-g", "-u", "-t", "-v", "-o", "-G", "-O", "-N", "-R",
+]);
+const BINARY = new Set([
+  "=", "==", "!=", "<", ">", "-eq", "-ne", "-lt", "-le", "-gt", "-ge", "-nt", "-ot", "-ef",
+]);
 
 const unaryTest = (op: string, arg: string, shell: Shell): boolean => {
   if (op === "-z") return arg.length === 0;
   if (op === "-n") return arg.length > 0;
+  if (op === "-t") return false; // stdio is piped in this environment
+  if (op === "-v" || op === "-R") return shell.has(arg);
+  if (op === "-o") return false; // shell option — unsupported
   const p = resolve(shell.cwd, arg);
+  const st = statOf(p);
+  const mode = st?.mode ?? 0;
   switch (op) {
-    case "-e": return statOf(p) !== null;
-    case "-f": return statOf(p)?.isFile() ?? false;
-    case "-d": return statOf(p)?.isDirectory() ?? false;
-    case "-s": return (statOf(p)?.size ?? 0) > 0;
+    case "-e": case "-a": return st !== null;
+    case "-f": return st?.isFile() ?? false;
+    case "-d": return st?.isDirectory() ?? false;
+    case "-b": return st?.isBlockDevice() ?? false;
+    case "-c": return st?.isCharacterDevice() ?? false;
+    case "-p": return st?.isFIFO() ?? false;
+    case "-S": return st?.isSocket() ?? false;
+    case "-s": return (st?.size ?? 0) > 0;
     case "-r": return canAccess(p, constants.R_OK);
     case "-w": return canAccess(p, constants.W_OK);
     case "-x": return canAccess(p, constants.X_OK);
+    case "-k": return st !== null && (mode & 0o1000) !== 0; // sticky
+    case "-g": return st !== null && (mode & 0o2000) !== 0; // setgid
+    case "-u": return st !== null && (mode & 0o4000) !== 0; // setuid
+    case "-G": return st !== null && st.gid === process.getgid?.();
+    case "-O": return st !== null && st.uid === process.getuid?.();
+    case "-N": return st !== null && st.mtimeMs > st.atimeMs;
     case "-h": case "-L":
       try {
         return lstatSync(p).isSymbolicLink();
@@ -902,6 +922,12 @@ const binaryTest = (a: string, op: string, b: string): boolean => {
     case "!=": return a !== b;
     case "<": return a < b;
     case ">": return a > b;
+    case "-nt": return (statOf(a)?.mtimeMs ?? -Infinity) > (statOf(b)?.mtimeMs ?? -Infinity);
+    case "-ot": return (statOf(a)?.mtimeMs ?? -Infinity) < (statOf(b)?.mtimeMs ?? -Infinity);
+    case "-ef": {
+      const x = statOf(a), y = statOf(b);
+      return x !== null && y !== null && x.dev === y.dev && x.ino === y.ino;
+    }
     case "-eq": return toInt(a) === toInt(b);
     case "-ne": return toInt(a) !== toInt(b);
     case "-lt": return toInt(a) < toInt(b);
@@ -928,6 +954,8 @@ const splitTop = (a: string[], sep: string): string[][] => {
 };
 
 const evalTest = (a: string[], shell: Shell): boolean => {
+  // bash's argc-based rules (test.c) for 0–2 args, where an operator name can
+  // itself be an operand.
   switch (a.length) {
     case 0:
       return false;
@@ -937,6 +965,14 @@ const evalTest = (a: string[], shell: Shell): boolean => {
       if (a[0] === "!") return !(a[1]!.length > 0);
       if (UNARY.has(a[0]!)) return unaryTest(a[0]!, a[1]!, shell);
       throw new Error(`${a[0]}: unary operator expected`);
+  }
+  // 3+ args: `-a`/`-o` at the top level bind the whole expression.
+  if (a.includes("-a") || a.includes("-o")) {
+    return splitTop(a, "-o").some((orPart) =>
+      splitTop(orPart, "-a").every((andPart) => evalTest(andPart, shell)),
+    );
+  }
+  switch (a.length) {
     case 3:
       if (BINARY.has(a[1]!)) return binaryTest(a[0]!, a[1]!, a[2]!);
       if (a[0] === "!") return !evalTest(a.slice(1), shell);
@@ -945,11 +981,10 @@ const evalTest = (a: string[], shell: Shell): boolean => {
     case 4:
       if (a[0] === "!") return !evalTest(a.slice(1), shell);
       if (a[0] === "(" && a[3] === ")") return evalTest(a.slice(1, 3), shell);
-      break;
+      throw new Error("too many arguments");
+    default:
+      throw new Error("too many arguments");
   }
-  return splitTop(a, "-o").some((orPart) =>
-    splitTop(orPart, "-a").every((andPart) => evalTest(andPart, shell)),
-  );
 };
 
 const testImpl = (shell: Shell, args: string[]): number => {
