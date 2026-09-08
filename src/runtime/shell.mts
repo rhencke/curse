@@ -223,6 +223,8 @@ export class Shell {
 
   private globalScope: Scope = Object.create(null) as Scope;
   private scope: Scope = this.globalScope;
+  /** For `$SECONDS`: shell start time. */
+  private startMs = Date.now();
   private functions: Record<string, unknown> = Object.create(builtins) as Record<string, unknown>;
 
   /** `sh.env.x` reads/writes variables over the dynamic scope chain. */
@@ -259,6 +261,31 @@ export class Shell {
         return true;
       },
     }) as Record<string, (...args: string[]) => Promise<number>>;
+
+    this.initSpecialVars();
+  }
+
+  /** Seed bash's static special variables at startup. */
+  private initSpecialVars(): void {
+    const uid = typeof process.getuid === "function" ? process.getuid() : 0;
+    const set = (n: string, v: string, exported = false): void => {
+      this.globalScope[n] = new Var(v, exported);
+    };
+    set("PWD", this.cwd, true); // bash keeps PWD exported and in sync with cwd
+    set("PPID", String(process.ppid));
+    set("UID", String(uid));
+    set("EUID", String(uid));
+    set("OSTYPE", "linux-gnu");
+    set("HOSTTYPE", "x86_64");
+    set("MACHTYPE", "x86_64-pc-linux-gnu");
+  }
+
+  /** Variables whose value is recomputed on each read (`$RANDOM`, `$SECONDS`),
+   *  unless the user has assigned one (checked before this by rawLookup). */
+  private dynamicSpecial(name: string): string | undefined {
+    if (name === "RANDOM") return String(Math.floor(Math.random() * 32768));
+    if (name === "SECONDS") return String(Math.floor((Date.now() - this.startMs) / 1000));
+    return undefined;
   }
 
   get pid(): number {
@@ -273,6 +300,8 @@ export class Shell {
       if (Object.prototype.hasOwnProperty.call(s, name)) return s[name];
       s = Object.getPrototypeOf(s) as Scope | null;
     }
+    const dyn = this.dynamicSpecial(name);
+    if (dyn !== undefined) return new Var(dyn);
     const e = process.env[name];
     return e === undefined ? undefined : new Var(e, true);
   }
