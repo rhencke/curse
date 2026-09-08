@@ -262,6 +262,10 @@ class Emitter {
   /** Quote-aware glob pattern from the operand's raw text (bash escapes quoted
    *  metacharacters); resolved at runtime since it depends on the quoting. */
   private patArg(prm: Param): string {
+    // A pattern with no quotes, backslash escapes, or `$`/backtick expansions is
+    // already its own glob (patExpand would return it unchanged), so emit it as
+    // a literal and skip the runtime pattern walk.
+    if (!/[\\'"$`]/.test(prm.arg)) return JSON.stringify(prm.arg);
     return `await sh.patExpand(${JSON.stringify(prm.arg)})`;
   }
   /** A `#`/`%`/`/` string op applied to `subj`, given pattern/replacement
