@@ -103,13 +103,14 @@ const s64 = (v: bigint): bigint => {
   const m = v & U64;
   return m >= 1n << 63n ? m - (1n << 64n) : m;
 };
-const pfNum = (shell: Shell, raw: string): bigint => {
+const pfNum = (shell: Shell, raw: string, onErr?: () => void): bigint => {
   const t = raw.replace(/^[ \t\n]+/, "");
   if (t === "") return 0n;
   if (t[0] === "'" || t[0] === '"') return BigInt(t.codePointAt(1) ?? 0);
   const m = /^[+-]?(0[xX][0-9a-fA-F]+|0[0-7]+|[0-9]+)/.exec(t);
   if (m === null) {
     shell.io.err(`printf: ${raw}: invalid number\n`);
+    onErr?.();
     return 0n;
   }
   let str = m[0];
@@ -164,6 +165,7 @@ const printf: Builtin = async (shell, ...args) => {
   const nextArg = (): string => (vi < values.length ? values[vi++]! : "");
 
   let out = "";
+  let status = 0; // 1 if any argument was an invalid number or format char
   let stopped = false; // a `\c` in the format string or a %b argument ends output
   const once = (): void => {
     let i = 0;
@@ -218,8 +220,10 @@ const printf: Builtin = async (shell, ...args) => {
       }
       // Apply precision (string truncation / numeric min-digits) then width
       // padding (left `-`, zero `0`, else spaces), matching C printf.
-      const format = (s: string, numeric: boolean): string => {
-        if (hasPrec) {
+      // `floatVal` values already carry their precision (decimal places), so
+      // skip the integer min-digits step and allow 0-padding despite precision.
+      const format = (s: string, numeric: boolean, floatVal = false): string => {
+        if (hasPrec && !floatVal) {
           const p = prec === "" ? 0 : parseInt(prec, 10);
           if (numeric) {
             const neg = s.startsWith("-") || s.startsWith("+") || s.startsWith(" ");
@@ -235,7 +239,7 @@ const printf: Builtin = async (shell, ...args) => {
         if (s.length >= w) return s;
         const fill = w - s.length;
         if (flags.includes("-")) return s + " ".repeat(fill);
-        if (flags.includes("0") && numeric && !hasPrec) {
+        if (flags.includes("0") && numeric && (!hasPrec || floatVal)) {
           const signed = s.startsWith("-") || s.startsWith("+") || s.startsWith(" ");
           return signed ? s[0]! + "0".repeat(fill) + s.slice(1) : "0".repeat(fill) + s;
         }
@@ -257,15 +261,16 @@ const printf: Builtin = async (shell, ...args) => {
         else if (s.includes(".")) s = s.replace(/\.?0+$/, ""); // %g trims trailing zeros
         return upper ? s.toUpperCase() : s;
       };
+      const num = (raw: string): bigint => pfNum(shell, raw, () => { status = 1; });
       switch (conv) {
         case "s": out += format(nextArg(), false); break;
         case "b": { const r = unescape(nextArg(), true); out += format(r.text, false); if (r.stop) { stopped = true; return; } break; }
-        case "d": case "i": { const n = s64(pfNum(shell, nextArg())); out += format(sign(n, String(n)), true); break; }
-        case "u": out += format(String(pfNum(shell, nextArg()) & U64), true); break;
-        case "x": out += format(alt("0x", (pfNum(shell, nextArg()) & U64).toString(16)), true); break;
-        case "X": out += format(alt("0X", (pfNum(shell, nextArg()) & U64).toString(16).toUpperCase()), true); break;
+        case "d": case "i": { const n = s64(num(nextArg())); out += format(sign(n, String(n)), true); break; }
+        case "u": out += format(String(num(nextArg()) & U64), true); break;
+        case "x": out += format(alt("0x", (num(nextArg()) & U64).toString(16)), true); break;
+        case "X": out += format(alt("0X", (num(nextArg()) & U64).toString(16).toUpperCase()), true); break;
         case "o": {
-          const s = (pfNum(shell, nextArg()) & U64).toString(8);
+          const s = (num(nextArg()) & U64).toString(8);
           out += format(flags.includes("#") && s[0] !== "0" ? "0" + s : s, true);
           break;
         }
@@ -273,12 +278,19 @@ const printf: Builtin = async (shell, ...args) => {
         case "q": out += format(shellBackslashQuote(nextArg()), false); break;
         case "f": case "F": {
           const n = pfFloat(nextArg());
-          out += format(sign(BigInt(Math.trunc(n)), n.toFixed(hasPrec ? (prec === "" ? 0 : parseInt(prec, 10)) : 6)), true);
+          let fs = n.toFixed(hasPrec ? (prec === "" ? 0 : parseInt(prec, 10)) : 6);
+          if (flags.includes("#") && !fs.includes(".")) fs += "."; // # keeps the point
+          out += format(sign(BigInt(Math.trunc(n)), fs), true, true);
           break;
         }
-        case "e": case "E": { const n = pfFloat(nextArg()); out += format(sign(n >= 0 ? 0n : -1n, efmt(n, conv === "E")), true); break; }
-        case "g": case "G": { const n = pfFloat(nextArg()); out += format(sign(n >= 0 ? 0n : -1n, gfmt(n, conv === "G")), true); break; }
-        default: out += "%" + conv;
+        case "e": case "E": { const n = pfFloat(nextArg()); out += format(sign(n >= 0 ? 0n : -1n, efmt(n, conv === "E")), true, true); break; }
+        case "g": case "G": { const n = pfFloat(nextArg()); out += format(sign(n >= 0 ? 0n : -1n, gfmt(n, conv === "G")), true, true); break; }
+        default:
+          // An invalid conversion aborts printf, keeping only the output so far.
+          shell.io.err(`printf: \`%${conv}': invalid format character\n`);
+          status = 1;
+          stopped = true;
+          return;
       }
       i = j + 1;
     }
@@ -296,10 +308,10 @@ const printf: Builtin = async (shell, ...args) => {
     const m = /^([A-Za-z_][A-Za-z0-9_]*)\[([^\]]*)\]$/.exec(target);
     if (m) await shell.elemSet(m[1]!, m[2]!, out);
     else shell.setVar(target, out);
-    return 0;
+    return status;
   }
   shell.io.out(out);
-  return 0;
+  return status;
 };
 
 const pwd: Builtin = (shell, ...args) => {

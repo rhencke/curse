@@ -16,3 +16,11 @@ printf 'hi\n' extra args
 
 # %b with \c only aborts remaining output
 printf '%s %b %s\n' one 'two\cthree' four; echo '(end)'
+
+# float flags: # keeps the decimal point, 0 zero-pads even with precision
+printf '%#.0f|%08.2f|%-8.2f|\n' 3 3.14 3.14
+printf '%010.2e\n' 3.14
+
+# error status: invalid number / invalid conversion abort with status 1
+printf '%d\n' abc 2>/dev/null; echo "int-rc=$?"
+printf 'AAA%zBBB\n' x 2>/dev/null; echo "fmt-rc=$?"
