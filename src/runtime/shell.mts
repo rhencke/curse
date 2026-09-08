@@ -326,16 +326,23 @@ export class Shell {
   /* ---------------- variables / scope ---------------- */
 
   private rawLookup(name: string): Var | undefined {
+    const v = this.scopeLookup(name);
+    if (v !== undefined) return v;
+    const dyn = this.dynamicSpecial(name);
+    if (dyn !== undefined) return new Var(dyn);
+    const e = process.env[name];
+    return e === undefined ? undefined : new Var(e, true);
+  }
+  /** Find a variable's Var box in the scope chain (no env/dynamic fallback), so
+   *  callers that mutate the box in place don't get a throwaway env Var. */
+  private scopeLookup(name: string): Var | undefined {
     let s: Scope | null = this.scope;
     while (s !== null) {
       const v = s.vars.get(name);
       if (v !== undefined) return v;
       s = s.parent;
     }
-    const dyn = this.dynamicSpecial(name);
-    if (dyn !== undefined) return new Var(dyn);
-    const e = process.env[name];
-    return e === undefined ? undefined : new Var(e, true);
+    return undefined;
   }
 
   /** Follow a nameref (declare -n) chain. The chain ends at a plain name, or at
@@ -432,14 +439,15 @@ export class Shell {
     if (r.sub !== null) { this.setElemSync(r.name, r.sub, String(value)); return undefined; }
     name = r.name;
     const s = String(value);
-    const owner = this.ownerScope(name);
-    const existing = owner?.vars.get(name);
-    if (existing && existing.readonly) {
-      this.io.err(`${this.name}: ${name}: readonly variable\n`);
-      this.readonlyHit = true;
-      return undefined;
-    }
+    // Single scope-chain walk: mutate the existing box in place, else create in
+    // the global scope (was two walks — ownerScope then get).
+    const existing = this.scopeLookup(name);
     if (existing) {
+      if (existing.readonly) {
+        this.io.err(`${this.name}: ${name}: readonly variable\n`);
+        this.readonlyHit = true;
+        return undefined;
+      }
       const cs = this.coerce(existing, s);
       if (existing.assoc !== null) existing.assoc.set("0", cs);
       else if (existing.arr !== null) existing.arr.set(0, cs);
@@ -993,6 +1001,19 @@ export class Shell {
   }
   /** `x++` / `++x` / `x--` / `--x` on a scalar; returns the pre/post value. */
   ainc(name: string, delta: bigint, post: boolean): bigint {
+    // Fast path: an existing plain, writable scalar (the typical loop counter) —
+    // one scope lookup, then mutate the box in place (no read-then-write-through).
+    const v = this.scopeLookup(name);
+    if (v !== undefined && !v.ref && !v.readonly && !v.integer && v.arr === null && v.assoc === null) {
+      const cur = v.ivStr === v.value ? v.iv : v.value === "" ? 0n : this.parseArithInt(v.value);
+      const nv = arithWrap(cur + delta);
+      const str = nv.toString();
+      v.value = str;
+      v.iv = nv;
+      v.ivStr = str;
+      v.unset = false;
+      return post ? cur : nv;
+    }
     const cur = this.aget(name);
     const nv = arithWrap(cur + delta);
     this.aset(name, nv);
