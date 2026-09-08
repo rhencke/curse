@@ -80,6 +80,36 @@ const echo: Builtin = (shell, ...args) => {
   return 0;
 };
 
+/** Parse a printf numeric argument (bash rules: leading ws, 0x/0 bases, 'c
+ *  char code, 64-bit) into a BigInt; invalid -> 0 with a stderr diagnostic. */
+const U64 = (1n << 64n) - 1n;
+const s64 = (v: bigint): bigint => {
+  const m = v & U64;
+  return m >= 1n << 63n ? m - (1n << 64n) : m;
+};
+const pfNum = (shell: Shell, raw: string): bigint => {
+  const t = raw.replace(/^[ \t\n]+/, "");
+  if (t === "") return 0n;
+  if (t[0] === "'" || t[0] === '"') return BigInt(t.codePointAt(1) ?? 0);
+  const m = /^[+-]?(0[xX][0-9a-fA-F]+|0[0-7]+|[0-9]+)/.exec(t);
+  if (m === null) {
+    shell.io.err(`printf: ${raw}: invalid number\n`);
+    return 0n;
+  }
+  let str = m[0];
+  const neg = str[0] === "-";
+  if (str[0] === "+" || str[0] === "-") str = str.slice(1);
+  let val: bigint;
+  if (/^0[xX]/.test(str)) val = BigInt(str);
+  else if (/^0[0-7]+$/.test(str)) val = BigInt("0o" + str.slice(1));
+  else val = BigInt(str);
+  return neg ? -val : val;
+};
+const pfFloat = (raw: string): number => {
+  const n = Number(raw.replace(/^[ \t\n]+/, "").replace(/[ \t\n]+$/, ""));
+  return Number.isNaN(n) ? 0 : n;
+};
+
 /** printf %q: quote a value so it can be reused as shell input. */
 const shellBackslashQuote = (v: string): string => {
   if (v === "") return "''";
@@ -141,13 +171,25 @@ const printf: Builtin = async (shell, ...args) => {
       let flags = "";
       while (j < fmt.length && "-+ 0#".includes(fmt[j]!)) flags += fmt[j++]!;
       let width = "";
-      while (j < fmt.length && fmt[j]! >= "0" && fmt[j]! <= "9") width += fmt[j++]!;
+      if (fmt[j] === "*") {
+        let wn = Number(pfNum(shell, nextArg()));
+        if (wn < 0) { flags += "-"; wn = -wn; }
+        width = String(wn);
+        j++;
+      } else {
+        while (j < fmt.length && fmt[j]! >= "0" && fmt[j]! <= "9") width += fmt[j++]!;
+      }
       let prec = "";
       let hasPrec = false;
       if (fmt[j] === ".") {
         hasPrec = true;
         j++;
-        while (j < fmt.length && fmt[j]! >= "0" && fmt[j]! <= "9") prec += fmt[j++]!;
+        if (fmt[j] === "*") {
+          prec = String(Math.max(0, Number(pfNum(shell, nextArg()))));
+          j++;
+        } else {
+          while (j < fmt.length && fmt[j]! >= "0" && fmt[j]! <= "9") prec += fmt[j++]!;
+        }
       }
       const conv = fmt[j];
       if (conv === undefined) {
@@ -180,22 +222,43 @@ const printf: Builtin = async (shell, ...args) => {
         }
         return " ".repeat(fill) + s;
       };
-      const signed = (n: number): string => {
-        const s = String(n);
-        if (n >= 0 && flags.includes("+")) return "+" + s;
-        if (n >= 0 && flags.includes(" ")) return " " + s;
-        return s;
+      const sign = (n: bigint, s: string): string =>
+        n >= 0n ? (flags.includes("+") ? "+" + s : flags.includes(" ") ? " " + s : s) : s;
+      const alt = (pfx: string, s: string): string => (flags.includes("#") && s !== "0" ? pfx + s : s);
+      const efmt = (n: number, upper: boolean): string => {
+        const p = hasPrec ? (prec === "" ? 0 : parseInt(prec, 10)) : 6;
+        // pad the exponent to at least two digits, as C printf does
+        const s = n.toExponential(p).replace(/e([+-])(\d)$/, "e$10$2");
+        return upper ? s.toUpperCase() : s;
+      };
+      const gfmt = (n: number, upper: boolean): string => {
+        const p = hasPrec ? (prec === "" ? 0 : parseInt(prec, 10)) || 1 : 6;
+        let s = n.toPrecision(p);
+        if (s.includes("e")) s = s.replace(/e([+-])(\d)$/, "e$10$2");
+        else if (s.includes(".")) s = s.replace(/\.?0+$/, ""); // %g trims trailing zeros
+        return upper ? s.toUpperCase() : s;
       };
       switch (conv) {
         case "s": out += format(nextArg(), false); break;
         case "b": out += format(unescape(nextArg()).text, false); break;
-        case "d": case "i": out += format(signed(toInt(nextArg())), true); break;
-        case "u": out += format(String(toInt(nextArg()) >>> 0), true); break;
-        case "x": out += format((toInt(nextArg()) >>> 0).toString(16), true); break;
-        case "X": out += format((toInt(nextArg()) >>> 0).toString(16).toUpperCase(), true); break;
-        case "o": out += format((toInt(nextArg()) >>> 0).toString(8), true); break;
+        case "d": case "i": { const n = s64(pfNum(shell, nextArg())); out += format(sign(n, String(n)), true); break; }
+        case "u": out += format(String(pfNum(shell, nextArg()) & U64), true); break;
+        case "x": out += format(alt("0x", (pfNum(shell, nextArg()) & U64).toString(16)), true); break;
+        case "X": out += format(alt("0X", (pfNum(shell, nextArg()) & U64).toString(16).toUpperCase()), true); break;
+        case "o": {
+          const s = (pfNum(shell, nextArg()) & U64).toString(8);
+          out += format(flags.includes("#") && s[0] !== "0" ? "0" + s : s, true);
+          break;
+        }
         case "c": out += format(nextArg().slice(0, 1), false); break;
         case "q": out += format(shellBackslashQuote(nextArg()), false); break;
+        case "f": case "F": {
+          const n = pfFloat(nextArg());
+          out += format(sign(BigInt(Math.trunc(n)), n.toFixed(hasPrec ? (prec === "" ? 0 : parseInt(prec, 10)) : 6)), true);
+          break;
+        }
+        case "e": case "E": { const n = pfFloat(nextArg()); out += format(sign(n >= 0 ? 0n : -1n, efmt(n, conv === "E")), true); break; }
+        case "g": case "G": { const n = pfFloat(nextArg()); out += format(sign(n >= 0 ? 0n : -1n, gfmt(n, conv === "G")), true); break; }
         default: out += "%" + conv;
       }
       i = j + 1;
