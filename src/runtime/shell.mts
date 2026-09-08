@@ -1234,6 +1234,18 @@ export class Shell {
     return globMatch(subject, await this.condPat(rawPat), this.shopts.nocasematch, this.shopts.extglob);
   }
 
+  /** `$-` — the current single-letter option flags (bash order: e h u x B;
+   *  h and B are on by default in a non-interactive shell). */
+  optionFlags(): string {
+    let s = "";
+    if (this.opts.errexit) s += "e";
+    s += "h";
+    if (this.opts.nounset) s += "u";
+    if (this.opts.xtrace) s += "x";
+    s += "B";
+    return s;
+  }
+
   /** Apply `!` inversion in generated code. */
   invert(): void {
     this.status = this.status === 0 ? 1 : 0;

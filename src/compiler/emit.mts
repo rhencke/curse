@@ -119,6 +119,7 @@ class Emitter {
       case "#": return "String(sh.positional.length)";
       case "$": return "String(sh.pid)";
       case "!": return "String(sh.lastBgPid)";
+      case "-": return "sh.optionFlags()";
       case "0": return "sh.name";
       case "@": case "*": return 'sh.positional.join(" ")';
       default: return `sh.param(${Number(name)})`;

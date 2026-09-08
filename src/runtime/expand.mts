@@ -52,6 +52,7 @@ const specialValue = (shell: Shell, name: string): string => {
     case "?": return String(shell.status);
     case "$": return String(shell.pid);
     case "!": return String(shell.lastBgPid);
+    case "-": return shell.optionFlags();
     case "#": return String(shell.positional.length);
     case "@": case "*": return shell.positional.join(" ");
     case "0": return shell.name;

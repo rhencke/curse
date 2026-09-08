@@ -358,7 +358,7 @@ class WordParser {
       return;
     }
 
-    if (n === "?" || n === "$" || n === "#" || n === "@" || n === "*" || n === "!" || (n >= "0" && n <= "9")) {
+    if (n === "?" || n === "$" || n === "#" || n === "@" || n === "*" || n === "!" || n === "-" || (n >= "0" && n <= "9")) {
       this.parts.push({ k: "param", p: simpleParam(n, true), quoted });
       this.i += 2;
       return;
@@ -438,7 +438,7 @@ function parseParam(inner: string): Param {
   let special = false;
   let i = 0;
   const c0 = s[0]!;
-  if (c0 === "@" || c0 === "*" || c0 === "#" || c0 === "?" || c0 === "$") {
+  if (c0 === "@" || c0 === "*" || c0 === "#" || c0 === "?" || c0 === "$" || c0 === "-" || c0 === "!") {
     name = c0;
     special = true;
     i = 1;
