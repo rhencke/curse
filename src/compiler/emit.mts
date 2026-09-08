@@ -14,7 +14,7 @@
 import type { Command, CondExpr, FunctionDef, SimpleCommand, Word } from "../ast/nodes.mts";
 import { CMD_INVERT_RETURN } from "../ast/nodes.mts";
 import { parse } from "../parser/parser.mts";
-import { parseWord } from "../parser/word.mts";
+import { parseHeredoc, parseWord } from "../parser/word.mts";
 import type { Param, WordPart } from "../parser/word.mts";
 import { braceExpand } from "../parser/brace.mts";
 import { globToRegExpSource } from "../runtime/glob.mts";
@@ -171,7 +171,13 @@ class Emitter {
     if (reds !== undefined && reds.length > 0) {
       const i = pad(ind);
       const rd = reds
-        .map((r) => `{ op: ${JSON.stringify(r.op)}, fd: ${r.fd}, target: ${this.templateOf(parseWord(r.target.text).parts)} }`)
+        .map((r) => {
+          const parts =
+            r.op === "<<" || r.op === "<<-"
+              ? parseHeredoc(r.target.text, r.expand !== false).parts
+              : parseWord(r.target.text).parts;
+          return `{ op: ${JSON.stringify(r.op)}, fd: ${r.fd}, target: ${this.templateOf(parts)} }`;
+        })
         .join(", ");
       core = `${i}await sh.withRedirects([${rd}], async () => {\n${this.base(cmd, ind + 1)}\n${i}});`;
     } else {

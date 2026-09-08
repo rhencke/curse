@@ -18,7 +18,8 @@ import type {
 } from "../ast/nodes.mts";
 import { CMD_INVERT_RETURN } from "../ast/nodes.mts";
 import { parse } from "../parser/parser.mts";
-import { expandNoSplit, expandWords, splitTaggedFields } from "./expand.mts";
+import { parseHeredoc } from "../parser/word.mts";
+import { expandNoSplit, expandParsed, expandWords, splitTaggedFields } from "./expand.mts";
 import { evalArith } from "./arith.mts";
 import { globMatch } from "./glob.mts";
 import {
@@ -393,6 +394,7 @@ export class Shell {
       case "&>>": { const w = openFile("a"); writers[1] = w; writers[2] = w; break; }
       case "<": this.stdinData = readFileSync(resolve(this.cwd, target), "utf8"); break;
       case "<<<": this.stdinData = target + "\n"; break;
+      case "<<": case "<<-": this.stdinData = target; break;
       case ">&": case "<&": {
         if (target === "-") {
           writers[r.fd] = () => {};
@@ -682,7 +684,11 @@ export class Shell {
     if (cmd.redirects !== undefined && cmd.redirects.length > 0) {
       const reds: RedirIO[] = [];
       for (const r of cmd.redirects) {
-        reds.push({ op: r.op, fd: r.fd, target: await expandNoSplit(this, r.target.text) });
+        const target =
+          r.op === "<<" || r.op === "<<-"
+            ? await expandParsed(this, parseHeredoc(r.target.text, r.expand !== false))
+            : await expandNoSplit(this, r.target.text);
+        reds.push({ op: r.op, fd: r.fd, target });
       }
       status = await this.withRedirects(reds, () => this.dispatch(cmd));
     } else {

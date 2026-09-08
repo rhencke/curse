@@ -9,7 +9,7 @@
 import type { Word } from "../ast/nodes.mts";
 import type { Shell } from "./shell.mts";
 import { parseWord } from "../parser/word.mts";
-import type { Param, WordPart } from "../parser/word.mts";
+import type { Param, ParsedWord, WordPart } from "../parser/word.mts";
 import { braceExpand } from "../parser/brace.mts";
 import { evalArith } from "./arith.mts";
 import { replaceGlob, substr, trimPrefix, trimSuffix } from "./param.mts";
@@ -162,7 +162,11 @@ const makeWordLocal = (text: string): Word => ({ text, flags: 0 });
 
 /** Expand text with no field splitting (assignment RHS, arithmetic operands). */
 export const expandNoSplit = async (shell: Shell, text: string): Promise<string> => {
-  const pw = parseWord(text);
+  return expandParsed(shell, parseWord(text));
+};
+
+/** Concatenate an already-parsed word's parts into a single string (no split). */
+export const expandParsed = async (shell: Shell, pw: ParsedWord): Promise<string> => {
   let out = "";
   for (const p of pw.parts) {
     out += p.k === "lit" ? p.s : await partValue(shell, p);

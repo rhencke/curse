@@ -419,9 +419,12 @@ class Parser {
     const m = /^(\d*)(.*)$/.exec(tok.value)!;
     const fdStr = m[1]!;
     const op = m[2]!;
-    if (op === "<<" || op === "<<-") {
-      throw new ParseError("here-documents `<<` not supported yet (planned)");
+
+    if (tok.heredoc !== undefined) {
+      const fd = fdStr !== "" ? parseInt(fdStr, 10) : 0;
+      return { op, fd, target: makeWord(tok.heredoc.body), expand: !tok.heredoc.quoted };
     }
+
     const t = this.peek();
     if (t.type !== "WORD") {
       throw new ParseError(`expected a redirection target (line ${t.line})`);

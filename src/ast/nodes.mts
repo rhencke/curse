@@ -16,7 +16,10 @@ export interface Redirect {
   /** ">" ">>" "<" ">&" "<&" "&>" "&>>" "<<<" ">|" "<<" "<<-" */
   op: string;
   fd: number;
+  /** filename / dup target / here-string / here-doc body */
   target: Word;
+  /** here-docs: expand `$` in the body (unquoted delimiter) vs. literal. */
+  expand?: boolean;
 }
 
 /* WORD_DESC (command.h). Faithful to bash: `text` is the raw token text with

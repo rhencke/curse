@@ -9,12 +9,22 @@
 
 export type TokenType = "WORD" | "OP" | "NEWLINE" | "ARITH" | "COND" | "REDIR" | "EOF";
 
+/** A here-document collected by the lexer; `body` is filled at end of line. */
+export interface Heredoc {
+  delim: string;
+  quoted: boolean;
+  stripTabs: boolean;
+  body: string;
+}
+
 export interface Token {
   type: TokenType;
   /** WORD: raw text incl. quotes. OP: the operator. NEWLINE: "\n". EOF: "". */
   value: string;
   pos: number;
   line: number;
+  /** For `<<` / `<<-` REDIR tokens: the collected here-document. */
+  heredoc?: Heredoc;
 }
 
 /** Unquoted characters that terminate a word / act as operators. */
@@ -31,6 +41,7 @@ class Lexer {
   private readonly n: number;
   private i = 0;
   private line = 1;
+  private pendingHeredocs: Heredoc[] = [];
 
   constructor(src: string) {
     this.s = src;
@@ -80,6 +91,7 @@ class Lexer {
     if (c === "\n") {
       this.i++;
       this.line++;
+      if (this.pendingHeredocs.length > 0) this.collectHeredocs();
       return { type: "NEWLINE", value: "\n", pos, line };
     }
 
@@ -378,8 +390,8 @@ class Lexer {
         this.i++;
         const m = this.at();
         if (m === "<") { this.i++; op += "<<<"; }
-        else if (m === "-") { this.i++; op += "<<-"; }
-        else op += "<<";
+        else if (m === "-") { this.i++; op += "<<-"; return this.startHeredoc(op, true, pos, line); }
+        else { op += "<<"; return this.startHeredoc(op, false, pos, line); }
       } else if (n === "&") {
         this.i++;
         op += "<&";
@@ -388,6 +400,66 @@ class Lexer {
       }
     }
     return { type: "REDIR", value: op, pos, line };
+  }
+
+  /** Read the here-doc delimiter and register the pending body collection. */
+  private startHeredoc(op: string, stripTabs: boolean, pos: number, line: number): Token {
+    while (isBlank(this.at())) this.i++;
+    let delim = "";
+    let quoted = false;
+    for (;;) {
+      const c = this.at();
+      if (c === undefined || isMeta(c)) break;
+      if (c === "'") {
+        quoted = true;
+        this.i++;
+        while (this.at() !== undefined && this.at() !== "'") delim += this.s[this.i++];
+        this.i++;
+        continue;
+      }
+      if (c === '"') {
+        quoted = true;
+        this.i++;
+        while (this.at() !== undefined && this.at() !== '"') delim += this.s[this.i++];
+        this.i++;
+        continue;
+      }
+      if (c === "\\") {
+        quoted = true;
+        this.i++;
+        const nc = this.at();
+        if (nc !== undefined) delim += this.s[this.i++];
+        continue;
+      }
+      delim += c;
+      this.i++;
+    }
+    const rec: Heredoc = { delim, quoted, stripTabs, body: "" };
+    this.pendingHeredocs.push(rec);
+    return { type: "REDIR", value: op, pos, line, heredoc: rec };
+  }
+
+  /** Consume here-document bodies following the newline just read. */
+  private collectHeredocs(): void {
+    for (const h of this.pendingHeredocs) {
+      let body = "";
+      for (;;) {
+        if (this.at() === undefined) break; // EOF before delimiter
+        let raw = "";
+        while (this.at() !== undefined && this.at() !== "\n") raw += this.s[this.i++];
+        const hadNewline = this.at() === "\n";
+        if (hadNewline) {
+          this.i++;
+          this.line++;
+        }
+        const stripped = h.stripTabs ? raw.replace(/^\t+/, "") : raw;
+        if (stripped === h.delim) break;
+        body += stripped + "\n";
+        if (!hadNewline) break;
+      }
+      h.body = body;
+    }
+    this.pendingHeredocs = [];
   }
 
   /** Scan a `(( ... ))` arithmetic command, returning the inner text (without

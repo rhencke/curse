@@ -133,6 +133,38 @@ class WordParser {
     return { parts: this.parts, anchored: this.anchored };
   }
 
+  /** Scan the whole input as double-quote-like content (for here-doc bodies):
+   *  `$`-expansions apply, `\` escapes only `$` `` ` `` `\` and newline, and
+   *  everything else (including quotes) is literal. */
+  parseDquoteAll(): ParsedWord {
+    for (;;) {
+      const c = this.at();
+      if (c === undefined) break;
+      if (c === "\\") {
+        const nd = this.at(1);
+        if (nd !== undefined && (nd === "$" || nd === "`" || nd === "\\")) {
+          this.lit += nd;
+          this.i += 2;
+        } else if (nd === "\n") {
+          this.i += 2;
+        } else {
+          this.lit += "\\";
+          this.i++;
+        }
+        continue;
+      }
+      if (c === "$") {
+        this.flushLit();
+        this.dollar(true);
+        continue;
+      }
+      this.lit += c;
+      this.i++;
+    }
+    this.flushLit();
+    return { parts: this.parts, anchored: true };
+  }
+
   /** Decode a `$'...'` ANSI-C string into literal text. */
   private ansiC(): void {
     this.i += 2; // past $'
@@ -426,3 +458,9 @@ function parseParam(inner: string): Param {
 }
 
 export const parseWord = (text: string): ParsedWord => new WordParser(text).parse();
+
+/** Parse a here-document body: `$`-expanded (unquoted delimiter) or literal. */
+export const parseHeredoc = (text: string, expand: boolean): ParsedWord =>
+  expand
+    ? new WordParser(text).parseDquoteAll()
+    : { parts: text === "" ? [] : [{ k: "lit", s: text }], anchored: true };
