@@ -19,7 +19,7 @@ import type {
 import { CMD_INVERT_RETURN } from "../ast/nodes.mts";
 import { parse } from "../parser/parser.mts";
 import { parseHeredoc } from "../parser/word.mts";
-import { evalParam, expandNoSplit, expandParsed, expandWords, splitTaggedFields } from "./expand.mts";
+import { evalParam, expandAssign, expandNoSplit, expandParsed, expandWords, splitTaggedFields } from "./expand.mts";
 import { evalArith } from "./arith.mts";
 import { globExpand, globMatch, hasExtglob, hasGlobMeta } from "./glob.mts";
 import {
@@ -1762,7 +1762,7 @@ export class Shell {
       const env: Record<string, string> = {};
       for (const wt of assignWords) {
         const m = ASSIGN.exec(wt)!;
-        if (m[2] === undefined && m[4] === undefined) env[m[1]!] = await expandNoSplit(this, m[5]!);
+        if (m[2] === undefined && m[4] === undefined) env[m[1]!] = await expandAssign(this, m[5]!);
       }
       return this.withEnv(env, () => this.callByName(argv[0]!, argv.slice(1)));
     }
@@ -1805,7 +1805,7 @@ export class Shell {
     const name = m[1]!;
     const sub = m[3];
     const append = m[4] === "+";
-    const value = await expandNoSplit(this, m[5]!);
+    const value = await expandAssign(this, m[5]!);
     if (m[2] !== undefined) {
       const raw = sub ?? "";
       if (append) await this.elemSet(name, raw, ((await this.elemGet(name, raw)) ?? "") + value);

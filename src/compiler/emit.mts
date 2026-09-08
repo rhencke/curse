@@ -404,7 +404,7 @@ class Emitter {
     const name = m[1]!;
     const hasSub = m[2] !== undefined;
     const append = m[4] === "+";
-    const rhs = this.templateOf(parseWord(m[5]!).parts);
+    const rhs = this.templateOf(parseWord(m[5]!, true).parts);
     const i = pad(ind);
     const J = JSON.stringify;
     if (hasSub) {
@@ -501,7 +501,7 @@ class Emitter {
     const env = assignWords
       .map((w) => ASSIGN.exec(w)!)
       .filter((m) => m[2] === undefined && m[4] === undefined)
-      .map((m) => `${JSON.stringify(m[1])}: ${this.templateOf(parseWord(m[5]!).parts)}`)
+      .map((m) => `${JSON.stringify(m[1])}: ${this.templateOf(parseWord(m[5]!, true).parts)}`)
       .join(", ");
     return arrayStmts + `${i}await sh.withEnv({ ${env} }, () => ${callInner});`;
   }

@@ -66,9 +66,27 @@ class WordParser {
   private anchored = false;
   private hasQuote = false;
   private readonly t: string;
+  private readonly assignValue: boolean;
+  /** In an assignment word, a tilde expands after `=` and each unquoted `:`. */
+  private assign = false;
 
-  constructor(text: string) {
+  constructor(text: string, assignValue = false) {
     this.t = text;
+    this.assignValue = assignValue;
+  }
+
+  /** At an assignment tilde-prefix position: `~`, `~/`, or `~` before `:`/end
+   *  -> $HOME (result not split). `~user` is left literal. Returns whether it
+   *  consumed a tilde. */
+  private tryTilde(): boolean {
+    if (this.at() !== "~") return false;
+    const n = this.at(1);
+    if (n !== undefined && n !== "/" && n !== ":") return false;
+    this.flushLit(); // emit any buffered literal (e.g. the `name=` prefix) first
+    this.parts.push({ k: "param", p: simpleParam("HOME", false), quoted: true });
+    this.anchored = true;
+    this.i++;
+    return true;
   }
 
   private at(k = 0): string | undefined {
@@ -86,8 +104,19 @@ class WordParser {
   }
 
   parse(): ParsedWord {
-    // Leading unquoted tilde: `~` or `~/...` -> $HOME (result is not split).
-    if (this.t[0] === "~" && (this.t.length === 1 || this.t[1] === "/")) {
+    // An assignment word (`name=…`, `name[k]=…`, `[k]=…`, `name+=…`) expands a
+    // tilde after the `=` and after each `:`; a plain value passed with
+    // assignValue is treated the same. Otherwise only a leading tilde expands.
+    const am = /^(?:[A-Za-z_][A-Za-z0-9_]*(?:\[[^\]]*\])?\+?=|\[[^\]]*\]\+?=)/.exec(this.t);
+    if (this.assignValue) {
+      this.assign = true;
+      this.tryTilde();
+    } else if (am !== null) {
+      this.assign = true;
+      this.pushLit(am[0]);
+      this.i = am[0].length;
+      this.tryTilde();
+    } else if (this.t[0] === "~" && (this.t.length === 1 || this.t[1] === "/")) {
       this.parts.push({ k: "param", p: simpleParam("HOME", false), quoted: true });
       this.anchored = true;
       this.i = 1;
@@ -155,6 +184,13 @@ class WordParser {
         this.i += 2; // past `<(` / `>(`
         this.parts.push({ k: "procsub", dir: c, src: this.cmdSubSrc() });
         this.anchored = true;
+        continue;
+      }
+      // In an assignment word, a tilde right after an unquoted `:` expands.
+      if (this.assign && c === ":") {
+        this.pushLit(":");
+        this.i++;
+        this.tryTilde();
         continue;
       }
       this.pushLit(c);
@@ -621,7 +657,8 @@ export function parseParam(inner: string): Param {
   throw new Error(`bad substitution: \${${inner}}`);
 }
 
-export const parseWord = (text: string): ParsedWord => new WordParser(text).parse();
+export const parseWord = (text: string, assignValue = false): ParsedWord =>
+  new WordParser(text, assignValue).parse();
 
 /** Parse a here-document body: `$`-expanded (unquoted delimiter) or literal. */
 export const parseHeredoc = (text: string, expand: boolean): ParsedWord =>

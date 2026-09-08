@@ -299,6 +299,12 @@ export const expandNoSplit = async (shell: Shell, text: string): Promise<string>
   return expandParsed(shell, parseWord(text));
 };
 
+/** Expand an assignment's value: like expandNoSplit but tilde also expands
+ *  after each `:` (bash's assignment tilde expansion). */
+export const expandAssign = async (shell: Shell, text: string): Promise<string> => {
+  return expandParsed(shell, parseWord(text, true));
+};
+
 /** Concatenate an already-parsed word's parts into a single string (no split). */
 export const expandParsed = async (shell: Shell, pw: ParsedWord): Promise<string> => {
   let out = "";
