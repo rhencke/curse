@@ -127,7 +127,8 @@ class Emitter {
       case "!": return "String(sh.lastBgPid)";
       case "-": return "sh.optionFlags()";
       case "0": return "sh.name";
-      case "@": case "*": return 'sh.positional.join(" ")';
+      case "*": return "sh.positional.join(sh.starSep())";
+      case "@": return 'sh.positional.join(" ")';
       default: return `sh.param(${Number(name)})`;
     }
   }
@@ -138,7 +139,9 @@ class Emitter {
   private valStr(prm: Param): string {
     const J = JSON.stringify;
     if (prm.special) return this.specialExpr(prm.name);
-    if (prm.sub === "@" || prm.sub === "*") return `sh.arrayValues(${J(prm.name)}).join(" ")`;
+    if (prm.sub === "@" || prm.sub === "*") {
+      return `sh.arrayValues(${J(prm.name)}).join(${prm.sub === "*" ? "sh.starSep()" : '" "'})`;
+    }
     if (prm.sub !== "") {
       return `((await sh.elemGet(${J(prm.name)}, ${J(prm.sub)})) ?? "")`;
     }

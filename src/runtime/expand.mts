@@ -47,6 +47,8 @@ export const splitTaggedFields = (
   return fields;
 };
 
+const starSep = (shell: Shell): string => shell.starSep();
+
 const specialValue = (shell: Shell, name: string): string => {
   switch (name) {
     case "?": return String(shell.status);
@@ -54,7 +56,8 @@ const specialValue = (shell: Shell, name: string): string => {
     case "!": return String(shell.lastBgPid);
     case "-": return shell.optionFlags();
     case "#": return String(shell.positional.length);
-    case "@": case "*": return shell.positional.join(" ");
+    case "*": return shell.positional.join(starSep(shell));
+    case "@": return shell.positional.join(" ");
     case "0": return shell.name;
     default: return shell.positional[Number(name) - 1] ?? "";
   }
@@ -143,7 +146,7 @@ export const evalParam = async (shell: Shell, prm: Param): Promise<string> => {
   } else if (prm.sub === "@" || prm.sub === "*") {
     const vals = shell.arrayValues(prm.name);
     if (prm.length) return String(vals.length); // ${#arr[@]}
-    rawVal = vals.join(" ");
+    rawVal = vals.join(prm.sub === "*" ? starSep(shell) : " ");
     isSet = vals.length > 0;
   } else if (prm.sub !== "") {
     rawVal = await shell.elemGet(prm.name, prm.sub);

@@ -644,6 +644,12 @@ export class Shell {
     return this.elemValueSync(m[1]!, m[2]!);
   }
 
+  /** Separator for `$*` / `${a[*]}`: the first char of IFS (a space when IFS is
+   *  unset, empty when IFS is set but empty). `$@` always joins with a space. */
+  starSep(): string {
+    const ifs = this.getVar("IFS");
+    return ifs === undefined ? " " : ifs === "" ? "" : ifs[0]!;
+  }
   /** Read a plain `$name` reference, honoring `set -u` (used by generated code). */
   ref(name: string): string {
     const r = this.resolveRef(name);
