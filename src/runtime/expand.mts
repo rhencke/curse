@@ -12,7 +12,7 @@ import { parseWord } from "../parser/word.mts";
 import type { Param, ParsedWord, WordPart } from "../parser/word.mts";
 import { braceExpand } from "../parser/brace.mts";
 import { evalArith } from "./arith.mts";
-import { replaceGlob, substr, transform, trimPrefix, trimSuffix } from "./param.mts";
+import { changeCase, replaceGlob, substr, transform, trimPrefix, trimSuffix } from "./param.mts";
 import { ExitSignal } from "./types.mts";
 
 const isIFSWhitespace = (c: string): boolean => c === " " || c === "\t" || c === "\n";
@@ -69,6 +69,8 @@ const sliceValues = (shell: Shell, prm: Param): Promise<string[]> =>
 
 /** `${x@op}` / `${arr[@]@op}` — is the operator a `@`-transform? */
 const isTransform = (prm: Param): boolean => prm.op.startsWith("@");
+/** `${x^}` `${x^^}` `${x,}` `${x,,}` — case-modification operator? */
+const isCaseOp = (op: string): boolean => op === "^" || op === "^^" || op === "," || op === ",,";
 /** Whether this param names a whole list (@/* subscript or special @/*). */
 const isList = (prm: Param): boolean =>
   prm.sub === "@" || prm.sub === "*" || (prm.special && (prm.name === "@" || prm.name === "*"));
@@ -91,6 +93,11 @@ const evalParam = async (shell: Shell, prm: Param): Promise<string> => {
       ? specialValue(shell, prm.name)
       : prm.sub !== "" ? (await shell.elemGet(prm.name, prm.sub)) ?? "" : shell.getVar(prm.name) ?? "";
     return transform(prm.op, base);
+  }
+  // ${arr[@]^^} etc. — case-modify each element of a list.
+  if (isCaseOp(prm.op) && isList(prm)) {
+    const pat = await expandNoSplit(shell, prm.arg);
+    return listValues(shell, prm).map((x) => changeCase(x, prm.op, pat)).join(" ");
   }
 
   // Resolve the referenced value (scalar, array element, or all elements).
@@ -165,6 +172,7 @@ const evalParam = async (shell: Shell, prm: Param): Promise<string> => {
       const len = prm.arg2 === "" ? undefined : Number(evalArith(shell, await arg2()));
       return substr(val, off, len);
     }
+    case "^": case "^^": case ",": case ",,": return changeCase(val, prm.op, await arg());
     default:
       throw new Error(`parameter operator not supported: ${prm.op}`);
   }
@@ -200,6 +208,11 @@ export const expandWord = async (shell: Shell, word: Word): Promise<string[]> =>
       // "${arr[@]@op}" / "${@@op}" — transform each element, one field each.
       if (isTransform(p) && (p.sub === "@" || (p.special && p.name === "@"))) {
         return listValues(shell, p).map((x) => transform(p.op, x));
+      }
+      // "${arr[@]^^}" etc. — case-modify each element, one field each.
+      if (isCaseOp(p.op) && (p.sub === "@" || (p.special && p.name === "@"))) {
+        const pat = await expandNoSplit(shell, p.arg);
+        return listValues(shell, p).map((x) => changeCase(x, p.op, pat));
       }
     }
   }

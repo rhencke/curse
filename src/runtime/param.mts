@@ -92,6 +92,21 @@ const expandEscapes = (v: string): string =>
     }
   });
 
+/** `${v^}` `${v^^}` `${v,}` `${v,,}` — case modification, optionally limited
+ *  to characters matching `pat` (empty pattern matches every character). */
+export const changeCase = (v: string, op: string, pat: string): string => {
+  const up = op[0] === "^";
+  const all = op.length === 2;
+  const re = pat === "" ? null : new RegExp("^(?:" + globToRegExpBody(pat) + ")$", "s");
+  const hit = (ch: string): boolean => re === null || re.test(ch);
+  const conv = (ch: string): string => (up ? ch.toUpperCase() : ch.toLowerCase());
+  if (all) return [...v].map((ch) => (hit(ch) ? conv(ch) : ch)).join("");
+  if (v.length === 0) return v;
+  const chars = [...v];
+  chars[0] = hit(chars[0]!) ? conv(chars[0]!) : chars[0]!;
+  return chars.join("");
+};
+
 /** `${parameter@op}` transformations (Q quote, E escapes, L/U case, u title). */
 export const transform = (op: string, v: string): string => {
   switch (op) {

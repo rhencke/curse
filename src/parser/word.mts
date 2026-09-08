@@ -498,6 +498,12 @@ function parseParam(inner: string): Param {
     p.arg = rest.slice(p.op.length);
     return p;
   }
+  if (a === "^" || a === ",") {
+    // ${v^}/${v^^} uppercase, ${v,}/${v,,} lowercase (optional match pattern).
+    p.op = rest[1] === a ? a + a : a;
+    p.arg = rest.slice(p.op.length);
+    return p;
+  }
   if (a === "/") {
     let body = rest.slice(1);
     p.op = "/";

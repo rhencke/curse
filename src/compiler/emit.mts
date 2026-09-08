@@ -29,6 +29,8 @@ const pad = (n: number): string => "  ".repeat(n);
 const bump = (s: string): string => s.replace(/^(?=.)/gm, "  ");
 /** An assignment word: name(1), optional `[sub(3)]`(2), optional `+`(4), value(5). */
 const ASSIGN = /^([A-Za-z_][A-Za-z0-9_]*)(\[([^\]]*)\])?(\+)?=([\s\S]*)$/;
+
+const isCaseOp = (op: string): boolean => op === "^" || op === "^^" || op === "," || op === ",,";
 const ident = (s: string): boolean => /^[A-Za-z_][A-Za-z0-9_]*$/.test(s);
 const escTemplate = (s: string): string =>
   s.replace(/\\/g, "\\\\").replace(/`/g, "\\`").replace(/\$/g, "\\$");
@@ -135,6 +137,13 @@ class Emitter {
       }
       return `sh.transform(${J(prm.op)}, String(${base}))`;
     }
+    if (isCaseOp(prm.op)) {
+      const pat = this.templateOf(parseWord(prm.arg).parts);
+      if (this.isList(prm)) {
+        return `${this.listExpr(prm)}.map((x) => sh.changeCase(x, ${J(prm.op)}, ${pat})).join(" ")`;
+      }
+      return `sh.changeCase(String(${base}), ${J(prm.op)}, ${pat})`;
+    }
     const arg = (): string => this.templateOf(parseWord(prm.arg).parts);
     const arg2 = (): string => this.templateOf(parseWord(prm.arg2).parts);
     if (prm.length) {
@@ -218,6 +227,11 @@ class Emitter {
         return `${this.listExpr(p.p)}.map((x) => sh.transform(${JSON.stringify(p.p.op)}, x))`;
       }
       if (p.p.names === "@") return `sh.matchNames(${JSON.stringify(p.p.name)})`;
+      // "${arr[@]^^}" etc. — case-modify each element, one field each.
+      if (isCaseOp(p.p.op) && (p.p.sub === "@" || (p.p.special && p.p.name === "@"))) {
+        const pat = this.templateOf(parseWord(p.p.arg).parts);
+        return `${this.listExpr(p.p)}.map((x) => sh.changeCase(x, ${JSON.stringify(p.p.op)}, ${pat}))`;
+      }
       if (p.p.op !== "") return null;
       if (p.p.special && p.p.name === "@") return "sh.positional";
       if (p.p.sub === "@") {

@@ -23,8 +23,8 @@ import { expandNoSplit, expandParsed, expandWords, splitTaggedFields } from "./e
 import { evalArith } from "./arith.mts";
 import { globExpand, globMatch, hasGlobMeta } from "./glob.mts";
 import {
-  replaceGlob as pReplaceGlob, sliceArr as pSliceArr, substr as pSubstr,
-  transform as pTransform, trimPrefix as pTrimPrefix, trimSuffix as pTrimSuffix,
+  changeCase as pChangeCase, replaceGlob as pReplaceGlob, sliceArr as pSliceArr,
+  substr as pSubstr, transform as pTransform, trimPrefix as pTrimPrefix, trimSuffix as pTrimSuffix,
 } from "./param.mts";
 import { builtins } from "./builtins.mts";
 import { ExitSignal, ReturnSignal, Var } from "./types.mts";
@@ -891,6 +891,10 @@ export class Shell {
   /** `${parameter@op}` transformation of a scalar value. */
   transform(op: string, v: string): string {
     return pTransform(op, v);
+  }
+  /** `${v^}` `${v^^}` `${v,}` `${v,,}` case modification. */
+  changeCase(v: string, op: string, pat: string): string {
+    return pChangeCase(v, op, pat);
   }
   /** `${arr[@]:offset:length}` — slice an array's values. */
   async sliceArr(name: string, offExpr: string, lenExpr: string): Promise<string[]> {
