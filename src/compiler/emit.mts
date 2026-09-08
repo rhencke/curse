@@ -419,7 +419,8 @@ class Emitter {
     const rest = words.slice(k);
 
     if (rest.length === 0) {
-      return assignWords.map((w) => this.assignStmt(w, ind)).join("\n");
+      // status 0, unless a command sub in the RHS overrides it (via sh.sub).
+      return `${pad(ind)}sh.status = 0;\n` + assignWords.map((w) => this.assignStmt(w, ind)).join("\n");
     }
 
     // `declare -a arr=(...)` / `local m=(...)` array-literal arguments.

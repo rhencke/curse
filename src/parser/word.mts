@@ -143,6 +143,10 @@ class WordParser {
         this.dollar(false);
         continue;
       }
+      if (c === "`") {
+        this.backtick(false);
+        continue;
+      }
       // Process substitution `<(cmds)` / `>(cmds)` -> a /dev-fd-like path.
       if ((c === "<" || c === ">") && this.at(1) === "(") {
         this.flushLit();
@@ -260,6 +264,29 @@ class WordParser {
     }
   }
 
+  /** Legacy `` `cmds` `` command substitution. Inside, a backslash escapes
+   *  only `` ` ``, `$` and `\`; the unescaped text is the command source. */
+  private backtick(quoted: boolean): void {
+    this.hasQuote = true;
+    this.anchored = true;
+    this.i++; // opening backtick
+    let src = "";
+    for (;;) {
+      const c = this.at();
+      if (c === undefined) throw new Error("unterminated `");
+      this.i++;
+      if (c === "`") break;
+      if (c === "\\") {
+        const n = this.at();
+        if (n === "`" || n === "$" || n === "\\") { src += n; this.i++; } else src += "\\";
+        continue;
+      }
+      src += c;
+    }
+    this.flushLit();
+    this.parts.push({ k: "cmdsub", src, quoted });
+  }
+
   private scanDouble(): void {
     this.anchored = true;
     this.i++; // opening quote
@@ -286,6 +313,10 @@ class WordParser {
       if (d === "$") {
         this.flushLit();
         this.dollar(true);
+        continue;
+      }
+      if (d === "`") {
+        this.backtick(true);
         continue;
       }
       this.lit += d;

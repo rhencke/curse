@@ -1454,15 +1454,17 @@ export class Shell {
     const rest = words.slice(k);
 
     if (rest.length === 0) {
-      for (const wt of assignWords) await this.applyAssign(wt);
+      // A pure assignment's status is 0, unless a command sub in the RHS ran —
+      // then it's that sub's status (bash). sub() sets this.status as it runs.
       this.status = 0;
-      return 0;
+      for (const wt of assignWords) await this.applyAssign(wt);
+      return this.status;
     }
     const argv = await expandWords(this, rest);
     if (argv.length === 0) {
-      for (const wt of assignWords) await this.applyAssign(wt);
       this.status = 0;
-      return 0;
+      for (const wt of assignWords) await this.applyAssign(wt);
+      return this.status;
     }
     if (cmd.arrayArgs !== undefined) await this.applyArrayArgs(cmd.arrayArgs, argv);
     if (this.opts.xtrace) this.io.err("+ " + argv.join(" ") + "\n");
