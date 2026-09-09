@@ -765,6 +765,23 @@ const letBuiltin: Builtin = async (shell, ...args) => {
   return nonzero ? 0 : 1;
 };
 
+// `times`: two lines of accumulated CPU time — the shell's own user/system on
+// the first, its children's on the second — each field as `%dm%.3fs`. Node
+// exposes the process's own CPU via process.cpuUsage() but has no aggregate for
+// reaped children, so the second line is reported as zero (bash's line is also
+// zero until a child has been waited on).
+const times: Builtin = (shell) => {
+  const fmt = (us: number): string => {
+    const sec = us / 1e6;
+    const min = Math.floor(sec / 60);
+    return `${min}m${(sec - min * 60).toFixed(3)}s`;
+  };
+  const self = process.cpuUsage();
+  shell.io.out(`${fmt(self.user)} ${fmt(self.system)}\n`);
+  shell.io.out(`0m0.000s 0m0.000s\n`);
+  return 0;
+};
+
 // break/continue share an argument protocol: outside any loop they warn and
 // return 0; a non-numeric count is a fatal error that exits the shell with 128
 // (bash aborts, it does not merely break); a numeric count acts on that many.
@@ -1717,6 +1734,7 @@ export const builtins: Record<string, Builtin> = {
   source: sourceBuiltin,
   ".": sourceBuiltin,
   let: letBuiltin,
+  times,
   break: breakBuiltin,
   continue: continueBuiltin,
   getopts,

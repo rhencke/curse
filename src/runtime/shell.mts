@@ -1918,7 +1918,9 @@ export class Shell {
   async condMatch(subject: string, rawRhs: string): Promise<boolean> {
     let re: RegExp;
     try {
-      re = new RegExp(await this.condRegex(rawRhs));
+      // `shopt -s nocasematch` makes `=~` case-insensitive, like it already
+      // does for `==`/`case` glob matching.
+      re = new RegExp(await this.condRegex(rawRhs), this.shopts.nocasematch ? "i" : "");
     } catch (e) {
       this.io.err(`${this.name}: ${rawRhs}: ${errMsg(e)}\n`);
       this.condFatal = true;
