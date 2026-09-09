@@ -194,9 +194,15 @@ export class Shell {
   /** Directory stack for pushd/popd/dirs; index 0 mirrors the current dir. */
   dirStack: string[] = [];
   positional: string[] = [];
-  /** Redirected stdin for this command (file contents / here-string), or null
-   *  to inherit. Read by the `read` builtin and passed to external stdin. */
-  stdinData: string | null = null;
+  /** Redirected stdin (file contents / here-string), or null to inherit. Read by
+   *  the `read` builtin and passed to external stdin. Held in a small box shared
+   *  by reference with subshells and command substitutions, so a read that
+   *  consumes input in a `( … )` or `$( … )` advances the same position the
+   *  parent sees next — matching bash's shared stdin fd. A pipeline stage instead
+   *  gets its own box (its slice of the upstream output). */
+  private stdinBuf: { data: string | null } = { data: null };
+  get stdinData(): string | null { return this.stdinBuf.data; }
+  set stdinData(v: string | null) { this.stdinBuf.data = v; }
 
   /** getopts scan state: char index within the current word (0 = the `-`),
    *  and the OPTIND value we last wrote (to detect an external reset). */
@@ -1476,6 +1482,7 @@ export class Shell {
     sub.dirStack = [...this.dirStack];
     sub.opts = { ...this.opts };
     sub.shopts = { ...this.shopts }; // a subshell inherits, but can't leak, shopt
+    sub.stdinBuf = this.stdinBuf; // share stdin by reference: a read in the subshell advances the parent's position too
     // Trap settings are inherited (visible to `trap -p`); a subshell can't leak.
     sub.traps = Object.assign(Object.create(null) as Record<string, string>, this.traps);
     return sub;
@@ -1806,7 +1813,7 @@ export class Shell {
       const chunks: string[] = [];
       const io: IO = isLast ? this.io : { out: (s) => void chunks.push(s), err: (s) => this.io.err(s) };
       const sub = this.cloneForSubshell(io);
-      sub.stdinData = input;
+      sub.stdinBuf = { data: input }; // its own slice of the upstream output, not the shared parent box
       status = await runBody(sub, stages[idx]!);
       statuses.push(status);
       if (status !== 0) lastNonZero = status;

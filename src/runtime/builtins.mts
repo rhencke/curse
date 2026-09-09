@@ -1041,6 +1041,7 @@ const read: Builtin = (shell, ...args) => {
   let delim = "\n";
   let nchars = -1;
   let exactN = -1;
+  let poll = false; // -t 0: test availability without consuming
   const names: string[] = [];
   for (let i = 0; i < args.length; i++) {
     const a = args[i]!;
@@ -1061,10 +1062,20 @@ const read: Builtin = (shell, ...args) => {
       else if (c === "n") { nchars = toInt(takeVal()); break; }
       else if (c === "N") { exactN = toInt(takeVal()); break; }
       else if (c === "p") { shell.io.err(takeVal()); break; }
-      else if (c === "t" || c === "u") { takeVal(); break; }
+      else if (c === "t") {
+        // `-t 0` is a non-blocking availability poll; any other timeout just
+        // reads (we can't truly wait, so an exhausted stream reports EOF).
+        if (parseFloat(takeVal()) === 0) poll = true;
+        break;
+      }
+      else if (c === "u") { takeVal(); break; }
       // other flags: ignored
     }
   }
+
+  // `-t 0`: succeed iff input is available (readable, EOF included), consuming
+  // nothing and leaving REPLY/vars untouched — matching bash's select(2) poll.
+  if (poll) return shell.stdinData !== null ? 0 : 1;
 
   if (shell.stdinData === null || shell.stdinData === "") return 1;
   let data = shell.stdinData;
