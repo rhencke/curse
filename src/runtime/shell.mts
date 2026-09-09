@@ -596,6 +596,11 @@ export class Shell {
   /** Set declare/local attributes on a variable, creating it if needed.
    *  Only future assignments are coerced — an existing value is left as-is
    *  (bash does not re-evaluate on `declare -i name`). */
+  /** Mark a variable declared-but-unset (`declare x` on a fresh name). */
+  markUnset(name: string): void {
+    const v = this.rawLookup(name);
+    if (v !== undefined) v.unset = true;
+  }
   setAttrs(name: string, a: { integer?: boolean; lower?: boolean; upper?: boolean; readonly?: boolean }): void {
     const v = this.varForWrite(name);
     if (a.integer !== undefined) v.integer = a.integer;
@@ -701,6 +706,8 @@ export class Shell {
         .map(([i, val]) => `[${i}]=${declareQuote(val)}`).join(" ");
       return `declare ${attr} ${name}=(${body})`;
     }
+    // A declared-but-unset scalar (`declare x`) prints without a `=value`.
+    if (v.unset) return `declare ${attr} ${name}`;
     return `declare ${attr} ${name}=${declareQuote(v.value)}`;
   }
 

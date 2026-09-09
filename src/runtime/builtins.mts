@@ -992,6 +992,7 @@ const declareBuiltin: Builtin = (shell, ...args) => {
       status = 1;
       continue;
     }
+    const existed = shell.varExists(name);
     if (clearRef) { shell.clearRef(name); continue; }
     if (flags.nameref) {
       if (!shell.setRef(name, value ?? "")) status = 1;
@@ -1005,6 +1006,9 @@ const declareBuiltin: Builtin = (shell, ...args) => {
     // (so this very assignment isn't rejected).
     shell.setAttrs(name, { ...flags, readonly: false });
     if (value !== undefined) { if (append) shell.appendVar(name, value); else shell.setVar(name, value); }
+    // `declare x` on a not-yet-existing scalar declares it but leaves it unset
+    // (bash), so `${x+set}` is empty and `declare -p x` prints no `=value`.
+    else if (!existed && !flags.array && !flags.assoc) shell.markUnset(name);
     if (flags.readonly) shell.setAttrs(name, { readonly: true });
     if (flags.exported) shell.exportVar(name);
   }
