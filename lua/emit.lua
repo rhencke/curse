@@ -30,6 +30,7 @@ local emit_value
 emit_value = function(e, lifted)
   local k = e.k
   if k == "num" then return e.v .. "LL" end
+  if k == "raw" then return e.code end -- a pre-computed Lua expr (inlined param binding)
   if k == "var" then return lifted[e.name] and lname(e.name) or ("sh:aget(%q)"):format(e.name) end
   if k == "param" then return ("rt.str_to_i64(sh:param(%d))"):format(e.n) end
   if k == "un" then
@@ -79,6 +80,7 @@ local function emit_word(w, lifted)
   local parts = {}
   for _, p in ipairs(w.parts) do
     if p.lit then parts[#parts + 1] = ("%q"):format(p.lit)
+    elseif p.raw then parts[#parts + 1] = p.raw -- pre-computed Lua string expr (inlined param)
     elseif p.var then
       parts[#parts + 1] = lifted[p.var] and ("rt.i64_to_str(%s)"):format(lname(p.var)) or ("sh:get(%q)"):format(p.var)
     elseif p.param then parts[#parts + 1] = ("sh:param(%d)"):format(p.param)
@@ -86,6 +88,8 @@ local function emit_word(w, lifted)
       if p.special == "#" then parts[#parts + 1] = "tostring(sh.nparams)"
       elseif p.special == "@" or p.special == "*" then parts[#parts + 1] = 'sh:paramsJoin(" ")'
       elseif p.special == "?" then parts[#parts + 1] = "tostring(sh.status)" end
+    elseif p.arithast then -- a pre-parsed+substituted arith AST (inlined word)
+      parts[#parts + 1] = "rt.i64_to_str(" .. emit_value(p.arithast, lifted) .. ")"
     elseif p.arith then
       parts[#parts + 1] = "rt.i64_to_str(" .. emit_value(require("parser").arith(p.arith), lifted) .. ")"
     end
@@ -143,13 +147,15 @@ local function collect_names(stmts, set)
     end
   end
 end
--- every var any function body touches (lifting these at the top level would go
--- stale vs the function's sh-direct access).
-local function collect_funcvars(stmts, set)
+-- every var touched by a NON-INLINABLE function body (those keep an out-of-line
+-- closure, so a var they touch must be a shared upvalue, not a run-local).
+-- Inlinable functions are spliced into run(), so their var access is run() access.
+local function collect_funcvars(stmts, set, inlinable)
   for _, st in ipairs(stmts) do
-    if st.t == "funcdef" then collect_names(st.body, set)
-    elseif st.t == "forc" or st.t == "whilec" or st.t == "forin" then collect_funcvars(st.body, set)
-    elseif st.t == "if" then for _, cl in ipairs(st.clauses) do collect_funcvars(cl.body, set) end end
+    if st.t == "funcdef" then
+      if not (inlinable and inlinable[st.name]) then collect_names(st.body, set) end
+    elseif st.t == "forc" or st.t == "whilec" or st.t == "forin" then collect_funcvars(st.body, set, inlinable)
+    elseif st.t == "if" then for _, cl in ipairs(st.clauses) do collect_funcvars(cl.body, set, inlinable) end end
   end
 end
 
@@ -234,11 +240,73 @@ local function func_flags(body)
   return f
 end
 
+-- A function is INLINABLE if its body is flat (only assignments and
+-- echo/:/true/false) — no control flow, calls, `return`, or `local`. Such a
+-- function is spliced into its direct call sites (params bound directly, no call,
+-- no string round-trip), which also lets its shared vars collapse to run-locals.
+local function word_varargs(w) -- uses $@ / $* / $# (needs a real param array, don't inline)
+  for _, p in ipairs(w.parts) do
+    if p.special and (p.special == "@" or p.special == "*" or p.special == "#") then return true end
+  end
+  return false
+end
+local function inlinable_body(body)
+  for _, st in ipairs(body) do
+    if st.t == "assign" then
+      if st.rhs and word_varargs(st.rhs) then return false end
+    elseif st.t == "simple" then
+      local cmd = st.words[1].parts[1] and st.words[1].parts[1].lit
+      if not (cmd == "echo" or cmd == ":" or cmd == "true" or cmd == "false") then return false end
+      for j = 2, #st.words do if word_varargs(st.words[j]) then return false end end
+    else
+      return false
+    end
+  end
+  return true
+end
+
+-- Substitute positional params ($n) with the caller's already-computed Lua exprs.
+-- pb[n] = { int = <arith Lua expr>, str = <string Lua expr> }.
+local function subst_arith(e, pb)
+  if type(e) ~= "table" then return e end
+  local k = e.k
+  if k == "param" then -- unset positional inside the callee is 0 in arith
+    return pb[e.n] and { k = "raw", code = pb[e.n].int } or { k = "num", v = "0" }
+  end
+  if k == "bin" then return { k = "bin", op = e.op, l = subst_arith(e.l, pb), r = subst_arith(e.r, pb) } end
+  if k == "un" then return { k = "un", op = e.op, e = subst_arith(e.e, pb) } end
+  if k == "asgn" then return { k = "asgn", name = e.name, op = e.op, e = subst_arith(e.e, pb) } end
+  return e -- num, var, post, pre, raw
+end
+local function subst_word(w, pb)
+  local parts = {}
+  for _, p in ipairs(w.parts) do
+    if p.param then parts[#parts + 1] = pb[p.param] and { raw = pb[p.param].str } or { lit = "" } -- unset positional = ""
+    elseif p.arith then parts[#parts + 1] = { arithast = subst_arith(require("parser").arith(p.arith), pb) }
+    else parts[#parts + 1] = p end
+  end
+  return { k = "word", parts = parts }
+end
+local function subst_list(body, pb)
+  local out = {}
+  for _, st in ipairs(body) do
+    if st.t == "assign" then
+      out[#out + 1] = st.arith and { t = "assign", name = st.name, arith = subst_arith(st.arith, pb) }
+        or { t = "assign", name = st.name, rhs = subst_word(st.rhs, pb) }
+    elseif st.t == "simple" then
+      local words = {}
+      for _, w in ipairs(st.words) do words[#words + 1] = subst_word(w, pb) end
+      out[#out + 1] = { t = "simple", words = words }
+    end
+  end
+  return out
+end
+
 -- Build a pc-dispatch CFG for a statement list. Shared by the top-level `run`
--- and every function body. `funcflags[name] = {params,locals}` marks user
--- functions (a simple command that calls one) and how to slim its call.
+-- and every function body. `funcflags[name]` marks user functions (out-of-line
+-- call), `inlinefns[name]` gives the body of an inlinable one (spliced in place).
 -- Returns { blocks, npc, entry, loopPc, stmtPc, DONE }.
-local function build_cfg(stmts, lifted, funcflags)
+local function build_cfg(stmts, lifted, funcflags, inlinefns)
   local blocks = {}
   local loopPc, stmtPc = {}, {}
   local npc = 0
@@ -271,6 +339,24 @@ local function build_cfg(stmts, lifted, funcflags)
         local n = st.words[2] and ("tonumber(%s)"):format(emit_word(st.words[2], lifted)) or "sh.status"
         blocks[p] = ("sh.status = (%s) or 0; pc = %d"):format(n, DONE)
         return p
+      end
+      if inlinefns and inlinefns[cmd] then
+        -- INLINE: bind $n to the caller's exprs and splice the body flowing to `after`.
+        local pb = {}
+        for j = 2, #st.words do
+          local w = st.words[j]
+          local strExpr = emit_word(w, lifted)
+          local intExpr
+          if #w.parts == 1 then
+            local pp = w.parts[1]
+            if pp.var then intExpr = lifted[pp.var] and lname(pp.var) or ("sh:aget(%q)"):format(pp.var)
+            elseif pp.lit and pp.lit:match("^[+-]?%d+$") then intExpr = pp.lit .. "LL"
+            elseif pp.arith then intExpr = emit_value(require("parser").arith(pp.arith), lifted)
+            else intExpr = ("rt.str_to_i64(%s)"):format(strExpr) end
+          else intExpr = ("rt.str_to_i64(%s)"):format(strExpr) end
+          pb[j - 1] = { int = intExpr, str = strExpr }
+        end
+        return flatten_list(subst_list(inlinefns[cmd], pb), after)
       end
       local p = newpc()
       local args = {}
@@ -393,16 +479,24 @@ local function assemble(cfg, sig, opts)
 end
 
 function M.emit(ast)
-  local funcflags = {}
-  for _, st in ipairs(ast.stmts) do if st.t == "funcdef" then funcflags[st.name] = func_flags(st.body) end end
-  -- Lift purely-arith vars to native int64. A var no function touches becomes a
-  -- run()-LOCAL (register-allocated — fast in hot loops). A var shared with a
-  -- function becomes a module-level UPVALUE both run() and the function see (no
-  -- hash lookup, no desync) — the upvalue can't stay in a register across a tight
-  -- loop, but shared vars are updated per-call, not per-hot-iteration.
+  local funcflags, inlinable, inlinefns = {}, {}, {}
+  for _, st in ipairs(ast.stmts) do
+    if st.t == "funcdef" then
+      funcflags[st.name] = func_flags(st.body)
+      if inlinable_body(st.body) then inlinable[st.name] = true; inlinefns[st.name] = st.body end
+    end
+  end
+  -- Lift purely-arith vars to native int64. A var touched by no OUT-OF-LINE
+  -- function becomes a run()-LOCAL (register-allocated — fast in hot loops); a
+  -- direct call to an inlinable function is spliced in, so its var access counts
+  -- as run() access. A var reached through a non-inlined function becomes a
+  -- module-level UPVALUE both run() and that function's closure see (no hash
+  -- lookup, no desync) — it can't be register-held across a loop, but such vars
+  -- are updated per-call, not per-hot-iteration. Every fn_x is still emitted (for
+  -- indirect/dynamic dispatch).
   local lifted = analyze_lift(ast)
   local funcTouched = {}
-  collect_funcvars(ast.stmts, funcTouched)
+  collect_funcvars(ast.stmts, funcTouched, inlinable)
   local upvals, runlocals = {}, {}
   for n in pairs(lifted) do
     if funcTouched[n] then upvals[#upvals + 1] = n else runlocals[#runlocals + 1] = n end
@@ -414,18 +508,20 @@ function M.emit(ast)
   if #upvals > 0 then
     local vs = {}
     for _, n in ipairs(upvals) do vs[#vs + 1] = lname(n) end
-    o[#o + 1] = "local " .. table.concat(vs, ", ") -- module-level upvalues (shared with functions)
+    o[#o + 1] = "local " .. table.concat(vs, ", ") -- module-level upvalues (shared with non-inlined functions)
   end
   local decls = {}
   for name in pairs(funcflags) do decls[#decls + 1] = "fn_" .. name end
   if #decls > 0 then o[#o + 1] = "local " .. table.concat(decls, ", ") end
   for _, st in ipairs(ast.stmts) do
     if st.t == "funcdef" then
-      local cfg = build_cfg(st.body, upset, funcflags) -- functions lift only the shared upvalues
+      -- keep every fn_x (indirect/dynamic dispatch); it can't see run-locals, so
+      -- it lifts only the shared upvalues and is sh-direct for the rest.
+      local cfg = build_cfg(st.body, upset, funcflags, inlinefns)
       o[#o + 1] = assemble(cfg, "fn_" .. st.name .. " = function(sh)", {})
     end
   end
-  local top = build_cfg(ast.stmts, lifted, funcflags)
+  local top = build_cfg(ast.stmts, lifted, funcflags, inlinefns)
   o[#o + 1] = "local loopPc = " .. serialize(top.loopPc)
   o[#o + 1] = "local stmtPc = " .. serialize(top.stmtPc)
   o[#o + 1] = assemble(top, "local function run(sh, pc)", { runlocals = runlocals, upvals = upvals, toplevel = true })

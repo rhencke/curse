@@ -50,7 +50,17 @@ params (`$1..$9`, `$@`, `$*`, `$#`, `$?`), `$(( … ))`, `$var` / `${var}`, 64-b
 int arithmetic. Functions gate OSR: the tier hands off only at top-level
 safepoints (calldepth 0), so a hot loop calling a function switches at the loop
 (function runs compiled each call); a hot loop inside a once-called function
-stays on the interpreter (still faster than bash). Lifting has two forms: a var no function touches becomes a `run()`-LOCAL
+stays on the interpreter (still faster than bash). **Inlining** (do both): a direct call to an INLINABLE function — flat body of
+only assignments + `echo`/`:`/`true`/`false`, no control flow, calls, `return`,
+`local`, or `$@`/`$*`/`$#` — is spliced into the call site: `$n` is bound
+directly to the caller's expression (so `add "$i"` with `i` an int64 skips the
+`tostring → parse` round-trip), and the body's vars collapse into `run()`-locals.
+Every `fn_x` is still emitted so indirect/dynamic dispatch (a name in `$1`,
+`eval`, `$@`/`local`/`return` functions) still works out-of-line via the upvalue
+path. Result: `funcs.sh` (1M `add "$i"` calls) went 574ms → 0.3ms — the call
+collapses to a native `v_sum += v_i` loop, same as the arith benchmark.
+
+Lifting has two forms: a var no OUT-OF-LINE function touches becomes a `run()`-LOCAL
 (register-allocated, ~0.6 ns/iter in hot loops); a var shared with a function
 becomes a module-level Lua UPVALUE that run() and the function closures all see —
 one real native variable, no hash lookup, no interp/compiled desync (seeded from
