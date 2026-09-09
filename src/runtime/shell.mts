@@ -1044,6 +1044,43 @@ export class Shell {
     this.aset(name, nv);
     return post ? cur : nv;
   }
+
+  /* Hoisted-box arithmetic: the emitter resolves a loop variable's Var box once
+   * (abox) and then reads/writes it directly, skipping the per-iteration scope
+   * Map lookup. Only used where a static safety check proved the loop can't
+   * unset/redeclare the variable or run opaque code (see the emitter). */
+  /** Resolve-or-create the scalar box a name refers to (deref simple namerefs). */
+  abox(name: string): Var {
+    const r = this.resolveRef(name);
+    const existing = this.scopeLookup(r.name);
+    if (existing) return existing;
+    const v = new Var("", process.env[r.name] !== undefined);
+    this.globalScope.vars.set(r.name, v);
+    return v;
+  }
+  bxget(v: Var): bigint {
+    if (v.unset) return 0n;
+    const c = v.intCache();
+    if (c !== null) return c;
+    const s = v.scalar();
+    if (s === "") return 0n;
+    const r = this.parseArithInt(s);
+    v.cacheInt(s, r);
+    return r;
+  }
+  bxset(v: Var, val: bigint): bigint {
+    v.setInt(val);
+    v.unset = false;
+    return val;
+  }
+  bxinc(v: Var, delta: bigint, post: boolean): bigint {
+    const c = v.intCache();
+    const cur = c !== null ? c : v.value === "" ? 0n : this.parseArithInt(v.value);
+    const nv = arithWrap(cur + delta);
+    v.setInt(nv);
+    v.unset = false;
+    return post ? cur : nv;
+  }
   adiv(l: bigint, r: bigint): bigint {
     if (r === 0n) throw new ArithError("division by 0");
     return arithWrap(l / r);

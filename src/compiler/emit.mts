@@ -11,7 +11,7 @@
  * Word structure comes from the shared parser (parser/word.mts), so the
  * compiled output and the interpreter agree. */
 
-import type { Command, CondExpr, FunctionDef, SimpleCommand, Word } from "../ast/nodes.mts";
+import type { ArithForCommand, Command, CondExpr, FunctionDef, SimpleCommand, Word } from "../ast/nodes.mts";
 import { CMD_INVERT_RETURN } from "../ast/nodes.mts";
 import { parse } from "../parser/parser.mts";
 import { parseDquote, parseHeredoc, parseWord } from "../parser/word.mts";
@@ -62,56 +62,68 @@ const arithBinJS = (op: string, l: string, r: string): string | null => {
   return null;
 };
 
-const arithNodeJS = (n: ArithNode): string | null => {
+const arithNodeJS = (n: ArithNode, hoist: Map<string, string> | null): string | null => {
   const J = JSON.stringify;
+  // Read/write a scalar via a hoisted box (no scope lookup) when available.
+  const box = (name: string): string | undefined => hoist?.get(name);
   switch (n.t) {
     case "num":
       return `${n.v}n`;
-    case "var":
-      return n.index !== undefined ? null : `sh.aget(${J(n.name)})`;
+    case "var": {
+      if (n.index !== undefined) return null;
+      const b = box(n.name);
+      return b !== undefined ? `sh.bxget(${b})` : `sh.aget(${J(n.name)})`;
+    }
     case "unary": {
-      const e = arithNodeJS(n.e);
+      const e = arithNodeJS(n.e, hoist);
       if (e === null) return null;
       if (n.op === "+") return `(${e})`;
       if (n.op === "-") return `sh.aw(-(${e}))`;
       if (n.op === "!") return `((${e}) === 0n ? 1n : 0n)`;
       return `sh.aw(~(${e}))`; // "~"
     }
-    case "incr":
-      return n.index !== undefined ? null
-        : `sh.ainc(${J(n.name)}, ${n.op === "++" ? "1n" : "-1n"}, ${n.post})`;
+    case "incr": {
+      if (n.index !== undefined) return null;
+      const d = n.op === "++" ? "1n" : "-1n";
+      const b = box(n.name);
+      return b !== undefined
+        ? `sh.bxinc(${b}, ${d}, ${n.post})`
+        : `sh.ainc(${J(n.name)}, ${d}, ${n.post})`;
+    }
     case "bin": {
-      const l = arithNodeJS(n.l), r = arithNodeJS(n.r);
+      const l = arithNodeJS(n.l, hoist), r = arithNodeJS(n.r, hoist);
       return l === null || r === null ? null : arithBinJS(n.op, l, r);
     }
     case "logic": {
-      const l = arithNodeJS(n.l), r = arithNodeJS(n.r);
+      const l = arithNodeJS(n.l, hoist), r = arithNodeJS(n.r, hoist);
       if (l === null || r === null) return null;
       return `((${l}) !== 0n ${n.op} (${r}) !== 0n ? 1n : 0n)`;
     }
     case "ternary": {
-      const c = arithNodeJS(n.c), a = arithNodeJS(n.a), b = arithNodeJS(n.b);
+      const c = arithNodeJS(n.c, hoist), a = arithNodeJS(n.a, hoist), b = arithNodeJS(n.b, hoist);
       return c === null || a === null || b === null ? null : `((${c}) !== 0n ? (${a}) : (${b}))`;
     }
     case "comma": {
-      const l = arithNodeJS(n.l), r = arithNodeJS(n.r);
+      const l = arithNodeJS(n.l, hoist), r = arithNodeJS(n.r, hoist);
       return l === null || r === null ? null : `((${l}), (${r}))`;
     }
     case "assign": {
       if (n.index !== undefined) return null;
-      const r = arithNodeJS(n.e);
+      const r = arithNodeJS(n.e, hoist);
       if (r === null) return null;
-      const nm = J(n.name);
-      if (n.op === "=") return `sh.aset(${nm}, (${r}))`;
-      const combined = arithBinJS(n.op.slice(0, -1), `sh.aget(${nm})`, `(${r})`);
-      return combined === null ? null : `sh.aset(${nm}, ${combined})`;
+      const b = box(n.name);
+      const read = b !== undefined ? `sh.bxget(${b})` : `sh.aget(${J(n.name)})`;
+      const val = n.op === "=" ? `(${r})` : arithBinJS(n.op.slice(0, -1), read, `(${r})`);
+      if (val === null) return null;
+      return b !== undefined ? `sh.bxset(${b}, ${val})` : `sh.aset(${J(n.name)}, ${val})`;
     }
   }
 };
 
 /** Compile an arithmetic expression to a JS BigInt expression, or null if it
- *  needs the runtime evaluator (empty, `$`/backtick expansion, or a subscript). */
-const arithToJS = (text: string): string | null => {
+ *  needs the runtime evaluator (empty, `$`/backtick expansion, or a subscript).
+ *  `hoist` maps loop variables to their pre-resolved box JS variable. */
+const arithToJS = (text: string, hoist: Map<string, string> | null = null): string | null => {
   if (text === "" || /[$`]/.test(text)) return null;
   let ast: ArithNode;
   try {
@@ -119,17 +131,32 @@ const arithToJS = (text: string): string | null => {
   } catch {
     return null;
   }
-  return arithNodeJS(ast);
+  return arithNodeJS(ast, hoist);
 };
 
 const CMP_JS: Record<string, string> = {
   "<": "<", "<=": "<=", ">": ">", ">=": ">=", "==": "===", "!=": "!==",
 };
 
+// Var-box hoisting: a word/command is "opaque" if it can run arbitrary code (a
+// command substitution or process substitution), and only these command words
+// are known not to restructure the scope (unset/declare/read/functions can).
+const OPAQUE = /\$\((?!\()|[`]|<\(|>\(/;
+const SAFE_CMDS = new Set(["echo", "printf", ":", "true", "false", "test", "["]);
+
+/** Context for the loop hoisting analysis: names assigned via arith (candidates)
+ *  vs. names ever used with a subscript (arrays — never hoisted); `ok` clears
+ *  when an unsafe construct makes hoisting unsound for the whole loop. */
+interface HoistCtx {
+  ok: boolean;
+  targets: Set<string>;
+  subscripted: Set<string>;
+}
+
 /** Compile an arithmetic expression used as a boolean (a loop test / `(( ))`
  *  truthiness) to a JS boolean, avoiding the `? 1n : 0n) !== 0n` round-trip when
  *  the top node is already a comparison. Returns null to fall back. */
-const arithToJSBool = (text: string): string | null => {
+const arithToJSBool = (text: string, hoist: Map<string, string> | null = null): string | null => {
   if (text === "" || /[$`]/.test(text)) return null;
   let ast: ArithNode;
   try {
@@ -138,10 +165,10 @@ const arithToJSBool = (text: string): string | null => {
     return null;
   }
   if (ast.t === "bin" && ast.op in CMP_JS) {
-    const l = arithNodeJS(ast.l), r = arithNodeJS(ast.r);
+    const l = arithNodeJS(ast.l, hoist), r = arithNodeJS(ast.r, hoist);
     if (l !== null && r !== null) return `(${l}) ${CMP_JS[ast.op]} (${r})`;
   }
-  const js = arithNodeJS(ast);
+  const js = arithNodeJS(ast, hoist);
   return js === null ? null : `(${js}) !== 0n`;
 };
 
@@ -218,6 +245,10 @@ const usesSet = (cmd: Command): boolean => {
 class Emitter {
   private forId = 0;
   private caseId = 0;
+  private hoistSeq = 0;
+  /** Loop variables whose Var box is hoisted (name → JS box variable), set while
+   *  compiling a proven-safe arith loop so arith accesses skip the scope lookup. */
+  private hoist: Map<string, string> | null = null;
   guards = false;
 
   /** Emit a command in an errexit-suppressed scope (a condition, `!`, or the
@@ -365,8 +396,8 @@ class Emitter {
       case ":": {
         // Compile static offset/length arithmetic; fall back if either needs
         // runtime `$`-expansion.
-        const offJS = arithToJS(prm.arg);
-        const lenJS = prm.arg2 === "" ? "null" : arithToJS(prm.arg2);
+        const offJS = arithToJS(prm.arg, this.hoist);
+        const lenJS = prm.arg2 === "" ? "null" : arithToJS(prm.arg2, this.hoist);
         if (offJS !== null && lenJS !== null) return `sh.substrN(String(${base}), ${offJS}, ${lenJS})`;
         return `await sh.substr(String(${base}), ${J(prm.arg)}, ${J(prm.arg2)})`;
       }
@@ -379,7 +410,7 @@ class Emitter {
       case "param":
         return this.paramExpr(p.p, p.quoted);
       case "arith": {
-        const js = arithToJS(p.expr);
+        const js = arithToJS(p.expr, this.hoist);
         return js !== null ? `String(${js})` : `await sh.arithStr(${JSON.stringify(p.expr)})`;
       }
       case "cmdsub": {
@@ -548,8 +579,11 @@ class Emitter {
     // `name=$(( expr ))`: assign the BigInt directly (keeps the arith cache warm
     // and skips the stringify → Proxy-set → re-parse round-trip in hot loops).
     if (!hasSub && !append && parts.length === 1 && parts[0]!.k === "arith") {
-      const js = arithToJS(parts[0]!.expr);
-      if (js !== null) return `${i}sh.aset(${J(name)}, ${js});`;
+      const js = arithToJS(parts[0]!.expr, this.hoist);
+      if (js !== null) {
+        const b = this.hoist?.get(name);
+        return b !== undefined ? `${i}sh.bxset(${b}, ${js});` : `${i}sh.aset(${J(name)}, ${js});`;
+      }
     }
     if (hasSub) {
       const sub = J(m[3] ?? "");
@@ -684,6 +718,105 @@ class Emitter {
     );
   }
 
+  /* ---- arith loop Var-box hoisting ---- */
+
+  /** Plan box hoisting for an arith-for loop: the set of scalar variables it is
+   *  safe to resolve once (name → JS box var), or null if the loop body could
+   *  unset/redeclare a variable or run opaque code. Conservative: anything not
+   *  understood bails, falling back to the (already fast) per-access path. */
+  private planHoist(cmd: ArithForCommand): Map<string, string> | null {
+    const ctx: HoistCtx = { ok: true, targets: new Set(), subscripted: new Set() };
+    this.scanArith(cmd.init, ctx);
+    this.scanArith(cmd.test, ctx);
+    this.scanArith(cmd.step, ctx);
+    this.scanBody(cmd.body, ctx);
+    if (!ctx.ok) return null;
+    const map = new Map<string, string>();
+    for (const n of ctx.targets) if (!ctx.subscripted.has(n)) map.set(n, `_hb${this.hoistSeq++}`);
+    return map.size > 0 ? map : null;
+  }
+
+  private scanArith(text: string, ctx: HoistCtx): void {
+    if (text === "" || /[$`]/.test(text)) return; // dynamic: safe, just not hoisted
+    let ast: ArithNode;
+    try {
+      ast = parseArithAst(text);
+    } catch {
+      return;
+    }
+    this.walkArith(ast, ctx);
+  }
+
+  private walkArith(n: ArithNode, ctx: HoistCtx): void {
+    switch (n.t) {
+      case "num": return;
+      case "var": if (n.index !== undefined) ctx.subscripted.add(n.name); return;
+      case "unary": this.walkArith(n.e, ctx); return;
+      case "incr":
+        if (n.index !== undefined) ctx.subscripted.add(n.name);
+        else ctx.targets.add(n.name);
+        return;
+      case "bin": case "logic": case "comma":
+        this.walkArith(n.l, ctx); this.walkArith(n.r, ctx); return;
+      case "ternary":
+        this.walkArith(n.c, ctx); this.walkArith(n.a, ctx); this.walkArith(n.b, ctx); return;
+      case "assign":
+        if (n.index !== undefined) ctx.subscripted.add(n.name);
+        else ctx.targets.add(n.name);
+        this.walkArith(n.e, ctx);
+        return;
+    }
+  }
+
+  /** Verify a loop body is safe for hoisting and collect its arith targets. */
+  private scanBody(cmd: Command, ctx: HoistCtx): void {
+    if (!ctx.ok) return;
+    if (cmd.redirects !== undefined && cmd.redirects.length > 0) { ctx.ok = false; return; }
+    switch (cmd.type) {
+      case "simple": {
+        if (cmd.arrayArgs !== undefined) { ctx.ok = false; return; }
+        for (const w of cmd.words) if (OPAQUE.test(w.text)) { ctx.ok = false; return; }
+        let sawCmd = false;
+        for (const w of cmd.words) {
+          const am = sawCmd ? null : ASSIGN.exec(w.text);
+          if (am !== null && am[2] === undefined && am[4] === undefined) {
+            const parts = parseWord(am[5]!, true).parts;
+            if (parts.length === 1 && parts[0]!.k === "arith") ctx.targets.add(am[1]!);
+            continue; // a leading scalar assignment
+          }
+          sawCmd = true;
+          if (!SAFE_CMDS.has(w.text)) { ctx.ok = false; return; }
+        }
+        for (const w of cmd.words) {
+          for (const p of parseWord(w.text).parts) if (p.k === "arith") this.scanArith(p.expr, ctx);
+        }
+        return;
+      }
+      case "arith": this.scanArith(cmd.expression, ctx); return;
+      case "arith_for":
+        this.scanArith(cmd.init, ctx); this.scanArith(cmd.test, ctx); this.scanArith(cmd.step, ctx);
+        this.scanBody(cmd.body, ctx); return;
+      case "for":
+        for (const w of cmd.words) if (OPAQUE.test(w.text)) { ctx.ok = false; return; }
+        this.scanBody(cmd.body, ctx); return;
+      case "while": this.scanBody(cmd.test, ctx); this.scanBody(cmd.body, ctx); return;
+      case "if":
+        this.scanBody(cmd.test, ctx); this.scanBody(cmd.consequent, ctx);
+        if (cmd.alternate !== null) this.scanBody(cmd.alternate, ctx); return;
+      case "case":
+        if (OPAQUE.test(cmd.word.text)) { ctx.ok = false; return; }
+        for (const cl of cmd.clauses) {
+          for (const p of cl.patterns) if (OPAQUE.test(p.text)) { ctx.ok = false; return; }
+          if (cl.body !== null) this.scanBody(cl.body, ctx);
+        }
+        return;
+      case "connection": this.scanBody(cmd.first, ctx); this.scanBody(cmd.second, ctx); return;
+      case "group": this.scanBody(cmd.body, ctx); return;
+      // subshell / pipeline / background / function / cond / array_assign / etc.
+      default: ctx.ok = false; return;
+    }
+  }
+
   private base(cmd: Command, ind: number): string {
     const i = pad(ind);
     switch (cmd.type) {
@@ -776,12 +909,28 @@ class Emitter {
         );
       }
       case "arith_for": {
+        // Hoist each safe scalar variable's Var box once (resolve outside the
+        // loop, mutate in place) so arith accesses skip the per-iteration scope
+        // lookup. planHoist returns null / a partial map when unsafe.
+        const savedHoist = this.hoist;
+        let prelude = "";
+        const plan = this.planHoist(cmd);
+        if (plan !== null) {
+          const merged = new Map(savedHoist ?? []);
+          for (const [n, jv] of plan) {
+            const outer = savedHoist?.get(n);
+            if (outer !== undefined) { merged.set(n, outer); continue; } // reuse outer box
+            merged.set(n, jv);
+            prelude += `${i}const ${jv} = sh.abox(${JSON.stringify(n)});\n`;
+          }
+          this.hoist = merged;
+        }
         // C-style header so a `continue` still runs the step then re-tests.
         // Compile each clause to native JS when possible (parsed once), else
         // fall back to the runtime string evaluator for the whole header.
-        const ic = cmd.init === "" ? "" : arithToJS(cmd.init);
-        const tc = cmd.test === "" ? "true" : arithToJSBool(cmd.test);
-        const sc = cmd.step === "" ? "" : arithToJS(cmd.step);
+        const ic = cmd.init === "" ? "" : arithToJS(cmd.init, this.hoist);
+        const tc = cmd.test === "" ? "true" : arithToJSBool(cmd.test, this.hoist);
+        const sc = cmd.step === "" ? "" : arithToJS(cmd.step, this.hoist);
         let header: string;
         if (ic !== null && tc !== null && sc !== null) {
           header = `for (${ic}; ${tc}; ${sc})`;
@@ -791,8 +940,10 @@ class Emitter {
             `await sh.arithTest(${JSON.stringify(cmd.test)}); ` +
             `await sh.arithRun(${JSON.stringify(cmd.step)}))`;
         }
+        const bodyCode = this.loopBody(cmd.body, ind + 1);
+        this.hoist = savedHoist;
         return this.loopScope(
-          `${i}${header} {\n` + this.loopBody(cmd.body, ind + 1) + "\n" + `${i}}`,
+          prelude + `${i}${header} {\n` + bodyCode + "\n" + `${i}}`,
           ind,
         );
       }
