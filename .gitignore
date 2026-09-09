@@ -21,3 +21,6 @@ core.*
 /..bfg-report/
 .ccache/
 /test/real/fetched/
+
+# LuaJIT backend POC scratch (built binary + hand-written Lua)
+/.bench-lua/
