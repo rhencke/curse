@@ -1505,6 +1505,12 @@ export class Shell {
 
   /** Whether a variable is set (used by generated `${x-…}` / `${x+…}`). */
   has(name: string): boolean {
+    // Special parameters aren't stored as Vars: `$@`/`$*` are set only with
+    // positional params, `$1`.. only within range, and `$0 $? $$ $# $! $- $_`
+    // are always set.
+    if (name === "@" || name === "*") return this.positional.length > 0;
+    if (/^[0-9]+$/.test(name)) return name === "0" || Number(name) <= this.positional.length;
+    if (name.length === 1 && "?$#!-_".includes(name)) return true;
     const v = this.lookup(name);
     if (v === undefined || v.unset) return false;
     // `$a` on an array/assoc is `${a[0]}` / key "0": set only if it exists.

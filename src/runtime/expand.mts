@@ -157,7 +157,14 @@ export const evalParam = async (shell: Shell, prm: Param, quoted = false): Promi
   let isSet: boolean;
   if (prm.special) {
     rawVal = specialValue(shell, prm.name);
-    isSet = true;
+    // `$@`/`$*` are unset when there are no positional params, and `$1`.. is
+    // unset past the end — so `${@-x}`/`${3-x}` fall back like bash. Other
+    // specials ($?, $$, $#, …) are always set.
+    isSet = prm.name === "@" || prm.name === "*"
+      ? shell.positional.length > 0
+      : /^[0-9]+$/.test(prm.name)
+      ? prm.name === "0" || Number(prm.name) <= shell.positional.length
+      : true;
   } else if (prm.sub === "@" || prm.sub === "*") {
     const vals = shell.arrayValues(prm.name);
     if (prm.length) return String(vals.length); // ${#arr[@]}
