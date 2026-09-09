@@ -101,6 +101,13 @@ local function exec_stmt(sh, st, hook)
       if not truth(eval(sh, st.cond)) then break end
       exec_list(sh, st.body, hook, false)
     end
+  elseif t == "if" then
+    for _, cl in ipairs(st.clauses) do
+      if cl.cond == nil or truth(eval(sh, cl.cond)) then
+        exec_list(sh, cl.body, hook, false)
+        break
+      end
+    end
   else
     error("interp: bad stmt " .. tostring(t))
   end

@@ -1,23 +1,31 @@
--- Transpile the AST to resumable Lua source.
---   return function(sh, resume) ... end
+-- Transpile the AST to a resumable Lua module using a flattened control-flow
+-- graph dispatched on a program counter:
 --
--- Two emission modes per top-level loop:
---   * sh-direct (fallback): all state in `sh`; the loop is inline with a
---     `::loop_id::` label so OSR resumes via `goto`. Correct for anything.
---   * lifted (fast): a "liftable" arithmetic loop (init/cond/step arithmetic and
---     a body of only arith assignments / nested liftable loops) becomes a
---     per-loop closure whose vars are native Lua int64 LOCALS, seeded from `sh`
---     on entry and written back on exit. The closure form sidesteps Lua's
---     "no goto into a local's scope" rule and makes OSR a plain seeded call:
---     resume into the loop == call the closure with the live `sh`.
+--   return { loopPc = {id->pc}, stmtPc = {k->pc}, run = function(sh, pc) ... end }
 --
--- State that isn't lifted stays in `sh`, so both tiers still share one table.
+-- run() seeds lifted vars from `sh`, then `while true do if pc==N then …; pc=M …`.
+-- Because control flow is flattened, run() can be ENTERED at ANY pc — the cond
+-- check of any loop, at any nesting depth — and following the pc transitions
+-- reconstructs the full continuation (inner loop exits -> outer step -> …). That
+-- is general on-stack replacement: the interpreter hands off at a loop back-edge
+-- and we jump into compiled code at that loop's cond pc. LuaJIT traces the hot
+-- pc path to machine code with ~zero dispatch overhead (measured 1.01x native).
+--
+-- Vars used only arithmetically (all assignments arithmetic or a numeric
+-- literal) are LIFTED to native Lua int64 locals, seeded from `sh` on entry and
+-- written back on exit. Everything else stays in `sh`, so both tiers share it.
 local M = {}
 
 local CMP = { ["=="] = "==", ["!="] = "~=", ["<"] = "<", ["<="] = "<=", [">"] = ">", [">="] = ">=" }
 local function lname(n) return "v_" .. n end
 
--- `lifted` maps bash var name -> true for vars held in Lua locals in this scope.
+-- serialize a {int->int} pc map to a Lua table literal
+local function serialize(t)
+  local parts = {}
+  for k, v in pairs(t) do parts[#parts + 1] = ("[%d]=%d"):format(k, v) end
+  return "{" .. table.concat(parts, ", ") .. "}"
+end
+
 local emit_value
 emit_value = function(e, lifted)
   local k = e.k
@@ -47,13 +55,11 @@ local function emit_bool(e, lifted)
   return "((" .. emit_value(e, lifted) .. ") ~= 0LL)"
 end
 
--- write to a var: a lifted var mutates its local, else sh:aset.
 local function emit_set(name, valexpr, lifted)
   if lifted[name] then return lname(name) .. " = " .. valexpr end
   return ("sh:aset(%q, %s)"):format(name, valexpr)
 end
 
--- arith expr in statement position (loop init / step)
 local function emit_arith_stmt(e, lifted)
   if e.k == "asgn" then
     local v = emit_value(e.e, lifted)
@@ -72,168 +78,162 @@ local function emit_word(w, lifted)
   local parts = {}
   for _, p in ipairs(w.parts) do
     if p.lit then parts[#parts + 1] = ("%q"):format(p.lit)
-    elseif p.var then parts[#parts + 1] = ("sh:get(%q)"):format(p.var)
-    elseif p.arith then parts[#parts + 1] = "rt.i64_to_str(" .. emit_value(require("parser").arith(p.arith), lifted) .. ")" end
+    elseif p.var then
+      parts[#parts + 1] = lifted[p.var] and ("rt.i64_to_str(%s)"):format(lname(p.var)) or ("sh:get(%q)"):format(p.var)
+    elseif p.arith then
+      parts[#parts + 1] = "rt.i64_to_str(" .. emit_value(require("parser").arith(p.arith), lifted) .. ")"
+    end
   end
   if #parts == 0 then return '""' end
   return "(" .. table.concat(parts, " .. ") .. ")"
 end
 
--- Is a loop "liftable"? init/cond/step must be arithmetic (already are), and the
--- body must be only arith assignments (name=$((…))) or nested liftable loops.
--- Collects every var name the loop reads/writes (for seed/writeback).
-local function scan_arith(e, set)
-  if type(e) ~= "table" then return end
-  if e.k == "var" or e.k == "asgn" or e.k == "post" or e.k == "pre" then set[e.name] = true end
-  scan_arith(e.e, set); scan_arith(e.l, set); scan_arith(e.r, set)
+-- a word that is exactly one numeric literal -> its digits (else nil)
+local function numeric_word(w)
+  if #w.parts == 1 and w.parts[1].lit and w.parts[1].lit:match("^[+-]?%d+$") then
+    return w.parts[1].lit
+  end
+  return nil
 end
-local function liftable(st, set)
-  if st.init then scan_arith(st.init, set) end
-  if st.cond then scan_arith(st.cond, set) end
-  if st.step then scan_arith(st.step, set) end
-  for _, b in ipairs(st.body) do
-    if b.t == "assign" and b.arith then
-      set[b.name] = true; scan_arith(b.arith, set)
-    elseif (b.t == "forc" or b.t == "whilec") then
-      if not liftable(b, set) then return false end
-    else
-      return false -- a command / word-assign => can't lift this loop
+
+-- Which vars can be int64 locals: assigned somewhere, and every assignment is
+-- arithmetic or a numeric literal (reads never disqualify).
+local function analyze_lift(ast)
+  local assigned, disq = {}, {}
+  local function scan_stmts(stmts)
+    for _, st in ipairs(stmts) do
+      if st.t == "assign" then
+        assigned[st.name] = true
+        if not st.arith and not (st.rhs and numeric_word(st.rhs)) then disq[st.name] = true end
+      elseif st.t == "forc" or st.t == "whilec" then
+        for _, e in ipairs({ st.init, st.cond, st.step }) do
+          if e and (e.k == "asgn" or e.k == "post" or e.k == "pre") then assigned[e.name] = true end
+        end
+        scan_stmts(st.body)
+      elseif st.t == "if" then
+        for _, cl in ipairs(st.clauses) do scan_stmts(cl.body) end
+      end
     end
   end
-  return true
-end
-
-local out, ind
-local function line(s) out[#out + 1] = ("  "):rep(ind) .. s end
-
--- emit statements that run inside a lifted loop closure (arith only)
-local function emit_lifted_body(stmts, lifted)
-  for _, b in ipairs(stmts) do
-    if b.t == "assign" then
-      line(emit_set(b.name, emit_value(b.arith, lifted), lifted))
-    elseif b.t == "forc" then
-      if b.init then line(emit_arith_stmt(b.init, lifted)) end
-      line("while " .. (b.cond and emit_bool(b.cond, lifted) or "true") .. " do")
-      ind = ind + 1; emit_lifted_body(b.body, lifted)
-      if b.step then line(emit_arith_stmt(b.step, lifted)) end
-      ind = ind - 1; line("end")
-    elseif b.t == "whilec" then
-      line("while " .. emit_bool(b.cond, lifted) .. " do")
-      ind = ind + 1; emit_lifted_body(b.body, lifted); ind = ind - 1; line("end")
-    end
-  end
-end
-
--- sh-direct statement (fallback for non-liftable loops and top-level non-loops)
-local NOLIFT = setmetatable({}, { __index = function() return false end })
-local emit_stmt_direct
-emit_stmt_direct = function(st)
-  local t = st.t
-  if t == "assign" then
-    if st.arith then line(emit_set(st.name, emit_value(st.arith, NOLIFT), NOLIFT))
-    else line(("sh:set_str(%q, %s)"):format(st.name, emit_word(st.rhs, NOLIFT))) end
-  elseif t == "simple" then
-    local args = {}
-    for j = 2, #st.words do args[#args + 1] = emit_word(st.words[j], NOLIFT) end
-    local cmd = st.words[1].parts[1] and st.words[1].parts[1].lit
-    if cmd == "echo" then line("sh:echo(" .. table.concat(args, ", ") .. ")")
-    elseif cmd == ":" or cmd == "true" then line("sh.status = 0")
-    elseif cmd == "false" then line("sh.status = 1")
-    else error("emit subset: unknown command " .. tostring(cmd)) end
-  elseif t == "forc" then
-    if st.init then line(emit_arith_stmt(st.init, NOLIFT)) end
-    line("::loop_" .. st.id .. "::")
-    line("while " .. (st.cond and emit_bool(st.cond, NOLIFT) or "true") .. " do")
-    ind = ind + 1
-    for _, b in ipairs(st.body) do emit_stmt_direct(b) end
-    if st.step then line(emit_arith_stmt(st.step, NOLIFT)) end
-    ind = ind - 1; line("end")
-  elseif t == "whilec" then
-    line("::loop_" .. st.id .. "::")
-    line("while " .. emit_bool(st.cond, NOLIFT) .. " do")
-    ind = ind + 1
-    for _, b in ipairs(st.body) do emit_stmt_direct(b) end
-    ind = ind - 1; line("end")
-  else
-    error("emit: bad stmt " .. tostring(t))
-  end
+  scan_stmts(ast.stmts)
+  local lifted = {}
+  for n in pairs(assigned) do if not disq[n] then lifted[n] = true end end
+  return lifted
 end
 
 function M.emit(ast)
-  out, ind = {}, 1
-  local top = ast.stmts
-  -- classify top-level loops
-  local info = {} -- k -> { lifted = bool, vars = sorted names, id = }
-  for k, st in ipairs(top) do
-    if st.t == "forc" or st.t == "whilec" then
-      local set = {}
-      local ok = liftable(st, set)
-      local vars = {}
-      if ok then for n in pairs(set) do vars[#vars + 1] = n end; table.sort(vars) end
-      info[k] = { lifted = ok, vars = vars, id = st.id }
-    end
-  end
+  local lifted = analyze_lift(ast)
+  local blocks = {}       -- pc -> code string (must set `pc` to a successor)
+  local loopPc, stmtPc = {}, {}
+  local npc = 0
+  local function newpc() local p = npc; npc = npc + 1; return p end
 
-  line('local rt = require("runtime")')
-  line("return function(sh, resume)")
-  ind = ind + 1
+  local DONE = newpc()
+  blocks[DONE] = "break"
 
-  -- per-loop closures for liftable loops (seed from sh, run on locals, write back)
-  for k, st in ipairs(top) do
-    local nfo = info[k]
-    if nfo and nfo.lifted then
-      local lifted = {}; for _, n in ipairs(nfo.vars) do lifted[n] = true end
-      line(("local function __loop%d(sh)"):format(nfo.id))
-      ind = ind + 1
-      for _, n in ipairs(nfo.vars) do line(("local %s = sh:aget(%q)"):format(lname(n), n)) end
-      if st.t == "forc" then
-        line("while " .. (st.cond and emit_bool(st.cond, lifted) or "true") .. " do")
-        ind = ind + 1; emit_lifted_body(st.body, lifted)
-        if st.step then line(emit_arith_stmt(st.step, lifted)) end
-        ind = ind - 1; line("end")
+  local flatten_list
+
+  -- Build blocks for `st`; its exit flows to pc `after`. Returns st's entry pc.
+  local function flatten_stmt(st, after)
+    local t = st.t
+    if t == "assign" then
+      local p = newpc()
+      if st.arith then
+        blocks[p] = emit_set(st.name, emit_value(st.arith, lifted), lifted) .. ("; pc = %d"):format(after)
+      elseif lifted[st.name] then
+        blocks[p] = emit_set(st.name, numeric_word(st.rhs) .. "LL", lifted) .. ("; pc = %d"):format(after)
       else
-        line("while " .. emit_bool(st.cond, lifted) .. " do")
-        ind = ind + 1; emit_lifted_body(st.body, lifted); ind = ind - 1; line("end")
+        blocks[p] = ("sh:set_str(%q, %s); pc = %d"):format(st.name, emit_word(st.rhs, lifted), after)
       end
-      for _, n in ipairs(nfo.vars) do line(("sh:aset(%q, %s)"):format(n, lname(n))) end
-      ind = ind - 1; line("end")
-    end
-  end
-
-  -- resume dispatch
-  line("if resume ~= nil then")
-  ind = ind + 1
-  for k, st in ipairs(top) do
-    local nfo = info[k]
-    if nfo then
-      if nfo.lifted then
-        line(("if resume.loop == %d then __loop%d(sh); goto s_%d end"):format(nfo.id, nfo.id, k + 1))
-      else
-        line(("if resume.loop == %d then goto loop_%d end"):format(nfo.id, nfo.id))
+      return p
+    elseif t == "simple" then
+      local p = newpc()
+      local args = {}
+      for j = 2, #st.words do args[#args + 1] = emit_word(st.words[j], lifted) end
+      local cmd = st.words[1].parts[1] and st.words[1].parts[1].lit
+      local body
+      if cmd == "echo" then body = "sh:echo(" .. table.concat(args, ", ") .. ")"
+      elseif cmd == ":" or cmd == "true" then body = "sh.status = 0"
+      elseif cmd == "false" then body = "sh.status = 1"
+      else error("emit subset: unknown command " .. tostring(cmd)) end
+      blocks[p] = body .. ("; pc = %d"):format(after)
+      return p
+    elseif t == "forc" then
+      local condp = newpc(); loopPc[st.id] = condp
+      local stepp = newpc()
+      local bodyentry = flatten_list(st.body, stepp)
+      blocks[stepp] = (st.step and emit_arith_stmt(st.step, lifted) .. "; " or "") .. ("pc = %d"):format(condp)
+      blocks[condp] = ("if %s then pc = %d else pc = %d end"):format(
+        st.cond and emit_bool(st.cond, lifted) or "true", bodyentry, after)
+      if st.init then
+        local ip = newpc()
+        blocks[ip] = emit_arith_stmt(st.init, lifted) .. ("; pc = %d"):format(condp)
+        return ip
       end
-    end
-  end
-  for k = 1, #top do line(("if resume.stmt == %d then goto s_%d end"):format(k, k)) end
-  ind = ind - 1
-  line("end")
-
-  -- statements
-  for k = 1, #top do
-    line("::s_" .. k .. "::")
-    local st = top[k]
-    local nfo = info[k]
-    if nfo and nfo.lifted then
-      if st.init then line(emit_arith_stmt(st.init, NOLIFT)) end -- fresh: seed sh so the closure reads it
-      line(("__loop%d(sh)"):format(nfo.id))
+      return condp
+    elseif t == "whilec" then
+      local condp = newpc(); loopPc[st.id] = condp
+      local bodyentry = flatten_list(st.body, condp)
+      blocks[condp] = ("if %s then pc = %d else pc = %d end"):format(emit_bool(st.cond, lifted), bodyentry, after)
+      return condp
+    elseif t == "if" then
+      -- allocate a cond pc per conditional clause (forward refs), flatten each
+      -- body once, then wire the false-branches to the next clause.
+      local cps, bentry = {}, {}
+      for i, cl in ipairs(st.clauses) do if cl.cond then cps[i] = newpc() end end
+      for i, cl in ipairs(st.clauses) do bentry[i] = flatten_list(cl.body, after) end
+      local entry
+      for i, cl in ipairs(st.clauses) do
+        if cl.cond then
+          local nxt = after
+          if st.clauses[i + 1] then nxt = cps[i + 1] or bentry[i + 1] end -- next cond, or an else body
+          blocks[cps[i]] = ("if %s then pc = %d else pc = %d end"):format(emit_bool(cl.cond, lifted), bentry[i], nxt)
+          entry = entry or cps[i]
+        else
+          entry = entry or bentry[i] -- a leading else (unusual)
+        end
+      end
+      return entry or after
     else
-      emit_stmt_direct(st)
+      error("emit: bad stmt " .. tostring(t))
     end
   end
-  line("::s_" .. (#top + 1) .. "::") -- fall-through target for a resume past the last loop
 
-  ind = ind - 1
-  line("end")
-  return table.concat(out, "\n") .. "\n"
+  flatten_list = function(stmts, after)
+    local nextpc = after
+    for k = #stmts, 1, -1 do nextpc = flatten_stmt(stmts[k], nextpc) end
+    return nextpc
+  end
+
+  -- top level: record each statement's entry pc for stmt-boundary resume
+  local nextpc = DONE
+  for k = #ast.stmts, 1, -1 do
+    nextpc = flatten_stmt(ast.stmts[k], nextpc)
+    stmtPc[k] = nextpc
+  end
+  local entry = stmtPc[1] or DONE
+
+  -- assemble
+  local o = {}
+  o[#o + 1] = 'local rt = require("runtime")'
+  o[#o + 1] = "local loopPc = " .. serialize(loopPc)
+  o[#o + 1] = "local stmtPc = " .. serialize(stmtPc)
+  o[#o + 1] = "local function run(sh, pc)"
+  local lv = {}
+  for n in pairs(lifted) do lv[#lv + 1] = n end
+  table.sort(lv)
+  for _, n in ipairs(lv) do o[#o + 1] = ("  local %s = sh:aget(%q)"):format(lname(n), n) end
+  o[#o + 1] = ("  pc = pc or %d"):format(entry)
+  o[#o + 1] = "  while true do"
+  for p = 0, npc - 1 do
+    o[#o + 1] = ("    %s pc == %d then %s"):format(p == 0 and "if" or "elseif", p, blocks[p])
+  end
+  o[#o + 1] = "    end"
+  o[#o + 1] = "  end"
+  for _, n in ipairs(lv) do o[#o + 1] = ("  sh:aset(%q, %s)"):format(n, lname(n)) end
+  o[#o + 1] = "end"
+  o[#o + 1] = "return { run = run, loopPc = loopPc, stmtPc = stmtPc }"
+  return table.concat(o, "\n") .. "\n"
 end
 
 return M

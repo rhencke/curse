@@ -22,16 +22,24 @@ Two tiers share **one `sh` runtime table**, so handoff transfers no state:
    statement-by-statement like bash. Bash-competitive (~1.8× faster than bash on
    the arith loop). At every **safepoint** — a top-level statement boundary and
    every loop back-edge — it calls a hook.
-2. **Compiled** (`emit.lua` → Lua source → `load()`) — transpiled Lua that can be
-   **entered at any safepoint** via a `goto`-dispatch keyed by a resume
-   descriptor. Because scripts often have no functions, the switch must work
-   mid-top-level-loop, not just at call boundaries — so a loop's back-edge is a
-   resume entry, and it continues off the live induction variable in `sh`.
+2. **Compiled** (`emit.lua` → Lua source → `load()`) — transpiled Lua as a
+   **flattened control-flow graph dispatched on a program counter**:
+   `run(sh, pc)` seeds lifted vars then `while true do if pc==N then …; pc=M …`.
+   Because control flow is flattened, run() can be ENTERED AT ANY pc — the cond
+   check of any loop, **at any nesting depth** — and following the pc transitions
+   reconstructs the full continuation (inner loop exits → outer step → outer cond
+   → …). That is general on-stack replacement; it works mid-loop for loops nested
+   in loops and in `if` branches, which scripts-without-functions need. LuaJIT
+   traces the hot pc path to machine code with ~zero dispatch overhead (measured
+   1.01× native nested `while`). Vars used only arithmetically are lifted to
+   native int64 locals, seeded from `sh` on entry / written back on exit.
 
-`tier.lua` orchestrates: interpret; when compiled is ready, the safepoint hook
-unwinds and we call `compiled(sh, resume)` — on-stack replacement into compiled
-code from exactly where the interpreter was. Proven bit-identical for switches
-before / mid / after the loop (`test_tier.lua`).
+`tier.lua` orchestrates: interpret; the safepoint hook reports a loop id or a
+statement index; on handoff the driver maps it to a pc (`mod.loopPc`/`stmtPc`)
+and calls `mod.run(sh, pc)` — OSR into compiled code from exactly where the
+interpreter was. Proven bit-identical for switches before / mid / after a
+top-level loop (`test_tier.lua`), a nested inner loop (`test_nested.lua`), and a
+loop inside an `if`.
 
 ## Status
 
@@ -40,11 +48,11 @@ Subset so far (the arith-loop spine): scalar assignments, `echo`/`:`/`true`/
 `${var}`, 64-bit int arithmetic (`+ - * / % == != < <= > >= && || ! ++ -- +=`…).
 
 ### Done
-- **Native-locals emit** — a liftable arithmetic loop compiles to a per-loop
-  closure with native int64 locals, seeded from `sh` on entry and written back on
-  exit. ~1 ns/iter, ~640× the interpreter, matching the hand-written POC, and OSR
-  into it (mid-loop resume seeds the locals from `sh`'s live state) stays
-  bit-identical. Non-liftable loops fall back to sh-direct.
+- **pc-dispatch CFG + native-locals** — the compiled module is a flattened
+  program-counter dispatch (see above) with arithmetic vars lifted to int64
+  locals. ~1 ns/iter, ~425× the interpreter, matching the hand-written POC.
+  General OSR: resuming mid-loop works at any nesting depth (nested loops, loops
+  inside `if`) with bit-identical results.
 
 - **Background compile** — `tier.run_background(script)` spawns a *detached*
   `luajit lua/transpile.lua` that writes `out.lua` (temp + atomic rename); the

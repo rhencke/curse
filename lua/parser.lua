@@ -226,6 +226,30 @@ function M.parse(src)
       local body_stmts = parse_stmts({ done = true })
       return { t = "whilec", id = id, line = ln, cond = arith(body), body = body_stmts }
     end
+    -- if (( cond )); then BODY [elif (( c )); then BODY]* [else BODY] fi
+    if peekword() == "if" then
+      local ln = line; ws(); i = i + 2
+      local function cond()
+        ws()
+        if src:sub(i, i + 1) ~= "((" then error("subset: if needs (( ))") end
+        local body, ni = grab_dparen(src, i + 2); i = ni
+        return arith(body)
+      end
+      local clauses = {}
+      while true do
+        local c = cond()
+        parse_stmts({ ["then"] = true }) -- skip to 'then'
+        local body, term = parse_stmts({ elif = true, ["else"] = true, fi = true })
+        clauses[#clauses + 1] = { cond = c, body = body }
+        if term == "else" then
+          local eb = parse_stmts({ fi = true })
+          clauses[#clauses + 1] = { cond = nil, body = eb }
+          break
+        elseif term == "fi" then break
+        elseif term ~= "elif" then error("if: missing fi") end
+      end
+      return { t = "if", line = ln, clauses = clauses }
+    end
     -- assignment: NAME=RHS
     do
       local s, e = src:find("^[%a_][%w_]*=", i)
@@ -257,20 +281,22 @@ function M.parse(src)
     return { t = "simple", line = ln, words = words }
   end
 
-  parse_stmts = function(stop)
-    stop = stop or {}
+  -- Parse statements until a terminator keyword in `stopset` (consumed and
+  -- returned) or EOF. Returns (stmts, terminator-or-nil).
+  parse_stmts = function(stopset)
+    stopset = stopset or {}
     local stmts = {}
     while true do
       skipsep()
-      if i > n then break end
-      if stop.done and peekword() == "done" then i = i + 4; break end
+      if i > n then return stmts, nil end
+      local pw = peekword()
+      if pw and stopset[pw] then i = i + #pw; return stmts, pw end
       local st = parse_stmt()
       if st then stmts[#stmts + 1] = st end
     end
-    return stmts
   end
 
-  return { stmts = parse_stmts({}) }
+  return { stmts = (parse_stmts({})) }
 end
 
 return M

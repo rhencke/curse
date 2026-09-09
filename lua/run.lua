@@ -18,7 +18,7 @@ else
   local ast = T.parser.parse(src)
   local sh = T.rt.Shell.new()
   if mode == "compiled" then
-    T.compile(ast)(sh, nil)
+    T.compile(ast).run(sh, nil)
   elseif mode == "interp" then
     T.interp.run(sh, ast)
   else
