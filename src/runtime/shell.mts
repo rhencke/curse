@@ -1515,6 +1515,13 @@ export class Shell {
         return false;
       }
     };
+    // A file redirect to an empty target is "ambiguous" (bash); a here-doc /
+    // here-string legitimately carries empty content.
+    if (target === "" && r.op !== "<<" && r.op !== "<<-" && r.op !== "<<<") {
+      this.io.err(`${this.name}: ambiguous redirect\n`);
+      return false;
+    }
+    try {
     switch (r.op) {
       case ">":
         if (clobberBlocked()) { this.io.err(`${this.name}: ${target}: cannot overwrite existing file\n`); return false; }
@@ -1565,6 +1572,18 @@ export class Shell {
       }
       default:
         throw new Error(`redirection \`${r.op}\` not supported yet`);
+    }
+    } catch (e) {
+      // Opening the target failed (missing/unwritable file, a directory, an
+      // ambiguous fd dup): report it and skip the command (status 1), like bash,
+      // rather than crashing.
+      const code = (e as NodeJS.ErrnoException).code;
+      const msg = code === "EISDIR" ? "Is a directory"
+        : code === "ENOENT" ? "No such file or directory"
+        : code === "EACCES" ? "Permission denied"
+        : errMsg(e);
+      this.io.err(`${this.name}: ${target}: ${msg}\n`);
+      return false;
     }
     return true;
   }
