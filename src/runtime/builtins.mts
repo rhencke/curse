@@ -752,8 +752,12 @@ const getopts: Builtin = (shell, ...args) => {
     shell.optsInd = optind;
     return ok ? 0 : 1;
   };
-  const noMore = (): number => {
+  const noMore = (reset = false): number => {
     shell.optsPos = 1;
+    // Calling getopts with no arguments at all rewinds OPTIND to 1 (bash);
+    // scanning a non-empty list to its end, or stopping at a non-option / `--`,
+    // leaves OPTIND pointing where it stopped.
+    if (reset) optind = 1;
     shell.setVar("OPTIND", String(optind));
     shell.optsInd = optind;
     store("?");
@@ -762,7 +766,7 @@ const getopts: Builtin = (shell, ...args) => {
   };
 
   for (;;) {
-    if (optind > words.length) return noMore();
+    if (optind > words.length) return noMore(words.length === 0);
     const word = words[optind - 1]!;
     if (shell.optsPos === 1) {
       if (word === "" || word[0] !== "-" || word === "-") return noMore();
