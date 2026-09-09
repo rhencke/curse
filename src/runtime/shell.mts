@@ -414,6 +414,11 @@ export class Shell {
     set("HOSTTYPE", "x86_64");
     set("MACHTYPE", "x86_64-pc-linux-gnu");
     set("OPTIND", "1"); // getopts index starts at 1
+    // Claim the bash version curse targets (the conformance oracle, 5.2.37), so
+    // scripts that gate features on `$BASH_VERSION` / `${BASH_VERSINFO[@]}` treat
+    // curse as bash.
+    set("BASH_VERSION", "5.2.37(1)-release");
+    this.setArray("BASH_VERSINFO", ["5", "2", "37", "1", "release", "x86_64-pc-linux-gnu"]);
   }
 
   /** Variables whose value is recomputed on each read (`$RANDOM`, `$SECONDS`),
