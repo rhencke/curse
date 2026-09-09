@@ -36,6 +36,7 @@ import {
 } from "node:fs";
 import { join, resolve } from "node:path";
 import { tmpdir } from "node:os";
+import { pathToFileURL } from "node:url";
 
 export type { IO } from "./types.mts";
 export { ExitSignal, LoopSignal, ReturnSignal, Var } from "./types.mts";
@@ -1849,6 +1850,35 @@ export class Shell {
   /** `eval` / `source`: parse `src` and run it in THIS shell (shared scope),
    *  letting return/exit/break propagate to the caller. This is the JIT path —
    *  generated code reaches it through the eval/source builtins. */
+  /** Run a `source`d file in this shell. AOT where possible: transpile the file
+   *  to a cached fragment (re-transpiled only when the file changes — so even
+   *  `source "$dynamic"` is cached by the resolved file's content) and run it
+   *  against this shell. Falls back to interpreting when the file can't be
+   *  compiled to an importable module (parse failure, unwritable cache, …). */
+  async sourceFile(path: string): Promise<number> {
+    let frag: ((sh: Shell) => Promise<number>) | null = null;
+    try {
+      const [{ emit }, { cachedModulePath }] = await Promise.all([
+        import("../compiler/emit.mts"),
+        import("../cli/cache.mts"),
+      ]);
+      const rt = new URL("./shell.mts", import.meta.url).href;
+      const modPath = cachedModulePath(
+        path, rt, (src) => emit(parse(src), { runtimeSpecifier: rt, fragment: true }), "frag",
+      );
+      if (modPath !== null) {
+        const mod = await import(pathToFileURL(modPath).href) as { default: (sh: Shell) => Promise<number> };
+        frag = mod.default;
+      }
+    } catch {
+      frag = null; // compile/import failed → interpret instead
+    }
+    // Running the fragment propagates control flow (exit) and real errors — no
+    // fallback here, or a half-run source would double-execute.
+    if (frag !== null) return frag(this);
+    return this.evalString(readFileSync(path, "utf8"));
+  }
+
   async evalString(src: string): Promise<number> {
     let cmd: Command | null;
     try {

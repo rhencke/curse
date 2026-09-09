@@ -654,11 +654,10 @@ const sourceBuiltin: Builtin = async (shell, ...args) => {
     shell.io.err(`${shell.name}: ${file}: No such file or directory\n`);
     return 1;
   }
-  const src = readFileSync(path, "utf8");
   const saved = shell.positional;
   if (args.length > 1) shell.positional = args.slice(1);
   try {
-    return await shell.evalString(src);
+    return await shell.sourceFile(path);
   } finally {
     shell.positional = saved;
   }
