@@ -200,7 +200,7 @@ export const evalParam = async (shell: Shell, prm: Param, quoted = false): Promi
       : !isSet;
     if (unbound) {
       shell.io.err(`${shell.name}: ${prm.name}: unbound variable\n`);
-      throw new ExitSignal(1);
+      throw new ExitSignal(shell.fatalStatus);
     }
   }
 

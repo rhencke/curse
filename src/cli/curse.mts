@@ -66,10 +66,13 @@ function applyOpts(sh: Shell, opts: OptSet): void {
   }
 }
 
-async function run(src: string, name: string, positional: string[] = [], opts: OptSet = []): Promise<void> {
+async function run(src: string, name: string, positional: string[] = [], opts: OptSet = [], cmdString = false): Promise<void> {
   const sh = new Shell();
   sh.name = name;
   sh.positional = positional;
+  // bash exits a `-c` command string with 127 on a fatal expansion error, but a
+  // script file with 1; match whichever mode we were invoked in.
+  if (cmdString) sh.fatalStatus = 127;
   applyOpts(sh, opts);
   sh.status = await sh.runString(src);
   await sh.runExitTrap();
@@ -181,7 +184,7 @@ async function main(): Promise<void> {
   if (cmdString !== null) {
     // -c command [name [args...]]  → $0 = name, $1.. = args
     if (noexec) { parse(cmdString); return; }
-    await run(cmdString, argv[i] ?? "curse", argv.slice(i + 1), opts);
+    await run(cmdString, argv[i] ?? "curse", argv.slice(i + 1), opts, true);
     return;
   }
 

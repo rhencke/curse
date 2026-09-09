@@ -234,6 +234,11 @@ export class Shell {
   /** `set` options. */
   opts = { errexit: false, nounset: false, xtrace: false, pipefail: false, noclobber: false, noglob: false };
 
+  /** Exit status when a fatal expansion error aborts the shell (an unbound
+   *  variable under `set -u`, or `${x:?}` / `${x?}`). bash uses 1 when running a
+   *  script file but 127 for a `-c` command string; the CLI sets this to match. */
+  fatalStatus = 1;
+
   /** State of a `set -o` option by long name, for `set -o`, `$SHELLOPTS`, and
    *  `test -o name`. Toggleable options reflect `opts`; the rest are fixed at
    *  their non-interactive defaults. Unknown names return undefined. */
@@ -750,7 +755,7 @@ export class Shell {
   /** `${x:?msg}` / `${x?msg}`: report the error and exit. */
   paramError(name: string, msg: string): never {
     this.io.err(`${this.name}: ${name}: ${msg === "" ? "parameter null or not set" : msg}\n`);
-    throw new ExitSignal(1);
+    throw new ExitSignal(this.fatalStatus);
   }
 
   /** `${!name}`: the value of the variable named by `$name`. */
@@ -805,7 +810,7 @@ export class Shell {
       : this.getVar(name) === undefined;
     if (unbound) {
       this.io.err(`${this.name}: ${name}: unbound variable\n`);
-      throw new ExitSignal(1);
+      throw new ExitSignal(this.fatalStatus);
     }
   }
   /** Read a plain `$name` reference, honoring `set -u` (used by generated code). */
@@ -820,7 +825,7 @@ export class Shell {
     if (val === undefined) {
       if (this.opts.nounset) {
         this.io.err(`${this.name}: ${name}: unbound variable\n`);
-        throw new ExitSignal(1);
+        throw new ExitSignal(this.fatalStatus);
       }
       return "";
     }
@@ -1483,6 +1488,7 @@ export class Shell {
     sub.opts = { ...this.opts };
     sub.shopts = { ...this.shopts }; // a subshell inherits, but can't leak, shopt
     sub.stdinBuf = this.stdinBuf; // share stdin by reference: a read in the subshell advances the parent's position too
+    sub.fatalStatus = this.fatalStatus; // same invocation mode (-c vs file)
     // Trap settings are inherited (visible to `trap -p`); a subshell can't leak.
     sub.traps = Object.assign(Object.create(null) as Record<string, string>, this.traps);
     return sub;
