@@ -21,7 +21,17 @@ function Shell.new()
     status = 0,      -- $?
     params = {},     -- positional $1..
     out = io.write,  -- stdout sink (swappable for capture)
+    forstate = {},   -- loop id -> { list = {strings}, idx } for `for x in`; kept
+                     -- in `sh` so a mid-loop OSR resumes the SAME expansion+index
   }, Shell)
+end
+
+-- Split on default-IFS whitespace (no empty fields), for unquoted `$var` in a
+-- `for x in $list` word list. (Custom IFS comes with the fuller word engine.)
+function Shell:split(s)
+  local out = {}
+  for w in s:gmatch("%S+") do out[#out + 1] = w end
+  return out
 end
 
 -- A variable box holds a string value and/or a cached int64. An arithmetic

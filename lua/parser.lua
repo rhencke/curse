@@ -197,23 +197,44 @@ function M.parse(src)
 
   local function parse_stmt()
     ws()
-    -- for (( init; cond; step )); do BODY done
+    -- for (( init; cond; step )) ; do BODY done   OR   for NAME in WORDS; do … done
     if peekword() == "for" then
       local ln = line
       ws(); i = i + 3; ws()
-      if src:sub(i, i + 1) ~= "((" then error("subset: for needs (( ))") end
-      local body, ni = grab_dparen(src, i + 2); i = ni
-      local a, b, c = body:match("^(.-);(.-);(.-)$")
-      if not a then error("for ((;;)) needs two ';'") end
+      if src:sub(i, i + 1) == "((" then
+        local body, ni = grab_dparen(src, i + 2); i = ni
+        local a, b, c = body:match("^(.-);(.-);(.-)$")
+        if not a then error("for ((;;)) needs two ';'") end
+        loopId = loopId + 1; local id = loopId
+        skipsep()
+        if peekword() == "do" then i = i + 2 end
+        local body_stmts = parse_stmts({ done = true })
+        return { t = "forc", id = id, line = ln,
+          init = a:match("%S") and arith(a) or nil,
+          cond = b:match("%S") and arith(b) or nil,
+          step = c:match("%S") and arith(c) or nil,
+          body = body_stmts }
+      end
+      -- for NAME in WORDS
+      local s, e = src:find("^[%a_][%w_]*", i)
+      if not s then error("subset: for needs a name or ((") end
+      local name = src:sub(s, e); i = e + 1
+      ws()
+      if peekword() == "in" then i = i + 2 else error("subset: for NAME needs 'in'") end
+      local words = {}
+      while true do
+        ws()
+        local c = src:sub(i, i)
+        if c == ";" or c == "\n" or c == "" or c == "#" then break end
+        if peekword() == "do" then break end
+        local w = word(); if w == "" then break end
+        words[#words + 1] = parse_word(unquote(w))
+      end
       loopId = loopId + 1; local id = loopId
       skipsep()
       if peekword() == "do" then i = i + 2 end
       local body_stmts = parse_stmts({ done = true })
-      return { t = "forc", id = id, line = ln,
-        init = a:match("%S") and arith(a) or nil,
-        cond = b:match("%S") and arith(b) or nil,
-        step = c:match("%S") and arith(c) or nil,
-        body = body_stmts }
+      return { t = "forin", id = id, line = ln, name = name, words = words, body = body_stmts }
     end
     -- while (( cond )); do BODY done
     if peekword() == "while" then

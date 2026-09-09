@@ -101,6 +101,26 @@ local function exec_stmt(sh, st, hook)
       if not truth(eval(sh, st.cond)) then break end
       exec_list(sh, st.body, hook, false)
     end
+  elseif t == "forin" then
+    -- expand the word list ONCE (bash semantics) and stash it in sh.forstate so
+    -- a mid-loop OSR resumes the same list + index.
+    local list = {}
+    for _, w in ipairs(st.words) do
+      if #w.parts == 1 and w.parts[1].var then
+        for _, piece in ipairs(sh:split(sh:get(w.parts[1].var))) do list[#list + 1] = piece end
+      else
+        list[#list + 1] = expand_word(sh, w)
+      end
+    end
+    sh.forstate[st.id] = { list = list, idx = 0 }
+    while true do
+      hook("loop", st.id)
+      local fs = sh.forstate[st.id]
+      fs.idx = fs.idx + 1
+      if fs.idx > #fs.list then break end
+      sh:set_str(st.name, fs.list[fs.idx])
+      exec_list(sh, st.body, hook, false)
+    end
   elseif t == "if" then
     for _, cl in ipairs(st.clauses) do
       if cl.cond == nil or truth(eval(sh, cl.cond)) then

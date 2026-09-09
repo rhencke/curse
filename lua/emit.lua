@@ -110,6 +110,9 @@ local function analyze_lift(ast)
           if e and (e.k == "asgn" or e.k == "post" or e.k == "pre") then assigned[e.name] = true end
         end
         scan_stmts(st.body)
+      elseif st.t == "forin" then
+        disq[st.name] = true -- a `for x in` var holds arbitrary strings, never lift it
+        scan_stmts(st.body)
       elseif st.t == "if" then
         for _, cl in ipairs(st.clauses) do scan_stmts(cl.body) end
       end
@@ -176,6 +179,24 @@ function M.emit(ast)
       local bodyentry = flatten_list(st.body, condp)
       blocks[condp] = ("if %s then pc = %d else pc = %d end"):format(emit_bool(st.cond, lifted), bodyentry, after)
       return condp
+    elseif t == "forin" then
+      local initp = newpc()
+      local advp = newpc(); loopPc[st.id] = advp -- back-edge = resume point
+      local bodyentry = flatten_list(st.body, advp)
+      -- init: expand the word list ONCE into sh.forstate[id] (so OSR resumes it)
+      local parts = { "local __l = {}" }
+      for _, w in ipairs(st.words) do
+        if #w.parts == 1 and w.parts[1].var then
+          parts[#parts + 1] = ("for _,p in ipairs(sh:split(sh:get(%q))) do __l[#__l+1]=p end"):format(w.parts[1].var)
+        else
+          parts[#parts + 1] = "__l[#__l+1] = " .. emit_word(w, lifted)
+        end
+      end
+      parts[#parts + 1] = ("sh.forstate[%d] = {list=__l, idx=0}"):format(st.id)
+      blocks[initp] = table.concat(parts, "; ") .. ("; pc = %d"):format(advp)
+      blocks[advp] = ("local fs = sh.forstate[%d]; fs.idx = fs.idx + 1; if fs.idx > #fs.list then pc = %d else sh:set_str(%q, fs.list[fs.idx]); pc = %d end"):format(
+        st.id, after, st.name, bodyentry)
+      return initp
     elseif t == "if" then
       -- allocate a cond pc per conditional clause (forward refs), flatten each
       -- body once, then wire the false-branches to the next clause.
