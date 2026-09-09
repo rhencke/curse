@@ -154,6 +154,31 @@ const declareQuote = (v: string): string => {
   return '"' + v.replace(/[\\"$`]/g, "\\$&") + '"';
 };
 
+/** bash iterates an associative array in the order of its internal hash table,
+ *  not insertion order: the key's FNV-1 hash (over its UTF-8 bytes) selects one
+ *  of 1024 buckets, buckets are walked in ascending index, and within a bucket
+ *  the most-recently-inserted key comes first (bash prepends to the chain).
+ *  Reproducing this makes `${!a[@]}`, `${a[@]}`, and `declare -p` match bash
+ *  exactly. (The table is fixed-size, so this holds regardless of entry count.)
+ */
+const ASSOC_BUCKETS = 1024;
+const assocBucket = (key: string): number => {
+  let h = 2166136261 >>> 0; // FNV-1 32-bit offset basis
+  for (const byte of Buffer.from(key, "utf8")) {
+    h = Math.imul(h, 16777619) >>> 0; // FNV prime, then xor the byte (FNV-1)
+    h = (h ^ byte) >>> 0;
+  }
+  return h & (ASSOC_BUCKETS - 1);
+};
+/** An assoc array's entries in bash's iteration order. `m` is in JS insertion
+ *  order (which equals bash's insertion order), so a stable sort by bucket
+ *  ascending with insertion **descending** as the tie-break yields bash order. */
+const assocEntries = (m: Map<string, string>): [string, string][] =>
+  [...m.entries()]
+    .map((e, i) => ({ e, i, b: assocBucket(e[0]) }))
+    .sort((a, z) => a.b - z.b || z.i - a.i)
+    .map((x) => x.e);
+
 /** Quote a value the way `set` (no args) prints it: bare when safe, `$'…'` for
  *  control characters, otherwise single-quoted. */
 const setQuote = (v: string): string => {
@@ -632,7 +657,7 @@ export class Shell {
       if (v === undefined || v.unset) continue;
       if (v.ref) { out.push(`${name}=${setQuote(v.value)}`); continue; } // nameref: shows its target
       if (v.assoc !== null) {
-        const body = [...v.assoc.entries()].map(([k, val]) => `[${k}]=${declareQuote(val)}`).join(" ");
+        const body = assocEntries(v.assoc).map(([k, val]) => `[${k}]=${declareQuote(val)}`).join(" ");
         out.push(`${name}=(${body})`);
       } else if (v.arr !== null) {
         const body = [...v.arr.entries()].sort((a, b) => a[0] - b[0])
@@ -703,7 +728,7 @@ export class Shell {
     const f = attrLetters(v);
     const attr = f === "" ? "--" : "-" + f;
     if (v.assoc !== null) {
-      const body = [...v.assoc.entries()].map(([k, val]) => `[${k}]=${declareQuote(val)}`).join(" ");
+      const body = assocEntries(v.assoc).map(([k, val]) => `[${k}]=${declareQuote(val)}`).join(" ");
       return `declare ${attr} ${name}=(${body}${v.assoc.size > 0 ? " " : ""})`;
     }
     if (v.arr !== null) {
@@ -791,14 +816,14 @@ export class Shell {
   arrayValues(name: string): string[] {
     const v = this.lookup(name);
     if (!v || v.unset) return [];
-    if (v.assoc !== null) return [...v.assoc.values()];
+    if (v.assoc !== null) return assocEntries(v.assoc).map((e) => e[1]);
     if (v.arr === null) return [v.value];
     return [...v.arr.entries()].sort((a, b) => a[0] - b[0]).map((e) => e[1]);
   }
   arrayIndices(name: string): string[] {
     const v = this.lookup(name);
     if (!v || v.unset) return [];
-    if (v.assoc !== null) return [...v.assoc.keys()];
+    if (v.assoc !== null) return assocEntries(v.assoc).map((e) => e[0]);
     if (v.arr === null) return ["0"];
     return [...v.arr.keys()].sort((a, b) => a - b).map(String);
   }
