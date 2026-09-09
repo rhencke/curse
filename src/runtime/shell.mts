@@ -658,11 +658,18 @@ export class Shell {
     return `declare ${attr} ${name}=${declareQuote(v.value)}`;
   }
 
-  /** `declare -n name=target` — make `name` a nameref to `target`. */
-  setRef(name: string, target: string): void {
+  /** `declare -n name=target` — make `name` a nameref to `target`. A non-empty
+   *  target must be a valid variable name (optionally `name[subscript]`), else
+   *  bash rejects it; returns false so the caller can report status 1. */
+  setRef(name: string, target: string): boolean {
+    if (target !== "" && !/^[A-Za-z_][A-Za-z0-9_]*(\[[\s\S]*\])?$/.test(target)) {
+      this.io.err(`${this.name}: declare: \`${target}': invalid variable name for name reference\n`);
+      return false;
+    }
     const v = this.varForWriteRaw(name);
     v.ref = true;
     if (target !== "") v.value = target;
+    return true;
   }
   private maxIndex(v: Var): number {
     let m = -1;

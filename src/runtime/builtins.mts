@@ -593,7 +593,7 @@ const local: Builtin = (shell, ...args) => {
     // a value keeps its current value (bash).
     if (value !== undefined || !isOwn) shell.local(name);
     if (flags.nameref) {
-      shell.setRef(name, value ?? "");
+      if (!shell.setRef(name, value ?? "")) status = 1;
       continue;
     }
     shell.setAttrs(name, flags);
@@ -928,7 +928,7 @@ const declareBuiltin: Builtin = (shell, ...args) => {
     }
     if (clearRef) { shell.clearRef(name); continue; }
     if (flags.nameref) {
-      shell.setRef(name, value ?? "");
+      if (!shell.setRef(name, value ?? "")) status = 1;
       continue;
     }
     // Establish array/assoc shape before setAttrs, so an empty `declare -a x`

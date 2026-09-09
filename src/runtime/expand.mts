@@ -121,6 +121,16 @@ export const evalParam = async (shell: Shell, prm: Param, quoted = false): Promi
   // positional like `1`, or a special like `?`). Any operator applies to that
   // target, so re-parse the referenced name and evaluate it with the operator.
   if (prm.indirect) {
+    // `${!ref}` on a NAMEREF inverts to the name it points to (bash), rather
+    // than double-indirecting through the target's value.
+    const box = prm.special ? undefined : shell.rawLookup(prm.name);
+    if (box !== undefined && box.ref && !box.unset) {
+      const refName = box.value;
+      if (prm.length) return String(shell.clen(refName));
+      if (prm.op === "") return refName;
+      // An operator on ${!nameref} applies to that target name as the value.
+      return evalParam(shell, { ...parseParam(refName), op: prm.op, arg: prm.arg, arg2: prm.arg2, length: prm.length });
+    }
     const targetName = prm.special ? specialValue(shell, prm.name) : (shell.getVar(prm.name) ?? "");
     if (targetName === "") {
       // The ref itself is unset/empty: no target to expand.
