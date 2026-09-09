@@ -380,6 +380,9 @@ export class Shell {
    *  when it had no args); a pure assignment resets it to empty. Set at the shared
    *  command chokepoint (callByName), so interp and AOT agree. */
   underscore = "";
+  /** The bash-function call stack (outermost first). Mirrored into the FUNCNAME
+   *  array (innermost first, so ${FUNCNAME[0]} is the running function). */
+  private funcStack: string[] = [];
   /** Called once at load by an emitted module to register its generated-line →
    *  source-line map for lazy `$LINENO` resolution (see linenoFromStack). */
   mapLines(url: string, pairs: ReadonlyArray<readonly [number, number]>): void {
@@ -1371,7 +1374,17 @@ export class Shell {
     const fn = this.functions[name];
     let code: number;
     if (fn && typeof fn === "object" && "__bashFunc" in fn) {
-      code = await this.invokeFunc((fn as BashFunc).__bashFunc, args);
+      // Maintain FUNCNAME: bash exposes the call stack (innermost first) while a
+      // function runs, and unsets it back at the top level.
+      this.funcStack.push(name);
+      this.setArray("FUNCNAME", [...this.funcStack].reverse());
+      try {
+        code = await this.invokeFunc((fn as BashFunc).__bashFunc, args);
+      } finally {
+        this.funcStack.pop();
+        if (this.funcStack.length > 0) this.setArray("FUNCNAME", [...this.funcStack].reverse());
+        else this.unsetVar("FUNCNAME");
+      }
     } else if (typeof fn === "function") {
       code = await (fn as (sh: Shell, ...a: string[]) => number | Promise<number>)(this, ...args);
     } else {
