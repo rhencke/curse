@@ -111,10 +111,12 @@ const applyStrOp = (op: string, v: string, pat: string, repl: string, extglob = 
 };
 
 export const evalParam = async (shell: Shell, prm: Param, quoted = false): Promise<string> => {
-  // ${!name[@]} / ${!name[*]} — array indices.
-  if (prm.indices) return shell.arrayIndices(prm.name).join(" ");
-  // ${!prefix*} / ${!prefix@} — names of set variables sharing a prefix.
-  if (prm.names) return shell.matchNames(prm.name).join(" ");
+  // ${!name[@]} / ${!name[*]} — array indices. The `*` form joins on IFS[0]
+  // (like $*) when this value is used as a scalar; `@` joins on a space.
+  if (prm.indices) return shell.arrayIndices(prm.name).join(prm.sub === "*" ? starSep(shell) : " ");
+  // ${!prefix*} / ${!prefix@} — names of set variables sharing a prefix; same
+  // join rule (`*` → IFS[0], `@` → space).
+  if (prm.names) return shell.matchNames(prm.name).join(prm.names === "*" ? starSep(shell) : " ");
   // ${!ref} — indirect: the ref names another variable (possibly `arr[i]`, a
   // positional like `1`, or a special like `?`). Any operator applies to that
   // target, so re-parse the referenced name and evaluate it with the operator.

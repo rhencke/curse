@@ -348,8 +348,9 @@ class Emitter {
 
   private paramExpr(prm: Param, quoted = false): string {
     const J = JSON.stringify;
-    if (prm.indices) return `sh.arrayIndices(${J(prm.name)}).join(" ")`;
-    if (prm.names) return `sh.matchNames(${J(prm.name)}).join(" ")`;
+    // `[*]`/`prefix*` join on IFS[0] (like $*); `[@]`/`prefix@` join on a space.
+    if (prm.indices) return `sh.arrayIndices(${J(prm.name)}).join(${prm.sub === "*" ? "sh.starSep()" : '" "'})`;
+    if (prm.names) return `sh.matchNames(${J(prm.name)}).join(${prm.names === "*" ? "sh.starSep()" : '" "'})`;
     if (prm.indirect) {
       return `await sh.indirectExpand(${J(prm.name)}, ${prm.special}, ${J(prm.op)}, ${J(prm.arg)}, ${J(prm.arg2)}, ${prm.length})`;
     }
