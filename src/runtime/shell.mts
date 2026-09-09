@@ -1596,6 +1596,7 @@ export class Shell {
     sub.shopts = { ...this.shopts }; // a subshell inherits, but can't leak, shopt
     sub.stdinBuf = this.stdinBuf; // share stdin by reference: a read in the subshell advances the parent's position too
     sub.fatalStatus = this.fatalStatus; // same invocation mode (-c vs file)
+    sub.condDepth = this.condDepth; // a subshell in a condition (`if ( … )`) inherits errexit suppression
     // Trap settings are inherited (visible to `trap -p`); a subshell can't leak.
     sub.traps = Object.assign(Object.create(null) as Record<string, string>, this.traps);
     return sub;
