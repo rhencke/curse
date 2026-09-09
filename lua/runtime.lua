@@ -25,9 +25,22 @@ function Shell.new()
                      -- in `sh` so a mid-loop OSR resumes the SAME expansion+index
     functions = {},  -- name -> AST body (interpreter); the compiled module has
                      -- its own closures
-    callstack = {},  -- function-call frames (for `local` restore + positional)
+    callstack = {},  -- full function-call frames (for `local` restore + positional)
+    paramstack = {}, -- lightweight positional-only stack (compiled fast path)
     calldepth = 0,   -- 0 at the top level; the tier only hands off at depth 0
   }, Shell)
+end
+
+-- Fast positional-only call boundary (compiled code, functions with no `local`):
+-- swap $@ using a reused stack, no per-call frame table, no calldepth (compiled
+-- has no OSR so the gate is irrelevant there).
+function Shell:pushParams(params)
+  self.paramstack[#self.paramstack + 1] = self.params
+  self.params = params or {}
+end
+function Shell:popParams()
+  local d = #self.paramstack
+  self.params = self.paramstack[d]; self.paramstack[d] = nil
 end
 
 -- positional parameters

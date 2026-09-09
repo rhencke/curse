@@ -184,10 +184,48 @@ local function analyze_lift(ast)
   return lifted
 end
 
+-- Does a function need a positional-param swap / a `local` frame? A call to a
+-- function that needs neither is emitted bare (fn_x(sh)); one that needs only
+-- params uses the lightweight pushParams; only `local` needs the full frame.
+local function scan_arith_param(e, f)
+  if type(e) ~= "table" then return end
+  if e.k == "param" then f.params = true end
+  scan_arith_param(e.e, f); scan_arith_param(e.l, f); scan_arith_param(e.r, f)
+end
+local function scan_word_param(w, f)
+  for _, p in ipairs(w.parts) do
+    if p.param or (p.special and p.special ~= "?") then f.params = true end -- $? is status, not $@
+    if p.arith then scan_arith_param(require("parser").arith(p.arith), f) end
+  end
+end
+local function func_flags(body)
+  local f = { params = false, locals = false }
+  local function scan(stmts)
+    for _, st in ipairs(stmts) do
+      if st.t == "simple" then
+        local cmd = st.words[1].parts[1] and st.words[1].parts[1].lit
+        if cmd == "local" then f.locals = true end
+        for j = 2, #st.words do scan_word_param(st.words[j], f) end
+      elseif st.t == "assign" then
+        if st.arith then scan_arith_param(st.arith, f) elseif st.rhs then scan_word_param(st.rhs, f) end
+      elseif st.t == "forc" or st.t == "whilec" then
+        scan_arith_param(st.init, f); scan_arith_param(st.cond, f); scan_arith_param(st.step, f); scan(st.body)
+      elseif st.t == "forin" then
+        for _, w in ipairs(st.words) do scan_word_param(w, f) end; scan(st.body)
+      elseif st.t == "if" then
+        for _, cl in ipairs(st.clauses) do scan_arith_param(cl.cond, f); scan(cl.body) end
+      end
+    end
+  end
+  scan(body)
+  return f
+end
+
 -- Build a pc-dispatch CFG for a statement list. Shared by the top-level `run`
--- and every function body. `funcnames[name]=true` marks user functions (a simple
--- command that calls one). Returns { blocks, npc, entry, loopPc, stmtPc, DONE }.
-local function build_cfg(stmts, lifted, funcnames)
+-- and every function body. `funcflags[name] = {params,locals}` marks user
+-- functions (a simple command that calls one) and how to slim its call.
+-- Returns { blocks, npc, entry, loopPc, stmtPc, DONE }.
+local function build_cfg(stmts, lifted, funcflags)
   local blocks = {}
   local loopPc, stmtPc = {}, {}
   local npc = 0
@@ -232,8 +270,15 @@ local function build_cfg(stmts, lifted, funcnames)
         local ls = {}
         for _, a in ipairs(args) do ls[#ls + 1] = ("sh:localAssign(%s)"):format(a) end
         body = table.concat(ls, "; ") .. (#ls > 0 and "; " or "") .. "sh.status = 0"
-      elseif funcnames[cmd] then
-        body = ("sh:pushCall({%s}); fn_%s(sh); sh:popCall()"):format(table.concat(args, ", "), cmd)
+      elseif funcflags[cmd] then
+        local ff = funcflags[cmd]
+        if ff.locals then -- full frame (save/restore shadowed vars + params)
+          body = ("sh:pushCall({%s}); fn_%s(sh); sh:popCall()"):format(table.concat(args, ", "), cmd)
+        elseif ff.params then -- positional swap only (no per-call frame table)
+          body = ("sh:pushParams({%s}); fn_%s(sh); sh:popParams()"):format(table.concat(args, ", "), cmd)
+        else -- neither: bare call, no allocation
+          body = ("fn_%s(sh)"):format(cmd)
+        end
       else error("emit subset: unknown command " .. tostring(cmd)) end
       blocks[p] = body .. ("; pc = %d"):format(after)
       return p
@@ -328,8 +373,8 @@ local function assemble(cfg, sig, liftvars, toplevel)
 end
 
 function M.emit(ast)
-  local funcnames = {}
-  for _, st in ipairs(ast.stmts) do if st.t == "funcdef" then funcnames[st.name] = true end end
+  local funcflags = {}
+  for _, st in ipairs(ast.stmts) do if st.t == "funcdef" then funcflags[st.name] = func_flags(st.body) end end
   -- Lift top-level arith vars; analyze_lift already excludes any var a function
   -- touches (which would go stale vs the function's sh-direct access).
   local lifted = analyze_lift(ast)
@@ -340,15 +385,15 @@ function M.emit(ast)
   local o = { 'local rt = require("runtime")' }
   -- forward-declare function locals so functions can call each other/forward
   local decls = {}
-  for name in pairs(funcnames) do decls[#decls + 1] = "fn_" .. name end
+  for name in pairs(funcflags) do decls[#decls + 1] = "fn_" .. name end
   if #decls > 0 then o[#o + 1] = "local " .. table.concat(decls, ", ") end
   for _, st in ipairs(ast.stmts) do
     if st.t == "funcdef" then
-      local cfg = build_cfg(st.body, {}, funcnames) -- function bodies are sh-direct
+      local cfg = build_cfg(st.body, {}, funcflags) -- function bodies are sh-direct
       o[#o + 1] = assemble(cfg, "fn_" .. st.name .. " = function(sh)", nil, false)
     end
   end
-  local top = build_cfg(ast.stmts, lifted, funcnames)
+  local top = build_cfg(ast.stmts, lifted, funcflags)
   o[#o + 1] = "local loopPc = " .. serialize(top.loopPc)
   o[#o + 1] = "local stmtPc = " .. serialize(top.stmtPc)
   o[#o + 1] = assemble(top, "local function run(sh, pc)", liftvars, true)

@@ -51,8 +51,11 @@ int arithmetic. Functions gate OSR: the tier hands off only at top-level
 safepoints (calldepth 0), so a hot loop calling a function switches at the loop
 (function runs compiled each call); a hot loop inside a once-called function
 stays on the interpreter (still faster than bash). Function bodies emit
-sh-direct; with functions present the top level is sh-direct too (a lifted
-global would go stale inside a function) — refinable.
+sh-direct; a top-level var lifts unless a function touches it. Calls are slimmed
+by need: a function using neither positional params nor `local` is called bare
+(`fn_x(sh)`, zero allocation); one using only params swaps `$@` via a reused
+stack (no per-call frame); only `local` needs the full frame. Compiled calls
+skip the `calldepth` OSR-gate bookkeeping (no OSR in compiled code).
 
 ### Done
 - **pc-dispatch CFG + native-locals** — the compiled module is a flattened
