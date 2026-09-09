@@ -23,7 +23,42 @@ function Shell.new()
     out = io.write,  -- stdout sink (swappable for capture)
     forstate = {},   -- loop id -> { list = {strings}, idx } for `for x in`; kept
                      -- in `sh` so a mid-loop OSR resumes the SAME expansion+index
+    functions = {},  -- name -> AST body (interpreter); the compiled module has
+                     -- its own closures
+    callstack = {},  -- function-call frames (for `local` restore + positional)
+    calldepth = 0,   -- 0 at the top level; the tier only hands off at depth 0
   }, Shell)
+end
+
+-- positional parameters
+function Shell:param(n) return self.params[n] or "" end
+function Shell:nparams() return #self.params end
+function Shell:paramsJoin(sep) return table.concat(self.params, sep or " ") end
+
+-- Enter/leave a function call: swap positional params and open a `local` frame.
+function Shell:pushCall(params)
+  self.callstack[#self.callstack + 1] = { saved = {}, params = self.params }
+  self.params = params or {}
+  self.calldepth = self.calldepth + 1
+end
+function Shell:popCall()
+  local f = self.callstack[#self.callstack]; self.callstack[#self.callstack] = nil
+  for name, old in pairs(f.saved) do self.vars[name] = old or nil end -- false => was absent
+  self.params = f.params
+  self.calldepth = self.calldepth - 1
+end
+-- `local name`: shadow the variable within the current call frame (restored on
+-- return). Records the prior box once so it can be put back.
+function Shell:localVar(name)
+  local f = self.callstack[#self.callstack]
+  if f and f.saved[name] == nil then f.saved[name] = self.vars[name] or false end
+  self.vars[name] = {}
+end
+
+-- one `local` operand: `name` or `name=value` (value already expanded).
+function Shell:localAssign(arg)
+  local nm, val = arg:match("^([%a_][%w_]*)=(.*)$")
+  if nm then self:localVar(nm); self:set_str(nm, val) else self:localVar(arg) end
 end
 
 -- Split on default-IFS whitespace (no empty fields), for unquoted `$var` in a

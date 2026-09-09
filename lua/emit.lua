@@ -31,6 +31,7 @@ emit_value = function(e, lifted)
   local k = e.k
   if k == "num" then return e.v .. "LL" end
   if k == "var" then return lifted[e.name] and lname(e.name) or ("sh:aget(%q)"):format(e.name) end
+  if k == "param" then return ("rt.str_to_i64(sh:param(%d))"):format(e.n) end
   if k == "un" then
     if e.op == "-" then return "(-(" .. emit_value(e.e, lifted) .. "))" end
     return "((" .. emit_value(e.e, lifted) .. ") == 0LL and 1LL or 0LL)"
@@ -80,6 +81,11 @@ local function emit_word(w, lifted)
     if p.lit then parts[#parts + 1] = ("%q"):format(p.lit)
     elseif p.var then
       parts[#parts + 1] = lifted[p.var] and ("rt.i64_to_str(%s)"):format(lname(p.var)) or ("sh:get(%q)"):format(p.var)
+    elseif p.param then parts[#parts + 1] = ("sh:param(%d)"):format(p.param)
+    elseif p.special then
+      if p.special == "#" then parts[#parts + 1] = "tostring(sh:nparams())"
+      elseif p.special == "@" or p.special == "*" then parts[#parts + 1] = 'sh:paramsJoin(" ")'
+      elseif p.special == "?" then parts[#parts + 1] = "tostring(sh.status)" end
     elseif p.arith then
       parts[#parts + 1] = "rt.i64_to_str(" .. emit_value(require("parser").arith(p.arith), lifted) .. ")"
     end
@@ -124,9 +130,11 @@ local function analyze_lift(ast)
   return lifted
 end
 
-function M.emit(ast)
-  local lifted = analyze_lift(ast)
-  local blocks = {}       -- pc -> code string (must set `pc` to a successor)
+-- Build a pc-dispatch CFG for a statement list. Shared by the top-level `run`
+-- and every function body. `funcnames[name]=true` marks user functions (a simple
+-- command that calls one). Returns { blocks, npc, entry, loopPc, stmtPc, DONE }.
+local function build_cfg(stmts, lifted, funcnames)
+  local blocks = {}
   local loopPc, stmtPc = {}, {}
   local npc = 0
   local function newpc() local p = npc; npc = npc + 1; return p end
@@ -149,15 +157,29 @@ function M.emit(ast)
         blocks[p] = ("sh:set_str(%q, %s); pc = %d"):format(st.name, emit_word(st.rhs, lifted), after)
       end
       return p
+    elseif t == "funcdef" then
+      local p = newpc(); blocks[p] = ("pc = %d"):format(after); return p -- closures are hoisted
     elseif t == "simple" then
+      local cmd = st.words[1].parts[1] and st.words[1].parts[1].lit
+      if cmd == "return" then -- exit the current CFG (function or top level)
+        local p = newpc()
+        local n = st.words[2] and ("tonumber(%s)"):format(emit_word(st.words[2], lifted)) or "sh.status"
+        blocks[p] = ("sh.status = (%s) or 0; pc = %d"):format(n, DONE)
+        return p
+      end
       local p = newpc()
       local args = {}
       for j = 2, #st.words do args[#args + 1] = emit_word(st.words[j], lifted) end
-      local cmd = st.words[1].parts[1] and st.words[1].parts[1].lit
       local body
       if cmd == "echo" then body = "sh:echo(" .. table.concat(args, ", ") .. ")"
       elseif cmd == ":" or cmd == "true" then body = "sh.status = 0"
       elseif cmd == "false" then body = "sh.status = 1"
+      elseif cmd == "local" then
+        local ls = {}
+        for _, a in ipairs(args) do ls[#ls + 1] = ("sh:localAssign(%s)"):format(a) end
+        body = table.concat(ls, "; ") .. (#ls > 0 and "; " or "") .. "sh.status = 0"
+      elseif funcnames[cmd] then
+        body = ("sh:pushCall({%s}); fn_%s(sh); sh:popCall()"):format(table.concat(args, ", "), cmd)
       else error("emit subset: unknown command " .. tostring(cmd)) end
       blocks[p] = body .. ("; pc = %d"):format(after)
       return p
@@ -220,39 +242,64 @@ function M.emit(ast)
     end
   end
 
-  flatten_list = function(stmts, after)
+  flatten_list = function(list, after)
     local nextpc = after
-    for k = #stmts, 1, -1 do nextpc = flatten_stmt(stmts[k], nextpc) end
+    for k = #list, 1, -1 do nextpc = flatten_stmt(list[k], nextpc) end
     return nextpc
   end
 
-  -- top level: record each statement's entry pc for stmt-boundary resume
   local nextpc = DONE
-  for k = #ast.stmts, 1, -1 do
-    nextpc = flatten_stmt(ast.stmts[k], nextpc)
+  for k = #stmts, 1, -1 do
+    nextpc = flatten_stmt(stmts[k], nextpc)
     stmtPc[k] = nextpc
   end
-  local entry = stmtPc[1] or DONE
+  return { blocks = blocks, npc = npc, entry = stmtPc[1] or DONE, loopPc = loopPc, stmtPc = stmtPc }
+end
 
-  -- assemble
-  local o = {}
-  o[#o + 1] = 'local rt = require("runtime")'
-  o[#o + 1] = "local loopPc = " .. serialize(loopPc)
-  o[#o + 1] = "local stmtPc = " .. serialize(stmtPc)
-  o[#o + 1] = "local function run(sh, pc)"
-  local lv = {}
-  for n in pairs(lifted) do lv[#lv + 1] = n end
-  table.sort(lv)
-  for _, n in ipairs(lv) do o[#o + 1] = ("  local %s = sh:aget(%q)"):format(lname(n), n) end
-  o[#o + 1] = ("  pc = pc or %d"):format(entry)
+-- Assemble a CFG into a Lua function string. `liftvars` (top-level only) are
+-- seeded from `sh` on entry and written back on exit.
+local function assemble(cfg, sig, liftvars, toplevel)
+  local o = { sig }
+  for _, n in ipairs(liftvars or {}) do o[#o + 1] = ("  local %s = sh:aget(%q)"):format(lname(n), n) end
+  o[#o + 1] = toplevel and ("  pc = pc or %d"):format(cfg.entry) or ("  local pc = %d"):format(cfg.entry)
   o[#o + 1] = "  while true do"
-  for p = 0, npc - 1 do
-    o[#o + 1] = ("    %s pc == %d then %s"):format(p == 0 and "if" or "elseif", p, blocks[p])
+  for p = 0, cfg.npc - 1 do
+    o[#o + 1] = ("    %s pc == %d then %s"):format(p == 0 and "if" or "elseif", p, cfg.blocks[p])
   end
   o[#o + 1] = "    end"
   o[#o + 1] = "  end"
-  for _, n in ipairs(lv) do o[#o + 1] = ("  sh:aset(%q, %s)"):format(n, lname(n)) end
+  for _, n in ipairs(liftvars or {}) do o[#o + 1] = ("  sh:aset(%q, %s)"):format(n, lname(n)) end
   o[#o + 1] = "end"
+  return table.concat(o, "\n")
+end
+
+function M.emit(ast)
+  local funcnames = {}
+  for _, st in ipairs(ast.stmts) do if st.t == "funcdef" then funcnames[st.name] = true end end
+  local hasfn = next(funcnames) ~= nil
+  -- With functions present keep the top level sh-direct too: a lifted global
+  -- would go stale inside a function's sh-direct body. (Refinable: lift only
+  -- globals no function touches.)
+  local lifted = hasfn and {} or analyze_lift(ast)
+  local liftvars = {}
+  for n in pairs(lifted) do liftvars[#liftvars + 1] = n end
+  table.sort(liftvars)
+
+  local o = { 'local rt = require("runtime")' }
+  -- forward-declare function locals so functions can call each other/forward
+  local decls = {}
+  for name in pairs(funcnames) do decls[#decls + 1] = "fn_" .. name end
+  if #decls > 0 then o[#o + 1] = "local " .. table.concat(decls, ", ") end
+  for _, st in ipairs(ast.stmts) do
+    if st.t == "funcdef" then
+      local cfg = build_cfg(st.body, {}, funcnames) -- function bodies are sh-direct
+      o[#o + 1] = assemble(cfg, "fn_" .. st.name .. " = function(sh)", nil, false)
+    end
+  end
+  local top = build_cfg(ast.stmts, lifted, funcnames)
+  o[#o + 1] = "local loopPc = " .. serialize(top.loopPc)
+  o[#o + 1] = "local stmtPc = " .. serialize(top.stmtPc)
+  o[#o + 1] = assemble(top, "local function run(sh, pc)", liftvars, true)
   o[#o + 1] = "return { run = run, loopPc = loopPc, stmtPc = stmtPc }"
   return table.concat(o, "\n") .. "\n"
 end

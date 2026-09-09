@@ -39,6 +39,16 @@ local function arith(src)
     if c == "-" then i = i + 1; return { k = "un", op = "-", e = primary() } end
     if c == "+" then i = i + 1; return primary() end
     if c == "!" then i = i + 1; return { k = "un", op = "!", e = primary() } end
+    if c == "$" then
+      i = i + 1
+      local d = src:sub(i, i)
+      if d:match("%d") then i = i + 1; return { k = "param", n = tonumber(d) } end
+      if d == "{" then
+        local e = src:find("}", i + 1, true); local nm = src:sub(i + 1, e - 1); i = e + 1
+        return { k = "var", name = nm }
+      end
+      return { k = "var", name = ident() } -- $name same as name in arith
+    end
     if c:match("%d") then
       local s, e = src:find("^%d+", i); i = e + 1
       return { k = "num", v = src:sub(s, e) }
@@ -114,18 +124,24 @@ local function grab_dparen(src, i)
   error("unterminated ((")
 end
 
--- A word is a list of parts: {lit=s} | {var=name} | {arith=src}.
+-- A word is a list of parts:
+--   {lit=s} | {var=name} | {arith=src} | {param=n} | {special=c}
 local function parse_word(w)
   local parts, i = {}, 1
   while i <= #w do
     local c = w:sub(i, i)
     if c == "$" then
+      local n = w:sub(i + 1, i + 1)
       if w:sub(i + 1, i + 2) == "((" then
         local body, ni = grab_dparen(w, i + 3)
         parts[#parts + 1] = { arith = body }; i = ni
-      elseif w:sub(i + 1, i + 1) == "{" then
+      elseif n == "{" then
         local e = w:find("}", i + 2, true)
         parts[#parts + 1] = { var = w:sub(i + 2, e - 1) }; i = e + 1
+      elseif n:match("%d") then
+        parts[#parts + 1] = { param = tonumber(n) }; i = i + 2 -- $1..$9 (single digit)
+      elseif n == "#" or n == "@" or n == "*" or n == "?" then
+        parts[#parts + 1] = { special = n }; i = i + 2
       else
         local s, e = w:find("^%$([%a_][%w_]*)", i)
         if s then parts[#parts + 1] = { var = w:sub(s + 1, e) }; i = e + 1
@@ -195,8 +211,36 @@ function M.parse(src)
     local w = s and src:sub(s, e) or nil; i = save; return w
   end
 
+  local function brace_group() -- parse `{ stmts }` (a function body / group)
+    ws()
+    if src:sub(i, i) ~= "{" then error("expected { for function body") end
+    i = i + 1
+    local stmts = parse_stmts({ ["}"] = true })
+    return stmts
+  end
+
   local function parse_stmt()
     ws()
+    -- function NAME [()] { … }   or   NAME() { … }
+    if peekword() == "function" then
+      ws(); i = i + 8; ws()
+      local s, e = src:find("^[%a_][%w_]*", i)
+      if not s then error("function needs a name") end
+      local nm = src:sub(s, e); i = e + 1; ws()
+      if src:sub(i, i + 1) == "()" then i = i + 2 end
+      return { t = "funcdef", name = nm, body = brace_group() }
+    end
+    do
+      local s, e = src:find("^[%a_][%w_]*", i)
+      if s then
+        local j = e + 1
+        while src:sub(j, j):match("[ \t]") do j = j + 1 end
+        if src:sub(j, j + 1) == "()" then
+          local nm = src:sub(s, e); i = j + 2
+          return { t = "funcdef", name = nm, body = brace_group() }
+        end
+      end
+    end
     -- for (( init; cond; step )) ; do BODY done   OR   for NAME in WORDS; do … done
     if peekword() == "for" then
       local ln = line
@@ -310,6 +354,7 @@ function M.parse(src)
     while true do
       skipsep()
       if i > n then return stmts, nil end
+      if stopset["}"] and src:sub(i, i) == "}" then i = i + 1; return stmts, "}" end
       local pw = peekword()
       if pw and stopset[pw] then i = i + #pw; return stmts, pw end
       local st = parse_stmt()

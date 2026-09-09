@@ -36,7 +36,9 @@ function M.run(src, opts)
   end
   local hook = function(kind, id)
     count = count + 1
-    if resume == nil and ready(kind, id, count) then
+    -- only hand off at a top-level safepoint (the compiled CFG can resume there);
+    -- never inside a function call (calldepth > 0).
+    if resume == nil and sh.calldepth == 0 and ready(kind, id, count) then
       resume = { kind = kind, id = id }
       error({ __curse_switch = true })
     end
@@ -69,7 +71,7 @@ function M.run_background(script_path, opts)
   local count, resume, mod = 0, nil, nil
   local hook = function(kind, id)
     count = count + 1
-    if mod == nil and count % poll_every == 0 then
+    if mod == nil and sh.calldepth == 0 and count % poll_every == 0 then
       local cf = io.open(out, "r")
       if cf then
         cf:close()

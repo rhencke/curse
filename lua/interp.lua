@@ -17,6 +17,7 @@ eval = function(sh, e)
   local k = e.k
   if k == "num" then return rt.str_to_i64(e.v) end
   if k == "var" then return sh:aget(e.name) end
+  if k == "param" then return rt.str_to_i64(sh:param(e.n)) end
   if k == "un" then
     local v = eval(sh, e.e)
     if e.op == "-" then return -v end
@@ -65,6 +66,11 @@ local function expand_word(sh, w)
   for _, p in ipairs(w.parts) do
     if p.lit then buf[#buf + 1] = p.lit
     elseif p.var then buf[#buf + 1] = sh:get(p.var)
+    elseif p.param then buf[#buf + 1] = sh:param(p.param)
+    elseif p.special then
+      if p.special == "#" then buf[#buf + 1] = tostring(sh:nparams())
+      elseif p.special == "@" or p.special == "*" then buf[#buf + 1] = sh:paramsJoin(" ")
+      elseif p.special == "?" then buf[#buf + 1] = tostring(sh.status) end
     elseif p.arith then buf[#buf + 1] = rt.i64_to_str(eval(sh, require("parser").arith(p.arith))) end
   end
   return table.concat(buf)
@@ -78,14 +84,30 @@ local function exec_stmt(sh, st, hook)
     if st.arith then sh:aset(st.name, eval(sh, st.arith))
     else sh:set_str(st.name, expand_word(sh, st.rhs)) end
     sh.status = 0
+  elseif t == "funcdef" then
+    sh.functions[st.name] = st.body
+    sh.status = 0
   elseif t == "simple" then
     local args = {}
     for _, w in ipairs(st.words) do args[#args + 1] = expand_word(sh, w) end
     local cmd = args[1]
     if cmd == "echo" then
-      sh:echo(table.unpack and table.unpack(args, 2) or unpack(args, 2))
+      sh:echo(unpack(args, 2))
     elseif cmd == ":" or cmd == "true" then sh.status = 0
     elseif cmd == "false" then sh.status = 1
+    elseif cmd == "return" then
+      error({ __curse_return = args[2] and tonumber(args[2]) or sh.status })
+    elseif cmd == "local" then
+      for j = 2, #args do sh:localAssign(args[j]) end
+      sh.status = 0
+    elseif sh.functions[cmd] then
+      sh:pushCall({ unpack(args, 2) })
+      local ok, err = pcall(exec_list, sh, sh.functions[cmd], hook, false)
+      sh:popCall()
+      if not ok then
+        if type(err) == "table" and err.__curse_return then sh.status = err.__curse_return
+        else error(err) end
+      end
     else error("interp subset: unknown command '" .. tostring(cmd) .. "'") end
   elseif t == "forc" then
     if st.init then eval(sh, st.init) end

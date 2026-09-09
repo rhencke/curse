@@ -43,9 +43,16 @@ loop inside an `if`.
 
 ## Status
 
-Subset so far (the arith-loop spine): scalar assignments, `echo`/`:`/`true`/
-`false`, `for (( init; cond; step ))`, `while (( cond ))`, `$(( … ))`, `$var` /
-`${var}`, 64-bit int arithmetic (`+ - * / % == != < <= > >= && || ! ++ -- +=`…).
+Subset so far: scalar assignments, `echo`/`:`/`true`/`false`, `for ((;;))`,
+`while (())`, `for NAME in WORDS`, `if/elif/else/fi` (with `(())` conds),
+**functions** (`name(){…}` / `function name`), `return`, `local`, positional
+params (`$1..$9`, `$@`, `$*`, `$#`, `$?`), `$(( … ))`, `$var` / `${var}`, 64-bit
+int arithmetic. Functions gate OSR: the tier hands off only at top-level
+safepoints (calldepth 0), so a hot loop calling a function switches at the loop
+(function runs compiled each call); a hot loop inside a once-called function
+stays on the interpreter (still faster than bash). Function bodies emit
+sh-direct; with functions present the top level is sh-direct too (a lifted
+global would go stale inside a function) — refinable.
 
 ### Done
 - **pc-dispatch CFG + native-locals** — the compiled module is a flattened
