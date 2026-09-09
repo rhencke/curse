@@ -1045,7 +1045,8 @@ class Emitter {
         // (brace-expand) — the interpreter resolves the assoc case at runtime.
         const frags = this.arrayElemFrags(cmd.elems, false);
         const fn = cmd.append ? "appendArrayFields" : "setArrayFields";
-        return `${i}sh.${fn}(${JSON.stringify(cmd.name)}, [${frags.join(", ")}]);`;
+        // Status is 0, unless a readonly target rejected the assignment (then 1).
+        return `${i}sh.readonlyHit = false; sh.${fn}(${JSON.stringify(cmd.name)}, [${frags.join(", ")}]); sh.status = sh.readonlyHit ? 1 : 0;`;
       }
       case "case": {
         const id = this.caseId++;

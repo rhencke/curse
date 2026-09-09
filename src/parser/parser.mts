@@ -185,7 +185,7 @@ class Parser {
 
     if (t.type === "ARITH") {
       this.advance();
-      return { type: "arith", expression: t.value };
+      return this.trailingRedirects({ type: "arith", expression: t.value });
     }
     if (t.type === "COND") {
       this.advance();
@@ -213,7 +213,7 @@ class Parser {
         /^[A-Za-z_][A-Za-z0-9_]*\+?=$/.test(t.value) &&
         this.peekAt(1).type === "OP" && this.peekAt(1).value === "("
       ) {
-        return this.parseArrayAssign();
+        return this.trailingRedirects(this.parseArrayAssign());
       }
       // name () compound   → function definition. bash accepts almost any word
       // as the name (e.g. `foo-bar`, `pkg.install`), not just POSIX identifiers.

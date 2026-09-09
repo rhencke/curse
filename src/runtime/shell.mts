@@ -629,6 +629,16 @@ export class Shell {
   private varForWrite(name: string): Var {
     return this.varForWriteRaw(this.deref(name));
   }
+  /** True (with an error + readonlyHit) if `name` is an existing readonly
+   *  variable, so array set/append paths can refuse the write, like bash. */
+  private readonlyBlocked(name: string): boolean {
+    if (this.lookup(name)?.readonly) {
+      this.io.err(`${this.name}: ${name}: readonly variable\n`);
+      this.readonlyHit = true;
+      return true;
+    }
+    return false;
+  }
   /** `declare -p name` — reconstruct the variable's definition, or null if
    *  it is unset. Attribute letters follow bash's order (a A i l n r t u x). */
   declareLine(name: string): string | null {
@@ -694,6 +704,7 @@ export class Shell {
     arr.set(i, value);
   }
   appendArray(name: string, values: string[]): void {
+    if (this.readonlyBlocked(name)) return;
     const v = this.varForWrite(name);
     v.unset = false;
     const arr = this.toArray(v);
@@ -769,6 +780,7 @@ export class Shell {
     }
   }
   setArrayFields(name: string, fields: string[]): void {
+    if (this.readonlyBlocked(name)) return;
     const v = this.varForWrite(name);
     v.unset = false;
     if (v.assoc !== null) {
@@ -781,6 +793,7 @@ export class Shell {
     this.fillArray(v.arr, fields, 0);
   }
   appendArrayFields(name: string, fields: string[]): void {
+    if (this.readonlyBlocked(name)) return;
     const v = this.varForWrite(name);
     v.unset = false;
     if (v.assoc !== null) {
@@ -2162,11 +2175,12 @@ export class Shell {
         // Assoc-ness of a standalone `name=( … )` isn't known statically, so
         // stay indexed here for interp/AOT parity (the emitter does the same);
         // the `declare -A name=( … )` form carries the flag and is handled below.
+        this.readonlyHit = false;
         const fields = await expandArrayElems(this, cmd.elems, false);
         if (cmd.append) this.appendArrayFields(cmd.name, fields);
         else this.setArrayFields(cmd.name, fields);
-        this.status = 0;
-        status = 0;
+        this.status = this.readonlyHit ? 1 : 0; // a readonly target fails the assignment
+        status = this.status;
         break;
       }
       default: {
