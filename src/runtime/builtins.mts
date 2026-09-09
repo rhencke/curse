@@ -1321,18 +1321,37 @@ const shopt: Builtin = (shell, ...args) => {
   return 0;
 };
 
+// Signal numbers → canonical names (Linux/glibc, matching the dev image); `0` is
+// the EXIT pseudo-signal. `trap` normalizes a numeric spec to its name so
+// `trap 2` and `trap INT`/`trap SIGINT` are the same key and `trap -p` prints
+// the full name (SIGINT), like bash.
+const SIGNUMS: Record<string, string> = {
+  "0": "EXIT", "1": "HUP", "2": "INT", "3": "QUIT", "4": "ILL", "5": "TRAP",
+  "6": "ABRT", "7": "BUS", "8": "FPE", "9": "KILL", "10": "USR1", "11": "SEGV",
+  "12": "USR2", "13": "PIPE", "14": "ALRM", "15": "TERM", "16": "STKFLT",
+  "17": "CHLD", "18": "CONT", "19": "STOP", "20": "TSTP", "21": "TTIN",
+  "22": "TTOU", "23": "URG", "24": "XCPU", "25": "XFSZ", "26": "VTALRM",
+  "27": "PROF", "28": "WINCH", "29": "IO", "30": "PWR", "31": "SYS",
+};
 const signalName = (s: string): string => {
+  if (/^[0-9]+$/.test(s)) return SIGNUMS[s] ?? s;
   const up = s.toUpperCase();
-  if (up === "0") return "EXIT";
   return up.startsWith("SIG") ? up.slice(3) : up;
 };
+// Name → number, so `trap`/`trap -p` can list handlers in bash's signal-number
+// order (EXIT=0, INT=2, …); the pseudo-signals sort after the real ones.
+const SIGNUM_OF: Record<string, number> = Object.fromEntries(
+  Object.entries(SIGNUMS).map(([n, name]) => [name, Number(n)]),
+);
+const signalOrder = (name: string): number =>
+  SIGNUM_OF[name] ?? ({ ERR: 100, DEBUG: 101, RETURN: 102 } as Record<string, number>)[name] ?? 200;
 const SIGNALS = new Set([
   "EXIT", "ERR", "DEBUG", "RETURN", "HUP", "INT", "QUIT", "ILL", "TRAP", "ABRT",
   "BUS", "FPE", "KILL", "USR1", "SEGV", "USR2", "PIPE", "ALRM", "TERM", "CHLD",
   "CONT", "STOP", "TSTP", "TTIN", "TTOU", "URG", "XCPU", "XFSZ", "VTALRM",
   "PROF", "WINCH", "IO", "PWR", "SYS", "STKFLT",
 ]);
-const isSignalSpec = (s: string): boolean => SIGNALS.has(signalName(s)) || /^[0-9]+$/.test(s);
+const isSignalSpec = (s: string): boolean => SIGNALS.has(signalName(s));
 
 const trap: Builtin = (shell, ...args) => {
   const quote = (h: string): string => "'" + h.replace(/'/g, "'\\''") + "'";
@@ -1343,10 +1362,12 @@ const trap: Builtin = (shell, ...args) => {
       if (h !== undefined) shell.io.out(`trap -- ${quote(h)} ${pseudo.has(n) ? n : "SIG" + n}\n`);
     }
   };
-  // `trap` / `trap -p [sig...]`: print current handlers.
+  // `trap` / `trap -p [sig...]`: print current handlers. A bare listing is
+  // ordered by signal number (bash); explicit specs print in the given order.
   if (args.length === 0 || args[0] === "-p") {
     const specs = args.slice(args[0] === "-p" ? 1 : 0);
-    printTraps(specs.length > 0 ? specs.map(signalName) : Object.keys(shell.traps));
+    const all = Object.keys(shell.traps).sort((a, b) => signalOrder(a) - signalOrder(b));
+    printTraps(specs.length > 0 ? specs.map(signalName) : all);
     return 0;
   }
   if (args[0] === "-l") return 0; // signal listing: not supported
