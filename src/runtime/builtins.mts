@@ -1034,16 +1034,26 @@ const read: Builtin = (shell, ...args) => {
   const names: string[] = [];
   for (let i = 0; i < args.length; i++) {
     const a = args[i]!;
-    if (a === "-r") raw = true;
-    else if (a === "-s") continue; // silent: no tty here
-    else if (a === "-a") arrayName = args[++i] ?? "";
-    else if (a === "-d") { const d = args[++i] ?? ""; delim = d === "" ? "\0" : d[0]!; }
-    else if (a === "-n") nchars = toInt(args[++i] ?? "0");
-    else if (a === "-N") exactN = toInt(args[++i] ?? "0");
-    else if (a === "-p") shell.io.err(args[++i] ?? "");
-    else if (a === "-t" || a === "-u") i++; // timeout / fd: ignore + consume
-    else if (a.length > 1 && a[0] === "-") continue; // other flags: ignore
-    else names.push(a);
+    if (a === "--") continue;
+    if (!(a.length > 1 && a[0] === "-")) { names.push(a); continue; }
+    // A cluster of short flags; a value-taking flag consumes the rest of the
+    // cluster (smooshed, `-n3`) or, if none, the next word (`-n 3`, `-rd ''`).
+    for (let k = 1; k < a.length; k++) {
+      const c = a[k]!;
+      const takeVal = (): string => {
+        const rest = a.slice(k + 1);
+        return rest !== "" ? rest : (args[++i] ?? "");
+      };
+      if (c === "r") raw = true;
+      else if (c === "s") { /* silent: no tty here */ }
+      else if (c === "a") { arrayName = takeVal(); break; }
+      else if (c === "d") { const d = takeVal(); delim = d === "" ? "\0" : d[0]!; break; }
+      else if (c === "n") { nchars = toInt(takeVal()); break; }
+      else if (c === "N") { exactN = toInt(takeVal()); break; }
+      else if (c === "p") { shell.io.err(takeVal()); break; }
+      else if (c === "t" || c === "u") { takeVal(); break; }
+      // other flags: ignored
+    }
   }
 
   if (shell.stdinData === null || shell.stdinData === "") return 1;
