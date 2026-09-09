@@ -153,34 +153,47 @@ local function collect_funcvars(stmts, set)
   end
 end
 
--- Which TOP-LEVEL vars can be int64 locals: assigned outside any function, every
--- assignment arithmetic or a numeric literal (reads never disqualify), and NOT
--- touched by any function.
+-- Which vars become native int64 MODULE-LEVEL locals (shared as upvalues by
+-- run() and every function closure). A var qualifies if it is assigned somewhere,
+-- every assignment is arithmetic or a numeric literal (reads never disqualify),
+-- and it is never `local`'d in a function (that would need per-call shadowing,
+-- which the sh scope handles instead). Scans EVERYWHERE, including function
+-- bodies — a var shared between the top level and a function still lifts, because
+-- the upvalue is one real variable both see (no hash lookup, no desync).
 local function analyze_lift(ast)
-  local assigned, disq = {}, {}
-  local function scan_stmts(stmts)
+  local assigned, disq, localed = {}, {}, {}
+  local function scan(stmts)
     for _, st in ipairs(stmts) do
       if st.t == "assign" then
         assigned[st.name] = true
         if not st.arith and not (st.rhs and numeric_word(st.rhs)) then disq[st.name] = true end
+      elseif st.t == "simple" then
+        local cmd = st.words[1].parts[1] and st.words[1].parts[1].lit
+        if cmd == "local" then
+          for j = 2, #st.words do
+            local p1 = st.words[j].parts[1]
+            local nm = p1 and p1.lit and p1.lit:match("^([%a_][%w_]*)")
+            if nm then localed[nm] = true end
+          end
+        end
       elseif st.t == "forc" or st.t == "whilec" then
         for _, e in ipairs({ st.init, st.cond, st.step }) do
           if e and (e.k == "asgn" or e.k == "post" or e.k == "pre") then assigned[e.name] = true end
         end
-        scan_stmts(st.body)
+        scan(st.body)
       elseif st.t == "forin" then
         disq[st.name] = true -- a `for x in` var holds arbitrary strings, never lift it
-        scan_stmts(st.body)
+        scan(st.body)
       elseif st.t == "if" then
-        for _, cl in ipairs(st.clauses) do scan_stmts(cl.body) end
-      end -- funcdef bodies are intentionally not scanned here
+        for _, cl in ipairs(st.clauses) do scan(cl.body) end
+      elseif st.t == "funcdef" then
+        scan(st.body)
+      end
     end
   end
-  scan_stmts(ast.stmts)
-  local funcvars = {}
-  collect_funcvars(ast.stmts, funcvars)
+  scan(ast.stmts)
   local lifted = {}
-  for n in pairs(assigned) do if not disq[n] and not funcvars[n] then lifted[n] = true end end
+  for n in pairs(assigned) do if not disq[n] and not localed[n] then lifted[n] = true end end
   return lifted
 end
 
@@ -357,17 +370,24 @@ end
 
 -- Assemble a CFG into a Lua function string. `liftvars` (top-level only) are
 -- seeded from `sh` on entry and written back on exit.
-local function assemble(cfg, sig, liftvars, toplevel)
+-- opts.runlocals: lifted vars DECLARED as run()-locals here (register-allocated,
+-- fast in hot loops). opts.upvals: lifted vars declared at module level (shared
+-- as upvalues with functions) — seeded/written-back but not re-declared. Both are
+-- seeded from `sh` on entry and written back on exit (run() only).
+local function assemble(cfg, sig, opts)
+  opts = opts or {}
   local o = { sig }
-  for _, n in ipairs(liftvars or {}) do o[#o + 1] = ("  local %s = sh:aget(%q)"):format(lname(n), n) end
-  o[#o + 1] = toplevel and ("  pc = pc or %d"):format(cfg.entry) or ("  local pc = %d"):format(cfg.entry)
+  for _, n in ipairs(opts.runlocals or {}) do o[#o + 1] = ("  local %s = sh:aget(%q)"):format(lname(n), n) end
+  for _, n in ipairs(opts.upvals or {}) do o[#o + 1] = ("  %s = sh:aget(%q)"):format(lname(n), n) end
+  o[#o + 1] = opts.toplevel and ("  pc = pc or %d"):format(cfg.entry) or ("  local pc = %d"):format(cfg.entry)
   o[#o + 1] = "  while true do"
   for p = 0, cfg.npc - 1 do
     o[#o + 1] = ("    %s pc == %d then %s"):format(p == 0 and "if" or "elseif", p, cfg.blocks[p])
   end
   o[#o + 1] = "    end"
   o[#o + 1] = "  end"
-  for _, n in ipairs(liftvars or {}) do o[#o + 1] = ("  sh:aset(%q, %s)"):format(n, lname(n)) end
+  for _, n in ipairs(opts.runlocals or {}) do o[#o + 1] = ("  sh:aset(%q, %s)"):format(n, lname(n)) end
+  for _, n in ipairs(opts.upvals or {}) do o[#o + 1] = ("  sh:aset(%q, %s)"):format(n, lname(n)) end
   o[#o + 1] = "end"
   return table.concat(o, "\n")
 end
@@ -375,28 +395,40 @@ end
 function M.emit(ast)
   local funcflags = {}
   for _, st in ipairs(ast.stmts) do if st.t == "funcdef" then funcflags[st.name] = func_flags(st.body) end end
-  -- Lift top-level arith vars; analyze_lift already excludes any var a function
-  -- touches (which would go stale vs the function's sh-direct access).
+  -- Lift purely-arith vars to native int64. A var no function touches becomes a
+  -- run()-LOCAL (register-allocated — fast in hot loops). A var shared with a
+  -- function becomes a module-level UPVALUE both run() and the function see (no
+  -- hash lookup, no desync) — the upvalue can't stay in a register across a tight
+  -- loop, but shared vars are updated per-call, not per-hot-iteration.
   local lifted = analyze_lift(ast)
-  local liftvars = {}
-  for n in pairs(lifted) do liftvars[#liftvars + 1] = n end
-  table.sort(liftvars)
+  local funcTouched = {}
+  collect_funcvars(ast.stmts, funcTouched)
+  local upvals, runlocals = {}, {}
+  for n in pairs(lifted) do
+    if funcTouched[n] then upvals[#upvals + 1] = n else runlocals[#runlocals + 1] = n end
+  end
+  table.sort(upvals); table.sort(runlocals)
+  local upset = {}; for _, n in ipairs(upvals) do upset[n] = true end
 
   local o = { 'local rt = require("runtime")' }
-  -- forward-declare function locals so functions can call each other/forward
+  if #upvals > 0 then
+    local vs = {}
+    for _, n in ipairs(upvals) do vs[#vs + 1] = lname(n) end
+    o[#o + 1] = "local " .. table.concat(vs, ", ") -- module-level upvalues (shared with functions)
+  end
   local decls = {}
   for name in pairs(funcflags) do decls[#decls + 1] = "fn_" .. name end
   if #decls > 0 then o[#o + 1] = "local " .. table.concat(decls, ", ") end
   for _, st in ipairs(ast.stmts) do
     if st.t == "funcdef" then
-      local cfg = build_cfg(st.body, {}, funcflags) -- function bodies are sh-direct
-      o[#o + 1] = assemble(cfg, "fn_" .. st.name .. " = function(sh)", nil, false)
+      local cfg = build_cfg(st.body, upset, funcflags) -- functions lift only the shared upvalues
+      o[#o + 1] = assemble(cfg, "fn_" .. st.name .. " = function(sh)", {})
     end
   end
   local top = build_cfg(ast.stmts, lifted, funcflags)
   o[#o + 1] = "local loopPc = " .. serialize(top.loopPc)
   o[#o + 1] = "local stmtPc = " .. serialize(top.stmtPc)
-  o[#o + 1] = assemble(top, "local function run(sh, pc)", liftvars, true)
+  o[#o + 1] = assemble(top, "local function run(sh, pc)", { runlocals = runlocals, upvals = upvals, toplevel = true })
   o[#o + 1] = "return { run = run, loopPc = loopPc, stmtPc = stmtPc }"
   return table.concat(o, "\n") .. "\n"
 end

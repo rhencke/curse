@@ -50,8 +50,12 @@ params (`$1..$9`, `$@`, `$*`, `$#`, `$?`), `$(( … ))`, `$var` / `${var}`, 64-b
 int arithmetic. Functions gate OSR: the tier hands off only at top-level
 safepoints (calldepth 0), so a hot loop calling a function switches at the loop
 (function runs compiled each call); a hot loop inside a once-called function
-stays on the interpreter (still faster than bash). Function bodies emit
-sh-direct; a top-level var lifts unless a function touches it. Calls are slimmed
+stays on the interpreter (still faster than bash). Lifting has two forms: a var no function touches becomes a `run()`-LOCAL
+(register-allocated, ~0.6 ns/iter in hot loops); a var shared with a function
+becomes a module-level Lua UPVALUE that run() and the function closures all see —
+one real native variable, no hash lookup, no interp/compiled desync (seeded from
+`sh` in run(), written back). An upvalue can't be register-held across a tight
+loop, so only shared vars use it; hot-loop vars stay run-locals. Calls are slimmed
 by need: a function using neither positional params nor `local` is called bare
 (`fn_x(sh)`); one using only params swaps `$@`; only `local` needs the full
 frame. Positional args go into per-depth POOL arrays (reused across calls, args
