@@ -325,7 +325,9 @@ class WordParser {
       if (c === "`") break;
       if (c === "\\") {
         const n = this.at();
-        if (n === "`" || n === "$" || n === "\\") { src += n; this.i++; } else src += "\\";
+        // Inside backticks a backslash is dropped before ` $ \ — and, when the
+        // backticks are themselves inside double quotes, before " too (bash).
+        if (n === "`" || n === "$" || n === "\\" || (quoted && n === '"')) { src += n!; this.i++; } else src += "\\";
         continue;
       }
       src += c;
