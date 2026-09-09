@@ -46,13 +46,20 @@ Subset so far (the arith-loop spine): scalar assignments, `echo`/`:`/`true`/
   into it (mid-loop resume seeds the locals from `sh`'s live state) stays
   bit-identical. Non-liftable loops fall back to sh-direct.
 
+- **Background compile** — `tier.run_background(script)` spawns a *detached*
+  `luajit lua/transpile.lua` that writes `out.lua` (temp + atomic rename); the
+  interpreter polls at safepoints and jumps in the instant it lands. On the arith
+  bench it interprets ~2048 iterations (~1ms) while transpiling, then switches
+  mid-loop and finishes compiled — total ~0.003s vs bash 0.811s (~270×), result
+  identical, no functions involved. Demo: `luajit lua/demo_background.lua
+  bench/arith.sh` (set `CURSE_LUAJIT` to the luajit binary).
+
 ### Next
-- **Background compile**: spawn a detached `luajit` transpile writing `out.lua`
-  via temp+atomic-rename; the interpreter polls at safepoints and `load()`s it.
-  (Currently `tier.lua` compiles synchronously and switches on a policy, which is
-  what proves the OSR mechanism.)
-- Grow the grammar toward the TS parser; wire the shared conformance harness for
-  parity.
+- Grow the grammar toward the TS parser (functions, `if`, `case`, `for x in`,
+  pipelines, redirections, real commands); `for x in LIST` OSR needs the expanded
+  list + index persisted in `sh`.
+- Wire the shared conformance harness for TS-vs-Lua parity.
+- Port the parser to Lua fully (transpile-time startup ~1ms too).
 
 ## Running
 
