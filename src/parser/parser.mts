@@ -181,6 +181,13 @@ class Parser {
   }
 
   private parseCommand(): Command {
+    const line = this.peek().line;
+    const cmd = this.parseCommand0();
+    if (cmd.line === undefined) cmd.line = line; // stamp source line for $LINENO
+    return cmd;
+  }
+
+  private parseCommand0(): Command {
     const t = this.peek();
 
     if (t.type === "ARITH") {

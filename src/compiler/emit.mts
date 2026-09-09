@@ -27,6 +27,9 @@ export interface EmitOptions {
   /** Emit a `source`-able fragment (a default-exported `(sh) => …` that runs
    *  against an injected shell) rather than a standalone program. */
   fragment?: boolean;
+  /** Inject `sh.line = N` before each command so `$LINENO` works — set only when
+   *  the program references LINENO, to keep ordinary output natural. */
+  lineno?: boolean;
 }
 
 const pad = (n: number): string => "  ".repeat(n);
@@ -258,6 +261,7 @@ class Emitter {
    *  compiling a proven-safe arith loop so arith accesses skip the scope lookup. */
   private hoist: Map<string, string> | null = null;
   guards = false;
+  lineno = false;
 
   /** Emit a command in an errexit-suppressed scope (a condition, `!`, or the
    *  non-final operand of && / ||). When the script never uses `set`, errexit
@@ -607,6 +611,9 @@ class Emitter {
   }
 
   command(cmd: Command, ind: number): string {
+    // $LINENO: stamp the current source line before the command (only when the
+    // program uses LINENO, so ordinary output stays clean).
+    const lnPrefix = this.lineno && cmd.line !== undefined ? `${pad(ind)}sh.line = ${cmd.line};\n` : "";
     const reds = cmd.redirects;
     let core: string;
     if (reds !== undefined && reds.length > 0) {
@@ -633,11 +640,11 @@ class Emitter {
     if (cmd.flags !== undefined && (cmd.flags & CMD_INVERT_RETURN) !== 0) {
       const i = pad(ind);
       if (this.guards) {
-        return `${i}{\n${pad(ind + 1)}using _ = sh.suppress();\n${bump(core)}\n${i}}\n${i}sh.invert();`;
+        return lnPrefix + `${i}{\n${pad(ind + 1)}using _ = sh.suppress();\n${bump(core)}\n${i}}\n${i}sh.invert();`;
       }
-      return core + "\n" + `${i}sh.invert();`;
+      return lnPrefix + core + "\n" + `${i}sh.invert();`;
     }
-    return core;
+    return lnPrefix + core;
   }
 
   /** Emit a statement for an assignment word (name=, name+=, name[i]=, …). */
@@ -1114,6 +1121,7 @@ class Emitter {
 export const emit = (cmd: Command | null, opts: EmitOptions): string => {
   const em = new Emitter();
   if (cmd !== null) em.guards = usesSet(cmd);
+  em.lineno = opts.lineno === true;
   const body = cmd === null ? "" : em.command(cmd, 1) + "\n";
   const rt = JSON.stringify(opts.runtimeSpecifier);
   if (opts.fragment) {
