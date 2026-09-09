@@ -1465,7 +1465,14 @@ const trap: Builtin = (shell, ...args) => {
     printTraps(specs.length > 0 ? specs.map(signalName) : all);
     return 0;
   }
-  if (args[0] === "-l") return 0; // signal listing: not supported
+  if (args[0] === "-l") {
+    // List signals as `kill -l` does: `%2d) SIG<name>`, tab-separated, five per
+    // row. Real-time signals (34-64) aren't modeled, so only 1-31 are printed.
+    const cells: string[] = [];
+    for (let n = 1; n <= 31; n++) cells.push(`${String(n).padStart(2)}) SIG${SIGNUMS[n]}`);
+    for (let i = 0; i < cells.length; i += 5) shell.io.out(cells.slice(i, i + 5).join("\t") + "\n");
+    return 0;
+  }
   let rest = args;
   if (rest[0] === "--") rest = rest.slice(1);
   if (rest.length === 0) return 0;

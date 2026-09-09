@@ -124,7 +124,7 @@ const attrLetters = (v: Var): string => {
 /** Command types before which the DEBUG trap fires — the "simple" leaf commands.
  *  Compound wrappers (if/while/for/…) don't fire it themselves; they recurse to
  *  their own leaf commands, which do. */
-const LEAF_TYPES = new Set(["simple", "arith", "cond", "array_assign"]);
+const LEAF_TYPES = new Set(["simple", "arith", "cond", "array_assign", "case"]);
 
 /** Temp files backing process substitutions, unlinked when the process exits. */
 let procSubSeq = 0;

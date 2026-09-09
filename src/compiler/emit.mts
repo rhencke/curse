@@ -616,7 +616,8 @@ class Emitter {
     // set/trap/eval/source, so trap-free code pays nothing.
     const dbg =
       this.guards && cmd.line !== undefined &&
-      (cmd.type === "simple" || cmd.type === "arith" || cmd.type === "cond" || cmd.type === "array_assign")
+      (cmd.type === "simple" || cmd.type === "arith" || cmd.type === "cond" ||
+        cmd.type === "array_assign" || cmd.type === "case")
         ? `${pad(ind)}await sh.debugTrap(${cmd.line});\n`
         : "";
     const reds = cmd.redirects;
