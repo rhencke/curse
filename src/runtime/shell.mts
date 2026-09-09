@@ -2598,6 +2598,8 @@ export class Shell {
     this.loopDepth++;
     try {
       for (const item of items) {
+        // bash fires the DEBUG trap at the loop header each iteration.
+        if (this.traps["DEBUG"] !== undefined) await this.debugTrap(cmd.line);
         this.setVar(cmd.name, item);
         const sig = await this.loopStep(cmd.body);
         last = this.status;

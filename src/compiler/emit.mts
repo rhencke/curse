@@ -993,6 +993,7 @@ class Emitter {
         const setName = ident(cmd.name) ? `sh.env.${cmd.name}` : `sh.env[${JSON.stringify(cmd.name)}]`;
         return this.loopScope(
           `${i}for (const ${v} of ${list}) {\n` +
+          (this.guards && cmd.line !== undefined ? `${pad(ind + 1)}await sh.debugTrap(${cmd.line});\n` : "") +
           `${pad(ind + 1)}${setName} = ${v};\n` +
           this.loopBody(cmd.body, ind + 1) + "\n" +
           `${i}}`,
