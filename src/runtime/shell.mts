@@ -341,6 +341,7 @@ export class Shell {
   endAssign(): void {
     if (this.subCount === this.subMarkCount) this.status = 0;
     if (this.readonlyHit) this.status = 1;
+    this.underscore = ""; // a pure assignment clears `$_` (bash)
   }
 
   private globalScope: Scope = new Scope();
@@ -350,6 +351,10 @@ export class Shell {
   /** Current source line, for `$LINENO` in the interpreter (set before each
    *  command). AOT resolves it lazily from the stack instead — see mapLines. */
   line = 0;
+  /** `$_`: the last argument of the previous simple command (or the command name
+   *  when it had no args); a pure assignment resets it to empty. Set at the shared
+   *  command chokepoint (callByName), so interp and AOT agree. */
+  underscore = "";
   /** Called once at load by an emitted module to register its generated-line →
    *  source-line map for lazy `$LINENO` resolution (see linenoFromStack). */
   mapLines(url: string, pairs: ReadonlyArray<readonly [number, number]>): void {
@@ -420,6 +425,7 @@ export class Shell {
     // (registered by `sh.mapLines`); the interpreter falls back to `this.line`,
     // which it sets before each command (no generated frame appears in its stack).
     if (name === "LINENO") return String(linenoFromStack() ?? this.line);
+    if (name === "_") return this.underscore;
     return undefined;
   }
 
@@ -1335,6 +1341,9 @@ export class Shell {
       code = await this.external(name, args, {});
     }
     this.status = code;
+    // `$_` becomes this command's last argument (or its name if it had none),
+    // set after it runs so a function call's arg wins over its body's commands.
+    this.underscore = args.length > 0 ? args[args.length - 1]! : name;
     this.setArray("PIPESTATUS", [String(code)]); // a lone command is a 1-stage pipeline
     await this.afterCommand();
     return code;
