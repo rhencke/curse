@@ -39,14 +39,18 @@ Subset so far (the arith-loop spine): scalar assignments, `echo`/`:`/`true`/
 `false`, `for (( init; cond; step ))`, `while (( cond ))`, `$(( … ))`, `$var` /
 `${var}`, 64-bit int arithmetic (`+ - * / % == != < <= > >= && || ! ++ -- +=`…).
 
+### Done
+- **Native-locals emit** — a liftable arithmetic loop compiles to a per-loop
+  closure with native int64 locals, seeded from `sh` on entry and written back on
+  exit. ~1 ns/iter, ~640× the interpreter, matching the hand-written POC, and OSR
+  into it (mid-loop resume seeds the locals from `sh`'s live state) stays
+  bit-identical. Non-liftable loops fall back to sh-direct.
+
 ### Next
 - **Background compile**: spawn a detached `luajit` transpile writing `out.lua`
   via temp+atomic-rename; the interpreter polls at safepoints and `load()`s it.
   (Currently `tier.lua` compiles synchronously and switches on a policy, which is
   what proves the OSR mechanism.)
-- **Native-locals emit** with seed-from-`sh` / write-back-to-`sh` at OSR
-  boundaries — turns the compiled loop from ~32 ns/iter (sh-direct hash lookups)
-  toward the ~0.6 ns/iter the hand-written POC hit.
 - Grow the grammar toward the TS parser; wire the shared conformance harness for
   parity.
 
