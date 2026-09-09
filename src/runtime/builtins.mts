@@ -691,14 +691,22 @@ const letBuiltin: Builtin = async (shell, ...args) => {
   return nonzero ? 0 : 1;
 };
 
-const breakBuiltin: Builtin = (shell, ...args) => {
-  if (shell.loopDepth <= 0) return 0; // no-op outside a loop (bash warns to stderr)
-  throw new LoopSignal("break", args.length > 0 ? Math.max(1, toInt(args[0]!)) : 1);
+// break/continue share an argument protocol: outside any loop they warn and
+// return 0; a non-numeric count is a fatal error that exits the shell with 128
+// (bash aborts, it does not merely break); a numeric count acts on that many.
+const loopControl = (kind: "break" | "continue"): Builtin => (shell, ...args) => {
+  if (shell.loopDepth <= 0) {
+    shell.io.err(`${shell.name}: ${kind}: only meaningful in a \`for', \`while', or \`until' loop\n`);
+    return 0;
+  }
+  if (args.length > 0 && !/^\s*[+-]?[0-9]+\s*$/.test(args[0]!)) {
+    shell.io.err(`${shell.name}: ${kind}: ${args[0]}: numeric argument required\n`);
+    throw new ExitSignal(128);
+  }
+  throw new LoopSignal(kind, args.length > 0 ? Math.max(1, toInt(args[0]!)) : 1);
 };
-const continueBuiltin: Builtin = (shell, ...args) => {
-  if (shell.loopDepth <= 0) return 0;
-  throw new LoopSignal("continue", args.length > 0 ? Math.max(1, toInt(args[0]!)) : 1);
-};
+const breakBuiltin: Builtin = loopControl("break");
+const continueBuiltin: Builtin = loopControl("continue");
 
 const getopts: Builtin = (shell, ...args) => {
   if (args.length < 2) {

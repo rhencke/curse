@@ -366,14 +366,18 @@ class Parser {
     this.advance();
     const name = nameTok.value;
 
-    let words: Word[] = [];
+    let words: Word[];
     if (this.wordIs("in")) {
       this.advance();
+      words = [];
       while (this.peek().type === "WORD" && this.peek().value !== "do") {
         words.push(makeWord(this.advance().value));
       }
+    } else {
+      // A bare `for x; do` iterates over the positional params, i.e. `in "$@"`.
+      // (An explicit empty `for x in; do` list, in contrast, iterates nothing.)
+      words = [makeWord('"$@"')];
     }
-    // (a bare `for x` iterates over "$@" — no positional params in M1, so [])
 
     this.skipSeparators();
     this.eatWord("do");

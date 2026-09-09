@@ -2264,7 +2264,17 @@ export class Shell {
     this.loopDepth++;
     try {
       for (;;) {
-        const s = await this.condition(cmd.test);
+        // `break`/`continue` may appear in the condition itself (`while break`);
+        // it acts on this loop like it would in the body.
+        let s: number;
+        try {
+          s = await this.condition(cmd.test);
+        } catch (e) {
+          if (!(e instanceof LoopSignal)) throw e;
+          if (--e.count > 0) throw e; // targets an enclosing loop
+          if (e.kind === "break") break;
+          continue; // `continue` re-tests the condition
+        }
         if (cmd.until ? s === 0 : s !== 0) break;
         const sig = await this.loopStep(cmd.body);
         last = this.status;

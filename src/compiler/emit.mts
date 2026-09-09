@@ -946,10 +946,20 @@ class Emitter {
       }
       case "while": {
         const brk = cmd.until ? "=== 0" : "!== 0";
+        const j = pad(ind + 1);
+        // `break`/`continue` may appear in the condition itself (`while break`);
+        // catch it here so it acts on this loop, not an enclosing one.
+        const cond =
+          `${j}try {\n` +
+          this.suppressed(cmd.test, ind + 2) + "\n" +
+          `${pad(ind + 2)}if (sh.status ${brk}) break;\n` +
+          `${j}} catch (e) {\n` +
+          `${pad(ind + 2)}if (e instanceof LoopSignal) { if (--e.count > 0) throw e; if (e.kind === "break") break; continue; }\n` +
+          `${pad(ind + 2)}throw e;\n` +
+          `${j}}`;
         return this.loopScope(
           `${i}for (;;) {\n` +
-          this.suppressed(cmd.test, ind + 1) + "\n" +
-          `${pad(ind + 1)}if (sh.status ${brk}) break;\n` +
+          cond + "\n" +
           this.loopBody(cmd.body, ind + 1) + "\n" +
           `${i}}`,
           ind,
