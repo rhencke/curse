@@ -1596,8 +1596,10 @@ export class Shell {
           }
           throw new Error(`${target}: ambiguous redirect`);
         }
-        if (r.op === ">&") writers[r.fd] = writers[t] ?? (() => {});
-        // `<&` (dup input) is uncommon; left as inherit for now.
+        // `N>&M` and `N<&M` both duplicate fd M onto fd N — the `<`/`>` only
+        // signals read/write intent, the dup is identical. (Only output fds are
+        // modeled here; an unmodeled source fd falls back to discarding.)
+        writers[r.fd] = writers[t] ?? (() => {});
         break;
       }
       default:
