@@ -168,6 +168,52 @@ const shellBackslashQuote = (v: string): string => {
   return v.replace(/[^A-Za-z0-9_@%+=:,./-]/g, "\\$&");
 };
 
+/** strftime for printf `%(FORMAT)T`. Uses Intl for timezone-aware components
+ *  (honoring $TZ); supports the common conversions. */
+const strftime = (f: string, epoch: number, tz: string | undefined): string => {
+  const d = new Date(epoch * 1000);
+  const zone = tz !== undefined && tz !== "" ? tz : undefined;
+  const p: Record<string, string> = {};
+  try {
+    const dtf = new Intl.DateTimeFormat("en-US", {
+      timeZone: zone, hourCycle: "h23",
+      year: "numeric", month: "2-digit", day: "2-digit",
+      hour: "2-digit", minute: "2-digit", second: "2-digit", weekday: "long",
+    });
+    for (const part of dtf.formatToParts(d)) p[part.type] = part.value;
+  } catch {
+    return f; // invalid TZ: best effort
+  }
+  const name = (opt: Intl.DateTimeFormatOptions): string => {
+    try {
+      return new Intl.DateTimeFormat("en-US", { timeZone: zone, ...opt }).format(d);
+    } catch {
+      return "";
+    }
+  };
+  return f.replace(/%(.)/g, (_m, c: string): string => {
+    switch (c) {
+      case "Y": return p.year ?? "";
+      case "y": return (p.year ?? "").slice(-2);
+      case "m": return p.month ?? "";
+      case "d": return p.day ?? "";
+      case "e": return String(Number(p.day)).padStart(2, " ");
+      case "H": return p.hour === "24" ? "00" : (p.hour ?? "");
+      case "M": return p.minute ?? "";
+      case "S": return p.second ?? "";
+      case "A": return p.weekday ?? "";
+      case "a": return name({ weekday: "short" });
+      case "B": return name({ month: "long" });
+      case "b": case "h": return name({ month: "short" });
+      case "Z": return name({ timeZoneName: "short" }).split(" ").pop() ?? "";
+      case "%": return "%";
+      case "n": return "\n";
+      case "t": return "\t";
+      default: return "%" + c;
+    }
+  });
+};
+
 const printf: Builtin = async (shell, ...args) => {
   // Options: `-v VAR` captures the output into a variable (or array element)
   // instead of stdout; `--` ends option processing.
@@ -301,6 +347,22 @@ const printf: Builtin = async (shell, ...args) => {
         }
         case "c": out += format(nextArg().slice(0, 1), false); break;
         case "q": out += format(shellBackslashQuote(nextArg()), false); break;
+        case "(": {
+          // %(FORMAT)T — strftime. The arg is epoch seconds; empty or negative
+          // (-1/-2) means "now".
+          const close = fmt.indexOf(")", j);
+          if (close < 0 || fmt[close + 1] !== "T") {
+            shell.io.err(`printf: \`%(': invalid format character\n`);
+            status = 1; stopped = true; return;
+          }
+          const tfmt = fmt.slice(j + 1, close);
+          j = close + 1; // now at 'T'
+          const raw = nextArg();
+          let epoch = raw === "" ? Math.floor(Date.now() / 1000) : Number(pfNum(shell, raw, () => { status = 1; }));
+          if (!Number.isFinite(epoch) || epoch < 0) epoch = Math.floor(Date.now() / 1000);
+          out += format(strftime(tfmt, epoch, shell.getVar("TZ")), false);
+          break;
+        }
         case "f": case "F": {
           const n = pfFloat(nextArg());
           let fs = n.toFixed(hasPrec ? (prec === "" ? 0 : parseInt(prec, 10)) : 6);
