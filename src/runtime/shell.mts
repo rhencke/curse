@@ -186,6 +186,8 @@ type BashFunc = { __bashFunc: (sh: Shell) => Promise<void> };
 export class Shell {
   io: IO;
   status = 0;
+  /** Set when the `exit` builtin ran (so an interactive loop knows to stop). */
+  exited = false;
   name = "curse";
   cwd = process.cwd();
   /** Directory stack for pushd/popd/dirs; index 0 mirrors the current dir. */
@@ -1848,10 +1850,8 @@ export class Shell {
     try {
       return await this.execute(cmd);
     } catch (e) {
-      if (e instanceof ReturnSignal || e instanceof ExitSignal) {
-        this.status = e.code;
-        return e.code;
-      }
+      if (e instanceof ExitSignal) { this.exited = true; this.status = e.code; return e.code; }
+      if (e instanceof ReturnSignal) { this.status = e.code; return e.code; }
       if (e instanceof LoopSignal) return this.status; // break/continue outside a loop
       throw e;
     }
