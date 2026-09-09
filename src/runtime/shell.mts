@@ -1593,6 +1593,10 @@ export class Shell {
   private async doSlice(list: string[], offExpr: string, lenExpr: string): Promise<string[]> {
     const off = Number(await this.arithValue(offExpr));
     const len = lenExpr === "" ? undefined : Number(await this.arithValue(lenExpr));
+    // Unlike a string slice, a negative length on an array/positional slice is a
+    // fatal expansion error that aborts the command (bash: "substring expression
+    // < 0"); ArithError routes through the same per-command abort as arithmetic.
+    if (len !== undefined && len < 0) throw new ArithError(`${len}: substring expression < 0`);
     return pSliceArr(list, off, len);
   }
   /** `${parameter@op}` transformation of a scalar value. */

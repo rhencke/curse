@@ -158,8 +158,11 @@ export const transform = (op: string, v: string): string => {
 
 /** `${arr[@]:offset:length}` / `${@:offset:length}` — slice a list (same rules). */
 export const sliceArr = (list: string[], offset: number, length: number | undefined): string[] => {
-  const start = offset < 0 ? Math.max(list.length + offset, 0) : Math.min(offset, list.length);
+  // A negative offset counts from the end; if it reaches before the start the
+  // slice is empty (bash), not clamped to the whole list. A negative length is
+  // rejected earlier (see Shell.doSlice) — for arrays it is an error.
+  const start = offset < 0 ? list.length + offset : Math.min(offset, list.length);
+  if (start < 0) return [];
   if (length === undefined) return list.slice(start);
-  if (length < 0) return list.slice(start, Math.max(list.length + length, start));
   return list.slice(start, start + length);
 };
