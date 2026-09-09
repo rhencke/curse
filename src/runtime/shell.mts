@@ -472,6 +472,11 @@ export class Shell {
    *  namerefs and arithmetic array assignment. */
   setElemSync(base: string, sub: string, value: string): void {
     const v = this.lookup(base);
+    if (v?.readonly) {
+      this.io.err(`${this.name}: ${base}: readonly variable\n`);
+      this.readonlyHit = true;
+      return;
+    }
     if (v && v.assoc !== null) { this.varForWriteRaw(this.deref(base)).assoc!.set(sub, value); return; }
     this.setElem(base, Number(evalArith(this, sub)), value);
   }
@@ -671,6 +676,11 @@ export class Shell {
   }
   setElem(name: string, index: number, value: string): void {
     const v = this.varForWrite(name);
+    if (v.readonly) {
+      this.io.err(`${this.name}: ${name}: readonly variable\n`);
+      this.readonlyHit = true;
+      return;
+    }
     const arr = this.toArray(v);
     const i = index < 0 ? this.maxIndex(v) + 1 + index : index;
     if (i < 0) {
@@ -731,6 +741,12 @@ export class Shell {
   }
   /** Set an array/assoc element by raw subscript. */
   async elemSet(name: string, subRaw: string, value: string): Promise<void> {
+    const existing = this.lookup(name);
+    if (existing?.readonly) {
+      this.io.err(`${this.name}: ${name}: readonly variable\n`);
+      this.readonlyHit = true;
+      return;
+    }
     const v = this.varForWrite(name);
     if (v.assoc !== null) {
       v.assoc.set(await expandNoSplit(this, subRaw), value);

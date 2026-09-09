@@ -703,7 +703,8 @@ class Emitter {
     let arrayStmts = "";
     if (cmd.arrayArgs !== undefined && cmd.arrayArgs.length > 0) {
       const isLocal = words[0]!.text === "local";
-      const isAssoc = words.some((w) => w.text === "-A");
+      // `-A` marks an associative array, even bundled in a cluster (`declare -Ar`).
+      const isAssoc = words.some((w) => (w.text[0] === "-" || w.text[0] === "+") && w.text.slice(1).includes("A"));
       // Attributes from the flags (declare -ai arr=(...)) apply to each array.
       const attrs: Record<string, boolean> = {};
       let exported = false;
