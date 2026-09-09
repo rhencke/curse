@@ -1307,22 +1307,30 @@ const shopt: Builtin = (shell, ...args) => {
       ? oflag ? `set ${on ? "-" : "+"}o ${n}\n` : `shopt -${on ? "s" : "u"} ${n}\n`
       : `${n.padEnd(15)}\t${on ? "on" : "off"}\n`;
 
+  const badOpt = (n: string): void =>
+    shell.io.err(`${shell.name}: shopt: ${n}: invalid ${oflag ? "option name" : "shell option name"}\n`);
+
   if (mode === "") {
-    // Query / print. `shopt`/`shopt -q` returns 0 iff every named option is set.
+    // Query / print. `shopt`/`shopt -q` returns 0 iff every named option is set;
+    // an unknown option name is an error (status 1) with nothing printed.
     const list = names.length > 0 ? names : Object.keys(oflag ? setOpts : shell.shopts).sort();
     let status = 0;
     for (const n of list) {
-      const on = state(n) ?? false;
-      if (!quiet) shell.io.out(line(n, on));
-      if (!on) status = 1;
+      const st = state(n);
+      if (st === undefined) { badOpt(n); status = 1; continue; }
+      if (!quiet) shell.io.out(line(n, st));
+      // A specific query fails if the option is off; listing them all is status 0.
+      if (!st && names.length > 0) status = 1;
     }
     return status;
   }
+  let status = 0;
   for (const n of names) {
+    if (state(n) === undefined) { badOpt(n); status = 1; continue; }
     if (oflag) setSetOpt(n, mode === "s");
     else shell.shopts[n] = mode === "s";
   }
-  return 0;
+  return status;
 };
 
 // Signal numbers → canonical names (Linux/glibc, matching the dev image); `0` is
