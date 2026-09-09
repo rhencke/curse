@@ -230,6 +230,9 @@ class WordParser {
         continue;
       }
       if (c === "$") {
+        // A `${:-word}` operand still recognizes $'...' ANSI-C quoting even in
+        // this double-quoted context (bash), unlike a plain "..." string.
+        if (this.at(1) === "'") { this.hasQuote = true; this.ansiC(); continue; }
         this.flushLit();
         this.dollar(true);
         continue;
