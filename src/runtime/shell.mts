@@ -19,7 +19,7 @@ import type {
 import { CMD_INVERT_RETURN } from "../ast/nodes.mts";
 import { parse } from "../parser/parser.mts";
 import { parseHeredoc } from "../parser/word.mts";
-import { evalParam, expandArith, expandArrayElems, expandAssign, expandNoSplit, expandParsed, expandWords, expandWordsAssign, splitTaggedFields } from "./expand.mts";
+import { evalParam, expandArith, expandArrayElems, expandAssign, expandNoSplit, expandParsed, expandWord, expandWords, expandWordsAssign, splitTaggedFields } from "./expand.mts";
 import { ArithError, arithWrap, evalArith } from "./arith.mts";
 import { globExpand, globIgnored, globMatch, hasExtglob, hasGlobMeta } from "./glob.mts";
 import {
@@ -738,6 +738,21 @@ export class Shell {
     return evalParam(this, {
       name, special, length, indices: false, indirect: true, names: "", sub: "", op, arg, arg2,
     });
+  }
+  /** `"${arr[@]-word}"` / `+word` / `?` — a set array yields its elements as
+   *  fields, else the default/alt word (one field if quoted, else split) or an
+   *  error. Generated-code bridge mirroring expandWord's list-alternation case. */
+  async altList(name: string, special: boolean, op: string, arg: string, quoted: boolean): Promise<string[]> {
+    const vals = special ? [...this.positional] : this.arrayValues(name);
+    const colon = op[0] === ":";
+    const set = colon ? vals.length > 1 || (vals.length === 1 && vals[0] !== "") : vals.length > 0;
+    const kind = colon ? op[1] : op[0];
+    const word = async (): Promise<string[]> =>
+      quoted ? [await expandNoSplit(this, arg)] : expandWord(this, { text: arg, flags: 0 });
+    if (kind === "-") return set ? vals : word();
+    if (kind === "+") return set ? word() : [];
+    if (set) return vals;
+    this.paramError(name, await expandNoSplit(this, arg));
   }
   /** Resolve a variable reference string (a name, or `name[subscript]`) to its
    *  value — the target of `${!ref}` / a nameref. */

@@ -40,6 +40,8 @@ const ELEM_ASSIGN = /^\[.*\]\+?=/;
 
 const isCaseOp = (op: string): boolean => op === "^" || op === "^^" || op === "," || op === ",,";
 const STR_OPS = new Set(["#", "##", "%", "%%", "/", "//", "/#", "/%"]);
+/** Alternation operators that keep a set `[@]` array as per-element fields. */
+const ALT_OPS = new Set(["-", ":-", "+", ":+", "?", ":?"]);
 
 /* ---- compile-time arithmetic: turn a `$(( ))` / `for (( ))` expression into
    native-JS BigInt code (parsed once here) instead of re-parsing the string at
@@ -468,6 +470,10 @@ class Emitter {
       // "${arr[@]^^}" etc. — case-modify each element, one field each.
       if (isCaseOp(p.p.op) && (p.p.sub === "@" || (p.p.special && p.p.name === "@"))) {
         return `(await (async () => { const p = ${this.patArg(p.p)}; return ${this.listExpr(p.p)}.map((x) => sh.changeCase(x, ${JSON.stringify(p.p.op)}, p)); })())`;
+      }
+      // "${arr[@]-word}" / "+word" / "?" — set array yields its elements.
+      if (ALT_OPS.has(p.p.op) && (p.p.sub === "@" || (p.p.special && p.p.name === "@"))) {
+        return `(await sh.altList(${JSON.stringify(p.p.name)}, ${p.p.special}, ${JSON.stringify(p.p.op)}, ${JSON.stringify(p.p.arg)}, ${p.quoted}))`;
       }
       if (p.p.op !== "") return null;
       if (p.p.special && p.p.name === "@") return "sh.positional";

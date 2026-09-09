@@ -94,6 +94,8 @@ const listValues = (shell: Shell, prm: Param): string[] =>
 
 /** `#`/`##`/`%`/`%%`/`/`/`//`/`/#`/`/%` — prefix/suffix/replace string ops. */
 const STR_OPS = new Set(["#", "##", "%", "%%", "/", "//", "/#", "/%"]);
+/** Alternation operators that keep a set `[@]` array as per-element fields. */
+const ALT_OPS = new Set(["-", ":-", "+", ":+", "?", ":?"]);
 const applyStrOp = (op: string, v: string, pat: string, repl: string, extglob = false): string => {
   switch (op) {
     case "#": return trimPrefix(v, pat, false, extglob);
@@ -282,6 +284,22 @@ export const expandWord = async (shell: Shell, word: Word): Promise<string[]> =>
         const repl = p.op[0] === "/" ? await expandNoSplit(shell, p.arg2) : "";
         const eg = shell.shopts.extglob;
         return listValues(shell, p).map((x) => applyStrOp(p.op, x, pat, repl, eg));
+      }
+      // "${arr[@]-word}" / "${arr[@]+word}" / "${arr[@]?}" — a set array yields
+      // its elements (one field each), else the default/alt word or an error.
+      if (ALT_OPS.has(p.op) && (p.sub === "@" || (p.special && p.name === "@"))) {
+        const vals = p.special ? [...shell.positional] : shell.arrayValues(p.name);
+        const colon = p.op[0] === ":";
+        const set = colon
+          ? vals.length > 1 || (vals.length === 1 && vals[0] !== "")
+          : vals.length > 0;
+        const kind = colon ? p.op[1] : p.op[0];
+        const word = async (): Promise<string[]> =>
+          only.quoted ? [await expandNoSplit(shell, p.arg)] : expandWord(shell, makeWordLocal(p.arg));
+        if (kind === "-") return set ? vals : word();
+        if (kind === "+") return set ? word() : [];
+        if (set) return vals; // "?" / ":?"
+        shell.paramError(p.name, await expandNoSplit(shell, p.arg));
       }
     }
   }
