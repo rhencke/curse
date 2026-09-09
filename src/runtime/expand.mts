@@ -210,7 +210,7 @@ export const evalParam = async (shell: Shell, prm: Param, quoted = false): Promi
     if (prm.name === "@" || prm.name === "*" || prm.name === "#") {
       return String(shell.positional.length);
     }
-    return String(val.length);
+    return String(shell.clen(val));
   }
   switch (prm.op) {
     case "": return val;

@@ -66,6 +66,18 @@ const ASSIGN_BUILTINS = new Set(["declare", "typeset", "local", "export", "reado
 
 const errMsg = (e: unknown): string => (e instanceof Error ? e.message : String(e));
 
+/** Count Unicode code points (not UTF-16 code units) in a JS string — a low
+ *  surrogate is counted with its high half, so an astral char counts once. */
+const cpLen = (s: string): number => {
+  let n = 0;
+  for (let i = 0; i < s.length; i++) {
+    const c = s.charCodeAt(i);
+    if (c >= 0xdc00 && c <= 0xdfff) continue;
+    n++;
+  }
+  return n;
+};
+
 /** A variable's attribute letters in bash's order (a A i l n r t u x), as used
  *  by `declare -p` and the `${var@a}` transform. */
 const attrLetters = (v: Var): string => {
@@ -238,6 +250,24 @@ export class Shell {
    *  variable under `set -u`, or `${x:?}` / `${x?}`). bash uses 1 when running a
    *  script file but 127 for a `-c` command string; the CLI sets this to match. */
   fatalStatus = 1;
+
+  /** Cached string-locale regime: true for a UTF-8 locale (character-oriented
+   *  ${#}/slice/case), false for C/POSIX (byte-oriented). Like bash, this is a
+   *  runtime lens read from LC_ALL/LC_CTYPE/LANG; recomputed lazily and cleared
+   *  when one of those is assigned or unset. */
+  private _localeUtf8: boolean | null = null;
+  localeUtf8(): boolean {
+    if (this._localeUtf8 === null) {
+      const pick = (n: string): string => { const v = this.getVar(n); return v !== undefined && v !== "" ? v : ""; };
+      const l = pick("LC_ALL") || pick("LC_CTYPE") || pick("LANG");
+      this._localeUtf8 = /\.utf-?8$/i.test(l);
+    }
+    return this._localeUtf8;
+  }
+  /** `${#s}` length: code points in a UTF-8 locale, bytes in a C/POSIX one. */
+  clen(s: string): number {
+    return this.localeUtf8() ? cpLen(s) : Buffer.byteLength(s, "utf8");
+  }
 
   /** State of a `set -o` option by long name, for `set -o`, `$SHELLOPTS`, and
    *  `test -o name`. Toggleable options reflect `opts`; the rest are fixed at
@@ -472,6 +502,9 @@ export class Shell {
     const r = this.resolveRef(name); // write through a nameref to its target
     if (r.sub !== null) { this.setElemSync(r.name, r.sub, String(value)); return undefined; }
     name = r.name;
+    // Assigning a locale variable invalidates the cached regime (gate on 'L' so
+    // ordinary assignments pay only a char compare).
+    if (name.charCodeAt(0) === 76 && (name === "LANG" || name === "LC_ALL" || name === "LC_CTYPE")) this._localeUtf8 = null;
     const s = String(value);
     // Single scope-chain walk: mutate the existing box in place, else create in
     // the global scope (was two walks — ownerScope then get).
@@ -852,6 +885,7 @@ export class Shell {
   }
   unsetVar(name: string): void {
     name = this.deref(name); // `unset ref` removes the target, as in bash
+    if (name.charCodeAt(0) === 76 && (name === "LANG" || name === "LC_ALL" || name === "LC_CTYPE")) this._localeUtf8 = null;
     const owner = this.ownerScope(name);
     if (owner === undefined) return;
     if (owner.vars.get(name)!.readonly) {

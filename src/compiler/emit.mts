@@ -387,7 +387,7 @@ class Emitter {
     if (prm.length) {
       if (prm.name === "@" || prm.name === "*" || prm.name === "#") return "String(sh.positional.length)";
       if (prm.sub === "@" || prm.sub === "*") return `String(sh.arrayLen(${J(prm.name)}))`;
-      return `String(${base}).length`;
+      return `String(sh.clen(String(${base})))`;
     }
     switch (prm.op) {
       case "": return prm.special || prm.sub !== "" ? base : `sh.ref(${J(prm.name)})`;
