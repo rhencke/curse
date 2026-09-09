@@ -227,6 +227,26 @@ export class Shell {
 
   /** `set` options. */
   opts = { errexit: false, nounset: false, xtrace: false, pipefail: false, noclobber: false, noglob: false };
+
+  /** State of a `set -o` option by long name, for `set -o`, `$SHELLOPTS`, and
+   *  `test -o name`. Toggleable options reflect `opts`; the rest are fixed at
+   *  their non-interactive defaults. Unknown names return undefined. */
+  setOption(name: string): boolean | undefined {
+    switch (name) {
+      case "errexit": return this.opts.errexit;
+      case "nounset": return this.opts.nounset;
+      case "xtrace": return this.opts.xtrace;
+      case "pipefail": return this.opts.pipefail;
+      case "noclobber": return this.opts.noclobber;
+      case "noglob": return this.opts.noglob;
+      case "braceexpand": case "hashall": return true;
+      case "emacs": case "errtrace": case "functrace": case "histexpand":
+      case "history": case "ignoreeof": case "keyword": case "monitor":
+      case "noexec": case "notify": case "onecmd": case "physical":
+      case "posix": case "verbose": case "vi": return false;
+      default: return undefined;
+    }
+  }
   /** Depth of errexit-suppressed contexts (conditions, `!`, `&&`/`||` non-final). */
   condDepth = 0;
   /** Enclosing loop nesting in the current function scope (0 outside any loop).
@@ -1926,6 +1946,13 @@ export class Shell {
       } else {
         status = await this.dispatch(cmd);
       }
+    } catch (e) {
+      // A fatal arithmetic error during this command's expansion (div by zero,
+      // a bad constant, an invalid base) aborts just this command with status 1
+      // and continues, exactly like bash — it is not a shell-fatal signal.
+      if (!(e instanceof ArithError)) throw e;
+      this.io.err(`${this.name}: ${e.message}\n`);
+      status = this.status = 1;
     } finally {
       if (invert) this.condDepth--;
     }
@@ -1962,6 +1989,15 @@ export class Shell {
       this.inErrTrap = false;
     }
     if (this.opts.errexit) throw new ExitSignal(this.status);
+  }
+
+  /** Called from AOT-generated per-command guards: a fatal arithmetic error
+   *  aborts just that command with status 1 and the program continues, matching
+   *  bash (and the interpreter's catch in `execute`). Non-arith errors re-throw. */
+  arithAbort(e: unknown): void {
+    if (!(e instanceof ArithError)) throw e;
+    this.io.err(`${this.name}: ${e.message}\n`);
+    this.status = 1;
   }
 
   private async dispatch(cmd: Command): Promise<number> {

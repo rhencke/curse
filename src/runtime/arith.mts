@@ -63,7 +63,16 @@ const parseNumber = (tok: string): bigint => {
     return v;
   }
   if (/^0[xX][0-9a-fA-F]+$/.test(tok)) return BigInt(tok);
-  if (/^0[0-7]+$/.test(tok)) return BigInt(parseInt(tok, 8));
+  if (/^0[0-9]+$/.test(tok)) {
+    // A leading zero means octal in arithmetic (unlike test/[, where it stays
+    // decimal). Any 8 or 9 is out of range — bash: "value too great for base".
+    let v = 0n;
+    for (const c of tok) {
+      if (c > "7") throw new ArithError(`${tok}: value too great for base (error token is "${tok}")`);
+      v = v * 8n + BigInt(c.charCodeAt(0) - 48);
+    }
+    return v;
+  }
   if (/^[0-9]+$/.test(tok)) return BigInt(tok);
   throw new ArithError(`${tok}: invalid arithmetic constant`);
 };

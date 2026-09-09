@@ -74,6 +74,17 @@ const toInt = (s: string): number => {
   return Number.isNaN(n) ? 0 : n;
 };
 
+// `test`/`[` numeric comparisons use bash's legal_number (strtoimax base 10),
+// NOT arithmetic: plain signed decimal, surrounding whitespace allowed, leading
+// `0` is still decimal (no octal/hex/base-N), and no expressions. Anything else
+// is an "integer expression expected" error — caught by testImpl as status 2.
+// 64-bit range via BigInt so large operands compare exactly like bash.
+const testInt = (s: string): bigint => {
+  const m = /^\s*([+-]?[0-9]+)\s*$/.exec(s);
+  if (m === null) throw new Error(`${s}: integer expression expected`);
+  return BigInt(m[1]!);
+};
+
 const echo: Builtin = (shell, ...args) => {
   let rest = args;
   let newline = true;
@@ -1410,7 +1421,7 @@ const unaryTest = (op: string, arg: string, shell: Shell): boolean => {
   if (op === "-n") return arg.length > 0;
   if (op === "-t") return false; // stdio is piped in this environment
   if (op === "-v" || op === "-R") return shell.isSet(arg);
-  if (op === "-o") return false; // shell option — unsupported
+  if (op === "-o") return shell.setOption(arg) === true; // `set -o` option is on
   const p = resolve(shell.cwd, arg);
   const st = statOf(p);
   const mode = st?.mode ?? 0;
@@ -1455,12 +1466,12 @@ const binaryTest = (a: string, op: string, b: string): boolean => {
       const x = statOf(a), y = statOf(b);
       return x !== null && y !== null && x.dev === y.dev && x.ino === y.ino;
     }
-    case "-eq": return toInt(a) === toInt(b);
-    case "-ne": return toInt(a) !== toInt(b);
-    case "-lt": return toInt(a) < toInt(b);
-    case "-le": return toInt(a) <= toInt(b);
-    case "-gt": return toInt(a) > toInt(b);
-    case "-ge": return toInt(a) >= toInt(b);
+    case "-eq": return testInt(a) === testInt(b);
+    case "-ne": return testInt(a) !== testInt(b);
+    case "-lt": return testInt(a) < testInt(b);
+    case "-le": return testInt(a) <= testInt(b);
+    case "-gt": return testInt(a) > testInt(b);
+    case "-ge": return testInt(a) >= testInt(b);
     default: throw new Error(`${op}: binary operator expected`);
   }
 };

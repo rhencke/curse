@@ -45,6 +45,9 @@ const isCaseOp = (op: string): boolean => op === "^" || op === "^^" || op === ",
 const STR_OPS = new Set(["#", "##", "%", "%%", "/", "//", "/#", "/%"]);
 /** Alternation operators that keep a set `[@]` array as per-element fields. */
 const ALT_OPS = new Set(["-", ":-", "+", ":+", "?", ":?"]);
+/** `[[ ]]` comparison operators that evaluate their operands arithmetically
+ *  (and so can raise a fatal arithmetic error), unlike the string ops. */
+const ARITH_COND_OPS = new Set(["-eq", "-ne", "-lt", "-le", "-gt", "-ge"]);
 
 /* ---- compile-time arithmetic: turn a `$(( ))` / `for (( ))` expression into
    native-JS BigInt code (parsed once here) instead of re-parsing the string at
@@ -547,6 +550,58 @@ class Emitter {
     }
   }
 
+  /** Whether this command node may raise a fatal arithmetic error (div by zero,
+   *  a bad constant/base) while expanding its own words — the emitter then wraps
+   *  it in a per-command guard so the error aborts just this command (status 1)
+   *  and the program continues, exactly like bash and the interpreter. Only leaf
+   *  nodes are inspected: structural nodes let their children guard themselves,
+   *  and `$( )` / `<( )` are nested commands that guard themselves too. */
+  private throwsArith(cmd: Command): boolean {
+    switch (cmd.type) {
+      case "arith": case "arith_for": return true;
+      case "cond": return this.condThrowsArith(cmd.expr);
+      case "array_assign": return cmd.elems.some((w) => this.wordThrowsArith(w.text));
+      case "simple": {
+        for (const w of cmd.words) if (this.wordThrowsArith(w.text)) return true;
+        if (cmd.arrayArgs !== undefined) {
+          for (const aa of cmd.arrayArgs) {
+            for (const w of aa.elems) if (this.wordThrowsArith(w.text)) return true;
+          }
+        }
+        return false;
+      }
+      default: return false;
+    }
+  }
+
+  private wordThrowsArith(text: string): boolean {
+    for (const p of parseWord(text).parts) {
+      if (p.k === "arith") return true; // $(( )) / $[ ]
+      if (p.k === "param") {
+        if (p.p.op === ":") return true; // ${x:off:len} — arithmetic offset/length
+        if (p.p.sub !== "" && p.p.sub !== "@" && p.p.sub !== "*") return true; // array subscript
+      }
+    }
+    return false;
+  }
+
+  private condThrowsArith(e: CondExpr): boolean {
+    switch (e.k) {
+      case "and": case "or": return this.condThrowsArith(e.l) || this.condThrowsArith(e.r);
+      case "not": return this.condThrowsArith(e.e);
+      case "binary": return ARITH_COND_OPS.has(e.op);
+      default: return false;
+    }
+  }
+
+  /** Wrap a leaf command's code so a fatal arithmetic error aborts just it. The
+   *  core keeps its own indentation (re-indenting would corrupt the literal
+   *  newlines inside a multi-line heredoc template). */
+  private arithGuard(core: string, ind: number): string {
+    const i = pad(ind);
+    return `${i}try {\n${core}\n${i}} catch (__e) {\n${pad(ind + 1)}sh.arithAbort(__e);\n${i}}`;
+  }
+
   command(cmd: Command, ind: number): string {
     const reds = cmd.redirects;
     let core: string;
@@ -564,6 +619,12 @@ class Emitter {
       core = `${i}await sh.withRedirects([${rd}], async () => {\n${this.base(cmd, ind + 1)}\n${i}});`;
     } else {
       core = this.base(cmd, ind);
+    }
+    // A fatal arithmetic error in this command's own expansion (or a redirect
+    // target) aborts just this command, like bash — wrap the leaf in a guard.
+    if (this.throwsArith(cmd) ||
+        (reds !== undefined && reds.some((r) => this.wordThrowsArith(r.target.text)))) {
+      core = this.arithGuard(core, ind);
     }
     if (cmd.flags !== undefined && (cmd.flags & CMD_INVERT_RETURN) !== 0) {
       const i = pad(ind);
