@@ -1,7 +1,7 @@
-# repeated function calls with locals and params
-add() { local a=$1 b=$2; echo $((a + b)); }
-total=0
-for ((i=0; i<100000; i++)); do
-  total=$(add "$total" "$i")
+# a function called in a tight loop (1M calls)
+add() { sum=$((sum + $1)); }
+sum=0
+for ((i=1; i<=1000000; i++)); do
+  add "$i"
 done
-echo "$total"
+echo "$sum"
