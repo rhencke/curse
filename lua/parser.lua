@@ -338,7 +338,6 @@ function M.parse(src)
       else
         local w = word()
         if w == "" then break end
-        if w == "done" or w == "do" then i = i - #w; break end
         words[#words + 1] = parse_word(unquote(w))
       end
     end

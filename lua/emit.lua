@@ -102,8 +102,60 @@ local function numeric_word(w)
   return nil
 end
 
--- Which vars can be int64 locals: assigned somewhere, and every assignment is
--- arithmetic or a numeric literal (reads never disqualify).
+-- collect every variable NAME referenced in an arith node / word / stmt list.
+local function collect_arith(e, set)
+  if type(e) ~= "table" then return end
+  if e.k == "var" or e.k == "asgn" or e.k == "post" or e.k == "pre" then set[e.name] = true end
+  collect_arith(e.e, set); collect_arith(e.l, set); collect_arith(e.r, set)
+end
+local function collect_word(w, set)
+  for _, p in ipairs(w.parts) do
+    if p.var then set[p.var] = true
+    elseif p.arith then collect_arith(require("parser").arith(p.arith), set) end
+  end
+end
+local function collect_names(stmts, set)
+  for _, st in ipairs(stmts) do
+    if st.t == "assign" then
+      set[st.name] = true
+      if st.arith then collect_arith(st.arith, set) elseif st.rhs then collect_word(st.rhs, set) end
+    elseif st.t == "simple" then
+      for j = 2, #st.words do collect_word(st.words[j], set) end
+      local cmd = st.words[1].parts[1] and st.words[1].parts[1].lit
+      if cmd == "local" then
+        for j = 2, #st.words do
+          local p1 = st.words[j].parts[1]
+          local nm = p1 and p1.lit and p1.lit:match("^([%a_][%w_]*)")
+          if nm then set[nm] = true end
+        end
+      end
+    elseif st.t == "forc" or st.t == "whilec" then
+      collect_arith(st.init, set); collect_arith(st.cond, set); collect_arith(st.step, set)
+      collect_names(st.body, set)
+    elseif st.t == "forin" then
+      set[st.name] = true
+      for _, w in ipairs(st.words) do collect_word(w, set) end
+      collect_names(st.body, set)
+    elseif st.t == "if" then
+      for _, cl in ipairs(st.clauses) do collect_arith(cl.cond, set); collect_names(cl.body, set) end
+    elseif st.t == "funcdef" then
+      collect_names(st.body, set)
+    end
+  end
+end
+-- every var any function body touches (lifting these at the top level would go
+-- stale vs the function's sh-direct access).
+local function collect_funcvars(stmts, set)
+  for _, st in ipairs(stmts) do
+    if st.t == "funcdef" then collect_names(st.body, set)
+    elseif st.t == "forc" or st.t == "whilec" or st.t == "forin" then collect_funcvars(st.body, set)
+    elseif st.t == "if" then for _, cl in ipairs(st.clauses) do collect_funcvars(cl.body, set) end end
+  end
+end
+
+-- Which TOP-LEVEL vars can be int64 locals: assigned outside any function, every
+-- assignment arithmetic or a numeric literal (reads never disqualify), and NOT
+-- touched by any function.
 local function analyze_lift(ast)
   local assigned, disq = {}, {}
   local function scan_stmts(stmts)
@@ -121,12 +173,14 @@ local function analyze_lift(ast)
         scan_stmts(st.body)
       elseif st.t == "if" then
         for _, cl in ipairs(st.clauses) do scan_stmts(cl.body) end
-      end
+      end -- funcdef bodies are intentionally not scanned here
     end
   end
   scan_stmts(ast.stmts)
+  local funcvars = {}
+  collect_funcvars(ast.stmts, funcvars)
   local lifted = {}
-  for n in pairs(assigned) do if not disq[n] then lifted[n] = true end end
+  for n in pairs(assigned) do if not disq[n] and not funcvars[n] then lifted[n] = true end end
   return lifted
 end
 
@@ -276,11 +330,9 @@ end
 function M.emit(ast)
   local funcnames = {}
   for _, st in ipairs(ast.stmts) do if st.t == "funcdef" then funcnames[st.name] = true end end
-  local hasfn = next(funcnames) ~= nil
-  -- With functions present keep the top level sh-direct too: a lifted global
-  -- would go stale inside a function's sh-direct body. (Refinable: lift only
-  -- globals no function touches.)
-  local lifted = hasfn and {} or analyze_lift(ast)
+  -- Lift top-level arith vars; analyze_lift already excludes any var a function
+  -- touches (which would go stale vs the function's sh-direct access).
+  local lifted = analyze_lift(ast)
   local liftvars = {}
   for n in pairs(lifted) do liftvars[#liftvars + 1] = n end
   table.sort(liftvars)

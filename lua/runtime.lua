@@ -37,13 +37,13 @@ function Shell:paramsJoin(sep) return table.concat(self.params, sep or " ") end
 
 -- Enter/leave a function call: swap positional params and open a `local` frame.
 function Shell:pushCall(params)
-  self.callstack[#self.callstack + 1] = { saved = {}, params = self.params }
+  self.callstack[#self.callstack + 1] = { params = self.params } -- `saved` lazily
   self.params = params or {}
   self.calldepth = self.calldepth + 1
 end
 function Shell:popCall()
   local f = self.callstack[#self.callstack]; self.callstack[#self.callstack] = nil
-  for name, old in pairs(f.saved) do self.vars[name] = old or nil end -- false => was absent
+  if f.saved then for name, old in pairs(f.saved) do self.vars[name] = old or nil end end -- false => was absent
   self.params = f.params
   self.calldepth = self.calldepth - 1
 end
@@ -51,7 +51,10 @@ end
 -- return). Records the prior box once so it can be put back.
 function Shell:localVar(name)
   local f = self.callstack[#self.callstack]
-  if f and f.saved[name] == nil then f.saved[name] = self.vars[name] or false end
+  if f then
+    if not f.saved then f.saved = {} end
+    if f.saved[name] == nil then f.saved[name] = self.vars[name] or false end
+  end
   self.vars[name] = {}
 end
 
