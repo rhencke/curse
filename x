@@ -15,9 +15,16 @@ here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 tty_flags=()
 if [ -t 0 ] && [ -t 1 ]; then tty_flags=(-it); fi
 
+# Persist Node's module compile cache across runs: type-stripping + compiling the
+# .mts CLI is ~90ms/spawn, and the test runners spawn `node` per case (thousands),
+# so caching the compiled modules on disk cuts a cold `curse -c` ~112ms -> ~41ms.
+mkdir -p "$here/.ccache"
+
 exec docker run --rm "${tty_flags[@]}" \
   -u "$(id -u):$(id -g)" \
   -e HOME=/tmp \
+  -e NODE_COMPILE_CACHE=/ccache \
   -v "$here":/work \
+  -v "$here/.ccache":/ccache \
   -w /work \
   "$IMAGE" "$@"
