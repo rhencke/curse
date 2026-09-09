@@ -137,8 +137,7 @@ async function main(): Promise<void> {
   }
   if (argv[0] === "transpile") {
     const file = argv[1];
-    const compile = (src: string): string =>
-      emit(parse(src), { runtimeSpecifier, lineno: /\bLINENO\b/.test(src) });
+    const compile = (src: string): string => emit(parse(src), { runtimeSpecifier });
     const code = file !== undefined && file !== "-" && !argv.includes("--no-cache")
       ? transpileFile(file, runtimeSpecifier, compile)
       : compile(readSource(file));

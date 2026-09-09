@@ -66,6 +66,34 @@ const ASSIGN_BUILTINS = new Set(["declare", "typeset", "local", "export", "reado
 
 const errMsg = (e: unknown): string => (e instanceof Error ? e.message : String(e));
 
+/** Per-module `$LINENO` maps: a generated-module URL → its sorted
+ *  [jsLine, shLine] pairs (sparse, at command boundaries). Populated at module
+ *  load by the emitted `sh.mapLines(import.meta.url, …)` call and consulted
+ *  lazily — only when `$LINENO` is actually read. */
+const lineMaps = new Map<string, ReadonlyArray<readonly [number, number]>>();
+
+/** Resolve `$LINENO` from the current call stack: find the innermost frame that
+ *  belongs to a mapped module and translate its JS line to the source line.
+ *  Returns undefined when no mapped frame is on the stack (e.g. the interpreter,
+ *  which uses `sh.line` instead). */
+const linenoFromStack = (): number | undefined => {
+  if (lineMaps.size === 0) return undefined;
+  const stack = new Error().stack;
+  if (stack === undefined) return undefined;
+  for (const frame of stack.split("\n")) {
+    const m = /(?:\(| at )(\S+?):(\d+):\d+\)?\s*$/.exec(frame);
+    if (m === null) continue;
+    const pairs = lineMaps.get(m[1]!);
+    if (pairs === undefined) continue;
+    const js = Number(m[2]);
+    // Largest jsLine <= the frame's line (the command that line belongs to).
+    let sh = pairs.length > 0 ? pairs[0]![1] : 0;
+    for (const [j, s] of pairs) { if (j > js) break; sh = s; }
+    return sh;
+  }
+  return undefined;
+};
+
 /** Count Unicode code points (not UTF-16 code units) in a JS string — a low
  *  surrogate is counted with its high half, so an astral char counts once. */
 const cpLen = (s: string): number => {
@@ -319,9 +347,14 @@ export class Shell {
   private scope: Scope = this.globalScope;
   /** For `$SECONDS`: shell start time. */
   private startMs = Date.now();
-  /** Current source line, for `$LINENO`: the interpreter sets it before each
-   *  command, and AOT code injects `sh.line = N` when the program uses LINENO. */
+  /** Current source line, for `$LINENO` in the interpreter (set before each
+   *  command). AOT resolves it lazily from the stack instead — see mapLines. */
   line = 0;
+  /** Called once at load by an emitted module to register its generated-line →
+   *  source-line map for lazy `$LINENO` resolution (see linenoFromStack). */
+  mapLines(url: string, pairs: ReadonlyArray<readonly [number, number]>): void {
+    lineMaps.set(url, pairs);
+  }
   private functions: Record<string, unknown> = Object.create(builtins) as Record<string, unknown>;
 
   /** `sh.env.x` reads/writes variables over the dynamic scope chain. */
@@ -383,7 +416,10 @@ export class Shell {
   private dynamicSpecial(name: string): string | undefined {
     if (name === "RANDOM") return String(Math.floor(Math.random() * 32768));
     if (name === "SECONDS") return String(Math.floor((Date.now() - this.startMs) / 1000));
-    if (name === "LINENO") return String(this.line);
+    // AOT resolves $LINENO lazily from the call stack via the module's line map
+    // (registered by `sh.mapLines`); the interpreter falls back to `this.line`,
+    // which it sets before each command (no generated frame appears in its stack).
+    if (name === "LINENO") return String(linenoFromStack() ?? this.line);
     return undefined;
   }
 
@@ -2025,7 +2061,7 @@ export class Shell {
       ]);
       const rt = new URL("./shell.mts", import.meta.url).href;
       const modPath = cachedModulePath(
-        path, rt, (src) => emit(parse(src), { runtimeSpecifier: rt, fragment: true, lineno: /\bLINENO\b/.test(src) }), "frag",
+        path, rt, (src) => emit(parse(src), { runtimeSpecifier: rt, fragment: true }), "frag",
       );
       if (modPath !== null) {
         const mod = await import(pathToFileURL(modPath).href) as { default: (sh: Shell) => Promise<number> };
