@@ -813,6 +813,12 @@ export class Shell {
       throw new ExitSignal(this.fatalStatus);
     }
   }
+  /** Report an unbound variable and exit (the `set -u` fatal path); used by the
+   *  arithmetic evaluator, which reads variables outside the `$`-expansion path. */
+  unbound(name: string): never {
+    this.io.err(`${this.name}: ${name}: unbound variable\n`);
+    throw new ExitSignal(this.fatalStatus);
+  }
   /** Read a plain `$name` reference, honoring `set -u` (used by generated code). */
   ref(name: string): string {
     const r = this.resolveRef(name);
@@ -1016,6 +1022,10 @@ export class Shell {
     try {
       this.status = (await this.arithValue(expr)) !== 0n ? 0 : 1;
     } catch (e) {
+      // A control-flow signal (exit — e.g. an unbound var under `set -u` — or
+      // return/break/continue) must propagate; only a genuine arithmetic error
+      // is reported and mapped to status 1.
+      if (e instanceof ExitSignal || e instanceof ReturnSignal || e instanceof LoopSignal) throw e;
       this.io.err(`${this.name}: ((: ${expr}: ${errMsg(e)}\n`);
       this.status = 1;
     }
@@ -1037,9 +1047,9 @@ export class Shell {
    *  as arithmetic; empty/unset is 0). */
   aget(name: string): bigint {
     const v = this.rawLookup(name);
-    if (v === undefined) return 0n;
+    if (v === undefined) { if (this.opts.nounset) this.unbound(name); return 0n; }
     if (v.ref && v.value !== "") return this.agetSlow(name); // nameref → full path
-    if (v.unset) return 0n;
+    if (v.unset) { if (this.opts.nounset) this.unbound(name); return 0n; }
     const c = v.intCache(); // fresh int, or a remembered parse: no re-parse
     if (c !== null) return c;
     const s = v.scalar();
@@ -1051,7 +1061,8 @@ export class Shell {
   /** Nameref / element-nameref arithmetic read (rare; no scalar cache). */
   private agetSlow(name: string): bigint {
     const raw = this.getVar(name);
-    return raw === undefined || raw.trim() === "" ? 0n : this.parseArithInt(raw);
+    if (raw === undefined) { if (this.opts.nounset) this.unbound(name); return 0n; }
+    return raw.trim() === "" ? 0n : this.parseArithInt(raw);
   }
   private parseArithInt(s: string): bigint {
     const t = s.trim();
@@ -1100,6 +1111,7 @@ export class Shell {
     // one scope lookup, then mutate the box in place (lazy BigInt, no string).
     const v = this.scopeLookup(name);
     if (v !== undefined && this.plainInt(v)) {
+      if (v.unset && this.opts.nounset) this.unbound(name); // unset placeholder under set -u
       const c = v.intCache();
       const cur = c !== null ? c : v.value === "" ? 0n : this.parseArithInt(v.value);
       const nv = arithWrap(cur + delta);

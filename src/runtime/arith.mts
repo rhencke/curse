@@ -311,7 +311,13 @@ const readVar = (shell: Shell, name: string, index: Node | undefined, rawIndex: 
   const raw = index === undefined
     ? shell.getVar(name)
     : shell.elemValueSync(name, subKey(shell, name, index, rawIndex, depth));
-  if (raw === undefined || raw.trim() === "") return 0n;
+  // Referencing an unset variable/element under `set -u` is a fatal error, even
+  // in arithmetic (which reads variables outside the normal expansion path).
+  if (raw === undefined) {
+    if (shell.opts.nounset) shell.unbound(index === undefined ? name : `${name}[${rawIndex ?? ""}]`);
+    return 0n;
+  }
+  if (raw.trim() === "") return 0n;
   return evalArith(shell, raw, depth + 1);
 };
 
