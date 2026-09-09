@@ -611,6 +611,14 @@ class Emitter {
     // emit() scans into a line map and then strips (same line, so line numbers
     // survive), leaving clean code — $LINENO is resolved lazily from the map.
     const lnMark = cmd.line !== undefined ? `/*@${cmd.line}@*/` : "";
+    // DEBUG trap: fire before each simple/leaf command (guarded at runtime on
+    // whether a DEBUG trap is actually set). Only emitted when the program uses
+    // set/trap/eval/source, so trap-free code pays nothing.
+    const dbg =
+      this.guards && cmd.line !== undefined &&
+      (cmd.type === "simple" || cmd.type === "arith" || cmd.type === "cond" || cmd.type === "array_assign")
+        ? `${pad(ind)}await sh.debugTrap(${cmd.line});\n`
+        : "";
     const reds = cmd.redirects;
     let core: string;
     if (reds !== undefined && reds.length > 0) {
@@ -637,11 +645,11 @@ class Emitter {
     if (cmd.flags !== undefined && (cmd.flags & CMD_INVERT_RETURN) !== 0) {
       const i = pad(ind);
       if (this.guards) {
-        return lnMark + `${i}{\n${pad(ind + 1)}using _ = sh.suppress();\n${bump(core)}\n${i}}\n${i}sh.invert();`;
+        return lnMark + dbg + `${i}{\n${pad(ind + 1)}using _ = sh.suppress();\n${bump(core)}\n${i}}\n${i}sh.invert();`;
       }
-      return lnMark + core + "\n" + `${i}sh.invert();`;
+      return lnMark + dbg + core + "\n" + `${i}sh.invert();`;
     }
-    return lnMark + core;
+    return lnMark + dbg + core;
   }
 
   /** Emit a statement for an assignment word (name=, name+=, name[i]=, …). */

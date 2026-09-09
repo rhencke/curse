@@ -121,6 +121,11 @@ const attrLetters = (v: Var): string => {
   return f;
 };
 
+/** Command types before which the DEBUG trap fires — the "simple" leaf commands.
+ *  Compound wrappers (if/while/for/…) don't fire it themselves; they recurse to
+ *  their own leaf commands, which do. */
+const LEAF_TYPES = new Set(["simple", "arith", "cond", "array_assign"]);
+
 /** Temp files backing process substitutions, unlinked when the process exits. */
 let procSubSeq = 0;
 const procSubFiles: string[] = [];
@@ -284,6 +289,7 @@ export class Shell {
   traps: Record<string, string> = Object.create(null) as Record<string, string>;
   private ranExitTrap = false;
   private inErrTrap = false;
+  private inDebugTrap = false;
 
   /** `shopt` toggles (all off by default, as in a non-interactive shell). */
   shopts: Record<string, boolean> = {
@@ -2203,6 +2209,9 @@ export class Shell {
 
   async execute(cmd: Command): Promise<number> {
     if (cmd.line !== undefined) this.line = cmd.line; // $LINENO
+    // DEBUG trap: fires before each simple/leaf command (not the compound
+    // wrappers, which recurse to their leaf commands here anyway).
+    if (this.traps["DEBUG"] !== undefined && LEAF_TYPES.has(cmd.type)) await this.debugTrap();
     const invert = cmd.flags !== undefined && (cmd.flags & CMD_INVERT_RETURN) !== 0;
     if (invert) this.condDepth++; // `! cmd` is exempt from errexit
     let status: number;
@@ -2263,6 +2272,34 @@ export class Shell {
       this.inErrTrap = false;
     }
     if (this.opts.errexit) throw new ExitSignal(this.status);
+  }
+
+  /** The DEBUG trap runs before each simple/leaf command, with $LINENO set to
+   *  that command's line. It doesn't recurse into itself, isn't inherited by
+   *  functions unless `set -o functrace`, and — crucially — leaves $? untouched
+   *  (its own exit status is discarded). `line` is the trapped command's line
+   *  (the AOT path passes it explicitly; interp reads the already-set sh.line).
+   *  Called from both the interpreter (execute) and generated code. */
+  async debugTrap(line?: number): Promise<void> {
+    const h = this.traps["DEBUG"];
+    if (h === undefined || h === "" || this.inDebugTrap) return;
+    if (this.funcStack.length > 0) return; // not inherited by functions (functrace unsupported)
+    const savedStatus = this.status;
+    const savedLine = this.line;
+    const at = line ?? savedLine;
+    this.inDebugTrap = true;
+    try {
+      const cmd = parse(h);
+      if (cmd !== null) { cmd.line = at; await this.execute(cmd); }
+    } catch (e) {
+      if (e instanceof ExitSignal || e instanceof ReturnSignal || e instanceof LoopSignal) throw e;
+      // a parse error in the handler is reported, not fatal
+      this.io.err(`${this.name}: ${errMsg(e)}\n`);
+    } finally {
+      this.inDebugTrap = false;
+      this.status = savedStatus; // DEBUG ignores $?
+      this.line = savedLine;
+    }
   }
 
   /** Called from AOT-generated per-command guards: a fatal arithmetic error
