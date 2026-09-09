@@ -703,7 +703,10 @@ class Emitter {
       const i = pad(ind);
       return `${i}sh.beginAssign();\n` +
         assignWords.map((w) => this.assignStmt(w, ind)).join("\n") +
-        `\n${i}sh.endAssign();`;
+        `\n${i}sh.endAssign();` +
+        // A failing pure assignment (readonly target, or a failed RHS command
+        // sub) fires the ERR trap and errexit like any other command.
+        (this.guards ? `\n${i}await sh.afterCommand();` : "");
     }
 
     // `declare -a arr=(...)` / `local m=(...)` array-literal arguments.

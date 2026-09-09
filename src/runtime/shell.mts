@@ -2377,6 +2377,12 @@ export class Shell {
       this.beginAssign();
       for (const wt of assignWords) await this.applyAssign(wt);
       this.endAssign();
+      // A pure assignment that ends non-zero (a readonly target, or a failed
+      // command sub in the RHS) still fires the ERR trap and errexit, like any
+      // other command. (bash's extra quirk of aborting the rest of a `;`-list
+      // after a readonly-assignment error, even without errexit, is not
+      // replicated — osh omits it too as unintentional.)
+      await this.afterCommand();
       return this.status;
     }
     const subBefore = this.subCount;
