@@ -17,7 +17,7 @@ import { parse, ParseError } from "../parser/parser.mts";
 import { CondError } from "../parser/cond.mts";
 import { LexError } from "../parser/lexer.mts";
 import { emit } from "../compiler/emit.mts";
-import { cachedTranspile } from "./cache.mts";
+import { transpileFile } from "./cache.mts";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const runtimeSpecifier = pathToFileURL(join(here, "../runtime/shell.mts")).href;
@@ -85,13 +85,12 @@ const main = async (): Promise<void> => {
 
   if (sub === "transpile") {
     const file = args[1];
-    const src = readSource(file);
-    // Reuse a cached transpile of identical source (git-style content hash),
-    // unless --no-cache; stdin ("-") is not cached (no stable identity).
-    const doEmit = (): string => emit(parse(src), { runtimeSpecifier });
-    const code = args.includes("--no-cache") || file === "-"
-      ? doEmit()
-      : cachedTranspile(src, runtimeSpecifier, doEmit);
+    const compile = (src: string): string => emit(parse(src), { runtimeSpecifier });
+    // A real file goes through the stat-indexed cache (skips reading/hashing an
+    // unchanged file); stdin ("-") and --no-cache always transpile fresh.
+    const code = file !== undefined && file !== "-" && !args.includes("--no-cache")
+      ? transpileFile(file, runtimeSpecifier, compile)
+      : compile(readSource(file));
     const oi = args.indexOf("-o");
     if (oi >= 0 && args[oi + 1] !== undefined) {
       writeFileSync(args[oi + 1]!, code);
