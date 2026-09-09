@@ -34,7 +34,7 @@ type OptSet = Array<[string, boolean]>;
 const here = dirname(fileURLToPath(import.meta.url));
 const runtimeSpecifier = pathToFileURL(join(here, "../runtime/shell.mts")).href;
 
-const usage = (): void => {
+function usage(): void {
   process.stderr.write(
     "usage:\n" +
       "  curse run <file>                  run a bash script\n" +
@@ -43,14 +43,14 @@ const usage = (): void => {
       "  curse parse <file>                print the AST as JSON\n" +
       "  curse <file>                      same as: curse run <file>\n",
   );
-};
+}
 
-const die = (msg: string): never => {
+function die(msg: string): never {
   process.stderr.write(`curse: ${msg}\n`);
   process.exit(2);
-};
+}
 
-const readSource = (file: string | undefined): string => {
+function readSource(file: string | undefined): string {
   if (file === undefined) die("missing file argument");
   try {
     // "-" means standard input (fd 0), matching the usual CLI convention.
@@ -58,15 +58,15 @@ const readSource = (file: string | undefined): string => {
   } catch {
     return die(`${file}: cannot read file`);
   }
-};
+}
 
-const applyOpts = (sh: Shell, opts: OptSet): void => {
+function applyOpts(sh: Shell, opts: OptSet): void {
   for (const [name, on] of opts) {
     if (LONG_OPTS.has(name)) (sh.opts as Record<string, boolean>)[name] = on;
   }
-};
+}
 
-const run = async (src: string, name: string, positional: string[] = [], opts: OptSet = []): Promise<void> => {
+async function run(src: string, name: string, positional: string[] = [], opts: OptSet = []): Promise<void> {
   const sh = new Shell();
   sh.name = name;
   sh.positional = positional;
@@ -74,10 +74,10 @@ const run = async (src: string, name: string, positional: string[] = [], opts: O
   sh.status = await sh.runString(src);
   await sh.runExitTrap();
   process.exitCode = sh.status;
-};
+}
 
 /** A `[[ ]]` / quote / heredoc that isn't closed yet — the REPL reads more. */
-const needMore = (src: string): boolean => {
+function needMore(src: string): boolean {
   try {
     parse(src);
     return false;
@@ -85,11 +85,11 @@ const needMore = (src: string): boolean => {
     const m = e instanceof Error ? e.message : "";
     return /unterminated|<eof>|unexpected end/.test(m);
   }
-};
+}
 
 /** Interactive read-eval-print loop (node:readline v1): one persistent Shell,
  *  multi-line continuation via re-parse, prompts on stderr like bash. */
-const repl = async (opts: OptSet, positional: string[]): Promise<void> => {
+async function repl(opts: OptSet, positional: string[]): Promise<void> {
   const sh = new Shell();
   applyOpts(sh, opts);
   sh.positional = positional;
@@ -116,7 +116,7 @@ const repl = async (opts: OptSet, positional: string[]): Promise<void> => {
   if (tty) process.stderr.write("\n");
   await sh.runExitTrap();
   process.exit(sh.status);
-};
+}
 
 async function main(): Promise<void> {
   const argv = process.argv.slice(2);
