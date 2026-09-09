@@ -491,7 +491,7 @@ export class Shell {
   /** Follow a nameref (declare -n) chain. The chain ends at a plain name, or at
    *  a `base[subscript]` target (a nameref to an array element), reported via
    *  `sub`. */
-  private resolveRef(name: string): { name: string; sub: string | null } {
+  private resolveRef(name: string): { name: string; sub: string | null; circular?: boolean } {
     // Fast path: the overwhelmingly common case is a plain (non-nameref)
     // variable — one lookup, no cycle-guard Set allocation.
     const first = this.rawLookup(name);
@@ -501,7 +501,13 @@ export class Shell {
     let cur = name;
     for (;;) {
       const v = this.rawLookup(cur);
-      if (v && v.ref && v.value !== "" && !seen.has(cur)) {
+      if (v && v.ref && v.value !== "") {
+        if (seen.has(cur)) {
+          // A circular chain (ref1→ref2→ref1). bash warns and treats the ref as
+          // unset (read → empty, write → rejected with status 1).
+          this.io.err(`${this.name}: warning: ${name}: circular name reference\n`);
+          return { name, sub: null, circular: true };
+        }
         seen.add(cur);
         const m = /^([A-Za-z_][A-Za-z0-9_]*)\[([\s\S]*)\]$/.exec(v.value);
         if (m) return { name: m[1]!, sub: m[2]! };
@@ -561,7 +567,9 @@ export class Shell {
   }
 
   private lookup(name: string): Var | undefined {
-    return this.rawLookup(this.deref(name));
+    const r = this.resolveRef(name);
+    if (r.circular) return undefined; // a circular nameref reads as unset
+    return this.rawLookup(r.name);
   }
 
   private ownerScope(name: string): Scope | undefined {
@@ -584,6 +592,9 @@ export class Shell {
       return value;
     }
     const r = this.resolveRef(name); // write through a nameref to its target
+    // A write through a circular nameref is rejected (bash warned in resolveRef);
+    // reuse the assignment-rejected flag so the command's status becomes 1.
+    if (r.circular) { this.readonlyHit = true; return undefined; }
     if (r.sub !== null) { this.setElemSync(r.name, r.sub, String(value)); return undefined; }
     name = r.name;
     // Assigning a locale variable invalidates the cached regime (gate on 'L' so
@@ -644,6 +655,7 @@ export class Shell {
 
   getVar(name: string): string | undefined {
     const r = this.resolveRef(name);
+    if (r.circular) return undefined; // a circular nameref reads as unset
     if (r.sub !== null) return this.elemValueSync(r.name, r.sub);
     const v = this.rawLookup(r.name);
     if (v === undefined || v.unset) return undefined;
@@ -983,7 +995,9 @@ export class Shell {
   /** Read a plain `$name` reference, honoring `set -u` (used by generated code). */
   ref(name: string): string {
     const r = this.resolveRef(name);
-    const val = r.sub !== null
+    const val = r.circular
+      ? undefined // a circular nameref reads as unset (resolveRef warned)
+      : r.sub !== null
       ? this.elemValueSync(r.name, r.sub)
       : (() => {
           const v = this.rawLookup(r.name);
