@@ -25,4 +25,10 @@ grab wait-for-it.sh       https://raw.githubusercontent.com/vishnubob/wait-for-i
 grab git-completion.bash  https://raw.githubusercontent.com/git/git/v2.45.0/contrib/completion/git-completion.bash
 grab starship-install.sh  https://raw.githubusercontent.com/starship/starship/v1.20.1/install/install.sh
 grab shunit2              https://raw.githubusercontent.com/kward/shunit2/v2.1.8/shunit2
+grab get-docker.sh        https://raw.githubusercontent.com/docker/docker-install/master/install.sh
+grab n.sh                 https://raw.githubusercontent.com/tj/n/v10.1.0/bin/n
+grab deno-install.sh      https://raw.githubusercontent.com/denoland/deno_install/master/install.sh
+grab pyenv-installer.sh   https://raw.githubusercontent.com/pyenv/pyenv-installer/master/bin/pyenv-installer
+grab homebrew-install.sh  https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh
+grab bats-core.sh         https://raw.githubusercontent.com/bats-core/bats-core/v1.11.0/libexec/bats-core/bats
 echo "fetched into $dir"

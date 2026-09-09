@@ -32,6 +32,7 @@ run_one() {  # $1=cname $2=out-prefix $3..=argv
   docker run --name "$cname" \
     --memory="$MEM" --memory-swap="$MEM" --cpus="$CPUS" --pids-limit=512 \
     -u "$(id -u):$(id -g)" -e HOME=/tmp -e NODE_COMPILE_CACHE=/ccache \
+    -e CURSE_CACHE=/ccache/curse-tc \
     -v "$here":/work:ro -v "$here/.ccache":/ccache \
     -v "$SCRIPT_HOST":/script.sh:ro -w /tmp \
     "$IMAGE" timeout "$TIMEOUT" "$@" >"$pfx.out" 2>"$pfx.err"
