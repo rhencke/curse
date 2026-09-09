@@ -68,7 +68,7 @@ local function expand_word(sh, w)
     elseif p.var then buf[#buf + 1] = sh:get(p.var)
     elseif p.param then buf[#buf + 1] = sh:param(p.param)
     elseif p.special then
-      if p.special == "#" then buf[#buf + 1] = tostring(sh:nparams())
+      if p.special == "#" then buf[#buf + 1] = tostring(sh.nparams)
       elseif p.special == "@" or p.special == "*" then buf[#buf + 1] = sh:paramsJoin(" ")
       elseif p.special == "?" then buf[#buf + 1] = tostring(sh.status) end
     elseif p.arith then buf[#buf + 1] = rt.i64_to_str(eval(sh, require("parser").arith(p.arith))) end
@@ -101,9 +101,11 @@ local function exec_stmt(sh, st, hook)
       for j = 2, #args do sh:localAssign(args[j]) end
       sh.status = 0
     elseif sh.functions[cmd] then
-      sh:pushCall({ unpack(args, 2) })
+      sh.calldepth = sh.calldepth + 1 -- OSR gate: no handoff inside a call
+      sh:pushCall(unpack(args, 2))
       local ok, err = pcall(exec_list, sh, sh.functions[cmd], hook, false)
       sh:popCall()
+      sh.calldepth = sh.calldepth - 1
       if not ok then
         if type(err) == "table" and err.__curse_return then sh.status = err.__curse_return
         else error(err) end

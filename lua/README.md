@@ -53,9 +53,13 @@ safepoints (calldepth 0), so a hot loop calling a function switches at the loop
 stays on the interpreter (still faster than bash). Function bodies emit
 sh-direct; a top-level var lifts unless a function touches it. Calls are slimmed
 by need: a function using neither positional params nor `local` is called bare
-(`fn_x(sh)`, zero allocation); one using only params swaps `$@` via a reused
-stack (no per-call frame); only `local` needs the full frame. Compiled calls
-skip the `calldepth` OSR-gate bookkeeping (no OSR in compiled code).
+(`fn_x(sh)`); one using only params swaps `$@`; only `local` needs the full
+frame. Positional args go into per-depth POOL arrays (reused across calls, args
+passed as varargs) so there is no per-call table allocation, and the interpreter
+owns the `calldepth` OSR-gate (compiled code has no OSR). Note: pooling barely
+moved the function-call micro-benchmark — LuaJIT already sinks the short-lived
+args table; the real per-call cost is the sh-direct access to a variable shared
+between the caller and the function (which therefore can't be lifted).
 
 ### Done
 - **pc-dispatch CFG + native-locals** — the compiled module is a flattened

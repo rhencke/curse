@@ -83,7 +83,7 @@ local function emit_word(w, lifted)
       parts[#parts + 1] = lifted[p.var] and ("rt.i64_to_str(%s)"):format(lname(p.var)) or ("sh:get(%q)"):format(p.var)
     elseif p.param then parts[#parts + 1] = ("sh:param(%d)"):format(p.param)
     elseif p.special then
-      if p.special == "#" then parts[#parts + 1] = "tostring(sh:nparams())"
+      if p.special == "#" then parts[#parts + 1] = "tostring(sh.nparams)"
       elseif p.special == "@" or p.special == "*" then parts[#parts + 1] = 'sh:paramsJoin(" ")'
       elseif p.special == "?" then parts[#parts + 1] = "tostring(sh.status)" end
     elseif p.arith then
@@ -273,9 +273,9 @@ local function build_cfg(stmts, lifted, funcflags)
       elseif funcflags[cmd] then
         local ff = funcflags[cmd]
         if ff.locals then -- full frame (save/restore shadowed vars + params)
-          body = ("sh:pushCall({%s}); fn_%s(sh); sh:popCall()"):format(table.concat(args, ", "), cmd)
+          body = ("sh:pushCall(%s); fn_%s(sh); sh:popCall()"):format(table.concat(args, ", "), cmd)
         elseif ff.params then -- positional swap only (no per-call frame table)
-          body = ("sh:pushParams({%s}); fn_%s(sh); sh:popParams()"):format(table.concat(args, ", "), cmd)
+          body = ("sh:pushParams(%s); fn_%s(sh); sh:popParams()"):format(table.concat(args, ", "), cmd)
         else -- neither: bare call, no allocation
           body = ("fn_%s(sh)"):format(cmd)
         end

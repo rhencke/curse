@@ -25,49 +25,62 @@ function Shell.new()
                      -- in `sh` so a mid-loop OSR resumes the SAME expansion+index
     functions = {},  -- name -> AST body (interpreter); the compiled module has
                      -- its own closures
-    callstack = {},  -- full function-call frames (for `local` restore + positional)
-    paramstack = {}, -- lightweight positional-only stack (compiled fast path)
-    calldepth = 0,   -- 0 at the top level; the tier only hands off at depth 0
+    -- Function-call plumbing with NO per-call allocation: positional args go into
+    -- a per-depth POOL array (reused across calls at that depth), the count is
+    -- tracked explicitly (nparams), and the save-stacks reuse their slots.
+    params = {},     -- current $@ array (may be an oversized pool array)
+    nparams = 0,     -- current $# (params[1..nparams] are live)
+    pd = 0,          -- call/param depth
+    paramstack = {}, -- saved `params` per depth
+    npstack = {},    -- saved `nparams` per depth
+    argpool = {},    -- reusable args array per depth
+    savedstack = {}, -- `local`-shadow record per depth (false until a local shadows)
+    calldepth = 0,   -- interpreter-only OSR gate (managed at the interp call site)
   }, Shell)
 end
 
--- Fast positional-only call boundary (compiled code, functions with no `local`):
--- swap $@ using a reused stack, no per-call frame table, no calldepth (compiled
--- has no OSR so the gate is irrelevant there).
-function Shell:pushParams(params)
-  self.paramstack[#self.paramstack + 1] = self.params
-  self.params = params or {}
+-- positional parameters ($# is read directly as sh.nparams)
+function Shell:param(n) return (n <= self.nparams) and self.params[n] or "" end
+function Shell:paramsJoin(sep) return table.concat(self.params, sep or " ", 1, self.nparams) end
+
+-- Positional-only call boundary: push args (varargs) into the depth pool — no
+-- table allocation per call after warmup.
+function Shell:pushParams(...)
+  local d = self.pd + 1; self.pd = d
+  self.paramstack[d] = self.params
+  self.npstack[d] = self.nparams
+  local a = self.argpool[d]; if not a then a = {}; self.argpool[d] = a end
+  local n = select("#", ...)
+  for i = 1, n do a[i] = (select(i, ...)) end
+  self.params = a; self.nparams = n
 end
 function Shell:popParams()
-  local d = #self.paramstack
-  self.params = self.paramstack[d]; self.paramstack[d] = nil
+  local d = self.pd; self.pd = d - 1
+  self.params = self.paramstack[d]; self.nparams = self.npstack[d]
 end
 
--- positional parameters
-function Shell:param(n) return self.params[n] or "" end
-function Shell:nparams() return #self.params end
-function Shell:paramsJoin(sep) return table.concat(self.params, sep or " ") end
-
--- Enter/leave a function call: swap positional params and open a `local` frame.
-function Shell:pushCall(params)
-  self.callstack[#self.callstack + 1] = { params = self.params } -- `saved` lazily
-  self.params = params or {}
-  self.calldepth = self.calldepth + 1
+-- Full call boundary (functions that use `local`): params pool + a lazy shadow
+-- record (allocated only if a `local` actually shadows something).
+function Shell:pushCall(...)
+  self:pushParams(...)
+  self.savedstack[self.pd] = false
 end
 function Shell:popCall()
-  local f = self.callstack[#self.callstack]; self.callstack[#self.callstack] = nil
-  if f.saved then for name, old in pairs(f.saved) do self.vars[name] = old or nil end end -- false => was absent
-  self.params = f.params
-  self.calldepth = self.calldepth - 1
+  local d = self.pd
+  local saved = self.savedstack[d]
+  if saved then
+    for name, old in pairs(saved) do self.vars[name] = old or nil end -- false => was absent
+    self.savedstack[d] = false
+  end
+  self:popParams()
 end
 -- `local name`: shadow the variable within the current call frame (restored on
 -- return). Records the prior box once so it can be put back.
 function Shell:localVar(name)
-  local f = self.callstack[#self.callstack]
-  if f then
-    if not f.saved then f.saved = {} end
-    if f.saved[name] == nil then f.saved[name] = self.vars[name] or false end
-  end
+  local d = self.pd
+  local saved = self.savedstack[d]
+  if not saved then saved = {}; self.savedstack[d] = saved end
+  if saved[name] == nil then saved[name] = self.vars[name] or false end
   self.vars[name] = {}
 end
 
