@@ -123,9 +123,8 @@ export const evalParam = async (shell: Shell, prm: Param, quoted = false): Promi
   if (prm.indirect) {
     // `${!ref}` on a NAMEREF inverts to the name it points to (bash), rather
     // than double-indirecting through the target's value.
-    const box = prm.special ? undefined : shell.rawLookup(prm.name);
-    if (box !== undefined && box.ref && !box.unset) {
-      const refName = box.value;
+    const refName = prm.special ? undefined : shell.namerefTarget(prm.name);
+    if (refName !== undefined) {
       if (prm.length) return String(shell.clen(refName));
       if (prm.op === "") return refName;
       // An operator on ${!nameref} applies to that target name as the value.

@@ -658,6 +658,12 @@ export class Shell {
     return `declare ${attr} ${name}=${declareQuote(v.value)}`;
   }
 
+  /** If `name` is a nameref, the (unresolved) name it points to; else undefined.
+   *  Used by `${!ref}` to invert a nameref to its target name. */
+  namerefTarget(name: string): string | undefined {
+    const v = this.rawLookup(name);
+    return v !== undefined && v.ref && !v.unset ? v.value : undefined;
+  }
   /** `declare -n name=target` — make `name` a nameref to `target`. A non-empty
    *  target must be a valid variable name (optionally `name[subscript]`), else
    *  bash rejects it; returns false so the caller can report status 1. */
