@@ -118,7 +118,7 @@ const repl = async (opts: OptSet, positional: string[]): Promise<void> => {
   process.exit(sh.status);
 };
 
-const main = async (): Promise<void> => {
+async function main(): Promise<void> {
   const argv = process.argv.slice(2);
 
   // Developer subcommands, recognized only as the first argument.
@@ -203,9 +203,8 @@ const main = async (): Promise<void> => {
   const src = readFileSync(0, "utf8");
   if (noexec) { parse(src); return; }
   await run(src, "curse", rest, opts);
-};
+}
 
-// No top-level await, so the `./curse` shim can load this module with require().
 main().catch((e: unknown) => {
   // A syntax error (lexer/parser/conditional) exits with status 2, as bash does.
   if (e instanceof ParseError || e instanceof CondError || e instanceof LexError) {
