@@ -368,6 +368,9 @@ class Emitter {
       if (this.isList(prm)) {
         return `${this.listExpr(prm)}.map((x) => sh.transform(${J(prm.op)}, x)).join(" ")`;
       }
+      // A plain scalar goes through transformScalar (unset → no field / nounset
+      // error); special params and elements keep the value-based path.
+      if (!prm.special && prm.sub === "") return `sh.transformScalar(${J(prm.op)}, ${J(prm.name)})`;
       return `sh.transform(${J(prm.op)}, String(${base}))`;
     }
     if (isCaseOp(prm.op)) {

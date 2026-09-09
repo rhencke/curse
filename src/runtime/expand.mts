@@ -142,6 +142,9 @@ export const evalParam = async (shell: Shell, prm: Param, quoted = false): Promi
   if (isSlice(prm)) return (await sliceValues(shell, prm)).join(" ");
   // ${x@op} / ${arr[@]@op} — transform (per element for lists).
   if (isTransform(prm)) {
+    // A plain scalar goes through transformScalar (unset → no field / nounset
+    // error), shared with the AOT path so both agree.
+    if (!prm.special && !isList(prm) && prm.sub === "") return shell.transformScalar(prm.op, prm.name);
     // ${var@a}: the variable's attribute letters (uses metadata, not the value).
     if (prm.op === "@a") return shell.attrOf(prm.name);
     if (isList(prm)) return listValues(shell, prm).map((x) => transform(prm.op, x)).join(" ");

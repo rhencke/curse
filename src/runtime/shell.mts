@@ -1595,7 +1595,8 @@ export class Shell {
     sub.opts = { ...this.opts };
     sub.shopts = { ...this.shopts }; // a subshell inherits, but can't leak, shopt
     sub.stdinBuf = this.stdinBuf; // share stdin by reference: a read in the subshell advances the parent's position too
-    sub.fatalStatus = this.fatalStatus; // same invocation mode (-c vs file)
+    // fatalStatus stays 1 (the default): only a top-level `-c` command string
+    // exits 127 on a fatal expansion error; a subshell exits 1.
     sub.condDepth = this.condDepth; // a subshell in a condition (`if ( … )`) inherits errexit suppression
     // Trap settings are inherited (visible to `trap -p`); a subshell can't leak.
     sub.traps = Object.assign(Object.create(null) as Record<string, string>, this.traps);
@@ -1691,6 +1692,17 @@ export class Shell {
   /** `${parameter@op}` transformation of a scalar value. */
   transform(op: string, v: string): string {
     return pTransform(op, v);
+  }
+  /** `${name@op}` on a plain scalar (no subscript, not a special param): an
+   *  unset name yields no field — and errors under `set -u` — while a set (even
+   *  empty) one transforms its value. Shared by interp and AOT so both agree. */
+  transformScalar(op: string, name: string): string {
+    if (this.getVar(name) === undefined) {
+      if (this.opts.nounset) this.unbound(name);
+      return "";
+    }
+    if (op === "@a") return this.attrOf(name);
+    return pTransform(op, this.getVar(name) ?? "");
   }
   /** `${v^}` `${v^^}` `${v,}` `${v,,}` case modification. */
   changeCase(v: string, op: string, pat: string): string {
