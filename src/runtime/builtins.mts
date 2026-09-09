@@ -576,12 +576,22 @@ const exportBuiltin: Builtin = (shell, ...args) => {
 
 const local: Builtin = (shell, ...args) => {
   const { flags, names } = parseDeclFlags(args);
+  let status = 0;
   for (const n of names) {
     const { name, value, append } = splitNameVal(n);
+    // A readonly variable can't be shadowed by a fresh local (bash errors).
+    if (shell.isReadonly(name)) {
+      shell.io.err(`${shell.name}: local: ${name}: readonly variable\n`);
+      status = 1;
+      continue;
+    }
     // `local s+=x` appends to an existing local in this scope, but a first-time
     // `local` starts empty (it does not inherit an enclosing value).
-    const inherited = append && shell.isLocalOwn(name) ? shell.getVar(name) ?? "" : "";
-    shell.local(name);
+    const isOwn = shell.isLocalOwn(name);
+    const inherited = append && isOwn ? shell.getVar(name) ?? "" : "";
+    // A fresh local resets to unset; re-declaring an existing own-local WITHOUT
+    // a value keeps its current value (bash).
+    if (value !== undefined || !isOwn) shell.local(name);
     if (flags.nameref) {
       shell.setRef(name, value ?? "");
       continue;
@@ -589,7 +599,7 @@ const local: Builtin = (shell, ...args) => {
     shell.setAttrs(name, flags);
     if (value !== undefined) shell.setVar(name, append ? inherited + value : value);
   }
-  return 0;
+  return status;
 };
 
 const unset: Builtin = (shell, ...args) => {
@@ -602,6 +612,8 @@ const unset: Builtin = (shell, ...args) => {
     else {
       const m = /^([A-Za-z_][A-Za-z0-9_]*)\[([\s\S]*)\]$/.exec(a);
       if (m) shell.unsetElem(m[1]!, m[2]!);
+      // `unset name` (no -v): a variable if one exists, otherwise a function.
+      else if (mode === "" && !shell.varExists(a) && shell.hasFunction(a)) shell.unsetFunc(a);
       else shell.unsetVar(a);
     }
   }

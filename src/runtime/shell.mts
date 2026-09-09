@@ -834,6 +834,16 @@ export class Shell {
   setVar(name: string, value: string): void {
     this.assign(name, value);
   }
+  /** Whether `name` is bound as a variable in some visible scope (set or a
+   *  declared-but-unset local). Used by `unset name` to decide whether to fall
+   *  back to unsetting a function of the same name. */
+  varExists(name: string): boolean {
+    return this.ownerScope(name) !== undefined;
+  }
+  /** Whether `name` resolves to a readonly variable in any visible scope. */
+  isReadonly(name: string): boolean {
+    return this.scopeLookup(name)?.readonly ?? false;
+  }
   unsetVar(name: string): void {
     name = this.deref(name); // `unset ref` removes the target, as in bash
     const owner = this.ownerScope(name);
@@ -843,7 +853,16 @@ export class Shell {
       this.readonlyHit = true;
       return;
     }
-    owner.vars.delete(name);
+    if (owner === this.globalScope) {
+      owner.vars.delete(name);
+    } else {
+      // Unsetting a local leaves an unset placeholder rather than deleting, so an
+      // enclosing variable of the same name stays hidden for the rest of the
+      // function (bash) — the placeholder is discarded when the scope pops.
+      const nv = new Var("");
+      nv.unset = true;
+      owner.vars.set(name, nv);
+    }
   }
   /** `unset arr[i]` / `unset assoc[key]` — remove a single element. */
   unsetElem(name: string, sub: string): void {
