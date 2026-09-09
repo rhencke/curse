@@ -1,0 +1,4 @@
+#!/usr/bin/env node
+// Launcher so curse runs as `./curse …`. Node 24 type-strips the .mts CLI, which
+// reads process.argv and runs itself on load.
+import "./src/cli/curse.mts";

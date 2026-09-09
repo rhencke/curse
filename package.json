@@ -6,7 +6,7 @@
   "type": "module",
   "private": true,
   "bin": {
-    "curse": "./src/cli/curse.mts"
+    "curse": "./curse"
   },
   "engines": {
     "node": ">=24"

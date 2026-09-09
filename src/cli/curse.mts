@@ -105,13 +105,12 @@ const main = async (): Promise<void> => {
   die(`unknown command \`${sub}\``);
 };
 
-try {
-  await main();
-} catch (e) {
+// No top-level await, so the `./curse` shim can load this module with require().
+main().catch((e: unknown) => {
   // A syntax error (lexer/parser/conditional) exits with status 2, as bash does.
   if (e instanceof ParseError || e instanceof CondError || e instanceof LexError) {
     process.stderr.write(`curse: ${e.message}\n`);
     process.exit(2);
   }
-  throw e;
-}
+  throw e; // unexpected: let Node report it and exit non-zero
+});
