@@ -20,3 +20,4 @@ core.*
 # BFG Repo-Cleaner report
 /..bfg-report/
 .ccache/
+/test/real/fetched/
