@@ -734,6 +734,7 @@ local BUILTINS = {
   eval = 1, source = 1, ["."] = 1, ["break"] = 1, ["continue"] = 1, ["true"] = 1,
   exec = 1, readonly = 1, umask = 1, alias = 1, unalias = 1, shopt = 1, wait = 1, trap = 1,
   mapfile = 1, readarray = 1, compgen = 1, complete = 1, compopt = 1,
+  pushd = 1, popd = 1, dirs = 1,
 }
 M.BUILTINS = BUILTINS -- exposed so the compiled backend delegates the same set
 local KEYWORDS = {
@@ -1269,7 +1270,61 @@ local function exec_simple(sh, args, hook)
     else
       sh.status = (C.chdir(dir) == 0) and 0 or 1
     end
-    if sh.status == 0 then sh:set_str("OLDPWD", prev); C.setenv("OLDPWD", prev, 1) end
+    if sh.status == 0 then
+      sh:set_str("OLDPWD", prev); C.setenv("OLDPWD", prev, 1)
+      if sh.dirstack then sh.dirstack[1] = sh:special_get("PWD") end -- cd replaces the top of the stack
+    end
+  elseif cmd == "pushd" or cmd == "popd" or cmd == "dirs" then
+    sh.dirstack = sh.dirstack or { sh:special_get("PWD") }
+    local ds = sh.dirstack
+    local function tilde(p) local h = sh:get("HOME"); if h ~= "" and p:sub(1, #h) == h then return "~" .. p:sub(#h + 1) end return p end
+    if cmd == "dirs" then
+      local vflag, pflag, lflag = false, false, false
+      for j = 2, #args do
+        local a = args[j]
+        if a == "-c" then sh.dirstack = { sh:special_get("PWD") }; ds = sh.dirstack
+        elseif a == "-v" then vflag = true elseif a == "-p" then pflag = true
+        elseif a == "-l" then lflag = true end
+      end
+      if not args[2] or not args[2]:find("c") or vflag or pflag or lflag then
+        local parts = {}
+        for k = 1, #ds do parts[k] = lflag and ds[k] or tilde(ds[k]) end
+        if vflag then for k = 1, #parts do sh:echo(("%2d  %s"):format(k - 1, parts[k])) end
+        elseif pflag then for k = 1, #parts do sh:echo(parts[k]) end
+        else sh:echo(table.concat(parts, " ")) end
+      end
+      sh.status = 0
+    elseif cmd == "pushd" then
+      local target
+      for j = 2, #args do local a = args[j]
+        if a == "--" then target = args[j + 1]; break
+        elseif a:sub(1, 1) == "-" and a ~= "-" and not a:match("^[+-]%d+$") then
+          io.stderr:write("curse: pushd: " .. a .. ": invalid option\n"); sh.status = 2; return
+        elseif not target then target = a end
+      end
+      if not target then -- swap top two
+        if #ds < 2 then io.stderr:write("curse: pushd: no other directory\n"); sh.status = 1; return end
+        ds[1], ds[2] = ds[2], ds[1]; C.chdir(ds[1])
+        sh:set_str("OLDPWD", sh:special_get("PWD")); ds[1] = sh:special_get("PWD")
+      else
+        local prev = sh:special_get("PWD")
+        if C.chdir(target) ~= 0 then io.stderr:write("curse: pushd: " .. target .. ": No such file or directory\n"); sh.status = 1; return end
+        sh:set_str("OLDPWD", prev); table.insert(ds, 1, sh:special_get("PWD"))
+      end
+      local parts = {}; for k = 1, #ds do parts[k] = tilde(ds[k]) end
+      sh:echo(table.concat(parts, " ")); sh.status = 0
+    else -- popd
+      for j = 2, #args do local a = args[j]
+        if a == "--" then -- ok
+        elseif a:sub(1, 1) == "-" and a ~= "-" and not a:match("^[+-]%d+$") then
+          io.stderr:write("curse: popd: " .. a .. ": invalid option\n"); sh.status = 2; return
+        elseif a ~= "-" then io.stderr:write("curse: popd: " .. a .. ": invalid argument\n"); sh.status = 2; return end
+      end
+      if #ds < 2 then io.stderr:write("curse: popd: directory stack empty\n"); sh.status = 1; return end
+      table.remove(ds, 1); C.chdir(ds[1]); ds[1] = sh:special_get("PWD")
+      local parts = {}; for k = 1, #ds do parts[k] = tilde(ds[k]) end
+      sh:echo(table.concat(parts, " ")); sh.status = 0
+    end
   elseif cmd == "unset" then
     local fmode, vmode = false, false -- -f: functions only; -v: vars only; neither: var then function
     sh.status = 0
