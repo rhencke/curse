@@ -1263,7 +1263,18 @@ local function exec_simple(sh, args, hook)
     error({ __curse_exit = args[2] and (tonumber(args[2]) % 256) or sh.status })
   elseif cmd == "cd" then
     local prev = sh:special_get("PWD")
-    local dir = args[2] or sh:get("HOME")
+    -- parse leading -L/-P/-e/-@ flags and a `--`, then the directory operand.
+    local operands, j = {}, 2
+    while args[j] do
+      local a = args[j]
+      if a == "--" then j = j + 1; break
+      elseif a == "-" then operands[#operands + 1] = a; j = j + 1
+      elseif a:match("^%-[LPe@]+$") then j = j + 1 -- flags (physical/logical: curse's PWD is physical)
+      else break end
+    end
+    for k = j, #args do operands[#operands + 1] = args[k] end
+    if #operands > 1 then io.stderr:write("curse: cd: too many arguments\n"); sh.status = 1; return end
+    local dir = operands[1] or sh:get("HOME")
     if dir == "-" then dir = sh:get("OLDPWD"); if dir == "" then dir = prev end
       sh.status = (C.chdir(dir) == 0) and 0 or 1
       if sh.status == 0 then sh:echo(sh:special_get("PWD")) end -- cd - prints the new dir
