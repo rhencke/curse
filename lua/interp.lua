@@ -555,7 +555,9 @@ indirect_part = function(sh, pe)
   if pe.index and pe.index ~= "@" and pe.index ~= "*" then
     tname = sh:array_get(pe.name, array_key(sh, pe.name, pe.index))
   else
-    local b = sh.vars[sh:deref(pe.name)]
+    local b = sh.vars[pe.name]
+    -- ${!ref} on a NAMEREF is inverted: it yields the target NAME, not its value.
+    if b and b.ref and b.s and not pe.iop then return { lit = b.s } end
     tname = (b and b.ref and b.s) or sh:get(pe.name)
   end
   if tname == nil or tname == "" then return nil end
