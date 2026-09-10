@@ -154,10 +154,14 @@ local function expand_word(sh, w)
     elseif p.arith then buf[#buf + 1] = rt.i64_to_str(eval(sh, require("parser").arith(p.arith)))
     elseif p.cmdsub then buf[#buf + 1] = sh:capture_src(p.cmdsub)
     elseif p.pexp then
-      local P = require("parser")
-      local arg = p.pexp.arg and expand_word(sh, P.parse_word(p.pexp.arg)) or nil
-      local arg2 = p.pexp.arg2 and expand_word(sh, P.parse_word(p.pexp.arg2)) or nil
-      buf[#buf + 1] = sh:expand_param(p.pexp, arg, arg2)
+      local pe, P = p.pexp, require("parser")
+      local idxnum
+      if pe.index and pe.index ~= "@" and pe.index ~= "*" then
+        idxnum = tonumber(rt.i64_to_str(eval(sh, P.arith(pe.index)))) or 0
+      end
+      local arg = pe.arg and expand_word(sh, P.parse_word(pe.arg)) or nil
+      local arg2 = pe.arg2 and expand_word(sh, P.parse_word(pe.arg2)) or nil
+      buf[#buf + 1] = sh:expand_param(pe, arg, arg2, idxnum)
     end
   end
   return table.concat(buf)
@@ -223,8 +227,21 @@ end
 local function exec_stmt(sh, st, hook)
   local t = st.t
   if t == "assign" then
-    if st.arith then sh:aset(st.name, eval(sh, st.arith))
-    else sh:set_str(st.name, expand_word(sh, st.rhs)) end
+    if st.index then
+      local idx = tonumber(rt.i64_to_str(eval(sh, require("parser").arith(st.index)))) or 0
+      sh:array_set(st.name, idx, expand_word(sh, st.rhs), st.append)
+    elseif st.arith then
+      sh:aset(st.name, eval(sh, st.arith))
+    elseif st.append then
+      sh:set_str(st.name, sh:get(st.name) .. expand_word(sh, st.rhs))
+    else
+      sh:set_str(st.name, expand_word(sh, st.rhs))
+    end
+    sh.status = 0
+  elseif t == "arrayassign" then
+    local vals = {}
+    for _, w in ipairs(st.elems) do vals[#vals + 1] = expand_word(sh, w) end
+    sh:array_assign(st.name, vals, st.append)
     sh.status = 0
   elseif t == "funcdef" then
     sh.functions[st.name] = st.body

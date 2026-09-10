@@ -513,6 +513,8 @@ local function assert_compilable(stmts)
     elseif t == "andor" then error("curse-nocompile: && / || list")
     elseif t == "pipeline" then error("curse-nocompile: pipeline")
     elseif t == "case" then error("curse-nocompile: case")
+    elseif t == "arrayassign" then error("curse-nocompile: array assign")
+    elseif t == "assign" and (st.index or st.append) then error("curse-nocompile: array/append assign")
     elseif t == "whilec" then
       if st.negate or cond_arith(st.cond) == nil then error("curse-nocompile: while/until cond") end
       assert_compilable(st.body)

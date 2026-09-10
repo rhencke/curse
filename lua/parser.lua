@@ -136,38 +136,50 @@ end
 local function parse_paramexp(inner)
   if inner == "" then return { lit = "" } end
   if inner == "#" then return { special = "#" } end
-  if inner:sub(1, 1) == "#" then return { pexp = { name = inner:sub(2), op = "len" } } end
+  local indices, lenpfx = false, false
+  if inner:sub(1, 1) == "!" then indices = true; inner = inner:sub(2)     -- ${!a[@]}
+  elseif inner:sub(1, 1) == "#" then lenpfx = true; inner = inner:sub(2) end -- ${#v} / ${#a[@]}
   local name, rest = inner:match("^([%a_][%w_]*)(.*)$")
   if not name then name, rest = inner:match("^(%d+)(.*)$") end
   if not name then name, rest = inner:match("^([@*])(.*)$") end
   if not name then return { var = inner } end
+  -- optional [subscript]
+  local index = nil
+  if rest:sub(1, 1) == "[" then
+    local close = rest:find("]", 2, true)
+    if close then index = rest:sub(2, close - 1); rest = rest:sub(close + 1) end
+  end
+  if indices then return { pexp = { name = name, op = "indices", index = index } } end
+  if lenpfx then return { pexp = { name = name, op = "len", index = index } } end
   if rest == "" then
+    if index then return { pexp = { name = name, index = index } } end -- ${a[i]}
     if name:match("^%d+$") then return { param = tonumber(name) } end
     if name == "@" or name == "*" then return { special = name } end
     return { var = name }
   end
   local two, one = rest:sub(1, 2), rest:sub(1, 1)
+  local function P(t) t.name = name; t.index = index; return { pexp = t } end
   if two == ":-" or two == ":=" or two == ":+" or two == ":?" then
-    return { pexp = { name = name, op = two, arg = rest:sub(3) } }
+    return P { op = two, arg = rest:sub(3) }
   elseif one == "-" or one == "=" or one == "+" or one == "?" then
-    return { pexp = { name = name, op = one, arg = rest:sub(2) } }
-  elseif two == "##" then return { pexp = { name = name, op = "##", arg = rest:sub(3) } }
-  elseif one == "#" then return { pexp = { name = name, op = "#", arg = rest:sub(2) } }
-  elseif two == "%%" then return { pexp = { name = name, op = "%%", arg = rest:sub(3) } }
-  elseif one == "%" then return { pexp = { name = name, op = "%", arg = rest:sub(2) } }
+    return P { op = one, arg = rest:sub(2) }
+  elseif two == "##" then return P { op = "##", arg = rest:sub(3) }
+  elseif one == "#" then return P { op = "#", arg = rest:sub(2) }
+  elseif two == "%%" then return P { op = "%%", arg = rest:sub(3) }
+  elseif one == "%" then return P { op = "%", arg = rest:sub(2) }
   elseif two == "//" then
-    local p, r = split_subst(rest:sub(3)); return { pexp = { name = name, op = "//", arg = p, arg2 = r } }
+    local p, r = split_subst(rest:sub(3)); return P { op = "//", arg = p, arg2 = r }
   elseif one == "/" then
-    local p, r = split_subst(rest:sub(2)); return { pexp = { name = name, op = "/", arg = p, arg2 = r } }
-  elseif two == "^^" then return { pexp = { name = name, op = "^^" } }
-  elseif one == "^" then return { pexp = { name = name, op = "^" } }
-  elseif two == ",," then return { pexp = { name = name, op = ",," } }
-  elseif one == "," then return { pexp = { name = name, op = "," } }
+    local p, r = split_subst(rest:sub(2)); return P { op = "/", arg = p, arg2 = r }
+  elseif two == "^^" then return P { op = "^^" }
+  elseif one == "^" then return P { op = "^" }
+  elseif two == ",," then return P { op = ",," }
+  elseif one == "," then return P { op = "," }
   elseif one == ":" then
     local body = rest:sub(2)
     local off, len = body:match("^(.-):(.+)$")
-    if off then return { pexp = { name = name, op = "sub", arg = off, arg2 = len } } end
-    return { pexp = { name = name, op = "sub", arg = body } }
+    if off then return P { op = "sub", arg = off, arg2 = len } end
+    return P { op = "sub", arg = body }
   end
   return { var = name }
 end
@@ -237,12 +249,13 @@ function M.parse(src)
       else break end
     end
   end
-  local function word()  -- read one shell word, keeping quotes and $(( )) / ${ } / $( ) balanced
+  local function word(stop_paren)  -- read one shell word, keeping quotes and $(( )) / ${ } / $( ) balanced
     ws()
     local start = i
     while i <= n do
       local c = src:sub(i, i)
-      if c == '"' or c == "'" then
+      if stop_paren and (c == ")" or c == "(") then break
+      elseif c == '"' or c == "'" then
         local q = c; i = i + 1
         while i <= n and src:sub(i, i) ~= q do i = i + 1 end
         i = i + 1 -- past closing quote
@@ -439,17 +452,43 @@ function M.parse(src)
       end
       return { t = "case", line = ln, subject = subject, clauses = clauses }
     end
-    -- assignment: NAME=RHS
+    -- assignment: NAME=RHS, NAME[i]=RHS, NAME+=RHS, NAME=(array literal)
     do
-      local s, e = src:find("^[%a_][%w_]*=", i)
-      if s then
-        local ln = line
-        local name = src:sub(s, e - 1); i = e + 1 -- skip past '='
-        local raw = word()
-        if raw:sub(1, 3) == "$((" and raw:sub(-2) == "))" then
-          return { t = "assign", name = name, line = ln, arith = arith(raw:sub(4, -3)) }
+      local name = src:match("^([%a_][%w_]*)", i)
+      if name then
+        local p = i + #name
+        local subidx = nil
+        if src:sub(p, p) == "[" then
+          local close = src:find("]", p + 1, true)
+          if close and src:sub(close + 1, close + 1):match("[+=]") then
+            subidx = src:sub(p + 1, close - 1); p = close + 1
+          end
         end
-        return { t = "assign", name = name, line = ln, rhs = parse_word(unquote(raw)) }
+        local op = nil
+        if src:sub(p, p + 1) == "+=" then op = "+="; p = p + 2
+        elseif src:sub(p, p) == "=" then op = "="; p = p + 1 end
+        if op then
+          local ln = line; i = p
+          if src:sub(i, i) == "(" then -- array literal
+            i = i + 1
+            local elems = {}
+            while i <= n do
+              ws()
+              local c = src:sub(i, i)
+              if c == ")" then i = i + 1; break end
+              if c == "\n" then line = line + 1; i = i + 1
+              elseif c == "" then break
+              else local w = word(true); if w == "" then break end; elems[#elems + 1] = parse_word(unquote(w)) end
+            end
+            return { t = "arrayassign", name = name, line = ln, elems = elems, append = (op == "+=") }
+          end
+          local raw = word()
+          if not subidx and op == "=" and raw:sub(1, 3) == "$((" and raw:sub(-2) == "))" then
+            return { t = "assign", name = name, line = ln, arith = arith(raw:sub(4, -3)) }
+          end
+          return { t = "assign", name = name, line = ln, index = subidx,
+            append = (op == "+="), rhs = parse_word(unquote(raw)) }
+        end
       end
     end
     -- simple command: WORD WORD ...

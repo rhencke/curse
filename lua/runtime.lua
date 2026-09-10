@@ -217,6 +217,7 @@ M.i64_to_str = i64_to_str
 function Shell:get(name)
   local b = self.vars[name]
   if b == nil then return "" end
+  if b.arr then return b.arr[0] or "" end -- $a == ${a[0]}
   if b.s == nil then
     if b.n == nil then return "" end
     b.s = i64_to_str(b.n)
@@ -243,6 +244,47 @@ function Shell:aset(name, n)
   b.n = i64(n); b.s = nil
   return b.n
 end
+
+-- ---- indexed arrays ----
+-- Stored in the var box as b.arr = { [0]=…, [1]=… } (0-based, may be sparse, to
+-- match bash). A plain scalar has no b.arr; reading $a is ${a[0]}.
+local function arr_max(arr) local m = -1; for k in pairs(arr) do if k > m then m = k end end; return m end
+
+function Shell:array_assign(name, values, append)
+  local b = box(name, self.vars)
+  if append and b.arr then
+    local base = arr_max(b.arr) + 1
+    for i = 1, #values do b.arr[base + i - 1] = values[i] end
+  else
+    b.arr = {}; b.s = nil; b.n = nil
+    for i = 1, #values do b.arr[i - 1] = values[i] end
+  end
+end
+function Shell:array_set(name, idx, val, append)
+  local b = box(name, self.vars)
+  if not b.arr then b.arr = {}; if b.s then b.arr[0] = b.s end; b.s = nil; b.n = nil end
+  if append then b.arr[idx] = (b.arr[idx] or "") .. val else b.arr[idx] = val end
+end
+function Shell:array_get(name, idx)
+  local b = self.vars[name]
+  if b and b.arr then return b.arr[idx] or "" end
+  if idx == 0 then return self:get(name) end
+  return ""
+end
+function Shell:array_indices(name)
+  local b = self.vars[name]
+  if b and b.arr then
+    local t = {}; for k in pairs(b.arr) do t[#t + 1] = k end; table.sort(t); return t
+  end
+  if b and (b.s ~= nil or b.n ~= nil) then return { 0 } end
+  return {}
+end
+function Shell:array_values(name)
+  local idx = self:array_indices(name); local t = {}
+  for i = 1, #idx do t[i] = self:array_get(name, idx[i]) end
+  return t
+end
+function Shell:array_count(name) return #self:array_indices(name) end
 
 -- ---- parameter expansion ${var OP arg} ----
 -- Convert a shell glob to a Lua pattern fragment (for #/%/// operators). Handles
@@ -309,11 +351,22 @@ function M.glob_match(s, glob)
   return s:match("^" .. glob_to_lpat(glob) .. "$") ~= nil
 end
 
--- Apply a ${…} operator. `arg`/`arg2` are already word-expanded by the caller.
-function Shell:expand_param(pe, arg, arg2)
-  local name, op = pe.name, pe.op
+-- Apply a ${…} operator. `arg`/`arg2` are already word-expanded by the caller;
+-- `idxnum` is the evaluated numeric subscript when pe.index is an expression.
+function Shell:expand_param(pe, arg, arg2, idxnum)
+  local name, op, index = pe.name, pe.op, pe.index
+  -- ${!a[@]} / ${!a[*]}: the list of set indices
+  if op == "indices" then
+    local idx = self:array_indices(name)
+    return table.concat(idx, " ")
+  end
   local val, isset
-  if name:match("^%d+$") then
+  if index == "@" or index == "*" then
+    if op == "len" then return tostring(self:array_count(name)) end -- ${#a[@]}
+    val = table.concat(self:array_values(name), " "); isset = self:array_count(name) > 0
+  elseif index then
+    val = self:array_get(name, idxnum or 0); isset = val ~= ""
+  elseif name:match("^%d+$") then
     local nn = tonumber(name); val = self:param(nn); isset = (nn <= self.nparams)
   elseif name == "@" or name == "*" then
     val = self:paramsJoin(" "); isset = self.nparams > 0
