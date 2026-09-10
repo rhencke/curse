@@ -316,6 +316,7 @@ function Shell:special_get(name)
   if name == "MACHTYPE" then return "x86_64-pc-linux-gnu" end
   if name == "HOSTTYPE" then return "x86_64" end
   if name == "SECONDS" then return tostring(os.time() - (self.start_time or os.time())) end
+  if name == "LINENO" then return tostring(self.cur_line or 0) end
   return ""
 end
 

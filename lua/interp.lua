@@ -1023,6 +1023,7 @@ end
 
 local function exec_stmt(sh, st, hook)
   local t = st.t
+  if st.line then sh.cur_line = st.line end -- $LINENO
   if t == "assign" then
     if st.index then
       sh:array_set(st.name, array_key(sh, st.name, st.index), expand_word(sh, st.rhs), st.append)
