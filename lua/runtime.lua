@@ -732,6 +732,34 @@ end
 -- Shell-quote a string so it round-trips through eval (single-quote form).
 local function shell_quote(s) return "'" .. s:gsub("'", "'\\''") .. "'" end
 
+-- Decode PS1 prompt backslash-escapes (for ${x@P}). Parameter/command expansion
+-- of the result is done by the caller (interp) afterward.
+function Shell:prompt_escapes(s)
+  local out, i, n = {}, 1, #s
+  while i <= n do
+    local c = s:sub(i, i)
+    if c == "\\" then
+      local d = s:sub(i + 1, i + 1)
+      local simple = ({ a = "\7", e = "\27", n = "\n", r = "\r", ["\\"] = "\\",
+        ["$"] = (self:special_get("EUID") == "0" and "#" or "$"), t = os.date("%H:%M:%S"),
+        T = os.date("%I:%M:%S"), ["@"] = os.date("%I:%M %p"), A = os.date("%H:%M"),
+        d = os.date("%a %b %d"), s = "curse", v = "5.2", V = "5.2.0", ["!"] = "1", ["#"] = "1", j = "0" })[d]
+      if d == "[" or d == "]" then i = i + 2 -- non-printing markers: drop
+      elseif d == "w" then out[#out + 1] = self:special_get("PWD"); i = i + 2
+      elseif d == "W" then out[#out + 1] = (self:special_get("PWD"):gsub(".*/", "")); i = i + 2
+      elseif d == "u" then out[#out + 1] = os.getenv("USER") or "user"; i = i + 2
+      elseif d == "h" then out[#out + 1] = (os.getenv("HOSTNAME") or "curse"):gsub("%..*$", ""); i = i + 2
+      elseif d == "H" then out[#out + 1] = os.getenv("HOSTNAME") or "curse"; i = i + 2
+      elseif simple then out[#out + 1] = simple; i = i + 2
+      elseif d:match("[0-7]") then
+        local oct = s:match("^[0-7][0-7]?[0-7]?", i + 1)
+        out[#out + 1] = string.char(tonumber(oct, 8) % 256); i = i + 1 + #oct
+      else out[#out + 1] = "\\" .. d; i = i + 2 end -- unknown escape kept literal
+    else out[#out + 1] = c; i = i + 1 end
+  end
+  return table.concat(out)
+end
+
 -- The per-value string-transform operators (pattern strip, substitute, substring,
 -- case, and the ${x@OP} transforms). Factored out so ${a[@]OP} can apply per element.
 function Shell:apply_str_op(op, val, arg, arg2)

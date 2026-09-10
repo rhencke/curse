@@ -260,6 +260,9 @@ local function expand_part_str(sh, p)
   elseif p.cmdsub then return sh:capture_src(p.cmdsub)
   elseif p.pexp then
     local pe, P = p.pexp, require("parser")
+    if pe.op == "@" and pe.arg == "P" then -- ${x@P}: decode prompt escapes, then expand
+      return expand_word(sh, P.parse_word(sh:prompt_escapes(sh:get(pe.name))))
+    end
     local subkey
     if pe.index and pe.index ~= "@" and pe.index ~= "*" then
       subkey = array_key(sh, pe.name, pe.index)
