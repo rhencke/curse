@@ -222,6 +222,16 @@ local function parse_dollar(w, i, add, q)
       j = j + 1
     end
     add({ cmdsub = w:sub(i + 2, j - 1), q = q }); return j + 1
+  elseif nx == "'" then
+    -- $'…' ANSI-C quoting: a literal string with backslash escapes, no expansion.
+    local j, buf = i + 2, {}
+    while j <= #w do
+      local c2 = w:sub(j, j)
+      if c2 == "\\" then buf[#buf + 1] = w:sub(j, j + 1); j = j + 2
+      elseif c2 == "'" then break
+      else buf[#buf + 1] = c2; j = j + 1 end
+    end
+    add({ lit = require("runtime").ansi_unescape(table.concat(buf)), q = true }); return j + 1
   elseif nx == "{" then
     local e = w:find("}", i + 2, true) or #w
     local part = parse_paramexp(w:sub(i + 2, e - 1)); part.q = q; add(part); return e + 1

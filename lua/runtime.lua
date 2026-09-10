@@ -647,6 +647,38 @@ function Shell:expand_param(pe, arg, arg2, idxnum)
   return val
 end
 
+-- Interpret backslash escapes for `echo -e` and ANSI-C `$'…'` quoting.
+function M.ansi_unescape(s)
+  local out, i, n = {}, 1, #s
+  while i <= n do
+    local c = s:sub(i, i)
+    if c == "\\" and i < n then
+      local d = s:sub(i + 1, i + 1)
+      if d == "n" then out[#out + 1] = "\n"; i = i + 2
+      elseif d == "t" then out[#out + 1] = "\t"; i = i + 2
+      elseif d == "r" then out[#out + 1] = "\r"; i = i + 2
+      elseif d == "\\" then out[#out + 1] = "\\"; i = i + 2
+      elseif d == "'" then out[#out + 1] = "'"; i = i + 2
+      elseif d == '"' then out[#out + 1] = '"'; i = i + 2
+      elseif d == "a" then out[#out + 1] = "\7"; i = i + 2
+      elseif d == "b" then out[#out + 1] = "\8"; i = i + 2
+      elseif d == "e" or d == "E" then out[#out + 1] = "\27"; i = i + 2
+      elseif d == "f" then out[#out + 1] = "\12"; i = i + 2
+      elseif d == "v" then out[#out + 1] = "\11"; i = i + 2
+      elseif d == "x" then
+        local hex = s:match("^%x%x?", i + 2)
+        if hex then out[#out + 1] = string.char(tonumber(hex, 16)); i = i + 2 + #hex
+        else out[#out + 1] = "\\x"; i = i + 2 end
+      elseif d:match("[0-7]") then -- octal \NNN (1-3 digits)
+        local oct = s:match("^[0-7][0-7]?[0-7]?", i + 1)
+        out[#out + 1] = string.char(tonumber(oct, 8) % 256); i = i + 1 + #oct
+      elseif d == "c" then return table.concat(out) -- \c: stop output
+      else out[#out + 1] = "\\" .. d; i = i + 2 end
+    else out[#out + 1] = c; i = i + 1 end
+  end
+  return table.concat(out)
+end
+
 function Shell:echo(...)
   local n = select("#", ...)
   for i = 1, n do

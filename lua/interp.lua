@@ -472,7 +472,21 @@ end
 local function exec_simple(sh, args, hook)
   local cmd = args[1]
   if cmd == nil then sh.status = 0
-  elseif cmd == "echo" then sh:echo(unpack(args, 2))
+  elseif cmd == "echo" then
+    -- echo [-neE] ARGS: -n suppresses the newline, -e interprets backslash escapes.
+    local j, nonl, esc = 2, false, false
+    while args[j] and args[j]:match("^%-[neE]+$") do
+      for ch in args[j]:sub(2):gmatch(".") do
+        if ch == "n" then nonl = true elseif ch == "e" then esc = true elseif ch == "E" then esc = false end
+      end
+      j = j + 1
+    end
+    local buf = {}
+    for k = j, #args do buf[#buf + 1] = args[k] end
+    local s = table.concat(buf, " ")
+    if esc then s = rt.ansi_unescape(s) end
+    sh.out(s); if not nonl then sh.out("\n") end
+    sh.status = 0
   elseif cmd == ":" or cmd == "true" then sh.status = 0
   elseif cmd == "false" then sh.status = 1
   elseif cmd == "[" or cmd == "test" then do_test(sh, args)
