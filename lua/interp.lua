@@ -959,6 +959,14 @@ local function exec_simple(sh, args, hook)
       line = io.read("*L") -- keep the newline so we can tell a full line from EOF
       if line then
         if line:sub(-1) == "\n" then line = line:sub(1, -2) else had_nl = false end
+        -- line continuation (non -r): a trailing odd number of backslashes means
+        -- the last was `\<newline>` — drop it and splice the next physical line.
+        while not raw and had_nl and (#(line:match("(\\*)$") or "") % 2 == 1) do
+          line = line:sub(1, -2)
+          local nxt = io.read("*L"); if not nxt then break end
+          if nxt:sub(-1) == "\n" then nxt = nxt:sub(1, -2) else had_nl = false end
+          line = line .. nxt
+        end
       end
     end
     if line == nil then
