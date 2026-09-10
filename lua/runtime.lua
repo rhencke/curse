@@ -440,6 +440,13 @@ function Shell:array_get(name, key)
   if key == 0 then return self:get(name) end
   return ""
 end
+-- Is element [key] set? (distinct from "" — for [[ -v a[k] ]]).
+function Shell:is_elem_set(name, key)
+  local b = self.vars[self:deref(name)]
+  if not b then return false end
+  if b.arr then return b.arr[norm_key(b, key)] ~= nil end
+  return key == 0 and (b.s ~= nil or b.n ~= nil)
+end
 -- unset a single element a[key] (negative allowed for indexed).
 function Shell:array_unset(name, key)
   local b = self.vars[self:deref(name)]

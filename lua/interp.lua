@@ -1049,6 +1049,12 @@ local function eval_dbracket(sh, node)
   if k == "or" then return eval_dbracket(sh, node.l) or eval_dbracket(sh, node.r) end
   if k == "not" then return not eval_dbracket(sh, node.e) end
   if k == "str" then return expand_word(sh, node.word) ~= "" end
+  if k == "unary" and node.op == "-v" then -- variable/element is set
+    local nm = expand_word(sh, node.word)
+    local base, sub = nm:match("^([%a_][%w_]*)%[(.+)%]$")
+    if base then return sh:is_elem_set(base, array_key(sh, base, sub)) end
+    return sh.vars[sh:deref(nm)] ~= nil or sh:special_get(nm) ~= ""
+  end
   if k == "unary" then return unary(node.op, expand_word(sh, node.word)) end
   if k == "binary" then
     local l, r, op = expand_word(sh, node.l), expand_word(sh, node.r), node.op
