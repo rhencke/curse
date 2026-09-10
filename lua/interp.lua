@@ -2379,6 +2379,7 @@ local function exec_stmt(sh, st, hook)
     sh.loopdepth = sh.loopdepth - 1
     sh.status = bodystatus
   elseif t == "if" then
+    local ran = false
     for _, cl in ipairs(st.clauses) do
       local take
       if cl.cond == nil then take = true
@@ -2386,8 +2387,9 @@ local function exec_stmt(sh, st, hook)
         sh.noerr = sh.noerr + 1; exec_list(sh, cl.cond, hook, false); sh.noerr = sh.noerr - 1
         take = (sh.status == 0)
       end
-      if take then exec_list(sh, cl.body, hook, false); break end
+      if take then exec_list(sh, cl.body, hook, false); ran = true; break end
     end
+    if not ran then sh.status = 0 end -- no branch taken (no else) -> status 0, like bash
   else
     error("interp: bad stmt " .. tostring(t))
   end
