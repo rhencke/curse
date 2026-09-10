@@ -627,7 +627,9 @@ end
 local function array_slice(els, off, len)
   local n = #els
   off = off or 0
-  if off < 0 then off = n + off; if off < 0 then off = 0 end end
+  -- a negative offset counts from the end; if it reaches past the start, bash
+  -- yields an EMPTY slice (not the whole array — don't clamp to 0).
+  if off < 0 then off = n + off; if off < 0 then return {} end end
   local last = n
   if len ~= nil then last = (len < 0) and (n + len) or (off + len) end
   local out = {}
