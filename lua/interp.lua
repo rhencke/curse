@@ -1724,9 +1724,18 @@ local function exec_simple(sh, args, hook, no_func)
       return true
     end
     local function list_decls()
+      -- plain `declare`/`typeset` (no attribute flags, no -p) prints bare
+      -- `name=value` like `set`; with a flag or -p it prints `declare -X name=…`.
+      local bare = (cmd == "declare" or cmd == "typeset") and not printmode
+        and not (doexport or rattr or iattr or lattr or uattr or aattr or assoc or nref)
       local names = {}; for nm in pairs(sh.vars) do names[#names + 1] = nm end
       table.sort(names)
-      for _, nm in ipairs(names) do if decl_match(nm, sh.vars[nm]) then local d = fmt_decl(sh, nm); if d then sh:echo(d) end end end
+      for _, nm in ipairs(names) do
+        if decl_match(nm, sh.vars[nm]) then
+          local d = bare and fmt_set_var(nm, sh.vars[nm]) or fmt_decl(sh, nm)
+          if d then sh:echo(d) end
+        end
+      end
     end
     if funcnames or funcbody then
       -- declare -F [name…] lists `declare -f NAME`; -f prints bodies (not
@@ -2253,7 +2262,14 @@ local function exec_simple(sh, args, hook, no_func)
         if a:find("n") then plusn = true end
       else rest[#rest + 1] = a end
     end
-    if not (nref or assoc or plusn) then
+    if #rest == 0 and not (nref or assoc or plusn) then
+      -- bare `local` / `local -p`: list this frame's local variables (bash format)
+      local saved, names = sh.savedstack[sh.pd], {}
+      if saved then for nm in pairs(saved) do names[#names + 1] = nm end end
+      table.sort(names)
+      for _, nm in ipairs(names) do local d = fmt_decl(sh, nm); if d then sh:echo(d) end end
+      sh.status = 0
+    elseif not (nref or assoc or plusn) then
       for _, a in ipairs(rest) do
         sh:localAssign(a)
         if sh.opt_a then local nm = a:match("^([%a_][%w_]*)"); local b = nm and sh.vars[sh:deref(nm)]
