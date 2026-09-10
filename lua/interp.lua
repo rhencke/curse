@@ -918,6 +918,13 @@ local function apply_redirs(sh, redirs)
   local function backup(fd) save[#save + 1] = { fd = fd, saved = C.dup(fd) } end
   -- redirect targets are word-expanded at runtime (e.g. `> $TMP/f`, `>& $myfd`).
   local function tgt(r) return expand_word(sh, P.parse_word(r.target or "")) end
+  -- A FILE redirect target is glob-expanded and word-split like any word; bash
+  -- requires it to resolve to EXACTLY ONE word, else "ambiguous redirect".
+  local function ftgt(r)
+    local fs = expand_to_fields(sh, P.parse_word(r.target or ""))
+    if #fs ~= 1 then io.stderr:write("curse: " .. (r.target or "") .. ": ambiguous redirect\n"); return nil end
+    return fs[1]
+  end
   for _, r in ipairs(redirs) do
     -- `{var}>…`: allocate a fresh fd (>=10), store it in `var`, and redirect there.
     -- `{var}>&-` instead closes the fd already stored in `var` (no allocation).
@@ -931,26 +938,33 @@ local function apply_redirs(sh, redirs)
     end
     if r.op == "out" then
       -- noclobber (set -C): O_EXCL so `>` fails on an existing file (705 adds O_EXCL)
-      backup(r.fd); local f = C.open(tgt(r), sh.opt_C and 705 or 577, 420)
-      if f >= 0 then place_fd(f, r.fd) else ok = false end
+      local t = ftgt(r); if not t then ok = false else
+      backup(r.fd); local f = C.open(t, sh.opt_C and 705 or 577, 420)
+      if f >= 0 then place_fd(f, r.fd) else ok = false end end
     elseif r.op == "clobber" then -- `>|` truncates regardless of noclobber
-      backup(r.fd); local f = C.open(tgt(r), 577, 420)
-      if f >= 0 then place_fd(f, r.fd) else ok = false end
+      local t = ftgt(r); if not t then ok = false else
+      backup(r.fd); local f = C.open(t, 577, 420)
+      if f >= 0 then place_fd(f, r.fd) else ok = false end end
     elseif r.op == "app" then
-      backup(r.fd); local f = C.open(tgt(r), 1089, 420)
-      if f >= 0 then place_fd(f, r.fd) else ok = false end
+      local t = ftgt(r); if not t then ok = false else
+      backup(r.fd); local f = C.open(t, 1089, 420)
+      if f >= 0 then place_fd(f, r.fd) else ok = false end end
     elseif r.op == "in" then
-      backup(r.fd); local f = C.open(tgt(r), 0, 0)
-      if f >= 0 then place_fd(f, r.fd) else ok = false end
+      local t = ftgt(r); if not t then ok = false else
+      backup(r.fd); local f = C.open(t, 0, 0)
+      if f >= 0 then place_fd(f, r.fd) else ok = false end end
     elseif r.op == "rw" then -- `N<>file`: open read+write (O_RDWR|O_CREAT, no truncate)
-      backup(r.fd); local f = C.open(tgt(r), 66, 420)
-      if f >= 0 then place_fd(f, r.fd) else ok = false end
+      local t = ftgt(r); if not t then ok = false else
+      backup(r.fd); local f = C.open(t, 66, 420)
+      if f >= 0 then place_fd(f, r.fd) else ok = false end end
     elseif r.op == "outboth" then -- `&>` truncation honors noclobber (O_EXCL) too
-      backup(1); backup(2); local f = C.open(tgt(r), sh.opt_C and 705 or 577, 420)
-      if f >= 0 then C.dup2(f, 1); C.dup2(f, 2); C.close(f) else ok = false end
+      local t = ftgt(r); if not t then ok = false else
+      backup(1); backup(2); local f = C.open(t, sh.opt_C and 705 or 577, 420)
+      if f >= 0 then C.dup2(f, 1); C.dup2(f, 2); C.close(f) else ok = false end end
     elseif r.op == "appboth" then -- `&>>`: append stdout+stderr (append ignores noclobber)
-      backup(1); backup(2); local f = C.open(tgt(r), 1089, 420)
-      if f >= 0 then C.dup2(f, 1); C.dup2(f, 2); C.close(f) else ok = false end
+      local t = ftgt(r); if not t then ok = false else
+      backup(1); backup(2); local f = C.open(t, 1089, 420)
+      if f >= 0 then C.dup2(f, 1); C.dup2(f, 2); C.close(f) else ok = false end end
     elseif r.op == "heredoc" then
       local body = r.expand and expand_word(sh, P.parse_heredoc(r.body or "")) or (r.body or "")
       backup(r.fd or 0); feed_stdin(r.fd or 0, body)
