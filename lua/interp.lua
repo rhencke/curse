@@ -445,7 +445,9 @@ local function expand_part_str(sh, p)
     return sh:param(p.param)
   elseif p.special then
     if p.special == "#" then return tostring(sh.nparams)
-    elseif p.special == "@" or p.special == "*" then return sh:paramsJoin(" ")
+    elseif p.special == "*" then -- $* joins on the first IFS char; $@ always on a space
+      return sh:paramsJoin(sh.vars["IFS"] and sh:get("IFS"):sub(1, 1) or " ")
+    elseif p.special == "@" then return sh:paramsJoin(" ")
     elseif p.special == "?" then return tostring(sh.status)
     elseif p.special == "$" then return tostring(sh:pid())
     elseif p.special == "!" then return sh.last_bg_pid or ""
