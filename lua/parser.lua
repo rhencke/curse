@@ -15,7 +15,11 @@ local function arith(src, nodefer)
   -- word-expanded and then re-parsed as pure arithmetic (nodefer). Plain $name and
   -- $digit ARE handled natively (as var/param nodes), so they aren't deferred —
   -- this keeps function inlining (which substitutes those params) working.
-  if not nodefer and (src:find("%${") or src:find("%$%(") or src:find("`")) then
+  -- Also defer when a `$` abuts a name character (`f$x`, `x$foo[5]`, `$x$y`):
+  -- there the expansion forms part of a compound variable NAME, which bash builds
+  -- by expanding first — the arith grammar can't parse the raw `$` mid-token.
+  if not nodefer and (src:find("%${") or src:find("%$%(") or src:find("`")
+      or src:find("[%w_]%$")) then
     return { k = "xpand", raw = src }
   end
   local i, n = 1, #src
