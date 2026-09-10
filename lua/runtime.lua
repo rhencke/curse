@@ -238,6 +238,7 @@ function Shell:capture_src(src)
   self.in_subprogram = self.in_subprogram - 1
   self.out = saved
   if not ok then error(err) end
+  self.last_cmdsub_status = self.status -- for a command whose argv is empty after expansion
   return (table.concat(buf):gsub("\n+$", ""))
 end
 

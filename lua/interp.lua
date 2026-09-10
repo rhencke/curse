@@ -2113,6 +2113,15 @@ local function exec_stmt(sh, st, hook)
       end
       if wi == 1 then is_assign = ASSIGN_CMD[args[1]] ~= nil end
     end
+    -- A command whose argv is empty after expansion but which contained command
+    -- substitution(s) takes the LAST cmdsub's exit status (bash: `false` -> 1,
+    -- $(exit 42) -> 42). With no cmdsub and no assigns it's a no-op (status 0).
+    if #args == 0 and not st.assigns then
+      local hadcs = false
+      for _, w in ipairs(st.words) do for _, p in ipairs(w.parts) do if p.cmdsub then hadcs = true; break end end end
+      sh.status = hadcs and (sh.last_cmdsub_status or 0) or 0
+      return
+    end
     if st.arrayargs then -- `declare -A a=(...)` / `local -a b=(...)` array literals
       local assoc = false
       for _, a in ipairs(args) do
