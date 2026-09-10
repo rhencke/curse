@@ -21,6 +21,8 @@ ffi.cdef [[
   int curse_stat(const char *path, void *buf) asm("stat");
   int fork(void);
   int dup2(int oldfd, int newfd);
+  int dup(int oldfd);
+  int open(const char *path, int flags, unsigned int mode);
   void _exit(int status);
 ]]
 local C = ffi.C
@@ -163,6 +165,61 @@ end
 
 local exec_list  -- forward
 
+-- ---- redirections ----
+-- Apply a command's redirs, saving fds 0/1/2 for restore. open flags: 577 =
+-- O_WRONLY|O_CREAT|O_TRUNC, 1089 = |O_APPEND, 0 = O_RDONLY; mode 0644.
+local function apply_redirs(redirs)
+  local save = { C.dup(0), C.dup(1), C.dup(2) }
+  for _, r in ipairs(redirs) do
+    if r.op == "out" then local f = C.open(r.target, 577, 420); if f >= 0 then C.dup2(f, r.fd); C.close(f) end
+    elseif r.op == "app" then local f = C.open(r.target, 1089, 420); if f >= 0 then C.dup2(f, r.fd); C.close(f) end
+    elseif r.op == "in" then local f = C.open(r.target, 0, 0); if f >= 0 then C.dup2(f, r.fd); C.close(f) end
+    elseif r.op == "outboth" then local f = C.open(r.target, 577, 420); if f >= 0 then C.dup2(f, 1); C.dup2(f, 2); C.close(f) end
+    elseif r.op == "dup" or r.op == "dupin" then
+      if r.target == "-" then C.close(r.fd) else local m = tonumber(r.target); if m then C.dup2(m, r.fd) end end
+    end
+  end
+  return save
+end
+local function restore_redirs(save)
+  for fd = 0, 2 do local s = save[fd + 1]; if s >= 0 then C.dup2(s, fd); C.close(s) end end
+end
+
+-- Dispatch one already-expanded simple command (no redirs — the caller sets those
+-- up). Builtins first, then user functions, then external.
+local function exec_simple(sh, args, hook)
+  local cmd = args[1]
+  if cmd == nil then sh.status = 0
+  elseif cmd == "echo" then sh:echo(unpack(args, 2))
+  elseif cmd == ":" or cmd == "true" then sh.status = 0
+  elseif cmd == "false" then sh.status = 1
+  elseif cmd == "[" or cmd == "test" then do_test(sh, args)
+  elseif cmd == "return" then
+    error({ __curse_return = args[2] and tonumber(args[2]) or sh.status })
+  elseif cmd == "exit" then
+    error({ __curse_exit = args[2] and tonumber(args[2]) or sh.status })
+  elseif cmd == "cd" then
+    local dir = args[2] or os.getenv("HOME") or ""
+    sh.status = (C.chdir(dir) == 0) and 0 or 1
+  elseif cmd == "unset" then
+    for j = 2, #args do sh.vars[args[j]] = nil end
+    sh.status = 0
+  elseif cmd == "local" then
+    for j = 2, #args do sh:localAssign(args[j]) end
+    sh.status = 0
+  elseif sh.functions[cmd] then
+    sh.calldepth = sh.calldepth + 1 -- OSR gate: no handoff inside a call
+    sh:pushCall(unpack(args, 2))
+    local ok, err = pcall(exec_list, sh, sh.functions[cmd], hook, false)
+    sh:popCall()
+    sh.calldepth = sh.calldepth - 1
+    if not ok then
+      if type(err) == "table" and err.__curse_return then sh.status = err.__curse_return
+      else error(err) end
+    end
+  else sh:exec(unpack(args)) end -- external command
+end
+
 local function exec_stmt(sh, st, hook)
   local t = st.t
   if t == "assign" then
@@ -175,36 +232,16 @@ local function exec_stmt(sh, st, hook)
   elseif t == "simple" then
     local args = {}
     for _, w in ipairs(st.words) do args[#args + 1] = expand_word(sh, w) end
-    local cmd = args[1]
-    if cmd == "echo" then
-      sh:echo(unpack(args, 2))
-    elseif cmd == ":" or cmd == "true" then sh.status = 0
-    elseif cmd == "false" then sh.status = 1
-    elseif cmd == "[" or cmd == "test" then do_test(sh, args)
-    elseif cmd == "return" then
-      error({ __curse_return = args[2] and tonumber(args[2]) or sh.status })
-    elseif cmd == "exit" then
-      error({ __curse_exit = args[2] and tonumber(args[2]) or sh.status })
-    elseif cmd == "cd" then
-      local dir = args[2] or os.getenv("HOME") or ""
-      sh.status = (C.chdir(dir) == 0) and 0 or 1
-    elseif cmd == "unset" then
-      for j = 2, #args do sh.vars[args[j]] = nil end
-      sh.status = 0
-    elseif cmd == "local" then
-      for j = 2, #args do sh:localAssign(args[j]) end
-      sh.status = 0
-    elseif sh.functions[cmd] then
-      sh.calldepth = sh.calldepth + 1 -- OSR gate: no handoff inside a call
-      sh:pushCall(unpack(args, 2))
-      local ok, err = pcall(exec_list, sh, sh.functions[cmd], hook, false)
-      sh:popCall()
-      sh.calldepth = sh.calldepth - 1
-      if not ok then
-        if type(err) == "table" and err.__curse_return then sh.status = err.__curse_return
-        else error(err) end
-      end
-    else sh:exec(unpack(args)) end -- external command
+    if st.redirs then
+      -- reconfigure fds and route builtin output (sh.out) to fd 1 for the command
+      local save, savedout = apply_redirs(st.redirs), sh.out
+      sh.out = io.write
+      local ok, err = pcall(exec_simple, sh, args, hook)
+      io.flush(); sh.out = savedout; restore_redirs(save)
+      if not ok then error(err) end
+    else
+      exec_simple(sh, args, hook)
+    end
   elseif t == "forc" then
     if st.init then eval(sh, st.init) end
     while true do

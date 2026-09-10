@@ -277,6 +277,30 @@ function M.parse(src)
     return stmts
   end
 
+  -- Try to read a redirection at the current position; returns a redir table and
+  -- advances i, or nil (leaving i put) if there isn't one. Handles
+  -- [N]> [N]>> [N]< >&M N>&M &> [N]>&- ; heredocs (<<) are left to parse_command.
+  local function parse_redir()
+    local p = i
+    local fd = src:match("^%d+", p)
+    local q = fd and (p + #fd) or p
+    local c = src:sub(q, q)
+    local op, tfd
+    if c == ">" then
+      if src:sub(q, q + 1) == ">&" then op = "dup"; tfd = fd and tonumber(fd) or 1; q = q + 2
+      elseif src:sub(q, q + 1) == ">>" then op = "app"; tfd = fd and tonumber(fd) or 1; q = q + 2
+      else op = "out"; tfd = fd and tonumber(fd) or 1; q = q + 1 end
+    elseif c == "<" then
+      if src:sub(q, q + 1) == "<<" then return nil end -- heredoc/herestring: not here
+      if src:sub(q, q + 1) == "<&" then op = "dupin"; tfd = fd and tonumber(fd) or 0; q = q + 2
+      else op = "in"; tfd = fd and tonumber(fd) or 0; q = q + 1 end
+    elseif c == "&" and src:sub(q, q + 1) == "&>" then op = "outboth"; tfd = 1; q = q + 2
+    else return nil end
+    i = q; ws()
+    local target = unquote(word())
+    return { fd = tfd, op = op, target = target }
+  end
+
   local function parse_command()
     ws()
     -- function NAME [()] { … }   or   NAME() { … }
@@ -388,18 +412,21 @@ function M.parse(src)
     -- simple command: WORD WORD ...
     local ln = line
     local words = {}
+    local redirs = {}
     while i <= n do
       local c = src:sub(i, i)
-      if c == "\n" or c == ";" or c == "#" or c == "&" or c == "|" then break end
-      if c:match("[ \t]") then ws()
+      local r = parse_redir() -- also catches &> before the & break below
+      if r then redirs[#redirs + 1] = r
+      elseif c == "\n" or c == ";" or c == "#" or c == "&" or c == "|" then break
+      elseif c:match("[ \t]") then ws()
       else
         local w = word()
         if w == "" then break end
         words[#words + 1] = parse_word(unquote(w))
       end
     end
-    if #words == 0 then return nil end
-    return { t = "simple", line = ln, words = words }
+    if #words == 0 and #redirs == 0 then return nil end
+    return { t = "simple", line = ln, words = words, redirs = (#redirs > 0 and redirs or nil) }
   end
 
   -- pipeline: cmd [ | cmd ]*   (optional leading `!` negates the exit status)

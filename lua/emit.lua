@@ -523,6 +523,7 @@ local function assert_compilable(stmts)
     elseif t == "forc" or t == "forin" or t == "funcdef" then
       assert_compilable(st.body)
     elseif t == "simple" then
+      if st.redirs then error("curse-nocompile: redirection") end
       local w1 = st.words[1]
       local cmd = w1 and w1.parts[1] and w1.parts[1].lit
       if cmd == "test" or cmd == "[" or cmd == "exit" or cmd == "cd" or cmd == "unset" then
