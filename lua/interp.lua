@@ -1447,33 +1447,53 @@ local function exec_simple(sh, args, hook, no_func)
     sh.status = 0; if (sh.loopdepth or 0) > 0 then error({ __curse_continue = tonumber(args[2]) or 1 }) end
   elseif cmd == "eval" then
     -- eval [--]: join args, parse, run in the CURRENT shell (return/exit propagate).
-    local start = (args[2] == "--") and 3 or 2
-    local code = table.concat({ unpack(args, start) }, " ")
-    if code:match("%S") then
-      local ok, parsed = pcall(require("parser").parse, code)
-      if not ok then io.stderr:write("curse: eval: " .. tostring(parsed) .. "\n"); sh.status = 2
-      else exec_list(sh, parsed.stmts, hook, false) end
-    else sh.status = 0 end
+    if args[2] and args[2] ~= "-" and args[2] ~= "--" and args[2]:sub(1, 1) == "-" then
+      io.stderr:write("curse: eval: " .. args[2] .. ": invalid option\n"); sh.status = 2
+    else
+      local start = (args[2] == "--") and 3 or 2
+      local code = table.concat({ unpack(args, start) }, " ")
+      if code:match("%S") then
+        local ok, parsed = pcall(require("parser").parse, code)
+        if not ok then io.stderr:write("curse: eval: " .. tostring(parsed) .. "\n"); sh.status = 2
+        else exec_list(sh, parsed.stmts, hook, false) end
+      else sh.status = 0 end
+    end
   elseif cmd == "source" or cmd == "." then
     -- source FILE [args]: run FILE in the current shell; a `return` ends the file.
-    local file = args[2]
-    local f = file and io.open(file, "r")
-    if not f then io.stderr:write("curse: " .. cmd .. ": " .. tostring(file) .. ": No such file or directory\n"); sh.status = 1
+    -- A name with no slash is looked up in $PATH (files only, dirs skipped), then
+    -- falls back to the bare name; `--` ends options.
+    local j = 2
+    if args[j] == "--" then j = j + 1 end
+    local name = args[j]
+    local file = name
+    if name and not name:find("/", 1, true) then
+      for dir in (sh:get("PATH") .. ":"):gmatch("([^:]*):") do
+        local cand = (dir == "" and "." or dir) .. "/" .. name
+        if file_test("-f", cand) then file = cand; break end
+      end
+    end
+    if not name then io.stderr:write("curse: " .. cmd .. ": filename argument required\n"); sh.status = 2
+    elseif file_test("-d", file) then
+      io.stderr:write("curse: " .. cmd .. ": " .. name .. ": is a directory\n"); sh.status = 1
     else
-      local src = f:read("*a"); f:close()
-      local ok, parsed = pcall(require("parser").parse, src)
-      if not ok then sh.status = 2
+      local f = io.open(file, "r")
+      if not f then io.stderr:write("curse: " .. cmd .. ": " .. name .. ": No such file or directory\n"); sh.status = 1
       else
-        local savep, savenp = sh.params, sh.nparams
-        if #args > 2 then
-          sh.params, sh.nparams = {}, 0
-          for k = 3, #args do sh.nparams = sh.nparams + 1; sh.params[sh.nparams] = args[k] end
-        end
-        local rok, err = pcall(exec_list, sh, parsed.stmts, hook, false)
-        if #args > 2 then sh.params, sh.nparams = savep, savenp end
-        if not rok then
-          if type(err) == "table" and err.__curse_return then sh.status = err.__curse_return
-          else error(err) end -- exit propagates
+        local src = f:read("*a"); f:close()
+        local ok, parsed = pcall(require("parser").parse, src)
+        if not ok then sh.status = 2
+        else
+          local savep, savenp = sh.params, sh.nparams
+          if #args > j then
+            sh.params, sh.nparams = {}, 0
+            for k = j + 1, #args do sh.nparams = sh.nparams + 1; sh.params[sh.nparams] = args[k] end
+          end
+          local rok, err = pcall(exec_list, sh, parsed.stmts, hook, false)
+          if #args > j then sh.params, sh.nparams = savep, savenp end
+          if not rok then
+            if type(err) == "table" and err.__curse_return then sh.status = err.__curse_return
+            else error(err) end -- exit propagates
+          end
         end
       end
     end
