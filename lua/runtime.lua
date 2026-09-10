@@ -10,6 +10,9 @@ local i64 = ffi.typeof("int64_t")
 
 local M = {}
 M.i64 = i64
+-- Single-quote a string for reuse as shell input: 'x' with embedded ' -> '\''.
+-- (Used by ${x@Q}/@A/@K, declare -p, set, and procsub's inner `sh -c`.)
+function M.shell_quote(s) return "'" .. s:gsub("'", "'\\''") .. "'" end
 
 local Shell = {}
 Shell.__index = Shell
@@ -958,13 +961,13 @@ function Shell:expand_param(pe, arg, arg2, idxnum)
   if op == "@" then -- ${x@OP} transforms; on an UNSET var they yield empty
     if not isset then return "" end
     if arg == "a" then return self:attr_string(name) end
-    if arg == "A" then return name .. "=" .. ("'" .. val:gsub("'", "'\\''") .. "'") end -- declare-able form
+    if arg == "A" then return name .. "=" .. M.shell_quote(val) end -- declare-able form
   end
   return self:apply_str_op(op, val, arg, arg2)
 end
 
 -- Shell-quote a string so it round-trips through eval (single-quote form).
-local function shell_quote(s) return "'" .. s:gsub("'", "'\\''") .. "'" end
+local shell_quote = M.shell_quote
 
 -- Decode PS1 prompt backslash-escapes (for ${x@P}). Parameter/command expansion
 -- of the result is done by the caller (interp) afterward.

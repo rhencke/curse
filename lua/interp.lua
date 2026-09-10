@@ -82,7 +82,7 @@ end
 local function sq(s)
   if s == "" then return "''" end
   if s:match("^[%w_,.:/@%%+=%-]+$") then return s end
-  return "'" .. s:gsub("'", "'\\''") .. "'"
+  return rt.shell_quote(s)
 end
 -- Field-split a line for `read` into exactly `nvars` values. Skips leading IFS
 -- whitespace; each field but the last stops at an IFS char (a run of IFS
@@ -2637,6 +2637,22 @@ local function child_status(sh, ok, err)
   if not ok and type(err) == "table" then sh.status = err.__curse_exit or err.__curse_return or sh.status end
 end
 
+-- Expand a simple command's words into `args` (in place). Module-level (not a
+-- per-command closure) so it can be pcall'd directly without allocating. When the
+-- command is a static declaration builtin, `name=value` words are assignment words
+-- (no split/glob); everything else goes through the field engine.
+local function expand_args(sh, st, args, is_assign)
+  for wi, w in ipairs(st.words) do
+    local p1 = w.parts[1]
+    if wi > 1 and is_assign and p1 and p1.lit and p1.lit:match("^[%a_][%w_]*%+?=") then
+      args[#args + 1] = expand_assign_word(sh, w, true) -- name=value word: no glob, ~ after =/:
+    else
+      local fs = expand_to_fields(sh, w)
+      for k = 1, #fs do args[#args + 1] = fs[k] end
+    end
+  end
+end
+
 -- Declaration builtins whose `name=value` arguments are assignment words.
 local ASSIGN_CMD = { export = 1, declare = 1, typeset = 1, readonly = 1, ["local"] = 1 }
 -- compound commands whose trailing redirs (`done < f`, `fi > f`) apply to the
@@ -2788,17 +2804,7 @@ local function exec_stmt(sh, st, hook)
     local args = {}
     -- A word-expansion error (bad substitution, invalid indirect name) aborts the
     -- WHOLE simple command with status 1 but is non-fatal: the script continues.
-    local eok, eerr = pcall(function()
-      for wi, w in ipairs(st.words) do
-        local p1 = w.parts[1]
-        if wi > 1 and is_assign and p1 and p1.lit and p1.lit:match("^[%a_][%w_]*%+?=") then
-          args[#args + 1] = expand_assign_word(sh, w, true) -- name=value word: no glob, ~ after =/:
-        else
-          local fs = expand_to_fields(sh, w)
-          for k = 1, #fs do args[#args + 1] = fs[k] end
-        end
-      end
-    end)
+    local eok, eerr = pcall(expand_args, sh, st, args, is_assign)
     if not eok then
       if type(eerr) == "table" and eerr.__curse_experr then
         sh.status = 1
@@ -2907,8 +2913,19 @@ local function exec_stmt(sh, st, hook)
     if (sh.in_subprogram or 0) == 0 and sh.procsub_pending then
       for _, ps in ipairs(sh.procsub_pending) do
         io.flush()
-        local q = "'" .. ps.cmd:gsub("'", "'\\''") .. "'"
-        os.execute(("sh -c %s < '%s'"):format(q, ps.file))
+        -- Run the >(cmd) body in a forked child through curse's OWN interpreter
+        -- (never `sh -c`, which would recurse once curse is /bin/sh), with stdin
+        -- redirected from the temp file the outer command wrote.
+        local pid = C.fork()
+        if pid == 0 then
+          local fd = C.open(ps.file, 0, 0) -- O_RDONLY
+          if fd >= 0 then C.dup2(fd, 0); C.close(fd) end
+          sh.in_subprogram = (sh.in_subprogram or 0) + 1; sh.out = io.write
+          local ok, err = pcall(function() exec_list(sh, P.parse(ps.cmd).stmts, function() end, false) end)
+          child_status(sh, ok, err)
+          io.flush(); C._exit(sh.status or 0)
+        end
+        local stbuf = ffi.new("int[1]"); C.waitpid(pid, stbuf, 0)
       end
       sh.procsub_pending = nil
     end
