@@ -734,6 +734,19 @@ local function shell_quote(s) return "'" .. s:gsub("'", "'\\''") .. "'" end
 
 -- Decode PS1 prompt backslash-escapes (for ${x@P}). Parameter/command expansion
 -- of the result is done by the caller (interp) afterward.
+-- $- : the current option flags. h/B are always on (like bash); set flags and the
+-- -i/-c invocation modes are appended in bash-ish order.
+function Shell:dash_flags()
+  local s = "h"
+  if self.opt_e then s = s .. "e" end
+  if self.opt_u then s = s .. "u" end
+  if self.opt_C then s = s .. "C" end
+  s = s .. "B"
+  if self.opt_i then s = s .. "i" end
+  if self.opt_c then s = s .. "c" end
+  return s
+end
+
 function Shell:prompt_escapes(s)
   local out, i, n = {}, 1, #s
   while i <= n do

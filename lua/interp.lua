@@ -254,7 +254,8 @@ local function expand_part_str(sh, p)
     elseif p.special == "@" or p.special == "*" then return sh:paramsJoin(" ")
     elseif p.special == "?" then return tostring(sh.status)
     elseif p.special == "$" then return tostring(sh:pid())
-    elseif p.special == "!" then return sh.last_bg_pid or "" end
+    elseif p.special == "!" then return sh.last_bg_pid or ""
+    elseif p.special == "-" then return sh:dash_flags() end
     return ""
   elseif p.arith then return rt.i64_to_str(eval(sh, require("parser").arith(p.arith)))
   elseif p.cmdsub then return sh:capture_src(p.cmdsub)

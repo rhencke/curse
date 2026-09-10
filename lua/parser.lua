@@ -279,7 +279,7 @@ local function parse_dollar(w, i, add, q)
     local part = parse_paramexp(w:sub(i + 2, j - 1)); part.q = q; add(part); return j + 1
   elseif nx:match("%d") then
     add({ param = tonumber(nx), q = q }); return i + 2
-  elseif nx == "#" or nx == "@" or nx == "*" or nx == "?" or nx == "$" or nx == "!" then
+  elseif nx == "#" or nx == "@" or nx == "*" or nx == "?" or nx == "$" or nx == "!" or nx == "-" then
     add({ special = nx, q = q }); return i + 2
   else
     local s, e = w:find("^%$([%a_][%w_]*)", i)

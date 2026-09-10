@@ -22,39 +22,60 @@ local T = require("tier")
 
 local sh
 
--- `-c CODE [name [args…]]` — run a command string like `sh -c` (so a script can
--- invoke curse as $SH). Lazy interp; $0 = name, $1.. = args.
-if arg[1] == "-c" then
-  sh = T.rt.Shell.new()
-  sh.argv0 = arg[3] or "curse"
-  for k = 4, #arg do sh.nparams = sh.nparams + 1; sh.params[sh.nparams] = arg[k] end
-  T.interp.run_lazy(sh, arg[2] or "")
+-- Collect leading shell options (as `sh -e -u -o NAME -O NAME` before -c/script).
+local ai, presets = 1, {}
+while true do
+  local a = arg[ai]
+  if a == "-e" or a == "+e" then presets[#presets + 1] = { f = "opt_e", on = a == "-e" }; ai = ai + 1
+  elseif a == "-u" or a == "+u" then presets[#presets + 1] = { f = "opt_u", on = a == "-u" }; ai = ai + 1
+  elseif a == "-C" or a == "+C" then presets[#presets + 1] = { f = "opt_C", on = a == "-C" }; ai = ai + 1
+  elseif a == "-o" or a == "+o" then presets[#presets + 1] = { o = arg[ai + 1], on = a == "-o" }; ai = ai + 2
+  elseif a == "-O" or a == "+O" then presets[#presets + 1] = { shopt = arg[ai + 1], on = a == "-O" }; ai = ai + 2
+  elseif a == "--norc" or a == "--noprofile" or a == "--rcfile" then
+    ai = ai + (a == "--rcfile" and 2 or 1) -- ignore rc flags
+  else break end
+end
+local OMAP = { errexit = "opt_e", nounset = "opt_u", noclobber = "opt_C", pipefail = "opt_pipefail" }
+local function apply(s)
+  for _, p in ipairs(presets) do
+    if p.f then s[p.f] = p.on
+    elseif p.o and OMAP[p.o] then s[OMAP[p.o]] = p.on
+    elseif p.shopt then s.shopt[p.shopt] = p.on end
+  end
+end
+
+-- `-c CODE [name [args…]]` — run a command string like `sh -c`.
+if arg[ai] == "-c" then
+  sh = T.rt.Shell.new(); apply(sh); sh.opt_c = true
+  sh.argv0 = arg[ai + 2] or "curse"
+  for k = ai + 3, #arg do sh.nparams = sh.nparams + 1; sh.params[sh.nparams] = arg[k] end
+  T.interp.run_lazy(sh, arg[ai + 1] or "")
   io.flush(); os.exit(sh.status or 0)
 end
 
 -- No script (or `-i`): interactive REPL (readline line editing + history).
-if arg[1] == nil or arg[1] == "-i" then
-  sh = T.rt.Shell.new(); sh.argv0 = "curse"
+if arg[ai] == nil or arg[ai] == "-i" then
+  sh = T.rt.Shell.new(); apply(sh); sh.argv0 = "curse"; sh.opt_i = (arg[ai] == "-i")
   require("repl").run(sh)
   io.flush(); os.exit(sh.status or 0)
 end
 
-local script = arg[1] or error("usage: run.lua <script.sh> [tiered|compiled|interp] | -c CODE | -i")
-local mode = arg[2] or "tiered"
+local script = arg[ai] or error("usage: run.lua <script.sh> [tiered|compiled|interp] | -c CODE | -i")
+local mode = arg[ai + 1] or "tiered"
 if mode == "cached" then
   -- persistent artifact cache: warm hit skips parse+emit; cold compiles+stores;
   -- any cache failure falls back to running uncached. This is the CLI/build/boot
   -- path (one-shot invocations that recur), reported on stderr for visibility.
   local Cache = require("cache")
   local f = assert(io.open(script, "r")); local src = f:read("*a"); f:close()
-  sh = T.rt.Shell.new(); sh.argv0 = script
+  sh = T.rt.Shell.new(); apply(sh); sh.argv0 = script
   local _, how = Cache.run(src, sh)
   if os.getenv("CURSE_CACHE_DEBUG") then io.stderr:write("[cache: " .. how .. "]\n") end
 elseif mode == "tiered" then
   sh = T.run_background(script, { luajit = os.getenv("CURSE_LUAJIT") or "luajit" })
 else
   local f = assert(io.open(script, "r")); local src = f:read("*a"); f:close()
-  sh = T.rt.Shell.new(); sh.argv0 = script
+  sh = T.rt.Shell.new(); apply(sh); sh.argv0 = script
   if mode == "compiled" then
     T.compile(T.parser.parse(src)).run(sh, nil)
   elseif mode == "interp" then
