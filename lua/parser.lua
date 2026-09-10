@@ -260,6 +260,46 @@ local function parse_word(w)
 end
 M.parse_word = parse_word
 
+-- Parse a [[ … ]] token list into a boolean-expression AST:
+--   {kind="and"/"or", l, r} | {kind="not", e} | {kind="str", word}
+--   {kind="unary", op, word} | {kind="binary", op, l, r, rq}
+-- `rq` marks the RHS of ==/!= as fully-quoted (literal, not a glob).
+local function parse_dbracket(toks, quoted)
+  local pos = 1
+  local function peek() return toks[pos] end
+  local parse_or
+  local function primary()
+    local t = peek()
+    if t == "!" then pos = pos + 1; return { kind = "not", e = primary() } end
+    if t == "(" then pos = pos + 1; local e = parse_or(); if peek() == ")" then pos = pos + 1 end; return e end
+    if t and t:match("^%-[a-zA-Z]$") then -- unary file/string test
+      pos = pos + 2; return { kind = "unary", op = t, word = parse_word(toks[pos - 1] or "") }
+    end
+    pos = pos + 1 -- consume lhs
+    local op = peek()
+    if op == "==" or op == "!=" or op == "=~" or op == "=" or op == "<" or op == ">"
+      or (op and op:match("^%-[a-z][a-z]$")) then
+      pos = pos + 1
+      local r = toks[pos]; pos = pos + 1
+      return { kind = "binary", op = op, l = parse_word(t), r = parse_word(r or ""),
+        rq = quoted[pos - 1] }
+    end
+    return { kind = "str", word = parse_word(t or "") }
+  end
+  local function parse_and()
+    local l = primary()
+    while peek() == "&&" do pos = pos + 1; l = { kind = "and", l = l, r = primary() } end
+    return l
+  end
+  parse_or = function()
+    local l = parse_and()
+    while peek() == "||" do pos = pos + 1; l = { kind = "or", l = l, r = parse_and() } end
+    return l
+  end
+  return parse_or()
+end
+M.parse_dbracket = parse_dbracket
+
 -- strip surrounding quotes from a raw shell word (subset: whole-word "…" or '…')
 local function unquote(w)
   if #w >= 2 and ((w:sub(1, 1) == '"' and w:sub(-1) == '"') or (w:sub(1, 1) == "'" and w:sub(-1) == "'")) then
@@ -444,6 +484,22 @@ function M.parse(src)
     if src:sub(i, i + 1) == "((" then
       local body, ni = grab_dparen(src, i + 2); i = ni
       return { t = "arithcmd", line = line, expr = arith(body) }
+    end
+    -- [[ EXPR ]] conditional (no word-splitting; == is glob, =~ is regex)
+    if src:sub(i, i + 1) == "[[" and src:sub(i + 2, i + 2):match("[ \t]") then
+      i = i + 2
+      local toks, quoted = {}, {}
+      while true do
+        ws()
+        if i > n or src:sub(i, i) == "\n" then break end
+        if src:sub(i, i + 1) == "]]" then i = i + 2; break end
+        local w = word()
+        if w == "" then break end
+        local c1 = w:sub(1, 1)
+        toks[#toks + 1] = w
+        quoted[#toks] = (c1 == '"' or c1 == "'")
+      end
+      return { t = "dbracket", line = line, expr = parse_dbracket(toks, quoted) }
     end
     -- case WORD in  PAT|PAT) BODY ;;  … esac
     if peekword() == "case" then

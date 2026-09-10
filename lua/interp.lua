@@ -297,6 +297,28 @@ local function exec_simple(sh, args, hook)
   else sh:exec(unpack(args)) end -- external command
 end
 
+-- [[ … ]] evaluation. Reuses the test builtin's unary/binary; == is a shell glob
+-- (literal when the RHS was quoted), =~ a regex (Lua-pattern approximation of ERE).
+local function eval_dbracket(sh, node)
+  local k = node.kind
+  if k == "and" then return eval_dbracket(sh, node.l) and eval_dbracket(sh, node.r) end
+  if k == "or" then return eval_dbracket(sh, node.l) or eval_dbracket(sh, node.r) end
+  if k == "not" then return not eval_dbracket(sh, node.e) end
+  if k == "str" then return expand_word(sh, node.word) ~= "" end
+  if k == "unary" then return unary(node.op, expand_word(sh, node.word)) end
+  if k == "binary" then
+    local l, r, op = expand_word(sh, node.l), expand_word(sh, node.r), node.op
+    if op == "==" or op == "=" then
+      if node.rq then return l == r else return rt.glob_match(l, r) end
+    elseif op == "!=" then
+      if node.rq then return l ~= r else return not rt.glob_match(l, r) end
+    elseif op == "=~" then
+      local ok, m = pcall(function() return l:match(r) ~= nil end); return ok and m
+    else return binary(l, op, r) end -- < > -eq -ne -lt …
+  end
+  return false
+end
+
 local function exec_stmt(sh, st, hook)
   local t = st.t
   if t == "assign" then
@@ -354,6 +376,8 @@ local function exec_stmt(sh, st, hook)
     end
   elseif t == "arithcmd" then
     sh.status = truth(eval(sh, st.expr)) and 0 or 1
+  elseif t == "dbracket" then
+    sh.status = eval_dbracket(sh, st.expr) and 0 or 1
   elseif t == "case" then
     local subj = expand_word(sh, st.subject)
     local P = require("parser")
