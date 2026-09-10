@@ -483,6 +483,7 @@ function Shell:import_env()
       local k = s:sub(1, eq - 1)
       if k == "PWD" then env_pwd = s:sub(eq + 1)
       elseif k == "OLDPWD" then env_oldpwd = s:sub(eq + 1)
+      elseif k == "UID" or k == "EUID" or k == "PPID" then -- shell-computed, not from env
       elseif k:match("^[%a_][%w_]*$") then
         self:set_str(k, s:sub(eq + 1))
         self.vars[k].exported = true -- inherited env vars are exported (bash)
@@ -496,6 +497,10 @@ function Shell:import_env()
   local pwd = (env_pwd and env_pwd:sub(1, 1) == "/" and same_file(env_pwd, phys)) and env_pwd or phys
   self:set_str("PWD", pwd); self.vars["PWD"].exported = true
   if env_oldpwd then self:set_str("OLDPWD", env_oldpwd); self.vars["OLDPWD"].exported = true end
+  -- bash provides a default $PATH when none is inherited (e.g. `unset PATH; sh -c …`).
+  if self.vars["PATH"] == nil then
+    self:set_str("PATH", "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin")
+  end
 end
 
 -- Arithmetic write: store the int64, defer the string (lazy).
