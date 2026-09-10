@@ -224,7 +224,9 @@ function Shell:capture_src(src)
   local buf = {}
   local saved = self.out
   self.out = function(x) buf[#buf + 1] = x end
+  self.in_subprogram = (self.in_subprogram or 0) + 1 -- $(...) is a subprogram: ERR trap suppressed
   local ok, err = pcall(I.run, self, ast)
+  self.in_subprogram = self.in_subprogram - 1
   self.out = saved
   if not ok then error(err) end
   return (table.concat(buf):gsub("\n+$", ""))

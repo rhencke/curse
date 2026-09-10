@@ -2074,6 +2074,7 @@ local function exec_stmt(sh, st, hook)
     io.flush() -- flush parent stdio so the fork doesn't duplicate buffered output
     local pid = C.fork()
     if pid == 0 then
+      sh.in_subprogram = (sh.in_subprogram or 0) + 1 -- ERR trap won't fire here (sans errtrace)
       local ok, err = pcall(function()
         if st.redirs then apply_redirs(sh, st.redirs) end
         sh.out = io.write
@@ -2091,6 +2092,7 @@ local function exec_stmt(sh, st, hook)
     io.flush()
     local pid = C.fork()
     if pid == 0 then
+      sh.in_subprogram = (sh.in_subprogram or 0) + 1 -- async subprogram: ERR trap won't fire (sans errtrace)
       local ok, err = pcall(function() sh.out = io.write; exec_stmt(sh, st.cmd, hook) end)
       if not ok and type(err) == "table" then sh.status = err.__curse_exit or err.__curse_return or sh.status end
       io.flush(); C._exit(sh.status or 0)
@@ -2239,7 +2241,10 @@ exec_list = function(sh, stmts, hook, toplevel)
     -- (restricted to those two types to avoid &&/|| short-circuit false-positives).
     if sh.noerr == 0 and sh.status ~= 0 and (st.t == "simple" or st.t == "pipeline") then
       local h = sh.traps and sh.traps.ERR
-      if h and h ~= "" and not sh.in_err_trap and (sh.calldepth or 0) == 0 then
+      -- ERR fires only in the main shell (calldepth 0, not in a subshell/cmdsub/
+      -- async), unless errtrace extends it to functions and subprograms.
+      local errscope = sh.opt_errtrace or ((sh.calldepth or 0) == 0 and (sh.in_subprogram or 0) == 0)
+      if h and h ~= "" and not sh.in_err_trap and errscope then
         sh.in_err_trap = true; local saved = sh.status
         run_trap(sh, h); sh.status = saved; sh.in_err_trap = false
       end
