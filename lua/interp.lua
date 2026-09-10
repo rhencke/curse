@@ -526,7 +526,7 @@ local function expand_part_str(sh, p)
     local pe, P = p.pexp, require("parser")
     if pe.op == "badsubst" then -- ${x|html} and other unrecognized ${…} forms
       io.stderr:write("curse: ${" .. (pe.raw or pe.name or "") .. "}: bad substitution\n")
-      error({ __curse_exit = 1 })
+      error({ __curse_exit = 1, __curse_experr = true }) -- fails the command, non-fatal
     end
     if pe.op == "@" and pe.arg == "P" then -- ${x@P}: decode prompt escapes, then expand
       return expand_word(sh, P.parse_word(sh:prompt_escapes(sh:get(pe.name))))
@@ -677,13 +677,21 @@ indirect_part = function(sh, pe)
     local b = sh.vars[pe.name]
     -- ${!ref} on a NAMEREF is inverted: it yields the target NAME, not its value.
     if b and b.ref and b.s and not pe.iop then return { lit = b.s } end
-    tname = (b and b.ref and b.s) or sh:get(pe.name)
+    if pe.name:match("^%d+$") then tname = sh:param(tonumber(pe.name)) -- ${!1}: positional
+    else tname = (b and b.ref and b.s) or sh:get(pe.name) end
   end
   if tname == nil or tname == "" then return nil end
   -- ${!ref} to a special parameter: $?, $$, $!, $#, $-, $N, $@, $*
   if not pe.iop then
     if tname:match("^%d+$") then return { param = tonumber(tname) } end
     if #tname == 1 and tname:match("[%?%$!#%-@%*]") then return { special = tname } end
+  end
+  -- The resolved target must be a valid variable reference: an identifier,
+  -- optionally with a [subscript]. Anything else (spaces, `/`, …) is invalid.
+  local base = tname:match("^[%a_][%w_]*")
+  if not base or (#tname > #base and tname:sub(#base + 1, #base + 1) ~= "[") then
+    io.stderr:write("curse: " .. tname .. ": invalid variable name\n")
+    error({ __curse_exit = 1, __curse_experr = true })
   end
   local ok, part = pcall(require("parser").parse_paramexp, tname .. (pe.iop or ""))
   return ok and part or nil
@@ -921,6 +929,19 @@ local function alloc_fd()
   for fd = 10, 250 do if C.fcntl(fd, 1) == -1 then return fd end end
   return -1
 end
+-- Open a `>`/`&>` target honoring noclobber (set -C): with noclobber, `>` must
+-- not overwrite an existing REGULAR file, but may still write non-regular files
+-- (/dev/null, fifos, devices). Returns the fd, or -1 on a noclobber clobber error.
+local function open_out(sh, path, mode)
+  if not sh.opt_C then return C.open(path, 577, mode) end -- O_WRONLY|O_CREAT|O_TRUNC
+  local f = C.open(path, 705, mode)                       -- + O_EXCL
+  if f >= 0 then return f end
+  local ok, rc = pcall(C.curse_stat, path, statbuf)       -- O_EXCL failed: allow non-regular
+  if ok and rc == 0 and bit.band(ffi.cast("uint32_t *", statbuf + 24)[0], 0xF000) ~= 0x8000 then
+    return C.open(path, 1, mode) -- not S_IFREG -> plain O_WRONLY (no truncate)
+  end
+  return -1
+end
 local function apply_redirs(sh, redirs)
   io.flush() -- flush pending stdout BEFORE moving fds, else buffered output from a
              -- prior command would be redirected into (and lost to) the new target
@@ -948,9 +969,9 @@ local function apply_redirs(sh, redirs)
       end
     end
     if r.op == "out" then
-      -- noclobber (set -C): O_EXCL so `>` fails on an existing file (705 adds O_EXCL)
+      -- noclobber (set -C): `>` fails on an existing regular file (open_out)
       local t = ftgt(r); if not t then ok = false else
-      backup(r.fd); local f = C.open(t, sh.opt_C and 705 or 577, 420)
+      backup(r.fd); local f = open_out(sh, t, 420)
       if f >= 0 then place_fd(f, r.fd) else ok = false end end
     elseif r.op == "clobber" then -- `>|` truncates regardless of noclobber
       local t = ftgt(r); if not t then ok = false else
@@ -968,9 +989,9 @@ local function apply_redirs(sh, redirs)
       local t = ftgt(r); if not t then ok = false else
       backup(r.fd); local f = C.open(t, 66, 420)
       if f >= 0 then place_fd(f, r.fd) else ok = false end end
-    elseif r.op == "outboth" then -- `&>` truncation honors noclobber (O_EXCL) too
+    elseif r.op == "outboth" then -- `&>` truncation honors noclobber too
       local t = ftgt(r); if not t then ok = false else
-      backup(1); backup(2); local f = C.open(t, sh.opt_C and 705 or 577, 420)
+      backup(1); backup(2); local f = open_out(sh, t, 420)
       if f >= 0 then C.dup2(f, 1); C.dup2(f, 2); C.close(f) else ok = false end end
     elseif r.op == "appboth" then -- `&>>`: append stdout+stderr (append ignores noclobber)
       local t = ftgt(r); if not t then ok = false else
@@ -2569,15 +2590,27 @@ local function exec_stmt(sh, st, hook)
     -- local/typeset) are ASSIGNMENT words: the value isn't word-split or globbed.
     local ASSIGN_CMD = { export = 1, declare = 1, typeset = 1, readonly = 1, ["local"] = 1 }
     local args, is_assign = {}, false
-    for wi, w in ipairs(st.words) do
-      local p1 = w.parts[1]
-      if wi > 1 and is_assign and p1 and p1.lit and p1.lit:match("^[%a_][%w_]*%+?=") then
-        args[#args + 1] = expand_assign_word(sh, w, true) -- name=value word: no glob, ~ after =/:
-      else
-        local fs = expand_to_fields(sh, w)
-        for k = 1, #fs do args[#args + 1] = fs[k] end
+    -- A word-expansion error (bad substitution, invalid indirect name) aborts the
+    -- WHOLE simple command with status 1 but is non-fatal: the script continues.
+    local eok, eerr = pcall(function()
+      for wi, w in ipairs(st.words) do
+        local p1 = w.parts[1]
+        if wi > 1 and is_assign and p1 and p1.lit and p1.lit:match("^[%a_][%w_]*%+?=") then
+          args[#args + 1] = expand_assign_word(sh, w, true) -- name=value word: no glob, ~ after =/:
+        else
+          local fs = expand_to_fields(sh, w)
+          for k = 1, #fs do args[#args + 1] = fs[k] end
+        end
+        if wi == 1 then is_assign = ASSIGN_CMD[args[1]] ~= nil end
       end
-      if wi == 1 then is_assign = ASSIGN_CMD[args[1]] ~= nil end
+    end)
+    if not eok then
+      if type(eerr) == "table" and eerr.__curse_experr then
+        sh.status = 1
+        if sh.opt_e then error({ __curse_exit = 1 }) end
+        return
+      end
+      error(eerr)
     end
     -- A command whose argv is empty after expansion but which contained command
     -- substitution(s) takes the LAST cmdsub's exit status (bash: `false` -> 1,
