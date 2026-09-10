@@ -1872,6 +1872,9 @@ local function exec_simple(sh, args, hook, no_func)
               if bb.s ~= nil or bb.n ~= nil then C.setenv(a, sh:get(a), 1) end
             end
           end
+        elseif a:find("[", 1, true) then -- name[subscript]=… : array-element form, leave as-is
+        else -- a token that isn't a valid name (`FOO-BAR`, `1x`, …): bash errors
+          io.stderr:write("curse: " .. cmd .. ": `" .. a .. "': not a valid identifier\n"); allok = false
         end
       end
       sh.status = allok and 0 or 1
@@ -2323,7 +2326,7 @@ local function exec_simple(sh, args, hook, no_func)
   elseif cmd == "local" then
     -- local [-naA] [+n] NAME[=val]…: shadow the var in this scope, honoring
     -- nameref (-n), indexed (-a) and associative (-A) attributes.
-    local nref, assoc, plusn, rest = false, false, false, {}
+    local nref, assoc, plusn, rest, lok = false, false, false, {}, true
     for j = 2, #args do
       local a = args[j]
       if a == "--" then
@@ -2343,9 +2346,13 @@ local function exec_simple(sh, args, hook, no_func)
       sh.status = 0
     elseif not (nref or assoc or plusn) then
       for _, a in ipairs(rest) do
-        sh:localAssign(a)
-        if sh.opt_a then local nm = a:match("^([%a_][%w_]*)"); local b = nm and sh.vars[sh:deref(nm)]
-          if b and not b.arr then b.exported = true; C.setenv(nm, sh:get(nm), 1) end end
+        if not (a:match("^[%a_][%w_]*$") or a:match("^[%a_][%w_]*%+?=") or a:find("[", 1, true)) then
+          io.stderr:write("curse: local: `" .. a .. "': not a valid identifier\n"); lok = false
+        else
+          sh:localAssign(a)
+          if sh.opt_a then local nm = a:match("^([%a_][%w_]*)"); local b = nm and sh.vars[sh:deref(nm)]
+            if b and not b.arr then b.exported = true; C.setenv(nm, sh:get(nm), 1) end end
+        end
       end
     else
       for _, a in ipairs(rest) do
@@ -2360,7 +2367,7 @@ local function exec_simple(sh, args, hook, no_func)
         elseif assoc then sh:declare_assoc(vname) end
       end
     end
-    sh.status = 0
+    sh.status = lok and 0 or 1
   elseif sh.functions[cmd] and not no_func then run_function(sh, cmd, sh.functions[cmd], args, hook)
   else sh:exec(unpack(args)) end -- external command
 end
