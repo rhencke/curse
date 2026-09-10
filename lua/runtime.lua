@@ -215,6 +215,13 @@ local function str_to_i64(s)
 end
 M.str_to_i64 = str_to_i64
 
+-- int64 integer power (** operator), shared by interp and compiled.
+function M.ipow(base, exp)
+  local r, n = i64(1), tonumber(exp)
+  for _ = 1, n do r = r * base end
+  return r
+end
+
 -- int64 -> decimal string with no cdata "LL" suffix (what bash would print).
 local function i64_to_str(n)
   return (tostring(n):gsub("LL$", ""))

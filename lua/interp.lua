@@ -407,9 +407,12 @@ local function exec_simple(sh, args, hook)
     for j = 2, #args do sh:localAssign(args[j]) end
     sh.status = 0
   elseif sh.functions[cmd] then
+    local fn = sh.functions[cmd]
     sh.calldepth = sh.calldepth + 1 -- OSR gate: no handoff inside a call
     sh:pushCall(unpack(args, 2))
-    local ok, err = pcall(exec_list, sh, sh.functions[cmd], hook, false)
+    local ok, err
+    if type(fn) == "function" then ok, err = pcall(fn, sh) -- a COMPILED function closure
+    else ok, err = pcall(exec_list, sh, fn, hook, false) end -- an interp AST body
     sh:popCall()
     sh.calldepth = sh.calldepth - 1
     if not ok then
@@ -622,6 +625,8 @@ local function exec_stmt(sh, st, hook)
     error("interp: bad stmt " .. tostring(t))
   end
 end
+
+M.exec_stmt = exec_stmt -- exposed so the compiled CFG can delegate cold statements
 
 exec_list = function(sh, stmts, hook, toplevel)
   for k = 1, #stmts do

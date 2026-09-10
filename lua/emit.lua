@@ -26,6 +26,56 @@ local function serialize(t)
   return "{" .. table.concat(parts, ", ") .. "}"
 end
 
+-- Serialize an arbitrary AST node (plain tables of strings/numbers/bools) to a
+-- Lua literal, so a cold statement can be baked into the compiled source and run
+-- by the shared interpreter (delegation). No cycles/functions in the AST.
+local function ser(v)
+  local t = type(v)
+  if t == "string" then return ("%q"):format(v) end
+  if t == "number" then return tostring(v) end
+  if t == "boolean" then return tostring(v) end
+  if t ~= "table" then return "nil" end
+  local parts, n = {}, #v
+  for i = 1, n do parts[#parts + 1] = ser(v[i]) end
+  for k, val in pairs(v) do
+    if type(k) ~= "number" or k < 1 or k > n or k ~= math.floor(k) then
+      parts[#parts + 1] = ("[%s]=%s"):format(ser(k), ser(val))
+    end
+  end
+  return "{" .. table.concat(parts, ",") .. "}"
+end
+
+-- Arith with a side effect (assignment / ++ / --) can't sit in a Lua expression
+-- position, so a word containing one must be run by the interpreter, not compiled.
+local function arith_side_effect(e)
+  if type(e) ~= "table" then return false end
+  if e.k == "asgn" or e.k == "post" or e.k == "pre" then return true end
+  return arith_side_effect(e.e) or arith_side_effect(e.l) or arith_side_effect(e.r)
+    or arith_side_effect(e.c) or arith_side_effect(e.a) or arith_side_effect(e.b)
+end
+-- A word emit_word can render (no ${..op..} pexp, no side-effecting arith).
+local function emitable_word(w)
+  for _, p in ipairs(w.parts) do
+    if p.pexp then return false end
+    if p.arith and arith_side_effect(require("parser").arith(p.arith)) then return false end
+  end
+  return true
+end
+-- A word that a compiled command can use directly: emit_word-able AND with no
+-- unquoted expansion (would word-split) or unquoted glob char (would path-expand)
+-- — those need the interpreter's field engine, so the command is delegated.
+local function word_safe(w)
+  if not emitable_word(w) then return false end -- pexp / side-effecting arith
+  for _, p in ipairs(w.parts) do
+    if p.special == "@" or p.special == "*" then return false end -- multi-element (even quoted)
+    if not p.q then
+      if p.var or p.param or p.special or p.cmdsub then return false end -- unquoted -> splits
+      if p.lit and p.lit:find("[*?%[]") then return false end           -- unquoted glob
+    end
+  end
+  return true
+end
+
 local emit_value
 emit_value = function(e, lifted)
   local k = e.k
@@ -36,7 +86,11 @@ emit_value = function(e, lifted)
   if k == "un" then
     if e.op == "-" then return "(-(" .. emit_value(e.e, lifted) .. "))" end
     if e.op == "!" then return "((" .. emit_value(e.e, lifted) .. ") == 0LL and 1LL or 0LL)" end
-    error("emit: unary '" .. tostring(e.op) .. "' not supported") -- ~ etc -> interp fallback
+    if e.op == "~" then return "bit.bnot(" .. emit_value(e.e, lifted) .. ")" end
+  end
+  if k == "tern" then
+    return ("((( %s ) ~= 0LL) and ( %s ) or ( %s ))"):format(
+      emit_value(e.c, lifted), emit_value(e.a, lifted), emit_value(e.b, lifted))
   end
   if k == "bin" then
     local l, r = emit_value(e.l, lifted), emit_value(e.r, lifted)
@@ -47,6 +101,12 @@ emit_value = function(e, lifted)
     if CMP[op] then return "((" .. l .. " " .. CMP[op] .. " " .. r .. ") and 1LL or 0LL)" end
     if op == "&&" then return "(((" .. l .. ") ~= 0LL and (" .. r .. ") ~= 0LL) and 1LL or 0LL)" end
     if op == "||" then return "(((" .. l .. ") ~= 0LL or (" .. r .. ") ~= 0LL) and 1LL or 0LL)" end
+    if op == "&" then return ("bit.band(%s, %s)"):format(l, r) end
+    if op == "|" then return ("bit.bor(%s, %s)"):format(l, r) end
+    if op == "^" then return ("bit.bxor(%s, %s)"):format(l, r) end
+    if op == "<<" then return ("bit.lshift(%s, tonumber(%s) %% 64)"):format(l, r) end
+    if op == ">>" then return ("bit.arshift(%s, tonumber(%s) %% 64)"):format(l, r) end
+    if op == "**" then return ("rt.ipow(%s, %s)"):format(l, r) end
   end
   error("emit: value position not supported for node " .. tostring(k))
 end
@@ -341,10 +401,34 @@ local function build_cfg(stmts, lifted, funcflags, inlinefns)
 
   local flatten_list
 
+  -- Delegate a cold statement to the shared interpreter on a baked AST node. Lifted
+  -- locals are synced to `sh` before and reloaded after, so the interpreter sees
+  -- current values and picks up any it changed (delegated statements are cold, so
+  -- this sync costs nothing). This is how the compiled tier reaches feature parity
+  -- without re-implementing the word engine in generated code.
+  local function delegate(st, after)
+    local p = newpc()
+    local out = {}
+    for n in pairs(lifted) do out[#out + 1] = ("sh:aset(%q, %s)"):format(n, lname(n)) end
+    out[#out + 1] = ("I.exec_stmt(sh, %s, __noop)"):format(ser(st))
+    for n in pairs(lifted) do out[#out + 1] = ("%s = sh:aget(%q)"):format(lname(n), n) end
+    out[#out + 1] = ("pc = %d"):format(after)
+    blocks[p] = table.concat(out, "; ")
+    return p
+  end
+
+  -- Statement types with no native compiled form yet -> always delegate.
+  local DELEGATE = {
+    arithcmd = 1, andor = 1, pipeline = 1, case = 1, group = 1, subshell = 1,
+    dbracket = 1, arrayassign = 1, parse_error = 1,
+  }
+
   -- Build blocks for `st`; its exit flows to pc `after`. Returns st's entry pc.
   local function flatten_stmt(st, after)
     local t = st.t
+    if DELEGATE[t] then return delegate(st, after) end
     if t == "assign" then
+      if st.index or st.append or (st.rhs and not emitable_word(st.rhs)) then return delegate(st, after) end
       local p = newpc()
       if st.arith then
         blocks[p] = emit_set(st.name, emit_value(st.arith, lifted), lifted) .. ("; pc = %d"):format(after)
@@ -358,6 +442,27 @@ local function build_cfg(stmts, lifted, funcflags, inlinefns)
       local p = newpc(); blocks[p] = ("pc = %d"):format(after); return p -- closures are hoisted
     elseif t == "simple" then
       local cmd = st.words[1].parts[1] and st.words[1].parts[1].lit
+      -- delegate if it needs the field engine (splitting/glob/pexp), a redirect,
+      -- or a builtin without a native compiled form.
+      local NATIVE_BUILTIN = { echo = 1, [":"] = 1, ["true"] = 1, ["false"] = 1, ["local"] = 1, ["return"] = 1 }
+      local isfunc = (inlinefns and inlinefns[cmd]) or funcflags[cmd]
+      local mustdeleg = st.redirs ~= nil
+      if not mustdeleg then
+        for _, w in ipairs(st.words) do
+          -- functions stay native (so they inline / call fn_x) unless an arg has a
+          -- ${..} the codegen can't render; other commands delegate on any word
+          -- that needs the field engine (splitting/glob/multi).
+          if isfunc then if not emitable_word(w) then mustdeleg = true; break end
+          elseif not word_safe(w) then mustdeleg = true; break end
+        end
+      end
+      -- interp-only builtins (no native compiled form) delegate
+      if not mustdeleg and cmd and not NATIVE_BUILTIN[cmd] and not isfunc then
+        local B = { test = 1, ["["] = 1, exit = 1, cd = 1, unset = 1, set = 1, shift = 1,
+          read = 1, export = 1, declare = 1, typeset = 1 }
+        if B[cmd] then mustdeleg = true end
+      end
+      if mustdeleg then return delegate(st, after) end
       if cmd == "return" then -- exit the current CFG (function or top level)
         local p = newpc()
         local n = st.words[2] and ("tonumber(%s)"):format(emit_word(st.words[2], lifted)) or "sh.status"
@@ -423,11 +528,15 @@ local function build_cfg(stmts, lifted, funcflags, inlinefns)
       end
       return condp
     elseif t == "whilec" then
+      if st.negate or cond_arith(st.cond) == nil then return delegate(st, after) end -- command-cond while/until
       local condp = newpc(); loopPc[st.id] = condp
       local bodyentry = flatten_list(st.body, condp)
       blocks[condp] = ("if %s then pc = %d else pc = %d end"):format(emit_bool(cond_arith(st.cond), lifted), bodyentry, after)
       return condp
     elseif t == "forin" then
+      -- if the word list needs the field engine (splitting/glob/array/@), delegate
+      -- the whole loop to the interpreter (list expansion is cold anyway).
+      for _, w in ipairs(st.words) do if not word_safe(w) then return delegate(st, after) end end
       local initp = newpc()
       local advp = newpc(); loopPc[st.id] = advp -- back-edge = resume point
       local bodyentry = flatten_list(st.body, advp)
@@ -446,6 +555,10 @@ local function build_cfg(stmts, lifted, funcflags, inlinefns)
         st.id, after, st.name, bodyentry)
       return initp
     elseif t == "if" then
+      -- if any clause has a non-arith (command) condition, delegate the whole if
+      for _, cl in ipairs(st.clauses) do
+        if cl.cond ~= nil and cond_arith(cl.cond) == nil then return delegate(st, after) end
+      end
       -- allocate a cond pc per conditional clause (forward refs), flatten each
       -- body once, then wire the false-branches to the next clause.
       local cps, bentry = {}, {}
@@ -464,7 +577,7 @@ local function build_cfg(stmts, lifted, funcflags, inlinefns)
       end
       return entry or after
     else
-      error("emit: bad stmt " .. tostring(t))
+      return delegate(st, after) -- unknown/cold statement: run it via the interpreter
     end
   end
 
@@ -491,6 +604,9 @@ end
 local function assemble(cfg, sig, opts)
   opts = opts or {}
   local o = { sig }
+  -- register compiled function closures into sh.functions so the interpreter
+  -- (reached via delegation) can call them too — full interp/compiled interop.
+  for _, n in ipairs(opts.register or {}) do o[#o + 1] = ("  sh.functions[%q] = fn_%s"):format(n, n) end
   for _, n in ipairs(opts.runlocals or {}) do o[#o + 1] = ("  local %s = sh:aget(%q)"):format(lname(n), n) end
   for _, n in ipairs(opts.upvals or {}) do o[#o + 1] = ("  %s = sh:aget(%q)"):format(lname(n), n) end
   o[#o + 1] = opts.toplevel and ("  pc = pc or %d"):format(cfg.entry) or ("  local pc = %d"):format(cfg.entry)
@@ -543,7 +659,6 @@ local function assert_compilable(stmts)
 end
 
 function M.emit(ast)
-  assert_compilable(ast.stmts)
   local funcflags, inlinable, inlinefns = {}, {}, {}
   for _, st in ipairs(ast.stmts) do
     if st.t == "funcdef" then
@@ -569,7 +684,8 @@ function M.emit(ast)
   table.sort(upvals); table.sort(runlocals)
   local upset = {}; for _, n in ipairs(upvals) do upset[n] = true end
 
-  local o = { 'local rt = require("runtime")' }
+  local o = { 'local rt = require("runtime")', 'local I = require("interp")',
+    'local bit = require("bit")', 'local __noop = function() end' }
   if #upvals > 0 then
     local vs = {}
     for _, n in ipairs(upvals) do vs[#vs + 1] = lname(n) end
@@ -586,10 +702,14 @@ function M.emit(ast)
       o[#o + 1] = assemble(cfg, "fn_" .. st.name .. " = function(sh)", {})
     end
   end
+  local funcnames = {}
+  for name in pairs(funcflags) do funcnames[#funcnames + 1] = name end
+  table.sort(funcnames)
   local top = build_cfg(ast.stmts, lifted, funcflags, inlinefns)
   o[#o + 1] = "local loopPc = " .. serialize(top.loopPc)
   o[#o + 1] = "local stmtPc = " .. serialize(top.stmtPc)
-  o[#o + 1] = assemble(top, "local function run(sh, pc)", { runlocals = runlocals, upvals = upvals, toplevel = true })
+  o[#o + 1] = assemble(top, "local function run(sh, pc)",
+    { runlocals = runlocals, upvals = upvals, toplevel = true, register = funcnames })
   o[#o + 1] = "return { run = run, loopPc = loopPc, stmtPc = stmtPc }"
   return table.concat(o, "\n") .. "\n"
 end
