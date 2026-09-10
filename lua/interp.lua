@@ -971,8 +971,9 @@ local function expand_to_fields(sh, w)
   local nullglob = sh.shopt.nullglob and true
   local gipats
   if giset then gipats = {}; for p in (gi .. ":"):gmatch("([^:]*):") do if p ~= "" then gipats[#gipats + 1] = p end end end
+  local noglob = sh.opt_f -- set -f: pathname expansion disabled; globs stay literal
   for _, f in ipairs(fields) do
-    if f.unq and (f.s:find("[*?%[]") or f.s:find("[?*+@!]%(")) then
+    if not noglob and f.unq and (f.s:find("[*?%[]") or f.s:find("[?*+@!]%(")) then
       local m = rt.glob_expand(f.s, { dotglob = dotglob })
       if m and gipats then
         local filt = {}
@@ -3427,7 +3428,8 @@ end
 local function errexit_stmt(sh, st)
   return sh.noerr == 0 and sh.status ~= 0 and not st.negate
     and (st.t == "simple" or st.t == "pipeline" or st.t == "arithcmd"
-      or st.t == "assign" or st.t == "assignlist")
+      or st.t == "assign" or st.t == "assignlist"
+      or st.t == "subshell" or st.t == "dbracket") -- a failing ( ) / [[ ]] also fires
 end
 -- Run the ERR trap (once, in scope: the main shell unless errtrace extends it to
 -- functions/subprograms) preserving $?, then exit if errexit is on. Shared by

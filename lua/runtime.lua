@@ -1050,11 +1050,22 @@ local shell_quote = M.shell_quote
 -- $- : the current option flags. h/B are always on (like bash); set flags and the
 -- -i/-c invocation modes are appended in bash-ish order.
 function Shell:dash_flags()
-  local s = "h"
+  -- $- in bash's canonical flag order: a b e f h k m n u v x B C i c (h and B are
+  -- on by default here). Only flags actually set appear.
+  local s = ""
+  if self.opt_a then s = s .. "a" end
+  if self.opt_b then s = s .. "b" end
   if self.opt_e then s = s .. "e" end
+  if self.opt_f then s = s .. "f" end
+  s = s .. "h"
+  if self.opt_k then s = s .. "k" end
+  if self.opt_m then s = s .. "m" end
+  if self.opt_n then s = s .. "n" end
   if self.opt_u then s = s .. "u" end
-  if self.opt_C then s = s .. "C" end
+  if self.opt_v then s = s .. "v" end
+  if self.opt_x then s = s .. "x" end
   s = s .. "B"
+  if self.opt_C then s = s .. "C" end
   if self.opt_i then s = s .. "i" end
   if self.opt_c then s = s .. "c" end
   return s
