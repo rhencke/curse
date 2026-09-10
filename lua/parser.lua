@@ -585,6 +585,14 @@ local function make_parser(src)
           if cc == "(" then d = d + 1 elseif cc == ")" then d = d - 1 end
           i = i + 1
         end
+      elseif c:match("[?*+@!]") and src:sub(i + 1, i + 1) == "(" then
+        -- extglob ?(..) *(..) +(..) @(..) !(..): part of the word, not a subshell
+        i = i + 2; local d = 1
+        while i <= n and d > 0 do
+          local cc = src:sub(i, i)
+          if cc == "(" then d = d + 1 elseif cc == ")" then d = d - 1 end
+          i = i + 1
+        end
       elseif c == "$" and src:sub(i + 1, i + 1) == "{" then
         local e = src:find("}", i + 2, true); i = (e or n) + 1
       elseif c == "`" then -- `…` command sub: keep it whole (spaces inside included)

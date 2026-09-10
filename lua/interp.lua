@@ -345,7 +345,7 @@ local function expand_to_fields(sh, w)
   -- pathname expansion on fields with unquoted glob metacharacters
   local out = {}
   for _, f in ipairs(fields) do
-    if f.unq and f.s:find("[*?%[]") then
+    if f.unq and (f.s:find("[*?%[]") or f.s:find("[?*+@!]%(")) then
       local m = rt.glob_expand(f.s)
       if m then for _, x in ipairs(m) do out[#out + 1] = x end else out[#out + 1] = f.s end
     else

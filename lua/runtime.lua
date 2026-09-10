@@ -631,7 +631,7 @@ function M.glob_expand(pattern)
   local dirpart = sl and pattern:sub(1, sl) or ""
   local filepat = sl and pattern:sub(sl + 1) or pattern
   if dirpart:find("[*?%[]") then return nil end
-  if not filepat:find("[*?%[]") then return nil end
+  if not (filepat:find("[*?%[]") or filepat:find("[?*+@!]%(")) then return nil end
   local scan = dirpart == "" and "." or dirpart
   local d = ffi.C.opendir(scan); if d == nil then return nil end
   local ere = glob_to_ere(filepat)
