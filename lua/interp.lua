@@ -615,7 +615,8 @@ is_multi = function(sh, p)
   if p.pexp.op == "len" then return false end
   if p.pexp.op == "prefix" then return true end -- ${!pfx@} / ${!pfx*}
   if p.pexp.op == "indirect" then local ip = indirect_part(sh, p.pexp); return ip ~= nil and is_multi(sh, ip) end
-  return p.pexp.index == "@" or p.pexp.index == "*"
+  -- $@/$* live in pexp.name (e.g. ${@:1}); array [@]/[*] live in pexp.index
+  return p.pexp.index == "@" or p.pexp.index == "*" or p.pexp.name == "@" or p.pexp.name == "*"
 end
 -- arith-evaluate a slice offset/length expression (e.g. "i-4", "(-4)", "2").
 arith_int = function(sh, s)
@@ -639,7 +640,7 @@ end
 local function multi_elems(sh, p) -- returns element list, star?
   if p.pexp then
     local pe, P = p.pexp, require("parser")
-    local star = (pe.index == "*")
+    local star = (pe.index == "*" or pe.name == "*") -- $* / ${*:…} join when quoted
     if pe.op == "indirect" then -- ${!ref} where ref names an array / $@ / subscript
       local ip = indirect_part(sh, pe)
       if ip then ip.q = p.q; return multi_elems(sh, ip) end
@@ -651,7 +652,15 @@ local function multi_elems(sh, p) -- returns element list, star?
       return t, star
     end
     if pe.op == "prefix" then return sh:var_prefix_names(pe.name), pe.star end
-    local els = sh:array_values(pe.name)
+    local els
+    if pe.op == "sub" and (pe.name == "@" or pe.name == "*") then
+      -- a positional-param slice is indexed over [$0, $1, $2, …]: ${@:0} includes
+      -- $0, ${@:1} starts at $1 (bash counts $0 at offset 0 for @/*).
+      els = { sh.argv0 or "" }
+      for i = 1, sh.nparams do els[#els + 1] = sh.params[i] end
+    else
+      els = sh:array_values(pe.name)
+    end
     if pe.op == "sub" then -- array slice
       local off = arith_int(sh, pe.arg and expand_word(sh, P.parse_word(pe.arg)) or nil)
       local len = pe.arg2 and arith_int(sh, expand_word(sh, P.parse_word(pe.arg2))) or nil
