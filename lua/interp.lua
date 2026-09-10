@@ -398,6 +398,8 @@ end
 -- can be restored. Returns (save, ok); ok is false when an open() failed (bash
 -- then skips the command and reports failure).
 local function apply_redirs(sh, redirs)
+  io.flush() -- flush pending stdout BEFORE moving fds, else buffered output from a
+             -- prior command would be redirected into (and lost to) the new target
   local P = require("parser")
   local save, ok = {}, true
   local function backup(fd) save[#save + 1] = { fd = fd, saved = C.dup(fd) } end
@@ -735,6 +737,7 @@ local function exec_simple(sh, args, hook)
     -- the process env so posix_spawn children inherit it. -A marks associative,
     -- -p prints declarations.
     local doexport, assoc, printmode, nref, plusn = (cmd == "export"), false, false, false, false
+    local funcnames, funcbody = false, false
     local rest = {}
     for j = 2, #args do
       local a = args[j]
@@ -744,11 +747,25 @@ local function exec_simple(sh, args, hook)
         if a:find("p") then printmode = true end
         if a:find("x") then doexport = true end
         if a:find("n") then nref = true end
+        if a:find("F") then funcnames = true end
+        if a:find("f") then funcbody = true end
       elseif a:sub(1, 1) == "+" and #a > 1 then
         if a:find("n") then plusn = true end
       else rest[#rest + 1] = a end
     end
-    if printmode then
+    if funcnames or funcbody then
+      -- declare -F [name…] lists `declare -f NAME`; -f prints bodies (not
+      -- reconstructed here) — either way the exit status signals existence.
+      local names, allok = rest, true
+      if #names == 0 then
+        names = {}; for k in pairs(sh.functions) do names[#names + 1] = k end; table.sort(names)
+      end
+      for _, nm in ipairs(names) do
+        if sh.functions[nm] then if funcnames then sh:echo("declare -f " .. nm) end
+        else allok = false end
+      end
+      sh.status = allok and 0 or 1
+    elseif printmode then
       local allok = true
       if #rest == 0 then -- best-effort: all shell vars, sorted
         local names = {}; for nm in pairs(sh.vars) do names[#names + 1] = nm end
