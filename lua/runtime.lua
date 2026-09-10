@@ -18,7 +18,7 @@ M.Shell = Shell
 local seeded = false
 function Shell.new()
   if not seeded then math.randomseed(os.time() + tonumber(ffi.C.getpid and ffi.C.getpid() or 0)); seeded = true end
-  return setmetatable({
+  local sh = setmetatable({
     vars = {},       -- name -> { s = string?, n = int64? }  (lazy: fill on demand)
     status = 0,      -- $?
     argv0 = "bash",  -- $0 (set by the CLI/daemon to the script/shell name)
@@ -44,6 +44,8 @@ function Shell.new()
     savedstack = {}, -- `local`-shadow record per depth (false until a local shadows)
     calldepth = 0,   -- interpreter-only OSR gate (managed at the interp call site)
   }, Shell)
+  sh:import_env()
+  return sh
 end
 
 -- positional parameters ($# is read directly as sh.nparams). $0 is the script/
@@ -337,6 +339,25 @@ end
 function Shell:set_str(name, s)
   local b = box(name, self.vars)
   b.s = s; b.n = nil
+end
+
+-- Inherit the process environment as shell variables (bash does this at startup).
+-- PWD/OLDPWD stay dynamic (special_get uses getcwd) so they don't go stale on cd.
+function Shell:import_env()
+  local e = ffi.C.environ
+  if e == nil then return end
+  local i = 0
+  while e[i] ~= nil do
+    local s = ffi.string(e[i])
+    local eq = s:find("=", 1, true)
+    if eq then
+      local k = s:sub(1, eq - 1)
+      if k:match("^[%a_][%w_]*$") and k ~= "PWD" and k ~= "OLDPWD" then
+        self:set_str(k, s:sub(eq + 1))
+      end
+    end
+    i = i + 1
+  end
 end
 
 -- Arithmetic write: store the int64, defer the string (lazy).

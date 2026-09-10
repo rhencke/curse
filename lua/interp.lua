@@ -308,29 +308,48 @@ local function feed_stdin(fd, body)
   if f >= 0 then C.dup2(f, fd); C.close(f) end
   os.remove(tmp)
 end
+-- Apply redirections, backing up each touched fd (any fd, not just 0/1/2) so it
+-- can be restored. Returns (save, ok); ok is false when an open() failed (bash
+-- then skips the command and reports failure).
 local function apply_redirs(sh, redirs)
-  local save = { C.dup(0), C.dup(1), C.dup(2) }
+  local P = require("parser")
+  local save, ok = {}, true
+  local function backup(fd) save[#save + 1] = { fd = fd, saved = C.dup(fd) } end
+  -- redirect targets are word-expanded at runtime (e.g. `> $TMP/f`, `>& $myfd`).
+  local function tgt(r) return expand_word(sh, P.parse_word(r.target or "")) end
   for _, r in ipairs(redirs) do
-    if r.op == "out" then local f = C.open(r.target, 577, 420); if f >= 0 then C.dup2(f, r.fd); C.close(f) end
-    elseif r.op == "app" then local f = C.open(r.target, 1089, 420); if f >= 0 then C.dup2(f, r.fd); C.close(f) end
-    elseif r.op == "in" then local f = C.open(r.target, 0, 0); if f >= 0 then C.dup2(f, r.fd); C.close(f) end
-    elseif r.op == "outboth" then local f = C.open(r.target, 577, 420); if f >= 0 then C.dup2(f, 1); C.dup2(f, 2); C.close(f) end
+    if r.op == "out" then
+      backup(r.fd); local f = C.open(tgt(r), 577, 420)
+      if f >= 0 then C.dup2(f, r.fd); C.close(f) else ok = false end
+    elseif r.op == "app" then
+      backup(r.fd); local f = C.open(tgt(r), 1089, 420)
+      if f >= 0 then C.dup2(f, r.fd); C.close(f) else ok = false end
+    elseif r.op == "in" then
+      backup(r.fd); local f = C.open(tgt(r), 0, 0)
+      if f >= 0 then C.dup2(f, r.fd); C.close(f) else ok = false end
+    elseif r.op == "outboth" then
+      backup(1); backup(2); local f = C.open(tgt(r), 577, 420)
+      if f >= 0 then C.dup2(f, 1); C.dup2(f, 2); C.close(f) else ok = false end
     elseif r.op == "heredoc" then
-      local P = require("parser")
       local body = r.expand and expand_word(sh, P.parse_heredoc(r.body or "")) or (r.body or "")
-      feed_stdin(r.fd or 0, body)
+      backup(r.fd or 0); feed_stdin(r.fd or 0, body)
     elseif r.op == "herestring" then
-      local P = require("parser")
       local body = expand_word(sh, P.parse_word(r.word or "")) .. "\n"
-      feed_stdin(r.fd or 0, body)
+      backup(r.fd or 0); feed_stdin(r.fd or 0, body)
     elseif r.op == "dup" or r.op == "dupin" then
-      if r.target == "-" then C.close(r.fd) else local m = tonumber(r.target); if m then C.dup2(m, r.fd) end end
+      backup(r.fd)
+      local tv = tgt(r)
+      if tv == "-" then C.close(r.fd)
+      else local m = tonumber(tv); if m then C.dup2(m, r.fd) end end
     end
   end
-  return save
+  return save, ok
 end
 local function restore_redirs(save)
-  for fd = 0, 2 do local s = save[fd + 1]; if s >= 0 then C.dup2(s, fd); C.close(s) end end
+  for k = #save, 1, -1 do
+    local s = save[k]
+    if s.saved >= 0 then C.dup2(s.saved, s.fd); C.close(s.saved) else C.close(s.fd) end
+  end
 end
 
 -- name classification for `type` / `command -v`
@@ -339,6 +358,7 @@ local BUILTINS = {
   exit = 1, cd = 1, unset = 1, export = 1, declare = 1, typeset = 1, set = 1, shift = 1,
   read = 1, getopts = 1, printf = 1, ["local"] = 1, command = 1, type = 1, pwd = 1,
   eval = 1, source = 1, ["."] = 1, ["break"] = 1, ["continue"] = 1, ["true"] = 1,
+  exec = 1, readonly = 1,
 }
 local KEYWORDS = {
   ["if"] = 1, ["then"] = 1, ["else"] = 1, ["elif"] = 1, ["fi"] = 1, ["for"] = 1,
@@ -763,13 +783,32 @@ local function exec_stmt(sh, st, hook)
         do_arrayassign(sh, aa)
       end
     end
+    -- `exec [redirs] [cmd…]`: redirections are permanent (not restored). With no
+    -- command it just rewires the shell's own fds (e.g. `exec 3>file`); with a
+    -- command it replaces the shell process with that command.
+    if args[1] == "exec" then
+      io.flush()
+      local ok = true
+      if st.redirs then _, ok = apply_redirs(sh, st.redirs) end
+      if #args > 1 then
+        exec_simple(sh, { unpack(args, 2) }, hook)
+        io.flush(); os.exit(sh.status or 0)
+      else
+        sh.status = ok and 0 or 1
+      end
+      return
+    end
     local function run_cmd()
       if st.redirs then
-        local save, savedout = apply_redirs(sh, st.redirs), sh.out
-        sh.out = io.write
-        local ok, err = pcall(exec_simple, sh, args, hook)
-        io.flush(); sh.out = savedout; restore_redirs(save)
-        if not ok then error(err) end
+        local save, ok = apply_redirs(sh, st.redirs)
+        if not ok then
+          sh.status = 1; restore_redirs(save) -- open failed: skip the command
+        else
+          local savedout = sh.out; sh.out = io.write
+          local pok, err = pcall(exec_simple, sh, args, hook)
+          io.flush(); sh.out = savedout; restore_redirs(save)
+          if not pok then error(err) end
+        end
       else
         exec_simple(sh, args, hook)
       end
