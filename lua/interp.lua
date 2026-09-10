@@ -157,6 +157,7 @@ ffi.cdef [[
   int kill(int pid, int sig);
   unsigned int geteuid(void);
   unsigned int getegid(void);
+  int fcntl(int fd, int cmd, ...);
 ]]
 local C = ffi.C
 -- Unbuffered one-byte read from a raw fd (for `read`, which must NOT over-read
@@ -876,6 +877,12 @@ end
 -- Apply redirections, backing up each touched fd (any fd, not just 0/1/2) so it
 -- can be restored. Returns (save, ok); ok is false when an open() failed (bash
 -- then skips the command and reports failure).
+-- Lowest free fd >= 10 (bash allocates named-fd redirs here); F_GETFD=1 on a
+-- closed fd returns -1 (EBADF).
+local function alloc_fd()
+  for fd = 10, 250 do if C.fcntl(fd, 1) == -1 then return fd end end
+  return -1
+end
 local function apply_redirs(sh, redirs)
   io.flush() -- flush pending stdout BEFORE moving fds, else buffered output from a
              -- prior command would be redirected into (and lost to) the new target
@@ -885,6 +892,16 @@ local function apply_redirs(sh, redirs)
   -- redirect targets are word-expanded at runtime (e.g. `> $TMP/f`, `>& $myfd`).
   local function tgt(r) return expand_word(sh, P.parse_word(r.target or "")) end
   for _, r in ipairs(redirs) do
+    -- `{var}>…`: allocate a fresh fd (>=10), store it in `var`, and redirect there.
+    -- `{var}>&-` instead closes the fd already stored in `var` (no allocation).
+    if r.fdvar then
+      if (r.op == "dup" or r.op == "dupin") and r.target == "-" then
+        r = setmetatable({ fd = tonumber(sh:get(r.fdvar)) or -1 }, { __index = r })
+      else
+        local nf = alloc_fd(); sh:set_str(r.fdvar, tostring(nf))
+        r = setmetatable({ fd = nf }, { __index = r }) -- shadow r.fd, inherit op/target
+      end
+    end
     if r.op == "out" then
       -- noclobber (set -C): O_EXCL so `>` fails on an existing file (705 adds O_EXCL)
       backup(r.fd); local f = C.open(tgt(r), sh.opt_C and 705 or 577, 420)

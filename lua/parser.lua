@@ -788,8 +788,11 @@ local function make_parser(src)
     local p = i
     -- `<(…)` / `>(…)` are process substitutions (word parts), not redirections.
     if src:sub(p, p + 1) == "<(" or src:sub(p, p + 1) == ">(" then return nil end
-    local fd = src:match("^%d+", p)
-    local q = fd and (p + #fd) or p
+    -- `{var}>…` names a fd: bash allocates a fd (>=10) and stores it in `var`.
+    -- Only when `{var}` is immediately followed by a redirection operator.
+    local fdvar = src:match("^{([%a_][%w_]*)}[<>]", p)
+    local fd = not fdvar and src:match("^%d+", p) or nil
+    local q = fdvar and (p + #fdvar + 2) or (fd and (p + #fd) or p)
     local c = src:sub(q, q)
     local op, tfd
     if c == ">" then
@@ -800,7 +803,7 @@ local function make_parser(src)
     elseif c == "<" then
       if src:sub(q, q + 2) == "<<<" then -- herestring: [N]<<< word
         i = q + 3; ws()
-        return { op = "herestring", fd = fd and tonumber(fd) or 0, word = word() } -- raw word (expanded at runtime)
+        return { op = "herestring", fd = fd and tonumber(fd) or 0, word = word(), fdvar = fdvar } -- raw word (expanded at runtime)
       end
       if src:sub(q, q + 1) == "<<" then -- heredoc: [N]<<[-] DELIM  (body collected after the line)
         local strip = false; q = q + 2
@@ -808,7 +811,7 @@ local function make_parser(src)
         i = q; ws()
         local draw = word()
         local quoted = draw:sub(1, 1) == "'" or draw:sub(1, 1) == '"'
-        local r = { op = "heredoc", fd = fd and tonumber(fd) or 0, delim = unquote(draw), expand = not quoted, strip = strip }
+        local r = { op = "heredoc", fd = fd and tonumber(fd) or 0, delim = unquote(draw), expand = not quoted, strip = strip, fdvar = fdvar }
         heredocs_pending[#heredocs_pending + 1] = r
         return r
       end
@@ -820,7 +823,7 @@ local function make_parser(src)
     else return nil end
     i = q; ws()
     local target = unquote(word())
-    return { fd = tfd, op = op, target = target }
+    return { fd = tfd, op = op, target = target, fdvar = fdvar }
   end
 
   local function parse_command()
