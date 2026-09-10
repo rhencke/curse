@@ -1130,6 +1130,13 @@ local function make_parser(src)
       -- a single `|` (not `||`) chains another command into the pipeline
       if src:sub(i, i) == "|" and src:sub(i + 1, i + 1) ~= "|" then
         i = i + 1
+        -- bash allows spaces, a comment, and newlines after `|` before the next cmd
+        while true do
+          ws()
+          if src:sub(i, i) == "#" then while i <= n and src:sub(i, i) ~= "\n" do i = i + 1 end
+          elseif src:sub(i, i) == "\n" then line = line + 1; i = i + 1
+          else break end
+        end
         cmds[#cmds + 1] = parse_command()
       else
         break
