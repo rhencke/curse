@@ -83,8 +83,14 @@ local function arith(src, nodefer)
       local s, e = src:find("^%d+#[%w@_]+", i)
       if not s then s, e = src:find("^0[xX]%x+", i) end
       if not s then s, e = src:find("^%d+", i) end
+      local v = src:sub(s, e)
+      -- a leading-0 literal is octal, so a digit 8/9 is invalid (bash: "value too
+      -- great for base"); reject it here so $(( 083 )) is a syntax error, not 83.
+      if v:match("^0%d") and not v:lower():match("^0x") and v:find("[89]") then
+        error("arith: invalid octal constant '" .. v .. "'")
+      end
       i = e + 1
-      return { k = "num", v = src:sub(s, e) }
+      return { k = "num", v = v }
     end
     -- a name (optionally subscripted): a var, an assignment, or ++/--
     local name, idx = nameSub()

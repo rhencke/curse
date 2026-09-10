@@ -553,8 +553,15 @@ local function expand_part_str(sh, p)
     elseif p.special == "!" then return sh.last_bg_pid or ""
     elseif p.special == "-" then return sh:dash_flags() end
     return ""
-  elseif p.arith then -- cache the parsed AST on the part: a loop re-expanding the
-    p.arith_ast = p.arith_ast or P.arith(p.arith) -- same $((…)) shouldn't re-parse it
+  elseif p.arith then -- cache the parsed AST on the part (a loop re-expanding the
+    if not p.arith_ast then -- same $((…)) shouldn't re-parse it)
+      local ok, ast = pcall(P.arith, p.arith)
+      if not ok then -- a syntax error in $(( )) fails the command, non-fatally (bash)
+        io.stderr:write("curse: " .. p.arith .. ": syntax error in expression\n")
+        error({ __curse_exit = 1, __curse_matherr = true, __curse_experr = true })
+      end
+      p.arith_ast = ast
+    end
     return rt.i64_to_str(eval(sh, p.arith_ast))
   elseif p.procsub then
     -- <(cmd)/>(cmd): substitute a filename. <( ) runs the command and captures its
@@ -2138,7 +2145,17 @@ local function exec_simple(sh, args, hook, no_func)
               if bb.s ~= nil or bb.n ~= nil then C.setenv(a, sh:get(a), 1) end
             end
           end
-        elseif a:find("[", 1, true) then -- name[subscript]=… : array-element form, leave as-is
+        elseif a:find("[", 1, true) then -- name[subscript]=value : array-element form
+          local anm, sub, aop, aval = a:match("^([%a_][%w_]*)%[(.-)%](%+?=)(.*)$")
+          -- bash creates the element for declare/typeset/local, but NOT via a
+          -- deferred `readonly a[i]=v` / `export a[i]=v` (those fail, status 1).
+          if anm and (cmd == "declare" or cmd == "typeset") then
+            if localize then sh:localVar(anm) end
+            sh:array_set(anm, array_key(sh, anm, sub), aval, aop == "+=")
+            local bb = sh.vars[sh:deref(anm)]; if roattr and bb then bb.ro = true end
+          else
+            allok = false
+          end
         else -- a token that isn't a valid name (`FOO-BAR`, `1x`, …): bash errors
           io.stderr:write("curse: " .. cmd .. ": `" .. a .. "': not a valid identifier\n"); allok = false
         end
@@ -2677,11 +2694,13 @@ local function exec_simple(sh, args, hook, no_func)
     sh.status = 0
   elseif cmd == "shift" then
     local nn = tonumber(args[2]) or 1
-    if nn > sh.nparams then nn = sh.nparams end
-    for k = 1, sh.nparams - nn do sh.params[k] = sh.params[k + nn] end
-    for k = sh.nparams - nn + 1, sh.nparams do sh.params[k] = nil end
-    sh.nparams = sh.nparams - nn
-    sh.status = 0
+    if nn < 0 or nn > sh.nparams then sh.status = 1 -- out of range: no-op, status 1 (bash)
+    else
+      for k = 1, sh.nparams - nn do sh.params[k] = sh.params[k + nn] end
+      for k = sh.nparams - nn + 1, sh.nparams do sh.params[k] = nil end
+      sh.nparams = sh.nparams - nn
+      sh.status = 0
+    end
   elseif cmd == "local" then
     -- local [-naA] [+n] NAME[=val]…: shadow the var in this scope, honoring
     -- nameref (-n), indexed (-a) and associative (-A) attributes.
@@ -2705,7 +2724,10 @@ local function exec_simple(sh, args, hook, no_func)
       sh.status = 0
     elseif not (nref or assoc or plusn) then
       for _, a in ipairs(rest) do
-        if not (a:match("^[%a_][%w_]*$") or a:match("^[%a_][%w_]*%+?=") or a:find("[", 1, true)) then
+        local anm, sub, aop, aval = a:match("^([%a_][%w_]*)%[(.-)%](%+?=)(.*)$")
+        if anm then -- local a[i]=v : create the element in a local array
+          sh:localVar(anm); sh:array_set(anm, array_key(sh, anm, sub), aval, aop == "+=")
+        elseif not (a:match("^[%a_][%w_]*$") or a:match("^[%a_][%w_]*%+?=") or a:find("[", 1, true)) then
           io.stderr:write("curse: local: `" .. a .. "': not a valid identifier\n"); lok = false
         else
           sh:localAssign(a)
