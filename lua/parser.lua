@@ -455,7 +455,7 @@ local function unquote(w)
   return w
 end
 
-function M.parse(src)
+local function make_parser(src)
   local i, n, line = 1, #src, 1
   local loopId = 0
   local heredocs_pending = {} -- heredoc redirs awaiting their body (filled at line end)
@@ -839,30 +839,44 @@ function M.parse(src)
     end
   end
 
-  -- Top-level parse is ERROR-TOLERANT (bash is lazy): if a top-level statement
-  -- fails to parse — e.g. the appended binary payload of a self-extracting
-  -- installer (makeself), which the shell part exits before ever reaching — we
-  -- stop and append a deferred `parse_error` node instead of failing the whole
-  -- program. If execution reaches that node it errors like bash (stderr + exit
-  -- 2); if an earlier `exit`/`return` fires first, no harm. (Nested lists —
-  -- function bodies, loops — stay strict: a broken body IS a real error.)
-  local stmts = {}
-  while true do
-    skipsep()
-    if i > n then break end
-    local start, startline = i, line
-    local ok, st = pcall(parse_stmt)
-    if not ok then
-      stmts[#stmts + 1] = { t = "parse_error", line = startline, msg = tostring(st) }
-      break
-    end
-    if st == nil then
-      if i <= start then break end -- no progress: stop (avoid a spin)
-    else
-      stmts[#stmts + 1] = st
+  -- Return the next TOP-LEVEL statement, or nil at EOF. Error-tolerant (bash is
+  -- lazy): if a top-level statement fails to parse — e.g. the appended binary
+  -- payload of a self-extracting installer (makeself), which the shell part exits
+  -- before ever reaching — yield a deferred `parse_error` node instead of
+  -- throwing. Reaching it errors like bash (stderr + exit 2); the lazy
+  -- interpreter simply never asks for it if an earlier `exit` fired. (Nested
+  -- lists — function bodies, loops — stay strict: a broken body IS a real error.)
+  local done = false
+  local function next_toplevel()
+    if done then return nil end
+    while true do
+      skipsep()
+      if i > n then done = true; return nil end
+      local start, startline = i, line
+      local ok, st = pcall(parse_stmt)
+      if not ok then done = true; return { t = "parse_error", line = startline, msg = tostring(st) } end
+      if st == nil then
+        if i <= start then done = true; return nil end -- no progress: stop
+      else
+        return st
+      end
     end
   end
+  return next_toplevel
+end
+
+-- Eager full parse -> { stmts } (used by the compiler, which needs the whole
+-- program, and by callers that want the AST).
+function M.parse(src)
+  local nextf = make_parser(src)
+  local stmts = {}
+  while true do local s = nextf(); if not s then break end; stmts[#stmts + 1] = s end
   return { stmts = stmts }
 end
+
+-- Lazy/incremental parse: returns an iterator yielding one top-level statement
+-- per call (nil at EOF). The interpreter uses this for instant start on large
+-- scripts and to never tokenize past an `exit` (hybrid installers).
+function M.open(src) return make_parser(src) end
 
 return M

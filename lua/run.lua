@@ -37,12 +37,11 @@ elseif mode == "tiered" then
   sh = T.run_background(script, { luajit = os.getenv("CURSE_LUAJIT") or "luajit" })
 else
   local f = assert(io.open(script, "r")); local src = f:read("*a"); f:close()
-  local ast = T.parser.parse(src)
   sh = T.rt.Shell.new()
   if mode == "compiled" then
-    T.compile(ast).run(sh, nil)
+    T.compile(T.parser.parse(src)).run(sh, nil)
   elseif mode == "interp" then
-    T.interp.run(sh, ast)
+    T.interp.run_lazy(sh, src) -- lazy: instant start, never parses past exit
   else
     error("unknown mode: " .. mode)
   end

@@ -44,7 +44,7 @@ function M.run(src, opts)
     end
   end
 
-  local ok, err = pcall(I.run, sh, ast, hook)
+  local ok, err = pcall(I.run_lazy, sh, src, hook) -- lazy interp; ast is for compile only
   if ok then return sh, "interp-only" end
   if type(err) == "table" and err.__curse_switch then
     mod.run(sh, resume_pc(mod, resume)) -- OSR into compiled code
@@ -61,7 +61,8 @@ function M.run_background(script_path, opts)
   local sh = opts.sh or rt.Shell.new()
   local f = assert(io.open(script_path, "r"))
   local src = f:read("*a"); f:close()
-  local ast = P.parse(src)
+  -- No eager parse here: the compile runs in a DETACHED process; the main process
+  -- interprets LAZILY (instant start, parses only as far as it executes).
 
   local out = os.tmpname() .. ".curse.lua"
   os.remove(out)
@@ -82,7 +83,7 @@ function M.run_background(script_path, opts)
     end
   end
 
-  local ok, err = pcall(I.run, sh, ast, hook)
+  local ok, err = pcall(I.run_lazy, sh, src, hook)
   os.remove(out)
   if ok then return sh, "interp-only", count end
   if type(err) == "table" and err.__curse_switch then

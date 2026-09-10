@@ -549,16 +549,39 @@ exec_list = function(sh, stmts, hook, toplevel)
 end
 M.exec_list = exec_list
 
--- Run a whole program. `hook` defaults to a no-op (pure interpretation). A top-
--- level `exit N` unwinds to here and sets $? (like bash ending the script).
-function M.run(sh, ast, hook)
-  hook = hook or function() end
-  local ok, err = pcall(exec_list, sh, ast.stmts, hook, true)
+local function finish(sh, ok, err)
   if not ok then
     if type(err) == "table" and err.__curse_exit then sh.status = err.__curse_exit
     elseif type(err) == "table" and err.__curse_return then sh.status = err.__curse_return
     else error(err) end
   end
+end
+
+-- Run a whole (already-parsed) program. `hook` defaults to a no-op. A top-level
+-- `exit N` unwinds to here and sets $? (like bash ending the script).
+function M.run(sh, ast, hook)
+  hook = hook or function() end
+  finish(sh, pcall(exec_list, sh, ast.stmts, hook, true))
+end
+
+-- Run LAZILY from source: parse one top-level statement, execute it, repeat.
+-- Instant start on large scripts (no full parse up front), and it never
+-- tokenizes past an `exit` — so a hybrid shell+binary installer just works with
+-- no special-casing. `hook("stmt", k)` fires per top-level statement (same k as
+-- the eager AST, so tier OSR-by-stmt still lines up).
+function M.run_lazy(sh, src, hook)
+  hook = hook or function() end
+  local nextf = require("parser").open(src)
+  finish(sh, pcall(function()
+    local k = 0
+    while true do
+      local st = nextf()
+      if st == nil then break end
+      k = k + 1
+      hook("stmt", k)
+      exec_stmt(sh, st, hook)
+    end
+  end))
 end
 
 return M
