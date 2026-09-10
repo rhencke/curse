@@ -787,7 +787,8 @@ local function exec_simple(sh, args, hook)
     end
   elseif cmd == "unalias" then
     local ok = true
-    if args[2] == "-a" then sh.aliases = {}
+    if #args < 2 then io.stderr:write("curse: unalias: usage: unalias [-a] name [name ...]\n"); ok = false
+    elseif args[2] == "-a" then sh.aliases = {}
     else
       for k = 2, #args do
         if args[k] ~= "--" then
@@ -1353,20 +1354,23 @@ local function exec_stmt(sh, st, hook)
     sh.status = 0
   elseif t == "simple" then
     -- alias expansion (bash: only with `shopt -s expand_aliases`): if the command
-    -- word is a defined alias, splice its parsed words in and re-dispatch.
-    if not st.__aliased and sh.shopt.expand_aliases and st.words[1] then
+    -- word is a defined alias not already expanded (loop guard), splice its parsed
+    -- words in and re-dispatch — recursively expanding the new first word too.
+    if sh.shopt.expand_aliases and st.words[1] then
       local cw = st.words[1]
       local nm = (#cw.parts == 1 and cw.parts[1].lit ~= nil and not cw.parts[1].q) and cw.parts[1].lit or nil
-      local av = nm and sh.aliases[nm]
+      local seen = st.alias_seen
+      local av = nm and not (seen and seen[nm]) and sh.aliases[nm]
       if av then
         local P = require("parser")
         local parsed = P.parse(av)
+        seen = seen or {}; seen[nm] = true
         if parsed.stmts and #parsed.stmts == 1 and parsed.stmts[1].t == "simple" then
           local nw = {}
           for _, w in ipairs(parsed.stmts[1].words) do nw[#nw + 1] = w end
           for k = 2, #st.words do nw[#nw + 1] = st.words[k] end
           return exec_stmt(sh, { t = "simple", words = nw, redirs = st.redirs, assigns = st.assigns,
-            arrayargs = parsed.stmts[1].arrayargs, __aliased = true }, hook)
+            arrayargs = parsed.stmts[1].arrayargs, alias_seen = seen }, hook)
         elseif parsed.stmts then
           for _, s in ipairs(parsed.stmts) do exec_stmt(sh, s, hook) end
           return
