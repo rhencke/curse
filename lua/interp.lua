@@ -504,6 +504,18 @@ expand_pattern = function(sh, w)
   return table.concat(buf)
 end
 
+-- Expand a word used as a `=~` regex: a QUOTED part is matched literally (its
+-- ERE metacharacters are backslash-escaped), an unquoted part is a live regex.
+local function expand_regex(sh, w)
+  local buf = {}
+  for _, p in ipairs(w.parts) do
+    local s = expand_part_str(sh, p)
+    if p.q then s = s:gsub("[%.%^%$%*%+%?%(%)%[%]%{%}%|\\]", "\\%0") end
+    buf[#buf + 1] = s
+  end
+  return table.concat(buf)
+end
+
 -- A part that expands to multiple elements: $@ / $* / ${a[@]} / ${a[*]} /
 -- ${!a[@]} (keys). ${#a[@]} (op="len") is a single count, NOT multi.
 local function is_multi(p)
@@ -1834,7 +1846,9 @@ local function eval_dbracket(sh, node)
     elseif op == "!=" then
       if node.rq then return l ~= r else return not rt.glob_match(l, expand_pattern(sh, node.r)) end
     elseif op == "=~" then
-      local caps = rt.regex_captures(l, r) -- real POSIX ERE + BASH_REMATCH
+      -- a quoted part of the regex is matched literally (bash), so re-expand with
+      -- regex-escaping of quoted segments instead of using the plain rhs.
+      local caps = rt.regex_captures(l, expand_regex(sh, node.r)) -- real POSIX ERE + BASH_REMATCH
       sh:array_assign("BASH_REMATCH", caps or {}, false)
       return caps ~= nil
     elseif op == "-eq" or op == "-ne" or op == "-lt" or op == "-le" or op == "-gt" or op == "-ge" then
