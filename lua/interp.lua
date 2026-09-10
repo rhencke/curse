@@ -825,6 +825,9 @@ local function apply_redirs(sh, redirs)
     elseif r.op == "in" then
       backup(r.fd); local f = C.open(tgt(r), 0, 0)
       if f >= 0 then place_fd(f, r.fd) else ok = false end
+    elseif r.op == "rw" then -- `N<>file`: open read+write (O_RDWR|O_CREAT, no truncate)
+      backup(r.fd); local f = C.open(tgt(r), 66, 420)
+      if f >= 0 then place_fd(f, r.fd) else ok = false end
     elseif r.op == "outboth" then -- `&>` truncation honors noclobber (O_EXCL) too
       backup(1); backup(2); local f = C.open(tgt(r), sh.opt_C and 705 or 577, 420)
       if f >= 0 then C.dup2(f, 1); C.dup2(f, 2); C.close(f) else ok = false end
@@ -843,7 +846,8 @@ local function apply_redirs(sh, redirs)
       if tv == "-" then C.close(r.fd)
       else
         local m = tonumber(tv)
-        if m then C.dup2(m, r.fd)
+        if m then if C.dup2(m, r.fd) < 0 then -- source fd not open -> redirect fails
+            io.stderr:write("curse: " .. tv .. ": Bad file descriptor\n"); ok = false end
         elseif r.op == "dup" and tv ~= "" then -- `>&word` (non-number): open the file for
           backup(2); local f = C.open(tv, sh.opt_C and 705 or 577, 420) -- both stdout AND stderr
           if f >= 0 then C.dup2(f, r.fd); C.dup2(f, 2); C.close(f) else ok = false end
