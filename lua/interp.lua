@@ -471,6 +471,12 @@ end
 local function expand_part_str(sh, p)
   if p.lit ~= nil then return p.lit
   elseif p.var then
+    -- a nameref whose target has a subscript (`typeset -n ref='a[2]'`) reads as
+    -- ${a[2]} — deref only yields the base name, so expand the target here.
+    local rb = sh.vars[p.var]
+    if rb and rb.ref and rb.s and rb.s:find("[", 1, true) then
+      return expand_word(sh, require("parser").parse_word("${" .. rb.s .. "}"))
+    end
     local b = sh.vars[sh:deref(p.var)]
     local unset = b == nil or (b.s == nil and b.n == nil and b.arr == nil)
     if sh.opt_u and unset and sh:special_get(p.var) == "" then
