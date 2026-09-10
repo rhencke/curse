@@ -917,7 +917,9 @@ local function fmt_decl(sh, name)
     -- attribute letters in bash's order: -rxilu (readonly/export/integer/lower/upper)
     local a = (b.ro and "r" or "") .. (os.getenv(name) ~= nil and "x" or "")
       .. (b.int and "i" or "") .. (b.lower and "l" or "") .. (b.upper and "u" or "")
-    return "declare " .. (a == "" and "--" or "-" .. a) .. " " .. name .. "=" .. decl_quote(sh:get(name))
+    local pre = "declare " .. (a == "" and "--" or "-" .. a) .. " " .. name
+    if b.s == nil and b.n == nil then return pre end -- declared but unset: no =value
+    return pre .. "=" .. decl_quote(sh:get(name))
   end
 end
 
@@ -1475,7 +1477,7 @@ local function exec_simple(sh, args, hook)
     -- the process env so posix_spawn children inherit it. -A marks associative,
     -- -p prints declarations.
     local doexport, assoc, printmode, nref, plusn = (cmd == "export"), false, false, false, false
-    local funcnames, funcbody, iattr, lattr, uattr, rattr = false, false, false, false, false, false
+    local funcnames, funcbody, iattr, lattr, uattr, rattr, aattr = false, false, false, false, false, false, false
     local rest = {}
     for j = 2, #args do
       local a = args[j]
@@ -1491,9 +1493,29 @@ local function exec_simple(sh, args, hook)
         if a:find("l") then lattr = true end
         if a:find("u") then uattr = true end
         if a:find("r") then rattr = true end
+        if a:find("a") then aattr = true end
       elseif a:sub(1, 1) == "+" and #a > 1 then
         if a:find("n") then plusn = true end
       else rest[#rest + 1] = a end
+    end
+    -- listing a subset of variables (bare `declare`/`export`/`readonly`, or with
+    -- -p and no names): the builtin + attribute flags select which vars to print.
+    local function decl_match(nm, b)
+      if not b then return false end
+      if cmd == "readonly" or rattr then return b.ro end
+      if cmd == "export" or doexport then return os.getenv(nm) ~= nil end
+      if nref then return b.ref end
+      if assoc then return b.assoc end
+      if aattr then return b.arr and not b.assoc end
+      if iattr then return b.int end
+      if lattr then return b.lower end
+      if uattr then return b.upper end
+      return true
+    end
+    local function list_decls()
+      local names = {}; for nm in pairs(sh.vars) do names[#names + 1] = nm end
+      table.sort(names)
+      for _, nm in ipairs(names) do if decl_match(nm, sh.vars[nm]) then local d = fmt_decl(sh, nm); if d then sh:echo(d) end end end
     end
     if funcnames or funcbody then
       -- declare -F [name…] lists `declare -f NAME`; -f prints bodies (not
@@ -1507,18 +1529,14 @@ local function exec_simple(sh, args, hook)
         else allok = false end
       end
       sh.status = allok and 0 or 1
+    elseif #rest == 0 then -- no operands: list matching declarations (declare -p, or bare)
+      list_decls(); sh.status = 0
     elseif printmode then
       local allok = true
-      if #rest == 0 then -- best-effort: all shell vars, sorted
-        local names = {}; for nm in pairs(sh.vars) do names[#names + 1] = nm end
-        table.sort(names)
-        for _, nm in ipairs(names) do local d = fmt_decl(sh, nm); if d then sh:echo(d) end end
-      else
-        for _, nm in ipairs(rest) do
-          local d = fmt_decl(sh, nm)
-          if d then sh:echo(d)
-          else allok = false; io.stderr:write("curse: " .. cmd .. ": " .. nm .. ": not found\n") end
-        end
+      for _, nm in ipairs(rest) do
+        local d = fmt_decl(sh, nm)
+        if d then sh:echo(d)
+        else allok = false; io.stderr:write("curse: " .. cmd .. ": " .. nm .. ": not found\n") end
       end
       sh.status = allok and 0 or 1
     else
@@ -1549,7 +1567,8 @@ local function exec_simple(sh, args, hook)
           elseif lattr or uattr then
             sh.vars[a] = sh.vars[a] or {}; sh.vars[a].lower = lattr or nil; sh.vars[a].upper = uattr or nil
           elseif assoc then sh:declare_assoc(a)
-          elseif doexport then C.setenv(a, sh:get(a), 1) end
+          elseif doexport then sh.vars[a] = sh.vars[a] or {}; C.setenv(a, sh:get(a), 1)
+          else sh.vars[a] = sh.vars[a] or {} end -- `declare x` creates a declared-but-unset var
           if roattr then sh.vars[a] = sh.vars[a] or {}; sh.vars[a].ro = true end
         end
       end
@@ -2220,6 +2239,7 @@ local function exec_stmt(sh, st, hook)
       for _, aa in ipairs(st.arrayargs) do
         if assoc then sh:declare_assoc(aa.name) end
         do_arrayassign(sh, aa)
+        args[#args + 1] = aa.name -- so `declare -A a=(...)` isn't seen as an operand-less listing
       end
     end
     -- `exec [redirs] [cmd…]`: redirections are permanent (not restored). With no

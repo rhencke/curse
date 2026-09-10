@@ -853,7 +853,11 @@ function Shell:expand_param(pe, arg, arg2, idxnum)
   elseif name == "@" or name == "*" then
     val = self:paramsJoin(" "); isset = self.nparams > 0
   else
-    isset = self.vars[self:deref(name)] ~= nil; val = self:get(name)
+    -- "set" means it actually holds a value: a declared-but-valueless var (declare x)
+    -- is NOT set, so ${x-default} yields the default (bash), even though declare -p lists it.
+    local b = self.vars[self:deref(name)]
+    isset = (b ~= nil and (b.s ~= nil or b.n ~= nil or b.arr ~= nil)) or self:special_get(name) ~= ""
+    val = self:get(name)
   end
   -- The default/alternate word for the test ops arrives as a thunk (lazy: only
   -- expanded when its branch is taken, so a side-effecting default runs at most once).
