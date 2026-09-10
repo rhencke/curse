@@ -1613,7 +1613,7 @@ local function exec_simple(sh, args, hook)
             end
           else -- flag, no argument
             cur = cur + 1; if 1 + cur > #word then optind = optind + 1; cur = 1 end
-            res = { opt = oc }
+            res = { opt = oc, arg = "" } -- a no-arg option clears OPTARG
           end
         end
       end

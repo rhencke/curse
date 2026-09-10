@@ -50,6 +50,7 @@ function Shell.new()
     calldepth = 0,   -- interpreter-only OSR gate (managed at the interp call site)
   }, Shell)
   sh:import_env()
+  if sh.vars["OPTIND"] == nil then sh:set_str("OPTIND", "1") end -- bash: OPTIND starts at 1
   return sh
 end
 
