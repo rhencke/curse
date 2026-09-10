@@ -675,31 +675,23 @@ local function expand_assign_word(sh, w, peel_name)
 end
 M.expand_assign_word = expand_assign_word
 
--- Expand a word used as a glob PATTERN (${v/pat/repl}, case, [[ == ]]): a QUOTED
--- part's glob metacharacters are backslash-escaped so they match literally, while
--- an unquoted part's (including unquoted $var expansions) stay active — matching
--- bash's rule that quoting, not the value, decides literalness.
-expand_pattern = function(sh, w)
+-- Expand a word, backslash-escaping the metacharacters in `charclass` for any
+-- QUOTED part (so they match literally) while leaving unquoted parts — including
+-- unquoted $var expansions — active. Matches bash's rule that quoting, not the
+-- value, decides literalness. Shared by glob-pattern and =~-regex expansion.
+local function expand_escaped(sh, w, charclass)
   local buf = {}
   for _, p in ipairs(w.parts) do
     local s = expand_part_str(sh, p)
-    if p.q then s = s:gsub("[%*%?%[%]\\%(%)%|%+%@%!]", "\\%0") end
+    if p.q then s = s:gsub(charclass, "\\%0") end
     buf[#buf + 1] = s
   end
   return table.concat(buf)
 end
-
--- Expand a word used as a `=~` regex: a QUOTED part is matched literally (its
--- ERE metacharacters are backslash-escaped), an unquoted part is a live regex.
-local function expand_regex(sh, w)
-  local buf = {}
-  for _, p in ipairs(w.parts) do
-    local s = expand_part_str(sh, p)
-    if p.q then s = s:gsub("[%.%^%$%*%+%?%(%)%[%]%{%}%|\\]", "\\%0") end
-    buf[#buf + 1] = s
-  end
-  return table.concat(buf)
-end
+-- glob PATTERN context (${v/pat/repl}, case, [[ == ]]): glob metacharacters.
+expand_pattern = function(sh, w) return expand_escaped(sh, w, "[%*%?%[%]\\%(%)%|%+%@%!]") end
+-- `=~` regex context: ERE metacharacters.
+local function expand_regex(sh, w) return expand_escaped(sh, w, "[%.%^%$%*%+%?%(%)%[%]%{%}%|\\]") end
 
 -- A part that expands to multiple elements: $@ / $* / ${a[@]} / ${a[*]} /
 -- ${!a[@]} (keys). ${#a[@]} (op="len") is a single count, NOT multi.
@@ -1747,8 +1739,8 @@ local function exec_simple(sh, args, hook, no_func)
     end
     sh.status = 0
     local newpwd = physical and sh:phys_cwd() or logical
-    sh:set_str("OLDPWD", prev); sh.vars["OLDPWD"].exported = true; C.setenv("OLDPWD", prev, 1)
-    sh:set_str("PWD", newpwd); sh.vars["PWD"].exported = true; C.setenv("PWD", newpwd, 1)
+    sh:export_str("OLDPWD", prev)
+    sh:export_str("PWD", newpwd)
     if print_dir then sh:echo(newpwd) end
     if sh.dirstack then sh.dirstack[1] = newpwd end
   elseif cmd == "kill" then
@@ -1794,7 +1786,7 @@ local function exec_simple(sh, args, hook, no_func)
     end
   elseif cmd == "pushd" or cmd == "popd" or cmd == "dirs" then
     sh.dirstack = sh.dirstack or { sh:pwd() }
-    local function cd_to(p) C.chdir(p); sh:set_str("PWD", p); sh.vars["PWD"].exported = true; C.setenv("PWD", p, 1) end
+    local function cd_to(p) C.chdir(p); sh:export_str("PWD", p) end
     local ds = sh.dirstack
     local function tilde(p) local h = sh:get("HOME"); if h ~= "" and p:sub(1, #h) == h then return "~" .. p:sub(#h + 1) end return p end
     if cmd == "dirs" then
@@ -1830,7 +1822,7 @@ local function exec_simple(sh, args, hook, no_func)
         local prev = sh:pwd()
         if C.chdir(target) ~= 0 then io.stderr:write("curse: pushd: " .. target .. ": No such file or directory\n"); sh.status = 1; return end
         local np = sh:phys_cwd(); sh:set_str("OLDPWD", prev)
-        sh:set_str("PWD", np); sh.vars["PWD"].exported = true; C.setenv("PWD", np, 1)
+        sh:export_str("PWD", np)
         table.insert(ds, 1, np)
       end
       local parts = {}; for k = 1, #ds do parts[k] = tilde(ds[k]) end
@@ -3007,6 +2999,9 @@ local function exec_stmt(sh, st, hook)
     io.flush()
     local pid = C.fork()
     if pid == 0 then
+      -- Without job control, an async command's stdin is /dev/null (bash), so it
+      -- can't steal the terminal — and it must not inherit a redirect it didn't ask for.
+      local dn = C.open("/dev/null", 0, 0); if dn >= 0 then C.dup2(dn, 0); C.close(dn) end
       sh.in_subprogram = (sh.in_subprogram or 0) + 1 -- async subprogram: ERR trap won't fire (sans errtrace)
       sh.loopdepth = 0
       local ok, err = pcall(function() sh.out = io.write; exec_stmt(sh, st.cmd, hook) end)

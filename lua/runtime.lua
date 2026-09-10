@@ -483,6 +483,12 @@ function Shell:set_str(name, s)
   if b.exported then C.setenv(self:deref(name), s, 1) end -- keep the env in sync
 end
 
+-- Set a variable AND mark it exported (updating the process env). Used for
+-- PWD/OLDPWD, which `cd`/pushd/popd must keep in the environment for children.
+function Shell:export_str(name, val)
+  self:set_str(name, val); self.vars[name].exported = true; C.setenv(name, val, 1)
+end
+
 -- Inherit the process environment as shell variables (bash does this at startup).
 -- PWD/OLDPWD are handled specially below: PWD is initialized (and kept logical),
 -- OLDPWD inherited if present; `cd` maintains both thereafter.
@@ -1126,6 +1132,11 @@ function Shell:echo(...)
     self.out(tostring((select(i, ...))))
   end
   self.out("\n")
+  -- bash's echo/printf flush stdout immediately (sh_chkwrite). This makes output
+  -- ordering deterministic across a fork — e.g. `echo a & echo b` prints b then a,
+  -- because the parent flushes b before the just-forked child is scheduled. Only
+  -- when writing to the real fd (not into a $()/pipe capture buffer).
+  if self.out == io.write then io.flush() end
   self.status = 0
 end
 
