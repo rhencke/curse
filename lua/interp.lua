@@ -1396,7 +1396,7 @@ local function exec_simple(sh, args, hook)
     exec_simple(sh, { unpack(args, 2) }, hook) -- run rest, bypassing functions (approx)
   elseif cmd == "compgen" then
     -- compgen [-A action|-f|-d|-c|-a|-b|-k|-v|-e] [-W wl] [-P pre] [-S suf] [prefix]
-    local actions, wordlist, prefix, bad, cpre, csuf = {}, nil, nil, false, "", ""
+    local actions, wordlist, prefix, bad, cpre, csuf, xfilter = {}, nil, nil, false, "", "", nil
     local VALID = { ["function"] = 1, alias = 1, builtin = 1, keyword = 1, variable = 1,
       command = 1, file = 1, directory = 1, setopt = 1, shopt = 1, arrayvar = 1,
       export = 1, helptopic = 1, user = 1, hostname = 1, group = 1, job = 1, service = 1,
@@ -1410,7 +1410,8 @@ local function exec_simple(sh, args, hook)
       elseif a == "-W" then wordlist = args[j + 1]; j = j + 2
       elseif a == "-P" then cpre = args[j + 1] or ""; j = j + 2
       elseif a == "-S" then csuf = args[j + 1] or ""; j = j + 2
-      elseif a == "-F" or a == "-G" or a == "-C" or a == "-X" or a == "-o" then j = j + 2 -- take+ignore
+      elseif a == "-X" then xfilter = args[j + 1]; j = j + 2
+      elseif a == "-F" or a == "-G" or a == "-C" or a == "-o" then j = j + 2 -- take+ignore
       elseif a:match("^-[fdcabkvegujs]+$") then for ch in a:sub(2):gmatch(".") do actions[#actions + 1] = SHORT[ch] end; j = j + 1
       elseif a:sub(1, 1) == "-" and #a > 1 then j = j + 1
       else prefix = a; j = j + 1 end
@@ -1420,29 +1421,42 @@ local function exec_simple(sh, args, hook)
       local out, seen = {}, {}
       local function emit(x) if (not prefix or x:sub(1, #prefix) == prefix) and not seen[x] then seen[x] = true; out[#out + 1] = x end end
       local function names(tbl) local t = {}; for k in pairs(tbl) do t[#t + 1] = k end; table.sort(t); return t end
+      -- -W words keep their insertion order; -A action results are sorted together.
       if wordlist then
         for _, w in ipairs(rt.ifs_split(sh.vars["IFS"] and sh:get("IFS") or " \t\n", wordlist)) do emit(w) end
       end
+      local acc = {}
+      local function add(x) acc[#acc + 1] = x end
       for _, act in ipairs(actions) do
-        if act == "function" then for _, n in ipairs(names(sh.functions)) do emit(n) end
-        elseif act == "alias" then for _, n in ipairs(names(sh.aliases)) do emit(n) end
-        elseif act == "builtin" then for _, n in ipairs(names(BUILTINS)) do emit(n) end
-        elseif act == "keyword" then for _, n in ipairs(names(KEYWORDS)) do emit(n) end
-        elseif act == "variable" or act == "arrayvar" then for _, n in ipairs(names(sh.vars)) do emit(n) end
-        elseif act == "export" then for _, n in ipairs(names(sh.vars)) do if os.getenv(n) ~= nil then emit(n) end end
-        elseif act == "setopt" then for _, e in ipairs(SETOPTS) do emit(e[1]) end
-        elseif act == "shopt" then for _, n in ipairs(SHOPT_ORDER) do emit(n) end
+        if act == "function" then for n in pairs(sh.functions) do add(n) end
+        elseif act == "alias" then for n in pairs(sh.aliases) do add(n) end
+        elseif act == "builtin" then for n in pairs(BUILTINS) do add(n) end
+        elseif act == "keyword" then for n in pairs(KEYWORDS) do add(n) end
+        elseif act == "variable" or act == "arrayvar" then for n in pairs(sh.vars) do add(n) end
+        elseif act == "export" then for n in pairs(sh.vars) do if os.getenv(n) ~= nil then add(n) end end
+        elseif act == "setopt" then for _, e in ipairs(SETOPTS) do add(e[1]) end
+        elseif act == "shopt" then for _, n in ipairs(SHOPT_ORDER) do add(n) end
         elseif act == "helptopic" then
-          for _, n in ipairs(names(BUILTINS)) do emit(n) end
-          for _, n in ipairs(names(KEYWORDS)) do emit(n) end
+          for n in pairs(BUILTINS) do add(n) end; for n in pairs(KEYWORDS) do add(n) end
         elseif act == "file" or act == "directory" then
           local matches = rt.glob_expand((prefix or "") .. "*", { dotglob = false }) or {}
-          for _, m in ipairs(matches) do if act == "file" or file_test("-d", m) then emit(m) end end
-        elseif act == "command" then
-          for _, n in ipairs(names(BUILTINS)) do emit(n) end
-          for _, n in ipairs(names(sh.functions)) do emit(n) end
-          for _, n in ipairs(names(sh.aliases)) do emit(n) end
+          for _, m in ipairs(matches) do if act == "file" or file_test("-d", m) then add(m) end end
+        elseif act == "command" then -- aliases, keywords, builtins, functions (+ PATH externals)
+          for n in pairs(BUILTINS) do add(n) end; for n in pairs(sh.functions) do add(n) end
+          for n in pairs(sh.aliases) do add(n) end; for n in pairs(KEYWORDS) do add(n) end
         end
+      end
+      table.sort(acc)
+      for _, n in ipairs(acc) do emit(n) end
+      if xfilter and xfilter ~= "" then -- -X PAT removes matches; -X !PAT keeps only matches
+        local neg = xfilter:sub(1, 1) == "!"
+        local pat = neg and xfilter:sub(2) or xfilter
+        local kept = {}
+        for _, x in ipairs(out) do
+          local m = rt.glob_match(x, pat)
+          if (neg and m) or (not neg and not m) then kept[#kept + 1] = x end
+        end
+        out = kept
       end
       for _, x in ipairs(out) do sh:echo(cpre .. x .. csuf) end
       sh.status = (#out > 0) and 0 or 1
