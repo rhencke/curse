@@ -907,8 +907,10 @@ local function make_parser(src)
     if peekword() == "while" or peekword() == "until" then
       local kind = peekword(); local ln = line; i = i + #kind
       loopId = loopId + 1; local id = loopId
-      local cond = parse_stmts({ ["do"] = true })
-      local body_stmts = parse_stmts({ done = true })
+      local cond, t1 = parse_stmts({ ["do"] = true })
+      if t1 ~= "do" then error("syntax error: `" .. kind .. "' expected `do'") end
+      local body_stmts, t2 = parse_stmts({ done = true })
+      if t2 ~= "done" then error("syntax error: `" .. kind .. "' expected `done'") end
       return { t = "whilec", id = id, line = ln, cond = cond, body = body_stmts,
         negate = (kind == "until"), redirs = tail_redirs() }
     end
