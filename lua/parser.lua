@@ -18,8 +18,11 @@ local function arith(src, nodefer)
   -- Also defer when a `$` abuts a name character (`f$x`, `x$foo[5]`, `$x$y`):
   -- there the expansion forms part of a compound variable NAME, which bash builds
   -- by expanding first — the arith grammar can't parse the raw `$` mid-token.
+  -- Also defer a `$` followed by a non-name char (`$*`, `$@`, `$?`, `$$`, `$-`…):
+  -- the arith grammar handles $name/$digit/${..} natively but not these specials,
+  -- so word-expand first (`$*` -> the joined params) then re-parse.
   if not nodefer and (src:find("%${") or src:find("%$%(") or src:find("`")
-      or src:find("[%w_]%$")) then
+      or src:find("[%w_]%$") or src:find("%$[^%w_{]")) then
     return { k = "xpand", raw = src }
   end
   local i, n = 1, #src
@@ -253,6 +256,15 @@ local function parse_dollar(w, i, add, q)
   local nx = w:sub(i + 1, i + 1)
   if w:sub(i + 1, i + 2) == "((" then
     local body, ni = grab_dparen(w, i + 3); add({ arith = body, q = q }); return ni
+  elseif nx == "[" then -- $[expr]: deprecated arithmetic, an alias of $(( ))
+    local depth, j = 1, i + 2
+    while j <= #w do
+      local c2 = w:sub(j, j)
+      if c2 == "[" then depth = depth + 1
+      elseif c2 == "]" then depth = depth - 1; if depth == 0 then break end end
+      j = j + 1
+    end
+    add({ arith = w:sub(i + 2, j - 1), q = q }); return j + 1
   elseif nx == "(" then
     local depth, j = 1, i + 2
     while j <= #w do
@@ -696,6 +708,13 @@ local function make_parser(src)
         i = i + 1
       elseif c == "$" and src:sub(i + 1, i + 2) == "((" then
         local _, ni = grab_dparen(src, i + 3); i = ni
+      elseif c == "$" and src:sub(i + 1, i + 1) == "[" then -- $[expr]: keep whole (spaces inside)
+        i = i + 2; local d = 1
+        while i <= n and d > 0 do
+          local cc = src:sub(i, i)
+          if cc == "[" then d = d + 1 elseif cc == "]" then d = d - 1 end
+          i = i + 1
+        end
       elseif c == "$" and src:sub(i + 1, i + 1) == "(" then
         i = i + 2; local d = 1
         while i <= n and d > 0 do
