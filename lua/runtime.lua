@@ -304,6 +304,11 @@ local function substr(val, off, len)
   return s
 end
 
+-- Full (anchored) shell-glob match, for `case` patterns.
+function M.glob_match(s, glob)
+  return s:match("^" .. glob_to_lpat(glob) .. "$") ~= nil
+end
+
 -- Apply a ${…} operator. `arg`/`arg2` are already word-expanded by the caller.
 function Shell:expand_param(pe, arg, arg2)
   local name, op = pe.name, pe.op

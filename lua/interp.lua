@@ -261,6 +261,17 @@ local function exec_stmt(sh, st, hook)
     end
   elseif t == "arithcmd" then
     sh.status = truth(eval(sh, st.expr)) and 0 or 1
+  elseif t == "case" then
+    local subj = expand_word(sh, st.subject)
+    local P = require("parser")
+    for _, cl in ipairs(st.clauses) do
+      local matched = false
+      for _, pat in ipairs(cl.pats) do
+        local g = expand_word(sh, P.parse_word(pat)) -- resolve vars in the pattern
+        if rt.glob_match(subj, g) then matched = true; break end
+      end
+      if matched then exec_list(sh, cl.body, hook, false); break end
+    end
   elseif t == "andor" then
     -- run each pipeline, short-circuiting on the running exit status
     for _, it in ipairs(st.items) do

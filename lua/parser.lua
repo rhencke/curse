@@ -277,6 +277,8 @@ function M.parse(src)
     return stmts
   end
 
+  local parse_stmt -- forward: the and-or wrapper (used by case bodies below)
+
   -- Try to read a redirection at the current position; returns a redir table and
   -- advances i, or nil (leaving i put) if there isn't one. Handles
   -- [N]> [N]>> [N]< >&M N>&M &> [N]>&- ; heredocs (<<) are left to parse_command.
@@ -396,6 +398,47 @@ function M.parse(src)
       local body, ni = grab_dparen(src, i + 2); i = ni
       return { t = "arithcmd", line = line, expr = arith(body) }
     end
+    -- case WORD in  PAT|PAT) BODY ;;  … esac
+    if peekword() == "case" then
+      local ln = line; i = i + 4; ws()
+      local subject = parse_word(unquote(word()))
+      ws(); if peekword() == "in" then i = i + 2 end
+      -- separator skipper that STOPS at ;; (so a clause body ends there)
+      local function skip_sep()
+        while i <= n do
+          if src:sub(i, i + 1) == ";;" then return "dsemi" end
+          local c = src:sub(i, i)
+          if c == "\n" then line = line + 1; i = i + 1
+          elseif c:match("[ \t;]") then i = i + 1
+          elseif c == "#" then while i <= n and src:sub(i, i) ~= "\n" do i = i + 1 end
+          else return nil end
+        end
+        return "eof"
+      end
+      local clauses = {}
+      while true do
+        skip_sep()
+        if peekword() == "esac" then i = i + 4; break end
+        if i > n then break end
+        if src:sub(i, i) == "(" then i = i + 1 end -- optional leading (
+        local patstr = {}
+        while i <= n and src:sub(i, i) ~= ")" do patstr[#patstr + 1] = src:sub(i, i); i = i + 1 end
+        i = i + 1 -- skip )
+        local pats = {}
+        for p in table.concat(patstr):gmatch("[^|]+") do pats[#pats + 1] = (p:gsub("^%s+", ""):gsub("%s+$", "")) end
+        local body = {}
+        while true do
+          local s = skip_sep()
+          if s == "dsemi" then i = i + 2; break end
+          if s == "eof" or peekword() == "esac" then break end
+          local st = parse_stmt()
+          if not st then break end
+          body[#body + 1] = st
+        end
+        clauses[#clauses + 1] = { pats = pats, body = body }
+      end
+      return { t = "case", line = ln, subject = subject, clauses = clauses }
+    end
     -- assignment: NAME=RHS
     do
       local s, e = src:find("^[%a_][%w_]*=", i)
@@ -452,7 +495,7 @@ function M.parse(src)
 
   -- and-or list: pipeline [ (&& | ||) pipeline ]*  ; a lone `&` (background) is
   -- accepted and run in the foreground for now.
-  local function parse_stmt()
+  parse_stmt = function()
     local head = parse_pipeline()
     local items = nil
     while true do

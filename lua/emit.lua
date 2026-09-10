@@ -512,6 +512,7 @@ local function assert_compilable(stmts)
     if t == "arithcmd" then error("curse-nocompile: (( )) command")
     elseif t == "andor" then error("curse-nocompile: && / || list")
     elseif t == "pipeline" then error("curse-nocompile: pipeline")
+    elseif t == "case" then error("curse-nocompile: case")
     elseif t == "whilec" then
       if st.negate or cond_arith(st.cond) == nil then error("curse-nocompile: while/until cond") end
       assert_compilable(st.body)
