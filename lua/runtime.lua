@@ -280,10 +280,34 @@ function Shell:array_get(name, key)
   if key == 0 then return self:get(name) end
   return ""
 end
+-- bash iterates an assoc array in HASH-TABLE order, not insertion order: the
+-- key's FNV-1 32-bit hash (over its bytes) picks one of 1024 buckets, buckets are
+-- walked ascending, and within a bucket the most-recently-inserted key comes
+-- first (bash prepends to the chain). Reproduced exactly (ported from the TS
+-- backend) so ${!m[@]} / ${m[@]} match bash. int64 keeps the 32-bit multiply
+-- exact (a plain Lua double would lose precision past 2^53).
+local FNV32_OFFSET, FNV32_PRIME, U32 = i64(2166136261), i64(16777619), i64(4294967296)
+local function assoc_bucket(key)
+  local h = FNV32_OFFSET
+  for j = 1, #key do
+    h = (h * FNV32_PRIME) % U32       -- FNV-1: multiply first…
+    h = bit.bxor(h, i64(key:byte(j))) -- …then xor the byte
+  end
+  return tonumber(h % i64(1024))
+end
+
 function Shell:array_indices(name)
   local b = self.vars[name]
   if b and b.assoc then
-    local t = {}; for _, k in ipairs(b.order) do if b.arr[k] ~= nil then t[#t + 1] = k end end; return t
+    local live = {}
+    for idx, k in ipairs(b.order) do
+      if b.arr[k] ~= nil then live[#live + 1] = { k = k, i = idx, bkt = assoc_bucket(k) } end
+    end
+    table.sort(live, function(a, z)
+      if a.bkt ~= z.bkt then return a.bkt < z.bkt else return a.i > z.i end
+    end)
+    local t = {}; for _, e in ipairs(live) do t[#t + 1] = e.k end
+    return t
   end
   if b and b.arr then
     local t = {}; for k in pairs(b.arr) do t[#t + 1] = k end; table.sort(t); return t
