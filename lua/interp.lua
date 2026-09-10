@@ -407,7 +407,9 @@ local function expand_to_fields(sh, w)
     if is_multi(p) then
       local els, star = multi_elems(sh, p)
       if p.q then
-        if star then add(table.concat(els, " "), false)
+        if star then -- "$*" / "${a[*]}" join with the first char of IFS
+          local sep = sh.vars["IFS"] and sh:get("IFS"):sub(1, 1) or " "
+          add(table.concat(els, sep), false)
         else for k = 1, #els do if k > 1 then brk() end; add(els[k], false) end end -- one field per element
       else
         for k = 1, #els do if k > 1 then brk() end; feed_split(els[k]) end
