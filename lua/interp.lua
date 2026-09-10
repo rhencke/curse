@@ -1040,8 +1040,10 @@ local function exec_simple(sh, args, hook)
     sh.status = 0
   elseif cmd == ":" or cmd == "true" then sh.status = 0
   elseif cmd == "false" then sh.status = 1
-  elseif cmd == "break" then sh.status = 0; error({ __curse_break = tonumber(args[2]) or 1 })
-  elseif cmd == "continue" then sh.status = 0; error({ __curse_continue = tonumber(args[2]) or 1 })
+  elseif cmd == "break" then -- outside a loop: a no-op (bash), not a fatal unwind
+    sh.status = 0; if (sh.loopdepth or 0) > 0 then error({ __curse_break = tonumber(args[2]) or 1 }) end
+  elseif cmd == "continue" then
+    sh.status = 0; if (sh.loopdepth or 0) > 0 then error({ __curse_continue = tonumber(args[2]) or 1 }) end
   elseif cmd == "eval" then
     -- eval [--]: join args, parse, run in the CURRENT shell (return/exit propagate).
     local start = (args[2] == "--") and 3 or 2
@@ -1794,9 +1796,11 @@ local function exec_simple(sh, args, hook)
     local fn = sh.functions[cmd]
     sh.calldepth = sh.calldepth + 1 -- OSR gate: no handoff inside a call
     sh:pushCall(unpack(args, 2))
+    local saved_ld = sh.loopdepth; sh.loopdepth = 0 -- break/continue don't cross into a function
     local ok, err
     if type(fn) == "function" then ok, err = pcall(fn, sh) -- a COMPILED function closure
     else ok, err = pcall(exec_list, sh, fn, hook, false) end -- an interp AST body
+    sh.loopdepth = saved_ld
     sh:popCall()
     sh.calldepth = sh.calldepth - 1
     if not ok then
@@ -2057,6 +2061,7 @@ local function exec_stmt(sh, st, hook)
   elseif t == "forc" then
     if st.init then eval(sh, st.init) end
     local bodystatus = 0 -- a loop's status is its last body command's (0 if none)
+    sh.loopdepth = (sh.loopdepth or 0) + 1
     while true do
       hook("loop", st.id)
       if st.cond and not truth(eval(sh, st.cond)) then break end
@@ -2064,18 +2069,29 @@ local function exec_stmt(sh, st, hook)
       if act == "break" then break end
       if st.step then eval(sh, st.step) end -- continue still runs the step
     end
+    sh.loopdepth = sh.loopdepth - 1
     sh.status = bodystatus
   elseif t == "whilec" then
     local bodystatus = 0
+    sh.loopdepth = (sh.loopdepth or 0) + 1
     while true do
       hook("loop", st.id)
-      sh.noerr = sh.noerr + 1; exec_list(sh, st.cond, hook, false); sh.noerr = sh.noerr - 1
+      -- a break/continue in the CONDITION affects this loop too (bash)
+      sh.noerr = sh.noerr + 1
+      local cok, cerr = pcall(exec_list, sh, st.cond, hook, false)
+      sh.noerr = sh.noerr - 1
+      if not cok then
+        if type(cerr) == "table" and cerr.__curse_break then break
+        elseif type(cerr) == "table" and cerr.__curse_continue then -- fallthrough to re-test
+        else sh.loopdepth = sh.loopdepth - 1; error(cerr) end
+      end
       local go = (sh.status == 0)
       if st.negate then go = not go end -- until
       if not go then break end
       local act = run_loop_body(sh, st.body, hook); bodystatus = sh.status
       if act == "break" then break end
     end
+    sh.loopdepth = sh.loopdepth - 1
     sh.status = bodystatus
   elseif t == "parse_error" then
     -- Reached the unparseable tail (e.g. a makeself binary payload) — bash would
@@ -2099,6 +2115,7 @@ local function exec_stmt(sh, st, hook)
     local pid = C.fork()
     if pid == 0 then
       sh.in_subprogram = (sh.in_subprogram or 0) + 1 -- ERR trap won't fire here (sans errtrace)
+      sh.loopdepth = 0 -- a loop enclosing this subshell isn't ours to break/continue
       local ok, err = pcall(function()
         if st.redirs then apply_redirs(sh, st.redirs) end
         sh.out = io.write
@@ -2117,6 +2134,7 @@ local function exec_stmt(sh, st, hook)
     local pid = C.fork()
     if pid == 0 then
       sh.in_subprogram = (sh.in_subprogram or 0) + 1 -- async subprogram: ERR trap won't fire (sans errtrace)
+      sh.loopdepth = 0
       local ok, err = pcall(function() sh.out = io.write; exec_stmt(sh, st.cmd, hook) end)
       if not ok and type(err) == "table" then sh.status = err.__curse_exit or err.__curse_return or sh.status end
       io.flush(); C._exit(sh.status or 0)
@@ -2215,6 +2233,7 @@ local function exec_stmt(sh, st, hook)
     end
     sh.forstate[st.id] = { list = list, idx = 0 }
     local bodystatus = 0
+    sh.loopdepth = (sh.loopdepth or 0) + 1
     while true do
       hook("loop", st.id)
       local fs = sh.forstate[st.id]
@@ -2225,6 +2244,7 @@ local function exec_stmt(sh, st, hook)
       local act = run_loop_body(sh, st.body, hook); bodystatus = sh.status
       if act == "break" then break end
     end
+    sh.loopdepth = sh.loopdepth - 1
     sh.status = bodystatus
   elseif t == "if" then
     for _, cl in ipairs(st.clauses) do
