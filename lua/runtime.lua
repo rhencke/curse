@@ -210,8 +210,25 @@ function Shell:exec(...)
   local pidp = ffi.new("curse_pid_t[1]")
   local rc = C.posix_spawnp(pidp, args[1], fa, nil, ffi.cast("char *const *", argv), C.environ)
   C.posix_spawn_file_actions_destroy(fa)
+  local pid = pidp[0]
+  if rc == 8 then -- ENOEXEC: an executable file with no shebang — bash runs it as a
+    pid = C.fork()  -- shell script; do the same through our own interpreter, in a child.
+    if pid == 0 then
+      C.dup2(wfd, 1); C.close(wfd); C.close(rfd)
+      local f = io.open(args[1], "r"); local src = f and f:read("*a") or ""; if f then f:close() end
+      self.params, self.nparams, self.argv0, self.traps, self.out = {}, 0, args[1], {}, io.write
+      for k = 2, n do self.nparams = self.nparams + 1; self.params[self.nparams] = args[k] end
+      local ok = pcall(require("interp").run_lazy, self, src)
+      io.flush(); C._exit(self.status or 0)
+    end
+  end
   C.close(wfd)
-  if rc ~= 0 then C.close(rfd); self.status = 127; return end -- e.g. ENOENT
+  if rc ~= 0 and rc ~= 8 then -- ENOENT -> "command not found" (127); else can't-execute (126)
+    C.close(rfd)
+    io.stderr:write("curse: " .. tostring(args[1]) .. (rc == 2 and ": command not found\n" or ": Permission denied\n"))
+    self.status = (rc == 2) and 127 or 126
+    return
+  end
   local buf = ffi.new("char[65536]")
   local chunks = {}
   while true do
@@ -221,7 +238,7 @@ function Shell:exec(...)
   end
   C.close(rfd)
   local st = ffi.new("int[1]")
-  C.waitpid(pidp[0], st, 0)
+  C.waitpid(pid, st, 0)
   self.status = M.wexit(st[0])
   local out = table.concat(chunks)
   if out ~= "" then self.out(out) end

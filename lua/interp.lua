@@ -2109,9 +2109,21 @@ local function exec_simple(sh, args, hook, no_func)
     elseif BUILTINS[args[j]] then exec_simple(sh, { unpack(args, j) }, hook, true) -- skip functions
     else io.stderr:write("curse: builtin: " .. args[j] .. ": not a shell builtin\n"); sh.status = 1 end
   elseif cmd == "command" then
-    local j = 2
-    while args[j] == "-p" do j = j + 1 end -- -p: use default PATH (ignored)
+    local j, usep = 2, false
+    while args[j] == "-p" or args[j] == "-v" or args[j] == "-V" do
+      if args[j] == "-p" then usep = true end; j = j + 1
+    end
     if args[j] == nil then sh.status = 0
+    elseif usep then
+      -- -p: resolve against a default PATH guaranteed to find the standard utilities,
+      -- not the caller's $PATH. Temporarily swap it (env + var) around the command.
+      local DEFPATH = "/usr/bin:/bin:/usr/sbin:/sbin"
+      local oldenv, oldbox = os.getenv("PATH"), sh.vars["PATH"]
+      sh:set_str("PATH", DEFPATH); C.setenv("PATH", DEFPATH, 1)
+      local ok, err = pcall(exec_simple, sh, { unpack(args, j) }, hook, true)
+      sh.vars["PATH"] = oldbox
+      if oldenv then C.setenv("PATH", oldenv, 1) else C.unsetenv("PATH") end
+      if not ok then error(err) end
     else exec_simple(sh, { unpack(args, j) }, hook, true) end -- run rest, skipping FUNCTION lookup
   elseif cmd == "compgen" then
     -- compgen [-A action|-f|-d|-c|…] [-W wl] [-F func] [-P pre] [-S suf] [-X filt] [word]
