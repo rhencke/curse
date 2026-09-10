@@ -822,13 +822,15 @@ local function make_parser(src)
       local toks, quoted = {}, {}
       while true do
         ws()
-        if i > n or src:sub(i, i) == "\n" then break end
-        if src:sub(i, i + 1) == "]]" then i = i + 2; break end
-        local w = word()
-        if w == "" then break end
-        local c1 = w:sub(1, 1)
-        toks[#toks + 1] = w
-        quoted[#toks] = (c1 == '"' or c1 == "'")
+        if src:sub(i, i) == "\n" then line = line + 1; i = i + 1 -- continuation inside [[ ]]
+        elseif i > n or src:sub(i, i + 1) == "]]" then if src:sub(i, i + 1) == "]]" then i = i + 2 end; break
+        else
+          local w = word()
+          if w == "" then break end
+          local c1 = w:sub(1, 1)
+          toks[#toks + 1] = w
+          quoted[#toks] = (c1 == '"' or c1 == "'")
+        end
       end
       return { t = "dbracket", line = line, expr = parse_dbracket(toks, quoted) }
     end

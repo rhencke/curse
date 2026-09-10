@@ -86,7 +86,7 @@ local function binary(x, op, y)
   if op == "!=" then return x ~= y end
   if op == "<" then return x < y end -- string compare (C locale, like bash)
   if op == ">" then return x > y end
-  local nx, ny = rt.str_to_i64(x), rt.str_to_i64(y)
+  local nx, ny = rt.arith_num(x), rt.arith_num(y) -- -eq etc. honor bases (017, 0xf, N#)
   if op == "-eq" then return nx == ny end
   if op == "-ne" then return nx ~= ny end
   if op == "-lt" then return nx < ny end
