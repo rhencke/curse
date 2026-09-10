@@ -634,7 +634,19 @@ function Shell:array_set(name, key, val, append)
   if append then b.arr[key] = (b.arr[key] or "") .. val else b.arr[key] = val end
   return true
 end
+-- FUNCNAME is a virtual array: the call stack innermost-first, then "main"
+-- (empty at the top level). funcstack[1] is the innermost function.
+function Shell:funcname_array()
+  local fs = self.funcstack
+  if not fs or #fs == 0 then return {} end
+  local t = {}
+  for i = 1, #fs do t[i] = fs[i] end
+  -- a script (or stdin) has a "main" bottom frame; `sh -c` has none (bash).
+  if not self.opt_c then t[#t + 1] = "main" end
+  return t
+end
 function Shell:array_get(name, key)
+  if name == "FUNCNAME" then return self:funcname_array()[(tonumber(key) or 0) + 1] or "" end
   local b = self.vars[self:deref(name)]
   if b and b.arr then return b.arr[norm_key(b, key)] or "" end
   if key == 0 then return self:get(name) end
@@ -681,6 +693,9 @@ local function assoc_bucket(key)
 end
 
 function Shell:array_indices(name)
+  if name == "FUNCNAME" then
+    local a = self:funcname_array(); local t = {}; for i = 1, #a do t[i] = i - 1 end; return t
+  end
   local b = self.vars[self:deref(name)]
   if b and b.assoc then
     local live = {}
@@ -700,6 +715,7 @@ function Shell:array_indices(name)
   return {}
 end
 function Shell:array_values(name)
+  if name == "FUNCNAME" then return self:funcname_array() end
   local idx = self:array_indices(name); local t = {}
   for i = 1, #idx do t[i] = self:array_get(name, idx[i]) end
   return t
