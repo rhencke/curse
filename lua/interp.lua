@@ -285,6 +285,7 @@ end
 
 local expand_word -- forward (used by eval's $-deferred arith and expand_part_str)
 local expand_pattern -- forward (quote-aware glob-pattern expansion for ${v/…} etc.)
+local indirect_part -- forward (${!ref} target resolution, re-parsed to a part)
 local eval  -- arithmetic evaluator (forward decl)
 local arith_resolve -- var-value-as-arith-expression resolver (forward decl)
 local arith_key -- array subscript in arith: string key for assoc, number for indexed
@@ -461,13 +462,11 @@ local function expand_part_str(sh, p)
     if pe.op == "@" and pe.arg == "P" then -- ${x@P}: decode prompt escapes, then expand
       return expand_word(sh, P.parse_word(sh:prompt_escapes(sh:get(pe.name))))
     end
-    if pe.op == "indirect" and pe.iop then -- ${!ref OP arg}: resolve name, then apply OP
-      local b = sh.vars[pe.name]
-      local tname = (b and b.ref and b.s) or sh:get(pe.name) -- nameref target, else $ref
-      tname = tname:gsub("%[.*$", "")
-      if tname == "" then return "" end
-      local part = P.parse_paramexp(tname .. pe.iop); part.q = p.q
-      return expand_part_str(sh, part)
+    if pe.op == "indirect" then -- ${!ref} / ${!ref OP}: resolve the name, then expand it
+      local ip = indirect_part(sh, pe)
+      if not ip then return "" end
+      ip.q = p.q
+      return expand_part_str(sh, ip)
     end
     local subkey
     if pe.index and pe.index ~= "@" and pe.index ~= "*" then
@@ -548,10 +547,27 @@ end
 
 -- A part that expands to multiple elements: $@ / $* / ${a[@]} / ${a[*]} /
 -- ${!a[@]} (keys). ${#a[@]} (op="len") is a single count, NOT multi.
-local function is_multi(p)
+-- ${!ref}: the name/expression `ref` indirects to (its value, or a nameref's
+-- target), with any trailing operator (iop) appended. Re-parsed into a part so
+-- the target can itself be an array (arr[@]), $@, a subscript, etc.
+indirect_part = function(sh, pe)
+  local tname
+  if pe.index and pe.index ~= "@" and pe.index ~= "*" then
+    tname = sh:array_get(pe.name, array_key(sh, pe.name, pe.index))
+  else
+    local b = sh.vars[sh:deref(pe.name)]
+    tname = (b and b.ref and b.s) or sh:get(pe.name)
+  end
+  if tname == nil or tname == "" then return nil end
+  local ok, part = pcall(require("parser").parse_paramexp, tname .. (pe.iop or ""))
+  return ok and part or nil
+end
+local is_multi
+is_multi = function(sh, p)
   if not p.pexp then return p.special == "@" or p.special == "*" end
   if p.pexp.op == "len" then return false end
   if p.pexp.op == "prefix" then return true end -- ${!pfx@} / ${!pfx*}
+  if p.pexp.op == "indirect" then local ip = indirect_part(sh, p.pexp); return ip ~= nil and is_multi(sh, ip) end
   return p.pexp.index == "@" or p.pexp.index == "*"
 end
 -- arith-evaluate a slice offset/length expression (e.g. "i-4", "(-4)", "2").
@@ -575,6 +591,11 @@ local function multi_elems(sh, p) -- returns element list, star?
   if p.pexp then
     local pe, P = p.pexp, require("parser")
     local star = (pe.index == "*")
+    if pe.op == "indirect" then -- ${!ref} where ref names an array / $@ / subscript
+      local ip = indirect_part(sh, pe)
+      if ip then ip.q = p.q; return multi_elems(sh, ip) end
+      return {}, false
+    end
     if pe.op == "indices" then -- ${!a[@]} -> the keys/indices
       local ix = sh:array_indices(pe.name); local t = {}
       for i = 1, #ix do t[i] = tostring(ix[i]) end
@@ -640,7 +661,7 @@ local function expand_to_fields(sh, w)
     end
   end
   for pi, p in ipairs(w.parts) do
-    if is_multi(p) then
+    if is_multi(sh, p) then
       local els, star = multi_elems(sh, p)
       if p.q then
         if star then -- "$*" / "${a[*]}" join with the first char of IFS
