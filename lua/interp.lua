@@ -2780,6 +2780,9 @@ local DEBUG_FIRE = { simple = true, pipeline = true, arithcmd = true, dbracket =
 local function run_debug(sh, line)
   local h = sh.traps and sh.traps.DEBUG
   if not h or h == "" or sh.in_debug then return end
+  -- DEBUG fires only at the current level (bash): not for commands inside a
+  -- function call, or a subshell/command substitution — unless functrace extends it.
+  if not sh.opt_functrace and ((sh.calldepth or 0) > 0 or (sh.in_subprogram or 0) > 0) then return end
   sh.in_debug = true
   local saved = sh.status
   if line then sh.cur_line = line end
