@@ -1245,7 +1245,7 @@ end
 
 -- Dispatch one already-expanded simple command (no redirs — the caller sets those
 -- up). Builtins first, then user functions, then external.
-local function exec_simple(sh, args, hook)
+local function exec_simple(sh, args, hook, no_func)
   local cmd = args[1]
   if cmd == nil then sh.status = 0
   elseif cmd == "echo" then
@@ -1823,27 +1823,34 @@ local function exec_simple(sh, args, hook)
     sh.status = allok and 0 or 1
   elseif cmd == "command" and (args[2] == "-v" or args[2] == "-V") then
     local verbose = args[2] == "-V"
-    local allok = true
+    local anyfound = false
     for j = 3, #args do
       local k, p = name_type(sh, args[j])
-      if not k then allok = false
-      elseif verbose then
-        if k == "file" then sh:echo(args[j] .. " is " .. p)
-        elseif k == "function" then sh:echo(args[j] .. " is a function")
-        elseif k == "keyword" then sh:echo(args[j] .. " is a shell keyword")
-        else sh:echo(args[j] .. " is a shell builtin") end
-      else sh:echo(k == "file" and p or args[j]) end
+      if not k then
+        if verbose then io.stderr:write("curse: command: " .. args[j] .. ": not found\n") end
+      else
+        anyfound = true
+        if verbose then
+          if k == "alias" then sh:echo(args[j] .. " is aliased to `" .. sh.aliases[args[j]] .. "'")
+          elseif k == "file" then sh:echo(args[j] .. " is " .. p)
+          elseif k == "function" then sh:echo(args[j] .. " is a function")
+          elseif k == "keyword" then sh:echo(args[j] .. " is a shell keyword")
+          else sh:echo(args[j] .. " is a shell builtin") end
+        else sh:echo(k == "file" and p or args[j]) end
+      end
     end
-    sh.status = allok and 0 or 1
+    sh.status = anyfound and 0 or 1 -- bash: 0 if ANY name resolved (multiple names swallow misses)
   elseif cmd == "builtin" then
-    -- builtin CMD args: run CMD as a shell builtin (skipping functions/aliases).
-    if args[2] == nil then sh.status = 0
-    else exec_simple(sh, { unpack(args, 2) }, hook) end -- builtins dispatch before functions here
+    -- builtin [--] NAME args: run NAME only if it's an actual shell builtin.
+    local j = 2; if args[j] == "--" then j = j + 1 end
+    if args[j] == nil then sh.status = 0
+    elseif BUILTINS[args[j]] then exec_simple(sh, { unpack(args, j) }, hook)
+    else io.stderr:write("curse: builtin: " .. args[j] .. ": not a shell builtin\n"); sh.status = 1 end
   elseif cmd == "command" then
     local j = 2
     while args[j] == "-p" do j = j + 1 end -- -p: use default PATH (ignored)
     if args[j] == nil then sh.status = 0
-    else exec_simple(sh, { unpack(args, j) }, hook) end -- run rest, bypassing functions (approx)
+    else exec_simple(sh, { unpack(args, j) }, hook, true) end -- run rest, skipping FUNCTION lookup
   elseif cmd == "compgen" then
     -- compgen [-A action|-f|-d|-c|…] [-W wl] [-F func] [-P pre] [-S suf] [-X filt] [word]
     local actions, wordlist, prefix, bad, cpre, csuf, xfilter, funcname = {}, nil, nil, false, "", "", nil, nil
@@ -2200,7 +2207,7 @@ local function exec_simple(sh, args, hook)
       end
     end
     sh.status = 0
-  elseif sh.functions[cmd] then
+  elseif sh.functions[cmd] and not no_func then -- `command CMD` skips the function lookup
     local fn = sh.functions[cmd]
     sh.calldepth = sh.calldepth + 1 -- OSR gate: no handoff inside a call
     sh:pushCall(unpack(args, 2))
