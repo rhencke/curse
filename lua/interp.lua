@@ -653,10 +653,11 @@ local function multi_elems(sh, p) -- returns element list, star?
     end
     if pe.op == "prefix" then return sh:var_prefix_names(pe.name), pe.star end
     local els
-    if pe.op == "sub" and (pe.name == "@" or pe.name == "*") then
-      -- a positional-param slice is indexed over [$0, $1, $2, …]: ${@:0} includes
-      -- $0, ${@:1} starts at $1 (bash counts $0 at offset 0 for @/*).
-      els = { sh.argv0 or "" }
+    if pe.name == "@" or pe.name == "*" then
+      -- $@ / $* operators (slice, @P/@Q transforms, …) run over the positional
+      -- params; a slice is indexed over [$0, $1, …] so ${@:0} includes $0.
+      els = {}
+      if pe.op == "sub" then els[1] = sh.argv0 or "" end
       for i = 1, sh.nparams do els[#els + 1] = sh.params[i] end
     else
       els = sh:array_values(pe.name)
