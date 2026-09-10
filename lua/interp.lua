@@ -472,9 +472,10 @@ local function expand_part_str(sh, p)
     if pe.index and pe.index ~= "@" and pe.index ~= "*" then
       subkey = array_key(sh, pe.name, pe.index)
     end
-    -- pattern-context ops (/, //) treat quoted metachars literally; everything
-    -- else (defaults :-/-, etc.) expands the arg as an ordinary value.
-    local patmode = pe.op == "/" or pe.op == "//"
+    -- pattern-context ops (strip #/##/%/%%, subst /,//) treat quoted metachars
+    -- literally; everything else (defaults :-/-, etc.) is an ordinary value.
+    local patmode = pe.op == "/" or pe.op == "//" or pe.op == "#" or pe.op == "##"
+      or pe.op == "%" or pe.op == "%%"
     local arg = pe.arg and (patmode and expand_pattern or expand_word)(sh, P.parse_word(pe.arg)) or nil
     local arg2 = pe.arg2 and expand_word(sh, P.parse_word(pe.arg2)) or nil
     if pe.op == "sub" then -- ${v:off:len}: offset/length are arithmetic expressions

@@ -574,21 +574,22 @@ local function glob_to_lpat(glob)
   end
   return table.concat(out)
 end
+-- Whole-string glob match via the POSIX regex engine (real char classes/extglob).
+-- Deferred to call time through M so it can be defined textually after this.
+local function full_match(s, glob) return M.regex_match(s, M.glob_to_ere(glob)) end
 local function strip_prefix(val, glob, longest)
-  local lp = "^" .. glob_to_lpat(glob) .. "$"
   if longest then
-    for k = #val, 0, -1 do if val:sub(1, k):match(lp) then return val:sub(k + 1) end end
+    for k = #val, 0, -1 do if full_match(val:sub(1, k), glob) then return val:sub(k + 1) end end
   else
-    for k = 0, #val do if val:sub(1, k):match(lp) then return val:sub(k + 1) end end
+    for k = 0, #val do if full_match(val:sub(1, k), glob) then return val:sub(k + 1) end end
   end
   return val
 end
 local function strip_suffix(val, glob, longest)
-  local lp = "^" .. glob_to_lpat(glob) .. "$"
   if longest then
-    for k = 1, #val + 1 do if val:sub(k):match(lp) then return val:sub(1, k - 1) end end
+    for k = 1, #val + 1 do if full_match(val:sub(k), glob) then return val:sub(1, k - 1) end end
   else
-    for k = #val + 1, 1, -1 do if val:sub(k):match(lp) then return val:sub(1, k - 1) end end
+    for k = #val + 1, 1, -1 do if full_match(val:sub(k), glob) then return val:sub(1, k - 1) end end
   end
   return val
 end
@@ -685,6 +686,7 @@ end
 local function glob_to_ere(glob, pn)
   return "^" .. glob_conv(glob, pn) .. "$"
 end
+M.glob_to_ere = glob_to_ere -- exposed for strip_prefix/suffix (defined earlier)
 -- GLOBIGNORE match: `glob` matched against a whole path with `/`-aware wildcards.
 function M.glob_ignore_match(path, glob)
   return M.regex_match(path, glob_to_ere(glob, true))
