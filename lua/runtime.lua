@@ -98,23 +98,30 @@ function Shell:split(s)
   return out
 end
 
--- Run an external command via fork + execvp + waitpid (FFI/libc directly — NOT
+-- Run an external command via posix_spawnp + waitpid (FFI/libc directly — NOT
 -- /bin/sh, which would recurse when curse IS /bin/sh, and would lose signal
--- info). argv... are already-expanded strings. stdout is captured through a pipe
+-- info). We use posix_spawn rather than a manual fork+execvp so spawning from a
+-- big/warm heap (the daemon) doesn't pay a page-table copy: glibc routes it
+-- through CLONE_VM|CLONE_VFORK, so it's ~as cheap from a fat process as a tiny
+-- one. argv... are already-expanded strings. stdout is captured through a pipe
 -- and written to sh.out (so it composes with $(...) capture); $? is the exact
--- exit status, or 128+signum when the command is killed — like bash. (stderr is
--- inherited for now; redirection via dup2 comes with the fd model.)
+-- exit status, or 128+signum when killed by a signal — like bash. (stderr is
+-- inherited for now; redirection via file_actions comes with the fd model.)
 local ffi = require("ffi")
 local bit = require("bit")
 ffi.cdef [[
-  int fork(void);
-  int execvp(const char *file, char *const argv[]);
+  typedef int32_t curse_pid_t;
+  int posix_spawnp(curse_pid_t *pid, const char *file, const void *file_actions,
+                   const void *attrp, char *const argv[], char *const envp[]);
+  int posix_spawn_file_actions_init(void *fa);
+  int posix_spawn_file_actions_destroy(void *fa);
+  int posix_spawn_file_actions_adddup2(void *fa, int fd, int newfd);
+  int posix_spawn_file_actions_addclose(void *fa, int fd);
   int waitpid(int pid, int *wstatus, int options);
   int pipe(int fildes[2]);
   int close(int fd);
-  int dup2(int oldfd, int newfd);
   long read(int fd, void *buf, unsigned long count);
-  void _exit(int status);
+  extern char **environ;
 ]]
 local C = ffi.C
 
@@ -122,7 +129,6 @@ function Shell:exec(...)
   local args = { ... }
   local n = #args
   if n == 0 or args[1] == "" then self.status = 127; return end
-  -- build argv in the PARENT (no Lua allocation in the child after fork)
   local argv = ffi.new("const char*[?]", n + 1)
   local anchor = {} -- keep the Lua strings alive while argv points into them
   for i = 1, n do anchor[i] = tostring(args[i]); argv[i - 1] = anchor[i] end
@@ -130,17 +136,17 @@ function Shell:exec(...)
   local fds = ffi.new("int[2]")
   if C.pipe(fds) ~= 0 then self.status = 127; return end
   local rfd, wfd = fds[0], fds[1]
-  local pid = C.fork()
-  if pid == 0 then -- child: stdout -> pipe, then exec. This block must NEVER
-    -- return into the interpreter (that would fork-bomb: a child that keeps
-    -- running the script), so guard it — ANY failure ends in _exit, not unwind.
-    pcall(function()
-      C.dup2(wfd, 1); C.close(rfd); C.close(wfd)
-      C.execvp(args[1], ffi.cast("char *const *", argv)) -- replaces the process on success
-    end)
-    C._exit(127) -- reached only if exec failed (command not found / threw)
-  end
+  -- opaque posix_spawn_file_actions_t (~80B on glibc; over-allocate to be safe):
+  -- dup the pipe's write end onto the child's stdout, and close its read end.
+  local fa = ffi.new("uint8_t[1024]")
+  C.posix_spawn_file_actions_init(fa)
+  C.posix_spawn_file_actions_adddup2(fa, wfd, 1)
+  C.posix_spawn_file_actions_addclose(fa, rfd)
+  local pidp = ffi.new("curse_pid_t[1]")
+  local rc = C.posix_spawnp(pidp, args[1], fa, nil, ffi.cast("char *const *", argv), C.environ)
+  C.posix_spawn_file_actions_destroy(fa)
   C.close(wfd)
+  if rc ~= 0 then C.close(rfd); self.status = 127; return end -- e.g. ENOENT
   local buf = ffi.new("char[65536]")
   local chunks = {}
   while true do
@@ -150,7 +156,7 @@ function Shell:exec(...)
   end
   C.close(rfd)
   local st = ffi.new("int[1]")
-  C.waitpid(pid, st, 0)
+  C.waitpid(pidp[0], st, 0)
   local s = st[0]
   local sig = bit.band(s, 0x7f)
   if sig ~= 0 and sig ~= 0x7f then
