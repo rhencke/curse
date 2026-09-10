@@ -846,16 +846,23 @@ function M.subst_glob(val, glob, repl, all)
   elseif anchor == "$" then ere = "(" .. ere .. ")$"
   else ere = "(" .. ere .. ")" end
   if ffi.C.regcomp(regbuf, ere, REG_EXTENDED) ~= 0 then return val end
-  local out, pos, n = {}, 0, #val
+  local out, pos, n, prev_end = {}, 0, #val, -1
   while pos <= n do
     local sub = val:sub(pos + 1)
     if ffi.C.regexec(regbuf, sub, 1, pmatch, pos > 0 and REG_NOTBOL or 0) ~= 0 then break end
     local so, eo = pmatch[0].rm_so, pmatch[0].rm_eo
-    out[#out + 1] = sub:sub(1, so) -- text before the match
-    out[#out + 1] = repl
-    if eo > so then pos = pos + eo
-    else out[#out + 1] = sub:sub(eo + 1, eo + 1); pos = pos + eo + 1 end -- empty match: keep one char
-    if not all or anchor then out[#out + 1] = val:sub(pos + 1); ffi.C.regfree(regbuf); return table.concat(out) end
+    if eo == so and pos + so == prev_end then
+      -- an EMPTY match right where the previous match ended (e.g. `.*` matched to
+      -- the end, then matches empty again): don't replace, just carry one char.
+      out[#out + 1] = sub:sub(1, so + 1); pos = pos + so + 1
+    else
+      out[#out + 1] = sub:sub(1, so) -- text before the match
+      out[#out + 1] = repl
+      prev_end = pos + eo
+      if eo > so then pos = pos + eo
+      else out[#out + 1] = sub:sub(eo + 1, eo + 1); pos = pos + eo + 1 end -- empty match: keep one char
+      if not all or anchor then out[#out + 1] = val:sub(pos + 1); ffi.C.regfree(regbuf); return table.concat(out) end
+    end
   end
   ffi.C.regfree(regbuf)
   out[#out + 1] = val:sub(pos + 1)
