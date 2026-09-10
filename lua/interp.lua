@@ -819,6 +819,144 @@ local function parse_umask(s, cur)
   return bit.band(bit.bnot(allowed), 511)
 end
 
+-- ---- printf (native, bash-compatible) ----
+-- An integer printf argument: `'x`/`"x` is the code of the first byte; "" is 0;
+-- otherwise arithmetic (bases honored). Returns (int64, ok) — ok=false marks an
+-- invalid number (bash prints 0 and sets status 1). int64 keeps full 64-bit
+-- precision for %d/%u/%o/%x (LuaJIT's string.format formats cdata directly).
+local function printf_int(s)
+  if s == nil or s == "" then return 0LL, true end
+  local c = s:sub(1, 1)
+  if c == "'" or c == '"' then return (#s >= 2 and i64(s:byte(2)) or 0LL), true end
+  local ok, v = pcall(rt.arith_num, s)
+  if ok then return v, true end
+  return 0LL, false
+end
+-- A floating printf argument (for %f/%e/%g): C strtod semantics via tonumber.
+local function printf_float(s)
+  if s == nil or s == "" then return 0, true end
+  local c = s:sub(1, 1)
+  if c == "'" or c == '"' then return (#s >= 2 and s:byte(2) or 0), true end
+  local v = tonumber(s)
+  if v then return v, true end
+  return 0, false
+end
+-- width/precision for %s or a %(…)T result via string.format on a plain string.
+-- printf %q: quote so the result re-reads as the same word (bash style: backslash-
+-- escape metacharacters/whitespace; $'…' when control chars are present).
+local function printf_q(s)
+  if s == "" then return "''" end
+  if s:match("^[%w_@%%%+%-%./,:=^]+$") then return s end
+  if s:find("[%z\1-\31\127]") then
+    local out = { "$'" }
+    for k = 1, #s do
+      local ch, b = s:sub(k, k), s:byte(k)
+      if ch == "\n" then out[#out + 1] = "\\n"
+      elseif ch == "\t" then out[#out + 1] = "\\t"
+      elseif ch == "\r" then out[#out + 1] = "\\r"
+      elseif b < 32 or b == 127 then out[#out + 1] = string.format("\\%03o", b)
+      elseif ch == "'" then out[#out + 1] = "\\'"
+      elseif ch == "\\" then out[#out + 1] = "\\\\"
+      else out[#out + 1] = ch end
+    end
+    out[#out + 1] = "'"; return table.concat(out)
+  end
+  return (s:gsub("[%s\"'\\|&;<>()$`?*%[%]#~=!{}^]", "\\%0"))
+end
+local uint64_t = ffi.typeof("uint64_t")
+-- Format one numeric %-conversion from a raw arg string. Returns (string, ok).
+local function printf_conv(full, conv, arg)
+  if conv == "d" or conv == "i" then
+    local v, ok = printf_int(arg); return string.format(full .. "d", v), ok
+  elseif conv == "u" then
+    local v, ok = printf_int(arg); return string.format(full .. "u", uint64_t(v)), ok
+  elseif conv == "o" or conv == "x" or conv == "X" then
+    local v, ok = printf_int(arg); return string.format(full .. conv, uint64_t(v)), ok
+  elseif conv == "f" or conv == "F" or conv == "e" or conv == "E" or conv == "g"
+      or conv == "G" or conv == "a" or conv == "A" then
+    local v, ok = printf_float(arg); return string.format(full .. (conv == "F" and "f" or conv), v), ok
+  end
+  return nil, true -- unknown conversion
+end
+-- The full printf engine. `argv[start..]` are the data args; the format is reused
+-- until they're exhausted. Returns (output, status).
+local function sh_printf(fmt, argv, start)
+  local out, status, ai = {}, 0, start
+  local nargs = #argv
+  local function nextarg() local v = argv[ai]; if v ~= nil then ai = ai + 1 end; return v or "" end
+  repeat
+    local pass_start = ai
+    local i, n = 1, #fmt
+    while i <= n do
+      local c = fmt:sub(i, i)
+      if c == "\\" then -- format-level backslash escapes (\n \t \\ \ooo \xHH …)
+        local d = fmt:sub(i + 1, i + 1)
+        if d == "n" then out[#out + 1] = "\n"; i = i + 2
+        elseif d == "t" then out[#out + 1] = "\t"; i = i + 2
+        elseif d == "r" then out[#out + 1] = "\r"; i = i + 2
+        elseif d == "\\" then out[#out + 1] = "\\"; i = i + 2
+        elseif d == "a" then out[#out + 1] = "\7"; i = i + 2
+        elseif d == "b" then out[#out + 1] = "\8"; i = i + 2
+        elseif d == "f" then out[#out + 1] = "\12"; i = i + 2
+        elseif d == "v" then out[#out + 1] = "\11"; i = i + 2
+        elseif d == "x" then local h = fmt:match("^%x%x?", i + 2)
+          if h then out[#out + 1] = string.char(tonumber(h, 16)); i = i + 2 + #h else out[#out + 1] = "\\"; i = i + 1 end
+        elseif d:match("[0-7]") then local o = fmt:match("^[0-7][0-7]?[0-7]?", i + 1)
+          out[#out + 1] = string.char(tonumber(o, 8) % 256); i = i + 1 + #o
+        else out[#out + 1] = "\\"; i = i + 1 end
+      elseif c == "%" then
+        local j = i + 1
+        if fmt:sub(j, j) == "%" then out[#out + 1] = "%"; i = j + 1
+        else
+          local spec = "%"
+          while fmt:sub(j, j):match("[-+ #0]") do spec = spec .. fmt:sub(j, j); j = j + 1 end
+          local width = ""
+          if fmt:sub(j, j) == "*" then local w = printf_num(nextarg()); width = tostring(math.floor(w)); j = j + 1
+          else while fmt:sub(j, j):match("%d") do width = width .. fmt:sub(j, j); j = j + 1 end end
+          local prec = nil
+          if fmt:sub(j, j) == "." then
+            j = j + 1; prec = ""
+            if fmt:sub(j, j) == "*" then local p = printf_num(nextarg()); prec = tostring(math.floor(p)); j = j + 1
+            else while fmt:sub(j, j):match("%d") do prec = prec .. fmt:sub(j, j); j = j + 1 end end
+          end
+          while fmt:sub(j, j):match("[lhLjzt]") do j = j + 1 end -- length mods (ignored)
+          if fmt:sub(j, j) == "(" then -- %(FORMAT)T strftime
+            local close = fmt:find(")", j + 1, true)
+            local tfmt = fmt:sub(j + 1, (close or j + 1) - 1)
+            j = (close or j) + 1 -- now at 'T'
+            local arg = nextarg()
+            local epoch = (arg == "" or arg == "-1") and os.time() or (tonumber(arg) or os.time())
+            local sres = os.date(tfmt, epoch) or ""
+            if prec then sres = sres:sub(1, tonumber(prec)) end
+            out[#out + 1] = string.format("%" .. (spec:sub(2)) .. width .. "s", sres)
+            i = j + 1
+          else
+            local conv = fmt:sub(j, j)
+            local full = spec .. width .. (prec and ("." .. prec) or "")
+            if conv == "s" then
+              out[#out + 1] = string.format((spec:gsub("0", "", 1)) .. width .. (prec and ("." .. prec) or "") .. "s", nextarg())
+            elseif conv == "c" then -- first char of the (string) argument
+              out[#out + 1] = string.format("%" .. spec:sub(2) .. width .. "s", nextarg():sub(1, 1))
+            elseif conv == "b" then
+              out[#out + 1] = string.format("%" .. spec:sub(2) .. width .. "s", rt.ansi_unescape(nextarg()))
+            elseif conv == "q" then
+              local s = printf_q(nextarg())
+              out[#out + 1] = width ~= "" and string.format("%" .. spec:sub(2) .. width .. "s", s) or s
+            else
+              local r, ok = printf_conv(full, conv, nextarg())
+              if not ok then status = 1 end
+              if r == nil then io.stderr:write("curse: printf: `" .. conv .. "': invalid conversion specification\n"); status = 1 end
+              out[#out + 1] = r or ""
+            end
+            i = j + 1
+          end
+        end
+      else out[#out + 1] = c; i = i + 1 end
+    end
+  until ai > nargs or ai == pass_start
+  return table.concat(out), status
+end
+
 -- Dispatch one already-expanded simple command (no redirs — the caller sets those
 -- up). Builtins first, then user functions, then external.
 local function exec_simple(sh, args, hook)
@@ -1384,16 +1522,32 @@ local function exec_simple(sh, args, hook)
       if res.err then io.stderr:write("curse: " .. res.err .. "\n") end
       sh.status = 0
     end
-  elseif cmd == "printf" and args[2] == "-v" then
-    -- printf -v VAR FMT ARGS: format via external printf, capture, assign to VAR
-    local var = args[3]
-    local buf, saved = {}, sh.out
-    sh.out = function(s) buf[#buf + 1] = s end
-    local pa = { "printf" }; for k = 4, #args do pa[#pa + 1] = args[k] end
-    sh:exec(unpack(pa))
-    sh.out = saved
-    sh:set_str(var, table.concat(buf))
-    sh.status = 0
+  elseif cmd == "printf" then
+    -- printf [-v VAR] FMT [ARGS…] — native, bash-compatible.
+    if args[2] == "-v" then
+      local target = args[3]
+      if target == nil then io.stderr:write("curse: printf: -v: option requires an argument\n"); sh.status = 2
+      else
+        local res, st = sh_printf(args[4] or "", args, 5)
+        -- target may be NAME or NAME[SUBSCRIPT]
+        local nm, sub = target:match("^([%a_][%w_]*)%[(.*)%]$")
+        if nm then
+          if sub == "" then io.stderr:write("curse: printf: `" .. target .. "': bad array subscript\n"); sh.status = 2
+          else sh:array_set(nm, array_key(sh, nm, sub), res, false); sh.status = st end
+        elseif target:find("%[") then -- malformed subscript like `a[`
+          io.stderr:write("curse: printf: `" .. target .. "': bad array subscript\n"); sh.status = 2
+        else sh:set_str(target, res); sh.status = st end
+      end
+    else
+      local fi = 2
+      if args[fi] == "--" then fi = fi + 1 end -- end of options
+      if args[fi] == nil then
+        io.stderr:write("curse: printf: usage: printf [-v var] format [arguments]\n"); sh.status = 2
+      else
+        local res, st = sh_printf(args[fi], args, fi + 1)
+        sh.out(res); sh.status = st
+      end
+    end
   elseif cmd == "read" then
     -- read [-r] [-a arr] [-p prompt] VAR...  (line from stdin, split on IFS)
     local raw, arr, j, nchars, ndelim, ufd = false, nil, 2, nil, false, 0
