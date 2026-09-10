@@ -477,7 +477,15 @@ local function expand_part_str(sh, p)
     -- literally; everything else (defaults :-/-, etc.) is an ordinary value.
     local patmode = pe.op == "/" or pe.op == "//" or pe.op == "#" or pe.op == "##"
       or pe.op == "%" or pe.op == "%%"
-    local arg = pe.arg and (patmode and expand_pattern or expand_word)(sh, P.parse_word(pe.arg)) or nil
+    -- The word for -/:-/+/:+/=/:=/?/:? is only expanded WHEN USED (bash: a default
+    -- with side effects like $((i++)) runs only if the branch is taken). Pass a thunk.
+    local TESTOP = { ["-"] = 1, [":-"] = 1, ["+"] = 1, [":+"] = 1, ["="] = 1, [":="] = 1, ["?"] = 1, [":?"] = 1 }
+    local arg
+    if TESTOP[pe.op] then
+      arg = pe.arg and function() return expand_word(sh, P.parse_word(pe.arg)) end or nil
+    else
+      arg = pe.arg and (patmode and expand_pattern or expand_word)(sh, P.parse_word(pe.arg)) or nil
+    end
     local arg2 = pe.arg2 and expand_word(sh, P.parse_word(pe.arg2)) or nil
     if pe.op == "sub" then -- ${v:off:len}: offset/length are arithmetic expressions
       arg = arg and tostring(arith_int(sh, arg) or 0) or nil

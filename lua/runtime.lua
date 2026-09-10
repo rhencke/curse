@@ -855,7 +855,9 @@ function Shell:expand_param(pe, arg, arg2, idxnum)
   else
     isset = self.vars[self:deref(name)] ~= nil; val = self:get(name)
   end
-  arg = arg or ""
+  -- The default/alternate word for the test ops arrives as a thunk (lazy: only
+  -- expanded when its branch is taken, so a side-effecting default runs at most once).
+  local function A() if type(arg) == "function" then return arg() end return arg or "" end
   -- set -u (nounset): a bare reference to an unset variable errors and exits. The
   -- unset-handling ops (:- - :+ + := = :? ?) and $@/$* are exempt.
   if self.opt_u and not isset and not (name == "@" or name == "*")
@@ -866,14 +868,15 @@ function Shell:expand_param(pe, arg, arg2, idxnum)
     io.stderr:write("curse: " .. name .. ": unbound variable\n"); error({ __curse_exit = 1 })
   end
   if op == "len" then return tostring(#val) end
-  if op == ":-" then return val ~= "" and val or arg end
-  if op == "-" then return isset and val or arg end
-  if op == ":+" then return val ~= "" and arg or "" end
-  if op == "+" then return isset and arg or "" end
-  if op == ":=" then if val == "" then self:set_str(name, arg); return arg end return val end
-  if op == "=" then if not isset then self:set_str(name, arg); return arg end return val end
-  if op == ":?" then if val == "" then error({ __curse_exit = 1 }) end return val end
-  if op == "?" then if not isset then error({ __curse_exit = 1 }) end return val end
+  if op == ":-" then return val ~= "" and val or A() end
+  if op == "-" then return isset and val or A() end
+  if op == ":+" then return val ~= "" and A() or "" end
+  if op == "+" then return isset and A() or "" end
+  if op == ":=" then if val == "" then local v = A(); self:set_str(name, v); return v end return val end
+  if op == "=" then if not isset then local v = A(); self:set_str(name, v); return v end return val end
+  if op == ":?" then if val == "" then io.stderr:write("curse: " .. name .. ": " .. A() .. "\n"); error({ __curse_exit = 1 }) end return val end
+  if op == "?" then if not isset then io.stderr:write("curse: " .. name .. ": " .. A() .. "\n"); error({ __curse_exit = 1 }) end return val end
+  arg = arg or ""
   if op == "@" then -- ${x@OP} transforms; on an UNSET var they yield empty
     if not isset then return "" end
     if arg == "a" then return self:attr_string(name) end
