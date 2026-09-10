@@ -808,7 +808,8 @@ local function multi_elems(sh, p) -- returns element list, star?
     end
     if pe.op == "sub" then -- array slice
       local off = arith_int(sh, pe.arg and expand_word(sh, P.parse_word(pe.arg)) or nil) or 0
-      local len = pe.arg2 and arith_int(sh, expand_word(sh, P.parse_word(pe.arg2))) or nil
+      -- a PRESENT length (even empty, `${a[@]:0:}`) is a count; empty means 0.
+      local len = pe.arg2 and (arith_int(sh, expand_word(sh, P.parse_word(pe.arg2))) or 0) or nil
       if pe.name ~= "@" and pe.name ~= "*" and not sh:is_assoc(pe.name) then
         -- indexed (possibly sparse) array: select by INDEX VALUE (elements whose
         -- index >= off), length is a COUNT. A negative offset counts from the

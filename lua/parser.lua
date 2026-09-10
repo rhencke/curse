@@ -247,8 +247,10 @@ local function parse_paramexp(inner)
   elseif one == "@" then return P { op = "@", arg = rest:sub(2) } -- ${x@Q/U/u/L/E}
   elseif one == ":" then
     local body = rest:sub(2)
-    local off, len = body:match("^(.-):(.+)$")
-    if off then return P { op = "sub", arg = off, arg2 = len } end
+    if body == "" then return P { op = "badsubst", raw = name .. rest } end -- ${x:} empty offset
+    -- split off the FIRST colon: ${x:off:len}; ${x::} means off=0, len=0 (empty).
+    local colon = body:find(":", 1, true)
+    if colon then return P { op = "sub", arg = body:sub(1, colon - 1), arg2 = body:sub(colon + 1) } end
     return P { op = "sub", arg = body }
   end
   -- Any trailing text that is not a recognized modifier is a bad substitution
