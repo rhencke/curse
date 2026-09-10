@@ -210,10 +210,19 @@ local function file_test(op, path)
   return false
 end
 local UNARY_STR = { ["-z"] = true, ["-n"] = true }
+-- `test -v NAME` / `[[ -v NAME ]]`: is the variable (or array element) set?
+local array_key -- forward (defined below)
+local function var_is_set(sh, nm)
+  local base, sub = nm:match("^([%a_][%w_]*)%[(.+)%]$")
+  if base then return sh:is_elem_set(base, array_key(sh, base, sub)) end
+  if nm:match("^%d+$") then return tonumber(nm) <= sh.nparams end -- positional param
+  return sh.vars[sh:deref(nm)] ~= nil or sh:special_get(nm) ~= ""
+end
 local function unary(sh, op, x)
   if op == "-z" then return x == "" end
   if op == "-n" then return x ~= "" end
   if op == "-o" then return sh and SETOPT[x] and opt_on(sh, SETOPT[x]) or false end -- shell option on
+  if op == "-v" then return sh and var_is_set(sh, x) or false end -- variable/element is set
   return file_test(op, x) -- -e/-f/-d/-r/-w/-x/-s…
 end
 local function binary(x, op, y)
@@ -363,7 +372,7 @@ M.eval = eval
 
 -- Resolve an array subscript to a key: a string (word-expanded) for an
 -- associative array, else an integer (arith-evaluated) for an indexed one.
-local function array_key(sh, name, index_raw)
+array_key = function(sh, name, index_raw)
   local P = require("parser")
   if sh:is_assoc(name) then return expand_word(sh, P.parse_word(index_raw)) end
   -- indexed: expand $()/$vars in the subscript, then evaluate it as arithmetic
@@ -1712,13 +1721,8 @@ local function eval_dbracket(sh, node)
   if k == "or" then return eval_dbracket(sh, node.l) or eval_dbracket(sh, node.r) end
   if k == "not" then return not eval_dbracket(sh, node.e) end
   if k == "str" then return expand_word(sh, node.word) ~= "" end
-  if k == "unary" and node.op == "-v" then -- variable/element is set
-    local nm = expand_word(sh, node.word)
-    local base, sub = nm:match("^([%a_][%w_]*)%[(.+)%]$")
-    if base then return sh:is_elem_set(base, array_key(sh, base, sub)) end
-    return sh.vars[sh:deref(nm)] ~= nil or sh:special_get(nm) ~= ""
-  end
-  if k == "unary" then return unary(node.op, expand_word(sh, node.word)) end
+  if k == "unary" and node.op == "-v" then return var_is_set(sh, expand_word(sh, node.word)) end
+  if k == "unary" then return unary(sh, node.op, expand_word(sh, node.word)) end
   if k == "binary" then
     local l, r, op = expand_word(sh, node.l), expand_word(sh, node.r), node.op
     if op == "==" or op == "=" then
