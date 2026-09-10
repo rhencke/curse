@@ -2413,9 +2413,14 @@ local function exec_stmt(sh, st, hook)
     end
     sh:set_str("_", "") -- a bare assignment resets $_ to empty (bash)
   elseif t == "arrayassign" then
-    do_arrayassign(sh, st)
-    sh.status = 0
-    sh:set_str("_", "")
+    local rb = sh.vars[sh:deref(st.name)]
+    if rb and rb.ro then -- readonly array: reject the (re)assignment
+      io.stderr:write("curse: " .. st.name .. ": readonly variable\n"); sh.status = 1
+    else
+      do_arrayassign(sh, st)
+      sh.status = 0
+      sh:set_str("_", "")
+    end
   elseif t == "funcdef" then
     sh.functions[st.name] = st.body
     sh.status = 0
