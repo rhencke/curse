@@ -2051,7 +2051,21 @@ local function exec_stmt(sh, st, hook)
         if parsed.stmts and #parsed.stmts == 1 and parsed.stmts[1].t == "simple" then
           local nw = {}
           for _, w in ipairs(parsed.stmts[1].words) do nw[#nw + 1] = w end
-          for k = 2, #st.words do nw[#nw + 1] = st.words[k] end
+          -- trailing-space chaining: when an alias value ends in a blank, the next
+          -- word is also alias-expanded (bash). Keep chaining while that holds.
+          local rest, ends_space = 2, av:match("%s$") ~= nil
+          while ends_space and st.words[rest] do
+            local w2 = st.words[rest]
+            local nm2 = (#w2.parts == 1 and w2.parts[1].lit ~= nil and not w2.parts[1].q) and w2.parts[1].lit or nil
+            local av2 = nm2 and not seen[nm2] and sh.aliases[nm2]
+            if not av2 then break end
+            local p2 = P.parse(av2)
+            if not (p2.stmts and #p2.stmts == 1 and p2.stmts[1].t == "simple") then break end
+            seen[nm2] = true
+            for _, w in ipairs(p2.stmts[1].words) do nw[#nw + 1] = w end
+            ends_space = av2:match("%s$") ~= nil; rest = rest + 1
+          end
+          for k = rest, #st.words do nw[#nw + 1] = st.words[k] end
           return exec_stmt(sh, { t = "simple", words = nw, redirs = st.redirs, assigns = st.assigns,
             arrayargs = parsed.stmts[1].arrayargs, alias_seen = seen }, hook)
         elseif parsed.stmts then
