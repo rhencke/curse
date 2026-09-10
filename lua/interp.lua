@@ -155,6 +155,8 @@ ffi.cdef [[
   unsigned int umask(unsigned int mask);
   long read(int fd, void *buf, unsigned long count);
   int kill(int pid, int sig);
+  unsigned int geteuid(void);
+  unsigned int getegid(void);
 ]]
 local C = ffi.C
 -- Unbuffered one-byte read from a raw fd (for `read`, which must NOT over-read
@@ -208,7 +210,28 @@ local function file_test(op, path)
   if op == "-g" then return bit.band(mode, 0x400) ~= 0 end -- setgid
   if op == "-u" then return bit.band(mode, 0x800) ~= 0 end -- setuid
   if op == "-s" then return tonumber(ffi.cast("int64_t *", statbuf + 48)[0]) > 0 end -- st_size @ 48
+  if op == "-O" then return ffi.cast("uint32_t *", statbuf + 28)[0] == C.geteuid() end -- st_uid @ 28
+  if op == "-G" then return ffi.cast("uint32_t *", statbuf + 32)[0] == C.getegid() end -- st_gid @ 32
   return false
+end
+-- file1 -ot/-nt/-ef file2: compare modification time / same inode (dev+ino).
+local statbuf2 = ffi.new("uint8_t[144]")
+local function file_bincmp(op, x, y)
+  local function st(path, buf) local ok, rc = pcall(C.curse_stat, path, buf); return ok and rc == 0 end
+  local ax, ay = st(x, statbuf), st(y, statbuf2)
+  if op == "-ef" then
+    if not (ax and ay) then return false end
+    return ffi.cast("uint64_t *", statbuf)[0] == ffi.cast("uint64_t *", statbuf2)[0]       -- st_dev @ 0
+       and ffi.cast("uint64_t *", statbuf + 8)[0] == ffi.cast("uint64_t *", statbuf2 + 8)[0] -- st_ino @ 8
+  end
+  -- compare (tv_sec @88, tv_nsec @96) lexicographically to avoid double overflow
+  local function older(ba, bb) -- ba's mtime < bb's mtime
+    local s1, s2 = tonumber(ffi.cast("int64_t *", ba + 88)[0]), tonumber(ffi.cast("int64_t *", bb + 88)[0])
+    if s1 ~= s2 then return s1 < s2 end
+    return tonumber(ffi.cast("int64_t *", ba + 96)[0]) < tonumber(ffi.cast("int64_t *", bb + 96)[0])
+  end
+  if op == "-nt" then return ax and (not ay or older(statbuf2, statbuf)) end -- x newer (or y missing)
+  return ay and (not ax or older(statbuf, statbuf2))                          -- -ot: x older (or x missing)
 end
 local UNARY_STR = { ["-z"] = true, ["-n"] = true }
 -- `test -v NAME` / `[[ -v NAME ]]`: is the variable (or array element) set?
@@ -226,12 +249,24 @@ local function unary(sh, op, x)
   if op == "-v" then return sh and var_is_set(sh, x) or false end -- variable/element is set
   return file_test(op, x) -- -e/-f/-d/-r/-w/-x/-s…
 end
+-- `test` numeric operands are plain DECIMAL integers (a leading 0 is NOT octal,
+-- 0x.. / N#.. / arithmetic are all rejected) — an invalid one is a syntax error.
+local function test_int(s)
+  local d = s:match("^%s*([+-]?%d+)%s*$")
+  if not d then error({ __test_syntax = ("%s: integer expression expected"):format(s) }) end
+  return tonumber(d, 10)
+end
+local TEST_BINOPS = { ["="] = 1, ["=="] = 1, ["!="] = 1, ["<"] = 1, [">"] = 1,
+  ["-eq"] = 1, ["-ne"] = 1, ["-lt"] = 1, ["-le"] = 1, ["-gt"] = 1, ["-ge"] = 1,
+  ["-ot"] = 1, ["-nt"] = 1, ["-ef"] = 1 }
 local function binary(x, op, y)
   if op == "=" or op == "==" then return x == y end
   if op == "!=" then return x ~= y end
   if op == "<" then return x < y end -- string compare (C locale, like bash)
   if op == ">" then return x > y end
-  local nx, ny = rt.arith_num(x), rt.arith_num(y) -- -eq etc. honor bases (017, 0xf, N#)
+  if op == "-ot" or op == "-nt" or op == "-ef" then return file_bincmp(op, x, y) end
+  if not TEST_BINOPS[op] then error({ __test_syntax = ("%s: binary operator expected"):format(op) }) end
+  local nx, ny = test_int(x), test_int(y)
   if op == "-eq" then return nx == ny end
   if op == "-ne" then return nx ~= ny end
   if op == "-lt" then return nx < ny end
@@ -271,7 +306,7 @@ local function eval_test(sh, a, lo, hi)
   if n == 1 then return a[lo] ~= "" end
   if n == 2 then return unary(sh, a[lo], a[lo + 1]) end
   if n == 3 then return binary(a[lo], a[lo + 1], a[lo + 2]) end
-  return false
+  error({ __test_syntax = "too many arguments" }) -- n>3 with no -a/-o/paren: bash syntax error
 end
 local function do_test(sh, args)
   local lo, hi = 2, #args
@@ -280,7 +315,10 @@ local function do_test(sh, args)
     hi = hi - 1
   end
   local ok, res = pcall(eval_test, sh, args, lo, hi)
-  sh.status = (ok and res) and 0 or 1
+  -- a malformed expression (bad operator, non-integer for -eq, too many args) is a
+  -- SYNTAX error (status 2); a well-formed expression that's false is status 1.
+  if not ok then sh.status = 2; return end
+  sh.status = res and 0 or 1
 end
 
 local expand_word -- forward (used by eval's $-deferred arith and expand_part_str)
