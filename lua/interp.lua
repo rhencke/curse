@@ -2869,7 +2869,10 @@ local function exec_stmt(sh, st, hook)
         local b = sh.vars[a.name] -- COPY the box: exec_stmt mutates it in place
         saved[#saved + 1] = { name = a.name, env = os.getenv(a.name),
           box = b and { s = b.s, n = b.n, arr = b.arr, assoc = b.assoc, order = b.order } or false }
-        exec_stmt(sh, a, hook); C.setenv(a.name, sh:get(a.name), 1)
+        exec_stmt(sh, a, hook)
+        -- An array-element prefix (`b[0]=2 cmd`) is a temporary assignment but is
+        -- NOT put in the command's environment (bash), unlike a scalar `x=v cmd`.
+        if not a.index then C.setenv(a.name, sh:get(a.name), 1) end
       end
       local ok, err = pcall(run_cmd)
       for k = #saved, 1, -1 do
