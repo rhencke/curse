@@ -26,7 +26,7 @@ local SPEC = ROOT .. "/reference/oil/spec"
 local LUAJIT = ROOT .. "/.bench-lua/luajit"
 local RUNLUA = ROOT .. "/lua/run.lua"
 local BUNDLE = ROOT .. "/dist/curse.bc"
-local TIMEOUT = 5
+local TIMEOUT = 2 -- cases are tiny; this only bounds hangs (e.g. `while true`)
 
 -- temp workspace (per run); each case gets a fresh cwd so file side effects don't
 -- leak between cases (matches run.mts).

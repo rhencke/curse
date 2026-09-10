@@ -228,7 +228,7 @@ function M.parse(src)
     return stmts
   end
 
-  local function parse_stmt()
+  local function parse_command()
     ws()
     -- function NAME [()] { … }   or   NAME() { … }
     if peekword() == "function" then
@@ -289,32 +289,26 @@ function M.parse(src)
       local body_stmts = parse_stmts({ done = true })
       return { t = "forin", id = id, line = ln, name = name, words = words, body = body_stmts }
     end
-    -- while (( cond )); do BODY done
-    if peekword() == "while" then
-      local ln = line; ws(); i = i + 5; ws()
-      if src:sub(i, i + 1) ~= "((" then error("subset: while needs (( ))") end
-      local body, ni = grab_dparen(src, i + 2); i = ni
+    -- while/until COND; do BODY; done  — COND is a command list; the loop runs
+    -- while its exit status is 0 (until: while it's non-zero). `while (( expr ))`
+    -- works because (( )) parses as an arithcmd statement inside COND.
+    if peekword() == "while" or peekword() == "until" then
+      local kind = peekword(); local ln = line; i = i + #kind
       loopId = loopId + 1; local id = loopId
-      skipsep()
-      if peekword() == "do" then i = i + 2 end
+      local cond = parse_stmts({ ["do"] = true })
       local body_stmts = parse_stmts({ done = true })
-      return { t = "whilec", id = id, line = ln, cond = arith(body), body = body_stmts }
+      return { t = "whilec", id = id, line = ln, cond = cond, body = body_stmts,
+        negate = (kind == "until") }
     end
-    -- if (( cond )); then BODY [elif (( c )); then BODY]* [else BODY] fi
+    -- if COND; then BODY [elif COND; then BODY]* [else BODY] fi — COND is a
+    -- command list; the branch is taken when its exit status is 0.
     if peekword() == "if" then
-      local ln = line; ws(); i = i + 2
-      local function cond()
-        ws()
-        if src:sub(i, i + 1) ~= "((" then error("subset: if needs (( ))") end
-        local body, ni = grab_dparen(src, i + 2); i = ni
-        return arith(body)
-      end
+      local ln = line; i = i + 2
       local clauses = {}
       while true do
-        local c = cond()
-        parse_stmts({ ["then"] = true }) -- skip to 'then'
+        local cond = parse_stmts({ ["then"] = true })
         local body, term = parse_stmts({ elif = true, ["else"] = true, fi = true })
-        clauses[#clauses + 1] = { cond = c, body = body }
+        clauses[#clauses + 1] = { cond = cond, body = body }
         if term == "else" then
           local eb = parse_stmts({ fi = true })
           clauses[#clauses + 1] = { cond = nil, body = eb }
@@ -323,6 +317,11 @@ function M.parse(src)
         elseif term ~= "elif" then error("if: missing fi") end
       end
       return { t = "if", line = ln, clauses = clauses }
+    end
+    -- (( expr )) arithmetic command: exit status 0 if expr != 0, else 1.
+    if src:sub(i, i + 1) == "((" then
+      local body, ni = grab_dparen(src, i + 2); i = ni
+      return { t = "arithcmd", line = line, expr = arith(body) }
     end
     -- assignment: NAME=RHS
     do
@@ -342,7 +341,7 @@ function M.parse(src)
     local words = {}
     while i <= n do
       local c = src:sub(i, i)
-      if c == "\n" or c == ";" or c == "#" then break end
+      if c == "\n" or c == ";" or c == "#" or c == "&" or c == "|" then break end
       if c:match("[ \t]") then ws()
       else
         local w = word()
@@ -352,6 +351,49 @@ function M.parse(src)
     end
     if #words == 0 then return nil end
     return { t = "simple", line = ln, words = words }
+  end
+
+  -- pipeline: cmd [ | cmd ]*   (optional leading `!` negates the exit status)
+  local function parse_pipeline()
+    ws()
+    local negate = false
+    if src:sub(i, i + 1) == "! " then negate = true; i = i + 2; ws() end
+    local first = parse_command()
+    local cmds = { first }
+    while true do
+      ws()
+      -- a single `|` (not `||`) chains another command into the pipeline
+      if src:sub(i, i) == "|" and src:sub(i + 1, i + 1) ~= "|" then
+        i = i + 1
+        cmds[#cmds + 1] = parse_command()
+      else
+        break
+      end
+    end
+    if #cmds == 1 and not negate then return first end
+    return { t = "pipeline", cmds = cmds, negate = negate }
+  end
+
+  -- and-or list: pipeline [ (&& | ||) pipeline ]*  ; a lone `&` (background) is
+  -- accepted and run in the foreground for now.
+  local function parse_stmt()
+    local head = parse_pipeline()
+    local items = nil
+    while true do
+      ws()
+      local two = src:sub(i, i + 1)
+      if two == "&&" or two == "||" then
+        i = i + 2
+        items = items or { { op = nil, cmd = head } }
+        items[#items + 1] = { op = two, cmd = parse_pipeline() }
+      elseif src:sub(i, i) == "&" then
+        i = i + 1 -- background: run in foreground (stdout comparison unaffected)
+      else
+        break
+      end
+    end
+    if items then return { t = "andor", items = items } end
+    return head
   end
 
   -- Parse statements until a terminator keyword in `stopset` (consumed and

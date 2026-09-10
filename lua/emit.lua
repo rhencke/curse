@@ -100,6 +100,19 @@ local function emit_word(w, lifted)
   return "(" .. table.concat(parts, " .. ") .. ")"
 end
 
+-- The CFG compiler only understands ARITHMETIC conditions. A forc cond is
+-- already an arith node; a while/if cond is now a command list, which we compile
+-- only when it's exactly one `(( expr ))` — extract that arith node here (never
+-- mutating the shared AST). Returns nil for a cond the compiler can't handle;
+-- assert_compilable (below) has already thrown for those, so post-validation this
+-- always yields the arith node for the conds that remain.
+local function cond_arith(c)
+  if type(c) ~= "table" then return nil end
+  if c.k then return c end -- an arith node already (forc init/cond/step)
+  if #c == 1 and c[1] and c[1].t == "arithcmd" then return c[1].expr end
+  return nil
+end
+
 -- a word that is exactly one numeric literal -> its digits (else nil)
 local function numeric_word(w)
   if #w.parts == 1 and w.parts[1].lit and w.parts[1].lit:match("^[+-]?%d+$") then
@@ -136,14 +149,14 @@ local function collect_names(stmts, set)
         end
       end
     elseif st.t == "forc" or st.t == "whilec" then
-      collect_arith(st.init, set); collect_arith(st.cond, set); collect_arith(st.step, set)
+      collect_arith(st.init, set); collect_arith(cond_arith(st.cond), set); collect_arith(st.step, set)
       collect_names(st.body, set)
     elseif st.t == "forin" then
       set[st.name] = true
       for _, w in ipairs(st.words) do collect_word(w, set) end
       collect_names(st.body, set)
     elseif st.t == "if" then
-      for _, cl in ipairs(st.clauses) do collect_arith(cl.cond, set); collect_names(cl.body, set) end
+      for _, cl in ipairs(st.clauses) do collect_arith(cond_arith(cl.cond), set); collect_names(cl.body, set) end
     elseif st.t == "funcdef" then
       collect_names(st.body, set)
     end
@@ -185,7 +198,7 @@ local function analyze_lift(ast)
           end
         end
       elseif st.t == "forc" or st.t == "whilec" then
-        for _, e in ipairs({ st.init, st.cond, st.step }) do
+        for _, e in ipairs({ st.init, cond_arith(st.cond), st.step }) do
           if e and (e.k == "asgn" or e.k == "post" or e.k == "pre") then assigned[e.name] = true end
         end
         scan(st.body)
@@ -230,11 +243,11 @@ local function func_flags(body)
       elseif st.t == "assign" then
         if st.arith then scan_arith_param(st.arith, f) elseif st.rhs then scan_word_param(st.rhs, f) end
       elseif st.t == "forc" or st.t == "whilec" then
-        scan_arith_param(st.init, f); scan_arith_param(st.cond, f); scan_arith_param(st.step, f); scan(st.body)
+        scan_arith_param(st.init, f); scan_arith_param(cond_arith(st.cond), f); scan_arith_param(st.step, f); scan(st.body)
       elseif st.t == "forin" then
         for _, w in ipairs(st.words) do scan_word_param(w, f) end; scan(st.body)
       elseif st.t == "if" then
-        for _, cl in ipairs(st.clauses) do scan_arith_param(cl.cond, f); scan(cl.body) end
+        for _, cl in ipairs(st.clauses) do scan_arith_param(cond_arith(cl.cond), f); scan(cl.body) end
       end
     end
   end
@@ -407,7 +420,7 @@ local function build_cfg(stmts, lifted, funcflags, inlinefns)
     elseif t == "whilec" then
       local condp = newpc(); loopPc[st.id] = condp
       local bodyentry = flatten_list(st.body, condp)
-      blocks[condp] = ("if %s then pc = %d else pc = %d end"):format(emit_bool(st.cond, lifted), bodyentry, after)
+      blocks[condp] = ("if %s then pc = %d else pc = %d end"):format(emit_bool(cond_arith(st.cond), lifted), bodyentry, after)
       return condp
     elseif t == "forin" then
       local initp = newpc()
@@ -438,7 +451,7 @@ local function build_cfg(stmts, lifted, funcflags, inlinefns)
         if cl.cond then
           local nxt = after
           if st.clauses[i + 1] then nxt = cps[i + 1] or bentry[i + 1] end -- next cond, or an else body
-          blocks[cps[i]] = ("if %s then pc = %d else pc = %d end"):format(emit_bool(cl.cond, lifted), bentry[i], nxt)
+          blocks[cps[i]] = ("if %s then pc = %d else pc = %d end"):format(emit_bool(cond_arith(cl.cond), lifted), bentry[i], nxt)
           entry = entry or cps[i]
         else
           entry = entry or bentry[i] -- a leading else (unusual)
@@ -488,7 +501,37 @@ local function assemble(cfg, sig, opts)
   return table.concat(o, "\n")
 end
 
+-- The CFG compiler is a subset. Throw for anything it can't faithfully compile,
+-- so cache.lua/tier fall back to the interpreter (the semantic oracle) rather
+-- than miscompiling. As coverage grows these gates are removed one by one.
+local function assert_compilable(stmts)
+  for _, st in ipairs(stmts) do
+    local t = st.t
+    if t == "arithcmd" then error("curse-nocompile: (( )) command")
+    elseif t == "andor" then error("curse-nocompile: && / || list")
+    elseif t == "pipeline" then error("curse-nocompile: pipeline")
+    elseif t == "whilec" then
+      if st.negate or cond_arith(st.cond) == nil then error("curse-nocompile: while/until cond") end
+      assert_compilable(st.body)
+    elseif t == "if" then
+      for _, cl in ipairs(st.clauses) do
+        if cl.cond ~= nil and cond_arith(cl.cond) == nil then error("curse-nocompile: if cond") end
+        assert_compilable(cl.body)
+      end
+    elseif t == "forc" or t == "forin" or t == "funcdef" then
+      assert_compilable(st.body)
+    elseif t == "simple" then
+      local w1 = st.words[1]
+      local cmd = w1 and w1.parts[1] and w1.parts[1].lit
+      if cmd == "test" or cmd == "[" or cmd == "exit" or cmd == "cd" or cmd == "unset" then
+        error("curse-nocompile: builtin " .. cmd)
+      end
+    end
+  end
+end
+
 function M.emit(ast)
+  assert_compilable(ast.stmts)
   local funcflags, inlinable, inlinefns = {}, {}, {}
   for _, st in ipairs(ast.stmts) do
     if st.t == "funcdef" then
