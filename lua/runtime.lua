@@ -256,10 +256,17 @@ M.str_to_i64 = str_to_i64
 -- Arithmetic numeric literal / value: like str_to_i64 but with bash arith bases —
 -- base#digits (2-64), 0x/0X hex, leading-0 octal. Used ONLY in arithmetic
 -- contexts ($(( )), arith var reads); `test` stays decimal (str_to_i64).
-local function digit_val(ch)
+local function digit_val(ch, base)
   local b = ch:byte()
   if b >= 48 and b <= 57 then return b - 48 end        -- 0-9
-  if b >= 97 and b <= 122 then return b - 97 + 10 end  -- a-z -> 10..35
+  if base and base > 36 then                            -- bases 37-64 (zsh/bash):
+    if b >= 97 and b <= 122 then return b - 97 + 10 end -- a-z -> 10..35
+    if b >= 65 and b <= 90 then return b - 65 + 36 end  -- A-Z -> 36..61
+    if ch == "@" then return 62 end
+    if ch == "_" then return 63 end
+    return nil
+  end
+  if b >= 97 and b <= 122 then return b - 97 + 10 end  -- a-z -> 10..35 (case-insensitive)
   if b >= 65 and b <= 90 then return b - 65 + 10 end   -- A-Z -> 10..35 (base<=36)
   return nil
 end
@@ -277,7 +284,7 @@ local function arith_num(s)
   if digits == "" or base < 2 or base > 64 then return sign < 0 and -str_to_i64(s) or str_to_i64(s) end
   local n, B = i64(0), i64(base)
   for k = 1, #digits do
-    local dv = digit_val(digits:sub(k, k))
+    local dv = digit_val(digits:sub(k, k), base)
     if not dv or dv >= base then break end
     n = n * B + i64(dv)
   end

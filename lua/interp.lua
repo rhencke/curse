@@ -764,7 +764,7 @@ local function exec_simple(sh, args, hook)
     sh.status = ok and 0 or 1
   elseif cmd == "shopt" then
     -- shopt [-s|-u|-q|-p|-o] [names]: set/unset/query shell options (subset).
-    local set_, unset_, quiet, oflag = false, false, false, false
+    local set_, unset_, quiet, oflag, badopt = false, false, false, false, false
     local names = {}
     for k = 2, #args do
       local a = args[k]
@@ -774,9 +774,12 @@ local function exec_simple(sh, args, hook)
       elseif a:match("^-[suqpo]+$") then
         if a:find("s") then set_ = true end; if a:find("u") then unset_ = true end
         if a:find("q") then quiet = true end; if a:find("o") then oflag = true end
+      elseif a:sub(1, 2) == "--" then badopt = true -- long opts are Oil syntax; bash errors
       else names[#names + 1] = a end
     end
-    if oflag then -- shopt -o: the `set -o` options
+    if badopt then
+      io.stderr:write("curse: shopt: invalid option\n"); sh.status = 1
+    elseif oflag then -- shopt -o: the `set -o` options
       if set_ or unset_ then
         for _, nm in ipairs(names) do
           if nm == "errexit" then sh.opt_e = set_ elseif nm == "nounset" then sh.opt_u = set_
