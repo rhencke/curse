@@ -328,7 +328,7 @@ local function parse_word(w)
     if c == "'" then -- single quotes: literal, no expansion
       local e = w:find("'", i + 1, true) or #w + 1
       add({ lit = w:sub(i + 1, e - 1), q = true }); i = e + 1
-    elseif c == '"' then -- double quotes: expand inside; skip $(..)/$((..))/`..`
+    elseif c == '"' then -- double quotes: expand inside; skip $(..)/$((..))/${..}/`..`
       local j = i + 1                              -- so their inner " isn't the close
       while j <= #w and w:sub(j, j) ~= '"' do
         local d = w:sub(j, j)
@@ -339,6 +339,13 @@ local function parse_word(w)
           while j <= #w and dep > 0 do
             local cc = w:sub(j, j)
             if cc == "(" then dep = dep + 1 elseif cc == ")" then dep = dep - 1 end
+            j = j + 1
+          end
+        elseif d == "$" and w:sub(j + 1, j + 1) == "{" then -- ${...}: inner " isn't the close
+          j = j + 2; local dep = 1
+          while j <= #w and dep > 0 do
+            local cc = w:sub(j, j)
+            if cc == "{" then dep = dep + 1 elseif cc == "}" then dep = dep - 1 end
             j = j + 1
           end
         elseif d == "`" then
