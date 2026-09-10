@@ -854,9 +854,12 @@ function Shell:expand_param(pe, arg, arg2, idxnum)
     val = self:paramsJoin(" "); isset = self.nparams > 0
   else
     -- "set" means it actually holds a value: a declared-but-valueless var (declare x)
-    -- is NOT set, so ${x-default} yields the default (bash), even though declare -p lists it.
+    -- and an EMPTY array (whose [0] is unset) are NOT set, so ${x-default} yields the
+    -- default (bash), even though declare -p lists them.
     local b = self.vars[self:deref(name)]
-    isset = (b ~= nil and (b.s ~= nil or b.n ~= nil or b.arr ~= nil)) or self:special_get(name) ~= ""
+    if b and b.arr then isset = b.arr[0] ~= nil or b.arr["0"] ~= nil
+    else isset = b ~= nil and (b.s ~= nil or b.n ~= nil) end
+    isset = isset or self:special_get(name) ~= ""
     val = self:get(name)
   end
   -- The default/alternate word for the test ops arrives as a thunk (lazy: only
