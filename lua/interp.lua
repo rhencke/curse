@@ -1104,7 +1104,7 @@ local BUILTINS = {
   eval = 1, source = 1, ["."] = 1, ["break"] = 1, ["continue"] = 1, ["true"] = 1,
   exec = 1, readonly = 1, umask = 1, alias = 1, unalias = 1, shopt = 1, wait = 1, trap = 1,
   mapfile = 1, readarray = 1, compgen = 1, complete = 1, compopt = 1,
-  pushd = 1, popd = 1, dirs = 1, builtin = 1, kill = 1, ulimit = 1,
+  pushd = 1, popd = 1, dirs = 1, builtin = 1, kill = 1, ulimit = 1, jobs = 1,
 }
 M.BUILTINS = BUILTINS -- exposed so the compiled backend delegates the same set
 local KEYWORDS = {
@@ -1446,6 +1446,40 @@ local function run_function(sh, cmd, fn, args, hook)
   end
 end
 
+-- ---- background job table (for `jobs`, `wait -n`, `wait %jobspec`) ----
+local WNOHANG = 1
+local function job_add(sh, pid, cmdstr)
+  sh.jobs = sh.jobs or {}
+  local maxid = 0
+  for _, j in ipairs(sh.jobs) do if not j.done and j.id > maxid then maxid = j.id end end
+  local job = { id = maxid + 1, pid = pid, cmd = cmdstr or "", done = false }
+  sh.jobs[#sh.jobs + 1] = job
+  sh.last_bg_pid = tostring(pid)
+  return job
+end
+-- Reap a job (blocking unless nohang); caches its exit status. Returns the status,
+-- or nil if it's still running (nohang) / already gone.
+local function job_reap(sh, job, nohang)
+  if job.done then return job.status end
+  local sb = ffi.new("int[1]")
+  local r = C.waitpid(job.pid, sb, nohang and WNOHANG or 0)
+  if r > 0 then job.done = true; job.status = rt.wexit(sb[0]); return job.status end
+  if r < 0 and not nohang then job.done = true; job.status = 127; return 127 end -- already gone
+  return nil -- still running (or, in a subshell, not our child to reap — keep it listed)
+end
+-- Resolve a `%…` jobspec to a job: %N by id, %+/%% current, %- previous, %str prefix.
+local function job_resolve(sh, spec)
+  local active = {}
+  for _, j in ipairs(sh.jobs or {}) do if not j.done then active[#active + 1] = j end end
+  if spec == "%%" or spec == "%+" then return active[#active] end
+  if spec == "%-" then return active[#active - 1] end
+  local n = spec:match("^%%(%d+)$")
+  if n then for _, j in ipairs(sh.jobs or {}) do if j.id == tonumber(n) and not j.done then return j end end return nil end
+  local str = spec:match("^%%%%?(.+)$") -- %str / %%str: command-prefix match
+  if str then for _, j in ipairs(active) do if j.cmd:sub(1, #str) == str then return j end end end
+  return nil
+end
+
 local function exec_simple(sh, args, hook, no_func)
   local cmd = args[1]
   -- A user function overrides a builtin of the same name (bash), so it wins here
@@ -1537,22 +1571,65 @@ local function exec_simple(sh, args, hook, no_func)
       if C.waitpid(pid, stbuf, 0) < 0 then return 127 end
       return rt.wexit(stbuf[0])
     end
-    local pids, bad = {}, false
+    local nflag, specs, bad = false, {}, false
     for k = 2, #args do
       local a = args[k]
-      if a == "-n" then -- wait for the next; approximate as the first tracked pid
-      elseif a:match("^%d+$") then pids[#pids + 1] = tonumber(a)
-      else bad = true end
+      if a == "-n" then nflag = true
+      elseif a == "-f" then -- accept (we always block until done anyway)
+      elseif a:sub(1, 1) == "-" and #a > 1 then bad = true
+      else specs[#specs + 1] = a end
     end
-    if bad then sh.status = 1
-    elseif #pids > 0 then
+    sh.jobs = sh.jobs or {}
+    if bad then sh.status = 2
+    elseif nflag and #specs == 0 then
+      -- wait for the NEXT job to finish (127 if there are none to wait for)
+      local active = false
+      for _, j in ipairs(sh.jobs) do if not j.done then active = true; break end end
+      if not active then sh.status = 127
+      else
+        local r = C.waitpid(-1, stbuf, 0); local est = rt.wexit(stbuf[0])
+        for _, j in ipairs(sh.jobs) do if j.pid == r then j.done = true; j.status = est end end
+        sh.status = est
+      end
+    elseif #specs > 0 then
       local last = 0
-      for _, p in ipairs(pids) do last = reap(p) end
+      for _, s in ipairs(specs) do
+        if s:sub(1, 1) == "%" then
+          local j = job_resolve(sh, s)
+          if not j then io.stderr:write("curse: wait: " .. s .. ": no such job\n"); last = 127
+          else last = job_reap(sh, j) or 127 end
+        elseif s:match("^%d+$") then
+          local pid, found = tonumber(s), nil
+          for _, j in ipairs(sh.jobs) do if j.pid == pid then found = j end end
+          if found then last = job_reap(sh, found) or 127 else last = reap(pid) end
+        else io.stderr:write("curse: wait: `" .. s .. "': not a pid or valid job spec\n"); last = 127; bad = true end
+      end
       sh.status = last
-    else
+    else -- wait for all jobs
+      for _, j in ipairs(sh.jobs) do job_reap(sh, j) end
       if sh.bg_pids then for _, p in ipairs(sh.bg_pids) do pcall(reap, p) end; sh.bg_pids = {} end
       sh.status = 0
     end
+  elseif cmd == "jobs" then
+    -- jobs [-p|-l|-r]: list active background jobs (one line each). Refresh done
+    -- state non-blockingly first so finished jobs drop off (bash removes them).
+    local pflag, lflag = false, false
+    for k = 2, #args do local a = args[k]
+      if a == "-p" then pflag = true elseif a == "-l" then lflag = true
+      elseif a == "-r" or a == "-s" or a == "-n" then -- filters: accept
+      elseif a:sub(1, 1) == "-" and #a > 1 then io.stderr:write("curse: jobs: " .. a .. ": invalid option\n"); sh.status = 2; return end
+    end
+    local sb = ffi.new("int[1]")
+    for _, j in ipairs(sh.jobs or {}) do job_reap(sh, j, true) end -- WNOHANG refresh
+    local active = {}
+    for _, j in ipairs(sh.jobs or {}) do if not j.done then active[#active + 1] = j end end
+    for i, j in ipairs(active) do
+      local mark = (i == #active) and "+" or (i == #active - 1 and "-" or " ")
+      if pflag then sh:echo(tostring(j.pid))
+      elseif lflag then sh:echo(("[%d]%s %d Running                 %s &"):format(j.id, mark, j.pid, j.cmd))
+      else sh:echo(("[%d]%s  Running                 %s &"):format(j.id, mark, j.cmd)) end
+    end
+    sh.status = 0
   elseif cmd == "trap" then
     -- trap [-p] [ACTION] SIG…  (subset: registers/prints; only EXIT actually fires)
     local j, pflag = 2, false
@@ -3032,7 +3109,11 @@ local function exec_stmt(sh, st, hook)
       child_status(sh, ok, err)
       io.flush(); C._exit(sh.status or 0)
     end
-    sh.last_bg_pid = tostring(pid)
+    -- register the job (for `jobs`/`wait %spec`/`wait -n`); best-effort command text
+    local c1 = st.cmd
+    while c1 and (c1.t == "pipeline") and c1.cmds do c1 = c1.cmds[1] end
+    local cmdstr = (c1 and c1.words and c1.words[1] and c1.words[1].parts[1] and c1.words[1].parts[1].lit) or "job"
+    job_add(sh, pid, cmdstr)
     sh.bg_pids = sh.bg_pids or {}
     sh.bg_pids[#sh.bg_pids + 1] = pid
     sh.status = 0
