@@ -1940,10 +1940,19 @@ local function exec_stmt(sh, st, hook)
         end
       end
     end
-    local args = {}
-    for _, w in ipairs(st.words) do
-      local fs = expand_to_fields(sh, w)
-      for k = 1, #fs do args[#args + 1] = fs[k] end
+    -- `name=value` arguments to a declaration builtin (export/declare/readonly/
+    -- local/typeset) are ASSIGNMENT words: the value isn't word-split or globbed.
+    local ASSIGN_CMD = { export = 1, declare = 1, typeset = 1, readonly = 1, ["local"] = 1 }
+    local args, is_assign = {}, false
+    for wi, w in ipairs(st.words) do
+      local p1 = w.parts[1]
+      if wi > 1 and is_assign and p1 and p1.lit and p1.lit:match("^[%a_][%w_]*%+?=") then
+        args[#args + 1] = expand_word(sh, w) -- assignment word: single field, no glob
+      else
+        local fs = expand_to_fields(sh, w)
+        for k = 1, #fs do args[#args + 1] = fs[k] end
+      end
+      if wi == 1 then is_assign = ASSIGN_CMD[args[1]] ~= nil end
     end
     if st.arrayargs then -- `declare -A a=(...)` / `local -a b=(...)` array literals
       local assoc = false
