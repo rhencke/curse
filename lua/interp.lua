@@ -1106,26 +1106,39 @@ local function exec_simple(sh, args, hook)
     local delim
     while j <= #args do
       local a = args[j]
-      if a == "-r" then raw = true; j = j + 1
-      elseif a == "-a" then arr = args[j + 1]; j = j + 2
-      elseif a == "-n" then nchars = tonumber(args[j + 1]); j = j + 2 -- N chars or newline
-      elseif a == "-N" then nchars = tonumber(args[j + 1]); ndelim = true; j = j + 2 -- exactly N
-      elseif a == "-d" then delim = args[j + 1]; j = j + 2 -- read until this delimiter
-      elseif a == "-p" or a == "-t" or a == "-u" then j = j + 2 -- take an arg, skip
-      elseif a:sub(1, 1) == "-" and #a > 1 then j = j + 1 -- ignore -s/…
+      if a == "--" then j = j + 1; break
+      elseif a:sub(1, 1) == "-" and #a > 1 then
+        -- parse a bundle like -rd, -rN 6; an arg-taking flag takes the attached
+        -- rest of the word or the next word, and ends the bundle.
+        local k, advance = 2, 1
+        while k <= #a do
+          local f = a:sub(k, k)
+          local function takearg()
+            local r = a:sub(k + 1)
+            if r ~= "" then k = #a + 1; return r else advance = 2; k = #a + 1; return args[j + 1] end
+          end
+          if f == "r" then raw = true; k = k + 1
+          elseif f == "d" then delim = takearg() or "\n"
+          elseif f == "n" then nchars = tonumber(takearg())
+          elseif f == "N" then nchars = tonumber(takearg()); ndelim = true
+          elseif f == "a" then arr = takearg()
+          elseif f == "p" or f == "t" or f == "u" then takearg() -- consume + ignore
+          else k = k + 1 end -- -s etc.: ignore
+        end
+        j = j + advance
       else break end
     end
     local vars = {}
     for k = j, #args do vars[#vars + 1] = args[k] end
     local line, had_nl = nil, true
     if delim and not nchars then -- -d: read chars until the delimiter (or EOF)
-      local dch = delim:sub(1, 1)
+      local dch = delim == "" and "\0" or delim:sub(1, 1) -- -d '' means NUL
       local buf, got = {}, false
       while true do
         local c = io.read(1)
         if c == nil then had_nl = false; break end
         got = true
-        if dch ~= "" and c == dch then had_nl = true; break end
+        if c == dch then had_nl = true; break end
         buf[#buf + 1] = c
       end
       line = got and table.concat(buf) or nil
