@@ -551,18 +551,6 @@ local function strip_suffix(val, glob, longest)
   end
   return val
 end
-local function subst(val, glob, repl, all)
-  local anchor -- ${v/#pat} anchors at start, ${v/%pat} at end
-  if glob:sub(1, 1) == "#" then glob = glob:sub(2); anchor = "^"
-  elseif glob:sub(1, 1) == "%" then glob = glob:sub(2); anchor = "$" end
-  local lp = glob_to_lpat(glob)
-  repl = repl:gsub("%%", "%%%%") -- literal repl
-  if anchor == "^" then lp = "^" .. lp elseif anchor == "$" then lp = lp .. "$" end
-  if all and not anchor then return (val:gsub(lp, repl)) end
-  local s, e = val:find(lp)
-  if s then return val:sub(1, s - 1) .. repl .. val:sub(e + 1) end
-  return val
-end
 local function substr(val, off, len)
   local o = tonumber(off) or 0
   if o < 0 then o = #val + o end
@@ -687,6 +675,40 @@ end
 -- Full (anchored) shell-glob match, for `case` patterns.
 function M.glob_match(s, glob)
   return M.regex_match(s, glob_to_ere(glob))
+end
+
+local REG_NOTBOL = 1
+-- ${v/pat/repl} and ${v//pat/repl}: substitute glob matches using the POSIX
+-- regex engine (real char classes, extglob, leftmost-longest), not weak Lua
+-- patterns. `all` replaces every match; a leading # / % on `glob` anchors the
+-- match at the start / end. An empty pattern is a no-op (matches bash).
+function M.subst_glob(val, glob, repl, all)
+  local anchor
+  if glob:sub(1, 1) == "#" then glob = glob:sub(2); anchor = "^"
+  elseif glob:sub(1, 1) == "%" then glob = glob:sub(2); anchor = "$" end
+  if glob == "" then -- empty pattern: no-op, except an anchored one inserts repl
+    if anchor == "^" then return repl .. val elseif anchor == "$" then return val .. repl end
+    return val
+  end
+  local ere = glob_conv(glob)
+  if anchor == "^" then ere = "^(" .. ere .. ")"
+  elseif anchor == "$" then ere = "(" .. ere .. ")$"
+  else ere = "(" .. ere .. ")" end
+  if ffi.C.regcomp(regbuf, ere, REG_EXTENDED) ~= 0 then return val end
+  local out, pos, n = {}, 0, #val
+  while pos <= n do
+    local sub = val:sub(pos + 1)
+    if ffi.C.regexec(regbuf, sub, 1, pmatch, pos > 0 and REG_NOTBOL or 0) ~= 0 then break end
+    local so, eo = pmatch[0].rm_so, pmatch[0].rm_eo
+    out[#out + 1] = sub:sub(1, so) -- text before the match
+    out[#out + 1] = repl
+    if eo > so then pos = pos + eo
+    else out[#out + 1] = sub:sub(eo + 1, eo + 1); pos = pos + eo + 1 end -- empty match: keep one char
+    if not all or anchor then out[#out + 1] = val:sub(pos + 1); ffi.C.regfree(regbuf); return table.concat(out) end
+  end
+  ffi.C.regfree(regbuf)
+  out[#out + 1] = val:sub(pos + 1)
+  return table.concat(out)
 end
 
 -- Scan one directory for entries matching a single glob segment. `dir` is the
@@ -868,8 +890,8 @@ function Shell:apply_str_op(op, val, arg, arg2)
   if op == "##" then return strip_prefix(val, arg, true) end
   if op == "%" then return strip_suffix(val, arg, false) end
   if op == "%%" then return strip_suffix(val, arg, true) end
-  if op == "/" then return subst(val, arg, arg2 or "", false) end
-  if op == "//" then return subst(val, arg, arg2 or "", true) end
+  if op == "/" then return M.subst_glob(val, arg, arg2 or "", false) end
+  if op == "//" then return M.subst_glob(val, arg, arg2 or "", true) end
   if op == "sub" then return substr(val, arg, arg2) end
   if op == "^^" then return val:upper() end
   if op == "^" then return val:sub(1, 1):upper() .. val:sub(2) end
