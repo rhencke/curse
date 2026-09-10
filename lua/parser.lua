@@ -955,6 +955,23 @@ local function make_parser(src)
         ws()
         if src:sub(i, i) == "\n" then line = line + 1; i = i + 1 -- continuation inside [[ ]]
         elseif i > n or src:sub(i, i + 1) == "]]" then if src:sub(i, i + 1) == "]]" then i = i + 2 end; break
+        elseif toks[#toks] == "=~" then
+          -- the =~ operand is ONE regex word: raw text up to unquoted whitespace at
+          -- bracket/paren depth 0 (so `(a  b)` / `[a b]` keep their inner spaces).
+          local rs, depth = i, 0
+          while i <= n do
+            if depth == 0 and (src:sub(i, i + 1) == "]]" or src:sub(i, i) == "\n"
+                or src:sub(i, i) == " " or src:sub(i, i) == "\t") then break end
+            local ch = src:sub(i, i)
+            if ch == "\\" then i = i + 2
+            elseif ch == "'" then i = i + 1; while i <= n and src:sub(i, i) ~= "'" do i = i + 1 end; i = i + 1
+            elseif ch == '"' then i = i + 1
+              while i <= n and src:sub(i, i) ~= '"' do i = i + (src:sub(i, i) == "\\" and 2 or 1) end; i = i + 1
+            elseif ch == "(" or ch == "[" then depth = depth + 1; i = i + 1
+            elseif (ch == ")" or ch == "]") and depth > 0 then depth = depth - 1; i = i + 1
+            else i = i + 1 end
+          end
+          toks[#toks + 1] = src:sub(rs, i - 1); quoted[#toks] = false
         else
           local before = i
           local w = word()
