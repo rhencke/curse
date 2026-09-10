@@ -196,8 +196,16 @@ end
 -- expand_to_fields treats those specially for word-splitting).
 local function expand_part_str(sh, p)
   if p.lit ~= nil then return p.lit
-  elseif p.var then return sh:get(p.var)
-  elseif p.param then return sh:param(p.param)
+  elseif p.var then
+    if sh.opt_u and sh.vars[sh:deref(p.var)] == nil and sh:special_get(p.var) == "" then
+      io.stderr:write("curse: " .. p.var .. ": unbound variable\n"); error({ __curse_exit = 1 })
+    end
+    return sh:get(p.var)
+  elseif p.param then
+    if sh.opt_u and p.param > sh.nparams then
+      io.stderr:write("curse: " .. p.param .. ": unbound variable\n"); error({ __curse_exit = 1 })
+    end
+    return sh:param(p.param)
   elseif p.special then
     if p.special == "#" then return tostring(sh.nparams)
     elseif p.special == "@" or p.special == "*" then return sh:paramsJoin(" ")
@@ -627,14 +635,18 @@ local function exec_simple(sh, args, hook)
     while j <= #args do
       local a = args[j]
       if a == "--" then dd = true; j = j + 1; break
-      elseif a == "-e" then sh.opt_e = true; j = j + 1
-      elseif a == "+e" then sh.opt_e = false; j = j + 1
       elseif a == "-o" or a == "+o" then
-        local o = args[j + 1]
-        if o == "errexit" then sh.opt_e = (a == "-o")
-        elseif o == "pipefail" then sh.opt_pipefail = (a == "-o") end
+        local o, on = args[j + 1], (a == "-o")
+        if o == "errexit" then sh.opt_e = on
+        elseif o == "nounset" then sh.opt_u = on
+        elseif o == "pipefail" then sh.opt_pipefail = on end
         j = j + 2
-      elseif a:match("^[-+][a-zA-Z]+$") then j = j + 1 -- other flags (-u/-x/-f/…): accept, ignore
+      elseif a:match("^[-+][a-zA-Z]+$") then -- short flag bundle: -eu, +u, …
+        local on = a:sub(1, 1) == "-"
+        for f in a:sub(2):gmatch(".") do
+          if f == "e" then sh.opt_e = on elseif f == "u" then sh.opt_u = on end
+        end
+        j = j + 1
       else break end
     end
     if dd or j <= #args then

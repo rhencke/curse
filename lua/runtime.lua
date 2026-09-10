@@ -24,6 +24,7 @@ function Shell.new()
     argv0 = "bash",  -- $0 (set by the CLI/daemon to the script/shell name)
     start_time = os.time(), -- for $SECONDS
     opt_e = false,   -- set -e (errexit)
+    opt_u = false,   -- set -u (nounset)
     opt_pipefail = false,
     noerr = 0,       -- >0 = errexit suppressed (inside a condition / negation)
     params = {},     -- positional $1..
@@ -656,6 +657,15 @@ function Shell:expand_param(pe, arg, arg2, idxnum)
     isset = self.vars[self:deref(name)] ~= nil; val = self:get(name)
   end
   arg = arg or ""
+  -- set -u (nounset): a bare reference to an unset variable errors and exits. The
+  -- unset-handling ops (:- - :+ + := = :? ?) and $@/$* are exempt.
+  if self.opt_u and not isset and not (name == "@" or name == "*")
+    and index ~= "@" and index ~= "*"
+    and op ~= ":-" and op ~= "-" and op ~= ":+" and op ~= "+"
+    and op ~= ":=" and op ~= "=" and op ~= ":?" and op ~= "?"
+    and self:special_get(name) == "" then
+    io.stderr:write("curse: " .. name .. ": unbound variable\n"); error({ __curse_exit = 1 })
+  end
   if op == "len" then return tostring(#val) end
   if op == ":-" then return val ~= "" and val or arg end
   if op == "-" then return isset and val or arg end
