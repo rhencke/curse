@@ -1293,7 +1293,10 @@ local function exec_stmt(sh, st, hook)
         sh:set_str(st.name, expand_word(sh, st.rhs))
       end
     end
-    sh.status = 0
+    -- exit status of an assignment = the last command substitution's, else 0
+    local hascs = false
+    if st.rhs then for _, p in ipairs(st.rhs.parts) do if p.cmdsub then hascs = true; break end end end
+    if not hascs then sh.status = 0 end
   elseif t == "arrayassign" then
     do_arrayassign(sh, st)
     sh.status = 0
