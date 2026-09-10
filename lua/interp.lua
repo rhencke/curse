@@ -884,35 +884,42 @@ local function exec_simple(sh, args, hook)
     end
     local vars = {}
     for k = j, #args do vars[#vars + 1] = args[k] end
-    local line
+    local line, had_nl = nil, true
     if nchars then
       line = io.read(nchars)
       if line and not ndelim then local nl = line:find("\n", 1, true); if nl then line = line:sub(1, nl - 1) end end
     else
-      line = io.read("*l")
+      line = io.read("*L") -- keep the newline so we can tell a full line from EOF
+      if line then
+        if line:sub(-1) == "\n" then line = line:sub(1, -2) else had_nl = false end
+      end
     end
     if line == nil then
-      sh.status = 1 -- EOF
+      sh.status = 1 -- EOF: nothing read
     else
       if not raw then line = line:gsub("\\(.)", "%1") end
       local ifs = sh.vars["IFS"] and sh:get("IFS") or " \t\n"
-      local fields = rt.ifs_split(ifs, line)
-      if arr then
-        sh:array_assign(arr, fields, false)
-      elseif #vars == 0 then
-        sh:set_str("REPLY", line)
-      else
-        for k = 1, #vars do
-          if k < #vars then
-            sh:set_str(vars[k], fields[k] or "")
-          else
-            local rest = {}
-            for m = k, #fields do rest[#rest + 1] = fields[m] end
-            sh:set_str(vars[k], table.concat(rest, " "))
-          end
-        end
+      -- IFS whitespace chars (trimmed from a single/last field, unlike other IFS chars)
+      local ws = ifs:gsub("[^ \t\n]", "")
+      local function trim(s)
+        if ws == "" then return s end
+        local pat = "[" .. ws:gsub("(%W)", "%%%1") .. "]"
+        return (s:gsub("^" .. pat .. "+", ""):gsub(pat .. "+$", ""))
       end
-      sh.status = 0
+      if arr then
+        sh:array_assign(arr, rt.ifs_split(ifs, line), false)
+      elseif #vars == 0 then
+        sh:set_str("REPLY", ndelim and line or trim(line))
+      elseif #vars == 1 then
+        sh:set_str(vars[1], trim(line)) -- single var: strip only leading/trailing IFS ws
+      else
+        local fields = rt.ifs_split(ifs, line)
+        for k = 1, #vars - 1 do sh:set_str(vars[k], fields[k] or "") end
+        local rest = {}
+        for m = #vars, #fields do rest[#rest + 1] = fields[m] end
+        sh:set_str(vars[#vars], table.concat(rest, " "))
+      end
+      sh.status = had_nl and 0 or 1
     end
   elseif cmd == "shift" then
     local nn = tonumber(args[2]) or 1
