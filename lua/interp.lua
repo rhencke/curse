@@ -419,7 +419,7 @@ local BUILTINS = {
   exit = 1, cd = 1, unset = 1, export = 1, declare = 1, typeset = 1, set = 1, shift = 1,
   read = 1, getopts = 1, printf = 1, ["local"] = 1, command = 1, type = 1, pwd = 1,
   eval = 1, source = 1, ["."] = 1, ["break"] = 1, ["continue"] = 1, ["true"] = 1,
-  exec = 1, readonly = 1, umask = 1,
+  exec = 1, readonly = 1, umask = 1, alias = 1, unalias = 1, shopt = 1,
 }
 local KEYWORDS = {
   ["if"] = 1, ["then"] = 1, ["else"] = 1, ["elif"] = 1, ["fi"] = 1, ["for"] = 1,
@@ -592,6 +592,75 @@ local function exec_simple(sh, args, hook)
     sh.status = 0
   elseif cmd == ":" or cmd == "true" then sh.status = 0
   elseif cmd == "false" then sh.status = 1
+  elseif cmd == "alias" then
+    -- alias [name[=value] …]: define or print aliases.
+    local j, ok, printed = 2, true, false
+    if args[j] == "--" then j = j + 1 end
+    if j > #args then -- print all, sorted
+      local ns = {}; for k in pairs(sh.aliases) do ns[#ns + 1] = k end; table.sort(ns)
+      for _, k in ipairs(ns) do sh:echo("alias " .. k .. "='" .. sh.aliases[k] .. "'") end
+      sh.status = 0
+    else
+      for k = j, #args do
+        local nm, val = args[k]:match("^([^=]+)=(.*)$")
+        if nm then sh.aliases[nm] = val
+        elseif sh.aliases[args[k]] then sh:echo("alias " .. args[k] .. "='" .. sh.aliases[args[k]] .. "'")
+        else io.stderr:write("curse: alias: " .. args[k] .. ": not found\n"); ok = false end
+      end
+      sh.status = ok and 0 or 1
+    end
+  elseif cmd == "unalias" then
+    local ok = true
+    if args[2] == "-a" then sh.aliases = {}
+    else
+      for k = 2, #args do
+        if args[k] ~= "--" then
+          if sh.aliases[args[k]] then sh.aliases[args[k]] = nil
+          else io.stderr:write("curse: unalias: " .. args[k] .. ": not found\n"); ok = false end
+        end
+      end
+    end
+    sh.status = ok and 0 or 1
+  elseif cmd == "shopt" then
+    -- shopt [-s|-u|-q|-p|-o] [names]: set/unset/query shell options (subset).
+    local set_, unset_, quiet, oflag = false, false, false, false
+    local names = {}
+    for k = 2, #args do
+      local a = args[k]
+      if a == "-s" then set_ = true elseif a == "-u" then unset_ = true
+      elseif a == "-q" then quiet = true elseif a == "-p" then -- print form
+      elseif a == "-o" then oflag = true
+      elseif a:match("^-[suqpo]+$") then
+        if a:find("s") then set_ = true end; if a:find("u") then unset_ = true end
+        if a:find("q") then quiet = true end; if a:find("o") then oflag = true end
+      else names[#names + 1] = a end
+    end
+    if oflag then -- shopt -o: the `set -o` options
+      if set_ or unset_ then
+        for _, nm in ipairs(names) do
+          if nm == "errexit" then sh.opt_e = set_ elseif nm == "nounset" then sh.opt_u = set_
+          elseif nm == "pipefail" then sh.opt_pipefail = set_ end
+        end
+        sh.status = 0
+      else
+        for _, nm in ipairs(names) do
+          local on = (nm == "errexit" and sh.opt_e) or (nm == "nounset" and sh.opt_u) or (nm == "pipefail" and sh.opt_pipefail)
+          if not quiet then sh:echo("set " .. (on and "-o " or "+o ") .. nm) end
+        end
+        sh.status = 0
+      end
+    elseif set_ or unset_ then
+      for _, nm in ipairs(names) do sh.shopt[nm] = set_ end
+      sh.status = 0
+    else -- query / print
+      local allok = true
+      for _, nm in ipairs(names) do
+        local on = sh.shopt[nm] and true or false
+        if not quiet then sh:echo("shopt " .. (on and "-s " or "-u ") .. nm) end
+        if not on then allok = false end
+      end
+      sh.status = allok and 0 or 1
+    end
   elseif cmd == "[" or cmd == "test" then do_test(sh, args)
   elseif cmd == "return" then
     error({ __curse_return = args[2] and tonumber(args[2]) or sh.status })
@@ -943,6 +1012,27 @@ local function exec_stmt(sh, st, hook)
     for _, a in ipairs(st.list) do exec_stmt(sh, a, hook) end
     sh.status = 0
   elseif t == "simple" then
+    -- alias expansion (bash: only with `shopt -s expand_aliases`): if the command
+    -- word is a defined alias, splice its parsed words in and re-dispatch.
+    if not st.__aliased and sh.shopt.expand_aliases and st.words[1] then
+      local cw = st.words[1]
+      local nm = (#cw.parts == 1 and cw.parts[1].lit ~= nil and not cw.parts[1].q) and cw.parts[1].lit or nil
+      local av = nm and sh.aliases[nm]
+      if av then
+        local P = require("parser")
+        local parsed = P.parse(av)
+        if parsed.stmts and #parsed.stmts == 1 and parsed.stmts[1].t == "simple" then
+          local nw = {}
+          for _, w in ipairs(parsed.stmts[1].words) do nw[#nw + 1] = w end
+          for k = 2, #st.words do nw[#nw + 1] = st.words[k] end
+          return exec_stmt(sh, { t = "simple", words = nw, redirs = st.redirs, assigns = st.assigns,
+            arrayargs = parsed.stmts[1].arrayargs, __aliased = true }, hook)
+        elseif parsed.stmts then
+          for _, s in ipairs(parsed.stmts) do exec_stmt(sh, s, hook) end
+          return
+        end
+      end
+    end
     local args = {}
     for _, w in ipairs(st.words) do
       local fs = expand_to_fields(sh, w)

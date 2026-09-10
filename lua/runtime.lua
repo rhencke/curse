@@ -26,6 +26,8 @@ function Shell.new()
     opt_e = false,   -- set -e (errexit)
     opt_u = false,   -- set -u (nounset)
     opt_pipefail = false,
+    aliases = {},    -- name -> replacement text (alias builtin)
+    shopt = {},      -- shopt option name -> bool (expand_aliases, nullglob, …)
     noerr = 0,       -- >0 = errexit suppressed (inside a condition / negation)
     params = {},     -- positional $1..
     out = io.write,  -- stdout sink (swappable for capture)
