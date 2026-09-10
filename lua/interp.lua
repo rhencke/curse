@@ -1191,20 +1191,28 @@ local function exec_simple(sh, args, hook)
     end
     if sh.status == 0 then sh:set_str("OLDPWD", prev); C.setenv("OLDPWD", prev, 1) end
   elseif cmd == "unset" then
-    local fmode = false -- -f: unset functions; -v: unset vars (default)
+    local fmode, vmode = false, false -- -f: functions only; -v: vars only; neither: var then function
+    sh.status = 0
     for j = 2, #args do
       local a = args[j]
       if a == "-f" then fmode = true
-      elseif a == "-v" then fmode = false
+      elseif a == "-v" then vmode = true
       elseif a:sub(1, 1) == "-" and #a > 1 then -- other flags: ignore
       elseif fmode then sh.functions[a] = nil
       else
         local nm, sub = a:match("^([%a_][%w_]*)%[(.+)%]$")
         if nm then sh:array_unset(nm, array_key(sh, nm, sub))
-        else sh.vars[a] = nil end
+        else
+          local b = sh.vars[sh:deref(a)]
+          if b and b.ro then -- readonly: cannot unset (bash: status 1, keep it)
+            io.stderr:write("curse: unset: " .. a .. ": cannot unset: readonly variable\n"); sh.status = 1
+          elseif b ~= nil or vmode then
+            sh.vars[sh:deref(a)] = nil; C.unsetenv(a) -- drop from the process env too
+          elseif sh.functions[a] then sh.functions[a] = nil -- plain unset falls back to a function
+          end
+        end
       end
     end
-    sh.status = 0
   elseif cmd == "export" or cmd == "declare" or cmd == "typeset" or cmd == "readonly" then
     -- export/declare [-Apx] NAME[=val]…: set the var; export/-x also pushes it to
     -- the process env so posix_spawn children inherit it. -A marks associative,
@@ -1770,9 +1778,9 @@ local function exec_stmt(sh, st, hook)
   if st.line and not sh.in_trap then sh.cur_line = st.line end -- $LINENO (frozen in traps)
   if t == "assign" then
     local rb = sh.vars[sh:deref(st.name)]
-    if rb and rb.ro then -- readonly: reject; a non-interactive shell exits (bash)
-      io.stderr:write("curse: " .. st.name .. ": readonly variable\n")
-      sh.status = 1; error({ __curse_exit = 1 })
+    if rb and rb.ro then -- readonly: reject the assignment (status 1). bash exits
+      io.stderr:write("curse: " .. st.name .. ": readonly variable\n") -- only in `sh -c` mode; a script keeps going.
+      sh.status = 1; if sh.opt_c then error({ __curse_exit = 1 }) end; return
     elseif st.index then
       sh:array_set(st.name, array_key(sh, st.name, st.index), expand_word(sh, st.rhs), st.append)
     elseif st.arith then
