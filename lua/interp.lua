@@ -1193,7 +1193,9 @@ local function eval_dbracket(sh, node)
     elseif op == "!=" then
       if node.rq then return l ~= r else return not rt.glob_match(l, r) end
     elseif op == "=~" then
-      return rt.regex_match(l, r) -- real POSIX ERE
+      local caps = rt.regex_captures(l, r) -- real POSIX ERE + BASH_REMATCH
+      sh:array_assign("BASH_REMATCH", caps or {}, false)
+      return caps ~= nil
     else return binary(l, op, r) end -- < > -eq -ne -lt …
   end
   return false

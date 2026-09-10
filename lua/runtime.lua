@@ -644,6 +644,24 @@ function M.regex_match(s, ere)
   ffi.C.regfree(regbuf)
   return rc == 0
 end
+-- Match with capture groups: returns {whole, grp1, grp2, …} for BASH_REMATCH, or
+-- nil on no match / bad regex. (glibc regoff_t is int; regmatch_t is 8 bytes.)
+local NMATCH = 20
+local pmatch = ffi.new("struct { int rm_so; int rm_eo; }[?]", NMATCH)
+function M.regex_captures(s, ere)
+  if ffi.C.regcomp(regbuf, ere, REG_EXTENDED) ~= 0 then return nil end -- no NOSUB: need offsets
+  local rc = ffi.C.regexec(regbuf, s, NMATCH, pmatch, 0)
+  ffi.C.regfree(regbuf)
+  if rc ~= 0 then return nil end
+  local last = 0
+  for i = 0, NMATCH - 1 do if pmatch[i].rm_so >= 0 then last = i end end
+  local caps = {}
+  for i = 0, last do
+    local so = pmatch[i].rm_so
+    caps[#caps + 1] = (so >= 0) and s:sub(so + 1, pmatch[i].rm_eo) or ""
+  end
+  return caps
+end
 
 -- Full (anchored) shell-glob match, for `case` patterns.
 function M.glob_match(s, glob)
