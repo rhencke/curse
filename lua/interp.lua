@@ -977,6 +977,9 @@ local function expand_to_fields(sh, w)
         m = (#filt > 0) and filt or nil
       end
       if m then for _, x in ipairs(m) do out[#out + 1] = x end
+      elseif sh.shopt.failglob then -- shopt -s failglob: no match is an error (non-fatal)
+        io.stderr:write("curse: no match: " .. f.s .. "\n")
+        error({ __curse_exit = 1, __curse_experr = true })
       elseif nullglob then -- no matches: nullglob drops the field entirely
       else out[#out + 1] = f.s end
     else
@@ -1036,8 +1039,16 @@ local function apply_redirs(sh, redirs)
   -- A FILE redirect target is glob-expanded and word-split like any word; bash
   -- requires it to resolve to EXACTLY ONE word, else "ambiguous redirect".
   local function ftgt(r)
-    local fs = expand_to_fields(sh, P.parse_word(r.target or ""))
-    if #fs ~= 1 then io.stderr:write("curse: " .. (r.target or "") .. ": ambiguous redirect\n"); return nil end
+    local raw = r.target or ""
+    -- bash brace-expands the target too; more than one word -> ambiguous redirect.
+    if P.brace_count(raw) > 1 then
+      io.stderr:write("curse: " .. raw .. ": ambiguous redirect\n"); return nil
+    end
+    -- expansion can also fail non-fatally (e.g. failglob no-match): the redirect
+    -- then fails (status 1) rather than aborting the script.
+    local eok, fs = pcall(expand_to_fields, sh, P.parse_word(raw))
+    if not eok then return nil end
+    if #fs ~= 1 then io.stderr:write("curse: " .. raw .. ": ambiguous redirect\n"); return nil end
     return fs[1]
   end
   for _, r in ipairs(redirs) do
