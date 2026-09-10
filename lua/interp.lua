@@ -540,8 +540,20 @@ local function expand_part_str(sh, p)
     local TESTOP = { ["-"] = 1, [":-"] = 1, ["+"] = 1, [":+"] = 1, ["="] = 1, [":="] = 1, ["?"] = 1, [":?"] = 1 }
     -- When the ${…} is inside double quotes, its default/alternate word follows
     -- double-quoted rules: single quotes are literal and a backslash is kept
-    -- except before $ ` " \ (parse_heredoc has exactly these semantics).
-    local pw = p.q and P.parse_heredoc or P.parse_word
+    -- except before $ ` " \ (parse_heredoc has exactly these semantics). An inner
+    -- double quote is syntactic (part of the outer quote), so `"${x:-"a b"}"`
+    -- yields `a b` — strip the unescaped `"` before the heredoc-style parse.
+    local function pw(txt)
+      if not p.q then return P.parse_word(txt) end
+      local out, k, m = {}, 1, #txt
+      while k <= m do
+        local ch = txt:sub(k, k)
+        if ch == "\\" then out[#out + 1] = txt:sub(k, k + 1); k = k + 2
+        elseif ch == '"' then k = k + 1 -- drop the syntactic inner quote
+        else out[#out + 1] = ch; k = k + 1 end
+      end
+      return P.parse_heredoc(table.concat(out))
+    end
     local arg
     if TESTOP[pe.op] then
       arg = pe.arg and function() return expand_word(sh, pw(pe.arg)) end or nil

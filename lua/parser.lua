@@ -688,6 +688,16 @@ local function make_parser(src)
               if cc == "(" then dep = dep + 1 elseif cc == ")" then dep = dep - 1 end
               i = i + 1
             end
+          elseif d == "$" and src:sub(i + 1, i + 1) == "{" then
+            -- ${…} brace-matched: its inner " / nested ${} are NOT the outer close
+            i = i + 2; local dep = 1
+            while i <= n and dep > 0 do
+              local cc = src:sub(i, i)
+              if cc == "\\" then i = i + 1
+              elseif cc == "{" then dep = dep + 1
+              elseif cc == "}" then dep = dep - 1 end
+              i = i + 1
+            end
           elseif d == "`" then
             i = i + 1
             while i <= n and src:sub(i, i) ~= "`" do if src:sub(i, i) == "\\" then i = i + 2 else i = i + 1 end end
