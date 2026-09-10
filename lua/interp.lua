@@ -708,9 +708,18 @@ local function multi_elems(sh, p) -- returns element list, star?
       els = sh:array_values(pe.name)
     end
     if pe.op == "sub" then -- array slice
-      local off = arith_int(sh, pe.arg and expand_word(sh, P.parse_word(pe.arg)) or nil)
+      local off = arith_int(sh, pe.arg and expand_word(sh, P.parse_word(pe.arg)) or nil) or 0
       local len = pe.arg2 and arith_int(sh, expand_word(sh, P.parse_word(pe.arg2))) or nil
-      els = array_slice(els, off or 0, len)
+      if pe.name ~= "@" and pe.name ~= "*" and not sh:is_assoc(pe.name) and off >= 0 then
+        -- sparse indexed array: a non-negative offset selects by INDEX VALUE
+        -- (elements whose index >= off), then length is a COUNT of those.
+        local idx = sh:array_indices(pe.name); local out = {}
+        for i = 1, #idx do if idx[i] >= off then out[#out + 1] = els[i] end end
+        if len ~= nil then local t = {}; for i = 1, math.min(len, #out) do t[i] = out[i] end; out = t end
+        els = out
+      else -- $@/$* and assoc, or a negative offset: position-based
+        els = array_slice(els, off, len)
+      end
     elseif pe.op == "-" and #els == 0 then -- unset/empty array: the default
       return { pe.arg and expand_word(sh, P.parse_word(pe.arg)) or "" }, star
     -- `:` variants test the JOINED value: ("" "") joins to " " (non-null), but
