@@ -386,9 +386,14 @@ arith_resolve = function(sh, s)
     error({ __curse_exit = 1, __curse_matherr = true, __curse_experr = true })
   end
   -- A nested bad value (rare: `s=t; t='1 2'`) stays swallowed as 0, matching the
-  -- previous behavior; only the directly-resolved value raises.
+  -- previous behavior; but a genuine arith error during eval (syntax/math, e.g. a
+  -- bad subscript) propagates so the command fails like bash instead of yielding 0.
   local ok2, v = pcall(eval, sh, ast)
-  return (ok2 and v ~= nil) and v or i64(0)
+  if not ok2 then
+    if type(v) == "table" and (v.__curse_experr or v.__curse_matherr) then error(v) end
+    return i64(0)
+  end
+  return v ~= nil and v or i64(0)
 end
 
 -- Division/modulo by zero is a fatal arithmetic error (bash aborts the current
@@ -416,7 +421,7 @@ eval = function(sh, e)
   end
   if k == "num" then return rt.arith_num(e.v) end
   if k == "var" then
-    if e.idx then arith_nounset(sh, e.name); return arith_resolve(sh, sh:array_get(e.name, arith_key(sh, e.name, e.idx))) end
+    if e.idxraw then arith_nounset(sh, e.name); return arith_resolve(sh, sh:array_get(e.name, arith_key(sh, e.name, e.idx, e.idxraw))) end
     arith_nounset(sh, e.name)
     return arith_resolve(sh, sh:get(e.name))
   end
@@ -465,7 +470,7 @@ eval = function(sh, e)
     end
   end
   if k == "asgn" then
-    local iv = e.idx and arith_key(sh, e.name, e.idx) or nil
+    local iv = e.idxraw and arith_key(sh, e.name, e.idx, e.idxraw) or nil
     local v = eval(sh, e.e)
     if e.op ~= "=" then
       arith_nounset(sh, e.name) -- `x += …` reads x first
@@ -481,8 +486,8 @@ eval = function(sh, e)
   end
   if k == "post" then
     arith_nounset(sh, e.name) -- x++ / x-- read x first
-    if e.idx then
-      local iv = arith_key(sh, e.name, e.idx)
+    if e.idxraw then
+      local iv = arith_key(sh, e.name, e.idx, e.idxraw)
       local cur = rt.arith_num(sh:array_get(e.name, iv))
       sh:array_set(e.name, iv, rt.i64_to_str(cur + i64(e.d))); return cur
     end
@@ -490,8 +495,8 @@ eval = function(sh, e)
   end
   if k == "pre" then
     arith_nounset(sh, e.name) -- ++x / --x read x first
-    if e.idx then
-      local iv = arith_key(sh, e.name, e.idx)
+    if e.idxraw then
+      local iv = arith_key(sh, e.name, e.idx, e.idxraw)
       local v = rt.arith_num(sh:array_get(e.name, iv)) + i64(e.d)
       sh:array_set(e.name, iv, rt.i64_to_str(v)); return v
     end
@@ -503,10 +508,16 @@ M.eval = eval
 
 -- An array subscript used in arithmetic: an associative array takes the
 -- evaluated-then-stringified value as its key ("5"), an indexed array a number.
-arith_key = function(sh, name, idxexpr)
-  local v = eval(sh, idxexpr)
-  if sh:is_assoc(name) then return rt.i64_to_str(v) end
-  return tonumber(rt.i64_to_str(v))
+arith_key = function(sh, name, idxexpr, idxraw)
+  -- An associative-array subscript in (( )) is a LITERAL string key (parameter-
+  -- expanded and quote-removed), NOT an arith expression: `A[K]` -> key "K",
+  -- `A[$k]` -> the value of k, `A['x']` -> "x". Reuse the normal key resolver.
+  if sh:is_assoc(name) then return array_key(sh, name, idxraw or "") end
+  if idxexpr == nil then -- a non-arith subscript (e.g. quoted) on a NON-assoc array
+    io.stderr:write("curse: " .. (idxraw or "") .. ": syntax error in expression\n")
+    error({ __curse_exit = 1, __curse_matherr = true, __curse_experr = true })
+  end
+  return tonumber(rt.i64_to_str(eval(sh, idxexpr)))
 end
 
 

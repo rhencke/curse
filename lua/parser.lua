@@ -41,16 +41,29 @@ local function arith(src, nodefer)
   end
 
   local parseComma
-  -- read `name` then an optional `[subscript]`; returns (name, idxAST or nil)
+  -- read `name` then an optional `[subscript]`; returns (name, idxAST or nil,
+  -- raw subscript text or nil). The raw text is captured by balancing brackets
+  -- (so a quoted or non-arith key like A['x'] doesn't break the parse) and is
+  -- used verbatim for ASSOCIATIVE arrays, whose (( )) subscript is a literal
+  -- string key. It's also parsed as arith (best-effort) for the indexed case.
   local function nameSub()
     local nm = ident()
     if starts("[") then
-      i = i + 1
-      local idx = parseComma()
-      if not eat("]") then error("arith: expected ]") end
-      return nm, idx
+      local rs = i + 1
+      local depth, j = 1, i + 1
+      while j <= n and depth > 0 do
+        local ch = src:sub(j, j)
+        if ch == "[" then depth = depth + 1
+        elseif ch == "]" then depth = depth - 1; if depth == 0 then break end end
+        j = j + 1
+      end
+      if depth ~= 0 then error("arith: expected ]") end
+      local raw = src:sub(rs, j - 1)
+      i = j + 1 -- past the ]
+      local ok, idx = pcall(arith, raw) -- may fail for a quoted/non-arith key
+      return nm, (ok and idx) or nil, raw
     end
-    return nm, nil
+    return nm, nil, nil
   end
 
   local function primary()
@@ -62,8 +75,8 @@ local function arith(src, nodefer)
       if not eat(")") then error("arith: expected )") end
       return e
     end
-    if eat("++") then local nm, idx = nameSub(); return { k = "pre", name = nm, idx = idx, d = 1 } end
-    if eat("--") then local nm, idx = nameSub(); return { k = "pre", name = nm, idx = idx, d = -1 } end
+    if eat("++") then local nm, idx, ir = nameSub(); return { k = "pre", name = nm, idx = idx, idxraw = ir, d = 1 } end
+    if eat("--") then local nm, idx, ir = nameSub(); return { k = "pre", name = nm, idx = idx, idxraw = ir, d = -1 } end
     if c == "-" then i = i + 1; return { k = "un", op = "-", e = primary() } end
     if c == "+" then i = i + 1; return primary() end
     if c == "!" then i = i + 1; return { k = "un", op = "!", e = primary() } end
@@ -93,18 +106,18 @@ local function arith(src, nodefer)
       return { k = "num", v = v }
     end
     -- a name (optionally subscripted): a var, an assignment, or ++/--
-    local name, idx = nameSub()
+    local name, idx, ir = nameSub()
     -- post ++/--
-    if starts("++") then i = i + 2; return { k = "post", name = name, idx = idx, d = 1 } end
-    if starts("--") then i = i + 2; return { k = "post", name = name, idx = idx, d = -1 } end
+    if starts("++") then i = i + 2; return { k = "post", name = name, idx = idx, idxraw = ir, d = 1 } end
+    if starts("--") then i = i + 2; return { k = "post", name = name, idx = idx, idxraw = ir, d = -1 } end
     -- assignment operators
     for _, op in ipairs({ "+=", "-=", "*=", "/=", "%=" }) do
-      if starts(op) then i = i + #op; return { k = "asgn", name = name, idx = idx, op = op, e = parseExpr(0) } end
+      if starts(op) then i = i + #op; return { k = "asgn", name = name, idx = idx, idxraw = ir, op = op, e = parseExpr(0) } end
     end
     if starts("=") and src:sub(i + 1, i + 1) ~= "=" then
-      i = i + 1; return { k = "asgn", name = name, idx = idx, op = "=", e = parseExpr(0) }
+      i = i + 1; return { k = "asgn", name = name, idx = idx, idxraw = ir, op = "=", e = parseExpr(0) }
     end
-    return { k = "var", name = name, idx = idx }
+    return { k = "var", name = name, idx = idx, idxraw = ir }
   end
 
   -- binary operators by precedence (higher binds tighter), matching bash
