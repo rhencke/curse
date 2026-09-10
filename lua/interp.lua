@@ -377,6 +377,55 @@ local function exec_simple(sh, args, hook)
       sh.params = np; sh.nparams = n
     end
     sh.status = 0
+  elseif cmd == "getopts" then
+    -- getopts OPTSTRING NAME [args…]: parse one option per call using OPTIND (+ an
+    -- internal char cursor for bundled opts); sets NAME, OPTARG; status 1 when done.
+    local spec, vname = args[2] or "", args[3] or "?"
+    local silent = spec:sub(1, 1) == ":"
+    local src_get, src_n
+    if #args >= 4 then src_n = #args - 3; src_get = function(k) return args[k + 3] end
+    else src_n = sh.nparams; src_get = function(k) return sh.params[k] end end
+    local optind = math.max(1, math.floor(tonumber(sh:get("OPTIND")) or 1))
+    local cur = sh.getopts_cur or 1
+    local res
+    while not res do
+      local word = optind <= src_n and src_get(optind) or nil
+      if not word or word == "-" or word:sub(1, 1) ~= "-" then res = { done = true }
+      elseif word == "--" then optind = optind + 1; res = { done = true }
+      else
+        local oc = word:sub(1 + cur, 1 + cur)
+        if oc == "" then optind = optind + 1; cur = 1
+        else
+          local pos = spec:find(oc, 1, true)
+          if not pos or oc == ":" then
+            cur = cur + 1; if 1 + cur > #word then optind = optind + 1; cur = 1 end
+            res = { opt = "?", arg = silent and oc or nil, err = not silent and ("illegal option -- " .. oc) }
+          elseif spec:sub(pos + 1, pos + 1) == ":" then -- takes an argument
+            local rest = word:sub(2 + cur)
+            if rest ~= "" then sh:set_str("OPTARG", rest); optind = optind + 1; cur = 1; res = { opt = oc }
+            else
+              local a = (optind + 1) <= src_n and src_get(optind + 1) or nil
+              if a then sh:set_str("OPTARG", a); optind = optind + 2; cur = 1; res = { opt = oc }
+              else optind = optind + 1; cur = 1
+                res = silent and { opt = ":", arg = oc } or { opt = "?", err = "option requires an argument -- " .. oc }
+              end
+            end
+          else -- flag, no argument
+            cur = cur + 1; if 1 + cur > #word then optind = optind + 1; cur = 1 end
+            res = { opt = oc }
+          end
+        end
+      end
+    end
+    sh.getopts_cur = cur
+    sh:set_str("OPTIND", tostring(optind))
+    if res.done then sh:set_str(vname, "?"); sh.getopts_cur = 1; sh.status = 1
+    else
+      sh:set_str(vname, res.opt)
+      if res.arg ~= nil then sh:set_str("OPTARG", res.arg) elseif res.err then sh.vars["OPTARG"] = nil end
+      if res.err then io.stderr:write("curse: " .. res.err .. "\n") end
+      sh.status = 0
+    end
   elseif cmd == "printf" and args[2] == "-v" then
     -- printf -v VAR FMT ARGS: format via external printf, capture, assign to VAR
     local var = args[3]
