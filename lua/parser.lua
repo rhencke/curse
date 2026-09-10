@@ -9,7 +9,15 @@ local M = {}
 -- ---- arithmetic expression parser (precedence climbing over a string) ----
 -- AST: {k="num",v}, {k="var",name}, {k="bin",op,l,r}, {k="un",op,e},
 --      {k="asgn",name,op,e}, {k="post",name,d}, {k="pre",name,d}
-local function arith(src)
+local function arith(src, nodefer)
+  -- Arith bodies may embed expansions the arith grammar can't parse: ${x:-5},
+  -- $(cmd), $((..)), `cmd`. Defer the whole thing — at eval the raw string is
+  -- word-expanded and then re-parsed as pure arithmetic (nodefer). Plain $name and
+  -- $digit ARE handled natively (as var/param nodes), so they aren't deferred —
+  -- this keeps function inlining (which substitutes those params) working.
+  if not nodefer and (src:find("%${") or src:find("%$%(") or src:find("`")) then
+    return { k = "xpand", raw = src }
+  end
   local i, n = 1, #src
   local function skip() while i <= n and src:sub(i, i):match("%s") do i = i + 1 end end
   local function peek() skip(); return src:sub(i, i) end
@@ -25,17 +33,30 @@ local function arith(src)
     return src:sub(s, e)
   end
 
+  local parseComma
+  -- read `name` then an optional `[subscript]`; returns (name, idxAST or nil)
+  local function nameSub()
+    local nm = ident()
+    if starts("[") then
+      i = i + 1
+      local idx = parseComma()
+      if not eat("]") then error("arith: expected ]") end
+      return nm, idx
+    end
+    return nm, nil
+  end
+
   local function primary()
     skip()
     local c = src:sub(i, i)
     if c == "(" then
       i = i + 1
-      local e = parseExpr(0)
+      local e = parseComma()
       if not eat(")") then error("arith: expected )") end
       return e
     end
-    if eat("++") then return { k = "pre", name = ident(), d = 1 } end
-    if eat("--") then return { k = "pre", name = ident(), d = -1 } end
+    if eat("++") then local nm, idx = nameSub(); return { k = "pre", name = nm, idx = idx, d = 1 } end
+    if eat("--") then local nm, idx = nameSub(); return { k = "pre", name = nm, idx = idx, d = -1 } end
     if c == "-" then i = i + 1; return { k = "un", op = "-", e = primary() } end
     if c == "+" then i = i + 1; return primary() end
     if c == "!" then i = i + 1; return { k = "un", op = "!", e = primary() } end
@@ -58,19 +79,19 @@ local function arith(src)
       i = e + 1
       return { k = "num", v = src:sub(s, e) }
     end
-    -- a name: could be a var, an assignment (name=…, name+=…), or i++/i--
-    local name = ident()
+    -- a name (optionally subscripted): a var, an assignment, or ++/--
+    local name, idx = nameSub()
     -- post ++/--
-    if starts("++") then i = i + 2; return { k = "post", name = name, d = 1 } end
-    if starts("--") then i = i + 2; return { k = "post", name = name, d = -1 } end
+    if starts("++") then i = i + 2; return { k = "post", name = name, idx = idx, d = 1 } end
+    if starts("--") then i = i + 2; return { k = "post", name = name, idx = idx, d = -1 } end
     -- assignment operators
     for _, op in ipairs({ "+=", "-=", "*=", "/=", "%=" }) do
-      if starts(op) then i = i + #op; return { k = "asgn", name = name, op = op, e = parseExpr(0) } end
+      if starts(op) then i = i + #op; return { k = "asgn", name = name, idx = idx, op = op, e = parseExpr(0) } end
     end
     if starts("=") and src:sub(i + 1, i + 1) ~= "=" then
-      i = i + 1; return { k = "asgn", name = name, op = "=", e = parseExpr(0) }
+      i = i + 1; return { k = "asgn", name = name, idx = idx, op = "=", e = parseExpr(0) }
     end
-    return { k = "var", name = name }
+    return { k = "var", name = name, idx = idx }
   end
 
   -- binary operators by precedence (higher binds tighter), matching bash
@@ -120,7 +141,14 @@ local function arith(src)
     return left
   end
 
-  local e = parseExpr(0)
+  -- comma operator: evaluate left-to-right, value is the last (bash/C semantics)
+  parseComma = function()
+    local e = parseExpr(0)
+    while peek() == "," do i = i + 1; e = { k = "comma", l = e, r = parseExpr(0) } end
+    return e
+  end
+
+  local e = parseComma()
   skip()
   if i <= n then error("arith: trailing input '" .. src:sub(i) .. "'") end
   return e
@@ -129,14 +157,18 @@ M.arith = arith
 
 -- ---- statement parser ----
 -- Captures a balanced `((` … `))` starting just after the opening `((`.
+-- Grab the body of `$((…))` / `((…))` starting just after the opening `((`.
+-- Counts single parens: the closing `))` is the first `)` seen at content-paren
+-- depth 0 (its partner is the next char). This correctly handles nested `$( )`
+-- command subs and `$(( ))` inside the arithmetic (their inner parens balance).
 local function grab_dparen(src, i)
-  local depth, start = 1, i
+  local start, d = i, 0
   while i <= #src do
-    local two = src:sub(i, i + 1)
-    if two == "((" then depth = depth + 1; i = i + 2
-    elseif two == "))" then depth = depth - 1; if depth == 0 then return src:sub(start, i - 1), i + 2 end; i = i + 2
-    elseif src:sub(i, i) == "(" then depth = depth + 1; i = i + 1
-    elseif src:sub(i, i) == ")" then depth = depth - 1; i = i + 1
+    local c = src:sub(i, i)
+    if c == "(" then d = d + 1; i = i + 1
+    elseif c == ")" then
+      if d == 0 then return src:sub(start, i - 1), i + 2 end -- the closing `))`
+      d = d - 1; i = i + 1
     else i = i + 1 end
   end
   error("unterminated ((")

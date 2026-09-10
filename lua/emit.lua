@@ -50,14 +50,27 @@ end
 local function arith_side_effect(e)
   if type(e) ~= "table" then return false end
   if e.k == "asgn" or e.k == "post" or e.k == "pre" then return true end
+  -- xpand (embedded $-expansion), comma, and array-subscripted operands aren't
+  -- compiled natively — treat like a side effect so the word/stmt delegates.
+  if e.k == "xpand" or e.k == "comma" or e.idx then return true end
   return arith_side_effect(e.e) or arith_side_effect(e.l) or arith_side_effect(e.r)
     or arith_side_effect(e.c) or arith_side_effect(e.a) or arith_side_effect(e.b)
+end
+-- Arith the CFG codegen cannot render at all (embedded $-expansion, comma, or
+-- array-subscripted operands) — distinct from a mere side effect, which forc
+-- init/step legitimately have. Such loops/statements delegate to the interpreter.
+local function not_compilable(e)
+  if type(e) ~= "table" then return false end
+  if e.k == "xpand" or e.k == "comma" or e.idx then return true end
+  return not_compilable(e.e) or not_compilable(e.l) or not_compilable(e.r)
+    or not_compilable(e.c) or not_compilable(e.a) or not_compilable(e.b)
 end
 -- A word emit_word can render (no ${..op..} pexp, no side-effecting arith).
 local function emitable_word(w)
   for _, p in ipairs(w.parts) do
     if p.pexp then return false end
     if p.arith and arith_side_effect(require("parser").arith(p.arith)) then return false end
+    if p.arithast and arith_side_effect(p.arithast) then return false end -- inlined arith
   end
   return true
 end
@@ -431,7 +444,8 @@ local function build_cfg(stmts, lifted, funcflags, inlinefns)
     local t = st.t
     if DELEGATE[t] then return delegate(st, after) end
     if t == "assign" then
-      if st.index or st.append or (st.rhs and not emitable_word(st.rhs)) then return delegate(st, after) end
+      if st.index or st.append or (st.rhs and not emitable_word(st.rhs))
+        or (st.arith and arith_side_effect(st.arith)) then return delegate(st, after) end
       local p = newpc()
       if st.arith then
         blocks[p] = emit_set(st.name, emit_value(st.arith, lifted), lifted) .. ("; pc = %d"):format(after)
@@ -519,6 +533,9 @@ local function build_cfg(stmts, lifted, funcflags, inlinefns)
       blocks[p] = body .. ("; pc = %d"):format(after)
       return p
     elseif t == "forc" then
+      if not_compilable(st.init) or not_compilable(st.cond) or not_compilable(st.step) then
+        return delegate(st, after)
+      end
       local condp = newpc(); loopPc[st.id] = condp
       local stepp = newpc()
       local bodyentry = flatten_list(st.body, stepp)
@@ -532,7 +549,9 @@ local function build_cfg(stmts, lifted, funcflags, inlinefns)
       end
       return condp
     elseif t == "whilec" then
-      if st.negate or cond_arith(st.cond) == nil then return delegate(st, after) end -- command-cond while/until
+      if st.negate or cond_arith(st.cond) == nil or not_compilable(cond_arith(st.cond)) then
+        return delegate(st, after) -- command-cond while/until, or uncompilable arith
+      end
       local condp = newpc(); loopPc[st.id] = condp
       local bodyentry = flatten_list(st.body, condp)
       blocks[condp] = ("if %s then pc = %d else pc = %d end"):format(emit_bool(cond_arith(st.cond), lifted), bodyentry, after)

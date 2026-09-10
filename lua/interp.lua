@@ -95,12 +95,21 @@ local function do_test(sh, args)
   sh.status = (ok and res) and 0 or 1
 end
 
+local expand_word -- forward (used by eval's $-deferred arith and expand_part_str)
 local eval  -- arithmetic evaluator (forward decl)
 eval = function(sh, e)
   local k = e.k
   if k == "num" then return rt.arith_num(e.v) end
-  if k == "var" then return sh:aget(e.name) end
+  if k == "var" then
+    if e.idx then return rt.arith_num(sh:array_get(e.name, tonumber(rt.i64_to_str(eval(sh, e.idx))))) end
+    return sh:aget(e.name)
+  end
   if k == "param" then return rt.str_to_i64(sh:param(e.n)) end
+  if k == "xpand" then -- deferred: expansions inside $(( )) resolved at runtime
+    local P = require("parser")
+    return eval(sh, P.arith(expand_word(sh, P.parse_word(e.raw)), true))
+  end
+  if k == "comma" then eval(sh, e.l); return eval(sh, e.r) end
   if k == "un" then
     local v = eval(sh, e.e)
     if e.op == "-" then return -v end
@@ -138,27 +147,38 @@ eval = function(sh, e)
     end
   end
   if k == "asgn" then
+    local iv = e.idx and tonumber(rt.i64_to_str(eval(sh, e.idx))) or nil
     local v = eval(sh, e.e)
     if e.op ~= "=" then
-      local cur = sh:aget(e.name)
+      local cur = iv and rt.arith_num(sh:array_get(e.name, iv)) or sh:aget(e.name)
       local o = e.op:sub(1, 1)
       if o == "+" then v = cur + v elseif o == "-" then v = cur - v
       elseif o == "*" then v = cur * v elseif o == "/" then v = cur / v
       elseif o == "%" then v = cur % v end
     end
+    if iv then sh:array_set(e.name, iv, rt.i64_to_str(v)); return v end
     return sh:aset(e.name, v)
   end
   if k == "post" then
+    if e.idx then
+      local iv = tonumber(rt.i64_to_str(eval(sh, e.idx)))
+      local cur = rt.arith_num(sh:array_get(e.name, iv))
+      sh:array_set(e.name, iv, rt.i64_to_str(cur + i64(e.d))); return cur
+    end
     local cur = sh:aget(e.name); sh:aset(e.name, cur + i64(e.d)); return cur
   end
   if k == "pre" then
+    if e.idx then
+      local iv = tonumber(rt.i64_to_str(eval(sh, e.idx)))
+      local v = rt.arith_num(sh:array_get(e.name, iv)) + i64(e.d)
+      sh:array_set(e.name, iv, rt.i64_to_str(v)); return v
+    end
     local v = sh:aget(e.name) + i64(e.d); return sh:aset(e.name, v)
   end
   error("interp: bad arith node " .. tostring(k))
 end
 M.eval = eval
 
-local expand_word -- forward (expand_part_str expands pexp args via it)
 
 -- Resolve an array subscript to a key: a string (word-expanded) for an
 -- associative array, else an integer (arith-evaluated) for an indexed one.

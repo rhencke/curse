@@ -635,7 +635,12 @@ function Shell:expand_param(pe, arg, arg2, idxnum)
     local b = self.vars[name]
     if b and b.ref and b.s then return b.s end
     local target = idxnum and self:array_get(name, idxnum) or self:get(name)
-    return self:get((target:gsub("%[.*$", ""))) -- plain-var target (subscript targets rare)
+    target = target:gsub("%[.*$", "") -- plain-var target (subscript targets rare)
+    if target == "" then return "" end
+    if target == "@" or target == "*" then return self:paramsJoin(" ") end
+    if target:match("^%d+$") then return self:param(tonumber(target)) end
+    if target == "?" then return tostring(self.status) end
+    return self:get(target)
   end
   local val, isset
   if index == "@" or index == "*" then
