@@ -23,6 +23,9 @@ function Shell.new()
     status = 0,      -- $?
     argv0 = "bash",  -- $0 (set by the CLI/daemon to the script/shell name)
     start_time = os.time(), -- for $SECONDS
+    opt_e = false,   -- set -e (errexit)
+    opt_pipefail = false,
+    noerr = 0,       -- >0 = errexit suppressed (inside a condition / negation)
     params = {},     -- positional $1..
     out = io.write,  -- stdout sink (swappable for capture)
     forstate = {},   -- loop id -> { list = {strings}, idx } for `for x in`; kept

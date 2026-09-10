@@ -411,10 +411,23 @@ local function exec_simple(sh, args, hook)
     end
     sh.status = 0
   elseif cmd == "set" then
-    -- set -- ARGS / set ARGS: replace positional params. Options (-e/-o/…) accepted, ignored.
-    if args[2] == "--" or (args[2] and args[2]:sub(1, 1) ~= "-") then
-      local j = (args[2] == "--") and 3 or 2
-      local np = {}; local n = 0
+    -- set [-e|+e|-o NAME|+o NAME|…] [--] [ARGS…]: options then positional params
+    local j, dd = 2, false
+    while j <= #args do
+      local a = args[j]
+      if a == "--" then dd = true; j = j + 1; break
+      elseif a == "-e" then sh.opt_e = true; j = j + 1
+      elseif a == "+e" then sh.opt_e = false; j = j + 1
+      elseif a == "-o" or a == "+o" then
+        local o = args[j + 1]
+        if o == "errexit" then sh.opt_e = (a == "-o")
+        elseif o == "pipefail" then sh.opt_pipefail = (a == "-o") end
+        j = j + 2
+      elseif a:match("^[-+][a-zA-Z]+$") then j = j + 1 -- other flags (-u/-x/-f/…): accept, ignore
+      else break end
+    end
+    if dd or j <= #args then
+      local np, n = {}, 0
       for k = j, #args do n = n + 1; np[n] = args[k] end
       sh.params = np; sh.nparams = n
     end
@@ -676,7 +689,7 @@ local function exec_stmt(sh, st, hook)
   elseif t == "whilec" then
     while true do
       hook("loop", st.id)
-      exec_list(sh, st.cond, hook, false)
+      sh.noerr = sh.noerr + 1; exec_list(sh, st.cond, hook, false); sh.noerr = sh.noerr - 1
       local go = (sh.status == 0)
       if st.negate then go = not go end -- until
       if not go then break end
@@ -773,14 +786,15 @@ local function exec_stmt(sh, st, hook)
       end
       if prev_read >= 0 then C.close(prev_read) end
       local stbuf = ffi.new("int[1]")
+      local last, pipe = 0, 0
       for k = 1, nst do
         C.waitpid(pids[k], stbuf, 0)
-        if k == nst then
-          local s = stbuf[0]
-          local sig = bit.band(s, 0x7f)
-          sh.status = (sig ~= 0 and sig ~= 0x7f) and (128 + sig) or bit.rshift(bit.band(s, 0xff00), 8)
-        end
+        local s = stbuf[0]; local sig = bit.band(s, 0x7f)
+        local est = (sig ~= 0 and sig ~= 0x7f) and (128 + sig) or bit.rshift(bit.band(s, 0xff00), 8)
+        if k == nst then last = est end
+        if est ~= 0 then pipe = est end -- rightmost non-zero (for pipefail)
       end
+      sh.status = sh.opt_pipefail and pipe or last
     end
     if st.negate then sh.status = (sh.status == 0) and 1 or 0 end
   elseif t == "forin" then
@@ -804,7 +818,10 @@ local function exec_stmt(sh, st, hook)
     for _, cl in ipairs(st.clauses) do
       local take
       if cl.cond == nil then take = true
-      else exec_list(sh, cl.cond, hook, false); take = (sh.status == 0) end
+      else
+        sh.noerr = sh.noerr + 1; exec_list(sh, cl.cond, hook, false); sh.noerr = sh.noerr - 1
+        take = (sh.status == 0)
+      end
       if take then exec_list(sh, cl.body, hook, false); break end
     end
   else
@@ -816,8 +833,14 @@ M.exec_stmt = exec_stmt -- exposed so the compiled CFG can delegate cold stateme
 
 exec_list = function(sh, stmts, hook, toplevel)
   for k = 1, #stmts do
+    local st = stmts[k]
     if toplevel then hook("stmt", k) end
-    exec_stmt(sh, stmts[k], hook)
+    exec_stmt(sh, st, hook)
+    -- errexit: a failing simple command / pipeline (not in a condition) exits. We
+    -- restrict to those two types to avoid the &&/|| short-circuit false-positives.
+    if sh.opt_e and sh.noerr == 0 and sh.status ~= 0 and (st.t == "simple" or st.t == "pipeline") then
+      error({ __curse_exit = sh.status })
+    end
   end
 end
 M.exec_list = exec_list
@@ -853,6 +876,9 @@ function M.run_lazy(sh, src, hook)
       k = k + 1
       hook("stmt", k)
       exec_stmt(sh, st, hook)
+      if sh.opt_e and sh.noerr == 0 and sh.status ~= 0 and (st.t == "simple" or st.t == "pipeline") then
+        error({ __curse_exit = sh.status })
+      end
     end
   end))
 end
