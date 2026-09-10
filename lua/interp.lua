@@ -723,6 +723,10 @@ local function multi_elems(sh, p) -- returns element list, star?
     elseif pe.op == ":+" then
       local ne = #els > 1 or (els[1] ~= nil and els[1] ~= "")
       return ne and { pe.arg and expand_word(sh, P.parse_word(pe.arg)) or "" } or {}, star
+    elseif pe.op == "@" and pe.arg == "a" then -- ${a[@]@a}: the variable's attribute string, per element
+      local attr = sh:attr_string(pe.name); local out = {}
+      for i = 1, #els do out[i] = attr end
+      els = out
     elseif pe.op and pe.op ~= ":-" and pe.op ~= "-" and pe.op ~= ":+" and pe.op ~= "+" then
       local arg = pe.arg and expand_word(sh, P.parse_word(pe.arg)) or ""
       local arg2 = pe.arg2 and expand_word(sh, P.parse_word(pe.arg2)) or nil
