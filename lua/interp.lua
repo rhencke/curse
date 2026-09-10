@@ -830,7 +830,7 @@ local function exec_simple(sh, args, hook)
       end
     end
     sh.status = 0
-  elseif cmd == "export" or cmd == "declare" or cmd == "typeset" then
+  elseif cmd == "export" or cmd == "declare" or cmd == "typeset" or cmd == "readonly" then
     -- export/declare [-Apx] NAME[=val]…: set the var; export/-x also pushes it to
     -- the process env so posix_spawn children inherit it. -A marks associative,
     -- -p prints declarations.
@@ -1307,21 +1307,25 @@ local function exec_stmt(sh, st, hook)
     end
   elseif t == "forc" then
     if st.init then eval(sh, st.init) end
+    local bodystatus = 0 -- a loop's status is its last body command's (0 if none)
     while true do
       hook("loop", st.id)
       if st.cond and not truth(eval(sh, st.cond)) then break end
-      exec_list(sh, st.body, hook, false)
+      exec_list(sh, st.body, hook, false); bodystatus = sh.status
       if st.step then eval(sh, st.step) end
     end
+    sh.status = bodystatus
   elseif t == "whilec" then
+    local bodystatus = 0
     while true do
       hook("loop", st.id)
       sh.noerr = sh.noerr + 1; exec_list(sh, st.cond, hook, false); sh.noerr = sh.noerr - 1
       local go = (sh.status == 0)
       if st.negate then go = not go end -- until
       if not go then break end
-      exec_list(sh, st.body, hook, false)
+      exec_list(sh, st.body, hook, false); bodystatus = sh.status
     end
+    sh.status = bodystatus
   elseif t == "parse_error" then
     -- Reached the unparseable tail (e.g. a makeself binary payload) — bash would
     -- syntax-error here too. If an earlier exit fired, we never get here.
@@ -1448,14 +1452,16 @@ local function exec_stmt(sh, st, hook)
       for k = 1, #fs do list[#list + 1] = fs[k] end
     end
     sh.forstate[st.id] = { list = list, idx = 0 }
+    local bodystatus = 0
     while true do
       hook("loop", st.id)
       local fs = sh.forstate[st.id]
       fs.idx = fs.idx + 1
       if fs.idx > #fs.list then break end
       sh:set_str(st.name, fs.list[fs.idx])
-      exec_list(sh, st.body, hook, false)
+      exec_list(sh, st.body, hook, false); bodystatus = sh.status
     end
+    sh.status = bodystatus
   elseif t == "if" then
     for _, cl in ipairs(st.clauses) do
       local take
