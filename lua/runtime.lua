@@ -359,6 +359,7 @@ end
 -- box has b.ref set and b.s holding the target's name (possibly with a subscript,
 -- which is stripped here — element namerefs resolve to the base array).
 function Shell:deref(name)
+  local seen
   for _ = 1, 100 do
     local b = self.vars[name]
     if not b or not b.ref or b.s == nil or b.s == "" then return name end
@@ -368,6 +369,9 @@ function Shell:deref(name)
     -- An invalid target name (e.g. `#`, `1`, `$1`) isn't a real reference: reading
     -- the nameref yields its own stored string, so resolve to the nameref itself.
     if not tname:match("^[%a_][%w_]*$") then return name end
+    -- mutually recursive namerefs (ref1->ref2->ref1) resolve to nothing in bash
+    if seen and seen[tname] then return "" end
+    seen = seen or {}; seen[name] = true
     name = tname
   end
   return name
