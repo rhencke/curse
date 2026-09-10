@@ -514,18 +514,26 @@ local function exec_simple(sh, args, hook)
     sh.status = 0
   elseif cmd == "read" then
     -- read [-r] [-a arr] [-p prompt] VAR...  (line from stdin, split on IFS)
-    local raw, arr, j = false, nil, 2
+    local raw, arr, j, nchars, ndelim = false, nil, 2, nil, false
     while j <= #args do
       local a = args[j]
       if a == "-r" then raw = true; j = j + 1
       elseif a == "-a" then arr = args[j + 1]; j = j + 2
-      elseif a == "-p" then j = j + 2 -- prompt: no tty, skip
-      elseif a:sub(1, 1) == "-" and #a > 1 then j = j + 1 -- ignore -n/-d/-s/…
+      elseif a == "-n" then nchars = tonumber(args[j + 1]); j = j + 2 -- N chars or newline
+      elseif a == "-N" then nchars = tonumber(args[j + 1]); ndelim = true; j = j + 2 -- exactly N
+      elseif a == "-p" or a == "-d" or a == "-t" or a == "-u" then j = j + 2 -- take an arg, skip
+      elseif a:sub(1, 1) == "-" and #a > 1 then j = j + 1 -- ignore -s/…
       else break end
     end
     local vars = {}
     for k = j, #args do vars[#vars + 1] = args[k] end
-    local line = io.read("*l")
+    local line
+    if nchars then
+      line = io.read(nchars)
+      if line and not ndelim then local nl = line:find("\n", 1, true); if nl then line = line:sub(1, nl - 1) end end
+    else
+      line = io.read("*l")
+    end
     if line == nil then
       sh.status = 1 -- EOF
     else
