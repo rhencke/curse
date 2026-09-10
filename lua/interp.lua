@@ -1036,9 +1036,17 @@ local function printf_int(s)
   if s == nil or s == "" then return 0LL, true end
   local c = s:sub(1, 1)
   if c == "'" or c == '"' then return (#s >= 2 and i64(s:byte(2)) or 0LL), true end
-  local ok, v = pcall(rt.arith_num, s)
-  if ok then return v, true end
-  return 0LL, false
+  -- strtoll semantics (NOT shell arithmetic): skip leading blanks, read a single
+  -- [sign] hex/octal/decimal integer, and any leftover (trailing chars OR blanks,
+  -- and no base#N) makes it invalid — bash still prints the parsed value, status 1.
+  local rest = s:gsub("^[ \t\n]+", "")
+  local tok = rest:match("^[%+%-]?0[xX]%x+")   -- 0x hex
+    or rest:match("^[%+%-]?0[0-7]*")           -- 0 / 0NNN octal
+    or rest:match("^[%+%-]?%d+")               -- decimal
+  if not tok then return 0LL, false end        -- no digits at all ("xyz") -> 0, invalid
+  local ok, v = pcall(rt.arith_num, tok)
+  if not ok then return 0LL, false end
+  return v, (rest:sub(#tok + 1) == "")         -- fully consumed?
 end
 -- A floating printf argument (for %f/%e/%g): C strtod semantics via tonumber.
 local function printf_float(s)
@@ -1119,12 +1127,12 @@ local function sh_printf(fmt, argv, start)
           local spec = "%"
           while fmt:sub(j, j):match("[-+ #0]") do spec = spec .. fmt:sub(j, j); j = j + 1 end
           local width = ""
-          if fmt:sub(j, j) == "*" then local w = printf_num(nextarg()); width = tostring(math.floor(w)); j = j + 1
+          if fmt:sub(j, j) == "*" then local w = tonumber((printf_int(nextarg()))); width = tostring(math.floor(w)); j = j + 1
           else while fmt:sub(j, j):match("%d") do width = width .. fmt:sub(j, j); j = j + 1 end end
           local prec = nil
           if fmt:sub(j, j) == "." then
             j = j + 1; prec = ""
-            if fmt:sub(j, j) == "*" then local p = printf_num(nextarg()); prec = tostring(math.floor(p)); j = j + 1
+            if fmt:sub(j, j) == "*" then local p = tonumber((printf_int(nextarg()))); prec = tostring(math.floor(p)); j = j + 1
             else while fmt:sub(j, j):match("%d") do prec = prec .. fmt:sub(j, j); j = j + 1 end end
           end
           while fmt:sub(j, j):match("[lhLjzt]") do j = j + 1 end -- length mods (ignored)
@@ -1146,7 +1154,9 @@ local function sh_printf(fmt, argv, start)
             elseif conv == "c" then -- first char of the (string) argument
               out[#out + 1] = string.format("%" .. spec:sub(2) .. width .. "s", nextarg():sub(1, 1))
             elseif conv == "b" then
-              out[#out + 1] = string.format("%" .. spec:sub(2) .. width .. "s", rt.ansi_unescape(nextarg()))
+              local bs, bstop = rt.ansi_unescape(nextarg(), "b") -- %b: \NNN & \0NNN; \c stops ALL output
+              out[#out + 1] = string.format("%" .. spec:sub(2) .. width .. "s", bs)
+              if bstop then return table.concat(out), status end
             elseif conv == "q" then
               local s = printf_q(nextarg())
               out[#out + 1] = width ~= "" and string.format("%" .. spec:sub(2) .. width .. "s", s) or s

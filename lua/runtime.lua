@@ -992,7 +992,10 @@ end
 -- Interpret backslash escapes for `echo -e` and ANSI-C `$'…'` quoting.
 -- `ansi_c` (true for $'…') enables \cX control chars and \u/\U code points; the
 -- default (echo -e) treats \c as "stop output".
-function M.ansi_unescape(s, ansi_c)
+-- mode: true = $'…' (\cX ctrl, \NNN octal); "b" = printf %b (\NNN and \0NNN octal,
+-- \c stops); nil/false = echo -e (\0NNN octal only — bare \NNN stays literal, \c stops).
+function M.ansi_unescape(s, mode)
+  local ansi_c = (mode == true)
   local out, i, n = {}, 1, #s
   while i <= n do
     local c = s:sub(i, i)
@@ -1028,7 +1031,10 @@ function M.ansi_unescape(s, ansi_c)
         local hex = s:match("^%x%x?", i + 2)
         if hex then out[#out + 1] = string.char(tonumber(hex, 16)); i = i + 2 + #hex
         else out[#out + 1] = "\\x"; i = i + 2 end
-      elseif d:match("[0-7]") then -- octal \NNN (1-3 digits)
+      elseif not ansi_c and d == "0" then -- echo -e / printf %b: \0NNN (0 prefix + up to 3 octal)
+        local oct = s:match("^[0-7]?[0-7]?[0-7]?", i + 2) or ""
+        out[#out + 1] = string.char(tonumber("0" .. oct, 8) % 256); i = i + 2 + #oct
+      elseif d:match("[0-7]") and (ansi_c or mode == "b") then -- \NNN octal ($'…' and %b, NOT echo -e)
         local oct = s:match("^[0-7][0-7]?[0-7]?", i + 1)
         out[#out + 1] = string.char(tonumber(oct, 8) % 256); i = i + 1 + #oct
       elseif d == "c" then return table.concat(out), true -- \c: stop all further output
