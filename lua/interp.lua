@@ -32,6 +32,24 @@ ffi.cdef [[
 ]]
 local C = ffi.C
 local statbuf = ffi.new("uint8_t[144]") -- glibc x86-64 struct stat is 144 bytes
+-- Signal name/number normalization for `trap`.
+local SIGNUM = { HUP = 1, INT = 2, QUIT = 3, ILL = 4, TRAP = 5, ABRT = 6, BUS = 7,
+  FPE = 8, KILL = 9, USR1 = 10, SEGV = 11, USR2 = 12, PIPE = 13, ALRM = 14, TERM = 15,
+  CHLD = 17, CONT = 18, STOP = 19, TSTP = 20, TTIN = 21, TTOU = 22, SYS = 31 }
+local NUMSIG = {}; for k, v in pairs(SIGNUM) do NUMSIG[v] = k end
+local function canon_sig(s)
+  s = s:upper()
+  if s == "0" or s == "EXIT" then return "EXIT" end
+  if s == "ERR" or s == "DEBUG" or s == "RETURN" then return s end
+  s = s:gsub("^SIG", "")
+  if s:match("^%d+$") then local nm = NUMSIG[tonumber(s)]; return nm and ("SIG" .. nm) or nil end
+  return SIGNUM[s] and ("SIG" .. s) or nil
+end
+local function sig_order(canon) -- for printing: EXIT=0, then by signal number
+  if canon == "EXIT" then return 0 end
+  local nm = canon:gsub("^SIG", ""); return SIGNUM[nm] or 99
+end
+
 local function file_test(op, path)
   if op == "-e" or op == "-a" then return C.access(path, 0) == 0 end
   if op == "-r" then return C.access(path, 4) == 0 end
@@ -446,7 +464,7 @@ local BUILTINS = {
   exit = 1, cd = 1, unset = 1, export = 1, declare = 1, typeset = 1, set = 1, shift = 1,
   read = 1, getopts = 1, printf = 1, ["local"] = 1, command = 1, type = 1, pwd = 1,
   eval = 1, source = 1, ["."] = 1, ["break"] = 1, ["continue"] = 1, ["true"] = 1,
-  exec = 1, readonly = 1, umask = 1, alias = 1, unalias = 1, shopt = 1, wait = 1,
+  exec = 1, readonly = 1, umask = 1, alias = 1, unalias = 1, shopt = 1, wait = 1, trap = 1,
 }
 local KEYWORDS = {
   ["if"] = 1, ["then"] = 1, ["else"] = 1, ["elif"] = 1, ["fi"] = 1, ["for"] = 1,
@@ -643,6 +661,33 @@ local function exec_simple(sh, args, hook)
     else
       if sh.bg_pids then for _, p in ipairs(sh.bg_pids) do pcall(reap, p) end; sh.bg_pids = {} end
       sh.status = 0
+    end
+  elseif cmd == "trap" then
+    -- trap [-p] [ACTION] SIG…  (subset: registers/prints; only EXIT actually fires)
+    local j = 2
+    if args[j] == "-p" or args[j] == "-l" then j = j + 1 end
+    if args[j] == "--" then j = j + 1 end
+    if j > #args then -- print all registered traps, in signal order
+      local list = {}
+      for canon, h in pairs(sh.traps) do list[#list + 1] = canon end
+      table.sort(list, function(a, b) return sig_order(a) < sig_order(b) end)
+      for _, canon in ipairs(list) do
+        sh:echo("trap -- '" .. sh.traps[canon] .. "' " .. canon)
+      end
+      sh.status = 0
+    else
+      -- first token is the action if it's not itself a signal, else action="-" (reset)
+      local action, sigstart
+      if canon_sig(args[j]) and #args == j then action, sigstart = "-", j -- `trap SIG` resets
+      else action, sigstart = args[j], j + 1 end
+      local ok = true
+      for k = sigstart, #args do
+        local canon = canon_sig(args[k])
+        if not canon then io.stderr:write("curse: trap: " .. args[k] .. ": invalid signal specification\n"); ok = false
+        elseif action == "-" then sh.traps[canon] = nil
+        else sh.traps[canon] = action end
+      end
+      sh.status = ok and 0 or 1
     end
   elseif cmd == "alias" then
     -- alias [name[=value] …]: define or print aliases.
@@ -1369,11 +1414,29 @@ exec_list = function(sh, stmts, hook, toplevel)
 end
 M.exec_list = exec_list
 
+-- Run a trap handler string; returns true if it called exit (which wins).
+local function run_trap(sh, code)
+  local exited = false
+  local ok, err = pcall(function()
+    for _, st in ipairs(require("parser").parse(code).stmts) do exec_stmt(sh, st, function() end) end
+  end)
+  if not ok and type(err) == "table" and err.__curse_exit then sh.status = err.__curse_exit; exited = true end
+  return exited
+end
+
 local function finish(sh, ok, err)
   if not ok then
     if type(err) == "table" and err.__curse_exit then sh.status = err.__curse_exit
     elseif type(err) == "table" and err.__curse_return then sh.status = err.__curse_return
     else error(err) end
+  end
+  -- EXIT trap: runs once with $? = the final status; its own status is ignored
+  -- unless it calls exit (bash semantics).
+  local h = sh.traps and sh.traps.EXIT
+  if h and h ~= "" and not sh.in_exit_trap then
+    sh.in_exit_trap = true
+    local saved = sh.status
+    if not run_trap(sh, h) then sh.status = saved end
   end
 end
 
