@@ -835,7 +835,7 @@ local function exec_simple(sh, args, hook)
     -- the process env so posix_spawn children inherit it. -A marks associative,
     -- -p prints declarations.
     local doexport, assoc, printmode, nref, plusn = (cmd == "export"), false, false, false, false
-    local funcnames, funcbody, iattr = false, false, false
+    local funcnames, funcbody, iattr, lattr, uattr = false, false, false, false, false
     local rest = {}
     for j = 2, #args do
       local a = args[j]
@@ -848,6 +848,8 @@ local function exec_simple(sh, args, hook)
         if a:find("F") then funcnames = true end
         if a:find("f") then funcbody = true end
         if a:find("i") then iattr = true end
+        if a:find("l") then lattr = true end
+        if a:find("u") then uattr = true end
       elseif a:sub(1, 1) == "+" and #a > 1 then
         if a:find("n") then plusn = true end
       else rest[#rest + 1] = a end
@@ -885,6 +887,9 @@ local function exec_simple(sh, args, hook)
           if nref then sh:make_nameref(nm, val)
           elseif iattr then -- declare -i: arith-evaluate the value, mark integer
             sh:aset(nm, eval(sh, require("parser").arith(val))); sh.vars[nm].int = true
+          elseif lattr or uattr then -- declare -l/-u: lower/upper case attribute
+            sh:set_str(nm, lattr and val:lower() or val:upper())
+            sh.vars[nm].lower = lattr or nil; sh.vars[nm].upper = uattr or nil
           else
             if assoc then sh:declare_assoc(nm) end
             sh:set_str(nm, val); if doexport then C.setenv(nm, val, 1) end
@@ -893,6 +898,8 @@ local function exec_simple(sh, args, hook)
           if plusn then sh:unref(a)
           elseif nref then sh:make_nameref(a)
           elseif iattr then sh.vars[a] = sh.vars[a] or {}; sh.vars[a].int = true
+          elseif lattr or uattr then
+            sh.vars[a] = sh.vars[a] or {}; sh.vars[a].lower = lattr or nil; sh.vars[a].upper = uattr or nil
           elseif assoc then sh:declare_assoc(a)
           elseif doexport then C.setenv(a, sh:get(a), 1) end
         end
@@ -1220,6 +1227,9 @@ local function exec_stmt(sh, st, hook)
       local b = sh.vars[sh:deref(st.name)]
       if b and b.int then -- integer var (declare -i): assign arith-evaluates
         sh:aset(st.name, eval(sh, require("parser").arith(expand_word(sh, st.rhs))))
+      elseif b and (b.lower or b.upper) then -- declare -l/-u: case-fold on assign
+        local v = expand_word(sh, st.rhs)
+        sh:set_str(st.name, b.lower and v:lower() or v:upper())
       else
         sh:set_str(st.name, expand_word(sh, st.rhs))
       end
