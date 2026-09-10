@@ -553,13 +553,14 @@ local function exec_stmt(sh, st, hook)
         if k < nst then local p = ffi.new("int[2]"); C.pipe(p); rd, wr = p[0], p[1] end
         local pid = C.fork()
         if pid == 0 then
-          pcall(function()
+          local ok, err = pcall(function()
             if prev_read >= 0 then C.dup2(prev_read, 0); C.close(prev_read) end
             if wr >= 0 then C.dup2(wr, 1); C.close(wr) end
             if rd >= 0 then C.close(rd) end
             sh.out = io.write -- this stage writes to its fd 1 (the pipe / terminal)
             exec_stmt(sh, cmds[k], hook)
           end)
+          if not ok and type(err) == "table" then sh.status = err.__curse_exit or err.__curse_return or sh.status end
           io.flush() -- before _exit (exit/error in the stage would skip an inline flush)
           C._exit(sh.status or 0)
         end
