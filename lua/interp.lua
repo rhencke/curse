@@ -1228,7 +1228,7 @@ local function exec_simple(sh, args, hook)
     -- the process env so posix_spawn children inherit it. -A marks associative,
     -- -p prints declarations.
     local doexport, assoc, printmode, nref, plusn = (cmd == "export"), false, false, false, false
-    local funcnames, funcbody, iattr, lattr, uattr = false, false, false, false, false
+    local funcnames, funcbody, iattr, lattr, uattr, rattr = false, false, false, false, false, false
     local rest = {}
     for j = 2, #args do
       local a = args[j]
@@ -1243,6 +1243,7 @@ local function exec_simple(sh, args, hook)
         if a:find("i") then iattr = true end
         if a:find("l") then lattr = true end
         if a:find("u") then uattr = true end
+        if a:find("r") then rattr = true end
       elseif a:sub(1, 1) == "+" and #a > 1 then
         if a:find("n") then plusn = true end
       else rest[#rest + 1] = a end
@@ -1274,7 +1275,7 @@ local function exec_simple(sh, args, hook)
       end
       sh.status = allok and 0 or 1
     else
-      local roattr = (cmd == "readonly")
+      local roattr = (cmd == "readonly") or rattr
       for _, a in ipairs(rest) do
         local nm, val = a:match("^([%a_][%w_]*)=(.*)$")
         if nm then

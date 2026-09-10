@@ -353,6 +353,20 @@ function Shell:make_nameref(name, target)
 end
 function Shell:unref(name) local b = self.vars[name]; if b then b.ref = nil end end
 function Shell:is_nameref(name) local b = self.vars[name]; return b and b.ref end
+-- ${var@a}: the variable's attribute flags, in bash's order (aA r x i l u n).
+function Shell:attr_string(name)
+  local b = self.vars[self:deref(name)]
+  if not b then return "" end
+  local s = ""
+  if b.assoc then s = s .. "A" elseif b.arr then s = s .. "a" end
+  if b.ro then s = s .. "r" end
+  if os.getenv(name) ~= nil then s = s .. "x" end
+  if b.int then s = s .. "i" end
+  if b.lower then s = s .. "l" end
+  if b.upper then s = s .. "u" end
+  if b.ref then s = s .. "n" end
+  return s
+end
 
 -- String value of a var (materialize from the cached int64 if needed).
 function Shell:get(name)
@@ -842,6 +856,11 @@ function Shell:expand_param(pe, arg, arg2, idxnum)
   if op == "=" then if not isset then self:set_str(name, arg); return arg end return val end
   if op == ":?" then if val == "" then error({ __curse_exit = 1 }) end return val end
   if op == "?" then if not isset then error({ __curse_exit = 1 }) end return val end
+  if op == "@" then -- ${x@OP} transforms; on an UNSET var they yield empty
+    if not isset then return "" end
+    if arg == "a" then return self:attr_string(name) end
+    if arg == "A" then return name .. "=" .. ("'" .. val:gsub("'", "'\\''") .. "'") end -- declare-able form
+  end
   return self:apply_str_op(op, val, arg, arg2)
 end
 
@@ -893,8 +912,8 @@ end
 -- case, and the ${x@OP} transforms). Factored out so ${a[@]OP} can apply per element.
 function Shell:apply_str_op(op, val, arg, arg2)
   arg = arg or ""
-  if op == "@" then -- ${x@Q}/@U/@u/@L/@E (bash 5.1 transforms)
-    if arg == "Q" then return shell_quote(val) end
+  if op == "@" then -- ${x@Q}/@U/@u/@L/@E/@K/@k (bash 5.x transforms)
+    if arg == "Q" or arg == "K" or arg == "k" then return shell_quote(val) end
     if arg == "U" then return val:upper() end
     if arg == "u" then return val:sub(1, 1):upper() .. val:sub(2) end
     if arg == "L" then return val:lower() end
