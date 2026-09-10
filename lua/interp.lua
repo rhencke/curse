@@ -1973,7 +1973,7 @@ local function exec_simple(sh, args, hook, no_func)
     end
     if bad then io.stderr:write("curse: compgen: invalid action\n"); sh.status = 2
     else
-      local out, seen = {}, {}
+      local out, seen, werr = {}, {}, false
       local function emit(x) if (not prefix or x:sub(1, #prefix) == prefix) and not seen[x] then seen[x] = true; out[#out + 1] = x end end
       if funcname then
         -- -F NAME: set the completion context vars bash exposes, call the function,
@@ -1995,7 +1995,12 @@ local function exec_simple(sh, args, hook, no_func)
       -- -W words keep their insertion order; each -A action is sorted within itself,
       -- and actions emit in the order given (bash does not globally merge-sort them).
       if wordlist then
-        for _, w in ipairs(rt.ifs_split(sh.vars["IFS"] and sh:get("IFS") or " \t\n", wordlist)) do emit(w) end
+        -- -W expands the wordlist (params/$()/arith) THEN splits on IFS; a fatal
+        -- expansion (bad ${…}, div-by-zero) makes compgen fail with status 1.
+        local ok, expanded = pcall(expand_word, sh, require("parser").parse_word(wordlist))
+        if ok then
+          for _, w in ipairs(rt.ifs_split(sh.vars["IFS"] and sh:get("IFS") or " \t\n", expanded)) do emit(w) end
+        else werr = true end
       end
       for _, act in ipairs(actions) do
         local acc = {}
@@ -2032,7 +2037,7 @@ local function exec_simple(sh, args, hook, no_func)
         out = kept
       end
       for _, x in ipairs(out) do sh:echo(cpre .. x .. csuf) end
-      sh.status = (#out > 0) and 0 or 1
+      sh.status = (not werr and #out > 0) and 0 or 1
     end
   elseif cmd == "complete" then
     -- complete [-p] [opts] [name…]: store/print completion specs (registration only)
