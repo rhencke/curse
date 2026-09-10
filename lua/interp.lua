@@ -1069,7 +1069,12 @@ local function exec_simple(sh, args, hook)
   elseif cmd == "trap" then
     -- trap [-p] [ACTION] SIG…  (subset: registers/prints; only EXIT actually fires)
     local j, pflag = 2, false
-    if args[j] == "-p" or args[j] == "-l" then pflag = true; j = j + 1 end
+    if args[j] == "-l" then -- list signal names (NN) SIGNAME)
+      local nums = {}; for n in pairs(NUMSIG) do nums[#nums + 1] = n end; table.sort(nums)
+      for _, n in ipairs(nums) do sh:echo(("%2d) SIG%s"):format(n, NUMSIG[n])) end
+      sh.status = 0; return
+    end
+    if args[j] == "-p" then pflag = true; j = j + 1 end
     if args[j] == "--" then j = j + 1 end
     if pflag or j > #args then -- print traps (all, or the named signals) in signal order
       local list = {}
@@ -1809,12 +1814,27 @@ end
 -- whole construct; handled generically below (simple/group/subshell do their own).
 local COMPOUND_REDIR = { whilec = true, forc = true, forin = true, ["if"] = true,
   case = true, arithcmd = true, dbracket = true }
+-- DEBUG trap fires just before each of these "command" nodes (bash runs it before
+-- every simple/pipeline/arith/[[/assignment); it preserves $? around the handler.
+local DEBUG_FIRE = { simple = true, pipeline = true, arithcmd = true, dbracket = true,
+  assign = true, assignlist = true }
+local run_trap -- forward (defined below)
+local function run_debug(sh, line)
+  local h = sh.traps and sh.traps.DEBUG
+  if not h or h == "" or sh.in_debug then return end
+  sh.in_debug = true
+  local saved = sh.status
+  if line then sh.cur_line = line end
+  run_trap(sh, h)
+  sh.status = saved; sh.in_debug = false
+end
 
 local function exec_stmt(sh, st, hook)
   local t = st.t
   -- set -n (noexec): a non-interactive shell reads but does not execute. Once on,
   -- every later statement (including `set +n`) is skipped — matches bash.
   if sh.opt_n and not sh.opt_i then sh.status = 0; return end
+  if DEBUG_FIRE[t] and not (sh.in_trap and sh.in_trap > 0) then run_debug(sh, st.line) end
   -- redirs trailing a compound command: apply around the whole thing, then run it
   -- with redirs temporarily detached (so this guard doesn't re-fire).
   if st.redirs and COMPOUND_REDIR[t] then
@@ -1829,7 +1849,7 @@ local function exec_stmt(sh, st, hook)
     if not pok then error(err) end
     return
   end
-  if st.line and not sh.in_trap then sh.cur_line = st.line end -- $LINENO (frozen in traps)
+  if st.line and not (sh.in_trap and sh.in_trap > 0) then sh.cur_line = st.line end -- $LINENO (frozen in traps)
   if t == "assign" then
     local rb = sh.vars[sh:deref(st.name)]
     if rb and rb.ro then -- readonly: reject the assignment (status 1). bash exits
@@ -2136,6 +2156,7 @@ local function exec_stmt(sh, st, hook)
       local fs = sh.forstate[st.id]
       fs.idx = fs.idx + 1
       if fs.idx > #fs.list then break end
+      run_debug(sh, st.line) -- DEBUG fires at the `for` header before each iteration
       sh:set_str(st.name, fs.list[fs.idx])
       local act = run_loop_body(sh, st.body, hook); bodystatus = sh.status
       if act == "break" then break end
@@ -2160,7 +2181,7 @@ M.exec_stmt = exec_stmt -- exposed so the compiled CFG can delegate cold stateme
 
 -- Run a trap handler string; preserves $LINENO (so an ERR/EXIT trap sees the
 -- failing command's line, not the handler's). Returns true if it called exit.
-local function run_trap(sh, code)
+run_trap = function(sh, code)
   local exited, savedline = false, sh.cur_line
   sh.in_trap = (sh.in_trap or 0) + 1
   local ok, err = pcall(function()
