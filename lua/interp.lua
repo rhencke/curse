@@ -538,9 +538,13 @@ local function expand_part_str(sh, p)
     -- The word for -/:-/+/:+/=/:=/?/:? is only expanded WHEN USED (bash: a default
     -- with side effects like $((i++)) runs only if the branch is taken). Pass a thunk.
     local TESTOP = { ["-"] = 1, [":-"] = 1, ["+"] = 1, [":+"] = 1, ["="] = 1, [":="] = 1, ["?"] = 1, [":?"] = 1 }
+    -- When the ${…} is inside double quotes, its default/alternate word follows
+    -- double-quoted rules: single quotes are literal and a backslash is kept
+    -- except before $ ` " \ (parse_heredoc has exactly these semantics).
+    local pw = p.q and P.parse_heredoc or P.parse_word
     local arg
     if TESTOP[pe.op] then
-      arg = pe.arg and function() return expand_word(sh, P.parse_word(pe.arg)) end or nil
+      arg = pe.arg and function() return expand_word(sh, pw(pe.arg)) end or nil
     else
       arg = pe.arg and (patmode and expand_pattern or expand_word)(sh, P.parse_word(pe.arg)) or nil
     end
