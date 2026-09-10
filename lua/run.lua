@@ -62,21 +62,27 @@ if arg[ai] == nil then
 end
 
 local script = arg[ai] or error("usage: run.lua <script.sh> [tiered|compiled|interp] | -c CODE | -i")
-local mode = arg[ai + 1] or "tiered"
+-- arg[ai+1] is the execution mode ONLY if it's a known mode keyword; otherwise it
+-- (and the rest) are the script's positional parameters ($1, $2, …), like bash.
+local MODES = { tiered = true, compiled = true, interp = true, cached = true }
+local mode, pstart = "tiered", ai + 1
+if arg[ai + 1] and MODES[arg[ai + 1]] then mode = arg[ai + 1]; pstart = ai + 2 end
+local function setparams(s) for k = pstart, #arg do s.nparams = s.nparams + 1; s.params[s.nparams] = arg[k] end end
 if mode == "cached" then
   -- persistent artifact cache: warm hit skips parse+emit; cold compiles+stores;
   -- any cache failure falls back to running uncached. This is the CLI/build/boot
   -- path (one-shot invocations that recur), reported on stderr for visibility.
   local Cache = require("cache")
   local f = assert(io.open(script, "r")); local src = f:read("*a"); f:close()
-  sh = T.rt.Shell.new(); apply(sh); sh.argv0 = script
+  sh = T.rt.Shell.new(); apply(sh); sh.argv0 = script; setparams(sh)
   local _, how = Cache.run(src, sh)
   if os.getenv("CURSE_CACHE_DEBUG") then io.stderr:write("[cache: " .. how .. "]\n") end
 elseif mode == "tiered" then
-  sh = T.run_background(script, { luajit = os.getenv("CURSE_LUAJIT") or "luajit" })
+  sh = T.rt.Shell.new(); apply(sh); sh.argv0 = script; setparams(sh)
+  T.run_background(script, { luajit = os.getenv("CURSE_LUAJIT") or "luajit", sh = sh })
 else
   local f = assert(io.open(script, "r")); local src = f:read("*a"); f:close()
-  sh = T.rt.Shell.new(); apply(sh); sh.argv0 = script
+  sh = T.rt.Shell.new(); apply(sh); sh.argv0 = script; setparams(sh)
   if mode == "compiled" then
     local mod = T.compile(T.parser.parse(src))
     T.interp.finish_run(sh, function() mod.run(sh, nil) end)
