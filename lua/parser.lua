@@ -1173,6 +1173,17 @@ local function make_parser(src)
       ws()
     end
 
+    -- a keyword that only closes/continues a compound command, reaching command
+    -- position on its own (or a bare `}`), is a misplaced-token syntax error.
+    do
+      local MISPLACED = { ["then"] = 1, ["else"] = 1, ["elif"] = 1, ["fi"] = 1,
+        ["do"] = 1, ["done"] = 1, ["esac"] = 1 }
+      local pwm = peekword()
+      if MISPLACED[pwm]
+          or (src:sub(i, i) == "}" and (i + 1 > n or src:sub(i + 1, i + 1):match("[ \t\n;)]"))) then
+        error("syntax error near `" .. (pwm ~= "" and pwm or "}") .. "'")
+      end
+    end
     -- simple command: WORD WORD ...
     local words = {}
     local redirs = {}
