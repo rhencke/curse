@@ -2786,8 +2786,13 @@ local function run_debug(sh, line)
   sh.in_debug = true
   local saved = sh.status
   if line then sh.cur_line = line end
-  run_trap(sh, h)
+  local exited = run_trap(sh, h)
+  local trap_status = sh.status
   sh.status = saved; sh.in_debug = false
+  -- `exit` in a DEBUG trap exits the shell; a non-zero DEBUG return under errexit
+  -- also exits (skipping the command), matching bash.
+  if exited then error({ __curse_exit = trap_status }) end
+  if sh.opt_e and trap_status ~= 0 then error({ __curse_exit = trap_status }) end
 end
 
 local function exec_stmt(sh, st, hook)
@@ -3335,7 +3340,11 @@ run_trap = function(sh, code)
     for _, st in ipairs(P.parse(code).stmts) do exec_stmt(sh, st, function() end) end
   end)
   sh.in_trap = sh.in_trap - 1; sh.cur_line = savedline
-  if not ok and type(err) == "table" and err.__curse_exit then sh.status = err.__curse_exit; exited = true end
+  if not ok then
+    if type(err) == "table" and err.__curse_exit then sh.status = err.__curse_exit; exited = true
+    elseif type(err) == "table" and err.__curse_return then sh.status = err.__curse_return -- `return N` in a trap sets its status
+    else error(err) end -- a real error propagates
+  end
   return exited
 end
 
