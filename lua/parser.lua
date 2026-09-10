@@ -676,7 +676,7 @@ local function make_parser(src)
       else break end
     end
   end
-  local function word(stop_paren)  -- read one shell word, keeping quotes and $(( )) / ${ } / $( ) balanced
+  local function word(stop_paren, stop_cmp)  -- read one shell word, keeping quotes and $(( )) / ${ } / $( ) balanced
     ws()
     local start = i
     while i <= n do
@@ -756,6 +756,7 @@ local function make_parser(src)
           if cc == "(" then d = d + 1 elseif cc == ")" then d = d - 1 end
           i = i + 1
         end
+      elseif stop_cmp and (c == "<" or c == ">") then break -- [[ ]]: <,> are operators
       elseif c == "$" and src:sub(i + 1, i + 1) == "{" then
         local e = src:find("}", i + 2, true); i = (e or n) + 1
       elseif c == "`" then -- `…` command sub: keep it whole (spaces inside included)
@@ -986,7 +987,7 @@ local function make_parser(src)
           toks[#toks + 1] = src:sub(rs, i - 1); quoted[#toks] = false
         else
           local before = i
-          local w = word()
+          local w = word(false, true) -- split on <,> operators (no spaces needed in [[ ]])
           if w == "" then
             -- word() stalled on a bare metacharacter (`;`, `)`, `<`, `>`, …) that
             -- is literal inside [[ ]] (e.g. part of a regex operand). Consume it as
