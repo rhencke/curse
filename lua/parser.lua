@@ -319,7 +319,10 @@ local function parse_word(w)
       while j <= #w and w:sub(j, j) ~= '"' do
         if w:sub(j, j) == "\\" then j = j + 2 else j = j + 1 end
       end
-      parse_dquote(w:sub(i + 1, j - 1), add); i = j + 1
+      local before = #parts
+      parse_dquote(w:sub(i + 1, j - 1), add)
+      if #parts == before then add({ lit = "", q = true }) end -- empty "" is still a field
+      i = j + 1
     elseif c == "$" then
       i = parse_dollar(w, i, add, false)
     elseif c == "`" then -- `cmd` command substitution
@@ -329,8 +332,13 @@ local function parse_word(w)
         else buf[#buf + 1] = w:sub(j, j); j = j + 1 end
       end
       add({ cmdsub = table.concat(buf), q = false }); i = j + 1
+    elseif c == "\\" then -- backslash escape: literal next char (newline = continuation)
+      local nx = w:sub(i + 1, i + 1)
+      if nx == "\n" or nx == "" then -- line continuation / trailing backslash: drop
+      else add({ lit = nx, q = true }) end
+      i = i + 2
     else
-      local s, e = w:find("^[^$'\"`]+", i)
+      local s, e = w:find("^[^$'\"`\\]+", i)
       add({ lit = w:sub(s, e), q = false }); i = e + 1
     end
   end
@@ -571,7 +579,8 @@ local function make_parser(src)
     local start = i
     while i <= n do
       local c = src:sub(i, i)
-      if stop_paren and (c == ")" or c == "(") then break
+      if c == "\\" then i = i + 2 -- backslash escapes the next char (incl. metachars/space)
+      elseif stop_paren and (c == ")" or c == "(") then break
       elseif c == '"' or c == "'" then
         local q = c; i = i + 1
         while i <= n and src:sub(i, i) ~= q do i = i + 1 end

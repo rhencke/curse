@@ -19,6 +19,8 @@ ffi.cdef [[
   int access(const char *path, int mode);
   int chdir(const char *path);
   int curse_stat(const char *path, void *buf) asm("stat");
+  int curse_lstat(const char *path, void *buf) asm("lstat");
+  int isatty(int fd);
   int fork(void);
   int dup2(int oldfd, int newfd);
   int dup(int oldfd);
@@ -35,7 +37,10 @@ local function file_test(op, path)
   if op == "-r" then return C.access(path, 4) == 0 end
   if op == "-w" then return C.access(path, 2) == 0 end
   if op == "-x" then return C.access(path, 1) == 0 end
-  local ok, rc = pcall(C.curse_stat, path, statbuf)
+  if op == "-t" then return C.isatty(tonumber(path) or -1) == 1 end -- fd is a terminal
+  -- -h/-L test the link itself (lstat); everything else follows symlinks (stat)
+  local statfn = (op == "-h" or op == "-L") and C.curse_lstat or C.curse_stat
+  local ok, rc = pcall(statfn, path, statbuf)
   if not ok or rc ~= 0 then return false end
   local mode = ffi.cast("uint32_t *", statbuf + 24)[0] -- st_mode @ offset 24
   local fmt = bit.band(mode, 0xF000)
@@ -45,6 +50,10 @@ local function file_test(op, path)
   if op == "-c" then return fmt == 0x2000 end
   if op == "-p" then return fmt == 0x1000 end
   if op == "-S" then return fmt == 0xC000 end
+  if op == "-h" or op == "-L" then return fmt == 0xA000 end -- S_IFLNK
+  if op == "-k" then return bit.band(mode, 0x200) ~= 0 end -- sticky
+  if op == "-g" then return bit.band(mode, 0x400) ~= 0 end -- setgid
+  if op == "-u" then return bit.band(mode, 0x800) ~= 0 end -- setuid
   if op == "-s" then return tonumber(ffi.cast("int64_t *", statbuf + 48)[0]) > 0 end -- st_size @ 48
   return false
 end
@@ -69,20 +78,36 @@ local function binary(x, op, y)
   return false
 end
 -- Evaluate a `test`/`[` argument list (already expanded). Returns a boolean.
+-- Recursive descent with `( )` grouping and `-o` (lowest) / `-a` / `!` precedence.
 local function eval_test(a, lo, hi)
   local n = hi - lo + 1
-  if n == 0 then return false end
-  if a[lo] == "!" then return not eval_test(a, lo + 1, hi) end
+  if n <= 0 then return false end
+  -- ( expr ): strip only when lo's `(` matches hi's `)`
+  if a[lo] == "(" then
+    local depth = 0
+    for j = lo, hi do
+      if a[j] == "(" then depth = depth + 1
+      elseif a[j] == ")" then depth = depth - 1; if depth == 0 then
+        if j == hi then return eval_test(a, lo + 1, hi - 1) end; break
+      end end
+    end
+  end
+  -- -o then -a, paren-aware, only when flanked by operands
+  for _, opw in ipairs({ "-o", "-a" }) do
+    local depth = 0
+    for j = lo, hi do
+      if a[j] == "(" then depth = depth + 1
+      elseif a[j] == ")" then depth = depth - 1
+      elseif a[j] == opw and depth == 0 and j > lo and j < hi then
+        local l, r = eval_test(a, lo, j - 1), eval_test(a, j + 1, hi)
+        if opw == "-o" then return l or r else return l and r end
+      end
+    end
+  end
+  if a[lo] == "!" and n > 1 then return not eval_test(a, lo + 1, hi) end
   if n == 1 then return a[lo] ~= "" end
   if n == 2 then return unary(a[lo], a[lo + 1]) end
   if n == 3 then return binary(a[lo], a[lo + 1], a[lo + 2]) end
-  -- n>=4: handle a single -a/-o join (deprecated but common), left-associative.
-  for j = lo, hi do
-    if a[j] == "-o" then return eval_test(a, lo, j - 1) or eval_test(a, j + 1, hi) end
-  end
-  for j = lo, hi do
-    if a[j] == "-a" then return eval_test(a, lo, j - 1) and eval_test(a, j + 1, hi) end
-  end
   return false
 end
 local function do_test(sh, args)
