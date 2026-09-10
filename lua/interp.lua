@@ -2072,6 +2072,8 @@ local function exec_stmt(sh, st, hook)
     else
       run_cmd()
     end
+    -- $_ : the last argument (after expansion) of the command just run.
+    if #args > 0 then sh:set_str("_", args[#args]) end
   elseif t == "forc" then
     if st.init then eval(sh, st.init) end
     local bodystatus = 0 -- a loop's status is its last body command's (0 if none)
