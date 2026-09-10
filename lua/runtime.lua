@@ -225,7 +225,12 @@ function Shell:capture_src(src)
   local saved = self.out
   self.out = function(x) buf[#buf + 1] = x end
   self.in_subprogram = (self.in_subprogram or 0) + 1 -- $(...) is a subprogram: ERR trap suppressed
+  -- errexit is NOT inherited into a command sub (unless inherit_errexit): a failing
+  -- middle command doesn't abort — only the cmdsub's final status propagates out.
+  local savede = self.opt_e
+  if not (self.shopt and self.shopt.inherit_errexit) then self.opt_e = false end
   local ok, err = pcall(I.run, self, ast)
+  self.opt_e = savede
   self.in_subprogram = self.in_subprogram - 1
   self.out = saved
   if not ok then error(err) end

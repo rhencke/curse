@@ -2239,7 +2239,8 @@ exec_list = function(sh, stmts, hook, toplevel)
     exec_stmt(sh, st, hook)
     -- ERR trap + errexit: fire on a failing simple/pipeline outside a condition
     -- (restricted to those two types to avoid &&/|| short-circuit false-positives).
-    if sh.noerr == 0 and sh.status ~= 0 and (st.t == "simple" or st.t == "pipeline") then
+    if sh.noerr == 0 and sh.status ~= 0 and (st.t == "simple" or st.t == "pipeline"
+        or st.t == "assign" or st.t == "assignlist") then
       local h = sh.traps and sh.traps.ERR
       -- ERR fires only in the main shell (calldepth 0, not in a subshell/cmdsub/
       -- async), unless errtrace extends it to functions and subprograms.
@@ -2299,7 +2300,8 @@ function M.run_lazy(sh, src, hook)
       k = k + 1
       hook("stmt", k)
       exec_stmt(sh, st, hook)
-      if sh.noerr == 0 and sh.status ~= 0 and (st.t == "simple" or st.t == "pipeline") then
+      if sh.noerr == 0 and sh.status ~= 0 and (st.t == "simple" or st.t == "pipeline"
+        or st.t == "assign" or st.t == "assignlist") then
         local h = sh.traps and sh.traps.ERR
         if h and h ~= "" and not sh.in_err_trap and (sh.calldepth or 0) == 0 then
           sh.in_err_trap = true; local saved = sh.status
