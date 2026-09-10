@@ -603,8 +603,10 @@ local function fmt_decl(sh, name)
     end
     return "declare -a " .. name .. "=(" .. table.concat(parts, " ") .. ")"
   else
-    local attr = os.getenv(name) ~= nil and "-x" or "--"
-    return "declare " .. attr .. " " .. name .. "=" .. decl_quote(sh:get(name))
+    -- attribute letters in bash's order: -rxilu (readonly/export/integer/lower/upper)
+    local a = (b.ro and "r" or "") .. (os.getenv(name) ~= nil and "x" or "")
+      .. (b.int and "i" or "") .. (b.lower and "l" or "") .. (b.upper and "u" or "")
+    return "declare " .. (a == "" and "--" or "-" .. a) .. " " .. name .. "=" .. decl_quote(sh:get(name))
   end
 end
 
@@ -674,8 +676,9 @@ local function exec_simple(sh, args, hook)
   elseif cmd == "break" then sh.status = 0; error({ __curse_break = tonumber(args[2]) or 1 })
   elseif cmd == "continue" then sh.status = 0; error({ __curse_continue = tonumber(args[2]) or 1 })
   elseif cmd == "eval" then
-    -- eval: join args, parse, run in the CURRENT shell (return/exit propagate).
-    local code = table.concat({ unpack(args, 2) }, " ")
+    -- eval [--]: join args, parse, run in the CURRENT shell (return/exit propagate).
+    local start = (args[2] == "--") and 3 or 2
+    local code = table.concat({ unpack(args, start) }, " ")
     if code:match("%S") then
       local ok, parsed = pcall(require("parser").parse, code)
       if not ok then io.stderr:write("curse: eval: " .. tostring(parsed) .. "\n"); sh.status = 2
@@ -904,6 +907,7 @@ local function exec_simple(sh, args, hook)
       end
       sh.status = allok and 0 or 1
     else
+      local roattr = (cmd == "readonly")
       for _, a in ipairs(rest) do
         local nm, val = a:match("^([%a_][%w_]*)=(.*)$")
         if nm then
@@ -917,6 +921,7 @@ local function exec_simple(sh, args, hook)
             if assoc then sh:declare_assoc(nm) end
             sh:set_str(nm, val); if doexport then C.setenv(nm, val, 1) end
           end
+          if roattr and sh.vars[sh:deref(nm)] then sh.vars[sh:deref(nm)].ro = true end
         elseif a:match("^[%a_][%w_]*$") then
           if plusn then sh:unref(a)
           elseif nref then sh:make_nameref(a)
@@ -925,6 +930,7 @@ local function exec_simple(sh, args, hook)
             sh.vars[a] = sh.vars[a] or {}; sh.vars[a].lower = lattr or nil; sh.vars[a].upper = uattr or nil
           elseif assoc then sh:declare_assoc(a)
           elseif doexport then C.setenv(a, sh:get(a), 1) end
+          if roattr then sh.vars[a] = sh.vars[a] or {}; sh.vars[a].ro = true end
         end
       end
       sh.status = 0
