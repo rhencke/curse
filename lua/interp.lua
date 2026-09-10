@@ -2824,9 +2824,9 @@ local function exec_stmt(sh, st, hook)
   if st.line and not (sh.in_trap and sh.in_trap > 0) then sh.cur_line = st.line end -- $LINENO (frozen in traps)
   if t == "assign" then
     local rb = sh.vars[sh:deref(st.name)]
-    if rb and rb.ro then -- readonly: reject the assignment (status 1). bash exits
-      io.stderr:write("curse: " .. st.name .. ": readonly variable\n") -- only in `sh -c` mode; a script keeps going.
-      sh.status = 1; if sh.opt_c then error({ __curse_exit = 1 }) end; return
+    if rb and rb.ro then -- readonly: reject the assignment (status 1); fatal in `sh -c`
+      io.stderr:write("curse: " .. st.name .. ": readonly variable\n") -- or posix mode; a plain script keeps going.
+      sh.status = 1; if sh.opt_c or sh.opt_posix then error({ __curse_exit = 1 }) end; return
     elseif st.index then
       if not sh:array_set(st.name, array_key(sh, st.name, st.index), expand_assign_word(sh, st.rhs), st.append) then
         io.stderr:write("curse: " .. st.name .. ": bad array subscript\n"); sh.status = 1; return
