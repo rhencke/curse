@@ -5,7 +5,19 @@
 --            then OSR into the compiled Lua. Needs $CURSE_LUAJIT (or "luajit").
 --   compiled transpile + load + run (no interpreter window) — steady-state speed.
 --   interp   pure tree-walking interpreter.
-package.path = "lua/?.lua;" .. package.path
+-- Prefer a precompiled bytecode bundle (one file open, no source parsing —
+-- ~1ms/invocation faster). Fall back to loading modules from source if the
+-- bundle is absent or unloadable (e.g. built for a different LuaJIT).
+local bundle = os.getenv("CURSE_BUNDLE") or "dist/curse.bc"
+local bf = io.open(bundle, "rb")
+if bf then
+  bf:close()
+  if not pcall(function() assert(loadfile(bundle))() end) then
+    package.path = "lua/?.lua;" .. package.path
+  end
+else
+  package.path = "lua/?.lua;" .. package.path
+end
 local T = require("tier")
 
 local script = arg[1] or error("usage: run.lua <script.sh> [tiered|compiled|interp]")
