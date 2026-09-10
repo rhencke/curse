@@ -32,7 +32,14 @@ if arg[1] == "-c" then
   io.flush(); os.exit(sh.status or 0)
 end
 
-local script = arg[1] or error("usage: run.lua <script.sh> [tiered|compiled|interp] | -c CODE")
+-- No script (or `-i`): interactive REPL (readline line editing + history).
+if arg[1] == nil or arg[1] == "-i" then
+  sh = T.rt.Shell.new(); sh.argv0 = "curse"
+  require("repl").run(sh)
+  io.flush(); os.exit(sh.status or 0)
+end
+
+local script = arg[1] or error("usage: run.lua <script.sh> [tiered|compiled|interp] | -c CODE | -i")
 local mode = arg[2] or "tiered"
 if mode == "cached" then
   -- persistent artifact cache: warm hit skips parse+emit; cold compiles+stores;

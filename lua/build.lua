@@ -7,7 +7,7 @@
 -- by this build for the exact LuaJIT it ships with (producer == consumer), so the
 -- fragility that rules bytecode out for a portable cache doesn't apply. Run:
 --   luajit lua/build.lua [dist/curse.bc]
-local mods = { "runtime", "parser", "emit", "interp", "tier", "cache" }
+local mods = { "runtime", "parser", "emit", "interp", "tier", "cache", "repl" }
 
 -- Wrap each module's source in a package.preload closure. `require("x")` then
 -- resolves from memory with no file I/O and no parse. Registration is lazy, so

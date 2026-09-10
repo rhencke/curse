@@ -25,6 +25,7 @@ function Shell.new()
     start_time = os.time(), -- for $SECONDS
     opt_e = false,   -- set -e (errexit)
     opt_u = false,   -- set -u (nounset)
+    opt_C = false,   -- set -C (noclobber)
     opt_pipefail = false,
     aliases = {},    -- name -> replacement text (alias builtin)
     shopt = {},      -- shopt option name -> bool (expand_aliases, nullglob, …)
