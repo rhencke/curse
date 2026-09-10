@@ -893,6 +893,18 @@ function Shell:dash_flags()
   return s
 end
 
+-- System hostname (for \h/\H): $HOSTNAME if set, else /proc/sys/kernel/hostname.
+local _hostname
+function M.hostname()
+  if _hostname then return _hostname end
+  _hostname = os.getenv("HOSTNAME")
+  if not _hostname or _hostname == "" then
+    local f = io.open("/proc/sys/kernel/hostname", "r")
+    if f then _hostname = (f:read("*l") or ""):gsub("%s+$", ""); f:close() end
+  end
+  if not _hostname or _hostname == "" then _hostname = "localhost" end
+  return _hostname
+end
 function Shell:prompt_escapes(s)
   local out, i, n = {}, 1, #s
   while i <= n do
@@ -907,8 +919,12 @@ function Shell:prompt_escapes(s)
       elseif d == "w" then out[#out + 1] = self:special_get("PWD"); i = i + 2
       elseif d == "W" then out[#out + 1] = (self:special_get("PWD"):gsub(".*/", "")); i = i + 2
       elseif d == "u" then out[#out + 1] = os.getenv("USER") or "user"; i = i + 2
-      elseif d == "h" then out[#out + 1] = (os.getenv("HOSTNAME") or "curse"):gsub("%..*$", ""); i = i + 2
-      elseif d == "H" then out[#out + 1] = os.getenv("HOSTNAME") or "curse"; i = i + 2
+      elseif d == "h" then out[#out + 1] = M.hostname():gsub("%..*$", ""); i = i + 2
+      elseif d == "H" then out[#out + 1] = M.hostname(); i = i + 2
+      elseif d == "D" and s:sub(i + 2, i + 2) == "{" then -- \D{strftime}
+        local close = s:find("}", i + 3, true)
+        local fmt = s:sub(i + 3, (close or i + 2) - 1)
+        out[#out + 1] = os.date(fmt ~= "" and fmt or "%X"); i = (close or i + 2) + 1
       elseif simple then out[#out + 1] = simple; i = i + 2
       elseif d:match("[0-7]") then
         local oct = s:match("^[0-7][0-7]?[0-7]?", i + 1)
