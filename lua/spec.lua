@@ -73,10 +73,17 @@ local stp = TMP .. "/st"
 -- The Oils harness puts spec/bin (argv.py etc.) on PATH; mirror that so
 -- argv.py-based cases are meaningful for both bash and curse.
 local BINPATH = SPEC .. "/bin:" .. ROOT .. "/.bench-lua/shim" -- argv.py + python2 shim
+-- Cap captured stdout: an unbounded producer (`yes`, `cat /dev/zero`) streams
+-- forever, so pipe through `head -c` — bounding the file AND closing the pipe
+-- early (SIGPIPE) so the case terminates fast instead of running to `timeout`.
+-- The cap is far larger than any real spec output, and applied identically to
+-- both shells, so it never changes a comparison. `$?` is recorded to a separate
+-- file (not the piped stdout) so the real exit status survives the `| head`.
+local CAP = 4000000
 local function run(cmdstr, cwd, shval)
   os.execute("cd " .. cwd .. " && { export LC_ALL=C TMP=" .. cwd .. " TMPDIR=" .. cwd ..
     " SH='" .. shval .. "' CURSE_BUNDLE=" .. BUNDLE .. " PATH=" .. BINPATH .. ":$PATH; timeout " .. TIMEOUT ..
-    " " .. cmdstr .. " ; } >" .. outp .. " 2>/dev/null; echo $? >" .. stp)
+    " " .. cmdstr .. " ; echo $? >" .. stp .. "; } 2>/dev/null | head -c " .. CAP .. " >" .. outp)
   return readfile(outp) or "", tonumber((readfile(stp) or "0"):match("%d+") or "0")
 end
 

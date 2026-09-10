@@ -194,6 +194,33 @@ function M.wexit(s)
   return bit.rshift(bit.band(s, 0xff00), 8)
 end
 
+-- Child side of the ENOEXEC fallback: an executable file with no shebang is a
+-- shell script (bash runs it as one), so resolve it via $PATH exactly as the
+-- failed execvp would, then run it through our own interpreter and _exit. fd 1
+-- must already point where the script's stdout should go. Never returns.
+function Shell:exec_script_child(args, n)
+  local path = args[1]
+  if not path:find("/", 1, true) then -- the FIRST executable match (X_OK), like execvp
+    for dir in (self:get("PATH") .. ":"):gmatch("([^:]*):") do
+      local cand = (dir == "" and "." or dir) .. "/" .. args[1]
+      if C.access(cand, 1) == 0 then path = cand; break end -- 1 == X_OK
+    end
+  end
+  local f = io.open(path, "r"); local src = f and f:read("*a") or ""; if f then f:close() end
+  self.params, self.nparams, self.argv0, self.traps, self.out = {}, 0, args[1], {}, io.write
+  for k = 2, n do self.nparams = self.nparams + 1; self.params[self.nparams] = args[k] end
+  pcall(require("interp").run_lazy, self, src)
+  io.flush(); C._exit(self.status or 0)
+end
+
+-- ENOEXEC fallback for the streaming (non-capturing) path: fd 1 is already the
+-- destination, so just fork a child that runs the script and inherits fd 1.
+function Shell:run_noexec(args, n)
+  local pid = C.fork()
+  if pid == 0 then self:exec_script_child(args, n) end
+  local st = ffi.new("int[1]"); C.waitpid(pid, st, 0); self.status = M.wexit(st[0])
+end
+
 function Shell:exec(...)
   local args = { ... }
   local n = #args
@@ -202,6 +229,21 @@ function Shell:exec(...)
   local anchor = {} -- keep the Lua strings alive while argv points into them
   for i = 1, n do anchor[i] = tostring(args[i]); argv[i - 1] = anchor[i] end
   argv[n] = nil
+  -- Not capturing (self.out is the real fd 1, e.g. a top-level command or a
+  -- pipeline stage): let the child write STRAIGHT to fd 1 (inherit fds) instead
+  -- of buffering all its output — so an unbounded producer (`cat /dev/zero | …`)
+  -- streams and SIGPIPE propagates, and there's no 2x-memory capture.
+  if self.out == io.write then
+    io.flush() -- our own buffered stdout must reach fd 1 before the child writes
+    local pidp = ffi.new("curse_pid_t[1]")
+    local rc = C.posix_spawnp(pidp, args[1], nil, nil, ffi.cast("char *const *", argv), C.environ)
+    if rc == 8 then return self:run_noexec(args, n) end -- no shebang: run as a script
+    if rc ~= 0 then
+      io.stderr:write("curse: " .. tostring(args[1]) .. (rc == 2 and ": command not found\n" or ": Permission denied\n"))
+      self.status = (rc == 2) and 127 or 126; return
+    end
+    local st = ffi.new("int[1]"); C.waitpid(pidp[0], st, 0); self.status = M.wexit(st[0]); return
+  end
   local fds = ffi.new("int[2]")
   if C.pipe(fds) ~= 0 then self.status = 127; return end
   local rfd, wfd = fds[0], fds[1]
@@ -215,22 +257,11 @@ function Shell:exec(...)
   local rc = C.posix_spawnp(pidp, args[1], fa, nil, ffi.cast("char *const *", argv), C.environ)
   C.posix_spawn_file_actions_destroy(fa)
   local pid = pidp[0]
-  if rc == 8 then -- ENOEXEC: an executable file with no shebang — bash runs it as a
-    pid = C.fork()  -- shell script; do the same through our own interpreter, in a child.
+  if rc == 8 then -- ENOEXEC: no-shebang script — run it through our interpreter in a
+    pid = C.fork()  -- child, with its stdout dup'd onto the capture pipe's write end.
     if pid == 0 then
       C.dup2(wfd, 1); C.close(wfd); C.close(rfd)
-      local path = args[1] -- resolve via $PATH the same way the failed exec did:
-      if not path:find("/", 1, true) then -- the FIRST executable match (X_OK), like execvp
-        for dir in (self:get("PATH") .. ":"):gmatch("([^:]*):") do
-          local cand = (dir == "" and "." or dir) .. "/" .. args[1]
-          if C.access(cand, 1) == 0 then path = cand; break end -- 1 == X_OK
-        end
-      end
-      local f = io.open(path, "r"); local src = f and f:read("*a") or ""; if f then f:close() end
-      self.params, self.nparams, self.argv0, self.traps, self.out = {}, 0, args[1], {}, io.write
-      for k = 2, n do self.nparams = self.nparams + 1; self.params[self.nparams] = args[k] end
-      local ok = pcall(require("interp").run_lazy, self, src)
-      io.flush(); C._exit(self.status or 0)
+      self:exec_script_child(args, n)
     end
   end
   C.close(wfd)
