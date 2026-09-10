@@ -617,13 +617,16 @@ local function make_parser(src)
   local function tail_redirs()
     local redirs = {}
     while true do ws(); local r = parse_redir(); if r then redirs[#redirs + 1] = r else break end end
-    collect_heredocs()
     return #redirs > 0 and redirs or nil
   end
   local function skipsep()  -- skip separators: whitespace, newlines, ;, comments
     while i <= n do
       local c = src:sub(i, i)
-      if c == "\n" then line = line + 1; i = i + 1
+      if c == "\n" then
+        -- heredoc bodies opened earlier on this logical line follow this newline,
+        -- in the order the `<<` operators appeared — collect them all here.
+        if #heredocs_pending > 0 then collect_heredocs() -- consumes the newline + bodies
+        else line = line + 1; i = i + 1 end
       elseif c:match("[ \t;]") then i = i + 1
       elseif c == "#" then while i <= n and src:sub(i, i) ~= "\n" do i = i + 1 end
       else break end
@@ -876,7 +879,6 @@ local function make_parser(src)
       local body = parse_stmts({ ["}"] = true })
       local redirs = {}
       while true do ws(); local r = parse_redir(); if r then redirs[#redirs + 1] = r else break end end
-      collect_heredocs()
       return { t = "group", line = line, body = body, redirs = (#redirs > 0 and redirs or nil) }
     end
     if src:sub(i, i) == "(" then
@@ -884,7 +886,6 @@ local function make_parser(src)
       local body = parse_stmts({ [")"] = true })
       local redirs = {}
       while true do ws(); local r = parse_redir(); if r then redirs[#redirs + 1] = r else break end end
-      collect_heredocs()
       return { t = "subshell", line = line, body = body, redirs = (#redirs > 0 and redirs or nil) }
     end
     -- case WORD in  PAT|PAT) BODY ;;  … esac
@@ -1076,8 +1077,6 @@ local function make_parser(src)
         end
       end
     end
-    -- collect any heredoc bodies (they follow this command's line)
-    collect_heredocs()
     if #words == 0 and #redirs == 0 then
       -- no command: the leading assignments are plain (persistent) statements
       if #assigns == 0 then return nil end
@@ -1158,7 +1157,9 @@ local function make_parser(src)
   -- interpreter simply never asks for it if an earlier `exit` fired. (Nested
   -- lists — function bodies, loops — stay strict: a broken body IS a real error.)
   local done = false
+  local queue, qi = {}, 0 -- statements from a heredoc-bearing line, drained in order
   local function next_toplevel()
+    if qi < #queue then qi = qi + 1; return queue[qi] end
     if done then return nil end
     while true do
       skipsep()
@@ -1166,6 +1167,23 @@ local function make_parser(src)
       local start, startline = i, line
       local ok, st = pcall(parse_stmt)
       if not ok then done = true; return { t = "parse_error", line = startline, msg = tostring(st) } end
+      -- Lazy mode executes each statement before parsing the next, but a heredoc's
+      -- body follows the whole LINE's newline. So if this statement opened one,
+      -- parse the rest of the physical line's `;`-separated statements first, then
+      -- collect every body in order — and hand them back one at a time.
+      if ok and #heredocs_pending > 0 then
+        local stmts = { st }
+        while true do
+          while i <= n and src:sub(i, i):match("[ \t;]") do i = i + 1 end
+          if i > n or src:sub(i, i) == "\n" then break end
+          local ok2, st2 = pcall(parse_stmt)
+          if not ok2 or st2 == nil then break end
+          stmts[#stmts + 1] = st2
+        end
+        collect_heredocs() -- now at the newline: reads all pending bodies in order
+        queue, qi = stmts, 1
+        return stmts[1]
+      end
       if st == nil then
         if i <= start then done = true; return nil end -- no progress: stop
       else
