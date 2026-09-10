@@ -26,6 +26,7 @@ ffi.cdef [[
   int setenv(const char *name, const char *value, int overwrite);
   int unsetenv(const char *name);
   void _exit(int status);
+  unsigned int umask(unsigned int mask);
 ]]
 local C = ffi.C
 local statbuf = ffi.new("uint8_t[144]") -- glibc x86-64 struct stat is 144 bytes
@@ -358,7 +359,7 @@ local BUILTINS = {
   exit = 1, cd = 1, unset = 1, export = 1, declare = 1, typeset = 1, set = 1, shift = 1,
   read = 1, getopts = 1, printf = 1, ["local"] = 1, command = 1, type = 1, pwd = 1,
   eval = 1, source = 1, ["."] = 1, ["break"] = 1, ["continue"] = 1, ["true"] = 1,
-  exec = 1, readonly = 1,
+  exec = 1, readonly = 1, umask = 1,
 }
 local KEYWORDS = {
   ["if"] = 1, ["then"] = 1, ["else"] = 1, ["elif"] = 1, ["fi"] = 1, ["for"] = 1,
@@ -465,6 +466,47 @@ local function fmt_decl(sh, name)
     local attr = os.getenv(name) ~= nil and "-x" or "--"
     return "declare " .. attr .. " " .. name .. "=" .. decl_quote(sh:get(name))
   end
+end
+
+-- ---- umask helpers ----
+local function perms_str(bits)
+  return (bit.band(bits, 4) ~= 0 and "r" or "") .. (bit.band(bits, 2) ~= 0 and "w" or "")
+    .. (bit.band(bits, 1) ~= 0 and "x" or "")
+end
+local function umask_symbolic(cur)
+  local allowed = bit.band(bit.bnot(cur), 511)
+  return "u=" .. perms_str(bit.band(bit.rshift(allowed, 6), 7))
+    .. ",g=" .. perms_str(bit.band(bit.rshift(allowed, 3), 7))
+    .. ",o=" .. perms_str(bit.band(allowed, 7))
+end
+-- Parse a umask MODE (octal like 0022, or symbolic like u=rwx,go=rx) against the
+-- current mask; returns the new mask, or nil on a syntax error.
+local function parse_umask(s, cur)
+  if s == "" then return nil end
+  if s:match("^[0-7]+$") then return tonumber(s, 8) % 512 end
+  local allowed = bit.band(bit.bnot(cur), 511) -- symbolic works on allowed perms
+  for clause in s:gmatch("[^,]+") do
+    local who, op, perms = clause:match("^([ugoa]*)([=+-])([rwx]*)$")
+    if not who then return nil end
+    local pv = 0
+    for ch in perms:gmatch(".") do
+      pv = bit.bor(pv, ch == "r" and 4 or ch == "w" and 2 or 1)
+    end
+    if who == "" then who = "a" end
+    local whos = {}
+    for c in who:gmatch(".") do
+      if c == "a" then whos = { "u", "g", "o" }; break else whos[#whos + 1] = c end
+    end
+    for _, wc in ipairs(whos) do
+      local sh4 = wc == "u" and 6 or wc == "g" and 3 or 0
+      local cbits = bit.band(bit.rshift(allowed, sh4), 7)
+      if op == "=" then cbits = pv
+      elseif op == "+" then cbits = bit.bor(cbits, pv)
+      else cbits = bit.band(cbits, bit.band(bit.bnot(pv), 7)) end
+      allowed = bit.bor(bit.band(allowed, bit.band(bit.bnot(bit.lshift(7, sh4)), 511)), bit.lshift(cbits, sh4))
+    end
+  end
+  return bit.band(bit.bnot(allowed), 511)
 end
 
 -- Dispatch one already-expanded simple command (no redirs — the caller sets those
@@ -606,6 +648,26 @@ local function exec_simple(sh, args, hook)
     exec_simple(sh, { unpack(args, 2) }, hook) -- run rest, bypassing functions (approx)
   elseif cmd == "pwd" then
     sh:echo(sh:special_get("PWD")); sh.status = 0
+  elseif cmd == "umask" then
+    -- umask [-S] [MODE]: print (octal or -S symbolic) or set the file-creation mask.
+    local sflag, badflag, pos = false, false, {}
+    for j = 2, #args do
+      local a = args[j]
+      if a == "-S" then sflag = true
+      elseif a == "-p" then -- print in reusable form: accept, treat like plain
+      elseif a:sub(1, 1) == "-" and #a > 1 then badflag = true
+      else pos[#pos + 1] = a end
+    end
+    local cur = tonumber(C.umask(0)) % 512; C.umask(cur)
+    if badflag then io.stderr:write("curse: umask: invalid option\n"); sh.status = 1
+    elseif #pos > 1 then io.stderr:write("curse: umask: too many arguments\n"); sh.status = 1
+    elseif #pos == 0 then
+      sh:echo(sflag and umask_symbolic(cur) or string.format("%04o", cur)); sh.status = 0
+    else
+      local m = parse_umask(pos[1], cur)
+      if m == nil then io.stderr:write("curse: umask: `" .. pos[1] .. "': invalid symbolic mode\n"); sh.status = 1
+      else C.umask(m); sh.status = 0 end
+    end
   elseif cmd == "getopts" then
     -- getopts OPTSTRING NAME [args…]: parse one option per call using OPTIND (+ an
     -- internal char cursor for bundled opts); sets NAME, OPTARG; status 1 when done.
