@@ -35,6 +35,16 @@ local TIMEOUT = 2 -- cases are tiny; this only bounds hangs (e.g. `while true`)
 local TMP = (os.getenv("TMPDIR") or "/tmp") .. "/curse-spec-" .. tostring(os.time())
 os.execute("mkdir -p " .. TMP)
 
+-- $SH must be a SINGLE command for tests that use it quoted (`"$SH" -c …`), like
+-- Oils' single-binary shells. curse is `luajit run.lua`, so wrap it in a tiny
+-- exec script and hand tests that path.
+local SH = TMP .. "/curse"
+do
+  local f = io.open(SH, "w")
+  f:write("#!/bin/sh\nexport CURSE_BUNDLE=" .. BUNDLE .. "\nexec " .. LUAJIT .. " " .. RUNLUA .. ' "$@"\n')
+  f:close(); os.execute("chmod +x " .. SH)
+end
+
 local function readfile(p) local f = io.open(p, "r"); if not f then return nil end local s = f:read("*a"); f:close(); return s end
 
 -- ---- case parser (mirrors test/spec/run.mts exactly) ----
@@ -105,7 +115,7 @@ for _, path in ipairs(files) do
     write_code(c.code)
     local bout, bst = run("bash " .. codep, cwd, "bash")
     os.execute("rm -rf " .. cwd .. "/*  2>/dev/null")
-    local cout, cst = run(curse_cmd(), cwd, LUAJIT .. " " .. RUNLUA)
+    local cout, cst = run(curse_cmd(), cwd, SH)
     os.execute("rm -rf " .. cwd .. "/* 2>/dev/null")
     if bout == cout and bst == cst then
       pass = pass + 1
