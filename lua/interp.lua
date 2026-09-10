@@ -284,6 +284,7 @@ end
 local function is_multi(p)
   if not p.pexp then return p.special == "@" or p.special == "*" end
   if p.pexp.op == "len" then return false end
+  if p.pexp.op == "prefix" then return true end -- ${!pfx@} / ${!pfx*}
   return p.pexp.index == "@" or p.pexp.index == "*"
 end
 -- arith-evaluate a slice offset/length expression (e.g. "i-4", "(-4)", "2").
@@ -312,6 +313,7 @@ local function multi_elems(sh, p) -- returns element list, star?
       for i = 1, #ix do t[i] = tostring(ix[i]) end
       return t, star
     end
+    if pe.op == "prefix" then return sh:var_prefix_names(pe.name), pe.star end
     local els = sh:array_values(pe.name)
     if pe.op == "sub" then -- array slice
       local off = arith_int(sh, pe.arg and expand_word(sh, P.parse_word(pe.arg)) or nil)

@@ -200,8 +200,10 @@ local function parse_paramexp(inner)
     if close then index = rest:sub(2, close - 1); rest = rest:sub(close + 1) end
   end
   if indices then
-    -- ${!a[@]}/${!a[*]} = the keys; ${!name} = indirect (value of the var named by name)
+    -- ${!a[@]}/${!a[*]} = keys; ${!pfx@}/${!pfx*} = var names with that prefix;
+    -- ${!name} = indirect (value of the var named by name)
     if index == "@" or index == "*" then return { pexp = { name = name, op = "indices", index = index } } end
+    if rest == "*" or rest == "@" then return { pexp = { name = name, op = "prefix", star = (rest == "*") } } end
     return { pexp = { name = name, op = "indirect", index = index } }
   end
   if lenpfx then return { pexp = { name = name, op = "len", index = index } } end

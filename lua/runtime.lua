@@ -441,6 +441,13 @@ function Shell:array_get(name, key)
   if key == 0 then return self:get(name) end
   return ""
 end
+-- Sorted variable names beginning with `pfx` (for ${!pfx@} / ${!pfx*}).
+function Shell:var_prefix_names(pfx)
+  local t = {}
+  for k in pairs(self.vars) do if k:sub(1, #pfx) == pfx then t[#t + 1] = k end end
+  table.sort(t)
+  return t
+end
 -- Is element [key] set? (distinct from "" — for [[ -v a[k] ]]).
 function Shell:is_elem_set(name, key)
   local b = self.vars[self:deref(name)]
@@ -672,6 +679,7 @@ function Shell:expand_param(pe, arg, arg2, idxnum)
     local idx = self:array_indices(name)
     return table.concat(idx, " ")
   end
+  if op == "prefix" then return table.concat(self:var_prefix_names(name), " ") end
   -- ${!name}: indirect. For a nameref, bash INVERTS this to yield the target NAME;
   -- otherwise it's the value of the variable named by $name.
   if op == "indirect" then
