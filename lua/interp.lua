@@ -280,9 +280,25 @@ end
 
 -- Expand a word to a single string (assignment RHS, case subject, arith index —
 -- contexts that do NOT word-split).
+-- Tilde expansion on a word-initial unquoted literal: ~ / ~/… -> $HOME, ~+ -> PWD,
+-- ~- -> OLDPWD (~user is left alone).
+local function tilde_prefix(sh, s)
+  if s:sub(1, 1) ~= "~" then return s end
+  local r = s:sub(2)
+  if r == "" or r:sub(1, 1) == "/" then local h = sh:get("HOME"); return h ~= "" and (h .. r) or s end
+  if (r == "+" or r:sub(1, 2) == "+/") then return sh:special_get("PWD") .. r:sub(2) end
+  if (r == "-" or r:sub(1, 2) == "-/") then local o = sh:get("OLDPWD"); return o ~= "" and (o .. r:sub(2)) or s end
+  return s
+end
+M.tilde_prefix = tilde_prefix
+
 expand_word = function(sh, w)
   local buf = {}
-  for _, p in ipairs(w.parts) do buf[#buf + 1] = expand_part_str(sh, p) end
+  for k, p in ipairs(w.parts) do
+    local s = expand_part_str(sh, p)
+    if k == 1 and p.lit ~= nil and not p.q then s = tilde_prefix(sh, s) end
+    buf[#buf + 1] = s
+  end
   return table.concat(buf)
 end
 
@@ -379,7 +395,7 @@ local function expand_to_fields(sh, w)
       end
     end
   end
-  for _, p in ipairs(w.parts) do
+  for pi, p in ipairs(w.parts) do
     if is_multi(p) then
       local els, star = multi_elems(sh, p)
       if p.q then
@@ -390,6 +406,7 @@ local function expand_to_fields(sh, w)
       end
     else
       local s = expand_part_str(sh, p)
+      if pi == 1 and p.lit ~= nil and not p.q then s = tilde_prefix(sh, s) end -- word-initial ~
       if p.q or p.lit ~= nil then add(s, not p.q) else feed_split(s) end
     end
   end

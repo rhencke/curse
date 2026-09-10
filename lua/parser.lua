@@ -992,7 +992,7 @@ local function make_parser(src)
         local elems = parse_array_elems()
         return { t = "arrayassign", name = name, elems = elems, append = (op == "+=") }
       end
-      local raw = word()
+      local raw = word(true) -- stop at unquoted ) so `(x=2)` closes the subshell
       if not subidx and op == "=" and raw:sub(1, 3) == "$((" and raw:sub(-2) == "))" then
         return { t = "assign", name = name, arith = arith(raw:sub(4, -3)) }
       end
