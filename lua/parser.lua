@@ -260,6 +260,15 @@ local function parse_word(w)
 end
 M.parse_word = parse_word
 
+-- Parse a heredoc body as double-quote content: $… expands, but quotes are
+-- literal (a heredoc doesn't treat ' or " specially). Used when the delimiter
+-- was unquoted; a quoted delimiter means no expansion (raw body).
+function M.parse_heredoc(body)
+  local parts = {}
+  parse_dquote(body, function(p) parts[#parts + 1] = p end)
+  return { k = "word", parts = parts }
+end
+
 -- Parse a [[ … ]] token list into a boolean-expression AST:
 --   {kind="and"/"or", l, r} | {kind="not", e} | {kind="str", word}
 --   {kind="unary", op, word} | {kind="binary", op, l, r, rq}
@@ -449,6 +458,7 @@ end
 function M.parse(src)
   local i, n, line = 1, #src, 1
   local loopId = 0
+  local heredocs_pending = {} -- heredoc redirs awaiting their body (filled at line end)
   local function ws()  -- skip spaces/tabs (not newlines)
     while i <= n and src:sub(i, i):match("[ \t]") do i = i + 1 end
   end
@@ -518,7 +528,20 @@ function M.parse(src)
       elseif src:sub(q, q + 1) == ">>" then op = "app"; tfd = fd and tonumber(fd) or 1; q = q + 2
       else op = "out"; tfd = fd and tonumber(fd) or 1; q = q + 1 end
     elseif c == "<" then
-      if src:sub(q, q + 1) == "<<" then return nil end -- heredoc/herestring: not here
+      if src:sub(q, q + 2) == "<<<" then -- herestring: <<< word
+        i = q + 3; ws()
+        return { op = "herestring", fd = 0, word = word() } -- raw word (expanded at runtime)
+      end
+      if src:sub(q, q + 1) == "<<" then -- heredoc: <<[-] DELIM  (body collected after the line)
+        local strip = false; q = q + 2
+        if src:sub(q, q) == "-" then strip = true; q = q + 1 end
+        i = q; ws()
+        local draw = word()
+        local quoted = draw:sub(1, 1) == "'" or draw:sub(1, 1) == '"'
+        local r = { op = "heredoc", fd = 0, delim = unquote(draw), expand = not quoted, strip = strip }
+        heredocs_pending[#heredocs_pending + 1] = r
+        return r
+      end
       if src:sub(q, q + 1) == "<&" then op = "dupin"; tfd = fd and tonumber(fd) or 0; q = q + 2
       else op = "in"; tfd = fd and tonumber(fd) or 0; q = q + 1 end
     elseif c == "&" and src:sub(q, q + 1) == "&>" then op = "outboth"; tfd = 1; q = q + 2
@@ -734,6 +757,24 @@ function M.parse(src)
         if w == "" then break end
         add_word(words, w)
       end
+    end
+    -- collect any heredoc bodies (they follow this command's line)
+    if #heredocs_pending > 0 then
+      while i <= n and src:sub(i, i) ~= "\n" do i = i + 1 end -- to end of command line
+      if i <= n then i = i + 1; line = line + 1 end
+      for _, hd in ipairs(heredocs_pending) do
+        local blines = {}
+        while i <= n do
+          local le = src:find("\n", i, true) or (n + 1)
+          local lstr = src:sub(i, le - 1)
+          if hd.strip then lstr = lstr:gsub("^\t+", "") end
+          i = le + 1; line = line + 1
+          if lstr == hd.delim then break end
+          blines[#blines + 1] = lstr
+        end
+        hd.body = #blines > 0 and (table.concat(blines, "\n") .. "\n") or ""
+      end
+      heredocs_pending = {}
     end
     if #words == 0 and #redirs == 0 then return nil end
     return { t = "simple", line = ln, words = words, redirs = (#redirs > 0 and redirs or nil) }

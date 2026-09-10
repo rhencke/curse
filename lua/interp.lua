@@ -230,13 +230,30 @@ local exec_list  -- forward
 -- ---- redirections ----
 -- Apply a command's redirs, saving fds 0/1/2 for restore. open flags: 577 =
 -- O_WRONLY|O_CREAT|O_TRUNC, 1089 = |O_APPEND, 0 = O_RDONLY; mode 0644.
-local function apply_redirs(redirs)
+-- Feed a string as a command's stdin (heredoc/herestring): write to a temp file,
+-- open it, dup2 onto fd 0, unlink (the open fd keeps the inode alive).
+local function feed_stdin(fd, body)
+  local tmp = os.tmpname()
+  local w = io.open(tmp, "w"); if w then w:write(body); w:close() end
+  local f = C.open(tmp, 0, 0)
+  if f >= 0 then C.dup2(f, fd); C.close(f) end
+  os.remove(tmp)
+end
+local function apply_redirs(sh, redirs)
   local save = { C.dup(0), C.dup(1), C.dup(2) }
   for _, r in ipairs(redirs) do
     if r.op == "out" then local f = C.open(r.target, 577, 420); if f >= 0 then C.dup2(f, r.fd); C.close(f) end
     elseif r.op == "app" then local f = C.open(r.target, 1089, 420); if f >= 0 then C.dup2(f, r.fd); C.close(f) end
     elseif r.op == "in" then local f = C.open(r.target, 0, 0); if f >= 0 then C.dup2(f, r.fd); C.close(f) end
     elseif r.op == "outboth" then local f = C.open(r.target, 577, 420); if f >= 0 then C.dup2(f, 1); C.dup2(f, 2); C.close(f) end
+    elseif r.op == "heredoc" then
+      local P = require("parser")
+      local body = r.expand and expand_word(sh, P.parse_heredoc(r.body or "")) or (r.body or "")
+      feed_stdin(r.fd or 0, body)
+    elseif r.op == "herestring" then
+      local P = require("parser")
+      local body = expand_word(sh, P.parse_word(r.word or "")) .. "\n"
+      feed_stdin(r.fd or 0, body)
     elseif r.op == "dup" or r.op == "dupin" then
       if r.target == "-" then C.close(r.fd) else local m = tonumber(r.target); if m then C.dup2(m, r.fd) end end
     end
@@ -399,7 +416,7 @@ local function exec_stmt(sh, st, hook)
     end
     if st.redirs then
       -- reconfigure fds and route builtin output (sh.out) to fd 1 for the command
-      local save, savedout = apply_redirs(st.redirs), sh.out
+      local save, savedout = apply_redirs(sh, st.redirs), sh.out
       sh.out = io.write
       local ok, err = pcall(exec_simple, sh, args, hook)
       io.flush(); sh.out = savedout; restore_redirs(save)
