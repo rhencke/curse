@@ -164,7 +164,11 @@ local expand_word -- forward (expand_part_str expands pexp args via it)
 local function array_key(sh, name, index_raw)
   local P = require("parser")
   if sh:is_assoc(name) then return expand_word(sh, P.parse_word(index_raw)) end
-  return tonumber(rt.i64_to_str(eval(sh, P.arith(index_raw)))) or 0
+  -- indexed: expand $()/$vars in the subscript, then evaluate it as arithmetic
+  local ex = expand_word(sh, P.parse_word(index_raw))
+  if ex == "" then return 0 end
+  local ok, v = pcall(function() return tonumber(rt.i64_to_str(eval(sh, P.arith(ex)))) end)
+  return (ok and v) or 0
 end
 
 -- Expand ONE part to its string value (a multi-element @/* part is joined here;
@@ -376,7 +380,15 @@ local function exec_simple(sh, args, hook)
     local dir = args[2] or os.getenv("HOME") or ""
     sh.status = (C.chdir(dir) == 0) and 0 or 1
   elseif cmd == "unset" then
-    for j = 2, #args do sh.vars[args[j]] = nil end
+    for j = 2, #args do
+      local a = args[j]
+      if a:sub(1, 1) == "-" and #a > 1 then -- -v/-f flags: ignore
+      else
+        local nm, sub = a:match("^([%a_][%w_]*)%[(.+)%]$")
+        if nm then sh:array_unset(nm, array_key(sh, nm, sub))
+        else sh.vars[a] = nil end
+      end
+    end
     sh.status = 0
   elseif cmd == "export" or cmd == "declare" or cmd == "typeset" then
     -- export/declare [-A] NAME[=val]…: set the var; export also pushes to the

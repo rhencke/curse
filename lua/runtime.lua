@@ -366,17 +366,31 @@ function Shell:array_assign(name, values, append)
     for i = 1, #values do b.arr[i - 1] = values[i] end
   end
 end
+-- Negative indexed subscripts count from the highest set index (bash: a[-1] is
+-- the last element). Assoc keys (strings) are used as-is.
+local function norm_key(b, key)
+  if type(key) == "number" and key < 0 and not (b and b.assoc) then
+    return (b and b.arr and arr_max(b.arr) or -1) + 1 + key
+  end
+  return key
+end
 function Shell:array_set(name, key, val, append)
   local b = box(name, self.vars)
   if not b.arr then b.arr = {}; if b.s then b.arr[0] = b.s end; b.s = nil; b.n = nil end
+  key = norm_key(b, key)
   if b.assoc and b.arr[key] == nil then b.order[#b.order + 1] = key end
   if append then b.arr[key] = (b.arr[key] or "") .. val else b.arr[key] = val end
 end
 function Shell:array_get(name, key)
   local b = self.vars[name]
-  if b and b.arr then return b.arr[key] or "" end
+  if b and b.arr then return b.arr[norm_key(b, key)] or "" end
   if key == 0 then return self:get(name) end
   return ""
+end
+-- unset a single element a[key] (negative allowed for indexed).
+function Shell:array_unset(name, key)
+  local b = self.vars[name]
+  if b and b.arr then b.arr[norm_key(b, key)] = nil end
 end
 -- bash iterates an assoc array in HASH-TABLE order, not insertion order: the
 -- key's FNV-1 32-bit hash (over its bytes) picks one of 1024 buckets, buckets are
