@@ -966,8 +966,15 @@ local function make_parser(src)
       local p = i + #name
       local subidx = nil
       if src:sub(p, p) == "[" then
-        local close = src:find("]", p + 1, true)
-        if close and src:sub(close + 1, close + 1):match("[+=]") then subidx = src:sub(p + 1, close - 1); p = close + 1 end
+        -- find the MATCHING ] (subscript may contain nested [ ] via ${a[i]})
+        local depth, q = 1, p + 1
+        while q <= n and depth > 0 do
+          local ch = src:sub(q, q)
+          if ch == "[" then depth = depth + 1 elseif ch == "]" then depth = depth - 1 end
+          if depth == 0 then break end
+          q = q + 1
+        end
+        if depth == 0 and src:sub(q + 1, q + 1):match("[+=]") then subidx = src:sub(p + 1, q - 1); p = q + 1 end
       end
       local op = nil
       if src:sub(p, p + 1) == "+=" then op = "+="; p = p + 2
