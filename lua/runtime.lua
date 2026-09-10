@@ -549,6 +549,10 @@ function Shell:import_env()
   if self.vars["PATH"] == nil then
     self:set_str("PATH", "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin")
   end
+  -- Shell-maintained vars bash always defines even with `env -i` and no rc file.
+  if self.vars["IFS"] == nil then self:set_str("IFS", " \t\n") end
+  if self.vars["PS4"] == nil then self:set_str("PS4", "+ ") end
+  if self.vars["SHELLOPTS"] == nil then self:set_str("SHELLOPTS", "braceexpand:hashall") end
 end
 
 -- Arithmetic write: store the int64, defer the string (lazy).
