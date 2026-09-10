@@ -214,7 +214,12 @@ local function parse_paramexp(inner)
     -- ${!ref OP arg}: capture the trailing operator to apply to the resolved target
     return { pexp = { name = name, op = "indirect", index = index, iop = (rest ~= "" and rest or nil) } }
   end
-  if lenpfx then return { pexp = { name = name, op = "len", index = index } } end
+  if lenpfx then
+    -- ${#x} / ${#a[@]} only; a trailing operator (${#a[0]/1/x}) can't combine with
+    -- the length prefix — bash rejects it as a bad substitution.
+    if rest ~= "" then return { pexp = { name = name, op = "badsubst", raw = "#" .. inner } } end
+    return { pexp = { name = name, op = "len", index = index } }
+  end
   if rest == "" then
     if index then return { pexp = { name = name, index = index } } end -- ${a[i]}
     if name:match("^%d+$") then return { param = tonumber(name) } end
