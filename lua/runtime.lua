@@ -243,6 +243,38 @@ local function str_to_i64(s)
 end
 M.str_to_i64 = str_to_i64
 
+-- Arithmetic numeric literal / value: like str_to_i64 but with bash arith bases —
+-- base#digits (2-64), 0x/0X hex, leading-0 octal. Used ONLY in arithmetic
+-- contexts ($(( )), arith var reads); `test` stays decimal (str_to_i64).
+local function digit_val(ch)
+  local b = ch:byte()
+  if b >= 48 and b <= 57 then return b - 48 end        -- 0-9
+  if b >= 97 and b <= 122 then return b - 97 + 10 end  -- a-z -> 10..35
+  if b >= 65 and b <= 90 then return b - 65 + 10 end   -- A-Z -> 10..35 (base<=36)
+  return nil
+end
+local function arith_num(s)
+  if s == nil or s == "" then return i64(0) end
+  s = s:match("^%s*(.-)%s*$")
+  local sign = 1
+  if s:sub(1, 1) == "-" then sign = -1; s = s:sub(2) elseif s:sub(1, 1) == "+" then s = s:sub(2) end
+  local base, digits = 10, nil
+  local b, d = s:match("^(%d+)#(.+)$")
+  if b then base = tonumber(b); digits = d
+  elseif s:sub(1, 2):lower() == "0x" then base = 16; digits = s:sub(3)
+  elseif s:sub(1, 1) == "0" and s:match("^0[0-7]+$") then base = 8; digits = s:sub(2)
+  else digits = s:match("^%d+") or "" end
+  if digits == "" or base < 2 or base > 64 then return sign < 0 and -str_to_i64(s) or str_to_i64(s) end
+  local n, B = i64(0), i64(base)
+  for k = 1, #digits do
+    local dv = digit_val(digits:sub(k, k))
+    if not dv or dv >= base then break end
+    n = n * B + i64(dv)
+  end
+  return sign < 0 and -n or n
+end
+M.arith_num = arith_num
+
 -- int64 integer power (** operator), shared by interp and compiled.
 function M.ipow(base, exp)
   local r, n = i64(1), tonumber(exp)
@@ -295,7 +327,7 @@ end
 function Shell:aget(name)
   local b = self.vars[name]
   if b == nil then return i64(0) end
-  if b.n == nil then b.n = str_to_i64(b.s) end
+  if b.n == nil then b.n = M.arith_num(b.s) end -- arith context: honor bases (0x, 010, N#)
   return b.n
 end
 

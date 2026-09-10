@@ -51,7 +51,11 @@ local function arith(src)
       return { k = "var", name = ident() } -- $name same as name in arith
     end
     if c:match("%d") then
-      local s, e = src:find("^%d+", i); i = e + 1
+      -- base#digits / 0xHEX / decimal-or-octal
+      local s, e = src:find("^%d+#[%w@_]+", i)
+      if not s then s, e = src:find("^0[xX]%x+", i) end
+      if not s then s, e = src:find("^%d+", i) end
+      i = e + 1
       return { k = "num", v = src:sub(s, e) }
     end
     -- a name: could be a var, an assignment (name=…, name+=…), or i++/i--

@@ -97,7 +97,7 @@ end
 local eval  -- arithmetic evaluator (forward decl)
 eval = function(sh, e)
   local k = e.k
-  if k == "num" then return rt.str_to_i64(e.v) end
+  if k == "num" then return rt.arith_num(e.v) end
   if k == "var" then return sh:aget(e.name) end
   if k == "param" then return rt.str_to_i64(sh:param(e.n)) end
   if k == "un" then

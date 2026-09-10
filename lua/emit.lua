@@ -79,7 +79,10 @@ end
 local emit_value
 emit_value = function(e, lifted)
   local k = e.k
-  if k == "num" then return e.v .. "LL" end
+  if k == "num" then
+    if e.v:match("^%d+$") and (e.v == "0" or e.v:sub(1, 1) ~= "0") then return e.v .. "LL" end
+    return ("rt.arith_num(%q)"):format(e.v) -- 0x.. / 010 octal / N#.. bases
+  end
   if k == "raw" then return e.code end -- a pre-computed Lua expr (inlined param binding)
   if k == "var" then return lifted[e.name] and lname(e.name) or ("sh:aget(%q)"):format(e.name) end
   if k == "param" then return ("rt.str_to_i64(sh:param(%d))"):format(e.n) end
