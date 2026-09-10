@@ -23,6 +23,7 @@ ffi.cdef [[
   int dup2(int oldfd, int newfd);
   int dup(int oldfd);
   int open(const char *path, int flags, unsigned int mode);
+  int setenv(const char *name, const char *value, int overwrite);
   void _exit(int status);
 ]]
 local C = ffi.C
@@ -265,6 +266,18 @@ local function exec_simple(sh, args, hook)
   elseif cmd == "unset" then
     for j = 2, #args do sh.vars[args[j]] = nil end
     sh.status = 0
+  elseif cmd == "export" or cmd == "declare" or cmd == "typeset" then
+    -- export/declare NAME[=val]…: set the var and push to the process env so
+    -- posix_spawn children inherit it. Flags (-x/-i/…) are skipped.
+    for j = 2, #args do
+      local a = args[j]
+      if a:sub(1, 1) ~= "-" then
+        local nm, val = a:match("^([%a_][%w_]*)=(.*)$")
+        if nm then sh:set_str(nm, val); C.setenv(nm, val, 1)
+        elseif a:match("^[%a_][%w_]*$") then C.setenv(a, sh:get(a), 1) end
+      end
+    end
+    sh.status = 0
   elseif cmd == "set" then
     -- set -- ARGS / set ARGS: replace positional params. Options (-e/-o/…) accepted, ignored.
     if args[2] == "--" or (args[2] and args[2]:sub(1, 1) ~= "-") then
@@ -274,6 +287,43 @@ local function exec_simple(sh, args, hook)
       sh.params = np; sh.nparams = n
     end
     sh.status = 0
+  elseif cmd == "read" then
+    -- read [-r] [-a arr] [-p prompt] VAR...  (line from stdin, split on IFS)
+    local raw, arr, j = false, nil, 2
+    while j <= #args do
+      local a = args[j]
+      if a == "-r" then raw = true; j = j + 1
+      elseif a == "-a" then arr = args[j + 1]; j = j + 2
+      elseif a == "-p" then j = j + 2 -- prompt: no tty, skip
+      elseif a:sub(1, 1) == "-" and #a > 1 then j = j + 1 -- ignore -n/-d/-s/…
+      else break end
+    end
+    local vars = {}
+    for k = j, #args do vars[#vars + 1] = args[k] end
+    local line = io.read("*l")
+    if line == nil then
+      sh.status = 1 -- EOF
+    else
+      if not raw then line = line:gsub("\\(.)", "%1") end
+      local fields = {}
+      for tok in line:gmatch("%S+") do fields[#fields + 1] = tok end
+      if arr then
+        sh:array_assign(arr, fields, false)
+      elseif #vars == 0 then
+        sh:set_str("REPLY", line)
+      else
+        for k = 1, #vars do
+          if k < #vars then
+            sh:set_str(vars[k], fields[k] or "")
+          else
+            local rest = {}
+            for m = k, #fields do rest[#rest + 1] = fields[m] end
+            sh:set_str(vars[k], table.concat(rest, " "))
+          end
+        end
+      end
+      sh.status = 0
+    end
   elseif cmd == "shift" then
     local nn = tonumber(args[2]) or 1
     if nn > sh.nparams then nn = sh.nparams end
@@ -374,6 +424,11 @@ local function exec_stmt(sh, st, hook)
       if not go then break end
       exec_list(sh, st.body, hook, false)
     end
+  elseif t == "parse_error" then
+    -- Reached the unparseable tail (e.g. a makeself binary payload) — bash would
+    -- syntax-error here too. If an earlier exit fired, we never get here.
+    io.stderr:write("curse: syntax error" .. (st.line and (": line " .. st.line) or "") .. "\n")
+    error({ __curse_exit = 2 })
   elseif t == "arithcmd" then
     sh.status = truth(eval(sh, st.expr)) and 0 or 1
   elseif t == "dbracket" then

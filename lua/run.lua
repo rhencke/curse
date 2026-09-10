@@ -23,21 +23,22 @@ local T = require("tier")
 local script = arg[1] or error("usage: run.lua <script.sh> [tiered|compiled|interp]")
 local mode = arg[2] or "tiered"
 
+local sh
 if mode == "cached" then
   -- persistent artifact cache: warm hit skips parse+emit; cold compiles+stores;
   -- any cache failure falls back to running uncached. This is the CLI/build/boot
   -- path (one-shot invocations that recur), reported on stderr for visibility.
   local Cache = require("cache")
   local f = assert(io.open(script, "r")); local src = f:read("*a"); f:close()
-  local sh = T.rt.Shell.new()
+  sh = T.rt.Shell.new()
   local _, how = Cache.run(src, sh)
   if os.getenv("CURSE_CACHE_DEBUG") then io.stderr:write("[cache: " .. how .. "]\n") end
 elseif mode == "tiered" then
-  T.run_background(script, { luajit = os.getenv("CURSE_LUAJIT") or "luajit" })
+  sh = T.run_background(script, { luajit = os.getenv("CURSE_LUAJIT") or "luajit" })
 else
   local f = assert(io.open(script, "r")); local src = f:read("*a"); f:close()
   local ast = T.parser.parse(src)
-  local sh = T.rt.Shell.new()
+  sh = T.rt.Shell.new()
   if mode == "compiled" then
     T.compile(ast).run(sh, nil)
   elseif mode == "interp" then
@@ -46,3 +47,8 @@ else
     error("unknown mode: " .. mode)
   end
 end
+
+-- Propagate $? as the process exit code (so `exit N`, `false`, etc. are visible
+-- to the caller — and to the spec runner). Flush buffered stdout first.
+io.flush()
+os.exit(sh and sh.status or 0)

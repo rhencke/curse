@@ -798,7 +798,30 @@ function M.parse(src)
     end
   end
 
-  return { stmts = (parse_stmts({})) }
+  -- Top-level parse is ERROR-TOLERANT (bash is lazy): if a top-level statement
+  -- fails to parse — e.g. the appended binary payload of a self-extracting
+  -- installer (makeself), which the shell part exits before ever reaching — we
+  -- stop and append a deferred `parse_error` node instead of failing the whole
+  -- program. If execution reaches that node it errors like bash (stderr + exit
+  -- 2); if an earlier `exit`/`return` fires first, no harm. (Nested lists —
+  -- function bodies, loops — stay strict: a broken body IS a real error.)
+  local stmts = {}
+  while true do
+    skipsep()
+    if i > n then break end
+    local start, startline = i, line
+    local ok, st = pcall(parse_stmt)
+    if not ok then
+      stmts[#stmts + 1] = { t = "parse_error", line = startline, msg = tostring(st) }
+      break
+    end
+    if st == nil then
+      if i <= start then break end -- no progress: stop (avoid a spin)
+    else
+      stmts[#stmts + 1] = st
+    end
+  end
+  return { stmts = stmts }
 end
 
 return M

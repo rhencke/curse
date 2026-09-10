@@ -509,7 +509,8 @@ end
 local function assert_compilable(stmts)
   for _, st in ipairs(stmts) do
     local t = st.t
-    if t == "arithcmd" then error("curse-nocompile: (( )) command")
+    if t == "parse_error" then error("curse-nocompile: parse_error (deferred)")
+    elseif t == "arithcmd" then error("curse-nocompile: (( )) command")
     elseif t == "andor" then error("curse-nocompile: && / || list")
     elseif t == "pipeline" then error("curse-nocompile: pipeline")
     elseif t == "case" then error("curse-nocompile: case")
@@ -530,9 +531,9 @@ local function assert_compilable(stmts)
       if st.redirs then error("curse-nocompile: redirection") end
       local w1 = st.words[1]
       local cmd = w1 and w1.parts[1] and w1.parts[1].lit
-      if cmd == "test" or cmd == "[" or cmd == "exit" or cmd == "cd" or cmd == "unset" then
-        error("curse-nocompile: builtin " .. cmd)
-      end
+      local BUILTIN = { test = 1, ["["] = 1, exit = 1, cd = 1, unset = 1,
+        set = 1, shift = 1, read = 1, export = 1, declare = 1, typeset = 1 }
+      if BUILTIN[cmd] then error("curse-nocompile: builtin " .. cmd) end
     end
   end
 end
