@@ -98,35 +98,83 @@ function Shell:split(s)
   return out
 end
 
--- Run an external command: argv... are already-expanded strings. Captured stdout
--- goes to sh.out (so it composes with $(...) capture); the exit status is read
--- back via a rare-byte marker the command prints (LuaJIT's io.popen doesn't
--- report it). stderr is inherited (not captured yet). A real backend would
--- execvp via an FFI/C binding instead of routing through /bin/sh.
-local function shquote(s)
-  return "'" .. tostring(s):gsub("'", "'\\''") .. "'"
-end
+-- Run an external command via fork + execvp + waitpid (FFI/libc directly — NOT
+-- /bin/sh, which would recurse when curse IS /bin/sh, and would lose signal
+-- info). argv... are already-expanded strings. stdout is captured through a pipe
+-- and written to sh.out (so it composes with $(...) capture); $? is the exact
+-- exit status, or 128+signum when the command is killed — like bash. (stderr is
+-- inherited for now; redirection via dup2 comes with the fd model.)
+local ffi = require("ffi")
+local bit = require("bit")
+ffi.cdef [[
+  int fork(void);
+  int execvp(const char *file, char *const argv[]);
+  int waitpid(int pid, int *wstatus, int options);
+  int pipe(int fildes[2]);
+  int close(int fd);
+  int dup2(int oldfd, int newfd);
+  long read(int fd, void *buf, unsigned long count);
+  void _exit(int status);
+]]
+local C = ffi.C
+
 function Shell:exec(...)
-  local argv = { ... }
-  if #argv == 0 or argv[1] == "" then self.status = 127; return end
-  local parts = {}
-  for i = 1, #argv do parts[i] = shquote(argv[i]) end
-  local f = io.popen(table.concat(parts, " ") .. "; printf '\1%d\1' \"$?\"", "r")
-  local out = f:read("*a") or ""
-  f:close()
-  local body, code = out:match("^(.*)\1(%d+)\1$")
-  if code then self.status = tonumber(code); out = body else self.status = 0 end
+  local args = { ... }
+  local n = #args
+  if n == 0 or args[1] == "" then self.status = 127; return end
+  -- build argv in the PARENT (no Lua allocation in the child after fork)
+  local argv = ffi.new("const char*[?]", n + 1)
+  local anchor = {} -- keep the Lua strings alive while argv points into them
+  for i = 1, n do anchor[i] = tostring(args[i]); argv[i - 1] = anchor[i] end
+  argv[n] = nil
+  local fds = ffi.new("int[2]")
+  if C.pipe(fds) ~= 0 then self.status = 127; return end
+  local rfd, wfd = fds[0], fds[1]
+  local pid = C.fork()
+  if pid == 0 then -- child: stdout -> pipe, then exec. This block must NEVER
+    -- return into the interpreter (that would fork-bomb: a child that keeps
+    -- running the script), so guard it — ANY failure ends in _exit, not unwind.
+    pcall(function()
+      C.dup2(wfd, 1); C.close(rfd); C.close(wfd)
+      C.execvp(args[1], ffi.cast("char *const *", argv)) -- replaces the process on success
+    end)
+    C._exit(127) -- reached only if exec failed (command not found / threw)
+  end
+  C.close(wfd)
+  local buf = ffi.new("char[65536]")
+  local chunks = {}
+  while true do
+    local nr = C.read(rfd, buf, 65536)
+    if nr <= 0 then break end
+    chunks[#chunks + 1] = ffi.string(buf, nr)
+  end
+  C.close(rfd)
+  local st = ffi.new("int[1]")
+  C.waitpid(pid, st, 0)
+  local s = st[0]
+  local sig = bit.band(s, 0x7f)
+  if sig ~= 0 and sig ~= 0x7f then
+    self.status = 128 + sig                       -- killed by a signal
+  else
+    self.status = bit.rshift(bit.band(s, 0xff00), 8) -- WEXITSTATUS
+  end
+  local out = table.concat(chunks)
   if out ~= "" then self.out(out) end
 end
 
--- Command substitution `$(...)`: capture an external command's stdout with
--- trailing newlines stripped (bash). Returns the captured string.
-function Shell:capture(...)
+-- Command substitution `$(...)`: run the inner program capturing stdout, with
+-- trailing newlines stripped (bash). Interpreted (it's I/O-bound, not hot), so
+-- it handles builtins, externals, and (in interp mode) functions uniformly.
+function Shell:capture_src(src)
+  local P = require("parser")
+  local I = require("interp")
+  local ast = P.parse(src)
   local buf = {}
   local saved = self.out
-  self.out = function(s) buf[#buf + 1] = s end
-  self:exec(...)
+  self.out = function(x) buf[#buf + 1] = x end
+  local ok, err = pcall(I.run, self, ast)
   self.out = saved
+  if not ok then error(err) end
   return (table.concat(buf):gsub("\n+$", ""))
 end
 

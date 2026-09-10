@@ -71,7 +71,8 @@ local function expand_word(sh, w)
       if p.special == "#" then buf[#buf + 1] = tostring(sh.nparams)
       elseif p.special == "@" or p.special == "*" then buf[#buf + 1] = sh:paramsJoin(" ")
       elseif p.special == "?" then buf[#buf + 1] = tostring(sh.status) end
-    elseif p.arith then buf[#buf + 1] = rt.i64_to_str(eval(sh, require("parser").arith(p.arith))) end
+    elseif p.arith then buf[#buf + 1] = rt.i64_to_str(eval(sh, require("parser").arith(p.arith)))
+    elseif p.cmdsub then buf[#buf + 1] = sh:capture_src(p.cmdsub) end
   end
   return table.concat(buf)
 end

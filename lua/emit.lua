@@ -92,6 +92,8 @@ local function emit_word(w, lifted)
       parts[#parts + 1] = "rt.i64_to_str(" .. emit_value(p.arithast, lifted) .. ")"
     elseif p.arith then
       parts[#parts + 1] = "rt.i64_to_str(" .. emit_value(require("parser").arith(p.arith), lifted) .. ")"
+    elseif p.cmdsub then -- $( … ): run the inner program capturing stdout (interpreted; I/O-bound)
+      parts[#parts + 1] = ("sh:capture_src(%q)"):format(p.cmdsub)
     end
   end
   if #parts == 0 then return '""' end
@@ -244,9 +246,13 @@ end
 -- echo/:/true/false) — no control flow, calls, `return`, or `local`. Such a
 -- function is spliced into its direct call sites (params bound directly, no call,
 -- no string round-trip), which also lets its shared vars collapse to run-locals.
-local function word_varargs(w) -- uses $@ / $* / $# (needs a real param array, don't inline)
+local function word_varargs(w) -- word that blocks inlining
   for _, p in ipairs(w.parts) do
+    -- $@ / $* / $# need a real param array (inlining has no call frame)…
     if p.special and (p.special == "@" or p.special == "*" or p.special == "#") then return true end
+    -- …and $( … ) is opaque source re-run against the live frame, so its inner
+    -- $n would see the caller's params, not the inlined ones — don't inline it.
+    if p.cmdsub then return true end
   end
   return false
 end

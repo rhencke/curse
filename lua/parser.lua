@@ -135,6 +135,15 @@ local function parse_word(w)
       if w:sub(i + 1, i + 2) == "((" then
         local body, ni = grab_dparen(w, i + 3)
         parts[#parts + 1] = { arith = body }; i = ni
+      elseif n == "(" then -- $( … ) command substitution
+        local depth, j = 1, i + 2
+        while j <= #w do
+          local c2 = w:sub(j, j)
+          if c2 == "(" then depth = depth + 1
+          elseif c2 == ")" then depth = depth - 1; if depth == 0 then break end end
+          j = j + 1
+        end
+        parts[#parts + 1] = { cmdsub = w:sub(i + 2, j - 1) }; i = j + 1
       elseif n == "{" then
         local e = w:find("}", i + 2, true)
         parts[#parts + 1] = { var = w:sub(i + 2, e - 1) }; i = e + 1
