@@ -58,8 +58,11 @@ end
 -- and the exit status; stderr is discarded (we compare stdout+status like run.mts).
 local outp = TMP .. "/out"
 local stp = TMP .. "/st"
+-- The Oils harness puts spec/bin (argv.py etc.) on PATH; mirror that so
+-- argv.py-based cases are meaningful for both bash and curse.
+local BINPATH = SPEC .. "/bin:" .. ROOT .. "/.bench-lua/shim" -- argv.py + python2 shim
 local function run(cmdstr, cwd)
-  os.execute("cd " .. cwd .. " && { timeout " .. TIMEOUT .. " " .. cmdstr ..
+  os.execute("cd " .. cwd .. " && PATH=" .. BINPATH .. ":$PATH { timeout " .. TIMEOUT .. " " .. cmdstr ..
     " ; } >" .. outp .. " 2>/dev/null; echo $? >" .. stp)
   return readfile(outp) or "", tonumber((readfile(stp) or "0"):match("%d+") or "0")
 end

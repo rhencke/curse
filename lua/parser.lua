@@ -185,41 +185,75 @@ local function parse_paramexp(inner)
 end
 M.parse_paramexp = parse_paramexp
 
--- A word is a list of parts:
---   {lit=s} | {var=name} | {arith=src} | {param=n} | {special=c} | {pexp=…}
+-- Parse a $… expansion at position i of string w; add(part) tagging it with the
+-- quoted flag q; returns the next index. (q drives word-splitting downstream.)
+local function parse_dollar(w, i, add, q)
+  local nx = w:sub(i + 1, i + 1)
+  if w:sub(i + 1, i + 2) == "((" then
+    local body, ni = grab_dparen(w, i + 3); add({ arith = body, q = q }); return ni
+  elseif nx == "(" then
+    local depth, j = 1, i + 2
+    while j <= #w do
+      local c2 = w:sub(j, j)
+      if c2 == "(" then depth = depth + 1
+      elseif c2 == ")" then depth = depth - 1; if depth == 0 then break end end
+      j = j + 1
+    end
+    add({ cmdsub = w:sub(i + 2, j - 1), q = q }); return j + 1
+  elseif nx == "{" then
+    local e = w:find("}", i + 2, true) or #w
+    local part = parse_paramexp(w:sub(i + 2, e - 1)); part.q = q; add(part); return e + 1
+  elseif nx:match("%d") then
+    add({ param = tonumber(nx), q = q }); return i + 2
+  elseif nx == "#" or nx == "@" or nx == "*" or nx == "?" then
+    add({ special = nx, q = q }); return i + 2
+  else
+    local s, e = w:find("^%$([%a_][%w_]*)", i)
+    if s then add({ var = w:sub(s + 1, e), q = q }); return e + 1
+    else add({ lit = "$", q = q }); return i + 1 end
+  end
+end
+
+-- Parse the inside of a "…" (everything is quoted): $ expansions + literals,
+-- honoring \$ \" \\ \` escapes.
+local function parse_dquote(inner, add)
+  local i = 1
+  while i <= #inner do
+    local c = inner:sub(i, i)
+    if c == "\\" then
+      local nx = inner:sub(i + 1, i + 1)
+      if nx == "$" or nx == '"' or nx == "\\" or nx == "`" then add({ lit = nx, q = true }); i = i + 2
+      else add({ lit = "\\", q = true }); i = i + 1 end
+    elseif c == "$" then
+      i = parse_dollar(inner, i, add, true)
+    else
+      local s, e = inner:find("^[^$\\]+", i); add({ lit = inner:sub(s, e), q = true }); i = e + 1
+    end
+  end
+end
+
+-- A word is a list of parts, each carrying q (came from inside quotes -> not
+-- word-split):  {lit=s} | {var} | {arith} | {param} | {special} | {pexp} | {cmdsub}
 local function parse_word(w)
-  local parts, i = {}, 1
+  local parts = {}
+  local function add(p) parts[#parts + 1] = p end
+  local i = 1
   while i <= #w do
     local c = w:sub(i, i)
-    if c == "$" then
-      local n = w:sub(i + 1, i + 1)
-      if w:sub(i + 1, i + 2) == "((" then
-        local body, ni = grab_dparen(w, i + 3)
-        parts[#parts + 1] = { arith = body }; i = ni
-      elseif n == "(" then -- $( … ) command substitution
-        local depth, j = 1, i + 2
-        while j <= #w do
-          local c2 = w:sub(j, j)
-          if c2 == "(" then depth = depth + 1
-          elseif c2 == ")" then depth = depth - 1; if depth == 0 then break end end
-          j = j + 1
-        end
-        parts[#parts + 1] = { cmdsub = w:sub(i + 2, j - 1) }; i = j + 1
-      elseif n == "{" then
-        local e = w:find("}", i + 2, true)
-        parts[#parts + 1] = parse_paramexp(w:sub(i + 2, e - 1)); i = e + 1
-      elseif n:match("%d") then
-        parts[#parts + 1] = { param = tonumber(n) }; i = i + 2 -- $1..$9 (single digit)
-      elseif n == "#" or n == "@" or n == "*" or n == "?" then
-        parts[#parts + 1] = { special = n }; i = i + 2
-      else
-        local s, e = w:find("^%$([%a_][%w_]*)", i)
-        if s then parts[#parts + 1] = { var = w:sub(s + 1, e) }; i = e + 1
-        else parts[#parts + 1] = { lit = "$" }; i = i + 1 end
+    if c == "'" then -- single quotes: literal, no expansion
+      local e = w:find("'", i + 1, true) or #w + 1
+      add({ lit = w:sub(i + 1, e - 1), q = true }); i = e + 1
+    elseif c == '"' then -- double quotes: expand inside, quoted
+      local j = i + 1
+      while j <= #w and w:sub(j, j) ~= '"' do
+        if w:sub(j, j) == "\\" then j = j + 2 else j = j + 1 end
       end
+      parse_dquote(w:sub(i + 1, j - 1), add); i = j + 1
+    elseif c == "$" then
+      i = parse_dollar(w, i, add, false)
     else
-      local s, e = w:find("^[^$]+", i)
-      parts[#parts + 1] = { lit = w:sub(s, e) }; i = e + 1
+      local s, e = w:find("^[^$'\"]+", i)
+      add({ lit = w:sub(s, e), q = false }); i = e + 1
     end
   end
   return { k = "word", parts = parts }
@@ -369,7 +403,7 @@ function M.parse(src)
         if c == ";" or c == "\n" or c == "" or c == "#" then break end
         if peekword() == "do" then break end
         local w = word(); if w == "" then break end
-        words[#words + 1] = parse_word(unquote(w))
+        words[#words + 1] = parse_word(w)
       end
       loopId = loopId + 1; local id = loopId
       skipsep()
@@ -414,7 +448,7 @@ function M.parse(src)
     -- case WORD in  PAT|PAT) BODY ;;  … esac
     if peekword() == "case" then
       local ln = line; i = i + 4; ws()
-      local subject = parse_word(unquote(word()))
+      local subject = parse_word(word())
       ws(); if peekword() == "in" then i = i + 2 end
       -- separator skipper that STOPS at ;; (so a clause body ends there)
       local function skip_sep()
@@ -478,7 +512,7 @@ function M.parse(src)
               if c == ")" then i = i + 1; break end
               if c == "\n" then line = line + 1; i = i + 1
               elseif c == "" then break
-              else local w = word(true); if w == "" then break end; elems[#elems + 1] = parse_word(unquote(w)) end
+              else local w = word(true); if w == "" then break end; elems[#elems + 1] = parse_word(w) end
             end
             return { t = "arrayassign", name = name, line = ln, elems = elems, append = (op == "+=") }
           end
@@ -487,7 +521,7 @@ function M.parse(src)
             return { t = "assign", name = name, line = ln, arith = arith(raw:sub(4, -3)) }
           end
           return { t = "assign", name = name, line = ln, index = subidx,
-            append = (op == "+="), rhs = parse_word(unquote(raw)) }
+            append = (op == "+="), rhs = parse_word(raw) }
         end
       end
     end
@@ -504,7 +538,7 @@ function M.parse(src)
       else
         local w = word()
         if w == "" then break end
-        words[#words + 1] = parse_word(unquote(w))
+        words[#words + 1] = parse_word(w)
       end
     end
     if #words == 0 and #redirs == 0 then return nil end

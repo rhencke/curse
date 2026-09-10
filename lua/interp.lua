@@ -141,30 +141,87 @@ eval = function(sh, e)
 end
 M.eval = eval
 
-local function expand_word(sh, w)
+local expand_word -- forward (expand_part_str expands pexp args via it)
+
+-- Expand ONE part to its string value (a multi-element @/* part is joined here;
+-- expand_to_fields treats those specially for word-splitting).
+local function expand_part_str(sh, p)
+  if p.lit ~= nil then return p.lit
+  elseif p.var then return sh:get(p.var)
+  elseif p.param then return sh:param(p.param)
+  elseif p.special then
+    if p.special == "#" then return tostring(sh.nparams)
+    elseif p.special == "@" or p.special == "*" then return sh:paramsJoin(" ")
+    elseif p.special == "?" then return tostring(sh.status) end
+    return ""
+  elseif p.arith then return rt.i64_to_str(eval(sh, require("parser").arith(p.arith)))
+  elseif p.cmdsub then return sh:capture_src(p.cmdsub)
+  elseif p.pexp then
+    local pe, P = p.pexp, require("parser")
+    local idxnum
+    if pe.index and pe.index ~= "@" and pe.index ~= "*" then
+      idxnum = tonumber(rt.i64_to_str(eval(sh, P.arith(pe.index)))) or 0
+    end
+    local arg = pe.arg and expand_word(sh, P.parse_word(pe.arg)) or nil
+    local arg2 = pe.arg2 and expand_word(sh, P.parse_word(pe.arg2)) or nil
+    return sh:expand_param(pe, arg, arg2, idxnum)
+  end
+  return ""
+end
+
+-- Expand a word to a single string (assignment RHS, case subject, arith index —
+-- contexts that do NOT word-split).
+expand_word = function(sh, w)
   local buf = {}
+  for _, p in ipairs(w.parts) do buf[#buf + 1] = expand_part_str(sh, p) end
+  return table.concat(buf)
+end
+
+-- A part that expands to multiple elements: $@ / $* / ${a[@]} / ${a[*]}.
+local function is_multi(p)
+  return (p.special == "@" or p.special == "*")
+    or (p.pexp and (p.pexp.index == "@" or p.pexp.index == "*"))
+end
+local function multi_elems(sh, p) -- returns element list, star?
+  if p.pexp then return sh:array_values(p.pexp.name), (p.pexp.index == "*") end
+  local els = {}; for i = 1, sh.nparams do els[i] = sh.params[i] end
+  return els, (p.special == "*")
+end
+
+-- Expand a word to a LIST of fields (command args, for-in lists): unquoted
+-- expansions split on default-IFS whitespace; quoted text never splits; "$@" /
+-- "${a[@]}" yield one field per element.
+local function expand_to_fields(sh, w)
+  local fields, cur = {}, nil
+  local function push() if cur ~= nil then fields[#fields + 1] = cur; cur = nil end end
+  -- append v to cur, splitting on whitespace (unquoted expansion)
+  local function split_into(v)
+    if v == "" then return end
+    local toks = {}
+    for tk in v:gmatch("%S+") do toks[#toks + 1] = tk end
+    if #toks == 0 then push(); return end -- all whitespace: field break
+    if v:match("^%s") then push() end
+    cur = (cur or "") .. toks[1]
+    for k = 2, #toks do push(); cur = toks[k] end
+    if v:match("%s$") then push() end
+  end
   for _, p in ipairs(w.parts) do
-    if p.lit then buf[#buf + 1] = p.lit
-    elseif p.var then buf[#buf + 1] = sh:get(p.var)
-    elseif p.param then buf[#buf + 1] = sh:param(p.param)
-    elseif p.special then
-      if p.special == "#" then buf[#buf + 1] = tostring(sh.nparams)
-      elseif p.special == "@" or p.special == "*" then buf[#buf + 1] = sh:paramsJoin(" ")
-      elseif p.special == "?" then buf[#buf + 1] = tostring(sh.status) end
-    elseif p.arith then buf[#buf + 1] = rt.i64_to_str(eval(sh, require("parser").arith(p.arith)))
-    elseif p.cmdsub then buf[#buf + 1] = sh:capture_src(p.cmdsub)
-    elseif p.pexp then
-      local pe, P = p.pexp, require("parser")
-      local idxnum
-      if pe.index and pe.index ~= "@" and pe.index ~= "*" then
-        idxnum = tonumber(rt.i64_to_str(eval(sh, P.arith(pe.index)))) or 0
+    if is_multi(p) then
+      local els, star = multi_elems(sh, p)
+      if p.q then
+        if star then cur = (cur or "") .. table.concat(els, " ")
+        else for k = 1, #els do if k == 1 then cur = (cur or "") .. els[k] else push(); cur = els[k] end end end
+      else
+        split_into(table.concat(els, " "))
       end
-      local arg = pe.arg and expand_word(sh, P.parse_word(pe.arg)) or nil
-      local arg2 = pe.arg2 and expand_word(sh, P.parse_word(pe.arg2)) or nil
-      buf[#buf + 1] = sh:expand_param(pe, arg, arg2, idxnum)
+    else
+      local s = expand_part_str(sh, p)
+      if p.q or p.lit ~= nil then cur = (cur or "") .. s -- quoted or literal: no split
+      else split_into(s) end -- unquoted expansion: split
     end
   end
-  return table.concat(buf)
+  push()
+  return fields
 end
 
 local exec_list  -- forward
@@ -208,6 +265,22 @@ local function exec_simple(sh, args, hook)
   elseif cmd == "unset" then
     for j = 2, #args do sh.vars[args[j]] = nil end
     sh.status = 0
+  elseif cmd == "set" then
+    -- set -- ARGS / set ARGS: replace positional params. Options (-e/-o/…) accepted, ignored.
+    if args[2] == "--" or (args[2] and args[2]:sub(1, 1) ~= "-") then
+      local j = (args[2] == "--") and 3 or 2
+      local np = {}; local n = 0
+      for k = j, #args do n = n + 1; np[n] = args[k] end
+      sh.params = np; sh.nparams = n
+    end
+    sh.status = 0
+  elseif cmd == "shift" then
+    local nn = tonumber(args[2]) or 1
+    if nn > sh.nparams then nn = sh.nparams end
+    for k = 1, sh.nparams - nn do sh.params[k] = sh.params[k + nn] end
+    for k = sh.nparams - nn + 1, sh.nparams do sh.params[k] = nil end
+    sh.nparams = sh.nparams - nn
+    sh.status = 0
   elseif cmd == "local" then
     for j = 2, #args do sh:localAssign(args[j]) end
     sh.status = 0
@@ -248,7 +321,10 @@ local function exec_stmt(sh, st, hook)
     sh.status = 0
   elseif t == "simple" then
     local args = {}
-    for _, w in ipairs(st.words) do args[#args + 1] = expand_word(sh, w) end
+    for _, w in ipairs(st.words) do
+      local fs = expand_to_fields(sh, w)
+      for k = 1, #fs do args[#args + 1] = fs[k] end
+    end
     if st.redirs then
       -- reconfigure fds and route builtin output (sh.out) to fd 1 for the command
       local save, savedout = apply_redirs(st.redirs), sh.out
@@ -345,11 +421,8 @@ local function exec_stmt(sh, st, hook)
     -- a mid-loop OSR resumes the same list + index.
     local list = {}
     for _, w in ipairs(st.words) do
-      if #w.parts == 1 and w.parts[1].var then
-        for _, piece in ipairs(sh:split(sh:get(w.parts[1].var))) do list[#list + 1] = piece end
-      else
-        list[#list + 1] = expand_word(sh, w)
-      end
+      local fs = expand_to_fields(sh, w)
+      for k = 1, #fs do list[#list + 1] = fs[k] end
     end
     sh.forstate[st.id] = { list = list, idx = 0 }
     while true do
