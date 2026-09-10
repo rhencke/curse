@@ -520,10 +520,29 @@ local function expand_to_fields(sh, w)
   brk()
   -- pathname expansion on fields with unquoted glob metacharacters
   local out = {}
+  -- GLOBIGNORE (set & non-null): filter matches by its `:`-separated patterns and
+  -- enable dotglob (leading-dot names then match); `.`/`..` are always excluded.
+  local gi = sh:get("GLOBIGNORE")
+  local giset = sh.vars[sh:deref("GLOBIGNORE")] ~= nil and gi ~= ""
+  local dotglob = giset or (sh.shopt.dotglob and true)
+  local nullglob = sh.shopt.nullglob and true
+  local gipats
+  if giset then gipats = {}; for p in (gi .. ":"):gmatch("([^:]*):") do if p ~= "" then gipats[#gipats + 1] = p end end end
   for _, f in ipairs(fields) do
     if f.unq and (f.s:find("[*?%[]") or f.s:find("[?*+@!]%(")) then
-      local m = rt.glob_expand(f.s)
-      if m then for _, x in ipairs(m) do out[#out + 1] = x end else out[#out + 1] = f.s end
+      local m = rt.glob_expand(f.s, { dotglob = dotglob })
+      if m and gipats then
+        local filt = {}
+        for _, x in ipairs(m) do
+          local ig = false
+          for _, p in ipairs(gipats) do if rt.glob_ignore_match(x, p) then ig = true; break end end
+          if not ig then filt[#filt + 1] = x end
+        end
+        m = (#filt > 0) and filt or nil
+      end
+      if m then for _, x in ipairs(m) do out[#out + 1] = x end
+      elseif nullglob then -- no matches: nullglob drops the field entirely
+      else out[#out + 1] = f.s end
     else
       out[#out + 1] = f.s
     end

@@ -604,7 +604,11 @@ local function split_arms(body)
 end
 -- Convert a glob (incl. extglob ?(..) *(..) +(..) @(..) !(..)) to an ERE body.
 local EXTOP = { ["?"] = true, ["*"] = true, ["+"] = true, ["@"] = true, ["!"] = true }
-local function glob_conv(glob)
+-- `pn` (pathname mode): `*`/`?` do NOT cross `/` (for GLOBIGNORE matching against
+-- a whole path). Default (case globs, per-segment expansion) lets them match `/`.
+local function glob_conv(glob, pn)
+  local star = pn and "[^/]*" or ".*"
+  local qmark = pn and "[^/]" or "."
   local out, i, n = {}, 1, #glob
   while i <= n do
     local c = glob:sub(i, i)
@@ -617,27 +621,40 @@ local function glob_conv(glob)
       end
       local arms = split_arms(glob:sub(i + 2, j - 1))
       local conv = {}
-      for _, a in ipairs(arms) do conv[#conv + 1] = glob_conv(a) end
+      for _, a in ipairs(arms) do conv[#conv + 1] = glob_conv(a, pn) end
       local group = "(" .. table.concat(conv, "|") .. ")"
       -- @ = exactly one; ? = 0/1; * = 0+; + = 1+; ! ≈ group (POSIX ERE can't negate)
       out[#out + 1] = (c == "?" and group .. "?") or (c == "*" and group .. "*")
         or (c == "+" and group .. "+") or group
       i = j + 1
-    elseif c == "*" then out[#out + 1] = ".*"; i = i + 1
-    elseif c == "?" then out[#out + 1] = "."; i = i + 1
+    elseif c == "*" then out[#out + 1] = star; i = i + 1
+    elseif c == "?" then out[#out + 1] = qmark; i = i + 1
     elseif c == "[" then
       local j, cls = i + 1, { "[" }
       if glob:sub(j, j) == "!" then cls[#cls + 1] = "^"; j = j + 1
       elseif glob:sub(j, j) == "^" then cls[#cls + 1] = "^"; j = j + 1 end
-      while j <= n and glob:sub(j, j) ~= "]" do cls[#cls + 1] = glob:sub(j, j); j = j + 1 end
+      if glob:sub(j, j) == "]" then cls[#cls + 1] = "]"; j = j + 1 end -- leading ] is literal
+      while j <= n and glob:sub(j, j) ~= "]" do
+        local nx = glob:sub(j + 1, j + 1)
+        if glob:sub(j, j) == "[" and (nx == ":" or nx == "." or nx == "=") then
+          -- POSIX [:class:] / [.coll.] / [=equiv=]: copy through its own close
+          local e = glob:find(nx .. "]", j + 2, true)
+          if e then cls[#cls + 1] = glob:sub(j, e + 1); j = e + 2
+          else cls[#cls + 1] = glob:sub(j, j); j = j + 1 end
+        else cls[#cls + 1] = glob:sub(j, j); j = j + 1 end
+      end
       cls[#cls + 1] = "]"; out[#out + 1] = table.concat(cls); i = j + 1
     elseif c:match("[%.%+%(%)%{%}%|%^%$\\]") then out[#out + 1] = "\\" .. c; i = i + 1
     else out[#out + 1] = c; i = i + 1 end
   end
   return table.concat(out)
 end
-local function glob_to_ere(glob)
-  return "^" .. glob_conv(glob) .. "$"
+local function glob_to_ere(glob, pn)
+  return "^" .. glob_conv(glob, pn) .. "$"
+end
+-- GLOBIGNORE match: `glob` matched against a whole path with `/`-aware wildcards.
+function M.glob_ignore_match(path, glob)
+  return M.regex_match(path, glob_to_ere(glob, true))
 end
 
 -- Match `s` against a POSIX ERE. `anchored_glob` false = raw ERE (=~), true = a
@@ -672,33 +689,65 @@ function M.glob_match(s, glob)
   return M.regex_match(s, glob_to_ere(glob))
 end
 
--- Pathname (glob) expansion: return the sorted matching paths for `pattern`, or
--- nil if none (bash default: the word stays literal). Supports an optional
--- literal directory prefix (dir/*.c, /etc/*.conf); a glob in the directory part
--- (multi-level like */*.c) is not expanded (returns nil -> literal).
-function M.glob_expand(pattern)
-  local sl = pattern:find("/[^/]*$")
-  local dirpart = sl and pattern:sub(1, sl) or ""
-  local filepat = sl and pattern:sub(sl + 1) or pattern
-  if dirpart:find("[*?%[]") then return nil end
-  if not (filepat:find("[*?%[]") or filepat:find("[?*+@!]%(")) then return nil end
-  local scan = dirpart == "" and "." or dirpart
-  local d = ffi.C.opendir(scan); if d == nil then return nil end
-  local ere = glob_to_ere(filepat)
-  if ffi.C.regcomp(regbuf, ere, REG_EXTENDED + REG_NOSUB) ~= 0 then ffi.C.closedir(d); return nil end
-  local hidden = filepat:sub(1, 1) == "."
-  local matches = {}
+-- Scan one directory for entries matching a single glob segment. `dir` is the
+-- directory to open ("" == cwd). Returns a list of matching base names (unsorted).
+-- `dotglob` controls whether names beginning with `.` match a non-`.`-initial glob.
+local function scan_seg(dir, seg, dotglob)
+  local scan = (dir == "" and ".") or dir
+  local d = ffi.C.opendir(scan); if d == nil then return {} end
+  local ere = glob_to_ere(seg)
+  if ffi.C.regcomp(regbuf, ere, REG_EXTENDED + REG_NOSUB) ~= 0 then ffi.C.closedir(d); return {} end
+  local hidden = seg:sub(1, 1) == "."
+  local out = {}
   while true do
     local e = ffi.C.readdir(d); if e == nil then break end
     local name = ffi.string(ffi.cast("const char *", e) + 19) -- d_name @ 19 (glibc x86-64)
-    if name ~= "." and name ~= ".." and (name:sub(1, 1) ~= "." or hidden) then
-      if ffi.C.regexec(regbuf, name, 0, nil, 0) == 0 then matches[#matches + 1] = dirpart .. name end
+    if name ~= "." and name ~= ".." and (name:sub(1, 1) ~= "." or hidden or dotglob) then
+      if ffi.C.regexec(regbuf, name, 0, nil, 0) == 0 then out[#out + 1] = name end
     end
   end
   ffi.C.regfree(regbuf); ffi.C.closedir(d)
-  if #matches == 0 then return nil end
-  table.sort(matches)
-  return matches
+  return out
+end
+
+-- Pathname (glob) expansion: return the sorted matching paths for `pattern`, or
+-- nil if none (bash default: the word stays literal). Multi-level patterns
+-- (`*/*.c`, `dir/*/x`) are expanded segment by segment; a glob segment that
+-- isn't the last must resolve to a directory to descend. `opts.dotglob` makes
+-- `*`/`?` also match leading-dot names (set by dotglob / a non-null GLOBIGNORE).
+function M.glob_expand(pattern, opts)
+  opts = opts or {}
+  if not (pattern:find("[*?%[]") or pattern:find("[?*+@!]%(")) then return nil end
+  local abs = pattern:sub(1, 1) == "/"
+  local segs = {}
+  for s in pattern:gmatch("[^/]+") do segs[#segs + 1] = s end
+  if #segs == 0 then return nil end
+  local cur = { abs and "/" or "" } -- accumulated path prefixes (dir, "" == cwd)
+  for si, seg in ipairs(segs) do
+    local isglob = seg:find("[*?%[]") or seg:find("[?*+@!]%(")
+    local islast = si == #segs
+    local nxt = {}
+    local function joined(base, name)
+      if base == "" then return name elseif base == "/" then return "/" .. name
+      else return base .. "/" .. name end
+    end
+    if not isglob then
+      -- literal segment: append; a nonexistent intermediate dir yields nothing
+      -- next round (opendir fails), so no explicit stat needed.
+      for _, base in ipairs(cur) do nxt[#nxt + 1] = joined(base, seg) end
+    else
+      for _, base in ipairs(cur) do
+        local hits = scan_seg(base, seg, opts.dotglob)
+        table.sort(hits)
+        for _, name in ipairs(hits) do nxt[#nxt + 1] = joined(base, name) end
+      end
+    end
+    cur = nxt
+    if #cur == 0 then return nil end
+  end
+  if #cur == 0 then return nil end
+  table.sort(cur)
+  return cur
 end
 
 -- Apply a ${…} operator. `arg`/`arg2` are already word-expanded by the caller;
