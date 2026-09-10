@@ -439,6 +439,21 @@ local function expand_part_str(sh, p)
     elseif p.special == "-" then return sh:dash_flags() end
     return ""
   elseif p.arith then return rt.i64_to_str(eval(sh, require("parser").arith(p.arith)))
+  elseif p.procsub then
+    -- <(cmd)/>(cmd): substitute a filename. <( ) runs the command and captures its
+    -- output to a temp file whose path is the word; >( ) makes a temp file the word
+    -- and feeds it to the command AFTER the outer command runs (sh.procsub_pending).
+    local tmp = os.tmpname()
+    if p.dir == "<" then
+      local out = sh:capture_src(p.procsub)
+      local f = io.open(tmp, "w"); if f then f:write(out); if out ~= "" then f:write("\n") end; f:close() end
+    else
+      sh.procsub_pending = sh.procsub_pending or {}
+      sh.procsub_pending[#sh.procsub_pending + 1] = { file = tmp, cmd = p.procsub }
+      local f = io.open(tmp, "w"); if f then f:close() end
+    end
+    sh.procsub_files = sh.procsub_files or {}; sh.procsub_files[#sh.procsub_files + 1] = tmp
+    return tmp
   elseif p.cmdsub then return sh:capture_src(p.cmdsub)
   elseif p.pexp then
     local pe, P = p.pexp, require("parser")
@@ -2159,6 +2174,21 @@ local function exec_stmt(sh, st, hook)
     end
     -- $_ : the last argument (after expansion) of the command just run.
     if #args > 0 then sh:set_str("_", args[#args]) end
+    -- process substitution cleanup: feed >(cmd) temp files to their commands, then
+    -- remove all temp files created for this command's <()/>(). Gated to the outer
+    -- level so a nested <()'s own command (run via capture) can't wipe sibling files.
+    if (sh.in_subprogram or 0) == 0 and sh.procsub_pending then
+      for _, ps in ipairs(sh.procsub_pending) do
+        io.flush()
+        local q = "'" .. ps.cmd:gsub("'", "'\\''") .. "'"
+        os.execute(("sh -c %s < '%s'"):format(q, ps.file))
+      end
+      sh.procsub_pending = nil
+    end
+    if (sh.in_subprogram or 0) == 0 and sh.procsub_files then
+      for _, f in ipairs(sh.procsub_files) do os.remove(f) end
+      sh.procsub_files = nil
+    end
   elseif t == "forc" then
     if st.init then eval(sh, st.init) end
     local bodystatus = 0 -- a loop's status is its last body command's (0 if none)

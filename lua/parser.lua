@@ -367,14 +367,24 @@ local function parse_word(w)
         else buf[#buf + 1] = w:sub(j, j); j = j + 1 end
       end
       add({ cmdsub = table.concat(buf), q = false }); i = j + 1
+    elseif (c == "<" or c == ">") and w:sub(i + 1, i + 1) == "(" then
+      -- <(cmd) / >(cmd) process substitution: capture the balanced inner command.
+      local j, d = i + 2, 1
+      while j <= #w and d > 0 do
+        local cc = w:sub(j, j)
+        if cc == "(" then d = d + 1 elseif cc == ")" then d = d - 1; if d == 0 then break end end
+        j = j + 1
+      end
+      add({ procsub = w:sub(i + 2, j - 1), dir = c, q = false }); i = j + 1
     elseif c == "\\" then -- backslash escape: literal next char (newline = continuation)
       local nx = w:sub(i + 1, i + 1)
       if nx == "\n" or nx == "" then -- line continuation / trailing backslash: drop
       else add({ lit = nx, q = true }) end
       i = i + 2
     else
-      local s, e = w:find("^[^$'\"`\\]+", i)
-      add({ lit = w:sub(s, e), q = false }); i = e + 1
+      local s, e = w:find("^[^$'\"`\\<>]+", i)
+      if not s then add({ lit = w:sub(i, i), q = false }); i = i + 1
+      else add({ lit = w:sub(s, e), q = false }); i = e + 1 end
     end
   end
   return { k = "word", parts = parts }
@@ -689,6 +699,14 @@ local function make_parser(src)
           if cc == "(" then d = d + 1 elseif cc == ")" then d = d - 1 end
           i = i + 1
         end
+      elseif (c == "<" or c == ">") and src:sub(i + 1, i + 1) == "(" then
+        -- <(cmd) / >(cmd) process substitution: part of the word (balanced parens)
+        i = i + 2; local d = 1
+        while i <= n and d > 0 do
+          local cc = src:sub(i, i)
+          if cc == "(" then d = d + 1 elseif cc == ")" then d = d - 1 end
+          i = i + 1
+        end
       elseif c:match("[?*+@!]") and src:sub(i + 1, i + 1) == "(" then
         -- extglob ?(..) *(..) +(..) @(..) !(..): part of the word, not a subshell
         i = i + 2; local d = 1
@@ -732,6 +750,8 @@ local function make_parser(src)
   -- [N]> [N]>> [N]< >&M N>&M &> [N]>&- ; heredocs (<<) are left to parse_command.
   parse_redir = function()
     local p = i
+    -- `<(…)` / `>(…)` are process substitutions (word parts), not redirections.
+    if src:sub(p, p + 1) == "<(" or src:sub(p, p + 1) == ">(" then return nil end
     local fd = src:match("^%d+", p)
     local q = fd and (p + #fd) or p
     local c = src:sub(q, q)
