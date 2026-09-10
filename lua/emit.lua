@@ -35,7 +35,8 @@ emit_value = function(e, lifted)
   if k == "param" then return ("rt.str_to_i64(sh:param(%d))"):format(e.n) end
   if k == "un" then
     if e.op == "-" then return "(-(" .. emit_value(e.e, lifted) .. "))" end
-    return "((" .. emit_value(e.e, lifted) .. ") == 0LL and 1LL or 0LL)"
+    if e.op == "!" then return "((" .. emit_value(e.e, lifted) .. ") == 0LL and 1LL or 0LL)" end
+    error("emit: unary '" .. tostring(e.op) .. "' not supported") -- ~ etc -> interp fallback
   end
   if k == "bin" then
     local l, r = emit_value(e.l, lifted), emit_value(e.r, lifted)

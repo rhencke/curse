@@ -103,6 +103,10 @@ eval = function(sh, e)
     local v = eval(sh, e.e)
     if e.op == "-" then return -v end
     if e.op == "!" then return b2i(not truth(v)) end
+    if e.op == "~" then return bit.bnot(v) end
+  end
+  if k == "tern" then
+    if truth(eval(sh, e.c)) then return eval(sh, e.a) else return eval(sh, e.b) end
   end
   if k == "bin" then
     local op = e.op
@@ -120,6 +124,16 @@ eval = function(sh, e)
     if op == "<=" then return b2i(l <= r) end
     if op == ">" then return b2i(l > r) end
     if op == ">=" then return b2i(l >= r) end
+    if op == "&" then return bit.band(l, r) end
+    if op == "|" then return bit.bor(l, r) end
+    if op == "^" then return bit.bxor(l, r) end
+    if op == "<<" then return bit.lshift(l, tonumber(r) % 64) end
+    if op == ">>" then return bit.arshift(l, tonumber(r) % 64) end
+    if op == "**" then
+      local base, n, res = l, tonumber(r), i64(1)
+      for _ = 1, n do res = res * base end
+      return res
+    end
   end
   if k == "asgn" then
     local v = eval(sh, e.e)

@@ -39,6 +39,7 @@ local function arith(src)
     if c == "-" then i = i + 1; return { k = "un", op = "-", e = primary() } end
     if c == "+" then i = i + 1; return primary() end
     if c == "!" then i = i + 1; return { k = "un", op = "!", e = primary() } end
+    if c == "~" then i = i + 1; return { k = "un", op = "~", e = primary() } end
     if c == "$" then
       i = i + 1
       local d = src:sub(i, i)
@@ -68,14 +69,19 @@ local function arith(src)
     return { k = "var", name = name }
   end
 
-  -- binary operators by precedence (higher binds tighter)
+  -- binary operators by precedence (higher binds tighter), matching bash
   local BIN = {
     ["||"] = 1, ["&&"] = 2,
-    ["=="] = 3, ["!="] = 3, ["<"] = 4, ["<="] = 4, [">"] = 4, [">="] = 4,
-    ["+"] = 5, ["-"] = 5, ["*"] = 6, ["/"] = 6, ["%"] = 6,
+    ["|"] = 3, ["^"] = 4, ["&"] = 5,
+    ["=="] = 6, ["!="] = 6,
+    ["<"] = 7, ["<="] = 7, [">"] = 7, [">="] = 7,
+    ["<<"] = 8, [">>"] = 8,
+    ["+"] = 9, ["-"] = 9, ["*"] = 10, ["/"] = 10, ["%"] = 10,
+    ["**"] = 11,
   }
-  -- longest-match order so "<=" beats "<", "==" beats "="
-  local OPS = { "||", "&&", "==", "!=", "<=", ">=", "<", ">", "+", "-", "*", "/", "%" }
+  -- longest-match order: multi-char ops before the single-char ones they prefix
+  local OPS = { "**", "<<", ">>", "<=", ">=", "==", "!=", "&&", "||",
+    "<", ">", "+", "-", "*", "/", "%", "&", "^", "|" }
 
   local function nextOp()
     skip()
@@ -96,8 +102,16 @@ local function arith(src)
       local prec = BIN[op]
       if prec == nil or prec < minprec then break end
       i = i + #op
-      local right = parseExpr(prec + 1)
+      local right = parseExpr(op == "**" and prec or prec + 1) -- ** is right-assoc
       left = { k = "bin", op = op, l = left, r = right }
+    end
+    -- ternary c ? a : b (lowest precedence, right-assoc) — only at the top level
+    if minprec == 0 and peek() == "?" then
+      i = i + 1
+      local a = parseExpr(0)
+      if not eat(":") then error("arith: expected : in ?:") end
+      local b = parseExpr(0)
+      left = { k = "tern", c = left, a = a, b = b }
     end
     return left
   end
