@@ -858,7 +858,9 @@ function Shell:expand_param(pe, arg, arg2, idxnum)
     if op == "len" then return tostring(self:array_count(name)) end -- ${#a[@]}
     val = table.concat(self:array_values(name), " "); isset = self:array_count(name) > 0
   elseif index then
-    val = self:array_get(name, idxnum or 0); isset = val ~= ""
+    -- set-ness (for the no-colon - / + ops) is PRESENCE, not non-emptiness: an
+    -- element holding "" is set, so ${a[0]-def} with a=("") yields "" not def.
+    val = self:array_get(name, idxnum or 0); isset = self:is_elem_set(name, idxnum or 0)
   elseif name:match("^%d+$") then
     local nn = tonumber(name); val = self:param(nn); isset = (nn <= self.nparams)
   elseif name == "@" or name == "*" then
@@ -885,13 +887,19 @@ function Shell:expand_param(pe, arg, arg2, idxnum)
     and self:special_get(name) == "" then
     io.stderr:write("curse: " .. name .. ": unbound variable\n"); error({ __curse_exit = 1 })
   end
+  -- := / = write back to the SAME target that was read: an array element when
+  -- subscripted (${a[0]=x} must populate a[0]), else the scalar variable.
+  local function assign_default(v)
+    if index and index ~= "@" and index ~= "*" then self:array_set(name, idxnum or 0, v)
+    else self:set_str(name, v) end
+  end
   if op == "len" then return tostring(#val) end
   if op == ":-" then return val ~= "" and val or A() end
   if op == "-" then return isset and val or A() end
   if op == ":+" then return val ~= "" and A() or "" end
   if op == "+" then return isset and A() or "" end
-  if op == ":=" then if val == "" then local v = A(); self:set_str(name, v); return v end return val end
-  if op == "=" then if not isset then local v = A(); self:set_str(name, v); return v end return val end
+  if op == ":=" then if val == "" then local v = A(); assign_default(v); return v end return val end
+  if op == "=" then if not isset then local v = A(); assign_default(v); return v end return val end
   if op == ":?" then if val == "" then io.stderr:write("curse: " .. name .. ": " .. A() .. "\n"); error({ __curse_exit = 1 }) end return val end
   if op == "?" then if not isset then io.stderr:write("curse: " .. name .. ": " .. A() .. "\n"); error({ __curse_exit = 1 }) end return val end
   arg = arg or ""
