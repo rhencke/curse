@@ -589,11 +589,24 @@ local function tilde_prefix(sh, s)
   if s:sub(1, 1) ~= "~" then return s end
   local r = s:sub(2)
   if r == "" or r:sub(1, 1) == "/" then local h = sh:get("HOME"); return h ~= "" and (h .. r) or s end
-  if (r == "+" or r:sub(1, 2) == "+/") then return sh:special_get("PWD") .. r:sub(2) end
+  if (r == "+" or r:sub(1, 2) == "+/") then return sh:pwd() .. r:sub(2) end
   if (r == "-" or r:sub(1, 2) == "-/") then local o = sh:get("OLDPWD"); return o ~= "" and (o .. r:sub(2)) or s end
   return s
 end
 M.tilde_prefix = tilde_prefix
+
+-- Canonicalize an absolute path string LOGICALLY: resolve `.`/`..` textually,
+-- without following symlinks (bash's default -L `cd` semantics — `..` pops the
+-- previous name even when it is a symlink).
+local function logical_canon(path)
+  local parts = {}
+  for seg in path:gmatch("[^/]+") do
+    if seg == "." then -- drop
+    elseif seg == ".." then if #parts > 0 then parts[#parts] = nil end
+    else parts[#parts + 1] = seg end
+  end
+  return "/" .. table.concat(parts, "/")
+end
 
 -- In an assignment RHS (x=…, x+=…, [k]=…) bash tilde-expands not just the word
 -- start but every segment following an unquoted ':' (the PATH=~/a:~/b idiom).
@@ -1625,29 +1638,51 @@ local function exec_simple(sh, args, hook, no_func)
     if args[2] and not tonumber(args[2]) then io.stderr:write("curse: exit: " .. args[2] .. ": numeric argument required\n"); error({ __curse_exit = 2 }) end
     error({ __curse_exit = args[2] and (tonumber(args[2]) % 256) or sh.status })
   elseif cmd == "cd" then
-    local prev = sh:special_get("PWD")
+    local prev = sh:pwd()
     -- parse leading -L/-P/-e/-@ flags and a `--`, then the directory operand.
-    local operands, j = {}, 2
+    local operands, j, physical = {}, 2, false
     while args[j] do
       local a = args[j]
       if a == "--" then j = j + 1; break
       elseif a == "-" then operands[#operands + 1] = a; j = j + 1
-      elseif a:match("^%-[LPe@]+$") then j = j + 1 -- flags (physical/logical: curse's PWD is physical)
+      elseif a:match("^%-[LPe@]+$") then
+        if a:find("P") then physical = true elseif a:find("L") then physical = false end
+        j = j + 1
       else break end
     end
     for k = j, #args do operands[#operands + 1] = args[k] end
     if #operands > 1 then io.stderr:write("curse: cd: too many arguments\n"); sh.status = 1; return end
-    local dir = operands[1] or sh:get("HOME")
-    if dir == "-" then dir = sh:get("OLDPWD"); if dir == "" then dir = prev end
-      sh.status = (C.chdir(dir) == 0) and 0 or 1
-      if sh.status == 0 then sh:echo(sh:special_get("PWD")) end -- cd - prints the new dir
-    else
-      sh.status = (C.chdir(dir) == 0) and 0 or 1
+    local dir, print_dir = operands[1], false
+    if dir == "-" then
+      dir = sh:get("OLDPWD")
+      if dir == "" then io.stderr:write("curse: cd: OLDPWD not set\n"); sh.status = 1; return end
+      print_dir = true
+    elseif dir == nil or dir == "" then
+      dir = sh:get("HOME")
+      if dir == "" then io.stderr:write("curse: cd: HOME not set\n"); sh.status = 1; return end
+    elseif dir:sub(1, 1) ~= "/" and dir ~= "." and dir:sub(1, 2) ~= "./"
+        and dir ~= ".." and dir:sub(1, 3) ~= "../" then
+      -- CDPATH: a relative operand (not . / ..) is looked up under each entry.
+      local cdpath = sh:get("CDPATH")
+      if cdpath ~= "" then
+        for entry in (cdpath .. ":"):gmatch("([^:]*):") do
+          local cand = (entry == "" and "." or entry) .. "/" .. dir
+          if C.chdir(cand) == 0 then dir = cand; print_dir = true; break end
+        end
+      end
     end
-    if sh.status == 0 then
-      sh:set_str("OLDPWD", prev); C.setenv("OLDPWD", prev, 1)
-      if sh.dirstack then sh.dirstack[1] = sh:special_get("PWD") end -- cd replaces the top of the stack
+    -- logical target: resolve . and .. against $PWD textually (unless -P)
+    local logical = logical_canon(dir:sub(1, 1) == "/" and dir or (prev .. "/" .. dir))
+    local target = physical and dir or logical
+    if C.chdir(target) ~= 0 and not (not physical and C.chdir(dir) == 0) then
+      io.stderr:write("curse: cd: " .. dir .. ": No such file or directory\n"); sh.status = 1; return
     end
+    sh.status = 0
+    local newpwd = physical and sh:phys_cwd() or logical
+    sh:set_str("OLDPWD", prev); sh.vars["OLDPWD"].exported = true; C.setenv("OLDPWD", prev, 1)
+    sh:set_str("PWD", newpwd); sh.vars["PWD"].exported = true; C.setenv("PWD", newpwd, 1)
+    if print_dir then sh:echo(newpwd) end
+    if sh.dirstack then sh.dirstack[1] = newpwd end
   elseif cmd == "kill" then
     if args[2] == "-l" or args[2] == "-L" then -- list / translate signal names<->numbers
       if #args == 2 then
@@ -1690,14 +1725,15 @@ local function exec_simple(sh, args, hook, no_func)
       sh.status = allok and 0 or 1
     end
   elseif cmd == "pushd" or cmd == "popd" or cmd == "dirs" then
-    sh.dirstack = sh.dirstack or { sh:special_get("PWD") }
+    sh.dirstack = sh.dirstack or { sh:pwd() }
+    local function cd_to(p) C.chdir(p); sh:set_str("PWD", p); sh.vars["PWD"].exported = true; C.setenv("PWD", p, 1) end
     local ds = sh.dirstack
     local function tilde(p) local h = sh:get("HOME"); if h ~= "" and p:sub(1, #h) == h then return "~" .. p:sub(#h + 1) end return p end
     if cmd == "dirs" then
       local vflag, pflag, lflag = false, false, false
       for j = 2, #args do
         local a = args[j]
-        if a == "-c" then sh.dirstack = { sh:special_get("PWD") }; ds = sh.dirstack
+        if a == "-c" then sh.dirstack = { sh:pwd() }; ds = sh.dirstack
         elseif a == "-v" then vflag = true elseif a == "-p" then pflag = true
         elseif a == "-l" then lflag = true end
       end
@@ -1719,12 +1755,15 @@ local function exec_simple(sh, args, hook, no_func)
       end
       if not target then -- swap top two
         if #ds < 2 then io.stderr:write("curse: pushd: no other directory\n"); sh.status = 1; return end
-        ds[1], ds[2] = ds[2], ds[1]; C.chdir(ds[1])
-        sh:set_str("OLDPWD", sh:special_get("PWD")); ds[1] = sh:special_get("PWD")
+        local prev = sh:pwd()
+        ds[1], ds[2] = ds[2], ds[1]; cd_to(ds[1])
+        sh:set_str("OLDPWD", prev)
       else
-        local prev = sh:special_get("PWD")
+        local prev = sh:pwd()
         if C.chdir(target) ~= 0 then io.stderr:write("curse: pushd: " .. target .. ": No such file or directory\n"); sh.status = 1; return end
-        sh:set_str("OLDPWD", prev); table.insert(ds, 1, sh:special_get("PWD"))
+        local np = sh:phys_cwd(); sh:set_str("OLDPWD", prev)
+        sh:set_str("PWD", np); sh.vars["PWD"].exported = true; C.setenv("PWD", np, 1)
+        table.insert(ds, 1, np)
       end
       local parts = {}; for k = 1, #ds do parts[k] = tilde(ds[k]) end
       sh:echo(table.concat(parts, " ")); sh.status = 0
@@ -1736,7 +1775,7 @@ local function exec_simple(sh, args, hook, no_func)
         elseif a ~= "-" then io.stderr:write("curse: popd: " .. a .. ": invalid argument\n"); sh.status = 2; return end
       end
       if #ds < 2 then io.stderr:write("curse: popd: directory stack empty\n"); sh.status = 1; return end
-      table.remove(ds, 1); C.chdir(ds[1]); ds[1] = sh:special_get("PWD")
+      table.remove(ds, 1); cd_to(ds[1])
       local parts = {}; for k = 1, #ds do parts[k] = tilde(ds[k]) end
       sh:echo(table.concat(parts, " ")); sh.status = 0
     end
@@ -2150,7 +2189,9 @@ local function exec_simple(sh, args, hook, no_func)
     end
     sh.status = 1
   elseif cmd == "pwd" then
-    sh:echo(sh:special_get("PWD")); sh.status = 0
+    local phys = false
+    for j = 2, #args do if args[j]:find("P") then phys = true elseif args[j]:find("L") then phys = false end end
+    sh:echo(phys and sh:phys_cwd() or sh:pwd()); sh.status = 0
   elseif cmd == "umask" then
     -- umask [-S] [MODE]: print (octal or -S symbolic) or set the file-creation mask.
     local sflag, badflag, pos = false, false, {}

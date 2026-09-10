@@ -338,13 +338,35 @@ M.i64_to_str = i64_to_str
 ffi.cdef [[
   int getpid(void); int getppid(void); int getuid(void); int geteuid(void);
   char *getcwd(char *buf, unsigned long size);
+  int curse_rt_stat(const char *path, void *buf) asm("stat");
 ]]
 local scratch = ffi.new("char[4096]")
+local stbuf_a, stbuf_b = ffi.new("uint8_t[144]"), ffi.new("uint8_t[144]")
+-- Do two paths name the same directory (same device + inode)? Used to validate an
+-- inherited $PWD against the real cwd on startup (bash keeps a symlinked $PWD only
+-- if it still refers to the current directory).
+local function same_file(a, b)
+  if ffi.C.curse_rt_stat(a, stbuf_a) ~= 0 then return false end
+  if ffi.C.curse_rt_stat(b, stbuf_b) ~= 0 then return false end
+  return ffi.cast("uint64_t *", stbuf_a)[0] == ffi.cast("uint64_t *", stbuf_b)[0]        -- st_dev @0
+     and ffi.cast("uint64_t *", stbuf_a + 8)[0] == ffi.cast("uint64_t *", stbuf_b + 8)[0] -- st_ino @8
+end
+function Shell:phys_cwd()
+  local p = ffi.C.getcwd(scratch, 4096); return p ~= nil and ffi.string(p) or ""
+end
+-- Logical current directory: the tracked $PWD (may keep a symlinked name), else
+-- the physical cwd. `pwd`, `cd`'s bookkeeping, tilde `~+` and prompts use this.
+function Shell:pwd()
+  local b = self.vars["PWD"]
+  if b and b.s and b.s ~= "" then return b.s end
+  return self:phys_cwd()
+end
 local pid_cache
 function Shell:pid() if not pid_cache then pid_cache = tonumber(ffi.C.getpid()) end return pid_cache end
 function Shell:special_get(name)
   if name == "RANDOM" then return tostring(math.random(0, 32767)) end
-  if name == "PWD" then local p = ffi.C.getcwd(scratch, 4096); return p ~= nil and ffi.string(p) or "" end
+  -- $PWD is a real tracked variable (see :pwd / import_env); once unset it reads
+  -- empty like any other var, so special_get does NOT fall back to getcwd here.
   if name == "PPID" then return tostring(tonumber(ffi.C.getppid())) end
   if name == "UID" then return tostring(tonumber(ffi.C.getuid())) end
   if name == "EUID" then return tostring(tonumber(ffi.C.geteuid())) end
@@ -448,23 +470,32 @@ function Shell:set_str(name, s)
 end
 
 -- Inherit the process environment as shell variables (bash does this at startup).
--- PWD/OLDPWD stay dynamic (special_get uses getcwd) so they don't go stale on cd.
+-- PWD/OLDPWD are handled specially below: PWD is initialized (and kept logical),
+-- OLDPWD inherited if present; `cd` maintains both thereafter.
 function Shell:import_env()
   local e = ffi.C.environ
   if e == nil then return end
-  local i = 0
+  local i, env_pwd, env_oldpwd = 0, nil, nil
   while e[i] ~= nil do
     local s = ffi.string(e[i])
     local eq = s:find("=", 1, true)
     if eq then
       local k = s:sub(1, eq - 1)
-      if k:match("^[%a_][%w_]*$") and k ~= "PWD" and k ~= "OLDPWD" then
+      if k == "PWD" then env_pwd = s:sub(eq + 1)
+      elseif k == "OLDPWD" then env_oldpwd = s:sub(eq + 1)
+      elseif k:match("^[%a_][%w_]*$") then
         self:set_str(k, s:sub(eq + 1))
         self.vars[k].exported = true -- inherited env vars are exported (bash)
       end
     end
     i = i + 1
   end
+  -- Initialize $PWD: keep an inherited absolute $PWD only if it still names the
+  -- current directory (so a symlinked path survives); otherwise use getcwd.
+  local phys = self:phys_cwd()
+  local pwd = (env_pwd and env_pwd:sub(1, 1) == "/" and same_file(env_pwd, phys)) and env_pwd or phys
+  self:set_str("PWD", pwd); self.vars["PWD"].exported = true
+  if env_oldpwd then self:set_str("OLDPWD", env_oldpwd); self.vars["OLDPWD"].exported = true end
 end
 
 -- Arithmetic write: store the int64, defer the string (lazy).
@@ -976,8 +1007,8 @@ function Shell:prompt_escapes(s)
         T = os.date("%I:%M:%S"), ["@"] = os.date("%I:%M %p"), A = os.date("%H:%M"),
         d = os.date("%a %b %d"), s = "curse", v = "5.2", V = "5.2.0", ["!"] = "1", ["#"] = "1", j = "0" })[d]
       if d == "[" or d == "]" then i = i + 2 -- non-printing markers: drop
-      elseif d == "w" then out[#out + 1] = self:special_get("PWD"); i = i + 2
-      elseif d == "W" then out[#out + 1] = (self:special_get("PWD"):gsub(".*/", "")); i = i + 2
+      elseif d == "w" then out[#out + 1] = self:pwd(); i = i + 2
+      elseif d == "W" then out[#out + 1] = (self:pwd():gsub(".*/", "")); i = i + 2
       elseif d == "u" then out[#out + 1] = os.getenv("USER") or "user"; i = i + 2
       elseif d == "h" then out[#out + 1] = M.hostname():gsub("%..*$", ""); i = i + 2
       elseif d == "H" then out[#out + 1] = M.hostname(); i = i + 2

@@ -79,8 +79,8 @@ local function prompt_of(sh, var, default)
   local ps = sh.vars[var] and sh:get(var) or default
   ps = ps:gsub("\\u", os.getenv("USER") or "user")
     :gsub("\\h", (os.getenv("HOSTNAME") or "curse"):gsub("%..*$", ""))
-    :gsub("\\w", sh:special_get("PWD"))
-    :gsub("\\W", (sh:special_get("PWD"):gsub(".*/", "")))
+    :gsub("\\w", sh:pwd())
+    :gsub("\\W", (sh:pwd():gsub(".*/", "")))
     :gsub("\\%$", "$"):gsub("\\n", "\n"):gsub("\\s", "curse"):gsub("\\v", "1")
   return ps
 end
