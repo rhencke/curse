@@ -535,6 +535,11 @@ function Shell:expand_param(pe, arg, arg2, idxnum)
     local idx = self:array_indices(name)
     return table.concat(idx, " ")
   end
+  -- ${!name}: indirect — the value of the variable named by $name
+  if op == "indirect" then
+    local target = idxnum and self:array_get(name, idxnum) or self:get(name)
+    return self:get((target:gsub("%[.*$", ""))) -- plain-var target (subscript targets rare)
+  end
   local val, isset
   if index == "@" or index == "*" then
     if op == "len" then return tostring(self:array_count(name)) end -- ${#a[@]}

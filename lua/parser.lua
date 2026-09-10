@@ -163,7 +163,11 @@ local function parse_paramexp(inner)
     local close = rest:find("]", 2, true)
     if close then index = rest:sub(2, close - 1); rest = rest:sub(close + 1) end
   end
-  if indices then return { pexp = { name = name, op = "indices", index = index } } end
+  if indices then
+    -- ${!a[@]}/${!a[*]} = the keys; ${!name} = indirect (value of the var named by name)
+    if index == "@" or index == "*" then return { pexp = { name = name, op = "indices", index = index } } end
+    return { pexp = { name = name, op = "indirect", index = index } }
+  end
   if lenpfx then return { pexp = { name = name, op = "len", index = index } } end
   if rest == "" then
     if index then return { pexp = { name = name, index = index } } end -- ${a[i]}
