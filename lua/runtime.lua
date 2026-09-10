@@ -552,9 +552,13 @@ local function strip_suffix(val, glob, longest)
   return val
 end
 local function subst(val, glob, repl, all)
+  local anchor -- ${v/#pat} anchors at start, ${v/%pat} at end
+  if glob:sub(1, 1) == "#" then glob = glob:sub(2); anchor = "^"
+  elseif glob:sub(1, 1) == "%" then glob = glob:sub(2); anchor = "$" end
   local lp = glob_to_lpat(glob)
   repl = repl:gsub("%%", "%%%%") -- literal repl
-  if all then return (val:gsub(lp, repl)) end
+  if anchor == "^" then lp = "^" .. lp elseif anchor == "$" then lp = lp .. "$" end
+  if all and not anchor then return (val:gsub(lp, repl)) end
   local s, e = val:find(lp)
   if s then return val:sub(1, s - 1) .. repl .. val:sub(e + 1) end
   return val

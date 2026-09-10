@@ -857,7 +857,9 @@ local function make_parser(src)
       -- separator skipper that STOPS at ;; (so a clause body ends there)
       local function skip_sep()
         while i <= n do
-          if src:sub(i, i + 1) == ";;" then return "dsemi" end
+          if src:sub(i, i + 2) == ";;&" then return "dsemi_amp" end -- ;;& (test next patterns)
+          if src:sub(i, i + 1) == ";;" then return "dsemi" end       -- ;; (stop)
+          if src:sub(i, i + 1) == ";&" then return "semi_amp" end     -- ;& (fall through)
           local c = src:sub(i, i)
           if c == "\n" then line = line + 1; i = i + 1
           elseif c:match("[ \t;]") then i = i + 1
@@ -900,16 +902,18 @@ local function make_parser(src)
         end
         pats[#pats + 1] = table.concat(cur)
         for k = 1, #pats do pats[k] = (pats[k]:gsub("^%s+", ""):gsub("%s+$", "")) end
-        local body = {}
+        local body, term = {}, "break"
         while true do
           local s = skip_sep()
-          if s == "dsemi" then i = i + 2; break end
+          if s == "dsemi" then i = i + 2; term = "break"; break end
+          if s == "dsemi_amp" then i = i + 3; term = "test"; break end -- ;;&
+          if s == "semi_amp" then i = i + 2; term = "fall"; break end  -- ;&
           if s == "eof" or peekword() == "esac" then break end
           local st = parse_stmt()
           if not st then break end
           body[#body + 1] = st
         end
-        clauses[#clauses + 1] = { pats = pats, body = body }
+        clauses[#clauses + 1] = { pats = pats, body = body, term = term }
       end
       return { t = "case", line = ln, subject = subject, clauses = clauses }
     end

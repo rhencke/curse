@@ -1395,13 +1395,22 @@ local function exec_stmt(sh, st, hook)
   elseif t == "case" then
     local subj = expand_word(sh, st.subject)
     local P = require("parser")
+    local fall = false -- carrying a `;&` fall-through into the next clause
+    sh.status = 0
     for _, cl in ipairs(st.clauses) do
-      local matched = false
-      for _, pat in ipairs(cl.pats) do
-        local g = expand_word(sh, P.parse_word(pat)) -- resolve vars in the pattern
-        if rt.glob_match(subj, g) then matched = true; break end
+      local matched = fall
+      if not matched then
+        for _, pat in ipairs(cl.pats) do
+          local g = expand_word(sh, P.parse_word(pat)) -- resolve vars in the pattern
+          if rt.glob_match(subj, g) then matched = true; break end
+        end
       end
-      if matched then exec_list(sh, cl.body, hook, false); break end
+      if matched then
+        exec_list(sh, cl.body, hook, false)
+        if cl.term == "fall" then fall = true -- ;& : run the next clause's body too
+        elseif cl.term == "test" then fall = false -- ;;& : keep testing later patterns
+        else break end -- ;; : done
+      end
     end
   elseif t == "andor" then
     -- run each pipeline, short-circuiting on the running exit status
