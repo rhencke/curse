@@ -748,12 +748,16 @@ local function multi_elems(sh, p) -- returns element list, star?
     -- `:` variants test the JOINED value: ("" "") joins to " " (non-null), but
     -- ('') joins to "" (null) — so a[@]:-w gives the default only for the latter.
     elseif pe.op == ":-" then
-      local ne = #els > 1 or (els[1] ~= nil and els[1] ~= "")
+      -- a `*` join tests the IFS[0]-joined string (empty IFS -> concatenation);
+      -- `@` tests whether any element is non-empty.
+      local ne = star and (table.concat(els, sh.vars["IFS"] and sh:get("IFS"):sub(1, 1) or " ") ~= "")
+        or (not star and (#els > 1 or (els[1] ~= nil and els[1] ~= "")))
       if not ne then return { pe.arg and expand_word(sh, P.parse_word(pe.arg)) or "" }, star end
     elseif pe.op == "+" then -- alternate iff the array has any element (is set)
       return (#els > 0) and { pe.arg and expand_word(sh, P.parse_word(pe.arg)) or "" } or {}, star
     elseif pe.op == ":+" then
-      local ne = #els > 1 or (els[1] ~= nil and els[1] ~= "")
+      local ne = star and (table.concat(els, sh.vars["IFS"] and sh:get("IFS"):sub(1, 1) or " ") ~= "")
+        or (not star and (#els > 1 or (els[1] ~= nil and els[1] ~= "")))
       return ne and { pe.arg and expand_word(sh, P.parse_word(pe.arg)) or "" } or {}, star
     elseif pe.op == "@" and pe.arg == "a" then -- ${a[@]@a}: the variable's attribute string, per element
       local attr = sh:attr_string(pe.name); local out = {}
