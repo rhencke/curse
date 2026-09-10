@@ -246,7 +246,9 @@ local function parse_paramexp(inner)
     if off then return P { op = "sub", arg = off, arg2 = len } end
     return P { op = "sub", arg = body }
   end
-  return { var = name }
+  -- Any trailing text that is not a recognized modifier is a bad substitution
+  -- (e.g. `${x|html}`, `${1abc}`, `${a b}`) — bash aborts with status 1.
+  return P { op = "badsubst", raw = name .. rest }
 end
 M.parse_paramexp = parse_paramexp
 

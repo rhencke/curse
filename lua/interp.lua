@@ -524,6 +524,10 @@ local function expand_part_str(sh, p)
   elseif p.cmdsub then return sh:capture_src(p.cmdsub)
   elseif p.pexp then
     local pe, P = p.pexp, require("parser")
+    if pe.op == "badsubst" then -- ${x|html} and other unrecognized ${…} forms
+      io.stderr:write("curse: ${" .. (pe.raw or pe.name or "") .. "}: bad substitution\n")
+      error({ __curse_exit = 1 })
+    end
     if pe.op == "@" and pe.arg == "P" then -- ${x@P}: decode prompt escapes, then expand
       return expand_word(sh, P.parse_word(sh:prompt_escapes(sh:get(pe.name))))
     end
