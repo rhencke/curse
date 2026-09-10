@@ -957,7 +957,7 @@ local function make_parser(src)
       -- so defer the parse failure to eval (caught by the arithcmd handler) rather
       -- than aborting the whole parse.
       local ok, e = pcall(arith, body)
-      return { t = "arithcmd", line = line, expr = ok and e or { k = "matherr" } }
+      return { t = "arithcmd", line = line, expr = ok and e or { k = "matherr" }, redirs = tail_redirs() }
     end
     -- [[ EXPR ]] conditional (no word-splitting; == is glob, =~ is regex)
     if src:sub(i, i + 1) == "[[" and src:sub(i + 2, i + 2):match("[ \t]") then
@@ -998,7 +998,7 @@ local function make_parser(src)
           quoted[#toks] = (c1 == '"' or c1 == "'")
         end
       end
-      return { t = "dbracket", line = line, expr = parse_dbracket(toks, quoted) }
+      return { t = "dbracket", line = line, expr = parse_dbracket(toks, quoted), redirs = tail_redirs() }
     end
     -- brace group { list; }  and subshell ( list )  — optional trailing redirs
     if src:sub(i, i) == "{" and src:sub(i + 1, i + 1):match("[ \t\n]") then

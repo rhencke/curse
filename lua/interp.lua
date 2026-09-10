@@ -2470,7 +2470,8 @@ local function eval_dbracket(sh, node)
     elseif op == "=~" then
       -- a quoted part of the regex is matched literally (bash), so re-expand with
       -- regex-escaping of quoted segments instead of using the plain rhs.
-      local caps = rt.regex_captures(l, expand_regex(sh, node.r), ic) -- real POSIX ERE + BASH_REMATCH
+      local caps, bad = rt.regex_captures(l, expand_regex(sh, node.r), ic) -- real POSIX ERE + BASH_REMATCH
+      if bad then error({ __curse_regexerr = true }) end -- invalid regex -> [[ ]] status 2
       sh:array_assign("BASH_REMATCH", caps or {}, false)
       return caps ~= nil
     elseif op == "-eq" or op == "-ne" or op == "-lt" or op == "-le" or op == "-gt" or op == "-ge" then
@@ -2533,7 +2534,9 @@ local function exec_stmt(sh, st, hook)
   if st.redirs and COMPOUND_REDIR[t] then
     local rd = st.redirs
     local save, ok = apply_redirs(sh, rd)
-    if not ok then sh.status = 1; restore_redirs(save); return end
+    if not ok then sh.status = 1; restore_redirs(save)
+      if sh.opt_e then error({ __curse_exit = 1 }) end -- errexit: a redirect failure exits
+      return end
     local savedout = sh.out; if redirs_touch_stdout(rd) then sh.out = io.write end
     st.redirs = nil
     local pok, err = pcall(exec_stmt, sh, st, hook)
@@ -2874,6 +2877,7 @@ local function exec_stmt(sh, st, hook)
     -- (e.g. `[[ a =~ $((1/0)) ]]`): it yields status 1 and execution continues.
     local ok, v = pcall(eval_dbracket, sh, st.expr)
     if ok then sh.status = v and 0 or 1
+    elseif type(v) == "table" and v.__curse_regexerr then sh.status = 2
     elseif type(v) == "table" and v.__curse_matherr then sh.status = 1
     else error(v) end
   elseif t == "case" then

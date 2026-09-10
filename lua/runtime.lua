@@ -771,7 +771,9 @@ end
 local NMATCH = 20
 local pmatch = ffi.new("struct { int rm_so; int rm_eo; }[?]", NMATCH)
 function M.regex_captures(s, ere, icase)
-  if ffi.C.regcomp(regbuf, ere, REG_EXTENDED + (icase and REG_ICASE or 0)) ~= 0 then return nil end -- no NOSUB: need offsets
+  -- second return = "invalid regex" (regcomp failed): [[ =~ ]] must report status
+  -- 2 for that, distinct from a valid regex that simply does not match (nil, nil).
+  if ffi.C.regcomp(regbuf, ere, REG_EXTENDED + (icase and REG_ICASE or 0)) ~= 0 then return nil, true end
   local rc = ffi.C.regexec(regbuf, s, NMATCH, pmatch, 0)
   ffi.C.regfree(regbuf)
   if rc ~= 0 then return nil end
