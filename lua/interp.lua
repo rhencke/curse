@@ -2378,7 +2378,7 @@ local function exec_simple(sh, args, hook, no_func)
             end
           else -- flag, no argument
             cur = cur + 1; if 1 + cur > #word then optind = optind + 1; cur = 1 end
-            res = { opt = oc, arg = "" } -- a no-arg option clears OPTARG
+            res = { opt = oc, clr = true } -- a no-arg option UNSETS OPTARG (bash)
           end
         end
       end
@@ -2388,7 +2388,7 @@ local function exec_simple(sh, args, hook, no_func)
     if res.done then sh:set_str(vname, "?"); sh.getopts_cur = 1; sh.status = 1
     else
       sh:set_str(vname, res.opt)
-      if res.arg ~= nil then sh:set_str("OPTARG", res.arg) elseif res.err then sh.vars["OPTARG"] = nil end
+      if res.arg ~= nil then sh:set_str("OPTARG", res.arg) elseif res.err or res.clr then sh.vars["OPTARG"] = nil end
       if res.err then io.stderr:write("curse: " .. res.err .. "\n") end
       sh.status = 0
     end
