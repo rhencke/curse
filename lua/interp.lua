@@ -2768,6 +2768,11 @@ local function exec_stmt(sh, st, hook)
     elseif type(v) == "table" and v.__curse_matherr then sh.status = 1
     else error(v) end
   elseif t == "dbracket" then
+    if st.expr and st.expr.kind == "syntaxerr" then -- malformed [[ ]]: fatal syntax error (bash aborts)
+      io.stderr:write("curse: syntax error in conditional expression\n"); sh.status = 2
+      if not sh.opt_i then error({ __curse_exit = 2 }) end
+      return
+    end
     -- like `(( ))`, a `[[ ]]` test is not fatal on an arith error in an operand
     -- (e.g. `[[ a =~ $((1/0)) ]]`): it yields status 1 and execution continues.
     local ok, v = pcall(eval_dbracket, sh, st.expr)

@@ -421,20 +421,23 @@ end
 --   {kind="unary", op, word} | {kind="binary", op, l, r, rq}
 -- `rq` marks the RHS of ==/!= as fully-quoted (literal, not a glob).
 local function parse_dbracket(toks, quoted)
-  local pos = 1
+  local pos, serr = 1, false
   local function peek() return toks[pos] end
   local parse_or
   local function primary()
     local t = peek()
+    if t == nil then serr = true; return { kind = "str", word = parse_word("") } end -- expected an operand
     if t == "!" then pos = pos + 1; return { kind = "not", e = primary() } end
-    if t == "(" then pos = pos + 1; local e = parse_or(); if peek() == ")" then pos = pos + 1 end; return e end
+    if t == "(" then pos = pos + 1; local e = parse_or(); if peek() == ")" then pos = pos + 1 else serr = true end; return e end
     if t and t:match("^%-[a-zA-Z]$") then -- unary file/string test
+      if toks[pos + 1] == nil then serr = true end -- a unary op needs an operand
       pos = pos + 2; return { kind = "unary", op = t, word = parse_word(toks[pos - 1] or "") }
     end
     pos = pos + 1 -- consume lhs
     local op = peek()
     if op == "==" or op == "!=" or op == "=~" or op == "=" or op == "<" or op == ">"
       or (op and op:match("^%-[a-z][a-z]$")) then
+      if toks[pos + 1] == nil then serr = true end -- a binary op needs a rhs
       pos = pos + 1
       local r = toks[pos]; pos = pos + 1
       return { kind = "binary", op = op, l = parse_word(t), r = parse_word(r or ""),
@@ -452,7 +455,10 @@ local function parse_dbracket(toks, quoted)
     while peek() == "||" do pos = pos + 1; l = { kind = "or", l = l, r = parse_and() } end
     return l
   end
-  return parse_or()
+  local ast = parse_or()
+  -- empty `[[ ]]`, a dangling/extra operand, or a leftover token is a syntax error
+  if serr or #toks == 0 or pos <= #toks then return { kind = "syntaxerr" } end
+  return ast
 end
 M.parse_dbracket = parse_dbracket
 
