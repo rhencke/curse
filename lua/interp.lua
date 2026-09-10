@@ -1558,6 +1558,7 @@ local function exec_simple(sh, args, hook)
     -- the process env so posix_spawn children inherit it. -A marks associative,
     -- -p prints declarations.
     local doexport, assoc, printmode, nref, plusn = (cmd == "export"), false, false, false, false
+    local plusx = false
     local funcnames, funcbody, iattr, lattr, uattr, rattr, aattr = false, false, false, false, false, false, false
     local rest = {}
     for j = 2, #args do
@@ -1577,6 +1578,7 @@ local function exec_simple(sh, args, hook)
         if a:find("a") then aattr = true end
       elseif a:sub(1, 1) == "+" and #a > 1 then
         if a:find("n") then plusn = true end
+        if a:find("x") then plusx = true end -- +x: drop the export attribute
       else rest[#rest + 1] = a end
     end
     -- listing a subset of variables (bare `declare`/`export`/`readonly`, or with
@@ -1601,12 +1603,13 @@ local function exec_simple(sh, args, hook)
     if funcnames or funcbody then
       -- declare -F [name…] lists `declare -f NAME`; -f prints bodies (not
       -- reconstructed here) — either way the exit status signals existence.
-      local names, allok = rest, true
+      local names, allok, named = rest, true, #rest > 0
       if #names == 0 then
         names = {}; for k in pairs(sh.functions) do names[#names + 1] = k end; table.sort(names)
       end
       for _, nm in ipairs(names) do
-        if sh.functions[nm] then if funcnames then sh:echo("declare -f " .. nm) end
+        -- `declare -F NAME` prints just NAME; bare `declare -F` prints `declare -f NAME`.
+        if sh.functions[nm] then if funcnames then sh:echo(named and nm or ("declare -f " .. nm)) end
         else allok = false end
       end
       sh.status = allok and 0 or 1
@@ -1622,9 +1625,13 @@ local function exec_simple(sh, args, hook)
       sh.status = allok and 0 or 1
     else
       local roattr = (cmd == "readonly") or rattr
+      local allok = true
       for _, a in ipairs(rest) do
         local nm, op, val = a:match("^([%a_][%w_]*)(%+?=)(.*)$")
-        if nm then
+        if nm and sh.vars[sh:deref(nm)] and sh.vars[sh:deref(nm)].ro then
+          -- reassigning a readonly variable is rejected (bash: `typeset +r r=v` too)
+          io.stderr:write("curse: " .. cmd .. ": " .. nm .. ": readonly variable\n"); allok = false
+        elseif nm then
           local ap = (op == "+=")
           if nref then sh:make_nameref(nm, val)
           elseif iattr then -- declare -i: arith-evaluate the value, mark integer
@@ -1641,8 +1648,10 @@ local function exec_simple(sh, args, hook)
             if doexport then C.setenv(nm, sh:get(nm), 1) end
           end
           if roattr and sh.vars[sh:deref(nm)] then sh.vars[sh:deref(nm)].ro = true end
+          if plusx then C.unsetenv(nm) end -- +x drops the export attribute
         elseif a:match("^[%a_][%w_]*$") then
           if plusn then sh:unref(a)
+          elseif plusx then C.unsetenv(a)
           elseif nref then sh:make_nameref(a)
           elseif iattr then sh.vars[a] = sh.vars[a] or {}; sh.vars[a].int = true
           elseif lattr or uattr then
@@ -1653,7 +1662,7 @@ local function exec_simple(sh, args, hook)
           if roattr then sh.vars[a] = sh.vars[a] or {}; sh.vars[a].ro = true end
         end
       end
-      sh.status = 0
+      sh.status = allok and 0 or 1
     end
   elseif cmd == "set" then
     -- set [-e|+e|-o NAME|+o NAME|…] [--] [ARGS…]: options then positional params

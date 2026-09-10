@@ -811,7 +811,7 @@ local function make_parser(src)
     -- `git-foo`, `a.b`), so match a run of non-metacharacter word bytes here.
     if peekword() == "function" then
       ws(); i = i + 8; ws()
-      local s, e = src:find("^[%w_][%w_%.%-:+@]*", i)
+      local s, e = src:find("^[%w_][%w_%.%-:+@/]*", i)
       if not s then error("function needs a name") end
       local nm = src:sub(s, e); i = e + 1; ws()
       -- optional `( )` (bash: `function f () { … }`, spaces allowed between parens)
@@ -822,7 +822,7 @@ local function make_parser(src)
       return { t = "funcdef", name = nm, body = func_body() }
     end
     do
-      local s, e = src:find("^[%w_][%w_%.%-:+@]*", i)
+      local s, e = src:find("^[%w_][%w_%.%-:+@/]*", i)
       if s then
         local j = e + 1
         while src:sub(j, j):match("[ \t]") do j = j + 1 end
