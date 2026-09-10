@@ -2862,7 +2862,9 @@ local function exec_stmt(sh, st, hook)
     sh:set_str("_", "") -- a bare assignment resets $_ to empty (bash)
   elseif t == "arrayassign" then
     local rb = sh.vars[sh:deref(st.name)]
-    if rb and rb.ro then -- readonly array: reject the (re)assignment
+    if st.index then -- `a[0]=(1 2)`: can't assign a list to an array MEMBER (bash)
+      io.stderr:write("curse: " .. st.name .. "[" .. st.index .. "]: cannot assign list to array member\n"); sh.status = 1
+    elseif rb and rb.ro then -- readonly array: reject the (re)assignment
       io.stderr:write("curse: " .. st.name .. ": readonly variable\n"); sh.status = 1
     else
       do_arrayassign(sh, st)
