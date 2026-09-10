@@ -11,10 +11,12 @@
 -- of the runner second).
 local mode = "interp"
 local verbose = false
+local diff = false
 local filters = {}
 for _, a in ipairs(arg) do
   if a == "--interp" or a == "--compiled" or a == "--cached" then mode = a:sub(3)
   elseif a == "--verbose" then verbose = true
+  elseif a == "--diff" then verbose = true; diff = true
   elseif a:sub(1, 2) == "--" then -- ignore unknown flags
   else filters[#filters + 1] = a end
 end
@@ -108,6 +110,10 @@ for _, path in ipairs(files) do
       pass = pass + 1
     elseif verbose then
       io.write(("  FAIL %s: %s\n"):format(path:match("[^/]+$"), c.name))
+      if diff then
+        io.write(("    CODE: %s\n    bash=[%s](%d)  curse=[%s](%d)\n")
+          :format(c.code:gsub("\n", "\\n"), bout:gsub("\n", "\\n"), bst, cout:gsub("\n", "\\n"), cst))
+      end
     end
     total = total + 1
   end

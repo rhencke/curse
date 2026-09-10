@@ -30,14 +30,14 @@ if mode == "cached" then
   -- path (one-shot invocations that recur), reported on stderr for visibility.
   local Cache = require("cache")
   local f = assert(io.open(script, "r")); local src = f:read("*a"); f:close()
-  sh = T.rt.Shell.new()
+  sh = T.rt.Shell.new(); sh.argv0 = script
   local _, how = Cache.run(src, sh)
   if os.getenv("CURSE_CACHE_DEBUG") then io.stderr:write("[cache: " .. how .. "]\n") end
 elseif mode == "tiered" then
   sh = T.run_background(script, { luajit = os.getenv("CURSE_LUAJIT") or "luajit" })
 else
   local f = assert(io.open(script, "r")); local src = f:read("*a"); f:close()
-  sh = T.rt.Shell.new()
+  sh = T.rt.Shell.new(); sh.argv0 = script
   if mode == "compiled" then
     T.compile(T.parser.parse(src)).run(sh, nil)
   elseif mode == "interp" then

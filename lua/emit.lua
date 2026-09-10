@@ -88,7 +88,9 @@ local function emit_word(w, lifted)
     elseif p.special then
       if p.special == "#" then parts[#parts + 1] = "tostring(sh.nparams)"
       elseif p.special == "@" or p.special == "*" then parts[#parts + 1] = 'sh:paramsJoin(" ")'
-      elseif p.special == "?" then parts[#parts + 1] = "tostring(sh.status)" end
+      elseif p.special == "?" then parts[#parts + 1] = "tostring(sh.status)"
+      elseif p.special == "$" then parts[#parts + 1] = "tostring(sh:pid())"
+      elseif p.special == "!" then parts[#parts + 1] = '(sh.last_bg_pid or "")' end
     elseif p.arithast then -- a pre-parsed+substituted arith AST (inlined word)
       parts[#parts + 1] = "rt.i64_to_str(" .. emit_value(p.arithast, lifted) .. ")"
     elseif p.arith then

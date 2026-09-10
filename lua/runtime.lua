@@ -15,10 +15,14 @@ local Shell = {}
 Shell.__index = Shell
 M.Shell = Shell
 
+local seeded = false
 function Shell.new()
+  if not seeded then math.randomseed(os.time() + tonumber(ffi.C.getpid and ffi.C.getpid() or 0)); seeded = true end
   return setmetatable({
     vars = {},       -- name -> { s = string?, n = int64? }  (lazy: fill on demand)
     status = 0,      -- $?
+    argv0 = "bash",  -- $0 (set by the CLI/daemon to the script/shell name)
+    start_time = os.time(), -- for $SECONDS
     params = {},     -- positional $1..
     out = io.write,  -- stdout sink (swappable for capture)
     forstate = {},   -- loop id -> { list = {strings}, idx } for `for x in`; kept
@@ -39,8 +43,12 @@ function Shell.new()
   }, Shell)
 end
 
--- positional parameters ($# is read directly as sh.nparams)
-function Shell:param(n) return (n <= self.nparams) and self.params[n] or "" end
+-- positional parameters ($# is read directly as sh.nparams). $0 is the script/
+-- shell name (not a positional; not affected by set/shift).
+function Shell:param(n)
+  if n == 0 then return self.argv0 or "bash" end
+  return (n <= self.nparams) and self.params[n] or ""
+end
 function Shell:paramsJoin(sep) return table.concat(self.params, sep or " ", 1, self.nparams) end
 
 -- Positional-only call boundary: push args (varargs) into the depth pool — no
@@ -213,10 +221,33 @@ local function i64_to_str(n)
 end
 M.i64_to_str = i64_to_str
 
+-- Dynamic special variables (only when not explicitly set). Many spec cases just
+-- check these "look like" a PID/uid/path, so exact values rarely matter.
+ffi.cdef [[
+  int getpid(void); int getppid(void); int getuid(void); int geteuid(void);
+  char *getcwd(char *buf, unsigned long size);
+]]
+local scratch = ffi.new("char[4096]")
+local pid_cache
+function Shell:pid() if not pid_cache then pid_cache = tonumber(ffi.C.getpid()) end return pid_cache end
+function Shell:special_get(name)
+  if name == "RANDOM" then return tostring(math.random(0, 32767)) end
+  if name == "PWD" then local p = ffi.C.getcwd(scratch, 4096); return p ~= nil and ffi.string(p) or "" end
+  if name == "PPID" then return tostring(tonumber(ffi.C.getppid())) end
+  if name == "UID" then return tostring(tonumber(ffi.C.getuid())) end
+  if name == "EUID" then return tostring(tonumber(ffi.C.geteuid())) end
+  if name == "BASHPID" then return tostring(self:pid()) end
+  if name == "OSTYPE" then return "linux-gnu" end
+  if name == "MACHTYPE" then return "x86_64-pc-linux-gnu" end
+  if name == "HOSTTYPE" then return "x86_64" end
+  if name == "SECONDS" then return tostring(os.time() - (self.start_time or os.time())) end
+  return ""
+end
+
 -- String value of a var (materialize from the cached int64 if needed).
 function Shell:get(name)
   local b = self.vars[name]
-  if b == nil then return "" end
+  if b == nil then return self:special_get(name) end
   if b.arr then return b.arr[0] or "" end -- $a == ${a[0]}
   if b.s == nil then
     if b.n == nil then return "" end
