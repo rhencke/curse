@@ -495,6 +495,7 @@ local BUILTINS = {
   read = 1, getopts = 1, printf = 1, ["local"] = 1, command = 1, type = 1, pwd = 1,
   eval = 1, source = 1, ["."] = 1, ["break"] = 1, ["continue"] = 1, ["true"] = 1,
   exec = 1, readonly = 1, umask = 1, alias = 1, unalias = 1, shopt = 1, wait = 1, trap = 1,
+  mapfile = 1, readarray = 1,
 }
 local KEYWORDS = {
   ["if"] = 1, ["then"] = 1, ["else"] = 1, ["elif"] = 1, ["fi"] = 1, ["for"] = 1,
@@ -1167,6 +1168,27 @@ local function exec_simple(sh, args, hook)
       end
       sh.status = had_nl and 0 or 1
     end
+  elseif cmd == "mapfile" or cmd == "readarray" then
+    -- mapfile [-t] [-d delim] [ARRAY]: read stdin lines into ARRAY (default MAPFILE)
+    local strip, arr, j, dch = false, "MAPFILE", 2, "\n"
+    while args[j] do
+      local a = args[j]
+      if a == "-t" then strip = true; j = j + 1
+      elseif a == "-d" then dch = (args[j + 1] or "\n"):sub(1, 1); if dch == "" then dch = "\0" end; j = j + 2
+      elseif a == "-n" or a == "-O" or a == "-s" or a == "-u" or a == "-c" or a == "-C" then j = j + 2
+      elseif a:sub(1, 1) == "-" and #a > 1 then j = j + 1
+      else break end
+    end
+    if args[j] then arr = args[j] end
+    local lines, buf = {}, {}
+    while true do
+      local c = io.read(1)
+      if c == nil then if #buf > 0 then lines[#lines + 1] = table.concat(buf) end break end
+      buf[#buf + 1] = c
+      if c == dch then lines[#lines + 1] = strip and table.concat(buf):sub(1, -2) or table.concat(buf); buf = {} end
+    end
+    sh:array_assign(arr, lines, false)
+    sh.status = 0
   elseif cmd == "shift" then
     local nn = tonumber(args[2]) or 1
     if nn > sh.nparams then nn = sh.nparams end
