@@ -544,7 +544,12 @@ local function expand_part_str(sh, p)
       error({ __curse_exit = 1, __curse_experr = true }) -- fails the command, non-fatal
     end
     if pe.op == "@" and pe.arg == "P" then -- ${x@P}: decode prompt escapes, then expand
-      return expand_word(sh, P.parse_word(sh:prompt_escapes(sh:get(pe.name))))
+      local decoded = sh:prompt_escapes(sh:get(pe.name))
+      -- The decode output is already final; only re-expand it for $var/$(…)/`…`
+      -- (promptvars). Re-parsing as a word otherwise eats decoded backslashes
+      -- (e.g. `\x55` -> `\x55`, a lone `\` stays `\`), which bash keeps.
+      if not decoded:find("[$`]") then return decoded end
+      return expand_word(sh, P.parse_word(decoded))
     end
     if pe.op == "indirect" then -- ${!ref} / ${!ref OP}: resolve the name, then expand it
       local ip = indirect_part(sh, pe)
