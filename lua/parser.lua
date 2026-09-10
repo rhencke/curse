@@ -1094,8 +1094,9 @@ local function make_parser(src)
           if s == "dsemi_amp" then i = i + 3; term = "test"; break end -- ;;&
           if s == "semi_amp" then i = i + 2; term = "fall"; break end  -- ;&
           if s == "eof" or peekword() == "esac" then break end
+          local before = i
           local st = parse_stmt()
-          if not st then break end
+          if not st or i == before then break end -- no progress (e.g. a stray `)`): stop, don't spin
           body[#body + 1] = st
         end
         clauses[#clauses + 1] = { pats = pats, body = body, term = term }
