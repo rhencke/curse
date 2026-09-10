@@ -28,6 +28,10 @@ while true do
   local a = arg[ai]
   if a == "-e" or a == "+e" then presets[#presets + 1] = { f = "opt_e", on = a == "-e" }; ai = ai + 1
   elseif a == "-i" then presets[#presets + 1] = { f = "opt_i", on = true }; ai = ai + 1
+  elseif a == "-l" or a == "--login" or a == "-x" or a == "+x" or a == "-v" or a == "+v"
+    or a == "-s" or a == "-B" or a == "+B" or a == "-h" or a == "+h" then ai = ai + 1 -- accepted, no-op
+  elseif a == "--" then ai = ai + 1; break -- end of options
+  elseif a == "-" then break -- `-` stops option processing; the script/args follow
   elseif a == "-u" or a == "+u" then presets[#presets + 1] = { f = "opt_u", on = a == "-u" }; ai = ai + 1
   elseif a == "-C" or a == "+C" then presets[#presets + 1] = { f = "opt_C", on = a == "-C" }; ai = ai + 1
   elseif a == "-o" or a == "+o" then presets[#presets + 1] = { o = arg[ai + 1], on = a == "-o" }; ai = ai + 2
@@ -45,8 +49,8 @@ local function apply(s)
   end
 end
 
--- `-c CODE [name [args…]]` — run a command string like `sh -c`.
-if arg[ai] == "-c" then
+-- `-c CODE [name [args…]]` — run a command string like `sh -c` (`+c` is accepted).
+if arg[ai] == "-c" or arg[ai] == "+c" then
   sh = T.rt.Shell.new(); apply(sh); sh.opt_c = true
   sh.argv0 = arg[ai + 2] or "curse"
   for k = ai + 3, #arg do sh.nparams = sh.nparams + 1; sh.params[sh.nparams] = arg[k] end
@@ -54,10 +58,17 @@ if arg[ai] == "-c" then
   io.flush(); os.exit(sh.status or 0)
 end
 
--- No script (`-i` already consumed as a leading option): interactive REPL.
+-- No script argument. With a tty on stdin (or -i) start the REPL; otherwise read
+-- commands from stdin and run them non-interactively (e.g. `echo cmd | sh`).
 if arg[ai] == nil then
-  sh = T.rt.Shell.new(); apply(sh); sh.argv0 = "curse"; sh.opt_i = true
-  require("repl").run(sh)
+  sh = T.rt.Shell.new(); apply(sh); sh.argv0 = "curse"
+  local istty = require("ffi").C.isatty(0) == 1
+  if sh.opt_i or istty then
+    sh.opt_i = true; require("repl").run(sh)
+  else
+    local src = io.read("*a") or ""
+    T.interp.run_lazy(sh, src)
+  end
   io.flush(); os.exit(sh.status or 0)
 end
 
