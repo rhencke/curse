@@ -491,11 +491,21 @@ local function split_top_comma(inner)
 end
 -- classify the inside of a {…}: a numeric/char range (symbolic) or a comma list
 -- (raw alternatives, possibly themselves containing braces), or nil (not a brace).
+-- bash zero-pads a numeric range to the widest endpoint iff either endpoint has
+-- a leading zero (e.g. {01..3} -> 01 02 03, {01..003} -> 001 002 003).
+local function num_pad_width(a, b)
+  if a:match("^%-?0%d") or b:match("^%-?0%d") then
+    return math.max(#(a:gsub("^%-", "")), #(b:gsub("^%-", "")))
+  end
+  return nil
+end
 local function classify_brace(inner)
   local a2, b2, s2 = inner:match("^(-?%d+)%.%.(-?%d+)%.%.(-?%d+)$")
-  if a2 then return { range = { a = tonumber(a2), b = tonumber(b2), step = math.max(1, math.abs(tonumber(s2))), char = false } } end
+  if a2 then return { range = { a = tonumber(a2), b = tonumber(b2), step = math.max(1, math.abs(tonumber(s2))), char = false, width = num_pad_width(a2, b2) } } end
   local a, b = inner:match("^(-?%d+)%.%.(-?%d+)$")
-  if a then return { range = { a = tonumber(a), b = tonumber(b), step = 1, char = false } } end
+  if a then return { range = { a = tonumber(a), b = tonumber(b), step = 1, char = false, width = num_pad_width(a, b) } } end
+  local ca3, cb3, cs3 = inner:match("^(%a)%.%.(%a)%.%.(-?%d+)$")
+  if ca3 then return { range = { a = ca3:byte(), b = cb3:byte(), step = math.max(1, math.abs(tonumber(cs3))), char = true } } end
   local ca, cb = inner:match("^(%a)%.%.(%a)$")
   if ca then return { range = { a = ca:byte(), b = cb:byte(), step = 1, char = true } } end
   local parts = split_top_comma(inner)
@@ -549,6 +559,11 @@ M.brace_factors = brace_factors
 
 local brace_stream -- forward (mutually recursive with itself over nested alts)
 local function range_count(r) return math.floor(math.abs(r.b - r.a) / r.step) + 1 end
+local function pad_num(v, w) -- zero-pad |v| to width w digits, keeping the sign
+  local d = tostring(math.abs(v))
+  if #d < w then d = string.rep("0", w - #d) .. d end
+  return (v < 0 and "-" or "") .. d
+end
 -- Stream every expansion of `factors` to emit(str); ranges iterate symbolically
 -- (never materialized). If emit returns true the stream STOPS — this is how a
 -- consumer bounds a pathological expansion after N results without iterating the
@@ -564,7 +579,7 @@ local function stream_factors(factors, emit)
       local r = f.range
       for k = 0, range_count(r) - 1 do
         local v = (r.a <= r.b) and (r.a + k * r.step) or (r.a - k * r.step)
-        go(idx + 1, acc .. (r.char and string.char(v) or tostring(v)))
+        go(idx + 1, acc .. (r.char and string.char(v) or (r.width and pad_num(v, r.width) or tostring(v))))
         if stopped then return end
       end
     else -- list: each alt may itself contain braces -> stream recursively
