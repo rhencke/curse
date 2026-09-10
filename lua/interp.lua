@@ -359,6 +359,16 @@ local function exec_simple(sh, args, hook)
       sh.params = np; sh.nparams = n
     end
     sh.status = 0
+  elseif cmd == "printf" and args[2] == "-v" then
+    -- printf -v VAR FMT ARGS: format via external printf, capture, assign to VAR
+    local var = args[3]
+    local buf, saved = {}, sh.out
+    sh.out = function(s) buf[#buf + 1] = s end
+    local pa = { "printf" }; for k = 4, #args do pa[#pa + 1] = args[k] end
+    sh:exec(unpack(pa))
+    sh.out = saved
+    sh:set_str(var, table.concat(buf))
+    sh.status = 0
   elseif cmd == "read" then
     -- read [-r] [-a arr] [-p prompt] VAR...  (line from stdin, split on IFS)
     local raw, arr, j = false, nil, 2
