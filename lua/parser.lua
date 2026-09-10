@@ -300,6 +300,144 @@ local function parse_dbracket(toks, quoted)
 end
 M.parse_dbracket = parse_dbracket
 
+-- ---- brace expansion ({a,b,c}, {m..n}, {m..n..step}, {a..z}) ----
+-- Textual, before any other expansion; applies to command words and for-in
+-- lists (NOT assignment RHS). Quoted regions are skipped.
+--
+-- Anti-"billion laughs": a word is parsed ONCE into factors (literal chunks and
+-- brace groups); ranges stay symbolic (a,b,step), never materialized. Combinations
+-- are produced by an odometer that STREAMS each result to a callback — so a huge
+-- expansion never builds a giant intermediate. Consumers decide the policy:
+-- for-in streams lazily (unbounded — `for i in {1..1e9}` runs in O(1) memory,
+-- better than bash which OOMs); argv materialization caps at BRACE_CAP (an argv
+-- can't be infinite). Nothing is a fatal error and nothing is silently dropped
+-- to literal — the expansion always happens, just lazily when it's large.
+local BRACE_CAP = 100000
+
+local function split_top_comma(inner)
+  local parts, depth, start = {}, 0, 1
+  for i = 1, #inner do
+    local c = inner:sub(i, i)
+    if c == "{" then depth = depth + 1
+    elseif c == "}" then depth = depth - 1
+    elseif c == "," and depth == 0 then parts[#parts + 1] = inner:sub(start, i - 1); start = i + 1 end
+  end
+  parts[#parts + 1] = inner:sub(start)
+  return parts
+end
+-- classify the inside of a {…}: a numeric/char range (symbolic) or a comma list
+-- (raw alternatives, possibly themselves containing braces), or nil (not a brace).
+local function classify_brace(inner)
+  local a2, b2, s2 = inner:match("^(-?%d+)%.%.(-?%d+)%.%.(-?%d+)$")
+  if a2 then return { range = { a = tonumber(a2), b = tonumber(b2), step = math.max(1, math.abs(tonumber(s2))), char = false } } end
+  local a, b = inner:match("^(-?%d+)%.%.(-?%d+)$")
+  if a then return { range = { a = tonumber(a), b = tonumber(b), step = 1, char = false } } end
+  local ca, cb = inner:match("^(%a)%.%.(%a)$")
+  if ca then return { range = { a = ca:byte(), b = cb:byte(), step = 1, char = true } } end
+  local parts = split_top_comma(inner)
+  if #parts > 1 then return { list = parts } end
+  return nil
+end
+-- Parse a raw word into factors, or nil if it has no expandable brace.
+local function brace_factors(s)
+  local factors, litbuf, any = {}, {}, false
+  local function flush() if #litbuf > 0 then factors[#factors + 1] = { lit = table.concat(litbuf) }; litbuf = {} end end
+  local i = 1
+  while i <= #s do
+    local c = s:sub(i, i)
+    if c == "'" or c == '"' then
+      litbuf[#litbuf + 1] = c; i = i + 1
+      while i <= #s and s:sub(i, i) ~= c do litbuf[#litbuf + 1] = s:sub(i, i); i = i + 1 end
+      if i <= #s then litbuf[#litbuf + 1] = c; i = i + 1 end
+    elseif c == "{" then
+      local d, j = 1, i + 1
+      while j <= #s and d > 0 do
+        local cc = s:sub(j, j)
+        if cc == "{" then d = d + 1 elseif cc == "}" then d = d - 1 end
+        if d == 0 then break end
+        j = j + 1
+      end
+      if d == 0 then
+        local f = classify_brace(s:sub(i + 1, j - 1))
+        if f then flush(); factors[#factors + 1] = f; any = true
+        else litbuf[#litbuf + 1] = s:sub(i, j) end
+        i = j + 1
+      else litbuf[#litbuf + 1] = c; i = i + 1 end
+    else litbuf[#litbuf + 1] = c; i = i + 1 end
+  end
+  flush()
+  return any and factors or nil
+end
+M.brace_factors = brace_factors
+
+local brace_stream -- forward (mutually recursive with itself over nested alts)
+local function range_count(r) return math.floor(math.abs(r.b - r.a) / r.step) + 1 end
+-- Stream every expansion of `factors` to emit(str); ranges iterate symbolically
+-- (never materialized). If emit returns true the stream STOPS — this is how a
+-- consumer bounds a pathological expansion after N results without iterating the
+-- rest (so a {1..1e9} range costs O(N), not O(1e9)).
+local function stream_factors(factors, emit)
+  local stopped = false
+  local function go(idx, acc)
+    if stopped then return end
+    if idx > #factors then if emit(acc) then stopped = true end return end
+    local f = factors[idx]
+    if f.lit then go(idx + 1, acc .. f.lit)
+    elseif f.range then
+      local r = f.range
+      for k = 0, range_count(r) - 1 do
+        local v = (r.a <= r.b) and (r.a + k * r.step) or (r.a - k * r.step)
+        go(idx + 1, acc .. (r.char and string.char(v) or tostring(v)))
+        if stopped then return end
+      end
+    else -- list: each alt may itself contain braces -> stream recursively
+      for _, alt in ipairs(f.list) do
+        brace_stream(alt, function(x) go(idx + 1, acc .. x); return stopped end)
+        if stopped then return end
+      end
+    end
+  end
+  go(1, "")
+end
+brace_stream = function(s, emit)
+  local f = brace_factors(s)
+  if not f then emit(s) else stream_factors(f, emit) end
+end
+M.brace_stream = brace_stream
+M.stream_factors = stream_factors
+
+-- Cheap count of a factor list's total expansions, capped (returns >BRACE_CAP as
+-- soon as it's known to exceed, without building anything).
+local function count_str(s)
+  local f = brace_factors(s); if not f then return 1 end
+  local total = 1
+  for _, fac in ipairs(f) do
+    local c
+    if fac.lit then c = 1
+    elseif fac.range then c = range_count(fac.range)
+    else c = 0; for _, alt in ipairs(fac.list) do c = c + count_str(alt); if c > BRACE_CAP then break end end end
+    total = total * c
+    if total > BRACE_CAP then return total end
+  end
+  return total
+end
+M.brace_count = count_str
+M.BRACE_CAP = BRACE_CAP
+
+-- Append a raw word to a word-list, brace-expanding it. Streams combinations
+-- (ranges symbolic) and STOPS after BRACE_CAP words — so a pathological
+-- expansion costs O(cap), never blows up, and is neither a fatal error nor
+-- silently dropped to literal: it expands, just bounded.
+local function add_word(words, w)
+  local factors = brace_factors(w)
+  if not factors then words[#words + 1] = parse_word(w); return end
+  local n = 0
+  stream_factors(factors, function(x)
+    words[#words + 1] = parse_word(x); n = n + 1
+    return n >= BRACE_CAP -- true -> stop the stream
+  end)
+end
+
 -- strip surrounding quotes from a raw shell word (subset: whole-word "…" or '…')
 local function unquote(w)
   if #w >= 2 and ((w:sub(1, 1) == '"' and w:sub(-1) == '"') or (w:sub(1, 1) == "'" and w:sub(-1) == "'")) then
@@ -443,7 +581,7 @@ function M.parse(src)
         if c == ";" or c == "\n" or c == "" or c == "#" then break end
         if peekword() == "do" then break end
         local w = word(); if w == "" then break end
-        words[#words + 1] = parse_word(w)
+        add_word(words, w)
       end
       loopId = loopId + 1; local id = loopId
       skipsep()
@@ -594,7 +732,7 @@ function M.parse(src)
       else
         local w = word()
         if w == "" then break end
-        words[#words + 1] = parse_word(w)
+        add_word(words, w)
       end
     end
     if #words == 0 and #redirs == 0 then return nil end
