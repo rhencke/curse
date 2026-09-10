@@ -367,6 +367,18 @@ function Shell:get(name)
   return b.s
 end
 
+-- Like :get, but enforces `set -u` (nounset) for a user-level $var reference.
+-- The compiled backend uses this for word expansion so it matches the interp,
+-- which checks nounset at the same point. (:get itself is used for internal
+-- reads like IFS/HOME that must not trip nounset.)
+function Shell:get_u(name)
+  if self.opt_u and self.vars[self:deref(name)] == nil and self:special_get(name) == ""
+      and name ~= "@" and name ~= "*" then
+    io.stderr:write("curse: " .. name .. ": unbound variable\n"); error({ __curse_exit = 1 })
+  end
+  return self:get(name)
+end
+
 -- int64 value of a var for arithmetic (use the cache, else parse the string).
 function Shell:aget(name)
   name = self:deref(name)

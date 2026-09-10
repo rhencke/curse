@@ -78,7 +78,8 @@ else
   local f = assert(io.open(script, "r")); local src = f:read("*a"); f:close()
   sh = T.rt.Shell.new(); apply(sh); sh.argv0 = script
   if mode == "compiled" then
-    T.compile(T.parser.parse(src)).run(sh, nil)
+    local mod = T.compile(T.parser.parse(src))
+    T.interp.finish_run(sh, function() mod.run(sh, nil) end)
   elseif mode == "interp" then
     T.interp.run_lazy(sh, src) -- lazy: instant start, never parses past exit
   else

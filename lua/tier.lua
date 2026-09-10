@@ -87,7 +87,7 @@ function M.run_background(script_path, opts)
   os.remove(out)
   if ok then return sh, "interp-only", count end
   if type(err) == "table" and err.__curse_switch then
-    mod.run(sh, resume_pc(mod, resume))
+    I.finish_run(sh, function() mod.run(sh, resume_pc(mod, resume)) end)
     return sh, "switched-after-" .. count .. "-safepoints", count
   end
   error(err)

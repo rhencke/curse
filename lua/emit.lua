@@ -159,7 +159,7 @@ local function emit_word(w, lifted)
     if p.lit then parts[#parts + 1] = ("%q"):format(p.lit)
     elseif p.raw then parts[#parts + 1] = p.raw -- pre-computed Lua string expr (inlined param)
     elseif p.var then
-      parts[#parts + 1] = lifted[p.var] and ("rt.i64_to_str(%s)"):format(lname(p.var)) or ("sh:get(%q)"):format(p.var)
+      parts[#parts + 1] = lifted[p.var] and ("rt.i64_to_str(%s)"):format(lname(p.var)) or ("sh:get_u(%q)"):format(p.var)
     elseif p.param then parts[#parts + 1] = ("sh:param(%d)"):format(p.param)
     elseif p.special then
       if p.special == "#" then parts[#parts + 1] = "tostring(sh.nparams)"

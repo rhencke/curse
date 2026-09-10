@@ -2195,6 +2195,11 @@ function M.run(sh, ast, hook)
   finish(sh, pcall(exec_list, sh, ast.stmts, hook, true))
 end
 
+-- Top-level exit/return/EXIT-trap handling for a compiled run: wrap the compiled
+-- module's run() so `exit`, nounset, errexit etc. thrown from compiled/delegated
+-- code unwind cleanly (setting $?) instead of crashing as an uncaught table.
+function M.finish_run(sh, fn) finish(sh, pcall(fn)) end
+
 -- Run LAZILY from source: parse one top-level statement, execute it, repeat.
 -- Instant start on large scripts (no full parse up front), and it never
 -- tokenizes past an `exit` — so a hybrid shell+binary installer just works with
