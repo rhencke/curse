@@ -789,11 +789,15 @@ local exec_list  -- forward
 -- O_WRONLY|O_CREAT|O_TRUNC, 1089 = |O_APPEND, 0 = O_RDONLY; mode 0644.
 -- Feed a string as a command's stdin (heredoc/herestring): write to a temp file,
 -- open it, dup2 onto fd 0, unlink (the open fd keeps the inode alive).
+-- Move an opened fd `f` onto target `fd`. If open() already handed us the target
+-- (it returns the lowest free fd, e.g. 3 for `3<file`), dup2/close would close the
+-- very fd we just set up — so only dup2+close when they differ.
+local function place_fd(f, fd) if f ~= fd then C.dup2(f, fd); C.close(f) end end
 local function feed_stdin(fd, body)
   local tmp = os.tmpname()
   local w = io.open(tmp, "w"); if w then w:write(body); w:close() end
   local f = C.open(tmp, 0, 0)
-  if f >= 0 then C.dup2(f, fd); C.close(f) end
+  if f >= 0 then place_fd(f, fd) end
   os.remove(tmp)
 end
 -- Apply redirections, backing up each touched fd (any fd, not just 0/1/2) so it
@@ -811,16 +815,16 @@ local function apply_redirs(sh, redirs)
     if r.op == "out" then
       -- noclobber (set -C): O_EXCL so `>` fails on an existing file (705 adds O_EXCL)
       backup(r.fd); local f = C.open(tgt(r), sh.opt_C and 705 or 577, 420)
-      if f >= 0 then C.dup2(f, r.fd); C.close(f) else ok = false end
+      if f >= 0 then place_fd(f, r.fd) else ok = false end
     elseif r.op == "clobber" then -- `>|` truncates regardless of noclobber
       backup(r.fd); local f = C.open(tgt(r), 577, 420)
-      if f >= 0 then C.dup2(f, r.fd); C.close(f) else ok = false end
+      if f >= 0 then place_fd(f, r.fd) else ok = false end
     elseif r.op == "app" then
       backup(r.fd); local f = C.open(tgt(r), 1089, 420)
-      if f >= 0 then C.dup2(f, r.fd); C.close(f) else ok = false end
+      if f >= 0 then place_fd(f, r.fd) else ok = false end
     elseif r.op == "in" then
       backup(r.fd); local f = C.open(tgt(r), 0, 0)
-      if f >= 0 then C.dup2(f, r.fd); C.close(f) else ok = false end
+      if f >= 0 then place_fd(f, r.fd) else ok = false end
     elseif r.op == "outboth" then -- `&>` truncation honors noclobber (O_EXCL) too
       backup(1); backup(2); local f = C.open(tgt(r), sh.opt_C and 705 or 577, 420)
       if f >= 0 then C.dup2(f, 1); C.dup2(f, 2); C.close(f) else ok = false end

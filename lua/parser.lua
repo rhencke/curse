@@ -779,17 +779,17 @@ local function make_parser(src)
       elseif src:sub(q, q + 1) == ">|" then op = "clobber"; tfd = fd and tonumber(fd) or 1; q = q + 2
       else op = "out"; tfd = fd and tonumber(fd) or 1; q = q + 1 end
     elseif c == "<" then
-      if src:sub(q, q + 2) == "<<<" then -- herestring: <<< word
+      if src:sub(q, q + 2) == "<<<" then -- herestring: [N]<<< word
         i = q + 3; ws()
-        return { op = "herestring", fd = 0, word = word() } -- raw word (expanded at runtime)
+        return { op = "herestring", fd = fd and tonumber(fd) or 0, word = word() } -- raw word (expanded at runtime)
       end
-      if src:sub(q, q + 1) == "<<" then -- heredoc: <<[-] DELIM  (body collected after the line)
+      if src:sub(q, q + 1) == "<<" then -- heredoc: [N]<<[-] DELIM  (body collected after the line)
         local strip = false; q = q + 2
         if src:sub(q, q) == "-" then strip = true; q = q + 1 end
         i = q; ws()
         local draw = word()
         local quoted = draw:sub(1, 1) == "'" or draw:sub(1, 1) == '"'
-        local r = { op = "heredoc", fd = 0, delim = unquote(draw), expand = not quoted, strip = strip }
+        local r = { op = "heredoc", fd = fd and tonumber(fd) or 0, delim = unquote(draw), expand = not quoted, strip = strip }
         heredocs_pending[#heredocs_pending + 1] = r
         return r
       end
