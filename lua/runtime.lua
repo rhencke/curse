@@ -98,6 +98,38 @@ function Shell:split(s)
   return out
 end
 
+-- Run an external command: argv... are already-expanded strings. Captured stdout
+-- goes to sh.out (so it composes with $(...) capture); the exit status is read
+-- back via a rare-byte marker the command prints (LuaJIT's io.popen doesn't
+-- report it). stderr is inherited (not captured yet). A real backend would
+-- execvp via an FFI/C binding instead of routing through /bin/sh.
+local function shquote(s)
+  return "'" .. tostring(s):gsub("'", "'\\''") .. "'"
+end
+function Shell:exec(...)
+  local argv = { ... }
+  if #argv == 0 or argv[1] == "" then self.status = 127; return end
+  local parts = {}
+  for i = 1, #argv do parts[i] = shquote(argv[i]) end
+  local f = io.popen(table.concat(parts, " ") .. "; printf '\1%d\1' \"$?\"", "r")
+  local out = f:read("*a") or ""
+  f:close()
+  local body, code = out:match("^(.*)\1(%d+)\1$")
+  if code then self.status = tonumber(code); out = body else self.status = 0 end
+  if out ~= "" then self.out(out) end
+end
+
+-- Command substitution `$(...)`: capture an external command's stdout with
+-- trailing newlines stripped (bash). Returns the captured string.
+function Shell:capture(...)
+  local buf = {}
+  local saved = self.out
+  self.out = function(s) buf[#buf + 1] = s end
+  self:exec(...)
+  self.out = saved
+  return (table.concat(buf):gsub("\n+$", ""))
+end
+
 -- A variable box holds a string value and/or a cached int64. An arithmetic
 -- write stores only the int64 (s = nil) and defers stringification until a
 -- string context reads it — this is the per-iteration allocation curse's JS

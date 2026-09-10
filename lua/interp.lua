@@ -110,7 +110,7 @@ local function exec_stmt(sh, st, hook)
         if type(err) == "table" and err.__curse_return then sh.status = err.__curse_return
         else error(err) end
       end
-    else error("interp subset: unknown command '" .. tostring(cmd) .. "'") end
+    else sh:exec(unpack(args)) end -- external command
   elseif t == "forc" then
     if st.init then eval(sh, st.init) end
     while true do

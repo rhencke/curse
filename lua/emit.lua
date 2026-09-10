@@ -378,7 +378,11 @@ local function build_cfg(stmts, lifted, funcflags, inlinefns)
         else -- neither: bare call, no allocation
           body = ("fn_%s(sh)"):format(cmd)
         end
-      else error("emit subset: unknown command " .. tostring(cmd)) end
+      else -- external command: sh:exec(all words including the command name)
+        local allargs = {}
+        for j = 1, #st.words do allargs[#allargs + 1] = emit_word(st.words[j], lifted) end
+        body = "sh:exec(" .. table.concat(allargs, ", ") .. ")"
+      end
       blocks[p] = body .. ("; pc = %d"):format(after)
       return p
     elseif t == "forc" then
