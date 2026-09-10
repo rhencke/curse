@@ -502,9 +502,10 @@ function Shell:array_set(name, key, val, append)
   local b = box(self:deref(name), self.vars)
   if not b.arr then b.arr = {}; if b.s then b.arr[0] = b.s end; b.s = nil; b.n = nil end
   key = norm_key(b, key)
-  if type(key) == "number" and key < 0 then return end -- out-of-bounds negative: bash rejects
+  if type(key) == "number" and key < 0 then return false end -- out-of-range negative: bash errors
   if b.assoc and b.arr[key] == nil then b.order[#b.order + 1] = key end
   if append then b.arr[key] = (b.arr[key] or "") .. val else b.arr[key] = val end
+  return true
 end
 function Shell:array_get(name, key)
   local b = self.vars[self:deref(name)]
@@ -526,10 +527,15 @@ function Shell:is_elem_set(name, key)
   if b.arr then return b.arr[norm_key(b, key)] ~= nil end
   return key == 0 and (b.s ~= nil or b.n ~= nil)
 end
--- unset a single element a[key] (negative allowed for indexed).
+-- unset a single element a[key]; returns false on an out-of-range negative index
+-- (bash: `unset a[-2]` on a 1-element array is an error).
 function Shell:array_unset(name, key)
   local b = self.vars[self:deref(name)]
-  if b and b.arr then b.arr[norm_key(b, key)] = nil end
+  if not (b and b.arr) then return true end
+  local k = norm_key(b, key)
+  if type(k) == "number" and k < 0 then return false end
+  b.arr[k] = nil
+  return true
 end
 -- bash iterates an assoc array in HASH-TABLE order, not insertion order: the
 -- key's FNV-1 32-bit hash (over its bytes) picks one of 1024 buckets, buckets are

@@ -1614,7 +1614,8 @@ local function exec_simple(sh, args, hook, no_func)
       elseif fmode then sh.functions[a] = nil
       else
         local nm, sub = a:match("^([%a_][%w_]*)%[(.+)%]$")
-        if nm then sh:array_unset(nm, array_key(sh, nm, sub))
+        if nm then if not sh:array_unset(nm, array_key(sh, nm, sub)) then
+            io.stderr:write("curse: unset: " .. a .. ": bad array subscript\n"); sh.status = 1 end
         else
           local b = sh.vars[sh:deref(a)]
           if b and b.ro then -- readonly: cannot unset (bash: status 1, keep it)
@@ -2347,7 +2348,9 @@ local function exec_stmt(sh, st, hook)
       io.stderr:write("curse: " .. st.name .. ": readonly variable\n") -- only in `sh -c` mode; a script keeps going.
       sh.status = 1; if sh.opt_c then error({ __curse_exit = 1 }) end; return
     elseif st.index then
-      sh:array_set(st.name, array_key(sh, st.name, st.index), expand_assign_word(sh, st.rhs), st.append)
+      if not sh:array_set(st.name, array_key(sh, st.name, st.index), expand_assign_word(sh, st.rhs), st.append) then
+        io.stderr:write("curse: " .. st.name .. ": bad array subscript\n"); sh.status = 1; return
+      end
     elseif st.arith then
       sh:aset(st.name, eval(sh, st.arith))
     elseif st.append then
