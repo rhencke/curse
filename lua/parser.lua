@@ -436,6 +436,19 @@ local function brace_factors(s)
       litbuf[#litbuf + 1] = c; i = i + 1
       while i <= #s and s:sub(i, i) ~= c do litbuf[#litbuf + 1] = s:sub(i, i); i = i + 1 end
       if i <= #s then litbuf[#litbuf + 1] = c; i = i + 1 end
+    elseif c == "$" and s:sub(i + 1, i + 1) == "{" then
+      -- ${…} is a parameter expansion, NOT brace expansion — copy it verbatim.
+      local e = s:find("}", i + 2, true) or #s
+      litbuf[#litbuf + 1] = s:sub(i, e); i = e + 1
+    elseif c == "$" and s:sub(i + 1, i + 1) == "(" then
+      -- $(…) / $((…)): copy verbatim (balancing parens).
+      local d, j = 0, i + 1
+      while j <= #s do
+        local cc = s:sub(j, j)
+        if cc == "(" then d = d + 1 elseif cc == ")" then d = d - 1; if d == 0 then break end end
+        j = j + 1
+      end
+      litbuf[#litbuf + 1] = s:sub(i, j); i = j + 1
     elseif c == "{" then
       local d, j = 1, i + 1
       while j <= #s and d > 0 do
