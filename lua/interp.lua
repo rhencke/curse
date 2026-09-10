@@ -2684,7 +2684,15 @@ local function exec_stmt(sh, st, hook)
     -- `name=value` arguments to a declaration builtin (export/declare/readonly/
     -- local/typeset) are ASSIGNMENT words: the value isn't word-split or globbed.
     local ASSIGN_CMD = { export = 1, declare = 1, typeset = 1, readonly = 1, ["local"] = 1 }
-    local args, is_assign = {}, false
+    -- Assignment-word treatment applies only when the command name is a STATIC
+    -- (literal, unquoted) declaration builtin — `typeset x=$x` splits, but
+    -- `cmd=typeset; $cmd x=$x` does NOT (bash: the name must be recognized before
+    -- expansion). Detected from the pre-expansion first word, not the expanded one.
+    local cw1 = st.words[1]
+    local cw1lit = cw1 and #cw1.parts == 1 and cw1.parts[1].lit ~= nil and not cw1.parts[1].q
+      and cw1.parts[1].lit or nil
+    local is_assign = cw1lit ~= nil and ASSIGN_CMD[cw1lit] ~= nil
+    local args = {}
     -- A word-expansion error (bad substitution, invalid indirect name) aborts the
     -- WHOLE simple command with status 1 but is non-fatal: the script continues.
     local eok, eerr = pcall(function()
@@ -2696,7 +2704,6 @@ local function exec_stmt(sh, st, hook)
           local fs = expand_to_fields(sh, w)
           for k = 1, #fs do args[#args + 1] = fs[k] end
         end
-        if wi == 1 then is_assign = ASSIGN_CMD[args[1]] ~= nil end
       end
     end)
     if not eok then
