@@ -267,6 +267,14 @@ local function expand_part_str(sh, p)
     if pe.op == "@" and pe.arg == "P" then -- ${x@P}: decode prompt escapes, then expand
       return expand_word(sh, P.parse_word(sh:prompt_escapes(sh:get(pe.name))))
     end
+    if pe.op == "indirect" and pe.iop then -- ${!ref OP arg}: resolve name, then apply OP
+      local b = sh.vars[pe.name]
+      local tname = (b and b.ref and b.s) or sh:get(pe.name) -- nameref target, else $ref
+      tname = tname:gsub("%[.*$", "")
+      if tname == "" then return "" end
+      local part = P.parse_paramexp(tname .. pe.iop); part.q = p.q
+      return expand_part_str(sh, part)
+    end
     local subkey
     if pe.index and pe.index ~= "@" and pe.index ~= "*" then
       subkey = array_key(sh, pe.name, pe.index)

@@ -204,7 +204,8 @@ local function parse_paramexp(inner)
     -- ${!name} = indirect (value of the var named by name)
     if index == "@" or index == "*" then return { pexp = { name = name, op = "indices", index = index } } end
     if rest == "*" or rest == "@" then return { pexp = { name = name, op = "prefix", star = (rest == "*") } } end
-    return { pexp = { name = name, op = "indirect", index = index } }
+    -- ${!ref OP arg}: capture the trailing operator to apply to the resolved target
+    return { pexp = { name = name, op = "indirect", index = index, iop = (rest ~= "" and rest or nil) } }
   end
   if lenpfx then return { pexp = { name = name, op = "len", index = index } } end
   if rest == "" then
