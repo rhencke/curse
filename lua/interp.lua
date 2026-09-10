@@ -427,6 +427,10 @@ local function apply_redirs(sh, redirs)
   local function tgt(r) return expand_word(sh, P.parse_word(r.target or "")) end
   for _, r in ipairs(redirs) do
     if r.op == "out" then
+      -- noclobber (set -C): O_EXCL so `>` fails on an existing file (705 adds O_EXCL)
+      backup(r.fd); local f = C.open(tgt(r), sh.opt_C and 705 or 577, 420)
+      if f >= 0 then C.dup2(f, r.fd); C.close(f) else ok = false end
+    elseif r.op == "clobber" then -- `>|` truncates regardless of noclobber
       backup(r.fd); local f = C.open(tgt(r), 577, 420)
       if f >= 0 then C.dup2(f, r.fd); C.close(f) else ok = false end
     elseif r.op == "app" then
@@ -769,12 +773,14 @@ local function exec_simple(sh, args, hook)
       if set_ or unset_ then
         for _, nm in ipairs(names) do
           if nm == "errexit" then sh.opt_e = set_ elseif nm == "nounset" then sh.opt_u = set_
+          elseif nm == "noclobber" then sh.opt_C = set_
           elseif nm == "pipefail" then sh.opt_pipefail = set_ end
         end
         sh.status = 0
       else
         for _, nm in ipairs(names) do
-          local on = (nm == "errexit" and sh.opt_e) or (nm == "nounset" and sh.opt_u) or (nm == "pipefail" and sh.opt_pipefail)
+          local on = (nm == "errexit" and sh.opt_e) or (nm == "nounset" and sh.opt_u)
+            or (nm == "noclobber" and sh.opt_C) or (nm == "pipefail" and sh.opt_pipefail)
           if not quiet then sh:echo("set " .. (on and "-o " or "+o ") .. nm) end
         end
         sh.status = 0
@@ -885,12 +891,14 @@ local function exec_simple(sh, args, hook)
         local o, on = args[j + 1], (a == "-o")
         if o == "errexit" then sh.opt_e = on
         elseif o == "nounset" then sh.opt_u = on
+        elseif o == "noclobber" then sh.opt_C = on
         elseif o == "pipefail" then sh.opt_pipefail = on end
         j = j + 2
       elseif a:match("^[-+][a-zA-Z]+$") then -- short flag bundle: -eu, +u, …
         local on = a:sub(1, 1) == "-"
         for f in a:sub(2):gmatch(".") do
-          if f == "e" then sh.opt_e = on elseif f == "u" then sh.opt_u = on end
+          if f == "e" then sh.opt_e = on elseif f == "u" then sh.opt_u = on
+          elseif f == "C" then sh.opt_C = on end
         end
         j = j + 1
       else break end

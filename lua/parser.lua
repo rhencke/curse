@@ -695,6 +695,7 @@ local function make_parser(src)
     if c == ">" then
       if src:sub(q, q + 1) == ">&" then op = "dup"; tfd = fd and tonumber(fd) or 1; q = q + 2
       elseif src:sub(q, q + 1) == ">>" then op = "app"; tfd = fd and tonumber(fd) or 1; q = q + 2
+      elseif src:sub(q, q + 1) == ">|" then op = "clobber"; tfd = fd and tonumber(fd) or 1; q = q + 2
       else op = "out"; tfd = fd and tonumber(fd) or 1; q = q + 1 end
     elseif c == "<" then
       if src:sub(q, q + 2) == "<<<" then -- herestring: <<< word
