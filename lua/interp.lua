@@ -1333,17 +1333,22 @@ local function exec_simple(sh, args, hook)
     else
       local roattr = (cmd == "readonly") or rattr
       for _, a in ipairs(rest) do
-        local nm, val = a:match("^([%a_][%w_]*)=(.*)$")
+        local nm, op, val = a:match("^([%a_][%w_]*)(%+?=)(.*)$")
         if nm then
+          local ap = (op == "+=")
           if nref then sh:make_nameref(nm, val)
           elseif iattr then -- declare -i: arith-evaluate the value, mark integer
-            sh:aset(nm, eval(sh, require("parser").arith(val))); sh.vars[nm].int = true
+            if ap then sh:aset(nm, sh:aget(nm) + eval(sh, require("parser").arith(val)))
+            else sh:aset(nm, eval(sh, require("parser").arith(val))) end
+            sh.vars[nm].int = true
           elseif lattr or uattr then -- declare -l/-u: lower/upper case attribute
-            sh:set_str(nm, lattr and val:lower() or val:upper())
+            local nv = lattr and val:lower() or val:upper()
+            sh:set_str(nm, ap and (sh:get(nm) .. nv) or nv)
             sh.vars[nm].lower = lattr or nil; sh.vars[nm].upper = uattr or nil
           else
             if assoc then sh:declare_assoc(nm) end
-            sh:set_str(nm, val); if doexport then C.setenv(nm, val, 1) end
+            sh:set_str(nm, ap and (sh:get(nm) .. val) or val)
+            if doexport then C.setenv(nm, sh:get(nm), 1) end
           end
           if roattr and sh.vars[sh:deref(nm)] then sh.vars[sh:deref(nm)].ro = true end
         elseif a:match("^[%a_][%w_]*$") then
