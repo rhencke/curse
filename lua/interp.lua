@@ -2193,6 +2193,8 @@ local function exec_stmt(sh, st, hook)
     end
     -- $_ : the last argument (after expansion) of the command just run.
     if #args > 0 then sh:set_str("_", args[#args]) end
+    -- PIPESTATUS for a simple command is a one-element array of its exit status.
+    sh:array_assign("PIPESTATUS", { tostring(sh.status) }, false)
     -- process substitution cleanup: feed >(cmd) temp files to their commands, then
     -- remove all temp files created for this command's <()/>(). Gated to the outer
     -- level so a nested <()'s own command (run via capture) can't wipe sibling files.
