@@ -1395,19 +1395,23 @@ local function exec_simple(sh, args, hook)
   elseif cmd == "command" then
     exec_simple(sh, { unpack(args, 2) }, hook) -- run rest, bypassing functions (approx)
   elseif cmd == "compgen" then
-    -- compgen [-A action|-f|-d|-c|-a|-b|-k|-v] [-W wordlist] [-F func] [prefix]
-    local actions, wordlist, prefix, bad = {}, nil, nil, false
+    -- compgen [-A action|-f|-d|-c|-a|-b|-k|-v|-e] [-W wl] [-P pre] [-S suf] [prefix]
+    local actions, wordlist, prefix, bad, cpre, csuf = {}, nil, nil, false, "", ""
     local VALID = { ["function"] = 1, alias = 1, builtin = 1, keyword = 1, variable = 1,
-      command = 1, file = 1, directory = 1, setopt = 1, shopt = 1, arrayvar = 1 }
+      command = 1, file = 1, directory = 1, setopt = 1, shopt = 1, arrayvar = 1,
+      export = 1, helptopic = 1, user = 1, hostname = 1, group = 1, job = 1, service = 1,
+      signal = 1, disabled = 1, enabled = 1, running = 1, stopped = 1 }
     local SHORT = { f = "file", d = "directory", c = "command", a = "alias", b = "builtin",
-      k = "keyword", v = "variable", e = "export" }
+      k = "keyword", v = "variable", e = "export", g = "group", u = "user", j = "job", s = "service" }
     local j = 2
     while args[j] do
       local a = args[j]
       if a == "-A" then local act = args[j + 1]; if not VALID[act] then bad = true end; actions[#actions + 1] = act; j = j + 2
       elseif a == "-W" then wordlist = args[j + 1]; j = j + 2
-      elseif a == "-F" or a == "-G" or a == "-C" or a == "-P" or a == "-S" or a == "-X" or a == "-o" then j = j + 2 -- take+ignore
-      elseif a:match("^-[fdcabkve]+$") then for ch in a:sub(2):gmatch(".") do actions[#actions + 1] = SHORT[ch] end; j = j + 1
+      elseif a == "-P" then cpre = args[j + 1] or ""; j = j + 2
+      elseif a == "-S" then csuf = args[j + 1] or ""; j = j + 2
+      elseif a == "-F" or a == "-G" or a == "-C" or a == "-X" or a == "-o" then j = j + 2 -- take+ignore
+      elseif a:match("^-[fdcabkvegujs]+$") then for ch in a:sub(2):gmatch(".") do actions[#actions + 1] = SHORT[ch] end; j = j + 1
       elseif a:sub(1, 1) == "-" and #a > 1 then j = j + 1
       else prefix = a; j = j + 1 end
     end
@@ -1425,12 +1429,22 @@ local function exec_simple(sh, args, hook)
         elseif act == "builtin" then for _, n in ipairs(names(BUILTINS)) do emit(n) end
         elseif act == "keyword" then for _, n in ipairs(names(KEYWORDS)) do emit(n) end
         elseif act == "variable" or act == "arrayvar" then for _, n in ipairs(names(sh.vars)) do emit(n) end
+        elseif act == "export" then for _, n in ipairs(names(sh.vars)) do if os.getenv(n) ~= nil then emit(n) end end
+        elseif act == "setopt" then for _, e in ipairs(SETOPTS) do emit(e[1]) end
+        elseif act == "shopt" then for _, n in ipairs(SHOPT_ORDER) do emit(n) end
+        elseif act == "helptopic" then
+          for _, n in ipairs(names(BUILTINS)) do emit(n) end
+          for _, n in ipairs(names(KEYWORDS)) do emit(n) end
+        elseif act == "file" or act == "directory" then
+          local matches = rt.glob_expand((prefix or "") .. "*", { dotglob = false }) or {}
+          for _, m in ipairs(matches) do if act == "file" or file_test("-d", m) then emit(m) end end
         elseif act == "command" then
           for _, n in ipairs(names(BUILTINS)) do emit(n) end
           for _, n in ipairs(names(sh.functions)) do emit(n) end
+          for _, n in ipairs(names(sh.aliases)) do emit(n) end
         end
       end
-      for _, x in ipairs(out) do sh:echo(x) end
+      for _, x in ipairs(out) do sh:echo(cpre .. x .. csuf) end
       sh.status = (#out > 0) and 0 or 1
     end
   elseif cmd == "complete" then
@@ -1440,17 +1454,19 @@ local function exec_simple(sh, args, hook)
       for _, n in ipairs(ns) do sh:echo(sh.complete[n] .. " " .. n) end
       sh.status = 0
     else
-      -- split trailing NAMEs from the option part; -F/-C etc. with no name is a usage error
-      local opts, cmds = { "complete" }, {}
+      -- split trailing NAMEs from the option part; -F/-C etc. with no name is a
+      -- usage error UNLESS -D/-E/-I (default/empty/initial-word) is given.
+      local opts, cmds, catchall = { "complete" }, {}, false
       local k = 2
       while args[k] do
         local a = args[k]
         if a == "-F" or a == "-C" or a == "-W" or a == "-A" or a == "-o" or a == "-P" or a == "-S" or a == "-X" or a == "-G" then
-          opts[#opts + 1] = a; opts[#opts + 1] = "'" .. (args[k + 1] or "") .. "'"; k = k + 2
+          opts[#opts + 1] = a; opts[#opts + 1] = sq(args[k + 1] or ""); k = k + 2
+        elseif a == "-D" or a == "-E" or a == "-I" then catchall = true; opts[#opts + 1] = a; k = k + 1
         elseif a:sub(1, 1) == "-" then opts[#opts + 1] = a; k = k + 1
         else cmds[#cmds + 1] = a; k = k + 1 end
       end
-      if #cmds == 0 then io.stderr:write("curse: complete: usage error\n"); sh.status = 2
+      if #cmds == 0 and not catchall then io.stderr:write("curse: complete: usage error\n"); sh.status = 2
       else
         sh.complete = sh.complete or {}
         for _, c in ipairs(cmds) do sh.complete[c] = table.concat(opts, " ") end
