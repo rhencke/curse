@@ -1061,8 +1061,11 @@ local function exec_simple(sh, args, hook)
       end
       if arr then
         sh:array_assign(arr, rt.ifs_split(ifs, line), false)
+      elseif ndelim then -- -N: no IFS processing; first var gets everything, rest empty
+        if #vars == 0 then sh:set_str("REPLY", line)
+        else sh:set_str(vars[1], line); for k = 2, #vars do sh:set_str(vars[k], "") end end
       elseif #vars == 0 then
-        sh:set_str("REPLY", ndelim and line or trim(line))
+        sh:set_str("REPLY", line) -- REPLY: the raw line, no IFS stripping
       elseif #vars == 1 then
         sh:set_str(vars[1], trim(line)) -- single var: strip only leading/trailing IFS ws
       else
