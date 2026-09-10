@@ -483,17 +483,21 @@ local KEYWORDS = {
   ["if"] = 1, ["then"] = 1, ["else"] = 1, ["elif"] = 1, ["fi"] = 1, ["for"] = 1,
   ["while"] = 1, ["until"] = 1, ["do"] = 1, ["done"] = 1, ["case"] = 1, ["esac"] = 1,
   ["function"] = 1, ["in"] = 1, ["select"] = 1, ["{"] = 1, ["}"] = 1, ["!"] = 1,
+  ["time"] = 1, ["[["] = 1, ["]]"] = 1, ["coproc"] = 1,
 }
+-- Find `name` in PATH (existence, F_OK — bash's type/command-v report a
+-- non-executable file too; execution then fails 126 via posix_spawn).
 local function find_in_path(name)
-  if name:find("/", 1, true) then return C.access(name, 1) == 0 and name or nil end
+  if name:find("/", 1, true) then return C.access(name, 0) == 0 and name or nil end
   local path = os.getenv("PATH") or "/usr/bin:/bin"
   for dir in path:gmatch("[^:]+") do
     local p = dir .. "/" .. name
-    if C.access(p, 1) == 0 then return p end -- X_OK
+    if C.access(p, 0) == 0 then return p end
   end
   return nil
 end
 local function name_type(sh, name)
+  if sh.aliases[name] then return "alias" end
   if KEYWORDS[name] then return "keyword" end
   if sh.functions[name] then return "function" end
   if BUILTINS[name] then return "builtin" end
@@ -920,19 +924,34 @@ local function exec_simple(sh, args, hook)
     end
     sh.status = 0
   elseif cmd == "type" then
-    -- type [-t] NAME…  ( -t prints the type word; plain prints a sentence )
-    local tflag = args[2] == "-t"
-    local j0 = tflag and 3 or 2
+    -- type [-t|-p|-P] NAME…  (-t type word; -p path-if-file; -P force PATH search)
+    local tflag, pflag, Pflag, j0 = false, false, false, 2
+    while args[j0] and args[j0]:sub(1, 1) == "-" and #args[j0] > 1 do
+      local f = args[j0]
+      if f:find("t") then tflag = true end
+      if f:find("p") then pflag = true end
+      if f:find("P") then Pflag = true end
+      j0 = j0 + 1
+    end
     local allok = true
     for j = j0, #args do
-      local k, p = name_type(sh, args[j])
-      if not k then allok = false
-        if not tflag then io.stderr:write("curse: type: " .. args[j] .. ": not found\n") end
-      elseif tflag then sh:echo(k)
-      elseif k == "file" then sh:echo(args[j] .. " is " .. p)
-      elseif k == "function" then sh:echo(args[j] .. " is a function")
-      elseif k == "keyword" then sh:echo(args[j] .. " is a shell keyword")
-      else sh:echo(args[j] .. " is a shell builtin") end
+      local nm = args[j]
+      if Pflag then
+        local p = find_in_path(nm); if p then sh:echo(p) else allok = false end
+      elseif pflag then
+        local k, p = name_type(sh, nm)
+        if k == "file" then sh:echo(p) elseif not k then allok = false end -- builtins/etc: nothing
+      elseif tflag then
+        local k = name_type(sh, nm); if k then sh:echo(k) else allok = false end
+      else -- sentence form
+        local k, p = name_type(sh, nm)
+        if not k then allok = false; io.stderr:write("curse: type: " .. nm .. ": not found\n")
+        elseif k == "alias" then sh:echo(nm .. " is aliased to `" .. sh.aliases[nm] .. "'")
+        elseif k == "file" then sh:echo(nm .. " is " .. p)
+        elseif k == "function" then sh:echo(nm .. " is a function")
+        elseif k == "keyword" then sh:echo(nm .. " is a shell keyword")
+        else sh:echo(nm .. " is a shell builtin") end
+      end
     end
     sh.status = allok and 0 or 1
   elseif cmd == "command" and (args[2] == "-v" or args[2] == "-V") then
