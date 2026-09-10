@@ -268,8 +268,15 @@ local function parse_dollar(w, i, add, q)
     end
     add({ lit = require("runtime").ansi_unescape(table.concat(buf)), q = true }); return j + 1
   elseif nx == "{" then
-    local e = w:find("}", i + 2, true) or #w
-    local part = parse_paramexp(w:sub(i + 2, e - 1)); part.q = q; add(part); return e + 1
+    -- find the MATCHING } (nested ${…} inside a default/operator value)
+    local depth, j = 1, i + 2
+    while j <= #w do
+      local ch = w:sub(j, j)
+      if ch == "{" then depth = depth + 1
+      elseif ch == "}" then depth = depth - 1; if depth == 0 then break end end
+      j = j + 1
+    end
+    local part = parse_paramexp(w:sub(i + 2, j - 1)); part.q = q; add(part); return j + 1
   elseif nx:match("%d") then
     add({ param = tonumber(nx), q = q }); return i + 2
   elseif nx == "#" or nx == "@" or nx == "*" or nx == "?" or nx == "$" or nx == "!" then
@@ -317,10 +324,24 @@ local function parse_word(w)
     if c == "'" then -- single quotes: literal, no expansion
       local e = w:find("'", i + 1, true) or #w + 1
       add({ lit = w:sub(i + 1, e - 1), q = true }); i = e + 1
-    elseif c == '"' then -- double quotes: expand inside, quoted
-      local j = i + 1
+    elseif c == '"' then -- double quotes: expand inside; skip $(..)/$((..))/`..`
+      local j = i + 1                              -- so their inner " isn't the close
       while j <= #w and w:sub(j, j) ~= '"' do
-        if w:sub(j, j) == "\\" then j = j + 2 else j = j + 1 end
+        local d = w:sub(j, j)
+        if d == "\\" then j = j + 2
+        elseif d == "$" and w:sub(j + 1, j + 2) == "((" then local _, nj = grab_dparen(w, j + 3); j = nj
+        elseif d == "$" and w:sub(j + 1, j + 1) == "(" then
+          j = j + 2; local dep = 1
+          while j <= #w and dep > 0 do
+            local cc = w:sub(j, j)
+            if cc == "(" then dep = dep + 1 elseif cc == ")" then dep = dep - 1 end
+            j = j + 1
+          end
+        elseif d == "`" then
+          j = j + 1
+          while j <= #w and w:sub(j, j) ~= "`" do if w:sub(j, j) == "\\" then j = j + 2 else j = j + 1 end end
+          j = j + 1
+        else j = j + 1 end
       end
       local before = #parts
       parse_dquote(w:sub(i + 1, j - 1), add)
@@ -584,10 +605,24 @@ local function make_parser(src)
       local c = src:sub(i, i)
       if c == "\\" then i = i + 2 -- backslash escapes the next char (incl. metachars/space)
       elseif stop_paren and (c == ")" or c == "(") then break
-      elseif c == '"' then -- double quotes honor \" \\ escapes
-        i = i + 1
+      elseif c == '"' then -- double quotes: honor \" and skip $(..)/$((..))/`..`
+        i = i + 1                                        -- (their inner " are not the close)
         while i <= n and src:sub(i, i) ~= '"' do
-          if src:sub(i, i) == "\\" then i = i + 2 else i = i + 1 end
+          local d = src:sub(i, i)
+          if d == "\\" then i = i + 2
+          elseif d == "$" and src:sub(i + 1, i + 2) == "((" then local _, ni = grab_dparen(src, i + 3); i = ni
+          elseif d == "$" and src:sub(i + 1, i + 1) == "(" then
+            i = i + 2; local dep = 1
+            while i <= n and dep > 0 do
+              local cc = src:sub(i, i)
+              if cc == "(" then dep = dep + 1 elseif cc == ")" then dep = dep - 1 end
+              i = i + 1
+            end
+          elseif d == "`" then
+            i = i + 1
+            while i <= n and src:sub(i, i) ~= "`" do if src:sub(i, i) == "\\" then i = i + 2 else i = i + 1 end end
+            i = i + 1
+          else i = i + 1 end
         end
         i = i + 1 -- past closing quote
       elseif c == "'" then -- single quotes: everything literal, no escapes
