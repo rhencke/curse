@@ -24,6 +24,7 @@ ffi.cdef [[
   int dup(int oldfd);
   int open(const char *path, int flags, unsigned int mode);
   int setenv(const char *name, const char *value, int overwrite);
+  int unsetenv(const char *name);
   void _exit(int status);
 ]]
 local C = ffi.C
@@ -492,21 +493,44 @@ local function exec_stmt(sh, st, hook)
   elseif t == "funcdef" then
     sh.functions[st.name] = st.body
     sh.status = 0
+  elseif t == "assignlist" then
+    for _, a in ipairs(st.list) do exec_stmt(sh, a, hook) end
+    sh.status = 0
   elseif t == "simple" then
     local args = {}
     for _, w in ipairs(st.words) do
       local fs = expand_to_fields(sh, w)
       for k = 1, #fs do args[#args + 1] = fs[k] end
     end
-    if st.redirs then
-      -- reconfigure fds and route builtin output (sh.out) to fd 1 for the command
-      local save, savedout = apply_redirs(sh, st.redirs), sh.out
-      sh.out = io.write
-      local ok, err = pcall(exec_simple, sh, args, hook)
-      io.flush(); sh.out = savedout; restore_redirs(save)
+    local function run_cmd()
+      if st.redirs then
+        local save, savedout = apply_redirs(sh, st.redirs), sh.out
+        sh.out = io.write
+        local ok, err = pcall(exec_simple, sh, args, hook)
+        io.flush(); sh.out = savedout; restore_redirs(save)
+        if not ok then error(err) end
+      else
+        exec_simple(sh, args, hook)
+      end
+    end
+    if st.assigns then
+      -- prefix assignments: apply as a temporary, EXPORTED env for this command
+      -- only, then restore (both the shell var and the process env).
+      local saved = {}
+      for _, a in ipairs(st.assigns) do
+        local b = sh.vars[a.name] -- COPY the box: exec_stmt mutates it in place
+        saved[#saved + 1] = { name = a.name, env = os.getenv(a.name),
+          box = b and { s = b.s, n = b.n, arr = b.arr, assoc = b.assoc, order = b.order } or false }
+        exec_stmt(sh, a, hook); C.setenv(a.name, sh:get(a.name), 1)
+      end
+      local ok, err = pcall(run_cmd)
+      for k = #saved, 1, -1 do
+        local s = saved[k]; sh.vars[s.name] = s.box or nil
+        if s.env then C.setenv(s.name, s.env, 1) else C.unsetenv(s.name) end
+      end
       if not ok then error(err) end
     else
-      exec_simple(sh, args, hook)
+      run_cmd()
     end
   elseif t == "forc" then
     if st.init then eval(sh, st.init) end

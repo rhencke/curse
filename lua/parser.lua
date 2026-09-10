@@ -732,47 +732,54 @@ local function make_parser(src)
       end
       return { t = "case", line = ln, subject = subject, clauses = clauses }
     end
-    -- assignment: NAME=RHS, NAME[i]=RHS, NAME+=RHS, NAME=(array literal)
-    do
+    -- Parse ONE assignment at the cursor (NAME=… / NAME[i]=… / NAME+=… /
+    -- NAME=(array)); returns an assign node, or nil (cursor unchanged) if there
+    -- isn't one. Used for both statements and leading prefix assignments.
+    local function try_assign()
       local name = src:match("^([%a_][%w_]*)", i)
-      if name then
-        local p = i + #name
-        local subidx = nil
-        if src:sub(p, p) == "[" then
-          local close = src:find("]", p + 1, true)
-          if close and src:sub(close + 1, close + 1):match("[+=]") then
-            subidx = src:sub(p + 1, close - 1); p = close + 1
-          end
-        end
-        local op = nil
-        if src:sub(p, p + 1) == "+=" then op = "+="; p = p + 2
-        elseif src:sub(p, p) == "=" then op = "="; p = p + 1 end
-        if op then
-          local ln = line; i = p
-          if src:sub(i, i) == "(" then -- array literal
-            i = i + 1
-            local elems = {}
-            while i <= n do
-              ws()
-              local c = src:sub(i, i)
-              if c == ")" then i = i + 1; break end
-              if c == "\n" then line = line + 1; i = i + 1
-              elseif c == "" then break
-              else local w = word(true); if w == "" then break end; elems[#elems + 1] = parse_word(w) end
-            end
-            return { t = "arrayassign", name = name, line = ln, elems = elems, append = (op == "+=") }
-          end
-          local raw = word()
-          if not subidx and op == "=" and raw:sub(1, 3) == "$((" and raw:sub(-2) == "))" then
-            return { t = "assign", name = name, line = ln, arith = arith(raw:sub(4, -3)) }
-          end
-          return { t = "assign", name = name, line = ln, index = subidx,
-            append = (op == "+="), rhs = parse_word(raw) }
-        end
+      if not name then return nil end
+      local p = i + #name
+      local subidx = nil
+      if src:sub(p, p) == "[" then
+        local close = src:find("]", p + 1, true)
+        if close and src:sub(close + 1, close + 1):match("[+=]") then subidx = src:sub(p + 1, close - 1); p = close + 1 end
       end
+      local op = nil
+      if src:sub(p, p + 1) == "+=" then op = "+="; p = p + 2
+      elseif src:sub(p, p) == "=" then op = "="; p = p + 1 end
+      if not op then return nil end
+      i = p
+      if src:sub(i, i) == "(" then -- array literal
+        i = i + 1
+        local elems = {}
+        while i <= n do
+          ws()
+          local c = src:sub(i, i)
+          if c == ")" then i = i + 1; break end
+          if c == "\n" then line = line + 1; i = i + 1
+          elseif c == "" then break
+          else local w = word(true); if w == "" then break end; elems[#elems + 1] = parse_word(w) end
+        end
+        return { t = "arrayassign", name = name, elems = elems, append = (op == "+=") }
+      end
+      local raw = word()
+      if not subidx and op == "=" and raw:sub(1, 3) == "$((" and raw:sub(-2) == "))" then
+        return { t = "assign", name = name, arith = arith(raw:sub(4, -3)) }
+      end
+      return { t = "assign", name = name, index = subidx, append = (op == "+="), rhs = parse_word(raw) }
     end
-    -- simple command: WORD WORD ...
+
+    -- leading assignments: prefix env for a following command, else statements
     local ln = line
+    local assigns = {}
+    while true do
+      local a = try_assign()
+      if not a then break end
+      a.line = ln; assigns[#assigns + 1] = a
+      ws()
+    end
+
+    -- simple command: WORD WORD ...
     local words = {}
     local redirs = {}
     while i <= n do
@@ -806,8 +813,15 @@ local function make_parser(src)
       end
       heredocs_pending = {}
     end
-    if #words == 0 and #redirs == 0 then return nil end
-    return { t = "simple", line = ln, words = words, redirs = (#redirs > 0 and redirs or nil) }
+    if #words == 0 and #redirs == 0 then
+      -- no command: the leading assignments are plain (persistent) statements
+      if #assigns == 0 then return nil end
+      if #assigns == 1 then return assigns[1] end
+      return { t = "assignlist", line = ln, list = assigns }
+    end
+    -- a command follows: any leading assignments are its temporary (exported) env
+    return { t = "simple", line = ln, words = words, redirs = (#redirs > 0 and redirs or nil),
+      assigns = (#assigns > 0 and assigns or nil) }
   end
 
   -- pipeline: cmd [ | cmd ]*   (optional leading `!` negates the exit status)

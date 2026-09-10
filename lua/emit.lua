@@ -420,7 +420,7 @@ local function build_cfg(stmts, lifted, funcflags, inlinefns)
   -- Statement types with no native compiled form yet -> always delegate.
   local DELEGATE = {
     arithcmd = 1, andor = 1, pipeline = 1, case = 1, group = 1, subshell = 1,
-    dbracket = 1, arrayassign = 1, parse_error = 1,
+    dbracket = 1, arrayassign = 1, parse_error = 1, assignlist = 1,
   }
 
   -- Build blocks for `st`; its exit flows to pc `after`. Returns st's entry pc.
@@ -446,7 +446,7 @@ local function build_cfg(stmts, lifted, funcflags, inlinefns)
       -- or a builtin without a native compiled form.
       local NATIVE_BUILTIN = { echo = 1, [":"] = 1, ["true"] = 1, ["false"] = 1, ["local"] = 1, ["return"] = 1 }
       local isfunc = (inlinefns and inlinefns[cmd]) or funcflags[cmd]
-      local mustdeleg = st.redirs ~= nil
+      local mustdeleg = st.redirs ~= nil or st.assigns ~= nil -- prefix env -> delegate
       if not mustdeleg then
         for _, w in ipairs(st.words) do
           -- functions stay native (so they inline / call fn_x) unless an arg has a
