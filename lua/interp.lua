@@ -743,12 +743,14 @@ local function exec_simple(sh, args, hook)
     end
   elseif cmd == "trap" then
     -- trap [-p] [ACTION] SIG…  (subset: registers/prints; only EXIT actually fires)
-    local j = 2
-    if args[j] == "-p" or args[j] == "-l" then j = j + 1 end
+    local j, pflag = 2, false
+    if args[j] == "-p" or args[j] == "-l" then pflag = true; j = j + 1 end
     if args[j] == "--" then j = j + 1 end
-    if j > #args then -- print all registered traps, in signal order
+    if pflag or j > #args then -- print traps (all, or the named signals) in signal order
       local list = {}
-      for canon, h in pairs(sh.traps) do list[#list + 1] = canon end
+      if j <= #args then -- print only the named signals
+        for k = j, #args do local c = canon_sig(args[k]); if c and sh.traps[c] then list[#list + 1] = c end end
+      else for canon in pairs(sh.traps) do list[#list + 1] = canon end end
       table.sort(list, function(a, b) return sig_order(a) < sig_order(b) end)
       for _, canon in ipairs(list) do
         sh:echo("trap -- '" .. sh.traps[canon] .. "' " .. canon)
@@ -851,8 +853,15 @@ local function exec_simple(sh, args, hook)
     if args[2] and not tonumber(args[2]) then io.stderr:write("curse: exit: " .. args[2] .. ": numeric argument required\n"); error({ __curse_exit = 2 }) end
     error({ __curse_exit = args[2] and (tonumber(args[2]) % 256) or sh.status })
   elseif cmd == "cd" then
-    local dir = args[2] or os.getenv("HOME") or ""
-    sh.status = (C.chdir(dir) == 0) and 0 or 1
+    local prev = sh:special_get("PWD")
+    local dir = args[2] or sh:get("HOME")
+    if dir == "-" then dir = sh:get("OLDPWD"); if dir == "" then dir = prev end
+      sh.status = (C.chdir(dir) == 0) and 0 or 1
+      if sh.status == 0 then sh:echo(sh:special_get("PWD")) end -- cd - prints the new dir
+    else
+      sh.status = (C.chdir(dir) == 0) and 0 or 1
+    end
+    if sh.status == 0 then sh:set_str("OLDPWD", prev); C.setenv("OLDPWD", prev, 1) end
   elseif cmd == "unset" then
     local fmode = false -- -f: unset functions; -v: unset vars (default)
     for j = 2, #args do
