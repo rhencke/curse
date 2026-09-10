@@ -1558,7 +1558,7 @@ local function exec_simple(sh, args, hook)
     -- the process env so posix_spawn children inherit it. -A marks associative,
     -- -p prints declarations.
     local doexport, assoc, printmode, nref, plusn = (cmd == "export"), false, false, false, false
-    local plusx = false
+    local plusx, gflag = false, false
     local funcnames, funcbody, iattr, lattr, uattr, rattr, aattr = false, false, false, false, false, false, false
     local rest = {}
     for j = 2, #args do
@@ -1576,6 +1576,7 @@ local function exec_simple(sh, args, hook)
         if a:find("u") then uattr = true end
         if a:find("r") then rattr = true end
         if a:find("a") then aattr = true end
+        if a:find("g") then gflag = true end
       elseif a:sub(1, 1) == "+" and #a > 1 then
         if a:find("n") then plusn = true end
         if a:find("x") then plusx = true end -- +x: drop the export attribute
@@ -1625,6 +1626,9 @@ local function exec_simple(sh, args, hook)
       sh.status = allok and 0 or 1
     else
       local roattr = (cmd == "readonly") or rattr
+      -- `declare`/`typeset` in a function make each name LOCAL (like `local`),
+      -- unless -g; `export`/`readonly` always act on the global var (bash).
+      local localize = (cmd == "declare" or cmd == "typeset") and not gflag and (sh.calldepth or 0) > 0
       local allok = true
       for _, a in ipairs(rest) do
         local nm, op, val = a:match("^([%a_][%w_]*)(%+?=)(.*)$")
@@ -1632,6 +1636,7 @@ local function exec_simple(sh, args, hook)
           -- reassigning a readonly variable is rejected (bash: `typeset +r r=v` too)
           io.stderr:write("curse: " .. cmd .. ": " .. nm .. ": readonly variable\n"); allok = false
         elseif nm then
+          if localize then sh:localVar(nm) end
           local ap = (op == "+=")
           if nref then sh:make_nameref(nm, val)
           elseif iattr then -- declare -i: arith-evaluate the value, mark integer
@@ -1650,6 +1655,7 @@ local function exec_simple(sh, args, hook)
           if roattr and sh.vars[sh:deref(nm)] then sh.vars[sh:deref(nm)].ro = true end
           if plusx then C.unsetenv(nm) end -- +x drops the export attribute
         elseif a:match("^[%a_][%w_]*$") then
+          if localize then sh:localVar(a) end
           if plusn then sh:unref(a)
           elseif plusx then C.unsetenv(a)
           elseif nref then sh:make_nameref(a)
