@@ -170,6 +170,8 @@ ffi.cdef [[
   int pipe(int fildes[2]);
   int close(int fd);
   long read(int fd, void *buf, unsigned long count);
+  int setenv(const char *name, const char *value, int overwrite);
+  int unsetenv(const char *name);
   extern char **environ;
 ]]
 local C = ffi.C
@@ -383,7 +385,7 @@ function Shell:attr_string(name)
   local s = ""
   if b.assoc then s = s .. "A" elseif b.arr then s = s .. "a" end
   if b.ro then s = s .. "r" end
-  if os.getenv(name) ~= nil then s = s .. "x" end
+  if b.exported then s = s .. "x" end
   if b.int then s = s .. "i" end
   if b.lower then s = s .. "l" end
   if b.upper then s = s .. "u" end
@@ -434,6 +436,7 @@ end
 function Shell:set_str(name, s)
   local b = box(self:deref(name), self.vars)
   b.s = s; b.n = nil
+  if b.exported then C.setenv(self:deref(name), s, 1) end -- keep the env in sync
 end
 
 -- Inherit the process environment as shell variables (bash does this at startup).
@@ -449,6 +452,7 @@ function Shell:import_env()
       local k = s:sub(1, eq - 1)
       if k:match("^[%a_][%w_]*$") and k ~= "PWD" and k ~= "OLDPWD" then
         self:set_str(k, s:sub(eq + 1))
+        self.vars[k].exported = true -- inherited env vars are exported (bash)
       end
     end
     i = i + 1

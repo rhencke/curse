@@ -1561,7 +1561,7 @@ local function exec_simple(sh, args, hook)
     -- the process env so posix_spawn children inherit it. -A marks associative,
     -- -p prints declarations.
     local doexport, assoc, printmode, nref, plusn = (cmd == "export"), false, false, false, false
-    local plusx, gflag = false, false
+    local plusx, gflag, unexport = false, false, false
     local funcnames, funcbody, iattr, lattr, uattr, rattr, aattr = false, false, false, false, false, false, false
     local rest = {}
     for j = 2, #args do
@@ -1571,7 +1571,8 @@ local function exec_simple(sh, args, hook)
         if a:find("A") then assoc = true end
         if a:find("p") then printmode = true end
         if a:find("x") then doexport = true end
-        if a:find("n") then nref = true end
+        -- `-n` un-exports for `export`, but means nameref for declare/typeset/local
+        if a:find("n") then if cmd == "export" then unexport = true else nref = true end end
         if a:find("F") then funcnames = true end
         if a:find("f") then funcbody = true end
         if a:find("i") then iattr = true end
@@ -1590,7 +1591,7 @@ local function exec_simple(sh, args, hook)
     local function decl_match(nm, b)
       if not b then return false end
       if cmd == "readonly" or rattr then return b.ro end
-      if cmd == "export" or doexport then return os.getenv(nm) ~= nil end
+      if cmd == "export" or doexport then return b.exported end
       if nref then return b.ref end
       if assoc then return b.assoc end
       if aattr then return b.arr and not b.assoc end
@@ -1653,22 +1654,32 @@ local function exec_simple(sh, args, hook)
           else
             if assoc then sh:declare_assoc(nm) end
             sh:set_str(nm, ap and (sh:get(nm) .. val) or val)
-            if doexport then C.setenv(nm, sh:get(nm), 1) end
           end
-          if roattr and sh.vars[sh:deref(nm)] then sh.vars[sh:deref(nm)].ro = true end
-          if plusx then C.unsetenv(nm) end -- +x drops the export attribute
+          local bb = sh.vars[sh:deref(nm)]
+          if roattr and bb then bb.ro = true end
+          -- export attribute: -n / +x clear it (keep the value), else export sets it
+          if bb then
+            if unexport or plusx then bb.exported = nil; C.unsetenv(nm)
+            elseif doexport then bb.exported = true; C.setenv(nm, sh:get(nm), 1) end
+          end
         elseif a:match("^[%a_][%w_]*$") then
           if localize then sh:localVar(a) end
           if plusn then sh:unref(a)
-          elseif plusx then C.unsetenv(a)
           elseif nref then sh:make_nameref(a)
           elseif iattr then sh.vars[a] = sh.vars[a] or {}; sh.vars[a].int = true
           elseif lattr or uattr then
             sh.vars[a] = sh.vars[a] or {}; sh.vars[a].lower = lattr or nil; sh.vars[a].upper = uattr or nil
           elseif assoc then sh:declare_assoc(a)
-          elseif doexport then sh.vars[a] = sh.vars[a] or {}; C.setenv(a, sh:get(a), 1)
           else sh.vars[a] = sh.vars[a] or {} end -- `declare x` creates a declared-but-unset var
-          if roattr then sh.vars[a] = sh.vars[a] or {}; sh.vars[a].ro = true end
+          local bb = sh.vars[sh:deref(a)]
+          if roattr and bb then bb.ro = true end
+          if bb then
+            if unexport or plusx then bb.exported = nil; C.unsetenv(a)
+            elseif doexport then
+              bb.exported = true -- `export U` defers the env until U gets a value (bash)
+              if bb.s ~= nil or bb.n ~= nil then C.setenv(a, sh:get(a), 1) end
+            end
+          end
         end
       end
       sh.status = allok and 0 or 1
