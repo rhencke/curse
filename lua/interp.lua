@@ -487,6 +487,33 @@ local function exec_stmt(sh, st, hook)
     -- syntax-error here too. If an earlier exit fired, we never get here.
     io.stderr:write("curse: syntax error" .. (st.line and (": line " .. st.line) or "") .. "\n")
     error({ __curse_exit = 2 })
+  elseif t == "group" then
+    -- { list; } runs in the current shell; redirs apply to the whole group
+    if st.redirs then
+      local save, savedout = apply_redirs(sh, st.redirs), sh.out
+      sh.out = io.write
+      local ok, err = pcall(exec_list, sh, st.body, hook, false)
+      io.flush(); sh.out = savedout; restore_redirs(save)
+      if not ok then error(err) end
+    else
+      exec_list(sh, st.body, hook, false)
+    end
+  elseif t == "subshell" then
+    -- ( list ) runs in a forked child: env/var changes don't escape, like bash
+    local pid = C.fork()
+    if pid == 0 then
+      local ok, err = pcall(function()
+        if st.redirs then apply_redirs(sh, st.redirs) end
+        sh.out = io.write
+        exec_list(sh, st.body, hook, false)
+      end)
+      if not ok and type(err) == "table" then sh.status = err.__curse_exit or err.__curse_return or sh.status end
+      io.flush() -- flush BEFORE _exit (which doesn't); exit/error skips an inline flush
+      C._exit(sh.status or 0)
+    end
+    local stbuf = ffi.new("int[1]"); C.waitpid(pid, stbuf, 0)
+    local s = stbuf[0]; local sig = bit.band(s, 0x7f)
+    sh.status = (sig ~= 0 and sig ~= 0x7f) and (128 + sig) or bit.rshift(bit.band(s, 0xff00), 8)
   elseif t == "arithcmd" then
     sh.status = truth(eval(sh, st.expr)) and 0 or 1
   elseif t == "dbracket" then
@@ -532,8 +559,8 @@ local function exec_stmt(sh, st, hook)
             if rd >= 0 then C.close(rd) end
             sh.out = io.write -- this stage writes to its fd 1 (the pipe / terminal)
             exec_stmt(sh, cmds[k], hook)
-            io.flush()
           end)
+          io.flush() -- before _exit (exit/error in the stage would skip an inline flush)
           C._exit(sh.status or 0)
         end
         pids[k] = pid

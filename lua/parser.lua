@@ -676,6 +676,21 @@ local function make_parser(src)
       end
       return { t = "dbracket", line = line, expr = parse_dbracket(toks, quoted) }
     end
+    -- brace group { list; }  and subshell ( list )  — optional trailing redirs
+    if src:sub(i, i) == "{" and src:sub(i + 1, i + 1):match("[ \t\n]") then
+      i = i + 1
+      local body = parse_stmts({ ["}"] = true })
+      local redirs = {}
+      while true do ws(); local r = parse_redir(); if r then redirs[#redirs + 1] = r else break end end
+      return { t = "group", line = line, body = body, redirs = (#redirs > 0 and redirs or nil) }
+    end
+    if src:sub(i, i) == "(" then
+      i = i + 1
+      local body = parse_stmts({ [")"] = true })
+      local redirs = {}
+      while true do ws(); local r = parse_redir(); if r then redirs[#redirs + 1] = r else break end end
+      return { t = "subshell", line = line, body = body, redirs = (#redirs > 0 and redirs or nil) }
+    end
     -- case WORD in  PAT|PAT) BODY ;;  … esac
     if peekword() == "case" then
       local ln = line; i = i + 4; ws()
@@ -764,10 +779,11 @@ local function make_parser(src)
       local c = src:sub(i, i)
       local r = parse_redir() -- also catches &> before the & break below
       if r then redirs[#redirs + 1] = r
-      elseif c == "\n" or c == ";" or c == "#" or c == "&" or c == "|" then break
+      elseif c == "\n" or c == ";" or c == "#" or c == "&" or c == "|"
+        or c == "(" or c == ")" then break -- ( ) are metacharacters (subshell bounds)
       elseif c:match("[ \t]") then ws()
       else
-        local w = word()
+        local w = word(true) -- stop at unquoted ( ) so `cmd)` ends at the subshell close
         if w == "" then break end
         add_word(words, w)
       end
@@ -846,6 +862,7 @@ local function make_parser(src)
       skipsep()
       if i > n then return stmts, nil end
       if stopset["}"] and src:sub(i, i) == "}" then i = i + 1; return stmts, "}" end
+      if stopset[")"] and src:sub(i, i) == ")" then i = i + 1; return stmts, ")" end
       local pw = peekword()
       if pw and stopset[pw] then i = i + #pw; return stmts, pw end
       local st = parse_stmt()
