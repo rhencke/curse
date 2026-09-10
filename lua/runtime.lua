@@ -174,6 +174,10 @@ ffi.cdef [[
   int waitpid(int pid, int *wstatus, int options);
   int pipe(int fildes[2]);
   int close(int fd);
+  int dup2(int oldfd, int newfd);
+  int fork(void);
+  void _exit(int status);
+  int access(const char *path, int mode);
   long read(int fd, void *buf, unsigned long count);
   int setenv(const char *name, const char *value, int overwrite);
   int unsetenv(const char *name);
@@ -215,7 +219,14 @@ function Shell:exec(...)
     pid = C.fork()  -- shell script; do the same through our own interpreter, in a child.
     if pid == 0 then
       C.dup2(wfd, 1); C.close(wfd); C.close(rfd)
-      local f = io.open(args[1], "r"); local src = f and f:read("*a") or ""; if f then f:close() end
+      local path = args[1] -- resolve via $PATH the same way the failed exec did:
+      if not path:find("/", 1, true) then -- the FIRST executable match (X_OK), like execvp
+        for dir in (self:get("PATH") .. ":"):gmatch("([^:]*):") do
+          local cand = (dir == "" and "." or dir) .. "/" .. args[1]
+          if C.access(cand, 1) == 0 then path = cand; break end -- 1 == X_OK
+        end
+      end
+      local f = io.open(path, "r"); local src = f and f:read("*a") or ""; if f then f:close() end
       self.params, self.nparams, self.argv0, self.traps, self.out = {}, 0, args[1], {}, io.write
       for k = 2, n do self.nparams = self.nparams + 1; self.params[self.nparams] = args[k] end
       local ok = pcall(require("interp").run_lazy, self, src)

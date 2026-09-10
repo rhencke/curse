@@ -169,6 +169,7 @@ ffi.cdef [[
   void _exit(int status);
   unsigned int umask(unsigned int mask);
   long read(int fd, void *buf, unsigned long count);
+  unsigned long confstr(int name, char *buf, unsigned long len);
   int kill(int pid, int sig);
   unsigned int geteuid(void);
   unsigned int getegid(void);
@@ -178,6 +179,17 @@ ffi.cdef [[
   int setrlimit(int resource, const struct curse_rlimit *rlim);
 ]]
 local C = ffi.C
+-- The standard utility PATH (`command -p`), from confstr(_CS_PATH) like bash —
+-- typically "/bin:/usr/bin". Cached; falls back if confstr is unavailable.
+local _std_path
+local function std_path()
+  if not _std_path then
+    local buf = ffi.new("char[1024]")
+    local n = tonumber(C.confstr(0, buf, 1024)) -- _CS_PATH == 0
+    _std_path = (n > 1 and n <= 1024) and ffi.string(buf) or "/bin:/usr/bin"
+  end
+  return _std_path
+end
 -- Unbuffered one-byte read from a raw fd (for `read`, which must NOT over-read
 -- past its delimiter/char count — buffered io.read would swallow the rest of the
 -- stream, breaking a subsequent read from the same underlying fd).
@@ -2115,9 +2127,9 @@ local function exec_simple(sh, args, hook, no_func)
     end
     if args[j] == nil then sh.status = 0
     elseif usep then
-      -- -p: resolve against a default PATH guaranteed to find the standard utilities,
-      -- not the caller's $PATH. Temporarily swap it (env + var) around the command.
-      local DEFPATH = "/usr/bin:/bin:/usr/sbin:/sbin"
+      -- -p: resolve against the standard-utility PATH (confstr _CS_PATH), not the
+      -- caller's $PATH. Temporarily swap it (env + var) around the command.
+      local DEFPATH = std_path()
       local oldenv, oldbox = os.getenv("PATH"), sh.vars["PATH"]
       sh:set_str("PATH", DEFPATH); C.setenv("PATH", DEFPATH, 1)
       local ok, err = pcall(exec_simple, sh, { unpack(args, j) }, hook, true)
