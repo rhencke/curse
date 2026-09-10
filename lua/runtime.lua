@@ -130,7 +130,9 @@ function M.ifs_split(ifs, s)
   local i, n = 1, #s
   while i <= n do
     local c = s:sub(i, i)
-    if inifs(c) then
+    if c == "\1" and i < n then -- CTLESC: next char is literal (read backslash-escape)
+      cur = (cur or "") .. s:sub(i + 1, i + 1); i = i + 2
+    elseif inifs(c) then
       if isws(c) then
         if cur ~= nil then brk() end
         i = i + 1; while i <= n and isws(s:sub(i, i)) do i = i + 1 end

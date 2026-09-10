@@ -88,25 +88,37 @@ end
 -- whitespace + at most one IFS non-whitespace is one delimiter); the LAST var
 -- gets the verbatim remainder (keeping its interior separators — unlike a
 -- re-join) with trailing IFS whitespace stripped.
+-- `read` field-splitting. The line may carry CTLESC markers (\1) before each
+-- backslash-escaped character (see the read builtin): a marked char is LITERAL —
+-- it is part of a field and never a delimiter — and the marker is dropped from
+-- the value. Split into an array of {ch, esc} cells, then apply IFS to those.
 local function read_split(ifs, line, nvars)
   local wsset, ifsset = {}, {}
   for c in ifs:gmatch(".") do ifsset[c] = true; if c == " " or c == "\t" or c == "\n" then wsset[c] = true end end
-  local i, n = 1, #line
-  local function cw(p) return wsset[line:sub(p, p)] end
-  local function cifs(p) return ifsset[line:sub(p, p)] end
-  while i <= n and cw(i) do i = i + 1 end -- leading IFS whitespace
+  local cells, p, m = {}, 1, #line
+  while p <= m do
+    local c = line:sub(p, p)
+    if c == "\1" and p < m then cells[#cells + 1] = { ch = line:sub(p + 1, p + 1), esc = true }; p = p + 2
+    else cells[#cells + 1] = { ch = c, esc = false }; p = p + 1 end
+  end
+  local n = #cells
+  local function isws(k) local c = cells[k]; return c and not c.esc and wsset[c.ch] end
+  local function isifs(k) local c = cells[k]; return c and not c.esc and ifsset[c.ch] end
+  local function slice(a, b) local t = {}; for k = a, b do t[#t + 1] = cells[k].ch end; return table.concat(t) end
+  local i = 1
+  while i <= n and isws(i) do i = i + 1 end -- leading IFS whitespace
   local out = {}
   for v = 1, nvars do
     if v == nvars then
-      local rest = line:sub(i)
-      while #rest > 0 and wsset[rest:sub(-1)] do rest = rest:sub(1, -2) end -- trailing IFS ws
-      out[v] = rest
+      local last = n
+      while last >= i and isws(last) do last = last - 1 end -- trailing IFS ws
+      out[v] = slice(i, last)
     else
       local s = i
-      while i <= n and not cifs(i) do i = i + 1 end
-      out[v] = line:sub(s, i - 1)
-      while i <= n and cw(i) do i = i + 1 end -- delimiter: IFS whitespace
-      if i <= n and cifs(i) then i = i + 1; while i <= n and cw(i) do i = i + 1 end end -- + one non-ws
+      while i <= n and not isifs(i) do i = i + 1 end
+      out[v] = slice(s, i - 1)
+      while i <= n and isws(i) do i = i + 1 end -- delimiter: IFS whitespace
+      if i <= n and isifs(i) then i = i + 1; while i <= n and isws(i) do i = i + 1 end end -- + one non-ws
     end
   end
   return out
@@ -2371,11 +2383,12 @@ local function exec_simple(sh, args, hook, no_func)
         if esc then -- backslash-escaped char: keep verbatim (drop the backslash)
           buf[#buf + 1] = c; esc = false
         elseif not raw and c == "\\" then
-          -- \<newline> is a line continuation (splice); other \x escapes the char.
+          -- \<newline> is a line continuation (splice); other \x escapes the char
+          -- (marked with \1 so IFS splitting treats it as literal, bash's CTLESC).
           local d = fd_getc(ufd)
           if d == nil then buf[#buf + 1] = "\\"; had_nl = false; break end
           if d == "\n" then -- swallow both (continuation), unless -N counts raw
-          else buf[#buf + 1] = d end
+          else buf[#buf + 1] = "\1" .. d end
         elseif not ndelim and c == dch then had_nl = true; break -- -N ignores the delimiter
         else buf[#buf + 1] = c end
       end
@@ -2388,10 +2401,11 @@ local function exec_simple(sh, args, hook, no_func)
       if arr then
         sh:array_assign(arr, rt.ifs_split(ifs, line), false)
       elseif ndelim then -- -N: no IFS processing; first var gets everything, rest empty
-        if #vars == 0 then sh:set_str("REPLY", line)
-        else sh:set_str(vars[1], line); for k = 2, #vars do sh:set_str(vars[k], "") end end
+        local plain = line:gsub("\1", "")
+        if #vars == 0 then sh:set_str("REPLY", plain)
+        else sh:set_str(vars[1], plain); for k = 2, #vars do sh:set_str(vars[k], "") end end
       elseif #vars == 0 then
-        sh:set_str("REPLY", line) -- REPLY: the raw line, no IFS stripping
+        sh:set_str("REPLY", (line:gsub("\1", ""))) -- REPLY: the raw line, no IFS stripping
       else
         local fields = read_split(ifs, line, #vars)
         for k = 1, #vars do sh:set_str(vars[k], fields[k] or "") end
