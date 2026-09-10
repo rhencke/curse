@@ -285,15 +285,37 @@ end
 local expand_word -- forward (used by eval's $-deferred arith and expand_part_str)
 local expand_pattern -- forward (quote-aware glob-pattern expansion for ${v/…} etc.)
 local eval  -- arithmetic evaluator (forward decl)
+local arith_resolve -- var-value-as-arith-expression resolver (forward decl)
+-- Resolve a variable's string value in arithmetic. bash treats it as an arith
+-- EXPRESSION: a bare number is its value, but a name (or `3+4`, `bar`) is
+-- recursively parsed and evaluated (so bar=foo; foo=5; $((bar)) == 5). A pure
+-- integer literal short-circuits (the hot path); a recursion guard bounds cycles.
+local function looks_numeric(s)
+  return s:match("^%s*[+-]?%d+%s*$") or s:match("^%s*[+-]?0[xX]%x+%s*$")
+    or s:match("^%s*[+-]?0[0-7]+%s*$") or s:match("^%s*%d+#[%w@_]+%s*$")
+end
+arith_resolve = function(sh, s)
+  if s == nil or s == "" then return i64(0) end
+  if looks_numeric(s) then return rt.arith_num(s) end
+  sh.arith_depth = (sh.arith_depth or 0) + 1
+  local r = i64(0)
+  if sh.arith_depth <= 40 then
+    local ok, ast = pcall(require("parser").arith, s)
+    if ok then local ok2, v = pcall(eval, sh, ast); if ok2 and v ~= nil then r = v end end
+  end
+  sh.arith_depth = sh.arith_depth - 1
+  return r
+end
+
 eval = function(sh, e)
   local k = e.k
   if k == "num" then return rt.arith_num(e.v) end
   if k == "var" then
-    if e.idx then return rt.arith_num(sh:array_get(e.name, tonumber(rt.i64_to_str(eval(sh, e.idx))))) end
+    if e.idx then return arith_resolve(sh, sh:array_get(e.name, tonumber(rt.i64_to_str(eval(sh, e.idx))))) end
     if sh.opt_u and sh.vars[sh:deref(e.name)] == nil and sh:special_get(e.name) == "" then
       io.stderr:write("curse: " .. e.name .. ": unbound variable\n"); error({ __curse_exit = 1 })
     end
-    return sh:aget(e.name)
+    return arith_resolve(sh, sh:get(e.name))
   end
   if k == "param" then return rt.str_to_i64(sh:param(e.n)) end
   if k == "xpand" then -- deferred: expansions inside $(( )) resolved at runtime
