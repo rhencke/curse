@@ -1562,11 +1562,20 @@ local function exec_simple(sh, args, hook, no_func)
         sh:echo("trap -- '" .. sh.traps[canon] .. "' " .. canon)
       end
       sh.status = 0
+    elseif args[j]:sub(1, 1) == "-" and args[j] ~= "-" then -- a stray -flag (e.g. `trap -1`)
+      io.stderr:write("curse: trap: " .. args[j] .. ": invalid option\n"); sh.status = 2
     else
-      -- first token is the action if it's not itself a signal, else action="-" (reset)
+      -- bash: reset-mode (all tokens are signals to reset) only when the first
+      -- token is a NUMERIC signal (`trap 0 2`) or the sole arg and a valid signal
+      -- (`trap TERM`); a NAME first token is the action, even a name that happens
+      -- to be a signal (`trap INT EXIT` runs `INT` at EXIT; `trap err ERR`).
       local action, sigstart
-      if canon_sig(args[j]) and #args == j then action, sigstart = "-", j -- `trap SIG` resets
+      if canon_sig(args[j]) and (#args == j or args[j]:match("^%d+$")) then
+        action, sigstart = "-", j
       else action, sigstart = args[j], j + 1 end
+      if sigstart > #args then -- an action with no signal spec is a usage error
+        io.stderr:write("curse: trap: usage: trap [-lp] [[arg] signal_spec ...]\n"); sh.status = 1; return
+      end
       local ok = true
       for k = sigstart, #args do
         local canon = canon_sig(args[k])
