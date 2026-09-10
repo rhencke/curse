@@ -243,15 +243,47 @@ local function is_multi(p)
   if p.pexp.op == "len" then return false end
   return p.pexp.index == "@" or p.pexp.index == "*"
 end
+-- arith-evaluate a slice offset/length expression (e.g. "i-4", "(-4)", "2").
+local function arith_int(sh, s)
+  if s == nil or s == "" then return nil end
+  local ok, v = pcall(function() return tonumber(rt.i64_to_str(eval(sh, require("parser").arith(s)))) end)
+  return (ok and v) or tonumber(s) or 0
+end
+-- ${a[@]:off:len}: select elements by (0-based, negatives-from-end) offset/length.
+local function array_slice(els, off, len)
+  local n = #els
+  off = off or 0
+  if off < 0 then off = n + off; if off < 0 then off = 0 end end
+  local last = n
+  if len ~= nil then last = (len < 0) and (n + len) or (off + len) end
+  local out = {}
+  for i = off, last - 1 do if els[i + 1] ~= nil then out[#out + 1] = els[i + 1] end end
+  return out
+end
 local function multi_elems(sh, p) -- returns element list, star?
   if p.pexp then
-    local star = (p.pexp.index == "*")
-    if p.pexp.op == "indices" then -- ${!a[@]} -> the keys/indices
-      local ix = sh:array_indices(p.pexp.name); local t = {}
+    local pe, P = p.pexp, require("parser")
+    local star = (pe.index == "*")
+    if pe.op == "indices" then -- ${!a[@]} -> the keys/indices
+      local ix = sh:array_indices(pe.name); local t = {}
       for i = 1, #ix do t[i] = tostring(ix[i]) end
       return t, star
     end
-    return sh:array_values(p.pexp.name), star
+    local els = sh:array_values(pe.name)
+    if pe.op == "sub" then -- array slice
+      local off = arith_int(sh, pe.arg and expand_word(sh, P.parse_word(pe.arg)) or nil)
+      local len = pe.arg2 and arith_int(sh, expand_word(sh, P.parse_word(pe.arg2))) or nil
+      els = array_slice(els, off or 0, len)
+    elseif (pe.op == ":-" or pe.op == "-") and #els == 0 then
+      return { pe.arg and expand_word(sh, P.parse_word(pe.arg)) or "" }, star
+    elseif pe.op and pe.op ~= ":-" and pe.op ~= "-" and pe.op ~= ":+" and pe.op ~= "+" then
+      local arg = pe.arg and expand_word(sh, P.parse_word(pe.arg)) or ""
+      local arg2 = pe.arg2 and expand_word(sh, P.parse_word(pe.arg2)) or nil
+      local out = {}
+      for i, v in ipairs(els) do out[i] = sh:apply_str_op(pe.op, v, arg, arg2) end
+      els = out
+    end
+    return els, star
   end
   local els = {}; for i = 1, sh.nparams do els[i] = sh.params[i] end
   return els, (p.special == "*")

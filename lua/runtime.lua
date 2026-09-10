@@ -675,6 +675,13 @@ function Shell:expand_param(pe, arg, arg2, idxnum)
   if op == "=" then if not isset then self:set_str(name, arg); return arg end return val end
   if op == ":?" then if val == "" then error({ __curse_exit = 1 }) end return val end
   if op == "?" then if not isset then error({ __curse_exit = 1 }) end return val end
+  return self:apply_str_op(op, val, arg, arg2)
+end
+
+-- The per-value string-transform operators (pattern strip, substitute, substring,
+-- case). Factored out so ${a[@]OP} can apply them to each element.
+function Shell:apply_str_op(op, val, arg, arg2)
+  arg = arg or ""
   if op == "#" then return strip_prefix(val, arg, false) end
   if op == "##" then return strip_prefix(val, arg, true) end
   if op == "%" then return strip_suffix(val, arg, false) end
