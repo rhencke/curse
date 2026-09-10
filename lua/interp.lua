@@ -283,6 +283,7 @@ local function do_test(sh, args)
 end
 
 local expand_word -- forward (used by eval's $-deferred arith and expand_part_str)
+local expand_pattern -- forward (quote-aware glob-pattern expansion for ${v/…} etc.)
 local eval  -- arithmetic evaluator (forward decl)
 eval = function(sh, e)
   local k = e.k
@@ -423,7 +424,10 @@ local function expand_part_str(sh, p)
     if pe.index and pe.index ~= "@" and pe.index ~= "*" then
       subkey = array_key(sh, pe.name, pe.index)
     end
-    local arg = pe.arg and expand_word(sh, P.parse_word(pe.arg)) or nil
+    -- pattern-context ops (/, //) treat quoted metachars literally; everything
+    -- else (defaults :-/-, etc.) expands the arg as an ordinary value.
+    local patmode = pe.op == "/" or pe.op == "//"
+    local arg = pe.arg and (patmode and expand_pattern or expand_word)(sh, P.parse_word(pe.arg)) or nil
     local arg2 = pe.arg2 and expand_word(sh, P.parse_word(pe.arg2)) or nil
     return sh:expand_param(pe, arg, arg2, subkey)
   end
@@ -449,6 +453,20 @@ expand_word = function(sh, w)
   for k, p in ipairs(w.parts) do
     local s = expand_part_str(sh, p)
     if k == 1 and p.lit ~= nil and not p.q then s = tilde_prefix(sh, s) end
+    buf[#buf + 1] = s
+  end
+  return table.concat(buf)
+end
+
+-- Expand a word used as a glob PATTERN (${v/pat/repl}, case, [[ == ]]): a QUOTED
+-- part's glob metacharacters are backslash-escaped so they match literally, while
+-- an unquoted part's (including unquoted $var expansions) stay active — matching
+-- bash's rule that quoting, not the value, decides literalness.
+expand_pattern = function(sh, w)
+  local buf = {}
+  for _, p in ipairs(w.parts) do
+    local s = expand_part_str(sh, p)
+    if p.q then s = s:gsub("[%*%?%[%]\\%(%)%|%+%@%!]", "\\%0") end
     buf[#buf + 1] = s
   end
   return table.concat(buf)

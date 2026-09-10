@@ -644,6 +644,10 @@ local function glob_conv(glob, pn)
       out[#out + 1] = (c == "?" and group .. "?") or (c == "*" and group .. "*")
         or (c == "+" and group .. "+") or group
       i = j + 1
+    elseif c == "\\" then -- backslash escapes the next char -> match it literally
+      local nc = glob:sub(i + 1, i + 1)
+      if nc == "" then out[#out + 1] = "\\\\"; i = i + 1
+      else out[#out + 1] = (nc:match("[%w]") and nc or ("\\" .. nc)); i = i + 2 end
     elseif c == "*" then out[#out + 1] = star; i = i + 1
     elseif c == "?" then out[#out + 1] = qmark; i = i + 1
     elseif c == "[" then
