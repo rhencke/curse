@@ -2249,16 +2249,11 @@ local function exec_stmt(sh, st, hook)
       return
     end
     if st.arrayargs then -- `declare -A a=(...)` / `local -a b=(...)` array literals
-      local assoc = false
-      for _, a in ipairs(args) do
-        if a == "--" then break end
-        if a:sub(1, 1) == "-" and a:find("A") then assoc = true end
-      end
-      for _, aa in ipairs(st.arrayargs) do
-        if assoc then sh:declare_assoc(aa.name) end
-        do_arrayassign(sh, aa)
-        args[#args + 1] = aa.name -- so `declare -A a=(...)` isn't seen as an operand-less listing
-      end
+      -- Only append the names now (so `declare -A a=(...)` isn't seen as a bare
+      -- listing and so `local`/`declare` establishes the scope + attributes). The
+      -- actual array assignment happens AFTER the builtin runs (below), so it lands
+      -- in the freshly-declared/local variable.
+      for _, aa in ipairs(st.arrayargs) do args[#args + 1] = aa.name end
     end
     -- `exec [redirs] [cmd…]`: redirections are permanent (not restored). With no
     -- command it just rewires the shell's own fds (e.g. `exec 3>file`); with a
@@ -2318,6 +2313,9 @@ local function exec_stmt(sh, st, hook)
     else
       run_cmd()
     end
+    -- Array literals for a declaration builtin are assigned AFTER it runs, so a
+    -- `local a=(…)` / `declare -A a=(…)` lands in the now-local/assoc variable.
+    if st.arrayargs then for _, aa in ipairs(st.arrayargs) do do_arrayassign(sh, aa) end end
     -- $_ : the last argument (after expansion) of the command just run.
     if #args > 0 then sh:set_str("_", args[#args]) end
     -- PIPESTATUS for a simple command is a one-element array of its exit status.
