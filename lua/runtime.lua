@@ -100,8 +100,9 @@ function Shell:localVar(name)
   local d = self.pd
   local saved = self.savedstack[d]
   if not saved then saved = {}; self.savedstack[d] = saved end
-  if saved[name] == nil then saved[name] = self.vars[name] or false end
-  self.vars[name] = {}
+  -- Only shadow on the FIRST `local name` in this scope; a repeat (`local foo;
+  -- local foo`) keeps the value already established here (bash).
+  if saved[name] == nil then saved[name] = self.vars[name] or false; self.vars[name] = {} end
 end
 
 -- one `local` operand: `name` or `name=value` (value already expanded).
@@ -409,7 +410,11 @@ end
 -- which checks nounset at the same point. (:get itself is used for internal
 -- reads like IFS/HOME that must not trip nounset.)
 function Shell:get_u(name)
-  if self.opt_u and self.vars[self:deref(name)] == nil and self:special_get(name) == ""
+  -- A declared-but-value-less box (`local foo` / `declare x`) is still UNSET for
+  -- nounset purposes, so treat it like a missing var.
+  local b = self.vars[self:deref(name)]
+  local unset = b == nil or (b.s == nil and b.n == nil and b.arr == nil)
+  if self.opt_u and unset and self:special_get(name) == ""
       and name ~= "@" and name ~= "*" then
     io.stderr:write("curse: " .. name .. ": unbound variable\n"); error({ __curse_exit = 1 })
   end

@@ -432,7 +432,9 @@ end
 local function expand_part_str(sh, p)
   if p.lit ~= nil then return p.lit
   elseif p.var then
-    if sh.opt_u and sh.vars[sh:deref(p.var)] == nil and sh:special_get(p.var) == "" then
+    local b = sh.vars[sh:deref(p.var)]
+    local unset = b == nil or (b.s == nil and b.n == nil and b.arr == nil)
+    if sh.opt_u and unset and sh:special_get(p.var) == "" then
       io.stderr:write("curse: " .. p.var .. ": unbound variable\n"); error({ __curse_exit = 1 })
     end
     return sh:get(p.var)
