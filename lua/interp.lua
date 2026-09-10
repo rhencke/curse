@@ -744,7 +744,14 @@ local function apply_redirs(sh, redirs)
       backup(r.fd)
       local tv = tgt(r)
       if tv == "-" then C.close(r.fd)
-      else local m = tonumber(tv); if m then C.dup2(m, r.fd) end end
+      else
+        local m = tonumber(tv)
+        if m then C.dup2(m, r.fd)
+        elseif r.op == "dup" and tv ~= "" then -- `>&word` (non-number): open the file for
+          backup(2); local f = C.open(tv, sh.opt_C and 705 or 577, 420) -- both stdout AND stderr
+          if f >= 0 then C.dup2(f, r.fd); C.dup2(f, 2); C.close(f) else ok = false end
+        end
+      end
     end
   end
   return save, ok
