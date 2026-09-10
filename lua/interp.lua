@@ -844,9 +844,11 @@ local function exec_simple(sh, args, hook)
     end
   elseif cmd == "[" or cmd == "test" then do_test(sh, args)
   elseif cmd == "return" then
-    error({ __curse_return = args[2] and tonumber(args[2]) or sh.status })
+    if args[2] and not tonumber(args[2]) then io.stderr:write("curse: return: " .. args[2] .. ": numeric argument required\n"); error({ __curse_return = 2 }) end
+    error({ __curse_return = args[2] and (tonumber(args[2]) % 256) or sh.status })
   elseif cmd == "exit" then
-    error({ __curse_exit = args[2] and tonumber(args[2]) or sh.status })
+    if args[2] and not tonumber(args[2]) then io.stderr:write("curse: exit: " .. args[2] .. ": numeric argument required\n"); error({ __curse_exit = 2 }) end
+    error({ __curse_exit = args[2] and (tonumber(args[2]) % 256) or sh.status })
   elseif cmd == "cd" then
     local dir = args[2] or os.getenv("HOME") or ""
     sh.status = (C.chdir(dir) == 0) and 0 or 1
@@ -1394,8 +1396,17 @@ local function exec_stmt(sh, st, hook)
       io.flush()
       local ok = true
       if st.redirs then _, ok = apply_redirs(sh, st.redirs) end
-      if #args > 1 then
-        exec_simple(sh, { unpack(args, 2) }, hook)
+      -- exec [-a name] [--] [cmd…]
+      local k, argv0 = 2, nil
+      while args[k] == "-a" or args[k] == "--" or (args[k] and args[k]:sub(1, 2) == "-a") do
+        if args[k] == "--" then k = k + 1; break
+        elseif args[k] == "-a" then argv0 = args[k + 1]; k = k + 2
+        else argv0 = args[k]:sub(3); k = k + 1 end
+      end
+      if k <= #args then
+        local rest = { unpack(args, k) }
+        if argv0 then rest[0] = argv0 end -- (argv[0] override best-effort)
+        exec_simple(sh, rest, hook)
         io.flush(); os.exit(sh.status or 0)
       else
         sh.status = ok and 0 or 1
