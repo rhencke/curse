@@ -2300,9 +2300,11 @@ local function exec_stmt(sh, st, hook)
       if st.rhs then for _, p in ipairs(st.rhs.parts) do if p.cmdsub then hascs = true; break end end end
       if not hascs then sh.status = 0 end
     end
+    sh:set_str("_", "") -- a bare assignment resets $_ to empty (bash)
   elseif t == "arrayassign" then
     do_arrayassign(sh, st)
     sh.status = 0
+    sh:set_str("_", "")
   elseif t == "funcdef" then
     sh.functions[st.name] = st.body
     sh.status = 0
@@ -2552,7 +2554,12 @@ local function exec_stmt(sh, st, hook)
     elseif type(v) == "table" and v.__curse_matherr then sh.status = 1
     else error(v) end
   elseif t == "dbracket" then
-    sh.status = eval_dbracket(sh, st.expr) and 0 or 1
+    -- like `(( ))`, a `[[ ]]` test is not fatal on an arith error in an operand
+    -- (e.g. `[[ a =~ $((1/0)) ]]`): it yields status 1 and execution continues.
+    local ok, v = pcall(eval_dbracket, sh, st.expr)
+    if ok then sh.status = v and 0 or 1
+    elseif type(v) == "table" and v.__curse_matherr then sh.status = 1
+    else error(v) end
   elseif t == "case" then
     local subj = expand_word(sh, st.subject)
     local P = require("parser")
