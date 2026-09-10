@@ -467,6 +467,7 @@ end
 -- Arithmetic write: store the int64, defer the string (lazy).
 function Shell:aset(name, n)
   local b = box(self:deref(name), self.vars)
+  if b.arr then b.arr[b.assoc and "0" or 0] = i64_to_str(i64(n)); return i64(n) end -- (( a = n )) hits a[0]
   b.n = i64(n); b.s = nil
   return b.n
 end
