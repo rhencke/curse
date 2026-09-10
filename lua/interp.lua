@@ -766,11 +766,13 @@ local KEYWORDS = {
 -- Find `name` in PATH (existence, F_OK — bash's type/command-v report a
 -- non-executable file too; execution then fails 126 via posix_spawn).
 local function find_in_path(name)
-  if name:find("/", 1, true) then return C.access(name, 0) == 0 and name or nil end
+  if name == "" then return nil end
+  local function usable(p) return C.access(p, 1) == 0 and not file_test("-d", p) end -- executable, not a dir
+  if name:find("/", 1, true) then return usable(name) and name or nil end
   local path = os.getenv("PATH") or "/usr/bin:/bin"
   for dir in path:gmatch("[^:]+") do
     local p = dir .. "/" .. name
-    if C.access(p, 0) == 0 then return p end
+    if usable(p) then return p end
   end
   return nil
 end
