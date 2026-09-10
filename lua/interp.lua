@@ -205,6 +205,10 @@ local SIGNUM = { HUP = 1, INT = 2, QUIT = 3, ILL = 4, TRAP = 5, ABRT = 6, BUS = 
   FPE = 8, KILL = 9, USR1 = 10, SEGV = 11, USR2 = 12, PIPE = 13, ALRM = 14, TERM = 15,
   CHLD = 17, CONT = 18, STOP = 19, TSTP = 20, TTIN = 21, TTOU = 22, SYS = 31 }
 local NUMSIG = {}; for k, v in pairs(SIGNUM) do NUMSIG[v] = k end
+-- Human-readable signal descriptions bash prints when a job is killed (`wait`).
+local SIGDESC = { [1] = "Hangup", [2] = "Interrupt", [3] = "Quit", [4] = "Illegal instruction",
+  [5] = "Trace/breakpoint trap", [6] = "Aborted", [7] = "Bus error", [8] = "Floating point exception",
+  [9] = "Killed", [11] = "Segmentation fault", [13] = "Broken pipe", [14] = "Alarm clock", [15] = "Terminated" }
 local function canon_sig(s)
   s = s:upper()
   if s == "0" or s == "EXIT" then return "EXIT" end
@@ -1463,7 +1467,11 @@ local function job_reap(sh, job, nohang)
   if job.done then return job.status end
   local sb = ffi.new("int[1]")
   local r = C.waitpid(job.pid, sb, nohang and WNOHANG or 0)
-  if r > 0 then job.done = true; job.status = rt.wexit(sb[0]); return job.status end
+  if r > 0 then
+    job.done = true; job.status = rt.wexit(sb[0])
+    local s = bit.band(sb[0], 0x7f); if s ~= 0 and s ~= 0x7f then job.sig = s end -- killed by a signal
+    return job.status
+  end
   if r < 0 and not nohang then job.done = true; job.status = 127; return 127 end -- already gone
   return nil -- still running (or, in a subshell, not our child to reap — keep it listed)
 end
@@ -1597,12 +1605,18 @@ local function exec_simple(sh, args, hook, no_func)
         if s:sub(1, 1) == "%" then
           local j = job_resolve(sh, s)
           if not j then io.stderr:write("curse: wait: " .. s .. ": no such job\n"); last = 127
-          else last = job_reap(sh, j) or 127 end
+          else last = job_reap(sh, j) or 127
+            if j.sig and SIGDESC[j.sig] then io.stderr:write(SIGDESC[j.sig] .. "\n") end end
         elseif s:match("^%d+$") then
           local pid, found = tonumber(s), nil
           for _, j in ipairs(sh.jobs) do if j.pid == pid then found = j end end
-          if found then last = job_reap(sh, found) or 127 else last = reap(pid) end
-        else io.stderr:write("curse: wait: `" .. s .. "': not a pid or valid job spec\n"); last = 127; bad = true end
+          if found then last = job_reap(sh, found) or 127
+            if found.sig and SIGDESC[found.sig] then io.stderr:write(SIGDESC[found.sig] .. "\n") end
+          else last = reap(pid) end
+        else -- a bare non-pid/non-jobspec word: status 1 alone, 127 under -n
+          io.stderr:write("curse: wait: `" .. s .. "': not a pid or valid job spec\n")
+          last = nflag and 127 or 1
+        end
       end
       sh.status = last
     else -- wait for all jobs
