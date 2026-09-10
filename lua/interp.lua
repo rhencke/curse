@@ -286,6 +286,7 @@ local expand_word -- forward (used by eval's $-deferred arith and expand_part_st
 local expand_pattern -- forward (quote-aware glob-pattern expansion for ${v/…} etc.)
 local eval  -- arithmetic evaluator (forward decl)
 local arith_resolve -- var-value-as-arith-expression resolver (forward decl)
+local run_trap -- trap-handler runner (forward decl; defined near the bottom)
 -- Resolve a variable's string value in arithmetic. bash treats it as an arith
 -- EXPRESSION: a bare number is its value, but a name (or `3+4`, `bar`) is
 -- recursively parsed and evaluated (so bar=foo; foo=5; $((bar)) == 5). A pure
@@ -1787,6 +1788,13 @@ local function exec_simple(sh, args, hook)
       if type(err) == "table" and err.__curse_return then sh.status = err.__curse_return
       else error(err) end
     end
+    -- RETURN trap: fires after the function body returns (in the caller's scope),
+    -- preserving the function's exit status.
+    local rt_h = sh.traps and sh.traps.RETURN
+    if rt_h and rt_h ~= "" and not sh.in_return_trap then
+      sh.in_return_trap = true; local saved = sh.status
+      run_trap(sh, rt_h); sh.status = saved; sh.in_return_trap = false
+    end
   else sh:exec(unpack(args)) end -- external command
 end
 
@@ -1840,7 +1848,6 @@ local COMPOUND_REDIR = { whilec = true, forc = true, forin = true, ["if"] = true
 -- every simple/pipeline/arith/[[/assignment); it preserves $? around the handler.
 local DEBUG_FIRE = { simple = true, pipeline = true, arithcmd = true, dbracket = true,
   assign = true, assignlist = true }
-local run_trap -- forward (defined below)
 local function run_debug(sh, line)
   local h = sh.traps and sh.traps.DEBUG
   if not h or h == "" or sh.in_debug then return end

@@ -72,6 +72,9 @@ function M.run_background(script_path, opts)
   local count, resume, mod = 0, nil, nil
   local hook = function(kind, id)
     count = count + 1
+    -- Don't OSR into compiled code while a DEBUG/RETURN trap is armed: those fire
+    -- per-command, which the native compiled path can't reproduce. Stay in interp.
+    if sh.traps and (sh.traps.DEBUG or sh.traps.RETURN) then return end
     if mod == nil and sh.calldepth == 0 and count % poll_every == 0 then
       local cf = io.open(out, "r")
       if cf then
