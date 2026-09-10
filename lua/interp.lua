@@ -518,6 +518,15 @@ local function tilde_prefix(sh, s)
 end
 M.tilde_prefix = tilde_prefix
 
+-- In an assignment RHS (x=…, x+=…, [k]=…) bash tilde-expands not just the word
+-- start but every segment following an unquoted ':' (the PATH=~/a:~/b idiom).
+local function tilde_assign(sh, s)
+  if not s:find("~", 1, true) then return s end -- fast path: nothing to expand
+  local segs = {}
+  for seg in (s .. ":"):gmatch("([^:]*):") do segs[#segs + 1] = tilde_prefix(sh, seg) end
+  return table.concat(segs, ":")
+end
+
 expand_word = function(sh, w)
   local buf = {}
   for k, p in ipairs(w.parts) do
@@ -527,6 +536,30 @@ expand_word = function(sh, w)
   end
   return table.concat(buf)
 end
+
+-- expand_word for an assignment RHS: unquoted literal parts get the after-':'
+-- tilde rule; expanded ($var/$()) and quoted text is never (re-)tilde-expanded.
+-- peel_name: the word is a full `name=value` (declaration-builtin arg), so the
+-- leading `name=` / `name+=` stays literal and the value after it is the first
+-- tilde segment (`readonly x=~/y`). Only the FIRST `=` is a boundary — bash
+-- leaves `x=foo=~` as foo=~, which falls out of expanding the value as one word.
+local function expand_assign_word(sh, w, peel_name)
+  local buf = {}
+  for i, p in ipairs(w.parts) do
+    local s = expand_part_str(sh, p)
+    if p.lit ~= nil and not p.q then
+      if peel_name and i == 1 then
+        local pre, rest = s:match("^([%a_][%w_]*%+?=)(.*)$")
+        s = pre and (pre .. tilde_assign(sh, rest)) or tilde_assign(sh, s)
+      else
+        s = tilde_assign(sh, s)
+      end
+    end
+    buf[#buf + 1] = s
+  end
+  return table.concat(buf)
+end
+M.expand_assign_word = expand_assign_word
 
 -- Expand a word used as a glob PATTERN (${v/pat/repl}, case, [[ == ]]): a QUOTED
 -- part's glob metacharacters are backslash-escaped so they match literally, while
@@ -873,7 +906,7 @@ local function do_arrayassign(sh, st)
   local items = {}
   for _, e in ipairs(st.elems) do
     if e.key ~= nil then -- keyed RHS is a single value (no field splitting)
-      items[#items + 1] = { key = e.key, op = e.op, val = expand_word(sh, e.word) }
+      items[#items + 1] = { key = e.key, op = e.op, val = expand_assign_word(sh, e.word) }
     else -- bare element: unquoted expansions split into multiple elements
       for _, f in ipairs(expand_to_fields(sh, e.word)) do
         items[#items + 1] = { key = nil, op = "=", val = f }
@@ -2180,7 +2213,7 @@ local function exec_stmt(sh, st, hook)
       io.stderr:write("curse: " .. st.name .. ": readonly variable\n") -- only in `sh -c` mode; a script keeps going.
       sh.status = 1; if sh.opt_c then error({ __curse_exit = 1 }) end; return
     elseif st.index then
-      sh:array_set(st.name, array_key(sh, st.name, st.index), expand_word(sh, st.rhs), st.append)
+      sh:array_set(st.name, array_key(sh, st.name, st.index), expand_assign_word(sh, st.rhs), st.append)
     elseif st.arith then
       sh:aset(st.name, eval(sh, st.arith))
     elseif st.append then
@@ -2188,17 +2221,17 @@ local function exec_stmt(sh, st, hook)
       if b and b.int then -- integer var: += is arithmetic addition
         sh:aset(st.name, sh:aget(st.name) + eval(sh, require("parser").arith(expand_word(sh, st.rhs))))
       else
-        sh:set_str(st.name, sh:get(st.name) .. expand_word(sh, st.rhs))
+        sh:set_str(st.name, sh:get(st.name) .. expand_assign_word(sh, st.rhs))
       end
     else
       local b = sh.vars[sh:deref(st.name)]
       if b and b.int then -- integer var (declare -i): assign arith-evaluates
         sh:aset(st.name, eval(sh, require("parser").arith(expand_word(sh, st.rhs))))
       elseif b and (b.lower or b.upper) then -- declare -l/-u: case-fold on assign
-        local v = expand_word(sh, st.rhs)
+        local v = expand_assign_word(sh, st.rhs)
         sh:set_str(st.name, b.lower and v:lower() or v:upper())
       else
-        sh:set_str(st.name, expand_word(sh, st.rhs))
+        sh:set_str(st.name, expand_assign_word(sh, st.rhs))
       end
     end
     -- exit status of an assignment = the last command substitution's, else 0
@@ -2263,7 +2296,7 @@ local function exec_stmt(sh, st, hook)
     for wi, w in ipairs(st.words) do
       local p1 = w.parts[1]
       if wi > 1 and is_assign and p1 and p1.lit and p1.lit:match("^[%a_][%w_]*%+?=") then
-        args[#args + 1] = expand_word(sh, w) -- assignment word: single field, no glob
+        args[#args + 1] = expand_assign_word(sh, w, true) -- name=value word: no glob, ~ after =/:
       else
         local fs = expand_to_fields(sh, w)
         for k = 1, #fs do args[#args + 1] = fs[k] end

@@ -743,6 +743,19 @@ local function make_parser(src)
     return stmts
   end
 
+  -- A function body is usually a `{ … }` group but may be a `( … )` subshell
+  -- (bash: `f() ( ... )`). Return a stmt list either way — the subshell form
+  -- yields a one-statement list holding a subshell node, so it runs isolated.
+  local function func_body()
+    ws()
+    if src:sub(i, i) == "(" then
+      local ln = line; i = i + 1
+      local body = parse_stmts({ [")"] = true })
+      return { { t = "subshell", line = ln, body = body } }
+    end
+    return brace_group()
+  end
+
   local parse_stmt -- forward: the and-or wrapper (used by case bodies below)
 
   -- Try to read a redirection at the current position; returns a redir table and
@@ -789,22 +802,32 @@ local function make_parser(src)
   local function parse_command()
     ws()
     -- function NAME [()] { … }   or   NAME() { … }
+    -- Function names may contain far more than identifier chars (bash: `show-len`,
+    -- `git-foo`, `a.b`), so match a run of non-metacharacter word bytes here.
     if peekword() == "function" then
       ws(); i = i + 8; ws()
-      local s, e = src:find("^[%a_][%w_]*", i)
+      local s, e = src:find("^[%w_][%w_%.%-:+@]*", i)
       if not s then error("function needs a name") end
       local nm = src:sub(s, e); i = e + 1; ws()
-      if src:sub(i, i + 1) == "()" then i = i + 2 end
-      return { t = "funcdef", name = nm, body = brace_group() }
+      -- optional `( )` (bash: `function f () { … }`, spaces allowed between parens)
+      if src:sub(i, i) == "(" then
+        local k = i + 1; while src:sub(k, k):match("[ \t]") do k = k + 1 end
+        if src:sub(k, k) == ")" then i = k + 1 end
+      end
+      return { t = "funcdef", name = nm, body = func_body() }
     end
     do
-      local s, e = src:find("^[%a_][%w_]*", i)
+      local s, e = src:find("^[%w_][%w_%.%-:+@]*", i)
       if s then
         local j = e + 1
         while src:sub(j, j):match("[ \t]") do j = j + 1 end
-        if src:sub(j, j + 1) == "()" then
-          local nm = src:sub(s, e); i = j + 2
-          return { t = "funcdef", name = nm, body = brace_group() }
+        -- NAME ( ) — a space is allowed between the parens (bash: `fun ( ) { … }`)
+        if src:sub(j, j) == "(" then
+          local k = j + 1; while src:sub(k, k):match("[ \t]") do k = k + 1 end
+          if src:sub(k, k) == ")" then
+            local nm = src:sub(s, e); i = k + 1
+            return { t = "funcdef", name = nm, body = func_body() }
+          end
         end
       end
     end

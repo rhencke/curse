@@ -395,7 +395,8 @@ function Shell:get(name)
   name = self:deref(name)
   local b = self.vars[name]
   if b == nil then return self:special_get(name) end
-  if b.arr then return b.arr[0] or "" end -- $a == ${a[0]}
+  -- $a == ${a[0]}: indexed arrays key on the number 0; assoc arrays on "0".
+  if b.arr then return (b.assoc and b.arr["0"] or b.arr[0]) or "" end
   if b.s == nil then
     if b.n == nil then return "" end
     b.s = i64_to_str(b.n)
