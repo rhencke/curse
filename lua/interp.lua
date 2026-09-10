@@ -287,6 +287,7 @@ local expand_pattern -- forward (quote-aware glob-pattern expansion for ${v/…}
 local eval  -- arithmetic evaluator (forward decl)
 local arith_resolve -- var-value-as-arith-expression resolver (forward decl)
 local arith_key -- array subscript in arith: string key for assoc, number for indexed
+local arith_int -- forward: arith-eval a slice offset/length string
 local run_trap -- trap-handler runner (forward decl; defined near the bottom)
 -- Resolve a variable's string value in arithmetic. bash treats it as an arith
 -- EXPRESSION: a bare number is its value, but a name (or `3+4`, `bar`) is
@@ -461,6 +462,10 @@ local function expand_part_str(sh, p)
     local patmode = pe.op == "/" or pe.op == "//"
     local arg = pe.arg and (patmode and expand_pattern or expand_word)(sh, P.parse_word(pe.arg)) or nil
     local arg2 = pe.arg2 and expand_word(sh, P.parse_word(pe.arg2)) or nil
+    if pe.op == "sub" then -- ${v:off:len}: offset/length are arithmetic expressions
+      arg = arg and tostring(arith_int(sh, arg) or 0) or nil
+      arg2 = arg2 and tostring(arith_int(sh, arg2) or 0) or nil
+    end
     return sh:expand_param(pe, arg, arg2, subkey)
   end
   return ""
@@ -525,7 +530,7 @@ local function is_multi(p)
   return p.pexp.index == "@" or p.pexp.index == "*"
 end
 -- arith-evaluate a slice offset/length expression (e.g. "i-4", "(-4)", "2").
-local function arith_int(sh, s)
+arith_int = function(sh, s)
   if s == nil or s == "" then return nil end
   local ok, v = pcall(function() return tonumber(rt.i64_to_str(eval(sh, require("parser").arith(s)))) end)
   return (ok and v) or tonumber(s) or 0
