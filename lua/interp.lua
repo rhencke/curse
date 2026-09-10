@@ -681,6 +681,24 @@ local function expand_to_fields(sh, w)
       else
         for k = 1, #els do if k > 1 then brk() end; feed_split(els[k]) end
       end
+    elseif p.pexp and not p.q and (p.pexp.op == ":-" or p.pexp.op == "-") and not p.pexp.index
+        and p.pexp.name ~= "@" and p.pexp.name ~= "*" then
+      -- unquoted ${x:-word}/-: when the WORD branch is taken, the word's OWN quoting
+      -- governs splitting (bash), so expand it field-wise rather than as a flat string.
+      local pe = p.pexp
+      local b = sh.vars[sh:deref(pe.name)]
+      local hasval = b ~= nil and (b.s ~= nil or b.n ~= nil or b.arr ~= nil) or sh:special_get(pe.name) ~= ""
+      local useword = (pe.op == ":-" and sh:get(pe.name) == "") or (pe.op == "-" and not hasval)
+      if useword and pe.arg then
+        -- expand the default's parts: a QUOTED part is one atomic (sub)field, an
+        -- unquoted part word-splits — so 'a b' stays one field but a b splits.
+        for _, sp in ipairs(require("parser").parse_word(pe.arg).parts) do
+          local s = expand_part_str(sh, sp)
+          if sp.q then add(s, false) else feed_split(s) end
+        end
+      else
+        feed_split(sh:get(pe.name))
+      end
     else
       local s = expand_part_str(sh, p)
       if pi == 1 and p.lit ~= nil and not p.q then s = tilde_prefix(sh, s) end -- word-initial ~
