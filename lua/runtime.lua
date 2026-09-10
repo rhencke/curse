@@ -178,6 +178,15 @@ ffi.cdef [[
 ]]
 local C = ffi.C
 
+-- Decode a waitpid status word into a bash exit code: 128+signum when killed by
+-- a signal, else the WEXITSTATUS byte. (Shared by Shell:exec, wait, subshell,
+-- pipeline.)
+function M.wexit(s)
+  local sig = bit.band(s, 0x7f)
+  if sig ~= 0 and sig ~= 0x7f then return 128 + sig end
+  return bit.rshift(bit.band(s, 0xff00), 8)
+end
+
 function Shell:exec(...)
   local args = { ... }
   local n = #args
@@ -210,13 +219,7 @@ function Shell:exec(...)
   C.close(rfd)
   local st = ffi.new("int[1]")
   C.waitpid(pidp[0], st, 0)
-  local s = st[0]
-  local sig = bit.band(s, 0x7f)
-  if sig ~= 0 and sig ~= 0x7f then
-    self.status = 128 + sig                       -- killed by a signal
-  else
-    self.status = bit.rshift(bit.band(s, 0xff00), 8) -- WEXITSTATUS
-  end
+  self.status = M.wexit(st[0])
   local out = table.concat(chunks)
   if out ~= "" then self.out(out) end
 end
@@ -632,27 +635,6 @@ end
 function Shell:array_count(name) return #self:array_indices(name) end
 
 -- ---- parameter expansion ${var OP arg} ----
--- Convert a shell glob to a Lua pattern fragment (for #/%/// operators). Handles
--- * ? and [..]/[!..]; escapes Lua-magic chars elsewhere.
-local function glob_to_lpat(glob)
-  local out, i = {}, 1
-  while i <= #glob do
-    local c = glob:sub(i, i)
-    if c == "*" then out[#out + 1] = ".*"
-    elseif c == "?" then out[#out + 1] = "."
-    elseif c == "[" then
-      local j = i + 1; local neg = false
-      if glob:sub(j, j) == "!" or glob:sub(j, j) == "^" then neg = true; j = j + 1 end
-      local cls = {}
-      while j <= #glob and glob:sub(j, j) ~= "]" do cls[#cls + 1] = glob:sub(j, j); j = j + 1 end
-      out[#out + 1] = "[" .. (neg and "^" or "") .. table.concat(cls) .. "]"
-      i = j
-    elseif c:match("[%(%)%.%%%+%-%^%$%]]") then out[#out + 1] = "%" .. c
-    else out[#out + 1] = c end
-    i = i + 1
-  end
-  return table.concat(out)
-end
 -- Whole-string glob match via the POSIX regex engine (real char classes/extglob).
 -- Deferred to call time through M so it can be defined textually after this.
 local function full_match(s, glob) return M.regex_match(s, M.glob_to_ere(glob)) end

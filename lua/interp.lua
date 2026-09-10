@@ -5,6 +5,7 @@
 -- when the compiled Lua is ready, unwinding here so execution can jump into the
 -- compiled code from exactly this point (state is already in `sh`).
 local rt = require("runtime")
+local P = require("parser") -- parser has no load-time dep on interp, so this is cycle-safe
 local i64 = rt.i64
 local ffi = require("ffi")
 local bit = require("bit")
@@ -149,6 +150,8 @@ end
 
 local function truth(n) return n ~= i64(0) end
 local function b2i(b) return b and 1LL or 0LL end
+-- ${…} operators whose default/alternate word is expanded lazily (only when used).
+local TESTOP = { ["-"] = 1, [":-"] = 1, ["+"] = 1, [":+"] = 1, ["="] = 1, [":="] = 1, ["?"] = 1, [":?"] = 1 }
 
 -- ---- `test` / `[` builtin ----
 ffi.cdef [[
@@ -345,6 +348,7 @@ local arith_resolve -- var-value-as-arith-expression resolver (forward decl)
 local arith_key -- array subscript in arith: string key for assoc, number for indexed
 local arith_int -- forward: arith-eval a slice offset/length string
 local run_trap -- trap-handler runner (forward decl; defined near the bottom)
+local fire_err -- ERR-trap + errexit enforcement (forward decl; defined near exec_list)
 -- Resolve a variable's string value in arithmetic. bash treats it as an arith
 -- EXPRESSION: a bare number is its value, but a name (or `3+4`, `bar`) is
 -- recursively parsed and evaluated (so bar=foo; foo=5; $((bar)) == 5). A pure
@@ -359,7 +363,7 @@ arith_resolve = function(sh, s)
   sh.arith_depth = (sh.arith_depth or 0) + 1
   local r = i64(0)
   if sh.arith_depth <= 40 then
-    local ok, ast = pcall(require("parser").arith, s)
+    local ok, ast = pcall(P.arith, s)
     if ok then local ok2, v = pcall(eval, sh, ast); if ok2 and v ~= nil then r = v end end
   end
   sh.arith_depth = sh.arith_depth - 1
@@ -390,7 +394,6 @@ eval = function(sh, e)
   end
   if k == "param" then return rt.str_to_i64(sh:param(e.n)) end
   if k == "xpand" then -- deferred: expansions inside $(( )) resolved at runtime
-    local P = require("parser")
     return eval(sh, P.arith(expand_word(sh, P.parse_word(e.raw)), true))
   end
   if k == "comma" then eval(sh, e.l); return eval(sh, e.r) end
@@ -479,7 +482,6 @@ end
 -- Resolve an array subscript to a key: a string (word-expanded) for an
 -- associative array, else an integer (arith-evaluated) for an indexed one.
 array_key = function(sh, name, index_raw)
-  local P = require("parser")
   if sh:is_assoc(name) then return expand_word(sh, P.parse_word(index_raw)) end
   -- indexed: expand $()/$vars in the subscript, then evaluate it as arithmetic
   local ex = expand_word(sh, P.parse_word(index_raw))
@@ -497,7 +499,7 @@ local function expand_part_str(sh, p)
     -- ${a[2]} — deref only yields the base name, so expand the target here.
     local rb = sh.vars[p.var]
     if rb and rb.ref and rb.s and rb.s:find("[", 1, true) then
-      return expand_word(sh, require("parser").parse_word("${" .. rb.s .. "}"))
+      return expand_word(sh, P.parse_word("${" .. rb.s .. "}"))
     end
     local b = sh.vars[sh:deref(p.var)]
     local unset = b == nil or (b.s == nil and b.n == nil and b.arr == nil)
@@ -520,7 +522,9 @@ local function expand_part_str(sh, p)
     elseif p.special == "!" then return sh.last_bg_pid or ""
     elseif p.special == "-" then return sh:dash_flags() end
     return ""
-  elseif p.arith then return rt.i64_to_str(eval(sh, require("parser").arith(p.arith)))
+  elseif p.arith then -- cache the parsed AST on the part: a loop re-expanding the
+    p.arith_ast = p.arith_ast or P.arith(p.arith) -- same $((…)) shouldn't re-parse it
+    return rt.i64_to_str(eval(sh, p.arith_ast))
   elseif p.procsub then
     -- <(cmd)/>(cmd): substitute a filename. <( ) runs the command and captures its
     -- output to a temp file whose path is the word; >( ) makes a temp file the word
@@ -538,7 +542,7 @@ local function expand_part_str(sh, p)
     return tmp
   elseif p.cmdsub then return sh:capture_src(p.cmdsub)
   elseif p.pexp then
-    local pe, P = p.pexp, require("parser")
+    local pe = p.pexp
     if pe.op == "badsubst" then -- ${x|html} and other unrecognized ${…} forms
       io.stderr:write("curse: ${" .. (pe.raw or pe.name or "") .. "}: bad substitution\n")
       error({ __curse_exit = 1, __curse_experr = true }) -- fails the command, non-fatal
@@ -568,7 +572,7 @@ local function expand_part_str(sh, p)
       or pe.op == "^" or pe.op == "^^" or pe.op == "," or pe.op == ",," -- case-fold pattern
     -- The word for -/:-/+/:+/=/:=/?/:? is only expanded WHEN USED (bash: a default
     -- with side effects like $((i++)) runs only if the branch is taken). Pass a thunk.
-    local TESTOP = { ["-"] = 1, [":-"] = 1, ["+"] = 1, [":+"] = 1, ["="] = 1, [":="] = 1, ["?"] = 1, [":?"] = 1 }
+    -- (TESTOP is a module-level constant.)
     -- When the ${…} is inside double quotes, its default/alternate word follows
     -- double-quoted rules: single quotes are literal and a backslash is kept
     -- except before $ ` " \ (parse_heredoc has exactly these semantics). An inner
@@ -726,7 +730,7 @@ indirect_part = function(sh, pe)
     io.stderr:write("curse: " .. tname .. ": invalid variable name\n")
     error({ __curse_exit = 1, __curse_experr = true })
   end
-  local ok, part = pcall(require("parser").parse_paramexp, tname .. (pe.iop or ""))
+  local ok, part = pcall(P.parse_paramexp, tname .. (pe.iop or ""))
   return ok and part or nil
 end
 local is_multi
@@ -741,7 +745,7 @@ end
 -- arith-evaluate a slice offset/length expression (e.g. "i-4", "(-4)", "2").
 arith_int = function(sh, s)
   if s == nil or s == "" then return nil end
-  local ok, v = pcall(function() return tonumber(rt.i64_to_str(eval(sh, require("parser").arith(s)))) end)
+  local ok, v = pcall(function() return tonumber(rt.i64_to_str(eval(sh, P.arith(s)))) end)
   return (ok and v) or tonumber(s) or 0
 end
 -- ${a[@]:off:len}: select elements by (0-based, negatives-from-end) offset/length.
@@ -759,7 +763,7 @@ local function array_slice(els, off, len)
 end
 local function multi_elems(sh, p) -- returns element list, star?
   if p.pexp then
-    local pe, P = p.pexp, require("parser")
+    local pe = p.pexp
     local star = (pe.index == "*" or pe.name == "*") -- $* / ${*:…} join when quoted
     -- Expand a default/alternate word (`:-`/`-`/`:+`/`+` arg). If it is itself a
     -- single array/$@ expansion (${d[@]}), preserve its elements as separate
@@ -905,7 +909,7 @@ local function expand_to_fields(sh, w)
       if useword and pe.arg then
         -- expand the default's parts: a QUOTED part is one atomic (sub)field, an
         -- unquoted part word-splits — so 'a b' stays one field but a b splits.
-        for k, sp in ipairs(require("parser").parse_word(pe.arg).parts) do
+        for k, sp in ipairs(P.parse_word(pe.arg).parts) do
           local s = expand_part_str(sh, sp)
           if k == 1 and sp.lit ~= nil and not sp.q then s = tilde_prefix(sh, s) end -- word-initial ~
           if sp.q then add(s, false) else feed_split(s) end
@@ -995,7 +999,6 @@ end
 local function apply_redirs(sh, redirs)
   io.flush() -- flush pending stdout BEFORE moving fds, else buffered output from a
              -- prior command would be redirected into (and lost to) the new target
-  local P = require("parser")
   local save, ok = {}, true
   local function backup(fd) save[#save + 1] = { fd = fd, saved = C.dup(fd) } end
   -- redirect targets are word-expanded at runtime (e.g. `> $TMP/f`, `>& $myfd`).
@@ -1478,7 +1481,7 @@ local function exec_simple(sh, args, hook, no_func)
       local start = (args[2] == "--") and 3 or 2
       local code = table.concat({ unpack(args, start) }, " ")
       if code:match("%S") then
-        local ok, parsed = pcall(require("parser").parse, code)
+        local ok, parsed = pcall(P.parse, code)
         if not ok then io.stderr:write("curse: eval: " .. tostring(parsed) .. "\n"); sh.status = 2
         else exec_list(sh, parsed.stmts, hook, false) end
       else sh.status = 0 end
@@ -1505,7 +1508,7 @@ local function exec_simple(sh, args, hook, no_func)
       if not f then io.stderr:write("curse: " .. cmd .. ": " .. name .. ": No such file or directory\n"); sh.status = 1
       else
         local src = f:read("*a"); f:close()
-        local ok, parsed = pcall(require("parser").parse, src)
+        local ok, parsed = pcall(P.parse, src)
         if not ok then sh.status = 2
         else
           local savep, savenp = sh.params, sh.nparams
@@ -1528,8 +1531,7 @@ local function exec_simple(sh, args, hook, no_func)
     local stbuf = ffi.new("int[1]")
     local function reap(pid)
       if C.waitpid(pid, stbuf, 0) < 0 then return 127 end
-      local s = stbuf[0]; local sig = bit.band(s, 0x7f)
-      return (sig ~= 0 and sig ~= 0x7f) and (128 + sig) or bit.rshift(bit.band(s, 0xff00), 8)
+      return rt.wexit(stbuf[0])
     end
     local pids, bad = {}, false
     for k = 2, #args do
@@ -1966,8 +1968,8 @@ local function exec_simple(sh, args, hook, no_func)
           local ap = (op == "+=")
           if nref then sh:make_nameref(nm, val)
           elseif iattr then -- declare -i: arith-evaluate the value, mark integer
-            if ap then sh:aset(nm, sh:aget(nm) + eval(sh, require("parser").arith(val)))
-            else sh:aset(nm, eval(sh, require("parser").arith(val))) end
+            if ap then sh:aset(nm, sh:aget(nm) + eval(sh, P.arith(val)))
+            else sh:aset(nm, eval(sh, P.arith(val))) end
             sh.vars[nm].int = true
           elseif lattr or uattr then -- declare -l/-u: lower/upper case attribute
             local nv = lattr and val:lower() or val:upper()
@@ -2168,7 +2170,7 @@ local function exec_simple(sh, args, hook, no_func)
       if wordlist then
         -- -W expands the wordlist (params/$()/arith) THEN splits on IFS; a fatal
         -- expansion (bad ${…}, div-by-zero) makes compgen fail with status 1.
-        local ok, expanded = pcall(expand_word, sh, require("parser").parse_word(wordlist))
+        local ok, expanded = pcall(expand_word, sh, P.parse_word(wordlist))
         if ok then
           for _, w in ipairs(rt.ifs_split(sh.vars["IFS"] and sh:get("IFS") or " \t\n", expanded)) do emit(w) end
         else werr = true end
@@ -2461,15 +2463,13 @@ local function exec_simple(sh, args, hook, no_func)
     -- ignores the delimiter entirely.
     local dch = delim == nil and "\n" or (delim == "" and "\0" or delim:sub(1, 1))
     do
-      local buf, got, esc = {}, false, false
+      local buf, got = {}, false
       while true do
         if nchars and #buf >= nchars then had_nl = true; break end -- -n/-N char limit reached
         local c = fd_getc(ufd)
         if c == nil then had_nl = false; break end
         got = true
-        if esc then -- backslash-escaped char: keep verbatim (drop the backslash)
-          buf[#buf + 1] = c; esc = false
-        elseif not raw and c == "\\" then
+        if not raw and c == "\\" then
           -- \<newline> is a line continuation (splice); other \x escapes the char
           -- (marked with \1 so IFS splitting treats it as literal, bash's CTLESC).
           local d = fd_getc(ufd)
@@ -2603,7 +2603,6 @@ local function eval_dbracket(sh, node)
     elseif op == "-eq" or op == "-ne" or op == "-lt" or op == "-le" or op == "-gt" or op == "-ge" then
       -- [[ ]] arithmetic comparisons evaluate each side as an arith EXPRESSION
       -- (bash: [[ 1+2 -eq 3 ]] is true), unlike `test` which needs integer literals.
-      local P = require("parser")
       local nl = eval(sh, P.arith(l == "" and "0" or l))
       local nr = eval(sh, P.arith(r == "" and "0" or r))
       if op == "-eq" then return nl == nr elseif op == "-ne" then return nl ~= nr
@@ -2631,6 +2630,15 @@ local function run_loop_body(sh, body, hook)
   error(err) -- exit/return/real error propagates
 end
 
+-- In a forked child (subshell/background/pipeline stage), translate an exit/return
+-- thrown as a control table into $? so the child _exits with the right status.
+-- (A non-table Lua error is left for the caller; forked children then _exit anyway.)
+local function child_status(sh, ok, err)
+  if not ok and type(err) == "table" then sh.status = err.__curse_exit or err.__curse_return or sh.status end
+end
+
+-- Declaration builtins whose `name=value` arguments are assignment words.
+local ASSIGN_CMD = { export = 1, declare = 1, typeset = 1, readonly = 1, ["local"] = 1 }
 -- compound commands whose trailing redirs (`done < f`, `fi > f`) apply to the
 -- whole construct; handled generically below (simple/group/subshell do their own).
 local COMPOUND_REDIR = { whilec = true, forc = true, forin = true, ["if"] = true,
@@ -2686,14 +2694,14 @@ local function exec_stmt(sh, st, hook)
     elseif st.append then
       local b = sh.vars[sh:deref(st.name)]
       if b and b.int then -- integer var: += is arithmetic addition
-        sh:aset(st.name, sh:aget(st.name) + eval(sh, require("parser").arith(expand_word(sh, st.rhs))))
+        sh:aset(st.name, sh:aget(st.name) + eval(sh, P.arith(expand_word(sh, st.rhs))))
       else
         sh:set_str(st.name, sh:get(st.name) .. expand_assign_word(sh, st.rhs))
       end
     else
       local b = sh.vars[sh:deref(st.name)]
       if b and b.int then -- integer var (declare -i): assign arith-evaluates
-        sh:aset(st.name, eval(sh, require("parser").arith(expand_word(sh, st.rhs))))
+        sh:aset(st.name, eval(sh, P.arith(expand_word(sh, st.rhs))))
       elseif b and (b.lower or b.upper) then -- declare -l/-u: case-fold on assign
         local v = expand_assign_word(sh, st.rhs)
         sh:set_str(st.name, b.lower and v:lower() or v:upper())
@@ -2739,7 +2747,6 @@ local function exec_stmt(sh, st, hook)
       local seen = st.alias_seen
       local av = nm and not (seen and seen[nm]) and sh.aliases[nm]
       if av then
-        local P = require("parser")
         local parsed = P.parse(av)
         seen = seen or {}; seen[nm] = true
         if parsed.stmts and #parsed.stmts == 1 and parsed.stmts[1].t == "simple" then
@@ -2768,9 +2775,8 @@ local function exec_stmt(sh, st, hook)
         end
       end
     end
-    -- `name=value` arguments to a declaration builtin (export/declare/readonly/
-    -- local/typeset) are ASSIGNMENT words: the value isn't word-split or globbed.
-    local ASSIGN_CMD = { export = 1, declare = 1, typeset = 1, readonly = 1, ["local"] = 1 }
+    -- `name=value` arguments to a declaration builtin (ASSIGN_CMD, module-level)
+    -- are ASSIGNMENT words: the value isn't word-split or globbed.
     -- Assignment-word treatment applies only when the command name is a STATIC
     -- (literal, unquoted) declaration builtin — `typeset x=$x` splits, but
     -- `cmd=typeset; $cmd x=$x` does NOT (bash: the name must be recognized before
@@ -2973,13 +2979,12 @@ local function exec_stmt(sh, st, hook)
         sh.out = io.write
         exec_list(sh, st.body, hook, false)
       end)
-      if not ok and type(err) == "table" then sh.status = err.__curse_exit or err.__curse_return or sh.status end
+      child_status(sh, ok, err)
       io.flush() -- flush BEFORE _exit (which doesn't); exit/error skips an inline flush
       C._exit(sh.status or 0)
     end
     local stbuf = ffi.new("int[1]"); C.waitpid(pid, stbuf, 0)
-    local s = stbuf[0]; local sig = bit.band(s, 0x7f)
-    sh.status = (sig ~= 0 and sig ~= 0x7f) and (128 + sig) or bit.rshift(bit.band(s, 0xff00), 8)
+    sh.status = rt.wexit(stbuf[0])
   elseif t == "background" then
     -- cmd & : fork, run in the child; parent records $! and continues (status 0).
     io.flush()
@@ -2988,7 +2993,7 @@ local function exec_stmt(sh, st, hook)
       sh.in_subprogram = (sh.in_subprogram or 0) + 1 -- async subprogram: ERR trap won't fire (sans errtrace)
       sh.loopdepth = 0
       local ok, err = pcall(function() sh.out = io.write; exec_stmt(sh, st.cmd, hook) end)
-      if not ok and type(err) == "table" then sh.status = err.__curse_exit or err.__curse_return or sh.status end
+      child_status(sh, ok, err)
       io.flush(); C._exit(sh.status or 0)
     end
     sh.last_bg_pid = tostring(pid)
@@ -3018,7 +3023,6 @@ local function exec_stmt(sh, st, hook)
     else error(v) end
   elseif t == "case" then
     local subj = expand_word(sh, st.subject)
-    local P = require("parser")
     local fall = false -- carrying a `;&` fall-through into the next clause
     sh.status = 0
     for _, cl in ipairs(st.clauses) do
@@ -3047,17 +3051,9 @@ local function exec_stmt(sh, st, hook)
       if go then exec_stmt(sh, it.cmd, hook) end
       if k == #st.items then ran_last = go end
     end
-    -- errexit applies to an &&/|| list only via its FINAL operand (bash exempts the
-    -- earlier ones); exit if that operand ran and failed, outside a condition.
-    if ran_last and sh.noerr == 0 and sh.status ~= 0 and sh.opt_e
-        and (sh.in_subprogram or 0) == 0 then
-      local h = sh.traps and sh.traps.ERR
-      if h and h ~= "" and not sh.in_err_trap and ((sh.calldepth or 0) == 0 or sh.opt_errtrace) then
-        sh.in_err_trap = true; local saved = sh.status
-        run_trap(sh, h); sh.status = saved; sh.in_err_trap = false
-      end
-      error({ __curse_exit = sh.status })
-    end
+    -- ERR/errexit apply to an &&/|| list only via its FINAL operand (bash exempts
+    -- the earlier ones): fire if that operand ran and failed, outside a condition.
+    if ran_last and sh.noerr == 0 and sh.status ~= 0 then fire_err(sh) end
   elseif t == "pipeline" then
     -- fork a child per stage wired by pipes; the last stage's exit status is the
     -- pipeline's. Each child is guarded so a failure can never return into the
@@ -3096,7 +3092,7 @@ local function exec_stmt(sh, st, hook)
               sh.out = io.write
               exec_stmt(sh, cmds[k], hook)
             end)
-            if not ok and type(err) == "table" then sh.status = err.__curse_exit or err.__curse_return or sh.status end
+            child_status(sh, ok, err)
             io.flush(); C._exit(sh.status or 0)
           end
           pids[k] = pid
@@ -3119,7 +3115,7 @@ local function exec_stmt(sh, st, hook)
               sh.out = io.write -- this stage writes to its fd 1 (the pipe / terminal)
               exec_stmt(sh, cmds[k], hook)
             end)
-            if not ok and type(err) == "table" then sh.status = err.__curse_exit or err.__curse_return or sh.status end
+            child_status(sh, ok, err)
             io.flush() -- before _exit (exit/error in the stage would skip an inline flush)
             C._exit(sh.status or 0)
           end
@@ -3137,8 +3133,7 @@ local function exec_stmt(sh, st, hook)
         if pids[k] == -1 then est = inline_status or 0 -- ran inline (lastpipe)
         else
           C.waitpid(pids[k], stbuf, 0)
-          local s = stbuf[0]; local sig = bit.band(s, 0x7f)
-          est = (sig ~= 0 and sig ~= 0x7f) and (128 + sig) or bit.rshift(bit.band(s, 0xff00), 8)
+          est = rt.wexit(stbuf[0])
         end
         pstat[k] = tostring(est)
         if k == nst then last = est end
@@ -3196,11 +3191,33 @@ run_trap = function(sh, code)
   local exited, savedline = false, sh.cur_line
   sh.in_trap = (sh.in_trap or 0) + 1
   local ok, err = pcall(function()
-    for _, st in ipairs(require("parser").parse(code).stmts) do exec_stmt(sh, st, function() end) end
+    for _, st in ipairs(P.parse(code).stmts) do exec_stmt(sh, st, function() end) end
   end)
   sh.in_trap = sh.in_trap - 1; sh.cur_line = savedline
   if not ok and type(err) == "table" and err.__curse_exit then sh.status = err.__curse_exit; exited = true end
   return exited
+end
+
+-- A statement that just failed and is subject to ERR/errexit: a bare
+-- simple/pipeline/(( ))/assignment outside a condition (`noerr`), a `!`-negated
+-- pipeline being exempt like a condition. (&&/|| lists have their own final-
+-- operand rule and call fire_err directly.)
+local function errexit_stmt(sh, st)
+  return sh.noerr == 0 and sh.status ~= 0 and not st.negate
+    and (st.t == "simple" or st.t == "pipeline" or st.t == "arithcmd"
+      or st.t == "assign" or st.t == "assignlist")
+end
+-- Run the ERR trap (once, in scope: the main shell unless errtrace extends it to
+-- functions/subprograms) preserving $?, then exit if errexit is on. Shared by
+-- exec_list, run_lazy and the &&/|| handler (which previously drifted apart).
+fire_err = function(sh)
+  local h = sh.traps and sh.traps.ERR
+  local errscope = sh.opt_errtrace or ((sh.calldepth or 0) == 0 and (sh.in_subprogram or 0) == 0)
+  if h and h ~= "" and not sh.in_err_trap and errscope then
+    sh.in_err_trap = true; local saved = sh.status
+    run_trap(sh, h); sh.status = saved; sh.in_err_trap = false
+  end
+  if sh.opt_e then error({ __curse_exit = sh.status }) end
 end
 
 exec_list = function(sh, stmts, hook, toplevel)
@@ -3208,22 +3225,7 @@ exec_list = function(sh, stmts, hook, toplevel)
     local st = stmts[k]
     if toplevel then hook("stmt", k) end
     exec_stmt(sh, st, hook)
-    -- ERR trap + errexit: fire on a failing simple/pipeline/(( )) outside a
-    -- condition (restricted to these to avoid &&/|| short-circuit false-positives).
-    -- A `!`-negated pipeline is exempt from errexit (bash), like a condition.
-    if sh.noerr == 0 and sh.status ~= 0 and not st.negate
-        and (st.t == "simple" or st.t == "pipeline" or st.t == "arithcmd"
-        or st.t == "assign" or st.t == "assignlist") then
-      local h = sh.traps and sh.traps.ERR
-      -- ERR fires only in the main shell (calldepth 0, not in a subshell/cmdsub/
-      -- async), unless errtrace extends it to functions and subprograms.
-      local errscope = sh.opt_errtrace or ((sh.calldepth or 0) == 0 and (sh.in_subprogram or 0) == 0)
-      if h and h ~= "" and not sh.in_err_trap and errscope then
-        sh.in_err_trap = true; local saved = sh.status
-        run_trap(sh, h); sh.status = saved; sh.in_err_trap = false
-      end
-      if sh.opt_e then error({ __curse_exit = sh.status }) end
-    end
+    if errexit_stmt(sh, st) then fire_err(sh) end
   end
 end
 M.exec_list = exec_list
@@ -3264,7 +3266,7 @@ function M.finish_run(sh, fn) finish(sh, pcall(fn)) end
 -- the eager AST, so tier OSR-by-stmt still lines up).
 function M.run_lazy(sh, src, hook)
   hook = hook or function() end
-  local nextf = require("parser").open(src)
+  local nextf = P.open(src)
   finish(sh, pcall(function()
     local k = 0
     while true do
@@ -3273,16 +3275,7 @@ function M.run_lazy(sh, src, hook)
       k = k + 1
       hook("stmt", k)
       exec_stmt(sh, st, hook)
-      if sh.noerr == 0 and sh.status ~= 0 and not st.negate
-        and (st.t == "simple" or st.t == "pipeline" or st.t == "arithcmd"
-        or st.t == "assign" or st.t == "assignlist") then
-        local h = sh.traps and sh.traps.ERR
-        if h and h ~= "" and not sh.in_err_trap and (sh.calldepth or 0) == 0 then
-          sh.in_err_trap = true; local saved = sh.status
-          run_trap(sh, h); sh.status = saved; sh.in_err_trap = false
-        end
-        if sh.opt_e then error({ __curse_exit = sh.status }) end
-      end
+      if errexit_stmt(sh, st) then fire_err(sh) end
     end
   end))
 end
