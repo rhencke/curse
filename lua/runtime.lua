@@ -338,8 +338,11 @@ function Shell:deref(name)
     if not b or not b.ref or b.s == nil or b.s == "" then return name end
     local t = b.s
     local br = t:find("[", 1, true)
-    name = br and t:sub(1, br - 1) or t
-    if name == "" then return t end
+    local tname = br and t:sub(1, br - 1) or t
+    -- An invalid target name (e.g. `#`, `1`, `$1`) isn't a real reference: reading
+    -- the nameref yields its own stored string, so resolve to the nameref itself.
+    if not tname:match("^[%a_][%w_]*$") then return name end
+    name = tname
   end
   return name
 end
