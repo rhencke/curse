@@ -609,8 +609,16 @@ local function multi_elems(sh, p) -- returns element list, star?
       local off = arith_int(sh, pe.arg and expand_word(sh, P.parse_word(pe.arg)) or nil)
       local len = pe.arg2 and arith_int(sh, expand_word(sh, P.parse_word(pe.arg2))) or nil
       els = array_slice(els, off or 0, len)
-    elseif (pe.op == ":-" or pe.op == "-") and #els == 0 then
+    elseif pe.op == "-" and #els == 0 then -- unset/empty array: the default
       return { pe.arg and expand_word(sh, P.parse_word(pe.arg)) or "" }, star
+    elseif pe.op == ":-" then -- default unless a non-empty element exists
+      local ne = false; for _, v in ipairs(els) do if v ~= "" then ne = true; break end end
+      if not ne then return { pe.arg and expand_word(sh, P.parse_word(pe.arg)) or "" }, star end
+    elseif pe.op == "+" then -- alternate iff the array has any element (is set)
+      return (#els > 0) and { pe.arg and expand_word(sh, P.parse_word(pe.arg)) or "" } or {}, star
+    elseif pe.op == ":+" then -- alternate iff a non-empty element exists
+      local ne = false; for _, v in ipairs(els) do if v ~= "" then ne = true; break end end
+      return ne and { pe.arg and expand_word(sh, P.parse_word(pe.arg)) or "" } or {}, star
     elseif pe.op and pe.op ~= ":-" and pe.op ~= "-" and pe.op ~= ":+" and pe.op ~= "+" then
       local arg = pe.arg and expand_word(sh, P.parse_word(pe.arg)) or ""
       local arg2 = pe.arg2 and expand_word(sh, P.parse_word(pe.arg2)) or nil
