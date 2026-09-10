@@ -805,6 +805,7 @@ local function make_parser(src)
   -- yields a one-statement list holding a subshell node, so it runs isolated.
   local function func_body()
     ws()
+    while src:sub(i, i) == "\n" do line = line + 1; i = i + 1; ws() end -- bash allows newlines before the body
     if src:sub(i, i) == "(" then
       local ln = line; i = i + 1
       local body = parse_stmts({ [")"] = true })
