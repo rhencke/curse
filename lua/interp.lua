@@ -485,6 +485,7 @@ local function expand_part_str(sh, p)
     -- literally; everything else (defaults :-/-, etc.) is an ordinary value.
     local patmode = pe.op == "/" or pe.op == "//" or pe.op == "#" or pe.op == "##"
       or pe.op == "%" or pe.op == "%%"
+      or pe.op == "^" or pe.op == "^^" or pe.op == "," or pe.op == ",," -- case-fold pattern
     -- The word for -/:-/+/:+/=/:=/?/:? is only expanded WHEN USED (bash: a default
     -- with side effects like $((i++)) runs only if the branch is taken). Pass a thunk.
     local TESTOP = { ["-"] = 1, [":-"] = 1, ["+"] = 1, [":+"] = 1, ["="] = 1, [":="] = 1, ["?"] = 1, [":?"] = 1 }

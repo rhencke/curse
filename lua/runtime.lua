@@ -973,6 +973,18 @@ end
 
 -- The per-value string-transform operators (pattern strip, substitute, substring,
 -- case, and the ${x@OP} transforms). Factored out so ${a[@]OP} can apply per element.
+-- Case-fold `val` per the ${x^PAT}/${x,,PAT} rules: `upper` picks the direction,
+-- `all` folds every matching char (else only the first). An empty PAT means "any".
+local function fold_case(val, pat, upper, all)
+  if pat == nil or pat == "" then pat = "?" end
+  local out, n = {}, all and #val or math.min(1, #val)
+  for k = 1, #val do
+    local c = val:sub(k, k)
+    if k <= n and M.glob_match(c, pat) then c = upper and c:upper() or c:lower() end
+    out[k] = c
+  end
+  return table.concat(out)
+end
 function Shell:apply_str_op(op, val, arg, arg2)
   arg = arg or ""
   if op == "@" then -- ${x@Q}/@U/@u/@L/@E/@K/@k (bash 5.x transforms)
@@ -990,10 +1002,10 @@ function Shell:apply_str_op(op, val, arg, arg2)
   if op == "/" then return M.subst_glob(val, arg, arg2 or "", false) end
   if op == "//" then return M.subst_glob(val, arg, arg2 or "", true) end
   if op == "sub" then return substr(val, arg, arg2) end
-  if op == "^^" then return val:upper() end
-  if op == "^" then return val:sub(1, 1):upper() .. val:sub(2) end
-  if op == ",," then return val:lower() end
-  if op == "," then return val:sub(1, 1):lower() .. val:sub(2) end
+  -- ${x^^PAT}/${x,,PAT}: fold every char matching glob PAT (default ? = any);
+  -- ${x^PAT}/${x,PAT}: fold only the first char, and only if it matches PAT.
+  if op == "^^" or op == ",," then return fold_case(val, arg, op == "^^", true) end
+  if op == "^" or op == "," then return fold_case(val, arg, op == "^", false) end
   return val
 end
 

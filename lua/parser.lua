@@ -232,10 +232,10 @@ local function parse_paramexp(inner)
     local p, r = split_subst(rest:sub(3)); return P { op = "//", arg = p, arg2 = r }
   elseif one == "/" then
     local p, r = split_subst(rest:sub(2)); return P { op = "/", arg = p, arg2 = r }
-  elseif two == "^^" then return P { op = "^^" }
-  elseif one == "^" then return P { op = "^" }
-  elseif two == ",," then return P { op = ",," }
-  elseif one == "," then return P { op = "," }
+  elseif two == "^^" then return P { op = "^^", arg = rest:sub(3) } -- optional fold pattern
+  elseif one == "^" then return P { op = "^", arg = rest:sub(2) }
+  elseif two == ",," then return P { op = ",,", arg = rest:sub(3) }
+  elseif one == "," then return P { op = ",", arg = rest:sub(2) }
   elseif one == "@" then return P { op = "@", arg = rest:sub(2) } -- ${x@Q/U/u/L/E}
   elseif one == ":" then
     local body = rest:sub(2)
