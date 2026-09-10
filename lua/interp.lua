@@ -1025,8 +1025,9 @@ local function exec_simple(sh, args, hook)
     local buf = {}
     for k = j, #args do buf[#buf + 1] = args[k] end
     local s = table.concat(buf, " ")
-    if esc then s = rt.ansi_unescape(s) end
-    sh.out(s); if not nonl then sh.out("\n") end
+    local stopped
+    if esc then s, stopped = rt.ansi_unescape(s) end -- \c stops all output (incl. the newline)
+    sh.out(s); if not nonl and not stopped then sh.out("\n") end
     sh.status = 0
   elseif cmd == ":" or cmd == "true" then sh.status = 0
   elseif cmd == "false" then sh.status = 1

@@ -958,7 +958,7 @@ function M.ansi_unescape(s, ansi_c)
         local x = s:sub(i + 2, i + 2)
         if x == "" then out[#out + 1] = "\\c"; i = i + 2
         else out[#out + 1] = string.char(x:byte() % 32); i = i + 3 end
-      elseif ansi_c and (d == "u" or d == "U") then -- \uXXXX / \UXXXXXXXX code point
+      elseif d == "u" or d == "U" then -- \uXXXX / \UXXXXXXXX code point (echo -e and $'…')
         local hex = s:match(d == "u" and "^%x%x?%x?%x?" or "^%x%x?%x?%x?%x?%x?%x?%x?", i + 2)
         if hex then
           local cp = tonumber(hex, 16); local u = {}
@@ -987,7 +987,7 @@ function M.ansi_unescape(s, ansi_c)
       elseif d:match("[0-7]") then -- octal \NNN (1-3 digits)
         local oct = s:match("^[0-7][0-7]?[0-7]?", i + 1)
         out[#out + 1] = string.char(tonumber(oct, 8) % 256); i = i + 1 + #oct
-      elseif d == "c" then return table.concat(out) -- \c: stop output
+      elseif d == "c" then return table.concat(out), true -- \c: stop all further output
       else out[#out + 1] = "\\" .. d; i = i + 2 end
     else out[#out + 1] = c; i = i + 1 end
   end
