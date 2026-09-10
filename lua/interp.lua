@@ -2383,6 +2383,12 @@ local function exec_stmt(sh, st, hook)
       local hadcs = false
       for _, w in ipairs(st.words) do for _, p in ipairs(w.parts) do if p.cmdsub then hadcs = true; break end end end
       sh.status = hadcs and (sh.last_cmdsub_status or 0) or 0
+      -- a redirection with no command still opens/truncates its target (`> file`)
+      if st.redirs then
+        local save, ok = apply_redirs(sh, st.redirs)
+        if not ok then sh.status = 1 end
+        restore_redirs(save)
+      end
       return
     end
     if st.arrayargs then -- `declare -A a=(...)` / `local -a b=(...)` array literals
