@@ -946,13 +946,30 @@ function Shell:apply_str_op(op, val, arg, arg2)
 end
 
 -- Interpret backslash escapes for `echo -e` and ANSI-C `$'…'` quoting.
-function M.ansi_unescape(s)
+-- `ansi_c` (true for $'…') enables \cX control chars and \u/\U code points; the
+-- default (echo -e) treats \c as "stop output".
+function M.ansi_unescape(s, ansi_c)
   local out, i, n = {}, 1, #s
   while i <= n do
     local c = s:sub(i, i)
     if c == "\\" and i < n then
       local d = s:sub(i + 1, i + 1)
-      if d == "n" then out[#out + 1] = "\n"; i = i + 2
+      if ansi_c and d == "c" then -- \cX -> Ctrl-X (code point & 0x1f)
+        local x = s:sub(i + 2, i + 2)
+        if x == "" then out[#out + 1] = "\\c"; i = i + 2
+        else out[#out + 1] = string.char(x:byte() % 32); i = i + 3 end
+      elseif ansi_c and (d == "u" or d == "U") then -- \uXXXX / \UXXXXXXXX code point
+        local hex = s:match(d == "u" and "^%x%x?%x?%x?" or "^%x%x?%x?%x?%x?%x?%x?%x?", i + 2)
+        if hex then
+          local cp = tonumber(hex, 16); local u = {}
+          if cp < 0x80 then u = { cp }
+          elseif cp < 0x800 then u = { 0xC0 + math.floor(cp / 64), 0x80 + cp % 64 }
+          elseif cp < 0x10000 then u = { 0xE0 + math.floor(cp / 4096), 0x80 + math.floor(cp / 64) % 64, 0x80 + cp % 64 }
+          else u = { 0xF0 + math.floor(cp / 262144), 0x80 + math.floor(cp / 4096) % 64, 0x80 + math.floor(cp / 64) % 64, 0x80 + cp % 64 } end
+          for _, b in ipairs(u) do out[#out + 1] = string.char(b) end
+          i = i + 2 + #hex
+        else out[#out + 1] = "\\" .. d; i = i + 2 end
+      elseif d == "n" then out[#out + 1] = "\n"; i = i + 2
       elseif d == "t" then out[#out + 1] = "\t"; i = i + 2
       elseif d == "r" then out[#out + 1] = "\r"; i = i + 2
       elseif d == "\\" then out[#out + 1] = "\\"; i = i + 2

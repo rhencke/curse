@@ -258,6 +258,9 @@ local function parse_dollar(w, i, add, q)
       j = j + 1
     end
     add({ cmdsub = w:sub(i + 2, j - 1), q = q }); return j + 1
+  elseif nx == '"' then
+    -- $"…" locale translation: with no catalog it's just the double-quoted string.
+    return i + 1 -- skip the `$`; the caller parses the following "…" normally
   elseif nx == "'" then
     -- $'…' ANSI-C quoting: a literal string with backslash escapes, no expansion.
     local j, buf = i + 2, {}
@@ -267,7 +270,7 @@ local function parse_dollar(w, i, add, q)
       elseif c2 == "'" then break
       else buf[#buf + 1] = c2; j = j + 1 end
     end
-    add({ lit = require("runtime").ansi_unescape(table.concat(buf)), q = true }); return j + 1
+    add({ lit = require("runtime").ansi_unescape(table.concat(buf), true), q = true }); return j + 1
   elseif nx == "{" then
     -- find the MATCHING } (nested ${…} inside a default/operator value)
     local depth, j = 1, i + 2
