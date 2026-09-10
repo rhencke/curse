@@ -1251,14 +1251,16 @@ local function exec_stmt(sh, st, hook)
       end
       if prev_read >= 0 then C.close(prev_read) end
       local stbuf = ffi.new("int[1]")
-      local last, pipe = 0, 0
+      local last, pipe, pstat = 0, 0, {}
       for k = 1, nst do
         C.waitpid(pids[k], stbuf, 0)
         local s = stbuf[0]; local sig = bit.band(s, 0x7f)
         local est = (sig ~= 0 and sig ~= 0x7f) and (128 + sig) or bit.rshift(bit.band(s, 0xff00), 8)
+        pstat[k] = tostring(est)
         if k == nst then last = est end
         if est ~= 0 then pipe = est end -- rightmost non-zero (for pipefail)
       end
+      sh:array_assign("PIPESTATUS", pstat, false) -- ${PIPESTATUS[@]}
       sh.status = sh.opt_pipefail and pipe or last
     end
     if st.negate then sh.status = (sh.status == 0) and 1 or 0 end
