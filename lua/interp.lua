@@ -363,6 +363,90 @@ local function name_type(sh, name)
   return nil
 end
 
+-- Execute an array literal assignment `name=(...)` / `name+=(...)`. bash evaluates
+-- in two phases: expand every RHS against the OLD array state first, then evaluate
+-- indices left-to-right against the array as it is being built.
+local function do_arrayassign(sh, st)
+  local isassoc = sh:is_assoc(st.name)
+  local anykeyed = false
+  for _, e in ipairs(st.elems) do if e.key ~= nil then anykeyed = true; break end end
+  local items = {}
+  for _, e in ipairs(st.elems) do
+    if e.key ~= nil then -- keyed RHS is a single value (no field splitting)
+      items[#items + 1] = { key = e.key, op = e.op, val = expand_word(sh, e.word) }
+    else -- bare element: unquoted expansions split into multiple elements
+      for _, f in ipairs(expand_to_fields(sh, e.word)) do
+        items[#items + 1] = { key = nil, op = "=", val = f }
+      end
+    end
+  end
+  if not st.append then -- plain assignment resets the array (keep assoc-ness)
+    local b = sh.vars[st.name]
+    if not b then sh:array_assign(st.name, {}, false); b = sh.vars[st.name] end
+    b.arr = {}; b.s = nil; b.n = nil
+    if isassoc then b.order = {} end
+  end
+  if isassoc then
+    if anykeyed then -- keyed elements assigned; bare ones are an error in bash (skip)
+      for _, it in ipairs(items) do
+        if it.key ~= nil then
+          sh:array_set(st.name, array_key(sh, st.name, it.key), it.val, it.op == "+=")
+        end
+      end
+    else -- all-bare assoc: alternating key value pairs
+      for k = 1, #items, 2 do
+        sh:array_set(st.name, items[k].val, items[k + 1] and items[k + 1].val or "", false)
+      end
+    end
+  else
+    local auto = 0
+    if st.append then
+      local mx, b = -1, sh.vars[st.name]
+      if b and b.arr then for kk in pairs(b.arr) do if kk > mx then mx = kk end end end
+      auto = mx + 1
+    end
+    for _, it in ipairs(items) do
+      if it.key ~= nil then
+        local idx = array_key(sh, st.name, it.key)
+        sh:array_set(st.name, idx, it.val, it.op == "+=")
+        auto = idx + 1
+      else
+        sh:array_set(st.name, auto, it.val, false)
+        auto = auto + 1
+      end
+    end
+  end
+end
+M.do_arrayassign = do_arrayassign
+
+-- Quote a value the way `declare -p` does: double-quoted with \ " $ ` escaped.
+local function decl_quote(s)
+  s = s:gsub("\\", "\\\\"):gsub('"', '\\"'):gsub("%$", "\\$"):gsub("`", "\\`")
+  return '"' .. s .. '"'
+end
+-- Format one variable as a `declare -p` line, or nil if it is unset.
+local function fmt_decl(sh, name)
+  local b = sh.vars[name]
+  if b == nil then return nil end
+  if b.assoc then
+    local parts = {}
+    for _, k in ipairs(sh:array_indices(name)) do
+      parts[#parts + 1] = "[" .. tostring(k) .. "]=" .. decl_quote(sh:array_get(name, k))
+    end
+    if #parts == 0 then return "declare -A " .. name .. "=()" end
+    return "declare -A " .. name .. "=(" .. table.concat(parts, " ") .. " )"
+  elseif b.arr then
+    local parts = {}
+    for _, k in ipairs(sh:array_indices(name)) do
+      parts[#parts + 1] = "[" .. tostring(k) .. "]=" .. decl_quote(sh:array_get(name, k))
+    end
+    return "declare -a " .. name .. "=(" .. table.concat(parts, " ") .. ")"
+  else
+    local attr = os.getenv(name) ~= nil and "-x" or "--"
+    return "declare " .. attr .. " " .. name .. "=" .. decl_quote(sh:get(name))
+  end
+end
+
 -- Dispatch one already-expanded simple command (no redirs — the caller sets those
 -- up). Builtins first, then user functions, then external.
 local function exec_simple(sh, args, hook)
@@ -391,14 +475,36 @@ local function exec_simple(sh, args, hook)
     end
     sh.status = 0
   elseif cmd == "export" or cmd == "declare" or cmd == "typeset" then
-    -- export/declare [-A] NAME[=val]…: set the var; export also pushes to the
-    -- process env so posix_spawn children inherit it. -A marks associative.
-    local doexport, assoc = (cmd == "export"), false
+    -- export/declare [-Apx] NAME[=val]…: set the var; export/-x also pushes it to
+    -- the process env so posix_spawn children inherit it. -A marks associative,
+    -- -p prints declarations.
+    local doexport, assoc, printmode = (cmd == "export"), false, false
+    local rest = {}
     for j = 2, #args do
       local a = args[j]
-      if a:sub(1, 1) == "-" and #a > 1 then
+      if a == "--" then -- end of flags
+      elseif a:sub(1, 1) == "-" and #a > 1 then
         if a:find("A") then assoc = true end
+        if a:find("p") then printmode = true end
+        if a:find("x") then doexport = true end
+      else rest[#rest + 1] = a end
+    end
+    if printmode then
+      local allok = true
+      if #rest == 0 then -- best-effort: all shell vars, sorted
+        local names = {}; for nm in pairs(sh.vars) do names[#names + 1] = nm end
+        table.sort(names)
+        for _, nm in ipairs(names) do local d = fmt_decl(sh, nm); if d then sh:echo(d) end end
       else
+        for _, nm in ipairs(rest) do
+          local d = fmt_decl(sh, nm)
+          if d then sh:echo(d)
+          else allok = false; io.stderr:write("curse: " .. cmd .. ": " .. nm .. ": not found\n") end
+        end
+      end
+      sh.status = allok and 0 or 1
+    else
+      for _, a in ipairs(rest) do
         local nm, val = a:match("^([%a_][%w_]*)=(.*)$")
         if nm then
           if assoc then sh:declare_assoc(nm) end
@@ -408,8 +514,8 @@ local function exec_simple(sh, args, hook)
           elseif doexport then C.setenv(a, sh:get(a), 1) end
         end
       end
+      sh.status = 0
     end
-    sh.status = 0
   elseif cmd == "set" then
     -- set [-e|+e|-o NAME|+o NAME|…] [--] [ARGS…]: options then positional params
     local j, dd = 2, false
@@ -632,9 +738,7 @@ local function exec_stmt(sh, st, hook)
     end
     sh.status = 0
   elseif t == "arrayassign" then
-    local vals = {}
-    for _, w in ipairs(st.elems) do vals[#vals + 1] = expand_word(sh, w) end
-    sh:array_assign(st.name, vals, st.append)
+    do_arrayassign(sh, st)
     sh.status = 0
   elseif t == "funcdef" then
     sh.functions[st.name] = st.body
@@ -647,6 +751,17 @@ local function exec_stmt(sh, st, hook)
     for _, w in ipairs(st.words) do
       local fs = expand_to_fields(sh, w)
       for k = 1, #fs do args[#args + 1] = fs[k] end
+    end
+    if st.arrayargs then -- `declare -A a=(...)` / `local -a b=(...)` array literals
+      local assoc = false
+      for _, a in ipairs(args) do
+        if a == "--" then break end
+        if a:sub(1, 1) == "-" and a:find("A") then assoc = true end
+      end
+      for _, aa in ipairs(st.arrayargs) do
+        if assoc then sh:declare_assoc(aa.name) end
+        do_arrayassign(sh, aa)
+      end
     end
     local function run_cmd()
       if st.redirs then

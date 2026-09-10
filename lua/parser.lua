@@ -459,6 +459,10 @@ M.BRACE_CAP = BRACE_CAP
 -- (ranges symbolic) and STOPS after BRACE_CAP words — so a pathological
 -- expansion costs O(cap), never blows up, and is neither a fatal error nor
 -- silently dropped to literal: it expands, just bounded.
+-- Declaration builtins: `NAME=(...)` in their argument position is an array
+-- literal (like a prefix assignment), not a scalar word + subshell.
+local DECL_BUILTINS = { declare = 1, typeset = 1, ["local"] = 1, readonly = 1, export = 1 }
+
 local function add_word(words, w)
   local factors = brace_factors(w)
   if not factors then words[#words + 1] = parse_word(w); return end
@@ -743,6 +747,40 @@ local function make_parser(src)
     -- Parse ONE assignment at the cursor (NAME=… / NAME[i]=… / NAME+=… /
     -- NAME=(array)); returns an assign node, or nil (cursor unchanged) if there
     -- isn't one. Used for both statements and leading prefix assignments.
+    -- Parse an array literal `( elem elem … )` with `i` positioned ON the `(`.
+    -- Each element is `value` or `[sub]=value` / `[sub]+=value`; the subscript may
+    -- nest brackets (`[a[0]]=x`). Consumes through the closing `)`.
+    local function parse_array_elems()
+      i = i + 1
+      local elems = {}
+      while i <= n do
+        ws()
+        local c = src:sub(i, i)
+        if c == ")" then i = i + 1; break end
+        if c == "\n" then line = line + 1; i = i + 1
+        elseif c == "" then break
+        else
+          local w = word(true); if w == "" then break end
+          local keyraw, eop, rhs = nil, "=", w
+          if w:sub(1, 1) == "[" then
+            local depth, close = 0, nil
+            for j = 1, #w do
+              local ch = w:sub(j, j)
+              if ch == "[" then depth = depth + 1
+              elseif ch == "]" then depth = depth - 1; if depth == 0 then close = j; break end end
+            end
+            if close then
+              local after = w:sub(close + 1)
+              if after:sub(1, 2) == "+=" then keyraw = w:sub(2, close - 1); eop = "+="; rhs = after:sub(3)
+              elseif after:sub(1, 1) == "=" then keyraw = w:sub(2, close - 1); eop = "="; rhs = after:sub(2) end
+            end
+          end
+          elems[#elems + 1] = { key = keyraw, op = eop, word = parse_word(rhs) }
+        end
+      end
+      return elems
+    end
+
     local function try_assign()
       local name = src:match("^([%a_][%w_]*)", i)
       if not name then return nil end
@@ -758,16 +796,7 @@ local function make_parser(src)
       if not op then return nil end
       i = p
       if src:sub(i, i) == "(" then -- array literal
-        i = i + 1
-        local elems = {}
-        while i <= n do
-          ws()
-          local c = src:sub(i, i)
-          if c == ")" then i = i + 1; break end
-          if c == "\n" then line = line + 1; i = i + 1
-          elseif c == "" then break
-          else local w = word(true); if w == "" then break end; elems[#elems + 1] = parse_word(w) end
-        end
+        local elems = parse_array_elems()
         return { t = "arrayassign", name = name, elems = elems, append = (op == "+=") }
       end
       local raw = word()
@@ -790,6 +819,7 @@ local function make_parser(src)
     -- simple command: WORD WORD ...
     local words = {}
     local redirs = {}
+    local arrayargs = nil -- `NAME=(...)` args to a declaration builtin
     while i <= n do
       local c = src:sub(i, i)
       local r = parse_redir() -- also catches &> before the & break below
@@ -798,9 +828,21 @@ local function make_parser(src)
         or c == "(" or c == ")" then break -- ( ) are metacharacters (subshell bounds)
       elseif c:match("[ \t]") then ws()
       else
-        local w = word(true) -- stop at unquoted ( ) so `cmd)` ends at the subshell close
-        if w == "" then break end
-        add_word(words, w)
+        -- `declare -A a=(...)` etc.: an array literal in argument position.
+        local cmd1 = words[1] and words[1].parts and words[1].parts[1]
+        local an, ap
+        if cmd1 and cmd1.lit and DECL_BUILTINS[cmd1.lit] then
+          an, ap = src:match("^([%a_][%w_]*)(%+?)=%(", i)
+        end
+        if an then
+          i = i + #an + #ap + 1 -- past NAME (+) = ; now on `(`
+          arrayargs = arrayargs or {}
+          arrayargs[#arrayargs + 1] = { name = an, elems = parse_array_elems(), append = (ap == "+") }
+        else
+          local w = word(true) -- stop at unquoted ( ) so `cmd)` ends at the subshell close
+          if w == "" then break end
+          add_word(words, w)
+        end
       end
     end
     -- collect any heredoc bodies (they follow this command's line)
@@ -829,7 +871,7 @@ local function make_parser(src)
     end
     -- a command follows: any leading assignments are its temporary (exported) env
     return { t = "simple", line = ln, words = words, redirs = (#redirs > 0 and redirs or nil),
-      assigns = (#assigns > 0 and assigns or nil) }
+      assigns = (#assigns > 0 and assigns or nil), arrayargs = arrayargs }
   end
 
   -- pipeline: cmd [ | cmd ]*   (optional leading `!` negates the exit status)
