@@ -231,6 +231,7 @@ local function parse_paramexp(inner)
   elseif one == "^" then return P { op = "^" }
   elseif two == ",," then return P { op = ",," }
   elseif one == "," then return P { op = "," }
+  elseif one == "@" then return P { op = "@", arg = rest:sub(2) } -- ${x@Q/U/u/L/E}
   elseif one == ":" then
     local body = rest:sub(2)
     local off, len = body:match("^(.-):(.+)$")
@@ -593,6 +594,13 @@ local function make_parser(src)
         i = i + 1
         while i <= n and src:sub(i, i) ~= "'" do i = i + 1 end
         i = i + 1 -- past closing quote
+      elseif c == "$" and src:sub(i + 1, i + 1) == "'" then
+        -- $'…' ANSI-C quote: scan to the close honoring \' \\
+        i = i + 2
+        while i <= n and src:sub(i, i) ~= "'" do
+          if src:sub(i, i) == "\\" then i = i + 2 else i = i + 1 end
+        end
+        i = i + 1
       elseif c == "$" and src:sub(i + 1, i + 2) == "((" then
         local _, ni = grab_dparen(src, i + 3); i = ni
       elseif c == "$" and src:sub(i + 1, i + 1) == "(" then

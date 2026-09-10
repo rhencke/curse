@@ -639,6 +639,37 @@ local function exec_simple(sh, args, hook)
     sh.status = 0
   elseif cmd == ":" or cmd == "true" then sh.status = 0
   elseif cmd == "false" then sh.status = 1
+  elseif cmd == "eval" then
+    -- eval: join args, parse, run in the CURRENT shell (return/exit propagate).
+    local code = table.concat({ unpack(args, 2) }, " ")
+    if code:match("%S") then
+      local ok, parsed = pcall(require("parser").parse, code)
+      if not ok then io.stderr:write("curse: eval: " .. tostring(parsed) .. "\n"); sh.status = 2
+      else exec_list(sh, parsed.stmts, hook, false) end
+    else sh.status = 0 end
+  elseif cmd == "source" or cmd == "." then
+    -- source FILE [args]: run FILE in the current shell; a `return` ends the file.
+    local file = args[2]
+    local f = file and io.open(file, "r")
+    if not f then io.stderr:write("curse: " .. cmd .. ": " .. tostring(file) .. ": No such file or directory\n"); sh.status = 1
+    else
+      local src = f:read("*a"); f:close()
+      local ok, parsed = pcall(require("parser").parse, src)
+      if not ok then sh.status = 2
+      else
+        local savep, savenp = sh.params, sh.nparams
+        if #args > 2 then
+          sh.params, sh.nparams = {}, 0
+          for k = 3, #args do sh.nparams = sh.nparams + 1; sh.params[sh.nparams] = args[k] end
+        end
+        local rok, err = pcall(exec_list, sh, parsed.stmts, hook, false)
+        if #args > 2 then sh.params, sh.nparams = savep, savenp end
+        if not rok then
+          if type(err) == "table" and err.__curse_return then sh.status = err.__curse_return
+          else error(err) end -- exit propagates
+        end
+      end
+    end
   elseif cmd == "wait" then
     -- wait [-n] [pid…]: reap background jobs. With pids, return the last one's
     -- status; with none, wait for all (status 0); an invalid arg is status 1.

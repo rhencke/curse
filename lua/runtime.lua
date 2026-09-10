@@ -728,10 +728,21 @@ function Shell:expand_param(pe, arg, arg2, idxnum)
   return self:apply_str_op(op, val, arg, arg2)
 end
 
+-- Shell-quote a string so it round-trips through eval (single-quote form).
+local function shell_quote(s) return "'" .. s:gsub("'", "'\\''") .. "'" end
+
 -- The per-value string-transform operators (pattern strip, substitute, substring,
--- case). Factored out so ${a[@]OP} can apply them to each element.
+-- case, and the ${x@OP} transforms). Factored out so ${a[@]OP} can apply per element.
 function Shell:apply_str_op(op, val, arg, arg2)
   arg = arg or ""
+  if op == "@" then -- ${x@Q}/@U/@u/@L/@E (bash 5.1 transforms)
+    if arg == "Q" then return shell_quote(val) end
+    if arg == "U" then return val:upper() end
+    if arg == "u" then return val:sub(1, 1):upper() .. val:sub(2) end
+    if arg == "L" then return val:lower() end
+    if arg == "E" then return M.ansi_unescape(val) end
+    return val
+  end
   if op == "#" then return strip_prefix(val, arg, false) end
   if op == "##" then return strip_prefix(val, arg, true) end
   if op == "%" then return strip_suffix(val, arg, false) end
