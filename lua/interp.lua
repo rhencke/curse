@@ -2009,8 +2009,15 @@ local function exec_simple(sh, args, hook, no_func)
         elseif act == "alias" then for n in pairs(sh.aliases) do add(n) end
         elseif act == "builtin" then for n in pairs(BUILTINS) do add(n) end
         elseif act == "keyword" then for n in pairs(KEYWORDS) do add(n) end
-        elseif act == "variable" or act == "arrayvar" then for n in pairs(sh.vars) do add(n) end
-        elseif act == "export" then for n in pairs(sh.vars) do if os.getenv(n) ~= nil then add(n) end end
+        elseif act == "variable" or act == "arrayvar" then
+          for n in pairs(sh.vars) do add(n) end
+          -- always-set dynamic specials bash reports too (PWD etc.)
+          for _, n in ipairs({ "PWD", "OLDPWD", "PPID", "UID", "EUID", "RANDOM", "SECONDS", "LINENO", "HOSTNAME" }) do
+            if sh.vars[n] == nil and sh:special_get(n) ~= "" then add(n) end
+          end
+        elseif act == "export" then
+          for n in pairs(sh.vars) do if os.getenv(n) ~= nil then add(n) end end
+          for _, n in ipairs({ "PWD", "OLDPWD" }) do if sh.vars[n] == nil and os.getenv(n) ~= nil then add(n) end end
         elseif act == "setopt" then for _, e in ipairs(SETOPTS) do add(e[1]) end
         elseif act == "shopt" then for _, n in ipairs(SHOPT_ORDER) do add(n) end
         elseif act == "helptopic" then
