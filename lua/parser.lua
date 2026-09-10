@@ -890,7 +890,20 @@ local function make_parser(src)
               elseif after:sub(1, 1) == "=" then keyraw = w:sub(2, close - 1); eop = "="; rhs = after:sub(2) end
             end
           end
-          elems[#elems + 1] = { key = keyraw, op = eop, word = parse_word(rhs) }
+          if keyraw == nil then
+            -- bare element: brace-expand into multiple elements ({1..9}, {a,b})
+            local factors = brace_factors(rhs)
+            if factors then
+              stream_factors(factors, function(x)
+                elems[#elems + 1] = { key = nil, op = "=", word = parse_word(x) }
+                return #elems >= BRACE_CAP
+              end)
+            else
+              elems[#elems + 1] = { key = nil, op = "=", word = parse_word(rhs) }
+            end
+          else
+            elems[#elems + 1] = { key = keyraw, op = eop, word = parse_word(rhs) }
+          end
         end
       end
       return elems

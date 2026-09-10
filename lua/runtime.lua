@@ -430,6 +430,7 @@ function Shell:array_set(name, key, val, append)
   local b = box(self:deref(name), self.vars)
   if not b.arr then b.arr = {}; if b.s then b.arr[0] = b.s end; b.s = nil; b.n = nil end
   key = norm_key(b, key)
+  if type(key) == "number" and key < 0 then return end -- out-of-bounds negative: bash rejects
   if b.assoc and b.arr[key] == nil then b.order[#b.order + 1] = key end
   if append then b.arr[key] = (b.arr[key] or "") .. val else b.arr[key] = val end
 end
