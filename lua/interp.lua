@@ -671,6 +671,8 @@ local function exec_simple(sh, args, hook)
     sh.status = 0
   elseif cmd == ":" or cmd == "true" then sh.status = 0
   elseif cmd == "false" then sh.status = 1
+  elseif cmd == "break" then sh.status = 0; error({ __curse_break = tonumber(args[2]) or 1 })
+  elseif cmd == "continue" then sh.status = 0; error({ __curse_continue = tonumber(args[2]) or 1 })
   elseif cmd == "eval" then
     -- eval: join args, parse, run in the CURRENT shell (return/exit propagate).
     local code = table.concat({ unpack(args, 2) }, " ")
@@ -837,9 +839,13 @@ local function exec_simple(sh, args, hook)
     local dir = args[2] or os.getenv("HOME") or ""
     sh.status = (C.chdir(dir) == 0) and 0 or 1
   elseif cmd == "unset" then
+    local fmode = false -- -f: unset functions; -v: unset vars (default)
     for j = 2, #args do
       local a = args[j]
-      if a:sub(1, 1) == "-" and #a > 1 then -- -v/-f flags: ignore
+      if a == "-f" then fmode = true
+      elseif a == "-v" then fmode = false
+      elseif a:sub(1, 1) == "-" and #a > 1 then -- other flags: ignore
+      elseif fmode then sh.functions[a] = nil
       else
         local nm, sub = a:match("^([%a_][%w_]*)%[(.+)%]$")
         if nm then sh:array_unset(nm, array_key(sh, nm, sub))
@@ -1225,6 +1231,23 @@ local function eval_dbracket(sh, node)
   return false
 end
 
+-- Run a loop body, catching break/continue (decrementing multi-level n and
+-- re-raising when it targets an outer loop). Returns "break", "continue", or nil.
+local function run_loop_body(sh, body, hook)
+  local ok, err = pcall(exec_list, sh, body, hook, false)
+  if ok then return nil end
+  if type(err) == "table" then
+    if err.__curse_break then
+      if err.__curse_break > 1 then error({ __curse_break = err.__curse_break - 1 }) end
+      return "break"
+    elseif err.__curse_continue then
+      if err.__curse_continue > 1 then error({ __curse_continue = err.__curse_continue - 1 }) end
+      return "continue"
+    end
+  end
+  error(err) -- exit/return/real error propagates
+end
+
 local function exec_stmt(sh, st, hook)
   local t = st.t
   if st.line then sh.cur_line = st.line end -- $LINENO
@@ -1354,8 +1377,9 @@ local function exec_stmt(sh, st, hook)
     while true do
       hook("loop", st.id)
       if st.cond and not truth(eval(sh, st.cond)) then break end
-      exec_list(sh, st.body, hook, false); bodystatus = sh.status
-      if st.step then eval(sh, st.step) end
+      local act = run_loop_body(sh, st.body, hook); bodystatus = sh.status
+      if act == "break" then break end
+      if st.step then eval(sh, st.step) end -- continue still runs the step
     end
     sh.status = bodystatus
   elseif t == "whilec" then
@@ -1366,7 +1390,8 @@ local function exec_stmt(sh, st, hook)
       local go = (sh.status == 0)
       if st.negate then go = not go end -- until
       if not go then break end
-      exec_list(sh, st.body, hook, false); bodystatus = sh.status
+      local act = run_loop_body(sh, st.body, hook); bodystatus = sh.status
+      if act == "break" then break end
     end
     sh.status = bodystatus
   elseif t == "parse_error" then
@@ -1511,7 +1536,8 @@ local function exec_stmt(sh, st, hook)
       fs.idx = fs.idx + 1
       if fs.idx > #fs.list then break end
       sh:set_str(st.name, fs.list[fs.idx])
-      exec_list(sh, st.body, hook, false); bodystatus = sh.status
+      local act = run_loop_body(sh, st.body, hook); bodystatus = sh.status
+      if act == "break" then break end
     end
     sh.status = bodystatus
   elseif t == "if" then
