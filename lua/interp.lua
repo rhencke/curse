@@ -741,6 +741,18 @@ local function multi_elems(sh, p) -- returns element list, star?
   if p.pexp then
     local pe, P = p.pexp, require("parser")
     local star = (pe.index == "*" or pe.name == "*") -- $* / ${*:…} join when quoted
+    -- Expand a default/alternate word (`:-`/`-`/`:+`/`+` arg). If it is itself a
+    -- single array/$@ expansion (${d[@]}), preserve its elements as separate
+    -- fields instead of flattening to one joined string.
+    local function defval(arg)
+      if arg == nil then return { "" } end
+      local w = P.parse_word(arg)
+      if #w.parts == 1 then
+        local part = w.parts[1]; part.q = p.q
+        if is_multi(sh, part) then return (multi_elems(sh, part)) end
+      end
+      return { expand_word(sh, w) }
+    end
     if pe.op == "indirect" then -- ${!ref} where ref names an array / $@ / subscript
       local ip = indirect_part(sh, pe)
       if ip then ip.q = p.q; return multi_elems(sh, ip) end
@@ -776,7 +788,7 @@ local function multi_elems(sh, p) -- returns element list, star?
         els = array_slice(els, off, len)
       end
     elseif pe.op == "-" and #els == 0 then -- unset/empty array: the default
-      return { pe.arg and expand_word(sh, P.parse_word(pe.arg)) or "" }, star
+      return defval(pe.arg), star
     -- `:` variants test the JOINED value: ("" "") joins to " " (non-null), but
     -- ('') joins to "" (null) — so a[@]:-w gives the default only for the latter.
     elseif pe.op == ":-" then
@@ -784,13 +796,13 @@ local function multi_elems(sh, p) -- returns element list, star?
       -- `@` tests whether any element is non-empty.
       local ne = star and (table.concat(els, sh.vars["IFS"] and sh:get("IFS"):sub(1, 1) or " ") ~= "")
         or (not star and (#els > 1 or (els[1] ~= nil and els[1] ~= "")))
-      if not ne then return { pe.arg and expand_word(sh, P.parse_word(pe.arg)) or "" }, star end
+      if not ne then return defval(pe.arg), star end
     elseif pe.op == "+" then -- alternate iff the array has any element (is set)
-      return (#els > 0) and { pe.arg and expand_word(sh, P.parse_word(pe.arg)) or "" } or {}, star
+      return (#els > 0) and defval(pe.arg) or {}, star
     elseif pe.op == ":+" then
       local ne = star and (table.concat(els, sh.vars["IFS"] and sh:get("IFS"):sub(1, 1) or " ") ~= "")
         or (not star and (#els > 1 or (els[1] ~= nil and els[1] ~= "")))
-      return ne and { pe.arg and expand_word(sh, P.parse_word(pe.arg)) or "" } or {}, star
+      return ne and defval(pe.arg) or {}, star
     elseif pe.op == "@" and pe.arg == "a" then -- ${a[@]@a}: the variable's attribute string, per element
       local attr = sh:attr_string(pe.name); local out = {}
       for i = 1, #els do out[i] = attr end
@@ -2909,8 +2921,8 @@ local function exec_stmt(sh, st, hook)
   elseif t == "pipeline" then
     -- fork a child per stage wired by pipes; the last stage's exit status is the
     -- pipeline's. Each child is guarded so a failure can never return into the
-    -- interpreter and fork-bomb. (stdout of the last stage goes to the current
-    -- fd 1; capture into $() through a pipeline is a known limitation for now.)
+    -- interpreter and fork-bomb. The last stage's stdout goes to the shell's fd 1,
+    -- except inside $(...) (sh.capturing) where it is drained into the capture buffer.
     local cmds, nst = st.cmds, #st.cmds
     if nst == 1 then
       exec_stmt(sh, cmds[1], hook) -- just a `! cmd` negation, no real pipe
