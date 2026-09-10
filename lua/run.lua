@@ -20,10 +20,20 @@ else
 end
 local T = require("tier")
 
-local script = arg[1] or error("usage: run.lua <script.sh> [tiered|compiled|interp]")
-local mode = arg[2] or "tiered"
-
 local sh
+
+-- `-c CODE [name [args…]]` — run a command string like `sh -c` (so a script can
+-- invoke curse as $SH). Lazy interp; $0 = name, $1.. = args.
+if arg[1] == "-c" then
+  sh = T.rt.Shell.new()
+  sh.argv0 = arg[3] or "curse"
+  for k = 4, #arg do sh.nparams = sh.nparams + 1; sh.params[sh.nparams] = arg[k] end
+  T.interp.run_lazy(sh, arg[2] or "")
+  io.flush(); os.exit(sh.status or 0)
+end
+
+local script = arg[1] or error("usage: run.lua <script.sh> [tiered|compiled|interp] | -c CODE")
+local mode = arg[2] or "tiered"
 if mode == "cached" then
   -- persistent artifact cache: warm hit skips parse+emit; cold compiles+stores;
   -- any cache failure falls back to running uncached. This is the CLI/build/boot

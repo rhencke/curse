@@ -63,9 +63,9 @@ local stp = TMP .. "/st"
 -- The Oils harness puts spec/bin (argv.py etc.) on PATH; mirror that so
 -- argv.py-based cases are meaningful for both bash and curse.
 local BINPATH = SPEC .. "/bin:" .. ROOT .. "/.bench-lua/shim" -- argv.py + python2 shim
-local function run(cmdstr, cwd)
+local function run(cmdstr, cwd, shval)
   os.execute("cd " .. cwd .. " && { export LC_ALL=C TMP=" .. cwd .. " TMPDIR=" .. cwd ..
-    " PATH=" .. BINPATH .. ":$PATH; timeout " .. TIMEOUT ..
+    " SH='" .. shval .. "' CURSE_BUNDLE=" .. BUNDLE .. " PATH=" .. BINPATH .. ":$PATH; timeout " .. TIMEOUT ..
     " " .. cmdstr .. " ; } >" .. outp .. " 2>/dev/null; echo $? >" .. stp)
   return readfile(outp) or "", tonumber((readfile(stp) or "0"):match("%d+") or "0")
 end
@@ -103,9 +103,9 @@ for _, path in ipairs(files) do
   local pass = 0
   for _, c in ipairs(cases) do
     write_code(c.code)
-    local bout, bst = run("bash " .. codep, cwd)
+    local bout, bst = run("bash " .. codep, cwd, "bash")
     os.execute("rm -rf " .. cwd .. "/*  2>/dev/null")
-    local cout, cst = run(curse_cmd(), cwd)
+    local cout, cst = run(curse_cmd(), cwd, LUAJIT .. " " .. RUNLUA)
     os.execute("rm -rf " .. cwd .. "/* 2>/dev/null")
     if bout == cout and bst == cst then
       pass = pass + 1
