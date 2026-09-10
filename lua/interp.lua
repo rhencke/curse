@@ -673,6 +673,7 @@ local BUILTINS = {
   exec = 1, readonly = 1, umask = 1, alias = 1, unalias = 1, shopt = 1, wait = 1, trap = 1,
   mapfile = 1, readarray = 1, compgen = 1, complete = 1, compopt = 1,
 }
+M.BUILTINS = BUILTINS -- exposed so the compiled backend delegates the same set
 local KEYWORDS = {
   ["if"] = 1, ["then"] = 1, ["else"] = 1, ["elif"] = 1, ["fi"] = 1, ["for"] = 1,
   ["while"] = 1, ["until"] = 1, ["do"] = 1, ["done"] = 1, ["case"] = 1, ["esac"] = 1,

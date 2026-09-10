@@ -473,12 +473,10 @@ local function build_cfg(stmts, lifted, funcflags, inlinefns)
           elseif not word_safe(w) then mustdeleg = true; break end
         end
       end
-      -- interp-only builtins (no native compiled form) delegate
+      -- interp-only builtins (no native compiled form) delegate. Use interp's own
+      -- builtin set so the two backends stay in lockstep as builtins are added.
       if not mustdeleg and cmd and not NATIVE_BUILTIN[cmd] and not isfunc then
-        local B = { test = 1, ["["] = 1, exit = 1, cd = 1, unset = 1, set = 1, shift = 1,
-          read = 1, export = 1, declare = 1, typeset = 1, printf = 1, getopts = 1,
-          type = 1, command = 1, pwd = 1 }
-        if B[cmd] then mustdeleg = true end
+        if require("interp").BUILTINS[cmd] then mustdeleg = true end
       end
       if mustdeleg then return delegate(st, after) end
       if cmd == "return" then -- exit the current CFG (function or top level)
