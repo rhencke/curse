@@ -346,6 +346,7 @@ function Shell:special_get(name)
   if name == "UID" then return tostring(tonumber(ffi.C.getuid())) end
   if name == "EUID" then return tostring(tonumber(ffi.C.geteuid())) end
   if name == "BASHPID" then return tostring(tonumber(ffi.C.getpid())) end -- fresh: changes in subshells
+  if name == "FUNCNAME" then return (self.funcstack and self.funcstack[1]) or "" end
   if name == "OSTYPE" then return "linux-gnu" end
   if name == "MACHTYPE" then return "x86_64-pc-linux-gnu" end
   if name == "HOSTTYPE" then return "x86_64" end

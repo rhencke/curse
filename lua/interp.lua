@@ -608,6 +608,11 @@ indirect_part = function(sh, pe)
     tname = (b and b.ref and b.s) or sh:get(pe.name)
   end
   if tname == nil or tname == "" then return nil end
+  -- ${!ref} to a special parameter: $?, $$, $!, $#, $-, $N, $@, $*
+  if not pe.iop then
+    if tname:match("^%d+$") then return { param = tonumber(tname) } end
+    if #tname == 1 and tname:match("[%?%$!#%-@%*]") then return { special = tname } end
+  end
   local ok, part = pcall(require("parser").parse_paramexp, tname .. (pe.iop or ""))
   return ok and part or nil
 end
@@ -2161,11 +2166,14 @@ local function exec_simple(sh, args, hook)
     local fn = sh.functions[cmd]
     sh.calldepth = sh.calldepth + 1 -- OSR gate: no handoff inside a call
     sh:pushCall(unpack(args, 2))
+    sh.funcstack = sh.funcstack or {}
+    table.insert(sh.funcstack, 1, cmd) -- $FUNCNAME[0] = the function now running
     local saved_ld = sh.loopdepth; sh.loopdepth = 0 -- break/continue don't cross into a function
     local ok, err
     if type(fn) == "function" then ok, err = pcall(fn, sh) -- a COMPILED function closure
     else ok, err = pcall(exec_list, sh, fn, hook, false) end -- an interp AST body
     sh.loopdepth = saved_ld
+    table.remove(sh.funcstack, 1)
     sh:popCall()
     sh.calldepth = sh.calldepth - 1
     if not ok then
