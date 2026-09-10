@@ -459,7 +459,8 @@ local function build_cfg(stmts, lifted, funcflags, inlinefns)
       -- interp-only builtins (no native compiled form) delegate
       if not mustdeleg and cmd and not NATIVE_BUILTIN[cmd] and not isfunc then
         local B = { test = 1, ["["] = 1, exit = 1, cd = 1, unset = 1, set = 1, shift = 1,
-          read = 1, export = 1, declare = 1, typeset = 1, printf = 1, getopts = 1 }
+          read = 1, export = 1, declare = 1, typeset = 1, printf = 1, getopts = 1,
+          type = 1, command = 1, pwd = 1 }
         if B[cmd] then mustdeleg = true end
       end
       if mustdeleg then return delegate(st, after) end

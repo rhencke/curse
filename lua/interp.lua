@@ -329,6 +329,36 @@ local function restore_redirs(save)
   for fd = 0, 2 do local s = save[fd + 1]; if s >= 0 then C.dup2(s, fd); C.close(s) end end
 end
 
+-- name classification for `type` / `command -v`
+local BUILTINS = {
+  echo = 1, [":"] = 1, ["true"] = 1, ["false"] = 1, ["["] = 1, test = 1, ["return"] = 1,
+  exit = 1, cd = 1, unset = 1, export = 1, declare = 1, typeset = 1, set = 1, shift = 1,
+  read = 1, getopts = 1, printf = 1, ["local"] = 1, command = 1, type = 1, pwd = 1,
+  eval = 1, source = 1, ["."] = 1, ["break"] = 1, ["continue"] = 1, ["true"] = 1,
+}
+local KEYWORDS = {
+  ["if"] = 1, ["then"] = 1, ["else"] = 1, ["elif"] = 1, ["fi"] = 1, ["for"] = 1,
+  ["while"] = 1, ["until"] = 1, ["do"] = 1, ["done"] = 1, ["case"] = 1, ["esac"] = 1,
+  ["function"] = 1, ["in"] = 1, ["select"] = 1, ["{"] = 1, ["}"] = 1, ["!"] = 1,
+}
+local function find_in_path(name)
+  if name:find("/", 1, true) then return C.access(name, 1) == 0 and name or nil end
+  local path = os.getenv("PATH") or "/usr/bin:/bin"
+  for dir in path:gmatch("[^:]+") do
+    local p = dir .. "/" .. name
+    if C.access(p, 1) == 0 then return p end -- X_OK
+  end
+  return nil
+end
+local function name_type(sh, name)
+  if KEYWORDS[name] then return "keyword" end
+  if sh.functions[name] then return "function" end
+  if BUILTINS[name] then return "builtin" end
+  local p = find_in_path(name)
+  if p then return "file", p end
+  return nil
+end
+
 -- Dispatch one already-expanded simple command (no redirs — the caller sets those
 -- up). Builtins first, then user functions, then external.
 local function exec_simple(sh, args, hook)
@@ -377,6 +407,40 @@ local function exec_simple(sh, args, hook)
       sh.params = np; sh.nparams = n
     end
     sh.status = 0
+  elseif cmd == "type" then
+    -- type [-t] NAME…  ( -t prints the type word; plain prints a sentence )
+    local tflag = args[2] == "-t"
+    local j0 = tflag and 3 or 2
+    local allok = true
+    for j = j0, #args do
+      local k, p = name_type(sh, args[j])
+      if not k then allok = false
+        if not tflag then io.stderr:write("curse: type: " .. args[j] .. ": not found\n") end
+      elseif tflag then sh:echo(k)
+      elseif k == "file" then sh:echo(args[j] .. " is " .. p)
+      elseif k == "function" then sh:echo(args[j] .. " is a function")
+      elseif k == "keyword" then sh:echo(args[j] .. " is a shell keyword")
+      else sh:echo(args[j] .. " is a shell builtin") end
+    end
+    sh.status = allok and 0 or 1
+  elseif cmd == "command" and (args[2] == "-v" or args[2] == "-V") then
+    local verbose = args[2] == "-V"
+    local allok = true
+    for j = 3, #args do
+      local k, p = name_type(sh, args[j])
+      if not k then allok = false
+      elseif verbose then
+        if k == "file" then sh:echo(args[j] .. " is " .. p)
+        elseif k == "function" then sh:echo(args[j] .. " is a function")
+        elseif k == "keyword" then sh:echo(args[j] .. " is a shell keyword")
+        else sh:echo(args[j] .. " is a shell builtin") end
+      else sh:echo(k == "file" and p or args[j]) end
+    end
+    sh.status = allok and 0 or 1
+  elseif cmd == "command" then
+    exec_simple(sh, { unpack(args, 2) }, hook) -- run rest, bypassing functions (approx)
+  elseif cmd == "pwd" then
+    sh:echo(sh:special_get("PWD")); sh.status = 0
   elseif cmd == "getopts" then
     -- getopts OPTSTRING NAME [args…]: parse one option per call using OPTIND (+ an
     -- internal char cursor for bundled opts); sets NAME, OPTARG; status 1 when done.
@@ -616,6 +680,7 @@ local function exec_stmt(sh, st, hook)
     end
   elseif t == "subshell" then
     -- ( list ) runs in a forked child: env/var changes don't escape, like bash
+    io.flush() -- flush parent stdio so the fork doesn't duplicate buffered output
     local pid = C.fork()
     if pid == 0 then
       local ok, err = pcall(function()
@@ -663,6 +728,7 @@ local function exec_stmt(sh, st, hook)
     if nst == 1 then
       exec_stmt(sh, cmds[1], hook) -- just a `! cmd` negation, no real pipe
     else
+      io.flush() -- flush parent stdio so forked stages don't duplicate buffered output
       local pids, prev_read = {}, -1
       for k = 1, nst do
         local rd, wr = -1, -1
