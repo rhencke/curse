@@ -1088,20 +1088,33 @@ local function exec_simple(sh, args, hook)
   elseif cmd == "read" then
     -- read [-r] [-a arr] [-p prompt] VAR...  (line from stdin, split on IFS)
     local raw, arr, j, nchars, ndelim = false, nil, 2, nil, false
+    local delim
     while j <= #args do
       local a = args[j]
       if a == "-r" then raw = true; j = j + 1
       elseif a == "-a" then arr = args[j + 1]; j = j + 2
       elseif a == "-n" then nchars = tonumber(args[j + 1]); j = j + 2 -- N chars or newline
       elseif a == "-N" then nchars = tonumber(args[j + 1]); ndelim = true; j = j + 2 -- exactly N
-      elseif a == "-p" or a == "-d" or a == "-t" or a == "-u" then j = j + 2 -- take an arg, skip
+      elseif a == "-d" then delim = args[j + 1]; j = j + 2 -- read until this delimiter
+      elseif a == "-p" or a == "-t" or a == "-u" then j = j + 2 -- take an arg, skip
       elseif a:sub(1, 1) == "-" and #a > 1 then j = j + 1 -- ignore -s/…
       else break end
     end
     local vars = {}
     for k = j, #args do vars[#vars + 1] = args[k] end
     local line, had_nl = nil, true
-    if nchars then
+    if delim and not nchars then -- -d: read chars until the delimiter (or EOF)
+      local dch = delim:sub(1, 1)
+      local buf, got = {}, false
+      while true do
+        local c = io.read(1)
+        if c == nil then had_nl = false; break end
+        got = true
+        if dch ~= "" and c == dch then had_nl = true; break end
+        buf[#buf + 1] = c
+      end
+      line = got and table.concat(buf) or nil
+    elseif nchars then
       line = io.read(nchars)
       if line and not ndelim then local nl = line:find("\n", 1, true); if nl then line = line:sub(1, nl - 1) end end
     else
