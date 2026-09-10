@@ -2352,35 +2352,53 @@ local function exec_stmt(sh, st, hook)
       exec_stmt(sh, cmds[1], hook) -- just a `! cmd` negation, no real pipe
     else
       io.flush() -- flush parent stdio so forked stages don't duplicate buffered output
-      local pids, prev_read = {}, -1
+      -- shopt -s lastpipe (non-interactive): the LAST stage runs in the CURRENT
+      -- shell (no fork), so its side effects — e.g. `read var` — persist.
+      local lastpipe = sh.shopt.lastpipe and not sh.opt_i and nst >= 2
+      local pids, prev_read, inline_status = {}, -1, nil
       for k = 1, nst do
         local rd, wr = -1, -1
         if k < nst then local p = ffi.new("int[2]"); C.pipe(p); rd, wr = p[0], p[1] end
-        local pid = C.fork()
-        if pid == 0 then
-          local ok, err = pcall(function()
-            if prev_read >= 0 then C.dup2(prev_read, 0); C.close(prev_read) end
-            if wr >= 0 then C.dup2(wr, 1); C.close(wr) end
-            if rd >= 0 then C.close(rd) end
-            sh.out = io.write -- this stage writes to its fd 1 (the pipe / terminal)
-            exec_stmt(sh, cmds[k], hook)
-          end)
-          if not ok and type(err) == "table" then sh.status = err.__curse_exit or err.__curse_return or sh.status end
-          io.flush() -- before _exit (exit/error in the stage would skip an inline flush)
-          C._exit(sh.status or 0)
+        if k == nst and lastpipe then
+          local save0 = C.dup(0)
+          if prev_read >= 0 then C.dup2(prev_read, 0); C.close(prev_read); prev_read = -1 end
+          local savedout = sh.out; sh.out = io.write
+          local ok, err = pcall(exec_stmt, sh, cmds[k], hook)
+          io.flush(); sh.out = savedout; C.dup2(save0, 0); C.close(save0)
+          if not ok and type(err) == "table" then sh.status = err.__curse_exit or err.__curse_return or sh.status
+          elseif not ok then error(err) end
+          inline_status = sh.status or 0; pids[k] = -1
+        else
+          local pid = C.fork()
+          if pid == 0 then
+            local ok, err = pcall(function()
+              if prev_read >= 0 then C.dup2(prev_read, 0); C.close(prev_read) end
+              if wr >= 0 then C.dup2(wr, 1); C.close(wr) end
+              if rd >= 0 then C.close(rd) end
+              sh.out = io.write -- this stage writes to its fd 1 (the pipe / terminal)
+              exec_stmt(sh, cmds[k], hook)
+            end)
+            if not ok and type(err) == "table" then sh.status = err.__curse_exit or err.__curse_return or sh.status end
+            io.flush() -- before _exit (exit/error in the stage would skip an inline flush)
+            C._exit(sh.status or 0)
+          end
+          pids[k] = pid
+          if prev_read >= 0 then C.close(prev_read) end
+          if wr >= 0 then C.close(wr) end
+          prev_read = rd
         end
-        pids[k] = pid
-        if prev_read >= 0 then C.close(prev_read) end
-        if wr >= 0 then C.close(wr) end
-        prev_read = rd
       end
       if prev_read >= 0 then C.close(prev_read) end
       local stbuf = ffi.new("int[1]")
       local last, pipe, pstat = 0, 0, {}
       for k = 1, nst do
-        C.waitpid(pids[k], stbuf, 0)
-        local s = stbuf[0]; local sig = bit.band(s, 0x7f)
-        local est = (sig ~= 0 and sig ~= 0x7f) and (128 + sig) or bit.rshift(bit.band(s, 0xff00), 8)
+        local est
+        if pids[k] == -1 then est = inline_status or 0 -- ran inline (lastpipe)
+        else
+          C.waitpid(pids[k], stbuf, 0)
+          local s = stbuf[0]; local sig = bit.band(s, 0x7f)
+          est = (sig ~= 0 and sig ~= 0x7f) and (128 + sig) or bit.rshift(bit.band(s, 0xff00), 8)
+        end
         pstat[k] = tostring(est)
         if k == nst then last = est end
         if est ~= 0 then pipe = est end -- rightmost non-zero (for pipefail)
