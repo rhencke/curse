@@ -613,7 +613,7 @@ ffi.cdef [[
   void *readdir(void *dirp);
   int closedir(void *dirp);
 ]]
-local REG_EXTENDED, REG_NOSUB = 1, 8
+local REG_EXTENDED, REG_NOSUB, REG_ICASE = 1, 8, 2
 local regbuf = ffi.new("char[512]") -- opaque regex_t (glibc ~64B; over-allocate)
 
 -- Convert a shell glob to a POSIX ERE, anchored. Char classes carry over (with
@@ -691,8 +691,8 @@ end
 
 -- Match `s` against a POSIX ERE. `anchored_glob` false = raw ERE (=~), true = a
 -- glob already converted to an anchored ERE. Returns boolean.
-function M.regex_match(s, ere)
-  if ffi.C.regcomp(regbuf, ere, REG_EXTENDED + REG_NOSUB) ~= 0 then return false end
+function M.regex_match(s, ere, icase)
+  if ffi.C.regcomp(regbuf, ere, REG_EXTENDED + REG_NOSUB + (icase and REG_ICASE or 0)) ~= 0 then return false end
   local rc = ffi.C.regexec(regbuf, s, 0, nil, 0)
   ffi.C.regfree(regbuf)
   return rc == 0
@@ -701,8 +701,8 @@ end
 -- nil on no match / bad regex. (glibc regoff_t is int; regmatch_t is 8 bytes.)
 local NMATCH = 20
 local pmatch = ffi.new("struct { int rm_so; int rm_eo; }[?]", NMATCH)
-function M.regex_captures(s, ere)
-  if ffi.C.regcomp(regbuf, ere, REG_EXTENDED) ~= 0 then return nil end -- no NOSUB: need offsets
+function M.regex_captures(s, ere, icase)
+  if ffi.C.regcomp(regbuf, ere, REG_EXTENDED + (icase and REG_ICASE or 0)) ~= 0 then return nil end -- no NOSUB: need offsets
   local rc = ffi.C.regexec(regbuf, s, NMATCH, pmatch, 0)
   ffi.C.regfree(regbuf)
   if rc ~= 0 then return nil end
@@ -717,8 +717,8 @@ function M.regex_captures(s, ere)
 end
 
 -- Full (anchored) shell-glob match, for `case` patterns.
-function M.glob_match(s, glob)
-  return M.regex_match(s, glob_to_ere(glob))
+function M.glob_match(s, glob, icase)
+  return M.regex_match(s, glob_to_ere(glob), icase)
 end
 
 local REG_NOTBOL = 1

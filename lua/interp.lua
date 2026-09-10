@@ -1927,14 +1927,15 @@ local function eval_dbracket(sh, node)
   if k == "unary" then return unary(sh, node.op, expand_word(sh, node.word)) end
   if k == "binary" then
     local l, r, op = expand_word(sh, node.l), expand_word(sh, node.r), node.op
+    local ic = sh.shopt.nocasematch and true or nil -- shopt -s nocasematch: case-insensitive
     if op == "==" or op == "=" then
-      if node.rq then return l == r else return rt.glob_match(l, expand_pattern(sh, node.r)) end
+      if node.rq and not ic then return l == r else return rt.glob_match(l, expand_pattern(sh, node.r), ic) end
     elseif op == "!=" then
-      if node.rq then return l ~= r else return not rt.glob_match(l, expand_pattern(sh, node.r)) end
+      if node.rq and not ic then return l ~= r else return not rt.glob_match(l, expand_pattern(sh, node.r), ic) end
     elseif op == "=~" then
       -- a quoted part of the regex is matched literally (bash), so re-expand with
       -- regex-escaping of quoted segments instead of using the plain rhs.
-      local caps = rt.regex_captures(l, expand_regex(sh, node.r)) -- real POSIX ERE + BASH_REMATCH
+      local caps = rt.regex_captures(l, expand_regex(sh, node.r), ic) -- real POSIX ERE + BASH_REMATCH
       sh:array_assign("BASH_REMATCH", caps or {}, false)
       return caps ~= nil
     elseif op == "-eq" or op == "-ne" or op == "-lt" or op == "-le" or op == "-gt" or op == "-ge" then
@@ -2288,7 +2289,7 @@ local function exec_stmt(sh, st, hook)
       if not matched then
         for _, pat in ipairs(cl.pats) do
           local g = expand_pattern(sh, P.parse_word(pat)) -- vars resolved; quoted metachars literal
-          if rt.glob_match(subj, g) then matched = true; break end
+          if rt.glob_match(subj, g, sh.shopt.nocasematch and true or nil) then matched = true; break end
         end
       end
       if matched then
