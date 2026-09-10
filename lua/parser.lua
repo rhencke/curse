@@ -945,7 +945,11 @@ local function make_parser(src)
     -- (( expr )) arithmetic command: exit status 0 if expr != 0, else 1.
     if src:sub(i, i + 1) == "((" then
       local body, ni = grab_dparen(src, i + 2); i = ni
-      return { t = "arithcmd", line = line, expr = arith(body) }
+      -- a malformed `(( expr ))` (bad lvalue) is a NON-fatal runtime error in bash,
+      -- so defer the parse failure to eval (caught by the arithcmd handler) rather
+      -- than aborting the whole parse.
+      local ok, e = pcall(arith, body)
+      return { t = "arithcmd", line = line, expr = ok and e or { k = "matherr" } }
     end
     -- [[ EXPR ]] conditional (no word-splitting; == is glob, =~ is regex)
     if src:sub(i, i + 1) == "[[" and src:sub(i + 2, i + 2):match("[ \t]") then

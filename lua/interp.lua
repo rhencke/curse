@@ -361,6 +361,10 @@ end
 
 eval = function(sh, e)
   local k = e.k
+  if k == "matherr" then -- a deferred arith parse error (bad lvalue): non-fatal in (( ))
+    io.stderr:write("curse: arithmetic syntax error\n")
+    error({ __curse_exit = 1, __curse_matherr = true })
+  end
   if k == "num" then return rt.arith_num(e.v) end
   if k == "var" then
     if e.idx then return arith_resolve(sh, sh:array_get(e.name, arith_key(sh, e.name, e.idx))) end
