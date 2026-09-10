@@ -11,6 +11,102 @@ local bit = require("bit")
 
 local M = {}
 
+-- `set -o NAME` / short-flag maps for the `set` builtin (and shopt -o).
+-- Ordered list mirrors bash's `set -o` output order.
+local SETOPTS = {
+  { "allexport", "opt_a" }, { "braceexpand", "opt_B" }, { "emacs", "opt_emacs" },
+  { "errexit", "opt_e" }, { "errtrace", "opt_errtrace" }, { "functrace", "opt_functrace" },
+  { "hashall", "opt_h" }, { "histexpand", "opt_H" }, { "history", "opt_history" },
+  { "ignoreeof", "opt_ignoreeof" }, { "interactive-comments", "opt_icomments" },
+  { "keyword", "opt_k" }, { "monitor", "opt_m" }, { "noclobber", "opt_C" },
+  { "noexec", "opt_n" }, { "noglob", "opt_f" }, { "nolog", "opt_nolog" },
+  { "notify", "opt_b" }, { "nounset", "opt_u" }, { "onecmd", "opt_t" },
+  { "physical", "opt_P" }, { "pipefail", "opt_pipefail" }, { "posix", "opt_posix" },
+  { "privileged", "opt_p" }, { "verbose", "opt_v" }, { "vi", "opt_vi" },
+  { "xtrace", "opt_x" },
+}
+local SETOPT = {} -- name -> field
+for _, o in ipairs(SETOPTS) do SETOPT[o[1]] = o[2] end
+local SETFLAG = { a = "opt_a", B = "opt_B", e = "opt_e", h = "opt_h", H = "opt_H",
+  k = "opt_k", m = "opt_m", C = "opt_C", n = "opt_n", f = "opt_f", b = "opt_b",
+  u = "opt_u", t = "opt_t", P = "opt_P", v = "opt_v", x = "opt_x", p = "opt_p" }
+-- options that default ON (interactive-comments and braceexpand/hashall/histexpand/
+-- history are on; emacs is on for the display default). nil field state == off.
+local SETDEFAULT = { opt_B = true, opt_h = true, opt_H = true, opt_history = true,
+  opt_icomments = true }
+local function opt_on(sh, field)
+  local v = sh[field]
+  if v ~= nil then return v end
+  -- emacs line-editing defaults on only for interactive shells.
+  if field == "opt_emacs" then return sh.opt_i and true or false end
+  return SETDEFAULT[field] or false
+end
+local function set_opt(sh, field, on)
+  sh[field] = on
+  -- emacs and vi line-editing modes are mutually exclusive.
+  if on and field == "opt_emacs" then sh.opt_vi = false
+  elseif on and field == "opt_vi" then sh.opt_emacs = false end
+end
+
+-- bash `shopt` options in bash's own listing order, with their default state.
+-- Curse doesn't implement most behaviors, but validity + default + on/off display
+-- must match bash. sh.shopt[name] overrides the default once set/unset.
+local SHOPT_ORDER = {
+  "autocd", "assoc_expand_once", "cdable_vars", "cdspell", "checkhash", "checkjobs",
+  "checkwinsize", "cmdhist", "compat31", "compat32", "compat40", "compat41",
+  "compat42", "compat43", "compat44", "complete_fullquote", "direxpand", "dirspell",
+  "dotglob", "execfail", "expand_aliases", "extdebug", "extglob", "extquote",
+  "failglob", "force_fignore", "globasciiranges", "globskipdots", "globstar",
+  "gnu_errfmt", "histappend", "histreedit", "histverify", "hostcomplete", "huponexit",
+  "inherit_errexit", "interactive_comments", "lastpipe", "lithist", "localvar_inherit",
+  "localvar_unset", "login_shell", "mailwarn", "no_empty_cmd_completion", "nocaseglob",
+  "nocasematch", "noexpand_translation", "nullglob", "patsub_replacement", "progcomp",
+  "progcomp_alias", "promptvars", "restricted_shell", "shift_verbose", "sourcepath",
+  "varredir_close", "xpg_echo",
+}
+local SHOPT_DEFAULT = {} -- name -> true (valid); default-on ones map to "on"
+for _, n in ipairs(SHOPT_ORDER) do SHOPT_DEFAULT[n] = false end
+for _, n in ipairs({ "checkwinsize", "cmdhist", "complete_fullquote", "extquote",
+  "force_fignore", "globasciiranges", "globskipdots", "hostcomplete",
+  "interactive_comments", "patsub_replacement", "progcomp", "promptvars",
+  "sourcepath" }) do SHOPT_DEFAULT[n] = true end
+local function shopt_on(sh, name)
+  local v = sh.shopt[name]
+  if v == nil then return SHOPT_DEFAULT[name] end
+  return v
+end
+
+-- Quote a value the way `set`/`declare -p` do: bare if it's all "safe" chars,
+-- else single-quoted with embedded quotes escaped as '\''.
+local function sq(s)
+  if s == "" then return "''" end
+  if s:match("^[%w_,.:/@%%+=%-]+$") then return s end
+  return "'" .. s:gsub("'", "'\\''") .. "'"
+end
+-- `set` (no args) one-line rendering of a variable box.
+local function fmt_set_var(name, b)
+  if b.assoc and b.arr then
+    local keys = {}
+    for k in pairs(b.arr) do keys[#keys + 1] = k end
+    table.sort(keys)
+    local parts = {}
+    for _, k in ipairs(keys) do
+      local kq = tostring(k):match("^[%w_]+$") and tostring(k) or ('"' .. tostring(k):gsub('"', '\\"') .. '"')
+      parts[#parts + 1] = ("[%s]=\"%s\""):format(kq, tostring(b.arr[k]):gsub('"', '\\"'))
+    end
+    return ("%s=(%s )"):format(name, table.concat(parts, " ")) -- trailing space, like bash
+  elseif b.arr then
+    local idx = {}
+    for k in pairs(b.arr) do idx[#idx + 1] = k end
+    table.sort(idx, function(x, y) return tonumber(x) < tonumber(y) end)
+    local parts = {}
+    for _, i in ipairs(idx) do parts[#parts + 1] = ('[%d]="%s"'):format(tonumber(i), tostring(b.arr[i]):gsub('"', '\\"')) end
+    return ("%s=(%s)"):format(name, table.concat(parts, " "))
+  else
+    return name .. "=" .. sq(b.s ~= nil and b.s or (b.n ~= nil and rt.i64_to_str(b.n) or ""))
+  end
+end
+
 local function truth(n) return n ~= i64(0) end
 local function b2i(b) return b and 1LL or 0LL end
 
@@ -76,9 +172,10 @@ local function file_test(op, path)
   return false
 end
 local UNARY_STR = { ["-z"] = true, ["-n"] = true }
-local function unary(op, x)
+local function unary(sh, op, x)
   if op == "-z" then return x == "" end
   if op == "-n" then return x ~= "" end
+  if op == "-o" then return sh and SETOPT[x] and opt_on(sh, SETOPT[x]) or false end -- shell option on
   return file_test(op, x) -- -e/-f/-d/-r/-w/-x/-s…
 end
 local function binary(x, op, y)
@@ -97,7 +194,7 @@ local function binary(x, op, y)
 end
 -- Evaluate a `test`/`[` argument list (already expanded). Returns a boolean.
 -- Recursive descent with `( )` grouping and `-o` (lowest) / `-a` / `!` precedence.
-local function eval_test(a, lo, hi)
+local function eval_test(sh, a, lo, hi)
   local n = hi - lo + 1
   if n <= 0 then return false end
   -- ( expr ): strip only when lo's `(` matches hi's `)`
@@ -106,7 +203,7 @@ local function eval_test(a, lo, hi)
     for j = lo, hi do
       if a[j] == "(" then depth = depth + 1
       elseif a[j] == ")" then depth = depth - 1; if depth == 0 then
-        if j == hi then return eval_test(a, lo + 1, hi - 1) end; break
+        if j == hi then return eval_test(sh, a, lo + 1, hi - 1) end; break
       end end
     end
   end
@@ -117,14 +214,14 @@ local function eval_test(a, lo, hi)
       if a[j] == "(" then depth = depth + 1
       elseif a[j] == ")" then depth = depth - 1
       elseif a[j] == opw and depth == 0 and j > lo and j < hi then
-        local l, r = eval_test(a, lo, j - 1), eval_test(a, j + 1, hi)
+        local l, r = eval_test(sh, a, lo, j - 1), eval_test(sh, a, j + 1, hi)
         if opw == "-o" then return l or r else return l and r end
       end
     end
   end
-  if a[lo] == "!" and n > 1 then return not eval_test(a, lo + 1, hi) end
+  if a[lo] == "!" and n > 1 then return not eval_test(sh, a, lo + 1, hi) end
   if n == 1 then return a[lo] ~= "" end
-  if n == 2 then return unary(a[lo], a[lo + 1]) end
+  if n == 2 then return unary(sh, a[lo], a[lo + 1]) end
   if n == 3 then return binary(a[lo], a[lo + 1], a[lo + 2]) end
   return false
 end
@@ -134,7 +231,7 @@ local function do_test(sh, args)
     if args[hi] ~= "]" then sh.status = 2; return end
     hi = hi - 1
   end
-  local ok, res = pcall(eval_test, args, lo, hi)
+  local ok, res = pcall(eval_test, sh, args, lo, hi)
   sh.status = (ok and res) and 0 or 1
 end
 
@@ -473,8 +570,11 @@ local function apply_redirs(sh, redirs)
     elseif r.op == "in" then
       backup(r.fd); local f = C.open(tgt(r), 0, 0)
       if f >= 0 then C.dup2(f, r.fd); C.close(f) else ok = false end
-    elseif r.op == "outboth" then
-      backup(1); backup(2); local f = C.open(tgt(r), 577, 420)
+    elseif r.op == "outboth" then -- `&>` truncation honors noclobber (O_EXCL) too
+      backup(1); backup(2); local f = C.open(tgt(r), sh.opt_C and 705 or 577, 420)
+      if f >= 0 then C.dup2(f, 1); C.dup2(f, 2); C.close(f) else ok = false end
+    elseif r.op == "appboth" then -- `&>>`: append stdout+stderr (append ignores noclobber)
+      backup(1); backup(2); local f = C.open(tgt(r), 1089, 420)
       if f >= 0 then C.dup2(f, 1); C.dup2(f, 2); C.close(f) else ok = false end
     elseif r.op == "heredoc" then
       local body = r.expand and expand_word(sh, P.parse_heredoc(r.body or "")) or (r.body or "")
@@ -804,16 +904,17 @@ local function exec_simple(sh, args, hook)
     sh.status = ok and 0 or 1
   elseif cmd == "shopt" then
     -- shopt [-s|-u|-q|-p|-o] [names]: set/unset/query shell options (subset).
-    local set_, unset_, quiet, oflag, badopt = false, false, false, false, false
+    local set_, unset_, quiet, oflag, pflag, badopt = false, false, false, false, false, false
     local names = {}
     for k = 2, #args do
       local a = args[k]
       if a == "-s" then set_ = true elseif a == "-u" then unset_ = true
-      elseif a == "-q" then quiet = true elseif a == "-p" then -- print form
+      elseif a == "-q" then quiet = true elseif a == "-p" then pflag = true
       elseif a == "-o" then oflag = true
       elseif a:match("^-[suqpo]+$") then
         if a:find("s") then set_ = true end; if a:find("u") then unset_ = true end
         if a:find("q") then quiet = true end; if a:find("o") then oflag = true end
+        if a:find("p") then pflag = true end
       elseif a:sub(1, 2) == "--" then badopt = true -- long opts are Oil syntax; bash errors
       else names[#names + 1] = a end
     end
@@ -821,29 +922,59 @@ local function exec_simple(sh, args, hook)
       io.stderr:write("curse: shopt: invalid option\n"); sh.status = 1
     elseif oflag then -- shopt -o: the `set -o` options
       if set_ or unset_ then
+        local allok = true
         for _, nm in ipairs(names) do
-          if nm == "errexit" then sh.opt_e = set_ elseif nm == "nounset" then sh.opt_u = set_
-          elseif nm == "noclobber" then sh.opt_C = set_
-          elseif nm == "pipefail" then sh.opt_pipefail = set_ end
+          if SETOPT[nm] then set_opt(sh, SETOPT[nm], set_)
+          else io.stderr:write("curse: shopt: " .. nm .. ": invalid option name\n"); allok = false end
+        end
+        sh.status = allok and 0 or 1
+      elseif #names == 0 then -- list all set-o options
+        for _, ent in ipairs(SETOPTS) do
+          if pflag then sh.out(("set %so %s\n"):format(opt_on(sh, ent[2]) and "-" or "+", ent[1]))
+          else sh.out(("%-15s\t%s\n"):format(ent[1], opt_on(sh, ent[2]) and "on" or "off")) end
         end
         sh.status = 0
       else
+        local allok = true
         for _, nm in ipairs(names) do
-          local on = (nm == "errexit" and sh.opt_e) or (nm == "nounset" and sh.opt_u)
-            or (nm == "noclobber" and sh.opt_C) or (nm == "pipefail" and sh.opt_pipefail)
-          if not quiet then sh:echo("set " .. (on and "-o " or "+o ") .. nm) end
+          if not SETOPT[nm] then allok = false -- unknown: skipped, drops status
+          else
+          local on = opt_on(sh, SETOPT[nm])
+          if not on then allok = false end
+          if not quiet then
+            if pflag then sh.out(("set %so %s\n"):format(on and "-" or "+", nm))
+            else sh.out(("%-15s\t%s\n"):format(nm, on and "on" or "off")) end
+          end
+          end
         end
-        sh.status = 0
+        sh.status = allok and 0 or 1
       end
     elseif set_ or unset_ then
-      for _, nm in ipairs(names) do sh.shopt[nm] = set_ end
-      sh.status = 0
-    else -- query / print
+      -- -s/-u NAMES: unknown names error (status 1) but valid ones still apply.
       local allok = true
       for _, nm in ipairs(names) do
-        local on = sh.shopt[nm] and true or false
-        if not quiet then sh:echo("shopt " .. (on and "-s " or "-u ") .. nm) end
-        if not on then allok = false end
+        if SHOPT_DEFAULT[nm] == nil then
+          io.stderr:write("curse: shopt: " .. nm .. ": invalid shell option name\n"); allok = false
+        else sh.shopt[nm] = set_ end
+      end
+      sh.status = allok and 0 or 1
+    elseif #names == 0 then -- print all options (query/-p; same 2-col/`shopt -s` form)
+      for _, nm in ipairs(SHOPT_ORDER) do
+        sh.out(("shopt %s%s\n"):format(shopt_on(sh, nm) and "-s " or "-u ", nm))
+      end
+      sh.status = 0
+    else -- query / print named: invalid names skipped, drop status to 1
+      local allok = true
+      for _, nm in ipairs(names) do
+        if SHOPT_DEFAULT[nm] == nil then allok = false -- unknown: not printed
+        else
+          local on = shopt_on(sh, nm)
+          if not on then allok = false end
+          if not quiet then
+            if pflag then sh.out(("shopt %s%s\n"):format(on and "-s " or "-u ", nm))
+            else sh.out(("%-15s\t%s\n"):format(nm, on and "on" or "off")) end
+          end
+        end
       end
       sh.status = allok and 0 or 1
     end
@@ -960,22 +1091,40 @@ local function exec_simple(sh, args, hook)
     end
   elseif cmd == "set" then
     -- set [-e|+e|-o NAME|+o NAME|…] [--] [ARGS…]: options then positional params
+    if #args == 1 then -- bare `set`: list all shell variables, sorted by name
+      local names = {}
+      for nm in pairs(sh.vars) do names[#names + 1] = nm end
+      table.sort(names)
+      for _, nm in ipairs(names) do
+        local b = sh.vars[nm]
+        if b and not (b.s == nil and b.n == nil and b.arr == nil) then
+          sh.out(fmt_set_var(nm, b) .. "\n")
+        end
+      end
+      sh.status = 0
+      return
+    end
     local j, dd = 2, false
     while j <= #args do
       local a = args[j]
       if a == "--" then dd = true; j = j + 1; break
       elseif a == "-o" or a == "+o" then
         local o, on = args[j + 1], (a == "-o")
-        if o == "errexit" then sh.opt_e = on
-        elseif o == "nounset" then sh.opt_u = on
-        elseif o == "noclobber" then sh.opt_C = on
-        elseif o == "pipefail" then sh.opt_pipefail = on end
-        j = j + 2
+        if o == nil then
+          -- `set -o`: list options aligned; `set +o`: reproducible `set ±o NAME`.
+          for _, ent in ipairs(SETOPTS) do
+            if on then sh.out(("%-15s\t%s\n"):format(ent[1], opt_on(sh, ent[2]) and "on" or "off"))
+            else sh.out(("set %so %s\n"):format(opt_on(sh, ent[2]) and "-" or "+", ent[1])) end
+          end
+          j = j + 1
+        else
+          if SETOPT[o] then set_opt(sh, SETOPT[o], on) end
+          j = j + 2
+        end
       elseif a:match("^[-+][a-zA-Z]+$") then -- short flag bundle: -eu, +u, …
         local on = a:sub(1, 1) == "-"
         for f in a:sub(2):gmatch(".") do
-          if f == "e" then sh.opt_e = on elseif f == "u" then sh.opt_u = on
-          elseif f == "C" then sh.opt_C = on end
+          if SETFLAG[f] then set_opt(sh, SETFLAG[f], on) end
         end
         j = j + 1
       else break end
@@ -1400,6 +1549,9 @@ end
 
 local function exec_stmt(sh, st, hook)
   local t = st.t
+  -- set -n (noexec): a non-interactive shell reads but does not execute. Once on,
+  -- every later statement (including `set +n`) is skipped — matches bash.
+  if sh.opt_n and not sh.opt_i then sh.status = 0; return end
   if st.line and not sh.in_trap then sh.cur_line = st.line end -- $LINENO (frozen in traps)
   if t == "assign" then
     local rb = sh.vars[sh:deref(st.name)]

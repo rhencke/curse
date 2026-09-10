@@ -715,6 +715,7 @@ local function make_parser(src)
       end
       if src:sub(q, q + 1) == "<&" then op = "dupin"; tfd = fd and tonumber(fd) or 0; q = q + 2
       else op = "in"; tfd = fd and tonumber(fd) or 0; q = q + 1 end
+    elseif c == "&" and src:sub(q, q + 2) == "&>>" then op = "appboth"; tfd = 1; q = q + 3
     elseif c == "&" and src:sub(q, q + 1) == "&>" then op = "outboth"; tfd = 1; q = q + 2
     else return nil end
     i = q; ws()

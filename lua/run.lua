@@ -27,6 +27,7 @@ local ai, presets = 1, {}
 while true do
   local a = arg[ai]
   if a == "-e" or a == "+e" then presets[#presets + 1] = { f = "opt_e", on = a == "-e" }; ai = ai + 1
+  elseif a == "-i" then presets[#presets + 1] = { f = "opt_i", on = true }; ai = ai + 1
   elseif a == "-u" or a == "+u" then presets[#presets + 1] = { f = "opt_u", on = a == "-u" }; ai = ai + 1
   elseif a == "-C" or a == "+C" then presets[#presets + 1] = { f = "opt_C", on = a == "-C" }; ai = ai + 1
   elseif a == "-o" or a == "+o" then presets[#presets + 1] = { o = arg[ai + 1], on = a == "-o" }; ai = ai + 2
@@ -53,9 +54,9 @@ if arg[ai] == "-c" then
   io.flush(); os.exit(sh.status or 0)
 end
 
--- No script (or `-i`): interactive REPL (readline line editing + history).
-if arg[ai] == nil or arg[ai] == "-i" then
-  sh = T.rt.Shell.new(); apply(sh); sh.argv0 = "curse"; sh.opt_i = (arg[ai] == "-i")
+-- No script (`-i` already consumed as a leading option): interactive REPL.
+if arg[ai] == nil then
+  sh = T.rt.Shell.new(); apply(sh); sh.argv0 = "curse"; sh.opt_i = true
   require("repl").run(sh)
   io.flush(); os.exit(sh.status or 0)
 end
