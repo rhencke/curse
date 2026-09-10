@@ -170,6 +170,9 @@ ffi.cdef [[
   unsigned int geteuid(void);
   unsigned int getegid(void);
   int fcntl(int fd, int cmd, ...);
+  struct curse_rlimit { uint64_t rlim_cur; uint64_t rlim_max; };
+  int getrlimit(int resource, struct curse_rlimit *rlim);
+  int setrlimit(int resource, const struct curse_rlimit *rlim);
 ]]
 local C = ffi.C
 -- Unbuffered one-byte read from a raw fd (for `read`, which must NOT over-read
@@ -1089,7 +1092,7 @@ local BUILTINS = {
   eval = 1, source = 1, ["."] = 1, ["break"] = 1, ["continue"] = 1, ["true"] = 1,
   exec = 1, readonly = 1, umask = 1, alias = 1, unalias = 1, shopt = 1, wait = 1, trap = 1,
   mapfile = 1, readarray = 1, compgen = 1, complete = 1, compopt = 1,
-  pushd = 1, popd = 1, dirs = 1, builtin = 1, kill = 1,
+  pushd = 1, popd = 1, dirs = 1, builtin = 1, kill = 1, ulimit = 1,
 }
 M.BUILTINS = BUILTINS -- exposed so the compiled backend delegates the same set
 local KEYWORDS = {
@@ -2237,6 +2240,76 @@ local function exec_simple(sh, args, hook, no_func)
       end
     end
     sh.status = 1
+  elseif cmd == "ulimit" then
+    -- ulimit [-HSaflags] [limit]: get/set process resource limits (getrlimit/
+    -- setrlimit). Reported/accepted in each resource's block unit; `unlimited`.
+    local INF = 0xFFFFFFFFFFFFFFFFULL
+    local RES = { -- flag -> { resource, bytes-per-unit, label, unit-name }
+      t = { 0, 1, "cpu time", "seconds" }, f = { 1, 1024, "file size", "blocks" },
+      d = { 2, 1024, "data seg size", "kbytes" }, s = { 3, 1024, "stack size", "kbytes" },
+      c = { 4, 512, "core file size", "blocks" }, m = { 5, 1024, "max memory size", "kbytes" },
+      l = { 8, 1024, "max locked memory", "kbytes" }, u = { 6, 1, "max user processes", "" },
+      n = { 7, 1, "open files", "" }, v = { 9, 1024, "virtual memory", "kbytes" },
+      p = { -1, 512, "pipe size", "512 bytes" },
+    }
+    local AORDER = { "t", "f", "d", "s", "c", "m", "l", "u", "n", "v" }
+    local rl = ffi.new("struct curse_rlimit[1]")
+    local function report(fl)
+      local r = RES[fl]; if not r or r[1] < 0 then return "unlimited" end
+      if C.getrlimit(r[1], rl) ~= 0 then return nil end
+      local v = rl[0].rlim_cur
+      if v == INF then return "unlimited" end
+      return (tostring(v / r[2]):gsub("[UuLl]+$", "")) -- drop LuaJIT's cdata "ULL" suffix
+    end
+    local hard, flags, value = false, {}, nil
+    local j = 2
+    while args[j] do
+      local a = args[j]
+      if a == "--" then j = j + 1; break
+      elseif a == "-a" or a == "--all" then flags = { "t", "f", "d", "s", "c", "m", "l", "u", "n", "v", "@all" }; j = j + 1
+      elseif a == "-H" then hard = true; j = j + 1
+      elseif a == "-S" then j = j + 1
+      elseif a:sub(1, 1) == "-" and #a > 1 then
+        for k = 2, #a do local f = a:sub(k, k)
+          if f == "H" then hard = true elseif f == "S" then -- soft (default)
+          elseif RES[f] then flags[#flags + 1] = f
+          else io.stderr:write("curse: ulimit: -" .. f .. ": invalid option\n"); sh.status = 2; return end
+        end
+        j = j + 1
+      else break end
+    end
+    value = args[j]
+    if args[j + 1] then io.stderr:write("curse: ulimit: too many arguments\n"); sh.status = 1; return end
+    if #flags == 0 then flags = { "f" } end -- default resource is -f
+    local allmode = flags[#flags] == "@all"
+    if allmode then flags[#flags] = nil end
+    if value ~= nil and (allmode or #flags ~= 1) then
+      io.stderr:write("curse: ulimit: a limit takes exactly one resource\n"); sh.status = 1; return
+    end
+    if value ~= nil then -- set the single resource
+      local r = RES[flags[1]]
+      local nv
+      if value == "unlimited" then nv = INF
+      elseif value:match("^%-?%d+$") then nv = ffi.cast("uint64_t", tonumber(value) or 0) * r[2]
+      else io.stderr:write("curse: ulimit: " .. value .. ": invalid number\n"); sh.status = 1; return end
+      if r[1] < 0 or C.getrlimit(r[1], rl) ~= 0 then sh.status = 1; return end
+      if hard then rl[0].rlim_max = nv else rl[0].rlim_cur = nv end
+      sh.status = (C.setrlimit(r[1], rl) == 0) and 0 or 1
+      if sh.status ~= 0 then io.stderr:write("curse: ulimit: cannot modify limit\n") end
+    elseif allmode then -- -a: list all
+      for _, fl in ipairs(AORDER) do
+        local r = RES[fl]; local v = report(fl) or "unlimited"
+        sh:echo(("%-24s(%s, -%s) %s"):format(r[3], r[4], fl, v))
+      end
+      sh.status = 0
+    else -- print one or more resources
+      sh.status = 0
+      for _, fl in ipairs(flags) do
+        local v = report(fl)
+        if #flags > 1 then sh:echo(("%-24s(-%s) %s"):format(RES[fl][3], fl, v or "unlimited"))
+        else sh:echo(v or "unlimited") end
+      end
+    end
   elseif cmd == "pwd" then
     local phys = false
     for j = 2, #args do if args[j]:find("P") then phys = true elseif args[j]:find("L") then phys = false end end
