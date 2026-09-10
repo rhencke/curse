@@ -411,6 +411,9 @@ eval = function(sh, e)
     if op == ">>" then return bit.arshift(l, tonumber(r) % 64) end
     if op == "**" then
       local base, n, res = l, tonumber(r), i64(1)
+      if n < 0 then -- bash disallows a negative exponent (fatal arith error)
+        io.stderr:write("curse: exponent less than 0\n"); error({ __curse_exit = 1, __curse_matherr = true })
+      end
       for _ = 1, n do res = res * base end
       return res
     end
