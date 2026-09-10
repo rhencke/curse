@@ -1175,8 +1175,11 @@ local function make_parser(src)
       if not op then return nil end
       i = p
       if src:sub(i, i) == "(" then -- array literal
+        local pstart = i
         local elems = parse_array_elems()
-        return { t = "arrayassign", name = name, elems = elems, append = (op == "+=") }
+        -- raw parenthesized text: a NAME=(…) used as a command PREFIX is a literal
+        -- string in bash (arrays can't be env bindings), decided at exec time.
+        return { t = "arrayassign", name = name, elems = elems, append = (op == "+="), raw = src:sub(pstart, i - 1) }
       end
       local raw = word(true) -- stop at unquoted ) so `(x=2)` closes the subshell
       if not subidx and op == "=" and raw:sub(1, 3) == "$((" and raw:sub(-2) == "))" then
