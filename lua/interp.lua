@@ -836,8 +836,9 @@ local function expand_to_fields(sh, w)
       if useword and pe.arg then
         -- expand the default's parts: a QUOTED part is one atomic (sub)field, an
         -- unquoted part word-splits — so 'a b' stays one field but a b splits.
-        for _, sp in ipairs(require("parser").parse_word(pe.arg).parts) do
+        for k, sp in ipairs(require("parser").parse_word(pe.arg).parts) do
           local s = expand_part_str(sh, sp)
+          if k == 1 and sp.lit ~= nil and not sp.q then s = tilde_prefix(sh, s) end -- word-initial ~
           if sp.q then add(s, false) else feed_split(s) end
         end
       else
