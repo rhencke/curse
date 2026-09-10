@@ -154,6 +154,7 @@ ffi.cdef [[
   void _exit(int status);
   unsigned int umask(unsigned int mask);
   long read(int fd, void *buf, unsigned long count);
+  int kill(int pid, int sig);
 ]]
 local C = ffi.C
 -- Unbuffered one-byte read from a raw fd (for `read`, which must NOT over-read
@@ -755,7 +756,7 @@ local BUILTINS = {
   eval = 1, source = 1, ["."] = 1, ["break"] = 1, ["continue"] = 1, ["true"] = 1,
   exec = 1, readonly = 1, umask = 1, alias = 1, unalias = 1, shopt = 1, wait = 1, trap = 1,
   mapfile = 1, readarray = 1, compgen = 1, complete = 1, compopt = 1,
-  pushd = 1, popd = 1, dirs = 1, builtin = 1,
+  pushd = 1, popd = 1, dirs = 1, builtin = 1, kill = 1,
 }
 M.BUILTINS = BUILTINS -- exposed so the compiled backend delegates the same set
 local KEYWORDS = {
@@ -1307,6 +1308,47 @@ local function exec_simple(sh, args, hook)
     if sh.status == 0 then
       sh:set_str("OLDPWD", prev); C.setenv("OLDPWD", prev, 1)
       if sh.dirstack then sh.dirstack[1] = sh:special_get("PWD") end -- cd replaces the top of the stack
+    end
+  elseif cmd == "kill" then
+    if args[2] == "-l" or args[2] == "-L" then -- list / translate signal names<->numbers
+      if #args == 2 then
+        local nums = {}; for n in pairs(NUMSIG) do nums[#nums + 1] = n end; table.sort(nums)
+        local line = {}
+        for _, n in ipairs(nums) do
+          line[#line + 1] = ("%2d) SIG%-8s"):format(n, NUMSIG[n])
+          if #line == 5 then sh:echo((table.concat(line):gsub("%s+$", ""))); line = {} end
+        end
+        if #line > 0 then sh:echo((table.concat(line):gsub("%s+$", ""))) end
+        sh.status = 0
+      else
+        local allok = true
+        for k = 3, #args do
+          local a = args[k]; local n = tonumber(a)
+          if n then
+            if n > 128 then n = n - 128 end
+            local nm = NUMSIG[n]
+            if nm then sh:echo(nm) else allok = false; io.stderr:write("curse: kill: " .. a .. ": invalid signal specification\n") end
+          else
+            local num = SIGNUM[a:gsub("^SIG", "")]
+            if num then sh:echo(tostring(num)) else allok = false; io.stderr:write("curse: kill: " .. a .. ": invalid signal specification\n") end
+          end
+        end
+        sh.status = allok and 0 or 1
+      end
+    else
+      local j, sig = 2, 15 -- default SIGTERM
+      if args[j] == "-n" then sig = tonumber(args[j + 1]) or 15; j = j + 2
+      elseif args[j] == "-s" then sig = SIGNUM[(args[j + 1] or ""):gsub("^SIG", "")] or 15; j = j + 2
+      elseif args[j] == "--" then j = j + 1
+      elseif args[j] and args[j]:match("^%-.") then
+        local s = args[j]:sub(2); sig = tonumber(s) or SIGNUM[s:gsub("^SIG", "")] or 15; j = j + 1
+      end
+      local allok = true
+      for k = j, #args do
+        local pid = tonumber(args[k])
+        if not (pid and C.kill(pid, sig) == 0) then allok = false end
+      end
+      sh.status = allok and 0 or 1
     end
   elseif cmd == "pushd" or cmd == "popd" or cmd == "dirs" then
     sh.dirstack = sh.dirstack or { sh:special_get("PWD") }
