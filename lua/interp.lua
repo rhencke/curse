@@ -286,6 +286,7 @@ local expand_word -- forward (used by eval's $-deferred arith and expand_part_st
 local expand_pattern -- forward (quote-aware glob-pattern expansion for ${v/…} etc.)
 local eval  -- arithmetic evaluator (forward decl)
 local arith_resolve -- var-value-as-arith-expression resolver (forward decl)
+local arith_key -- array subscript in arith: string key for assoc, number for indexed
 local run_trap -- trap-handler runner (forward decl; defined near the bottom)
 -- Resolve a variable's string value in arithmetic. bash treats it as an arith
 -- EXPRESSION: a bare number is its value, but a name (or `3+4`, `bar`) is
@@ -312,7 +313,7 @@ eval = function(sh, e)
   local k = e.k
   if k == "num" then return rt.arith_num(e.v) end
   if k == "var" then
-    if e.idx then return arith_resolve(sh, sh:array_get(e.name, tonumber(rt.i64_to_str(eval(sh, e.idx))))) end
+    if e.idx then return arith_resolve(sh, sh:array_get(e.name, arith_key(sh, e.name, e.idx))) end
     if sh.opt_u and sh.vars[sh:deref(e.name)] == nil and sh:special_get(e.name) == "" then
       io.stderr:write("curse: " .. e.name .. ": unbound variable\n"); error({ __curse_exit = 1 })
     end
@@ -361,7 +362,7 @@ eval = function(sh, e)
     end
   end
   if k == "asgn" then
-    local iv = e.idx and tonumber(rt.i64_to_str(eval(sh, e.idx))) or nil
+    local iv = e.idx and arith_key(sh, e.name, e.idx) or nil
     local v = eval(sh, e.e)
     if e.op ~= "=" then
       local cur = iv and rt.arith_num(sh:array_get(e.name, iv)) or sh:aget(e.name)
@@ -375,7 +376,7 @@ eval = function(sh, e)
   end
   if k == "post" then
     if e.idx then
-      local iv = tonumber(rt.i64_to_str(eval(sh, e.idx)))
+      local iv = arith_key(sh, e.name, e.idx)
       local cur = rt.arith_num(sh:array_get(e.name, iv))
       sh:array_set(e.name, iv, rt.i64_to_str(cur + i64(e.d))); return cur
     end
@@ -383,7 +384,7 @@ eval = function(sh, e)
   end
   if k == "pre" then
     if e.idx then
-      local iv = tonumber(rt.i64_to_str(eval(sh, e.idx)))
+      local iv = arith_key(sh, e.name, e.idx)
       local v = rt.arith_num(sh:array_get(e.name, iv)) + i64(e.d)
       sh:array_set(e.name, iv, rt.i64_to_str(v)); return v
     end
@@ -392,6 +393,14 @@ eval = function(sh, e)
   error("interp: bad arith node " .. tostring(k))
 end
 M.eval = eval
+
+-- An array subscript used in arithmetic: an associative array takes the
+-- evaluated-then-stringified value as its key ("5"), an indexed array a number.
+arith_key = function(sh, name, idxexpr)
+  local v = eval(sh, idxexpr)
+  if sh:is_assoc(name) then return rt.i64_to_str(v) end
+  return tonumber(rt.i64_to_str(v))
+end
 
 
 -- Resolve an array subscript to a key: a string (word-expanded) for an
