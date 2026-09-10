@@ -83,6 +83,34 @@ local function sq(s)
   if s:match("^[%w_,.:/@%%+=%-]+$") then return s end
   return "'" .. s:gsub("'", "'\\''") .. "'"
 end
+-- Field-split a line for `read` into exactly `nvars` values. Skips leading IFS
+-- whitespace; each field but the last stops at an IFS char (a run of IFS
+-- whitespace + at most one IFS non-whitespace is one delimiter); the LAST var
+-- gets the verbatim remainder (keeping its interior separators — unlike a
+-- re-join) with trailing IFS whitespace stripped.
+local function read_split(ifs, line, nvars)
+  local wsset, ifsset = {}, {}
+  for c in ifs:gmatch(".") do ifsset[c] = true; if c == " " or c == "\t" or c == "\n" then wsset[c] = true end end
+  local i, n = 1, #line
+  local function cw(p) return wsset[line:sub(p, p)] end
+  local function cifs(p) return ifsset[line:sub(p, p)] end
+  while i <= n and cw(i) do i = i + 1 end -- leading IFS whitespace
+  local out = {}
+  for v = 1, nvars do
+    if v == nvars then
+      local rest = line:sub(i)
+      while #rest > 0 and wsset[rest:sub(-1)] do rest = rest:sub(1, -2) end -- trailing IFS ws
+      out[v] = rest
+    else
+      local s = i
+      while i <= n and not cifs(i) do i = i + 1 end
+      out[v] = line:sub(s, i - 1)
+      while i <= n and cw(i) do i = i + 1 end -- delimiter: IFS whitespace
+      if i <= n and cifs(i) then i = i + 1; while i <= n and cw(i) do i = i + 1 end end -- + one non-ws
+    end
+  end
+  return out
+end
 -- `set` (no args) one-line rendering of a variable box.
 local function fmt_set_var(name, b)
   if b.assoc and b.arr then
@@ -125,8 +153,18 @@ ffi.cdef [[
   int unsetenv(const char *name);
   void _exit(int status);
   unsigned int umask(unsigned int mask);
+  long read(int fd, void *buf, unsigned long count);
 ]]
 local C = ffi.C
+-- Unbuffered one-byte read from a raw fd (for `read`, which must NOT over-read
+-- past its delimiter/char count — buffered io.read would swallow the rest of the
+-- stream, breaking a subsequent read from the same underlying fd).
+local rd1 = ffi.new("char[1]")
+local function fd_getc(fd)
+  local n = C.read(fd, rd1, 1)
+  if n == 1 then return string.char(rd1[0] % 256) end
+  return nil -- EOF or error
+end
 local statbuf = ffi.new("uint8_t[144]") -- glibc x86-64 struct stat is 144 bytes
 -- Signal name/number normalization for `trap`.
 local SIGNUM = { HUP = 1, INT = 2, QUIT = 3, ILL = 4, TRAP = 5, ABRT = 6, BUS = 7,
@@ -1358,7 +1396,7 @@ local function exec_simple(sh, args, hook)
     sh.status = 0
   elseif cmd == "read" then
     -- read [-r] [-a arr] [-p prompt] VAR...  (line from stdin, split on IFS)
-    local raw, arr, j, nchars, ndelim = false, nil, 2, nil, false
+    local raw, arr, j, nchars, ndelim, ufd = false, nil, 2, nil, false, 0
     local delim
     while j <= #args do
       local a = args[j]
@@ -1378,7 +1416,8 @@ local function exec_simple(sh, args, hook)
           elseif f == "n" then nchars = tonumber(takearg())
           elseif f == "N" then nchars = tonumber(takearg()); ndelim = true
           elseif f == "a" then arr = takearg()
-          elseif f == "p" or f == "t" or f == "u" then takearg() -- consume + ignore
+          elseif f == "u" then ufd = tonumber(takearg()) or 0
+          elseif f == "p" or f == "t" then takearg() -- consume + ignore
           else k = k + 1 end -- -s etc.: ignore
         end
         j = j + advance
@@ -1387,46 +1426,35 @@ local function exec_simple(sh, args, hook)
     local vars = {}
     for k = j, #args do vars[#vars + 1] = args[k] end
     local line, had_nl = nil, true
-    if delim and not nchars then -- -d: read chars until the delimiter (or EOF)
-      local dch = delim == "" and "\0" or delim:sub(1, 1) -- -d '' means NUL
-      local buf, got = {}, false
+    -- Read from `ufd` one byte at a time (never over-reading past the terminator),
+    -- honoring -r (backslash escaping), -d DELIM, and -n/-N char counts. `dch` is
+    -- the record delimiter: the line terminator (\n) unless -d overrode it; -N
+    -- ignores the delimiter entirely.
+    local dch = delim == nil and "\n" or (delim == "" and "\0" or delim:sub(1, 1))
+    do
+      local buf, got, esc = {}, false, false
       while true do
-        local c = io.read(1)
+        if nchars and #buf >= nchars then had_nl = true; break end -- -n/-N char limit reached
+        local c = fd_getc(ufd)
         if c == nil then had_nl = false; break end
         got = true
-        if c == dch then had_nl = true; break end
-        buf[#buf + 1] = c
+        if esc then -- backslash-escaped char: keep verbatim (drop the backslash)
+          buf[#buf + 1] = c; esc = false
+        elseif not raw and c == "\\" then
+          -- \<newline> is a line continuation (splice); other \x escapes the char.
+          local d = fd_getc(ufd)
+          if d == nil then buf[#buf + 1] = "\\"; had_nl = false; break end
+          if d == "\n" then -- swallow both (continuation), unless -N counts raw
+          else buf[#buf + 1] = d end
+        elseif not ndelim and c == dch then had_nl = true; break -- -N ignores the delimiter
+        else buf[#buf + 1] = c end
       end
       line = got and table.concat(buf) or nil
-    elseif nchars then
-      line = io.read(nchars)
-      if line and not ndelim then local nl = line:find("\n", 1, true); if nl then line = line:sub(1, nl - 1) end end
-    else
-      line = io.read("*L") -- keep the newline so we can tell a full line from EOF
-      if line then
-        if line:sub(-1) == "\n" then line = line:sub(1, -2) else had_nl = false end
-        -- line continuation (non -r): a trailing odd number of backslashes means
-        -- the last was `\<newline>` — drop it and splice the next physical line.
-        while not raw and had_nl and (#(line:match("(\\*)$") or "") % 2 == 1) do
-          line = line:sub(1, -2)
-          local nxt = io.read("*L"); if not nxt then break end
-          if nxt:sub(-1) == "\n" then nxt = nxt:sub(1, -2) else had_nl = false end
-          line = line .. nxt
-        end
-      end
     end
     if line == nil then
       sh.status = 1 -- EOF: nothing read
     else
-      if not raw then line = line:gsub("\\(.)", "%1") end
       local ifs = sh.vars["IFS"] and sh:get("IFS") or " \t\n"
-      -- IFS whitespace chars (trimmed from a single/last field, unlike other IFS chars)
-      local ws = ifs:gsub("[^ \t\n]", "")
-      local function trim(s)
-        if ws == "" then return s end
-        local pat = "[" .. ws:gsub("(%W)", "%%%1") .. "]"
-        return (s:gsub("^" .. pat .. "+", ""):gsub(pat .. "+$", ""))
-      end
       if arr then
         sh:array_assign(arr, rt.ifs_split(ifs, line), false)
       elseif ndelim then -- -N: no IFS processing; first var gets everything, rest empty
@@ -1434,14 +1462,9 @@ local function exec_simple(sh, args, hook)
         else sh:set_str(vars[1], line); for k = 2, #vars do sh:set_str(vars[k], "") end end
       elseif #vars == 0 then
         sh:set_str("REPLY", line) -- REPLY: the raw line, no IFS stripping
-      elseif #vars == 1 then
-        sh:set_str(vars[1], trim(line)) -- single var: strip only leading/trailing IFS ws
       else
-        local fields = rt.ifs_split(ifs, line)
-        for k = 1, #vars - 1 do sh:set_str(vars[k], fields[k] or "") end
-        local rest = {}
-        for m = #vars, #fields do rest[#rest + 1] = fields[m] end
-        sh:set_str(vars[#vars], table.concat(rest, " "))
+        local fields = read_split(ifs, line, #vars)
+        for k = 1, #vars do sh:set_str(vars[k], fields[k] or "") end
       end
       sh.status = had_nl and 0 or 1
     end
@@ -1566,11 +1589,30 @@ local function run_loop_body(sh, body, hook)
   error(err) -- exit/return/real error propagates
 end
 
+-- compound commands whose trailing redirs (`done < f`, `fi > f`) apply to the
+-- whole construct; handled generically below (simple/group/subshell do their own).
+local COMPOUND_REDIR = { whilec = true, forc = true, forin = true, ["if"] = true,
+  case = true, arithcmd = true, dbracket = true }
+
 local function exec_stmt(sh, st, hook)
   local t = st.t
   -- set -n (noexec): a non-interactive shell reads but does not execute. Once on,
   -- every later statement (including `set +n`) is skipped — matches bash.
   if sh.opt_n and not sh.opt_i then sh.status = 0; return end
+  -- redirs trailing a compound command: apply around the whole thing, then run it
+  -- with redirs temporarily detached (so this guard doesn't re-fire).
+  if st.redirs and COMPOUND_REDIR[t] then
+    local rd = st.redirs
+    local save, ok = apply_redirs(sh, rd)
+    if not ok then sh.status = 1; restore_redirs(save); return end
+    local savedout = sh.out; sh.out = io.write
+    st.redirs = nil
+    local pok, err = pcall(exec_stmt, sh, st, hook)
+    st.redirs = rd
+    io.flush(); sh.out = savedout; restore_redirs(save)
+    if not pok then error(err) end
+    return
+  end
   if st.line and not sh.in_trap then sh.cur_line = st.line end -- $LINENO (frozen in traps)
   if t == "assign" then
     local rb = sh.vars[sh:deref(st.name)]

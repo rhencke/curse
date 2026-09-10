@@ -587,8 +587,38 @@ local function make_parser(src)
   local i, n, line = 1, #src, 1
   local loopId = 0
   local heredocs_pending = {} -- heredoc redirs awaiting their body (filled at line end)
+  -- Collect the bodies of any heredocs opened on the just-parsed line. Called
+  -- after a simple command AND after a compound command's redirs (group,
+  -- subshell, etc.), since `{ ...; } <<EOF` also opens a heredoc.
+  local function collect_heredocs()
+    if #heredocs_pending == 0 then return end
+    while i <= n and src:sub(i, i) ~= "\n" do i = i + 1 end -- to end of command line
+    if i <= n then i = i + 1; line = line + 1 end
+    for _, hd in ipairs(heredocs_pending) do
+      local blines = {}
+      while i <= n do
+        local le = src:find("\n", i, true) or (n + 1)
+        local lstr = src:sub(i, le - 1)
+        if hd.strip then lstr = lstr:gsub("^\t+", "") end
+        i = le + 1; line = line + 1
+        if lstr == hd.delim then break end
+        blines[#blines + 1] = lstr
+      end
+      hd.body = #blines > 0 and (table.concat(blines, "\n") .. "\n") or ""
+    end
+    heredocs_pending = {}
+  end
   local function ws()  -- skip spaces/tabs (not newlines)
     while i <= n and src:sub(i, i):match("[ \t]") do i = i + 1 end
+  end
+  local parse_redir -- forward (defined in make_parser body)
+  -- Redirections trailing a compound command (loop/if/case): `done < f`,
+  -- `done <<EOF … EOF`. Collect them and any heredoc bodies they open.
+  local function tail_redirs()
+    local redirs = {}
+    while true do ws(); local r = parse_redir(); if r then redirs[#redirs + 1] = r else break end end
+    collect_heredocs()
+    return #redirs > 0 and redirs or nil
   end
   local function skipsep()  -- skip separators: whitespace, newlines, ;, comments
     while i <= n do
@@ -687,7 +717,7 @@ local function make_parser(src)
   -- Try to read a redirection at the current position; returns a redir table and
   -- advances i, or nil (leaving i put) if there isn't one. Handles
   -- [N]> [N]>> [N]< >&M N>&M &> [N]>&- ; heredocs (<<) are left to parse_command.
-  local function parse_redir()
+  parse_redir = function()
     local p = i
     local fd = src:match("^%d+", p)
     local q = fd and (p + #fd) or p
@@ -761,7 +791,7 @@ local function make_parser(src)
           init = a:match("%S") and arith(a) or nil,
           cond = b:match("%S") and arith(b) or nil,
           step = c:match("%S") and arith(c) or nil,
-          body = body_stmts }
+          body = body_stmts, redirs = tail_redirs() }
       end
       -- for NAME in WORDS
       local s, e = src:find("^[%a_][%w_]*", i)
@@ -786,7 +816,7 @@ local function make_parser(src)
       skipsep()
       if peekword() == "do" then i = i + 2 end
       local body_stmts = parse_stmts({ done = true })
-      return { t = "forin", id = id, line = ln, name = name, words = words, body = body_stmts }
+      return { t = "forin", id = id, line = ln, name = name, words = words, body = body_stmts, redirs = tail_redirs() }
     end
     -- while/until COND; do BODY; done  — COND is a command list; the loop runs
     -- while its exit status is 0 (until: while it's non-zero). `while (( expr ))`
@@ -797,7 +827,7 @@ local function make_parser(src)
       local cond = parse_stmts({ ["do"] = true })
       local body_stmts = parse_stmts({ done = true })
       return { t = "whilec", id = id, line = ln, cond = cond, body = body_stmts,
-        negate = (kind == "until") }
+        negate = (kind == "until"), redirs = tail_redirs() }
     end
     -- if COND; then BODY [elif COND; then BODY]* [else BODY] fi — COND is a
     -- command list; the branch is taken when its exit status is 0.
@@ -815,7 +845,7 @@ local function make_parser(src)
         elseif term == "fi" then break
         elseif term ~= "elif" then error("if: missing fi") end
       end
-      return { t = "if", line = ln, clauses = clauses }
+      return { t = "if", line = ln, clauses = clauses, redirs = tail_redirs() }
     end
     -- (( expr )) arithmetic command: exit status 0 if expr != 0, else 1.
     if src:sub(i, i + 1) == "((" then
@@ -846,6 +876,7 @@ local function make_parser(src)
       local body = parse_stmts({ ["}"] = true })
       local redirs = {}
       while true do ws(); local r = parse_redir(); if r then redirs[#redirs + 1] = r else break end end
+      collect_heredocs()
       return { t = "group", line = line, body = body, redirs = (#redirs > 0 and redirs or nil) }
     end
     if src:sub(i, i) == "(" then
@@ -853,6 +884,7 @@ local function make_parser(src)
       local body = parse_stmts({ [")"] = true })
       local redirs = {}
       while true do ws(); local r = parse_redir(); if r then redirs[#redirs + 1] = r else break end end
+      collect_heredocs()
       return { t = "subshell", line = line, body = body, redirs = (#redirs > 0 and redirs or nil) }
     end
     -- case WORD in  PAT|PAT) BODY ;;  … esac
@@ -921,7 +953,7 @@ local function make_parser(src)
         end
         clauses[#clauses + 1] = { pats = pats, body = body, term = term }
       end
-      return { t = "case", line = ln, subject = subject, clauses = clauses }
+      return { t = "case", line = ln, subject = subject, clauses = clauses, redirs = tail_redirs() }
     end
     -- Parse ONE assignment at the cursor (NAME=… / NAME[i]=… / NAME+=… /
     -- NAME=(array)); returns an assign node, or nil (cursor unchanged) if there
@@ -1045,23 +1077,7 @@ local function make_parser(src)
       end
     end
     -- collect any heredoc bodies (they follow this command's line)
-    if #heredocs_pending > 0 then
-      while i <= n and src:sub(i, i) ~= "\n" do i = i + 1 end -- to end of command line
-      if i <= n then i = i + 1; line = line + 1 end
-      for _, hd in ipairs(heredocs_pending) do
-        local blines = {}
-        while i <= n do
-          local le = src:find("\n", i, true) or (n + 1)
-          local lstr = src:sub(i, le - 1)
-          if hd.strip then lstr = lstr:gsub("^\t+", "") end
-          i = le + 1; line = line + 1
-          if lstr == hd.delim then break end
-          blines[#blines + 1] = lstr
-        end
-        hd.body = #blines > 0 and (table.concat(blines, "\n") .. "\n") or ""
-      end
-      heredocs_pending = {}
-    end
+    collect_heredocs()
     if #words == 0 and #redirs == 0 then
       -- no command: the leading assignments are plain (persistent) statements
       if #assigns == 0 then return nil end
