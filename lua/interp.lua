@@ -1258,8 +1258,43 @@ end
 
 -- Dispatch one already-expanded simple command (no redirs — the caller sets those
 -- up). Builtins first, then user functions, then external.
+-- Run a shell function `cmd` (its body `fn`) with args[2..] as positional params.
+-- A function OVERRIDES a builtin of the same name in bash, so this is dispatched
+-- before the builtin table (except via `command`, which passes no_func).
+local function run_function(sh, cmd, fn, args, hook)
+  sh.calldepth = sh.calldepth + 1 -- OSR gate: no handoff inside a call
+  sh:pushCall(unpack(args, 2))
+  sh.funcstack = sh.funcstack or {}
+  table.insert(sh.funcstack, 1, cmd) -- $FUNCNAME[0] = the function now running
+  local saved_ld = sh.loopdepth; sh.loopdepth = 0 -- break/continue don't cross into a function
+  local ok, err
+  if type(fn) == "function" then ok, err = pcall(fn, sh) -- a COMPILED function closure
+  else ok, err = pcall(exec_list, sh, fn, hook, false) end -- an interp AST body
+  sh.loopdepth = saved_ld
+  table.remove(sh.funcstack, 1)
+  sh:popCall()
+  sh.calldepth = sh.calldepth - 1
+  if not ok then
+    if type(err) == "table" and err.__curse_return then sh.status = err.__curse_return
+    else error(err) end
+  end
+  -- RETURN trap: fires after the function body returns (in the caller's scope),
+  -- preserving the function's exit status.
+  local rt_h = sh.traps and sh.traps.RETURN
+  if rt_h and rt_h ~= "" and not sh.in_return_trap then
+    sh.in_return_trap = true; local saved = sh.status
+    run_trap(sh, rt_h); sh.status = saved; sh.in_return_trap = false
+  end
+end
+
 local function exec_simple(sh, args, hook, no_func)
   local cmd = args[1]
+  -- A user function overrides a builtin of the same name (bash), so it wins here
+  -- — unless invoked via `command` (no_func) or the word is a keyword/assignment
+  -- builtin whose parse shape a function can't stand in for.
+  if cmd ~= nil and not no_func and sh.functions[cmd] then
+    return run_function(sh, cmd, sh.functions[cmd], args, hook)
+  end
   if cmd == nil then sh.status = 0
   elseif cmd == "echo" then
     -- echo [-neE] ARGS: -n suppresses the newline, -e interprets backslash escapes.
@@ -1858,7 +1893,7 @@ local function exec_simple(sh, args, hook, no_func)
     -- builtin [--] NAME args: run NAME only if it's an actual shell builtin.
     local j = 2; if args[j] == "--" then j = j + 1 end
     if args[j] == nil then sh.status = 0
-    elseif BUILTINS[args[j]] then exec_simple(sh, { unpack(args, j) }, hook)
+    elseif BUILTINS[args[j]] then exec_simple(sh, { unpack(args, j) }, hook, true) -- skip functions
     else io.stderr:write("curse: builtin: " .. args[j] .. ": not a shell builtin\n"); sh.status = 1 end
   elseif cmd == "command" then
     local j = 2
@@ -2221,31 +2256,7 @@ local function exec_simple(sh, args, hook, no_func)
       end
     end
     sh.status = 0
-  elseif sh.functions[cmd] and not no_func then -- `command CMD` skips the function lookup
-    local fn = sh.functions[cmd]
-    sh.calldepth = sh.calldepth + 1 -- OSR gate: no handoff inside a call
-    sh:pushCall(unpack(args, 2))
-    sh.funcstack = sh.funcstack or {}
-    table.insert(sh.funcstack, 1, cmd) -- $FUNCNAME[0] = the function now running
-    local saved_ld = sh.loopdepth; sh.loopdepth = 0 -- break/continue don't cross into a function
-    local ok, err
-    if type(fn) == "function" then ok, err = pcall(fn, sh) -- a COMPILED function closure
-    else ok, err = pcall(exec_list, sh, fn, hook, false) end -- an interp AST body
-    sh.loopdepth = saved_ld
-    table.remove(sh.funcstack, 1)
-    sh:popCall()
-    sh.calldepth = sh.calldepth - 1
-    if not ok then
-      if type(err) == "table" and err.__curse_return then sh.status = err.__curse_return
-      else error(err) end
-    end
-    -- RETURN trap: fires after the function body returns (in the caller's scope),
-    -- preserving the function's exit status.
-    local rt_h = sh.traps and sh.traps.RETURN
-    if rt_h and rt_h ~= "" and not sh.in_return_trap then
-      sh.in_return_trap = true; local saved = sh.status
-      run_trap(sh, rt_h); sh.status = saved; sh.in_return_trap = false
-    end
+  elseif sh.functions[cmd] and not no_func then run_function(sh, cmd, sh.functions[cmd], args, hook)
   else sh:exec(unpack(args)) end -- external command
 end
 
