@@ -238,13 +238,19 @@ function Shell:capture_src(src)
   -- middle command doesn't abort — only the cmdsub's final status propagates out.
   local savede = self.opt_e
   if not (self.shopt and self.shopt.inherit_errexit) then self.opt_e = false end
-  local ok, err = pcall(I.run, self, ast)
+  -- Run via exec_list (NOT interp.run): an `exit`/`return` inside $() ends only
+  -- the sub (sets its status), and the parent's EXIT trap must NOT fire here.
+  local ok, err = pcall(I.exec_list, self, ast.stmts, function() end, true)
   self.opt_e = savede
   self.loopdepth = saved_ld
   self.in_subprogram = self.in_subprogram - 1
   self.capturing = saved_cap
   self.out = saved
-  if not ok then error(err) end
+  if not ok then
+    if type(err) == "table" and (err.__curse_exit or err.__curse_return) then
+      self.status = err.__curse_exit or err.__curse_return
+    else error(err) end
+  end
   self.last_cmdsub_status = self.status -- for a command whose argv is empty after expansion
   -- bash strips NUL bytes from command-substitution output ("ignored null byte")
   return (table.concat(buf):gsub("%z", ""):gsub("\n+$", ""))
