@@ -242,7 +242,8 @@ function Shell:capture_src(src)
   self.out = saved
   if not ok then error(err) end
   self.last_cmdsub_status = self.status -- for a command whose argv is empty after expansion
-  return (table.concat(buf):gsub("\n+$", ""))
+  -- bash strips NUL bytes from command-substitution output ("ignored null byte")
+  return (table.concat(buf):gsub("%z", ""):gsub("\n+$", ""))
 end
 
 -- A variable box holds a string value and/or a cached int64. An arithmetic
