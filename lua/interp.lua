@@ -1315,7 +1315,7 @@ end
 
 local function exec_stmt(sh, st, hook)
   local t = st.t
-  if st.line then sh.cur_line = st.line end -- $LINENO
+  if st.line and not sh.in_trap then sh.cur_line = st.line end -- $LINENO (frozen in traps)
   if t == "assign" then
     if st.index then
       sh:array_set(st.name, array_key(sh, st.name, st.index), expand_word(sh, st.rhs), st.append)
@@ -1637,30 +1637,39 @@ end
 
 M.exec_stmt = exec_stmt -- exposed so the compiled CFG can delegate cold statements
 
+-- Run a trap handler string; preserves $LINENO (so an ERR/EXIT trap sees the
+-- failing command's line, not the handler's). Returns true if it called exit.
+local function run_trap(sh, code)
+  local exited, savedline = false, sh.cur_line
+  sh.in_trap = (sh.in_trap or 0) + 1
+  local ok, err = pcall(function()
+    for _, st in ipairs(require("parser").parse(code).stmts) do exec_stmt(sh, st, function() end) end
+  end)
+  sh.in_trap = sh.in_trap - 1; sh.cur_line = savedline
+  if not ok and type(err) == "table" and err.__curse_exit then sh.status = err.__curse_exit; exited = true end
+  return exited
+end
+
 exec_list = function(sh, stmts, hook, toplevel)
   for k = 1, #stmts do
     local st = stmts[k]
     if toplevel then hook("stmt", k) end
     exec_stmt(sh, st, hook)
-    -- errexit: a failing simple command / pipeline (not in a condition) exits. We
-    -- restrict to those two types to avoid the &&/|| short-circuit false-positives.
-    if sh.opt_e and sh.noerr == 0 and sh.status ~= 0 and (st.t == "simple" or st.t == "pipeline") then
-      error({ __curse_exit = sh.status })
+    -- ERR trap + errexit: fire on a failing simple/pipeline outside a condition
+    -- (restricted to those two types to avoid &&/|| short-circuit false-positives).
+    if sh.noerr == 0 and sh.status ~= 0 and (st.t == "simple" or st.t == "pipeline") then
+      local h = sh.traps and sh.traps.ERR
+      if h and h ~= "" and not sh.in_err_trap and (sh.calldepth or 0) == 0 then
+        sh.in_err_trap = true; local saved = sh.status
+        run_trap(sh, h); sh.status = saved; sh.in_err_trap = false
+      end
+      if sh.opt_e then error({ __curse_exit = sh.status }) end
     end
   end
 end
 M.exec_list = exec_list
 
 -- Run a trap handler string; returns true if it called exit (which wins).
-local function run_trap(sh, code)
-  local exited = false
-  local ok, err = pcall(function()
-    for _, st in ipairs(require("parser").parse(code).stmts) do exec_stmt(sh, st, function() end) end
-  end)
-  if not ok and type(err) == "table" and err.__curse_exit then sh.status = err.__curse_exit; exited = true end
-  return exited
-end
-
 local function finish(sh, ok, err)
   if not ok then
     if type(err) == "table" and err.__curse_exit then sh.status = err.__curse_exit
@@ -1700,8 +1709,13 @@ function M.run_lazy(sh, src, hook)
       k = k + 1
       hook("stmt", k)
       exec_stmt(sh, st, hook)
-      if sh.opt_e and sh.noerr == 0 and sh.status ~= 0 and (st.t == "simple" or st.t == "pipeline") then
-        error({ __curse_exit = sh.status })
+      if sh.noerr == 0 and sh.status ~= 0 and (st.t == "simple" or st.t == "pipeline") then
+        local h = sh.traps and sh.traps.ERR
+        if h and h ~= "" and not sh.in_err_trap and (sh.calldepth or 0) == 0 then
+          sh.in_err_trap = true; local saved = sh.status
+          run_trap(sh, h); sh.status = saved; sh.in_err_trap = false
+        end
+        if sh.opt_e then error({ __curse_exit = sh.status }) end
       end
     end
   end))
