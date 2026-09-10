@@ -558,24 +558,54 @@ local regbuf = ffi.new("char[512]") -- opaque regex_t (glibc ~64B; over-allocate
 
 -- Convert a shell glob to a POSIX ERE, anchored. Char classes carry over (with
 -- [!..] -> [^..]); regex-special chars elsewhere are escaped.
-local function glob_to_ere(glob)
-  local out, i = { "^" }, 1
-  while i <= #glob do
+-- Split `body` on top-level `|` (respecting nested parens) — extglob arms.
+local function split_arms(body)
+  local arms, depth, start = {}, 0, 1
+  for k = 1, #body do
+    local ch = body:sub(k, k)
+    if ch == "(" then depth = depth + 1
+    elseif ch == ")" then depth = depth - 1
+    elseif ch == "|" and depth == 0 then arms[#arms + 1] = body:sub(start, k - 1); start = k + 1 end
+  end
+  arms[#arms + 1] = body:sub(start)
+  return arms
+end
+-- Convert a glob (incl. extglob ?(..) *(..) +(..) @(..) !(..)) to an ERE body.
+local EXTOP = { ["?"] = true, ["*"] = true, ["+"] = true, ["@"] = true, ["!"] = true }
+local function glob_conv(glob)
+  local out, i, n = {}, 1, #glob
+  while i <= n do
     local c = glob:sub(i, i)
-    if c == "*" then out[#out + 1] = ".*"
-    elseif c == "?" then out[#out + 1] = "."
+    if EXTOP[c] and glob:sub(i + 1, i + 1) == "(" then
+      local d, j = 1, i + 2
+      while j <= n and d > 0 do
+        local cc = glob:sub(j, j)
+        if cc == "(" then d = d + 1 elseif cc == ")" then d = d - 1; if d == 0 then break end end
+        j = j + 1
+      end
+      local arms = split_arms(glob:sub(i + 2, j - 1))
+      local conv = {}
+      for _, a in ipairs(arms) do conv[#conv + 1] = glob_conv(a) end
+      local group = "(" .. table.concat(conv, "|") .. ")"
+      -- @ = exactly one; ? = 0/1; * = 0+; + = 1+; ! ≈ group (POSIX ERE can't negate)
+      out[#out + 1] = (c == "?" and group .. "?") or (c == "*" and group .. "*")
+        or (c == "+" and group .. "+") or group
+      i = j + 1
+    elseif c == "*" then out[#out + 1] = ".*"; i = i + 1
+    elseif c == "?" then out[#out + 1] = "."; i = i + 1
     elseif c == "[" then
       local j, cls = i + 1, { "[" }
       if glob:sub(j, j) == "!" then cls[#cls + 1] = "^"; j = j + 1
       elseif glob:sub(j, j) == "^" then cls[#cls + 1] = "^"; j = j + 1 end
-      while j <= #glob and glob:sub(j, j) ~= "]" do cls[#cls + 1] = glob:sub(j, j); j = j + 1 end
-      cls[#cls + 1] = "]"; out[#out + 1] = table.concat(cls); i = j
-    elseif c:match("[%.%+%(%)%{%}%|%^%$\\]") then out[#out + 1] = "\\" .. c
-    else out[#out + 1] = c end
-    i = i + 1
+      while j <= n and glob:sub(j, j) ~= "]" do cls[#cls + 1] = glob:sub(j, j); j = j + 1 end
+      cls[#cls + 1] = "]"; out[#out + 1] = table.concat(cls); i = j + 1
+    elseif c:match("[%.%+%(%)%{%}%|%^%$\\]") then out[#out + 1] = "\\" .. c; i = i + 1
+    else out[#out + 1] = c; i = i + 1 end
   end
-  out[#out + 1] = "$"
   return table.concat(out)
+end
+local function glob_to_ere(glob)
+  return "^" .. glob_conv(glob) .. "$"
 end
 
 -- Match `s` against a POSIX ERE. `anchored_glob` false = raw ERE (=~), true = a

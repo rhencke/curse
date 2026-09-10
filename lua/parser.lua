@@ -801,11 +801,34 @@ local function make_parser(src)
         if peekword() == "esac" then i = i + 4; break end
         if i > n then break end
         if src:sub(i, i) == "(" then i = i + 1 end -- optional leading (
-        local patstr = {}
-        while i <= n and src:sub(i, i) ~= ")" do patstr[#patstr + 1] = src:sub(i, i); i = i + 1 end
-        i = i + 1 -- skip )
-        local pats = {}
-        for p in table.concat(patstr):gmatch("[^|]+") do pats[#pats + 1] = (p:gsub("^%s+", ""):gsub("%s+$", "")) end
+        -- read to the clause-terminating ), balancing extglob parens @(a|b) and
+        -- copying quoted sections verbatim (their ) / | are not structural).
+        local patstr, depth = {}, 0
+        while i <= n do
+          local c = src:sub(i, i)
+          if c == ")" and depth == 0 then break end
+          if c == "'" or c == '"' then
+            patstr[#patstr + 1] = c; i = i + 1
+            while i <= n and src:sub(i, i) ~= c do patstr[#patstr + 1] = src:sub(i, i); i = i + 1 end
+            patstr[#patstr + 1] = src:sub(i, i); i = i + 1
+          else
+            if c == "(" then depth = depth + 1 elseif c == ")" then depth = depth - 1 end
+            patstr[#patstr + 1] = c; i = i + 1
+          end
+        end
+        i = i + 1 -- skip the terminating )
+        -- split on top-level | (extglob's internal | is protected by parens)
+        local pats, d2, cur = {}, 0, {}
+        local full = table.concat(patstr)
+        for k = 1, #full do
+          local ch = full:sub(k, k)
+          if ch == "(" then d2 = d2 + 1; cur[#cur + 1] = ch
+          elseif ch == ")" then d2 = d2 - 1; cur[#cur + 1] = ch
+          elseif ch == "|" and d2 == 0 then pats[#pats + 1] = table.concat(cur); cur = {}
+          else cur[#cur + 1] = ch end
+        end
+        pats[#pats + 1] = table.concat(cur)
+        for k = 1, #pats do pats[k] = (pats[k]:gsub("^%s+", ""):gsub("%s+$", "")) end
         local body = {}
         while true do
           local s = skip_sep()
