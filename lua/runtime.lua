@@ -106,6 +106,34 @@ function Shell:split(s)
   return out
 end
 
+-- Bash-correct standalone IFS split (for `read`): whitespace-IFS runs collapse and
+-- trim edges; each non-whitespace-IFS char delimits (empty fields allowed), with a
+-- trailing delimiter not adding a trailing empty.
+function M.ifs_split(ifs, s)
+  local fields, cur = {}, nil
+  local function isws(c) return c == " " or c == "\t" or c == "\n" end
+  local function inifs(c) return c ~= "" and ifs:find(c, 1, true) ~= nil end
+  local function brk() if cur ~= nil then fields[#fields + 1] = cur; cur = nil end end
+  local i, n = 1, #s
+  while i <= n do
+    local c = s:sub(i, i)
+    if inifs(c) then
+      if isws(c) then
+        if cur ~= nil then brk() end
+        i = i + 1; while i <= n and isws(s:sub(i, i)) do i = i + 1 end
+        if i <= n and inifs(s:sub(i, i)) and not isws(s:sub(i, i)) then
+          i = i + 1; while i <= n and isws(s:sub(i, i)) do i = i + 1 end
+        end
+      else
+        if cur == nil then cur = "" end; brk()
+        i = i + 1; while i <= n and isws(s:sub(i, i)) do i = i + 1 end
+      end
+    else cur = (cur or "") .. c; i = i + 1 end
+  end
+  brk()
+  return fields
+end
+
 -- Run an external command via posix_spawnp + waitpid (FFI/libc directly — NOT
 -- /bin/sh, which would recurse when curse IS /bin/sh, and would lose signal
 -- info). We use posix_spawn rather than a manual fork+execvp so spawning from a

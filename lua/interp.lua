@@ -227,39 +227,56 @@ end
 -- expansions split on default-IFS whitespace; quoted text never splits; "$@" /
 -- "${a[@]}" yield one field per element.
 local function expand_to_fields(sh, w)
-  -- fields carry `unq` = did any UNQUOTED content contribute (so glob chars in it
-  -- are eligible for pathname expansion; quoted glob chars are literal).
+  -- Concatenate-then-split model: build the word left to right, splitting the
+  -- chars that came from UNQUOTED expansions on $IFS (default: space/tab/newline),
+  -- while literal/quoted chars are never delimiters. This is what bash does, and
+  -- it handles concatenation ($x-, pre$x) and custom IFS correctly. Fields also
+  -- track `unq` for glob eligibility (quoted glob chars stay literal).
+  local ifs = sh.vars["IFS"] and sh:get("IFS") or " \t\n"
+  local function isws(c) return c == " " or c == "\t" or c == "\n" end
+  local function inifs(c) return c ~= "" and ifs:find(c, 1, true) ~= nil end
   local fields, cur, cur_unq = {}, nil, false
-  local function push() if cur ~= nil then fields[#fields + 1] = { s = cur, unq = cur_unq }; cur = nil; cur_unq = false end end
+  local function brk() if cur ~= nil then fields[#fields + 1] = { s = cur, unq = cur_unq }; cur = nil; cur_unq = false end end
   local function add(s, unq) cur = (cur or "") .. s; if unq then cur_unq = true end end
-  local function split_into(v) -- unquoted expansion: split on IFS whitespace (each field unq)
-    if v == "" then return end
-    local toks = {}
-    for tk in v:gmatch("%S+") do toks[#toks + 1] = tk end
-    if #toks == 0 then push(); return end
-    if v:match("^%s") then push() end
-    cur = (cur or "") .. toks[1]; cur_unq = true
-    for k = 2, #toks do push(); cur = toks[k]; cur_unq = true end
-    if v:match("%s$") then push() end
+  local function feed_split(v) -- unquoted expansion text: split on $IFS
+    local i, n = 1, #v
+    while i <= n do
+      local c = v:sub(i, i)
+      if inifs(c) then
+        if isws(c) then
+          if cur ~= nil then brk() end
+          i = i + 1
+          while i <= n and isws(v:sub(i, i)) do i = i + 1 end
+          if i <= n and inifs(v:sub(i, i)) and not isws(v:sub(i, i)) then
+            i = i + 1; while i <= n and isws(v:sub(i, i)) do i = i + 1 end
+          end
+        else                       -- non-whitespace IFS delimiter
+          if cur == nil then cur = "" end -- a delimiter always ends a field (empty ok)
+          cur_unq = true; brk()
+          i = i + 1
+          while i <= n and isws(v:sub(i, i)) do i = i + 1 end
+        end
+      else
+        add(c, true); i = i + 1
+      end
+    end
   end
   for _, p in ipairs(w.parts) do
     if is_multi(p) then
       local els, star = multi_elems(sh, p)
       if p.q then
         if star then add(table.concat(els, " "), false)
-        else for k = 1, #els do if k == 1 then add(els[k], false) else push(); cur = els[k] end end end
+        else for k = 1, #els do if k > 1 then brk() end; add(els[k], false) end end -- one field per element
       else
-        split_into(table.concat(els, " "))
+        for k = 1, #els do if k > 1 then brk() end; feed_split(els[k]) end
       end
     else
       local s = expand_part_str(sh, p)
-      if p.q or p.lit ~= nil then add(s, not p.q) -- literal (unq) or quoted expansion (not unq)
-      else split_into(s) end                      -- unquoted expansion: split
+      if p.q or p.lit ~= nil then add(s, not p.q) else feed_split(s) end
     end
   end
-  push()
-  -- pathname expansion: a field with unquoted glob metacharacters expands to its
-  -- sorted matches (or stays literal if none — bash default, nullglob off).
+  brk()
+  -- pathname expansion on fields with unquoted glob metacharacters
   local out = {}
   for _, f in ipairs(fields) do
     if f.unq and f.s:find("[*?%[]") then
@@ -387,8 +404,8 @@ local function exec_simple(sh, args, hook)
       sh.status = 1 -- EOF
     else
       if not raw then line = line:gsub("\\(.)", "%1") end
-      local fields = {}
-      for tok in line:gmatch("%S+") do fields[#fields + 1] = tok end
+      local ifs = sh.vars["IFS"] and sh:get("IFS") or " \t\n"
+      local fields = rt.ifs_split(ifs, line)
       if arr then
         sh:array_assign(arr, fields, false)
       elseif #vars == 0 then
