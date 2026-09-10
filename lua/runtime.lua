@@ -413,9 +413,82 @@ local function substr(val, off, len)
   return s
 end
 
+-- ---- real regex via libc POSIX regcomp/regexec (for case globs, =~, and
+-- pathname/glob expansion) — a real engine, unlike Lua patterns. ----
+ffi.cdef [[
+  int regcomp(void *preg, const char *regex, int cflags);
+  int regexec(const void *preg, const char *s, unsigned long nmatch, void *pmatch, int eflags);
+  void regfree(void *preg);
+  void *opendir(const char *name);
+  void *readdir(void *dirp);
+  int closedir(void *dirp);
+]]
+local REG_EXTENDED, REG_NOSUB = 1, 8
+local regbuf = ffi.new("char[512]") -- opaque regex_t (glibc ~64B; over-allocate)
+
+-- Convert a shell glob to a POSIX ERE, anchored. Char classes carry over (with
+-- [!..] -> [^..]); regex-special chars elsewhere are escaped.
+local function glob_to_ere(glob)
+  local out, i = { "^" }, 1
+  while i <= #glob do
+    local c = glob:sub(i, i)
+    if c == "*" then out[#out + 1] = ".*"
+    elseif c == "?" then out[#out + 1] = "."
+    elseif c == "[" then
+      local j, cls = i + 1, { "[" }
+      if glob:sub(j, j) == "!" then cls[#cls + 1] = "^"; j = j + 1
+      elseif glob:sub(j, j) == "^" then cls[#cls + 1] = "^"; j = j + 1 end
+      while j <= #glob and glob:sub(j, j) ~= "]" do cls[#cls + 1] = glob:sub(j, j); j = j + 1 end
+      cls[#cls + 1] = "]"; out[#out + 1] = table.concat(cls); i = j
+    elseif c:match("[%.%+%(%)%{%}%|%^%$\\]") then out[#out + 1] = "\\" .. c
+    else out[#out + 1] = c end
+    i = i + 1
+  end
+  out[#out + 1] = "$"
+  return table.concat(out)
+end
+
+-- Match `s` against a POSIX ERE. `anchored_glob` false = raw ERE (=~), true = a
+-- glob already converted to an anchored ERE. Returns boolean.
+function M.regex_match(s, ere)
+  if ffi.C.regcomp(regbuf, ere, REG_EXTENDED + REG_NOSUB) ~= 0 then return false end
+  local rc = ffi.C.regexec(regbuf, s, 0, nil, 0)
+  ffi.C.regfree(regbuf)
+  return rc == 0
+end
+
 -- Full (anchored) shell-glob match, for `case` patterns.
 function M.glob_match(s, glob)
-  return s:match("^" .. glob_to_lpat(glob) .. "$") ~= nil
+  return M.regex_match(s, glob_to_ere(glob))
+end
+
+-- Pathname (glob) expansion: return the sorted matching paths for `pattern`, or
+-- nil if none (bash default: the word stays literal). Supports an optional
+-- literal directory prefix (dir/*.c, /etc/*.conf); a glob in the directory part
+-- (multi-level like */*.c) is not expanded (returns nil -> literal).
+function M.glob_expand(pattern)
+  local sl = pattern:find("/[^/]*$")
+  local dirpart = sl and pattern:sub(1, sl) or ""
+  local filepat = sl and pattern:sub(sl + 1) or pattern
+  if dirpart:find("[*?%[]") then return nil end
+  if not filepat:find("[*?%[]") then return nil end
+  local scan = dirpart == "" and "." or dirpart
+  local d = ffi.C.opendir(scan); if d == nil then return nil end
+  local ere = glob_to_ere(filepat)
+  if ffi.C.regcomp(regbuf, ere, REG_EXTENDED + REG_NOSUB) ~= 0 then ffi.C.closedir(d); return nil end
+  local hidden = filepat:sub(1, 1) == "."
+  local matches = {}
+  while true do
+    local e = ffi.C.readdir(d); if e == nil then break end
+    local name = ffi.string(ffi.cast("const char *", e) + 19) -- d_name @ 19 (glibc x86-64)
+    if name ~= "." and name ~= ".." and (name:sub(1, 1) ~= "." or hidden) then
+      if ffi.C.regexec(regbuf, name, 0, nil, 0) == 0 then matches[#matches + 1] = dirpart .. name end
+    end
+  end
+  ffi.C.regfree(regbuf); ffi.C.closedir(d)
+  if #matches == 0 then return nil end
+  table.sort(matches)
+  return matches
 end
 
 -- Apply a ${…} operator. `arg`/`arg2` are already word-expanded by the caller;

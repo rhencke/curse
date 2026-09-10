@@ -64,7 +64,7 @@ local stp = TMP .. "/st"
 -- argv.py-based cases are meaningful for both bash and curse.
 local BINPATH = SPEC .. "/bin:" .. ROOT .. "/.bench-lua/shim" -- argv.py + python2 shim
 local function run(cmdstr, cwd)
-  os.execute("cd " .. cwd .. " && { export PATH=" .. BINPATH .. ":$PATH; timeout " .. TIMEOUT ..
+  os.execute("cd " .. cwd .. " && { export LC_ALL=C PATH=" .. BINPATH .. ":$PATH; timeout " .. TIMEOUT ..
     " " .. cmdstr .. " ; } >" .. outp .. " 2>/dev/null; echo $? >" .. stp)
   return readfile(outp) or "", tonumber((readfile(stp) or "0"):match("%d+") or "0")
 end
