@@ -362,6 +362,7 @@ function Shell:aget(name)
   name = self:deref(name)
   local b = self.vars[name]
   if b == nil then return i64(0) end
+  if b.arr then return M.arith_num(b.arr[0] or b.arr["0"] or "0") end -- decays to [0]/["0"]
   if b.n == nil then b.n = M.arith_num(b.s) end -- arith context: honor bases (0x, 010, N#)
   return b.n
 end

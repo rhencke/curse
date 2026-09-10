@@ -145,6 +145,9 @@ eval = function(sh, e)
   if k == "num" then return rt.arith_num(e.v) end
   if k == "var" then
     if e.idx then return rt.arith_num(sh:array_get(e.name, tonumber(rt.i64_to_str(eval(sh, e.idx))))) end
+    if sh.opt_u and sh.vars[sh:deref(e.name)] == nil and sh:special_get(e.name) == "" then
+      io.stderr:write("curse: " .. e.name .. ": unbound variable\n"); error({ __curse_exit = 1 })
+    end
     return sh:aget(e.name)
   end
   if k == "param" then return rt.str_to_i64(sh:param(e.n)) end
