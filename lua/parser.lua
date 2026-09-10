@@ -1276,8 +1276,14 @@ local function make_parser(src)
       if stopset[")"] and src:sub(i, i) == ")" then i = i + 1; return stmts, ")" end
       local pw = peekword()
       if pw and stopset[pw] then i = i + #pw; return stmts, pw end
+      local before = i
       local st = parse_stmt()
-      if st then stmts[#stmts + 1] = st end
+      if st then stmts[#stmts + 1] = st
+      elseif i == before then
+        -- no progress: a stray metacharacter/keyword in command position (`)`, `}`,
+        -- `;;`, `do`, …) — a syntax error, and a guard against an infinite loop.
+        error("syntax error near `" .. src:sub(i, i) .. "'")
+      end
     end
   end
 
