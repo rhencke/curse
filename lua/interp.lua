@@ -891,6 +891,7 @@ local function do_arrayassign(sh, st)
     local auto = 0
     if st.append then
       local mx, b = -1, sh.vars[st.name]
+      if b and b.s ~= nil and not b.arr then b.arr = { [0] = b.s }; b.s = nil; b.n = nil end -- scalar -> [0]
       if b and b.arr then for kk in pairs(b.arr) do if kk > mx then mx = kk end end end
       auto = mx + 1
     end
