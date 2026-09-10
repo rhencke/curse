@@ -250,6 +250,14 @@ end
 -- match bash). A plain scalar has no b.arr; reading $a is ${a[0]}.
 local function arr_max(arr) local m = -1; for k in pairs(arr) do if k > m then m = k end end; return m end
 
+-- `declare -A name`: mark as associative (string keys, insertion-order iteration —
+-- note: real bash iterates in hash order; insertion order matches the common cases).
+function Shell:declare_assoc(name)
+  local b = box(name, self.vars); b.assoc = true; b.arr = b.arr or {}; b.order = b.order or {}
+  b.s = nil; b.n = nil
+end
+function Shell:is_assoc(name) local b = self.vars[name]; return b and b.assoc end
+
 function Shell:array_assign(name, values, append)
   local b = box(name, self.vars)
   if append and b.arr then
@@ -260,19 +268,23 @@ function Shell:array_assign(name, values, append)
     for i = 1, #values do b.arr[i - 1] = values[i] end
   end
 end
-function Shell:array_set(name, idx, val, append)
+function Shell:array_set(name, key, val, append)
   local b = box(name, self.vars)
   if not b.arr then b.arr = {}; if b.s then b.arr[0] = b.s end; b.s = nil; b.n = nil end
-  if append then b.arr[idx] = (b.arr[idx] or "") .. val else b.arr[idx] = val end
+  if b.assoc and b.arr[key] == nil then b.order[#b.order + 1] = key end
+  if append then b.arr[key] = (b.arr[key] or "") .. val else b.arr[key] = val end
 end
-function Shell:array_get(name, idx)
+function Shell:array_get(name, key)
   local b = self.vars[name]
-  if b and b.arr then return b.arr[idx] or "" end
-  if idx == 0 then return self:get(name) end
+  if b and b.arr then return b.arr[key] or "" end
+  if key == 0 then return self:get(name) end
   return ""
 end
 function Shell:array_indices(name)
   local b = self.vars[name]
+  if b and b.assoc then
+    local t = {}; for _, k in ipairs(b.order) do if b.arr[k] ~= nil then t[#t + 1] = k end end; return t
+  end
   if b and b.arr then
     local t = {}; for k in pairs(b.arr) do t[#t + 1] = k end; table.sort(t); return t
   end

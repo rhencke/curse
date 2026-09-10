@@ -158,6 +158,14 @@ M.eval = eval
 
 local expand_word -- forward (expand_part_str expands pexp args via it)
 
+-- Resolve an array subscript to a key: a string (word-expanded) for an
+-- associative array, else an integer (arith-evaluated) for an indexed one.
+local function array_key(sh, name, index_raw)
+  local P = require("parser")
+  if sh:is_assoc(name) then return expand_word(sh, P.parse_word(index_raw)) end
+  return tonumber(rt.i64_to_str(eval(sh, P.arith(index_raw)))) or 0
+end
+
 -- Expand ONE part to its string value (a multi-element @/* part is joined here;
 -- expand_to_fields treats those specially for word-splitting).
 local function expand_part_str(sh, p)
@@ -173,13 +181,13 @@ local function expand_part_str(sh, p)
   elseif p.cmdsub then return sh:capture_src(p.cmdsub)
   elseif p.pexp then
     local pe, P = p.pexp, require("parser")
-    local idxnum
+    local subkey
     if pe.index and pe.index ~= "@" and pe.index ~= "*" then
-      idxnum = tonumber(rt.i64_to_str(eval(sh, P.arith(pe.index)))) or 0
+      subkey = array_key(sh, pe.name, pe.index)
     end
     local arg = pe.arg and expand_word(sh, P.parse_word(pe.arg)) or nil
     local arg2 = pe.arg2 and expand_word(sh, P.parse_word(pe.arg2)) or nil
-    return sh:expand_param(pe, arg, arg2, idxnum)
+    return sh:expand_param(pe, arg, arg2, subkey)
   end
   return ""
 end
@@ -192,13 +200,23 @@ expand_word = function(sh, w)
   return table.concat(buf)
 end
 
--- A part that expands to multiple elements: $@ / $* / ${a[@]} / ${a[*]}.
+-- A part that expands to multiple elements: $@ / $* / ${a[@]} / ${a[*]} /
+-- ${!a[@]} (keys). ${#a[@]} (op="len") is a single count, NOT multi.
 local function is_multi(p)
-  return (p.special == "@" or p.special == "*")
-    or (p.pexp and (p.pexp.index == "@" or p.pexp.index == "*"))
+  if not p.pexp then return p.special == "@" or p.special == "*" end
+  if p.pexp.op == "len" then return false end
+  return p.pexp.index == "@" or p.pexp.index == "*"
 end
 local function multi_elems(sh, p) -- returns element list, star?
-  if p.pexp then return sh:array_values(p.pexp.name), (p.pexp.index == "*") end
+  if p.pexp then
+    local star = (p.pexp.index == "*")
+    if p.pexp.op == "indices" then -- ${!a[@]} -> the keys/indices
+      local ix = sh:array_indices(p.pexp.name); local t = {}
+      for i = 1, #ix do t[i] = tostring(ix[i]) end
+      return t, star
+    end
+    return sh:array_values(p.pexp.name), star
+  end
   local els = {}; for i = 1, sh.nparams do els[i] = sh.params[i] end
   return els, (p.special == "*")
 end
@@ -298,14 +316,22 @@ local function exec_simple(sh, args, hook)
     for j = 2, #args do sh.vars[args[j]] = nil end
     sh.status = 0
   elseif cmd == "export" or cmd == "declare" or cmd == "typeset" then
-    -- export/declare NAME[=val]…: set the var and push to the process env so
-    -- posix_spawn children inherit it. Flags (-x/-i/…) are skipped.
+    -- export/declare [-A] NAME[=val]…: set the var; export also pushes to the
+    -- process env so posix_spawn children inherit it. -A marks associative.
+    local doexport, assoc = (cmd == "export"), false
     for j = 2, #args do
       local a = args[j]
-      if a:sub(1, 1) ~= "-" then
+      if a:sub(1, 1) == "-" and #a > 1 then
+        if a:find("A") then assoc = true end
+      else
         local nm, val = a:match("^([%a_][%w_]*)=(.*)$")
-        if nm then sh:set_str(nm, val); C.setenv(nm, val, 1)
-        elseif a:match("^[%a_][%w_]*$") then C.setenv(a, sh:get(a), 1) end
+        if nm then
+          if assoc then sh:declare_assoc(nm) end
+          sh:set_str(nm, val); if doexport then C.setenv(nm, val, 1) end
+        elseif a:match("^[%a_][%w_]*$") then
+          if assoc then sh:declare_assoc(a)
+          elseif doexport then C.setenv(a, sh:get(a), 1) end
+        end
       end
     end
     sh.status = 0
@@ -404,8 +430,7 @@ local function exec_stmt(sh, st, hook)
   local t = st.t
   if t == "assign" then
     if st.index then
-      local idx = tonumber(rt.i64_to_str(eval(sh, require("parser").arith(st.index)))) or 0
-      sh:array_set(st.name, idx, expand_word(sh, st.rhs), st.append)
+      sh:array_set(st.name, array_key(sh, st.name, st.index), expand_word(sh, st.rhs), st.append)
     elseif st.arith then
       sh:aset(st.name, eval(sh, st.arith))
     elseif st.append then
