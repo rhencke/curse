@@ -312,6 +312,14 @@ arith_resolve = function(sh, s)
   return r
 end
 
+-- Division/modulo by zero is a fatal arithmetic error (bash aborts the current
+-- command with status 1 and a diagnostic). Tagged __curse_matherr so a caller
+-- that runs code in a protected context (compgen -F) can recover from it.
+local function arith_div0()
+  io.stderr:write("curse: division by 0\n")
+  error({ __curse_exit = 1, __curse_matherr = true })
+end
+
 eval = function(sh, e)
   local k = e.k
   if k == "num" then return rt.arith_num(e.v) end
@@ -345,8 +353,8 @@ eval = function(sh, e)
     if op == "+" then return l + r end
     if op == "-" then return l - r end
     if op == "*" then return l * r end
-    if op == "/" then return l / r end
-    if op == "%" then return l % r end
+    if op == "/" then if r == i64(0) then arith_div0() end; return l / r end
+    if op == "%" then if r == i64(0) then arith_div0() end; return l % r end
     if op == "==" then return b2i(l == r) end
     if op == "!=" then return b2i(l ~= r) end
     if op == "<" then return b2i(l < r) end
@@ -371,8 +379,9 @@ eval = function(sh, e)
       local cur = iv and rt.arith_num(sh:array_get(e.name, iv)) or sh:aget(e.name)
       local o = e.op:sub(1, 1)
       if o == "+" then v = cur + v elseif o == "-" then v = cur - v
-      elseif o == "*" then v = cur * v elseif o == "/" then v = cur / v
-      elseif o == "%" then v = cur % v end
+      elseif o == "*" then v = cur * v
+      elseif o == "/" then if v == i64(0) then arith_div0() end; v = cur / v
+      elseif o == "%" then if v == i64(0) then arith_div0() end; v = cur % v end
     end
     if iv then sh:array_set(e.name, iv, rt.i64_to_str(v)); return v end
     return sh:aset(e.name, v)
@@ -1696,8 +1705,8 @@ local function exec_simple(sh, args, hook)
     if args[j] == nil then sh.status = 0
     else exec_simple(sh, { unpack(args, j) }, hook) end -- run rest, bypassing functions (approx)
   elseif cmd == "compgen" then
-    -- compgen [-A action|-f|-d|-c|-a|-b|-k|-v|-e] [-W wl] [-P pre] [-S suf] [prefix]
-    local actions, wordlist, prefix, bad, cpre, csuf, xfilter = {}, nil, nil, false, "", "", nil
+    -- compgen [-A action|-f|-d|-c|…] [-W wl] [-F func] [-P pre] [-S suf] [-X filt] [word]
+    local actions, wordlist, prefix, bad, cpre, csuf, xfilter, funcname = {}, nil, nil, false, "", "", nil, nil
     local VALID = { ["function"] = 1, alias = 1, builtin = 1, keyword = 1, variable = 1,
       command = 1, file = 1, directory = 1, setopt = 1, shopt = 1, arrayvar = 1,
       export = 1, helptopic = 1, user = 1, hostname = 1, group = 1, job = 1, service = 1,
@@ -1712,23 +1721,41 @@ local function exec_simple(sh, args, hook)
       elseif a == "-P" then cpre = args[j + 1] or ""; j = j + 2
       elseif a == "-S" then csuf = args[j + 1] or ""; j = j + 2
       elseif a == "-X" then xfilter = args[j + 1]; j = j + 2
-      elseif a == "-F" or a == "-G" or a == "-C" or a == "-o" then j = j + 2 -- take+ignore
+      elseif a == "-F" then funcname = args[j + 1]; j = j + 2
+      elseif a == "-G" or a == "-C" or a == "-o" then j = j + 2 -- take+ignore
       elseif a:match("^-[fdcabkvegujs]+$") then for ch in a:sub(2):gmatch(".") do actions[#actions + 1] = SHORT[ch] end; j = j + 1
       elseif a:sub(1, 1) == "-" and #a > 1 then j = j + 1
-      else prefix = a; j = j + 1 end
+      else if prefix == nil then prefix = a end; j = j + 1 end -- the word is the first operand
     end
     if bad then io.stderr:write("curse: compgen: invalid action\n"); sh.status = 2
     else
       local out, seen = {}, {}
       local function emit(x) if (not prefix or x:sub(1, #prefix) == prefix) and not seen[x] then seen[x] = true; out[#out + 1] = x end end
-      local function names(tbl) local t = {}; for k in pairs(tbl) do t[#t + 1] = k end; table.sort(t); return t end
-      -- -W words keep their insertion order; -A action results are sorted together.
+      if funcname then
+        -- -F NAME: set the completion context vars bash exposes, call the function,
+        -- and take its COMPREPLY verbatim. bash does NOT prefix-filter -F results —
+        -- the function itself is responsible for that; only -X/-P/-S post-process.
+        sh:array_assign("COMP_WORDS", {}, false)
+        sh:set_str("COMP_CWORD", "-1"); sh:set_str("COMP_LINE", ""); sh:set_str("COMP_POINT", "0")
+        if sh.functions[funcname] then
+          local ok, err = pcall(exec_simple, sh, { funcname, "compgen", prefix or "", "" }, hook)
+          if ok then
+            for _, v in ipairs(sh:array_values("COMPREPLY")) do out[#out + 1] = v end
+          elseif not (type(err) == "table" and err.__curse_matherr) then
+            error(err) -- exit/return/real errors propagate; only a math fault is caught
+          end -- fatal arith error in the function: no candidates, status 1 (below)
+        else
+          for _, v in ipairs(sh:array_values("COMPREPLY")) do out[#out + 1] = v end
+        end
+      else
+      -- -W words keep their insertion order; each -A action is sorted within itself,
+      -- and actions emit in the order given (bash does not globally merge-sort them).
       if wordlist then
         for _, w in ipairs(rt.ifs_split(sh.vars["IFS"] and sh:get("IFS") or " \t\n", wordlist)) do emit(w) end
       end
-      local acc = {}
-      local function add(x) acc[#acc + 1] = x end
       for _, act in ipairs(actions) do
+        local acc = {}
+        local function add(x) acc[#acc + 1] = x end
         if act == "function" then for n in pairs(sh.functions) do add(n) end
         elseif act == "alias" then for n in pairs(sh.aliases) do add(n) end
         elseif act == "builtin" then for n in pairs(BUILTINS) do add(n) end
@@ -1746,9 +1773,10 @@ local function exec_simple(sh, args, hook)
           for n in pairs(BUILTINS) do add(n) end; for n in pairs(sh.functions) do add(n) end
           for n in pairs(sh.aliases) do add(n) end; for n in pairs(KEYWORDS) do add(n) end
         end
+        table.sort(acc)
+        for _, n in ipairs(acc) do emit(n) end
       end
-      table.sort(acc)
-      for _, n in ipairs(acc) do emit(n) end
+      end
       if xfilter and xfilter ~= "" then -- -X PAT removes matches; -X !PAT keeps only matches
         local neg = xfilter:sub(1, 1) == "!"
         local pat = neg and xfilter:sub(2) or xfilter
@@ -2424,7 +2452,13 @@ local function exec_stmt(sh, st, hook)
     sh.bg_pids[#sh.bg_pids + 1] = pid
     sh.status = 0
   elseif t == "arithcmd" then
-    sh.status = truth(eval(sh, st.expr)) and 0 or 1
+    -- A `(( expr ))` command (standalone or as an if/while condition) is NOT fatal
+    -- on a division-by-zero — it just yields status 1 and execution continues
+    -- (unlike a `$(( ))` word expansion, which aborts the command list).
+    local ok, v = pcall(eval, sh, st.expr)
+    if ok then sh.status = truth(v) and 0 or 1
+    elseif type(v) == "table" and v.__curse_matherr then sh.status = 1
+    else error(v) end
   elseif t == "dbracket" then
     sh.status = eval_dbracket(sh, st.expr) and 0 or 1
   elseif t == "case" then

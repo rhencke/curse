@@ -111,9 +111,11 @@ emit_value = function(e, lifted)
   if k == "bin" then
     local l, r = emit_value(e.l, lifted), emit_value(e.r, lifted)
     local op = e.op
-    if op == "+" or op == "-" or op == "*" or op == "/" or op == "%" then
+    if op == "+" or op == "-" or op == "*" then
       return "(" .. l .. " " .. op .. " " .. r .. ")"
     end
+    if op == "/" then return ("rt.idiv(%s, %s)"):format(l, r) end -- fatal on /0
+    if op == "%" then return ("rt.imod(%s, %s)"):format(l, r) end
     if CMP[op] then return "((" .. l .. " " .. CMP[op] .. " " .. r .. ") and 1LL or 0LL)" end
     if op == "&&" then return "(((" .. l .. ") ~= 0LL and (" .. r .. ") ~= 0LL) and 1LL or 0LL)" end
     if op == "||" then return "(((" .. l .. ") ~= 0LL or (" .. r .. ") ~= 0LL) and 1LL or 0LL)" end
