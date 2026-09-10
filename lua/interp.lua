@@ -835,7 +835,7 @@ local function exec_simple(sh, args, hook)
     -- the process env so posix_spawn children inherit it. -A marks associative,
     -- -p prints declarations.
     local doexport, assoc, printmode, nref, plusn = (cmd == "export"), false, false, false, false
-    local funcnames, funcbody = false, false
+    local funcnames, funcbody, iattr = false, false, false
     local rest = {}
     for j = 2, #args do
       local a = args[j]
@@ -847,6 +847,7 @@ local function exec_simple(sh, args, hook)
         if a:find("n") then nref = true end
         if a:find("F") then funcnames = true end
         if a:find("f") then funcbody = true end
+        if a:find("i") then iattr = true end
       elseif a:sub(1, 1) == "+" and #a > 1 then
         if a:find("n") then plusn = true end
       else rest[#rest + 1] = a end
@@ -882,6 +883,8 @@ local function exec_simple(sh, args, hook)
         local nm, val = a:match("^([%a_][%w_]*)=(.*)$")
         if nm then
           if nref then sh:make_nameref(nm, val)
+          elseif iattr then -- declare -i: arith-evaluate the value, mark integer
+            sh:aset(nm, eval(sh, require("parser").arith(val))); sh.vars[nm].int = true
           else
             if assoc then sh:declare_assoc(nm) end
             sh:set_str(nm, val); if doexport then C.setenv(nm, val, 1) end
@@ -889,6 +892,7 @@ local function exec_simple(sh, args, hook)
         elseif a:match("^[%a_][%w_]*$") then
           if plusn then sh:unref(a)
           elseif nref then sh:make_nameref(a)
+          elseif iattr then sh.vars[a] = sh.vars[a] or {}; sh.vars[a].int = true
           elseif assoc then sh:declare_assoc(a)
           elseif doexport then C.setenv(a, sh:get(a), 1) end
         end
@@ -1204,9 +1208,19 @@ local function exec_stmt(sh, st, hook)
     elseif st.arith then
       sh:aset(st.name, eval(sh, st.arith))
     elseif st.append then
-      sh:set_str(st.name, sh:get(st.name) .. expand_word(sh, st.rhs))
+      local b = sh.vars[sh:deref(st.name)]
+      if b and b.int then -- integer var: += is arithmetic addition
+        sh:aset(st.name, sh:aget(st.name) + eval(sh, require("parser").arith(expand_word(sh, st.rhs))))
+      else
+        sh:set_str(st.name, sh:get(st.name) .. expand_word(sh, st.rhs))
+      end
     else
-      sh:set_str(st.name, expand_word(sh, st.rhs))
+      local b = sh.vars[sh:deref(st.name)]
+      if b and b.int then -- integer var (declare -i): assign arith-evaluates
+        sh:aset(st.name, eval(sh, require("parser").arith(expand_word(sh, st.rhs))))
+      else
+        sh:set_str(st.name, expand_word(sh, st.rhs))
+      end
     end
     sh.status = 0
   elseif t == "arrayassign" then
