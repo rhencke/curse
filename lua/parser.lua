@@ -204,9 +204,20 @@ end
 -- {special}; anything with an operator becomes {pexp={name, op, arg, arg2}} which
 -- Shell:expand_param interprets. `arg`/`arg2` are raw text (the caller expands
 -- them before applying the operator, so ${v:-$x} and pattern vars work).
-local function split_subst(s) -- "pat/repl" or "pat" -> pat, repl
-  local slash = s:find("/", 1, true)
-  if slash then return s:sub(1, slash - 1), s:sub(slash + 1) end
+-- Split ${v/pat/repl} into pat, repl. The separator is the first `/` that is
+-- NOT at position 1 (bash treats a `/` right after the operator as pattern text,
+-- so ${x////c} is pat=`/` repl=`c`), NOT backslash-escaped, and NOT inside
+-- single/double quotes. No separator -> the whole thing is the pattern.
+local function split_subst(s)
+  local i, n, q = 1, #s, nil
+  while i <= n do
+    local c = s:sub(i, i)
+    if c == "\\" then i = i + 2
+    elseif q then if c == q then q = nil end; i = i + 1
+    elseif c == "'" or c == '"' then q = c; i = i + 1
+    elseif c == "/" and i > 1 then return s:sub(1, i - 1), s:sub(i + 1)
+    else i = i + 1 end
+  end
   return s, ""
 end
 local function parse_paramexp(inner)
