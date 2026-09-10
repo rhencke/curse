@@ -754,7 +754,7 @@ local BUILTINS = {
   eval = 1, source = 1, ["."] = 1, ["break"] = 1, ["continue"] = 1, ["true"] = 1,
   exec = 1, readonly = 1, umask = 1, alias = 1, unalias = 1, shopt = 1, wait = 1, trap = 1,
   mapfile = 1, readarray = 1, compgen = 1, complete = 1, compopt = 1,
-  pushd = 1, popd = 1, dirs = 1,
+  pushd = 1, popd = 1, dirs = 1, builtin = 1,
 }
 M.BUILTINS = BUILTINS -- exposed so the compiled backend delegates the same set
 local KEYWORDS = {
@@ -1555,8 +1555,15 @@ local function exec_simple(sh, args, hook)
       else sh:echo(k == "file" and p or args[j]) end
     end
     sh.status = allok and 0 or 1
+  elseif cmd == "builtin" then
+    -- builtin CMD args: run CMD as a shell builtin (skipping functions/aliases).
+    if args[2] == nil then sh.status = 0
+    else exec_simple(sh, { unpack(args, 2) }, hook) end -- builtins dispatch before functions here
   elseif cmd == "command" then
-    exec_simple(sh, { unpack(args, 2) }, hook) -- run rest, bypassing functions (approx)
+    local j = 2
+    while args[j] == "-p" do j = j + 1 end -- -p: use default PATH (ignored)
+    if args[j] == nil then sh.status = 0
+    else exec_simple(sh, { unpack(args, j) }, hook) end -- run rest, bypassing functions (approx)
   elseif cmd == "compgen" then
     -- compgen [-A action|-f|-d|-c|-a|-b|-k|-v|-e] [-W wl] [-P pre] [-S suf] [prefix]
     local actions, wordlist, prefix, bad, cpre, csuf, xfilter = {}, nil, nil, false, "", "", nil
