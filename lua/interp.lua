@@ -777,14 +777,19 @@ local function multi_elems(sh, p) -- returns element list, star?
     if pe.op == "sub" then -- array slice
       local off = arith_int(sh, pe.arg and expand_word(sh, P.parse_word(pe.arg)) or nil) or 0
       local len = pe.arg2 and arith_int(sh, expand_word(sh, P.parse_word(pe.arg2))) or nil
-      if pe.name ~= "@" and pe.name ~= "*" and not sh:is_assoc(pe.name) and off >= 0 then
-        -- sparse indexed array: a non-negative offset selects by INDEX VALUE
-        -- (elements whose index >= off), then length is a COUNT of those.
-        local idx = sh:array_indices(pe.name); local out = {}
-        for i = 1, #idx do if idx[i] >= off then out[#out + 1] = els[i] end end
-        if len ~= nil then local t = {}; for i = 1, math.min(len, #out) do t[i] = out[i] end; out = t end
+      if pe.name ~= "@" and pe.name ~= "*" and not sh:is_assoc(pe.name) then
+        -- indexed (possibly sparse) array: select by INDEX VALUE (elements whose
+        -- index >= off), length is a COUNT. A negative offset counts from the
+        -- highest index + 1 (bash), not from the element count.
+        local idx = sh:array_indices(pe.name)
+        if off < 0 then off = (idx[#idx] or -1) + 1 + off end
+        local out = {}
+        if off >= 0 then -- an out-of-bounds negative offset (off < 0 here) is empty
+          for i = 1, #idx do if idx[i] >= off then out[#out + 1] = els[i] end end
+          if len ~= nil then local t = {}; for i = 1, math.min(len, #out) do t[i] = out[i] end; out = t end
+        end
         els = out
-      else -- $@/$* and assoc, or a negative offset: position-based
+      else -- $@/$* and assoc: position-based
         els = array_slice(els, off, len)
       end
     elseif pe.op == "-" and #els == 0 then -- unset/empty array: the default
