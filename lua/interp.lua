@@ -150,7 +150,13 @@ local function expand_word(sh, w)
       elseif p.special == "@" or p.special == "*" then buf[#buf + 1] = sh:paramsJoin(" ")
       elseif p.special == "?" then buf[#buf + 1] = tostring(sh.status) end
     elseif p.arith then buf[#buf + 1] = rt.i64_to_str(eval(sh, require("parser").arith(p.arith)))
-    elseif p.cmdsub then buf[#buf + 1] = sh:capture_src(p.cmdsub) end
+    elseif p.cmdsub then buf[#buf + 1] = sh:capture_src(p.cmdsub)
+    elseif p.pexp then
+      local P = require("parser")
+      local arg = p.pexp.arg and expand_word(sh, P.parse_word(p.pexp.arg)) or nil
+      local arg2 = p.pexp.arg2 and expand_word(sh, P.parse_word(p.pexp.arg2)) or nil
+      buf[#buf + 1] = sh:expand_param(p.pexp, arg, arg2)
+    end
   end
   return table.concat(buf)
 end

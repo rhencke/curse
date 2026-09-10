@@ -244,6 +244,101 @@ function Shell:aset(name, n)
   return b.n
 end
 
+-- ---- parameter expansion ${var OP arg} ----
+-- Convert a shell glob to a Lua pattern fragment (for #/%/// operators). Handles
+-- * ? and [..]/[!..]; escapes Lua-magic chars elsewhere.
+local function glob_to_lpat(glob)
+  local out, i = {}, 1
+  while i <= #glob do
+    local c = glob:sub(i, i)
+    if c == "*" then out[#out + 1] = ".*"
+    elseif c == "?" then out[#out + 1] = "."
+    elseif c == "[" then
+      local j = i + 1; local neg = false
+      if glob:sub(j, j) == "!" or glob:sub(j, j) == "^" then neg = true; j = j + 1 end
+      local cls = {}
+      while j <= #glob and glob:sub(j, j) ~= "]" do cls[#cls + 1] = glob:sub(j, j); j = j + 1 end
+      out[#out + 1] = "[" .. (neg and "^" or "") .. table.concat(cls) .. "]"
+      i = j
+    elseif c:match("[%(%)%.%%%+%-%^%$%]]") then out[#out + 1] = "%" .. c
+    else out[#out + 1] = c end
+    i = i + 1
+  end
+  return table.concat(out)
+end
+local function strip_prefix(val, glob, longest)
+  local lp = "^" .. glob_to_lpat(glob) .. "$"
+  if longest then
+    for k = #val, 0, -1 do if val:sub(1, k):match(lp) then return val:sub(k + 1) end end
+  else
+    for k = 0, #val do if val:sub(1, k):match(lp) then return val:sub(k + 1) end end
+  end
+  return val
+end
+local function strip_suffix(val, glob, longest)
+  local lp = "^" .. glob_to_lpat(glob) .. "$"
+  if longest then
+    for k = 1, #val + 1 do if val:sub(k):match(lp) then return val:sub(1, k - 1) end end
+  else
+    for k = #val + 1, 1, -1 do if val:sub(k):match(lp) then return val:sub(1, k - 1) end end
+  end
+  return val
+end
+local function subst(val, glob, repl, all)
+  local lp = glob_to_lpat(glob)
+  repl = repl:gsub("%%", "%%%%") -- literal repl
+  if all then return (val:gsub(lp, repl)) end
+  local s, e = val:find(lp)
+  if s then return val:sub(1, s - 1) .. repl .. val:sub(e + 1) end
+  return val
+end
+local function substr(val, off, len)
+  local o = tonumber(off) or 0
+  if o < 0 then o = #val + o end
+  if o < 0 then o = 0 end
+  local s = val:sub(o + 1)
+  if len and len ~= "" then
+    local l = tonumber(len) or 0
+    if l < 0 then s = s:sub(1, #s + l) else s = s:sub(1, l) end
+  end
+  return s
+end
+
+-- Apply a ${…} operator. `arg`/`arg2` are already word-expanded by the caller.
+function Shell:expand_param(pe, arg, arg2)
+  local name, op = pe.name, pe.op
+  local val, isset
+  if name:match("^%d+$") then
+    local nn = tonumber(name); val = self:param(nn); isset = (nn <= self.nparams)
+  elseif name == "@" or name == "*" then
+    val = self:paramsJoin(" "); isset = self.nparams > 0
+  else
+    isset = self.vars[name] ~= nil; val = self:get(name)
+  end
+  arg = arg or ""
+  if op == "len" then return tostring(#val) end
+  if op == ":-" then return val ~= "" and val or arg end
+  if op == "-" then return isset and val or arg end
+  if op == ":+" then return val ~= "" and arg or "" end
+  if op == "+" then return isset and arg or "" end
+  if op == ":=" then if val == "" then self:set_str(name, arg); return arg end return val end
+  if op == "=" then if not isset then self:set_str(name, arg); return arg end return val end
+  if op == ":?" then if val == "" then error({ __curse_exit = 1 }) end return val end
+  if op == "?" then if not isset then error({ __curse_exit = 1 }) end return val end
+  if op == "#" then return strip_prefix(val, arg, false) end
+  if op == "##" then return strip_prefix(val, arg, true) end
+  if op == "%" then return strip_suffix(val, arg, false) end
+  if op == "%%" then return strip_suffix(val, arg, true) end
+  if op == "/" then return subst(val, arg, arg2 or "", false) end
+  if op == "//" then return subst(val, arg, arg2 or "", true) end
+  if op == "sub" then return substr(val, arg, arg2) end
+  if op == "^^" then return val:upper() end
+  if op == "^" then return val:sub(1, 1):upper() .. val:sub(2) end
+  if op == ",," then return val:lower() end
+  if op == "," then return val:sub(1, 1):lower() .. val:sub(2) end
+  return val
+end
+
 function Shell:echo(...)
   local n = select("#", ...)
   for i = 1, n do

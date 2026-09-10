@@ -124,8 +124,57 @@ local function grab_dparen(src, i)
   error("unterminated ((")
 end
 
+-- Parse the inside of ${ … } into a word part. Plain forms stay {var}/{param}/
+-- {special}; anything with an operator becomes {pexp={name, op, arg, arg2}} which
+-- Shell:expand_param interprets. `arg`/`arg2` are raw text (the caller expands
+-- them before applying the operator, so ${v:-$x} and pattern vars work).
+local function split_subst(s) -- "pat/repl" or "pat" -> pat, repl
+  local slash = s:find("/", 1, true)
+  if slash then return s:sub(1, slash - 1), s:sub(slash + 1) end
+  return s, ""
+end
+local function parse_paramexp(inner)
+  if inner == "" then return { lit = "" } end
+  if inner == "#" then return { special = "#" } end
+  if inner:sub(1, 1) == "#" then return { pexp = { name = inner:sub(2), op = "len" } } end
+  local name, rest = inner:match("^([%a_][%w_]*)(.*)$")
+  if not name then name, rest = inner:match("^(%d+)(.*)$") end
+  if not name then name, rest = inner:match("^([@*])(.*)$") end
+  if not name then return { var = inner } end
+  if rest == "" then
+    if name:match("^%d+$") then return { param = tonumber(name) } end
+    if name == "@" or name == "*" then return { special = name } end
+    return { var = name }
+  end
+  local two, one = rest:sub(1, 2), rest:sub(1, 1)
+  if two == ":-" or two == ":=" or two == ":+" or two == ":?" then
+    return { pexp = { name = name, op = two, arg = rest:sub(3) } }
+  elseif one == "-" or one == "=" or one == "+" or one == "?" then
+    return { pexp = { name = name, op = one, arg = rest:sub(2) } }
+  elseif two == "##" then return { pexp = { name = name, op = "##", arg = rest:sub(3) } }
+  elseif one == "#" then return { pexp = { name = name, op = "#", arg = rest:sub(2) } }
+  elseif two == "%%" then return { pexp = { name = name, op = "%%", arg = rest:sub(3) } }
+  elseif one == "%" then return { pexp = { name = name, op = "%", arg = rest:sub(2) } }
+  elseif two == "//" then
+    local p, r = split_subst(rest:sub(3)); return { pexp = { name = name, op = "//", arg = p, arg2 = r } }
+  elseif one == "/" then
+    local p, r = split_subst(rest:sub(2)); return { pexp = { name = name, op = "/", arg = p, arg2 = r } }
+  elseif two == "^^" then return { pexp = { name = name, op = "^^" } }
+  elseif one == "^" then return { pexp = { name = name, op = "^" } }
+  elseif two == ",," then return { pexp = { name = name, op = ",," } }
+  elseif one == "," then return { pexp = { name = name, op = "," } }
+  elseif one == ":" then
+    local body = rest:sub(2)
+    local off, len = body:match("^(.-):(.+)$")
+    if off then return { pexp = { name = name, op = "sub", arg = off, arg2 = len } } end
+    return { pexp = { name = name, op = "sub", arg = body } }
+  end
+  return { var = name }
+end
+M.parse_paramexp = parse_paramexp
+
 -- A word is a list of parts:
---   {lit=s} | {var=name} | {arith=src} | {param=n} | {special=c}
+--   {lit=s} | {var=name} | {arith=src} | {param=n} | {special=c} | {pexp=…}
 local function parse_word(w)
   local parts, i = {}, 1
   while i <= #w do
@@ -146,7 +195,7 @@ local function parse_word(w)
         parts[#parts + 1] = { cmdsub = w:sub(i + 2, j - 1) }; i = j + 1
       elseif n == "{" then
         local e = w:find("}", i + 2, true)
-        parts[#parts + 1] = { var = w:sub(i + 2, e - 1) }; i = e + 1
+        parts[#parts + 1] = parse_paramexp(w:sub(i + 2, e - 1)); i = e + 1
       elseif n:match("%d") then
         parts[#parts + 1] = { param = tonumber(n) }; i = i + 2 -- $1..$9 (single digit)
       elseif n == "#" or n == "@" or n == "*" or n == "?" then

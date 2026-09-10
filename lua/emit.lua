@@ -94,6 +94,8 @@ local function emit_word(w, lifted)
       parts[#parts + 1] = "rt.i64_to_str(" .. emit_value(require("parser").arith(p.arith), lifted) .. ")"
     elseif p.cmdsub then -- $( … ): run the inner program capturing stdout (interpreted; I/O-bound)
       parts[#parts + 1] = ("sh:capture_src(%q)"):format(p.cmdsub)
+    elseif p.pexp then
+      error("curse-nocompile: ${..} operator") -- interp handles it; compiled falls back
     end
   end
   if #parts == 0 then return '""' end
