@@ -956,8 +956,14 @@ local function make_parser(src)
         if src:sub(i, i) == "\n" then line = line + 1; i = i + 1 -- continuation inside [[ ]]
         elseif i > n or src:sub(i, i + 1) == "]]" then if src:sub(i, i + 1) == "]]" then i = i + 2 end; break
         else
+          local before = i
           local w = word()
-          if w == "" then break end
+          if w == "" then
+            -- word() stalled on a bare metacharacter (`;`, `)`, `<`, `>`, …) that
+            -- is literal inside [[ ]] (e.g. part of a regex operand). Consume it as
+            -- its own token so the tokenizer makes progress instead of looping.
+            if i == before then w = src:sub(i, i); i = i + 1 else break end
+          end
           local c1 = w:sub(1, 1)
           toks[#toks + 1] = w
           quoted[#toks] = (c1 == '"' or c1 == "'")
