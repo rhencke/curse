@@ -505,7 +505,7 @@ local BUILTINS = {
   read = 1, getopts = 1, printf = 1, ["local"] = 1, command = 1, type = 1, pwd = 1,
   eval = 1, source = 1, ["."] = 1, ["break"] = 1, ["continue"] = 1, ["true"] = 1,
   exec = 1, readonly = 1, umask = 1, alias = 1, unalias = 1, shopt = 1, wait = 1, trap = 1,
-  mapfile = 1, readarray = 1,
+  mapfile = 1, readarray = 1, compgen = 1, complete = 1, compopt = 1,
 }
 local KEYWORDS = {
   ["if"] = 1, ["then"] = 1, ["else"] = 1, ["elif"] = 1, ["fi"] = 1, ["for"] = 1,
@@ -1033,6 +1033,80 @@ local function exec_simple(sh, args, hook)
     sh.status = allok and 0 or 1
   elseif cmd == "command" then
     exec_simple(sh, { unpack(args, 2) }, hook) -- run rest, bypassing functions (approx)
+  elseif cmd == "compgen" then
+    -- compgen [-A action|-f|-d|-c|-a|-b|-k|-v] [-W wordlist] [-F func] [prefix]
+    local actions, wordlist, prefix, bad = {}, nil, nil, false
+    local VALID = { ["function"] = 1, alias = 1, builtin = 1, keyword = 1, variable = 1,
+      command = 1, file = 1, directory = 1, setopt = 1, shopt = 1, arrayvar = 1 }
+    local SHORT = { f = "file", d = "directory", c = "command", a = "alias", b = "builtin",
+      k = "keyword", v = "variable", e = "export" }
+    local j = 2
+    while args[j] do
+      local a = args[j]
+      if a == "-A" then local act = args[j + 1]; if not VALID[act] then bad = true end; actions[#actions + 1] = act; j = j + 2
+      elseif a == "-W" then wordlist = args[j + 1]; j = j + 2
+      elseif a == "-F" or a == "-G" or a == "-C" or a == "-P" or a == "-S" or a == "-X" or a == "-o" then j = j + 2 -- take+ignore
+      elseif a:match("^-[fdcabkve]+$") then for ch in a:sub(2):gmatch(".") do actions[#actions + 1] = SHORT[ch] end; j = j + 1
+      elseif a:sub(1, 1) == "-" and #a > 1 then j = j + 1
+      else prefix = a; j = j + 1 end
+    end
+    if bad then io.stderr:write("curse: compgen: invalid action\n"); sh.status = 2
+    else
+      local out, seen = {}, {}
+      local function emit(x) if (not prefix or x:sub(1, #prefix) == prefix) and not seen[x] then seen[x] = true; out[#out + 1] = x end end
+      local function names(tbl) local t = {}; for k in pairs(tbl) do t[#t + 1] = k end; table.sort(t); return t end
+      if wordlist then
+        for _, w in ipairs(rt.ifs_split(sh.vars["IFS"] and sh:get("IFS") or " \t\n", wordlist)) do emit(w) end
+      end
+      for _, act in ipairs(actions) do
+        if act == "function" then for _, n in ipairs(names(sh.functions)) do emit(n) end
+        elseif act == "alias" then for _, n in ipairs(names(sh.aliases)) do emit(n) end
+        elseif act == "builtin" then for _, n in ipairs(names(BUILTINS)) do emit(n) end
+        elseif act == "keyword" then for _, n in ipairs(names(KEYWORDS)) do emit(n) end
+        elseif act == "variable" or act == "arrayvar" then for _, n in ipairs(names(sh.vars)) do emit(n) end
+        elseif act == "command" then
+          for _, n in ipairs(names(BUILTINS)) do emit(n) end
+          for _, n in ipairs(names(sh.functions)) do emit(n) end
+        end
+      end
+      for _, x in ipairs(out) do sh:echo(x) end
+      sh.status = (#out > 0) and 0 or 1
+    end
+  elseif cmd == "complete" then
+    -- complete [-p] [opts] [name…]: store/print completion specs (registration only)
+    if args[2] == nil or args[2] == "-p" then
+      local ns = {}; for n in pairs(sh.complete or {}) do ns[#ns + 1] = n end; table.sort(ns)
+      for _, n in ipairs(ns) do sh:echo(sh.complete[n] .. " " .. n) end
+      sh.status = 0
+    else
+      -- split trailing NAMEs from the option part; -F/-C etc. with no name is a usage error
+      local opts, cmds = { "complete" }, {}
+      local k = 2
+      while args[k] do
+        local a = args[k]
+        if a == "-F" or a == "-C" or a == "-W" or a == "-A" or a == "-o" or a == "-P" or a == "-S" or a == "-X" or a == "-G" then
+          opts[#opts + 1] = a; opts[#opts + 1] = "'" .. (args[k + 1] or "") .. "'"; k = k + 2
+        elseif a:sub(1, 1) == "-" then opts[#opts + 1] = a; k = k + 1
+        else cmds[#cmds + 1] = a; k = k + 1 end
+      end
+      if #cmds == 0 then io.stderr:write("curse: complete: usage error\n"); sh.status = 2
+      else
+        sh.complete = sh.complete or {}
+        for _, c in ipairs(cmds) do sh.complete[c] = table.concat(opts, " ") end
+        sh.status = 0
+      end
+    end
+  elseif cmd == "compopt" then
+    -- only valid inside a completion function; we don't run those, so: usage-error
+    -- on a bad -o value (2), else "not in completion function" (1).
+    for k = 2, #args do
+      if args[k] == "-o" or args[k] == "+o" then
+        local v = args[k + 1]
+        local OK = { default = 1, nospace = 1, filenames = 1, dirnames = 1, bashdefault = 1, plusdirs = 1, nosort = 1 }
+        if not OK[v] then io.stderr:write("curse: compopt: invalid option name\n"); sh.status = 2; return end
+      end
+    end
+    sh.status = 1
   elseif cmd == "pwd" then
     sh:echo(sh:special_get("PWD")); sh.status = 0
   elseif cmd == "umask" then
