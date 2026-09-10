@@ -374,16 +374,21 @@ local function looks_numeric(s)
     or s:match("^%s*[+-]?0[0-7]+%s*$") or s:match("^%s*%d+#[%w@_]+%s*$")
 end
 arith_resolve = function(sh, s)
-  if s == nil or s == "" then return i64(0) end
+  if s == nil or s:match("^%s*$") then return i64(0) end -- unset/blank value -> 0 (bash)
   if looks_numeric(s) then return rt.arith_num(s) end
   sh.arith_depth = (sh.arith_depth or 0) + 1
-  local r = i64(0)
-  if sh.arith_depth <= 40 then
-    local ok, ast = pcall(P.arith, s)
-    if ok then local ok2, v = pcall(eval, sh, ast); if ok2 and v ~= nil then r = v end end
+  if sh.arith_depth > 40 then sh.arith_depth = sh.arith_depth - 1; return i64(0) end -- cycle guard
+  local ok, ast = pcall(P.arith, s)
+  sh.arith_depth = sh.arith_depth - 1 -- balanced BEFORE any error unwinds past here
+  if not ok then -- the value is not a valid arith expression (e.g. "12 34", "1+"): a
+    -- non-fatal syntax error — fails the containing command, script continues.
+    io.stderr:write("curse: " .. s .. ": syntax error in expression\n")
+    error({ __curse_exit = 1, __curse_matherr = true, __curse_experr = true })
   end
-  sh.arith_depth = sh.arith_depth - 1
-  return r
+  -- A nested bad value (rare: `s=t; t='1 2'`) stays swallowed as 0, matching the
+  -- previous behavior; only the directly-resolved value raises.
+  local ok2, v = pcall(eval, sh, ast)
+  return (ok2 and v ~= nil) and v or i64(0)
 end
 
 -- Division/modulo by zero is a fatal arithmetic error (bash aborts the current
@@ -394,6 +399,15 @@ local function arith_div0()
   error({ __curse_exit = 1, __curse_matherr = true })
 end
 
+-- Reading an unset variable in arithmetic under `set -u` is a fatal unbound-
+-- variable error (bash), just like `$var`. Applies to plain reads and to the
+-- read side of `+=`/`++`/`--`, but NOT to a pure `=` assignment (which defines).
+local function arith_nounset(sh, name)
+  if sh.opt_u and sh.vars[sh:deref(name)] == nil and sh:special_get(name) == "" then
+    io.stderr:write("curse: " .. name .. ": unbound variable\n"); error({ __curse_exit = 1 })
+  end
+end
+
 eval = function(sh, e)
   local k = e.k
   if k == "matherr" then -- a deferred arith parse error (bad lvalue): non-fatal in (( ))
@@ -402,10 +416,8 @@ eval = function(sh, e)
   end
   if k == "num" then return rt.arith_num(e.v) end
   if k == "var" then
-    if e.idx then return arith_resolve(sh, sh:array_get(e.name, arith_key(sh, e.name, e.idx))) end
-    if sh.opt_u and sh.vars[sh:deref(e.name)] == nil and sh:special_get(e.name) == "" then
-      io.stderr:write("curse: " .. e.name .. ": unbound variable\n"); error({ __curse_exit = 1 })
-    end
+    if e.idx then arith_nounset(sh, e.name); return arith_resolve(sh, sh:array_get(e.name, arith_key(sh, e.name, e.idx))) end
+    arith_nounset(sh, e.name)
     return arith_resolve(sh, sh:get(e.name))
   end
   if k == "param" then return rt.str_to_i64(sh:param(e.n)) end
@@ -456,6 +468,7 @@ eval = function(sh, e)
     local iv = e.idx and arith_key(sh, e.name, e.idx) or nil
     local v = eval(sh, e.e)
     if e.op ~= "=" then
+      arith_nounset(sh, e.name) -- `x += …` reads x first
       local cur = iv and rt.arith_num(sh:array_get(e.name, iv)) or sh:aget(e.name)
       local o = e.op:sub(1, 1)
       if o == "+" then v = cur + v elseif o == "-" then v = cur - v
@@ -467,6 +480,7 @@ eval = function(sh, e)
     return sh:aset(e.name, v)
   end
   if k == "post" then
+    arith_nounset(sh, e.name) -- x++ / x-- read x first
     if e.idx then
       local iv = arith_key(sh, e.name, e.idx)
       local cur = rt.arith_num(sh:array_get(e.name, iv))
@@ -475,6 +489,7 @@ eval = function(sh, e)
     local cur = sh:aget(e.name); sh:aset(e.name, cur + i64(e.d)); return cur
   end
   if k == "pre" then
+    arith_nounset(sh, e.name) -- ++x / --x read x first
     if e.idx then
       local iv = arith_key(sh, e.name, e.idx)
       local v = rt.arith_num(sh:array_get(e.name, iv)) + i64(e.d)
@@ -810,6 +825,12 @@ local function multi_elems(sh, p) -- returns element list, star?
       local off = arith_int(sh, pe.arg and expand_word(sh, P.parse_word(pe.arg)) or nil) or 0
       -- a PRESENT length (even empty, `${a[@]:0:}`) is a count; empty means 0.
       local len = pe.arg2 and (arith_int(sh, expand_word(sh, P.parse_word(pe.arg2))) or 0) or nil
+      -- Unlike a scalar substring, a NEGATIVE length over @/*/array/assoc is a
+      -- fatal expansion error in bash (aborts the script with status 1).
+      if len and len < 0 then
+        io.stderr:write("curse: " .. len .. ": substring expression < 0\n")
+        error({ __curse_exit = 1 })
+      end
       if pe.name ~= "@" and pe.name ~= "*" and not sh:is_assoc(pe.name) then
         -- indexed (possibly sparse) array: select by INDEX VALUE (elements whose
         -- index >= off), length is a COUNT. A negative offset counts from the
@@ -1195,6 +1216,11 @@ local function do_arrayassign(sh, st)
       end
     end
   end
+  -- An array can't live in the process environment: converting a variable to an
+  -- array drops it from the env (so a child sees nothing), though bash keeps the
+  -- export ATTRIBUTE on the shell variable itself.
+  local b = sh.vars[st.name]
+  if b and b.exported then C.unsetenv(st.name) end
 end
 M.do_arrayassign = do_arrayassign
 
