@@ -1174,8 +1174,9 @@ function Shell:echo(...)
   -- bash's echo/printf flush stdout immediately (sh_chkwrite). This makes output
   -- ordering deterministic across a fork — e.g. `echo a & echo b` prints b then a,
   -- because the parent flushes b before the just-forked child is scheduled. Only
-  -- when writing to the real fd (not into a $()/pipe capture buffer).
-  if self.out == io.write then io.flush() end
+  -- when writing to the real fd (not into a $()/pipe capture buffer). A flush
+  -- error (e.g. a full disk) is a write error -> status 1, like bash's sh_chkwrite.
+  if self.out == io.write and not io.flush() then self.write_err = true end -- full disk etc.
   self.status = 0
 end
 

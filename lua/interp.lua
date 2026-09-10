@@ -1513,6 +1513,7 @@ local function exec_simple(sh, args, hook, no_func)
     local stopped
     if esc then s, stopped = rt.ansi_unescape(s) end -- \c stops all output (incl. the newline)
     sh.out(s); if not nonl and not stopped then sh.out("\n") end
+    if sh.out == io.write and not io.flush() then sh.write_err = true end -- full disk etc.
     sh.status = 0
   elseif cmd == ":" or cmd == "true" then sh.status = 0
   elseif cmd == "false" then sh.status = 1
@@ -2537,7 +2538,9 @@ local function exec_simple(sh, args, hook, no_func)
         io.stderr:write("curse: printf: usage: printf [-v var] format [arguments]\n"); sh.status = 2
       else
         local res, st = sh_printf(args[fi], args, fi + 1)
-        sh.out(res); sh.status = st
+        sh.out(res)
+        if sh.out == io.write and not io.flush() then sh.write_err = true end -- full disk etc.
+        sh.status = st
       end
     end
   elseif cmd == "read" then
@@ -2985,6 +2988,7 @@ local function exec_stmt(sh, st, hook)
       return
     end
     local function run_cmd()
+      sh.write_err = nil -- a builtin sets this on an output write error (e.g. full disk)
       if st.redirs then
         local save, ok = apply_redirs(sh, st.redirs)
         if not ok then
@@ -2997,10 +3001,12 @@ local function exec_stmt(sh, st, hook)
           if redirs_touch_stdout(st.redirs) then sh.out = io.write end
           local pok, err = pcall(exec_simple, sh, args, hook)
           io.flush(); sh.out = savedout; restore_redirs(save)
+          if pok and sh.write_err then sh.status = 1 end -- builtin hit a write error
           if not pok then error(err) end
         end
       else
         exec_simple(sh, args, hook)
+        if sh.write_err then sh.status = 1 end -- builtin hit a write error (e.g. full disk)
       end
     end
     if st.assigns then
