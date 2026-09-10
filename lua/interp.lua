@@ -974,6 +974,18 @@ local function apply_redirs(sh, redirs)
   end
   return save, ok
 end
+-- Does this redirection list target stdout (fd 1)? Used to decide whether to
+-- route captured/builtin output to the real fd 1 vs a $(...) capture buffer.
+local function redirs_touch_stdout(rd)
+  for _, r in ipairs(rd) do
+    if not r.fdvar and (r.op == "outboth" or r.op == "appboth"
+        or (r.fd == 1 and (r.op == "out" or r.op == "app" or r.op == "clobber"
+          or r.op == "dup" or r.op == "rw"))) then
+      return true
+    end
+  end
+  return false
+end
 local function restore_redirs(save)
   for k = #save, 1, -1 do
     local s = save[k]
@@ -2416,7 +2428,7 @@ local function exec_stmt(sh, st, hook)
     local rd = st.redirs
     local save, ok = apply_redirs(sh, rd)
     if not ok then sh.status = 1; restore_redirs(save); return end
-    local savedout = sh.out; sh.out = io.write
+    local savedout = sh.out; if redirs_touch_stdout(rd) then sh.out = io.write end
     st.redirs = nil
     local pok, err = pcall(exec_stmt, sh, st, hook)
     st.redirs = rd
@@ -2587,7 +2599,11 @@ local function exec_stmt(sh, st, hook)
         if not ok then
           sh.status = 1; restore_redirs(save) -- open failed: skip the command
         else
-          local savedout = sh.out; sh.out = io.write
+          -- Only route builtin/captured output to the real fd 1 when a redirect
+          -- actually targets stdout; a stdin-only redirect (heredoc, `<`) must not
+          -- steal fd-1 output away from a $(...) capture buffer.
+          local savedout = sh.out
+          if redirs_touch_stdout(st.redirs) then sh.out = io.write end
           local pok, err = pcall(exec_simple, sh, args, hook)
           io.flush(); sh.out = savedout; restore_redirs(save)
           if not pok then error(err) end
