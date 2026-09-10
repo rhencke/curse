@@ -767,15 +767,19 @@ local function make_parser(src)
       if not s then error("subset: for needs a name or ((") end
       local name = src:sub(s, e); i = e + 1
       ws()
-      if peekword() == "in" then i = i + 2 else error("subset: for NAME needs 'in'") end
       local words = {}
-      while true do
-        ws()
-        local c = src:sub(i, i)
-        if c == ";" or c == "\n" or c == "" or c == "#" then break end
-        if peekword() == "do" then break end
-        local w = word(); if w == "" then break end
-        add_word(words, w)
+      if peekword() == "in" then
+        i = i + 2
+        while true do
+          ws()
+          local c = src:sub(i, i)
+          if c == ";" or c == "\n" or c == "" or c == "#" then break end
+          if peekword() == "do" then break end
+          local w = word(); if w == "" then break end
+          add_word(words, w)
+        end
+      else
+        words = { parse_word('"$@"') } -- `for NAME; do …` iterates the positional params
       end
       loopId = loopId + 1; local id = loopId
       skipsep()

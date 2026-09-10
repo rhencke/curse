@@ -1326,7 +1326,11 @@ local function exec_stmt(sh, st, hook)
   local t = st.t
   if st.line and not sh.in_trap then sh.cur_line = st.line end -- $LINENO (frozen in traps)
   if t == "assign" then
-    if st.index then
+    local rb = sh.vars[sh:deref(st.name)]
+    if rb and rb.ro then -- readonly: reject; a non-interactive shell exits (bash)
+      io.stderr:write("curse: " .. st.name .. ": readonly variable\n")
+      sh.status = 1; error({ __curse_exit = 1 })
+    elseif st.index then
       sh:array_set(st.name, array_key(sh, st.name, st.index), expand_word(sh, st.rhs), st.append)
     elseif st.arith then
       sh:aset(st.name, eval(sh, st.arith))
@@ -1349,9 +1353,12 @@ local function exec_stmt(sh, st, hook)
       end
     end
     -- exit status of an assignment = the last command substitution's, else 0
-    local hascs = false
-    if st.rhs then for _, p in ipairs(st.rhs.parts) do if p.cmdsub then hascs = true; break end end end
-    if not hascs then sh.status = 0 end
+    -- (skip when it was a rejected readonly assignment, which already set status 1)
+    if not (rb and rb.ro) then
+      local hascs = false
+      if st.rhs then for _, p in ipairs(st.rhs.parts) do if p.cmdsub then hascs = true; break end end end
+      if not hascs then sh.status = 0 end
+    end
   elseif t == "arrayassign" then
     do_arrayassign(sh, st)
     sh.status = 0
