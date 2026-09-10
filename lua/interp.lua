@@ -1660,7 +1660,7 @@ local function exec_simple(sh, args, hook)
           -- export attribute: -n / +x clear it (keep the value), else export sets it
           if bb then
             if unexport or plusx then bb.exported = nil; C.unsetenv(nm)
-            elseif doexport then bb.exported = true; C.setenv(nm, sh:get(nm), 1) end
+            elseif doexport or sh.opt_a then bb.exported = true; C.setenv(nm, sh:get(nm), 1) end
           end
         elseif a:match("^[%a_][%w_]*$") then
           if localize then sh:localVar(a) end
@@ -1716,6 +1716,9 @@ local function exec_simple(sh, args, hook)
           if SETOPT[o] then set_opt(sh, SETOPT[o], on) end
           j = j + 2
         end
+      elseif a == "-" then -- bare `-`: turn off -v/-x and stop option processing (rest = params)
+        set_opt(sh, "opt_v", false); set_opt(sh, "opt_x", false); dd = true; j = j + 1; break
+      elseif a == "+" then j = j + 1 -- bare `+`: an ignored no-op flag; keep scanning
       elseif a:match("^[-+][a-zA-Z]+$") then -- short flag bundle: -eu, +u, …
         local on = a:sub(1, 1) == "-"
         for f in a:sub(2):gmatch(".") do
@@ -2121,7 +2124,11 @@ local function exec_simple(sh, args, hook)
       else rest[#rest + 1] = a end
     end
     if not (nref or assoc or plusn) then
-      for _, a in ipairs(rest) do sh:localAssign(a) end
+      for _, a in ipairs(rest) do
+        sh:localAssign(a)
+        if sh.opt_a then local nm = a:match("^([%a_][%w_]*)"); local b = nm and sh.vars[sh:deref(nm)]
+          if b and not b.arr then b.exported = true; C.setenv(nm, sh:get(nm), 1) end end
+      end
     else
       for _, a in ipairs(rest) do
         local nm, val = a:match("^([%a_][%w_]*)=(.*)$")
@@ -2280,6 +2287,11 @@ local function exec_stmt(sh, st, hook)
       else
         sh:set_str(st.name, expand_assign_word(sh, st.rhs))
       end
+    end
+    -- set -a (allexport): a plain scalar assignment auto-exports the variable
+    if sh.opt_a and not st.index then
+      local b = sh.vars[sh:deref(st.name)]
+      if b and not b.arr then b.exported = true; C.setenv(st.name, sh:get(st.name), 1) end
     end
     -- exit status of an assignment = the last command substitution's, else 0
     -- (skip when it was a rejected readonly assignment, which already set status 1)
