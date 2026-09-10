@@ -2891,6 +2891,31 @@ local function exec_stmt(sh, st, hook)
           if not ok and type(err) == "table" then sh.status = err.__curse_exit or err.__curse_return or sh.status
           elseif not ok then error(err) end
           inline_status = sh.status or 0; pids[k] = -1
+        elseif k == nst and sh.capturing then
+          -- inside $(...): the last stage's stdout must land in the capture buffer,
+          -- not the shell's real fd 1. Wire it to a pipe the parent drains into sh.out.
+          local cp = ffi.new("int[2]"); C.pipe(cp)
+          local pid = C.fork()
+          if pid == 0 then
+            local ok, err = pcall(function()
+              if prev_read >= 0 then C.dup2(prev_read, 0); C.close(prev_read) end
+              C.dup2(cp[1], 1); C.close(cp[1]); C.close(cp[0])
+              sh.out = io.write
+              exec_stmt(sh, cmds[k], hook)
+            end)
+            if not ok and type(err) == "table" then sh.status = err.__curse_exit or err.__curse_return or sh.status end
+            io.flush(); C._exit(sh.status or 0)
+          end
+          pids[k] = pid
+          if prev_read >= 0 then C.close(prev_read); prev_read = -1 end
+          C.close(cp[1]) -- parent keeps only the read end; drain to EOF before waitpid
+          local chunks, rbuf = {}, ffi.new("char[65536]")
+          while true do
+            local n = tonumber(C.read(cp[0], rbuf, 65536))
+            if n <= 0 then break end
+            chunks[#chunks + 1] = ffi.string(rbuf, n)
+          end
+          C.close(cp[0]); sh.out(table.concat(chunks))
         else
           local pid = C.fork()
           if pid == 0 then

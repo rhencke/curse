@@ -30,8 +30,9 @@ while true do
   elseif a == "-i" then presets[#presets + 1] = { f = "opt_i", on = true }; ai = ai + 1
   elseif a == "-l" or a == "--login" or a == "-x" or a == "+x" or a == "-v" or a == "+v"
     or a == "-s" or a == "-B" or a == "+B" or a == "-h" or a == "+h" then ai = ai + 1 -- accepted, no-op
-  elseif a == "--" then ai = ai + 1; break -- end of options
-  elseif a == "-" then break -- `-` stops option processing; the script/args follow
+  elseif a == "--help" then
+    io.write("curse: a bash-compatible shell.\nusage: curse [options] [script [args]]\n"); os.exit(0)
+  elseif a == "--" or a == "-" then ai = ai + 1; break -- end of options (script/args follow)
   elseif a == "-u" or a == "+u" then presets[#presets + 1] = { f = "opt_u", on = a == "-u" }; ai = ai + 1
   elseif a == "-C" or a == "+C" then presets[#presets + 1] = { f = "opt_C", on = a == "-C" }; ai = ai + 1
   elseif a == "-o" or a == "+o" then presets[#presets + 1] = { o = arg[ai + 1], on = a == "-o" }; ai = ai + 2
@@ -49,12 +50,43 @@ local function apply(s)
   end
 end
 
+-- Consume one option token into `presets`; returns tokens consumed, or 0 if `a`
+-- is not a recognized option (bash accepts these both leading and after -c).
+local function opt_consume(a, nexta)
+  if a == "-e" or a == "+e" then presets[#presets + 1] = { f = "opt_e", on = a == "-e" }; return 1
+  elseif a == "-u" or a == "+u" then presets[#presets + 1] = { f = "opt_u", on = a == "-u" }; return 1
+  elseif a == "-C" or a == "+C" then presets[#presets + 1] = { f = "opt_C", on = a == "-C" }; return 1
+  elseif a == "-i" then presets[#presets + 1] = { f = "opt_i", on = true }; return 1
+  elseif a == "-l" or a == "--login" or a == "-x" or a == "+x" or a == "-v" or a == "+v"
+    or a == "-s" or a == "-B" or a == "+B" or a == "-h" or a == "+h" then return 1 -- accepted, no-op
+  elseif a == "-o" or a == "+o" then presets[#presets + 1] = { o = nexta, on = a == "-o" }; return 2
+  elseif a == "-O" or a == "+O" then presets[#presets + 1] = { shopt = nexta, on = a == "-O" }; return 2
+  elseif a == "--norc" or a == "--noprofile" then return 1
+  elseif a == "--rcfile" then return 2 end
+  return 0
+end
+
 -- `-c CODE [name [args…]]` — run a command string like `sh -c` (`+c` is accepted).
 if arg[ai] == "-c" or arg[ai] == "+c" then
+  -- bash keeps parsing options after -c until a non-option word (the command
+  -- string) or a terminator (`-`/`--`); an unrecognized option is a usage error.
+  local j = ai + 1
+  while true do
+    local a = arg[j]
+    if a == nil then io.stderr:write("curse: -c: option requires an argument\n"); io.flush(); os.exit(2)
+    elseif a == "--" or a == "-" then j = j + 1; break
+    elseif a:sub(1, 1) == "-" or a:sub(1, 1) == "+" then
+      local n = opt_consume(a, arg[j + 1])
+      if n == 0 then io.stderr:write("curse: " .. a .. ": invalid option\n"); io.flush(); os.exit(2) end
+      j = j + n
+    else break end -- the command string
+  end
+  local code = arg[j]
+  if code == nil then io.stderr:write("curse: -c: option requires an argument\n"); io.flush(); os.exit(2) end
   sh = T.rt.Shell.new(); apply(sh); sh.opt_c = true
-  sh.argv0 = arg[ai + 2] or "curse"
-  for k = ai + 3, #arg do sh.nparams = sh.nparams + 1; sh.params[sh.nparams] = arg[k] end
-  T.interp.run_lazy(sh, arg[ai + 1] or "")
+  sh.argv0 = arg[j + 1] or "curse"
+  for k = j + 2, #arg do sh.nparams = sh.nparams + 1; sh.params[sh.nparams] = arg[k] end
+  T.interp.run_lazy(sh, code)
   io.flush(); os.exit(sh.status or 0)
 end
 

@@ -229,6 +229,7 @@ function Shell:capture_src(src)
   local buf = {}
   local saved = self.out
   self.out = function(x) buf[#buf + 1] = x end
+  local saved_cap = self.capturing; self.capturing = true -- last pipeline stage drains into buf
   self.in_subprogram = (self.in_subprogram or 0) + 1 -- $(...) is a subprogram: ERR trap suppressed
   local saved_ld = self.loopdepth; self.loopdepth = 0 -- break/continue don't cross into $(...)
   -- errexit is NOT inherited into a command sub (unless inherit_errexit): a failing
@@ -239,6 +240,7 @@ function Shell:capture_src(src)
   self.opt_e = savede
   self.loopdepth = saved_ld
   self.in_subprogram = self.in_subprogram - 1
+  self.capturing = saved_cap
   self.out = saved
   if not ok then error(err) end
   self.last_cmdsub_status = self.status -- for a command whose argv is empty after expansion
