@@ -1818,7 +1818,16 @@ local function eval_dbracket(sh, node)
       local caps = rt.regex_captures(l, r) -- real POSIX ERE + BASH_REMATCH
       sh:array_assign("BASH_REMATCH", caps or {}, false)
       return caps ~= nil
-    else return binary(l, op, r) end -- < > -eq -ne -lt …
+    elseif op == "-eq" or op == "-ne" or op == "-lt" or op == "-le" or op == "-gt" or op == "-ge" then
+      -- [[ ]] arithmetic comparisons evaluate each side as an arith EXPRESSION
+      -- (bash: [[ 1+2 -eq 3 ]] is true), unlike `test` which needs integer literals.
+      local P = require("parser")
+      local nl = eval(sh, P.arith(l == "" and "0" or l))
+      local nr = eval(sh, P.arith(r == "" and "0" or r))
+      if op == "-eq" then return nl == nr elseif op == "-ne" then return nl ~= nr
+      elseif op == "-lt" then return nl < nr elseif op == "-le" then return nl <= nr
+      elseif op == "-gt" then return nl > nr else return nl >= nr end
+    else return binary(l, op, r) end -- < > (string comparisons)
   end
   return false
 end
