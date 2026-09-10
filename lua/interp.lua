@@ -1776,9 +1776,9 @@ local function eval_dbracket(sh, node)
   if k == "binary" then
     local l, r, op = expand_word(sh, node.l), expand_word(sh, node.r), node.op
     if op == "==" or op == "=" then
-      if node.rq then return l == r else return rt.glob_match(l, r) end
+      if node.rq then return l == r else return rt.glob_match(l, expand_pattern(sh, node.r)) end
     elseif op == "!=" then
-      if node.rq then return l ~= r else return not rt.glob_match(l, r) end
+      if node.rq then return l ~= r else return not rt.glob_match(l, expand_pattern(sh, node.r)) end
     elseif op == "=~" then
       local caps = rt.regex_captures(l, r) -- real POSIX ERE + BASH_REMATCH
       sh:array_assign("BASH_REMATCH", caps or {}, false)
@@ -2054,7 +2054,7 @@ local function exec_stmt(sh, st, hook)
       local matched = fall
       if not matched then
         for _, pat in ipairs(cl.pats) do
-          local g = expand_word(sh, P.parse_word(pat)) -- resolve vars in the pattern
+          local g = expand_pattern(sh, P.parse_word(pat)) -- vars resolved; quoted metachars literal
           if rt.glob_match(subj, g) then matched = true; break end
         end
       end
