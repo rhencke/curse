@@ -436,7 +436,7 @@ local function build_cfg(stmts, lifted, funcflags, inlinefns)
   -- Statement types with no native compiled form yet -> always delegate.
   local DELEGATE = {
     arithcmd = 1, andor = 1, pipeline = 1, case = 1, group = 1, subshell = 1,
-    dbracket = 1, arrayassign = 1, parse_error = 1, assignlist = 1,
+    dbracket = 1, arrayassign = 1, parse_error = 1, assignlist = 1, background = 1,
   }
 
   -- Build blocks for `st`; its exit flows to pc `after`. Returns st's entry pc.

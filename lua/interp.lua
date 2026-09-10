@@ -419,7 +419,7 @@ local BUILTINS = {
   exit = 1, cd = 1, unset = 1, export = 1, declare = 1, typeset = 1, set = 1, shift = 1,
   read = 1, getopts = 1, printf = 1, ["local"] = 1, command = 1, type = 1, pwd = 1,
   eval = 1, source = 1, ["."] = 1, ["break"] = 1, ["continue"] = 1, ["true"] = 1,
-  exec = 1, readonly = 1, umask = 1, alias = 1, unalias = 1, shopt = 1,
+  exec = 1, readonly = 1, umask = 1, alias = 1, unalias = 1, shopt = 1, wait = 1,
 }
 local KEYWORDS = {
   ["if"] = 1, ["then"] = 1, ["else"] = 1, ["elif"] = 1, ["fi"] = 1, ["for"] = 1,
@@ -592,6 +592,31 @@ local function exec_simple(sh, args, hook)
     sh.status = 0
   elseif cmd == ":" or cmd == "true" then sh.status = 0
   elseif cmd == "false" then sh.status = 1
+  elseif cmd == "wait" then
+    -- wait [-n] [pid…]: reap background jobs. With pids, return the last one's
+    -- status; with none, wait for all (status 0); an invalid arg is status 1.
+    local stbuf = ffi.new("int[1]")
+    local function reap(pid)
+      if C.waitpid(pid, stbuf, 0) < 0 then return 127 end
+      local s = stbuf[0]; local sig = bit.band(s, 0x7f)
+      return (sig ~= 0 and sig ~= 0x7f) and (128 + sig) or bit.rshift(bit.band(s, 0xff00), 8)
+    end
+    local pids, bad = {}, false
+    for k = 2, #args do
+      local a = args[k]
+      if a == "-n" then -- wait for the next; approximate as the first tracked pid
+      elseif a:match("^%d+$") then pids[#pids + 1] = tonumber(a)
+      else bad = true end
+    end
+    if bad then sh.status = 1
+    elseif #pids > 0 then
+      local last = 0
+      for _, p in ipairs(pids) do last = reap(p) end
+      sh.status = last
+    else
+      if sh.bg_pids then for _, p in ipairs(sh.bg_pids) do pcall(reap, p) end; sh.bg_pids = {} end
+      sh.status = 0
+    end
   elseif cmd == "alias" then
     -- alias [name[=value] …]: define or print aliases.
     local j, ok, printed = 2, true, false
@@ -1155,6 +1180,19 @@ local function exec_stmt(sh, st, hook)
     local stbuf = ffi.new("int[1]"); C.waitpid(pid, stbuf, 0)
     local s = stbuf[0]; local sig = bit.band(s, 0x7f)
     sh.status = (sig ~= 0 and sig ~= 0x7f) and (128 + sig) or bit.rshift(bit.band(s, 0xff00), 8)
+  elseif t == "background" then
+    -- cmd & : fork, run in the child; parent records $! and continues (status 0).
+    io.flush()
+    local pid = C.fork()
+    if pid == 0 then
+      local ok, err = pcall(function() sh.out = io.write; exec_stmt(sh, st.cmd, hook) end)
+      if not ok and type(err) == "table" then sh.status = err.__curse_exit or err.__curse_return or sh.status end
+      io.flush(); C._exit(sh.status or 0)
+    end
+    sh.last_bg_pid = tostring(pid)
+    sh.bg_pids = sh.bg_pids or {}
+    sh.bg_pids[#sh.bg_pids + 1] = pid
+    sh.status = 0
   elseif t == "arithcmd" then
     sh.status = truth(eval(sh, st.expr)) and 0 or 1
   elseif t == "dbracket" then

@@ -1005,7 +1005,7 @@ local function make_parser(src)
   -- accepted and run in the foreground for now.
   parse_stmt = function()
     local head = parse_pipeline()
-    local items = nil
+    local items, bg = nil, false
     while true do
       ws()
       local two = src:sub(i, i + 1)
@@ -1013,14 +1013,15 @@ local function make_parser(src)
         i = i + 2
         items = items or { { op = nil, cmd = head } }
         items[#items + 1] = { op = two, cmd = parse_pipeline() }
-      elseif src:sub(i, i) == "&" then
-        i = i + 1 -- background: run in foreground (stdout comparison unaffected)
+      elseif src:sub(i, i) == "&" and src:sub(i + 1, i + 1) ~= "&" then
+        i = i + 1; bg = true; break -- background job
       else
         break
       end
     end
-    if items then return { t = "andor", items = items } end
-    return head
+    local node = items and { t = "andor", items = items } or head
+    if bg then return { t = "background", cmd = node } end
+    return node
   end
 
   -- Parse statements until a terminator keyword in `stopset` (consumed and
