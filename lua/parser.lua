@@ -290,8 +290,15 @@ local function parse_dquote(inner, add)
       else add({ lit = "\\", q = true }); i = i + 1 end
     elseif c == "$" then
       i = parse_dollar(inner, i, add, true)
+    elseif c == "`" then -- `cmd` command substitution inside "…"
+      local j, buf = i + 1, {}
+      while j <= #inner and inner:sub(j, j) ~= "`" do
+        if inner:sub(j, j) == "\\" and inner:sub(j + 1, j + 1):match("[`$\\]") then buf[#buf + 1] = inner:sub(j + 1, j + 1); j = j + 2
+        else buf[#buf + 1] = inner:sub(j, j); j = j + 1 end
+      end
+      add({ cmdsub = table.concat(buf), q = true }); i = j + 1
     else
-      local s, e = inner:find("^[^$\\]+", i); add({ lit = inner:sub(s, e), q = true }); i = e + 1
+      local s, e = inner:find("^[^$\\`]+", i); add({ lit = inner:sub(s, e), q = true }); i = e + 1
     end
   end
 end
@@ -315,8 +322,15 @@ local function parse_word(w)
       parse_dquote(w:sub(i + 1, j - 1), add); i = j + 1
     elseif c == "$" then
       i = parse_dollar(w, i, add, false)
+    elseif c == "`" then -- `cmd` command substitution
+      local j, buf = i + 1, {}
+      while j <= #w and w:sub(j, j) ~= "`" do
+        if w:sub(j, j) == "\\" and w:sub(j + 1, j + 1):match("[`$\\]") then buf[#buf + 1] = w:sub(j + 1, j + 1); j = j + 2
+        else buf[#buf + 1] = w:sub(j, j); j = j + 1 end
+      end
+      add({ cmdsub = table.concat(buf), q = false }); i = j + 1
     else
-      local s, e = w:find("^[^$'\"]+", i)
+      local s, e = w:find("^[^$'\"`]+", i)
       add({ lit = w:sub(s, e), q = false }); i = e + 1
     end
   end
@@ -560,6 +574,12 @@ local function make_parser(src)
         end
       elseif c == "$" and src:sub(i + 1, i + 1) == "{" then
         local e = src:find("}", i + 2, true); i = (e or n) + 1
+      elseif c == "`" then -- `…` command sub: keep it whole (spaces inside included)
+        i = i + 1
+        while i <= n and src:sub(i, i) ~= "`" do
+          if src:sub(i, i) == "\\" then i = i + 2 else i = i + 1 end
+        end
+        i = i + 1
       elseif c:match("[ \t\n;]") then break
       else i = i + 1 end
     end
