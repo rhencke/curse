@@ -316,8 +316,31 @@ function Shell:special_get(name)
   return ""
 end
 
+-- Follow nameref (declare -n) chains to the effective variable name. A nameref
+-- box has b.ref set and b.s holding the target's name (possibly with a subscript,
+-- which is stripped here — element namerefs resolve to the base array).
+function Shell:deref(name)
+  for _ = 1, 100 do
+    local b = self.vars[name]
+    if not b or not b.ref or b.s == nil or b.s == "" then return name end
+    local t = b.s
+    local br = t:find("[", 1, true)
+    name = br and t:sub(1, br - 1) or t
+    if name == "" then return t end
+  end
+  return name
+end
+-- Mark `name` as a nameref (declare -n); target is the referenced variable name.
+function Shell:make_nameref(name, target)
+  local b = box(name, self.vars); b.ref = true
+  if target ~= nil then b.s = target; b.n = nil; b.arr = nil end
+end
+function Shell:unref(name) local b = self.vars[name]; if b then b.ref = nil end end
+function Shell:is_nameref(name) local b = self.vars[name]; return b and b.ref end
+
 -- String value of a var (materialize from the cached int64 if needed).
 function Shell:get(name)
+  name = self:deref(name)
   local b = self.vars[name]
   if b == nil then return self:special_get(name) end
   if b.arr then return b.arr[0] or "" end -- $a == ${a[0]}
@@ -330,6 +353,7 @@ end
 
 -- int64 value of a var for arithmetic (use the cache, else parse the string).
 function Shell:aget(name)
+  name = self:deref(name)
   local b = self.vars[name]
   if b == nil then return i64(0) end
   if b.n == nil then b.n = M.arith_num(b.s) end -- arith context: honor bases (0x, 010, N#)
@@ -337,7 +361,7 @@ function Shell:aget(name)
 end
 
 function Shell:set_str(name, s)
-  local b = box(name, self.vars)
+  local b = box(self:deref(name), self.vars)
   b.s = s; b.n = nil
 end
 
@@ -362,7 +386,7 @@ end
 
 -- Arithmetic write: store the int64, defer the string (lazy).
 function Shell:aset(name, n)
-  local b = box(name, self.vars)
+  local b = box(self:deref(name), self.vars)
   b.n = i64(n); b.s = nil
   return b.n
 end
@@ -375,13 +399,13 @@ local function arr_max(arr) local m = -1; for k in pairs(arr) do if k > m then m
 -- `declare -A name`: mark as associative (string keys, insertion-order iteration —
 -- note: real bash iterates in hash order; insertion order matches the common cases).
 function Shell:declare_assoc(name)
-  local b = box(name, self.vars); b.assoc = true; b.arr = b.arr or {}; b.order = b.order or {}
+  local b = box(self:deref(name), self.vars); b.assoc = true; b.arr = b.arr or {}; b.order = b.order or {}
   b.s = nil; b.n = nil
 end
-function Shell:is_assoc(name) local b = self.vars[name]; return b and b.assoc end
+function Shell:is_assoc(name) local b = self.vars[self:deref(name)]; return b and b.assoc end
 
 function Shell:array_assign(name, values, append)
-  local b = box(name, self.vars)
+  local b = box(self:deref(name), self.vars)
   if append and b.arr then
     local base = arr_max(b.arr) + 1
     for i = 1, #values do b.arr[base + i - 1] = values[i] end
@@ -399,21 +423,21 @@ local function norm_key(b, key)
   return key
 end
 function Shell:array_set(name, key, val, append)
-  local b = box(name, self.vars)
+  local b = box(self:deref(name), self.vars)
   if not b.arr then b.arr = {}; if b.s then b.arr[0] = b.s end; b.s = nil; b.n = nil end
   key = norm_key(b, key)
   if b.assoc and b.arr[key] == nil then b.order[#b.order + 1] = key end
   if append then b.arr[key] = (b.arr[key] or "") .. val else b.arr[key] = val end
 end
 function Shell:array_get(name, key)
-  local b = self.vars[name]
+  local b = self.vars[self:deref(name)]
   if b and b.arr then return b.arr[norm_key(b, key)] or "" end
   if key == 0 then return self:get(name) end
   return ""
 end
 -- unset a single element a[key] (negative allowed for indexed).
 function Shell:array_unset(name, key)
-  local b = self.vars[name]
+  local b = self.vars[self:deref(name)]
   if b and b.arr then b.arr[norm_key(b, key)] = nil end
 end
 -- bash iterates an assoc array in HASH-TABLE order, not insertion order: the
@@ -433,7 +457,7 @@ local function assoc_bucket(key)
 end
 
 function Shell:array_indices(name)
-  local b = self.vars[name]
+  local b = self.vars[self:deref(name)]
   if b and b.assoc then
     local live = {}
     for idx, k in ipairs(b.order) do
@@ -605,8 +629,11 @@ function Shell:expand_param(pe, arg, arg2, idxnum)
     local idx = self:array_indices(name)
     return table.concat(idx, " ")
   end
-  -- ${!name}: indirect — the value of the variable named by $name
+  -- ${!name}: indirect. For a nameref, bash INVERTS this to yield the target NAME;
+  -- otherwise it's the value of the variable named by $name.
   if op == "indirect" then
+    local b = self.vars[name]
+    if b and b.ref and b.s then return b.s end
     local target = idxnum and self:array_get(name, idxnum) or self:get(name)
     return self:get((target:gsub("%[.*$", ""))) -- plain-var target (subscript targets rare)
   end
@@ -621,7 +648,7 @@ function Shell:expand_param(pe, arg, arg2, idxnum)
   elseif name == "@" or name == "*" then
     val = self:paramsJoin(" "); isset = self.nparams > 0
   else
-    isset = self.vars[name] ~= nil; val = self:get(name)
+    isset = self.vars[self:deref(name)] ~= nil; val = self:get(name)
   end
   arg = arg or ""
   if op == "len" then return tostring(#val) end

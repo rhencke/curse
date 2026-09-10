@@ -449,6 +449,7 @@ end
 local function fmt_decl(sh, name)
   local b = sh.vars[name]
   if b == nil then return nil end
+  if b.ref then return "declare -n " .. name .. "=" .. decl_quote(b.s or "") end
   if b.assoc then
     local parts = {}
     for _, k in ipairs(sh:array_indices(name)) do
@@ -554,7 +555,7 @@ local function exec_simple(sh, args, hook)
     -- export/declare [-Apx] NAME[=val]…: set the var; export/-x also pushes it to
     -- the process env so posix_spawn children inherit it. -A marks associative,
     -- -p prints declarations.
-    local doexport, assoc, printmode = (cmd == "export"), false, false
+    local doexport, assoc, printmode, nref, plusn = (cmd == "export"), false, false, false, false
     local rest = {}
     for j = 2, #args do
       local a = args[j]
@@ -563,6 +564,9 @@ local function exec_simple(sh, args, hook)
         if a:find("A") then assoc = true end
         if a:find("p") then printmode = true end
         if a:find("x") then doexport = true end
+        if a:find("n") then nref = true end
+      elseif a:sub(1, 1) == "+" and #a > 1 then
+        if a:find("n") then plusn = true end
       else rest[#rest + 1] = a end
     end
     if printmode then
@@ -583,10 +587,15 @@ local function exec_simple(sh, args, hook)
       for _, a in ipairs(rest) do
         local nm, val = a:match("^([%a_][%w_]*)=(.*)$")
         if nm then
-          if assoc then sh:declare_assoc(nm) end
-          sh:set_str(nm, val); if doexport then C.setenv(nm, val, 1) end
+          if nref then sh:make_nameref(nm, val)
+          else
+            if assoc then sh:declare_assoc(nm) end
+            sh:set_str(nm, val); if doexport then C.setenv(nm, val, 1) end
+          end
         elseif a:match("^[%a_][%w_]*$") then
-          if assoc then sh:declare_assoc(a)
+          if plusn then sh:unref(a)
+          elseif nref then sh:make_nameref(a)
+          elseif assoc then sh:declare_assoc(a)
           elseif doexport then C.setenv(a, sh:get(a), 1) end
         end
       end
@@ -780,7 +789,34 @@ local function exec_simple(sh, args, hook)
     sh.nparams = sh.nparams - nn
     sh.status = 0
   elseif cmd == "local" then
-    for j = 2, #args do sh:localAssign(args[j]) end
+    -- local [-naA] [+n] NAME[=val]…: shadow the var in this scope, honoring
+    -- nameref (-n), indexed (-a) and associative (-A) attributes.
+    local nref, assoc, plusn, rest = false, false, false, {}
+    for j = 2, #args do
+      local a = args[j]
+      if a == "--" then
+      elseif a:sub(1, 1) == "-" and #a > 1 then
+        if a:find("n") then nref = true end
+        if a:find("A") then assoc = true end
+      elseif a:sub(1, 1) == "+" and #a > 1 then
+        if a:find("n") then plusn = true end
+      else rest[#rest + 1] = a end
+    end
+    if not (nref or assoc or plusn) then
+      for _, a in ipairs(rest) do sh:localAssign(a) end
+    else
+      for _, a in ipairs(rest) do
+        local nm, val = a:match("^([%a_][%w_]*)=(.*)$")
+        local vname = nm or a
+        sh:localVar(vname)
+        if nm then
+          if nref then sh:make_nameref(nm, val)
+          else if assoc then sh:declare_assoc(nm) end; sh:set_str(nm, val) end
+        elseif plusn then sh:unref(vname)
+        elseif nref then sh:make_nameref(vname)
+        elseif assoc then sh:declare_assoc(vname) end
+      end
+    end
     sh.status = 0
   elseif sh.functions[cmd] then
     local fn = sh.functions[cmd]
