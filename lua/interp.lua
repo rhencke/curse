@@ -2322,12 +2322,25 @@ local function exec_stmt(sh, st, hook)
     end
   elseif t == "andor" then
     -- run each pipeline, short-circuiting on the running exit status
-    for _, it in ipairs(st.items) do
+    local ran_last = false
+    for k, it in ipairs(st.items) do
       local go
       if it.op == nil then go = true
       elseif it.op == "&&" then go = (sh.status == 0)
       else go = (sh.status ~= 0) end -- "||"
       if go then exec_stmt(sh, it.cmd, hook) end
+      if k == #st.items then ran_last = go end
+    end
+    -- errexit applies to an &&/|| list only via its FINAL operand (bash exempts the
+    -- earlier ones); exit if that operand ran and failed, outside a condition.
+    if ran_last and sh.noerr == 0 and sh.status ~= 0 and sh.opt_e
+        and (sh.in_subprogram or 0) == 0 then
+      local h = sh.traps and sh.traps.ERR
+      if h and h ~= "" and not sh.in_err_trap and ((sh.calldepth or 0) == 0 or sh.opt_errtrace) then
+        sh.in_err_trap = true; local saved = sh.status
+        run_trap(sh, h); sh.status = saved; sh.in_err_trap = false
+      end
+      error({ __curse_exit = sh.status })
     end
   elseif t == "pipeline" then
     -- fork a child per stage wired by pipes; the last stage's exit status is the
