@@ -400,62 +400,82 @@ local function binary(x, op, y)
   if op == "-ge" then return nx >= ny end
   return false
 end
--- Evaluate a `test`/`[` argument list (already expanded). Returns a boolean.
--- Recursive descent with `( )` grouping and `-o` (lowest) / `-a` / `!` precedence.
-local function eval_test(sh, a, lo, hi)
-  local n = hi - lo + 1
-  if n <= 0 then return false end
-  -- ( expr ): strip only when lo's `(` matches hi's `)`
-  if a[lo] == "(" then
-    local depth = 0
-    for j = lo, hi do
-      if a[j] == "(" then depth = depth + 1
-      elseif a[j] == ")" then depth = depth - 1; if depth == 0 then
-        if j == hi then return eval_test(sh, a, lo + 1, hi - 1) end; break
-      end end
-    end
-  end
-  -- -o then -a, paren-aware, only when flanked by operands
-  for _, opw in ipairs({ "-o", "-a" }) do
-    local depth = 0
-    for j = lo, hi do
-      if a[j] == "(" then depth = depth + 1
-      elseif a[j] == ")" then depth = depth - 1
-      elseif a[j] == opw and depth == 0 and j > lo and j < hi then
-        local l, r = eval_test(sh, a, lo, j - 1), eval_test(sh, a, j + 1, hi)
-        if opw == "-o" then return l or r else return l and r end
-      end
-    end
-  end
-  if a[lo] == "!" and n > 1 then return not eval_test(sh, a, lo + 1, hi) end
-  if n == 1 then return a[lo] ~= "" end
-  if n == 2 then
-    -- bash: a 2-arg test needs a unary operator first (`=`, `(`, or a plain word
-    -- is "unary operator expected", status 2 — not a string test).
-    if not TEST_UNOPS[a[lo]] then error({ __test_syntax = a[lo] .. ": unary operator expected" }) end
-    return unary(sh, a[lo], a[lo + 1])
-  end
-  if n == 3 then return binary(a[lo], a[lo + 1], a[lo + 2]) end
-  error({ __test_syntax = "too many arguments" }) -- n>3 with no -a/-o/paren: bash syntax error
-end
+-- Evaluate a `test`/`[` argument list (already expanded), following bash's
+-- test.c exactly: a count-based dispatch (the 1/2/3-argument POSIX special cases
+-- have their own rules) with a recursive-descent parser (or → and → term, with
+-- `-o` lowest / `-a` / `!` precedence and `( )` grouping) for the general case.
+-- Consuming terms strictly left-to-right is what lets `-o`/`-a` be an OPERAND
+-- where an operand is expected — `test 1 -ne 0 -a -o != --` parses as
+-- `(1 -ne 0) -a (-o != --)`, not by grabbing the first `-o` as an operator.
 local function do_test(sh, args)
   local lo, hi = 2, #args
   if args[1] == "[" then
     if args[hi] ~= "]" then sh.status = 2; return end
     hi = hi - 1
   end
-  -- POSIX 3-argument rule (top level only): a binary operator in the MIDDLE binds
-  -- first, so `[ ( = ) ]` is the string compare "(" = ")", not `( )` grouping of
-  -- a lone `=`. Grouping only applies to `( )` in longer (recursively-parsed)
-  -- expressions.
-  local ok, res
-  if hi - lo + 1 == 3 and TEST_BINOPS[args[lo + 1]] then
-    ok, res = pcall(binary, args[lo], args[lo + 1], args[lo + 2])
-  else
-    ok, res = pcall(eval_test, sh, args, lo, hi)
+  local n = hi - lo + 1
+  local pos = lo
+  local expr_, and_, term_
+  -- one argument: true when the string is non-empty.
+  local function one_arg() local v = args[pos] ~= ""; pos = pos + 1; return v end
+  -- two arguments: `! X`, or a unary primary `-X arg` (else "unary operator expected").
+  local function two_args()
+    if args[pos] == "!" then pos = pos + 1; return not one_arg() end
+    if TEST_UNOPS[args[pos]] then local v = unary(sh, args[pos], args[pos + 1]); pos = pos + 2; return v end
+    error({ __test_syntax = args[pos] .. ": unary operator expected" })
   end
-  -- a malformed expression (bad operator, non-integer for -eq, too many args) is a
-  -- SYNTAX error (status 2); a well-formed expression that's false is status 1.
+  -- three arguments: a binary primary in the MIDDLE binds first (so `( = )` is the
+  -- string compare "(" = ")"); then `-a`/`-o` of two operands; then `! X Y`; then
+  -- a parenthesized single operand `( X )`.
+  local function three_args()
+    if TEST_BINOPS[args[pos + 1]] then local v = binary(args[pos], args[pos + 1], args[pos + 2]); pos = pos + 3; return v end
+    if args[pos + 1] == "-a" then local x, y = args[pos] ~= "", args[pos + 2] ~= ""; pos = pos + 3; return x and y end
+    if args[pos + 1] == "-o" then local x, y = args[pos] ~= "", args[pos + 2] ~= ""; pos = pos + 3; return x or y end
+    if args[pos] == "!" then pos = pos + 1; return not two_args() end
+    if args[pos] == "(" and args[pos + 2] == ")" then local v = args[pos + 1] ~= ""; pos = pos + 3; return v end
+    error({ __test_syntax = args[pos + 1] .. ": binary operator expected" })
+  end
+  term_ = function()
+    if pos > hi then error({ __test_syntax = "argument expected" }) end
+    if args[pos] == "!" then pos = pos + 1; return not term_() end
+    if args[pos] == "(" then
+      pos = pos + 1
+      local v = expr_()
+      if args[pos] ~= ")" then error({ __test_syntax = "`)' expected" }) end
+      pos = pos + 1
+      return v
+    end
+    if pos + 2 <= hi and TEST_BINOPS[args[pos + 1]] then
+      local v = binary(args[pos], args[pos + 1], args[pos + 2]); pos = pos + 3; return v
+    end
+    if pos + 1 <= hi and TEST_UNOPS[args[pos]] then
+      local v = unary(sh, args[pos], args[pos + 1]); pos = pos + 2; return v
+    end
+    return one_arg()
+  end
+  and_ = function()
+    local v = term_()
+    while pos <= hi and args[pos] == "-a" do pos = pos + 1; local v2 = term_(); v = v and v2 end
+    return v
+  end
+  expr_ = function()
+    local v = and_()
+    while pos <= hi and args[pos] == "-o" do pos = pos + 1; local v2 = and_(); v = v or v2 end
+    return v
+  end
+  -- a malformed expression (bad operator, non-integer for -eq, leftover tokens) is
+  -- a SYNTAX error (status 2); a well-formed expression that's false is status 1.
+  local ok, res = pcall(function()
+    if n == 0 then return false
+    elseif n == 1 then return one_arg()
+    elseif n == 2 then return two_args()
+    elseif n == 3 then return three_args()
+    else
+      local v = expr_()
+      if pos <= hi then error({ __test_syntax = "too many arguments" }) end
+      return v
+    end
+  end)
   if not ok then sh.status = 2; return end
   sh.status = res and 0 or 1
 end
