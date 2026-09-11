@@ -306,7 +306,12 @@ local function var_is_set(sh, nm)
   local base, sub = nm:match("^([%a_][%w_]*)%[(.+)%]$")
   if base then return sh:is_elem_set(base, array_key(sh, base, sub)) end
   if nm:match("^%d+$") then return tonumber(nm) <= sh.nparams end -- positional param
-  return sh.vars[sh:deref(nm)] ~= nil or sh:special_get(nm) ~= ""
+  local dn = sh:deref(nm)
+  local b = sh.vars[dn]
+  -- a bare array name tests element 0 (`test -v a` == `test -v a[0]`), so an
+  -- empty (declared-but-elementless) array reads as unset, like bash.
+  if b and b.arr then return sh:is_elem_set(dn, array_key(sh, dn, "0")) end
+  return b ~= nil or sh:special_get(nm) ~= ""
 end
 local function unary(sh, op, x)
   if op == "-z" then return x == "" end
@@ -2370,6 +2375,9 @@ local function exec_simple(sh, args, hook, no_func)
           elseif lattr or uattr then
             sh.vars[a] = sh.vars[a] or {}; sh.vars[a].lower = lattr or nil; sh.vars[a].upper = uattr or nil
           elseif assoc then sh:declare_assoc(a)
+          elseif aattr then -- `declare -a`: mark an (empty) indexed array; convert a scalar to [0]
+            local b = sh.vars[a] or {}; sh.vars[a] = b
+            if b.s ~= nil and not b.arr then b.arr = { [0] = b.s }; b.s = nil; b.n = nil else b.arr = b.arr or {} end
           else sh.vars[a] = sh.vars[a] or {} end -- `declare x` creates a declared-but-unset var
           local bb = sh.vars[sh:deref(a)]
           if roattr and bb and not nref then bb.ro = true end -- bash ignores -r when -n is given
@@ -3250,14 +3258,18 @@ local function exec_stmt(sh, st, hook)
       sh:aset(st.name, eval(sh, st.arith))
     elseif st.append then
       local b = sh.vars[sh:deref(st.name)]
-      if b and b.int then -- integer var: += is arithmetic addition
+      if b and b.arr then -- `name+=value` on an array appends to element 0 (bash)
+        sh:array_set(st.name, array_key(sh, st.name, "0"), expand_assign_word(sh, st.rhs), true)
+      elseif b and b.int then -- integer var: += is arithmetic addition
         sh:aset(st.name, sh:aget(st.name) + eval(sh, P.arith(expand_word(sh, st.rhs))))
       else
         sh:set_str(st.name, sh:get(st.name) .. expand_assign_word(sh, st.rhs))
       end
     else
       local b = sh.vars[sh:deref(st.name)]
-      if b and b.int then -- integer var (declare -i): assign arith-evaluates
+      if b and b.arr then -- plain `name=value` on an array var writes element 0 (bash)
+        sh:array_set(st.name, array_key(sh, st.name, "0"), expand_assign_word(sh, st.rhs), false)
+      elseif b and b.int then -- integer var (declare -i): assign arith-evaluates
         sh:aset(st.name, eval(sh, P.arith(expand_word(sh, st.rhs))))
       elseif b and (b.lower or b.upper) then -- declare -l/-u: case-fold on assign
         local v = expand_assign_word(sh, st.rhs)
