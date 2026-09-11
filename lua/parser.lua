@@ -1205,7 +1205,14 @@ local function make_parser(src)
     -- case WORD in  PAT|PAT) BODY ;;  … esac
     if peekword() == "case" then
       local ln = line; i = i + 4; ws()
-      local subject = parse_word(word())
+      -- bash requires the case subject on the same line as `case`; a newline or
+      -- separator before any word (`case\nin esac`, `case;`) is a syntax error.
+      local subw = word()
+      if subw == "" then
+        local c = src:sub(i, i)
+        error("syntax error near `" .. (c == "\n" and "newline" or (c == "" and "esac" or c)) .. "'")
+      end
+      local subject = parse_word(subw)
       while src:sub(i, i):match("[ \t\n]") do if src:sub(i, i) == "\n" then line = line + 1 end; i = i + 1 end
       if peekword() == "in" then i = i + 2
       else error("syntax error: `case' expected `in'") end -- ysh `case (x) { }` etc. rejected
