@@ -638,8 +638,15 @@ end
 -- (leaving the var untouched) so the caller can report the error + status 1. A
 -- nil target (`typeset -n ref` converting an existing var) is NOT validated.
 function Shell:make_nameref(name, target)
-  if target ~= nil and not (target:match("^[%a_][%w_]*$") or target:match("^[%a_][%w_]*%[.+%]$")) then
-    return false
+  local function valid(t) return t:match("^[%a_][%w_]*$") or t:match("^[%a_][%w_]*%[.+%]$") end
+  if target ~= nil then
+    if not valid(target) then return false end -- explicit target (empty/@/*/1/… rejected)
+  else
+    -- converting an existing var: its current value becomes the target — bash
+    -- rejects the conversion if that value is not a valid target (a non-empty
+    -- invalid one; an unset/empty var makes a valid deferred nameref).
+    local b = self.vars[name]
+    if b and b.s and b.s ~= "" and not valid(b.s) then return false end
   end
   local b = box(name, self.vars); b.ref = true
   if target ~= nil then b.s = target; b.n = nil; b.arr = nil end

@@ -2612,7 +2612,11 @@ local function exec_simple(sh, args, hook, no_func)
         elseif a:match("^[%a_][%w_]*$") then
           if localize then sh:localVar(a) end
           if plusn then sh:unref(a)
-          elseif nref then sh:make_nameref(a)
+          elseif nref then
+            if not sh:make_nameref(a) then -- existing value is an invalid nameref target
+              io.stderr:write("curse: " .. cmd .. ": `" .. (sh.vars[a] and sh.vars[a].s or "") .. "': invalid variable name for name reference\n")
+              allok = false
+            end
           elseif iattr then sh.vars[a] = sh.vars[a] or {}; sh.vars[a].int = true
           elseif lattr or uattr then
             sh.vars[a] = sh.vars[a] or {}; sh.vars[a].lower = lattr or nil; sh.vars[a].upper = uattr or nil
@@ -3306,7 +3310,11 @@ local function exec_simple(sh, args, hook, no_func)
             end
           else if assoc then sh:declare_assoc(nm) end; sh:set_str(nm, val) end
         elseif plusn then sh:unref(vname)
-        elseif nref then sh:make_nameref(vname)
+        elseif nref then
+          if not sh:make_nameref(vname) then
+            io.stderr:write("curse: local: `" .. (sh.vars[vname] and sh.vars[vname].s or "") .. "': invalid variable name for name reference\n")
+            lok = false
+          end
         elseif assoc then sh:declare_assoc(vname) end
       end
     end
