@@ -196,6 +196,8 @@ ffi.cdef [[
   unsigned long confstr(int name, char *buf, unsigned long len);
   long long strtoll(const char *nptr, char **endptr, int base);
   unsigned long long strtoull(const char *nptr, char **endptr, int base);
+  struct curse_passwd { char *pw_name; char *pw_passwd; unsigned int pw_uid; unsigned int pw_gid; char *pw_gecos; char *pw_dir; char *pw_shell; };
+  struct curse_passwd *getpwnam(const char *name);
   int kill(int pid, int sig);
   unsigned int geteuid(void);
   unsigned int getegid(void);
@@ -683,7 +685,7 @@ end
 -- Expand a word to a single string (assignment RHS, case subject, arith index —
 -- contexts that do NOT word-split).
 -- Tilde expansion on a word-initial unquoted literal: ~ / ~/… -> $HOME, ~+ -> PWD,
--- ~- -> OLDPWD (~user is left alone).
+-- ~- -> OLDPWD, ~user/… -> that user's home (getpwnam), else the text is literal.
 local function tilde_prefix(sh, s)
   if s:sub(1, 1) ~= "~" then return s end
   local r = s:sub(2)
@@ -693,6 +695,12 @@ local function tilde_prefix(sh, s)
   end
   if (r == "+" or r:sub(1, 2) == "+/") then return sh:pwd() .. r:sub(2) end
   if (r == "-" or r:sub(1, 2) == "-/") then local o = sh:get("OLDPWD"); return o ~= "" and (o .. r:sub(2)) or s end
+  -- ~user / ~user/… : the named user's home directory (unknown user stays literal)
+  local user, tail = r:match("^([^/]+)(.*)$")
+  if user then
+    local pw = C.getpwnam(user)
+    if pw ~= nil then return ffi.string(pw.pw_dir) .. tail end
+  end
   return s
 end
 M.tilde_prefix = tilde_prefix
@@ -719,11 +727,21 @@ local function tilde_assign(sh, s)
   return table.concat(segs, ":")
 end
 
+-- Word-initial unquoted-literal tilde. bash also tilde-expands a word shaped like
+-- `NAME=value` (a valid identifier before `=`) as if it were an assignment RHS —
+-- at the value start and after each `:` — even for a plain command argument
+-- (`echo x=~`). Otherwise only a leading `~` expands.
+local function tilde_word_initial(sh, s)
+  local pre, rest = s:match("^([%a_][%w_]*%+?=)(.*)$")
+  if pre then return pre .. tilde_assign(sh, rest) end
+  return tilde_prefix(sh, s)
+end
+
 expand_word = function(sh, w)
   local buf = {}
   for k, p in ipairs(w.parts) do
     local s = expand_part_str(sh, p)
-    if k == 1 and p.lit ~= nil and not p.q then s = tilde_prefix(sh, s) end
+    if k == 1 and p.lit ~= nil and not p.q then s = tilde_word_initial(sh, s) end
     buf[#buf + 1] = s
   end
   return table.concat(buf)
@@ -997,7 +1015,7 @@ local function expand_to_fields(sh, w)
       end
     else
       local s = expand_part_str(sh, p)
-      if pi == 1 and p.lit ~= nil and not p.q then s = tilde_prefix(sh, s) end -- word-initial ~
+      if pi == 1 and p.lit ~= nil and not p.q then s = tilde_word_initial(sh, s) end -- word-initial / NAME= ~
       if p.q or p.lit ~= nil then add(s, not p.q) else feed_split(s) end
     end
   end
