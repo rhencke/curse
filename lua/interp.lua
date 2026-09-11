@@ -3063,6 +3063,9 @@ local function exec_simple(sh, args, hook, no_func)
           sh:localVar(anm); sh:array_set(anm, array_key(sh, anm, sub), aval, aop == "+=")
         elseif not (a:match("^[%a_][%w_]*$") or a:match("^[%a_][%w_]*%+?=") or a:find("[", 1, true)) then
           io.stderr:write("curse: local: `" .. a .. "': not a valid identifier\n"); lok = false
+        elseif (function() local ln = a:match("^([%a_][%w_]*)"); local lb = ln and sh.vars[sh:deref(ln)]; return lb and lb.ro end)() then
+          -- a readonly var can't be localized (bash errors, skips it, continues)
+          io.stderr:write("curse: local: " .. a:match("^([%a_][%w_]*)") .. ": readonly variable\n"); lok = false
         else
           sh:localAssign(a)
           if sh.opt_a then local nm = a:match("^([%a_][%w_]*)"); local b = nm and sh.vars[sh:deref(nm)]
