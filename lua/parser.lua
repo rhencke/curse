@@ -260,13 +260,18 @@ local function parse_paramexp(inner)
   -- ${-} ${?} ${$} ${!}: the special one-char parameters (like their bare $-, $?,
   -- $$, $! forms). Handled here so `!` isn't mistaken for the indirect prefix.
   if inner == "-" or inner == "?" or inner == "$" or inner == "!" then return { special = inner } end
-  local indices, lenpfx = false, false
+  local indices, lenpfx, sharp_op = false, false, nil
   if inner:sub(1, 1) == "!" then indices = true; inner = inner:sub(2)     -- ${!a[@]}
     -- after `!` (indirect/keys) another prefix operator is a bad substitution
     -- (`${!!x}`, `${!#x}` are not valid — bash errors).
     if inner:sub(1, 1) == "!" or inner:sub(1, 1) == "#" then
       return { pexp = { op = "badsubst", raw = "!" .. inner } }
     end
+  elseif inner:sub(1, 2) == "##" and #inner > 2 then
+    -- ${##X…}: two leading #, then more → the parameter is `#` ($#) and the rest
+    -- is an operator (strip etc.) applied to its value (`${##2}` = ${#} with `#2`
+    -- prefix-strip = 5). ${##} alone is length-of-$# (the `#`-prefix branch below).
+    sharp_op = inner:sub(2)
   elseif inner:sub(1, 1) == "#" then lenpfx = true; inner = inner:sub(2) -- ${#v} / ${#a[@]}
     -- ${#@}/${#*} are the positional-parameter COUNT, same as ${#}/$#.
     if inner == "@" or inner == "*" then return { special = "#" } end
@@ -275,7 +280,9 @@ local function parse_paramexp(inner)
       return { special = inner, lenof = true }
     end
   end
-  local name, rest = inner:match("^([%a_][%w_]*)(.*)$")
+  local name, rest
+  if sharp_op then name, rest = "#", sharp_op
+  else name, rest = inner:match("^([%a_][%w_]*)(.*)$") end
   if not name then name, rest = inner:match("^(%d+)(.*)$") end
   if not name then name, rest = inner:match("^([@*])(.*)$") end
   if not name then

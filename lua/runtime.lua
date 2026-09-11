@@ -590,6 +590,9 @@ end
 local pid_cache
 function Shell:pid() if not pid_cache then pid_cache = tonumber(ffi.C.getpid()) end return pid_cache end
 function Shell:special_get(name)
+  -- $# as a base value for an operator form (`${##2}` = $# with a `#2` strip); the
+  -- bare ${#}/${#@} count and ${#var} length go through their own dedicated nodes.
+  if name == "#" then return tostring(self.nparams) end
   if name == "RANDOM" then return tostring(math.random(0, 32767)) end
   -- $PWD is a real tracked variable (see :pwd / import_env); once unset it reads
   -- empty like any other var, so special_get does NOT fall back to getcwd here.
