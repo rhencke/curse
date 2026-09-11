@@ -2168,14 +2168,24 @@ local function exec_simple(sh, args, hook, no_func)
     sh.dirstack = sh.dirstack or { sh:pwd() }
     local function cd_to(p) C.chdir(p); sh:export_str("PWD", p) end
     local ds = sh.dirstack
-    local function tilde(p) local h = sh:get("HOME"); if h ~= "" and p:sub(1, #h) == h then return "~" .. p:sub(#h + 1) end return p end
+    -- collapse a leading $HOME to ~ only at a path boundary (not a mere prefix:
+    -- HOME=/a/b must NOT turn /a/bc into ~c).
+    local function tilde(p)
+      local h = sh:get("HOME")
+      if h ~= "" and p:sub(1, #h) == h and (#p == #h or p:sub(#h + 1, #h + 1) == "/") then
+        return "~" .. p:sub(#h + 1)
+      end
+      return p
+    end
     if cmd == "dirs" then
       local vflag, pflag, lflag = false, false, false
       for j = 2, #args do
         local a = args[j]
         if a == "-c" then sh.dirstack = { sh:pwd() }; ds = sh.dirstack
         elseif a == "-v" then vflag = true elseif a == "-p" then pflag = true
-        elseif a == "-l" then lflag = true end
+        elseif a == "-l" then lflag = true
+        elseif a:match("^[+-]%d+$") then -- +N / -N select one entry (accepted)
+        else io.stderr:write("curse: dirs: " .. a .. ": invalid option\n"); sh.status = 2; return end
       end
       if not args[2] or not args[2]:find("c") or vflag or pflag or lflag then
         local parts = {}
@@ -2186,13 +2196,14 @@ local function exec_simple(sh, args, hook, no_func)
       end
       sh.status = 0
     elseif cmd == "pushd" then
-      local target
+      local target, nops = nil, 0
       for j = 2, #args do local a = args[j]
-        if a == "--" then target = args[j + 1]; break
+        if a == "--" then target = args[j + 1]; nops = nops + (args[j + 1] and 1 or 0); break
         elseif a:sub(1, 1) == "-" and a ~= "-" and not a:match("^[+-]%d+$") then
           io.stderr:write("curse: pushd: " .. a .. ": invalid option\n"); sh.status = 2; return
-        elseif not target then target = a end
+        else nops = nops + 1; if not target then target = a end end
       end
+      if nops > 1 then io.stderr:write("curse: pushd: too many arguments\n"); sh.status = 1; return end
       if not target then -- swap top two
         if #ds < 2 then io.stderr:write("curse: pushd: no other directory\n"); sh.status = 1; return end
         local prev = sh:pwd()
