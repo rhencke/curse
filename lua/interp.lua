@@ -1496,12 +1496,17 @@ local function run_function(sh, cmd, fn, args, hook)
   sh:pushCall(unpack(args, 2))
   sh.funcstack = sh.funcstack or {}
   table.insert(sh.funcstack, 1, cmd) -- $FUNCNAME[0] = the function now running
+  -- Parallel call-stack for ${BASH_LINENO[@]}/${BASH_SOURCE[@]}: the call SITE's
+  -- line, and the file it ran in (single-file scripts: the main script path).
+  sh.linestack = sh.linestack or {}; table.insert(sh.linestack, 1, sh.cur_line or 0)
+  sh.srcstack = sh.srcstack or {}; table.insert(sh.srcstack, 1, sh.cur_source or sh.argv0 or "")
   local saved_ld = sh.loopdepth; sh.loopdepth = 0 -- break/continue don't cross into a function
   local ok, err
   if type(fn) == "function" then ok, err = pcall(fn, sh) -- a COMPILED function closure
   else ok, err = pcall(exec_list, sh, fn, hook, false) end -- an interp AST body
   sh.loopdepth = saved_ld
   table.remove(sh.funcstack, 1)
+  table.remove(sh.linestack, 1); table.remove(sh.srcstack, 1)
   sh:popCall()
   sh.calldepth = sh.calldepth - 1
   if not ok then

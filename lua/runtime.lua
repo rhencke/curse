@@ -445,6 +445,8 @@ function Shell:special_get(name)
   if name == "EUID" then return tostring(tonumber(ffi.C.geteuid())) end
   if name == "BASHPID" then return tostring(tonumber(ffi.C.getpid())) end -- fresh: changes in subshells
   if name == "FUNCNAME" then return (self.funcstack and self.funcstack[1]) or "" end
+  if name == "BASH_SOURCE" then return self:bash_source_array()[1] or "" end -- [0]: current source
+  if name == "BASH_LINENO" then return self:bash_lineno_array()[1] or "0" end -- [0]: caller's line
   if name == "OSTYPE" then return "linux-gnu" end
   if name == "MACHTYPE" then return "x86_64-pc-linux-gnu" end
   if name == "HOSTTYPE" then return "x86_64" end
@@ -645,8 +647,26 @@ function Shell:funcname_array()
   if not self.opt_c then t[#t + 1] = "main" end
   return t
 end
+-- ${BASH_SOURCE[@]} / ${BASH_LINENO[@]}: parallel to the call stack. BASH_SOURCE[0]
+-- is the current source; BASH_LINENO[0] is where the current function was called.
+-- The bottom frame is the main script / line 0. (Single-file scripts: all the
+-- sources are the main script path — curse doesn't track per-function def files.)
+function Shell:bash_source_array()
+  local t = { self.cur_source or self.argv0 or "" }
+  local ss = self.srcstack or {}
+  for i = 1, #ss do t[#t + 1] = ss[i] end
+  return t
+end
+function Shell:bash_lineno_array()
+  local t = {}
+  local ls = self.linestack or {}
+  for i = 1, #ls do t[i] = tostring(ls[i]) end
+  t[#t + 1] = "0"
+  return t
+end
+local VIRT_ARR = { FUNCNAME = "funcname_array", BASH_SOURCE = "bash_source_array", BASH_LINENO = "bash_lineno_array" }
 function Shell:array_get(name, key)
-  if name == "FUNCNAME" then return self:funcname_array()[(tonumber(key) or 0) + 1] or "" end
+  if VIRT_ARR[name] then return self[VIRT_ARR[name]](self)[(tonumber(key) or 0) + 1] or "" end
   local b = self.vars[self:deref(name)]
   if b and b.arr then return b.arr[norm_key(b, key)] or "" end
   if key == 0 then return self:get(name) end
@@ -693,8 +713,8 @@ local function assoc_bucket(key)
 end
 
 function Shell:array_indices(name)
-  if name == "FUNCNAME" then
-    local a = self:funcname_array(); local t = {}; for i = 1, #a do t[i] = i - 1 end; return t
+  if VIRT_ARR[name] then
+    local a = self[VIRT_ARR[name]](self); local t = {}; for i = 1, #a do t[i] = i - 1 end; return t
   end
   local b = self.vars[self:deref(name)]
   if b and b.assoc then
@@ -715,7 +735,7 @@ function Shell:array_indices(name)
   return {}
 end
 function Shell:array_values(name)
-  if name == "FUNCNAME" then return self:funcname_array() end
+  if VIRT_ARR[name] then return self[VIRT_ARR[name]](self) end
   local idx = self:array_indices(name); local t = {}
   for i = 1, #idx do t[i] = self:array_get(name, idx[i]) end
   return t
