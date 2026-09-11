@@ -3310,10 +3310,19 @@ local function exec_stmt(sh, st, hook)
     -- A command whose argv is empty after expansion but which contained command
     -- substitution(s) takes the LAST cmdsub's exit status (bash: `false` -> 1,
     -- $(exit 42) -> 42). With no cmdsub and no assigns it's a no-op (status 0).
-    if #args == 0 and not st.assigns then
-      local hadcs = false
-      for _, w in ipairs(st.words) do for _, p in ipairs(w.parts) do if p.cmdsub then hadcs = true; break end end end
-      sh.status = hadcs and (sh.last_cmdsub_status or 0) or 0
+    if #args == 0 and not st.arrayargs then
+      -- No command word. Any prefix assignments are PERMANENT (there is no command
+      -- to scope them to) and take effect even if a following redirect fails —
+      -- bash applies `abc=def > /nonexistent` regardless (only the status is 1).
+      if st.assigns then
+        for _, a in ipairs(st.assigns) do
+          if a.raw then sh:set_str(a.name, a.raw) else exec_stmt(sh, a, hook) end
+        end
+      else -- a bare $(...) / redirection: status is the last cmdsub's, else 0
+        local hadcs = false
+        for _, w in ipairs(st.words) do for _, p in ipairs(w.parts) do if p.cmdsub then hadcs = true; break end end end
+        sh.status = hadcs and (sh.last_cmdsub_status or 0) or 0
+      end
       -- a redirection with no command still opens/truncates its target (`> file`)
       if st.redirs then
         local save, ok = apply_redirs(sh, st.redirs)
