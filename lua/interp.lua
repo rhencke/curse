@@ -3499,11 +3499,16 @@ exec_stmt = function(sh, st, hook)
     if rb and rb.ro then -- readonly: reject the assignment (status 1); fatal in `sh -c`
       io.stderr:write("curse: " .. st.name .. ": readonly variable\n") -- or posix mode; a plain script keeps going.
       sh.status = 1; if sh.opt_c or sh.opt_posix then error({ __curse_exit = 1 }) end; return
-    elseif nref_base then
+    else
+    -- A bad substitution / invalid indirect in the RHS fails the assignment but is
+    -- NON-fatal (bash: `x=${bad|y}` leaves x unset, status 1, script continues) —
+    -- like a bad-subst in a command word. Catch it around the RHS expansion.
+    local aok, aerr = pcall(function()
+    if nref_base then
       sh:array_set(nref_base, array_key(sh, nref_base, nref_sub), expand_assign_word(sh, st.rhs), st.append)
     elseif st.index then
       if not sh:array_set(st.name, array_key(sh, st.name, st.index), expand_assign_word(sh, st.rhs), st.append) then
-        io.stderr:write("curse: " .. st.name .. ": bad array subscript\n"); sh.status = 1; return
+        error({ __curse_badsub = true })
       end
     elseif st.arith then
       sh:aset(st.name, eval(sh, st.arith))
@@ -3528,6 +3533,14 @@ exec_stmt = function(sh, st, hook)
       else
         sh:set_str(st.name, expand_assign_word(sh, st.rhs))
       end
+    end
+    end)
+    if not aok then
+      if type(aerr) == "table" and aerr.__curse_badsub then
+        io.stderr:write("curse: " .. st.name .. ": bad array subscript\n"); sh.status = 1; return
+      elseif type(aerr) == "table" and aerr.__curse_experr then sh.status = 1; return -- bad-subst RHS: non-fatal
+      else error(aerr) end -- a real error (exit, nounset, matherr) propagates
+    end
     end
     -- set -a (allexport): a plain scalar assignment auto-exports the variable
     if sh.opt_a and not st.index then
