@@ -1619,6 +1619,10 @@ local function make_parser(src)
     local cmds = { first }
     while true do
       ws()
+      -- a `\<newline>` line continuation may sit between a stage and the `|` (e.g.
+      -- `{ …; } \<nl> | cat`); a simple command absorbs its own trailing one via
+      -- word(), but a compound stage does not, so skip it here before the `|` test.
+      while src:sub(i, i) == "\\" and src:sub(i + 1, i + 1) == "\n" do i = i + 2; line = line + 1; ws() end
       -- a single `|` (not `||`) chains another command into the pipeline
       if src:sub(i, i) == "|" and src:sub(i + 1, i + 1) ~= "|" then
         if src:sub(i, i + 1) == "|&" then
