@@ -1210,10 +1210,10 @@ local function find_in_path(name)
   end
   return nil
 end
-local function name_type(sh, name)
+local function name_type(sh, name, nofunc)
   if sh.aliases[name] then return "alias" end
   if KEYWORDS[name] then return "keyword" end
-  if sh.functions[name] then return "function" end
+  if not nofunc and sh.functions[name] then return "function" end -- `type -f` skips functions
   if BUILTINS[name] then return "builtin" end
   local p = find_in_path(name)
   if p then return "file", p end
@@ -2327,12 +2327,13 @@ local function exec_simple(sh, args, hook, no_func)
     sh.status = 0
   elseif cmd == "type" then
     -- type [-t|-p|-P] NAME…  (-t type word; -p path-if-file; -P force PATH search)
-    local tflag, pflag, Pflag, j0 = false, false, false, 2
+    local tflag, pflag, Pflag, fflag, j0 = false, false, false, false, 2
     while args[j0] and args[j0]:sub(1, 1) == "-" and #args[j0] > 1 do
       local f = args[j0]
       if f:find("t") then tflag = true end
       if f:find("p") then pflag = true end
       if f:find("P") then Pflag = true end
+      if f:find("f") then fflag = true end -- -f: suppress shell-function lookup
       j0 = j0 + 1
     end
     local allok = true
@@ -2341,12 +2342,12 @@ local function exec_simple(sh, args, hook, no_func)
       if Pflag then
         local p = find_in_path(nm); if p then sh:echo(p) else allok = false end
       elseif pflag then
-        local k, p = name_type(sh, nm)
+        local k, p = name_type(sh, nm, fflag)
         if k == "file" then sh:echo(p) elseif not k then allok = false end -- builtins/etc: nothing
       elseif tflag then
-        local k = name_type(sh, nm); if k then sh:echo(k) else allok = false end
+        local k = name_type(sh, nm, fflag); if k then sh:echo(k) else allok = false end
       else -- sentence form
-        local k, p = name_type(sh, nm)
+        local k, p = name_type(sh, nm, fflag)
         if not k then allok = false; io.stderr:write("curse: type: " .. nm .. ": not found\n")
         elseif k == "alias" then sh:echo(nm .. " is aliased to `" .. sh.aliases[nm] .. "'")
         elseif k == "file" then sh:echo(nm .. " is " .. p)
@@ -2475,9 +2476,17 @@ local function exec_simple(sh, args, hook, no_func)
         elseif act == "file" or act == "directory" then
           local matches = rt.glob_expand((prefix or "") .. "*", { dotglob = false }) or {}
           for _, m in ipairs(matches) do if act == "file" or file_test("-d", m) then add(m) end end
-        elseif act == "command" then -- aliases, keywords, builtins, functions (+ PATH externals)
+        elseif act == "command" then -- aliases, keywords, builtins, functions + PATH externals
           for n in pairs(BUILTINS) do add(n) end; for n in pairs(sh.functions) do add(n) end
           for n in pairs(sh.aliases) do add(n) end; for n in pairs(KEYWORDS) do add(n) end
+          local pfx = prefix or ""
+          for dir in (sh:get("PATH") .. ":"):gmatch("([^:]*):") do
+            local d = (dir == "" and "." or dir)
+            local p = io.popen and io.popen("ls -1 '" .. d .. "' 2>/dev/null")
+            if p then for name in p:lines() do
+              if name:sub(1, #pfx) == pfx and C.access(d .. "/" .. name, 1) == 0 then add(name) end
+            end; p:close() end
+          end
         end
         table.sort(acc)
         for _, n in ipairs(acc) do emit(n) end
