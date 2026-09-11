@@ -418,6 +418,7 @@ local function do_test(sh, args)
   sh.status = res and 0 or 1
 end
 
+local tilde_prefix -- forward (word-initial ~ expansion; defined below, used in paramexp)
 local expand_word -- forward (used by eval's $-deferred arith and expand_part_str)
 local expand_pattern -- forward (quote-aware glob-pattern expansion for ${v/…} etc.)
 local indirect_part -- forward (${!ref} target resolution, re-parsed to a part)
@@ -718,6 +719,10 @@ local function expand_part_str(sh, p)
     if pe.op == "sub" then -- ${v:off:len}: offset/length are arithmetic expressions
       arg = arg and tostring(arith_int(sh, arg) or 0) or nil
       arg2 = arg2 and tostring(arith_int(sh, arg2) or 0) or nil
+    elseif not TESTOP[pe.op] then
+      -- a word-initial ~ in a pattern / replacement expands (${p//~/z}, ${p#~/x})
+      if type(arg) == "string" then arg = tilde_prefix(sh, arg) end
+      if arg2 then arg2 = tilde_prefix(sh, arg2) end
     end
     return sh:expand_param(pe, arg, arg2, subkey)
   end
@@ -728,7 +733,7 @@ end
 -- contexts that do NOT word-split).
 -- Tilde expansion on a word-initial unquoted literal: ~ / ~/… -> $HOME, ~+ -> PWD,
 -- ~- -> OLDPWD, ~user/… -> that user's home (getpwnam), else the text is literal.
-local function tilde_prefix(sh, s)
+tilde_prefix = function(sh, s)
   if s:sub(1, 1) ~= "~" then return s end
   local r = s:sub(2)
   if r == "" or r:sub(1, 1) == "/" then -- ~ / ~/… : HOME's value if HOME is SET (even to ""); else literal
