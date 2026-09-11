@@ -343,9 +343,11 @@ function Shell:capture_src(src)
   -- middle command doesn't abort — only the cmdsub's final status propagates out.
   local savede = self.opt_e
   if not (self.shopt and self.shopt.inherit_errexit) then self.opt_e = false end
+  local saved_line = self.cur_line -- $LINENO: the sub's internal lines don't leak out
   -- Run via exec_list (NOT interp.run): an `exit`/`return` inside $() ends only
   -- the sub (sets its status), and the parent's EXIT trap must NOT fire here.
   local ok, err = pcall(I.exec_list, self, ast.stmts, function() end, true)
+  self.cur_line = saved_line
   self.opt_e = savede
   self.loopdepth = saved_ld
   self.in_subprogram = self.in_subprogram - 1
