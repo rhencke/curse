@@ -1195,7 +1195,10 @@ function M.glob_expand(pattern, opts)
   end
   if #cur == 0 then return nil end
   table.sort(cur)
-  return cur
+  -- dedup: multiple `**` segments can reach the same path more than once
+  local seen, dedup = {}, {}
+  for _, p in ipairs(cur) do if not seen[p] then seen[p] = true; dedup[#dedup + 1] = p end end
+  return dedup
 end
 
 -- Apply a ${…} operator. `arg`/`arg2` are already word-expanded by the caller;
