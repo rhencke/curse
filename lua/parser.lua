@@ -236,7 +236,13 @@ local function parse_paramexp(inner)
   -- optional [subscript]
   local index = nil
   if rest:sub(1, 1) == "[" then
-    local close = rest:find("]", 2, true)
+    -- balance nested brackets so `${a[a[0]]}` takes `a[0]` as the subscript, not `a[0`
+    local depth, close = 0, nil
+    for k = 1, #rest do
+      local ch = rest:sub(k, k)
+      if ch == "[" then depth = depth + 1
+      elseif ch == "]" then depth = depth - 1; if depth == 0 then close = k; break end end
+    end
     if close then index = rest:sub(2, close - 1); rest = rest:sub(close + 1) end
   end
   if indices then
