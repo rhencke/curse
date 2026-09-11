@@ -2225,13 +2225,22 @@ local function exec_simple(sh, args, hook, no_func)
         sh.status = allok and 0 or 1
       end
     else
-      local j, sig = 2, 15 -- default SIGTERM
-      if args[j] == "-n" then sig = tonumber(args[j + 1]) or 15; j = j + 2
-      elseif args[j] == "-s" then sig = SIGNUM[(args[j + 1] or ""):gsub("^SIG", "")] or 15; j = j + 2
+      local j, sig, bad = 2, 15, nil -- default SIGTERM
+      -- Resolve a signal spec to its number: a name (TERM/SIGTERM) via SIGNUM, or a
+      -- number that names a real signal (or 0 = the null check). An unknown name or
+      -- an out-of-range number (`kill -s 9999`) is invalid → status 1, not silently 15.
+      local function resolve_sig(spec)
+        local n = tonumber(spec)
+        if n then return (n == 0 or NUMSIG[n]) and n or nil end
+        return SIGNUM[(spec or ""):upper():gsub("^SIG", "")] -- names are case-insensitive
+      end
+      if args[j] == "-n" then sig = resolve_sig(args[j + 1]); bad = sig == nil and (args[j + 1] or "") or nil; j = j + 2
+      elseif args[j] == "-s" then sig = resolve_sig(args[j + 1]); bad = sig == nil and (args[j + 1] or "") or nil; j = j + 2
       elseif args[j] == "--" then j = j + 1
       elseif args[j] and args[j]:match("^%-.") then
-        local s = args[j]:sub(2); sig = tonumber(s) or SIGNUM[s:gsub("^SIG", "")] or 15; j = j + 1
+        local s = args[j]:sub(2); sig = resolve_sig(s); bad = sig == nil and s or nil; j = j + 1
       end
+      if bad then io.stderr:write("curse: kill: " .. bad .. ": invalid signal specification\n"); sh.status = 1; return end
       local allok = true
       for k = j, #args do
         local target = args[k]
