@@ -1188,6 +1188,7 @@ local BUILTINS = {
   exec = 1, readonly = 1, umask = 1, alias = 1, unalias = 1, shopt = 1, wait = 1, trap = 1,
   mapfile = 1, readarray = 1, compgen = 1, complete = 1, compopt = 1,
   pushd = 1, popd = 1, dirs = 1, builtin = 1, kill = 1, ulimit = 1, jobs = 1,
+  history = 1, fc = 1,
 }
 M.BUILTINS = BUILTINS -- exposed so the compiled backend delegates the same set
 local KEYWORDS = {
@@ -1727,6 +1728,58 @@ local function exec_simple(sh, args, hook, no_func)
       if sh.bg_pids then for _, p in ipairs(sh.bg_pids) do pcall(reap, p) end; sh.bg_pids = {} end
       sh.status = 0
     end
+  elseif cmd == "history" then
+    -- history [-c] [-r [file]] [-w [file]] | history : the shell command history.
+    sh.history = sh.history or {}
+    local a = args[2]
+    if a == "-c" then for i = #sh.history, 1, -1 do sh.history[i] = nil end; sh.status = 0
+    elseif a == "-r" or a == "-n" then -- read history from FILE (default $HISTFILE)
+      local file = args[3] or sh:get("HISTFILE")
+      local f = file ~= "" and file and io.open(file, "r")
+      if f then for line in f:lines() do sh.history[#sh.history + 1] = line end; f:close() end
+      sh.status = 0
+    elseif a == "-w" or a == "-a" then -- write history to FILE
+      local file = args[3] or sh:get("HISTFILE")
+      local f = file ~= "" and file and io.open(file, "w")
+      if f then for _, h in ipairs(sh.history) do f:write(h, "\n") end; f:close() end
+      sh.status = 0
+    elseif a == nil then -- list the whole history
+      for i = 1, #sh.history do sh:echo(("%5d  %s"):format(i, sh.history[i])) end
+      sh.status = 0
+    else sh.status = 0 end
+  elseif cmd == "fc" then
+    -- fc -l [-n] [-r] [first] [last]: LIST history (edit/re-exec modes not supported).
+    -- The `fc` command is itself the last history entry, so it's excluded from ranges.
+    sh.history = sh.history or {}
+    local lflag, nflag, rflag, nums = false, false, false, {}
+    for j = 2, #args do
+      local x = args[j]
+      if x:sub(1, 1) == "-" and #x > 1 and x:match("^%-[lnr]+$") then
+        if x:find("l") then lflag = true end
+        if x:find("n") then nflag = true end
+        if x:find("r") then rflag = true end
+      else nums[#nums + 1] = x end
+    end
+    local cur = #sh.history -- index of this `fc` command; ranges cover 1..cur-1
+    local function resolve(s, dflt)
+      if s == nil then return dflt end
+      local v = tonumber(s); if not v then return dflt end
+      if v < 0 then v = cur + v end -- negative: offset back from the current command
+      return v
+    end
+    local last_default = cur - 1
+    local first = resolve(nums[1], math.max(1, last_default - 15))
+    local last = resolve(nums[2], last_default)
+    if lflag or true then -- only -l (list) is implemented; treat any fc as a listing
+      local step = (first <= last) and 1 or -1
+      if rflag then first, last, step = last, first, -step end -- -r reverses
+      for i = first, last, step do
+        if i >= 1 and i <= cur - 1 and sh.history[i] then
+          sh:echo((nflag and "" or tostring(i)) .. "\t " .. sh.history[i])
+        end
+      end
+    end
+    sh.status = 0
   elseif cmd == "jobs" then
     -- jobs [-p|-l|-r]: list active background jobs (one line each). Refresh done
     -- state non-blockingly first so finished jobs drop off (bash removes them).

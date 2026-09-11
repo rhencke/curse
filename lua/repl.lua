@@ -22,11 +22,12 @@ for _, name in ipairs({ "readline", "libreadline.so.8", "libreadline.so.7", "lib
   local ok, lib = pcall(ffi.load, name)
   if ok then RL = lib; break end
 end
-local interactive = ffi.C.isatty(0) == 1
+local istty = ffi.C.isatty(0) == 1
+local interactive = istty -- becomes true for `-i` too once run() sees opt_i
 
 -- One line of input. With readline: full editing + history. Otherwise plain read.
 local function read_line(prompt)
-  if RL then
+  if RL and istty then -- readline only on a real tty; piped stdin prompts to stderr
     local c = RL.readline(prompt)
     if c == nil then return nil end -- EOF (Ctrl-D)
     local s = ffi.string(c); ffi.C.free(c)
@@ -83,7 +84,8 @@ end
 
 local M = {}
 function M.run(sh)
-  if RL then
+  interactive = istty or (sh and sh.opt_i) or false -- prompts print for `-i` even off a tty
+  if RL and istty then
     RL.using_history()
     local hist = os.getenv("HISTFILE") or ((os.getenv("HOME") or ".") .. "/.curse_history")
     pcall(function() RL.read_history(hist) end)
@@ -101,7 +103,8 @@ function M.run(sh)
       -- keep reading this logical command on the next line (PS2)
     else
       if buf:match("%S") then
-        if RL then RL.add_history(buf) end
+        sh.history = sh.history or {}; sh.history[#sh.history + 1] = buf -- for `history`/`fc`
+        if RL and istty then RL.add_history(buf) end
         local ok, err = pcall(interp.run_lazy, sh, buf)
         if not ok and type(err) == "table" and err.__curse_exit then
           io.flush(); break -- `exit` in the REPL
@@ -113,7 +116,7 @@ function M.run(sh)
       buf = ""
     end
   end
-  if RL then
+  if RL and istty then
     local hist = os.getenv("HISTFILE") or ((os.getenv("HOME") or ".") .. "/.curse_history")
     pcall(function() RL.write_history(hist) end)
   end
