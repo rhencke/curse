@@ -226,6 +226,9 @@ end
 local function parse_paramexp(inner)
   if inner == "" then return { lit = "" } end
   if inner == "#" then return { special = "#" } end
+  -- ${-} ${?} ${$} ${!}: the special one-char parameters (like their bare $-, $?,
+  -- $$, $! forms). Handled here so `!` isn't mistaken for the indirect prefix.
+  if inner == "-" or inner == "?" or inner == "$" or inner == "!" then return { special = inner } end
   local indices, lenpfx = false, false
   if inner:sub(1, 1) == "!" then indices = true; inner = inner:sub(2)     -- ${!a[@]}
     -- after `!` (indirect/keys) another prefix operator is a bad substitution
@@ -237,7 +240,14 @@ local function parse_paramexp(inner)
   local name, rest = inner:match("^([%a_][%w_]*)(.*)$")
   if not name then name, rest = inner:match("^(%d+)(.*)$") end
   if not name then name, rest = inner:match("^([@*])(.*)$") end
-  if not name then return { var = inner } end
+  if not name then
+    -- a lone invalid parameter char (${%}, ${.}, ${+}) is a bad substitution in
+    -- bash (fails the command, status 1). Multi-char inners are left to the
+    -- lenient var fallback (ksh funsubs `${ …}`/`${| …}`, special-param-plus-op
+    -- like ${?@a} tolerated as empty), to match curse's prior behavior.
+    if #inner == 1 then return { pexp = { op = "badsubst", raw = inner } } end
+    return { var = inner }
+  end
   -- optional [subscript]
   local index = nil
   if rest:sub(1, 1) == "[" then
