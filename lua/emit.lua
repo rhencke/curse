@@ -630,6 +630,11 @@ local function assemble(cfg, sig, opts)
   -- register compiled function closures into sh.functions so the interpreter
   -- (reached via delegation) can call them too — full interp/compiled interop.
   for _, n in ipairs(opts.register or {}) do o[#o + 1] = ("  sh.functions[%q] = fn_%s"):format(n, n) end
+  -- verbatim definition source for `declare -f`/`type` (parity with the interpreter)
+  if opts.funcsrc and next(opts.funcsrc) then
+    o[#o + 1] = "  sh.func_src = sh.func_src or {}"
+    for n, txt in pairs(opts.funcsrc) do o[#o + 1] = ("  sh.func_src[%q] = %q"):format(n, txt) end
+  end
   for _, n in ipairs(opts.runlocals or {}) do o[#o + 1] = ("  local %s = sh:aget(%q)"):format(lname(n), n) end
   for _, n in ipairs(opts.upvals or {}) do o[#o + 1] = ("  %s = sh:aget(%q)"):format(lname(n), n) end
   o[#o + 1] = opts.toplevel and ("  pc = pc or %d"):format(cfg.entry) or ("  local pc = %d"):format(cfg.entry)
@@ -728,11 +733,13 @@ function M.emit(ast)
   local funcnames = {}
   for name in pairs(funcflags) do funcnames[#funcnames + 1] = name end
   table.sort(funcnames)
+  local funcsrc = {} -- name -> verbatim definition text (top-level funcdefs)
+  for _, st in ipairs(ast.stmts) do if st.t == "funcdef" and st.deftext then funcsrc[st.name] = st.deftext end end
   local top = build_cfg(ast.stmts, lifted, funcflags, inlinefns)
   o[#o + 1] = "local loopPc = " .. serialize(top.loopPc)
   o[#o + 1] = "local stmtPc = " .. serialize(top.stmtPc)
   o[#o + 1] = assemble(top, "local function run(sh, pc)",
-    { runlocals = runlocals, upvals = upvals, toplevel = true, register = funcnames })
+    { runlocals = runlocals, upvals = upvals, toplevel = true, register = funcnames, funcsrc = funcsrc })
   o[#o + 1] = "return { run = run, loopPc = loopPc, stmtPc = stmtPc }"
   return table.concat(o, "\n") .. "\n"
 end
