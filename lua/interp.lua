@@ -77,6 +77,29 @@ local function shopt_on(sh, name)
   return v
 end
 
+-- $SHELLOPTS: sorted colon-list of enabled `set -o` options; $BASHOPTS: same for
+-- shopt. bash keeps both live (read-only). Defined here so they share the single
+-- SETOPTS/SHOPT tables and opt_on/shopt_on rules. history/histexpand appear only
+-- interactively.
+function rt.Shell:shellopts()
+  local names = {}
+  for _, o in ipairs(SETOPTS) do
+    local field, on = o[2], nil
+    if field == "opt_H" or field == "opt_history" then
+      on = (self[field] ~= nil) and self[field] or (self.opt_i and true or false)
+    else on = opt_on(self, field) end
+    if on then names[#names + 1] = o[1] end
+  end
+  table.sort(names)
+  return table.concat(names, ":")
+end
+function rt.Shell:bashopts()
+  local names = {}
+  for _, n in ipairs(SHOPT_ORDER) do if shopt_on(self, n) then names[#names + 1] = n end end
+  table.sort(names)
+  return table.concat(names, ":")
+end
+
 -- Quote a value the way `set`/`declare -p` do: bare if it's all "safe" chars,
 -- else single-quoted with embedded quotes escaped as '\''.
 local function sq(s)
@@ -1262,6 +1285,10 @@ local function decl_quote(s)
 end
 -- Format one variable as a `declare -p` line, or nil if it is unset.
 local function fmt_decl(sh, name)
+  -- SHELLOPTS/BASHOPTS are readonly, exported, derived specials with no var box.
+  if (name == "SHELLOPTS" or name == "BASHOPTS") and (sh.shellopts) then
+    return "declare -r " .. name .. "=" .. decl_quote(sh:special_get(name))
+  end
   local b = sh.vars[name]
   if b == nil then return nil end
   if b.ref then return "declare -n " .. name .. "=" .. decl_quote(b.s or "") end
@@ -2910,6 +2937,10 @@ local function exec_stmt(sh, st, hook)
   end
   if st.line and not (sh.in_trap and sh.in_trap > 0) then sh.cur_line = st.line end -- $LINENO (frozen in traps)
   if t == "assign" then
+    if st.name == "SHELLOPTS" or st.name == "BASHOPTS" then -- readonly specials (bash)
+      io.stderr:write("curse: " .. st.name .. ": readonly variable\n")
+      sh.status = 1; if sh.opt_c or sh.opt_posix then error({ __curse_exit = 1 }) end; return
+    end
     local rb = sh.vars[sh:deref(st.name)]
     -- A nameref whose target carries a subscript (declare -n ref='A[K]'): a plain
     -- `ref=v` / `ref+=v` writes THROUGH to that element, not the base array's [0].

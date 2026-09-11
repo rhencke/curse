@@ -447,6 +447,8 @@ function Shell:special_get(name)
   if name == "FUNCNAME" then return (self.funcstack and self.funcstack[1]) or "" end
   if name == "BASH_SOURCE" then return self:bash_source_array()[1] or "" end -- [0]: current source
   if name == "BASH_LINENO" then return self:bash_lineno_array()[1] or "0" end -- [0]: caller's line
+  if name == "SHELLOPTS" and self.shellopts then return self:shellopts() end -- live set -o list
+  if name == "BASHOPTS" and self.bashopts then return self:bashopts() end -- live shopt list
   if name == "OSTYPE" then return "linux-gnu" end
   if name == "MACHTYPE" then return "x86_64-pc-linux-gnu" end
   if name == "HOSTTYPE" then return "x86_64" end
@@ -564,7 +566,9 @@ function Shell:import_env()
       local k = s:sub(1, eq - 1)
       if k == "PWD" then env_pwd = s:sub(eq + 1)
       elseif k == "OLDPWD" then env_oldpwd = s:sub(eq + 1)
-      elseif k == "UID" or k == "EUID" or k == "PPID" then -- shell-computed, not from env
+      elseif k == "UID" or k == "EUID" or k == "PPID" -- shell-computed, not from env
+        or k == "SHELLOPTS" or k == "BASHOPTS" then -- readonly, derived live from the option state
+
       elseif k:match("^[%a_][%w_]*$") then
         self:set_str(k, s:sub(eq + 1))
         self.vars[k].exported = true -- inherited env vars are exported (bash)
@@ -585,7 +589,8 @@ function Shell:import_env()
   -- Shell-maintained vars bash always defines even with `env -i` and no rc file.
   if self.vars["IFS"] == nil then self:set_str("IFS", " \t\n") end
   if self.vars["PS4"] == nil then self:set_str("PS4", "+ ") end
-  if self.vars["SHELLOPTS"] == nil then self:set_str("SHELLOPTS", "braceexpand:hashall") end
+  -- SHELLOPTS/BASHOPTS are NOT stored: special_get derives them live from the
+  -- current set -o / shopt state (and they're readonly), matching bash.
 end
 
 -- Arithmetic write: store the int64, defer the string (lazy).
