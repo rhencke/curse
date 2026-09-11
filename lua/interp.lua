@@ -1282,7 +1282,10 @@ local function apply_redirs(sh, redirs)
              -- prior command would be redirected into (and lost to) the new target
   local save, ok = {}, true
   local fd1file = false -- has fd 1 gone to a real file? (then `2>&1` isn't captured)
-  local function backup(fd) save[#save + 1] = { fd = fd, saved = C.dup(fd) } end
+  -- Named-fd (`{var}>`) targets are NOT restored after the command: bash leaves
+  -- them open (so a later `{var}>` gets the next fd), unlike a numeric redirect.
+  local persist = {}
+  local function backup(fd) if not persist[fd] then save[#save + 1] = { fd = fd, saved = C.dup(fd) } end end
   -- redirect targets are word-expanded at runtime (e.g. `> $TMP/f`, `>& $myfd`).
   local function tgt(r) return expand_word(sh, P.parse_word(r.target or "")) end
   -- A FILE redirect target is glob-expanded and word-split like any word; bash
@@ -1307,7 +1310,7 @@ local function apply_redirs(sh, redirs)
       if (r.op == "dup" or r.op == "dupin") and r.target == "-" then
         r = setmetatable({ fd = tonumber(sh:get(r.fdvar)) or -1 }, { __index = r })
       else
-        local nf = alloc_fd(); sh:set_str(r.fdvar, tostring(nf))
+        local nf = alloc_fd(); sh:set_str(r.fdvar, tostring(nf)); persist[nf] = true
         r = setmetatable({ fd = nf }, { __index = r }) -- shadow r.fd, inherit op/target
       end
     end
