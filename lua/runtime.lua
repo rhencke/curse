@@ -838,20 +838,25 @@ local function glob_conv(glob, pn)
     elseif c == "*" then out[#out + 1] = star; i = i + 1
     elseif c == "?" then out[#out + 1] = qmark; i = i + 1
     elseif c == "[" then
-      local j, cls = i + 1, { "[" }
-      if glob:sub(j, j) == "!" then cls[#cls + 1] = "^"; j = j + 1
-      elseif glob:sub(j, j) == "^" then cls[#cls + 1] = "^"; j = j + 1 end
-      if glob:sub(j, j) == "]" then cls[#cls + 1] = "]"; j = j + 1 end -- leading ] is literal
+      local j, neg, has_rb, members = i + 1, false, false, {}
+      if glob:sub(j, j) == "!" or glob:sub(j, j) == "^" then neg = true; j = j + 1 end
+      if glob:sub(j, j) == "]" then has_rb = true; j = j + 1 end -- leading ] is a literal member
       while j <= n and glob:sub(j, j) ~= "]" do
-        local nx = glob:sub(j + 1, j + 1)
-        if glob:sub(j, j) == "[" and (nx == ":" or nx == "." or nx == "=") then
+        local cj, nx = glob:sub(j, j), glob:sub(j + 1, j + 1)
+        if cj == "\\" then -- inside [...], `\` escapes the next char (bash); `\]` is a literal ]
+          if nx == "]" then has_rb = true; j = j + 2
+          elseif nx == "" then members[#members + 1] = "\\"; j = j + 1
+          else members[#members + 1] = nx; j = j + 2 end -- ERE: backslash isn't special in a class
+        elseif cj == "[" and (nx == ":" or nx == "." or nx == "=") then
           -- POSIX [:class:] / [.coll.] / [=equiv=]: copy through its own close
           local e = glob:find(nx .. "]", j + 2, true)
-          if e then cls[#cls + 1] = glob:sub(j, e + 1); j = e + 2
-          else cls[#cls + 1] = glob:sub(j, j); j = j + 1 end
-        else cls[#cls + 1] = glob:sub(j, j); j = j + 1 end
+          if e then members[#members + 1] = glob:sub(j, e + 1); j = e + 2
+          else members[#members + 1] = cj; j = j + 1 end
+        else members[#members + 1] = cj; j = j + 1 end
       end
-      cls[#cls + 1] = "]"; out[#out + 1] = table.concat(cls); i = j + 1
+      -- ERE class: a literal ] must come FIRST (right after [ or [^).
+      out[#out + 1] = "[" .. (neg and "^" or "") .. (has_rb and "]" or "") .. table.concat(members) .. "]"
+      i = j + 1
     elseif c:match("[%.%+%(%)%{%}%|%^%$\\]") then out[#out + 1] = "\\" .. c; i = i + 1
     else out[#out + 1] = c; i = i + 1 end
   end
