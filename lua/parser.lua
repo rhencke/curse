@@ -808,6 +808,30 @@ local function make_parser(src)
       else break end
     end
   end
+  -- Like skipsep but STOPS at a statement separator (; & |) instead of eating it,
+  -- so the statement loops can tell a *trailing* separator (fine) from one in
+  -- command position (a syntax error — see bare_sep_tok).
+  local function skipblank()
+    while i <= n do
+      local c = src:sub(i, i)
+      if c == "\n" then
+        if #heredocs_pending > 0 then collect_heredocs()
+        else line = line + 1; i = i + 1 end
+      elseif c == " " or c == "\t" then i = i + 1
+      elseif c == "#" then while i <= n and src:sub(i, i) ~= "\n" do i = i + 1 end
+      else break end
+    end
+  end
+  -- At a command-expected position a control operator means an empty command,
+  -- which bash rejects as a syntax error (status 2): a leading/doubled `;`, `;;`,
+  -- `&`, `&&`, `||`, `|`, or `|&`. Returns the offending token, or nil.
+  local function bare_sep_tok()
+    local c2 = src:sub(i, i + 1)
+    if c2 == ";;" or c2 == "&&" or c2 == "||" or c2 == "|&" then return c2 end
+    local c = src:sub(i, i)
+    if c == ";" or c == "&" or c == "|" then return c end
+    return nil
+  end
   local function word(stop_paren, stop_cmp)  -- read one shell word, keeping quotes and $(( )) / ${ } / $( ) balanced
     ws()
     local start = i
@@ -1500,20 +1524,28 @@ local function make_parser(src)
     stopset = stopset or {}
     local stmts = {}
     while true do
-      skipsep()
+      skipblank()
       if i > n then return stmts, nil end
       if stopset["}"] and src:sub(i, i) == "}" then i = i + 1; return stmts, "}" end
       if stopset[")"] and src:sub(i, i) == ")" then i = i + 1; return stmts, ")" end
       local pw = peekword()
       if pw and stopset[pw] then i = i + #pw; return stmts, pw end
+      -- a control operator in command position is an empty command (bash: error)
+      local bs = bare_sep_tok()
+      if bs then error("syntax error near `" .. bs .. "'") end
       local before = i
       local st = parse_stmt()
       if st then stmts[#stmts + 1] = st
       elseif i == before then
         -- no progress: a stray metacharacter/keyword in command position (`)`, `}`,
-        -- `;;`, `do`, …) — a syntax error, and a guard against an infinite loop.
+        -- `do`, …) — a syntax error, and a guard against an infinite loop.
         error("syntax error near `" .. src:sub(i, i) .. "'")
       end
+      -- consume this statement's single trailing `;` (its terminator), so the next
+      -- iteration lands on a genuine command position; `&`/newlines are handled by
+      -- parse_stmt/skipblank. A following `;` is then a bare separator (error).
+      ws()
+      if src:sub(i, i) == ";" and src:sub(i + 1, i + 1) ~= ";" then i = i + 1 end
     end
   end
 
@@ -1530,8 +1562,12 @@ local function make_parser(src)
     if qi < #queue then qi = qi + 1; return queue[qi] end
     if done then return nil end
     while true do
-      skipsep()
+      skipblank()
       if i > n then done = true; return nil end
+      -- a control operator in command position (bare/leading/doubled `;`, `&`, `|`)
+      -- is a syntax error in bash (status 2) — not installer payload, so report it.
+      local bs = bare_sep_tok()
+      if bs then done = true; return { t = "parse_error", line = line, msg = "syntax error near `" .. bs .. "'" } end
       local start, startline = i, line
       local ok, st = pcall(parse_stmt)
       if not ok then done = true; return { t = "parse_error", line = startline, msg = tostring(st) } end
@@ -1555,6 +1591,10 @@ local function make_parser(src)
       -- No progress (a stray `)`/`}` etc. yields an empty node or nil without
       -- advancing): stop, so the lazy top-level loop can't spin forever.
       if i <= start then done = true; return nil end
+      -- consume this statement's single trailing `;`, so the next call lands on a
+      -- real command position and a following separator reads as bare (error).
+      ws()
+      if st ~= nil and src:sub(i, i) == ";" and src:sub(i + 1, i + 1) ~= ";" then i = i + 1 end
       if st ~= nil then return st end
     end
   end
