@@ -1599,9 +1599,16 @@ local function make_parser(src)
         queue, qi = stmts, 1
         return stmts[1]
       end
-      -- No progress (a stray `)`/`}` etc. yields an empty node or nil without
-      -- advancing): stop, so the lazy top-level loop can't spin forever.
-      if i <= start then done = true; return nil end
+      -- No progress: parse_stmt neither advanced nor threw — a stray metacharacter
+      -- or keyword in command position (`)`, `}`, `done`, `fi`, `var=)` leaves a
+      -- `)`, …). bash reports this as a syntax error (status 2); defer it as a
+      -- parse_error node (reached only if no earlier `exit` fired, matching bash),
+      -- which also guards the lazy loop against spinning forever.
+      if i <= start then
+        done = true
+        local tok = peekword() or src:sub(i, i)
+        return { t = "parse_error", line = line, msg = "syntax error near `" .. tok .. "'" }
+      end
       -- consume this statement's single trailing `;`, so the next call lands on a
       -- real command position and a following separator reads as bare (error).
       ws()
