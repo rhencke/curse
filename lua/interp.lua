@@ -824,6 +824,7 @@ local function multi_elems(sh, p) -- returns element list, star?
       return {}, false
     end
     if pe.op == "indices" then -- ${!a[@]} -> the keys/indices
+      if pe.drop then return {}, star end -- ${!a[@]@X}: a transform on the keys -> empty (bash)
       local ix = sh:array_indices(pe.name); local t = {}
       for i = 1, #ix do t[i] = tostring(ix[i]) end
       return t, star
