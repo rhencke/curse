@@ -212,6 +212,8 @@ ffi.cdef [[
   struct curse_rlimit { uint64_t rlim_cur; uint64_t rlim_max; };
   int getrlimit(int resource, struct curse_rlimit *rlim);
   int setrlimit(int resource, const struct curse_rlimit *rlim);
+  struct curse_timeval { long tv_sec; long tv_usec; };
+  int gettimeofday(struct curse_timeval *tv, void *tz);
 ]]
 local C = ffi.C
 -- The standard utility PATH (`command -p`), from confstr(_CS_PATH) like bash —
@@ -3302,8 +3304,28 @@ local function run_debug(sh, line)
   if sh.opt_e and trap_status ~= 0 then error({ __curse_exit = trap_status }) end
 end
 
-local function exec_stmt(sh, st, hook)
+local tv_now = ffi.new("struct curse_timeval") -- reused buffer for `time`'s wall clock
+local function wall_secs()
+  C.gettimeofday(tv_now, nil); return tonumber(tv_now.tv_sec) + tonumber(tv_now.tv_usec) * 1e-6
+end
+local function fmt_time(s) return ("%dm%.3fs"):format(math.floor(s / 60), s % 60) end
+
+local exec_stmt
+exec_stmt = function(sh, st, hook)
   local t = st.t
+  -- `time [-p] pipeline` reserved word: run the pipeline (with its own type/negate
+  -- preserved for errexit), then report elapsed real/user/sys to STDERR like bash.
+  if st.timed then
+    st.timed = false
+    local r0, c0 = wall_secs(), os.clock()
+    local ok, err = pcall(exec_stmt, sh, st, hook)
+    local real, cpu = wall_secs() - r0, os.clock() - c0
+    st.timed = true
+    if st.timed_p then io.stderr:write(("real %.2f\nuser %.2f\nsys %.2f\n"):format(real, cpu, 0))
+    else io.stderr:write(("\nreal\t%s\nuser\t%s\nsys\t%s\n"):format(fmt_time(real), fmt_time(cpu), fmt_time(0))) end
+    if not ok then error(err) end
+    return
+  end
   -- set -n (noexec): a non-interactive shell reads but does not execute. Once on,
   -- every later statement (including `set +n`) is skipped — matches bash.
   if sh.opt_n and not sh.opt_i then sh.status = 0; return end

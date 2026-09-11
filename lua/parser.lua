@@ -1361,6 +1361,13 @@ local function make_parser(src)
     ws()
     local ln = line
     local negate = false
+    -- `time [-p]` reserved word may precede the (optionally `!`-negated) pipeline;
+    -- it's a keyword only as a standalone word (followed by whitespace/newline).
+    local timed, timed_p = false, false
+    if src:sub(i, i + 3) == "time" and src:sub(i + 4, i + 4):match("[ \t\n]") then
+      timed = true; i = i + 4; ws()
+      while src:sub(i, i + 1) == "-p" and src:sub(i + 2, i + 2):match("[ \t\n]") do timed_p = true; i = i + 2; ws() end
+    end
     if src:sub(i, i + 1) == "! " then negate = true; i = i + 2; ws() end
     local first = parse_command()
     local cmds = { first }
@@ -1381,8 +1388,10 @@ local function make_parser(src)
         break
       end
     end
-    if #cmds == 1 and not negate then return first end
-    return { t = "pipeline", cmds = cmds, negate = negate, line = ln }
+    local pipe = (#cmds == 1 and not negate) and first
+      or { t = "pipeline", cmds = cmds, negate = negate, line = ln }
+    if timed then pipe.timed = true; pipe.timed_p = timed_p end -- `time` prefix: measure this pipeline
+    return pipe
   end
 
   -- and-or list: pipeline [ (&& | ||) pipeline ]*  ; a lone `&` (background) is
