@@ -632,9 +632,18 @@ function Shell:deref(name)
   return name
 end
 -- Mark `name` as a nameref (declare -n); target is the referenced variable name.
+-- A nameref target (when one is given) must be a plain identifier, optionally
+-- with a subscript (`ref`, `a[0]`, `a[@]`); bash rejects `@`, `*`, `1`, `a b`,
+-- `a-b`, empty, … as "invalid variable name for name reference". Returns false
+-- (leaving the var untouched) so the caller can report the error + status 1. A
+-- nil target (`typeset -n ref` converting an existing var) is NOT validated.
 function Shell:make_nameref(name, target)
+  if target ~= nil and not (target:match("^[%a_][%w_]*$") or target:match("^[%a_][%w_]*%[.+%]$")) then
+    return false
+  end
   local b = box(name, self.vars); b.ref = true
   if target ~= nil then b.s = target; b.n = nil; b.arr = nil end
+  return true
 end
 function Shell:unref(name) local b = self.vars[name]; if b then b.ref = nil end end
 function Shell:is_nameref(name) local b = self.vars[name]; return b and b.ref end

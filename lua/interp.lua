@@ -2580,7 +2580,11 @@ local function exec_simple(sh, args, hook, no_func)
         elseif nm then
           if localize then sh:localVar(nm) end
           local ap = (op == "+=")
-          if nref then sh:make_nameref(nm, val)
+          if nref then
+            if not sh:make_nameref(nm, val) then
+              io.stderr:write("curse: " .. cmd .. ": `" .. (val or "") .. "': invalid variable name for name reference\n")
+              allok = false
+            end
           elseif iattr then -- declare -i: arith-evaluate the value, mark integer
             if ap then sh:aset(nm, sh:aget(nm) + eval(sh, P.arith(val)))
             else sh:aset(nm, eval(sh, P.arith(val))) end
@@ -3295,7 +3299,11 @@ local function exec_simple(sh, args, hook, no_func)
         local vname = nm or a
         sh:localVar(vname)
         if nm then
-          if nref then sh:make_nameref(nm, val)
+          if nref then
+            if not sh:make_nameref(nm, val) then
+              io.stderr:write("curse: local: `" .. (val or "") .. "': invalid variable name for name reference\n")
+              lok = false
+            end
           else if assoc then sh:declare_assoc(nm) end; sh:set_str(nm, val) end
         elseif plusn then sh:unref(vname)
         elseif nref then sh:make_nameref(vname)
