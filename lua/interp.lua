@@ -3392,6 +3392,9 @@ exec_stmt = function(sh, st, hook)
       io.stderr:write("curse: " .. st.name .. ": readonly variable\n")
       sh.status = 1; if sh.opt_c or sh.opt_posix then error({ __curse_exit = 1 }) end; return
     end
+    if st.index == "" then -- `a[]=v`: empty subscript is a bad array subscript (bash: status 1, no assign)
+      io.stderr:write("curse: `" .. st.name .. "[]': bad array subscript\n"); sh.status = 1; return
+    end
     local rb = sh.vars[sh:deref(st.name)]
     -- A nameref whose target carries a subscript (declare -n ref='A[K]'): a plain
     -- `ref=v` / `ref+=v` writes THROUGH to that element, not the base array's [0].

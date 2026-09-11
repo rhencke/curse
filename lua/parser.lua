@@ -280,6 +280,7 @@ local function parse_paramexp(inner)
       elseif ch == "]" then depth = depth - 1; if depth == 0 then close = k; break end end
     end
     if close then index = rest:sub(2, close - 1); rest = rest:sub(close + 1) end
+    if index == "" then return { pexp = { op = "badsubst", raw = name .. "[]" } } end -- ${a[]} is invalid (bash)
   end
   if indices then
     -- ${!a[@]}/${!a[*]} = keys; ${!pfx@}/${!pfx*} = var names with that prefix;
