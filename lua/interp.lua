@@ -347,6 +347,11 @@ end
 local TEST_BINOPS = { ["="] = 1, ["=="] = 1, ["!="] = 1, ["<"] = 1, [">"] = 1,
   ["-eq"] = 1, ["-ne"] = 1, ["-lt"] = 1, ["-le"] = 1, ["-gt"] = 1, ["-ge"] = 1,
   ["-ot"] = 1, ["-nt"] = 1, ["-ef"] = 1 }
+-- Unary primaries bash recognizes in `test`/`[`. Used to reject a 2-arg test
+-- whose first token is not an operator (`[ = '' ]`, `[ '(' foo ]`, `[ a b ]`):
+-- bash calls that "unary operator expected" (status 2), not a false result.
+local TEST_UNOPS = {}
+for w in ("-a -b -c -d -e -f -g -h -k -p -r -s -t -u -w -x -G -L -N -O -R -S -o -v -z -n"):gmatch("%S+") do TEST_UNOPS[w] = 1 end
 local function binary(x, op, y)
   if op == "=" or op == "==" then return x == y end
   if op == "!=" then return x ~= y end
@@ -392,7 +397,12 @@ local function eval_test(sh, a, lo, hi)
   end
   if a[lo] == "!" and n > 1 then return not eval_test(sh, a, lo + 1, hi) end
   if n == 1 then return a[lo] ~= "" end
-  if n == 2 then return unary(sh, a[lo], a[lo + 1]) end
+  if n == 2 then
+    -- bash: a 2-arg test needs a unary operator first (`=`, `(`, or a plain word
+    -- is "unary operator expected", status 2 — not a string test).
+    if not TEST_UNOPS[a[lo]] then error({ __test_syntax = a[lo] .. ": unary operator expected" }) end
+    return unary(sh, a[lo], a[lo + 1])
+  end
   if n == 3 then return binary(a[lo], a[lo + 1], a[lo + 2]) end
   error({ __test_syntax = "too many arguments" }) -- n>3 with no -a/-o/paren: bash syntax error
 end
