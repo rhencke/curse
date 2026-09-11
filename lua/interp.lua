@@ -1008,9 +1008,20 @@ local function expand_to_fields(sh, w)
   local ifs = sh.vars["IFS"] and sh:get("IFS") or " \t\n"
   local function isws(c) return c == " " or c == "\t" or c == "\n" end
   local function inifs(c) return c ~= "" and ifs:find(c, 1, true) ~= nil end
-  local fields, cur, cur_unq = {}, nil, false
-  local function brk() if cur ~= nil then fields[#fields + 1] = { s = cur, unq = cur_unq }; cur = nil; cur_unq = false end end
-  local function add(s, unq) cur = (cur or "") .. s; if unq then cur_unq = true end end
+  -- `q` is a per-character literal-mask parallel to the field's string ("1" = the
+  -- char came from QUOTED/escaped text so it's literal in pathname expansion, "0" =
+  -- glob-active). Kept OUT OF BAND (not an escape byte) so it can't collide with a
+  -- real byte in the data — curse is byte-transparent, so `'[bc]'*.mm` matches the
+  -- file [bc]ar.mm while a $'\x01' byte passes through untouched.
+  local fields, cur, cur_unq, cur_q = {}, nil, false, nil
+  local function brk()
+    if cur ~= nil then fields[#fields + 1] = { s = cur, unq = cur_unq, q = cur_q }; cur, cur_unq, cur_q = nil, false, nil end
+  end
+  local function add(s, unq)
+    cur = (cur or "") .. s
+    cur_q = (cur_q or "") .. (unq and "0" or "1"):rep(#s)
+    if unq then cur_unq = true end
+  end
   local function feed_split(v) -- unquoted expansion text: split on $IFS
     local i, n = 1, #v
     while i <= n do
@@ -1093,10 +1104,36 @@ local function expand_to_fields(sh, w)
     if #cur > 0 then gipats[#gipats + 1] = table.concat(cur) end
   end
   local noglob = sh.opt_f -- set -f: pathname expansion disabled; globs stay literal
+  local GLOBSPECIAL = { ["*"] = 1, ["?"] = 1, ["["] = 1, ["]"] = 1, ["\\"] = 1,
+    ["+"] = 1, ["@"] = 1, ["!"] = 1, ["("] = 1, [")"] = 1 }
+  -- is there a glob metacharacter at a NON-masked (glob-active) position?
+  local function glob_active(f)
+    local s, q = f.s, f.q
+    for i = 1, #s do
+      if not q or q:sub(i, i) == "0" then
+        local c = s:sub(i, i)
+        if c == "*" or c == "?" or c == "[" then return true end
+        if (c == "?" or c == "*" or c == "+" or c == "@" or c == "!")
+          and s:sub(i + 1, i + 1) == "(" and (not q or q:sub(i + 1, i + 1) == "0") then return true end
+      end
+    end
+    return false
+  end
+  -- build the glob pattern: a masked (quoted) glob-special char is backslash-escaped
+  -- so glob_conv treats it literally; the stored value f.s is left byte-for-byte intact.
+  local function glob_pat(f)
+    if not f.q or not f.q:find("1") then return f.s end
+    local o = {}
+    for i = 1, #f.s do
+      local c = f.s:sub(i, i)
+      o[#o + 1] = (f.q:sub(i, i) == "1" and GLOBSPECIAL[c]) and ("\\" .. c) or c
+    end
+    return table.concat(o)
+  end
   for _, f in ipairs(fields) do
-    if not noglob and f.unq and (f.s:find("[*?%[]") or f.s:find("[?*+@!]%(")) then
+    if not noglob and f.unq and glob_active(f) then
       -- a set GLOBIGNORE always filters `.`/`..` (overriding globskipdots)
-      local m = rt.glob_expand(f.s, { dotglob = dotglob, skipdots = giset or shopt_on(sh, "globskipdots"),
+      local m = rt.glob_expand(glob_pat(f), { dotglob = dotglob, skipdots = giset or shopt_on(sh, "globskipdots"),
         globstar = shopt_on(sh, "globstar") })
       if m and gipats then
         local filt = {}
