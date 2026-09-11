@@ -3626,6 +3626,12 @@ end
 
 -- Declaration builtins whose `name=value` arguments are assignment words.
 local ASSIGN_CMD = { export = 1, declare = 1, typeset = 1, readonly = 1, ["local"] = 1 }
+-- POSIX "special built-in utilities": under `set -o posix`, a prefix assignment
+-- on one of these persists in the shell (see the prefix-assignment handling).
+-- `exec` is special too but is intercepted earlier with its own env handling.
+local SPECIAL_BUILTIN = { [":"] = 1, ["."] = 1, source = 1, eval = 1, exit = 1,
+  export = 1, readonly = 1, ["set"] = 1, shift = 1, times = 1, trap = 1, unset = 1,
+  ["break"] = 1, ["continue"] = 1, ["return"] = 1 }
 -- compound commands whose trailing redirs (`done < f`, `fi > f`) apply to the
 -- whole construct; handled generically below (simple/group/subshell do their own).
 local COMPOUND_REDIR = { whilec = true, forc = true, forin = true, ["if"] = true,
@@ -3926,7 +3932,17 @@ exec_stmt = function(sh, st, hook)
         if sh.write_err then sh.status = 1 end -- builtin hit a write error (e.g. full disk)
       end
     end
-    if st.assigns then
+    if st.assigns and sh.opt_posix and args[1] and SPECIAL_BUILTIN[args[1]] then
+      -- POSIX (bash under `set -o posix`): a variable assignment prefixed to a
+      -- SPECIAL builtin (`:`, `.`, eval, export, readonly, set, shift, trap,
+      -- unset, …) persists in the shell as a normal, NON-exported assignment —
+      -- not scoped to the command. `foo=bar :` leaves foo=bar; `foo=bar readonly
+      -- spam=eggs` leaves foo set but not in the environment.
+      for _, a in ipairs(st.assigns) do
+        if a.raw then sh:set_str(a.name, a.raw) else exec_stmt(sh, a, hook) end
+      end
+      run_cmd()
+    elseif st.assigns then
       -- prefix assignments: apply as a temporary, EXPORTED env for this command
       -- only, then restore (both the shell var and the process env). Each binding
       -- is pushed onto sh.tenv (LIFO) so an `unset` inside the command reveals the
