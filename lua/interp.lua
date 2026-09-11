@@ -1981,16 +1981,26 @@ local function exec_simple(sh, args, hook, no_func)
       if not f then io.stderr:write("curse: " .. cmd .. ": " .. name .. ": No such file or directory\n"); sh.status = 1
       else
         local src = f:read("*a"); f:close()
-        local ok, parsed = pcall(P.parse, src)
-        if not ok then sh.status = 2
-        else
+        do
           local savep, savenp = sh.params, sh.nparams
           if #args > j then
             sh.params, sh.nparams = {}, 0
             for k = j + 1, #args do sh.nparams = sh.nparams + 1; sh.params[sh.nparams] = args[k] end
           end
           sh.sourcedepth = (sh.sourcedepth or 0) + 1 -- a `return` is valid while sourcing
-          local rok, err = pcall(exec_list, sh, parsed.stmts, hook, false)
+          -- Run the file the way the shell runs its own input: LAZILY through the
+          -- sh-aware parser, so aliases defined earlier expand later and a `return`
+          -- ends the file. A syntax error stops after the valid prefix (bash),
+          -- reported as status 2 without halting the shell.
+          local rok, err = pcall(function()
+            local nextf = P.open(src, sh)
+            while true do
+              local st = nextf()
+              if st == nil then break end
+              if st.t == "parse_error" then error({ __curse_parseerr = true }) end
+              exec_list(sh, { st }, hook, false)
+            end
+          end)
           sh.sourcedepth = sh.sourcedepth - 1
           if #args > j then sh.params, sh.nparams = savep, savenp end
           if not rok then
