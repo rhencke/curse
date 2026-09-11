@@ -503,11 +503,16 @@ eval = function(sh, e)
     if e.op ~= "=" then
       arith_nounset(sh, e.name) -- `x += …` reads x first
       local cur = iv and rt.arith_num(sh:array_get(e.name, iv)) or sh:aget(e.name)
-      local o = e.op:sub(1, 1)
+      local o = e.op:sub(1, #e.op - 1) -- strip the trailing '=' (`<<=` -> `<<`)
       if o == "+" then v = cur + v elseif o == "-" then v = cur - v
       elseif o == "*" then v = cur * v
       elseif o == "/" then if v == i64(0) then arith_div0() end; v = cur / v
-      elseif o == "%" then if v == i64(0) then arith_div0() end; v = cur % v end
+      elseif o == "%" then if v == i64(0) then arith_div0() end; v = cur % v
+      elseif o == "&" then v = bit.band(cur, v)
+      elseif o == "|" then v = bit.bor(cur, v)
+      elseif o == "^" then v = bit.bxor(cur, v)
+      elseif o == "<<" then v = bit.lshift(cur, tonumber(v) % 64)
+      elseif o == ">>" then v = bit.arshift(cur, tonumber(v) % 64) end
     end
     if iv then sh:array_set(e.name, iv, rt.i64_to_str(v)); return v end
     return sh:aset(e.name, v)
@@ -1217,7 +1222,7 @@ local BUILTINS = {
   exec = 1, readonly = 1, umask = 1, alias = 1, unalias = 1, shopt = 1, wait = 1, trap = 1,
   mapfile = 1, readarray = 1, compgen = 1, complete = 1, compopt = 1,
   pushd = 1, popd = 1, dirs = 1, builtin = 1, kill = 1, ulimit = 1, jobs = 1,
-  history = 1, fc = 1, hash = 1,
+  history = 1, fc = 1, hash = 1, ["let"] = 1,
 }
 M.BUILTINS = BUILTINS -- exposed so the compiled backend delegates the same set
 local KEYWORDS = {
@@ -2025,6 +2030,19 @@ local function exec_simple(sh, args, hook, no_func)
         end
       end
       sh.status = allok and 0 or 1
+    end
+  elseif cmd == "let" then
+    -- let EXPR…: evaluate each as arithmetic (assignments take effect). Status is
+    -- 0 if the LAST expression is non-zero, else 1; a bad/empty expression or no
+    -- args is also status 1 (an arith error is non-fatal, like `(( ))`).
+    if #args < 2 then io.stderr:write("curse: let: expression expected\n"); sh.status = 1
+    else
+      local last = 0
+      for k = 2, #args do
+        local ok, v = pcall(function() return eval(sh, P.arith(args[k])) end)
+        last = ok and tonumber(rt.i64_to_str(v)) or 0
+      end
+      sh.status = (last ~= 0) and 0 or 1
     end
   elseif cmd == "[" or cmd == "test" then do_test(sh, args)
   elseif cmd == "return" then

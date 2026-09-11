@@ -110,8 +110,8 @@ local function arith(src, nodefer)
     -- post ++/--
     if starts("++") then i = i + 2; return { k = "post", name = name, idx = idx, idxraw = ir, d = 1 } end
     if starts("--") then i = i + 2; return { k = "post", name = name, idx = idx, idxraw = ir, d = -1 } end
-    -- assignment operators
-    for _, op in ipairs({ "+=", "-=", "*=", "/=", "%=" }) do
+    -- assignment operators (3-char shifts before their 2-char prefixes)
+    for _, op in ipairs({ "<<=", ">>=", "+=", "-=", "*=", "/=", "%=", "&=", "^=", "|=" }) do
       if starts(op) then i = i + #op; return { k = "asgn", name = name, idx = idx, idxraw = ir, op = op, e = parseExpr(0) } end
     end
     if starts("=") and src:sub(i + 1, i + 1) ~= "=" then
