@@ -2396,8 +2396,13 @@ local function exec_simple(sh, args, hook, no_func)
             sh:set_str(nm, ap and (sh:get(nm) .. nv) or nv)
             sh.vars[nm].lower = lattr or nil; sh.vars[nm].upper = uattr or nil
           else
-            if assoc then sh:declare_assoc(nm) end
-            sh:set_str(nm, ap and (sh:get(nm) .. val) or val)
+            local eb = sh.vars[sh:deref(nm)]
+            if eb and eb.arr and not eb.assoc and not assoc then -- scalar (+)= on an indexed array -> element 0
+              sh:array_set(nm, array_key(sh, nm, "0"), val, ap)
+            else
+              if assoc then sh:declare_assoc(nm) end
+              sh:set_str(nm, ap and (sh:get(nm) .. val) or val)
+            end
           end
           local bb = sh.vars[sh:deref(nm)]
           if roattr and bb and not nref then bb.ro = true end -- bash ignores -r when -n is given
