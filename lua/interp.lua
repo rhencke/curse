@@ -725,7 +725,9 @@ local function expand_part_str(sh, p, assign)
       while k <= m do
         local ch = txt:sub(k, k)
         if ch == "\\" then
-          if txt:sub(k + 1, k + 1) == "\n" then k = k + 2 -- backslash-newline: line continuation (removed)
+          local nx2 = txt:sub(k + 1, k + 1)
+          if nx2 == "\n" then k = k + 2 -- backslash-newline: line continuation (removed)
+          elseif nx2 == "}" then out[#out + 1] = "}"; k = k + 2 -- \} in a ${…} word is a literal }
           else out[#out + 1] = txt:sub(k, k + 1); k = k + 2 end
         elseif ch == '"' then k = k + 1 -- drop the syntactic inner quote
         else out[#out + 1] = ch; k = k + 1 end
