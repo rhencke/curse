@@ -257,7 +257,7 @@ function Shell:exec(...)
   if not args[1]:find("/", 1, true) then
     execpath = self:resolve_cmd(args[1])
     if not execpath then
-      io.stderr:write("curse: " .. args[1] .. ": command not found\n"); self.status = 127; return
+      self:errmsg("curse: " .. args[1] .. ": command not found\n"); self.status = 127; return
     end
   end
   local argv = ffi.new("const char*[?]", n + 1)
@@ -274,7 +274,7 @@ function Shell:exec(...)
     local rc = C.posix_spawnp(pidp, execpath, nil, nil, ffi.cast("char *const *", argv), C.environ)
     if rc == 8 then return self:run_noexec(execpath, args, n) end -- no shebang: run as a script
     if rc ~= 0 then
-      io.stderr:write("curse: " .. tostring(args[1]) .. (rc == 2 and ": command not found\n" or ": Permission denied\n"))
+      self:errmsg("curse: " .. tostring(args[1]) .. (rc == 2 and ": command not found\n" or ": Permission denied\n"))
       self.status = (rc == 2) and 127 or 126; return
     end
     local st = ffi.new("int[1]"); C.waitpid(pidp[0], st, 0); self.status = M.wexit(st[0]); return
@@ -302,7 +302,7 @@ function Shell:exec(...)
   C.close(wfd)
   if rc ~= 0 and rc ~= 8 then -- ENOENT -> "command not found" (127); else can't-execute (126)
     C.close(rfd)
-    io.stderr:write("curse: " .. tostring(args[1]) .. (rc == 2 and ": command not found\n" or ": Permission denied\n"))
+    self:errmsg("curse: " .. tostring(args[1]) .. (rc == 2 and ": command not found\n" or ": Permission denied\n"))
     self.status = (rc == 2) and 127 or 126
     return
   end
@@ -606,6 +606,12 @@ function Shell:get_u(name)
     io.stderr:write("curse: " .. name .. ": unbound variable\n"); error({ __curse_exit = 1 })
   end
   return self:get(name)
+end
+-- Capture-aware error write: inside a `$(...)` capture with `2>&1` active, route
+-- the message into the capture buffer (self.out) so it's captured like bash;
+-- otherwise to real stderr. Mirrors interp's sherr for runtime-side messages.
+function Shell:errmsg(msg)
+  if self.capturing and (self.err2out or 0) > 0 then self.out(msg) else io.stderr:write(msg) end
 end
 
 -- int64 value of a var for arithmetic (use the cache, else parse the string).

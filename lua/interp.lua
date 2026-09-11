@@ -410,6 +410,7 @@ local arith_key -- array subscript in arith: string key for assoc, number for in
 local arith_int -- forward: arith-eval a slice offset/length string
 local run_trap -- trap-handler runner (forward decl; defined near the bottom)
 local fire_err -- ERR-trap + errexit enforcement (forward decl; defined near exec_list)
+local sherr -- error-message writer, capture-aware for `2>&1` in $() (defined w/ redirs)
 -- Resolve a variable's string value in arithmetic. bash treats it as an arith
 -- EXPRESSION: a bare number is its value, but a name (or `3+4`, `bar`) is
 -- recursively parsed and evaluated (so bar=foo; foo=5; $((bar)) == 5). A pure
@@ -643,7 +644,7 @@ local function expand_part_str(sh, p)
   elseif p.pexp then
     local pe = p.pexp
     if pe.op == "badsubst" then -- ${x|html} and other unrecognized ${…} forms
-      io.stderr:write("curse: ${" .. (pe.raw or pe.name or "") .. "}: bad substitution\n")
+      sherr(sh, "curse: ${" .. (pe.raw or pe.name or "") .. "}: bad substitution\n")
       error({ __curse_exit = 1, __curse_experr = true }) -- fails the command, non-fatal
     end
     if pe.op == "@" and pe.arg == "P" then -- ${x@P}: decode prompt escapes, then expand
@@ -1137,6 +1138,7 @@ local function apply_redirs(sh, redirs)
   io.flush() -- flush pending stdout BEFORE moving fds, else buffered output from a
              -- prior command would be redirected into (and lost to) the new target
   local save, ok = {}, true
+  local fd1file = false -- has fd 1 gone to a real file? (then `2>&1` isn't captured)
   local function backup(fd) save[#save + 1] = { fd = fd, saved = C.dup(fd) } end
   -- redirect targets are word-expanded at runtime (e.g. `> $TMP/f`, `>& $myfd`).
   local function tgt(r) return expand_word(sh, P.parse_word(r.target or "")) end
@@ -1166,6 +1168,8 @@ local function apply_redirs(sh, redirs)
         r = setmetatable({ fd = nf }, { __index = r }) -- shadow r.fd, inherit op/target
       end
     end
+    if ((r.op == "out" or r.op == "clobber" or r.op == "app" or r.op == "rw") and r.fd == 1)
+        or r.op == "outboth" or r.op == "appboth" then fd1file = true end
     if r.op == "out" then
       -- noclobber (set -C): `>` fails on an existing regular file (open_out)
       local t = ftgt(r); if not t then ok = false else
@@ -1216,6 +1220,12 @@ local function apply_redirs(sh, redirs)
           else
             backup(r.fd); C.dup2(m, r.fd)
             if movesrc then C.close(m) end
+            -- `2>&1` while capturing (fd 1 not a file): route curse's OWN error
+            -- output into the capture buffer too (bash captures it; our in-process
+            -- capture leaves fd 1 real, so the error would otherwise leak). See sherr.
+            if r.fd == 2 and m == 1 and sh.capturing and not fd1file then
+              save.e2o = (save.e2o or 0) + 1; save._sh = sh; sh.err2out = (sh.err2out or 0) + 1
+            end
           end
         elseif r.op == "dup" and tv ~= "" then -- `>&word` (non-number): open the file for
           backup(r.fd); backup(2); local f = C.open(tv, sh.opt_C and 705 or 577, 438) -- both stdout AND stderr
@@ -1239,10 +1249,17 @@ local function redirs_touch_stdout(rd)
   return false
 end
 local function restore_redirs(save)
+  if save.e2o and save._sh then save._sh.err2out = (save._sh.err2out or 0) - save.e2o end -- undo 2>&1 capture routing
   for k = #save, 1, -1 do
     local s = save[k]
     if s.saved >= 0 then C.dup2(s.saved, s.fd); C.close(s.saved) else C.close(s.fd) end
   end
+end
+-- Write a curse error message. Inside a `$(...)` capture where `2>&1` is active,
+-- route it into the capture buffer (sh.out) so it's captured like bash does;
+-- otherwise to real stderr.
+sherr = function(sh, msg)
+  if sh.capturing and (sh.err2out or 0) > 0 then sh.out(msg) else io.stderr:write(msg) end
 end
 
 -- name classification for `type` / `command -v`
@@ -2248,7 +2265,7 @@ local function exec_simple(sh, args, hook, no_func)
           io.stderr:write("curse: popd: " .. a .. ": invalid option\n"); sh.status = 2; return
         elseif a ~= "-" then io.stderr:write("curse: popd: " .. a .. ": invalid argument\n"); sh.status = 2; return end
       end
-      if #ds < 2 then io.stderr:write("curse: popd: directory stack empty\n"); sh.status = 1; return end
+      if #ds < 2 then sherr(sh, "curse: popd: directory stack empty\n"); sh.status = 1; return end
       table.remove(ds, 1); cd_to(ds[1])
       local parts = {}; for k = 1, #ds do parts[k] = tilde(ds[k]) end
       sh:echo(table.concat(parts, " ")); sh.status = 0
