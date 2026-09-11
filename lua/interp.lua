@@ -684,7 +684,10 @@ end
 local function tilde_prefix(sh, s)
   if s:sub(1, 1) ~= "~" then return s end
   local r = s:sub(2)
-  if r == "" or r:sub(1, 1) == "/" then local h = sh:get("HOME"); return h ~= "" and (h .. r) or s end
+  if r == "" or r:sub(1, 1) == "/" then -- ~ / ~/… : HOME's value if HOME is SET (even to ""); else literal
+    if sh.vars[sh:deref("HOME")] ~= nil then return sh:get("HOME") .. r end
+    return s
+  end
   if (r == "+" or r:sub(1, 2) == "+/") then return sh:pwd() .. r:sub(2) end
   if (r == "-" or r:sub(1, 2) == "-/") then local o = sh:get("OLDPWD"); return o ~= "" and (o .. r:sub(2)) or s end
   return s
@@ -2810,21 +2813,37 @@ end
 
 -- [[ … ]] evaluation. Reuses the test builtin's unary/binary; == is a shell glob
 -- (literal when the RHS was quoted), =~ a regex (Lua-pattern approximation of ERE).
+-- [[ ]] operands undergo word-initial tilde expansion (bash), unlike a scalar
+-- var value. Only an UNQUOTED literal `~…` at word start expands.
+local function word_initial_tilde(w)
+  local p1 = w and w.parts and w.parts[1]
+  return p1 and p1.lit ~= nil and not p1.q and p1.lit:sub(1, 1) == "~"
+end
+local function dbracket_word(sh, w)
+  local s = expand_word(sh, w)
+  if word_initial_tilde(w) and s:sub(1, 1) == "~" then return tilde_prefix(sh, s) end
+  return s
+end
+local function dbracket_pattern(sh, w)
+  local p = expand_pattern(sh, w)
+  if word_initial_tilde(w) and p:sub(1, 1) == "~" then return tilde_prefix(sh, p) end
+  return p
+end
 local function eval_dbracket(sh, node)
   local k = node.kind
   if k == "and" then return eval_dbracket(sh, node.l) and eval_dbracket(sh, node.r) end
   if k == "or" then return eval_dbracket(sh, node.l) or eval_dbracket(sh, node.r) end
   if k == "not" then return not eval_dbracket(sh, node.e) end
-  if k == "str" then return expand_word(sh, node.word) ~= "" end
+  if k == "str" then return dbracket_word(sh, node.word) ~= "" end
   if k == "unary" and node.op == "-v" then return var_is_set(sh, expand_word(sh, node.word)) end
-  if k == "unary" then return unary(sh, node.op, expand_word(sh, node.word)) end
+  if k == "unary" then return unary(sh, node.op, dbracket_word(sh, node.word)) end
   if k == "binary" then
-    local l, r, op = expand_word(sh, node.l), expand_word(sh, node.r), node.op
+    local l, r, op = dbracket_word(sh, node.l), dbracket_word(sh, node.r), node.op
     local ic = sh.shopt.nocasematch and true or nil -- shopt -s nocasematch: case-insensitive
     if op == "==" or op == "=" then
-      if node.rq and not ic then return l == r else return rt.glob_match(l, expand_pattern(sh, node.r), ic) end
+      if node.rq and not ic then return l == r else return rt.glob_match(l, dbracket_pattern(sh, node.r), ic) end
     elseif op == "!=" then
-      if node.rq and not ic then return l ~= r else return not rt.glob_match(l, expand_pattern(sh, node.r), ic) end
+      if node.rq and not ic then return l ~= r else return not rt.glob_match(l, dbracket_pattern(sh, node.r), ic) end
     elseif op == "=~" then
       -- a quoted part of the regex is matched literally (bash), so re-expand with
       -- regex-escaping of quoted segments instead of using the plain rhs.
