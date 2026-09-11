@@ -1921,7 +1921,17 @@ local function exec_simple(sh, args, hook, no_func)
     elseif a == nil then -- list the whole history
       for i = 1, #sh.history do sh:echo(("%5d  %s"):format(i, sh.history[i])) end
       sh.status = 0
-    else sh.status = 0 end
+    elseif a:sub(1, 1) == "-" then -- an unrecognized `-X` flag (e.g. `history -5`)
+      io.stderr:write("curse: history: " .. a .. ": invalid option\n"); sh.status = 2
+    elseif args[3] ~= nil then -- too many arguments
+      io.stderr:write("curse: history: too many arguments\n"); sh.status = 1
+    elseif not tonumber((a:gsub("^%+", ""))) then -- a non-numeric count (`history f`)
+      io.stderr:write("curse: history: " .. a .. ": numeric argument required\n"); sh.status = 1
+    else -- `history N` / `history +N`: list the last N entries
+      local nn = math.abs(tonumber((a:gsub("^%+", ""))))
+      for i = math.max(1, #sh.history - nn + 1), #sh.history do sh:echo(("%5d  %s"):format(i, sh.history[i])) end
+      sh.status = 0
+    end
   elseif cmd == "fc" then
     -- fc -l [-n] [-r] [first] [last]: LIST history (edit/re-exec modes not supported).
     -- The `fc` command is itself the last history entry, so it's excluded from ranges.
