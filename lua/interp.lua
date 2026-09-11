@@ -677,7 +677,9 @@ local function expand_part_str(sh, p)
       local out, k, m = {}, 1, #txt
       while k <= m do
         local ch = txt:sub(k, k)
-        if ch == "\\" then out[#out + 1] = txt:sub(k, k + 1); k = k + 2
+        if ch == "\\" then
+          if txt:sub(k + 1, k + 1) == "\n" then k = k + 2 -- backslash-newline: line continuation (removed)
+          else out[#out + 1] = txt:sub(k, k + 1); k = k + 2 end
         elseif ch == '"' then k = k + 1 -- drop the syntactic inner quote
         else out[#out + 1] = ch; k = k + 1 end
       end
