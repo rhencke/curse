@@ -543,7 +543,7 @@ end
 -- that runs code in a protected context (compgen -F) can recover from it.
 local function arith_div0()
   io.stderr:write("curse: division by 0\n")
-  error({ __curse_exit = 1, __curse_matherr = true })
+  error({ __curse_exit = 1, __curse_matherr = true, __curse_lineabort = true })
 end
 
 -- Reading an unset variable in arithmetic under `set -u` is a fatal unbound-
@@ -1262,9 +1262,11 @@ local function expand_to_fields(sh, w)
         m = (#filt > 0) and filt or nil
       end
       if m then for _, x in ipairs(m) do out[#out + 1] = x end
-      elseif sh.shopt.failglob then -- shopt -s failglob: no match is an error (non-fatal)
+      elseif sh.shopt.failglob then -- shopt -s failglob: no match aborts the rest of
+        -- the current LINE (bash: like a fatal expansion error), so tag lineabort
+        -- (not experr) — run_lazy fast-forwards past same-line statements.
         io.stderr:write("curse: no match: " .. f.s .. "\n")
-        error({ __curse_exit = 1, __curse_experr = true })
+        error({ __curse_exit = 1, __curse_lineabort = true })
       elseif nullglob then -- no matches: nullglob drops the field entirely
       else out[#out + 1] = f.s end
     else
@@ -4461,20 +4463,25 @@ function M.run_lazy(sh, src, hook)
     while true do
       local st = nextf()
       if st == nil then break end
-      -- A fatal arithmetic error (divide by zero) in a WORD-context $((…)) — an
-      -- argument, an assignment value, an `if`/`case` word — aborts the REST of the
-      -- current input LINE, then bash resumes at the next line with $?=1. Skip the
-      -- statements that began on that same line. (A `(( … ))` COMMAND-context div0
-      -- is non-fatal and handled by the arithcmd path, so it never reaches here.)
+      -- bash's read-parse-execute unit is the whole LINE, so a fatal expansion in a
+      -- WORD context — divide-by-zero in $((…)), a `failglob` no-match — aborts the
+      -- REST of the current input line and resumes at the next line with $?=1.
+      -- Fast-forward past statements that began on that same line, keeping the lazy
+      -- statement parser (no lookahead, so no hang). `;` is thus NOT equivalent to a
+      -- newline here. (A `(( … ))` COMMAND-context div0 is non-fatal and handled by
+      -- the arithcmd path, so it never reaches here.)
       if skip_to and st.line and st.line <= skip_to then
-        -- swallowed: same line as the div0
+        -- swallowed: same line as the aborting error
       else
         skip_to = nil
         k = k + 1
         hook("stmt", k)
         local ok, err = pcall(exec_stmt, sh, st, hook)
         if not ok then
-          if type(err) == "table" and err.__curse_matherr then
+          if type(err) == "table" and err.__curse_lineabort then
+            -- under `set -e` a failed expansion exits the shell (like any failed
+            -- command); otherwise fast-forward past the rest of the current line
+            if sh.opt_e then error(err) end
             sh.status = 1; skip_to = st.line or 0
           else error(err) end
         else

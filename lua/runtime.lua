@@ -528,11 +528,12 @@ function M.ipow(base, exp)
 end
 
 -- Division/modulo with bash's fatal divide-by-zero (aborts the command, status 1).
--- Tagged __curse_matherr so a protected caller (compgen -F) can recover; shared by
--- both tiers so the compiled path faults identically to the interpreter.
+-- __curse_matherr lets a protected caller (compgen -F) recover; __curse_lineabort
+-- makes run_lazy fast-forward past the rest of the current input LINE (bash's
+-- line-oriented abort). Shared by both tiers so the compiled path faults alike.
 local function div0()
   io.stderr:write("curse: division by 0\n")
-  error({ __curse_exit = 1, __curse_matherr = true })
+  error({ __curse_exit = 1, __curse_matherr = true, __curse_lineabort = true })
 end
 function M.idiv(l, r) if r == i64(0) then div0() end; return l / r end
 function M.imod(l, r) if r == i64(0) then div0() end; return l % r end
