@@ -1056,6 +1056,7 @@ local function make_parser(src)
       skipsep()
       if peekword() == "do" then i = i + 2 end
       local body_stmts = parse_stmts({ done = true })
+      if #body_stmts == 0 then error("syntax error near `done'") end -- bash: empty do/done is invalid
       return { t = "forin", id = id, line = ln, name = name, words = words, body = body_stmts, redirs = tail_redirs() }
     end
     -- while/until COND; do BODY; done  — COND is a command list; the loop runs
@@ -1068,6 +1069,7 @@ local function make_parser(src)
       if t1 ~= "do" then error("syntax error: `" .. kind .. "' expected `do'") end
       local body_stmts, t2 = parse_stmts({ done = true })
       if t2 ~= "done" then error("syntax error: `" .. kind .. "' expected `done'") end
+      if #body_stmts == 0 then error("syntax error near `done'") end -- bash: empty do/done is invalid
       return { t = "whilec", id = id, line = ln, cond = cond, body = body_stmts,
         negate = (kind == "until"), redirs = tail_redirs() }
     end
@@ -1079,9 +1081,11 @@ local function make_parser(src)
       while true do
         local cond = parse_stmts({ ["then"] = true })
         local body, term = parse_stmts({ elif = true, ["else"] = true, fi = true })
+        if #body == 0 then error("syntax error near `" .. term .. "'") end -- bash: empty then/elif body
         clauses[#clauses + 1] = { cond = cond, body = body }
         if term == "else" then
           local eb = parse_stmts({ fi = true })
+          if #eb == 0 then error("syntax error near `fi'") end -- bash: empty else body
           clauses[#clauses + 1] = { cond = nil, body = eb }
           break
         elseif term == "fi" then break
