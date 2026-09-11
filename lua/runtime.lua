@@ -1050,9 +1050,12 @@ function Shell:expand_param(pe, arg, arg2, idxnum)
   if op == ":?" then if val == "" then io.stderr:write("curse: " .. name .. ": " .. A() .. "\n"); error({ __curse_exit = 1 }) end return val end
   if op == "?" then if not isset then io.stderr:write("curse: " .. name .. ": " .. A() .. "\n"); error({ __curse_exit = 1 }) end return val end
   arg = arg or ""
-  if op == "@" then -- ${x@OP} transforms; on an UNSET var they yield empty
-    if not isset then return "" end
+  if op == "@" then -- ${x@OP} transforms
+    -- @a reports the VARIABLE's attributes (e.g. `A` for a declared assoc array),
+    -- so it's non-empty even when the scalar view (a[0]) is unset; the other
+    -- transforms yield empty on an unset var.
     if arg == "a" then return self:attr_string(name) end
+    if not isset then return "" end
     if arg == "A" then return name .. "=" .. M.shell_quote(val) end -- declare-able form
   end
   return self:apply_str_op(op, val, arg, arg2)
