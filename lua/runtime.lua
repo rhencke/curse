@@ -1132,6 +1132,27 @@ local function scan_seg(dir, seg, dotglob, skipdots)
   return out
 end
 
+local stbuf_g = ffi.new("uint8_t[144]")
+local function is_dir(path)
+  if ffi.C.curse_rt_stat(path == "" and "." or path, stbuf_g) ~= 0 then return false end
+  return bit.band(ffi.cast("uint32_t *", stbuf_g + 24)[0], 0xF000) == 0x4000
+end
+-- globstar `**`: every directory at or under `base` (recursively), including base
+-- itself (the zero-level case) — the prefixes an intermediate `**/` descends into.
+local function rec_dirs(base, dotglob)
+  local out = { base }
+  local d = ffi.C.opendir(base == "" and "." or base); if d == nil then return out end
+  while true do
+    local e = ffi.C.readdir(d); if e == nil then break end
+    local name = ffi.string(ffi.cast("const char *", e) + 19)
+    if name ~= "." and name ~= ".." and (name:sub(1, 1) ~= "." or dotglob) then
+      local path = base == "" and name or (base == "/" and "/" .. name or base .. "/" .. name)
+      if is_dir(path) then for _, sd in ipairs(rec_dirs(path, dotglob)) do out[#out + 1] = sd end end
+    end
+  end
+  ffi.C.closedir(d)
+  return out
+end
 -- Pathname (glob) expansion: return the sorted matching paths for `pattern`, or
 -- nil if none (bash default: the word stays literal). Multi-level patterns
 -- (`*/*.c`, `dir/*/x`) are expanded segment by segment; a glob segment that
@@ -1153,7 +1174,12 @@ function M.glob_expand(pattern, opts)
       if base == "" then return name elseif base == "/" then return "/" .. name
       else return base .. "/" .. name end
     end
-    if not isglob then
+    if seg == "**" and opts.globstar and not islast then
+      -- an intermediate `**/` matches zero or more directory levels
+      for _, base in ipairs(cur) do
+        for _, dir in ipairs(rec_dirs(base, opts.dotglob)) do nxt[#nxt + 1] = dir end
+      end
+    elseif not isglob then
       -- literal segment: append; a nonexistent intermediate dir yields nothing
       -- next round (opendir fails), so no explicit stat needed.
       for _, base in ipairs(cur) do nxt[#nxt + 1] = joined(base, seg) end
