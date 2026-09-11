@@ -434,7 +434,9 @@ function Shell:capture_src(src)
   self.capturing = saved_cap
   self.out = saved
   if not ok then
-    if type(err) == "table" and (err.__curse_exit or err.__curse_return) then
+    if type(err) == "table" and err.__curse_parseerr then
+      error(err) -- a SYNTAX error inside $(…) is fatal to the whole containing command (bash)
+    elseif type(err) == "table" and (err.__curse_exit or err.__curse_return) then
       self.status = err.__curse_exit or err.__curse_return
     else error(err) end
   end
