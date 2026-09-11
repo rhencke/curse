@@ -989,6 +989,11 @@ local function make_parser(src, sh)
     if not on then return end
     if not cmdpos then
       if not (alias_next and alias_tail and i >= alias_tail) then return end
+      -- Now past the previous value: this is a fresh input word, so the guard
+      -- resets (bash only blocks an alias WITHIN its own value's expansion, not a
+      -- separate later occurrence — `echo-x echo-x` expands both). The word's own
+      -- value recursion below still accumulates into the fresh guard.
+      alias_seen = {}
     end
     local expanded = false
     while true do
