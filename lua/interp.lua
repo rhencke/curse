@@ -2227,6 +2227,15 @@ local function exec_simple(sh, args, hook, no_func)
         if nm and sh.vars[sh:deref(nm)] and sh.vars[sh:deref(nm)].ro then
           -- reassigning a readonly variable is rejected (bash: `typeset +r r=v` too)
           io.stderr:write("curse: " .. cmd .. ": " .. nm .. ": readonly variable\n"); allok = false
+        elseif nm and (aattr or assoc) and val:sub(1, 1) == "(" and val:sub(-1) == ")" then
+          -- dynamic array literal: `declare -a "x=(1 2 3)"` (the -a/-A flag is required)
+          if localize then sh:localVar(nm) end
+          if assoc then sh:declare_assoc(nm) end
+          local ast = P.parse(nm .. (op == "+=" and "+=" or "=") .. val)
+          local st1 = ast.stmts[1]
+          if st1 and st1.t == "arrayassign" then M.do_arrayassign(sh, st1) end
+          local bb = sh.vars[sh:deref(nm)]
+          if roattr and bb then bb.ro = true end
         elseif nm then
           if localize then sh:localVar(nm) end
           local ap = (op == "+=")
