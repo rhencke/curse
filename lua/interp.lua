@@ -4139,8 +4139,10 @@ exec_stmt = function(sh, st, hook)
       local pids, prev_read, inline_status = {}, -1, nil
       for k = 1, nst do
         -- DEBUG fires before each stage IN THE PARENT (bash: a forked stage's child
-        -- does NOT fire it); the lastpipe in-process stage fires via its own exec_stmt.
-        if not (k == nst and lastpipe) and not (sh.in_trap and sh.in_trap > 0) then
+        -- does NOT fire it), but only for a stage that is itself a DEBUG-firing node
+        -- — a `{ }`/compound stage fires nothing (`{ …; } | cat` fires once, for cat).
+        -- The lastpipe in-process stage fires via its own exec_stmt instead.
+        if DEBUG_FIRE[cmds[k].t] and not (k == nst and lastpipe) and not (sh.in_trap and sh.in_trap > 0) then
           run_debug(sh, cmds[k].line or st.line)
         end
         local rd, wr = -1, -1
