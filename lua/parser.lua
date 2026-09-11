@@ -701,6 +701,28 @@ local function unquote(w)
   return w
 end
 
+-- Remove ALL quoting from a word (every ' " and \ segment), concatenating the
+-- literal content — bash's quote removal for a heredoc delimiter, so `'EOF'"2"`
+-- and `E\OF` collapse to EOF2 / EOF.
+local function dequote_word(w)
+  local out, i, len = {}, 1, #w
+  while i <= len do
+    local c = w:sub(i, i)
+    if c == "\\" then out[#out + 1] = w:sub(i + 1, i + 1); i = i + 2
+    elseif c == "'" then
+      i = i + 1; while i <= len and w:sub(i, i) ~= "'" do out[#out + 1] = w:sub(i, i); i = i + 1 end; i = i + 1
+    elseif c == '"' then
+      i = i + 1
+      while i <= len and w:sub(i, i) ~= '"' do
+        if w:sub(i, i) == "\\" then out[#out + 1] = w:sub(i + 1, i + 1); i = i + 2
+        else out[#out + 1] = w:sub(i, i); i = i + 1 end
+      end
+      i = i + 1
+    else out[#out + 1] = c; i = i + 1 end
+  end
+  return table.concat(out)
+end
+
 local function make_parser(src)
   local i, n, line = 1, #src, 1
   local loopId = 0
@@ -912,8 +934,10 @@ local function make_parser(src)
         if src:sub(q, q) == "-" then strip = true; q = q + 1 end
         i = q; ws()
         local draw = word()
-        local quoted = draw:sub(1, 1) == "'" or draw:sub(1, 1) == '"'
-        local r = { op = "heredoc", fd = fd and tonumber(fd) or 0, delim = unquote(draw), expand = not quoted, strip = strip, fdvar = fdvar }
+        -- ANY quoting anywhere in the delimiter word makes the body literal (bash);
+        -- the delimiter itself is the word with all quotes removed.
+        local quoted = draw:find('[\'"\\]') ~= nil
+        local r = { op = "heredoc", fd = fd and tonumber(fd) or 0, delim = dequote_word(draw), expand = not quoted, strip = strip, fdvar = fdvar }
         heredocs_pending[#heredocs_pending + 1] = r
         return r
       end
