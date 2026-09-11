@@ -2819,7 +2819,9 @@ local function exec_simple(sh, args, hook, no_func)
         local found = false
         if sh.aliases[nm] then sh:echo(nm .. " is aliased to `" .. sh.aliases[nm] .. "'"); found = true end
         if KEYWORDS[nm] then sh:echo(nm .. " is a shell keyword"); found = true end
-        if not fflag and sh.functions[nm] then sh:echo(nm .. " is a function"); found = true end
+        if not fflag and sh.functions[nm] then sh:echo(nm .. " is a function")
+          local d = sh.func_src and sh.func_src[nm]; if d then sh:echo(d) end -- verbatim body (bash prints it)
+          found = true end
         if BUILTINS[nm] then sh:echo(nm .. " is a shell builtin"); found = true end
         for _, p in ipairs(find_all_in_path(nm)) do sh:echo(nm .. " is " .. p); found = true end
         if not found then allok = false; io.stderr:write("curse: type: " .. nm .. ": not found\n") end
