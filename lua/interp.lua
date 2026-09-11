@@ -1053,7 +1053,18 @@ local function expand_to_fields(sh, w)
   local dotglob = giset or (sh.shopt.dotglob and true)
   local nullglob = sh.shopt.nullglob and true
   local gipats
-  if giset then gipats = {}; for p in (gi .. ":"):gmatch("([^:]*):") do if p ~= "" then gipats[#gipats + 1] = p end end end
+  if giset then -- split on ':' but NOT inside [...] (a `[[:alnum:]]` class holds colons)
+    gipats = {}
+    local depth, cur = 0, {}
+    for k = 1, #gi do
+      local c = gi:sub(k, k)
+      if c == "[" then depth = depth + 1; cur[#cur + 1] = c
+      elseif c == "]" then if depth > 0 then depth = depth - 1 end; cur[#cur + 1] = c
+      elseif c == ":" and depth == 0 then if #cur > 0 then gipats[#gipats + 1] = table.concat(cur); cur = {} end
+      else cur[#cur + 1] = c end
+    end
+    if #cur > 0 then gipats[#gipats + 1] = table.concat(cur) end
+  end
   local noglob = sh.opt_f -- set -f: pathname expansion disabled; globs stay literal
   for _, f in ipairs(fields) do
     if not noglob and f.unq and (f.s:find("[*?%[]") or f.s:find("[?*+@!]%(")) then
