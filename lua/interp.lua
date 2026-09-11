@@ -624,15 +624,18 @@ local function expand_part_str(sh, p)
     end
     return sh:param(p.param)
   elseif p.special then
-    if p.special == "#" then return tostring(sh.nparams)
+    local v
+    if p.special == "#" then v = tostring(sh.nparams)
     elseif p.special == "*" then -- $* joins on the first IFS char; $@ always on a space
-      return sh:paramsJoin(sh.vars["IFS"] and sh:get("IFS"):sub(1, 1) or " ")
-    elseif p.special == "@" then return sh:paramsJoin(" ")
-    elseif p.special == "?" then return tostring(sh.status)
-    elseif p.special == "$" then return tostring(sh:pid())
-    elseif p.special == "!" then return sh.last_bg_pid or ""
-    elseif p.special == "-" then return sh:dash_flags() end
-    return ""
+      v = sh:paramsJoin(sh.vars["IFS"] and sh:get("IFS"):sub(1, 1) or " ")
+    elseif p.special == "@" then v = sh:paramsJoin(" ")
+    elseif p.special == "?" then v = tostring(sh.status)
+    elseif p.special == "$" then v = tostring(sh:pid())
+    elseif p.special == "!" then v = sh.last_bg_pid or ""
+    elseif p.special == "-" then v = sh:dash_flags()
+    else v = "" end
+    if p.lenof then return tostring(#v) end -- ${##} ${#?} ${#-} ${#$} ${#!}: length
+    return v
   elseif p.arith then -- cache the parsed AST on the part (a loop re-expanding the
     if not p.arith_ast then -- same $((…)) shouldn't re-parse it)
       local ok, ast = pcall(P.arith, p.arith)

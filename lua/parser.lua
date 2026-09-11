@@ -265,7 +265,14 @@ local function parse_paramexp(inner)
     if inner:sub(1, 1) == "!" or inner:sub(1, 1) == "#" then
       return { pexp = { op = "badsubst", raw = "!" .. inner } }
     end
-  elseif inner:sub(1, 1) == "#" then lenpfx = true; inner = inner:sub(2) end -- ${#v} / ${#a[@]}
+  elseif inner:sub(1, 1) == "#" then lenpfx = true; inner = inner:sub(2) -- ${#v} / ${#a[@]}
+    -- ${#@}/${#*} are the positional-parameter COUNT, same as ${#}/$#.
+    if inner == "@" or inner == "*" then return { special = "#" } end
+    -- ${##} ${#?} ${#-} ${#$} ${#!}: the LENGTH of a special one-char parameter.
+    if inner == "#" or inner == "?" or inner == "-" or inner == "$" or inner == "!" then
+      return { special = inner, lenof = true }
+    end
+  end
   local name, rest = inner:match("^([%a_][%w_]*)(.*)$")
   if not name then name, rest = inner:match("^(%d+)(.*)$") end
   if not name then name, rest = inner:match("^([@*])(.*)$") end
