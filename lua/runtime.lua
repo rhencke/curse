@@ -12,7 +12,26 @@ local M = {}
 M.i64 = i64
 -- Single-quote a string for reuse as shell input: 'x' with embedded ' -> '\''.
 -- (Used by ${x@Q}/@A/@K, declare -p, set, and procsub's inner `sh -c`.)
-function M.shell_quote(s) return "'" .. s:gsub("'", "'\\''") .. "'" end
+-- Quote a string so it re-reads as itself. A control char or high byte forces
+-- ANSI-C $'…' form (\n \t \r, \NNN octal for other bytes), like bash's ${x@Q}
+-- and `set`/`declare` output; otherwise plain single-quoting.
+function M.shell_quote(s)
+  if s:find("[%z\1-\31\127-\255]") then
+    local out = { "$'" }
+    for i = 1, #s do
+      local b = s:byte(i)
+      if b == 10 then out[#out + 1] = "\\n"
+      elseif b == 9 then out[#out + 1] = "\\t"
+      elseif b == 13 then out[#out + 1] = "\\r"
+      elseif b == 92 then out[#out + 1] = "\\\\"
+      elseif b == 39 then out[#out + 1] = "\\'"
+      elseif b >= 32 and b < 127 then out[#out + 1] = string.char(b)
+      else out[#out + 1] = ("\\%03o"):format(b) end
+    end
+    out[#out + 1] = "'"; return table.concat(out)
+  end
+  return "'" .. s:gsub("'", "'\\''") .. "'"
+end
 
 local Shell = {}
 Shell.__index = Shell

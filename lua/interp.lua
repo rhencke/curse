@@ -1284,6 +1284,9 @@ M.do_arrayassign = do_arrayassign
 
 -- Quote a value the way `declare -p` does: double-quoted with \ " $ ` escaped.
 local function decl_quote(s)
+  -- a control char or high byte forces $'…' (bash: `declare -- x=$'a\nb'`);
+  -- otherwise the usual double-quoted form.
+  if s:find("[%z\1-\31\127-\255]") then return rt.shell_quote(s) end
   s = s:gsub("\\", "\\\\"):gsub('"', '\\"'):gsub("%$", "\\$"):gsub("`", "\\`")
   return '"' .. s .. '"'
 end
@@ -1402,14 +1405,14 @@ end
 local function printf_q(s)
   if s == "" then return "''" end
   if s:match("^[%w_@%%%+%-%./,:=^]+$") then return s end
-  if s:find("[%z\1-\31\127]") then
+  if s:find("[%z\1-\31\127-\255]") then -- control OR high byte -> $'…' (octal for bytes)
     local out = { "$'" }
     for k = 1, #s do
       local ch, b = s:sub(k, k), s:byte(k)
       if ch == "\n" then out[#out + 1] = "\\n"
       elseif ch == "\t" then out[#out + 1] = "\\t"
       elseif ch == "\r" then out[#out + 1] = "\\r"
-      elseif b < 32 or b == 127 then out[#out + 1] = string.format("\\%03o", b)
+      elseif b < 32 or b >= 127 then out[#out + 1] = string.format("\\%03o", b)
       elseif ch == "'" then out[#out + 1] = "\\'"
       elseif ch == "\\" then out[#out + 1] = "\\\\"
       else out[#out + 1] = ch end
