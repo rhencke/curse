@@ -1400,11 +1400,10 @@ local function make_parser(src)
         queue, qi = stmts, 1
         return stmts[1]
       end
-      if st == nil then
-        if i <= start then done = true; return nil end -- no progress: stop
-      else
-        return st
-      end
+      -- No progress (a stray `)`/`}` etc. yields an empty node or nil without
+      -- advancing): stop, so the lazy top-level loop can't spin forever.
+      if i <= start then done = true; return nil end
+      if st ~= nil then return st end
     end
   end
   return next_toplevel
