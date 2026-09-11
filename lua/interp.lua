@@ -2752,10 +2752,12 @@ local function exec_simple(sh, args, hook, no_func)
       sh.status = 0
       return
     end
-    local j, dd = 2, false
+    -- `force` (only `--`) replaces the positional params even when none follow; a
+    -- lone `-`/`+` merely stops option processing, so `set + -` leaves them alone.
+    local j, force = 2, false
     while j <= #args do
       local a = args[j]
-      if a == "--" then dd = true; j = j + 1; break
+      if a == "--" then force = true; j = j + 1; break
       elseif a == "-o" or a == "+o" then
         local o, on = args[j + 1], (a == "-o")
         if o == nil then
@@ -2769,8 +2771,9 @@ local function exec_simple(sh, args, hook, no_func)
           if SETOPT[o] then set_opt(sh, SETOPT[o], on) end
           j = j + 2
         end
-      elseif a == "-" then -- bare `-`: turn off -v/-x and stop option processing (rest = params)
-        set_opt(sh, "opt_v", false); set_opt(sh, "opt_x", false); dd = true; j = j + 1; break
+      elseif a == "-" then -- bare `-`: turn off -v/-x and STOP option processing; any
+        -- remaining args become params, but with none the params are left unchanged.
+        set_opt(sh, "opt_v", false); set_opt(sh, "opt_x", false); j = j + 1; break
       elseif a == "+" then j = j + 1 -- bare `+`: an ignored no-op flag; keep scanning
       elseif a:match("^[-+][a-zA-Z]+$") then -- short flag bundle: -eu, +u, …
         local on = a:sub(1, 1) == "-"
@@ -2780,7 +2783,7 @@ local function exec_simple(sh, args, hook, no_func)
         j = j + 1
       else break end
     end
-    if dd or j <= #args then
+    if force or j <= #args then
       local np, n = {}, 0
       for k = j, #args do n = n + 1; np[n] = args[k] end
       sh.params = np; sh.nparams = n
