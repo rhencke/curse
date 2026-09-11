@@ -2402,11 +2402,27 @@ local function exec_simple(sh, args, hook, no_func)
         if nm then if not sh:array_unset(nm, array_key(sh, nm, sub)) then
             io.stderr:write("curse: unset: " .. a .. ": bad array subscript\n"); sh.status = 1 end
         else
-          local b = sh.vars[sh:deref(a)]
+          local dn = sh:deref(a)
+          local b = sh.vars[dn]
           if b and b.ro then -- readonly: cannot unset (bash: status 1, keep it)
             io.stderr:write("curse: unset: " .. a .. ": cannot unset: readonly variable\n"); sh.status = 1
           elseif b ~= nil or vmode then
-            sh.vars[sh:deref(a)] = nil; C.unsetenv(a) -- drop from the process env too
+            -- bash dynamic-scope unset: when the var is NOT local to the CURRENT
+            -- frame but shadows a local declared in an ENCLOSING frame (e.g. an
+            -- `unset -v` run from a nested `unlocal` helper), removing it REVEALS
+            -- that outer binding instead of leaving the name unset.
+            local revealed = false
+            if (sh.pd or 0) > 0 and not (sh.savedstack[sh.pd] and sh.savedstack[sh.pd][dn] ~= nil) then
+              for d = sh.pd, 1, -1 do
+                local ss = sh.savedstack[d]
+                if ss and ss[dn] ~= nil then
+                  sh.vars[dn] = ss[dn] or nil -- reveal the shadowed box (false = was absent)
+                  ss[dn] = nil; revealed = true; break
+                end
+              end
+            end
+            if not revealed then sh.vars[dn] = nil end
+            C.unsetenv(a) -- drop from the process env too
           elseif sh.functions[a] then sh.functions[a] = nil -- plain unset falls back to a function
           end
         end
