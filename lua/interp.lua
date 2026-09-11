@@ -1698,9 +1698,13 @@ end
 -- Run a shell function `cmd` (its body `fn`) with args[2..] as positional params.
 -- A function OVERRIDES a builtin of the same name in bash, so this is dispatched
 -- before the builtin table (except via `command`, which passes no_func).
-local function run_function(sh, cmd, fn, args, hook)
+local function run_function(sh, cmd, fn, args, hook, tenv_base)
   sh.calldepth = sh.calldepth + 1 -- OSR gate: no handoff inside a call
   sh:pushCall(unpack(args, 2))
+  -- Tempenv bindings applied as THIS call's prefix (`x=v func`) belong to this new
+  -- frame — tag them so a `local x` in the body absorbs its own call's tempenv
+  -- (but not an outer/eval tempenv). See Shell:localVar.
+  if tenv_base then for k = tenv_base + 1, #sh.tenv do sh.tenv[k].frame = sh.pd end end
   sh.funcstack = sh.funcstack or {}
   table.insert(sh.funcstack, 1, cmd) -- $FUNCNAME[0] = the function now running
   -- Parallel call-stack for ${BASH_LINENO[@]}/${BASH_SOURCE[@]}: the call SITE's
@@ -1778,11 +1782,16 @@ end
 
 local function exec_simple(sh, args, hook, no_func)
   local cmd = args[1]
+  -- Consume any pending tempenv-call marker (set by exec_stmt for `x=v cmd`): only
+  -- the FIRST command dispatched under it may claim those bindings. A direct
+  -- function call tags them with its frame; anything else (a builtin like `eval`,
+  -- an external) just drops the marker so a function it later invokes can't absorb.
+  local tcb = sh.tenv_call_base; sh.tenv_call_base = nil
   -- A user function overrides a builtin of the same name (bash), so it wins here
   -- — unless invoked via `command` (no_func) or the word is a keyword/assignment
   -- builtin whose parse shape a function can't stand in for.
   if cmd ~= nil and not no_func and sh.functions[cmd] then
-    return run_function(sh, cmd, sh.functions[cmd], args, hook)
+    return run_function(sh, cmd, sh.functions[cmd], args, hook, tcb)
   end
   if cmd == nil then sh.status = 0
   elseif cmd == "echo" then
@@ -3772,7 +3781,11 @@ exec_stmt = function(sh, st, hook)
           if not a.index then C.setenv(a.name, sh:get(a.name), 1) end
         end
       end
+      -- mark these entries so a DIRECT function call (not `eval`/a builtin) can tag
+      -- them with its frame: `local x` absorbs only its OWN call's tempenv.
+      sh.tenv_call_base = base
       local ok, err = pcall(run_cmd)
+      sh.tenv_call_base = nil
       for k = #sh.tenv, base + 1, -1 do
         local s = sh.tenv[k]; sh.tenv[k] = nil
         if not s.consumed then -- an `unset` inside the command already revealed it

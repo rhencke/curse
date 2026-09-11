@@ -137,24 +137,30 @@ function Shell:localVar(name, has_init)
   -- Only shadow on the FIRST `local name` in this scope; a repeat (`local foo;
   -- local foo`) keeps the value already established here (bash).
   if saved[name] == nil then
-    -- If a tempenv binding for `name` is active (`x=v func` … `local x`), the local
-    -- ABSORBS it (bash): the local takes over that slot, so the box we shadow is
-    -- what the TEMPENV shadowed (e.g. the global) — not the tempenv value — and the
-    -- tempenv no longer restores/reveals on its own. A no-initializer `local` also
-    -- INHERITS the tempenv's current value (but never the global/exported one).
+    -- An active tempenv binding for `name` interacts with `local` two ways (bash):
+    --  * INHERIT: a no-initializer `local x` takes the tempenv's current value
+    --    (dynamically scoped — any active tempenv, even from an enclosing call);
+    --    never the plain global/exported value.
+    --  * ABSORB: only when the tempenv is THIS call's own prefix (te.frame == pd)
+    --    does the local take over its slot — the box we shadow is then what the
+    --    tempenv shadowed (e.g. the global), and the tempenv stops restoring on its
+    --    own. A tempenv from `eval`/an enclosing call is NOT absorbed: the local
+    --    shadows the tempenv value normally, so `unset` later reveals the tempenv.
     local te
     for k = #self.tenv, 1, -1 do
       local e = self.tenv[k]
       if not e.consumed and e.name == name then te = e; break end
     end
-    if te then
+    if te and te.frame == self.pd then
       saved[name] = te.box; te.consumed = true
-      if has_init then self.vars[name] = {} else
-        local b = self.vars[name]
-        self.vars[name] = b and { s = b.s, n = b.n, arr = b.arr, assoc = b.assoc, order = b.order } or {}
-      end
     else
-      saved[name] = self.vars[name] or false; self.vars[name] = {}
+      saved[name] = self.vars[name] or false
+    end
+    if te and not has_init then -- inherit the tempenv value
+      local b = self.vars[name]
+      self.vars[name] = b and { s = b.s, n = b.n, arr = b.arr, assoc = b.assoc, order = b.order } or {}
+    else
+      self.vars[name] = {}
     end
   end
 end
