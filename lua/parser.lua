@@ -971,8 +971,12 @@ local function make_parser(src)
     elseif c == "&" and src:sub(q, q + 1) == "&>" then op = "outboth"; tfd = 1; q = q + 2
     else return nil end
     i = q; ws()
-    local target = unquote(word())
-    return { fd = tfd, op = op, target = target, fdvar = fdvar }
+    local raw = word()
+    -- a redirection with NO word (`echo >`, `cmd <;`) is a syntax error in bash
+    -- (status 2). A quoted empty target (`> ''`) is a real, empty filename — that's
+    -- a runtime failure, not a parse error — so key on the raw word being absent.
+    if raw == "" then error("syntax error near `" .. (src:sub(i, i) == "" and "newline" or src:sub(i, i)) .. "'") end
+    return { fd = tfd, op = op, target = unquote(raw), fdvar = fdvar }
   end
 
   local function parse_command()

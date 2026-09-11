@@ -1815,7 +1815,13 @@ local function exec_simple(sh, args, hook, no_func)
       local code = table.concat({ unpack(args, start) }, " ")
       if code:match("%S") then
         local ok, parsed = pcall(P.parse, code)
+        -- a syntax error in the eval'd code makes eval RETURN 2 (bash), running
+        -- nothing — it must NOT abort the shell (the lazy parser reports it as a
+        -- parse_error node, which would otherwise throw when executed).
+        local perr = ok and parsed.stmts[1]
+        for _, s in ipairs(ok and parsed.stmts or {}) do if s.t == "parse_error" then perr = s; break end end
         if not ok then io.stderr:write("curse: eval: " .. tostring(parsed) .. "\n"); sh.status = 2
+        elseif perr and perr.t == "parse_error" then io.stderr:write("curse: eval: syntax error\n"); sh.status = 2
         else exec_list(sh, parsed.stmts, hook, false) end
       else sh.status = 0 end
     end
@@ -1855,7 +1861,8 @@ local function exec_simple(sh, args, hook, no_func)
           if #args > j then sh.params, sh.nparams = savep, savenp end
           if not rok then
             if type(err) == "table" and err.__curse_return then sh.status = err.__curse_return
-            else error(err) end -- exit propagates
+            elseif type(err) == "table" and err.__curse_parseerr then sh.status = 2 -- a syntax error in the file: source returns 2, doesn't halt the shell (bash)
+            else error(err) end -- a real `exit` propagates
           end
         end
       end
@@ -3748,7 +3755,7 @@ exec_stmt = function(sh, st, hook)
     -- Reached the unparseable tail (e.g. a makeself binary payload) — bash would
     -- syntax-error here too. If an earlier exit fired, we never get here.
     io.stderr:write("curse: syntax error" .. (st.line and (": line " .. st.line) or "") .. "\n")
-    error({ __curse_exit = 2 })
+    error({ __curse_exit = 2, __curse_parseerr = true })
   elseif t == "group" then
     -- { list; } runs in the current shell. Any trailing redirs are applied by the
     -- COMPOUND_REDIR wrapper above (which checks open failures + errexit), so here
@@ -3999,7 +4006,8 @@ run_trap = function(sh, code)
   end)
   sh.in_trap = sh.in_trap - 1; sh.cur_line = savedline
   if not ok then
-    if type(err) == "table" and err.__curse_exit then sh.status = err.__curse_exit; exited = true
+    if type(err) == "table" and err.__curse_parseerr then -- syntax error in the trap code: warned, non-fatal, doesn't exit or change status (bash)
+    elseif type(err) == "table" and err.__curse_exit then sh.status = err.__curse_exit; exited = true
     elseif type(err) == "table" and err.__curse_return then sh.status = err.__curse_return -- `return N` in a trap sets its status
     else error(err) end -- a real error propagates
   end
