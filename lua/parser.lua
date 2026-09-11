@@ -1013,8 +1013,11 @@ local function make_parser(src)
       if src:sub(q, q + 1) == "<>" then op = "rw"; tfd = fd and tonumber(fd) or 0; q = q + 2 -- open for read+write
       elseif src:sub(q, q + 1) == "<&" then op = "dupin"; tfd = fd and tonumber(fd) or 0; q = q + 2
       else op = "in"; tfd = fd and tonumber(fd) or 0; q = q + 1 end
-    elseif c == "&" and src:sub(q, q + 2) == "&>>" then op = "appboth"; tfd = 1; q = q + 3
-    elseif c == "&" and src:sub(q, q + 1) == "&>" then op = "outboth"; tfd = 1; q = q + 2
+    -- `&>`/`&>>` (redirect both stdout+stderr) take NO fd prefix: a digit before
+    -- them (`2&>1`) is a command word, not an fd, so leave it (parse_redir re-runs
+    -- on the `&>` after the word is read).
+    elseif c == "&" and not fd and src:sub(q, q + 2) == "&>>" then op = "appboth"; tfd = 1; q = q + 3
+    elseif c == "&" and not fd and src:sub(q, q + 1) == "&>" then op = "outboth"; tfd = 1; q = q + 2
     else return nil end
     i = q; ws()
     local raw = word()
