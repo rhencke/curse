@@ -987,7 +987,7 @@ local function make_parser(src)
     -- `git-foo`, `a.b`), so match a run of non-metacharacter word bytes here.
     if peekword() == "function" then
       ws(); i = i + 8; ws()
-      local s, e = src:find("^[%w_][%w_%.%-:+@/]*", i)
+      local s, e = src:find("^[%w_][%w_%.%-:+@/!]*", i)
       if not s then error("function needs a name") end
       local nm = src:sub(s, e); i = e + 1; ws()
       -- optional `( )` (bash: `function f () { … }`, spaces allowed between parens)
@@ -998,7 +998,7 @@ local function make_parser(src)
       return funcdef_node(nm, dstart)
     end
     do
-      local s, e = src:find("^[%w_][%w_%.%-:+@/]*", i)
+      local s, e = src:find("^[%w_][%w_%.%-:+@/!]*", i)
       if s then
         local j = e + 1
         while src:sub(j, j):match("[ \t]") do j = j + 1 end
@@ -1364,6 +1364,12 @@ local function make_parser(src)
       local c = src:sub(i, i)
       local r = parse_redir() -- also catches &> before the & break below
       if r then redirs[#redirs + 1] = r
+      elseif c == "(" and src:sub(i + 1, i + 1) ~= "(" and #words > 0 then
+        -- a bare single `(` after a command word isn't a subshell — `ls foo=(1 2)`,
+        -- `builtin typeset a=(…)`, `echo a(b)` are syntax errors in bash. (extglob
+        -- @(…), $(…), <(…) are consumed inside word(); `((` is left to break so an
+        -- empty-alias `a (( … ))` still reaches the arith-command path.)
+        error("syntax error near `('")
       elseif c == "\n" or c == ";" or c == "#" or c == "&" or c == "|"
         or c == "(" or c == ")" then break -- ( ) are metacharacters (subshell bounds)
       elseif c:match("[ \t]") then ws()
