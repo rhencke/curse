@@ -198,6 +198,9 @@ ffi.cdef [[
   unsigned long long strtoull(const char *nptr, char **endptr, int base);
   struct curse_passwd { char *pw_name; char *pw_passwd; unsigned int pw_uid; unsigned int pw_gid; char *pw_gecos; char *pw_dir; char *pw_shell; };
   struct curse_passwd *getpwnam(const char *name);
+  struct curse_passwd *getpwent(void);
+  void setpwent(void);
+  void endpwent(void);
   int kill(int pid, int sig);
   unsigned int geteuid(void);
   unsigned int getegid(void);
@@ -2574,9 +2577,14 @@ local function exec_simple(sh, args, hook, no_func)
         else werr = true end
       end
       for _, act in ipairs(actions) do
-        local acc = {}
+        local acc, nosort = {}, false
         local function add(x) acc[#acc + 1] = x end
-        if act == "function" then for n in pairs(sh.functions) do add(n) end
+        if act == "user" then -- users in /etc/passwd order (bash does NOT sort these)
+          nosort = true
+          C.setpwent()
+          while true do local pw = C.getpwent(); if pw == nil then break end; add(ffi.string(pw.pw_name)) end
+          C.endpwent()
+        elseif act == "function" then for n in pairs(sh.functions) do add(n) end
         elseif act == "alias" then for n in pairs(sh.aliases) do add(n) end
         elseif act == "builtin" then for n in pairs(BUILTINS) do add(n) end
         elseif act == "keyword" then for n in pairs(KEYWORDS) do add(n) end
@@ -2608,7 +2616,7 @@ local function exec_simple(sh, args, hook, no_func)
             end; p:close() end
           end
         end
-        table.sort(acc)
+        if not nosort then table.sort(acc) end
         for _, n in ipairs(acc) do emit(n) end
       end
       end
