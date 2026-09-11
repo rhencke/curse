@@ -300,6 +300,7 @@ function Shell:exec(...)
   local anchor = {} -- keep the Lua strings alive while argv points into them
   for i = 1, n do anchor[i] = tostring(args[i]); argv[i - 1] = anchor[i] end
   argv[n] = nil
+  if self.exec_argv0 then anchor.a0 = tostring(self.exec_argv0); argv[0] = anchor.a0 end -- exec -a NAME
   -- Not capturing (self.out is the real fd 1, e.g. a top-level command or a
   -- pipeline stage): let the child write STRAIGHT to fd 1 (inherit fds) instead
   -- of buffering all its output — so an unbounded producer (`cat /dev/zero | …`)

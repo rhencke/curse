@@ -3583,7 +3583,7 @@ exec_stmt = function(sh, st, hook)
       end
       if k <= #args then
         local rest = { unpack(args, k) }
-        if argv0 then rest[0] = argv0 end -- (argv[0] override best-effort)
+        if argv0 then sh.exec_argv0 = argv0 end -- exec -a NAME: override the child's argv[0]
         if st.assigns then -- prefix bindings become the exec'd command's environment (bash)
           for _, a in ipairs(st.assigns) do
             if a.raw then sh:set_str(a.name, a.raw); C.setenv(a.name, a.raw, 1)
