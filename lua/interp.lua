@@ -492,6 +492,7 @@ local arith_key -- array subscript in arith: string key for assoc, number for in
 local arith_int -- forward: arith-eval a slice offset/length string
 local run_trap -- trap-handler runner (forward decl; defined near the bottom)
 local fire_err -- ERR-trap + errexit enforcement (forward decl; defined near exec_list)
+local fire_err_trap -- the ERR-trap half of fire_err WITHOUT errexit-exit (used inside handlers)
 local sherr -- error-message writer, capture-aware for `2>&1` in $() (defined w/ redirs)
 -- Resolve a variable's string value in arithmetic. bash treats it as an arith
 -- EXPRESSION: a bare number is its value, but a name (or `3+4`, `bar`) is
@@ -3639,7 +3640,10 @@ exec_stmt = function(sh, st, hook)
   -- set -n (noexec): a non-interactive shell reads but does not execute. Once on,
   -- every later statement (including `set +n`) is skipped — matches bash.
   if sh.opt_n and not sh.opt_i then sh.status = 0; return end
-  if DEBUG_FIRE[t] and not (sh.in_trap and sh.in_trap > 0) then run_debug(sh, st.line) end
+  -- DEBUG fires before each command, INCLUDING inside ERR/RETURN/signal/EXIT trap
+  -- handlers (bash) — only the DEBUG handler itself suppresses it (run_debug's
+  -- in_debug guard). Inside any trap the reported line is the frozen (trapped) one.
+  if DEBUG_FIRE[t] then run_debug(sh, (sh.in_trap and sh.in_trap > 0) and sh.cur_line or st.line) end
   -- redirs trailing a compound command: apply around the whole thing, then run it
   -- with redirs temporarily detached (so this guard doesn't re-fire).
   if st.redirs and COMPOUND_REDIR[t] then
@@ -3966,7 +3970,7 @@ exec_stmt = function(sh, st, hook)
   elseif t == "forc" then
     -- DEBUG fires (at the `for` line) before the init, before EACH condition
     -- evaluation, and before EACH step — bash's `[6][6][7]…` per-iteration pattern.
-    local function fdbg() if not (sh.in_trap and sh.in_trap > 0) then run_debug(sh, st.line) end end
+    local function fdbg() run_debug(sh, (sh.in_trap and sh.in_trap > 0) and sh.cur_line or st.line) end
     if st.init then fdbg(); eval(sh, st.init) end
     local bodystatus = 0 -- a loop's status is its last body command's (0 if none)
     sh.loopdepth = (sh.loopdepth or 0) + 1
@@ -4144,8 +4148,8 @@ exec_stmt = function(sh, st, hook)
         -- does NOT fire it), but only for a stage that is itself a DEBUG-firing node
         -- — a `{ }`/compound stage fires nothing (`{ …; } | cat` fires once, for cat).
         -- The lastpipe in-process stage fires via its own exec_stmt instead.
-        if DEBUG_FIRE[cmds[k].t] and not (k == nst and lastpipe) and not (sh.in_trap and sh.in_trap > 0) then
-          run_debug(sh, cmds[k].line or st.line)
+        if DEBUG_FIRE[cmds[k].t] and not (k == nst and lastpipe) then
+          run_debug(sh, (sh.in_trap and sh.in_trap > 0) and sh.cur_line or (cmds[k].line or st.line))
         end
         local rd, wr = -1, -1
         if k < nst then local p = ffi.new("int[2]"); C.pipe(p); rd, wr = p[0], p[1] end
@@ -4283,7 +4287,16 @@ run_trap = function(sh, code)
   local exited, savedline = false, sh.cur_line
   sh.in_trap = (sh.in_trap or 0) + 1
   local ok, err = pcall(function()
-    for _, st in ipairs(P.parse(code).stmts) do exec_stmt(sh, st, function() end) end
+    for _, st in ipairs(P.parse(code).stmts) do
+      exec_stmt(sh, st, function() end)
+      -- a failed eligible command INSIDE a handler fires the ERR trap (bash), but
+      -- NOT the errexit-exit half; in_err_trap keeps the ERR handler from re-firing.
+      if sh.noerr == 0 and sh.status ~= 0 and not st.negate
+        and (st.t == "simple" or st.t == "pipeline" or st.t == "arithcmd"
+          or st.t == "assign" or st.t == "assignlist" or st.t == "subshell" or st.t == "dbracket") then
+        fire_err_trap(sh)
+      end
+    end
   end)
   sh.in_trap = sh.in_trap - 1; sh.cur_line = savedline
   if not ok then
@@ -4308,7 +4321,9 @@ end
 -- Run the ERR trap (once, in scope: the main shell unless errtrace extends it to
 -- functions/subprograms) preserving $?, then exit if errexit is on. Shared by
 -- exec_list, run_lazy and the &&/|| handler (which previously drifted apart).
-fire_err = function(sh)
+-- Run just the ERR trap (once, in scope), preserving $?; no errexit-exit. Used
+-- both by fire_err and directly by run_trap (a failed command inside a handler).
+fire_err_trap = function(sh)
   local h = sh.traps and sh.traps.ERR
   -- ERR is not re-run inside a forked pipeline stage (bash fires it ONCE for the
   -- whole pipeline, in the parent); errtrace still extends it to functions/subshells.
@@ -4317,6 +4332,9 @@ fire_err = function(sh)
     sh.in_err_trap = true; local saved = sh.status
     run_trap(sh, h); sh.status = saved; sh.in_err_trap = false
   end
+end
+fire_err = function(sh)
+  fire_err_trap(sh)
   if sh.opt_e then error({ __curse_exit = sh.status }) end
 end
 
@@ -4335,7 +4353,12 @@ local function run_pending_signals(sh)
     local sig = C.sigtimedwait(sigset_poll, nil, zero_ts)
     if sig < 0 then break end -- no more pending
     local h = sh.traps and sh.traps["SIG" .. (NUMSIG[sig] or "")]
-    if h and h ~= "" then local saved = sh.status; run_trap(sh, h); sh.status = saved end
+    -- an asynchronously-delivered signal handler reports $LINENO = 1 (bash), not the
+    -- line the shell happened to be at when the signal arrived; restore it after.
+    if h and h ~= "" then
+      local saved, sl = sh.status, sh.cur_line; sh.cur_line = 1
+      run_trap(sh, h); sh.status = saved; sh.cur_line = sl
+    end
   end
 end
 M.run_pending_signals = run_pending_signals
