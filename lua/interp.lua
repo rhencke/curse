@@ -1149,7 +1149,16 @@ local function expand_to_fields(sh, w)
           add(table.concat(els, sep), false)
         else for k = 1, #els do if k > 1 then brk() end; add(els[k], false) end end -- one field per element
       else
-        for k = 1, #els do if k > 1 then brk() end; feed_split(els[k]) end
+        -- unquoted $@/$*/array: bash joins the elements with IFS[0] (space when IFS
+        -- is whitespace/unset) into ONE string and word-splits that — so empty
+        -- elements survive under a non-whitespace IFS (`=$@=` on empty params gives
+        -- `= '' '' '' =`) and an empty middle element becomes an empty field. With
+        -- IFS='' there is no splitting, so keep the per-element model (empty drops).
+        if ifs == "" then
+          for k = 1, #els do if k > 1 then brk() end; feed_split(els[k]) end
+        else
+          feed_split(table.concat(els, ifs:sub(1, 1)))
+        end
       end
     elseif p.pexp and not p.q and (p.pexp.op == ":-" or p.pexp.op == "-") and not p.pexp.index
         and p.pexp.name ~= "@" and p.pexp.name ~= "*" then
