@@ -510,6 +510,8 @@ ffi.cdef [[
   int getpid(void); int getppid(void); int getuid(void); int geteuid(void);
   char *getcwd(char *buf, unsigned long size);
   int curse_rt_stat(const char *path, void *buf) asm("stat");
+  struct curse_pw { char *pw_name; char *pw_passwd; unsigned int pw_uid; unsigned int pw_gid; char *pw_gecos; char *pw_dir; char *pw_shell; };
+  struct curse_pw *getpwuid(unsigned int uid);
 ]]
 local scratch = ffi.new("char[4096]")
 local stbuf_a, stbuf_b = ffi.new("uint8_t[144]"), ffi.new("uint8_t[144]")
@@ -714,6 +716,11 @@ function Shell:import_env()
   -- Shell-maintained vars bash always defines even with `env -i` and no rc file.
   if self.vars["IFS"] == nil then self:set_str("IFS", " \t\n") end
   if self.vars["PS4"] == nil then self:set_str("PS4", "+ ") end
+  -- $SHELL: bash sets it from the passwd entry (the login shell) when not inherited.
+  if self.vars["SHELL"] == nil then
+    local pw = ffi.C.getpwuid(ffi.C.geteuid())
+    if pw ~= nil and pw.pw_shell ~= nil then self:set_str("SHELL", ffi.string(pw.pw_shell)) end
+  end
   -- SHELLOPTS/BASHOPTS are NOT stored: special_get derives them live from the
   -- current set -o / shopt state (and they're readonly), matching bash.
 end
