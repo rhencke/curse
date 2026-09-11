@@ -960,6 +960,11 @@ indirect_part = function(sh, pe)
     error({ __curse_exit = 1, __curse_experr = true })
   end
   local ok, part = pcall(P.parse_paramexp, tname .. (pe.iop or ""))
+  -- Mark the reconstructed part as coming through indirection: bash's `:-`/`:+`
+  -- null test on an array reached via `${!ref:-…}` keys on the element COUNT
+  -- (zero = null), unlike the DIRECT `${a[@]:-…}` which treats one empty element
+  -- as null. (The `-`/`:+`-less `-` variant is already count-based for both.)
+  if ok and part and part.pexp then part.pexp.via_indirect = true end
   return ok and part or nil
 end
 local is_multi
@@ -1068,7 +1073,9 @@ local function multi_elems(sh, p) -- returns element list, star?
     -- instead — null iff there are no elements, or exactly one empty element.
     elseif pe.op == ":-" or pe.op == ":+" then
       local ne
-      if star and p.q then
+      if pe.via_indirect then
+        ne = #els > 0 -- indirect array :-/:+ tests element COUNT, not emptiness (bash)
+      elseif star and p.q then
         ne = table.concat(els, sh.vars["IFS"] and sh:get("IFS"):sub(1, 1) or " ") ~= ""
       else
         ne = #els > 1 or (els[1] ~= nil and els[1] ~= "")
