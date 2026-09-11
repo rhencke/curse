@@ -911,6 +911,10 @@ local function multi_elems(sh, p) -- returns element list, star?
       end
       return { expand_word(sh, w) }
     end
+    if pe.op == "badsubst" then -- e.g. ${a[@]:} (empty offset): fails the command, non-fatal
+      sherr(sh, "curse: ${" .. (pe.raw or pe.name or "") .. "}: bad substitution\n")
+      error({ __curse_exit = 1, __curse_experr = true })
+    end
     if pe.op == "indirect" then -- ${!ref} where ref names an array / $@ / subscript
       local ip = indirect_part(sh, pe)
       if ip then ip.q = p.q; return multi_elems(sh, ip) end
