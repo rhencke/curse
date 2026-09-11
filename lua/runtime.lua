@@ -417,7 +417,15 @@ local function arith_num(s)
   if s:sub(1, 1) == "-" then sign = -1; s = s:sub(2) elseif s:sub(1, 1) == "+" then s = s:sub(2) end
   local base, digits = 10, nil
   local b, d = s:match("^(%d+)#(.+)$")
-  if b then base = tonumber(b); digits = d
+  if b then
+    -- explicit N#digits: the base must not have a leading zero, and every digit
+    -- must be valid for it (bash errors otherwise, unlike the lenient forms below).
+    if (b:sub(1, 1) == "0" and #b > 1) or tonumber(b) < 2 or tonumber(b) > 64 then
+      error({ __curse_exit = 1, __curse_matherr = true, __curse_experr = true })
+    end
+    base = tonumber(b); digits = d
+    for k = 1, #d do local dv = digit_val(d:sub(k, k), base)
+      if not dv or dv >= base then error({ __curse_exit = 1, __curse_matherr = true, __curse_experr = true }) end end
   elseif s:sub(1, 2):lower() == "0x" then base = 16; digits = s:sub(3)
   elseif s:sub(1, 1) == "0" and s:match("^0[0-7]+$") then base = 8; digits = s:sub(2)
   else digits = s:match("^%d+") or "" end
