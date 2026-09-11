@@ -838,7 +838,11 @@ local function expand_regex(sh, w) return expand_escaped(sh, w, "[%.%^%$%*%+%?%(
 -- the target can itself be an array (arr[@]), $@, a subscript, etc.
 indirect_part = function(sh, pe)
   local tname
-  if pe.index and pe.index ~= "@" and pe.index ~= "*" then
+  if pe.index == "@" or pe.index == "*" then
+    -- ${!name[@]OP}: the reference name is ${name[@]} space-joined (a single
+    -- element derefs cleanly; several join to a name with spaces = invalid).
+    tname = table.concat(sh:array_values(pe.name), " ")
+  elseif pe.index then
     tname = sh:array_get(pe.name, array_key(sh, pe.name, pe.index))
   else
     local b = sh.vars[pe.name]

@@ -253,8 +253,12 @@ local function parse_paramexp(inner)
   if indices then
     -- ${!a[@]}/${!a[*]} = keys; ${!pfx@}/${!pfx*} = var names with that prefix;
     -- ${!name} = indirect (value of the var named by name)
-    -- ${!a[@]@X}: a transform after the keys yields empty in bash (assoc); mark it.
-    if index == "@" or index == "*" then return { pexp = { name = name, op = "indices", index = index, drop = (rest ~= "" or nil) } } end
+    -- ${!a[@]OP}: a suffix operator flips this from "keys" to INDIRECT — bash uses
+    -- ${a[@]} (space-joined) as the reference name, derefs it, then applies OP.
+    if index == "@" or index == "*" then
+      if rest ~= "" then return { pexp = { name = name, op = "indirect", index = index, iop = rest } } end
+      return { pexp = { name = name, op = "indices", index = index } }
+    end
     if rest == "*" or rest == "@" then return { pexp = { name = name, op = "prefix", star = (rest == "*") } } end
     -- ${!ref OP arg}: capture the trailing operator to apply to the resolved target
     return { pexp = { name = name, op = "indirect", index = index, iop = (rest ~= "" and rest or nil) } }
