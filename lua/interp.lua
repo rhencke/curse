@@ -1796,7 +1796,9 @@ local function exec_simple(sh, args, hook, no_func)
             sh.params, sh.nparams = {}, 0
             for k = j + 1, #args do sh.nparams = sh.nparams + 1; sh.params[sh.nparams] = args[k] end
           end
+          sh.sourcedepth = (sh.sourcedepth or 0) + 1 -- a `return` is valid while sourcing
           local rok, err = pcall(exec_list, sh, parsed.stmts, hook, false)
+          sh.sourcedepth = sh.sourcedepth - 1
           if #args > j then sh.params, sh.nparams = savep, savenp end
           if not rok then
             if type(err) == "table" and err.__curse_return then sh.status = err.__curse_return
@@ -2131,6 +2133,12 @@ local function exec_simple(sh, args, hook, no_func)
     end
   elseif cmd == "[" or cmd == "test" then do_test(sh, args)
   elseif cmd == "return" then
+    -- `return` is only valid inside a function, a sourced script, or a trap;
+    -- elsewhere bash reports an error (status 2) but keeps running (no unwind).
+    if (sh.calldepth or 0) == 0 and (sh.sourcedepth or 0) == 0 and (sh.in_trap or 0) == 0 then
+      io.stderr:write("curse: return: can only `return' from a function or sourced script\n")
+      sh.status = 2; return
+    end
     if args[2] and not tonumber(args[2]) then io.stderr:write("curse: return: " .. args[2] .. ": numeric argument required\n"); error({ __curse_return = 2 }) end
     error({ __curse_return = args[2] and (tonumber(args[2]) % 256) or sh.status })
   elseif cmd == "exit" then
@@ -3271,7 +3279,7 @@ local ASSIGN_CMD = { export = 1, declare = 1, typeset = 1, readonly = 1, ["local
 -- compound commands whose trailing redirs (`done < f`, `fi > f`) apply to the
 -- whole construct; handled generically below (simple/group/subshell do their own).
 local COMPOUND_REDIR = { whilec = true, forc = true, forin = true, ["if"] = true,
-  case = true, arithcmd = true, dbracket = true }
+  case = true, arithcmd = true, dbracket = true, group = true }
 -- DEBUG trap fires just before each of these "command" nodes (bash runs it before
 -- every simple/pipeline/arith/[[/assignment); it preserves $? around the handler.
 local DEBUG_FIRE = { simple = true, pipeline = true, arithcmd = true, dbracket = true,
@@ -3625,18 +3633,10 @@ local function exec_stmt(sh, st, hook)
     io.stderr:write("curse: syntax error" .. (st.line and (": line " .. st.line) or "") .. "\n")
     error({ __curse_exit = 2 })
   elseif t == "group" then
-    -- { list; } runs in the current shell; redirs apply to the whole group
-    if st.redirs then
-      local pnp, pnf = procsub_mark(sh) -- >() target drains after the whole group
-      local save, savedout = apply_redirs(sh, st.redirs), sh.out
-      sh.out = io.write
-      local ok, err = pcall(exec_list, sh, st.body, hook, false)
-      io.flush(); sh.out = savedout; restore_redirs(save)
-      drain_procsub(sh, pnp, pnf) -- a >() redirect target (`{ …; } > >(tac)`) runs after the group
-      if not ok then error(err) end
-    else
-      exec_list(sh, st.body, hook, false)
-    end
+    -- { list; } runs in the current shell. Any trailing redirs are applied by the
+    -- COMPOUND_REDIR wrapper above (which checks open failures + errexit), so here
+    -- st.redirs is already detached.
+    exec_list(sh, st.body, hook, false)
   elseif t == "subshell" then
     -- ( list ) runs in a forked child: env/var changes don't escape, like bash
     io.flush() -- flush parent stdio so the fork doesn't duplicate buffered output
