@@ -2676,12 +2676,15 @@ local function exec_simple(sh, args, hook, no_func)
     end
     sh.getopts_cur = cur
     sh:set_str("OPTIND", tostring(optind))
-    if res.done then sh:set_str(vname, "?"); sh.getopts_cur = 1; sh.status = 1
+    local valid = vname:match("^[%a_][%w_]*$") -- an invalid NAME -> status 1, var not set
+    if res.done then
+      if valid then sh:set_str(vname, "?") end
+      sh.getopts_cur = 1; sh.vars["OPTARG"] = nil; sh.status = 1 -- end of options: OPTARG unset
     else
-      sh:set_str(vname, res.opt)
+      if valid then sh:set_str(vname, res.opt) end
       if res.arg ~= nil then sh:set_str("OPTARG", res.arg) elseif res.err or res.clr then sh.vars["OPTARG"] = nil end
       if res.err then io.stderr:write("curse: " .. res.err .. "\n") end
-      sh.status = 0
+      sh.status = valid and 0 or 1
     end
   elseif cmd == "printf" then
     -- printf [-v VAR] FMT [ARGS…] — native, bash-compatible.
