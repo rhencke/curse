@@ -1937,15 +1937,22 @@ local function exec_simple(sh, args, hook, no_func)
       local start = (args[2] == "--") and 3 or 2
       local code = table.concat({ unpack(args, start) }, " ")
       if code:match("%S") then
-        local ok, parsed = pcall(P.parse, code)
-        -- a syntax error in the eval'd code makes eval RETURN 2 (bash), running
-        -- nothing — it must NOT abort the shell (the lazy parser reports it as a
-        -- parse_error node, which would otherwise throw when executed).
-        local perr = ok and parsed.stmts[1]
-        for _, s in ipairs(ok and parsed.stmts or {}) do if s.t == "parse_error" then perr = s; break end end
-        if not ok then io.stderr:write("curse: eval: " .. tostring(parsed) .. "\n"); sh.status = 2
-        elseif perr and perr.t == "parse_error" then io.stderr:write("curse: eval: syntax error\n"); sh.status = 2
-        else exec_list(sh, parsed.stmts, hook, false) end
+        -- Parse+run in the CURRENT shell, LAZILY (like the shell's own input) so an
+        -- alias defined by one statement expands in the next; a syntax error stops
+        -- at that point after the valid prefix has run (bash), and return/exit/
+        -- break/continue propagate out. Alias expansion sees the live table (sh).
+        local ok, err = pcall(function()
+          local nextf = P.open(code, sh)
+          while true do
+            local st = nextf()
+            if st == nil then break end
+            if st.t == "parse_error" then
+              io.stderr:write("curse: eval: syntax error\n"); sh.status = 2; return
+            end
+            exec_list(sh, { st }, hook, false) -- one stmt (errexit + signal delivery included)
+          end
+        end)
+        if not ok then error(err) end -- control-flow (exit/return/…) or a real error
       else sh.status = 0 end
     end
   elseif cmd == "source" or cmd == "." then
@@ -3801,43 +3808,9 @@ exec_stmt = function(sh, st, hook)
     sh.status = 0
   elseif t == "simple" then
     local pnp, pnf = procsub_mark(sh) -- drain only <()/>() this command registers
-    -- alias expansion (bash: only with `shopt -s expand_aliases`): if the command
-    -- word is a defined alias not already expanded (loop guard), splice its parsed
-    -- words in and re-dispatch — recursively expanding the new first word too.
-    if sh.shopt.expand_aliases and st.words[1] then
-      local cw = st.words[1]
-      local nm = (#cw.parts == 1 and cw.parts[1].lit ~= nil and not cw.parts[1].q) and cw.parts[1].lit or nil
-      local seen = st.alias_seen
-      local av = nm and not (seen and seen[nm]) and sh.aliases[nm]
-      if av then
-        local parsed = P.parse(av)
-        seen = seen or {}; seen[nm] = true
-        if parsed.stmts and #parsed.stmts == 1 and parsed.stmts[1].t == "simple" then
-          local nw = {}
-          for _, w in ipairs(parsed.stmts[1].words) do nw[#nw + 1] = w end
-          -- trailing-space chaining: when an alias value ends in a blank, the next
-          -- word is also alias-expanded (bash). Keep chaining while that holds.
-          local rest, ends_space = 2, av:match("%s$") ~= nil
-          while ends_space and st.words[rest] do
-            local w2 = st.words[rest]
-            local nm2 = (#w2.parts == 1 and w2.parts[1].lit ~= nil and not w2.parts[1].q) and w2.parts[1].lit or nil
-            local av2 = nm2 and not seen[nm2] and sh.aliases[nm2]
-            if not av2 then break end
-            local p2 = P.parse(av2)
-            if not (p2.stmts and #p2.stmts == 1 and p2.stmts[1].t == "simple") then break end
-            seen[nm2] = true
-            for _, w in ipairs(p2.stmts[1].words) do nw[#nw + 1] = w end
-            ends_space = av2:match("%s$") ~= nil; rest = rest + 1
-          end
-          for k = rest, #st.words do nw[#nw + 1] = st.words[k] end
-          return exec_stmt(sh, { t = "simple", words = nw, redirs = st.redirs, assigns = st.assigns,
-            arrayargs = parsed.stmts[1].arrayargs, alias_seen = seen }, hook)
-        elseif parsed.stmts then
-          for _, s in ipairs(parsed.stmts) do exec_stmt(sh, s, hook) end
-          return
-        end
-      end
-    end
+    -- Alias expansion is done in the PARSER (a source-deterministic in-context
+    -- splice — see make_parser), so the tree reaching here is already expanded and
+    -- exec just runs it; the interpreter and the compiler stay in agreement.
     -- `name=value` arguments to a declaration builtin (ASSIGN_CMD, module-level)
     -- are ASSIGNMENT words: the value isn't word-split or globbed.
     -- Assignment-word treatment applies only when the command name is a STATIC
@@ -4443,7 +4416,7 @@ function M.finish_run(sh, fn) finish(sh, pcall(fn)) end
 -- the eager AST, so tier OSR-by-stmt still lines up).
 function M.run_lazy(sh, src, hook)
   hook = hook or function() end
-  local nextf = P.open(src)
+  local nextf = P.open(src, sh) -- sh: alias expansion uses the live alias table
   finish(sh, pcall(function()
     local k = 0
     while true do

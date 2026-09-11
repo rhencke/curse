@@ -400,7 +400,7 @@ end
 function Shell:capture_src(src)
   local P = require("parser")
   local I = require("interp")
-  local ast = P.parse(src)
+  local ast = P.parse(src, self) -- self: $()/`` expand aliases from the live table
   -- $(< file) / `< file`: bash reads the file's contents (a faster $(cat file)).
   if #ast.stmts == 1 then
     local st = ast.stmts[1]
@@ -424,9 +424,14 @@ function Shell:capture_src(src)
   local savede = self.opt_e
   if not (self.shopt and self.shopt.inherit_errexit) then self.opt_e = false end
   local saved_line = self.cur_line -- $LINENO: the sub's internal lines don't leak out
+  -- $() is a child: it INHERITS the parent's aliases but its own alias/unalias
+  -- do not leak back out (bash). Give it an independent copy, restored after.
+  local saved_aliases = self.aliases
+  do local c = {}; for k, v in pairs(saved_aliases) do c[k] = v end; self.aliases = c end
   -- Run via exec_list (NOT interp.run): an `exit`/`return` inside $() ends only
   -- the sub (sets its status), and the parent's EXIT trap must NOT fire here.
   local ok, err = pcall(I.exec_list, self, ast.stmts, function() end, true)
+  self.aliases = saved_aliases -- discard aliases defined inside $()
   self.cur_line = saved_line
   self.opt_e = savede
   self.loopdepth = saved_ld

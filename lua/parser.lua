@@ -902,10 +902,117 @@ local function dequote_word(w)
   return table.concat(out)
 end
 
-local function make_parser(src)
+local function make_parser(src, sh)
   local i, n, line = 1, #src, 1
   local loopId = 0
   local heredocs_pending = {} -- heredoc redirs awaiting their body (filled at line end)
+  -- Alias expansion, done here in the PARSER as a deterministic function of the
+  -- source text (recognizing `shopt -s/-u expand_aliases`, `alias`, `unalias` as
+  -- they are parsed), so the interpreter and the behind-the-scenes compiler both
+  -- consume the identical expanded tree — an alias is a "baby source": its value
+  -- is spliced into the token stream and re-tokenized IN CONTEXT, so a `{`/`(`
+  -- pairs with a later `}`/`)`, `|` forms a real pipeline, and a trailing blank
+  -- makes the following word alias-eligible too.
+  local alias_on = false             -- shopt expand_aliases state (from source)
+  local aliases = {}                 -- name -> value (from parsed `alias` commands)
+  local alias_seen                   -- names being expanded now (recursion guard)
+  local alias_next = false           -- next word is eligible (prev value ended blank)
+  local alias_tail = nil             -- byte position just past the current expansion
+  -- The static (fully-literal, unquoted) text of a word, or nil if any part is an
+  -- expansion/quoted-out — used to read alias/shopt/unalias operands from source.
+  local function static_word(w)
+    if not w or not w.parts then return nil end
+    local out = {}
+    for _, p in ipairs(w.parts) do
+      if p.lit == nil then return nil end
+      out[#out + 1] = p.lit
+    end
+    return table.concat(out)
+  end
+  -- The active alias table + on-flag. When interpreting, `sh` carries the LIVE
+  -- runtime state (the lazy interp defines aliases by executing `alias`/`shopt`
+  -- before parsing later commands, and eval/source/$() feed their text through
+  -- the same sh-aware parse), so those are authoritative and cross parse
+  -- boundaries. With no `sh` (the state-less background compile) the parser tracks
+  -- the same state from source deterministically, so the static common case
+  -- compiles to the identical tree.
+  local function alias_state()
+    if sh then return sh.shopt and sh.shopt.expand_aliases, sh.aliases end
+    return alias_on, aliases
+  end
+  -- Record alias-affecting builtins as they are parsed so later words expand
+  -- (source-tracking; only needed for the sh-less compile path).
+  local function record_alias_state(node)
+    if sh then return end
+    if not (node and node.t == "simple" and node.words and node.words[1]) then return end
+    local w1 = node.words[1].parts
+    local cmd = (#w1 == 1 and not w1[1].q and w1[1].lit) or nil
+    if cmd == "shopt" then
+      local set = nil
+      for k = 2, #node.words do
+        local a = static_word(node.words[k])
+        if a == "-s" then set = true elseif a == "-u" then set = false
+        elseif a == "-q" or a == "-p" or a == "-o" then -- flags, ignore
+        elseif a == "expand_aliases" and set ~= nil then alias_on = set end
+      end
+    elseif cmd == "alias" then
+      for k = 2, #node.words do
+        local w = node.words[k]
+        -- name=value: the `=` is in the first literal part; the value is the rest
+        -- of that part plus every following literal part (already quote-stripped).
+        local first = w.parts[1]
+        if first and first.lit and not first.lit:match("^%-") then
+          local eq = first.lit:find("=", 1, true)
+          if eq then
+            local name = first.lit:sub(1, eq - 1)
+            local rest, ok = { first.lit:sub(eq + 1) }, true
+            for p = 2, #w.parts do
+              if w.parts[p].lit == nil then ok = false; break end
+              rest[#rest + 1] = w.parts[p].lit
+            end
+            if ok and name ~= "" then aliases[name] = table.concat(rest) end
+          end
+        end
+      end
+    elseif cmd == "unalias" then
+      for k = 2, #node.words do
+        local a = static_word(node.words[k])
+        if a == "-a" then aliases = {} elseif a and not a:match("^%-") then aliases[a] = nil end
+      end
+    end
+  end
+  -- Try to expand an alias at the current position. `cmdpos` = command position
+  -- (always eligible); otherwise eligible only via trailing-blank chaining, and
+  -- only once the parser has consumed past the value that set the flag.
+  local function try_alias(cmdpos)
+    local on, tab = alias_state()
+    if not on then return end
+    if not cmdpos then
+      if not (alias_next and alias_tail and i >= alias_tail) then return end
+    end
+    local expanded = false
+    while true do
+      local rs, re = src:find("^[^ \t\n|&;()<>'\"`\\$]+", i)
+      if not rs then break end
+      local nextch = src:sub(re + 1, re + 1)
+      if nextch ~= "" and nextch:match("['\"`\\$]") then break end -- not a pure literal word
+      local cand = src:sub(rs, re)
+      local val = tab and tab[cand]
+      if val == nil or alias_seen[cand] then break end
+      alias_seen[cand] = true
+      local L = re - rs + 1
+      src = src:sub(1, rs - 1) .. val .. src:sub(re + 1); n = #src
+      if alias_tail == nil then alias_tail = rs + #val
+      else alias_tail = alias_tail + (#val - L) end
+      alias_next = val:match("[ \t]$") ~= nil
+      expanded = true
+      -- recurse: the value's first word (now at i) is itself command-position
+    end
+    -- A chained (argument-position) word that turned out NOT to be an alias ends
+    -- the chain. A command-position miss must NOT clear a chain a prior expansion
+    -- set (the command word is re-checked here after being expanded at dispatch).
+    if not expanded and not cmdpos then alias_next = false end
+  end
   -- Collect the bodies of any heredocs opened on the just-parsed line. Called
   -- after a simple command AND after a compound command's redirs (group,
   -- subshell, etc.), since `{ ...; } <<EOF` also opens a heredoc.
@@ -1039,8 +1146,7 @@ local function make_parser(src)
           if cc == "(" then d = d + 1 elseif cc == ")" then d = d - 1 end
           i = i + 1
         end
-      elseif c == "<" or c == ">" then break -- redirection metacharacters break a word (procsub <(/>( handled above)
-      elseif stop_cmp and (c == "&" or c == "|") then break -- &&/|| are self-delimiting inside [[ ]] (no surrounding space needed)
+      elseif c == "<" or c == ">" or c == "|" or c == "&" then break -- metacharacters end a word: redirs (procsub <(/>( handled above), `|`/`&` pipelines/lists & `&&`/`||`/`>&` need no surrounding space
       elseif c == "$" and src:sub(i + 1, i + 1) == "{" then
         i = scan_braces(src, i + 1) -- ${…}: match the close, honoring \ ' " and nesting
       elseif c == "`" then -- `…` command sub: keep it whole (spaces inside included)
@@ -1155,6 +1261,12 @@ local function make_parser(src)
 
   local function parse_command()
     ws()
+    -- reset the per-command alias recursion guard, then expand a leading alias in
+    -- place (handles a compound-command alias like LEFT='{' before dispatch; the
+    -- command-word case with leading assignments/redirects re-runs in the simple
+    -- loop, sharing this guard so a self-referential alias can't loop).
+    alias_seen = {}; alias_next = false; alias_tail = nil
+    try_alias(true)
     local dstart = i -- byte offset where this command (hence a funcdef) begins
     -- function NAME [()] { … }   or   NAME() { … }
     -- Function names may contain far more than identifier chars (bash: `show-len`,
@@ -1591,6 +1703,9 @@ local function make_parser(src)
         or c == "(" or c == ")" then break -- ( ) are metacharacters (subshell bounds)
       elseif c:match("[ \t]") then ws()
       else
+        -- Expand the command word here too (it can follow leading assignments or
+        -- redirects: `FOO=1 al`, `>f al`), else trailing-blank-chain an arg word.
+        try_alias(#words == 0)
         -- `declare -A a=(...)` etc.: an array literal in argument position.
         local cmd1 = words[1] and words[1].parts and words[1].parts[1]
         local an, ap
@@ -1615,8 +1730,10 @@ local function make_parser(src)
       return { t = "assignlist", line = ln, list = assigns }
     end
     -- a command follows: any leading assignments are its temporary (exported) env
-    return { t = "simple", line = ln, words = words, redirs = (#redirs > 0 and redirs or nil),
+    local node = { t = "simple", line = ln, words = words, redirs = (#redirs > 0 and redirs or nil),
       assigns = (#assigns > 0 and assigns or nil), arrayargs = arrayargs }
+    record_alias_state(node) -- note shopt/alias/unalias so later words expand
+    return node
   end
 
   -- pipeline: cmd [ | cmd ]*   (optional leading `!` negates the exit status)
@@ -1789,9 +1906,11 @@ local function make_parser(src)
 end
 
 -- Eager full parse -> { stmts } (used by the compiler, which needs the whole
--- program, and by callers that want the AST).
-function M.parse(src)
-  local nextf = make_parser(src)
+-- program, and by callers that want the AST). An optional `sh` makes alias
+-- expansion consult the live runtime table (for eval/source/$() at runtime); the
+-- compiler passes none, so it tracks aliases deterministically from source.
+function M.parse(src, sh)
+  local nextf = make_parser(src, sh)
   local stmts = {}
   while true do local s = nextf(); if not s then break end; stmts[#stmts + 1] = s end
   return { stmts = stmts }
@@ -1799,7 +1918,8 @@ end
 
 -- Lazy/incremental parse: returns an iterator yielding one top-level statement
 -- per call (nil at EOF). The interpreter uses this for instant start on large
--- scripts and to never tokenize past an `exit` (hybrid installers).
-function M.open(src) return make_parser(src) end
+-- scripts and to never tokenize past an `exit` (hybrid installers). `sh` (present
+-- when interpreting) makes alias expansion use the live runtime alias table.
+function M.open(src, sh) return make_parser(src, sh) end
 
 return M
