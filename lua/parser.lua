@@ -357,8 +357,20 @@ local function parse_paramexp(inner)
   elseif one == ":" then
     local body = rest:sub(2)
     if body == "" then return P { op = "badsubst", raw = name .. rest } end -- ${x:} empty offset
-    -- split off the FIRST colon: ${x:off:len}; ${x::} means off=0, len=0 (empty).
-    local colon = body:find(":", 1, true)
+    -- ${x:off:len}: split off from len at the `:` that is NOT a ternary colon.
+    -- The offset is arithmetic and may contain `? :` ternaries (`${s: a?2:0 :1}`),
+    -- so track the ternary depth as bash does (subst.c skip_to_delim SD_ARITHEXP:
+    -- each `?` raises the skip count, each `:` while it is positive belongs to
+    -- that ternary). `${x::}` -> off="" (0), len="" (0). `\` escapes the next char.
+    local colon, skipcol, k = nil, 0, 1
+    while k <= #body do
+      local ch = body:sub(k, k)
+      if ch == "\\" then k = k + 2
+      elseif ch == "?" then skipcol = skipcol + 1; k = k + 1
+      elseif ch == ":" and skipcol > 0 then skipcol = skipcol - 1; k = k + 1
+      elseif ch == ":" then colon = k; break
+      else k = k + 1 end
+    end
     if colon then return P { op = "sub", arg = body:sub(1, colon - 1), arg2 = body:sub(colon + 1) } end
     return P { op = "sub", arg = body }
   end
