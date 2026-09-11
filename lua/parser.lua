@@ -1232,7 +1232,12 @@ local function make_parser(src)
           if s == "eof" or peekword() == "esac" then break end
           local before = i
           local st = parse_stmt()
-          if not st or i == before then break end -- no progress (e.g. a stray `)`): stop, don't spin
+          if not st or i == before then
+            -- a stray `)` here means a case clause had no `;;` before the next
+            -- pattern (`a) b) …`) — bash rejects that as a syntax error.
+            if src:sub(i, i) == ")" then error("syntax error near `)'") end
+            break -- other no-progress (guard against spinning)
+          end
           body[#body + 1] = st
         end
         clauses[#clauses + 1] = { pats = pats, body = body, term = term }
