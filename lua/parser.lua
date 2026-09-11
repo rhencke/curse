@@ -854,6 +854,7 @@ local function make_parser(src)
           if cc == "(" then d = d + 1 elseif cc == ")" then d = d - 1 end
           i = i + 1
         end
+        if d > 0 then error("syntax error: unexpected end of file") end -- unclosed $(
       elseif (c == "<" or c == ">") and src:sub(i + 1, i + 1) == "(" then
         -- <(cmd) / >(cmd) process substitution: part of the word (balanced parens)
         i = i + 2; local d = 1
@@ -878,6 +879,7 @@ local function make_parser(src)
         while i <= n and src:sub(i, i) ~= "`" do
           if src:sub(i, i) == "\\" then i = i + 2 else i = i + 1 end
         end
+        if i > n then error("syntax error: unexpected end of file") end -- unclosed backtick
         i = i + 1
       elseif c:match("[ \t\n;]") then break
       else i = i + 1 end
