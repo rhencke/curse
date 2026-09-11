@@ -2320,10 +2320,15 @@ local function exec_simple(sh, args, hook, no_func)
     end
     -- logical target: resolve . and .. against $PWD textually (unless -P)
     local logical = logical_canon(dir:sub(1, 1) == "/" and dir or (prev .. "/" .. dir))
-    local target = physical and dir or logical
-    if C.chdir(target) ~= 0 and not (not physical and C.chdir(dir) == 0) then
+    -- bash chdir's the LITERAL operand first — this validates that every path
+    -- component really exists, so `cd nonexistent/..` is an error even though `..`
+    -- would textually cancel it. In logical mode it then moves to the canonicalized
+    -- path so the process and $PWD agree logically (e.g. `cd symlink/..` lands in
+    -- the symlink's textual parent, not its physical one).
+    if C.chdir(dir) ~= 0 then
       io.stderr:write("curse: cd: " .. dir .. ": No such file or directory\n"); sh.status = 1; return
     end
+    if not physical then C.chdir(logical) end
     sh.status = 0
     local newpwd = physical and sh:phys_cwd() or logical
     sh:export_str("OLDPWD", prev)
