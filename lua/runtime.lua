@@ -239,18 +239,21 @@ end
 -- must already point where the script's stdout should go. Never returns.
 function Shell:exec_script_child(path, args, n)
   -- This forked child inherited the parent's blocked signal mask (set while a
-  -- trap is active). Reset to empty so the child is interruptible, and drop the
-  -- trap table so it doesn't poll for signals it no longer handles.
+  -- trap is active). Reset to empty so the child is interruptible.
   if self.sigtraps and next(self.sigtraps) then
     local set = ffi.new("uint8_t[1024]"); C.sigemptyset(set)
     C.sigprocmask(2, set, nil) -- SIG_SETMASK
-    self.sigtraps = nil
   end
   local f = io.open(path, "r"); local src = f and f:read("*a") or ""; if f then f:close() end
-  self.params, self.nparams, self.argv0, self.traps, self.out = {}, 0, args[1], {}, io.write
-  for k = 2, n do self.nparams = self.nparams + 1; self.params[self.nparams] = args[k] end
-  pcall(require("interp").run_lazy, self, src)
-  io.flush(); C._exit(self.status or 0)
+  -- A no-shebang script is exec'd as a FRESH process: it sees only the exported
+  -- environment, NOT the parent's in-memory shell vars/functions/traps. Build a
+  -- new shell (import_env populates it from the environment) rather than reusing
+  -- self, so a non-exported `x=1; ./script` doesn't leak x into the script.
+  local child = Shell.new()
+  child.argv0, child.out = args[1], io.write
+  for k = 2, n do child.nparams = child.nparams + 1; child.params[child.nparams] = args[k] end
+  pcall(require("interp").run_lazy, child, src)
+  io.flush(); C._exit(child.status or 0)
 end
 
 -- ENOEXEC fallback for the streaming (non-capturing) path: fd 1 is already the
