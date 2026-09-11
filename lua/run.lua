@@ -40,9 +40,33 @@ while true do
   elseif a == "-O" or a == "+O" then presets[#presets + 1] = { shopt = arg[ai + 1], on = a == "-O" }; ai = ai + 2
   elseif a == "--norc" or a == "--noprofile" or a == "--rcfile" then
     ai = ai + (a == "--rcfile" and 2 or 1) -- ignore rc flags
+  elseif a and a:match("^%-[eiuxCoOlvsBh]+$") and #a > 2 then
+    -- bundled short flags: `-eu`, `-oo errexit noglob`, `-ex` … (bash bundles
+    -- single-char options; each `o`/`O` in the bundle takes the NEXT word as its
+    -- argument, consumed left-to-right).
+    local wi = ai
+    for k = 2, #a do
+      local f = a:sub(k, k)
+      if f == "e" then presets[#presets + 1] = { f = "opt_e", on = true }
+      elseif f == "u" then presets[#presets + 1] = { f = "opt_u", on = true }
+      elseif f == "x" then presets[#presets + 1] = { f = "opt_x", on = true }
+      elseif f == "C" then presets[#presets + 1] = { f = "opt_C", on = true }
+      elseif f == "i" then presets[#presets + 1] = { f = "opt_i", on = true }
+      elseif f == "o" then wi = wi + 1; presets[#presets + 1] = { o = arg[wi], on = true }
+      elseif f == "O" then wi = wi + 1; presets[#presets + 1] = { shopt = arg[wi], on = true }
+      end -- l/v/s/B/h: accepted no-ops
+    end
+    ai = wi + 1
   else break end
 end
-local OMAP = { errexit = "opt_e", nounset = "opt_u", noclobber = "opt_C", pipefail = "opt_pipefail" }
+-- `-o NAME` / `+o NAME`: same long-option names as the `set -o` builtin.
+local OMAP = { errexit = "opt_e", errtrace = "opt_errtrace", functrace = "opt_functrace",
+  hashall = "opt_h", histexpand = "opt_H", history = "opt_history", ignoreeof = "opt_ignoreeof",
+  ["interactive-comments"] = "opt_icomments", keyword = "opt_k", monitor = "opt_m",
+  noclobber = "opt_C", noexec = "opt_n", noglob = "opt_f", nolog = "opt_nolog",
+  notify = "opt_b", nounset = "opt_u", onecmd = "opt_t", physical = "opt_P",
+  pipefail = "opt_pipefail", posix = "opt_posix", privileged = "opt_p", verbose = "opt_v",
+  vi = "opt_vi", xtrace = "opt_x" }
 local function apply(s)
   for _, p in ipairs(presets) do
     if p.f then s[p.f] = p.on
