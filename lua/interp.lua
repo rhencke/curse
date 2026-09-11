@@ -214,6 +214,8 @@ ffi.cdef [[
   int setrlimit(int resource, const struct curse_rlimit *rlim);
   struct curse_timeval { long tv_sec; long tv_usec; };
   int gettimeofday(struct curse_timeval *tv, void *tz);
+  struct curse_pollfd { int fd; short events; short revents; };
+  int poll(struct curse_pollfd *fds, unsigned long nfds, int timeout);
 ]]
 local C = ffi.C
 -- The standard utility PATH (`command -p`), from confstr(_CS_PATH) like bash —
@@ -235,6 +237,13 @@ local function fd_getc(fd)
   local n = C.read(fd, rd1, 1)
   if n == 1 then return string.char(rd1[0] % 256) end
   return nil -- EOF or error
+end
+-- `read -t 0`: is a read on `fd` ready (data available OR EOF), so it wouldn't
+-- block? poll with a 0 timeout (POLLIN=1); >0 means ready (POLLIN or POLLHUP).
+local pollfd1 = ffi.new("struct curse_pollfd[1]")
+local function fd_ready(fd)
+  pollfd1[0].fd = fd; pollfd1[0].events = 1; pollfd1[0].revents = 0
+  return C.poll(pollfd1, 1, 0) > 0
 end
 local statbuf = ffi.new("uint8_t[144]") -- glibc x86-64 struct stat is 144 bytes
 -- Signal name/number normalization for `trap`.
@@ -3140,7 +3149,7 @@ local function exec_simple(sh, args, hook, no_func)
   elseif cmd == "read" then
     -- read [-r] [-a arr] [-p prompt] VAR...  (line from stdin, split on IFS)
     local raw, arr, j, nchars, ndelim, ufd = false, nil, 2, nil, false, 0
-    local delim
+    local delim, tmout
     while j <= #args do
       local a = args[j]
       if a == "--" then j = j + 1; break
@@ -3160,12 +3169,16 @@ local function exec_simple(sh, args, hook, no_func)
           elseif f == "N" then nchars = tonumber(takearg()); ndelim = true
           elseif f == "a" then arr = takearg()
           elseif f == "u" then ufd = tonumber(takearg()) or 0
-          elseif f == "p" or f == "t" then takearg() -- consume + ignore
+          elseif f == "p" then takearg() -- prompt: consume + ignore (non-interactive)
+          elseif f == "t" then tmout = takearg() -- timeout (only -t 0 is honored below)
           else k = k + 1 end -- -s etc.: ignore
         end
         j = j + advance
       else break end
     end
+    -- `read -t 0`: don't read anything — just report whether input is available
+    -- on the fd (bash: status 0 if a read wouldn't block, non-zero otherwise).
+    if tmout and tonumber(tmout) == 0 then sh.status = fd_ready(ufd) and 0 or 1; return end
     local vars = {}
     for k = j, #args do vars[#vars + 1] = args[k] end
     local line, had_nl = nil, true
