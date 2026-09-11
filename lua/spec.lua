@@ -47,6 +47,25 @@ end
 
 local function readfile(p) local f = io.open(p, "r"); if not f then return nil end local s = f:read("*a"); f:close(); return s end
 
+-- A case is OSH/YSH-specific — NOT a bash-behavior test — when its `case $SH in
+-- … esac` guard sends bash to exit/return (bash skips the whole case). curse
+-- targets bash only, so such cases are excluded from the scoreboard (like the
+-- ysh-*/hay* files). Detected by: a guard clause whose pattern matches "bash"
+-- and whose body begins with exit/return.
+local function osh_only(code)
+  for seg in code:gmatch("case%s+%$SH%s+in(.-)esac") do
+    for pats, bw in seg:gmatch("([%w%*%?@_%-%.:| ]+)%)%s*(%a+)") do
+      if bw == "exit" or bw == "return" then
+        for alt in (pats .. "|"):gmatch("%s*([%w%*%?@_%-%.:]+)%s*|") do
+          local pat = "^" .. alt:gsub("[%.%-]", "%%%0"):gsub("%*", ".*"):gsub("%?", ".") .. "$"
+          if ("bash"):match(pat) then return true end
+        end
+      end
+    end
+  end
+  return false
+end
+
 -- ---- case parser (mirrors test/spec/run.mts exactly) ----
 local function parse_cases(text)
   local cases, cur, inMeta = {}, nil, false
@@ -62,7 +81,9 @@ local function parse_cases(text)
   end
   if cur then cases[#cases + 1] = { name = cur.name, code = table.concat(cur.code, "\n") } end
   local out = {}
-  for _, c in ipairs(cases) do if c.code:match("%S") then out[#out + 1] = c end end
+  for _, c in ipairs(cases) do
+    if c.code:match("%S") and not osh_only(c.code) then out[#out + 1] = c end
+  end
   return out
 end
 
@@ -100,6 +121,7 @@ end
 local function is_oil(path)
   local b = path:match("[^/]+$") or ""
   return b:match("^ysh%-") or b:match("^hay") or b:match("^tea")
+    or b:match("^osh%-") or b:match("%-osh%.test") -- OSH-specific files (errexit-osh, osh-bugs)
 end
 if #filters > 0 then
   local kept = {}
