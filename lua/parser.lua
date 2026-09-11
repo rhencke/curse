@@ -10,6 +10,10 @@ local M = {}
 -- AST: {k="num",v}, {k="var",name}, {k="bin",op,l,r}, {k="un",op,e},
 --      {k="asgn",name,op,e}, {k="post",name,d}, {k="pre",name,d}
 local function arith(src, nodefer)
+  -- Line continuations are removed before arithmetic parsing, like bash's tokenizer:
+  -- a `\<newline>` inside `$(( ))` / `(( ))` joins the lines (`\` has no meaning in
+  -- arithmetic, so this is unambiguous). Bare newlines are already skipped as space.
+  src = src:gsub("\\\n", "")
   -- An empty (or all-whitespace) arithmetic expression is 0 in bash: `$(( ))` -> 0,
   -- `(( ))` -> value 0 -> status 1.
   if src:match("^%s*$") then return { k = "num", v = "0" } end
