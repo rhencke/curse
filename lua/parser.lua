@@ -1087,7 +1087,10 @@ local function make_parser(src)
           local c = src:sub(i, i)
           if c == ";" or c == "\n" or c == "" or c == "#" then break end
           if peekword() == "do" then break end
-          local w = word(); if w == "" then break end
+          -- an unquoted bare `(` in word position is a syntax error (`for x in a=()`,
+          -- `for x in (`); extglob/$()/<() are consumed inside word(true).
+          if c == "(" or c == ")" then error("syntax error near `" .. c .. "'") end
+          local w = word(true); if w == "" then break end
           add_word(words, w)
         end
       else
@@ -1207,7 +1210,8 @@ local function make_parser(src)
       local ln = line; i = i + 4; ws()
       -- bash requires the case subject on the same line as `case`; a newline or
       -- separator before any word (`case\nin esac`, `case;`) is a syntax error.
-      local subw = word()
+      -- word(true) also stops at a bare `(` so `case a=() in` errors (expected in).
+      local subw = word(true)
       if subw == "" then
         local c = src:sub(i, i)
         error("syntax error near `" .. (c == "\n" and "newline" or (c == "" and "esac" or c)) .. "'")
