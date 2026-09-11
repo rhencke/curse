@@ -968,7 +968,9 @@ local function make_parser(src)
     local start = i
     while i <= n do
       local c = src:sub(i, i)
-      if c == "\\" then i = i + 2 -- backslash escapes the next char (incl. metachars/space)
+      if c == "\\" then -- backslash escapes the next char (incl. metachars/space)
+        if src:sub(i + 1, i + 1) == "\n" then line = line + 1 end -- `\<newline>` line continuation
+        i = i + 2
       elseif stop_paren and (c == ")" or c == "(") then break
       elseif c == '"' then -- double quotes: honor \" and skip $(..)/$((..))/`..`
         i = i + 1                                        -- (their inner " are not the close)
