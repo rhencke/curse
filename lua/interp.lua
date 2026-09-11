@@ -1746,14 +1746,20 @@ local function exec_simple(sh, args, hook, no_func)
   elseif cmd == ":" or cmd == "true" then sh.status = 0
   elseif cmd == "false" then sh.status = 1
   elseif cmd == "break" then -- outside a loop: a no-op (bash), not a fatal unwind
-    if args[2] and not tonumber(args[2]) then -- non-numeric arg: error 128, still breaks one level
+    if args[3] ~= nil then -- too many arguments: a usage error (fatal under -c, else status 1)
+      io.stderr:write("curse: break: too many arguments\n"); sh.status = 1
+      if sh.opt_c then error({ __curse_exit = 1 }) end
+    elseif args[2] and not tonumber(args[2]) then -- non-numeric arg: error 128, still breaks one level
       io.stderr:write("curse: break: " .. args[2] .. ": numeric argument required\n")
       sh.status = 128; if (sh.loopdepth or 0) > 0 then error({ __curse_break = 1 }) end
     else
       sh.status = 0; if (sh.loopdepth or 0) > 0 then error({ __curse_break = tonumber(args[2]) or 1 }) end
     end
   elseif cmd == "continue" then
-    if args[2] and not tonumber(args[2]) then
+    if args[3] ~= nil then
+      io.stderr:write("curse: continue: too many arguments\n"); sh.status = 1
+      if sh.opt_c then error({ __curse_exit = 1 }) end
+    elseif args[2] and not tonumber(args[2]) then
       io.stderr:write("curse: continue: " .. args[2] .. ": numeric argument required\n")
       sh.status = 128; if (sh.loopdepth or 0) > 0 then error({ __curse_continue = 1 }) end
     else
@@ -3108,6 +3114,10 @@ local function exec_simple(sh, args, hook, no_func)
     end
     sh.status = 0
   elseif cmd == "shift" then
+    if args[3] ~= nil or (args[2] and not tonumber(args[2])) then -- too many / non-numeric args
+      io.stderr:write("curse: shift: " .. (args[3] ~= nil and "too many arguments" or (args[2] .. ": numeric argument required")) .. "\n")
+      sh.status = 1; if sh.opt_c then error({ __curse_exit = 1 }) end
+    else
     local nn = tonumber(args[2]) or 1
     if nn < 0 or nn > sh.nparams then sh.status = 1 -- out of range: no-op, status 1 (bash)
     else
@@ -3115,6 +3125,7 @@ local function exec_simple(sh, args, hook, no_func)
       for k = sh.nparams - nn + 1, sh.nparams do sh.params[k] = nil end
       sh.nparams = sh.nparams - nn
       sh.status = 0
+    end
     end
   elseif cmd == "local" then
     -- local [-naA] [+n] NAME[=val]…: shadow the var in this scope, honoring
