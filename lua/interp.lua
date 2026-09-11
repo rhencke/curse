@@ -1535,9 +1535,18 @@ local function run_function(sh, cmd, fn, args, hook)
   sh.linestack = sh.linestack or {}; table.insert(sh.linestack, 1, sh.cur_line or 0)
   sh.srcstack = sh.srcstack or {}; table.insert(sh.srcstack, 1, sh.cur_source or sh.argv0 or "")
   local saved_ld = sh.loopdepth; sh.loopdepth = 0 -- break/continue don't cross into a function
-  local ok, err
-  if type(fn) == "function" then ok, err = pcall(fn, sh) -- a COMPILED function closure
+  -- Redirects on the definition (`f(){ … } >&2`) apply to the whole body per call.
+  local fr = sh.func_redirs and sh.func_redirs[cmd]
+  local rsave, rsavedout, rok
+  if fr then
+    rsave, rok = apply_redirs(sh, fr)
+    rsavedout = sh.out; if redirs_touch_stdout(fr) then sh.out = io.write end
+  end
+  local ok, err = true, nil
+  if fr and rok == false then sh.status = 1 -- a failed redirect skips the body (bash)
+  elseif type(fn) == "function" then ok, err = pcall(fn, sh) -- a COMPILED function closure
   else ok, err = pcall(exec_list, sh, fn, hook, false) end -- an interp AST body
+  if fr then io.flush(); sh.out = rsavedout; restore_redirs(rsave) end
   sh.loopdepth = saved_ld
   table.remove(sh.funcstack, 1)
   table.remove(sh.linestack, 1); table.remove(sh.srcstack, 1)
@@ -3132,6 +3141,7 @@ local function exec_stmt(sh, st, hook)
     end
   elseif t == "funcdef" then
     sh.functions[st.name] = st.body
+    sh.func_redirs = sh.func_redirs or {}; sh.func_redirs[st.name] = st.redirs -- `f(){ … } >&2`
     sh.status = 0
   elseif t == "assignlist" then
     for _, a in ipairs(st.list) do exec_stmt(sh, a, hook) end

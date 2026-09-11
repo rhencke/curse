@@ -856,6 +856,14 @@ local function make_parser(src)
     end
     return brace_group()
   end
+  -- A function definition, with any trailing redirects (`f() { … } >&2`) that apply
+  -- to the whole body on every call.
+  local function funcdef_node(nm)
+    local body = func_body()
+    local redirs = {}
+    while true do ws(); local r = parse_redir(); if r then redirs[#redirs + 1] = r else break end end
+    return { t = "funcdef", name = nm, body = body, redirs = (#redirs > 0 and redirs or nil) }
+  end
 
   local parse_stmt -- forward: the and-or wrapper (used by case bodies below)
 
@@ -919,7 +927,7 @@ local function make_parser(src)
         local k = i + 1; while src:sub(k, k):match("[ \t]") do k = k + 1 end
         if src:sub(k, k) == ")" then i = k + 1 end
       end
-      return { t = "funcdef", name = nm, body = func_body() }
+      return funcdef_node(nm)
     end
     do
       local s, e = src:find("^[%w_][%w_%.%-:+@/]*", i)
@@ -931,7 +939,7 @@ local function make_parser(src)
           local k = j + 1; while src:sub(k, k):match("[ \t]") do k = k + 1 end
           if src:sub(k, k) == ")" then
             local nm = src:sub(s, e); i = k + 1
-            return { t = "funcdef", name = nm, body = func_body() }
+            return funcdef_node(nm)
           end
         end
       end
