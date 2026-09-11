@@ -367,7 +367,8 @@ local function parse_dquote(inner, add, heredoc)
       -- `\` escapes $ ` \ (and " in a real "…", but NOT in a heredoc body where
       -- " is an ordinary char, so `\"` stays literal there).
       local nx = inner:sub(i + 1, i + 1)
-      if nx == "$" or (nx == '"' and not heredoc) or nx == "\\" or nx == "`" then add({ lit = nx, q = true }); i = i + 2
+      if nx == "\n" and not heredoc then i = i + 2 -- backslash-newline: line continuation (removed)
+      elseif nx == "$" or (nx == '"' and not heredoc) or nx == "\\" or nx == "`" then add({ lit = nx, q = true }); i = i + 2
       else add({ lit = "\\", q = true }); i = i + 1 end
     elseif c == "$" then
       i = parse_dollar(inner, i, add, true)
