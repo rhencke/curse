@@ -3946,15 +3946,18 @@ exec_stmt = function(sh, st, hook)
     sh:array_assign("PIPESTATUS", { tostring(sh.status) }, false)
     drain_procsub(sh, pnp, pnf) -- feed >() temps, clean up <()/>() temp files
   elseif t == "forc" then
-    if st.init then eval(sh, st.init) end
+    -- DEBUG fires (at the `for` line) before the init, before EACH condition
+    -- evaluation, and before EACH step — bash's `[6][6][7]…` per-iteration pattern.
+    local function fdbg() if not (sh.in_trap and sh.in_trap > 0) then run_debug(sh, st.line) end end
+    if st.init then fdbg(); eval(sh, st.init) end
     local bodystatus = 0 -- a loop's status is its last body command's (0 if none)
     sh.loopdepth = (sh.loopdepth or 0) + 1
     while true do
       hook("loop", st.id)
-      if st.cond and not truth(eval(sh, st.cond)) then break end
+      if st.cond then fdbg(); if not truth(eval(sh, st.cond)) then break end end
       local act = run_loop_body(sh, st.body, hook); bodystatus = sh.status
       if act == "break" then break end
-      if st.step then eval(sh, st.step) end -- continue still runs the step
+      if st.step then fdbg(); eval(sh, st.step) end -- continue still runs the step
     end
     sh.loopdepth = sh.loopdepth - 1
     sh.status = bodystatus
