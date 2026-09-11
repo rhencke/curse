@@ -1188,7 +1188,7 @@ local BUILTINS = {
   exec = 1, readonly = 1, umask = 1, alias = 1, unalias = 1, shopt = 1, wait = 1, trap = 1,
   mapfile = 1, readarray = 1, compgen = 1, complete = 1, compopt = 1,
   pushd = 1, popd = 1, dirs = 1, builtin = 1, kill = 1, ulimit = 1, jobs = 1,
-  history = 1, fc = 1,
+  history = 1, fc = 1, hash = 1,
 }
 M.BUILTINS = BUILTINS -- exposed so the compiled backend delegates the same set
 local KEYWORDS = {
@@ -1740,6 +1740,33 @@ local function exec_simple(sh, args, hook, no_func)
       if sh.bg_pids then for _, p in ipairs(sh.bg_pids) do pcall(reap, p) end; sh.bg_pids = {} end
       sh.status = 0
     end
+  elseif cmd == "hash" then
+    -- hash [-r] [NAME…] : the command-location cache. bare = list; NAME = look up
+    -- and cache; -r = forget all. (bash keeps a cached path until -r, ignoring a
+    -- later PATH change — see Shell:resolve_cmd.)
+    sh.hashcache = sh.hashcache or {}
+    local rflag, names, j = false, {}, 2
+    while args[j] and args[j]:sub(1, 1) == "-" and #args[j] > 1 do
+      if args[j]:find("r") then rflag = true end
+      j = j + 1
+    end
+    for k = j, #args do names[#names + 1] = args[k] end
+    if rflag then for k in pairs(sh.hashcache) do sh.hashcache[k] = nil end end
+    if #names > 0 then
+      sh.status = 0
+      for _, nm in ipairs(names) do
+        if not nm:find("/", 1, true) and not sh:resolve_cmd(nm) then
+          io.stderr:write("curse: hash: " .. nm .. ": not found\n"); sh.status = 1
+        end
+      end
+    elseif not rflag then -- bare `hash`: print the cache (bash format)
+      local ks = {}; for k in pairs(sh.hashcache) do ks[#ks + 1] = k end; table.sort(ks)
+      if #ks > 0 then
+        sh:echo("hits\tcommand")
+        for _, k in ipairs(ks) do sh:echo(("%4d\t%s"):format(sh.hashcache[k].hits, sh.hashcache[k].path)) end
+      end
+      sh.status = 0
+    else sh.status = 0 end
   elseif cmd == "history" then
     -- history [-c] [-r [file]] [-w [file]] | history : the shell command history.
     sh.history = sh.history or {}

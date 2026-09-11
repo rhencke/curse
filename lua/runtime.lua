@@ -226,14 +226,7 @@ end
 -- shell script (bash runs it as one), so resolve it via $PATH exactly as the
 -- failed execvp would, then run it through our own interpreter and _exit. fd 1
 -- must already point where the script's stdout should go. Never returns.
-function Shell:exec_script_child(args, n)
-  local path = args[1]
-  if not path:find("/", 1, true) then -- the FIRST executable match (X_OK), like execvp
-    for dir in (self:get("PATH") .. ":"):gmatch("([^:]*):") do
-      local cand = (dir == "" and "." or dir) .. "/" .. args[1]
-      if C.access(cand, 1) == 0 then path = cand; break end -- 1 == X_OK
-    end
-  end
+function Shell:exec_script_child(path, args, n)
   local f = io.open(path, "r"); local src = f and f:read("*a") or ""; if f then f:close() end
   self.params, self.nparams, self.argv0, self.traps, self.out = {}, 0, args[1], {}, io.write
   for k = 2, n do self.nparams = self.nparams + 1; self.params[self.nparams] = args[k] end
@@ -243,9 +236,9 @@ end
 
 -- ENOEXEC fallback for the streaming (non-capturing) path: fd 1 is already the
 -- destination, so just fork a child that runs the script and inherits fd 1.
-function Shell:run_noexec(args, n)
+function Shell:run_noexec(path, args, n)
   local pid = C.fork()
-  if pid == 0 then self:exec_script_child(args, n) end
+  if pid == 0 then self:exec_script_child(path, args, n) end
   local st = ffi.new("int[1]"); C.waitpid(pid, st, 0); self.status = M.wexit(st[0])
 end
 
@@ -253,6 +246,15 @@ function Shell:exec(...)
   local args = { ... }
   local n = #args
   if n == 0 or args[1] == "" then self.status = 127; return end
+  -- Resolve a bare name to its (cached) $PATH location, but keep argv[0] = the
+  -- name as typed. A command with a `/` is exec'd directly.
+  local execpath = args[1]
+  if not args[1]:find("/", 1, true) then
+    execpath = self:resolve_cmd(args[1])
+    if not execpath then
+      io.stderr:write("curse: " .. args[1] .. ": command not found\n"); self.status = 127; return
+    end
+  end
   local argv = ffi.new("const char*[?]", n + 1)
   local anchor = {} -- keep the Lua strings alive while argv points into them
   for i = 1, n do anchor[i] = tostring(args[i]); argv[i - 1] = anchor[i] end
@@ -264,8 +266,8 @@ function Shell:exec(...)
   if self.out == io.write then
     io.flush() -- our own buffered stdout must reach fd 1 before the child writes
     local pidp = ffi.new("curse_pid_t[1]")
-    local rc = C.posix_spawnp(pidp, args[1], nil, nil, ffi.cast("char *const *", argv), C.environ)
-    if rc == 8 then return self:run_noexec(args, n) end -- no shebang: run as a script
+    local rc = C.posix_spawnp(pidp, execpath, nil, nil, ffi.cast("char *const *", argv), C.environ)
+    if rc == 8 then return self:run_noexec(execpath, args, n) end -- no shebang: run as a script
     if rc ~= 0 then
       io.stderr:write("curse: " .. tostring(args[1]) .. (rc == 2 and ": command not found\n" or ": Permission denied\n"))
       self.status = (rc == 2) and 127 or 126; return
@@ -282,14 +284,14 @@ function Shell:exec(...)
   C.posix_spawn_file_actions_adddup2(fa, wfd, 1)
   C.posix_spawn_file_actions_addclose(fa, rfd)
   local pidp = ffi.new("curse_pid_t[1]")
-  local rc = C.posix_spawnp(pidp, args[1], fa, nil, ffi.cast("char *const *", argv), C.environ)
+  local rc = C.posix_spawnp(pidp, execpath, fa, nil, ffi.cast("char *const *", argv), C.environ)
   C.posix_spawn_file_actions_destroy(fa)
   local pid = pidp[0]
   if rc == 8 then -- ENOEXEC: no-shebang script — run it through our interpreter in a
     pid = C.fork()  -- child, with its stdout dup'd onto the capture pipe's write end.
     if pid == 0 then
       C.dup2(wfd, 1); C.close(wfd); C.close(rfd)
-      self:exec_script_child(args, n)
+      self:exec_script_child(execpath, args, n)
     end
   end
   C.close(wfd)
@@ -465,6 +467,23 @@ local function same_file(a, b)
   if ffi.C.curse_rt_stat(b, stbuf_b) ~= 0 then return false end
   return ffi.cast("uint64_t *", stbuf_a)[0] == ffi.cast("uint64_t *", stbuf_b)[0]        -- st_dev @0
      and ffi.cast("uint64_t *", stbuf_a + 8)[0] == ffi.cast("uint64_t *", stbuf_b + 8)[0] -- st_ino @8
+end
+-- Resolve a bare command NAME to an absolute path via $PATH — the first
+-- executable, non-directory match (like execvp) — and cache it (bash's command
+-- hash: a later PATH change is ignored until `hash -r`). nil if not found.
+function Shell:resolve_cmd(name)
+  local c = self.hashcache and self.hashcache[name]
+  if c then c.hits = c.hits + 1; return c.path end
+  for dir in (self:get("PATH") .. ":"):gmatch("([^:]*):") do
+    local cand = (dir == "" and "." or dir) .. "/" .. name
+    if ffi.C.access(cand, 1) == 0 and ffi.C.curse_rt_stat(cand, stbuf_a) == 0 -- 1 == X_OK
+        and bit.band(ffi.cast("uint32_t *", stbuf_a + 24)[0], 0xF000) ~= 0x4000 then -- not a dir
+      self.hashcache = self.hashcache or {}
+      self.hashcache[name] = { path = cand, hits = 1 }
+      return cand
+    end
+  end
+  return nil
 end
 function Shell:phys_cwd()
   local p = ffi.C.getcwd(scratch, 4096); return p ~= nil and ffi.string(p) or ""
