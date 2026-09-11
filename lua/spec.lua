@@ -93,11 +93,23 @@ do
   local p = io.popen("ls " .. SPEC .. "/*.test.sh 2>/dev/null")
   if p then for line in p:lines() do files[#files + 1] = line end p:close() end
 end
+-- OSH's spec suite bundles YSH (Oil's OWN language) tests — ysh-*, hay*, tea*.
+-- curse targets BASH compatibility ONLY (it does not implement the YSH language),
+-- so the default scoreboard runs just the bash-compat files. An explicit
+-- file-substring filter can still select an excluded file, for debugging.
+local function is_oil(path)
+  local b = path:match("[^/]+$") or ""
+  return b:match("^ysh%-") or b:match("^hay") or b:match("^tea")
+end
 if #filters > 0 then
   local kept = {}
   for _, f in ipairs(files) do
     for _, s in ipairs(filters) do if f:find(s, 1, true) then kept[#kept + 1] = f; break end end
   end
+  files = kept
+else
+  local kept = {}
+  for _, f in ipairs(files) do if not is_oil(f) then kept[#kept + 1] = f end end
   files = kept
 end
 
