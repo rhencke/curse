@@ -31,7 +31,8 @@ local SETOPT = {} -- name -> field
 for _, o in ipairs(SETOPTS) do SETOPT[o[1]] = o[2] end
 local SETFLAG = { a = "opt_a", B = "opt_B", e = "opt_e", h = "opt_h", H = "opt_H",
   k = "opt_k", m = "opt_m", C = "opt_C", n = "opt_n", f = "opt_f", b = "opt_b",
-  u = "opt_u", t = "opt_t", P = "opt_P", v = "opt_v", x = "opt_x", p = "opt_p" }
+  u = "opt_u", t = "opt_t", P = "opt_P", v = "opt_v", x = "opt_x", p = "opt_p",
+  T = "opt_functrace", E = "opt_errtrace" }
 -- options that default ON (interactive-comments and braceexpand/hashall/histexpand/
 -- history are on; emacs is on for the display default). nil field state == off.
 local SETDEFAULT = { opt_B = true, opt_h = true, opt_H = true, opt_history = true,
@@ -1802,8 +1803,10 @@ local function run_function(sh, cmd, fn, args, hook, tenv_base)
     else error(err) end
   end
   -- RETURN trap: fires after the function body returns (in the caller's scope),
-  -- preserving the function's exit status.
-  local rt_h = sh.traps and sh.traps.RETURN
+  -- preserving the function's exit status. A top-level RETURN trap is NOT inherited
+  -- by a function unless functrace (`set -T`) is on (bash) — a sourced script's
+  -- return fires it regardless (see the `.`/source builtin).
+  local rt_h = sh.opt_functrace and sh.traps and sh.traps.RETURN
   if rt_h and rt_h ~= "" and not sh.in_return_trap then
     sh.in_return_trap = true; local saved = sh.status
     run_trap(sh, rt_h); sh.status = saved; sh.in_return_trap = false
@@ -1934,6 +1937,10 @@ local function exec_simple(sh, args, hook, no_func)
         if file_test("-f", cand) then file = cand; break end
       end
     end
+    -- `.`/source fires the RETURN trap when it returns — for EVERY outcome except
+    -- the no-argument usage error (directory/not-found/syntax-error/success all
+    -- fire), regardless of functrace; an `exit` in the file propagates and skips it.
+    local do_return = name ~= nil
     if not name then io.stderr:write("curse: " .. cmd .. ": filename argument required\n"); sh.status = 2
     elseif file_test("-d", file) then
       io.stderr:write("curse: " .. cmd .. ": " .. name .. ": is a directory\n"); sh.status = 1
@@ -1957,9 +1964,16 @@ local function exec_simple(sh, args, hook, no_func)
           if not rok then
             if type(err) == "table" and err.__curse_return then sh.status = err.__curse_return
             elseif type(err) == "table" and err.__curse_parseerr then sh.status = 2 -- a syntax error in the file: source returns 2, doesn't halt the shell (bash)
-            else error(err) end -- a real `exit` propagates
+            else error(err) end -- a real `exit` propagates (skips the RETURN trap)
           end
         end
+      end
+    end
+    if do_return then
+      local rt = sh.traps and sh.traps.RETURN
+      if rt and rt ~= "" and not sh.in_return_trap then
+        sh.in_return_trap = true; local sv = sh.status
+        run_trap(sh, rt); sh.status = sv; sh.in_return_trap = false
       end
     end
   elseif cmd == "wait" then
