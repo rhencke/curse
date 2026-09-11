@@ -368,6 +368,92 @@ local function parse_paramexp(inner)
 end
 M.parse_paramexp = parse_paramexp
 
+-- Find the `)` that closes a `$( … )` command substitution. `j` is the index of
+-- the first char INSIDE the parens (just past "$("); returns the index just PAST
+-- the closing `)`. Understands single/double/ANSI-C quotes, backslash escapes,
+-- nested $()/${ }/$(( ))/backticks, and — crucially — `case … esac`, whose
+-- pattern-terminating `)` does NOT close the substitution (`$(case x in x) …;; esac)`).
+local scan_cmdsub
+scan_cmdsub = function(src, j)
+  local n = #src
+  local pdepth = 0            -- nested subshell / group / extglob paren depth
+  local cst = {}              -- stack of enclosing `case` phases: "in"|"pat"|"body"
+  local patp = 0              -- paren depth WITHIN the current case pattern
+  local patstart = false      -- at the very start of a pattern (a leading `(` is optional)
+  local wstart = true         -- next char begins a word (for `#` comments and keywords)
+  local i = j
+  local function skipq(close) -- skip from a quote at i to just past `close`, honoring `\`
+    local k = i + 1
+    while k <= n and src:sub(k, k) ~= close do
+      if src:sub(k, k) == "\\" then k = k + 2 else k = k + 1 end
+    end
+    return k + 1
+  end
+  while i <= n do
+    local c = src:sub(i, i)
+    if c == " " or c == "\t" or c == "\n" then i = i + 1; wstart = true
+    elseif c == "\\" then i = i + 2; wstart = false
+    elseif c == ";" then
+      if src:sub(i, i + 1) == ";;" then
+        if cst[#cst] == "body" then cst[#cst] = "pat"; patstart = true end
+        i = i + 2
+      else i = i + 1 end
+      wstart = true
+    elseif c == "&" then i = i + (src:sub(i, i + 1) == "&&" and 2 or 1); wstart = true
+    elseif c == "|" then
+      if cst[#cst] == "pat" then i = i + 1 -- `|` is pattern alternation, not a pipe
+      else i = i + (src:sub(i, i + 1) == "|&" and 2 or 1); wstart = true end
+    elseif c == "'" then i = skipq("'"); wstart = false; patstart = false
+    elseif c == "$" and src:sub(i + 1, i + 1) == "'" then i = i + 1; i = skipq("'"); wstart = false; patstart = false
+    elseif c == '"' then
+      i = i + 1
+      while i <= n and src:sub(i, i) ~= '"' do
+        local d = src:sub(i, i)
+        if d == "\\" then i = i + 2
+        elseif d == "$" and src:sub(i + 1, i + 2) == "((" then local _, ni = grab_dparen(src, i + 3); i = ni
+        elseif d == "$" and src:sub(i + 1, i + 1) == "(" then i = scan_cmdsub(src, i + 2)
+        elseif d == "$" and src:sub(i + 1, i + 1) == "{" then i = scan_braces(src, i + 1)
+        elseif d == "`" then i = i + 1; while i <= n and src:sub(i, i) ~= "`" do i = i + (src:sub(i, i) == "\\" and 2 or 1) end; i = i + 1
+        else i = i + 1 end
+      end
+      i = i + 1; wstart = false; patstart = false
+    elseif c == "`" then
+      i = i + 1; while i <= n and src:sub(i, i) ~= "`" do i = i + (src:sub(i, i) == "\\" and 2 or 1) end; i = i + 1
+      wstart = false; patstart = false
+    elseif c == "$" and src:sub(i + 1, i + 2) == "((" then local _, ni = grab_dparen(src, i + 3); i = ni; wstart = false; patstart = false
+    elseif c == "$" and src:sub(i + 1, i + 1) == "(" then i = scan_cmdsub(src, i + 2); wstart = false; patstart = false
+    elseif c == "$" and src:sub(i + 1, i + 1) == "{" then i = scan_braces(src, i + 1); wstart = false; patstart = false
+    elseif c == "#" and wstart then
+      while i <= n and src:sub(i, i) ~= "\n" do i = i + 1 end -- comment to end of line
+    elseif c == "(" then
+      if cst[#cst] == "pat" then
+        if patstart then patstart = false else patp = patp + 1 end -- leading `(` is optional; else extglob/group
+        wstart = false
+      else pdepth = pdepth + 1; wstart = true end
+      i = i + 1
+    elseif c == ")" then
+      if cst[#cst] == "pat" then
+        if patp > 0 then patp = patp - 1; i = i + 1
+        else cst[#cst] = "body"; patstart = false; i = i + 1; wstart = true end -- pattern terminator
+      elseif pdepth > 0 then pdepth = pdepth - 1; i = i + 1; wstart = false
+      else return i + 1 end -- the `)` that closes the $(
+    elseif c == "<" or c == ">" then i = i + 1; wstart = false
+    else
+      local a, b = src:find("^[^ \t\n;&|()<>'\"`$#\\]+", i)
+      if not a then i = i + 1
+      else
+        local wd, was = src:sub(a, b), wstart
+        wstart = false; if cst[#cst] == "pat" then patstart = false end
+        if was and wd == "case" then cst[#cst + 1] = "in"
+        elseif wd == "in" and cst[#cst] == "in" then cst[#cst] = "pat"; patstart = true
+        elseif was and wd == "esac" and #cst > 0 then table.remove(cst) end
+        i = b + 1
+      end
+    end
+  end
+  error("syntax error: unexpected end of file") -- unclosed $(
+end
+
 -- `$((` is arithmetic ONLY when it's a balanced `$(( expr ))` — the paren balance
 -- first returns to 0 at a `)` immediately followed by another `)`. Otherwise the
 -- first `(` opened a subshell (`$( (…) )`, #2337). Quote-aware.
@@ -407,14 +493,8 @@ local function parse_dollar(w, i, add, q)
     end
     add({ arith = w:sub(i + 2, j - 1), q = q }); return j + 1
   elseif nx == "(" then
-    local depth, j = 1, i + 2
-    while j <= #w do
-      local c2 = w:sub(j, j)
-      if c2 == "(" then depth = depth + 1
-      elseif c2 == ")" then depth = depth - 1; if depth == 0 then break end end
-      j = j + 1
-    end
-    add({ cmdsub = w:sub(i + 2, j - 1), q = q }); return j + 1
+    local je = scan_cmdsub(w, i + 2) -- index just past the closing `)` (case/quote/nesting aware)
+    add({ cmdsub = w:sub(i + 2, je - 2), q = q }); return je
   elseif nx == '"' then
     -- $"…" locale translation: with no catalog it's just the double-quoted string.
     return i + 1 -- skip the `$`; the caller parses the following "…" normally
@@ -895,12 +975,7 @@ local function make_parser(src)
           if d == "\\" then i = i + 2
           elseif d == "$" and src:sub(i + 1, i + 2) == "((" then local _, ni = grab_dparen(src, i + 3); i = ni
           elseif d == "$" and src:sub(i + 1, i + 1) == "(" then
-            i = i + 2; local dep = 1
-            while i <= n and dep > 0 do
-              local cc = src:sub(i, i)
-              if cc == "(" then dep = dep + 1 elseif cc == ")" then dep = dep - 1 end
-              i = i + 1
-            end
+            i = scan_cmdsub(src, i + 2) -- case/quote/nesting-aware boundary
           elseif d == "$" and src:sub(i + 1, i + 1) == "{" then
             i = scan_braces(src, i + 1) -- ${…}: inner \ ' " and nested {} don't close it
           elseif d == "`" then
@@ -931,13 +1006,7 @@ local function make_parser(src)
           i = i + 1
         end
       elseif c == "$" and src:sub(i + 1, i + 1) == "(" then
-        i = i + 2; local d = 1
-        while i <= n and d > 0 do
-          local cc = src:sub(i, i)
-          if cc == "(" then d = d + 1 elseif cc == ")" then d = d - 1 end
-          i = i + 1
-        end
-        if d > 0 then error("syntax error: unexpected end of file") end -- unclosed $(
+        i = scan_cmdsub(src, i + 2) -- case/quote/nesting-aware boundary (errors if unclosed)
       elseif (c == "<" or c == ">") and src:sub(i + 1, i + 1) == "(" then
         -- <(cmd) / >(cmd) process substitution: part of the word (balanced parens)
         i = i + 2; local d = 1
