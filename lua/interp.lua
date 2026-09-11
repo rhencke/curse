@@ -8,6 +8,7 @@ local rt = require("runtime")
 local P = require("parser") -- parser has no load-time dep on interp, so this is cycle-safe
 local i64 = rt.i64
 local ffi = require("ffi")
+local u64 = ffi.typeof("uint64_t") -- string.format formats int64_t/uint64_t cdata directly
 local bit = require("bit")
 
 local M = {}
@@ -193,6 +194,8 @@ ffi.cdef [[
   unsigned int umask(unsigned int mask);
   long read(int fd, void *buf, unsigned long count);
   unsigned long confstr(int name, char *buf, unsigned long len);
+  long long strtoll(const char *nptr, char **endptr, int base);
+  unsigned long long strtoull(const char *nptr, char **endptr, int base);
   int kill(int pid, int sig);
   unsigned int geteuid(void);
   unsigned int getegid(void);
@@ -1382,10 +1385,10 @@ end
 -- otherwise arithmetic (bases honored). Returns (int64, ok) — ok=false marks an
 -- invalid number (bash prints 0 and sets status 1). int64 keeps full 64-bit
 -- precision for %d/%u/%o/%x (LuaJIT's string.format formats cdata directly).
-local function printf_int(s)
-  if s == nil or s == "" then return 0LL, true end
+local function printf_int(s, uns)
+  if s == nil or s == "" then return 0, true end
   local c = s:sub(1, 1)
-  if c == "'" or c == '"' then return (#s >= 2 and i64(s:byte(2)) or 0LL), true end
+  if c == "'" or c == '"' then return (#s >= 2 and s:byte(2) or 0), true end
   -- strtoll semantics (NOT shell arithmetic): skip leading blanks, read a single
   -- [sign] hex/octal/decimal integer, and any leftover (trailing chars OR blanks,
   -- and no base#N) makes it invalid — bash still prints the parsed value, status 1.
@@ -1393,9 +1396,11 @@ local function printf_int(s)
   local tok = rest:match("^[%+%-]?0[xX]%x+")   -- 0x hex
     or rest:match("^[%+%-]?0[0-7]*")           -- 0 / 0NNN octal
     or rest:match("^[%+%-]?%d+")               -- decimal
-  if not tok then return 0LL, false end        -- no digits at all ("xyz") -> 0, invalid
-  local ok, v = pcall(rt.arith_num, tok)
-  if not ok then return 0LL, false end
+  if not tok then return 0, false end          -- no digits at all ("xyz") -> 0, invalid
+  -- libc strtoll/strtoull clamp out-of-range values to the type limits (and
+  -- strtoull wraps a negative modulo 2^64), exactly matching bash's printf. Cast
+  -- to the int64_t/uint64_t typedefs so string.format formats them directly.
+  local v = uns and u64(C.strtoull(tok, nil, 0)) or i64(C.strtoll(tok, nil, 0))
   return v, (rest:sub(#tok + 1) == "")         -- fully consumed?
 end
 -- A floating printf argument (for %f/%e/%g): C strtod semantics via tonumber.
@@ -1429,15 +1434,14 @@ local function printf_q(s)
   end
   return (s:gsub("[%s\"'\\|&;<>()$`?*%[%]#~=!{}^]", "\\%0"))
 end
-local uint64_t = ffi.typeof("uint64_t")
 -- Format one numeric %-conversion from a raw arg string. Returns (string, ok).
 local function printf_conv(full, conv, arg)
   if conv == "d" or conv == "i" then
     local v, ok = printf_int(arg); return string.format(full .. "d", v), ok
   elseif conv == "u" then
-    local v, ok = printf_int(arg); return string.format(full .. "u", uint64_t(v)), ok
+    local v, ok = printf_int(arg, true); return string.format(full .. "u", v), ok
   elseif conv == "o" or conv == "x" or conv == "X" then
-    local v, ok = printf_int(arg); return string.format(full .. conv, uint64_t(v)), ok
+    local v, ok = printf_int(arg, true); return string.format(full .. conv, v), ok
   elseif conv == "f" or conv == "F" or conv == "e" or conv == "E" or conv == "g"
       or conv == "G" or conv == "a" or conv == "A" then
     local v, ok = printf_float(arg); return string.format(full .. (conv == "F" and "f" or conv), v), ok
