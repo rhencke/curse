@@ -3901,8 +3901,16 @@ exec_stmt = function(sh, st, hook)
   elseif t == "subshell" then
     -- ( list ) runs in a forked child: env/var changes don't escape, like bash
     io.flush() -- flush parent stdio so the fork doesn't duplicate buffered output
+    -- Inside a $(…) capture, the child's stdout must reach the capture buffer, not
+    -- the real fd 1 (a forked subshell would otherwise LEAK past the in-process
+    -- capture) — route it through a pipe the parent drains into sh.out. A stdout
+    -- redirect in the body still overrides fd 1 in the child (pipe drains empty).
+    local cap = sh.capturing and true
+    local pfd
+    if cap then pfd = ffi.new("int[2]"); if C.pipe(pfd) ~= 0 then cap = false end end
     local pid = C.fork()
     if pid == 0 then
+      if cap then C.close(pfd[0]); C.dup2(pfd[1], 1); C.close(pfd[1]) end
       sh.in_subprogram = (sh.in_subprogram or 0) + 1 -- ERR trap won't fire here (sans errtrace)
       sh.loopdepth = 0 -- a loop enclosing this subshell isn't ours to break/continue
       local ok, err = pcall(function()
@@ -3913,6 +3921,16 @@ exec_stmt = function(sh, st, hook)
       child_status(sh, ok, err)
       io.flush() -- flush BEFORE _exit (which doesn't); exit/error skips an inline flush
       C._exit(sh.status or 0)
+    end
+    if cap then -- parent: drain the child's stdout into the capture buffer, then reap
+      C.close(pfd[1])
+      local rbuf = ffi.new("char[8192]")
+      while true do
+        local nr = tonumber(C.read(pfd[0], rbuf, 8192))
+        if not nr or nr <= 0 then break end
+        sh.out(ffi.string(rbuf, nr))
+      end
+      C.close(pfd[0])
     end
     local stbuf = ffi.new("int[1]"); C.waitpid(pid, stbuf, 0)
     sh.status = rt.wexit(stbuf[0])
