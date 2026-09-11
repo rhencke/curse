@@ -349,13 +349,15 @@ end
 
 -- Parse the inside of a "…" (everything is quoted): $ expansions + literals,
 -- honoring \$ \" \\ \` escapes.
-local function parse_dquote(inner, add)
+local function parse_dquote(inner, add, heredoc)
   local i = 1
   while i <= #inner do
     local c = inner:sub(i, i)
     if c == "\\" then
+      -- `\` escapes $ ` \ (and " in a real "…", but NOT in a heredoc body where
+      -- " is an ordinary char, so `\"` stays literal there).
       local nx = inner:sub(i + 1, i + 1)
-      if nx == "$" or nx == '"' or nx == "\\" or nx == "`" then add({ lit = nx, q = true }); i = i + 2
+      if nx == "$" or (nx == '"' and not heredoc) or nx == "\\" or nx == "`" then add({ lit = nx, q = true }); i = i + 2
       else add({ lit = "\\", q = true }); i = i + 1 end
     elseif c == "$" then
       i = parse_dollar(inner, i, add, true)
@@ -449,9 +451,12 @@ M.parse_word = parse_word
 -- Parse a heredoc body as double-quote content: $… expands, but quotes are
 -- literal (a heredoc doesn't treat ' or " specially). Used when the delimiter
 -- was unquoted; a quoted delimiter means no expansion (raw body).
-function M.parse_heredoc(body)
+-- `is_body` true for a real heredoc body (where " is an ordinary char, so `\"`
+-- stays literal); false/omitted for a double-quoted-context reuse (a quoted
+-- ${x-default} word), where `\"` escapes to " like inside "…".
+function M.parse_heredoc(body, is_body)
   local parts = {}
-  parse_dquote(body, function(p) parts[#parts + 1] = p end)
+  parse_dquote(body, function(p) parts[#parts + 1] = p end, is_body)
   return { k = "word", parts = parts }
 end
 

@@ -1111,7 +1111,7 @@ local function apply_redirs(sh, redirs)
       backup(1); backup(2); local f = C.open(t, 1089, 420)
       if f >= 0 then C.dup2(f, 1); C.dup2(f, 2); C.close(f) else ok = false end end
     elseif r.op == "heredoc" then
-      local body = r.expand and expand_word(sh, P.parse_heredoc(r.body or "")) or (r.body or "")
+      local body = r.expand and expand_word(sh, P.parse_heredoc(r.body or "", true)) or (r.body or "")
       backup(r.fd or 0); feed_stdin(r.fd or 0, body)
     elseif r.op == "herestring" then
       local body = expand_word(sh, P.parse_word(r.word or "")) .. "\n"
