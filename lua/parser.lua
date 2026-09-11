@@ -1392,7 +1392,12 @@ local function make_parser(src)
         while true do
           ws()
           if src:sub(i, i) == "#" then while i <= n and src:sub(i, i) ~= "\n" do i = i + 1 end
-          elseif src:sub(i, i) == "\n" then line = line + 1; i = i + 1
+          elseif src:sub(i, i) == "\n" then
+            -- a heredoc opened by the stage before this `|` has its body on the
+            -- following lines (`cat <<EOF |` <newline> body EOF <newline> next) —
+            -- consume it here before the next stage, else the body parses as cmds.
+            if #heredocs_pending > 0 then collect_heredocs()
+            else line = line + 1; i = i + 1 end
           else break end
         end
         cmds[#cmds + 1] = parse_command()
