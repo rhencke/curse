@@ -198,6 +198,10 @@ ffi.cdef [[
   unsigned long long strtoull(const char *nptr, char **endptr, int base);
   struct curse_passwd { char *pw_name; char *pw_passwd; unsigned int pw_uid; unsigned int pw_gid; char *pw_gecos; char *pw_dir; char *pw_shell; };
   struct curse_passwd *getpwnam(const char *name);
+  int sigemptyset(void *set);
+  int sigaddset(void *set, int signum);
+  int sigprocmask(int how, const void *set, void *oldset);
+  int sigtimedwait(const void *set, void *info, const void *timeout);
   struct curse_passwd *getpwent(void);
   void setpwent(void);
   void endpwent(void);
@@ -236,6 +240,17 @@ local SIGNUM = { HUP = 1, INT = 2, QUIT = 3, ILL = 4, TRAP = 5, ABRT = 6, BUS = 
   FPE = 8, KILL = 9, USR1 = 10, SEGV = 11, USR2 = 12, PIPE = 13, ALRM = 14, TERM = 15,
   CHLD = 17, CONT = 18, STOP = 19, TSTP = 20, TTIN = 21, TTOU = 22, SYS = 31 }
 local NUMSIG = {}; for k, v in pairs(SIGNUM) do NUMSIG[v] = k end
+-- Real-signal traps: LuaJIT forbids calling Lua from an async C signal handler,
+-- so instead of installing one we BLOCK the trapped signal (sigprocmask) and POLL
+-- for it synchronously at safepoints with sigtimedwait — running the handler
+-- between commands, like bash delivers a trap.
+local sigset_poll = ffi.new("uint8_t[128]")  -- glibc sigset_t is 128 bytes
+local sigset_one = ffi.new("uint8_t[128]")
+local zero_ts = ffi.new("long[2]", 0, 0)     -- struct timespec {0,0} = poll, don't block
+local function block_sig(signum, block) -- SIG_BLOCK=0, SIG_UNBLOCK=1
+  C.sigemptyset(sigset_one); C.sigaddset(sigset_one, signum)
+  C.sigprocmask(block and 0 or 1, sigset_one, nil)
+end
 -- Human-readable signal descriptions bash prints when a job is killed (`wait`).
 local SIGDESC = { [1] = "Hangup", [2] = "Interrupt", [3] = "Quit", [4] = "Illegal instruction",
   [5] = "Trace/breakpoint trap", [6] = "Aborted", [7] = "Bus error", [8] = "Floating point exception",
@@ -1981,6 +1996,16 @@ local function exec_simple(sh, args, hook, no_func)
         if not canon then io.stderr:write("curse: trap: " .. args[k] .. ": invalid signal specification\n"); ok = false
         elseif action == "-" then sh.traps[canon] = nil
         else sh.traps[canon] = action end
+        -- a REAL signal (not EXIT/DEBUG/RETURN/ERR): block it so we can poll it at
+        -- safepoints; resetting unblocks it. sh.sigtraps counts active signal traps.
+        local num = canon and SIGNUM[canon:match("^SIG(.+)$") or ""]
+        if num and num ~= 9 and num ~= 19 then -- KILL/STOP can't be trapped
+          local had = sh.sigtraps and sh.sigtraps[canon]
+          if action == "-" and had then block_sig(num, false); sh.sigtraps[canon] = nil
+          elseif action ~= "-" and not had then
+            sh.sigtraps = sh.sigtraps or {}; sh.sigtraps[canon] = true; block_sig(num, true)
+          end
+        end
       end
       sh.status = ok and 0 or 1
     end
@@ -3880,12 +3905,33 @@ fire_err = function(sh)
   if sh.opt_e then error({ __curse_exit = sh.status }) end
 end
 
+-- Run any trapped real signals that arrived (blocked → pending) since the last
+-- check, in the current scope. Cheap no-op when no signal traps are set.
+local function run_pending_signals(sh)
+  if not sh.sigtraps or (sh.in_trap and sh.in_trap > 0) then return end
+  C.sigemptyset(sigset_poll)
+  local any = false
+  for canon in pairs(sh.sigtraps) do
+    local num = SIGNUM[canon:match("^SIG(.+)$") or ""]
+    if num then C.sigaddset(sigset_poll, num); any = true end
+  end
+  if not any then return end
+  while true do
+    local sig = C.sigtimedwait(sigset_poll, nil, zero_ts)
+    if sig < 0 then break end -- no more pending
+    local h = sh.traps and sh.traps["SIG" .. (NUMSIG[sig] or "")]
+    if h and h ~= "" then local saved = sh.status; run_trap(sh, h); sh.status = saved end
+  end
+end
+M.run_pending_signals = run_pending_signals
+
 exec_list = function(sh, stmts, hook, toplevel)
   for k = 1, #stmts do
     local st = stmts[k]
     if toplevel then hook("stmt", k) end
     exec_stmt(sh, st, hook)
     if errexit_stmt(sh, st) then fire_err(sh) end
+    if sh.sigtraps then run_pending_signals(sh) end -- deliver any pending signal traps
   end
 end
 M.exec_list = exec_list
@@ -3936,6 +3982,7 @@ function M.run_lazy(sh, src, hook)
       hook("stmt", k)
       exec_stmt(sh, st, hook)
       if errexit_stmt(sh, st) then fire_err(sh) end
+      if sh.sigtraps then run_pending_signals(sh) end -- deliver any pending signal traps
     end
   end))
 end
