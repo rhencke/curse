@@ -246,6 +246,14 @@ end
 
 local function parse_paramexp(inner)
   if inner == "" then return { lit = "" } end
+  -- ${ …}/${\t…}/${|…}: whitespace or `|` right after `{` is a bad substitution
+  -- in bash 5.2 (these are ksh93 funsub `${ cmd;}` / `${|cmd;}` syntax, which this
+  -- bash does not support). Non-fatal (status 1), matching bash.
+  do local c1 = inner:sub(1, 1)
+    if c1 == " " or c1 == "\t" or c1 == "\n" or c1 == "|" then
+      return { pexp = { op = "badsubst", raw = inner } }
+    end
+  end
   if inner == "#" then return { special = "#" } end
   -- ${-} ${?} ${$} ${!}: the special one-char parameters (like their bare $-, $?,
   -- $$, $! forms). Handled here so `!` isn't mistaken for the indirect prefix.
