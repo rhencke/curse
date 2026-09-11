@@ -540,9 +540,11 @@ local function parse_dquote(inner, add, heredoc)
     elseif c == "$" then
       i = parse_dollar(inner, i, add, true)
     elseif c == "`" then -- `cmd` command substitution inside "…"
+      -- within a backtick INSIDE double quotes, `\` also escapes `"` (unlike the
+      -- `$()` form) — bash unwraps `\"`→`"`, so `"`echo \"hi\"`"` runs `echo "hi"`.
       local j, buf = i + 1, {}
       while j <= #inner and inner:sub(j, j) ~= "`" do
-        if inner:sub(j, j) == "\\" and inner:sub(j + 1, j + 1):match("[`$\\]") then buf[#buf + 1] = inner:sub(j + 1, j + 1); j = j + 2
+        if inner:sub(j, j) == "\\" and inner:sub(j + 1, j + 1):match("[`$\\\"]") then buf[#buf + 1] = inner:sub(j + 1, j + 1); j = j + 2
         else buf[#buf + 1] = inner:sub(j, j); j = j + 1 end
       end
       add({ cmdsub = table.concat(buf), q = true }); i = j + 1
