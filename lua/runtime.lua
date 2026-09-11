@@ -92,7 +92,16 @@ function Shell:popCall()
   local d = self.pd
   local saved = self.savedstack[d]
   if saved then
-    for name, old in pairs(saved) do self.vars[name] = old or nil end -- false => was absent
+    for name, old in pairs(saved) do
+      local cur = self.vars[name]
+      self.vars[name] = old or nil -- false => was absent
+      -- An exported local (`local x; export x`) had a function-scoped env entry;
+      -- revert it on return — restore the outer var's env value, or drop it (bash).
+      if cur and cur.exported then
+        if old and old.exported then ffi.C.setenv(name, self:get(name) or "", 1)
+        else ffi.C.unsetenv(name) end
+      end
+    end
     self.savedstack[d] = false
   end
   self:popParams()
