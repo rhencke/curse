@@ -3636,7 +3636,9 @@ exec_stmt = function(sh, st, hook)
     end
     -- Array literals for a declaration builtin are assigned AFTER it runs, so a
     -- `local a=(…)` / `declare -A a=(…)` lands in the now-local/assoc variable.
-    if st.arrayargs then for _, aa in ipairs(st.arrayargs) do do_arrayassign(sh, aa) end end
+    -- Skip when the builtin failed (e.g. a rejected -A/-a type change): the array
+    -- must stay untouched, not be mangled by the literal.
+    if st.arrayargs and sh.status == 0 then for _, aa in ipairs(st.arrayargs) do do_arrayassign(sh, aa) end end
     -- $_ : the last argument (after expansion) of the command just run.
     if #args > 0 then sh:set_str("_", args[#args]) end
     -- PIPESTATUS for a simple command is a one-element array of its exit status.
