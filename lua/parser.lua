@@ -824,7 +824,7 @@ local function make_parser(src)
           if cc == "(" then d = d + 1 elseif cc == ")" then d = d - 1 end
           i = i + 1
         end
-      elseif stop_cmp and (c == "<" or c == ">") then break -- [[ ]]: <,> are operators
+      elseif c == "<" or c == ">" then break -- redirection metacharacters break a word (procsub <(/>( handled above)
       elseif c == "$" and src:sub(i + 1, i + 1) == "{" then
         local e = src:find("}", i + 2, true); i = (e or n) + 1
       elseif c == "`" then -- `…` command sub: keep it whole (spaces inside included)
