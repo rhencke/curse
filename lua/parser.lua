@@ -1028,6 +1028,7 @@ local function make_parser(src)
           i = i + 1
         end
       elseif c == "<" or c == ">" then break -- redirection metacharacters break a word (procsub <(/>( handled above)
+      elseif stop_cmp and (c == "&" or c == "|") then break -- &&/|| are self-delimiting inside [[ ]] (no surrounding space needed)
       elseif c == "$" and src:sub(i + 1, i + 1) == "{" then
         i = scan_braces(src, i + 1) -- ${…}: match the close, honoring \ ' " and nesting
       elseif c == "`" then -- `…` command sub: keep it whole (spaces inside included)
@@ -1326,10 +1327,14 @@ local function make_parser(src)
           local before = i
           local w = word(true, true) -- split on <,>,(,) operators (no spaces needed in [[ ]])
           if w == "" then
-            -- word() stalled on a bare metacharacter (`;`, `)`, `<`, `>`, …) that
-            -- is literal inside [[ ]] (e.g. part of a regex operand). Consume it as
-            -- its own token so the tokenizer makes progress instead of looping.
-            if i == before then w = src:sub(i, i); i = i + 1 else break end
+            -- word() stalled on a self-delimiting metacharacter. `&&`/`||` are
+            -- two-char operator tokens; `(`, `)`, `<`, `>`, `;`, … are one char
+            -- (each becomes its own token so the tokenizer makes progress).
+            if i == before then
+              local two = src:sub(i, i + 1)
+              if two == "&&" or two == "||" then w = two; i = i + 2
+              else w = src:sub(i, i); i = i + 1 end
+            else break end
           end
           local c1 = w:sub(1, 1)
           toks[#toks + 1] = w
