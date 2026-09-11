@@ -1768,6 +1768,7 @@ end
 -- A function OVERRIDES a builtin of the same name in bash, so this is dispatched
 -- before the builtin table (except via `command`, which passes no_func).
 local function run_function(sh, cmd, fn, args, hook, tenv_base)
+  local savedline = sh.cur_line -- the call-site line: $LINENO is restored to it on return
   sh.calldepth = sh.calldepth + 1 -- OSR gate: no handoff inside a call
   sh:pushCall(unpack(args, 2))
   -- Tempenv bindings applied as THIS call's prefix (`x=v func`) belong to this new
@@ -1798,6 +1799,7 @@ local function run_function(sh, cmd, fn, args, hook, tenv_base)
   table.remove(sh.linestack, 1); table.remove(sh.srcstack, 1)
   sh:popCall()
   sh.calldepth = sh.calldepth - 1
+  sh.cur_line = savedline -- back in the caller: $LINENO (e.g. for a top-level ERR trap) is the call site
   if not ok then
     if type(err) == "table" and err.__curse_return then sh.status = err.__curse_return
     else error(err) end
