@@ -1,0 +1,21 @@
+
+# from test/process-table-portable.sh
+PS_COLS='pid,ppid,pgid,sid,tpgid,comm'
+
+show-shell-state() {
+  local prefix=$1
+
+  echo -n "$prefix: "
+
+  echo "pid = $$"
+
+  # Hm TPGID has changed in both OSH and bash
+  # I guess that's because because ps itself becomes the leader of the process
+  # group
+
+  ps -o $PS_COLS $$
+}
+
+show-shell-state myrc
+
+

@@ -1698,11 +1698,13 @@ local function make_parser(src, sh)
       local c = src:sub(i, i)
       local r = parse_redir() -- also catches &> before the & break below
       if r then redirs[#redirs + 1] = r
-      elseif c == "(" and src:sub(i + 1, i + 1) ~= "(" and #words > 0 then
+      elseif c == "(" and src:sub(i + 1, i + 1) ~= "(" and (#words > 0 or #assigns > 0) then
         -- a bare single `(` after a command word isn't a subshell — `ls foo=(1 2)`,
-        -- `builtin typeset a=(…)`, `echo a(b)` are syntax errors in bash. (extglob
-        -- @(…), $(…), <(…) are consumed inside word(); `((` is left to break so an
-        -- empty-alias `a (( … ))` still reaches the arith-command path.)
+        -- `builtin typeset a=(…)`, `echo a(b)` are syntax errors in bash. Likewise a
+        -- `(` after an assignment prefix with a space: `a= (1 2)` is a syntax error
+        -- (the `(` can't be a command word there; `a=(1 2)` with no space is an
+        -- array assignment, parsed earlier). (extglob @(…), $(…), <(…) are consumed
+        -- inside word(); `((` is left to break so `a (( … ))` reaches arith.)
         error("syntax error near `('")
       elseif c == "\n" or c == ";" or c == "#" or c == "&" or c == "|"
         or c == "(" or c == ")" then break -- ( ) are metacharacters (subshell bounds)

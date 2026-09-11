@@ -1,0 +1,1 @@
+/tmp/lua_rV7i7V: line 3: --rcfile: command not found
