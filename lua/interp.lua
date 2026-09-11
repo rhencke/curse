@@ -954,20 +954,21 @@ local function multi_elems(sh, p) -- returns element list, star?
       end
     elseif pe.op == "-" and #els == 0 then -- unset/empty array: the default
       return defval(pe.arg), star
-    -- `:` variants test the JOINED value: ("" "") joins to " " (non-null), but
-    -- ('') joins to "" (null) — so a[@]:-w gives the default only for the latter.
-    elseif pe.op == ":-" then
-      -- a `*` join tests the IFS[0]-joined string (empty IFS -> concatenation);
-      -- `@` tests whether any element is non-empty.
-      local ne = star and (table.concat(els, sh.vars["IFS"] and sh:get("IFS"):sub(1, 1) or " ") ~= "")
-        or (not star and (#els > 1 or (els[1] ~= nil and els[1] ~= "")))
-      if not ne then return defval(pe.arg), star end
+    -- `:` null-test for @/* differs by form: a QUOTED `*` tests the IFS[0]-joined
+    -- string (empty IFS -> concatenation), so `"${a[*]:-w}"` with ("" "") joins to
+    -- "" and IS null; `@` (any quoting) and an UNQUOTED `*` test the element list
+    -- instead — null iff there are no elements, or exactly one empty element.
+    elseif pe.op == ":-" or pe.op == ":+" then
+      local ne
+      if star and p.q then
+        ne = table.concat(els, sh.vars["IFS"] and sh:get("IFS"):sub(1, 1) or " ") ~= ""
+      else
+        ne = #els > 1 or (els[1] ~= nil and els[1] ~= "")
+      end
+      if pe.op == ":-" then if not ne then return defval(pe.arg), star end
+      else return ne and defval(pe.arg) or {}, star end
     elseif pe.op == "+" then -- alternate iff the array has any element (is set)
       return (#els > 0) and defval(pe.arg) or {}, star
-    elseif pe.op == ":+" then
-      local ne = star and (table.concat(els, sh.vars["IFS"] and sh:get("IFS"):sub(1, 1) or " ") ~= "")
-        or (not star and (#els > 1 or (els[1] ~= nil and els[1] ~= "")))
-      return ne and defval(pe.arg) or {}, star
     elseif pe.op == "@" and pe.arg == "a" then -- ${a[@]@a}: the variable's attribute string, per element
       local attr = sh:attr_string(pe.name); local out = {}
       for i = 1, #els do out[i] = attr end
