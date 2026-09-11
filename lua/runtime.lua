@@ -1168,6 +1168,14 @@ function Shell:apply_str_op(op, val, arg, arg2)
 end
 
 -- Interpret backslash escapes for `echo -e` and ANSI-C `$'…'` quoting.
+-- Encode a Unicode code point as UTF-8 bytes (for \u/\U in $'…', echo -e, printf).
+function M.utf8_char(cp)
+  if cp < 0x80 then return string.char(cp)
+  elseif cp < 0x800 then return string.char(0xC0 + math.floor(cp / 64), 0x80 + cp % 64)
+  elseif cp < 0x10000 then return string.char(0xE0 + math.floor(cp / 4096), 0x80 + math.floor(cp / 64) % 64, 0x80 + cp % 64)
+  else return string.char(0xF0 + math.floor(cp / 262144), 0x80 + math.floor(cp / 4096) % 64, 0x80 + math.floor(cp / 64) % 64, 0x80 + cp % 64) end
+end
+
 -- `ansi_c` (true for $'…') enables \cX control chars and \u/\U code points; the
 -- default (echo -e) treats \c as "stop output".
 -- mode: true = $'…' (\cX ctrl, \NNN octal); "b" = printf %b (\NNN and \0NNN octal,

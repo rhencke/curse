@@ -1418,6 +1418,9 @@ local function sh_printf(fmt, argv, start)
         elseif d == "v" then out[#out + 1] = "\11"; i = i + 2
         elseif d == "x" then local h = fmt:match("^%x%x?", i + 2)
           if h then out[#out + 1] = string.char(tonumber(h, 16)); i = i + 2 + #h else out[#out + 1] = "\\"; i = i + 1 end
+        elseif d == "u" or d == "U" then -- \uHHHH / \UHHHHHHHH code point -> UTF-8
+          local h = fmt:match(d == "u" and "^%x%x?%x?%x?" or "^%x%x?%x?%x?%x?%x?%x?%x?", i + 2)
+          if h then out[#out + 1] = rt.utf8_char(tonumber(h, 16)); i = i + 2 + #h else out[#out + 1] = "\\"; i = i + 1 end
         elseif d:match("[0-7]") then local o = fmt:match("^[0-7][0-7]?[0-7]?", i + 1)
           out[#out + 1] = string.char(tonumber(o, 8) % 256); i = i + 1 + #o
         else out[#out + 1] = "\\"; i = i + 1 end
