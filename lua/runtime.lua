@@ -1331,7 +1331,11 @@ function Shell:expand_param(pe, arg, arg2, idxnum)
   -- subscripted (${a[0]=x} must populate a[0]), else the scalar variable.
   local function assign_default(v)
     if index and index ~= "@" and index ~= "*" then self:array_set(name, idxnum or 0, v)
-    else self:set_str(name, v) end
+    else
+      -- a bare name that IS an array writes element 0 (bash), not a scalar shadow
+      local b = self.vars[self:deref(name)]
+      if b and b.arr then self:array_set(name, 0, v) else self:set_str(name, v) end
+    end
   end
   if op == "len" then return tostring(#val) end
   if op == ":-" then return val ~= "" and val or A() end
