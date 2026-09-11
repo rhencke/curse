@@ -3590,11 +3590,13 @@ local COMPOUND_REDIR = { whilec = true, forc = true, forin = true, ["if"] = true
 -- every simple/pipeline/arith/[[/assignment); it preserves $? around the handler.
 -- `case` also fires DEBUG before the compound itself (at the `case` line); `if`,
 -- `while`, `{ }` groups etc. do NOT — only their inner condition/body commands do.
-local DEBUG_FIRE = { simple = true, pipeline = true, arithcmd = true, dbracket = true,
+-- A `pipeline` is NOT here: bash fires DEBUG once per STAGE (in the parent, before
+-- forking each), handled inline in the pipeline exec below.
+local DEBUG_FIRE = { simple = true, arithcmd = true, dbracket = true,
   assign = true, assignlist = true, case = true }
 local function run_debug(sh, line)
   local h = sh.traps and sh.traps.DEBUG
-  if not h or h == "" or sh.in_debug then return end
+  if not h or h == "" or sh.in_debug or (sh.in_pipestage or 0) > 0 then return end
   -- DEBUG fires only at the current level (bash): not for commands inside a
   -- function call, or a subshell/command substitution — unless functrace extends it.
   if not sh.opt_functrace and ((sh.calldepth or 0) > 0 or (sh.in_subprogram or 0) > 0) then return end
@@ -4136,6 +4138,11 @@ exec_stmt = function(sh, st, hook)
       local lastpipe = sh.shopt.lastpipe and not sh.opt_i and nst >= 2
       local pids, prev_read, inline_status = {}, -1, nil
       for k = 1, nst do
+        -- DEBUG fires before each stage IN THE PARENT (bash: a forked stage's child
+        -- does NOT fire it); the lastpipe in-process stage fires via its own exec_stmt.
+        if not (k == nst and lastpipe) and not (sh.in_trap and sh.in_trap > 0) then
+          run_debug(sh, cmds[k].line or st.line)
+        end
         local rd, wr = -1, -1
         if k < nst then local p = ffi.new("int[2]"); C.pipe(p); rd, wr = p[0], p[1] end
         if k == nst and lastpipe then
@@ -4154,6 +4161,7 @@ exec_stmt = function(sh, st, hook)
           local pid = C.fork()
           if pid == 0 then
             reset_child_sigtraps(sh) -- caught signal traps revert to default in a pipeline stage
+            sh.in_pipestage = (sh.in_pipestage or 0) + 1 -- a forked stage re-runs neither DEBUG nor ERR
             local ok, err = pcall(function()
               if prev_read >= 0 then C.dup2(prev_read, 0); C.close(prev_read) end
               C.dup2(cp[1], 1); C.close(cp[1]); C.close(cp[0])
@@ -4177,6 +4185,7 @@ exec_stmt = function(sh, st, hook)
           local pid = C.fork()
           if pid == 0 then
             reset_child_sigtraps(sh) -- caught signal traps revert to default in a pipeline stage
+            sh.in_pipestage = (sh.in_pipestage or 0) + 1 -- a forked stage re-runs neither DEBUG nor ERR
             local ok, err = pcall(function()
               if prev_read >= 0 then C.dup2(prev_read, 0); C.close(prev_read) end
               if wr >= 0 then C.dup2(wr, 1); C.close(wr) end
@@ -4297,7 +4306,9 @@ end
 -- exec_list, run_lazy and the &&/|| handler (which previously drifted apart).
 fire_err = function(sh)
   local h = sh.traps and sh.traps.ERR
-  local errscope = sh.opt_errtrace or ((sh.calldepth or 0) == 0 and (sh.in_subprogram or 0) == 0)
+  -- ERR is not re-run inside a forked pipeline stage (bash fires it ONCE for the
+  -- whole pipeline, in the parent); errtrace still extends it to functions/subshells.
+  local errscope = sh.opt_errtrace or ((sh.calldepth or 0) == 0 and (sh.in_subprogram or 0) == 0 and (sh.in_pipestage or 0) == 0)
   if h and h ~= "" and not sh.in_err_trap and errscope then
     sh.in_err_trap = true; local saved = sh.status
     run_trap(sh, h); sh.status = saved; sh.in_err_trap = false
