@@ -1256,14 +1256,21 @@ local function make_parser(src)
       return { t = "assign", name = name, index = subidx, append = (op == "+="), rhs = parse_word(raw) }
     end
 
-    -- leading assignments: prefix env for a following command, else statements
+    -- leading assignments AND redirects (bash allows them interleaved before the
+    -- command: `FOO=1 >f BAR=2 cmd`), forming the prefix for a following command,
+    -- else a bare assignment/redirection statement.
     local ln = line
     local assigns = {}
+    local redirs = {}
     while true do
-      local a = try_assign()
-      if not a then break end
-      a.line = ln; assigns[#assigns + 1] = a
       ws()
+      local r = parse_redir()
+      if r then redirs[#redirs + 1] = r
+      else
+        local a = try_assign()
+        if not a then break end
+        a.line = ln; assigns[#assigns + 1] = a
+      end
     end
 
     -- a keyword that only closes/continues a compound command, reaching command
@@ -1279,7 +1286,6 @@ local function make_parser(src)
     end
     -- simple command: WORD WORD ...
     local words = {}
-    local redirs = {}
     local arrayargs = nil -- `NAME=(...)` args to a declaration builtin
     while i <= n do
       local c = src:sub(i, i)
