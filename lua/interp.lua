@@ -2059,8 +2059,9 @@ local function exec_simple(sh, args, hook, no_func)
           local a = args[k]; local n = tonumber(a)
           if n then
             if n > 128 then n = n - 128 end
-            local nm = NUMSIG[n]
+            local nm = n == 0 and "EXIT" or NUMSIG[n] -- signal 0 is the pseudo-signal EXIT
             if nm then sh:echo(nm) else allok = false; io.stderr:write("curse: kill: " .. a .. ": invalid signal specification\n") end
+          elseif a:upper():gsub("^SIG", "") == "EXIT" then sh:echo("0") -- name EXIT maps back to 0
           else
             local num = SIGNUM[a:gsub("^SIG", "")]
             if num then sh:echo(tostring(num)) else allok = false; io.stderr:write("curse: kill: " .. a .. ": invalid signal specification\n") end
@@ -2078,7 +2079,12 @@ local function exec_simple(sh, args, hook, no_func)
       end
       local allok = true
       for k = j, #args do
-        local pid = tonumber(args[k])
+        local target = args[k]
+        local pid = tonumber(target)
+        if not pid and target:sub(1, 1) == "%" then -- %-jobspec: resolve to its pid
+          local jb = job_resolve(sh, target)
+          if jb then pid = jb.pid else io.stderr:write("curse: kill: " .. target .. ": no such job\n") end
+        end
         if not (pid and C.kill(pid, sig) == 0) then allok = false end
       end
       sh.status = allok and 0 or 1
