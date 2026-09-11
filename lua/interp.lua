@@ -1866,6 +1866,7 @@ local function exec_simple(sh, args, hook, no_func)
     if args[2] and not tonumber(args[2]) then io.stderr:write("curse: return: " .. args[2] .. ": numeric argument required\n"); error({ __curse_return = 2 }) end
     error({ __curse_return = args[2] and (tonumber(args[2]) % 256) or sh.status })
   elseif cmd == "exit" then
+    if #args > 2 then io.stderr:write("curse: exit: too many arguments\n"); sh.status = 1; return end -- bash: non-fatal
     if args[2] and not tonumber(args[2]) then io.stderr:write("curse: exit: " .. args[2] .. ": numeric argument required\n"); error({ __curse_exit = 2 }) end
     error({ __curse_exit = args[2] and (tonumber(args[2]) % 256) or sh.status })
   elseif cmd == "cd" then
@@ -2483,7 +2484,7 @@ local function exec_simple(sh, args, hook, no_func)
     if #flags == 0 then flags = { "f" } end -- default resource is -f
     local allmode = flags[#flags] == "@all"
     if allmode then flags[#flags] = nil end
-    if value ~= nil and allmode then sh.status = 1; return end -- `ulimit -a N` is an error
+    if allmode then value = nil end -- `ulimit -a` ignores a trailing value (bash prints all, status 0)
     if value ~= nil then -- SET each named resource
       -- with neither -S nor -H, bash sets BOTH; -S sets soft, -H sets hard.
       local setsoft, sethard = softflag or not hardflag, hardflag or not softflag
