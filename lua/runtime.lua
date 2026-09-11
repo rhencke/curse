@@ -321,6 +321,18 @@ function Shell:capture_src(src)
   local P = require("parser")
   local I = require("interp")
   local ast = P.parse(src)
+  -- $(< file) / `< file`: bash reads the file's contents (a faster $(cat file)).
+  if #ast.stmts == 1 then
+    local st = ast.stmts[1]
+    if st.t == "simple" and (not st.words or #st.words == 0)
+        and st.redirs and #st.redirs == 1 and st.redirs[1].op == "in" then
+      local path = I.expand_assign_word(self, P.parse_word(st.redirs[1].target or ""))
+      local f = path ~= "" and io.open(path, "r")
+      if f then local c = f:read("*a") or ""; f:close(); self.status = 0
+        return (c:gsub("%z", ""):gsub("\n+$", "")) end
+      io.stderr:write("curse: " .. path .. ": No such file or directory\n"); self.status = 1; return ""
+    end
+  end
   local buf = {}
   local saved = self.out
   self.out = function(x) buf[#buf + 1] = x end
