@@ -1085,15 +1085,15 @@ local function apply_redirs(sh, redirs)
     if r.op == "out" then
       -- noclobber (set -C): `>` fails on an existing regular file (open_out)
       local t = ftgt(r); if not t then ok = false else
-      backup(r.fd); local f = open_out(sh, t, 420)
+      backup(r.fd); local f = open_out(sh, t, 438)
       if f >= 0 then place_fd(f, r.fd) else ok = false end end
     elseif r.op == "clobber" then -- `>|` truncates regardless of noclobber
       local t = ftgt(r); if not t then ok = false else
-      backup(r.fd); local f = C.open(t, 577, 420)
+      backup(r.fd); local f = C.open(t, 577, 438)
       if f >= 0 then place_fd(f, r.fd) else ok = false end end
     elseif r.op == "app" then
       local t = ftgt(r); if not t then ok = false else
-      backup(r.fd); local f = C.open(t, 1089, 420)
+      backup(r.fd); local f = C.open(t, 1089, 438)
       if f >= 0 then place_fd(f, r.fd) else ok = false end end
     elseif r.op == "in" then
       local t = ftgt(r); if not t then ok = false else
@@ -1101,15 +1101,15 @@ local function apply_redirs(sh, redirs)
       if f >= 0 then place_fd(f, r.fd) else ok = false end end
     elseif r.op == "rw" then -- `N<>file`: open read+write (O_RDWR|O_CREAT, no truncate)
       local t = ftgt(r); if not t then ok = false else
-      backup(r.fd); local f = C.open(t, 66, 420)
+      backup(r.fd); local f = C.open(t, 66, 438)
       if f >= 0 then place_fd(f, r.fd) else ok = false end end
     elseif r.op == "outboth" then -- `&>` truncation honors noclobber too
       local t = ftgt(r); if not t then ok = false else
-      backup(1); backup(2); local f = open_out(sh, t, 420)
+      backup(1); backup(2); local f = open_out(sh, t, 438)
       if f >= 0 then C.dup2(f, 1); C.dup2(f, 2); C.close(f) else ok = false end end
     elseif r.op == "appboth" then -- `&>>`: append stdout+stderr (append ignores noclobber)
       local t = ftgt(r); if not t then ok = false else
-      backup(1); backup(2); local f = C.open(t, 1089, 420)
+      backup(1); backup(2); local f = C.open(t, 1089, 438)
       if f >= 0 then C.dup2(f, 1); C.dup2(f, 2); C.close(f) else ok = false end end
     elseif r.op == "heredoc" then
       local body = r.expand and expand_word(sh, P.parse_heredoc(r.body or "", true)) or (r.body or "")
@@ -1126,7 +1126,7 @@ local function apply_redirs(sh, redirs)
         if m then if C.dup2(m, r.fd) < 0 then -- source fd not open -> redirect fails
             io.stderr:write("curse: " .. tv .. ": Bad file descriptor\n"); ok = false end
         elseif r.op == "dup" and tv ~= "" then -- `>&word` (non-number): open the file for
-          backup(2); local f = C.open(tv, sh.opt_C and 705 or 577, 420) -- both stdout AND stderr
+          backup(2); local f = C.open(tv, sh.opt_C and 705 or 577, 438) -- both stdout AND stderr
           if f >= 0 then C.dup2(f, r.fd); C.dup2(f, 2); C.close(f) else ok = false end
         end
       end
@@ -1303,9 +1303,15 @@ end
 -- current mask; returns the new mask, or nil on a syntax error.
 local function parse_umask(s, cur)
   if s == "" then return nil end
-  if s:match("^[0-7]+$") then return tonumber(s, 8) % 512 end
+  if s:match("^[0-7]+$") then
+    local v = tonumber(s, 8)
+    if v > 511 then return nil end -- > 0777: out of range (bash errors; it doesn't truncate)
+    return v
+  end
   local allowed = bit.band(bit.bnot(cur), 511) -- symbolic works on allowed perms
-  for clause in s:gmatch("[^,]+") do
+  -- iterate clauses INCLUDING empty ones (`u-r,,u-r`) so an empty clause is a
+  -- syntax error, not silently skipped (gmatch "[^,]+" would drop it).
+  for clause in (s .. ","):gmatch("([^,]*),") do
     local who, op, perms = clause:match("^([ugoa]*)([=+-])([rwx]*)$")
     if not who then return nil end
     local pv = 0
@@ -2518,19 +2524,19 @@ local function exec_simple(sh, args, hook, no_func)
     sh:echo(phys and sh:phys_cwd() or sh:pwd()); sh.status = 0
   elseif cmd == "umask" then
     -- umask [-S] [MODE]: print (octal or -S symbolic) or set the file-creation mask.
-    local sflag, badflag, pos = false, false, {}
+    local sflag, pflag, badflag, pos = false, false, false, {}
     for j = 2, #args do
       local a = args[j]
       if a == "-S" then sflag = true
-      elseif a == "-p" then -- print in reusable form: accept, treat like plain
+      elseif a == "-p" then pflag = true -- print in a form that can be eval'd
       elseif a:sub(1, 1) == "-" and #a > 1 then badflag = true
       else pos[#pos + 1] = a end
     end
     local cur = tonumber(C.umask(0)) % 512; C.umask(cur)
     if badflag then io.stderr:write("curse: umask: invalid option\n"); sh.status = 1
-    elseif #pos > 1 then io.stderr:write("curse: umask: too many arguments\n"); sh.status = 1
-    elseif #pos == 0 then
-      sh:echo(sflag and umask_symbolic(cur) or string.format("%04o", cur)); sh.status = 0
+    elseif #pos == 0 then -- bash ignores extra args; it uses only the first MODE
+      local body = sflag and umask_symbolic(cur) or string.format("%04o", cur)
+      sh:echo(pflag and ("umask " .. (sflag and "-S " or "") .. body) or body); sh.status = 0
     else
       local m = parse_umask(pos[1], cur)
       if m == nil then io.stderr:write("curse: umask: `" .. pos[1] .. "': invalid symbolic mode\n"); sh.status = 1
