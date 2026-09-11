@@ -69,9 +69,10 @@ function Shell.new()
     npstack = {},    -- saved `nparams` per depth
     argpool = {},    -- reusable args array per depth
     savedstack = {}, -- `local`-shadow record per depth (false until a local shadows)
-    tenv = {},       -- tempenv shadow stack: {name, box, env, consumed} per `x=v cmd`
-                     -- binding, LIFO; `unset` peels the top one (reveals the box
-                     -- beneath), matching bash's dynamic-scope tempenv unwinding.
+    tenv = {},       -- tempenv shadow stack: {name, box, env, consumed, seq} per
+                     -- `x=v cmd` binding; `unset` peels the highest-seq shadow layer
+                     -- (tenv entry OR a `local` shadow), matching bash dynamic scope.
+    vseq = 0,        -- monotonic counter ordering local/tempenv shadow layers
     calldepth = 0,   -- interpreter-only OSR gate (managed at the interp call site)
   }, Shell)
   sh:import_env()
@@ -114,7 +115,8 @@ function Shell:popCall()
   local d = self.pd
   local saved = self.savedstack[d]
   if saved then
-    for name, old in pairs(saved) do
+    for name, rec in pairs(saved) do
+      local old = rec.box -- rec = { box = <prior box>|false, seq = N }
       local cur = self.vars[name]
       self.vars[name] = old or nil -- false => was absent
       -- An exported local (`local x; export x`) had a function-scoped env entry;
@@ -151,10 +153,11 @@ function Shell:localVar(name, has_init)
       local e = self.tenv[k]
       if not e.consumed and e.name == name then te = e; break end
     end
+    self.vseq = self.vseq + 1
     if te and te.frame == self.pd then
-      saved[name] = te.box; te.consumed = true
+      saved[name] = { box = te.box, seq = self.vseq }; te.consumed = true
     else
-      saved[name] = self.vars[name] or false
+      saved[name] = { box = self.vars[name] or false, seq = self.vseq }
     end
     if te and not has_init then -- inherit the tempenv value
       local b = self.vars[name]
