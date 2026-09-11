@@ -136,9 +136,22 @@ local function read_split(ifs, line, nvars)
   local out = {}
   for v = 1, nvars do
     if v == nvars then
-      local last = n
-      while last >= i and isws(last) do last = last - 1 end -- trailing IFS ws
-      out[v] = slice(i, last)
+      -- bash (read.def): extract one field from the remainder (consuming it plus its
+      -- single trailing delimiter). If NOTHING remains after that, the value is just
+      -- that field (its trailing delimiter stripped — so `IFS=x; read a b <<< axbx`
+      -- gives b="b", and `xx` gives b=""). Otherwise the value is the raw remainder
+      -- with only trailing IFS WHITESPACE stripped (interior/trailing non-ws kept).
+      local s, j = i, i
+      while j <= n and not isifs(j) do j = j + 1 end -- field = s..j-1
+      local fieldend = j - 1
+      while j <= n and isws(j) do j = j + 1 end -- delimiter: IFS whitespace
+      if j <= n and isifs(j) then j = j + 1; while j <= n and isws(j) do j = j + 1 end end -- + one non-ws
+      if j > n then out[v] = slice(s, fieldend) -- single field, delimiter stripped
+      else
+        local last = n
+        while last >= s and isws(last) do last = last - 1 end -- trailing IFS ws only
+        out[v] = slice(s, last)
+      end
     else
       local s = i
       while i <= n and not isifs(i) do i = i + 1 end
