@@ -470,11 +470,15 @@ local function same_file(a, b)
 end
 -- Resolve a bare command NAME to an absolute path via $PATH — the first
 -- executable, non-directory match (like execvp) — and cache it (bash's command
--- hash: a later PATH change is ignored until `hash -r`). nil if not found.
+-- hash). The cache survives filesystem changes under a STABLE $PATH (only
+-- `hash -r` clears it then), but CHANGING $PATH invalidates it — bash rehashes.
 function Shell:resolve_cmd(name)
+  local curpath = self:get("PATH")
+  if self.hashpath and self.hashpath ~= curpath then self.hashcache = {} end -- PATH changed: rehash
+  self.hashpath = curpath
   local c = self.hashcache and self.hashcache[name]
   if c then c.hits = c.hits + 1; return c.path end
-  for dir in (self:get("PATH") .. ":"):gmatch("([^:]*):") do
+  for dir in (curpath .. ":"):gmatch("([^:]*):") do
     local cand = (dir == "" and "." or dir) .. "/" .. name
     if ffi.C.access(cand, 1) == 0 and ffi.C.curse_rt_stat(cand, stbuf_a) == 0 -- 1 == X_OK
         and bit.band(ffi.cast("uint32_t *", stbuf_a + 24)[0], 0xF000) ~= 0x4000 then -- not a dir
