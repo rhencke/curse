@@ -1157,14 +1157,37 @@ local function make_parser(src)
       end
       return { t = "if", line = ln, clauses = clauses, redirs = tail_redirs() }
     end
-    -- (( expr )) arithmetic command: exit status 0 if expr != 0, else 1.
+    -- (( expr )) arithmetic command: exit status 0 if expr != 0, else 1. But `((`
+    -- is arith ONLY when it's a balanced `(( expr ))`; `((cmd) …)` is nested
+    -- subshells (#2337). Disambiguate by scanning (quote-aware): if the paren
+    -- balance first returns to 0 at a `)` that is NOT followed by another `)`, the
+    -- `(` closed a subshell, not the arith — fall through to the subshell parser.
     if src:sub(i, i + 1) == "((" then
-      local body, ni = grab_dparen(src, i + 2); i = ni
-      -- a malformed `(( expr ))` (bad lvalue) is a NON-fatal runtime error in bash,
-      -- so defer the parse failure to eval (caught by the arithcmd handler) rather
-      -- than aborting the whole parse.
-      local ok, e = pcall(arith, body)
-      return { t = "arithcmd", line = line, expr = ok and e or { k = "matherr" }, redirs = tail_redirs() }
+      local j, d, isarith = i + 2, 0, false
+      while j <= n do
+        local c = src:sub(j, j)
+        if c == "\\" then j = j + 2
+        elseif c == "'" or c == '"' then
+          local q = c; j = j + 1
+          while j <= n and src:sub(j, j) ~= q do
+            if src:sub(j, j) == "\\" and q == '"' then j = j + 2 else j = j + 1 end
+          end
+          j = j + 1
+        elseif c == "(" then d = d + 1; j = j + 1
+        elseif c == ")" then
+          if d == 0 then isarith = (src:sub(j + 1, j + 1) == ")"); break end
+          d = d - 1; j = j + 1
+        else j = j + 1 end
+      end
+      if isarith then
+        local body, ni = grab_dparen(src, i + 2); i = ni
+        -- a malformed `(( expr ))` (bad lvalue) is a NON-fatal runtime error in bash,
+        -- so defer the parse failure to eval (caught by the arithcmd handler) rather
+        -- than aborting the whole parse.
+        local ok, e = pcall(arith, body)
+        return { t = "arithcmd", line = line, expr = ok and e or { k = "matherr" }, redirs = tail_redirs() }
+      end
+      -- not arith: fall through to the subshell parser below (i still at the first `(`)
     end
     -- [[ EXPR ]] conditional (no word-splitting; == is glob, =~ is regex)
     if src:sub(i, i + 1) == "[[" and src:sub(i + 2, i + 2):match("[ \t]") then
