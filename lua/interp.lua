@@ -2409,8 +2409,11 @@ local function exec_simple(sh, args, hook, no_func)
         names = {}; for k in pairs(sh.functions) do names[#names + 1] = k end; table.sort(names)
       end
       for _, nm in ipairs(names) do
+        -- `declare -f NAME` prints the verbatim definition (captured at parse time);
         -- `declare -F NAME` prints just NAME; bare `declare -F` prints `declare -f NAME`.
-        if sh.functions[nm] then if funcnames then sh:echo(named and nm or ("declare -f " .. nm)) end
+        if sh.functions[nm] then
+          if funcbody then local d = sh.func_src and sh.func_src[nm]; if d then sh:echo(d) end
+          elseif funcnames then sh:echo(named and nm or ("declare -f " .. nm)) end
         else allok = false end
       end
       sh.status = allok and 0 or 1
@@ -2605,6 +2608,7 @@ local function exec_simple(sh, args, hook, no_func)
         elseif k == "alias" then sh:echo(nm .. " is aliased to `" .. sh.aliases[nm] .. "'")
         elseif k == "file" then sh:echo(nm .. " is " .. p)
         elseif k == "function" then sh:echo(nm .. " is a function")
+          local d = sh.func_src and sh.func_src[nm]; if d then sh:echo(d) end -- verbatim body (bash prints it)
         elseif k == "keyword" then sh:echo(nm .. " is a shell keyword")
         else sh:echo(nm .. " is a shell builtin") end
       end
@@ -2623,6 +2627,7 @@ local function exec_simple(sh, args, hook, no_func)
           if k == "alias" then sh:echo(args[j] .. " is aliased to `" .. sh.aliases[args[j]] .. "'")
           elseif k == "file" then sh:echo(args[j] .. " is " .. p)
           elseif k == "function" then sh:echo(args[j] .. " is a function")
+            local d = sh.func_src and sh.func_src[args[j]]; if d then sh:echo(d) end -- verbatim body
           elseif k == "keyword" then sh:echo(args[j] .. " is a shell keyword")
           else sh:echo(args[j] .. " is a shell builtin") end
         else sh:echo(k == "file" and p or args[j]) end
@@ -3445,6 +3450,7 @@ exec_stmt = function(sh, st, hook)
   elseif t == "funcdef" then
     sh.functions[st.name] = st.body
     sh.func_redirs = sh.func_redirs or {}; sh.func_redirs[st.name] = st.redirs -- `f(){ … } >&2`
+    sh.func_src = sh.func_src or {}; sh.func_src[st.name] = st.deftext -- verbatim def for declare -f
     sh.status = 0
   elseif t == "assignlist" then
     for _, a in ipairs(st.list) do exec_stmt(sh, a, hook) end
