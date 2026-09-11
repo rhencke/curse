@@ -2298,7 +2298,7 @@ local function exec_simple(sh, args, hook, no_func)
             sh:set_str(nm, ap and (sh:get(nm) .. val) or val)
           end
           local bb = sh.vars[sh:deref(nm)]
-          if roattr and bb then bb.ro = true end
+          if roattr and bb and not nref then bb.ro = true end -- bash ignores -r when -n is given
           -- export attribute: -n / +x clear it (keep the value), else export sets it
           if bb then
             if unexport or plusx then bb.exported = nil; C.unsetenv(nm)
@@ -2314,7 +2314,7 @@ local function exec_simple(sh, args, hook, no_func)
           elseif assoc then sh:declare_assoc(a)
           else sh.vars[a] = sh.vars[a] or {} end -- `declare x` creates a declared-but-unset var
           local bb = sh.vars[sh:deref(a)]
-          if roattr and bb then bb.ro = true end
+          if roattr and bb and not nref then bb.ro = true end -- bash ignores -r when -n is given
           if bb then
             if unexport or plusx then bb.exported = nil; C.unsetenv(a)
             elseif doexport then
@@ -3151,7 +3151,14 @@ local function exec_stmt(sh, st, hook)
     local nref_base, nref_sub
     if not st.index and not st.arith then
       local nb = sh.vars[st.name]
-      if nb and nb.ref and nb.s then nref_base, nref_sub = nb.s:match("^([%a_][%w_]*)%[(.+)%]$") end
+      if nb and nb.ref and nb.s then
+        -- a nameref cycle (ref1->ref2->ref1) derefs to "" — bash detects it on write
+        if nb.s ~= "" and sh:deref(st.name) == "" then
+          io.stderr:write("curse: warning: " .. st.name .. ": circular name reference\n")
+          sh.status = 1; return
+        end
+        nref_base, nref_sub = nb.s:match("^([%a_][%w_]*)%[(.+)%]$")
+      end
     end
     if rb and rb.ro then -- readonly: reject the assignment (status 1); fatal in `sh -c`
       io.stderr:write("curse: " .. st.name .. ": readonly variable\n") -- or posix mode; a plain script keeps going.
