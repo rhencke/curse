@@ -1147,15 +1147,23 @@ local function apply_redirs(sh, redirs)
       local body = expand_word(sh, P.parse_word(r.word or "")) .. "\n"
       backup(r.fd or 0); feed_stdin(r.fd or 0, body)
     elseif r.op == "dup" or r.op == "dupin" then
-      backup(r.fd)
       local tv = tgt(r)
-      if tv == "-" then C.close(r.fd)
+      if tv == "-" then backup(r.fd); C.close(r.fd) -- `N>&-` closes fd N
       else
-        local m = tonumber(tv)
-        if m then if C.dup2(m, r.fd) < 0 then -- source fd not open -> redirect fails
-            io.stderr:write("curse: " .. tv .. ": Bad file descriptor\n"); ok = false end
+        local movesrc = tv:match("^(%d+)%-$")       -- `N>&M-`: dup then close the source (move)
+        local m = tonumber(movesrc or tv)
+        if m then
+          -- Validate the source fd is open BEFORE backing up the destination: a
+          -- dup-based backup would otherwise reuse a just-closed source fd number,
+          -- making a stale `>&N` spuriously succeed (fd N reopened as the backup).
+          if C.fcntl(m, 1) == -1 then -- F_GETFD on a closed fd returns -1 (EBADF)
+            io.stderr:write("curse: " .. tv .. ": Bad file descriptor\n"); ok = false
+          else
+            backup(r.fd); C.dup2(m, r.fd)
+            if movesrc then C.close(m) end
+          end
         elseif r.op == "dup" and tv ~= "" then -- `>&word` (non-number): open the file for
-          backup(2); local f = C.open(tv, sh.opt_C and 705 or 577, 438) -- both stdout AND stderr
+          backup(r.fd); backup(2); local f = C.open(tv, sh.opt_C and 705 or 577, 438) -- both stdout AND stderr
           if f >= 0 then C.dup2(f, r.fd); C.dup2(f, 2); C.close(f) else ok = false end
         end
       end
