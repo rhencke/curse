@@ -32,7 +32,9 @@ local function read_line(prompt)
     local s = ffi.string(c); ffi.C.free(c)
     return s
   end
-  if interactive then io.write(prompt); io.flush() end
+  -- The prompt goes to STDERR (bash), so a script's captured stdout isn't polluted
+  -- by PS1/PS2 when commands are piped into an interactive shell.
+  if interactive then io.stderr:write(prompt) end
   return io.read("*l")
 end
 
@@ -91,7 +93,7 @@ function M.run(sh)
     local prompt = buf == "" and prompt_of(sh, "PS1", "curse\\$ ") or prompt_of(sh, "PS2", "> ")
     local line = read_line(prompt)
     if line == nil then -- EOF
-      if interactive then io.write("\n") end
+      if interactive then io.stderr:write("\n") end -- final newline to stderr, like the prompt
       break
     end
     buf = (buf == "") and line or (buf .. "\n" .. line)
