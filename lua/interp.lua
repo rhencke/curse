@@ -2888,6 +2888,45 @@ local function child_status(sh, ok, err)
   if not ok and type(err) == "table" then sh.status = err.__curse_exit or err.__curse_return or sh.status end
 end
 
+-- Snapshot the <()/>() counts before a command expands its words/redirs, so its
+-- cleanup drains ONLY the procsubs it registered — not ones an enclosing group's
+-- redirect (`{ …; } > >(tac)`) left pending, which drain after the whole group.
+local function procsub_mark(sh)
+  return (sh.procsub_pending and #sh.procsub_pending or 0), (sh.procsub_files and #sh.procsub_files or 0)
+end
+-- Process-substitution cleanup, run after the command a <()/>() was attached to:
+-- feed each new >(cmd) its temp file, then remove the temp files it created. Only
+-- entries added since the (np,nf) mark are handled; gated to the outer level.
+local function drain_procsub(sh, np, nf)
+  np, nf = np or 0, nf or 0
+  if (sh.in_subprogram or 0) ~= 0 then return end
+  local pend = sh.procsub_pending
+  if pend then
+    for i = np + 1, #pend do
+      local ps = pend[i]; io.flush()
+      -- Run the >(cmd) body in a forked child through curse's OWN interpreter
+      -- (never `sh -c`, which would recurse once curse is /bin/sh), stdin from temp.
+      local pid = C.fork()
+      if pid == 0 then
+        local fd = C.open(ps.file, 0, 0) -- O_RDONLY
+        if fd >= 0 then C.dup2(fd, 0); C.close(fd) end
+        sh.in_subprogram = (sh.in_subprogram or 0) + 1; sh.out = io.write
+        local ok, err = pcall(function() exec_list(sh, P.parse(ps.cmd).stmts, function() end, false) end)
+        child_status(sh, ok, err)
+        io.flush(); C._exit(sh.status or 0)
+      end
+      local stbuf = ffi.new("int[1]"); C.waitpid(pid, stbuf, 0)
+    end
+    for i = #pend, np + 1, -1 do pend[i] = nil end
+    if #pend == 0 then sh.procsub_pending = nil end
+  end
+  local files = sh.procsub_files
+  if files then
+    for i = #files, nf + 1, -1 do os.remove(files[i]); files[i] = nil end
+    if #files == 0 then sh.procsub_files = nil end
+  end
+end
+
 -- Expand a simple command's words into `args` (in place). Module-level (not a
 -- per-command closure) so it can be pcall'd directly without allocating. When the
 -- command is a static declaration builtin, `name=value` words are assignment words
@@ -2942,6 +2981,7 @@ local function exec_stmt(sh, st, hook)
   -- with redirs temporarily detached (so this guard doesn't re-fire).
   if st.redirs and COMPOUND_REDIR[t] then
     local rd = st.redirs
+    local pnp, pnf = procsub_mark(sh) -- a >() redirect target drains after the whole command
     local save, ok = apply_redirs(sh, rd)
     if not ok then sh.status = 1; restore_redirs(save)
       if sh.opt_e then error({ __curse_exit = 1 }) end -- errexit: a redirect failure exits
@@ -2951,6 +2991,7 @@ local function exec_stmt(sh, st, hook)
     local pok, err = pcall(exec_stmt, sh, st, hook)
     st.redirs = rd
     io.flush(); sh.out = savedout; restore_redirs(save)
+    drain_procsub(sh, pnp, pnf) -- a >() redirect target on a compound command runs after it
     if not pok then error(err) end
     return
   end
@@ -3028,6 +3069,7 @@ local function exec_stmt(sh, st, hook)
     for _, a in ipairs(st.list) do exec_stmt(sh, a, hook) end
     sh.status = 0
   elseif t == "simple" then
+    local pnp, pnf = procsub_mark(sh) -- drain only <()/>() this command registers
     -- alias expansion (bash: only with `shopt -s expand_aliases`): if the command
     -- word is a defined alias not already expanded (loop guard), splice its parsed
     -- words in and re-dispatch — recursively expanding the new first word too.
@@ -3188,32 +3230,7 @@ local function exec_stmt(sh, st, hook)
     if #args > 0 then sh:set_str("_", args[#args]) end
     -- PIPESTATUS for a simple command is a one-element array of its exit status.
     sh:array_assign("PIPESTATUS", { tostring(sh.status) }, false)
-    -- process substitution cleanup: feed >(cmd) temp files to their commands, then
-    -- remove all temp files created for this command's <()/>(). Gated to the outer
-    -- level so a nested <()'s own command (run via capture) can't wipe sibling files.
-    if (sh.in_subprogram or 0) == 0 and sh.procsub_pending then
-      for _, ps in ipairs(sh.procsub_pending) do
-        io.flush()
-        -- Run the >(cmd) body in a forked child through curse's OWN interpreter
-        -- (never `sh -c`, which would recurse once curse is /bin/sh), with stdin
-        -- redirected from the temp file the outer command wrote.
-        local pid = C.fork()
-        if pid == 0 then
-          local fd = C.open(ps.file, 0, 0) -- O_RDONLY
-          if fd >= 0 then C.dup2(fd, 0); C.close(fd) end
-          sh.in_subprogram = (sh.in_subprogram or 0) + 1; sh.out = io.write
-          local ok, err = pcall(function() exec_list(sh, P.parse(ps.cmd).stmts, function() end, false) end)
-          child_status(sh, ok, err)
-          io.flush(); C._exit(sh.status or 0)
-        end
-        local stbuf = ffi.new("int[1]"); C.waitpid(pid, stbuf, 0)
-      end
-      sh.procsub_pending = nil
-    end
-    if (sh.in_subprogram or 0) == 0 and sh.procsub_files then
-      for _, f in ipairs(sh.procsub_files) do os.remove(f) end
-      sh.procsub_files = nil
-    end
+    drain_procsub(sh, pnp, pnf) -- feed >() temps, clean up <()/>() temp files
   elseif t == "forc" then
     if st.init then eval(sh, st.init) end
     local bodystatus = 0 -- a loop's status is its last body command's (0 if none)
@@ -3257,10 +3274,12 @@ local function exec_stmt(sh, st, hook)
   elseif t == "group" then
     -- { list; } runs in the current shell; redirs apply to the whole group
     if st.redirs then
+      local pnp, pnf = procsub_mark(sh) -- >() target drains after the whole group
       local save, savedout = apply_redirs(sh, st.redirs), sh.out
       sh.out = io.write
       local ok, err = pcall(exec_list, sh, st.body, hook, false)
       io.flush(); sh.out = savedout; restore_redirs(save)
+      drain_procsub(sh, pnp, pnf) -- a >() redirect target (`{ …; } > >(tac)`) runs after the group
       if not ok then error(err) end
     else
       exec_list(sh, st.body, hook, false)
