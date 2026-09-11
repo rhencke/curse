@@ -1199,17 +1199,25 @@ local KEYWORDS = {
 }
 -- Find `name` in PATH (existence, F_OK — bash's type/command-v report a
 -- non-executable file too; execution then fails 126 via posix_spawn).
-local function find_in_path(name)
-  if name == "" then return nil end
-  local function usable(p) return C.access(p, 1) == 0 and not file_test("-d", p) end -- executable, not a dir
-  if name:find("/", 1, true) then return usable(name) and name or nil end
+-- Every PATH match for `name`, in search order, as `type`/`command -v` report
+-- them. Executables are preferred: when any exist they ARE the result; only when
+-- none is executable do we fall back to non-executable regular files (bash still
+-- reports those — unlike actual command execution, which requires +x).
+local function find_all_in_path(name)
+  if name == "" then return {} end
+  local function isfile(p) return C.access(p, 0) == 0 and not file_test("-d", p) end
+  local function isexec(p) return C.access(p, 1) == 0 and not file_test("-d", p) end
+  if name:find("/", 1, true) then return isexec(name) and { name } or {} end -- a path operand still needs +x
   local path = os.getenv("PATH") or "/usr/bin:/bin"
+  local exe, nonexe = {}, {}
   for dir in path:gmatch("[^:]+") do
     local p = dir .. "/" .. name
-    if usable(p) then return p end
+    if isexec(p) then exe[#exe + 1] = p
+    elseif isfile(p) then nonexe[#nonexe + 1] = p end
   end
-  return nil
+  return #exe > 0 and exe or nonexe
 end
+local function find_in_path(name) return find_all_in_path(name)[1] end
 local function name_type(sh, name, nofunc)
   if sh.aliases[name] then return "alias" end
   if KEYWORDS[name] then return "keyword" end
@@ -2378,25 +2386,38 @@ local function exec_simple(sh, args, hook, no_func)
     sh.status = 0
   elseif cmd == "type" then
     -- type [-t|-p|-P] NAME…  (-t type word; -p path-if-file; -P force PATH search)
-    local tflag, pflag, Pflag, fflag, j0 = false, false, false, false, 2
+    local tflag, pflag, Pflag, fflag, aflag, j0 = false, false, false, false, false, 2
     while args[j0] and args[j0]:sub(1, 1) == "-" and #args[j0] > 1 do
       local f = args[j0]
       if f:find("t") then tflag = true end
       if f:find("p") then pflag = true end
       if f:find("P") then Pflag = true end
       if f:find("f") then fflag = true end -- -f: suppress shell-function lookup
+      if f:find("a") then aflag = true end -- -a: list ALL locations (each PATH file too)
       j0 = j0 + 1
     end
     local allok = true
     for j = j0, #args do
       local nm = args[j]
-      if Pflag then
-        local p = find_in_path(nm); if p then sh:echo(p) else allok = false end
-      elseif pflag then
-        local k, p = name_type(sh, nm, fflag)
-        if k == "file" then sh:echo(p) elseif not k then allok = false end -- builtins/etc: nothing
+      if Pflag then -- force PATH search (all files with -a, else the first)
+        local ps = find_all_in_path(nm)
+        if #ps == 0 then allok = false
+        elseif aflag then for _, p in ipairs(ps) do sh:echo(p) end
+        else sh:echo(ps[1]) end
+      elseif pflag then -- print path(s); status tracks whether the name resolves at all
+        if aflag then for _, p in ipairs(find_all_in_path(nm)) do sh:echo(p) end
+        else local k, p = name_type(sh, nm, fflag); if k == "file" then sh:echo(p) end end
+        if not name_type(sh, nm, fflag) then allok = false end
       elseif tflag then
         local k = name_type(sh, nm, fflag); if k then sh:echo(k) else allok = false end
+      elseif aflag then -- every location, in resolution order
+        local found = false
+        if sh.aliases[nm] then sh:echo(nm .. " is aliased to `" .. sh.aliases[nm] .. "'"); found = true end
+        if KEYWORDS[nm] then sh:echo(nm .. " is a shell keyword"); found = true end
+        if not fflag and sh.functions[nm] then sh:echo(nm .. " is a function"); found = true end
+        if BUILTINS[nm] then sh:echo(nm .. " is a shell builtin"); found = true end
+        for _, p in ipairs(find_all_in_path(nm)) do sh:echo(nm .. " is " .. p); found = true end
+        if not found then allok = false; io.stderr:write("curse: type: " .. nm .. ": not found\n") end
       else -- sentence form
         local k, p = name_type(sh, nm, fflag)
         if not k then allok = false; io.stderr:write("curse: type: " .. nm .. ": not found\n")
