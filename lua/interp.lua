@@ -3208,8 +3208,10 @@ local function exec_simple(sh, args, hook, no_func)
     local optind = math.max(1, math.floor(tonumber(sh:get("OPTIND")) or 1))
     local cur = sh.getopts_cur or 1
     -- A leftover OPTIND pointing past a now-shorter argument list (e.g. after a
-    -- fresh `set --`) means a new scan: bash resets OPTIND to 1.
-    if optind > src_n + 1 then optind = 1; cur = 1 end
+    -- fresh `set --`) is exhausted: bash returns EOF and clamps OPTIND to
+    -- nargs+1 (getopt.c: `sh_optind >= argc` -> `sh_optind = argc`, argc =
+    -- nparams+1). It does NOT rescan from 1 — only an explicit OPTIND= does.
+    if optind > src_n + 1 then optind = src_n + 1; cur = 1 end
     local res
     while not res do
       local word = optind <= src_n and src_get(optind) or nil
