@@ -10,6 +10,9 @@ local M = {}
 -- AST: {k="num",v}, {k="var",name}, {k="bin",op,l,r}, {k="un",op,e},
 --      {k="asgn",name,op,e}, {k="post",name,d}, {k="pre",name,d}
 local function arith(src, nodefer)
+  -- An empty (or all-whitespace) arithmetic expression is 0 in bash: `$(( ))` -> 0,
+  -- `(( ))` -> value 0 -> status 1.
+  if src:match("^%s*$") then return { k = "num", v = "0" } end
   -- Arith bodies may embed expansions the arith grammar can't parse: ${x:-5},
   -- $(cmd), $((..)), `cmd`. Defer the whole thing — at eval the raw string is
   -- word-expanded and then re-parsed as pure arithmetic (nodefer). Plain $name and
@@ -1231,6 +1234,13 @@ local function make_parser(src)
         -- raw parenthesized text: a NAME=(…) used as a command PREFIX is a literal
         -- string in bash (arrays can't be env bindings), decided at exec time.
         return { t = "arrayassign", name = name, elems = elems, append = (op == "+="), raw = src:sub(pstart, i - 1), index = subidx }
+      end
+      -- The value is read from right after `=` with NO leading-whitespace skip: an
+      -- empty value (`X= cmd`) must stay empty, not absorb the next word as `word()`
+      -- (which skips blanks) would. Only read when a value actually follows.
+      local c0 = src:sub(i, i)
+      if c0 == "" or c0:match("[ \t\n;&|)#]") then
+        return { t = "assign", name = name, index = subidx, append = (op == "+="), rhs = parse_word("") }
       end
       local raw = word(true) -- stop at unquoted ) so `(x=2)` closes the subshell
       if not subidx and op == "=" and raw:sub(1, 3) == "$((" and raw:sub(-2) == "))" then
