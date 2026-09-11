@@ -1006,7 +1006,15 @@ local function make_parser(src)
       local s, e = src:find("^[%a_][%w_]*", i)
       if not s then error("subset: for needs a name or ((") end
       local name = src:sub(s, e); i = e + 1
-      ws()
+      -- bash allows blank lines / comments between the loop var and `in` (but a
+      -- `;` terminates the header — `for i;` iterates "$@").
+      while true do
+        ws()
+        local c = src:sub(i, i)
+        if c == "\n" then line = line + 1; i = i + 1
+        elseif c == "#" then while i <= n and src:sub(i, i) ~= "\n" do i = i + 1 end
+        else break end
+      end
       local words = {}
       if peekword() == "in" then
         i = i + 2
