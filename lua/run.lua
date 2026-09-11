@@ -116,6 +116,9 @@ local script = arg[ai] or error("usage: run.lua <script.sh> [tiered|compiled|int
 local MODES = { tiered = true, compiled = true, interp = true, cached = true }
 local mode, pstart = "tiered", ai + 1
 if arg[ai + 1] and MODES[arg[ai + 1]] then mode = arg[ai + 1]; pstart = ai + 2 end
+-- A missing/unreadable script is exit 127 (bash), not a Lua assert crash.
+do local sf = io.open(script, "r"); if sf then sf:close() else
+  io.stderr:write("curse: " .. script .. ": No such file or directory\n"); io.flush(); os.exit(127) end end
 local function setparams(s) for k = pstart, #arg do s.nparams = s.nparams + 1; s.params[s.nparams] = arg[k] end end
 if mode == "cached" then
   -- persistent artifact cache: warm hit skips parse+emit; cold compiles+stores;
