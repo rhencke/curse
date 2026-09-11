@@ -472,7 +472,7 @@ end
 -- read side of `+=`/`++`/`--`, but NOT to a pure `=` assignment (which defines).
 local function arith_nounset(sh, name)
   if sh.opt_u and sh.vars[sh:deref(name)] == nil and sh:special_get(name) == "" then
-    io.stderr:write("curse: " .. name .. ": unbound variable\n"); error({ __curse_exit = 1 })
+    io.stderr:write("curse: " .. name .. ": unbound variable\n"); error({ __curse_exit = sh.opt_c and 127 or 1 })
   end
 end
 
@@ -614,12 +614,12 @@ local function expand_part_str(sh, p)
     local b = sh.vars[sh:deref(p.var)]
     local unset = b == nil or (b.s == nil and b.n == nil and b.arr == nil)
     if sh.opt_u and unset and sh:special_get(p.var) == "" then
-      io.stderr:write("curse: " .. p.var .. ": unbound variable\n"); error({ __curse_exit = 1 })
+      io.stderr:write("curse: " .. p.var .. ": unbound variable\n"); error({ __curse_exit = sh.opt_c and 127 or 1 })
     end
     return sh:get(p.var)
   elseif p.param then
     if sh.opt_u and p.param > sh.nparams then
-      io.stderr:write("curse: " .. p.param .. ": unbound variable\n"); error({ __curse_exit = 1 })
+      io.stderr:write("curse: " .. p.param .. ": unbound variable\n"); error({ __curse_exit = sh.opt_c and 127 or 1 })
     end
     return sh:param(p.param)
   elseif p.special then

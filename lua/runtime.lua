@@ -643,7 +643,7 @@ function Shell:get_u(name)
   local unset = b == nil or (b.s == nil and b.n == nil and b.arr == nil)
   if self.opt_u and unset and self:special_get(name) == ""
       and name ~= "@" and name ~= "*" then
-    io.stderr:write("curse: " .. name .. ": unbound variable\n"); error({ __curse_exit = 1 })
+    io.stderr:write("curse: " .. name .. ": unbound variable\n"); error({ __curse_exit = self.opt_c and 127 or 1 })
   end
   return self:get(name)
 end
@@ -1325,7 +1325,7 @@ function Shell:expand_param(pe, arg, arg2, idxnum)
     and op ~= ":-" and op ~= "-" and op ~= ":+" and op ~= "+"
     and op ~= ":=" and op ~= "=" and op ~= ":?" and op ~= "?"
     and self:special_get(name) == "" then
-    io.stderr:write("curse: " .. name .. ": unbound variable\n"); error({ __curse_exit = 1 })
+    io.stderr:write("curse: " .. name .. ": unbound variable\n"); error({ __curse_exit = self.opt_c and 127 or 1 })
   end
   -- := / = write back to the SAME target that was read: an array element when
   -- subscripted (${a[0]=x} must populate a[0]), else the scalar variable.
@@ -1344,8 +1344,8 @@ function Shell:expand_param(pe, arg, arg2, idxnum)
   if op == "+" then return isset and A() or "" end
   if op == ":=" then if val == "" then local v = A(); assign_default(v); return v end return val end
   if op == "=" then if not isset then local v = A(); assign_default(v); return v end return val end
-  if op == ":?" then if val == "" then io.stderr:write("curse: " .. name .. ": " .. A() .. "\n"); error({ __curse_exit = 1 }) end return val end
-  if op == "?" then if not isset then io.stderr:write("curse: " .. name .. ": " .. A() .. "\n"); error({ __curse_exit = 1 }) end return val end
+  if op == ":?" then if val == "" then io.stderr:write("curse: " .. name .. ": " .. A() .. "\n"); error({ __curse_exit = self.opt_c and 127 or 1 }) end return val end
+  if op == "?" then if not isset then io.stderr:write("curse: " .. name .. ": " .. A() .. "\n"); error({ __curse_exit = self.opt_c and 127 or 1 }) end return val end
   arg = arg or ""
   if op == "@" then -- ${x@OP} transforms
     -- @a reports the VARIABLE's attributes (e.g. `A` for a declared assoc array),
