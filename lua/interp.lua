@@ -4240,6 +4240,15 @@ exec_stmt = function(sh, st, hook)
       end
       sh:array_assign("PIPESTATUS", pstat, false) -- ${PIPESTATUS[@]}
       sh.status = sh.opt_pipefail and pipe or last
+      -- bash quirk (execute_cmd.c:720): the LAST stage of a pipeline, when it is a
+      -- subshell `(…)` that failed, runs the ERR trap for that subshell — on top of
+      -- the pipeline's own ERR fire — so `(false)|(false)` triggers ERR twice. It
+      -- keys on the subshell's OWN failure (not the pipeline's `!`, which applies to
+      -- the pipeline), so `! (false)|(false)` still fires it once. A group/simple
+      -- last stage does not (only the pipeline fires).
+      if cmds[nst] and cmds[nst].t == "subshell" and last ~= 0 and sh.noerr == 0 then
+        fire_err_trap(sh)
+      end
     end
     if st.negate then sh.status = (sh.status == 0) and 1 or 0 end
   elseif t == "forin" then
