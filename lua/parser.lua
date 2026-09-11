@@ -556,6 +556,11 @@ end
 local function parse_dbracket(toks, quoted)
   local pos, serr = 1, false
   local function peek() return toks[pos] end
+  -- `<` `>` `&&` `||` can't stand where an operand is expected (`[[ -f < ]]` is a
+  -- parse error). Note `=`/`==`/`!=`/`=~` ARE accepted there as literal strings.
+  local function is_op(tok)
+    return tok == "<" or tok == ">" or tok == "&&" or tok == "||"
+  end
   local parse_or
   local function primary()
     local t = peek()
@@ -565,7 +570,7 @@ local function parse_dbracket(toks, quoted)
     if t == "!" then pos = pos + 1; return { kind = "not", e = primary() } end
     if t == "(" then pos = pos + 1; local e = parse_or(); if peek() == ")" then pos = pos + 1 else serr = true end; return e end
     if t and t:match("^%-[a-zA-Z]$") then -- unary file/string test
-      if toks[pos + 1] == nil then serr = true end -- a unary op needs an operand
+      if toks[pos + 1] == nil or is_op(toks[pos + 1]) then serr = true end -- needs a (non-operator) operand
       pos = pos + 2; return { kind = "unary", op = t, word = parse_word(toks[pos - 1] or "") }
     end
     pos = pos + 1 -- consume lhs
