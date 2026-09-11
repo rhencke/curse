@@ -246,11 +246,13 @@ end
 
 local function parse_paramexp(inner)
   if inner == "" then return { lit = "" } end
-  -- ${ …}/${\t…}/${|…}: whitespace or `|` right after `{` is a bad substitution
-  -- in bash 5.2 (these are ksh93 funsub `${ cmd;}` / `${|cmd;}` syntax, which this
-  -- bash does not support). Non-fatal (status 1), matching bash.
+  -- ${ …}/${\t…}/${|…}/${(…}: whitespace, `|`, or `(` right after `{` is a bad
+  -- substitution in bash 5.2 (ksh93 funsub `${ cmd;}`/`${|cmd;}` and zsh flag
+  -- `${(m)x}`/`${(@k)a}` syntax, none of which this bash supports). Non-fatal
+  -- (status 1), matching bash. (A `(` in a default VALUE like ${x:-(a)} is fine —
+  -- only a `(` as the very first inner char is rejected.)
   do local c1 = inner:sub(1, 1)
-    if c1 == " " or c1 == "\t" or c1 == "\n" or c1 == "|" then
+    if c1 == " " or c1 == "\t" or c1 == "\n" or c1 == "|" or c1 == "(" then
       return { pexp = { op = "badsubst", raw = inner } }
     end
   end
