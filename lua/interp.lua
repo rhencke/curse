@@ -1519,7 +1519,7 @@ local function do_arrayassign(sh, st)
   if not st.append then -- plain assignment resets the array (keep assoc-ness)
     local b = sh.vars[st.name]
     if not b then sh:array_assign(st.name, {}, false); b = sh.vars[st.name] end
-    b.arr = {}; b.s = nil; b.n = nil
+    b.arr = {}; b.s = nil; b.n = nil; b.empty_decl = nil -- assigned now (even `a=()` -> shows =())
     if isassoc then b.order = {} end
   end
   if isassoc then
@@ -1583,13 +1583,15 @@ local function fmt_decl(sh, name)
     for _, k in ipairs(sh:array_indices(name)) do
       parts[#parts + 1] = "[" .. tostring(k) .. "]=" .. decl_quote(sh:array_get(name, k))
     end
-    if #parts == 0 then return "declare -A " .. name .. "=()" end
+    if #parts == 0 then return b.empty_decl and ("declare -A " .. name) or ("declare -A " .. name .. "=()") end
     return "declare -A " .. name .. "=(" .. table.concat(parts, " ") .. " )"
   elseif b.arr then
     local parts = {}
     for _, k in ipairs(sh:array_indices(name)) do
       parts[#parts + 1] = "[" .. tostring(k) .. "]=" .. decl_quote(sh:array_get(name, k))
     end
+    -- declared with `declare -a` but never assigned (not even `a=()`) -> no =value
+    if #parts == 0 and b.empty_decl then return "declare -a " .. name end
     return "declare -a " .. name .. "=(" .. table.concat(parts, " ") .. ")"
   else
     -- attribute letters in bash's order: -rxilu (readonly/export/integer/lower/upper)
@@ -2774,20 +2776,27 @@ local function exec_simple(sh, args, hook, no_func)
           elseif iattr then sh.vars[a] = sh.vars[a] or {}; sh.vars[a].int = true
           elseif lattr or uattr then
             sh.vars[a] = sh.vars[a] or {}; sh.vars[a].lower = lattr or nil; sh.vars[a].upper = uattr or nil
-          elseif assoc then -- bash forbids converting an existing indexed array to associative
+          elseif assoc and cmd ~= "readonly" then -- bash forbids converting an existing indexed array to associative
+            -- (`readonly -A` with NO value does NOT apply the attribute — bash then
+            -- shows just `declare -r`, so let it fall through to the plain-var branch)
             local b = sh.vars[sh:deref(a)]
             if b and b.arr and not b.assoc then
               io.stderr:write("curse: " .. cmd .. ": " .. a .. ": cannot convert indexed to associative array\n"); allok = false
-            else sh:declare_assoc(a) end
-          elseif aattr then -- `declare -a`: mark an (empty) indexed array; convert a scalar to [0]
+            else
+              local fresh = b == nil or (b.arr == nil and b.s == nil and b.n == nil)
+              sh:declare_assoc(a)
+              if fresh then sh.vars[sh:deref(a)].empty_decl = true end -- declared, never assigned
+            end
+          elseif aattr and cmd ~= "readonly" then -- `declare -a`: mark an (empty) indexed array; convert a scalar to [0]
             local b = sh.vars[a] or {}
             if b.assoc then -- …and the reverse conversion is forbidden too
               io.stderr:write("curse: " .. cmd .. ": " .. a .. ": cannot convert associative to indexed array\n"); allok = false
             else
               sh.vars[a] = b
-              if b.s ~= nil and not b.arr then b.arr = { [0] = b.s }; b.s = nil; b.n = nil else b.arr = b.arr or {} end
+              if b.s ~= nil and not b.arr then b.arr = { [0] = b.s }; b.s = nil; b.n = nil
+              elseif not b.arr then b.arr = {}; b.empty_decl = true end -- declared, never assigned
             end
-          else sh.vars[a] = sh.vars[a] or {} end -- `declare x` creates a declared-but-unset var
+          else sh.vars[a] = sh.vars[a] or {} end -- `declare x` (or `readonly -a/-A` with no value) creates a declared-but-unset var
           local bb = sh.vars[sh:deref(a)]
           if roattr and bb and not nref then bb.ro = true end -- bash ignores -r when -n is given
           if bb then
