@@ -1056,8 +1056,11 @@ local function make_parser(src)
           -- bracket/paren depth 0 (so `(a  b)` / `[a b]` keep their inner spaces).
           local rs, depth = i, 0
           while i <= n do
+            -- a `)` at depth 0 ends the operand: it closes an enclosing `[[ ( … )`
+            -- group (or, unbalanced, is a syntax error) — bash never takes it as a
+            -- literal regex char. A balanced `(…)` or escaped `\)` stays in-operand.
             if depth == 0 and (src:sub(i, i + 1) == "]]" or src:sub(i, i) == "\n"
-                or src:sub(i, i) == " " or src:sub(i, i) == "\t") then break end
+                or src:sub(i, i) == " " or src:sub(i, i) == "\t" or src:sub(i, i) == ")") then break end
             local ch = src:sub(i, i)
             if ch == "\\" then i = i + 2
             elseif ch == "'" then i = i + 1; while i <= n and src:sub(i, i) ~= "'" do i = i + 1 end; i = i + 1
@@ -1070,7 +1073,7 @@ local function make_parser(src)
           toks[#toks + 1] = src:sub(rs, i - 1); quoted[#toks] = false
         else
           local before = i
-          local w = word(false, true) -- split on <,> operators (no spaces needed in [[ ]])
+          local w = word(true, true) -- split on <,>,(,) operators (no spaces needed in [[ ]])
           if w == "" then
             -- word() stalled on a bare metacharacter (`;`, `)`, `<`, `>`, …) that
             -- is literal inside [[ ]] (e.g. part of a regex operand). Consume it as

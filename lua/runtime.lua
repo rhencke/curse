@@ -1074,9 +1074,29 @@ function M.ext_match(str, pat, icase)
   end
   return false
 end
+-- Count capturing groups `(…)` in a POSIX ERE (= regex_t.re_nsub) so BASH_REMATCH
+-- reports one slot per group even when the matched alternative skipped some. A `(`
+-- doesn't count when backslash-escaped or inside a `[…]` bracket expression.
+local function count_groups(ere)
+  local n, i, len = 0, 1, #ere
+  while i <= len do
+    local c = ere:sub(i, i)
+    if c == "\\" then i = i + 2
+    elseif c == "[" then -- skip a bracket expression: ] is literal right after [ or [^
+      i = i + 1
+      if ere:sub(i, i) == "^" then i = i + 1 end
+      if ere:sub(i, i) == "]" then i = i + 1 end
+      while i <= len and ere:sub(i, i) ~= "]" do i = i + 1 end
+      i = i + 1
+    elseif c == "(" then n = n + 1; i = i + 1
+    else i = i + 1 end
+  end
+  return n
+end
+
 -- Match with capture groups: returns {whole, grp1, grp2, …} for BASH_REMATCH, or
 -- nil on no match / bad regex. (glibc regoff_t is int; regmatch_t is 8 bytes.)
-local NMATCH = 20
+local NMATCH = 100
 local pmatch = ffi.new("struct { int rm_so; int rm_eo; }[?]", NMATCH)
 function M.regex_captures(s, ere, icase)
   -- second return = "invalid regex" (regcomp failed): [[ =~ ]] must report status
@@ -1085,10 +1105,13 @@ function M.regex_captures(s, ere, icase)
   local rc = ffi.C.regexec(regbuf, s, NMATCH, pmatch, 0)
   ffi.C.regfree(regbuf)
   if rc ~= 0 then return nil end
-  local last = 0
-  for i = 0, NMATCH - 1 do if pmatch[i].rm_so >= 0 then last = i end end
+  -- bash's BASH_REMATCH holds group 0 (whole) plus every capturing group, with
+  -- non-participating groups as "" — so report up to re_nsub, not just the last
+  -- group that happened to match.
+  local hi = count_groups(ere)
+  if hi > NMATCH - 1 then hi = NMATCH - 1 end
   local caps = {}
-  for i = 0, last do
+  for i = 0, hi do
     local so = pmatch[i].rm_so
     caps[#caps + 1] = (so >= 0) and s:sub(so + 1, pmatch[i].rm_eo) or ""
   end
