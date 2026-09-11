@@ -223,6 +223,27 @@ local function split_subst(s)
   end
   return s, ""
 end
+-- Scan a ${…} starting at the `{` (index `bi`) in `s`, returning the index just
+-- past the matching `}`. Respects backslash escapes, '…'/"…" quoting (so a `}`
+-- inside quotes doesn't close), and nested `{…}` — unlike a naive find("}").
+local function scan_braces(s, bi)
+  local i, ns, depth = bi + 1, #s, 1
+  while i <= ns and depth > 0 do
+    local c = s:sub(i, i)
+    if c == "\\" then i = i + 2
+    elseif c == "'" then
+      i = i + 1; while i <= ns and s:sub(i, i) ~= "'" do i = i + 1 end; i = i + 1
+    elseif c == '"' then
+      i = i + 1
+      while i <= ns and s:sub(i, i) ~= '"' do i = i + (s:sub(i, i) == "\\" and 2 or 1) end
+      i = i + 1
+    elseif c == "{" then depth = depth + 1; i = i + 1
+    elseif c == "}" then depth = depth - 1; i = i + 1
+    else i = i + 1 end
+  end
+  return i
+end
+
 local function parse_paramexp(inner)
   if inner == "" then return { lit = "" } end
   if inner == "#" then return { special = "#" } end
@@ -356,15 +377,10 @@ local function parse_dollar(w, i, add, q)
     end
     add({ lit = require("runtime").ansi_unescape(table.concat(buf), true), q = true }); return j + 1
   elseif nx == "{" then
-    -- find the MATCHING } (nested ${…} inside a default/operator value)
-    local depth, j = 1, i + 2
-    while j <= #w do
-      local ch = w:sub(j, j)
-      if ch == "{" then depth = depth + 1
-      elseif ch == "}" then depth = depth - 1; if depth == 0 then break end end
-      j = j + 1
-    end
-    local part = parse_paramexp(w:sub(i + 2, j - 1)); part.q = q; add(part); return j + 1
+    -- find the MATCHING } — honoring \-escapes, '…'/"…" quoting, and nested ${…}
+    -- so `${var#\}}`, `${var-'}'}`, `${a:-${b}}` take the right inner text.
+    local endp = scan_braces(w, i + 1) -- index just past the closing }
+    local part = parse_paramexp(w:sub(i + 2, endp - 2)); part.q = q; add(part); return endp
   elseif nx:match("%d") then
     add({ param = tonumber(nx), q = q }); return i + 2
   elseif nx == "#" or nx == "@" or nx == "*" or nx == "?" or nx == "$" or nx == "!" or nx == "-" then
@@ -428,13 +444,8 @@ local function parse_word(w)
             if cc == "(" then dep = dep + 1 elseif cc == ")" then dep = dep - 1 end
             j = j + 1
           end
-        elseif d == "$" and w:sub(j + 1, j + 1) == "{" then -- ${...}: inner " isn't the close
-          j = j + 2; local dep = 1
-          while j <= #w and dep > 0 do
-            local cc = w:sub(j, j)
-            if cc == "{" then dep = dep + 1 elseif cc == "}" then dep = dep - 1 end
-            j = j + 1
-          end
+        elseif d == "$" and w:sub(j + 1, j + 1) == "{" then -- ${...}: inner \ ' " and {} nesting
+          j = scan_braces(w, j + 1)
         elseif d == "`" then
           j = j + 1
           while j <= #w and w:sub(j, j) ~= "`" do if w:sub(j, j) == "\\" then j = j + 2 else j = j + 1 end end
@@ -807,15 +818,7 @@ local function make_parser(src)
               i = i + 1
             end
           elseif d == "$" and src:sub(i + 1, i + 1) == "{" then
-            -- ${…} brace-matched: its inner " / nested ${} are NOT the outer close
-            i = i + 2; local dep = 1
-            while i <= n and dep > 0 do
-              local cc = src:sub(i, i)
-              if cc == "\\" then i = i + 1
-              elseif cc == "{" then dep = dep + 1
-              elseif cc == "}" then dep = dep - 1 end
-              i = i + 1
-            end
+            i = scan_braces(src, i + 1) -- ${…}: inner \ ' " and nested {} don't close it
           elseif d == "`" then
             i = i + 1
             while i <= n and src:sub(i, i) ~= "`" do if src:sub(i, i) == "\\" then i = i + 2 else i = i + 1 end end
@@ -868,7 +871,7 @@ local function make_parser(src)
         end
       elseif c == "<" or c == ">" then break -- redirection metacharacters break a word (procsub <(/>( handled above)
       elseif c == "$" and src:sub(i + 1, i + 1) == "{" then
-        local e = src:find("}", i + 2, true); i = (e or n) + 1
+        i = scan_braces(src, i + 1) -- ${…}: match the close, honoring \ ' " and nesting
       elseif c == "`" then -- `…` command sub: keep it whole (spaces inside included)
         i = i + 1
         while i <= n and src:sub(i, i) ~= "`" do
