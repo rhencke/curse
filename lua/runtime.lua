@@ -130,13 +130,33 @@ function Shell:popCall()
 end
 -- `local name`: shadow the variable within the current call frame (restored on
 -- return). Records the prior box once so it can be put back.
-function Shell:localVar(name)
+function Shell:localVar(name, has_init)
   local d = self.pd
   local saved = self.savedstack[d]
   if not saved then saved = {}; self.savedstack[d] = saved end
   -- Only shadow on the FIRST `local name` in this scope; a repeat (`local foo;
   -- local foo`) keeps the value already established here (bash).
-  if saved[name] == nil then saved[name] = self.vars[name] or false; self.vars[name] = {} end
+  if saved[name] == nil then
+    -- If a tempenv binding for `name` is active (`x=v func` … `local x`), the local
+    -- ABSORBS it (bash): the local takes over that slot, so the box we shadow is
+    -- what the TEMPENV shadowed (e.g. the global) — not the tempenv value — and the
+    -- tempenv no longer restores/reveals on its own. A no-initializer `local` also
+    -- INHERITS the tempenv's current value (but never the global/exported one).
+    local te
+    for k = #self.tenv, 1, -1 do
+      local e = self.tenv[k]
+      if not e.consumed and e.name == name then te = e; break end
+    end
+    if te then
+      saved[name] = te.box; te.consumed = true
+      if has_init then self.vars[name] = {} else
+        local b = self.vars[name]
+        self.vars[name] = b and { s = b.s, n = b.n, arr = b.arr, assoc = b.assoc, order = b.order } or {}
+      end
+    else
+      saved[name] = self.vars[name] or false; self.vars[name] = {}
+    end
+  end
 end
 
 -- one `local` operand: `name`, `name=value`, or `name+=value` (value expanded).
@@ -145,7 +165,7 @@ end
 function Shell:localAssign(arg)
   local nm, op, val = arg:match("^([%a_][%w_]*)(%+?=)(.*)$")
   if nm then
-    self:localVar(nm)
+    self:localVar(nm, true)
     self:set_str(nm, op == "+=" and (self:get(nm) .. val) or val)
   else self:localVar(arg) end
 end
