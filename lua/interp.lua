@@ -249,7 +249,9 @@ local statbuf = ffi.new("uint8_t[144]") -- glibc x86-64 struct stat is 144 bytes
 -- Signal name/number normalization for `trap`.
 local SIGNUM = { HUP = 1, INT = 2, QUIT = 3, ILL = 4, TRAP = 5, ABRT = 6, BUS = 7,
   FPE = 8, KILL = 9, USR1 = 10, SEGV = 11, USR2 = 12, PIPE = 13, ALRM = 14, TERM = 15,
-  CHLD = 17, CONT = 18, STOP = 19, TSTP = 20, TTIN = 21, TTOU = 22, SYS = 31 }
+  STKFLT = 16, CHLD = 17, CONT = 18, STOP = 19, TSTP = 20, TTIN = 21, TTOU = 22,
+  URG = 23, XCPU = 24, XFSZ = 25, VTALRM = 26, PROF = 27, WINCH = 28, IO = 29,
+  PWR = 30, SYS = 31 }
 local NUMSIG = {}; for k, v in pairs(SIGNUM) do NUMSIG[v] = k end
 -- Real-signal traps: LuaJIT forbids calling Lua from an async C signal handler,
 -- so instead of installing one we BLOCK the trapped signal (sigprocmask) and POLL
@@ -277,6 +279,27 @@ end
 local function sig_order(canon) -- for printing: EXIT=0, then by signal number
   if canon == "EXIT" then return 0 end
   local nm = canon:gsub("^SIG", ""); return SIGNUM[nm] or 99
+end
+-- A forked subshell (background `&`, `( )`, a pipeline stage, `>(…)`) resets
+-- CAUGHT signal traps to their default DISPOSITION, like bash — the handler no
+-- longer fires when the signal arrives (e.g. `kill -URG $!` after `trap … URG`).
+-- bash's reset is deferred, though: `trap`/`trap -p` in the subshell still
+-- DISPLAYS the inherited handler strings, so keep sh.traps[canon] and only drop
+-- the entry from sh.sigtraps (which drives firing) and unblock the signal. A
+-- signal set to be ignored (`trap '' SIG`) keeps both its ignore disposition and
+-- its display.
+local function reset_child_sigtraps(sh)
+  if not sh.sigtraps then return end
+  local kept
+  for canon in pairs(sh.sigtraps) do
+    if sh.traps[canon] == "" then -- ignored: keep ignore disposition and display
+      kept = kept or {}; kept[canon] = true
+    else -- caught: revert to default disposition, but keep the string for `trap -p`
+      local num = SIGNUM[canon:match("^SIG(.+)$") or ""]
+      if num then block_sig(num, false) end -- unblock so the default action applies
+    end
+  end
+  sh.sigtraps = kept
 end
 
 local function file_test(op, path)
@@ -2440,9 +2463,19 @@ local function exec_simple(sh, args, hook, no_func)
       elseif fmode then sh.functions[a] = nil
       else
         local nm, sub = a:match("^([%a_][%w_]*)%[(.+)%]$")
-        if nm then if not sh:array_unset(nm, array_key(sh, nm, sub)) then
-            io.stderr:write("curse: unset: " .. a .. ": bad array subscript\n"); sh.status = 1 end
-        else
+        if nm then
+          local eb = sh.vars[sh:deref(nm)]
+          if eb and eb.arr then -- real indexed/assoc array: unset one element
+            if not sh:array_unset(nm, array_key(sh, nm, sub)) then
+              io.stderr:write("curse: unset: " .. a .. ": bad array subscript\n"); sh.status = 1 end
+          elseif eb and array_key(sh, nm, sub) == 0 then
+            a = nm; nm = nil -- `name[0]` on a scalar unsets the whole variable
+          elseif eb then -- non-array with a non-zero subscript (bash: "not an array")
+            io.stderr:write("curse: unset: " .. a .. ": not an array\n"); sh.status = 1
+          end
+          -- eb == nil: `name[sub]` with no such variable is a no-op (status 0)
+        end
+        if nm == nil then
           local dn = sh:deref(a)
           local b = sh.vars[dn]
           if b and b.ro then -- readonly: cannot unset (bash: status 1, keep it)
@@ -3459,6 +3492,7 @@ local function drain_procsub(sh, np, nf)
       -- (never `sh -c`, which would recurse once curse is /bin/sh), stdin from temp.
       local pid = C.fork()
       if pid == 0 then
+        reset_child_sigtraps(sh) -- caught signal traps revert to default in the >(…) subshell
         local fd = C.open(ps.file, 0, 0) -- O_RDONLY
         if fd >= 0 then C.dup2(fd, 0); C.close(fd) end
         sh.in_subprogram = (sh.in_subprogram or 0) + 1; sh.out = io.write
@@ -3929,6 +3963,7 @@ exec_stmt = function(sh, st, hook)
     local pid = C.fork()
     if pid == 0 then
       if cap then C.close(pfd[0]); C.dup2(pfd[1], 1); C.close(pfd[1]) end
+      reset_child_sigtraps(sh) -- caught signal traps revert to default in a subshell
       sh.in_subprogram = (sh.in_subprogram or 0) + 1 -- ERR trap won't fire here (sans errtrace)
       sh.loopdepth = 0 -- a loop enclosing this subshell isn't ours to break/continue
       local ok, err = pcall(function()
@@ -3960,6 +3995,7 @@ exec_stmt = function(sh, st, hook)
       -- Without job control, an async command's stdin is /dev/null (bash), so it
       -- can't steal the terminal — and it must not inherit a redirect it didn't ask for.
       local dn = C.open("/dev/null", 0, 0); if dn >= 0 then C.dup2(dn, 0); C.close(dn) end
+      reset_child_sigtraps(sh) -- caught signal traps revert to default in the async subshell
       sh.in_subprogram = (sh.in_subprogram or 0) + 1 -- async subprogram: ERR trap won't fire (sans errtrace)
       sh.loopdepth = 0
       local ok, err = pcall(function() sh.out = io.write; exec_stmt(sh, st.cmd, hook) end)
@@ -4060,6 +4096,7 @@ exec_stmt = function(sh, st, hook)
           local cp = ffi.new("int[2]"); C.pipe(cp)
           local pid = C.fork()
           if pid == 0 then
+            reset_child_sigtraps(sh) -- caught signal traps revert to default in a pipeline stage
             local ok, err = pcall(function()
               if prev_read >= 0 then C.dup2(prev_read, 0); C.close(prev_read) end
               C.dup2(cp[1], 1); C.close(cp[1]); C.close(cp[0])
@@ -4082,6 +4119,7 @@ exec_stmt = function(sh, st, hook)
         else
           local pid = C.fork()
           if pid == 0 then
+            reset_child_sigtraps(sh) -- caught signal traps revert to default in a pipeline stage
             local ok, err = pcall(function()
               if prev_read >= 0 then C.dup2(prev_read, 0); C.close(prev_read) end
               if wr >= 0 then C.dup2(wr, 1); C.close(wr) end
