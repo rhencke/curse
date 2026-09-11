@@ -439,6 +439,7 @@ end
 
 local tilde_prefix -- forward (word-initial ~ expansion; defined below, used in paramexp)
 local expand_word -- forward (used by eval's $-deferred arith and expand_part_str)
+local expand_assign_word -- forward (assignment-RHS expander; ${-default} tilde ctx)
 local expand_pattern -- forward (quote-aware glob-pattern expansion for ${v/…} etc.)
 local indirect_part -- forward (${!ref} target resolution, re-parsed to a part)
 local eval  -- arithmetic evaluator (forward decl)
@@ -622,7 +623,7 @@ end
 
 -- Expand ONE part to its string value (a multi-element @/* part is joined here;
 -- expand_to_fields treats those specially for word-splitting).
-local function expand_part_str(sh, p)
+local function expand_part_str(sh, p, assign)
   if p.lit ~= nil then return p.lit
   elseif p.var then
     -- a nameref whose target has a subscript (`typeset -n ref='a[2]'`) reads as
@@ -733,7 +734,10 @@ local function expand_part_str(sh, p)
     end
     local arg
     if TESTOP[pe.op] then
-      arg = pe.arg and function() return expand_word(sh, pw(pe.arg)) end or nil
+      -- In an assignment RHS the default word gets the after-`:` tilde rule too
+      -- (`x=${undef-~:~}` -> HOME:HOME), so use the assignment-aware expander.
+      local wexp = assign and expand_assign_word or expand_word
+      arg = pe.arg and function() return wexp(sh, pw(pe.arg)) end or nil
     else
       arg = pe.arg and (patmode and expand_pattern or expand_word)(sh, P.parse_word(pe.arg)) or nil
     end
@@ -758,14 +762,18 @@ end
 tilde_prefix = function(sh, s)
   if s:sub(1, 1) ~= "~" then return s end
   local r = s:sub(2)
-  if r == "" or r:sub(1, 1) == "/" then -- ~ / ~/… : HOME's value if HOME is SET (even to ""); else literal
+  -- The tilde-prefix login name ends at the first `/` OR `:` (bash: `~:~` -> the
+  -- bare `~` expands, `:~` stays; `~root:x` -> /root:x). So `:` terminates the ~/
+  -- ~+/~-/~user forms just like `/` does.
+  local c1 = r:sub(1, 1)
+  if r == "" or c1 == "/" or c1 == ":" then -- ~ / ~/… / ~:… : HOME's value if SET (even ""); else literal
     if sh.vars[sh:deref("HOME")] ~= nil then return sh:get("HOME") .. r end
     return s
   end
-  if (r == "+" or r:sub(1, 2) == "+/") then return sh:pwd() .. r:sub(2) end
-  if (r == "-" or r:sub(1, 2) == "-/") then local o = sh:get("OLDPWD"); return o ~= "" and (o .. r:sub(2)) or s end
+  if r == "+" or r:sub(1, 2) == "+/" or r:sub(1, 2) == "+:" then return sh:pwd() .. r:sub(2) end
+  if r == "-" or r:sub(1, 2) == "-/" or r:sub(1, 2) == "-:" then local o = sh:get("OLDPWD"); return o ~= "" and (o .. r:sub(2)) or s end
   -- ~user / ~user/… : the named user's home directory (unknown user stays literal)
-  local user, tail = r:match("^([^/]+)(.*)$")
+  local user, tail = r:match("^([^/:]+)(.*)$")
   if user then
     local pw = C.getpwnam(user)
     if pw ~= nil then return ffi.string(pw.pw_dir) .. tail end
@@ -822,10 +830,10 @@ end
 -- leading `name=` / `name+=` stays literal and the value after it is the first
 -- tilde segment (`readonly x=~/y`). Only the FIRST `=` is a boundary — bash
 -- leaves `x=foo=~` as foo=~, which falls out of expanding the value as one word.
-local function expand_assign_word(sh, w, peel_name)
+expand_assign_word = function(sh, w, peel_name)
   local buf = {}
   for i, p in ipairs(w.parts) do
-    local s = expand_part_str(sh, p)
+    local s = expand_part_str(sh, p, true) -- assignment context: ${-default} tilde after ':'
     if p.lit ~= nil and not p.q then
       if peel_name and i == 1 then
         local pre, rest = s:match("^([%a_][%w_]*%+?=)(.*)$")
