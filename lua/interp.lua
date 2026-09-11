@@ -997,12 +997,15 @@ local function multi_elems(sh, p) -- returns element list, star?
     -- Expand a default/alternate word (`:-`/`-`/`:+`/`+` arg). If it is itself a
     -- single array/$@ expansion (${d[@]}), preserve its elements as separate
     -- fields instead of flattening to one joined string.
+    -- Returns the field list; for a QUOTED multi alternate (`${x+"${a[@]}"}`) it
+    -- also returns (star, quoted=true) so the caller keeps the elements separate
+    -- even when the outer ${…} is unquoted — the alternate's OWN quoting governs.
     local function defval(arg)
       if arg == nil then return { "" } end
       local w = P.parse_word(arg)
-      if #w.parts == 1 then
-        local part = w.parts[1]; part.q = p.q
-        if is_multi(sh, part) then return (multi_elems(sh, part)) end
+      if #w.parts == 1 and is_multi(sh, w.parts[1]) then
+        local part = w.parts[1]; part.q = p.q or part.q -- inner quoting is significant
+        local e, s = multi_elems(sh, part); return e, s, part.q
       end
       return { expand_word(sh, w) }
     end
@@ -1058,7 +1061,7 @@ local function multi_elems(sh, p) -- returns element list, star?
         els = array_slice(els, off, len)
       end
     elseif pe.op == "-" and #els == 0 then -- unset/empty array: the default
-      return defval(pe.arg), star
+      local d, ds, dq = defval(pe.arg); return d, (dq ~= nil and ds or star), dq
     -- `:` null-test for @/* differs by form: a QUOTED `*` tests the IFS[0]-joined
     -- string (empty IFS -> concatenation), so `"${a[*]:-w}"` with ("" "") joins to
     -- "" and IS null; `@` (any quoting) and an UNQUOTED `*` test the element list
@@ -1070,10 +1073,13 @@ local function multi_elems(sh, p) -- returns element list, star?
       else
         ne = #els > 1 or (els[1] ~= nil and els[1] ~= "")
       end
-      if pe.op == ":-" then if not ne then return defval(pe.arg), star end
-      else return ne and defval(pe.arg) or {}, star end
+      if pe.op == ":-" then
+        if not ne then local d, ds, dq = defval(pe.arg); return d, (dq ~= nil and ds or star), dq end
+      elseif ne then local d, ds, dq = defval(pe.arg); return d, (dq ~= nil and ds or star), dq
+      else return {}, star end
     elseif pe.op == "+" then -- alternate iff the array has any element (is set)
-      return (#els > 0) and defval(pe.arg) or {}, star
+      if #els > 0 then local d, ds, dq = defval(pe.arg); return d, (dq ~= nil and ds or star), dq
+      else return {}, star end
     elseif pe.op == "@" and pe.arg == "a" then -- ${a[@]@a}: the variable's attribute string, per element
       local attr = sh:attr_string(pe.name); local out = {}
       for i = 1, #els do out[i] = attr end
@@ -1142,8 +1148,8 @@ local function expand_to_fields(sh, w)
   end
   for pi, p in ipairs(w.parts) do
     if is_multi(sh, p) then
-      local els, star = multi_elems(sh, p)
-      if p.q then
+      local els, star, qforced = multi_elems(sh, p) -- qforced: a quoted multi alternate
+      if p.q or qforced then
         if star then -- "$*" / "${a[*]}" join with the first char of IFS
           local sep = sh.vars["IFS"] and sh:get("IFS"):sub(1, 1) or " "
           add(table.concat(els, sep), false)
