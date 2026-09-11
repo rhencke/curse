@@ -1415,7 +1415,16 @@ local function make_parser(src)
       ws()
       -- a single `|` (not `||`) chains another command into the pipeline
       if src:sub(i, i) == "|" and src:sub(i + 1, i + 1) ~= "|" then
-        i = i + 1
+        if src:sub(i, i + 1) == "|&" then
+          -- `cmd |& next` == `cmd 2>&1 | next`: merge the previous stage's stderr
+          -- into its stdout (which the pipe carries to the next stage).
+          local prev = cmds[#cmds]
+          prev.redirs = prev.redirs or {}
+          prev.redirs[#prev.redirs + 1] = { fd = 2, op = "dup", target = "1" }
+          i = i + 2
+        else
+          i = i + 1
+        end
         -- bash allows spaces, a comment, and newlines after `|` before the next cmd
         while true do
           ws()

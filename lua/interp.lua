@@ -1334,7 +1334,7 @@ local BUILTINS = {
   exec = 1, readonly = 1, umask = 1, alias = 1, unalias = 1, shopt = 1, wait = 1, trap = 1,
   mapfile = 1, readarray = 1, compgen = 1, complete = 1, compopt = 1,
   pushd = 1, popd = 1, dirs = 1, builtin = 1, kill = 1, ulimit = 1, jobs = 1,
-  history = 1, fc = 1, hash = 1, ["let"] = 1,
+  history = 1, fc = 1, hash = 1, ["let"] = 1, times = 1,
 }
 M.BUILTINS = BUILTINS -- exposed so the compiled backend delegates the same set
 local KEYWORDS = {
@@ -2955,6 +2955,13 @@ local function exec_simple(sh, args, hook, no_func)
         else sh:echo(v or "unlimited") end
       end
     end
+  elseif cmd == "times" then
+    -- Two lines: shell user/sys, then children user/sys, each `%dm%.3fs`.
+    local function ct(s) return ("%dm%.3fs"):format(math.floor(s / 60), s % 60) end
+    local c = os.clock()
+    sh:echo(ct(c) .. " " .. ct(0))
+    sh:echo(ct(0) .. " " .. ct(0))
+    sh.status = 0
   elseif cmd == "pwd" then
     local phys = false
     for j = 2, #args do if args[j]:find("P") then phys = true elseif args[j]:find("L") then phys = false end end
