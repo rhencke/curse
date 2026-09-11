@@ -2488,10 +2488,19 @@ local function exec_simple(sh, args, hook, no_func)
           elseif iattr then sh.vars[a] = sh.vars[a] or {}; sh.vars[a].int = true
           elseif lattr or uattr then
             sh.vars[a] = sh.vars[a] or {}; sh.vars[a].lower = lattr or nil; sh.vars[a].upper = uattr or nil
-          elseif assoc then sh:declare_assoc(a)
+          elseif assoc then -- bash forbids converting an existing indexed array to associative
+            local b = sh.vars[sh:deref(a)]
+            if b and b.arr and not b.assoc then
+              io.stderr:write("curse: " .. cmd .. ": " .. a .. ": cannot convert indexed to associative array\n"); allok = false
+            else sh:declare_assoc(a) end
           elseif aattr then -- `declare -a`: mark an (empty) indexed array; convert a scalar to [0]
-            local b = sh.vars[a] or {}; sh.vars[a] = b
-            if b.s ~= nil and not b.arr then b.arr = { [0] = b.s }; b.s = nil; b.n = nil else b.arr = b.arr or {} end
+            local b = sh.vars[a] or {}
+            if b.assoc then -- …and the reverse conversion is forbidden too
+              io.stderr:write("curse: " .. cmd .. ": " .. a .. ": cannot convert associative to indexed array\n"); allok = false
+            else
+              sh.vars[a] = b
+              if b.s ~= nil and not b.arr then b.arr = { [0] = b.s }; b.s = nil; b.n = nil else b.arr = b.arr or {} end
+            end
           else sh.vars[a] = sh.vars[a] or {} end -- `declare x` creates a declared-but-unset var
           local bb = sh.vars[sh:deref(a)]
           if roattr and bb and not nref then bb.ro = true end -- bash ignores -r when -n is given
