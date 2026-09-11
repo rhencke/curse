@@ -3052,7 +3052,23 @@ local function exec_simple(sh, args, hook, no_func)
   elseif cmd == "pwd" then
     local phys = false
     for j = 2, #args do if args[j]:find("P") then phys = true elseif args[j]:find("L") then phys = false end end
-    sh:echo(phys and sh:phys_cwd() or sh:pwd()); sh.status = 0
+    local out
+    if phys then out = sh:phys_cwd()
+    else
+      -- pwd -L (default): use $PWD only when it actually names the current directory
+      -- (an absolute path with the same dev+inode as "."); a lied-about `PWD=foo`
+      -- falls back to the physical cwd. But when the cwd is gone (stat "." fails),
+      -- getcwd can't help either, so bash keeps $PWD as-is — only validate when the
+      -- current directory is still accessible.
+      out = sh:pwd()
+      local same = out:sub(1, 1) == "/" and C.curse_stat(out, statbuf) == 0 and C.curse_stat(".", statbuf2) == 0
+        and ffi.cast("uint64_t *", statbuf)[0] == ffi.cast("uint64_t *", statbuf2)[0]        -- st_dev @ 0
+        and ffi.cast("uint64_t *", statbuf + 8)[0] == ffi.cast("uint64_t *", statbuf2 + 8)[0] -- st_ino @ 8
+      -- fall back to the physical cwd only when it's actually available: if getcwd
+      -- fails (the cwd was removed), bash keeps $PWD rather than printing nothing.
+      if not same then local pc = sh:phys_cwd(); if pc ~= "" then out = pc end end
+    end
+    sh:echo(out); sh.status = 0
   elseif cmd == "umask" then
     -- umask [-S] [MODE]: print (octal or -S symbolic) or set the file-creation mask.
     local sflag, pflag, badflag, pos = false, false, false, {}
