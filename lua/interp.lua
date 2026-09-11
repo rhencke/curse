@@ -1009,7 +1009,7 @@ local function expand_to_fields(sh, w)
   local noglob = sh.opt_f -- set -f: pathname expansion disabled; globs stay literal
   for _, f in ipairs(fields) do
     if not noglob and f.unq and (f.s:find("[*?%[]") or f.s:find("[?*+@!]%(")) then
-      local m = rt.glob_expand(f.s, { dotglob = dotglob })
+      local m = rt.glob_expand(f.s, { dotglob = dotglob, skipdots = shopt_on(sh, "globskipdots") })
       if m and gipats then
         local filt = {}
         for _, x in ipairs(m) do

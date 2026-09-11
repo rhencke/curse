@@ -949,17 +949,21 @@ end
 -- Scan one directory for entries matching a single glob segment. `dir` is the
 -- directory to open ("" == cwd). Returns a list of matching base names (unsorted).
 -- `dotglob` controls whether names beginning with `.` match a non-`.`-initial glob.
-local function scan_seg(dir, seg, dotglob)
+local function scan_seg(dir, seg, dotglob, skipdots)
   local scan = (dir == "" and ".") or dir
   local d = ffi.C.opendir(scan); if d == nil then return {} end
   local ere = glob_to_ere(seg)
   if ffi.C.regcomp(regbuf, ere, REG_EXTENDED + REG_NOSUB) ~= 0 then ffi.C.closedir(d); return {} end
   local hidden = seg:sub(1, 1) == "."
+  skipdots = skipdots ~= false -- default: skip . and .. (globskipdots on)
   local out = {}
   while true do
     local e = ffi.C.readdir(d); if e == nil then break end
     local name = ffi.string(ffi.cast("const char *", e) + 19) -- d_name @ 19 (glibc x86-64)
-    if name ~= "." and name ~= ".." and (name:sub(1, 1) ~= "." or hidden or dotglob) then
+    -- . and .. are matched only by an explicit leading-dot pattern with
+    -- globskipdots off; a leading-dot name otherwise needs `.`-pattern or dotglob.
+    local dotdot = name == "." or name == ".."
+    if (not dotdot or (not skipdots and hidden)) and (name:sub(1, 1) ~= "." or hidden or dotglob) then
       if ffi.C.regexec(regbuf, name, 0, nil, 0) == 0 then out[#out + 1] = name end
     end
   end
@@ -994,7 +998,7 @@ function M.glob_expand(pattern, opts)
       for _, base in ipairs(cur) do nxt[#nxt + 1] = joined(base, seg) end
     else
       for _, base in ipairs(cur) do
-        local hits = scan_seg(base, seg, opts.dotglob)
+        local hits = scan_seg(base, seg, opts.dotglob, opts.skipdots)
         table.sort(hits)
         for _, name in ipairs(hits) do nxt[#nxt + 1] = joined(base, name) end
       end
