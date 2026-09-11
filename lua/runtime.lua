@@ -1105,8 +1105,12 @@ end
 local function scan_seg(dir, seg, dotglob, skipdots)
   local scan = (dir == "" and ".") or dir
   local d = ffi.C.opendir(scan); if d == nil then return {} end
-  local ere = glob_to_ere(seg)
-  if ffi.C.regcomp(regbuf, ere, REG_EXTENDED + REG_NOSUB) ~= 0 then ffi.C.closedir(d); return {} end
+  -- a `!()` segment needs the split matcher (per entry); everything else uses one
+  -- precompiled ERE.
+  local neg = seg:find("!(", 1, true) ~= nil
+  if not neg then
+    if ffi.C.regcomp(regbuf, glob_to_ere(seg), REG_EXTENDED + REG_NOSUB) ~= 0 then ffi.C.closedir(d); return {} end
+  end
   local hidden = seg:sub(1, 1) == "."
   skipdots = skipdots ~= false -- default: skip . and .. (globskipdots on)
   local out = {}
@@ -1117,10 +1121,14 @@ local function scan_seg(dir, seg, dotglob, skipdots)
     -- globskipdots off; a leading-dot name otherwise needs `.`-pattern or dotglob.
     local dotdot = name == "." or name == ".."
     if (not dotdot or (not skipdots and hidden)) and (name:sub(1, 1) ~= "." or hidden or dotglob) then
-      if ffi.C.regexec(regbuf, name, 0, nil, 0) == 0 then out[#out + 1] = name end
+      local m
+      if neg then m = M.ext_match(name, seg) -- (explicit if: a false ext_match must NOT fall to regexec on an uncompiled regbuf)
+      else m = ffi.C.regexec(regbuf, name, 0, nil, 0) == 0 end
+      if m then out[#out + 1] = name end
     end
   end
-  ffi.C.regfree(regbuf); ffi.C.closedir(d)
+  if not neg then ffi.C.regfree(regbuf) end
+  ffi.C.closedir(d)
   return out
 end
 
