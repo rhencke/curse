@@ -2317,13 +2317,19 @@ local function exec_simple(sh, args, hook, no_func)
     elseif #rest == 0 then -- no operands: list matching declarations (declare -p, or bare)
       list_decls(); sh.status = 0
     elseif printmode then
-      local allok = true
-      for _, nm in ipairs(rest) do
-        local d = fmt_decl(sh, nm)
-        if d then sh:echo(d)
-        else allok = false; io.stderr:write("curse: " .. cmd .. ": " .. nm .. ": not found\n") end
+      -- Only `declare`/`typeset -p NAME` prints a named declaration; `readonly -p
+      -- NAME` and `export -p NAME` (with operands) print nothing (bash quirk — the
+      -- no-operand forms still list all, handled above).
+      if cmd == "readonly" or cmd == "export" then sh.status = 0
+      else
+        local allok = true
+        for _, nm in ipairs(rest) do
+          local d = fmt_decl(sh, nm)
+          if d then sh:echo(d)
+          else allok = false; io.stderr:write("curse: " .. cmd .. ": " .. nm .. ": not found\n") end
+        end
+        sh.status = allok and 0 or 1
       end
-      sh.status = allok and 0 or 1
     else
       local roattr = (cmd == "readonly") or rattr
       -- `declare`/`typeset` in a function make each name LOCAL (like `local`),
