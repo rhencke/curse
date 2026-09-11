@@ -28,7 +28,8 @@ while true do
   local a = arg[ai]
   if a == "-e" or a == "+e" then presets[#presets + 1] = { f = "opt_e", on = a == "-e" }; ai = ai + 1
   elseif a == "-i" then presets[#presets + 1] = { f = "opt_i", on = true }; ai = ai + 1
-  elseif a == "-l" or a == "--login" or a == "-x" or a == "+x" or a == "-v" or a == "+v"
+  elseif a == "-x" or a == "+x" then presets[#presets + 1] = { f = "opt_x", on = a == "-x" }; ai = ai + 1
+  elseif a == "-l" or a == "--login" or a == "-v" or a == "+v"
     or a == "-s" or a == "-B" or a == "+B" or a == "-h" or a == "+h" then ai = ai + 1 -- accepted, no-op
   elseif a == "--help" then
     io.write("curse: a bash-compatible shell.\nusage: curse [options] [script [args]]\n"); os.exit(0)
@@ -57,7 +58,8 @@ local function opt_consume(a, nexta)
   elseif a == "-u" or a == "+u" then presets[#presets + 1] = { f = "opt_u", on = a == "-u" }; return 1
   elseif a == "-C" or a == "+C" then presets[#presets + 1] = { f = "opt_C", on = a == "-C" }; return 1
   elseif a == "-i" then presets[#presets + 1] = { f = "opt_i", on = true }; return 1
-  elseif a == "-l" or a == "--login" or a == "-x" or a == "+x" or a == "-v" or a == "+v"
+  elseif a == "-x" or a == "+x" then presets[#presets + 1] = { f = "opt_x", on = a == "-x" }; return 1
+  elseif a == "-l" or a == "--login" or a == "-v" or a == "+v"
     or a == "-s" or a == "-B" or a == "+B" or a == "-h" or a == "+h" then return 1 -- accepted, no-op
   elseif a == "-o" or a == "+o" then presets[#presets + 1] = { o = nexta, on = a == "-o" }; return 2
   elseif a == "-O" or a == "+O" then presets[#presets + 1] = { shopt = nexta, on = a == "-O" }; return 2
