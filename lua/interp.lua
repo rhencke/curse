@@ -4457,15 +4457,31 @@ function M.run_lazy(sh, src, hook)
   hook = hook or function() end
   local nextf = P.open(src, sh) -- sh: alias expansion uses the live alias table
   finish(sh, pcall(function()
-    local k = 0
+    local k, skip_to = 0, nil
     while true do
       local st = nextf()
       if st == nil then break end
-      k = k + 1
-      hook("stmt", k)
-      exec_stmt(sh, st, hook)
-      if errexit_stmt(sh, st) then fire_err(sh) end
-      if sh.sigtraps then run_pending_signals(sh) end -- deliver any pending signal traps
+      -- A fatal arithmetic error (divide by zero) in a WORD-context $((…)) — an
+      -- argument, an assignment value, an `if`/`case` word — aborts the REST of the
+      -- current input LINE, then bash resumes at the next line with $?=1. Skip the
+      -- statements that began on that same line. (A `(( … ))` COMMAND-context div0
+      -- is non-fatal and handled by the arithcmd path, so it never reaches here.)
+      if skip_to and st.line and st.line <= skip_to then
+        -- swallowed: same line as the div0
+      else
+        skip_to = nil
+        k = k + 1
+        hook("stmt", k)
+        local ok, err = pcall(exec_stmt, sh, st, hook)
+        if not ok then
+          if type(err) == "table" and err.__curse_matherr then
+            sh.status = 1; skip_to = st.line or 0
+          else error(err) end
+        else
+          if errexit_stmt(sh, st) then fire_err(sh) end
+          if sh.sigtraps then run_pending_signals(sh) end -- deliver any pending signal traps
+        end
+      end
     end
   end))
 end
