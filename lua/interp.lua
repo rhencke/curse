@@ -1352,8 +1352,11 @@ local function apply_redirs(sh, redirs)
       local body = expand_word(sh, P.parse_word(r.word or "")) .. "\n"
       backup(r.fd or 0); feed_stdin(r.fd or 0, body)
     elseif r.op == "dup" or r.op == "dupin" then
-      local tv = tgt(r)
-      if tv == "-" then backup(r.fd); C.close(r.fd) -- `N>&-` closes fd N
+      -- the `>&`/`<&` target is field-split like a file target: more than one field
+      -- (e.g. `>& "$@"` with several params) is an ambiguous redirect (bash).
+      local tv = ftgt(r)
+      if not tv then ok = false
+      elseif tv == "-" then backup(r.fd); C.close(r.fd) -- `N>&-` closes fd N
       else
         local movesrc = tv:match("^(%d+)%-$")       -- `N>&M-`: dup then close the source (move)
         local m = tonumber(movesrc or tv)
