@@ -364,11 +364,34 @@ local function parse_paramexp(inner)
 end
 M.parse_paramexp = parse_paramexp
 
+-- `$((` is arithmetic ONLY when it's a balanced `$(( expr ))` — the paren balance
+-- first returns to 0 at a `)` immediately followed by another `)`. Otherwise the
+-- first `(` opened a subshell (`$( (…) )`, #2337). Quote-aware.
+local function dparen_is_arith(w, j0)
+  local depth, j, n = 0, j0, #w
+  while j <= n do
+    local c = w:sub(j, j)
+    if c == "\\" then j = j + 2
+    elseif c == "'" or c == '"' then
+      local q = c; j = j + 1
+      while j <= n and w:sub(j, j) ~= q do
+        if w:sub(j, j) == "\\" and q == '"' then j = j + 2 else j = j + 1 end
+      end
+      j = j + 1
+    elseif c == "(" then depth = depth + 1; j = j + 1
+    elseif c == ")" then
+      if depth == 0 then return w:sub(j + 1, j + 1) == ")" end
+      depth = depth - 1; j = j + 1
+    else j = j + 1 end
+  end
+  return false
+end
+
 -- Parse a $… expansion at position i of string w; add(part) tagging it with the
 -- quoted flag q; returns the next index. (q drives word-splitting downstream.)
 local function parse_dollar(w, i, add, q)
   local nx = w:sub(i + 1, i + 1)
-  if w:sub(i + 1, i + 2) == "((" then
+  if w:sub(i + 1, i + 2) == "((" and dparen_is_arith(w, i + 3) then
     local body, ni = grab_dparen(w, i + 3); add({ arith = body, q = q }); return ni
   elseif nx == "[" then -- $[expr]: deprecated arithmetic, an alias of $(( ))
     local depth, j = 1, i + 2
@@ -889,7 +912,7 @@ local function make_parser(src)
           if src:sub(i, i) == "\\" then i = i + 2 else i = i + 1 end
         end
         i = i + 1
-      elseif c == "$" and src:sub(i + 1, i + 2) == "((" then
+      elseif c == "$" and src:sub(i + 1, i + 2) == "((" and dparen_is_arith(src, i + 3) then
         local _, ni = grab_dparen(src, i + 3); i = ni
       elseif c == "$" and src:sub(i + 1, i + 1) == "[" then -- $[expr]: keep whole (spaces inside)
         i = i + 2; local d = 1
