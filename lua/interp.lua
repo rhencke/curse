@@ -3340,9 +3340,12 @@ local function exec_stmt(sh, st, hook)
     elseif rb and rb.ro then -- readonly array: reject the (re)assignment
       io.stderr:write("curse: " .. st.name .. ": readonly variable\n"); sh.status = 1
     else
-      do_arrayassign(sh, st)
-      sh.status = 0
-      sh:set_str("_", "")
+      -- a failglob no-match inside `a=(*.ZZ)` fails the assignment non-fatally (bash)
+      local aok, aerr = pcall(do_arrayassign, sh, st)
+      if aok then sh.status = 0; sh:set_str("_", "")
+      elseif type(aerr) == "table" and aerr.__curse_experr then
+        sh.status = 1; if sh.opt_e then error({ __curse_exit = 1 }) end
+      else error(aerr) end
     end
   elseif t == "funcdef" then
     sh.functions[st.name] = st.body
@@ -3763,9 +3766,19 @@ local function exec_stmt(sh, st, hook)
     -- expand the word list ONCE (bash semantics) and stash it in sh.forstate so
     -- a mid-loop OSR resumes the same list + index.
     local list = {}
-    for _, w in ipairs(st.words) do
-      local fs = expand_to_fields(sh, w)
-      for k = 1, #fs do list[#list + 1] = fs[k] end
+    -- a failglob no-match while expanding the word list fails the `for` non-fatally
+    -- (status 1, no iterations), like bash — not an abort.
+    local eok, eerr = pcall(function()
+      for _, w in ipairs(st.words) do
+        local fs = expand_to_fields(sh, w)
+        for k = 1, #fs do list[#list + 1] = fs[k] end
+      end
+    end)
+    if not eok then
+      if type(eerr) == "table" and eerr.__curse_experr then
+        sh.status = 1; if sh.opt_e then error({ __curse_exit = 1 }) end; return
+      end
+      error(eerr)
     end
     sh.forstate[st.id] = { list = list, idx = 0 }
     local bodystatus = 0
