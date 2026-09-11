@@ -380,7 +380,16 @@ local function do_test(sh, args)
     if args[hi] ~= "]" then sh.status = 2; return end
     hi = hi - 1
   end
-  local ok, res = pcall(eval_test, sh, args, lo, hi)
+  -- POSIX 3-argument rule (top level only): a binary operator in the MIDDLE binds
+  -- first, so `[ ( = ) ]` is the string compare "(" = ")", not `( )` grouping of
+  -- a lone `=`. Grouping only applies to `( )` in longer (recursively-parsed)
+  -- expressions.
+  local ok, res
+  if hi - lo + 1 == 3 and TEST_BINOPS[args[lo + 1]] then
+    ok, res = pcall(binary, args[lo], args[lo + 1], args[lo + 2])
+  else
+    ok, res = pcall(eval_test, sh, args, lo, hi)
+  end
   -- a malformed expression (bad operator, non-integer for -eq, too many args) is a
   -- SYNTAX error (status 2); a well-formed expression that's false is status 1.
   if not ok then sh.status = 2; return end
