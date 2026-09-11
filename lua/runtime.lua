@@ -915,9 +915,14 @@ local function glob_conv(glob, pn)
           else members[#members + 1] = cj; j = j + 1 end
         else members[#members + 1] = cj; j = j + 1 end
       end
-      -- ERE class: a literal ] must come FIRST (right after [ or [^).
-      out[#out + 1] = "[" .. (neg and "^" or "") .. (has_rb and "]" or "") .. table.concat(members) .. "]"
-      i = j + 1
+      if glob:sub(j, j) ~= "]" then
+        -- no closing ] : bash treats the `[` as a literal character (not a class)
+        out[#out + 1] = "\\["; i = i + 1
+      else
+        -- ERE class: a literal ] must come FIRST (right after [ or [^).
+        out[#out + 1] = "[" .. (neg and "^" or "") .. (has_rb and "]" or "") .. table.concat(members) .. "]"
+        i = j + 1
+      end
     elseif c:match("[%.%+%(%)%{%}%|%^%$\\]") then out[#out + 1] = "\\" .. c; i = i + 1
     else out[#out + 1] = c; i = i + 1 end
   end
