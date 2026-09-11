@@ -3260,8 +3260,10 @@ local function exec_simple(sh, args, hook, no_func)
           end
           if f == "r" then raw = true; k = k + 1
           elseif f == "d" then delim = takearg() or "\n"
-          elseif f == "n" then nchars = tonumber(takearg())
-          elseif f == "N" then nchars = tonumber(takearg()); ndelim = true
+          elseif f == "n" or f == "N" then -- char count; a non-numeric arg is an error (not a hang)
+            local v = takearg(); nchars = tonumber(v)
+            if not nchars then io.stderr:write("curse: read: " .. tostring(v) .. ": invalid number\n"); sh.status = 1; return end
+            if f == "N" then ndelim = true end
           elseif f == "a" then arr = takearg()
           elseif f == "u" then ufd = tonumber(takearg()) or 0
           elseif f == "p" then takearg() -- prompt: consume + ignore (non-interactive)
