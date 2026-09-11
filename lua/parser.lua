@@ -228,6 +228,11 @@ local function parse_paramexp(inner)
   if inner == "#" then return { special = "#" } end
   local indices, lenpfx = false, false
   if inner:sub(1, 1) == "!" then indices = true; inner = inner:sub(2)     -- ${!a[@]}
+    -- after `!` (indirect/keys) another prefix operator is a bad substitution
+    -- (`${!!x}`, `${!#x}` are not valid — bash errors).
+    if inner:sub(1, 1) == "!" or inner:sub(1, 1) == "#" then
+      return { pexp = { op = "badsubst", raw = "!" .. inner } }
+    end
   elseif inner:sub(1, 1) == "#" then lenpfx = true; inner = inner:sub(2) end -- ${#v} / ${#a[@]}
   local name, rest = inner:match("^([%a_][%w_]*)(.*)$")
   if not name then name, rest = inner:match("^(%d+)(.*)$") end
