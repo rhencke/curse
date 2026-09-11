@@ -2424,18 +2424,35 @@ local function exec_simple(sh, args, hook, no_func)
             -- frame but shadows a local declared in an ENCLOSING frame (e.g. an
             -- `unset -v` run from a nested `unlocal` helper), removing it REVEALS
             -- that outer binding instead of leaving the name unset.
-            local revealed = false
-            if (sh.pd or 0) > 0 and not (sh.savedstack[sh.pd] and sh.savedstack[sh.pd][dn] ~= nil) then
-              for d = sh.pd, 1, -1 do
-                local ss = sh.savedstack[d]
-                if ss and ss[dn] ~= nil then
-                  sh.vars[dn] = ss[dn] or nil -- reveal the shadowed box (false = was absent)
-                  ss[dn] = nil; revealed = true; break
+            local revealed, env_done = false, false
+            -- unset of a var LOCAL to the current frame just makes it appear unset
+            -- (bash: the global stays hidden until the function returns). Only when
+            -- the name is NOT local here does unset REVEAL a shadowed binding — an
+            -- enclosing local (savedstack) or a tempenv `x=v cmd` binding (sh.tenv),
+            -- peeling exactly one layer (bash dynamic scope).
+            if not (sh.savedstack[sh.pd] and sh.savedstack[sh.pd][dn] ~= nil) then
+              if (sh.pd or 0) > 0 then
+                for d = sh.pd, 1, -1 do
+                  local ss = sh.savedstack[d]
+                  if ss and ss[dn] ~= nil then
+                    sh.vars[dn] = ss[dn] or nil -- reveal the shadowed box (false = was absent)
+                    ss[dn] = nil; revealed = true; break
+                  end
+                end
+              end
+              if not revealed then
+                for k = #sh.tenv, 1, -1 do
+                  local e = sh.tenv[k]
+                  if not e.consumed and e.name == dn then
+                    sh.vars[dn] = e.box or nil; e.consumed = true; revealed = true
+                    if e.env then C.setenv(dn, e.env, 1) else C.unsetenv(dn) end
+                    env_done = true; break
+                  end
                 end
               end
             end
             if not revealed then sh.vars[dn] = nil end
-            C.unsetenv(a) -- drop from the process env too
+            if not env_done then C.unsetenv(a) end -- drop from the process env too
           elseif sh.functions[a] then sh.functions[a] = nil -- plain unset falls back to a function
           end
         end
@@ -3736,12 +3753,16 @@ exec_stmt = function(sh, st, hook)
     end
     if st.assigns then
       -- prefix assignments: apply as a temporary, EXPORTED env for this command
-      -- only, then restore (both the shell var and the process env).
-      local saved = {}
+      -- only, then restore (both the shell var and the process env). Each binding
+      -- is pushed onto sh.tenv (LIFO) so an `unset` inside the command reveals the
+      -- shadowed value beneath instead of leaving the name unset (bash dynamic
+      -- scope); a consumed entry is skipped on restore.
+      local base = #sh.tenv
       for _, a in ipairs(st.assigns) do
         local b = sh.vars[a.name] -- COPY the box: exec_stmt mutates it in place
-        saved[#saved + 1] = { name = a.name, env = os.getenv(a.name),
-          box = b and { s = b.s, n = b.n, arr = b.arr, assoc = b.assoc, order = b.order } or false }
+        sh.tenv[#sh.tenv + 1] = { name = a.name, env = os.getenv(a.name), consumed = false,
+          box = b and { s = b.s, n = b.n, arr = b.arr, assoc = b.assoc, order = b.order,
+                        exported = b.exported, ro = b.ro, ref = b.ref } or false }
         if a.raw then -- NAME=(…) as a command prefix is a literal string, not an array (bash)
           sh:set_str(a.name, a.raw); C.setenv(a.name, a.raw, 1)
         else
@@ -3752,9 +3773,12 @@ exec_stmt = function(sh, st, hook)
         end
       end
       local ok, err = pcall(run_cmd)
-      for k = #saved, 1, -1 do
-        local s = saved[k]; sh.vars[s.name] = s.box or nil
-        if s.env then C.setenv(s.name, s.env, 1) else C.unsetenv(s.name) end
+      for k = #sh.tenv, base + 1, -1 do
+        local s = sh.tenv[k]; sh.tenv[k] = nil
+        if not s.consumed then -- an `unset` inside the command already revealed it
+          sh.vars[s.name] = s.box or nil
+          if s.env then C.setenv(s.name, s.env, 1) else C.unsetenv(s.name) end
+        end
       end
       if not ok then error(err) end
     else

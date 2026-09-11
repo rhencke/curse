@@ -69,6 +69,9 @@ function Shell.new()
     npstack = {},    -- saved `nparams` per depth
     argpool = {},    -- reusable args array per depth
     savedstack = {}, -- `local`-shadow record per depth (false until a local shadows)
+    tenv = {},       -- tempenv shadow stack: {name, box, env, consumed} per `x=v cmd`
+                     -- binding, LIFO; `unset` peels the top one (reveals the box
+                     -- beneath), matching bash's dynamic-scope tempenv unwinding.
     calldepth = 0,   -- interpreter-only OSR gate (managed at the interp call site)
   }, Shell)
   sh:import_env()
