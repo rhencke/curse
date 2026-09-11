@@ -529,6 +529,7 @@ local function parse_dbracket(toks, quoted)
     local t = peek()
     if t == nil then serr = true; return { kind = "str", word = parse_word("") } end -- expected an operand
     if t == "&&" or t == "||" then serr = true; pos = pos + 1; return { kind = "str", word = parse_word("") } end -- operator with no left operand
+    if t == ")" then serr = true; pos = pos + 1; return { kind = "str", word = parse_word("") } end -- unmatched `)` (a matched one is consumed after `(`)
     if t == "!" then pos = pos + 1; return { kind = "not", e = primary() } end
     if t == "(" then pos = pos + 1; local e = parse_or(); if peek() == ")" then pos = pos + 1 else serr = true end; return e end
     if t and t:match("^%-[a-zA-Z]$") then -- unary file/string test
