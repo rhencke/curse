@@ -3574,8 +3574,10 @@ local COMPOUND_REDIR = { whilec = true, forc = true, forin = true, ["if"] = true
   case = true, arithcmd = true, dbracket = true, group = true }
 -- DEBUG trap fires just before each of these "command" nodes (bash runs it before
 -- every simple/pipeline/arith/[[/assignment); it preserves $? around the handler.
+-- `case` also fires DEBUG before the compound itself (at the `case` line); `if`,
+-- `while`, `{ }` groups etc. do NOT — only their inner condition/body commands do.
 local DEBUG_FIRE = { simple = true, pipeline = true, arithcmd = true, dbracket = true,
-  assign = true, assignlist = true }
+  assign = true, assignlist = true, case = true }
 local function run_debug(sh, line)
   local h = sh.traps and sh.traps.DEBUG
   if not h or h == "" or sh.in_debug then return end
