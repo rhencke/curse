@@ -136,10 +136,15 @@ function Shell:localVar(name)
   if saved[name] == nil then saved[name] = self.vars[name] or false; self.vars[name] = {} end
 end
 
--- one `local` operand: `name` or `name=value` (value already expanded).
+-- one `local` operand: `name`, `name=value`, or `name+=value` (value expanded).
+-- `+=` appends to the value AFTER localizing (bash: appends to the new local, not
+-- the shadowed outer one).
 function Shell:localAssign(arg)
-  local nm, val = arg:match("^([%a_][%w_]*)=(.*)$")
-  if nm then self:localVar(nm); self:set_str(nm, val) else self:localVar(arg) end
+  local nm, op, val = arg:match("^([%a_][%w_]*)(%+?=)(.*)$")
+  if nm then
+    self:localVar(nm)
+    self:set_str(nm, op == "+=" and (self:get(nm) .. val) or val)
+  else self:localVar(arg) end
 end
 
 -- Split on default-IFS whitespace (no empty fields), for unquoted `$var` in a
