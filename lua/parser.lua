@@ -1332,6 +1332,7 @@ local function make_parser(src)
   -- pipeline: cmd [ | cmd ]*   (optional leading `!` negates the exit status)
   local function parse_pipeline()
     ws()
+    local ln = line
     local negate = false
     if src:sub(i, i + 1) == "! " then negate = true; i = i + 2; ws() end
     local first = parse_command()
@@ -1354,7 +1355,7 @@ local function make_parser(src)
       end
     end
     if #cmds == 1 and not negate then return first end
-    return { t = "pipeline", cmds = cmds, negate = negate }
+    return { t = "pipeline", cmds = cmds, negate = negate, line = ln }
   end
 
   -- and-or list: pipeline [ (&& | ||) pipeline ]*  ; a lone `&` (background) is
