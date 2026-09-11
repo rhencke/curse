@@ -604,7 +604,9 @@ local function brace_factors(s)
   local i = 1
   while i <= #s do
     local c = s:sub(i, i)
-    if c == "'" or c == '"' then
+    if c == "\\" then -- a backslash escapes the next char, so `\{` isn't a brace open
+      litbuf[#litbuf + 1] = c; if i + 1 <= #s then litbuf[#litbuf + 1] = s:sub(i + 1, i + 1) end; i = i + 2
+    elseif c == "'" or c == '"' then
       litbuf[#litbuf + 1] = c; i = i + 1
       while i <= #s and s:sub(i, i) ~= c do litbuf[#litbuf + 1] = s:sub(i, i); i = i + 1 end
       if i <= #s then litbuf[#litbuf + 1] = c; i = i + 1 end
