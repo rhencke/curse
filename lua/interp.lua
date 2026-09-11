@@ -3543,6 +3543,14 @@ exec_stmt = function(sh, st, hook)
         nref_base, nref_sub = nb.s:match("^([%a_][%w_]*)%[(.+)%]$")
       end
     end
+    -- `ref[i]=` where ref is a nameref TO a subscripted element (`a[0]`) would be
+    -- `a[0][i]` — not a valid identifier (bash: status 1, no assign).
+    if st.index then
+      local nb = sh.vars[st.name]
+      if nb and nb.ref and nb.s and nb.s:match("^[%a_][%w_]*%[.+%]$") then
+        io.stderr:write("curse: `" .. nb.s .. "': not a valid identifier\n"); sh.status = 1; return
+      end
+    end
     if rb and rb.ro then -- readonly: reject the assignment (status 1); fatal in `sh -c`
       io.stderr:write("curse: " .. st.name .. ": readonly variable\n") -- or posix mode; a plain script keeps going.
       sh.status = 1; if sh.opt_c or sh.opt_posix then error({ __curse_exit = 1 }) end; return
