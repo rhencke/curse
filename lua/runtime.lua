@@ -1072,42 +1072,6 @@ function M.regex_match(s, ere, icase)
   ffi.C.regfree(regbuf)
   return rc == 0
 end
--- Extended-glob matcher for patterns containing `!(...)` negation, which POSIX
--- ERE can't express. Splits the pattern at the FIRST top-level `!(list)` and
--- searches: `A!(list)B` matches S iff there is a split S = a·m·b where A fully
--- matches a, m matches NONE of the list's alternatives, and B matches b. Every
--- non-negated part goes through the proven glob→ERE path; nested/adjacent `!()`
--- recurse. Only invoked for patterns that actually contain `!(` (see glob_match).
-local function find_neg(pat)
-  local i, n = 1, #pat
-  while i <= n do
-    local c = pat:sub(i, i)
-    if c == "\\" then i = i + 2
-    elseif c == "[" then -- skip a bracket class (its ) / ! aren't operators)
-      local j = i + 1
-      if pat:sub(j, j) == "!" or pat:sub(j, j) == "^" then j = j + 1 end
-      if pat:sub(j, j) == "]" then j = j + 1 end
-      while j <= n and pat:sub(j, j) ~= "]" do
-        if pat:sub(j, j) == "[" and pat:sub(j + 1, j + 1):match("[:.=]") then
-          local e = pat:find("]", j + 2, true); j = e and e + 1 or j + 1
-        else j = j + 1 end
-      end
-      i = j + 1
-    elseif (c == "!" or c == "@" or c == "?" or c == "*" or c == "+") and pat:sub(i + 1, i + 1) == "(" then
-      local d, j = 1, i + 2
-      while j <= n and d > 0 do
-        local cc = pat:sub(j, j)
-        if cc == "\\" then j = j + 1
-        elseif cc == "(" then d = d + 1
-        elseif cc == ")" then d = d - 1; if d == 0 then break end end
-        j = j + 1
-      end
-      if c == "!" then return pat:sub(1, i - 1), pat:sub(i + 2, j - 1), pat:sub(j + 1) end
-      i = j + 1 -- a non-! group: ERE handles it, skip past
-    else i = i + 1 end
-  end
-  return nil
-end
 local function split_alts(s) -- top-level `|` split (paren/bracket-aware)
   local alts, depth, cur, i, n = {}, 0, {}, 1, #s
   while i <= n do
@@ -1121,22 +1085,76 @@ local function split_alts(s) -- top-level `|` split (paren/bracket-aware)
   alts[#alts + 1] = table.concat(cur)
   return alts
 end
+-- Whole-string extglob match with backtracking. Handles the extended operators
+-- `@()/?()/*()/+()/!()` at ANY nesting depth (POSIX ERE can't express `!()`
+-- negation, and a `!()` nested inside another group needs a real matcher, not the
+-- ERE conversion) — literals / `*` / `?` / `[…]` are matched positionally too so
+-- it composes with the operators. Used only for patterns containing `!(`; plain
+-- extglob still goes through the faster glob_to_ere path.
 function M.ext_match(str, pat, icase)
-  local before, altstr, after = find_neg(pat)
-  if not before then return M.regex_match(str, glob_to_ere(pat), icase) end -- no !(): plain ERE
-  local alts, n = split_alts(altstr), #str
-  local pre_ere = "^" .. glob_conv(before) .. "$"
-  for k = 0, n do
-    if M.regex_match(str:sub(1, k), pre_ere, icase) then -- A matches the prefix str[1..k]
-      for j = k, n do
-        local seg = str:sub(k + 1, j)
-        local excluded = false
-        for _, a in ipairs(alts) do if M.ext_match(seg, a, icase) then excluded = true; break end end
-        if not excluded and M.ext_match(str:sub(j + 1), after, icase) then return true end
+  local plen, slen = #pat, #str
+  local ceq = icase and function(a, b) return a:lower() == b:lower() end or function(a, b) return a == b end
+  -- index of the `)` closing an extglob group whose op is at `gi` (`(` at gi+1)
+  local function group_end(gi)
+    local d, j = 1, gi + 2
+    while j <= plen do
+      local cc = pat:sub(j, j)
+      if cc == "\\" then j = j + 2
+      elseif cc == "(" then d = d + 1; j = j + 1
+      elseif cc == ")" then d = d - 1; if d == 0 then return j end; j = j + 1
+      else j = j + 1 end
+    end
+    return j
+  end
+  local m -- does pat[pi..] match str[si..slen] EXACTLY?
+  m = function(si, pi)
+    if pi > plen then return si > slen end
+    local c, nc = pat:sub(pi, pi), pat:sub(pi + 1, pi + 1)
+    if EXTOP[c] and nc == "(" then
+      local ge = group_end(pi)
+      local alts = split_alts(pat:sub(pi + 2, ge - 1))
+      local rest = ge + 1
+      local function altfull(seg) for _, a in ipairs(alts) do if M.ext_match(seg, a, icase) then return true end end return false end
+      if c == "@" then
+        for j = si - 1, slen do if altfull(str:sub(si, j)) and m(j + 1, rest) then return true end end
+      elseif c == "?" then
+        if m(si, rest) then return true end
+        for j = si, slen do if altfull(str:sub(si, j)) and m(j + 1, rest) then return true end end
+      elseif c == "!" then
+        for j = si - 1, slen do if not altfull(str:sub(si, j)) and m(j + 1, rest) then return true end end
+      else -- `*` (zero or more) or `+` (one or more)
+        local function rep(pos, count)
+          if (c == "*" or count >= 1) and m(pos, rest) then return true end
+          for j = pos, slen do if altfull(str:sub(pos, j)) and rep(j + 1, count + 1) then return true end end
+          return false
+        end
+        return rep(si, 0)
       end
+      return false
+    elseif c == "\\" then
+      return si <= slen and ceq(str:sub(si, si), nc) and m(si + 1, pi + 2)
+    elseif c == "*" then
+      for j = si - 1, slen do if m(j + 1, pi + 1) then return true end end
+      return false
+    elseif c == "?" then
+      return si <= slen and m(si + 1, pi + 1)
+    elseif c == "[" then
+      local j = pi + 1
+      if pat:sub(j, j) == "!" or pat:sub(j, j) == "^" then j = j + 1 end
+      if pat:sub(j, j) == "]" then j = j + 1 end
+      while j <= plen and pat:sub(j, j) ~= "]" do j = j + 1 end
+      if pat:sub(j, j) ~= "]" then -- unclosed `[` is a literal `[`
+        return si <= slen and str:sub(si, si) == "[" and m(si + 1, pi + 1)
+      end
+      if si <= slen and M.regex_match(str:sub(si, si), "^" .. glob_conv(pat:sub(pi, j)) .. "$", icase) then
+        return m(si + 1, j + 1)
+      end
+      return false
+    else
+      return si <= slen and ceq(str:sub(si, si), c) and m(si + 1, pi + 1)
     end
   end
-  return false
+  return m(1, 1)
 end
 -- Count capturing groups `(…)` in a POSIX ERE (= regex_t.re_nsub) so BASH_REMATCH
 -- reports one slot per group even when the matched alternative skipped some. A `(`
