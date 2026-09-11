@@ -3515,6 +3515,12 @@ local function exec_stmt(sh, st, hook)
       if k <= #args then
         local rest = { unpack(args, k) }
         if argv0 then rest[0] = argv0 end -- (argv[0] override best-effort)
+        if st.assigns then -- prefix bindings become the exec'd command's environment (bash)
+          for _, a in ipairs(st.assigns) do
+            if a.raw then sh:set_str(a.name, a.raw); C.setenv(a.name, a.raw, 1)
+            else exec_stmt(sh, a, hook); if not a.index then C.setenv(a.name, sh:get(a.name), 1) end end
+          end
+        end
         exec_simple(sh, rest, hook)
         io.flush(); os.exit(sh.status or 0)
       else
