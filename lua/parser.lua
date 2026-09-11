@@ -1433,22 +1433,29 @@ local function make_parser(src, sh)
         if src:sub(i, i) == "\n" then line = line + 1; i = i + 1 -- continuation inside [[ ]]
         elseif i > n or src:sub(i, i + 1) == "]]" then if src:sub(i, i + 1) == "]]" then i = i + 2 end; break
         elseif toks[#toks] == "=~" then
-          -- the =~ operand is ONE regex word: raw text up to unquoted whitespace at
-          -- bracket/paren depth 0 (so `(a  b)` / `[a b]` keep their inner spaces).
-          local rs, depth = i, 0
+          -- the =~ operand is ONE regex word. TWO nesting counters, because bash
+          -- treats `()` and `[]` differently here: a `( … )` group SHIELDS inner
+          -- spaces (`([a b])` stays whole) but a `[ … ]` bracket class does NOT —
+          -- bash splits `[[ a =~ [a b] ]]` at the space into two words (a syntax
+          -- error). Yet a `]]` INSIDE a bracket class is not the terminator, so
+          -- `[[:space:]]` reads whole. So: `pd` (parens) gates space/`)` breaks;
+          -- `depth` (parens+brackets) gates the `]]` terminator. Operator metachars
+          -- `;` `&` `<` `>` end the operand outside any group (`|` does not — it is
+          -- an ordinary regex char).
+          local rs, pd, depth = i, 0, 0
           while i <= n do
-            -- a `)` at depth 0 ends the operand: it closes an enclosing `[[ ( … )`
-            -- group (or, unbalanced, is a syntax error) — bash never takes it as a
-            -- literal regex char. A balanced `(…)` or escaped `\)` stays in-operand.
-            if depth == 0 and (src:sub(i, i + 1) == "]]" or src:sub(i, i) == "\n"
-                or src:sub(i, i) == " " or src:sub(i, i) == "\t" or src:sub(i, i) == ")") then break end
-            local ch = src:sub(i, i)
-            if ch == "\\" then i = i + 2
-            elseif ch == "'" then i = i + 1; while i <= n and src:sub(i, i) ~= "'" do i = i + 1 end; i = i + 1
-            elseif ch == '"' then i = i + 1
+            local c0 = src:sub(i, i)
+            if depth == 0 and src:sub(i, i + 1) == "]]" then break end
+            if pd == 0 and (c0 == "\n" or c0 == " " or c0 == "\t" or c0 == ")") then break end
+            if pd == 0 and depth == 0 and (c0 == ";" or c0 == "&" or c0 == "<" or c0 == ">") then break end
+            if c0 == "\\" then i = i + 2
+            elseif c0 == "'" then i = i + 1; while i <= n and src:sub(i, i) ~= "'" do i = i + 1 end; i = i + 1
+            elseif c0 == '"' then i = i + 1
               while i <= n and src:sub(i, i) ~= '"' do i = i + (src:sub(i, i) == "\\" and 2 or 1) end; i = i + 1
-            elseif ch == "(" or ch == "[" then depth = depth + 1; i = i + 1
-            elseif (ch == ")" or ch == "]") and depth > 0 then depth = depth - 1; i = i + 1
+            elseif c0 == "(" then pd = pd + 1; depth = depth + 1; i = i + 1
+            elseif c0 == ")" then if pd > 0 then pd = pd - 1 end; if depth > 0 then depth = depth - 1 end; i = i + 1
+            elseif c0 == "[" then depth = depth + 1; i = i + 1
+            elseif c0 == "]" then if depth > 0 then depth = depth - 1 end; i = i + 1
             else i = i + 1 end
           end
           toks[#toks + 1] = src:sub(rs, i - 1); quoted[#toks] = false
