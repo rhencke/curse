@@ -204,6 +204,12 @@ ffi.cdef [[
   int posix_spawn_file_actions_destroy(void *fa);
   int posix_spawn_file_actions_adddup2(void *fa, int fd, int newfd);
   int posix_spawn_file_actions_addclose(void *fa, int fd);
+  int posix_spawnattr_init(void *attr);
+  int posix_spawnattr_destroy(void *attr);
+  int posix_spawnattr_setflags(void *attr, short flags);
+  int posix_spawnattr_setsigmask(void *attr, const void *sigmask);
+  int sigemptyset(void *set);
+  int sigprocmask(int how, const void *set, void *oldset);
   int waitpid(int pid, int *wstatus, int options);
   int pipe(int fildes[2]);
   int close(int fd);
@@ -232,6 +238,14 @@ end
 -- failed execvp would, then run it through our own interpreter and _exit. fd 1
 -- must already point where the script's stdout should go. Never returns.
 function Shell:exec_script_child(path, args, n)
+  -- This forked child inherited the parent's blocked signal mask (set while a
+  -- trap is active). Reset to empty so the child is interruptible, and drop the
+  -- trap table so it doesn't poll for signals it no longer handles.
+  if self.sigtraps and next(self.sigtraps) then
+    local set = ffi.new("uint8_t[1024]"); C.sigemptyset(set)
+    C.sigprocmask(2, set, nil) -- SIG_SETMASK
+    self.sigtraps = nil
+  end
   local f = io.open(path, "r"); local src = f and f:read("*a") or ""; if f then f:close() end
   self.params, self.nparams, self.argv0, self.traps, self.out = {}, 0, args[1], {}, io.write
   for k = 2, n do self.nparams = self.nparams + 1; self.params[self.nparams] = args[k] end
@@ -245,6 +259,25 @@ function Shell:run_noexec(path, args, n)
   local pid = C.fork()
   if pid == 0 then self:exec_script_child(path, args, n) end
   local st = ffi.new("int[1]"); C.waitpid(pid, st, 0); self.status = M.wexit(st[0])
+end
+
+-- When signal traps are active the shell BLOCKS the trapped signals (so it can
+-- poll them at safepoints instead of running Lua from an async handler). A
+-- posix_spawn child inherits that blocked mask, which would make a foreground
+-- external command uninterruptible by the very signal the user trapped (e.g.
+-- Ctrl-C during `sleep 100`). Reset the child's mask to empty — like a bash
+-- child — via a spawnattr with SETSIGMASK. Returns the attr (kept alive by the
+-- caller until after the spawn, then destroyed) or nil when no trap is active.
+local SPAWN_SETSIGMASK = 0x08 -- POSIX_SPAWN_SETSIGMASK (glibc)
+local function child_spawnattr(self)
+  if not (self.sigtraps and next(self.sigtraps)) then return nil end
+  local attr = ffi.new("uint8_t[1024]") -- opaque posix_spawnattr_t; over-allocate
+  if C.posix_spawnattr_init(attr) ~= 0 then return nil end
+  local set = ffi.new("uint8_t[1024]") -- copied into attr by setsigmask; needn't outlive it
+  C.sigemptyset(set)
+  C.posix_spawnattr_setsigmask(attr, set)
+  C.posix_spawnattr_setflags(attr, SPAWN_SETSIGMASK)
+  return attr
 end
 
 function Shell:exec(...)
@@ -271,7 +304,9 @@ function Shell:exec(...)
   if self.out == io.write then
     io.flush() -- our own buffered stdout must reach fd 1 before the child writes
     local pidp = ffi.new("curse_pid_t[1]")
-    local rc = C.posix_spawnp(pidp, execpath, nil, nil, ffi.cast("char *const *", argv), C.environ)
+    local attr = child_spawnattr(self)
+    local rc = C.posix_spawnp(pidp, execpath, nil, attr, ffi.cast("char *const *", argv), C.environ)
+    if attr then C.posix_spawnattr_destroy(attr) end
     if rc == 8 then return self:run_noexec(execpath, args, n) end -- no shebang: run as a script
     if rc ~= 0 then
       self:errmsg("curse: " .. tostring(args[1]) .. (rc == 2 and ": command not found\n" or ": Permission denied\n"))
@@ -289,7 +324,9 @@ function Shell:exec(...)
   C.posix_spawn_file_actions_adddup2(fa, wfd, 1)
   C.posix_spawn_file_actions_addclose(fa, rfd)
   local pidp = ffi.new("curse_pid_t[1]")
-  local rc = C.posix_spawnp(pidp, execpath, fa, nil, ffi.cast("char *const *", argv), C.environ)
+  local attr = child_spawnattr(self)
+  local rc = C.posix_spawnp(pidp, execpath, fa, attr, ffi.cast("char *const *", argv), C.environ)
+  if attr then C.posix_spawnattr_destroy(attr) end
   C.posix_spawn_file_actions_destroy(fa)
   local pid = pidp[0]
   if rc == 8 then -- ENOEXEC: no-shebang script — run it through our interpreter in a
