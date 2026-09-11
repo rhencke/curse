@@ -1694,9 +1694,19 @@ local function exec_simple(sh, args, hook, no_func)
   elseif cmd == ":" or cmd == "true" then sh.status = 0
   elseif cmd == "false" then sh.status = 1
   elseif cmd == "break" then -- outside a loop: a no-op (bash), not a fatal unwind
-    sh.status = 0; if (sh.loopdepth or 0) > 0 then error({ __curse_break = tonumber(args[2]) or 1 }) end
+    if args[2] and not tonumber(args[2]) then -- non-numeric arg: error 128, still breaks one level
+      io.stderr:write("curse: break: " .. args[2] .. ": numeric argument required\n")
+      sh.status = 128; if (sh.loopdepth or 0) > 0 then error({ __curse_break = 1 }) end
+    else
+      sh.status = 0; if (sh.loopdepth or 0) > 0 then error({ __curse_break = tonumber(args[2]) or 1 }) end
+    end
   elseif cmd == "continue" then
-    sh.status = 0; if (sh.loopdepth or 0) > 0 then error({ __curse_continue = tonumber(args[2]) or 1 }) end
+    if args[2] and not tonumber(args[2]) then
+      io.stderr:write("curse: continue: " .. args[2] .. ": numeric argument required\n")
+      sh.status = 128; if (sh.loopdepth or 0) > 0 then error({ __curse_continue = 1 }) end
+    else
+      sh.status = 0; if (sh.loopdepth or 0) > 0 then error({ __curse_continue = tonumber(args[2]) or 1 }) end
+    end
   elseif cmd == "eval" then
     -- eval [--]: join args, parse, run in the CURRENT shell (return/exit propagate).
     if args[2] and args[2] ~= "-" and args[2] ~= "--" and args[2]:sub(1, 1) == "-" then
