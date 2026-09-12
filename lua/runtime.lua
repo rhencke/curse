@@ -997,12 +997,14 @@ local regbuf = ffi.new("char[512]") -- opaque regex_t (glibc ~64B; over-allocate
 -- [!..] -> [^..]); regex-special chars elsewhere are escaped.
 -- Split `body` on top-level `|` (respecting nested parens) — extglob arms.
 local function split_arms(body)
-  local arms, depth, start = {}, 0, 1
-  for k = 1, #body do
+  local arms, depth, start, k, n = {}, 0, 1, 1, #body
+  while k <= n do
     local ch = body:sub(k, k)
-    if ch == "(" then depth = depth + 1
-    elseif ch == ")" then depth = depth - 1
-    elseif ch == "|" and depth == 0 then arms[#arms + 1] = body:sub(start, k - 1); start = k + 1 end
+    if ch == "\\" then k = k + 2 -- a `\|` (quoted/escaped bar) is literal, not a separator
+    elseif ch == "(" then depth = depth + 1; k = k + 1
+    elseif ch == ")" then depth = depth - 1; k = k + 1
+    elseif ch == "|" and depth == 0 then arms[#arms + 1] = body:sub(start, k - 1); start = k + 1; k = k + 1
+    else k = k + 1 end
   end
   arms[#arms + 1] = body:sub(start)
   return arms

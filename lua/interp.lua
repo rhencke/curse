@@ -1278,7 +1278,8 @@ local function expand_to_fields(sh, w)
   end
   local noglob = sh.opt_f -- set -f: pathname expansion disabled; globs stay literal
   local GLOBSPECIAL = { ["*"] = 1, ["?"] = 1, ["["] = 1, ["]"] = 1, ["\\"] = 1,
-    ["+"] = 1, ["@"] = 1, ["!"] = 1, ["("] = 1, [")"] = 1 }
+    ["+"] = 1, ["@"] = 1, ["!"] = 1, ["("] = 1, [")"] = 1, ["|"] = 1 } -- `|` protects a
+    -- quoted/escaped extglob alternation bar (`@(a|'b|c')`) from split_arms
   -- is there a glob metacharacter at a NON-masked (glob-active) position?
   local function glob_active(f)
     local s, q = f.s, f.q
