@@ -550,6 +550,22 @@ local function i64_to_str(n)
 end
 M.i64_to_str = i64_to_str
 
+-- Indexed-array KEYS. LuaJIT's LUA_NUMBER is a double, so a Lua-number key loses
+-- precision above 2^53 (distinct huge int64 indices would collide). Key by a plain
+-- NUMBER in the exact-double range (the common, fast case — numeric hashing, no
+-- string churn) and by the canonical decimal STRING only beyond it (exact). The
+-- two key spaces never overlap (t[5] vs t["5"] differ), and a given index always
+-- maps to the same key, so writes and reads agree.
+local I64_EXACT = 0x20000000000000LL -- 2^53
+local function to_arr_key(v) -- v: int64 -> number|string key
+  if v >= -I64_EXACT and v <= I64_EXACT then return tonumber(v) end
+  return i64_to_str(v)
+end
+local function key_i64(k) -- either key form -> int64 (for compare/arith)
+  return type(k) == "string" and str_to_i64(k) or i64(k)
+end
+M.to_arr_key, M.key_i64 = to_arr_key, key_i64
+
 -- Dynamic special variables (only when not explicitly set). Many spec cases just
 -- check these "look like" a PID/uid/path, so exact values rarely matter.
 ffi.cdef [[
@@ -802,7 +818,7 @@ end
 -- ---- indexed arrays ----
 -- Stored in the var box as b.arr = { [0]=…, [1]=… } (0-based, may be sparse, to
 -- match bash). A plain scalar has no b.arr; reading $a is ${a[0]}.
-local function arr_max(arr) local m = -1; for k in pairs(arr) do if k > m then m = k end end; return m end
+local function arr_max(arr) local m = i64(-1); for k in pairs(arr) do local ki = key_i64(k); if ki > m then m = ki end end; return m end
 
 -- `declare -A name`: mark as associative (string keys, insertion-order iteration —
 -- note: real bash iterates in hash order; insertion order matches the common cases).
@@ -826,7 +842,8 @@ end
 -- the last element). Assoc keys (strings) are used as-is.
 local function norm_key(b, key)
   if type(key) == "number" and key < 0 and not (b and b.assoc) then
-    return (b and b.arr and arr_max(b.arr) or -1) + 1 + key
+    local mx = (b and b.arr) and arr_max(b.arr) or i64(-1) -- int64 highest index
+    return to_arr_key(mx + 1 + key) -- resolve from end, then re-key (number|string)
   end
   return key
 end
@@ -932,7 +949,8 @@ function Shell:array_indices(name)
     return t
   end
   if b and b.arr then
-    local t = {}; for k in pairs(b.arr) do t[#t + 1] = k end; table.sort(t); return t
+    local t = {}; for k in pairs(b.arr) do t[#t + 1] = k end
+    table.sort(t, function(a, z) return key_i64(a) < key_i64(z) end); return t -- int64 order (mixed number/string keys)
   end
   if b and (b.s ~= nil or b.n ~= nil) then return { 0 } end
   return {}

@@ -182,7 +182,7 @@ local function fmt_set_var(name, b)
     for k in pairs(b.arr) do idx[#idx + 1] = k end
     table.sort(idx, function(x, y) return tonumber(x) < tonumber(y) end)
     local parts = {}
-    for _, i in ipairs(idx) do parts[#parts + 1] = ('[%d]="%s"'):format(tonumber(i), tostring(b.arr[i]):gsub('"', '\\"')) end
+    for _, i in ipairs(idx) do parts[#parts + 1] = ('[%s]="%s"'):format(rt.i64_to_str(rt.key_i64(i)), tostring(b.arr[i]):gsub('"', '\\"')) end
     return ("%s=(%s)"):format(name, table.concat(parts, " "))
   else
     return name .. "=" .. sq(b.s ~= nil and b.s or (b.n ~= nil and rt.i64_to_str(b.n) or ""))
@@ -716,7 +716,7 @@ arith_key = function(sh, name, idxexpr, idxraw)
     io.stderr:write("curse: " .. (idxraw or "") .. ": syntax error in expression\n")
     error({ __curse_exit = 1, __curse_matherr = true, __curse_experr = true })
   end
-  return tonumber(rt.i64_to_str(eval(sh, idxexpr)))
+  return rt.to_arr_key(eval(sh, idxexpr))
 end
 
 
@@ -727,7 +727,7 @@ array_key = function(sh, name, index_raw)
   -- indexed: expand $()/$vars in the subscript, then evaluate it as arithmetic
   local ex = expand_word(sh, P.parse_word(index_raw))
   if ex == "" then return 0 end
-  local ok, v = pcall(function() return tonumber(rt.i64_to_str(eval(sh, P.arith(ex)))) end)
+  local ok, v = pcall(function() return rt.to_arr_key(eval(sh, P.arith(ex))) end)
   return (ok and v) or 0
 end
 
