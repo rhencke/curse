@@ -559,7 +559,46 @@ end
 -- Command substitution `$(...)`: run the inner program capturing stdout, with
 -- trailing newlines stripped (bash). Interpreted (it's I/O-bound, not hot), so
 -- it handles builtins, externals, and (in interp mode) functions uniformly.
+-- `$(…)` runs IN-PROCESS by default (fast: no fork, shared state). bash runs it in
+-- a forked subshell, which matters ONLY when the body needs a distinct process
+-- identity — `$BASHPID`. Detect that (a cheap substring check) and fork just those,
+-- via CoW (the child already holds all state), so the common `$(cmd)` stays
+-- in-process and only `$(… $BASHPID …)` pays a fork — like the subshell path.
+function Shell:capture_forked(src)
+  local P = require("parser"); local I = require("interp")
+  local ast = P.parse(src, self)
+  io.flush()
+  local pfd = ffi.new("int[2]")
+  if C.pipe(pfd) ~= 0 then return nil end -- caller falls back to in-process
+  local pid = C.fork()
+  if pid == 0 then
+    C.close(pfd[0]); C.dup2(pfd[1], 1); C.close(pfd[1])
+    self.out = io.write
+    self.in_subprogram = (self.in_subprogram or 0) + 1
+    local ok, err = pcall(I.exec_list, self, ast.stmts, function() end, true)
+    if not ok and type(err) == "table" and (err.__curse_exit or err.__curse_return) then
+      self.status = err.__curse_exit or err.__curse_return
+    end
+    io.flush(); C._exit(self.status or 0)
+  end
+  C.close(pfd[1])
+  local chunks, rbuf = {}, ffi.new("char[8192]")
+  while true do
+    local nr = tonumber(C.read(pfd[0], rbuf, 8192))
+    if not nr or nr <= 0 then break end
+    chunks[#chunks + 1] = ffi.string(rbuf, nr)
+  end
+  C.close(pfd[0])
+  local stbuf = ffi.new("int[1]"); C.waitpid(pid, stbuf, 0)
+  self.status = M.wexit(stbuf[0])
+  return (table.concat(chunks):gsub("%z", ""):gsub("\n+$", ""))
+end
 function Shell:capture_src(src)
+  -- Fork only when the body needs a real subshell pid ($BASHPID); else in-process.
+  if src:find("BASHPID", 1, true) then
+    local out = self:capture_forked(src)
+    if out ~= nil then return out end
+  end
   local P = require("parser")
   local I = require("interp")
   local ast = P.parse(src, self) -- self: $()/`` expand aliases from the live table

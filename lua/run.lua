@@ -171,8 +171,21 @@ local MODES = { tiered = true, compiled = true, interp = true, cached = true }
 local mode, pstart = "tiered", ai + 1
 if arg[ai + 1] and MODES[arg[ai + 1]] then mode = arg[ai + 1]; pstart = ai + 2 end
 -- A missing/unreadable script is exit 127 (bash), not a Lua assert crash.
-do local sf = io.open(script, "r"); if sf then sf:close() else
-  io.stderr:write("curse: " .. script .. ": No such file or directory\n"); io.flush(); os.exit(127) end end
+do local sf = io.open(script, "r")
+  if sf then
+    -- A NUL byte in the FIRST line makes bash treat the file as a binary and refuse
+    -- it ("cannot execute binary file", 126); a NUL on a later line runs fine. Read a
+    -- raw chunk (read("*l") stops AT a NUL, so it can't see one) and look before \n.
+    local head = sf:read(8192) or ""; sf:close()
+    local nl = head:find("\n", 1, true)
+    local first = nl and head:sub(1, nl - 1) or head
+    if first:find("\0", 1, true) then
+      io.stderr:write("curse: " .. script .. ": cannot execute binary file\n"); io.flush(); os.exit(126)
+    end
+  else
+    io.stderr:write("curse: " .. script .. ": No such file or directory\n"); io.flush(); os.exit(127)
+  end
+end
 local function setparams(s) for k = pstart, #arg do s.nparams = s.nparams + 1; s.params[s.nparams] = arg[k] end end
 if mode == "cached" then
   -- persistent artifact cache: warm hit skips parse+emit; cold compiles+stores;

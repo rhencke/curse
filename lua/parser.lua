@@ -1954,6 +1954,15 @@ local function make_parser(src, sh)
       local two = src:sub(i, i + 1)
       if two == "&&" or two == "||" then
         i = i + 2
+        -- `&&`/`||` at end of a line CONTINUE to the next line (bash), so skip any
+        -- newlines / blank lines / comments before the right-hand pipeline.
+        while true do
+          ws()
+          local c = src:sub(i, i)
+          if c == "\n" then line = line + 1; i = i + 1
+          elseif c == "#" then while i <= n and src:sub(i, i) ~= "\n" do i = i + 1 end
+          else break end
+        end
         items = items or { { op = nil, cmd = head } }
         items[#items + 1] = { op = two, cmd = parse_pipeline() }
       elseif src:sub(i, i) == "&" and src:sub(i + 1, i + 1) ~= "&" then
