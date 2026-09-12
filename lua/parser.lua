@@ -1774,6 +1774,25 @@ local function make_parser(src, sh)
       end
     end
 
+    -- At command position, `NAME[` with an UNCLOSED `[` is a syntax error in bash
+    -- ("unexpected EOF looking for matching `]'") — it began an array-assignment LHS
+    -- that never closed (try_assign already consumed real `NAME[..]=` assignments
+    -- and closed `NAME[..]` commands are left to fall through to the word/glob path).
+    do
+      local bs = src:match("^[%a_][%w_]*()%[", i) -- offset of `[` if the word is NAME[
+      if bs then
+        local depth, j = 0, bs
+        while j <= n do
+          local ch = src:sub(j, j)
+          if ch == "[" then depth = depth + 1
+          elseif ch == "]" then depth = depth - 1; if depth == 0 then break end
+          elseif depth >= 1 and ch:match("[\n;&|]") then break end -- terminator before `]`
+          j = j + 1
+        end
+        if depth ~= 0 then error("syntax error near `" .. (src:sub(i):match("^%S+") or "[") .. "'") end
+      end
+    end
+
     -- a keyword that only closes/continues a compound command, reaching command
     -- position on its own (or a bare `}`), is a misplaced-token syntax error.
     do
