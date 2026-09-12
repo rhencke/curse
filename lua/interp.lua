@@ -1004,7 +1004,19 @@ indirect_part = function(sh, pe)
     if pe.name:match("^%d+$") then tname = sh:param(tonumber(pe.name)) -- ${!1}: positional
     else tname = (b and b.ref and b.s) or sh:get(pe.name) end
   end
-  if tname == nil or tname == "" then return nil end
+  if tname == nil or tname == "" then
+    -- bash 5.2: an indirect whose ref BASE VAR is UNSET (`${!undef}`, `${!a[@]OP}`
+    -- with a unset) is an "invalid indirect expansion" — status 1, non-fatal (fatal
+    -- under set -u, where the unset ref also trips nounset). A SET ref that merely
+    -- resolves to empty (an assoc's empty scalar, `${!A@a}`) expands to empty, and a
+    -- positional ref (`${!1}`) that is unset stays empty, as bash does.
+    if pe.name and pe.name:match("^%d+$") then return nil end
+    local bb = pe.name and sh.vars[pe.name]
+    if bb and (bb.s ~= nil or bb.n ~= nil or bb.arr ~= nil) then return nil end
+    io.stderr:write("curse: " .. (pe.name or "") .. ": invalid indirect expansion\n")
+    if sh.opt_u then error({ __curse_exit = sh.opt_c and 127 or 1, __curse_lineabort = sh.opt_i or nil }) end
+    error({ __curse_exit = 1, __curse_experr = true })
+  end
   -- ${!ref} to a special parameter: $?, $$, $!, $#, $-, $N, $@, $*
   if not pe.iop then
     if tname:match("^%d+$") then return { param = tonumber(tname) } end
