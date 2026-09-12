@@ -2820,10 +2820,19 @@ local function exec_simple(sh, args, hook, no_func)
     local plusx, gflag, unexport = false, false, false
     local funcnames, funcbody, iattr, lattr, uattr, rattr, aattr = false, false, false, false, false, false, false
     local rest = {}
+    -- Valid attribute letters per command; any other letter is an invalid option
+    -- (bash: status 2, or 1 for `local`). export/readonly accept a narrower set.
+    local VALID = (cmd == "export" or cmd == "readonly") and "afnpA" or "aAfFgilnprtuxI"
+    local opterr, endopts = nil, false
     for j = 2, #args do
       local a = args[j]
-      if a == "--" then -- end of flags
-      elseif a:sub(1, 1) == "-" and #a > 1 then
+      if a == "--" then endopts = true -- end of flags
+      elseif not endopts and a:sub(1, 1) == "-" and #a > 1 then
+        for ci = 2, #a do
+          local ch = a:sub(ci, ci)
+          if not VALID:find(ch, 1, true) then opterr = ch; break end
+        end
+        if opterr then break end
         if a:find("A") then assoc = true end
         if a:find("p") then printmode = true end
         if a:find("x") then doexport = true end
@@ -2837,10 +2846,14 @@ local function exec_simple(sh, args, hook, no_func)
         if a:find("r") then rattr = true end
         if a:find("a") then aattr = true end
         if a:find("g") then gflag = true end
-      elseif a:sub(1, 1) == "+" and #a > 1 then
+      elseif not endopts and a:sub(1, 1) == "+" and #a > 1 then
         if a:find("n") then plusn = true end
         if a:find("x") then plusx = true end -- +x: drop the export attribute
       else rest[#rest + 1] = a end
+    end
+    if opterr then -- an unknown attribute letter: bash prints usage and fails (status 2)
+      io.stderr:write("curse: " .. cmd .. ": -" .. opterr .. ": invalid option\n")
+      sh.status = 2; return
     end
     -- listing a subset of variables (bare `declare`/`export`/`readonly`, or with
     -- -p and no names): the builtin + attribute flags select which vars to print.
