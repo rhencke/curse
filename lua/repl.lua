@@ -85,8 +85,10 @@ function M.run(sh)
       -- keep reading this logical command on the next line (PS2)
     else
       if buf:match("%S") then
-        sh.history = sh.history or {}; sh.history[#sh.history + 1] = buf -- for `history`/`fc`
-        if RL and istty then RL.add_history(buf) end
+        if sh.opt_history ~= false then -- `set +o history` stops recording (bash), not execution
+          sh.history = sh.history or {}; sh.history[#sh.history + 1] = buf -- for `history`/`fc`
+          if RL and istty then RL.add_history(buf) end
+        end
         local ok, err = pcall(interp.run_lazy, sh, buf)
         if not ok and type(err) == "table" and err.__curse_exit then
           io.flush(); break -- `exit` in the REPL
