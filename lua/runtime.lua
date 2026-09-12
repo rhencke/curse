@@ -1130,15 +1130,22 @@ local function strip_suffix(val, glob, longest)
   return val
 end
 local function substr(val, off, len)
+  -- ${v:off:len} slices by CHARACTER (codepoint) in the locale, like bash — offset
+  -- and length count codepoints, not bytes (byte-equivalent under LC_ALL=C).
+  local chars = M.mb_chars(val)
+  local n = #chars
   local o = tonumber(off) or 0
-  if o < 0 then o = #val + o end
+  if o < 0 then o = n + o end
   if o < 0 then o = 0 end
-  local s = val:sub(o + 1)
+  local last = n
   if len and len ~= "" then
     local l = tonumber(len) or 0
-    if l < 0 then s = s:sub(1, #s + l) else s = s:sub(1, l) end
+    last = (l < 0) and (n + l) or (o + l)
   end
-  return s
+  if last > n then last = n end
+  local out = {}
+  for k = o + 1, last do out[#out + 1] = chars[k].s end
+  return table.concat(out)
 end
 
 -- ---- real regex via libc POSIX regcomp/regexec (for case globs, =~, and
