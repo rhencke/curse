@@ -80,6 +80,10 @@ function Shell.new()
   sh:import_env()
   if sh.vars["OPTIND"] == nil then sh:set_str("OPTIND", "1") end -- bash: OPTIND starts at 1
   if sh.vars["HOSTNAME"] == nil then sh:set_str("HOSTNAME", M.hostname()) end
+  -- curse identifies as bash (see shellname/basename); advertise a version so
+  -- feature-detection (`test -n "$BASH_VERSION"`, `[[ $BASH_VERSION == 5* ]]`)
+  -- works. A normal var: scripts can reassign or `unset` it (bash).
+  if sh.vars["BASH_VERSION"] == nil then sh:set_str("BASH_VERSION", "5.2.0(1)-release") end
   return sh
 end
 
