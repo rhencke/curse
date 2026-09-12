@@ -87,6 +87,8 @@ function M.run(sh)
       if buf:match("%S") then
         if sh.opt_history ~= false then -- `set +o history` stops recording (bash), not execution
           sh.history = sh.history or {}; sh.history[#sh.history + 1] = buf -- for `history`/`fc`
+          local hsz = tonumber(sh:get("HISTSIZE")) -- bash trims to HISTSIZE on each add
+          if hsz and hsz >= 0 then while #sh.history > hsz do table.remove(sh.history, 1) end end
           if RL and istty then RL.add_history(buf) end
         end
         local ok, err = pcall(interp.run_lazy, sh, buf)
@@ -101,7 +103,9 @@ function M.run(sh)
     end
   end
   if histfile then -- write the session's history back to an explicit $HISTFILE
-    local f = io.open(histfile, "w")
+    -- `shopt -s histappend` appends the session's list to the file; otherwise it
+    -- overwrites (bash). (HISTSIZE has already trimmed the in-memory list.)
+    local f = io.open(histfile, (sh.shopt and sh.shopt.histappend) and "a" or "w")
     if f then for _, h in ipairs(sh.history or {}) do f:write(h, "\n") end; f:close() end
   elseif RL and istty then
     pcall(function() RL.write_history((os.getenv("HOME") or ".") .. "/.curse_history") end)
