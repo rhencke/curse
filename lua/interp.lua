@@ -4292,18 +4292,35 @@ exec_stmt = function(sh, st, hook)
     -- DEBUG fires (at the `for` line) before the init, before EACH condition
     -- evaluation, and before EACH step — bash's `[6][6][7]…` per-iteration pattern.
     local function fdbg() run_debug(sh, (sh.in_trap and sh.in_trap > 0) and sh.cur_line or st.line) end
-    if st.init then fdbg(); eval(sh, st.init) end
+    -- A slot whose arith failed to parse (`i='3'`) was deferred: bash reports the
+    -- error at RUNTIME and runs the loop zero (or partial) iterations, non-fatally.
+    local function ev(node)
+      if node.k == "arith_perr" then
+        io.stderr:write("curse: " .. (node.raw:match("^%s*(.-)%s*$")) .. ": syntax error in expression\n")
+        error({ __curse_exit = 1, __curse_experr = true })
+      end
+      return eval(sh, node)
+    end
     local bodystatus = 0 -- a loop's status is its last body command's (0 if none)
     sh.loopdepth = (sh.loopdepth or 0) + 1
-    while true do
-      hook("loop", st.id)
-      if st.cond then fdbg(); if not truth(eval(sh, st.cond)) then break end end
-      local act = run_loop_body(sh, st.body, hook); bodystatus = sh.status
-      if act == "break" then break end
-      if st.step then fdbg(); eval(sh, st.step) end -- continue still runs the step
-    end
+    local cok, cerr = pcall(function()
+      if st.init then fdbg(); ev(st.init) end
+      while true do
+        hook("loop", st.id)
+        if st.cond then fdbg(); if not truth(ev(st.cond)) then break end end
+        local act = run_loop_body(sh, st.body, hook); bodystatus = sh.status
+        if act == "break" then break end
+        if st.step then fdbg(); ev(st.step) end -- continue still runs the step
+      end
+    end)
     sh.loopdepth = sh.loopdepth - 1
-    sh.status = bodystatus
+    if not cok then
+      if type(cerr) == "table" and cerr.__curse_experr then
+        sh.status = 1; if sh.opt_e then error({ __curse_exit = 1 }) end
+      else error(cerr) end
+    else
+      sh.status = bodystatus
+    end
   elseif t == "whilec" then
     local bodystatus = 0
     sh.loopdepth = (sh.loopdepth or 0) + 1

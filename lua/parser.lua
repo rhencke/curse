@@ -28,6 +28,13 @@ local function arith(src, nodefer)
   -- Also defer a `$` followed by a non-name char (`$*`, `$@`, `$?`, `$$`, `$-`…):
   -- the arith grammar handles $name/$digit/${..} natively but not these specials,
   -- so word-expand first (`$*` -> the joined params) then re-parse.
+  -- bash IGNORES a `$` that immediately prefixes a quote inside arithmetic (the
+  -- locale/ANSI-C quote prefix has no meaning there): `$"3"` -> `"3"` (a strippable
+  -- pair below), `$'3'` -> `'3'` (single quotes kept -> the tokenizer errors, as
+  -- bash does). Only when the expression has no ${…}/$(…)/`…` to expand as a whole.
+  if not (src:find("%${") or src:find("%$%(") or src:find("`")) then
+    src = src:gsub("%$([\"'])", "%1")
+  end
   if not nodefer and (src:find("%${") or src:find("%$%(") or src:find("`")
       or src:find("[%w_]%$") or src:find("%$[^%w_{]")) then
     return { k = "xpand", raw = src }
@@ -1355,10 +1362,18 @@ local function make_parser(src, sh)
         skipsep()
         if peekword() == "do" then i = i + 2 end
         local body_stmts = parse_stmts({ done = true })
+        -- Parse each arith slot eagerly, but a SYNTAX ERROR in a slot (`i='3'`,
+        -- `++'i'`) is deferred to runtime — bash reports such an error when the loop
+        -- executes and runs zero iterations non-fatally, rather than failing to parse
+        -- the whole script (same rule as `$((…))`). A clean parse is unchanged.
+        local function parith(s)
+          if not s:match("%S") then return nil end
+          local ok, ast = pcall(arith, s)
+          if ok then return ast end
+          return { k = "arith_perr", raw = s }
+        end
         return { t = "forc", id = id, line = ln,
-          init = a:match("%S") and arith(a) or nil,
-          cond = b:match("%S") and arith(b) or nil,
-          step = c:match("%S") and arith(c) or nil,
+          init = parith(a), cond = parith(b), step = parith(c),
           body = body_stmts, redirs = tail_redirs() }
       end
       -- for NAME in WORDS. Capture NAME as a whole token (not just a valid
