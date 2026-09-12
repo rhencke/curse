@@ -3971,8 +3971,13 @@ exec_stmt = function(sh, st, hook)
       end
     end
     if rb and rb.ro then -- readonly: reject the assignment (status 1); fatal in `sh -c`
-      io.stderr:write("curse: " .. st.name .. ": readonly variable\n") -- or posix mode; a plain script keeps going.
-      sh.status = 1; if sh.opt_c or sh.opt_posix then error({ __curse_exit = 1 }) end; return
+      io.stderr:write("curse: " .. st.name .. ": readonly variable\n") -- or posix mode.
+      sh.status = 1; if sh.opt_c or sh.opt_posix then error({ __curse_exit = 1 }) end
+      -- A readonly command PREFIX (`abc=def echo one`) is non-fatal: bash still runs
+      -- the command. But a STANDALONE readonly assignment (`readonly x=1; x=2; echo
+      -- hi`) aborts the REST of the line, then the next line runs.
+      if sh.applying_prefix then return end
+      error({ __curse_exit = 1, __curse_lineabort = true })
     else
     -- A bad substitution / invalid indirect in the RHS fails the assignment but is
     -- NON-fatal (bash: `x=${bad|y}` leaves x unset, status 1, script continues) —
@@ -4214,7 +4219,8 @@ exec_stmt = function(sh, st, hook)
         end
       end
       for _, a in ipairs(st.assigns) do
-        if a.raw then sh:set_str(a.name, a.raw) else exec_stmt(sh, a, hook) end
+        if a.raw then sh:set_str(a.name, a.raw)
+        else sh.applying_prefix = true; exec_stmt(sh, a, hook); sh.applying_prefix = nil end
         if not a.index then -- a scalar command prefix stays exported (bash)
           local b = sh.vars[sh:deref(a.name)]; if b then b.exported = true end
           C.setenv(a.name, sh:get(a.name), 1)
@@ -4240,7 +4246,7 @@ exec_stmt = function(sh, st, hook)
         if a.raw then -- NAME=(…) as a command prefix is a literal string, not an array (bash)
           sh:set_str(a.name, a.raw); C.setenv(a.name, a.raw, 1)
         else
-          exec_stmt(sh, a, hook)
+          sh.applying_prefix = true; exec_stmt(sh, a, hook); sh.applying_prefix = nil
           -- An array-element prefix (`b[0]=2 cmd`) is a temporary assignment but is
           -- NOT put in the command's environment (bash), unlike a scalar `x=v cmd`.
           if not a.index then C.setenv(a.name, sh:get(a.name), 1) end
