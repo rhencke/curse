@@ -2985,6 +2985,7 @@ local function exec_simple(sh, args, hook, no_func)
   elseif cmd == "compgen" then
     -- compgen [-A action|-f|-d|-c|…] [-W wl] [-F func] [-P pre] [-S suf] [-X filt] [word]
     local actions, wordlist, prefix, bad, cpre, csuf, xfilter, funcname = {}, nil, nil, false, "", "", nil, nil
+    local cmdname = nil
     local VALID = { ["function"] = 1, alias = 1, builtin = 1, keyword = 1, variable = 1,
       command = 1, file = 1, directory = 1, setopt = 1, shopt = 1, arrayvar = 1,
       export = 1, helptopic = 1, user = 1, hostname = 1, group = 1, job = 1, service = 1,
@@ -3000,7 +3001,8 @@ local function exec_simple(sh, args, hook, no_func)
       elseif a == "-S" then csuf = args[j + 1] or ""; j = j + 2
       elseif a == "-X" then xfilter = args[j + 1]; j = j + 2
       elseif a == "-F" then funcname = args[j + 1]; j = j + 2
-      elseif a == "-G" or a == "-C" or a == "-o" then j = j + 2 -- take+ignore
+      elseif a == "-C" then cmdname = args[j + 1]; j = j + 2
+      elseif a == "-G" or a == "-o" then j = j + 2 -- take+ignore
       elseif a:match("^-[fdcabkvegujs]+$") then for ch in a:sub(2):gmatch(".") do actions[#actions + 1] = SHORT[ch] end; j = j + 1
       elseif a:sub(1, 1) == "-" and #a > 1 then j = j + 1
       else if prefix == nil then prefix = a end; j = j + 1 end -- the word is the first operand
@@ -3009,7 +3011,13 @@ local function exec_simple(sh, args, hook, no_func)
     else
       local out, seen, werr = {}, {}, false
       local function emit(x) if (not prefix or x:sub(1, #prefix) == prefix) and not seen[x] then seen[x] = true; out[#out + 1] = x end end
-      if funcname then
+      if cmdname then
+        -- -C CMD: run the completion command; each line of its stdout is a candidate
+        -- (verbatim — not prefix-filtered, like -F; -X/-P/-S still post-process).
+        sh:set_str("COMP_LINE", prefix or ""); sh:set_str("COMP_POINT", tostring(#(prefix or "")))
+        local ok, res = pcall(function() return sh:capture_src(cmdname) end)
+        if ok and res then for line in (res .. "\n"):gmatch("(.-)\n") do if line ~= "" then out[#out + 1] = line end end end
+      elseif funcname then
         -- -F NAME: set the completion context vars bash exposes, call the function,
         -- and take its COMPREPLY verbatim. bash does NOT prefix-filter -F results —
         -- the function itself is responsible for that; only -X/-P/-S post-process.
