@@ -52,10 +52,20 @@ end
 local M = {}
 function M.run(sh)
   interactive = istty or (sh and sh.opt_i) or false -- prompts print for `-i` even off a tty
+  -- Persist $HISTFILE across the session (load now, write at exit) — but only when
+  -- it was EXPLICITLY set (env/script), never the ~/.bash_history default, so a
+  -- piped `-i` run never clobbers the user's real history. On a real tty, readline
+  -- also loads its editing history from the same file.
+  local histfile = sh:get("HISTFILE")
+  if histfile == "" or sh.histfile_default then histfile = nil end
+  if histfile then
+    sh.history = sh.history or {}
+    local f = io.open(histfile, "r")
+    if f then for line in f:lines() do sh.history[#sh.history + 1] = line end; f:close() end
+  end
   if RL and istty then
     RL.using_history()
-    local hist = os.getenv("HISTFILE") or ((os.getenv("HOME") or ".") .. "/.curse_history")
-    pcall(function() RL.read_history(hist) end)
+    pcall(function() RL.read_history(histfile or os.getenv("HISTFILE") or ((os.getenv("HOME") or ".") .. "/.curse_history")) end)
   end
   local buf = ""
   while true do
@@ -88,9 +98,11 @@ function M.run(sh)
       buf = ""
     end
   end
-  if RL and istty then
-    local hist = os.getenv("HISTFILE") or ((os.getenv("HOME") or ".") .. "/.curse_history")
-    pcall(function() RL.write_history(hist) end)
+  if histfile then -- write the session's history back to an explicit $HISTFILE
+    local f = io.open(histfile, "w")
+    if f then for _, h in ipairs(sh.history or {}) do f:write(h, "\n") end; f:close() end
+  elseif RL and istty then
+    pcall(function() RL.write_history((os.getenv("HOME") or ".") .. "/.curse_history") end)
   end
 end
 
