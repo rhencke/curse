@@ -38,7 +38,17 @@ os.execute("mkdir -p " .. TMP)
 -- $SH must be a SINGLE command for tests that use it quoted (`"$SH" -c …`), like
 -- Oils' single-binary shells. curse is `luajit run.lua`, so wrap it in a tiny
 -- exec script and hand tests that path.
-local SH = TMP .. "/curse"
+--
+-- We NAME that wrapper after the shell curse is impersonating (`bash`). Oils'
+-- suite branches per shell via `case $SH in …`; the glob arms (`*bash|*osh`)
+-- key off $SH ENDING in the shell name, so a wrapper at `…/bash` takes bash's
+-- branch — the correct branch for a bash-compatible shell — instead of falling
+-- to `*)`. The harness still INVOKES curse explicitly (curse_cmd, below), so
+-- $SH is only the identity string test code sees; `"$SH" -c …` runs this
+-- wrapper (= curse) and a hardcoded `bash` in a test body still runs real bash.
+-- (Point SHNAME at "dash"/"sh" to run the suite as those shells later.)
+local SHNAME = "bash"
+local SH = TMP .. "/" .. SHNAME
 do
   local f = io.open(SH, "w")
   f:write("#!/bin/sh\nexport CURSE_BUNDLE=" .. BUNDLE .. "\nexec " .. LUAJIT .. " " .. RUNLUA .. ' "$@"\n')
