@@ -1827,6 +1827,9 @@ local function sh_printf(fmt, argv, start)
             local arg = nextarg()
             local epoch = (arg == "" or arg == "-1") and os.time() or (tonumber(arg) or os.time())
             local sres = os.date(tfmt, epoch) or ""
+            -- bash formats into a fixed 128-byte buffer; a result that doesn't fit
+            -- yields the empty string (see spec's strftime-truncation case).
+            if #sres >= 128 then sres = "" end
             if prec then sres = sres:sub(1, tonumber(prec)) end
             out[#out + 1] = string.format("%" .. (spec:sub(2)) .. width .. "s", sres)
             i = j + 1
