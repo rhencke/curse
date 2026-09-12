@@ -1222,7 +1222,16 @@ local function expand_to_fields(sh, w)
         -- elements survive under a non-whitespace IFS (`=$@=` on empty params gives
         -- `= '' '' '' =`) and an empty middle element becomes an empty field. With
         -- IFS='' there is no splitting, so keep the per-element model (empty drops).
-        if ifs == "" then
+        local pe = p.pexp
+        if star and pe and (pe.op == "prefix" or pe.op == "indices") then
+          -- The INDIRECT `${!pfx*}` / `${!a[*]}` `*` forms join into ONE string
+          -- BEFORE word-splitting even under IFS='' (unlike `$*`/`${a[*]}`, which
+          -- stay per-element there). Join with IFS[0]; when IFS is empty the prefix
+          -- form concatenates but the KEYS form falls back to a space (bug #627).
+          local sep = sh.vars["IFS"] and sh:get("IFS"):sub(1, 1) or " "
+          if sep == "" and pe.op == "indices" then sep = " " end
+          feed_split(table.concat(els, sep))
+        elseif ifs == "" then
           for k = 1, #els do if k > 1 then brk() end; feed_split(els[k]) end
         else
           feed_split(table.concat(els, ifs:sub(1, 1)))
