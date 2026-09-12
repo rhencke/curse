@@ -246,6 +246,8 @@ ffi.cdef [[
   typedef int curse_rl_cmd(int, int);
   curse_rl_cmd *rl_named_function(const char *);
   char **rl_invoking_keyseqs(curse_rl_cmd *);
+  int rl_parse_and_bind(char *);
+  int rl_bind_keyseq(const char *, curse_rl_cmd *);
   extern void *rl_outstream;
   void *fopen(const char *, const char *);
   int fclose(void *);
@@ -2252,12 +2254,36 @@ local function exec_simple(sh, args, hook, no_func)
     end
     sh.status = 0
   elseif cmd == "bind" then
-    -- readline introspection via FFI (same library bash links -> identical
-    -- output, no tty needed). Editing/keybinding subcommands (-x/-X/-m/-r/-u/-f)
-    -- need shell-command-binding state we don't keep, and are accepted as no-ops.
-    local a = args[2]
+    -- readline introspection + binding via FFI (same library bash links ->
+    -- identical output, no tty needed). Shell-command bindings (-x/-X) are kept
+    -- curse-side, per keymap, in bash's `"keyseq": "cmd"` format.
+    local j = 2
+    local keymap = "emacs" -- -m KEYMAP selects the keymap for -x/-X (default emacs)
+    if args[j] == "-m" then keymap = args[j + 1] or keymap; j = j + 2 end
+    local a = args[j]
     local function emit(lines) if lines then for _, l in ipairs(lines) do sh:echo(l) end end end
-    if a == "-l" then
+    if a == "-x" then -- bind a key sequence to a shell command: -x '"KEYSEQ": CMD'
+      local seq, command = (args[j + 1] or ""):match('^%s*"(.-)"%s*:%s*(.*)$')
+      if seq then
+        sh.bind_x = sh.bind_x or {}; sh.bind_x[keymap] = sh.bind_x[keymap] or {}
+        local km = sh.bind_x[keymap]
+        for _, e in ipairs(km) do if e.seq == seq then e.cmd = command; seq = nil; break end end
+        if seq then km[#km + 1] = { seq = seq, cmd = command } end
+      end
+      sh.status = 0
+    elseif a == "-X" then -- list shell-command bindings for the keymap
+      local km = sh.bind_x and sh.bind_x[keymap]
+      if km then for _, e in ipairs(km) do sh:echo('"' .. e.seq .. '": "' .. e.cmd .. '"') end end
+      sh.status = 0
+    elseif a == "-r" then -- remove the binding for a key sequence
+      local seq = args[j + 1]
+      if seq then
+        local km = sh.bind_x and sh.bind_x[keymap]
+        if km then for i = #km, 1, -1 do if km[i].seq == seq then table.remove(km, i) end end end
+        local rl = rl_lib(); if rl then pcall(rl.rl_bind_keyseq, seq, nil) end -- readline binding
+      end
+      sh.status = 0
+    elseif a == "-l" then
       local rl = rl_lib()
       if rl then local names = rl.rl_funmap_names(); local i = 0
         while names[i] ~= nil do sh:echo(ffi.string(names[i])); i = i + 1 end end
@@ -2284,8 +2310,12 @@ local function exec_simple(sh, args, hook, no_func)
           sh:echo(name .. " can be invoked via " .. table.concat(parts, ", ") .. "."); sh.status = 0
         end
       end
+    elseif a and a:sub(1, 1) ~= "-" then -- a bare inputrc line: `'"KEYSEQ": function'`
+      local rl = rl_lib()
+      if rl then local buf = ffi.new("char[?]", #a + 1, a); pcall(rl.rl_parse_and_bind, buf) end
+      sh.status = 0
     else
-      sh.status = 0 -- -x/-X/-m/-r/-u/-f and bare `bind`: accept (no-op)
+      sh.status = 0 -- -u/-f and other accepted-but-unimplemented forms: no-op
     end
   elseif cmd == "jobs" then
     -- jobs [-p|-l|-r]: list active background jobs (one line each). Refresh done
