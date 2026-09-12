@@ -988,6 +988,7 @@ local function arr_max(arr) local m = i64(-1); for k in pairs(arr) do local ki =
 -- note: real bash iterates in hash order; insertion order matches the common cases).
 function Shell:declare_assoc(name)
   local b = box(self:deref(name), self.vars); b.assoc = true; b.arr = b.arr or {}; b.order = b.order or {}
+  if b.s ~= nil then b.arr["0"] = b.s; b.order[#b.order + 1] = "0" end -- a scalar becomes [0] (bash)
   b.s = nil; b.n = nil
 end
 function Shell:is_assoc(name) local b = self.vars[self:deref(name)]; return b and b.assoc end
