@@ -1868,55 +1868,58 @@ local function make_parser(src, sh)
   -- interpreter simply never asks for it if an earlier `exit` fired. (Nested
   -- lists — function bodies, loops — stay strict: a broken body IS a real error.)
   local done = false
-  local queue, qi = {}, 0 -- statements from a heredoc-bearing line, drained in order
-  local function next_toplevel()
-    if qi < #queue then qi = qi + 1; return queue[qi] end
-    if done then return nil end
+  -- Skip within-LINE whitespace: spaces/tabs and `\<newline>` line continuations
+  -- (which bash removes at the lexer level, so they EXTEND the logical line), but
+  -- NOT a real newline — that ends the line.
+  local function skip_inline()
     while true do
-      skipblank()
-      if i > n then done = true; return nil end
-      -- a control operator in command position (bare/leading/doubled `;`, `&`, `|`)
-      -- is a syntax error in bash (status 2) — not installer payload, so report it.
-      local bs = bare_sep_tok()
-      if bs then done = true; return { t = "parse_error", line = line, msg = "syntax error near `" .. bs .. "'" } end
-      local start, startline = i, line
-      local ok, st = pcall(parse_stmt)
-      if not ok then done = true; return { t = "parse_error", line = startline, msg = tostring(st) } end
-      -- Lazy mode executes each statement before parsing the next, but a heredoc's
-      -- body follows the whole LINE's newline. So if this statement opened one,
-      -- parse the rest of the physical line's `;`-separated statements first, then
-      -- collect every body in order — and hand them back one at a time.
-      if ok and #heredocs_pending > 0 then
-        local stmts = { st }
-        while true do
-          while i <= n and src:sub(i, i):match("[ \t;]") do i = i + 1 end
-          if i > n or src:sub(i, i) == "\n" then break end
-          local ok2, st2 = pcall(parse_stmt)
-          if not ok2 or st2 == nil then break end
-          stmts[#stmts + 1] = st2
-        end
-        collect_heredocs() -- now at the newline: reads all pending bodies in order
-        queue, qi = stmts, 1
-        return stmts[1]
-      end
-      -- No progress: parse_stmt neither advanced nor threw — a stray metacharacter
-      -- or keyword in command position (`)`, `}`, `done`, `fi`, `var=)` leaves a
-      -- `)`, …). bash reports this as a syntax error (status 2); defer it as a
-      -- parse_error node (reached only if no earlier `exit` fired, matching bash),
-      -- which also guards the lazy loop against spinning forever.
-      if i <= start then
-        done = true
-        local tok = peekword() or src:sub(i, i)
-        return { t = "parse_error", line = line, msg = "syntax error near `" .. tok .. "'" }
-      end
-      -- consume this statement's single trailing `;`, so the next call lands on a
-      -- real command position and a following separator reads as bare (error).
-      ws()
-      if st ~= nil and src:sub(i, i) == ";" and src:sub(i + 1, i + 1) ~= ";" then i = i + 1 end
-      if st ~= nil then return st end
+      local c = src:sub(i, i)
+      if c == " " or c == "\t" then i = i + 1
+      elseif c == "\\" and src:sub(i + 1, i + 1) == "\n" then i = i + 2; line = line + 1
+      else break end
     end
   end
-  return next_toplevel
+  -- Yield one LOGICAL LINE at a time: a complete `simple_list` — all the
+  -- `;`/`&`/`&&`/`||`-joined and-or lists up to a top-level newline or EOF, as
+  -- bash's `inputunit` does. Returns { stmts = {…}, perr = <parse_error>? } or nil.
+  -- A `perr` means a syntax error was hit somewhere on the line, so the WHOLE line
+  -- runs nothing (bash parses the entire line before executing any of it). The
+  -- parser stays statement-lazy (parse_stmt consumes complete multi-line compounds
+  -- and each stmt makes progress or errors), so there is no parse-ahead spin.
+  local function next_line()
+    if done then return nil end
+    skipblank() -- blank lines, comments, and pending heredocs
+    if i > n then done = true; return nil end
+    local bs = bare_sep_tok() -- a leading control op (`;`, `&`, `||`, …) is an error
+    if bs then done = true; return { stmts = {}, perr = { t = "parse_error", line = line, msg = "syntax error near `" .. bs .. "'" } } end
+    local stmts = {}
+    while true do
+      local start, startline = i, line
+      local ok, st = pcall(parse_stmt)
+      if not ok then return { stmts = stmts, perr = { t = "parse_error", line = startline, msg = tostring(st) } } end
+      -- No progress: a stray metacharacter/keyword in command position (`)`, `}`,
+      -- `done`, `fi`, …). Report a syntax error (and guard against spinning).
+      if i <= start then
+        local tok = peekword() or src:sub(i, i)
+        return { stmts = stmts, perr = { t = "parse_error", line = line, msg = "syntax error near `" .. tok .. "'" } }
+      end
+      stmts[#stmts + 1] = st
+      skip_inline()
+      if st.t ~= "background" then
+        -- foreground: a single `;` continues the line; anything else ends it
+        if src:sub(i, i) == ";" and src:sub(i + 1, i + 1) ~= ";" then i = i + 1; skip_inline()
+        else break end
+      end -- background: the `&` already separated this statement; another may follow
+      if i > n then break end
+      local c = src:sub(i, i)
+      if c == "\n" or c == "#" then break end -- end of the logical line
+      local bs2 = bare_sep_tok() -- `;;`, `&&`, `||` etc. with no command before them
+      if bs2 then return { stmts = stmts, perr = { t = "parse_error", line = line, msg = "syntax error near `" .. bs2 .. "'" } } end
+    end
+    if #heredocs_pending > 0 then collect_heredocs() end -- read bodies after the line
+    return { stmts = stmts }
+  end
+  return next_line
 end
 
 -- Eager full parse -> { stmts } (used by the compiler, which needs the whole
@@ -1924,10 +1927,15 @@ end
 -- expansion consult the live runtime table (for eval/source/$() at runtime); the
 -- compiler passes none, so it tracks aliases deterministically from source.
 function M.parse(src, sh)
-  local nextf = make_parser(src, sh)
-  local stmts = {}
-  while true do local s = nextf(); if not s then break end; stmts[#stmts + 1] = s end
-  return { stmts = stmts }
+  local nextf = make_parser(src, sh) -- yields logical-line groups { stmts, perr }
+  local stmts, lines = {}, {}
+  while true do
+    local lg = nextf(); if not lg then break end
+    lines[#lines + 1] = lg
+    for _, st in ipairs(lg.stmts) do stmts[#stmts + 1] = st end
+    if lg.perr then stmts[#stmts + 1] = lg.perr end -- flatten for eager callers/compiler
+  end
+  return { stmts = stmts, lines = lines }
 end
 
 -- Lazy/incremental parse: returns an iterator yielding one top-level statement

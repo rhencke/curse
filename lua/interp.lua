@@ -1961,12 +1961,20 @@ local function exec_simple(sh, args, hook, no_func)
         local ok, err = pcall(function()
           local nextf = P.open(code, sh)
           while true do
-            local st = nextf()
-            if st == nil then break end
-            if st.t == "parse_error" then
+            local lg = nextf()
+            if lg == nil then break end
+            if lg.perr then -- syntax error on the line: run nothing on it (bash), status 2
               io.stderr:write("curse: eval: syntax error\n"); sh.status = 2; return
             end
-            exec_list(sh, { st }, hook, false) -- one stmt (errexit + signal delivery included)
+            for _, st in ipairs(lg.stmts) do
+              local sok, serr = pcall(exec_list, sh, { st }, hook, false) -- errexit + signals incl.
+              if not sok then
+                if type(serr) == "table" and serr.__curse_lineabort then
+                  if sh.opt_e then error(serr) end
+                  sh.status = 1; break -- div0/failglob: abort the rest of this line
+                else error(serr) end
+              end
+            end
           end
         end)
         if not ok then error(err) end -- control-flow (exit/return/…) or a real error
@@ -2012,10 +2020,18 @@ local function exec_simple(sh, args, hook, no_func)
           local rok, err = pcall(function()
             local nextf = P.open(src, sh)
             while true do
-              local st = nextf()
-              if st == nil then break end
-              if st.t == "parse_error" then error({ __curse_parseerr = true }) end
-              exec_list(sh, { st }, hook, false)
+              local lg = nextf()
+              if lg == nil then break end
+              if lg.perr then error({ __curse_parseerr = true }) end -- syntax error: source returns 2
+              for _, st in ipairs(lg.stmts) do
+                local sok, serr = pcall(exec_list, sh, { st }, hook, false)
+                if not sok then
+                  if type(serr) == "table" and serr.__curse_lineabort then
+                    if sh.opt_e then error(serr) end
+                    sh.status = 1; break
+                  else error(serr) end
+                end
+              end
             end
           end)
           sh.sourcedepth = sh.sourcedepth - 1
@@ -4468,30 +4484,24 @@ function M.run_lazy(sh, src, hook)
   hook = hook or function() end
   local nextf = P.open(src, sh) -- sh: alias expansion uses the live alias table
   finish(sh, pcall(function()
-    local k, skip_to = 0, nil
+    local k = 0
     while true do
-      local st = nextf()
-      if st == nil then break end
-      -- bash's read-parse-execute unit is the whole LINE, so a fatal expansion in a
-      -- WORD context — divide-by-zero in $((…)), a `failglob` no-match — aborts the
-      -- REST of the current input line and resumes at the next line with $?=1.
-      -- Fast-forward past statements that began on that same line, keeping the lazy
-      -- statement parser (no lookahead, so no hang). `;` is thus NOT equivalent to a
-      -- newline here. (A `(( … ))` COMMAND-context div0 is non-fatal and handled by
-      -- the arithcmd path, so it never reaches here.)
-      if skip_to and st.line and st.line <= skip_to then
-        -- swallowed: same line as the aborting error
-      else
-        skip_to = nil
+      local lg = nextf()
+      if lg == nil then break end
+      -- bash parses a whole LOGICAL LINE (a `simple_list` up to a top-level newline)
+      -- before executing any of it, so a syntax error ANYWHERE on the line means the
+      -- line runs nothing (retroactive). Handle that first.
+      if lg.perr then exec_stmt(sh, lg.perr, hook) end -- raises __curse_exit=2 (bash exits)
+      for _, st in ipairs(lg.stmts) do
         k = k + 1
         hook("stmt", k)
         local ok, err = pcall(exec_stmt, sh, st, hook)
         if not ok then
+          -- a fatal WORD-context expansion (div0 in $((…)), failglob no-match) aborts
+          -- the REST of this line; under `set -e` it exits the shell like any failure
           if type(err) == "table" and err.__curse_lineabort then
-            -- under `set -e` a failed expansion exits the shell (like any failed
-            -- command); otherwise fast-forward past the rest of the current line
             if sh.opt_e then error(err) end
-            sh.status = 1; skip_to = st.line or 0
+            sh.status = 1; break
           else error(err) end
         else
           if errexit_stmt(sh, st) then fire_err(sh) end
