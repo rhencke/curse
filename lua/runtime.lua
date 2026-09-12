@@ -387,6 +387,14 @@ function M.coll_lt(a, b)
   if c ~= 0 then return c < 0 end
   return a < b
 end
+-- bash values are C strings: a NUL byte terminates them. Truncate at the first NUL
+-- wherever a byte string becomes a variable value or an argv entry (assignment,
+-- fields/argv, for-lists). I/O streams (echo/printf output, pipes) keep raw NULs —
+-- those never pass through this. Fast no-op when there is no NUL (the common case).
+function M.cstr(s)
+  local z = s:find("\0", 1, true)
+  return z and s:sub(1, z - 1) or s
+end
 
 -- Decode a waitpid status word into a bash exit code: 128+signum when killed by
 -- a signal, else the WEXITSTATUS byte. (Shared by Shell:exec, wait, subshell,
@@ -880,6 +888,7 @@ local LOCALE_VARS = { LANG = 1, LC_ALL = 1, LC_CTYPE = 1, LC_NUMERIC = 1,
 M.LOCALE_VARS = LOCALE_VARS
 
 function Shell:set_str(name, s)
+  if s:find("\0", 1, true) then s = M.cstr(s) end -- bash vars are C strings: cut at NUL
   local dn = self:deref(name)
   local b = box(dn, self.vars)
   b.s = s; b.n = nil
@@ -981,6 +990,7 @@ local function norm_key(b, key)
   return key
 end
 function Shell:array_set(name, key, val, append)
+  if val:find("\0", 1, true) then val = M.cstr(val) end -- C-string element: cut at NUL
   local b = box(self:deref(name), self.vars)
   if not b.arr then b.arr = {}; if b.s then b.arr[0] = b.s end; b.s = nil; b.n = nil end
   key = norm_key(b, key)

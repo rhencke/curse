@@ -3918,10 +3918,10 @@ local function expand_args(sh, st, args, is_assign)
   for wi, w in ipairs(st.words) do
     local p1 = w.parts[1]
     if wi > 1 and is_assign and p1 and p1.lit and p1.lit:match("^[%a_][%w_]*%+?=") then
-      args[#args + 1] = expand_assign_word(sh, w, true) -- name=value word: no glob, ~ after =/:
+      args[#args + 1] = rt.cstr(expand_assign_word(sh, w, true)) -- name=value word: no glob, ~ after =/:
     else
       local fs = expand_to_fields(sh, w)
-      for k = 1, #fs do args[#args + 1] = fs[k] end
+      for k = 1, #fs do args[#args + 1] = rt.cstr(fs[k]) end -- argv entries are C strings: cut at NUL
     end
   end
 end
