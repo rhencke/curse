@@ -1321,8 +1321,10 @@ local function make_parser(src, sh)
           step = c:match("%S") and arith(c) or nil,
           body = body_stmts, redirs = tail_redirs() }
       end
-      -- for NAME in WORDS
-      local s, e = src:find("^[%a_][%w_]*", i)
+      -- for NAME in WORDS. Capture NAME as a whole token (not just a valid
+      -- identifier): bash accepts `for i.j`/`for -` at PARSE time and reports the
+      -- invalid name as a non-fatal RUNTIME error (status 1), so the interp checks.
+      local s, e = src:find("^[^%s;#()]+", i)
       if not s then error("subset: for needs a name or ((") end
       local name = src:sub(s, e); i = e + 1
       -- bash allows blank lines / comments between the loop var and `in` (but a
