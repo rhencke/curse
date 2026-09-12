@@ -1256,8 +1256,12 @@ local function expand_to_fields(sh, w)
   -- GLOBIGNORE (set & non-null): filter matches by its `:`-separated patterns and
   -- enable dotglob (leading-dot names then match); `.`/`..` are always excluded.
   local gi = sh:get("GLOBIGNORE")
-  local giset = sh.vars[sh:deref("GLOBIGNORE")] ~= nil and gi ~= ""
-  local dotglob = giset or (sh.shopt.dotglob and true)
+  -- The dotglob + `.`/`..`-exclusion SIDE EFFECT triggers when GLOBIGNORE merely
+  -- EXISTS (bash: `GLOBIGNORE=` empty still enables it — only `unset` reverts);
+  -- the pattern FILTERING needs it non-empty.
+  local gi_exists = sh.vars[sh:deref("GLOBIGNORE")] ~= nil
+  local giset = gi_exists and gi ~= ""
+  local dotglob = gi_exists or (sh.shopt.dotglob and true)
   local nullglob = sh.shopt.nullglob and true
   local gipats
   if giset then -- split on ':' but NOT inside [...] (a `[[:alnum:]]` class holds colons)
