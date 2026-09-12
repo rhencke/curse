@@ -1775,21 +1775,38 @@ end
 -- escape metacharacters/whitespace; $'…' when control chars are present).
 local function printf_q(s)
   if s == "" then return "''" end
-  if s:match("^[%w_@%%%+%-%./,:=^]+$") then return s end
-  if s:find("[%z\1-\31\127-\255]") then -- control OR high byte -> $'…' (octal for bytes)
+  -- Decode per the locale (bash does the same, with invalid-UTF-8 error recovery):
+  -- $'…' is used only when a CONTROL/non-printable/bad char is present; a printable
+  -- multibyte char (μ) is kept RAW, not octal-escaped.
+  local chars = rt.mb_chars(s)
+  local needc = false
+  for _, ch in ipairs(chars) do
+    if not ch.wc or ch.wc < 32 or ch.wc == 127 or rt.iswprint(ch.wc) == 0 then needc = true; break end
+  end
+  if needc then
     local out = { "$'" }
-    for k = 1, #s do
-      local ch, b = s:sub(k, k), s:byte(k)
-      if ch == "\n" then out[#out + 1] = "\\n"
-      elseif ch == "\t" then out[#out + 1] = "\\t"
-      elseif ch == "\r" then out[#out + 1] = "\\r"
-      elseif b < 32 or b >= 127 then out[#out + 1] = string.format("\\%03o", b)
-      elseif ch == "'" then out[#out + 1] = "\\'"
-      elseif ch == "\\" then out[#out + 1] = "\\\\"
-      else out[#out + 1] = ch end
+    for _, ch in ipairs(chars) do
+      if ch.wc and ch.wc >= 32 and ch.wc ~= 127 and rt.iswprint(ch.wc) ~= 0 then
+        if ch.s == "'" then out[#out + 1] = "\\'"
+        elseif ch.s == "\\" then out[#out + 1] = "\\\\"
+        else out[#out + 1] = ch.s end -- printable codepoint kept raw
+      else
+        for i = 1, #ch.s do
+          local ch2, b = ch.s:sub(i, i), ch.s:byte(i)
+          if ch2 == "\n" then out[#out + 1] = "\\n"
+          elseif ch2 == "\t" then out[#out + 1] = "\\t"
+          elseif ch2 == "\r" then out[#out + 1] = "\\r"
+          elseif b < 32 or b >= 127 then out[#out + 1] = string.format("\\%03o", b)
+          elseif ch2 == "'" then out[#out + 1] = "\\'"
+          elseif ch2 == "\\" then out[#out + 1] = "\\\\"
+          else out[#out + 1] = ch2 end
+        end
+      end
     end
     out[#out + 1] = "'"; return table.concat(out)
   end
+  if s:match("^[%w_@%%%+%-%./,:=^]+$") then return s end -- nothing to quote: bare
+  -- backslash-escape shell metacharacters; printable multibyte bytes are kept raw
   return (s:gsub("[%s\"'\\|&;<>()$`?*%[%]#~=!{}^]", "\\%0"))
 end
 -- Format one numeric %-conversion from a raw arg string. Returns (string, ok).

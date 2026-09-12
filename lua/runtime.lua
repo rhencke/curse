@@ -15,22 +15,41 @@ M.i64 = i64
 -- Quote a string so it re-reads as itself. A control char or high byte forces
 -- ANSI-C $'…' form (\n \t \r, \NNN octal for other bytes), like bash's ${x@Q}
 -- and `set`/`declare` output; otherwise plain single-quoting.
+-- Quote a string the way bash's ${x@Q} / printf %q do. A PRINTABLE string (even
+-- with multibyte chars) uses a plain single-quote; only a control/non-printable
+-- byte forces the $'…' form, and inside it printable codepoints stay raw (per the
+-- locale via iswprint) while control/bad bytes are escaped. Byte-identical to bash.
 function M.shell_quote(s)
-  if s:find("[%z\1-\31\127-\255]") then
-    local out = { "$'" }
-    for i = 1, #s do
-      local b = s:byte(i)
-      if b == 10 then out[#out + 1] = "\\n"
-      elseif b == 9 then out[#out + 1] = "\\t"
-      elseif b == 13 then out[#out + 1] = "\\r"
-      elseif b == 92 then out[#out + 1] = "\\\\"
-      elseif b == 39 then out[#out + 1] = "\\'"
-      elseif b >= 32 and b < 127 then out[#out + 1] = string.char(b)
-      else out[#out + 1] = ("\\%03o"):format(b) end
-    end
-    out[#out + 1] = "'"; return table.concat(out)
+  if not s:find("[%z\1-\31\127-\255]") then
+    return "'" .. s:gsub("'", "'\\''") .. "'"
   end
-  return "'" .. s:gsub("'", "'\\''") .. "'"
+  -- there is a high/low byte: decide char-by-char whether $'…' is really needed
+  local chars = M.mb_chars(s)
+  local needc = false
+  for _, ch in ipairs(chars) do
+    if not ch.wc or ch.wc < 32 or ch.wc == 127 or M.iswprint(ch.wc) == 0 then needc = true; break end
+  end
+  if not needc then return "'" .. s:gsub("'", "'\\''") .. "'" end -- all printable (e.g. `'μ'`)
+  local out = { "$'" }
+  for _, ch in ipairs(chars) do
+    if ch.wc and ch.wc >= 32 and ch.wc ~= 127 and M.iswprint(ch.wc) ~= 0 then
+      if ch.s == "'" then out[#out + 1] = "\\'"
+      elseif ch.s == "\\" then out[#out + 1] = "\\\\"
+      else out[#out + 1] = ch.s end -- printable codepoint: keep the raw bytes
+    else
+      for i = 1, #ch.s do -- control char / non-printable / bad byte: escape each byte
+        local b = ch.s:byte(i)
+        if b == 10 then out[#out + 1] = "\\n"
+        elseif b == 9 then out[#out + 1] = "\\t"
+        elseif b == 13 then out[#out + 1] = "\\r"
+        elseif b == 92 then out[#out + 1] = "\\\\"
+        elseif b == 39 then out[#out + 1] = "\\'"
+        elseif b >= 32 and b < 127 then out[#out + 1] = string.char(b)
+        else out[#out + 1] = ("\\%03o"):format(b) end
+      end
+    end
+  end
+  out[#out + 1] = "'"; return table.concat(out)
 end
 
 local Shell = {}
@@ -270,6 +289,7 @@ ffi.cdef [[
   size_t wcrtomb(char *s, int wc, curse_mbstate_t *ps);
   int towupper(int wc);
   int towlower(int wc);
+  int iswprint(int wc);
   int iswctype(int wc, unsigned long desc);
   unsigned long wctype(const char *name);
   int wcwidth(int wc);
@@ -357,6 +377,7 @@ function M.wc_to_bytes(wc, orig)
 end
 M.towupper = function(wc) return tonumber(C.towupper(wc)) end
 M.towlower = function(wc) return tonumber(C.towlower(wc)) end
+M.iswprint = function(wc) return tonumber(C.iswprint(wc)) end
 
 -- Decode a waitpid status word into a bash exit code: 128+signum when killed by
 -- a signal, else the WEXITSTATUS byte. (Shared by Shell:exec, wait, subshell,
