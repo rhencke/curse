@@ -232,6 +232,53 @@ ffi.cdef [[
   int poll(struct curse_pollfd *fds, unsigned long nfds, int timeout);
 ]]
 local C = ffi.C
+
+-- GNU readline via FFI for the `bind` builtin's introspection subcommands. bash
+-- links the SAME library, so calling readline's own dumpers gives byte-identical
+-- output with no terminal — the non-interactive half of `bind` (spec/stateful has
+-- the rest). Lazy-loaded; nil if libreadline is absent (bind then degrades).
+ffi.cdef [[
+  int rl_initialize(void);
+  const char **rl_funmap_names(void);
+  void rl_variable_dumper(int);
+  void rl_function_dumper(int);
+  void rl_macro_dumper(int);
+  typedef int curse_rl_cmd(int, int);
+  curse_rl_cmd *rl_named_function(const char *);
+  char **rl_invoking_keyseqs(curse_rl_cmd *);
+  extern void *rl_outstream;
+  void *fopen(const char *, const char *);
+  int fclose(void *);
+]]
+local RL, rl_ready
+local function rl_lib()
+  if rl_ready ~= nil then return RL end
+  rl_ready = false
+  for _, nm in ipairs({ "readline", "libreadline.so.8", "libreadline.so.7", "libreadline.so" }) do
+    local ok, lib = pcall(ffi.load, nm)
+    if ok then RL = lib; break end
+  end
+  if RL then pcall(RL.rl_initialize); rl_ready = true end
+  return RL
+end
+-- Run a readline dumper with its output stream pointed at a temp file, and return
+-- the lines it wrote (nil if readline is unavailable). Restores rl_outstream.
+local function rl_capture(dumpfn)
+  local rl = rl_lib(); if not rl then return nil end
+  local tmp = os.tmpname()
+  local f = C.fopen(tmp, "w")
+  if f == nil then os.remove(tmp); return nil end
+  local save = rl.rl_outstream
+  rl.rl_outstream = f
+  pcall(dumpfn, rl)
+  rl.rl_outstream = save
+  C.fclose(f)
+  local out = {}
+  for line in io.lines(tmp) do out[#out + 1] = line end
+  os.remove(tmp)
+  return out
+end
+
 -- The standard utility PATH (`command -p`), from confstr(_CS_PATH) like bash —
 -- typically "/bin:/usr/bin". Cached; falls back if confstr is unavailable.
 local _std_path
@@ -1459,7 +1506,7 @@ local BUILTINS = {
   exec = 1, readonly = 1, umask = 1, alias = 1, unalias = 1, shopt = 1, wait = 1, trap = 1,
   mapfile = 1, readarray = 1, compgen = 1, complete = 1, compopt = 1,
   pushd = 1, popd = 1, dirs = 1, builtin = 1, kill = 1, ulimit = 1, jobs = 1,
-  history = 1, fc = 1, hash = 1, ["let"] = 1, times = 1,
+  history = 1, fc = 1, hash = 1, ["let"] = 1, times = 1, bind = 1,
 }
 M.BUILTINS = BUILTINS -- exposed so the compiled backend delegates the same set
 local KEYWORDS = {
@@ -2204,6 +2251,42 @@ local function exec_simple(sh, args, hook, no_func)
       end
     end
     sh.status = 0
+  elseif cmd == "bind" then
+    -- readline introspection via FFI (same library bash links -> identical
+    -- output, no tty needed). Editing/keybinding subcommands (-x/-X/-m/-r/-u/-f)
+    -- need shell-command-binding state we don't keep, and are accepted as no-ops.
+    local a = args[2]
+    local function emit(lines) if lines then for _, l in ipairs(lines) do sh:echo(l) end end end
+    if a == "-l" then
+      local rl = rl_lib()
+      if rl then local names = rl.rl_funmap_names(); local i = 0
+        while names[i] ~= nil do sh:echo(ffi.string(names[i])); i = i + 1 end end
+      sh.status = 0
+    elseif a == "-v" or a == "-V" then
+      emit(rl_capture(function(rl) rl.rl_variable_dumper(a == "-v" and 1 or 0) end)); sh.status = 0
+    elseif a == "-p" or a == "-P" then
+      emit(rl_capture(function(rl) rl.rl_function_dumper(a == "-p" and 1 or 0) end)); sh.status = 0
+    elseif a == "-s" or a == "-S" then
+      emit(rl_capture(function(rl) rl.rl_macro_dumper(a == "-s" and 1 or 0) end)); sh.status = 0
+    elseif a == "-q" then
+      local name = args[3]
+      local rl = rl_lib()
+      local fn = rl and name and rl.rl_named_function(name)
+      if not rl or fn == nil then
+        io.stderr:write("curse: bind: `" .. tostring(name) .. "': unknown function name\n"); sh.status = 1
+      else
+        local ks = rl.rl_invoking_keyseqs(fn)
+        if ks == nil or ks[0] == nil then
+          sh:echo(name .. " is not bound to any keys."); sh.status = 1
+        else
+          local parts, i = {}, 0
+          while ks[i] ~= nil do parts[#parts + 1] = '"' .. ffi.string(ks[i]) .. '"'; i = i + 1 end
+          sh:echo(name .. " can be invoked via " .. table.concat(parts, ", ") .. "."); sh.status = 0
+        end
+      end
+    else
+      sh.status = 0 -- -x/-X/-m/-r/-u/-f and bare `bind`: accept (no-op)
+    end
   elseif cmd == "jobs" then
     -- jobs [-p|-l|-r]: list active background jobs (one line each). Refresh done
     -- state non-blockingly first so finished jobs drop off (bash removes them).
