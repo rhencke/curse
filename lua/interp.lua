@@ -1945,6 +1945,7 @@ local function job_resolve(sh, spec)
   return nil
 end
 
+local SPECIAL_BUILTIN -- forward decl (assigned below); posix dispatch/funcdef rules
 -- xtrace (`set -x`): before running a command, write `$PS4<cmd words>` to stderr,
 -- single-quoting any word that isn't a plain token (bash). PS4's first char is
 -- repeated by call depth. Control-char / unicode quoting (bash's $'…') is a
@@ -1973,9 +1974,11 @@ local function exec_simple(sh, args, hook, no_func)
   -- an external) just drops the marker so a function it later invokes can't absorb.
   local tcb = sh.tenv_call_base; sh.tenv_call_base = nil
   -- A user function overrides a builtin of the same name (bash), so it wins here
-  -- — unless invoked via `command` (no_func) or the word is a keyword/assignment
-  -- builtin whose parse shape a function can't stand in for.
-  if cmd ~= nil and not no_func and sh.functions[cmd] then
+  -- — unless invoked via `command` (no_func), the word is a keyword/assignment
+  -- builtin a function can't stand in for, OR (posix mode) it's a SPECIAL builtin,
+  -- which is found before the function (so an `eval`/`set`/… function is bypassed).
+  if cmd ~= nil and not no_func and sh.functions[cmd]
+    and not (sh.opt_posix and SPECIAL_BUILTIN[cmd]) then
     return run_function(sh, cmd, sh.functions[cmd], args, hook, tcb)
   end
   if cmd == nil then sh.status = 0
@@ -3841,7 +3844,7 @@ local ASSIGN_CMD = { export = 1, declare = 1, typeset = 1, readonly = 1, ["local
 -- POSIX "special built-in utilities": under `set -o posix`, a prefix assignment
 -- on one of these persists in the shell (see the prefix-assignment handling).
 -- `exec` is special too but is intercepted earlier with its own env handling.
-local SPECIAL_BUILTIN = { [":"] = 1, ["."] = 1, source = 1, eval = 1, exit = 1,
+SPECIAL_BUILTIN = { [":"] = 1, ["."] = 1, source = 1, eval = 1, exit = 1,
   export = 1, readonly = 1, ["set"] = 1, shift = 1, times = 1, trap = 1, unset = 1,
   ["break"] = 1, ["continue"] = 1, ["return"] = 1 }
 -- compound commands whose trailing redirs (`done < f`, `fi > f`) apply to the
@@ -4047,6 +4050,10 @@ exec_stmt = function(sh, st, hook)
       else error(aerr) end
     end
   elseif t == "funcdef" then
+    if sh.opt_posix and SPECIAL_BUILTIN[st.name] then -- posix: can't shadow a special builtin
+      io.stderr:write("curse: `" .. st.name .. "': is a special builtin\n")
+      sh.status = 2; error({ __curse_exit = 2 }) -- fatal (bash aborts)
+    end
     sh.functions[st.name] = st.body
     sh.func_redirs = sh.func_redirs or {}; sh.func_redirs[st.name] = st.redirs -- `f(){ … } >&2`
     sh.func_src = sh.func_src or {}; sh.func_src[st.name] = st.deftext -- verbatim def for declare -f
