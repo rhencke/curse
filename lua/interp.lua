@@ -2186,11 +2186,18 @@ local function exec_simple(sh, args, hook, no_func)
     local a = args[2]
     if a == "-c" then for i = #sh.history, 1, -1 do sh.history[i] = nil end; sh.status = 0
     elseif a == "-r" or a == "-n" then -- read history from FILE (default $HISTFILE)
+      -- -r reads the whole file; -n reads only the lines NOT already read (bash
+      -- tracks a line offset so a later -n picks up commands appended since).
       local file = args[3] or sh:get("HISTFILE")
       if file and file ~= "" then
         local f = io.open(file, "r")
         if f then
-          for line in f:lines() do sh.history[#sh.history + 1] = line end; f:close(); sh.status = 0
+          local lines = {}
+          for line in f:lines() do lines[#lines + 1] = line end; f:close()
+          local from = (a == "-n") and ((sh.hist_read_lines or 0) + 1) or 1
+          for k = from, #lines do sh.history[#sh.history + 1] = lines[k] end
+          sh.hist_read_lines = #lines
+          sh.status = 0
         else -- a named history file that can't be read is an error (bash)
           io.stderr:write("curse: history: cannot read history file: " .. file .. "\n"); sh.status = 1
         end
