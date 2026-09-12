@@ -1637,7 +1637,8 @@ local function fmt_decl(sh, name)
   end
   local b = sh.vars[name]
   if b == nil then return nil end
-  if b.ref then return "declare -n " .. name .. "=" .. decl_quote(b.s or "") end
+  if b.ref then -- bash shows the export letter on a nameref as `declare -nx`
+    return "declare -n" .. (os.getenv(name) ~= nil and "x" or "") .. " " .. name .. "=" .. decl_quote(b.s or "") end
   if b.assoc then
     local parts = {}
     for _, k in ipairs(sh:array_indices(name)) do
@@ -2959,10 +2960,14 @@ local function exec_simple(sh, args, hook, no_func)
           end
           local bb = sh.vars[sh:deref(nm)]
           if roattr and bb and not nref then bb.ro = true end -- bash ignores -r when -n is given
-          -- export attribute: -n / +x clear it (keep the value), else export sets it
-          if bb then
-            if unexport or plusx then bb.exported = nil; C.unsetenv(nm)
-            elseif doexport or sh.opt_a then bb.exported = true; C.setenv(nm, sh:get(nm), 1) end
+          -- export attribute: -n / +x clear it (keep the value), else export sets it.
+          -- A nameref exports the nameref BOX itself, and its env value is the TARGET
+          -- NAME it points at (`declare -nx ref=x` -> env ref="x"), not the deref value.
+          local xb = nref and sh.vars[nm] or bb
+          local xval = nref and (xb and xb.s or "") or sh:get(nm)
+          if xb then
+            if unexport or plusx then xb.exported = nil; C.unsetenv(nm)
+            elseif doexport or sh.opt_a then xb.exported = true; C.setenv(nm, xval, 1) end
           end
         elseif a:match("^[%a_][%w_]*$") then
           if localize then sh:localVar(a) end
