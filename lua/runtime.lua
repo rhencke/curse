@@ -559,14 +559,12 @@ end
 -- Command substitution `$(...)`: run the inner program capturing stdout, with
 -- trailing newlines stripped (bash). Interpreted (it's I/O-bound, not hot), so
 -- it handles builtins, externals, and (in interp mode) functions uniformly.
--- `$(…)` runs IN-PROCESS by default (fast: no fork, shared state). bash runs it in
--- a forked subshell, which matters ONLY when the body needs a distinct process
--- identity — `$BASHPID`. Detect that (a cheap substring check) and fork just those,
--- via CoW (the child already holds all state), so the common `$(cmd)` stays
--- in-process and only `$(… $BASHPID …)` pays a fork — like the subshell path.
-function Shell:capture_forked(src)
-  local P = require("parser"); local I = require("interp")
-  local ast = P.parse(src, self)
+-- `$(…)` runs in a forked child (CoW — the child already holds all state), so it
+-- gets FULL subshell isolation for free (vars, set-flags, fds, cwd, umask, traps,
+-- functions, $BASHPID) exactly like bash — which manual in-process save/restore
+-- can't reliably do. Output is captured through a pipe, like the subshell path.
+function Shell:capture_forked(ast)
+  local I = require("interp")
   io.flush()
   local pfd = ffi.new("int[2]")
   if C.pipe(pfd) ~= 0 then return nil end -- caller falls back to in-process
@@ -593,16 +591,41 @@ function Shell:capture_forked(src)
   self.status = M.wexit(stbuf[0])
   return (table.concat(chunks):gsub("%z", ""):gsub("\n+$", ""))
 end
-function Shell:capture_src(src)
-  -- Fork only when the body needs a real subshell pid ($BASHPID); else in-process.
-  if src:find("BASHPID", 1, true) then
-    local out = self:capture_forked(src)
-    if out ~= nil then return out end
+-- A `$(…)` body is "pure" (no shell-state side effects, so safe to run in-process
+-- for speed) when every command is a plain external/non-mutating-builtin call with
+-- no assignments, no mutating builtin, no user-function call, and no control flow.
+-- Anything else forks for full isolation. (A file redirect like `>f` is fine — the
+-- write happens either way; only `exec` rewires shell fds, and it's listed here.)
+local CAPTURE_IMPURE = { cd = 1, set = 1, shopt = 1, unset = 1, export = 1,
+  declare = 1, typeset = 1, ["local"] = 1, readonly = 1, trap = 1, umask = 1,
+  exec = 1, eval = 1, source = 1, ["."] = 1, pushd = 1, popd = 1, hash = 1,
+  shift = 1, read = 1, mapfile = 1, readarray = 1, let = 1, getopts = 1,
+  ulimit = 1, disown = 1, ["return"] = 1, ["set-o"] = 1 }
+local function capture_pure(sh, st)
+  local t = st.t
+  if t == "andor" then
+    for _, it in ipairs(st.items) do if not capture_pure(sh, it.cmd) then return false end end
+    return true
+  elseif t == "pipeline" then
+    for _, c in ipairs(st.cmds) do if not capture_pure(sh, c) then return false end end
+    return true
+  elseif t == "simple" then
+    if st.assigns or st.arrayargs then return false end -- prefix/array assignment mutates
+    local w = st.words and st.words[1]
+    local lit = w and w.parts and #w.parts == 1 and w.parts[1].lit
+    if not lit then return false end -- dynamic/compound command name: be safe, fork
+    if CAPTURE_IMPURE[lit] or sh.functions[lit] then return false end
+    return true
   end
+  return false -- if/while/for/case/subshell/group/funcdef/background/arithcmd: fork
+end
+
+function Shell:capture_src(src)
   local P = require("parser")
   local I = require("interp")
   local ast = P.parse(src, self) -- self: $()/`` expand aliases from the live table
-  -- $(< file) / `< file`: bash reads the file's contents (a faster $(cat file)).
+  -- $(< file) / `< file`: bash reads the file's contents (a faster $(cat file)) —
+  -- a pure read, no isolation needed, so keep it in-process.
   if #ast.stmts == 1 then
     local st = ast.stmts[1]
     if st.t == "simple" and (not st.words or #st.words == 0)
@@ -613,6 +636,25 @@ function Shell:capture_src(src)
         return (c:gsub("%z", ""):gsub("\n+$", "")) end
       io.stderr:write("curse: " .. path .. ": No such file or directory\n"); self.status = 1; return ""
     end
+  end
+  -- Fork for full subshell isolation (bash) UNLESS the body is provably pure — a
+  -- pure body has no shell-state side effects to leak, so it runs in-process for
+  -- speed (the common `$(cmd)`/`$(echo …)` case). Fall back to in-process if the
+  -- fork/pipe itself fails.
+  -- $BASHPID reads the child's pid, so it needs a real fork even with no mutation.
+  local forkit = src:find("BASHPID", 1, true) ~= nil
+  local has_perr = false
+  for _, st in ipairs(ast.stmts) do
+    if st.t == "parse_error" then has_perr = true end
+    if not capture_pure(self, st) then forkit = true end
+  end
+  -- A SYNTAX error in the body is fatal to the CONTAINING command (bash), which the
+  -- in-process path propagates via __curse_parseerr — so never fork a parse-error
+  -- body (a forked child would only surface it as an exit status, which `echo $(…)`
+  -- would then ignore). Otherwise fork impure bodies for full isolation.
+  if forkit and not has_perr then
+    local out = self:capture_forked(ast)
+    if out ~= nil then return out end
   end
   local buf = {}
   local saved = self.out

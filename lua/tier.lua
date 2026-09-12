@@ -51,9 +51,14 @@ function M.run(src, opts)
   end
   local hook = function(kind, id)
     count = count + 1
-    -- only hand off at a top-level safepoint (the compiled CFG can resume there);
-    -- never inside a function call (calldepth > 0).
-    if resume == nil and sh.calldepth == 0 and ready(kind, id, count) then
+    -- Hand off ONLY at a true top-level safepoint the compiled CFG can resume at:
+    -- never inside a function call (calldepth > 0), and never inside a FORKED child
+    -- (a subshell / $() / async / pipeline stage — in_subprogram/in_pipestage > 0):
+    -- that child's loop has no pc in the top-level module (subshells are delegated),
+    -- so OSR-ing it would jump to the wrong place. Children stay interp.
+    if resume == nil and sh.calldepth == 0
+        and (sh.in_subprogram or 0) == 0 and (sh.in_pipestage or 0) == 0
+        and ready(kind, id, count) then
       resume = { kind = kind, id = id }
       error({ __curse_switch = true })
     end
@@ -90,6 +95,9 @@ function M.run_background(script_path, opts)
     -- Don't OSR into compiled code while a DEBUG/RETURN trap is armed: those fire
     -- per-command, which the native compiled path can't reproduce. Stay in interp.
     if sh.traps and (sh.traps.DEBUG or sh.traps.RETURN) then return end
+    -- Never OSR inside a forked child (subshell/$()/async/pipeline stage): its loop
+    -- has no pc in the top-level module, so it must stay in the interpreter.
+    if (sh.in_subprogram or 0) ~= 0 or (sh.in_pipestage or 0) ~= 0 then return end
     if mod == nil and sh.calldepth == 0 and count % poll_every == 0 then
       local cf = io.open(out, "r")
       if cf then
