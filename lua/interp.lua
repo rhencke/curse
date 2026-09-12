@@ -2138,9 +2138,20 @@ local function exec_simple(sh, args, hook, no_func)
     if a == "-c" then for i = #sh.history, 1, -1 do sh.history[i] = nil end; sh.status = 0
     elseif a == "-r" or a == "-n" then -- read history from FILE (default $HISTFILE)
       local file = args[3] or sh:get("HISTFILE")
-      local f = file ~= "" and file and io.open(file, "r")
-      if f then for line in f:lines() do sh.history[#sh.history + 1] = line end; f:close() end
-      sh.status = 0
+      if file and file ~= "" then
+        local f = io.open(file, "r")
+        if f then
+          for line in f:lines() do sh.history[#sh.history + 1] = line end; f:close(); sh.status = 0
+        else -- a named history file that can't be read is an error (bash)
+          io.stderr:write("curse: history: cannot read history file: " .. file .. "\n"); sh.status = 1
+        end
+      else sh.status = 0 end
+    elseif a == "-d" then -- delete the history entry at OFFSET (negative counts from end)
+      local off = tonumber(args[3])
+      local n = #sh.history
+      local idx = off and (off >= 0 and off or n + off + 1)
+      if idx and idx >= 1 and idx <= n then table.remove(sh.history, idx); sh.status = 0
+      else io.stderr:write("curse: history: " .. tostring(args[3]) .. ": history position out of range\n"); sh.status = 1 end
     elseif a == "-w" or a == "-a" then -- write history to FILE
       local file = args[3] or sh:get("HISTFILE")
       local f = file ~= "" and file and io.open(file, "w")
