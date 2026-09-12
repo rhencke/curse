@@ -58,6 +58,9 @@ while true do
       end -- l/v/s/B/h: accepted no-ops
     end
     ai = wi + 1
+  elseif a and a:sub(1, 2) == "--" then
+    -- an unrecognized long option (e.g. bash rejects `--rcdir`) is a usage error
+    io.stderr:write("curse: " .. a .. ": invalid option\n"); io.flush(); os.exit(2)
   else break end
 end
 -- `-o NAME` / `+o NAME`: same long-option names as the `set -o` builtin.
