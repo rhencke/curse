@@ -35,20 +35,22 @@ local TIMEOUT = 2 -- cases are tiny; this only bounds hangs (e.g. `while true`)
 local TMP = (os.getenv("TMPDIR") or "/tmp") .. "/curse-spec-" .. tostring(os.time())
 os.execute("mkdir -p " .. TMP)
 
--- $SH must be a SINGLE command for tests that use it quoted (`"$SH" -c …`), like
--- Oils' single-binary shells. curse is `luajit run.lua`, so wrap it in a tiny
--- exec script and hand tests that path.
+-- curse is `luajit run.lua`; wrap it in a tiny exec script named after the shell
+-- we're impersonating (SHNAME="bash"), living ALONE in SHBIN so we can put it
+-- first on the tested shell's PATH. This models "curse installed as /bin/bash".
 --
--- We NAME that wrapper after the shell curse is impersonating (`bash`). Oils'
--- suite branches per shell via `case $SH in …`; the glob arms (`*bash|*osh`)
--- key off $SH ENDING in the shell name, so a wrapper at `…/bash` takes bash's
--- branch — the correct branch for a bash-compatible shell — instead of falling
--- to `*)`. The harness still INVOKES curse explicitly (curse_cmd, below), so
--- $SH is only the identity string test code sees; `"$SH" -c …` runs this
--- wrapper (= curse) and a hardcoded `bash` in a test body still runs real bash.
--- (Point SHNAME at "dash"/"sh" to run the suite as those shells later.)
+-- Oils' suite branches per shell via `case $SH in …`. We give the CURSE run
+-- $SH="bash" (bare) so BOTH gate styles take bash's branch — the correct branch
+-- for a bash-compatible shell: the glob arms `*bash|*osh)` (needs $SH ending in
+-- the name) and the exact arms `bash)` (needs the literal string). With SHBIN
+-- first on the curse run's PATH, `"$SH" -c …` / `$SH -i` resolve `bash` to this
+-- wrapper (= curse, which then self-identifies as bash via CURSE_ARGV0), and a
+-- hardcoded `bash` in a test body runs curse too (curse IS bash here). The
+-- ORACLE run keeps a clean PATH (no SHBIN), so ITS `bash` is real bash — the
+-- honest reference. (Point SHNAME at "dash"/"sh" to run the suite as those.)
 local SHNAME = "bash"
-local SH = TMP .. "/" .. SHNAME
+local SHBIN = TMP .. "/shbin"; os.execute("mkdir -p " .. SHBIN)
+local SH = SHBIN .. "/" .. SHNAME
 do
   local f = io.open(SH, "w")
   -- forward $0 (how the wrapper was invoked) so curse self-identifies by basename
@@ -112,9 +114,9 @@ local BINPATH = SPEC .. "/bin:" .. ROOT .. "/.bench-lua/shim" -- argv.py + pytho
 -- both shells, so it never changes a comparison. `$?` is recorded to a separate
 -- file (not the piped stdout) so the real exit status survives the `| head`.
 local CAP = 4000000
-local function run(cmdstr, cwd, shval)
+local function run(cmdstr, cwd, shval, pathpre)
   os.execute("cd " .. cwd .. " && { export LC_ALL=C TMP=" .. cwd .. " TMPDIR=" .. cwd ..
-    " SH='" .. shval .. "' CURSE_BUNDLE=" .. BUNDLE .. " PATH=" .. BINPATH .. ":$PATH; timeout " .. TIMEOUT ..
+    " SH='" .. shval .. "' CURSE_BUNDLE=" .. BUNDLE .. " PATH=" .. (pathpre or "") .. BINPATH .. ":$PATH; timeout " .. TIMEOUT ..
     " " .. cmdstr .. " ; echo $? >" .. stp .. "; } 2>/dev/null | head -c " .. CAP .. " >" .. outp)
   return readfile(outp) or "", tonumber((readfile(stp) or "0"):match("%d+") or "0")
 end
@@ -168,9 +170,9 @@ for _, path in ipairs(files) do
   local pass = 0
   for _, c in ipairs(cases) do
     write_code(c.code)
-    local bout, bst = run("bash " .. codep, cwd, "bash")
+    local bout, bst = run("bash " .. codep, cwd, SHNAME)          -- oracle: clean PATH -> real bash
     os.execute("rm -rf " .. cwd .. "/*  2>/dev/null")
-    local cout, cst = run(curse_cmd(), cwd, SH)
+    local cout, cst = run(curse_cmd(), cwd, SHNAME, SHBIN .. ":") -- curse: SHBIN first -> `bash` = curse
     os.execute("rm -rf " .. cwd .. "/* 2>/dev/null")
     if bout == cout and bst == cst then
       pass = pass + 1
