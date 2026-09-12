@@ -1817,6 +1817,19 @@ local function make_parser(src, sh)
           i = i + #an + #ap + 1 -- past NAME (+) = ; now on `(`
           arrayargs = arrayargs or {}
           arrayargs[#arrayargs + 1] = { name = an, elems = parse_array_elems(), append = (ap == "+") }
+        elseif cmd1 and cmd1.lit == "let" and src:match("^[%a_][%w_]*%+?=%(", i) then
+          -- `let x=( 1 )`: bash reads a `NAME=( … )` arg to `let` as ONE balanced-
+          -- paren ARITH word (the `( )` group; it is NOT an array literal), so the
+          -- let builtin evaluates `x = (1)`. Capture NAME=( … ) whole (naive paren
+          -- balance — arith rarely quotes a paren) and parse it as a literal word.
+          local st, depth = i, 0
+          i = i + #src:match("^[%a_][%w_]*%+?=", i) -- past NAME(+)=; now on `(`
+          repeat
+            local ch = src:sub(i, i)
+            if ch == "(" then depth = depth + 1 elseif ch == ")" then depth = depth - 1 end
+            i = i + 1
+          until depth == 0 or i > n
+          words[#words + 1] = parse_word(src:sub(st, i - 1))
         else
           local w = word(true) -- stop at unquoted ( ) so `cmd)` ends at the subshell close
           if w == "" then break end
