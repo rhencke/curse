@@ -24,6 +24,7 @@ local sh
 
 -- Collect leading shell options (as `sh -e -u -o NAME -O NAME` before -c/script).
 local ai, presets = 1, {}
+local rcfile, norc -- --rcfile FILE / --norc: an interactive shell sources FILE first
 while true do
   local a = arg[ai]
   if a == "-e" or a == "+e" then presets[#presets + 1] = { f = "opt_e", on = a == "-e" }; ai = ai + 1
@@ -38,8 +39,8 @@ while true do
   elseif a == "-C" or a == "+C" then presets[#presets + 1] = { f = "opt_C", on = a == "-C" }; ai = ai + 1
   elseif a == "-o" or a == "+o" then presets[#presets + 1] = { o = arg[ai + 1], on = a == "-o" }; ai = ai + 2
   elseif a == "-O" or a == "+O" then presets[#presets + 1] = { shopt = arg[ai + 1], on = a == "-O" }; ai = ai + 2
-  elseif a == "--norc" or a == "--noprofile" or a == "--rcfile" then
-    ai = ai + (a == "--rcfile" and 2 or 1) -- ignore rc flags
+  elseif a == "--norc" or a == "--noprofile" then norc = true; ai = ai + 1
+  elseif a == "--rcfile" then rcfile = arg[ai + 1]; ai = ai + 2
   elseif a and a:match("^%-[eiuxCoOlvsBh]+$") and #a > 2 then
     -- bundled short flags: `-eu`, `-oo errexit noglob`, `-ex` … (bash bundles
     -- single-char options; each `o`/`O` in the bundle takes the NEXT word as its
@@ -83,6 +84,17 @@ local function apply(s)
   end
 end
 
+-- An interactive shell sources --rcfile (unless --norc) before running -c/REPL; a
+-- real `exit` in the rc file ends the whole shell here (skipping -c), like bash.
+local function source_rc(sh)
+  if not (sh.opt_i and rcfile and not norc) then return end
+  local ok, err = pcall(T.interp.source_file, sh, rcfile)
+  if not ok then
+    if type(err) == "table" and err.__curse_exit then io.flush(); os.exit(err.__curse_exit)
+    else error(err) end
+  end
+end
+
 -- Consume one option token into `presets`; returns tokens consumed, or 0 if `a`
 -- is not a recognized option (bash accepts these both leading and after -c).
 local function opt_consume(a, nexta)
@@ -122,6 +134,7 @@ if arg[ai] == "-c" or arg[ai] == "+c" then
   if sh.opt_i and sh.vars.HISTFILE == nil then sh:set_str("HISTFILE", (os.getenv("HOME") or "") .. "/.bash_history") end
   sh.argv0 = arg[j + 1] or "curse"
   for k = j + 2, #arg do sh.nparams = sh.nparams + 1; sh.params[sh.nparams] = arg[k] end
+  source_rc(sh) -- interactive: --rcfile is sourced before the command string
   T.interp.run_lazy(sh, code)
   io.flush(); os.exit(sh.status or 0)
 end
@@ -134,6 +147,7 @@ if arg[ai] == nil then
   if sh.opt_i or istty then
     sh.opt_i = true
     if sh.vars.HISTFILE == nil then sh:set_str("HISTFILE", (os.getenv("HOME") or "") .. "/.bash_history") end
+    source_rc(sh) -- --rcfile sourced before the interactive session
     require("repl").run(sh)
   else
     local src = io.read("*a") or ""

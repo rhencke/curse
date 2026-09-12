@@ -39,43 +39,10 @@ local function read_line(prompt)
   return io.read("*l")
 end
 
--- Heuristic: does `buf` have an obviously-unterminated construct, so the REPL
--- should keep reading (PS2) instead of trying to run it? Counts unbalanced quotes,
--- $(/${/(( , a trailing backslash, and open block keywords vs their closers.
-local function needs_more(buf)
-  if buf:sub(-1) == "\\" then return true end
-  local i, n = 1, #buf
-  local sq, dq, paren, brace = false, false, 0, 0 -- paren counts ( $( $(( uniformly
-  local words = {}
-  while i <= n do
-    local c = buf:sub(i, i)
-    if sq then if c == "'" then sq = false end; i = i + 1
-    elseif dq then
-      if c == "\\" then i = i + 2 elseif c == '"' then dq = false; i = i + 1 else i = i + 1 end
-    elseif c == "'" then sq = true; i = i + 1
-    elseif c == '"' then dq = true; i = i + 1
-    elseif c == "\\" then i = i + 2
-    elseif c == "#" then while i <= n and buf:sub(i, i) ~= "\n" do i = i + 1 end
-    elseif c == "$" and buf:sub(i + 1, i + 2) == "((" then paren = paren + 2; i = i + 3
-    elseif c == "$" and buf:sub(i + 1, i + 1) == "(" then paren = paren + 1; i = i + 2
-    elseif c == "$" and buf:sub(i + 1, i + 1) == "{" then brace = brace + 1; i = i + 2
-    elseif c == "(" then paren = paren + 1; i = i + 1
-    elseif c == ")" then paren = paren - 1; i = i + 1
-    elseif c == "}" then brace = brace - 1; i = i + 1
-    else
-      local s, e, w = buf:find("^([%a_][%w_]*)", i)
-      if w then words[#words + 1] = w; i = e + 1 else i = i + 1 end
-    end
-  end
-  if sq or dq or paren > 0 or brace > 0 then return true end
-  -- block keywords: opens (if/for/while/until/case/select) must be closed
-  local opens, closes = 0, 0
-  for _, w in ipairs(words) do
-    if w == "if" or w == "for" or w == "while" or w == "until" or w == "case" or w == "select" then opens = opens + 1
-    elseif w == "fi" or w == "done" or w == "esac" then closes = closes + 1 end
-  end
-  return opens > closes
-end
+-- Does `buf` have an obviously-unterminated construct, so the REPL should keep
+-- reading (PS2) instead of running it? Shared with interp.source_file (rc-file
+-- completeness). See interp.incomplete_input.
+local needs_more = interp.incomplete_input
 
 -- Expand PS1/PS2 escapes for the prompt via the shared, full prompt decoder.
 local function prompt_of(sh, var, default)

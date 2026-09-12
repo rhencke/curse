@@ -4689,4 +4689,78 @@ function M.run_prompt_command(sh, hook)
   sh.status = saved
 end
 
+-- Does `buf` end with an obviously-unterminated construct (unbalanced quotes,
+-- (/${/((, a trailing backslash, or an open block keyword)? The REPL uses it to
+-- decide PS2-continue; source_file uses it to reject an incomplete rc file whole
+-- (bash reads the file as a unit, so an unclosed `(` runs nothing). Heuristic.
+function M.incomplete_input(buf)
+  if buf:sub(-1) == "\\" then return true end
+  local i, n = 1, #buf
+  local sq, dq, paren, brace = false, false, 0, 0
+  local words = {}
+  while i <= n do
+    local c = buf:sub(i, i)
+    if sq then if c == "'" then sq = false end; i = i + 1
+    elseif dq then
+      if c == "\\" then i = i + 2 elseif c == '"' then dq = false; i = i + 1 else i = i + 1 end
+    elseif c == "'" then sq = true; i = i + 1
+    elseif c == '"' then dq = true; i = i + 1
+    elseif c == "\\" then i = i + 2
+    elseif c == "#" then while i <= n and buf:sub(i, i) ~= "\n" do i = i + 1 end
+    elseif c == "$" and buf:sub(i + 1, i + 2) == "((" then paren = paren + 2; i = i + 3
+    elseif c == "$" and buf:sub(i + 1, i + 1) == "(" then paren = paren + 1; i = i + 2
+    elseif c == "$" and buf:sub(i + 1, i + 1) == "{" then brace = brace + 1; i = i + 2
+    elseif c == "(" then paren = paren + 1; i = i + 1
+    elseif c == ")" then paren = paren - 1; i = i + 1
+    elseif c == "}" then brace = brace - 1; i = i + 1
+    else
+      local _, e, w = buf:find("^([%a_][%w_]*)", i)
+      if w then words[#words + 1] = w; i = e + 1 else i = i + 1 end
+    end
+  end
+  if sq or dq or paren > 0 or brace > 0 then return true end
+  local opens, closes = 0, 0
+  for _, w in ipairs(words) do
+    if w == "if" or w == "for" or w == "while" or w == "until" or w == "case" or w == "select" then opens = opens + 1
+    elseif w == "fi" or w == "done" or w == "esac" then closes = closes + 1 end
+  end
+  return opens > closes
+end
+
+-- Source an rc file (bash's --rcfile) before an interactive shell runs -c/REPL:
+-- run it like the shell's own input; a syntax error is reported WITH the file
+-- name (bash) and is non-fatal, but a real `exit` in the rc file propagates to
+-- end the whole shell (before -c runs). Missing file: silently skipped.
+function M.source_file(sh, path, hook)
+  local f = io.open(path, "r"); if not f then return end
+  local src = f:read("*a"); f:close()
+  hook = hook or function() end
+  -- bash parses the whole rc file; an unterminated construct is a syntax error
+  -- that runs NOTHING (curse's parser is lazily lenient about unclosed (/{ , so
+  -- detect it here). Non-fatal: the shell still runs -c/REPL afterward.
+  if M.incomplete_input(src) then
+    io.stderr:write("curse: " .. path .. ": syntax error: unexpected end of file\n")
+    sh.status = 2; return
+  end
+  local nextf = P.open(src, sh)
+  while true do
+    local lg = nextf()
+    if lg == nil then break end
+    if lg.perr then
+      io.stderr:write("curse: " .. path .. ": line " .. (lg.perr.line or 1) .. ": " ..
+        (lg.perr.msg or "syntax error") .. "\n")
+      sh.status = 2; return
+    end
+    for _, st in ipairs(lg.stmts) do
+      local sok, serr = pcall(exec_stmt, sh, st, hook)
+      if not sok then
+        if type(serr) == "table" and serr.__curse_lineabort then
+          if sh.opt_e then error(serr) end
+          sh.status = 1; break
+        else error(serr) end -- a real `exit` (or return) propagates
+      end
+    end
+  end
+end
+
 return M
