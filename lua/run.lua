@@ -132,7 +132,7 @@ if arg[ai] == "-c" or arg[ai] == "+c" then
   sh = T.rt.Shell.new(); apply(sh); sh.opt_c = true
   -- an interactive shell sets $HISTFILE (bash), even for `-i -c`
   if sh.opt_i and sh.vars.HISTFILE == nil then sh:set_str("HISTFILE", (os.getenv("HOME") or "") .. "/.bash_history"); sh.histfile_default = true end
-  sh.argv0 = arg[j + 1] or "curse"
+  sh.argv0 = arg[j + 1] or SHELLNAME -- $0 defaults to the shell name (bash), not "curse"
   for k = j + 2, #arg do sh.nparams = sh.nparams + 1; sh.params[sh.nparams] = arg[k] end
   source_rc(sh) -- interactive: --rcfile is sourced before the command string
   T.interp.run_lazy(sh, code)
@@ -142,7 +142,7 @@ end
 -- No script argument. With a tty on stdin (or -i) start the REPL; otherwise read
 -- commands from stdin and run them non-interactively (e.g. `echo cmd | sh`).
 if arg[ai] == nil then
-  sh = T.rt.Shell.new(); apply(sh); sh.argv0 = "curse"
+  sh = T.rt.Shell.new(); apply(sh); sh.argv0 = SHELLNAME -- $0 = the shell name (bash)
   local istty = require("ffi").C.isatty(0) == 1
   if sh.opt_i or istty then
     sh.opt_i = true
