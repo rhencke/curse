@@ -1743,10 +1743,17 @@ end
 -- otherwise arithmetic (bases honored). Returns (int64, ok) — ok=false marks an
 -- invalid number (bash prints 0 and sets status 1). int64 keeps full 64-bit
 -- precision for %d/%u/%o/%x (LuaJIT's string.format formats cdata directly).
+-- printf "'X" / '"X': the numeric value of the FIRST CHARACTER — its codepoint in
+-- the current locale (bash), falling back to the first byte for invalid UTF-8.
+local function char_value(s)
+  if s == "" then return 0 end
+  local ch = rt.mb_chars(s)[1]
+  return (ch and ch.wc) or s:byte(1)
+end
 local function printf_int(s, uns)
   if s == nil or s == "" then return 0, true end
   local c = s:sub(1, 1)
-  if c == "'" or c == '"' then return (#s >= 2 and s:byte(2) or 0), true end
+  if c == "'" or c == '"' then return char_value(s:sub(2)), true end
   -- strtoll semantics (NOT shell arithmetic): skip leading blanks, read a single
   -- [sign] hex/octal/decimal integer, and any leftover (trailing chars OR blanks,
   -- and no base#N) makes it invalid — bash still prints the parsed value, status 1.
@@ -1765,7 +1772,7 @@ end
 local function printf_float(s)
   if s == nil or s == "" then return 0, true end
   local c = s:sub(1, 1)
-  if c == "'" or c == '"' then return (#s >= 2 and s:byte(2) or 0), true end
+  if c == "'" or c == '"' then return char_value(s:sub(2)), true end
   local v = tonumber(s)
   if v then return v, true end
   return 0, false
