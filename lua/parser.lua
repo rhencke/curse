@@ -1626,7 +1626,9 @@ local function make_parser(src, sh)
         while i <= n do
           local c = src:sub(i, i)
           if c == ")" and depth == 0 then break end
-          if c == "'" or c == '"' then
+          if c == "\\" then -- a backslash escapes the next char (incl. a quote or `)`):
+            patstr[#patstr + 1] = src:sub(i, i + 1); i = i + 2 -- copy both, don't treat `\'` as a quote
+          elseif c == "'" or c == '"' then
             patstr[#patstr + 1] = c; i = i + 1
             while i <= n and src:sub(i, i) ~= c do patstr[#patstr + 1] = src:sub(i, i); i = i + 1 end
             patstr[#patstr + 1] = src:sub(i, i); i = i + 1

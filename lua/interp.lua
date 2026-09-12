@@ -3659,6 +3659,9 @@ local function exec_simple(sh, args, hook, no_func)
           if d == "\n" then -- swallow both (continuation), unless -N counts raw
           else buf[#buf + 1] = "\1" .. d end
         elseif not ndelim and c == dch then had_nl = true; break -- -N ignores the delimiter
+        elseif c == "\0" then -- bash strips NUL bytes from read input (keeps the rest)
+        elseif c == "\1" then buf[#buf + 1] = "\1\1" -- DOUBLE a real CTLESC byte so it
+                                                     -- survives the \1-marker unescape below
         else buf[#buf + 1] = c end
       end
       line = got and table.concat(buf) or nil
@@ -3670,11 +3673,11 @@ local function exec_simple(sh, args, hook, no_func)
       if arr then
         sh:array_assign(arr, rt.ifs_split(ifs, line), false)
       elseif ndelim then -- -N: no IFS processing; first var gets everything, rest empty
-        local plain = line:gsub("\1", "")
+        local plain = line:gsub("\1(.)", "%1") -- \1x -> x (unescape); \1\1 -> \1 (literal CTLESC)
         if #vars == 0 then sh:set_str("REPLY", plain)
         else sh:set_str(vars[1], plain); for k = 2, #vars do sh:set_str(vars[k], "") end end
       elseif #vars == 0 then
-        sh:set_str("REPLY", (line:gsub("\1", ""))) -- REPLY: the raw line, no IFS stripping
+        sh:set_str("REPLY", (line:gsub("\1(.)", "%1"))) -- REPLY: raw line, unescape CTLESC markers
       else
         local fields = read_split(ifs, line, #vars)
         for k = 1, #vars do sh:set_str(vars[k], fields[k] or "") end
