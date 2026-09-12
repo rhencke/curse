@@ -316,11 +316,19 @@ function M.reset_locale(sh)
   local all = sh.vars["LC_ALL"] and sh:get("LC_ALL")
   local lang = sh.vars["LANG"] and sh:get("LANG")
   for name, cat in pairs(LC_CATEGORIES) do
-    local v
-    if all and all ~= "" then v = all
-    else local b = sh.vars[name]; local lv = b and sh:get(name)
-      v = (lv and lv ~= "" and lv) or (lang and lang ~= "" and lang) or "C" end
-    C.setlocale(cat, v)
+    -- Precedence LC_ALL > LC_<cat> > LANG > "C". An INVALID name makes setlocale
+    -- return NULL; bash then falls through to the next candidate (so LC_CTYPE=invalid
+    -- with LANG=C.UTF-8 still gives a UTF-8 ctype). Take the first that SUCCEEDS.
+    local cands
+    if all and all ~= "" then cands = { all, "C" }
+    else
+      local b = sh.vars[name]; local lv = b and sh:get(name)
+      cands = {}
+      if lv and lv ~= "" then cands[#cands + 1] = lv end
+      if lang and lang ~= "" then cands[#cands + 1] = lang end
+      cands[#cands + 1] = "C"
+    end
+    for _, v in ipairs(cands) do if C.setlocale(cat, v) ~= nil then break end end
   end
   lc_mb_cur_max = tonumber(C.__ctype_get_mb_cur_max()) or 1
 end
@@ -363,6 +371,19 @@ function M.mb_chars(s)
     i = i + r
   end
   return out
+end
+
+-- Byte length of the character starting at byte index `i` (1-based) of `s`: 1 for
+-- ASCII or a single-byte locale, else the multibyte length via mbrtowc (a bad or
+-- incomplete byte counts as 1). Lets the hot IFS-split path stay byte-fast for
+-- ASCII while handling a multibyte IFS delimiter (`IFS=ç`) correctly.
+function M.mb_charlen(s, i)
+  local b = s:byte(i)
+  if not b or b < 0x80 or lc_mb_cur_max <= 1 then return 1 end
+  ffi.fill(_mb_st, ffi.sizeof(_mb_st))
+  local r = tonumber(C.mbrtowc(_mb_wc, ffi.cast("const char *", s) + (i - 1), #s - i + 1, _mb_st))
+  if r <= 0 or r > (#s - i + 1) then return 1 end
+  return r
 end
 
 -- Re-encode a codepoint to bytes in the current locale (wcrtomb); on failure keep

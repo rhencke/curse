@@ -1187,8 +1187,16 @@ local function expand_to_fields(sh, w)
   -- it handles concatenation ($x-, pre$x) and custom IFS correctly. Fields also
   -- track `unq` for glob eligibility (quoted glob chars stay literal).
   local ifs = sh.vars["IFS"] and sh:get("IFS") or " \t\n"
+  -- IFS is a SET of characters; a delimiter may be multibyte (`IFS=ç`), so index by
+  -- whole codepoint, not byte (byte-indexing splits ç's two bytes as two delimiters).
+  local ifsset = {}; for _, ch in ipairs(rt.mb_chars(ifs)) do ifsset[ch.s] = true end
+  local mbifs = rt.lc_mb_cur_max() > 1 and ifs:find("[\128-\255]") ~= nil -- any multibyte IFS char?
   local function isws(c) return c == " " or c == "\t" or c == "\n" end
-  local function inifs(c) return c ~= "" and ifs:find(c, 1, true) ~= nil end
+  local function inifs(c) return c ~= "" and ifsset[c] end
+  local function clen(v, i) -- byte length of the char at i (fast for ASCII)
+    if not mbifs or v:byte(i) < 0x80 then return 1 end
+    return rt.mb_charlen(v, i)
+  end
   -- `q` is a per-character literal-mask parallel to the field's string ("1" = the
   -- char came from QUOTED/escaped text so it's literal in pathname expansion, "0" =
   -- glob-active). Kept OUT OF BAND (not an escape byte) so it can't collide with a
@@ -1206,23 +1214,27 @@ local function expand_to_fields(sh, w)
   local function feed_split(v) -- unquoted expansion text: split on $IFS
     local i, n = 1, #v
     while i <= n do
-      local c = v:sub(i, i)
+      local cl = clen(v, i)
+      local c = cl == 1 and v:sub(i, i) or v:sub(i, i + cl - 1)
       if inifs(c) then
-        if isws(c) then
+        if isws(c) then          -- whitespace IFS chars are always single-byte
           if cur ~= nil then brk() end
           i = i + 1
           while i <= n and isws(v:sub(i, i)) do i = i + 1 end
-          if i <= n and inifs(v:sub(i, i)) and not isws(v:sub(i, i)) then
-            i = i + 1; while i <= n and isws(v:sub(i, i)) do i = i + 1 end
+          if i <= n then
+            local nl = clen(v, i); local nc = nl == 1 and v:sub(i, i) or v:sub(i, i + nl - 1)
+            if inifs(nc) and not isws(nc) then
+              i = i + nl; while i <= n and isws(v:sub(i, i)) do i = i + 1 end
+            end
           end
-        else                       -- non-whitespace IFS delimiter
+        else                       -- non-whitespace IFS delimiter (may be multibyte)
           if cur == nil then cur = "" end -- a delimiter always ends a field (empty ok)
           cur_unq = true; brk()
-          i = i + 1
+          i = i + cl
           while i <= n and isws(v:sub(i, i)) do i = i + 1 end
         end
       else
-        add(c, true); i = i + 1
+        add(c, true); i = i + cl
       end
     end
   end
