@@ -1516,7 +1516,12 @@ local function make_parser(src, sh)
           if src:sub(i, i + 1) == ";;" then return "dsemi" end       -- ;; (stop)
           if src:sub(i, i + 1) == ";&" then return "semi_amp" end     -- ;& (fall through)
           local c = src:sub(i, i)
-          if c == "\n" then line = line + 1; i = i + 1
+          if c == "\n" then
+            -- a heredoc opened by a command in this arm has its body after the
+            -- newline (like the shared skipsep) — collect it, else it leaks as
+            -- commands (`x) cat <<EOF … EOF ;;`).
+            if #heredocs_pending > 0 then collect_heredocs()
+            else line = line + 1; i = i + 1 end
           elseif c:match("[ \t;]") then i = i + 1
           elseif c == "#" then while i <= n and src:sub(i, i) ~= "\n" do i = i + 1 end
           else return nil end
