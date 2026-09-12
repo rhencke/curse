@@ -78,6 +78,7 @@ function Shell.new()
     calldepth = 0,   -- interpreter-only OSR gate (managed at the interp call site)
   }, Shell)
   sh:import_env()
+  M.reset_locale(sh) -- adopt $LANG/$LC_* (bash calls setlocale at startup)
   if sh.vars["OPTIND"] == nil then sh:set_str("OPTIND", "1") end -- bash: OPTIND starts at 1
   if sh.vars["HOSTNAME"] == nil then sh:set_str("HOSTNAME", M.hostname()) end
   -- curse identifies as bash (see shellname/basename); advertise a version so
@@ -259,8 +260,103 @@ ffi.cdef [[
   int setenv(const char *name, const char *value, int overwrite);
   int unsetenv(const char *name);
   extern char **environ;
+  /* Locale — delegate every multibyte/collation/case op to glibc, exactly as bash
+     does, so curse matches bash under ANY locale (UTF-8, ISO-8859-*, EUC, GB18030,
+     locale-specific collation/case), not just byte/UTF-8. */
+  char *setlocale(int category, const char *locale);
+  size_t __ctype_get_mb_cur_max(void);
+  typedef struct { int __count; unsigned int __value; } curse_mbstate_t;
+  size_t mbrtowc(int *pwc, const char *s, size_t n, curse_mbstate_t *ps);
+  size_t wcrtomb(char *s, int wc, curse_mbstate_t *ps);
+  int towupper(int wc);
+  int towlower(int wc);
+  int iswctype(int wc, unsigned long desc);
+  unsigned long wctype(const char *name);
+  int wcwidth(int wc);
+  int strcoll(const char *s1, const char *s2);
+  size_t strxfrm(char *dest, const char *src, size_t n);
 ]]
 local C = ffi.C
+
+-- ---- Locale (glibc-delegated, like bash) ----------------------------------
+-- A C program starts in the "C" locale until setlocale(LC_ALL,"") is called, so
+-- $LANG/$LC_* have no effect on mbrtowc/towupper/strcoll until we opt in. bash
+-- calls setlocale at startup AND whenever a locale variable changes; we mirror
+-- that so curse tracks the locale live (`LC_COLLATE=…; echo [a-z]*` mid-script).
+-- glibc category numbers (locale.h): CTYPE 0, NUMERIC 1, TIME 2, COLLATE 3,
+-- MONETARY 4, MESSAGES 5, ALL 6.
+local LC_CATEGORIES = { LC_CTYPE = 0, LC_NUMERIC = 1, LC_TIME = 2, LC_COLLATE = 3, LC_MONETARY = 4, LC_MESSAGES = 5 }
+local lc_mb_cur_max = 1 -- module-global: setlocale is process-wide
+M.lc_mb_cur_max = function() return lc_mb_cur_max end
+-- Re-apply the shell's locale variables to the C library, honoring bash/POSIX
+-- precedence per category: LC_ALL overrides; else LC_<category>; else LANG. An
+-- invalid locale name makes setlocale return NULL and leaves the prior locale in
+-- place (bash warns and continues) — so we never clobber a good locale.
+function M.reset_locale(sh)
+  local all = sh.vars["LC_ALL"] and sh:get("LC_ALL")
+  local lang = sh.vars["LANG"] and sh:get("LANG")
+  for name, cat in pairs(LC_CATEGORIES) do
+    local v
+    if all and all ~= "" then v = all
+    else local b = sh.vars[name]; local lv = b and sh:get(name)
+      v = (lv and lv ~= "" and lv) or (lang and lang ~= "" and lang) or "C" end
+    C.setlocale(cat, v)
+  end
+  lc_mb_cur_max = tonumber(C.__ctype_get_mb_cur_max()) or 1
+end
+M.LC_CATEGORIES = LC_CATEGORIES
+
+-- Count CHARACTERS (codepoints) in a byte string using the current LC_CTYPE, the
+-- way bash's MB_STRLEN does: single-byte locale -> byte length; else walk with
+-- mbrtowc, counting an invalid/incomplete byte as one char and resyncing by one.
+local _mb_wc = ffi.new("int[1]")
+local _mb_st = ffi.new("curse_mbstate_t")
+function M.mb_strlen(s)
+  if lc_mb_cur_max <= 1 then return #s end
+  ffi.fill(_mb_st, ffi.sizeof(_mb_st))
+  local ptr, i, n, count = ffi.cast("const char *", s), 0, #s, 0
+  while i < n do
+    local r = tonumber(C.mbrtowc(_mb_wc, ptr + i, n - i, _mb_st))
+    if r == 0 or r > (n - i) then r = 1 end -- NUL / invalid / incomplete: one char, one byte
+    i = i + r; count = count + 1
+  end
+  return count
+end
+
+-- Decode a byte string into a list of { s = <the raw bytes of this char>, wc =
+-- <codepoint or nil for a bad byte> } — the char granularity bash uses for
+-- case-folding and other per-character operations. Single-byte locale => one
+-- entry per byte (wc = the byte value).
+function M.mb_chars(s)
+  local out, n = {}, #s
+  if lc_mb_cur_max <= 1 then
+    for k = 1, n do out[k] = { s = s:sub(k, k), wc = s:byte(k) } end
+    return out
+  end
+  ffi.fill(_mb_st, ffi.sizeof(_mb_st))
+  local ptr, i = ffi.cast("const char *", s), 0
+  while i < n do
+    local r = tonumber(C.mbrtowc(_mb_wc, ptr + i, n - i, _mb_st))
+    local wc = _mb_wc[0]
+    if r == 0 or r > (n - i) then r = 1; wc = nil end -- bad byte: no codepoint
+    out[#out + 1] = { s = s:sub(i + 1, i + r), wc = wc }
+    i = i + r
+  end
+  return out
+end
+
+-- Re-encode a codepoint to bytes in the current locale (wcrtomb); on failure keep
+-- the original bytes. Used to write back a case-folded character.
+local _mb_buf = ffi.new("char[16]")
+function M.wc_to_bytes(wc, orig)
+  if lc_mb_cur_max <= 1 then return string.char(wc % 256) end
+  ffi.fill(_mb_st, ffi.sizeof(_mb_st))
+  local r = tonumber(C.wcrtomb(_mb_buf, wc, _mb_st))
+  if r <= 0 or r > 16 then return orig end
+  return ffi.string(_mb_buf, r)
+end
+M.towupper = function(wc) return tonumber(C.towupper(wc)) end
+M.towlower = function(wc) return tonumber(C.towlower(wc)) end
 
 -- Decode a waitpid status word into a bash exit code: 128+signum when killed by
 -- a signal, else the WEXITSTATUS byte. (Shared by Shell:exec, wait, subshell,
@@ -748,10 +844,17 @@ function Shell:aget(name)
   return b.n
 end
 
+-- Locale variables: assigning/unsetting any of these re-applies setlocale (bash).
+local LOCALE_VARS = { LANG = 1, LC_ALL = 1, LC_CTYPE = 1, LC_NUMERIC = 1,
+  LC_TIME = 1, LC_COLLATE = 1, LC_MONETARY = 1, LC_MESSAGES = 1 }
+M.LOCALE_VARS = LOCALE_VARS
+
 function Shell:set_str(name, s)
-  local b = box(self:deref(name), self.vars)
+  local dn = self:deref(name)
+  local b = box(dn, self.vars)
   b.s = s; b.n = nil
-  if b.exported then C.setenv(self:deref(name), s, 1) end -- keep the env in sync
+  if b.exported then C.setenv(dn, s, 1) end -- keep the env in sync
+  if LOCALE_VARS[dn] then M.reset_locale(self) end -- track the locale live, like bash
 end
 
 -- Set a variable AND mark it exported (updating the process env). Used for
@@ -1449,7 +1552,7 @@ function Shell:expand_param(pe, arg, arg2, idxnum)
       if b and b.arr then self:array_set(name, 0, v) else self:set_str(name, v) end
     end
   end
-  if op == "len" then return tostring(#val) end
+  if op == "len" then return tostring(M.mb_strlen(val)) end -- ${#v}: codepoints in the locale
   if op == ":-" then return val ~= "" and val or A() end
   if op == "-" then return isset and val or A() end
   if op == ":+" then return val ~= "" and A() or "" end
@@ -1547,11 +1650,18 @@ end
 -- `all` folds every matching char (else only the first). An empty PAT means "any".
 local function fold_case(val, pat, upper, all)
   if pat == nil or pat == "" then pat = "?" end
-  local out, n = {}, all and #val or math.min(1, #val)
-  for k = 1, #val do
-    local c = val:sub(k, k)
-    if k <= n and M.glob_match(c, pat) then c = upper and c:upper() or c:lower() end
-    out[k] = c
+  -- Fold per CHARACTER (codepoint) using the locale's towupper/towlower, exactly
+  -- as bash does — so `${x^^}` upcases μ→Μ under a UTF-8 locale, Turkish i→İ under
+  -- tr_TR, etc. A bad byte (wc == nil) is left as-is.
+  local chars = M.mb_chars(val)
+  local out, limit = {}, all and #chars or math.min(1, #chars)
+  for k = 1, #chars do
+    local ch = chars[k]; local s = ch.s
+    if k <= limit and ch.wc and M.glob_match(s, pat) then
+      local w2 = upper and M.towupper(ch.wc) or M.towlower(ch.wc)
+      if w2 ~= ch.wc then s = M.wc_to_bytes(w2, ch.s) end
+    end
+    out[k] = s
   end
   return table.concat(out)
 end
@@ -1559,9 +1669,9 @@ function Shell:apply_str_op(op, val, arg, arg2)
   arg = arg or ""
   if op == "@" then -- ${x@Q}/@U/@u/@L/@E/@K/@k (bash 5.x transforms)
     if arg == "Q" or arg == "K" or arg == "k" then return shell_quote(val) end
-    if arg == "U" then return val:upper() end
-    if arg == "u" then return val:sub(1, 1):upper() .. val:sub(2) end
-    if arg == "L" then return val:lower() end
+    if arg == "U" then return fold_case(val, "?", true, true) end   -- upcase all (locale)
+    if arg == "u" then return fold_case(val, "?", true, false) end  -- upcase first char
+    if arg == "L" then return fold_case(val, "?", false, true) end  -- downcase all
     if arg == "E" then return M.ansi_unescape(val) end
     return val
   end

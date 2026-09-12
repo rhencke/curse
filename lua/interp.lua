@@ -770,7 +770,7 @@ local function expand_part_str(sh, p, assign)
     elseif p.special == "!" then v = sh.last_bg_pid or ""
     elseif p.special == "-" then v = sh:dash_flags()
     else v = "" end
-    if p.lenof then return tostring(#v) end -- ${##} ${#?} ${#-} ${#$} ${#!}: length
+    if p.lenof then return tostring(rt.mb_strlen(v)) end -- ${##} ${#?} ${#-} ${#$} ${#!}: length
     return v
   elseif p.arith then -- cache the parsed AST on the part (a loop re-expanding the
     if not p.arith_ast then -- same $((…)) shouldn't re-parse it)
@@ -2834,6 +2834,7 @@ local function exec_simple(sh, args, hook, no_func)
             end
             if not revealed then sh.vars[dn] = nil end
             if not env_done then C.unsetenv(a) end -- drop from the process env too
+            if rt.LOCALE_VARS[dn] then rt.reset_locale(sh) end -- re-apply locale (bash)
           elseif sh.functions[a] then sh.functions[a] = nil -- plain unset falls back to a function
           end
         end
