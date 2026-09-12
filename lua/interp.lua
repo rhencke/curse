@@ -49,6 +49,9 @@ local function set_opt(sh, field, on)
   -- emacs and vi line-editing modes are mutually exclusive.
   if on and field == "opt_emacs" then sh.opt_vi = false
   elseif on and field == "opt_vi" then sh.opt_emacs = false end
+  -- if $SHELLOPTS is exported, keep the process env in sync so children inherit
+  -- the current option set (bash's cross-process `set -x` etc.).
+  if sh.shellopts_exported then ffi.C.setenv("SHELLOPTS", sh:shellopts(), 1) end
 end
 
 -- bash `shopt` options in bash's own listing order, with their default state.
@@ -1942,6 +1945,26 @@ local function job_resolve(sh, spec)
   return nil
 end
 
+-- xtrace (`set -x`): before running a command, write `$PS4<cmd words>` to stderr,
+-- single-quoting any word that isn't a plain token (bash). PS4's first char is
+-- repeated by call depth. Control-char / unicode quoting (bash's $'…') is a
+-- byte-fidelity concern we deliberately don't reproduce.
+local function xtrace_quote(w)
+  if w == "" then return "''" end
+  if w:match("^[%w_@%%+=:,./%-]+$") then return w end
+  return "'" .. w:gsub("'", "'\\''") .. "'"
+end
+local function xtrace(sh, args)
+  local ps4 = sh:get("PS4"); if ps4 == "" then ps4 = "+ " end
+  local lead = ps4:sub(1, 1)
+  local depth = (sh.calldepth or 0)
+  local pre = ps4
+  if lead ~= "" and depth > 0 then pre = lead:rep(depth) .. ps4 end -- repeat PS4[0] by depth
+  local parts = {}
+  for i = 1, #args do parts[i] = xtrace_quote(args[i]) end
+  io.stderr:write(pre .. table.concat(parts, " ") .. "\n")
+end
+
 local function exec_simple(sh, args, hook, no_func)
   local cmd = args[1]
   -- Consume any pending tempenv-call marker (set by exec_stmt for `x=v cmd`): only
@@ -2869,6 +2892,13 @@ local function exec_simple(sh, args, hook, no_func)
       local localize = (cmd == "declare" or cmd == "typeset") and not gflag and (sh.calldepth or 0) > 0
       local allok = true
       for _, a in ipairs(rest) do
+        if a == "SHELLOPTS" and (doexport or roattr) and not unexport and not plusx then
+          -- $SHELLOPTS is a dynamic special (special_get), not a stored var: mark
+          -- it exported and sync the env NOW (set_opt keeps it current after), so
+          -- children inherit the option set. Don't create a shadowing real var.
+          if doexport then sh.shellopts_exported = true; C.setenv("SHELLOPTS", sh:shellopts(), 1) end
+          goto continue
+        end
         local nm, op, val = a:match("^([%a_][%w_]*)(%+?=)(.*)$")
         if nm and sh.vars[sh:deref(nm)] and sh.vars[sh:deref(nm)].ro then
           -- reassigning a readonly variable is rejected (bash: `typeset +r r=v` too)
@@ -2969,6 +2999,7 @@ local function exec_simple(sh, args, hook, no_func)
         else -- a token that isn't a valid name (`FOO-BAR`, `1x`, …): bash errors
           io.stderr:write("curse: " .. cmd .. ": `" .. a .. "': not a valid identifier\n"); allok = false
         end
+        ::continue::
       end
       sh.status = allok and 0 or 1
     end
@@ -4113,6 +4144,9 @@ exec_stmt = function(sh, st, hook)
     end
     local function run_cmd()
       sh.write_err = nil -- a builtin sets this on an output write error (e.g. full disk)
+      -- `set -x` trace: BEFORE the command's own redirects, so `cmd 2>file` doesn't
+      -- capture the trace (bash writes it to the shell's stderr).
+      if sh.opt_x and args[1] ~= nil then xtrace(sh, args) end
       if st.redirs then
         local save, ok = apply_redirs(sh, st.redirs)
         if not ok then

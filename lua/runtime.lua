@@ -759,8 +759,9 @@ function Shell:import_env()
       if k == "PWD" then env_pwd = s:sub(eq + 1)
       elseif k == "OLDPWD" then env_oldpwd = s:sub(eq + 1)
       elseif k == "UID" or k == "EUID" or k == "PPID" -- shell-computed, not from env
-        or k == "SHELLOPTS" or k == "BASHOPTS" then -- readonly, derived live from the option state
-
+        or k == "BASHOPTS" then -- readonly, derived live from the option state
+      elseif k == "SHELLOPTS" then -- inherited set -o options: enable them (bash), keep exported
+        self.shellopts_import = s:sub(eq + 1); self.shellopts_exported = true
       elseif k:match("^[%a_][%w_]*$") then
         self:set_str(k, s:sub(eq + 1))
         self.vars[k].exported = true -- inherited env vars are exported (bash)

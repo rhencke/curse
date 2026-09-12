@@ -77,6 +77,11 @@ local SH_IS_POSIX = SHELLNAME == "sh" or SHELLNAME == "dash" or SHELLNAME == "as
 local function apply(s)
   s.shellname = SHELLNAME
   if SH_IS_POSIX then s.opt_posix = true end
+  -- Options inherited via an exported $SHELLOPTS (set by a parent shell): enable
+  -- each named set -o option we recognize, so e.g. cross-process `set -x` traces.
+  if s.shellopts_import then
+    for name in s.shellopts_import:gmatch("[^:]+") do if OMAP[name] then s[OMAP[name]] = true end end
+  end
   for _, p in ipairs(presets) do
     if p.f then s[p.f] = p.on
     elseif p.o and OMAP[p.o] then s[OMAP[p.o]] = p.on
