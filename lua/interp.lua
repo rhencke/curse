@@ -3964,6 +3964,26 @@ exec_stmt = function(sh, st, hook)
       local b = sh.vars[sh:deref(st.name)]
       if b and not b.arr then b.exported = true; C.setenv(st.name, sh:get(st.name), 1) end
     end
+    -- HISTSIZE shrinks the in-memory history; HISTFILESIZE truncates $HISTFILE —
+    -- both to the last N entries, on assignment (bash).
+    if not st.index and (st.name == "HISTSIZE" or st.name == "HISTFILESIZE") then
+      local nsz = tonumber(sh:get(st.name))
+      if nsz and nsz >= 0 then
+        if st.name == "HISTSIZE" and sh.history then
+          while #sh.history > nsz do table.remove(sh.history, 1) end
+        elseif st.name == "HISTFILESIZE" then
+          local hf = sh:get("HISTFILE")
+          if hf and hf ~= "" then
+            local lines, f = {}, io.open(hf, "r")
+            if f then for l in f:lines() do lines[#lines + 1] = l end; f:close() end
+            if #lines > nsz then
+              local o = io.open(hf, "w")
+              if o then for k = #lines - nsz + 1, #lines do o:write(lines[k], "\n") end; o:close() end
+            end
+          end
+        end
+      end
+    end
     -- exit status of an assignment = the last command substitution's, else 0
     -- (skip when it was a rejected readonly assignment, which already set status 1)
     if not (rb and rb.ro) then
