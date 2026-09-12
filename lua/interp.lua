@@ -4106,8 +4106,8 @@ exec_stmt = function(sh, st, hook)
     end)
     if not aok then
       if type(aerr) == "table" and aerr.__curse_badsub then
-        io.stderr:write("curse: " .. st.name .. ": bad array subscript\n"); sh.status = 1; return
-      elseif type(aerr) == "table" and aerr.__curse_experr then sh.status = 1; return -- bad-subst RHS: non-fatal
+        io.stderr:write("curse: " .. st.name .. ": bad array subscript\n"); sh.status = 1; sh.assign_err = true; return
+      elseif type(aerr) == "table" and aerr.__curse_experr then sh.status = 1; sh.assign_err = true; return -- bad-subst RHS: non-fatal
       else error(aerr) end -- a real error (exit, nounset, matherr) propagates
     end
     end
@@ -4177,7 +4177,13 @@ exec_stmt = function(sh, st, hook)
     sh.func_file = sh.func_file or {}; sh.func_file[st.name] = sh.cur_source or sh.argv0 or ""
     sh.status = 0
   elseif t == "assignlist" then
-    for _, a in ipairs(st.list) do exec_stmt(sh, a, hook) end
+    -- a bad array subscript / bad-subst in one binding aborts the REST of the list
+    -- (bash: `a=x b[0+]=y c=z` sets only a), keeping the error status.
+    for _, a in ipairs(st.list) do
+      sh.assign_err = nil
+      exec_stmt(sh, a, hook)
+      if sh.assign_err then return end
+    end
     sh.status = 0
   elseif t == "simple" then
     local pnp, pnf = procsub_mark(sh) -- drain only <()/>() this command registers
