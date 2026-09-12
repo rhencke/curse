@@ -590,7 +590,28 @@ end
 
 -- A word is a list of parts, each carrying q (came from inside quotes -> not
 -- word-split):  {lit=s} | {var} | {arith} | {param} | {special} | {pexp} | {cmdsub}
+-- bash removes a backslash-newline (line continuation) during tokenization,
+-- EVERYWHERE except inside single quotes — so a continuation splitting any token
+-- vanishes (`$\<nl>?` -> `$?`, `ab\<nl>cd` -> `abcd`). Do it up front (guarded to a
+-- no-op when the word has none) so parse_dollar/parse_dquote see the joined token.
+local function strip_contin(w)
+  if not w:find("\\\n", 1, true) then return w end
+  local o, i, n = {}, 1, #w
+  while i <= n do
+    local c = w:sub(i, i)
+    if c == "'" then -- single quotes: literal, keep verbatim (incl. any \<nl>)
+      local e = w:find("'", i + 1, true) or n
+      o[#o + 1] = w:sub(i, e); i = e + 1
+    elseif c == "\\" then
+      if w:sub(i + 1, i + 1) == "\n" then i = i + 2 -- continuation: drop both
+      else o[#o + 1] = w:sub(i, i + 1); i = i + 2 end -- escaped char: keep the pair
+    else o[#o + 1] = c; i = i + 1 end
+  end
+  return table.concat(o)
+end
+
 local function parse_word(w)
+  w = strip_contin(w)
   local parts = {}
   local function add(p) parts[#parts + 1] = p end
   local i = 1
