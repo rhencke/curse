@@ -161,7 +161,7 @@ else
   sh = T.rt.Shell.new(); apply(sh); sh.argv0 = script; setparams(sh)
   if mode == "compiled" then
     local mod = T.compile(T.parser.parse(src))
-    T.interp.finish_run(sh, function() mod.run(sh, nil) end)
+    T.interp.finish_run(sh, function() T.run_compiled(mod, sh, nil) end)
   elseif mode == "interp" then
     T.interp.run_lazy(sh, src) -- lazy: instant start, never parses past exit
   else

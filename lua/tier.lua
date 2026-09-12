@@ -22,6 +22,21 @@ local function resume_pc(mod, r)
   return (r.kind == "loop") and mod.loopPc[r.id] or mod.stmtPc[r.id]
 end
 
+-- Run the compiled module with the interp's line-abort semantics: a div0/failglob
+-- __curse_lineabort thrown from compiled code aborts the REST of the current input
+-- line (bash), so re-enter run at sh._ff (set by the per-top-level-statement
+-- markers) with $?=1. Under `set -e` it exits like any failed command. Keeping this
+-- retry OUT of the generated run() lets pc/lifted stay fast locals (no closure).
+function M.run_compiled(mod, sh, pc)
+  while true do
+    local ok, err = pcall(mod.run, sh, pc)
+    if ok then return end
+    if type(err) == "table" and err.__curse_lineabort and not sh.opt_e then
+      sh.status = 1; pc = sh._ff
+    else error(err) end
+  end
+end
+
 -- Run with a switch POLICY (synchronous compile). opts.switch_after = hand off
 -- after this many safepoints (nil = pure interpret); opts.ready overrides.
 function M.run(src, opts)
@@ -47,7 +62,7 @@ function M.run(src, opts)
   local ok, err = pcall(I.run_lazy, sh, src, hook) -- lazy interp; ast is for compile only
   if ok then return sh, "interp-only" end
   if type(err) == "table" and err.__curse_switch then
-    mod.run(sh, resume_pc(mod, resume)) -- OSR into compiled code
+    M.run_compiled(mod, sh, resume_pc(mod, resume)) -- OSR into compiled code
     return sh, "switched@" .. resume.kind .. resume.id
   end
   error(err)
@@ -90,7 +105,7 @@ function M.run_background(script_path, opts)
   os.remove(out)
   if ok then return sh, "interp-only", count end
   if type(err) == "table" and err.__curse_switch then
-    I.finish_run(sh, function() mod.run(sh, resume_pc(mod, resume)) end)
+    I.finish_run(sh, function() M.run_compiled(mod, sh, resume_pc(mod, resume)) end)
     return sh, "switched-after-" .. count .. "-safepoints", count
   end
   error(err)

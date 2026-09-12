@@ -408,7 +408,7 @@ end
 -- and every function body. `funcflags[name]` marks user functions (out-of-line
 -- call), `inlinefns[name]` gives the body of an inlinable one (spliced in place).
 -- Returns { blocks, npc, entry, loopPc, stmtPc, DONE }.
-local function build_cfg(stmts, lifted, funcflags, inlinefns)
+local function build_cfg(stmts, lifted, funcflags, inlinefns, toplevel)
   local blocks = {}
   local loopPc, stmtPc = {}, {}
   local npc = 0
@@ -615,6 +615,30 @@ local function build_cfg(stmts, lifted, funcflags, inlinefns)
     nextpc = flatten_stmt(stmts[k], nextpc)
     stmtPc[k] = nextpc
   end
+  -- Top-level line-abort markers (parity with the interp's line model): each
+  -- top-level statement is entered through a tiny marker that records `_ff`, the
+  -- pc to fast-forward to if a div0/failglob lineabort fires — the marker of the
+  -- first LATER statement on a NEW line (or DONE). run's retry loop jumps there
+  -- and sets $?=1 (a "fancy goto"), so `;` is not a newline and a fatal expansion
+  -- aborts only the rest of the current line, matching the interpreter.
+  if toplevel then
+    -- Sync lifted vars to sh at each marker so, on a lineabort, the tier's retry
+    -- wrapper can re-enter run at sh._ff with the pre-statement state intact (run
+    -- re-seeds lifted from sh). This is once per TOP-LEVEL statement, never inside a
+    -- hot loop body, so it costs nothing on the fast path.
+    local wb = {}
+    for n in pairs(lifted) do wb[#wb + 1] = ("sh:aset(%q, %s)"):format(n, lname(n)) end
+    local wbs = #wb > 0 and (table.concat(wb, "; ") .. "; ") or ""
+    local real, mark = {}, {}
+    for k = 1, #stmts do real[k] = stmtPc[k]; mark[k] = newpc() end
+    for k = 1, #stmts do
+      local ff = DONE
+      for j = k + 1, #stmts do if (stmts[j].line or 0) > (stmts[k].line or 0) then ff = mark[j]; break end end
+      blocks[mark[k]] = ("sh._ff = %d; %spc = %d"):format(ff, wbs, real[k])
+      stmtPc[k] = mark[k] -- OSR resume enters at the marker so sh._ff + state are set
+    end
+    return { blocks = blocks, npc = npc, entry = mark[1] or DONE, loopPc = loopPc, stmtPc = stmtPc }
+  end
   return { blocks = blocks, npc = npc, entry = stmtPc[1] or DONE, loopPc = loopPc, stmtPc = stmtPc }
 end
 
@@ -637,6 +661,10 @@ local function assemble(cfg, sig, opts)
   end
   for _, n in ipairs(opts.runlocals or {}) do o[#o + 1] = ("  local %s = sh:aget(%q)"):format(lname(n), n) end
   for _, n in ipairs(opts.upvals or {}) do o[#o + 1] = ("  %s = sh:aget(%q)"):format(lname(n), n) end
+  -- pc stays a plain LOCAL (register-allocated, fast in hot loops). A div0/failglob
+  -- lineabort thrown from compiled code is caught by the tier's retry wrapper, which
+  -- re-enters run at sh._ff — the markers wrote lifted state + sh._ff back per
+  -- top-level statement, so no closure/upvalue boxing (which would slow hot loops).
   o[#o + 1] = opts.toplevel and ("  pc = pc or %d"):format(cfg.entry) or ("  local pc = %d"):format(cfg.entry)
   o[#o + 1] = "  while true do"
   for p = 0, cfg.npc - 1 do
@@ -735,7 +763,7 @@ function M.emit(ast)
   table.sort(funcnames)
   local funcsrc = {} -- name -> verbatim definition text (top-level funcdefs)
   for _, st in ipairs(ast.stmts) do if st.t == "funcdef" and st.deftext then funcsrc[st.name] = st.deftext end end
-  local top = build_cfg(ast.stmts, lifted, funcflags, inlinefns)
+  local top = build_cfg(ast.stmts, lifted, funcflags, inlinefns, true)
   o[#o + 1] = "local loopPc = " .. serialize(top.loopPc)
   o[#o + 1] = "local stmtPc = " .. serialize(top.stmtPc)
   o[#o + 1] = assemble(top, "local function run(sh, pc)",

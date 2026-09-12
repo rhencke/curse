@@ -140,12 +140,24 @@ end
 -- "warm" (ran a cached artifact), "cold" (compiled fresh, then cached), or
 -- "interp" (the compiler couldn't handle it — ran the tree-walker). Never fails
 -- for a cache reason.
+-- Run a compiled module with the interp's line-abort semantics (see tier.lua):
+-- a div0/failglob lineabort re-enters run at sh._ff (next line) with $?=1.
+local function run_compiled(mod, sh, pc)
+  while true do
+    local ok, err = pcall(mod.run, sh, pc)
+    if ok then return end
+    if type(err) == "table" and err.__curse_lineabort and not sh.opt_e then
+      sh.status = 1; pc = sh._ff
+    else error(err) end
+  end
+end
+
 function M.run(src, sh)
   local path = M.artifact_path(src)
 
   local mod = M.load(path)          -- warm hit: skip parse AND emit
   if mod then
-    mod.run(sh, nil)
+    run_compiled(mod, sh, nil)
     return sh, "warm"
   end
 
@@ -158,7 +170,7 @@ function M.run(src, sh)
       local built, m = pcall(chunk)
       if built and type(m) == "table" and m.run then
         M.store(path, code)          -- populate for next time (best-effort)
-        m.run(sh, nil)
+        run_compiled(m, sh, nil)
         return sh, "cold"
       end
     end
