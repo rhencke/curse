@@ -2251,8 +2251,10 @@ local function exec_simple(sh, args, hook, no_func)
     local first = resolve(nums[1], math.max(1, last_default - 15))
     local last = resolve(nums[2], last_default)
     if lflag or true then -- only -l (list) is implemented; treat any fc as a listing
-      local step = (first <= last) and 1 or -1
-      if rflag then first, last, step = last, first, -step end -- -r reverses
+      local step
+      if rflag then -- -r lists high->low, regardless of the given order (bash: a
+        first, last, step = math.max(first, last), math.min(first, last), -1 -- reversed range isn't "undone"
+      else step = (first <= last) and 1 or -1 end -- otherwise follow first->last
       for i = first, last, step do
         if i >= 1 and i <= cur - 1 and sh.history[i] then
           sh:echo((nflag and "" or tostring(i)) .. "\t " .. sh.history[i])
