@@ -378,6 +378,15 @@ end
 M.towupper = function(wc) return tonumber(C.towupper(wc)) end
 M.towlower = function(wc) return tonumber(C.towlower(wc)) end
 M.iswprint = function(wc) return tonumber(C.iswprint(wc)) end
+-- Collation order per LC_COLLATE (glob-result sort, [[ < ]] compare), with a
+-- byte-order tiebreak so equal-weight strings keep a stable total order like bash.
+-- Under LC_COLLATE=C this is plain byte order (strcoll == strcmp), so it is a
+-- no-op there; only a real collating locale reorders.
+function M.coll_lt(a, b)
+  local c = tonumber(C.strcoll(a, b))
+  if c ~= 0 then return c < 0 end
+  return a < b
+end
 
 -- Decode a waitpid status word into a bash exit code: 128+signum when killed by
 -- a signal, else the WEXITSTATUS byte. (Shared by Shell:exec, wait, subshell,
@@ -1491,7 +1500,7 @@ function M.glob_expand(pattern, opts)
     else
       for _, base in ipairs(cur) do
         local hits = scan_seg(base, seg, opts.dotglob, opts.skipdots)
-        table.sort(hits)
+        table.sort(hits, M.coll_lt) -- glob results sort by LC_COLLATE (bash)
         for _, name in ipairs(hits) do nxt[#nxt + 1] = joined(base, name) end
       end
     end
@@ -1499,7 +1508,7 @@ function M.glob_expand(pattern, opts)
     if #cur == 0 then return nil end
   end
   if #cur == 0 then return nil end
-  table.sort(cur)
+  table.sort(cur, M.coll_lt)
   -- dedup: multiple `**` segments can reach the same path more than once
   local seen, dedup = {}, {}
   for _, p in ipairs(cur) do if not seen[p] then seen[p] = true; dedup[#dedup + 1] = p end end

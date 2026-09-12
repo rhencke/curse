@@ -453,8 +453,8 @@ for w in ("-a -b -c -d -e -f -g -h -k -p -r -s -t -u -w -x -G -L -N -O -R -S -o 
 local function binary(x, op, y)
   if op == "=" or op == "==" then return x == y end
   if op == "!=" then return x ~= y end
-  if op == "<" then return x < y end -- string compare (C locale, like bash)
-  if op == ">" then return x > y end
+  if op == "<" then return rt.coll_lt(x, y) end -- string compare by LC_COLLATE (bash)
+  if op == ">" then return rt.coll_lt(y, x) end
   if op == "-ot" or op == "-nt" or op == "-ef" then return file_bincmp(op, x, y) end
   if not TEST_BINOPS[op] then error({ __test_syntax = ("%s: binary operator expected"):format(op) }) end
   local nx, ny = test_int(x), test_int(y)
