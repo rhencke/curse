@@ -1115,6 +1115,9 @@ local function multi_elems(sh, p) -- returns element list, star?
         end
         els = out
       else -- $@/$* and assoc: position-based
+        -- bash's assoc-array slice has an off-by-one quirk: offset N starts at
+        -- element N-1 (so :0 and :1 give the same slice). $@/$* are normal.
+        if off > 0 and sh:is_assoc(pe.name) then off = off - 1 end
         els = array_slice(els, off, len)
       end
     elseif pe.op == "-" and #els == 0 then -- unset/empty array: the default
