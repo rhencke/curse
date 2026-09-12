@@ -724,11 +724,17 @@ end
 -- associative array, else an integer (arith-evaluated) for an indexed one.
 array_key = function(sh, name, index_raw)
   if sh:is_assoc(name) then return expand_word(sh, P.parse_word(index_raw)) end
-  -- indexed: expand $()/$vars in the subscript, then evaluate it as arithmetic
-  local ex = expand_word(sh, P.parse_word(index_raw))
-  if ex == "" then return 0 end
-  local ok, v = pcall(function() return rt.to_arr_key(eval(sh, P.arith(ex))) end)
-  return (ok and v) or 0
+  -- indexed: arith-evaluate the subscript. Parse the RAW subscript with arith (its
+  -- defer/xpand handles $()/$vars) rather than word-expanding it first, so bash's
+  -- arith quote rules apply — a double-quote PAIR strips to its content (`a["3"]`),
+  -- a SINGLE quote is a syntax error (`a['3']` -> status 1, assignment skipped).
+  if index_raw:match("^%s*$") then return 0 end
+  local ok, v = pcall(function() return rt.to_arr_key(eval(sh, P.arith(index_raw))) end)
+  if not ok then
+    io.stderr:write("curse: " .. index_raw .. ": syntax error in expression\n")
+    error({ __curse_exit = 1, __curse_experr = true })
+  end
+  return v
 end
 
 -- Expand ONE part to its string value (a multi-element @/* part is joined here;
