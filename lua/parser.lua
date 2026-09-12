@@ -1332,8 +1332,12 @@ local function make_parser(src, sh)
       return funcdef_node(nm, dstart, dline)
     end
     do
-      local s, e = src:find("^[%w_][%w_%.%-:+@/!#]*", i)
-      if s then
+      -- bash is lenient about funcdef names: `=` is allowed in the middle
+      -- (`func-name=ext () { … }`), as long as the name doesn't END in `=` — that
+      -- is an array/scalar assignment (`a=()`, `x=`), which the assignment path
+      -- handles instead (and `a=(` is caught there before we get here anyway).
+      local s, e = src:find("^[%w_][%w_%.%-:+@/!#=]*", i)
+      if s and src:sub(e, e) ~= "=" then
         local j = e + 1
         while src:sub(j, j):match("[ \t]") do j = j + 1 end
         -- NAME ( ) — a space is allowed between the parens (bash: `fun ( ) { … }`)
