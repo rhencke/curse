@@ -440,7 +440,7 @@ end
 local function test_int(s)
   local d = s:match("^%s*([+-]?%d+)%s*$")
   if not d then error({ __test_syntax = ("%s: integer expression expected"):format(s) }) end
-  return tonumber(d, 10)
+  return rt.str_to_i64(d) -- exact int64 (not a double) so huge values don't collide; base-10, like bash's test
 end
 local TEST_BINOPS = { ["="] = 1, ["=="] = 1, ["!="] = 1, ["<"] = 1, [">"] = 1,
   ["-eq"] = 1, ["-ne"] = 1, ["-lt"] = 1, ["-le"] = 1, ["-gt"] = 1, ["-ge"] = 1,
