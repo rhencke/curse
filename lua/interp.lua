@@ -2868,7 +2868,11 @@ local function exec_simple(sh, args, hook, no_func)
         -- `declare -F NAME` prints just NAME; bare `declare -F` prints `declare -f NAME`.
         if sh.functions[nm] then
           if funcbody then local d = sh.func_src and sh.func_src[nm]; if d then sh:echo(d) end
-          elseif funcnames then sh:echo(named and nm or ("declare -f " .. nm)) end
+          elseif funcnames then
+            if named and sh.shopt.extdebug then -- extdebug: `name line file`
+              sh:echo(nm .. " " .. (sh.func_line and sh.func_line[nm] or 0) .. " " .. (sh.func_file and sh.func_file[nm] or ""))
+            else sh:echo(named and nm or ("declare -f " .. nm)) end
+          end
         else allok = false end
       end
       sh.status = allok and 0 or 1
@@ -4057,6 +4061,9 @@ exec_stmt = function(sh, st, hook)
     sh.functions[st.name] = st.body
     sh.func_redirs = sh.func_redirs or {}; sh.func_redirs[st.name] = st.redirs -- `f(){ … } >&2`
     sh.func_src = sh.func_src or {}; sh.func_src[st.name] = st.deftext -- verbatim def for declare -f
+    -- definition site for `declare -F` under extdebug (name line file)
+    sh.func_line = sh.func_line or {}; sh.func_line[st.name] = st.line
+    sh.func_file = sh.func_file or {}; sh.func_file[st.name] = sh.cur_source or sh.argv0 or ""
     sh.status = 0
   elseif t == "assignlist" then
     for _, a in ipairs(st.list) do exec_stmt(sh, a, hook) end

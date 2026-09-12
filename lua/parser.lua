@@ -1196,7 +1196,7 @@ local function make_parser(src, sh)
   end
   -- A function definition, with any trailing redirects (`f() { … } >&2`) that apply
   -- to the whole body on every call.
-  local function funcdef_node(nm, dstart)
+  local function funcdef_node(nm, dstart, dline)
     local body = func_body()
     -- capture the definition's exact source text (name/`function` through the
     -- closing `}`) so `declare -f`/`type`/`command -V` can recover it verbatim,
@@ -1204,7 +1204,7 @@ local function make_parser(src, sh)
     local deftext = dstart and src:sub(dstart, i - 1) or nil
     local redirs = {}
     while true do ws(); local r = parse_redir(); if r then redirs[#redirs + 1] = r else break end end
-    return { t = "funcdef", name = nm, body = body, deftext = deftext,
+    return { t = "funcdef", name = nm, body = body, deftext = deftext, line = dline,
       redirs = (#redirs > 0 and redirs or nil) }
   end
 
@@ -1272,7 +1272,7 @@ local function make_parser(src, sh)
     -- loop, sharing this guard so a self-referential alias can't loop).
     alias_seen = {}; alias_next = false; alias_tail = nil
     try_alias(true)
-    local dstart = i -- byte offset where this command (hence a funcdef) begins
+    local dstart, dline = i, line -- byte offset + line where this command (hence a funcdef) begins
     -- function NAME [()] { … }   or   NAME() { … }
     -- Function names may contain far more than identifier chars (bash: `show-len`,
     -- `git-foo`, `a.b`), so match a run of non-metacharacter word bytes here.
@@ -1286,7 +1286,7 @@ local function make_parser(src, sh)
         local k = i + 1; while src:sub(k, k):match("[ \t]") do k = k + 1 end
         if src:sub(k, k) == ")" then i = k + 1 end
       end
-      return funcdef_node(nm, dstart)
+      return funcdef_node(nm, dstart, dline)
     end
     do
       local s, e = src:find("^[%w_][%w_%.%-:+@/!#]*", i)
@@ -1298,7 +1298,7 @@ local function make_parser(src, sh)
           local k = j + 1; while src:sub(k, k):match("[ \t]") do k = k + 1 end
           if src:sub(k, k) == ")" then
             local nm = src:sub(s, e); i = k + 1
-            return funcdef_node(nm, dstart)
+            return funcdef_node(nm, dstart, dline)
           end
         end
       end
