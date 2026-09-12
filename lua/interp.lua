@@ -4170,9 +4170,9 @@ exec_stmt = function(sh, st, hook)
     if st.assigns and sh.opt_posix and args[1] and SPECIAL_BUILTIN[args[1]] then
       -- POSIX (bash under `set -o posix`): a variable assignment prefixed to a
       -- SPECIAL builtin (`:`, `.`, eval, export, readonly, set, shift, trap,
-      -- unset, …) persists in the shell as a normal, NON-exported assignment —
-      -- not scoped to the command. `foo=bar :` leaves foo=bar; `foo=bar readonly
-      -- spam=eggs` leaves foo set but not in the environment.
+      -- unset, …) PERSISTS in the shell — and, being a command prefix, stays
+      -- EXPORTED (`foo=bar readonly …` then `printenv foo` -> bar; `x=tmp :`
+      -- leaves x=tmp in the environment).
       -- EXCEPTION, per variable: if the builtin is `unset` and it removes a var we
       -- just assigned, that var REVERTS to its prior value rather than persisting
       -- (`a=A x=tmp unset x` → a=A, x=<prior>); other assigns still persist.
@@ -4186,6 +4186,10 @@ exec_stmt = function(sh, st, hook)
       end
       for _, a in ipairs(st.assigns) do
         if a.raw then sh:set_str(a.name, a.raw) else exec_stmt(sh, a, hook) end
+        if not a.index then -- a scalar command prefix stays exported (bash)
+          local b = sh.vars[sh:deref(a.name)]; if b then b.exported = true end
+          C.setenv(a.name, sh:get(a.name), 1)
+        end
       end
       run_cmd()
       for name, box in pairs(prior) do
