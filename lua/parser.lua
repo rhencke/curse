@@ -1905,15 +1905,26 @@ local function make_parser(src, sh)
       end
       stmts[#stmts + 1] = st
       skip_inline()
-      if st.t ~= "background" then
-        -- foreground: a single `;` continues the line; anything else ends it
-        if src:sub(i, i) == ";" and src:sub(i + 1, i + 1) ~= ";" then i = i + 1; skip_inline()
-        else break end
-      end -- background: the `&` already separated this statement; another may follow
-      if i > n then break end
       local c = src:sub(i, i)
+      if st.t ~= "background" then
+        -- foreground: a single `;` continues the line; `\n`/EOF/`#` end it cleanly.
+        -- A bare separator here (`;;`, `|`) is a syntax error ON the line — bash runs
+        -- nothing on it (`echo 1 ;; echo 2`). Anything else (`(`, `((`, `)`, `}`, a
+        -- stray keyword) is left to the existing statement-boundary handling.
+        if c == ";" and src:sub(i + 1, i + 1) ~= ";" then i = i + 1; skip_inline()
+        elseif i > n or c == "\n" or c == "#" then break
+        else
+          local bsx = bare_sep_tok()
+          if bsx then return { stmts = stmts, perr = { t = "parse_error", line = line, msg = "syntax error near `" .. bsx .. "'" } } end
+          break
+        end
+      elseif i > n or c == "\n" or c == "#" then break -- background & already separated; line may end
+      end
+      -- now at a command position for the next statement; a bare sep here is an error
+      if i > n then break end
+      c = src:sub(i, i)
       if c == "\n" or c == "#" then break end -- end of the logical line
-      local bs2 = bare_sep_tok() -- `;;`, `&&`, `||` etc. with no command before them
+      local bs2 = bare_sep_tok() -- `;;`, `&&`, `||`, bare `;`/`&` with no command before them
       if bs2 then return { stmts = stmts, perr = { t = "parse_error", line = line, msg = "syntax error near `" .. bs2 .. "'" } } end
     end
     if #heredocs_pending > 0 then collect_heredocs() end -- read bodies after the line
