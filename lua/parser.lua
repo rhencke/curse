@@ -32,6 +32,21 @@ local function arith(src, nodefer)
       or src:find("[%w_]%$") or src:find("%$[^%w_{]")) then
     return { k = "xpand", raw = src }
   end
+  -- bash strips matched double-quote PAIRS inside arithmetic (`$(( "1+2" * 3 ))`
+  -- -> 1+2*3), keeping the content; a lone unmatched `"` is left in place so the
+  -- tokenizer reports the error bash does. (Single quotes are never stripped.)
+  if src:find('"', 1, true) then
+    local o, open = {}, false
+    for k = 1, #src do
+      local ch = src:sub(k, k)
+      if ch == '"' then
+        if open then open = false          -- close of a pair: drop it
+        elseif src:find('"', k + 1, true) then open = true -- open of a pair: drop it
+        else o[#o + 1] = ch end            -- unmatched: keep (-> tokenizer errors)
+      else o[#o + 1] = ch end
+    end
+    src = table.concat(o)
+  end
   local i, n = 1, #src
   local function skip() while i <= n and src:sub(i, i):match("%s") do i = i + 1 end end
   local function peek() skip(); return src:sub(i, i) end
