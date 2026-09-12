@@ -2023,12 +2023,12 @@ end
 local SPECIAL_BUILTIN -- forward decl (assigned below); posix dispatch/funcdef rules
 -- xtrace (`set -x`): before running a command, write `$PS4<cmd words>` to stderr,
 -- single-quoting any word that isn't a plain token (bash). PS4's first char is
--- repeated by call depth. Control-char / unicode quoting (bash's $'…') is a
--- byte-fidelity concern we deliberately don't reproduce.
+-- repeated by call depth. A plain token is bare; anything else is quoted the way
+-- bash quotes it (shell_quote: `$'…'` for control/non-printable, else `'…'`).
 local function xtrace_quote(w)
   if w == "" then return "''" end
   if w:match("^[%w_@%%+=:,./%-]+$") then return w end
-  return "'" .. w:gsub("'", "'\\''") .. "'"
+  return rt.shell_quote(w)
 end
 local function xtrace(sh, args)
   local ps4 = sh:get("PS4"); if ps4 == "" then ps4 = "+ " end
