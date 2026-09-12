@@ -1220,7 +1220,10 @@ local function make_parser(src, sh)
     ws()
     if src:sub(i, i) ~= "{" then error("expected { for function body") end
     i = i + 1
-    local stmts = parse_stmts({ ["}"] = true })
+    local stmts, term = parse_stmts({ ["}"] = true })
+    -- a function body that never closes (e.g. an unterminated heredoc ate the `}`)
+    -- is a syntax error in bash ("unexpected end of file"), not a lenient no-op.
+    if term ~= "}" then error("syntax error: unexpected end of file") end
     return stmts
   end
 
@@ -1564,7 +1567,8 @@ local function make_parser(src, sh)
     -- brace group { list; }  and subshell ( list )  — optional trailing redirs
     if src:sub(i, i) == "{" and src:sub(i + 1, i + 1):match("[ \t\n]") then
       i = i + 1
-      local body = parse_stmts({ ["}"] = true })
+      local body, term = parse_stmts({ ["}"] = true })
+      if term ~= "}" then error("syntax error: unexpected end of file") end -- unclosed { }
       local redirs = {}
       while true do ws(); local r = parse_redir(); if r then redirs[#redirs + 1] = r else break end end
       return { t = "group", line = line, body = body, redirs = (#redirs > 0 and redirs or nil) }
