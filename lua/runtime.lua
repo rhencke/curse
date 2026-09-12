@@ -44,6 +44,8 @@ function Shell.new()
     vars = {},       -- name -> { s = string?, n = int64? }  (lazy: fill on demand)
     status = 0,      -- $?
     argv0 = "bash",  -- $0 (set by the CLI/daemon to the script/shell name)
+    shellname = "bash", -- the shell we're mimicking, from our invocation basename
+                        -- (\s prompt escape, posix-when-sh). Set by the CLI.
     start_time = os.time(), -- for $SECONDS
     opt_e = false,   -- set -e (errexit)
     opt_u = false,   -- set -u (nounset)
@@ -1493,7 +1495,7 @@ function Shell:prompt_escapes(s)
       local simple = ({ a = "\7", e = "\27", n = "\n", r = "\r", ["\\"] = "\\",
         ["$"] = (self:special_get("EUID") == "0" and "#" or "$"), t = os.date("%H:%M:%S"),
         T = os.date("%I:%M:%S"), ["@"] = os.date("%I:%M %p"), A = os.date("%H:%M"),
-        d = os.date("%a %b %d"), s = "curse", v = "5.2", V = "5.2.0", ["!"] = "1", ["#"] = "1", j = "0" })[d]
+        d = os.date("%a %b %d"), s = self.shellname or "bash", v = "5.2", V = "5.2.0", ["!"] = "1", ["#"] = "1", j = "0" })[d]
       if d == "[" or d == "]" then i = i + 2 -- non-printing markers: drop
       elseif d == "w" then out[#out + 1] = self:pwd(); i = i + 2
       elseif d == "W" then out[#out + 1] = (self:pwd():gsub(".*/", "")); i = i + 2

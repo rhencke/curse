@@ -51,7 +51,8 @@ local SHNAME = "bash"
 local SH = TMP .. "/" .. SHNAME
 do
   local f = io.open(SH, "w")
-  f:write("#!/bin/sh\nexport CURSE_BUNDLE=" .. BUNDLE .. "\nexec " .. LUAJIT .. " " .. RUNLUA .. ' "$@"\n')
+  -- forward $0 (how the wrapper was invoked) so curse self-identifies by basename
+  f:write("#!/bin/sh\nexport CURSE_BUNDLE=" .. BUNDLE .. " CURSE_ARGV0=\"$0\"\nexec " .. LUAJIT .. " " .. RUNLUA .. ' "$@"\n')
   f:close(); os.execute("chmod +x " .. SH)
 end
 
@@ -152,7 +153,10 @@ local function write_code(code) local f = io.open(codep, "w"); f:write(code); f:
 -- `env` for the var so it survives the `timeout` wrapper (timeout would try to
 -- exec a bare VAR=val assignment as a program).
 local function curse_cmd()
-  local envp = (io.open(BUNDLE, "r") and ("env CURSE_BUNDLE=" .. BUNDLE .. " ") or "")
+  -- the top-level run doesn't go through the wrapper, so set CURSE_ARGV0 here too
+  -- (basename = SHNAME) — curse self-identifies as the shell we're mimicking.
+  local haveb = io.open(BUNDLE, "r"); if haveb then haveb:close() end
+  local envp = "env CURSE_ARGV0=" .. SH .. (haveb and (" CURSE_BUNDLE=" .. BUNDLE) or "") .. " "
   return envp .. LUAJIT .. " " .. RUNLUA .. " " .. codep .. " " .. mode
 end
 

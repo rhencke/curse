@@ -67,7 +67,15 @@ local OMAP = { errexit = "opt_e", errtrace = "opt_errtrace", functrace = "opt_fu
   notify = "opt_b", nounset = "opt_u", onecmd = "opt_t", physical = "opt_P",
   pipefail = "opt_pipefail", posix = "opt_posix", privileged = "opt_p", verbose = "opt_v",
   vi = "opt_vi", xtrace = "opt_x" }
+-- Which shell are we mimicking? By our invocation basename, like busybox/bash
+-- (bash run as `sh` goes posix). The wrapper/launcher forwards its $0 as
+-- CURSE_ARGV0; absent that, we default to bash. Drives \s (prompt) and, for a
+-- posix-named invocation, posix mode.
+local SHELLNAME = (os.getenv("CURSE_ARGV0") or "bash"):match("[^/]+$") or "bash"
+local SH_IS_POSIX = SHELLNAME == "sh" or SHELLNAME == "dash" or SHELLNAME == "ash"
 local function apply(s)
+  s.shellname = SHELLNAME
+  if SH_IS_POSIX then s.opt_posix = true end
   for _, p in ipairs(presets) do
     if p.f then s[p.f] = p.on
     elseif p.o and OMAP[p.o] then s[OMAP[p.o]] = p.on
