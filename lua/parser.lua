@@ -1680,6 +1680,19 @@ local function make_parser(src, sh)
         if c == ")" then i = i + 1; break end
         if c == "\n" then line = line + 1; i = i + 1
         elseif c == "" then break
+        elseif c == "(" then
+          -- an ELEMENT can't be `(` (a nested `()`, as in `a=( inside=() )`): bash
+          -- reports a syntax error but the assignment is NON-fatal (the var stays
+          -- unset, the script CONTINUES). Resync past the outer `)` that closes the
+          -- array, then raise a RECOVERABLE error the line-parser marks as such.
+          local depth = 0
+          while i <= n do
+            local ch = src:sub(i, i)
+            if ch == "(" then depth = depth + 1
+            elseif ch == ")" then depth = depth - 1; if depth < 0 then i = i + 1; break end end
+            i = i + 1
+          end
+          error({ __curse_arraylit = true })
         else
           local w = word(true); if w == "" then break end
           local keyraw, eop, rhs = nil, "=", w
@@ -2015,7 +2028,14 @@ local function make_parser(src, sh)
     while true do
       local start, startline = i, line
       local ok, st = pcall(parse_stmt)
-      if not ok then return { stmts = stmts, perr = { t = "parse_error", line = startline, msg = tostring(st) } } end
+      if not ok then
+        -- A RECOVERABLE parse error (an invalid `NAME=( … )` array-literal element)
+        -- fails only that assignment: bash reports it but the script continues, so
+        -- flag it so the executor runs nothing on the line yet does NOT exit.
+        local recover = type(st) == "table" and st.__curse_arraylit
+        return { stmts = stmts, perr = { t = "parse_error", line = startline,
+          msg = recover and "syntax error near `('" or tostring(st), recoverable = recover or nil } }
+      end
       -- No progress: a stray metacharacter/keyword in command position (`)`, `}`,
       -- `done`, `fi`, …). Report a syntax error (and guard against spinning).
       if i <= start then

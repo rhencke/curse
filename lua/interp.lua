@@ -4812,7 +4812,13 @@ function M.run_lazy(sh, src, hook)
       -- bash parses a whole LOGICAL LINE (a `simple_list` up to a top-level newline)
       -- before executing any of it, so a syntax error ANYWHERE on the line means the
       -- line runs nothing (retroactive). Handle that first.
-      if lg.perr then exec_stmt(sh, lg.perr, hook) end -- raises __curse_exit=2 (bash exits)
+      if lg.perr then
+        -- A RECOVERABLE parse error (invalid `NAME=( … )` array-literal element) is
+        -- reported but NON-fatal: the assignment is dropped (var stays unset) and the
+        -- script continues, like bash. Any other syntax error runs nothing + exits 2.
+        if lg.perr.recoverable then io.stderr:write("curse: " .. (lg.perr.msg or "syntax error") .. "\n"); sh.status = 1
+        else exec_stmt(sh, lg.perr, hook) end -- raises __curse_exit=2 (bash exits)
+      end
       for _, st in ipairs(lg.stmts) do
         k = k + 1
         hook("stmt", k)
