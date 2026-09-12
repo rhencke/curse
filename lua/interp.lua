@@ -3927,7 +3927,9 @@ exec_stmt = function(sh, st, hook)
     local pnp, pnf = procsub_mark(sh) -- a >() redirect target drains after the whole command
     local save, ok = apply_redirs(sh, rd)
     if not ok then sh.status = 1; restore_redirs(save)
-      if sh.opt_e then error({ __curse_exit = 1 }) end -- errexit: a redirect failure exits
+      -- a failed redirect on a compound fires the ERR trap (and, under errexit,
+      -- exits) — bash; the body never ran, so nothing else fires it.
+      if sh.noerr == 0 then fire_err(sh) end
       return end
     local savedout = sh.out; if redirs_touch_stdout(rd) then sh.out = io.write end
     st.redirs = nil
