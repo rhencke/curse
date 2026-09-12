@@ -1303,6 +1303,31 @@ local function make_parser(src, sh)
         end
       end
     end
+    -- A funcdef whose "name" is an EXPANSION (`$foo-bar()`, `foo-$(x)()`): bash
+    -- parses it and reports "not a valid identifier" at RUNTIME (status 1), not a
+    -- parse error. Scan the word (balancing $()); if it's `$`-bearing and followed
+    -- by `()`, treat it as a funcdef with that (invalid) name.
+    do
+      local j, depth = i, 0
+      while j <= n do
+        local c = src:sub(j, j)
+        if c == "$" and src:sub(j + 1, j + 1) == "(" then depth = depth + 1; j = j + 2
+        elseif c == "(" and depth > 0 then depth = depth + 1; j = j + 1
+        elseif c == ")" and depth > 0 then depth = depth - 1; j = j + 1
+        elseif depth == 0 and (c == "" or c:match("[ \t\n(;&|<>]")) then break
+        else j = j + 1 end
+      end
+      if j > i and src:sub(i, j - 1):find("$", 1, true) then
+        local k = j; while src:sub(k, k):match("[ \t]") do k = k + 1 end
+        if src:sub(k, k) == "(" then
+          local m = k + 1; while src:sub(m, m):match("[ \t]") do m = m + 1 end
+          if src:sub(m, m) == ")" then
+            local nm = src:sub(i, j - 1); i = m + 1
+            return funcdef_node(nm, dstart, dline)
+          end
+        end
+      end
+    end
     -- for (( init; cond; step )) ; do BODY done   OR   for NAME in WORDS; do … done
     if peekword() == "for" then
       local ln = line

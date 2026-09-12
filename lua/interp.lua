@@ -4064,6 +4064,11 @@ exec_stmt = function(sh, st, hook)
       else error(aerr) end
     end
   elseif t == "funcdef" then
+    -- a funcdef whose name is an expansion (`$foo-bar()`) is a NON-fatal runtime
+    -- error (bash: status 1) — the name was captured raw by the parser.
+    if not st.name:match("^[%w_][%w_%.%-:+@/!#]*$") then
+      io.stderr:write("curse: `" .. st.name .. "': not a valid identifier\n"); sh.status = 1; return
+    end
     if sh.opt_posix and SPECIAL_BUILTIN[st.name] then -- posix: can't shadow a special builtin
       io.stderr:write("curse: `" .. st.name .. "': is a special builtin\n")
       sh.status = 2; error({ __curse_exit = 2 }) -- fatal (bash aborts)
