@@ -92,6 +92,11 @@ function M.run(sh)
   end
   local buf = ""
   while true do
+    if buf == "" then -- before each PRIMARY prompt, bash runs $PROMPT_COMMAND
+      local ok, err = pcall(interp.run_prompt_command, sh)
+      if not ok and type(err) == "table" and err.__curse_exit then io.flush(); break end
+      io.flush()
+    end
     local prompt = buf == "" and prompt_of(sh, "PS1", "curse\\$ ") or prompt_of(sh, "PS2", "> ")
     local line = read_line(prompt)
     if line == nil then -- EOF

@@ -4658,4 +4658,35 @@ function M.run_lazy(sh, src, hook)
   end))
 end
 
+-- Run $PROMPT_COMMAND before an interactive prompt (bash), in the current shell.
+-- $? is restored afterward so the upcoming command sees the previous command's
+-- status (PROMPT_COMMAND can READ it); side effects (vars, BASH_REMATCH) persist.
+-- A parse error, runtime error, or div0/failglob is reported/absorbed and
+-- non-fatal (the REPL keeps going); only a real `exit` propagates. No EXIT trap
+-- (that's not run per-prompt), so this is NOT run_lazy/finish.
+function M.run_prompt_command(sh, hook)
+  local pc = sh.vars.PROMPT_COMMAND and sh:get("PROMPT_COMMAND")
+  if not pc or pc == "" then return end
+  hook = hook or function() end
+  local saved = sh.status
+  local ok, err = pcall(function()
+    local nextf = P.open(pc, sh)
+    while true do
+      local lg = nextf()
+      if lg == nil then break end
+      if lg.perr then io.stderr:write("curse: PROMPT_COMMAND: line 1: syntax error\n"); return end
+      for _, st in ipairs(lg.stmts) do
+        local sok, serr = pcall(exec_stmt, sh, st, hook)
+        if not sok then
+          if type(serr) == "table" and serr.__curse_exit and not serr.__curse_lineabort then error(serr)
+          elseif type(serr) == "table" and serr.__curse_lineabort then sh.status = 1; break
+          else return end -- other runtime error: non-fatal, like bash
+        end
+      end
+    end
+  end)
+  if not ok then error(err) end -- a real `exit` in PROMPT_COMMAND
+  sh.status = saved
+end
+
 return M
