@@ -295,6 +295,7 @@ ffi.cdef [[
   int wcwidth(int wc);
   int strcoll(const char *s1, const char *s2);
   size_t strxfrm(char *dest, const char *src, size_t n);
+  char *ttyname(int fd);
 ]]
 local C = ffi.C
 
@@ -1693,6 +1694,9 @@ function Shell:prompt_escapes(s)
         T = os.date("%I:%M:%S"), ["@"] = os.date("%I:%M %p"), A = os.date("%H:%M"),
         d = os.date("%a %b %d"), s = self.shellname or "bash", v = "5.2", V = "5.2.0", ["!"] = "1", ["#"] = "1", j = "0" })[d]
       if d == "[" or d == "]" then i = i + 2 -- non-printing markers: drop
+      elseif d == "l" then -- basename of the controlling tty, or "tty" when none (bash)
+        local tn = C.isatty(0) == 1 and C.ttyname(0) or nil
+        out[#out + 1] = tn ~= nil and (ffi.string(tn):gsub(".*/", "")) or "tty"; i = i + 2
       elseif d == "w" then out[#out + 1] = self:pwd(); i = i + 2
       elseif d == "W" then out[#out + 1] = (self:pwd():gsub(".*/", "")); i = i + 2
       elseif d == "u" then out[#out + 1] = os.getenv("USER") or "user"; i = i + 2

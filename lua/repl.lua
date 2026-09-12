@@ -23,6 +23,7 @@ for _, name in ipairs({ "readline", "libreadline.so.8", "libreadline.so.7", "lib
   if ok then RL = lib; break end
 end
 local istty = ffi.C.isatty(0) == 1
+local stderr_tty = ffi.C.isatty(2) == 1 -- bash prints PS1/PS2 only when stderr is a terminal
 local interactive = istty -- becomes true for `-i` too once run() sees opt_i
 
 -- One line of input. With readline: full editing + history. Otherwise plain read.
@@ -33,9 +34,10 @@ local function read_line(prompt)
     local s = ffi.string(c); ffi.C.free(c)
     return s
   end
-  -- The prompt goes to STDERR (bash), so a script's captured stdout isn't polluted
-  -- by PS1/PS2 when commands are piped into an interactive shell.
-  if interactive then io.stderr:write(prompt) end
+  -- The prompt goes to STDERR (bash), and ONLY when stderr is a terminal — a
+  -- `-i` shell with stderr redirected to a file writes no prompt (bash), so a
+  -- script's captured output isn't polluted by PS1/PS2.
+  if interactive and stderr_tty then io.stderr:write(prompt) end
   return io.read("*l")
 end
 
@@ -77,7 +79,7 @@ function M.run(sh)
     local prompt = buf == "" and prompt_of(sh, "PS1", "curse\\$ ") or prompt_of(sh, "PS2", "> ")
     local line = read_line(prompt)
     if line == nil then -- EOF
-      if interactive then io.stderr:write("\n") end -- final newline to stderr, like the prompt
+      if interactive and stderr_tty then io.stderr:write("\n") end -- newline to stderr, like the prompt
       break
     end
     buf = (buf == "") and line or (buf .. "\n" .. line)
