@@ -291,8 +291,11 @@ end
 -- Returns op, argoffset (index of the first argument), or nil.
 local function resolve_cf(st)
   if st.t ~= "simple" or not st.words[1] or st.redirs then return nil end
-  local c, off = full_lit(st.words[1]), 1
-  if (c == "builtin" or c == "command") and st.words[2] then c = full_lit(st.words[2]); off = 2 end
+  local off = 1
+  local c = full_lit(st.words[off])
+  while (c == "builtin" or c == "command") and st.words[off + 1] do -- strip nested builtin/command prefixes
+    off = off + 1; c = full_lit(st.words[off])
+  end
   if c == "break" or c == "continue" or c == "return" then return c, off + 1 end
   return nil
 end
@@ -1073,7 +1076,7 @@ local function build_cfg(stmts, lifted, funcflags, inlinefns, toplevel)
       end
       return p
     elseif t == "simple" then
-      local cmd = st.words[1] and st.words[1].parts[1] and st.words[1].parts[1].lit
+      local cmd = st.words[1] and full_lit(st.words[1]) -- full literal → \-escaped builtins (\exit, \echo) dispatch
       if cmd and emit_redir_funcs[cmd] then return delegate(st, after) end -- call to a def-redirect func
       -- redirects compile (targets computed natively, syscalls via rt.redir_apply)
       -- when every one is compilable AND this isn't `exec` (its redirs persist);
