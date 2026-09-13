@@ -1039,7 +1039,12 @@ local function build_cfg(stmts, lifted, funcflags, inlinefns, toplevel)
       end
       local ua = emit_underscore and '; sh:set_str("_", "")' or "" -- a bare assignment resets $_ (bash)
       if st.arith then
-        blocks[p] = d .. emit_set(st.name, emit_value(st.arith, lifted), lifted) .. ua .. ("; pc = %d"):format(after)
+        -- x=$((…)): a non-lifted read honors set -u and resolves recursively (bash),
+        -- exactly as the $(())-in-word and (( )) paths do — swap in arith_read.
+        local saved = arith_varread; arith_varread = "I.arith_read(sh, %q)"
+        local rhs = emit_value(st.arith, lifted)
+        arith_varread = saved
+        blocks[p] = d .. emit_set(st.name, rhs, lifted) .. ua .. ("; pc = %d"):format(after)
       elseif lifted[st.name] then
         blocks[p] = d .. emit_set(st.name, numeric_word(st.rhs) .. "LL", lifted) .. ua .. ("; pc = %d"):format(after)
       elseif emit_has_attr then -- readonly reject / array [0] / declare -i,-l,-u — via interp's logic

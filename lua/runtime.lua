@@ -865,9 +865,17 @@ local function arith_num(s)
 end
 M.arith_num = arith_num
 
--- int64 integer power (** operator), shared by interp and compiled.
+-- int64 integer power (** operator) for the compiled backend (interp inlines its
+-- own, guarding the negative exponent before it reaches here). bash disallows a
+-- negative exponent: throw the same non-fatal matherr div0 does (lineabort so a
+-- word-context $(( )) aborts the command; matherr so a (( )) pcall maps it to $?=1).
 function M.ipow(base, exp)
-  local r, n = i64(1), tonumber(exp)
+  local n = tonumber(exp)
+  if n < 0 then
+    io.stderr:write("curse: exponent less than 0\n")
+    error({ __curse_exit = 1, __curse_matherr = true, __curse_lineabort = true })
+  end
+  local r = i64(1)
   for _ = 1, n do r = r * base end
   return r
 end
