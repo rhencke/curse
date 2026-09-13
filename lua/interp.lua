@@ -716,8 +716,18 @@ M.eval = eval
 -- compiled == interp on recursive-name-eval / array decay / set -u. It may raise a
 -- non-fatal matherr (bad expression) — the (( )) codegen catches it as status 1.
 function M.arith_read(sh, name)
-  arith_nounset(sh, name)
-  return arith_resolve(sh, sh:get(name))
+  arith_nounset(sh, name) -- set -u: unbound in arith is FATAL (throws, aborts — bash)
+  local s = sh:get(name)
+  if s == nil or s:match("^%s*$") then return i64(0) end
+  if looks_numeric(s) then return rt.arith_num(s) end -- hot path: plain number, no parse/pcall
+  if sh.arithfault then return i64(0) end -- a prior read in this (( )) already faulted
+  -- a name/expression value ("bar", "1 3"): recursively parse+eval. A malformed value
+  -- is a NON-fatal matherr in (( )) — record it as a flag (the arithcmd codegen maps
+  -- the flag to $?=1) instead of throwing, so the common case needs no per-iter pcall.
+  local ok, v = pcall(arith_resolve, sh, s)
+  if ok then return v end
+  if type(v) == "table" and (v.__curse_matherr or v.__curse_experr) then sh.arithfault = true; return i64(0) end
+  error(v)
 end
 
 -- An array subscript used in arithmetic: an associative array takes the

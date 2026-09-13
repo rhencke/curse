@@ -397,6 +397,19 @@ local function arith_can_error(e, lifted)
     or arith_can_error(e.c, lifted) or arith_can_error(e.a, lifted) or arith_can_error(e.b, lifted)
 end
 
+-- Can this arith raise a THROWN error (as opposed to a flagged read fault)? Only
+-- ÷0 / mod-0 / negative ** do — via rt.idiv/imod/ipow. Those need a pcall to catch;
+-- everything else (non-lifted reads) records sh.arithfault without throwing, so the
+-- common accumulator `(( sum += x ))` needs no per-iteration pcall/closure.
+local function arith_can_div_fault(e)
+  if type(e) ~= "table" then return false end
+  local k = e.k
+  if k == "bin" and (e.op == "/" or e.op == "%" or e.op == "**") then return true end
+  if k == "asgn" and (e.op == "/=" or e.op == "%=") then return true end
+  return arith_can_div_fault(e.e) or arith_can_div_fault(e.l) or arith_can_div_fault(e.r)
+    or arith_can_div_fault(e.c) or arith_can_div_fault(e.a) or arith_can_div_fault(e.b)
+end
+
 -- The CFG compiler only understands ARITHMETIC conditions. A forc cond is
 -- already an arith node; a while/if cond is now a command list, which we compile
 -- only when it's exactly one `(( expr ))` — extract that arith node here (never
@@ -960,11 +973,17 @@ local function build_cfg(stmts, lifted, funcflags, inlinefns, toplevel)
       local saved = arith_varread; arith_varread = "I.arith_read(sh, %q)" -- nounset+recursive-eval reads
       local code = emit_arith_into("__ar", st.expr, lifted)
       arith_varread = saved
-      if arith_can_error(st.expr, lifted) then
-        -- a fault is possible: catch a NON-fatal arith error (bad expr / ÷0) as
-        -- $?=1 and continue, exactly like interp's arithcmd; re-raise anything else.
-        blocks[p] = ("do local __ok, __v = pcall(function() local __ar = 0LL; %s; return (__ar ~= 0LL) and 0 or 1 end); "
-          .. "if __ok then sh.status = __v elseif type(__v) == 'table' and __v.__curse_matherr then sh.status = 1 else error(__v) end end%s; pc = %d")
+      if arith_can_div_fault(st.expr) then
+        -- ÷0 / mod-0 / negative ** THROW a non-fatal matherr — catch it (and any
+        -- flagged read fault) as $?=1 and continue, like interp; re-raise anything else.
+        blocks[p] = ("do sh.arithfault = false; local __ok, __v = pcall(function() local __ar = 0LL; %s; return (__ar ~= 0LL) and 0 or 1 end); "
+          .. "if not __ok then if type(__v) == 'table' and __v.__curse_matherr then sh.status = 1 else error(__v) end "
+          .. "elseif sh.arithfault then sh.status = 1 else sh.status = __v end end%s; pc = %d")
+          :format(code, ecs, after)
+      elseif arith_can_error(st.expr, lifted) then
+        -- a non-lifted read may fault; arith_read records it in sh.arithfault WITHOUT
+        -- throwing, so no per-iteration pcall/closure — the accumulator stays JIT-native.
+        blocks[p] = ("do sh.arithfault = false; local __ar = 0LL; %s; sh.status = sh.arithfault and 1 or ((__ar ~= 0LL) and 0 or 1) end%s; pc = %d")
           :format(code, ecs, after)
       else -- provably error-free (lifted ints, +-*/comparisons): inline, JIT-native
         blocks[p] = ("do local __ar = 0LL; %s; sh.status = (__ar ~= 0LL) and 0 or 1 end%s; pc = %d")
