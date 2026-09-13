@@ -46,6 +46,22 @@ local function scan_attr(stmts)
   end
   return false
 end
+-- Does the program install a `trap … SIG` for one of `sigs` (a set of names)? Used
+-- to gate per-command trap hooks (ERR/DEBUG) so a trap-free script pays nothing.
+local function scan_trap(stmts, sigs)
+  for _, st in ipairs(stmts or {}) do
+    if st.t == "simple" and st.words[1] and st.words[1].parts[1]
+        and st.words[1].parts[1].lit == "trap" then
+      for j = 2, #st.words do
+        local l = st.words[j].parts[1] and st.words[j].parts[1].lit
+        if l and sigs[l] then return true end
+      end
+    end
+    if st.body and scan_trap(st.body, sigs) then return true end
+    if st.clauses then for _, cl in ipairs(st.clauses) do if scan_trap(cl.body, sigs) then return true end end end
+  end
+  return false
+end
 
 -- serialize a {int->int} pc map to a Lua table literal
 local function serialize(t)
@@ -134,8 +150,19 @@ end
 local ERREXIT_TYPES = { simple = 1, pipeline = 1, arithcmd = 1, assign = 1,
   assignlist = 1, subshell = 1, dbracket = 1 }
 local ERRCHK = "if sh.opt_e and sh.noerr == 0 and sh.status ~= 0 then error({ __curse_exit = sh.status }) end"
+local emit_has_err = false -- program installs an ERR trap → fire it after a failing command
+local emit_toplevel = false -- current build_cfg is the top level (ERR only fires there; a
+-- compiled function body doesn't track calldepth so it would wrongly fire ERR — bash needs
+-- errtrace for that. Subshell bodies live in the top-level CFG but fire_err_trap's runtime
+-- in_subprogram check keeps ERR from firing in the forked child.)
 local function errchk(st) -- the guard statement for `st`, or "" when errexit never applies
-  return (st and ERREXIT_TYPES[st.t] and not st.negate) and ERRCHK or ""
+  if not (st and ERREXIT_TYPES[st.t] and not st.negate) then return "" end
+  if emit_has_err and emit_toplevel then -- ERR trap fires on the same condition as errexit;
+    -- set $LINENO to this command's line for the handler, fire ERR, THEN errexit (bash order).
+    return ("if sh.noerr == 0 and sh.status ~= 0 then sh.cur_line = %d; I.fire_err_trap(sh); if sh.opt_e then error({ __curse_exit = sh.status }) end end")
+      :format(st.line or 0)
+  end
+  return ERRCHK
 end
 -- Special params emit_word knows how to render; any OTHER `$special` (e.g. `$-`,
 -- the option string) must delegate, or emit_word would silently render it empty.
@@ -740,6 +767,7 @@ end
 -- call), `inlinefns[name]` gives the body of an inlinable one (spliced in place).
 -- Returns { blocks, npc, entry, loopPc, stmtPc, DONE }.
 local function build_cfg(stmts, lifted, funcflags, inlinefns, toplevel)
+  emit_toplevel = toplevel and true or false -- gates top-level-only ERR firing (see errchk)
   local blocks = {}
   local loopPc, stmtPc = {}, {}
   local npc = 0
@@ -1389,6 +1417,7 @@ end
 
 function M.emit(ast)
   emit_has_attr = scan_attr(ast.stmts) -- gate compiled attribute-aware scalar assign
+  emit_has_err = scan_trap(ast.stmts, { ERR = 1 }) -- gate compiled ERR-trap firing
   local funcflags, inlinable, inlinefns = {}, {}, {}
   for _, st in ipairs(ast.stmts) do
     if st.t == "funcdef" then

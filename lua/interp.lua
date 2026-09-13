@@ -4858,6 +4858,7 @@ fire_err = function(sh)
   fire_err_trap(sh)
   if sh.opt_e then error({ __curse_exit = sh.status }) end
 end
+M.fire_err_trap = fire_err_trap -- compiled tier fires ERR after a failing native command
 
 -- Run any trapped real signals that arrived (blocked → pending) since the last
 -- check, in the current scope. Cheap no-op when no signal traps are set.
