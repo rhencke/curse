@@ -114,6 +114,9 @@ function Shell:param(n)
   return (n <= self.nparams) and self.params[n] or ""
 end
 function Shell:paramsJoin(sep) return table.concat(self.params, sep or " ", 1, self.nparams) end
+-- "$*" in a string context: params joined by IFS[0] (space if IFS unset, nothing
+-- if IFS is set but empty) — bash. "$@" always joins by a literal space.
+function Shell:paramsStar() return self:paramsJoin(self.vars["IFS"] and self:get("IFS"):sub(1, 1) or " ") end
 
 -- Positional-only call boundary: push args (varargs) into the depth pool — no
 -- table allocation per call after warmup.

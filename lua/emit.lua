@@ -409,7 +409,8 @@ local function emit_word(w, lifted)
     elseif p.param then parts[#parts + 1] = ("sh:param(%d)"):format(p.param)
     elseif p.special then
       if p.special == "#" then parts[#parts + 1] = "tostring(sh.nparams)"
-      elseif p.special == "@" or p.special == "*" then parts[#parts + 1] = 'sh:paramsJoin(" ")'
+      elseif p.special == "@" then parts[#parts + 1] = 'sh:paramsJoin(" ")'
+      elseif p.special == "*" then parts[#parts + 1] = 'sh:paramsStar()' -- "$*": IFS[0]-joined
       elseif p.special == "?" then parts[#parts + 1] = "tostring(sh.status)"
       elseif p.special == "$" then parts[#parts + 1] = "tostring(sh:pid())"
       elseif p.special == "!" then parts[#parts + 1] = '(sh.last_bg_pid or "")' end
@@ -1083,6 +1084,9 @@ local function build_cfg(stmts, lifted, funcflags, inlinefns, toplevel)
     elseif t == "simple" then
       local cmd = st.words[1] and full_lit(st.words[1]) -- full literal → \-escaped builtins (\exit, \echo) dispatch
       if cmd and emit_redir_funcs[cmd] then return delegate(st, after) end -- call to a def-redirect func
+      -- `local a=(…)` / `declare a=(…)`: the array value lives in st.arrayargs, which
+      -- the native builtin paths don't render — interp does the scope-aware array assign.
+      if st.arrayargs then return delegate(st, after) end
       -- redirects compile (targets computed natively, syscalls via rt.redir_apply)
       -- when every one is compilable AND this isn't `exec` (its redirs persist);
       -- otherwise the whole command delegates.
