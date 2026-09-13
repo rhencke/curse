@@ -977,7 +977,17 @@ local function build_cfg(stmts, lifted, funcflags, inlinefns, toplevel)
       end
       return p
     elseif t == "funcdef" then
-      local p = newpc(); blocks[p] = ("pc = %d"):format(after); return p -- closures are hoisted
+      -- Register the (hoisted) closure into sh.functions when the DEFINITION runs, not
+      -- at load — so a function doesn't "exist" (declare -f / delegated call / prefix
+      -- assign) before its def line (bash). Direct compiled calls use the hoisted local
+      -- regardless. Nested funcdefs (not in funcflags) stay a no-op for now.
+      local p = newpc()
+      if funcflags[st.name] then
+        blocks[p] = ("sh.functions[%q] = %s; pc = %d"):format(st.name, fnlname(st.name), after)
+      else
+        blocks[p] = ("pc = %d"):format(after)
+      end
+      return p
     elseif t == "simple" then
       local cmd = st.words[1] and st.words[1].parts[1] and st.words[1].parts[1].lit
       -- redirects compile (targets computed natively, syscalls via rt.redir_apply)
@@ -1559,7 +1569,7 @@ function M.emit(ast)
   o[#o + 1] = "local loopPc = " .. serialize(top.loopPc)
   o[#o + 1] = "local stmtPc = " .. serialize(top.stmtPc)
   o[#o + 1] = assemble(top, "local function run(sh, pc)",
-    { runlocals = runlocals, upvals = upvals, toplevel = true, register = funcnames, funcsrc = funcsrc })
+    { runlocals = runlocals, upvals = upvals, toplevel = true, funcsrc = funcsrc })
   o[#o + 1] = "return { run = run, loopPc = loopPc, stmtPc = stmtPc }"
   return table.concat(o, "\n") .. "\n"
 end
