@@ -157,7 +157,7 @@ function M.run(src, sh)
 
   local mod = M.load(path)          -- warm hit: skip parse AND emit
   if mod then
-    run_compiled(mod, sh, nil)
+    I.finish_run(sh, function() run_compiled(mod, sh, nil) end) -- exit N -> $?, fire EXIT trap
     return sh, "warm"
   end
 
@@ -170,7 +170,7 @@ function M.run(src, sh)
       local built, m = pcall(chunk)
       if built and type(m) == "table" and m.run then
         M.store(path, code)          -- populate for next time (best-effort)
-        run_compiled(m, sh, nil)
+        I.finish_run(sh, function() run_compiled(m, sh, nil) end) -- exit N -> $?, EXIT trap
         return sh, "cold"
       end
     end
