@@ -1493,32 +1493,34 @@ local function build_cfg(stmts, lifted, funcflags, inlinefns, toplevel)
     return nextpc
   end
 
-  local nextpc = DONE
-  for k = #stmts, 1, -1 do
-    nextpc = flatten_stmt(stmts[k], nextpc)
-    stmtPc[k] = nextpc
-  end
   -- Top-level line-abort markers (parity with the interp's line model): each
   -- top-level statement is entered through a tiny marker that records `_ff`, the
   -- pc to fast-forward to if a div0/failglob lineabort fires — the marker of the
-  -- first LATER statement on a NEW line (or DONE). run's retry loop jumps there
-  -- and sets $?=1 (a "fancy goto"), so `;` is not a newline and a fatal expansion
-  -- aborts only the rest of the current line, matching the interpreter.
+  -- first LATER statement on a NEW line (or DONE). run's retry loop jumps there and
+  -- sets $?=1 (a "fancy goto"), so `;` is not a newline and a fatal expansion aborts
+  -- only the rest of the current line, matching the interpreter. CRITICAL: each
+  -- statement must FLOW INTO the next statement's marker (not its real entry), so
+  -- `sh._ff` is refreshed before every statement — else a lineabort fast-forwards to a
+  -- stale target and re-runs the current statement (e.g. failglob in a for-in list).
+  local mark = {}
+  if toplevel then for k = 1, #stmts do mark[k] = newpc() end end
+  local nextpc = DONE
+  for k = #stmts, 1, -1 do
+    nextpc = flatten_stmt(stmts[k], toplevel and (mark[k + 1] or DONE) or nextpc)
+    stmtPc[k] = nextpc -- the statement's REAL entry
+  end
   if toplevel then
     -- Sync lifted vars to sh at each marker so, on a lineabort, the tier's retry
     -- wrapper can re-enter run at sh._ff with the pre-statement state intact (run
-    -- re-seeds lifted from sh). This is once per TOP-LEVEL statement, never inside a
-    -- hot loop body, so it costs nothing on the fast path.
+    -- re-seeds lifted from sh). Once per TOP-LEVEL statement (never in a hot loop body).
     local wb = {}
     for n in pairs(lifted) do wb[#wb + 1] = ("sh:aset(%q, %s)"):format(n, lname(n)) end
     local wbs = #wb > 0 and (table.concat(wb, "; ") .. "; ") or ""
-    local real, mark = {}, {}
-    for k = 1, #stmts do real[k] = stmtPc[k]; mark[k] = newpc() end
     for k = 1, #stmts do
       local ff = DONE
       for j = k + 1, #stmts do if (stmts[j].line or 0) > (stmts[k].line or 0) then ff = mark[j]; break end end
-      blocks[mark[k]] = ("sh._ff = %d; %spc = %d"):format(ff, wbs, real[k])
-      stmtPc[k] = mark[k] -- OSR resume enters at the marker so sh._ff + state are set
+      blocks[mark[k]] = ("sh._ff = %d; %spc = %d"):format(ff, wbs, stmtPc[k])
+      stmtPc[k] = mark[k] -- entry/OSR resume enters at the marker so sh._ff + state are set
     end
     return { blocks = blocks, npc = npc, entry = mark[1] or DONE, loopPc = loopPc, stmtPc = stmtPc, loopvars = loopvars }
   end
