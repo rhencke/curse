@@ -696,7 +696,10 @@ local function analyze_lift(ast)
     for _, st in ipairs(stmts) do
       if st.t == "assign" then
         assigned[st.name] = true
-        if not st.arith and not (st.rhs and numeric_word(st.rhs)) then disq[st.name] = true end
+        -- an INDEXED assign (`a[i]=…`) makes an ARRAY: never int64-lift it (a native
+        -- scalar can't hold an array, and the delegated array ops read sh.vars).
+        if st.index or (not st.arith and not (st.rhs and numeric_word(st.rhs))) then disq[st.name] = true end
+      elseif st.t == "arrayassign" then disq[st.name] = true -- `a=(…)` array literal
       elseif st.t == "simple" then
         local cmd = st.words[1] and st.words[1].parts[1] and st.words[1].parts[1].lit
         if cmd == "local" then
