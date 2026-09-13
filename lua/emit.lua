@@ -236,6 +236,31 @@ local function resolve_cf(st)
   return nil
 end
 
+-- Does this statement list contain a break/continue the CFG can't place as a static
+-- jump — a non-literal level (`break $x`), extra args (`continue 1 2 3`), or (in a
+-- loop CONDITION) any break/continue at all (loopstack isn't active while the cond is
+-- flattened)? Such a loop delegates whole to the interpreter (else the delegated
+-- break/continue is lost and the compiled loop spins forever). Descends into if/group
+-- but not nested loops/functions/subshells (their break/continue are their own).
+local function hard_cf(stmts, in_cond)
+  for _, st in ipairs(stmts or {}) do
+    local op, argoff = resolve_cf(st)
+    if op == "break" or op == "continue" then
+      if in_cond then return true end
+      local lvlw = st.words[argoff]
+      if lvlw and (not (function() local wl = full_lit(lvlw); return wl and wl:match("^%d+$") end)() or st.words[argoff + 1]) then
+        return true
+      end
+    end
+    if st.t == "if" then
+      for _, cl in ipairs(st.clauses) do if hard_cf(cl.body, in_cond) then return true end end
+    elseif st.t == "group" then
+      if hard_cf(st.body, in_cond) then return true end
+    end
+  end
+  return false
+end
+
 local emit_value
 emit_value = function(e, lifted)
   local k = e.k
@@ -1116,6 +1141,7 @@ local function build_cfg(stmts, lifted, funcflags, inlinefns, toplevel)
       return p
     elseif t == "forc" then
       if st.redirs then return delegate(st, after) end -- redirs on the loop: interp applies them
+      if hard_cf(st.body) then return delegate(st, after) end -- un-static break/continue
       if not_compilable(st.init) or not_compilable(st.cond) or not_compilable(st.step)
           or arith_side_effect(st.cond) then -- a side-effecting cond can't be an emit_bool expr
         return delegate(st, after)
@@ -1136,6 +1162,11 @@ local function build_cfg(stmts, lifted, funcflags, inlinefns, toplevel)
       return condp
     elseif t == "whilec" then
       if st.redirs then return delegate(st, after) end -- redirs on the loop (heredoc/file): interp applies them
+      -- un-static break/continue in the body, or ANY in the command condition (loopstack
+      -- isn't active there) → delegate the whole loop (else the signal is lost → spin).
+      if hard_cf(st.body) or (type(st.cond) == "table" and not st.cond.k and hard_cf(st.cond, true)) then
+        return delegate(st, after)
+      end
       local arith = cond_arith(st.cond)
       if arith and not st.negate and not not_compilable(arith) and not arith_side_effect(arith) then
         -- fast path: a native arith condition `while (( expr ))` — no command run.
@@ -1189,6 +1220,8 @@ local function build_cfg(stmts, lifted, funcflags, inlinefns, toplevel)
       return entry
     elseif t == "forin" then
       if st.redirs then return delegate(st, after) end -- redirs on the loop: interp applies them
+      if hard_cf(st.body) then return delegate(st, after) end -- un-static break/continue
+      if not st.name:match("^[%a_][%w_]*$") then return delegate(st, after) end -- invalid loop var → interp errors
       -- Each word must be word_safe (one field) or a field_word (an unquoted
       -- expansion/glob the field engine splits+globs at runtime). Array/@/* and
       -- mixed literal+expansion words still delegate the whole loop (cold path).
