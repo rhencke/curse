@@ -2052,6 +2052,10 @@ local function make_parser(src, sh)
         -- fails only that assignment: bash reports it but the script continues, so
         -- flag it so the executor runs nothing on the line yet does NOT exit.
         local recover = type(st) == "table" and st.__curse_arraylit
+        -- A real (non-recoverable) syntax error stops parsing (bash): mark done so a
+        -- repeated caller (the eager M.parse) can't spin re-parsing the same bad
+        -- token. A recoverable array-lit error continues (its resync advanced i).
+        if not recover then done = true end
         return { stmts = stmts, perr = { t = "parse_error", line = startline,
           msg = recover and "syntax error near `('" or tostring(st), recoverable = recover or nil } }
       end
@@ -2059,6 +2063,7 @@ local function make_parser(src, sh)
       -- `done`, `fi`, …). Report a syntax error (and guard against spinning).
       if i <= start then
         local tok = peekword() or src:sub(i, i)
+        done = true -- stray keyword/metachar in command position: stop (no-progress guard)
         return { stmts = stmts, perr = { t = "parse_error", line = line, msg = "syntax error near `" .. tok .. "'" } }
       end
       stmts[#stmts + 1] = st
@@ -2073,7 +2078,7 @@ local function make_parser(src, sh)
         elseif i > n or c == "\n" or c == "#" then break
         else
           local bsx = bare_sep_tok()
-          if bsx then return { stmts = stmts, perr = { t = "parse_error", line = line, msg = "syntax error near `" .. bsx .. "'" } } end
+          if bsx then done = true; return { stmts = stmts, perr = { t = "parse_error", line = line, msg = "syntax error near `" .. bsx .. "'" } } end
           break
         end
       elseif i > n or c == "\n" or c == "#" then break -- background & already separated; line may end
@@ -2083,7 +2088,7 @@ local function make_parser(src, sh)
       c = src:sub(i, i)
       if c == "\n" or c == "#" then break end -- end of the logical line
       local bs2 = bare_sep_tok() -- `;;`, `&&`, `||`, bare `;`/`&` with no command before them
-      if bs2 then return { stmts = stmts, perr = { t = "parse_error", line = line, msg = "syntax error near `" .. bs2 .. "'" } } end
+      if bs2 then done = true; return { stmts = stmts, perr = { t = "parse_error", line = line, msg = "syntax error near `" .. bs2 .. "'" } } end
     end
     if #heredocs_pending > 0 then collect_heredocs() end -- read bodies after the line
     return { stmts = stmts }
