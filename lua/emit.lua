@@ -214,6 +214,10 @@ local emit_has_debug = false -- program installs a DEBUG trap → fire it before
 local emit_funcstack = false -- program reads $FUNCNAME → maintain sh.funcstack around calls
 local emit_underscore = false -- program reads $_ → set it to each command's last arg
 local emit_redir_funcs = {} -- funcs with a definition redirect (`f(){…} >&2`): delegate them + their calls
+local emit_multidef = {} -- names defined by more than one top-level funcdef: a single hoisted
+-- fn_x can't represent the sequential redefinition (a call between two defs must see the FIRST
+-- body, but the last `fn_x = function…` wins at load), so both the defs and the calls delegate
+-- to interp, which registers each def into sh.functions in program order and dispatches live.
 -- The DEBUG-trap prefix for a natively-compiled command (else ""). DEBUG fires BEFORE
 -- the command with $LINENO = its line. Top-level only (a compiled function body would
 -- wrongly fire without functrace — bash fires DEBUG once at the CALL site, which is a
@@ -1070,7 +1074,9 @@ local function build_cfg(stmts, lifted, funcflags, inlinefns, toplevel)
       -- at load — so a function doesn't "exist" (declare -f / delegated call / prefix
       -- assign) before its def line (bash). Direct compiled calls use the hoisted local
       -- regardless. Nested funcdefs (not in funcflags) stay a no-op for now.
-      if st.redirs then return delegate(st, after) end -- def-redirect func: interp registers func_redirs
+      -- def-redirect and redefined funcs: interp registers the def (with func_redirs, or
+      -- in program order for a redefinition) — the compiled fn_x can't represent either.
+      if st.redirs or emit_redir_funcs[st.name] then return delegate(st, after) end
       local p = newpc()
       if not st.name:match("^[%w_][%w_%.%-:+@/!#=]*$") then -- name is an expansion (`$foo-bar()`):
         blocks[p] = ("io.stderr:write(%q); sh.status = 1; pc = %d") -- non-fatal runtime error (bash)
@@ -1629,12 +1635,22 @@ function M.emit(ast)
   -- silent (its build_cfg is non-toplevel).
   local no_inline = emit_has_err or emit_has_debug or emit_funcstack
   emit_redir_funcs = {}
+  emit_multidef = {}
+  do -- a name defined by more than one top-level funcdef can't be a single hoisted fn_x
+    local seen = {}
+    for _, st in ipairs(ast.stmts) do
+      if st.t == "funcdef" then
+        if seen[st.name] then emit_multidef[st.name] = true else seen[st.name] = true end
+      end
+    end
+  end
   for _, st in ipairs(ast.stmts) do
     if st.t == "funcdef" then
       -- A function with a DEFINITION redirect (`f(){…} >&2`) applies that redirect per
       -- call (target re-evaluated each time) — interp's run_function does this; a compiled
-      -- fn_x can't. Delegate the funcdef AND its calls to the interpreter.
-      if st.redirs then emit_redir_funcs[st.name] = true
+      -- fn_x can't. Delegate the funcdef AND its calls to the interpreter. Same for a
+      -- redefined name: interp registers each body in sh.functions in program order.
+      if st.redirs or emit_multidef[st.name] then emit_redir_funcs[st.name] = true
       else
         funcflags[st.name] = func_flags(st.body)
         if not no_inline and inlinable_body(st.body) then inlinable[st.name] = true; inlinefns[st.name] = st.body end
