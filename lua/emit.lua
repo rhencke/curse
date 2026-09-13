@@ -287,9 +287,10 @@ end
 local RENDERABLE_SPECIAL = { ["#"] = 1, ["@"] = 1, ["*"] = 1, ["?"] = 1, ["$"] = 1, ["!"] = 1 }
 -- A word emit_word can render (no ${..op..} pexp, no side-effecting arith, no
 -- unhandled special param).
+local pexp_compilable, pexp_scalar -- fwd decl (defined after COMPILE_UNSAFE_VAR)
 local function emitable_word(w)
   for _, p in ipairs(w.parts) do
-    if p.pexp then return false end
+    if p.pexp and not pexp_compilable(p.pexp) then return false end
     if p.procsub then return false end -- <(cmd)/>(cmd): needs the interp's temp-file setup
     if p.special and not RENDERABLE_SPECIAL[p.special] then return false end -- e.g. $-
     if p.arith and arith_side_effect(require("parser").arith(p.arith)) then return false end
@@ -305,7 +306,7 @@ local function word_safe(w)
   for _, p in ipairs(w.parts) do
     if p.special == "@" or p.special == "*" then return false end -- multi-element (even quoted)
     if not p.q then
-      if p.var or p.param or p.special or p.cmdsub then return false end -- unquoted -> splits
+      if p.var or p.param or p.special or p.cmdsub or p.pexp then return false end -- unquoted -> splits
       if p.lit and (p.lit:find("[*?%[]") or p.lit:find("[@!+?*]%(")) then return false end -- unquoted glob / extglob
     end
   end
@@ -471,7 +472,8 @@ local function emit_word(w, lifted)
     elseif p.cmdsub then -- $( … ): run the inner program capturing stdout (interpreted; I/O-bound)
       parts[#parts + 1] = ("sh:capture_src(%q)"):format(p.cmdsub)
     elseif p.pexp then
-      error("curse-nocompile: ${..} operator") -- interp handles it; compiled falls back
+      if not pexp_compilable(p.pexp) then error("curse-nocompile: ${..} operator") end -- interp handles it
+      parts[#parts + 1] = pexp_scalar(p.pexp, lifted)
     end
   end
   if #parts == 0 then return '""' end
@@ -505,6 +507,30 @@ local COMPILE_UNSAFE_VAR = {}
 for _, n in ipairs({ "_", "LINENO", "SECONDS", "FUNCNAME", "BASH_SOURCE", "BASH_LINENO",
   "BASH_COMMAND", "RANDOM", "SRANDOM" }) do COMPILE_UNSAFE_VAR[n] = true end
 
+-- Parameter-expansion OPERATORS whose per-value transform is a runtime PRIMITIVE
+-- (Shell:apply_str_op) applied to natively-computed operands: pattern strip
+-- (#/##/%/%%), glob substitute (/,//), and case-fold (^/^^/,/,,). The op is known
+-- at compile time; the value and (literal) pattern are the operands.
+local PEXP_STROP = { ["#"] = 1, ["##"] = 1, ["%"] = 1, ["%%"] = 1,
+  ["/"] = 1, ["//"] = 1, ["^"] = 1, ["^^"] = 1, [","] = 1, [",,"] = 1 }
+-- A pexp ARG is compile-time constant when it is plain literal glob text: no
+-- expansion ($ ` ~), no quote char (a quoted metachar is literal — different glob
+-- semantics), and no backslash (escapes a glob char, or is a literal in a
+-- replacement). Anything with those needs interp's word expansion, so it delegates.
+local function pexp_literal_arg(a) return a == nil or not a:find("[%$`~\\\"']") end
+function pexp_compilable(pe)
+  if pe.index or pe.via_indirect then return false end -- array subscript / ${!ref} indirection
+  local name = pe.name
+  if type(name) ~= "string" or not name:match("^[%a_][%w_]*$") or COMPILE_UNSAFE_VAR[name] then return false end
+  return PEXP_STROP[pe.op] and pexp_literal_arg(pe.arg) and pexp_literal_arg(pe.arg2) or false
+end
+-- Lua expr for a compilable pexp's scalar string value (assumes pexp_compilable).
+function pexp_scalar(pe, lifted)
+  local val = lifted[pe.name] and ("rt.i64_to_str(%s)"):format(lname(pe.name))
+    or ("sh:get_u(%q)"):format(pe.name) -- get_u: an unset var trips set -u, like bash
+  return ("sh:apply_str_op(%q, %s, %q, %q)"):format(pe.op, val, pe.arg or "", pe.arg2 or "")
+end
+
 local function field_word(w, lifted)
   if not emitable_word(w) then return nil end
   if #w.parts == 0 then return nil end
@@ -522,7 +548,7 @@ local function field_word(w, lifted)
     if p.q then return nil end                 -- a quoted part needs the mask
     if p.special then return nil end           -- @/*/$?/... handled elsewhere
     if p.var and COMPILE_UNSAFE_VAR[p.var] then return nil end -- $LINENO/$_/… → interp
-    if p.var or p.param or p.cmdsub or p.arith or p.arithast then alllit = false
+    if p.var or p.param or p.cmdsub or p.arith or p.arithast or p.pexp then alllit = false
     elseif p.lit then
       allexp = false
       if p.lit:find("[*?%[]") or p.lit:find("[@!+?*]%(") then hasglob = true end -- glob / extglob

@@ -1330,21 +1330,102 @@ local function full_match(s, glob)
   if glob:find("!(", 1, true) then return M.ext_match(s, glob) end -- !() needs the split matcher
   return M.regex_match(s, M.glob_to_ere(glob))
 end
-local function strip_prefix(val, glob, longest)
-  if longest then
-    for k = #val, 0, -1 do if full_match(val:sub(1, k), glob) then return val:sub(k + 1) end end
-  else
-    for k = 0, #val do if full_match(val:sub(1, k), glob) then return val:sub(k + 1) end end
+-- Fast path: a glob with no char class / extglob / escape and at most ONE `*` is
+-- `pre * post` (either side possibly empty), matchable with plain byte find/compare —
+-- no regcomp. Returns the stripped string, or nil when the glob needs the regex path.
+-- The naive strip below tries every split point × a regcomp each, which is O(n)
+-- regex compiles per call — ruinous in a loop (`${p##*/}`), so this handles the
+-- overwhelmingly common patterns (literal, `*/`, `.*`, `*.c`, `foo*`) directly.
+local function simple_glob(glob)
+  if glob:find("[%?%[%]\\]") then return nil end          -- ?, [ ], backslash-escape
+  if glob:find("[@!+?*]%(") then return nil end            -- extglob @(..) etc
+  local star = select(2, glob:gsub("%*", ""))
+  if star == 0 then return "", glob, "" end                -- literal (pre only, no star)
+  if star ~= 1 then return nil end                          -- multiple * -> regex path
+  local pre, post = glob:match("^(.-)%*(.*)$")
+  if post:find("%*") then return nil end
+  return "*", pre, post
+end
+local function fast_strip(val, glob, prefix, longest)
+  local kind, pre, post = simple_glob(glob)
+  if not kind then return nil, false end
+  if kind == "" then -- pure literal: prefix/suffix must match exactly (longest==shortest)
+    local L = pre
+    if prefix then
+      if val:sub(1, #L) == L then return val:sub(#L + 1), true end
+    else
+      if L == "" or val:sub(#val - #L + 1) == L then return (L == "" and val or val:sub(1, #val - #L)), true end
+    end
+    return val, true
   end
-  return val
+  -- pattern = pre * post
+  if prefix then
+    if val:sub(1, #pre) ~= pre then return val, true end     -- must start with pre
+    if post == "" then return longest and "" or val:sub(#pre + 1), true end -- pre* : strip pre / all
+    -- find first/last occurrence of post at or after pre
+    if longest then
+      local last
+      local i = #pre + 1
+      while true do local s = val:find(post, i, true); if not s then break end; last = s; i = s + 1 end
+      if last then return val:sub(last + #post), true end
+    else
+      local s = val:find(post, #pre + 1, true)
+      if s then return val:sub(s + #post), true end
+    end
+    return val, true
+  else -- suffix: pattern pre*post; val must end with post
+    if post ~= "" and val:sub(#val - #post + 1) ~= post then return val, true end
+    local hi = #val - #post - #pre + 1                       -- last valid start of pre
+    if hi < 1 then return val, true end
+    if pre == "" then -- pattern *post: shortest suffix = post only, longest = whole ending in post
+      return longest and "" or val:sub(1, #val - #post), true
+    end
+    if longest then -- first occurrence of pre in [1, hi]
+      local s = val:find(pre, 1, true)
+      if s and s <= hi then return val:sub(1, s - 1), true end
+    else            -- last occurrence of pre in [1, hi]
+      local last, i = nil, 1
+      while true do local s = val:find(pre, i, true); if not s or s > hi then break end; last = s; i = s + 1 end
+      if last then return val:sub(1, last - 1), true end
+    end
+    return val, true
+  end
+end
+-- Regex fallback for strip: compile the glob's ERE ONCE, then regexec each candidate
+-- prefix/suffix. (The naive form recompiled per split point — O(n) regcomps per call.)
+-- `!()` extglob needs the split matcher, so it stays on the per-substring path.
+local function strip_regex(val, glob, prefix, longest)
+  if glob:find("!(", 1, true) then
+    if prefix then
+      if longest then for k = #val, 0, -1 do if full_match(val:sub(1, k), glob) then return val:sub(k + 1) end end
+      else for k = 0, #val do if full_match(val:sub(1, k), glob) then return val:sub(k + 1) end end end
+    else
+      if longest then for k = 1, #val + 1 do if full_match(val:sub(k), glob) then return val:sub(1, k - 1) end end
+      else for k = #val + 1, 1, -1 do if full_match(val:sub(k), glob) then return val:sub(1, k - 1) end end end
+    end
+    return val
+  end
+  local rb = ffi.new("char[512]") -- own regex_t (regbuf local is declared later in the file)
+  if ffi.C.regcomp(rb, M.glob_to_ere(glob), 1 + 8) ~= 0 then return val end -- REG_EXTENDED|REG_NOSUB
+  local function m(s) return ffi.C.regexec(rb, s, 0, nil, 0) == 0 end
+  local res = val
+  if prefix then
+    if longest then for k = #val, 0, -1 do if m(val:sub(1, k)) then res = val:sub(k + 1); break end end
+    else for k = 0, #val do if m(val:sub(1, k)) then res = val:sub(k + 1); break end end end
+  else
+    if longest then for k = 1, #val + 1 do if m(val:sub(k)) then res = val:sub(1, k - 1); break end end
+    else for k = #val + 1, 1, -1 do if m(val:sub(k)) then res = val:sub(1, k - 1); break end end end
+  end
+  ffi.C.regfree(rb)
+  return res
+end
+local function strip_prefix(val, glob, longest)
+  local r, ok = fast_strip(val, glob, true, longest); if ok then return r end
+  return strip_regex(val, glob, true, longest)
 end
 local function strip_suffix(val, glob, longest)
-  if longest then
-    for k = 1, #val + 1 do if full_match(val:sub(k), glob) then return val:sub(1, k - 1) end end
-  else
-    for k = #val + 1, 1, -1 do if full_match(val:sub(k), glob) then return val:sub(1, k - 1) end end
-  end
-  return val
+  local r, ok = fast_strip(val, glob, false, longest); if ok then return r end
+  return strip_regex(val, glob, false, longest)
 end
 local function substr(val, off, len)
   -- ${v:off:len} slices by CHARACTER (codepoint) in the locale, like bash — offset
