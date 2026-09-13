@@ -615,11 +615,15 @@ local function build_cfg(stmts, lifted, funcflags, inlinefns, toplevel)
       if cmd == "return" and redir_apply then return delegate(st, after) end -- rare; wrapper assumes a run body
       local mustdeleg = st.assigns ~= nil -- prefix env -> delegate
       if not mustdeleg then
-        for _, w in ipairs(st.words) do
+        for j, w in ipairs(st.words) do
+          -- The command word of a NATIVE builtin is dispatched by literal name (never
+          -- glob-expanded), so skip its field-engine check — otherwise `[` trips the
+          -- unquoted-glob rule on its own `[` char and the whole `[ … ]` delegates.
+          if j == 1 and NATIVE_BUILTIN[cmd] then -- literal builtin name
           -- functions stay native (so they inline / call fn_x) unless an arg has a
           -- ${..} the codegen can't render; other commands delegate on any word
           -- that needs the field engine (splitting/glob/multi).
-          if isfunc then if not emitable_word(w) then mustdeleg = true; break end
+          elseif isfunc then if not emitable_word(w) then mustdeleg = true; break end
           elseif not word_safe(w) then mustdeleg = true; break end
         end
       end
