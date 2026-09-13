@@ -690,7 +690,8 @@ local function build_cfg(stmts, lifted, funcflags, inlinefns, toplevel)
       return p
     elseif t == "forc" then
       if st.redirs then return delegate(st, after) end -- redirs on the loop: interp applies them
-      if not_compilable(st.init) or not_compilable(st.cond) or not_compilable(st.step) then
+      if not_compilable(st.init) or not_compilable(st.cond) or not_compilable(st.step)
+          or arith_side_effect(st.cond) then -- a side-effecting cond can't be an emit_bool expr
         return delegate(st, after)
       end
       local condp = newpc(); loopPc[st.id] = condp
@@ -710,7 +711,7 @@ local function build_cfg(stmts, lifted, funcflags, inlinefns, toplevel)
     elseif t == "whilec" then
       if st.redirs then return delegate(st, after) end -- redirs on the loop (heredoc/file): interp applies them
       local arith = cond_arith(st.cond)
-      if arith and not st.negate and not not_compilable(arith) then
+      if arith and not st.negate and not not_compilable(arith) and not arith_side_effect(arith) then
         -- fast path: a native arith condition `while (( expr ))` — no command run.
         local condp = newpc(); loopPc[st.id] = condp
         loopstack[#loopstack + 1] = { brk = after, cont = condp }
@@ -788,7 +789,7 @@ local function build_cfg(stmts, lifted, funcflags, inlinefns, toplevel)
           condentry[i] = bentry[i] -- an `else` clause: its body runs unconditionally
         else
           local arith = cond_arith(cl.cond)
-          if arith and not not_compilable(arith) then
+          if arith and not not_compilable(arith) and not arith_side_effect(arith) then
             local cp = newpc()
             blocks[cp] = ("if %s then pc = %d else pc = %d end"):format(emit_bool(arith, lifted), bentry[i], nxt)
             condentry[i] = cp
