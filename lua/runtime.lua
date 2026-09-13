@@ -1720,6 +1720,122 @@ function M.glob_expand(pattern, opts)
   return dedup
 end
 
+-- Field engine, SPLIT path. The compiled tiers call this on the already-computed
+-- VALUE of a SINGLE unquoted expansion (`$list`, `$(cmd)`, `$((expr))`, `${a[@]}`),
+-- or on an unquoted glob LITERAL (`*.txt`). It is the genuine-compilation twin of
+-- interp's expand_to_fields: emitted native code computes the operand string, then
+-- this primitive performs the two runtime-dependent steps that CANNOT be decided at
+-- compile time — IFS word-splitting and pathname (glob) expansion. `split=true` for
+-- an unquoted expansion (split on $IFS, then glob each field); `split=false` for a
+-- literal glob (no splitting — a literal is never word-split — just glob). Because
+-- the whole value came from ONE unquoted source, every char is split- and
+-- glob-active (no per-char quote mask needed). Kept byte-for-byte in lockstep with
+-- expand_to_fields' feed_split + glob tail (interp.lua).
+function M.field_split(sh, value, split)
+  local fields
+  if split then
+    -- word-split on $IFS. IFS is a SET of chars; a delimiter may be multibyte
+    -- (`IFS=ç`), so index by whole codepoint. Whitespace runs collapse, and a single
+    -- non-whitespace delimiter (optionally surrounded by whitespace) ends a field.
+    fields = {}
+    local ifs = sh.vars["IFS"] and sh:get("IFS") or " \t\n"
+    local ifsset = {}; for _, ch in ipairs(M.mb_chars(ifs)) do ifsset[ch.s] = true end
+    local mbifs = M.lc_mb_cur_max() > 1 and ifs:find("[\128-\255]") ~= nil
+    local function isws(c) return c == " " or c == "\t" or c == "\n" end
+    local function inifs(c) return c ~= "" and ifsset[c] end
+    local function clen(v, i)
+      if not mbifs or v:byte(i) < 0x80 then return 1 end
+      return M.mb_charlen(v, i)
+    end
+    local cur = nil
+    local function brk() if cur ~= nil then fields[#fields + 1] = cur; cur = nil end end
+    local v = value
+    local i, n = 1, #v
+    while i <= n do
+      local cl = clen(v, i)
+      local c = cl == 1 and v:sub(i, i) or v:sub(i, i + cl - 1)
+      if inifs(c) then
+        if isws(c) then
+          if cur ~= nil then brk() end
+          i = i + 1
+          while i <= n and isws(v:sub(i, i)) do i = i + 1 end
+          if i <= n then
+            local nl = clen(v, i); local nc = nl == 1 and v:sub(i, i) or v:sub(i, i + nl - 1)
+            if inifs(nc) and not isws(nc) then
+              i = i + nl; while i <= n and isws(v:sub(i, i)) do i = i + 1 end
+            end
+          end
+        else
+          if cur == nil then cur = "" end
+          brk()
+          i = i + cl
+          while i <= n and isws(v:sub(i, i)) do i = i + 1 end
+        end
+      else
+        cur = (cur or "") .. c; i = i + cl
+      end
+    end
+    brk()
+  else
+    fields = { value }
+  end
+  -- pathname expansion on each field (all glob-active; nothing quoted).
+  local out = {}
+  local gi = sh:get("GLOBIGNORE")
+  local gi_exists = sh.vars[sh:deref("GLOBIGNORE")] ~= nil
+  local giset = gi_exists and gi ~= ""
+  local dotglob = gi_exists or (sh.shopt.dotglob and true)
+  local nullglob = sh.shopt.nullglob and true
+  local gipats
+  if giset then -- split on ':' but NOT inside [...]
+    gipats = {}
+    local depth, curp = 0, {}
+    for k = 1, #gi do
+      local c = gi:sub(k, k)
+      if c == "[" then depth = depth + 1; curp[#curp + 1] = c
+      elseif c == "]" then if depth > 0 then depth = depth - 1 end; curp[#curp + 1] = c
+      elseif c == ":" and depth == 0 then if #curp > 0 then gipats[#gipats + 1] = table.concat(curp); curp = {} end
+      else curp[#curp + 1] = c end
+    end
+    if #curp > 0 then gipats[#gipats + 1] = table.concat(curp) end
+  end
+  local noglob = sh.opt_f -- set -f: pathname expansion disabled
+  -- globskipdots defaults ON, globstar defaults OFF (SHOPT_DEFAULT, interp.lua).
+  local skipdots = giset or (sh.shopt.globskipdots ~= false)
+  local globstar = sh.shopt.globstar and true
+  local function glob_active(s)
+    for i = 1, #s do
+      local c = s:sub(i, i)
+      if c == "*" or c == "?" or c == "[" then return true end
+      if (c == "?" or c == "*" or c == "+" or c == "@" or c == "!") and s:sub(i + 1, i + 1) == "(" then return true end
+    end
+    return false
+  end
+  for _, s in ipairs(fields) do
+    if not noglob and glob_active(s) then
+      local m = M.glob_expand(s, { dotglob = dotglob, skipdots = skipdots, globstar = globstar })
+      if m and gipats then
+        local filt = {}
+        for _, x in ipairs(m) do
+          local ig = false
+          for _, gp in ipairs(gipats) do if M.glob_ignore_match(x, gp) then ig = true; break end end
+          if not ig then filt[#filt + 1] = x end
+        end
+        m = (#filt > 0) and filt or nil
+      end
+      if m then for _, x in ipairs(m) do out[#out + 1] = x end
+      elseif sh.shopt.failglob then
+        io.stderr:write("curse: no match: " .. s .. "\n")
+        error({ __curse_exit = 1, __curse_lineabort = true })
+      elseif nullglob then -- drop
+      else out[#out + 1] = s end
+    else
+      out[#out + 1] = s
+    end
+  end
+  return out
+end
+
 -- Apply a ${…} operator. `arg`/`arg2` are already word-expanded by the caller;
 -- `idxnum` is the evaluated numeric subscript when pe.index is an expression.
 function Shell:expand_param(pe, arg, arg2, idxnum)

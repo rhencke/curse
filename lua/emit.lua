@@ -233,6 +233,79 @@ local function emit_word(w, lifted)
   return "(" .. table.concat(parts, " .. ") .. ")"
 end
 
+-- The field engine (genuine compilation). A word that isn't word_safe still
+-- compiles when it is a SINGLE unquoted source that split+glob can process at
+-- runtime on a natively-computed value: either EVERY part is an unquoted expansion
+-- (the whole concatenation word-splits then globs — `$x`, `$x$y`, `$(cmd)`), or the
+-- word is an all-literal unquoted glob (no split — a literal is never word-split —
+-- just glob: `*.txt`). Returns {expr, split} for rt.field_split, else nil. Mixed
+-- literal+expansion (`dir/$x*`) needs the per-char quote mask → interp (delegate).
+-- Dynamic special vars whose VALUE the compiled tier doesn't reproduce (it doesn't
+-- track the current line or maintain $_ / the call stack): a word referencing one
+-- must delegate so the interpreter computes it. `_` and `LINENO` are the tested
+-- ones; the rest depend on execution state the CFG doesn't thread. (When $LINENO is
+-- inlined as a compile-time literal and $_ is tracked natively, drop them here.)
+local COMPILE_UNSAFE_VAR = {}
+for _, n in ipairs({ "_", "LINENO", "SECONDS", "FUNCNAME", "BASH_SOURCE", "BASH_LINENO",
+  "BASH_COMMAND", "RANDOM", "SRANDOM" }) do COMPILE_UNSAFE_VAR[n] = true end
+
+local function field_word(w, lifted)
+  if not emitable_word(w) then return nil end
+  if #w.parts == 0 then return nil end
+  -- Scalar fast path (compile-time decision): a lone arith result or lifted-int64
+  -- var always renders to a numeric string — no IFS/glob chars — so it is provably
+  -- a SINGLE field. Skip the runtime split+glob entirely (one table entry, no alloc).
+  if #w.parts == 1 then
+    local p = w.parts[1]
+    if not p.q and (p.arith or p.arithast or (p.var and lifted[p.var])) then
+      return { expr = emit_word(w, lifted), scalar = true }
+    end
+  end
+  local allexp, alllit, hasglob = true, true, false
+  for _, p in ipairs(w.parts) do
+    if p.q then return nil end                 -- a quoted part needs the mask
+    if p.special then return nil end           -- @/*/$?/... handled elsewhere
+    if p.var and COMPILE_UNSAFE_VAR[p.var] then return nil end -- $LINENO/$_/… → interp
+    if p.var or p.param or p.cmdsub or p.arith or p.arithast then alllit = false
+    elseif p.lit then
+      allexp = false
+      if p.lit:find("[*?%[]") then hasglob = true end
+    else return nil end
+  end
+  if allexp then return { expr = emit_word(w, lifted), split = true } end -- $x / $x$y
+  if alllit and hasglob then
+    if w.parts[1].lit and w.parts[1].lit:sub(1, 1) == "~" then return nil end -- ~ needs interp
+    return { expr = emit_word(w, lifted), split = false }                     -- *.txt
+  end
+  return nil
+end
+
+-- Emit statement(s) appending word `w`'s final field(s) to Lua table `tbl`. A
+-- word_safe word contributes one field (emit_word); a field_word splits+globs at
+-- runtime via rt.field_split. `wrap` (e.g. "rt.cstr(%s)") wraps each final field.
+local function emit_fields_into(tbl, w, lifted, wrap)
+  local function W(x) return wrap and wrap:format(x) or x end
+  local fw = not word_safe(w) and field_word(w, lifted)
+  if word_safe(w) or (fw and fw.scalar) then -- one field, no runtime split/glob
+    return ("%s[#%s+1] = %s"):format(tbl, tbl, W(word_safe(w) and emit_word(w, lifted) or fw.expr))
+  end
+  return ("do local __f = rt.field_split(sh, %s, %s); for __i=1,#__f do %s[#%s+1]=%s end end")
+    :format(fw.expr, tostring(fw.split), tbl, tbl, W("__f[__i]"))
+end
+
+-- Build a `local __a = {...}` argv table for words[from..#words] (each field
+-- split+globbed), or nil if any word needs the interpreter. `wrap` is applied to
+-- each final field. Used for commands whose args word-split/glob.
+local function field_argv(words, from, lifted, wrap, prefix)
+  local out = { prefix and ("local __a = {" .. prefix .. "}") or "local __a = {}" }
+  for j = from, #words do
+    local w = words[j]
+    if not word_safe(w) and not field_word(w, lifted) then return nil end
+    out[#out + 1] = emit_fields_into("__a", w, lifted, wrap)
+  end
+  return table.concat(out, "; ")
+end
+
 -- The CFG compiler only understands ARITHMETIC conditions. A forc cond is
 -- already an arith node; a while/if cond is now a command list, which we compile
 -- only when it's exactly one `(( expr ))` — extract that arith node here (never
@@ -613,6 +686,48 @@ local function build_cfg(stmts, lifted, funcflags, inlinefns, toplevel)
         ["return"] = 1, test = 1, ["["] = 1 }
       local isfunc = (inlinefns and inlinefns[cmd]) or funcflags[cmd]
       if cmd == "return" and redir_apply then return delegate(st, after) end -- rare; wrapper assumes a run body
+      -- FIELD-ENGINE path: an argument word-splits or globs, so argv is variable
+      -- length. Commands with a STATIC dispatch (echo, test/[, a named external, a
+      -- non-inline function) consume it via rt.field_split on natively-computed
+      -- operands; everything else (inline fn, interp-only builtin, prefix env,
+      -- dynamic command word) delegates.
+      if st.assigns == nil then
+        local anyfield = false
+        for j = 1, #st.words do if not word_safe(st.words[j]) then anyfield = true; break end end
+        if anyfield then
+          local from, wrap, call, prefix
+          if cmd == "echo" then from = 2; call = "sh:echo(unpack(__a))"
+          elseif cmd == "test" or cmd == "[" then -- the [ / test command word is a literal (dispatched by
+            from = 2; wrap = "rt.cstr(%s)"; call = "I.do_test(sh, __a)" -- name, never glob-expanded)
+            prefix = ("rt.cstr(%q)"):format(cmd)
+          elseif funcflags[cmd] and (funcflags[cmd].locals or funcflags[cmd].params) then
+            from = 2
+            local ff = funcflags[cmd]
+            call = ff.locals and ("sh:pushCall(unpack(__a)); fn_%s(sh); sh:popCall()"):format(cmd)
+              or ("sh:pushParams(unpack(__a)); fn_%s(sh); sh:popParams()"):format(cmd)
+          elseif cmd ~= nil and not NATIVE_BUILTIN[cmd] and not (inlinefns and inlinefns[cmd])
+              and not funcflags[cmd] and not require("interp").BUILTINS[cmd] then
+            from = 1; call = "sh:exec(unpack(__a))" -- external, static command name
+          else
+            return delegate(st, after)
+          end
+          local builder = field_argv(st.words, from, lifted, wrap, prefix)
+          if not builder then return delegate(st, after) end
+          local p = newpc()
+          local ec = errchk(st); local ecs = ec ~= "" and ("; " .. ec) or ""
+          if redir_apply then
+            -- bash order: expand the words (side-effecting cmdsubs run) BEFORE the
+            -- redirects are applied, so `cmd $(read f) > f` reads f before it's
+            -- truncated. Build argv first, then install redirs around the dispatch.
+            blocks[p] = builder ..
+              ("; do local __rs = {}; if %s then %s else sh.status = 1 end; rt.redir_restore(__rs) end%s; pc = %d")
+              :format(redir_apply, call, ecs, after)
+          else
+            blocks[p] = builder .. "; " .. call .. ecs .. ("; pc = %d"):format(after)
+          end
+          return p
+        end
+      end
       local mustdeleg = st.assigns ~= nil -- prefix env -> delegate
       if not mustdeleg then
         for j, w in ipairs(st.words) do
@@ -759,9 +874,12 @@ local function build_cfg(stmts, lifted, funcflags, inlinefns, toplevel)
       return entry
     elseif t == "forin" then
       if st.redirs then return delegate(st, after) end -- redirs on the loop: interp applies them
-      -- if the word list needs the field engine (splitting/glob/array/@), delegate
-      -- the whole loop to the interpreter (list expansion is cold anyway).
-      for _, w in ipairs(st.words) do if not word_safe(w) then return delegate(st, after) end end
+      -- Each word must be word_safe (one field) or a field_word (an unquoted
+      -- expansion/glob the field engine splits+globs at runtime). Array/@/* and
+      -- mixed literal+expansion words still delegate the whole loop (cold path).
+      for _, w in ipairs(st.words) do
+        if not word_safe(w) and not field_word(w, lifted) then return delegate(st, after) end
+      end
       local initp = newpc()
       local advp = newpc(); loopPc[st.id] = advp -- back-edge = resume point
       loopstack[#loopstack + 1] = { brk = after, cont = advp } -- break exits, continue advances
@@ -770,11 +888,7 @@ local function build_cfg(stmts, lifted, funcflags, inlinefns, toplevel)
       -- init: expand the word list ONCE into sh.forstate[id] (so OSR resumes it)
       local parts = { "local __l = {}" }
       for _, w in ipairs(st.words) do
-        if #w.parts == 1 and w.parts[1].var then
-          parts[#parts + 1] = ("for _,p in ipairs(sh:split(sh:get(%q))) do __l[#__l+1]=p end"):format(w.parts[1].var)
-        else
-          parts[#parts + 1] = "__l[#__l+1] = " .. emit_word(w, lifted)
-        end
+        parts[#parts + 1] = emit_fields_into("__l", w, lifted)
       end
       parts[#parts + 1] = ("sh.forstate[%d] = {list=__l, idx=0}"):format(st.id)
       blocks[initp] = table.concat(parts, "; ") .. ("; pc = %d"):format(advp)
@@ -870,7 +984,13 @@ local function build_cfg(stmts, lifted, funcflags, inlinefns, toplevel)
       -- hot-loop case, so the compiled fork+body path still applies for speed.
       local delpc = delegate(st, after)
       local exitpc = newpc(); blocks[exitpc] = "rt.subshell_exit(sh.status or 0)"
+      -- A subshell is a fork: break/continue inside it target only loops WITHIN the
+      -- subshell, never the parent's. Hide the enclosing loopstack while flattening
+      -- the body (a break/continue with no in-subshell loop becomes a no-op, like
+      -- bash), then restore it for the parent's control flow.
+      local saved_loops = loopstack; loopstack = {}
       local bodyentry = flatten_list(st.body, exitpc)
+      loopstack = saved_loops
       local p = newpc()
       blocks[p] = ("if sh.opt_e then pc = %d else local __pid = rt.subshell_fork(sh); if __pid == 0 then pc = %d else sh.status = rt.subshell_wait(__pid); pc = %d end end")
         :format(delpc, bodyentry, after)
