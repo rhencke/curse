@@ -2106,8 +2106,13 @@ function M.parse(src, sh)
   while true do
     local lg = nextf(); if not lg then break end
     lines[#lines + 1] = lg
+    -- A syntax error on a line means the WHOLE line runs nothing (bash parses the
+    -- line before executing any of it), so the parse_error goes BEFORE the line's
+    -- own statements: a non-recoverable error then aborts (exit 2) before they run,
+    -- and a recoverable one (bad array literal) reports + continues to them — the
+    -- same order run_lazy uses, so the compiler and interpreter agree.
+    if lg.perr then stmts[#stmts + 1] = lg.perr end
     for _, st in ipairs(lg.stmts) do stmts[#stmts + 1] = st end
-    if lg.perr then stmts[#stmts + 1] = lg.perr end -- flatten for eager callers/compiler
   end
   return { stmts = stmts, lines = lines }
 end

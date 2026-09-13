@@ -4455,10 +4455,18 @@ exec_stmt = function(sh, st, hook)
     sh.loopdepth = sh.loopdepth - 1
     sh.status = bodystatus
   elseif t == "parse_error" then
-    -- Reached the unparseable tail (e.g. a makeself binary payload) — bash would
-    -- syntax-error here too. If an earlier exit fired, we never get here.
-    io.stderr:write("curse: syntax error" .. (st.line and (": line " .. st.line) or "") .. "\n")
-    error({ __curse_exit = 2, __curse_parseerr = true })
+    -- A RECOVERABLE parse error (an invalid `NAME=( … )` array-literal element) is
+    -- reported but NON-fatal: the assignment is dropped and the script continues
+    -- (bash). This matches run_lazy's handling, so the compiled path (which reaches
+    -- a parse_error via delegation) behaves the same as the interpreter.
+    if st.recoverable then
+      io.stderr:write("curse: " .. (st.msg or "syntax error") .. "\n"); sh.status = 1
+    else
+      -- Reached the unparseable tail (e.g. a makeself binary payload) — bash would
+      -- syntax-error here too. If an earlier exit fired, we never get here.
+      io.stderr:write("curse: syntax error" .. (st.line and (": line " .. st.line) or "") .. "\n")
+      error({ __curse_exit = 2, __curse_parseerr = true })
+    end
   elseif t == "group" then
     -- { list; } runs in the current shell. Any trailing redirs are applied by the
     -- COMPOUND_REDIR wrapper above (which checks open failures + errexit), so here
