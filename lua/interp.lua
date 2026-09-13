@@ -3940,6 +3940,19 @@ local function eval_dbracket(sh, node)
   return false
 end
 
+-- Compiled-tier [[ ]] leaf primitives: the compiled backend renders the and/or/not
+-- tree as native Lua (short-circuit) and calls these for the leaves, with operands
+-- computed natively via emit_word — genuine compilation, not an AST re-walk.
+function M.dbracket_arith(sh, s) return eval(sh, P.arith(s == "" and "0" or s)) end -- -eq/-lt… operand
+function M.dbracket_unary(sh, op, val) return unary(sh, op, val) end -- file tests, -o, -v, -z/-n
+function M.dbracket_bincmp(l, op, r) return binary(l, op, r) end -- -nt/-ot/-ef
+local function glob_escape(s) return (s:gsub("[%*%?%[%]\\]", "\\%0")) end
+function M.dbracket_eq(sh, l, r, rq) -- ==/= : quoted rhs is literal, else a glob
+  local ic = sh.shopt.nocasematch and true or nil
+  if rq and not ic then return l == r end
+  return rt.glob_match(l, rq and glob_escape(r) or r, ic)
+end
+
 -- Run a loop body, catching break/continue (decrementing multi-level n and
 -- re-raising when it targets an outer loop). Returns "break", "continue", or nil.
 local function run_loop_body(sh, body, hook)

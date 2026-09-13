@@ -491,6 +491,7 @@ local function und(st, lifted)
   return ("; sh:set_str(%q, %s)"):format("_", v)
 end
 
+
 -- The field engine (genuine compilation). A word that isn't word_safe still
 -- compiles when it is a SINGLE unquoted source that split+glob can process at
 -- runtime on a natively-computed value: either EVERY part is an unquoted expansion
@@ -506,6 +507,60 @@ end
 local COMPILE_UNSAFE_VAR = {}
 for _, n in ipairs({ "_", "LINENO", "SECONDS", "FUNCNAME", "BASH_SOURCE", "BASH_LINENO",
   "BASH_COMMAND", "RANDOM", "SRANDOM" }) do COMPILE_UNSAFE_VAR[n] = true end
+
+-- A [[ ]] operand word the compiled tier can render to its exact value: emit_word-able
+-- and free of a dynamic special var whose value the CFG doesn't reproduce ($LINENO/$_…).
+local function db_word_ok(w)
+  if not emitable_word(w) then return false end
+  for _, p in ipairs(w.parts) do
+    if p.var and COMPILE_UNSAFE_VAR[p.var] then return false end
+  end
+  return true
+end
+-- Compile a [[ ]] expression tree to a native Lua boolean expression (and/or/not
+-- short-circuit natively; leaves computed via emit_word + a runtime/interp PRIMITIVE
+-- on the values). Returns the expr, or nil when any leaf can't compile (the caller
+-- delegates the whole [[ ]]). No word splitting happens in [[ ]], so emit_word (a
+-- scalar concat) is exactly the operand value.
+local ARITH_CMP = { ["-eq"] = "==", ["-ne"] = "~=", ["-lt"] = "<", ["-le"] = "<=", ["-gt"] = ">", ["-ge"] = ">=" }
+local function emit_dbracket(node, lifted)
+  local k = node.kind
+  if k == "and" or k == "or" then
+    local a = emit_dbracket(node.l, lifted); if not a then return nil end
+    local b = emit_dbracket(node.r, lifted); if not b then return nil end
+    return "(" .. a .. (k == "and" and " and " or " or ") .. b .. ")"
+  elseif k == "not" then
+    local e = emit_dbracket(node.e, lifted); if not e then return nil end
+    return "(not " .. e .. ")"
+  elseif k == "str" then -- [[ $x ]] : true when non-empty
+    if not db_word_ok(node.word) then return nil end
+    return "(" .. emit_word(node.word, lifted) .. ' ~= "")'
+  elseif k == "unary" then
+    if not db_word_ok(node.word) then return nil end
+    local op, val = node.op, emit_word(node.word, lifted)
+    if op == "-z" then return "(" .. val .. ' == "")' end
+    if op == "-n" then return "(" .. val .. ' ~= "")' end
+    return ("I.dbracket_unary(sh, %q, %s)"):format(op, val) -- file tests, -o, -v
+  elseif k == "binary" then
+    if not db_word_ok(node.l) or not db_word_ok(node.r) then return nil end
+    local op, l = node.op, emit_word(node.l, lifted)
+    if op == "=~" then return nil end -- BASH_REMATCH side effect + status-2 -> interp
+    if op == "==" or op == "=" or op == "!=" then
+      if not node.rq then -- an unquoted RHS is a glob; mixed quoting can't be told apart -> delegate
+        for _, p in ipairs(node.r.parts) do if p.q then return nil end end
+      end
+      local eq = ("I.dbracket_eq(sh, %s, %s, %s)"):format(l, emit_word(node.r, lifted), node.rq and "true" or "false")
+      return op == "!=" and ("(not " .. eq .. ")") or eq
+    elseif ARITH_CMP[op] then
+      return ("(I.dbracket_arith(sh, %s) %s I.dbracket_arith(sh, %s))"):format(l, ARITH_CMP[op], emit_word(node.r, lifted))
+    elseif op == "<" then return ("rt.coll_lt(%s, %s)"):format(l, emit_word(node.r, lifted))
+    elseif op == ">" then return ("rt.coll_lt(%s, %s)"):format(emit_word(node.r, lifted), l)
+    elseif op == "-nt" or op == "-ot" or op == "-ef" then
+      return ("I.dbracket_bincmp(%s, %q, %s)"):format(l, op, emit_word(node.r, lifted))
+    end
+  end
+  return nil
+end
 
 -- Parameter-expansion OPERATORS whose per-value transform is a runtime PRIMITIVE
 -- (Shell:apply_str_op) applied to natively-computed operands: pattern strip
@@ -1025,7 +1080,7 @@ local function build_cfg(stmts, lifted, funcflags, inlinefns, toplevel)
   -- Statement types with no native compiled form yet -> always delegate.
   local DELEGATE = {
     pipeline = 1, case = 1, group = 1,
-    dbracket = 1, arrayassign = 1, parse_error = 1, assignlist = 1, background = 1,
+    arrayassign = 1, parse_error = 1, assignlist = 1, background = 1,
   }
 
   -- Compile one redirect's target to a native Lua expr (op + fd are already
@@ -1120,6 +1175,18 @@ local function build_cfg(stmts, lifted, funcflags, inlinefns, toplevel)
           return p
         end -- else (pexp/${…}): not intercepted — falls through (emit deopts to interp, which is correct)
       end
+    end
+    if t == "dbracket" then
+      -- [[ ]] : compile the and/or/not tree + leaf comparisons natively; $? = 0/1.
+      -- Any leaf the compiler can't render (=~, mixed-quote glob, procsub) -> delegate.
+      if st.redirs then return delegate(st, after) end
+      local cond = emit_dbracket(st.expr, lifted)
+      if not cond then return delegate(st, after) end
+      local p = newpc()
+      local d = dbg(st)
+      local ec = errchk(st); local ecs = ec ~= "" and ("; " .. ec) or ""
+      blocks[p] = d .. ("sh.status = (%s) and 0 or 1%s; pc = %d"):format(cond, ecs, after)
+      return p
     end
     if DELEGATE[t] then return delegate(st, after) end
     if t == "assign" then

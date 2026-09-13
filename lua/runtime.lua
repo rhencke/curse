@@ -1681,8 +1681,16 @@ function M.regex_captures(s, ere, icase)
   return caps
 end
 
--- Full (anchored) shell-glob match, for `case` patterns.
+-- Full (anchored) shell-glob match, for `case` patterns and [[ == ]].
 function M.glob_match(s, glob, icase)
+  if not icase then -- simple globs (no ?/[/extglob, ≤1 star) match with plain byte ops
+    local kind, pre, post = simple_glob(glob)
+    if kind == "" then return s == pre end                      -- literal
+    if kind == "*" then                                          -- pre*post
+      return #s >= #pre + #post and s:sub(1, #pre) == pre
+        and (post == "" or s:sub(#s - #post + 1) == post)
+    end
+  end
   if glob:find("!(", 1, true) then return M.ext_match(s, glob, icase) end -- !() needs the split matcher
   return M.regex_match(s, glob_to_ere(glob), icase)
 end
