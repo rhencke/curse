@@ -943,8 +943,11 @@ local function build_cfg(stmts, lifted, funcflags, inlinefns, toplevel)
       elseif lifted[st.name] then
         blocks[p] = d .. emit_set(st.name, numeric_word(st.rhs) .. "LL", lifted) .. ("; pc = %d"):format(after)
       elseif emit_has_attr then -- readonly reject / array [0] / declare -i,-l,-u — via interp's logic
-        blocks[p] = d .. ("I.assign_scalar(sh, %q, %s); pc = %d")
-          :format(st.name, emit_word(st.rhs, lifted), after)
+        -- status 0 first so a plain RHS yields 0 (a cmdsub RHS overwrites it), then
+        -- assign_scalar (which sets 1 on a readonly reject); errchk applies errexit/ERR.
+        local ec = errchk(st); local ecs = ec ~= "" and ("; " .. ec) or ""
+        blocks[p] = d .. ("sh.status = 0; I.assign_scalar(sh, %q, %s)%s; pc = %d")
+          :format(st.name, emit_word(st.rhs, lifted), ecs, after)
       else
         blocks[p] = d .. ("sh:set_str(%q, %s); pc = %d"):format(st.name, emit_word(st.rhs, lifted), after)
       end
