@@ -51,16 +51,19 @@ function M.run(src, opts)
   end
   local hook = function(kind, id)
     count = count + 1
-    -- Hand off ONLY at a true top-level safepoint the compiled CFG can resume at:
-    -- never inside a function call (calldepth > 0), and never inside a FORKED child
-    -- (a subshell / $() / async / pipeline stage — in_subprogram/in_pipestage > 0):
-    -- that child's loop has no pc in the top-level module (subshells are delegated),
-    -- so OSR-ing it would jump to the wrong place. Children stay interp.
-    if resume == nil and sh.calldepth == 0
-        and (sh.in_subprogram or 0) == 0 and (sh.in_pipestage or 0) == 0
-        and ready(kind, id, count) then
+    -- Hand off only where the compiled module has a resume pc for THIS safepoint:
+    -- never inside a function call (calldepth>0), and — crucially — a forked child
+    -- (subshell) resumes into its OWN bounded fragment (whose loops now have pcs),
+    -- NOT the top-level continuation. A still-delegated context has no pc, so
+    -- resume_pc is nil there and the child stays in the interpreter.
+    if resume ~= nil or sh.calldepth ~= 0 or not ready(kind, id, count) then return end
+    local pc = resume_pc(mod, { kind = kind, id = id })
+    if pc ~= nil then
       resume = { kind = kind, id = id }
-      error({ __curse_switch = true })
+      -- carry the OSR itself on the error, so whoever catches it can run it: the
+      -- top level here, OR a forked subshell child (which OSRs into its own
+      -- bounded fragment and _exits, without the parent's finish_run/EXIT trap).
+      error({ __curse_switch = true, osr = function() M.run_compiled(mod, sh, pc) end })
     end
   end
 
@@ -95,17 +98,22 @@ function M.run_background(script_path, opts)
     -- Don't OSR into compiled code while a DEBUG/RETURN trap is armed: those fire
     -- per-command, which the native compiled path can't reproduce. Stay in interp.
     if sh.traps and (sh.traps.DEBUG or sh.traps.RETURN) then return end
-    -- Never OSR inside a forked child (subshell/$()/async/pipeline stage): its loop
-    -- has no pc in the top-level module, so it must stay in the interpreter.
-    if (sh.in_subprogram or 0) ~= 0 or (sh.in_pipestage or 0) ~= 0 then return end
-    if mod == nil and sh.calldepth == 0 and count % poll_every == 0 then
-      local cf = io.open(out, "r")
-      if cf then
-        cf:close()
-        mod = assert(loadfile(out))() -- fully written (atomic rename)
-        resume = { kind = kind, id = id }
-        error({ __curse_switch = true })
-      end
+    if sh.calldepth ~= 0 then return end -- inside a function call: not an OSR target
+    if mod == nil then
+      if count % poll_every ~= 0 then return end
+      local cf = io.open(out, "r"); if not cf then return end
+      cf:close(); mod = assert(loadfile(out))() -- fully written (atomic rename)
+    end
+    -- OSR only where THIS context has a resume pc: the top level, or a forked child
+    -- (subshell) into its OWN bounded fragment. A delegated context has no pc, so
+    -- it stays in the interpreter. The compiled module (out.lua) is the SAME shared
+    -- artifact for parent and children — each jumps to the entry that matches it.
+    local pc = resume_pc(mod, { kind = kind, id = id })
+    if pc ~= nil then
+      resume = { kind = kind, id = id }
+      -- attach the OSR (see M.run) so a forked subshell child can OSR itself into
+      -- its own bounded fragment (ends in subshell_exit → _exit) when it catches this.
+      error({ __curse_switch = true, osr = function() M.run_compiled(mod, sh, pc) end })
     end
   end
 

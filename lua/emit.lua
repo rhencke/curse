@@ -65,6 +65,35 @@ local function not_compilable(e)
   return not_compilable(e.e) or not_compilable(e.l) or not_compilable(e.r)
     or not_compilable(e.c) or not_compilable(e.a) or not_compilable(e.b)
 end
+-- Does a subshell body statically run `set`? A fork-compiled subshell body is a
+-- straight-line sub-CFG; it can't honor an errexit toggle (`set -e`) that turns
+-- on partway through, whereas the interpreter checks errexit per command. So a
+-- body that runs `set` is delegated WHOLE to the interpreter (still inside a
+-- fork), matching interp exactly. (Errexit INHERITED at entry is handled
+-- separately by the runtime `sh.opt_e` guard in the subshell branch.)
+local function stmt_runs_set(st)
+  local t = st.t
+  if t == "simple" then
+    local w1 = st.words[1]
+    return (w1 and w1.parts[1] and w1.parts[1].lit) == "set"
+  elseif t == "background" then return stmt_runs_set(st.cmd)
+  elseif t == "pipeline" then
+    for _, c in ipairs(st.cmds) do if stmt_runs_set(c) then return true end end
+  elseif t == "andor" then
+    for _, it in ipairs(st.items) do if stmt_runs_set(it.cmd) then return true end end
+  elseif t == "if" or t == "case" then
+    for _, cl in ipairs(st.clauses) do
+      for _, s in ipairs(cl.body) do if stmt_runs_set(s) then return true end end
+    end
+  elseif st.body then
+    for _, s in ipairs(st.body) do if stmt_runs_set(s) then return true end end
+  end
+  return false
+end
+local function body_runs_set(list)
+  for _, st in ipairs(list) do if stmt_runs_set(st) then return true end end
+  return false
+end
 -- A word emit_word can render (no ${..op..} pexp, no side-effecting arith).
 local function emitable_word(w)
   for _, p in ipairs(w.parts) do
@@ -437,7 +466,7 @@ local function build_cfg(stmts, lifted, funcflags, inlinefns, toplevel)
 
   -- Statement types with no native compiled form yet -> always delegate.
   local DELEGATE = {
-    arithcmd = 1, andor = 1, pipeline = 1, case = 1, group = 1, subshell = 1,
+    arithcmd = 1, andor = 1, pipeline = 1, case = 1, group = 1,
     dbracket = 1, arrayassign = 1, parse_error = 1, assignlist = 1, background = 1,
   }
 
@@ -460,6 +489,9 @@ local function build_cfg(stmts, lifted, funcflags, inlinefns, toplevel)
     elseif t == "funcdef" then
       local p = newpc(); blocks[p] = ("pc = %d"):format(after); return p -- closures are hoisted
     elseif t == "simple" then
+      -- a redirect-only command (`< file`) has no words: nothing to compile, so
+      -- delegate — the field engine / redirection live in the interpreter anyway.
+      if not st.words[1] then return delegate(st, after) end
       local cmd = st.words[1].parts[1] and st.words[1].parts[1].lit
       -- delegate if it needs the field engine (splitting/glob/pexp), a redirect,
       -- or a builtin without a native compiled form.
@@ -599,6 +631,28 @@ local function build_cfg(stmts, lifted, funcflags, inlinefns, toplevel)
         end
       end
       return entry or after
+    elseif t == "subshell" then
+      -- ( body ): a subshell is not special, just SEPARATED — fork, and the child
+      -- runs the body as a BOUNDED sub-CFG that _exits at its end (so it never runs
+      -- the top-level continuation); the parent waits. The body's loops get their
+      -- own loopPc entries, so a forked child that started in interp can OSR into
+      -- the RIGHT place (its own fragment), honoring interp/bg-compile/OSR. Redirs
+      -- on the subshell delegate for now.
+      if st.redirs then return delegate(st, after) end
+      -- A body that toggles options with `set` (e.g. `set -e` mid-body) needs the
+      -- interpreter's per-command semantics, which the straight-line sub-CFG can't
+      -- reproduce — delegate the whole subshell (interp forks + enforces it).
+      if body_runs_set(st.body) then return delegate(st, after) end
+      -- Under errexit INHERITED at entry, likewise delegate at runtime (the fork +
+      -- errexit enforcement happen in the interpreter). errexit is off in the
+      -- hot-loop case, so the compiled fork+body path still applies for speed.
+      local delpc = delegate(st, after)
+      local exitpc = newpc(); blocks[exitpc] = "rt.subshell_exit(sh.status or 0)"
+      local bodyentry = flatten_list(st.body, exitpc)
+      local p = newpc()
+      blocks[p] = ("if sh.opt_e then pc = %d else local __pid = rt.subshell_fork(sh); if __pid == 0 then pc = %d else sh.status = rt.subshell_wait(__pid); pc = %d end end")
+        :format(delpc, bodyentry, after)
+      return p
     else
       return delegate(st, after) -- unknown/cold statement: run it via the interpreter
     end
@@ -689,7 +743,10 @@ local function assert_compilable(stmts)
     elseif t == "andor" then error("curse-nocompile: && / || list")
     elseif t == "pipeline" then error("curse-nocompile: pipeline")
     elseif t == "case" then error("curse-nocompile: case")
-    elseif t == "group" or t == "subshell" then error("curse-nocompile: group/subshell")
+    elseif t == "group" then error("curse-nocompile: group")
+    elseif t == "subshell" then
+      if st.redirs then error("curse-nocompile: subshell with redirs") end
+      assert_compilable(st.body) -- bare ( body ) compiles: fork + bounded sub-CFG
     elseif t == "dbracket" then error("curse-nocompile: [[ ]]")
     elseif t == "arrayassign" then error("curse-nocompile: array assign")
     elseif t == "assign" and (st.index or st.append) then error("curse-nocompile: array/append assign")

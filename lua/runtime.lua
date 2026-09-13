@@ -409,6 +409,23 @@ function M.coll_lt(a, b)
   if c ~= 0 then return c < 0 end
   return a < b
 end
+-- Subshell fork helpers for the COMPILED path: a `( … )` is compiled as fork + a
+-- bounded body sub-CFG that _exits at its boundary (so it never runs the top-level
+-- continuation), while the parent waits — the same design as the interp subshell,
+-- so a forked child running the body honors interp/bg-compile/OSR like any code.
+function M.subshell_fork(sh) -- returns pid (0 in the child, which is set up here)
+  io.flush() -- flush buffered parent stdout so the fork doesn't duplicate it
+  local pid = C.fork()
+  if pid == 0 then
+    sh.in_subprogram = (sh.in_subprogram or 0) + 1 -- ERR trap won't fire here (sans errtrace)
+    sh.loopdepth = 0 -- an enclosing loop isn't ours to break/continue
+    sh.out = io.write
+  end
+  return pid
+end
+local _ss_st = ffi.new("int[1]")
+function M.subshell_wait(pid) C.waitpid(pid, _ss_st, 0); return M.wexit(_ss_st[0]) end
+function M.subshell_exit(status) io.flush(); C._exit(status or 0) end
 -- bash values are C strings: a NUL byte terminates them. Truncate at the first NUL
 -- wherever a byte string becomes a variable value or an argv entry (assignment,
 -- fields/argv, for-lists). I/O streams (echo/printf output, pipes) keep raw NULs —

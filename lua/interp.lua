@@ -4461,6 +4461,11 @@ exec_stmt = function(sh, st, hook)
         sh.out = io.write
         exec_list(sh, st.body, hook, false)
       end)
+      -- Tiered handoff INSIDE the child: the compiled artifact is ready, so this
+      -- child OSRs into its OWN bounded fragment (the subshell's compiled sub-CFG,
+      -- which _exits at the boundary) instead of interpreting the rest. The child
+      -- honors interp/bg-compile/OSR like any code — it just jumps to the right pc.
+      if not ok and type(err) == "table" and err.__curse_switch then err.osr() end
       child_status(sh, ok, err)
       io.flush() -- flush BEFORE _exit (which doesn't); exit/error skips an inline flush
       C._exit(sh.status or 0)
