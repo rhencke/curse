@@ -709,6 +709,17 @@ eval = function(sh, e)
 end
 M.eval = eval
 
+-- Read a variable in ARITHMETIC context, exactly as the interpreter's `var` node
+-- does: enforce nounset, then resolve the value AS AN ARITH EXPRESSION (a bare
+-- number is itself; a name or "3+4" is recursively parsed+evaluated; an array
+-- decays to [0]). The compiled tiers call this for every non-lifted arith read so
+-- compiled == interp on recursive-name-eval / array decay / set -u. It may raise a
+-- non-fatal matherr (bad expression) — the (( )) codegen catches it as status 1.
+function M.arith_read(sh, name)
+  arith_nounset(sh, name)
+  return arith_resolve(sh, sh:get(name))
+end
+
 -- An array subscript used in arithmetic: an associative array takes the
 -- evaluated-then-stringified value as its key ("5"), an indexed array a number.
 arith_key = function(sh, name, idxexpr, idxraw)

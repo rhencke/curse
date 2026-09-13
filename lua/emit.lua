@@ -139,6 +139,13 @@ local function word_safe(w)
   return true
 end
 
+-- How a NON-lifted arith var read is emitted. Default `sh:aget` parses the value's
+-- immediate number (fast, used by whilec/forc/arith-word conditions). Inside a
+-- (( )) command the arithcmd codegen swaps in I.arith_read, which matches interp
+-- exactly (nounset + recursive-name-eval + array decay); codegen is synchronous, so
+-- this scoped toggle needs no threading through emit_value's recursion.
+local arith_varread = "sh:aget(%q)"
+
 local emit_value
 emit_value = function(e, lifted)
   local k = e.k
@@ -147,7 +154,7 @@ emit_value = function(e, lifted)
     return ("rt.arith_num(%q)"):format(e.v) -- 0x.. / 010 octal / N#.. bases
   end
   if k == "raw" then return e.code end -- a pre-computed Lua expr (inlined param binding)
-  if k == "var" then return lifted[e.name] and lname(e.name) or ("sh:aget(%q)"):format(e.name) end
+  if k == "var" then return lifted[e.name] and lname(e.name) or (arith_varread):format(e.name) end
   if k == "param" then return ("rt.str_to_i64(sh:param(%d))"):format(e.n) end
   if k == "un" then
     if e.op == "-" then return "(-(" .. emit_value(e.e, lifted) .. "))" end
@@ -304,6 +311,90 @@ local function field_argv(words, from, lifted, wrap, prefix)
     out[#out + 1] = emit_fields_into("__a", w, lifted, wrap)
   end
   return table.concat(out, "; ")
+end
+
+-- Arith usable in a VALUE position (what emit_value renders): pure, no side effect,
+-- no array subscript / embedded $-expansion / dynamic-special var.
+local function arith_value_ok(e)
+  if type(e) ~= "table" then return false end
+  local k = e.k
+  if k == "num" or k == "param" then return true end
+  if k == "var" then return not e.idx and not e.idxraw and not COMPILE_UNSAFE_VAR[e.name] end
+  if k == "un" then return arith_value_ok(e.e) end
+  if k == "bin" then return arith_value_ok(e.l) and arith_value_ok(e.r) end
+  if k == "tern" then return arith_value_ok(e.c) and arith_value_ok(e.a) and arith_value_ok(e.b) end
+  return false -- asgn/post/pre/comma/xpand/matherr are not values
+end
+
+-- Arith usable at STATEMENT position ((( … )) or forc init/step): a comma sequence,
+-- a top-level assignment/inc/dec (with a value-position rhs), or a pure value. A
+-- side effect nested in an operand, an array subscript, or a dynamic special var
+-- ($LINENO/$_/…) delegates to the interpreter (the emitter renders none of those).
+local function arith_stmt_ok(e)
+  if type(e) ~= "table" then return false end
+  local k = e.k
+  if k == "comma" then return arith_stmt_ok(e.l) and arith_stmt_ok(e.r) end
+  if k == "asgn" then
+    return not e.idx and not e.idxraw and not COMPILE_UNSAFE_VAR[e.name] and arith_value_ok(e.e)
+  end
+  if k == "post" or k == "pre" then
+    return not e.idx and not e.idxraw and not COMPILE_UNSAFE_VAR[e.name]
+  end
+  return arith_value_ok(e)
+end
+
+-- Emit statements that evaluate arith `e` WITH its side effects, leaving the
+-- result int64 in Lua local `dst`. A lifted var is a native int64 local; a
+-- non-lifted one goes through the sh:aget/aset int64 accessors (genuine primitive
+-- calls on natively-computed values, not an AST re-walk). Compound ops reuse
+-- emit_value's operator logic (div0, shifts, **) via a synthetic bin node.
+local function emit_arith_into(dst, e, lifted)
+  local k = e.k
+  if k == "comma" then -- l for its side effect, r for the result
+    return emit_arith_into(dst, e.l, lifted) .. "; " .. emit_arith_into(dst, e.r, lifted)
+  end
+  if k == "asgn" then
+    local rhs
+    if e.op == "=" then rhs = emit_value(e.e, lifted) -- pure define: no read of the target
+    else
+      local cur = lifted[e.name] and lname(e.name) or (arith_varread):format(e.name) -- compound reads first
+      rhs = emit_value({ k = "bin", op = e.op:sub(1, #e.op - 1), l = { k = "raw", code = cur }, r = e.e }, lifted)
+    end
+    if lifted[e.name] then return ("%s = %s; %s = %s"):format(lname(e.name), rhs, dst, lname(e.name)) end
+    return ("%s = sh:aset(%q, %s)"):format(dst, e.name, rhs)
+  end
+  if k == "pre" then -- ++x / --x: update, then result is the new value
+    if lifted[e.name] then
+      return ("%s = %s + %dLL; %s = %s"):format(lname(e.name), lname(e.name), e.d, dst, lname(e.name))
+    end
+    return ("%s = sh:aset(%q, %s + %dLL)"):format(dst, e.name, (arith_varread):format(e.name), e.d)
+  end
+  if k == "post" then -- x++ / x--: result is the OLD value, then update
+    if lifted[e.name] then
+      return ("%s = %s; %s = %s + %dLL"):format(dst, lname(e.name), lname(e.name), lname(e.name), e.d)
+    end
+    return ("%s = %s; sh:aset(%q, %s + %dLL)"):format(dst, (arith_varread):format(e.name), e.name, dst, e.d)
+  end
+  return ("%s = %s"):format(dst, emit_value(e, lifted)) -- a pure value
+end
+
+-- Can this arith raise at runtime? A non-lifted read may fault (nounset /
+-- recursive-eval parse error / bad array value); /, %, ** and /=, %= can fault
+-- (÷0, negative exponent). If none apply, the (( )) result is emitted inline with
+-- no pcall — keeping the lifted-int64 hot loop native (JIT-compilable).
+local function arith_can_error(e, lifted)
+  if type(e) ~= "table" then return false end
+  local k = e.k
+  if k == "var" then return not lifted[e.name] end
+  if k == "bin" and (e.op == "/" or e.op == "%" or e.op == "**") then return true end
+  if k == "asgn" then
+    if e.op == "/=" or e.op == "%=" then return true end
+    if e.op ~= "=" and not lifted[e.name] then return true end -- compound reads the target
+    return arith_can_error(e.e, lifted)
+  end
+  if (k == "post" or k == "pre") and not lifted[e.name] then return true end
+  return arith_can_error(e.e, lifted) or arith_can_error(e.l, lifted) or arith_can_error(e.r, lifted)
+    or arith_can_error(e.c, lifted) or arith_can_error(e.a, lifted) or arith_can_error(e.b, lifted)
 end
 
 -- The CFG compiler only understands ARITHMETIC conditions. A forc cond is
@@ -573,7 +664,7 @@ local function build_cfg(stmts, lifted, funcflags, inlinefns, toplevel)
 
   -- Statement types with no native compiled form yet -> always delegate.
   local DELEGATE = {
-    arithcmd = 1, pipeline = 1, case = 1, group = 1,
+    pipeline = 1, case = 1, group = 1,
     dbracket = 1, arrayassign = 1, parse_error = 1, assignlist = 1, background = 1,
   }
 
@@ -816,6 +907,29 @@ local function build_cfg(stmts, lifted, funcflags, inlinefns, toplevel)
           :format(redir_apply, body, ecs, after)
       else
         blocks[p] = body .. ecs .. ("; pc = %d"):format(after)
+      end
+      return p
+    elseif t == "arithcmd" then
+      -- (( expr )): evaluate expr WITH side effects natively (assignments, ++/--,
+      -- comma), then $? = (result != 0) ? 0 : 1 — bash's arith-command status. No
+      -- delegation; the interpreter is only used for the parts the emitter can't
+      -- render (array subscripts, embedded $-expansion, $LINENO/$_, redirects).
+      if st.redirs then return delegate(st, after) end
+      if not arith_stmt_ok(st.expr) then return delegate(st, after) end
+      local p = newpc()
+      local ec = errchk(st); local ecs = ec ~= "" and ("; " .. ec) or ""
+      local saved = arith_varread; arith_varread = "I.arith_read(sh, %q)" -- nounset+recursive-eval reads
+      local code = emit_arith_into("__ar", st.expr, lifted)
+      arith_varread = saved
+      if arith_can_error(st.expr, lifted) then
+        -- a fault is possible: catch a NON-fatal arith error (bad expr / ÷0) as
+        -- $?=1 and continue, exactly like interp's arithcmd; re-raise anything else.
+        blocks[p] = ("do local __ok, __v = pcall(function() local __ar = 0LL; %s; return (__ar ~= 0LL) and 0 or 1 end); "
+          .. "if __ok then sh.status = __v elseif type(__v) == 'table' and __v.__curse_matherr then sh.status = 1 else error(__v) end end%s; pc = %d")
+          :format(code, ecs, after)
+      else -- provably error-free (lifted ints, +-*/comparisons): inline, JIT-native
+        blocks[p] = ("do local __ar = 0LL; %s; sh.status = (__ar ~= 0LL) and 0 or 1 end%s; pc = %d")
+          :format(code, ecs, after)
       end
       return p
     elseif t == "forc" then
