@@ -4047,6 +4047,7 @@ local function run_debug(sh, line)
   if exited then error({ __curse_exit = trap_status }) end
   if sh.opt_e and trap_status ~= 0 then error({ __curse_exit = trap_status }) end
 end
+M.run_debug = run_debug -- compiled tier fires DEBUG before each native command
 
 local tv_now = ffi.new("struct curse_timeval") -- reused buffer for `time`'s wall clock
 local function wall_secs()

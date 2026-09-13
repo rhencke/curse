@@ -164,6 +164,16 @@ local function errchk(st) -- the guard statement for `st`, or "" when errexit ne
   end
   return ERRCHK
 end
+local emit_has_debug = false -- program installs a DEBUG trap → fire it before each command
+-- The DEBUG-trap prefix for a natively-compiled command (else ""). DEBUG fires BEFORE
+-- the command with $LINENO = its line. Top-level only (a compiled function body would
+-- wrongly fire without functrace — bash fires DEBUG once at the CALL site, which is a
+-- top-level command). Delegated commands fire DEBUG via interp's exec_stmt, so this is
+-- prepended ONLY to native blocks (exactly one fires).
+local function dbg(st)
+  if emit_has_debug and emit_toplevel then return ("I.run_debug(sh, %d); "):format(st.line or 0) end
+  return ""
+end
 -- Special params emit_word knows how to render; any OTHER `$special` (e.g. `$-`,
 -- the option string) must delegate, or emit_word would silently render it empty.
 local RENDERABLE_SPECIAL = { ["#"] = 1, ["@"] = 1, ["*"] = 1, ["?"] = 1, ["$"] = 1, ["!"] = 1 }
@@ -895,15 +905,16 @@ local function build_cfg(stmts, lifted, funcflags, inlinefns, toplevel)
       if st.index or st.append or (st.rhs and not emitable_word(st.rhs))
         or (st.arith and arith_side_effect(st.arith)) then return delegate(st, after) end
       local p = newpc()
+      local d = dbg(st) -- DEBUG trap fires before the assignment (bash: DEBUG_FIRE.assign)
       if st.arith then
-        blocks[p] = emit_set(st.name, emit_value(st.arith, lifted), lifted) .. ("; pc = %d"):format(after)
+        blocks[p] = d .. emit_set(st.name, emit_value(st.arith, lifted), lifted) .. ("; pc = %d"):format(after)
       elseif lifted[st.name] then
-        blocks[p] = emit_set(st.name, numeric_word(st.rhs) .. "LL", lifted) .. ("; pc = %d"):format(after)
+        blocks[p] = d .. emit_set(st.name, numeric_word(st.rhs) .. "LL", lifted) .. ("; pc = %d"):format(after)
       elseif emit_has_attr then -- readonly reject / array [0] / declare -i,-l,-u — via interp's logic
-        blocks[p] = ("I.assign_scalar(sh, %q, %s); pc = %d")
+        blocks[p] = d .. ("I.assign_scalar(sh, %q, %s); pc = %d")
           :format(st.name, emit_word(st.rhs, lifted), after)
       else
-        blocks[p] = ("sh:set_str(%q, %s); pc = %d"):format(st.name, emit_word(st.rhs, lifted), after)
+        blocks[p] = d .. ("sh:set_str(%q, %s); pc = %d"):format(st.name, emit_word(st.rhs, lifted), after)
       end
       return p
     elseif t == "funcdef" then
@@ -922,7 +933,7 @@ local function build_cfg(stmts, lifted, funcflags, inlinefns, toplevel)
       -- (their open/truncate is the effect), status 0 (or 1 on failure), then restore.
       if not st.words[1] then
         local p = newpc()
-        blocks[p] = ("do local __rs = {}; sh.status = %s and 0 or 1; rt.redir_restore(__rs) end; pc = %d")
+        blocks[p] = dbg(st) .. ("do local __rs = {}; sh.status = %s and 0 or 1; rt.redir_restore(__rs) end; pc = %d")
           :format(redir_apply, after)
         return p
       end
@@ -961,15 +972,16 @@ local function build_cfg(stmts, lifted, funcflags, inlinefns, toplevel)
           if not builder then return delegate(st, after) end
           local p = newpc()
           local ec = errchk(st); local ecs = ec ~= "" and ("; " .. ec) or ""
+          local d = dbg(st) -- DEBUG fires before the command (and its expansions)
           if redir_apply then
             -- bash order: expand the words (side-effecting cmdsubs run) BEFORE the
             -- redirects are applied, so `cmd $(read f) > f` reads f before it's
             -- truncated. Build argv first, then install redirs around the dispatch.
-            blocks[p] = builder ..
+            blocks[p] = d .. builder ..
               ("; do local __rs = {}; if %s then %s else sh.status = 1 end; rt.redir_restore(__rs) end%s; pc = %d")
               :format(redir_apply, call, ecs, after)
           else
-            blocks[p] = builder .. "; " .. call .. ecs .. ("; pc = %d"):format(after)
+            blocks[p] = d .. builder .. "; " .. call .. ecs .. ("; pc = %d"):format(after)
           end
           return p
         end
@@ -1055,13 +1067,14 @@ local function build_cfg(stmts, lifted, funcflags, inlinefns, toplevel)
       end
       local ec = errchk(st) -- errexit after a failing native simple command
       local ecs = ec ~= "" and ("; " .. ec) or ""
+      local d = dbg(st) -- DEBUG fires before the command
       if redir_apply then
         -- install the redirs (backing up fds), run the command only if they all
         -- succeeded (else $?=1, bash), then restore the fds — real syscalls, no AST.
-        blocks[p] = ("do local __rs = {}; if %s then %s else sh.status = 1 end; rt.redir_restore(__rs) end%s; pc = %d")
+        blocks[p] = d .. ("do local __rs = {}; if %s then %s else sh.status = 1 end; rt.redir_restore(__rs) end%s; pc = %d")
           :format(redir_apply, body, ecs, after)
       else
-        blocks[p] = body .. ecs .. ("; pc = %d"):format(after)
+        blocks[p] = d .. body .. ecs .. ("; pc = %d"):format(after)
       end
       return p
     elseif t == "arithcmd" then
@@ -1073,23 +1086,24 @@ local function build_cfg(stmts, lifted, funcflags, inlinefns, toplevel)
       if not arith_stmt_ok(st.expr) then return delegate(st, after) end
       local p = newpc()
       local ec = errchk(st); local ecs = ec ~= "" and ("; " .. ec) or ""
+      local d = dbg(st) -- DEBUG fires before the (( )) command (bash: DEBUG_FIRE.arithcmd)
       local saved = arith_varread; arith_varread = "I.arith_read(sh, %q)" -- nounset+recursive-eval reads
       local code = emit_arith_into("__ar", st.expr, lifted)
       arith_varread = saved
       if arith_can_div_fault(st.expr) then
         -- ÷0 / mod-0 / negative ** THROW a non-fatal matherr — catch it (and any
         -- flagged read fault) as $?=1 and continue, like interp; re-raise anything else.
-        blocks[p] = ("do sh.arithfault = false; local __ok, __v = pcall(function() local __ar = 0LL; %s; return (__ar ~= 0LL) and 0 or 1 end); "
+        blocks[p] = d .. ("do sh.arithfault = false; local __ok, __v = pcall(function() local __ar = 0LL; %s; return (__ar ~= 0LL) and 0 or 1 end); "
           .. "if not __ok then if type(__v) == 'table' and __v.__curse_matherr then sh.status = 1 else error(__v) end "
           .. "elseif sh.arithfault then sh.status = 1 else sh.status = __v end end%s; pc = %d")
           :format(code, ecs, after)
       elseif arith_can_error(st.expr, lifted) then
         -- a non-lifted read may fault; arith_read records it in sh.arithfault WITHOUT
         -- throwing, so no per-iteration pcall/closure — the accumulator stays JIT-native.
-        blocks[p] = ("do sh.arithfault = false; local __ar = 0LL; %s; sh.status = sh.arithfault and 1 or ((__ar ~= 0LL) and 0 or 1) end%s; pc = %d")
+        blocks[p] = d .. ("do sh.arithfault = false; local __ar = 0LL; %s; sh.status = sh.arithfault and 1 or ((__ar ~= 0LL) and 0 or 1) end%s; pc = %d")
           :format(code, ecs, after)
       else -- provably error-free (lifted ints, +-*/comparisons): inline, JIT-native
-        blocks[p] = ("do local __ar = 0LL; %s; sh.status = (__ar ~= 0LL) and 0 or 1 end%s; pc = %d")
+        blocks[p] = d .. ("do local __ar = 0LL; %s; sh.status = (__ar ~= 0LL) and 0 or 1 end%s; pc = %d")
           :format(code, ecs, after)
       end
       return p
@@ -1418,11 +1432,17 @@ end
 function M.emit(ast)
   emit_has_attr = scan_attr(ast.stmts) -- gate compiled attribute-aware scalar assign
   emit_has_err = scan_trap(ast.stmts, { ERR = 1 }) -- gate compiled ERR-trap firing
+  emit_has_debug = scan_trap(ast.stmts, { DEBUG = 1 }) -- gate compiled DEBUG-trap firing
   local funcflags, inlinable, inlinefns = {}, {}, {}
+  -- With a DEBUG/ERR trap, DON'T inline: an inlined body runs at the caller's level,
+  -- where its commands would fire DEBUG/ERR that bash scopes to the (un-entered)
+  -- function. A normal call fires the trap once at the call site and keeps the body
+  -- silent (its build_cfg is non-toplevel).
+  local no_inline = emit_has_err or emit_has_debug
   for _, st in ipairs(ast.stmts) do
     if st.t == "funcdef" then
       funcflags[st.name] = func_flags(st.body)
-      if inlinable_body(st.body) then inlinable[st.name] = true; inlinefns[st.name] = st.body end
+      if not no_inline and inlinable_body(st.body) then inlinable[st.name] = true; inlinefns[st.name] = st.body end
     end
   end
   -- Lift purely-arith vars to native int64. A var touched by no OUT-OF-LINE
