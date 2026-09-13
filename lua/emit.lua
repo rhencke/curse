@@ -94,10 +94,30 @@ local function body_runs_set(list)
   for _, st in ipairs(list) do if stmt_runs_set(st) then return true end end
   return false
 end
--- A word emit_word can render (no ${..op..} pexp, no side-effecting arith).
+-- errexit (`set -e`): after a failing command the shell exits — but only for the
+-- statement kinds bash applies it to (a compound's INNER commands fire it; &&/||
+-- have their own final-operand rule handled by the delegated interp; conditions
+-- run with sh.noerr set, which we honor). In the compiled CFG a native command is
+-- never a condition (those are arith or delegate the whole construct), so the same
+-- kinds the interpreter checks (see interp errexit_stmt) get this guard. `noerr`
+-- is maintained by the interpreter around delegated conditions, so a compiled
+-- function called AS a condition (interp sets noerr, then calls the compiled fn)
+-- correctly does NOT fire. Off the errexit path (`sh.opt_e` false) it's one branch.
+local ERREXIT_TYPES = { simple = 1, pipeline = 1, arithcmd = 1, assign = 1,
+  assignlist = 1, subshell = 1, dbracket = 1 }
+local ERRCHK = "if sh.opt_e and sh.noerr == 0 and sh.status ~= 0 then error({ __curse_exit = sh.status }) end"
+local function errchk(st) -- the guard statement for `st`, or "" when errexit never applies
+  return (st and ERREXIT_TYPES[st.t] and not st.negate) and ERRCHK or ""
+end
+-- Special params emit_word knows how to render; any OTHER `$special` (e.g. `$-`,
+-- the option string) must delegate, or emit_word would silently render it empty.
+local RENDERABLE_SPECIAL = { ["#"] = 1, ["@"] = 1, ["*"] = 1, ["?"] = 1, ["$"] = 1, ["!"] = 1 }
+-- A word emit_word can render (no ${..op..} pexp, no side-effecting arith, no
+-- unhandled special param).
 local function emitable_word(w)
   for _, p in ipairs(w.parts) do
     if p.pexp then return false end
+    if p.special and not RENDERABLE_SPECIAL[p.special] then return false end -- e.g. $-
     if p.arith and arith_side_effect(require("parser").arith(p.arith)) then return false end
     if p.arithast and arith_side_effect(p.arithast) then return false end -- inlined arith
   end
@@ -459,6 +479,10 @@ local function build_cfg(stmts, lifted, funcflags, inlinefns, toplevel)
     for n in pairs(lifted) do out[#out + 1] = ("sh:aset(%q, %s)"):format(n, lname(n)) end
     out[#out + 1] = ("I.exec_stmt(sh, %s, __noop)"):format(ser(st))
     for n in pairs(lifted) do out[#out + 1] = ("%s = sh:aget(%q)"):format(lname(n), n) end
+    -- errexit: a delegated errexit-relevant statement (interp's exec_stmt doesn't
+    -- fire it — exec_list does) gets the guard here. Compounds (if/for/case) fire
+    -- errexit for their inner commands inside exec_stmt already, so they're excluded.
+    local ec = errchk(st); if ec ~= "" then out[#out + 1] = ec end
     out[#out + 1] = ("pc = %d"):format(after)
     blocks[p] = table.concat(out, "; ")
     return p
@@ -562,7 +586,8 @@ local function build_cfg(stmts, lifted, funcflags, inlinefns, toplevel)
         for j = 1, #st.words do allargs[#allargs + 1] = emit_word(st.words[j], lifted) end
         body = "sh:exec(" .. table.concat(allargs, ", ") .. ")"
       end
-      blocks[p] = body .. ("; pc = %d"):format(after)
+      local ec = errchk(st) -- errexit after a failing native simple command
+      blocks[p] = body .. (ec ~= "" and "; " .. ec or "") .. ("; pc = %d"):format(after)
       return p
     elseif t == "forc" then
       if not_compilable(st.init) or not_compilable(st.cond) or not_compilable(st.step) then
