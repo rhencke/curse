@@ -964,12 +964,17 @@ M.tilde_word_initial = tilde_word_initial -- the compiled tier tilde-expands wor
 -- evaluate for `declare -i`; case-fold for `declare -l/-u`; else a plain set. Only
 -- emitted when the program creates such a var (else compiled uses sh:set_str).
 function M.assign_scalar(sh, name, value)
+  local direct = sh.vars[name]
   local b = sh.vars[sh:deref(name)]
   if b and b.ro then
     io.stderr:write("curse: " .. name .. ": readonly variable\n")
     sh.status = 1
+    -- Writing THROUGH a nameref to a readonly target is NON-fatal (bash: status 1,
+    -- continue). A DIRECT readonly assignment hard-exits in -c/posix, else aborts
+    -- the rest of the line (like interp's assign handler).
+    if direct and direct.ref then return end
     if sh.opt_c or sh.opt_posix then error({ __curse_exit = 1 }) end
-    return
+    error({ __curse_exit = 1, __curse_lineabort = true })
   end
   if b and b.arr then sh:array_set(name, array_key(sh, name, "0"), value, false)
   elseif b and b.int then sh:aset(name, eval(sh, P.arith(value)))
