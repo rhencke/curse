@@ -466,6 +466,15 @@ local function build_cfg(stmts, lifted, funcflags, inlinefns, toplevel)
   local DONE = newpc()
   blocks[DONE] = "break"
 
+  -- Compile-time loop stack for break/continue: each entry is { brk = pc to exit
+  -- the loop, cont = pc to re-test/advance }. `break N` / `continue N` jump to the
+  -- Nth-innermost enclosing loop — a compile-time decision, so they become native
+  -- jumps (no runtime unwind). loopvars are run()-level status holders (one per
+  -- command-condition while), declared 0 and used to give the loop bash's exit
+  -- status (last body command, or 0). Both are returned for assemble to declare.
+  local loopstack, loopvars = {}, {}
+  local function newloopvar() local v = "__lw" .. #loopvars; loopvars[#loopvars + 1] = v; return v end
+
   local flatten_list
 
   -- Delegate a cold statement to the shared interpreter on a baked AST node. Lifted
@@ -490,13 +499,37 @@ local function build_cfg(stmts, lifted, funcflags, inlinefns, toplevel)
 
   -- Statement types with no native compiled form yet -> always delegate.
   local DELEGATE = {
-    arithcmd = 1, andor = 1, pipeline = 1, case = 1, group = 1,
+    arithcmd = 1, pipeline = 1, case = 1, group = 1,
     dbracket = 1, arrayassign = 1, parse_error = 1, assignlist = 1, background = 1,
   }
 
   -- Build blocks for `st`; its exit flows to pc `after`. Returns st's entry pc.
   local function flatten_stmt(st, after)
     local t = st.t
+    -- break / continue [N]: a compile-time jump to the Nth enclosing loop's exit or
+    -- re-test point. Both set $?=0 (bash). Outside any loop it's a no-op. A
+    -- non-literal level (`break $n`) is rare — delegate it.
+    if t == "simple" and st.words[1] and st.words[1].parts[1] and not st.redirs then
+      local c0 = st.words[1].parts[1].lit
+      if (c0 == "break" or c0 == "continue") and #st.words[1].parts == 1 then
+        local lvl, ok = 1, true
+        if st.words[2] then
+          local w2 = st.words[2]
+          if #w2.parts == 1 and w2.parts[1].lit and w2.parts[1].lit:match("^%d+$") then lvl = tonumber(w2.parts[1].lit)
+          else ok = false end
+        end
+        if ok and (not st.words[3]) then
+          local p = newpc()
+          if #loopstack == 0 then blocks[p] = ("sh.status = 0; pc = %d"):format(after) -- no-op outside a loop
+          else
+            local idx = #loopstack - (lvl - 1); if idx < 1 then idx = 1 end
+            local tgt = (c0 == "break") and loopstack[idx].brk or loopstack[idx].cont
+            blocks[p] = ("sh.status = 0; pc = %d"):format(tgt)
+          end
+          return p
+        end
+      end
+    end
     if DELEGATE[t] then return delegate(st, after) end
     if t == "assign" then
       if st.index or st.append or (st.rhs and not emitable_word(st.rhs))
@@ -590,12 +623,15 @@ local function build_cfg(stmts, lifted, funcflags, inlinefns, toplevel)
       blocks[p] = body .. (ec ~= "" and "; " .. ec or "") .. ("; pc = %d"):format(after)
       return p
     elseif t == "forc" then
+      if st.redirs then return delegate(st, after) end -- redirs on the loop: interp applies them
       if not_compilable(st.init) or not_compilable(st.cond) or not_compilable(st.step) then
         return delegate(st, after)
       end
       local condp = newpc(); loopPc[st.id] = condp
       local stepp = newpc()
+      loopstack[#loopstack + 1] = { brk = after, cont = stepp } -- break exits, continue steps
       local bodyentry = flatten_list(st.body, stepp)
+      loopstack[#loopstack] = nil
       blocks[stepp] = (st.step and emit_arith_stmt(st.step, lifted) .. "; " or "") .. ("pc = %d"):format(condp)
       blocks[condp] = ("if %s then pc = %d else pc = %d end"):format(
         st.cond and emit_bool(st.cond, lifted) or "true", bodyentry, after)
@@ -606,20 +642,49 @@ local function build_cfg(stmts, lifted, funcflags, inlinefns, toplevel)
       end
       return condp
     elseif t == "whilec" then
-      if st.negate or cond_arith(st.cond) == nil or not_compilable(cond_arith(st.cond)) then
-        return delegate(st, after) -- command-cond while/until, or uncompilable arith
+      if st.redirs then return delegate(st, after) end -- redirs on the loop (heredoc/file): interp applies them
+      local arith = cond_arith(st.cond)
+      if arith and not st.negate and not not_compilable(arith) then
+        -- fast path: a native arith condition `while (( expr ))` — no command run.
+        local condp = newpc(); loopPc[st.id] = condp
+        loopstack[#loopstack + 1] = { brk = after, cont = condp }
+        local bodyentry = flatten_list(st.body, condp)
+        loopstack[#loopstack] = nil
+        blocks[condp] = ("if %s then pc = %d else pc = %d end"):format(emit_bool(arith, lifted), bodyentry, after)
+        return condp
       end
-      local condp = newpc(); loopPc[st.id] = condp
-      local bodyentry = flatten_list(st.body, condp)
-      blocks[condp] = ("if %s then pc = %d else pc = %d end"):format(emit_bool(cond_arith(st.cond), lifted), bodyentry, after)
-      return condp
+      -- COMMAND condition (or `until`): run the condition list as a sub-CFG with
+      -- sh.noerr raised (errexit-exempt, like the interpreter), then branch on its
+      -- exit status — `while` enters the body on 0, `until` on non-zero. The loop's
+      -- exit status is the LAST body command's status (bash), which the condition
+      -- clobbers — so one native register (lv) remembers it across the re-test.
+      -- loopPc = the condition entry (an OSR resumes at the re-test point). Genuine
+      -- control flow, no delegation.
+      local lv = newloopvar()
+      local prep = newpc(); loopPc[st.id] = prep
+      local donep = newpc()
+      local exitp = newpc(); blocks[exitp] = ("sh.status = %s; pc = %d"):format(lv, after)
+      loopstack[#loopstack + 1] = { brk = after, cont = prep } -- break exits (status 0), continue re-tests
+      local bodysave = newpc()
+      local bodyentry = flatten_list(st.body, bodysave)
+      loopstack[#loopstack] = nil
+      blocks[bodysave] = ("%s = sh.status; pc = %d"):format(lv, prep)
+      blocks[donep] = ("sh.noerr = sh.noerr - 1; if sh.status %s 0 then pc = %d else pc = %d end")
+        :format(st.negate and "~=" or "==", bodyentry, exitp)
+      local listentry = flatten_list(st.cond, donep)
+      blocks[prep] = ("sh.noerr = sh.noerr + 1; pc = %d"):format(listentry)
+      local entry = newpc(); blocks[entry] = ("%s = 0; pc = %d"):format(lv, prep) -- status 0 if body never runs
+      return entry
     elseif t == "forin" then
+      if st.redirs then return delegate(st, after) end -- redirs on the loop: interp applies them
       -- if the word list needs the field engine (splitting/glob/array/@), delegate
       -- the whole loop to the interpreter (list expansion is cold anyway).
       for _, w in ipairs(st.words) do if not word_safe(w) then return delegate(st, after) end end
       local initp = newpc()
       local advp = newpc(); loopPc[st.id] = advp -- back-edge = resume point
+      loopstack[#loopstack + 1] = { brk = after, cont = advp } -- break exits, continue advances
       local bodyentry = flatten_list(st.body, advp)
+      loopstack[#loopstack] = nil
       -- init: expand the word list ONCE into sh.forstate[id] (so OSR resumes it)
       local parts = { "local __l = {}" }
       for _, w in ipairs(st.words) do
@@ -635,27 +700,77 @@ local function build_cfg(stmts, lifted, funcflags, inlinefns, toplevel)
         st.id, after, st.name, bodyentry)
       return initp
     elseif t == "if" then
-      -- if any clause has a non-arith (command) condition, delegate the whole if
-      for _, cl in ipairs(st.clauses) do
-        if cl.cond ~= nil and cond_arith(cl.cond) == nil then return delegate(st, after) end
-      end
-      -- allocate a cond pc per conditional clause (forward refs), flatten each
-      -- body once, then wire the false-branches to the next clause.
-      local cps, bentry = {}, {}
-      for i, cl in ipairs(st.clauses) do if cl.cond then cps[i] = newpc() end end
-      for i, cl in ipairs(st.clauses) do bentry[i] = flatten_list(cl.body, after) end
-      local entry
-      for i, cl in ipairs(st.clauses) do
-        if cl.cond then
-          local nxt = after
-          if st.clauses[i + 1] then nxt = cps[i + 1] or bentry[i + 1] end -- next cond, or an else body
-          blocks[cps[i]] = ("if %s then pc = %d else pc = %d end"):format(emit_bool(cond_arith(cl.cond), lifted), bentry[i], nxt)
-          entry = entry or cps[i]
+      -- Each clause's condition is either a native arith `(( ))` (emit_bool) or a
+      -- COMMAND LIST run for its status. Both compile — the command condition is a
+      -- sub-CFG run with sh.noerr raised (errexit-exempt, like the interpreter),
+      -- then we branch on sh.status. No delegation. Flatten bodies once, then build
+      -- clauses back-to-front so each false-branch target (the next condition, the
+      -- else body, or `after`) already exists.
+      if st.redirs then return delegate(st, after) end -- redirs on the whole `if`: interp applies them
+      local bentry = {}
+      local has_else = false
+      for i, cl in ipairs(st.clauses) do bentry[i] = flatten_list(cl.body, after); if not cl.cond then has_else = true end end
+      -- With no else clause, falling past every (false) condition runs no body, so
+      -- the `if` yields status 0 (bash) — route that fall-through through a reset.
+      local fallthrough = after
+      if not has_else then local s0 = newpc(); blocks[s0] = ("sh.status = 0; pc = %d"):format(after); fallthrough = s0 end
+      local condentry = {}
+      for i = #st.clauses, 1, -1 do
+        local cl = st.clauses[i]
+        local nxt = st.clauses[i + 1] and (condentry[i + 1] or bentry[i + 1]) or fallthrough
+        if not cl.cond then
+          condentry[i] = bentry[i] -- an `else` clause: its body runs unconditionally
         else
-          entry = entry or bentry[i] -- a leading else (unusual)
+          local arith = cond_arith(cl.cond)
+          if arith and not not_compilable(arith) then
+            local cp = newpc()
+            blocks[cp] = ("if %s then pc = %d else pc = %d end"):format(emit_bool(arith, lifted), bentry[i], nxt)
+            condentry[i] = cp
+          else -- command condition: noerr++ ; run list ; noerr-- ; branch on status
+            local donep = newpc()
+            blocks[donep] = ("sh.noerr = sh.noerr - 1; if sh.status == 0 then pc = %d else pc = %d end")
+              :format(bentry[i], nxt)
+            local listentry = flatten_list(cl.cond, donep)
+            local prep = newpc()
+            blocks[prep] = ("sh.noerr = sh.noerr + 1; pc = %d"):format(listentry)
+            condentry[i] = prep
+          end
         end
       end
-      return entry or after
+      return condentry[1] or after
+    elseif t == "andor" then
+      -- `a && b || c`: run item 1, then each item iff the previous status matches
+      -- its operator (&& on 0, || on non-zero) — pure control flow. Errexit exempts
+      -- every operand EXCEPT the final one that runs (bash), so raise sh.noerr across
+      -- the non-final operands and restore it right before the last, letting only its
+      -- own errchk fire. Status is the last item that ran (natural). break/continue
+      -- inside an operand compile to native jumps via flatten_stmt (that's why this
+      -- must be real codegen, not delegation). `!`-negation lives on each pipeline.
+      if st.redirs then return delegate(st, after) end
+      local items = st.items
+      local nI = #items
+      local runafter = {} -- where item i flows after running
+      for i = 1, nI - 1 do runafter[i] = 0 end -- filled with checkp[i+1] below
+      runafter[nI] = after
+      local checkp = {}
+      for i = 2, nI do checkp[i] = newpc() end
+      for i = 1, nI - 1 do runafter[i] = checkp[i + 1] end
+      local runentry = {}
+      for i = 1, nI do runentry[i] = flatten_stmt(items[i].cmd, runafter[i]) end
+      for i = 2, nI do
+        local cmp = (items[i].op == "&&") and "==" or "~=" -- && runs on success, || on failure
+        if i == nI then -- last operand: restore noerr so its OWN errchk applies
+          blocks[checkp[i]] = ("sh.noerr = sh.noerr - 1; if sh.status %s 0 then pc = %d else pc = %d end")
+            :format(cmp, runentry[i], after)
+        else
+          blocks[checkp[i]] = ("if sh.status %s 0 then pc = %d else pc = %d end")
+            :format(cmp, runentry[i], checkp[i + 1])
+        end
+      end
+      local entry = newpc()
+      -- raise noerr for the non-final operands; a lone-item andor never occurs (>=2).
+      blocks[entry] = ("sh.noerr = sh.noerr + 1; pc = %d"):format(runentry[1])
+      return entry
     elseif t == "subshell" then
       -- ( body ): a subshell is not special, just SEPARATED — fork, and the child
       -- runs the body as a BOUNDED sub-CFG that _exits at its end (so it never runs
@@ -716,9 +831,9 @@ local function build_cfg(stmts, lifted, funcflags, inlinefns, toplevel)
       blocks[mark[k]] = ("sh._ff = %d; %spc = %d"):format(ff, wbs, real[k])
       stmtPc[k] = mark[k] -- OSR resume enters at the marker so sh._ff + state are set
     end
-    return { blocks = blocks, npc = npc, entry = mark[1] or DONE, loopPc = loopPc, stmtPc = stmtPc }
+    return { blocks = blocks, npc = npc, entry = mark[1] or DONE, loopPc = loopPc, stmtPc = stmtPc, loopvars = loopvars }
   end
-  return { blocks = blocks, npc = npc, entry = stmtPc[1] or DONE, loopPc = loopPc, stmtPc = stmtPc }
+  return { blocks = blocks, npc = npc, entry = stmtPc[1] or DONE, loopPc = loopPc, stmtPc = stmtPc, loopvars = loopvars }
 end
 
 -- Assemble a CFG into a Lua function string. `liftvars` (top-level only) are
@@ -740,6 +855,8 @@ local function assemble(cfg, sig, opts)
   end
   for _, n in ipairs(opts.runlocals or {}) do o[#o + 1] = ("  local %s = sh:aget(%q)"):format(lname(n), n) end
   for _, n in ipairs(opts.upvals or {}) do o[#o + 1] = ("  %s = sh:aget(%q)"):format(lname(n), n) end
+  -- per-loop status holders (while-command loops): plain native locals, init 0.
+  for _, v in ipairs(cfg.loopvars or {}) do o[#o + 1] = ("  local %s = 0"):format(v) end
   -- pc stays a plain LOCAL (register-allocated, fast in hot loops). A div0/failglob
   -- lineabort thrown from compiled code is caught by the tier's retry wrapper, which
   -- re-enters run at sh._ff — the markers wrote lifted state + sh._ff back per
