@@ -1045,7 +1045,10 @@ local function build_cfg(stmts, lifted, funcflags, inlinefns, toplevel)
       -- assign) before its def line (bash). Direct compiled calls use the hoisted local
       -- regardless. Nested funcdefs (not in funcflags) stay a no-op for now.
       local p = newpc()
-      if funcflags[st.name] then
+      if not st.name:match("^[%w_][%w_%.%-:+@/!#=]*$") then -- name is an expansion (`$foo-bar()`):
+        blocks[p] = ("io.stderr:write(%q); sh.status = 1; pc = %d") -- non-fatal runtime error (bash)
+          :format("curse: `" .. st.name .. "': not a valid identifier\n", after)
+      elseif funcflags[st.name] then
         blocks[p] = ("sh.functions[%q] = %s; pc = %d"):format(st.name, fnlname(st.name), after)
       else
         blocks[p] = ("pc = %d"):format(after)
