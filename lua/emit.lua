@@ -1038,7 +1038,14 @@ local function build_cfg(stmts, lifted, funcflags, inlinefns, toplevel)
         blocks[p] = d .. ("sh.status = 0; I.assign_scalar(sh, %q, %s)%s%s; pc = %d")
           :format(st.name, rhsval(), ecs, ua, after)
       else
-        blocks[p] = d .. ("sh:set_str(%q, %s)%s; pc = %d"):format(st.name, rhsval(), ua, after)
+        -- $? after a plain assignment: the RHS's last cmdsub status, else 0 — but the
+        -- RHS is evaluated FIRST (so `st=$?` reads the PREVIOUS status), then reset to 0
+        -- only when the RHS has no cmdsub; then errchk fires ERR/errexit (`x=$(false)`).
+        local ec = errchk(st); local ecs = ec ~= "" and ("; " .. ec) or ""
+        local hascmd = false
+        if st.rhs then for _, pp in ipairs(st.rhs.parts) do if pp.cmdsub then hascmd = true; break end end end
+        local st0 = hascmd and "" or "; sh.status = 0"
+        blocks[p] = d .. ("sh:set_str(%q, %s)%s%s%s; pc = %d"):format(st.name, rhsval(), st0, ecs, ua, after)
       end
       return p
     elseif t == "funcdef" then
@@ -1458,8 +1465,11 @@ local function build_cfg(stmts, lifted, funcflags, inlinefns, toplevel)
       local bodyentry = flatten_list(st.body, exitpc)
       loopstack = saved_loops
       local p = newpc()
-      blocks[p] = ("if sh.opt_e then pc = %d else local __pid = rt.subshell_fork(sh); if __pid == 0 then pc = %d else sh.status = rt.subshell_wait(__pid); pc = %d end end")
-        :format(delpc, bodyentry, after)
+      -- ERR trap after a failing subshell (`( exit 42 )`) fires in the PARENT; the
+      -- errexit path already delegated above, so this errchk only fires ERR (opt_e false).
+      local ec = errchk(st); local ecs = ec ~= "" and ("; " .. ec) or ""
+      blocks[p] = ("if sh.opt_e then pc = %d else local __pid = rt.subshell_fork(sh); if __pid == 0 then pc = %d else sh.status = rt.subshell_wait(__pid)%s; pc = %d end end")
+        :format(delpc, bodyentry, ecs, after)
       return p
     else
       return delegate(st, after) -- unknown/cold statement: run it via the interpreter
