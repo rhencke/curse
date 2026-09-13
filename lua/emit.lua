@@ -410,6 +410,45 @@ local function cond_arith(c)
   return nil
 end
 
+-- `[ A -op B ]` / `test A -op B` do an ARITHMETIC comparison. When both operands
+-- are provably integer, the whole test is a native int64 compare — no do_test, no
+-- per-iteration argv table. bash errors on a non-integer operand, so a plain string
+-- var stays on the do_test path; only a lifted-int64 var, an integer literal, or an
+-- arith $((…)) qualifies (quoting is irrelevant in arithmetic).
+local TEST_ARITH_OP = { ["-eq"] = "==", ["-ne"] = "!=", ["-lt"] = "<", ["-le"] = "<=", ["-gt"] = ">", ["-ge"] = ">=" }
+local function test_operand_arith(w, lifted)
+  if #w.parts ~= 1 then return nil end
+  local p = w.parts[1]
+  if p.var and lifted[p.var] then return { k = "var", name = p.var } end
+  if p.lit and p.lit:match("^[+-]?%d+$") then return { k = "num", v = p.lit } end
+  if p.arithast then return p.arithast end
+  if p.arith then return require("parser").arith(p.arith) end
+  return nil
+end
+-- Returns the equivalent arith comparison node for a compilable `[ … ]`/test cond,
+-- or nil (caller falls back to the do_test command path).
+local function test_as_arith(cond, lifted)
+  if type(cond) ~= "table" or cond.k or #cond ~= 1 then return nil end
+  local st = cond[1]
+  if not st or st.t ~= "simple" or st.redirs or st.assigns then return nil end
+  local w = st.words
+  local function lit1(x) return x and x.parts[1] and #x.parts == 1 and x.parts[1].lit end
+  local cmd, A, opw, B = lit1(w[1]), nil, nil, nil
+  if cmd == "[" then
+    if #w ~= 5 or lit1(w[5]) ~= "]" then return nil end
+    A, opw, B = w[2], w[3], w[4]
+  elseif cmd == "test" then
+    if #w ~= 4 then return nil end
+    A, opw, B = w[2], w[3], w[4]
+  else return nil end
+  local op = TEST_ARITH_OP[lit1(opw) or ""]
+  if not op then return nil end
+  local l, r = test_operand_arith(A, lifted), test_operand_arith(B, lifted)
+  if not l or not r or not_compilable(l) or not_compilable(r)
+      or arith_side_effect(l) or arith_side_effect(r) then return nil end
+  return { k = "bin", op = op, l = l, r = r }
+end
+
 -- a word that is exactly one numeric literal -> its digits (else nil)
 local function numeric_word(w)
   if #w.parts == 1 and w.parts[1].lit and w.parts[1].lit:match("^[+-]?%d+$") then
@@ -964,6 +1003,25 @@ local function build_cfg(stmts, lifted, funcflags, inlinefns, toplevel)
         blocks[condp] = ("if %s then pc = %d else pc = %d end"):format(emit_bool(arith, lifted), bodyentry, after)
         return condp
       end
+      -- fast path: `while/until [ A -op B ]` with integer operands — a native int64
+      -- compare instead of building an argv table and running do_test each iteration.
+      -- Keeps [ ]'s own $? (0/1) for the body's first command AND the loop's
+      -- last-body exit status (lv), exactly like the command-condition path below.
+      local tarith = test_as_arith(st.cond, lifted)
+      if tarith then
+        local lv = newloopvar()
+        local condp = newpc(); loopPc[st.id] = condp
+        local exitp = newpc(); blocks[exitp] = ("sh.status = %s; pc = %d"):format(lv, after)
+        loopstack[#loopstack + 1] = { brk = after, cont = condp }
+        local bodysave = newpc()
+        local bodyentry = flatten_list(st.body, bodysave)
+        loopstack[#loopstack] = nil
+        blocks[bodysave] = ("%s = sh.status; pc = %d"):format(lv, condp)
+        blocks[condp] = ("sh.status = (%s) and 0 or 1; if sh.status %s 0 then pc = %d else pc = %d end")
+          :format(emit_bool(tarith, lifted), st.negate and "~=" or "==", bodyentry, exitp)
+        local entry = newpc(); blocks[entry] = ("%s = 0; pc = %d"):format(lv, condp)
+        return entry
+      end
       -- COMMAND condition (or `until`): run the condition list as a sub-CFG with
       -- sh.noerr raised (errexit-exempt, like the interpreter), then branch on its
       -- exit status — `while` enters the body on 0, `until` on non-zero. The loop's
@@ -1032,9 +1090,15 @@ local function build_cfg(stmts, lifted, funcflags, inlinefns, toplevel)
           condentry[i] = bentry[i] -- an `else` clause: its body runs unconditionally
         else
           local arith = cond_arith(cl.cond)
+          local tarith = not arith and test_as_arith(cl.cond, lifted) -- `[ A -op B ]`, integer operands
           if arith and not not_compilable(arith) and not arith_side_effect(arith) then
             local cp = newpc()
             blocks[cp] = ("if %s then pc = %d else pc = %d end"):format(emit_bool(arith, lifted), bentry[i], nxt)
+            condentry[i] = cp
+          elseif tarith then -- native int64 compare, and set [ ]'s own $? (0/1)
+            local cp = newpc()
+            blocks[cp] = ("sh.status = (%s) and 0 or 1; if sh.status == 0 then pc = %d else pc = %d end")
+              :format(emit_bool(tarith, lifted), bentry[i], nxt)
             condentry[i] = cp
           else -- command condition: noerr++ ; run list ; noerr-- ; branch on status
             local donep = newpc()
