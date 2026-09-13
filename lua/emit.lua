@@ -36,7 +36,14 @@ local function makes_attr(st)
   if st.t == "assign" and st.index then return true end -- a[i]=… makes/extends an array
   if st.t ~= "simple" or not st.words[1] then return false end
   local c = st.words[1].parts[1] and #st.words[1].parts == 1 and st.words[1].parts[1].lit
-  return c == "readonly" or c == "declare" or c == "typeset" or c == "local" or c == "export"
+  if c == "readonly" or c == "declare" or c == "typeset" or c == "local" or c == "export" then return true end
+  if c == "set" then -- `set -a` / `set -o allexport` makes later plain assigns auto-export
+    for j = 2, #st.words do
+      local l = st.words[j].parts[1] and st.words[j].parts[1].lit
+      if l == "-a" or l == "allexport" or (l and l:match("^%-%a*a")) then return true end
+    end
+  end
+  return false
 end
 local function scan_attr(stmts)
   for _, st in ipairs(stmts or {}) do

@@ -975,6 +975,10 @@ function M.assign_scalar(sh, name, value)
   elseif b and b.int then sh:aset(name, eval(sh, P.arith(value)))
   elseif b and (b.lower or b.upper) then sh:set_str(name, b.lower and value:lower() or value:upper())
   else sh:set_str(name, value) end
+  if sh.opt_a then -- set -a (allexport): a plain scalar assignment auto-exports (bash)
+    local nb = sh.vars[sh:deref(name)]
+    if nb and not nb.arr then nb.exported = true; C.setenv(sh:deref(name), sh:get(name), 1) end
+  end
 end
 
 expand_word = function(sh, w)
