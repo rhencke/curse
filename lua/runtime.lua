@@ -138,14 +138,23 @@ function Shell:pushCall(...)
   self.savedstack[self.pd] = false
 end
 
--- $FUNCNAME maintenance for the compiled tier: push the running function's name
--- (innermost at [1], matching interp's run_function); the compiled call site emits
--- these around fn_x only when the program reads FUNCNAME (else zero cost).
-function Shell:enterFunc(name)
+-- $FUNCNAME / $BASH_LINENO / $BASH_SOURCE maintenance for the compiled tier: push the
+-- running function's name, the CALL-site line, and the source file (innermost at [1],
+-- matching interp's run_function). The compiled call site emits these around fn_x only
+-- when the program reads one of those vars (else zero cost).
+function Shell:enterFunc(name, line)
   local fs = self.funcstack; if not fs then fs = {}; self.funcstack = fs end
   table.insert(fs, 1, name)
+  local ls = self.linestack; if not ls then ls = {}; self.linestack = ls end
+  table.insert(ls, 1, line or 0)
+  local ss = self.srcstack; if not ss then ss = {}; self.srcstack = ss end
+  table.insert(ss, 1, self.cur_source or self.argv0 or "")
 end
-function Shell:leaveFunc() if self.funcstack then table.remove(self.funcstack, 1) end end
+function Shell:leaveFunc()
+  if self.funcstack then table.remove(self.funcstack, 1) end
+  if self.linestack then table.remove(self.linestack, 1) end
+  if self.srcstack then table.remove(self.srcstack, 1) end
+end
 function Shell:popCall()
   local d = self.pd
   local saved = self.savedstack[d]
