@@ -179,6 +179,24 @@ end
 -- this scoped toggle needs no threading through emit_value's recursion.
 local arith_varread = "sh:aget(%q)"
 
+-- The whole word as one literal string when every part is literal — sees through a
+-- \-escaped name (`\return` parses as parts "r".."eturn"). nil if any part expands.
+local function full_lit(w)
+  local s = {}
+  for _, p in ipairs(w.parts) do if p.lit == nil then return nil end; s[#s + 1] = p.lit end
+  return table.concat(s)
+end
+-- Recognize a control-flow command (break/continue/return) even when written with a
+-- \-escaped name or a `builtin`/`command` prefix (`\return`, `builtin return 3`).
+-- Returns op, argoffset (index of the first argument), or nil.
+local function resolve_cf(st)
+  if st.t ~= "simple" or not st.words[1] or st.redirs then return nil end
+  local c, off = full_lit(st.words[1]), 1
+  if (c == "builtin" or c == "command") and st.words[2] then c = full_lit(st.words[2]); off = 2 end
+  if c == "break" or c == "continue" or c == "return" then return c, off + 1 end
+  return nil
+end
+
 local emit_value
 emit_value = function(e, lifted)
   local k = e.k
@@ -821,25 +839,32 @@ local function build_cfg(stmts, lifted, funcflags, inlinefns, toplevel)
     -- break / continue [N]: a compile-time jump to the Nth enclosing loop's exit or
     -- re-test point. Both set $?=0 (bash). Outside any loop it's a no-op. A
     -- non-literal level (`break $n`) is rare — delegate it.
-    if t == "simple" and st.words[1] and st.words[1].parts[1] and not st.redirs then
-      local c0 = st.words[1].parts[1].lit
-      if (c0 == "break" or c0 == "continue") and #st.words[1].parts == 1 then
-        local lvl, ok = 1, true
-        if st.words[2] then
-          local w2 = st.words[2]
-          if #w2.parts == 1 and w2.parts[1].lit and w2.parts[1].lit:match("^%d+$") then lvl = tonumber(w2.parts[1].lit)
-          else ok = false end
+    local cf_op, cf_arg = resolve_cf(st)
+    if cf_op == "break" or cf_op == "continue" then
+      local lvl, ok = 1, true
+      if st.words[cf_arg] then
+        local wl = full_lit(st.words[cf_arg])
+        if wl and wl:match("^%d+$") and not st.words[cf_arg + 1] then lvl = tonumber(wl)
+        else ok = false end
+      end
+      if ok then
+        local p = newpc()
+        if #loopstack == 0 then blocks[p] = ("sh.status = 0; pc = %d"):format(after) -- no-op outside a loop
+        else
+          local idx = #loopstack - (lvl - 1); if idx < 1 then idx = 1 end
+          local tgt = (cf_op == "break") and loopstack[idx].brk or loopstack[idx].cont
+          blocks[p] = ("sh.status = 0; pc = %d"):format(tgt)
         end
-        if ok and (not st.words[3]) then
-          local p = newpc()
-          if #loopstack == 0 then blocks[p] = ("sh.status = 0; pc = %d"):format(after) -- no-op outside a loop
-          else
-            local idx = #loopstack - (lvl - 1); if idx < 1 then idx = 1 end
-            local tgt = (c0 == "break") and loopstack[idx].brk or loopstack[idx].cont
-            blocks[p] = ("sh.status = 0; pc = %d"):format(tgt)
-          end
-          return p
-        end
+        return p
+      end
+    elseif cf_op == "return" then
+      -- return [N] (incl. \return / builtin return / command return): set $? and exit
+      -- the CFG. A non-literal/expression status word is fine (emit_word handles it).
+      if not st.words[cf_arg + 1] then -- at most one status arg
+        local p = newpc()
+        local n = st.words[cf_arg] and ("tonumber(%s)"):format(emit_word(st.words[cf_arg], lifted)) or "sh.status"
+        blocks[p] = ("sh.status = (%s) or 0; pc = %d"):format(n, DONE)
+        return p
       end
     end
     if DELEGATE[t] then return delegate(st, after) end
