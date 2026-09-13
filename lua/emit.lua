@@ -1071,6 +1071,10 @@ local function build_cfg(stmts, lifted, funcflags, inlinefns, toplevel)
         return p
       end
     elseif cf_op == "return" then
+      -- `return` at the top level is an error (status 2 + diagnostic, but execution
+      -- continues) — not a program exit. A compiled top level is always the main
+      -- script (source runs through interp), so delegate and let interp diagnose.
+      if toplevel then return delegate(st, after) end
       -- return [N] (incl. \return / builtin return / command return): set $? and exit
       -- the CFG. I.return_status: N%256, or 2 + diagnostic on non-numeric; no arg → $?.
       local aw = st.words[cf_arg]
