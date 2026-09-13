@@ -253,6 +253,12 @@ local function full_lit(w)
   for _, p in ipairs(w.parts) do if p.lit == nil then return nil end; s[#s + 1] = p.lit end
   return table.concat(s)
 end
+-- Like full_lit, but only when every part is an UNQUOTED literal (so a quoted `'~'`
+-- is excluded) — used to decide tilde expansion, which never touches quoted text.
+local function unq_full_lit(w)
+  for _, p in ipairs(w.parts) do if p.lit == nil or p.q then return nil end end
+  return full_lit(w)
+end
 -- Recognize a control-flow command (break/continue/return) even when written with a
 -- \-escaped name or a `builtin`/`command` prefix (`\return`, `builtin return 3`).
 -- Returns op, argoffset (index of the first argument), or nil.
@@ -358,12 +364,13 @@ end
 local function emit_word(w, lifted)
   local parts = {}
   for i, p in ipairs(w.parts) do
-    if i == 1 and p.lit and not p.q and p.lit:sub(1, 1) == "~" then
-      -- word-initial unquoted literal tilde (~, ~/…, ~user, ~+/~-): expanded at
-      -- runtime ($HOME/getpwnam/$PWD). Only a genuine LITERAL leading ~ triggers —
-      -- a tilde from a variable's value never expands (bash), and this part is a
-      -- literal, so there's no over-expansion. Other tilde positions (NAME=…:~,
-      -- ~ mid-word) stay literal for now (interp handles them; no regression).
+    if i == 1 and p.lit and not p.q and (p.lit:sub(1, 1) == "~"
+        or (p.lit:find("~", 1, true) and p.lit:match("^[%a_][%w_]*%+?=") ~= nil)) then
+      -- word-initial unquoted literal tilde (~, ~/…, ~user, ~+/~-) OR a NAME=…~ word
+      -- (`echo x=~`, which bash tilde-expands like an assignment): expanded at runtime
+      -- ($HOME/getpwnam/$PWD, each `:`-segment after NAME=). Only a genuine LITERAL ~
+      -- triggers — a tilde from a variable's value never expands (bash), and this part
+      -- is a literal, so no over-expansion. ~ mid-word (not after NAME=) stays literal.
       parts[#parts + 1] = ("I.tilde_word_initial(sh, %q)"):format(p.lit)
     elseif p.lit then parts[#parts + 1] = ("%q"):format(p.lit)
     elseif p.raw then parts[#parts + 1] = p.raw -- pre-computed Lua string expr (inlined param)
@@ -976,6 +983,14 @@ local function build_cfg(stmts, lifted, funcflags, inlinefns, toplevel)
         or (st.arith and arith_side_effect(st.arith)) then return delegate(st, after) end
       local p = newpc()
       local d = dbg(st) -- DEBUG trap fires before the assignment (bash: DEBUG_FIRE.assign)
+      -- assignment-RHS tilde (string paths only; st.rhs is nil for an arith assign): an
+      -- ALL-LITERAL rhs containing ~ expands each `:`-segment (`x=foo:~` -> foo:$HOME).
+      -- Only literal tildes expand — a ~ from a variable's value never does.
+      local function rhsval()
+        local fl = unq_full_lit(st.rhs)
+        if fl and fl:find("~", 1, true) then return ("I.tilde_assign(sh, %q)"):format(fl) end
+        return emit_word(st.rhs, lifted)
+      end
       if st.arith then
         blocks[p] = d .. emit_set(st.name, emit_value(st.arith, lifted), lifted) .. ("; pc = %d"):format(after)
       elseif lifted[st.name] then
@@ -985,9 +1000,9 @@ local function build_cfg(stmts, lifted, funcflags, inlinefns, toplevel)
         -- assign_scalar (which sets 1 on a readonly reject); errchk applies errexit/ERR.
         local ec = errchk(st); local ecs = ec ~= "" and ("; " .. ec) or ""
         blocks[p] = d .. ("sh.status = 0; I.assign_scalar(sh, %q, %s)%s; pc = %d")
-          :format(st.name, emit_word(st.rhs, lifted), ecs, after)
+          :format(st.name, rhsval(), ecs, after)
       else
-        blocks[p] = d .. ("sh:set_str(%q, %s); pc = %d"):format(st.name, emit_word(st.rhs, lifted), after)
+        blocks[p] = d .. ("sh:set_str(%q, %s); pc = %d"):format(st.name, rhsval(), after)
       end
       return p
     elseif t == "funcdef" then
@@ -1122,7 +1137,12 @@ local function build_cfg(stmts, lifted, funcflags, inlinefns, toplevel)
       elseif cmd == "false" then body = "sh.status = 1"
       elseif cmd == "local" then
         local ls = {}
-        for _, a in ipairs(args) do ls[#ls + 1] = ("sh:localAssign(%s)"):format(a) end
+        for j = 2, #st.words do -- a `local NAME=foo:~` arg tilde-expands the RHS (all-literal only)
+          local aw, av = st.words[j], emit_word(st.words[j], lifted)
+          local fl = unq_full_lit(aw)
+          if fl and fl:find("~", 1, true) then av = ("I.tilde_word_initial(sh, %q)"):format(fl) end
+          ls[#ls + 1] = ("sh:localAssign(%s)"):format(av)
+        end
         body = table.concat(ls, "; ") .. (#ls > 0 and "; " or "") .. "sh.status = 0"
       elseif cmd == "test" or cmd == "[" then
         -- [ EXPR ] / test EXPR: the operator/arity are compile-time known; compute the

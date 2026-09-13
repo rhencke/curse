@@ -957,6 +957,7 @@ local function tilde_word_initial(sh, s)
   return tilde_prefix(sh, s)
 end
 M.tilde_word_initial = tilde_word_initial -- the compiled tier tilde-expands word-initial literals
+M.tilde_assign = tilde_assign -- compiled tier tilde-expands each `:`-segment of an assignment RHS
 
 -- Compiled-tier plain scalar assignment (`name=value`), mirroring interp's assign
 -- handler for an ATTRIBUTED target: reject a readonly var ($?=1 + diagnostic, fatal
