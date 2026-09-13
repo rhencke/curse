@@ -545,6 +545,10 @@ local function do_test(sh, args)
   if not ok then sh.status = 2; return end
   sh.status = res and 0 or 1
 end
+-- Exposed so the compiled tier can run `test`/`[` natively: it computes the args
+-- (emit_word) and calls this PRIMITIVE on the values — real code + a library call,
+-- not an AST re-walk.
+M.do_test = do_test
 
 local tilde_prefix -- forward (word-initial ~ expansion; defined below, used in paramexp)
 local expand_word -- forward (used by eval's $-deferred arith and expand_part_str)

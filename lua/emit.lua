@@ -609,7 +609,8 @@ local function build_cfg(stmts, lifted, funcflags, inlinefns, toplevel)
       end
       -- delegate if it needs the field engine (splitting/glob/pexp), or a builtin
       -- without a native compiled form.
-      local NATIVE_BUILTIN = { echo = 1, [":"] = 1, ["true"] = 1, ["false"] = 1, ["local"] = 1, ["return"] = 1 }
+      local NATIVE_BUILTIN = { echo = 1, [":"] = 1, ["true"] = 1, ["false"] = 1, ["local"] = 1,
+        ["return"] = 1, test = 1, ["["] = 1 }
       local isfunc = (inlinefns and inlinefns[cmd]) or funcflags[cmd]
       if cmd == "return" and redir_apply then return delegate(st, after) end -- rare; wrapper assumes a run body
       local mustdeleg = st.assigns ~= nil -- prefix env -> delegate
@@ -663,6 +664,16 @@ local function build_cfg(stmts, lifted, funcflags, inlinefns, toplevel)
         local ls = {}
         for _, a in ipairs(args) do ls[#ls + 1] = ("sh:localAssign(%s)"):format(a) end
         body = table.concat(ls, "; ") .. (#ls > 0 and "; " or "") .. "sh.status = 0"
+      elseif cmd == "test" or cmd == "[" then
+        -- [ EXPR ] / test EXPR: the operator/arity are compile-time known; compute the
+        -- args natively (word_safe, so no field engine) and run the POSIX test logic
+        -- via the do_test PRIMITIVE (access/stat/string/arith on the VALUES — not an
+        -- AST re-walk). do_test sets $? (0/1, or 2 on a malformed expression). Each arg
+        -- is rt.cstr'd: an argv entry is a C string, so a NUL truncates it (`$'\0'`);
+        -- interp truncates in expand_args, external exec via C — do_test is Lua-side.
+        local allargs = {}
+        for j = 1, #st.words do allargs[#allargs + 1] = ("rt.cstr(%s)"):format(emit_word(st.words[j], lifted)) end
+        body = "I.do_test(sh, {" .. table.concat(allargs, ", ") .. "})"
       elseif funcflags[cmd] then
         local ff = funcflags[cmd]
         if ff.locals then -- full frame (save/restore shadowed vars + params)
