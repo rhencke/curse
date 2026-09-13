@@ -267,9 +267,13 @@ local function emit_word(w, lifted)
       elseif p.special == "$" then parts[#parts + 1] = "tostring(sh:pid())"
       elseif p.special == "!" then parts[#parts + 1] = '(sh.last_bg_pid or "")' end
     elseif p.arithast then -- a pre-parsed+substituted arith AST (inlined word)
+      local saved = arith_varread; arith_varread = "I.arith_read(sh, %q)" -- $(()) reads recursively (bar=foo;$((bar)))
       parts[#parts + 1] = "rt.i64_to_str(" .. emit_value(p.arithast, lifted) .. ")"
+      arith_varread = saved
     elseif p.arith then
+      local saved = arith_varread; arith_varread = "I.arith_read(sh, %q)" -- name/expr values re-parse as arith
       parts[#parts + 1] = "rt.i64_to_str(" .. emit_value(require("parser").arith(p.arith), lifted) .. ")"
+      arith_varread = saved
     elseif p.cmdsub then -- $( … ): run the inner program capturing stdout (interpreted; I/O-bound)
       parts[#parts + 1] = ("sh:capture_src(%q)"):format(p.cmdsub)
     elseif p.pexp then
