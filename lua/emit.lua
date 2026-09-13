@@ -213,6 +213,7 @@ end
 local emit_has_debug = false -- program installs a DEBUG trap → fire it before each command
 local emit_funcstack = false -- program reads $FUNCNAME → maintain sh.funcstack around calls
 local emit_underscore = false -- program reads $_ → set it to each command's last arg
+local emit_redir_funcs = {} -- funcs with a definition redirect (`f(){…} >&2`): delegate them + their calls
 -- The DEBUG-trap prefix for a natively-compiled command (else ""). DEBUG fires BEFORE
 -- the command with $LINENO = its line. Top-level only (a compiled function body would
 -- wrongly fire without functrace — bash fires DEBUG once at the CALL site, which is a
@@ -1060,6 +1061,7 @@ local function build_cfg(stmts, lifted, funcflags, inlinefns, toplevel)
       -- at load — so a function doesn't "exist" (declare -f / delegated call / prefix
       -- assign) before its def line (bash). Direct compiled calls use the hoisted local
       -- regardless. Nested funcdefs (not in funcflags) stay a no-op for now.
+      if st.redirs then return delegate(st, after) end -- def-redirect func: interp registers func_redirs
       local p = newpc()
       if not st.name:match("^[%w_][%w_%.%-:+@/!#=]*$") then -- name is an expansion (`$foo-bar()`):
         blocks[p] = ("io.stderr:write(%q); sh.status = 1; pc = %d") -- non-fatal runtime error (bash)
@@ -1072,6 +1074,7 @@ local function build_cfg(stmts, lifted, funcflags, inlinefns, toplevel)
       return p
     elseif t == "simple" then
       local cmd = st.words[1] and st.words[1].parts[1] and st.words[1].parts[1].lit
+      if cmd and emit_redir_funcs[cmd] then return delegate(st, after) end -- call to a def-redirect func
       -- redirects compile (targets computed natively, syscalls via rt.redir_apply)
       -- when every one is compilable AND this isn't `exec` (its redirs persist);
       -- otherwise the whole command delegates.
@@ -1611,10 +1614,17 @@ function M.emit(ast)
   -- function. A normal call fires the trap once at the call site and keeps the body
   -- silent (its build_cfg is non-toplevel).
   local no_inline = emit_has_err or emit_has_debug or emit_funcstack
+  emit_redir_funcs = {}
   for _, st in ipairs(ast.stmts) do
     if st.t == "funcdef" then
-      funcflags[st.name] = func_flags(st.body)
-      if not no_inline and inlinable_body(st.body) then inlinable[st.name] = true; inlinefns[st.name] = st.body end
+      -- A function with a DEFINITION redirect (`f(){…} >&2`) applies that redirect per
+      -- call (target re-evaluated each time) — interp's run_function does this; a compiled
+      -- fn_x can't. Delegate the funcdef AND its calls to the interpreter.
+      if st.redirs then emit_redir_funcs[st.name] = true
+      else
+        funcflags[st.name] = func_flags(st.body)
+        if not no_inline and inlinable_body(st.body) then inlinable[st.name] = true; inlinefns[st.name] = st.body end
+      end
     end
   end
   -- Lift purely-arith vars to native int64. A var touched by no OUT-OF-LINE
