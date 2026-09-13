@@ -958,6 +958,20 @@ local function tilde_word_initial(sh, s)
 end
 M.tilde_word_initial = tilde_word_initial -- the compiled tier tilde-expands word-initial literals
 
+-- Compiled-tier scalar-assignment guard: true = allowed, false = rejected (var is
+-- readonly). Mirrors interp's assign handler — $?=1 + diagnostic, and fatal in
+-- `sh -c`/posix mode. Only emitted when the program can create a readonly var.
+function M.assign_guard(sh, name)
+  local rb = sh.vars[sh:deref(name)]
+  if rb and rb.ro then
+    io.stderr:write("curse: " .. name .. ": readonly variable\n")
+    sh.status = 1
+    if sh.opt_c or sh.opt_posix then error({ __curse_exit = 1 }) end
+    return false
+  end
+  return true
+end
+
 expand_word = function(sh, w)
   local buf = {}
   for k, p in ipairs(w.parts) do

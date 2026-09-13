@@ -24,6 +24,34 @@ local function lname(n) return "v_" .. n end
 -- original name (the dispatch key); only the generated identifier is mangled.
 local function fnlname(n) return "fn_" .. n:gsub("[^%w_]", function(c) return ("_%02x_"):format(c:byte()) end) end
 
+-- Does the program contain a command that can make a variable readonly (`readonly`,
+-- or declare/typeset/local with a -r flag)? Set once per emit; when false, compiled
+-- scalar assignments skip the readonly guard entirely (zero hot-path cost). A
+-- dynamically-created readonly (eval) is rare and simply not guarded — no worse than
+-- before (compiled ignored readonly entirely).
+local emit_has_ro = false
+local function makes_ro(st)
+  if st.t ~= "simple" or not st.words[1] then return false end
+  local c = st.words[1].parts[1] and #st.words[1].parts == 1 and st.words[1].parts[1].lit
+  if c == "readonly" then return true end
+  if c == "declare" or c == "typeset" or c == "local" then
+    for j = 2, #st.words do
+      local l = st.words[j].parts[1] and st.words[j].parts[1].lit
+      if l and l:match("^%-%a*r") then return true end
+      if l and l:sub(1, 1) ~= "-" then break end -- first operand ends the option scan
+    end
+  end
+  return false
+end
+local function scan_readonly(stmts)
+  for _, st in ipairs(stmts or {}) do
+    if makes_ro(st) then return true end
+    if st.body and scan_readonly(st.body) then return true end
+    if st.clauses then for _, cl in ipairs(st.clauses) do if scan_readonly(cl.body) then return true end end end
+  end
+  return false
+end
+
 -- serialize a {int->int} pc map to a Lua table literal
 local function serialize(t)
   local parts = {}
@@ -556,6 +584,15 @@ local function analyze_lift(ast)
             local nm = p1 and p1.lit and p1.lit:match("^([%a_][%w_]*)")
             if nm then localed[nm] = true end
           end
+        elseif cmd == "readonly" or cmd == "declare" or cmd == "typeset"
+            or cmd == "export" or cmd == "unset" then
+          -- these delegated builtins manage the var's BOX + attributes (ro/integer/
+          -- exported) in sh.vars; a native-int64 local would desync, so never lift.
+          for j = 2, #st.words do
+            local p1 = st.words[j].parts[1]
+            local nm = p1 and p1.lit and p1.lit:match("^([%a_][%w_]*)")
+            if nm then disq[nm] = true end
+          end
         end
       elseif st.t == "forc" or st.t == "whilec" then
         for _, e in ipairs({ st.init, cond_arith(st.cond), st.step }) do
@@ -810,6 +847,9 @@ local function build_cfg(stmts, lifted, funcflags, inlinefns, toplevel)
         blocks[p] = emit_set(st.name, emit_value(st.arith, lifted), lifted) .. ("; pc = %d"):format(after)
       elseif lifted[st.name] then
         blocks[p] = emit_set(st.name, numeric_word(st.rhs) .. "LL", lifted) .. ("; pc = %d"):format(after)
+      elseif emit_has_ro then -- reject a reassignment to a readonly var (bash: $?=1, fatal in -c/posix)
+        blocks[p] = ("if I.assign_guard(sh, %q) then sh:set_str(%q, %s) end; pc = %d")
+          :format(st.name, st.name, emit_word(st.rhs, lifted), after)
       else
         blocks[p] = ("sh:set_str(%q, %s); pc = %d"):format(st.name, emit_word(st.rhs, lifted), after)
       end
@@ -1324,6 +1364,7 @@ local function assert_compilable(stmts)
 end
 
 function M.emit(ast)
+  emit_has_ro = scan_readonly(ast.stmts) -- gate compiled readonly guards for this program
   local funcflags, inlinable, inlinefns = {}, {}, {}
   for _, st in ipairs(ast.stmts) do
     if st.t == "funcdef" then
