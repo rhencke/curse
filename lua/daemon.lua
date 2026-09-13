@@ -43,6 +43,7 @@ ffi.cdef [[
   int chmod(const char *path, unsigned int mode);
   int getuid(void);
   int getpid(void);
+  int get_nprocs(void);
   void _exit(int status);
 
   struct curse_iovec  { void *base; unsigned long len; };
@@ -153,7 +154,54 @@ local function run_worker(cfd, req, fds)
   local sbuf = ffi.new("int32_t[1]", status)
   C.write(cfd, sbuf, 4)
   C.close(cfd)
-  C._exit(status)
+  -- The SCRIPT status went to the client via the socket; the worker's OWN exit code
+  -- is a POOL signal to the parent (0 = served -> replenish). Never the script's
+  -- status, which could collide with WORKER_IDLE.
+  C._exit(0)
+end
+
+local WORKER_IDLE = 99 -- worker exit code meaning "accept() timed out" (parent may drain)
+
+-- A one-shot pre-forked worker: block in accept() on the shared listen socket, serve
+-- exactly one connection, then _exit. Pre-forked from the warm parent (CoW: warm
+-- heap + JIT traces + artifact cache), so a request costs NO fork on its critical
+-- path — the replacement fork happens in the parent after dispatch. accept() honors
+-- the listen socket's SO_RCVTIMEO, so an idle worker _exit(WORKER_IDLE) and the
+-- parent can drain the pool when the daemon has been idle.
+local function worker_main(lfd, my_uid)
+  local cfd
+  while true do
+    cfd = C.accept(lfd, nil, nil)
+    if cfd >= 0 then break end
+    local e = ffi.errno()
+    if e == EAGAIN or e == EWOULDBLOCK then C._exit(WORKER_IDLE) end
+    if e ~= EINTR then C._exit(1) end -- unexpected: let the parent replenish
+  end
+  -- SO_PEERCRED: reject any peer that isn't us (defense-in-depth).
+  local cred = ffi.new("struct curse_ucred[1]")
+  local credlen = ffi.new("unsigned int[1]"); credlen[0] = ffi.sizeof("struct curse_ucred")
+  C.getsockopt(cfd, SOL_SOCKET, SO_PEERCRED, cred, credlen)
+  if my_uid and cred[0].uid ~= my_uid then C.close(cfd); C._exit(0) end
+  -- recvmsg: request bytes + passed stdin/out/err fds (SCM_RIGHTS).
+  local iobuf = ffi.new("char[?]", 65536)
+  local ctrl = ffi.new("char[64]")
+  local iov = ffi.new("struct curse_iovec[1]"); iov[0].base = iobuf; iov[0].len = 65536
+  local msg = ffi.new("struct curse_msghdr[1]"); msg[0].iov = iov; msg[0].iovlen = 1
+  msg[0].control = ctrl; msg[0].controllen = 64
+  local n = tonumber(C.recvmsg(cfd, msg, 0))
+  if n <= 0 then C.close(cfd); C._exit(0) end
+  local fds = {}
+  local clen = tonumber(ffi.cast("unsigned long *", ctrl)[0])
+  local level = ffi.cast("int *", ctrl + 8)[0]
+  local ctype = ffi.cast("int *", ctrl + 12)[0]
+  if level == SOL_SOCKET and ctype == SCM_RIGHTS then
+    local nfds = math.floor((clen - 16) / 4)
+    local fdp = ffi.cast("int *", ctrl + 16)
+    for i = 0, nfds - 1 do fds[i + 1] = fdp[i] end
+  end
+  local req = parse_request(ffi.string(iobuf, n))
+  if not req then for _, f in ipairs(fds) do C.close(f) end; C.close(cfd); C._exit(0) end
+  run_worker(cfd, req, fds) -- serves on the caller's fds, replies, and _exit(0)s
 end
 
 -- ---- serve
@@ -180,78 +228,50 @@ local function serve()
   C.chmod(path, 384) -- 0600, defense-in-depth (dir is already 0700)
   if C.listen(lfd, 128) ~= 0 then log("listen() failed"); os.exit(1) end
 
-  -- idle self-exit so inactive users don't hold RAM: accept() with SO_RCVTIMEO.
+  -- Idle self-exit: workers' accept() honors this SO_RCVTIMEO (inherited via fork),
+  -- so an idle worker returns EAGAIN and _exit(WORKER_IDLE); the parent drains.
   local idle = tonumber(os.getenv("CURSE_IDLE") or "300")
   if idle > 0 then
     local tv = ffi.new("struct curse_tv"); tv.sec = idle; tv.usec = 0
     C.setsockopt(lfd, SOL_SOCKET, SO_RCVTIMEO, tv, ffi.sizeof("struct curse_tv"))
   end
-  log("listening on " .. path .. " (idle=" .. idle .. "s, pid=" .. tonumber(C.getpid()) .. ")")
+
+  -- PREFORK POOL: keep POOL workers pre-forked and blocked in accept() so a request
+  -- never waits for a fork (the ~500us fork is paid at startup + on replenish, off
+  -- the critical path). Concurrency up to POOL is served immediately; beyond POOL,
+  -- connections queue in the listen backlog (backpressure — never rejected). Plain
+  -- accept() on a shared socket wakes exactly one worker (no thundering herd).
+  local nproc = 4; pcall(function() nproc = tonumber(C.get_nprocs()) or 4 end)
+  local POOL = tonumber(os.getenv("CURSE_WORKERS") or "") or math.max(4, math.min(64, nproc * 2))
+  log("listening on " .. path .. " (idle=" .. idle .. "s, pool=" .. POOL ..
+      ", pid=" .. tonumber(C.getpid()) .. ")")
+
+  local live = 0
+  local function spawn()
+    local pid = C.fork()
+    if pid == 0 then worker_main(lfd, my_uid); C._exit(0) end -- worker_main _exits
+    if pid > 0 then live = live + 1 end
+  end
+  for _ = 1, POOL do spawn() end
 
   local st = ffi.new("int[1]")
-  local iobuf = ffi.new("char[?]", 65536)
-  local ctrl = ffi.new("char[64]")
-  local cred = ffi.new("struct curse_ucred[1]")
-  local credlen = ffi.new("unsigned int[1]")
-
-  while true do
-    while C.waitpid(-1, st, WNOHANG) > 0 do end -- reap finished workers (no zombies)
-
-    local cfd = C.accept(lfd, nil, nil)
-    if cfd < 0 then
-      local e = ffi.errno()
-      if e == EAGAIN or e == EWOULDBLOCK then
-        while C.waitpid(-1, st, WNOHANG) > 0 do end
-        log("idle timeout; exiting"); break
-      elseif e == EINTR then
-        -- retry
+  local last_active = os.time()
+  while live > 0 do
+    local pid = tonumber(C.waitpid(-1, st, 0)) -- block until a worker exits
+    if pid > 0 then
+      live = live - 1
+      local code = math.floor(tonumber(st[0]) / 256) % 256
+      if code == WORKER_IDLE then
+        -- A worker idled out. Replenish only while there's been recent activity;
+        -- once the daemon has been idle >= `idle`, stop -> the pool drains to 0 -> exit.
+        if os.time() - last_active < idle and live < POOL then spawn() end
       else
-        log("accept() errno=" .. e); break
-      end
-    else
-      -- SO_PEERCRED: reject any peer that isn't us (defense-in-depth).
-      credlen[0] = ffi.sizeof("struct curse_ucred")
-      C.getsockopt(cfd, SOL_SOCKET, SO_PEERCRED, cred, credlen)
-      local peer_uid = cred[0].uid
-      if my_uid and peer_uid ~= my_uid then
-        log("rejecting peer uid " .. tonumber(peer_uid)); C.close(cfd)
-      else
-        -- recvmsg: request bytes into iobuf, passed fds in ctrl (SCM_RIGHTS).
-        local iov = ffi.new("struct curse_iovec[1]")
-        iov[0].base = iobuf; iov[0].len = 65536
-        local msg = ffi.new("struct curse_msghdr[1]")
-        msg[0].iov = iov; msg[0].iovlen = 1
-        msg[0].control = ctrl; msg[0].controllen = 64
-        local n = tonumber(C.recvmsg(cfd, msg, 0))
-        if n <= 0 then
-          C.close(cfd)
-        else
-          local fds = {}
-          local clen = tonumber(ffi.cast("unsigned long *", ctrl)[0])
-          local level = ffi.cast("int *", ctrl + 8)[0]
-          local ctype = ffi.cast("int *", ctrl + 12)[0]
-          if level == SOL_SOCKET and ctype == SCM_RIGHTS then
-            local nfds = math.floor((clen - 16) / 4)
-            local fdp = ffi.cast("int *", ctrl + 16)
-            for i = 0, nfds - 1 do fds[i + 1] = fdp[i] end
-          end
-          local req = parse_request(ffi.string(iobuf, n))
-          if not req then
-            for _, f in ipairs(fds) do C.close(f) end
-            C.close(cfd)
-          else
-            local pid = C.fork()
-            if pid == 0 then
-              run_worker(cfd, req, fds) -- never returns
-            end
-            -- parent: the worker owns cfd + the passed fds now.
-            for _, f in ipairs(fds) do C.close(f) end
-            C.close(cfd)
-          end
-        end
+        last_active = os.time() -- served (or a transient failure); keep the pool full
+        if live < POOL then spawn() end
       end
     end
   end
+  log("idle timeout; exiting")
   C.unlink(path)
 end
 
