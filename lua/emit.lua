@@ -710,9 +710,15 @@ local function test_as_arith(cond, lifted)
   return { k = "bin", op = op, l = l, r = r }
 end
 
--- a word that is exactly one numeric literal -> its digits (else nil)
+-- A word that is exactly one DECIMAL integer literal -> its digits (else nil). A
+-- leading-zero literal (`017`) is REJECTED: bash keeps the string and reads it as
+-- OCTAL only in arithmetic, but appending "LL" would make Lua parse it as decimal
+-- (017LL == 17, not 15). Rejecting it here keeps the var out of the int64 lift
+-- (analyze_lift also gates on numeric_word), so it stays a string that aget/arith_num
+-- interpret with bash's base rules.
 local function numeric_word(w)
-  if #w.parts == 1 and w.parts[1].lit and w.parts[1].lit:match("^[+-]?%d+$") then
+  if #w.parts == 1 and w.parts[1].lit and w.parts[1].lit:match("^[+-]?%d+$")
+      and not w.parts[1].lit:match("^[+-]?0%d") then
     return w.parts[1].lit
   end
   return nil
@@ -833,7 +839,11 @@ end
 local function scan_arith_param(e, f)
   if type(e) ~= "table" then return end
   if e.k == "param" then f.params = true end
+  -- an embedded $-expansion (`$(( $* ))`, `$(( $1+1 ))`) is re-expanded at runtime and
+  -- may reference the positional params — conservatively require the param swap.
+  if e.k == "xpand" then f.params = true end
   scan_arith_param(e.e, f); scan_arith_param(e.l, f); scan_arith_param(e.r, f)
+  scan_arith_param(e.c, f); scan_arith_param(e.a, f); scan_arith_param(e.b, f)
 end
 local function scan_word_param(w, f)
   for _, p in ipairs(w.parts) do
@@ -878,10 +888,21 @@ local function word_varargs(w) -- word that blocks inlining
   end
   return false
 end
+-- An arith node is inline-substitutable only if subst_arith reaches every leaf that
+-- could reference the caller. An `xpand` (embedded $-expansion, e.g. `$(( $* ))`) is
+-- delegated verbatim and would re-read the INLINE SITE's sh.params/vars — never inline it.
+local function arith_inlinable(e)
+  if type(e) ~= "table" then return true end
+  if e.k == "xpand" then return false end
+  return arith_inlinable(e.e) and arith_inlinable(e.l) and arith_inlinable(e.r)
+    and arith_inlinable(e.c) and arith_inlinable(e.a) and arith_inlinable(e.b)
+end
+
 local function inlinable_body(body)
   for _, st in ipairs(body) do
     if st.t == "assign" then
       if st.rhs and word_varargs(st.rhs) then return false end
+      if st.arith and not arith_inlinable(st.arith) then return false end
     elseif st.t == "simple" then
       local cmd = st.words[1] and st.words[1].parts[1] and st.words[1].parts[1].lit
       if not (cmd == "echo" or cmd == ":" or cmd == "true" or cmd == "false") then return false end
