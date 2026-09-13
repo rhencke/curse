@@ -1200,8 +1200,9 @@ local function build_cfg(stmts, lifted, funcflags, inlinefns, toplevel)
       end
       parts[#parts + 1] = ("sh.forstate[%d] = {list=__l, idx=0}"):format(st.id)
       blocks[initp] = table.concat(parts, "; ") .. ("; pc = %d"):format(advp)
-      blocks[advp] = ("local fs = sh.forstate[%d]; fs.idx = fs.idx + 1; if fs.idx > #fs.list then pc = %d else sh:set_str(%q, fs.list[fs.idx]); pc = %d end"):format(
-        st.id, after, st.name, bodyentry)
+      -- DEBUG fires at the `for` header before each iteration (bash), with an element present.
+      blocks[advp] = ("local fs = sh.forstate[%d]; fs.idx = fs.idx + 1; if fs.idx > #fs.list then pc = %d else sh:set_str(%q, fs.list[fs.idx]); %spc = %d end"):format(
+        st.id, after, st.name, dbg(st), bodyentry)
       return initp
     elseif t == "if" then
       -- Each clause's condition is either a native arith `(( ))` (emit_bool) or a
