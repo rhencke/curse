@@ -1700,6 +1700,25 @@ function M.subst_glob(val, glob, repl, all)
     if anchor == "^" then return repl .. val elseif anchor == "$" then return val .. repl end
     return val
   end
+  -- Literal pattern (no glob metachars): plain byte find/replace, no regex — the
+  -- common `${x//-/_}` / `${x//,/ }` case (regex is left for real globs).
+  if not glob:find("[%*%?%[\\]") and not glob:find("[@!+?*]%(") then
+    local plen = #glob
+    if anchor == "^" then
+      return val:sub(1, plen) == glob and (repl .. val:sub(plen + 1)) or val
+    elseif anchor == "$" then
+      return val:sub(#val - plen + 1) == glob and (val:sub(1, #val - plen) .. repl) or val
+    end
+    local out, i = {}, 1
+    while true do
+      local s, e = val:find(glob, i, true)
+      if not s then break end
+      out[#out + 1] = val:sub(i, s - 1); out[#out + 1] = repl; i = e + 1
+      if not all then break end
+    end
+    out[#out + 1] = val:sub(i)
+    return table.concat(out)
+  end
   local ere = glob_conv(glob)
   if anchor == "^" then ere = "^(" .. ere .. ")"
   elseif anchor == "$" then ere = "(" .. ere .. ")$"
@@ -2114,6 +2133,10 @@ end
 -- `all` folds every matching char (else only the first). An empty PAT means "any".
 local function fold_case(val, pat, upper, all)
   if pat == nil or pat == "" then pat = "?" end
+  -- `?` (the default, `${x^^}`/`${x,,}` with no pattern) matches EVERY single char,
+  -- so skip the per-char glob_match — it would regcomp once per character (ruinous
+  -- in a loop). Only a real pattern (`${x^[a-z]}`) needs the match test.
+  local any = (pat == "?")
   -- Fold per CHARACTER (codepoint) using the locale's towupper/towlower, exactly
   -- as bash does — so `${x^^}` upcases μ→Μ under a UTF-8 locale, Turkish i→İ under
   -- tr_TR, etc. A bad byte (wc == nil) is left as-is.
@@ -2121,7 +2144,7 @@ local function fold_case(val, pat, upper, all)
   local out, limit = {}, all and #chars or math.min(1, #chars)
   for k = 1, #chars do
     local ch = chars[k]; local s = ch.s
-    if k <= limit and ch.wc and M.glob_match(s, pat) then
+    if k <= limit and ch.wc and (any or M.glob_match(s, pat)) then
       local w2 = upper and M.towupper(ch.wc) or M.towlower(ch.wc)
       if w2 ~= ch.wc then s = M.wc_to_bytes(w2, ch.s) end
     end
