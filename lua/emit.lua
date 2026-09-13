@@ -117,6 +117,7 @@ local RENDERABLE_SPECIAL = { ["#"] = 1, ["@"] = 1, ["*"] = 1, ["?"] = 1, ["$"] =
 local function emitable_word(w)
   for _, p in ipairs(w.parts) do
     if p.pexp then return false end
+    if p.procsub then return false end -- <(cmd)/>(cmd): needs the interp's temp-file setup
     if p.special and not RENDERABLE_SPECIAL[p.special] then return false end -- e.g. $-
     if p.arith and arith_side_effect(require("parser").arith(p.arith)) then return false end
     if p.arithast and arith_side_effect(p.arithast) then return false end -- inlined arith
@@ -272,7 +273,7 @@ local function collect_names(stmts, set)
       if st.arith then collect_arith(st.arith, set) elseif st.rhs then collect_word(st.rhs, set) end
     elseif st.t == "simple" then
       for j = 2, #st.words do collect_word(st.words[j], set) end
-      local cmd = st.words[1].parts[1] and st.words[1].parts[1].lit
+      local cmd = st.words[1] and st.words[1].parts[1] and st.words[1].parts[1].lit
       if cmd == "local" then
         for j = 2, #st.words do
           local p1 = st.words[j].parts[1]
@@ -321,7 +322,7 @@ local function analyze_lift(ast)
         assigned[st.name] = true
         if not st.arith and not (st.rhs and numeric_word(st.rhs)) then disq[st.name] = true end
       elseif st.t == "simple" then
-        local cmd = st.words[1].parts[1] and st.words[1].parts[1].lit
+        local cmd = st.words[1] and st.words[1].parts[1] and st.words[1].parts[1].lit
         if cmd == "local" then
           for j = 2, #st.words do
             local p1 = st.words[j].parts[1]
@@ -369,7 +370,7 @@ local function func_flags(body)
   local function scan(stmts)
     for _, st in ipairs(stmts) do
       if st.t == "simple" then
-        local cmd = st.words[1].parts[1] and st.words[1].parts[1].lit
+        local cmd = st.words[1] and st.words[1].parts[1] and st.words[1].parts[1].lit
         if cmd == "local" then f.locals = true end
         for j = 2, #st.words do scan_word_param(st.words[j], f) end
       elseif st.t == "assign" then
@@ -406,7 +407,7 @@ local function inlinable_body(body)
     if st.t == "assign" then
       if st.rhs and word_varargs(st.rhs) then return false end
     elseif st.t == "simple" then
-      local cmd = st.words[1].parts[1] and st.words[1].parts[1].lit
+      local cmd = st.words[1] and st.words[1].parts[1] and st.words[1].parts[1].lit
       if not (cmd == "echo" or cmd == ":" or cmd == "true" or cmd == "false") then return false end
       for j = 2, #st.words do if word_varargs(st.words[j]) then return false end end
     else
@@ -503,6 +504,49 @@ local function build_cfg(stmts, lifted, funcflags, inlinefns, toplevel)
     dbracket = 1, arrayassign = 1, parse_error = 1, assignlist = 1, background = 1,
   }
 
+  -- Compile one redirect's target to a native Lua expr (op + fd are already
+  -- compile-time constants). Returns the expr, or nil when this redirect isn't
+  -- monomorphic enough to compile — a `{var}>` named fd, a fd MOVE (`>&N-`), an
+  -- expanding heredoc, a dup target that isn't a plain fd, or a FILE target that
+  -- needs the field engine ($/glob/brace/tilde/split/ambiguity). The caller then
+  -- delegates the whole command (honest transition; those are the defect to grind).
+  local P = require("parser")
+  local REDIR_FILE = { out = 1, app = 1, ["in"] = 1, clobber = 1, rw = 1, appboth = 1, outboth = 1 }
+  local function redir_target_expr(r)
+    if r.fdvar then return nil end
+    if REDIR_FILE[r.op] then
+      local t = r.target or ""
+      -- needs the field engine or a subshell/procsub (`> >(cmd)`, `< <(cmd)`): delegate.
+      if t == "" or t:find("[%$`%*%?%[~{()]") then return nil end
+      return ("%q"):format(t) -- a static literal path
+    elseif r.op == "dup" or r.op == "dupin" then
+      local t = r.target or ""
+      if t == "-" or t:match("^%d+$") then return ("%q"):format(t) end
+      return nil -- a dynamic fd, or a MOVE (`>&5-`): delegate
+    elseif r.op == "herestring" then
+      local w = P.parse_word(r.word or ""); if not emitable_word(w) then return nil end
+      return "(" .. emit_word(w, lifted) .. ' .. "\\n")' -- one blob (no split), + a trailing newline
+    elseif r.op == "heredoc" then
+      if r.expand then return nil end -- an expanding body needs the word engine — later
+      return ("%q"):format(r.body or "")
+    end
+    return nil
+  end
+  -- Build the "install all redirs, run, restore" conditions for `st.redirs`, or nil
+  -- if any redir can't be compiled (caller delegates) or the command is `exec`
+  -- (whose redirs must PERSIST — never restored). Returns the `and`-chained apply
+  -- expression; the caller wraps the command body with it.
+  local function redir_conds(st, cmd)
+    if cmd == "exec" then return nil end
+    local conds = {}
+    for _, r in ipairs(st.redirs) do
+      local texpr = redir_target_expr(r)
+      if not texpr then return nil end
+      conds[#conds + 1] = ("rt.redir_apply(sh, %q, %d, %s, __rs)"):format(r.op, r.fd or 0, texpr)
+    end
+    return table.concat(conds, " and ")
+  end
+
   -- Build blocks for `st`; its exit flows to pc `after`. Returns st's entry pc.
   local function flatten_stmt(st, after)
     local t = st.t
@@ -546,15 +590,29 @@ local function build_cfg(stmts, lifted, funcflags, inlinefns, toplevel)
     elseif t == "funcdef" then
       local p = newpc(); blocks[p] = ("pc = %d"):format(after); return p -- closures are hoisted
     elseif t == "simple" then
-      -- a redirect-only command (`< file`) has no words: nothing to compile, so
-      -- delegate — the field engine / redirection live in the interpreter anyway.
-      if not st.words[1] then return delegate(st, after) end
-      local cmd = st.words[1].parts[1] and st.words[1].parts[1].lit
-      -- delegate if it needs the field engine (splitting/glob/pexp), a redirect,
-      -- or a builtin without a native compiled form.
+      local cmd = st.words[1] and st.words[1].parts[1] and st.words[1].parts[1].lit
+      -- redirects compile (targets computed natively, syscalls via rt.redir_apply)
+      -- when every one is compilable AND this isn't `exec` (its redirs persist);
+      -- otherwise the whole command delegates.
+      local redir_apply = nil
+      if st.redirs then
+        redir_apply = redir_conds(st, cmd)
+        if not redir_apply then return delegate(st, after) end
+      end
+      -- a redirect-ONLY command (`> file`, `< f`): no command runs; apply the redirs
+      -- (their open/truncate is the effect), status 0 (or 1 on failure), then restore.
+      if not st.words[1] then
+        local p = newpc()
+        blocks[p] = ("do local __rs = {}; sh.status = %s and 0 or 1; rt.redir_restore(__rs) end; pc = %d")
+          :format(redir_apply, after)
+        return p
+      end
+      -- delegate if it needs the field engine (splitting/glob/pexp), or a builtin
+      -- without a native compiled form.
       local NATIVE_BUILTIN = { echo = 1, [":"] = 1, ["true"] = 1, ["false"] = 1, ["local"] = 1, ["return"] = 1 }
       local isfunc = (inlinefns and inlinefns[cmd]) or funcflags[cmd]
-      local mustdeleg = st.redirs ~= nil or st.assigns ~= nil -- prefix env -> delegate
+      if cmd == "return" and redir_apply then return delegate(st, after) end -- rare; wrapper assumes a run body
+      local mustdeleg = st.assigns ~= nil -- prefix env -> delegate
       if not mustdeleg then
         for _, w in ipairs(st.words) do
           -- functions stay native (so they inline / call fn_x) unless an arg has a
@@ -576,7 +634,7 @@ local function build_cfg(stmts, lifted, funcflags, inlinefns, toplevel)
         blocks[p] = ("sh.status = (%s) or 0; pc = %d"):format(n, DONE)
         return p
       end
-      if inlinefns and inlinefns[cmd] then
+      if inlinefns and inlinefns[cmd] and not redir_apply then
         -- INLINE: bind $n to the caller's exprs and splice the body flowing to `after`.
         local pb = {}
         for j = 2, #st.words do
@@ -620,7 +678,15 @@ local function build_cfg(stmts, lifted, funcflags, inlinefns, toplevel)
         body = "sh:exec(" .. table.concat(allargs, ", ") .. ")"
       end
       local ec = errchk(st) -- errexit after a failing native simple command
-      blocks[p] = body .. (ec ~= "" and "; " .. ec or "") .. ("; pc = %d"):format(after)
+      local ecs = ec ~= "" and ("; " .. ec) or ""
+      if redir_apply then
+        -- install the redirs (backing up fds), run the command only if they all
+        -- succeeded (else $?=1, bash), then restore the fds — real syscalls, no AST.
+        blocks[p] = ("do local __rs = {}; if %s then %s else sh.status = 1 end; rt.redir_restore(__rs) end%s; pc = %d")
+          :format(redir_apply, body, ecs, after)
+      else
+        blocks[p] = body .. ecs .. ("; pc = %d"):format(after)
+      end
       return p
     elseif t == "forc" then
       if st.redirs then return delegate(st, after) end -- redirs on the loop: interp applies them

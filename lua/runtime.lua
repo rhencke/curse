@@ -272,6 +272,9 @@ ffi.cdef [[
   int pipe(int fildes[2]);
   int close(int fd);
   int dup2(int oldfd, int newfd);
+  int dup(int oldfd);
+  int open(const char *path, int flags, int mode);
+  int fcntl(int fd, int cmd, ...);
   int fork(void);
   void _exit(int status);
   int access(const char *path, int mode);
@@ -426,6 +429,70 @@ end
 local _ss_st = ffi.new("int[1]")
 function M.subshell_wait(pid) C.waitpid(pid, _ss_st, 0); return M.wexit(_ss_st[0]) end
 function M.subshell_exit(status) io.flush(); C._exit(status or 0) end
+
+-- Redirections, GENUINELY COMPILED. The compiler knows each redirect's operator +
+-- fd at compile time and computes its target natively, then calls this with the
+-- computed operands — real syscalls, not an AST re-walk. redir_apply backs up each
+-- touched fd into `saves` and installs the redirect; redir_restore puts them back.
+-- A failure (open error, ambiguous/unopened dup target) returns false: the command
+-- is skipped with $?=1, like bash. The compiler only hands us monomorphic cases
+-- (literal file target, digit/`-` dup target, heredoc/herestring body); dynamic
+-- field-engine targets, `exec` (which must PERSIST), and fd moves are delegated.
+local _redir_stat = ffi.new("char[144]") -- struct stat scratch (st_mode at +24)
+local function _temp_fd(content) -- write body to a temp file, return an O_RDONLY fd
+  local tmp = os.tmpname()
+  local w = io.open(tmp, "w"); if not w then return -1 end
+  w:write(content); w:close()
+  local f = C.open(tmp, 0, 0) -- O_RDONLY
+  os.remove(tmp) -- the open fd keeps the inode alive
+  return f
+end
+function M.redir_apply(sh, op, fd, target, saves)
+  io.flush() -- flush buffered stdout before moving fds (else it lands in the new target)
+  local function backup(f) saves[#saves + 1] = { fd = f, saved = C.dup(f) } end
+  local function open_out(path) -- honor noclobber (set -C) for a truncating '>'
+    if not sh.opt_C then return C.open(path, 577, 438) end -- O_WRONLY|O_CREAT|O_TRUNC
+    local h = C.open(path, 705, 438) -- + O_EXCL
+    if h >= 0 then return h end
+    if C.curse_rt_stat(path, _redir_stat) == 0
+        and bit.band(ffi.cast("uint32_t *", _redir_stat + 24)[0], 0xF000) ~= 0x8000 then
+      return C.open(path, 1, 438) -- existing NON-regular (e.g. /dev/null): plain O_WRONLY
+    end
+    return -1
+  end
+  if op == "out" or op == "clobber" then
+    backup(fd); local h = (op == "out") and open_out(target) or C.open(target, 577, 438)
+    if h < 0 then return false end; if h ~= fd then C.dup2(h, fd); C.close(h) end
+  elseif op == "app" then
+    backup(fd); local h = C.open(target, 1089, 438) -- O_WRONLY|O_CREAT|O_APPEND
+    if h < 0 then return false end; if h ~= fd then C.dup2(h, fd); C.close(h) end
+  elseif op == "in" then
+    backup(fd); local h = C.open(target, 0, 0) -- O_RDONLY
+    if h < 0 then return false end; if h ~= fd then C.dup2(h, fd); C.close(h) end
+  elseif op == "rw" then
+    backup(fd); local h = C.open(target, 66, 438) -- O_RDWR|O_CREAT
+    if h < 0 then return false end; if h ~= fd then C.dup2(h, fd); C.close(h) end
+  elseif op == "dup" or op == "dupin" then -- N>&M / N<&M / N>&-
+    if target == "-" then backup(fd); C.close(fd)
+    else
+      local tf = tonumber(target); if not tf then return false end
+      if C.fcntl(tf, 1) == -1 then return false end -- F_GETFD: target fd not open -> bash fails
+      backup(fd); C.dup2(tf, fd)
+    end
+  elseif op == "outboth" or op == "appboth" then -- &> / &>>
+    backup(1); backup(2)
+    local h = (op == "appboth") and C.open(target, 1089, 438) or open_out(target)
+    if h < 0 then return false end; C.dup2(h, 1); C.dup2(h, 2); C.close(h)
+  elseif op == "heredoc" or op == "herestring" then
+    backup(fd); local h = _temp_fd(target) -- target = the already-built body text
+    if h < 0 then return false end; if h ~= fd then C.dup2(h, fd); C.close(h) end
+  else return nil end -- op the compiler shouldn't have handed us
+  return true
+end
+function M.redir_restore(saves)
+  io.flush()
+  for i = #saves, 1, -1 do local s = saves[i]; C.dup2(s.saved, s.fd); C.close(s.saved) end
+end
 -- bash values are C strings: a NUL byte terminates them. Truncate at the first NUL
 -- wherever a byte string becomes a variable value or an argv entry (assignment,
 -- fields/argv, for-lists). I/O streams (echo/printf output, pipes) keep raw NULs —
@@ -1947,8 +2014,9 @@ function Shell:echo(...)
   -- because the parent flushes b before the just-forked child is scheduled. Only
   -- when writing to the real fd (not into a $()/pipe capture buffer). A flush
   -- error (e.g. a full disk) is a write error -> status 1, like bash's sh_chkwrite.
-  if self.out == io.write and not io.flush() then self.write_err = true end -- full disk etc.
-  self.status = 0
+  local werr = (self.out == io.write) and not io.flush() -- flush error (e.g. full disk) here
+  if werr then self.write_err = true end
+  self.status = werr and 1 or 0 -- a write error is status 1, like bash's sh_chkwrite
 end
 
 return M
