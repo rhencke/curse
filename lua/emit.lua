@@ -18,6 +18,11 @@ local M = {}
 
 local CMP = { ["=="] = "==", ["!="] = "~=", ["<"] = "<", ["<="] = "<=", [">"] = ">", [">="] = ">=" }
 local function lname(n) return "v_" .. n end
+-- A valid Lua identifier for the closure of shell function `n`. bash function names
+-- may hold -/./=/! etc. (`foo-bar`, `my.helper`), which can't spell a Lua local, so
+-- escape every non-identifier byte as `_XX_`. sh.functions is still keyed by the
+-- original name (the dispatch key); only the generated identifier is mangled.
+local function fnlname(n) return "fn_" .. n:gsub("[^%w_]", function(c) return ("_%02x_"):format(c:byte()) end) end
 
 -- serialize a {int->int} pc map to a Lua table literal
 local function serialize(t)
@@ -133,7 +138,7 @@ local function word_safe(w)
     if p.special == "@" or p.special == "*" then return false end -- multi-element (even quoted)
     if not p.q then
       if p.var or p.param or p.special or p.cmdsub then return false end -- unquoted -> splits
-      if p.lit and p.lit:find("[*?%[]") then return false end           -- unquoted glob
+      if p.lit and (p.lit:find("[*?%[]") or p.lit:find("[@!+?*]%(")) then return false end -- unquoted glob / extglob
     end
   end
   return true
@@ -283,7 +288,7 @@ local function field_word(w, lifted)
     if p.var or p.param or p.cmdsub or p.arith or p.arithast then alllit = false
     elseif p.lit then
       allexp = false
-      if p.lit:find("[*?%[]") then hasglob = true end
+      if p.lit:find("[*?%[]") or p.lit:find("[@!+?*]%(") then hasglob = true end -- glob / extglob
     else return nil end
   end
   if allexp then return { expr = emit_word(w, lifted), split = true } end -- $x / $x$y
@@ -852,8 +857,8 @@ local function build_cfg(stmts, lifted, funcflags, inlinefns, toplevel)
           elseif funcflags[cmd] and (funcflags[cmd].locals or funcflags[cmd].params) then
             from = 2
             local ff = funcflags[cmd]
-            call = ff.locals and ("sh:pushCall(unpack(__a)); fn_%s(sh); sh:popCall()"):format(cmd)
-              or ("sh:pushParams(unpack(__a)); fn_%s(sh); sh:popParams()"):format(cmd)
+            call = ff.locals and ("sh:pushCall(unpack(__a)); %s(sh); sh:popCall()"):format(fnlname(cmd))
+              or ("sh:pushParams(unpack(__a)); %s(sh); sh:popParams()"):format(fnlname(cmd))
           elseif cmd ~= nil and not NATIVE_BUILTIN[cmd] and not (inlinefns and inlinefns[cmd])
               and not funcflags[cmd] and not require("interp").BUILTINS[cmd] then
             from = 1; call = "sh:exec(unpack(__a))" -- external, static command name
@@ -945,11 +950,11 @@ local function build_cfg(stmts, lifted, funcflags, inlinefns, toplevel)
       elseif funcflags[cmd] then
         local ff = funcflags[cmd]
         if ff.locals then -- full frame (save/restore shadowed vars + params)
-          body = ("sh:pushCall(%s); fn_%s(sh); sh:popCall()"):format(table.concat(args, ", "), cmd)
+          body = ("sh:pushCall(%s); %s(sh); sh:popCall()"):format(table.concat(args, ", "), fnlname(cmd))
         elseif ff.params then -- positional swap only (no per-call frame table)
-          body = ("sh:pushParams(%s); fn_%s(sh); sh:popParams()"):format(table.concat(args, ", "), cmd)
+          body = ("sh:pushParams(%s); %s(sh); sh:popParams()"):format(table.concat(args, ", "), fnlname(cmd))
         else -- neither: bare call, no allocation
-          body = ("fn_%s(sh)"):format(cmd)
+          body = ("%s(sh)"):format(fnlname(cmd))
         end
       else -- external command: sh:exec(all words including the command name)
         local allargs = {}
@@ -1252,7 +1257,7 @@ local function assemble(cfg, sig, opts)
   local o = { sig }
   -- register compiled function closures into sh.functions so the interpreter
   -- (reached via delegation) can call them too — full interp/compiled interop.
-  for _, n in ipairs(opts.register or {}) do o[#o + 1] = ("  sh.functions[%q] = fn_%s"):format(n, n) end
+  for _, n in ipairs(opts.register or {}) do o[#o + 1] = ("  sh.functions[%q] = %s"):format(n, fnlname(n)) end
   -- verbatim definition source for `declare -f`/`type` (parity with the interpreter)
   if opts.funcsrc and next(opts.funcsrc) then
     o[#o + 1] = "  sh.func_src = sh.func_src or {}"
@@ -1352,14 +1357,14 @@ function M.emit(ast)
     o[#o + 1] = "local " .. table.concat(vs, ", ") -- module-level upvalues (shared with non-inlined functions)
   end
   local decls = {}
-  for name in pairs(funcflags) do decls[#decls + 1] = "fn_" .. name end
+  for name in pairs(funcflags) do decls[#decls + 1] = fnlname(name) end
   if #decls > 0 then o[#o + 1] = "local " .. table.concat(decls, ", ") end
   for _, st in ipairs(ast.stmts) do
     if st.t == "funcdef" then
       -- keep every fn_x (indirect/dynamic dispatch); it can't see run-locals, so
       -- it lifts only the shared upvalues and is sh-direct for the rest.
       local cfg = build_cfg(st.body, upset, funcflags, inlinefns)
-      o[#o + 1] = assemble(cfg, "fn_" .. st.name .. " = function(sh)", {})
+      o[#o + 1] = assemble(cfg, fnlname(st.name) .. " = function(sh)", {})
     end
   end
   local funcnames = {}
