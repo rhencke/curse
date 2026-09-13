@@ -202,8 +202,9 @@ local emit_toplevel = false -- current build_cfg is the top level (ERR only fire
 -- in_subprogram check keeps ERR from firing in the forked child.)
 local function errchk(st) -- the guard statement for `st`, or "" when errexit never applies
   if not (st and ERREXIT_TYPES[st.t] and not st.negate) then return "" end
-  if emit_has_err and emit_toplevel then -- ERR trap fires on the same condition as errexit;
-    -- set $LINENO to this command's line for the handler, fire ERR, THEN errexit (bash order).
+  if emit_has_err then -- ERR trap fires on the same condition as errexit; set $LINENO to this
+    -- command's line, fire ERR (fire_err_trap scopes by calldepth/in_subprogram — inside a
+    -- function/subshell only under errtrace), THEN errexit (bash order).
     return ("if sh.noerr == 0 and sh.status ~= 0 then sh.cur_line = %d; I.fire_err_trap(sh); if sh.opt_e then error({ __curse_exit = sh.status }) end end")
       :format(st.line or 0)
   end
@@ -218,15 +219,21 @@ local emit_underscore = false -- program reads $_ → set it to each command's l
 -- top-level command). Delegated commands fire DEBUG via interp's exec_stmt, so this is
 -- prepended ONLY to native blocks (exactly one fires).
 local function dbg(st)
-  if emit_has_debug and emit_toplevel then return ("I.run_debug(sh, %d); "):format(st.line or 0) end
+  -- run_debug scopes by calldepth/in_subprogram (fires inside a function/subshell only
+  -- under functrace); calldepth is tracked in fnwrap when a DEBUG trap is present.
+  if emit_has_debug then return ("I.run_debug(sh, %d); "):format(st.line or 0) end
   return ""
 end
 -- Wrap a compiled function call `s` (function `cmd`, called at source `line`) with
--- call-stack maintenance when the program reads FUNCNAME/BASH_SOURCE/BASH_LINENO;
--- else return it unchanged (zero cost).
+-- call-stack maintenance ($FUNCNAME/BASH_* when read) and, when an ERR/DEBUG trap is
+-- present, calldepth tracking — so fire_err_trap/run_debug scope those traps to the
+-- function (they fire inside a function only under errtrace/functrace). Zero cost when
+-- neither applies. (Inline is disabled when a trap is present, so all calls come here.)
 local function fnwrap(cmd, line, s)
-  if emit_funcstack then return ("sh:enterFunc(%q, %d); "):format(cmd, line or 0) .. s .. "; sh:leaveFunc()" end
-  return s
+  local pre, post = "", ""
+  if emit_funcstack then pre = ("sh:enterFunc(%q, %d); "):format(cmd, line or 0); post = "; sh:leaveFunc()" end
+  if emit_has_err or emit_has_debug then pre = pre .. "sh.calldepth = sh.calldepth + 1; "; post = post .. "; sh.calldepth = sh.calldepth - 1" end
+  return pre .. s .. post
 end
 -- Special params emit_word knows how to render; any OTHER `$special` (e.g. `$-`,
 -- the option string) must delegate, or emit_word would silently render it empty.
