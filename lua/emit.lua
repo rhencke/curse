@@ -952,12 +952,22 @@ local function build_cfg(stmts, lifted, funcflags, inlinefns, toplevel)
       end
     elseif cf_op == "return" then
       -- return [N] (incl. \return / builtin return / command return): set $? and exit
-      -- the CFG. A non-literal/expression status word is fine (emit_word handles it).
-      if not st.words[cf_arg + 1] then -- at most one status arg
-        local p = newpc()
-        local n = st.words[cf_arg] and ("tonumber(%s)"):format(emit_word(st.words[cf_arg], lifted)) or "sh.status"
-        blocks[p] = ("sh.status = (%s) or 0; pc = %d"):format(n, DONE)
-        return p
+      -- the CFG. I.return_status: N%256, or 2 + diagnostic on non-numeric; no arg → $?.
+      local aw = st.words[cf_arg]
+      if not st.words[cf_arg + 1] then -- at most one status WORD (pre-split)
+        if not aw then -- `return` with no arg → previous status
+          local p = newpc(); blocks[p] = ("pc = %d"):format(DONE); return p
+        elseif word_safe(aw) then -- one field (literal/quoted): `return ""` → 2, `return 42` → 42
+          local p = newpc()
+          blocks[p] = ("sh.status = I.return_status(sh, %s); pc = %d"):format(emit_word(aw, lifted), DONE)
+          return p
+        elseif field_word(aw, lifted) then -- unquoted expansion: split — 0 fields → $?, else 1st field
+          local fw = field_word(aw, lifted)
+          local p = newpc()
+          blocks[p] = ("do local __f = rt.field_split(sh, %s, %s); if #__f > 0 then sh.status = I.return_status(sh, __f[1]) end end; pc = %d")
+            :format(fw.expr, tostring(fw.split), DONE)
+          return p
+        end -- else (pexp/${…}): not intercepted — falls through (emit deopts to interp, which is correct)
       end
     end
     if DELEGATE[t] then return delegate(st, after) end
