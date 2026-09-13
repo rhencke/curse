@@ -1276,12 +1276,13 @@ local function build_cfg(stmts, lifted, funcflags, inlinefns, toplevel)
       loopstack[#loopstack + 1] = { brk = after, cont = stepp } -- break exits, continue steps
       local bodyentry = flatten_list(st.body, stepp)
       loopstack[#loopstack] = nil
-      blocks[stepp] = (st.step and emit_arith_stmt(st.step, lifted) .. "; " or "") .. ("pc = %d"):format(condp)
-      blocks[condp] = ("if %s then pc = %d else pc = %d end"):format(
+      local d = dbg(st) -- DEBUG fires at the for(( header for the init, each cond, and each step (bash)
+      blocks[stepp] = d .. (st.step and emit_arith_stmt(st.step, lifted) .. "; " or "") .. ("pc = %d"):format(condp)
+      blocks[condp] = d .. ("if %s then pc = %d else pc = %d end"):format(
         st.cond and emit_bool(st.cond, lifted) or "true", bodyentry, after)
       if st.init then
         local ip = newpc()
-        blocks[ip] = emit_arith_stmt(st.init, lifted) .. ("; pc = %d"):format(condp)
+        blocks[ip] = d .. emit_arith_stmt(st.init, lifted) .. ("; pc = %d"):format(condp)
         return ip
       end
       return condp
