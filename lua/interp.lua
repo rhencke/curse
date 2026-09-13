@@ -958,18 +958,23 @@ local function tilde_word_initial(sh, s)
 end
 M.tilde_word_initial = tilde_word_initial -- the compiled tier tilde-expands word-initial literals
 
--- Compiled-tier scalar-assignment guard: true = allowed, false = rejected (var is
--- readonly). Mirrors interp's assign handler — $?=1 + diagnostic, and fatal in
--- `sh -c`/posix mode. Only emitted when the program can create a readonly var.
-function M.assign_guard(sh, name)
-  local rb = sh.vars[sh:deref(name)]
-  if rb and rb.ro then
+-- Compiled-tier plain scalar assignment (`name=value`), mirroring interp's assign
+-- handler for an ATTRIBUTED target: reject a readonly var ($?=1 + diagnostic, fatal
+-- in -c/posix); write element [0] of an array var (bash: `a=v` on an array); arith-
+-- evaluate for `declare -i`; case-fold for `declare -l/-u`; else a plain set. Only
+-- emitted when the program creates such a var (else compiled uses sh:set_str).
+function M.assign_scalar(sh, name, value)
+  local b = sh.vars[sh:deref(name)]
+  if b and b.ro then
     io.stderr:write("curse: " .. name .. ": readonly variable\n")
     sh.status = 1
     if sh.opt_c or sh.opt_posix then error({ __curse_exit = 1 }) end
-    return false
+    return
   end
-  return true
+  if b and b.arr then sh:array_set(name, array_key(sh, name, "0"), value, false)
+  elseif b and b.int then sh:aset(name, eval(sh, P.arith(value)))
+  elseif b and (b.lower or b.upper) then sh:set_str(name, b.lower and value:lower() or value:upper())
+  else sh:set_str(name, value) end
 end
 
 expand_word = function(sh, w)

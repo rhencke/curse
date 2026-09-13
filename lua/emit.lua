@@ -24,30 +24,25 @@ local function lname(n) return "v_" .. n end
 -- original name (the dispatch key); only the generated identifier is mangled.
 local function fnlname(n) return "fn_" .. n:gsub("[^%w_]", function(c) return ("_%02x_"):format(c:byte()) end) end
 
--- Does the program contain a command that can make a variable readonly (`readonly`,
--- or declare/typeset/local with a -r flag)? Set once per emit; when false, compiled
--- scalar assignments skip the readonly guard entirely (zero hot-path cost). A
--- dynamically-created readonly (eval) is rare and simply not guarded — no worse than
--- before (compiled ignored readonly entirely).
-local emit_has_ro = false
-local function makes_ro(st)
+-- Does the program create an ATTRIBUTED variable — one whose later plain `name=value`
+-- assignment isn't a simple string set: readonly (reject), an array (write [0]), or
+-- declare -i/-l/-u (arith / case-fold)? Detects the attribute BUILTINS and array
+-- assignments. When false, compiled scalar assignments are a bare sh:set_str (zero
+-- hot-path cost); when true they route through I.assign_scalar. A var attributed via
+-- eval is rare and simply unguarded — no worse than before.
+local emit_has_attr = false
+local function makes_attr(st)
+  if st.t == "arrayassign" then return true end        -- a=(…) makes an array
+  if st.t == "assign" and st.index then return true end -- a[i]=… makes/extends an array
   if st.t ~= "simple" or not st.words[1] then return false end
   local c = st.words[1].parts[1] and #st.words[1].parts == 1 and st.words[1].parts[1].lit
-  if c == "readonly" then return true end
-  if c == "declare" or c == "typeset" or c == "local" then
-    for j = 2, #st.words do
-      local l = st.words[j].parts[1] and st.words[j].parts[1].lit
-      if l and l:match("^%-%a*r") then return true end
-      if l and l:sub(1, 1) ~= "-" then break end -- first operand ends the option scan
-    end
-  end
-  return false
+  return c == "readonly" or c == "declare" or c == "typeset" or c == "local" or c == "export"
 end
-local function scan_readonly(stmts)
+local function scan_attr(stmts)
   for _, st in ipairs(stmts or {}) do
-    if makes_ro(st) then return true end
-    if st.body and scan_readonly(st.body) then return true end
-    if st.clauses then for _, cl in ipairs(st.clauses) do if scan_readonly(cl.body) then return true end end end
+    if makes_attr(st) then return true end
+    if st.body and scan_attr(st.body) then return true end
+    if st.clauses then for _, cl in ipairs(st.clauses) do if scan_attr(cl.body) then return true end end end
   end
   return false
 end
@@ -876,9 +871,9 @@ local function build_cfg(stmts, lifted, funcflags, inlinefns, toplevel)
         blocks[p] = emit_set(st.name, emit_value(st.arith, lifted), lifted) .. ("; pc = %d"):format(after)
       elseif lifted[st.name] then
         blocks[p] = emit_set(st.name, numeric_word(st.rhs) .. "LL", lifted) .. ("; pc = %d"):format(after)
-      elseif emit_has_ro then -- reject a reassignment to a readonly var (bash: $?=1, fatal in -c/posix)
-        blocks[p] = ("if I.assign_guard(sh, %q) then sh:set_str(%q, %s) end; pc = %d")
-          :format(st.name, st.name, emit_word(st.rhs, lifted), after)
+      elseif emit_has_attr then -- readonly reject / array [0] / declare -i,-l,-u — via interp's logic
+        blocks[p] = ("I.assign_scalar(sh, %q, %s); pc = %d")
+          :format(st.name, emit_word(st.rhs, lifted), after)
       else
         blocks[p] = ("sh:set_str(%q, %s); pc = %d"):format(st.name, emit_word(st.rhs, lifted), after)
       end
@@ -1393,7 +1388,7 @@ local function assert_compilable(stmts)
 end
 
 function M.emit(ast)
-  emit_has_ro = scan_readonly(ast.stmts) -- gate compiled readonly guards for this program
+  emit_has_attr = scan_attr(ast.stmts) -- gate compiled attribute-aware scalar assign
   local funcflags, inlinable, inlinefns = {}, {}, {}
   for _, st in ipairs(ast.stmts) do
     if st.t == "funcdef" then
