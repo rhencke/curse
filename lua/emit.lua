@@ -108,6 +108,48 @@ local function scan_trap(stmts, sigs)
   return false
 end
 
+-- Collect literal names targeted by `unset` (skipping -f/-v flags) anywhere in the
+-- program. A function whose name is unset must dispatch through sh.functions so the
+-- call AFTER the unset fails (127) — a hoisted fn_x would still be callable.
+local function collect_unset(stmts, set)
+  for _, st in ipairs(stmts or {}) do
+    if st.t == "simple" and st.words[1] and st.words[1].parts[1]
+        and st.words[1].parts[1].lit == "unset" then
+      for j = 2, #st.words do
+        local l = st.words[j].parts[1] and #st.words[j].parts == 1 and st.words[j].parts[1].lit
+        if l and l:sub(1, 1) ~= "-" then set[l] = true end
+      end
+    end
+    if st.body then collect_unset(st.body, set) end
+    if st.cond then collect_unset(st.cond, set) end
+    if st.clauses then for _, cl in ipairs(st.clauses) do
+      if cl.body then collect_unset(cl.body, set) end
+      if cl.cond then collect_unset(cl.cond, set) end
+    end end
+  end
+end
+
+-- Collect names defined by a NESTED funcdef (one not directly at the top level —
+-- inside a function body, loop, if, or case). The compiled tier only hoists an fn_x
+-- for top-level funcdefs; a nested def compiles to nothing and its call would resolve
+-- as an external command (127). Delegating the def (interp registers it) and the calls
+-- (interp dispatches) makes them work while the enclosing body stays compiled.
+local function collect_nested_funcdefs(stmts, set, top)
+  for _, st in ipairs(stmts or {}) do
+    if st.t == "funcdef" then
+      if not top then set[st.name] = true end
+      if st.body then collect_nested_funcdefs(st.body, set, false) end
+    else
+      if st.body then collect_nested_funcdefs(st.body, set, false) end
+      if st.cond then collect_nested_funcdefs(st.cond, set, false) end
+      if st.clauses then for _, cl in ipairs(st.clauses) do
+        if cl.body then collect_nested_funcdefs(cl.body, set, false) end
+        if cl.cond then collect_nested_funcdefs(cl.cond, set, false) end
+      end end
+    end
+  end
+end
+
 -- serialize a {int->int} pc map to a Lua table literal
 local function serialize(t)
   local parts = {}
@@ -1636,13 +1678,20 @@ function M.emit(ast)
   local no_inline = emit_has_err or emit_has_debug or emit_funcstack
   emit_redir_funcs = {}
   emit_multidef = {}
-  do -- a name defined by more than one top-level funcdef can't be a single hoisted fn_x
-    local seen = {}
+  do -- a name defined by more than one top-level funcdef can't be a single hoisted fn_x;
+    -- neither can a function whose name is `unset` (the call after the unset must fail).
+    local seen, unset = {}, {}
     for _, st in ipairs(ast.stmts) do
       if st.t == "funcdef" then
         if seen[st.name] then emit_multidef[st.name] = true else seen[st.name] = true end
       end
     end
+    collect_unset(ast.stmts, unset)
+    for name in pairs(seen) do if unset[name] then emit_multidef[name] = true end end
+    collect_nested_funcdefs(ast.stmts, emit_multidef, true) -- nested defs + their calls delegate
+    -- route every delegated-function name (redef/unset/nested) through the same
+    -- def-and-call delegation the def-redirect path uses.
+    for name in pairs(emit_multidef) do emit_redir_funcs[name] = true end
   end
   for _, st in ipairs(ast.stmts) do
     if st.t == "funcdef" then
