@@ -53,6 +53,23 @@ local function scan_attr(stmts)
   end
   return false
 end
+-- Does any word in the program READ $FUNCNAME (as $FUNCNAME or ${FUNCNAME…})? Gates
+-- funcstack maintenance around compiled function calls (else zero cost).
+local function reads_funcname(stmts)
+  for _, st in ipairs(stmts or {}) do
+    if st.words then
+      for _, w in ipairs(st.words) do
+        for _, p in ipairs(w.parts) do
+          if p.var == "FUNCNAME" or (p.pexp and p.pexp.name == "FUNCNAME") then return true end
+        end
+      end
+    end
+    if st.body and reads_funcname(st.body) then return true end
+    if st.clauses then for _, cl in ipairs(st.clauses) do if reads_funcname(cl.body) then return true end end end
+  end
+  return false
+end
+
 -- Does the program install a `trap … SIG` for one of `sigs` (a set of names)? Used
 -- to gate per-command trap hooks (ERR/DEBUG) so a trap-free script pays nothing.
 local function scan_trap(stmts, sigs)
@@ -172,6 +189,7 @@ local function errchk(st) -- the guard statement for `st`, or "" when errexit ne
   return ERRCHK
 end
 local emit_has_debug = false -- program installs a DEBUG trap → fire it before each command
+local emit_funcstack = false -- program reads $FUNCNAME → maintain sh.funcstack around calls
 -- The DEBUG-trap prefix for a natively-compiled command (else ""). DEBUG fires BEFORE
 -- the command with $LINENO = its line. Top-level only (a compiled function body would
 -- wrongly fire without functrace — bash fires DEBUG once at the CALL site, which is a
@@ -180,6 +198,12 @@ local emit_has_debug = false -- program installs a DEBUG trap → fire it before
 local function dbg(st)
   if emit_has_debug and emit_toplevel then return ("I.run_debug(sh, %d); "):format(st.line or 0) end
   return ""
+end
+-- Wrap a compiled function call `s` (for function `cmd`) with $FUNCNAME maintenance
+-- when the program reads FUNCNAME; else return it unchanged (zero cost).
+local function fnwrap(cmd, s)
+  if emit_funcstack then return ("sh:enterFunc(%q); "):format(cmd) .. s .. "; sh:leaveFunc()" end
+  return s
 end
 -- Special params emit_word knows how to render; any OTHER `$special` (e.g. `$-`,
 -- the option string) must delegate, or emit_word would silently render it empty.
@@ -995,8 +1019,8 @@ local function build_cfg(stmts, lifted, funcflags, inlinefns, toplevel)
           elseif funcflags[cmd] and (funcflags[cmd].locals or funcflags[cmd].params) then
             from = 2
             local ff = funcflags[cmd]
-            call = ff.locals and ("sh:pushCall(unpack(__a)); %s(sh); sh:popCall()"):format(fnlname(cmd))
-              or ("sh:pushParams(unpack(__a)); %s(sh); sh:popParams()"):format(fnlname(cmd))
+            call = fnwrap(cmd, ff.locals and ("sh:pushCall(unpack(__a)); %s(sh); sh:popCall()"):format(fnlname(cmd))
+              or ("sh:pushParams(unpack(__a)); %s(sh); sh:popParams()"):format(fnlname(cmd)))
           elseif cmd ~= nil and not NATIVE_BUILTIN[cmd] and not (inlinefns and inlinefns[cmd])
               and not funcflags[cmd] and not require("interp").BUILTINS[cmd] then
             from = 1; call = "sh:exec(unpack(__a))" -- external, static command name
@@ -1089,11 +1113,11 @@ local function build_cfg(stmts, lifted, funcflags, inlinefns, toplevel)
       elseif funcflags[cmd] then
         local ff = funcflags[cmd]
         if ff.locals then -- full frame (save/restore shadowed vars + params)
-          body = ("sh:pushCall(%s); %s(sh); sh:popCall()"):format(table.concat(args, ", "), fnlname(cmd))
+          body = fnwrap(cmd, ("sh:pushCall(%s); %s(sh); sh:popCall()"):format(table.concat(args, ", "), fnlname(cmd)))
         elseif ff.params then -- positional swap only (no per-call frame table)
-          body = ("sh:pushParams(%s); %s(sh); sh:popParams()"):format(table.concat(args, ", "), fnlname(cmd))
+          body = fnwrap(cmd, ("sh:pushParams(%s); %s(sh); sh:popParams()"):format(table.concat(args, ", "), fnlname(cmd)))
         else -- neither: bare call, no allocation
-          body = ("%s(sh)"):format(fnlname(cmd))
+          body = fnwrap(cmd, ("%s(sh)"):format(fnlname(cmd)))
         end
       else -- external command: sh:exec(all words including the command name)
         local allargs = {}
@@ -1477,12 +1501,13 @@ function M.emit(ast)
   emit_has_attr = scan_attr(ast.stmts) -- gate compiled attribute-aware scalar assign
   emit_has_err = scan_trap(ast.stmts, { ERR = 1 }) -- gate compiled ERR-trap firing
   emit_has_debug = scan_trap(ast.stmts, { DEBUG = 1 }) -- gate compiled DEBUG-trap firing
+  emit_funcstack = reads_funcname(ast.stmts) -- gate $FUNCNAME funcstack maintenance
   local funcflags, inlinable, inlinefns = {}, {}, {}
   -- With a DEBUG/ERR trap, DON'T inline: an inlined body runs at the caller's level,
   -- where its commands would fire DEBUG/ERR that bash scopes to the (un-entered)
   -- function. A normal call fires the trap once at the call site and keeps the body
   -- silent (its build_cfg is non-toplevel).
-  local no_inline = emit_has_err or emit_has_debug
+  local no_inline = emit_has_err or emit_has_debug or emit_funcstack
   for _, st in ipairs(ast.stmts) do
     if st.t == "funcdef" then
       funcflags[st.name] = func_flags(st.body)

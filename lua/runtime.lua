@@ -137,6 +137,15 @@ function Shell:pushCall(...)
   self:pushParams(...)
   self.savedstack[self.pd] = false
 end
+
+-- $FUNCNAME maintenance for the compiled tier: push the running function's name
+-- (innermost at [1], matching interp's run_function); the compiled call site emits
+-- these around fn_x only when the program reads FUNCNAME (else zero cost).
+function Shell:enterFunc(name)
+  local fs = self.funcstack; if not fs then fs = {}; self.funcstack = fs end
+  table.insert(fs, 1, name)
+end
+function Shell:leaveFunc() if self.funcstack then table.remove(self.funcstack, 1) end end
 function Shell:popCall()
   local d = self.pd
   local saved = self.savedstack[d]
