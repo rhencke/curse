@@ -3303,11 +3303,35 @@ local function exec_simple(sh, args, hook, no_func)
       -- -W words keep their insertion order; each -A action is sorted within itself,
       -- and actions emit in the order given (bash does not globally merge-sort them).
       if wordlist then
-        -- -W expands the wordlist (params/$()/arith) THEN splits on IFS; a fatal
-        -- expansion (bad ${…}, div-by-zero) makes compgen fail with status 1.
-        local ok, expanded = pcall(expand_word, sh, P.parse_word(wordlist))
+        -- -W EXPANDS the whole list (params/$()/arith) — atomically: a fatal
+        -- expansion (bad ${…}, 1/0) yields NO candidates and status 1 — then splits
+        -- on IFS. Unlike normal word-splitting, -W splits UNQUOTED LITERALS too
+        -- (`a:b` on IFS=: → a b), but QUOTED/backslash-escaped chars are protected
+        -- (`a\:b`, `'a:b'` → one word); it never globs. Build the string with a
+        -- per-char "protected" mask (chars from a quoted part), then split where the
+        -- mask is clear; empty fields are dropped.
+        local ifs = sh.vars["IFS"] and sh:get("IFS") or " \t\n"
+        local ifsset = {}; for k = 1, #ifs do ifsset[ifs:sub(k, k)] = true end
+        local ok, str, prot = pcall(function()
+          local w, buf, mask = P.parse_word(wordlist), {}, {}
+          for pi, p in ipairs(w.parts) do
+            local s = expand_part_str(sh, p)
+            if pi == 1 and p.lit ~= nil and not p.q then s = tilde_word_initial(sh, s) end
+            buf[#buf + 1] = s
+            local q = p.q and true or false -- quoted part: protected from splitting
+            for _ = 1, #s do mask[#mask + 1] = q end
+          end
+          return table.concat(buf), mask
+        end)
         if ok then
-          for _, w in ipairs(rt.ifs_split(sh.vars["IFS"] and sh:get("IFS") or " \t\n", expanded)) do emit(w) end
+          local cur, started = {}, false
+          for i = 1, #str do
+            local c = str:sub(i, i)
+            if not prot[i] and ifsset[c] then
+              if started then emit(table.concat(cur)); cur = {}; started = false end
+            else cur[#cur + 1] = c; started = true end
+          end
+          if started then emit(table.concat(cur)) end
         else werr = true end
       end
       for _, act in ipairs(actions) do
