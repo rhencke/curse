@@ -982,11 +982,12 @@ local function build_cfg(stmts, lifted, funcflags, inlinefns, toplevel)
       end
       if ok then
         local p = newpc()
-        if #loopstack == 0 then blocks[p] = ("sh.status = 0; pc = %d"):format(after) -- no-op outside a loop
+        local d = dbg(st) -- DEBUG fires before break/continue too (it's a command)
+        if #loopstack == 0 then blocks[p] = d .. ("sh.status = 0; pc = %d"):format(after) -- no-op outside a loop
         else
           local idx = #loopstack - (lvl - 1); if idx < 1 then idx = 1 end
           local tgt = (cf_op == "break") and loopstack[idx].brk or loopstack[idx].cont
-          blocks[p] = ("sh.status = 0; pc = %d"):format(tgt)
+          blocks[p] = d .. ("sh.status = 0; pc = %d"):format(tgt)
         end
         return p
       end
@@ -995,16 +996,17 @@ local function build_cfg(stmts, lifted, funcflags, inlinefns, toplevel)
       -- the CFG. I.return_status: N%256, or 2 + diagnostic on non-numeric; no arg → $?.
       local aw = st.words[cf_arg]
       if not st.words[cf_arg + 1] then -- at most one status WORD (pre-split)
+        local d = dbg(st) -- DEBUG fires before return too
         if not aw then -- `return` with no arg → previous status
-          local p = newpc(); blocks[p] = ("pc = %d"):format(DONE); return p
+          local p = newpc(); blocks[p] = d .. ("pc = %d"):format(DONE); return p
         elseif word_safe(aw) then -- one field (literal/quoted): `return ""` → 2, `return 42` → 42
           local p = newpc()
-          blocks[p] = ("sh.status = I.return_status(sh, %s); pc = %d"):format(emit_word(aw, lifted), DONE)
+          blocks[p] = d .. ("sh.status = I.return_status(sh, %s); pc = %d"):format(emit_word(aw, lifted), DONE)
           return p
         elseif field_word(aw, lifted) then -- unquoted expansion: split — 0 fields → $?, else 1st field
           local fw = field_word(aw, lifted)
           local p = newpc()
-          blocks[p] = ("do local __f = rt.field_split(sh, %s, %s); if #__f > 0 then sh.status = I.return_status(sh, __f[1]) end end; pc = %d")
+          blocks[p] = d .. ("do local __f = rt.field_split(sh, %s, %s); if #__f > 0 then sh.status = I.return_status(sh, __f[1]) end end; pc = %d")
             :format(fw.expr, tostring(fw.split), DONE)
           return p
         end -- else (pexp/${…}): not intercepted — falls through (emit deopts to interp, which is correct)
