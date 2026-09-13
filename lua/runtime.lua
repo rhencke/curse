@@ -1924,12 +1924,24 @@ function M.ansi_unescape(s, mode)
 end
 
 function Shell:echo(...)
+  -- echo [-neE] ARGS: -n suppresses the trailing newline, -e interprets backslash
+  -- escapes, -E disables them (bash). Same flag handling as the interp echo builtin,
+  -- so compiled and interpreted echo agree.
   local n = select("#", ...)
-  for i = 1, n do
-    if i > 1 then self.out(" ") end
-    self.out(tostring((select(i, ...))))
+  local args = { ... }
+  local j, nonl, esc = 1, false, false
+  while j <= n and type(args[j]) == "string" and args[j]:match("^%-[neE]+$") do
+    for ch in args[j]:sub(2):gmatch(".") do
+      if ch == "n" then nonl = true elseif ch == "e" then esc = true elseif ch == "E" then esc = false end
+    end
+    j = j + 1
   end
-  self.out("\n")
+  local buf = {}
+  for k = j, n do buf[#buf + 1] = tostring(args[k]) end
+  local s = table.concat(buf, " ")
+  local stopped
+  if esc then s, stopped = M.ansi_unescape(s) end -- \c stops all output (incl. the newline)
+  self.out(s); if not nonl and not stopped then self.out("\n") end
   -- bash's echo/printf flush stdout immediately (sh_chkwrite). This makes output
   -- ordering deterministic across a fork — e.g. `echo a & echo b` prints b then a,
   -- because the parent flushes b before the just-forked child is scheduled. Only
