@@ -73,6 +73,24 @@ local function reads_debugstack(stmts)
   return false
 end
 
+-- Does any word READ $_ (as $_ or ${_})? Gates per-command $_ (last-arg) maintenance.
+local function reads_underscore(stmts)
+  for _, st in ipairs(stmts or {}) do
+    if st.words then
+      for _, w in ipairs(st.words) do
+        for _, p in ipairs(w.parts) do
+          if p.var == "_" or (p.pexp and p.pexp.name == "_") then return true end
+        end
+      end
+    end
+    if st.rhs then for _, p in ipairs(st.rhs.parts) do
+      if p.var == "_" or (p.pexp and p.pexp.name == "_") then return true end end end
+    if st.body and reads_underscore(st.body) then return true end
+    if st.clauses then for _, cl in ipairs(st.clauses) do if reads_underscore(cl.body) then return true end end end
+  end
+  return false
+end
+
 -- Does the program install a `trap … SIG` for one of `sigs` (a set of names)? Used
 -- to gate per-command trap hooks (ERR/DEBUG) so a trap-free script pays nothing.
 local function scan_trap(stmts, sigs)
@@ -193,6 +211,7 @@ local function errchk(st) -- the guard statement for `st`, or "" when errexit ne
 end
 local emit_has_debug = false -- program installs a DEBUG trap → fire it before each command
 local emit_funcstack = false -- program reads $FUNCNAME → maintain sh.funcstack around calls
+local emit_underscore = false -- program reads $_ → set it to each command's last arg
 -- The DEBUG-trap prefix for a natively-compiled command (else ""). DEBUG fires BEFORE
 -- the command with $LINENO = its line. Top-level only (a compiled function body would
 -- wrongly fire without functrace — bash fires DEBUG once at the CALL site, which is a
@@ -399,6 +418,17 @@ local function emit_word(w, lifted)
   end
   if #parts == 0 then return '""' end
   return "(" .. table.concat(parts, " .. ") .. ")"
+end
+
+-- $_ suffix: after a simple command, $_ = its LAST argument (bash). Only when the
+-- program reads $_ and the last word is a single field (word_safe — re-evaluating it
+-- is side-effect-free; a split/cmdsub last arg is left alone). Empty string for no words.
+local function und(st, lifted)
+  if not (emit_underscore and st.words) then return "" end
+  local last = st.words[#st.words]
+  if last and not word_safe(last) then return "" end -- split/cmdsub last arg: skip (rare)
+  local v = last and emit_word(last, lifted) or '""'
+  return ("; sh:set_str(%q, %s)"):format("_", v)
 end
 
 -- The field engine (genuine compilation). A word that isn't word_safe still
@@ -994,18 +1024,19 @@ local function build_cfg(stmts, lifted, funcflags, inlinefns, toplevel)
         if fl and fl:find("~", 1, true) then return ("I.tilde_assign(sh, %q)"):format(fl) end
         return emit_word(st.rhs, lifted)
       end
+      local ua = emit_underscore and '; sh:set_str("_", "")' or "" -- a bare assignment resets $_ (bash)
       if st.arith then
-        blocks[p] = d .. emit_set(st.name, emit_value(st.arith, lifted), lifted) .. ("; pc = %d"):format(after)
+        blocks[p] = d .. emit_set(st.name, emit_value(st.arith, lifted), lifted) .. ua .. ("; pc = %d"):format(after)
       elseif lifted[st.name] then
-        blocks[p] = d .. emit_set(st.name, numeric_word(st.rhs) .. "LL", lifted) .. ("; pc = %d"):format(after)
+        blocks[p] = d .. emit_set(st.name, numeric_word(st.rhs) .. "LL", lifted) .. ua .. ("; pc = %d"):format(after)
       elseif emit_has_attr then -- readonly reject / array [0] / declare -i,-l,-u — via interp's logic
         -- status 0 first so a plain RHS yields 0 (a cmdsub RHS overwrites it), then
         -- assign_scalar (which sets 1 on a readonly reject); errchk applies errexit/ERR.
         local ec = errchk(st); local ecs = ec ~= "" and ("; " .. ec) or ""
-        blocks[p] = d .. ("sh.status = 0; I.assign_scalar(sh, %q, %s)%s; pc = %d")
-          :format(st.name, rhsval(), ecs, after)
+        blocks[p] = d .. ("sh.status = 0; I.assign_scalar(sh, %q, %s)%s%s; pc = %d")
+          :format(st.name, rhsval(), ecs, ua, after)
       else
-        blocks[p] = d .. ("sh:set_str(%q, %s); pc = %d"):format(st.name, rhsval(), after)
+        blocks[p] = d .. ("sh:set_str(%q, %s)%s; pc = %d"):format(st.name, rhsval(), ua, after)
       end
       return p
     elseif t == "funcdef" then
@@ -1173,14 +1204,15 @@ local function build_cfg(stmts, lifted, funcflags, inlinefns, toplevel)
       end
       local ec = errchk(st) -- errexit after a failing native simple command
       local ecs = ec ~= "" and ("; " .. ec) or ""
+      local u = und(st, lifted) -- $_ = this command's last arg (bash), for the NEXT command
       local d = dbg(st) -- DEBUG fires before the command
       if redir_apply then
         -- install the redirs (backing up fds), run the command only if they all
         -- succeeded (else $?=1, bash), then restore the fds — real syscalls, no AST.
-        blocks[p] = d .. ("do local __rs = {}; if %s then %s else sh.status = 1 end; rt.redir_restore(__rs) end%s; pc = %d")
-          :format(redir_apply, body, ecs, after)
+        blocks[p] = d .. ("do local __rs = {}; if %s then %s else sh.status = 1 end; rt.redir_restore(__rs) end%s%s; pc = %d")
+          :format(redir_apply, body, ecs, u, after)
       else
-        blocks[p] = d .. body .. ecs .. ("; pc = %d"):format(after)
+        blocks[p] = d .. body .. ecs .. u .. ("; pc = %d"):format(after)
       end
       return p
     elseif t == "arithcmd" then
@@ -1549,6 +1581,7 @@ function M.emit(ast)
   emit_has_err = scan_trap(ast.stmts, { ERR = 1 }) -- gate compiled ERR-trap firing
   emit_has_debug = scan_trap(ast.stmts, { DEBUG = 1 }) -- gate compiled DEBUG-trap firing
   emit_funcstack = reads_debugstack(ast.stmts) -- gate FUNCNAME/BASH_SOURCE/BASH_LINENO stacks
+  emit_underscore = reads_underscore(ast.stmts) -- gate $_ (last-arg) maintenance
   local funcflags, inlinable, inlinefns = {}, {}, {}
   -- With a DEBUG/ERR trap, DON'T inline: an inlined body runs at the caller's level,
   -- where its commands would fire DEBUG/ERR that bash scopes to the (un-entered)
