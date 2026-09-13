@@ -1618,7 +1618,11 @@ local function make_parser(src, sh)
       while true do
         skip_sep()
         if peekword() == "esac" then i = i + 4; break end
-        if i > n then break end
+        -- Reaching EOF without a closing `esac` is a syntax error (bash). This
+        -- happens when a clause body swallowed `esac` as a command ARGUMENT — e.g.
+        -- `case x in a) echo a esac` (no `;;`): `echo a esac` is one command, so the
+        -- case is left unterminated, exactly as bash sees it.
+        if i > n then error("syntax error: unexpected end of file") end
         if src:sub(i, i) == "(" then i = i + 1 end -- optional leading (
         -- read to the clause-terminating ), balancing extglob parens @(a|b) and
         -- copying quoted sections verbatim (their ) / | are not structural).
