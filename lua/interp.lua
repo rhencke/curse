@@ -956,6 +956,7 @@ local function tilde_word_initial(sh, s)
   if pre then return pre .. tilde_assign(sh, rest) end
   return tilde_prefix(sh, s)
 end
+M.tilde_word_initial = tilde_word_initial -- the compiled tier tilde-expands word-initial literals
 
 expand_word = function(sh, w)
   local buf = {}

@@ -214,8 +214,15 @@ end
 
 local function emit_word(w, lifted)
   local parts = {}
-  for _, p in ipairs(w.parts) do
-    if p.lit then parts[#parts + 1] = ("%q"):format(p.lit)
+  for i, p in ipairs(w.parts) do
+    if i == 1 and p.lit and not p.q and p.lit:sub(1, 1) == "~" then
+      -- word-initial unquoted literal tilde (~, ~/…, ~user, ~+/~-): expanded at
+      -- runtime ($HOME/getpwnam/$PWD). Only a genuine LITERAL leading ~ triggers —
+      -- a tilde from a variable's value never expands (bash), and this part is a
+      -- literal, so there's no over-expansion. Other tilde positions (NAME=…:~,
+      -- ~ mid-word) stay literal for now (interp handles them; no regression).
+      parts[#parts + 1] = ("I.tilde_word_initial(sh, %q)"):format(p.lit)
+    elseif p.lit then parts[#parts + 1] = ("%q"):format(p.lit)
     elseif p.raw then parts[#parts + 1] = p.raw -- pre-computed Lua string expr (inlined param)
     elseif p.var then
       parts[#parts + 1] = lifted[p.var] and ("rt.i64_to_str(%s)"):format(lname(p.var)) or ("sh:get_u(%q)"):format(p.var)
@@ -281,8 +288,7 @@ local function field_word(w, lifted)
   end
   if allexp then return { expr = emit_word(w, lifted), split = true } end -- $x / $x$y
   if alllit and hasglob then
-    if w.parts[1].lit and w.parts[1].lit:sub(1, 1) == "~" then return nil end -- ~ needs interp
-    return { expr = emit_word(w, lifted), split = false }                     -- *.txt
+    return { expr = emit_word(w, lifted), split = false } -- *.txt (emit_word tilde-expands a leading ~)
   end
   return nil
 end
