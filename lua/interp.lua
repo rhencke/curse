@@ -621,6 +621,14 @@ eval = function(sh, e)
   if k == "var" then
     if e.idxraw then arith_nounset(sh, e.name); return arith_resolve(sh, sh:array_get(e.name, arith_key(sh, e.name, e.idx, e.idxraw))) end
     arith_nounset(sh, e.name)
+    -- Numeric-authoritative fast path: a scalar set via aset holds its i64 in b.n
+    -- with b.s cleared. Reading it back through sh:get would stringify (i64_to_str)
+    -- then arith_resolve would re-parse (arith_num) — a full round-trip per read in
+    -- an arithmetic loop. Return b.n directly. Safe: b.n is only ever a non-integer
+    -- (aget caching arith_num of a recursive expression) while b.s is still set, so
+    -- the b.s==nil guard excludes that case and falls through to arith_resolve.
+    local b = sh.vars[sh:deref(e.name)]
+    if b and b.n ~= nil and b.s == nil and not b.arr then return b.n end
     return arith_resolve(sh, sh:get(e.name))
   end
   if k == "param" then return rt.str_to_i64(sh:param(e.n)) end
