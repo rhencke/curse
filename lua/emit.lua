@@ -1190,6 +1190,9 @@ local function build_cfg(stmts, lifted, funcflags, inlinefns, toplevel)
     end
     if DELEGATE[t] then return delegate(st, after) end
     if t == "assign" then
+      -- Assigning these fires a side effect only interp's assign implements (resize
+      -- history / truncate the histfile); a native set_str would skip it. Delegate.
+      if not st.index and (st.name == "HISTSIZE" or st.name == "HISTFILESIZE") then return delegate(st, after) end
       if st.index or st.append or (st.rhs and not emitable_word(st.rhs))
         or (st.arith and arith_side_effect(st.arith)) then return delegate(st, after) end
       local p = newpc()
