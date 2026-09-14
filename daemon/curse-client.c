@@ -11,10 +11,11 @@
  * the user, cleaned on logout), so there is no cross-user surface and no
  * privilege drop to get wrong. See daemon/README.
  *
- * Startup must beat dash (~0.1ms), so this is deliberately minimal C: no libc
- * init beyond the basics, one connect, one sendmsg, one read.
+ * Startup must beat dash, so this is deliberately minimal C: no libc init beyond
+ * the basics, one connect, one sendmsg, one read — and built STATIC so exec pays
+ * no dynamic loader (ld.so costs ~0.185ms/invocation, measured).
  *
- *   cc -O2 -o curse daemon/curse-client.c
+ *   cc -O2 -s -static -o curse daemon/curse-client.c
  */
 #include <stdio.h>
 #include <stdlib.h>

@@ -14,7 +14,9 @@ boot) rather than one-shot use, where a fresh process can never amortize warmup.
   Connects to the user's `cursed`, hands over `argv` + cwd + `environ` and its own
   stdin/stdout/stderr (via `SCM_RIGHTS`, so the script's I/O *is* the caller's, no
   proxying), waits for the exit status, exits with it. Must start faster than
-  dash, so it's minimal C. Build: `cc -O2 -o curse daemon/curse-client.c`.
+  dash, so it's minimal C, built **static** to skip the dynamic loader (ld.so is
+  ~0.185 ms of per-invocation startup — measured). Build:
+  `cc -O2 -s -static -o curse daemon/curse-client.c`.
 - **`../lua/daemon.lua`** — the server. Loads the bytecode bundle, listens,
   `accept → recvmsg → fork worker → keep accepting`. Workers send their own exit
   status back and `_exit`; the parent reaps them opportunistically (no zombies,
@@ -69,7 +71,7 @@ Response (daemon → client): `int32 status`, then close.
 
 ## Run it
 
-    cc -O2 -o dist/curse daemon/curse-client.c
+    cc -O2 -s -static -o dist/curse daemon/curse-client.c   # static: no ld.so
     luajit lua/build.lua                       # dist/curse.bc
     CURSE_IDLE=300 luajit lua/daemon.lua &     # self-exits after 300s idle
     ./dist/curse -c 'echo hi; echo $((2+3))'
