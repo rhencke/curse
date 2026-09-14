@@ -347,6 +347,7 @@ local function resolve_cf(st)
   return nil
 end
 
+
 -- Does this statement list contain a break/continue the CFG can't place as a static
 -- jump — a non-literal level (`break $x`), extra args (`continue 1 2 3`), or (in a
 -- loop CONDITION) any break/continue at all (loopstack isn't active while the cond is
@@ -1054,6 +1055,10 @@ local function build_cfg(stmts, lifted, funcflags, inlinefns, toplevel)
   -- status (last body command, or 0). Both are returned for assemble to declare.
   local loopstack, loopvars = {}, {}
   local function newloopvar() local v = "__lw" .. #loopvars; loopvars[#loopvars + 1] = v; return v end
+  -- Stack of subshell exit pcs (subshell_exit). `return` inside a subshell exits the
+  -- subshell with that status (like `exit`), so it targets this — not the function's
+  -- DONE, which in the forked child would return PAST the subshell.
+  local subexit = {}
 
   local flatten_list
 
@@ -1158,20 +1163,23 @@ local function build_cfg(stmts, lifted, funcflags, inlinefns, toplevel)
       if toplevel then return delegate(st, after) end
       -- return [N] (incl. \return / builtin return / command return): set $? and exit
       -- the CFG. I.return_status: N%256, or 2 + diagnostic on non-numeric; no arg → $?.
+      -- inside a subshell, `return` exits the subshell (subshell_exit) with the
+      -- status; otherwise it exits the function/CFG at DONE.
+      local retpc = subexit[#subexit] or DONE
       local aw = st.words[cf_arg]
       if not st.words[cf_arg + 1] then -- at most one status WORD (pre-split)
         local d = dbg(st) -- DEBUG fires before return too
         if not aw then -- `return` with no arg → previous status
-          local p = newpc(); blocks[p] = d .. ("pc = %d"):format(DONE); return p
+          local p = newpc(); blocks[p] = d .. ("pc = %d"):format(retpc); return p
         elseif word_safe(aw) then -- one field (literal/quoted): `return ""` → 2, `return 42` → 42
           local p = newpc()
-          blocks[p] = d .. ("sh.status = I.return_status(sh, %s); pc = %d"):format(emit_word(aw, lifted), DONE)
+          blocks[p] = d .. ("sh.status = I.return_status(sh, %s); pc = %d"):format(emit_word(aw, lifted), retpc)
           return p
         elseif field_word(aw, lifted) then -- unquoted expansion: split — 0 fields → $?, else 1st field
           local fw = field_word(aw, lifted)
           local p = newpc()
           blocks[p] = d .. ("do local __f = rt.field_split(sh, %s, %s); if #__f > 0 then sh.status = I.return_status(sh, __f[1]) end end; pc = %d")
-            :format(fw.expr, tostring(fw.split), DONE)
+            :format(fw.expr, tostring(fw.split), retpc)
           return p
         end -- else (pexp/${…}): not intercepted — falls through (emit deopts to interp, which is correct)
       end
@@ -1654,7 +1662,9 @@ local function build_cfg(stmts, lifted, funcflags, inlinefns, toplevel)
       -- the body (a break/continue with no in-subshell loop becomes a no-op, like
       -- bash), then restore it for the parent's control flow.
       local saved_loops = loopstack; loopstack = {}
+      subexit[#subexit + 1] = exitpc -- `return` in the body exits THIS subshell
       local bodyentry = flatten_list(st.body, exitpc)
+      subexit[#subexit] = nil
       loopstack = saved_loops
       local p = newpc()
       -- ERR trap after a failing subshell (`( exit 42 )`) fires in the PARENT; the
