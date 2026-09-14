@@ -137,6 +137,9 @@ local function run_worker(cfd, req, fds)
   if req.cwd and req.cwd ~= "" then C.chdir(req.cwd) end
   apply_env(req.env)
 
+  -- A FRESH Shell.new (correct: imports the caller's env exactly), but cheap because
+  -- worker_main pre-faulted the heap pages before accept — Shell.new in a cold forked
+  -- child is ~480us (page faults), ~48us on warmed pages (measured).
   local sh = rt.Shell.new()
   -- sh.out defaults to io.write -> C stdout (fd 1, now the caller's). Flush before exit.
   local ok = pcall(function()
@@ -169,6 +172,14 @@ local WORKER_IDLE = 99 -- worker exit code meaning "accept() timed out" (parent 
 -- the listen socket's SO_RCVTIMEO, so an idle worker _exit(WORKER_IDLE) and the
 -- parent can drain the pool when the daemon has been idle.
 local function worker_main(lfd, my_uid)
+  -- PRE-FAULT the heap BEFORE blocking on accept: a forked child's first Shell.new
+  -- pays ~480us of cold page faults (touching CoW/fresh pages the first time). Do a
+  -- throwaway Shell.new + GC now (off the request path) so those pages are resident
+  -- and on LuaJIT's free list; the per-request Shell.new then reuses them at ~48us.
+  -- Unlike reusing a pre-built sh, the request still does a FULL fresh import, so the
+  -- caller's env is always exact — no env-hash / volatile-var ($_/SHLVL) fragility.
+  do local w = rt.Shell.new(); w = rt.Shell.new(); w = nil end
+  collectgarbage("collect")
   local cfd
   while true do
     cfd = C.accept(lfd, nil, nil)
