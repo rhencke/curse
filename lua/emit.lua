@@ -73,20 +73,21 @@ local function reads_debugstack(stmts)
   return false
 end
 
--- Does any word READ $_ (as $_ or ${_})? Gates per-command $_ (last-arg) maintenance.
-local function reads_underscore(stmts)
+-- Does any word READ variable `name` (as $name or ${name…})? Gates per-command
+-- maintenance of otherwise-free-to-skip specials ($_ last-arg, $PIPESTATUS).
+local function reads_var(stmts, name)
   for _, st in ipairs(stmts or {}) do
     if st.words then
       for _, w in ipairs(st.words) do
         for _, p in ipairs(w.parts) do
-          if p.var == "_" or (p.pexp and p.pexp.name == "_") then return true end
+          if p.var == name or (p.pexp and p.pexp.name == name) then return true end
         end
       end
     end
     if st.rhs then for _, p in ipairs(st.rhs.parts) do
-      if p.var == "_" or (p.pexp and p.pexp.name == "_") then return true end end end
-    if st.body and reads_underscore(st.body) then return true end
-    if st.clauses then for _, cl in ipairs(st.clauses) do if reads_underscore(cl.body) then return true end end end
+      if p.var == name or (p.pexp and p.pexp.name == name) then return true end end end
+    if st.body and reads_var(st.body, name) then return true end
+    if st.clauses then for _, cl in ipairs(st.clauses) do if reads_var(cl.body, name) then return true end end end
   end
   return false
 end
@@ -255,6 +256,7 @@ end
 local emit_has_debug = false -- program installs a DEBUG trap → fire it before each command
 local emit_funcstack = false -- program reads $FUNCNAME → maintain sh.funcstack around calls
 local emit_underscore = false -- program reads $_ → set it to each command's last arg
+local emit_pipestatus = false -- program reads $PIPESTATUS → set it (=(status)) after each simple cmd
 local emit_redir_funcs = {} -- funcs with a definition redirect (`f(){…} >&2`): delegate them + their calls
 local emit_multidef = {} -- names defined by more than one top-level funcdef: a single hoisted
 -- fn_x can't represent the sequential redefinition (a call between two defs must see the FIRST
@@ -1416,14 +1418,17 @@ local function build_cfg(stmts, lifted, funcflags, inlinefns, toplevel)
       local ec = errchk(st) -- errexit after a failing native simple command
       local ecs = ec ~= "" and ("; " .. ec) or ""
       local u = und(st, lifted) -- $_ = this command's last arg (bash), for the NEXT command
+      -- PIPESTATUS after a simple command is a one-element array of its status (bash);
+      -- set BEFORE errchk so an ERR trap sees it. Gated on the program reading it.
+      local ps = emit_pipestatus and '; sh:array_assign("PIPESTATUS", {tostring(sh.status)}, false)' or ""
       local d = dbg(st) -- DEBUG fires before the command
       if redir_apply then
         -- install the redirs (backing up fds), run the command only if they all
         -- succeeded (else $?=1, bash), then restore the fds — real syscalls, no AST.
-        blocks[p] = d .. ("do local __rs = {}; if %s then %s else sh.status = 1 end; rt.redir_restore(__rs) end%s%s; pc = %d")
-          :format(redir_apply, body, ecs, u, after)
+        blocks[p] = d .. ("do local __rs = {}; if %s then %s else sh.status = 1 end; rt.redir_restore(__rs) end%s%s%s; pc = %d")
+          :format(redir_apply, body, ps, ecs, u, after)
       else
-        blocks[p] = d .. body .. ecs .. u .. ("; pc = %d"):format(after)
+        blocks[p] = d .. body .. ps .. ecs .. u .. ("; pc = %d"):format(after)
       end
       return p
     elseif t == "arithcmd" then
@@ -1800,7 +1805,8 @@ function M.emit(ast)
   emit_has_err = scan_trap(ast.stmts, { ERR = 1 }) -- gate compiled ERR-trap firing
   emit_has_debug = scan_trap(ast.stmts, { DEBUG = 1 }) -- gate compiled DEBUG-trap firing
   emit_funcstack = reads_debugstack(ast.stmts) -- gate FUNCNAME/BASH_SOURCE/BASH_LINENO stacks
-  emit_underscore = reads_underscore(ast.stmts) -- gate $_ (last-arg) maintenance
+  emit_underscore = reads_var(ast.stmts, "_") -- gate $_ (last-arg) maintenance
+  emit_pipestatus = reads_var(ast.stmts, "PIPESTATUS") -- gate $PIPESTATUS after simple cmds
   local funcflags, inlinable, inlinefns = {}, {}, {}
   -- With a DEBUG/ERR trap, DON'T inline: an inlined body runs at the caller's level,
   -- where its commands would fire DEBUG/ERR that bash scopes to the (un-entered)
