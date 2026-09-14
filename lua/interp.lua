@@ -1235,7 +1235,36 @@ end
 -- Expand a word to a LIST of fields (command args, for-in lists): unquoted
 -- expansions split on default-IFS whitespace; quoted text never splits; "$@" /
 -- "${a[@]}" yield one field per element.
+-- bash glob_pattern_p on a plain (already-expanded) string: `*`/`?` always
+-- active, `[` only with a later `]`. Conservative — never reports inactive for a
+-- real glob — so the caller may safely skip pathname expansion when it's false.
+local function str_glob_active(s)
+  local open = false
+  for i = 1, #s do
+    local c = s:sub(i, i)
+    if c == "*" or c == "?" then return true
+    elseif c == "[" then open = true
+    elseif c == "]" then if open then return true end
+    elseif (c == "+" or c == "@" or c == "!") and s:sub(i + 1, i + 1) == "(" then return true end
+  end
+  return false
+end
+
 local function expand_to_fields(sh, w)
+  -- Fast path: a single literal part — the common shape of command words (`[`,
+  -- operators, numbers, most argv). No expansion, no IFS split, and (when it has
+  -- no active glob metachar and no `~`) no pathname expansion either — so skip the
+  -- entire per-word setup (closures, IFS parse, glob machinery). A quoted literal
+  -- is atomic and never globs; an unquoted one needs the full path only for a
+  -- word-initial `~` or an active glob.
+  if #w.parts == 1 then
+    local p = w.parts[1]
+    if p.lit ~= nil and not p.pexp and not is_multi(sh, p) then
+      local s = expand_part_str(sh, p)
+      if p.q then return { s } end
+      if not s:find("~", 1, true) and (sh.opt_f or not str_glob_active(s)) then return { s } end
+    end
+  end
   -- Concatenate-then-split model: build the word left to right, splitting the
   -- chars that came from UNQUOTED expansions on $IFS (default: space/tab/newline),
   -- while literal/quoted chars are never delimiters. This is what bash does, and
@@ -1244,8 +1273,16 @@ local function expand_to_fields(sh, w)
   local ifs = sh.vars["IFS"] and sh:get("IFS") or " \t\n"
   -- IFS is a SET of characters; a delimiter may be multibyte (`IFS=ç`), so index by
   -- whole codepoint, not byte (byte-indexing splits ç's two bytes as two delimiters).
-  local ifsset = {}; for _, ch in ipairs(rt.mb_chars(ifs)) do ifsset[ch.s] = true end
-  local mbifs = rt.lc_mb_cur_max() > 1 and ifs:find("[\128-\255]") ~= nil -- any multibyte IFS char?
+  -- Memoize the parse keyed on the IFS string: it changes rarely but this runs per
+  -- word, and rt.mb_chars uses per-char mbrtowc FFI calls — costly in a hot loop.
+  local ic = sh._ifscache
+  if not ic or ic.ifs ~= ifs then
+    local set = {}; for _, ch in ipairs(rt.mb_chars(ifs)) do set[ch.s] = true end
+    ic = { ifs = ifs, set = set,
+      mbifs = rt.lc_mb_cur_max() > 1 and ifs:find("[\128-\255]") ~= nil } -- any multibyte IFS char?
+    sh._ifscache = ic
+  end
+  local ifsset, mbifs = ic.set, ic.mbifs
   local function isws(c) return c == " " or c == "\t" or c == "\n" end
   local function inifs(c) return c ~= "" and ifsset[c] end
   local function clen(v, i) -- byte length of the char at i (fast for ASCII)
@@ -1378,13 +1415,20 @@ local function expand_to_fields(sh, w)
     ["+"] = 1, ["@"] = 1, ["!"] = 1, ["("] = 1, [")"] = 1, ["|"] = 1 } -- `|` protects a
     -- quoted/escaped extglob alternation bar (`@(a|'b|c')`) from split_arms
   -- is there a glob metacharacter at a NON-masked (glob-active) position?
+  -- bash glob_pattern_p: `*`/`?` are always active; `[` only counts when a later
+  -- (unmasked) `]` closes it — a lone `[` (e.g. the `[` test builtin) is literal,
+  -- so it must NOT trigger a directory scan. Mirrors glob_conv's own "no closing
+  -- ] → literal [" rule; keeping them in sync avoids pointless per-word globbing.
   local function glob_active(f)
     local s, q = f.s, f.q
+    local open = false
     for i = 1, #s do
       if not q or q:sub(i, i) == "0" then
         local c = s:sub(i, i)
-        if c == "*" or c == "?" or c == "[" then return true end
-        if (c == "?" or c == "*" or c == "+" or c == "@" or c == "!")
+        if c == "*" or c == "?" then return true end
+        if c == "[" then open = true
+        elseif c == "]" then if open then return true end
+        elseif (c == "+" or c == "@" or c == "!")
           and s:sub(i + 1, i + 1) == "(" and (not q or q:sub(i + 1, i + 1) == "0") then return true end
       end
     end

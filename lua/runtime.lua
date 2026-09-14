@@ -1940,11 +1940,20 @@ function M.field_split(sh, value, split)
   -- globskipdots defaults ON, globstar defaults OFF (SHOPT_DEFAULT, interp.lua).
   local skipdots = giset or (sh.shopt.globskipdots ~= false)
   local globstar = sh.shopt.globstar and true
+  -- bash glob_pattern_p: `[` is a metacharacter only when a later `]` closes it
+  -- (a lone `[` stays literal — no directory scan); `\c` escapes the next char.
+  -- Matches glob_conv's own "no closing ] → literal [" so we never scan for a
+  -- pattern that will expand to a literal.
   local function glob_active(s)
-    for i = 1, #s do
+    local i, n, open = 1, #s, false
+    while i <= n do
       local c = s:sub(i, i)
-      if c == "*" or c == "?" or c == "[" then return true end
-      if (c == "?" or c == "*" or c == "+" or c == "@" or c == "!") and s:sub(i + 1, i + 1) == "(" then return true end
+      if c == "\\" then i = i + 2
+      elseif c == "*" or c == "?" then return true
+      elseif c == "[" then open = true; i = i + 1
+      elseif c == "]" then if open then return true end; i = i + 1
+      elseif (c == "+" or c == "@" or c == "!") and s:sub(i + 1, i + 1) == "(" then return true
+      else i = i + 1 end
     end
     return false
   end
