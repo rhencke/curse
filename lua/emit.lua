@@ -1348,6 +1348,10 @@ local function build_cfg(stmts, lifted, funcflags, inlinefns, toplevel)
       -- Assigning these fires a side effect only interp's assign implements (resize
       -- history / truncate the histfile); a native set_str would skip it. Delegate.
       if not st.index and (st.name == "HISTSIZE" or st.name == "HISTFILESIZE") then return delegate(st, after) end
+      -- SHELLOPTS/BASHOPTS are readonly derived specials with no var box, so neither a
+      -- bare native set nor I.assign_scalar rejects them. Always delegate so interp
+      -- reports "readonly variable" (status 1), as bash does.
+      if not st.index and (st.name == "SHELLOPTS" or st.name == "BASHOPTS") then return delegate(st, after) end
       if st.index or st.append or (st.rhs and not emitable_word(st.rhs))
         or (st.arith and arith_side_effect(st.arith)) then return delegate(st, after) end
       local p = newpc()
@@ -1896,8 +1900,12 @@ local function build_cfg(stmts, lifted, funcflags, inlinefns, toplevel)
     for k = 1, #stmts do
       local ff = DONE
       for j = k + 1, #stmts do if (stmts[j].line or 0) > (stmts[k].line or 0) then ff = mark[j]; break end end
-      blocks[mark[k]] = ("sh._ff = %d; %sif sh.sigtraps then I.run_pending_signals(sh)%s end; pc = %d")
-        :format(ff, wbs, rbs, stmtPc[k])
+      -- `set -n` (noexec): once set, the shell READS but does not execute the rest of
+      -- a non-interactive script — so every later top-level statement is skipped (which
+      -- also means a later `set +n` never runs). Checked here at the top-level boundary
+      -- only (never in a hot loop body). opt_n is off until `set -n` actually runs.
+      blocks[mark[k]] = ("if sh.opt_n then pc = %d else sh._ff = %d; %sif sh.sigtraps then I.run_pending_signals(sh)%s end; pc = %d end")
+        :format(DONE, ff, wbs, rbs, stmtPc[k])
       stmtPc[k] = mark[k] -- entry/OSR resume enters at the marker so sh._ff + state are set
     end
     return { blocks = blocks, npc = npc, entry = mark[1] or DONE, loopPc = loopPc, stmtPc = stmtPc, loopvars = loopvars }
