@@ -1475,6 +1475,12 @@ local function build_cfg(stmts, lifted, funcflags, inlinefns, toplevel)
         if require("interp").BUILTINS[cmd] then mustdeleg = true end
       end
       if mustdeleg then return delegate(st, after) end
+      -- A DYNAMIC command word (`"$a"`, cmd is not a compile-time literal) must be
+      -- resolved at runtime against functions → builtins → externals, exactly as the
+      -- interpreter does. The native fall-through below assumes an EXTERNAL command
+      -- (sh:exec = PATH lookup), so `a=typeset; "$a" v=1` reported "command not found"
+      -- instead of running the builtin. Delegate — before the newpc, so no pc leaks.
+      if cmd == nil then return delegate(st, after) end
       if cmd == "return" then -- exit the current CFG (function or top level)
         local p = newpc()
         local n = st.words[2] and ("tonumber(%s)"):format(emit_word(st.words[2], lifted)) or "sh.status"
