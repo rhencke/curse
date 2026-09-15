@@ -221,6 +221,17 @@ local function not_compilable(e)
   return not_compilable(e.e) or not_compilable(e.l) or not_compilable(e.r)
     or not_compilable(e.c) or not_compilable(e.a) or not_compilable(e.b)
 end
+-- parser.arith() THROWS on a malformed expression — invalid octal `083`, a quoted
+-- operand `'3'` — because only the parser's own `parith` wrapper turns that into an
+-- arith_perr node. emit's ANALYSIS (emitable_word, collect_word, func_flags) parses
+-- word arith eagerly and must not crash on it, so route every such parse through
+-- this guard: a throw becomes an arith_perr leaf, which not_compilable rejects — the
+-- word/statement then delegates to the interpreter, which reproduces bash's error.
+local function safe_arith(s)
+  local ok, a = pcall(require("parser").arith, s)
+  if ok then return a end
+  return { k = "arith_perr", raw = s }
+end
 -- Does a subshell body statically run `set`? A fork-compiled subshell body is a
 -- straight-line sub-CFG; it can't honor an errexit toggle (`set -e`) that turns
 -- on partway through, whereas the interpreter checks errexit per command. So a
@@ -319,7 +330,7 @@ local function emitable_word(w)
     if p.pexp and not pexp_compilable(p.pexp) then return false end
     if p.procsub then return false end -- <(cmd)/>(cmd): needs the interp's temp-file setup
     if p.special and not RENDERABLE_SPECIAL[p.special] then return false end -- e.g. $-
-    if p.arith and arith_side_effect(require("parser").arith(p.arith)) then return false end
+    if p.arith then local a = safe_arith(p.arith); if not_compilable(a) or arith_side_effect(a) then return false end end
     if p.arithast and arith_side_effect(p.arithast) then return false end -- inlined arith
   end
   return true
@@ -494,7 +505,7 @@ local function emit_word(w, lifted)
       arith_varread = saved
     elseif p.arith then
       local saved = arith_varread; arith_varread = "I.arith_read(sh, %q)" -- name/expr values re-parse as arith
-      parts[#parts + 1] = "rt.i64_to_str(" .. emit_value(require("parser").arith(p.arith), lifted) .. ")"
+      parts[#parts + 1] = "rt.i64_to_str(" .. emit_value(safe_arith(p.arith), lifted) .. ")"
       arith_varread = saved
     elseif p.cmdsub then -- $( … ): run the inner program capturing stdout (interpreted; I/O-bound)
       parts[#parts + 1] = ("sh:capture_src(%q)"):format(p.cmdsub)
@@ -791,7 +802,7 @@ local function test_operand_arith(w, lifted)
   if p.var and lifted[p.var] then return { k = "var", name = p.var } end
   if p.lit and p.lit:match("^[+-]?%d+$") then return { k = "num", v = p.lit } end
   if p.arithast then return p.arithast end
-  if p.arith then return require("parser").arith(p.arith) end
+  if p.arith then return safe_arith(p.arith) end
   return nil
 end
 -- Returns the equivalent arith comparison node for a compilable `[ … ]`/test cond,
@@ -841,7 +852,7 @@ end
 local function collect_word(w, set)
   for _, p in ipairs(w.parts) do
     if p.var then set[p.var] = true
-    elseif p.arith then collect_arith(require("parser").arith(p.arith), set) end
+    elseif p.arith then collect_arith(safe_arith(p.arith), set) end
   end
 end
 local function collect_names(stmts, set)
@@ -966,7 +977,7 @@ local function scan_word_param(w, f)
     if p.param or (p.special and p.special ~= "?") then f.params = true end -- $? is status, not $@
     if p.pexp and pexp_reads_params(p.pexp) then f.params = true end -- ${*:1}/${1:-x}
     if p.cmdsub then f.params = true end -- $(…) re-runs against the live frame; its $n/$* need the swap
-    if p.arith then scan_arith_param(require("parser").arith(p.arith), f) end
+    if p.arith then scan_arith_param(safe_arith(p.arith), f) end
   end
 end
 local function func_flags(body)
@@ -1078,7 +1089,7 @@ local function subst_word(w, pb)
   local parts = {}
   for _, p in ipairs(w.parts) do
     if p.param then parts[#parts + 1] = pb[p.param] and { raw = pb[p.param].str } or { lit = "" } -- unset positional = ""
-    elseif p.arith then parts[#parts + 1] = { arithast = subst_arith(require("parser").arith(p.arith), pb) }
+    elseif p.arith then parts[#parts + 1] = { arithast = subst_arith(safe_arith(p.arith), pb) }
     else parts[#parts + 1] = p end
   end
   return { k = "word", parts = parts }
@@ -1498,7 +1509,7 @@ local function build_cfg(stmts, lifted, funcflags, inlinefns, toplevel)
             local pp = w.parts[1]
             if pp.var then intExpr = lifted[pp.var] and lname(pp.var) or ("sh:aget(%q)"):format(pp.var)
             elseif pp.lit and pp.lit:match("^[+-]?%d+$") then intExpr = pp.lit .. "LL"
-            elseif pp.arith then intExpr = emit_value(require("parser").arith(pp.arith), lifted)
+            elseif pp.arith then intExpr = emit_value(safe_arith(pp.arith), lifted)
             else intExpr = ("rt.str_to_i64(%s)"):format(strExpr) end
           else intExpr = ("rt.str_to_i64(%s)"):format(strExpr) end
           pb[j - 1] = { int = intExpr, str = strExpr }
