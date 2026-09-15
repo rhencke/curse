@@ -980,15 +980,24 @@ local function func_flags(body)
         -- writes the GLOBAL. `declare -g` still targets the global (interp honors -g
         -- inside the frame), so treating any declare/typeset as frame-needing is safe.
         if cmd == "local" or cmd == "declare" or cmd == "typeset" then f.locals = true end
+        -- getopts parses $@ and shift mutates it — both implicitly need the callee's
+        -- positional params (no $-word to trigger scan_word_param), so force the swap.
+        if cmd == "getopts" or cmd == "shift" then f.params = true end
         for j = 2, #st.words do scan_word_param(st.words[j], f) end
       elseif st.t == "assign" then
         if st.arith then scan_arith_param(st.arith, f) elseif st.rhs then scan_word_param(st.rhs, f) end
       elseif st.t == "forc" or st.t == "whilec" then
-        scan_arith_param(st.init, f); scan_arith_param(cond_arith(st.cond), f); scan_arith_param(st.step, f); scan(st.body)
+        scan_arith_param(st.init, f); scan_arith_param(cond_arith(st.cond), f); scan_arith_param(st.step, f)
+        if type(st.cond) == "table" and st.cond[1] then scan(st.cond) end -- COMMAND condition (a stmt list)
+        scan(st.body)
       elseif st.t == "forin" then
         for _, w in ipairs(st.words) do scan_word_param(w, f) end; scan(st.body)
       elseif st.t == "if" then
-        for _, cl in ipairs(st.clauses) do scan_arith_param(cond_arith(cl.cond), f); scan(cl.body) end
+        for _, cl in ipairs(st.clauses) do
+          scan_arith_param(cond_arith(cl.cond), f)
+          if type(cl.cond) == "table" and cl.cond[1] then scan(cl.cond) end -- COMMAND condition
+          scan(cl.body)
+        end
       -- Compound bodies also reference $@/$*/$n and define locals — a function whose
       -- body is a pipeline (`f(){ echo "$1" | od; }`), case, group, subshell, or &&/||
       -- list needs the param swap / frame just as much. Missing these dispatched the
