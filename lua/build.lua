@@ -7,9 +7,18 @@
 -- by this build for the exact LuaJIT it ships with (producer == consumer), so the
 -- fragility that rules bytecode out for a portable cache doesn't apply. Run:
 --   luajit lua/build.lua [dist/curse.bc]
+-- CORE modules: needed by essentially any script, so embedded as nested closures
+-- that the single bundle chunk bcreads in one fast pass at startup.
 local mods = { "runtime", "parser", "emit", "interp", "tier", "cache", "repl" }
 
--- Wrap each module's source in a package.preload closure. `require("x")` then
+-- FEATURE modules: embedded in the SAME unified bundle but bcread LAZILY — their
+-- bytecode rides along as a string constant (copied, not proto-parsed, at startup)
+-- and only turns into functions when a script first require()s the feature. A cold
+-- simple script (which touches ~7% of the interpreter) never pays for them. require
+-- caches in package.loaded, so a feature loads at most once. Files: lua/<name>.lua.
+local lazy_mods = {} -- e.g. "b_completion" — populated as exec_simple's rare builtins move out
+
+-- Wrap each core module's source in a package.preload closure. `require("x")` then
 -- resolves from memory with no file I/O and no parse. Registration is lazy, so
 -- inter-module requires resolve fine regardless of order.
 local parts = {}
@@ -17,6 +26,17 @@ for _, m in ipairs(mods) do
   local f = assert(io.open("lua/" .. m .. ".lua", "r"))
   local s = f:read("*a"); f:close()
   parts[#parts + 1] = ("package.preload[%q] = function(...)\n%s\nend\n"):format(m, s)
+end
+-- Each lazy feature module's bytecode as an escaped string constant + a preload
+-- loader that bcreads it on demand.
+local function esc(s) return (s:gsub(".", function(c) return "\\" .. c:byte() end)) end
+for _, m in ipairs(lazy_mods) do
+  local f = assert(io.open("lua/" .. m .. ".lua", "r"))
+  local s = f:read("*a"); f:close()
+  local mbc = string.dump(assert(loadstring(s, "=" .. m)))
+  parts[#parts + 1] =
+    ("package.preload[%q] = function(...) return assert(loadstring(\"%s\", \"=%s\"))(...) end\n")
+      :format(m, esc(mbc), m)
 end
 local bundle_src = table.concat(parts)
 
