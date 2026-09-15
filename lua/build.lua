@@ -16,7 +16,7 @@ local mods = { "runtime", "parser", "emit", "interp", "tier", "cache", "repl" }
 -- and only turns into functions when a script first require()s the feature. A cold
 -- simple script (which touches ~7% of the interpreter) never pays for them. require
 -- caches in package.loaded, so a feature loads at most once. Files: lua/<name>.lua.
-local lazy_mods = { "b_completion" } -- exec_simple's rare builtins, moved out of the cold path
+local lazy_mods = { "b_completion", "b_rare" }
 
 -- Wrap each core module's source in a package.preload closure. `require("x")` then
 -- resolves from memory with no file I/O and no parse. Registration is lazy, so
