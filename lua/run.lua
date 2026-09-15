@@ -8,15 +8,21 @@
 -- Prefer a precompiled bytecode bundle (one file open, no source parsing —
 -- ~1ms/invocation faster). Fall back to loading modules from source if the
 -- bundle is absent or unloadable (e.g. built for a different LuaJIT).
-local bundle = os.getenv("CURSE_BUNDLE") or "dist/curse.bc"
-local bf = io.open(bundle, "rb")
-if bf then
-  bf:close()
-  if not pcall(function() assert(loadfile(bundle))() end) then
+-- The bundle registers all curse modules into package.preload. A self-contained
+-- static binary has it EMBEDDED (curse_load_bundle in luajit.c ran it before us),
+-- so the modules are already preloaded — skip the disk load entirely. Otherwise
+-- load dist/curse.bc from disk, falling back to source on the package path.
+if not package.preload["tier"] then
+  local bundle = os.getenv("CURSE_BUNDLE") or "dist/curse.bc"
+  local bf = io.open(bundle, "rb")
+  if bf then
+    bf:close()
+    if not pcall(function() assert(loadfile(bundle))() end) then
+      package.path = "lua/?.lua;" .. package.path
+    end
+  else
     package.path = "lua/?.lua;" .. package.path
   end
-else
-  package.path = "lua/?.lua;" .. package.path
 end
 local T = require("tier")
 
