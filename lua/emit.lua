@@ -83,6 +83,32 @@ local function scan_local_unsafe(stmts)
   end
   return false
 end
+-- Does the program create a nameref (declare/typeset/local -n)? A plain `name=value`
+-- assignment then WRITES THROUGH the nameref (to a var, an array/assoc element, or a
+-- detected cycle) — semantics only interp's full assign implements; the native
+-- assign_scalar can't. When present, delegate scalar assigns so those work. Rare, so
+-- the native fast assign is kept for every ordinary program.
+local emit_has_nameref = false
+local function makes_nameref(st)
+  if st.t ~= "simple" or not st.words[1] then return false end
+  local c = st.words[1].parts[1] and #st.words[1].parts == 1 and st.words[1].parts[1].lit
+  if c ~= "declare" and c ~= "typeset" and c ~= "local" then return false end
+  for j = 2, #st.words do local l = st.words[j].parts[1] and st.words[j].parts[1].lit
+    if l and l:match("^%-%a*n") then return true end
+    if l and l:sub(1, 1) ~= "-" then break end -- past the flags
+  end
+  return false
+end
+local function scan_nameref(stmts)
+  for _, st in ipairs(stmts or {}) do
+    if makes_nameref(st) then return true end
+    if st.body and scan_nameref(st.body) then return true end
+    if st.clauses then for _, cl in ipairs(st.clauses) do if scan_nameref(cl.body) then return true end end end
+    if st.cmds and scan_nameref(st.cmds) then return true end
+    if st.items then for _, it in ipairs(st.items) do if it.cmd and scan_nameref({ it.cmd }) then return true end end end
+  end
+  return false
+end
 -- Does any word in the program READ a call-stack var (FUNCNAME/BASH_SOURCE/BASH_LINENO)?
 -- Gates funcstack/linestack/srcstack maintenance around compiled calls (else zero cost).
 local DEBUGSTACK_VAR = { FUNCNAME = 1, BASH_SOURCE = 1, BASH_LINENO = 1 }
@@ -1402,6 +1428,11 @@ local function build_cfg(stmts, lifted, funcflags, inlinefns, toplevel)
     end
     if DELEGATE[t] then return delegate(st, after) end
     if t == "assign" then
+      -- The program declares a nameref: a plain `name=value` may write THROUGH one
+      -- (to a var / array or assoc element / a detected cycle) — only interp's full
+      -- assign does that, so delegate. Gated to nameref programs (rare); ordinary
+      -- assigns stay native.
+      if emit_has_nameref then return delegate(st, after) end
       -- Assigning these fires a side effect only interp's assign implements (resize
       -- history / truncate the histfile); a native set_str would skip it. Delegate.
       if not st.index and (st.name == "HISTSIZE" or st.name == "HISTFILESIZE") then return delegate(st, after) end
@@ -2073,6 +2104,7 @@ end
 function M.emit(ast)
   emit_has_attr = scan_attr(ast.stmts) -- gate compiled attribute-aware scalar assign
   emit_local_unsafe = scan_local_unsafe(ast.stmts) -- readonly/set-a present → delegate `local`
+  emit_has_nameref = scan_nameref(ast.stmts) -- declare -n present → delegate scalar assigns
   emit_has_err = scan_trap(ast.stmts, { ERR = 1 }) -- gate compiled ERR-trap firing
   emit_has_debug = scan_trap(ast.stmts, { DEBUG = 1 }) -- gate compiled DEBUG-trap firing
   emit_funcstack = reads_debugstack(ast.stmts) -- gate FUNCNAME/BASH_SOURCE/BASH_LINENO stacks
