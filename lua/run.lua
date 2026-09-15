@@ -24,7 +24,12 @@ if not package.preload["tier"] then
     package.path = "lua/?.lua;" .. package.path
   end
 end
-local T = require("tier")
+-- Require only what the chosen mode needs. runtime + interp (which pulls parser)
+-- cover the interp and interactive paths; the compile/tier machinery (tier -> emit
+-- + cache, ~0.18ms of load+init) is pulled in lazily ONLY by the compiled/tiered/
+-- cached branches below. A plain `interp` or interactive start never loads emit.
+local rt = require("runtime")
+local interp = require("interp")
 
 local sh
 
@@ -102,7 +107,7 @@ end
 -- real `exit` in the rc file ends the whole shell here (skipping -c), like bash.
 local function source_rc(sh)
   if not (sh.opt_i and rcfile and not norc) then return end
-  local ok, err = pcall(T.interp.source_file, sh, rcfile)
+  local ok, err = pcall(interp.source_file, sh, rcfile)
   if not ok then
     if type(err) == "table" and err.__curse_exit then io.flush(); os.exit(err.__curse_exit)
     else error(err) end
@@ -143,20 +148,20 @@ if arg[ai] == "-c" or arg[ai] == "+c" then
   end
   local code = arg[j]
   if code == nil then io.stderr:write("curse: -c: option requires an argument\n"); io.flush(); os.exit(2) end
-  sh = T.rt.Shell.new(); apply(sh); sh.opt_c = true
+  sh = rt.Shell.new(); apply(sh); sh.opt_c = true
   -- an interactive shell sets $HISTFILE (bash), even for `-i -c`
   if sh.opt_i and sh.vars.HISTFILE == nil then sh:set_str("HISTFILE", (os.getenv("HOME") or "") .. "/.bash_history"); sh.histfile_default = true end
   sh.argv0 = arg[j + 1] or SHELLNAME -- $0 defaults to the shell name (bash), not "curse"
   for k = j + 2, #arg do sh.nparams = sh.nparams + 1; sh.params[sh.nparams] = arg[k] end
   source_rc(sh) -- interactive: --rcfile is sourced before the command string
-  T.interp.run_lazy(sh, code)
+  interp.run_lazy(sh, code)
   io.flush(); os.exit(sh.status or 0)
 end
 
 -- No script argument. With a tty on stdin (or -i) start the REPL; otherwise read
 -- commands from stdin and run them non-interactively (e.g. `echo cmd | sh`).
 if arg[ai] == nil then
-  sh = T.rt.Shell.new(); apply(sh); sh.argv0 = SHELLNAME -- $0 = the shell name (bash)
+  sh = rt.Shell.new(); apply(sh); sh.argv0 = SHELLNAME -- $0 = the shell name (bash)
   local istty = require("ffi").C.isatty(0) == 1
   if sh.opt_i or istty then
     sh.opt_i = true
@@ -165,7 +170,7 @@ if arg[ai] == nil then
     require("repl").run(sh)
   else
     local src = io.read("*a") or ""
-    T.interp.run_lazy(sh, src)
+    interp.run_lazy(sh, src)
   end
   io.flush(); os.exit(sh.status or 0)
 end
@@ -199,20 +204,22 @@ if mode == "cached" then
   -- path (one-shot invocations that recur), reported on stderr for visibility.
   local Cache = require("cache")
   local f = assert(io.open(script, "r")); local src = f:read("*a"); f:close()
-  sh = T.rt.Shell.new(); apply(sh); sh.argv0 = script; setparams(sh)
+  sh = rt.Shell.new(); apply(sh); sh.argv0 = script; setparams(sh)
   local _, how = Cache.run(src, sh)
   if os.getenv("CURSE_CACHE_DEBUG") then io.stderr:write("[cache: " .. how .. "]\n") end
 elseif mode == "tiered" then
-  sh = T.rt.Shell.new(); apply(sh); sh.argv0 = script; setparams(sh)
+  local T = require("tier") -- pulls emit + cache; only the tiered path needs them
+  sh = rt.Shell.new(); apply(sh); sh.argv0 = script; setparams(sh)
   T.run_background(script, { luajit = os.getenv("CURSE_LUAJIT") or "luajit", sh = sh })
 else
   local f = assert(io.open(script, "r")); local src = f:read("*a"); f:close()
-  sh = T.rt.Shell.new(); apply(sh); sh.argv0 = script; setparams(sh)
+  sh = rt.Shell.new(); apply(sh); sh.argv0 = script; setparams(sh)
   if mode == "compiled" then
-    local mod = T.compile(T.parser.parse(src))
-    T.interp.finish_run(sh, function() T.run_compiled(mod, sh, nil) end)
+    local T = require("tier") -- pulls emit + cache; only the compiled path needs them
+    local mod = T.compile(require("parser").parse(src))
+    interp.finish_run(sh, function() T.run_compiled(mod, sh, nil) end)
   elseif mode == "interp" then
-    T.interp.run_lazy(sh, src) -- lazy: instant start, never parses past exit
+    interp.run_lazy(sh, src) -- lazy: instant start, never parses past exit
   else
     error("unknown mode: " .. mode)
   end
