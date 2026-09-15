@@ -324,6 +324,11 @@ end
 local RENDERABLE_SPECIAL = { ["#"] = 1, ["@"] = 1, ["*"] = 1, ["?"] = 1, ["$"] = 1, ["!"] = 1 }
 -- A word emit_word can render (no ${..op..} pexp, no side-effecting arith, no
 -- unhandled special param).
+-- An empty brace alternative (`{X,,Y,}`) parses to a ZERO-PART word. bash removes it
+-- from argv entirely (an unquoted null), and the interpreter yields zero fields for
+-- it; the compiled argv builders must skip it too (else they emit a stray "" arg). A
+-- quoted empty `""` is ONE part with q=true — a real empty field, never elided.
+local function empty_word(w) return #w.parts == 0 end
 local pexp_compilable, pexp_scalar -- fwd decl (defined after COMPILE_UNSAFE_VAR)
 local function emitable_word(w)
   for _, p in ipairs(w.parts) do
@@ -674,8 +679,10 @@ local function field_argv(words, from, lifted, wrap, prefix)
   local out = { prefix and ("local __a = {" .. prefix .. "}") or "local __a = {}" }
   for j = from, #words do
     local w = words[j]
-    if not word_safe(w) and not field_word(w, lifted) then return nil end
-    out[#out + 1] = emit_fields_into("__a", w, lifted, wrap)
+    if not empty_word(w) then -- an empty brace alternative ({X,,Y,}) adds no arg
+      if not word_safe(w) and not field_word(w, lifted) then return nil end
+      out[#out + 1] = emit_fields_into("__a", w, lifted, wrap)
+    end
   end
   return table.concat(out, "; ")
 end
@@ -1552,7 +1559,7 @@ local function build_cfg(stmts, lifted, funcflags, inlinefns, toplevel)
       end
       local p = newpc()
       local args = {}
-      for j = 2, #st.words do args[#args + 1] = emit_word(st.words[j], lifted) end
+      for j = 2, #st.words do if not empty_word(st.words[j]) then args[#args + 1] = emit_word(st.words[j], lifted) end end
       local body
       if cmd == "echo" then body = "sh:echo(" .. table.concat(args, ", ") .. ")"
       elseif cmd == ":" or cmd == "true" then body = "sh.status = 0"
@@ -1560,10 +1567,13 @@ local function build_cfg(stmts, lifted, funcflags, inlinefns, toplevel)
       elseif cmd == "local" then
         local ls = {}
         for j = 2, #st.words do -- a `local NAME=foo:~` arg tilde-expands the RHS (all-literal only)
-          local aw, av = st.words[j], emit_word(st.words[j], lifted)
-          local fl = unq_full_lit(aw)
-          if fl and fl:find("~", 1, true) then av = ("I.tilde_word_initial(sh, %q)"):format(fl) end
-          ls[#ls + 1] = ("sh:localAssign(%s)"):format(av)
+          local aw = st.words[j]
+          if not empty_word(aw) then
+            local av = emit_word(aw, lifted)
+            local fl = unq_full_lit(aw)
+            if fl and fl:find("~", 1, true) then av = ("I.tilde_word_initial(sh, %q)"):format(fl) end
+            ls[#ls + 1] = ("sh:localAssign(%s)"):format(av)
+          end
         end
         body = table.concat(ls, "; ") .. (#ls > 0 and "; " or "") .. "sh.status = 0"
       elseif cmd == "test" or cmd == "[" then
@@ -1574,7 +1584,7 @@ local function build_cfg(stmts, lifted, funcflags, inlinefns, toplevel)
         -- is rt.cstr'd: an argv entry is a C string, so a NUL truncates it (`$'\0'`);
         -- interp truncates in expand_args, external exec via C — do_test is Lua-side.
         local allargs = {}
-        for j = 1, #st.words do allargs[#allargs + 1] = ("rt.cstr(%s)"):format(emit_word(st.words[j], lifted)) end
+        for j = 1, #st.words do if not empty_word(st.words[j]) then allargs[#allargs + 1] = ("rt.cstr(%s)"):format(emit_word(st.words[j], lifted)) end end
         body = "I.do_test(sh, {" .. table.concat(allargs, ", ") .. "})"
       elseif funcflags[cmd] then
         local ff = funcflags[cmd]
@@ -1587,7 +1597,7 @@ local function build_cfg(stmts, lifted, funcflags, inlinefns, toplevel)
         end
       else -- external command: sh:exec(all words including the command name)
         local allargs = {}
-        for j = 1, #st.words do allargs[#allargs + 1] = emit_word(st.words[j], lifted) end
+        for j = 1, #st.words do if not empty_word(st.words[j]) then allargs[#allargs + 1] = emit_word(st.words[j], lifted) end end
         body = "sh:exec(" .. table.concat(allargs, ", ") .. ")"
       end
       local ec = errchk(st) -- errexit after a failing native simple command
@@ -1734,7 +1744,7 @@ local function build_cfg(stmts, lifted, funcflags, inlinefns, toplevel)
       -- init: expand the word list ONCE into sh.forstate[id] (so OSR resumes it)
       local parts = { "local __l = {}" }
       for _, w in ipairs(st.words) do
-        parts[#parts + 1] = emit_fields_into("__l", w, lifted)
+        if not empty_word(w) then parts[#parts + 1] = emit_fields_into("__l", w, lifted) end
       end
       parts[#parts + 1] = ("sh.forstate[%d] = {list=__l, idx=0}"):format(st.id)
       blocks[initp] = table.concat(parts, "; ") .. ("; pc = %d"):format(advp)
