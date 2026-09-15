@@ -223,8 +223,17 @@ else
   sh = rt.Shell.new(); apply(sh); sh.argv0 = script; setparams(sh)
   if mode == "compiled" then
     local T = require("tier") -- pulls emit + cache; only the compiled path needs them
-    local mod = T.compile(require("parser").parse(src))
-    interp.finish_run(sh, function() T.run_compiled(mod, sh, nil) end)
+    -- The compiler THROWS `curse-nocompile:` for a program it can't faithfully
+    -- compile (e.g. alias expansion, which needs line-at-a-time parsing). That's the
+    -- honest tiered behavior — run it in the interpreter, exactly as the daemon/cache
+    -- path does on the same signal. Any OTHER compile error still propagates.
+    local ok, mod = pcall(T.compile, require("parser").parse(src))
+    if not ok then
+      if type(mod) == "string" and mod:find("curse%-nocompile") then interp.run_lazy(sh, src)
+      else error(mod) end
+    else
+      interp.finish_run(sh, function() T.run_compiled(mod, sh, nil) end)
+    end
   elseif mode == "interp" then
     interp.run_lazy(sh, src) -- lazy: instant start, never parses past exit
   else

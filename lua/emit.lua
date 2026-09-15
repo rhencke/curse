@@ -2107,7 +2107,31 @@ local function assert_compilable(stmts)
   end
 end
 
+-- Does the program define/use aliases? Alias expansion is a PARSE-time in-context
+-- splice, and it depends on line-at-a-time reading: an alias defined on a line does
+-- NOT expand its own line, and a dynamically-built alias (`alias "$x"`) is only
+-- known once the alias builtin runs. A whole-file compile parse can't honor either,
+-- so it would mis-expand — refuse to compile (the interpreter's lazy per-line parse
+-- gets it right), matching the tiered deploy which stays in interp for such scripts.
+local function scan_alias(stmts)
+  for _, st in ipairs(stmts or {}) do
+    if st.t == "simple" and st.words[1] then
+      local c = st.words[1].parts[1] and #st.words[1].parts == 1 and st.words[1].parts[1].lit
+      if c == "alias" or c == "unalias" then return true end
+      if c == "shopt" then
+        for j = 2, #st.words do local l = st.words[j].parts[1] and st.words[j].parts[1].lit
+          if l == "expand_aliases" then return true end end
+      end
+    end
+    if st.body and scan_alias(st.body) then return true end
+    if st.clauses then for _, cl in ipairs(st.clauses) do if scan_alias(cl.body) then return true end end end
+    if st.cmds and scan_alias(st.cmds) then return true end
+    if st.items then for _, it in ipairs(st.items) do if it.cmd and scan_alias({ it.cmd }) then return true end end end
+  end
+  return false
+end
 function M.emit(ast)
+  if scan_alias(ast.stmts) then error("curse-nocompile: alias expansion needs line-at-a-time parse") end
   emit_has_attr = scan_attr(ast.stmts) -- gate compiled attribute-aware scalar assign
   emit_local_unsafe = scan_local_unsafe(ast.stmts) -- readonly/set-a present → delegate `local`
   emit_has_nameref = scan_nameref(ast.stmts) -- declare -n present → delegate scalar assigns
