@@ -1071,16 +1071,61 @@ local function build_cfg(stmts, lifted, funcflags, inlinefns, toplevel)
   -- without re-implementing the word engine in generated code.
   local function delegate(st, after)
     local p = newpc()
-    local out = {}
-    for n in pairs(lifted) do out[#out + 1] = ("sh:aset(%q, %s)"):format(n, lname(n)) end
-    out[#out + 1] = ("I.exec_stmt(sh, %s, __noop)"):format(ser(st))
-    for n in pairs(lifted) do out[#out + 1] = ("%s = sh:aget(%q)"):format(lname(n), n) end
+    local sync_in, sync_out = {}, {}
+    for n in pairs(lifted) do sync_in[#sync_in + 1] = ("sh:aset(%q, %s)"):format(n, lname(n)) end
+    for n in pairs(lifted) do sync_out[#sync_out + 1] = ("%s = sh:aget(%q)"):format(lname(n), n) end
     -- errexit: a delegated errexit-relevant statement (interp's exec_stmt doesn't
     -- fire it — exec_list does) gets the guard here. Compounds (if/for/case) fire
     -- errexit for their inner commands inside exec_stmt already, so they're excluded.
-    local ec = errchk(st); if ec ~= "" then out[#out + 1] = ec end
-    out[#out + 1] = ("pc = %d"):format(after)
-    blocks[p] = table.concat(out, "; ")
+    local ec = errchk(st)
+    -- CONTROL FLOW THROUGH DELEGATION: a delegated `eval break`, a dynamic command
+    -- word that resolves to break/continue/return (`b=break; $b`), or a delegated
+    -- compound (case/pipeline) containing one, raises a __curse_break/continue/return
+    -- from the interpreter. The compiled CFG is pc-based (no Lua loop to unwind to),
+    -- so unguarded it would escape run() entirely. When this delegate sits inside a
+    -- compiled loop or function, wrap exec_stmt in a pcall and translate the signal
+    -- into the native pc jump the corresponding literal keyword would make. loopdepth/
+    -- calldepth are set to the compile-time nesting first, so the interpreter's break/
+    -- continue/return actually FIRE (they gate on "is there an enclosing loop/func").
+    local inloop, infunc = #loopstack > 0, not toplevel
+    if not (inloop or infunc) then -- top level, no loop: nothing to catch (interp no-ops)
+      local out = {}
+      for _, s in ipairs(sync_in) do out[#out + 1] = s end
+      out[#out + 1] = ("I.exec_stmt(sh, %s, __noop)"):format(ser(st))
+      for _, s in ipairs(sync_out) do out[#out + 1] = s end
+      if ec ~= "" then out[#out + 1] = ec end
+      out[#out + 1] = ("pc = %d"):format(after)
+      blocks[p] = table.concat(out, "; ")
+      return p
+    end
+    local o = { "do", table.concat(sync_in, "; ") }
+    o[#o + 1] = "local __sl, __sc = sh.loopdepth, sh.calldepth"
+    if inloop then o[#o + 1] = ("sh.loopdepth = %d"):format(#loopstack) end
+    if infunc then o[#o + 1] = "if (sh.calldepth or 0) < 1 then sh.calldepth = 1 end" end
+    o[#o + 1] = ("local __ok, __e = pcall(I.exec_stmt, sh, %s, __noop)"):format(ser(st))
+    o[#o + 1] = "sh.loopdepth, sh.calldepth = __sl, __sc"
+    o[#o + 1] = table.concat(sync_out, "; ")
+    o[#o + 1] = ("if __ok then %spc = %d"):format(ec ~= "" and (ec .. "; ") or "", after)
+    o[#o + 1] = "elseif type(__e) == \"table\" then"
+    local hs = {}
+    if inloop then
+      local brk, cont = {}, {} -- innermost-first: level 1 = nearest enclosing loop
+      for i = #loopstack, 1, -1 do brk[#brk + 1] = tostring(loopstack[i].brk); cont[#cont + 1] = tostring(loopstack[i].cont) end
+      -- interp already set sh.status before raising (0 normal, 1/128 on a bad arg);
+      -- leave it — the loop's exit status is the break/continue command's, like bash.
+      hs[#hs + 1] = ("if __e.__curse_break then local __lv = __e.__curse_break; if __lv > %d then __lv = %d end; pc = ({%s})[__lv]")
+        :format(#loopstack, #loopstack, table.concat(brk, ", "))
+      hs[#hs + 1] = ("elseif __e.__curse_continue then local __lv = __e.__curse_continue; if __lv > %d then __lv = %d end; pc = ({%s})[__lv]")
+        :format(#loopstack, #loopstack, table.concat(cont, ", "))
+    end
+    if infunc then
+      hs[#hs + 1] = ("%s __e.__curse_return ~= nil then sh.status = __e.__curse_return; pc = %d")
+        :format(#hs > 0 and "elseif" or "if", subexit[#subexit] or DONE)
+    end
+    o[#o + 1] = table.concat(hs, " ") .. " else error(__e) end"
+    o[#o + 1] = "else error(__e) end"
+    o[#o + 1] = "end"
+    blocks[p] = table.concat(o, "\n")
     return p
   end
 
