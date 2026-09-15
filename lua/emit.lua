@@ -1784,13 +1784,24 @@ local function build_cfg(stmts, lifted, funcflags, inlinefns, toplevel)
     -- Sync lifted vars to sh at each marker so, on a lineabort, the tier's retry
     -- wrapper can re-enter run at sh._ff with the pre-statement state intact (run
     -- re-seeds lifted from sh). Once per TOP-LEVEL statement (never in a hot loop body).
-    local wb = {}
-    for n in pairs(lifted) do wb[#wb + 1] = ("sh:aset(%q, %s)"):format(n, lname(n)) end
+    local wb, rb = {}, {}
+    for n in pairs(lifted) do
+      wb[#wb + 1] = ("sh:aset(%q, %s)"):format(n, lname(n))
+      rb[#rb + 1] = ("%s = sh:aget(%q)"):format(lname(n), n)
+    end
     local wbs = #wb > 0 and (table.concat(wb, "; ") .. "; ") or ""
+    -- Deliver pending signal traps at each top-level statement boundary (parity with
+    -- the interpreter's exec_list poll: a blocked signal fires its trap BEFORE the
+    -- next command). Gated by the near-free `sh.sigtraps` nil-check, so a script with
+    -- no trap set pays one field read and the hot loop body (which has NO markers) is
+    -- untouched. A fired trap runs in the interpreter against `sh`, so re-seed the
+    -- lifted run-locals from `sh` afterwards in case the handler changed one.
+    local rbs = #rb > 0 and ("; " .. table.concat(rb, "; ")) or ""
     for k = 1, #stmts do
       local ff = DONE
       for j = k + 1, #stmts do if (stmts[j].line or 0) > (stmts[k].line or 0) then ff = mark[j]; break end end
-      blocks[mark[k]] = ("sh._ff = %d; %spc = %d"):format(ff, wbs, stmtPc[k])
+      blocks[mark[k]] = ("sh._ff = %d; %sif sh.sigtraps then I.run_pending_signals(sh)%s end; pc = %d")
+        :format(ff, wbs, rbs, stmtPc[k])
       stmtPc[k] = mark[k] -- entry/OSR resume enters at the marker so sh._ff + state are set
     end
     return { blocks = blocks, npc = npc, entry = mark[1] or DONE, loopPc = loopPc, stmtPc = stmtPc, loopvars = loopvars }
