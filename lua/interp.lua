@@ -1662,7 +1662,8 @@ end
 -- inline dispatch, so a cold script that never uses them never loads their code.
 local BUILTIN_LAZY = {
   compgen = "b_completion", complete = "b_completion", compopt = "b_completion",
-  ulimit = "b_rare", times = "b_rare",
+  ulimit = "b_rare", times = "b_rare", alias = "b_rare", unalias = "b_rare",
+  umask = "b_rare", getopts = "b_rare",
 }
 local BUILTINS = {
   echo = 1, [":"] = 1, ["true"] = 1, ["false"] = 1, ["["] = 1, test = 1, ["return"] = 1,
@@ -2621,36 +2622,6 @@ local function exec_simple(sh, args, hook, no_func)
       end
       sh.status = ok and 0 or 1
     end
-  elseif cmd == "alias" then
-    -- alias [name[=value] …]: define or print aliases.
-    local j, ok, printed = 2, true, false
-    if args[j] == "--" then j = j + 1 end
-    if j > #args then -- print all, sorted
-      local ns = {}; for k in pairs(sh.aliases) do ns[#ns + 1] = k end; table.sort(ns)
-      for _, k in ipairs(ns) do sh:echo("alias " .. k .. "='" .. sh.aliases[k] .. "'") end
-      sh.status = 0
-    else
-      for k = j, #args do
-        local nm, val = args[k]:match("^([^=]+)=(.*)$")
-        if nm then sh.aliases[nm] = val
-        elseif sh.aliases[args[k]] then sh:echo("alias " .. args[k] .. "='" .. sh.aliases[args[k]] .. "'")
-        else io.stderr:write("curse: alias: " .. args[k] .. ": not found\n"); ok = false end
-      end
-      sh.status = ok and 0 or 1
-    end
-  elseif cmd == "unalias" then
-    local ok = true
-    if #args < 2 then io.stderr:write("curse: unalias: usage: unalias [-a] name [name ...]\n"); ok = false
-    elseif args[2] == "-a" then sh.aliases = {}
-    else
-      for k = 2, #args do
-        if args[k] ~= "--" then
-          if sh.aliases[args[k]] then sh.aliases[args[k]] = nil
-          else io.stderr:write("curse: unalias: " .. args[k] .. ": not found\n"); ok = false end
-        end
-      end
-    end
-    sh.status = ok and 0 or 1
   elseif cmd == "shopt" then
     -- shopt [-s|-u|-q|-p|-o] [names]: set/unset/query shell options (subset).
     local set_, unset_, quiet, oflag, pflag, badopt = false, false, false, false, false, false
@@ -3387,83 +3358,6 @@ local function exec_simple(sh, args, hook, no_func)
       if not same then local pc = sh:phys_cwd(); if pc ~= "" then out = pc end end
     end
     sh:echo(out); sh.status = 0
-  elseif cmd == "umask" then
-    -- umask [-S] [MODE]: print (octal or -S symbolic) or set the file-creation mask.
-    local sflag, pflag, badflag, pos = false, false, false, {}
-    for j = 2, #args do
-      local a = args[j]
-      if a == "-S" then sflag = true
-      elseif a == "-p" then pflag = true -- print in a form that can be eval'd
-      elseif a:sub(1, 1) == "-" and #a > 1 then badflag = true
-      else pos[#pos + 1] = a end
-    end
-    local cur = tonumber(C.umask(0)) % 512; C.umask(cur)
-    if badflag then io.stderr:write("curse: umask: invalid option\n"); sh.status = 1
-    elseif #pos == 0 then -- bash ignores extra args; it uses only the first MODE
-      local body = sflag and umask_symbolic(cur) or string.format("%04o", cur)
-      sh:echo(pflag and ("umask " .. (sflag and "-S " or "") .. body) or body); sh.status = 0
-    else
-      local m = parse_umask(pos[1], cur)
-      if m == nil then io.stderr:write("curse: umask: `" .. pos[1] .. "': invalid symbolic mode\n"); sh.status = 1
-      else C.umask(m); sh.status = 0 end
-    end
-  elseif cmd == "getopts" then
-    -- getopts OPTSTRING NAME [args…]: parse one option per call using OPTIND (+ an
-    -- internal char cursor for bundled opts); sets NAME, OPTARG; status 1 when done.
-    local spec, vname = args[2] or "", args[3] or "?"
-    local silent = spec:sub(1, 1) == ":"
-    local src_get, src_n
-    if #args >= 4 then src_n = #args - 3; src_get = function(k) return args[k + 3] end
-    else src_n = sh.nparams; src_get = function(k) return sh.params[k] end end
-    local optind = math.max(1, math.floor(tonumber(sh:get("OPTIND")) or 1))
-    local cur = sh.getopts_cur or 1
-    -- A leftover OPTIND pointing past a now-shorter argument list (e.g. after a
-    -- fresh `set --`) is exhausted: bash returns EOF and clamps OPTIND to
-    -- nargs+1 (getopt.c: `sh_optind >= argc` -> `sh_optind = argc`, argc =
-    -- nparams+1). It does NOT rescan from 1 — only an explicit OPTIND= does.
-    if optind > src_n + 1 then optind = src_n + 1; cur = 1 end
-    local res
-    while not res do
-      local word = optind <= src_n and src_get(optind) or nil
-      if not word or word == "-" or word:sub(1, 1) ~= "-" then res = { done = true }
-      elseif word == "--" then optind = optind + 1; res = { done = true }
-      else
-        local oc = word:sub(1 + cur, 1 + cur)
-        if oc == "" then optind = optind + 1; cur = 1
-        else
-          local pos = spec:find(oc, 1, true)
-          if not pos or oc == ":" then
-            cur = cur + 1; if 1 + cur > #word then optind = optind + 1; cur = 1 end
-            res = { opt = "?", arg = silent and oc or nil, err = not silent and ("illegal option -- " .. oc) }
-          elseif spec:sub(pos + 1, pos + 1) == ":" then -- takes an argument
-            local rest = word:sub(2 + cur)
-            if rest ~= "" then sh:set_str("OPTARG", rest); optind = optind + 1; cur = 1; res = { opt = oc }
-            else
-              local a = (optind + 1) <= src_n and src_get(optind + 1) or nil
-              if a then sh:set_str("OPTARG", a); optind = optind + 2; cur = 1; res = { opt = oc }
-              else optind = optind + 1; cur = 1
-                res = silent and { opt = ":", arg = oc } or { opt = "?", err = "option requires an argument -- " .. oc }
-              end
-            end
-          else -- flag, no argument
-            cur = cur + 1; if 1 + cur > #word then optind = optind + 1; cur = 1 end
-            res = { opt = oc, clr = true } -- a no-arg option UNSETS OPTARG (bash)
-          end
-        end
-      end
-    end
-    sh.getopts_cur = cur
-    sh:set_str("OPTIND", tostring(optind))
-    local valid = vname:match("^[%a_][%w_]*$") -- an invalid NAME -> status 1, var not set
-    if res.done then
-      if valid then sh:set_str(vname, "?") end
-      sh.getopts_cur = 1; sh.vars["OPTARG"] = nil; sh.status = 1 -- end of options: OPTARG unset
-    else
-      if valid then sh:set_str(vname, res.opt) end
-      if res.arg ~= nil then sh:set_str("OPTARG", res.arg) elseif res.err or res.clr then sh.vars["OPTARG"] = nil end
-      if res.err then io.stderr:write("curse: " .. res.err .. "\n") end
-      sh.status = valid and 0 or 1
-    end
   elseif cmd == "printf" then
     -- printf [-v VAR] FMT [ARGS…] — native, bash-compatible.
     if args[2] == "-v" then
@@ -4914,6 +4808,7 @@ M._int = {
   exec_simple = exec_simple, expand_part_str = expand_part_str,
   tilde_word_initial = tilde_word_initial, file_test = file_test, sq = sq,
   BUILTINS = BUILTINS, KEYWORDS = KEYWORDS, SETOPTS = SETOPTS, SHOPT_ORDER = SHOPT_ORDER,
+  parse_umask = parse_umask, umask_symbolic = umask_symbolic,
   C = C, P = P, rt = rt,
 }
 
