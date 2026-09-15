@@ -980,10 +980,27 @@ local function scan_word_param(w, f)
     if p.arith then scan_arith_param(safe_arith(p.arith), f) end
   end
 end
+-- A REDIRECT target/word/heredoc-body is a raw source STRING (`> "$@"`, `>&$1`),
+-- not a word AST — but it too can reference positional params, so a function whose
+-- ONLY use of $@/$n is in a redirect still needs the param swap (`f(){ echo x >"$@";}`
+-- was dispatched bare → $@ empty → wrong/ambiguous redirect; `is_fd_open(){ :>&$1;}`
+-- looped forever). Match $@ $* $# $n (optional brace) and any $(…)/`…` command sub.
+local function str_reads_params(s)
+  if type(s) ~= "string" then return false end
+  return s:find("%$%{?[@*#0-9]") ~= nil or s:find("%$%(") ~= nil or s:find("`") ~= nil
+end
+local function scan_redir_params(st, f)
+  if not st.redirs then return end
+  for _, r in ipairs(st.redirs) do
+    if str_reads_params(r.target) or str_reads_params(r.word)
+        or (r.expand and str_reads_params(r.body)) then f.params = true end
+  end
+end
 local function func_flags(body)
   local f = { params = false, locals = false }
   local function scan(stmts)
     for _, st in ipairs(stmts) do
+      scan_redir_params(st, f) -- $@/$n in any redirect target also needs the frame
       if st.t == "simple" then
         local cmd = st.words[1] and st.words[1].parts[1] and st.words[1].parts[1].lit
         -- declare/typeset inside a function make their names LOCAL (bash), like `local`,
@@ -1058,6 +1075,15 @@ end
 
 local function inlinable_body(body)
   for _, st in ipairs(body) do
+    -- A redirect whose target references params/cmdsub (`echo x > "$@"`, `: >&$1`)
+    -- can't inline — spliced at the call site it would read the SITE's params, not
+    -- the callee's (a static `> /tmp/f` redirect is fine and stays inlinable).
+    if st.redirs then
+      for _, r in ipairs(st.redirs) do
+        if str_reads_params(r.target) or str_reads_params(r.word)
+            or (r.expand and str_reads_params(r.body)) then return false end
+      end
+    end
     if st.t == "assign" then
       if st.rhs and word_varargs(st.rhs) then return false end
       if st.arith and not arith_inlinable(st.arith) then return false end
