@@ -1033,6 +1033,16 @@ local function scan_redir_params(st, f)
         or (r.expand and str_reads_params(r.body)) then f.params = true end
   end
 end
+-- Walk a [[ … ]] expression tree for $@/$n operands: `and`/`or`/`not` nodes recurse
+-- through l/r/e; a `binary` leaf's l/r are WORDS; a `unary` leaf's operand is .word.
+-- A function whose only param use is inside [[ ]] (`f(){ [[ -n "$1" ]]; }`) was
+-- dispatched bare, so $1 read empty.
+local function scan_dbracket(e, f)
+  if type(e) ~= "table" then return end
+  if e.parts then scan_word_param(e, f); return end -- a word operand
+  if e.word then scan_word_param(e.word, f) end      -- unary operand
+  scan_dbracket(e.l, f); scan_dbracket(e.r, f); scan_dbracket(e.e, f)
+end
 local function func_flags(body)
   local f = { params = false, locals = false }
   local function scan(stmts)
@@ -1076,6 +1086,8 @@ local function func_flags(body)
         for _, cl in ipairs(st.clauses or {}) do scan(cl.body or {}) end
       elseif st.t == "group" or st.t == "subshell" then
         scan(st.body or {})
+      elseif st.t == "dbracket" then
+        scan_dbracket(st.expr, f) -- $@/$n inside [[ … ]]
       end
     end
   end
