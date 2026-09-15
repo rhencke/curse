@@ -56,17 +56,38 @@ end
 -- Does any word in the program READ a call-stack var (FUNCNAME/BASH_SOURCE/BASH_LINENO)?
 -- Gates funcstack/linestack/srcstack maintenance around compiled calls (else zero cost).
 local DEBUGSTACK_VAR = { FUNCNAME = 1, BASH_SOURCE = 1, BASH_LINENO = 1 }
+-- BASH_LINENO/FUNCNAME/BASH_SOURCE can also be read as an arith VAR node inside
+-- $((…)) / (( )) (`echo $((BASH_LINENO))`); walk the arith tree for one.
+local function arith_reads_debugstack(e)
+  if type(e) ~= "table" then return false end
+  if e.k == "var" and DEBUGSTACK_VAR[e.name] then return true end
+  return arith_reads_debugstack(e.e) or arith_reads_debugstack(e.l) or arith_reads_debugstack(e.r)
+    or arith_reads_debugstack(e.c) or arith_reads_debugstack(e.a) or arith_reads_debugstack(e.b)
+end
+local function word_reads_debugstack(w)
+  for _, p in ipairs(w.parts) do
+    if (p.var and DEBUGSTACK_VAR[p.var]) or (p.pexp and DEBUGSTACK_VAR[p.pexp.name]) then return true end
+    -- p.arith is a source string; arith() can THROW on a malformed expr (only the
+    -- parser's own `parith` wrapper turns that into arith_perr), so pcall it — a
+    -- parse failure just means "no debugstack ref here" (the stmt delegates anyway).
+    if p.arith then
+      local ok, ast = pcall(require("parser").arith, p.arith)
+      if ok and arith_reads_debugstack(ast) then return true end
+    end
+    if p.arithast and arith_reads_debugstack(p.arithast) then return true end
+  end
+  return false
+end
 local function reads_debugstack(stmts)
   for _, st in ipairs(stmts or {}) do
     if st.words then
-      for _, w in ipairs(st.words) do
-        for _, p in ipairs(w.parts) do
-          if (p.var and DEBUGSTACK_VAR[p.var]) or (p.pexp and DEBUGSTACK_VAR[p.pexp.name]) then return true end
-        end
-      end
+      for _, w in ipairs(st.words) do if word_reads_debugstack(w) then return true end end
     end
-    -- BASH_LINENO in $((…)) arith reads through an arith var node too
-    if st.expr and st.t == "arithcmd" then end -- (arith reads delegate; scan handled by word scan above)
+    -- (( … )) command reads the same vars through arith var nodes; st.expr is an
+    -- already-parsed arith AST (NOT a source string), so walk it directly.
+    if st.t == "arithcmd" and st.expr and arith_reads_debugstack(st.expr) then return true end
+    if st.rhs and word_reads_debugstack(st.rhs) then return true end -- x=$((BASH_LINENO))
+    if st.arith and arith_reads_debugstack(st.arith) then return true end -- x=$(( … )) parsed
     if st.body and reads_debugstack(st.body) then return true end
     if st.clauses then for _, cl in ipairs(st.clauses) do if reads_debugstack(cl.body) then return true end end end
   end
@@ -193,7 +214,10 @@ end
 -- init/step legitimately have. Such loops/statements delegate to the interpreter.
 local function not_compilable(e)
   if type(e) ~= "table" then return false end
-  if e.k == "xpand" or e.k == "xpandleaf" or e.k == "comma" or e.idx then return true end
+  -- arith_perr = a deferred arith PARSE error (`(( i = '3' ))`): only the interpreter
+  -- renders it (prints bash's "syntax error in expression" + aborts the line), so the
+  -- enclosing loop/statement must delegate — else emit_value throws an uncaught error.
+  if e.k == "xpand" or e.k == "xpandleaf" or e.k == "comma" or e.k == "arith_perr" or e.idx then return true end
   return not_compilable(e.e) or not_compilable(e.l) or not_compilable(e.r)
     or not_compilable(e.c) or not_compilable(e.a) or not_compilable(e.b)
 end
