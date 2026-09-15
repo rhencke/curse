@@ -53,6 +53,36 @@ local function scan_attr(stmts)
   end
   return false
 end
+-- Does the program readonly a variable or enable allexport (set -a)? If so, a later
+-- `local NAME=val` can't use the native fast path: bash makes a local FAIL when the
+-- name is readonly, and EXPORTS it under set -a — neither of which sh:localAssign
+-- does. This is NARROW on purpose (plain `local`/`declare`/`export` don't count), so
+-- an ordinary recursive-locals function keeps the native local.
+local emit_local_unsafe = false
+local function makes_local_unsafe(st)
+  if st.t ~= "simple" or not st.words[1] then return false end
+  local c = st.words[1].parts[1] and #st.words[1].parts == 1 and st.words[1].parts[1].lit
+  if c == "readonly" then return true end
+  if c == "declare" or c == "typeset" then -- a -r flag makes it readonly
+    for j = 2, #st.words do local l = st.words[j].parts[1] and st.words[j].parts[1].lit
+      if l and l:match("^%-%a*r") then return true end end
+  end
+  if c == "set" then -- set -a / set -o allexport
+    for j = 2, #st.words do local l = st.words[j].parts[1] and st.words[j].parts[1].lit
+      if l == "-a" or l == "allexport" or (l and l:match("^%-%a*a")) then return true end end
+  end
+  return false
+end
+local function scan_local_unsafe(stmts)
+  for _, st in ipairs(stmts or {}) do
+    if makes_local_unsafe(st) then return true end
+    if st.body and scan_local_unsafe(st.body) then return true end
+    if st.clauses then for _, cl in ipairs(st.clauses) do if scan_local_unsafe(cl.body) then return true end end end
+    if st.cmds and scan_local_unsafe(st.cmds) then return true end -- pipeline stages
+    if st.items then for _, it in ipairs(st.items) do if it.cmd and scan_local_unsafe({ it.cmd }) then return true end end end
+  end
+  return false
+end
 -- Does any word in the program READ a call-stack var (FUNCNAME/BASH_SOURCE/BASH_LINENO)?
 -- Gates funcstack/linestack/srcstack maintenance around compiled calls (else zero cost).
 local DEBUGSTACK_VAR = { FUNCNAME = 1, BASH_SOURCE = 1, BASH_LINENO = 1 }
@@ -1428,6 +1458,9 @@ local function build_cfg(stmts, lifted, funcflags, inlinefns, toplevel)
       -- interp's full `local`, which also errors a bad name and skips a readonly
       -- (matching bash). Done BEFORE the simple-stmt's newpc so no pc is orphaned.
       if cmd == "local" then
+        -- readonly/set-a in the program: interp's `local` must run (it fails a readonly
+        -- local and exports under set -a; the native localAssign does neither).
+        if emit_local_unsafe then return delegate(st, after) end
         local plain = #st.words >= 2
         for j = 2, #st.words do
           local p1 = st.words[j].parts[1]; local lit = p1 and p1.lit
@@ -2002,6 +2035,7 @@ end
 
 function M.emit(ast)
   emit_has_attr = scan_attr(ast.stmts) -- gate compiled attribute-aware scalar assign
+  emit_local_unsafe = scan_local_unsafe(ast.stmts) -- readonly/set-a present → delegate `local`
   emit_has_err = scan_trap(ast.stmts, { ERR = 1 }) -- gate compiled ERR-trap firing
   emit_has_debug = scan_trap(ast.stmts, { DEBUG = 1 }) -- gate compiled DEBUG-trap firing
   emit_funcstack = reads_debugstack(ast.stmts) -- gate FUNCNAME/BASH_SOURCE/BASH_LINENO stacks
