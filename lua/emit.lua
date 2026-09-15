@@ -1648,10 +1648,19 @@ local function build_cfg(stmts, lifted, funcflags, inlinefns, toplevel)
         else -- neither: bare call, no allocation
           body = fnwrap(cmd, st.line, ("%s(sh)"):format(fnlname(cmd)))
         end
-      else -- external command: sh:exec(all words including the command name)
+      else -- external command — OR a function DEFINED AT RUNTIME (via source/eval).
         local allargs = {}
         for j = 1, #st.words do if not empty_word(st.words[j]) then allargs[#allargs + 1] = emit_word(st.words[j], lifted) end end
-        body = "sh:exec(" .. table.concat(allargs, ", ") .. ")"
+        -- The name wasn't a funcdef at compile time, but source/eval can install one
+        -- into sh.functions before this runs; bash resolves function → builtin →
+        -- external, so check sh.functions at runtime and delegate to interp (which
+        -- sets up the frame/params/return) when present — else exec the external.
+        local ei = {}; for n in pairs(lifted) do ei[#ei + 1] = ("sh:aset(%q, %s)"):format(n, lname(n)) end
+        local eo = {}; for n in pairs(lifted) do eo[#eo + 1] = ("%s = sh:aget(%q)"):format(lname(n), n) end
+        local si = #ei > 0 and (table.concat(ei, "; ") .. "; ") or ""
+        local so = #eo > 0 and ("; " .. table.concat(eo, "; ")) or ""
+        body = ("if sh.functions[%q] then %sI.exec_stmt(sh, %s, __noop)%s else sh:exec(%s) end")
+          :format(cmd, si, ser(st), so, table.concat(allargs, ", "))
       end
       local ec = errchk(st) -- errexit after a failing native simple command
       local ecs = ec ~= "" and ("; " .. ec) or ""
