@@ -451,7 +451,7 @@ local function resolve_cf(st)
   while (c == "builtin" or c == "command") and st.words[off + 1] do -- strip nested builtin/command prefixes
     off = off + 1; c = full_lit(st.words[off])
   end
-  if c == "break" or c == "continue" or c == "return" then return c, off + 1 end
+  if c == "break" or c == "continue" or c == "return" or c == "exit" then return c, off + 1 end
   return nil
 end
 
@@ -1419,6 +1419,24 @@ local function build_cfg(stmts, lifted, funcflags, inlinefns, toplevel)
           return p
         end -- else (pexp/${…}): not intercepted — falls through (emit deopts to interp, which is correct)
       end
+    elseif cf_op == "exit" and #subexit > 0 then
+      -- `exit [N]` inside a compiled subshell exits ONLY the subshell (bash), so jump
+      -- to its subshell_exit pc with the status. If it instead delegated (raising
+      -- __curse_exit), that error unwinds to the nearest pcall — e.g. run_trap's, when
+      -- the subshell sits inside a trap — and the forked child CONTINUES rather than
+      -- _exiting, re-running the rest of the program. A top-level/function exit (no
+      -- enclosing subshell) falls through to the interpreter, which ends the shell.
+      local exitp = subexit[#subexit]
+      local aw = st.words[cf_arg]
+      if not st.words[cf_arg + 1] then
+        local d = dbg(st)
+        if not aw then local p = newpc(); blocks[p] = d .. ("pc = %d"):format(exitp); return p
+        elseif word_safe(aw) then
+          local p = newpc()
+          blocks[p] = d .. ("sh.status = I.return_status(sh, %s); pc = %d"):format(emit_word(aw, lifted), exitp)
+          return p
+        end
+      end -- dynamic/multi-arg: fall through to delegate
     end
     if t == "dbracket" then
       -- [[ ]] : compile the and/or/not tree + leaf comparisons natively; $? = 0/1.
