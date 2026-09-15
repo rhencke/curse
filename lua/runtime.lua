@@ -926,6 +926,31 @@ ffi.cdef [[
   struct curse_pw *getpwuid(unsigned int uid);
 ]]
 local scratch = ffi.new("char[4096]")
+
+-- Password database read DIRECTLY from /etc/passwd, not via getpw*/NSS. A fully
+-- static build can't dlopen libnss_*, and for a shell (~user, $SHELL, ~user
+-- completion) the local passwd file is what these want. Cached for the process
+-- lifetime — daemon workers are short-lived, a cold one-shot reads it once.
+local _passwd
+local function passwd_all()
+  if _passwd then return _passwd end
+  _passwd = {}
+  local f = io.open("/etc/passwd", "r")
+  if f then
+    for line in f:lines() do
+      -- name:passwd:uid:gid:gecos:dir:shell
+      local name, uid, dir, shell = line:match("^([^:]*):[^:]*:([^:]*):[^:]*:[^:]*:([^:]*):([^:]*)$")
+      if name and name ~= "" and name:sub(1, 1) ~= "#" then
+        _passwd[#_passwd + 1] = { name = name, uid = tonumber(uid), dir = dir or "", shell = shell or "" }
+      end
+    end
+    f:close()
+  end
+  return _passwd
+end
+function M.pw_by_name(n) for _, e in ipairs(passwd_all()) do if e.name == n then return e end end end
+function M.pw_by_uid(u) for _, e in ipairs(passwd_all()) do if e.uid == u then return e end end end
+function M.pw_names() local o = {}; for _, e in ipairs(passwd_all()) do o[#o + 1] = e.name end; return o end
 local stbuf_a, stbuf_b = ffi.new("uint8_t[144]"), ffi.new("uint8_t[144]")
 -- Do two paths name the same directory (same device + inode)? Used to validate an
 -- inherited $PWD against the real cwd on startup (bash keeps a symlinked $PWD only
@@ -1158,8 +1183,8 @@ function Shell:import_env()
   if self.vars["PS4"] == nil then self:set_str("PS4", "+ ") end
   -- $SHELL: bash sets it from the passwd entry (the login shell) when not inherited.
   if self.vars["SHELL"] == nil then
-    local pw = ffi.C.getpwuid(ffi.C.geteuid())
-    if pw ~= nil and pw.pw_shell ~= nil then self:set_str("SHELL", ffi.string(pw.pw_shell)) end
+    local pw = M.pw_by_uid(tonumber(ffi.C.geteuid()))
+    if pw and pw.shell ~= "" then self:set_str("SHELL", pw.shell) end
   end
   -- SHELLOPTS/BASHOPTS are NOT stored: special_get derives them live from the
   -- current set -o / shopt state (and they're readonly), matching bash.

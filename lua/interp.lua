@@ -926,8 +926,8 @@ tilde_prefix = function(sh, s)
   -- ~user / ~user/… : the named user's home directory (unknown user stays literal)
   local user, tail = r:match("^([^/:]+)(.*)$")
   if user then
-    local pw = C.getpwnam(user)
-    if pw ~= nil then return ffi.string(pw.pw_dir) .. tail end
+    local pw = rt.pw_by_name(user)
+    if pw and pw.dir ~= "" then return pw.dir .. tail end
   end
   return s
 end
@@ -3446,9 +3446,7 @@ local function exec_simple(sh, args, hook, no_func)
         local function add(x) acc[#acc + 1] = x end
         if act == "user" then -- users in /etc/passwd order (bash does NOT sort these)
           nosort = true
-          C.setpwent()
-          while true do local pw = C.getpwent(); if pw == nil then break end; add(ffi.string(pw.pw_name)) end
-          C.endpwent()
+          for _, n in ipairs(rt.pw_names()) do add(n) end
         elseif act == "function" then for n in pairs(sh.functions) do add(n) end
         elseif act == "alias" then for n in pairs(sh.aliases) do add(n) end
         elseif act == "builtin" then for n in pairs(BUILTINS) do add(n) end
