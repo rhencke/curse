@@ -2002,6 +2002,14 @@ local function assemble(cfg, sig, opts)
     o[#o + 1] = "  sh.func_src = sh.func_src or {}"
     for n, txt in pairs(opts.funcsrc) do o[#o + 1] = ("  sh.func_src[%q] = %q"):format(n, txt) end
   end
+  -- definition line/file for `declare -F` under extdebug (name line file). The file is
+  -- the runtime source (a compiled top level is the main script or a sourced file).
+  if opts.funcline and next(opts.funcline) then
+    o[#o + 1] = "  sh.func_line = sh.func_line or {}; sh.func_file = sh.func_file or {}"
+    for n, ln in pairs(opts.funcline) do
+      o[#o + 1] = ("  sh.func_line[%q] = %d; sh.func_file[%q] = sh.cur_source or sh.argv0 or \"\""):format(n, ln, n)
+    end
+  end
   for _, n in ipairs(opts.runlocals or {}) do o[#o + 1] = ("  local %s = sh:aget(%q)"):format(lname(n), n) end
   for _, n in ipairs(opts.upvals or {}) do o[#o + 1] = ("  %s = sh:aget(%q)"):format(lname(n), n) end
   -- per-loop status holders (while-command loops): plain native locals, init 0.
@@ -2152,13 +2160,16 @@ function M.emit(ast)
   local funcnames = {}
   for name in pairs(funcflags) do funcnames[#funcnames + 1] = name end
   table.sort(funcnames)
-  local funcsrc = {} -- name -> verbatim definition text (top-level funcdefs)
-  for _, st in ipairs(ast.stmts) do if st.t == "funcdef" and st.deftext then funcsrc[st.name] = st.deftext end end
+  local funcsrc, funcline = {}, {} -- name -> verbatim definition text / def line (top-level funcdefs)
+  for _, st in ipairs(ast.stmts) do
+    if st.t == "funcdef" and st.deftext then funcsrc[st.name] = st.deftext end
+    if st.t == "funcdef" and st.line then funcline[st.name] = st.line end -- declare -F under extdebug
+  end
   local top = build_cfg(ast.stmts, lifted, funcflags, inlinefns, true)
   o[#o + 1] = "local loopPc = " .. serialize(top.loopPc)
   o[#o + 1] = "local stmtPc = " .. serialize(top.stmtPc)
   o[#o + 1] = assemble(top, "local function run(sh, pc)",
-    { runlocals = runlocals, upvals = upvals, toplevel = true, funcsrc = funcsrc })
+    { runlocals = runlocals, upvals = upvals, toplevel = true, funcsrc = funcsrc, funcline = funcline })
   o[#o + 1] = "return { run = run, loopPc = loopPc, stmtPc = stmtPc }"
   return table.concat(o, "\n") .. "\n"
 end
