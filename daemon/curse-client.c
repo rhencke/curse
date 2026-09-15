@@ -22,11 +22,33 @@
 #include <string.h>
 #include <unistd.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <stdint.h>
 
 #define CURSE_MAGIC 0x43555253u /* "CURS" */
+
+/* Auto-start the resident daemon in the background so FUTURE invocations are warm.
+ * $CURSE_DAEMON is the launch command (e.g. "luajit /path/lua/daemon.lua"); unset
+ * -> no daemon, we just fall back. Double-fork + setsid so the daemon is reparented
+ * to init (not our child — no zombie, outlives us), with stdio detached to
+ * /dev/null. We never wait: THIS request still falls back below while the daemon
+ * warms up. Racing clients that all spawn one are harmless — the daemon's flock
+ * single-instance guard lets exactly one win. */
+static void spawn_daemon(void) {
+    const char *cmd = getenv("CURSE_DAEMON");
+    if (!cmd || !*cmd) return;
+    pid_t pid = fork();
+    if (pid != 0) return;              /* parent or fork failure: carry on to fallback */
+    setsid();
+    pid = fork();
+    if (pid != 0) _exit(0);           /* intermediate exits; grandchild reparents to init */
+    int nul = open("/dev/null", O_RDWR);
+    if (nul >= 0) { dup2(nul, 0); dup2(nul, 1); dup2(nul, 2); if (nul > 2) close(nul); }
+    execl("/bin/sh", "sh", "-c", cmd, (char *)NULL);
+    _exit(127);
+}
 
 /* Fallback: run the script without the daemon. $CURSE_FALLBACK overrides the
  * program (default "dash" — a POSIX one-shot; a shipped curse would point this
@@ -72,7 +94,8 @@ int main(int argc, char **argv, char **envp) {
     strcpy(addr.sun_path, path);
     if (connect(fd, (struct sockaddr *)&addr, sizeof addr) < 0) {
         close(fd);
-        fallback(argv); /* daemon not running -> run directly */
+        spawn_daemon(); /* not running -> start it for next time */
+        fallback(argv); /* and run THIS request directly (daemon warms in the background) */
     }
 
     /* Build the request: magic, argv, cwd, environ. */

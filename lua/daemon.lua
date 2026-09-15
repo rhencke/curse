@@ -227,9 +227,21 @@ local function serve()
   end
   local my_uid = C.getuid() -- for the SO_PEERCRED defense-in-depth check
 
+  -- Single-instance guard FIRST, before we touch the socket. Clients auto-start a
+  -- daemon on connect failure, so several may race to spawn one; whoever wins this
+  -- exclusive flock is THE daemon and the only one that unlinks/binds the socket.
+  -- The losers exit before disturbing the running daemon's socket. flock releases
+  -- on process death, so a crash leaves no stale lock (unlike a bare pidfile).
+  local O_CREAT, O_RDWR, LOCK_EX, LOCK_NB = 64, 2, 2, 4
+  local lock = C.open(path .. ".lock", O_CREAT + O_RDWR, 384) -- 0600; left open for life
+  if lock < 0 or C.flock(lock, LOCK_EX + LOCK_NB) ~= 0 then
+    if lock >= 0 then C.close(lock) end
+    os.exit(0) -- another cursed already owns the instance
+  end
+
   local lfd = C.socket(AF_UNIX, SOCK_STREAM, 0)
   if lfd < 0 then log("socket() failed"); os.exit(1) end
-  C.unlink(path) -- clear a stale socket
+  C.unlink(path) -- clear a stale socket (safe: we hold the instance lock)
   local addr = ffi.new("struct curse_sun")
   addr.family = AF_UNIX
   ffi.copy(addr.path, path, math.min(#path, 107))
