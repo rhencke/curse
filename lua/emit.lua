@@ -1953,9 +1953,16 @@ function M.emit(ast)
   do -- a name defined by more than one top-level funcdef can't be a single hoisted fn_x;
     -- neither can a function whose name is `unset` (the call after the unset must fail).
     local seen, unset = {}, {}
+    local BUILTINS = require("interp").BUILTINS
     for _, st in ipairs(ast.stmts) do
       if st.t == "funcdef" then
         if seen[st.name] then emit_multidef[st.name] = true else seen[st.name] = true end
+        -- A function shadowing a builtin must dispatch in PROGRAM ORDER: a call to the
+        -- name BEFORE its definition runs the builtin, and `set -o posix` forbids
+        -- redefining a special builtin at all. A single hoisted fn_x (defined at load,
+        -- before any statement) can't model either — so delegate the def AND its calls
+        -- to the interpreter, the oracle for builtin-vs-function resolution.
+        if BUILTINS[st.name] then emit_multidef[st.name] = true end
       end
     end
     collect_unset(ast.stmts, unset)
