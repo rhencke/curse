@@ -951,7 +951,11 @@ local function func_flags(body)
     for _, st in ipairs(stmts) do
       if st.t == "simple" then
         local cmd = st.words[1] and st.words[1].parts[1] and st.words[1].parts[1].lit
-        if cmd == "local" then f.locals = true end
+        -- declare/typeset inside a function make their names LOCAL (bash), like `local`,
+        -- so the call needs a real frame (pushCall) — else a delegated `declare x=1`
+        -- writes the GLOBAL. `declare -g` still targets the global (interp honors -g
+        -- inside the frame), so treating any declare/typeset as frame-needing is safe.
+        if cmd == "local" or cmd == "declare" or cmd == "typeset" then f.locals = true end
         for j = 2, #st.words do scan_word_param(st.words[j], f) end
       elseif st.t == "assign" then
         if st.arith then scan_arith_param(st.arith, f) elseif st.rhs then scan_word_param(st.rhs, f) end
