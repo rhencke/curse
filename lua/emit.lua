@@ -929,9 +929,19 @@ local function scan_arith_param(e, f)
   scan_arith_param(e.e, f); scan_arith_param(e.l, f); scan_arith_param(e.r, f)
   scan_arith_param(e.c, f); scan_arith_param(e.a, f); scan_arith_param(e.b, f)
 end
+-- A ${…} operator on a POSITIONAL parameter (@, *, or a digit — ${*:1}, ${@//x/y},
+-- ${1:-def}) reads the call's params exactly like a bare $@/$*/$n does. Missing this
+-- (only bare $special was checked) made such a function dispatch WITHOUT the param
+-- swap, so $* inside saw the caller's params: `f(){ echo ${*:1};}; f a b` printed "".
+local function pexp_reads_params(pe)
+  local n = pe and pe.name
+  return n == "@" or n == "*" or (type(n) == "string" and n:match("^%d+$") ~= nil)
+end
 local function scan_word_param(w, f)
   for _, p in ipairs(w.parts) do
     if p.param or (p.special and p.special ~= "?") then f.params = true end -- $? is status, not $@
+    if p.pexp and pexp_reads_params(p.pexp) then f.params = true end -- ${*:1}/${1:-x}
+    if p.cmdsub then f.params = true end -- $(…) re-runs against the live frame; its $n/$* need the swap
     if p.arith then scan_arith_param(require("parser").arith(p.arith), f) end
   end
 end
@@ -966,6 +976,9 @@ local function word_varargs(w) -- word that blocks inlining
   for _, p in ipairs(w.parts) do
     -- $@ / $* / $# need a real param array (inlining has no call frame)…
     if p.special and (p.special == "@" or p.special == "*" or p.special == "#") then return true end
+    -- …a ${…} op on a positional param (${*:1}/${1:-x}) is delegated verbatim and
+    -- would read the inline SITE's params, not the callee's — don't inline it…
+    if p.pexp and pexp_reads_params(p.pexp) then return true end
     -- …and $( … ) is opaque source re-run against the live frame, so its inner
     -- $n would see the caller's params, not the inlined ones — don't inline it.
     if p.cmdsub then return true end
