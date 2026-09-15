@@ -13,15 +13,22 @@
 -- so the modules are already preloaded — skip the disk load entirely. Otherwise
 -- load dist/curse.bc from disk, falling back to source on the package path.
 if not package.preload["tier"] then
+  -- Source fallback path, made ABSOLUTE from the startup cwd: modules (incl. the
+  -- lazy b_* builtins) may require() mid-script, after the script has cd'd, so a
+  -- relative "lua/?.lua" would then miss. (The bundle path preloads everything and
+  -- doesn't hit this.)
+  local dir = arg[0] and arg[0]:match("^(.*)/[^/]+$") or "lua"
+  if dir:sub(1, 1) ~= "/" then dir = (os.getenv("PWD") or ".") .. "/" .. dir end
+  local srcpath = dir .. "/?.lua;"
   local bundle = os.getenv("CURSE_BUNDLE") or "dist/curse.bc"
   local bf = io.open(bundle, "rb")
   if bf then
     bf:close()
     if not pcall(function() assert(loadfile(bundle))() end) then
-      package.path = "lua/?.lua;" .. package.path
+      package.path = srcpath .. package.path
     end
   else
-    package.path = "lua/?.lua;" .. package.path
+    package.path = srcpath .. package.path
   end
 end
 -- Require only what the chosen mode needs. runtime + interp (which pulls parser)

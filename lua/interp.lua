@@ -1667,6 +1667,7 @@ local BUILTIN_LAZY = {
   umask = "b_umask", getopts = "b_getopts", hash = "b_hash", history = "b_history",
   jobs = "b_jobs", trap = "b_trap", type = "b_type", printf = "b_printf", read = "b_read",
   mapfile = "b_mapfile", readarray = "b_mapfile",
+  cd = "b_cd", unset = "b_unset", set = "b_set",
   export = "b_export", declare = "b_export", typeset = "b_export", readonly = "b_export",
 }
 local BUILTINS = {
@@ -2565,57 +2566,6 @@ local function exec_simple(sh, args, hook, no_func)
     if #args > 2 then io.stderr:write("curse: exit: too many arguments\n"); sh.status = 1; return end -- bash: non-fatal
     if args[2] and not tonumber(args[2]) then io.stderr:write("curse: exit: " .. args[2] .. ": numeric argument required\n"); error({ __curse_exit = 2 }) end
     error({ __curse_exit = args[2] and (tonumber(args[2]) % 256) or sh.status })
-  elseif cmd == "cd" then
-    local prev = sh:pwd()
-    -- parse leading -L/-P/-e/-@ flags and a `--`, then the directory operand.
-    local operands, j, physical = {}, 2, false
-    while args[j] do
-      local a = args[j]
-      if a == "--" then j = j + 1; break
-      elseif a == "-" then operands[#operands + 1] = a; j = j + 1
-      elseif a:match("^%-[LPe@]+$") then
-        if a:find("P") then physical = true elseif a:find("L") then physical = false end
-        j = j + 1
-      else break end
-    end
-    for k = j, #args do operands[#operands + 1] = args[k] end
-    if #operands > 1 then io.stderr:write("curse: cd: too many arguments\n"); sh.status = 1; return end
-    local dir, print_dir = operands[1], false
-    if dir == "-" then
-      dir = sh:get("OLDPWD")
-      if dir == "" then io.stderr:write("curse: cd: OLDPWD not set\n"); sh.status = 1; return end
-      print_dir = true
-    elseif dir == nil or dir == "" then
-      dir = sh:get("HOME")
-      if dir == "" then io.stderr:write("curse: cd: HOME not set\n"); sh.status = 1; return end
-    elseif dir:sub(1, 1) ~= "/" and dir ~= "." and dir:sub(1, 2) ~= "./"
-        and dir ~= ".." and dir:sub(1, 3) ~= "../" then
-      -- CDPATH: a relative operand (not . / ..) is looked up under each entry.
-      local cdpath = sh:get("CDPATH")
-      if cdpath ~= "" then
-        for entry in (cdpath .. ":"):gmatch("([^:]*):") do
-          local cand = (entry == "" and "." or entry) .. "/" .. dir
-          if C.chdir(cand) == 0 then dir = cand; print_dir = true; break end
-        end
-      end
-    end
-    -- logical target: resolve . and .. against $PWD textually (unless -P)
-    local logical = logical_canon(dir:sub(1, 1) == "/" and dir or (prev .. "/" .. dir))
-    -- bash chdir's the LITERAL operand first — this validates that every path
-    -- component really exists, so `cd nonexistent/..` is an error even though `..`
-    -- would textually cancel it. In logical mode it then moves to the canonicalized
-    -- path so the process and $PWD agree logically (e.g. `cd symlink/..` lands in
-    -- the symlink's textual parent, not its physical one).
-    if C.chdir(dir) ~= 0 then
-      io.stderr:write("curse: cd: " .. dir .. ": No such file or directory\n"); sh.status = 1; return
-    end
-    if not physical then C.chdir(logical) end
-    sh.status = 0
-    local newpwd = physical and sh:phys_cwd() or logical
-    sh:export_str("OLDPWD", prev)
-    sh:export_str("PWD", newpwd)
-    if print_dir then sh:echo(newpwd) end
-    if sh.dirstack then sh.dirstack[1] = newpwd end
   elseif cmd == "kill" then
     if args[2] == "-l" or args[2] == "-L" then -- list / translate signal names<->numbers
       if #args == 2 then
@@ -2738,126 +2688,6 @@ local function exec_simple(sh, args, hook, no_func)
       local parts = {}; for k = 1, #ds do parts[k] = tilde(ds[k]) end
       sh:echo(table.concat(parts, " ")); sh.status = 0
     end
-  elseif cmd == "unset" then
-    local fmode, vmode = false, false -- -f: functions only; -v: vars only; neither: var then function
-    sh.status = 0
-    for j = 2, #args do
-      local a = args[j]
-      if a == "-f" then fmode = true
-      elseif a == "-v" then vmode = true
-      elseif a:sub(1, 1) == "-" and #a > 1 then -- other flags: ignore
-      elseif fmode then sh.functions[a] = nil
-      else
-        local nm, sub = a:match("^([%a_][%w_]*)%[(.+)%]$")
-        if nm then
-          local eb = sh.vars[sh:deref(nm)]
-          if eb and eb.arr then -- real indexed/assoc array: unset one element
-            if not sh:array_unset(nm, array_key(sh, nm, sub)) then
-              io.stderr:write("curse: unset: " .. a .. ": bad array subscript\n"); sh.status = 1 end
-          elseif eb and array_key(sh, nm, sub) == 0 then
-            a = nm; nm = nil -- `name[0]` on a scalar unsets the whole variable
-          elseif eb then -- non-array with a non-zero subscript (bash: "not an array")
-            io.stderr:write("curse: unset: " .. a .. ": not an array\n"); sh.status = 1
-          end
-          -- eb == nil: `name[sub]` with no such variable is a no-op (status 0)
-        end
-        if nm == nil then
-          local dn = sh:deref(a)
-          local b = sh.vars[dn]
-          if b and b.ro then -- readonly: cannot unset (bash: status 1, keep it)
-            io.stderr:write("curse: unset: " .. a .. ": cannot unset: readonly variable\n"); sh.status = 1
-          elseif b ~= nil or vmode then
-            -- bash dynamic-scope unset: when the var is NOT local to the CURRENT
-            -- frame but shadows a local declared in an ENCLOSING frame (e.g. an
-            -- `unset -v` run from a nested `unlocal` helper), removing it REVEALS
-            -- that outer binding instead of leaving the name unset.
-            local revealed, env_done = false, false
-            -- unset of a var LOCAL to the current frame just makes it appear unset
-            -- (bash: the outer value stays hidden until the function returns). Only
-            -- when the name is NOT local here does unset REVEAL a shadowed binding —
-            -- and it peels the MOST RECENT layer, whether that's an enclosing `local`
-            -- shadow (savedstack) or a tempenv `x=v cmd` binding (sh.tenv), ordered by
-            -- a monotonic seq so interleaved local/tempenv layers unwind correctly.
-            if not (sh.savedstack[sh.pd] and sh.savedstack[sh.pd][dn] ~= nil) then
-              local best_seq, best_d, best_k = -1, nil, nil
-              for d = (sh.pd or 0), 1, -1 do
-                local ss = sh.savedstack[d]
-                if ss and ss[dn] ~= nil and ss[dn].seq > best_seq then best_seq = ss[dn].seq; best_d = d; best_k = nil end
-              end
-              for k = #sh.tenv, 1, -1 do
-                local e = sh.tenv[k]
-                if not e.consumed and e.name == dn and e.seq > best_seq then best_seq = e.seq; best_k = k; best_d = nil end
-              end
-              if best_d then
-                sh.vars[dn] = sh.savedstack[best_d][dn].box or nil -- false = was absent
-                sh.savedstack[best_d][dn] = nil; revealed = true
-              elseif best_k then
-                local e = sh.tenv[best_k]
-                sh.vars[dn] = e.box or nil; e.consumed = true; revealed = true
-                if e.env then C.setenv(dn, e.env, 1) else C.unsetenv(dn) end
-                env_done = true
-              end
-            end
-            if not revealed then sh.vars[dn] = nil end
-            if not env_done then C.unsetenv(a) end -- drop from the process env too
-            if rt.LOCALE_VARS[dn] then rt.reset_locale(sh) end -- re-apply locale (bash)
-          elseif sh.functions[a] then sh.functions[a] = nil -- plain unset falls back to a function
-          end
-        end
-      end
-    end
-  elseif cmd == "set" then
-    -- set [-e|+e|-o NAME|+o NAME|…] [--] [ARGS…]: options then positional params
-    if #args == 1 then -- bare `set`: list all shell variables, sorted by name
-      local names = {}
-      for nm in pairs(sh.vars) do names[#names + 1] = nm end
-      table.sort(names)
-      for _, nm in ipairs(names) do
-        local b = sh.vars[nm]
-        if b and not (b.s == nil and b.n == nil and b.arr == nil) then
-          sh.out(fmt_set_var(nm, b) .. "\n")
-        end
-      end
-      sh.status = 0
-      return
-    end
-    -- `force` (only `--`) replaces the positional params even when none follow; a
-    -- lone `-`/`+` merely stops option processing, so `set + -` leaves them alone.
-    local j, force = 2, false
-    while j <= #args do
-      local a = args[j]
-      if a == "--" then force = true; j = j + 1; break
-      elseif a == "-o" or a == "+o" then
-        local o, on = args[j + 1], (a == "-o")
-        if o == nil then
-          -- `set -o`: list options aligned; `set +o`: reproducible `set ±o NAME`.
-          for _, ent in ipairs(SETOPTS) do
-            if on then sh.out(("%-15s\t%s\n"):format(ent[1], opt_on(sh, ent[2]) and "on" or "off"))
-            else sh.out(("set %so %s\n"):format(opt_on(sh, ent[2]) and "-" or "+", ent[1])) end
-          end
-          j = j + 1
-        else
-          if SETOPT[o] then set_opt(sh, SETOPT[o], on) end
-          j = j + 2
-        end
-      elseif a == "-" then -- bare `-`: turn off -v/-x and STOP option processing; any
-        -- remaining args become params, but with none the params are left unchanged.
-        set_opt(sh, "opt_v", false); set_opt(sh, "opt_x", false); j = j + 1; break
-      elseif a == "+" then j = j + 1 -- bare `+`: an ignored no-op flag; keep scanning
-      elseif a:match("^[-+][a-zA-Z]+$") then -- short flag bundle: -eu, +u, …
-        local on = a:sub(1, 1) == "-"
-        for f in a:sub(2):gmatch(".") do
-          if SETFLAG[f] then set_opt(sh, SETFLAG[f], on) end
-        end
-        j = j + 1
-      else break end
-    end
-    if force or j <= #args then
-      local np, n = {}, 0
-      for k = j, #args do n = n + 1; np[n] = args[k] end
-      sh.params = np; sh.nparams = n
-    end
-    sh.status = 0
   elseif cmd == "command" and (args[2] == "-v" or args[2] == "-V") then
     local verbose = args[2] == "-V"
     local anyfound = false
@@ -4230,6 +4060,7 @@ M._int = {
   find_all_in_path = find_all_in_path, name_type = name_type, SIGNUM = SIGNUM, NUMSIG = NUMSIG,
   array_key = array_key, sh_printf = sh_printf, fd_getc = fd_getc, fd_ready = fd_ready, read_split = read_split,
   do_arrayassign = do_arrayassign, eval = eval, fmt_decl = fmt_decl, fmt_set_var = fmt_set_var,
+  logical_canon = logical_canon, opt_on = opt_on, set_opt = set_opt, SETFLAG = SETFLAG, SETOPT = SETOPT,
   C = C, P = P, rt = rt,
 }
 
