@@ -97,6 +97,10 @@ end
 local function word_reads_debugstack(w)
   for _, p in ipairs(w.parts) do
     if (p.var and DEBUGSTACK_VAR[p.var]) or (p.pexp and DEBUGSTACK_VAR[p.pexp.name]) then return true end
+    -- an INDIRECT expansion ${!ref} can name FUNCNAME/BASH_SOURCE/BASH_LINENO at
+    -- runtime (`ref=FUNCNAME; echo ${!ref}`) — can't know statically, so maintain the
+    -- call stack whenever one is present (rare; cost is per-call enterFunc/leaveFunc).
+    if p.pexp and (p.pexp.op == "indirect" or p.pexp.via_indirect) then return true end
     -- p.arith is a source string; arith() can THROW on a malformed expr (only the
     -- parser's own `parith` wrapper turns that into arith_perr), so pcall it — a
     -- parse failure just means "no debugstack ref here" (the stmt delegates anyway).
@@ -1058,6 +1062,10 @@ local function func_flags(body)
         -- getopts parses $@ and shift mutates it — both implicitly need the callee's
         -- positional params (no $-word to trigger scan_word_param), so force the swap.
         if cmd == "getopts" or cmd == "shift" then f.params = true end
+        -- eval / source / . run an OPAQUE string (or file) against the live frame — it
+        -- can reference $@/$n and declare locals (`eval 'local v=$*'`), which the scan
+        -- can't see, so conservatively give the callee a full frame (params + locals).
+        if cmd == "eval" or cmd == "source" or cmd == "." then f.params = true; f.locals = true end
         for j = 2, #st.words do scan_word_param(st.words[j], f) end
       elseif st.t == "assign" then
         if st.arith then scan_arith_param(st.arith, f) elseif st.rhs then scan_word_param(st.rhs, f) end
