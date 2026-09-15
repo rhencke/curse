@@ -1374,6 +1374,22 @@ local function build_cfg(stmts, lifted, funcflags, inlinefns, toplevel)
       -- `local a=(…)` / `declare a=(…)`: the array value lives in st.arrayargs, which
       -- the native builtin paths don't render — interp does the scope-aware array assign.
       if st.arrayargs then return delegate(st, after) end
+      -- The native `local` fast path (sh:localAssign) handles ONLY a plain scalar
+      -- `local NAME[=val]`: it can't validate the name, honor a flag (-n/-A/-p), do
+      -- an array element `a[i]=`, or LIST (bare `local`). Delegate anything else to
+      -- interp's full `local`, which also errors a bad name and skips a readonly
+      -- (matching bash). Done BEFORE the simple-stmt's newpc so no pc is orphaned.
+      if cmd == "local" then
+        local plain = #st.words >= 2
+        for j = 2, #st.words do
+          local p1 = st.words[j].parts[1]; local lit = p1 and p1.lit
+          if not (lit and (lit:match("^[%a_][%w_]*%+?=")
+              or (lit:match("^[%a_][%w_]*$") and #st.words[j].parts == 1))) then
+            plain = false; break
+          end
+        end
+        if not plain then return delegate(st, after) end
+      end
       -- redirects compile (targets computed natively, syscalls via rt.redir_apply)
       -- when every one is compilable AND this isn't `exec` (its redirs persist);
       -- otherwise the whole command delegates.
