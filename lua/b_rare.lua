@@ -5,6 +5,9 @@ local ffi = require("ffi")
 local I = require("interp")._int
 local C = I.C
 local parse_umask, umask_symbolic = I.parse_umask, I.umask_symbolic
+local job_reap, block_sig, canon_sig, sig_order = I.job_reap, I.block_sig, I.canon_sig, I.sig_order
+local find_all_in_path, name_type = I.find_all_in_path, I.name_type
+local SIGNUM, NUMSIG, BUILTINS, KEYWORDS, P = I.SIGNUM, I.NUMSIG, I.BUILTINS, I.KEYWORDS, I.P
 
 return function(sh, cmd, args, hook, tcb)
   if cmd == "ulimit" then
@@ -198,5 +201,200 @@ return function(sh, cmd, args, hook, tcb)
       if res.err then io.stderr:write("curse: " .. res.err .. "\n") end
       sh.status = valid and 0 or 1
     end
+  elseif cmd == "hash" then
+    -- hash [-r] [NAME…] : the command-location cache. bare = list; NAME = look up
+    -- and cache; -r = forget all. (bash keeps a cached path until -r, ignoring a
+    -- later PATH change — see Shell:resolve_cmd.)
+    sh.hashcache = sh.hashcache or {}
+    local rflag, names, j = false, {}, 2
+    while args[j] and args[j]:sub(1, 1) == "-" and #args[j] > 1 do
+      if args[j]:find("r") then rflag = true end
+      j = j + 1
+    end
+    for k = j, #args do names[#names + 1] = args[k] end
+    if rflag then for k in pairs(sh.hashcache) do sh.hashcache[k] = nil end end
+    if #names > 0 then
+      sh.status = 0
+      for _, nm in ipairs(names) do
+        if not nm:find("/", 1, true) and not sh:resolve_cmd(nm) then
+          io.stderr:write("curse: hash: " .. nm .. ": not found\n"); sh.status = 1
+        end
+      end
+    elseif not rflag then -- bare `hash`: print the cache (bash format)
+      local ks = {}; for k in pairs(sh.hashcache) do ks[#ks + 1] = k end; table.sort(ks)
+      if #ks > 0 then
+        sh:echo("hits\tcommand")
+        for _, k in ipairs(ks) do sh:echo(("%4d\t%s"):format(sh.hashcache[k].hits, sh.hashcache[k].path)) end
+      end
+      sh.status = 0
+    else sh.status = 0 end
+  elseif cmd == "history" then
+    -- history [-c] [-r [file]] [-w [file]] | history : the shell command history.
+    sh.history = sh.history or {}
+    local a = args[2]
+    if a == "-c" then for i = #sh.history, 1, -1 do sh.history[i] = nil end; sh.status = 0
+    elseif a == "-r" or a == "-n" then -- read history from FILE (default $HISTFILE)
+      -- -r reads the whole file; -n reads only the lines NOT already read (bash
+      -- tracks a line offset so a later -n picks up commands appended since).
+      local file = args[3] or sh:get("HISTFILE")
+      if file and file ~= "" then
+        local f = io.open(file, "r")
+        if f then
+          local lines = {}
+          for line in f:lines() do lines[#lines + 1] = line end; f:close()
+          local from = (a == "-n") and ((sh.hist_read_lines or 0) + 1) or 1
+          for k = from, #lines do sh.history[#sh.history + 1] = lines[k] end
+          sh.hist_read_lines = #lines
+          sh.status = 0
+        else -- a named history file that can't be read is an error (bash)
+          io.stderr:write("curse: history: cannot read history file: " .. file .. "\n"); sh.status = 1
+        end
+      else sh.status = 0 end
+    elseif a == "-d" then -- delete the history entry at OFFSET (negative counts from end)
+      local off = tonumber(args[3])
+      local n = #sh.history
+      local idx = off and (off >= 0 and off or n + off + 1)
+      if idx and idx >= 1 and idx <= n then table.remove(sh.history, idx); sh.status = 0
+      else io.stderr:write("curse: history: " .. tostring(args[3]) .. ": history position out of range\n"); sh.status = 1 end
+    elseif a == "-w" or a == "-a" then -- write history to FILE
+      local file = args[3] or sh:get("HISTFILE")
+      local f = file ~= "" and file and io.open(file, "w")
+      if f then for _, h in ipairs(sh.history) do f:write(h, "\n") end; f:close() end
+      sh.status = 0
+    elseif a == nil then -- list the whole history
+      for i = 1, #sh.history do sh:echo(("%5d  %s"):format(i, sh.history[i])) end
+      sh.status = 0
+    elseif a:sub(1, 1) == "-" then -- an unrecognized `-X` flag (e.g. `history -5`)
+      io.stderr:write("curse: history: " .. a .. ": invalid option\n"); sh.status = 2
+    elseif args[3] ~= nil then -- too many arguments
+      io.stderr:write("curse: history: too many arguments\n"); sh.status = 1
+    elseif not tonumber((a:gsub("^%+", ""))) then -- a non-numeric count (`history f`)
+      io.stderr:write("curse: history: " .. a .. ": numeric argument required\n"); sh.status = 1
+    else -- `history N` / `history +N`: list the last N entries
+      local nn = math.abs(tonumber((a:gsub("^%+", ""))))
+      for i = math.max(1, #sh.history - nn + 1), #sh.history do sh:echo(("%5d  %s"):format(i, sh.history[i])) end
+      sh.status = 0
+    end
+  elseif cmd == "jobs" then
+    -- jobs [-p|-l|-r]: list active background jobs (one line each). Refresh done
+    -- state non-blockingly first so finished jobs drop off (bash removes them).
+    local pflag, lflag = false, false
+    for k = 2, #args do local a = args[k]
+      if a == "-p" then pflag = true elseif a == "-l" then lflag = true
+      elseif a == "-r" or a == "-s" or a == "-n" then -- filters: accept
+      elseif a:sub(1, 1) == "-" and #a > 1 then io.stderr:write("curse: jobs: " .. a .. ": invalid option\n"); sh.status = 2; return end
+    end
+    local sb = ffi.new("int[1]")
+    for _, j in ipairs(sh.jobs or {}) do job_reap(sh, j, true) end -- WNOHANG refresh
+    local active = {}
+    for _, j in ipairs(sh.jobs or {}) do if not j.done then active[#active + 1] = j end end
+    for i, j in ipairs(active) do
+      local mark = (i == #active) and "+" or (i == #active - 1 and "-" or " ")
+      if pflag then sh:echo(tostring(j.pid))
+      elseif lflag then sh:echo(("[%d]%s %d Running                 %s &"):format(j.id, mark, j.pid, j.cmd))
+      else sh:echo(("[%d]%s  Running                 %s &"):format(j.id, mark, j.cmd)) end
+    end
+    sh.status = 0
+  elseif cmd == "trap" then
+    -- trap [-p] [ACTION] SIG…  (subset: registers/prints; only EXIT actually fires)
+    local j, pflag = 2, false
+    if args[j] == "-l" then -- list signal names (NN) SIGNAME)
+      local nums = {}; for n in pairs(NUMSIG) do nums[#nums + 1] = n end; table.sort(nums)
+      for _, n in ipairs(nums) do sh:echo(("%2d) SIG%s"):format(n, NUMSIG[n])) end
+      sh.status = 0; return
+    end
+    if args[j] == "-p" then pflag = true; j = j + 1 end
+    if args[j] == "--" then j = j + 1 end
+    if pflag or j > #args then -- print traps (all, or the named signals) in signal order
+      local list = {}
+      if j <= #args then -- print only the named signals
+        for k = j, #args do local c = canon_sig(args[k]); if c and sh.traps[c] then list[#list + 1] = c end end
+      else for canon in pairs(sh.traps) do list[#list + 1] = canon end end
+      table.sort(list, function(a, b) return sig_order(a) < sig_order(b) end)
+      for _, canon in ipairs(list) do
+        sh:echo("trap -- '" .. sh.traps[canon] .. "' " .. canon)
+      end
+      sh.status = 0
+    elseif args[j]:sub(1, 1) == "-" and args[j] ~= "-" then -- a stray -flag (e.g. `trap -1`)
+      io.stderr:write("curse: trap: " .. args[j] .. ": invalid option\n"); sh.status = 2
+    else
+      -- bash: reset-mode (all tokens are signals to reset) only when the first
+      -- token is a NUMERIC signal (`trap 0 2`) or the sole arg and a valid signal
+      -- (`trap TERM`); a NAME first token is the action, even a name that happens
+      -- to be a signal (`trap INT EXIT` runs `INT` at EXIT; `trap err ERR`).
+      local action, sigstart
+      if canon_sig(args[j]) and (#args == j or args[j]:match("^%d+$")) then
+        action, sigstart = "-", j
+      else action, sigstart = args[j], j + 1 end
+      if sigstart > #args then -- an action with no signal spec is a usage error
+        io.stderr:write("curse: trap: usage: trap [-lp] [[arg] signal_spec ...]\n"); sh.status = 1; return
+      end
+      local ok = true
+      for k = sigstart, #args do
+        local canon = canon_sig(args[k])
+        if not canon then io.stderr:write("curse: trap: " .. args[k] .. ": invalid signal specification\n"); ok = false
+        elseif action == "-" then sh.traps[canon] = nil
+        else sh.traps[canon] = action end
+        -- a REAL signal (not EXIT/DEBUG/RETURN/ERR): block it so we can poll it at
+        -- safepoints; resetting unblocks it. sh.sigtraps counts active signal traps.
+        local num = canon and SIGNUM[canon:match("^SIG(.+)$") or ""]
+        if num and num ~= 9 and num ~= 19 then -- KILL/STOP can't be trapped
+          local had = sh.sigtraps and sh.sigtraps[canon]
+          if action == "-" and had then block_sig(num, false); sh.sigtraps[canon] = nil
+          elseif action ~= "-" and not had then
+            sh.sigtraps = sh.sigtraps or {}; sh.sigtraps[canon] = true; block_sig(num, true)
+          end
+        end
+      end
+      sh.status = ok and 0 or 1
+    end
+  elseif cmd == "type" then
+    -- type [-t|-p|-P] NAME…  (-t type word; -p path-if-file; -P force PATH search)
+    local tflag, pflag, Pflag, fflag, aflag, j0 = false, false, false, false, false, 2
+    while args[j0] and args[j0]:sub(1, 1) == "-" and #args[j0] > 1 do
+      local f = args[j0]
+      if f:find("t") then tflag = true end
+      if f:find("p") then pflag = true end
+      if f:find("P") then Pflag = true end
+      if f:find("f") then fflag = true end -- -f: suppress shell-function lookup
+      if f:find("a") then aflag = true end -- -a: list ALL locations (each PATH file too)
+      j0 = j0 + 1
+    end
+    local allok = true
+    for j = j0, #args do
+      local nm = args[j]
+      if Pflag then -- force PATH search (all files with -a, else the first)
+        local ps = find_all_in_path(nm)
+        if #ps == 0 then allok = false
+        elseif aflag then for _, p in ipairs(ps) do sh:echo(p) end
+        else sh:echo(ps[1]) end
+      elseif pflag then -- print path(s); status tracks whether the name resolves at all
+        if aflag then for _, p in ipairs(find_all_in_path(nm)) do sh:echo(p) end
+        else local k, p = name_type(sh, nm, fflag); if k == "file" then sh:echo(p) end end
+        if not name_type(sh, nm, fflag) then allok = false end
+      elseif tflag then
+        local k = name_type(sh, nm, fflag); if k then sh:echo(k) else allok = false end
+      elseif aflag then -- every location, in resolution order
+        local found = false
+        if sh.aliases[nm] then sh:echo(nm .. " is aliased to `" .. sh.aliases[nm] .. "'"); found = true end
+        if KEYWORDS[nm] then sh:echo(nm .. " is a shell keyword"); found = true end
+        if not fflag and sh.functions[nm] then sh:echo(nm .. " is a function")
+          local d = sh.func_src and sh.func_src[nm]; if d then sh:echo(d) end -- verbatim body (bash prints it)
+          found = true end
+        if BUILTINS[nm] then sh:echo(nm .. " is a shell builtin"); found = true end
+        for _, p in ipairs(find_all_in_path(nm)) do sh:echo(nm .. " is " .. p); found = true end
+        if not found then allok = false; io.stderr:write("curse: type: " .. nm .. ": not found\n") end
+      else -- sentence form
+        local k, p = name_type(sh, nm, fflag)
+        if not k then allok = false; io.stderr:write("curse: type: " .. nm .. ": not found\n")
+        elseif k == "alias" then sh:echo(nm .. " is aliased to `" .. sh.aliases[nm] .. "'")
+        elseif k == "file" then sh:echo(nm .. " is " .. p)
+        elseif k == "function" then sh:echo(nm .. " is a function")
+          local d = sh.func_src and sh.func_src[nm]; if d then sh:echo(d) end -- verbatim body (bash prints it)
+        elseif k == "keyword" then sh:echo(nm .. " is a shell keyword")
+        else sh:echo(nm .. " is a shell builtin") end
+      end
+    end
+    sh.status = allok and 0 or 1
   end
 end
