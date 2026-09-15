@@ -965,6 +965,19 @@ local function func_flags(body)
         for _, w in ipairs(st.words) do scan_word_param(w, f) end; scan(st.body)
       elseif st.t == "if" then
         for _, cl in ipairs(st.clauses) do scan_arith_param(cond_arith(cl.cond), f); scan(cl.body) end
+      -- Compound bodies also reference $@/$*/$n and define locals — a function whose
+      -- body is a pipeline (`f(){ echo "$1" | od; }`), case, group, subshell, or &&/||
+      -- list needs the param swap / frame just as much. Missing these dispatched the
+      -- function bare, so $1 inside the pipeline saw the CALLER's (empty) params.
+      elseif st.t == "pipeline" then
+        scan(st.cmds or {})
+      elseif st.t == "andor" then
+        for _, it in ipairs(st.items or {}) do if it.cmd then scan({ it.cmd }) end end
+      elseif st.t == "case" then
+        if st.subject then scan_word_param(st.subject, f) end
+        for _, cl in ipairs(st.clauses or {}) do scan(cl.body or {}) end
+      elseif st.t == "group" or st.t == "subshell" then
+        scan(st.body or {})
       end
     end
   end
