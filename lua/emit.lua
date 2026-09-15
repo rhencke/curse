@@ -1731,14 +1731,15 @@ local function build_cfg(stmts, lifted, funcflags, inlinefns, toplevel)
       if arith_can_div_fault(st.expr) then
         -- ÷0 / mod-0 / negative ** THROW a non-fatal matherr — catch it (and any
         -- flagged read fault) as $?=1 and continue, like interp; re-raise anything else.
-        blocks[p] = d .. ("do sh.arithfault = false; local __ok, __v = pcall(function() local __ar = 0LL; %s; return (__ar ~= 0LL) and 0 or 1 end); "
+        blocks[p] = d .. ("do local __ia = sh.in_arithcmd; sh.arithfault = false; sh.in_arithcmd = true; local __ok, __v = pcall(function() local __ar = 0LL; %s; return (__ar ~= 0LL) and 0 or 1 end); sh.in_arithcmd = __ia; "
           .. "if not __ok then if type(__v) == 'table' and __v.__curse_matherr then sh.status = 1 else error(__v) end "
           .. "elseif sh.arithfault then sh.status = 1 else sh.status = __v end end%s; pc = %d")
           :format(code, ecs, after)
       elseif arith_can_error(st.expr, lifted) then
-        -- a non-lifted read may fault; arith_read records it in sh.arithfault WITHOUT
-        -- throwing, so no per-iteration pcall/closure — the accumulator stays JIT-native.
-        blocks[p] = d .. ("do sh.arithfault = false; local __ar = 0LL; %s; sh.status = sh.arithfault and 1 or ((__ar ~= 0LL) and 0 or 1) end%s; pc = %d")
+        -- a non-lifted read may fault; INSIDE the (( )) command arith_read records it in
+        -- sh.arithfault WITHOUT throwing (sh.in_arithcmd gates that), so no per-iteration
+        -- pcall/closure — the accumulator stays JIT-native.
+        blocks[p] = d .. ("do local __ia = sh.in_arithcmd; sh.arithfault = false; sh.in_arithcmd = true; local __ar = 0LL; %s; sh.in_arithcmd = __ia; sh.status = sh.arithfault and 1 or ((__ar ~= 0LL) and 0 or 1) end%s; pc = %d")
           :format(code, ecs, after)
       else -- provably error-free (lifted ints, +-*/comparisons): inline, JIT-native
         blocks[p] = d .. ("do local __ar = 0LL; %s; sh.status = (__ar ~= 0LL) and 0 or 1 end%s; pc = %d")

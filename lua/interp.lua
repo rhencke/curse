@@ -731,13 +731,18 @@ function M.arith_read(sh, name)
   local s = sh:get(name)
   if s == nil or s:match("^%s*$") then return i64(0) end
   if looks_numeric(s) then return rt.arith_num(s) end -- hot path: plain number, no parse/pcall
-  if sh.arithfault then return i64(0) end -- a prior read in this (( )) already faulted
+  if sh.arithfault and sh.in_arithcmd then return i64(0) end -- a prior read in THIS (( )) faulted
   -- a name/expression value ("bar", "1 3"): recursively parse+eval. A malformed value
-  -- is a NON-fatal matherr in (( )) — record it as a flag (the arithcmd codegen maps
-  -- the flag to $?=1) instead of throwing, so the common case needs no per-iter pcall.
+  -- ("a[<(..)]") is a matherr. Inside a (( )) command (sh.in_arithcmd) it's NON-fatal —
+  -- record it as a flag (the arithcmd codegen maps the flag to $?=1), so the common case
+  -- needs no per-iter pcall. In a WORD/assignment `$((…))` bash instead ABORTS the rest
+  -- of the line (like a div0), so raise a lineabort the tier catches ($?=1, line skipped).
   local ok, v = pcall(arith_resolve, sh, s)
   if ok then return v end
-  if type(v) == "table" and (v.__curse_matherr or v.__curse_experr) then sh.arithfault = true; return i64(0) end
+  if type(v) == "table" and (v.__curse_matherr or v.__curse_experr) then
+    if sh.in_arithcmd then sh.arithfault = true; return i64(0) end
+    error({ __curse_lineabort = true })
+  end
   error(v)
 end
 
