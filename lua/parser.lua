@@ -678,6 +678,47 @@ local function parse_word(w)
 end
 M.parse_word = parse_word
 
+-- Memoize the runtime-facing parsers. The interpreter re-parses the SAME arith
+-- expressions and words on every loop iteration — $(( … )), array subscripts,
+-- ${x:-word}, ${x#pat}, redirect targets — via P.arith / P.parse_word. Both are
+-- pure functions of their source string (the returned AST is used read-only by
+-- the evaluator/expander), so cache them. Measured: an assoc-array/arith loop was
+-- ~5x slower than bash because it re-lexed the subscript + arith text every pass.
+-- Bounded so a script with unboundedly many distinct expressions can't leak.
+local MEMO_CAP = 8192
+do
+  local acache, an = {}, 0
+  local aimpl = arith
+  arith = function(src, nodefer)
+    if type(src) == "string" then
+      local key = (nodefer and "\1" or "\0") .. src
+      local hit = acache[key]
+      if hit ~= nil then return hit end
+      local ast = aimpl(src, nodefer)
+      if an >= MEMO_CAP then acache = {}; an = 0 end
+      acache[key] = ast; an = an + 1
+      return ast
+    end
+    return aimpl(src, nodefer)
+  end
+  M.arith = arith
+
+  local wcache, wn = {}, 0
+  local wimpl = parse_word
+  parse_word = function(src)
+    if type(src) == "string" then
+      local hit = wcache[src]
+      if hit ~= nil then return hit end
+      local w = wimpl(src)
+      if wn >= MEMO_CAP then wcache = {}; wn = 0 end
+      wcache[src] = w; wn = wn + 1
+      return w
+    end
+    return wimpl(src)
+  end
+  M.parse_word = parse_word
+end
+
 -- Parse a heredoc body as double-quote content: $… expands, but quotes are
 -- literal (a heredoc doesn't treat ' or " specially). Used when the delimiter
 -- was unquoted; a quoted delimiter means no expansion (raw body).
