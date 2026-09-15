@@ -35,8 +35,14 @@ local function arith(src, nodefer)
   if not (src:find("%${") or src:find("%$%(") or src:find("`")) then
     src = src:gsub("%$([\"'])", "%1")
   end
-  if not nodefer and (src:find("%${") or src:find("%$%(") or src:find("`")
-      or src:find("[%w_]%$") or src:find("%$[^%w_{]")) then
+  -- `${…}` no longer forces a whole-expression defer — primary() consumes it as an
+  -- opaque operand leaf. A GLUED `${…}` (part of a compound name, `x${y}`) is still
+  -- caught by `[%w_]%$` below and deferred whole, as are $(…), `…`, and $*/$@/$?/…
+  -- specials — none of which primary can split into a clean operand.
+  if not nodefer and (src:find("%$%(") or src:find("`")
+      or src:find("[%w_]%$") or src:find("%$[^%w_{]") or src:find("}[%w_#]")) then
+    -- `}[%w_#]`: a `${…}` GLUED to following chars (`${base}#a` -> 16#a, `${z}11`,
+    -- `${z}xAB`) forms one compound token that must expand-then-parse whole.
     return { k = "xpand", raw = src }
   end
   -- bash strips matched double-quote PAIRS inside arithmetic (`$(( "1+2" * 3 ))`
@@ -115,8 +121,19 @@ local function arith(src, nodefer)
       local d = src:sub(i, i)
       if d:match("%d") then i = i + 1; return { k = "param", n = tonumber(d) } end
       if d == "{" then
-        local e = src:find("}", i + 1, true); local nm = src:sub(i + 1, e - 1); i = e + 1
-        return { k = "var", name = nm }
+        -- ${…}: an opaque parameter-expansion OPERAND (${x:-0}, ${arr[k]}, ${#x}…).
+        -- Consume the balanced braces and defer JUST this leaf — at eval it is
+        -- word-expanded and arith-resolved, so the surrounding arithmetic is parsed
+        -- once (and memoized) instead of re-parsing the expanded string each pass.
+        local depth, j = 1, i + 1
+        while j <= n and depth > 0 do
+          local ch = src:sub(j, j)
+          if ch == "{" then depth = depth + 1 elseif ch == "}" then depth = depth - 1 end
+          j = j + 1
+        end
+        local raw = src:sub(i - 1, j - 1) -- "$" … "}"
+        i = j
+        return { k = "xpandleaf", raw = raw }
       end
       return { k = "var", name = ident() } -- $name same as name in arith
     end

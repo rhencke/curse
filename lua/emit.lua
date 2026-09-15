@@ -184,7 +184,7 @@ local function arith_side_effect(e)
   if e.k == "asgn" or e.k == "post" or e.k == "pre" then return true end
   -- xpand (embedded $-expansion), comma, and array-subscripted operands aren't
   -- compiled natively — treat like a side effect so the word/stmt delegates.
-  if e.k == "xpand" or e.k == "comma" or e.idx then return true end
+  if e.k == "xpand" or e.k == "xpandleaf" or e.k == "comma" or e.idx then return true end
   return arith_side_effect(e.e) or arith_side_effect(e.l) or arith_side_effect(e.r)
     or arith_side_effect(e.c) or arith_side_effect(e.a) or arith_side_effect(e.b)
 end
@@ -193,7 +193,7 @@ end
 -- init/step legitimately have. Such loops/statements delegate to the interpreter.
 local function not_compilable(e)
   if type(e) ~= "table" then return false end
-  if e.k == "xpand" or e.k == "comma" or e.idx then return true end
+  if e.k == "xpand" or e.k == "xpandleaf" or e.k == "comma" or e.idx then return true end
   return not_compilable(e.e) or not_compilable(e.l) or not_compilable(e.r)
     or not_compilable(e.c) or not_compilable(e.a) or not_compilable(e.b)
 end

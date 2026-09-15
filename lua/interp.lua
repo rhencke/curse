@@ -635,6 +635,9 @@ eval = function(sh, e)
   if k == "xpand" then -- deferred: expansions inside $(( )) resolved at runtime
     return eval(sh, P.arith(expand_word(sh, P.parse_word(e.raw)), true))
   end
+  if k == "xpandleaf" then -- an opaque ${…} operand: expand it, arith-resolve the value
+    return arith_resolve(sh, expand_word(sh, P.parse_word(e.raw)))
+  end
   if k == "comma" then eval(sh, e.l); return eval(sh, e.r) end
   if k == "un" then
     local v = eval(sh, e.e)
