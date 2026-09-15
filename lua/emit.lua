@@ -1411,7 +1411,11 @@ local function build_cfg(stmts, lifted, funcflags, inlinefns, toplevel)
       end
       -- a redirect-ONLY command (`> file`, `< f`): no command runs; apply the redirs
       -- (their open/truncate is the effect), status 0 (or 1 on failure), then restore.
+      -- BUT a prefix assignment with no command (`abc=def > f`) performs the assignment
+      -- in the current shell EVEN when the redirect fails — the native path here would
+      -- drop it, so delegate to interp, which applies the assignment then the redirect.
       if not st.words[1] then
+        if st.assigns then return delegate(st, after) end
         local p = newpc()
         blocks[p] = dbg(st) .. ("do local __rs = {}; sh.status = %s and 0 or 1; rt.redir_restore(__rs) end; pc = %d")
           :format(redir_apply, after)
