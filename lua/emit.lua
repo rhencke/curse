@@ -392,6 +392,12 @@ local function empty_word(w) return #w.parts == 0 end
 local pexp_compilable, pexp_scalar -- fwd decl (defined after COMPILE_UNSAFE_VAR)
 local function emitable_word(w)
   for _, p in ipairs(w.parts) do
+    -- In a program that declares a nameref, a variable read (`$ref`, `"$ref"`,
+    -- `${ref…}`) may resolve THROUGH the nameref to an array/assoc ELEMENT — which
+    -- the native read renders as the base var, not the element (only interp derefs
+    -- element-namerefs, and only on some paths). Delegate any var read so it's
+    -- correct. Gated to nameref programs (rare); ordinary reads stay native.
+    if emit_has_nameref and (p.var or p.pexp) then return false end
     if p.pexp and not pexp_compilable(p.pexp) then return false end
     if p.procsub then return false end -- <(cmd)/>(cmd): needs the interp's temp-file setup
     if p.special and not RENDERABLE_SPECIAL[p.special] then return false end -- e.g. $-
