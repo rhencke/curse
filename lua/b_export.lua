@@ -12,6 +12,7 @@ local job_reap, block_sig, canon_sig, sig_order = I.job_reap, I.block_sig, I.can
 local find_all_in_path, name_type, SIGNUM, NUMSIG = I.find_all_in_path, I.name_type, I.SIGNUM, I.NUMSIG
 local array_key, sh_printf, fd_getc, fd_ready, read_split = I.array_key, I.sh_printf, I.fd_getc, I.fd_ready, I.read_split
 local do_arrayassign, eval, fmt_decl, fmt_set_var = I.do_arrayassign, I.eval, I.fmt_decl, I.fmt_set_var
+local func_body_text = I.func_body_text
 local C, P = I.C, I.P
 
 return function(sh, cmd, args, hook, tcb)
@@ -97,7 +98,7 @@ return function(sh, cmd, args, hook, tcb)
         -- `declare -f NAME` prints the verbatim definition (captured at parse time);
         -- `declare -F NAME` prints just NAME; bare `declare -F` prints `declare -f NAME`.
         if sh.functions[nm] then
-          if funcbody then local d = sh.func_src and sh.func_src[nm]; if d then sh:echo(d) end
+          if funcbody then local d = func_body_text(sh, nm); if d then sh:echo(d) end
           elseif funcnames then
             if named and sh.shopt.extdebug then -- extdebug: `name line file`
               sh:echo(nm .. " " .. (sh.func_line and sh.func_line[nm] or 0) .. " " .. (sh.func_file and sh.func_file[nm] or ""))

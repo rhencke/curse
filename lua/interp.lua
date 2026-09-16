@@ -1696,6 +1696,51 @@ local KEYWORDS = {
   ["function"] = 1, ["in"] = 1, ["select"] = 1, ["{"] = 1, ["}"] = 1, ["!"] = 1,
   ["time"] = 1, ["[["] = 1, ["]]"] = 1, ["coproc"] = 1,
 }
+
+-- Deparse a function body AST into bash's canonical single-function form, as
+-- `declare -f`, `type NAME`, and `command -V NAME` all print it:
+--     NAME () \n{ \n    stmt\n    stmt\n}
+-- (header has a trailing space, `{ ` a trailing space, body indented 4 spaces).
+-- We only render the shapes we can reproduce byte-for-byte — a plain simple
+-- command of unquoted literal words — and return nil for anything else, so
+-- callers fall back to the verbatim definition text (never worse than before).
+local function deparse_plain_word(w)
+  if w.k ~= "word" or not w.parts or #w.parts == 0 then return nil end
+  local out = {}
+  for _, p in ipairs(w.parts) do
+    for k in pairs(p) do if k ~= "lit" and k ~= "q" then return nil end end
+    if p.q ~= false or type(p.lit) ~= "string" then return nil end
+    out[#out + 1] = p.lit
+  end
+  return table.concat(out)
+end
+local function deparse_stmt(st)
+  if st.t ~= "simple" or not st.words or #st.words == 0 then return nil end
+  if (st.redirs and #st.redirs > 0) or (st.assigns and #st.assigns > 0) then return nil end
+  local ws = {}
+  for _, w in ipairs(st.words) do
+    local s = deparse_plain_word(w); if not s then return nil end
+    ws[#ws + 1] = s
+  end
+  return table.concat(ws, " ")
+end
+local function deparse_func(name, body)
+  if type(body) ~= "table" or #body == 0 then return nil end
+  local lines = {}
+  for _, st in ipairs(body) do
+    local s = deparse_stmt(st); if not s then return nil end
+    lines[#lines + 1] = "    " .. s
+  end
+  return name .. " () \n{ \n" .. table.concat(lines, "\n") .. "\n}"
+end
+M.deparse_func = deparse_func -- also used by emit.lua at compile time (parity)
+-- The stored function body text for `declare -f`/`type`/`command -V`: the
+-- bash-canonical deparse, computed at DEFINITION time in both tiers (so interp
+-- and compiled print identically) and falling back to the verbatim source.
+local function func_body_text(sh, name)
+  return sh.func_src and sh.func_src[name]
+end
+
 -- Find `name` in PATH (existence, F_OK — bash's type/command-v report a
 -- non-executable file too; execution then fails 126 via posix_spawn).
 -- Every PATH match for `name`, in search order, as `type`/`command -v` report
@@ -2242,7 +2287,7 @@ local function exec_simple(sh, args, hook, no_func)
           if k == "alias" then sh:echo(args[j] .. " is aliased to `" .. sh.aliases[args[j]] .. "'")
           elseif k == "file" then sh:echo(args[j] .. " is " .. p)
           elseif k == "function" then sh:echo(args[j] .. " is a function")
-            local d = sh.func_src and sh.func_src[args[j]]; if d then sh:echo(d) end -- verbatim body
+            local d = func_body_text(sh, args[j]); if d then sh:echo(d) end -- canonical (or verbatim) body
           elseif k == "keyword" then sh:echo(args[j] .. " is a shell keyword")
           else sh:echo(args[j] .. " is a shell builtin") end
         else sh:echo(k == "file" and p or args[j]) end
@@ -2647,7 +2692,7 @@ exec_stmt = function(sh, st, hook)
     end
     sh.functions[st.name] = st.body
     sh.func_redirs = sh.func_redirs or {}; sh.func_redirs[st.name] = st.redirs -- `f(){ … } >&2`
-    sh.func_src = sh.func_src or {}; sh.func_src[st.name] = st.deftext -- verbatim def for declare -f
+    sh.func_src = sh.func_src or {}; sh.func_src[st.name] = deparse_func(st.name, st.body) or st.deftext -- canonical body for declare -f
     -- definition site for `declare -F` under extdebug (name line file)
     sh.func_line = sh.func_line or {}; sh.func_line[st.name] = st.line
     sh.func_file = sh.func_file or {}; sh.func_file[st.name] = sh.cur_source or sh.argv0 or ""
@@ -3508,6 +3553,7 @@ M._int = {
   array_key = array_key, sh_printf = sh_printf, fd_getc = fd_getc, fd_ready = fd_ready, read_split = read_split,
   do_arrayassign = do_arrayassign, eval = eval, fmt_decl = fmt_decl, fmt_set_var = fmt_set_var,
   logical_canon = logical_canon, opt_on = opt_on, set_opt = set_opt, SETFLAG = SETFLAG, SETOPT = SETOPT,
+  func_body_text = func_body_text,
   exec_list = exec_list, statbuf = statbuf, statbuf2 = statbuf2, run_trap = run_trap, job_resolve = job_resolve, SIGDESC = SIGDESC, rl_capture = rl_capture,
   rl_lib = rl_lib, SHOPT_DEFAULT = SHOPT_DEFAULT, shopt_on = shopt_on, sherr = sherr,
   C = C, P = P, rt = rt,

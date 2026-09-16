@@ -2243,7 +2243,7 @@ function M.emit(ast)
   table.sort(funcnames)
   local funcsrc, funcline = {}, {} -- name -> verbatim definition text / def line (top-level funcdefs)
   for _, st in ipairs(ast.stmts) do
-    if st.t == "funcdef" and st.deftext then funcsrc[st.name] = st.deftext end
+    if st.t == "funcdef" and st.deftext then funcsrc[st.name] = require("interp").deparse_func(st.name, st.body) or st.deftext end
     if st.t == "funcdef" and st.line then funcline[st.name] = st.line end -- declare -F under extdebug
   end
   local top = build_cfg(ast.stmts, lifted, funcflags, inlinefns, true)

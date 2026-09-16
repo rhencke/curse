@@ -12,6 +12,7 @@ local job_reap, block_sig, canon_sig, sig_order = I.job_reap, I.block_sig, I.can
 local find_all_in_path, name_type, SIGNUM, NUMSIG = I.find_all_in_path, I.name_type, I.SIGNUM, I.NUMSIG
 local array_key, sh_printf, fd_getc, fd_ready, read_split = I.array_key, I.sh_printf, I.fd_getc, I.fd_ready, I.read_split
 local do_arrayassign, eval, fmt_decl, fmt_set_var = I.do_arrayassign, I.eval, I.fmt_decl, I.fmt_set_var
+local func_body_text = I.func_body_text
 local C, P = I.C, I.P
 
 return function(sh, cmd, args, hook, tcb)
@@ -46,7 +47,7 @@ return function(sh, cmd, args, hook, tcb)
         if sh.aliases[nm] then sh:echo(nm .. " is aliased to `" .. sh.aliases[nm] .. "'"); found = true end
         if KEYWORDS[nm] then sh:echo(nm .. " is a shell keyword"); found = true end
         if not fflag and sh.functions[nm] then sh:echo(nm .. " is a function")
-          local d = sh.func_src and sh.func_src[nm]; if d then sh:echo(d) end -- verbatim body (bash prints it)
+          local d = func_body_text(sh, nm); if d then sh:echo(d) end -- canonical (or verbatim) body
           found = true end
         if BUILTINS[nm] then sh:echo(nm .. " is a shell builtin"); found = true end
         for _, p in ipairs(find_all_in_path(nm)) do sh:echo(nm .. " is " .. p); found = true end
@@ -57,7 +58,7 @@ return function(sh, cmd, args, hook, tcb)
         elseif k == "alias" then sh:echo(nm .. " is aliased to `" .. sh.aliases[nm] .. "'")
         elseif k == "file" then sh:echo(nm .. " is " .. p)
         elseif k == "function" then sh:echo(nm .. " is a function")
-          local d = sh.func_src and sh.func_src[nm]; if d then sh:echo(d) end -- verbatim body (bash prints it)
+          local d = func_body_text(sh, nm); if d then sh:echo(d) end -- canonical (or verbatim) body
         elseif k == "keyword" then sh:echo(nm .. " is a shell keyword")
         else sh:echo(nm .. " is a shell builtin") end
       end
