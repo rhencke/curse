@@ -1504,7 +1504,10 @@ end
 local EXTOP = { ["?"] = true, ["*"] = true, ["+"] = true, ["@"] = true, ["!"] = true }
 -- `pn` (pathname mode): `*`/`?` do NOT cross `/` (for GLOBIGNORE matching against
 -- a whole path). Default (case globs, per-segment expansion) lets them match `/`.
-local function glob_conv(glob, pn)
+-- `patsub` (only ${v/pat/repl} passes it): a bash quirk unique to the substitution
+-- matcher — `]` right after `[^`/`[!` CLOSES an empty negated class (which matches
+-- nothing), whereas #/%/case/glob treat that `]` as a literal member.
+local function glob_conv(glob, pn, patsub)
   local star = pn and "[^/]*" or ".*"
   local qmark = pn and "[^/]" or "."
   local out, i, n = {}, 1, #glob
@@ -1519,7 +1522,7 @@ local function glob_conv(glob, pn)
       end
       local arms = split_arms(glob:sub(i + 2, j - 1))
       local conv = {}
-      for _, a in ipairs(arms) do conv[#conv + 1] = glob_conv(a, pn) end
+      for _, a in ipairs(arms) do conv[#conv + 1] = glob_conv(a, pn, patsub) end
       local group = "(" .. table.concat(conv, "|") .. ")"
       -- @ = exactly one; ? = 0/1; * = 0+; + = 1+; ! ≈ group (POSIX ERE can't negate)
       out[#out + 1] = (c == "?" and group .. "?") or (c == "*" and group .. "*")
@@ -1534,6 +1537,12 @@ local function glob_conv(glob, pn)
     elseif c == "[" then
       local j, neg, has_rb, members = i + 1, false, false, {}
       if glob:sub(j, j) == "!" or glob:sub(j, j) == "^" then neg = true; j = j + 1 end
+      if patsub and neg and glob:sub(j, j) == "]" then
+        -- `[^]`/`[!]` in the subst matcher: the `]` closes an EMPTY negated class,
+        -- which matches nothing. Emit a never-match atom: a negated class of every
+        -- non-NUL byte matches only NUL, which a shell (C-)string never contains.
+        out[#out + 1] = "[^\1-\255]"; i = j + 1
+      else
       if glob:sub(j, j) == "]" then has_rb = true; j = j + 1 end -- leading ] is a literal member
       while j <= n and glob:sub(j, j) ~= "]" do
         local cj, nx = glob:sub(j, j), glob:sub(j + 1, j + 1)
@@ -1555,6 +1564,7 @@ local function glob_conv(glob, pn)
         -- ERE class: a literal ] must come FIRST (right after [ or [^).
         out[#out + 1] = "[" .. (neg and "^" or "") .. (has_rb and "]" or "") .. table.concat(members) .. "]"
         i = j + 1
+      end
       end
     elseif c:match("[%.%+%(%)%{%}%|%^%$\\]") then out[#out + 1] = "\\" .. c; i = i + 1
     else out[#out + 1] = c; i = i + 1 end
@@ -1752,7 +1762,7 @@ function M.subst_glob(val, glob, repl, all)
     out[#out + 1] = val:sub(i)
     return table.concat(out)
   end
-  local ere = glob_conv(glob)
+  local ere = glob_conv(glob, false, true) -- patsub=true: [^]/[!] empty-negated quirk
   if anchor == "^" then ere = "^(" .. ere .. ")"
   elseif anchor == "$" then ere = "(" .. ere .. ")$"
   else ere = "(" .. ere .. ")" end
