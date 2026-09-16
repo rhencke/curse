@@ -1540,8 +1540,13 @@ local function glob_conv(glob, pn, patsub)
       i = j + 1
     elseif c == "\\" then -- backslash escapes the next char -> match it literally
       local nc = glob:sub(i + 1, i + 1)
+      -- Escape the char in the ERE ONLY if it is itself an ERE metacharacter. Emitting
+      -- `\x` for a NON-metacharacter (e.g. `\'`, `` \` ``, `\<`) hits glibc's GNU regex
+      -- extensions (`\'` = end-of-buffer anchor, …) and never matches — a plain char is
+      -- already literal in an ERE, so pass it through. Fixes an unquoted `$v` glob like
+      -- `*\'.txt` matching `x'.txt`.
       if nc == "" then out[#out + 1] = "\\\\"; i = i + 1
-      else out[#out + 1] = (nc:match("[%w]") and nc or ("\\" .. nc)); i = i + 2 end
+      else out[#out + 1] = (nc:match("[%.%[%]%(%)%{%}%*%+%?%|%^%$\\]") and ("\\" .. nc) or nc); i = i + 2 end
     elseif c == "*" then out[#out + 1] = star; i = i + 1
     elseif c == "?" then out[#out + 1] = qmark; i = i + 1
     elseif c == "[" then
