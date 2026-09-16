@@ -188,8 +188,15 @@ local script = arg[ai] or error("usage: run.lua <script.sh> [tiered|compiled|int
 local MODES = { tiered = true, compiled = true, interp = true, cached = true }
 local mode, pstart = "tiered", ai + 1
 if arg[ai + 1] and MODES[arg[ai + 1]] then mode = arg[ai + 1]; pstart = ai + 2 end
--- A missing/unreadable script is exit 127 (bash), not a Lua assert crash.
+-- A missing/unreadable script is exit 127 (bash), not a Lua assert crash — but
+-- under errexit (`-e`/`-o errexit`) bash reports the open failure as exit 1
+-- instead (errexit reclassifies it; nounset/xtrace/pipefail/noexec do not).
 do local sf = io.open(script, "r")
+  local errexit = false
+  for _, p in ipairs(presets) do
+    if p.f == "opt_e" then errexit = p.on
+    elseif p.o and OMAP[p.o] == "opt_e" then errexit = p.on end
+  end
   if sf then
     -- A NUL byte in the FIRST line makes bash treat the file as a binary and refuse
     -- it ("cannot execute binary file", 126); a NUL on a later line runs fine. Read a
@@ -201,7 +208,7 @@ do local sf = io.open(script, "r")
       io.stderr:write("curse: " .. script .. ": cannot execute binary file\n"); io.flush(); os.exit(126)
     end
   else
-    io.stderr:write("curse: " .. script .. ": No such file or directory\n"); io.flush(); os.exit(127)
+    io.stderr:write("curse: " .. script .. ": No such file or directory\n"); io.flush(); os.exit(errexit and 1 or 127)
   end
 end
 local function setparams(s) for k = pstart, #arg do s.nparams = s.nparams + 1; s.params[s.nparams] = arg[k] end end
