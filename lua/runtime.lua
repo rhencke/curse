@@ -856,6 +856,44 @@ function Shell:capture_compiled(cs_fn, mustfork, backtick)
   return self:capture_inproc(backtick, cs_fn)
 end
 
+-- In a forked child (subshell/background/pipeline stage), translate an exit/return
+-- thrown as a control table into $? so the child _exits with the right status.
+function M.child_status(sh, ok, err)
+  if not ok and type(err) == "table" then sh.status = err.__curse_exit or err.__curse_return or sh.status end
+end
+
+-- Register a background job (for `jobs`/`wait %spec`/`wait -n`) and set $!.
+function M.job_add(sh, pid, cmdstr)
+  sh.jobs = sh.jobs or {}
+  local maxid = 0
+  for _, j in ipairs(sh.jobs) do if not j.done and j.id > maxid then maxid = j.id end end
+  local job = { id = maxid + 1, pid = pid, cmd = cmdstr or "", done = false }
+  sh.jobs[#sh.jobs + 1] = job
+  sh.last_bg_pid = tostring(pid)
+  return job
+end
+
+-- `cmd &`: fork; the child runs the COMPILED command fragment cmd_fn(sh) with stdin
+-- redirected to /dev/null (async, can't steal the terminal) as a subprogram (ERR
+-- suppressed); the parent records $! + the job and returns status 0. Compiled tier
+-- only, gated by emit to trap-free programs (so the child needs no signal reset).
+function Shell:run_background(cmd_fn, cmdstr)
+  io.flush()
+  local pid = C.fork()
+  if pid == 0 then
+    local dn = C.open("/dev/null", 0, 0); if dn >= 0 then C.dup2(dn, 0); C.close(dn) end
+    self.in_subprogram = (self.in_subprogram or 0) + 1
+    self.loopdepth = 0
+    local ok, err = pcall(function() self.out = io.write; cmd_fn(self) end)
+    M.child_status(self, ok, err)
+    io.flush(); C._exit(self.status or 0)
+  end
+  M.job_add(self, pid, cmdstr)
+  self.bg_pids = self.bg_pids or {}
+  self.bg_pids[#self.bg_pids + 1] = pid
+  self.status = 0
+end
+
 -- A variable box holds a string value and/or a cached int64. An arithmetic
 -- write stores only the int64 (s = nil) and defers stringification until a
 -- string context reads it — this is the per-iteration allocation curse's JS

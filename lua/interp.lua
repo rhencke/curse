@@ -2221,15 +2221,7 @@ end
 
 -- ---- background job table (for `jobs`, `wait -n`, `wait %jobspec`) ----
 local WNOHANG = 1
-local function job_add(sh, pid, cmdstr)
-  sh.jobs = sh.jobs or {}
-  local maxid = 0
-  for _, j in ipairs(sh.jobs) do if not j.done and j.id > maxid then maxid = j.id end end
-  local job = { id = maxid + 1, pid = pid, cmd = cmdstr or "", done = false }
-  sh.jobs[#sh.jobs + 1] = job
-  sh.last_bg_pid = tostring(pid)
-  return job
-end
+local job_add = rt.job_add -- (moved to runtime; the compiled tier's run_background uses it too)
 -- Reap a job (blocking unless nohang); caches its exit status. Returns the status,
 -- or nil if it's still running (nohang) / already gone.
 local function job_reap(sh, job, nohang)
@@ -2479,9 +2471,7 @@ end
 -- In a forked child (subshell/background/pipeline stage), translate an exit/return
 -- thrown as a control table into $? so the child _exits with the right status.
 -- (A non-table Lua error is left for the caller; forked children then _exit anyway.)
-local function child_status(sh, ok, err)
-  if not ok and type(err) == "table" then sh.status = err.__curse_exit or err.__curse_return or sh.status end
-end
+local child_status = rt.child_status -- (moved to runtime; shared with the compiled tier)
 
 -- Snapshot the <()/>() counts before a command expands its words/redirs, so its
 -- cleanup drains ONLY the procsubs it registered — not ones an enclosing group's

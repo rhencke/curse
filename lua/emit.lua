@@ -30,7 +30,8 @@ local function fnlname(n) return "fn_" .. n:gsub("[^%w_]", function(c) return ("
 -- assignments. When false, compiled scalar assignments are a bare sh:set_str (zero
 -- hot-path cost); when true they route through I.assign_scalar. A var attributed via
 -- eval is rare and simply unguarded — no worse than before.
-local emit_has_attr = false
+local EF = {} -- emit-time program flags, grouped so a function referencing several stays one upvalue
+EF.has_attr = false
 local function makes_attr(st)
   if st.t == "arrayassign" then return true end        -- a=(…) makes an array
   if st.t == "assign" and st.index then return true end -- a[i]=… makes/extends an array
@@ -58,7 +59,7 @@ end
 -- name is readonly, and EXPORTS it under set -a — neither of which sh:localAssign
 -- does. This is NARROW on purpose (plain `local`/`declare`/`export` don't count), so
 -- an ordinary recursive-locals function keeps the native local.
-local emit_local_unsafe = false
+EF.local_unsafe = false
 local function makes_local_unsafe(st)
   if st.t ~= "simple" or not st.words[1] then return false end
   local c = st.words[1].parts[1] and #st.words[1].parts == 1 and st.words[1].parts[1].lit
@@ -88,7 +89,7 @@ end
 -- detected cycle) — semantics only interp's full assign implements; the native
 -- assign_scalar can't. When present, delegate scalar assigns so those work. Rare, so
 -- the native fast assign is kept for every ordinary program.
-local emit_has_nameref = false
+EF.has_nameref = false
 local function makes_nameref(st)
   if st.t ~= "simple" or not st.words[1] then return false end
   local c = st.words[1].parts[1] and #st.words[1].parts == 1 and st.words[1].parts[1].lit
@@ -175,6 +176,23 @@ end
 
 -- Does the program install a `trap … SIG` for one of `sigs` (a set of names)? Used
 -- to gate per-command trap hooks (ERR/DEBUG) so a trap-free script pays nothing.
+-- Does the program install ANY trap? A forked `&`/pipeline-stage child resets caught
+-- SIGNAL traps to default (bash); we compile those constructs only when the program
+-- has no traps at all, so the child needs no signal machinery. Recurses broadly
+-- (body/clauses/cmd/cmds/items) so a trap anywhere is seen.
+local function scan_any_trap(stmts)
+  for _, st in ipairs(stmts or {}) do
+    if st.t == "simple" and st.words and st.words[1] and st.words[1].parts[1]
+        and st.words[1].parts[1].lit == "trap" then return true end
+    if st.body and scan_any_trap(st.body) then return true end
+    if st.cmd and scan_any_trap({ st.cmd }) then return true end
+    if st.cmds and scan_any_trap(st.cmds) then return true end
+    if st.items then for _, it in ipairs(st.items) do if it.cmd and scan_any_trap({ it.cmd }) then return true end end end
+    if st.clauses then for _, cl in ipairs(st.clauses) do if scan_any_trap(cl.body) then return true end end end
+  end
+  return false
+end
+
 local function scan_trap(stmts, sigs)
   for _, st in ipairs(stmts or {}) do
     if st.t == "simple" and st.words[1] and st.words[1].parts[1]
@@ -367,14 +385,14 @@ end
 local ERREXIT_TYPES = { simple = 1, pipeline = 1, arithcmd = 1, assign = 1,
   assignlist = 1, subshell = 1, dbracket = 1 }
 local ERRCHK = "if sh.opt_e and sh.noerr == 0 and sh.status ~= 0 then error({ __curse_exit = sh.status }) end"
-local emit_has_err = false -- program installs an ERR trap → fire it after a failing command
+EF.has_err = false -- program installs an ERR trap → fire it after a failing command
 local emit_toplevel = false -- current build_cfg is the top level (ERR only fires there; a
 -- compiled function body doesn't track calldepth so it would wrongly fire ERR — bash needs
 -- errtrace for that. Subshell bodies live in the top-level CFG but fire_err_trap's runtime
 -- in_subprogram check keeps ERR from firing in the forked child.)
 local function errchk(st) -- the guard statement for `st`, or "" when errexit never applies
   if not (st and ERREXIT_TYPES[st.t] and not st.negate) then return "" end
-  if emit_has_err then -- ERR trap fires on the same condition as errexit; set $LINENO to this
+  if EF.has_err then -- ERR trap fires on the same condition as errexit; set $LINENO to this
     -- command's line, fire ERR (fire_err_trap scopes by calldepth/in_subprogram — inside a
     -- function/subshell only under errtrace), THEN errexit (bash order).
     return ("if sh.noerr == 0 and sh.status ~= 0 then sh.cur_line = %d; I.fire_err_trap(sh); if sh.opt_e then error({ __curse_exit = sh.status }) end end")
@@ -382,10 +400,11 @@ local function errchk(st) -- the guard statement for `st`, or "" when errexit ne
   end
   return ERRCHK
 end
-local emit_has_debug = false -- program installs a DEBUG trap → fire it before each command
-local emit_funcstack = false -- program reads $FUNCNAME → maintain sh.funcstack around calls
-local emit_underscore = false -- program reads $_ → set it to each command's last arg
-local emit_pipestatus = false -- program reads $PIPESTATUS → set it (=(status)) after each simple cmd
+EF.has_debug = false -- program installs a DEBUG trap → fire it before each command
+EF.funcstack = false -- program reads $FUNCNAME → maintain sh.funcstack around calls
+EF.underscore = false -- program reads $_ → set it to each command's last arg
+EF.pipestatus = false -- program reads $PIPESTATUS → set it (=(status)) after each simple cmd
+EF.has_trap = false -- program installs any trap → a forked `&`/pipeline child must reset caught signal traps
 local emit_redir_funcs = {} -- funcs with a definition redirect (`f(){…} >&2`): delegate them + their calls
 local emit_multidef = {} -- names defined by more than one top-level funcdef: a single hoisted
 -- fn_x can't represent the sequential redefinition (a call between two defs must see the FIRST
@@ -399,7 +418,7 @@ local emit_multidef = {} -- names defined by more than one top-level funcdef: a 
 local function dbg(st)
   -- run_debug scopes by calldepth/in_subprogram (fires inside a function/subshell only
   -- under functrace); calldepth is tracked in fnwrap when a DEBUG trap is present.
-  if emit_has_debug then return ("I.run_debug(sh, %d); "):format(st.line or 0) end
+  if EF.has_debug then return ("I.run_debug(sh, %d); "):format(st.line or 0) end
   return ""
 end
 -- Wrap a compiled function call `s` (function `cmd`, called at source `line`) with
@@ -409,8 +428,8 @@ end
 -- neither applies. (Inline is disabled when a trap is present, so all calls come here.)
 local function fnwrap(cmd, line, s)
   local pre, post = "", ""
-  if emit_funcstack then pre = ("sh:enterFunc(%q, %d); "):format(cmd, line or 0); post = "; sh:leaveFunc()" end
-  if emit_has_err or emit_has_debug then pre = pre .. "sh.calldepth = sh.calldepth + 1; "; post = post .. "; sh.calldepth = sh.calldepth - 1" end
+  if EF.funcstack then pre = ("sh:enterFunc(%q, %d); "):format(cmd, line or 0); post = "; sh:leaveFunc()" end
+  if EF.has_err or EF.has_debug then pre = pre .. "sh.calldepth = sh.calldepth + 1; "; post = post .. "; sh.calldepth = sh.calldepth - 1" end
   return pre .. s .. post
 end
 -- Special params emit_word knows how to render; any OTHER `$special` (e.g. `$-`,
@@ -431,7 +450,7 @@ local function emitable_word(w)
     -- the native read renders as the base var, not the element (only interp derefs
     -- element-namerefs, and only on some paths). Delegate any var read so it's
     -- correct. Gated to nameref programs (rare); ordinary reads stay native.
-    if emit_has_nameref and (p.var or p.pexp) then return false end
+    if EF.has_nameref and (p.var or p.pexp) then return false end
     if p.pexp and not pexp_compilable(p.pexp) then return false end
     if p.procsub then return false end -- <(cmd)/>(cmd): needs the interp's temp-file setup
     if p.special and not RENDERABLE_SPECIAL[p.special] then return false end -- e.g. $-
@@ -620,6 +639,27 @@ end
 -- flushed to sh first. It runs in a FORKED child (correct capture for builtins AND
 -- externals). Falls back to sh:capture_src only for a genuine syntax error or the
 -- `$(< file)` special-read (whose runtime semantics live there).
+-- Compile `stmts` into an inline fragment closure cs_N (reads sh directly, lift set
+-- {}) and return its id, or nil if the body hits a compiler gap. Shared by $(…),
+-- background, and pipeline stages — the compiled tier's "run this subprogram" unit.
+local function emit_fragment(stmts)
+  local saved_tl = emit_toplevel
+  local bok, cfg = pcall(build_cfg, stmts, {}, emit_frag_ctx.funcflags, emit_frag_ctx.inlinefns, false)
+  emit_toplevel = saved_tl
+  if not bok then return nil end
+  emit_frag_n = emit_frag_n + 1
+  emit_frags[#emit_frags + 1] = assemble(cfg, ("cs_%d = function(sh)"):format(emit_frag_n), {})
+  return emit_frag_n
+end
+
+-- "flush lifted operands to sh; " prefix so a fragment (which reads sh) sees current
+-- values of the enclosing scope's native-int64 locals. "" when nothing is lifted.
+local function lifted_flush(lifted)
+  local f = {}
+  for n in pairs(lifted) do f[#f + 1] = ("sh:aset(%q, %s)"):format(n, lname(n)) end
+  return #f > 0 and (table.concat(f, "; ") .. "; ") or ""
+end
+
 local function compile_cmdsub(src, backtick, lifted)
   local fallback = ("sh:capture_src(%q%s)"):format(src, backtick and ", true" or "")
   local pok, ast = pcall(require("parser").parse, src)
@@ -640,17 +680,11 @@ local function compile_cmdsub(src, backtick, lifted)
       return fallback
     end
   end
-  local saved_tl = emit_toplevel
-  local bok, cfg = pcall(build_cfg, ast.stmts, {}, emit_frag_ctx.funcflags, emit_frag_ctx.inlinefns, false)
-  emit_toplevel = saved_tl
-  if not bok then return fallback end -- compiler gap (curse-nocompile): to be closed upstream
-  emit_frag_n = emit_frag_n + 1
-  local id = emit_frag_n
-  emit_frags[#emit_frags + 1] = assemble(cfg, ("cs_%d = function(sh)"):format(id), {})
+  local id = emit_fragment(ast.stmts)
+  if not id then return fallback end -- compiler gap (curse-nocompile): to be closed upstream
   local call = ("sh:capture_compiled(cs_%d, true, %s)"):format(id, backtick and "true" or "false")
-  local flush = {}
-  for n in pairs(lifted) do flush[#flush + 1] = ("sh:aset(%q, %s)"):format(n, lname(n)) end
-  if #flush > 0 then return ("(function() %s; return %s end)()"):format(table.concat(flush, "; "), call) end
+  local flush = lifted_flush(lifted)
+  if flush ~= "" then return ("(function() %s return %s end)()"):format(flush, call) end
   return call
 end
 
@@ -700,7 +734,7 @@ end
 -- program reads $_ and the last word is a single field (word_safe — re-evaluating it
 -- is side-effect-free; a split/cmdsub last arg is left alone). Empty string for no words.
 local function und(st, lifted)
-  if not (emit_underscore and st.words) then return "" end
+  if not (EF.underscore and st.words) then return "" end
   local last = st.words[#st.words]
   if last and not word_safe(last) then return "" end -- split/cmdsub last arg: skip (rare)
   local v = last and emit_word(last, lifted) or '""'
@@ -868,7 +902,7 @@ end
 -- CFG-unreproducible special ($LINENO/$_). Plain literal+var+param+$@/$* words qualify —
 -- exactly the mixed shapes (`foo$x`, `$x.txt`, `x$@y`) that field_word can't render.
 local function mixed_expandable(w, lifted)
-  if emit_has_nameref then return false end
+  if EF.has_nameref then return false end
   for _, p in ipairs(w.parts) do
     if p.arith or p.arithast or p.cmdsub or p.pexp or p.procsub then return false end
     if p.var and COMPILE_UNSAFE_VAR[p.var] then return false end
@@ -1457,7 +1491,7 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
 
   -- Statement types with no native compiled form yet -> always delegate.
   local DELEGATE = {
-    pipeline = 1, parse_error = 1, assignlist = 1, background = 1,
+    pipeline = 1, parse_error = 1, assignlist = 1,
   }
 
   -- Compile one redirect's target to a native Lua expr (op + fd are already
@@ -1592,7 +1626,7 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
       -- (to a var / array or assoc element / a detected cycle) — only interp's full
       -- assign does that, so delegate. Gated to nameref programs (rare); ordinary
       -- assigns stay native.
-      if emit_has_nameref then return delegate(st, after) end
+      if EF.has_nameref then return delegate(st, after) end
       -- Assigning these fires a side effect only interp's assign implements (resize
       -- history / truncate the histfile); a native set_str would skip it. Delegate.
       if not st.index and (st.name == "HISTSIZE" or st.name == "HISTFILESIZE") then return delegate(st, after) end
@@ -1612,7 +1646,7 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
         if fl and fl:find("~", 1, true) then return ("rt.tilde_assign(sh, %q)"):format(fl) end
         return emit_word(st.rhs, lifted)
       end
-      local ua = emit_underscore and '; sh:set_str("_", "")' or "" -- a bare assignment resets $_ (bash)
+      local ua = EF.underscore and '; sh:set_str("_", "")' or "" -- a bare assignment resets $_ (bash)
       if st.arith then
         -- x=$((…)): a non-lifted read honors set -u and resolves recursively (bash),
         -- exactly as the $(())-in-word and (( )) paths do — swap in arith_read.
@@ -1622,7 +1656,7 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
         blocks[p] = d .. emit_set(st.name, rhs, lifted) .. ua .. ("; pc = %d"):format(after)
       elseif lifted[st.name] then
         blocks[p] = d .. emit_set(st.name, numeric_word(st.rhs) .. "LL", lifted) .. ua .. ("; pc = %d"):format(after)
-      elseif emit_has_attr then -- readonly reject / array [0] / declare -i,-l,-u — via interp's logic
+      elseif EF.has_attr then -- readonly reject / array [0] / declare -i,-l,-u — via interp's logic
         -- status 0 first so a plain RHS yields 0 (a cmdsub RHS overwrites it), then
         -- assign_scalar (which sets 1 on a readonly reject); errchk applies errexit/ERR.
         local ec = errchk(st); local ecs = ec ~= "" and ("; " .. ec) or ""
@@ -1671,7 +1705,7 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
       if cmd == "local" then
         -- readonly/set-a in the program: interp's `local` must run (it fails a readonly
         -- local and exports under set -a; the native localAssign does neither).
-        if emit_local_unsafe then return delegate(st, after) end
+        if EF.local_unsafe then return delegate(st, after) end
         local plain = #st.words >= 2
         for j = 2, #st.words do
           local p1 = st.words[j].parts[1]; local lit = p1 and p1.lit
@@ -1884,7 +1918,7 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
       local u = und(st, lifted) -- $_ = this command's last arg (bash), for the NEXT command
       -- PIPESTATUS after a simple command is a one-element array of its status (bash);
       -- set BEFORE errchk so an ERR trap sees it. Gated on the program reading it.
-      local ps = emit_pipestatus and '; sh:array_assign("PIPESTATUS", {tostring(sh.status)}, false)' or ""
+      local ps = EF.pipestatus and '; sh:array_assign("PIPESTATUS", {tostring(sh.status)}, false)' or ""
       local d = dbg(st) -- DEBUG fires before the command
       if redir_apply then
         -- install the redirs (backing up fds), run the command only if they all
@@ -2154,6 +2188,21 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
       -- body inline (redirs on the group still delegate; break/continue flow natively).
       if st.redirs then return delegate(st, after) end
       return flatten_list(st.body, after)
+    elseif t == "background" then
+      -- cmd & : fork, run the COMPILED command in the child; the parent records $! + the
+      -- job and continues with status 0. Reuses the fragment mechanism (the child is a
+      -- subprogram). Gated to trap-free programs — a forked child otherwise resets caught
+      -- signal traps (interp-side signal machinery). Flush lifted operands so the child
+      -- (which reads sh) sees current values; no reload (the parent's copy is unaffected).
+      if EF.has_trap then return delegate(st, after) end
+      local id = emit_fragment({ st.cmd })
+      if not id then return delegate(st, after) end
+      local c1 = st.cmd -- best-effort command text for the job table
+      while c1 and c1.t == "pipeline" and c1.cmds do c1 = c1.cmds[1] end
+      local cmdstr = (c1 and c1.words and c1.words[1] and c1.words[1].parts[1] and c1.words[1].parts[1].lit) or "job"
+      local p = newpc()
+      blocks[p] = dbg(st) .. lifted_flush(lifted) .. ("sh:run_background(cs_%d, %q); pc = %d"):format(id, cmdstr, after)
+      return p
     elseif t == "arrayassign" then
       -- a=(…): dispatch to the array-assign runtime primitive (readonly/index checks +
       -- error-contained do_arrayassign + status/$_), NOT the exec_stmt tree-walker. Flush
@@ -2371,20 +2420,21 @@ end
 function M.emit(ast)
   emit_frags, emit_frag_n = {}, 0 -- compiled `$(…)` fragments (cs_N closures) collected during build
   if scan_alias(ast.stmts) then error("curse-nocompile: alias expansion needs line-at-a-time parse") end
-  emit_has_attr = scan_attr(ast.stmts) -- gate compiled attribute-aware scalar assign
-  emit_local_unsafe = scan_local_unsafe(ast.stmts) -- readonly/set-a present → delegate `local`
-  emit_has_nameref = scan_nameref(ast.stmts) -- declare -n present → delegate scalar assigns
-  emit_has_err = scan_trap(ast.stmts, { ERR = 1 }) -- gate compiled ERR-trap firing
-  emit_has_debug = scan_trap(ast.stmts, { DEBUG = 1 }) -- gate compiled DEBUG-trap firing
-  emit_funcstack = reads_debugstack(ast.stmts) -- gate FUNCNAME/BASH_SOURCE/BASH_LINENO stacks
-  emit_underscore = reads_var(ast.stmts, "_") -- gate $_ (last-arg) maintenance
-  emit_pipestatus = reads_var(ast.stmts, "PIPESTATUS") -- gate $PIPESTATUS after simple cmds
+  EF.has_attr = scan_attr(ast.stmts) -- gate compiled attribute-aware scalar assign
+  EF.local_unsafe = scan_local_unsafe(ast.stmts) -- readonly/set-a present → delegate `local`
+  EF.has_nameref = scan_nameref(ast.stmts) -- declare -n present → delegate scalar assigns
+  EF.has_err = scan_trap(ast.stmts, { ERR = 1 }) -- gate compiled ERR-trap firing
+  EF.has_debug = scan_trap(ast.stmts, { DEBUG = 1 }) -- gate compiled DEBUG-trap firing
+  EF.funcstack = reads_debugstack(ast.stmts) -- gate FUNCNAME/BASH_SOURCE/BASH_LINENO stacks
+  EF.underscore = reads_var(ast.stmts, "_") -- gate $_ (last-arg) maintenance
+  EF.pipestatus = reads_var(ast.stmts, "PIPESTATUS") -- gate $PIPESTATUS after simple cmds
+  EF.has_trap = scan_any_trap(ast.stmts) -- gate compiled `&`/pipeline (forked child resets signal traps)
   local funcflags, inlinable, inlinefns = {}, {}, {}
   -- With a DEBUG/ERR trap, DON'T inline: an inlined body runs at the caller's level,
   -- where its commands would fire DEBUG/ERR that bash scopes to the (un-entered)
   -- function. A normal call fires the trap once at the call site and keeps the body
   -- silent (its build_cfg is non-toplevel).
-  local no_inline = emit_has_err or emit_has_debug or emit_funcstack
+  local no_inline = EF.has_err or EF.has_debug or EF.funcstack
   emit_redir_funcs = {}
   emit_multidef = {}
   do -- a name defined by more than one top-level funcdef can't be a single hoisted fn_x;
