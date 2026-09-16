@@ -1213,10 +1213,12 @@ local function make_parser(src, sh)
             i = i + 1
           else i = i + 1 end
         end
+        if i > n then error("syntax error: unexpected end of file") end -- unterminated "
         i = i + 1 -- past closing quote
       elseif c == "'" then -- single quotes: everything literal, no escapes
         i = i + 1
         while i <= n and src:sub(i, i) ~= "'" do i = i + 1 end
+        if i > n then error("syntax error: unexpected end of file") end -- unterminated '
         i = i + 1 -- past closing quote
       elseif c == "$" and src:sub(i + 1, i + 1) == "'" then
         -- $'…' ANSI-C quote: scan to the close honoring \' \\
@@ -1224,6 +1226,7 @@ local function make_parser(src, sh)
         while i <= n and src:sub(i, i) ~= "'" do
           if src:sub(i, i) == "\\" then i = i + 2 else i = i + 1 end
         end
+        if i > n then error("syntax error: unexpected end of file") end -- unterminated $'
         i = i + 1
       elseif c == "$" and src:sub(i + 1, i + 2) == "((" and dparen_is_arith(src, i + 3) then
         local _, ni = grab_dparen(src, i + 3); i = ni
