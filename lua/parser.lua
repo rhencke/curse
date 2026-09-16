@@ -40,9 +40,14 @@ local function arith(src, nodefer)
   -- caught by `[%w_]%$` below and deferred whole, as are $(…), `…`, and $*/$@/$?/…
   -- specials — none of which primary can split into a clean operand.
   if not nodefer and (src:find("%$%(") or src:find("`")
-      or src:find("[%w_]%$") or src:find("%$[^%w_{]") or src:find("}[%w_#]")) then
+      or src:find("[%w_]%$") or src:find("%$[^%w_{]") or src:find("}[%w_#]")
+      or src:find("%$[%a_{]")) then
     -- `}[%w_#]`: a `${…}` GLUED to following chars (`${base}#a` -> 16#a, `${z}11`,
     -- `${z}xAB`) forms one compound token that must expand-then-parse whole.
+    -- `%$[%a_{]` — $name / ${…}: bash substitutes the VALUE as TEXT and re-parses. The
+    -- xpand eval fast-paths this (parse once, eval native) and only re-parses textually
+    -- when a value isn't a plain number, so hot `(( $i < n ))` stays native. ($digit
+    -- stays a native param node so function inlining keeps substituting positionals.)
     return { k = "xpand", raw = src }
   end
   -- bash strips matched double-quote PAIRS inside arithmetic (`$(( "1+2" * 3 ))`
@@ -135,7 +140,7 @@ local function arith(src, nodefer)
         i = j
         return { k = "xpandleaf", raw = raw }
       end
-      return { k = "var", name = ident() } -- $name same as name in arith
+      return { k = "var", name = ident(), dollar = true } -- $name: value substituted textually (eval checks)
     end
     if c:match("%d") then
       -- base#digits / 0xHEX / decimal-or-octal

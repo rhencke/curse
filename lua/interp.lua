@@ -645,14 +645,37 @@ eval = function(sh, e)
     -- the b.s==nil guard excludes that case and falls through to arith_resolve.
     local b = sh.vars[sh:deref(e.name)]
     if b and b.n ~= nil and b.s == nil and not b.arr then return b.n end
-    return arith_resolve(sh, sh:get(e.name))
+    local v = sh:get(e.name)
+    -- `$name` (dollar): bash substitutes the value's TEXT into the arithmetic and
+    -- re-parses, so a value with a binary operator re-associates with the surrounding
+    -- ops (`x='1 + 2'; $(( $x * 3 ))` is `1 + 2 * 3` = 7, not (eval x)*3 = 9). A plain
+    -- NUMBER binds like an atom (native == textual — the common hot-loop `$i`), so only a
+    -- non-numeric $name value needs the textual path, signalled up to the xpand wrapper.
+    if e.dollar and not looks_numeric(v) then error({ __arith_textual = true }) end
+    return arith_resolve(sh, v)
   end
   if k == "param" then return rt.str_to_i64(sh:param(e.n)) end
   if k == "xpand" then -- deferred: expansions inside $(( )) resolved at runtime
+    -- Fast path when the raw only uses $name/${…}/$digit (no $(…)/`…`/$*/glued name):
+    -- parse it ONCE as a native tree and eval that, so a hot `(( $i < n ))` doesn't
+    -- expand-and-reparse per iteration. Fall back to bash's textual substitution
+    -- (expand the raw, re-parse the result) only when a value isn't a simple operand.
+    if e.fast == nil then
+      e.fast = not (e.raw:find("%$%(") or e.raw:find("`") or e.raw:find("%$[^%w_{]")
+        or e.raw:find("[%w_]%$") or e.raw:find("}[%w_#]"))
+    end
+    if e.fast then
+      e.native = e.native or P.arith(e.raw, true)
+      local ok, r = pcall(eval, sh, e.native)
+      if ok then return r end
+      if not (type(r) == "table" and r.__arith_textual) then error(r) end
+    end
     return eval(sh, P.arith(expand_word(sh, P.parse_word(e.raw)), true))
   end
-  if k == "xpandleaf" then -- an opaque ${…} operand: expand it, arith-resolve the value
-    return arith_resolve(sh, expand_word(sh, P.parse_word(e.raw)))
+  if k == "xpandleaf" then -- an opaque ${…} operand: expand it; a non-numeric value must
+    local v = expand_word(sh, P.parse_word(e.raw)) -- take bash's textual substitution path
+    if not looks_numeric(v) then error({ __arith_textual = true }) end
+    return arith_resolve(sh, v)
   end
   if k == "comma" then eval(sh, e.l); return eval(sh, e.r) end
   if k == "un" then
