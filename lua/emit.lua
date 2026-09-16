@@ -402,7 +402,6 @@ local function errchk(st) -- the guard statement for `st`, or "" when errexit ne
 end
 EF.has_debug = false -- program installs a DEBUG trap → fire it before each command
 EF.funcstack = false -- program reads $FUNCNAME → maintain sh.funcstack around calls
-EF.underscore = false -- program reads $_ → set it to each command's last arg
 EF.pipestatus = false -- program reads $PIPESTATUS → set it (=(status)) after each simple cmd
 EF.has_trap = false -- program installs any trap → a forked `&`/pipeline child must reset caught signal traps
 local emit_redir_funcs = {} -- funcs with a definition redirect (`f(){…} >&2`): delegate them + their calls
@@ -734,7 +733,7 @@ end
 -- program reads $_ and the last word is a single field (word_safe — re-evaluating it
 -- is side-effect-free; a split/cmdsub last arg is left alone). Empty string for no words.
 local function und(st, lifted)
-  if not (EF.underscore and st.words) then return "" end
+  if not st.words then return "" end -- $_ is maintained after every command (bash), like exec_simple's path
   local last = st.words[#st.words]
   if last and not word_safe(last) then return "" end -- split/cmdsub last arg: skip (rare)
   local v = last and emit_word(last, lifted) or '""'
@@ -1646,7 +1645,7 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
         if fl and fl:find("~", 1, true) then return ("rt.tilde_assign(sh, %q)"):format(fl) end
         return emit_word(st.rhs, lifted)
       end
-      local ua = EF.underscore and '; sh:set_str("_", "")' or "" -- a bare assignment resets $_ (bash)
+      local ua = '; sh:set_str("_", "")' -- a bare assignment resets $_ (bash)
       if st.arith then
         -- x=$((…)): a non-lifted read honors set -u and resolves recursively (bash),
         -- exactly as the $(())-in-word and (( )) paths do — swap in arith_read.
@@ -2429,7 +2428,6 @@ function M.emit(ast)
   EF.has_err = scan_trap(ast.stmts, { ERR = 1 }) -- gate compiled ERR-trap firing
   EF.has_debug = scan_trap(ast.stmts, { DEBUG = 1 }) -- gate compiled DEBUG-trap firing
   EF.funcstack = reads_debugstack(ast.stmts) -- gate FUNCNAME/BASH_SOURCE/BASH_LINENO stacks
-  EF.underscore = reads_var(ast.stmts, "_") -- gate $_ (last-arg) maintenance
   EF.pipestatus = reads_var(ast.stmts, "PIPESTATUS") -- gate $PIPESTATUS after simple cmds
   EF.has_trap = scan_any_trap(ast.stmts) -- gate compiled `&`/pipeline (forked child resets signal traps)
   local funcflags, inlinable, inlinefns = {}, {}, {}
