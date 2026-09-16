@@ -151,9 +151,25 @@ local function read_split(ifs, line, nvars)
       if j <= n and isifs(j) then j = j + 1; while j <= n and isws(j) do j = j + 1 end end -- + one non-ws
       if j > n then out[v] = slice(s, fieldend) -- single field, delimiter stripped
       else
-        local last = n
-        while last >= s and isws(last) do last = last - 1 end -- trailing IFS ws only
-        out[v] = slice(s, last)
+        -- bash's strip_trailing_ifs_whitespace (subst.c) runs on the RAW remainder,
+        -- CTLESC (\1) markers and all: scan back while the byte is IFS whitespace, OR
+        -- it's a \1 whose FOLLOWING byte is space/tab/nl — never removing the first
+        -- byte. That strips a \1's escaped space while orphaning the bare \1, so a lone
+        -- \001 leaks into the value (read.def bug; builtin-read "read bash bug"). Mirror
+        -- it byte-for-byte by re-encoding cells[s..n] and dequoting only afterward.
+        local raw = {}
+        for k = s, n do raw[#raw + 1] = cells[k].esc and ("\1" .. cells[k].ch) or cells[k].ch end
+        raw = table.concat(raw)
+        local S = #raw
+        local function sptn(c) return c == " " or c == "\t" or c == "\n" end
+        while S > 1 and (wsset[raw:sub(S, S)] or (raw:sub(S, S) == "\1" and sptn(raw:sub(S + 1, S + 1)))) do S = S - 1 end
+        raw = raw:sub(1, S)
+        local o, k2 = {}, 1 -- dequote: \1 escapes the next byte; a trailing lone \1 stays
+        while k2 <= #raw do
+          if raw:sub(k2, k2) == "\1" and k2 < #raw then o[#o + 1] = raw:sub(k2 + 1, k2 + 1); k2 = k2 + 2
+          else o[#o + 1] = raw:sub(k2, k2); k2 = k2 + 1 end
+        end
+        out[v] = table.concat(o)
       end
     else
       local s = i
