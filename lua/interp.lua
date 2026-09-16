@@ -969,29 +969,9 @@ end
 
 -- Expand a word to a single string (assignment RHS, case subject, arith index —
 -- contexts that do NOT word-split).
--- Tilde expansion on a word-initial unquoted literal: ~ / ~/… -> $HOME, ~+ -> PWD,
--- ~- -> OLDPWD, ~user/… -> that user's home (getpwnam), else the text is literal.
-tilde_prefix = function(sh, s)
-  if s:sub(1, 1) ~= "~" then return s end
-  local r = s:sub(2)
-  -- The tilde-prefix login name ends at the first `/` OR `:` (bash: `~:~` -> the
-  -- bare `~` expands, `:~` stays; `~root:x` -> /root:x). So `:` terminates the ~/
-  -- ~+/~-/~user forms just like `/` does.
-  local c1 = r:sub(1, 1)
-  if r == "" or c1 == "/" or c1 == ":" then -- ~ / ~/… / ~:… : HOME's value if SET (even ""); else literal
-    if sh.vars[sh:deref("HOME")] ~= nil then return sh:get("HOME") .. r end
-    return s
-  end
-  if r == "+" or r:sub(1, 2) == "+/" or r:sub(1, 2) == "+:" then return sh:pwd() .. r:sub(2) end
-  if r == "-" or r:sub(1, 2) == "-/" or r:sub(1, 2) == "-:" then local o = sh:get("OLDPWD"); return o ~= "" and (o .. r:sub(2)) or s end
-  -- ~user / ~user/… : the named user's home directory (unknown user stays literal)
-  local user, tail = r:match("^([^/:]+)(.*)$")
-  if user then
-    local pw = rt.pw_by_name(user)
-    if pw and pw.dir ~= "" then return pw.dir .. tail end
-  end
-  return s
-end
+-- Tilde expansion lives in runtime.lua (pure runtime: HOME/PWD/OLDPWD + passwd db).
+-- interp aliases it locally; both tiers share the runtime version.
+tilde_prefix = rt.tilde_prefix
 M.tilde_prefix = tilde_prefix
 
 -- Canonicalize an absolute path string LOGICALLY: resolve `.`/`..` textually,
@@ -1007,24 +987,10 @@ local function logical_canon(path)
   return "/" .. table.concat(parts, "/")
 end
 
--- In an assignment RHS (x=…, x+=…, [k]=…) bash tilde-expands not just the word
--- start but every segment following an unquoted ':' (the PATH=~/a:~/b idiom).
-local function tilde_assign(sh, s)
-  if not s:find("~", 1, true) then return s end -- fast path: nothing to expand
-  local segs = {}
-  for seg in (s .. ":"):gmatch("([^:]*):") do segs[#segs + 1] = tilde_prefix(sh, seg) end
-  return table.concat(segs, ":")
-end
-
--- Word-initial unquoted-literal tilde. bash also tilde-expands a word shaped like
--- `NAME=value` (a valid identifier before `=`) as if it were an assignment RHS —
--- at the value start and after each `:` — even for a plain command argument
--- (`echo x=~`). Otherwise only a leading `~` expands.
-local function tilde_word_initial(sh, s)
-  local pre, rest = s:match("^([%a_][%w_]*%+?=)(.*)$")
-  if pre then return pre .. tilde_assign(sh, rest) end
-  return tilde_prefix(sh, s)
-end
+-- Assignment-RHS and word-initial tilde expansion also live in runtime.lua; interp
+-- aliases them locally so its expansion paths and M.* exports keep working.
+local tilde_assign = rt.tilde_assign
+local tilde_word_initial = rt.tilde_word_initial
 M.tilde_word_initial = tilde_word_initial -- the compiled tier tilde-expands word-initial literals
 M.tilde_assign = tilde_assign -- compiled tier tilde-expands each `:`-segment of an assignment RHS
 

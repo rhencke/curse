@@ -615,7 +615,7 @@ local function emit_word(w, lifted)
       -- ($HOME/getpwnam/$PWD, each `:`-segment after NAME=). Only a genuine LITERAL ~
       -- triggers — a tilde from a variable's value never expands (bash), and this part
       -- is a literal, so no over-expansion. ~ mid-word (not after NAME=) stays literal.
-      parts[#parts + 1] = ("I.tilde_word_initial(sh, %q)"):format(p.lit)
+      parts[#parts + 1] = ("rt.tilde_word_initial(sh, %q)"):format(p.lit)
     elseif p.lit then parts[#parts + 1] = ("%q"):format(p.lit)
     elseif p.raw then parts[#parts + 1] = p.raw -- pre-computed Lua string expr (inlined param)
     elseif p.var then
@@ -1560,7 +1560,7 @@ local function build_cfg(stmts, lifted, funcflags, inlinefns, toplevel)
       -- Only literal tildes expand — a ~ from a variable's value never does.
       local function rhsval()
         local fl = unq_full_lit(st.rhs)
-        if fl and fl:find("~", 1, true) then return ("I.tilde_assign(sh, %q)"):format(fl) end
+        if fl and fl:find("~", 1, true) then return ("rt.tilde_assign(sh, %q)"):format(fl) end
         return emit_word(st.rhs, lifted)
       end
       local ua = emit_underscore and '; sh:set_str("_", "")' or "" -- a bare assignment resets $_ (bash)
@@ -1792,7 +1792,7 @@ local function build_cfg(stmts, lifted, funcflags, inlinefns, toplevel)
           if not empty_word(aw) then
             local av = emit_word(aw, lifted)
             local fl = unq_full_lit(aw)
-            if fl and fl:find("~", 1, true) then av = ("I.tilde_word_initial(sh, %q)"):format(fl) end
+            if fl and fl:find("~", 1, true) then av = ("rt.tilde_word_initial(sh, %q)"):format(fl) end
             ls[#ls + 1] = ("sh:localAssign(%s)"):format(av)
           end
         end
