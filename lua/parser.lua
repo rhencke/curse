@@ -1792,7 +1792,22 @@ local function make_parser(src, sh)
               elems[#elems + 1] = { key = nil, op = "=", word = parse_word(rhs) }
             end
           else
-            elems[#elems + 1] = { key = keyraw, op = eop, word = parse_word(rhs) }
+            -- KEYED element. bash brace-expands the value only for an INDEXED array,
+            -- where a multi-word expansion also DE-KEYS it (`a=([k]=-{a,b}-)` ->
+            -- [0]="[k]=-a-" [1]="[k]=-b-"); an ASSOCIATIVE array keeps it keyed and
+            -- literal (`declare -A a; a=([k]=-{a,b}-)` -> a[k]="-{a,b}-"). The array
+            -- type isn't known until runtime, so precompute the brace-expanded BARE
+            -- words of the whole token and let do_arrayassign pick (indexed -> bare).
+            local elem = { key = keyraw, op = eop, word = parse_word(rhs) }
+            local factors = brace_factors(w)
+            if factors then
+              elem.brace_bare = {}
+              stream_factors(factors, function(x)
+                elem.brace_bare[#elem.brace_bare + 1] = parse_word(x)
+                return #elem.brace_bare >= BRACE_CAP
+              end)
+            end
+            elems[#elems + 1] = elem
           end
         end
       end

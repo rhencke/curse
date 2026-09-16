@@ -1797,11 +1797,16 @@ local function do_arrayassign(sh, st)
   for _, e in ipairs(st.elems) do if e.key ~= nil then anykeyed = true; break end end
   local items = {}
   for _, e in ipairs(st.elems) do
-    if e.key ~= nil then -- keyed RHS is a single value (no field splitting)
+    if e.key ~= nil and not (e.brace_bare and not isassoc) then
+      -- keyed: an associative array (always keyed), or an indexed key with no brace.
       items[#items + 1] = { key = e.key, op = e.op, val = expand_assign_word(sh, e.word) }
-    else -- bare element: unquoted expansions split into multiple elements
-      for _, f in ipairs(expand_to_fields(sh, e.word)) do
-        items[#items + 1] = { key = nil, op = "=", val = f }
+    else
+      -- bare: a genuine bare element, OR an indexed keyed element whose value
+      -- brace-expands (bash de-keys it — `[k]=` becomes literal in each bare word).
+      for _, bw in ipairs(e.brace_bare or { e.word }) do
+        for _, f in ipairs(expand_to_fields(sh, bw)) do
+          items[#items + 1] = { key = nil, op = "=", val = f }
+        end
       end
     end
   end
