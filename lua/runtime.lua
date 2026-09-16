@@ -828,6 +828,18 @@ end
 -- forks for full subshell isolation; otherwise the (provably pure) body runs
 -- in-process for speed. This is the "known at compile time -> compile it" path;
 -- emit falls back to capture_src for bodies it can't compile (the tiered path).
+-- $(< file) / `< file`: bash reads the file's contents (a faster $(cat file)) — a pure
+-- read, no fork. NUL bytes stripped, trailing newlines stripped, status 0; a missing
+-- file is status 1 + diagnostic. The compiled tier calls this with the expanded path.
+function Shell:capture_file(path)
+  local f = path ~= "" and io.open(path, "r")
+  if f then
+    local c = f:read("*a") or ""; f:close(); self.status = 0
+    return (c:gsub("%z", ""):gsub("\n+$", ""))
+  end
+  io.stderr:write("curse: " .. path .. ": No such file or directory\n"); self.status = 1; return ""
+end
+
 function Shell:capture_compiled(cs_fn, mustfork, backtick)
   if mustfork then
     -- The forked child must inherit the $() isolation: errexit is NOT inherited into a

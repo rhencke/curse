@@ -521,7 +521,7 @@ end
 -- Forward-declared here (build_cfg/assemble are defined far below); emit_frags
 -- collects the assembled fragments, emit_frag_ctx carries the analysis context, and
 -- emit_frag_n is the id counter. All reset per M.emit.
-local build_cfg, assemble
+local build_cfg, assemble, emit_word
 local emit_frags, emit_frag_ctx, emit_frag_n
 
 local emit_value
@@ -627,10 +627,18 @@ local function compile_cmdsub(src, backtick, lifted)
   -- A syntax error inside $(…) is fatal to the containing command (bash, status 2);
   -- capture_src reproduces that exactly, so route any parse_error body there.
   for _, st in ipairs(ast.stmts) do if st.t == "parse_error" then return fallback end end
-  if #ast.stmts == 1 then -- $(< file): a special read, not a command — keep the runtime path
+  if #ast.stmts == 1 then -- $(< file): read the file's contents (a special, not a command)
     local st = ast.stmts[1]
     if st.t == "simple" and (not st.words or #st.words == 0)
-        and st.redirs and #st.redirs == 1 and st.redirs[1].op == "in" then return fallback end
+        and st.redirs and #st.redirs == 1 and st.redirs[1].op == "in" then
+      -- compile the path word and read the file directly — no interp
+      local wok, pw = pcall(require("parser").parse_word, st.redirs[1].target or "")
+      if wok then
+        local eok, pathexpr = pcall(emit_word, pw, lifted)
+        if eok then return ("sh:capture_file(%s)"):format(pathexpr) end
+      end
+      return fallback
+    end
   end
   local saved_tl = emit_toplevel
   local bok, cfg = pcall(build_cfg, ast.stmts, {}, emit_frag_ctx.funcflags, emit_frag_ctx.inlinefns, false)
@@ -646,7 +654,7 @@ local function compile_cmdsub(src, backtick, lifted)
   return call
 end
 
-local function emit_word(w, lifted)
+emit_word = function(w, lifted)
   local parts = {}
   for i, p in ipairs(w.parts) do
     if i == 1 and p.lit and not p.q and (p.lit:sub(1, 1) == "~"
