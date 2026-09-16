@@ -2956,6 +2956,8 @@ exec_stmt = function(sh, st, hook)
     -- A slot whose arith failed to parse (`i='3'`) was deferred: bash reports the
     -- error at RUNTIME and runs the loop zero (or partial) iterations, non-fatally.
     local function ev(node)
+      sh.cur_line = st.line -- $LINENO inside the for(( init/cond/step is the `for` line (bash),
+                            -- not whatever line the body last ran (the cond re-evals per iteration)
       if node.k == "arith_perr" then
         io.stderr:write("curse: " .. (node.raw:match("^%s*(.-)%s*$")) .. ": syntax error in expression\n")
         error({ __curse_exit = 1, __curse_experr = true })

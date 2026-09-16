@@ -616,6 +616,14 @@ end
 local COMPILE_UNSAFE_VAR = {}
 for _, n in ipairs({ "_", "LINENO", "SECONDS", "FUNCNAME", "BASH_SOURCE", "BASH_LINENO",
   "BASH_COMMAND", "RANDOM", "SRANDOM" }) do COMPILE_UNSAFE_VAR[n] = true end
+-- Same, but for a value read as an ARITH var node (`for (( i < LINENO ))`, `(( RANDOM ))`):
+-- the CFG can't reproduce it, so a forc/whilec arith touching one must delegate to interp.
+local function arith_reads_unsafe(e)
+  if type(e) ~= "table" then return false end
+  if e.k == "var" and COMPILE_UNSAFE_VAR[e.name] then return true end
+  return arith_reads_unsafe(e.e) or arith_reads_unsafe(e.l) or arith_reads_unsafe(e.r)
+    or arith_reads_unsafe(e.c) or arith_reads_unsafe(e.a) or arith_reads_unsafe(e.b)
+end
 
 -- A [[ ]] operand word the compiled tier can render to its exact value: emit_word-able
 -- and free of a dynamic special var whose value the CFG doesn't reproduce ($LINENO/$_…).
@@ -1768,8 +1776,9 @@ local function build_cfg(stmts, lifted, funcflags, inlinefns, toplevel)
       if st.redirs then return delegate(st, after) end -- redirs on the loop: interp applies them
       if hard_cf(st.body) then return delegate(st, after) end -- un-static break/continue
       if not_compilable(st.init) or not_compilable(st.cond) or not_compilable(st.step)
-          or arith_side_effect(st.cond) then -- a side-effecting cond can't be an emit_bool expr
-        return delegate(st, after)
+          or arith_side_effect(st.cond) -- a side-effecting cond can't be an emit_bool expr
+          or arith_reads_unsafe(st.init) or arith_reads_unsafe(st.cond) or arith_reads_unsafe(st.step) then
+        return delegate(st, after) -- $LINENO/$RANDOM/… in the arith: interp reproduces the value
       end
       local condp = newpc(); loopPc[st.id] = condp
       local stepp = newpc()
