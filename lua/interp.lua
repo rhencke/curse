@@ -1677,7 +1677,7 @@ local BUILTIN_LAZY = {
   mapfile = "b_mapfile", readarray = "b_mapfile",
   cd = "b_cd", unset = "b_unset", set = "b_set",
   export = "b_export", declare = "b_export", typeset = "b_export", readonly = "b_export",
-  eval='b_eval', source='b_source', ['.']='b_source', wait='b_wait', fc='b_fc', bind='b_bind', shopt='b_shopt', let='b_let', kill='b_kill', pushd='b_pushd', popd='b_pushd', dirs='b_pushd', builtin='b_builtin', pwd='b_pwd', shift='b_shift', ['local']='b_local',
+  eval='b_eval', source='b_source', ['.']='b_source', wait='b_wait', fc='b_fc', bind='b_bind', shopt='b_shopt', let='b_let', kill='b_kill', pushd='b_pushd', popd='b_pushd', dirs='b_pushd', builtin='b_builtin', pwd='b_pwd', shift='b_shift', ['local']='b_local', help='b_help',
 }
 local BUILTINS = {
   echo = 1, [":"] = 1, ["true"] = 1, ["false"] = 1, ["["] = 1, test = 1, ["return"] = 1,
@@ -1687,7 +1687,7 @@ local BUILTINS = {
   exec = 1, readonly = 1, umask = 1, alias = 1, unalias = 1, shopt = 1, wait = 1, trap = 1,
   mapfile = 1, readarray = 1, compgen = 1, complete = 1, compopt = 1,
   pushd = 1, popd = 1, dirs = 1, builtin = 1, kill = 1, ulimit = 1, jobs = 1,
-  history = 1, fc = 1, hash = 1, ["let"] = 1, times = 1, bind = 1,
+  history = 1, fc = 1, hash = 1, ["let"] = 1, times = 1, bind = 1, help = 1,
 }
 M.BUILTINS = BUILTINS -- exposed so the compiled backend delegates the same set
 local KEYWORDS = {

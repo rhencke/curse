@@ -26,7 +26,7 @@ local lazy_mods = { "b_echo", "b_completion",
   "b_ulimit", "b_times", "b_alias", "b_unalias", "b_umask", "b_getopts", "b_hash",
   "b_history", "b_jobs", "b_trap", "b_type", "b_printf", "b_read", "b_mapfile", "b_export", "b_cd", "b_unset", "b_set",
   "b_eval", "b_source", "b_wait", "b_fc", "b_bind", "b_shopt", "b_let", "b_kill",
-  "b_pushd", "b_builtin", "b_pwd", "b_shift", "b_local" }
+  "b_pushd", "b_builtin", "b_pwd", "b_shift", "b_local", "b_help" }
 
 -- Wrap each core module's source in a package.preload closure. `require("x")` then
 -- resolves from memory with no file I/O and no parse. Registration is lazy, so
