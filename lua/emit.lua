@@ -260,12 +260,45 @@ end
 
 -- Arith with a side effect (assignment / ++ / --) can't sit in a Lua expression
 -- position, so a word containing one must be run by the interpreter, not compiled.
+-- Dynamic special vars whose VALUE the compiled tier doesn't reproduce (the CFG doesn't
+-- track the current line or maintain $_ / the call stack): a read must delegate so the
+-- interpreter computes it. (Defined here so xpand_fast can reject them; also gates word
+-- reads below.)
+local COMPILE_UNSAFE_VAR = {}
+for _, n in ipairs({ "_", "LINENO", "SECONDS", "FUNCNAME", "BASH_SOURCE", "BASH_LINENO",
+  "BASH_COMMAND", "RANDOM", "SRANDOM" }) do COMPILE_UNSAFE_VAR[n] = true end
+-- A deferred xpand whose raw uses ONLY $name/$digit expansions (no ${…}, $(…), `…`,
+-- $*/$@/… specials, or a glued name$): the CFG CAN compile it — parse the raw as a
+-- native tree, read each $name like a var, and guard non-lifted operands (see emit_value).
+local function xpand_fast(raw)
+  if raw:find("%$%(") or raw:find("`") or raw:find("%${")
+    or raw:find("%$[^%w_]") or raw:find("[%w_]%$") or raw:find("}[%w_#]") then return false end
+  -- a special whose value the CFG can't reproduce ($LINENO/$RANDOM/$_/…): delegate to interp
+  for nm in raw:gmatch("%$([%a_][%w_]*)") do if COMPILE_UNSAFE_VAR[nm] then return false end end
+  return true
+end
+-- Split a native arith tree's unique $name operands into NON-lifted (nl — need a
+-- run-time numeric guard) and LIFTED (lf — i64 locals, always numeric). On the textual
+-- fallback the lifted operands must be flushed to sh first, else the interpreter reads a
+-- stale sh value (the authoritative value is the native local) — an infinite loop.
+local function xpand_split(e, lifted, nl, lf, seen)
+  if type(e) ~= "table" then return end
+  if e.k == "var" and e.dollar and not e.idx and not seen[e.name] then
+    seen[e.name] = true
+    if lifted[e.name] then lf[#lf + 1] = e.name else nl[#nl + 1] = e.name end
+  end
+  xpand_split(e.e, lifted, nl, lf, seen); xpand_split(e.l, lifted, nl, lf, seen)
+  xpand_split(e.r, lifted, nl, lf, seen); xpand_split(e.c, lifted, nl, lf, seen)
+  xpand_split(e.a, lifted, nl, lf, seen); xpand_split(e.b, lifted, nl, lf, seen)
+end
 local function arith_side_effect(e)
   if type(e) ~= "table" then return false end
   if e.k == "asgn" or e.k == "post" or e.k == "pre" then return true end
-  -- xpand (embedded $-expansion), comma, and array-subscripted operands aren't
-  -- compiled natively — treat like a side effect so the word/stmt delegates.
-  if e.k == "xpand" or e.k == "xpandleaf" or e.k == "comma" or e.idx then return true end
+  -- xpandleaf (${…}), comma, and array-subscripted operands aren't compiled natively —
+  -- treat like a side effect so the word/stmt delegates. A FAST xpand ($name only) IS
+  -- compiled (emit_value renders it), so it isn't a side effect.
+  if e.k == "xpandleaf" or e.k == "comma" or e.idx then return true end
+  if e.k == "xpand" then return not xpand_fast(e.raw) end
   return arith_side_effect(e.e) or arith_side_effect(e.l) or arith_side_effect(e.r)
     or arith_side_effect(e.c) or arith_side_effect(e.a) or arith_side_effect(e.b)
 end
@@ -277,7 +310,8 @@ local function not_compilable(e)
   -- arith_perr = a deferred arith PARSE error (`(( i = '3' ))`): only the interpreter
   -- renders it (prints bash's "syntax error in expression" + aborts the line), so the
   -- enclosing loop/statement must delegate — else emit_value throws an uncaught error.
-  if e.k == "xpand" or e.k == "xpandleaf" or e.k == "comma" or e.k == "arith_perr" or e.idx then return true end
+  if e.k == "xpandleaf" or e.k == "comma" or e.k == "arith_perr" or e.idx then return true end
+  if e.k == "xpand" then return not xpand_fast(e.raw) end -- a fast $name xpand compiles
   return not_compilable(e.e) or not_compilable(e.l) or not_compilable(e.r)
     or not_compilable(e.c) or not_compilable(e.a) or not_compilable(e.b)
 end
@@ -491,6 +525,30 @@ emit_value = function(e, lifted)
   if k == "raw" then return e.code end -- a pre-computed Lua expr (inlined param binding)
   if k == "var" then return lifted[e.name] and lname(e.name) or (arith_varread):format(e.name) end
   if k == "param" then return ("rt.str_to_i64(sh:param(%d))"):format(e.n) end
+  if k == "xpand" then
+    -- $name/$digit arithmetic: bash substitutes each value's TEXT and re-parses, which
+    -- agrees with reading the operand natively WHEN the value is a plain number (a number
+    -- binds like an atom). Lifted operands are i64 locals — always numeric — so a hot
+    -- `(( $i < n ))` compiles to pure native code. A NON-lifted $name is guarded: if its
+    -- value isn't numeric, bash re-associates operators, so fall back to the interpreter's
+    -- textual substitution (I.arith_textual). Only reached for a fast xpand (not_compilable).
+    local ok, native = pcall(require("parser").arith, e.raw, true)
+    if not ok then return ("I.arith_textual(sh, %q)"):format(e.raw) end
+    local nl, lf = {}, {}
+    xpand_split(native, lifted, nl, lf, {})
+    local nat = emit_value(native, lifted)
+    if #nl == 0 then return nat end -- every $-operand is a lifted i64: pure native
+    local conds = {}
+    for _, nm in ipairs(nl) do conds[#conds + 1] = ("I.arith_isnum(sh,%q)"):format(nm) end
+    local fb -- fallback: flush any lifted operands to sh, then bash's textual substitution
+    if #lf == 0 then fb = ("I.arith_textual(sh,%q)"):format(e.raw)
+    else
+      local syncs = {}
+      for _, nm in ipairs(lf) do syncs[#syncs + 1] = ("sh:aset(%q,%s)"):format(nm, lname(nm)) end
+      fb = ("(function() %s; return I.arith_textual(sh,%q) end)()"):format(table.concat(syncs, "; "), e.raw)
+    end
+    return ("((%s) and (%s) or %s)"):format(table.concat(conds, " and "), nat, fb)
+  end
   if k == "un" then
     if e.op == "-" then return "(-(" .. emit_value(e.e, lifted) .. "))" end
     if e.op == "!" then return "((" .. emit_value(e.e, lifted) .. ") == 0LL and 1LL or 0LL)" end
@@ -608,14 +666,7 @@ end
 -- word is an all-literal unquoted glob (no split — a literal is never word-split —
 -- just glob: `*.txt`). Returns {expr, split} for rt.field_split, else nil. Mixed
 -- literal+expansion (`dir/$x*`) needs the per-char quote mask → interp (delegate).
--- Dynamic special vars whose VALUE the compiled tier doesn't reproduce (it doesn't
--- track the current line or maintain $_ / the call stack): a word referencing one
--- must delegate so the interpreter computes it. `_` and `LINENO` are the tested
--- ones; the rest depend on execution state the CFG doesn't thread. (When $LINENO is
--- inlined as a compile-time literal and $_ is tracked natively, drop them here.)
-local COMPILE_UNSAFE_VAR = {}
-for _, n in ipairs({ "_", "LINENO", "SECONDS", "FUNCNAME", "BASH_SOURCE", "BASH_LINENO",
-  "BASH_COMMAND", "RANDOM", "SRANDOM" }) do COMPILE_UNSAFE_VAR[n] = true end
+-- (COMPILE_UNSAFE_VAR is defined earlier, near xpand_fast, so it can gate xpand too.)
 -- Same, but for a value read as an ARITH var node (`for (( i < LINENO ))`, `(( RANDOM ))`):
 -- the CFG can't reproduce it, so a forc/whilec arith touching one must delegate to interp.
 local function arith_reads_unsafe(e)
@@ -1803,14 +1854,12 @@ local function build_cfg(stmts, lifted, funcflags, inlinefns, toplevel)
         return delegate(st, after)
       end
       local arith = cond_arith(st.cond)
-      if arith and (not_compilable(arith) or arith_reads_unsafe(arith)) then
-        -- a `(( ))` condition with an embedded $-expansion ($i/${…}/$(…)) or an
-        -- unreproducible special ($LINENO/$RANDOM): delegate the WHOLE loop to interp.
-        -- Interp's hot loop is fully optimized (faster than bash), whereas the hybrid
-        -- "compiled loop + per-iteration interp condition" pays a crossing cost each pass.
+      if arith and arith_reads_unsafe(arith) then
+        -- a `(( ))` condition reading an unreproducible special ($LINENO/$RANDOM/…):
+        -- delegate the whole loop to interp, which reproduces the value.
         return delegate(st, after)
       end
-      if arith and not st.negate and not arith_side_effect(arith) then
+      if arith and not st.negate and not not_compilable(arith) and not arith_side_effect(arith) then
         -- fast path: a native arith condition `while (( expr ))` — no command run.
         local condp = newpc(); loopPc[st.id] = condp
         loopstack[#loopstack + 1] = { brk = after, cont = condp }

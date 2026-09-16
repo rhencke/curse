@@ -785,6 +785,20 @@ function M.arith_read(sh, name)
   error(v)
 end
 
+-- Compiled-tier helpers for `$name` arithmetic (the emit fast-xpand path):
+-- arith_isnum gates the native compiled expression — true when the var's value binds
+-- like an atom (a plain number, so native == bash's textual substitution). arith_textual
+-- is the fallback for a non-numeric value: expand the raw arithmetic and re-parse it,
+-- exactly as bash substitutes the value's TEXT (`x='1 + 2'; $(( $x*3 ))` -> 1 + 2 * 3).
+function M.arith_isnum(sh, name)
+  local s = sh.vars[sh:deref(name)]
+  if s and s.n ~= nil and s.s == nil and not s.arr then return true end -- i64-authoritative
+  return looks_numeric(sh:get(name)) ~= nil
+end
+function M.arith_textual(sh, raw)
+  return eval(sh, P.arith(expand_word(sh, P.parse_word(raw)), true))
+end
+
 -- An array subscript used in arithmetic: an associative array takes the
 -- evaluated-then-stringified value as its key ("5"), an indexed array a number.
 arith_key = function(sh, name, idxexpr, idxraw)
