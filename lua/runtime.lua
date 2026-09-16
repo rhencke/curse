@@ -867,6 +867,16 @@ local function str_to_i64(s)
 end
 M.str_to_i64 = str_to_i64
 
+-- `return [n]` status: no arg -> current $?; a numeric arg -> n mod 256; a
+-- non-numeric arg -> 2 + diagnostic (bash). A pure runtime primitive the compiled
+-- tier calls directly (no interp).
+function M.return_status(sh, value)
+  if value == nil then return sh.status end
+  local n = tonumber(value)
+  if not n then io.stderr:write("curse: return: " .. value .. ": numeric argument required\n"); return 2 end
+  return n % 256
+end
+
 -- Arithmetic numeric literal / value: like str_to_i64 but with bash arith bases —
 -- base#digits (2-64), 0x/0X hex, leading-0 octal. Used ONLY in arithmetic
 -- contexts ($(( )), arith var reads); `test` stays decimal (str_to_i64).

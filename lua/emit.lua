@@ -1526,7 +1526,7 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
       -- script (source runs through interp), so delegate and let interp diagnose.
       if toplevel then return delegate(st, after) end
       -- return [N] (incl. \return / builtin return / command return): set $? and exit
-      -- the CFG. I.return_status: N%256, or 2 + diagnostic on non-numeric; no arg → $?.
+      -- the CFG. rt.return_status: N%256, or 2 + diagnostic on non-numeric; no arg → $?.
       -- inside a subshell, `return` exits the subshell (subshell_exit) with the
       -- status; otherwise it exits the function/CFG at DONE.
       local retpc = subexit[#subexit] or DONE
@@ -1537,12 +1537,12 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
           local p = newpc(); blocks[p] = d .. ("pc = %d"):format(retpc); return p
         elseif word_safe(aw) then -- one field (literal/quoted): `return ""` → 2, `return 42` → 42
           local p = newpc()
-          blocks[p] = d .. ("sh.status = I.return_status(sh, %s); pc = %d"):format(emit_word(aw, lifted), retpc)
+          blocks[p] = d .. ("sh.status = rt.return_status(sh, %s); pc = %d"):format(emit_word(aw, lifted), retpc)
           return p
         elseif field_word(aw, lifted) then -- unquoted expansion: split — 0 fields → $?, else 1st field
           local fw = field_word(aw, lifted)
           local p = newpc()
-          blocks[p] = d .. ("do local __f = rt.field_split(sh, %s, %s); if #__f > 0 then sh.status = I.return_status(sh, __f[1]) end end; pc = %d")
+          blocks[p] = d .. ("do local __f = rt.field_split(sh, %s, %s); if #__f > 0 then sh.status = rt.return_status(sh, __f[1]) end end; pc = %d")
             :format(fw.expr, tostring(fw.split), retpc)
           return p
         end -- else (pexp/${…}): not intercepted — falls through (emit deopts to interp, which is correct)
@@ -1561,7 +1561,7 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
         if not aw then local p = newpc(); blocks[p] = d .. ("pc = %d"):format(exitp); return p
         elseif word_safe(aw) then
           local p = newpc()
-          blocks[p] = d .. ("sh.status = I.return_status(sh, %s); pc = %d"):format(emit_word(aw, lifted), exitp)
+          blocks[p] = d .. ("sh.status = rt.return_status(sh, %s); pc = %d"):format(emit_word(aw, lifted), exitp)
           return p
         end
       end -- dynamic/multi-arg: fall through to delegate

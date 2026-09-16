@@ -3415,14 +3415,8 @@ fire_err = function(sh)
 end
 M.fire_err_trap = fire_err_trap -- compiled tier fires ERR after a failing native command
 
--- Compiled `return N` status: N numeric → N % 256; non-numeric → 2 + diagnostic
--- (bash); the return still happens with that status (matching interp).
-function M.return_status(sh, value)
-  if value == nil then return sh.status end
-  local n = tonumber(value)
-  if not n then io.stderr:write("curse: return: " .. value .. ": numeric argument required\n"); return 2 end
-  return n % 256
-end
+-- (`return N` status is now rt.return_status — a pure runtime primitive the compiled
+-- tier calls directly.)
 
 -- Run any trapped real signals that arrived (blocked → pending) since the last
 -- check, in the current scope. Cheap no-op when no signal traps are set.
