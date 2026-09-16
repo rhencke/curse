@@ -1757,7 +1757,7 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
         exit = 1, ["return"] = 1, ["break"] = 1, ["continue"] = 1, exec = 1, wait = 1 }
       if cmd and st.assigns == nil and not redir_apply and not NATIVE_BUILTIN[cmd] and not isfunc
           and not EXEC_SIMPLE_SKIP[cmd] and require("interp").BUILTINS[cmd] then
-        local builder = field_argv(st.words, 1, lifted) -- from=1: argv[1] is the builtin name
+        local builder = field_argv(st.words, 1, lifted, "rt.cstr(%s)") -- argv entries are C strings (cut at NUL, like interp's expand_args)
         if builder then
           local p = newpc()
           local ec = errchk(st); local ecs = ec ~= "" and ("; " .. ec) or ""
@@ -1793,6 +1793,7 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
           else
             return delegate(st, after)
           end
+          wrap = wrap or "rt.cstr(%s)" -- argv entries are C strings: cut each at NUL (bash/interp)
           local builder = field_argv(st.words, from, lifted, wrap, prefix)
           if not builder then return delegate(st, after) end
           local p = newpc()
@@ -1863,7 +1864,9 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
       end
       local p = newpc()
       local args = {}
-      for j = 2, #st.words do if not empty_word(st.words[j]) then args[#args + 1] = emit_word(st.words[j], lifted) end end
+      -- argv entries are C strings: cut each at NUL (bash/interp expand_args), so
+      -- `echo $'a\0b'` / a function arg with a NUL match. Command name kept as-is.
+      for j = 2, #st.words do if not empty_word(st.words[j]) then args[#args + 1] = ("rt.cstr(%s)"):format(emit_word(st.words[j], lifted)) end end
       local body
       if cmd == "echo" then body = "sh:echo(" .. table.concat(args, ", ") .. ")"
       elseif cmd == ":" or cmd == "true" then body = "sh.status = 0"
@@ -1901,7 +1904,7 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
         end
       else -- external command — OR a function DEFINED AT RUNTIME (via source/eval).
         local allargs = {}
-        for j = 1, #st.words do if not empty_word(st.words[j]) then allargs[#allargs + 1] = emit_word(st.words[j], lifted) end end
+        for j = 1, #st.words do if not empty_word(st.words[j]) then allargs[#allargs + 1] = ("rt.cstr(%s)"):format(emit_word(st.words[j], lifted)) end end
         -- The name wasn't a funcdef at compile time, but source/eval can install one
         -- into sh.functions before this runs; bash resolves function → builtin →
         -- external, so check sh.functions at runtime and delegate to interp (which
