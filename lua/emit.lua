@@ -1660,6 +1660,32 @@ local function build_cfg(stmts, lifted, funcflags, inlinefns, toplevel)
         ["return"] = 1, test = 1, ["["] = 1 }
       local isfunc = (inlinefns and inlinefns[cmd]) or funcflags[cmd]
       if cmd == "return" and redir_apply then return delegate(st, after) end -- rare; wrapper assumes a run body
+      -- Simple interp-only builtins (printf/set/shopt/umask/type/read/getopts/…): build
+      -- argv with the shared field engine and dispatch through exec_simple — the command
+      -- RUNNER, not statement re-interpretation. EXCLUDED (they need exec_stmt's fuller
+      -- handling, compiled separately): assignment builtins whose `name=val` args must NOT
+      -- word-split (export/declare/readonly/local/typeset), code/control-flow builtins
+      -- (eval/source/./command/builtin/exit/return/break/continue). exec_stmt sets $_ to
+      -- the last arg; replicate that. Prefix-env (`x=v cmd`) keeps interp's tempenv binding.
+      -- `wait` needs interp's job-control context; a REDIRECTED builtin needs exec_stmt's
+      -- flush-and-check-write-error handling (a builtin that writes to a full disk must
+      -- return non-zero) — both still delegate.
+      local EXEC_SIMPLE_SKIP = { export = 1, declare = 1, readonly = 1, ["local"] = 1,
+        typeset = 1, eval = 1, source = 1, ["."] = 1, command = 1, builtin = 1,
+        exit = 1, ["return"] = 1, ["break"] = 1, ["continue"] = 1, exec = 1, wait = 1 }
+      if cmd and st.assigns == nil and not redir_apply and not NATIVE_BUILTIN[cmd] and not isfunc
+          and not EXEC_SIMPLE_SKIP[cmd] and require("interp").BUILTINS[cmd] then
+        local builder = field_argv(st.words, 1, lifted) -- from=1: argv[1] is the builtin name
+        if builder then
+          local p = newpc()
+          local ec = errchk(st); local ecs = ec ~= "" and ("; " .. ec) or ""
+          local d = dbg(st) -- DEBUG fires before the command and its expansions
+          local lastarg = "if #__a > 0 then sh:set_str('_', __a[#__a]) end" -- $_ = last arg (bash)
+          blocks[p] = d .. builder .. "; I.exec_simple(sh, __a, __noop); " .. lastarg .. ecs ..
+            ("; pc = %d"):format(after)
+          return p
+        end
+      end
       -- FIELD-ENGINE path: an argument word-splits or globs, so argv is variable
       -- length. Commands with a STATIC dispatch (echo, test/[, a named external, a
       -- non-inline function) consume it via rt.field_split on natively-computed
