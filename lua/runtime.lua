@@ -894,6 +894,93 @@ function Shell:run_background(cmd_fn, cmdstr)
   self.status = 0
 end
 
+-- `a | b | c`: fork a child per stage wired by pipes, running each COMPILED stage
+-- fragment; the last stage's exit is the pipeline's (or the rightmost non-zero under
+-- pipefail). The last stage's stdout goes to fd 1, or the capture buffer inside $(…),
+-- or runs in the current shell under `shopt -s lastpipe`. Sets $PIPESTATUS and applies
+-- `!` negation. Compiled tier only (gated by emit to no trap/DEBUG/ERR — so no signal
+-- reset or per-stage trap firing is needed here). `stage_fns` are cs_N fragments.
+function Shell:run_pipeline(stage_fns, negate)
+  local nst = #stage_fns
+  if nst == 1 then -- defensive: a single stage (emit delegates `! cmd` for exact errexit)
+    stage_fns[1](self)
+  else
+    io.flush() -- flush parent stdio so forked stages don't duplicate buffered output
+    local lastpipe = self.shopt.lastpipe and not self.opt_i and nst >= 2
+    local pids, prev_read, inline_status = {}, -1, nil
+    for k = 1, nst do
+      local rd, wr = -1, -1
+      if k < nst then local p = ffi.new("int[2]"); C.pipe(p); rd, wr = p[0], p[1] end
+      if k == nst and lastpipe then -- last stage runs in the current shell (side effects persist)
+        local save0 = C.dup(0)
+        if prev_read >= 0 then C.dup2(prev_read, 0); C.close(prev_read); prev_read = -1 end
+        local savedout = self.out; self.out = io.write
+        local ok, err = pcall(stage_fns[k], self)
+        io.flush(); self.out = savedout; C.dup2(save0, 0); C.close(save0)
+        if not ok and type(err) == "table" then self.status = err.__curse_exit or err.__curse_return or self.status
+        elseif not ok then error(err) end
+        inline_status = self.status or 0; pids[k] = -1
+      elseif k == nst and self.capturing then -- inside $(…): drain last stage into the capture buffer
+        local cp = ffi.new("int[2]"); C.pipe(cp)
+        local pid = C.fork()
+        if pid == 0 then
+          self.in_pipestage = (self.in_pipestage or 0) + 1
+          local ok, err = pcall(function()
+            if prev_read >= 0 then C.dup2(prev_read, 0); C.close(prev_read) end
+            C.dup2(cp[1], 1); C.close(cp[1]); C.close(cp[0])
+            self.out = io.write
+            stage_fns[k](self)
+          end)
+          M.child_status(self, ok, err)
+          io.flush(); C._exit(self.status or 0)
+        end
+        pids[k] = pid
+        if prev_read >= 0 then C.close(prev_read); prev_read = -1 end
+        C.close(cp[1])
+        local chunks, rbuf = {}, ffi.new("char[65536]")
+        while true do
+          local n = tonumber(C.read(cp[0], rbuf, 65536))
+          if n <= 0 then break end
+          chunks[#chunks + 1] = ffi.string(rbuf, n)
+        end
+        C.close(cp[0]); self.out(table.concat(chunks))
+      else
+        local pid = C.fork()
+        if pid == 0 then
+          self.in_pipestage = (self.in_pipestage or 0) + 1
+          local ok, err = pcall(function()
+            if prev_read >= 0 then C.dup2(prev_read, 0); C.close(prev_read) end
+            if wr >= 0 then C.dup2(wr, 1); C.close(wr) end
+            if rd >= 0 then C.close(rd) end
+            self.out = io.write
+            stage_fns[k](self)
+          end)
+          M.child_status(self, ok, err)
+          io.flush(); C._exit(self.status or 0)
+        end
+        pids[k] = pid
+        if prev_read >= 0 then C.close(prev_read) end
+        if wr >= 0 then C.close(wr) end
+        prev_read = rd
+      end
+    end
+    if prev_read >= 0 then C.close(prev_read) end
+    local stbuf = ffi.new("int[1]")
+    local last, pipe, pstat = 0, 0, {}
+    for k = 1, nst do
+      local est
+      if pids[k] == -1 then est = inline_status or 0 -- ran inline (lastpipe)
+      else C.waitpid(pids[k], stbuf, 0); est = M.wexit(stbuf[0]) end
+      pstat[k] = tostring(est)
+      if k == nst then last = est end
+      if est ~= 0 then pipe = est end -- rightmost non-zero (pipefail)
+    end
+    self:array_assign("PIPESTATUS", pstat, false)
+    self.status = self.opt_pipefail and pipe or last
+  end
+  if negate then self.status = (self.status == 0) and 1 or 0 end
+end
+
 -- A variable box holds a string value and/or a cached int64. An arithmetic
 -- write stores only the int64 (s = nil) and defers stringification until a
 -- string context reads it — this is the per-iteration allocation curse's JS

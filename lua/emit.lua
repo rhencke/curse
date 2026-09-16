@@ -390,7 +390,10 @@ local emit_toplevel = false -- current build_cfg is the top level (ERR only fire
 -- compiled function body doesn't track calldepth so it would wrongly fire ERR — bash needs
 -- errtrace for that. Subshell bodies live in the top-level CFG but fire_err_trap's runtime
 -- in_subprogram check keeps ERR from firing in the forked child.)
+local emit_neg_ctx = false -- building a `!`-inverted command's fragment: its own errexit is exempt
+                           -- (bash), but a called function's internal errexit still fires (fn_x, built separately)
 local function errchk(st) -- the guard statement for `st`, or "" when errexit never applies
+  if emit_neg_ctx then return "" end -- direct command of a `!`-inverted pipeline: errexit-exempt
   if not (st and ERREXIT_TYPES[st.t] and not st.negate) then return "" end
   if EF.has_err then -- ERR trap fires on the same condition as errexit; set $LINENO to this
     -- command's line, fire ERR (fire_err_trap scopes by calldepth/in_subprogram — inside a
@@ -641,10 +644,14 @@ end
 -- Compile `stmts` into an inline fragment closure cs_N (reads sh directly, lift set
 -- {}) and return its id, or nil if the body hits a compiler gap. Shared by $(…),
 -- background, and pipeline stages — the compiled tier's "run this subprogram" unit.
-local function emit_fragment(stmts)
-  local saved_tl = emit_toplevel
-  local bok, cfg = pcall(build_cfg, stmts, {}, emit_frag_ctx.funcflags, emit_frag_ctx.inlinefns, false)
-  emit_toplevel = saved_tl
+local function emit_fragment(stmts, neg)
+  local saved_tl, saved_neg = emit_toplevel, emit_neg_ctx
+  if neg then emit_neg_ctx = true end -- `! cmd`: exempt its own errexit (see errchk)
+  -- a `!`-inverted command must NOT inline a called function (its body keeps its own
+  -- errexit, checked in fn_x — which is built separately, unaffected by emit_neg_ctx).
+  local inlfns = neg and {} or emit_frag_ctx.inlinefns
+  local bok, cfg = pcall(build_cfg, stmts, {}, emit_frag_ctx.funcflags, inlfns, false)
+  emit_toplevel, emit_neg_ctx = saved_tl, saved_neg
   if not bok then return nil end
   emit_frag_n = emit_frag_n + 1
   emit_frags[#emit_frags + 1] = assemble(cfg, ("cs_%d = function(sh)"):format(emit_frag_n), {})
@@ -1490,7 +1497,7 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
 
   -- Statement types with no native compiled form yet -> always delegate.
   local DELEGATE = {
-    pipeline = 1, parse_error = 1, assignlist = 1,
+    parse_error = 1, assignlist = 1,
   }
 
   -- Compile one redirect's target to a native Lua expr (op + fd are already
@@ -2190,6 +2197,35 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
       -- body inline (redirs on the group still delegate; break/continue flow natively).
       if st.redirs then return delegate(st, after) end
       return flatten_list(st.body, after)
+    elseif t == "pipeline" then
+      -- a | b | c: compile each stage to a fragment and let the runtime orchestrate the
+      -- fork/pipe/wait/PIPESTATUS, running the COMPILED stages — not exec_stmt. Gated to
+      -- no trap/DEBUG/ERR (a forked stage otherwise resets signal traps / re-fires
+      -- per-stage traps — interp-side). Flush lifted before (stages read sh) and reload
+      -- after (a lastpipe last stage runs in-process and may write).
+      if EF.has_trap or EF.has_debug or EF.has_err then return delegate(st, after) end
+      local n = #st.cmds
+      local frags = {}
+      for i = 1, n do
+        -- nst==1 is `! cmd` (a single negated command run in the current shell): compile
+        -- it as a negated fragment so its OWN errexit is exempt (bash), while a called
+        -- function's internal errexit still fires (fn_x). Real pipe stages (n>=2) fork,
+        -- so they compile normally (a stage's errexit just exits its own child).
+        local id = emit_fragment({ st.cmds[i] }, n == 1 and st.negate)
+        if not id then return delegate(st, after) end
+        frags[i] = "cs_" .. id
+      end
+      local reload = {}
+      for nm in pairs(lifted) do reload[#reload + 1] = ("%s = sh:aget(%q)"):format(lname(nm), nm) end
+      local post = #reload > 0 and ("; " .. table.concat(reload, "; ")) or ""
+      local p = newpc()
+      -- errexit/ERR are exempt for a `!`-inverted pipeline (bash: the -e setting is
+      -- ignored when the return value is inverted with !), regardless of the negated status.
+      local ec = st.negate and "" or errchk(st); local ecs = ec ~= "" and ("; " .. ec) or ""
+      blocks[p] = dbg(st) .. lifted_flush(lifted)
+        .. ("sh:run_pipeline({%s}, %s)"):format(table.concat(frags, ", "), st.negate and "true" or "false")
+        .. post .. ecs .. ("; pc = %d"):format(after)
+      return p
     elseif t == "background" then
       -- cmd & : fork, run the COMPILED command in the child; the parent records $! + the
       -- job and continues with status 0. Reuses the fragment mechanism (the child is a
