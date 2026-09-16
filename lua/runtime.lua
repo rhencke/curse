@@ -668,8 +668,12 @@ end
 -- gets FULL subshell isolation for free (vars, set-flags, fds, cwd, umask, traps,
 -- functions, $BASHPID) exactly like bash — which manual in-process save/restore
 -- can't reliably do. Output is captured through a pipe, like the subshell path.
-function Shell:capture_forked(ast)
-  local I = require("interp")
+-- `runner(self)` executes the body (default: interpret `ast.stmts`); the compiled
+-- tier passes a runner that runs a compiled cmdsub fragment instead.
+function Shell:capture_forked(ast, runner)
+  runner = runner or function(self)
+    return require("interp").exec_list(self, ast.stmts, function() end, true)
+  end
   io.flush()
   local pfd = ffi.new("int[2]")
   if C.pipe(pfd) ~= 0 then return nil end -- caller falls back to in-process
@@ -678,7 +682,7 @@ function Shell:capture_forked(ast)
     C.close(pfd[0]); C.dup2(pfd[1], 1); C.close(pfd[1])
     self.out = io.write
     self.in_subprogram = (self.in_subprogram or 0) + 1
-    local ok, err = pcall(I.exec_list, self, ast.stmts, function() end, true)
+    local ok, err = pcall(runner, self)
     if not ok and type(err) == "table" and (err.__curse_exit or err.__curse_return) then
       self.status = err.__curse_exit or err.__curse_return
     end
@@ -770,14 +774,26 @@ function Shell:capture_src(src, backtick)
     local out = self:capture_forked(ast)
     if out ~= nil then return out end
   end
+  -- Run via exec_list (NOT interp.run): an `exit`/`return` inside $() ends only
+  -- the sub (sets its status), and the parent's EXIT trap must NOT fire here.
+  return self:capture_inproc(backtick, function(self)
+    return require("interp").exec_list(self, ast.stmts, function() end, true)
+  end)
+end
+
+-- Run a cmdsub body IN-PROCESS with full $(...) isolation: output buffered into a
+-- string, ERR trap suppressed (in_subprogram), errexit not inherited, and
+-- LINENO/aliases/loopdepth saved & restored. `runner(self)` executes the body —
+-- the interp path passes exec_list, the compiled path a compiled fragment. Errors
+-- follow bash: a syntax error is fatal to the containing command (contained for
+-- backticks), and exit/return set the sub's status.
+function Shell:capture_inproc(backtick, runner)
   local buf = {}
   local saved = self.out
   self.out = function(x) buf[#buf + 1] = x end
   local saved_cap = self.capturing; self.capturing = true -- last pipeline stage drains into buf
   self.in_subprogram = (self.in_subprogram or 0) + 1 -- $(...) is a subprogram: ERR trap suppressed
   local saved_ld = self.loopdepth; self.loopdepth = 0 -- break/continue don't cross into $(...)
-  -- errexit is NOT inherited into a command sub (unless inherit_errexit): a failing
-  -- middle command doesn't abort — only the cmdsub's final status propagates out.
   local savede = self.opt_e
   if not (self.shopt and self.shopt.inherit_errexit) then self.opt_e = false end
   local saved_line = self.cur_line -- $LINENO: the sub's internal lines don't leak out
@@ -785,9 +801,7 @@ function Shell:capture_src(src, backtick)
   -- do not leak back out (bash). Give it an independent copy, restored after.
   local saved_aliases = self.aliases
   do local c = {}; for k, v in pairs(saved_aliases) do c[k] = v end; self.aliases = c end
-  -- Run via exec_list (NOT interp.run): an `exit`/`return` inside $() ends only
-  -- the sub (sets its status), and the parent's EXIT trap must NOT fire here.
-  local ok, err = pcall(I.exec_list, self, ast.stmts, function() end, true)
+  local ok, err = pcall(runner, self)
   self.aliases = saved_aliases -- discard aliases defined inside $()
   self.cur_line = saved_line
   self.opt_e = savede
@@ -806,6 +820,28 @@ function Shell:capture_src(src, backtick)
   self.last_cmdsub_status = self.status -- for a command whose argv is empty after expansion
   -- bash strips NUL bytes from command-substitution output ("ignored null byte")
   return (table.concat(buf):gsub("%z", ""):gsub("\n+$", ""))
+end
+
+-- Compiled-tier command substitution: run a compiled cmdsub fragment `cs_fn(sh)`
+-- (the inner program, compiled at emit time). `mustfork` — computed statically by
+-- emit: the body mutates shell state, calls a user function, or reads $BASHPID —
+-- forks for full subshell isolation; otherwise the (provably pure) body runs
+-- in-process for speed. This is the "known at compile time -> compile it" path;
+-- emit falls back to capture_src for bodies it can't compile (the tiered path).
+function Shell:capture_compiled(cs_fn, mustfork, backtick)
+  if mustfork then
+    -- The forked child must inherit the $() isolation: errexit is NOT inherited into a
+    -- command sub (unless inherit_errexit), and ERR is suppressed (in_subprogram). Set
+    -- these before the fork (the child copies them); restore in the parent after.
+    local savede = self.opt_e
+    if not (self.shopt and self.shopt.inherit_errexit) then self.opt_e = false end
+    self.in_subprogram = (self.in_subprogram or 0) + 1
+    local out = self:capture_forked(nil, cs_fn)
+    self.in_subprogram = self.in_subprogram - 1
+    self.opt_e = savede
+    if out ~= nil then return out end -- fork failed: fall through to in-process
+  end
+  return self:capture_inproc(backtick, cs_fn)
 end
 
 -- A variable box holds a string value and/or a cached int64. An arithmetic

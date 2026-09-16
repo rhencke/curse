@@ -515,6 +515,15 @@ local function hard_cf(stmts, in_cond)
   return false
 end
 
+-- Command-substitution fragment compilation (emit_word's `$(…)` path). A literal
+-- `$(cmd)` inner is KNOWN at this compile time, so it is COMPILED into an inline
+-- fragment closure (cs_N) sharing this module's fn_x/upvals — never interpreted.
+-- Forward-declared here (build_cfg/assemble are defined far below); emit_frags
+-- collects the assembled fragments, emit_frag_ctx carries the analysis context, and
+-- emit_frag_n is the id counter. All reset per M.emit.
+local build_cfg, assemble
+local emit_frags, emit_frag_ctx, emit_frag_n
+
 local emit_value
 emit_value = function(e, lifted)
   local k = e.k
@@ -605,6 +614,38 @@ local function emit_arith_stmt(e, lifted)
   error("emit: statement position not supported for arith node " .. tostring(e.k))
 end
 
+-- Compile a literal `$(cmd)` / backtick inner (KNOWN at this compile time) into an
+-- inline fragment closure cs_N and return the Lua expr that runs it capturing
+-- stdout. The fragment reads `sh` directly (lift set {}), so lifted operands are
+-- flushed to sh first. It runs in a FORKED child (correct capture for builtins AND
+-- externals). Falls back to sh:capture_src only for a genuine syntax error or the
+-- `$(< file)` special-read (whose runtime semantics live there).
+local function compile_cmdsub(src, backtick, lifted)
+  local fallback = ("sh:capture_src(%q%s)"):format(src, backtick and ", true" or "")
+  local pok, ast = pcall(require("parser").parse, src)
+  if not pok or type(ast) ~= "table" or ast.stmts == nil then return fallback end -- syntax error
+  -- A syntax error inside $(…) is fatal to the containing command (bash, status 2);
+  -- capture_src reproduces that exactly, so route any parse_error body there.
+  for _, st in ipairs(ast.stmts) do if st.t == "parse_error" then return fallback end end
+  if #ast.stmts == 1 then -- $(< file): a special read, not a command — keep the runtime path
+    local st = ast.stmts[1]
+    if st.t == "simple" and (not st.words or #st.words == 0)
+        and st.redirs and #st.redirs == 1 and st.redirs[1].op == "in" then return fallback end
+  end
+  local saved_tl = emit_toplevel
+  local bok, cfg = pcall(build_cfg, ast.stmts, {}, emit_frag_ctx.funcflags, emit_frag_ctx.inlinefns, false)
+  emit_toplevel = saved_tl
+  if not bok then return fallback end -- compiler gap (curse-nocompile): to be closed upstream
+  emit_frag_n = emit_frag_n + 1
+  local id = emit_frag_n
+  emit_frags[#emit_frags + 1] = assemble(cfg, ("cs_%d = function(sh)"):format(id), {})
+  local call = ("sh:capture_compiled(cs_%d, true, %s)"):format(id, backtick and "true" or "false")
+  local flush = {}
+  for n in pairs(lifted) do flush[#flush + 1] = ("sh:aset(%q, %s)"):format(n, lname(n)) end
+  if #flush > 0 then return ("(function() %s; return %s end)()"):format(table.concat(flush, "; "), call) end
+  return call
+end
+
 local function emit_word(w, lifted)
   local parts = {}
   for i, p in ipairs(w.parts) do
@@ -636,8 +677,8 @@ local function emit_word(w, lifted)
       local saved = arith_varread; arith_varread = "I.arith_read(sh, %q)" -- name/expr values re-parse as arith
       parts[#parts + 1] = "rt.i64_to_str(" .. emit_value(safe_arith(p.arith), lifted) .. ")"
       arith_varread = saved
-    elseif p.cmdsub then -- $( … ): run the inner program capturing stdout (interpreted; I/O-bound)
-      parts[#parts + 1] = ("sh:capture_src(%q%s)"):format(p.cmdsub, p.backtick and ", true" or "")
+    elseif p.cmdsub then -- $( … ): COMPILE the inner (known at compile time) and run it captured
+      parts[#parts + 1] = compile_cmdsub(p.cmdsub, p.backtick, lifted)
     elseif p.pexp then
       if not pexp_compilable(p.pexp) then error("curse-nocompile: ${..} operator") end -- interp handles it
       parts[#parts + 1] = pexp_scalar(p.pexp, lifted)
@@ -1316,7 +1357,7 @@ end
 -- and every function body. `funcflags[name]` marks user functions (out-of-line
 -- call), `inlinefns[name]` gives the body of an inlinable one (spliced in place).
 -- Returns { blocks, npc, entry, loopPc, stmtPc, DONE }.
-local function build_cfg(stmts, lifted, funcflags, inlinefns, toplevel)
+build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
   emit_toplevel = toplevel and true or false -- gates top-level-only ERR firing (see errchk)
   local blocks = {}
   local loopPc, stmtPc = {}, {}
@@ -2217,7 +2258,7 @@ end
 -- fast in hot loops). opts.upvals: lifted vars declared at module level (shared
 -- as upvalues with functions) — seeded/written-back but not re-declared. Both are
 -- seeded from `sh` on entry and written back on exit (run() only).
-local function assemble(cfg, sig, opts)
+assemble = function(cfg, sig, opts)
   opts = opts or {}
   local o = { sig }
   -- register compiled function closures into sh.functions so the interpreter
@@ -2320,6 +2361,7 @@ local function scan_alias(stmts)
   return false
 end
 function M.emit(ast)
+  emit_frags, emit_frag_n = {}, 0 -- compiled `$(…)` fragments (cs_N closures) collected during build
   if scan_alias(ast.stmts) then error("curse-nocompile: alias expansion needs line-at-a-time parse") end
   emit_has_attr = scan_attr(ast.stmts) -- gate compiled attribute-aware scalar assign
   emit_local_unsafe = scan_local_unsafe(ast.stmts) -- readonly/set-a present → delegate `local`
@@ -2390,6 +2432,8 @@ function M.emit(ast)
   table.sort(upvals); table.sort(runlocals)
   local upset = {}; for _, n in ipairs(upvals) do upset[n] = true end
 
+  emit_frag_ctx = { funcflags = funcflags, inlinefns = inlinefns } -- context for compile_cmdsub's build_cfg
+
   local o = { 'local rt = require("runtime")', 'local I = require("interp")',
     'local bit = require("bit")', 'local __noop = function() end' }
   if #upvals > 0 then
@@ -2399,24 +2443,30 @@ function M.emit(ast)
   end
   local decls = {}
   for name in pairs(funcflags) do decls[#decls + 1] = fnlname(name) end
-  if #decls > 0 then o[#o + 1] = "local " .. table.concat(decls, ", ") end
+  -- fn_x bodies (build_cfg may register compiled `$(…)` fragments as a side effect, so
+  -- assemble them into a buffer and splice after the forward-declaration line below).
+  local fndefs = {}
   for _, st in ipairs(ast.stmts) do
     if st.t == "funcdef" then
       -- keep every fn_x (indirect/dynamic dispatch); it can't see run-locals, so
       -- it lifts only the shared upvalues and is sh-direct for the rest.
       local cfg = build_cfg(st.body, upset, funcflags, inlinefns)
-      o[#o + 1] = assemble(cfg, fnlname(st.name) .. " = function(sh)", {})
+      fndefs[#fndefs + 1] = assemble(cfg, fnlname(st.name) .. " = function(sh)", {})
     end
   end
-  local funcnames = {}
-  for name in pairs(funcflags) do funcnames[#funcnames + 1] = name end
-  table.sort(funcnames)
   local funcsrc, funcline = {}, {} -- name -> verbatim definition text / def line (top-level funcdefs)
   for _, st in ipairs(ast.stmts) do
     if st.t == "funcdef" and st.deftext then funcsrc[st.name] = require("interp").deparse_func(st.name, st.body) or st.deftext end
     if st.t == "funcdef" and st.line then funcline[st.name] = st.line end -- declare -F under extdebug
   end
   local top = build_cfg(ast.stmts, lifted, funcflags, inlinefns, true)
+  -- Every compiled `$(…)` fragment is now registered (from fn_x bodies + the top level).
+  -- Forward-declare each cs_N alongside the fn_x names so run/fn_x/nested fragments can
+  -- close over them, then emit the fn_x and fragment definitions (order-independent).
+  for i = 1, emit_frag_n do decls[#decls + 1] = "cs_" .. i end
+  if #decls > 0 then o[#o + 1] = "local " .. table.concat(decls, ", ") end
+  for _, d in ipairs(fndefs) do o[#o + 1] = d end
+  for _, d in ipairs(emit_frags) do o[#o + 1] = d end
   o[#o + 1] = "local loopPc = " .. serialize(top.loopPc)
   o[#o + 1] = "local stmtPc = " .. serialize(top.stmtPc)
   o[#o + 1] = assemble(top, "local function run(sh, pc)",
