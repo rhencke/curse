@@ -28,10 +28,27 @@ LJ="$LJDIR/src"
 BOOT="$ROOT/.bench-lua/luajit"           # a working luajit to build the bundle with
 CCOPT="-O3 -march=native -fomit-frame-pointer"
 JOBS=$(nproc 2>/dev/null || echo 4)
-PGO=1; [ "${1:-}" = "--no-pgo" ] && PGO=0
+PGO=1; FRESH=0
+for a in "$@"; do case "$a" in --no-pgo) PGO=0;; --fresh) FRESH=1;;
+  *) echo "usage: build-luajit.sh [--no-pgo] [--fresh]" >&2; exit 2;; esac; done
+
+# Reproducible LuaJIT source = pristine upstream at a PINNED commit + curse's tracked
+# C-mods (patches/luajit/: curse.patch for luajit.c/lj_clib.c, lib_cursesys.c verbatim).
+# The gitignored .bench-lua/src/luajit checkout is REGENERATED from those, so the build
+# is reproducible on a bare machine (needs network for the one clone). --fresh forces it.
+PATCHDIR="$ROOT/patches/luajit"
+LJCOMMIT=$(cat "$PATCHDIR/LUAJIT_COMMIT")
+prepare_luajit() {
+  echo ">> preparing LuaJIT $LJCOMMIT + curse patches (into $LJDIR)"
+  rm -rf "$LJDIR"; mkdir -p "$(dirname "$LJDIR")"
+  git clone -q https://github.com/LuaJIT/LuaJIT.git "$LJDIR"
+  git -C "$LJDIR" checkout -q "$LJCOMMIT"
+  git -C "$LJDIR" apply "$PATCHDIR/curse.patch"
+  cp "$PATCHDIR/lib_cursesys.c" "$LJ/lib_cursesys.c"
+}
 
 [ -x "$BOOT" ] || { echo "need a bootstrap luajit at $BOOT" >&2; exit 1; }
-[ -d "$LJ" ]   || { echo "no luajit source tree at $LJ" >&2; exit 1; }
+{ [ "$FRESH" = 1 ] || [ ! -f "$LJ/lib_cursesys.c" ]; } && prepare_luajit
 
 # 1. The module bundle: bytecode file (for the dynamic binary) + C array (embed).
 echo ">> building bundle"
