@@ -793,10 +793,39 @@ local function emit_fields_into(tbl, w, lifted, wrap)
   if word_safe(w) or (fw and fw.scalar) then -- one field, no runtime split/glob
     return ("%s[#%s+1] = %s"):format(tbl, tbl, W(word_safe(w) and emit_word(w, lifted) or fw.expr))
   end
-  return ("do local __f = rt.field_split(sh, %s, %s); for __i=1,#__f do %s[#%s+1]=%s end end")
-    :format(fw.expr, tostring(fw.split), tbl, tbl, W("__f[__i]"))
+  if fw then
+    return ("do local __f = rt.field_split(sh, %s, %s); for __i=1,#__f do %s[#%s+1]=%s end end")
+      :format(fw.expr, tostring(fw.split), tbl, tbl, W("__f[__i]"))
+  end
+  -- Any other word (mixed literal+expansion `foo$x`, `i=$i`, `x$@y`, quoted glob…):
+  -- expand it with the SHARED field engine. Flush any LIFTED operand to sh first (a
+  -- native i64 local isn't visible there — command args only READ vars, so no reload).
+  -- This is a runtime call like rt.field_split; the statement's dispatch stays native.
+  local flush, seen = {}, {}
+  for _, p in ipairs(w.parts) do
+    if p.var and lifted[p.var] and not seen[p.var] then
+      seen[p.var] = true; flush[#flush + 1] = ("sh:aset(%q, %s)"):format(p.var, lname(p.var))
+    end
+  end
+  local pre = #flush > 0 and (table.concat(flush, "; ") .. "; ") or ""
+  return ("do %slocal __f = I.expand_to_fields(sh, %s); for __i=1,#__f do %s[#%s+1]=%s end end")
+    :format(pre, ser(w), tbl, tbl, W("__f[__i]"))
 end
 
+-- A word the shared field engine (I.expand_to_fields) can expand safely from the
+-- compiled path: no expansion that can RAISE a containable error (arith / command sub /
+-- ${…} operator like :? — those must delegate so exec_stmt contains the error and
+-- keeps $?=1 without aborting the line), no nameref (element-deref subtlety), and no
+-- CFG-unreproducible special ($LINENO/$_). Plain literal+var+param+$@/$* words qualify —
+-- exactly the mixed shapes (`foo$x`, `$x.txt`, `x$@y`) that field_word can't render.
+local function mixed_expandable(w, lifted)
+  if emit_has_nameref then return false end
+  for _, p in ipairs(w.parts) do
+    if p.arith or p.arithast or p.cmdsub or p.pexp or p.procsub then return false end
+    if p.var and COMPILE_UNSAFE_VAR[p.var] then return false end
+  end
+  return true
+end
 -- Build a `local __a = {...}` argv table for words[from..#words] (each field
 -- split+globbed), or nil if any word needs the interpreter. `wrap` is applied to
 -- each final field. Used for commands whose args word-split/glob.
@@ -805,7 +834,7 @@ local function field_argv(words, from, lifted, wrap, prefix)
   for j = from, #words do
     local w = words[j]
     if not empty_word(w) then -- an empty brace alternative ({X,,Y,}) adds no arg
-      if not word_safe(w) and not field_word(w, lifted) then return nil end
+      if not word_safe(w) and not field_word(w, lifted) and not mixed_expandable(w, lifted) then return nil end
       out[#out + 1] = emit_fields_into("__a", w, lifted, wrap)
     end
   end

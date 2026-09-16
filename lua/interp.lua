@@ -1542,6 +1542,7 @@ local function expand_to_fields(sh, w)
   end
   return out
 end
+M.expand_to_fields = expand_to_fields -- the compiled tier builds argv fields for a word AST
 
 local exec_list  -- forward
 
@@ -3344,7 +3345,25 @@ exec_stmt = function(sh, st, hook)
   end
 end
 
+M.exec_simple = exec_simple -- the compiled CFG dispatches a natively-built argv (builtins/externals)
 M.exec_stmt = exec_stmt -- exposed so the compiled CFG can delegate cold statements
+do local dlog = os.getenv("CURSE_COUNT_DELEG") -- instrumentation: log compiled->interp delegations
+  if dlog then
+    local raw = exec_stmt
+    M.exec_stmt = function(sh, st, hook)
+      local f = io.open(dlog, "a")
+      if f then
+        local tag = type(st) == "table" and st.t or tostring(st)
+        if type(st) == "table" and st.t == "simple" and st.words and st.words[1] then
+          local p1 = st.words[1].parts and st.words[1].parts[1]
+          tag = "simple:" .. (p1 and (p1.lit or (p1.var and "$"..p1.var) or (p1.pexp and "${}") or (p1.cmdsub and "$()") or "?") or "?")
+        end
+        f:write(tag .. "\n"); f:close()
+      end
+      return raw(sh, st, hook)
+    end
+  end
+end
 
 -- Run a trap handler string; preserves $LINENO (so an ERR/EXIT trap sees the
 -- failing command's line, not the handler's). Returns true if it called exit.
