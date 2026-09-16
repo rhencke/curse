@@ -1805,8 +1805,15 @@ local function do_arrayassign(sh, st)
       end
     end
   end
+  -- bash quirk (ASSOCIATIVE arrays only): inside a `=` (not `+=`) compound literal, a
+  -- `[k]+=v` element appends to the value a[k] had BEFORE the whole statement — NOT the
+  -- (cleared) value nor one set by an earlier element in the same literal. So snapshot
+  -- the old element map before clearing. INDEXED arrays instead append to the current
+  -- (post-clear) value, and `a+=(...)` keeps the normal "append to current" too.
+  local snap
   if not st.append then -- plain assignment resets the array (keep assoc-ness)
     local b = sh.vars[st.name]
+    if isassoc then snap = b and b.arr or nil end
     if not b then sh:array_assign(st.name, {}, false); b = sh.vars[st.name] end
     b.arr = {}; b.s = nil; b.n = nil; b.empty_decl = nil -- assigned now (even `a=()` -> shows =())
     if isassoc then b.order = {} end
@@ -1815,7 +1822,12 @@ local function do_arrayassign(sh, st)
     if anykeyed then -- keyed elements assigned; bare ones are an error in bash (skip)
       for _, it in ipairs(items) do
         if it.key ~= nil then
-          sh:array_set(st.name, array_key(sh, st.name, it.key), it.val, it.op == "+=")
+          local idx = array_key(sh, st.name, it.key)
+          if it.op == "+=" and not st.append then -- append to the pre-statement value (see snap)
+            sh:array_set(st.name, idx, (snap and snap[idx] or "") .. it.val, false)
+          else
+            sh:array_set(st.name, idx, it.val, it.op == "+=")
+          end
         end
       end
     else -- all-bare assoc: alternating key value pairs
@@ -1834,7 +1846,7 @@ local function do_arrayassign(sh, st)
     for _, it in ipairs(items) do
       if it.key ~= nil then
         local idx = array_key(sh, st.name, it.key)
-        sh:array_set(st.name, idx, it.val, it.op == "+=")
+        sh:array_set(st.name, idx, it.val, it.op == "+=") -- indexed += appends to CURRENT (unlike assoc)
         auto = idx + 1
       else
         sh:array_set(st.name, auto, it.val, false)
