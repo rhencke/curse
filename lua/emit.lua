@@ -2101,6 +2101,11 @@ local function build_cfg(stmts, lifted, funcflags, inlinefns, toplevel)
       blocks[p] = ("if sh.opt_e then pc = %d else local __pid = rt.subshell_fork(sh); if __pid == 0 then pc = %d else sh.status = rt.subshell_wait(__pid)%s; pc = %d end end")
         :format(delpc, bodyentry, ecs, after)
       return p
+    elseif t == "group" then
+      -- { list; }: not a subshell — just a sequence in the current shell. Flatten the
+      -- body inline (redirs on the group still delegate; break/continue flow natively).
+      if st.redirs then return delegate(st, after) end
+      return flatten_list(st.body, after)
     elseif t == "case" then
       -- case SUBJ in pat) body ;; … esac. Evaluate the subject once (native single string),
       -- then a chain of match blocks: each tests the subject against its clause's patterns
