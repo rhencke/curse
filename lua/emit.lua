@@ -2101,6 +2101,34 @@ local function build_cfg(stmts, lifted, funcflags, inlinefns, toplevel)
       blocks[p] = ("if sh.opt_e then pc = %d else local __pid = rt.subshell_fork(sh); if __pid == 0 then pc = %d else sh.status = rt.subshell_wait(__pid)%s; pc = %d end end")
         :format(delpc, bodyentry, ecs, after)
       return p
+    elseif t == "case" then
+      -- case SUBJ in pat) body ;; … esac. Evaluate the subject once (native single string),
+      -- then a chain of match blocks: each tests the subject against its clause's patterns
+      -- via the shared matcher (I.case_match — vars expand, quoted metachars literal,
+      -- nocasematch honored) and branches to the clause body or the next match. A body
+      -- flows to `after` (;;), the next body (;& = "fall"), or the next match (;;& = "test").
+      if st.redirs then return delegate(st, after) end -- redirs on the case: interp applies them
+      if not emitable_word(st.subject) then return delegate(st, after) end -- subject needs interp's expander
+      local sv = newloopvar()
+      local n = #st.clauses
+      local matchentry, bodyentry = {}, {}
+      for i = n, 1, -1 do -- back-to-front so forward targets (next body/match) already exist
+        local cl = st.clauses[i]
+        local btarget = (cl.term == "fall" and (i < n and bodyentry[i + 1] or after))
+          or (cl.term == "test" and (i < n and matchentry[i + 1] or after)) or after
+        bodyentry[i] = flatten_list(cl.body, btarget)
+        local nextmatch = (i < n) and matchentry[i + 1] or after
+        local pq = {}
+        for _, pat in ipairs(cl.pats) do pq[#pq + 1] = ("%q"):format(pat) end
+        local mp = newpc()
+        blocks[mp] = ("if I.case_match(sh, %s, {%s}) then pc = %d else pc = %d end")
+          :format(sv, table.concat(pq, ", "), bodyentry[i], nextmatch)
+        matchentry[i] = mp
+      end
+      local subjp = newpc()
+      blocks[subjp] = dbg(st) .. ("%s = %s; sh.status = 0; pc = %d")
+        :format(sv, emit_word(st.subject, lifted), n > 0 and matchentry[1] or after)
+      return subjp
     else
       return delegate(st, after) -- unknown/cold statement: run it via the interpreter
     end

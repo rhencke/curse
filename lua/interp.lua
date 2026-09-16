@@ -1105,6 +1105,16 @@ local function expand_escaped(sh, w, charclass)
 end
 -- glob PATTERN context (${v/pat/repl}, case, [[ == ]]): glob metacharacters.
 expand_pattern = function(sh, w) return expand_escaped(sh, w, "[%*%?%[%]\\%(%)%|%+%@%!]") end
+-- Does `subj` match any of the case-clause pattern strings? The compiled tier's case
+-- codegen dispatches clauses natively but matches through this shared helper (vars in
+-- a pattern expand; quoted metachars stay literal), honoring shopt nocasematch.
+function M.case_match(sh, subj, pats)
+  local ic = sh.shopt.nocasematch and true or nil
+  for _, pat in ipairs(pats) do
+    if rt.glob_match(subj, expand_pattern(sh, P.parse_word(pat)), ic) then return true end
+  end
+  return false
+end
 -- `=~` regex context: ERE metacharacters.
 local function expand_regex(sh, w) return expand_escaped(sh, w, "[%.%^%$%*%+%?%(%)%[%]%{%}%|\\]") end
 
