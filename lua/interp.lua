@@ -1914,6 +1914,22 @@ local function do_arrayassign(sh, st)
   if b and b.exported then C.unsetenv(st.name) end
 end
 M.do_arrayassign = do_arrayassign
+-- Whole `a=(…)` statement (readonly/index checks + error-contained assign + status/$_),
+-- so the compiled tier runs it as a runtime primitive instead of delegating to exec_stmt.
+function M.run_arrayassign(sh, st)
+  local rb = sh.vars[sh:deref(st.name)]
+  if st.index then
+    io.stderr:write("curse: " .. st.name .. "[" .. st.index .. "]: cannot assign list to array member\n"); sh.status = 1
+  elseif rb and rb.ro then
+    io.stderr:write("curse: " .. st.name .. ": readonly variable\n"); sh.status = 1
+  else
+    local aok, aerr = pcall(do_arrayassign, sh, st)
+    if aok then sh.status = 0; sh:set_str("_", "")
+    elseif type(aerr) == "table" and aerr.__curse_experr then
+      sh.status = 1; if sh.opt_e then error({ __curse_exit = 1 }) end
+    else error(aerr) end
+  end
+end
 
 -- Quote a value the way `declare -p` does: double-quoted with \ " $ ` escaped.
 local function decl_quote(s)

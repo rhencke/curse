@@ -1408,8 +1408,7 @@ local function build_cfg(stmts, lifted, funcflags, inlinefns, toplevel)
 
   -- Statement types with no native compiled form yet -> always delegate.
   local DELEGATE = {
-    pipeline = 1, case = 1, group = 1,
-    arrayassign = 1, parse_error = 1, assignlist = 1, background = 1,
+    pipeline = 1, parse_error = 1, assignlist = 1, background = 1,
   }
 
   -- Compile one redirect's target to a native Lua expr (op + fd are already
@@ -2106,6 +2105,21 @@ local function build_cfg(stmts, lifted, funcflags, inlinefns, toplevel)
       -- body inline (redirs on the group still delegate; break/continue flow natively).
       if st.redirs then return delegate(st, after) end
       return flatten_list(st.body, after)
+    elseif t == "arrayassign" then
+      -- a=(…): dispatch to the array-assign runtime primitive (readonly/index checks +
+      -- error-contained do_arrayassign + status/$_), NOT the exec_stmt tree-walker. Flush
+      -- lifted operands to sh first (an elem may read one) and reload after (a `$((b=…))`
+      -- elem may write one).
+      local sync, reload = {}, {}
+      for n in pairs(lifted) do sync[#sync + 1] = ("sh:aset(%q, %s)"):format(n, lname(n)) end
+      for n in pairs(lifted) do reload[#reload + 1] = ("%s = sh:aget(%q)"):format(lname(n), n) end
+      local p = newpc()
+      local ec = errchk(st); local ecs = ec ~= "" and ("; " .. ec) or ""
+      local pre = #sync > 0 and (table.concat(sync, "; ") .. "; ") or ""
+      local post = #reload > 0 and ("; " .. table.concat(reload, "; ")) or ""
+      blocks[p] = dbg(st) .. pre .. ("I.run_arrayassign(sh, %s)"):format(ser(st)) .. post .. ecs ..
+        ("; pc = %d"):format(after)
+      return p
     elseif t == "case" then
       -- case SUBJ in pat) body ;; … esac. Evaluate the subject once (native single string),
       -- then a chain of match blocks: each tests the subject against its clause's patterns
@@ -2113,7 +2127,10 @@ local function build_cfg(stmts, lifted, funcflags, inlinefns, toplevel)
       -- nocasematch honored) and branches to the clause body or the next match. A body
       -- flows to `after` (;;), the next body (;& = "fall"), or the next match (;;& = "test").
       if st.redirs then return delegate(st, after) end -- redirs on the case: interp applies them
-      if not emitable_word(st.subject) then return delegate(st, after) end -- subject needs interp's expander
+      -- Subject must be emittable AND free of a dynamic special var ($LINENO/$_/…) whose value
+      -- the CFG can't reproduce — those run on the interp tier (compile-eventually), else the
+      -- native subject would read a wrong LINENO/etc.
+      if not db_word_ok(st.subject) then return delegate(st, after) end
       local sv = newloopvar()
       local n = #st.clauses
       local matchentry, bodyentry = {}, {}
