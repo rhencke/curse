@@ -9,7 +9,13 @@
 --   luajit lua/build.lua [dist/curse.bc]
 -- CORE modules: needed by essentially any script, so embedded as nested closures
 -- that the single bundle chunk bcreads in one fast pass at startup.
-local mods = { "runtime", "parser", "emit", "interp", "tier", "cache", "repl" }
+-- `run` is lua/run.lua — the sh CLI entry (`-c CODE`, `script args`, `-i`, options).
+-- It's a script, not a return-module, so requiring it EXECUTES the shell (reading the
+-- global `arg` the static binary's luajit.c sets up) and os.exit()s. Bundling it lets
+-- the self-contained static binary BE /bin/sh: pmain, when invoked as a shell name,
+-- does require("run"). The dynamic dev binary loads run.lua as a file instead, so this
+-- preload entry just rides along unused there.
+local mods = { "runtime", "parser", "emit", "interp", "tier", "cache", "repl", "run" }
 
 -- FEATURE modules: embedded in the SAME unified bundle but bcread LAZILY — their
 -- bytecode rides along as a string constant (copied, not proto-parsed, at startup)

@@ -50,14 +50,16 @@ static void spawn_daemon(void) {
     _exit(127);
 }
 
-/* Fallback: run the script without the daemon. $CURSE_FALLBACK overrides the
- * program (default "dash" — a POSIX one-shot; a shipped curse would point this
- * at the standalone one-shot binary). argv is passed through unchanged. */
+/* No daemon reachable: run the script in curse ITSELF — the self-contained one-shot
+ * binary (a shell when invoked under a shell name). The goal is to REPLACE bash/dash,
+ * so we never defer to them; curse always runs its own scripts, warm or cold.
+ * $CURSE_FALLBACK overrides the curse binary path/name (default "curse"); argv is
+ * passed UNCHANGED, so argv[0]'s shell name (e.g. "sh") puts curse into shell mode. */
 static void fallback(char **argv) {
     const char *prog = getenv("CURSE_FALLBACK");
-    if (!prog || !*prog) prog = "dash";
+    if (!prog || !*prog) prog = "curse";
     execvp(prog, argv);
-    /* If even the fallback can't exec, mimic the shell's not-found status. */
+    /* If curse itself can't exec, mimic the shell's not-found status. */
     _exit(127);
 }
 

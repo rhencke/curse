@@ -93,7 +93,7 @@ local OMAP = { errexit = "opt_e", errtrace = "opt_errtrace", functrace = "opt_fu
 -- (bash run as `sh` goes posix). The wrapper/launcher forwards its $0 as
 -- CURSE_ARGV0; absent that, we default to bash. Drives \s (prompt) and, for a
 -- posix-named invocation, posix mode.
-local SHELLNAME = (os.getenv("CURSE_ARGV0") or "bash"):match("[^/]+$") or "bash"
+local SHELLNAME = (os.getenv("CURSE_ARGV0") or arg[0] or "bash"):match("[^/]+$") or "bash"
 local SH_IS_POSIX = SHELLNAME == "sh" or SHELLNAME == "dash" or SHELLNAME == "ash"
 local function apply(s)
   s.shellname = SHELLNAME
