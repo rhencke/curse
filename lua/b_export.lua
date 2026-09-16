@@ -228,7 +228,23 @@ return function(sh, cmd, args, hook, tcb)
             end
           end
         elseif a:find("[", 1, true) then -- name[subscript]=value : array-element form
-          local anm, sub, aop, aval = a:match("^([%a_][%w_]*)%[(.-)%](%+?=)(.*)$")
+          -- Find the MATCHING ] for the first [ (the subscript may itself contain a
+          -- `[...]`, e.g. `declare a[a[0]=1]=X`), not the first ] — then =/+= and value.
+          local anm, sub, aop, aval = nil, nil, nil, nil
+          local nm, rest = a:match("^([%a_][%w_]*)%[(.*)$")
+          if nm then
+            local depth, close = 1, nil
+            for j = 1, #rest do
+              local ch = rest:sub(j, j)
+              if ch == "[" then depth = depth + 1
+              elseif ch == "]" then depth = depth - 1; if depth == 0 then close = j; break end end
+            end
+            if close then
+              local after = rest:sub(close + 1)
+              if after:sub(1, 2) == "+=" then anm, sub, aop, aval = nm, rest:sub(1, close - 1), "+=", after:sub(3)
+              elseif after:sub(1, 1) == "=" then anm, sub, aop, aval = nm, rest:sub(1, close - 1), "=", after:sub(2) end
+            end
+          end
           -- bash creates the element for declare/typeset/local, but NOT via a
           -- deferred `readonly a[i]=v` / `export a[i]=v` (those fail, status 1).
           if anm and (cmd == "declare" or cmd == "typeset") then
