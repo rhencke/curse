@@ -2811,18 +2811,23 @@ exec_stmt = function(sh, st, hook)
       -- scope); a consumed entry is skipped on restore.
       local base = #sh.tenv
       for _, a in ipairs(st.assigns) do
-        local b = sh.vars[a.name] -- COPY the box: exec_stmt mutates it in place
-        sh.vseq = sh.vseq + 1
-        sh.tenv[#sh.tenv + 1] = { name = a.name, env = os.getenv(a.name), consumed = false, seq = sh.vseq,
-          box = b and { s = b.s, n = b.n, arr = b.arr, assoc = b.assoc, order = b.order,
-                        exported = b.exported, ro = b.ro, ref = b.ref } or false }
-        if a.raw then -- NAME=(…) as a command prefix is a literal string, not an array (bash)
-          sh:set_str(a.name, a.raw); C.setenv(a.name, a.raw, 1)
+        if a.index then
+          -- An array-element assignment (`a[i]=v cmd`) is NOT a valid command-prefix
+          -- binding: bash prints "not a valid identifier" and does NOT apply it (the
+          -- command still runs, non-fatal). Skip it entirely — no tenv, no mutation.
+          io.stderr:write("curse: `" .. a.name .. "[" .. tostring(a.index) .. "]': not a valid identifier\n")
         else
-          sh.applying_prefix = true; exec_stmt(sh, a, hook); sh.applying_prefix = nil
-          -- An array-element prefix (`b[0]=2 cmd`) is a temporary assignment but is
-          -- NOT put in the command's environment (bash), unlike a scalar `x=v cmd`.
-          if not a.index then C.setenv(a.name, sh:get(a.name), 1) end
+          local b = sh.vars[a.name] -- COPY the box: exec_stmt mutates it in place
+          sh.vseq = sh.vseq + 1
+          sh.tenv[#sh.tenv + 1] = { name = a.name, env = os.getenv(a.name), consumed = false, seq = sh.vseq,
+            box = b and { s = b.s, n = b.n, arr = b.arr, assoc = b.assoc, order = b.order,
+                          exported = b.exported, ro = b.ro, ref = b.ref } or false }
+          if a.raw then -- NAME=(…) as a command prefix is a literal string, not an array (bash)
+            sh:set_str(a.name, a.raw); C.setenv(a.name, a.raw, 1)
+          else
+            sh.applying_prefix = true; exec_stmt(sh, a, hook); sh.applying_prefix = nil
+            C.setenv(a.name, sh:get(a.name), 1)
+          end
         end
       end
       -- mark these entries so a DIRECT function call (not `eval`/a builtin) can tag
