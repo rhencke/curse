@@ -1803,7 +1803,14 @@ local function build_cfg(stmts, lifted, funcflags, inlinefns, toplevel)
         return delegate(st, after)
       end
       local arith = cond_arith(st.cond)
-      if arith and not st.negate and not not_compilable(arith) and not arith_side_effect(arith) then
+      if arith and (not_compilable(arith) or arith_reads_unsafe(arith)) then
+        -- a `(( ))` condition with an embedded $-expansion ($i/${…}/$(…)) or an
+        -- unreproducible special ($LINENO/$RANDOM): delegate the WHOLE loop to interp.
+        -- Interp's hot loop is fully optimized (faster than bash), whereas the hybrid
+        -- "compiled loop + per-iteration interp condition" pays a crossing cost each pass.
+        return delegate(st, after)
+      end
+      if arith and not st.negate and not arith_side_effect(arith) then
         -- fast path: a native arith condition `while (( expr ))` — no command run.
         local condp = newpc(); loopPc[st.id] = condp
         loopstack[#loopstack + 1] = { brk = after, cont = condp }
