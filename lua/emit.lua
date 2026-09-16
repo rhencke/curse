@@ -579,7 +579,7 @@ local function emit_word(w, lifted)
       parts[#parts + 1] = "rt.i64_to_str(" .. emit_value(safe_arith(p.arith), lifted) .. ")"
       arith_varread = saved
     elseif p.cmdsub then -- $( … ): run the inner program capturing stdout (interpreted; I/O-bound)
-      parts[#parts + 1] = ("sh:capture_src(%q)"):format(p.cmdsub)
+      parts[#parts + 1] = ("sh:capture_src(%q%s)"):format(p.cmdsub, p.backtick and ", true" or "")
     elseif p.pexp then
       if not pexp_compilable(p.pexp) then error("curse-nocompile: ${..} operator") end -- interp handles it
       parts[#parts + 1] = pexp_scalar(p.pexp, lifted)

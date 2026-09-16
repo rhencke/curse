@@ -854,7 +854,7 @@ local function expand_part_str(sh, p, assign)
     end
     sh.procsub_files = sh.procsub_files or {}; sh.procsub_files[#sh.procsub_files + 1] = tmp
     return tmp
-  elseif p.cmdsub then return sh:capture_src(p.cmdsub)
+  elseif p.cmdsub then return sh:capture_src(p.cmdsub, p.backtick)
   elseif p.pexp then
     local pe = p.pexp
     if pe.op == "badsubst" then -- ${x|html} and other unrecognized ${…} forms

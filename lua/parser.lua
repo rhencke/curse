@@ -598,7 +598,7 @@ local function parse_dquote(inner, add, heredoc)
         if inner:sub(j, j) == "\\" and inner:sub(j + 1, j + 1):match("[`$\\\"]") then buf[#buf + 1] = inner:sub(j + 1, j + 1); j = j + 2
         else buf[#buf + 1] = inner:sub(j, j); j = j + 1 end
       end
-      add({ cmdsub = table.concat(buf), q = true }); i = j + 1
+      add({ cmdsub = table.concat(buf), q = true, backtick = true }); i = j + 1
     else
       local s, e = inner:find("^[^$\\`]+", i); add({ lit = inner:sub(s, e), q = true }); i = e + 1
     end
@@ -670,7 +670,7 @@ local function parse_word(w)
         if w:sub(j, j) == "\\" and w:sub(j + 1, j + 1):match("[`$\\]") then buf[#buf + 1] = w:sub(j + 1, j + 1); j = j + 2
         else buf[#buf + 1] = w:sub(j, j); j = j + 1 end
       end
-      add({ cmdsub = table.concat(buf), q = false }); i = j + 1
+      add({ cmdsub = table.concat(buf), q = false, backtick = true }); i = j + 1
     elseif (c == "<" or c == ">") and w:sub(i + 1, i + 1) == "(" then
       -- <(cmd) / >(cmd) process substitution: capture the balanced inner command.
       local j, d = i + 2, 1

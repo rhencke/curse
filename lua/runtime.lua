@@ -725,10 +725,19 @@ local function capture_pure(sh, st)
   return false -- if/while/for/case/subshell/group/funcdef/background/arithcmd: fork
 end
 
-function Shell:capture_src(src)
+function Shell:capture_src(src, backtick)
   local P = require("parser")
   local I = require("interp")
-  local ast = P.parse(src, self) -- self: $()/`` expand aliases from the live table
+  -- A SYNTAX error in the body: bash makes `$(…)` fatal to the whole containing
+  -- command, but a backtick `…` only PRINTS the error and yields "" (non-fatal —
+  -- `echo A``echo "``B` prints "AB" and exits 0). Backticks are parsed lazily at
+  -- expansion time, so a throw here (e.g. an unterminated quote) is contained.
+  local pok, parsed = pcall(P.parse, src, self) -- self: $()/`` expand aliases from the live table
+  if not pok then
+    if backtick then io.stderr:write("curse: command substitution: " .. tostring(parsed) .. "\n"); self.status = 1; return "" end
+    error(parsed)
+  end
+  local ast = parsed
   -- $(< file) / `< file`: bash reads the file's contents (a faster $(cat file)) —
   -- a pure read, no isolation needed, so keep it in-process.
   if #ast.stmts == 1 then
@@ -788,6 +797,7 @@ function Shell:capture_src(src)
   self.out = saved
   if not ok then
     if type(err) == "table" and err.__curse_parseerr then
+      if backtick then self.status = 1; return "" end -- backtick: contained (non-fatal)
       error(err) -- a SYNTAX error inside $(…) is fatal to the whole containing command (bash)
     elseif type(err) == "table" and (err.__curse_exit or err.__curse_return) then
       self.status = err.__curse_exit or err.__curse_return
