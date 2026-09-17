@@ -977,6 +977,9 @@ local function array_multi_op(pe)
   if not pe.op then return true end -- bare ${a[@]} / ${a[*]} (bare $@/$* is p.special, not here)
   if pe.op == "@" then return PEXP_AT[pe.arg] and true or false end -- ${a[@]@Q} … (not @a/@P)
   if pe.op == "sub" then return slice_args_ok(pe) end -- ${a[@]:off:len} slice
+  -- ${!a[@]} keys. The `*` (star) form has bash bug #627 (an empty-IFS join quirk that
+  -- rt.expand_fields does not replicate — the interp field engine does), so ${!a[*]} delegates.
+  if pe.op == "indices" then return pe.index == "@" and not pe.drop end
   return PEXP_STROP[pe.op] and pexp_literal_arg(pe.arg) and pexp_literal_arg(pe.arg2) or false
 end
 -- Lua expr for a compilable pexp's scalar string value (assumes pexp_compilable).
@@ -1088,7 +1091,9 @@ local function emit_seg(p, i, lifted)
     local elems = positional
       and (pe.op == "sub" and "sh:paramListSub()" or "sh:paramList()")
       or ("sh:array_values(%q)"):format(pe.name)
-    if pe.op == "sub" then -- ${a[@]:off:len} / ${@:off:len} slice: arith off/len, then select
+    if pe.op == "indices" then -- ${!a[@]}: the keys/indices, not the values
+      elems = ("rt.array_index_strs(sh, %q)"):format(pe.name)
+    elseif pe.op == "sub" then -- ${a[@]:off:len} / ${@:off:len} slice: arith off/len, then select
       local P = require("parser")
       local off = ("(rt.arith_int(sh, %s) or 0)"):format(emit_word(P.parse_word(pe.arg or ""), lifted))
       local len = pe.arg2 and ("(rt.arith_int(sh, %s) or 0)"):format(emit_word(P.parse_word(pe.arg2), lifted)) or "nil"

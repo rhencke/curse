@@ -3031,6 +3031,14 @@ function M.array_op_values(sh, els, op, arg, arg2)
   return out
 end
 
+-- ${!a[@]} / ${!a[*]}: the array's keys/indices as strings (a multi-element segment),
+-- exactly interp's multi_elems indices branch.
+function M.array_index_strs(sh, name)
+  local ix = sh:array_indices(name); local t = {}
+  for i = 1, #ix do t[i] = tostring(ix[i]) end
+  return t
+end
+
 -- ${a[@]:off:len} / ${a[*]:off:len} array slice for the compiled tier — replicates interp's
 -- multi_elems sub branch exactly. `els` is the fetched value list (dense, parallel to
 -- array_indices); off/len are already arith-evaluated (len nil = no length given). An
