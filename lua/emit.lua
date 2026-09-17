@@ -918,21 +918,24 @@ local PEXP_STROP = { ["#"] = 1, ["##"] = 1, ["%"] = 1, ["%%"] = 1,
 -- Q/K/k shell-quote, U/u/L case-fold, E ANSI-unescape. @P (prompt) and @a/@A (attributes)
 -- are NOT here — they need interp's expand_param — so they still delegate.
 local PEXP_AT = { Q = 1, K = 1, k = 1, U = 1, u = 1, L = 1, E = 1 }
--- Default/alternate ops. In a QUOTED context they compile to a scalar (pexp_scalar); an
--- UNQUOTED one still delegates (field_word rejects it) — the default word's own quoting
--- governs field-splitting there, which needs the interp word engine.
+-- Default/alternate ops. Quoted -> pexp_scalar; unquoted scalar -> field_word renders the
+-- pexp value and the outer field_split splits it (the default word's own quoting is gated
+-- out of the compilable set, so scalar-value + split == bash's field-wise default).
 local PEXP_DEFAULT = { [":-"] = 1, ["-"] = 1, [":+"] = 1, ["+"] = 1,
   [":="] = 1, ["="] = 1, [":?"] = 1, ["?"] = 1 }
+-- The default/alternate ops valid on an ARRAY/positional [@]/[*] (bash: := / = / :? / ? are
+-- not — `${a[@]:=x}` errors). These yield the value list or the default field-list.
+local ARRAY_DEFAULT = { [":-"] = 1, ["-"] = 1, [":+"] = 1, ["+"] = 1 }
 -- A pexp ARG is compile-time constant when it is plain literal glob text: no
 -- expansion ($ ` ~), no quote char (a quoted metachar is literal — different glob
 -- semantics), and no backslash (escapes a glob char, or is a literal in a
 -- replacement). Anything with those needs interp's word expansion, so it delegates.
 local function pexp_literal_arg(a) return a == nil or not a:find("[%$`~\\\"']") end
--- ${…:off:len} slice: off/len are arith expression words. Compilable when each is an
+-- The op's word arg(s) (a slice off/len, or a default word) are compilable when each is an
 -- emit_word-able word free of ~ \ ' " (so emit_word == interp's expand_word and the arith
--- eval runs on the identical expanded string). Shared by the scalar (pexp_compilable) and
--- array (array_multi_op) slice gates.
-local function slice_args_ok(pe)
+-- eval / field-split runs on the identical expanded string). Shared by the scalar
+-- (pexp_compilable) and array (array_multi_op) slice + default gates.
+local function pexp_word_args_ok(pe)
   local function wok(a)
     if a == nil then return true end
     if a:find("[~\\'\"]") then return false end
@@ -958,7 +961,7 @@ function pexp_compilable(pe)
     local ok, w = pcall(require("parser").parse_word, pe.arg or "")
     return ok and emitable_word(w) or false
   end
-  if pe.op == "sub" then return slice_args_ok(pe) end -- ${v:off:len} scalar substring
+  if pe.op == "sub" then return pexp_word_args_ok(pe) end -- ${v:off:len} scalar substring
   return PEXP_STROP[pe.op] and pexp_literal_arg(pe.arg) and pexp_literal_arg(pe.arg2) or false
 end
 -- ${a[@]OP} / ${a[*]OP}: a per-element string-op over the whole array, compiled by
@@ -976,7 +979,8 @@ local function array_multi_op(pe)
   if is_arr and (type(pe.name) ~= "string" or not pe.name:match("^[%a_][%w_]*$")) then return false end
   if not pe.op then return true end -- bare ${a[@]} / ${a[*]} (bare $@/$* is p.special, not here)
   if pe.op == "@" then return PEXP_AT[pe.arg] and true or false end -- ${a[@]@Q} … (not @a/@P)
-  if pe.op == "sub" then return slice_args_ok(pe) end -- ${a[@]:off:len} slice
+  if pe.op == "sub" then return pexp_word_args_ok(pe) end -- ${a[@]:off:len} slice
+  if ARRAY_DEFAULT[pe.op] then return pexp_word_args_ok(pe) end -- ${a[@]:-def}/-/:+/+
   -- ${!a[@]} keys. The `*` (star) form has bash bug #627 (an empty-IFS join quirk that
   -- rt.expand_fields does not replicate — the interp field engine does), so ${!a[*]} delegates.
   if pe.op == "indices" then return pe.index == "@" and not pe.drop end
@@ -1101,6 +1105,22 @@ local function emit_seg(p, i, lifted)
       local off = ("(rt.arith_int(sh, %s) or 0)"):format(emit_word(P.parse_word(pe.arg or ""), lifted))
       local len = pe.arg2 and ("(rt.arith_int(sh, %s) or 0)"):format(emit_word(P.parse_word(pe.arg2), lifted)) or "nil"
       elems = ("rt.array_slice_values(sh, %q, %s, %s, %s)"):format(pe.name, elems, off, len)
+    elseif ARRAY_DEFAULT[pe.op] then -- ${a[@]:-def}/-/:+/+ : the value list, or the default
+      -- as a SINGLE field (rt.expand_fields then splits/keeps it per the outer q, exactly
+      -- bash's field-wise default). null test grounded in bash string_list_dollar_at/_star:
+      -- [@]/unquoted-[*] join with a non-empty sep (== #els>1 or els[1] non-empty); quoted
+      -- [*] joins with IFS[0] (can be empty) -> rt.ifs_join_ne. -/+ test element count.
+      local P = require("parser")
+      local def = emit_word(P.parse_word(pe.arg or ""), lifted)
+      local ne = ((pe.index == "*" or pe.name == "*") and p.q)
+        and "rt.ifs_join_ne(sh, __e)"
+        or "(#__e > 1 or (__e[1] ~= nil and __e[1] ~= \"\"))"
+      local body
+      if pe.op == "-" then body = ("if #__e > 0 then return __e else return {%s} end"):format(def)
+      elseif pe.op == ":-" then body = ("if %s then return __e else return {%s} end"):format(ne, def)
+      elseif pe.op == "+" then body = ("if #__e > 0 then return {%s} else return {} end"):format(def)
+      else body = ("if %s then return {%s} else return {} end"):format(ne, def) end -- :+
+      elems = ("(function() local __e = %s; %s end)()"):format(elems, body)
     elseif pe.op then -- per-element string-op (strip/subst/case/@Q…): map apply_str_op
       elems = ("rt.array_op_values(sh, %s, %q, %q, %q)"):format(elems, pe.op, pe.arg or "", pe.arg2 or "")
     end

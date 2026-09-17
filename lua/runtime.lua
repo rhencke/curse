@@ -3031,6 +3031,13 @@ function M.array_op_values(sh, els, op, arg, arg2)
   return out
 end
 
+-- ${a[*]:-…} / ${*:-…} null test for the QUOTED-star form: the IFS[0]-joined string is
+-- non-empty (interp multi_elems `star and p.q` branch). Empty IFS joins with no separator.
+function M.ifs_join_ne(sh, els)
+  local sep = sh.vars["IFS"] and sh:get("IFS"):sub(1, 1) or " "
+  return table.concat(els, sep) ~= ""
+end
+
 -- ${!a[@]} / ${!a[*]}: the array's keys/indices as strings (a multi-element segment),
 -- exactly interp's multi_elems indices branch.
 function M.array_index_strs(sh, name)
