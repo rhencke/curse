@@ -1705,17 +1705,7 @@ end
 -- Builtins whose implementation is extracted into a lazily-loaded feature module
 -- (name -> module). exec_simple routes these through require() instead of its
 -- inline dispatch, so a cold script that never uses them never loads their code.
-local BUILTIN_LAZY = {
-  echo = "b_echo",
-  compgen = "b_completion", complete = "b_completion", compopt = "b_completion",
-  ulimit = "b_ulimit", times = "b_times", alias = "b_alias", unalias = "b_unalias",
-  umask = "b_umask", getopts = "b_getopts", hash = "b_hash", history = "b_history",
-  jobs = "b_jobs", trap = "b_trap", type = "b_type", printf = "b_printf", read = "b_read",
-  mapfile = "b_mapfile", readarray = "b_mapfile",
-  cd = "b_cd", unset = "b_unset", set = "b_set",
-  export = "b_export", declare = "b_export", typeset = "b_export", readonly = "b_export",
-  eval='b_eval', source='b_source', ['.']='b_source', wait='b_wait', fc='b_fc', bind='b_bind', shopt='b_shopt', let='b_let', kill='b_kill', pushd='b_pushd', popd='b_pushd', dirs='b_pushd', builtin='b_builtin', pwd='b_pwd', shift='b_shift', ['local']='b_local', help='b_help',
-}
+local BUILTIN_LAZY = rt.BUILTIN_LAZY -- one source of truth (runtime); shared with the compiled tier
 local BUILTINS = {
   echo = 1, [":"] = 1, ["true"] = 1, ["false"] = 1, ["["] = 1, test = 1, ["return"] = 1,
   exit = 1, cd = 1, unset = 1, export = 1, declare = 1, typeset = 1, set = 1, shift = 1,

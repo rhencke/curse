@@ -2560,4 +2560,32 @@ function Shell:echo(...)
   self.status = werr and 1 or 0 -- a write error is status 1, like bash's sh_chkwrite
 end
 
+-- Builtin registry (name -> lazily-loaded module). The interpreter shares this
+-- table (interp aliases rt.BUILTIN_LAZY), so there is one source of truth.
+local BUILTIN_LAZY = {
+  echo = "b_echo",
+  compgen = "b_completion", complete = "b_completion", compopt = "b_completion",
+  ulimit = "b_ulimit", times = "b_times", alias = "b_alias", unalias = "b_unalias",
+  umask = "b_umask", getopts = "b_getopts", hash = "b_hash", history = "b_history",
+  jobs = "b_jobs", trap = "b_trap", type = "b_type", printf = "b_printf", read = "b_read",
+  mapfile = "b_mapfile", readarray = "b_mapfile",
+  cd = "b_cd", unset = "b_unset", set = "b_set",
+  export = "b_export", declare = "b_export", typeset = "b_export", readonly = "b_export",
+  eval='b_eval', source='b_source', ['.']='b_source', wait='b_wait', fc='b_fc', bind='b_bind', shopt='b_shopt', let='b_let', kill='b_kill', pushd='b_pushd', popd='b_pushd', dirs='b_pushd', builtin='b_builtin', pwd='b_pwd', shift='b_shift', ['local']='b_local', help='b_help',
+}
+M.BUILTIN_LAZY = BUILTIN_LAZY
+local _noop = function() end
+-- Run a shell builtin natively for the compiled tier: the argv has already been
+-- built by the field engine and the name is a statically-known builtin (emit gates
+-- on this), so resolve its module and call it directly — the command RUNNER, not
+-- statement re-interpretation. A function (possibly defined dynamically, e.g. via
+-- eval/source) may shadow the builtin at runtime; that command isn't known at
+-- compile time, so defer it to the bootstrap dispatcher, which decides function vs
+-- (posix-)special-builtin exactly as an interpreted run would.
+function M.builtin(sh, argv, hook)
+  local cmd = argv[1]
+  if sh.functions[cmd] then return require("interp").exec_simple(sh, argv, hook or _noop) end
+  return require(BUILTIN_LAZY[cmd])(sh, cmd, argv, hook or _noop)
+end
+
 return M

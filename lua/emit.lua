@@ -1769,7 +1769,7 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
           local ec = errchk(st); local ecs = ec ~= "" and ("; " .. ec) or ""
           local d = dbg(st) -- DEBUG fires before the command and its expansions
           local lastarg = "if #__a > 0 then sh:set_str('_', __a[#__a]) end" -- $_ = last arg (bash)
-          blocks[p] = d .. builder .. "; I.exec_simple(sh, __a, __noop); " .. lastarg .. ecs ..
+          blocks[p] = d .. builder .. "; rt.builtin(sh, __a, __noop); " .. lastarg .. ecs ..
             ("; pc = %d"):format(after)
           return p
         end
