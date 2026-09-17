@@ -48,7 +48,12 @@ local LOCALE = "C.UTF-8"
 
 -- temp workspace (per run); each case gets a fresh cwd so file side effects don't
 -- leak between cases (matches run.mts).
-local TMP = (os.getenv("TMPDIR") or "/tmp") .. "/curse-spec-" .. tostring(os.time())
+local TMPROOT = os.getenv("TMPDIR") or "/tmp"
+-- /tmp is often a tmpfs (RAM-backed): a run killed before its cleanup (line ~end)
+-- leaks its whole workspace into RAM. Reap any stale ones (>30 min old, so a
+-- concurrent run's is never touched) at startup so leaks can't accumulate.
+os.execute("find " .. TMPROOT .. " -maxdepth 1 -name 'curse-spec-*' -mmin +30 -exec rm -rf {} + 2>/dev/null")
+local TMP = TMPROOT .. "/curse-spec-" .. tostring(os.time())
 os.execute("mkdir -p " .. TMP)
 
 -- curse is `luajit run.lua`; wrap it in a tiny exec script named after the shell
