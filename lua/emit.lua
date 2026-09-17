@@ -989,6 +989,10 @@ end
 --   unquoted literal  -> add(s, true):  glob-active, no split (word-initial ~)
 --   unquoted $expand  -> feed_split(s): word-split on $IFS, then glob each field
 local function emit_seg(p, i, lifted)
+  if p.special == "@" or p.special == "*" then -- $@ / $*: a multi-element segment
+    return ("{multi=true,star=%s,q=%s,elems=sh:paramList()}"):format(
+      tostring(p.special == "*"), tostring(p.q or false))
+  end
   if p.q then
     return ("{s=%s,split=false,unq=false}"):format(emit_scalar_val(p, i, lifted, false))
   elseif p.lit ~= nil then
@@ -1010,20 +1014,21 @@ local function emit_fields_into(tbl, w, lifted, wrap)
     return ("do local __f = rt.field_split(sh, %s, %s); for __i=1,#__f do %s[#%s+1]=%s end end")
       :format(fw.expr, tostring(fw.split), tbl, tbl, W("__f[__i]"))
   end
-  -- A mixed word whose parts are ALL scalar (literal/quoted, `$x`/`$?`/param — no
-  -- $@/$*, and none of the raise-y expansions mixed_expandable excludes): compile
-  -- each part's VALUE and hand the segments to rt.expand_fields, which does the
-  -- mask-aware split+glob at runtime. Genuine compilation — no interp field engine.
-  -- Lifted operands are read straight from the native i64 local (no sh flush needed).
+  -- A mixed word whose every part emit_seg can render (literal/quoted, `$x`/`$?`/param,
+  -- and $@/$* as a multi-element segment — none of the raise-y expansions
+  -- mixed_expandable excludes): compile each part's VALUE and hand the segments to
+  -- rt.expand_fields, which does the mask-aware split+glob at runtime. Genuine
+  -- compilation — no interp field engine. Lifted operands are read straight from the
+  -- native i64 local (no sh flush needed).
   if seg_native(w, lifted) then
     local segs = {}
     for i, p in ipairs(w.parts) do segs[#segs + 1] = emit_seg(p, i, lifted) end
     return ("do local __f = rt.expand_fields(sh, {%s}); for __i=1,#__f do %s[#%s+1]=%s end end")
       :format(table.concat(segs, ", "), tbl, tbl, W("__f[__i]"))
   end
-  -- Anything left (a $@/$* mixed word `x$@y`): expand with the SHARED field engine.
-  -- Flush any LIFTED operand to sh first (a native i64 local isn't visible there —
-  -- command args only READ vars, so no reload). A runtime call like rt.field_split.
+  -- Anything left (e.g. a word with a `${##}` length-op part): expand with the SHARED
+  -- field engine. Flush any LIFTED operand to sh first (a native i64 local isn't visible
+  -- there — command args only READ vars, so no reload). A runtime call like rt.field_split.
   local flush, seen = {}, {}
   for _, p in ipairs(w.parts) do
     if p.var and lifted[p.var] and not seen[p.var] then
@@ -1049,13 +1054,13 @@ function mixed_expandable(w, lifted)
   end
   return true
 end
--- A mixed word whose EVERY part renders to a SCALAR segment via emit_scalar_val:
--- these compile to rt.expand_fields (native split+glob) rather than delegating to the
--- interp field engine. This is an explicit ALLOWLIST — exactly the part shapes
--- emit_scalar_val handles, so it inherently excludes $@/$* (multi-element), a length
--- op (`${##}`: `lenof` computes the VALUE's length, which emit_scalar_val does not
--- apply), pexp/cmdsub/arith/arithast/procsub (raise-y or non-scalar), namerefs, and
--- any CFG-unreproducible special ($LINENO/$_/…).
+-- A mixed word whose EVERY part emit_seg can render: these compile to rt.expand_fields
+-- (native split+glob) rather than delegating to the interp field engine. This is an
+-- explicit ALLOWLIST — scalar parts (literal/quoted, $x, $1..$9, the scalar specials
+-- #/?/$/!) plus $@/$* as a multi-element segment. It excludes a length op (`${##}`:
+-- `lenof` computes the VALUE's length, which emit_seg does not apply),
+-- pexp/cmdsub/arith/arithast/procsub (raise-y or non-scalar), namerefs, and any
+-- CFG-unreproducible special ($LINENO/$_/…).
 function seg_native(w, lifted)
   if EF.has_nameref then return false end
   for _, p in ipairs(w.parts) do
@@ -1064,7 +1069,8 @@ function seg_native(w, lifted)
     elseif p.var then if COMPILE_UNSAFE_VAR[p.var] then return false end
     elseif p.param then -- $1..$9 positional: ok
     elseif p.special == "#" or p.special == "?" or p.special == "$" or p.special == "!" then -- scalar specials
-    else return false end -- $@/$*, pexp, cmdsub, arith, procsub, or anything unknown
+    elseif p.special == "@" or p.special == "*" then -- $@/$*: multi-element (emit_seg renders it)
+    else return false end -- pexp, cmdsub, arith, procsub, or anything unknown
   end
   return true
 end

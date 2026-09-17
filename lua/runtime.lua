@@ -117,6 +117,8 @@ function Shell:paramsJoin(sep) return table.concat(self.params, sep or " ", 1, s
 -- "$*" in a string context: params joined by IFS[0] (space if IFS unset, nothing
 -- if IFS is set but empty) — bash. "$@" always joins by a literal space.
 function Shell:paramsStar() return self:paramsJoin(self.vars["IFS"] and self:get("IFS"):sub(1, 1) or " ") end
+-- The positional params as a fresh 1-based list (for the field engine's $@/$* segments).
+function Shell:paramList() local t = {}; for i = 1, self.nparams do t[i] = self.params[i] end; return t end
 
 -- Positional-only call boundary: push args (varargs) into the depth pool — no
 -- table allocation per call after warmup.
@@ -2370,7 +2372,21 @@ function M.expand_fields(sh, segs)
     end
   end
   for _, seg in ipairs(segs) do
-    if seg.split then feed_split(seg.s) else add(seg.s, seg.unq) end
+    if seg.multi then
+      -- a $@ / $* part: multiple elements (seg.elems), joined/split per bash. Quoted
+      -- "$@" is one field PER element (each concatenates with the abutting text — the
+      -- first with what precedes, the last with what follows); quoted "$*" joins on
+      -- IFS[0]; unquoted joins on IFS[0] then word-splits (per-element under IFS="").
+      local els = seg.elems
+      if seg.q then
+        if seg.star then add(table.concat(els, ifs:sub(1, 1)), false)
+        else for k = 1, #els do if k > 1 then brk() end; add(els[k], false) end end
+      elseif ifs == "" then
+        for k = 1, #els do if k > 1 then brk() end; feed_split(els[k]) end
+      else
+        feed_split(table.concat(els, ifs:sub(1, 1)))
+      end
+    elseif seg.split then feed_split(seg.s) else add(seg.s, seg.unq) end
   end
   brk()
   -- pathname expansion on fields with unquoted glob metacharacters (mask-aware)
