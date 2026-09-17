@@ -914,6 +914,10 @@ end
 -- at compile time; the value and (literal) pattern are the operands.
 local PEXP_STROP = { ["#"] = 1, ["##"] = 1, ["%"] = 1, ["%%"] = 1,
   ["/"] = 1, ["//"] = 1, ["^"] = 1, ["^^"] = 1, [","] = 1, [",,"] = 1 }
+-- ${x@OP} transforms apply_str_op implements directly on the scalar value (bash 5.x):
+-- Q/K/k shell-quote, U/u/L case-fold, E ANSI-unescape. @P (prompt) and @a/@A (attributes)
+-- are NOT here — they need interp's expand_param — so they still delegate.
+local PEXP_AT = { Q = 1, K = 1, k = 1, U = 1, u = 1, L = 1, E = 1 }
 -- A pexp ARG is compile-time constant when it is plain literal glob text: no
 -- expansion ($ ` ~), no quote char (a quoted metachar is literal — different glob
 -- semantics), and no backslash (escapes a glob char, or is a literal in a
@@ -924,6 +928,7 @@ function pexp_compilable(pe)
   local name = pe.name
   if type(name) ~= "string" or not name:match("^[%a_][%w_]*$") or COMPILE_UNSAFE_VAR[name] then return false end
   if pe.op == "len" then return true end -- ${#x}: scalar codepoint length via apply_str_op("len")
+  if pe.op == "@" then return PEXP_AT[pe.arg] and true or false end -- ${x@Q}/@U/@L/@E … (not @P/@a)
   return PEXP_STROP[pe.op] and pexp_literal_arg(pe.arg) and pexp_literal_arg(pe.arg2) or false
 end
 -- Lua expr for a compilable pexp's scalar string value (assumes pexp_compilable).
@@ -931,6 +936,7 @@ function pexp_scalar(pe, lifted)
   local val = lifted[pe.name] and ("rt.i64_to_str(%s)"):format(lname(pe.name))
     or ("sh:get_u(%q)"):format(pe.name) -- get_u: an unset var trips set -u, like bash
   if pe.op == "len" then return ("tostring(rt.mb_strlen(%s))"):format(val) end -- ${#x}: codepoint length
+  if pe.op == "@" then return ("rt.at_transform(sh, %q, %s, %q)"):format(pe.name, val, pe.arg) end -- unset-aware transform
   return ("sh:apply_str_op(%q, %s, %q, %q)"):format(pe.op, val, pe.arg or "", pe.arg2 or "")
 end
 

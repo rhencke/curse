@@ -2979,6 +2979,16 @@ function M.var_is_set(sh, nm)
   return b ~= nil or sh:special_get(nm) ~= ""
 end
 
+-- ${x@Q}/@U/@u/@L/@E/@K/@k transform for the compiled tier: an UNSET var yields nothing
+-- (bash — the transform doesn't apply; an unquoted empty then drops as a field), matching
+-- interp's expand_param (`if not isset then return "" end`). `val` is the already-read
+-- value (its get_u already tripped set -u). Only the apply_str_op-handled args reach here
+-- (emit gates out @P/@a).
+function M.at_transform(sh, name, val, arg)
+  if not M.var_is_set(sh, name) then return "" end
+  return sh:apply_str_op("@", val, arg, "")
+end
+
 -- The `test`/`[` engine (shared by both tiers; the compiled tier computes the argv with
 -- emit_word and calls M.do_test on the values — real code + a library call, not an AST
 -- re-walk). Follows bash's test.c exactly. Every operand primitive is already a runtime
