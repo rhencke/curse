@@ -945,6 +945,19 @@ function pexp_compilable(pe)
     local ok, w = pcall(require("parser").parse_word, pe.arg or "")
     return ok and emitable_word(w) or false
   end
+  if pe.op == "sub" then
+    -- ${v:off:len} scalar substring: off/len are ARITH expression words. Compile when
+    -- each is an emit_word-able word (so emit_word == interp's expand_word); the arith
+    -- eval then runs on the identical expanded string via rt.arith_int. Reject ~ \ ' "
+    -- (emit_word diverges from expand_word there — same guard as the default ops).
+    local function wok(a)
+      if a == nil then return true end
+      if a:find("[~\\'\"]") then return false end
+      local ok, w = pcall(require("parser").parse_word, a)
+      return ok and emitable_word(w) or false
+    end
+    return wok(pe.arg) and wok(pe.arg2)
+  end
   return PEXP_STROP[pe.op] and pexp_literal_arg(pe.arg) and pexp_literal_arg(pe.arg2) or false
 end
 -- ${a[@]OP} / ${a[*]OP}: a per-element string-op over the whole array, compiled by
@@ -984,6 +997,14 @@ function pexp_scalar(pe, lifted)
     if pe.op == "=" then return ("(rt.var_has_value(sh, %q) and %s or rt.assign_default(sh, %q, %s))"):format(pe.name, getv, pe.name, def) end
     if pe.op == ":?" then return ("(function() local __d = %s; return __d ~= \"\" and __d or rt.param_error(sh, %q, %s) end)()"):format(getv, pe.name, def) end
     return ("(rt.var_has_value(sh, %q) and %s or rt.param_error(sh, %q, %s))"):format(pe.name, getv, pe.name, def) -- ?
+  end
+  if pe.op == "sub" then -- ${v:off:len}: arith-eval off/len (nil-coerced to 0 for a present
+    -- operand, like interp), then substr by codepoint via apply_str_op("sub").
+    local P = require("parser")
+    local off = ("(rt.arith_int(sh, %s) or 0)"):format(emit_word(P.parse_word(pe.arg or ""), lifted))
+    if pe.arg2 == nil then return ("sh:apply_str_op(\"sub\", %s, %s)"):format(val, off) end
+    local len = ("(rt.arith_int(sh, %s) or 0)"):format(emit_word(P.parse_word(pe.arg2), lifted))
+    return ("sh:apply_str_op(\"sub\", %s, %s, %s)"):format(val, off, len)
   end
   return ("sh:apply_str_op(%q, %s, %q, %q)"):format(pe.op, val, pe.arg or "", pe.arg2 or "")
 end

@@ -2961,6 +2961,18 @@ function M.arith_str(sh, s)
   if fn then return fn(sh) end
   return require("interp").dbracket_arith(sh, s)
 end
+
+-- ${v:off:len} slice offset/length: arith-evaluate the already-expanded expression
+-- string LENIENTLY — a parse/eval error falls back to tonumber(s) or 0, exactly interp's
+-- arith_int (interp.lua). Returns a Lua number, or nil for empty/nil input (the caller
+-- coerces nil->0 for a present operand). Shares the arith_str evaluator (native
+-- compile_arith_value, interp bootstrap for the dynamic slow path — no new seam).
+function M.arith_int(sh, s)
+  if s == nil or s == "" then return nil end
+  local ok, v = pcall(M.arith_str, sh, s)
+  if ok then return tonumber(v) end
+  return tonumber(s) or 0
+end
 -- `[[ -v NAME ]]` / `[[ -v a[i] ]]`: is the variable (or array element) set? interp's
 -- var_is_set twin. `nm` is already word-expanded, so an array subscript is a plain literal
 -- (no $): an ASSOC key is used verbatim, an INDEXED subscript is arith-evaluated via
