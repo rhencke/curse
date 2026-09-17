@@ -478,7 +478,7 @@ end
 
 -- How a NON-lifted arith var read is emitted. Default `sh:aget` parses the value's
 -- immediate number (fast, used by whilec/forc/arith-word conditions). Inside a
--- (( )) command the arithcmd codegen swaps in I.arith_read, which matches interp
+-- (( )) command the arithcmd codegen swaps in rt.arith_read, which matches interp
 -- exactly (nounset + recursive-name-eval + array decay); codegen is synchronous, so
 -- this scoped toggle needs no threading through emit_value's recursion.
 local arith_varread = "sh:aget(%q)"
@@ -561,21 +561,21 @@ emit_value = function(e, lifted)
     -- binds like an atom). Lifted operands are i64 locals — always numeric — so a hot
     -- `(( $i < n ))` compiles to pure native code. A NON-lifted $name is guarded: if its
     -- value isn't numeric, bash re-associates operators, so fall back to the interpreter's
-    -- textual substitution (I.arith_textual). Only reached for a fast xpand (not_compilable).
+    -- textual substitution (rt.arith_textual). Only reached for a fast xpand (not_compilable).
     local ok, native = pcall(require("parser").arith, e.raw, true)
-    if not ok then return ("I.arith_textual(sh, %q)"):format(e.raw) end
+    if not ok then return ("rt.arith_textual(sh, %q)"):format(e.raw) end
     local nl, lf = {}, {}
     xpand_split(native, lifted, nl, lf, {})
     local nat = emit_value(native, lifted)
     if #nl == 0 then return nat end -- every $-operand is a lifted i64: pure native
     local conds = {}
-    for _, nm in ipairs(nl) do conds[#conds + 1] = ("I.arith_isnum(sh,%q)"):format(nm) end
+    for _, nm in ipairs(nl) do conds[#conds + 1] = ("rt.arith_isnum(sh,%q)"):format(nm) end
     local fb -- fallback: flush any lifted operands to sh, then bash's textual substitution
-    if #lf == 0 then fb = ("I.arith_textual(sh,%q)"):format(e.raw)
+    if #lf == 0 then fb = ("rt.arith_textual(sh,%q)"):format(e.raw)
     else
       local syncs = {}
       for _, nm in ipairs(lf) do syncs[#syncs + 1] = ("sh:aset(%q,%s)"):format(nm, lname(nm)) end
-      fb = ("(function() %s; return I.arith_textual(sh,%q) end)()"):format(table.concat(syncs, "; "), e.raw)
+      fb = ("(function() %s; return rt.arith_textual(sh,%q) end)()"):format(table.concat(syncs, "; "), e.raw)
     end
     return ("((%s) and (%s) or %s)"):format(table.concat(conds, " and "), nat, fb)
   end
@@ -718,11 +718,11 @@ emit_word = function(w, lifted)
       elseif p.special == "$" then parts[#parts + 1] = "tostring(sh:pid())"
       elseif p.special == "!" then parts[#parts + 1] = '(sh.last_bg_pid or "")' end
     elseif p.arithast then -- a pre-parsed+substituted arith AST (inlined word)
-      local saved = arith_varread; arith_varread = "I.arith_read(sh, %q)" -- $(()) reads recursively (bar=foo;$((bar)))
+      local saved = arith_varread; arith_varread = "rt.arith_read(sh, %q)" -- $(()) reads recursively (bar=foo;$((bar)))
       parts[#parts + 1] = "rt.i64_to_str(" .. emit_value(p.arithast, lifted) .. ")"
       arith_varread = saved
     elseif p.arith then
-      local saved = arith_varread; arith_varread = "I.arith_read(sh, %q)" -- name/expr values re-parse as arith
+      local saved = arith_varread; arith_varread = "rt.arith_read(sh, %q)" -- name/expr values re-parse as arith
       parts[#parts + 1] = "rt.i64_to_str(" .. emit_value(safe_arith(p.arith), lifted) .. ")"
       arith_varread = saved
     elseif p.cmdsub then -- $( … ): COMPILE the inner (known at compile time) and run it captured
@@ -1656,7 +1656,7 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
       if st.arith then
         -- x=$((…)): a non-lifted read honors set -u and resolves recursively (bash),
         -- exactly as the $(())-in-word and (( )) paths do — swap in arith_read.
-        local saved = arith_varread; arith_varread = "I.arith_read(sh, %q)"
+        local saved = arith_varread; arith_varread = "rt.arith_read(sh, %q)"
         local rhs = emit_value(st.arith, lifted)
         arith_varread = saved
         blocks[p] = d .. emit_set(st.name, rhs, lifted) .. ua .. ("; pc = %d"):format(after)
@@ -2014,7 +2014,7 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
       local p = newpc()
       local ec = errchk(st); local ecs = ec ~= "" and ("; " .. ec) or ""
       local d = dbg(st) -- DEBUG fires before the (( )) command (bash: DEBUG_FIRE.arithcmd)
-      local saved = arith_varread; arith_varread = "I.arith_read(sh, %q)" -- nounset+recursive-eval reads
+      local saved = arith_varread; arith_varread = "rt.arith_read(sh, %q)" -- nounset+recursive-eval reads
       local code = emit_arith_into("__ar", st.expr, lifted)
       arith_varread = saved
       if arith_can_div_fault(st.expr) then

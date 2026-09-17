@@ -590,10 +590,7 @@ local sherr -- error-message writer, capture-aware for `2>&1` in $() (defined w/
 -- EXPRESSION: a bare number is its value, but a name (or `3+4`, `bar`) is
 -- recursively parsed and evaluated (so bar=foo; foo=5; $((bar)) == 5). A pure
 -- integer literal short-circuits (the hot path); a recursion guard bounds cycles.
-local function looks_numeric(s)
-  return s:match("^%s*[+-]?%d+%s*$") or s:match("^%s*[+-]?0[xX]%x+%s*$")
-    or s:match("^%s*[+-]?0[0-7]+%s*$") or s:match("^%s*%d+#[%w@_]+%s*$")
-end
+local looks_numeric = rt.looks_numeric -- shared with the compiled tier (one source in runtime)
 arith_resolve = function(sh, s)
   if s == nil or s:match("^%s*$") then return i64(0) end -- unset/blank value -> 0 (bash)
   if looks_numeric(s) then return rt.arith_num(s) end

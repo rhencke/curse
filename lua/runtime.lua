@@ -2588,4 +2588,31 @@ function M.builtin(sh, argv, hook)
   return require(BUILTIN_LAZY[cmd])(sh, cmd, argv, hook or _noop)
 end
 
+-- Arithmetic variable reads for the compiled tier. The hot case — a variable holding
+-- a plain number — is fully native (no interpreter). A non-numeric value (a stored
+-- expression like x="1+2"), an unset var (set -u), or a blank value falls to the
+-- interpreter's full arith_read, which recursively parses+evals the value's TEXT:
+-- genuinely dynamic (the value isn't known at compile time), so it is the bootstrap.
+function M.looks_numeric(s)
+  return s:match("^%s*[+-]?%d+%s*$") or s:match("^%s*[+-]?0[xX]%x+%s*$")
+    or s:match("^%s*[+-]?0[0-7]+%s*$") or s:match("^%s*%d+#[%w@_]+%s*$")
+end
+function M.arith_read(sh, name)
+  local s = sh:get(name)
+  if s ~= nil and M.looks_numeric(s) then return M.arith_num(s) end -- native fast path
+  return require("interp").arith_read(sh, name) -- unset/blank/non-numeric: full & dynamic
+end
+-- Gate for the compiled fast-xpand path: true when the var's value binds like a
+-- numeric atom (so native rendering == bash's textual substitution).
+function M.arith_isnum(sh, name)
+  local b = sh.vars[sh:deref(name)]
+  if b and b.n ~= nil and b.s == nil and not b.arr then return true end -- i64-authoritative
+  return M.looks_numeric(sh:get(name)) ~= nil
+end
+-- Textual substitution of a non-numeric $name value into arithmetic (bash re-parses
+-- the value's TEXT). Dynamic — deferred to the interpreter bootstrap.
+function M.arith_textual(sh, raw)
+  return require("interp").arith_textual(sh, raw)
+end
+
 return M
