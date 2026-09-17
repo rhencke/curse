@@ -3028,6 +3028,39 @@ function M.array_op_values(sh, els, op, arg, arg2)
   return out
 end
 
+-- ${a[@]:off:len} / ${a[*]:off:len} array slice for the compiled tier — replicates interp's
+-- multi_elems sub branch exactly. `els` is the fetched value list (dense, parallel to
+-- array_indices); off/len are already arith-evaluated (len nil = no length given). An
+-- indexed (possibly sparse) array selects by INDEX VALUE (elements whose index >= off; a
+-- negative off counts from highest index + 1); $@/$* and assoc are position-based (assoc
+-- has bash's :0==:1 off-by-one). A negative length is a FATAL expansion error.
+function M.array_slice_values(sh, name, els, off, len)
+  off = off or 0
+  if len ~= nil and len < 0 then
+    io.stderr:write("curse: " .. len .. ": substring expression < 0\n")
+    error({ __curse_exit = 1 })
+  end
+  if name ~= "@" and name ~= "*" and not sh:is_assoc(name) then
+    local idx = sh:array_indices(name)
+    if off < 0 then off = (idx[#idx] or -1) + 1 + off end
+    local out = {}
+    if off >= 0 then -- an out-of-bounds negative offset (off < 0 here) is empty
+      for i = 1, #idx do if idx[i] >= off then out[#out + 1] = els[i] end end
+      if len ~= nil then local t = {}; for i = 1, math.min(len, #out) do t[i] = out[i] end; out = t end
+    end
+    return out
+  end
+  -- $@/$* and assoc: position-based (0-based off, negatives from the end)
+  if off > 0 and sh:is_assoc(name) then off = off - 1 end
+  local n = #els
+  if off < 0 then off = n + off; if off < 0 then return {} end end
+  local last = n
+  if len ~= nil then last = (len < 0) and (n + len) or (off + len) end
+  local out = {}
+  for i = off, last - 1 do if els[i + 1] ~= nil then out[#out + 1] = els[i + 1] end end
+  return out
+end
+
 -- ${x@Q}/@U/@u/@L/@E/@K/@k transform for the compiled tier: an UNSET var yields nothing
 -- (bash — the transform doesn't apply; an unquoted empty then drops as a field), matching
 -- interp's expand_param (`if not isset then return "" end`). `val` is the already-read

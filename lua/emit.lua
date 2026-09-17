@@ -928,6 +928,19 @@ local PEXP_DEFAULT = { [":-"] = 1, ["-"] = 1, [":+"] = 1, ["+"] = 1,
 -- semantics), and no backslash (escapes a glob char, or is a literal in a
 -- replacement). Anything with those needs interp's word expansion, so it delegates.
 local function pexp_literal_arg(a) return a == nil or not a:find("[%$`~\\\"']") end
+-- ${…:off:len} slice: off/len are arith expression words. Compilable when each is an
+-- emit_word-able word free of ~ \ ' " (so emit_word == interp's expand_word and the arith
+-- eval runs on the identical expanded string). Shared by the scalar (pexp_compilable) and
+-- array (array_multi_op) slice gates.
+local function slice_args_ok(pe)
+  local function wok(a)
+    if a == nil then return true end
+    if a:find("[~\\'\"]") then return false end
+    local ok, w = pcall(require("parser").parse_word, a)
+    return ok and emitable_word(w) or false
+  end
+  return wok(pe.arg) and wok(pe.arg2)
+end
 function pexp_compilable(pe)
   if pe.index or pe.via_indirect then return false end -- array subscript / ${!ref} indirection
   local name = pe.name
@@ -945,19 +958,7 @@ function pexp_compilable(pe)
     local ok, w = pcall(require("parser").parse_word, pe.arg or "")
     return ok and emitable_word(w) or false
   end
-  if pe.op == "sub" then
-    -- ${v:off:len} scalar substring: off/len are ARITH expression words. Compile when
-    -- each is an emit_word-able word (so emit_word == interp's expand_word); the arith
-    -- eval then runs on the identical expanded string via rt.arith_int. Reject ~ \ ' "
-    -- (emit_word diverges from expand_word there — same guard as the default ops).
-    local function wok(a)
-      if a == nil then return true end
-      if a:find("[~\\'\"]") then return false end
-      local ok, w = pcall(require("parser").parse_word, a)
-      return ok and emitable_word(w) or false
-    end
-    return wok(pe.arg) and wok(pe.arg2)
-  end
+  if pe.op == "sub" then return slice_args_ok(pe) end -- ${v:off:len} scalar substring
   return PEXP_STROP[pe.op] and pexp_literal_arg(pe.arg) and pexp_literal_arg(pe.arg2) or false
 end
 -- ${a[@]OP} / ${a[*]OP}: a per-element string-op over the whole array, compiled by
@@ -973,6 +974,7 @@ local function array_multi_op(pe)
   if type(pe.name) ~= "string" or not pe.name:match("^[%a_][%w_]*$") then return false end
   if not pe.op then return true end -- bare ${a[@]} / ${a[*]}
   if pe.op == "@" then return PEXP_AT[pe.arg] and true or false end -- ${a[@]@Q} … (not @a/@P)
+  if pe.op == "sub" then return slice_args_ok(pe) end -- ${a[@]:off:len} slice
   return PEXP_STROP[pe.op] and pexp_literal_arg(pe.arg) and pexp_literal_arg(pe.arg2) or false
 end
 -- Lua expr for a compilable pexp's scalar string value (assumes pexp_compilable).
@@ -1079,7 +1081,12 @@ local function emit_seg(p, i, lifted)
   if p.pexp then -- ${a[@]} / ${a[*]}: array elements as a multi-element segment (gated)
     local pe = p.pexp
     local elems = ("sh:array_values(%q)"):format(pe.name)
-    if pe.op then -- per-element string-op (strip/subst/case/@Q…): map apply_str_op
+    if pe.op == "sub" then -- ${a[@]:off:len} slice: arith off/len, then index/assoc-aware select
+      local P = require("parser")
+      local off = ("(rt.arith_int(sh, %s) or 0)"):format(emit_word(P.parse_word(pe.arg or ""), lifted))
+      local len = pe.arg2 and ("(rt.arith_int(sh, %s) or 0)"):format(emit_word(P.parse_word(pe.arg2), lifted)) or "nil"
+      elems = ("rt.array_slice_values(sh, %q, %s, %s, %s)"):format(pe.name, elems, off, len)
+    elseif pe.op then -- per-element string-op (strip/subst/case/@Q…): map apply_str_op
       elems = ("rt.array_op_values(sh, %s, %q, %q, %q)"):format(elems, pe.op, pe.arg or "", pe.arg2 or "")
     end
     return ("{multi=true,star=%s,q=%s,elems=%s}"):format(
