@@ -873,6 +873,46 @@ local function field_word(w, lifted)
   return nil
 end
 
+-- Forward: mixed_expandable and seg_native are defined just below, but the mixed
+-- branch of emit_fields_into (above them) needs to see them.
+local mixed_expandable, seg_native
+
+-- Render ONE part of a mixed word to its scalar value expression — the same per-part
+-- computation as emit_word, restricted to the scalar subset seg_native admits.
+-- `tilde` enables word-initial ~ expansion for an unquoted literal at part index 1.
+local function emit_scalar_val(p, i, lifted, tilde)
+  if p.lit ~= nil then
+    if tilde and i == 1 and (p.lit:sub(1, 1) == "~"
+        or (p.lit:find("~", 1, true) and p.lit:match("^[%a_][%w_]*%+?=") ~= nil)) then
+      return ("rt.tilde_word_initial(sh, %q)"):format(p.lit)
+    end
+    return ("%q"):format(p.lit)
+  elseif p.raw then return p.raw
+  elseif p.var then
+    return lifted[p.var] and ("rt.i64_to_str(%s)"):format(lname(p.var)) or ("sh:get_u(%q)"):format(p.var)
+  elseif p.param then return ("sh:param(%d)"):format(p.param)
+  elseif p.special == "#" then return "tostring(sh.nparams)"
+  elseif p.special == "?" then return "tostring(sh.status)"
+  elseif p.special == "$" then return "tostring(sh:pid())"
+  elseif p.special == "!" then return '(sh.last_bg_pid or "")'
+  end
+  error("curse-nocompile: mixed-word segment") -- unreachable given seg_native
+end
+
+-- Render one part to a segment literal {s=<value>, split=<bool>, unq=<bool>} for
+-- rt.expand_fields, classifying it exactly as expand_to_fields' per-part add/feed_split:
+--   quoted            -> add(s, false): literal, no split, no glob
+--   unquoted literal  -> add(s, true):  glob-active, no split (word-initial ~)
+--   unquoted $expand  -> feed_split(s): word-split on $IFS, then glob each field
+local function emit_seg(p, i, lifted)
+  if p.q then
+    return ("{s=%s,split=false,unq=false}"):format(emit_scalar_val(p, i, lifted, false))
+  elseif p.lit ~= nil then
+    return ("{s=%s,split=false,unq=true}"):format(emit_scalar_val(p, i, lifted, true))
+  end
+  return ("{s=%s,split=true,unq=true}"):format(emit_scalar_val(p, i, lifted, false))
+end
+
 -- Emit statement(s) appending word `w`'s final field(s) to Lua table `tbl`. A
 -- word_safe word contributes one field (emit_word); a field_word splits+globs at
 -- runtime via rt.field_split. `wrap` (e.g. "rt.cstr(%s)") wraps each final field.
@@ -886,10 +926,20 @@ local function emit_fields_into(tbl, w, lifted, wrap)
     return ("do local __f = rt.field_split(sh, %s, %s); for __i=1,#__f do %s[#%s+1]=%s end end")
       :format(fw.expr, tostring(fw.split), tbl, tbl, W("__f[__i]"))
   end
-  -- Any other word (mixed literal+expansion `foo$x`, `i=$i`, `x$@y`, quoted glob…):
-  -- expand it with the SHARED field engine. Flush any LIFTED operand to sh first (a
-  -- native i64 local isn't visible there — command args only READ vars, so no reload).
-  -- This is a runtime call like rt.field_split; the statement's dispatch stays native.
+  -- A mixed word whose parts are ALL scalar (literal/quoted, `$x`/`$?`/param — no
+  -- $@/$*, and none of the raise-y expansions mixed_expandable excludes): compile
+  -- each part's VALUE and hand the segments to rt.expand_fields, which does the
+  -- mask-aware split+glob at runtime. Genuine compilation — no interp field engine.
+  -- Lifted operands are read straight from the native i64 local (no sh flush needed).
+  if seg_native(w, lifted) then
+    local segs = {}
+    for i, p in ipairs(w.parts) do segs[#segs + 1] = emit_seg(p, i, lifted) end
+    return ("do local __f = rt.expand_fields(sh, {%s}); for __i=1,#__f do %s[#%s+1]=%s end end")
+      :format(table.concat(segs, ", "), tbl, tbl, W("__f[__i]"))
+  end
+  -- Anything left (a $@/$* mixed word `x$@y`): expand with the SHARED field engine.
+  -- Flush any LIFTED operand to sh first (a native i64 local isn't visible there —
+  -- command args only READ vars, so no reload). A runtime call like rt.field_split.
   local flush, seen = {}, {}
   for _, p in ipairs(w.parts) do
     if p.var and lifted[p.var] and not seen[p.var] then
@@ -907,11 +957,30 @@ end
 -- keeps $?=1 without aborting the line), no nameref (element-deref subtlety), and no
 -- CFG-unreproducible special ($LINENO/$_). Plain literal+var+param+$@/$* words qualify —
 -- exactly the mixed shapes (`foo$x`, `$x.txt`, `x$@y`) that field_word can't render.
-local function mixed_expandable(w, lifted)
+function mixed_expandable(w, lifted)
   if EF.has_nameref then return false end
   for _, p in ipairs(w.parts) do
     if p.arith or p.arithast or p.cmdsub or p.pexp or p.procsub then return false end
     if p.var and COMPILE_UNSAFE_VAR[p.var] then return false end
+  end
+  return true
+end
+-- A mixed word whose EVERY part renders to a SCALAR segment via emit_scalar_val:
+-- these compile to rt.expand_fields (native split+glob) rather than delegating to the
+-- interp field engine. This is an explicit ALLOWLIST — exactly the part shapes
+-- emit_scalar_val handles, so it inherently excludes $@/$* (multi-element), a length
+-- op (`${##}`: `lenof` computes the VALUE's length, which emit_scalar_val does not
+-- apply), pexp/cmdsub/arith/arithast/procsub (raise-y or non-scalar), namerefs, and
+-- any CFG-unreproducible special ($LINENO/$_/…).
+function seg_native(w, lifted)
+  if EF.has_nameref then return false end
+  for _, p in ipairs(w.parts) do
+    if p.lenof then return false end -- ${#x}/${##}: length, not the plain value
+    if p.lit ~= nil or p.raw then -- literal text / inlined-param string: ok
+    elseif p.var then if COMPILE_UNSAFE_VAR[p.var] then return false end
+    elseif p.param then -- $1..$9 positional: ok
+    elseif p.special == "#" or p.special == "?" or p.special == "$" or p.special == "!" then -- scalar specials
+    else return false end -- $@/$*, pexp, cmdsub, arith, procsub, or anything unknown
   end
   return true
 end

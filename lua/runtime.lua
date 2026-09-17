@@ -2306,6 +2306,147 @@ function M.field_split(sh, value, split)
   return out
 end
 
+-- Mask-aware field split + glob for a MIXED word (`foo$x`, `x=$i`, `$?.txt`) — the
+-- genuine-compilation replacement for interp's expand_to_fields on that shape. Emit
+-- compiles each part's VALUE into a segment {s=<value>, split, unq}:
+--   split=true              value came from an UNQUOTED expansion ($x/$?/param) —
+--                           word-split on $IFS, then glob each field (glob-active).
+--   split=false, unq=true   an UNQUOTED literal (`*.txt`) — no split, but glob-active.
+--   split=false, unq=false  QUOTED/escaped text — literal (no split, no glob).
+-- We rebuild the field left to right with a per-char quote mask (`q`: "0"=glob-active,
+-- "1"=masked) so `"$x"foo*` globs foo* but not $x's content. $@/$*/array (multi-
+-- element) parts are NOT in this subset — those stay on expand_to_fields. Kept
+-- byte-for-byte in lockstep with expand_to_fields' feed_split/add + glob tail.
+function M.expand_fields(sh, segs)
+  local ifs = sh.vars["IFS"] and sh:get("IFS") or " \t\n"
+  -- Memoize the IFS char-set parse (shared with expand_to_fields via sh._ifscache).
+  local ic = sh._ifscache
+  if not ic or ic.ifs ~= ifs then
+    local set = {}; for _, ch in ipairs(M.mb_chars(ifs)) do set[ch.s] = true end
+    ic = { ifs = ifs, set = set, mbifs = M.lc_mb_cur_max() > 1 and ifs:find("[\128-\255]") ~= nil }
+    sh._ifscache = ic
+  end
+  local ifsset, mbifs = ic.set, ic.mbifs
+  local function isws(c) return c == " " or c == "\t" or c == "\n" end
+  local function inifs(c) return c ~= "" and ifsset[c] end
+  local function clen(v, i)
+    if not mbifs or v:byte(i) < 0x80 then return 1 end
+    return M.mb_charlen(v, i)
+  end
+  local fields, cur, cur_unq, cur_q = {}, nil, false, nil
+  local function brk()
+    if cur ~= nil then fields[#fields + 1] = { s = cur, unq = cur_unq, q = cur_q }; cur, cur_unq, cur_q = nil, false, nil end
+  end
+  local function add(s, unq)
+    cur = (cur or "") .. s
+    cur_q = (cur_q or "") .. (unq and "0" or "1"):rep(#s)
+    if unq then cur_unq = true end
+  end
+  local function feed_split(v) -- unquoted expansion text: split on $IFS
+    local i, n = 1, #v
+    while i <= n do
+      local cl = clen(v, i)
+      local c = cl == 1 and v:sub(i, i) or v:sub(i, i + cl - 1)
+      if inifs(c) then
+        if isws(c) then
+          if cur ~= nil then brk() end
+          i = i + 1
+          while i <= n and isws(v:sub(i, i)) do i = i + 1 end
+          if i <= n then
+            local nl = clen(v, i); local nc = nl == 1 and v:sub(i, i) or v:sub(i, i + nl - 1)
+            if inifs(nc) and not isws(nc) then
+              i = i + nl; while i <= n and isws(v:sub(i, i)) do i = i + 1 end
+            end
+          end
+        else
+          if cur == nil then cur = "" end
+          cur_unq = true; brk()
+          i = i + cl
+          while i <= n and isws(v:sub(i, i)) do i = i + 1 end
+        end
+      else
+        add(c, true); i = i + cl
+      end
+    end
+  end
+  for _, seg in ipairs(segs) do
+    if seg.split then feed_split(seg.s) else add(seg.s, seg.unq) end
+  end
+  brk()
+  -- pathname expansion on fields with unquoted glob metacharacters (mask-aware)
+  local out = {}
+  local gi = sh:get("GLOBIGNORE")
+  local gi_exists = sh.vars[sh:deref("GLOBIGNORE")] ~= nil
+  local giset = gi_exists and gi ~= ""
+  local dotglob = gi_exists or (sh.shopt.dotglob and true)
+  local nullglob = sh.shopt.nullglob and true
+  local gipats
+  if giset then -- split on ':' but NOT inside [...]
+    gipats = {}
+    local depth, curp = 0, {}
+    for k = 1, #gi do
+      local c = gi:sub(k, k)
+      if c == "[" then depth = depth + 1; curp[#curp + 1] = c
+      elseif c == "]" then if depth > 0 then depth = depth - 1 end; curp[#curp + 1] = c
+      elseif c == ":" and depth == 0 then if #curp > 0 then gipats[#gipats + 1] = table.concat(curp); curp = {} end
+      else curp[#curp + 1] = c end
+    end
+    if #curp > 0 then gipats[#gipats + 1] = table.concat(curp) end
+  end
+  local noglob = sh.opt_f
+  local skipdots = giset or (sh.shopt.globskipdots ~= false)
+  local globstar = sh.shopt.globstar and true
+  local GLOBSPECIAL = { ["*"] = 1, ["?"] = 1, ["["] = 1, ["]"] = 1, ["\\"] = 1,
+    ["+"] = 1, ["@"] = 1, ["!"] = 1, ["("] = 1, [")"] = 1, ["|"] = 1 }
+  local function glob_active(f) -- glob metachar at a NON-masked (glob-active) position?
+    local s, q = f.s, f.q
+    local open = false
+    for i = 1, #s do
+      if not q or q:sub(i, i) == "0" then
+        local c = s:sub(i, i)
+        if c == "*" or c == "?" then return true end
+        if c == "[" then open = true
+        elseif c == "]" then if open then return true end
+        elseif (c == "+" or c == "@" or c == "!")
+          and s:sub(i + 1, i + 1) == "(" and (not q or q:sub(i + 1, i + 1) == "0") then return true end
+      end
+    end
+    return false
+  end
+  local function glob_pat(f) -- backslash-escape masked (quoted) glob-special chars
+    if not f.q or not f.q:find("1") then return f.s end
+    local o = {}
+    for i = 1, #f.s do
+      local c = f.s:sub(i, i)
+      o[#o + 1] = (f.q:sub(i, i) == "1" and GLOBSPECIAL[c]) and ("\\" .. c) or c
+    end
+    return table.concat(o)
+  end
+  for _, f in ipairs(fields) do
+    if not noglob and f.unq and glob_active(f) then
+      local m = M.glob_expand(glob_pat(f), { dotglob = dotglob, skipdots = skipdots, globstar = globstar })
+      if m and gipats then
+        local filt = {}
+        for _, x in ipairs(m) do
+          local ig = false
+          for _, p in ipairs(gipats) do if M.glob_ignore_match(x, p) then ig = true; break end end
+          if not ig then filt[#filt + 1] = x end
+        end
+        m = (#filt > 0) and filt or nil
+      end
+      if m then for _, x in ipairs(m) do out[#out + 1] = x end
+      elseif sh.shopt.failglob then
+        io.stderr:write("curse: no match: " .. f.s .. "\n")
+        error({ __curse_exit = 1, __curse_lineabort = true })
+      elseif nullglob then -- drop
+      else out[#out + 1] = f.s end
+    else
+      out[#out + 1] = f.s
+    end
+  end
+  return out
+end
+
 -- Apply a ${…} operator. `arg`/`arg2` are already word-expanded by the caller;
 -- `idxnum` is the evaluated numeric subscript when pe.index is an expression.
 function Shell:expand_param(pe, arg, arg2, idxnum)
