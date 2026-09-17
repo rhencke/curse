@@ -1112,13 +1112,62 @@ M.to_arr_key, M.key_i64 = to_arr_key, key_i64
 -- Dynamic special variables (only when not explicitly set). Many spec cases just
 -- check these "look like" a PID/uid/path, so exact values rarely matter.
 ffi.cdef [[
-  int getpid(void); int getppid(void); int getuid(void); int geteuid(void);
+  int getpid(void); int getppid(void); int getuid(void); int geteuid(void); int getegid(void);
   char *getcwd(char *buf, unsigned long size);
   int curse_rt_stat(const char *path, void *buf) asm("stat");
+  int curse_rt_lstat(const char *path, void *buf) asm("lstat");
   struct curse_pw { char *pw_name; char *pw_passwd; unsigned int pw_uid; unsigned int pw_gid; char *pw_gecos; char *pw_dir; char *pw_shell; };
   struct curse_pw *getpwuid(unsigned int uid);
 ]]
 local scratch = ffi.new("char[4096]")
+
+-- `test`/`[`/`[[ ]]` file predicates (shared by both tiers and the builtins that used
+-- to import them from interp). Pure stat/access FFI — a runtime primitive, not
+-- interpretation. Offsets are glibc x86-64 struct stat (st_mode@24, st_uid@28,
+-- st_gid@32, st_size@48, mtime sec@88/nsec@96, dev@0, ino@8).
+local _ft_a, _ft_b = ffi.new("uint8_t[144]"), ffi.new("uint8_t[144]")
+function M.file_test(op, path)
+  if op == "-e" or op == "-a" then return C.access(path, 0) == 0 end
+  if op == "-r" then return C.access(path, 4) == 0 end
+  if op == "-w" then return C.access(path, 2) == 0 end
+  if op == "-x" then return C.access(path, 1) == 0 end
+  if op == "-t" then return C.isatty(tonumber(path) or -1) == 1 end -- fd is a terminal
+  local statfn = (op == "-h" or op == "-L") and C.curse_rt_lstat or C.curse_rt_stat
+  local ok, rc = pcall(statfn, path, _ft_a)
+  if not ok or rc ~= 0 then return false end
+  local mode = ffi.cast("uint32_t *", _ft_a + 24)[0]
+  local fmt = bit.band(mode, 0xF000)
+  if op == "-f" then return fmt == 0x8000 end -- S_IFREG
+  if op == "-d" then return fmt == 0x4000 end -- S_IFDIR
+  if op == "-b" then return fmt == 0x6000 end
+  if op == "-c" then return fmt == 0x2000 end
+  if op == "-p" then return fmt == 0x1000 end
+  if op == "-S" then return fmt == 0xC000 end
+  if op == "-h" or op == "-L" then return fmt == 0xA000 end -- S_IFLNK
+  if op == "-k" then return bit.band(mode, 0x200) ~= 0 end -- sticky
+  if op == "-g" then return bit.band(mode, 0x400) ~= 0 end -- setgid
+  if op == "-u" then return bit.band(mode, 0x800) ~= 0 end -- setuid
+  if op == "-s" then return tonumber(ffi.cast("int64_t *", _ft_a + 48)[0]) > 0 end -- st_size
+  if op == "-O" then return ffi.cast("uint32_t *", _ft_a + 28)[0] == C.geteuid() end -- st_uid
+  if op == "-G" then return ffi.cast("uint32_t *", _ft_a + 32)[0] == C.getegid() end -- st_gid
+  return false
+end
+function M.file_bincmp(op, x, y)
+  local function st(path, buf) local ok, rc = pcall(C.curse_rt_stat, path, buf); return ok and rc == 0 end
+  local ax, ay = st(x, _ft_a), st(y, _ft_b)
+  if op == "-ef" then
+    if not (ax and ay) then return false end
+    return ffi.cast("uint64_t *", _ft_a)[0] == ffi.cast("uint64_t *", _ft_b)[0]       -- st_dev @0
+       and ffi.cast("uint64_t *", _ft_a + 8)[0] == ffi.cast("uint64_t *", _ft_b + 8)[0] -- st_ino @8
+  end
+  local function older(ba, bb) -- ba's mtime < bb's mtime (sec@88, nsec@96, lexicographic)
+    local s1, s2 = tonumber(ffi.cast("int64_t *", ba + 88)[0]), tonumber(ffi.cast("int64_t *", bb + 88)[0])
+    if s1 ~= s2 then return s1 < s2 end
+    return tonumber(ffi.cast("int64_t *", ba + 96)[0]) < tonumber(ffi.cast("int64_t *", bb + 96)[0])
+  end
+  if op == "-nt" then return ax and (not ay or older(_ft_b, _ft_a)) end -- x newer (or y missing)
+  return ay and (not ax or older(_ft_a, _ft_b))                          -- -ot: x older (or x missing)
+end
 
 -- Password database read DIRECTLY from /etc/passwd, not via getpw*/NSS. A fully
 -- static build can't dlopen libnss_*, and for a shell (~user, $SHELL, ~user
