@@ -3006,6 +3006,16 @@ function M.param_error(sh, name, msg)
   error({ __curse_exit = sh.opt_c and 127 or 1, __curse_lineabort = sh.opt_i or nil })
 end
 
+-- ${a[@]OP}/${a[*]OP} per-element string-op for the compiled tier: map apply_str_op
+-- over the array's element list (strip #/##/%/%%, subst /,//, case ^/^^/,/,, and the
+-- @Q/@U… transforms), exactly interp's generic per-element path. `els` is the already-
+-- fetched dense value list; the op + (literal) args are compile-time constants.
+function M.array_op_values(sh, els, op, arg, arg2)
+  local out = {}
+  for i, v in ipairs(els) do out[i] = sh:apply_str_op(op, v, arg, arg2) end
+  return out
+end
+
 -- ${x@Q}/@U/@u/@L/@E/@K/@k transform for the compiled tier: an UNSET var yields nothing
 -- (bash — the transform doesn't apply; an unquoted empty then drops as a field), matching
 -- interp's expand_param (`if not isset then return "" end`). `val` is the already-read

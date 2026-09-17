@@ -947,6 +947,21 @@ function pexp_compilable(pe)
   end
   return PEXP_STROP[pe.op] and pexp_literal_arg(pe.arg) and pexp_literal_arg(pe.arg2) or false
 end
+-- ${a[@]OP} / ${a[*]OP}: a per-element string-op over the whole array, compiled by
+-- mapping apply_str_op via rt.array_op_values — exactly interp's generic per-element
+-- path (interp.lua multi_elems). Admits the bare expansion (no op) and the string
+-- ops whose per-element transform is a scalar apply_str_op: strip (#/##/%/%%), subst
+-- (/,//), case-fold (^/^^/,/,,), and the @Q/@U… transforms — all with compile-time
+-- literal args. Excludes slice (:off:len — index/assoc position semantics), default/
+-- alternate (:-/-/:+/+/…: field-wise default word), @a/@P, and ${!ref} indirection.
+local function array_multi_op(pe)
+  if pe.index ~= "@" and pe.index ~= "*" then return false end
+  if pe.via_indirect then return false end
+  if type(pe.name) ~= "string" or not pe.name:match("^[%a_][%w_]*$") then return false end
+  if not pe.op then return true end -- bare ${a[@]} / ${a[*]}
+  if pe.op == "@" then return PEXP_AT[pe.arg] and true or false end -- ${a[@]@Q} … (not @a/@P)
+  return PEXP_STROP[pe.op] and pexp_literal_arg(pe.arg) and pexp_literal_arg(pe.arg2) or false
+end
 -- Lua expr for a compilable pexp's scalar string value (assumes pexp_compilable).
 function pexp_scalar(pe, lifted)
   local val = lifted[pe.name] and ("rt.i64_to_str(%s)"):format(lname(pe.name))
@@ -1040,9 +1055,14 @@ local function emit_seg(p, i, lifted)
     return ("{multi=true,star=%s,q=%s,elems=sh:paramList()}"):format(
       tostring(p.special == "*"), tostring(p.q or false))
   end
-  if p.pexp then -- ${a[@]} / ${a[*]}: array elements as a multi-element segment (gated bare)
-    return ("{multi=true,star=%s,q=%s,elems=sh:array_values(%q)}"):format(
-      tostring(p.pexp.index == "*"), tostring(p.q or false), p.pexp.name)
+  if p.pexp then -- ${a[@]} / ${a[*]}: array elements as a multi-element segment (gated)
+    local pe = p.pexp
+    local elems = ("sh:array_values(%q)"):format(pe.name)
+    if pe.op then -- per-element string-op (strip/subst/case/@Q…): map apply_str_op
+      elems = ("rt.array_op_values(sh, %s, %q, %q, %q)"):format(elems, pe.op, pe.arg or "", pe.arg2 or "")
+    end
+    return ("{multi=true,star=%s,q=%s,elems=%s}"):format(
+      tostring(pe.index == "*"), tostring(p.q or false), elems)
   end
   if p.q then
     return ("{s=%s,split=false,unq=false}"):format(emit_scalar_val(p, i, lifted, false))
@@ -1103,7 +1123,7 @@ function mixed_expandable(w, lifted)
     if p.arith or p.arithast or p.cmdsub or p.procsub then return false end
     -- a bare ${a[@]}/${a[*]} array expansion is a multi-element segment seg_native renders;
     -- any other ${…} (slice/strip/indirect/scalar op) still delegates.
-    if p.pexp and not ((p.pexp.index == "@" or p.pexp.index == "*") and not p.pexp.op) then return false end
+    if p.pexp and not array_multi_op(p.pexp) then return false end
     if p.var and COMPILE_UNSAFE_VAR[p.var] then return false end
   end
   return true
@@ -1124,8 +1144,7 @@ function seg_native(w, lifted)
     elseif p.param then -- $1..$9 positional: ok
     elseif p.special == "#" or p.special == "?" or p.special == "$" or p.special == "!" then -- scalar specials
     elseif p.special == "@" or p.special == "*" then -- $@/$*: multi-element (emit_seg renders it)
-    elseif p.pexp and (p.pexp.index == "@" or p.pexp.index == "*") and not p.pexp.op
-        and p.pexp.name and p.pexp.name:match("^[%a_][%w_]*$") then -- bare ${a[@]}/${a[*]} (no slice/strip/indirect)
+    elseif p.pexp and array_multi_op(p.pexp) then -- ${a[@]}/${a[*]} bare or per-element string-op
     else return false end -- other pexp, cmdsub, arith, procsub, or anything unknown
   end
   return true
