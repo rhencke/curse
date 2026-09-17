@@ -119,6 +119,10 @@ function Shell:paramsJoin(sep) return table.concat(self.params, sep or " ", 1, s
 function Shell:paramsStar() return self:paramsJoin(self.vars["IFS"] and self:get("IFS"):sub(1, 1) or " ") end
 -- The positional params as a fresh 1-based list (for the field engine's $@/$* segments).
 function Shell:paramList() local t = {}; for i = 1, self.nparams do t[i] = self.params[i] end; return t end
+-- Backslash-escape glob metacharacters in a string so it matches literally in a glob
+-- pattern (the compiled tier's twin of interp's expand_escaped for a QUOTED pattern part:
+-- `case $x in "$p"*)` — "$p"'s metachars are literal, the trailing * is active).
+function M.glob_quote(s) return (s:gsub("[%*%?%[%]\\%(%)%|%+%@%!]", "\\%0")) end
 
 -- Positional-only call boundary: push args (varargs) into the depth pool — no
 -- table allocation per call after warmup.

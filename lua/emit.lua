@@ -1074,23 +1074,32 @@ function seg_native(w, lifted)
   end
   return true
 end
--- A case-clause pattern that is ALL literal text (no $x/$(…)/${…}) has a glob-form known
--- at COMPILE time: expand_pattern on a literal just backslash-escapes the QUOTED glob
--- metachars (interp's expand_escaped). Return that glob-form so the compiled tier matches
--- it with rt.glob_match natively (verified byte-equivalent to expand_pattern); nil if any
--- part expands — then the value + quote-aware escaping are dynamic, so keep I.case_match.
+-- Render a case-clause pattern to a Lua EXPRESSION for its glob-form, quote-aware exactly
+-- like interp's expand_pattern/expand_escaped: a QUOTED part's glob metachars are
+-- backslash-escaped (literal match), an UNQUOTED expansion's metachars stay active. A
+-- literal part folds to a compile-time constant; a scalar expansion ($x/$1/$?…) reads at
+-- runtime, quoted ones wrapped in rt.glob_quote. Returns nil (→ keep I.case_match) for a
+-- part emit can't render here: cmdsub/arith/${…}-op/$@/$*/length/CFG-unsafe special.
 local CASE_GLOBSPECIAL = "[%*%?%[%]\\%(%)%|%+%@%!]"
-local function case_lit_globform(pat)
+local function emit_pattern_glob(pat, lifted)
   local ok, w = pcall(require("parser").parse_word, pat)
   if not ok then return nil end
-  local buf = {}
-  for _, p in ipairs(w.parts) do
-    if p.lit == nil then return nil end -- $x / $(…) / ${…}: dynamic
-    local s = p.lit
-    if p.q then s = s:gsub(CASE_GLOBSPECIAL, "\\%0") end
-    buf[#buf + 1] = s
+  local out = {}
+  for i, p in ipairs(w.parts) do
+    if p.lenof or p.cmdsub or p.arith or p.arithast or p.pexp or p.procsub then return nil end
+    if p.special == "@" or p.special == "*" then return nil end -- multi-element in a pattern
+    if p.var and COMPILE_UNSAFE_VAR[p.var] then return nil end
+    if p.lit ~= nil then
+      local s = p.lit
+      if p.q then s = s:gsub(CASE_GLOBSPECIAL, "\\%0") end -- quoted metachars -> literal
+      out[#out + 1] = ("%q"):format(s)
+    else -- var / param / raw / scalar special ($#/$?/$$/$!): value; escape if quoted
+      local v = emit_scalar_val(p, i, lifted, false)
+      out[#out + 1] = p.q and ("rt.glob_quote(%s)"):format(v) or v
+    end
   end
-  return table.concat(buf)
+  if #out == 0 then return '""' end
+  return table.concat(out, " .. ")
 end
 -- Build a `local __a = {...}` argv table for words[from..#words] (each field
 -- split+globbed), or nil if any word needs the interpreter. `wrap` is applied to
@@ -2519,18 +2528,18 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
           or (cl.term == "test" and (i < n and matchentry[i + 1] or after)) or after
         bodyentry[i] = flatten_list(cl.body, btarget)
         local nextmatch = (i < n) and matchentry[i + 1] or after
-        -- All-literal patterns: compile each glob-form and match natively (rt.glob_match);
-        -- a clause with any expansion pattern keeps I.case_match (dynamic value+escaping).
-        local globs, alllit = {}, true
+        -- Compile each pattern's glob-form and match natively (rt.glob_match); a clause
+        -- with a pattern emit can't render (cmdsub/arith/${…}-op/$@/$*) keeps I.case_match.
+        local globs, allok = {}, true
         for _, pat in ipairs(cl.pats) do
-          local g = case_lit_globform(pat)
-          if g == nil then alllit = false; break end
+          local g = emit_pattern_glob(pat, lifted)
+          if g == nil then allok = false; break end
           globs[#globs + 1] = g
         end
         local mp = newpc()
-        if alllit and #globs > 0 then
+        if allok and #globs > 0 then
           local disj = {}
-          for _, g in ipairs(globs) do disj[#disj + 1] = ("rt.glob_match(%s, %q, __ic)"):format(sv, g) end
+          for _, g in ipairs(globs) do disj[#disj + 1] = ("rt.glob_match(%s, %s, __ic)"):format(sv, g) end
           blocks[mp] = ("local __ic = sh.shopt.nocasematch and true or nil; if %s then pc = %d else pc = %d end")
             :format(table.concat(disj, " or "), bodyentry[i], nextmatch)
         else
