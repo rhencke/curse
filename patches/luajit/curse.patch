@@ -1,5 +1,129 @@
+diff --git a/src/lj_asm.c b/src/lj_asm.c
+index 4818c68d..b1bb9815 100644
+--- a/src/lj_asm.c
++++ b/src/lj_asm.c
+@@ -1177,6 +1177,7 @@ static void asm_tdup(ASMState *as, IRIns *ir)
+ }
+ 
+ static void asm_gc_check(ASMState *as);
++static void asm_interrupt_check(ASMState *as);  /* curse: hook-pending exit at loop back-edge */
+ 
+ /* Explicit GC step. */
+ static void asm_gcstep(ASMState *as, IRIns *ir)
+@@ -1688,6 +1689,7 @@ static void asm_loop(ASMState *as)
+   MCode *mcspill;
+   /* LOOP is a guard, so the snapno is up to date. */
+   as->loopsnapno = as->snapno;
++  asm_interrupt_check(as);  /* curse: allow a pending VM hook to break this loop */
+   if (as->gcsteps)
+     asm_gc_check(as);
+   /* LOOP marks the transition from the variant to the invariant part. */
+@@ -2491,6 +2493,9 @@ void lj_asm_trace(jit_State *J, GCtrace *T)
+   /* Setup initial state. Copy some fields to reduce indirections. */
+   as->J = J;
+   as->T = T;
++#ifdef CURSE_SIG_DESTRUCTIVE
++  T->loopback = NULL;  /* curse: set in asm_loop_fixup iff this trace has a patchable loop. */
++#endif
+   J->curfinal = lj_trace_alloc(J->L, T);  /* This copies the IR, too. */
+   as->flags = J->flags;
+   as->loopref = J->loopref;
+@@ -2504,6 +2509,14 @@ void lj_asm_trace(jit_State *J, GCtrace *T)
+   /* Reserve MCode memory. */
+   as->mctop = as->mctoporig = lj_mcode_reserve(J, &as->mcbot);
+   as->mcp = as->mctop;
++#ifdef CURSE_SIG_DESTRUCTIVE
++  /* curse: reserve 5 bytes of patch room above the trace's final safepoint. The
++   * loop back-edge sits flush against the top; on a signal we overwrite it with a
++   * 5-byte jmp to the exit stub, and a 2-byte short back-edge spills 3 bytes past
++   * the code. This guarantees those bytes are ours, not the neighbouring trace's.
++   * mctoporig is left at the true top so exit-stub setup and icache sync cover it. */
++  as->mctop -= 5;
++#endif
+   as->mclim = as->mcbot + MCLIM_REDZONE;
+   asm_setup_target(as);
+ 
+diff --git a/src/lj_asm_x86.h b/src/lj_asm_x86.h
+index a2cf8fe9..a772634b 100644
+--- a/src/lj_asm_x86.h
++++ b/src/lj_asm_x86.h
+@@ -2819,6 +2819,29 @@ static void asm_stack_restore(ASMState *as, SnapShot *snap)
+ /* -- GC handling --------------------------------------------------------- */
+ 
+ /* Check GC threshold and do one or more GC steps. */
++/* curse: at a loop back-edge, exit the trace when a VM hook is pending
++ * (g->hookmask != 0) so an async signal's scheduled hook can interrupt a
++ * JIT-compiled loop. Emits: movzx tmp, byte [g->hookmask]; test tmp,tmp;
++ * jne exitstub(loopsnapno) — a state-restoring side-exit to the interpreter.
++ * (Assumes asm_snap_prep() already done, like asm_gc_check.) */
++static void asm_interrupt_check(ASMState *as)
++{
++#ifdef CURSE_SIG_DESTRUCTIVE
++  /* Destructive-edit variant (no NOP, no per-iteration check — the trace is
++   * emitted exactly as LuaJIT would). We only record the loop snapshot's exit
++   * stub here; asm_loop_fixup records the address of the back-edge rel32 once it
++   * is emitted. On a signal that arrives while this trace runs,
++   * curse_sig_patch_trace() destructively repoints the back-edge jump at the exit
++   * stub, and lj_trace_exit restores the original target the instant we exit. */
++  as->T->loopexit = exitstub_addr(as->J, as->loopsnapno);
++#else
++  Reg tmp = ra_scratch(as, RSET_GPR);
++  asm_guardcc(as, CC_NE);
++  emit_rr(as, XO_TEST, tmp, tmp);
++  emit_opgl(as, XO_MOVZXb, tmp, hookmask);
++#endif
++}
++
+ static void asm_gc_check(ASMState *as)
+ {
+   const CCallInfo *ci = &lj_ir_callinfo[IRCALL_lj_gc_step_jit];
+@@ -2859,6 +2882,9 @@ static void asm_loop_fixup(ASMState *as)
+   MCode *target = as->mcp;
+   if (as->realign) {  /* Realigned loops use short jumps. */
+     as->realign = NULL;  /* Stop another retry. */
++#ifdef CURSE_SIG_DESTRUCTIVE
++    as->T->loopback = NULL;  /* curse: loopinv realign is skipped (see below). */
++#endif
+     lj_assertA(((intptr_t)target & 15) == 0, "loop realign failed");
+     if (as->loopinv) {  /* Inverted loop branch? */
+       p -= 5;
+@@ -2871,6 +2897,13 @@ static void asm_loop_fixup(ASMState *as)
+       lj_assertA(target - p >= -128, "loop realign failed");
+       p[-1] = (MCode)(int8_t)(target - p);  /* Patch short jmp. */
+       p[-2] = XI_JMPs;
++#ifdef CURSE_SIG_DESTRUCTIVE
++      /* curse: the back-edge is a 2-byte short jmp at mctop-2 (the loop's final
++       * safepoint). We can't fit a 5-byte jmp there, so on a signal we overwrite
++       * 5 bytes starting here, spilling 3 bytes into the reserved buffer past the
++       * trace end (asm_tail_start reserves it). Record the back-edge start. */
++      as->T->loopback = p-2;
++#endif
+     }
+   } else {
+     MCode *newloop;
+@@ -2880,12 +2913,20 @@ static void asm_loop_fixup(ASMState *as)
+       p -= 5;
+       newloop = target+4;
+       *(int32_t *)(p-4) = (int32_t)(target - p);  /* Patch jcc. */
++#ifdef CURSE_SIG_DESTRUCTIVE
++      as->T->loopback = NULL;  /* curse: inverted-branch back-edge — skip (rare). */
++#endif
+       if (as->loopinv == 2) {
+ 	*(int32_t *)(p-10) = (int32_t)(target - p + 6);  /* Patch opt. jp. */
+ 	newloop = target+8;
+       }
+     } else {  /* Otherwise just patch jmp. */
+       *(int32_t *)(p-4) = (int32_t)(target - p);
++#ifdef CURSE_SIG_DESTRUCTIVE
++      /* curse: back-edge is a 5-byte E9 rel32 at mctop-5 (the loop's final
++       * safepoint) — already 5 bytes wide, so overwriting it needs no buffer. */
++      as->T->loopback = p-5;
++#endif
+       newloop = target+3;
+     }
+     /* Realign small loops and shorten the loop branch. */
 diff --git a/src/lj_clib.c b/src/lj_clib.c
-index 283b6e4..62c231e 100644
+index 283b6e42..62c231ef 100644
 --- a/src/lj_clib.c
 +++ b/src/lj_clib.c
 @@ -137,9 +137,13 @@ static void clib_unloadlib(CLibrary *cl)
@@ -16,8 +140,90 @@ index 283b6e4..62c231e 100644
    return p;
  }
  
+diff --git a/src/lj_jit.h b/src/lj_jit.h
+index af50e5c1..91736c2f 100644
+--- a/src/lj_jit.h
++++ b/src/lj_jit.h
+@@ -280,6 +280,10 @@ typedef struct GCtrace {
+   uint8_t topslot;	/* Top stack slot already checked to be allocated. */
+   uint8_t linktype;	/* Type of link. */
+   uint8_t unused1;
++#ifdef CURSE_SIG_DESTRUCTIVE
++  MCode *loopback;	/* curse: addr of the loop back-edge rel32 (NULL if none). */
++  MCode *loopexit;	/* curse: exit stub addr for the loop snapshot. */
++#endif
+ #ifdef LUAJIT_USE_GDBJIT
+   void *gdbjit_entry;	/* GDB JIT entry. */
+ #endif
+diff --git a/src/lj_trace.c b/src/lj_trace.c
+index 24a1f7e4..2f590b42 100644
+--- a/src/lj_trace.c
++++ b/src/lj_trace.c
+@@ -883,9 +883,62 @@ static TraceNo trace_exit_find(jit_State *J, MCode *pc)
+ #endif
+ 
+ /* A trace exited. Restore interpreter state. */
++#ifdef CURSE_SIG_DESTRUCTIVE
++#include <sys/mman.h>
++#include <unistd.h>
++extern lua_State *curse_globalL(void);
++static MCode *curse_patched_back;   /* Addr of the overwritten back-edge (or NULL). */
++static MCode curse_patched_orig[5]; /* Its original 5 bytes, to restore on exit. */
++
++/* curse: called from the async signal handler when a signal arrives while a JIT
++ * trace is running (LuaJIT hooks don't fire inside a trace). No NOP, no reserved
++ * slot: it destructively repoints the running loop's back-edge jump — an existing,
++ * necessary instruction — from the loop top at the loop's exit stub, so the next
++ * back-edge is a clean, state-restoring side-exit to the interpreter (where the
++ * scheduled VM hook then runs the trap). Only the 4-byte rel32 displacement is
++ * touched; a signal's saved RIP is always an instruction boundary and never lands
++ * inside that operand, so there is no mid-instruction resume hazard, and the
++ * machine state at the back-edge IS the loop snapshot, so exiting there is exact.
++ * lj_trace_exit restores the original target the instant the exit fires. */
++void curse_sig_patch_trace(void)
++{
++  lua_State *L = curse_globalL();
++  global_State *g;
++  jit_State *J;
++  GCtrace *T;
++  MCode *bk, *ex;
++  int32_t vs;
++  intptr_t pg, a, b;
++  if (!L) return;
++  g = G(L);
++  vs = (int32_t)g->vmstate;
++  if (vs <= 0) return;               /* Not currently executing a trace. */
++  if (curse_patched_back) return;    /* One outstanding patch at a time. */
++  J = G2J(g);
++  T = traceref(J, (TraceNo)vs);
++  if (!T || !T->loopback) return;    /* No patchable loop back-edge. */
++  bk = T->loopback; ex = T->loopexit;
++  pg = (intptr_t)sysconf(_SC_PAGESIZE);
++  a = ((intptr_t)bk) & ~(pg-1);
++  b = (((intptr_t)bk + 5 + pg-1) & ~(pg-1));
++  if (mprotect((void *)a, (size_t)(b-a), PROT_READ|PROT_WRITE|PROT_EXEC)) return;
++  memcpy(curse_patched_orig, bk, 5);               /* Save the 5 bytes we clobber. */
++  curse_patched_back = bk;
++  bk[0] = 0xe9;                                     /* jmp rel32 -> loop exit stub. */
++  *(int32_t *)(bk+1) = (int32_t)(ex - (bk+5));
++  /* x86: sigreturn (iret) serializes, so the trace re-fetches the patched rel32. */
++}
++#endif
++
+ int LJ_FASTCALL lj_trace_exit(jit_State *J, void *exptr)
+ {
+   ERRNO_SAVE
++#ifdef CURSE_SIG_DESTRUCTIVE
++  if (curse_patched_back) {  /* Restore the back-edge the instant we exit. */
++    memcpy(curse_patched_back, curse_patched_orig, 5);
++    curse_patched_back = NULL;
++  }
++#endif
+   lua_State *L = J->L;
+   ExitState *ex = (ExitState *)exptr;
+   ExitDataCP exd;
 diff --git a/src/luajit.c b/src/luajit.c
-index 65d55c3..c717f8d 100644
+index 65d55c3c..c717f8d6 100644
 --- a/src/luajit.c
 +++ b/src/luajit.c
 @@ -53,6 +53,9 @@ static void signal_set(int sig, void (*h)(int))

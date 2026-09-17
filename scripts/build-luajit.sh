@@ -26,7 +26,11 @@ ROOT=$(pwd)
 LJDIR="$ROOT/.bench-lua/src/luajit"
 LJ="$LJDIR/src"
 BOOT="$ROOT/.bench-lua/luajit"           # a working luajit to build the bundle with
-CCOPT="-O3 -march=native -fomit-frame-pointer"
+# -DCURSE_SIG_DESTRUCTIVE: preempt a running JIT loop by destructively overwriting
+# its back-edge (the loop's final safepoint) with a jmp to the exit stub on a
+# signal, restored the instant we exit. Zero steady-state footprint (the hot loop
+# is byte-identical to stock LuaJIT). See patches/luajit/curse.patch + lib_cursesig.c.
+CCOPT="-O3 -march=native -fomit-frame-pointer -DCURSE_SIG_DESTRUCTIVE"
 JOBS=$(nproc 2>/dev/null || echo 4)
 PGO=1; FRESH=0
 for a in "$@"; do case "$a" in --no-pgo) PGO=0;; --fresh) FRESH=1;;

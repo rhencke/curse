@@ -62,6 +62,12 @@ static void curse_sig_onsignal(int s)
   L = curse_globalL();
   if (L) lua_sethook(L, curse_sig_hook,
                      LUA_MASKCALL | LUA_MASKRET | LUA_MASKCOUNT, 1);
+#ifdef CURSE_SIG_DESTRUCTIVE
+  /* A pure-compute JIT loop never reaches a VM safepoint, so the scheduled hook
+   * above won't fire inside it. Destructively patch the running trace's back-edge
+   * to force a side-exit (reverted the instant the exit fires). See lj_trace.c. */
+  { extern void curse_sig_patch_trace(void); curse_sig_patch_trace(); }
+#endif
 }
 
 /* Install curse's async handler for signal `s` (no SA_RESTART -> blocking syscalls
