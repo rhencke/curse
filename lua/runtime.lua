@@ -2991,6 +2991,21 @@ function M.var_has_value(sh, name)
   return isset or sh:special_get(name) ~= ""
 end
 
+-- ${x:=word}/${x=word}: assign the default to the variable (bash's assign_default for a
+-- scalar/bare-array name — pexp_compilable never compiles a subscripted target), returning
+-- the value. A bare name that IS an array writes element 0.
+function M.assign_default(sh, name, v)
+  local b = sh.vars[sh:deref(name)]
+  if b and b.arr then sh:array_set(name, 0, v) else sh:set_str(name, v) end
+  return v
+end
+-- ${x:?word}/${x?word}: the value was empty/unset — print the message and abort (exits
+-- under -c/posix, else line-abort), exactly as interp's expand_param.
+function M.param_error(sh, name, msg)
+  io.stderr:write("curse: " .. name .. ": " .. msg .. "\n")
+  error({ __curse_exit = sh.opt_c and 127 or 1, __curse_lineabort = sh.opt_i or nil })
+end
+
 -- ${x@Q}/@U/@u/@L/@E/@K/@k transform for the compiled tier: an UNSET var yields nothing
 -- (bash — the transform doesn't apply; an unquoted empty then drops as a field), matching
 -- interp's expand_param (`if not isset then return "" end`). `val` is the already-read

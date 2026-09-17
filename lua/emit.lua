@@ -921,7 +921,8 @@ local PEXP_AT = { Q = 1, K = 1, k = 1, U = 1, u = 1, L = 1, E = 1 }
 -- Default/alternate ops. In a QUOTED context they compile to a scalar (pexp_scalar); an
 -- UNQUOTED one still delegates (field_word rejects it) — the default word's own quoting
 -- governs field-splitting there, which needs the interp word engine.
-local PEXP_DEFAULT = { [":-"] = 1, ["-"] = 1, [":+"] = 1, ["+"] = 1 }
+local PEXP_DEFAULT = { [":-"] = 1, ["-"] = 1, [":+"] = 1, ["+"] = 1,
+  [":="] = 1, ["="] = 1, [":?"] = 1, ["?"] = 1 }
 -- A pexp ARG is compile-time constant when it is plain literal glob text: no
 -- expansion ($ ` ~), no quote char (a quoted metachar is literal — different glob
 -- semantics), and no backslash (escapes a glob char, or is a literal in a
@@ -933,14 +934,13 @@ function pexp_compilable(pe)
   if type(name) ~= "string" or not name:match("^[%a_][%w_]*$") or COMPILE_UNSAFE_VAR[name] then return false end
   if pe.op == "len" then return true end -- ${#x}: scalar codepoint length via apply_str_op("len")
   if pe.op == "@" then return PEXP_AT[pe.arg] and true or false end -- ${x@Q}/@U/@L/@E … (not @P/@a)
-  if pe.op == ":-" or pe.op == "-" or pe.op == ":+" or pe.op == "+" then
-    -- default/alternate: compile when the default word itself is emit_word-able (its cmdsub/
-    -- vars/nested ops render). The default is lazy (Lua short-circuit). Only a QUOTED context
-    -- reaches pexp_scalar (field_word rejects an unquoted one — its field-wise splitting of
-    -- the default needs the interp word engine). No :=/:? here (assign/error side effects).
-    -- The default word's tilde (word- vs assign-context), backslash escapes, and inner
-    -- quoting (`"${x:-'c d'}"`) differ from emit_word — reject those chars so only a plain /
-    -- $var / $(…) default (where emit_word matches interp's word expansion) compiles.
+  if PEXP_DEFAULT[pe.op] then
+    -- default/alternate/assign/error: compile when the default word is emit_word-able. The
+    -- default is lazy (Lua short-circuit). Only a QUOTED context reaches pexp_scalar
+    -- (field_word rejects an unquoted one — its field-wise default splitting needs the interp
+    -- word engine). The default word's tilde (word- vs assign-context), backslash escapes,
+    -- and inner quoting (`"${x:-'c d'}"`) differ from emit_word — reject those chars so only
+    -- a plain / $var / $(…) default (where emit_word matches interp's word expansion) compiles.
     if pe.arg and pe.arg:find("[~\\'\"]") then return false end
     local ok, w = pcall(require("parser").parse_word, pe.arg or "")
     return ok and emitable_word(w) or false
@@ -953,8 +953,8 @@ function pexp_scalar(pe, lifted)
     or ("sh:get_u(%q)"):format(pe.name) -- get_u: an unset var trips set -u, like bash
   if pe.op == "len" then return ("tostring(rt.mb_strlen(%s))"):format(val) end -- ${#x}: codepoint length
   if pe.op == "@" then return ("rt.at_transform(sh, %q, %s, %q)"):format(pe.name, val, pe.arg) end -- unset-aware transform
-  if pe.op == ":-" or pe.op == "-" or pe.op == ":+" or pe.op == "+" then
-    -- default/alternate (SCALAR/quoted context). `getv` uses sh:get (these ops are set -u
+  if PEXP_DEFAULT[pe.op] then
+    -- default/alternate/assign/error (SCALAR/quoted context). `getv` uses sh:get (set -u
     -- exempt); the default word is expanded lazily via Lua short-circuit (a side-effecting
     -- $(…) default runs only when its branch is taken). - / + test set-ness, :- / :+ test
     -- non-emptiness.
@@ -963,7 +963,12 @@ function pexp_scalar(pe, lifted)
     if pe.op == ":-" then return ("(function() local __d = %s; return __d ~= \"\" and __d or %s end)()"):format(getv, def) end
     if pe.op == ":+" then return ("(function() local __d = %s; return __d ~= \"\" and %s or \"\" end)()"):format(getv, def) end
     if pe.op == "-" then return ("(rt.var_has_value(sh, %q) and %s or %s)"):format(pe.name, getv, def) end
-    return ("(rt.var_has_value(sh, %q) and %s or \"\")"):format(pe.name, def) -- +
+    if pe.op == "+" then return ("(rt.var_has_value(sh, %q) and %s or \"\")"):format(pe.name, def) end
+    -- :=/= assign the default to the var (side effect) and return it; :?/? error out.
+    if pe.op == ":=" then return ("(function() local __d = %s; return __d ~= \"\" and __d or rt.assign_default(sh, %q, %s) end)()"):format(getv, pe.name, def) end
+    if pe.op == "=" then return ("(rt.var_has_value(sh, %q) and %s or rt.assign_default(sh, %q, %s))"):format(pe.name, getv, pe.name, def) end
+    if pe.op == ":?" then return ("(function() local __d = %s; return __d ~= \"\" and __d or rt.param_error(sh, %q, %s) end)()"):format(getv, pe.name, def) end
+    return ("(rt.var_has_value(sh, %q) and %s or rt.param_error(sh, %q, %s))"):format(pe.name, getv, pe.name, def) -- ?
   end
   return ("sh:apply_str_op(%q, %s, %q, %q)"):format(pe.op, val, pe.arg or "", pe.arg2 or "")
 end
