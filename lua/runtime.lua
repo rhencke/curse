@@ -2891,20 +2891,45 @@ function M.arith_read(sh, name)
   end
   return require("interp").arith_read(sh, name) -- unset/blank/$-expansion/subscript: bootstrap
 end
--- A `[[ … -eq/-lt/… … ]]` numeric operand: arith-evaluate the (already word-expanded)
--- operand string, exactly as interp's dbracket_arith = eval(P.arith(s)). Empty is 0; a
--- plain number is native; otherwise compile it (compile_arith_value renders var operands
--- as recursive rt.arith_read, so `[[ $a -eq 5 ]]` with a naming another var resolves and
--- the shared cycle guard applies). A subscript/$-form operand it can't compile defers to
--- the interp evaluator, which also raises the same math/syntax error the [[ ]] codegen
--- maps to status 2.
-function M.dbracket_arith(sh, s)
+-- Evaluate an ALREADY word-expanded string as an arithmetic expression, exactly as
+-- interp's eval(P.arith(s)) — used for a `[[ … -eq … ]]` operand AND a `declare -i n=EXPR`
+-- value. Empty is 0; a plain number is native; otherwise compile it (compile_arith_value
+-- renders var operands as recursive rt.arith_read, so a value naming another var resolves
+-- under the shared cycle guard). A subscript/$-form it can't compile defers to the interp
+-- evaluator (interp.dbracket_arith = eval(P.arith(s)), empty->0), which also raises the
+-- same math/syntax error the caller's codegen maps to a failing status.
+function M.arith_str(sh, s)
   if s == "" then return i64(0) end
   if M.looks_numeric(s) then return M.arith_num(s) end
   local fn = _acache[s]
   if fn == nil then fn = require("emit").compile_arith_value(s) or false; _acache[s] = fn end
   if fn then return fn(sh) end
   return require("interp").dbracket_arith(sh, s)
+end
+-- Attribute-aware scalar assignment (interp's assign_scalar twin, for the EF.has_attr
+-- compiled path): the RHS `value` is already word-expanded. A readonly target errors
+-- (writing THROUGH a nameref is non-fatal; a direct one aborts the line, or hard-exits
+-- under -c/posix); an array target assigns element [0]; an integer var arith-evaluates
+-- the value (rt.arith_str — native, subscript/$-form via the interp seam); -l/-u fold
+-- case; else a plain string set. `set -a` auto-exports a plain scalar. No array_key.
+function M.assign_scalar(sh, name, value)
+  local direct = sh.vars[name]
+  local b = sh.vars[sh:deref(name)]
+  if b and b.ro then
+    io.stderr:write("curse: " .. name .. ": readonly variable\n")
+    sh.status = 1
+    if direct and direct.ref then return end -- through a nameref: non-fatal (bash)
+    if sh.opt_c or sh.opt_posix then error({ __curse_exit = 1 }) end
+    error({ __curse_exit = 1, __curse_lineabort = true })
+  end
+  if b and b.arr then sh:array_set(name, sh:is_assoc(name) and "0" or 0, value, false) -- a=x on an array -> a[0]
+  elseif b and b.int then sh:aset(name, M.arith_str(sh, value)) -- declare -i: RHS is arithmetic
+  elseif b and (b.lower or b.upper) then sh:set_str(name, b.lower and value:lower() or value:upper())
+  else sh:set_str(name, value) end
+  if sh.opt_a then -- set -a (allexport): a plain scalar assignment auto-exports (bash)
+    local nb = sh.vars[sh:deref(name)]
+    if nb and not nb.arr then nb.exported = true; C.setenv(sh:deref(name), sh:get(name), 1) end
+  end
 end
 -- Gate for the compiled fast-xpand path: true when the var's value binds like a
 -- numeric atom (so native rendering == bash's textual substitution).

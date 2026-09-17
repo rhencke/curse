@@ -896,7 +896,7 @@ local function emit_dbracket(node, lifted)
       local eq = ("rt.dbracket_eq(sh, %s, %s, %s)"):format(l, emit_word(node.r, lifted), node.rq and "true" or "false")
       return op == "!=" and ("(not " .. eq .. ")") or eq
     elseif ARITH_CMP[op] then
-      return ("(rt.dbracket_arith(sh, %s) %s rt.dbracket_arith(sh, %s))"):format(l, ARITH_CMP[op], emit_word(node.r, lifted))
+      return ("(rt.arith_str(sh, %s) %s rt.arith_str(sh, %s))"):format(l, ARITH_CMP[op], emit_word(node.r, lifted))
     elseif op == "<" then return ("rt.coll_lt(%s, %s)"):format(l, emit_word(node.r, lifted))
     elseif op == ">" then return ("rt.coll_lt(%s, %s)"):format(emit_word(node.r, lifted), l)
     elseif op == "-nt" or op == "-ot" or op == "-ef" then
@@ -1864,11 +1864,11 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
         blocks[p] = d .. emit_set(st.name, rhs, lifted) .. ua .. ("; pc = %d"):format(after)
       elseif lifted[st.name] then
         blocks[p] = d .. emit_set(st.name, numeric_word(st.rhs) .. "LL", lifted) .. ua .. ("; pc = %d"):format(after)
-      elseif EF.has_attr then -- readonly reject / array [0] / declare -i,-l,-u — via interp's logic
+      elseif EF.has_attr then -- readonly reject / array [0] / declare -i,-l,-u — native primitive
         -- status 0 first so a plain RHS yields 0 (a cmdsub RHS overwrites it), then
         -- assign_scalar (which sets 1 on a readonly reject); errchk applies errexit/ERR.
         local ec = errchk(st); local ecs = ec ~= "" and ("; " .. ec) or ""
-        blocks[p] = d .. ("sh.status = 0; I.assign_scalar(sh, %q, %s)%s%s; pc = %d")
+        blocks[p] = d .. ("sh.status = 0; rt.assign_scalar(sh, %q, %s)%s%s; pc = %d")
           :format(st.name, rhsval(), ecs, ua, after)
       else
         -- $? after a plain assignment: the RHS's last cmdsub status, else 0 — but the
