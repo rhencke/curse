@@ -635,6 +635,90 @@ local function emit_arith_stmt(e, lifted)
   error("emit: statement position not supported for arith node " .. tostring(e.k))
 end
 
+-- ---- recursive-value arith: native compile of a var's VALUE re-evaluated as arith ----
+-- `x="1+2"; $((x))` reads x, then re-parses+evaluates its VALUE "1+2" as arithmetic
+-- (interp: arith_read -> arith_resolve -> eval). That recursive evaluation was the
+-- rt.arith_read -> interp.arith_read seam. Here we COMPILE the value's AST to native
+-- Lua ops instead, for the WORD-ENGINE-FREE subset only: no $-expansion (xpand — its
+-- textual substitution is dynamic) and no array subscript (arith_key can run cmdsub —
+-- the bugs.test.sh `a[$(…)]=1` case). Anything outside the subset returns nil, so
+-- rt.arith_read keeps the interp bootstrap for it (compile-eventually, never a NEW seam).
+local function arith_native_ok(e)
+  if type(e) ~= "table" then return false end
+  local k = e.k
+  if k == "num" or k == "param" then return true end
+  if k == "var" then return not e.idx and not e.idxraw end -- scalar only (subscript -> arith_key)
+  if k == "un" then return arith_native_ok(e.e) end
+  if k == "bin" then return arith_native_ok(e.l) and arith_native_ok(e.r) end
+  if k == "tern" then return arith_native_ok(e.c) and arith_native_ok(e.a) and arith_native_ok(e.b) end
+  if k == "comma" then return arith_native_ok(e.l) and arith_native_ok(e.r) end
+  return false -- asgn/post/pre (nounset + lifted-var write subtleties), xpand/xpandleaf/
+  -- matherr/raw (dynamic or subscript): keep the interp bootstrap (identical to HEAD).
+end
+-- Render an arithmetic binary op (same op->expr mapping as emit_value's `bin`); shared
+-- by emit_avalue's bin node and its compound-assignment (`x <<= y`).
+local function arith_binop(op, l, r)
+  if op == "+" or op == "-" or op == "*" then return "(" .. l .. " " .. op .. " " .. r .. ")" end
+  if op == "/" then return ("rt.idiv(%s, %s)"):format(l, r) end
+  if op == "%" then return ("rt.imod(%s, %s)"):format(l, r) end
+  if op == "&" then return ("bit.band(%s, %s)"):format(l, r) end
+  if op == "|" then return ("bit.bor(%s, %s)"):format(l, r) end
+  if op == "^" then return ("bit.bxor(%s, %s)"):format(l, r) end
+  if op == "<<" then return ("bit.lshift(%s, tonumber(%s) %% 64)"):format(l, r) end
+  if op == ">>" then return ("bit.arshift(%s, tonumber(%s) %% 64)"):format(l, r) end
+  if op == "**" then return ("rt.ipow(%s, %s)"):format(l, r) end
+  error("arith_binop: unsupported " .. tostring(op))
+end
+-- Render one arith node to a value-returning Lua expression. Like emit_value but with
+-- the side-effecting nodes (asgn/post/pre/comma) as value expressions/IIFEs, and every
+-- var read recurses through rt.arith_read (a value may itself hold an expression). lifted
+-- is always {} (a standalone value string), so no i64 locals — assign returns via sh:aset.
+local emit_avalue
+emit_avalue = function(e)
+  local k = e.k
+  if k == "num" then
+    if e.v:match("^%d+$") and (e.v == "0" or e.v:sub(1, 1) ~= "0") then return e.v .. "LL" end
+    return ("rt.arith_num(%q)"):format(e.v) -- 0x.. / 010 / N#.. bases
+  end
+  if k == "var" then return ("rt.arith_read(sh, %q)"):format(e.name) end -- recursive (reentrancy-guarded)
+  if k == "param" then return ("rt.str_to_i64(sh:param(%d))"):format(e.n) end
+  if k == "un" then
+    local v = emit_avalue(e.e)
+    if e.op == "-" then return "(-(" .. v .. "))" end
+    if e.op == "!" then return "((" .. v .. ") == 0LL and 1LL or 0LL)" end
+    if e.op == "~" then return "bit.bnot(" .. v .. ")" end
+  end
+  if k == "tern" then
+    return ("((( %s ) ~= 0LL) and ( %s ) or ( %s ))"):format(emit_avalue(e.c), emit_avalue(e.a), emit_avalue(e.b))
+  end
+  if k == "comma" then
+    return ("(function() local _ = %s; return %s end)()"):format(emit_avalue(e.l), emit_avalue(e.r))
+  end
+  if k == "bin" then
+    local op = e.op
+    if op == "&&" then return ("(((%s) ~= 0LL and (%s) ~= 0LL) and 1LL or 0LL)"):format(emit_avalue(e.l), emit_avalue(e.r)) end
+    if op == "||" then return ("(((%s) ~= 0LL or (%s) ~= 0LL) and 1LL or 0LL)"):format(emit_avalue(e.l), emit_avalue(e.r)) end
+    local l, r = emit_avalue(e.l), emit_avalue(e.r)
+    if CMP[op] then return "((" .. l .. " " .. CMP[op] .. " " .. r .. ") and 1LL or 0LL)" end
+    return arith_binop(op, l, r)
+  end
+  -- asgn/post/pre are gated out by arith_native_ok (their nounset + lifted-var write
+  -- semantics stay on the interp bootstrap), so they never reach here.
+  error("emit_avalue: unsupported arith node " .. tostring(k))
+end
+-- Compile a var's VALUE string to `function(sh) return <int64> end`, or nil if the value
+-- isn't a parseable in-subset arith expression (caller keeps the interp bootstrap). The
+-- returned fn reads only sh + rt + bit (same preamble as M.emit's module header).
+function M.compile_arith_value(s)
+  local ok, ast = pcall(require("parser").arith, s) -- deferred form, exactly as arith_resolve
+  if not ok or not arith_native_ok(ast) then return nil end
+  local ok2, expr = pcall(emit_avalue, ast)
+  if not ok2 then return nil end
+  local f = load('local rt = require("runtime"); local bit = require("bit"); return function(sh) return '
+    .. expr .. ' end', "=curse:arith")
+  return f and f() or nil
+end
+
 -- Compile a literal `$(cmd)` / backtick inner (KNOWN at this compile time) into an
 -- inline fragment closure cs_N and return the Lua expr that runs it capturing
 -- stdout. The fragment reads `sh` directly (lift set {}), so lifted operands are

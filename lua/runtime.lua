@@ -2787,10 +2787,43 @@ function M.looks_numeric(s)
   return s:match("^%s*[+-]?%d+%s*$") or s:match("^%s*[+-]?0[xX]%x+%s*$")
     or s:match("^%s*[+-]?0[0-7]+%s*$") or s:match("^%s*%d+#[%w@_]+%s*$")
 end
+local _acache = {} -- value-string -> compiled fn(sh) | false (uncompilable; keep the seam)
 function M.arith_read(sh, name)
   local s = sh:get(name)
   if s ~= nil and M.looks_numeric(s) then return M.arith_num(s) end -- native fast path
-  return require("interp").arith_read(sh, name) -- unset/blank/non-numeric: full & dynamic
+  -- Non-numeric VALUE (a stored expression like x="1+2"): COMPILE it to native ops and
+  -- run — exactly what interp's arith_read -> arith_resolve -> eval does, but as genuine
+  -- compiled code, not a tree-walk. Only the word-engine-free subset compiles (no
+  -- $-expansion, no array subscript); $-forms/subscripts/unset/blank stay the interp
+  -- bootstrap (their value/parse is dynamic, not reducible to monomorphic native ops).
+  if s ~= nil and not s:match("^%s*$") and not (sh.arithfault and sh.in_arithcmd) then
+    local fn = _acache[s]
+    if fn == nil then fn = require("emit").compile_arith_value(s) or false; _acache[s] = fn end
+    if fn then
+      -- Mirror arith_read∘arith_resolve exactly: a depth guard (bash cycle protection;
+      -- 40 matches interp's arith_resolve, shared via sh.arith_depth across the seam),
+      -- a nested bad value swallowed to 0, and a real matherr/experr mapped to a
+      -- non-fatal $?=1 inside (( )) (sh.arithfault flag) or a line-abort in a word $((…)).
+      local ok, v = pcall(function()
+        sh.arith_depth = (sh.arith_depth or 0) + 1
+        if sh.arith_depth > 40 then sh.arith_depth = sh.arith_depth - 1; return i64(0) end -- cycle guard
+        local ok2, r = pcall(fn, sh)
+        sh.arith_depth = sh.arith_depth - 1
+        if not ok2 then
+          if type(r) == "table" and (r.__curse_experr or r.__curse_matherr) then error(r) end
+          return i64(0) -- a nested bad value stays swallowed as 0 (matches arith_resolve)
+        end
+        return r ~= nil and r or i64(0)
+      end)
+      if ok then return v end
+      if type(v) == "table" and (v.__curse_matherr or v.__curse_experr) then
+        if sh.in_arithcmd then sh.arithfault = true; return i64(0) end
+        error({ __curse_lineabort = true })
+      end
+      error(v)
+    end
+  end
+  return require("interp").arith_read(sh, name) -- unset/blank/$-expansion/subscript: bootstrap
 end
 -- Gate for the compiled fast-xpand path: true when the var's value binds like a
 -- numeric atom (so native rendering == bash's textual substitution).
