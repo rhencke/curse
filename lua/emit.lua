@@ -1074,6 +1074,24 @@ function seg_native(w, lifted)
   end
   return true
 end
+-- A case-clause pattern that is ALL literal text (no $x/$(…)/${…}) has a glob-form known
+-- at COMPILE time: expand_pattern on a literal just backslash-escapes the QUOTED glob
+-- metachars (interp's expand_escaped). Return that glob-form so the compiled tier matches
+-- it with rt.glob_match natively (verified byte-equivalent to expand_pattern); nil if any
+-- part expands — then the value + quote-aware escaping are dynamic, so keep I.case_match.
+local CASE_GLOBSPECIAL = "[%*%?%[%]\\%(%)%|%+%@%!]"
+local function case_lit_globform(pat)
+  local ok, w = pcall(require("parser").parse_word, pat)
+  if not ok then return nil end
+  local buf = {}
+  for _, p in ipairs(w.parts) do
+    if p.lit == nil then return nil end -- $x / $(…) / ${…}: dynamic
+    local s = p.lit
+    if p.q then s = s:gsub(CASE_GLOBSPECIAL, "\\%0") end
+    buf[#buf + 1] = s
+  end
+  return table.concat(buf)
+end
 -- Build a `local __a = {...}` argv table for words[from..#words] (each field
 -- split+globbed), or nil if any word needs the interpreter. `wrap` is applied to
 -- each final field. Used for commands whose args word-split/glob.
@@ -2501,11 +2519,26 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
           or (cl.term == "test" and (i < n and matchentry[i + 1] or after)) or after
         bodyentry[i] = flatten_list(cl.body, btarget)
         local nextmatch = (i < n) and matchentry[i + 1] or after
-        local pq = {}
-        for _, pat in ipairs(cl.pats) do pq[#pq + 1] = ("%q"):format(pat) end
+        -- All-literal patterns: compile each glob-form and match natively (rt.glob_match);
+        -- a clause with any expansion pattern keeps I.case_match (dynamic value+escaping).
+        local globs, alllit = {}, true
+        for _, pat in ipairs(cl.pats) do
+          local g = case_lit_globform(pat)
+          if g == nil then alllit = false; break end
+          globs[#globs + 1] = g
+        end
         local mp = newpc()
-        blocks[mp] = ("if I.case_match(sh, %s, {%s}) then pc = %d else pc = %d end")
-          :format(sv, table.concat(pq, ", "), bodyentry[i], nextmatch)
+        if alllit and #globs > 0 then
+          local disj = {}
+          for _, g in ipairs(globs) do disj[#disj + 1] = ("rt.glob_match(%s, %q, __ic)"):format(sv, g) end
+          blocks[mp] = ("local __ic = sh.shopt.nocasematch and true or nil; if %s then pc = %d else pc = %d end")
+            :format(table.concat(disj, " or "), bodyentry[i], nextmatch)
+        else
+          local pq = {}
+          for _, pat in ipairs(cl.pats) do pq[#pq + 1] = ("%q"):format(pat) end
+          blocks[mp] = ("if I.case_match(sh, %s, {%s}) then pc = %d else pc = %d end")
+            :format(sv, table.concat(pq, ", "), bodyentry[i], nextmatch)
+        end
         matchentry[i] = mp
       end
       local subjp = newpc()
