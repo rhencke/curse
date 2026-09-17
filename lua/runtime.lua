@@ -2509,27 +2509,43 @@ function M.expand_fields(sh, segs)
   return out
 end
 
--- Compile-tier array literal for the BARE-element case (`a=(1 2 3)`, `a=($x)`, `a+=(…)`,
--- `a=()`): the compiled field engine has already split+globbed every element into `fields`
--- (in order), so this performs exactly do_arrayassign's storage for ALL-BARE items — no
--- keys, hence no array_key/word-engine dependency. Kept in lockstep with do_arrayassign
--- (interp.lua): reset (assoc-aware) unless appending, then assoc = alternating key/value
--- pairs / indexed = auto-index from 0 (or max+1 when appending), then drop from the env.
--- Keyed or brace-de-keyed literals still go through I.run_arrayassign.
-function M.arrayassign_bare(sh, name, fields, append)
+-- Compile-tier array literal (`a=(1 2 3)`, `a=($x)`, `a=([0]=x [k]=v)`, `a+=(…)`, `a=()`):
+-- emit has already expanded the elements into `items` in order — a BARE element is one
+-- or more {val=field} (field engine), a KEYED element is {key=<literal subscript>, op, val}
+-- (emit gates keyed to literal keys, so the subscript needs no word engine). This does
+-- exactly do_arrayassign's storage (interp.lua): assoc `[k]+=` in a `=` literal appends to
+-- the PRE-statement value (snap); a literal key resolves natively (assoc verbatim, indexed
+-- via arith_str); reset unless appending; assoc all-bare = alternating key/value pairs;
+-- indexed = auto-index from 0 (or max+1 appending, scalar->[0]); then drop from the env.
+function M.arrayassign(sh, name, items, append)
   local rb = sh.vars[sh:deref(name)]
   if rb and rb.ro then
     io.stderr:write("curse: " .. name .. ": readonly variable\n"); sh.status = 1; return
   end
   local isassoc = sh:is_assoc(name)
+  local anykeyed = false
+  for _, it in ipairs(items) do if it.key ~= nil then anykeyed = true; break end end
+  local function keyof(kt) return isassoc and kt or M.to_arr_key(M.arith_str(sh, kt)) end
+  local snap
   if not append then -- plain assignment resets the array (keeps assoc-ness)
     local b = sh.vars[name]
+    if isassoc then snap = b and b.arr or nil end -- assoc `[k]+=` reads the pre-clear value
     if not b then sh:array_assign(name, {}, false); b = sh.vars[name] end
     b.arr = {}; b.s = nil; b.n = nil; b.empty_decl = nil
     if isassoc then b.order = {} end
   end
-  if isassoc then -- all-bare assoc literal: alternating key value pairs
-    for k = 1, #fields, 2 do sh:array_set(name, fields[k], fields[k + 1] or "", false) end
+  if isassoc then
+    if anykeyed then -- keyed elements assigned; bare ones are an error in bash (skip)
+      for _, it in ipairs(items) do
+        if it.key ~= nil then
+          local idx = keyof(it.key)
+          if it.op == "+=" and not append then sh:array_set(name, idx, (snap and snap[idx] or "") .. it.val, false)
+          else sh:array_set(name, idx, it.val, it.op == "+=") end
+        end
+      end
+    else -- all-bare assoc literal: alternating key value pairs
+      for k = 1, #items, 2 do sh:array_set(name, items[k].val, items[k + 1] and items[k + 1].val or "", false) end
+    end
   else
     local auto = 0
     if append then
@@ -2538,7 +2554,14 @@ function M.arrayassign_bare(sh, name, fields, append)
       if b and b.arr then for kk in pairs(b.arr) do if kk > mx then mx = kk end end end
       auto = mx + 1
     end
-    for _, v in ipairs(fields) do sh:array_set(name, auto, v, false); auto = auto + 1 end
+    for _, it in ipairs(items) do
+      if it.key ~= nil then
+        local idx = keyof(it.key)
+        sh:array_set(name, idx, it.val, it.op == "+="); auto = idx + 1 -- indexed += appends to CURRENT
+      else
+        sh:array_set(name, auto, it.val, false); auto = auto + 1
+      end
+    end
   end
   local b = sh.vars[name]
   if b and b.exported then C.unsetenv(name) end -- an array can't live in the process env

@@ -1106,16 +1106,22 @@ local function emit_pattern_glob(pat, lifted)
   if #out == 0 then return '""' end
   return table.concat(out, " .. ")
 end
--- An `a=(…)` array literal whose elements are ALL BARE (no `[k]=`, no brace-de-key, no
--- element `+=`) and whose every element word the field engine can expand (word_safe /
--- field_word / seg_native). Such a literal compiles: the field engine builds the element
--- list natively and rt.arrayassign_bare stores it (no array_key). Keyed/complex literals,
--- an `a[i]=(…)` list-to-member error, or a nameref program keep I.run_arrayassign.
-local function arrayassign_bare_ok(st, lifted)
+-- An `a=(…)` array literal the compiled tier can build: each BARE element's word is
+-- field-engine-able (word_safe/field_word/seg_native), and each KEYED element `[k]=v` has
+-- a LITERAL subscript (no $/`/quote — so rt.arrayassign resolves it with no word engine:
+-- assoc verbatim, indexed via arith_str) and an emit_word-able value. An `a[i]=(…)`
+-- list-to-member error, a brace-de-keyed element, or a nameref program keep I.run_arrayassign.
+local function arrayassign_ok(st, lifted)
   if st.index or EF.has_nameref then return false end
   for _, e in ipairs(st.elems) do
-    if e.key ~= nil or e.brace_bare or e.op ~= "=" then return false end
-    if not (word_safe(e.word) or field_word(e.word, lifted) or seg_native(e.word, lifted)) then return false end
+    if e.brace_bare then return false end -- `[k]=` value brace-expands (de-keyed): interp
+    if e.key ~= nil then
+      if e.key:find("[%$`'\"]") then return false end -- dynamic subscript -> interp
+      if not emitable_word(e.word) then return false end
+    else
+      if e.op ~= "=" then return false end
+      if not (word_safe(e.word) or field_word(e.word, lifted) or seg_native(e.word, lifted)) then return false end
+    end
   end
   return true
 end
@@ -2512,17 +2518,28 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
       blocks[p] = dbg(st) .. lifted_flush(lifted) .. ("sh:run_background(cs_%d, %q); pc = %d"):format(id, cmdstr, after)
       return p
     elseif t == "arrayassign" then
-      -- Bare-element literal (`a=(1 2 3)`, `a=($x)`, `a+=(…)`, `a=()`): expand every element
-      -- with the field engine natively and store via rt.arrayassign_bare — no interp.
-      if arrayassign_bare_ok(st, lifted) then
+      -- `a=(1 2 3)` / `a=($x)` / `a=([0]=x [k]=v)` / `a+=(…)` / `a=()`: build the element
+      -- items natively — a bare word field-splits via the field engine into {val=field}
+      -- entries, a keyed element renders {key,op,val} — then store via rt.arrayassign. No
+      -- interp: keyed subscripts are gated to literals (resolved by arith_str/verbatim).
+      if arrayassign_ok(st, lifted) then
         local p = newpc()
-        local parts = { "local __ar = {}" }
+        local parts = { "local __it = {}" }
         for _, e in ipairs(st.elems) do
-          if not empty_word(e.word) then parts[#parts + 1] = emit_fields_into("__ar", e.word, lifted) end
+          if e.key ~= nil then
+            -- keyed value: assign-context RHS (an all-literal ~ colon-expands via
+            -- rt.tilde_assign, like scalar `x=~:~`), else the ordinary word value.
+            local fl = unq_full_lit(e.word)
+            local valx = (fl and fl:find("~", 1, true)) and ("rt.tilde_assign(sh, %q)"):format(fl)
+              or emit_word(e.word, lifted)
+            parts[#parts + 1] = ("__it[#__it+1] = {key=%q, op=%q, val=%s}"):format(e.key, e.op, valx)
+          elseif not empty_word(e.word) then
+            parts[#parts + 1] = emit_fields_into("__it", e.word, lifted, "{val=%s}")
+          end
         end
         local ec = errchk(st); local ecs = ec ~= "" and ("; " .. ec) or ""
         blocks[p] = dbg(st) .. "do " .. table.concat(parts, "; ")
-          .. ("; rt.arrayassign_bare(sh, %q, __ar, %s) end"):format(st.name, tostring(st.append and true or false))
+          .. ("; rt.arrayassign(sh, %q, __it, %s) end"):format(st.name, tostring(st.append and true or false))
           .. ecs .. ("; pc = %d"):format(after)
         return p
       end
