@@ -22,6 +22,7 @@ local verbose = false
 local diff = false
 local show_live = false      -- also print the live-bash pass total
 local show_diverge = false   -- list cases where golden ≠ host bash
+local memprof = false        -- --mem: report peak child RSS (find the OOM culprit)
 local filters = {}
 for _, a in ipairs(arg) do
   if a == "--interp" or a == "--compiled" or a == "--cached" then mode = a:sub(3)
@@ -29,8 +30,20 @@ for _, a in ipairs(arg) do
   elseif a == "--diff" then verbose = true; diff = true
   elseif a == "--live" then show_live = true
   elseif a == "--divergence" or a == "--diverge" then show_diverge = true; show_live = true
+  elseif a == "--mem" then memprof = true
   elseif a:sub(1, 2) == "--" then -- ignore unknown flags
   else filters[#filters + 1] = a end
+end
+-- Peak-RSS watermark (--mem). getrusage(RUSAGE_CHILDREN).ru_maxrss is a MONOTONIC
+-- high-water-mark (KB on Linux) over all reaped children, so a case that RAISES it just
+-- set a new memory high — the escalation log names the culprits tripping the OOM guard.
+-- Run on ONE file (`spec.lua --compiled --mem FILE`) to get that file's isolated peak.
+local peak_kb
+if memprof then
+  local ffi = require("ffi")
+  ffi.cdef[[ struct curse_ru { long d[18]; }; int getrusage(int who, struct curse_ru *u); ]]
+  local ru = ffi.new("struct curse_ru")
+  peak_kb = function() ffi.C.getrusage(-1, ru); return tonumber(ru.d[4]) end -- CHILDREN; ru_maxrss @ d[4]
 end
 
 -- Absolute paths: each case runs in its own cwd, so the luajit binary, run.lua,
@@ -260,6 +273,7 @@ end
 --               as Oils judges" number we drive to 100%.
 local total, goldPass, livePass, structPass, divergences = 0, 0, 0, 0, 0
 local perFile = {}
+local mem_peak, mem_log = 0, {} -- --mem: running peak (KB) and the new-high escalation log
 for _, path in ipairs(files) do
   local cases = parse_cases(readfile(path) or "")
   local cwd = TMP .. "/cwd"; os.execute("rm -rf " .. cwd .. "; mkdir -p " .. cwd)
@@ -271,6 +285,13 @@ for _, path in ipairs(files) do
     os.execute("rm -rf " .. cwd .. "/* 2>/dev/null")
     local cout, cst = run(curse_cmd(), cwd, SHNAME, SHBIN .. ":")  -- curse: SHBIN first -> `bash` = curse
     os.execute("rm -rf " .. cwd .. "/* 2>/dev/null")
+    if memprof then -- a new peak = this case (its bash or curse child) is a memory high
+      local p = peak_kb()
+      if p > mem_peak then
+        mem_log[#mem_log + 1] = { kb = p, prev = mem_peak, file = path:match("[^/]+$"), case = c.name }
+        mem_peak = p
+      end
+    end
     local gok = (cst == exp.status) and (not exp.check_out or cout == exp.out)
     local lok = (cout == bout) and (cst == bst)
     local sok = (cst == bst) and (not exp.check_out or cout == bout)
@@ -310,5 +331,12 @@ io.write(("\nspec conformance (%s): %d/%d cases (%s%%) across %d files\n")
 if show_live then
   io.write(("  golden-only (vs recorded spec): %d/%d   pure-live (stdout+status vs host bash): %d/%d   golden-vs-hostbash divergences: %d\n")
     :format(goldPass, total, livePass, total, divergences))
+end
+if memprof then
+  io.write("\npeak child-RSS escalation (each line set a new high — the memory culprits):\n")
+  for _, m in ipairs(mem_log) do
+    io.write(("  %8.1f MB  %s: %s\n"):format(m.kb / 1024, m.file, m.case))
+  end
+  io.write(("PEAK child RSS: %.1f MB (%d KB) across %d files\n"):format(mem_peak / 1024, mem_peak, #files))
 end
 os.execute("rm -rf " .. TMP)
