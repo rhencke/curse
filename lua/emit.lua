@@ -923,12 +923,14 @@ function pexp_compilable(pe)
   if pe.index or pe.via_indirect then return false end -- array subscript / ${!ref} indirection
   local name = pe.name
   if type(name) ~= "string" or not name:match("^[%a_][%w_]*$") or COMPILE_UNSAFE_VAR[name] then return false end
+  if pe.op == "len" then return true end -- ${#x}: scalar codepoint length via apply_str_op("len")
   return PEXP_STROP[pe.op] and pexp_literal_arg(pe.arg) and pexp_literal_arg(pe.arg2) or false
 end
 -- Lua expr for a compilable pexp's scalar string value (assumes pexp_compilable).
 function pexp_scalar(pe, lifted)
   local val = lifted[pe.name] and ("rt.i64_to_str(%s)"):format(lname(pe.name))
     or ("sh:get_u(%q)"):format(pe.name) -- get_u: an unset var trips set -u, like bash
+  if pe.op == "len" then return ("tostring(rt.mb_strlen(%s))"):format(val) end -- ${#x}: codepoint length
   return ("sh:apply_str_op(%q, %s, %q, %q)"):format(pe.op, val, pe.arg or "", pe.arg2 or "")
 end
 
