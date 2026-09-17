@@ -998,6 +998,10 @@ local function emit_seg(p, i, lifted)
     return ("{multi=true,star=%s,q=%s,elems=sh:paramList()}"):format(
       tostring(p.special == "*"), tostring(p.q or false))
   end
+  if p.pexp then -- ${a[@]} / ${a[*]}: array elements as a multi-element segment (gated bare)
+    return ("{multi=true,star=%s,q=%s,elems=sh:array_values(%q)}"):format(
+      tostring(p.pexp.index == "*"), tostring(p.q or false), p.pexp.name)
+  end
   if p.q then
     return ("{s=%s,split=false,unq=false}"):format(emit_scalar_val(p, i, lifted, false))
   elseif p.lit ~= nil then
@@ -1054,7 +1058,10 @@ end
 function mixed_expandable(w, lifted)
   if EF.has_nameref then return false end
   for _, p in ipairs(w.parts) do
-    if p.arith or p.arithast or p.cmdsub or p.pexp or p.procsub then return false end
+    if p.arith or p.arithast or p.cmdsub or p.procsub then return false end
+    -- a bare ${a[@]}/${a[*]} array expansion is a multi-element segment seg_native renders;
+    -- any other ${…} (slice/strip/indirect/scalar op) still delegates.
+    if p.pexp and not ((p.pexp.index == "@" or p.pexp.index == "*") and not p.pexp.op) then return false end
     if p.var and COMPILE_UNSAFE_VAR[p.var] then return false end
   end
   return true
@@ -1075,7 +1082,9 @@ function seg_native(w, lifted)
     elseif p.param then -- $1..$9 positional: ok
     elseif p.special == "#" or p.special == "?" or p.special == "$" or p.special == "!" then -- scalar specials
     elseif p.special == "@" or p.special == "*" then -- $@/$*: multi-element (emit_seg renders it)
-    else return false end -- pexp, cmdsub, arith, procsub, or anything unknown
+    elseif p.pexp and (p.pexp.index == "@" or p.pexp.index == "*") and not p.pexp.op
+        and p.pexp.name and p.pexp.name:match("^[%a_][%w_]*$") then -- bare ${a[@]}/${a[*]} (no slice/strip/indirect)
+    else return false end -- other pexp, cmdsub, arith, procsub, or anything unknown
   end
   return true
 end
@@ -2081,15 +2090,18 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
           local p = newpc()
           local ec = errchk(st); local ecs = ec ~= "" and ("; " .. ec) or ""
           local d = dbg(st) -- DEBUG fires before the command (and its expansions)
+          -- PIPESTATUS after a simple command is a one-element array of its status
+          -- (bash), like the static-dispatch path below; gated on the program reading it.
+          local ps = EF.pipestatus and '; sh:array_assign("PIPESTATUS", {tostring(sh.status)}, false)' or ""
           if redir_apply then
             -- bash order: expand the words (side-effecting cmdsubs run) BEFORE the
             -- redirects are applied, so `cmd $(read f) > f` reads f before it's
             -- truncated. Build argv first, then install redirs around the dispatch.
             blocks[p] = d .. builder ..
-              ("; do local __rs = {}; if %s then %s else sh.status = 1 end; rt.redir_restore(__rs) end%s; pc = %d")
-              :format(redir_apply, call, ecs, after)
+              ("; do local __rs = {}; if %s then %s else sh.status = 1 end; rt.redir_restore(__rs) end%s%s; pc = %d")
+              :format(redir_apply, call, ps, ecs, after)
           else
-            blocks[p] = d .. builder .. "; " .. call .. ecs .. ("; pc = %d"):format(after)
+            blocks[p] = d .. builder .. "; " .. call .. ps .. ecs .. ("; pc = %d"):format(after)
           end
           return p
         end
