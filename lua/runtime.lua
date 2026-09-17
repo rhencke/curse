@@ -2979,6 +2979,18 @@ function M.var_is_set(sh, nm)
   return b ~= nil or sh:special_get(nm) ~= ""
 end
 
+-- Set-ness for the ${x-word}/${x+word} default/alternate ops: a var is "set" only when it
+-- HAS A VALUE (interp's expand_param isset), so a declared-but-valueless `local v` reads as
+-- unset (unlike var_is_set / `[[ -v ]]`, which count a bare box). Scalar name only (the
+-- default ops don't compile with a subscript).
+function M.var_has_value(sh, name)
+  local b = sh.vars[sh:deref(name)]
+  local isset
+  if b and b.arr then isset = b.arr[0] ~= nil or b.arr["0"] ~= nil
+  else isset = b ~= nil and (b.s ~= nil or b.n ~= nil) end
+  return isset or sh:special_get(name) ~= ""
+end
+
 -- ${x@Q}/@U/@u/@L/@E/@K/@k transform for the compiled tier: an UNSET var yields nothing
 -- (bash — the transform doesn't apply; an unquoted empty then drops as a field), matching
 -- interp's expand_param (`if not isset then return "" end`). `val` is the already-read
