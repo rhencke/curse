@@ -1761,8 +1761,30 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
       local EXEC_SIMPLE_SKIP = { export = 1, declare = 1, readonly = 1, ["local"] = 1,
         typeset = 1, eval = 1, source = 1, ["."] = 1, command = 1, builtin = 1,
         exit = 1, ["return"] = 1, ["break"] = 1, ["continue"] = 1, exec = 1, wait = 1 }
+      -- Declaration builtins normally delegate because a LITERAL `name=value` arg must
+      -- expand its value in assignment context (no word-split/glob, tilde after =) —
+      -- which this field path can't do. But when NO arg is a literal assignment (only
+      -- flags and bare names: `export FOO`, `readonly -p`, `declare -A m`, `declare -f`),
+      -- their args split like any builtin's, so run them natively via rt.builtin. A
+      -- `name=value` written in source, an array value (st.arrayargs), or `a[i]=` still
+      -- delegates. (`$x` that expands to `name=value` is a normal split arg the builtin
+      -- assigns — that is correct here, matching bash.)
+      -- Only at top level: inside a function, declare/typeset (and a bare name) DEFAULT
+      -- to a LOCAL, which needs the function-scope context the delegation path sets up
+      -- but rt.builtin does not — so an in-function `declare -A d` would leak to global.
+      -- At top level there is no local scope, so the native dispatch is exact.
+      local DECL_BUILTIN = { export = 1, declare = 1, readonly = 1, typeset = 1 }
+      local decl_native = DECL_BUILTIN[cmd] and toplevel and not st.arrayargs
+      if decl_native then
+        for j = 2, #st.words do
+          local p1 = st.words[j].parts[1]; local lit = p1 and p1.lit
+          if lit and (lit:match("^[%a_][%w_]*%+?=") or lit:match("^[%a_][%w_]*%b[]%+?=")) then
+            decl_native = false; break
+          end
+        end
+      end
       if cmd and st.assigns == nil and not redir_apply and not NATIVE_BUILTIN[cmd] and not isfunc
-          and not EXEC_SIMPLE_SKIP[cmd] and require("interp").BUILTINS[cmd] then
+          and (not EXEC_SIMPLE_SKIP[cmd] or decl_native) and require("interp").BUILTINS[cmd] then
         local builder = field_argv(st.words, 1, lifted, "rt.cstr(%s)") -- argv entries are C strings (cut at NUL, like interp's expand_args)
         if builder then
           local p = newpc()
