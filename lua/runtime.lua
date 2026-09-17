@@ -2467,6 +2467,42 @@ function M.expand_fields(sh, segs)
   return out
 end
 
+-- Compile-tier array literal for the BARE-element case (`a=(1 2 3)`, `a=($x)`, `a+=(…)`,
+-- `a=()`): the compiled field engine has already split+globbed every element into `fields`
+-- (in order), so this performs exactly do_arrayassign's storage for ALL-BARE items — no
+-- keys, hence no array_key/word-engine dependency. Kept in lockstep with do_arrayassign
+-- (interp.lua): reset (assoc-aware) unless appending, then assoc = alternating key/value
+-- pairs / indexed = auto-index from 0 (or max+1 when appending), then drop from the env.
+-- Keyed or brace-de-keyed literals still go through I.run_arrayassign.
+function M.arrayassign_bare(sh, name, fields, append)
+  local rb = sh.vars[sh:deref(name)]
+  if rb and rb.ro then
+    io.stderr:write("curse: " .. name .. ": readonly variable\n"); sh.status = 1; return
+  end
+  local isassoc = sh:is_assoc(name)
+  if not append then -- plain assignment resets the array (keeps assoc-ness)
+    local b = sh.vars[name]
+    if not b then sh:array_assign(name, {}, false); b = sh.vars[name] end
+    b.arr = {}; b.s = nil; b.n = nil; b.empty_decl = nil
+    if isassoc then b.order = {} end
+  end
+  if isassoc then -- all-bare assoc literal: alternating key value pairs
+    for k = 1, #fields, 2 do sh:array_set(name, fields[k], fields[k + 1] or "", false) end
+  else
+    local auto = 0
+    if append then
+      local mx, b = -1, sh.vars[name]
+      if b and b.s ~= nil and not b.arr then b.arr = { [0] = b.s }; b.s = nil; b.n = nil end -- scalar -> [0]
+      if b and b.arr then for kk in pairs(b.arr) do if kk > mx then mx = kk end end end
+      auto = mx + 1
+    end
+    for _, v in ipairs(fields) do sh:array_set(name, auto, v, false); auto = auto + 1 end
+  end
+  local b = sh.vars[name]
+  if b and b.exported then C.unsetenv(name) end -- an array can't live in the process env
+  sh.status = 0; sh:set_str("_", "")
+end
+
 -- Apply a ${…} operator. `arg`/`arg2` are already word-expanded by the caller;
 -- `idxnum` is the evaluated numeric subscript when pe.index is an expression.
 function Shell:expand_param(pe, arg, arg2, idxnum)

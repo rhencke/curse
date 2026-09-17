@@ -1101,6 +1101,19 @@ local function emit_pattern_glob(pat, lifted)
   if #out == 0 then return '""' end
   return table.concat(out, " .. ")
 end
+-- An `a=(…)` array literal whose elements are ALL BARE (no `[k]=`, no brace-de-key, no
+-- element `+=`) and whose every element word the field engine can expand (word_safe /
+-- field_word / seg_native). Such a literal compiles: the field engine builds the element
+-- list natively and rt.arrayassign_bare stores it (no array_key). Keyed/complex literals,
+-- an `a[i]=(…)` list-to-member error, or a nameref program keep I.run_arrayassign.
+local function arrayassign_bare_ok(st, lifted)
+  if st.index or EF.has_nameref then return false end
+  for _, e in ipairs(st.elems) do
+    if e.key ~= nil or e.brace_bare or e.op ~= "=" then return false end
+    if not (word_safe(e.word) or field_word(e.word, lifted) or seg_native(e.word, lifted)) then return false end
+  end
+  return true
+end
 -- Build a `local __a = {...}` argv table for words[from..#words] (each field
 -- split+globbed), or nil if any word needs the interpreter. `wrap` is applied to
 -- each final field. Used for commands whose args word-split/glob.
@@ -2494,6 +2507,20 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
       blocks[p] = dbg(st) .. lifted_flush(lifted) .. ("sh:run_background(cs_%d, %q); pc = %d"):format(id, cmdstr, after)
       return p
     elseif t == "arrayassign" then
+      -- Bare-element literal (`a=(1 2 3)`, `a=($x)`, `a+=(…)`, `a=()`): expand every element
+      -- with the field engine natively and store via rt.arrayassign_bare — no interp.
+      if arrayassign_bare_ok(st, lifted) then
+        local p = newpc()
+        local parts = { "local __ar = {}" }
+        for _, e in ipairs(st.elems) do
+          if not empty_word(e.word) then parts[#parts + 1] = emit_fields_into("__ar", e.word, lifted) end
+        end
+        local ec = errchk(st); local ecs = ec ~= "" and ("; " .. ec) or ""
+        blocks[p] = dbg(st) .. "do " .. table.concat(parts, "; ")
+          .. ("; rt.arrayassign_bare(sh, %q, __ar, %s) end"):format(st.name, tostring(st.append and true or false))
+          .. ecs .. ("; pc = %d"):format(after)
+        return p
+      end
       -- a=(…): dispatch to the array-assign runtime primitive (readonly/index checks +
       -- error-contained do_arrayassign + status/$_), NOT the exec_stmt tree-walker. Flush
       -- lifted operands to sh first (an elem may read one) and reload after (a `$((b=…))`
