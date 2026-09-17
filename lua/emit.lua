@@ -896,7 +896,7 @@ local function emit_dbracket(node, lifted)
       local eq = ("rt.dbracket_eq(sh, %s, %s, %s)"):format(l, emit_word(node.r, lifted), node.rq and "true" or "false")
       return op == "!=" and ("(not " .. eq .. ")") or eq
     elseif ARITH_CMP[op] then
-      return ("(I.dbracket_arith(sh, %s) %s I.dbracket_arith(sh, %s))"):format(l, ARITH_CMP[op], emit_word(node.r, lifted))
+      return ("(rt.dbracket_arith(sh, %s) %s rt.dbracket_arith(sh, %s))"):format(l, ARITH_CMP[op], emit_word(node.r, lifted))
     elseif op == "<" then return ("rt.coll_lt(%s, %s)"):format(l, emit_word(node.r, lifted))
     elseif op == ">" then return ("rt.coll_lt(%s, %s)"):format(emit_word(node.r, lifted), l)
     elseif op == "-nt" or op == "-ot" or op == "-ef" then

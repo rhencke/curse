@@ -2891,6 +2891,21 @@ function M.arith_read(sh, name)
   end
   return require("interp").arith_read(sh, name) -- unset/blank/$-expansion/subscript: bootstrap
 end
+-- A `[[ … -eq/-lt/… … ]]` numeric operand: arith-evaluate the (already word-expanded)
+-- operand string, exactly as interp's dbracket_arith = eval(P.arith(s)). Empty is 0; a
+-- plain number is native; otherwise compile it (compile_arith_value renders var operands
+-- as recursive rt.arith_read, so `[[ $a -eq 5 ]]` with a naming another var resolves and
+-- the shared cycle guard applies). A subscript/$-form operand it can't compile defers to
+-- the interp evaluator, which also raises the same math/syntax error the [[ ]] codegen
+-- maps to status 2.
+function M.dbracket_arith(sh, s)
+  if s == "" then return i64(0) end
+  if M.looks_numeric(s) then return M.arith_num(s) end
+  local fn = _acache[s]
+  if fn == nil then fn = require("emit").compile_arith_value(s) or false; _acache[s] = fn end
+  if fn then return fn(sh) end
+  return require("interp").dbracket_arith(sh, s)
+end
 -- Gate for the compiled fast-xpand path: true when the var's value binds like a
 -- numeric atom (so native rendering == bash's textual substitution).
 function M.arith_isnum(sh, name)
