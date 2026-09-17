@@ -17,10 +17,20 @@ index 283b6e4..62c231e 100644
  }
  
 diff --git a/src/luajit.c b/src/luajit.c
-index 65d55c3..c7216b4 100644
+index 65d55c3..c717f8d 100644
 --- a/src/luajit.c
 +++ b/src/luajit.c
-@@ -523,6 +523,25 @@ static struct Smain {
+@@ -53,6 +53,9 @@ static void signal_set(int sig, void (*h)(int))
+ #endif
+ 
+ static lua_State *globalL = NULL;
++/* curse: expose the main lua_State to lib_cursesig.c so its async signal handler
++ * can schedule a VM hook (laction pattern) that runs the shell's trap. */
++lua_State *curse_globalL(void) { return globalL; }
+ static const char *progname = LUA_PROGNAME;
+ static char *empty_argv[2] = { NULL, NULL };
+ 
+@@ -523,6 +526,25 @@ static struct Smain {
    int status;
  } smain;
  
@@ -46,7 +56,7 @@ index 65d55c3..c7216b4 100644
  static int pmain(lua_State *L)
  {
    struct Smain *s = &smain;
-@@ -532,6 +551,34 @@ static int pmain(lua_State *L)
+@@ -532,6 +554,34 @@ static int pmain(lua_State *L)
    globalL = L;
    LUAJIT_VERSION_SYM();  /* Linker-enforced version check. */
  
@@ -81,7 +91,7 @@ index 65d55c3..c7216b4 100644
    argn = collectargs(argv, &flags);
    if (argn < 0) {  /* Invalid args? */
      print_usage();
-@@ -547,6 +594,7 @@ static int pmain(lua_State *L)
+@@ -547,6 +597,7 @@ static int pmain(lua_State *L)
    /* Stop collector during library initialization. */
    lua_gc(L, LUA_GCSTOP, 0);
    luaL_openlibs(L);

@@ -55,14 +55,19 @@ return function(sh, cmd, args, hook, tcb)
         if not canon then io.stderr:write("curse: trap: " .. args[k] .. ": invalid signal specification\n"); ok = false
         elseif action == "-" then sh.traps[canon] = nil
         else sh.traps[canon] = action end
-        -- a REAL signal (not EXIT/DEBUG/RETURN/ERR): block it so we can poll it at
-        -- safepoints; resetting unblocks it. sh.sigtraps counts active signal traps.
+        -- a REAL signal (not EXIT/DEBUG/RETURN/ERR): install curse's async handler
+        -- (block_sig(num,true)); it schedules a VM hook that runs the trap at the next
+        -- safepoint (no polling). Resetting restores the default disposition.
+        -- sh.sigtraps counts active signal traps.
         local num = canon and SIGNUM[canon:match("^SIG(.+)$") or ""]
         if num and num ~= 9 and num ~= 19 then -- KILL/STOP can't be trapped
           local had = sh.sigtraps and sh.sigtraps[canon]
           if action == "-" and had then block_sig(num, false); sh.sigtraps[canon] = nil
           elseif action ~= "-" and not had then
             sh.sigtraps = sh.sigtraps or {}; sh.sigtraps[canon] = true; block_sig(num, true)
+            -- the C signal hook calls this global with the signal number to run its
+            -- trap directly (bound to the shell that owns the traps).
+            _G.__curse_sigrun = function(s) M.run_signal(sh, s) end
           end
         end
       end

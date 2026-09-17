@@ -85,9 +85,20 @@ extern char unsetenv[];
 extern char waitpid[];
 extern char wcrtomb[];
 extern char write[];
+/* curse async signal primitives (defined in lib_cursesig.c; address-only refs). */
+extern char curse_sig_catch[];
+extern char curse_sig_default[];
+extern char curse_sig_ignore[];
+extern char curse_sig_clearpending[];
+extern char curse_sig_hold[];
 typedef struct { const char *name; void *addr; } curse_sym_t;
 static const curse_sym_t curse_syms[] = {
   { "environ", (void*)&environ },
+  { "curse_sig_catch", (void*)curse_sig_catch },
+  { "curse_sig_default", (void*)curse_sig_default },
+  { "curse_sig_ignore", (void*)curse_sig_ignore },
+  { "curse_sig_clearpending", (void*)curse_sig_clearpending },
+  { "curse_sig_hold", (void*)curse_sig_hold },
   { "accept", (void*)accept },
   { "access", (void*)access },
   { "bind", (void*)bind },

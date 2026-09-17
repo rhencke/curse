@@ -232,9 +232,14 @@ ffi.cdef [[
   struct curse_passwd { char *pw_name; char *pw_passwd; unsigned int pw_uid; unsigned int pw_gid; char *pw_gecos; char *pw_dir; char *pw_shell; };
   struct curse_passwd *getpwnam(const char *name);
   int sigemptyset(void *set);
-  int sigaddset(void *set, int signum);
   int sigprocmask(int how, const void *set, void *oldset);
-  int sigtimedwait(const void *set, void *info, const void *timeout);
+  /* curse async signal handling (lib_cursesig.c): a real handler installed without
+   * SA_RESTART (blocking syscalls EINTR) that schedules a VM hook to run the trap. */
+  int curse_sig_catch(int signum);
+  int curse_sig_default(int signum);
+  int curse_sig_ignore(int signum);
+  void curse_sig_clearpending(void);
+  void curse_sig_hold(int hold);
   struct curse_passwd *getpwent(void);
   void setpwent(void);
   void endpwent(void);
@@ -335,16 +340,15 @@ local SIGNUM = { HUP = 1, INT = 2, QUIT = 3, ILL = 4, TRAP = 5, ABRT = 6, BUS = 
   URG = 23, XCPU = 24, XFSZ = 25, VTALRM = 26, PROF = 27, WINCH = 28, IO = 29,
   PWR = 30, SYS = 31 }
 local NUMSIG = {}; for k, v in pairs(SIGNUM) do NUMSIG[v] = k end
--- Real-signal traps: LuaJIT forbids calling Lua from an async C signal handler,
--- so instead of installing one we BLOCK the trapped signal (sigprocmask) and POLL
--- for it synchronously at safepoints with sigtimedwait — running the handler
--- between commands, like bash delivers a trap.
-local sigset_poll = ffi.new("uint8_t[128]")  -- glibc sigset_t is 128 bytes
-local sigset_one = ffi.new("uint8_t[128]")
-local zero_ts = ffi.new("long[2]", 0, 0)     -- struct timespec {0,0} = poll, don't block
-local function block_sig(signum, block) -- SIG_BLOCK=0, SIG_UNBLOCK=1
-  C.sigemptyset(sigset_one); C.sigaddset(sigset_one, signum)
-  C.sigprocmask(block and 0 or 1, sigset_one, nil)
+-- Real-signal traps: install curse's async C handler (lib_cursesig.c), WITHOUT
+-- SA_RESTART. It records the signal and schedules a VM hook (the only async-safe
+-- work) that runs the trap directly at the next safepoint — so a blocking syscall
+-- (read/waitpid/…) returns EINTR and the trap fires immediately (preemption), with
+-- no polling and no pending queue. `block_sig(num, true)` installs the handler;
+-- `block_sig(num, false)` restores the default disposition. (Was sigprocmask-block +
+-- a sigtimedwait poll at every safepoint, which couldn't interrupt a blocked read.)
+local function block_sig(signum, on)
+  if on then C.curse_sig_catch(signum) else C.curse_sig_default(signum) end
 end
 -- Human-readable signal descriptions bash prints when a job is killed (`wait`).
 local SIGDESC = { [1] = "Hangup", [2] = "Interrupt", [3] = "Quit", [4] = "Illegal instruction",
@@ -378,10 +382,13 @@ local function reset_child_sigtraps(sh)
       kept = kept or {}; kept[canon] = true
     else -- caught: revert to default disposition, but keep the string for `trap -p`
       local num = SIGNUM[canon:match("^SIG(.+)$") or ""]
-      if num then block_sig(num, false) end -- unblock so the default action applies
+      if num then block_sig(num, false) end -- restore default so the default action applies
     end
   end
   sh.sigtraps = kept
+  -- Handlers are now default; discard any trap the child caught in the fork→reset
+  -- window (e.g. `cmd & ; kill -SIG $!`) so it doesn't fire a spurious trap.
+  C.curse_sig_clearpending()
 end
 
 local function file_test(op, path)
@@ -3089,18 +3096,23 @@ exec_stmt = function(sh, st, hook)
   elseif t == "background" then
     -- cmd & : fork, run in the child; parent records $! and continues (status 0).
     io.flush()
+    -- Block signals across the fork + the child's disposition reset so an immediate
+    -- `kill -SIG $!` can't be delivered to the child before it clears its traps (bash).
+    C.curse_sig_hold(1)
     local pid = C.fork()
     if pid == 0 then
       -- Without job control, an async command's stdin is /dev/null (bash), so it
       -- can't steal the terminal — and it must not inherit a redirect it didn't ask for.
       local dn = C.open("/dev/null", 0, 0); if dn >= 0 then C.dup2(dn, 0); C.close(dn) end
       reset_child_sigtraps(sh) -- caught signal traps revert to default in the async subshell
+      C.curse_sig_hold(0) -- dispositions set: safe to receive signals now
       sh.in_subprogram = (sh.in_subprogram or 0) + 1 -- async subprogram: ERR trap won't fire (sans errtrace)
       sh.loopdepth = 0
       local ok, err = pcall(function() sh.out = io.write; exec_stmt(sh, st.cmd, hook) end)
       child_status(sh, ok, err)
       io.flush(); C._exit(sh.status or 0)
     end
+    C.curse_sig_hold(0) -- parent: unblock
     -- register the job (for `jobs`/`wait %spec`/`wait -n`); best-effort command text
     local c1 = st.cmd
     while c1 and (c1.t == "pipeline") and c1.cmds do c1 = c1.cmds[1] end
@@ -3408,30 +3420,24 @@ M.fire_err_trap = fire_err_trap -- compiled tier fires ERR after a failing nativ
 -- (`return N` status is now rt.return_status — a pure runtime primitive the compiled
 -- tier calls directly.)
 
--- Run any trapped real signals that arrived (blocked → pending) since the last
--- check, in the current scope. Cheap no-op when no signal traps are set.
-local function run_pending_signals(sh)
-  if not sh.sigtraps or (sh.in_trap and sh.in_trap > 0) then return end
-  C.sigemptyset(sigset_poll)
-  local any = false
-  for canon in pairs(sh.sigtraps) do
-    local num = SIGNUM[canon:match("^SIG(.+)$") or ""]
-    if num then C.sigaddset(sigset_poll, num); any = true end
-  end
-  if not any then return end
-  while true do
-    local sig = C.sigtimedwait(sigset_poll, nil, zero_ts)
-    if sig < 0 then break end -- no more pending
-    local h = sh.traps and sh.traps["SIG" .. (NUMSIG[sig] or "")]
-    -- an asynchronously-delivered signal handler reports $LINENO = 1 (bash), not the
-    -- line the shell happened to be at when the signal arrived; restore it after.
-    if h and h ~= "" then
-      local saved, sl = sh.status, sh.cur_line; sh.cur_line = 1
-      run_trap(sh, h); sh.status = saved; sh.cur_line = sl
-    end
-  end
+-- Run the trap for the signal `signum` that the async handler delivered via the VM
+-- hook (lib_cursesig.c). No pending queue — the hook hands us exactly the signal
+-- that fired. run_trap bumps sh.in_trap so a signal arriving DURING the handler is
+-- serialized (the hook re-arms and runs it after this returns), never nested. A
+-- signal trap doesn't change $? unless it exits/returns; `exit` in the handler
+-- propagates to exit the shell (bash).
+local function run_signal(sh, signum)
+  if sh.in_trap and sh.in_trap > 0 then return end -- don't run a trap inside a trap
+  local h = sh.traps and sh.traps["SIG" .. (NUMSIG[signum] or "")]
+  if not h or h == "" then return end
+  -- an asynchronously-delivered signal handler reports $LINENO = 1 (bash).
+  local saved, sl = sh.status, sh.cur_line; sh.cur_line = 1
+  local exited = run_trap(sh, h)
+  sh.cur_line = sl
+  if exited then error({ __curse_exit = sh.status }) end -- `exit` in the trap exits the shell
+  sh.status = saved -- otherwise $? is preserved across the signal
 end
-M.run_pending_signals = run_pending_signals
+M.run_signal = run_signal
 
 exec_list = function(sh, stmts, hook, toplevel)
   for k = 1, #stmts do
@@ -3439,7 +3445,7 @@ exec_list = function(sh, stmts, hook, toplevel)
     if toplevel then hook("stmt", k) end
     exec_stmt(sh, st, hook)
     if errexit_stmt(sh, st) then fire_err(sh) end
-    if sh.sigtraps then run_pending_signals(sh) end -- deliver any pending signal traps
+    -- (signal traps are delivered by the async VM hook — no per-statement poll)
   end
 end
 M.exec_list = exec_list
@@ -3509,7 +3515,7 @@ function M.run_lazy(sh, src, hook)
           else error(err) end
         else
           if errexit_stmt(sh, st) then fire_err(sh) end
-          if sh.sigtraps then run_pending_signals(sh) end -- deliver any pending signal traps
+          -- (signal traps are delivered by the async VM hook — no per-statement poll)
         end
       end
     end

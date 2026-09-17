@@ -45,6 +45,7 @@ prepare_luajit() {
   git -C "$LJDIR" checkout -q "$LJCOMMIT"
   git -C "$LJDIR" apply "$PATCHDIR/curse.patch"
   cp "$PATCHDIR/lib_cursesys.c" "$LJ/lib_cursesys.c"
+  cp "$PATCHDIR/lib_cursesig.c" "$LJ/lib_cursesig.c"
 }
 
 [ -x "$BOOT" ] || { echo "need a bootstrap luajit at $BOOT" >&2; exit 1; }
@@ -63,7 +64,8 @@ build_a() {
     [ "${3:-}" = clean ] && make clean >/dev/null 2>&1
     make -B CCOPT="$CCOPT $1" LDFLAGS="$2" -j"$JOBS" >/dev/null 2>&1 || true )
   cc $CCOPT $1 -I"$LJ" -c "$LJ/lib_cursesys.c" -o "$LJ/lib_cursesys.o"
-  ar r "$LJ/libluajit.a" "$LJ/lib_cursesys.o"
+  cc $CCOPT $1 -I"$LJ" -c "$LJ/lib_cursesig.c" -o "$LJ/lib_cursesig.o"
+  ar r "$LJ/libluajit.a" "$LJ/lib_cursesys.o" "$LJ/lib_cursesig.o"
   [ -f "$LJ/luajit.o" ] || { echo "build_a: luajit.o not produced (make failed)" >&2; exit 1; }
 }
 
