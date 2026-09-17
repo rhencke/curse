@@ -1033,7 +1033,10 @@ local function field_word(w, lifted)
     if p.q then return nil end                 -- a quoted part needs the mask
     if p.special then return nil end           -- @/*/$?/... handled elsewhere
     if p.var and COMPILE_UNSAFE_VAR[p.var] then return nil end -- $LINENO/$_/… → interp
-    if p.pexp and PEXP_DEFAULT[p.pexp.op] then return nil end -- unquoted ${x:-word}: field-wise default → interp
+    -- unquoted ${x:-word}: the taken branch (value or default) becomes the scalar value,
+    -- then the outer field_split splits+globs it — pexp_compilable already gates the default
+    -- to an emit_word-able word free of ~ \ ' " (quoted/multi/$* defaults, where field-wise
+    -- expansion would differ, delegate), so scalar-value + split matches interp's field-wise.
     if p.var or p.param or p.cmdsub or p.arith or p.arithast or p.pexp then alllit = false
     elseif p.lit then
       allexp = false
