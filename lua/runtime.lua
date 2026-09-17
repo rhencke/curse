@@ -1175,6 +1175,16 @@ function M.file_bincmp(op, x, y)
   return ay and (not ax or older(_ft_a, _ft_b))                          -- -ot: x older (or x missing)
 end
 
+-- [[ l == r ]] / [[ l = r ]] (the compiled tier's twin of interp's dbracket_eq): a QUOTED
+-- rhs is a literal string (fast `==` unless nocasematch, else glob its escaped form), an
+-- UNQUOTED rhs is a glob pattern. Honors shopt nocasematch. `rq` = rhs was quoted.
+local function db_glob_escape(s) return (s:gsub("[%*%?%[%]\\]", "\\%0")) end
+function M.dbracket_eq(sh, l, r, rq)
+  local ic = sh.shopt.nocasematch and true or nil
+  if rq and not ic then return l == r end
+  return M.glob_match(l, rq and db_glob_escape(r) or r, ic)
+end
+
 -- Password database read DIRECTLY from /etc/passwd, not via getpw*/NSS. A fully
 -- static build can't dlopen libnss_*, and for a shell (~user, $SHELL, ~user
 -- completion) the local passwd file is what these want. Cached for the process

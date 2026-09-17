@@ -881,7 +881,10 @@ local function emit_dbracket(node, lifted)
     local op, val = node.op, emit_word(node.word, lifted)
     if op == "-z" then return "(" .. val .. ' == "")' end
     if op == "-n" then return "(" .. val .. ' ~= "")' end
-    return ("I.dbracket_unary(sh, %q, %s)"):format(op, val) -- file tests, -o, -v
+    -- -o (shell option) / -v (variable set: array_key/word-engine) stay on the interp seam;
+    -- every other unary is a file predicate -> the pure-FFI runtime primitive.
+    if op == "-o" or op == "-v" then return ("I.dbracket_unary(sh, %q, %s)"):format(op, val) end
+    return ("rt.file_test(%q, %s)"):format(op, val)
   elseif k == "binary" then
     if not db_word_ok(node.l) or not db_word_ok(node.r) then return nil end
     local op, l = node.op, emit_word(node.l, lifted)
@@ -890,14 +893,14 @@ local function emit_dbracket(node, lifted)
       if not node.rq then -- an unquoted RHS is a glob; mixed quoting can't be told apart -> delegate
         for _, p in ipairs(node.r.parts) do if p.q then return nil end end
       end
-      local eq = ("I.dbracket_eq(sh, %s, %s, %s)"):format(l, emit_word(node.r, lifted), node.rq and "true" or "false")
+      local eq = ("rt.dbracket_eq(sh, %s, %s, %s)"):format(l, emit_word(node.r, lifted), node.rq and "true" or "false")
       return op == "!=" and ("(not " .. eq .. ")") or eq
     elseif ARITH_CMP[op] then
       return ("(I.dbracket_arith(sh, %s) %s I.dbracket_arith(sh, %s))"):format(l, ARITH_CMP[op], emit_word(node.r, lifted))
     elseif op == "<" then return ("rt.coll_lt(%s, %s)"):format(l, emit_word(node.r, lifted))
     elseif op == ">" then return ("rt.coll_lt(%s, %s)"):format(emit_word(node.r, lifted), l)
     elseif op == "-nt" or op == "-ot" or op == "-ef" then
-      return ("I.dbracket_bincmp(%s, %q, %s)"):format(l, op, emit_word(node.r, lifted))
+      return ("rt.file_bincmp(%q, %s, %s)"):format(op, l, emit_word(node.r, lifted))
     end
   end
   return nil
