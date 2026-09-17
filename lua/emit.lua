@@ -1783,6 +1783,50 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
           end
         end
       end
+      -- Top-level declaration builtin WITH a literal `name=value` arg (`export FOO=bar`,
+      -- `declare -i n=5`, `export PATH=$PATH:/x`): build argv statically, expanding each
+      -- assignment value in assignment context — no word-split (emit_word renders the
+      -- whole `name=value` word to a single field), and tilde after `=`/`:` via
+      -- rt.tilde_assign for an all-literal value. b_export then does attribute processing
+      -- (arith for -i, etc.) on the expanded string. Defers to delegation for an array
+      -- element `a[i]=`, a value with a literal ~ mixed with expansions (needs the
+      -- assign-context tilde engine), or a splitting/unrenderable non-assignment arg.
+      if DECL_BUILTIN[cmd] and toplevel and not st.arrayargs and not decl_native
+          and cmd and st.assigns == nil and not redir_apply and not isfunc then
+        local items, ok = {}, true
+        for j = 1, #st.words do
+          local w = st.words[j]; local p1 = w.parts[1]; local lit = p1 and p1.lit
+          if j > 1 and lit and lit:match("^[%a_][%w_]*%b[]") then ok = false; break -- a[i]=/a[i]
+          elseif j > 1 and lit and lit:match("^[%a_][%w_]*%+?=") then -- scalar assignment
+            local pfx = lit:match("^([%a_][%w_]*%+?=)")
+            local fl = unq_full_lit(w)
+            if fl then -- all-literal name=value
+              if fl:find("~", 1, true) then
+                items[#items + 1] = ("rt.cstr(%q .. rt.tilde_assign(sh, %q))"):format(pfx, fl:sub(#pfx + 1))
+              else
+                items[#items + 1] = ("rt.cstr(%q)"):format(fl)
+              end
+            else -- value has expansions: emit_word renders name=value (no split); a
+              local htilde = false -- literal ~ mixed in needs the assign-tilde engine → defer
+              for _, pp in ipairs(w.parts) do if pp.lit and pp.lit:find("~", 1, true) then htilde = true; break end end
+              if htilde or not emitable_word(w) then ok = false; break end
+              items[#items + 1] = ("rt.cstr(%s)"):format(emit_word(w, lifted))
+            end
+          else -- command word / flag / bare name: must not need the field engine
+            if not word_safe(w) then ok = false; break end
+            items[#items + 1] = ("rt.cstr(%s)"):format(emit_word(w, lifted))
+          end
+        end
+        if ok then
+          local p = newpc()
+          local ec = errchk(st); local ecs = ec ~= "" and ("; " .. ec) or ""
+          local d = dbg(st)
+          local lastarg = "if #__a > 0 then sh:set_str('_', __a[#__a]) end"
+          blocks[p] = d .. ("local __a = { %s }; rt.builtin(sh, __a, __noop); "):format(table.concat(items, ", "))
+            .. lastarg .. ecs .. ("; pc = %d"):format(after)
+          return p
+        end
+      end
       if cmd and st.assigns == nil and not redir_apply and not NATIVE_BUILTIN[cmd] and not isfunc
           and (not EXEC_SIMPLE_SKIP[cmd] or decl_native) and require("interp").BUILTINS[cmd] then
         local builder = field_argv(st.words, 1, lifted, "rt.cstr(%s)") -- argv entries are C strings (cut at NUL, like interp's expand_args)
