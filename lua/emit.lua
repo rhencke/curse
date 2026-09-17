@@ -969,10 +969,12 @@ end
 -- literal args. Excludes slice (:off:len — index/assoc position semantics), default/
 -- alternate (:-/-/:+/+/…: field-wise default word), @a/@P, and ${!ref} indirection.
 local function array_multi_op(pe)
-  if pe.index ~= "@" and pe.index ~= "*" then return false end
+  local is_arr = (pe.index == "@" or pe.index == "*") -- ${a[@]OP}: array subscript
+  local is_pos = (pe.index == nil and (pe.name == "@" or pe.name == "*")) -- ${@OP}/${*OP}: positional
+  if not (is_arr or is_pos) then return false end
   if pe.via_indirect then return false end
-  if type(pe.name) ~= "string" or not pe.name:match("^[%a_][%w_]*$") then return false end
-  if not pe.op then return true end -- bare ${a[@]} / ${a[*]}
+  if is_arr and (type(pe.name) ~= "string" or not pe.name:match("^[%a_][%w_]*$")) then return false end
+  if not pe.op then return true end -- bare ${a[@]} / ${a[*]} (bare $@/$* is p.special, not here)
   if pe.op == "@" then return PEXP_AT[pe.arg] and true or false end -- ${a[@]@Q} … (not @a/@P)
   if pe.op == "sub" then return slice_args_ok(pe) end -- ${a[@]:off:len} slice
   return PEXP_STROP[pe.op] and pexp_literal_arg(pe.arg) and pexp_literal_arg(pe.arg2) or false
@@ -1080,8 +1082,13 @@ local function emit_seg(p, i, lifted)
   end
   if p.pexp then -- ${a[@]} / ${a[*]}: array elements as a multi-element segment (gated)
     local pe = p.pexp
-    local elems = ("sh:array_values(%q)"):format(pe.name)
-    if pe.op == "sub" then -- ${a[@]:off:len} slice: arith off/len, then index/assoc-aware select
+    local positional = (pe.name == "@" or pe.name == "*") -- ${@OP}/${*OP} vs ${a[@]OP}
+    -- Element source: positional params ($1.. — plus $0 for a slice, whose offset is
+    -- indexed) or the array's values.
+    local elems = positional
+      and (pe.op == "sub" and "sh:paramListSub()" or "sh:paramList()")
+      or ("sh:array_values(%q)"):format(pe.name)
+    if pe.op == "sub" then -- ${a[@]:off:len} / ${@:off:len} slice: arith off/len, then select
       local P = require("parser")
       local off = ("(rt.arith_int(sh, %s) or 0)"):format(emit_word(P.parse_word(pe.arg or ""), lifted))
       local len = pe.arg2 and ("(rt.arith_int(sh, %s) or 0)"):format(emit_word(P.parse_word(pe.arg2), lifted)) or "nil"
@@ -1090,7 +1097,7 @@ local function emit_seg(p, i, lifted)
       elems = ("rt.array_op_values(sh, %s, %q, %q, %q)"):format(elems, pe.op, pe.arg or "", pe.arg2 or "")
     end
     return ("{multi=true,star=%s,q=%s,elems=%s}"):format(
-      tostring(pe.index == "*"), tostring(p.q or false), elems)
+      tostring(pe.index == "*" or pe.name == "*"), tostring(p.q or false), elems)
   end
   if p.q then
     return ("{s=%s,split=false,unq=false}"):format(emit_scalar_val(p, i, lifted, false))

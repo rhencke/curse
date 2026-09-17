@@ -119,6 +119,9 @@ function Shell:paramsJoin(sep) return table.concat(self.params, sep or " ", 1, s
 function Shell:paramsStar() return self:paramsJoin(self.vars["IFS"] and self:get("IFS"):sub(1, 1) or " ") end
 -- The positional params as a fresh 1-based list (for the field engine's $@/$* segments).
 function Shell:paramList() local t = {}; for i = 1, self.nparams do t[i] = self.params[i] end; return t end
+-- ${@:off:len}/${*:off:len} slices over [$0, $1, …] (the offset is indexed so ${@:0}
+-- includes $0), unlike every other $@ expansion which is $1.. only — matches interp.
+function Shell:paramListSub() local t = { self.argv0 or "" }; for i = 1, self.nparams do t[i + 1] = self.params[i] end; return t end
 -- Backslash-escape glob metacharacters in a string so it matches literally in a glob
 -- pattern (the compiled tier's twin of interp's expand_escaped for a QUOTED pattern part:
 -- `case $x in "$p"*)` — "$p"'s metachars are literal, the trailing * is active).
