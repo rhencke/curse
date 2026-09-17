@@ -2906,6 +2906,23 @@ function M.arith_str(sh, s)
   if fn then return fn(sh) end
   return require("interp").dbracket_arith(sh, s)
 end
+-- `[[ -v NAME ]]` / `[[ -v a[i] ]]`: is the variable (or array element) set? interp's
+-- var_is_set twin. `nm` is already word-expanded, so an array subscript is a plain literal
+-- (no $): an ASSOC key is used verbatim, an INDEXED subscript is arith-evaluated via
+-- rt.arith_str (native; a nested-subscript operand defers through arith_str's seam). A
+-- bare array name tests element 0 (like bash); a digit is a positional parameter.
+function M.var_is_set(sh, nm)
+  local base, sub = nm:match("^([%a_][%w_]*)%[(.+)%]$")
+  if base then
+    local key = sh:is_assoc(base) and sub or M.to_arr_key(M.arith_str(sh, sub))
+    return sh:is_elem_set(base, key)
+  end
+  if nm:match("^%d+$") then return tonumber(nm) <= sh.nparams end -- positional param
+  local dn = sh:deref(nm)
+  local b = sh.vars[dn]
+  if b and b.arr then return sh:is_elem_set(dn, sh:is_assoc(dn) and "0" or 0) end -- bare array -> [0]
+  return b ~= nil or sh:special_get(nm) ~= ""
+end
 -- Attribute-aware scalar assignment (interp's assign_scalar twin, for the EF.has_attr
 -- compiled path): the RHS `value` is already word-expanded. A readonly target errors
 -- (writing THROUGH a nameref is non-fatal; a direct one aborts the line, or hard-exits

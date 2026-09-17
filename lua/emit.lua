@@ -881,9 +881,11 @@ local function emit_dbracket(node, lifted)
     local op, val = node.op, emit_word(node.word, lifted)
     if op == "-z" then return "(" .. val .. ' == "")' end
     if op == "-n" then return "(" .. val .. ' ~= "")' end
-    -- -o (shell option) / -v (variable set: array_key/word-engine) stay on the interp seam;
-    -- every other unary is a file predicate -> the pure-FFI runtime primitive.
-    if op == "-o" or op == "-v" then return ("I.dbracket_unary(sh, %q, %s)"):format(op, val) end
+    -- -v (variable/element set): the operand is already word-expanded, so its subscript is
+    -- a literal -> rt.var_is_set is native. -o (shell option) still needs SETOPT/opt_on ->
+    -- interp seam. Every other unary is a file predicate -> the pure-FFI runtime primitive.
+    if op == "-v" then return ("rt.var_is_set(sh, %s)"):format(val) end
+    if op == "-o" then return ("I.dbracket_unary(sh, %q, %s)"):format(op, val) end
     return ("rt.file_test(%q, %s)"):format(op, val)
   elseif k == "binary" then
     if not db_word_ok(node.l) or not db_word_ok(node.r) then return nil end
