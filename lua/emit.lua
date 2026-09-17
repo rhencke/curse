@@ -2056,7 +2056,7 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
           local from, wrap, call, prefix
           if cmd == "echo" then from = 2; call = "sh:echo(unpack(__a))"
           elseif cmd == "test" or cmd == "[" then -- the [ / test command word is a literal (dispatched by
-            from = 2; wrap = "rt.cstr(%s)"; call = "I.do_test(sh, __a)" -- name, never glob-expanded)
+            from = 2; wrap = "rt.cstr(%s)"; call = "rt.do_test(sh, __a)" -- name, never glob-expanded)
             prefix = ("rt.cstr(%q)"):format(cmd)
           elseif funcflags[cmd] and (funcflags[cmd].locals or funcflags[cmd].params) then
             from = 2
@@ -2168,7 +2168,7 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
         -- interp truncates in expand_args, external exec via C — do_test is Lua-side.
         local allargs = {}
         for j = 1, #st.words do if not empty_word(st.words[j]) then allargs[#allargs + 1] = ("rt.cstr(%s)"):format(emit_word(st.words[j], lifted)) end end
-        body = "I.do_test(sh, {" .. table.concat(allargs, ", ") .. "})"
+        body = "rt.do_test(sh, {" .. table.concat(allargs, ", ") .. "})"
       elseif funcflags[cmd] then
         local ff = funcflags[cmd]
         if ff.locals then -- full frame (save/restore shadowed vars + params)

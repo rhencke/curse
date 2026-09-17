@@ -1127,6 +1127,38 @@ ffi.cdef [[
 ]]
 local scratch = ffi.new("char[4096]")
 
+-- Shell `set` options. `set -o NAME` and `$-` letters map to a Shell field; option
+-- STATE is runtime data (sh.opt_*), so this machinery lives in runtime (interp and the
+-- set/shopt builtins import it back via interp._int). SETOPTS is the ordered long-name
+-- list; SETOPT maps a long name -> field; SETFLAG maps a `-x` letter -> field.
+M.SETOPTS = {
+  { "allexport", "opt_a" }, { "braceexpand", "opt_B" }, { "emacs", "opt_emacs" },
+  { "errexit", "opt_e" }, { "errtrace", "opt_errtrace" }, { "functrace", "opt_functrace" },
+  { "hashall", "opt_h" }, { "histexpand", "opt_H" }, { "history", "opt_history" },
+  { "ignoreeof", "opt_ignoreeof" }, { "interactive-comments", "opt_icomments" },
+  { "keyword", "opt_k" }, { "monitor", "opt_m" }, { "noclobber", "opt_C" },
+  { "noexec", "opt_n" }, { "noglob", "opt_f" }, { "nolog", "opt_nolog" },
+  { "notify", "opt_b" }, { "nounset", "opt_u" }, { "onecmd", "opt_t" },
+  { "physical", "opt_P" }, { "pipefail", "opt_pipefail" }, { "posix", "opt_posix" },
+  { "privileged", "opt_p" }, { "verbose", "opt_v" }, { "vi", "opt_vi" },
+  { "xtrace", "opt_x" },
+}
+M.SETOPT = {}
+for _, o in ipairs(M.SETOPTS) do M.SETOPT[o[1]] = o[2] end
+M.SETFLAG = { a = "opt_a", B = "opt_B", e = "opt_e", h = "opt_h", H = "opt_H",
+  k = "opt_k", m = "opt_m", C = "opt_C", n = "opt_n", f = "opt_f", b = "opt_b",
+  u = "opt_u", t = "opt_t", P = "opt_P", v = "opt_v", x = "opt_x", p = "opt_p",
+  T = "opt_functrace", E = "opt_errtrace" }
+-- options that default ON (nil field state == off for the rest).
+M.SETDEFAULT = { opt_B = true, opt_h = true, opt_H = true, opt_history = true,
+  opt_icomments = true }
+function M.opt_on(sh, field)
+  local v = sh[field]
+  if v ~= nil then return v end
+  if field == "opt_emacs" then return sh.opt_i and true or false end -- emacs on only when interactive
+  return M.SETDEFAULT[field] or false
+end
+
 -- `test`/`[`/`[[ ]]` file predicates (shared by both tiers and the builtins that used
 -- to import them from interp). Pure stat/access FFI — a runtime primitive, not
 -- interpretation. Offsets are glibc x86-64 struct stat (st_mode@24, st_uid@28,
@@ -2923,6 +2955,121 @@ function M.var_is_set(sh, nm)
   if b and b.arr then return sh:is_elem_set(dn, sh:is_assoc(dn) and "0" or 0) end -- bare array -> [0]
   return b ~= nil or sh:special_get(nm) ~= ""
 end
+
+-- The `test`/`[` engine (shared by both tiers; the compiled tier computes the argv with
+-- emit_word and calls M.do_test on the values — real code + a library call, not an AST
+-- re-walk). Follows bash's test.c exactly. Every operand primitive is already a runtime
+-- function (file_test, coll_lt, file_bincmp, var_is_set, SETOPT/opt_on), so this is
+-- self-contained — no interpreter.
+local function test_unary(sh, op, x)
+  if op == "-z" then return x == "" end
+  if op == "-n" then return x ~= "" end
+  if op == "-o" then return sh and M.SETOPT[x] and M.opt_on(sh, M.SETOPT[x]) or false end -- shell option on
+  if op == "-v" then return sh and M.var_is_set(sh, x) or false end -- variable/element is set
+  return M.file_test(op, x) -- -e/-f/-d/-r/-w/-x/-s…
+end
+-- `test` numeric operands are plain DECIMAL integers (leading 0 is NOT octal; 0x/N#/arith
+-- rejected) — an invalid one is a syntax error.
+local function test_int(s)
+  local d = s:match("^%s*([+-]?%d+)%s*$")
+  if not d then error({ __test_syntax = ("%s: integer expression expected"):format(s) }) end
+  return M.str_to_i64(d) -- exact int64, base-10, like bash's test
+end
+local TEST_BINOPS = { ["="] = 1, ["=="] = 1, ["!="] = 1, ["<"] = 1, [">"] = 1,
+  ["-eq"] = 1, ["-ne"] = 1, ["-lt"] = 1, ["-le"] = 1, ["-gt"] = 1, ["-ge"] = 1,
+  ["-ot"] = 1, ["-nt"] = 1, ["-ef"] = 1 }
+-- Unary primaries bash recognizes: a 2-arg test whose first token isn't one of these is
+-- "unary operator expected" (status 2), not a false result.
+local TEST_UNOPS = {}
+for w in ("-a -b -c -d -e -f -g -h -k -p -r -s -t -u -w -x -G -L -N -O -R -S -o -v -z -n"):gmatch("%S+") do TEST_UNOPS[w] = 1 end
+local function test_binary(x, op, y)
+  if op == "=" or op == "==" then return x == y end
+  if op == "!=" then return x ~= y end
+  if op == "<" then return M.coll_lt(x, y) end -- string compare by LC_COLLATE (bash)
+  if op == ">" then return M.coll_lt(y, x) end
+  if op == "-ot" or op == "-nt" or op == "-ef" then return M.file_bincmp(op, x, y) end
+  if not TEST_BINOPS[op] then error({ __test_syntax = ("%s: binary operator expected"):format(op) }) end
+  local nx, ny = test_int(x), test_int(y)
+  if op == "-eq" then return nx == ny end
+  if op == "-ne" then return nx ~= ny end
+  if op == "-lt" then return nx < ny end
+  if op == "-le" then return nx <= ny end
+  if op == "-gt" then return nx > ny end
+  if op == "-ge" then return nx >= ny end
+  return false
+end
+-- Evaluate a `test`/`[` argument list (already expanded): count-based dispatch (POSIX
+-- 1/2/3-arg special cases) then a recursive-descent parser (or->and->term, `-o` lowest /
+-- `-a` / `!` / `( )`), consuming terms strictly left-to-right so `-o`/`-a` can be an
+-- OPERAND where one is expected.
+local function do_test(sh, args)
+  local lo, hi = 2, #args
+  if args[1] == "[" then
+    if args[hi] ~= "]" then sh.status = 2; return end
+    hi = hi - 1
+  end
+  local n = hi - lo + 1
+  local pos = lo
+  local expr_, and_, term_
+  local function one_arg() local v = args[pos] ~= ""; pos = pos + 1; return v end
+  local function two_args()
+    if args[pos] == "!" then pos = pos + 1; return not one_arg() end
+    if TEST_UNOPS[args[pos]] then local v = test_unary(sh, args[pos], args[pos + 1]); pos = pos + 2; return v end
+    error({ __test_syntax = args[pos] .. ": unary operator expected" })
+  end
+  local function three_args()
+    if TEST_BINOPS[args[pos + 1]] then local v = test_binary(args[pos], args[pos + 1], args[pos + 2]); pos = pos + 3; return v end
+    if args[pos + 1] == "-a" then local x, y = args[pos] ~= "", args[pos + 2] ~= ""; pos = pos + 3; return x and y end
+    if args[pos + 1] == "-o" then local x, y = args[pos] ~= "", args[pos + 2] ~= ""; pos = pos + 3; return x or y end
+    if args[pos] == "!" then pos = pos + 1; return not two_args() end
+    if args[pos] == "(" and args[pos + 2] == ")" then local v = args[pos + 1] ~= ""; pos = pos + 3; return v end
+    error({ __test_syntax = args[pos + 1] .. ": binary operator expected" })
+  end
+  term_ = function()
+    if pos > hi then error({ __test_syntax = "argument expected" }) end
+    if args[pos] == "!" then pos = pos + 1; return not term_() end
+    if args[pos] == "(" then
+      pos = pos + 1
+      local v = expr_()
+      if args[pos] ~= ")" then error({ __test_syntax = "`)' expected" }) end
+      pos = pos + 1
+      return v
+    end
+    if pos + 2 <= hi and TEST_BINOPS[args[pos + 1]] then
+      local v = test_binary(args[pos], args[pos + 1], args[pos + 2]); pos = pos + 3; return v
+    end
+    if pos + 1 <= hi and TEST_UNOPS[args[pos]] then
+      local v = test_unary(sh, args[pos], args[pos + 1]); pos = pos + 2; return v
+    end
+    return one_arg()
+  end
+  and_ = function()
+    local v = term_()
+    while pos <= hi and args[pos] == "-a" do pos = pos + 1; local v2 = term_(); v = v and v2 end
+    return v
+  end
+  expr_ = function()
+    local v = and_()
+    while pos <= hi and args[pos] == "-o" do pos = pos + 1; local v2 = and_(); v = v or v2 end
+    return v
+  end
+  local ok, res = pcall(function()
+    if n == 0 then return false
+    elseif n == 1 then return one_arg()
+    elseif n == 2 then return two_args()
+    elseif n == 3 then return three_args()
+    else
+      local v = expr_()
+      if pos <= hi then error({ __test_syntax = "too many arguments" }) end
+      return v
+    end
+  end)
+  if not ok then sh.status = 2; return end
+  sh.status = res and 0 or 1
+end
+M.test_unary, M.test_binary, M.test_int = test_unary, test_binary, test_int
+M.TEST_BINOPS, M.TEST_UNOPS, M.do_test = TEST_BINOPS, TEST_UNOPS, do_test
+
 -- Attribute-aware scalar assignment (interp's assign_scalar twin, for the EF.has_attr
 -- compiled path): the RHS `value` is already word-expanded. A readonly target errors
 -- (writing THROUGH a nameref is non-fatal; a direct one aborts the line, or hard-exits
