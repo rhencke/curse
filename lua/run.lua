@@ -95,6 +95,12 @@ local OMAP = { errexit = "opt_e", errtrace = "opt_errtrace", functrace = "opt_fu
 -- posix-named invocation, posix mode.
 local SHELLNAME = (os.getenv("CURSE_ARGV0") or arg[0] or "bash"):match("[^/]+$") or "bash"
 local SH_IS_POSIX = SHELLNAME == "sh" or SHELLNAME == "dash" or SHELLNAME == "ash"
+-- Default interactive prompt. bash's own compiled default is `\s-\v\$ `, but Debian's
+-- /etc/bash.bashrc (read for interactive shells even under --rcfile) sets this one, and
+-- curse impersonates Debian bash — so an interactive shell with PS1 unset gets it. Set
+-- BEFORE the rcfile so a user's rc can still override it. `[[ ]]` keeps the backslashes
+-- literal (they are prompt escapes, decoded later by ${PS1@P}).
+local DEFAULT_PS1 = [[${debian_chroot:+($debian_chroot)}\u@\h:\w\$ ]]
 local function apply(s)
   s.shellname = SHELLNAME
   if SH_IS_POSIX then s.opt_posix = true end
@@ -158,6 +164,7 @@ if arg[ai] == "-c" or arg[ai] == "+c" then
   sh = rt.Shell.new(); apply(sh); sh.opt_c = true
   -- an interactive shell sets $HISTFILE (bash), even for `-i -c`
   if sh.opt_i and sh.vars.HISTFILE == nil then sh:set_str("HISTFILE", (os.getenv("HOME") or "") .. "/.bash_history"); sh.histfile_default = true end
+  if sh.opt_i and sh.vars.PS1 == nil then sh:set_str("PS1", DEFAULT_PS1) end
   sh.argv0 = arg[j + 1] or SHELLNAME -- $0 defaults to the shell name (bash), not "curse"
   for k = j + 2, #arg do sh.nparams = sh.nparams + 1; sh.params[sh.nparams] = arg[k] end
   source_rc(sh) -- interactive: --rcfile is sourced before the command string
@@ -173,6 +180,7 @@ if arg[ai] == nil then
   if sh.opt_i or istty then
     sh.opt_i = true
     if sh.vars.HISTFILE == nil then sh:set_str("HISTFILE", (os.getenv("HOME") or "") .. "/.bash_history"); sh.histfile_default = true end
+    if sh.vars.PS1 == nil then sh:set_str("PS1", DEFAULT_PS1) end
     source_rc(sh) -- --rcfile sourced before the interactive session
     require("repl").run(sh)
   else
