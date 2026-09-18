@@ -2251,6 +2251,9 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
             local ff = funcflags[cmd]
             call = fnwrap(cmd, st.line, ff.locals and ("sh:pushCall(unpack(__a)); %s(sh); sh:popCall()"):format(fnlname(cmd))
               or ("sh:pushParams(unpack(__a)); %s(sh); sh:popParams()"):format(fnlname(cmd)))
+          elseif funcflags[cmd] then -- bare function (references NO positional params): build argv
+            from = 2                  -- to run the args' side effects, then a bare call (params unread)
+            call = fnwrap(cmd, st.line, ("%s(sh)"):format(fnlname(cmd)))
           elseif cmd ~= nil and not NATIVE_BUILTIN[cmd] and not (inlinefns and inlinefns[cmd])
               and not funcflags[cmd] and not require("interp").BUILTINS[cmd] then
             from = 1; call = "sh:exec(unpack(__a))" -- external, static command name
