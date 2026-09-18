@@ -2617,7 +2617,14 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
       -- dynamic command word) delegates.
       if st.assigns == nil then
         local anyfield = false
-        for j = 1, #st.words do if not word_safe(st.words[j]) then anyfield = true; break end end
+        -- A `local`/in-function `declare` VALUE word (j>1) never word-splits or globs
+        -- (assignment context), so a merely-renderable value (`local x=$y`) is NOT a
+        -- field-engine word — gate it on emitable_word, letting it reach the native
+        -- localAssign path below rather than delegating here.
+        for j = 1, #st.words do
+          if as_local and j > 1 then if not emitable_word(st.words[j]) then anyfield = true; break end
+          elseif not word_safe(st.words[j]) then anyfield = true; break end
+        end
         if anyfield then
           local from, wrap, call, prefix
           if cmd == "echo" then from = 2; call = "sh:echo(unpack(__a))"
@@ -2671,6 +2678,11 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
           -- ${..} the codegen can't render; other commands delegate on any word
           -- that needs the field engine (splitting/glob/multi).
           elseif isfunc then if not emitable_word(w) then mustdeleg = true; break end
+          -- `local`/in-function `declare|typeset` VALUE word (j>1): an assignment RHS
+          -- never word-splits or globs, so it needs only to be renderable (emitable_word),
+          -- not word_safe — `local x=$y` / `local x=$(cmd)` / `local x=*.txt` assign the
+          -- value verbatim. (The command word j==1 keeps the word_safe/native-builtin path.)
+          elseif as_local and j > 1 then if not emitable_word(w) then mustdeleg = true; break end
           elseif not word_safe(w) then mustdeleg = true; break end
         end
       end
@@ -2724,17 +2736,24 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
         local ev = #args > 0 and ("local __a = { " .. table.concat(args, ", ") .. " }; ") or ""
         body = ev .. ("sh.status = %d"):format(cmd == "false" and 1 or 0)
       elseif as_local then -- local / in-function declare|typeset: each NAME[=val] a local
-        local ls = {}
-        for j = 2, #st.words do -- a `local NAME=foo:~` arg tilde-expands the RHS (all-literal only)
+        -- bash expands ALL the assignment words FIRST (in the OUTER scope), THEN localizes
+        -- + assigns them — so `local a=1 b=$a` gives b=<outer a>, not 1. Pre-evaluate every
+        -- value into a temp before any localAssign so a later operand can't see an earlier
+        -- one's new binding. A `local NAME=foo:~` arg tilde-expands the RHS (all-literal only).
+        local tmps, calls = {}, {}
+        for j = 2, #st.words do
           local aw = st.words[j]
           if not empty_word(aw) then
             local av = emit_word(aw, lifted)
             local fl = unq_full_lit(aw)
             if fl and fl:find("~", 1, true) then av = ("rt.tilde_word_initial(sh, %q)"):format(fl) end
-            ls[#ls + 1] = ("sh:localAssign(%s)"):format(av)
+            local tn = "__lv" .. (#tmps + 1)
+            tmps[#tmps + 1] = ("local %s = %s"):format(tn, av)
+            calls[#calls + 1] = ("sh:localAssign(%s)"):format(tn)
           end
         end
-        body = table.concat(ls, "; ") .. (#ls > 0 and "; " or "") .. "sh.status = 0"
+        body = table.concat(tmps, "; ") .. (#tmps > 0 and "; " or "")
+          .. table.concat(calls, "; ") .. (#calls > 0 and "; " or "") .. "sh.status = 0"
       elseif cmd == "test" or cmd == "[" then
         -- [ EXPR ] / test EXPR: the operator/arity are compile-time known; compute the
         -- args natively (word_safe, so no field engine) and run the POSIX test logic
