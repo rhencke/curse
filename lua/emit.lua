@@ -494,12 +494,12 @@ local function empty_word(w) return #w.parts == 0 end
 local pexp_compilable, pexp_scalar, emit_pattern_glob -- fwd decl (defined after COMPILE_UNSAFE_VAR)
 local function emitable_word(w)
   for _, p in ipairs(w.parts) do
-    -- In a program that declares a nameref, a variable read (`$ref`, `"$ref"`,
-    -- `${ref…}`) may resolve THROUGH the nameref to an array/assoc ELEMENT — which
-    -- the native read renders as the base var, not the element (only interp derefs
-    -- element-namerefs, and only on some paths). Delegate any var read so it's
-    -- correct. Gated to nameref programs (rare); ordinary reads stay native.
-    if EF.has_nameref and (p.var or p.pexp) then return false end
+    -- In a program that declares a nameref, a `${ref…}` OPERATOR read (default,
+    -- length, subscript, …) may resolve THROUGH the nameref to an array/assoc
+    -- ELEMENT — which the native pexp renderers do not deref. Keep those delegating.
+    -- A plain scalar read (`$ref`/`${ref}`/`"$ref"`/`foo$ref` — all p.var) compiles:
+    -- it renders via rt.nameref_read, which reproduces the interp's element-deref.
+    if EF.has_nameref and p.pexp then return false end
     if p.pexp and not pexp_compilable(p.pexp) then return false end
     if p.procsub then return false end -- <(cmd)/>(cmd): needs the interp's temp-file setup
     if p.special and not RENDERABLE_SPECIAL[p.special] then return false end -- e.g. $-
@@ -859,7 +859,8 @@ emit_word = function(w, lifted)
     elseif p.var == "LINENO" then -- $LINENO: the current source line, a compile-time constant
       parts[#parts + 1] = ("%q"):format(tostring(EF.cur_line or 0))
     elseif p.var then
-      parts[#parts + 1] = lifted[p.var] and ("rt.i64_to_str(%s)"):format(lname(p.var)) or ("sh:get_u(%q)"):format(p.var)
+      parts[#parts + 1] = EF.has_nameref and ("rt.nameref_read(sh, %q)"):format(p.var)
+        or lifted[p.var] and ("rt.i64_to_str(%s)"):format(lname(p.var)) or ("sh:get_u(%q)"):format(p.var)
     elseif p.param then parts[#parts + 1] = ("sh:param(%d)"):format(p.param)
     elseif p.special then
       if p.special == "#" then parts[#parts + 1] = "tostring(sh.nparams)"
@@ -1224,7 +1225,8 @@ local function emit_scalar_val(p, i, lifted, tilde)
   elseif p.var == "LINENO" then -- $LINENO: its value is the current source line, known at compile time
     return ("%q"):format(tostring(EF.cur_line or 0))
   elseif p.var then
-    return lifted[p.var] and ("rt.i64_to_str(%s)"):format(lname(p.var)) or ("sh:get_u(%q)"):format(p.var)
+    return EF.has_nameref and ("rt.nameref_read(sh, %q)"):format(p.var)
+      or lifted[p.var] and ("rt.i64_to_str(%s)"):format(lname(p.var)) or ("sh:get_u(%q)"):format(p.var)
   elseif p.param then return ("sh:param(%d)"):format(p.param)
   elseif p.special == "#" then return "tostring(sh.nparams)"
   elseif p.special == "?" then return "tostring(sh.status)"
@@ -1355,9 +1357,12 @@ end
 -- CFG-unreproducible special ($LINENO/$_). Plain literal+var+param+$@/$* words qualify —
 -- exactly the mixed shapes (`foo$x`, `$x.txt`, `x$@y`) that field_word can't render.
 function mixed_expandable(w, lifted)
-  if EF.has_nameref then return false end
   for _, p in ipairs(w.parts) do
     if p.arith or p.arithast or p.cmdsub or p.procsub then return false end
+    -- In a nameref program a ${…}-OP read may deref an element-nameref (which the
+    -- native pexp renderers do not handle): delegate any pexp. A plain var part is
+    -- fine — it renders via rt.nameref_read (emit_scalar_val).
+    if EF.has_nameref and p.pexp then return false end
     -- a bare ${a[@]}/${a[*]} array expansion is a multi-element segment seg_native renders;
     -- a scalar ${..} op (len/subst/strip/default/substring/@Q) renders via pexp_scalar; the
     -- ${!ref} indirect via the bootstrap. Anything else (a non-compilable ${…}) still delegates.
@@ -1374,15 +1379,14 @@ end
 -- pexp/cmdsub/arith/arithast/procsub (raise-y or non-scalar), namerefs, and any
 -- CFG-unreproducible special ($LINENO/$_/…).
 function seg_native(w, lifted)
-  if EF.has_nameref then return false end
   for _, p in ipairs(w.parts) do
     if p.lenof then return false end -- ${#x}/${##}: length, not the plain value
     if p.lit ~= nil or p.raw then -- literal text / inlined-param string: ok
-    elseif p.var then if (COMPILE_UNSAFE_VAR[p.var] and p.var ~= "LINENO") then return false end
+    elseif p.var then if (COMPILE_UNSAFE_VAR[p.var] and p.var ~= "LINENO") then return false end -- a nameref-program var reads via rt.nameref_read (emit_scalar_val)
     elseif p.param then -- $1..$9 positional: ok
     elseif p.special == "#" or p.special == "?" or p.special == "$" or p.special == "!" then -- scalar specials
     elseif p.special == "@" or p.special == "*" then -- $@/$*: multi-element (emit_seg renders it)
-    elseif p.pexp and (array_multi_op(p.pexp) or indirect_ok(p.pexp) or pexp_compilable(p.pexp) or (p.pexp.op == "prefix" and not p.pexp.star)) then -- ${a[@]}, ${!ref}, scalar ${..} op, or ${!pre@} name-prefix
+    elseif not EF.has_nameref and p.pexp and (array_multi_op(p.pexp) or indirect_ok(p.pexp) or pexp_compilable(p.pexp) or (p.pexp.op == "prefix" and not p.pexp.star)) then -- ${a[@]}, ${!ref}, scalar ${..} op, or ${!pre@} name-prefix (a ${…}-OP may deref an element-nameref: delegate in nameref programs)
     else return false end -- other pexp, cmdsub, arith, procsub, or anything unknown
   end
   return true

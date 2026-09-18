@@ -1462,6 +1462,15 @@ function Shell:get_u(name)
   end
   return self:get(name)
 end
+-- Read a scalar variable ($x / ${x} / "$x") in a program that DECLARES a nameref.
+-- A nameref can resolve THROUGH to an array/assoc ELEMENT (`declare -n ref='a[2]'`),
+-- which :deref renders as the base var's [0] rather than the element — only the word
+-- engine derefs an element-nameref. Nameref programs are rare/cold, so reproduce the
+-- interp's word-read exactly (element-deref + nounset) via a bootstrap rather than
+-- re-deriving the deref subtlety here. (BOOT into the shared expander, not a SEAM.)
+function M.nameref_read(sh, name)
+  return require("interp")._int.expand_part_str(sh, { var = name })
+end
 -- Capture-aware error write: inside a `$(...)` capture with `2>&1` active, route
 -- the message into the capture buffer (self.out) so it's captured like bash;
 -- otherwise to real stderr. Mirrors interp's sherr for runtime-side messages.
