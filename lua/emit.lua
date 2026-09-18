@@ -344,6 +344,37 @@ local function safe_arith(s)
   if ok then return a end
   return { k = "arith_perr", raw = s }
 end
+-- An arith node renderable in VALUE position by emit_value (num/var/param/fast-$name/
+-- un/bin/tern) — no side effect and nothing not_compilable rejects. Matches the pure-arith
+-- word path (emitable_word via not_compilable), used to vet the OPERANDS of a side-effecting
+-- word arith so nothing nested reaches emit_value's unsupported asgn/post/pre/comma cases.
+local function arith_val_r(e)
+  if type(e) ~= "table" then return false end
+  local k = e.k
+  if k == "num" or k == "param" or k == "raw" then return true end
+  if k == "var" then return not e.idx and not e.idxraw and not COMPILE_UNSAFE_VAR[e.name] end
+  if k == "xpand" then return xpand_fast(e.raw) end -- a fast $name xpand emit_value renders
+  if k == "un" then return arith_val_r(e.e) end
+  if k == "bin" then return arith_val_r(e.l) and arith_val_r(e.r) end
+  if k == "tern" then return arith_val_r(e.c) and arith_val_r(e.a) and arith_val_r(e.b) end
+  return false -- asgn/post/pre/comma/xpandleaf/matherr: side effect or non-renderable
+end
+-- A SIDE-EFFECTING word arith (`echo $((x++))`, `${x:=$((n+=1))}`) that emit_arith_into can
+-- render into an IIFE: the side effect sits at the TOP level (a bare ++/--/assignment) with
+-- value-position operands — bash evaluates the whole $((…)) once, so one IIFE reproduces it.
+-- A side effect nested in an operand (`$(( (x++) + 1 ))`), an array subscript, or a dynamic
+-- special ($LINENO/…) is rejected -> the word keeps delegating.
+local function arith_word_ok(e)
+  if type(e) ~= "table" then return false end
+  local k = e.k
+  if k == "asgn" then
+    return not e.idx and not e.idxraw and not COMPILE_UNSAFE_VAR[e.name] and arith_val_r(e.e)
+  end
+  if k == "post" or k == "pre" then
+    return not e.idx and not e.idxraw and not COMPILE_UNSAFE_VAR[e.name]
+  end
+  return arith_val_r(e) -- a value with a nested side effect fails here (operands must be pure)
+end
 -- Does a subshell body statically run `set`? A fork-compiled subshell body is a
 -- straight-line sub-CFG; it can't honor an errexit toggle (`set -e`) that turns
 -- on partway through, whereas the interpreter checks errexit per command. So a
@@ -456,8 +487,11 @@ local function emitable_word(w)
     if p.pexp and not pexp_compilable(p.pexp) then return false end
     if p.procsub then return false end -- <(cmd)/>(cmd): needs the interp's temp-file setup
     if p.special and not RENDERABLE_SPECIAL[p.special] then return false end -- e.g. $-
-    if p.arith then local a = safe_arith(p.arith); if not_compilable(a) or arith_side_effect(a) then return false end end
-    if p.arithast and arith_side_effect(p.arithast) then return false end -- inlined arith
+    -- pure value arith renders via emit_value; a side-effecting one (x++/x=…/x+=…) via
+    -- emit_arith_into in an IIFE, provided the side effect is top-level (arith_word_ok).
+    if p.arith then local a = safe_arith(p.arith)
+      if not_compilable(a) or (arith_side_effect(a) and not arith_word_ok(a)) then return false end end
+    if p.arithast and arith_side_effect(p.arithast) and not arith_word_ok(p.arithast) then return false end -- inlined arith
   end
   return true
 end
@@ -545,7 +579,7 @@ end
 local build_cfg, assemble, emit_word
 local emit_frags, emit_frag_ctx, emit_frag_n
 
-local emit_value
+local emit_value, emit_arith_into
 emit_value = function(e, lifted)
   local k = e.k
   if k == "num" then
@@ -779,6 +813,17 @@ local function compile_cmdsub(src, backtick, lifted)
   return call
 end
 
+-- Render an arith node `a` (from a `$((…))`/inlined word) to a Lua string EXPRESSION.
+-- A pure value is emit_value inline; a side-effecting one (vetted by arith_word_ok) runs
+-- emit_arith_into in an IIFE so the ++/--/assignment fires exactly once, then stringifies
+-- the result. Assumes arith_varread is already set to the recursive $(()) reader by the caller.
+local function emit_arith_word(a, lifted)
+  if arith_side_effect(a) then
+    return "(function() local __v; " .. emit_arith_into("__v", a, lifted) .. "; return rt.i64_to_str(__v) end)()"
+  end
+  return "rt.i64_to_str(" .. emit_value(a, lifted) .. ")"
+end
+
 emit_word = function(w, lifted)
   local parts = {}
   for i, p in ipairs(w.parts) do
@@ -806,11 +851,11 @@ emit_word = function(w, lifted)
       elseif p.special == "!" then parts[#parts + 1] = '(sh.last_bg_pid or "")' end
     elseif p.arithast then -- a pre-parsed+substituted arith AST (inlined word)
       local saved = arith_varread; arith_varread = "rt.arith_read(sh, %q)" -- $(()) reads recursively (bar=foo;$((bar)))
-      parts[#parts + 1] = "rt.i64_to_str(" .. emit_value(p.arithast, lifted) .. ")"
+      parts[#parts + 1] = emit_arith_word(p.arithast, lifted)
       arith_varread = saved
     elseif p.arith then
       local saved = arith_varread; arith_varread = "rt.arith_read(sh, %q)" -- name/expr values re-parse as arith
-      parts[#parts + 1] = "rt.i64_to_str(" .. emit_value(safe_arith(p.arith), lifted) .. ")"
+      parts[#parts + 1] = emit_arith_word(safe_arith(p.arith), lifted)
       arith_varread = saved
     elseif p.cmdsub then -- $( … ): COMPILE the inner (known at compile time) and run it captured
       parts[#parts + 1] = compile_cmdsub(p.cmdsub, p.backtick, lifted)
@@ -1287,6 +1332,14 @@ local function arrayassign_ok(st, lifted)
     if e.brace_bare then return false end -- `[k]=` value brace-expands (de-keyed): interp
     if e.key ~= nil then
       if e.key:find("[%$`'\"]") then return false end -- dynamic subscript -> interp
+      -- A side-effecting arith in a KEYED element's subscript or value (`[100+i++]=$((i++))`)
+      -- has a subtle eval order — bash evaluates ALL the values, THEN all the keys — that the
+      -- straight-line compiled arrayassign can't reproduce. Delegate (interp gets the order).
+      if arith_side_effect(safe_arith(e.key)) then return false end
+      for _, p in ipairs(e.word.parts) do
+        if (p.arith and arith_side_effect(safe_arith(p.arith)))
+          or (p.arithast and arith_side_effect(p.arithast)) then return false end
+      end
       if not emitable_word(e.word) then return false end
     else
       if e.op ~= "=" then return false end
@@ -1345,7 +1398,7 @@ end
 -- non-lifted one goes through the sh:aget/aset int64 accessors (genuine primitive
 -- calls on natively-computed values, not an AST re-walk). Compound ops reuse
 -- emit_value's operator logic (div0, shifts, **) via a synthetic bin node.
-local function emit_arith_into(dst, e, lifted)
+emit_arith_into = function(dst, e, lifted)
   local k = e.k
   if k == "comma" then -- l for its side effect, r for the result
     return emit_arith_into(dst, e.l, lifted) .. "; " .. emit_arith_into(dst, e.r, lifted)
@@ -2399,8 +2452,11 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
       for j = 2, #st.words do if not empty_word(st.words[j]) then args[#args + 1] = ("rt.cstr(%s)"):format(emit_word(st.words[j], lifted)) end end
       local body
       if cmd == "echo" then body = "sh:echo(" .. table.concat(args, ", ") .. ")"
-      elseif cmd == ":" or cmd == "true" then body = "sh.status = 0"
-      elseif cmd == "false" then body = "sh.status = 1"
+      elseif cmd == ":" or cmd == "true" or cmd == "false" then
+        -- :/true/false ignore their args but bash still EXPANDS them, so a side-effecting arg
+        -- (`: $((a/=3))`, `: "${x:=d}"`, `: "$(cmd)"`) must run. Evaluate the argv, discard it.
+        local ev = #args > 0 and ("local __a = { " .. table.concat(args, ", ") .. " }; ") or ""
+        body = ev .. ("sh.status = %d"):format(cmd == "false" and 1 or 0)
       elseif as_local then -- local / in-function declare|typeset: each NAME[=val] a local
         local ls = {}
         for j = 2, #st.words do -- a `local NAME=foo:~` arg tilde-expands the RHS (all-literal only)
