@@ -315,9 +315,11 @@ end
 -- rt.arith_read_elem (which contains the nounset/matherr edges). A subscripted WRITE
 -- (asgn/post/pre) is NOT this — it stays delegated.
 local function arith_elem_ok(e)
-  if type(e) ~= "table" or e.k ~= "var" or not e.idx then return false end
+  -- gate on idxraw (the RAW subscript), not e.idx: a QUOTED subscript (`A['x']`) sets idxraw but
+  -- leaves e.idx nil (its arith parse is skipped), yet it's still an element read rt.array_key
+  -- resolves (assoc: dequoted word; indexed: arith_str(raw), which errors on a single quote).
+  if type(e) ~= "table" or e.k ~= "var" or type(e.idxraw) ~= "string" then return false end
   if type(e.name) ~= "string" or not e.name:match("^[%a_][%w_]*$") or COMPILE_UNSAFE_VAR[e.name] then return false end
-  if type(e.idxraw) ~= "string" then return false end
   local ok, sw = pcall(require("parser").parse_word, e.idxraw)
   if not ok then return false end
   for _, p in ipairs(sw.parts) do if p.cmdsub or p.procsub then return false end end
@@ -329,7 +331,7 @@ local function arith_side_effect(e)
   -- xpandleaf (${…}), comma, and a NON-compilable array subscript aren't compiled natively —
   -- treat like a side effect so the word/stmt delegates. A FAST xpand ($name only) and a
   -- read-only array element (arith_elem_ok) ARE compiled, so they aren't side effects.
-  if e.k == "xpandleaf" or e.k == "comma" or (e.idx and not arith_elem_ok(e)) then return true end
+  if e.k == "xpandleaf" or e.k == "comma" or (e.idxraw and not arith_elem_ok(e)) then return true end
   if e.k == "xpand" then return not xpand_fast(e.raw) end
   return arith_side_effect(e.e) or arith_side_effect(e.l) or arith_side_effect(e.r)
     or arith_side_effect(e.c) or arith_side_effect(e.a) or arith_side_effect(e.b)
@@ -342,7 +344,7 @@ local function not_compilable(e)
   -- arith_perr = a deferred arith PARSE error (`(( i = '3' ))`): only the interpreter
   -- renders it (prints bash's "syntax error in expression" + aborts the line), so the
   -- enclosing loop/statement must delegate — else emit_value throws an uncaught error.
-  if e.k == "xpandleaf" or e.k == "comma" or e.k == "arith_perr" or (e.idx and not arith_elem_ok(e)) then return true end
+  if e.k == "xpandleaf" or e.k == "comma" or e.k == "arith_perr" or (e.idxraw and not arith_elem_ok(e)) then return true end
   if e.k == "xpand" then return not xpand_fast(e.raw) end -- a fast $name xpand compiles
   return not_compilable(e.e) or not_compilable(e.l) or not_compilable(e.r)
     or not_compilable(e.c) or not_compilable(e.a) or not_compilable(e.b)
@@ -602,7 +604,7 @@ emit_value = function(e, lifted)
   end
   if k == "raw" then return e.code end -- a pre-computed Lua expr (inlined param binding)
   if k == "var" and e.name == "LINENO" then return (tostring(EF.cur_line or 0) .. "LL") end -- compile-time line
-  if k == "var" and e.idx then -- $(( a[i] )): array/assoc element read (gated by arith_elem_ok)
+  if k == "var" and e.idxraw then -- $(( a[i] )): array/assoc element read (gated by arith_elem_ok)
     return ("rt.arith_read_elem(sh, %q, %q, %s)"):format(e.name, e.idxraw, emit_word(require("parser").parse_word(e.idxraw), lifted))
   end
   if k == "var" then return lifted[e.name] and lname(e.name) or (arith_varread):format(e.name) end
@@ -1493,7 +1495,9 @@ local function arith_value_ok(e)
   if type(e) ~= "table" then return false end
   local k = e.k
   if k == "num" or k == "param" then return true end
-  if k == "var" then return not e.idx and not e.idxraw and not COMPILE_UNSAFE_VAR[e.name] end
+  -- a subscripted READ (a[i]) is a value emit_value renders via rt.arith_read_elem (write
+  -- targets are gated separately by arith_stmt_ok's `not e.idx` on asgn/post/pre).
+  if k == "var" then if e.idxraw then return arith_elem_ok(e) end; return not COMPILE_UNSAFE_VAR[e.name] end
   if k == "un" then return arith_value_ok(e.e) end
   if k == "bin" then return arith_value_ok(e.l) and arith_value_ok(e.r) end
   if k == "tern" then return arith_value_ok(e.c) and arith_value_ok(e.a) and arith_value_ok(e.b) end
