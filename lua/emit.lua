@@ -1503,6 +1503,10 @@ end
 -- bodies — a var shared between the top level and a function still lifts, because
 -- the upvalue is one real variable both see (no hash lookup, no desync).
 local function analyze_lift(ast)
+  -- A nameref program writes THROUGH namerefs (name=value -> some other var) via
+  -- rt.assign_scalar, which has no lifted-local to update — so an int64 local would desync.
+  -- Nameref programs are rare/cold; disable lifting so every var is sh-authoritative.
+  if EF.has_nameref then return {} end
   local assigned, disq, localed = {}, {}, {}
   local function scan(stmts)
     for _, st in ipairs(stmts) do
@@ -2001,8 +2005,10 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
       -- The program declares a nameref: a plain `name=value` may write THROUGH one
       -- (to a var / array or assoc element / a detected cycle) — only interp's full
       -- assign does that, so delegate. Gated to nameref programs (rare); ordinary
-      -- assigns stay native.
-      if EF.has_nameref then return delegate(st, after) end
+      -- assigns stay native (via rt.assign_scalar, which does the nameref write-through).
+      -- A nameref ELEMENT/append/arith assign (ref[i]=, ref+=, ref=$((…))) needs interp's
+      -- fuller handling, so delegate those; a plain scalar ref=value compiles.
+      if EF.has_nameref and (st.index or st.append or st.arith) then return delegate(st, after) end
       -- Assigning these fires a side effect only interp's assign implements (resize
       -- history / truncate the histfile); a native set_str would skip it. Delegate.
       if not st.index and (st.name == "HISTSIZE" or st.name == "HISTFILESIZE") then return delegate(st, after) end
@@ -2052,9 +2058,9 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
         blocks[p] = d .. emit_set(st.name, rhs, lifted) .. ua .. ("; pc = %d"):format(after)
       elseif lifted[st.name] then
         blocks[p] = d .. emit_set(st.name, numeric_word(st.rhs) .. "LL", lifted) .. ua .. ("; pc = %d"):format(after)
-      elseif EF.has_attr then -- readonly reject / array [0] / declare -i,-l,-u — native primitive
+      elseif EF.has_attr or EF.has_nameref then -- readonly / array[0] / -i,-l,-u / nameref write-through
         -- status 0 first so a plain RHS yields 0 (a cmdsub RHS overwrites it), then
-        -- assign_scalar (which sets 1 on a readonly reject); errchk applies errexit/ERR.
+        -- assign_scalar (readonly reject + nameref/cycle/subscript write-through); errchk applies.
         local ec = errchk(st); local ecs = ec ~= "" and ("; " .. ec) or ""
         blocks[p] = d .. ("sh.status = 0; rt.assign_scalar(sh, %q, %s)%s%s; pc = %d")
           :format(st.name, rhsval(), ecs, ua, after)

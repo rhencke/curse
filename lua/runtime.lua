@@ -3283,6 +3283,27 @@ M.TEST_BINOPS, M.TEST_UNOPS, M.do_test = TEST_BINOPS, TEST_UNOPS, do_test
 -- case; else a plain string set. `set -a` auto-exports a plain scalar. No array_key.
 function M.assign_scalar(sh, name, value)
   local direct = sh.vars[name]
+  -- nameref write-through (interp assign path): a cycle (ref -> … -> ref) is a non-fatal
+  -- warning; a nameref whose value carries a SUBSCRIPT (declare -n ref='a[2]') writes to
+  -- that element, not the base's [0] that a plain deref would give.
+  if direct and direct.ref and direct.s and direct.s ~= "" then
+    if sh:deref(name) == "" then
+      io.stderr:write("curse: warning: " .. name .. ": circular name reference\n"); sh.status = 1; return
+    end
+    local nbase, nsub = direct.s:match("^([%a_][%w_]*)%[(.+)%]$")
+    if nbase then
+      local rb = sh.vars[nbase]
+      if rb and rb.ro then -- through a nameref: readonly is non-fatal (bash)
+        io.stderr:write("curse: " .. name .. ": readonly variable\n"); sh.status = 1
+        if sh.opt_c or sh.opt_posix then error({ __curse_exit = 1 }) end
+        return
+      end
+      -- key resolution (assoc: dequote/expand the subscript; indexed: arith) is interp's
+      -- array_key — a rare-case bootstrap (a subscript-carrying nameref target).
+      sh:array_set(nbase, require("interp")._int.array_key(sh, nbase, nsub), value, false)
+      return
+    end
+  end
   local b = sh.vars[sh:deref(name)]
   if b and b.ro then
     io.stderr:write("curse: " .. name .. ": readonly variable\n")
