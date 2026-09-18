@@ -2379,6 +2379,24 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
           end
         end
       end
+      -- `builtin CMD args`: force the shell BUILTIN for CMD (skip any function of that name).
+      -- rt.exec_dynamic on the argv WITH "builtin" kept as argv[1] does exactly this — exec_simple
+      -- resolves "builtin" to the b_builtin builtin, which force-runs the rest as a builtin —
+      -- and reuses delegate's cf-signal wrapper (so `builtin break` in a loop jumps) + opts.redir.
+      if cmd == "builtin" and st.words[2] and not st.assigns then
+        local argvbody = field_argv(st.words, 1, lifted, nil, nil)
+        local bi_redir = nil
+        if argvbody and st.redirs then bi_redir = redir_conds(st, nil) end
+        if argvbody and not (st.redirs and not bi_redir) then
+          local hadcs = false
+          for j = 2, #st.words do
+            for _, pp in ipairs(st.words[j].parts) do if pp.cmdsub then hadcs = true; break end end
+            if hadcs then break end
+          end
+          return delegate(st, after, { prelude = argvbody, callee = "rt.exec_dynamic",
+            callargs = ("sh, __a, __noop, %s"):format(tostring(hadcs)), redir = bi_redir })
+        end
+      end
       -- `declare`/`typeset` INSIDE a function (no -g) make each name local, exactly like
       -- `local` (bash) — so route a plain one through the native local path. A flag (incl.
       -- -g), an array value (st.arrayargs delegated above), or `a[i]=` fails the plain check
