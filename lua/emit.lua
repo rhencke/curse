@@ -553,6 +553,7 @@ emit_value = function(e, lifted)
     return ("rt.arith_num(%q)"):format(e.v) -- 0x.. / 010 octal / N#.. bases
   end
   if k == "raw" then return e.code end -- a pre-computed Lua expr (inlined param binding)
+  if k == "var" and e.name == "LINENO" then return (tostring(EF.cur_line or 0) .. "LL") end -- compile-time line
   if k == "var" then return lifted[e.name] and lname(e.name) or (arith_varread):format(e.name) end
   if k == "param" then return ("rt.str_to_i64(sh:param(%d))"):format(e.n) end
   if k == "xpand" then
@@ -729,13 +730,13 @@ end
 -- {}) and return its id, or nil if the body hits a compiler gap. Shared by $(…),
 -- background, and pipeline stages — the compiled tier's "run this subprogram" unit.
 local function emit_fragment(stmts, neg)
-  local saved_tl, saved_neg = emit_toplevel, emit_neg_ctx
+  local saved_tl, saved_neg, saved_line = emit_toplevel, emit_neg_ctx, EF.cur_line
   if neg then emit_neg_ctx = true end -- `! cmd`: exempt its own errexit (see errchk)
   -- a `!`-inverted command must NOT inline a called function (its body keeps its own
   -- errexit, checked in fn_x — which is built separately, unaffected by emit_neg_ctx).
   local inlfns = neg and {} or emit_frag_ctx.inlinefns
   local bok, cfg = pcall(build_cfg, stmts, {}, emit_frag_ctx.funcflags, inlfns, false)
-  emit_toplevel, emit_neg_ctx = saved_tl, saved_neg
+  emit_toplevel, emit_neg_ctx, EF.cur_line = saved_tl, saved_neg, saved_line
   if not bok then return nil end
   emit_frag_n = emit_frag_n + 1
   emit_frags[#emit_frags + 1] = assemble(cfg, ("cs_%d = function(sh)"):format(emit_frag_n), {})
@@ -791,6 +792,8 @@ emit_word = function(w, lifted)
       parts[#parts + 1] = ("rt.tilde_word_initial(sh, %q)"):format(p.lit)
     elseif p.lit then parts[#parts + 1] = ("%q"):format(p.lit)
     elseif p.raw then parts[#parts + 1] = p.raw -- pre-computed Lua string expr (inlined param)
+    elseif p.var == "LINENO" then -- $LINENO: the current source line, a compile-time constant
+      parts[#parts + 1] = ("%q"):format(tostring(EF.cur_line or 0))
     elseif p.var then
       parts[#parts + 1] = lifted[p.var] and ("rt.i64_to_str(%s)"):format(lname(p.var)) or ("sh:get_u(%q)"):format(p.var)
     elseif p.param then parts[#parts + 1] = ("sh:param(%d)"):format(p.param)
@@ -860,7 +863,7 @@ end
 local function db_word_ok(w)
   if not emitable_word(w) then return false end
   for _, p in ipairs(w.parts) do
-    if p.var and COMPILE_UNSAFE_VAR[p.var] then return false end
+    if p.var and (COMPILE_UNSAFE_VAR[p.var] and p.var ~= "LINENO") then return false end
   end
   return true
 end
@@ -1042,7 +1045,7 @@ local function field_word(w, lifted)
   for _, p in ipairs(w.parts) do
     if p.q then return nil end                 -- a quoted part needs the mask
     if p.special then return nil end           -- @/*/$?/... handled elsewhere
-    if p.var and COMPILE_UNSAFE_VAR[p.var] then return nil end -- $LINENO/$_/… → interp
+    if p.var and (COMPILE_UNSAFE_VAR[p.var] and p.var ~= "LINENO") then return nil end -- $LINENO/$_/… → interp
     -- unquoted ${x:-word}: the taken branch (value or default) becomes the scalar value,
     -- then the outer field_split splits+globs it — pexp_compilable already gates the default
     -- to an emit_word-able word free of ~ \ ' " (quoted/multi/$* defaults, where field-wise
@@ -1075,6 +1078,8 @@ local function emit_scalar_val(p, i, lifted, tilde)
     end
     return ("%q"):format(p.lit)
   elseif p.raw then return p.raw
+  elseif p.var == "LINENO" then -- $LINENO: its value is the current source line, known at compile time
+    return ("%q"):format(tostring(EF.cur_line or 0))
   elseif p.var then
     return lifted[p.var] and ("rt.i64_to_str(%s)"):format(lname(p.var)) or ("sh:get_u(%q)"):format(p.var)
   elseif p.param then return ("sh:param(%d)"):format(p.param)
@@ -1193,7 +1198,7 @@ function mixed_expandable(w, lifted)
     -- a bare ${a[@]}/${a[*]} array expansion is a multi-element segment seg_native renders;
     -- any other ${…} (slice/strip/indirect/scalar op) still delegates.
     if p.pexp and not array_multi_op(p.pexp) then return false end
-    if p.var and COMPILE_UNSAFE_VAR[p.var] then return false end
+    if p.var and (COMPILE_UNSAFE_VAR[p.var] and p.var ~= "LINENO") then return false end
   end
   return true
 end
@@ -1209,7 +1214,7 @@ function seg_native(w, lifted)
   for _, p in ipairs(w.parts) do
     if p.lenof then return false end -- ${#x}/${##}: length, not the plain value
     if p.lit ~= nil or p.raw then -- literal text / inlined-param string: ok
-    elseif p.var then if COMPILE_UNSAFE_VAR[p.var] then return false end
+    elseif p.var then if (COMPILE_UNSAFE_VAR[p.var] and p.var ~= "LINENO") then return false end
     elseif p.param then -- $1..$9 positional: ok
     elseif p.special == "#" or p.special == "?" or p.special == "$" or p.special == "!" then -- scalar specials
     elseif p.special == "@" or p.special == "*" then -- $@/$*: multi-element (emit_seg renders it)
@@ -1232,7 +1237,7 @@ local function emit_pattern_glob(pat, lifted)
   for i, p in ipairs(w.parts) do
     if p.lenof or p.cmdsub or p.arith or p.arithast or p.pexp or p.procsub then return nil end
     if p.special == "@" or p.special == "*" then return nil end -- multi-element in a pattern
-    if p.var and COMPILE_UNSAFE_VAR[p.var] then return nil end
+    if p.var and (COMPILE_UNSAFE_VAR[p.var] and p.var ~= "LINENO") then return nil end
     if p.lit ~= nil then
       local s = p.lit
       if p.q then s = s:gsub(CASE_GLOBSPECIAL, "\\%0") end -- quoted metachars -> literal
@@ -1743,12 +1748,12 @@ local function subst_list(body, pb)
   local out = {}
   for _, st in ipairs(body) do
     if st.t == "assign" then
-      out[#out + 1] = st.arith and { t = "assign", name = st.name, arith = subst_arith(st.arith, pb) }
-        or { t = "assign", name = st.name, rhs = subst_word(st.rhs, pb) }
+      out[#out + 1] = st.arith and { t = "assign", name = st.name, arith = subst_arith(st.arith, pb), line = st.line }
+        or { t = "assign", name = st.name, rhs = subst_word(st.rhs, pb), line = st.line }
     elseif st.t == "simple" then
       local words = {}
       for _, w in ipairs(st.words) do words[#words + 1] = subst_word(w, pb) end
-      out[#out + 1] = { t = "simple", words = words }
+      out[#out + 1] = { t = "simple", words = words, line = st.line } -- keep line for $LINENO
     end
   end
   return out
@@ -1918,6 +1923,7 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
   -- Build blocks for `st`; its exit flows to pc `after`. Returns st's entry pc.
   local function flatten_stmt(st, after)
     local t = st.t
+    if st.line then EF.cur_line = st.line end -- for $LINENO (compile-time constant)
     -- break / continue [N]: a compile-time jump to the Nth enclosing loop's exit or
     -- re-test point. Both set $?=0 (bash). Outside any loop it's a no-op. A
     -- non-literal level (`break $n`) is rare — delegate it.
@@ -2555,6 +2561,10 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
       -- expansion/glob the field engine splits+globs at runtime). Array/@/* and
       -- mixed literal+expansion words still delegate the whole loop (cold path).
       for _, w in ipairs(st.words) do
+        -- $LINENO in a for-in list on a CONTINUATION line is the word's line, not the `for`
+        -- line (st.line) the compile-time constant would use — delegate so interp's per-line
+        -- tracking gives the exact value (rare; the whole loop is cold anyway).
+        for _, p in ipairs(w.parts) do if p.var == "LINENO" then return delegate(st, after) end end
         if not word_safe(w) and not field_word(w, lifted) then return delegate(st, after) end
       end
       local initp = newpc()
@@ -2815,6 +2825,7 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
         end
         matchentry[i] = mp
       end
+      if st.line then EF.cur_line = st.line end -- clause flattening moved it; restore for $LINENO in the subject
       local subjp = newpc()
       blocks[subjp] = dbg(st) .. ("%s = %s; sh.status = 0; pc = %d")
         :format(sv, emit_word(st.subject, lifted), n > 0 and matchentry[1] or after)
