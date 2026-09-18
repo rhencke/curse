@@ -1690,8 +1690,10 @@ local function analyze_lift(ast)
       if st.t == "assign" then
         assigned[st.name] = true
         -- an INDEXED assign (`a[i]=…`) makes an ARRAY: never int64-lift it (a native
-        -- scalar can't hold an array, and the delegated array ops read sh.vars).
-        if st.index or (not st.arith and not (st.rhs and numeric_word(st.rhs))) then disq[st.name] = true end
+        -- scalar can't hold an array, and the delegated array ops read sh.vars). A scalar
+        -- `name+=v` is STRING concatenation (not arith), so it can produce a non-numeric
+        -- value and its rt.append_scalar reads sh.vars — never lift an appended var either.
+        if st.index or st.append or (not st.arith and not (st.rhs and numeric_word(st.rhs))) then disq[st.name] = true end
       elseif st.t == "arrayassign" then disq[st.name] = true -- `a=(…)` array literal
       elseif st.t == "simple" then
         local cmd = st.words[1] and st.words[1].parts[1] and st.words[1].parts[1].lit
@@ -2236,7 +2238,7 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
       -- bare native set nor I.assign_scalar rejects them. Always delegate so interp
       -- reports "readonly variable" (status 1), as bash does.
       if not st.index and (st.name == "SHELLOPTS" or st.name == "BASHOPTS") then return delegate(st, after) end
-      if (st.append and not st.index) or (st.rhs and not emitable_word(st.rhs))
+      if (st.rhs and not emitable_word(st.rhs))
         or (st.arith and arith_side_effect(st.arith)) then return delegate(st, after) end
       -- a[i]=v / a[i]+=v: compile when the subscript is a non-empty emit_word-able word (rt
       -- .assign_element resolves it as an assoc key or an indexed arith at runtime). An empty
@@ -2267,6 +2269,13 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
         local ec = errchk(st); local ecs = ec ~= "" and ("; " .. ec) or ""
         blocks[p] = d .. ("sh.status = 0; rt.assign_element(sh, %q, %q, %s, %s, %s)%s; pc = %d")
           :format(st.name, st.index, emit_word(iw, lifted), rhsval(), tostring(st.append and true or false), ecs, after)
+        return p
+      end
+      if st.append and not st.arith then -- scalar name+=value: rt.append_scalar picks concat /
+        -- int arith-add / array[0]-append by the var's type at runtime (interp's append path).
+        local ec = errchk(st); local ecs = ec ~= "" and ("; " .. ec) or ""
+        blocks[p] = d .. ("sh.status = 0; rt.append_scalar(sh, %q, %s)%s%s; pc = %d")
+          :format(st.name, rhsval(), ecs, ua, after)
         return p
       end
       if st.arith then

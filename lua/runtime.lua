@@ -2640,6 +2640,26 @@ function M.array_key(sh, name, raw, expanded)
   return v
 end
 
+-- Scalar `name+=value` (non-index) for the compiled tier, exactly interp's append path: an
+-- ARRAY var appends value to element 0, an INTEGER var (declare -i) arithmetic-adds it, and a
+-- plain/unset scalar string-concatenates. A readonly var is rejected (status 1, line-abort like
+-- a standalone assignment). Gated at emit to non-nameref programs with an emit_word-able rhs.
+function M.append_scalar(sh, name, value)
+  local b = sh.vars[sh:deref(name)]
+  if b and b.ro then
+    io.stderr:write("curse: " .. name .. ": readonly variable\n"); sh.status = 1
+    if sh.opt_c or sh.opt_posix then error({ __curse_exit = 1 }) end
+    error({ __curse_exit = 1, __curse_lineabort = true })
+  end
+  if b and b.arr then
+    sh:array_set(name, require("interp")._int.array_key(sh, name, "0"), value, true)
+  elseif b and b.int then
+    sh:aset(name, sh:aget(name) + M.arith_str(sh, value))
+  else
+    sh:set_str(name, sh:get(name) .. value)
+  end
+end
+
 -- Read a scalar array/assoc ELEMENT ${name[sub]} (op=nil) for the compiled tier: resolve the
 -- key, then defer to Shell:expand_param — the SAME element read + set -u nounset + isset path
 -- the interpreter uses, so the value matches exactly.
