@@ -475,7 +475,7 @@ local RENDERABLE_SPECIAL = { ["#"] = 1, ["@"] = 1, ["*"] = 1, ["?"] = 1, ["$"] =
 -- it; the compiled argv builders must skip it too (else they emit a stray "" arg). A
 -- quoted empty `""` is ONE part with q=true — a real empty field, never elided.
 local function empty_word(w) return #w.parts == 0 end
-local pexp_compilable, pexp_scalar -- fwd decl (defined after COMPILE_UNSAFE_VAR)
+local pexp_compilable, pexp_scalar, emit_pattern_glob -- fwd decl (defined after COMPILE_UNSAFE_VAR)
 local function emitable_word(w)
   for _, p in ipairs(w.parts) do
     -- In a program that declares a nameref, a variable read (`$ref`, `"$ref"`,
@@ -1016,7 +1016,18 @@ function pexp_compilable(pe)
     return ok and emitable_word(w) or false
   end
   if pe.op == "sub" then return pexp_word_args_ok(pe) end -- ${v:off:len} scalar substring
-  return PEXP_STROP[pe.op] and pexp_literal_arg(pe.arg) and pexp_literal_arg(pe.arg2) or false
+  if PEXP_STROP[pe.op] then -- strip #/##/%/%% , subst /,// , case-fold ^/^^/,/,, : PATTERN in arg
+    if pexp_literal_arg(pe.arg) and pexp_literal_arg(pe.arg2) then return true end -- plain literal
+    -- A DYNAMIC or QUOTED pattern (`${x#$pre}`, `${x//$p/L}`, `${x#"*"}`) renders mask-aware
+    -- via emit_pattern_glob (quoted metachars escaped -> literal; unquoted-expansion metachars
+    -- active) — exactly interp's expand_pattern. EXCLUDE a ~ (bash tilde-expands the pattern,
+    -- `${p//~/z}`) or a backslash (escape subtleties) — emit_pattern_glob renders neither, so
+    -- those keep delegating. The subst REPLACEMENT (arg2) stays gated to a literal: a dynamic
+    -- replacement's `&`/`\&` (matched-text) semantics differ from a plain value's.
+    if pe.arg and pe.arg:find("[~\\]") then return false end
+    return emit_pattern_glob(pe.arg or "", {}) ~= nil and pexp_literal_arg(pe.arg2)
+  end
+  return false
 end
 -- ${a[@]OP} / ${a[*]OP}: a per-element string-op over the whole array, compiled by
 -- mapping apply_str_op via rt.array_op_values — exactly interp's generic per-element
@@ -1081,6 +1092,12 @@ function pexp_scalar(pe, lifted)
     if pe.arg2 == nil then return ("sh:apply_str_op(\"sub\", %s, %s)"):format(val, off) end
     local len = ("(rt.arith_int(sh, %s) or 0)"):format(emit_word(P.parse_word(pe.arg2), lifted))
     return ("sh:apply_str_op(\"sub\", %s, %s, %s)"):format(val, off, len)
+  end
+  -- strip/subst/case (PEXP_STROP): a plain literal pattern is passed verbatim (apply_str_op
+  -- globs it); a dynamic/quoted pattern is rendered mask-aware via emit_pattern_glob to the
+  -- expanded glob string. Replacement (arg2) is literal (pexp_compilable gated it).
+  if not pexp_literal_arg(pe.arg) then
+    return ("sh:apply_str_op(%q, %s, %s, %q)"):format(pe.op, val, emit_pattern_glob(pe.arg or "", lifted), pe.arg2 or "")
   end
   return ("sh:apply_str_op(%q, %s, %q, %q)"):format(pe.op, val, pe.arg or "", pe.arg2 or "")
 end
@@ -1301,7 +1318,7 @@ end
 -- runtime, quoted ones wrapped in rt.glob_quote. Returns nil (→ keep I.case_match) for a
 -- part emit can't render here: cmdsub/arith/${…}-op/$@/$*/length/CFG-unsafe special.
 local CASE_GLOBSPECIAL = "[%*%?%[%]\\%(%)%|%+%@%!]"
-local function emit_pattern_glob(pat, lifted)
+emit_pattern_glob = function(pat, lifted)
   local ok, w = pcall(require("parser").parse_word, pat)
   if not ok then return nil end
   local out = {}
