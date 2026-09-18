@@ -2117,12 +2117,17 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
             callargs = ("sh, __a, __noop, %s"):format(tostring(hadcs)) })
         end
       end
+      -- `declare`/`typeset` INSIDE a function (no -g) make each name local, exactly like
+      -- `local` (bash) — so route a plain one through the native local path. A flag (incl.
+      -- -g), an array value (st.arrayargs delegated above), or `a[i]=` fails the plain check
+      -- below and delegates, as for local. At the top level declare stays a global (decl_native).
+      local as_local = cmd == "local" or ((cmd == "declare" or cmd == "typeset") and not toplevel)
       -- The native `local` fast path (sh:localAssign) handles ONLY a plain scalar
       -- `local NAME[=val]`: it can't validate the name, honor a flag (-n/-A/-p), do
       -- an array element `a[i]=`, or LIST (bare `local`). Delegate anything else to
       -- interp's full `local`, which also errors a bad name and skips a readonly
       -- (matching bash). Done BEFORE the simple-stmt's newpc so no pc is orphaned.
-      if cmd == "local" then
+      if as_local then
         -- readonly/set-a in the program: interp's `local` must run (it fails a readonly
         -- local and exports under set -a; the native localAssign does neither).
         if EF.local_unsafe then return delegate(st, after) end
@@ -2319,8 +2324,9 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
         end
       end
       -- interp-only builtins (no native compiled form) delegate. Use interp's own
-      -- builtin set so the two backends stay in lockstep as builtins are added.
-      if not mustdeleg and cmd and not NATIVE_BUILTIN[cmd] and not isfunc then
+      -- builtin set so the two backends stay in lockstep as builtins are added. `as_local`
+      -- (in-function declare/typeset) has a native form (sh:localAssign) — don't delegate it.
+      if not mustdeleg and cmd and not NATIVE_BUILTIN[cmd] and not isfunc and not as_local then
         if require("interp").BUILTINS[cmd] then mustdeleg = true end
       end
       if mustdeleg then return delegate(st, after) end
@@ -2363,7 +2369,7 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
       if cmd == "echo" then body = "sh:echo(" .. table.concat(args, ", ") .. ")"
       elseif cmd == ":" or cmd == "true" then body = "sh.status = 0"
       elseif cmd == "false" then body = "sh.status = 1"
-      elseif cmd == "local" then
+      elseif as_local then -- local / in-function declare|typeset: each NAME[=val] a local
         local ls = {}
         for j = 2, #st.words do -- a `local NAME=foo:~` arg tilde-expands the RHS (all-literal only)
           local aw = st.words[j]
