@@ -707,6 +707,7 @@ function Shell:capture_forked(ast, runner)
   C.close(pfd[0])
   local stbuf = ffi.new("int[1]"); C.waitpid(pid, stbuf, 0)
   self.status = M.wexit(stbuf[0])
+  self.last_cmdsub_status = self.status -- like capture_inproc: for an empty-argv command's status
   return (table.concat(chunks):gsub("%z", ""):gsub("\n+$", ""))
 end
 -- A `$(…)` body is "pure" (no shell-state side effects, so safe to run in-process
@@ -2900,6 +2901,28 @@ function M.builtin(sh, argv, hook)
   local cmd = argv[1]
   if sh.functions[cmd] then return require("interp").exec_simple(sh, argv, hook or _noop) end
   return require(BUILTIN_LAZY[cmd])(sh, cmd, argv, hook or _noop)
+end
+
+-- A DYNAMIC command word (`$cmd`/`${x}`/… — the first word resolves late, argv already
+-- built by the compiled field engine) dispatched through the command runner. The command
+-- is genuinely unknown at compile time (function / builtin / external), so resolution
+-- bootstraps through exec_simple exactly like M.builtin does; the ARG EXPANSION is compiled.
+-- Replicates interp exec_stmt's simple-command wrapper: xtrace before the run, a builtin
+-- write-error -> status 1, then $_ (last arg) and PIPESTATUS. Control-flow builtins reached
+-- this way (`b=break; $b`) raise __curse_break/continue/return/exit, which the caller's
+-- delegate wrapper translates into the native pc jump.
+function M.exec_dynamic(sh, argv, hook, hadcs)
+  local n = #argv
+  -- All words expanded away: an empty command takes the LAST command sub's exit status when
+  -- one was performed (`$(exit 42)` -> 42, bare `false` -> 1), else 0 (bash) — matching interp.
+  if n == 0 then sh.status = hadcs and (sh.last_cmdsub_status or 0) or 0; return end
+  local I = require("interp")
+  sh.write_err = nil
+  if sh.opt_x then I.xtrace(sh, argv) end
+  I.exec_simple(sh, argv, hook or _noop)
+  if sh.write_err then sh.status = 1 end
+  sh:set_str("_", argv[n])
+  sh:array_assign("PIPESTATUS", { tostring(sh.status) }, false)
 end
 
 -- Arithmetic variable reads for the compiled tier. The hot case — a variable holding

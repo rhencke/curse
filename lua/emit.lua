@@ -1778,8 +1778,15 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
   -- current values and picks up any it changed (delegated statements are cold, so
   -- this sync costs nothing). This is how the compiled tier reaches feature parity
   -- without re-implementing the word engine in generated code.
-  local function delegate(st, after)
+  -- `opts` (optional) swaps the interp delegation for a compiled dispatch that reuses this
+  -- wrapper's control-flow-signal translation: opts.prelude is emitted first (e.g. building
+  -- __a, a native argv), and opts.callee(opts.callargs) replaces I.exec_stmt(sh, ser(st)).
+  -- Used by the dynamic command word (rt.exec_dynamic on a field-engine-built argv).
+  local function delegate(st, after, opts)
     local p = newpc()
+    local prelude = opts and opts.prelude
+    local callee = (opts and opts.callee) or "I.exec_stmt"
+    local callargs = (opts and opts.callargs) or ("sh, %s, __noop"):format(ser(st))
     local sync_in, sync_out = {}, {}
     for n in pairs(lifted) do sync_in[#sync_in + 1] = ("sh:aset(%q, %s)"):format(n, lname(n)) end
     for n in pairs(lifted) do sync_out[#sync_out + 1] = ("%s = sh:aget(%q)"):format(lname(n), n) end
@@ -1800,7 +1807,8 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
     if not (inloop or infunc) then -- top level, no loop: nothing to catch (interp no-ops)
       local out = {}
       for _, s in ipairs(sync_in) do out[#out + 1] = s end
-      out[#out + 1] = ("I.exec_stmt(sh, %s, __noop)"):format(ser(st))
+      if prelude then out[#out + 1] = prelude end
+      out[#out + 1] = ("%s(%s)"):format(callee, callargs)
       for _, s in ipairs(sync_out) do out[#out + 1] = s end
       if ec ~= "" then out[#out + 1] = ec end
       out[#out + 1] = ("pc = %d"):format(after)
@@ -1808,10 +1816,11 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
       return p
     end
     local o = { "do", table.concat(sync_in, "; ") }
+    if prelude then o[#o + 1] = prelude end
     o[#o + 1] = "local __sl, __sc = sh.loopdepth, sh.calldepth"
     if inloop then o[#o + 1] = ("sh.loopdepth = %d"):format(#loopstack) end
     if infunc then o[#o + 1] = "if (sh.calldepth or 0) < 1 then sh.calldepth = 1 end" end
-    o[#o + 1] = ("local __ok, __e = pcall(I.exec_stmt, sh, %s, __noop)"):format(ser(st))
+    o[#o + 1] = ("local __ok, __e = pcall(%s, %s)"):format(callee, callargs)
     o[#o + 1] = "sh.loopdepth, sh.calldepth = __sl, __sc"
     o[#o + 1] = table.concat(sync_out, "; ")
     o[#o + 1] = ("if __ok then %spc = %d"):format(ec ~= "" and (ec .. "; ") or "", after)
@@ -2046,6 +2055,24 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
       -- `local a=(…)` / `declare a=(…)`: the array value lives in st.arrayargs, which
       -- the native builtin paths don't render — interp does the scope-aware array assign.
       if st.arrayargs then return delegate(st, after) end
+      -- DYNAMIC command word (first word not a compile-time literal — `$cmd`, `${x}`, …):
+      -- the command STRUCTURE is a static simple-command; only the word is late-bound. Build
+      -- argv with the field engine and dispatch via rt.exec_dynamic (the command runner),
+      -- reusing delegate's control-flow-signal wrapper. Redirs / prefix assigns still need
+      -- exec_stmt's fuller handling, so those delegate.
+      if cmd == nil and st.words[1] and not st.redirs and not st.assigns then
+        local argvbody = field_argv(st.words, 1, lifted, nil, nil)
+        if argvbody then
+          -- hadcs (compile-time): a word contains a command sub, so an empty argv keeps its status.
+          local hadcs = false
+          for _, w in ipairs(st.words) do
+            for _, pp in ipairs(w.parts) do if pp.cmdsub then hadcs = true; break end end
+            if hadcs then break end
+          end
+          return delegate(st, after, { prelude = argvbody, callee = "rt.exec_dynamic",
+            callargs = ("sh, __a, __noop, %s"):format(tostring(hadcs)) })
+        end
+      end
       -- The native `local` fast path (sh:localAssign) handles ONLY a plain scalar
       -- `local NAME[=val]`: it can't validate the name, honor a flag (-n/-A/-p), do
       -- an array element `a[i]=`, or LIST (bare `local`). Delegate anything else to

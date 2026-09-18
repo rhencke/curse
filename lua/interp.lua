@@ -3134,6 +3134,7 @@ end
 
 M.exec_simple = exec_simple -- the compiled CFG dispatches a natively-built argv (builtins/externals)
 M.exec_stmt = exec_stmt -- exposed so the compiled CFG can delegate cold statements
+M.xtrace = xtrace -- set -x trace, for rt.exec_dynamic (compiled dynamic command word)
 do local dlog = os.getenv("CURSE_COUNT_DELEG") -- instrumentation: log compiled->interp delegations
   if dlog then
     local raw = exec_stmt
