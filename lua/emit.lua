@@ -1991,11 +1991,21 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
     -- calldepth are set to the compile-time nesting first, so the interpreter's break/
     -- continue/return actually FIRE (they gate on "is there an enclosing loop/func").
     local inloop, infunc = #loopstack > 0, not toplevel
+    -- opts.redir (a redir_conds expression) wraps the compiled callee in install/restore:
+    -- the redirs apply around the dispatch (a failed one -> status 1, no call), then restore.
+    local redir = opts and opts.redir
+    local function callwrap()
+      if redir then
+        return ("do local __rs = {}; if %s then %s(%s) else sh.status = 1 end; rt.redir_restore(__rs) end")
+          :format(redir, callee, callargs)
+      end
+      return ("%s(%s)"):format(callee, callargs)
+    end
     if not (inloop or infunc) then -- top level, no loop: nothing to catch (interp no-ops)
       local out = {}
       for _, s in ipairs(sync_in) do out[#out + 1] = s end
       if prelude then out[#out + 1] = prelude end
-      out[#out + 1] = ("%s(%s)"):format(callee, callargs)
+      out[#out + 1] = callwrap()
       for _, s in ipairs(sync_out) do out[#out + 1] = s end
       if ec ~= "" then out[#out + 1] = ec end
       out[#out + 1] = ("pc = %d"):format(after)
@@ -2007,7 +2017,15 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
     o[#o + 1] = "local __sl, __sc = sh.loopdepth, sh.calldepth"
     if inloop then o[#o + 1] = ("sh.loopdepth = %d"):format(#loopstack) end
     if infunc then o[#o + 1] = "if (sh.calldepth or 0) < 1 then sh.calldepth = 1 end" end
-    o[#o + 1] = ("local __ok, __e = pcall(%s, %s)"):format(callee, callargs)
+    if redir then
+      -- install the redirs, run the dispatch (still under pcall so a break/continue/return
+      -- signal is caught below) only if they succeeded, then restore — regardless of signal.
+      o[#o + 1] = "local __rs = {}; local __ok, __e = true, nil"
+      o[#o + 1] = ("if %s then __ok, __e = pcall(%s, %s) else sh.status = 1 end"):format(redir, callee, callargs)
+      o[#o + 1] = "rt.redir_restore(__rs)"
+    else
+      o[#o + 1] = ("local __ok, __e = pcall(%s, %s)"):format(callee, callargs)
+    end
     o[#o + 1] = "sh.loopdepth, sh.calldepth = __sl, __sc"
     o[#o + 1] = table.concat(sync_out, "; ")
     o[#o + 1] = ("if __ok then %spc = %d"):format(ec ~= "" and (ec .. "; ") or "", after)
@@ -2304,11 +2322,15 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
       -- DYNAMIC command word (first word not a compile-time literal — `$cmd`, `${x}`, …):
       -- the command STRUCTURE is a static simple-command; only the word is late-bound. Build
       -- argv with the field engine and dispatch via rt.exec_dynamic (the command runner),
-      -- reusing delegate's control-flow-signal wrapper. Redirs / prefix assigns still need
-      -- exec_stmt's fuller handling, so those delegate.
-      if cmd == nil and st.words[1] and not st.redirs and not st.assigns then
+      -- reusing delegate's control-flow-signal wrapper. A prefix assign (tempenv) still needs
+      -- exec_stmt's fuller handling; a redirect is applied around the dispatch (opts.redir).
+      if cmd == nil and st.words[1] and not st.assigns then
         local argvbody = field_argv(st.words, 1, lifted, nil, nil)
-        if argvbody then
+        local dyn_redir = nil
+        if argvbody and st.redirs then
+          dyn_redir = redir_conds(st, nil) -- nil => uncompilable redir shape: fall through to full delegate
+        end
+        if argvbody and not (st.redirs and not dyn_redir) then
           -- hadcs (compile-time): a word contains a command sub, so an empty argv keeps its status.
           local hadcs = false
           for _, w in ipairs(st.words) do
@@ -2316,7 +2338,7 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
             if hadcs then break end
           end
           return delegate(st, after, { prelude = argvbody, callee = "rt.exec_dynamic",
-            callargs = ("sh, __a, __noop, %s"):format(tostring(hadcs)) })
+            callargs = ("sh, __a, __noop, %s"):format(tostring(hadcs)), redir = dyn_redir })
         end
       end
       -- `declare`/`typeset` INSIDE a function (no -g) make each name local, exactly like
