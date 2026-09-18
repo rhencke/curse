@@ -1992,8 +1992,21 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
       -- bare native set nor I.assign_scalar rejects them. Always delegate so interp
       -- reports "readonly variable" (status 1), as bash does.
       if not st.index and (st.name == "SHELLOPTS" or st.name == "BASHOPTS") then return delegate(st, after) end
-      if st.index or st.append or (st.rhs and not emitable_word(st.rhs))
+      if (st.append and not st.index) or (st.rhs and not emitable_word(st.rhs))
         or (st.arith and arith_side_effect(st.arith)) then return delegate(st, after) end
+      -- a[i]=v / a[i]+=v: compile when the subscript is a non-empty emit_word-able word (rt
+      -- .assign_element resolves it as an assoc key or an indexed arith at runtime). An empty
+      -- or unrenderable subscript delegates. Gated to non-nameref programs (above) — a nameref
+      -- element write needs interp.
+      local iw
+      if st.index then
+        if st.index == "" then return delegate(st, after) end
+        local iok; iok, iw = pcall(require("parser").parse_word, st.index)
+        if not (iok and emitable_word(iw)) then return delegate(st, after) end
+        -- a cmdsub/procsub subscript is expanded once by emit_word AND (for indexed) arith-
+        -- evaluated from the raw — two evals of a side-effecting sub. Delegate those.
+        for _, pp in ipairs(iw.parts) do if pp.cmdsub or pp.procsub then return delegate(st, after) end end
+      end
       local p = newpc()
       local d = dbg(st) -- DEBUG trap fires before the assignment (bash: DEBUG_FIRE.assign)
       -- assignment-RHS tilde (string paths only; st.rhs is nil for an arith assign): an
@@ -2005,6 +2018,13 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
         return emit_word(st.rhs, lifted)
       end
       local ua = '; sh:set_str("_", "")' -- a bare assignment resets $_ (bash)
+      if st.index then -- a[i]=v / a[i]+=v: status 0 first (so a plain RHS is 0; a cmdsub in the
+        -- subscript/RHS overwrites it), then the element assign; assign_element leaves status.
+        local ec = errchk(st); local ecs = ec ~= "" and ("; " .. ec) or ""
+        blocks[p] = d .. ("sh.status = 0; rt.assign_element(sh, %q, %q, %s, %s, %s)%s; pc = %d")
+          :format(st.name, st.index, emit_word(iw, lifted), rhsval(), tostring(st.append and true or false), ecs, after)
+        return p
+      end
       if st.arith then
         -- x=$((…)): a non-lifted read honors set -u and resolves recursively (bash),
         -- exactly as the $(())-in-word and (( )) paths do — swap in arith_read.

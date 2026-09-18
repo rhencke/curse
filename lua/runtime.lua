@@ -2572,6 +2572,39 @@ function M.arrayassign(sh, name, items, append)
   sh.status = 0; sh:set_str("_", "")
 end
 
+-- Single array-element assignment `a[i]=v` / `a[i]+=v` for the compiled tier — mirrors interp's
+-- assign path (the st.index branch). `key_expanded` is the subscript already word-expanded
+-- (emit_word, == interp's array_key for assoc); for an INDEXED array it is arith-evaluated
+-- (to_arr_key(arith_str)). Readonly -> reject (status 1, line-abort like interp); a bad
+-- subscript (negative out of range) -> status 1, non-fatal. Gated at emit to non-nameref
+-- programs and a non-empty, emit_word-able subscript.
+function M.assign_element(sh, name, raw, expanded, value, append)
+  local rb = sh.vars[sh:deref(name)]
+  if rb and rb.ro then
+    io.stderr:write("curse: " .. name .. ": readonly variable\n"); sh.status = 1
+    if sh.opt_c or sh.opt_posix then error({ __curse_exit = 1 }) end
+    if sh.applying_prefix then return end
+    error({ __curse_exit = 1, __curse_lineabort = true })
+  end
+  -- array_key: an ASSOC uses the word-expanded subscript verbatim; an INDEXED array
+  -- arith-evaluates the RAW subscript (so `a['3']=` is the syntax error bash reports,
+  -- while emit_word would have stripped the quotes), exactly interp's array_key.
+  local key
+  if sh:is_assoc(name) then key = expanded
+  elseif raw:match("^%s*$") then key = 0
+  else
+    local ok, v = pcall(function() return M.to_arr_key(M.arith_str(sh, raw)) end)
+    if not ok then
+      io.stderr:write("curse: " .. raw .. ": syntax error in expression\n"); sh.status = 1; return
+    end
+    key = v
+  end
+  if not sh:array_set(name, key, value, append) then
+    io.stderr:write("curse: " .. name .. ": bad array subscript\n"); sh.status = 1; sh.assign_err = true; return
+  end
+  sh:set_str("_", "") -- a bare assignment resets $_ (bash); status stays the RHS's (emit set 0 first)
+end
+
 -- Apply a ${…} operator. `arg`/`arg2` are already word-expanded by the caller;
 -- `idxnum` is the evaluated numeric subscript when pe.index is an expression.
 function Shell:expand_param(pe, arg, arg2, idxnum)
