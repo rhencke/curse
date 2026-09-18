@@ -1118,6 +1118,14 @@ local function emit_seg(p, i, lifted)
       :format(pe.name, pe.index and ("%q"):format(pe.index) or "nil",
         pe.iop and ("%q"):format(pe.iop) or "nil", tostring(p.q or false), EF.cur_line or 0, tostring(p.q or false))
   end
+  if p.pexp and pexp_compilable(p.pexp) then -- scalar ${..} op: len/subst/strip/default/@Q/substring
+    -- A SCALAR string operation renders to one value via pexp_scalar (the same expr emit_word
+    -- uses). Quoted -> a literal segment (no split/glob); unquoted -> its value word-splits on
+    -- $IFS then globs, exactly like a bare $x (the default word is gated simple by pexp_compilable).
+    local s = pexp_scalar(p.pexp, lifted)
+    if p.q then return ("{s=%s,split=false,unq=false}"):format(s) end
+    return ("{s=%s,split=true,unq=true}"):format(s)
+  end
   if p.pexp then -- ${a[@]} / ${a[*]}: array elements as a multi-element segment (gated)
     local pe = p.pexp
     local positional = (pe.name == "@" or pe.name == "*") -- ${@OP}/${*OP} vs ${a[@]OP}
@@ -1213,8 +1221,9 @@ function mixed_expandable(w, lifted)
   for _, p in ipairs(w.parts) do
     if p.arith or p.arithast or p.cmdsub or p.procsub then return false end
     -- a bare ${a[@]}/${a[*]} array expansion is a multi-element segment seg_native renders;
-    -- any other ${…} (slice/strip/indirect/scalar op) still delegates.
-    if p.pexp and not (array_multi_op(p.pexp) or indirect_ok(p.pexp)) then return false end
+    -- a scalar ${..} op (len/subst/strip/default/substring/@Q) renders via pexp_scalar; the
+    -- ${!ref} indirect via the bootstrap. Anything else (a non-compilable ${…}) still delegates.
+    if p.pexp and not (array_multi_op(p.pexp) or indirect_ok(p.pexp) or pexp_compilable(p.pexp)) then return false end
     if p.var and (COMPILE_UNSAFE_VAR[p.var] and p.var ~= "LINENO") then return false end
   end
   return true
@@ -1235,7 +1244,7 @@ function seg_native(w, lifted)
     elseif p.param then -- $1..$9 positional: ok
     elseif p.special == "#" or p.special == "?" or p.special == "$" or p.special == "!" then -- scalar specials
     elseif p.special == "@" or p.special == "*" then -- $@/$*: multi-element (emit_seg renders it)
-    elseif p.pexp and (array_multi_op(p.pexp) or indirect_ok(p.pexp)) then -- ${a[@]}/${a[*]} bare or per-element string-op
+    elseif p.pexp and (array_multi_op(p.pexp) or indirect_ok(p.pexp) or pexp_compilable(p.pexp)) then -- ${a[@]} bare/per-element, ${!ref}, or a scalar ${..} op
     else return false end -- other pexp, cmdsub, arith, procsub, or anything unknown
   end
   return true
