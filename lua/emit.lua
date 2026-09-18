@@ -1023,6 +1023,7 @@ function pexp_compilable(pe)
     -- READ-ONLY ops on the element VALUE compile: bare read, length, slice, and the
     -- strip/subst/case pattern ops. @-transform/indices/prefix/indirect keep their own paths.
     if op == nil or op == "len" then return true end
+    if op == "@" then return PEXP_AT[pe.arg] and true or false end -- ${a[i]@Q}/@U/… (not @a/@A/@P)
     if op == "sub" then return pexp_word_args_ok(pe) end
     if PEXP_STROP[op] then return strop_pat_ok(pe) end
     -- default/alternate/assign/error (${a[i]:-d} / := / ? …): Shell:expand_param does the
@@ -1104,6 +1105,13 @@ function pexp_scalar(pe, lifted)
       local defthunk = ("function() return %s end"):format(emit_word(require("parser").parse_word(pe.arg or ""), lifted))
       return ("sh:expand_param({[\"name\"]=%q,[\"index\"]=%q,[\"op\"]=%q}, %s, nil, rt.array_key(sh, %q, %q, %s))")
         :format(pe.name, pe.index, pe.op, defthunk, pe.name, pe.index, expanded)
+    end
+    if pe.op == "@" then
+      -- ${a[i]@Q}/@U/@L/…: route via expand_param so ELEMENT set-ness (is_elem_set) decides —
+      -- an unset element yields "" (rt.at_transform would test the BASE var's set-ness instead).
+      -- The transform letter is the 3rd (arg) PARAMETER, exactly as interp calls expand_param.
+      return ("sh:expand_param({[\"name\"]=%q,[\"index\"]=%q,[\"op\"]=\"@\"}, %q, nil, rt.array_key(sh, %q, %q, %s))")
+        :format(pe.name, pe.index, pe.arg, pe.name, pe.index, expanded)
     end
   else
     val = lifted[pe.name] and ("rt.i64_to_str(%s)"):format(lname(pe.name))
