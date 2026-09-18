@@ -54,36 +54,6 @@ local function scan_attr(stmts)
   end
   return false
 end
--- Does the program readonly a variable or enable allexport (set -a)? If so, a later
--- `local NAME=val` can't use the native fast path: bash makes a local FAIL when the
--- name is readonly, and EXPORTS it under set -a — neither of which sh:localAssign
--- does. This is NARROW on purpose (plain `local`/`declare`/`export` don't count), so
--- an ordinary recursive-locals function keeps the native local.
-EF.local_unsafe = false
-local function makes_local_unsafe(st)
-  if st.t ~= "simple" or not st.words[1] then return false end
-  local c = st.words[1].parts[1] and #st.words[1].parts == 1 and st.words[1].parts[1].lit
-  if c == "readonly" then return true end
-  if c == "declare" or c == "typeset" then -- a -r flag makes it readonly
-    for j = 2, #st.words do local l = st.words[j].parts[1] and st.words[j].parts[1].lit
-      if l and l:match("^%-%a*r") then return true end end
-  end
-  if c == "set" then -- set -a / set -o allexport
-    for j = 2, #st.words do local l = st.words[j].parts[1] and st.words[j].parts[1].lit
-      if l == "-a" or l == "allexport" or (l and l:match("^%-%a*a")) then return true end end
-  end
-  return false
-end
-local function scan_local_unsafe(stmts)
-  for _, st in ipairs(stmts or {}) do
-    if makes_local_unsafe(st) then return true end
-    if st.body and scan_local_unsafe(st.body) then return true end
-    if st.clauses then for _, cl in ipairs(st.clauses) do if scan_local_unsafe(cl.body) then return true end end end
-    if st.cmds and scan_local_unsafe(st.cmds) then return true end -- pipeline stages
-    if st.items then for _, it in ipairs(st.items) do if it.cmd and scan_local_unsafe({ it.cmd }) then return true end end end
-  end
-  return false
-end
 -- Does the program create a nameref (declare/typeset/local -n)? A plain `name=value`
 -- assignment then WRITES THROUGH the nameref (to a var, an array/assoc element, or a
 -- detected cycle) — semantics only interp's full assign implements; the native
@@ -2458,9 +2428,9 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
       -- interp's full `local`, which also errors a bad name and skips a readonly
       -- (matching bash). Done BEFORE the simple-stmt's newpc so no pc is orphaned.
       if as_local then
-        -- readonly/set-a in the program: interp's `local` must run (it fails a readonly
-        -- local and exports under set -a; the native localAssign does neither).
-        if EF.local_unsafe then return delegate(st, after) end
+        -- (readonly / set -a are handled per-name at runtime by sh:localAssign — a
+        -- readonly operand fails with $?=1, a set -a local is exported — so no
+        -- whole-program blanket is needed here.)
         local plain = #st.words >= 2
         for j = 2, #st.words do
           local p1 = st.words[j].parts[1]; local lit = p1 and p1.lit
@@ -2749,11 +2719,14 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
             if fl and fl:find("~", 1, true) then av = ("rt.tilde_word_initial(sh, %q)"):format(fl) end
             local tn = "__lv" .. (#tmps + 1)
             tmps[#tmps + 1] = ("local %s = %s"):format(tn, av)
-            calls[#calls + 1] = ("sh:localAssign(%s)"):format(tn)
+            -- localAssign returns false for a READONLY name (message + that operand fails);
+            -- `local` returns 1 if ANY operand failed, else 0 — the others still localize.
+            calls[#calls + 1] = ("__lok = (sh:localAssign(%s) ~= false) and __lok"):format(tn)
           end
         end
-        body = table.concat(tmps, "; ") .. (#tmps > 0 and "; " or "")
-          .. table.concat(calls, "; ") .. (#calls > 0 and "; " or "") .. "sh.status = 0"
+        if #calls == 0 then body = "sh.status = 0"
+        else body = table.concat(tmps, "; ") .. "; local __lok = true; "
+          .. table.concat(calls, "; ") .. "; sh.status = __lok and 0 or 1" end
       elseif cmd == "test" or cmd == "[" then
         -- [ EXPR ] / test EXPR: the operator/arity are compile-time known; compute the
         -- args natively (word_safe, so no field engine) and run the POSIX test logic
@@ -3379,7 +3352,6 @@ function M.emit(ast)
   emit_frags, emit_frag_n = {}, 0 -- compiled `$(…)` fragments (cs_N closures) collected during build
   if scan_alias(ast.stmts) then error("curse-nocompile: alias expansion needs line-at-a-time parse") end
   EF.has_attr = scan_attr(ast.stmts) -- gate compiled attribute-aware scalar assign
-  EF.local_unsafe = scan_local_unsafe(ast.stmts) -- readonly/set-a present → delegate `local`
   EF.has_nameref = scan_nameref(ast.stmts) -- declare -n present → delegate scalar assigns
   EF.has_err = scan_trap(ast.stmts, { ERR = 1 }) -- gate compiled ERR-trap firing
   EF.has_debug = scan_trap(ast.stmts, { DEBUG = 1 }) -- gate compiled DEBUG-trap firing

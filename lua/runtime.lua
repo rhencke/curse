@@ -230,13 +230,30 @@ end
 
 -- one `local` operand: `name`, `name=value`, or `name+=value` (value expanded).
 -- `+=` appends to the value AFTER localizing (bash: appends to the new local, not
--- the shadowed outer one).
+-- the shadowed outer one). Returns false (else true) when the name is READONLY: bash
+-- fails that operand (message + `local` returns 1) WITHOUT shadowing it or changing
+-- the value, and continues with the rest — so the caller ORs the results into $?.
 function Shell:localAssign(arg)
   local nm, op, val = arg:match("^([%a_][%w_]*)(%+?=)(.*)$")
+  local name = nm or arg
+  -- readonly NAME: no shadow, no assignment (the readonly global stays visible in the
+  -- frame). Message routes through any 2>&1 capture, exactly like interp.
+  local eb = self.vars[name]
+  if eb and eb.ro then
+    self:errmsg("curse: local: " .. name .. ": readonly variable\n")
+    return false
+  end
   if nm then
     self:localVar(nm, true)
     self:set_str(nm, op == "+=" and (self:get(nm) .. val) or val)
   else self:localVar(arg) end
+  -- set -a (allexport): the local scalar is exported for the frame's lifetime; popCall
+  -- reverts the env entry on return (an unset outer var is unset again).
+  if self.opt_a then
+    local b = self.vars[name]
+    if b and not b.arr then b.exported = true; ffi.C.setenv(name, self:get(name) or "", 1) end
+  end
+  return true
 end
 
 -- Split on default-IFS whitespace (no empty fields), for unquoted `$var` in a
