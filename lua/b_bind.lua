@@ -5,81 +5,137 @@ local ffi = require("ffi")
 local rt = require("runtime")
 local M = require("interp")
 local I = M._int
-local exec_simple, expand_part_str, tilde_word_initial, file_test, sq = I.exec_simple, I.expand_part_str, I.tilde_word_initial, I.file_test, I.sq
+local exec_simple, expand_part_str, tilde_word_initial, file_test, sq =
+	I.exec_simple, I.expand_part_str, I.tilde_word_initial, I.file_test, I.sq
 local BUILTINS, KEYWORDS, SETOPTS, SHOPT_ORDER = I.BUILTINS, I.KEYWORDS, I.SETOPTS, I.SHOPT_ORDER
 local parse_umask, umask_symbolic = I.parse_umask, I.umask_symbolic
 local job_reap, block_sig, canon_sig, sig_order = I.job_reap, I.block_sig, I.canon_sig, I.sig_order
 local find_all_in_path, name_type, SIGNUM, NUMSIG = I.find_all_in_path, I.name_type, I.SIGNUM, I.NUMSIG
-local array_key, sh_printf, fd_getc, fd_ready, read_split = I.array_key, I.sh_printf, I.fd_getc, I.fd_ready, I.read_split
+local array_key, sh_printf, fd_getc, fd_ready, read_split =
+	I.array_key, I.sh_printf, I.fd_getc, I.fd_ready, I.read_split
 local do_arrayassign, eval, fmt_decl, fmt_set_var = I.do_arrayassign, I.eval, I.fmt_decl, I.fmt_set_var
 local C, P = I.C, I.P
 local rl_capture, rl_lib = I.rl_capture, I.rl_lib
 
-
 return function(sh, cmd, args, hook, tcb)
-  if cmd == "bind" then
-    -- readline introspection + binding via FFI (same library bash links ->
-    -- identical output, no tty needed). Shell-command bindings (-x/-X) are kept
-    -- curse-side, per keymap, in bash's `"keyseq": "cmd"` format.
-    local j = 2
-    local keymap = "emacs" -- -m KEYMAP selects the keymap for -x/-X (default emacs)
-    if args[j] == "-m" then keymap = args[j + 1] or keymap; j = j + 2 end
-    local a = args[j]
-    local function emit(lines) if lines then for _, l in ipairs(lines) do sh:echo(l) end end end
-    if a == "-x" then -- bind a key sequence to a shell command: -x '"KEYSEQ": CMD'
-      local seq, command = (args[j + 1] or ""):match('^%s*"(.-)"%s*:%s*(.*)$')
-      if seq then
-        sh.bind_x = sh.bind_x or {}; sh.bind_x[keymap] = sh.bind_x[keymap] or {}
-        local km = sh.bind_x[keymap]
-        for _, e in ipairs(km) do if e.seq == seq then e.cmd = command; seq = nil; break end end
-        if seq then km[#km + 1] = { seq = seq, cmd = command } end
-      end
-      sh.status = 0
-    elseif a == "-X" then -- list shell-command bindings for the keymap
-      local km = sh.bind_x and sh.bind_x[keymap]
-      if km then for _, e in ipairs(km) do sh:echo('"' .. e.seq .. '": "' .. e.cmd .. '"') end end
-      sh.status = 0
-    elseif a == "-r" then -- remove the binding for a key sequence
-      local seq = args[j + 1]
-      if seq then
-        local km = sh.bind_x and sh.bind_x[keymap]
-        if km then for i = #km, 1, -1 do if km[i].seq == seq then table.remove(km, i) end end end
-        local rl = rl_lib(); if rl then pcall(rl.rl_bind_keyseq, seq, nil) end -- readline binding
-      end
-      sh.status = 0
-    elseif a == "-l" then
-      local rl = rl_lib()
-      if rl then local names = rl.rl_funmap_names(); local i = 0
-        while names[i] ~= nil do sh:echo(ffi.string(names[i])); i = i + 1 end end
-      sh.status = 0
-    elseif a == "-v" or a == "-V" then
-      emit(rl_capture(function(rl) rl.rl_variable_dumper(a == "-v" and 1 or 0) end)); sh.status = 0
-    elseif a == "-p" or a == "-P" then
-      emit(rl_capture(function(rl) rl.rl_function_dumper(a == "-p" and 1 or 0) end)); sh.status = 0
-    elseif a == "-s" or a == "-S" then
-      emit(rl_capture(function(rl) rl.rl_macro_dumper(a == "-s" and 1 or 0) end)); sh.status = 0
-    elseif a == "-q" then
-      local name = args[3]
-      local rl = rl_lib()
-      local fn = rl and name and rl.rl_named_function(name)
-      if not rl or fn == nil then
-        io.stderr:write("curse: bind: `" .. tostring(name) .. "': unknown function name\n"); sh.status = 1
-      else
-        local ks = rl.rl_invoking_keyseqs(fn)
-        if ks == nil or ks[0] == nil then
-          sh:echo(name .. " is not bound to any keys."); sh.status = 1
-        else
-          local parts, i = {}, 0
-          while ks[i] ~= nil do parts[#parts + 1] = '"' .. ffi.string(ks[i]) .. '"'; i = i + 1 end
-          sh:echo(name .. " can be invoked via " .. table.concat(parts, ", ") .. "."); sh.status = 0
-        end
-      end
-    elseif a and a:sub(1, 1) ~= "-" then -- a bare inputrc line: `'"KEYSEQ": function'`
-      local rl = rl_lib()
-      if rl then local buf = ffi.new("char[?]", #a + 1, a); pcall(rl.rl_parse_and_bind, buf) end
-      sh.status = 0
-    else
-      sh.status = 0 -- -u/-f and other accepted-but-unimplemented forms: no-op
-    end
-  end
+	if cmd == "bind" then
+		-- readline introspection + binding via FFI (same library bash links ->
+		-- identical output, no tty needed). Shell-command bindings (-x/-X) are kept
+		-- curse-side, per keymap, in bash's `"keyseq": "cmd"` format.
+		local j = 2
+		local keymap = "emacs" -- -m KEYMAP selects the keymap for -x/-X (default emacs)
+		if args[j] == "-m" then
+			keymap = args[j + 1] or keymap
+			j = j + 2
+		end
+		local a = args[j]
+		local function emit(lines)
+			if lines then
+				for _, l in ipairs(lines) do
+					sh:echo(l)
+				end
+			end
+		end
+		if a == "-x" then -- bind a key sequence to a shell command: -x '"KEYSEQ": CMD'
+			local seq, command = (args[j + 1] or ""):match('^%s*"(.-)"%s*:%s*(.*)$')
+			if seq then
+				sh.bind_x = sh.bind_x or {}
+				sh.bind_x[keymap] = sh.bind_x[keymap] or {}
+				local km = sh.bind_x[keymap]
+				for _, e in ipairs(km) do
+					if e.seq == seq then
+						e.cmd = command
+						seq = nil
+						break
+					end
+				end
+				if seq then
+					km[#km + 1] = { seq = seq, cmd = command }
+				end
+			end
+			sh.status = 0
+		elseif a == "-X" then -- list shell-command bindings for the keymap
+			local km = sh.bind_x and sh.bind_x[keymap]
+			if km then
+				for _, e in ipairs(km) do
+					sh:echo('"' .. e.seq .. '": "' .. e.cmd .. '"')
+				end
+			end
+			sh.status = 0
+		elseif a == "-r" then -- remove the binding for a key sequence
+			local seq = args[j + 1]
+			if seq then
+				local km = sh.bind_x and sh.bind_x[keymap]
+				if km then
+					for i = #km, 1, -1 do
+						if km[i].seq == seq then
+							table.remove(km, i)
+						end
+					end
+				end
+				local rl = rl_lib()
+				if rl then
+					pcall(rl.rl_bind_keyseq, seq, nil)
+				end -- readline binding
+			end
+			sh.status = 0
+		elseif a == "-l" then
+			local rl = rl_lib()
+			if rl then
+				local names = rl.rl_funmap_names()
+				local i = 0
+				while names[i] ~= nil do
+					sh:echo(ffi.string(names[i]))
+					i = i + 1
+				end
+			end
+			sh.status = 0
+		elseif a == "-v" or a == "-V" then
+			emit(rl_capture(function(rl)
+				rl.rl_variable_dumper(a == "-v" and 1 or 0)
+			end))
+			sh.status = 0
+		elseif a == "-p" or a == "-P" then
+			emit(rl_capture(function(rl)
+				rl.rl_function_dumper(a == "-p" and 1 or 0)
+			end))
+			sh.status = 0
+		elseif a == "-s" or a == "-S" then
+			emit(rl_capture(function(rl)
+				rl.rl_macro_dumper(a == "-s" and 1 or 0)
+			end))
+			sh.status = 0
+		elseif a == "-q" then
+			local name = args[3]
+			local rl = rl_lib()
+			local fn = rl and name and rl.rl_named_function(name)
+			if not rl or fn == nil then
+				io.stderr:write("curse: bind: `" .. tostring(name) .. "': unknown function name\n")
+				sh.status = 1
+			else
+				local ks = rl.rl_invoking_keyseqs(fn)
+				if ks == nil or ks[0] == nil then
+					sh:echo(name .. " is not bound to any keys.")
+					sh.status = 1
+				else
+					local parts, i = {}, 0
+					while ks[i] ~= nil do
+						parts[#parts + 1] = '"' .. ffi.string(ks[i]) .. '"'
+						i = i + 1
+					end
+					sh:echo(name .. " can be invoked via " .. table.concat(parts, ", ") .. ".")
+					sh.status = 0
+				end
+			end
+		elseif a and a:sub(1, 1) ~= "-" then -- a bare inputrc line: `'"KEYSEQ": function'`
+			local rl = rl_lib()
+			if rl then
+				local buf = ffi.new("char[?]", #a + 1, a)
+				pcall(rl.rl_parse_and_bind, buf)
+			end
+			sh.status = 0
+		else
+			sh.status = 0 -- -u/-f and other accepted-but-unimplemented forms: no-op
+		end
+	end
 end

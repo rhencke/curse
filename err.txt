@@ -1,1 +1,0 @@
-/tmp/lua_rV7i7V: line 7: -c: command not found

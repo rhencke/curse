@@ -3,24 +3,17 @@
 # Specific files we port/vendor are attributed in NOTICE.md.
 /reference/
 
-# Node
-node_modules/
-
 # Build / scratch output
 /dist/
-*.tsbuildinfo
 /.curse-out/
 core
 core.*
 *.core
-
-# Benchmark: generated transpile output (bench/*.sh are the sources)
-/bench/*.mts
 
 # BFG Repo-Cleaner report
 /..bfg-report/
 .ccache/
 /test/real/fetched/
 
-# LuaJIT backend POC scratch (built binary + hand-written Lua)
+# LuaJIT build output (patched luajit + the shippable static `curse` binary)
 /.bench-lua/

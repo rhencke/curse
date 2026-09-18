@@ -9,11 +9,13 @@ local script, out = arg[1], arg[2]
 assert(script and out, "usage: transpile.lua <script.sh> <out.lua>")
 
 local f = assert(io.open(script, "r"))
-local src = f:read("*a"); f:close()
+local src = f:read("*a")
+f:close()
 
 local code = E.emit(P.parse(src))
 
 local tmp = out .. ".tmp." .. tostring(os.time()) .. tostring(math.random(1e6))
 local o = assert(io.open(tmp, "w"))
-o:write(code); o:close()
+o:write(code)
+o:close()
 assert(os.rename(tmp, out)) -- atomic publish

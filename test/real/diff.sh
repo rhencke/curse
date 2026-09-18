@@ -13,14 +13,17 @@
 #   test/real/diff.sh [script ...]      # defaults to test/real/scripts/*.sh
 set -u
 
+# Image must provide bash + a curse-capable luajit + the repo (mounted at /work).
+# The old in-repo curse-dev Dockerfile was removed with the Node tooling; point
+# CURSE_IMAGE at your own bash+luajit build environment.
 IMAGE="${CURSE_IMAGE:-curse-dev:latest}"
 MEM="${MEM:-512m}"; CPUS="${CPUS:-1}"; TIMEOUT="${TIMEOUT:-60}"
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 mkdir -p "$here/.ccache"
 
-# Paths whose changes are noise, not script behavior: engine plumbing (node/npm
-# caches), and inherently-nondeterministic content (a .git repo's internals).
-NOISE='/tmp/\.(npm|node|v8|cache)|/tmp/curse-|\.ccache|/\.git/|/\.git$'
+# Paths whose changes are noise, not script behavior: engine plumbing (curse's
+# compiled-artifact cache), and nondeterministic content (a .git repo's internals).
+NOISE='/tmp/\.cache|/tmp/curse-|/ccache|\.ccache|/\.git/|/\.git$'
 # Collapse per-run randomness so it doesn't masquerade as a divergence: mktemp
 # suffixes, long digit runs (pids, epochs), and the sandbox path itself.
 canon() { sed -E -e 's#(/tmp/[A-Za-z0-9._-]*[Tt]mp\.?)[A-Za-z0-9]{6,}#\1X#g' \
@@ -31,8 +34,7 @@ run_one() {  # $1=cname $2=out-prefix $3..=argv
   local cname="$1" pfx="$2"; shift 2
   docker run --name "$cname" \
     --memory="$MEM" --memory-swap="$MEM" --cpus="$CPUS" --pids-limit=512 \
-    -u "$(id -u):$(id -g)" -e HOME=/tmp -e NODE_COMPILE_CACHE=/ccache \
-    -e CURSE_CACHE=/ccache/curse-tc \
+    -u "$(id -u):$(id -g)" -e HOME=/tmp -e XDG_CACHE_HOME=/ccache \
     -v "$here":/work:ro -v "$here/.ccache":/ccache \
     -v "$SCRIPT_HOST":/script.sh:ro -w /tmp \
     "$IMAGE" timeout "$TIMEOUT" "$@" >"$pfx.out" 2>"$pfx.err"
@@ -57,7 +59,7 @@ for SCRIPT_HOST in "${scripts[@]}"; do
   docker rm -f "$bc" "$cc" >/dev/null 2>&1
 
   run_one "$bc" "$OUT/bash"  bash /script.sh
-  run_one "$cc" "$OUT/curse" node /work/src/cli/curse.mts run /script.sh
+  run_one "$cc" "$OUT/curse" luajit /work/lua/run.lua /script.sh
 
   bcode=$(cat "$OUT/bash.code"); ccode=$(cat "$OUT/curse.code")
   odiff=$(diff <(norm "$OUT/bash.out") <(norm "$OUT/curse.out"))

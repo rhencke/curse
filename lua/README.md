@@ -1,18 +1,15 @@
-# curse — LuaJIT backend (tiered execution) — WORK IN PROGRESS
+# curse — tiered execution (interpreter + LuaJIT compile) — WORK IN PROGRESS
 
-A second implementation of curse targeting **LuaJIT**, alongside the reference
-TypeScript/Node implementation in `../src` (which stays authoritative for
-conformance and is the oracle for parity). Motivation, from the POC
-(`../.bench-lua`, gitignored):
+curse's shell engine, on **LuaJIT**. Motivation for the LuaJIT target, measured
+on the POC (`.bench-lua`, gitignored):
 
-- LuaJIT **starts in ~1ms** — faster than bash (2ms), vs Node's ~34ms floor
-  (the one axis the TS/Node backend loses to bash on).
-- LuaJIT runs a hot arithmetic loop **~2700× faster than bash** and **~33×
-  faster than the Node/BigInt AOT**, and **exact 64-bit arithmetic is free**:
-  `int64` cdata (FFI) wraps like bash and LuaJIT sinks the boxing in traces, so
-  correctness costs nothing (unlike JS `BigInt`).
-- Lua strings are byte arrays — exactly bash's storage model (raw-byte fidelity
-  that the JS Unicode-string model can't do comes for free).
+- LuaJIT **starts in ~1ms** — faster than bash (~2ms). Startup is the one axis
+  a shell can't hide from high-count `make`/`configure` workloads.
+- LuaJIT runs a hot arithmetic loop **~2700× faster than bash**, and **exact
+  64-bit arithmetic is free**: `int64` cdata (FFI) wraps like bash and LuaJIT
+  sinks the boxing in traces, so correctness costs nothing.
+- Lua strings are byte arrays — exactly bash's storage model, so raw-byte
+  fidelity (no Unicode re-encoding) comes for free.
 
 ## Architecture: interpret, then switch (tiered / OSR)
 
@@ -91,15 +88,15 @@ between the caller and the function (which therefore can't be lifted).
   bench/arith.sh` (set `CURSE_LUAJIT` to the luajit binary).
 
 ### Next
-- Grow the grammar toward the TS parser (functions, `if`, `case`, `for x in`,
+- Grow the grammar toward full bash (functions, `if`, `case`, `for x in`,
   pipelines, redirections, real commands); `for x in LIST` OSR needs the expanded
   list + index persisted in `sh`.
-- Wire the shared conformance harness for TS-vs-Lua parity.
-- Port the parser to Lua fully (transpile-time startup ~1ms too).
+- Wire the conformance harness against real bash (the oracle).
+- Complete the parser to the full bash grammar.
 
 ## Running
 
-Needs a `luajit` binary (build: `git clone https://github.com/LuaJIT/LuaJIT &&
-cd LuaJIT && make`). Then:
+Needs a `luajit` binary. curse ships a patched one (`scripts/build-luajit.sh`),
+but stock upstream LuaJIT runs these tests from source too. Then:
 
     luajit lua/test_tier.lua

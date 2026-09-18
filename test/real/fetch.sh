@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Fetch a curated set of real-world shell scripts into test/real/fetched/
-# (gitignored — third-party, not committed). Run inside the dev image via ./x so
-# it works regardless of host tooling: `./x bash /work/test/real/fetch.sh`.
-# Uses Node's built-in fetch, so no curl/wget needed.
+# (gitignored — third-party, not committed). Run on any host with curl or wget:
+# `bash test/real/fetch.sh`. These scripts are inputs for the differential test
+# (see diff.sh).
 set -u
 dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/fetched"
 mkdir -p "$dir"
@@ -10,13 +10,11 @@ mkdir -p "$dir"
 # name<TAB>url  — pinned where possible for reproducibility.
 grab() {
   local name="$1" url="$2"
-  node -e '
-    const [, url, out] = process.argv;
-    fetch(url, { redirect: "follow" })
-      .then((r) => { if (!r.ok) throw new Error("HTTP " + r.status); return r.text(); })
-      .then((t) => require("fs").writeFileSync(out, t))
-      .catch((e) => { console.error(e.message); process.exit(1); });
-  ' "$url" "$dir/$name" && echo "  got $name ($(wc -l < "$dir/$name") lines)" || echo "  FAILED $name"
+  if command -v curl >/dev/null 2>&1; then
+    curl -fsSL "$url" -o "$dir/$name"
+  else
+    wget -qO "$dir/$name" "$url"
+  fi && echo "  got $name ($(wc -l < "$dir/$name") lines)" || echo "  FAILED $name"
 }
 
 grab nvm-install.sh       https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.1/install.sh

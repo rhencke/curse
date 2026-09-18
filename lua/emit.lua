@@ -17,12 +17,18 @@
 local M = {}
 
 local CMP = { ["=="] = "==", ["!="] = "~=", ["<"] = "<", ["<="] = "<=", [">"] = ">", [">="] = ">=" }
-local function lname(n) return "v_" .. n end
+local function lname(n)
+	return "v_" .. n
+end
 -- A valid Lua identifier for the closure of shell function `n`. bash function names
 -- may hold -/./=/! etc. (`foo-bar`, `my.helper`), which can't spell a Lua local, so
 -- escape every non-identifier byte as `_XX_`. sh.functions is still keyed by the
 -- original name (the dispatch key); only the generated identifier is mangled.
-local function fnlname(n) return "fn_" .. n:gsub("[^%w_]", function(c) return ("_%02x_"):format(c:byte()) end) end
+local function fnlname(n)
+	return "fn_" .. n:gsub("[^%w_]", function(c)
+		return ("_%02x_"):format(c:byte())
+	end)
+end
 
 -- Does the program create an ATTRIBUTED variable — one whose later plain `name=value`
 -- assignment isn't a simple string set: readonly (reject), an array (write [0]), or
@@ -33,26 +39,46 @@ local function fnlname(n) return "fn_" .. n:gsub("[^%w_]", function(c) return ("
 local EF = {} -- emit-time program flags, grouped so a function referencing several stays one upvalue
 EF.has_attr = false
 local function makes_attr(st)
-  if st.t == "arrayassign" then return true end        -- a=(…) makes an array
-  if st.t == "assign" and st.index then return true end -- a[i]=… makes/extends an array
-  if st.t ~= "simple" or not st.words[1] then return false end
-  local c = st.words[1].parts[1] and #st.words[1].parts == 1 and st.words[1].parts[1].lit
-  if c == "readonly" or c == "declare" or c == "typeset" or c == "local" or c == "export" then return true end
-  if c == "set" then -- `set -a` / `set -o allexport` makes later plain assigns auto-export
-    for j = 2, #st.words do
-      local l = st.words[j].parts[1] and st.words[j].parts[1].lit
-      if l == "-a" or l == "allexport" or (l and l:match("^%-%a*a")) then return true end
-    end
-  end
-  return false
+	if st.t == "arrayassign" then
+		return true
+	end -- a=(…) makes an array
+	if st.t == "assign" and st.index then
+		return true
+	end -- a[i]=… makes/extends an array
+	if st.t ~= "simple" or not st.words[1] then
+		return false
+	end
+	local c = st.words[1].parts[1] and #st.words[1].parts == 1 and st.words[1].parts[1].lit
+	if c == "readonly" or c == "declare" or c == "typeset" or c == "local" or c == "export" then
+		return true
+	end
+	if c == "set" then -- `set -a` / `set -o allexport` makes later plain assigns auto-export
+		for j = 2, #st.words do
+			local l = st.words[j].parts[1] and st.words[j].parts[1].lit
+			if l == "-a" or l == "allexport" or (l and l:match("^%-%a*a")) then
+				return true
+			end
+		end
+	end
+	return false
 end
 local function scan_attr(stmts)
-  for _, st in ipairs(stmts or {}) do
-    if makes_attr(st) then return true end
-    if st.body and scan_attr(st.body) then return true end
-    if st.clauses then for _, cl in ipairs(st.clauses) do if scan_attr(cl.body) then return true end end end
-  end
-  return false
+	for _, st in ipairs(stmts or {}) do
+		if makes_attr(st) then
+			return true
+		end
+		if st.body and scan_attr(st.body) then
+			return true
+		end
+		if st.clauses then
+			for _, cl in ipairs(st.clauses) do
+				if scan_attr(cl.body) then
+					return true
+				end
+			end
+		end
+	end
+	return false
 end
 -- Does the program create a nameref (declare/typeset/local -n)? A plain `name=value`
 -- assignment then WRITES THROUGH the nameref (to a var, an array/assoc element, or a
@@ -61,24 +87,51 @@ end
 -- the native fast assign is kept for every ordinary program.
 EF.has_nameref = false
 local function makes_nameref(st)
-  if st.t ~= "simple" or not st.words[1] then return false end
-  local c = st.words[1].parts[1] and #st.words[1].parts == 1 and st.words[1].parts[1].lit
-  if c ~= "declare" and c ~= "typeset" and c ~= "local" then return false end
-  for j = 2, #st.words do local l = st.words[j].parts[1] and st.words[j].parts[1].lit
-    if l and l:match("^%-%a*n") then return true end
-    if l and l:sub(1, 1) ~= "-" then break end -- past the flags
-  end
-  return false
+	if st.t ~= "simple" or not st.words[1] then
+		return false
+	end
+	local c = st.words[1].parts[1] and #st.words[1].parts == 1 and st.words[1].parts[1].lit
+	if c ~= "declare" and c ~= "typeset" and c ~= "local" then
+		return false
+	end
+	for j = 2, #st.words do
+		local l = st.words[j].parts[1] and st.words[j].parts[1].lit
+		if l and l:match("^%-%a*n") then
+			return true
+		end
+		if l and l:sub(1, 1) ~= "-" then
+			break
+		end -- past the flags
+	end
+	return false
 end
 local function scan_nameref(stmts)
-  for _, st in ipairs(stmts or {}) do
-    if makes_nameref(st) then return true end
-    if st.body and scan_nameref(st.body) then return true end
-    if st.clauses then for _, cl in ipairs(st.clauses) do if scan_nameref(cl.body) then return true end end end
-    if st.cmds and scan_nameref(st.cmds) then return true end
-    if st.items then for _, it in ipairs(st.items) do if it.cmd and scan_nameref({ it.cmd }) then return true end end end
-  end
-  return false
+	for _, st in ipairs(stmts or {}) do
+		if makes_nameref(st) then
+			return true
+		end
+		if st.body and scan_nameref(st.body) then
+			return true
+		end
+		if st.clauses then
+			for _, cl in ipairs(st.clauses) do
+				if scan_nameref(cl.body) then
+					return true
+				end
+			end
+		end
+		if st.cmds and scan_nameref(st.cmds) then
+			return true
+		end
+		if st.items then
+			for _, it in ipairs(st.items) do
+				if it.cmd and scan_nameref({ it.cmd }) then
+					return true
+				end
+			end
+		end
+	end
+	return false
 end
 -- Does any word in the program READ a call-stack var (FUNCNAME/BASH_SOURCE/BASH_LINENO)?
 -- Gates funcstack/linestack/srcstack maintenance around compiled calls (else zero cost).
@@ -86,62 +139,111 @@ local DEBUGSTACK_VAR = { FUNCNAME = 1, BASH_SOURCE = 1, BASH_LINENO = 1 }
 -- BASH_LINENO/FUNCNAME/BASH_SOURCE can also be read as an arith VAR node inside
 -- $((…)) / (( )) (`echo $((BASH_LINENO))`); walk the arith tree for one.
 local function arith_reads_debugstack(e)
-  if type(e) ~= "table" then return false end
-  if e.k == "var" and DEBUGSTACK_VAR[e.name] then return true end
-  return arith_reads_debugstack(e.e) or arith_reads_debugstack(e.l) or arith_reads_debugstack(e.r)
-    or arith_reads_debugstack(e.c) or arith_reads_debugstack(e.a) or arith_reads_debugstack(e.b)
+	if type(e) ~= "table" then
+		return false
+	end
+	if e.k == "var" and DEBUGSTACK_VAR[e.name] then
+		return true
+	end
+	return arith_reads_debugstack(e.e)
+		or arith_reads_debugstack(e.l)
+		or arith_reads_debugstack(e.r)
+		or arith_reads_debugstack(e.c)
+		or arith_reads_debugstack(e.a)
+		or arith_reads_debugstack(e.b)
 end
 local function word_reads_debugstack(w)
-  for _, p in ipairs(w.parts) do
-    if (p.var and DEBUGSTACK_VAR[p.var]) or (p.pexp and DEBUGSTACK_VAR[p.pexp.name]) then return true end
-    -- an INDIRECT expansion ${!ref} can name FUNCNAME/BASH_SOURCE/BASH_LINENO at
-    -- runtime (`ref=FUNCNAME; echo ${!ref}`) — can't know statically, so maintain the
-    -- call stack whenever one is present (rare; cost is per-call enterFunc/leaveFunc).
-    if p.pexp and (p.pexp.op == "indirect" or p.pexp.via_indirect) then return true end
-    -- p.arith is a source string; arith() can THROW on a malformed expr (only the
-    -- parser's own `parith` wrapper turns that into arith_perr), so pcall it — a
-    -- parse failure just means "no debugstack ref here" (the stmt delegates anyway).
-    if p.arith then
-      local ok, ast = pcall(require("parser").arith, p.arith)
-      if ok and arith_reads_debugstack(ast) then return true end
-    end
-    if p.arithast and arith_reads_debugstack(p.arithast) then return true end
-  end
-  return false
+	for _, p in ipairs(w.parts) do
+		if (p.var and DEBUGSTACK_VAR[p.var]) or (p.pexp and DEBUGSTACK_VAR[p.pexp.name]) then
+			return true
+		end
+		-- an INDIRECT expansion ${!ref} can name FUNCNAME/BASH_SOURCE/BASH_LINENO at
+		-- runtime (`ref=FUNCNAME; echo ${!ref}`) — can't know statically, so maintain the
+		-- call stack whenever one is present (rare; cost is per-call enterFunc/leaveFunc).
+		if p.pexp and (p.pexp.op == "indirect" or p.pexp.via_indirect) then
+			return true
+		end
+		-- p.arith is a source string; arith() can THROW on a malformed expr (only the
+		-- parser's own `parith` wrapper turns that into arith_perr), so pcall it — a
+		-- parse failure just means "no debugstack ref here" (the stmt delegates anyway).
+		if p.arith then
+			local ok, ast = pcall(require("parser").arith, p.arith)
+			if ok and arith_reads_debugstack(ast) then
+				return true
+			end
+		end
+		if p.arithast and arith_reads_debugstack(p.arithast) then
+			return true
+		end
+	end
+	return false
 end
 local function reads_debugstack(stmts)
-  for _, st in ipairs(stmts or {}) do
-    if st.words then
-      for _, w in ipairs(st.words) do if word_reads_debugstack(w) then return true end end
-    end
-    -- (( … )) command reads the same vars through arith var nodes; st.expr is an
-    -- already-parsed arith AST (NOT a source string), so walk it directly.
-    if st.t == "arithcmd" and st.expr and arith_reads_debugstack(st.expr) then return true end
-    if st.rhs and word_reads_debugstack(st.rhs) then return true end -- x=$((BASH_LINENO))
-    if st.arith and arith_reads_debugstack(st.arith) then return true end -- x=$(( … )) parsed
-    if st.body and reads_debugstack(st.body) then return true end
-    if st.clauses then for _, cl in ipairs(st.clauses) do if reads_debugstack(cl.body) then return true end end end
-  end
-  return false
+	for _, st in ipairs(stmts or {}) do
+		if st.words then
+			for _, w in ipairs(st.words) do
+				if word_reads_debugstack(w) then
+					return true
+				end
+			end
+		end
+		-- (( … )) command reads the same vars through arith var nodes; st.expr is an
+		-- already-parsed arith AST (NOT a source string), so walk it directly.
+		if st.t == "arithcmd" and st.expr and arith_reads_debugstack(st.expr) then
+			return true
+		end
+		if st.rhs and word_reads_debugstack(st.rhs) then
+			return true
+		end -- x=$((BASH_LINENO))
+		if st.arith and arith_reads_debugstack(st.arith) then
+			return true
+		end -- x=$(( … )) parsed
+		if st.body and reads_debugstack(st.body) then
+			return true
+		end
+		if st.clauses then
+			for _, cl in ipairs(st.clauses) do
+				if reads_debugstack(cl.body) then
+					return true
+				end
+			end
+		end
+	end
+	return false
 end
 
 -- Does any word READ variable `name` (as $name or ${name…})? Gates per-command
 -- maintenance of otherwise-free-to-skip specials ($_ last-arg, $PIPESTATUS).
 local function reads_var(stmts, name)
-  for _, st in ipairs(stmts or {}) do
-    if st.words then
-      for _, w in ipairs(st.words) do
-        for _, p in ipairs(w.parts) do
-          if p.var == name or (p.pexp and p.pexp.name == name) then return true end
-        end
-      end
-    end
-    if st.rhs then for _, p in ipairs(st.rhs.parts) do
-      if p.var == name or (p.pexp and p.pexp.name == name) then return true end end end
-    if st.body and reads_var(st.body, name) then return true end
-    if st.clauses then for _, cl in ipairs(st.clauses) do if reads_var(cl.body, name) then return true end end end
-  end
-  return false
+	for _, st in ipairs(stmts or {}) do
+		if st.words then
+			for _, w in ipairs(st.words) do
+				for _, p in ipairs(w.parts) do
+					if p.var == name or (p.pexp and p.pexp.name == name) then
+						return true
+					end
+				end
+			end
+		end
+		if st.rhs then
+			for _, p in ipairs(st.rhs.parts) do
+				if p.var == name or (p.pexp and p.pexp.name == name) then
+					return true
+				end
+			end
+		end
+		if st.body and reads_var(st.body, name) then
+			return true
+		end
+		if st.clauses then
+			for _, cl in ipairs(st.clauses) do
+				if reads_var(cl.body, name) then
+					return true
+				end
+			end
+		end
+	end
+	return false
 end
 
 -- Does the program install a `trap … SIG` for one of `sigs` (a set of names)? Used
@@ -151,52 +253,97 @@ end
 -- has no traps at all, so the child needs no signal machinery. Recurses broadly
 -- (body/clauses/cmd/cmds/items) so a trap anywhere is seen.
 local function scan_any_trap(stmts)
-  for _, st in ipairs(stmts or {}) do
-    if st.t == "simple" and st.words and st.words[1] and st.words[1].parts[1]
-        and st.words[1].parts[1].lit == "trap" then return true end
-    if st.body and scan_any_trap(st.body) then return true end
-    if st.cmd and scan_any_trap({ st.cmd }) then return true end
-    if st.cmds and scan_any_trap(st.cmds) then return true end
-    if st.items then for _, it in ipairs(st.items) do if it.cmd and scan_any_trap({ it.cmd }) then return true end end end
-    if st.clauses then for _, cl in ipairs(st.clauses) do if scan_any_trap(cl.body) then return true end end end
-  end
-  return false
+	for _, st in ipairs(stmts or {}) do
+		if
+			st.t == "simple"
+			and st.words
+			and st.words[1]
+			and st.words[1].parts[1]
+			and st.words[1].parts[1].lit == "trap"
+		then
+			return true
+		end
+		if st.body and scan_any_trap(st.body) then
+			return true
+		end
+		if st.cmd and scan_any_trap({ st.cmd }) then
+			return true
+		end
+		if st.cmds and scan_any_trap(st.cmds) then
+			return true
+		end
+		if st.items then
+			for _, it in ipairs(st.items) do
+				if it.cmd and scan_any_trap({ it.cmd }) then
+					return true
+				end
+			end
+		end
+		if st.clauses then
+			for _, cl in ipairs(st.clauses) do
+				if scan_any_trap(cl.body) then
+					return true
+				end
+			end
+		end
+	end
+	return false
 end
 
 local function scan_trap(stmts, sigs)
-  for _, st in ipairs(stmts or {}) do
-    if st.t == "simple" and st.words[1] and st.words[1].parts[1]
-        and st.words[1].parts[1].lit == "trap" then
-      for j = 2, #st.words do
-        local l = st.words[j].parts[1] and st.words[j].parts[1].lit
-        if l and sigs[l] then return true end
-      end
-    end
-    if st.body and scan_trap(st.body, sigs) then return true end
-    if st.clauses then for _, cl in ipairs(st.clauses) do if scan_trap(cl.body, sigs) then return true end end end
-  end
-  return false
+	for _, st in ipairs(stmts or {}) do
+		if st.t == "simple" and st.words[1] and st.words[1].parts[1] and st.words[1].parts[1].lit == "trap" then
+			for j = 2, #st.words do
+				local l = st.words[j].parts[1] and st.words[j].parts[1].lit
+				if l and sigs[l] then
+					return true
+				end
+			end
+		end
+		if st.body and scan_trap(st.body, sigs) then
+			return true
+		end
+		if st.clauses then
+			for _, cl in ipairs(st.clauses) do
+				if scan_trap(cl.body, sigs) then
+					return true
+				end
+			end
+		end
+	end
+	return false
 end
 
 -- Collect literal names targeted by `unset` (skipping -f/-v flags) anywhere in the
 -- program. A function whose name is unset must dispatch through sh.functions so the
 -- call AFTER the unset fails (127) — a hoisted fn_x would still be callable.
 local function collect_unset(stmts, set)
-  for _, st in ipairs(stmts or {}) do
-    if st.t == "simple" and st.words[1] and st.words[1].parts[1]
-        and st.words[1].parts[1].lit == "unset" then
-      for j = 2, #st.words do
-        local l = st.words[j].parts[1] and #st.words[j].parts == 1 and st.words[j].parts[1].lit
-        if l and l:sub(1, 1) ~= "-" then set[l] = true end
-      end
-    end
-    if st.body then collect_unset(st.body, set) end
-    if st.cond then collect_unset(st.cond, set) end
-    if st.clauses then for _, cl in ipairs(st.clauses) do
-      if cl.body then collect_unset(cl.body, set) end
-      if cl.cond then collect_unset(cl.cond, set) end
-    end end
-  end
+	for _, st in ipairs(stmts or {}) do
+		if st.t == "simple" and st.words[1] and st.words[1].parts[1] and st.words[1].parts[1].lit == "unset" then
+			for j = 2, #st.words do
+				local l = st.words[j].parts[1] and #st.words[j].parts == 1 and st.words[j].parts[1].lit
+				if l and l:sub(1, 1) ~= "-" then
+					set[l] = true
+				end
+			end
+		end
+		if st.body then
+			collect_unset(st.body, set)
+		end
+		if st.cond then
+			collect_unset(st.cond, set)
+		end
+		if st.clauses then
+			for _, cl in ipairs(st.clauses) do
+				if cl.body then
+					collect_unset(cl.body, set)
+				end
+				if cl.cond then
+					collect_unset(cl.cond, set)
+				end
+			end
+		end
+	end
 end
 
 -- Collect names defined by a NESTED funcdef (one not directly at the top level —
@@ -205,45 +352,71 @@ end
 -- as an external command (127). Delegating the def (interp registers it) and the calls
 -- (interp dispatches) makes them work while the enclosing body stays compiled.
 local function collect_nested_funcdefs(stmts, set, top)
-  for _, st in ipairs(stmts or {}) do
-    if st.t == "funcdef" then
-      if not top then set[st.name] = true end
-      if st.body then collect_nested_funcdefs(st.body, set, false) end
-    else
-      if st.body then collect_nested_funcdefs(st.body, set, false) end
-      if st.cond then collect_nested_funcdefs(st.cond, set, false) end
-      if st.clauses then for _, cl in ipairs(st.clauses) do
-        if cl.body then collect_nested_funcdefs(cl.body, set, false) end
-        if cl.cond then collect_nested_funcdefs(cl.cond, set, false) end
-      end end
-    end
-  end
+	for _, st in ipairs(stmts or {}) do
+		if st.t == "funcdef" then
+			if not top then
+				set[st.name] = true
+			end
+			if st.body then
+				collect_nested_funcdefs(st.body, set, false)
+			end
+		else
+			if st.body then
+				collect_nested_funcdefs(st.body, set, false)
+			end
+			if st.cond then
+				collect_nested_funcdefs(st.cond, set, false)
+			end
+			if st.clauses then
+				for _, cl in ipairs(st.clauses) do
+					if cl.body then
+						collect_nested_funcdefs(cl.body, set, false)
+					end
+					if cl.cond then
+						collect_nested_funcdefs(cl.cond, set, false)
+					end
+				end
+			end
+		end
+	end
 end
 
 -- serialize a {int->int} pc map to a Lua table literal
 local function serialize(t)
-  local parts = {}
-  for k, v in pairs(t) do parts[#parts + 1] = ("[%d]=%d"):format(k, v) end
-  return "{" .. table.concat(parts, ", ") .. "}"
+	local parts = {}
+	for k, v in pairs(t) do
+		parts[#parts + 1] = ("[%d]=%d"):format(k, v)
+	end
+	return "{" .. table.concat(parts, ", ") .. "}"
 end
 
 -- Serialize an arbitrary AST node (plain tables of strings/numbers/bools) to a
 -- Lua literal, so a cold statement can be baked into the compiled source and run
 -- by the shared interpreter (delegation). No cycles/functions in the AST.
 local function ser(v)
-  local t = type(v)
-  if t == "string" then return ("%q"):format(v) end
-  if t == "number" then return tostring(v) end
-  if t == "boolean" then return tostring(v) end
-  if t ~= "table" then return "nil" end
-  local parts, n = {}, #v
-  for i = 1, n do parts[#parts + 1] = ser(v[i]) end
-  for k, val in pairs(v) do
-    if type(k) ~= "number" or k < 1 or k > n or k ~= math.floor(k) then
-      parts[#parts + 1] = ("[%s]=%s"):format(ser(k), ser(val))
-    end
-  end
-  return "{" .. table.concat(parts, ",") .. "}"
+	local t = type(v)
+	if t == "string" then
+		return ("%q"):format(v)
+	end
+	if t == "number" then
+		return tostring(v)
+	end
+	if t == "boolean" then
+		return tostring(v)
+	end
+	if t ~= "table" then
+		return "nil"
+	end
+	local parts, n = {}, #v
+	for i = 1, n do
+		parts[#parts + 1] = ser(v[i])
+	end
+	for k, val in pairs(v) do
+		if type(k) ~= "number" or k < 1 or k > n or k ~= math.floor(k) then
+			parts[#parts + 1] = ("[%s]=%s"):format(ser(k), ser(val))
+		end
+	end
+	return "{" .. table.concat(parts, ",") .. "}"
 end
 
 -- Arith with a side effect (assignment / ++ / --) can't sit in a Lua expression
@@ -253,31 +426,63 @@ end
 -- interpreter computes it. (Defined here so xpand_fast can reject them; also gates word
 -- reads below.)
 local COMPILE_UNSAFE_VAR = {}
-for _, n in ipairs({ "_", "LINENO", "SECONDS", "FUNCNAME", "BASH_SOURCE", "BASH_LINENO",
-  "BASH_COMMAND", "RANDOM", "SRANDOM" }) do COMPILE_UNSAFE_VAR[n] = true end
+for _, n in ipairs({
+	"_",
+	"LINENO",
+	"SECONDS",
+	"FUNCNAME",
+	"BASH_SOURCE",
+	"BASH_LINENO",
+	"BASH_COMMAND",
+	"RANDOM",
+	"SRANDOM",
+}) do
+	COMPILE_UNSAFE_VAR[n] = true
+end
 -- A deferred xpand whose raw uses ONLY $name/$digit expansions (no ${…}, $(…), `…`,
 -- $*/$@/… specials, or a glued name$): the CFG CAN compile it — parse the raw as a
 -- native tree, read each $name like a var, and guard non-lifted operands (see emit_value).
 local function xpand_fast(raw)
-  if raw:find("%$%(") or raw:find("`") or raw:find("%${")
-    or raw:find("%$[^%w_]") or raw:find("[%w_]%$") or raw:find("}[%w_#]") then return false end
-  -- a special whose value the CFG can't reproduce ($LINENO/$RANDOM/$_/…): delegate to interp
-  for nm in raw:gmatch("%$([%a_][%w_]*)") do if COMPILE_UNSAFE_VAR[nm] then return false end end
-  return true
+	if
+		raw:find("%$%(")
+		or raw:find("`")
+		or raw:find("%${")
+		or raw:find("%$[^%w_]")
+		or raw:find("[%w_]%$")
+		or raw:find("}[%w_#]")
+	then
+		return false
+	end
+	-- a special whose value the CFG can't reproduce ($LINENO/$RANDOM/$_/…): delegate to interp
+	for nm in raw:gmatch("%$([%a_][%w_]*)") do
+		if COMPILE_UNSAFE_VAR[nm] then
+			return false
+		end
+	end
+	return true
 end
 -- Split a native arith tree's unique $name operands into NON-lifted (nl — need a
 -- run-time numeric guard) and LIFTED (lf — i64 locals, always numeric). On the textual
 -- fallback the lifted operands must be flushed to sh first, else the interpreter reads a
 -- stale sh value (the authoritative value is the native local) — an infinite loop.
 local function xpand_split(e, lifted, nl, lf, seen)
-  if type(e) ~= "table" then return end
-  if e.k == "var" and e.dollar and not e.idx and not seen[e.name] then
-    seen[e.name] = true
-    if lifted[e.name] then lf[#lf + 1] = e.name else nl[#nl + 1] = e.name end
-  end
-  xpand_split(e.e, lifted, nl, lf, seen); xpand_split(e.l, lifted, nl, lf, seen)
-  xpand_split(e.r, lifted, nl, lf, seen); xpand_split(e.c, lifted, nl, lf, seen)
-  xpand_split(e.a, lifted, nl, lf, seen); xpand_split(e.b, lifted, nl, lf, seen)
+	if type(e) ~= "table" then
+		return
+	end
+	if e.k == "var" and e.dollar and not e.idx and not seen[e.name] then
+		seen[e.name] = true
+		if lifted[e.name] then
+			lf[#lf + 1] = e.name
+		else
+			nl[#nl + 1] = e.name
+		end
+	end
+	xpand_split(e.e, lifted, nl, lf, seen)
+	xpand_split(e.l, lifted, nl, lf, seen)
+	xpand_split(e.r, lifted, nl, lf, seen)
+	xpand_split(e.c, lifted, nl, lf, seen)
+	xpand_split(e.a, lifted, nl, lf, seen)
+	xpand_split(e.b, lifted, nl, lf, seen)
 end
 -- A READ of an array/assoc element in arith (`$(( a[i] ))`): a `var` node with a subscript
 -- whose base is a plain name and whose RAW subscript has no cmdsub/procsub (its arith-vs-assoc
@@ -285,39 +490,71 @@ end
 -- rt.arith_read_elem (which contains the nounset/matherr edges). A subscripted WRITE
 -- (asgn/post/pre) is NOT this — it stays delegated.
 local function arith_elem_ok(e)
-  -- gate on idxraw (the RAW subscript), not e.idx: a QUOTED subscript (`A['x']`) sets idxraw but
-  -- leaves e.idx nil (its arith parse is skipped), yet it's still an element read rt.array_key
-  -- resolves (assoc: dequoted word; indexed: arith_str(raw), which errors on a single quote).
-  if type(e) ~= "table" or e.k ~= "var" or type(e.idxraw) ~= "string" then return false end
-  if type(e.name) ~= "string" or not e.name:match("^[%a_][%w_]*$") or COMPILE_UNSAFE_VAR[e.name] then return false end
-  local ok, sw = pcall(require("parser").parse_word, e.idxraw)
-  if not ok then return false end
-  for _, p in ipairs(sw.parts) do if p.cmdsub or p.procsub then return false end end
-  return true
+	-- gate on idxraw (the RAW subscript), not e.idx: a QUOTED subscript (`A['x']`) sets idxraw but
+	-- leaves e.idx nil (its arith parse is skipped), yet it's still an element read rt.array_key
+	-- resolves (assoc: dequoted word; indexed: arith_str(raw), which errors on a single quote).
+	if type(e) ~= "table" or e.k ~= "var" or type(e.idxraw) ~= "string" then
+		return false
+	end
+	if type(e.name) ~= "string" or not e.name:match("^[%a_][%w_]*$") or COMPILE_UNSAFE_VAR[e.name] then
+		return false
+	end
+	local ok, sw = pcall(require("parser").parse_word, e.idxraw)
+	if not ok then
+		return false
+	end
+	for _, p in ipairs(sw.parts) do
+		if p.cmdsub or p.procsub then
+			return false
+		end
+	end
+	return true
 end
 local function arith_side_effect(e)
-  if type(e) ~= "table" then return false end
-  if e.k == "asgn" or e.k == "post" or e.k == "pre" then return true end
-  -- xpandleaf (${…}), comma, and a NON-compilable array subscript aren't compiled natively —
-  -- treat like a side effect so the word/stmt delegates. A FAST xpand ($name only) and a
-  -- read-only array element (arith_elem_ok) ARE compiled, so they aren't side effects.
-  if e.k == "xpandleaf" or e.k == "comma" or (e.idxraw and not arith_elem_ok(e)) then return true end
-  if e.k == "xpand" then return not xpand_fast(e.raw) end
-  return arith_side_effect(e.e) or arith_side_effect(e.l) or arith_side_effect(e.r)
-    or arith_side_effect(e.c) or arith_side_effect(e.a) or arith_side_effect(e.b)
+	if type(e) ~= "table" then
+		return false
+	end
+	if e.k == "asgn" or e.k == "post" or e.k == "pre" then
+		return true
+	end
+	-- xpandleaf (${…}), comma, and a NON-compilable array subscript aren't compiled natively —
+	-- treat like a side effect so the word/stmt delegates. A FAST xpand ($name only) and a
+	-- read-only array element (arith_elem_ok) ARE compiled, so they aren't side effects.
+	if e.k == "xpandleaf" or e.k == "comma" or (e.idxraw and not arith_elem_ok(e)) then
+		return true
+	end
+	if e.k == "xpand" then
+		return not xpand_fast(e.raw)
+	end
+	return arith_side_effect(e.e)
+		or arith_side_effect(e.l)
+		or arith_side_effect(e.r)
+		or arith_side_effect(e.c)
+		or arith_side_effect(e.a)
+		or arith_side_effect(e.b)
 end
 -- Arith the CFG codegen cannot render at all (embedded $-expansion, comma, or
 -- array-subscripted operands) — distinct from a mere side effect, which forc
 -- init/step legitimately have. Such loops/statements delegate to the interpreter.
 local function not_compilable(e)
-  if type(e) ~= "table" then return false end
-  -- arith_perr = a deferred arith PARSE error (`(( i = '3' ))`): only the interpreter
-  -- renders it (prints bash's "syntax error in expression" + aborts the line), so the
-  -- enclosing loop/statement must delegate — else emit_value throws an uncaught error.
-  if e.k == "xpandleaf" or e.k == "comma" or e.k == "arith_perr" or (e.idxraw and not arith_elem_ok(e)) then return true end
-  if e.k == "xpand" then return not xpand_fast(e.raw) end -- a fast $name xpand compiles
-  return not_compilable(e.e) or not_compilable(e.l) or not_compilable(e.r)
-    or not_compilable(e.c) or not_compilable(e.a) or not_compilable(e.b)
+	if type(e) ~= "table" then
+		return false
+	end
+	-- arith_perr = a deferred arith PARSE error (`(( i = '3' ))`): only the interpreter
+	-- renders it (prints bash's "syntax error in expression" + aborts the line), so the
+	-- enclosing loop/statement must delegate — else emit_value throws an uncaught error.
+	if e.k == "xpandleaf" or e.k == "comma" or e.k == "arith_perr" or (e.idxraw and not arith_elem_ok(e)) then
+		return true
+	end
+	if e.k == "xpand" then
+		return not xpand_fast(e.raw)
+	end -- a fast $name xpand compiles
+	return not_compilable(e.e)
+		or not_compilable(e.l)
+		or not_compilable(e.r)
+		or not_compilable(e.c)
+		or not_compilable(e.a)
+		or not_compilable(e.b)
 end
 -- parser.arith() THROWS on a malformed expression — invalid octal `083`, a quoted
 -- operand `'3'` — because only the parser's own `parith` wrapper turns that into an
@@ -326,24 +563,40 @@ end
 -- this guard: a throw becomes an arith_perr leaf, which not_compilable rejects — the
 -- word/statement then delegates to the interpreter, which reproduces bash's error.
 local function safe_arith(s)
-  local ok, a = pcall(require("parser").arith, s)
-  if ok then return a end
-  return { k = "arith_perr", raw = s }
+	local ok, a = pcall(require("parser").arith, s)
+	if ok then
+		return a
+	end
+	return { k = "arith_perr", raw = s }
 end
 -- An arith node renderable in VALUE position by emit_value (num/var/param/fast-$name/
 -- un/bin/tern) — no side effect and nothing not_compilable rejects. Matches the pure-arith
 -- word path (emitable_word via not_compilable), used to vet the OPERANDS of a side-effecting
 -- word arith so nothing nested reaches emit_value's unsupported asgn/post/pre/comma cases.
 local function arith_val_r(e)
-  if type(e) ~= "table" then return false end
-  local k = e.k
-  if k == "num" or k == "param" or k == "raw" then return true end
-  if k == "var" then return not e.idx and not e.idxraw and not COMPILE_UNSAFE_VAR[e.name] end
-  if k == "xpand" then return xpand_fast(e.raw) end -- a fast $name xpand emit_value renders
-  if k == "un" then return arith_val_r(e.e) end
-  if k == "bin" then return arith_val_r(e.l) and arith_val_r(e.r) end
-  if k == "tern" then return arith_val_r(e.c) and arith_val_r(e.a) and arith_val_r(e.b) end
-  return false -- asgn/post/pre/comma/xpandleaf/matherr: side effect or non-renderable
+	if type(e) ~= "table" then
+		return false
+	end
+	local k = e.k
+	if k == "num" or k == "param" or k == "raw" then
+		return true
+	end
+	if k == "var" then
+		return not e.idx and not e.idxraw and not COMPILE_UNSAFE_VAR[e.name]
+	end
+	if k == "xpand" then
+		return xpand_fast(e.raw)
+	end -- a fast $name xpand emit_value renders
+	if k == "un" then
+		return arith_val_r(e.e)
+	end
+	if k == "bin" then
+		return arith_val_r(e.l) and arith_val_r(e.r)
+	end
+	if k == "tern" then
+		return arith_val_r(e.c) and arith_val_r(e.a) and arith_val_r(e.b)
+	end
+	return false -- asgn/post/pre/comma/xpandleaf/matherr: side effect or non-renderable
 end
 -- A SIDE-EFFECTING word arith (`echo $((x++))`, `${x:=$((n+=1))}`) that emit_arith_into can
 -- render into an IIFE: the side effect sits at the TOP level (a bare ++/--/assignment) with
@@ -351,15 +604,17 @@ end
 -- A side effect nested in an operand (`$(( (x++) + 1 ))`), an array subscript, or a dynamic
 -- special ($LINENO/…) is rejected -> the word keeps delegating.
 local function arith_word_ok(e)
-  if type(e) ~= "table" then return false end
-  local k = e.k
-  if k == "asgn" then
-    return not e.idx and not e.idxraw and not COMPILE_UNSAFE_VAR[e.name] and arith_val_r(e.e)
-  end
-  if k == "post" or k == "pre" then
-    return not e.idx and not e.idxraw and not COMPILE_UNSAFE_VAR[e.name]
-  end
-  return arith_val_r(e) -- a value with a nested side effect fails here (operands must be pure)
+	if type(e) ~= "table" then
+		return false
+	end
+	local k = e.k
+	if k == "asgn" then
+		return not e.idx and not e.idxraw and not COMPILE_UNSAFE_VAR[e.name] and arith_val_r(e.e)
+	end
+	if k == "post" or k == "pre" then
+		return not e.idx and not e.idxraw and not COMPILE_UNSAFE_VAR[e.name]
+	end
+	return arith_val_r(e) -- a value with a nested side effect fails here (operands must be pure)
 end
 -- Does a subshell body statically run `set`? A fork-compiled subshell body is a
 -- straight-line sub-CFG; it can't honor an errexit toggle (`set -e`) that turns
@@ -368,27 +623,48 @@ end
 -- fork), matching interp exactly. (Errexit INHERITED at entry is handled
 -- separately by the runtime `sh.opt_e` guard in the subshell branch.)
 local function stmt_runs_set(st)
-  local t = st.t
-  if t == "simple" then
-    local w1 = st.words[1]
-    return (w1 and w1.parts[1] and w1.parts[1].lit) == "set"
-  elseif t == "background" then return stmt_runs_set(st.cmd)
-  elseif t == "pipeline" then
-    for _, c in ipairs(st.cmds) do if stmt_runs_set(c) then return true end end
-  elseif t == "andor" then
-    for _, it in ipairs(st.items) do if stmt_runs_set(it.cmd) then return true end end
-  elseif t == "if" or t == "case" then
-    for _, cl in ipairs(st.clauses) do
-      for _, s in ipairs(cl.body) do if stmt_runs_set(s) then return true end end
-    end
-  elseif st.body then
-    for _, s in ipairs(st.body) do if stmt_runs_set(s) then return true end end
-  end
-  return false
+	local t = st.t
+	if t == "simple" then
+		local w1 = st.words[1]
+		return (w1 and w1.parts[1] and w1.parts[1].lit) == "set"
+	elseif t == "background" then
+		return stmt_runs_set(st.cmd)
+	elseif t == "pipeline" then
+		for _, c in ipairs(st.cmds) do
+			if stmt_runs_set(c) then
+				return true
+			end
+		end
+	elseif t == "andor" then
+		for _, it in ipairs(st.items) do
+			if stmt_runs_set(it.cmd) then
+				return true
+			end
+		end
+	elseif t == "if" or t == "case" then
+		for _, cl in ipairs(st.clauses) do
+			for _, s in ipairs(cl.body) do
+				if stmt_runs_set(s) then
+					return true
+				end
+			end
+		end
+	elseif st.body then
+		for _, s in ipairs(st.body) do
+			if stmt_runs_set(s) then
+				return true
+			end
+		end
+	end
+	return false
 end
 local function body_runs_set(list)
-  for _, st in ipairs(list) do if stmt_runs_set(st) then return true end end
-  return false
+	for _, st in ipairs(list) do
+		if stmt_runs_set(st) then
+			return true
+		end
+	end
+	return false
 end
 -- errexit (`set -e`): after a failing command the shell exits — but only for the
 -- statement kinds bash applies it to (a compound's INNER commands fire it; &&/||
@@ -399,8 +675,7 @@ end
 -- is maintained by the interpreter around delegated conditions, so a compiled
 -- function called AS a condition (interp sets noerr, then calls the compiled fn)
 -- correctly does NOT fire. Off the errexit path (`sh.opt_e` false) it's one branch.
-local ERREXIT_TYPES = { simple = 1, pipeline = 1, arithcmd = 1, assign = 1,
-  assignlist = 1, subshell = 1, dbracket = 1 }
+local ERREXIT_TYPES = { simple = 1, pipeline = 1, arithcmd = 1, assign = 1, assignlist = 1, subshell = 1, dbracket = 1 }
 local ERRCHK = "if sh.opt_e and sh.noerr == 0 and sh.status ~= 0 then error({ __curse_exit = sh.status }) end"
 EF.has_err = false -- program installs an ERR trap → fire it after a failing command
 local emit_toplevel = false -- current build_cfg is the top level (ERR only fires there; a
@@ -408,17 +683,22 @@ local emit_toplevel = false -- current build_cfg is the top level (ERR only fire
 -- errtrace for that. Subshell bodies live in the top-level CFG but fire_err_trap's runtime
 -- in_subprogram check keeps ERR from firing in the forked child.)
 local emit_neg_ctx = false -- building a `!`-inverted command's fragment: its own errexit is exempt
-                           -- (bash), but a called function's internal errexit still fires (fn_x, built separately)
+-- (bash), but a called function's internal errexit still fires (fn_x, built separately)
 local function errchk(st) -- the guard statement for `st`, or "" when errexit never applies
-  if emit_neg_ctx then return "" end -- direct command of a `!`-inverted pipeline: errexit-exempt
-  if not (st and ERREXIT_TYPES[st.t] and not st.negate) then return "" end
-  if EF.has_err then -- ERR trap fires on the same condition as errexit; set $LINENO to this
-    -- command's line, fire ERR (fire_err_trap scopes by calldepth/in_subprogram — inside a
-    -- function/subshell only under errtrace), THEN errexit (bash order).
-    return ("if sh.noerr == 0 and sh.status ~= 0 then sh.cur_line = %d; I.fire_err_trap(sh); if sh.opt_e then error({ __curse_exit = sh.status }) end end")
-      :format(st.line or 0)
-  end
-  return ERRCHK
+	if emit_neg_ctx then
+		return ""
+	end -- direct command of a `!`-inverted pipeline: errexit-exempt
+	if not (st and ERREXIT_TYPES[st.t] and not st.negate) then
+		return ""
+	end
+	if EF.has_err then -- ERR trap fires on the same condition as errexit; set $LINENO to this
+		-- command's line, fire ERR (fire_err_trap scopes by calldepth/in_subprogram — inside a
+		-- function/subshell only under errtrace), THEN errexit (bash order).
+		return ("if sh.noerr == 0 and sh.status ~= 0 then sh.cur_line = %d; I.fire_err_trap(sh); if sh.opt_e then error({ __curse_exit = sh.status }) end end"):format(
+			st.line or 0
+		)
+	end
+	return ERRCHK
 end
 EF.has_debug = false -- program installs a DEBUG trap → fire it before each command
 EF.funcstack = false -- program reads $FUNCNAME → maintain sh.funcstack around calls
@@ -435,10 +715,12 @@ local emit_multidef = {} -- names defined by more than one top-level funcdef: a 
 -- top-level command). Delegated commands fire DEBUG via interp's exec_stmt, so this is
 -- prepended ONLY to native blocks (exactly one fires).
 local function dbg(st)
-  -- run_debug scopes by calldepth/in_subprogram (fires inside a function/subshell only
-  -- under functrace); calldepth is tracked in fnwrap when a DEBUG trap is present.
-  if EF.has_debug then return ("I.run_debug(sh, %d); "):format(st.line or 0) end
-  return ""
+	-- run_debug scopes by calldepth/in_subprogram (fires inside a function/subshell only
+	-- under functrace); calldepth is tracked in fnwrap when a DEBUG trap is present.
+	if EF.has_debug then
+		return ("I.run_debug(sh, %d); "):format(st.line or 0)
+	end
+	return ""
 end
 -- Wrap a compiled function call `s` (function `cmd`, called at source `line`) with
 -- call-stack maintenance ($FUNCNAME/BASH_* when read) and, when an ERR/DEBUG trap is
@@ -446,10 +728,16 @@ end
 -- function (they fire inside a function only under errtrace/functrace). Zero cost when
 -- neither applies. (Inline is disabled when a trap is present, so all calls come here.)
 local function fnwrap(cmd, line, s)
-  local pre, post = "", ""
-  if EF.funcstack then pre = ("sh:enterFunc(%q, %d); "):format(cmd, line or 0); post = "; sh:leaveFunc()" end
-  if EF.has_err or EF.has_debug then pre = pre .. "sh.calldepth = sh.calldepth + 1; "; post = post .. "; sh.calldepth = sh.calldepth - 1" end
-  return pre .. s .. post
+	local pre, post = "", ""
+	if EF.funcstack then
+		pre = ("sh:enterFunc(%q, %d); "):format(cmd, line or 0)
+		post = "; sh:leaveFunc()"
+	end
+	if EF.has_err or EF.has_debug then
+		pre = pre .. "sh.calldepth = sh.calldepth + 1; "
+		post = post .. "; sh.calldepth = sh.calldepth - 1"
+	end
+	return pre .. s .. post
 end
 -- Special params emit_word knows how to render; any OTHER `$special` (e.g. `$-`,
 -- the option string) must delegate, or emit_word would silently render it empty.
@@ -460,40 +748,64 @@ local RENDERABLE_SPECIAL = { ["#"] = 1, ["@"] = 1, ["*"] = 1, ["?"] = 1, ["$"] =
 -- from argv entirely (an unquoted null), and the interpreter yields zero fields for
 -- it; the compiled argv builders must skip it too (else they emit a stray "" arg). A
 -- quoted empty `""` is ONE part with q=true — a real empty field, never elided.
-local function empty_word(w) return #w.parts == 0 end
+local function empty_word(w)
+	return #w.parts == 0
+end
 local pexp_compilable, pexp_scalar, emit_pattern_glob -- fwd decl (defined after COMPILE_UNSAFE_VAR)
 local function emitable_word(w)
-  for _, p in ipairs(w.parts) do
-    -- In a program that declares a nameref, a `${ref…}` OPERATOR read (default,
-    -- length, subscript, …) may resolve THROUGH the nameref to an array/assoc
-    -- ELEMENT — which the native pexp renderers do not deref. Keep those delegating.
-    -- A plain scalar read (`$ref`/`${ref}`/`"$ref"`/`foo$ref` — all p.var) compiles:
-    -- it renders via rt.nameref_read, which reproduces the interp's element-deref.
-    if EF.has_nameref and p.pexp then return false end
-    if p.pexp and not pexp_compilable(p.pexp) then return false end
-    if p.procsub then return false end -- <(cmd)/>(cmd): needs the interp's temp-file setup
-    if p.special and not RENDERABLE_SPECIAL[p.special] then return false end -- e.g. $-
-    -- pure value arith renders via emit_value; a side-effecting one (x++/x=…/x+=…) via
-    -- emit_arith_into in an IIFE, provided the side effect is top-level (arith_word_ok).
-    if p.arith then local a = safe_arith(p.arith)
-      if not_compilable(a) or (arith_side_effect(a) and not arith_word_ok(a)) then return false end end
-    if p.arithast and arith_side_effect(p.arithast) and not arith_word_ok(p.arithast) then return false end -- inlined arith
-  end
-  return true
+	for _, p in ipairs(w.parts) do
+		-- In a program that declares a nameref, a `${ref…}` OPERATOR read (default,
+		-- length, subscript, …) may resolve THROUGH the nameref to an array/assoc
+		-- ELEMENT — which the native pexp renderers do not deref. Keep those delegating.
+		-- A plain scalar read (`$ref`/`${ref}`/`"$ref"`/`foo$ref` — all p.var) compiles:
+		-- it renders via rt.nameref_read, which reproduces the interp's element-deref.
+		if EF.has_nameref and p.pexp then
+			return false
+		end
+		if p.pexp and not pexp_compilable(p.pexp) then
+			return false
+		end
+		if p.procsub then
+			return false
+		end -- <(cmd)/>(cmd): needs the interp's temp-file setup
+		if p.special and not RENDERABLE_SPECIAL[p.special] then
+			return false
+		end -- e.g. $-
+		-- pure value arith renders via emit_value; a side-effecting one (x++/x=…/x+=…) via
+		-- emit_arith_into in an IIFE, provided the side effect is top-level (arith_word_ok).
+		if p.arith then
+			local a = safe_arith(p.arith)
+			if not_compilable(a) or (arith_side_effect(a) and not arith_word_ok(a)) then
+				return false
+			end
+		end
+		if p.arithast and arith_side_effect(p.arithast) and not arith_word_ok(p.arithast) then
+			return false
+		end -- inlined arith
+	end
+	return true
 end
 -- A word that a compiled command can use directly: emit_word-able AND with no
 -- unquoted expansion (would word-split) or unquoted glob char (would path-expand)
 -- — those need the interpreter's field engine, so the command is delegated.
 local function word_safe(w)
-  if not emitable_word(w) then return false end -- pexp / side-effecting arith
-  for _, p in ipairs(w.parts) do
-    if p.special == "@" or p.special == "*" then return false end -- multi-element (even quoted)
-    if not p.q then
-      if p.var or p.param or p.special or p.cmdsub or p.pexp then return false end -- unquoted -> splits
-      if p.lit and (p.lit:find("[*?%[]") or p.lit:find("[@!+?*]%(")) then return false end -- unquoted glob / extglob
-    end
-  end
-  return true
+	if not emitable_word(w) then
+		return false
+	end -- pexp / side-effecting arith
+	for _, p in ipairs(w.parts) do
+		if p.special == "@" or p.special == "*" then
+			return false
+		end -- multi-element (even quoted)
+		if not p.q then
+			if p.var or p.param or p.special or p.cmdsub or p.pexp then
+				return false
+			end -- unquoted -> splits
+			if p.lit and (p.lit:find("[*?%[]") or p.lit:find("[@!+?*]%(")) then
+				return false
+			end -- unquoted glob / extglob
+		end
+	end
+	return true
 end
 
 -- How a NON-lifted arith var read is emitted. Default `sh:aget` parses the value's
@@ -506,30 +818,43 @@ local arith_varread = "sh:aget(%q)"
 -- The whole word as one literal string when every part is literal — sees through a
 -- \-escaped name (`\return` parses as parts "r".."eturn"). nil if any part expands.
 local function full_lit(w)
-  local s = {}
-  for _, p in ipairs(w.parts) do if p.lit == nil then return nil end; s[#s + 1] = p.lit end
-  return table.concat(s)
+	local s = {}
+	for _, p in ipairs(w.parts) do
+		if p.lit == nil then
+			return nil
+		end
+		s[#s + 1] = p.lit
+	end
+	return table.concat(s)
 end
 -- Like full_lit, but only when every part is an UNQUOTED literal (so a quoted `'~'`
 -- is excluded) — used to decide tilde expansion, which never touches quoted text.
 local function unq_full_lit(w)
-  for _, p in ipairs(w.parts) do if p.lit == nil or p.q then return nil end end
-  return full_lit(w)
+	for _, p in ipairs(w.parts) do
+		if p.lit == nil or p.q then
+			return nil
+		end
+	end
+	return full_lit(w)
 end
 -- Recognize a control-flow command (break/continue/return) even when written with a
 -- \-escaped name or a `builtin`/`command` prefix (`\return`, `builtin return 3`).
 -- Returns op, argoffset (index of the first argument), or nil.
 local function resolve_cf(st)
-  if st.t ~= "simple" or not st.words[1] or st.redirs then return nil end
-  local off = 1
-  local c = full_lit(st.words[off])
-  while (c == "builtin" or c == "command") and st.words[off + 1] do -- strip nested builtin/command prefixes
-    off = off + 1; c = full_lit(st.words[off])
-  end
-  if c == "break" or c == "continue" or c == "return" or c == "exit" then return c, off + 1 end
-  return nil
+	if st.t ~= "simple" or not st.words[1] or st.redirs then
+		return nil
+	end
+	local off = 1
+	local c = full_lit(st.words[off])
+	while (c == "builtin" or c == "command") and st.words[off + 1] do -- strip nested builtin/command prefixes
+		off = off + 1
+		c = full_lit(st.words[off])
+	end
+	if c == "break" or c == "continue" or c == "return" or c == "exit" then
+		return c, off + 1
+	end
+	return nil
 end
-
 
 -- Does this statement list contain a break/continue the CFG can't place as a static
 -- jump — a non-literal level (`break $x`), extra args (`continue 1 2 3`), or (in a
@@ -538,22 +863,38 @@ end
 -- break/continue is lost and the compiled loop spins forever). Descends into if/group
 -- but not nested loops/functions/subshells (their break/continue are their own).
 local function hard_cf(stmts, in_cond)
-  for _, st in ipairs(stmts or {}) do
-    local op, argoff = resolve_cf(st)
-    if op == "break" or op == "continue" then
-      if in_cond then return true end
-      local lvlw = st.words[argoff]
-      if lvlw and (not (function() local wl = full_lit(lvlw); return wl and wl:match("^%d+$") end)() or st.words[argoff + 1]) then
-        return true
-      end
-    end
-    if st.t == "if" then
-      for _, cl in ipairs(st.clauses) do if hard_cf(cl.body, in_cond) then return true end end
-    elseif st.t == "group" then
-      if hard_cf(st.body, in_cond) then return true end
-    end
-  end
-  return false
+	for _, st in ipairs(stmts or {}) do
+		local op, argoff = resolve_cf(st)
+		if op == "break" or op == "continue" then
+			if in_cond then
+				return true
+			end
+			local lvlw = st.words[argoff]
+			if
+				lvlw
+				and (
+					not (function()
+						local wl = full_lit(lvlw)
+						return wl and wl:match("^%d+$")
+					end)() or st.words[argoff + 1]
+				)
+			then
+				return true
+			end
+		end
+		if st.t == "if" then
+			for _, cl in ipairs(st.clauses) do
+				if hard_cf(cl.body, in_cond) then
+					return true
+				end
+			end
+		elseif st.t == "group" then
+			if hard_cf(st.body, in_cond) then
+				return true
+			end
+		end
+	end
+	return false
 end
 
 -- Command-substitution fragment compilation (emit_word's `$(…)` path). A literal
@@ -567,96 +908,154 @@ local emit_frags, emit_frag_ctx, emit_frag_n
 
 local emit_value, emit_arith_into
 emit_value = function(e, lifted)
-  local k = e.k
-  if k == "num" then
-    if e.v:match("^%d+$") and (e.v == "0" or e.v:sub(1, 1) ~= "0") then return e.v .. "LL" end
-    return ("rt.arith_num(%q)"):format(e.v) -- 0x.. / 010 octal / N#.. bases
-  end
-  if k == "raw" then return e.code end -- a pre-computed Lua expr (inlined param binding)
-  if k == "var" and e.name == "LINENO" then return (tostring(EF.cur_line or 0) .. "LL") end -- compile-time line
-  if k == "var" and e.idxraw then -- $(( a[i] )): array/assoc element read (gated by arith_elem_ok)
-    return ("rt.arith_read_elem(sh, %q, %q, %s)"):format(e.name, e.idxraw, emit_word(require("parser").parse_word(e.idxraw), lifted))
-  end
-  if k == "var" then return lifted[e.name] and lname(e.name) or (arith_varread):format(e.name) end
-  if k == "param" then return ("rt.str_to_i64(sh:param(%d))"):format(e.n) end
-  if k == "xpand" then
-    -- $name/$digit arithmetic: bash substitutes each value's TEXT and re-parses, which
-    -- agrees with reading the operand natively WHEN the value is a plain number (a number
-    -- binds like an atom). Lifted operands are i64 locals — always numeric — so a hot
-    -- `(( $i < n ))` compiles to pure native code. A NON-lifted $name is guarded: if its
-    -- value isn't numeric, bash re-associates operators, so fall back to the interpreter's
-    -- textual substitution (rt.arith_textual). Only reached for a fast xpand (not_compilable).
-    local ok, native = pcall(require("parser").arith, e.raw, true)
-    if not ok then return ("rt.arith_textual(sh, %q)"):format(e.raw) end
-    local nl, lf = {}, {}
-    xpand_split(native, lifted, nl, lf, {})
-    local nat = emit_value(native, lifted)
-    if #nl == 0 then return nat end -- every $-operand is a lifted i64: pure native
-    local conds = {}
-    for _, nm in ipairs(nl) do conds[#conds + 1] = ("rt.arith_isnum(sh,%q)"):format(nm) end
-    local fb -- fallback: flush any lifted operands to sh, then bash's textual substitution
-    if #lf == 0 then fb = ("rt.arith_textual(sh,%q)"):format(e.raw)
-    else
-      local syncs = {}
-      for _, nm in ipairs(lf) do syncs[#syncs + 1] = ("sh:aset(%q,%s)"):format(nm, lname(nm)) end
-      fb = ("(function() %s; return rt.arith_textual(sh,%q) end)()"):format(table.concat(syncs, "; "), e.raw)
-    end
-    return ("((%s) and (%s) or %s)"):format(table.concat(conds, " and "), nat, fb)
-  end
-  if k == "un" then
-    if e.op == "-" then return "(-(" .. emit_value(e.e, lifted) .. "))" end
-    if e.op == "!" then return "((" .. emit_value(e.e, lifted) .. ") == 0LL and 1LL or 0LL)" end
-    if e.op == "~" then return "bit.bnot(" .. emit_value(e.e, lifted) .. ")" end
-  end
-  if k == "tern" then
-    return ("((( %s ) ~= 0LL) and ( %s ) or ( %s ))"):format(
-      emit_value(e.c, lifted), emit_value(e.a, lifted), emit_value(e.b, lifted))
-  end
-  if k == "bin" then
-    local l, r = emit_value(e.l, lifted), emit_value(e.r, lifted)
-    local op = e.op
-    if op == "+" or op == "-" or op == "*" then
-      return "(" .. l .. " " .. op .. " " .. r .. ")"
-    end
-    if op == "/" then return ("rt.idiv(%s, %s)"):format(l, r) end -- fatal on /0
-    if op == "%" then return ("rt.imod(%s, %s)"):format(l, r) end
-    if CMP[op] then return "((" .. l .. " " .. CMP[op] .. " " .. r .. ") and 1LL or 0LL)" end
-    if op == "&&" then return "(((" .. l .. ") ~= 0LL and (" .. r .. ") ~= 0LL) and 1LL or 0LL)" end
-    if op == "||" then return "(((" .. l .. ") ~= 0LL or (" .. r .. ") ~= 0LL) and 1LL or 0LL)" end
-    if op == "&" then return ("bit.band(%s, %s)"):format(l, r) end
-    if op == "|" then return ("bit.bor(%s, %s)"):format(l, r) end
-    if op == "^" then return ("bit.bxor(%s, %s)"):format(l, r) end
-    if op == "<<" then return ("bit.lshift(%s, tonumber(%s) %% 64)"):format(l, r) end
-    if op == ">>" then return ("bit.arshift(%s, tonumber(%s) %% 64)"):format(l, r) end
-    if op == "**" then return ("rt.ipow(%s, %s)"):format(l, r) end
-  end
-  error("emit: value position not supported for node " .. tostring(k))
+	local k = e.k
+	if k == "num" then
+		if e.v:match("^%d+$") and (e.v == "0" or e.v:sub(1, 1) ~= "0") then
+			return e.v .. "LL"
+		end
+		return ("rt.arith_num(%q)"):format(e.v) -- 0x.. / 010 octal / N#.. bases
+	end
+	if k == "raw" then
+		return e.code
+	end -- a pre-computed Lua expr (inlined param binding)
+	if k == "var" and e.name == "LINENO" then
+		return (tostring(EF.cur_line or 0) .. "LL")
+	end -- compile-time line
+	if k == "var" and e.idxraw then -- $(( a[i] )): array/assoc element read (gated by arith_elem_ok)
+		return ("rt.arith_read_elem(sh, %q, %q, %s)"):format(
+			e.name,
+			e.idxraw,
+			emit_word(require("parser").parse_word(e.idxraw), lifted)
+		)
+	end
+	if k == "var" then
+		return lifted[e.name] and lname(e.name) or (arith_varread):format(e.name)
+	end
+	if k == "param" then
+		return ("rt.str_to_i64(sh:param(%d))"):format(e.n)
+	end
+	if k == "xpand" then
+		-- $name/$digit arithmetic: bash substitutes each value's TEXT and re-parses, which
+		-- agrees with reading the operand natively WHEN the value is a plain number (a number
+		-- binds like an atom). Lifted operands are i64 locals — always numeric — so a hot
+		-- `(( $i < n ))` compiles to pure native code. A NON-lifted $name is guarded: if its
+		-- value isn't numeric, bash re-associates operators, so fall back to the interpreter's
+		-- textual substitution (rt.arith_textual). Only reached for a fast xpand (not_compilable).
+		local ok, native = pcall(require("parser").arith, e.raw, true)
+		if not ok then
+			return ("rt.arith_textual(sh, %q)"):format(e.raw)
+		end
+		local nl, lf = {}, {}
+		xpand_split(native, lifted, nl, lf, {})
+		local nat = emit_value(native, lifted)
+		if #nl == 0 then
+			return nat
+		end -- every $-operand is a lifted i64: pure native
+		local conds = {}
+		for _, nm in ipairs(nl) do
+			conds[#conds + 1] = ("rt.arith_isnum(sh,%q)"):format(nm)
+		end
+		local fb -- fallback: flush any lifted operands to sh, then bash's textual substitution
+		if #lf == 0 then
+			fb = ("rt.arith_textual(sh,%q)"):format(e.raw)
+		else
+			local syncs = {}
+			for _, nm in ipairs(lf) do
+				syncs[#syncs + 1] = ("sh:aset(%q,%s)"):format(nm, lname(nm))
+			end
+			fb = ("(function() %s; return rt.arith_textual(sh,%q) end)()"):format(table.concat(syncs, "; "), e.raw)
+		end
+		return ("((%s) and (%s) or %s)"):format(table.concat(conds, " and "), nat, fb)
+	end
+	if k == "un" then
+		if e.op == "-" then
+			return "(-(" .. emit_value(e.e, lifted) .. "))"
+		end
+		if e.op == "!" then
+			return "((" .. emit_value(e.e, lifted) .. ") == 0LL and 1LL or 0LL)"
+		end
+		if e.op == "~" then
+			return "bit.bnot(" .. emit_value(e.e, lifted) .. ")"
+		end
+	end
+	if k == "tern" then
+		return ("((( %s ) ~= 0LL) and ( %s ) or ( %s ))"):format(
+			emit_value(e.c, lifted),
+			emit_value(e.a, lifted),
+			emit_value(e.b, lifted)
+		)
+	end
+	if k == "bin" then
+		local l, r = emit_value(e.l, lifted), emit_value(e.r, lifted)
+		local op = e.op
+		if op == "+" or op == "-" or op == "*" then
+			return "(" .. l .. " " .. op .. " " .. r .. ")"
+		end
+		if op == "/" then
+			return ("rt.idiv(%s, %s)"):format(l, r)
+		end -- fatal on /0
+		if op == "%" then
+			return ("rt.imod(%s, %s)"):format(l, r)
+		end
+		if CMP[op] then
+			return "((" .. l .. " " .. CMP[op] .. " " .. r .. ") and 1LL or 0LL)"
+		end
+		if op == "&&" then
+			return "(((" .. l .. ") ~= 0LL and (" .. r .. ") ~= 0LL) and 1LL or 0LL)"
+		end
+		if op == "||" then
+			return "(((" .. l .. ") ~= 0LL or (" .. r .. ") ~= 0LL) and 1LL or 0LL)"
+		end
+		if op == "&" then
+			return ("bit.band(%s, %s)"):format(l, r)
+		end
+		if op == "|" then
+			return ("bit.bor(%s, %s)"):format(l, r)
+		end
+		if op == "^" then
+			return ("bit.bxor(%s, %s)"):format(l, r)
+		end
+		if op == "<<" then
+			return ("bit.lshift(%s, tonumber(%s) %% 64)"):format(l, r)
+		end
+		if op == ">>" then
+			return ("bit.arshift(%s, tonumber(%s) %% 64)"):format(l, r)
+		end
+		if op == "**" then
+			return ("rt.ipow(%s, %s)"):format(l, r)
+		end
+	end
+	error("emit: value position not supported for node " .. tostring(k))
 end
 
 local function emit_bool(e, lifted)
-  if e.k == "bin" and CMP[e.op] then
-    return "(" .. emit_value(e.l, lifted) .. " " .. CMP[e.op] .. " " .. emit_value(e.r, lifted) .. ")"
-  end
-  return "((" .. emit_value(e, lifted) .. ") ~= 0LL)"
+	if e.k == "bin" and CMP[e.op] then
+		return "(" .. emit_value(e.l, lifted) .. " " .. CMP[e.op] .. " " .. emit_value(e.r, lifted) .. ")"
+	end
+	return "((" .. emit_value(e, lifted) .. ") ~= 0LL)"
 end
 
 local function emit_set(name, valexpr, lifted)
-  if lifted[name] then return lname(name) .. " = " .. valexpr end
-  return ("sh:aset(%q, %s)"):format(name, valexpr)
+	if lifted[name] then
+		return lname(name) .. " = " .. valexpr
+	end
+	return ("sh:aset(%q, %s)"):format(name, valexpr)
 end
 
 local function emit_arith_stmt(e, lifted)
-  if e.k == "asgn" then
-    local v = emit_value(e.e, lifted)
-    if e.op == "=" then return emit_set(e.name, v, lifted) end
-    local cur = lifted[e.name] and lname(e.name) or ("sh:aget(%q)"):format(e.name)
-    return emit_set(e.name, ("(%s %s (%s))"):format(cur, e.op:sub(1, 1), v), lifted)
-  end
-  if e.k == "post" or e.k == "pre" then
-    local cur = lifted[e.name] and lname(e.name) or ("sh:aget(%q)"):format(e.name)
-    return emit_set(e.name, ("(%s + %dLL)"):format(cur, e.d), lifted)
-  end
-  error("emit: statement position not supported for arith node " .. tostring(e.k))
+	if e.k == "asgn" then
+		local v = emit_value(e.e, lifted)
+		if e.op == "=" then
+			return emit_set(e.name, v, lifted)
+		end
+		local cur = lifted[e.name] and lname(e.name) or ("sh:aget(%q)"):format(e.name)
+		return emit_set(e.name, ("(%s %s (%s))"):format(cur, e.op:sub(1, 1), v), lifted)
+	end
+	if e.k == "post" or e.k == "pre" then
+		local cur = lifted[e.name] and lname(e.name) or ("sh:aget(%q)"):format(e.name)
+		return emit_set(e.name, ("(%s + %dLL)"):format(cur, e.d), lifted)
+	end
+	error("emit: statement position not supported for arith node " .. tostring(e.k))
 end
 
 -- ---- recursive-value arith: native compile of a var's VALUE re-evaluated as arith ----
@@ -668,30 +1067,62 @@ end
 -- the bugs.test.sh `a[$(…)]=1` case). Anything outside the subset returns nil, so
 -- rt.arith_read keeps the interp bootstrap for it (compile-eventually, never a NEW seam).
 local function arith_native_ok(e)
-  if type(e) ~= "table" then return false end
-  local k = e.k
-  if k == "num" or k == "param" then return true end
-  if k == "var" then return not e.idx and not e.idxraw end -- scalar only (subscript -> arith_key)
-  if k == "un" then return arith_native_ok(e.e) end
-  if k == "bin" then return arith_native_ok(e.l) and arith_native_ok(e.r) end
-  if k == "tern" then return arith_native_ok(e.c) and arith_native_ok(e.a) and arith_native_ok(e.b) end
-  if k == "comma" then return arith_native_ok(e.l) and arith_native_ok(e.r) end
-  return false -- asgn/post/pre (nounset + lifted-var write subtleties), xpand/xpandleaf/
-  -- matherr/raw (dynamic or subscript): keep the interp bootstrap (identical to HEAD).
+	if type(e) ~= "table" then
+		return false
+	end
+	local k = e.k
+	if k == "num" or k == "param" then
+		return true
+	end
+	if k == "var" then
+		return not e.idx and not e.idxraw
+	end -- scalar only (subscript -> arith_key)
+	if k == "un" then
+		return arith_native_ok(e.e)
+	end
+	if k == "bin" then
+		return arith_native_ok(e.l) and arith_native_ok(e.r)
+	end
+	if k == "tern" then
+		return arith_native_ok(e.c) and arith_native_ok(e.a) and arith_native_ok(e.b)
+	end
+	if k == "comma" then
+		return arith_native_ok(e.l) and arith_native_ok(e.r)
+	end
+	return false -- asgn/post/pre (nounset + lifted-var write subtleties), xpand/xpandleaf/
+	-- matherr/raw (dynamic or subscript): keep the interp bootstrap (identical to HEAD).
 end
 -- Render an arithmetic binary op (same op->expr mapping as emit_value's `bin`); shared
 -- by emit_avalue's bin node and its compound-assignment (`x <<= y`).
 local function arith_binop(op, l, r)
-  if op == "+" or op == "-" or op == "*" then return "(" .. l .. " " .. op .. " " .. r .. ")" end
-  if op == "/" then return ("rt.idiv(%s, %s)"):format(l, r) end
-  if op == "%" then return ("rt.imod(%s, %s)"):format(l, r) end
-  if op == "&" then return ("bit.band(%s, %s)"):format(l, r) end
-  if op == "|" then return ("bit.bor(%s, %s)"):format(l, r) end
-  if op == "^" then return ("bit.bxor(%s, %s)"):format(l, r) end
-  if op == "<<" then return ("bit.lshift(%s, tonumber(%s) %% 64)"):format(l, r) end
-  if op == ">>" then return ("bit.arshift(%s, tonumber(%s) %% 64)"):format(l, r) end
-  if op == "**" then return ("rt.ipow(%s, %s)"):format(l, r) end
-  error("arith_binop: unsupported " .. tostring(op))
+	if op == "+" or op == "-" or op == "*" then
+		return "(" .. l .. " " .. op .. " " .. r .. ")"
+	end
+	if op == "/" then
+		return ("rt.idiv(%s, %s)"):format(l, r)
+	end
+	if op == "%" then
+		return ("rt.imod(%s, %s)"):format(l, r)
+	end
+	if op == "&" then
+		return ("bit.band(%s, %s)"):format(l, r)
+	end
+	if op == "|" then
+		return ("bit.bor(%s, %s)"):format(l, r)
+	end
+	if op == "^" then
+		return ("bit.bxor(%s, %s)"):format(l, r)
+	end
+	if op == "<<" then
+		return ("bit.lshift(%s, tonumber(%s) %% 64)"):format(l, r)
+	end
+	if op == ">>" then
+		return ("bit.arshift(%s, tonumber(%s) %% 64)"):format(l, r)
+	end
+	if op == "**" then
+		return ("rt.ipow(%s, %s)"):format(l, r)
+	end
+	error("arith_binop: unsupported " .. tostring(op))
 end
 -- Render one arith node to a value-returning Lua expression. Like emit_value but with
 -- the side-effecting nodes (asgn/post/pre/comma) as value expressions/IIFEs, and every
@@ -699,48 +1130,72 @@ end
 -- is always {} (a standalone value string), so no i64 locals — assign returns via sh:aset.
 local emit_avalue
 emit_avalue = function(e)
-  local k = e.k
-  if k == "num" then
-    if e.v:match("^%d+$") and (e.v == "0" or e.v:sub(1, 1) ~= "0") then return e.v .. "LL" end
-    return ("rt.arith_num(%q)"):format(e.v) -- 0x.. / 010 / N#.. bases
-  end
-  if k == "var" then return ("rt.arith_read(sh, %q)"):format(e.name) end -- recursive (reentrancy-guarded)
-  if k == "param" then return ("rt.str_to_i64(sh:param(%d))"):format(e.n) end
-  if k == "un" then
-    local v = emit_avalue(e.e)
-    if e.op == "-" then return "(-(" .. v .. "))" end
-    if e.op == "!" then return "((" .. v .. ") == 0LL and 1LL or 0LL)" end
-    if e.op == "~" then return "bit.bnot(" .. v .. ")" end
-  end
-  if k == "tern" then
-    return ("((( %s ) ~= 0LL) and ( %s ) or ( %s ))"):format(emit_avalue(e.c), emit_avalue(e.a), emit_avalue(e.b))
-  end
-  if k == "comma" then
-    return ("(function() local _ = %s; return %s end)()"):format(emit_avalue(e.l), emit_avalue(e.r))
-  end
-  if k == "bin" then
-    local op = e.op
-    if op == "&&" then return ("(((%s) ~= 0LL and (%s) ~= 0LL) and 1LL or 0LL)"):format(emit_avalue(e.l), emit_avalue(e.r)) end
-    if op == "||" then return ("(((%s) ~= 0LL or (%s) ~= 0LL) and 1LL or 0LL)"):format(emit_avalue(e.l), emit_avalue(e.r)) end
-    local l, r = emit_avalue(e.l), emit_avalue(e.r)
-    if CMP[op] then return "((" .. l .. " " .. CMP[op] .. " " .. r .. ") and 1LL or 0LL)" end
-    return arith_binop(op, l, r)
-  end
-  -- asgn/post/pre are gated out by arith_native_ok (their nounset + lifted-var write
-  -- semantics stay on the interp bootstrap), so they never reach here.
-  error("emit_avalue: unsupported arith node " .. tostring(k))
+	local k = e.k
+	if k == "num" then
+		if e.v:match("^%d+$") and (e.v == "0" or e.v:sub(1, 1) ~= "0") then
+			return e.v .. "LL"
+		end
+		return ("rt.arith_num(%q)"):format(e.v) -- 0x.. / 010 / N#.. bases
+	end
+	if k == "var" then
+		return ("rt.arith_read(sh, %q)"):format(e.name)
+	end -- recursive (reentrancy-guarded)
+	if k == "param" then
+		return ("rt.str_to_i64(sh:param(%d))"):format(e.n)
+	end
+	if k == "un" then
+		local v = emit_avalue(e.e)
+		if e.op == "-" then
+			return "(-(" .. v .. "))"
+		end
+		if e.op == "!" then
+			return "((" .. v .. ") == 0LL and 1LL or 0LL)"
+		end
+		if e.op == "~" then
+			return "bit.bnot(" .. v .. ")"
+		end
+	end
+	if k == "tern" then
+		return ("((( %s ) ~= 0LL) and ( %s ) or ( %s ))"):format(emit_avalue(e.c), emit_avalue(e.a), emit_avalue(e.b))
+	end
+	if k == "comma" then
+		return ("(function() local _ = %s; return %s end)()"):format(emit_avalue(e.l), emit_avalue(e.r))
+	end
+	if k == "bin" then
+		local op = e.op
+		if op == "&&" then
+			return ("(((%s) ~= 0LL and (%s) ~= 0LL) and 1LL or 0LL)"):format(emit_avalue(e.l), emit_avalue(e.r))
+		end
+		if op == "||" then
+			return ("(((%s) ~= 0LL or (%s) ~= 0LL) and 1LL or 0LL)"):format(emit_avalue(e.l), emit_avalue(e.r))
+		end
+		local l, r = emit_avalue(e.l), emit_avalue(e.r)
+		if CMP[op] then
+			return "((" .. l .. " " .. CMP[op] .. " " .. r .. ") and 1LL or 0LL)"
+		end
+		return arith_binop(op, l, r)
+	end
+	-- asgn/post/pre are gated out by arith_native_ok (their nounset + lifted-var write
+	-- semantics stay on the interp bootstrap), so they never reach here.
+	error("emit_avalue: unsupported arith node " .. tostring(k))
 end
 -- Compile a var's VALUE string to `function(sh) return <int64> end`, or nil if the value
 -- isn't a parseable in-subset arith expression (caller keeps the interp bootstrap). The
 -- returned fn reads only sh + rt + bit (same preamble as M.emit's module header).
 function M.compile_arith_value(s)
-  local ok, ast = pcall(require("parser").arith, s) -- deferred form, exactly as arith_resolve
-  if not ok or not arith_native_ok(ast) then return nil end
-  local ok2, expr = pcall(emit_avalue, ast)
-  if not ok2 then return nil end
-  local f = load('local rt = require("runtime"); local bit = require("bit"); return function(sh) return '
-    .. expr .. ' end', "=curse:arith")
-  return f and f() or nil
+	local ok, ast = pcall(require("parser").arith, s) -- deferred form, exactly as arith_resolve
+	if not ok or not arith_native_ok(ast) then
+		return nil
+	end
+	local ok2, expr = pcall(emit_avalue, ast)
+	if not ok2 then
+		return nil
+	end
+	local f = load(
+		'local rt = require("runtime"); local bit = require("bit"); return function(sh) return ' .. expr .. " end",
+		"=curse:arith"
+	)
+	return f and f() or nil
 end
 
 -- Compile a literal `$(cmd)` / backtick inner (KNOWN at this compile time) into an
@@ -753,53 +1208,76 @@ end
 -- {}) and return its id, or nil if the body hits a compiler gap. Shared by $(…),
 -- background, and pipeline stages — the compiled tier's "run this subprogram" unit.
 local function emit_fragment(stmts, neg)
-  local saved_tl, saved_neg, saved_line = emit_toplevel, emit_neg_ctx, EF.cur_line
-  if neg then emit_neg_ctx = true end -- `! cmd`: exempt its own errexit (see errchk)
-  -- a `!`-inverted command must NOT inline a called function (its body keeps its own
-  -- errexit, checked in fn_x — which is built separately, unaffected by emit_neg_ctx).
-  local inlfns = neg and {} or emit_frag_ctx.inlinefns
-  local bok, cfg = pcall(build_cfg, stmts, {}, emit_frag_ctx.funcflags, inlfns, false)
-  emit_toplevel, emit_neg_ctx, EF.cur_line = saved_tl, saved_neg, saved_line
-  if not bok then return nil end
-  emit_frag_n = emit_frag_n + 1
-  emit_frags[#emit_frags + 1] = assemble(cfg, ("cs_%d = function(sh)"):format(emit_frag_n), {})
-  return emit_frag_n
+	local saved_tl, saved_neg, saved_line = emit_toplevel, emit_neg_ctx, EF.cur_line
+	if neg then
+		emit_neg_ctx = true
+	end -- `! cmd`: exempt its own errexit (see errchk)
+	-- a `!`-inverted command must NOT inline a called function (its body keeps its own
+	-- errexit, checked in fn_x — which is built separately, unaffected by emit_neg_ctx).
+	local inlfns = neg and {} or emit_frag_ctx.inlinefns
+	local bok, cfg = pcall(build_cfg, stmts, {}, emit_frag_ctx.funcflags, inlfns, false)
+	emit_toplevel, emit_neg_ctx, EF.cur_line = saved_tl, saved_neg, saved_line
+	if not bok then
+		return nil
+	end
+	emit_frag_n = emit_frag_n + 1
+	emit_frags[#emit_frags + 1] = assemble(cfg, ("cs_%d = function(sh)"):format(emit_frag_n), {})
+	return emit_frag_n
 end
 
 -- "flush lifted operands to sh; " prefix so a fragment (which reads sh) sees current
 -- values of the enclosing scope's native-int64 locals. "" when nothing is lifted.
 local function lifted_flush(lifted)
-  local f = {}
-  for n in pairs(lifted) do f[#f + 1] = ("sh:aset(%q, %s)"):format(n, lname(n)) end
-  return #f > 0 and (table.concat(f, "; ") .. "; ") or ""
+	local f = {}
+	for n in pairs(lifted) do
+		f[#f + 1] = ("sh:aset(%q, %s)"):format(n, lname(n))
+	end
+	return #f > 0 and (table.concat(f, "; ") .. "; ") or ""
 end
 
 local function compile_cmdsub(src, backtick, lifted)
-  local fallback = ("sh:capture_src(%q%s)"):format(src, backtick and ", true" or "")
-  local pok, ast = pcall(require("parser").parse, src)
-  if not pok or type(ast) ~= "table" or ast.stmts == nil then return fallback end -- syntax error
-  -- A syntax error inside $(…) is fatal to the containing command (bash, status 2);
-  -- capture_src reproduces that exactly, so route any parse_error body there.
-  for _, st in ipairs(ast.stmts) do if st.t == "parse_error" then return fallback end end
-  if #ast.stmts == 1 then -- $(< file): read the file's contents (a special, not a command)
-    local st = ast.stmts[1]
-    if st.t == "simple" and (not st.words or #st.words == 0)
-        and st.redirs and #st.redirs == 1 and st.redirs[1].op == "in" then
-      -- compile the path word and read the file directly — no interp
-      local wok, pw = pcall(require("parser").parse_word, st.redirs[1].target or "")
-      if wok then
-        local eok, pathexpr = pcall(emit_word, pw, lifted)
-        if eok then return ("sh:capture_file(%s)"):format(pathexpr) end
-      end
-      return fallback
-    end
-  end
-  local id = emit_fragment(ast.stmts)
-  if not id then return fallback end -- compiler gap (curse-nocompile): to be closed upstream
-  local call = ("sh:capture_compiled(cs_%d, true, %s)"):format(id, backtick and "true" or "false")
-  local flush = lifted_flush(lifted)
-  if flush ~= "" then return ("(function() %s return %s end)()"):format(flush, call) end
-  return call
+	local fallback = ("sh:capture_src(%q%s)"):format(src, backtick and ", true" or "")
+	local pok, ast = pcall(require("parser").parse, src)
+	if not pok or type(ast) ~= "table" or ast.stmts == nil then
+		return fallback
+	end -- syntax error
+	-- A syntax error inside $(…) is fatal to the containing command (bash, status 2);
+	-- capture_src reproduces that exactly, so route any parse_error body there.
+	for _, st in ipairs(ast.stmts) do
+		if st.t == "parse_error" then
+			return fallback
+		end
+	end
+	if #ast.stmts == 1 then -- $(< file): read the file's contents (a special, not a command)
+		local st = ast.stmts[1]
+		if
+			st.t == "simple"
+			and (not st.words or #st.words == 0)
+			and st.redirs
+			and #st.redirs == 1
+			and st.redirs[1].op == "in"
+		then
+			-- compile the path word and read the file directly — no interp
+			local wok, pw = pcall(require("parser").parse_word, st.redirs[1].target or "")
+			if wok then
+				local eok, pathexpr = pcall(emit_word, pw, lifted)
+				if eok then
+					return ("sh:capture_file(%s)"):format(pathexpr)
+				end
+			end
+			return fallback
+		end
+	end
+	local id = emit_fragment(ast.stmts)
+	if not id then
+		return fallback
+	end -- compiler gap (curse-nocompile): to be closed upstream
+	local call = ("sh:capture_compiled(cs_%d, true, %s)"):format(id, backtick and "true" or "false")
+	local flush = lifted_flush(lifted)
+	if flush ~= "" then
+		return ("(function() %s return %s end)()"):format(flush, call)
+	end
+	return call
 end
 
 -- Render an arith node `a` (from a `$((…))`/inlined word) to a Lua string EXPRESSION.
@@ -807,74 +1285,102 @@ end
 -- emit_arith_into in an IIFE so the ++/--/assignment fires exactly once, then stringifies
 -- the result. Assumes arith_varread is already set to the recursive $(()) reader by the caller.
 local function emit_arith_word(a, lifted)
-  if arith_side_effect(a) then
-    return "(function() local __v; " .. emit_arith_into("__v", a, lifted) .. "; return rt.i64_to_str(__v) end)()"
-  end
-  return "rt.i64_to_str(" .. emit_value(a, lifted) .. ")"
+	if arith_side_effect(a) then
+		return "(function() local __v; " .. emit_arith_into("__v", a, lifted) .. "; return rt.i64_to_str(__v) end)()"
+	end
+	return "rt.i64_to_str(" .. emit_value(a, lifted) .. ")"
 end
 
 emit_word = function(w, lifted)
-  local parts = {}
-  for i, p in ipairs(w.parts) do
-    if i == 1 and p.lit and not p.q and (p.lit:sub(1, 1) == "~"
-        or (p.lit:find("~", 1, true) and p.lit:match("^[%a_][%w_]*%+?=") ~= nil)) then
-      -- word-initial unquoted literal tilde (~, ~/…, ~user, ~+/~-) OR a NAME=…~ word
-      -- (`echo x=~`, which bash tilde-expands like an assignment): expanded at runtime
-      -- ($HOME/getpwnam/$PWD, each `:`-segment after NAME=). Only a genuine LITERAL ~
-      -- triggers — a tilde from a variable's value never expands (bash), and this part
-      -- is a literal, so no over-expansion. ~ mid-word (not after NAME=) stays literal.
-      parts[#parts + 1] = ("rt.tilde_word_initial(sh, %q)"):format(p.lit)
-    elseif p.lit then parts[#parts + 1] = ("%q"):format(p.lit)
-    elseif p.raw then parts[#parts + 1] = p.raw -- pre-computed Lua string expr (inlined param)
-    elseif p.var == "LINENO" then -- $LINENO: the current source line, a compile-time constant
-      parts[#parts + 1] = ("%q"):format(tostring(EF.cur_line or 0))
-    elseif p.var then
-      parts[#parts + 1] = EF.has_nameref and ("rt.nameref_read(sh, %q)"):format(p.var)
-        or lifted[p.var] and ("rt.i64_to_str(%s)"):format(lname(p.var)) or ("sh:get_u(%q)"):format(p.var)
-    elseif p.param then parts[#parts + 1] = ("sh:param(%d)"):format(p.param)
-    elseif p.special then
-      if p.special == "#" then parts[#parts + 1] = "tostring(sh.nparams)"
-      elseif p.special == "@" then parts[#parts + 1] = 'sh:paramsJoin(" ")'
-      elseif p.special == "*" then parts[#parts + 1] = 'sh:paramsStar()' -- "$*": IFS[0]-joined
-      elseif p.special == "?" then parts[#parts + 1] = "tostring(sh.status)"
-      elseif p.special == "$" then parts[#parts + 1] = "tostring(sh:pid())"
-      elseif p.special == "!" then parts[#parts + 1] = '(sh.last_bg_pid or "")' end
-    elseif p.arithast then -- a pre-parsed+substituted arith AST (inlined word)
-      local saved = arith_varread; arith_varread = "rt.arith_read(sh, %q)" -- $(()) reads recursively (bar=foo;$((bar)))
-      parts[#parts + 1] = emit_arith_word(p.arithast, lifted)
-      arith_varread = saved
-    elseif p.arith then
-      local saved = arith_varread; arith_varread = "rt.arith_read(sh, %q)" -- name/expr values re-parse as arith
-      parts[#parts + 1] = emit_arith_word(safe_arith(p.arith), lifted)
-      arith_varread = saved
-    elseif p.cmdsub then -- $( … ): COMPILE the inner (known at compile time) and run it captured
-      parts[#parts + 1] = compile_cmdsub(p.cmdsub, p.backtick, lifted)
-    elseif p.pexp then
-      if not pexp_compilable(p.pexp) then error("curse-nocompile: ${..} operator") end -- interp handles it
-      parts[#parts + 1] = pexp_scalar(p.pexp, lifted)
-    end
-  end
-  if #parts == 0 then return '""' end
-  return "(" .. table.concat(parts, " .. ") .. ")"
+	local parts = {}
+	for i, p in ipairs(w.parts) do
+		if
+			i == 1
+			and p.lit
+			and not p.q
+			and (p.lit:sub(1, 1) == "~" or (p.lit:find("~", 1, true) and p.lit:match("^[%a_][%w_]*%+?=") ~= nil))
+		then
+			-- word-initial unquoted literal tilde (~, ~/…, ~user, ~+/~-) OR a NAME=…~ word
+			-- (`echo x=~`, which bash tilde-expands like an assignment): expanded at runtime
+			-- ($HOME/getpwnam/$PWD, each `:`-segment after NAME=). Only a genuine LITERAL ~
+			-- triggers — a tilde from a variable's value never expands (bash), and this part
+			-- is a literal, so no over-expansion. ~ mid-word (not after NAME=) stays literal.
+			parts[#parts + 1] = ("rt.tilde_word_initial(sh, %q)"):format(p.lit)
+		elseif p.lit then
+			parts[#parts + 1] = ("%q"):format(p.lit)
+		elseif p.raw then
+			parts[#parts + 1] = p.raw -- pre-computed Lua string expr (inlined param)
+		elseif p.var == "LINENO" then -- $LINENO: the current source line, a compile-time constant
+			parts[#parts + 1] = ("%q"):format(tostring(EF.cur_line or 0))
+		elseif p.var then
+			parts[#parts + 1] = EF.has_nameref and ("rt.nameref_read(sh, %q)"):format(p.var)
+				or lifted[p.var] and ("rt.i64_to_str(%s)"):format(lname(p.var))
+				or ("sh:get_u(%q)"):format(p.var)
+		elseif p.param then
+			parts[#parts + 1] = ("sh:param(%d)"):format(p.param)
+		elseif p.special then
+			if p.special == "#" then
+				parts[#parts + 1] = "tostring(sh.nparams)"
+			elseif p.special == "@" then
+				parts[#parts + 1] = 'sh:paramsJoin(" ")'
+			elseif p.special == "*" then
+				parts[#parts + 1] = "sh:paramsStar()" -- "$*": IFS[0]-joined
+			elseif p.special == "?" then
+				parts[#parts + 1] = "tostring(sh.status)"
+			elseif p.special == "$" then
+				parts[#parts + 1] = "tostring(sh:pid())"
+			elseif p.special == "!" then
+				parts[#parts + 1] = '(sh.last_bg_pid or "")'
+			end
+		elseif p.arithast then -- a pre-parsed+substituted arith AST (inlined word)
+			local saved = arith_varread
+			arith_varread = "rt.arith_read(sh, %q)" -- $(()) reads recursively (bar=foo;$((bar)))
+			parts[#parts + 1] = emit_arith_word(p.arithast, lifted)
+			arith_varread = saved
+		elseif p.arith then
+			local saved = arith_varread
+			arith_varread = "rt.arith_read(sh, %q)" -- name/expr values re-parse as arith
+			parts[#parts + 1] = emit_arith_word(safe_arith(p.arith), lifted)
+			arith_varread = saved
+		elseif p.cmdsub then -- $( … ): COMPILE the inner (known at compile time) and run it captured
+			parts[#parts + 1] = compile_cmdsub(p.cmdsub, p.backtick, lifted)
+		elseif p.pexp then
+			if not pexp_compilable(p.pexp) then
+				error("curse-nocompile: ${..} operator")
+			end -- interp handles it
+			parts[#parts + 1] = pexp_scalar(p.pexp, lifted)
+		end
+	end
+	if #parts == 0 then
+		return '""'
+	end
+	return "(" .. table.concat(parts, " .. ") .. ")"
 end
 
 -- $_ suffix: after a simple command, $_ = its LAST argument (bash). Only when the
 -- program reads $_ and the last word is a single field (word_safe — re-evaluating it
 -- is side-effect-free; a split/cmdsub last arg is left alone). Empty string for no words.
 local function und(st, lifted)
-  if not st.words then return "" end -- $_ is maintained after every command (bash), like exec_simple's path
-  local last = st.words[#st.words]
-  if last and not word_safe(last) then return "" end -- split/cmdsub last arg: skip (rare)
-  -- A word_safe last arg can still hold a SIDE-EFFECTING expansion (a quoted `"$(cmd)"`, a
-  -- $((n++)), a procsub): re-emitting it here to set $_ would run it a SECOND time. Skip $_
-  -- for those (rare) rather than double the side effect — the command already ran it once.
-  if last then for _, p in ipairs(last.parts) do
-    if p.cmdsub or p.procsub or p.arith or p.arithast then return "" end
-  end end
-  local v = last and emit_word(last, lifted) or '""'
-  return ("; sh:set_str(%q, %s)"):format("_", v)
+	if not st.words then
+		return ""
+	end -- $_ is maintained after every command (bash), like exec_simple's path
+	local last = st.words[#st.words]
+	if last and not word_safe(last) then
+		return ""
+	end -- split/cmdsub last arg: skip (rare)
+	-- A word_safe last arg can still hold a SIDE-EFFECTING expansion (a quoted `"$(cmd)"`, a
+	-- $((n++)), a procsub): re-emitting it here to set $_ would run it a SECOND time. Skip $_
+	-- for those (rare) rather than double the side effect — the command already ran it once.
+	if last then
+		for _, p in ipairs(last.parts) do
+			if p.cmdsub or p.procsub or p.arith or p.arithast then
+				return ""
+			end
+		end
+	end
+	local v = last and emit_word(last, lifted) or '""'
+	return ("; sh:set_str(%q, %s)"):format("_", v)
 end
-
 
 -- The field engine (genuine compilation). A word that isn't word_safe still
 -- compiles when it is a SINGLE unquoted source that split+glob can process at
@@ -887,20 +1393,32 @@ end
 -- Same, but for a value read as an ARITH var node (`for (( i < LINENO ))`, `(( RANDOM ))`):
 -- the CFG can't reproduce it, so a forc/whilec arith touching one must delegate to interp.
 local function arith_reads_unsafe(e)
-  if type(e) ~= "table" then return false end
-  if e.k == "var" and COMPILE_UNSAFE_VAR[e.name] then return true end
-  return arith_reads_unsafe(e.e) or arith_reads_unsafe(e.l) or arith_reads_unsafe(e.r)
-    or arith_reads_unsafe(e.c) or arith_reads_unsafe(e.a) or arith_reads_unsafe(e.b)
+	if type(e) ~= "table" then
+		return false
+	end
+	if e.k == "var" and COMPILE_UNSAFE_VAR[e.name] then
+		return true
+	end
+	return arith_reads_unsafe(e.e)
+		or arith_reads_unsafe(e.l)
+		or arith_reads_unsafe(e.r)
+		or arith_reads_unsafe(e.c)
+		or arith_reads_unsafe(e.a)
+		or arith_reads_unsafe(e.b)
 end
 
 -- A [[ ]] operand word the compiled tier can render to its exact value: emit_word-able
 -- and free of a dynamic special var whose value the CFG doesn't reproduce ($LINENO/$_…).
 local function db_word_ok(w)
-  if not emitable_word(w) then return false end
-  for _, p in ipairs(w.parts) do
-    if p.var and (COMPILE_UNSAFE_VAR[p.var] and p.var ~= "LINENO") then return false end
-  end
-  return true
+	if not emitable_word(w) then
+		return false
+	end
+	for _, p in ipairs(w.parts) do
+		if p.var and (COMPILE_UNSAFE_VAR[p.var] and p.var ~= "LINENO") then
+			return false
+		end
+	end
+	return true
 end
 -- Compile a [[ ]] expression tree to a native Lua boolean expression (and/or/not
 -- short-circuit natively; leaves computed via emit_word + a runtime/interp PRIMITIVE
@@ -909,55 +1427,104 @@ end
 -- scalar concat) is exactly the operand value.
 local ARITH_CMP = { ["-eq"] = "==", ["-ne"] = "~=", ["-lt"] = "<", ["-le"] = "<=", ["-gt"] = ">", ["-ge"] = ">=" }
 local function emit_dbracket(node, lifted)
-  local k = node.kind
-  if k == "and" or k == "or" then
-    local a = emit_dbracket(node.l, lifted); if not a then return nil end
-    local b = emit_dbracket(node.r, lifted); if not b then return nil end
-    return "(" .. a .. (k == "and" and " and " or " or ") .. b .. ")"
-  elseif k == "not" then
-    local e = emit_dbracket(node.e, lifted); if not e then return nil end
-    return "(not " .. e .. ")"
-  elseif k == "str" then -- [[ $x ]] : true when non-empty
-    if not db_word_ok(node.word) then return nil end
-    return "(" .. emit_word(node.word, lifted) .. ' ~= "")'
-  elseif k == "unary" then
-    if not db_word_ok(node.word) then return nil end
-    local op, val = node.op, emit_word(node.word, lifted)
-    if op == "-z" then return "(" .. val .. ' == "")' end
-    if op == "-n" then return "(" .. val .. ' ~= "")' end
-    -- -v (variable/element set): the operand is already word-expanded, so its subscript is
-    -- a literal -> rt.var_is_set is native. -o (shell option) still needs SETOPT/opt_on ->
-    -- interp seam. Every other unary is a file predicate -> the pure-FFI runtime primitive.
-    if op == "-v" then return ("rt.var_is_set(sh, %s)"):format(val) end
-    if op == "-o" then return ("I.dbracket_unary(sh, %q, %s)"):format(op, val) end
-    return ("rt.file_test(%q, %s)"):format(op, val)
-  elseif k == "binary" then
-    if not db_word_ok(node.l) or not db_word_ok(node.r) then return nil end
-    local op, l = node.op, emit_word(node.l, lifted)
-    if op == "=~" then return nil end -- BASH_REMATCH side effect + status-2 -> interp
-    if op == "==" or op == "=" or op == "!=" then
-      if not node.rq then -- an unquoted RHS is a glob; mixed quoting can't be told apart -> delegate
-        for _, p in ipairs(node.r.parts) do if p.q then return nil end end
-      end
-      local eq = ("rt.dbracket_eq(sh, %s, %s, %s)"):format(l, emit_word(node.r, lifted), node.rq and "true" or "false")
-      return op == "!=" and ("(not " .. eq .. ")") or eq
-    elseif ARITH_CMP[op] then
-      return ("(rt.arith_str(sh, %s) %s rt.arith_str(sh, %s))"):format(l, ARITH_CMP[op], emit_word(node.r, lifted))
-    elseif op == "<" then return ("rt.coll_lt(%s, %s)"):format(l, emit_word(node.r, lifted))
-    elseif op == ">" then return ("rt.coll_lt(%s, %s)"):format(emit_word(node.r, lifted), l)
-    elseif op == "-nt" or op == "-ot" or op == "-ef" then
-      return ("rt.file_bincmp(%q, %s, %s)"):format(op, l, emit_word(node.r, lifted))
-    end
-  end
-  return nil
+	local k = node.kind
+	if k == "and" or k == "or" then
+		local a = emit_dbracket(node.l, lifted)
+		if not a then
+			return nil
+		end
+		local b = emit_dbracket(node.r, lifted)
+		if not b then
+			return nil
+		end
+		return "(" .. a .. (k == "and" and " and " or " or ") .. b .. ")"
+	elseif k == "not" then
+		local e = emit_dbracket(node.e, lifted)
+		if not e then
+			return nil
+		end
+		return "(not " .. e .. ")"
+	elseif k == "str" then -- [[ $x ]] : true when non-empty
+		if not db_word_ok(node.word) then
+			return nil
+		end
+		return "(" .. emit_word(node.word, lifted) .. ' ~= "")'
+	elseif k == "unary" then
+		if not db_word_ok(node.word) then
+			return nil
+		end
+		local op, val = node.op, emit_word(node.word, lifted)
+		if op == "-z" then
+			return "(" .. val .. ' == "")'
+		end
+		if op == "-n" then
+			return "(" .. val .. ' ~= "")'
+		end
+		-- -v (variable/element set): the operand is already word-expanded, so its subscript is
+		-- a literal -> rt.var_is_set is native. -o (shell option) still needs SETOPT/opt_on ->
+		-- interp seam. Every other unary is a file predicate -> the pure-FFI runtime primitive.
+		if op == "-v" then
+			return ("rt.var_is_set(sh, %s)"):format(val)
+		end
+		if op == "-o" then
+			return ("I.dbracket_unary(sh, %q, %s)"):format(op, val)
+		end
+		return ("rt.file_test(%q, %s)"):format(op, val)
+	elseif k == "binary" then
+		if not db_word_ok(node.l) or not db_word_ok(node.r) then
+			return nil
+		end
+		local op, l = node.op, emit_word(node.l, lifted)
+		if op == "=~" then
+			return nil
+		end -- BASH_REMATCH side effect + status-2 -> interp
+		if op == "==" or op == "=" or op == "!=" then
+			if not node.rq then -- an unquoted RHS is a glob; mixed quoting can't be told apart -> delegate
+				for _, p in ipairs(node.r.parts) do
+					if p.q then
+						return nil
+					end
+				end
+			end
+			local eq = ("rt.dbracket_eq(sh, %s, %s, %s)"):format(
+				l,
+				emit_word(node.r, lifted),
+				node.rq and "true" or "false"
+			)
+			return op == "!=" and ("(not " .. eq .. ")") or eq
+		elseif ARITH_CMP[op] then
+			return ("(rt.arith_str(sh, %s) %s rt.arith_str(sh, %s))"):format(
+				l,
+				ARITH_CMP[op],
+				emit_word(node.r, lifted)
+			)
+		elseif op == "<" then
+			return ("rt.coll_lt(%s, %s)"):format(l, emit_word(node.r, lifted))
+		elseif op == ">" then
+			return ("rt.coll_lt(%s, %s)"):format(emit_word(node.r, lifted), l)
+		elseif op == "-nt" or op == "-ot" or op == "-ef" then
+			return ("rt.file_bincmp(%q, %s, %s)"):format(op, l, emit_word(node.r, lifted))
+		end
+	end
+	return nil
 end
 
 -- Parameter-expansion OPERATORS whose per-value transform is a runtime PRIMITIVE
 -- (Shell:apply_str_op) applied to natively-computed operands: pattern strip
 -- (#/##/%/%%), glob substitute (/,//), and case-fold (^/^^/,/,,). The op is known
 -- at compile time; the value and (literal) pattern are the operands.
-local PEXP_STROP = { ["#"] = 1, ["##"] = 1, ["%"] = 1, ["%%"] = 1,
-  ["/"] = 1, ["//"] = 1, ["^"] = 1, ["^^"] = 1, [","] = 1, [",,"] = 1 }
+local PEXP_STROP = {
+	["#"] = 1,
+	["##"] = 1,
+	["%"] = 1,
+	["%%"] = 1,
+	["/"] = 1,
+	["//"] = 1,
+	["^"] = 1,
+	["^^"] = 1,
+	[","] = 1,
+	[",,"] = 1,
+}
 -- ${x@OP} transforms apply_str_op implements directly on the scalar value (bash 5.x):
 -- Q/K/k shell-quote, U/u/L case-fold, E ANSI-unescape. @P (prompt) and @a/@A (attributes)
 -- are NOT here — they need interp's expand_param — so they still delegate.
@@ -965,8 +1532,7 @@ local PEXP_AT = { Q = 1, K = 1, k = 1, U = 1, u = 1, L = 1, E = 1 }
 -- Default/alternate ops. Quoted -> pexp_scalar; unquoted scalar -> field_word renders the
 -- pexp value and the outer field_split splits it (the default word's own quoting is gated
 -- out of the compilable set, so scalar-value + split == bash's field-wise default).
-local PEXP_DEFAULT = { [":-"] = 1, ["-"] = 1, [":+"] = 1, ["+"] = 1,
-  [":="] = 1, ["="] = 1, [":?"] = 1, ["?"] = 1 }
+local PEXP_DEFAULT = { [":-"] = 1, ["-"] = 1, [":+"] = 1, ["+"] = 1, [":="] = 1, ["="] = 1, [":?"] = 1, ["?"] = 1 }
 -- The default/alternate ops valid on an ARRAY/positional [@]/[*] (bash: := / = / :? / ? are
 -- not — `${a[@]:=x}` errors). These yield the value list or the default field-list.
 local ARRAY_DEFAULT = { [":-"] = 1, ["-"] = 1, [":+"] = 1, ["+"] = 1 }
@@ -974,19 +1540,25 @@ local ARRAY_DEFAULT = { [":-"] = 1, ["-"] = 1, [":+"] = 1, ["+"] = 1 }
 -- expansion ($ ` ~), no quote char (a quoted metachar is literal — different glob
 -- semantics), and no backslash (escapes a glob char, or is a literal in a
 -- replacement). Anything with those needs interp's word expansion, so it delegates.
-local function pexp_literal_arg(a) return a == nil or not a:find("[%$`~\\\"']") end
+local function pexp_literal_arg(a)
+	return a == nil or not a:find("[%$`~\\\"']")
+end
 -- The op's word arg(s) (a slice off/len, or a default word) are compilable when each is an
 -- emit_word-able word free of ~ \ ' " (so emit_word == interp's expand_word and the arith
 -- eval / field-split runs on the identical expanded string). Shared by the scalar
 -- (pexp_compilable) and array (array_multi_op) slice + default gates.
 local function pexp_word_args_ok(pe)
-  local function wok(a)
-    if a == nil then return true end
-    if a:find("[~\\'\"]") then return false end
-    local ok, w = pcall(require("parser").parse_word, a)
-    return ok and emitable_word(w) or false
-  end
-  return wok(pe.arg) and wok(pe.arg2)
+	local function wok(a)
+		if a == nil then
+			return true
+		end
+		if a:find("[~\\'\"]") then
+			return false
+		end
+		local ok, w = pcall(require("parser").parse_word, a)
+		return ok and emitable_word(w) or false
+	end
+	return wok(pe.arg) and wok(pe.arg2)
 end
 -- A strip/subst/case op's PATTERN compiles: a plain literal (fast), or a dynamic/quoted
 -- pattern emit_pattern_glob renders mask-aware — but not a ~ (bash tilde-expands the pattern)
@@ -994,55 +1566,93 @@ end
 -- replacement's `&`/`\&` matched-text semantics differ from a plain value's. Shared by the
 -- scalar and array-element strop gates.
 local function strop_pat_ok(pe)
-  if pexp_literal_arg(pe.arg) and pexp_literal_arg(pe.arg2) then return true end
-  if pe.arg and pe.arg:find("[~\\]") then return false end
-  return emit_pattern_glob(pe.arg or "", {}) ~= nil and pexp_literal_arg(pe.arg2)
+	if pexp_literal_arg(pe.arg) and pexp_literal_arg(pe.arg2) then
+		return true
+	end
+	if pe.arg and pe.arg:find("[~\\]") then
+		return false
+	end
+	return emit_pattern_glob(pe.arg or "", {}) ~= nil and pexp_literal_arg(pe.arg2)
 end
 function pexp_compilable(pe)
-  if pe.via_indirect then return false end -- ${!ref} indirection (its own path)
-  if pe.index then
-    if type(pe.name) ~= "string" or not pe.name:match("^[%a_][%w_]*$") or COMPILE_UNSAFE_VAR[pe.name] then return false end
-    local op = pe.op
-    -- ${#a[@]} / ${#a[*]}: the array element COUNT (a scalar number via sh:array_count).
-    if pe.index == "@" or pe.index == "*" then return op == "len" end
-    -- ${a[sub]…}: a scalar element (rt.array_elem). The subscript must render with no cmdsub/
-    -- procsub — its indexed-arith vs assoc-word double path would run a subscript side effect twice.
-    local ok, sw = pcall(require("parser").parse_word, pe.index)
-    if not (ok and emitable_word(sw)) then return false end
-    for _, p in ipairs(sw.parts) do if p.cmdsub or p.procsub then return false end end
-    -- READ-ONLY ops on the element VALUE compile: bare read, length, slice, and the
-    -- strip/subst/case pattern ops. @-transform/indices/prefix/indirect keep their own paths.
-    if op == nil or op == "len" then return true end
-    if op == "@" then return PEXP_AT[pe.arg] and true or false end -- ${a[i]@Q}/@U/… (not @a/@A/@P)
-    if op == "sub" then return pexp_word_args_ok(pe) end
-    if PEXP_STROP[op] then return strop_pat_ok(pe) end
-    -- default/alternate/assign/error (${a[i]:-d} / := / ? …): Shell:expand_param does the
-    -- element set-ness test and := write-back, so reuse it — same default-word gate as scalars.
-    if PEXP_DEFAULT[op] then
-      if pe.arg and pe.arg:find("[~\\'\"]") then return false end
-      local wok, w = pcall(require("parser").parse_word, pe.arg or "")
-      return wok and emitable_word(w) or false
-    end
-    return false
-  end
-  local name = pe.name
-  if type(name) ~= "string" or not name:match("^[%a_][%w_]*$") or COMPILE_UNSAFE_VAR[name] then return false end
-  if pe.op == "len" then return true end -- ${#x}: scalar codepoint length via apply_str_op("len")
-  if pe.op == "@" then return PEXP_AT[pe.arg] and true or false end -- ${x@Q}/@U/@L/@E … (not @P/@a)
-  if PEXP_DEFAULT[pe.op] then
-    -- default/alternate/assign/error: compile when the default word is emit_word-able. The
-    -- default is lazy (Lua short-circuit). Only a QUOTED context reaches pexp_scalar
-    -- (field_word rejects an unquoted one — its field-wise default splitting needs the interp
-    -- word engine). The default word's tilde (word- vs assign-context), backslash escapes,
-    -- and inner quoting (`"${x:-'c d'}"`) differ from emit_word — reject those chars so only
-    -- a plain / $var / $(…) default (where emit_word matches interp's word expansion) compiles.
-    if pe.arg and pe.arg:find("[~\\'\"]") then return false end
-    local ok, w = pcall(require("parser").parse_word, pe.arg or "")
-    return ok and emitable_word(w) or false
-  end
-  if pe.op == "sub" then return pexp_word_args_ok(pe) end -- ${v:off:len} scalar substring
-  if PEXP_STROP[pe.op] then return strop_pat_ok(pe) end -- strip #/##/%/%% , subst /,// , case-fold ^/^^/,/,,
-  return false
+	if pe.via_indirect then
+		return false
+	end -- ${!ref} indirection (its own path)
+	if pe.index then
+		if type(pe.name) ~= "string" or not pe.name:match("^[%a_][%w_]*$") or COMPILE_UNSAFE_VAR[pe.name] then
+			return false
+		end
+		local op = pe.op
+		-- ${#a[@]} / ${#a[*]}: the array element COUNT (a scalar number via sh:array_count).
+		if pe.index == "@" or pe.index == "*" then
+			return op == "len"
+		end
+		-- ${a[sub]…}: a scalar element (rt.array_elem). The subscript must render with no cmdsub/
+		-- procsub — its indexed-arith vs assoc-word double path would run a subscript side effect twice.
+		local ok, sw = pcall(require("parser").parse_word, pe.index)
+		if not (ok and emitable_word(sw)) then
+			return false
+		end
+		for _, p in ipairs(sw.parts) do
+			if p.cmdsub or p.procsub then
+				return false
+			end
+		end
+		-- READ-ONLY ops on the element VALUE compile: bare read, length, slice, and the
+		-- strip/subst/case pattern ops. @-transform/indices/prefix/indirect keep their own paths.
+		if op == nil or op == "len" then
+			return true
+		end
+		if op == "@" then
+			return PEXP_AT[pe.arg] and true or false
+		end -- ${a[i]@Q}/@U/… (not @a/@A/@P)
+		if op == "sub" then
+			return pexp_word_args_ok(pe)
+		end
+		if PEXP_STROP[op] then
+			return strop_pat_ok(pe)
+		end
+		-- default/alternate/assign/error (${a[i]:-d} / := / ? …): Shell:expand_param does the
+		-- element set-ness test and := write-back, so reuse it — same default-word gate as scalars.
+		if PEXP_DEFAULT[op] then
+			if pe.arg and pe.arg:find("[~\\'\"]") then
+				return false
+			end
+			local wok, w = pcall(require("parser").parse_word, pe.arg or "")
+			return wok and emitable_word(w) or false
+		end
+		return false
+	end
+	local name = pe.name
+	if type(name) ~= "string" or not name:match("^[%a_][%w_]*$") or COMPILE_UNSAFE_VAR[name] then
+		return false
+	end
+	if pe.op == "len" then
+		return true
+	end -- ${#x}: scalar codepoint length via apply_str_op("len")
+	if pe.op == "@" then
+		return PEXP_AT[pe.arg] and true or false
+	end -- ${x@Q}/@U/@L/@E … (not @P/@a)
+	if PEXP_DEFAULT[pe.op] then
+		-- default/alternate/assign/error: compile when the default word is emit_word-able. The
+		-- default is lazy (Lua short-circuit). Only a QUOTED context reaches pexp_scalar
+		-- (field_word rejects an unquoted one — its field-wise default splitting needs the interp
+		-- word engine). The default word's tilde (word- vs assign-context), backslash escapes,
+		-- and inner quoting (`"${x:-'c d'}"`) differ from emit_word — reject those chars so only
+		-- a plain / $var / $(…) default (where emit_word matches interp's word expansion) compiles.
+		if pe.arg and pe.arg:find("[~\\'\"]") then
+			return false
+		end
+		local ok, w = pcall(require("parser").parse_word, pe.arg or "")
+		return ok and emitable_word(w) or false
+	end
+	if pe.op == "sub" then
+		return pexp_word_args_ok(pe)
+	end -- ${v:off:len} scalar substring
+	if PEXP_STROP[pe.op] then
+		return strop_pat_ok(pe)
+	end -- strip #/##/%/%% , subst /,// , case-fold ^/^^/,/,,
+	return false
 end
 -- ${a[@]OP} / ${a[*]OP}: a per-element string-op over the whole array, compiled by
 -- mapping apply_str_op via rt.array_op_values — exactly interp's generic per-element
@@ -1056,125 +1666,211 @@ end
 -- line is passed so a $LINENO target resolves correctly. Only the plain op=="indirect" form
 -- (a scalar/subscript ref); the ${!a[@]}-keys op=="indices" form stays with array_index_strs.
 local function indirect_ok(pe)
-  -- Exclude the array-multi indirect forms (${!a[@]-op}, ${!a[*]…}): the name resolves to a
-  -- space-joined list -> "invalid variable name", which raises; inside a compiled subshell the
-  -- fork doesn't contain that lineabort. Rare — delegate them. Scalar / [i] / $N / @ refs compile.
-  return pe.op == "indirect" and pe.index ~= "@" and pe.index ~= "*"
-    and type(pe.name) == "string" and pe.name ~= ""
+	-- Exclude the array-multi indirect forms (${!a[@]-op}, ${!a[*]…}): the name resolves to a
+	-- space-joined list -> "invalid variable name", which raises; inside a compiled subshell the
+	-- fork doesn't contain that lineabort. Rare — delegate them. Scalar / [i] / $N / @ refs compile.
+	return pe.op == "indirect" and pe.index ~= "@" and pe.index ~= "*" and type(pe.name) == "string" and pe.name ~= ""
 end
 local function array_multi_op(pe)
-  local is_arr = (pe.index == "@" or pe.index == "*") -- ${a[@]OP}: array subscript
-  local is_pos = (pe.index == nil and (pe.name == "@" or pe.name == "*")) -- ${@OP}/${*OP}: positional
-  if not (is_arr or is_pos) then return false end
-  if pe.via_indirect then return false end
-  if is_arr and (type(pe.name) ~= "string" or not pe.name:match("^[%a_][%w_]*$")) then return false end
-  if not pe.op then return true end -- bare ${a[@]} / ${a[*]} (bare $@/$* is p.special, not here)
-  if pe.op == "@" then return PEXP_AT[pe.arg] and true or false end -- ${a[@]@Q} … (not @a/@P)
-  if pe.op == "sub" then return pexp_word_args_ok(pe) end -- ${a[@]:off:len} slice
-  if ARRAY_DEFAULT[pe.op] then return pexp_word_args_ok(pe) end -- ${a[@]:-def}/-/:+/+
-  -- ${!a[@]} keys. The `*` (star) form has bash bug #627 (an empty-IFS join quirk that
-  -- rt.expand_fields does not replicate — the interp field engine does), so ${!a[*]} delegates.
-  if pe.op == "indices" then return pe.index == "@" and not pe.drop end
-  return PEXP_STROP[pe.op] and pexp_literal_arg(pe.arg) and pexp_literal_arg(pe.arg2) or false
+	local is_arr = (pe.index == "@" or pe.index == "*") -- ${a[@]OP}: array subscript
+	local is_pos = (pe.index == nil and (pe.name == "@" or pe.name == "*")) -- ${@OP}/${*OP}: positional
+	if not (is_arr or is_pos) then
+		return false
+	end
+	if pe.via_indirect then
+		return false
+	end
+	if is_arr and (type(pe.name) ~= "string" or not pe.name:match("^[%a_][%w_]*$")) then
+		return false
+	end
+	if not pe.op then
+		return true
+	end -- bare ${a[@]} / ${a[*]} (bare $@/$* is p.special, not here)
+	if pe.op == "@" then
+		return PEXP_AT[pe.arg] and true or false
+	end -- ${a[@]@Q} … (not @a/@P)
+	if pe.op == "sub" then
+		return pexp_word_args_ok(pe)
+	end -- ${a[@]:off:len} slice
+	if ARRAY_DEFAULT[pe.op] then
+		return pexp_word_args_ok(pe)
+	end -- ${a[@]:-def}/-/:+/+
+	-- ${!a[@]} keys. The `*` (star) form has bash bug #627 (an empty-IFS join quirk that
+	-- rt.expand_fields does not replicate — the interp field engine does), so ${!a[*]} delegates.
+	if pe.op == "indices" then
+		return pe.index == "@" and not pe.drop
+	end
+	return PEXP_STROP[pe.op] and pexp_literal_arg(pe.arg) and pexp_literal_arg(pe.arg2) or false
 end
 -- Lua expr for a compilable pexp's scalar string value (assumes pexp_compilable).
 function pexp_scalar(pe, lifted)
-  local val
-  if pe.index == "@" or pe.index == "*" then -- ${#a[@]}: array element COUNT (op is len, gated)
-    return ("tostring(sh:array_count(%q))"):format(pe.name)
-  elseif pe.index then -- ${name[sub]…}: read the element; a read-only op (below) then applies to it.
-    -- Pass BOTH the raw subscript (arith-evaluated for an indexed array) and its word-expanded
-    -- form (the assoc key); rt.array_elem picks per the array's type, matching interp's array_key.
-    local expanded = emit_word(require("parser").parse_word(pe.index), lifted)
-    val = ("rt.array_elem(sh, %q, %q, %s)"):format(pe.name, pe.index, expanded)
-    if pe.op == nil then return val end
-    if PEXP_DEFAULT[pe.op] then
-      -- ${a[i]:-d} / := / ? …: defer to Shell:expand_param with the resolved key and a LAZY
-      -- default-word thunk (a side-effecting default runs only when its branch is taken, and
-      -- := writes back to a[key]) — interp's exact element default/assign/error path.
-      local defthunk = ("function() return %s end"):format(emit_word(require("parser").parse_word(pe.arg or ""), lifted))
-      return ("sh:expand_param({[\"name\"]=%q,[\"index\"]=%q,[\"op\"]=%q}, %s, nil, rt.array_key(sh, %q, %q, %s))")
-        :format(pe.name, pe.index, pe.op, defthunk, pe.name, pe.index, expanded)
-    end
-    if pe.op == "@" then
-      -- ${a[i]@Q}/@U/@L/…: route via expand_param so ELEMENT set-ness (is_elem_set) decides —
-      -- an unset element yields "" (rt.at_transform would test the BASE var's set-ness instead).
-      -- The transform letter is the 3rd (arg) PARAMETER, exactly as interp calls expand_param.
-      return ("sh:expand_param({[\"name\"]=%q,[\"index\"]=%q,[\"op\"]=\"@\"}, %q, nil, rt.array_key(sh, %q, %q, %s))")
-        :format(pe.name, pe.index, pe.arg, pe.name, pe.index, expanded)
-    end
-  else
-    val = lifted[pe.name] and ("rt.i64_to_str(%s)"):format(lname(pe.name))
-      or ("sh:get_u(%q)"):format(pe.name) -- get_u: an unset var trips set -u, like bash
-  end
-  if pe.op == "len" then return ("tostring(rt.mb_strlen(%s))"):format(val) end -- ${#x}: codepoint length
-  if pe.op == "@" then return ("rt.at_transform(sh, %q, %s, %q)"):format(pe.name, val, pe.arg) end -- unset-aware transform
-  if PEXP_DEFAULT[pe.op] then
-    -- default/alternate/assign/error (SCALAR/quoted context). `getv` uses sh:get (set -u
-    -- exempt); the default word is expanded lazily via Lua short-circuit (a side-effecting
-    -- $(…) default runs only when its branch is taken). - / + test set-ness, :- / :+ test
-    -- non-emptiness.
-    local def = emit_word(require("parser").parse_word(pe.arg or ""), lifted)
-    local getv = lifted[pe.name] and ("rt.i64_to_str(%s)"):format(lname(pe.name)) or ("sh:get(%q)"):format(pe.name)
-    if pe.op == ":-" then return ("(function() local __d = %s; return __d ~= \"\" and __d or %s end)()"):format(getv, def) end
-    if pe.op == ":+" then return ("(function() local __d = %s; return __d ~= \"\" and %s or \"\" end)()"):format(getv, def) end
-    if pe.op == "-" then return ("(rt.var_has_value(sh, %q) and %s or %s)"):format(pe.name, getv, def) end
-    if pe.op == "+" then return ("(rt.var_has_value(sh, %q) and %s or \"\")"):format(pe.name, def) end
-    -- :=/= assign the default to the var (side effect) and return it; :?/? error out.
-    if pe.op == ":=" then return ("(function() local __d = %s; return __d ~= \"\" and __d or rt.assign_default(sh, %q, %s) end)()"):format(getv, pe.name, def) end
-    if pe.op == "=" then return ("(rt.var_has_value(sh, %q) and %s or rt.assign_default(sh, %q, %s))"):format(pe.name, getv, pe.name, def) end
-    if pe.op == ":?" then return ("(function() local __d = %s; return __d ~= \"\" and __d or rt.param_error(sh, %q, %s) end)()"):format(getv, pe.name, def) end
-    return ("(rt.var_has_value(sh, %q) and %s or rt.param_error(sh, %q, %s))"):format(pe.name, getv, pe.name, def) -- ?
-  end
-  if pe.op == "sub" then -- ${v:off:len}: arith-eval off/len (nil-coerced to 0 for a present
-    -- operand, like interp), then substr by codepoint via apply_str_op("sub").
-    local P = require("parser")
-    local off = ("(rt.arith_int(sh, %s) or 0)"):format(emit_word(P.parse_word(pe.arg or ""), lifted))
-    if pe.arg2 == nil then return ("sh:apply_str_op(\"sub\", %s, %s)"):format(val, off) end
-    local len = ("(rt.arith_int(sh, %s) or 0)"):format(emit_word(P.parse_word(pe.arg2), lifted))
-    return ("sh:apply_str_op(\"sub\", %s, %s, %s)"):format(val, off, len)
-  end
-  -- strip/subst/case (PEXP_STROP): a plain literal pattern is passed verbatim (apply_str_op
-  -- globs it); a dynamic/quoted pattern is rendered mask-aware via emit_pattern_glob to the
-  -- expanded glob string. Replacement (arg2) is literal (pexp_compilable gated it).
-  if not pexp_literal_arg(pe.arg) then
-    return ("sh:apply_str_op(%q, %s, %s, %q)"):format(pe.op, val, emit_pattern_glob(pe.arg or "", lifted), pe.arg2 or "")
-  end
-  return ("sh:apply_str_op(%q, %s, %q, %q)"):format(pe.op, val, pe.arg or "", pe.arg2 or "")
+	local val
+	if pe.index == "@" or pe.index == "*" then -- ${#a[@]}: array element COUNT (op is len, gated)
+		return ("tostring(sh:array_count(%q))"):format(pe.name)
+	elseif pe.index then -- ${name[sub]…}: read the element; a read-only op (below) then applies to it.
+		-- Pass BOTH the raw subscript (arith-evaluated for an indexed array) and its word-expanded
+		-- form (the assoc key); rt.array_elem picks per the array's type, matching interp's array_key.
+		local expanded = emit_word(require("parser").parse_word(pe.index), lifted)
+		val = ("rt.array_elem(sh, %q, %q, %s)"):format(pe.name, pe.index, expanded)
+		if pe.op == nil then
+			return val
+		end
+		if PEXP_DEFAULT[pe.op] then
+			-- ${a[i]:-d} / := / ? …: defer to Shell:expand_param with the resolved key and a LAZY
+			-- default-word thunk (a side-effecting default runs only when its branch is taken, and
+			-- := writes back to a[key]) — interp's exact element default/assign/error path.
+			local defthunk = ("function() return %s end"):format(
+				emit_word(require("parser").parse_word(pe.arg or ""), lifted)
+			)
+			return ('sh:expand_param({["name"]=%q,["index"]=%q,["op"]=%q}, %s, nil, rt.array_key(sh, %q, %q, %s))'):format(
+				pe.name,
+				pe.index,
+				pe.op,
+				defthunk,
+				pe.name,
+				pe.index,
+				expanded
+			)
+		end
+		if pe.op == "@" then
+			-- ${a[i]@Q}/@U/@L/…: route via expand_param so ELEMENT set-ness (is_elem_set) decides —
+			-- an unset element yields "" (rt.at_transform would test the BASE var's set-ness instead).
+			-- The transform letter is the 3rd (arg) PARAMETER, exactly as interp calls expand_param.
+			return ('sh:expand_param({["name"]=%q,["index"]=%q,["op"]="@"}, %q, nil, rt.array_key(sh, %q, %q, %s))'):format(
+				pe.name,
+				pe.index,
+				pe.arg,
+				pe.name,
+				pe.index,
+				expanded
+			)
+		end
+	else
+		val = lifted[pe.name] and ("rt.i64_to_str(%s)"):format(lname(pe.name)) or ("sh:get_u(%q)"):format(pe.name) -- get_u: an unset var trips set -u, like bash
+	end
+	if pe.op == "len" then
+		return ("tostring(rt.mb_strlen(%s))"):format(val)
+	end -- ${#x}: codepoint length
+	if pe.op == "@" then
+		return ("rt.at_transform(sh, %q, %s, %q)"):format(pe.name, val, pe.arg)
+	end -- unset-aware transform
+	if PEXP_DEFAULT[pe.op] then
+		-- default/alternate/assign/error (SCALAR/quoted context). `getv` uses sh:get (set -u
+		-- exempt); the default word is expanded lazily via Lua short-circuit (a side-effecting
+		-- $(…) default runs only when its branch is taken). - / + test set-ness, :- / :+ test
+		-- non-emptiness.
+		local def = emit_word(require("parser").parse_word(pe.arg or ""), lifted)
+		local getv = lifted[pe.name] and ("rt.i64_to_str(%s)"):format(lname(pe.name)) or ("sh:get(%q)"):format(pe.name)
+		if pe.op == ":-" then
+			return ('(function() local __d = %s; return __d ~= "" and __d or %s end)()'):format(getv, def)
+		end
+		if pe.op == ":+" then
+			return ('(function() local __d = %s; return __d ~= "" and %s or "" end)()'):format(getv, def)
+		end
+		if pe.op == "-" then
+			return ("(rt.var_has_value(sh, %q) and %s or %s)"):format(pe.name, getv, def)
+		end
+		if pe.op == "+" then
+			return ('(rt.var_has_value(sh, %q) and %s or "")'):format(pe.name, def)
+		end
+		-- :=/= assign the default to the var (side effect) and return it; :?/? error out.
+		if pe.op == ":=" then
+			return ('(function() local __d = %s; return __d ~= "" and __d or rt.assign_default(sh, %q, %s) end)()'):format(
+				getv,
+				pe.name,
+				def
+			)
+		end
+		if pe.op == "=" then
+			return ("(rt.var_has_value(sh, %q) and %s or rt.assign_default(sh, %q, %s))"):format(
+				pe.name,
+				getv,
+				pe.name,
+				def
+			)
+		end
+		if pe.op == ":?" then
+			return ('(function() local __d = %s; return __d ~= "" and __d or rt.param_error(sh, %q, %s) end)()'):format(
+				getv,
+				pe.name,
+				def
+			)
+		end
+		return ("(rt.var_has_value(sh, %q) and %s or rt.param_error(sh, %q, %s))"):format(pe.name, getv, pe.name, def) -- ?
+	end
+	if pe.op == "sub" then -- ${v:off:len}: arith-eval off/len (nil-coerced to 0 for a present
+		-- operand, like interp), then substr by codepoint via apply_str_op("sub").
+		local P = require("parser")
+		local off = ("(rt.arith_int(sh, %s) or 0)"):format(emit_word(P.parse_word(pe.arg or ""), lifted))
+		if pe.arg2 == nil then
+			return ('sh:apply_str_op("sub", %s, %s)'):format(val, off)
+		end
+		local len = ("(rt.arith_int(sh, %s) or 0)"):format(emit_word(P.parse_word(pe.arg2), lifted))
+		return ('sh:apply_str_op("sub", %s, %s, %s)'):format(val, off, len)
+	end
+	-- strip/subst/case (PEXP_STROP): a plain literal pattern is passed verbatim (apply_str_op
+	-- globs it); a dynamic/quoted pattern is rendered mask-aware via emit_pattern_glob to the
+	-- expanded glob string. Replacement (arg2) is literal (pexp_compilable gated it).
+	if not pexp_literal_arg(pe.arg) then
+		return ("sh:apply_str_op(%q, %s, %s, %q)"):format(
+			pe.op,
+			val,
+			emit_pattern_glob(pe.arg or "", lifted),
+			pe.arg2 or ""
+		)
+	end
+	return ("sh:apply_str_op(%q, %s, %q, %q)"):format(pe.op, val, pe.arg or "", pe.arg2 or "")
 end
 
 local function field_word(w, lifted)
-  if not emitable_word(w) then return nil end
-  if #w.parts == 0 then return nil end
-  -- Scalar fast path (compile-time decision): a lone arith result or lifted-int64
-  -- var always renders to a numeric string — no IFS/glob chars — so it is provably
-  -- a SINGLE field. Skip the runtime split+glob entirely (one table entry, no alloc).
-  if #w.parts == 1 then
-    local p = w.parts[1]
-    if not p.q and (p.arith or p.arithast or (p.var and lifted[p.var])) then
-      return { expr = emit_word(w, lifted), scalar = true }
-    end
-  end
-  local allexp, alllit, hasglob = true, true, false
-  for _, p in ipairs(w.parts) do
-    if p.q then return nil end                 -- a quoted part needs the mask
-    if p.special then return nil end           -- @/*/$?/... handled elsewhere
-    if p.var and (COMPILE_UNSAFE_VAR[p.var] and p.var ~= "LINENO") then return nil end -- $LINENO/$_/… → interp
-    -- unquoted ${x:-word}: the taken branch (value or default) becomes the scalar value,
-    -- then the outer field_split splits+globs it — pexp_compilable already gates the default
-    -- to an emit_word-able word free of ~ \ ' " (quoted/multi/$* defaults, where field-wise
-    -- expansion would differ, delegate), so scalar-value + split matches interp's field-wise.
-    if p.var or p.param or p.cmdsub or p.arith or p.arithast or p.pexp then alllit = false
-    elseif p.lit then
-      allexp = false
-      if p.lit:find("[*?%[]") or p.lit:find("[@!+?*]%(") then hasglob = true end -- glob / extglob
-    else return nil end
-  end
-  if allexp then return { expr = emit_word(w, lifted), split = true } end -- $x / $x$y
-  if alllit and hasglob then
-    return { expr = emit_word(w, lifted), split = false } -- *.txt (emit_word tilde-expands a leading ~)
-  end
-  return nil
+	if not emitable_word(w) then
+		return nil
+	end
+	if #w.parts == 0 then
+		return nil
+	end
+	-- Scalar fast path (compile-time decision): a lone arith result or lifted-int64
+	-- var always renders to a numeric string — no IFS/glob chars — so it is provably
+	-- a SINGLE field. Skip the runtime split+glob entirely (one table entry, no alloc).
+	if #w.parts == 1 then
+		local p = w.parts[1]
+		if not p.q and (p.arith or p.arithast or (p.var and lifted[p.var])) then
+			return { expr = emit_word(w, lifted), scalar = true }
+		end
+	end
+	local allexp, alllit, hasglob = true, true, false
+	for _, p in ipairs(w.parts) do
+		if p.q then
+			return nil
+		end -- a quoted part needs the mask
+		if p.special then
+			return nil
+		end -- @/*/$?/... handled elsewhere
+		if p.var and (COMPILE_UNSAFE_VAR[p.var] and p.var ~= "LINENO") then
+			return nil
+		end -- $LINENO/$_/… → interp
+		-- unquoted ${x:-word}: the taken branch (value or default) becomes the scalar value,
+		-- then the outer field_split splits+globs it — pexp_compilable already gates the default
+		-- to an emit_word-able word free of ~ \ ' " (quoted/multi/$* defaults, where field-wise
+		-- expansion would differ, delegate), so scalar-value + split matches interp's field-wise.
+		if p.var or p.param or p.cmdsub or p.arith or p.arithast or p.pexp then
+			alllit = false
+		elseif p.lit then
+			allexp = false
+			if p.lit:find("[*?%[]") or p.lit:find("[@!+?*]%(") then
+				hasglob = true
+			end -- glob / extglob
+		else
+			return nil
+		end
+	end
+	if allexp then
+		return { expr = emit_word(w, lifted), split = true }
+	end -- $x / $x$y
+	if alllit and hasglob then
+		return { expr = emit_word(w, lifted), split = false } -- *.txt (emit_word tilde-expands a leading ~)
+	end
+	return nil
 end
 
 -- Forward: mixed_expandable and seg_native are defined just below, but the mixed
@@ -1185,25 +1881,35 @@ local mixed_expandable, seg_native
 -- computation as emit_word, restricted to the scalar subset seg_native admits.
 -- `tilde` enables word-initial ~ expansion for an unquoted literal at part index 1.
 local function emit_scalar_val(p, i, lifted, tilde)
-  if p.lit ~= nil then
-    if tilde and i == 1 and (p.lit:sub(1, 1) == "~"
-        or (p.lit:find("~", 1, true) and p.lit:match("^[%a_][%w_]*%+?=") ~= nil)) then
-      return ("rt.tilde_word_initial(sh, %q)"):format(p.lit)
-    end
-    return ("%q"):format(p.lit)
-  elseif p.raw then return p.raw
-  elseif p.var == "LINENO" then -- $LINENO: its value is the current source line, known at compile time
-    return ("%q"):format(tostring(EF.cur_line or 0))
-  elseif p.var then
-    return EF.has_nameref and ("rt.nameref_read(sh, %q)"):format(p.var)
-      or lifted[p.var] and ("rt.i64_to_str(%s)"):format(lname(p.var)) or ("sh:get_u(%q)"):format(p.var)
-  elseif p.param then return ("sh:param(%d)"):format(p.param)
-  elseif p.special == "#" then return "tostring(sh.nparams)"
-  elseif p.special == "?" then return "tostring(sh.status)"
-  elseif p.special == "$" then return "tostring(sh:pid())"
-  elseif p.special == "!" then return '(sh.last_bg_pid or "")'
-  end
-  error("curse-nocompile: mixed-word segment") -- unreachable given seg_native
+	if p.lit ~= nil then
+		if
+			tilde
+			and i == 1
+			and (p.lit:sub(1, 1) == "~" or (p.lit:find("~", 1, true) and p.lit:match("^[%a_][%w_]*%+?=") ~= nil))
+		then
+			return ("rt.tilde_word_initial(sh, %q)"):format(p.lit)
+		end
+		return ("%q"):format(p.lit)
+	elseif p.raw then
+		return p.raw
+	elseif p.var == "LINENO" then -- $LINENO: its value is the current source line, known at compile time
+		return ("%q"):format(tostring(EF.cur_line or 0))
+	elseif p.var then
+		return EF.has_nameref and ("rt.nameref_read(sh, %q)"):format(p.var)
+			or lifted[p.var] and ("rt.i64_to_str(%s)"):format(lname(p.var))
+			or ("sh:get_u(%q)"):format(p.var)
+	elseif p.param then
+		return ("sh:param(%d)"):format(p.param)
+	elseif p.special == "#" then
+		return "tostring(sh.nparams)"
+	elseif p.special == "?" then
+		return "tostring(sh.status)"
+	elseif p.special == "$" then
+		return "tostring(sh:pid())"
+	elseif p.special == "!" then
+		return '(sh.last_bg_pid or "")'
+	end
+	error("curse-nocompile: mixed-word segment") -- unreachable given seg_native
 end
 
 -- Render one part to a segment literal {s=<value>, split=<bool>, unq=<bool>} for
@@ -1212,112 +1918,149 @@ end
 --   unquoted literal  -> add(s, true):  glob-active, no split (word-initial ~)
 --   unquoted $expand  -> feed_split(s): word-split on $IFS, then glob each field
 local function emit_seg(p, i, lifted)
-  if p.special == "@" or p.special == "*" then -- $@ / $*: a multi-element segment
-    return ("{multi=true,star=%s,q=%s,elems=sh:paramList()}"):format(
-      tostring(p.special == "*"), tostring(p.q or false))
-  end
-  if p.pexp and p.pexp.op == "indirect" then -- ${!ref}: runtime-resolved (bootstrap) multi-segment
-    local pe = p.pexp -- q = the outer quoting OR a quoted multi alternate's forced quoting (__qf)
-    return ("(function() local __e, __s, __qf = rt.indirect_elems(sh, %q, %s, %s, %s, %d); return {multi=true,star=__s,q=(%s or __qf),elems=__e} end)()")
-      :format(pe.name, pe.index and ("%q"):format(pe.index) or "nil",
-        pe.iop and ("%q"):format(pe.iop) or "nil", tostring(p.q or false), EF.cur_line or 0, tostring(p.q or false))
-  end
-  if p.pexp and p.pexp.op == "prefix" then -- ${!pre@}: the set of variable NAMES with the prefix,
-    -- as a multi-element segment (each name its own field) — interp's var_prefix_names. The `*`
-    -- form (${!pre*}) is gated out upstream (bug #627 empty-IFS join quirk, like ${!a[*]}).
-    return ("{multi=true,star=false,q=%s,elems=sh:var_prefix_names(%q)}")
-      :format(tostring(p.q or false), p.pexp.name)
-  end
-  if p.pexp and pexp_compilable(p.pexp) then -- scalar ${..} op: len/subst/strip/default/@Q/substring
-    -- A SCALAR string operation renders to one value via pexp_scalar (the same expr emit_word
-    -- uses). Quoted -> a literal segment (no split/glob); unquoted -> its value word-splits on
-    -- $IFS then globs, exactly like a bare $x (the default word is gated simple by pexp_compilable).
-    local s = pexp_scalar(p.pexp, lifted)
-    if p.q then return ("{s=%s,split=false,unq=false}"):format(s) end
-    return ("{s=%s,split=true,unq=true}"):format(s)
-  end
-  if p.pexp then -- ${a[@]} / ${a[*]}: array elements as a multi-element segment (gated)
-    local pe = p.pexp
-    local positional = (pe.name == "@" or pe.name == "*") -- ${@OP}/${*OP} vs ${a[@]OP}
-    -- Element source: positional params ($1.. — plus $0 for a slice, whose offset is
-    -- indexed) or the array's values.
-    local elems = positional
-      and (pe.op == "sub" and "sh:paramListSub()" or "sh:paramList()")
-      or ("sh:array_values(%q)"):format(pe.name)
-    if pe.op == "indices" then -- ${!a[@]}: the keys/indices, not the values
-      elems = ("rt.array_index_strs(sh, %q)"):format(pe.name)
-    elseif pe.op == "sub" then -- ${a[@]:off:len} / ${@:off:len} slice: arith off/len, then select
-      local P = require("parser")
-      local off = ("(rt.arith_int(sh, %s) or 0)"):format(emit_word(P.parse_word(pe.arg or ""), lifted))
-      local len = pe.arg2 and ("(rt.arith_int(sh, %s) or 0)"):format(emit_word(P.parse_word(pe.arg2), lifted)) or "nil"
-      elems = ("rt.array_slice_values(sh, %q, %s, %s, %s)"):format(pe.name, elems, off, len)
-    elseif ARRAY_DEFAULT[pe.op] then -- ${a[@]:-def}/-/:+/+ : the value list, or the default
-      -- as a SINGLE field (rt.expand_fields then splits/keeps it per the outer q, exactly
-      -- bash's field-wise default). null test grounded in bash string_list_dollar_at/_star:
-      -- [@]/unquoted-[*] join with a non-empty sep (== #els>1 or els[1] non-empty); quoted
-      -- [*] joins with IFS[0] (can be empty) -> rt.ifs_join_ne. -/+ test element count.
-      local P = require("parser")
-      local def = emit_word(P.parse_word(pe.arg or ""), lifted)
-      local ne = ((pe.index == "*" or pe.name == "*") and p.q)
-        and "rt.ifs_join_ne(sh, __e)"
-        or "(#__e > 1 or (__e[1] ~= nil and __e[1] ~= \"\"))"
-      local body
-      if pe.op == "-" then body = ("if #__e > 0 then return __e else return {%s} end"):format(def)
-      elseif pe.op == ":-" then body = ("if %s then return __e else return {%s} end"):format(ne, def)
-      elseif pe.op == "+" then body = ("if #__e > 0 then return {%s} else return {} end"):format(def)
-      else body = ("if %s then return {%s} else return {} end"):format(ne, def) end -- :+
-      elems = ("(function() local __e = %s; %s end)()"):format(elems, body)
-    elseif pe.op then -- per-element string-op (strip/subst/case/@Q…): map apply_str_op
-      elems = ("rt.array_op_values(sh, %s, %q, %q, %q)"):format(elems, pe.op, pe.arg or "", pe.arg2 or "")
-    end
-    return ("{multi=true,star=%s,q=%s,elems=%s}"):format(
-      tostring(pe.index == "*" or pe.name == "*"), tostring(p.q or false), elems)
-  end
-  if p.q then
-    return ("{s=%s,split=false,unq=false}"):format(emit_scalar_val(p, i, lifted, false))
-  elseif p.lit ~= nil then
-    return ("{s=%s,split=false,unq=true}"):format(emit_scalar_val(p, i, lifted, true))
-  end
-  return ("{s=%s,split=true,unq=true}"):format(emit_scalar_val(p, i, lifted, false))
+	if p.special == "@" or p.special == "*" then -- $@ / $*: a multi-element segment
+		return ("{multi=true,star=%s,q=%s,elems=sh:paramList()}"):format(
+			tostring(p.special == "*"),
+			tostring(p.q or false)
+		)
+	end
+	if p.pexp and p.pexp.op == "indirect" then -- ${!ref}: runtime-resolved (bootstrap) multi-segment
+		local pe = p.pexp -- q = the outer quoting OR a quoted multi alternate's forced quoting (__qf)
+		return ("(function() local __e, __s, __qf = rt.indirect_elems(sh, %q, %s, %s, %s, %d); return {multi=true,star=__s,q=(%s or __qf),elems=__e} end)()"):format(
+			pe.name,
+			pe.index and ("%q"):format(pe.index) or "nil",
+			pe.iop and ("%q"):format(pe.iop) or "nil",
+			tostring(p.q or false),
+			EF.cur_line or 0,
+			tostring(p.q or false)
+		)
+	end
+	if p.pexp and p.pexp.op == "prefix" then -- ${!pre@}: the set of variable NAMES with the prefix,
+		-- as a multi-element segment (each name its own field) — interp's var_prefix_names. The `*`
+		-- form (${!pre*}) is gated out upstream (bug #627 empty-IFS join quirk, like ${!a[*]}).
+		return ("{multi=true,star=false,q=%s,elems=sh:var_prefix_names(%q)}"):format(
+			tostring(p.q or false),
+			p.pexp.name
+		)
+	end
+	if p.pexp and pexp_compilable(p.pexp) then -- scalar ${..} op: len/subst/strip/default/@Q/substring
+		-- A SCALAR string operation renders to one value via pexp_scalar (the same expr emit_word
+		-- uses). Quoted -> a literal segment (no split/glob); unquoted -> its value word-splits on
+		-- $IFS then globs, exactly like a bare $x (the default word is gated simple by pexp_compilable).
+		local s = pexp_scalar(p.pexp, lifted)
+		if p.q then
+			return ("{s=%s,split=false,unq=false}"):format(s)
+		end
+		return ("{s=%s,split=true,unq=true}"):format(s)
+	end
+	if p.pexp then -- ${a[@]} / ${a[*]}: array elements as a multi-element segment (gated)
+		local pe = p.pexp
+		local positional = (pe.name == "@" or pe.name == "*") -- ${@OP}/${*OP} vs ${a[@]OP}
+		-- Element source: positional params ($1.. — plus $0 for a slice, whose offset is
+		-- indexed) or the array's values.
+		local elems = positional and (pe.op == "sub" and "sh:paramListSub()" or "sh:paramList()")
+			or ("sh:array_values(%q)"):format(pe.name)
+		if pe.op == "indices" then -- ${!a[@]}: the keys/indices, not the values
+			elems = ("rt.array_index_strs(sh, %q)"):format(pe.name)
+		elseif pe.op == "sub" then -- ${a[@]:off:len} / ${@:off:len} slice: arith off/len, then select
+			local P = require("parser")
+			local off = ("(rt.arith_int(sh, %s) or 0)"):format(emit_word(P.parse_word(pe.arg or ""), lifted))
+			local len = pe.arg2 and ("(rt.arith_int(sh, %s) or 0)"):format(emit_word(P.parse_word(pe.arg2), lifted))
+				or "nil"
+			elems = ("rt.array_slice_values(sh, %q, %s, %s, %s)"):format(pe.name, elems, off, len)
+		elseif ARRAY_DEFAULT[pe.op] then -- ${a[@]:-def}/-/:+/+ : the value list, or the default
+			-- as a SINGLE field (rt.expand_fields then splits/keeps it per the outer q, exactly
+			-- bash's field-wise default). null test grounded in bash string_list_dollar_at/_star:
+			-- [@]/unquoted-[*] join with a non-empty sep (== #els>1 or els[1] non-empty); quoted
+			-- [*] joins with IFS[0] (can be empty) -> rt.ifs_join_ne. -/+ test element count.
+			local P = require("parser")
+			local def = emit_word(P.parse_word(pe.arg or ""), lifted)
+			local ne = ((pe.index == "*" or pe.name == "*") and p.q) and "rt.ifs_join_ne(sh, __e)"
+				or '(#__e > 1 or (__e[1] ~= nil and __e[1] ~= ""))'
+			local body
+			if pe.op == "-" then
+				body = ("if #__e > 0 then return __e else return {%s} end"):format(def)
+			elseif pe.op == ":-" then
+				body = ("if %s then return __e else return {%s} end"):format(ne, def)
+			elseif pe.op == "+" then
+				body = ("if #__e > 0 then return {%s} else return {} end"):format(def)
+			else
+				body = ("if %s then return {%s} else return {} end"):format(ne, def)
+			end -- :+
+			elems = ("(function() local __e = %s; %s end)()"):format(elems, body)
+		elseif pe.op then -- per-element string-op (strip/subst/case/@Q…): map apply_str_op
+			elems = ("rt.array_op_values(sh, %s, %q, %q, %q)"):format(elems, pe.op, pe.arg or "", pe.arg2 or "")
+		end
+		return ("{multi=true,star=%s,q=%s,elems=%s}"):format(
+			tostring(pe.index == "*" or pe.name == "*"),
+			tostring(p.q or false),
+			elems
+		)
+	end
+	if p.q then
+		return ("{s=%s,split=false,unq=false}"):format(emit_scalar_val(p, i, lifted, false))
+	elseif p.lit ~= nil then
+		return ("{s=%s,split=false,unq=true}"):format(emit_scalar_val(p, i, lifted, true))
+	end
+	return ("{s=%s,split=true,unq=true}"):format(emit_scalar_val(p, i, lifted, false))
 end
 
 -- Emit statement(s) appending word `w`'s final field(s) to Lua table `tbl`. A
 -- word_safe word contributes one field (emit_word); a field_word splits+globs at
 -- runtime via rt.field_split. `wrap` (e.g. "rt.cstr(%s)") wraps each final field.
 local function emit_fields_into(tbl, w, lifted, wrap)
-  local function W(x) return wrap and wrap:format(x) or x end
-  local fw = not word_safe(w) and field_word(w, lifted)
-  if word_safe(w) or (fw and fw.scalar) then -- one field, no runtime split/glob
-    return ("%s[#%s+1] = %s"):format(tbl, tbl, W(word_safe(w) and emit_word(w, lifted) or fw.expr))
-  end
-  if fw then
-    return ("do local __f = rt.field_split(sh, %s, %s); for __i=1,#__f do %s[#%s+1]=%s end end")
-      :format(fw.expr, tostring(fw.split), tbl, tbl, W("__f[__i]"))
-  end
-  -- A mixed word whose every part emit_seg can render (literal/quoted, `$x`/`$?`/param,
-  -- and $@/$* as a multi-element segment — none of the raise-y expansions
-  -- mixed_expandable excludes): compile each part's VALUE and hand the segments to
-  -- rt.expand_fields, which does the mask-aware split+glob at runtime. Genuine
-  -- compilation — no interp field engine. Lifted operands are read straight from the
-  -- native i64 local (no sh flush needed).
-  if seg_native(w, lifted) then
-    local segs = {}
-    for i, p in ipairs(w.parts) do segs[#segs + 1] = emit_seg(p, i, lifted) end
-    return ("do local __f = rt.expand_fields(sh, {%s}); for __i=1,#__f do %s[#%s+1]=%s end end")
-      :format(table.concat(segs, ", "), tbl, tbl, W("__f[__i]"))
-  end
-  -- Anything left (e.g. a word with a `${##}` length-op part): expand with the SHARED
-  -- field engine. Flush any LIFTED operand to sh first (a native i64 local isn't visible
-  -- there — command args only READ vars, so no reload). A runtime call like rt.field_split.
-  local flush, seen = {}, {}
-  for _, p in ipairs(w.parts) do
-    if p.var and lifted[p.var] and not seen[p.var] then
-      seen[p.var] = true; flush[#flush + 1] = ("sh:aset(%q, %s)"):format(p.var, lname(p.var))
-    end
-  end
-  local pre = #flush > 0 and (table.concat(flush, "; ") .. "; ") or ""
-  return ("do %slocal __f = I.expand_to_fields(sh, %s); for __i=1,#__f do %s[#%s+1]=%s end end")
-    :format(pre, ser(w), tbl, tbl, W("__f[__i]"))
+	local function W(x)
+		return wrap and wrap:format(x) or x
+	end
+	local fw = not word_safe(w) and field_word(w, lifted)
+	if word_safe(w) or (fw and fw.scalar) then -- one field, no runtime split/glob
+		return ("%s[#%s+1] = %s"):format(tbl, tbl, W(word_safe(w) and emit_word(w, lifted) or fw.expr))
+	end
+	if fw then
+		return ("do local __f = rt.field_split(sh, %s, %s); for __i=1,#__f do %s[#%s+1]=%s end end"):format(
+			fw.expr,
+			tostring(fw.split),
+			tbl,
+			tbl,
+			W("__f[__i]")
+		)
+	end
+	-- A mixed word whose every part emit_seg can render (literal/quoted, `$x`/`$?`/param,
+	-- and $@/$* as a multi-element segment — none of the raise-y expansions
+	-- mixed_expandable excludes): compile each part's VALUE and hand the segments to
+	-- rt.expand_fields, which does the mask-aware split+glob at runtime. Genuine
+	-- compilation — no interp field engine. Lifted operands are read straight from the
+	-- native i64 local (no sh flush needed).
+	if seg_native(w, lifted) then
+		local segs = {}
+		for i, p in ipairs(w.parts) do
+			segs[#segs + 1] = emit_seg(p, i, lifted)
+		end
+		return ("do local __f = rt.expand_fields(sh, {%s}); for __i=1,#__f do %s[#%s+1]=%s end end"):format(
+			table.concat(segs, ", "),
+			tbl,
+			tbl,
+			W("__f[__i]")
+		)
+	end
+	-- Anything left (e.g. a word with a `${##}` length-op part): expand with the SHARED
+	-- field engine. Flush any LIFTED operand to sh first (a native i64 local isn't visible
+	-- there — command args only READ vars, so no reload). A runtime call like rt.field_split.
+	local flush, seen = {}, {}
+	for _, p in ipairs(w.parts) do
+		if p.var and lifted[p.var] and not seen[p.var] then
+			seen[p.var] = true
+			flush[#flush + 1] = ("sh:aset(%q, %s)"):format(p.var, lname(p.var))
+		end
+	end
+	local pre = #flush > 0 and (table.concat(flush, "; ") .. "; ") or ""
+	return ("do %slocal __f = I.expand_to_fields(sh, %s); for __i=1,#__f do %s[#%s+1]=%s end end"):format(
+		pre,
+		ser(w),
+		tbl,
+		tbl,
+		W("__f[__i]")
+	)
 end
 
 -- A word the shared field engine (I.expand_to_fields) can expand safely from the
@@ -1327,19 +2070,35 @@ end
 -- CFG-unreproducible special ($LINENO/$_). Plain literal+var+param+$@/$* words qualify —
 -- exactly the mixed shapes (`foo$x`, `$x.txt`, `x$@y`) that field_word can't render.
 function mixed_expandable(w, lifted)
-  for _, p in ipairs(w.parts) do
-    if p.arith or p.arithast or p.cmdsub or p.procsub then return false end
-    -- In a nameref program a ${…}-OP read may deref an element-nameref (which the
-    -- native pexp renderers do not handle): delegate any pexp. A plain var part is
-    -- fine — it renders via rt.nameref_read (emit_scalar_val).
-    if EF.has_nameref and p.pexp then return false end
-    -- a bare ${a[@]}/${a[*]} array expansion is a multi-element segment seg_native renders;
-    -- a scalar ${..} op (len/subst/strip/default/substring/@Q) renders via pexp_scalar; the
-    -- ${!ref} indirect via the bootstrap. Anything else (a non-compilable ${…}) still delegates.
-    if p.pexp and not (array_multi_op(p.pexp) or indirect_ok(p.pexp) or pexp_compilable(p.pexp) or (p.pexp.op == "prefix" and not p.pexp.star)) then return false end
-    if p.var and (COMPILE_UNSAFE_VAR[p.var] and p.var ~= "LINENO") then return false end
-  end
-  return true
+	for _, p in ipairs(w.parts) do
+		if p.arith or p.arithast or p.cmdsub or p.procsub then
+			return false
+		end
+		-- In a nameref program a ${…}-OP read may deref an element-nameref (which the
+		-- native pexp renderers do not handle): delegate any pexp. A plain var part is
+		-- fine — it renders via rt.nameref_read (emit_scalar_val).
+		if EF.has_nameref and p.pexp then
+			return false
+		end
+		-- a bare ${a[@]}/${a[*]} array expansion is a multi-element segment seg_native renders;
+		-- a scalar ${..} op (len/subst/strip/default/substring/@Q) renders via pexp_scalar; the
+		-- ${!ref} indirect via the bootstrap. Anything else (a non-compilable ${…}) still delegates.
+		if
+			p.pexp
+			and not (
+				array_multi_op(p.pexp)
+				or indirect_ok(p.pexp)
+				or pexp_compilable(p.pexp)
+				or (p.pexp.op == "prefix" and not p.pexp.star)
+			)
+		then
+			return false
+		end
+		if p.var and (COMPILE_UNSAFE_VAR[p.var] and p.var ~= "LINENO") then
+			return false
+		end
+	end
+	return true
 end
 -- A mixed word whose EVERY part emit_seg can render: these compile to rt.expand_fields
 -- (native split+glob) rather than delegating to the interp field engine. This is an
@@ -1349,17 +2108,33 @@ end
 -- pexp/cmdsub/arith/arithast/procsub (raise-y or non-scalar), namerefs, and any
 -- CFG-unreproducible special ($LINENO/$_/…).
 function seg_native(w, lifted)
-  for _, p in ipairs(w.parts) do
-    if p.lenof then return false end -- ${#x}/${##}: length, not the plain value
-    if p.lit ~= nil or p.raw then -- literal text / inlined-param string: ok
-    elseif p.var then if (COMPILE_UNSAFE_VAR[p.var] and p.var ~= "LINENO") then return false end -- a nameref-program var reads via rt.nameref_read (emit_scalar_val)
-    elseif p.param then -- $1..$9 positional: ok
-    elseif p.special == "#" or p.special == "?" or p.special == "$" or p.special == "!" then -- scalar specials
-    elseif p.special == "@" or p.special == "*" then -- $@/$*: multi-element (emit_seg renders it)
-    elseif not EF.has_nameref and p.pexp and (array_multi_op(p.pexp) or indirect_ok(p.pexp) or pexp_compilable(p.pexp) or (p.pexp.op == "prefix" and not p.pexp.star)) then -- ${a[@]}, ${!ref}, scalar ${..} op, or ${!pre@} name-prefix (a ${…}-OP may deref an element-nameref: delegate in nameref programs)
-    else return false end -- other pexp, cmdsub, arith, procsub, or anything unknown
-  end
-  return true
+	for _, p in ipairs(w.parts) do
+		if p.lenof then
+			return false
+		end -- ${#x}/${##}: length, not the plain value
+		if p.lit ~= nil or p.raw then -- literal text / inlined-param string: ok
+		elseif p.var then
+			if COMPILE_UNSAFE_VAR[p.var] and p.var ~= "LINENO" then
+				return false
+			end -- a nameref-program var reads via rt.nameref_read (emit_scalar_val)
+		elseif p.param then -- $1..$9 positional: ok
+		elseif p.special == "#" or p.special == "?" or p.special == "$" or p.special == "!" then -- scalar specials
+		elseif p.special == "@" or p.special == "*" then -- $@/$*: multi-element (emit_seg renders it)
+		elseif
+			not EF.has_nameref
+			and p.pexp
+			and (
+				array_multi_op(p.pexp)
+				or indirect_ok(p.pexp)
+				or pexp_compilable(p.pexp)
+				or (p.pexp.op == "prefix" and not p.pexp.star)
+			)
+		then -- ${a[@]}, ${!ref}, scalar ${..} op, or ${!pre@} name-prefix (a ${…}-OP may deref an element-nameref: delegate in nameref programs)
+		else
+			return false
+		end -- other pexp, cmdsub, arith, procsub, or anything unknown
+	end
+	return true
 end
 -- Also reachable via the shared EF table so flatten_stmt (the for-in list gate) can call it
 -- without taking a fresh upvalue — flatten_stmt is at the 60-upvalue cap (as with cur_line /
@@ -1373,24 +2148,36 @@ EF.seg_native = seg_native
 -- part emit can't render here: cmdsub/arith/${…}-op/$@/$*/length/CFG-unsafe special.
 local CASE_GLOBSPECIAL = "[%*%?%[%]\\%(%)%|%+%@%!]"
 emit_pattern_glob = function(pat, lifted)
-  local ok, w = pcall(require("parser").parse_word, pat)
-  if not ok then return nil end
-  local out = {}
-  for i, p in ipairs(w.parts) do
-    if p.lenof or p.cmdsub or p.arith or p.arithast or p.pexp or p.procsub then return nil end
-    if p.special == "@" or p.special == "*" then return nil end -- multi-element in a pattern
-    if p.var and (COMPILE_UNSAFE_VAR[p.var] and p.var ~= "LINENO") then return nil end
-    if p.lit ~= nil then
-      local s = p.lit
-      if p.q then s = s:gsub(CASE_GLOBSPECIAL, "\\%0") end -- quoted metachars -> literal
-      out[#out + 1] = ("%q"):format(s)
-    else -- var / param / raw / scalar special ($#/$?/$$/$!): value; escape if quoted
-      local v = emit_scalar_val(p, i, lifted, false)
-      out[#out + 1] = p.q and ("rt.glob_quote(%s)"):format(v) or v
-    end
-  end
-  if #out == 0 then return '""' end
-  return table.concat(out, " .. ")
+	local ok, w = pcall(require("parser").parse_word, pat)
+	if not ok then
+		return nil
+	end
+	local out = {}
+	for i, p in ipairs(w.parts) do
+		if p.lenof or p.cmdsub or p.arith or p.arithast or p.pexp or p.procsub then
+			return nil
+		end
+		if p.special == "@" or p.special == "*" then
+			return nil
+		end -- multi-element in a pattern
+		if p.var and (COMPILE_UNSAFE_VAR[p.var] and p.var ~= "LINENO") then
+			return nil
+		end
+		if p.lit ~= nil then
+			local s = p.lit
+			if p.q then
+				s = s:gsub(CASE_GLOBSPECIAL, "\\%0")
+			end -- quoted metachars -> literal
+			out[#out + 1] = ("%q"):format(s)
+		else -- var / param / raw / scalar special ($#/$?/$$/$!): value; escape if quoted
+			local v = emit_scalar_val(p, i, lifted, false)
+			out[#out + 1] = p.q and ("rt.glob_quote(%s)"):format(v) or v
+		end
+	end
+	if #out == 0 then
+		return '""'
+	end
+	return table.concat(out, " .. ")
 end
 -- Render a `[[ L =~ R ]]` RHS word to its ERE string (interp's expand_regex): an unquoted
 -- literal or expansion keeps ERE metachars ACTIVE; a quoted part is ERE-escaped (matched
@@ -1401,25 +2188,37 @@ end
 -- from the =~ block — reuses its existing EF upvalue instead of adding one (the 60-upvalue cap).
 local REGEX_SPECIAL = "[%.%^%$%*%+%?%(%)%[%]%{%}%|\\]"
 EF.emit_regex_glob = function(w, lifted)
-  for i, p in ipairs(w.parts) do
-    if p.lenof or p.cmdsub or p.arith or p.arithast or p.pexp or p.procsub then return nil end
-    if p.special == "@" or p.special == "*" then return nil end -- multi-element in a regex
-    if p.var and (COMPILE_UNSAFE_VAR[p.var] and p.var ~= "LINENO") then return nil end
-    if i == 1 and p.lit ~= nil and not p.q and p.lit:sub(1, 1) == "~" then return nil end -- word-initial ~
-  end
-  local out = {}
-  for i, p in ipairs(w.parts) do
-    if p.lit ~= nil then
-      local s = p.lit
-      if p.q then s = s:gsub(REGEX_SPECIAL, "\\%0") end -- quoted ERE metachars -> literal
-      out[#out + 1] = ("%q"):format(s)
-    else -- var / param / raw / scalar special: value; ERE-escape it when quoted
-      local v = emit_scalar_val(p, i, lifted, false)
-      out[#out + 1] = p.q and ("rt.regex_quote(%s)"):format(v) or v
-    end
-  end
-  if #out == 0 then return '""' end
-  return table.concat(out, " .. ")
+	for i, p in ipairs(w.parts) do
+		if p.lenof or p.cmdsub or p.arith or p.arithast or p.pexp or p.procsub then
+			return nil
+		end
+		if p.special == "@" or p.special == "*" then
+			return nil
+		end -- multi-element in a regex
+		if p.var and (COMPILE_UNSAFE_VAR[p.var] and p.var ~= "LINENO") then
+			return nil
+		end
+		if i == 1 and p.lit ~= nil and not p.q and p.lit:sub(1, 1) == "~" then
+			return nil
+		end -- word-initial ~
+	end
+	local out = {}
+	for i, p in ipairs(w.parts) do
+		if p.lit ~= nil then
+			local s = p.lit
+			if p.q then
+				s = s:gsub(REGEX_SPECIAL, "\\%0")
+			end -- quoted ERE metachars -> literal
+			out[#out + 1] = ("%q"):format(s)
+		else -- var / param / raw / scalar special: value; ERE-escape it when quoted
+			local v = emit_scalar_val(p, i, lifted, false)
+			out[#out + 1] = p.q and ("rt.regex_quote(%s)"):format(v) or v
+		end
+	end
+	if #out == 0 then
+		return '""'
+	end
+	return table.concat(out, " .. ")
 end
 -- An `a=(…)` array literal the compiled tier can build: each BARE element's word is
 -- field-engine-able (word_safe/field_word/seg_native), and each KEYED element `[k]=v` has
@@ -1427,55 +2226,90 @@ end
 -- assoc verbatim, indexed via arith_str) and an emit_word-able value. An `a[i]=(…)`
 -- list-to-member error, a brace-de-keyed element, or a nameref program keep I.run_arrayassign.
 local function arrayassign_ok(st, lifted)
-  if st.index or EF.has_nameref then return false end
-  for _, e in ipairs(st.elems) do
-    if e.brace_bare then return false end -- `[k]=` value brace-expands (de-keyed): interp
-    if e.key ~= nil then
-      if e.key:find("[%$`'\"]") then return false end -- dynamic subscript -> interp
-      -- A side-effecting arith in a KEYED element's subscript or value (`[100+i++]=$((i++))`)
-      -- has a subtle eval order — bash evaluates ALL the values, THEN all the keys — that the
-      -- straight-line compiled arrayassign can't reproduce. Delegate (interp gets the order).
-      if arith_side_effect(safe_arith(e.key)) then return false end
-      for _, p in ipairs(e.word.parts) do
-        if (p.arith and arith_side_effect(safe_arith(p.arith)))
-          or (p.arithast and arith_side_effect(p.arithast)) then return false end
-      end
-      if not emitable_word(e.word) then return false end
-    else
-      if e.op ~= "=" then return false end
-      if not (word_safe(e.word) or field_word(e.word, lifted) or seg_native(e.word, lifted)) then return false end
-    end
-  end
-  return true
+	if st.index or EF.has_nameref then
+		return false
+	end
+	for _, e in ipairs(st.elems) do
+		if e.brace_bare then
+			return false
+		end -- `[k]=` value brace-expands (de-keyed): interp
+		if e.key ~= nil then
+			if e.key:find("[%$`'\"]") then
+				return false
+			end -- dynamic subscript -> interp
+			-- A side-effecting arith in a KEYED element's subscript or value (`[100+i++]=$((i++))`)
+			-- has a subtle eval order — bash evaluates ALL the values, THEN all the keys — that the
+			-- straight-line compiled arrayassign can't reproduce. Delegate (interp gets the order).
+			if arith_side_effect(safe_arith(e.key)) then
+				return false
+			end
+			for _, p in ipairs(e.word.parts) do
+				if
+					(p.arith and arith_side_effect(safe_arith(p.arith)))
+					or (p.arithast and arith_side_effect(p.arithast))
+				then
+					return false
+				end
+			end
+			if not emitable_word(e.word) then
+				return false
+			end
+		else
+			if e.op ~= "=" then
+				return false
+			end
+			if not (word_safe(e.word) or field_word(e.word, lifted) or seg_native(e.word, lifted)) then
+				return false
+			end
+		end
+	end
+	return true
 end
 -- Build a `local __a = {...}` argv table for words[from..#words] (each field
 -- split+globbed), or nil if any word needs the interpreter. `wrap` is applied to
 -- each final field. Used for commands whose args word-split/glob.
 local function field_argv(words, from, lifted, wrap, prefix)
-  local out = { prefix and ("local __a = {" .. prefix .. "}") or "local __a = {}" }
-  for j = from, #words do
-    local w = words[j]
-    if not empty_word(w) then -- an empty brace alternative ({X,,Y,}) adds no arg
-      if not word_safe(w) and not field_word(w, lifted) and not mixed_expandable(w, lifted) then return nil end
-      out[#out + 1] = emit_fields_into("__a", w, lifted, wrap)
-    end
-  end
-  return table.concat(out, "; ")
+	local out = { prefix and ("local __a = {" .. prefix .. "}") or "local __a = {}" }
+	for j = from, #words do
+		local w = words[j]
+		if not empty_word(w) then -- an empty brace alternative ({X,,Y,}) adds no arg
+			if not word_safe(w) and not field_word(w, lifted) and not mixed_expandable(w, lifted) then
+				return nil
+			end
+			out[#out + 1] = emit_fields_into("__a", w, lifted, wrap)
+		end
+	end
+	return table.concat(out, "; ")
 end
 
 -- Arith usable in a VALUE position (what emit_value renders): pure, no side effect,
 -- no array subscript / embedded $-expansion / dynamic-special var.
 local function arith_value_ok(e)
-  if type(e) ~= "table" then return false end
-  local k = e.k
-  if k == "num" or k == "param" then return true end
-  -- a subscripted READ (a[i]) is a value emit_value renders via rt.arith_read_elem (write
-  -- targets are gated separately by arith_stmt_ok's `not e.idx` on asgn/post/pre).
-  if k == "var" then if e.idxraw then return arith_elem_ok(e) end; return not COMPILE_UNSAFE_VAR[e.name] end
-  if k == "un" then return arith_value_ok(e.e) end
-  if k == "bin" then return arith_value_ok(e.l) and arith_value_ok(e.r) end
-  if k == "tern" then return arith_value_ok(e.c) and arith_value_ok(e.a) and arith_value_ok(e.b) end
-  return false -- asgn/post/pre/comma/xpand/matherr are not values
+	if type(e) ~= "table" then
+		return false
+	end
+	local k = e.k
+	if k == "num" or k == "param" then
+		return true
+	end
+	-- a subscripted READ (a[i]) is a value emit_value renders via rt.arith_read_elem (write
+	-- targets are gated separately by arith_stmt_ok's `not e.idx` on asgn/post/pre).
+	if k == "var" then
+		if e.idxraw then
+			return arith_elem_ok(e)
+		end
+		return not COMPILE_UNSAFE_VAR[e.name]
+	end
+	if k == "un" then
+		return arith_value_ok(e.e)
+	end
+	if k == "bin" then
+		return arith_value_ok(e.l) and arith_value_ok(e.r)
+	end
+	if k == "tern" then
+		return arith_value_ok(e.c) and arith_value_ok(e.a) and arith_value_ok(e.b)
+	end
+	return false -- asgn/post/pre/comma/xpand/matherr are not values
 end
 
 -- Arith usable at STATEMENT position ((( … )) or forc init/step): a comma sequence,
@@ -1483,19 +2317,27 @@ end
 -- side effect nested in an operand, an array subscript, or a dynamic special var
 -- ($LINENO/$_/…) delegates to the interpreter (the emitter renders none of those).
 local function arith_stmt_ok(e)
-  if type(e) ~= "table" then return false end
-  local k = e.k
-  if k == "comma" then return arith_stmt_ok(e.l) and arith_stmt_ok(e.r) end
-  if k == "asgn" then
-    -- element WRITE target a[i]= : rt.arith_elem_write, gated on a compilable subscript.
-    if e.idxraw then return arith_elem_ok(e) and arith_value_ok(e.e) end
-    return not COMPILE_UNSAFE_VAR[e.name] and arith_value_ok(e.e)
-  end
-  if k == "post" or k == "pre" then
-    if e.idxraw then return arith_elem_ok(e) end -- ++a[i] / a[i]++ via rt.arith_elem_incr
-    return not COMPILE_UNSAFE_VAR[e.name]
-  end
-  return arith_value_ok(e)
+	if type(e) ~= "table" then
+		return false
+	end
+	local k = e.k
+	if k == "comma" then
+		return arith_stmt_ok(e.l) and arith_stmt_ok(e.r)
+	end
+	if k == "asgn" then
+		-- element WRITE target a[i]= : rt.arith_elem_write, gated on a compilable subscript.
+		if e.idxraw then
+			return arith_elem_ok(e) and arith_value_ok(e.e)
+		end
+		return not COMPILE_UNSAFE_VAR[e.name] and arith_value_ok(e.e)
+	end
+	if k == "post" or k == "pre" then
+		if e.idxraw then
+			return arith_elem_ok(e)
+		end -- ++a[i] / a[i]++ via rt.arith_elem_incr
+		return not COMPILE_UNSAFE_VAR[e.name]
+	end
+	return arith_value_ok(e)
 end
 
 -- Emit statements that evaluate arith `e` WITH its side effects, leaving the
@@ -1504,49 +2346,60 @@ end
 -- calls on natively-computed values, not an AST re-walk). Compound ops reuse
 -- emit_value's operator logic (div0, shifts, **) via a synthetic bin node.
 emit_arith_into = function(dst, e, lifted)
-  local k = e.k
-  if k == "comma" then -- l for its side effect, r for the result
-    return emit_arith_into(dst, e.l, lifted) .. "; " .. emit_arith_into(dst, e.r, lifted)
-  end
-  -- ${..[i]} element WRITE target (gated by arith_stmt_ok via arith_elem_ok): resolve the key
-  -- once and store through rt.arith_elem_write/_incr; the operator arithmetic stays in emit_value
-  -- via a compute closure over the OLD element value (__o).
-  local function elem_args(ee)
-    return ("%q, %q, %s"):format(ee.name, ee.idxraw, emit_word(require("parser").parse_word(ee.idxraw), lifted))
-  end
-  if (k == "asgn" or k == "pre" or k == "post") and e.idxraw then
-    if k == "asgn" and e.op == "=" then -- a[i] = e: no read
-      return ("%s = rt.arith_elem_write(sh, %s, false, function() return %s end)")
-        :format(dst, elem_args(e), emit_value(e.e, lifted))
-    elseif k == "asgn" then -- a[i] OP= e: read old (__o), apply the binop, store
-      local newv = emit_value({ k = "bin", op = e.op:sub(1, #e.op - 1), l = { k = "raw", code = "__o" }, r = e.e }, lifted)
-      return ("%s = rt.arith_elem_write(sh, %s, true, function(__o) return %s end)"):format(dst, elem_args(e), newv)
-    end
-    return ("%s = rt.arith_elem_incr(sh, %s, %dLL, %s)"):format(dst, elem_args(e), e.d, tostring(k == "post"))
-  end
-  if k == "asgn" then
-    local rhs
-    if e.op == "=" then rhs = emit_value(e.e, lifted) -- pure define: no read of the target
-    else
-      local cur = lifted[e.name] and lname(e.name) or (arith_varread):format(e.name) -- compound reads first
-      rhs = emit_value({ k = "bin", op = e.op:sub(1, #e.op - 1), l = { k = "raw", code = cur }, r = e.e }, lifted)
-    end
-    if lifted[e.name] then return ("%s = %s; %s = %s"):format(lname(e.name), rhs, dst, lname(e.name)) end
-    return ("%s = sh:aset(%q, %s)"):format(dst, e.name, rhs)
-  end
-  if k == "pre" then -- ++x / --x: update, then result is the new value
-    if lifted[e.name] then
-      return ("%s = %s + %dLL; %s = %s"):format(lname(e.name), lname(e.name), e.d, dst, lname(e.name))
-    end
-    return ("%s = sh:aset(%q, %s + %dLL)"):format(dst, e.name, (arith_varread):format(e.name), e.d)
-  end
-  if k == "post" then -- x++ / x--: result is the OLD value, then update
-    if lifted[e.name] then
-      return ("%s = %s; %s = %s + %dLL"):format(dst, lname(e.name), lname(e.name), lname(e.name), e.d)
-    end
-    return ("%s = %s; sh:aset(%q, %s + %dLL)"):format(dst, (arith_varread):format(e.name), e.name, dst, e.d)
-  end
-  return ("%s = %s"):format(dst, emit_value(e, lifted)) -- a pure value
+	local k = e.k
+	if k == "comma" then -- l for its side effect, r for the result
+		return emit_arith_into(dst, e.l, lifted) .. "; " .. emit_arith_into(dst, e.r, lifted)
+	end
+	-- ${..[i]} element WRITE target (gated by arith_stmt_ok via arith_elem_ok): resolve the key
+	-- once and store through rt.arith_elem_write/_incr; the operator arithmetic stays in emit_value
+	-- via a compute closure over the OLD element value (__o).
+	local function elem_args(ee)
+		return ("%q, %q, %s"):format(ee.name, ee.idxraw, emit_word(require("parser").parse_word(ee.idxraw), lifted))
+	end
+	if (k == "asgn" or k == "pre" or k == "post") and e.idxraw then
+		if k == "asgn" and e.op == "=" then -- a[i] = e: no read
+			return ("%s = rt.arith_elem_write(sh, %s, false, function() return %s end)"):format(
+				dst,
+				elem_args(e),
+				emit_value(e.e, lifted)
+			)
+		elseif k == "asgn" then -- a[i] OP= e: read old (__o), apply the binop, store
+			local newv =
+				emit_value({ k = "bin", op = e.op:sub(1, #e.op - 1), l = { k = "raw", code = "__o" }, r = e.e }, lifted)
+			return ("%s = rt.arith_elem_write(sh, %s, true, function(__o) return %s end)"):format(
+				dst,
+				elem_args(e),
+				newv
+			)
+		end
+		return ("%s = rt.arith_elem_incr(sh, %s, %dLL, %s)"):format(dst, elem_args(e), e.d, tostring(k == "post"))
+	end
+	if k == "asgn" then
+		local rhs
+		if e.op == "=" then
+			rhs = emit_value(e.e, lifted) -- pure define: no read of the target
+		else
+			local cur = lifted[e.name] and lname(e.name) or (arith_varread):format(e.name) -- compound reads first
+			rhs = emit_value({ k = "bin", op = e.op:sub(1, #e.op - 1), l = { k = "raw", code = cur }, r = e.e }, lifted)
+		end
+		if lifted[e.name] then
+			return ("%s = %s; %s = %s"):format(lname(e.name), rhs, dst, lname(e.name))
+		end
+		return ("%s = sh:aset(%q, %s)"):format(dst, e.name, rhs)
+	end
+	if k == "pre" then -- ++x / --x: update, then result is the new value
+		if lifted[e.name] then
+			return ("%s = %s + %dLL; %s = %s"):format(lname(e.name), lname(e.name), e.d, dst, lname(e.name))
+		end
+		return ("%s = sh:aset(%q, %s + %dLL)"):format(dst, e.name, (arith_varread):format(e.name), e.d)
+	end
+	if k == "post" then -- x++ / x--: result is the OLD value, then update
+		if lifted[e.name] then
+			return ("%s = %s; %s = %s + %dLL"):format(dst, lname(e.name), lname(e.name), lname(e.name), e.d)
+		end
+		return ("%s = %s; sh:aset(%q, %s + %dLL)"):format(dst, (arith_varread):format(e.name), e.name, dst, e.d)
+	end
+	return ("%s = %s"):format(dst, emit_value(e, lifted)) -- a pure value
 end
 
 -- Can this arith raise at runtime? A non-lifted read may fault (nounset /
@@ -1554,18 +2407,34 @@ end
 -- (÷0, negative exponent). If none apply, the (( )) result is emitted inline with
 -- no pcall — keeping the lifted-int64 hot loop native (JIT-compilable).
 local function arith_can_error(e, lifted)
-  if type(e) ~= "table" then return false end
-  local k = e.k
-  if k == "var" then return not lifted[e.name] end
-  if k == "bin" and (e.op == "/" or e.op == "%" or e.op == "**") then return true end
-  if k == "asgn" then
-    if e.op == "/=" or e.op == "%=" then return true end
-    if e.op ~= "=" and not lifted[e.name] then return true end -- compound reads the target
-    return arith_can_error(e.e, lifted)
-  end
-  if (k == "post" or k == "pre") and not lifted[e.name] then return true end
-  return arith_can_error(e.e, lifted) or arith_can_error(e.l, lifted) or arith_can_error(e.r, lifted)
-    or arith_can_error(e.c, lifted) or arith_can_error(e.a, lifted) or arith_can_error(e.b, lifted)
+	if type(e) ~= "table" then
+		return false
+	end
+	local k = e.k
+	if k == "var" then
+		return not lifted[e.name]
+	end
+	if k == "bin" and (e.op == "/" or e.op == "%" or e.op == "**") then
+		return true
+	end
+	if k == "asgn" then
+		if e.op == "/=" or e.op == "%=" then
+			return true
+		end
+		if e.op ~= "=" and not lifted[e.name] then
+			return true
+		end -- compound reads the target
+		return arith_can_error(e.e, lifted)
+	end
+	if (k == "post" or k == "pre") and not lifted[e.name] then
+		return true
+	end
+	return arith_can_error(e.e, lifted)
+		or arith_can_error(e.l, lifted)
+		or arith_can_error(e.r, lifted)
+		or arith_can_error(e.c, lifted)
+		or arith_can_error(e.a, lifted)
+		or arith_can_error(e.b, lifted)
 end
 
 -- Can this arith raise a THROWN error (as opposed to a flagged read fault)? Only
@@ -1573,12 +2442,22 @@ end
 -- everything else (non-lifted reads) records sh.arithfault without throwing, so the
 -- common accumulator `(( sum += x ))` needs no per-iteration pcall/closure.
 local function arith_can_div_fault(e)
-  if type(e) ~= "table" then return false end
-  local k = e.k
-  if k == "bin" and (e.op == "/" or e.op == "%" or e.op == "**") then return true end
-  if k == "asgn" and (e.op == "/=" or e.op == "%=") then return true end
-  return arith_can_div_fault(e.e) or arith_can_div_fault(e.l) or arith_can_div_fault(e.r)
-    or arith_can_div_fault(e.c) or arith_can_div_fault(e.a) or arith_can_div_fault(e.b)
+	if type(e) ~= "table" then
+		return false
+	end
+	local k = e.k
+	if k == "bin" and (e.op == "/" or e.op == "%" or e.op == "**") then
+		return true
+	end
+	if k == "asgn" and (e.op == "/=" or e.op == "%=") then
+		return true
+	end
+	return arith_can_div_fault(e.e)
+		or arith_can_div_fault(e.l)
+		or arith_can_div_fault(e.r)
+		or arith_can_div_fault(e.c)
+		or arith_can_div_fault(e.a)
+		or arith_can_div_fault(e.b)
 end
 
 -- The CFG compiler only understands ARITHMETIC conditions. A forc cond is
@@ -1588,10 +2467,16 @@ end
 -- assert_compilable (below) has already thrown for those, so post-validation this
 -- always yields the arith node for the conds that remain.
 local function cond_arith(c)
-  if type(c) ~= "table" then return nil end
-  if c.k then return c end -- an arith node already (forc init/cond/step)
-  if #c == 1 and c[1] and c[1].t == "arithcmd" then return c[1].expr end
-  return nil
+	if type(c) ~= "table" then
+		return nil
+	end
+	if c.k then
+		return c
+	end -- an arith node already (forc init/cond/step)
+	if #c == 1 and c[1] and c[1].t == "arithcmd" then
+		return c[1].expr
+	end
+	return nil
 end
 
 -- `[ A -op B ]` / `test A -op B` do an ARITHMETIC comparison. When both operands
@@ -1601,36 +2486,61 @@ end
 -- arith $((…)) qualifies (quoting is irrelevant in arithmetic).
 local TEST_ARITH_OP = { ["-eq"] = "==", ["-ne"] = "!=", ["-lt"] = "<", ["-le"] = "<=", ["-gt"] = ">", ["-ge"] = ">=" }
 local function test_operand_arith(w, lifted)
-  if #w.parts ~= 1 then return nil end
-  local p = w.parts[1]
-  if p.var and lifted[p.var] then return { k = "var", name = p.var } end
-  if p.lit and p.lit:match("^[+-]?%d+$") then return { k = "num", v = p.lit } end
-  if p.arithast then return p.arithast end
-  if p.arith then return safe_arith(p.arith) end
-  return nil
+	if #w.parts ~= 1 then
+		return nil
+	end
+	local p = w.parts[1]
+	if p.var and lifted[p.var] then
+		return { k = "var", name = p.var }
+	end
+	if p.lit and p.lit:match("^[+-]?%d+$") then
+		return { k = "num", v = p.lit }
+	end
+	if p.arithast then
+		return p.arithast
+	end
+	if p.arith then
+		return safe_arith(p.arith)
+	end
+	return nil
 end
 -- Returns the equivalent arith comparison node for a compilable `[ … ]`/test cond,
 -- or nil (caller falls back to the do_test command path).
 local function test_as_arith(cond, lifted)
-  if type(cond) ~= "table" or cond.k or #cond ~= 1 then return nil end
-  local st = cond[1]
-  if not st or st.t ~= "simple" or st.redirs or st.assigns then return nil end
-  local w = st.words
-  local function lit1(x) return x and x.parts[1] and #x.parts == 1 and x.parts[1].lit end
-  local cmd, A, opw, B = lit1(w[1]), nil, nil, nil
-  if cmd == "[" then
-    if #w ~= 5 or lit1(w[5]) ~= "]" then return nil end
-    A, opw, B = w[2], w[3], w[4]
-  elseif cmd == "test" then
-    if #w ~= 4 then return nil end
-    A, opw, B = w[2], w[3], w[4]
-  else return nil end
-  local op = TEST_ARITH_OP[lit1(opw) or ""]
-  if not op then return nil end
-  local l, r = test_operand_arith(A, lifted), test_operand_arith(B, lifted)
-  if not l or not r or not_compilable(l) or not_compilable(r)
-      or arith_side_effect(l) or arith_side_effect(r) then return nil end
-  return { k = "bin", op = op, l = l, r = r }
+	if type(cond) ~= "table" or cond.k or #cond ~= 1 then
+		return nil
+	end
+	local st = cond[1]
+	if not st or st.t ~= "simple" or st.redirs or st.assigns then
+		return nil
+	end
+	local w = st.words
+	local function lit1(x)
+		return x and x.parts[1] and #x.parts == 1 and x.parts[1].lit
+	end
+	local cmd, A, opw, B = lit1(w[1]), nil, nil, nil
+	if cmd == "[" then
+		if #w ~= 5 or lit1(w[5]) ~= "]" then
+			return nil
+		end
+		A, opw, B = w[2], w[3], w[4]
+	elseif cmd == "test" then
+		if #w ~= 4 then
+			return nil
+		end
+		A, opw, B = w[2], w[3], w[4]
+	else
+		return nil
+	end
+	local op = TEST_ARITH_OP[lit1(opw) or ""]
+	if not op then
+		return nil
+	end
+	local l, r = test_operand_arith(A, lifted), test_operand_arith(B, lifted)
+	if not l or not r or not_compilable(l) or not_compilable(r) or arith_side_effect(l) or arith_side_effect(r) then
+		return nil
+	end
+	return { k = "bin", op = op, l = l, r = r }
 end
 
 -- A word that is exactly one DECIMAL integer literal -> its digits (else nil). A
@@ -1640,64 +2550,99 @@ end
 -- (analyze_lift also gates on numeric_word), so it stays a string that aget/arith_num
 -- interpret with bash's base rules.
 local function numeric_word(w)
-  if #w.parts == 1 and w.parts[1].lit and w.parts[1].lit:match("^[+-]?%d+$")
-      and not w.parts[1].lit:match("^[+-]?0%d") then
-    return w.parts[1].lit
-  end
-  return nil
+	if
+		#w.parts == 1
+		and w.parts[1].lit
+		and w.parts[1].lit:match("^[+-]?%d+$")
+		and not w.parts[1].lit:match("^[+-]?0%d")
+	then
+		return w.parts[1].lit
+	end
+	return nil
 end
 
 -- collect every variable NAME referenced in an arith node / word / stmt list.
 local function collect_arith(e, set)
-  if type(e) ~= "table" then return end
-  if e.k == "var" or e.k == "asgn" or e.k == "post" or e.k == "pre" then set[e.name] = true end
-  collect_arith(e.e, set); collect_arith(e.l, set); collect_arith(e.r, set)
+	if type(e) ~= "table" then
+		return
+	end
+	if e.k == "var" or e.k == "asgn" or e.k == "post" or e.k == "pre" then
+		set[e.name] = true
+	end
+	collect_arith(e.e, set)
+	collect_arith(e.l, set)
+	collect_arith(e.r, set)
 end
 local function collect_word(w, set)
-  for _, p in ipairs(w.parts) do
-    if p.var then set[p.var] = true
-    elseif p.arith then collect_arith(safe_arith(p.arith), set) end
-  end
+	for _, p in ipairs(w.parts) do
+		if p.var then
+			set[p.var] = true
+		elseif p.arith then
+			collect_arith(safe_arith(p.arith), set)
+		end
+	end
 end
 local function collect_names(stmts, set)
-  for _, st in ipairs(stmts) do
-    if st.t == "assign" then
-      set[st.name] = true
-      if st.arith then collect_arith(st.arith, set) elseif st.rhs then collect_word(st.rhs, set) end
-    elseif st.t == "simple" then
-      for j = 2, #st.words do collect_word(st.words[j], set) end
-      local cmd = st.words[1] and st.words[1].parts[1] and st.words[1].parts[1].lit
-      if cmd == "local" then
-        for j = 2, #st.words do
-          local p1 = st.words[j].parts[1]
-          local nm = p1 and p1.lit and p1.lit:match("^([%a_][%w_]*)")
-          if nm then set[nm] = true end
-        end
-      end
-    elseif st.t == "forc" or st.t == "whilec" then
-      collect_arith(st.init, set); collect_arith(cond_arith(st.cond), set); collect_arith(st.step, set)
-      collect_names(st.body, set)
-    elseif st.t == "forin" then
-      set[st.name] = true
-      for _, w in ipairs(st.words) do collect_word(w, set) end
-      collect_names(st.body, set)
-    elseif st.t == "if" then
-      for _, cl in ipairs(st.clauses) do collect_arith(cond_arith(cl.cond), set); collect_names(cl.body, set) end
-    elseif st.t == "funcdef" then
-      collect_names(st.body, set)
-    end
-  end
+	for _, st in ipairs(stmts) do
+		if st.t == "assign" then
+			set[st.name] = true
+			if st.arith then
+				collect_arith(st.arith, set)
+			elseif st.rhs then
+				collect_word(st.rhs, set)
+			end
+		elseif st.t == "simple" then
+			for j = 2, #st.words do
+				collect_word(st.words[j], set)
+			end
+			local cmd = st.words[1] and st.words[1].parts[1] and st.words[1].parts[1].lit
+			if cmd == "local" then
+				for j = 2, #st.words do
+					local p1 = st.words[j].parts[1]
+					local nm = p1 and p1.lit and p1.lit:match("^([%a_][%w_]*)")
+					if nm then
+						set[nm] = true
+					end
+				end
+			end
+		elseif st.t == "forc" or st.t == "whilec" then
+			collect_arith(st.init, set)
+			collect_arith(cond_arith(st.cond), set)
+			collect_arith(st.step, set)
+			collect_names(st.body, set)
+		elseif st.t == "forin" then
+			set[st.name] = true
+			for _, w in ipairs(st.words) do
+				collect_word(w, set)
+			end
+			collect_names(st.body, set)
+		elseif st.t == "if" then
+			for _, cl in ipairs(st.clauses) do
+				collect_arith(cond_arith(cl.cond), set)
+				collect_names(cl.body, set)
+			end
+		elseif st.t == "funcdef" then
+			collect_names(st.body, set)
+		end
+	end
 end
 -- every var touched by a NON-INLINABLE function body (those keep an out-of-line
 -- closure, so a var they touch must be a shared upvalue, not a run-local).
 -- Inlinable functions are spliced into run(), so their var access is run() access.
 local function collect_funcvars(stmts, set, inlinable)
-  for _, st in ipairs(stmts) do
-    if st.t == "funcdef" then
-      if not (inlinable and inlinable[st.name]) then collect_names(st.body, set) end
-    elseif st.t == "forc" or st.t == "whilec" or st.t == "forin" then collect_funcvars(st.body, set, inlinable)
-    elseif st.t == "if" then for _, cl in ipairs(st.clauses) do collect_funcvars(cl.body, set, inlinable) end end
-  end
+	for _, st in ipairs(stmts) do
+		if st.t == "funcdef" then
+			if not (inlinable and inlinable[st.name]) then
+				collect_names(st.body, set)
+			end
+		elseif st.t == "forc" or st.t == "whilec" or st.t == "forin" then
+			collect_funcvars(st.body, set, inlinable)
+		elseif st.t == "if" then
+			for _, cl in ipairs(st.clauses) do
+				collect_funcvars(cl.body, set, inlinable)
+			end
+		end
+	end
 end
 
 -- Which vars become native int64 MODULE-LEVEL locals (shared as upvalues by
@@ -1708,87 +2653,127 @@ end
 -- bodies — a var shared between the top level and a function still lifts, because
 -- the upvalue is one real variable both see (no hash lookup, no desync).
 local function analyze_lift(ast)
-  -- A nameref program writes THROUGH namerefs (name=value -> some other var) via
-  -- rt.assign_scalar, which has no lifted-local to update — so an int64 local would desync.
-  -- Nameref programs are rare/cold; disable lifting so every var is sh-authoritative.
-  if EF.has_nameref then return {} end
-  local assigned, disq, localed = {}, {}, {}
-  local function scan(stmts)
-    for _, st in ipairs(stmts) do
-      if st.t == "assign" then
-        assigned[st.name] = true
-        -- an INDEXED assign (`a[i]=…`) makes an ARRAY: never int64-lift it (a native
-        -- scalar can't hold an array, and the delegated array ops read sh.vars). A scalar
-        -- `name+=v` is STRING concatenation (not arith), so it can produce a non-numeric
-        -- value and its rt.append_scalar reads sh.vars — never lift an appended var either.
-        if st.index or st.append or (not st.arith and not (st.rhs and numeric_word(st.rhs))) then disq[st.name] = true end
-      elseif st.t == "arrayassign" then disq[st.name] = true -- `a=(…)` array literal
-      elseif st.t == "simple" then
-        local cmd = st.words[1] and st.words[1].parts[1] and st.words[1].parts[1].lit
-        if cmd == "local" then
-          for j = 2, #st.words do
-            local p1 = st.words[j].parts[1]
-            local nm = p1 and p1.lit and p1.lit:match("^([%a_][%w_]*)")
-            if nm then localed[nm] = true end
-          end
-        elseif cmd == "readonly" or cmd == "declare" or cmd == "typeset"
-            or cmd == "export" or cmd == "unset" then
-          -- these delegated builtins manage the var's BOX + attributes (ro/integer/
-          -- exported) in sh.vars; a native-int64 local would desync, so never lift.
-          for j = 2, #st.words do
-            local p1 = st.words[j].parts[1]
-            local nm = p1 and p1.lit and p1.lit:match("^([%a_][%w_]*)")
-            if nm then disq[nm] = true end
-          end
-        end
-      elseif st.t == "forc" or st.t == "whilec" then
-        for _, e in ipairs({ st.init, cond_arith(st.cond), st.step }) do
-          if e and (e.k == "asgn" or e.k == "post" or e.k == "pre") then assigned[e.name] = true end
-        end
-        scan(st.body)
-      elseif st.t == "forin" then
-        disq[st.name] = true -- a `for x in` var holds arbitrary strings, never lift it
-        scan(st.body)
-      elseif st.t == "if" then
-        for _, cl in ipairs(st.clauses) do scan(cl.body) end
-      elseif st.t == "funcdef" then
-        scan(st.body)
-      end
-    end
-  end
-  scan(ast.stmts)
-  local lifted = {}
-  for n in pairs(assigned) do if not disq[n] and not localed[n] then lifted[n] = true end end
-  return lifted
+	-- A nameref program writes THROUGH namerefs (name=value -> some other var) via
+	-- rt.assign_scalar, which has no lifted-local to update — so an int64 local would desync.
+	-- Nameref programs are rare/cold; disable lifting so every var is sh-authoritative.
+	if EF.has_nameref then
+		return {}
+	end
+	local assigned, disq, localed = {}, {}, {}
+	local function scan(stmts)
+		for _, st in ipairs(stmts) do
+			if st.t == "assign" then
+				assigned[st.name] = true
+				-- an INDEXED assign (`a[i]=…`) makes an ARRAY: never int64-lift it (a native
+				-- scalar can't hold an array, and the delegated array ops read sh.vars). A scalar
+				-- `name+=v` is STRING concatenation (not arith), so it can produce a non-numeric
+				-- value and its rt.append_scalar reads sh.vars — never lift an appended var either.
+				if st.index or st.append or (not st.arith and not (st.rhs and numeric_word(st.rhs))) then
+					disq[st.name] = true
+				end
+			elseif st.t == "arrayassign" then
+				disq[st.name] = true -- `a=(…)` array literal
+			elseif st.t == "simple" then
+				local cmd = st.words[1] and st.words[1].parts[1] and st.words[1].parts[1].lit
+				if cmd == "local" then
+					for j = 2, #st.words do
+						local p1 = st.words[j].parts[1]
+						local nm = p1 and p1.lit and p1.lit:match("^([%a_][%w_]*)")
+						if nm then
+							localed[nm] = true
+						end
+					end
+				elseif
+					cmd == "readonly"
+					or cmd == "declare"
+					or cmd == "typeset"
+					or cmd == "export"
+					or cmd == "unset"
+				then
+					-- these delegated builtins manage the var's BOX + attributes (ro/integer/
+					-- exported) in sh.vars; a native-int64 local would desync, so never lift.
+					for j = 2, #st.words do
+						local p1 = st.words[j].parts[1]
+						local nm = p1 and p1.lit and p1.lit:match("^([%a_][%w_]*)")
+						if nm then
+							disq[nm] = true
+						end
+					end
+				end
+			elseif st.t == "forc" or st.t == "whilec" then
+				for _, e in ipairs({ st.init, cond_arith(st.cond), st.step }) do
+					if e and (e.k == "asgn" or e.k == "post" or e.k == "pre") then
+						assigned[e.name] = true
+					end
+				end
+				scan(st.body)
+			elseif st.t == "forin" then
+				disq[st.name] = true -- a `for x in` var holds arbitrary strings, never lift it
+				scan(st.body)
+			elseif st.t == "if" then
+				for _, cl in ipairs(st.clauses) do
+					scan(cl.body)
+				end
+			elseif st.t == "funcdef" then
+				scan(st.body)
+			end
+		end
+	end
+	scan(ast.stmts)
+	local lifted = {}
+	for n in pairs(assigned) do
+		if not disq[n] and not localed[n] then
+			lifted[n] = true
+		end
+	end
+	return lifted
 end
 
 -- Does a function need a positional-param swap / a `local` frame? A call to a
 -- function that needs neither is emitted bare (fn_x(sh)); one that needs only
 -- params uses the lightweight pushParams; only `local` needs the full frame.
 local function scan_arith_param(e, f)
-  if type(e) ~= "table" then return end
-  if e.k == "param" then f.params = true end
-  -- an embedded $-expansion (`$(( $* ))`, `$(( $1+1 ))`) is re-expanded at runtime and
-  -- may reference the positional params — conservatively require the param swap.
-  if e.k == "xpand" then f.params = true end
-  scan_arith_param(e.e, f); scan_arith_param(e.l, f); scan_arith_param(e.r, f)
-  scan_arith_param(e.c, f); scan_arith_param(e.a, f); scan_arith_param(e.b, f)
+	if type(e) ~= "table" then
+		return
+	end
+	if e.k == "param" then
+		f.params = true
+	end
+	-- an embedded $-expansion (`$(( $* ))`, `$(( $1+1 ))`) is re-expanded at runtime and
+	-- may reference the positional params — conservatively require the param swap.
+	if e.k == "xpand" then
+		f.params = true
+	end
+	scan_arith_param(e.e, f)
+	scan_arith_param(e.l, f)
+	scan_arith_param(e.r, f)
+	scan_arith_param(e.c, f)
+	scan_arith_param(e.a, f)
+	scan_arith_param(e.b, f)
 end
 -- A ${…} operator on a POSITIONAL parameter (@, *, or a digit — ${*:1}, ${@//x/y},
 -- ${1:-def}) reads the call's params exactly like a bare $@/$*/$n does. Missing this
 -- (only bare $special was checked) made such a function dispatch WITHOUT the param
 -- swap, so $* inside saw the caller's params: `f(){ echo ${*:1};}; f a b` printed "".
 local function pexp_reads_params(pe)
-  local n = pe and pe.name
-  return n == "@" or n == "*" or (type(n) == "string" and n:match("^%d+$") ~= nil)
+	local n = pe and pe.name
+	return n == "@" or n == "*" or (type(n) == "string" and n:match("^%d+$") ~= nil)
 end
 local function scan_word_param(w, f)
-  for _, p in ipairs(w.parts) do
-    if p.param or (p.special and p.special ~= "?") then f.params = true end -- $? is status, not $@
-    if p.pexp and pexp_reads_params(p.pexp) then f.params = true end -- ${*:1}/${1:-x}
-    if p.cmdsub then f.params = true end -- $(…) re-runs against the live frame; its $n/$* need the swap
-    if p.arith then scan_arith_param(safe_arith(p.arith), f) end
-  end
+	for _, p in ipairs(w.parts) do
+		if p.param or (p.special and p.special ~= "?") then
+			f.params = true
+		end -- $? is status, not $@
+		if p.pexp and pexp_reads_params(p.pexp) then
+			f.params = true
+		end -- ${*:1}/${1:-x}
+		if p.cmdsub then
+			f.params = true
+		end -- $(…) re-runs against the live frame; its $n/$* need the swap
+		if p.arith then
+			scan_arith_param(safe_arith(p.arith), f)
+		end
+	end
 end
 -- A REDIRECT target/word/heredoc-body is a raw source STRING (`> "$@"`, `>&$1`),
 -- not a word AST — but it too can reference positional params, so a function whose
@@ -1796,80 +2781,124 @@ end
 -- was dispatched bare → $@ empty → wrong/ambiguous redirect; `is_fd_open(){ :>&$1;}`
 -- looped forever). Match $@ $* $# $n (optional brace) and any $(…)/`…` command sub.
 local function str_reads_params(s)
-  if type(s) ~= "string" then return false end
-  return s:find("%$%{?[@*#0-9]") ~= nil or s:find("%$%(") ~= nil or s:find("`") ~= nil
+	if type(s) ~= "string" then
+		return false
+	end
+	return s:find("%$%{?[@*#0-9]") ~= nil or s:find("%$%(") ~= nil or s:find("`") ~= nil
 end
 local function scan_redir_params(st, f)
-  if not st.redirs then return end
-  for _, r in ipairs(st.redirs) do
-    if str_reads_params(r.target) or str_reads_params(r.word)
-        or (r.expand and str_reads_params(r.body)) then f.params = true end
-  end
+	if not st.redirs then
+		return
+	end
+	for _, r in ipairs(st.redirs) do
+		if str_reads_params(r.target) or str_reads_params(r.word) or (r.expand and str_reads_params(r.body)) then
+			f.params = true
+		end
+	end
 end
 -- Walk a [[ … ]] expression tree for $@/$n operands: `and`/`or`/`not` nodes recurse
 -- through l/r/e; a `binary` leaf's l/r are WORDS; a `unary` leaf's operand is .word.
 -- A function whose only param use is inside [[ ]] (`f(){ [[ -n "$1" ]]; }`) was
 -- dispatched bare, so $1 read empty.
 local function scan_dbracket(e, f)
-  if type(e) ~= "table" then return end
-  if e.parts then scan_word_param(e, f); return end -- a word operand
-  if e.word then scan_word_param(e.word, f) end      -- unary operand
-  scan_dbracket(e.l, f); scan_dbracket(e.r, f); scan_dbracket(e.e, f)
+	if type(e) ~= "table" then
+		return
+	end
+	if e.parts then
+		scan_word_param(e, f)
+		return
+	end -- a word operand
+	if e.word then
+		scan_word_param(e.word, f)
+	end -- unary operand
+	scan_dbracket(e.l, f)
+	scan_dbracket(e.r, f)
+	scan_dbracket(e.e, f)
 end
 local function func_flags(body)
-  local f = { params = false, locals = false }
-  local function scan(stmts)
-    for _, st in ipairs(stmts) do
-      scan_redir_params(st, f) -- $@/$n in any redirect target also needs the frame
-      if st.t == "simple" then
-        local cmd = st.words[1] and st.words[1].parts[1] and st.words[1].parts[1].lit
-        -- declare/typeset inside a function make their names LOCAL (bash), like `local`,
-        -- so the call needs a real frame (pushCall) — else a delegated `declare x=1`
-        -- writes the GLOBAL. `declare -g` still targets the global (interp honors -g
-        -- inside the frame), so treating any declare/typeset as frame-needing is safe.
-        if cmd == "local" or cmd == "declare" or cmd == "typeset" then f.locals = true end
-        -- getopts parses $@ and shift mutates it — both implicitly need the callee's
-        -- positional params (no $-word to trigger scan_word_param), so force the swap.
-        if cmd == "getopts" or cmd == "shift" then f.params = true end
-        -- eval / source / . run an OPAQUE string (or file) against the live frame — it
-        -- can reference $@/$n and declare locals (`eval 'local v=$*'`), which the scan
-        -- can't see, so conservatively give the callee a full frame (params + locals).
-        if cmd == "eval" or cmd == "source" or cmd == "." then f.params = true; f.locals = true end
-        for j = 2, #st.words do scan_word_param(st.words[j], f) end
-      elseif st.t == "assign" then
-        if st.arith then scan_arith_param(st.arith, f) elseif st.rhs then scan_word_param(st.rhs, f) end
-      elseif st.t == "forc" or st.t == "whilec" then
-        scan_arith_param(st.init, f); scan_arith_param(cond_arith(st.cond), f); scan_arith_param(st.step, f)
-        if type(st.cond) == "table" and st.cond[1] then scan(st.cond) end -- COMMAND condition (a stmt list)
-        scan(st.body)
-      elseif st.t == "forin" then
-        for _, w in ipairs(st.words) do scan_word_param(w, f) end; scan(st.body)
-      elseif st.t == "if" then
-        for _, cl in ipairs(st.clauses) do
-          scan_arith_param(cond_arith(cl.cond), f)
-          if type(cl.cond) == "table" and cl.cond[1] then scan(cl.cond) end -- COMMAND condition
-          scan(cl.body)
-        end
-      -- Compound bodies also reference $@/$*/$n and define locals — a function whose
-      -- body is a pipeline (`f(){ echo "$1" | od; }`), case, group, subshell, or &&/||
-      -- list needs the param swap / frame just as much. Missing these dispatched the
-      -- function bare, so $1 inside the pipeline saw the CALLER's (empty) params.
-      elseif st.t == "pipeline" then
-        scan(st.cmds or {})
-      elseif st.t == "andor" then
-        for _, it in ipairs(st.items or {}) do if it.cmd then scan({ it.cmd }) end end
-      elseif st.t == "case" then
-        if st.subject then scan_word_param(st.subject, f) end
-        for _, cl in ipairs(st.clauses or {}) do scan(cl.body or {}) end
-      elseif st.t == "group" or st.t == "subshell" then
-        scan(st.body or {})
-      elseif st.t == "dbracket" then
-        scan_dbracket(st.expr, f) -- $@/$n inside [[ … ]]
-      end
-    end
-  end
-  scan(body)
-  return f
+	local f = { params = false, locals = false }
+	local function scan(stmts)
+		for _, st in ipairs(stmts) do
+			scan_redir_params(st, f) -- $@/$n in any redirect target also needs the frame
+			if st.t == "simple" then
+				local cmd = st.words[1] and st.words[1].parts[1] and st.words[1].parts[1].lit
+				-- declare/typeset inside a function make their names LOCAL (bash), like `local`,
+				-- so the call needs a real frame (pushCall) — else a delegated `declare x=1`
+				-- writes the GLOBAL. `declare -g` still targets the global (interp honors -g
+				-- inside the frame), so treating any declare/typeset as frame-needing is safe.
+				if cmd == "local" or cmd == "declare" or cmd == "typeset" then
+					f.locals = true
+				end
+				-- getopts parses $@ and shift mutates it — both implicitly need the callee's
+				-- positional params (no $-word to trigger scan_word_param), so force the swap.
+				if cmd == "getopts" or cmd == "shift" then
+					f.params = true
+				end
+				-- eval / source / . run an OPAQUE string (or file) against the live frame — it
+				-- can reference $@/$n and declare locals (`eval 'local v=$*'`), which the scan
+				-- can't see, so conservatively give the callee a full frame (params + locals).
+				if cmd == "eval" or cmd == "source" or cmd == "." then
+					f.params = true
+					f.locals = true
+				end
+				for j = 2, #st.words do
+					scan_word_param(st.words[j], f)
+				end
+			elseif st.t == "assign" then
+				if st.arith then
+					scan_arith_param(st.arith, f)
+				elseif st.rhs then
+					scan_word_param(st.rhs, f)
+				end
+			elseif st.t == "forc" or st.t == "whilec" then
+				scan_arith_param(st.init, f)
+				scan_arith_param(cond_arith(st.cond), f)
+				scan_arith_param(st.step, f)
+				if type(st.cond) == "table" and st.cond[1] then
+					scan(st.cond)
+				end -- COMMAND condition (a stmt list)
+				scan(st.body)
+			elseif st.t == "forin" then
+				for _, w in ipairs(st.words) do
+					scan_word_param(w, f)
+				end
+				scan(st.body)
+			elseif st.t == "if" then
+				for _, cl in ipairs(st.clauses) do
+					scan_arith_param(cond_arith(cl.cond), f)
+					if type(cl.cond) == "table" and cl.cond[1] then
+						scan(cl.cond)
+					end -- COMMAND condition
+					scan(cl.body)
+				end
+			-- Compound bodies also reference $@/$*/$n and define locals — a function whose
+			-- body is a pipeline (`f(){ echo "$1" | od; }`), case, group, subshell, or &&/||
+			-- list needs the param swap / frame just as much. Missing these dispatched the
+			-- function bare, so $1 inside the pipeline saw the CALLER's (empty) params.
+			elseif st.t == "pipeline" then
+				scan(st.cmds or {})
+			elseif st.t == "andor" then
+				for _, it in ipairs(st.items or {}) do
+					if it.cmd then
+						scan({ it.cmd })
+					end
+				end
+			elseif st.t == "case" then
+				if st.subject then
+					scan_word_param(st.subject, f)
+				end
+				for _, cl in ipairs(st.clauses or {}) do
+					scan(cl.body or {})
+				end
+			elseif st.t == "group" or st.t == "subshell" then
+				scan(st.body or {})
+			elseif st.t == "dbracket" then
+				scan_dbracket(st.expr, f) -- $@/$n inside [[ … ]]
+			end
+		end
+	end
+	scan(body)
+	return f
 end
 
 -- A function is INLINABLE if its body is flat (only assignments and
@@ -1877,88 +2906,132 @@ end
 -- function is spliced into its direct call sites (params bound directly, no call,
 -- no string round-trip), which also lets its shared vars collapse to run-locals.
 local function word_varargs(w) -- word that blocks inlining
-  for _, p in ipairs(w.parts) do
-    -- $@ / $* / $# need a real param array (inlining has no call frame)…
-    if p.special and (p.special == "@" or p.special == "*" or p.special == "#") then return true end
-    -- …a ${…} op on a positional param (${*:1}/${1:-x}) is delegated verbatim and
-    -- would read the inline SITE's params, not the callee's — don't inline it…
-    if p.pexp and pexp_reads_params(p.pexp) then return true end
-    -- …and $( … ) is opaque source re-run against the live frame, so its inner
-    -- $n would see the caller's params, not the inlined ones — don't inline it.
-    if p.cmdsub then return true end
-  end
-  return false
+	for _, p in ipairs(w.parts) do
+		-- $@ / $* / $# need a real param array (inlining has no call frame)…
+		if p.special and (p.special == "@" or p.special == "*" or p.special == "#") then
+			return true
+		end
+		-- …a ${…} op on a positional param (${*:1}/${1:-x}) is delegated verbatim and
+		-- would read the inline SITE's params, not the callee's — don't inline it…
+		if p.pexp and pexp_reads_params(p.pexp) then
+			return true
+		end
+		-- …and $( … ) is opaque source re-run against the live frame, so its inner
+		-- $n would see the caller's params, not the inlined ones — don't inline it.
+		if p.cmdsub then
+			return true
+		end
+	end
+	return false
 end
 -- An arith node is inline-substitutable only if subst_arith reaches every leaf that
 -- could reference the caller. An `xpand` (embedded $-expansion, e.g. `$(( $* ))`) is
 -- delegated verbatim and would re-read the INLINE SITE's sh.params/vars — never inline it.
 local function arith_inlinable(e)
-  if type(e) ~= "table" then return true end
-  if e.k == "xpand" then return false end
-  return arith_inlinable(e.e) and arith_inlinable(e.l) and arith_inlinable(e.r)
-    and arith_inlinable(e.c) and arith_inlinable(e.a) and arith_inlinable(e.b)
+	if type(e) ~= "table" then
+		return true
+	end
+	if e.k == "xpand" then
+		return false
+	end
+	return arith_inlinable(e.e)
+		and arith_inlinable(e.l)
+		and arith_inlinable(e.r)
+		and arith_inlinable(e.c)
+		and arith_inlinable(e.a)
+		and arith_inlinable(e.b)
 end
 
 local function inlinable_body(body)
-  for _, st in ipairs(body) do
-    -- A redirect whose target references params/cmdsub (`echo x > "$@"`, `: >&$1`)
-    -- can't inline — spliced at the call site it would read the SITE's params, not
-    -- the callee's (a static `> /tmp/f` redirect is fine and stays inlinable).
-    if st.redirs then
-      for _, r in ipairs(st.redirs) do
-        if str_reads_params(r.target) or str_reads_params(r.word)
-            or (r.expand and str_reads_params(r.body)) then return false end
-      end
-    end
-    if st.t == "assign" then
-      if st.rhs and word_varargs(st.rhs) then return false end
-      if st.arith and not arith_inlinable(st.arith) then return false end
-    elseif st.t == "simple" then
-      local cmd = st.words[1] and st.words[1].parts[1] and st.words[1].parts[1].lit
-      if not (cmd == "echo" or cmd == ":" or cmd == "true" or cmd == "false") then return false end
-      for j = 2, #st.words do if word_varargs(st.words[j]) then return false end end
-    else
-      return false
-    end
-  end
-  return true
+	for _, st in ipairs(body) do
+		-- A redirect whose target references params/cmdsub (`echo x > "$@"`, `: >&$1`)
+		-- can't inline — spliced at the call site it would read the SITE's params, not
+		-- the callee's (a static `> /tmp/f` redirect is fine and stays inlinable).
+		if st.redirs then
+			for _, r in ipairs(st.redirs) do
+				if
+					str_reads_params(r.target)
+					or str_reads_params(r.word)
+					or (r.expand and str_reads_params(r.body))
+				then
+					return false
+				end
+			end
+		end
+		if st.t == "assign" then
+			if st.rhs and word_varargs(st.rhs) then
+				return false
+			end
+			if st.arith and not arith_inlinable(st.arith) then
+				return false
+			end
+		elseif st.t == "simple" then
+			local cmd = st.words[1] and st.words[1].parts[1] and st.words[1].parts[1].lit
+			if not (cmd == "echo" or cmd == ":" or cmd == "true" or cmd == "false") then
+				return false
+			end
+			for j = 2, #st.words do
+				if word_varargs(st.words[j]) then
+					return false
+				end
+			end
+		else
+			return false
+		end
+	end
+	return true
 end
 
 -- Substitute positional params ($n) with the caller's already-computed Lua exprs.
 -- pb[n] = { int = <arith Lua expr>, str = <string Lua expr> }.
 local function subst_arith(e, pb)
-  if type(e) ~= "table" then return e end
-  local k = e.k
-  if k == "param" then -- unset positional inside the callee is 0 in arith
-    return pb[e.n] and { k = "raw", code = pb[e.n].int } or { k = "num", v = "0" }
-  end
-  if k == "bin" then return { k = "bin", op = e.op, l = subst_arith(e.l, pb), r = subst_arith(e.r, pb) } end
-  if k == "un" then return { k = "un", op = e.op, e = subst_arith(e.e, pb) } end
-  if k == "asgn" then return { k = "asgn", name = e.name, op = e.op, e = subst_arith(e.e, pb) } end
-  return e -- num, var, post, pre, raw
+	if type(e) ~= "table" then
+		return e
+	end
+	local k = e.k
+	if k == "param" then -- unset positional inside the callee is 0 in arith
+		return pb[e.n] and { k = "raw", code = pb[e.n].int } or { k = "num", v = "0" }
+	end
+	if k == "bin" then
+		return { k = "bin", op = e.op, l = subst_arith(e.l, pb), r = subst_arith(e.r, pb) }
+	end
+	if k == "un" then
+		return { k = "un", op = e.op, e = subst_arith(e.e, pb) }
+	end
+	if k == "asgn" then
+		return { k = "asgn", name = e.name, op = e.op, e = subst_arith(e.e, pb) }
+	end
+	return e -- num, var, post, pre, raw
 end
 local function subst_word(w, pb)
-  local parts = {}
-  for _, p in ipairs(w.parts) do
-    if p.param then parts[#parts + 1] = pb[p.param] and { raw = pb[p.param].str } or { lit = "" } -- unset positional = ""
-    elseif p.arith then parts[#parts + 1] = { arithast = subst_arith(safe_arith(p.arith), pb) }
-    else parts[#parts + 1] = p end
-  end
-  return { k = "word", parts = parts }
+	local parts = {}
+	for _, p in ipairs(w.parts) do
+		if p.param then
+			parts[#parts + 1] = pb[p.param] and { raw = pb[p.param].str } or { lit = "" } -- unset positional = ""
+		elseif p.arith then
+			parts[#parts + 1] = { arithast = subst_arith(safe_arith(p.arith), pb) }
+		else
+			parts[#parts + 1] = p
+		end
+	end
+	return { k = "word", parts = parts }
 end
 local function subst_list(body, pb)
-  local out = {}
-  for _, st in ipairs(body) do
-    if st.t == "assign" then
-      out[#out + 1] = st.arith and { t = "assign", name = st.name, arith = subst_arith(st.arith, pb), line = st.line }
-        or { t = "assign", name = st.name, rhs = subst_word(st.rhs, pb), line = st.line }
-    elseif st.t == "simple" then
-      local words = {}
-      for _, w in ipairs(st.words) do words[#words + 1] = subst_word(w, pb) end
-      out[#out + 1] = { t = "simple", words = words, line = st.line } -- keep line for $LINENO
-    end
-  end
-  return out
+	local out = {}
+	for _, st in ipairs(body) do
+		if st.t == "assign" then
+			out[#out + 1] = st.arith
+					and { t = "assign", name = st.name, arith = subst_arith(st.arith, pb), line = st.line }
+				or { t = "assign", name = st.name, rhs = subst_word(st.rhs, pb), line = st.line }
+		elseif st.t == "simple" then
+			local words = {}
+			for _, w in ipairs(st.words) do
+				words[#words + 1] = subst_word(w, pb)
+			end
+			out[#out + 1] = { t = "simple", words = words, line = st.line } -- keep line for $LINENO
+		end
+	end
+	return out
 end
 
 -- Build a pc-dispatch CFG for a statement list. Shared by the top-level `run`
@@ -1966,1278 +3039,1887 @@ end
 -- call), `inlinefns[name]` gives the body of an inlinable one (spliced in place).
 -- Returns { blocks, npc, entry, loopPc, stmtPc, DONE }.
 build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
-  emit_toplevel = toplevel and true or false -- gates top-level-only ERR firing (see errchk)
-  local blocks = {}
-  local loopPc, stmtPc = {}, {}
-  local npc = 0
-  local function newpc() local p = npc; npc = npc + 1; return p end
+	emit_toplevel = toplevel and true or false -- gates top-level-only ERR firing (see errchk)
+	local blocks = {}
+	local loopPc, stmtPc = {}, {}
+	local npc = 0
+	local function newpc()
+		local p = npc
+		npc = npc + 1
+		return p
+	end
 
-  local DONE = newpc()
-  blocks[DONE] = "break"
+	local DONE = newpc()
+	blocks[DONE] = "break"
 
-  -- Compile-time loop stack for break/continue: each entry is { brk = pc to exit
-  -- the loop, cont = pc to re-test/advance }. `break N` / `continue N` jump to the
-  -- Nth-innermost enclosing loop — a compile-time decision, so they become native
-  -- jumps (no runtime unwind). loopvars are run()-level status holders (one per
-  -- command-condition while), declared 0 and used to give the loop bash's exit
-  -- status (last body command, or 0). Both are returned for assemble to declare.
-  local loopstack, loopvars = {}, {}
-  local function newloopvar() local v = "__lw" .. #loopvars; loopvars[#loopvars + 1] = v; return v end
-  -- Stack of subshell exit pcs (subshell_exit). `return` inside a subshell exits the
-  -- subshell with that status (like `exit`), so it targets this — not the function's
-  -- DONE, which in the forked child would return PAST the subshell.
-  local subexit = {}
+	-- Compile-time loop stack for break/continue: each entry is { brk = pc to exit
+	-- the loop, cont = pc to re-test/advance }. `break N` / `continue N` jump to the
+	-- Nth-innermost enclosing loop — a compile-time decision, so they become native
+	-- jumps (no runtime unwind). loopvars are run()-level status holders (one per
+	-- command-condition while), declared 0 and used to give the loop bash's exit
+	-- status (last body command, or 0). Both are returned for assemble to declare.
+	local loopstack, loopvars = {}, {}
+	local function newloopvar()
+		local v = "__lw" .. #loopvars
+		loopvars[#loopvars + 1] = v
+		return v
+	end
+	-- Stack of subshell exit pcs (subshell_exit). `return` inside a subshell exits the
+	-- subshell with that status (like `exit`), so it targets this — not the function's
+	-- DONE, which in the forked child would return PAST the subshell.
+	local subexit = {}
 
-  local flatten_list
+	local flatten_list
 
-  -- Delegate a cold statement to the shared interpreter on a baked AST node. Lifted
-  -- locals are synced to `sh` before and reloaded after, so the interpreter sees
-  -- current values and picks up any it changed (delegated statements are cold, so
-  -- this sync costs nothing). This is how the compiled tier reaches feature parity
-  -- without re-implementing the word engine in generated code.
-  -- `opts` (optional) swaps the interp delegation for a compiled dispatch that reuses this
-  -- wrapper's control-flow-signal translation: opts.prelude is emitted first (e.g. building
-  -- __a, a native argv), and opts.callee(opts.callargs) replaces I.exec_stmt(sh, ser(st)).
-  -- Used by the dynamic command word (rt.exec_dynamic on a field-engine-built argv).
-  local function delegate(st, after, opts)
-    local p = newpc()
-    local prelude = opts and opts.prelude
-    local callee = (opts and opts.callee) or "I.exec_stmt"
-    local callargs = (opts and opts.callargs) or ("sh, %s, __noop"):format(ser(st))
-    local sync_in, sync_out = {}, {}
-    for n in pairs(lifted) do sync_in[#sync_in + 1] = ("sh:aset(%q, %s)"):format(n, lname(n)) end
-    for n in pairs(lifted) do sync_out[#sync_out + 1] = ("%s = sh:aget(%q)"):format(lname(n), n) end
-    -- errexit: a delegated errexit-relevant statement (interp's exec_stmt doesn't
-    -- fire it — exec_list does) gets the guard here. Compounds (if/for/case) fire
-    -- errexit for their inner commands inside exec_stmt already, so they're excluded.
-    local ec = errchk(st)
-    -- CONTROL FLOW THROUGH DELEGATION: a delegated `eval break`, a dynamic command
-    -- word that resolves to break/continue/return (`b=break; $b`), or a delegated
-    -- compound (case/pipeline) containing one, raises a __curse_break/continue/return
-    -- from the interpreter. The compiled CFG is pc-based (no Lua loop to unwind to),
-    -- so unguarded it would escape run() entirely. When this delegate sits inside a
-    -- compiled loop or function, wrap exec_stmt in a pcall and translate the signal
-    -- into the native pc jump the corresponding literal keyword would make. loopdepth/
-    -- calldepth are set to the compile-time nesting first, so the interpreter's break/
-    -- continue/return actually FIRE (they gate on "is there an enclosing loop/func").
-    local inloop, infunc = #loopstack > 0, not toplevel
-    -- opts.redir (a redir_conds expression) wraps the compiled callee in install/restore:
-    -- the redirs apply around the dispatch (a failed one -> status 1, no call), then restore.
-    local redir = opts and opts.redir
-    local function callwrap()
-      if redir then
-        return ("do local __rs = {}; if %s then %s(%s) else sh.status = 1 end; rt.redir_restore(__rs) end")
-          :format(redir, callee, callargs)
-      end
-      return ("%s(%s)"):format(callee, callargs)
-    end
-    if not (inloop or infunc) then -- top level, no loop: nothing to catch (interp no-ops)
-      local out = {}
-      for _, s in ipairs(sync_in) do out[#out + 1] = s end
-      if prelude then out[#out + 1] = prelude end
-      out[#out + 1] = callwrap()
-      for _, s in ipairs(sync_out) do out[#out + 1] = s end
-      if ec ~= "" then out[#out + 1] = ec end
-      out[#out + 1] = ("pc = %d"):format(after)
-      blocks[p] = table.concat(out, "; ")
-      return p
-    end
-    local o = { "do", table.concat(sync_in, "; ") }
-    if prelude then o[#o + 1] = prelude end
-    o[#o + 1] = "local __sl, __sc = sh.loopdepth, sh.calldepth"
-    if inloop then o[#o + 1] = ("sh.loopdepth = %d"):format(#loopstack) end
-    if infunc then o[#o + 1] = "if (sh.calldepth or 0) < 1 then sh.calldepth = 1 end" end
-    if redir then
-      -- install the redirs, run the dispatch (still under pcall so a break/continue/return
-      -- signal is caught below) only if they succeeded, then restore — regardless of signal.
-      o[#o + 1] = "local __rs = {}; local __ok, __e = true, nil"
-      o[#o + 1] = ("if %s then __ok, __e = pcall(%s, %s) else sh.status = 1 end"):format(redir, callee, callargs)
-      o[#o + 1] = "rt.redir_restore(__rs)"
-    else
-      o[#o + 1] = ("local __ok, __e = pcall(%s, %s)"):format(callee, callargs)
-    end
-    o[#o + 1] = "sh.loopdepth, sh.calldepth = __sl, __sc"
-    o[#o + 1] = table.concat(sync_out, "; ")
-    o[#o + 1] = ("if __ok then %spc = %d"):format(ec ~= "" and (ec .. "; ") or "", after)
-    o[#o + 1] = "elseif type(__e) == \"table\" then"
-    local hs = {}
-    if inloop then
-      local brk, cont = {}, {} -- innermost-first: level 1 = nearest enclosing loop
-      for i = #loopstack, 1, -1 do brk[#brk + 1] = tostring(loopstack[i].brk); cont[#cont + 1] = tostring(loopstack[i].cont) end
-      -- interp already set sh.status before raising (0 normal, 1/128 on a bad arg);
-      -- leave it — the loop's exit status is the break/continue command's, like bash.
-      hs[#hs + 1] = ("if __e.__curse_break then local __lv = __e.__curse_break; if __lv > %d then __lv = %d end; pc = ({%s})[__lv]")
-        :format(#loopstack, #loopstack, table.concat(brk, ", "))
-      hs[#hs + 1] = ("elseif __e.__curse_continue then local __lv = __e.__curse_continue; if __lv > %d then __lv = %d end; pc = ({%s})[__lv]")
-        :format(#loopstack, #loopstack, table.concat(cont, ", "))
-    end
-    if infunc then
-      hs[#hs + 1] = ("%s __e.__curse_return ~= nil then sh.status = __e.__curse_return; pc = %d")
-        :format(#hs > 0 and "elseif" or "if", subexit[#subexit] or DONE)
-    end
-    o[#o + 1] = table.concat(hs, " ") .. " else error(__e) end"
-    o[#o + 1] = "else error(__e) end"
-    o[#o + 1] = "end"
-    blocks[p] = table.concat(o, "\n")
-    return p
-  end
+	-- Delegate a cold statement to the shared interpreter on a baked AST node. Lifted
+	-- locals are synced to `sh` before and reloaded after, so the interpreter sees
+	-- current values and picks up any it changed (delegated statements are cold, so
+	-- this sync costs nothing). This is how the compiled tier reaches feature parity
+	-- without re-implementing the word engine in generated code.
+	-- `opts` (optional) swaps the interp delegation for a compiled dispatch that reuses this
+	-- wrapper's control-flow-signal translation: opts.prelude is emitted first (e.g. building
+	-- __a, a native argv), and opts.callee(opts.callargs) replaces I.exec_stmt(sh, ser(st)).
+	-- Used by the dynamic command word (rt.exec_dynamic on a field-engine-built argv).
+	local function delegate(st, after, opts)
+		local p = newpc()
+		local prelude = opts and opts.prelude
+		local callee = (opts and opts.callee) or "I.exec_stmt"
+		local callargs = (opts and opts.callargs) or ("sh, %s, __noop"):format(ser(st))
+		local sync_in, sync_out = {}, {}
+		for n in pairs(lifted) do
+			sync_in[#sync_in + 1] = ("sh:aset(%q, %s)"):format(n, lname(n))
+		end
+		for n in pairs(lifted) do
+			sync_out[#sync_out + 1] = ("%s = sh:aget(%q)"):format(lname(n), n)
+		end
+		-- errexit: a delegated errexit-relevant statement (interp's exec_stmt doesn't
+		-- fire it — exec_list does) gets the guard here. Compounds (if/for/case) fire
+		-- errexit for their inner commands inside exec_stmt already, so they're excluded.
+		local ec = errchk(st)
+		-- CONTROL FLOW THROUGH DELEGATION: a delegated `eval break`, a dynamic command
+		-- word that resolves to break/continue/return (`b=break; $b`), or a delegated
+		-- compound (case/pipeline) containing one, raises a __curse_break/continue/return
+		-- from the interpreter. The compiled CFG is pc-based (no Lua loop to unwind to),
+		-- so unguarded it would escape run() entirely. When this delegate sits inside a
+		-- compiled loop or function, wrap exec_stmt in a pcall and translate the signal
+		-- into the native pc jump the corresponding literal keyword would make. loopdepth/
+		-- calldepth are set to the compile-time nesting first, so the interpreter's break/
+		-- continue/return actually FIRE (they gate on "is there an enclosing loop/func").
+		local inloop, infunc = #loopstack > 0, not toplevel
+		-- opts.redir (a redir_conds expression) wraps the compiled callee in install/restore:
+		-- the redirs apply around the dispatch (a failed one -> status 1, no call), then restore.
+		local redir = opts and opts.redir
+		local function callwrap()
+			if redir then
+				return ("do local __rs = {}; if %s then %s(%s) else sh.status = 1 end; rt.redir_restore(__rs) end"):format(
+					redir,
+					callee,
+					callargs
+				)
+			end
+			return ("%s(%s)"):format(callee, callargs)
+		end
+		if not (inloop or infunc) then -- top level, no loop: nothing to catch (interp no-ops)
+			local out = {}
+			for _, s in ipairs(sync_in) do
+				out[#out + 1] = s
+			end
+			if prelude then
+				out[#out + 1] = prelude
+			end
+			out[#out + 1] = callwrap()
+			for _, s in ipairs(sync_out) do
+				out[#out + 1] = s
+			end
+			if ec ~= "" then
+				out[#out + 1] = ec
+			end
+			out[#out + 1] = ("pc = %d"):format(after)
+			blocks[p] = table.concat(out, "; ")
+			return p
+		end
+		local o = { "do", table.concat(sync_in, "; ") }
+		if prelude then
+			o[#o + 1] = prelude
+		end
+		o[#o + 1] = "local __sl, __sc = sh.loopdepth, sh.calldepth"
+		if inloop then
+			o[#o + 1] = ("sh.loopdepth = %d"):format(#loopstack)
+		end
+		if infunc then
+			o[#o + 1] = "if (sh.calldepth or 0) < 1 then sh.calldepth = 1 end"
+		end
+		if redir then
+			-- install the redirs, run the dispatch (still under pcall so a break/continue/return
+			-- signal is caught below) only if they succeeded, then restore — regardless of signal.
+			o[#o + 1] = "local __rs = {}; local __ok, __e = true, nil"
+			o[#o + 1] = ("if %s then __ok, __e = pcall(%s, %s) else sh.status = 1 end"):format(redir, callee, callargs)
+			o[#o + 1] = "rt.redir_restore(__rs)"
+		else
+			o[#o + 1] = ("local __ok, __e = pcall(%s, %s)"):format(callee, callargs)
+		end
+		o[#o + 1] = "sh.loopdepth, sh.calldepth = __sl, __sc"
+		o[#o + 1] = table.concat(sync_out, "; ")
+		o[#o + 1] = ("if __ok then %spc = %d"):format(ec ~= "" and (ec .. "; ") or "", after)
+		o[#o + 1] = 'elseif type(__e) == "table" then'
+		local hs = {}
+		if inloop then
+			local brk, cont = {}, {} -- innermost-first: level 1 = nearest enclosing loop
+			for i = #loopstack, 1, -1 do
+				brk[#brk + 1] = tostring(loopstack[i].brk)
+				cont[#cont + 1] = tostring(loopstack[i].cont)
+			end
+			-- interp already set sh.status before raising (0 normal, 1/128 on a bad arg);
+			-- leave it — the loop's exit status is the break/continue command's, like bash.
+			hs[#hs + 1] = ("if __e.__curse_break then local __lv = __e.__curse_break; if __lv > %d then __lv = %d end; pc = ({%s})[__lv]"):format(
+				#loopstack,
+				#loopstack,
+				table.concat(brk, ", ")
+			)
+			hs[#hs + 1] = ("elseif __e.__curse_continue then local __lv = __e.__curse_continue; if __lv > %d then __lv = %d end; pc = ({%s})[__lv]"):format(
+				#loopstack,
+				#loopstack,
+				table.concat(cont, ", ")
+			)
+		end
+		if infunc then
+			hs[#hs + 1] = ("%s __e.__curse_return ~= nil then sh.status = __e.__curse_return; pc = %d"):format(
+				#hs > 0 and "elseif" or "if",
+				subexit[#subexit] or DONE
+			)
+		end
+		o[#o + 1] = table.concat(hs, " ") .. " else error(__e) end"
+		o[#o + 1] = "else error(__e) end"
+		o[#o + 1] = "end"
+		blocks[p] = table.concat(o, "\n")
+		return p
+	end
 
-  -- Statement types with no native compiled form yet -> always delegate.
-  local DELEGATE = {
-    parse_error = 1, assignlist = 1,
-  }
+	-- Statement types with no native compiled form yet -> always delegate.
+	local DELEGATE = {
+		parse_error = 1,
+		assignlist = 1,
+	}
 
-  -- Compile one redirect's target to a native Lua expr (op + fd are already
-  -- compile-time constants). Returns the expr, or nil when this redirect isn't
-  -- monomorphic enough to compile — a `{var}>` named fd, a fd MOVE (`>&N-`), an
-  -- expanding heredoc, a dup target that isn't a plain fd, or a FILE target that
-  -- needs the field engine ($/glob/brace/tilde/split/ambiguity). The caller then
-  -- delegates the whole command (honest transition; those are the defect to grind).
-  local P = require("parser")
-  local REDIR_FILE = { out = 1, app = 1, ["in"] = 1, clobber = 1, rw = 1, appboth = 1, outboth = 1 }
-  -- One redirect -> its full rt.redir_apply[_expand] call expression, or nil to delegate the
-  -- whole command (a {var}> named fd, a fd MOVE, an expanding heredoc, a dup to a dynamic fd,
-  -- a brace/cmdsub/procsub/non-seg target). A FILE target that is a static literal path applies
-  -- directly; an EXPANDABLE one ($/glob/~ etc.) hands mask-aware segments to redir_apply_expand
-  -- (field expansion + the ambiguous-redirect check at runtime).
-  local function redir_apply_expr(r)
-    if r.fdvar then return nil end
-    local op, fd = r.op, r.fd or 0
-    if REDIR_FILE[op] then
-      local t = r.target or ""
-      if t == "" then return nil end
-      if not t:find("[%$`%*%?%[~{()]") then -- static literal path
-        return ("rt.redir_apply(sh, %q, %d, %q, __rs)"):format(op, fd, t)
-      end
-      if t:find("{", 1, true) then return nil end -- brace expansion in the target: let interp handle it
-      local ok, w = pcall(P.parse_word, t)
-      if not (ok and seg_native(w)) then return nil end -- cmdsub/arith/procsub/nameref target: delegate
-      local segs = {}
-      for i, p in ipairs(w.parts) do segs[#segs + 1] = emit_seg(p, i, lifted) end
-      return ("rt.redir_apply_expand(sh, %q, %d, {%s}, %q, __rs)"):format(op, fd, table.concat(segs, ", "), t)
-    elseif op == "dup" or op == "dupin" then
-      local t = r.target or ""
-      if t == "-" or t:match("^%d+$") then return ("rt.redir_apply(sh, %q, %d, %q, __rs)"):format(op, fd, t) end
-      return nil -- a dynamic fd, or a MOVE (`>&5-`): delegate
-    elseif op == "herestring" then
-      local w = P.parse_word(r.word or ""); if not emitable_word(w) then return nil end
-      return ("rt.redir_apply(sh, %q, %d, (%s .. \"\\n\"), __rs)"):format(op, fd, emit_word(w, lifted))
-    elseif op == "heredoc" then
-      if r.expand then
-        -- an UNquoted-delimiter heredoc (<<EOF) expands its body like a double-quoted string
-        -- ($var/$(cmd)/arith, no split/glob): parse it in heredoc mode and render with emit_word,
-        -- exactly interp's expand_word(parse_heredoc(body, true)). A part emit_word can't render
-        -- (procsub/nameref/$LINENO/…) fails emitable_word -> delegate.
-        local ok, w = pcall(P.parse_heredoc, r.body or "", true)
-        if not (ok and emitable_word(w)) then return nil end
-        return ("rt.redir_apply(sh, %q, %d, %s, __rs)"):format(op, fd, emit_word(w, lifted))
-      end
-      return ("rt.redir_apply(sh, %q, %d, %q, __rs)"):format(op, fd, r.body or "")
-    end
-    return nil
-  end
-  -- Build the "install all redirs, run, restore" conditions for `st.redirs`, or nil if any redir
-  -- can't be compiled (caller delegates) or the command is `exec` (whose redirs must PERSIST).
-  local function redir_conds(st, cmd)
-    if cmd == "exec" then return nil end
-    local conds = {}
-    for _, r in ipairs(st.redirs) do
-      local e = redir_apply_expr(r); if not e then return nil end
-      conds[#conds + 1] = e
-    end
-    return table.concat(conds, " and ")
-  end
+	-- Compile one redirect's target to a native Lua expr (op + fd are already
+	-- compile-time constants). Returns the expr, or nil when this redirect isn't
+	-- monomorphic enough to compile — a `{var}>` named fd, a fd MOVE (`>&N-`), an
+	-- expanding heredoc, a dup target that isn't a plain fd, or a FILE target that
+	-- needs the field engine ($/glob/brace/tilde/split/ambiguity). The caller then
+	-- delegates the whole command (honest transition; those are the defect to grind).
+	local P = require("parser")
+	local REDIR_FILE = { out = 1, app = 1, ["in"] = 1, clobber = 1, rw = 1, appboth = 1, outboth = 1 }
+	-- One redirect -> its full rt.redir_apply[_expand] call expression, or nil to delegate the
+	-- whole command (a {var}> named fd, a fd MOVE, an expanding heredoc, a dup to a dynamic fd,
+	-- a brace/cmdsub/procsub/non-seg target). A FILE target that is a static literal path applies
+	-- directly; an EXPANDABLE one ($/glob/~ etc.) hands mask-aware segments to redir_apply_expand
+	-- (field expansion + the ambiguous-redirect check at runtime).
+	local function redir_apply_expr(r)
+		if r.fdvar then
+			return nil
+		end
+		local op, fd = r.op, r.fd or 0
+		if REDIR_FILE[op] then
+			local t = r.target or ""
+			if t == "" then
+				return nil
+			end
+			if not t:find("[%$`%*%?%[~{()]") then -- static literal path
+				return ("rt.redir_apply(sh, %q, %d, %q, __rs)"):format(op, fd, t)
+			end
+			if t:find("{", 1, true) then
+				return nil
+			end -- brace expansion in the target: let interp handle it
+			local ok, w = pcall(P.parse_word, t)
+			if not (ok and seg_native(w)) then
+				return nil
+			end -- cmdsub/arith/procsub/nameref target: delegate
+			local segs = {}
+			for i, p in ipairs(w.parts) do
+				segs[#segs + 1] = emit_seg(p, i, lifted)
+			end
+			return ("rt.redir_apply_expand(sh, %q, %d, {%s}, %q, __rs)"):format(op, fd, table.concat(segs, ", "), t)
+		elseif op == "dup" or op == "dupin" then
+			local t = r.target or ""
+			if t == "-" or t:match("^%d+$") then
+				return ("rt.redir_apply(sh, %q, %d, %q, __rs)"):format(op, fd, t)
+			end
+			return nil -- a dynamic fd, or a MOVE (`>&5-`): delegate
+		elseif op == "herestring" then
+			local w = P.parse_word(r.word or "")
+			if not emitable_word(w) then
+				return nil
+			end
+			return ('rt.redir_apply(sh, %q, %d, (%s .. "\\n"), __rs)'):format(op, fd, emit_word(w, lifted))
+		elseif op == "heredoc" then
+			if r.expand then
+				-- an UNquoted-delimiter heredoc (<<EOF) expands its body like a double-quoted string
+				-- ($var/$(cmd)/arith, no split/glob): parse it in heredoc mode and render with emit_word,
+				-- exactly interp's expand_word(parse_heredoc(body, true)). A part emit_word can't render
+				-- (procsub/nameref/$LINENO/…) fails emitable_word -> delegate.
+				local ok, w = pcall(P.parse_heredoc, r.body or "", true)
+				if not (ok and emitable_word(w)) then
+					return nil
+				end
+				return ("rt.redir_apply(sh, %q, %d, %s, __rs)"):format(op, fd, emit_word(w, lifted))
+			end
+			return ("rt.redir_apply(sh, %q, %d, %q, __rs)"):format(op, fd, r.body or "")
+		end
+		return nil
+	end
+	-- Build the "install all redirs, run, restore" conditions for `st.redirs`, or nil if any redir
+	-- can't be compiled (caller delegates) or the command is `exec` (whose redirs must PERSIST).
+	local function redir_conds(st, cmd)
+		if cmd == "exec" then
+			return nil
+		end
+		local conds = {}
+		for _, r in ipairs(st.redirs) do
+			local e = redir_apply_expr(r)
+			if not e then
+				return nil
+			end
+			conds[#conds + 1] = e
+		end
+		return table.concat(conds, " and ")
+	end
 
-  -- Build blocks for `st`; its exit flows to pc `after`. Returns st's entry pc.
-  local function flatten_stmt(st, after)
-    local t = st.t
-    if st.line then EF.cur_line = st.line end -- for $LINENO (compile-time constant)
-    -- break / continue [N]: a compile-time jump to the Nth enclosing loop's exit or
-    -- re-test point. Both set $?=0 (bash). Outside any loop it's a no-op. A
-    -- non-literal level (`break $n`) is rare — delegate it.
-    local cf_op, cf_arg = resolve_cf(st)
-    if cf_op == "break" or cf_op == "continue" then
-      local lvl, ok = 1, true
-      if st.words[cf_arg] then
-        local wl = full_lit(st.words[cf_arg])
-        if wl and wl:match("^%d+$") and not st.words[cf_arg + 1] then lvl = tonumber(wl)
-        else ok = false end
-      end
-      if ok then
-        local p = newpc()
-        local d = dbg(st) -- DEBUG fires before break/continue too (it's a command)
-        if #loopstack == 0 then blocks[p] = d .. ("sh.status = 0; pc = %d"):format(after) -- no-op outside a loop
-        else
-          local idx = #loopstack - (lvl - 1); if idx < 1 then idx = 1 end
-          local tgt = (cf_op == "break") and loopstack[idx].brk or loopstack[idx].cont
-          blocks[p] = d .. ("sh.status = 0; pc = %d"):format(tgt)
-        end
-        return p
-      end
-    elseif cf_op == "return" then
-      -- `return` at the top level is an error (status 2 + diagnostic, but execution
-      -- continues) — not a program exit. A compiled top level is always the main
-      -- script (source runs through interp), so delegate and let interp diagnose.
-      if toplevel then return delegate(st, after) end
-      -- return [N] (incl. \return / builtin return / command return): set $? and exit
-      -- the CFG. rt.return_status: N%256, or 2 + diagnostic on non-numeric; no arg → $?.
-      -- inside a subshell, `return` exits the subshell (subshell_exit) with the
-      -- status; otherwise it exits the function/CFG at DONE.
-      local retpc = subexit[#subexit] or DONE
-      local aw = st.words[cf_arg]
-      if not st.words[cf_arg + 1] then -- at most one status WORD (pre-split)
-        local d = dbg(st) -- DEBUG fires before return too
-        if not aw then -- `return` with no arg → previous status
-          local p = newpc(); blocks[p] = d .. ("pc = %d"):format(retpc); return p
-        elseif word_safe(aw) then -- one field (literal/quoted): `return ""` → 2, `return 42` → 42
-          local p = newpc()
-          blocks[p] = d .. ("sh.status = rt.return_status(sh, %s); pc = %d"):format(emit_word(aw, lifted), retpc)
-          return p
-        elseif field_word(aw, lifted) then -- unquoted expansion: split — 0 fields → $?, else 1st field
-          local fw = field_word(aw, lifted)
-          local p = newpc()
-          blocks[p] = d .. ("do local __f = rt.field_split(sh, %s, %s); if #__f > 0 then sh.status = rt.return_status(sh, __f[1]) end end; pc = %d")
-            :format(fw.expr, tostring(fw.split), retpc)
-          return p
-        end -- else (pexp/${…}): not intercepted — falls through (emit deopts to interp, which is correct)
-      end
-    elseif cf_op == "exit" then
-      -- `exit [N]` inside a compiled subshell exits ONLY the subshell (bash), so jump to its
-      -- subshell_exit pc with the status; otherwise raise __curse_exit, which finish() catches
-      -- (sets $?, runs the EXIT trap, ends the shell) — the same signal delegation raised, so
-      -- no behavioral change but no I.exec_stmt. A delegated __curse_exit inside a compiled
-      -- subshell would unwind to run_trap's pcall and the child would CONTINUE, hence the
-      -- subshell jump. Multi-arg (`exit a b`: too-many, non-fatal) / dynamic arg -> delegate.
-      local exitp = #subexit > 0 and subexit[#subexit] or nil
-      local aw = st.words[cf_arg]
-      if not st.words[cf_arg + 1] then
-        local d = dbg(st)
-        local statusexpr = aw and word_safe(aw) and ("rt.return_status(sh, %s, \"exit\")"):format(emit_word(aw, lifted))
-          or (not aw and "sh.status") or nil
-        if statusexpr then
-          local p = newpc()
-          if exitp then blocks[p] = d .. ("sh.status = %s; pc = %d"):format(statusexpr, exitp)
-          else blocks[p] = d .. ("error({ __curse_exit = %s })"):format(statusexpr) end
-          return p
-        end
-      end -- dynamic/multi-arg: fall through to delegate
-    end
-    if t == "dbracket" then
-      -- [[ ]] : compile the and/or/not tree + leaf comparisons natively; $? = 0/1.
-      -- Any leaf the compiler can't render (mixed-quote glob, procsub) -> delegate.
-      if st.redirs then return delegate(st, after) end
-      -- `[[ L =~ R ]]` as the SOLE condition: emit_dbracket can't express =~ (it has a
-      -- BASH_REMATCH side effect AND a tri-state status — 0 match / 1 no-match / 2 bad
-      -- regex — that the boolean leaf model has no slot for), so compile it here via
-      -- rt.regex_captures (real POSIX ERE, exactly interp's path). The RHS is rendered
-      -- mask-aware by emit_regex_glob. A =~ nested inside and/or/not still delegates.
-      if st.expr.kind == "binary" and st.expr.op == "=~" and db_word_ok(st.expr.l) then
-        local re = EF.emit_regex_glob(st.expr.r, lifted)
-        if re then
-          local p = newpc()
-          local d = dbg(st)
-          local ec = errchk(st); local ecs = ec ~= "" and ("; " .. ec) or ""
-          blocks[p] = d .. ("do local __c, __bad = rt.regex_captures(%s, %s, (sh.shopt.nocasematch and true or nil)); if __bad then sh.status = 2 else sh:array_assign(\"BASH_REMATCH\", __c or {}, false); sh.status = __c and 0 or 1 end end%s; pc = %d")
-            :format(emit_word(st.expr.l, lifted), re, ecs, after)
-          return p
-        end
-      end
-      local cond = emit_dbracket(st.expr, lifted)
-      if not cond then return delegate(st, after) end
-      local p = newpc()
-      local d = dbg(st)
-      local ec = errchk(st); local ecs = ec ~= "" and ("; " .. ec) or ""
-      blocks[p] = d .. ("sh.status = (%s) and 0 or 1%s; pc = %d"):format(cond, ecs, after)
-      return p
-    end
-    if DELEGATE[t] then return delegate(st, after) end
-    if t == "assign" then
-      -- The program declares a nameref: a plain `name=value` may write THROUGH one
-      -- (to a var / array or assoc element / a detected cycle) — only interp's full
-      -- assign does that, so delegate. Gated to nameref programs (rare); ordinary
-      -- assigns stay native (via rt.assign_scalar, which does the nameref write-through).
-      -- A nameref ELEMENT/append/arith assign (ref[i]=, ref+=, ref=$((…))) needs interp's
-      -- fuller handling, so delegate those; a plain scalar ref=value compiles.
-      if EF.has_nameref and (st.index or st.append or st.arith) then return delegate(st, after) end
-      -- Assigning these fires a side effect only interp's assign implements (resize
-      -- history / truncate the histfile); a native set_str would skip it. Delegate.
-      if not st.index and (st.name == "HISTSIZE" or st.name == "HISTFILESIZE") then return delegate(st, after) end
-      -- SHELLOPTS/BASHOPTS are readonly derived specials with no var box, so neither a
-      -- bare native set nor I.assign_scalar rejects them. Always delegate so interp
-      -- reports "readonly variable" (status 1), as bash does.
-      if not st.index and (st.name == "SHELLOPTS" or st.name == "BASHOPTS") then return delegate(st, after) end
-      if (st.rhs and not emitable_word(st.rhs))
-        or (st.arith and arith_side_effect(st.arith)) then return delegate(st, after) end
-      -- a[i]=v / a[i]+=v: compile when the subscript is a non-empty emit_word-able word (rt
-      -- .assign_element resolves it as an assoc key or an indexed arith at runtime). An empty
-      -- or unrenderable subscript delegates. Gated to non-nameref programs (above) — a nameref
-      -- element write needs interp.
-      local iw
-      if st.index then
-        if st.index == "" then return delegate(st, after) end
-        local iok; iok, iw = pcall(require("parser").parse_word, st.index)
-        if not (iok and emitable_word(iw)) then return delegate(st, after) end
-        -- a cmdsub/procsub subscript is expanded once by emit_word AND (for indexed) arith-
-        -- evaluated from the raw — two evals of a side-effecting sub. Delegate those.
-        for _, pp in ipairs(iw.parts) do if pp.cmdsub or pp.procsub then return delegate(st, after) end end
-      end
-      local p = newpc()
-      local d = dbg(st) -- DEBUG trap fires before the assignment (bash: DEBUG_FIRE.assign)
-      -- assignment-RHS tilde (string paths only; st.rhs is nil for an arith assign): an
-      -- ALL-LITERAL rhs containing ~ expands each `:`-segment (`x=foo:~` -> foo:$HOME).
-      -- Only literal tildes expand — a ~ from a variable's value never does.
-      local function rhsval()
-        local fl = unq_full_lit(st.rhs)
-        if fl and fl:find("~", 1, true) then return ("rt.tilde_assign(sh, %q)"):format(fl) end
-        return emit_word(st.rhs, lifted)
-      end
-      local ua = '; sh:set_str("_", "")' -- a bare assignment resets $_ (bash)
-      if st.index then -- a[i]=v / a[i]+=v: status 0 first (so a plain RHS is 0; a cmdsub in the
-        -- subscript/RHS overwrites it), then the element assign; assign_element leaves status.
-        local ec = errchk(st); local ecs = ec ~= "" and ("; " .. ec) or ""
-        blocks[p] = d .. ("sh.status = 0; rt.assign_element(sh, %q, %q, %s, %s, %s)%s; pc = %d")
-          :format(st.name, st.index, emit_word(iw, lifted), rhsval(), tostring(st.append and true or false), ecs, after)
-        return p
-      end
-      if st.append and not st.arith then -- scalar name+=value: rt.append_scalar picks concat /
-        -- int arith-add / array[0]-append by the var's type at runtime (interp's append path).
-        local ec = errchk(st); local ecs = ec ~= "" and ("; " .. ec) or ""
-        blocks[p] = d .. ("sh.status = 0; rt.append_scalar(sh, %q, %s)%s%s; pc = %d")
-          :format(st.name, rhsval(), ecs, ua, after)
-        return p
-      end
-      if st.arith then
-        -- x=$((…)): a non-lifted read honors set -u and resolves recursively (bash),
-        -- exactly as the $(())-in-word and (( )) paths do — swap in arith_read.
-        local saved = arith_varread; arith_varread = "rt.arith_read(sh, %q)"
-        local rhs = emit_value(st.arith, lifted)
-        arith_varread = saved
-        blocks[p] = d .. emit_set(st.name, rhs, lifted) .. ua .. ("; pc = %d"):format(after)
-      elseif lifted[st.name] then
-        blocks[p] = d .. emit_set(st.name, numeric_word(st.rhs) .. "LL", lifted) .. ua .. ("; pc = %d"):format(after)
-      elseif EF.has_attr or EF.has_nameref then -- readonly / array[0] / -i,-l,-u / nameref write-through
-        -- status 0 first so a plain RHS yields 0 (a cmdsub RHS overwrites it), then
-        -- assign_scalar (readonly reject + nameref/cycle/subscript write-through); errchk applies.
-        local ec = errchk(st); local ecs = ec ~= "" and ("; " .. ec) or ""
-        blocks[p] = d .. ("sh.status = 0; rt.assign_scalar(sh, %q, %s)%s%s; pc = %d")
-          :format(st.name, rhsval(), ecs, ua, after)
-      else
-        -- $? after a plain assignment: the RHS's last cmdsub status, else 0 — but the
-        -- RHS is evaluated FIRST (so `st=$?` reads the PREVIOUS status), then reset to 0
-        -- only when the RHS has no cmdsub; then errchk fires ERR/errexit (`x=$(false)`).
-        local ec = errchk(st); local ecs = ec ~= "" and ("; " .. ec) or ""
-        local hascmd = false
-        if st.rhs then for _, pp in ipairs(st.rhs.parts) do if pp.cmdsub then hascmd = true; break end end end
-        local st0 = hascmd and "" or "; sh.status = 0"
-        blocks[p] = d .. ("sh:set_str(%q, %s)%s%s%s; pc = %d"):format(st.name, rhsval(), st0, ecs, ua, after)
-      end
-      return p
-    elseif t == "funcdef" then
-      -- Register the (hoisted) closure into sh.functions when the DEFINITION runs, not
-      -- at load — so a function doesn't "exist" (declare -f / delegated call / prefix
-      -- assign) before its def line (bash). Direct compiled calls use the hoisted local
-      -- regardless. Nested funcdefs (not in funcflags) stay a no-op for now.
-      -- def-redirect and redefined funcs: interp registers the def (with func_redirs, or
-      -- in program order for a redefinition) — the compiled fn_x can't represent either.
-      if st.redirs or emit_redir_funcs[st.name] then return delegate(st, after) end
-      local p = newpc()
-      if not st.name:match("^[%w_][%w_%.%-:+@/!#=]*$") then -- name is an expansion (`$foo-bar()`):
-        blocks[p] = ("io.stderr:write(%q); sh.status = 1; pc = %d") -- non-fatal runtime error (bash)
-          :format("curse: `" .. st.name .. "': not a valid identifier\n", after)
-      elseif funcflags[st.name] then
-        blocks[p] = ("sh.functions[%q] = %s; pc = %d"):format(st.name, fnlname(st.name), after)
-      else
-        blocks[p] = ("pc = %d"):format(after)
-      end
-      return p
-    elseif t == "simple" then
-      local cmd = st.words[1] and full_lit(st.words[1]) -- full literal → \-escaped builtins (\exit, \echo) dispatch
-      if cmd and emit_redir_funcs[cmd] then return delegate(st, after) end -- call to a def-redirect func
-      -- `local a=(…)` / `declare a=(…)`: the array value lives in st.arrayargs, which
-      -- the native builtin paths don't render — interp does the scope-aware array assign.
-      if st.arrayargs then return delegate(st, after) end
-      -- DYNAMIC command word (first word not a compile-time literal — `$cmd`, `${x}`, …):
-      -- the command STRUCTURE is a static simple-command; only the word is late-bound. Build
-      -- argv with the field engine and dispatch via rt.exec_dynamic (the command runner),
-      -- reusing delegate's control-flow-signal wrapper. A prefix assign (tempenv) still needs
-      -- exec_stmt's fuller handling; a redirect is applied around the dispatch (opts.redir).
-      if cmd == nil and st.words[1] and not st.assigns then
-        local argvbody = field_argv(st.words, 1, lifted, nil, nil)
-        local dyn_redir = nil
-        if argvbody and st.redirs then
-          dyn_redir = redir_conds(st, nil) -- nil => uncompilable redir shape: fall through to full delegate
-        end
-        if argvbody and not (st.redirs and not dyn_redir) then
-          -- hadcs (compile-time): a word contains a command sub, so an empty argv keeps its status.
-          local hadcs = false
-          for _, w in ipairs(st.words) do
-            for _, pp in ipairs(w.parts) do if pp.cmdsub then hadcs = true; break end end
-            if hadcs then break end
-          end
-          return delegate(st, after, { prelude = argvbody, callee = "rt.exec_dynamic",
-            callargs = ("sh, __a, __noop, %s"):format(tostring(hadcs)), redir = dyn_redir })
-        end
-      end
-      -- `command CMD args` (no -p/-v/-V/-- flag): run CMD skipping SHELL FUNCTION lookup
-      -- (builtin/external only) — exactly interp's exec_simple(rest, no_func=true). Build argv
-      -- from words[2..] and dispatch through rt.exec_dynamic with no_func, reusing delegate's
-      -- cf-signal wrapper and opts.redir. A flag form (`command -v`, `command -p`) delegates.
-      if cmd == "command" and st.words[2] and not st.assigns then
-        local w2 = st.words[2].parts[1]
-        if not (w2 and w2.lit and w2.lit:sub(1, 1) == "-") then -- not a flag / --
-          local argvbody = field_argv(st.words, 2, lifted, nil, nil)
-          local cmd_redir = nil
-          if argvbody and st.redirs then cmd_redir = redir_conds(st, nil) end
-          if argvbody and not (st.redirs and not cmd_redir) then
-            local hadcs = false
-            for j = 2, #st.words do
-              for _, pp in ipairs(st.words[j].parts) do if pp.cmdsub then hadcs = true; break end end
-              if hadcs then break end
-            end
-            return delegate(st, after, { prelude = argvbody, callee = "rt.exec_dynamic",
-              callargs = ("sh, __a, __noop, %s, true"):format(tostring(hadcs)), redir = cmd_redir })
-          end
-        end
-      end
-      -- `builtin CMD args`: force the shell BUILTIN for CMD (skip any function of that name).
-      -- rt.exec_dynamic on the argv WITH "builtin" kept as argv[1] does exactly this — exec_simple
-      -- resolves "builtin" to the b_builtin builtin, which force-runs the rest as a builtin —
-      -- and reuses delegate's cf-signal wrapper (so `builtin break` in a loop jumps) + opts.redir.
-      if cmd == "builtin" and st.words[2] and not st.assigns then
-        local argvbody = field_argv(st.words, 1, lifted, nil, nil)
-        local bi_redir = nil
-        if argvbody and st.redirs then bi_redir = redir_conds(st, nil) end
-        if argvbody and not (st.redirs and not bi_redir) then
-          local hadcs = false
-          for j = 2, #st.words do
-            for _, pp in ipairs(st.words[j].parts) do if pp.cmdsub then hadcs = true; break end end
-            if hadcs then break end
-          end
-          return delegate(st, after, { prelude = argvbody, callee = "rt.exec_dynamic",
-            callargs = ("sh, __a, __noop, %s"):format(tostring(hadcs)), redir = bi_redir })
-        end
-      end
-      -- `declare`/`typeset` INSIDE a function (no -g) make each name local, exactly like
-      -- `local` (bash) — so route a plain one through the native local path. A flag (incl.
-      -- -g), an array value (st.arrayargs delegated above), or `a[i]=` fails the plain check
-      -- below and delegates, as for local. At the top level declare stays a global (decl_native).
-      local as_local = cmd == "local" or ((cmd == "declare" or cmd == "typeset") and not toplevel)
-      -- The native `local` fast path (sh:localAssign) handles ONLY a plain scalar
-      -- `local NAME[=val]`: it can't validate the name, honor a flag (-n/-A/-p), do
-      -- an array element `a[i]=`, or LIST (bare `local`). Delegate anything else to
-      -- interp's full `local`, which also errors a bad name and skips a readonly
-      -- (matching bash). Done BEFORE the simple-stmt's newpc so no pc is orphaned.
-      if as_local then
-        -- (readonly / set -a are handled per-name at runtime by sh:localAssign — a
-        -- readonly operand fails with $?=1, a set -a local is exported — so no
-        -- whole-program blanket is needed here.)
-        local plain = #st.words >= 2
-        for j = 2, #st.words do
-          local p1 = st.words[j].parts[1]; local lit = p1 and p1.lit
-          if not (lit and (lit:match("^[%a_][%w_]*%+?=")
-              or (lit:match("^[%a_][%w_]*$") and #st.words[j].parts == 1))) then
-            plain = false; break
-          end
-        end
-        if not plain then return delegate(st, after) end
-      end
-      -- `exec` with ONLY redirects and no command word (`exec > log`, `exec 3< f`,
-      -- `exec 2>&1`): a PERSISTENT redirect — apply the redirs to the shell's own fds and do
-      -- NOT restore (they outlive the statement), status 0 / 1 on failure, exactly interp's
-      -- exec path. `exec cmd…` (process replacement) and an uncompilable redir shape delegate.
-      if cmd == "exec" and #st.words == 1 and st.redirs and not st.assigns then
-        local re = redir_conds(st, nil) -- nil cmd bypasses the exec guard in redir_conds
-        if re then
-          local p = newpc()
-          blocks[p] = dbg(st) .. ("do local __rs = {}; sh.status = (%s) and 0 or 1 end; pc = %d"):format(re, after)
-          return p
-        end
-      end
-      -- redirects compile (targets computed natively, syscalls via rt.redir_apply)
-      -- when every one is compilable AND this isn't `exec` (its redirs persist);
-      -- otherwise the whole command delegates.
-      local redir_apply = nil
-      if st.redirs then
-        redir_apply = redir_conds(st, cmd)
-        if not redir_apply then return delegate(st, after) end
-      end
-      -- a redirect-ONLY command (`> file`, `< f`): no command runs; apply the redirs
-      -- (their open/truncate is the effect), status 0 (or 1 on failure), then restore.
-      -- BUT a prefix assignment with no command (`abc=def > f`) performs the assignment
-      -- in the current shell EVEN when the redirect fails — the native path here would
-      -- drop it, so delegate to interp, which applies the assignment then the redirect.
-      if not st.words[1] then
-        if st.assigns then return delegate(st, after) end
-        local p = newpc()
-        blocks[p] = dbg(st) .. ("do local __rs = {}; sh.status = %s and 0 or 1; rt.redir_restore(__rs) end; pc = %d")
-          :format(redir_apply, after)
-        return p
-      end
-      -- delegate if it needs the field engine (splitting/glob/pexp), or a builtin
-      -- without a native compiled form.
-      local NATIVE_BUILTIN = { echo = 1, [":"] = 1, ["true"] = 1, ["false"] = 1, ["local"] = 1,
-        ["return"] = 1, test = 1, ["["] = 1 }
-      local isfunc = (inlinefns and inlinefns[cmd]) or funcflags[cmd]
-      if cmd == "return" and redir_apply then return delegate(st, after) end -- rare; wrapper assumes a run body
-      -- Simple interp-only builtins (printf/set/shopt/umask/type/read/getopts/…): build
-      -- argv with the shared field engine and dispatch through exec_simple — the command
-      -- RUNNER, not statement re-interpretation. EXCLUDED (they need exec_stmt's fuller
-      -- handling, compiled separately): assignment builtins whose `name=val` args must NOT
-      -- word-split (export/declare/readonly/local/typeset), code/control-flow builtins
-      -- (eval/source/./command/builtin/exit/return/break/continue). exec_stmt sets $_ to
-      -- the last arg; replicate that. Prefix-env (`x=v cmd`) keeps interp's tempenv binding.
-      -- `wait` needs interp's job-control context, so it still delegates. A REDIRECTED builtin
-      -- IS compiled below (install redirs, run, flush-before-restore, honor a flagged write error).
-      local EXEC_SIMPLE_SKIP = { export = 1, declare = 1, readonly = 1, ["local"] = 1,
-        typeset = 1, eval = 1, source = 1, ["."] = 1, command = 1, builtin = 1,
-        exit = 1, ["return"] = 1, ["break"] = 1, ["continue"] = 1, exec = 1, wait = 1 }
-      -- Declaration builtins normally delegate because a LITERAL `name=value` arg must
-      -- expand its value in assignment context (no word-split/glob, tilde after =) —
-      -- which this field path can't do. But when NO arg is a literal assignment (only
-      -- flags and bare names: `export FOO`, `readonly -p`, `declare -A m`, `declare -f`),
-      -- their args split like any builtin's, so run them natively via rt.builtin. A
-      -- `name=value` written in source, an array value (st.arrayargs), or `a[i]=` still
-      -- delegates. (`$x` that expands to `name=value` is a normal split arg the builtin
-      -- assigns — that is correct here, matching bash.)
-      -- Only at top level: inside a function, declare/typeset (and a bare name) DEFAULT
-      -- to a LOCAL, which needs the function-scope context the delegation path sets up
-      -- but rt.builtin does not — so an in-function `declare -A d` would leak to global.
-      -- At top level there is no local scope, so the native dispatch is exact.
-      local DECL_BUILTIN = { export = 1, declare = 1, readonly = 1, typeset = 1 }
-      local decl_native = DECL_BUILTIN[cmd] and toplevel and not st.arrayargs
-      if decl_native then
-        for j = 2, #st.words do
-          local p1 = st.words[j].parts[1]; local lit = p1 and p1.lit
-          if lit and (lit:match("^[%a_][%w_]*%+?=") or lit:match("^[%a_][%w_]*%b[]%+?=")) then
-            decl_native = false; break
-          end
-        end
-      end
-      -- Top-level declaration builtin WITH a literal `name=value` arg (`export FOO=bar`,
-      -- `declare -i n=5`, `export PATH=$PATH:/x`): build argv statically, expanding each
-      -- assignment value in assignment context — no word-split (emit_word renders the
-      -- whole `name=value` word to a single field), and tilde after `=`/`:` via
-      -- rt.tilde_assign for an all-literal value. b_export then does attribute processing
-      -- (arith for -i, etc.) on the expanded string. Defers to delegation for an array
-      -- element `a[i]=`, a value with a literal ~ mixed with expansions (needs the
-      -- assign-context tilde engine), or a splitting/unrenderable non-assignment arg.
-      if DECL_BUILTIN[cmd] and toplevel and not st.arrayargs and not decl_native
-          and cmd and st.assigns == nil and not redir_apply and not isfunc then
-        local items, ok = {}, true
-        for j = 1, #st.words do
-          local w = st.words[j]; local p1 = w.parts[1]; local lit = p1 and p1.lit
-          if j > 1 and lit and lit:match("^[%a_][%w_]*%b[]") then ok = false; break -- a[i]=/a[i]
-          elseif j > 1 and lit and lit:match("^[%a_][%w_]*%+?=") then -- scalar assignment
-            local pfx = lit:match("^([%a_][%w_]*%+?=)")
-            local fl = unq_full_lit(w)
-            if fl then -- all-literal name=value
-              if fl:find("~", 1, true) then
-                items[#items + 1] = ("rt.cstr(%q .. rt.tilde_assign(sh, %q))"):format(pfx, fl:sub(#pfx + 1))
-              else
-                items[#items + 1] = ("rt.cstr(%q)"):format(fl)
-              end
-            else -- value has expansions: emit_word renders name=value (no split); a
-              local htilde = false -- literal ~ mixed in needs the assign-tilde engine → defer
-              for _, pp in ipairs(w.parts) do if pp.lit and pp.lit:find("~", 1, true) then htilde = true; break end end
-              if htilde or not emitable_word(w) then ok = false; break end
-              items[#items + 1] = ("rt.cstr(%s)"):format(emit_word(w, lifted))
-            end
-          else -- command word / flag / bare name: must not need the field engine
-            if not word_safe(w) then ok = false; break end
-            items[#items + 1] = ("rt.cstr(%s)"):format(emit_word(w, lifted))
-          end
-        end
-        if ok then
-          local p = newpc()
-          local ec = errchk(st); local ecs = ec ~= "" and ("; " .. ec) or ""
-          local d = dbg(st)
-          local lastarg = "if #__a > 0 then sh:set_str('_', __a[#__a]) end"
-          blocks[p] = d .. ("local __a = { %s }; rt.builtin(sh, __a, __noop); "):format(table.concat(items, ", "))
-            .. lastarg .. ecs .. ("; pc = %d"):format(after)
-          return p
-        end
-      end
-      if cmd and st.assigns == nil and not NATIVE_BUILTIN[cmd] and not isfunc
-          and (not EXEC_SIMPLE_SKIP[cmd] or decl_native) and require("interp").BUILTINS[cmd] then
-        local builder = field_argv(st.words, 1, lifted, "rt.cstr(%s)") -- argv entries are C strings (cut at NUL, like interp's expand_args)
-        if builder then
-          local p = newpc()
-          local ec = errchk(st); local ecs = ec ~= "" and ("; " .. ec) or ""
-          local d = dbg(st) -- DEBUG fires before the command and its expansions
-          local lastarg = "if #__a > 0 then sh:set_str('_', __a[#__a]) end" -- $_ = last arg (bash)
-          if redir_apply then
-            -- a REDIRECTED builtin (`printf x > f`, `read v < f`, `type ls > f`): install the
-            -- redirs, run it (its output/input now on the target fd), then io.flush BEFORE
-            -- restoring — buffered output must reach the target fd, not the restored one
-            -- (interp flushes here too). A write error the builtin flagged (full disk) is
-            -- status 1, like bash's sh_chkwrite.
-            blocks[p] = d .. builder .. ("; do local __rs = {}; if %s then sh.write_err = nil; rt.builtin(sh, __a, __noop); io.flush() else sh.status = 1 end; rt.redir_restore(__rs); if sh.write_err then sh.status = 1 end end; %s%s; pc = %d")
-              :format(redir_apply, lastarg, ecs, after)
-          else
-            blocks[p] = d .. builder .. "; rt.builtin(sh, __a, __noop); " .. lastarg .. ecs ..
-              ("; pc = %d"):format(after)
-          end
-          return p
-        end
-      end
-      -- FIELD-ENGINE path: an argument word-splits or globs, so argv is variable
-      -- length. Commands with a STATIC dispatch (echo, test/[, a named external, a
-      -- non-inline function) consume it via rt.field_split on natively-computed
-      -- operands; everything else (inline fn, interp-only builtin, prefix env,
-      -- dynamic command word) delegates.
-      if st.assigns == nil then
-        local anyfield = false
-        -- A `local`/in-function `declare` VALUE word (j>1) never word-splits or globs
-        -- (assignment context), so a merely-renderable value (`local x=$y`) is NOT a
-        -- field-engine word — gate it on emitable_word, letting it reach the native
-        -- localAssign path below rather than delegating here.
-        for j = 1, #st.words do
-          if as_local and j > 1 then if not emitable_word(st.words[j]) then anyfield = true; break end
-          elseif not word_safe(st.words[j]) then anyfield = true; break end
-        end
-        if anyfield then
-          local from, wrap, call, prefix
-          if cmd == "echo" then from = 2; call = "sh:echo(unpack(__a))"
-          elseif cmd == "test" or cmd == "[" then -- the [ / test command word is a literal (dispatched by
-            from = 2; wrap = "rt.cstr(%s)"; call = "rt.do_test(sh, __a)" -- name, never glob-expanded)
-            prefix = ("rt.cstr(%q)"):format(cmd)
-          elseif funcflags[cmd] and (funcflags[cmd].locals or funcflags[cmd].params) then
-            from = 2
-            local ff = funcflags[cmd]
-            call = fnwrap(cmd, st.line, ff.locals and ("sh:pushCall(unpack(__a)); %s(sh); sh:popCall()"):format(fnlname(cmd))
-              or ("sh:pushParams(unpack(__a)); %s(sh); sh:popParams()"):format(fnlname(cmd)))
-          elseif funcflags[cmd] then -- bare function (references NO positional params): build argv
-            from = 2                  -- to run the args' side effects, then a bare call (params unread)
-            call = fnwrap(cmd, st.line, ("%s(sh)"):format(fnlname(cmd)))
-          elseif cmd ~= nil and not NATIVE_BUILTIN[cmd] and not (inlinefns and inlinefns[cmd])
-              and not funcflags[cmd] and not require("interp").BUILTINS[cmd] then
-            from = 1; call = "sh:exec(unpack(__a))" -- external, static command name
-          else
-            return delegate(st, after)
-          end
-          wrap = wrap or "rt.cstr(%s)" -- argv entries are C strings: cut each at NUL (bash/interp)
-          local builder = field_argv(st.words, from, lifted, wrap, prefix)
-          if not builder then return delegate(st, after) end
-          local p = newpc()
-          local ec = errchk(st); local ecs = ec ~= "" and ("; " .. ec) or ""
-          local d = dbg(st) -- DEBUG fires before the command (and its expansions)
-          -- PIPESTATUS after a simple command is a one-element array of its status
-          -- (bash), like the static-dispatch path below; gated on the program reading it.
-          local ps = EF.pipestatus and '; sh:array_assign("PIPESTATUS", {tostring(sh.status)}, false)' or ""
-          if redir_apply then
-            -- bash order: expand the words (side-effecting cmdsubs run) BEFORE the
-            -- redirects are applied, so `cmd $(read f) > f` reads f before it's
-            -- truncated. Build argv first, then install redirs around the dispatch.
-            blocks[p] = d .. builder ..
-              ("; do local __rs = {}; if %s then %s else sh.status = 1 end; rt.redir_restore(__rs) end%s%s; pc = %d")
-              :format(redir_apply, call, ps, ecs, after)
-          else
-            blocks[p] = d .. builder .. "; " .. call .. ps .. ecs .. ("; pc = %d"):format(after)
-          end
-          return p
-        end
-      end
-      local mustdeleg = st.assigns ~= nil -- prefix env -> delegate
-      if not mustdeleg then
-        for j, w in ipairs(st.words) do
-          -- The command word of a NATIVE builtin is dispatched by literal name (never
-          -- glob-expanded), so skip its field-engine check — otherwise `[` trips the
-          -- unquoted-glob rule on its own `[` char and the whole `[ … ]` delegates.
-          if j == 1 and NATIVE_BUILTIN[cmd] then -- literal builtin name
-          -- functions stay native (so they inline / call fn_x) unless an arg has a
-          -- ${..} the codegen can't render; other commands delegate on any word
-          -- that needs the field engine (splitting/glob/multi).
-          elseif isfunc then if not emitable_word(w) then mustdeleg = true; break end
-          -- `local`/in-function `declare|typeset` VALUE word (j>1): an assignment RHS
-          -- never word-splits or globs, so it needs only to be renderable (emitable_word),
-          -- not word_safe — `local x=$y` / `local x=$(cmd)` / `local x=*.txt` assign the
-          -- value verbatim. (The command word j==1 keeps the word_safe/native-builtin path.)
-          elseif as_local and j > 1 then if not emitable_word(w) then mustdeleg = true; break end
-          elseif not word_safe(w) then mustdeleg = true; break end
-        end
-      end
-      -- interp-only builtins (no native compiled form) delegate. Use interp's own
-      -- builtin set so the two backends stay in lockstep as builtins are added. `as_local`
-      -- (in-function declare/typeset) has a native form (sh:localAssign) — don't delegate it.
-      if not mustdeleg and cmd and not NATIVE_BUILTIN[cmd] and not isfunc and not as_local then
-        if require("interp").BUILTINS[cmd] then mustdeleg = true end
-      end
-      if mustdeleg then return delegate(st, after) end
-      -- A DYNAMIC command word (`"$a"`, cmd is not a compile-time literal) must be
-      -- resolved at runtime against functions → builtins → externals, exactly as the
-      -- interpreter does. The native fall-through below assumes an EXTERNAL command
-      -- (sh:exec = PATH lookup), so `a=typeset; "$a" v=1` reported "command not found"
-      -- instead of running the builtin. Delegate — before the newpc, so no pc leaks.
-      if cmd == nil then return delegate(st, after) end
-      if cmd == "return" then -- exit the current CFG (function or top level)
-        local p = newpc()
-        local n = st.words[2] and ("tonumber(%s)"):format(emit_word(st.words[2], lifted)) or "sh.status"
-        blocks[p] = ("sh.status = (%s) or 0; pc = %d"):format(n, DONE)
-        return p
-      end
-      if inlinefns and inlinefns[cmd] and not redir_apply then
-        -- INLINE: bind $n to the caller's exprs and splice the body flowing to `after`.
-        local pb = {}
-        for j = 2, #st.words do
-          local w = st.words[j]
-          local strExpr = emit_word(w, lifted)
-          local intExpr
-          if #w.parts == 1 then
-            local pp = w.parts[1]
-            if pp.var then intExpr = lifted[pp.var] and lname(pp.var) or ("sh:aget(%q)"):format(pp.var)
-            elseif pp.lit and pp.lit:match("^[+-]?%d+$") then intExpr = pp.lit .. "LL"
-            elseif pp.arith then intExpr = emit_value(safe_arith(pp.arith), lifted)
-            else intExpr = ("rt.str_to_i64(%s)"):format(strExpr) end
-          else intExpr = ("rt.str_to_i64(%s)"):format(strExpr) end
-          pb[j - 1] = { int = intExpr, str = strExpr }
-        end
-        return flatten_list(subst_list(inlinefns[cmd], pb), after)
-      end
-      local p = newpc()
-      local args = {}
-      -- argv entries are C strings: cut each at NUL (bash/interp expand_args), so
-      -- `echo $'a\0b'` / a function arg with a NUL match. Command name kept as-is.
-      for j = 2, #st.words do if not empty_word(st.words[j]) then args[#args + 1] = ("rt.cstr(%s)"):format(emit_word(st.words[j], lifted)) end end
-      local body
-      if cmd == "echo" then body = "sh:echo(" .. table.concat(args, ", ") .. ")"
-      elseif cmd == ":" or cmd == "true" or cmd == "false" then
-        -- :/true/false ignore their args but bash still EXPANDS them, so a side-effecting arg
-        -- (`: $((a/=3))`, `: "${x:=d}"`, `: "$(cmd)"`) must run. Evaluate the argv, discard it.
-        local ev = #args > 0 and ("local __a = { " .. table.concat(args, ", ") .. " }; ") or ""
-        body = ev .. ("sh.status = %d"):format(cmd == "false" and 1 or 0)
-      elseif as_local then -- local / in-function declare|typeset: each NAME[=val] a local
-        -- bash expands ALL the assignment words FIRST (in the OUTER scope), THEN localizes
-        -- + assigns them — so `local a=1 b=$a` gives b=<outer a>, not 1. Pre-evaluate every
-        -- value into a temp before any localAssign so a later operand can't see an earlier
-        -- one's new binding. A `local NAME=foo:~` arg tilde-expands the RHS (all-literal only).
-        local tmps, calls = {}, {}
-        for j = 2, #st.words do
-          local aw = st.words[j]
-          if not empty_word(aw) then
-            local av = emit_word(aw, lifted)
-            local fl = unq_full_lit(aw)
-            if fl and fl:find("~", 1, true) then av = ("rt.tilde_word_initial(sh, %q)"):format(fl) end
-            local tn = "__lv" .. (#tmps + 1)
-            tmps[#tmps + 1] = ("local %s = %s"):format(tn, av)
-            -- localAssign returns false for a READONLY name (message + that operand fails);
-            -- `local` returns 1 if ANY operand failed, else 0 — the others still localize.
-            calls[#calls + 1] = ("__lok = (sh:localAssign(%s) ~= false) and __lok"):format(tn)
-          end
-        end
-        if #calls == 0 then body = "sh.status = 0"
-        else body = table.concat(tmps, "; ") .. "; local __lok = true; "
-          .. table.concat(calls, "; ") .. "; sh.status = __lok and 0 or 1" end
-      elseif cmd == "test" or cmd == "[" then
-        -- [ EXPR ] / test EXPR: the operator/arity are compile-time known; compute the
-        -- args natively (word_safe, so no field engine) and run the POSIX test logic
-        -- via the do_test PRIMITIVE (access/stat/string/arith on the VALUES — not an
-        -- AST re-walk). do_test sets $? (0/1, or 2 on a malformed expression). Each arg
-        -- is rt.cstr'd: an argv entry is a C string, so a NUL truncates it (`$'\0'`);
-        -- interp truncates in expand_args, external exec via C — do_test is Lua-side.
-        local allargs = {}
-        for j = 1, #st.words do if not empty_word(st.words[j]) then allargs[#allargs + 1] = ("rt.cstr(%s)"):format(emit_word(st.words[j], lifted)) end end
-        body = "rt.do_test(sh, {" .. table.concat(allargs, ", ") .. "})"
-      elseif funcflags[cmd] then
-        local ff = funcflags[cmd]
-        if ff.locals then -- full frame (save/restore shadowed vars + params)
-          body = fnwrap(cmd, st.line, ("sh:pushCall(%s); %s(sh); sh:popCall()"):format(table.concat(args, ", "), fnlname(cmd)))
-        elseif ff.params then -- positional swap only (no per-call frame table)
-          body = fnwrap(cmd, st.line, ("sh:pushParams(%s); %s(sh); sh:popParams()"):format(table.concat(args, ", "), fnlname(cmd)))
-        else -- neither: bare call, no allocation
-          body = fnwrap(cmd, st.line, ("%s(sh)"):format(fnlname(cmd)))
-        end
-      else -- external command — OR a function DEFINED AT RUNTIME (via source/eval).
-        local allargs = {}
-        for j = 1, #st.words do if not empty_word(st.words[j]) then allargs[#allargs + 1] = ("rt.cstr(%s)"):format(emit_word(st.words[j], lifted)) end end
-        -- The name wasn't a funcdef at compile time, but source/eval can install one
-        -- into sh.functions before this runs; bash resolves function → builtin →
-        -- external, so check sh.functions at runtime and delegate to interp (which
-        -- sets up the frame/params/return) when present — else exec the external.
-        local ei = {}; for n in pairs(lifted) do ei[#ei + 1] = ("sh:aset(%q, %s)"):format(n, lname(n)) end
-        local eo = {}; for n in pairs(lifted) do eo[#eo + 1] = ("%s = sh:aget(%q)"):format(lname(n), n) end
-        local si = #ei > 0 and (table.concat(ei, "; ") .. "; ") or ""
-        local so = #eo > 0 and ("; " .. table.concat(eo, "; ")) or ""
-        body = ("if sh.functions[%q] then %sI.exec_stmt(sh, %s, __noop)%s else sh:exec(%s) end")
-          :format(cmd, si, ser(st), so, table.concat(allargs, ", "))
-      end
-      local ec = errchk(st) -- errexit after a failing native simple command
-      local ecs = ec ~= "" and ("; " .. ec) or ""
-      local u = und(st, lifted) -- $_ = this command's last arg (bash), for the NEXT command
-      -- PIPESTATUS after a simple command is a one-element array of its status (bash);
-      -- set BEFORE errchk so an ERR trap sees it. Gated on the program reading it.
-      local ps = EF.pipestatus and '; sh:array_assign("PIPESTATUS", {tostring(sh.status)}, false)' or ""
-      local d = dbg(st) -- DEBUG fires before the command
-      if redir_apply then
-        -- install the redirs (backing up fds), run the command only if they all
-        -- succeeded (else $?=1, bash), then restore the fds — real syscalls, no AST.
-        blocks[p] = d .. ("do local __rs = {}; if %s then %s else sh.status = 1 end; rt.redir_restore(__rs) end%s%s%s; pc = %d")
-          :format(redir_apply, body, ps, ecs, u, after)
-      else
-        blocks[p] = d .. body .. ps .. ecs .. u .. ("; pc = %d"):format(after)
-      end
-      return p
-    elseif t == "arithcmd" then
-      -- (( expr )): evaluate expr WITH side effects natively (assignments, ++/--,
-      -- comma), then $? = (result != 0) ? 0 : 1 — bash's arith-command status. No
-      -- delegation; the interpreter is only used for the parts the emitter can't
-      -- render (array subscripts, embedded $-expansion, $LINENO/$_, redirects).
-      if st.redirs then return delegate(st, after) end
-      if not arith_stmt_ok(st.expr) then return delegate(st, after) end
-      local p = newpc()
-      local ec = errchk(st); local ecs = ec ~= "" and ("; " .. ec) or ""
-      local d = dbg(st) -- DEBUG fires before the (( )) command (bash: DEBUG_FIRE.arithcmd)
-      local saved = arith_varread; arith_varread = "rt.arith_read(sh, %q)" -- nounset+recursive-eval reads
-      local code = emit_arith_into("__ar", st.expr, lifted)
-      arith_varread = saved
-      if arith_can_div_fault(st.expr) then
-        -- ÷0 / mod-0 / negative ** THROW a non-fatal matherr — catch it (and any
-        -- flagged read fault) as $?=1 and continue, like interp; re-raise anything else.
-        blocks[p] = d .. ("do local __ia = sh.in_arithcmd; sh.arithfault = false; sh.in_arithcmd = true; local __ok, __v = pcall(function() local __ar = 0LL; %s; return (__ar ~= 0LL) and 0 or 1 end); sh.in_arithcmd = __ia; "
-          .. "if not __ok then if type(__v) == 'table' and __v.__curse_matherr then sh.status = 1 else error(__v) end "
-          .. "elseif sh.arithfault then sh.status = 1 else sh.status = __v end end%s; pc = %d")
-          :format(code, ecs, after)
-      elseif arith_can_error(st.expr, lifted) then
-        -- a non-lifted read may fault; INSIDE the (( )) command arith_read records it in
-        -- sh.arithfault WITHOUT throwing (sh.in_arithcmd gates that), so no per-iteration
-        -- pcall/closure — the accumulator stays JIT-native.
-        blocks[p] = d .. ("do local __ia = sh.in_arithcmd; sh.arithfault = false; sh.in_arithcmd = true; local __ar = 0LL; %s; sh.in_arithcmd = __ia; sh.status = sh.arithfault and 1 or ((__ar ~= 0LL) and 0 or 1) end%s; pc = %d")
-          :format(code, ecs, after)
-      else -- provably error-free (lifted ints, +-*/comparisons): inline, JIT-native
-        blocks[p] = d .. ("do local __ar = 0LL; %s; sh.status = (__ar ~= 0LL) and 0 or 1 end%s; pc = %d")
-          :format(code, ecs, after)
-      end
-      return p
-    elseif t == "forc" then
-      if st.redirs then return delegate(st, after) end -- redirs on the loop: interp applies them
-      if hard_cf(st.body) then return delegate(st, after) end -- un-static break/continue
-      if not_compilable(st.init) or not_compilable(st.cond) or not_compilable(st.step)
-          or arith_side_effect(st.cond) -- a side-effecting cond can't be an emit_bool expr
-          or arith_reads_unsafe(st.init) or arith_reads_unsafe(st.cond) or arith_reads_unsafe(st.step) then
-        return delegate(st, after) -- $LINENO/$RANDOM/… in the arith: interp reproduces the value
-      end
-      local condp = newpc(); loopPc[st.id] = condp
-      local stepp = newpc()
-      loopstack[#loopstack + 1] = { brk = after, cont = stepp } -- break exits, continue steps
-      local bodyentry = flatten_list(st.body, stepp)
-      loopstack[#loopstack] = nil
-      local d = dbg(st) -- DEBUG fires at the for(( header for the init, each cond, and each step (bash)
-      blocks[stepp] = d .. (st.step and emit_arith_stmt(st.step, lifted) .. "; " or "") .. ("pc = %d"):format(condp)
-      blocks[condp] = d .. ("if %s then pc = %d else pc = %d end"):format(
-        st.cond and emit_bool(st.cond, lifted) or "true", bodyentry, after)
-      if st.init then
-        local ip = newpc()
-        blocks[ip] = d .. emit_arith_stmt(st.init, lifted) .. ("; pc = %d"):format(condp)
-        return ip
-      end
-      return condp
-    elseif t == "whilec" then
-      if st.redirs then return delegate(st, after) end -- redirs on the loop (heredoc/file): interp applies them
-      -- un-static break/continue in the body, or ANY in the command condition (loopstack
-      -- isn't active there) → delegate the whole loop (else the signal is lost → spin).
-      if hard_cf(st.body) or (type(st.cond) == "table" and not st.cond.k and hard_cf(st.cond, true)) then
-        return delegate(st, after)
-      end
-      local arith = cond_arith(st.cond)
-      if arith and arith_reads_unsafe(arith) then
-        -- a `(( ))` condition reading an unreproducible special ($LINENO/$RANDOM/…):
-        -- delegate the whole loop to interp, which reproduces the value.
-        return delegate(st, after)
-      end
-      if arith and not st.negate and not not_compilable(arith) and not arith_side_effect(arith) then
-        -- fast path: a native arith condition `while (( expr ))` — no command run.
-        local condp = newpc(); loopPc[st.id] = condp
-        loopstack[#loopstack + 1] = { brk = after, cont = condp }
-        local bodyentry = flatten_list(st.body, condp)
-        loopstack[#loopstack] = nil
-        blocks[condp] = ("if %s then pc = %d else pc = %d end"):format(emit_bool(arith, lifted), bodyentry, after)
-        return condp
-      end
-      -- fast path: `while/until [ A -op B ]` with integer operands — a native int64
-      -- compare instead of building an argv table and running do_test each iteration.
-      -- Keeps [ ]'s own $? (0/1) for the body's first command AND the loop's
-      -- last-body exit status (lv), exactly like the command-condition path below.
-      local tarith = test_as_arith(st.cond, lifted)
-      if tarith then
-        local lv = newloopvar()
-        local condp = newpc(); loopPc[st.id] = condp
-        local exitp = newpc(); blocks[exitp] = ("sh.status = %s; pc = %d"):format(lv, after)
-        loopstack[#loopstack + 1] = { brk = after, cont = condp }
-        local bodysave = newpc()
-        local bodyentry = flatten_list(st.body, bodysave)
-        loopstack[#loopstack] = nil
-        blocks[bodysave] = ("%s = sh.status; pc = %d"):format(lv, condp)
-        blocks[condp] = ("sh.status = (%s) and 0 or 1; if sh.status %s 0 then pc = %d else pc = %d end")
-          :format(emit_bool(tarith, lifted), st.negate and "~=" or "==", bodyentry, exitp)
-        local entry = newpc(); blocks[entry] = ("%s = 0; pc = %d"):format(lv, condp)
-        return entry
-      end
-      -- COMMAND condition (or `until`): run the condition list as a sub-CFG with
-      -- sh.noerr raised (errexit-exempt, like the interpreter), then branch on its
-      -- exit status — `while` enters the body on 0, `until` on non-zero. The loop's
-      -- exit status is the LAST body command's status (bash), which the condition
-      -- clobbers — so one native register (lv) remembers it across the re-test.
-      -- loopPc = the condition entry (an OSR resumes at the re-test point). Genuine
-      -- control flow, no delegation.
-      local lv = newloopvar()
-      local prep = newpc(); loopPc[st.id] = prep
-      local donep = newpc()
-      local exitp = newpc(); blocks[exitp] = ("sh.status = %s; pc = %d"):format(lv, after)
-      loopstack[#loopstack + 1] = { brk = after, cont = prep } -- break exits (status 0), continue re-tests
-      local bodysave = newpc()
-      local bodyentry = flatten_list(st.body, bodysave)
-      loopstack[#loopstack] = nil
-      blocks[bodysave] = ("%s = sh.status; pc = %d"):format(lv, prep)
-      blocks[donep] = ("sh.noerr = sh.noerr - 1; if sh.status %s 0 then pc = %d else pc = %d end")
-        :format(st.negate and "~=" or "==", bodyentry, exitp)
-      local listentry = flatten_list(st.cond, donep)
-      blocks[prep] = ("sh.noerr = sh.noerr + 1; pc = %d"):format(listentry)
-      local entry = newpc(); blocks[entry] = ("%s = 0; pc = %d"):format(lv, prep) -- status 0 if body never runs
-      return entry
-    elseif t == "forin" then
-      if st.redirs then return delegate(st, after) end -- redirs on the loop: interp applies them
-      if hard_cf(st.body) then return delegate(st, after) end -- un-static break/continue
-      if not st.name:match("^[%a_][%w_]*$") then return delegate(st, after) end -- invalid loop var → interp errors
-      -- Each word expands to for-list fields exactly like a command argument: word_safe (one
-      -- field), a field_word (an unquoted expansion/glob the field engine splits+globs), or a
-      -- seg_native mixed word (rt.expand_fields — literal+$x, $@/$*, ${a[@]}, ${!a[@]}, scalar
-      -- ${..} ops). emit_fields_into renders each fully natively (no interp field engine); a
-      -- word only the shared engine could take still delegates the loop (rare, cold).
-      for _, w in ipairs(st.words) do
-        -- $LINENO in a for-in list on a CONTINUATION line is the word's line, not the `for`
-        -- line (st.line) the compile-time constant would use — delegate so interp's per-line
-        -- tracking gives the exact value (rare; the whole loop is cold anyway).
-        for _, p in ipairs(w.parts) do if p.var == "LINENO" then return delegate(st, after) end end
-        if not word_safe(w) and not field_word(w, lifted) and not EF.seg_native(w, lifted) then
-          return delegate(st, after)
-        end
-      end
-      local initp = newpc()
-      local advp = newpc(); loopPc[st.id] = advp -- back-edge = resume point
-      loopstack[#loopstack + 1] = { brk = after, cont = advp } -- break exits, continue advances
-      local bodyentry = flatten_list(st.body, advp)
-      loopstack[#loopstack] = nil
-      -- init: expand the word list ONCE into sh.forstate[id] (so OSR resumes it)
-      local parts = { "local __l = {}" }
-      for _, w in ipairs(st.words) do
-        if not empty_word(w) then parts[#parts + 1] = emit_fields_into("__l", w, lifted) end
-      end
-      parts[#parts + 1] = ("sh.forstate[%d] = {list=__l, idx=0}"):format(st.id)
-      blocks[initp] = table.concat(parts, "; ") .. ("; pc = %d"):format(advp)
-      -- DEBUG fires at the `for` header before each iteration (bash), with an element present.
-      blocks[advp] = ("local fs = sh.forstate[%d]; fs.idx = fs.idx + 1; if fs.idx > #fs.list then pc = %d else sh:set_str(%q, fs.list[fs.idx]); %spc = %d end"):format(
-        st.id, after, st.name, dbg(st), bodyentry)
-      return initp
-    elseif t == "if" then
-      -- Each clause's condition is either a native arith `(( ))` (emit_bool) or a
-      -- COMMAND LIST run for its status. Both compile — the command condition is a
-      -- sub-CFG run with sh.noerr raised (errexit-exempt, like the interpreter),
-      -- then we branch on sh.status. No delegation. Flatten bodies once, then build
-      -- clauses back-to-front so each false-branch target (the next condition, the
-      -- else body, or `after`) already exists.
-      if st.redirs then return delegate(st, after) end -- redirs on the whole `if`: interp applies them
-      local bentry = {}
-      local has_else = false
-      for i, cl in ipairs(st.clauses) do bentry[i] = flatten_list(cl.body, after); if not cl.cond then has_else = true end end
-      -- With no else clause, falling past every (false) condition runs no body, so
-      -- the `if` yields status 0 (bash) — route that fall-through through a reset.
-      local fallthrough = after
-      if not has_else then local s0 = newpc(); blocks[s0] = ("sh.status = 0; pc = %d"):format(after); fallthrough = s0 end
-      local condentry = {}
-      for i = #st.clauses, 1, -1 do
-        local cl = st.clauses[i]
-        local nxt = st.clauses[i + 1] and (condentry[i + 1] or bentry[i + 1]) or fallthrough
-        if not cl.cond then
-          condentry[i] = bentry[i] -- an `else` clause: its body runs unconditionally
-        else
-          local arith = cond_arith(cl.cond)
-          local tarith = not arith and test_as_arith(cl.cond, lifted) -- `[ A -op B ]`, integer operands
-          if arith and not not_compilable(arith) and not arith_side_effect(arith) then
-            local cp = newpc()
-            blocks[cp] = ("if %s then pc = %d else pc = %d end"):format(emit_bool(arith, lifted), bentry[i], nxt)
-            condentry[i] = cp
-          elseif tarith then -- native int64 compare, and set [ ]'s own $? (0/1)
-            local cp = newpc()
-            blocks[cp] = ("sh.status = (%s) and 0 or 1; if sh.status == 0 then pc = %d else pc = %d end")
-              :format(emit_bool(tarith, lifted), bentry[i], nxt)
-            condentry[i] = cp
-          else -- command condition: noerr++ ; run list ; noerr-- ; branch on status
-            local donep = newpc()
-            blocks[donep] = ("sh.noerr = sh.noerr - 1; if sh.status == 0 then pc = %d else pc = %d end")
-              :format(bentry[i], nxt)
-            local listentry = flatten_list(cl.cond, donep)
-            local prep = newpc()
-            blocks[prep] = ("sh.noerr = sh.noerr + 1; pc = %d"):format(listentry)
-            condentry[i] = prep
-          end
-        end
-      end
-      return condentry[1] or after
-    elseif t == "andor" then
-      -- `a && b || c`: run item 1, then each item iff the previous status matches
-      -- its operator (&& on 0, || on non-zero) — pure control flow. Errexit exempts
-      -- every operand EXCEPT the final one that runs (bash), so raise sh.noerr across
-      -- the non-final operands and restore it right before the last, letting only its
-      -- own errchk fire. Status is the last item that ran (natural). break/continue
-      -- inside an operand compile to native jumps via flatten_stmt (that's why this
-      -- must be real codegen, not delegation). `!`-negation lives on each pipeline.
-      if st.redirs then return delegate(st, after) end
-      local items = st.items
-      local nI = #items
-      local runafter = {} -- where item i flows after running
-      for i = 1, nI - 1 do runafter[i] = 0 end -- filled with checkp[i+1] below
-      runafter[nI] = after
-      local checkp = {}
-      for i = 2, nI do checkp[i] = newpc() end
-      for i = 1, nI - 1 do runafter[i] = checkp[i + 1] end
-      local runentry = {}
-      for i = 1, nI do runentry[i] = flatten_stmt(items[i].cmd, runafter[i]) end
-      for i = 2, nI do
-        local cmp = (items[i].op == "&&") and "==" or "~=" -- && runs on success, || on failure
-        if i == nI then -- last operand: restore noerr so its OWN errchk applies
-          blocks[checkp[i]] = ("sh.noerr = sh.noerr - 1; if sh.status %s 0 then pc = %d else pc = %d end")
-            :format(cmp, runentry[i], after)
-        else
-          blocks[checkp[i]] = ("if sh.status %s 0 then pc = %d else pc = %d end")
-            :format(cmp, runentry[i], checkp[i + 1])
-        end
-      end
-      local entry = newpc()
-      -- raise noerr for the non-final operands; a lone-item andor never occurs (>=2).
-      blocks[entry] = ("sh.noerr = sh.noerr + 1; pc = %d"):format(runentry[1])
-      return entry
-    elseif t == "subshell" then
-      -- ( body ): a subshell is not special, just SEPARATED — fork, and the child
-      -- runs the body as a BOUNDED sub-CFG that _exits at its end (so it never runs
-      -- the top-level continuation); the parent waits. The body's loops get their
-      -- own loopPc entries, so a forked child that started in interp can OSR into
-      -- the RIGHT place (its own fragment), honoring interp/bg-compile/OSR.
-      -- Redirs on the subshell apply in the CHILD (they belong to the fork and die with
-      -- it — no restore), so compile them when the shapes are compilable; else delegate.
-      local sub_redir = nil
-      if st.redirs then
-        sub_redir = redir_conds(st, nil)
-        if not sub_redir then return delegate(st, after) end
-      end
-      -- A body that toggles options with `set` (e.g. `set -e` mid-body) needs the
-      -- interpreter's per-command semantics, which the straight-line sub-CFG can't
-      -- reproduce — delegate the whole subshell (interp forks + enforces it).
-      if body_runs_set(st.body) then return delegate(st, after) end
-      -- Under errexit INHERITED at entry, likewise delegate at runtime (the fork +
-      -- errexit enforcement happen in the interpreter). errexit is off in the
-      -- hot-loop case, so the compiled fork+body path still applies for speed.
-      local delpc = delegate(st, after)
-      local exitpc = newpc(); blocks[exitpc] = "rt.subshell_exit(sh.status or 0)"
-      -- A subshell is a fork: break/continue inside it target only loops WITHIN the
-      -- subshell, never the parent's. Hide the enclosing loopstack while flattening
-      -- the body (a break/continue with no in-subshell loop becomes a no-op, like
-      -- bash), then restore it for the parent's control flow.
-      local saved_loops = loopstack; loopstack = {}
-      subexit[#subexit + 1] = exitpc -- `return` in the body exits THIS subshell
-      local bodyentry = flatten_list(st.body, exitpc)
-      subexit[#subexit] = nil
-      loopstack = saved_loops
-      local p = newpc()
-      -- ERR trap after a failing subshell (`( exit 42 )`) fires in the PARENT; the
-      -- errexit path already delegated above, so this errchk only fires ERR (opt_e false).
-      local ec = errchk(st); local ecs = ec ~= "" and ("; " .. ec) or ""
-      -- The forked child sets sh._ff = the subshell's exit pc, so a lineabort raised in the
-      -- body (div0, failglob, an invalid-indirect, …) exits the SUBSHELL (subshell_exit ->
-      -- _exit) instead of fast-forwarding into the PARENT's continuation and re-running it.
-      -- With redirs, the child installs them first (no restore — it _exits), then runs the
-      -- body REGARDLESS of the result: interp's subshell child applies the redirs and ignores
-      -- whether they succeeded (a failed subshell redirect does not abort the body there), so
-      -- match that — the redir expression runs for its side effect, its boolean discarded.
-      local child = sub_redir
-        and ("sh._ff = %d; local __rs = {}; local _ = %s; pc = %d"):format(exitpc, sub_redir, bodyentry)
-        or ("sh._ff = %d; pc = %d"):format(exitpc, bodyentry)
-      blocks[p] = ("if sh.opt_e then pc = %d else local __pid = rt.subshell_fork(sh); if __pid == 0 then %s else sh.status = rt.subshell_wait(__pid)%s; pc = %d end end")
-        :format(delpc, child, ecs, after)
-      return p
-    elseif t == "group" then
-      -- { list; }: not a subshell — just a sequence in the current shell. Flatten the
-      -- body inline (redirs on the group still delegate; break/continue flow natively).
-      if st.redirs then return delegate(st, after) end
-      return flatten_list(st.body, after)
-    elseif t == "pipeline" then
-      -- a | b | c: compile each stage to a fragment and let the runtime orchestrate the
-      -- fork/pipe/wait/PIPESTATUS, running the COMPILED stages — not exec_stmt. Gated to
-      -- no trap/DEBUG/ERR (a forked stage otherwise resets signal traps / re-fires
-      -- per-stage traps — interp-side). Flush lifted before (stages read sh) and reload
-      -- after (a lastpipe last stage runs in-process and may write).
-      if EF.has_trap or EF.has_debug or EF.has_err then return delegate(st, after) end
-      local n = #st.cmds
-      local frags = {}
-      for i = 1, n do
-        -- nst==1 is `! cmd` (a single negated command run in the current shell): compile
-        -- it as a negated fragment so its OWN errexit is exempt (bash), while a called
-        -- function's internal errexit still fires (fn_x). Real pipe stages (n>=2) fork,
-        -- so they compile normally (a stage's errexit just exits its own child).
-        local id = emit_fragment({ st.cmds[i] }, n == 1 and st.negate)
-        if not id then return delegate(st, after) end
-        frags[i] = "cs_" .. id
-      end
-      local reload = {}
-      for nm in pairs(lifted) do reload[#reload + 1] = ("%s = sh:aget(%q)"):format(lname(nm), nm) end
-      local post = #reload > 0 and ("; " .. table.concat(reload, "; ")) or ""
-      local p = newpc()
-      -- errexit/ERR are exempt for a `!`-inverted pipeline (bash: the -e setting is
-      -- ignored when the return value is inverted with !), regardless of the negated status.
-      local ec = st.negate and "" or errchk(st); local ecs = ec ~= "" and ("; " .. ec) or ""
-      blocks[p] = dbg(st) .. lifted_flush(lifted)
-        .. ("sh:run_pipeline({%s}, %s)"):format(table.concat(frags, ", "), st.negate and "true" or "false")
-        .. post .. ecs .. ("; pc = %d"):format(after)
-      return p
-    elseif t == "background" then
-      -- cmd & : fork, run the COMPILED command in the child; the parent records $! + the
-      -- job and continues with status 0. Reuses the fragment mechanism (the child is a
-      -- subprogram). Gated to trap-free programs — a forked child otherwise resets caught
-      -- signal traps (interp-side signal machinery). Flush lifted operands so the child
-      -- (which reads sh) sees current values; no reload (the parent's copy is unaffected).
-      if EF.has_trap then return delegate(st, after) end
-      local id = emit_fragment({ st.cmd })
-      if not id then return delegate(st, after) end
-      local c1 = st.cmd -- best-effort command text for the job table
-      while c1 and c1.t == "pipeline" and c1.cmds do c1 = c1.cmds[1] end
-      local cmdstr = (c1 and c1.words and c1.words[1] and c1.words[1].parts[1] and c1.words[1].parts[1].lit) or "job"
-      local p = newpc()
-      blocks[p] = dbg(st) .. lifted_flush(lifted) .. ("sh:run_background(cs_%d, %q); pc = %d"):format(id, cmdstr, after)
-      return p
-    elseif t == "arrayassign" then
-      -- `a=(1 2 3)` / `a=($x)` / `a=([0]=x [k]=v)` / `a+=(…)` / `a=()`: build the element
-      -- items natively — a bare word field-splits via the field engine into {val=field}
-      -- entries, a keyed element renders {key,op,val} — then store via rt.arrayassign. No
-      -- interp: keyed subscripts are gated to literals (resolved by arith_str/verbatim).
-      if arrayassign_ok(st, lifted) then
-        local p = newpc()
-        local parts = { "local __it = {}" }
-        for _, e in ipairs(st.elems) do
-          if e.key ~= nil then
-            -- keyed value: assign-context RHS (an all-literal ~ colon-expands via
-            -- rt.tilde_assign, like scalar `x=~:~`), else the ordinary word value.
-            local fl = unq_full_lit(e.word)
-            local valx = (fl and fl:find("~", 1, true)) and ("rt.tilde_assign(sh, %q)"):format(fl)
-              or emit_word(e.word, lifted)
-            parts[#parts + 1] = ("__it[#__it+1] = {key=%q, op=%q, val=%s}"):format(e.key, e.op, valx)
-          elseif not empty_word(e.word) then
-            parts[#parts + 1] = emit_fields_into("__it", e.word, lifted, "{val=%s}")
-          end
-        end
-        local ec = errchk(st); local ecs = ec ~= "" and ("; " .. ec) or ""
-        blocks[p] = dbg(st) .. "do " .. table.concat(parts, "; ")
-          .. ("; rt.arrayassign(sh, %q, __it, %s) end"):format(st.name, tostring(st.append and true or false))
-          .. ecs .. ("; pc = %d"):format(after)
-        return p
-      end
-      -- a=(…): dispatch to the array-assign runtime primitive (readonly/index checks +
-      -- error-contained do_arrayassign + status/$_), NOT the exec_stmt tree-walker. Flush
-      -- lifted operands to sh first (an elem may read one) and reload after (a `$((b=…))`
-      -- elem may write one).
-      local sync, reload = {}, {}
-      for n in pairs(lifted) do sync[#sync + 1] = ("sh:aset(%q, %s)"):format(n, lname(n)) end
-      for n in pairs(lifted) do reload[#reload + 1] = ("%s = sh:aget(%q)"):format(lname(n), n) end
-      local p = newpc()
-      local ec = errchk(st); local ecs = ec ~= "" and ("; " .. ec) or ""
-      local pre = #sync > 0 and (table.concat(sync, "; ") .. "; ") or ""
-      local post = #reload > 0 and ("; " .. table.concat(reload, "; ")) or ""
-      blocks[p] = dbg(st) .. pre .. ("I.run_arrayassign(sh, %s)"):format(ser(st)) .. post .. ecs ..
-        ("; pc = %d"):format(after)
-      return p
-    elseif t == "case" then
-      -- case SUBJ in pat) body ;; … esac. Evaluate the subject once (native single string),
-      -- then a chain of match blocks: each tests the subject against its clause's patterns
-      -- via the shared matcher (I.case_match — vars expand, quoted metachars literal,
-      -- nocasematch honored) and branches to the clause body or the next match. A body
-      -- flows to `after` (;;), the next body (;& = "fall"), or the next match (;;& = "test").
-      if st.redirs then return delegate(st, after) end -- redirs on the case: interp applies them
-      -- Subject must be emittable AND free of a dynamic special var ($LINENO/$_/…) whose value
-      -- the CFG can't reproduce — those run on the interp tier (compile-eventually), else the
-      -- native subject would read a wrong LINENO/etc.
-      if not db_word_ok(st.subject) then return delegate(st, after) end
-      local sv = newloopvar()
-      local n = #st.clauses
-      local matchentry, bodyentry = {}, {}
-      for i = n, 1, -1 do -- back-to-front so forward targets (next body/match) already exist
-        local cl = st.clauses[i]
-        local btarget = (cl.term == "fall" and (i < n and bodyentry[i + 1] or after))
-          or (cl.term == "test" and (i < n and matchentry[i + 1] or after)) or after
-        bodyentry[i] = flatten_list(cl.body, btarget)
-        local nextmatch = (i < n) and matchentry[i + 1] or after
-        -- Compile each pattern's glob-form and match natively (rt.glob_match); a clause
-        -- with a pattern emit can't render (cmdsub/arith/${…}-op/$@/$*) keeps I.case_match.
-        local globs, allok = {}, true
-        for _, pat in ipairs(cl.pats) do
-          local g = emit_pattern_glob(pat, lifted)
-          if g == nil then allok = false; break end
-          globs[#globs + 1] = g
-        end
-        local mp = newpc()
-        if allok and #globs > 0 then
-          local disj = {}
-          for _, g in ipairs(globs) do disj[#disj + 1] = ("rt.glob_match(%s, %s, __ic)"):format(sv, g) end
-          blocks[mp] = ("local __ic = sh.shopt.nocasematch and true or nil; if %s then pc = %d else pc = %d end")
-            :format(table.concat(disj, " or "), bodyentry[i], nextmatch)
-        else
-          local pq = {}
-          for _, pat in ipairs(cl.pats) do pq[#pq + 1] = ("%q"):format(pat) end
-          blocks[mp] = ("if I.case_match(sh, %s, {%s}) then pc = %d else pc = %d end")
-            :format(sv, table.concat(pq, ", "), bodyentry[i], nextmatch)
-        end
-        matchentry[i] = mp
-      end
-      if st.line then EF.cur_line = st.line end -- clause flattening moved it; restore for $LINENO in the subject
-      local subjp = newpc()
-      blocks[subjp] = dbg(st) .. ("%s = %s; sh.status = 0; pc = %d")
-        :format(sv, emit_word(st.subject, lifted), n > 0 and matchentry[1] or after)
-      return subjp
-    else
-      return delegate(st, after) -- unknown/cold statement: run it via the interpreter
-    end
-  end
+	-- Build blocks for `st`; its exit flows to pc `after`. Returns st's entry pc.
+	local function flatten_stmt(st, after)
+		local t = st.t
+		if st.line then
+			EF.cur_line = st.line
+		end -- for $LINENO (compile-time constant)
+		-- break / continue [N]: a compile-time jump to the Nth enclosing loop's exit or
+		-- re-test point. Both set $?=0 (bash). Outside any loop it's a no-op. A
+		-- non-literal level (`break $n`) is rare — delegate it.
+		local cf_op, cf_arg = resolve_cf(st)
+		if cf_op == "break" or cf_op == "continue" then
+			local lvl, ok = 1, true
+			if st.words[cf_arg] then
+				local wl = full_lit(st.words[cf_arg])
+				if wl and wl:match("^%d+$") and not st.words[cf_arg + 1] then
+					lvl = tonumber(wl)
+				else
+					ok = false
+				end
+			end
+			if ok then
+				local p = newpc()
+				local d = dbg(st) -- DEBUG fires before break/continue too (it's a command)
+				if #loopstack == 0 then
+					blocks[p] = d .. ("sh.status = 0; pc = %d"):format(after) -- no-op outside a loop
+				else
+					local idx = #loopstack - (lvl - 1)
+					if idx < 1 then
+						idx = 1
+					end
+					local tgt = (cf_op == "break") and loopstack[idx].brk or loopstack[idx].cont
+					blocks[p] = d .. ("sh.status = 0; pc = %d"):format(tgt)
+				end
+				return p
+			end
+		elseif cf_op == "return" then
+			-- `return` at the top level is an error (status 2 + diagnostic, but execution
+			-- continues) — not a program exit. A compiled top level is always the main
+			-- script (source runs through interp), so delegate and let interp diagnose.
+			if toplevel then
+				return delegate(st, after)
+			end
+			-- return [N] (incl. \return / builtin return / command return): set $? and exit
+			-- the CFG. rt.return_status: N%256, or 2 + diagnostic on non-numeric; no arg → $?.
+			-- inside a subshell, `return` exits the subshell (subshell_exit) with the
+			-- status; otherwise it exits the function/CFG at DONE.
+			local retpc = subexit[#subexit] or DONE
+			local aw = st.words[cf_arg]
+			if not st.words[cf_arg + 1] then -- at most one status WORD (pre-split)
+				local d = dbg(st) -- DEBUG fires before return too
+				if not aw then -- `return` with no arg → previous status
+					local p = newpc()
+					blocks[p] = d .. ("pc = %d"):format(retpc)
+					return p
+				elseif word_safe(aw) then -- one field (literal/quoted): `return ""` → 2, `return 42` → 42
+					local p = newpc()
+					blocks[p] = d
+						.. ("sh.status = rt.return_status(sh, %s); pc = %d"):format(emit_word(aw, lifted), retpc)
+					return p
+				elseif field_word(aw, lifted) then -- unquoted expansion: split — 0 fields → $?, else 1st field
+					local fw = field_word(aw, lifted)
+					local p = newpc()
+					blocks[p] = d
+						.. ("do local __f = rt.field_split(sh, %s, %s); if #__f > 0 then sh.status = rt.return_status(sh, __f[1]) end end; pc = %d"):format(
+							fw.expr,
+							tostring(fw.split),
+							retpc
+						)
+					return p
+				end -- else (pexp/${…}): not intercepted — falls through (emit deopts to interp, which is correct)
+			end
+		elseif cf_op == "exit" then
+			-- `exit [N]` inside a compiled subshell exits ONLY the subshell (bash), so jump to its
+			-- subshell_exit pc with the status; otherwise raise __curse_exit, which finish() catches
+			-- (sets $?, runs the EXIT trap, ends the shell) — the same signal delegation raised, so
+			-- no behavioral change but no I.exec_stmt. A delegated __curse_exit inside a compiled
+			-- subshell would unwind to run_trap's pcall and the child would CONTINUE, hence the
+			-- subshell jump. Multi-arg (`exit a b`: too-many, non-fatal) / dynamic arg -> delegate.
+			local exitp = #subexit > 0 and subexit[#subexit] or nil
+			local aw = st.words[cf_arg]
+			if not st.words[cf_arg + 1] then
+				local d = dbg(st)
+				local statusexpr = aw
+						and word_safe(aw)
+						and ('rt.return_status(sh, %s, "exit")'):format(emit_word(aw, lifted))
+					or (not aw and "sh.status")
+					or nil
+				if statusexpr then
+					local p = newpc()
+					if exitp then
+						blocks[p] = d .. ("sh.status = %s; pc = %d"):format(statusexpr, exitp)
+					else
+						blocks[p] = d .. ("error({ __curse_exit = %s })"):format(statusexpr)
+					end
+					return p
+				end
+			end -- dynamic/multi-arg: fall through to delegate
+		end
+		if t == "dbracket" then
+			-- [[ ]] : compile the and/or/not tree + leaf comparisons natively; $? = 0/1.
+			-- Any leaf the compiler can't render (mixed-quote glob, procsub) -> delegate.
+			if st.redirs then
+				return delegate(st, after)
+			end
+			-- `[[ L =~ R ]]` as the SOLE condition: emit_dbracket can't express =~ (it has a
+			-- BASH_REMATCH side effect AND a tri-state status — 0 match / 1 no-match / 2 bad
+			-- regex — that the boolean leaf model has no slot for), so compile it here via
+			-- rt.regex_captures (real POSIX ERE, exactly interp's path). The RHS is rendered
+			-- mask-aware by emit_regex_glob. A =~ nested inside and/or/not still delegates.
+			if st.expr.kind == "binary" and st.expr.op == "=~" and db_word_ok(st.expr.l) then
+				local re = EF.emit_regex_glob(st.expr.r, lifted)
+				if re then
+					local p = newpc()
+					local d = dbg(st)
+					local ec = errchk(st)
+					local ecs = ec ~= "" and ("; " .. ec) or ""
+					blocks[p] = d
+						.. ('do local __c, __bad = rt.regex_captures(%s, %s, (sh.shopt.nocasematch and true or nil)); if __bad then sh.status = 2 else sh:array_assign("BASH_REMATCH", __c or {}, false); sh.status = __c and 0 or 1 end end%s; pc = %d'):format(
+							emit_word(st.expr.l, lifted),
+							re,
+							ecs,
+							after
+						)
+					return p
+				end
+			end
+			local cond = emit_dbracket(st.expr, lifted)
+			if not cond then
+				return delegate(st, after)
+			end
+			local p = newpc()
+			local d = dbg(st)
+			local ec = errchk(st)
+			local ecs = ec ~= "" and ("; " .. ec) or ""
+			blocks[p] = d .. ("sh.status = (%s) and 0 or 1%s; pc = %d"):format(cond, ecs, after)
+			return p
+		end
+		if DELEGATE[t] then
+			return delegate(st, after)
+		end
+		if t == "assign" then
+			-- The program declares a nameref: a plain `name=value` may write THROUGH one
+			-- (to a var / array or assoc element / a detected cycle) — only interp's full
+			-- assign does that, so delegate. Gated to nameref programs (rare); ordinary
+			-- assigns stay native (via rt.assign_scalar, which does the nameref write-through).
+			-- A nameref ELEMENT/append/arith assign (ref[i]=, ref+=, ref=$((…))) needs interp's
+			-- fuller handling, so delegate those; a plain scalar ref=value compiles.
+			if EF.has_nameref and (st.index or st.append or st.arith) then
+				return delegate(st, after)
+			end
+			-- Assigning these fires a side effect only interp's assign implements (resize
+			-- history / truncate the histfile); a native set_str would skip it. Delegate.
+			if not st.index and (st.name == "HISTSIZE" or st.name == "HISTFILESIZE") then
+				return delegate(st, after)
+			end
+			-- SHELLOPTS/BASHOPTS are readonly derived specials with no var box, so neither a
+			-- bare native set nor I.assign_scalar rejects them. Always delegate so interp
+			-- reports "readonly variable" (status 1), as bash does.
+			if not st.index and (st.name == "SHELLOPTS" or st.name == "BASHOPTS") then
+				return delegate(st, after)
+			end
+			if (st.rhs and not emitable_word(st.rhs)) or (st.arith and arith_side_effect(st.arith)) then
+				return delegate(st, after)
+			end
+			-- a[i]=v / a[i]+=v: compile when the subscript is a non-empty emit_word-able word (rt
+			-- .assign_element resolves it as an assoc key or an indexed arith at runtime). An empty
+			-- or unrenderable subscript delegates. Gated to non-nameref programs (above) — a nameref
+			-- element write needs interp.
+			local iw
+			if st.index then
+				if st.index == "" then
+					return delegate(st, after)
+				end
+				local iok
+				iok, iw = pcall(require("parser").parse_word, st.index)
+				if not (iok and emitable_word(iw)) then
+					return delegate(st, after)
+				end
+				-- a cmdsub/procsub subscript is expanded once by emit_word AND (for indexed) arith-
+				-- evaluated from the raw — two evals of a side-effecting sub. Delegate those.
+				for _, pp in ipairs(iw.parts) do
+					if pp.cmdsub or pp.procsub then
+						return delegate(st, after)
+					end
+				end
+			end
+			local p = newpc()
+			local d = dbg(st) -- DEBUG trap fires before the assignment (bash: DEBUG_FIRE.assign)
+			-- assignment-RHS tilde (string paths only; st.rhs is nil for an arith assign): an
+			-- ALL-LITERAL rhs containing ~ expands each `:`-segment (`x=foo:~` -> foo:$HOME).
+			-- Only literal tildes expand — a ~ from a variable's value never does.
+			local function rhsval()
+				local fl = unq_full_lit(st.rhs)
+				if fl and fl:find("~", 1, true) then
+					return ("rt.tilde_assign(sh, %q)"):format(fl)
+				end
+				return emit_word(st.rhs, lifted)
+			end
+			local ua = '; sh:set_str("_", "")' -- a bare assignment resets $_ (bash)
+			if st.index then -- a[i]=v / a[i]+=v: status 0 first (so a plain RHS is 0; a cmdsub in the
+				-- subscript/RHS overwrites it), then the element assign; assign_element leaves status.
+				local ec = errchk(st)
+				local ecs = ec ~= "" and ("; " .. ec) or ""
+				blocks[p] = d
+					.. ("sh.status = 0; rt.assign_element(sh, %q, %q, %s, %s, %s)%s; pc = %d"):format(
+						st.name,
+						st.index,
+						emit_word(iw, lifted),
+						rhsval(),
+						tostring(st.append and true or false),
+						ecs,
+						after
+					)
+				return p
+			end
+			if st.append and not st.arith then -- scalar name+=value: rt.append_scalar picks concat /
+				-- int arith-add / array[0]-append by the var's type at runtime (interp's append path).
+				local ec = errchk(st)
+				local ecs = ec ~= "" and ("; " .. ec) or ""
+				blocks[p] = d
+					.. ("sh.status = 0; rt.append_scalar(sh, %q, %s)%s%s; pc = %d"):format(
+						st.name,
+						rhsval(),
+						ecs,
+						ua,
+						after
+					)
+				return p
+			end
+			if st.arith then
+				-- x=$((…)): a non-lifted read honors set -u and resolves recursively (bash),
+				-- exactly as the $(())-in-word and (( )) paths do — swap in arith_read.
+				local saved = arith_varread
+				arith_varread = "rt.arith_read(sh, %q)"
+				local rhs = emit_value(st.arith, lifted)
+				arith_varread = saved
+				blocks[p] = d .. emit_set(st.name, rhs, lifted) .. ua .. ("; pc = %d"):format(after)
+			elseif lifted[st.name] then
+				blocks[p] = d
+					.. emit_set(st.name, numeric_word(st.rhs) .. "LL", lifted)
+					.. ua
+					.. ("; pc = %d"):format(after)
+			elseif EF.has_attr or EF.has_nameref then -- readonly / array[0] / -i,-l,-u / nameref write-through
+				-- status 0 first so a plain RHS yields 0 (a cmdsub RHS overwrites it), then
+				-- assign_scalar (readonly reject + nameref/cycle/subscript write-through); errchk applies.
+				local ec = errchk(st)
+				local ecs = ec ~= "" and ("; " .. ec) or ""
+				blocks[p] = d
+					.. ("sh.status = 0; rt.assign_scalar(sh, %q, %s)%s%s; pc = %d"):format(
+						st.name,
+						rhsval(),
+						ecs,
+						ua,
+						after
+					)
+			else
+				-- $? after a plain assignment: the RHS's last cmdsub status, else 0 — but the
+				-- RHS is evaluated FIRST (so `st=$?` reads the PREVIOUS status), then reset to 0
+				-- only when the RHS has no cmdsub; then errchk fires ERR/errexit (`x=$(false)`).
+				local ec = errchk(st)
+				local ecs = ec ~= "" and ("; " .. ec) or ""
+				local hascmd = false
+				if st.rhs then
+					for _, pp in ipairs(st.rhs.parts) do
+						if pp.cmdsub then
+							hascmd = true
+							break
+						end
+					end
+				end
+				local st0 = hascmd and "" or "; sh.status = 0"
+				blocks[p] = d .. ("sh:set_str(%q, %s)%s%s%s; pc = %d"):format(st.name, rhsval(), st0, ecs, ua, after)
+			end
+			return p
+		elseif t == "funcdef" then
+			-- Register the (hoisted) closure into sh.functions when the DEFINITION runs, not
+			-- at load — so a function doesn't "exist" (declare -f / delegated call / prefix
+			-- assign) before its def line (bash). Direct compiled calls use the hoisted local
+			-- regardless. Nested funcdefs (not in funcflags) stay a no-op for now.
+			-- def-redirect and redefined funcs: interp registers the def (with func_redirs, or
+			-- in program order for a redefinition) — the compiled fn_x can't represent either.
+			if st.redirs or emit_redir_funcs[st.name] then
+				return delegate(st, after)
+			end
+			local p = newpc()
+			if not st.name:match("^[%w_][%w_%.%-:+@/!#=]*$") then -- name is an expansion (`$foo-bar()`):
+				blocks[p] = ("io.stderr:write(%q); sh.status = 1; pc = %d") -- non-fatal runtime error (bash)
+					:format("curse: `" .. st.name .. "': not a valid identifier\n", after)
+			elseif funcflags[st.name] then
+				blocks[p] = ("sh.functions[%q] = %s; pc = %d"):format(st.name, fnlname(st.name), after)
+			else
+				blocks[p] = ("pc = %d"):format(after)
+			end
+			return p
+		elseif t == "simple" then
+			local cmd = st.words[1] and full_lit(st.words[1]) -- full literal → \-escaped builtins (\exit, \echo) dispatch
+			if cmd and emit_redir_funcs[cmd] then
+				return delegate(st, after)
+			end -- call to a def-redirect func
+			-- `local a=(…)` / `declare a=(…)`: the array value lives in st.arrayargs, which
+			-- the native builtin paths don't render — interp does the scope-aware array assign.
+			if st.arrayargs then
+				return delegate(st, after)
+			end
+			-- DYNAMIC command word (first word not a compile-time literal — `$cmd`, `${x}`, …):
+			-- the command STRUCTURE is a static simple-command; only the word is late-bound. Build
+			-- argv with the field engine and dispatch via rt.exec_dynamic (the command runner),
+			-- reusing delegate's control-flow-signal wrapper. A prefix assign (tempenv) still needs
+			-- exec_stmt's fuller handling; a redirect is applied around the dispatch (opts.redir).
+			if cmd == nil and st.words[1] and not st.assigns then
+				local argvbody = field_argv(st.words, 1, lifted, nil, nil)
+				local dyn_redir = nil
+				if argvbody and st.redirs then
+					dyn_redir = redir_conds(st, nil) -- nil => uncompilable redir shape: fall through to full delegate
+				end
+				if argvbody and not (st.redirs and not dyn_redir) then
+					-- hadcs (compile-time): a word contains a command sub, so an empty argv keeps its status.
+					local hadcs = false
+					for _, w in ipairs(st.words) do
+						for _, pp in ipairs(w.parts) do
+							if pp.cmdsub then
+								hadcs = true
+								break
+							end
+						end
+						if hadcs then
+							break
+						end
+					end
+					return delegate(
+						st,
+						after,
+						{
+							prelude = argvbody,
+							callee = "rt.exec_dynamic",
+							callargs = ("sh, __a, __noop, %s"):format(tostring(hadcs)),
+							redir = dyn_redir,
+						}
+					)
+				end
+			end
+			-- `command CMD args` (no -p/-v/-V/-- flag): run CMD skipping SHELL FUNCTION lookup
+			-- (builtin/external only) — exactly interp's exec_simple(rest, no_func=true). Build argv
+			-- from words[2..] and dispatch through rt.exec_dynamic with no_func, reusing delegate's
+			-- cf-signal wrapper and opts.redir. A flag form (`command -v`, `command -p`) delegates.
+			if cmd == "command" and st.words[2] and not st.assigns then
+				local w2 = st.words[2].parts[1]
+				if not (w2 and w2.lit and w2.lit:sub(1, 1) == "-") then -- not a flag / --
+					local argvbody = field_argv(st.words, 2, lifted, nil, nil)
+					local cmd_redir = nil
+					if argvbody and st.redirs then
+						cmd_redir = redir_conds(st, nil)
+					end
+					if argvbody and not (st.redirs and not cmd_redir) then
+						local hadcs = false
+						for j = 2, #st.words do
+							for _, pp in ipairs(st.words[j].parts) do
+								if pp.cmdsub then
+									hadcs = true
+									break
+								end
+							end
+							if hadcs then
+								break
+							end
+						end
+						return delegate(
+							st,
+							after,
+							{
+								prelude = argvbody,
+								callee = "rt.exec_dynamic",
+								callargs = ("sh, __a, __noop, %s, true"):format(tostring(hadcs)),
+								redir = cmd_redir,
+							}
+						)
+					end
+				end
+			end
+			-- `builtin CMD args`: force the shell BUILTIN for CMD (skip any function of that name).
+			-- rt.exec_dynamic on the argv WITH "builtin" kept as argv[1] does exactly this — exec_simple
+			-- resolves "builtin" to the b_builtin builtin, which force-runs the rest as a builtin —
+			-- and reuses delegate's cf-signal wrapper (so `builtin break` in a loop jumps) + opts.redir.
+			if cmd == "builtin" and st.words[2] and not st.assigns then
+				local argvbody = field_argv(st.words, 1, lifted, nil, nil)
+				local bi_redir = nil
+				if argvbody and st.redirs then
+					bi_redir = redir_conds(st, nil)
+				end
+				if argvbody and not (st.redirs and not bi_redir) then
+					local hadcs = false
+					for j = 2, #st.words do
+						for _, pp in ipairs(st.words[j].parts) do
+							if pp.cmdsub then
+								hadcs = true
+								break
+							end
+						end
+						if hadcs then
+							break
+						end
+					end
+					return delegate(
+						st,
+						after,
+						{
+							prelude = argvbody,
+							callee = "rt.exec_dynamic",
+							callargs = ("sh, __a, __noop, %s"):format(tostring(hadcs)),
+							redir = bi_redir,
+						}
+					)
+				end
+			end
+			-- `declare`/`typeset` INSIDE a function (no -g) make each name local, exactly like
+			-- `local` (bash) — so route a plain one through the native local path. A flag (incl.
+			-- -g), an array value (st.arrayargs delegated above), or `a[i]=` fails the plain check
+			-- below and delegates, as for local. At the top level declare stays a global (decl_native).
+			local as_local = cmd == "local" or ((cmd == "declare" or cmd == "typeset") and not toplevel)
+			-- The native `local` fast path (sh:localAssign) handles ONLY a plain scalar
+			-- `local NAME[=val]`: it can't validate the name, honor a flag (-n/-A/-p), do
+			-- an array element `a[i]=`, or LIST (bare `local`). Delegate anything else to
+			-- interp's full `local`, which also errors a bad name and skips a readonly
+			-- (matching bash). Done BEFORE the simple-stmt's newpc so no pc is orphaned.
+			if as_local then
+				-- (readonly / set -a are handled per-name at runtime by sh:localAssign — a
+				-- readonly operand fails with $?=1, a set -a local is exported — so no
+				-- whole-program blanket is needed here.)
+				local plain = #st.words >= 2
+				for j = 2, #st.words do
+					local p1 = st.words[j].parts[1]
+					local lit = p1 and p1.lit
+					if
+						not (
+							lit
+							and (
+								lit:match("^[%a_][%w_]*%+?=")
+								or (lit:match("^[%a_][%w_]*$") and #st.words[j].parts == 1)
+							)
+						)
+					then
+						plain = false
+						break
+					end
+				end
+				if not plain then
+					return delegate(st, after)
+				end
+			end
+			-- `exec` with ONLY redirects and no command word (`exec > log`, `exec 3< f`,
+			-- `exec 2>&1`): a PERSISTENT redirect — apply the redirs to the shell's own fds and do
+			-- NOT restore (they outlive the statement), status 0 / 1 on failure, exactly interp's
+			-- exec path. `exec cmd…` (process replacement) and an uncompilable redir shape delegate.
+			if cmd == "exec" and #st.words == 1 and st.redirs and not st.assigns then
+				local re = redir_conds(st, nil) -- nil cmd bypasses the exec guard in redir_conds
+				if re then
+					local p = newpc()
+					blocks[p] = dbg(st)
+						.. ("do local __rs = {}; sh.status = (%s) and 0 or 1 end; pc = %d"):format(re, after)
+					return p
+				end
+			end
+			-- redirects compile (targets computed natively, syscalls via rt.redir_apply)
+			-- when every one is compilable AND this isn't `exec` (its redirs persist);
+			-- otherwise the whole command delegates.
+			local redir_apply = nil
+			if st.redirs then
+				redir_apply = redir_conds(st, cmd)
+				if not redir_apply then
+					return delegate(st, after)
+				end
+			end
+			-- a redirect-ONLY command (`> file`, `< f`): no command runs; apply the redirs
+			-- (their open/truncate is the effect), status 0 (or 1 on failure), then restore.
+			-- BUT a prefix assignment with no command (`abc=def > f`) performs the assignment
+			-- in the current shell EVEN when the redirect fails — the native path here would
+			-- drop it, so delegate to interp, which applies the assignment then the redirect.
+			if not st.words[1] then
+				if st.assigns then
+					return delegate(st, after)
+				end
+				local p = newpc()
+				blocks[p] = dbg(st)
+					.. ("do local __rs = {}; sh.status = %s and 0 or 1; rt.redir_restore(__rs) end; pc = %d"):format(
+						redir_apply,
+						after
+					)
+				return p
+			end
+			-- delegate if it needs the field engine (splitting/glob/pexp), or a builtin
+			-- without a native compiled form.
+			local NATIVE_BUILTIN = {
+				echo = 1,
+				[":"] = 1,
+				["true"] = 1,
+				["false"] = 1,
+				["local"] = 1,
+				["return"] = 1,
+				test = 1,
+				["["] = 1,
+			}
+			local isfunc = (inlinefns and inlinefns[cmd]) or funcflags[cmd]
+			if cmd == "return" and redir_apply then
+				return delegate(st, after)
+			end -- rare; wrapper assumes a run body
+			-- Simple interp-only builtins (printf/set/shopt/umask/type/read/getopts/…): build
+			-- argv with the shared field engine and dispatch through exec_simple — the command
+			-- RUNNER, not statement re-interpretation. EXCLUDED (they need exec_stmt's fuller
+			-- handling, compiled separately): assignment builtins whose `name=val` args must NOT
+			-- word-split (export/declare/readonly/local/typeset), code/control-flow builtins
+			-- (eval/source/./command/builtin/exit/return/break/continue). exec_stmt sets $_ to
+			-- the last arg; replicate that. Prefix-env (`x=v cmd`) keeps interp's tempenv binding.
+			-- `wait` needs interp's job-control context, so it still delegates. A REDIRECTED builtin
+			-- IS compiled below (install redirs, run, flush-before-restore, honor a flagged write error).
+			local EXEC_SIMPLE_SKIP = {
+				export = 1,
+				declare = 1,
+				readonly = 1,
+				["local"] = 1,
+				typeset = 1,
+				eval = 1,
+				source = 1,
+				["."] = 1,
+				command = 1,
+				builtin = 1,
+				exit = 1,
+				["return"] = 1,
+				["break"] = 1,
+				["continue"] = 1,
+				exec = 1,
+				wait = 1,
+			}
+			-- Declaration builtins normally delegate because a LITERAL `name=value` arg must
+			-- expand its value in assignment context (no word-split/glob, tilde after =) —
+			-- which this field path can't do. But when NO arg is a literal assignment (only
+			-- flags and bare names: `export FOO`, `readonly -p`, `declare -A m`, `declare -f`),
+			-- their args split like any builtin's, so run them natively via rt.builtin. A
+			-- `name=value` written in source, an array value (st.arrayargs), or `a[i]=` still
+			-- delegates. (`$x` that expands to `name=value` is a normal split arg the builtin
+			-- assigns — that is correct here, matching bash.)
+			-- Only at top level: inside a function, declare/typeset (and a bare name) DEFAULT
+			-- to a LOCAL, which needs the function-scope context the delegation path sets up
+			-- but rt.builtin does not — so an in-function `declare -A d` would leak to global.
+			-- At top level there is no local scope, so the native dispatch is exact.
+			local DECL_BUILTIN = { export = 1, declare = 1, readonly = 1, typeset = 1 }
+			local decl_native = DECL_BUILTIN[cmd] and toplevel and not st.arrayargs
+			if decl_native then
+				for j = 2, #st.words do
+					local p1 = st.words[j].parts[1]
+					local lit = p1 and p1.lit
+					if lit and (lit:match("^[%a_][%w_]*%+?=") or lit:match("^[%a_][%w_]*%b[]%+?=")) then
+						decl_native = false
+						break
+					end
+				end
+			end
+			-- Top-level declaration builtin WITH a literal `name=value` arg (`export FOO=bar`,
+			-- `declare -i n=5`, `export PATH=$PATH:/x`): build argv statically, expanding each
+			-- assignment value in assignment context — no word-split (emit_word renders the
+			-- whole `name=value` word to a single field), and tilde after `=`/`:` via
+			-- rt.tilde_assign for an all-literal value. b_export then does attribute processing
+			-- (arith for -i, etc.) on the expanded string. Defers to delegation for an array
+			-- element `a[i]=`, a value with a literal ~ mixed with expansions (needs the
+			-- assign-context tilde engine), or a splitting/unrenderable non-assignment arg.
+			if
+				DECL_BUILTIN[cmd]
+				and toplevel
+				and not st.arrayargs
+				and not decl_native
+				and cmd
+				and st.assigns == nil
+				and not redir_apply
+				and not isfunc
+			then
+				local items, ok = {}, true
+				for j = 1, #st.words do
+					local w = st.words[j]
+					local p1 = w.parts[1]
+					local lit = p1 and p1.lit
+					if j > 1 and lit and lit:match("^[%a_][%w_]*%b[]") then
+						ok = false
+						break -- a[i]=/a[i]
+					elseif j > 1 and lit and lit:match("^[%a_][%w_]*%+?=") then -- scalar assignment
+						local pfx = lit:match("^([%a_][%w_]*%+?=)")
+						local fl = unq_full_lit(w)
+						if fl then -- all-literal name=value
+							if fl:find("~", 1, true) then
+								items[#items + 1] = ("rt.cstr(%q .. rt.tilde_assign(sh, %q))"):format(
+									pfx,
+									fl:sub(#pfx + 1)
+								)
+							else
+								items[#items + 1] = ("rt.cstr(%q)"):format(fl)
+							end
+						else -- value has expansions: emit_word renders name=value (no split); a
+							local htilde = false -- literal ~ mixed in needs the assign-tilde engine → defer
+							for _, pp in ipairs(w.parts) do
+								if pp.lit and pp.lit:find("~", 1, true) then
+									htilde = true
+									break
+								end
+							end
+							if htilde or not emitable_word(w) then
+								ok = false
+								break
+							end
+							items[#items + 1] = ("rt.cstr(%s)"):format(emit_word(w, lifted))
+						end
+					else -- command word / flag / bare name: must not need the field engine
+						if not word_safe(w) then
+							ok = false
+							break
+						end
+						items[#items + 1] = ("rt.cstr(%s)"):format(emit_word(w, lifted))
+					end
+				end
+				if ok then
+					local p = newpc()
+					local ec = errchk(st)
+					local ecs = ec ~= "" and ("; " .. ec) or ""
+					local d = dbg(st)
+					local lastarg = "if #__a > 0 then sh:set_str('_', __a[#__a]) end"
+					blocks[p] = d
+						.. ("local __a = { %s }; rt.builtin(sh, __a, __noop); "):format(table.concat(items, ", "))
+						.. lastarg
+						.. ecs
+						.. ("; pc = %d"):format(after)
+					return p
+				end
+			end
+			if
+				cmd
+				and st.assigns == nil
+				and not NATIVE_BUILTIN[cmd]
+				and not isfunc
+				and (not EXEC_SIMPLE_SKIP[cmd] or decl_native)
+				and require("interp").BUILTINS[cmd]
+			then
+				local builder = field_argv(st.words, 1, lifted, "rt.cstr(%s)") -- argv entries are C strings (cut at NUL, like interp's expand_args)
+				if builder then
+					local p = newpc()
+					local ec = errchk(st)
+					local ecs = ec ~= "" and ("; " .. ec) or ""
+					local d = dbg(st) -- DEBUG fires before the command and its expansions
+					local lastarg = "if #__a > 0 then sh:set_str('_', __a[#__a]) end" -- $_ = last arg (bash)
+					if redir_apply then
+						-- a REDIRECTED builtin (`printf x > f`, `read v < f`, `type ls > f`): install the
+						-- redirs, run it (its output/input now on the target fd), then io.flush BEFORE
+						-- restoring — buffered output must reach the target fd, not the restored one
+						-- (interp flushes here too). A write error the builtin flagged (full disk) is
+						-- status 1, like bash's sh_chkwrite.
+						blocks[p] = d
+							.. builder
+							.. ("; do local __rs = {}; if %s then sh.write_err = nil; rt.builtin(sh, __a, __noop); io.flush() else sh.status = 1 end; rt.redir_restore(__rs); if sh.write_err then sh.status = 1 end end; %s%s; pc = %d"):format(
+								redir_apply,
+								lastarg,
+								ecs,
+								after
+							)
+					else
+						blocks[p] = d
+							.. builder
+							.. "; rt.builtin(sh, __a, __noop); "
+							.. lastarg
+							.. ecs
+							.. ("; pc = %d"):format(after)
+					end
+					return p
+				end
+			end
+			-- FIELD-ENGINE path: an argument word-splits or globs, so argv is variable
+			-- length. Commands with a STATIC dispatch (echo, test/[, a named external, a
+			-- non-inline function) consume it via rt.field_split on natively-computed
+			-- operands; everything else (inline fn, interp-only builtin, prefix env,
+			-- dynamic command word) delegates.
+			if st.assigns == nil then
+				local anyfield = false
+				-- A `local`/in-function `declare` VALUE word (j>1) never word-splits or globs
+				-- (assignment context), so a merely-renderable value (`local x=$y`) is NOT a
+				-- field-engine word — gate it on emitable_word, letting it reach the native
+				-- localAssign path below rather than delegating here.
+				for j = 1, #st.words do
+					if as_local and j > 1 then
+						if not emitable_word(st.words[j]) then
+							anyfield = true
+							break
+						end
+					elseif not word_safe(st.words[j]) then
+						anyfield = true
+						break
+					end
+				end
+				if anyfield then
+					local from, wrap, call, prefix
+					if cmd == "echo" then
+						from = 2
+						call = "sh:echo(unpack(__a))"
+					elseif cmd == "test" or cmd == "[" then -- the [ / test command word is a literal (dispatched by
+						from = 2
+						wrap = "rt.cstr(%s)"
+						call = "rt.do_test(sh, __a)" -- name, never glob-expanded)
+						prefix = ("rt.cstr(%q)"):format(cmd)
+					elseif funcflags[cmd] and (funcflags[cmd].locals or funcflags[cmd].params) then
+						from = 2
+						local ff = funcflags[cmd]
+						call = fnwrap(
+							cmd,
+							st.line,
+							ff.locals and ("sh:pushCall(unpack(__a)); %s(sh); sh:popCall()"):format(fnlname(cmd))
+								or ("sh:pushParams(unpack(__a)); %s(sh); sh:popParams()"):format(fnlname(cmd))
+						)
+					elseif funcflags[cmd] then -- bare function (references NO positional params): build argv
+						from = 2 -- to run the args' side effects, then a bare call (params unread)
+						call = fnwrap(cmd, st.line, ("%s(sh)"):format(fnlname(cmd)))
+					elseif
+						cmd ~= nil
+						and not NATIVE_BUILTIN[cmd]
+						and not (inlinefns and inlinefns[cmd])
+						and not funcflags[cmd]
+						and not require("interp").BUILTINS[cmd]
+					then
+						from = 1
+						call = "sh:exec(unpack(__a))" -- external, static command name
+					else
+						return delegate(st, after)
+					end
+					wrap = wrap or "rt.cstr(%s)" -- argv entries are C strings: cut each at NUL (bash/interp)
+					local builder = field_argv(st.words, from, lifted, wrap, prefix)
+					if not builder then
+						return delegate(st, after)
+					end
+					local p = newpc()
+					local ec = errchk(st)
+					local ecs = ec ~= "" and ("; " .. ec) or ""
+					local d = dbg(st) -- DEBUG fires before the command (and its expansions)
+					-- PIPESTATUS after a simple command is a one-element array of its status
+					-- (bash), like the static-dispatch path below; gated on the program reading it.
+					local ps = EF.pipestatus and '; sh:array_assign("PIPESTATUS", {tostring(sh.status)}, false)' or ""
+					if redir_apply then
+						-- bash order: expand the words (side-effecting cmdsubs run) BEFORE the
+						-- redirects are applied, so `cmd $(read f) > f` reads f before it's
+						-- truncated. Build argv first, then install redirs around the dispatch.
+						blocks[p] = d
+							.. builder
+							.. ("; do local __rs = {}; if %s then %s else sh.status = 1 end; rt.redir_restore(__rs) end%s%s; pc = %d"):format(
+								redir_apply,
+								call,
+								ps,
+								ecs,
+								after
+							)
+					else
+						blocks[p] = d .. builder .. "; " .. call .. ps .. ecs .. ("; pc = %d"):format(after)
+					end
+					return p
+				end
+			end
+			local mustdeleg = st.assigns ~= nil -- prefix env -> delegate
+			if not mustdeleg then
+				for j, w in ipairs(st.words) do
+					-- The command word of a NATIVE builtin is dispatched by literal name (never
+					-- glob-expanded), so skip its field-engine check — otherwise `[` trips the
+					-- unquoted-glob rule on its own `[` char and the whole `[ … ]` delegates.
+					if j == 1 and NATIVE_BUILTIN[cmd] then -- literal builtin name
+					-- functions stay native (so they inline / call fn_x) unless an arg has a
+					-- ${..} the codegen can't render; other commands delegate on any word
+					-- that needs the field engine (splitting/glob/multi).
+					elseif isfunc then
+						if not emitable_word(w) then
+							mustdeleg = true
+							break
+						end
+					-- `local`/in-function `declare|typeset` VALUE word (j>1): an assignment RHS
+					-- never word-splits or globs, so it needs only to be renderable (emitable_word),
+					-- not word_safe — `local x=$y` / `local x=$(cmd)` / `local x=*.txt` assign the
+					-- value verbatim. (The command word j==1 keeps the word_safe/native-builtin path.)
+					elseif as_local and j > 1 then
+						if not emitable_word(w) then
+							mustdeleg = true
+							break
+						end
+					elseif not word_safe(w) then
+						mustdeleg = true
+						break
+					end
+				end
+			end
+			-- interp-only builtins (no native compiled form) delegate. Use interp's own
+			-- builtin set so the two backends stay in lockstep as builtins are added. `as_local`
+			-- (in-function declare/typeset) has a native form (sh:localAssign) — don't delegate it.
+			if not mustdeleg and cmd and not NATIVE_BUILTIN[cmd] and not isfunc and not as_local then
+				if require("interp").BUILTINS[cmd] then
+					mustdeleg = true
+				end
+			end
+			if mustdeleg then
+				return delegate(st, after)
+			end
+			-- A DYNAMIC command word (`"$a"`, cmd is not a compile-time literal) must be
+			-- resolved at runtime against functions → builtins → externals, exactly as the
+			-- interpreter does. The native fall-through below assumes an EXTERNAL command
+			-- (sh:exec = PATH lookup), so `a=typeset; "$a" v=1` reported "command not found"
+			-- instead of running the builtin. Delegate — before the newpc, so no pc leaks.
+			if cmd == nil then
+				return delegate(st, after)
+			end
+			if cmd == "return" then -- exit the current CFG (function or top level)
+				local p = newpc()
+				local n = st.words[2] and ("tonumber(%s)"):format(emit_word(st.words[2], lifted)) or "sh.status"
+				blocks[p] = ("sh.status = (%s) or 0; pc = %d"):format(n, DONE)
+				return p
+			end
+			if inlinefns and inlinefns[cmd] and not redir_apply then
+				-- INLINE: bind $n to the caller's exprs and splice the body flowing to `after`.
+				local pb = {}
+				for j = 2, #st.words do
+					local w = st.words[j]
+					local strExpr = emit_word(w, lifted)
+					local intExpr
+					if #w.parts == 1 then
+						local pp = w.parts[1]
+						if pp.var then
+							intExpr = lifted[pp.var] and lname(pp.var) or ("sh:aget(%q)"):format(pp.var)
+						elseif pp.lit and pp.lit:match("^[+-]?%d+$") then
+							intExpr = pp.lit .. "LL"
+						elseif pp.arith then
+							intExpr = emit_value(safe_arith(pp.arith), lifted)
+						else
+							intExpr = ("rt.str_to_i64(%s)"):format(strExpr)
+						end
+					else
+						intExpr = ("rt.str_to_i64(%s)"):format(strExpr)
+					end
+					pb[j - 1] = { int = intExpr, str = strExpr }
+				end
+				return flatten_list(subst_list(inlinefns[cmd], pb), after)
+			end
+			local p = newpc()
+			local args = {}
+			-- argv entries are C strings: cut each at NUL (bash/interp expand_args), so
+			-- `echo $'a\0b'` / a function arg with a NUL match. Command name kept as-is.
+			for j = 2, #st.words do
+				if not empty_word(st.words[j]) then
+					args[#args + 1] = ("rt.cstr(%s)"):format(emit_word(st.words[j], lifted))
+				end
+			end
+			local body
+			if cmd == "echo" then
+				body = "sh:echo(" .. table.concat(args, ", ") .. ")"
+			elseif cmd == ":" or cmd == "true" or cmd == "false" then
+				-- :/true/false ignore their args but bash still EXPANDS them, so a side-effecting arg
+				-- (`: $((a/=3))`, `: "${x:=d}"`, `: "$(cmd)"`) must run. Evaluate the argv, discard it.
+				local ev = #args > 0 and ("local __a = { " .. table.concat(args, ", ") .. " }; ") or ""
+				body = ev .. ("sh.status = %d"):format(cmd == "false" and 1 or 0)
+			elseif as_local then -- local / in-function declare|typeset: each NAME[=val] a local
+				-- bash expands ALL the assignment words FIRST (in the OUTER scope), THEN localizes
+				-- + assigns them — so `local a=1 b=$a` gives b=<outer a>, not 1. Pre-evaluate every
+				-- value into a temp before any localAssign so a later operand can't see an earlier
+				-- one's new binding. A `local NAME=foo:~` arg tilde-expands the RHS (all-literal only).
+				local tmps, calls = {}, {}
+				for j = 2, #st.words do
+					local aw = st.words[j]
+					if not empty_word(aw) then
+						local av = emit_word(aw, lifted)
+						local fl = unq_full_lit(aw)
+						if fl and fl:find("~", 1, true) then
+							av = ("rt.tilde_word_initial(sh, %q)"):format(fl)
+						end
+						local tn = "__lv" .. (#tmps + 1)
+						tmps[#tmps + 1] = ("local %s = %s"):format(tn, av)
+						-- localAssign returns false for a READONLY name (message + that operand fails);
+						-- `local` returns 1 if ANY operand failed, else 0 — the others still localize.
+						calls[#calls + 1] = ("__lok = (sh:localAssign(%s) ~= false) and __lok"):format(tn)
+					end
+				end
+				if #calls == 0 then
+					body = "sh.status = 0"
+				else
+					body = table.concat(tmps, "; ")
+						.. "; local __lok = true; "
+						.. table.concat(calls, "; ")
+						.. "; sh.status = __lok and 0 or 1"
+				end
+			elseif cmd == "test" or cmd == "[" then
+				-- [ EXPR ] / test EXPR: the operator/arity are compile-time known; compute the
+				-- args natively (word_safe, so no field engine) and run the POSIX test logic
+				-- via the do_test PRIMITIVE (access/stat/string/arith on the VALUES — not an
+				-- AST re-walk). do_test sets $? (0/1, or 2 on a malformed expression). Each arg
+				-- is rt.cstr'd: an argv entry is a C string, so a NUL truncates it (`$'\0'`);
+				-- interp truncates in expand_args, external exec via C — do_test is Lua-side.
+				local allargs = {}
+				for j = 1, #st.words do
+					if not empty_word(st.words[j]) then
+						allargs[#allargs + 1] = ("rt.cstr(%s)"):format(emit_word(st.words[j], lifted))
+					end
+				end
+				body = "rt.do_test(sh, {" .. table.concat(allargs, ", ") .. "})"
+			elseif funcflags[cmd] then
+				local ff = funcflags[cmd]
+				if ff.locals then -- full frame (save/restore shadowed vars + params)
+					body = fnwrap(
+						cmd,
+						st.line,
+						("sh:pushCall(%s); %s(sh); sh:popCall()"):format(table.concat(args, ", "), fnlname(cmd))
+					)
+				elseif ff.params then -- positional swap only (no per-call frame table)
+					body = fnwrap(
+						cmd,
+						st.line,
+						("sh:pushParams(%s); %s(sh); sh:popParams()"):format(table.concat(args, ", "), fnlname(cmd))
+					)
+				else -- neither: bare call, no allocation
+					body = fnwrap(cmd, st.line, ("%s(sh)"):format(fnlname(cmd)))
+				end
+			else -- external command — OR a function DEFINED AT RUNTIME (via source/eval).
+				local allargs = {}
+				for j = 1, #st.words do
+					if not empty_word(st.words[j]) then
+						allargs[#allargs + 1] = ("rt.cstr(%s)"):format(emit_word(st.words[j], lifted))
+					end
+				end
+				-- The name wasn't a funcdef at compile time, but source/eval can install one
+				-- into sh.functions before this runs; bash resolves function → builtin →
+				-- external, so check sh.functions at runtime and delegate to interp (which
+				-- sets up the frame/params/return) when present — else exec the external.
+				local ei = {}
+				for n in pairs(lifted) do
+					ei[#ei + 1] = ("sh:aset(%q, %s)"):format(n, lname(n))
+				end
+				local eo = {}
+				for n in pairs(lifted) do
+					eo[#eo + 1] = ("%s = sh:aget(%q)"):format(lname(n), n)
+				end
+				local si = #ei > 0 and (table.concat(ei, "; ") .. "; ") or ""
+				local so = #eo > 0 and ("; " .. table.concat(eo, "; ")) or ""
+				body = ("if sh.functions[%q] then %sI.exec_stmt(sh, %s, __noop)%s else sh:exec(%s) end"):format(
+					cmd,
+					si,
+					ser(st),
+					so,
+					table.concat(allargs, ", ")
+				)
+			end
+			local ec = errchk(st) -- errexit after a failing native simple command
+			local ecs = ec ~= "" and ("; " .. ec) or ""
+			local u = und(st, lifted) -- $_ = this command's last arg (bash), for the NEXT command
+			-- PIPESTATUS after a simple command is a one-element array of its status (bash);
+			-- set BEFORE errchk so an ERR trap sees it. Gated on the program reading it.
+			local ps = EF.pipestatus and '; sh:array_assign("PIPESTATUS", {tostring(sh.status)}, false)' or ""
+			local d = dbg(st) -- DEBUG fires before the command
+			if redir_apply then
+				-- install the redirs (backing up fds), run the command only if they all
+				-- succeeded (else $?=1, bash), then restore the fds — real syscalls, no AST.
+				blocks[p] = d
+					.. ("do local __rs = {}; if %s then %s else sh.status = 1 end; rt.redir_restore(__rs) end%s%s%s; pc = %d"):format(
+						redir_apply,
+						body,
+						ps,
+						ecs,
+						u,
+						after
+					)
+			else
+				blocks[p] = d .. body .. ps .. ecs .. u .. ("; pc = %d"):format(after)
+			end
+			return p
+		elseif t == "arithcmd" then
+			-- (( expr )): evaluate expr WITH side effects natively (assignments, ++/--,
+			-- comma), then $? = (result != 0) ? 0 : 1 — bash's arith-command status. No
+			-- delegation; the interpreter is only used for the parts the emitter can't
+			-- render (array subscripts, embedded $-expansion, $LINENO/$_, redirects).
+			if st.redirs then
+				return delegate(st, after)
+			end
+			if not arith_stmt_ok(st.expr) then
+				return delegate(st, after)
+			end
+			local p = newpc()
+			local ec = errchk(st)
+			local ecs = ec ~= "" and ("; " .. ec) or ""
+			local d = dbg(st) -- DEBUG fires before the (( )) command (bash: DEBUG_FIRE.arithcmd)
+			local saved = arith_varread
+			arith_varread = "rt.arith_read(sh, %q)" -- nounset+recursive-eval reads
+			local code = emit_arith_into("__ar", st.expr, lifted)
+			arith_varread = saved
+			if arith_can_div_fault(st.expr) then
+				-- ÷0 / mod-0 / negative ** THROW a non-fatal matherr — catch it (and any
+				-- flagged read fault) as $?=1 and continue, like interp; re-raise anything else.
+				blocks[p] = d
+					.. (
+						"do local __ia = sh.in_arithcmd; sh.arithfault = false; sh.in_arithcmd = true; local __ok, __v = pcall(function() local __ar = 0LL; %s; return (__ar ~= 0LL) and 0 or 1 end); sh.in_arithcmd = __ia; "
+						.. "if not __ok then if type(__v) == 'table' and __v.__curse_matherr then sh.status = 1 else error(__v) end "
+						.. "elseif sh.arithfault then sh.status = 1 else sh.status = __v end end%s; pc = %d"
+					):format(code, ecs, after)
+			elseif arith_can_error(st.expr, lifted) then
+				-- a non-lifted read may fault; INSIDE the (( )) command arith_read records it in
+				-- sh.arithfault WITHOUT throwing (sh.in_arithcmd gates that), so no per-iteration
+				-- pcall/closure — the accumulator stays JIT-native.
+				blocks[p] = d
+					.. ("do local __ia = sh.in_arithcmd; sh.arithfault = false; sh.in_arithcmd = true; local __ar = 0LL; %s; sh.in_arithcmd = __ia; sh.status = sh.arithfault and 1 or ((__ar ~= 0LL) and 0 or 1) end%s; pc = %d"):format(
+						code,
+						ecs,
+						after
+					)
+			else -- provably error-free (lifted ints, +-*/comparisons): inline, JIT-native
+				blocks[p] = d
+					.. ("do local __ar = 0LL; %s; sh.status = (__ar ~= 0LL) and 0 or 1 end%s; pc = %d"):format(
+						code,
+						ecs,
+						after
+					)
+			end
+			return p
+		elseif t == "forc" then
+			if st.redirs then
+				return delegate(st, after)
+			end -- redirs on the loop: interp applies them
+			if hard_cf(st.body) then
+				return delegate(st, after)
+			end -- un-static break/continue
+			if
+				not_compilable(st.init)
+				or not_compilable(st.cond)
+				or not_compilable(st.step)
+				or arith_side_effect(st.cond) -- a side-effecting cond can't be an emit_bool expr
+				or arith_reads_unsafe(st.init)
+				or arith_reads_unsafe(st.cond)
+				or arith_reads_unsafe(st.step)
+			then
+				return delegate(st, after) -- $LINENO/$RANDOM/… in the arith: interp reproduces the value
+			end
+			local condp = newpc()
+			loopPc[st.id] = condp
+			local stepp = newpc()
+			loopstack[#loopstack + 1] = { brk = after, cont = stepp } -- break exits, continue steps
+			local bodyentry = flatten_list(st.body, stepp)
+			loopstack[#loopstack] = nil
+			local d = dbg(st) -- DEBUG fires at the for(( header for the init, each cond, and each step (bash)
+			blocks[stepp] = d
+				.. (st.step and emit_arith_stmt(st.step, lifted) .. "; " or "")
+				.. ("pc = %d"):format(condp)
+			blocks[condp] = d
+				.. ("if %s then pc = %d else pc = %d end"):format(
+					st.cond and emit_bool(st.cond, lifted) or "true",
+					bodyentry,
+					after
+				)
+			if st.init then
+				local ip = newpc()
+				blocks[ip] = d .. emit_arith_stmt(st.init, lifted) .. ("; pc = %d"):format(condp)
+				return ip
+			end
+			return condp
+		elseif t == "whilec" then
+			if st.redirs then
+				return delegate(st, after)
+			end -- redirs on the loop (heredoc/file): interp applies them
+			-- un-static break/continue in the body, or ANY in the command condition (loopstack
+			-- isn't active there) → delegate the whole loop (else the signal is lost → spin).
+			if hard_cf(st.body) or (type(st.cond) == "table" and not st.cond.k and hard_cf(st.cond, true)) then
+				return delegate(st, after)
+			end
+			local arith = cond_arith(st.cond)
+			if arith and arith_reads_unsafe(arith) then
+				-- a `(( ))` condition reading an unreproducible special ($LINENO/$RANDOM/…):
+				-- delegate the whole loop to interp, which reproduces the value.
+				return delegate(st, after)
+			end
+			if arith and not st.negate and not not_compilable(arith) and not arith_side_effect(arith) then
+				-- fast path: a native arith condition `while (( expr ))` — no command run.
+				local condp = newpc()
+				loopPc[st.id] = condp
+				loopstack[#loopstack + 1] = { brk = after, cont = condp }
+				local bodyentry = flatten_list(st.body, condp)
+				loopstack[#loopstack] = nil
+				blocks[condp] = ("if %s then pc = %d else pc = %d end"):format(
+					emit_bool(arith, lifted),
+					bodyentry,
+					after
+				)
+				return condp
+			end
+			-- fast path: `while/until [ A -op B ]` with integer operands — a native int64
+			-- compare instead of building an argv table and running do_test each iteration.
+			-- Keeps [ ]'s own $? (0/1) for the body's first command AND the loop's
+			-- last-body exit status (lv), exactly like the command-condition path below.
+			local tarith = test_as_arith(st.cond, lifted)
+			if tarith then
+				local lv = newloopvar()
+				local condp = newpc()
+				loopPc[st.id] = condp
+				local exitp = newpc()
+				blocks[exitp] = ("sh.status = %s; pc = %d"):format(lv, after)
+				loopstack[#loopstack + 1] = { brk = after, cont = condp }
+				local bodysave = newpc()
+				local bodyentry = flatten_list(st.body, bodysave)
+				loopstack[#loopstack] = nil
+				blocks[bodysave] = ("%s = sh.status; pc = %d"):format(lv, condp)
+				blocks[condp] = ("sh.status = (%s) and 0 or 1; if sh.status %s 0 then pc = %d else pc = %d end"):format(
+					emit_bool(tarith, lifted),
+					st.negate and "~=" or "==",
+					bodyentry,
+					exitp
+				)
+				local entry = newpc()
+				blocks[entry] = ("%s = 0; pc = %d"):format(lv, condp)
+				return entry
+			end
+			-- COMMAND condition (or `until`): run the condition list as a sub-CFG with
+			-- sh.noerr raised (errexit-exempt, like the interpreter), then branch on its
+			-- exit status — `while` enters the body on 0, `until` on non-zero. The loop's
+			-- exit status is the LAST body command's status (bash), which the condition
+			-- clobbers — so one native register (lv) remembers it across the re-test.
+			-- loopPc = the condition entry (an OSR resumes at the re-test point). Genuine
+			-- control flow, no delegation.
+			local lv = newloopvar()
+			local prep = newpc()
+			loopPc[st.id] = prep
+			local donep = newpc()
+			local exitp = newpc()
+			blocks[exitp] = ("sh.status = %s; pc = %d"):format(lv, after)
+			loopstack[#loopstack + 1] = { brk = after, cont = prep } -- break exits (status 0), continue re-tests
+			local bodysave = newpc()
+			local bodyentry = flatten_list(st.body, bodysave)
+			loopstack[#loopstack] = nil
+			blocks[bodysave] = ("%s = sh.status; pc = %d"):format(lv, prep)
+			blocks[donep] = ("sh.noerr = sh.noerr - 1; if sh.status %s 0 then pc = %d else pc = %d end"):format(
+				st.negate and "~=" or "==",
+				bodyentry,
+				exitp
+			)
+			local listentry = flatten_list(st.cond, donep)
+			blocks[prep] = ("sh.noerr = sh.noerr + 1; pc = %d"):format(listentry)
+			local entry = newpc()
+			blocks[entry] = ("%s = 0; pc = %d"):format(lv, prep) -- status 0 if body never runs
+			return entry
+		elseif t == "forin" then
+			if st.redirs then
+				return delegate(st, after)
+			end -- redirs on the loop: interp applies them
+			if hard_cf(st.body) then
+				return delegate(st, after)
+			end -- un-static break/continue
+			if not st.name:match("^[%a_][%w_]*$") then
+				return delegate(st, after)
+			end -- invalid loop var → interp errors
+			-- Each word expands to for-list fields exactly like a command argument: word_safe (one
+			-- field), a field_word (an unquoted expansion/glob the field engine splits+globs), or a
+			-- seg_native mixed word (rt.expand_fields — literal+$x, $@/$*, ${a[@]}, ${!a[@]}, scalar
+			-- ${..} ops). emit_fields_into renders each fully natively (no interp field engine); a
+			-- word only the shared engine could take still delegates the loop (rare, cold).
+			for _, w in ipairs(st.words) do
+				-- $LINENO in a for-in list on a CONTINUATION line is the word's line, not the `for`
+				-- line (st.line) the compile-time constant would use — delegate so interp's per-line
+				-- tracking gives the exact value (rare; the whole loop is cold anyway).
+				for _, p in ipairs(w.parts) do
+					if p.var == "LINENO" then
+						return delegate(st, after)
+					end
+				end
+				if not word_safe(w) and not field_word(w, lifted) and not EF.seg_native(w, lifted) then
+					return delegate(st, after)
+				end
+			end
+			local initp = newpc()
+			local advp = newpc()
+			loopPc[st.id] = advp -- back-edge = resume point
+			loopstack[#loopstack + 1] = { brk = after, cont = advp } -- break exits, continue advances
+			local bodyentry = flatten_list(st.body, advp)
+			loopstack[#loopstack] = nil
+			-- init: expand the word list ONCE into sh.forstate[id] (so OSR resumes it)
+			local parts = { "local __l = {}" }
+			for _, w in ipairs(st.words) do
+				if not empty_word(w) then
+					parts[#parts + 1] = emit_fields_into("__l", w, lifted)
+				end
+			end
+			parts[#parts + 1] = ("sh.forstate[%d] = {list=__l, idx=0}"):format(st.id)
+			blocks[initp] = table.concat(parts, "; ") .. ("; pc = %d"):format(advp)
+			-- DEBUG fires at the `for` header before each iteration (bash), with an element present.
+			blocks[advp] = ("local fs = sh.forstate[%d]; fs.idx = fs.idx + 1; if fs.idx > #fs.list then pc = %d else sh:set_str(%q, fs.list[fs.idx]); %spc = %d end"):format(
+				st.id,
+				after,
+				st.name,
+				dbg(st),
+				bodyentry
+			)
+			return initp
+		elseif t == "if" then
+			-- Each clause's condition is either a native arith `(( ))` (emit_bool) or a
+			-- COMMAND LIST run for its status. Both compile — the command condition is a
+			-- sub-CFG run with sh.noerr raised (errexit-exempt, like the interpreter),
+			-- then we branch on sh.status. No delegation. Flatten bodies once, then build
+			-- clauses back-to-front so each false-branch target (the next condition, the
+			-- else body, or `after`) already exists.
+			if st.redirs then
+				return delegate(st, after)
+			end -- redirs on the whole `if`: interp applies them
+			local bentry = {}
+			local has_else = false
+			for i, cl in ipairs(st.clauses) do
+				bentry[i] = flatten_list(cl.body, after)
+				if not cl.cond then
+					has_else = true
+				end
+			end
+			-- With no else clause, falling past every (false) condition runs no body, so
+			-- the `if` yields status 0 (bash) — route that fall-through through a reset.
+			local fallthrough = after
+			if not has_else then
+				local s0 = newpc()
+				blocks[s0] = ("sh.status = 0; pc = %d"):format(after)
+				fallthrough = s0
+			end
+			local condentry = {}
+			for i = #st.clauses, 1, -1 do
+				local cl = st.clauses[i]
+				local nxt = st.clauses[i + 1] and (condentry[i + 1] or bentry[i + 1]) or fallthrough
+				if not cl.cond then
+					condentry[i] = bentry[i] -- an `else` clause: its body runs unconditionally
+				else
+					local arith = cond_arith(cl.cond)
+					local tarith = not arith and test_as_arith(cl.cond, lifted) -- `[ A -op B ]`, integer operands
+					if arith and not not_compilable(arith) and not arith_side_effect(arith) then
+						local cp = newpc()
+						blocks[cp] = ("if %s then pc = %d else pc = %d end"):format(
+							emit_bool(arith, lifted),
+							bentry[i],
+							nxt
+						)
+						condentry[i] = cp
+					elseif tarith then -- native int64 compare, and set [ ]'s own $? (0/1)
+						local cp = newpc()
+						blocks[cp] = ("sh.status = (%s) and 0 or 1; if sh.status == 0 then pc = %d else pc = %d end"):format(
+							emit_bool(tarith, lifted),
+							bentry[i],
+							nxt
+						)
+						condentry[i] = cp
+					else -- command condition: noerr++ ; run list ; noerr-- ; branch on status
+						local donep = newpc()
+						blocks[donep] = ("sh.noerr = sh.noerr - 1; if sh.status == 0 then pc = %d else pc = %d end"):format(
+							bentry[i],
+							nxt
+						)
+						local listentry = flatten_list(cl.cond, donep)
+						local prep = newpc()
+						blocks[prep] = ("sh.noerr = sh.noerr + 1; pc = %d"):format(listentry)
+						condentry[i] = prep
+					end
+				end
+			end
+			return condentry[1] or after
+		elseif t == "andor" then
+			-- `a && b || c`: run item 1, then each item iff the previous status matches
+			-- its operator (&& on 0, || on non-zero) — pure control flow. Errexit exempts
+			-- every operand EXCEPT the final one that runs (bash), so raise sh.noerr across
+			-- the non-final operands and restore it right before the last, letting only its
+			-- own errchk fire. Status is the last item that ran (natural). break/continue
+			-- inside an operand compile to native jumps via flatten_stmt (that's why this
+			-- must be real codegen, not delegation). `!`-negation lives on each pipeline.
+			if st.redirs then
+				return delegate(st, after)
+			end
+			local items = st.items
+			local nI = #items
+			local runafter = {} -- where item i flows after running
+			for i = 1, nI - 1 do
+				runafter[i] = 0
+			end -- filled with checkp[i+1] below
+			runafter[nI] = after
+			local checkp = {}
+			for i = 2, nI do
+				checkp[i] = newpc()
+			end
+			for i = 1, nI - 1 do
+				runafter[i] = checkp[i + 1]
+			end
+			local runentry = {}
+			for i = 1, nI do
+				runentry[i] = flatten_stmt(items[i].cmd, runafter[i])
+			end
+			for i = 2, nI do
+				local cmp = (items[i].op == "&&") and "==" or "~=" -- && runs on success, || on failure
+				if i == nI then -- last operand: restore noerr so its OWN errchk applies
+					blocks[checkp[i]] = ("sh.noerr = sh.noerr - 1; if sh.status %s 0 then pc = %d else pc = %d end"):format(
+						cmp,
+						runentry[i],
+						after
+					)
+				else
+					blocks[checkp[i]] = ("if sh.status %s 0 then pc = %d else pc = %d end"):format(
+						cmp,
+						runentry[i],
+						checkp[i + 1]
+					)
+				end
+			end
+			local entry = newpc()
+			-- raise noerr for the non-final operands; a lone-item andor never occurs (>=2).
+			blocks[entry] = ("sh.noerr = sh.noerr + 1; pc = %d"):format(runentry[1])
+			return entry
+		elseif t == "subshell" then
+			-- ( body ): a subshell is not special, just SEPARATED — fork, and the child
+			-- runs the body as a BOUNDED sub-CFG that _exits at its end (so it never runs
+			-- the top-level continuation); the parent waits. The body's loops get their
+			-- own loopPc entries, so a forked child that started in interp can OSR into
+			-- the RIGHT place (its own fragment), honoring interp/bg-compile/OSR.
+			-- Redirs on the subshell apply in the CHILD (they belong to the fork and die with
+			-- it — no restore), so compile them when the shapes are compilable; else delegate.
+			local sub_redir = nil
+			if st.redirs then
+				sub_redir = redir_conds(st, nil)
+				if not sub_redir then
+					return delegate(st, after)
+				end
+			end
+			-- A body that toggles options with `set` (e.g. `set -e` mid-body) needs the
+			-- interpreter's per-command semantics, which the straight-line sub-CFG can't
+			-- reproduce — delegate the whole subshell (interp forks + enforces it).
+			if body_runs_set(st.body) then
+				return delegate(st, after)
+			end
+			-- Under errexit INHERITED at entry, likewise delegate at runtime (the fork +
+			-- errexit enforcement happen in the interpreter). errexit is off in the
+			-- hot-loop case, so the compiled fork+body path still applies for speed.
+			local delpc = delegate(st, after)
+			local exitpc = newpc()
+			blocks[exitpc] = "rt.subshell_exit(sh.status or 0)"
+			-- A subshell is a fork: break/continue inside it target only loops WITHIN the
+			-- subshell, never the parent's. Hide the enclosing loopstack while flattening
+			-- the body (a break/continue with no in-subshell loop becomes a no-op, like
+			-- bash), then restore it for the parent's control flow.
+			local saved_loops = loopstack
+			loopstack = {}
+			subexit[#subexit + 1] = exitpc -- `return` in the body exits THIS subshell
+			local bodyentry = flatten_list(st.body, exitpc)
+			subexit[#subexit] = nil
+			loopstack = saved_loops
+			local p = newpc()
+			-- ERR trap after a failing subshell (`( exit 42 )`) fires in the PARENT; the
+			-- errexit path already delegated above, so this errchk only fires ERR (opt_e false).
+			local ec = errchk(st)
+			local ecs = ec ~= "" and ("; " .. ec) or ""
+			-- The forked child sets sh._ff = the subshell's exit pc, so a lineabort raised in the
+			-- body (div0, failglob, an invalid-indirect, …) exits the SUBSHELL (subshell_exit ->
+			-- _exit) instead of fast-forwarding into the PARENT's continuation and re-running it.
+			-- With redirs, the child installs them first (no restore — it _exits), then runs the
+			-- body REGARDLESS of the result: interp's subshell child applies the redirs and ignores
+			-- whether they succeeded (a failed subshell redirect does not abort the body there), so
+			-- match that — the redir expression runs for its side effect, its boolean discarded.
+			local child = sub_redir
+					and ("sh._ff = %d; local __rs = {}; local _ = %s; pc = %d"):format(exitpc, sub_redir, bodyentry)
+				or ("sh._ff = %d; pc = %d"):format(exitpc, bodyentry)
+			blocks[p] = ("if sh.opt_e then pc = %d else local __pid = rt.subshell_fork(sh); if __pid == 0 then %s else sh.status = rt.subshell_wait(__pid)%s; pc = %d end end"):format(
+				delpc,
+				child,
+				ecs,
+				after
+			)
+			return p
+		elseif t == "group" then
+			-- { list; }: not a subshell — just a sequence in the current shell. Flatten the
+			-- body inline (redirs on the group still delegate; break/continue flow natively).
+			if st.redirs then
+				return delegate(st, after)
+			end
+			return flatten_list(st.body, after)
+		elseif t == "pipeline" then
+			-- a | b | c: compile each stage to a fragment and let the runtime orchestrate the
+			-- fork/pipe/wait/PIPESTATUS, running the COMPILED stages — not exec_stmt. Gated to
+			-- no trap/DEBUG/ERR (a forked stage otherwise resets signal traps / re-fires
+			-- per-stage traps — interp-side). Flush lifted before (stages read sh) and reload
+			-- after (a lastpipe last stage runs in-process and may write).
+			if EF.has_trap or EF.has_debug or EF.has_err then
+				return delegate(st, after)
+			end
+			local n = #st.cmds
+			local frags = {}
+			for i = 1, n do
+				-- nst==1 is `! cmd` (a single negated command run in the current shell): compile
+				-- it as a negated fragment so its OWN errexit is exempt (bash), while a called
+				-- function's internal errexit still fires (fn_x). Real pipe stages (n>=2) fork,
+				-- so they compile normally (a stage's errexit just exits its own child).
+				local id = emit_fragment({ st.cmds[i] }, n == 1 and st.negate)
+				if not id then
+					return delegate(st, after)
+				end
+				frags[i] = "cs_" .. id
+			end
+			local reload = {}
+			for nm in pairs(lifted) do
+				reload[#reload + 1] = ("%s = sh:aget(%q)"):format(lname(nm), nm)
+			end
+			local post = #reload > 0 and ("; " .. table.concat(reload, "; ")) or ""
+			local p = newpc()
+			-- errexit/ERR are exempt for a `!`-inverted pipeline (bash: the -e setting is
+			-- ignored when the return value is inverted with !), regardless of the negated status.
+			local ec = st.negate and "" or errchk(st)
+			local ecs = ec ~= "" and ("; " .. ec) or ""
+			blocks[p] = dbg(st)
+				.. lifted_flush(lifted)
+				.. ("sh:run_pipeline({%s}, %s)"):format(table.concat(frags, ", "), st.negate and "true" or "false")
+				.. post
+				.. ecs
+				.. ("; pc = %d"):format(after)
+			return p
+		elseif t == "background" then
+			-- cmd & : fork, run the COMPILED command in the child; the parent records $! + the
+			-- job and continues with status 0. Reuses the fragment mechanism (the child is a
+			-- subprogram). Gated to trap-free programs — a forked child otherwise resets caught
+			-- signal traps (interp-side signal machinery). Flush lifted operands so the child
+			-- (which reads sh) sees current values; no reload (the parent's copy is unaffected).
+			if EF.has_trap then
+				return delegate(st, after)
+			end
+			local id = emit_fragment({ st.cmd })
+			if not id then
+				return delegate(st, after)
+			end
+			local c1 = st.cmd -- best-effort command text for the job table
+			while c1 and c1.t == "pipeline" and c1.cmds do
+				c1 = c1.cmds[1]
+			end
+			local cmdstr = (c1 and c1.words and c1.words[1] and c1.words[1].parts[1] and c1.words[1].parts[1].lit)
+				or "job"
+			local p = newpc()
+			blocks[p] = dbg(st)
+				.. lifted_flush(lifted)
+				.. ("sh:run_background(cs_%d, %q); pc = %d"):format(id, cmdstr, after)
+			return p
+		elseif t == "arrayassign" then
+			-- `a=(1 2 3)` / `a=($x)` / `a=([0]=x [k]=v)` / `a+=(…)` / `a=()`: build the element
+			-- items natively — a bare word field-splits via the field engine into {val=field}
+			-- entries, a keyed element renders {key,op,val} — then store via rt.arrayassign. No
+			-- interp: keyed subscripts are gated to literals (resolved by arith_str/verbatim).
+			if arrayassign_ok(st, lifted) then
+				local p = newpc()
+				local parts = { "local __it = {}" }
+				for _, e in ipairs(st.elems) do
+					if e.key ~= nil then
+						-- keyed value: assign-context RHS (an all-literal ~ colon-expands via
+						-- rt.tilde_assign, like scalar `x=~:~`), else the ordinary word value.
+						local fl = unq_full_lit(e.word)
+						local valx = (fl and fl:find("~", 1, true)) and ("rt.tilde_assign(sh, %q)"):format(fl)
+							or emit_word(e.word, lifted)
+						parts[#parts + 1] = ("__it[#__it+1] = {key=%q, op=%q, val=%s}"):format(e.key, e.op, valx)
+					elseif not empty_word(e.word) then
+						parts[#parts + 1] = emit_fields_into("__it", e.word, lifted, "{val=%s}")
+					end
+				end
+				local ec = errchk(st)
+				local ecs = ec ~= "" and ("; " .. ec) or ""
+				blocks[p] = dbg(st)
+					.. "do "
+					.. table.concat(parts, "; ")
+					.. ("; rt.arrayassign(sh, %q, __it, %s) end"):format(st.name, tostring(st.append and true or false))
+					.. ecs
+					.. ("; pc = %d"):format(after)
+				return p
+			end
+			-- a=(…): dispatch to the array-assign runtime primitive (readonly/index checks +
+			-- error-contained do_arrayassign + status/$_), NOT the exec_stmt tree-walker. Flush
+			-- lifted operands to sh first (an elem may read one) and reload after (a `$((b=…))`
+			-- elem may write one).
+			local sync, reload = {}, {}
+			for n in pairs(lifted) do
+				sync[#sync + 1] = ("sh:aset(%q, %s)"):format(n, lname(n))
+			end
+			for n in pairs(lifted) do
+				reload[#reload + 1] = ("%s = sh:aget(%q)"):format(lname(n), n)
+			end
+			local p = newpc()
+			local ec = errchk(st)
+			local ecs = ec ~= "" and ("; " .. ec) or ""
+			local pre = #sync > 0 and (table.concat(sync, "; ") .. "; ") or ""
+			local post = #reload > 0 and ("; " .. table.concat(reload, "; ")) or ""
+			blocks[p] = dbg(st)
+				.. pre
+				.. ("I.run_arrayassign(sh, %s)"):format(ser(st))
+				.. post
+				.. ecs
+				.. ("; pc = %d"):format(after)
+			return p
+		elseif t == "case" then
+			-- case SUBJ in pat) body ;; … esac. Evaluate the subject once (native single string),
+			-- then a chain of match blocks: each tests the subject against its clause's patterns
+			-- via the shared matcher (I.case_match — vars expand, quoted metachars literal,
+			-- nocasematch honored) and branches to the clause body or the next match. A body
+			-- flows to `after` (;;), the next body (;& = "fall"), or the next match (;;& = "test").
+			if st.redirs then
+				return delegate(st, after)
+			end -- redirs on the case: interp applies them
+			-- Subject must be emittable AND free of a dynamic special var ($LINENO/$_/…) whose value
+			-- the CFG can't reproduce — those run on the interp tier (compile-eventually), else the
+			-- native subject would read a wrong LINENO/etc.
+			if not db_word_ok(st.subject) then
+				return delegate(st, after)
+			end
+			local sv = newloopvar()
+			local n = #st.clauses
+			local matchentry, bodyentry = {}, {}
+			for i = n, 1, -1 do -- back-to-front so forward targets (next body/match) already exist
+				local cl = st.clauses[i]
+				local btarget = (cl.term == "fall" and (i < n and bodyentry[i + 1] or after))
+					or (cl.term == "test" and (i < n and matchentry[i + 1] or after))
+					or after
+				bodyentry[i] = flatten_list(cl.body, btarget)
+				local nextmatch = (i < n) and matchentry[i + 1] or after
+				-- Compile each pattern's glob-form and match natively (rt.glob_match); a clause
+				-- with a pattern emit can't render (cmdsub/arith/${…}-op/$@/$*) keeps I.case_match.
+				local globs, allok = {}, true
+				for _, pat in ipairs(cl.pats) do
+					local g = emit_pattern_glob(pat, lifted)
+					if g == nil then
+						allok = false
+						break
+					end
+					globs[#globs + 1] = g
+				end
+				local mp = newpc()
+				if allok and #globs > 0 then
+					local disj = {}
+					for _, g in ipairs(globs) do
+						disj[#disj + 1] = ("rt.glob_match(%s, %s, __ic)"):format(sv, g)
+					end
+					blocks[mp] = ("local __ic = sh.shopt.nocasematch and true or nil; if %s then pc = %d else pc = %d end"):format(
+						table.concat(disj, " or "),
+						bodyentry[i],
+						nextmatch
+					)
+				else
+					local pq = {}
+					for _, pat in ipairs(cl.pats) do
+						pq[#pq + 1] = ("%q"):format(pat)
+					end
+					blocks[mp] = ("if I.case_match(sh, %s, {%s}) then pc = %d else pc = %d end"):format(
+						sv,
+						table.concat(pq, ", "),
+						bodyentry[i],
+						nextmatch
+					)
+				end
+				matchentry[i] = mp
+			end
+			if st.line then
+				EF.cur_line = st.line
+			end -- clause flattening moved it; restore for $LINENO in the subject
+			local subjp = newpc()
+			blocks[subjp] = dbg(st)
+				.. ("%s = %s; sh.status = 0; pc = %d"):format(
+					sv,
+					emit_word(st.subject, lifted),
+					n > 0 and matchentry[1] or after
+				)
+			return subjp
+		else
+			return delegate(st, after) -- unknown/cold statement: run it via the interpreter
+		end
+	end
 
-  flatten_list = function(list, after)
-    local nextpc = after
-    for k = #list, 1, -1 do nextpc = flatten_stmt(list[k], nextpc) end
-    return nextpc
-  end
+	flatten_list = function(list, after)
+		local nextpc = after
+		for k = #list, 1, -1 do
+			nextpc = flatten_stmt(list[k], nextpc)
+		end
+		return nextpc
+	end
 
-  -- Top-level line-abort markers (parity with the interp's line model): each
-  -- top-level statement is entered through a tiny marker that records `_ff`, the
-  -- pc to fast-forward to if a div0/failglob lineabort fires — the marker of the
-  -- first LATER statement on a NEW line (or DONE). run's retry loop jumps there and
-  -- sets $?=1 (a "fancy goto"), so `;` is not a newline and a fatal expansion aborts
-  -- only the rest of the current line, matching the interpreter. CRITICAL: each
-  -- statement must FLOW INTO the next statement's marker (not its real entry), so
-  -- `sh._ff` is refreshed before every statement — else a lineabort fast-forwards to a
-  -- stale target and re-runs the current statement (e.g. failglob in a for-in list).
-  local mark = {}
-  if toplevel then for k = 1, #stmts do mark[k] = newpc() end end
-  local nextpc = DONE
-  for k = #stmts, 1, -1 do
-    nextpc = flatten_stmt(stmts[k], toplevel and (mark[k + 1] or DONE) or nextpc)
-    stmtPc[k] = nextpc -- the statement's REAL entry
-  end
-  if toplevel then
-    -- Sync lifted vars to sh at each marker so, on a lineabort, the tier's retry
-    -- wrapper can re-enter run at sh._ff with the pre-statement state intact (run
-    -- re-seeds lifted from sh). Once per TOP-LEVEL statement (never in a hot loop body).
-    -- Signal traps are delivered by the async VM hook (lib_cursesig.c), not polled here.
-    local wb = {}
-    for n in pairs(lifted) do wb[#wb + 1] = ("sh:aset(%q, %s)"):format(n, lname(n)) end
-    local wbs = #wb > 0 and (table.concat(wb, "; ") .. "; ") or ""
-    for k = 1, #stmts do
-      local ff = DONE
-      for j = k + 1, #stmts do if (stmts[j].line or 0) > (stmts[k].line or 0) then ff = mark[j]; break end end
-      -- `set -n` (noexec): once set, the shell READS but does not execute the rest of
-      -- a non-interactive script — so every later top-level statement is skipped (which
-      -- also means a later `set +n` never runs). Checked here at the top-level boundary
-      -- only (never in a hot loop body). opt_n is off until `set -n` actually runs.
-      blocks[mark[k]] = ("if sh.opt_n then pc = %d else sh._ff = %d; %spc = %d end")
-        :format(DONE, ff, wbs, stmtPc[k])
-      stmtPc[k] = mark[k] -- entry/OSR resume enters at the marker so sh._ff + state are set
-    end
-    return { blocks = blocks, npc = npc, entry = mark[1] or DONE, loopPc = loopPc, stmtPc = stmtPc, loopvars = loopvars }
-  end
-  return { blocks = blocks, npc = npc, entry = stmtPc[1] or DONE, loopPc = loopPc, stmtPc = stmtPc, loopvars = loopvars }
+	-- Top-level line-abort markers (parity with the interp's line model): each
+	-- top-level statement is entered through a tiny marker that records `_ff`, the
+	-- pc to fast-forward to if a div0/failglob lineabort fires — the marker of the
+	-- first LATER statement on a NEW line (or DONE). run's retry loop jumps there and
+	-- sets $?=1 (a "fancy goto"), so `;` is not a newline and a fatal expansion aborts
+	-- only the rest of the current line, matching the interpreter. CRITICAL: each
+	-- statement must FLOW INTO the next statement's marker (not its real entry), so
+	-- `sh._ff` is refreshed before every statement — else a lineabort fast-forwards to a
+	-- stale target and re-runs the current statement (e.g. failglob in a for-in list).
+	local mark = {}
+	if toplevel then
+		for k = 1, #stmts do
+			mark[k] = newpc()
+		end
+	end
+	local nextpc = DONE
+	for k = #stmts, 1, -1 do
+		nextpc = flatten_stmt(stmts[k], toplevel and (mark[k + 1] or DONE) or nextpc)
+		stmtPc[k] = nextpc -- the statement's REAL entry
+	end
+	if toplevel then
+		-- Sync lifted vars to sh at each marker so, on a lineabort, the tier's retry
+		-- wrapper can re-enter run at sh._ff with the pre-statement state intact (run
+		-- re-seeds lifted from sh). Once per TOP-LEVEL statement (never in a hot loop body).
+		-- Signal traps are delivered by the async VM hook (lib_cursesig.c), not polled here.
+		local wb = {}
+		for n in pairs(lifted) do
+			wb[#wb + 1] = ("sh:aset(%q, %s)"):format(n, lname(n))
+		end
+		local wbs = #wb > 0 and (table.concat(wb, "; ") .. "; ") or ""
+		for k = 1, #stmts do
+			local ff = DONE
+			for j = k + 1, #stmts do
+				if (stmts[j].line or 0) > (stmts[k].line or 0) then
+					ff = mark[j]
+					break
+				end
+			end
+			-- `set -n` (noexec): once set, the shell READS but does not execute the rest of
+			-- a non-interactive script — so every later top-level statement is skipped (which
+			-- also means a later `set +n` never runs). Checked here at the top-level boundary
+			-- only (never in a hot loop body). opt_n is off until `set -n` actually runs.
+			blocks[mark[k]] = ("if sh.opt_n then pc = %d else sh._ff = %d; %spc = %d end"):format(
+				DONE,
+				ff,
+				wbs,
+				stmtPc[k]
+			)
+			stmtPc[k] = mark[k] -- entry/OSR resume enters at the marker so sh._ff + state are set
+		end
+		return {
+			blocks = blocks,
+			npc = npc,
+			entry = mark[1] or DONE,
+			loopPc = loopPc,
+			stmtPc = stmtPc,
+			loopvars = loopvars,
+		}
+	end
+	return {
+		blocks = blocks,
+		npc = npc,
+		entry = stmtPc[1] or DONE,
+		loopPc = loopPc,
+		stmtPc = stmtPc,
+		loopvars = loopvars,
+	}
 end
 
 -- Assemble a CFG into a Lua function string. `liftvars` (top-level only) are
@@ -3247,82 +4929,126 @@ end
 -- as upvalues with functions) — seeded/written-back but not re-declared. Both are
 -- seeded from `sh` on entry and written back on exit (run() only).
 assemble = function(cfg, sig, opts)
-  opts = opts or {}
-  local o = { sig }
-  -- register compiled function closures into sh.functions so the interpreter
-  -- (reached via delegation) can call them too — full interp/compiled interop.
-  for _, n in ipairs(opts.register or {}) do o[#o + 1] = ("  sh.functions[%q] = %s"):format(n, fnlname(n)) end
-  -- verbatim definition source for `declare -f`/`type` (parity with the interpreter)
-  if opts.funcsrc and next(opts.funcsrc) then
-    o[#o + 1] = "  sh.func_src = sh.func_src or {}"
-    for n, txt in pairs(opts.funcsrc) do o[#o + 1] = ("  sh.func_src[%q] = %q"):format(n, txt) end
-  end
-  -- definition line/file for `declare -F` under extdebug (name line file). The file is
-  -- the runtime source (a compiled top level is the main script or a sourced file).
-  if opts.funcline and next(opts.funcline) then
-    o[#o + 1] = "  sh.func_line = sh.func_line or {}; sh.func_file = sh.func_file or {}"
-    for n, ln in pairs(opts.funcline) do
-      o[#o + 1] = ("  sh.func_line[%q] = %d; sh.func_file[%q] = sh.cur_source or sh.argv0 or \"\""):format(n, ln, n)
-    end
-  end
-  for _, n in ipairs(opts.runlocals or {}) do o[#o + 1] = ("  local %s = sh:aget(%q)"):format(lname(n), n) end
-  for _, n in ipairs(opts.upvals or {}) do o[#o + 1] = ("  %s = sh:aget(%q)"):format(lname(n), n) end
-  -- per-loop status holders (while-command loops): plain native locals, init 0.
-  for _, v in ipairs(cfg.loopvars or {}) do o[#o + 1] = ("  local %s = 0"):format(v) end
-  -- pc stays a plain LOCAL (register-allocated, fast in hot loops). A div0/failglob
-  -- lineabort thrown from compiled code is caught by the tier's retry wrapper, which
-  -- re-enters run at sh._ff — the markers wrote lifted state + sh._ff back per
-  -- top-level statement, so no closure/upvalue boxing (which would slow hot loops).
-  o[#o + 1] = opts.toplevel and ("  pc = pc or %d"):format(cfg.entry) or ("  local pc = %d"):format(cfg.entry)
-  o[#o + 1] = "  while true do"
-  for p = 0, cfg.npc - 1 do
-    o[#o + 1] = ("    %s pc == %d then %s"):format(p == 0 and "if" or "elseif", p, cfg.blocks[p])
-  end
-  o[#o + 1] = "    end"
-  o[#o + 1] = "  end"
-  for _, n in ipairs(opts.runlocals or {}) do o[#o + 1] = ("  sh:aset(%q, %s)"):format(n, lname(n)) end
-  for _, n in ipairs(opts.upvals or {}) do o[#o + 1] = ("  sh:aset(%q, %s)"):format(n, lname(n)) end
-  o[#o + 1] = "end"
-  return table.concat(o, "\n")
+	opts = opts or {}
+	local o = { sig }
+	-- register compiled function closures into sh.functions so the interpreter
+	-- (reached via delegation) can call them too — full interp/compiled interop.
+	for _, n in ipairs(opts.register or {}) do
+		o[#o + 1] = ("  sh.functions[%q] = %s"):format(n, fnlname(n))
+	end
+	-- verbatim definition source for `declare -f`/`type` (parity with the interpreter)
+	if opts.funcsrc and next(opts.funcsrc) then
+		o[#o + 1] = "  sh.func_src = sh.func_src or {}"
+		for n, txt in pairs(opts.funcsrc) do
+			o[#o + 1] = ("  sh.func_src[%q] = %q"):format(n, txt)
+		end
+	end
+	-- definition line/file for `declare -F` under extdebug (name line file). The file is
+	-- the runtime source (a compiled top level is the main script or a sourced file).
+	if opts.funcline and next(opts.funcline) then
+		o[#o + 1] = "  sh.func_line = sh.func_line or {}; sh.func_file = sh.func_file or {}"
+		for n, ln in pairs(opts.funcline) do
+			o[#o + 1] = ('  sh.func_line[%q] = %d; sh.func_file[%q] = sh.cur_source or sh.argv0 or ""'):format(n, ln, n)
+		end
+	end
+	for _, n in ipairs(opts.runlocals or {}) do
+		o[#o + 1] = ("  local %s = sh:aget(%q)"):format(lname(n), n)
+	end
+	for _, n in ipairs(opts.upvals or {}) do
+		o[#o + 1] = ("  %s = sh:aget(%q)"):format(lname(n), n)
+	end
+	-- per-loop status holders (while-command loops): plain native locals, init 0.
+	for _, v in ipairs(cfg.loopvars or {}) do
+		o[#o + 1] = ("  local %s = 0"):format(v)
+	end
+	-- pc stays a plain LOCAL (register-allocated, fast in hot loops). A div0/failglob
+	-- lineabort thrown from compiled code is caught by the tier's retry wrapper, which
+	-- re-enters run at sh._ff — the markers wrote lifted state + sh._ff back per
+	-- top-level statement, so no closure/upvalue boxing (which would slow hot loops).
+	o[#o + 1] = opts.toplevel and ("  pc = pc or %d"):format(cfg.entry) or ("  local pc = %d"):format(cfg.entry)
+	o[#o + 1] = "  while true do"
+	for p = 0, cfg.npc - 1 do
+		o[#o + 1] = ("    %s pc == %d then %s"):format(p == 0 and "if" or "elseif", p, cfg.blocks[p])
+	end
+	o[#o + 1] = "    end"
+	o[#o + 1] = "  end"
+	for _, n in ipairs(opts.runlocals or {}) do
+		o[#o + 1] = ("  sh:aset(%q, %s)"):format(n, lname(n))
+	end
+	for _, n in ipairs(opts.upvals or {}) do
+		o[#o + 1] = ("  sh:aset(%q, %s)"):format(n, lname(n))
+	end
+	o[#o + 1] = "end"
+	return table.concat(o, "\n")
 end
 
 -- The CFG compiler is a subset. Throw for anything it can't faithfully compile,
 -- so cache.lua/tier fall back to the interpreter (the semantic oracle) rather
 -- than miscompiling. As coverage grows these gates are removed one by one.
 local function assert_compilable(stmts)
-  for _, st in ipairs(stmts) do
-    local t = st.t
-    if t == "parse_error" then error("curse-nocompile: parse_error (deferred)")
-    elseif t == "arithcmd" then error("curse-nocompile: (( )) command")
-    elseif t == "andor" then error("curse-nocompile: && / || list")
-    elseif t == "pipeline" then error("curse-nocompile: pipeline")
-    elseif t == "case" then error("curse-nocompile: case")
-    elseif t == "group" then error("curse-nocompile: group")
-    elseif t == "subshell" then
-      if st.redirs then error("curse-nocompile: subshell with redirs") end
-      assert_compilable(st.body) -- bare ( body ) compiles: fork + bounded sub-CFG
-    elseif t == "dbracket" then error("curse-nocompile: [[ ]]")
-    elseif t == "arrayassign" then error("curse-nocompile: array assign")
-    elseif t == "assign" and (st.index or st.append) then error("curse-nocompile: array/append assign")
-    elseif t == "whilec" then
-      if st.negate or cond_arith(st.cond) == nil then error("curse-nocompile: while/until cond") end
-      assert_compilable(st.body)
-    elseif t == "if" then
-      for _, cl in ipairs(st.clauses) do
-        if cl.cond ~= nil and cond_arith(cl.cond) == nil then error("curse-nocompile: if cond") end
-        assert_compilable(cl.body)
-      end
-    elseif t == "forc" or t == "forin" or t == "funcdef" then
-      assert_compilable(st.body)
-    elseif t == "simple" then
-      if st.redirs then error("curse-nocompile: redirection") end
-      local w1 = st.words[1]
-      local cmd = w1 and w1.parts[1] and w1.parts[1].lit
-      local BUILTIN = { test = 1, ["["] = 1, exit = 1, cd = 1, unset = 1,
-        set = 1, shift = 1, read = 1, export = 1, declare = 1, typeset = 1 }
-      if BUILTIN[cmd] then error("curse-nocompile: builtin " .. cmd) end
-    end
-  end
+	for _, st in ipairs(stmts) do
+		local t = st.t
+		if t == "parse_error" then
+			error("curse-nocompile: parse_error (deferred)")
+		elseif t == "arithcmd" then
+			error("curse-nocompile: (( )) command")
+		elseif t == "andor" then
+			error("curse-nocompile: && / || list")
+		elseif t == "pipeline" then
+			error("curse-nocompile: pipeline")
+		elseif t == "case" then
+			error("curse-nocompile: case")
+		elseif t == "group" then
+			error("curse-nocompile: group")
+		elseif t == "subshell" then
+			if st.redirs then
+				error("curse-nocompile: subshell with redirs")
+			end
+			assert_compilable(st.body) -- bare ( body ) compiles: fork + bounded sub-CFG
+		elseif t == "dbracket" then
+			error("curse-nocompile: [[ ]]")
+		elseif t == "arrayassign" then
+			error("curse-nocompile: array assign")
+		elseif t == "assign" and (st.index or st.append) then
+			error("curse-nocompile: array/append assign")
+		elseif t == "whilec" then
+			if st.negate or cond_arith(st.cond) == nil then
+				error("curse-nocompile: while/until cond")
+			end
+			assert_compilable(st.body)
+		elseif t == "if" then
+			for _, cl in ipairs(st.clauses) do
+				if cl.cond ~= nil and cond_arith(cl.cond) == nil then
+					error("curse-nocompile: if cond")
+				end
+				assert_compilable(cl.body)
+			end
+		elseif t == "forc" or t == "forin" or t == "funcdef" then
+			assert_compilable(st.body)
+		elseif t == "simple" then
+			if st.redirs then
+				error("curse-nocompile: redirection")
+			end
+			local w1 = st.words[1]
+			local cmd = w1 and w1.parts[1] and w1.parts[1].lit
+			local BUILTIN = {
+				test = 1,
+				["["] = 1,
+				exit = 1,
+				cd = 1,
+				unset = 1,
+				set = 1,
+				shift = 1,
+				read = 1,
+				export = 1,
+				declare = 1,
+				typeset = 1,
+			}
+			if BUILTIN[cmd] then
+				error("curse-nocompile: builtin " .. cmd)
+			end
+		end
+	end
 end
 
 -- Does the program define/use aliases? Alias expansion is a PARSE-time in-context
@@ -3332,134 +5058,205 @@ end
 -- so it would mis-expand — refuse to compile (the interpreter's lazy per-line parse
 -- gets it right), matching the tiered deploy which stays in interp for such scripts.
 local function scan_alias(stmts)
-  for _, st in ipairs(stmts or {}) do
-    if st.t == "simple" and st.words[1] then
-      local c = st.words[1].parts[1] and #st.words[1].parts == 1 and st.words[1].parts[1].lit
-      if c == "alias" or c == "unalias" then return true end
-      if c == "shopt" then
-        for j = 2, #st.words do local l = st.words[j].parts[1] and st.words[j].parts[1].lit
-          if l == "expand_aliases" then return true end end
-      end
-    end
-    if st.body and scan_alias(st.body) then return true end
-    if st.clauses then for _, cl in ipairs(st.clauses) do if scan_alias(cl.body) then return true end end end
-    if st.cmds and scan_alias(st.cmds) then return true end
-    if st.items then for _, it in ipairs(st.items) do if it.cmd and scan_alias({ it.cmd }) then return true end end end
-  end
-  return false
+	for _, st in ipairs(stmts or {}) do
+		if st.t == "simple" and st.words[1] then
+			local c = st.words[1].parts[1] and #st.words[1].parts == 1 and st.words[1].parts[1].lit
+			if c == "alias" or c == "unalias" then
+				return true
+			end
+			if c == "shopt" then
+				for j = 2, #st.words do
+					local l = st.words[j].parts[1] and st.words[j].parts[1].lit
+					if l == "expand_aliases" then
+						return true
+					end
+				end
+			end
+		end
+		if st.body and scan_alias(st.body) then
+			return true
+		end
+		if st.clauses then
+			for _, cl in ipairs(st.clauses) do
+				if scan_alias(cl.body) then
+					return true
+				end
+			end
+		end
+		if st.cmds and scan_alias(st.cmds) then
+			return true
+		end
+		if st.items then
+			for _, it in ipairs(st.items) do
+				if it.cmd and scan_alias({ it.cmd }) then
+					return true
+				end
+			end
+		end
+	end
+	return false
 end
 function M.emit(ast)
-  emit_frags, emit_frag_n = {}, 0 -- compiled `$(…)` fragments (cs_N closures) collected during build
-  if scan_alias(ast.stmts) then error("curse-nocompile: alias expansion needs line-at-a-time parse") end
-  EF.has_attr = scan_attr(ast.stmts) -- gate compiled attribute-aware scalar assign
-  EF.has_nameref = scan_nameref(ast.stmts) -- declare -n present → delegate scalar assigns
-  EF.has_err = scan_trap(ast.stmts, { ERR = 1 }) -- gate compiled ERR-trap firing
-  EF.has_debug = scan_trap(ast.stmts, { DEBUG = 1 }) -- gate compiled DEBUG-trap firing
-  EF.funcstack = reads_debugstack(ast.stmts) -- gate FUNCNAME/BASH_SOURCE/BASH_LINENO stacks
-  EF.pipestatus = reads_var(ast.stmts, "PIPESTATUS") -- gate $PIPESTATUS after simple cmds
-  EF.has_trap = scan_any_trap(ast.stmts) -- gate compiled `&`/pipeline (forked child resets signal traps)
-  local funcflags, inlinable, inlinefns = {}, {}, {}
-  -- With a DEBUG/ERR trap, DON'T inline: an inlined body runs at the caller's level,
-  -- where its commands would fire DEBUG/ERR that bash scopes to the (un-entered)
-  -- function. A normal call fires the trap once at the call site and keeps the body
-  -- silent (its build_cfg is non-toplevel).
-  local no_inline = EF.has_err or EF.has_debug or EF.funcstack
-  emit_redir_funcs = {}
-  emit_multidef = {}
-  do -- a name defined by more than one top-level funcdef can't be a single hoisted fn_x;
-    -- neither can a function whose name is `unset` (the call after the unset must fail).
-    local seen, unset = {}, {}
-    local BUILTINS = require("interp").BUILTINS
-    for _, st in ipairs(ast.stmts) do
-      if st.t == "funcdef" then
-        if seen[st.name] then emit_multidef[st.name] = true else seen[st.name] = true end
-        -- A function shadowing a builtin must dispatch in PROGRAM ORDER: a call to the
-        -- name BEFORE its definition runs the builtin, and `set -o posix` forbids
-        -- redefining a special builtin at all. A single hoisted fn_x (defined at load,
-        -- before any statement) can't model either — so delegate the def AND its calls
-        -- to the interpreter, the oracle for builtin-vs-function resolution.
-        if BUILTINS[st.name] then emit_multidef[st.name] = true end
-      end
-    end
-    collect_unset(ast.stmts, unset)
-    for name in pairs(seen) do if unset[name] then emit_multidef[name] = true end end
-    collect_nested_funcdefs(ast.stmts, emit_multidef, true) -- nested defs + their calls delegate
-    -- route every delegated-function name (redef/unset/nested) through the same
-    -- def-and-call delegation the def-redirect path uses.
-    for name in pairs(emit_multidef) do emit_redir_funcs[name] = true end
-  end
-  for _, st in ipairs(ast.stmts) do
-    if st.t == "funcdef" then
-      -- A function with a DEFINITION redirect (`f(){…} >&2`) applies that redirect per
-      -- call (target re-evaluated each time) — interp's run_function does this; a compiled
-      -- fn_x can't. Delegate the funcdef AND its calls to the interpreter. Same for a
-      -- redefined name: interp registers each body in sh.functions in program order.
-      if st.redirs or emit_multidef[st.name] then emit_redir_funcs[st.name] = true
-      else
-        funcflags[st.name] = func_flags(st.body)
-        if not no_inline and inlinable_body(st.body) then inlinable[st.name] = true; inlinefns[st.name] = st.body end
-      end
-    end
-  end
-  -- Lift purely-arith vars to native int64. A var touched by no OUT-OF-LINE
-  -- function becomes a run()-LOCAL (register-allocated — fast in hot loops); a
-  -- direct call to an inlinable function is spliced in, so its var access counts
-  -- as run() access. A var reached through a non-inlined function becomes a
-  -- module-level UPVALUE both run() and that function's closure see (no hash
-  -- lookup, no desync) — it can't be register-held across a loop, but such vars
-  -- are updated per-call, not per-hot-iteration. Every fn_x is still emitted (for
-  -- indirect/dynamic dispatch).
-  local lifted = analyze_lift(ast)
-  local funcTouched = {}
-  collect_funcvars(ast.stmts, funcTouched, inlinable)
-  local upvals, runlocals = {}, {}
-  for n in pairs(lifted) do
-    if funcTouched[n] then upvals[#upvals + 1] = n else runlocals[#runlocals + 1] = n end
-  end
-  table.sort(upvals); table.sort(runlocals)
-  local upset = {}; for _, n in ipairs(upvals) do upset[n] = true end
+	emit_frags, emit_frag_n = {}, 0 -- compiled `$(…)` fragments (cs_N closures) collected during build
+	if scan_alias(ast.stmts) then
+		error("curse-nocompile: alias expansion needs line-at-a-time parse")
+	end
+	EF.has_attr = scan_attr(ast.stmts) -- gate compiled attribute-aware scalar assign
+	EF.has_nameref = scan_nameref(ast.stmts) -- declare -n present → delegate scalar assigns
+	EF.has_err = scan_trap(ast.stmts, { ERR = 1 }) -- gate compiled ERR-trap firing
+	EF.has_debug = scan_trap(ast.stmts, { DEBUG = 1 }) -- gate compiled DEBUG-trap firing
+	EF.funcstack = reads_debugstack(ast.stmts) -- gate FUNCNAME/BASH_SOURCE/BASH_LINENO stacks
+	EF.pipestatus = reads_var(ast.stmts, "PIPESTATUS") -- gate $PIPESTATUS after simple cmds
+	EF.has_trap = scan_any_trap(ast.stmts) -- gate compiled `&`/pipeline (forked child resets signal traps)
+	local funcflags, inlinable, inlinefns = {}, {}, {}
+	-- With a DEBUG/ERR trap, DON'T inline: an inlined body runs at the caller's level,
+	-- where its commands would fire DEBUG/ERR that bash scopes to the (un-entered)
+	-- function. A normal call fires the trap once at the call site and keeps the body
+	-- silent (its build_cfg is non-toplevel).
+	local no_inline = EF.has_err or EF.has_debug or EF.funcstack
+	emit_redir_funcs = {}
+	emit_multidef = {}
+	do -- a name defined by more than one top-level funcdef can't be a single hoisted fn_x;
+		-- neither can a function whose name is `unset` (the call after the unset must fail).
+		local seen, unset = {}, {}
+		local BUILTINS = require("interp").BUILTINS
+		for _, st in ipairs(ast.stmts) do
+			if st.t == "funcdef" then
+				if seen[st.name] then
+					emit_multidef[st.name] = true
+				else
+					seen[st.name] = true
+				end
+				-- A function shadowing a builtin must dispatch in PROGRAM ORDER: a call to the
+				-- name BEFORE its definition runs the builtin, and `set -o posix` forbids
+				-- redefining a special builtin at all. A single hoisted fn_x (defined at load,
+				-- before any statement) can't model either — so delegate the def AND its calls
+				-- to the interpreter, the oracle for builtin-vs-function resolution.
+				if BUILTINS[st.name] then
+					emit_multidef[st.name] = true
+				end
+			end
+		end
+		collect_unset(ast.stmts, unset)
+		for name in pairs(seen) do
+			if unset[name] then
+				emit_multidef[name] = true
+			end
+		end
+		collect_nested_funcdefs(ast.stmts, emit_multidef, true) -- nested defs + their calls delegate
+		-- route every delegated-function name (redef/unset/nested) through the same
+		-- def-and-call delegation the def-redirect path uses.
+		for name in pairs(emit_multidef) do
+			emit_redir_funcs[name] = true
+		end
+	end
+	for _, st in ipairs(ast.stmts) do
+		if st.t == "funcdef" then
+			-- A function with a DEFINITION redirect (`f(){…} >&2`) applies that redirect per
+			-- call (target re-evaluated each time) — interp's run_function does this; a compiled
+			-- fn_x can't. Delegate the funcdef AND its calls to the interpreter. Same for a
+			-- redefined name: interp registers each body in sh.functions in program order.
+			if st.redirs or emit_multidef[st.name] then
+				emit_redir_funcs[st.name] = true
+			else
+				funcflags[st.name] = func_flags(st.body)
+				if not no_inline and inlinable_body(st.body) then
+					inlinable[st.name] = true
+					inlinefns[st.name] = st.body
+				end
+			end
+		end
+	end
+	-- Lift purely-arith vars to native int64. A var touched by no OUT-OF-LINE
+	-- function becomes a run()-LOCAL (register-allocated — fast in hot loops); a
+	-- direct call to an inlinable function is spliced in, so its var access counts
+	-- as run() access. A var reached through a non-inlined function becomes a
+	-- module-level UPVALUE both run() and that function's closure see (no hash
+	-- lookup, no desync) — it can't be register-held across a loop, but such vars
+	-- are updated per-call, not per-hot-iteration. Every fn_x is still emitted (for
+	-- indirect/dynamic dispatch).
+	local lifted = analyze_lift(ast)
+	local funcTouched = {}
+	collect_funcvars(ast.stmts, funcTouched, inlinable)
+	local upvals, runlocals = {}, {}
+	for n in pairs(lifted) do
+		if funcTouched[n] then
+			upvals[#upvals + 1] = n
+		else
+			runlocals[#runlocals + 1] = n
+		end
+	end
+	table.sort(upvals)
+	table.sort(runlocals)
+	local upset = {}
+	for _, n in ipairs(upvals) do
+		upset[n] = true
+	end
 
-  emit_frag_ctx = { funcflags = funcflags, inlinefns = inlinefns } -- context for compile_cmdsub's build_cfg
+	emit_frag_ctx = { funcflags = funcflags, inlinefns = inlinefns } -- context for compile_cmdsub's build_cfg
 
-  local o = { 'local rt = require("runtime")', 'local I = require("interp")',
-    'local bit = require("bit")', 'local __noop = function() end' }
-  if #upvals > 0 then
-    local vs = {}
-    for _, n in ipairs(upvals) do vs[#vs + 1] = lname(n) end
-    o[#o + 1] = "local " .. table.concat(vs, ", ") -- module-level upvalues (shared with non-inlined functions)
-  end
-  local decls = {}
-  for name in pairs(funcflags) do decls[#decls + 1] = fnlname(name) end
-  -- fn_x bodies (build_cfg may register compiled `$(…)` fragments as a side effect, so
-  -- assemble them into a buffer and splice after the forward-declaration line below).
-  local fndefs = {}
-  for _, st in ipairs(ast.stmts) do
-    if st.t == "funcdef" then
-      -- keep every fn_x (indirect/dynamic dispatch); it can't see run-locals, so
-      -- it lifts only the shared upvalues and is sh-direct for the rest.
-      local cfg = build_cfg(st.body, upset, funcflags, inlinefns)
-      fndefs[#fndefs + 1] = assemble(cfg, fnlname(st.name) .. " = function(sh)", {})
-    end
-  end
-  local funcsrc, funcline = {}, {} -- name -> verbatim definition text / def line (top-level funcdefs)
-  for _, st in ipairs(ast.stmts) do
-    if st.t == "funcdef" and st.deftext then funcsrc[st.name] = require("interp").deparse_func(st.name, st.body) or st.deftext end
-    if st.t == "funcdef" and st.line then funcline[st.name] = st.line end -- declare -F under extdebug
-  end
-  local top = build_cfg(ast.stmts, lifted, funcflags, inlinefns, true)
-  -- Every compiled `$(…)` fragment is now registered (from fn_x bodies + the top level).
-  -- Forward-declare each cs_N alongside the fn_x names so run/fn_x/nested fragments can
-  -- close over them, then emit the fn_x and fragment definitions (order-independent).
-  for i = 1, emit_frag_n do decls[#decls + 1] = "cs_" .. i end
-  if #decls > 0 then o[#o + 1] = "local " .. table.concat(decls, ", ") end
-  for _, d in ipairs(fndefs) do o[#o + 1] = d end
-  for _, d in ipairs(emit_frags) do o[#o + 1] = d end
-  o[#o + 1] = "local loopPc = " .. serialize(top.loopPc)
-  o[#o + 1] = "local stmtPc = " .. serialize(top.stmtPc)
-  o[#o + 1] = assemble(top, "local function run(sh, pc)",
-    { runlocals = runlocals, upvals = upvals, toplevel = true, funcsrc = funcsrc, funcline = funcline })
-  o[#o + 1] = "return { run = run, loopPc = loopPc, stmtPc = stmtPc }"
-  return table.concat(o, "\n") .. "\n"
+	local o = {
+		'local rt = require("runtime")',
+		'local I = require("interp")',
+		'local bit = require("bit")',
+		"local __noop = function() end",
+	}
+	if #upvals > 0 then
+		local vs = {}
+		for _, n in ipairs(upvals) do
+			vs[#vs + 1] = lname(n)
+		end
+		o[#o + 1] = "local " .. table.concat(vs, ", ") -- module-level upvalues (shared with non-inlined functions)
+	end
+	local decls = {}
+	for name in pairs(funcflags) do
+		decls[#decls + 1] = fnlname(name)
+	end
+	-- fn_x bodies (build_cfg may register compiled `$(…)` fragments as a side effect, so
+	-- assemble them into a buffer and splice after the forward-declaration line below).
+	local fndefs = {}
+	for _, st in ipairs(ast.stmts) do
+		if st.t == "funcdef" then
+			-- keep every fn_x (indirect/dynamic dispatch); it can't see run-locals, so
+			-- it lifts only the shared upvalues and is sh-direct for the rest.
+			local cfg = build_cfg(st.body, upset, funcflags, inlinefns)
+			fndefs[#fndefs + 1] = assemble(cfg, fnlname(st.name) .. " = function(sh)", {})
+		end
+	end
+	local funcsrc, funcline = {}, {} -- name -> verbatim definition text / def line (top-level funcdefs)
+	for _, st in ipairs(ast.stmts) do
+		if st.t == "funcdef" and st.deftext then
+			funcsrc[st.name] = require("interp").deparse_func(st.name, st.body) or st.deftext
+		end
+		if st.t == "funcdef" and st.line then
+			funcline[st.name] = st.line
+		end -- declare -F under extdebug
+	end
+	local top = build_cfg(ast.stmts, lifted, funcflags, inlinefns, true)
+	-- Every compiled `$(…)` fragment is now registered (from fn_x bodies + the top level).
+	-- Forward-declare each cs_N alongside the fn_x names so run/fn_x/nested fragments can
+	-- close over them, then emit the fn_x and fragment definitions (order-independent).
+	for i = 1, emit_frag_n do
+		decls[#decls + 1] = "cs_" .. i
+	end
+	if #decls > 0 then
+		o[#o + 1] = "local " .. table.concat(decls, ", ")
+	end
+	for _, d in ipairs(fndefs) do
+		o[#o + 1] = d
+	end
+	for _, d in ipairs(emit_frags) do
+		o[#o + 1] = d
+	end
+	o[#o + 1] = "local loopPc = " .. serialize(top.loopPc)
+	o[#o + 1] = "local stmtPc = " .. serialize(top.stmtPc)
+	o[#o + 1] = assemble(
+		top,
+		"local function run(sh, pc)",
+		{ runlocals = runlocals, upvals = upvals, toplevel = true, funcsrc = funcsrc, funcline = funcline }
+	)
+	o[#o + 1] = "return { run = run, loopPc = loopPc, stmtPc = stmtPc }"
+	return table.concat(o, "\n") .. "\n"
 end
 
 return M
