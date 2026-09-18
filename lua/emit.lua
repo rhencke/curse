@@ -2365,6 +2365,18 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
         end
         if not plain then return delegate(st, after) end
       end
+      -- `exec` with ONLY redirects and no command word (`exec > log`, `exec 3< f`,
+      -- `exec 2>&1`): a PERSISTENT redirect — apply the redirs to the shell's own fds and do
+      -- NOT restore (they outlive the statement), status 0 / 1 on failure, exactly interp's
+      -- exec path. `exec cmd…` (process replacement) and an uncompilable redir shape delegate.
+      if cmd == "exec" and #st.words == 1 and st.redirs and not st.assigns then
+        local re = redir_conds(st, nil) -- nil cmd bypasses the exec guard in redir_conds
+        if re then
+          local p = newpc()
+          blocks[p] = dbg(st) .. ("do local __rs = {}; sh.status = (%s) and 0 or 1 end; pc = %d"):format(re, after)
+          return p
+        end
+      end
       -- redirects compile (targets computed natively, syscalls via rt.redir_apply)
       -- when every one is compilable AND this isn't `exec` (its redirs persist);
       -- otherwise the whole command delegates.
