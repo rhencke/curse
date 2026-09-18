@@ -309,13 +309,27 @@ local function xpand_split(e, lifted, nl, lf, seen)
   xpand_split(e.r, lifted, nl, lf, seen); xpand_split(e.c, lifted, nl, lf, seen)
   xpand_split(e.a, lifted, nl, lf, seen); xpand_split(e.b, lifted, nl, lf, seen)
 end
+-- A READ of an array/assoc element in arith (`$(( a[i] ))`): a `var` node with a subscript
+-- whose base is a plain name and whose RAW subscript has no cmdsub/procsub (its arith-vs-assoc
+-- double path would run a subscript side effect twice). emit_value renders it via
+-- rt.arith_read_elem (which contains the nounset/matherr edges). A subscripted WRITE
+-- (asgn/post/pre) is NOT this — it stays delegated.
+local function arith_elem_ok(e)
+  if type(e) ~= "table" or e.k ~= "var" or not e.idx then return false end
+  if type(e.name) ~= "string" or not e.name:match("^[%a_][%w_]*$") or COMPILE_UNSAFE_VAR[e.name] then return false end
+  if type(e.idxraw) ~= "string" then return false end
+  local ok, sw = pcall(require("parser").parse_word, e.idxraw)
+  if not ok then return false end
+  for _, p in ipairs(sw.parts) do if p.cmdsub or p.procsub then return false end end
+  return true
+end
 local function arith_side_effect(e)
   if type(e) ~= "table" then return false end
   if e.k == "asgn" or e.k == "post" or e.k == "pre" then return true end
-  -- xpandleaf (${…}), comma, and array-subscripted operands aren't compiled natively —
-  -- treat like a side effect so the word/stmt delegates. A FAST xpand ($name only) IS
-  -- compiled (emit_value renders it), so it isn't a side effect.
-  if e.k == "xpandleaf" or e.k == "comma" or e.idx then return true end
+  -- xpandleaf (${…}), comma, and a NON-compilable array subscript aren't compiled natively —
+  -- treat like a side effect so the word/stmt delegates. A FAST xpand ($name only) and a
+  -- read-only array element (arith_elem_ok) ARE compiled, so they aren't side effects.
+  if e.k == "xpandleaf" or e.k == "comma" or (e.idx and not arith_elem_ok(e)) then return true end
   if e.k == "xpand" then return not xpand_fast(e.raw) end
   return arith_side_effect(e.e) or arith_side_effect(e.l) or arith_side_effect(e.r)
     or arith_side_effect(e.c) or arith_side_effect(e.a) or arith_side_effect(e.b)
@@ -328,7 +342,7 @@ local function not_compilable(e)
   -- arith_perr = a deferred arith PARSE error (`(( i = '3' ))`): only the interpreter
   -- renders it (prints bash's "syntax error in expression" + aborts the line), so the
   -- enclosing loop/statement must delegate — else emit_value throws an uncaught error.
-  if e.k == "xpandleaf" or e.k == "comma" or e.k == "arith_perr" or e.idx then return true end
+  if e.k == "xpandleaf" or e.k == "comma" or e.k == "arith_perr" or (e.idx and not arith_elem_ok(e)) then return true end
   if e.k == "xpand" then return not xpand_fast(e.raw) end -- a fast $name xpand compiles
   return not_compilable(e.e) or not_compilable(e.l) or not_compilable(e.r)
     or not_compilable(e.c) or not_compilable(e.a) or not_compilable(e.b)
@@ -588,6 +602,9 @@ emit_value = function(e, lifted)
   end
   if k == "raw" then return e.code end -- a pre-computed Lua expr (inlined param binding)
   if k == "var" and e.name == "LINENO" then return (tostring(EF.cur_line or 0) .. "LL") end -- compile-time line
+  if k == "var" and e.idx then -- $(( a[i] )): array/assoc element read (gated by arith_elem_ok)
+    return ("rt.arith_read_elem(sh, %q, %q, %s)"):format(e.name, e.idxraw, emit_word(require("parser").parse_word(e.idxraw), lifted))
+  end
   if k == "var" then return lifted[e.name] and lname(e.name) or (arith_varread):format(e.name) end
   if k == "param" then return ("rt.str_to_i64(sh:param(%d))"):format(e.n) end
   if k == "xpand" then

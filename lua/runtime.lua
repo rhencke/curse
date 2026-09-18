@@ -2667,6 +2667,23 @@ function M.array_elem(sh, name, raw, expanded)
   return sh:expand_param({ name = name, index = raw }, nil, nil, M.array_key(sh, name, raw, expanded))
 end
 
+-- Read an array/assoc ELEMENT in ARITHMETIC context (`$(( a[i] ))`), exactly interp's arith
+-- var-with-idx path (interp.lua ~448): a set -u check on the BASE var (arith_nounset — FATAL
+-- for an unset base, but an unset ELEMENT of a set array reads as 0), then arith_resolve the
+-- element value recursively (a[0]="x+1" -> x+1). A non-numeric element ("12 34") is a NON-fatal
+-- syntax error: arith_resolve prints the exact message and raises experr, which is converted to
+-- the tier's lineabort so run_compiled contains it (status 1, abort line, continue).
+function M.arith_read_elem(sh, name, raw, expanded)
+  local I = require("interp")._int
+  I.arith_nounset(sh, name) -- fatal if the base var is unset under set -u (outside the pcall)
+  local ok, v = pcall(I.arith_resolve, sh, sh:array_get(name, M.array_key(sh, name, raw, expanded)))
+  if ok then return v end
+  if type(v) == "table" and (v.__curse_experr or v.__curse_matherr) and not v.__curse_lineabort then
+    error({ __curse_exit = v.__curse_exit or 1, __curse_lineabort = true })
+  end
+  error(v)
+end
+
 -- Apply a ${…} operator. `arg`/`arg2` are already word-expanded by the caller;
 -- `idxnum` is the evaluated numeric subscript when pe.index is an expression.
 function Shell:expand_param(pe, arg, arg2, idxnum)
