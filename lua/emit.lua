@@ -827,6 +827,12 @@ local function und(st, lifted)
   if not st.words then return "" end -- $_ is maintained after every command (bash), like exec_simple's path
   local last = st.words[#st.words]
   if last and not word_safe(last) then return "" end -- split/cmdsub last arg: skip (rare)
+  -- A word_safe last arg can still hold a SIDE-EFFECTING expansion (a quoted `"$(cmd)"`, a
+  -- $((n++)), a procsub): re-emitting it here to set $_ would run it a SECOND time. Skip $_
+  -- for those (rare) rather than double the side effect — the command already ran it once.
+  if last then for _, p in ipairs(last.parts) do
+    if p.cmdsub or p.procsub or p.arith or p.arithast then return "" end
+  end end
   local v = last and emit_word(last, lifted) or '""'
   return ("; sh:set_str(%q, %s)"):format("_", v)
 end
