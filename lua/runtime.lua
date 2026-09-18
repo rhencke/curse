@@ -1017,10 +1017,10 @@ M.str_to_i64 = str_to_i64
 -- `return [n]` status: no arg -> current $?; a numeric arg -> n mod 256; a
 -- non-numeric arg -> 2 + diagnostic (bash). A pure runtime primitive the compiled
 -- tier calls directly (no interp).
-function M.return_status(sh, value)
+function M.return_status(sh, value, name)
   if value == nil then return sh.status end
   local n = tonumber(value)
-  if not n then io.stderr:write("curse: return: " .. value .. ": numeric argument required\n"); return 2 end
+  if not n then io.stderr:write("curse: " .. (name or "return") .. ": " .. value .. ": numeric argument required\n"); return 2 end
   return n % 256
 end
 

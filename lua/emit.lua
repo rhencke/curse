@@ -1947,21 +1947,23 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
           return p
         end -- else (pexp/${…}): not intercepted — falls through (emit deopts to interp, which is correct)
       end
-    elseif cf_op == "exit" and #subexit > 0 then
-      -- `exit [N]` inside a compiled subshell exits ONLY the subshell (bash), so jump
-      -- to its subshell_exit pc with the status. If it instead delegated (raising
-      -- __curse_exit), that error unwinds to the nearest pcall — e.g. run_trap's, when
-      -- the subshell sits inside a trap — and the forked child CONTINUES rather than
-      -- _exiting, re-running the rest of the program. A top-level/function exit (no
-      -- enclosing subshell) falls through to the interpreter, which ends the shell.
-      local exitp = subexit[#subexit]
+    elseif cf_op == "exit" then
+      -- `exit [N]` inside a compiled subshell exits ONLY the subshell (bash), so jump to its
+      -- subshell_exit pc with the status; otherwise raise __curse_exit, which finish() catches
+      -- (sets $?, runs the EXIT trap, ends the shell) — the same signal delegation raised, so
+      -- no behavioral change but no I.exec_stmt. A delegated __curse_exit inside a compiled
+      -- subshell would unwind to run_trap's pcall and the child would CONTINUE, hence the
+      -- subshell jump. Multi-arg (`exit a b`: too-many, non-fatal) / dynamic arg -> delegate.
+      local exitp = #subexit > 0 and subexit[#subexit] or nil
       local aw = st.words[cf_arg]
       if not st.words[cf_arg + 1] then
         local d = dbg(st)
-        if not aw then local p = newpc(); blocks[p] = d .. ("pc = %d"):format(exitp); return p
-        elseif word_safe(aw) then
+        local statusexpr = aw and word_safe(aw) and ("rt.return_status(sh, %s, \"exit\")"):format(emit_word(aw, lifted))
+          or (not aw and "sh.status") or nil
+        if statusexpr then
           local p = newpc()
-          blocks[p] = d .. ("sh.status = rt.return_status(sh, %s); pc = %d"):format(emit_word(aw, lifted), exitp)
+          if exitp then blocks[p] = d .. ("sh.status = %s; pc = %d"):format(statusexpr, exitp)
+          else blocks[p] = d .. ("error({ __curse_exit = %s })"):format(statusexpr) end
           return p
         end
       end -- dynamic/multi-arg: fall through to delegate
