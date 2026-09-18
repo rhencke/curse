@@ -1311,6 +1311,10 @@ function seg_native(w, lifted)
   end
   return true
 end
+-- Also reachable via the shared EF table so flatten_stmt (the for-in list gate) can call it
+-- without taking a fresh upvalue — flatten_stmt is at the 60-upvalue cap (as with cur_line /
+-- emit_regex_glob). Ordinary callers keep using the local seg_native directly.
+EF.seg_native = seg_native
 -- Render a case-clause pattern to a Lua EXPRESSION for its glob-form, quote-aware exactly
 -- like interp's expand_pattern/expand_escaped: a QUOTED part's glob metachars are
 -- backslash-escaped (literal match), an UNQUOTED expansion's metachars stay active. A
@@ -2701,15 +2705,19 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
       if st.redirs then return delegate(st, after) end -- redirs on the loop: interp applies them
       if hard_cf(st.body) then return delegate(st, after) end -- un-static break/continue
       if not st.name:match("^[%a_][%w_]*$") then return delegate(st, after) end -- invalid loop var → interp errors
-      -- Each word must be word_safe (one field) or a field_word (an unquoted
-      -- expansion/glob the field engine splits+globs at runtime). Array/@/* and
-      -- mixed literal+expansion words still delegate the whole loop (cold path).
+      -- Each word expands to for-list fields exactly like a command argument: word_safe (one
+      -- field), a field_word (an unquoted expansion/glob the field engine splits+globs), or a
+      -- seg_native mixed word (rt.expand_fields — literal+$x, $@/$*, ${a[@]}, ${!a[@]}, scalar
+      -- ${..} ops). emit_fields_into renders each fully natively (no interp field engine); a
+      -- word only the shared engine could take still delegates the loop (rare, cold).
       for _, w in ipairs(st.words) do
         -- $LINENO in a for-in list on a CONTINUATION line is the word's line, not the `for`
         -- line (st.line) the compile-time constant would use — delegate so interp's per-line
         -- tracking gives the exact value (rare; the whole loop is cold anyway).
         for _, p in ipairs(w.parts) do if p.var == "LINENO" then return delegate(st, after) end end
-        if not word_safe(w) and not field_word(w, lifted) then return delegate(st, after) end
+        if not word_safe(w) and not field_word(w, lifted) and not EF.seg_native(w, lifted) then
+          return delegate(st, after)
+        end
       end
       local initp = newpc()
       local advp = newpc(); loopPc[st.id] = advp -- back-edge = resume point
