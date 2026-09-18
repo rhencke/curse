@@ -1087,6 +1087,20 @@ local function multi_elems(sh, p) -- returns element list, star?
   return els, (p.special == "*")
 end
 
+-- ${!ref}: return (element list, star) for the compiled tier's multi-segment. A target that
+-- resolves to an array/$@ is multi (multi_elems); a scalar target is a 1-element list of the
+-- scalar indirect value. An empty/absent resolution (a set ref whose value is "", an unset
+-- positional ref) is ONE empty field ("" — matching the scalar path, which yields one field
+-- when quoted); an invalid indirect (unset ref base) raises in indirect_part.
+function M.indirect_seg(sh, pe, q)
+  local part = { pexp = pe, q = q }
+  if is_multi(sh, part) then return multi_elems(sh, part) end
+  local ip = indirect_part(sh, pe)
+  if not ip then return { "" }, false end -- set-ref-empty / unset-positional: one empty field
+  ip.q = q
+  return { expand_part_str(sh, ip) }, false
+end
+
 -- Expand a word to a LIST of fields (command args, for-in lists): unquoted
 -- expansions split on default-IFS whitespace; quoted text never splits; "$@" /
 -- "${a[@]}" yield one field per element.

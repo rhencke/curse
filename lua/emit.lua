@@ -980,6 +980,17 @@ end
 -- (/,//), case-fold (^/^^/,/,,), and the @Q/@U… transforms — all with compile-time
 -- literal args. Excludes slice (:off:len — index/assoc position semantics), default/
 -- alternate (:-/-/:+/+/…: field-wise default word), @a/@P, and ${!ref} indirection.
+-- ${!ref} indirect: a runtime-resolved multi-segment (rt.indirect_elems bootstraps interp's
+-- resolution — the target name and its scalar/array shape are late-bound). The ${!ref}'s own
+-- line is passed so a $LINENO target resolves correctly. Only the plain op=="indirect" form
+-- (a scalar/subscript ref); the ${!a[@]}-keys op=="indices" form stays with array_index_strs.
+local function indirect_ok(pe)
+  -- Exclude the array-multi indirect forms (${!a[@]-op}, ${!a[*]…}): the name resolves to a
+  -- space-joined list -> "invalid variable name", which raises; inside a compiled subshell the
+  -- fork doesn't contain that lineabort. Rare — delegate them. Scalar / [i] / $N / @ refs compile.
+  return pe.op == "indirect" and pe.index ~= "@" and pe.index ~= "*"
+    and type(pe.name) == "string" and pe.name ~= ""
+end
 local function array_multi_op(pe)
   local is_arr = (pe.index == "@" or pe.index == "*") -- ${a[@]OP}: array subscript
   local is_pos = (pe.index == nil and (pe.name == "@" or pe.name == "*")) -- ${@OP}/${*OP}: positional
@@ -1101,6 +1112,12 @@ local function emit_seg(p, i, lifted)
     return ("{multi=true,star=%s,q=%s,elems=sh:paramList()}"):format(
       tostring(p.special == "*"), tostring(p.q or false))
   end
+  if p.pexp and p.pexp.op == "indirect" then -- ${!ref}: runtime-resolved (bootstrap) multi-segment
+    local pe = p.pexp -- q = the outer quoting OR a quoted multi alternate's forced quoting (__qf)
+    return ("(function() local __e, __s, __qf = rt.indirect_elems(sh, %q, %s, %s, %s, %d); return {multi=true,star=__s,q=(%s or __qf),elems=__e} end)()")
+      :format(pe.name, pe.index and ("%q"):format(pe.index) or "nil",
+        pe.iop and ("%q"):format(pe.iop) or "nil", tostring(p.q or false), EF.cur_line or 0, tostring(p.q or false))
+  end
   if p.pexp then -- ${a[@]} / ${a[*]}: array elements as a multi-element segment (gated)
     local pe = p.pexp
     local positional = (pe.name == "@" or pe.name == "*") -- ${@OP}/${*OP} vs ${a[@]OP}
@@ -1197,7 +1214,7 @@ function mixed_expandable(w, lifted)
     if p.arith or p.arithast or p.cmdsub or p.procsub then return false end
     -- a bare ${a[@]}/${a[*]} array expansion is a multi-element segment seg_native renders;
     -- any other ${…} (slice/strip/indirect/scalar op) still delegates.
-    if p.pexp and not array_multi_op(p.pexp) then return false end
+    if p.pexp and not (array_multi_op(p.pexp) or indirect_ok(p.pexp)) then return false end
     if p.var and (COMPILE_UNSAFE_VAR[p.var] and p.var ~= "LINENO") then return false end
   end
   return true
@@ -1218,7 +1235,7 @@ function seg_native(w, lifted)
     elseif p.param then -- $1..$9 positional: ok
     elseif p.special == "#" or p.special == "?" or p.special == "$" or p.special == "!" then -- scalar specials
     elseif p.special == "@" or p.special == "*" then -- $@/$*: multi-element (emit_seg renders it)
-    elseif p.pexp and array_multi_op(p.pexp) then -- ${a[@]}/${a[*]} bare or per-element string-op
+    elseif p.pexp and (array_multi_op(p.pexp) or indirect_ok(p.pexp)) then -- ${a[@]}/${a[*]} bare or per-element string-op
     else return false end -- other pexp, cmdsub, arith, procsub, or anything unknown
   end
   return true
@@ -2691,8 +2708,11 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
       -- ERR trap after a failing subshell (`( exit 42 )`) fires in the PARENT; the
       -- errexit path already delegated above, so this errchk only fires ERR (opt_e false).
       local ec = errchk(st); local ecs = ec ~= "" and ("; " .. ec) or ""
-      blocks[p] = ("if sh.opt_e then pc = %d else local __pid = rt.subshell_fork(sh); if __pid == 0 then pc = %d else sh.status = rt.subshell_wait(__pid)%s; pc = %d end end")
-        :format(delpc, bodyentry, ecs, after)
+      -- The forked child sets sh._ff = the subshell's exit pc, so a lineabort raised in the
+      -- body (div0, failglob, an invalid-indirect, …) exits the SUBSHELL (subshell_exit ->
+      -- _exit) instead of fast-forwarding into the PARENT's continuation and re-running it.
+      blocks[p] = ("if sh.opt_e then pc = %d else local __pid = rt.subshell_fork(sh); if __pid == 0 then sh._ff = %d; pc = %d else sh.status = rt.subshell_wait(__pid)%s; pc = %d end end")
+        :format(delpc, exitpc, bodyentry, ecs, after)
       return p
     elseif t == "group" then
       -- { list; }: not a subshell — just a sequence in the current shell. Flatten the

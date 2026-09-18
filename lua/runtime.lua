@@ -3103,6 +3103,27 @@ function M.array_op_values(sh, els, op, arg, arg2)
   return out
 end
 
+-- ${!ref} indirect for the compiled tier: resolve + expand via interp (the target name is
+-- late-bound and its scalar/array shape is genuinely dynamic — a bootstrap, like rt.builtin),
+-- returning (element list, star) for the enclosing multi-segment (the field split/glob is then
+-- compiled by expand_fields). `line` is the ${!ref}'s source line (compile-time constant) —
+-- set sh.cur_line so a $LINENO indirect target (`ref=LINENO; ${!ref}`) reads the right line
+-- (the compiled tier's cur_line is otherwise stale). An invalid-indirect error (bash line-
+-- aborts) becomes the tier's __curse_lineabort so the command fails non-fatally.
+function M.indirect_elems(sh, refname, refindex, iop, q, line)
+  if line then sh.cur_line = line end
+  -- qforced: a QUOTED multi alternate (`${!ref+"${a[@]}"}`) keeps its elements separate even
+  -- when the outer ${…} is unquoted — the caller ORs it into the segment's q.
+  local ok, els, star, qforced = pcall(require("interp").indirect_seg, sh,
+    { name = refname, index = refindex, op = "indirect", iop = iop }, q)
+  if ok then return els, star, qforced end
+  local e = els -- pcall put the error here
+  if type(e) == "table" and e.__curse_experr and not e.__curse_lineabort then
+    error({ __curse_exit = e.__curse_exit or 1, __curse_lineabort = true })
+  end
+  error(e) -- fatal (set -u nounset, etc.) propagates
+end
+
 -- ${a[*]:-…} / ${*:-…} null test for the QUOTED-star form: the IFS[0]-joined string is
 -- non-empty (interp multi_elems `star and p.q` branch). Empty IFS joins with no separator.
 function M.ifs_join_ne(sh, els)
