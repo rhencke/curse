@@ -1860,37 +1860,47 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
   -- delegates the whole command (honest transition; those are the defect to grind).
   local P = require("parser")
   local REDIR_FILE = { out = 1, app = 1, ["in"] = 1, clobber = 1, rw = 1, appboth = 1, outboth = 1 }
-  local function redir_target_expr(r)
+  -- One redirect -> its full rt.redir_apply[_expand] call expression, or nil to delegate the
+  -- whole command (a {var}> named fd, a fd MOVE, an expanding heredoc, a dup to a dynamic fd,
+  -- a brace/cmdsub/procsub/non-seg target). A FILE target that is a static literal path applies
+  -- directly; an EXPANDABLE one ($/glob/~ etc.) hands mask-aware segments to redir_apply_expand
+  -- (field expansion + the ambiguous-redirect check at runtime).
+  local function redir_apply_expr(r)
     if r.fdvar then return nil end
-    if REDIR_FILE[r.op] then
+    local op, fd = r.op, r.fd or 0
+    if REDIR_FILE[op] then
       local t = r.target or ""
-      -- needs the field engine or a subshell/procsub (`> >(cmd)`, `< <(cmd)`): delegate.
-      if t == "" or t:find("[%$`%*%?%[~{()]") then return nil end
-      return ("%q"):format(t) -- a static literal path
-    elseif r.op == "dup" or r.op == "dupin" then
+      if t == "" then return nil end
+      if not t:find("[%$`%*%?%[~{()]") then -- static literal path
+        return ("rt.redir_apply(sh, %q, %d, %q, __rs)"):format(op, fd, t)
+      end
+      if t:find("{", 1, true) then return nil end -- brace expansion in the target: let interp handle it
+      local ok, w = pcall(P.parse_word, t)
+      if not (ok and seg_native(w)) then return nil end -- cmdsub/arith/procsub/nameref target: delegate
+      local segs = {}
+      for i, p in ipairs(w.parts) do segs[#segs + 1] = emit_seg(p, i, lifted) end
+      return ("rt.redir_apply_expand(sh, %q, %d, {%s}, %q, __rs)"):format(op, fd, table.concat(segs, ", "), t)
+    elseif op == "dup" or op == "dupin" then
       local t = r.target or ""
-      if t == "-" or t:match("^%d+$") then return ("%q"):format(t) end
+      if t == "-" or t:match("^%d+$") then return ("rt.redir_apply(sh, %q, %d, %q, __rs)"):format(op, fd, t) end
       return nil -- a dynamic fd, or a MOVE (`>&5-`): delegate
-    elseif r.op == "herestring" then
+    elseif op == "herestring" then
       local w = P.parse_word(r.word or ""); if not emitable_word(w) then return nil end
-      return "(" .. emit_word(w, lifted) .. ' .. "\\n")' -- one blob (no split), + a trailing newline
-    elseif r.op == "heredoc" then
+      return ("rt.redir_apply(sh, %q, %d, (%s .. \"\\n\"), __rs)"):format(op, fd, emit_word(w, lifted))
+    elseif op == "heredoc" then
       if r.expand then return nil end -- an expanding body needs the word engine — later
-      return ("%q"):format(r.body or "")
+      return ("rt.redir_apply(sh, %q, %d, %q, __rs)"):format(op, fd, r.body or "")
     end
     return nil
   end
-  -- Build the "install all redirs, run, restore" conditions for `st.redirs`, or nil
-  -- if any redir can't be compiled (caller delegates) or the command is `exec`
-  -- (whose redirs must PERSIST — never restored). Returns the `and`-chained apply
-  -- expression; the caller wraps the command body with it.
+  -- Build the "install all redirs, run, restore" conditions for `st.redirs`, or nil if any redir
+  -- can't be compiled (caller delegates) or the command is `exec` (whose redirs must PERSIST).
   local function redir_conds(st, cmd)
     if cmd == "exec" then return nil end
     local conds = {}
     for _, r in ipairs(st.redirs) do
-      local texpr = redir_target_expr(r)
-      if not texpr then return nil end
-      conds[#conds + 1] = ("rt.redir_apply(sh, %q, %d, %s, __rs)"):format(r.op, r.fd or 0, texpr)
+      local e = redir_apply_expr(r); if not e then return nil end
+      conds[#conds + 1] = e
     end
     return table.concat(conds, " and ")
   end

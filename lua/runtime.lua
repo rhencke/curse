@@ -521,7 +521,23 @@ function M.redir_apply(sh, op, fd, target, saves)
 end
 function M.redir_restore(saves)
   io.flush()
-  for i = #saves, 1, -1 do local s = saves[i]; C.dup2(s.saved, s.fd); C.close(s.saved) end
+  -- s.saved >= 0: the fd was open — restore it. s.saved < 0 (C.dup failed): the fd was NOT
+  -- open before, so CLOSE it rather than dup2(-1) which leaks it (matches interp restore_redirs).
+  for i = #saves, 1, -1 do
+    local s = saves[i]
+    if s.saved >= 0 then C.dup2(s.saved, s.fd); C.close(s.saved) else C.close(s.fd) end
+  end
+end
+
+-- A FILE redirect whose target is EXPANDABLE (`> $f`, `< $dir/in`, `> *.glob`): the compiled
+-- tier hands the mask-aware segments; expand them, require EXACTLY one field (else "ambiguous
+-- redirect", status 1), then apply — matching interp's ftgt. A raise during expansion (failglob,
+-- set -u) fails the redirect non-fatally, as interp's pcall does.
+function M.redir_apply_expand(sh, op, fd, segs, raw, saves)
+  local ok, fs = pcall(M.expand_fields, sh, segs)
+  if not ok then return false end
+  if #fs ~= 1 then io.stderr:write("curse: " .. raw .. ": ambiguous redirect\n"); return false end
+  return M.redir_apply(sh, op, fd, fs[1], saves)
 end
 -- bash values are C strings: a NUL byte terminates them. Truncate at the first NUL
 -- wherever a byte string becomes a variable value or an argv entry (assignment,
