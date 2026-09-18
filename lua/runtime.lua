@@ -2625,25 +2625,26 @@ function M.assign_element(sh, name, raw, expanded, value, append)
   sh:set_str("_", "") -- a bare assignment resets $_ (bash); status stays the RHS's (emit set 0 first)
 end
 
--- Read a scalar array/assoc ELEMENT ${name[sub]} (op=nil) for the compiled tier. Resolve the
--- subscript exactly like assign_element / interp's array_key — an ASSOC uses the word-expanded
--- subscript (`expanded`, built by emit_word for the caller), an INDEXED array arith-evaluates
--- the RAW subscript (empty -> 0) — then defer to Shell:expand_param, the SAME element read +
--- set -u nounset + isset path the interpreter uses, so the value matches exactly. A subscript
+-- Resolve a subscript to its array KEY for the compiled tier, exactly like assign_element /
+-- interp's array_key: an ASSOC uses the word-expanded subscript (`expanded`, built by emit_word
+-- for the caller); an INDEXED array arith-evaluates the RAW subscript (empty -> 0). A subscript
 -- arith syntax error (`${a['3']}`) becomes the tier's non-fatal lineabort (interp's experr).
-function M.array_elem(sh, name, raw, expanded)
-  local key
-  if sh:is_assoc(name) then key = expanded
-  elseif raw:match("^%s*$") then key = 0
-  else
-    local ok, v = pcall(function() return M.to_arr_key(M.arith_str(sh, raw)) end)
-    if not ok then
-      io.stderr:write("curse: " .. raw .. ": syntax error in expression\n")
-      error({ __curse_exit = 1, __curse_lineabort = true })
-    end
-    key = v
+function M.array_key(sh, name, raw, expanded)
+  if sh:is_assoc(name) then return expanded end
+  if raw:match("^%s*$") then return 0 end
+  local ok, v = pcall(function() return M.to_arr_key(M.arith_str(sh, raw)) end)
+  if not ok then
+    io.stderr:write("curse: " .. raw .. ": syntax error in expression\n")
+    error({ __curse_exit = 1, __curse_lineabort = true })
   end
-  return sh:expand_param({ name = name, index = raw }, nil, nil, key)
+  return v
+end
+
+-- Read a scalar array/assoc ELEMENT ${name[sub]} (op=nil) for the compiled tier: resolve the
+-- key, then defer to Shell:expand_param — the SAME element read + set -u nounset + isset path
+-- the interpreter uses, so the value matches exactly.
+function M.array_elem(sh, name, raw, expanded)
+  return sh:expand_param({ name = name, index = raw }, nil, nil, M.array_key(sh, name, raw, expanded))
 end
 
 -- Apply a ${…} operator. `arg`/`arg2` are already word-expanded by the caller;

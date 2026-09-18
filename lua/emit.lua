@@ -1021,11 +1021,17 @@ function pexp_compilable(pe)
     if not (ok and emitable_word(sw)) then return false end
     for _, p in ipairs(sw.parts) do if p.cmdsub or p.procsub then return false end end
     -- READ-ONLY ops on the element VALUE compile: bare read, length, slice, and the
-    -- strip/subst/case pattern ops. The default/assign/error ops (:-/:=/? …) need element
-    -- set-ness + write-back, and @-transform/indices/prefix/indirect their own paths → delegate.
+    -- strip/subst/case pattern ops. @-transform/indices/prefix/indirect keep their own paths.
     if op == nil or op == "len" then return true end
     if op == "sub" then return pexp_word_args_ok(pe) end
     if PEXP_STROP[op] then return strop_pat_ok(pe) end
+    -- default/alternate/assign/error (${a[i]:-d} / := / ? …): Shell:expand_param does the
+    -- element set-ness test and := write-back, so reuse it — same default-word gate as scalars.
+    if PEXP_DEFAULT[op] then
+      if pe.arg and pe.arg:find("[~\\'\"]") then return false end
+      local wok, w = pcall(require("parser").parse_word, pe.arg or "")
+      return wok and emitable_word(w) or false
+    end
     return false
   end
   local name = pe.name
@@ -1088,8 +1094,17 @@ function pexp_scalar(pe, lifted)
   elseif pe.index then -- ${name[sub]…}: read the element; a read-only op (below) then applies to it.
     -- Pass BOTH the raw subscript (arith-evaluated for an indexed array) and its word-expanded
     -- form (the assoc key); rt.array_elem picks per the array's type, matching interp's array_key.
-    val = ("rt.array_elem(sh, %q, %q, %s)"):format(pe.name, pe.index, emit_word(require("parser").parse_word(pe.index), lifted))
+    local expanded = emit_word(require("parser").parse_word(pe.index), lifted)
+    val = ("rt.array_elem(sh, %q, %q, %s)"):format(pe.name, pe.index, expanded)
     if pe.op == nil then return val end
+    if PEXP_DEFAULT[pe.op] then
+      -- ${a[i]:-d} / := / ? …: defer to Shell:expand_param with the resolved key and a LAZY
+      -- default-word thunk (a side-effecting default runs only when its branch is taken, and
+      -- := writes back to a[key]) — interp's exact element default/assign/error path.
+      local defthunk = ("function() return %s end"):format(emit_word(require("parser").parse_word(pe.arg or ""), lifted))
+      return ("sh:expand_param({[\"name\"]=%q,[\"index\"]=%q,[\"op\"]=%q}, %s, nil, rt.array_key(sh, %q, %q, %s))")
+        :format(pe.name, pe.index, pe.op, defthunk, pe.name, pe.index, expanded)
+    end
   else
     val = lifted[pe.name] and ("rt.i64_to_str(%s)"):format(lname(pe.name))
       or ("sh:get_u(%q)"):format(pe.name) -- get_u: an unset var trips set -u, like bash
