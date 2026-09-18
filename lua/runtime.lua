@@ -126,6 +126,10 @@ function Shell:paramListSub() local t = { self.argv0 or "" }; for i = 1, self.np
 -- pattern (the compiled tier's twin of interp's expand_escaped for a QUOTED pattern part:
 -- `case $x in "$p"*)` — "$p"'s metachars are literal, the trailing * is active).
 function M.glob_quote(s) return (s:gsub("[%*%?%[%]\\%(%)%|%+%@%!]", "\\%0")) end
+-- ERE-escape a QUOTED part of a `[[ =~ ]]` regex (the compiled twin of interp's expand_regex
+-- for a quoted segment): a quoted `"$re"`/`"a.c"` matches literally, so every ERE metachar is
+-- backslash-escaped. Mirrors interp's expand_escaped metachar set for the =~ context.
+function M.regex_quote(s) return (s:gsub("[%.%^%$%*%+%?%(%)%[%]%{%}%|\\]", "\\%0")) end
 
 -- Positional-only call boundary: push args (varargs) into the depth pool — no
 -- table allocation per call after warmup.

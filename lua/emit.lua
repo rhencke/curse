@@ -1338,6 +1338,35 @@ emit_pattern_glob = function(pat, lifted)
   if #out == 0 then return '""' end
   return table.concat(out, " .. ")
 end
+-- Render a `[[ L =~ R ]]` RHS word to its ERE string (interp's expand_regex): an unquoted
+-- literal or expansion keeps ERE metachars ACTIVE; a quoted part is ERE-escaped (matched
+-- literally). Returns nil (delegate) for a part emit can't render (cmdsub/arith/${..}-op/
+-- $@/$*/length/CFG-unsafe special) or a word-initial ~ (bash tilde-expands the RHS then
+-- matches THAT literally — a rarer path interp handles).
+-- Assigned onto the shared EF table (not a new module local) so build_cfg — which calls it
+-- from the =~ block — reuses its existing EF upvalue instead of adding one (the 60-upvalue cap).
+local REGEX_SPECIAL = "[%.%^%$%*%+%?%(%)%[%]%{%}%|\\]"
+EF.emit_regex_glob = function(w, lifted)
+  for i, p in ipairs(w.parts) do
+    if p.lenof or p.cmdsub or p.arith or p.arithast or p.pexp or p.procsub then return nil end
+    if p.special == "@" or p.special == "*" then return nil end -- multi-element in a regex
+    if p.var and (COMPILE_UNSAFE_VAR[p.var] and p.var ~= "LINENO") then return nil end
+    if i == 1 and p.lit ~= nil and not p.q and p.lit:sub(1, 1) == "~" then return nil end -- word-initial ~
+  end
+  local out = {}
+  for i, p in ipairs(w.parts) do
+    if p.lit ~= nil then
+      local s = p.lit
+      if p.q then s = s:gsub(REGEX_SPECIAL, "\\%0") end -- quoted ERE metachars -> literal
+      out[#out + 1] = ("%q"):format(s)
+    else -- var / param / raw / scalar special: value; ERE-escape it when quoted
+      local v = emit_scalar_val(p, i, lifted, false)
+      out[#out + 1] = p.q and ("rt.regex_quote(%s)"):format(v) or v
+    end
+  end
+  if #out == 0 then return '""' end
+  return table.concat(out, " .. ")
+end
 -- An `a=(…)` array literal the compiled tier can build: each BARE element's word is
 -- field-engine-able (word_safe/field_word/seg_native), and each KEYED element `[k]=v` has
 -- a LITERAL subscript (no $/`/quote — so rt.arrayassign resolves it with no word engine:
@@ -2092,8 +2121,24 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
     end
     if t == "dbracket" then
       -- [[ ]] : compile the and/or/not tree + leaf comparisons natively; $? = 0/1.
-      -- Any leaf the compiler can't render (=~, mixed-quote glob, procsub) -> delegate.
+      -- Any leaf the compiler can't render (mixed-quote glob, procsub) -> delegate.
       if st.redirs then return delegate(st, after) end
+      -- `[[ L =~ R ]]` as the SOLE condition: emit_dbracket can't express =~ (it has a
+      -- BASH_REMATCH side effect AND a tri-state status — 0 match / 1 no-match / 2 bad
+      -- regex — that the boolean leaf model has no slot for), so compile it here via
+      -- rt.regex_captures (real POSIX ERE, exactly interp's path). The RHS is rendered
+      -- mask-aware by emit_regex_glob. A =~ nested inside and/or/not still delegates.
+      if st.expr.kind == "binary" and st.expr.op == "=~" and db_word_ok(st.expr.l) then
+        local re = EF.emit_regex_glob(st.expr.r, lifted)
+        if re then
+          local p = newpc()
+          local d = dbg(st)
+          local ec = errchk(st); local ecs = ec ~= "" and ("; " .. ec) or ""
+          blocks[p] = d .. ("do local __c, __bad = rt.regex_captures(%s, %s, (sh.shopt.nocasematch and true or nil)); if __bad then sh.status = 2 else sh:array_assign(\"BASH_REMATCH\", __c or {}, false); sh.status = __c and 0 or 1 end end%s; pc = %d")
+            :format(emit_word(st.expr.l, lifted), re, ecs, after)
+          return p
+        end
+      end
       local cond = emit_dbracket(st.expr, lifted)
       if not cond then return delegate(st, after) end
       local p = newpc()
