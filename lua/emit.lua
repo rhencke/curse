@@ -2350,6 +2350,27 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
             callargs = ("sh, __a, __noop, %s"):format(tostring(hadcs)), redir = dyn_redir })
         end
       end
+      -- `command CMD args` (no -p/-v/-V/-- flag): run CMD skipping SHELL FUNCTION lookup
+      -- (builtin/external only) — exactly interp's exec_simple(rest, no_func=true). Build argv
+      -- from words[2..] and dispatch through rt.exec_dynamic with no_func, reusing delegate's
+      -- cf-signal wrapper and opts.redir. A flag form (`command -v`, `command -p`) delegates.
+      if cmd == "command" and st.words[2] and not st.assigns then
+        local w2 = st.words[2].parts[1]
+        if not (w2 and w2.lit and w2.lit:sub(1, 1) == "-") then -- not a flag / --
+          local argvbody = field_argv(st.words, 2, lifted, nil, nil)
+          local cmd_redir = nil
+          if argvbody and st.redirs then cmd_redir = redir_conds(st, nil) end
+          if argvbody and not (st.redirs and not cmd_redir) then
+            local hadcs = false
+            for j = 2, #st.words do
+              for _, pp in ipairs(st.words[j].parts) do if pp.cmdsub then hadcs = true; break end end
+              if hadcs then break end
+            end
+            return delegate(st, after, { prelude = argvbody, callee = "rt.exec_dynamic",
+              callargs = ("sh, __a, __noop, %s, true"):format(tostring(hadcs)), redir = cmd_redir })
+          end
+        end
+      end
       -- `declare`/`typeset` INSIDE a function (no -g) make each name local, exactly like
       -- `local` (bash) — so route a plain one through the native local path. A flag (incl.
       -- -g), an array value (st.arrayargs delegated above), or `a[i]=` fails the plain check

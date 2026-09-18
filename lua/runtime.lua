@@ -3006,7 +3006,7 @@ end
 -- write-error -> status 1, then $_ (last arg) and PIPESTATUS. Control-flow builtins reached
 -- this way (`b=break; $b`) raise __curse_break/continue/return/exit, which the caller's
 -- delegate wrapper translates into the native pc jump.
-function M.exec_dynamic(sh, argv, hook, hadcs)
+function M.exec_dynamic(sh, argv, hook, hadcs, no_func)
   local n = #argv
   -- All words expanded away: an empty command takes the LAST command sub's exit status when
   -- one was performed (`$(exit 42)` -> 42, bare `false` -> 1), else 0 (bash) — matching interp.
@@ -3014,7 +3014,8 @@ function M.exec_dynamic(sh, argv, hook, hadcs)
   local I = require("interp")
   sh.write_err = nil
   if sh.opt_x then I.xtrace(sh, argv) end
-  I.exec_simple(sh, argv, hook or _noop)
+  -- no_func (the `command` prefix): run argv skipping SHELL FUNCTION lookup (builtin/external only).
+  I.exec_simple(sh, argv, hook or _noop, no_func)
   if sh.write_err then sh.status = 1 end
   sh:set_str("_", argv[n])
   sh:array_assign("PIPESTATUS", { tostring(sh.status) }, false)
