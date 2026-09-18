@@ -2684,6 +2684,31 @@ function M.arith_read_elem(sh, name, raw, expanded)
   error(v)
 end
 
+-- WRITE an array/assoc element in ARITHMETIC context (`(( a[i] = e ))`, `(( a[i] += e ))`).
+-- Resolve the key ONCE (so a subscript side effect runs once), read the current element only
+-- when the op reads it first (`read_first` for a compound assignment; a plain `=` does not,
+-- and so takes no set -u nounset — writing an unset base creates it), then `compute(old)` (the
+-- caller's closure, which applies the operator via emit_value) gives the new int64; store it.
+function M.arith_elem_write(sh, name, raw, expanded, read_first, compute)
+  if read_first then require("interp")._int.arith_nounset(sh, name) end
+  local key = M.array_key(sh, name, raw, expanded)
+  local old = read_first and M.arith_str(sh, sh:array_get(name, key) or "") or nil
+  local v = compute(old)
+  sh:array_set(name, key, M.i64_to_str(v))
+  return v
+end
+
+-- ++a[i] / a[i]++ (and --): read the element (nounset on the base), store old±1, return the
+-- OLD value for post or the NEW value for pre.
+function M.arith_elem_incr(sh, name, raw, expanded, delta, is_post)
+  require("interp")._int.arith_nounset(sh, name)
+  local key = M.array_key(sh, name, raw, expanded)
+  local old = M.arith_str(sh, sh:array_get(name, key) or "")
+  sh:array_set(name, key, M.i64_to_str(old + delta))
+  if is_post then return old end
+  return old + delta
+end
+
 -- Apply a ${…} operator. `arg`/`arg2` are already word-expanded by the caller;
 -- `idxnum` is the evaluated numeric subscript when pe.index is an expression.
 function Shell:expand_param(pe, arg, arg2, idxnum)

@@ -1513,10 +1513,13 @@ local function arith_stmt_ok(e)
   local k = e.k
   if k == "comma" then return arith_stmt_ok(e.l) and arith_stmt_ok(e.r) end
   if k == "asgn" then
-    return not e.idx and not e.idxraw and not COMPILE_UNSAFE_VAR[e.name] and arith_value_ok(e.e)
+    -- element WRITE target a[i]= : rt.arith_elem_write, gated on a compilable subscript.
+    if e.idxraw then return arith_elem_ok(e) and arith_value_ok(e.e) end
+    return not COMPILE_UNSAFE_VAR[e.name] and arith_value_ok(e.e)
   end
   if k == "post" or k == "pre" then
-    return not e.idx and not e.idxraw and not COMPILE_UNSAFE_VAR[e.name]
+    if e.idxraw then return arith_elem_ok(e) end -- ++a[i] / a[i]++ via rt.arith_elem_incr
+    return not COMPILE_UNSAFE_VAR[e.name]
   end
   return arith_value_ok(e)
 end
@@ -1530,6 +1533,22 @@ emit_arith_into = function(dst, e, lifted)
   local k = e.k
   if k == "comma" then -- l for its side effect, r for the result
     return emit_arith_into(dst, e.l, lifted) .. "; " .. emit_arith_into(dst, e.r, lifted)
+  end
+  -- ${..[i]} element WRITE target (gated by arith_stmt_ok via arith_elem_ok): resolve the key
+  -- once and store through rt.arith_elem_write/_incr; the operator arithmetic stays in emit_value
+  -- via a compute closure over the OLD element value (__o).
+  local function elem_args(ee)
+    return ("%q, %q, %s"):format(ee.name, ee.idxraw, emit_word(require("parser").parse_word(ee.idxraw), lifted))
+  end
+  if (k == "asgn" or k == "pre" or k == "post") and e.idxraw then
+    if k == "asgn" and e.op == "=" then -- a[i] = e: no read
+      return ("%s = rt.arith_elem_write(sh, %s, false, function() return %s end)")
+        :format(dst, elem_args(e), emit_value(e.e, lifted))
+    elseif k == "asgn" then -- a[i] OP= e: read old (__o), apply the binop, store
+      local newv = emit_value({ k = "bin", op = e.op:sub(1, #e.op - 1), l = { k = "raw", code = "__o" }, r = e.e }, lifted)
+      return ("%s = rt.arith_elem_write(sh, %s, true, function(__o) return %s end)"):format(dst, elem_args(e), newv)
+    end
+    return ("%s = rt.arith_elem_incr(sh, %s, %dLL, %s)"):format(dst, elem_args(e), e.d, tostring(k == "post"))
   end
   if k == "asgn" then
     local rhs
