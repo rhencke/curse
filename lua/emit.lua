@@ -2368,9 +2368,8 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
       -- word-split (export/declare/readonly/local/typeset), code/control-flow builtins
       -- (eval/source/./command/builtin/exit/return/break/continue). exec_stmt sets $_ to
       -- the last arg; replicate that. Prefix-env (`x=v cmd`) keeps interp's tempenv binding.
-      -- `wait` needs interp's job-control context; a REDIRECTED builtin needs exec_stmt's
-      -- flush-and-check-write-error handling (a builtin that writes to a full disk must
-      -- return non-zero) — both still delegate.
+      -- `wait` needs interp's job-control context, so it still delegates. A REDIRECTED builtin
+      -- IS compiled below (install redirs, run, flush-before-restore, honor a flagged write error).
       local EXEC_SIMPLE_SKIP = { export = 1, declare = 1, readonly = 1, ["local"] = 1,
         typeset = 1, eval = 1, source = 1, ["."] = 1, command = 1, builtin = 1,
         exit = 1, ["return"] = 1, ["break"] = 1, ["continue"] = 1, exec = 1, wait = 1 }
@@ -2440,7 +2439,7 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
           return p
         end
       end
-      if cmd and st.assigns == nil and not redir_apply and not NATIVE_BUILTIN[cmd] and not isfunc
+      if cmd and st.assigns == nil and not NATIVE_BUILTIN[cmd] and not isfunc
           and (not EXEC_SIMPLE_SKIP[cmd] or decl_native) and require("interp").BUILTINS[cmd] then
         local builder = field_argv(st.words, 1, lifted, "rt.cstr(%s)") -- argv entries are C strings (cut at NUL, like interp's expand_args)
         if builder then
@@ -2448,8 +2447,18 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
           local ec = errchk(st); local ecs = ec ~= "" and ("; " .. ec) or ""
           local d = dbg(st) -- DEBUG fires before the command and its expansions
           local lastarg = "if #__a > 0 then sh:set_str('_', __a[#__a]) end" -- $_ = last arg (bash)
-          blocks[p] = d .. builder .. "; rt.builtin(sh, __a, __noop); " .. lastarg .. ecs ..
-            ("; pc = %d"):format(after)
+          if redir_apply then
+            -- a REDIRECTED builtin (`printf x > f`, `read v < f`, `type ls > f`): install the
+            -- redirs, run it (its output/input now on the target fd), then io.flush BEFORE
+            -- restoring — buffered output must reach the target fd, not the restored one
+            -- (interp flushes here too). A write error the builtin flagged (full disk) is
+            -- status 1, like bash's sh_chkwrite.
+            blocks[p] = d .. builder .. ("; do local __rs = {}; if %s then sh.write_err = nil; rt.builtin(sh, __a, __noop); io.flush() else sh.status = 1 end; rt.redir_restore(__rs); if sh.write_err then sh.status = 1 end end; %s%s; pc = %d")
+              :format(redir_apply, lastarg, ecs, after)
+          else
+            blocks[p] = d .. builder .. "; rt.builtin(sh, __a, __noop); " .. lastarg .. ecs ..
+              ("; pc = %d"):format(after)
+          end
           return p
         end
       end
