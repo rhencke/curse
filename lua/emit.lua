@@ -999,7 +999,20 @@ local function pexp_word_args_ok(pe)
   return wok(pe.arg) and wok(pe.arg2)
 end
 function pexp_compilable(pe)
-  if pe.index or pe.via_indirect then return false end -- array subscript / ${!ref} indirection
+  if pe.via_indirect then return false end -- ${!ref} indirection (its own path)
+  if pe.index then
+    -- ${name[sub]} : a BARE scalar element read (op=nil) compiles via rt.array_elem, which
+    -- resolves the subscript (assoc word / indexed arith) and reads through Shell:expand_param.
+    -- The whole-array @/* forms and ANY operator on the element (${a[i]:-d}, ${a[i]#p}, ${#a[i]})
+    -- still delegate; a cmdsub/procsub subscript delegates too (its arith-vs-word double path
+    -- would evaluate the side effect twice).
+    if pe.op ~= nil or pe.index == "@" or pe.index == "*" then return false end
+    if type(pe.name) ~= "string" or not pe.name:match("^[%a_][%w_]*$") or COMPILE_UNSAFE_VAR[pe.name] then return false end
+    local ok, sw = pcall(require("parser").parse_word, pe.index)
+    if not (ok and emitable_word(sw)) then return false end
+    for _, p in ipairs(sw.parts) do if p.cmdsub or p.procsub then return false end end
+    return true
+  end
   local name = pe.name
   if type(name) ~= "string" or not name:match("^[%a_][%w_]*$") or COMPILE_UNSAFE_VAR[name] then return false end
   if pe.op == "len" then return true end -- ${#x}: scalar codepoint length via apply_str_op("len")
@@ -1064,6 +1077,12 @@ local function array_multi_op(pe)
 end
 -- Lua expr for a compilable pexp's scalar string value (assumes pexp_compilable).
 function pexp_scalar(pe, lifted)
+  if pe.index then -- ${name[sub]} bare element read (op=nil, gated by pexp_compilable)
+    -- Pass BOTH the raw subscript (arith-evaluated for an indexed array) and its word-expanded
+    -- form (the assoc key); rt.array_elem picks per the array's type, matching interp's array_key.
+    local expanded = emit_word(require("parser").parse_word(pe.index), lifted)
+    return ("rt.array_elem(sh, %q, %q, %s)"):format(pe.name, pe.index, expanded)
+  end
   local val = lifted[pe.name] and ("rt.i64_to_str(%s)"):format(lname(pe.name))
     or ("sh:get_u(%q)"):format(pe.name) -- get_u: an unset var trips set -u, like bash
   if pe.op == "len" then return ("tostring(rt.mb_strlen(%s))"):format(val) end -- ${#x}: codepoint length
