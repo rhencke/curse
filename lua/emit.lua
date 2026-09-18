@@ -2878,9 +2878,14 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
       -- runs the body as a BOUNDED sub-CFG that _exits at its end (so it never runs
       -- the top-level continuation); the parent waits. The body's loops get their
       -- own loopPc entries, so a forked child that started in interp can OSR into
-      -- the RIGHT place (its own fragment), honoring interp/bg-compile/OSR. Redirs
-      -- on the subshell delegate for now.
-      if st.redirs then return delegate(st, after) end
+      -- the RIGHT place (its own fragment), honoring interp/bg-compile/OSR.
+      -- Redirs on the subshell apply in the CHILD (they belong to the fork and die with
+      -- it — no restore), so compile them when the shapes are compilable; else delegate.
+      local sub_redir = nil
+      if st.redirs then
+        sub_redir = redir_conds(st, nil)
+        if not sub_redir then return delegate(st, after) end
+      end
       -- A body that toggles options with `set` (e.g. `set -e` mid-body) needs the
       -- interpreter's per-command semantics, which the straight-line sub-CFG can't
       -- reproduce — delegate the whole subshell (interp forks + enforces it).
@@ -2906,8 +2911,15 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
       -- The forked child sets sh._ff = the subshell's exit pc, so a lineabort raised in the
       -- body (div0, failglob, an invalid-indirect, …) exits the SUBSHELL (subshell_exit ->
       -- _exit) instead of fast-forwarding into the PARENT's continuation and re-running it.
-      blocks[p] = ("if sh.opt_e then pc = %d else local __pid = rt.subshell_fork(sh); if __pid == 0 then sh._ff = %d; pc = %d else sh.status = rt.subshell_wait(__pid)%s; pc = %d end end")
-        :format(delpc, exitpc, bodyentry, ecs, after)
+      -- With redirs, the child installs them first (no restore — it _exits), then runs the
+      -- body REGARDLESS of the result: interp's subshell child applies the redirs and ignores
+      -- whether they succeeded (a failed subshell redirect does not abort the body there), so
+      -- match that — the redir expression runs for its side effect, its boolean discarded.
+      local child = sub_redir
+        and ("sh._ff = %d; local __rs = {}; local _ = %s; pc = %d"):format(exitpc, sub_redir, bodyentry)
+        or ("sh._ff = %d; pc = %d"):format(exitpc, bodyentry)
+      blocks[p] = ("if sh.opt_e then pc = %d else local __pid = rt.subshell_fork(sh); if __pid == 0 then %s else sh.status = rt.subshell_wait(__pid)%s; pc = %d end end")
+        :format(delpc, child, ecs, after)
       return p
     elseif t == "group" then
       -- { list; }: not a subshell — just a sequence in the current shell. Flatten the
