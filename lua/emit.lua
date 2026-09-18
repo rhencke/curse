@@ -2075,7 +2075,15 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
       local w = P.parse_word(r.word or ""); if not emitable_word(w) then return nil end
       return ("rt.redir_apply(sh, %q, %d, (%s .. \"\\n\"), __rs)"):format(op, fd, emit_word(w, lifted))
     elseif op == "heredoc" then
-      if r.expand then return nil end -- an expanding body needs the word engine — later
+      if r.expand then
+        -- an UNquoted-delimiter heredoc (<<EOF) expands its body like a double-quoted string
+        -- ($var/$(cmd)/arith, no split/glob): parse it in heredoc mode and render with emit_word,
+        -- exactly interp's expand_word(parse_heredoc(body, true)). A part emit_word can't render
+        -- (procsub/nameref/$LINENO/…) fails emitable_word -> delegate.
+        local ok, w = pcall(P.parse_heredoc, r.body or "", true)
+        if not (ok and emitable_word(w)) then return nil end
+        return ("rt.redir_apply(sh, %q, %d, %s, __rs)"):format(op, fd, emit_word(w, lifted))
+      end
       return ("rt.redir_apply(sh, %q, %d, %q, __rs)"):format(op, fd, r.body or "")
     end
     return nil
