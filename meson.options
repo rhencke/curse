@@ -1,0 +1,8 @@
+option('pgo', type: 'boolean', value: false,
+  description: 'Build LuaJIT with 3-stage profile-guided optimization. Slower to build (instrument -> train -> rebuild); use for release/shippable binaries.')
+
+option('native', type: 'boolean', value: true,
+  description: 'Compile LuaJIT with -march=native. Disable for portable binaries that must run on other CPUs.')
+
+option('conformance', type: 'feature', value: 'enabled',
+  description: 'Fetch the bash + oil conformance corpora (Meson subprojects) and register the bash/oil conformance tests. enabled (default): required — a fetch failure is a hard error, not a silent skip. disabled: skip the fetch for a lean/offline build. auto: best-effort (non-fatal if offline).')

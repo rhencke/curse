@@ -1,0 +1,12 @@
+[wrap-file]
+# GNU bash's own test suite, from the canonical release tarball (checksummed).
+# Pinned to 5.2.21 to match the host oracle bash; bump both together. The tarball
+# ships tests/*.tests + *.right; the harness runs the *.tests under each shell.
+# (ftpmirror redirects to a mirror; the bytes are identical across mirrors, so the
+# hash is stable. Use https://ftp.gnu.org/gnu/bash/ if a mirror misbehaves.)
+directory = bash-5.2.21
+source_url = https://ftpmirror.gnu.org/bash/bash-5.2.21.tar.gz
+source_filename = bash-5.2.21.tar.gz
+source_hash = c8e31bdc59b69aaffc5b36509905ba3e5cbb12747091d27b4b977f078560d5b8
+# Overlay adds a source-only meson.build so this is a valid subproject.
+patch_directory = bash-5.2.21

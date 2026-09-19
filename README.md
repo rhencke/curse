@@ -59,30 +59,32 @@ See [`lua/README.md`](lua/README.md) for the full tiered-execution write-up.
 
 ## The custom LuaJIT
 
-curse runs on stock LuaJIT plus a small, tracked patch set in
-[`patches/luajit/`](patches/luajit/), pinned to a specific upstream commit
-([`LUAJIT_COMMIT`](patches/luajit/LUAJIT_COMMIT)). The build clones pristine
-upstream at that commit and applies:
+curse runs on stock LuaJIT plus a small, tracked patch set. Meson pins LuaJIT to
+an exact upstream commit ([`subprojects/luajit.wrap`](subprojects/luajit.wrap))
+and, at `meson setup`, applies curse's C-mods from
+[`subprojects/packagefiles/luajit/`](subprojects/packagefiles/luajit/):
 
-- **[`curse.patch`](patches/luajit/curse.patch)** — patches `luajit.c` and the JIT
-  core. It adds three things:
+- **[`curse.patch`](subprojects/packagefiles/luajit/curse.patch)** — patches `luajit.c`
+  and the JIT core. It adds three things:
   - an **optionally-embedded bytecode bundle** (`curse_load_bundle`): the runtime
     modules are baked into the binary as a weak-linked C array, so `require()`
     resolves them from memory with no file open and no source parse;
   - **shell-name dispatch**: when the binary is invoked under a shell name
-    (`sh`/`bash`/`dash`/… or a login `-name`) with the bundle embedded, the whole
-    argv is routed to curse's sh CLI ([`lua/run.lua`](lua/run.lua)) — making the
-    self-contained static binary a **drop-in `/bin/sh`**;
+    (`sh`/`bash`/`dash`/`ash`/`rbash`, or a login `-name`) with the bundle
+    embedded, the whole argv is routed to curse's sh CLI
+    ([`lua/run.lua`](lua/run.lua)) — so a `sh` symlink to the static binary is a
+    **drop-in `/bin/sh`**. (Invoked as `curse` itself it stays plain luajit, for
+    dev / bytecode / build use.)
   - **destructive JIT-loop preemption** (`-DCURSE_SIG_DESTRUCTIVE`): on a signal,
     a running JIT loop's back-edge is overwritten with a jump to the exit stub and
     restored the instant it exits — so signals and `trap` are delivered even inside
     hot compiled loops, at **zero steady-state cost** (the hot loop stays
     byte-identical to stock LuaJIT).
-- **[`lib_cursesys.c`](patches/luajit/lib_cursesys.c)** — a direct-syscall system
-  library (e.g. reads `/etc/passwd` itself, so the static binary needs no glibc NSS
-  / `dlopen`).
-- **[`lib_cursesig.c`](patches/luajit/lib_cursesig.c)** — the async signal handler
-  that schedules the VM hook running the shell's trap.
+- **[`lib_cursesys.c`](subprojects/packagefiles/luajit/src/lib_cursesys.c)** — a
+  direct-syscall system library (e.g. reads `/etc/passwd` itself, so the static
+  binary needs no glibc NSS / `dlopen`).
+- **[`lib_cursesig.c`](subprojects/packagefiles/luajit/src/lib_cursesig.c)** — the
+  async signal handler that schedules the VM hook running the shell's trap.
 
 ## The daemon
 
@@ -102,43 +104,47 @@ Full design, wire protocol, and current limits: [`daemon/README.md`](daemon/READ
 
 ## Build
 
-You need a C toolchain (`cc`, `make`, `ar`), `git`, GNU `readline` (for the
-interactive REPL), and network access for the one-time LuaJIT clone. A bootstrap
-`luajit` is needed to compile the bundle.
+Needs [Meson](https://mesonbuild.com) + [Ninja](https://ninja-build.org), a C
+toolchain (`cc`, `make`, `ar`), `git`, GNU `readline` (for the interactive REPL),
+and network access for the one-time LuaJIT clone.
 
 ```sh
-scripts/build-luajit.sh          # (--no-pgo to skip profile-guided opt, --fresh to re-clone)
+meson setup build
+meson compile -C build     # -Dpgo=true    for the PGO release build (instrument -> train -> rebuild)
+                           # -Dnative=false for portable binaries (no -march=native)
 ```
 
-This clones the pinned LuaJIT, applies the curse patches, builds with
-`-O3 -march=native` + PGO, and produces (all under the gitignored `.bench-lua/`):
+Meson pins + fetches LuaJIT, applies curse's C-mods, drives LuaJIT's own Makefile
+via [`tools/build-luajit-vm.sh`](tools/build-luajit-vm.sh), then bundles the Lua
+runtime ([`lua/build.lua`](lua/build.lua), run on the just-built luajit) and links
+everything. Outputs land in `build/`:
 
-- **`.bench-lua/luajit`** — dynamic; loads `dist/curse.bc` from disk. Used by the
-  daemon, the spec harness, and dev.
-- **`.bench-lua/curse`** — fully static, with the module bundle **embedded**.
-  Self-contained (no `dist/` or `lua/` dir needed) — the shippable one-shot binary
-  and drop-in `/bin/sh`.
+- **`build/luajit`** — dynamic; loads `dist/curse.bc` from disk. For the daemon,
+  the spec harness, and dev.
+- **`build/curse`** — fully static, module bundle **embedded**. Self-contained
+  (no `dist/` or `lua/` needed) — the shippable one-shot binary; symlink `sh` → it
+  for a drop-in `/bin/sh`.
+- **`build/curse-client`** — the tiny static daemon front end.
 
-[`lua/build.lua`](lua/build.lua) produces the bundle itself
-(`dist/curse.bc` bytecode + `dist/curse_bundle.c` for embedding).
+`meson test -C build` runs the unit + conformance suites (see **Tests** below); the bash/oil
+conformance corpora are fetched at setup as subprojects. `ninja -C build fetch-real`
+downloads the real-world diff-test scripts.
 
 ## Run
 
 ```sh
-# One-shot, self-contained static binary:
-.bench-lua/curse -c 'echo hi; echo $((2 + 3))'
+# Self-contained static binary — it's the shell when invoked as `sh` (symlink it):
+ln -s "$PWD/build/curse" /tmp/sh && /tmp/sh -c 'echo hi; echo $((2 + 3))'
 
-# Or drive the CLI directly on any luajit (picks up dist/curse.bc if present):
-luajit lua/run.lua script.sh                 # run a script
-luajit lua/run.lua -c 'for ((i=0;i<3;i++)); do echo $i; done'
-luajit lua/run.lua script.sh interp          # force a tier: interp | compiled | tiered (default)
-luajit lua/run.lua -i                         # interactive REPL (readline)
+# Or drive the CLI directly on the dynamic luajit (picks up dist/curse.bc if present):
+build/luajit lua/run.lua script.sh              # run a script
+build/luajit lua/run.lua -c 'for ((i=0;i<3;i++)); do echo $i; done'
+build/luajit lua/run.lua script.sh interp       # force a tier: interp | compiled | tiered (default)
+build/luajit lua/run.lua -i                      # interactive REPL (readline)
 
-# Resident daemon + client:
-cc -O2 -s -static -o dist/curse daemon/curse-client.c
-luajit lua/build.lua                          # -> dist/curse.bc
-CURSE_IDLE=300 luajit lua/daemon.lua &        # self-exits after 300s idle
-./dist/curse -c 'echo hi'                      # client talks to the daemon
+# Resident daemon + client (full setup in daemon/README.md):
+CURSE_BUNDLE=build/curse.bc build/luajit lua/daemon.lua &   # self-exits on idle ($CURSE_IDLE)
+build/curse-client -c 'echo hi'                 # client talks to the daemon
 ```
 
 Leading shell options (`-e`, `-u`, `-x`, `-o NAME`, `-O NAME`, `--rcfile`,
@@ -146,19 +152,44 @@ Leading shell options (`-e`, `-u`, `-x`, `-o NAME`, `-O NAME`, `--rcfile`,
 
 ## Tests
 
-- **[`test/cases/`](test/cases/)** — curse's own conformance corpus: small bash
-  scripts, each checked against **real bash**'s output and exit status (bash is the
-  oracle).
-- **Oils spec suite** — [`lua/spec.lua`](lua/spec.lua) runs the
-  [Oils](https://oils.pub) spec tests as a progress scoreboard:
-  ```sh
-  test/spec/fetch.sh                  # download Oils' spec/*.test.sh into reference/oil/ (gitignored)
-  luajit lua/spec.lua --interp        # or --compiled / --cached; [--diff] [--divergence] [file-substr…]
-  ```
-- **[`test/real/`](test/real/)** — end-to-end real-world scripts (e.g. `diff.sh`,
-  `fetch.sh`).
-- **Unit tests** — targeted Lua tests run directly, e.g. `luajit lua/test_tier.lua`
-  (also `test_nested`, `test_funcs`, `test_forin`, `test_cache`).
+`meson test -C build --suite unit` runs the fast tiered-execution suites (`test_tier`,
+`test_nested`, `test_funcs`, `test_forin`, `test_cache`) on the built luajit.
+
+**Conformance harness** — [`test/conformance/run.sh`](test/conformance/run.sh)
+runs each test under **bash** (the oracle), **dash** (where it supports the test),
+and curse's three tiers (**interp / compiled / tiered**), scoring each shell's
+agreement with bash on stdout + exit status **and its summed run time** (bash vs
+dash vs curse's tiers). Parallelism is bounded (`--jobs`, default gentle — each
+tier spawns work; use `--jobs 1` for clean timing). Three corpora:
+
+- **`cases`** — [`test/cases/`](test/cases/), curse's own scripts (no download).
+- **`bash`** — GNU bash's own `tests/*.tests` suite.
+- **`oil`** — the [Oils](https://oils.pub) `spec/*.test.sh` cases that target bash
+  (bash listed in `compare_shells`, minus oil-only / `N-I bash` cases).
+
+The `bash` and `oil` corpora are **Meson subprojects** — bash from the GNU release
+tarball + `source_hash` ([`subprojects/bash.wrap`](subprojects/bash.wrap), pinned
+to match the host oracle), oil from a pinned git commit
+([`subprojects/oil.wrap`](subprojects/oil.wrap), since no Oils release tarball
+ships the spec tests). Meson fetches them **at setup** (required by default — a
+fetch failure is a hard error, not a silent skip) and finds the shells it needs
+(`bash`, `dash`, `timeout`), so the whole suite just runs — no flags, nothing to prep:
+
+```sh
+meson setup build          # fetches bash (tarball) + oil (git) corpora; checks bash/dash/timeout
+meson compile -C build
+meson test -C build                 # unit + conformance (cases + bash + oil)
+meson test -C build --suite unit    # just the fast unit tests
+meson test -C build --suite conformance -v    # just the conformance scoreboards
+```
+
+`-Dconformance=disabled` skips the corpus fetch (lean/offline build); `=auto` makes
+it best-effort (non-fatal offline). For a tight loop, run the harness directly:
+`test/conformance/run.sh --corpus oil --jobs 4 arith`.
+
+- **[`test/real/`](test/real/)** — end-to-end real-world scripts under `docker diff`
+  ([`diff.sh`](test/real/diff.sh)). **[`lua/spec.lua`](lua/spec.lua)** — the older
+  single-tier Oils runner, scored against the recorded golden files.
 
 ## Layout
 
@@ -173,17 +204,19 @@ lua/              the shell
   runtime.lua       the shared `sh` state (scope chain, expansion, int64 arithmetic)
   cache.lua         persistent content-hashed compiled-artifact cache
   daemon.lua        the resident per-user server (cursed)
-  build.lua         amalgamate modules -> dist/curse.bc (+ curse_bundle.c)
+  build.lua         amalgamate modules -> curse.bc (+ curse_bundle.c)
   b_*.lua           builtins (cd, export, read, trap, printf, getopts, jobs, …)
-patches/luajit/   the custom LuaJIT patch + C libs (see above)
 daemon/           curse-client.c (the tiny static front end) + design doc
-scripts/          build-luajit.sh (reproducible LuaJIT build recipe)
+subprojects/      Meson deps: LuaJIT (luajit.wrap + curse's C-mods in packagefiles/)
+                    and the conformance corpora (bash.wrap tarball, oil.wrap git)
+tools/            build-luajit-vm.sh (Meson-driven VM build), run-lua.sh
+meson.build       the build: fetch LuaJIT -> patched VM -> bundle -> curse + client
 test/
-  cases/            conformance scripts (vs real bash)
-  spec/             Oils spec-test fetch + runner glue
-  real/             real-world end-to-end scripts
+  cases/            curse's own conformance scripts (vs real bash)
+  conformance/      run.sh — the bash/dash/curse×3 harness
+  real/             real-world end-to-end scripts (docker diff)
 reference/        upstream bash + Oils sources (gitignored) — porting + test source
-dist/             build output (gitignored): curse.bc, curse_bundle.c
+build/            Meson build dir (gitignored): luajit, curse, curse-client, curse.bc
 ```
 
 ## Status

@@ -1,0 +1,11 @@
+[wrap-git]
+# Oils spec tests. NO Oils release tarball ships the spec suite — every family on
+# oils.pub/download is a build distribution without spec/*.test.sh (verified oil,
+# oils-for-unix, and oils-ref at 0.38.0). The spec tests live only in the git dev
+# tree, so this is a pinned-commit git subproject rather than a tarball. The commit
+# SHA (the 0.38.0 tag) is cryptographically verified by git — reproducible, no hash
+# file needed.
+url = https://github.com/oilshell/oil
+revision = 08310e96b182cf1d2dd65161e07b1743d17f8936
+# Overlay adds a source-only meson.build so this is a valid subproject.
+patch_directory = oil

@@ -1,0 +1,19 @@
+[wrap-git]
+url = https://github.com/LuaJIT/LuaJIT.git
+# Pinned to the exact upstream commit curse's patch set targets. No `depth` --
+# an arbitrary SHA can't be shallow-fetched.
+revision = c6ffc141a8762b41703f9287d63d93622a13dd8f
+# Meson prepares the source at setup time, entirely from packagefiles/luajit/:
+#   patch_directory  overlays the NEW files -- the subproject meson.build (so
+#                    this is a valid source-only subproject) and curse's two
+#                    added C libs (src/lib_cursesys.c, src/lib_cursesig.c).
+#   diff_files       applies curse's modifications to LuaJIT's own files. It's
+#                    applied to LuaJIT's own git checkout (its .git, not curse's
+#                    parent repo), so it lands correctly.
+# Both paths are relative to subprojects/packagefiles/. curse.patch lives inside
+# the overlay dir to keep everything LuaJIT-specific together; Meson copies the
+# whole overlay tree, so the patch also lands as a stray subprojects/luajit/
+# curse.patch -- inert, and tools/build-luajit-vm.sh excludes it from the build
+# tree alongside the overlay meson.build.
+patch_directory = luajit
+diff_files = luajit/curse.patch

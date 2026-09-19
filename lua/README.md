@@ -96,7 +96,8 @@ between the caller and the function (which therefore can't be lifted).
 
 ## Running
 
-Needs a `luajit` binary. curse ships a patched one (`scripts/build-luajit.sh`),
-but stock upstream LuaJIT runs these tests from source too. Then:
+Build the patched luajit with Meson (`meson setup build && meson compile -C
+build`, see the top-level README), then run the tiered-execution suites:
 
-    luajit lua/test_tier.lua
+    meson test -C build            # all of them
+    build/luajit lua/test_tier.lua # or one directly (stock upstream luajit works too)

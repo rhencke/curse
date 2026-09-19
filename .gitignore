@@ -3,6 +3,11 @@
 # Specific files we port/vendor are attributed in NOTICE.md.
 /reference/
 
+# Meson build dir + fetched subprojects (packagefiles/ + *.wrap stay tracked).
+/build/
+/subprojects/*/
+!/subprojects/packagefiles/
+
 # Build / scratch output
 /dist/
 /.curse-out/
