@@ -90,6 +90,80 @@ function M.run(src, opts)
 	error(err)
 end
 
+-- Run a PRE-COMPILED module tiered: interpret (instant start), then OSR into `mod`
+-- at the first safepoint past `switch_after` (default 0 -> the first one). Same
+-- structure as run_background (the interp self-handles exit; only the OSR->compiled
+-- part runs under finish_run, for exit-status + EXIT trap) but with the module
+-- already built -- for the daemon cold path, which caches `mod` and needs no
+-- detached transpile.
+function M.run_mod(mod, sh, src, switch_after)
+	switch_after = switch_after or 0
+	local count, resume = 0, nil
+	local hook = function(kind, id)
+		count = count + 1
+		if sh.traps and (sh.traps.DEBUG or sh.traps.RETURN) then
+			return
+		end
+		if resume ~= nil or sh.calldepth ~= 0 or count <= switch_after then
+			return
+		end
+		local pc = resume_pc(mod, { kind = kind, id = id })
+		if pc ~= nil then
+			resume = { kind = kind, id = id }
+			error({
+				__curse_switch = true,
+				osr = function()
+					M.run_compiled(mod, sh, pc)
+				end,
+			})
+		end
+	end
+	local ok, err = pcall(I.run_lazy, sh, src, hook)
+	if ok then
+		return sh, "interp-only"
+	end
+	if type(err) == "table" and err.__curse_switch then
+		I.finish_run(sh, function()
+			M.run_compiled(mod, sh, resume_pc(mod, resume))
+		end)
+		return sh, "cold"
+	end
+	error(err)
+end
+
+-- Daemon cold/hot execution. A warm cache hit loads the dumped bytecode and runs it
+-- compiled ("warm"); a miss emits + STORES the bytecode (so the next run is a hit)
+-- and runs TIERED (interp, then OSR fall-over into the compiled module) -- "cold".
+-- If the emitter can't handle the script, fall back to the interpreter. Mirrors
+-- cache.lua's M.run, but the cold path tiers instead of running compiled from pc=0.
+function M.run_tiered(src, sh)
+	local Cache = require("cache")
+	local path = Cache.artifact_path(src)
+	local mod = Cache.load(path)
+	if mod then
+		I.finish_run(sh, function()
+			M.run_compiled(mod, sh, nil)
+		end)
+		return sh, "warm"
+	end
+	local ok, code = pcall(function()
+		return E.emit(P.parse(src))
+	end)
+	if ok then
+		local chunk = load(code, "=curse:compiled")
+		if chunk then
+			local built, m = pcall(chunk)
+			if built and type(m) == "table" and m.run then
+				local okd, bc = pcall(string.dump, chunk, true)
+				Cache.store(path, okd and bc or code) -- populate for the next (warm) run
+				return M.run_mod(m, sh, src, 0) -- interp -> OSR fall-over
+			end
+		end
+	end
+	I.run(sh, P.parse(src)) -- fallback: always correct
+	return sh, "interp"
+end
+
 -- The real thing: transpile in a DETACHED process while interpreting, switch the
 -- instant the compiled Lua lands (works mid-loop, any nesting).
 function M.run_background(script_path, opts)

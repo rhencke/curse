@@ -33,7 +33,8 @@ end
 
 local ffi = require("ffi")
 local rt = require("runtime") -- also cdefs waitpid, close, read, environ, pipe
-local Cache = require("cache")
+local Tier = require("tier") -- cold requests tier (interp -> OSR + cache); warm ones load .bc
+require("cache") -- for its open/flock/mkdir ffi cdefs (serve()'s instance lock uses C.open/C.flock)
 
 -- Only NEW symbols here (runtime.lua already declared waitpid/close/read/environ/pipe).
 ffi.cdef([[
@@ -194,13 +195,13 @@ local function serve_request(cfd, req, fds, ctx)
 	local ok = pcall(function()
 		local kind, payload = dispatch(sh, req.args)
 		if kind == "code" then
-			Cache.run(payload, sh)
+			Tier.run_tiered(payload, sh)
 		else
 			local f = io.open(payload, "r")
 			if f then
 				local s = f:read("*a")
 				f:close()
-				Cache.run(s, sh)
+				Tier.run_tiered(s, sh)
 			else
 				io.stderr:write("curse: cannot open " .. payload .. "\n")
 				sh.status = 127
