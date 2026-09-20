@@ -97,7 +97,7 @@ fi
 
 # ------------------------------- driver --------------------------------------
 CORPUS=all; JOBS="${JOBS:-}"; H_TIMEOUT="${TIMEOUT:-10}"; VERBOSE=0
-SHELLS_SEL=""; FILTERS=(); BASH_DIR=""; OIL_DIR=""
+SHELLS_SEL=""; FILTERS=(); BASH_DIR=""; OIL_DIR=""; RESULTS=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --corpus)   CORPUS="$2"; shift 2 ;;
@@ -106,6 +106,7 @@ while [ $# -gt 0 ]; do
     --shells)   SHELLS_SEL="$2"; shift 2 ;;
     --bash-dir) BASH_DIR="$2"; shift 2 ;;   # bash suite tests/ dir (Meson subproject)
     --oil-dir)  OIL_DIR="$2"; shift 2 ;;    # oil spec/ dir (Meson subproject)
+    --results)  RESULTS="$2"; shift 2 ;;    # keep the raw per-test rows (corpus\tshell\tverdict\tduration_us\ttestid)
     -v|--verbose) VERBOSE=1; shift ;;
     -h|--help) sed -n '2,30p' "$0"; exit 0 ;;
     --) shift; while [ $# -gt 0 ]; do FILTERS+=("$1"); shift; done ;;
@@ -254,6 +255,7 @@ seq 1 "$total" | xargs -P "$JOBS" -I{} "$0" --run-unit "$workdir" {}
 # ------------------------------ scoreboard -----------------------------------
 echo
 cat "$workdir"/res/*.tsv > "$workdir/all.tsv" 2>/dev/null
+[ -n "$RESULTS" ] && cp "$workdir/all.tsv" "$RESULTS" 2>/dev/null   # preserve raw per-test rows for analysis
 awk -F'\t' '
   { seen_corpus[$1]=1; seen_shell[$2]=1; dur[$1,$2]+=$4
     if($3!="ORACLE"){tot[$1,$2]++; c[$1,$2,$3]++} else {oracle[$1]++} }

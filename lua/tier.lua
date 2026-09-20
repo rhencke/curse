@@ -136,11 +136,43 @@ end
 -- and runs TIERED (interp, then OSR fall-over into the compiled module) -- "cold".
 -- If the emitter can't handle the script, fall back to the interpreter. Mirrors
 -- cache.lua's M.run, but the cold path tiers instead of running compiled from pc=0.
+-- In-process module cache for a resident worker (daemon). Keyed by artifact path
+-- (which embeds the content hash + build stamp), it holds the ALREADY-INSTANTIATED
+-- module so a repeat script skips both the disk loadfile AND the module rebuild
+-- (running the generated chunk to define its closures + pc tables). A module is
+-- reusable across runs: all per-run state lives in `sh`, never in the module
+-- (verified — repeated run_compiled on one mod yields identical results). Bounded
+-- by a generational flip (keep the last full generation as a fallback, so a flush
+-- never fully cold-starts a hot workload) to cap memory in a long-lived daemon.
+local modcache, modcache_old, modcache_n = {}, {}, 0
+local MODCACHE_CAP = 1024
+local function modcache_get(path)
+	local m = modcache[path]
+	if m then return m end
+	m = modcache_old[path]
+	if m then modcache[path] = m; return m end -- promote survivor into the new generation
+	return nil
+end
+local function modcache_put(path, m)
+	if modcache_n >= MODCACHE_CAP then modcache_old, modcache, modcache_n = modcache, {}, 0 end
+	modcache[path] = m; modcache_n = modcache_n + 1
+end
+
 function M.run_tiered(src, sh)
 	local Cache = require("cache")
 	local path = Cache.artifact_path(src)
+	if path then
+		local cached = modcache_get(path)
+		if cached then -- in-process hit: no disk read, no module rebuild
+			I.finish_run(sh, function()
+				M.run_compiled(cached, sh, nil)
+			end)
+			return sh, "warm-mem"
+		end
+	end
 	local mod = Cache.load(path)
 	if mod then
+		if path then modcache_put(path, mod) end -- memoize the instantiated module
 		I.finish_run(sh, function()
 			M.run_compiled(mod, sh, nil)
 		end)
@@ -156,6 +188,7 @@ function M.run_tiered(src, sh)
 			if built and type(m) == "table" and m.run then
 				local okd, bc = pcall(string.dump, chunk, true)
 				Cache.store(path, okd and bc or code) -- populate for the next (warm) run
+				if path then modcache_put(path, m) end -- and keep it in-process for this worker
 				return M.run_mod(m, sh, src, 0) -- interp -> OSR fall-over
 			end
 		end
