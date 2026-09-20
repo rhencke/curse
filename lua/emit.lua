@@ -86,6 +86,29 @@ end
 -- assign_scalar can't. When present, delegate scalar assigns so those work. Rare, so
 -- the native fast assign is kept for every ordinary program.
 EF.has_nameref = false
+EF.has_dyncode = false -- program runs eval/source/. → $(…) bodies can't assume names are externals
+-- Does the program run eval / source / . anywhere? If so a command NAME that looks
+-- external at compile time could actually be a runtime-defined shell function that
+-- mutates state — so a $(…) whose body calls it must FORK for isolation. Absent any
+-- dynamic code, a literal non-builtin non-funcdef name is provably an external
+-- (a separate process, cannot touch the parent shell), so its $(…) can run in-process.
+local function makes_dyncode(st)
+	if st.t ~= "simple" or not st.words[1] then
+		return false
+	end
+	local c = st.words[1].parts[1] and #st.words[1].parts == 1 and st.words[1].parts[1].lit
+	return c == "eval" or c == "source" or c == "."
+end
+local function scan_dyncode(stmts)
+	for _, st in ipairs(stmts or {}) do
+		if makes_dyncode(st) then return true end
+		if st.body and scan_dyncode(st.body) then return true end
+		if st.clauses then for _, cl in ipairs(st.clauses) do if scan_dyncode(cl.body) then return true end end end
+		if st.cmds and scan_dyncode(st.cmds) then return true end
+		if st.items then for _, it in ipairs(st.items) do if it.cmd and scan_dyncode({ it.cmd }) then return true end end end
+	end
+	return false
+end
 local function makes_nameref(st)
 	if st.t ~= "simple" or not st.words[1] then
 		return false
@@ -1235,6 +1258,38 @@ local function lifted_flush(lifted)
 	return #f > 0 and (table.concat(f, "; ") .. "; ") or ""
 end
 
+-- Command substitutions that never mutate escaping shell state (no var assignment,
+-- cd, set/shopt, unset, trap, read, exec, function def, …) can run IN-PROCESS
+-- (capture_inproc) instead of forking a whole warm-worker child — forking the fat
+-- LuaJIT heap is the dominant cost of $(…)-heavy scripts. Safe iff the program has
+-- no eval/source (else a literal name could be a runtime mutating function) AND every
+-- body statement is a simple command whose literal name is a KNOWN-PURE builtin or a
+-- plain EXTERNAL (a separate process — cannot touch the parent shell). Anything else
+-- (a non-pure builtin, a function, a dynamic/compound/assigning body) keeps forking.
+-- Missing a builtin from the pure set only costs a fork (never correctness).
+local PURE_BUILTIN_CMDSUB = { echo = 1, printf = 1, ["true"] = 1, ["false"] = 1,
+	[":"] = 1, pwd = 1, test = 1, ["["] = 1, exit = 1 }
+local function cmdsub_nofork_ok(stmts)
+	if EF.has_dyncode or #stmts == 0 then return false end
+	local BUILTINS = require("interp").BUILTINS
+	local ff = (emit_frag_ctx and emit_frag_ctx.funcflags) or {}
+	for _, st in ipairs(stmts) do
+		if st.t ~= "simple" then return false end
+		if st.assigns then return false end -- prefix env / assignment prefix mutates
+		local w1 = st.words and st.words[1]
+		local c = w1 and w1.parts[1] and #w1.parts == 1 and w1.parts[1].lit
+		if not c then return false end -- no/dynamic command word (or assignment-only line)
+		if ff[c] then return false end -- a shell function may mutate the parent shell
+		if not (PURE_BUILTIN_CMDSUB[c] or not BUILTINS[c]) then return false end -- a non-pure builtin
+		if c == "printf" then
+			for j = 2, #st.words do
+				local p1 = st.words[j].parts[1]
+				if p1 and p1.lit == "-v" then return false end -- printf -v NAME writes a variable
+			end
+		end
+	end
+	return true
+end
 local function compile_cmdsub(src, backtick, lifted)
 	local fallback = ("sh:capture_src(%q%s)"):format(src, backtick and ", true" or "")
 	local pok, ast = pcall(require("parser").parse, src)
@@ -1272,7 +1327,9 @@ local function compile_cmdsub(src, backtick, lifted)
 	if not id then
 		return fallback
 	end -- compiler gap (curse-nocompile): to be closed upstream
-	local call = ("sh:capture_compiled(cs_%d, true, %s)"):format(id, backtick and "true" or "false")
+	-- A pure body runs in-process (no fork); anything that can mutate escaping state forks.
+	local mustfork = not cmdsub_nofork_ok(ast.stmts)
+	local call = ("sh:capture_compiled(cs_%d, %s, %s)"):format(id, tostring(mustfork), backtick and "true" or "false")
 	local flush = lifted_flush(lifted)
 	if flush ~= "" then
 		return ("(function() %s return %s end)()"):format(flush, call)
@@ -5102,6 +5159,7 @@ function M.emit(ast)
 		error("curse-nocompile: alias expansion needs line-at-a-time parse")
 	end
 	EF.has_attr = scan_attr(ast.stmts) -- gate compiled attribute-aware scalar assign
+	EF.has_dyncode = scan_dyncode(ast.stmts) -- eval/source present → a $(…) can't assume its body's names are externals
 	EF.has_nameref = scan_nameref(ast.stmts) -- declare -n present → delegate scalar assigns
 	EF.has_err = scan_trap(ast.stmts, { ERR = 1 }) -- gate compiled ERR-trap firing
 	EF.has_debug = scan_trap(ast.stmts, { DEBUG = 1 }) -- gate compiled DEBUG-trap firing
