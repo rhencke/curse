@@ -2864,6 +2864,27 @@ end
 local function substr(val, off, len)
 	-- ${v:off:len} slices by CHARACTER (codepoint) in the locale, like bash — offset
 	-- and length count codepoints, not bytes (byte-equivalent under LC_ALL=C).
+	-- ASCII/single-byte fast path: codepoint == byte, so slice directly with the same
+	-- offset/length math — no mb_chars char-table.
+	if lc_mb_cur_max <= 1 then
+		local n = #val
+		local o = tonumber(off) or 0
+		if o < 0 then
+			o = n + o
+		end
+		if o < 0 then
+			o = 0
+		end
+		local last = n
+		if len and len ~= "" then
+			local l = tonumber(len) or 0
+			last = (l < 0) and (n + l) or (o + l)
+		end
+		if last > n then
+			last = n
+		end
+		return val:sub(o + 1, last)
+	end
 	local chars = M.mb_chars(val)
 	local n = #chars
 	local o = tonumber(off) or 0
@@ -4560,6 +4581,20 @@ local function fold_case(val, pat, upper, all)
 	-- so skip the per-char glob_match — it would regcomp once per character (ruinous
 	-- in a loop). Only a real pattern (`${x^[a-z]}`) needs the match test.
 	local any = (pat == "?")
+	-- ASCII/single-byte fast path: with the default `?` (fold every char) in a
+	-- single-byte locale, folding is exactly string.upper/lower (Lua's toupper/tolower
+	-- is the same locale-aware per-byte fold) — no mb_chars char-table, no per-char
+	-- loop, no allocation. This is the common `${x^^}`/`${x,,}` case.
+	if lc_mb_cur_max <= 1 and any then
+		local f = upper and string.upper or string.lower
+		if all then
+			return f(val)
+		end
+		if val == "" then
+			return val
+		end
+		return f(val:sub(1, 1)) .. val:sub(2)
+	end
 	-- Fold per CHARACTER (codepoint) using the locale's towupper/towlower, exactly
 	-- as bash does — so `${x^^}` upcases μ→Μ under a UTF-8 locale, Turkish i→İ under
 	-- tr_TR, etc. A bad byte (wc == nil) is left as-is.
