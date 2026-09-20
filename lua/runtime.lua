@@ -2639,7 +2639,10 @@ end
 -- The naive strip below tries every split point × a regcomp each, which is O(n)
 -- regex compiles per call — ruinous in a loop (`${p##*/}`), so this handles the
 -- overwhelmingly common patterns (literal, `*/`, `.*`, `*.c`, `foo*`) directly.
-local function simple_glob(glob)
+-- Classify a glob into a fast-path shape: "" (literal, no star) or "*" (single
+-- star: prefix "*" suffix), else nil (needs the general regex matcher). Pure
+-- function of `glob` — same pattern always yields the same shape.
+local function simple_glob_uncached(glob)
 	if glob:find("[%?%[%]\\]") then
 		return nil
 	end -- ?, [ ], backslash-escape
@@ -2658,6 +2661,30 @@ local function simple_glob(glob)
 		return nil
 	end
 	return "*", pre, post
+end
+-- Memoize the shape classification. simple_glob runs on EVERY ${x#pat}/${x%pat},
+-- ${x//a/b}, and `case … in pat)` — including in loops with a constant pattern —
+-- and re-parsing that constant each call was ~1/4 of curse's compute-path CPU
+-- (profiled). Cache keyed by the pattern string (pure fn), bounded by a flush so a
+-- long-lived daemon can't grow it without bound (distinct literal patterns are few).
+local _glob_cache, _glob_n = {}, 0
+local GLOB_NOFAST = {} -- sentinel: this pattern is NOT a fast-path glob
+local function simple_glob(glob)
+	local c = _glob_cache[glob]
+	if c == nil then
+		local k, pre, post = simple_glob_uncached(glob)
+		c = k ~= nil and { k, pre, post } or GLOB_NOFAST
+		if _glob_n >= 1024 then
+			_glob_cache = {}
+			_glob_n = 0
+		end
+		_glob_cache[glob] = c
+		_glob_n = _glob_n + 1
+	end
+	if c == GLOB_NOFAST then
+		return nil
+	end
+	return c[1], c[2], c[3]
 end
 local function fast_strip(val, glob, prefix, longest)
 	local kind, pre, post = simple_glob(glob)
