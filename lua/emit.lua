@@ -3608,10 +3608,16 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
 				arith_varread = "rt.arith_read(sh, %q)"
 				local rhs = emit_value(st.arith, lifted)
 				arith_varread = saved
-				blocks[p] = d .. emit_set(st.name, rhs, lifted) .. ua .. ("; pc = %d"):format(after)
+				blocks[p] = d .. emit_set(st.name, rhs, lifted) .. "; sh.status = 0" .. ua .. ("; pc = %d"):format(after) -- pure arith (side-effecting delegates): $? = 0
 			elseif lifted[st.name] then
+				-- a lifted RHS is a numeric literal (never a cmdsub), so $? resets to 0 like any
+				-- plain assignment (`false; x=1; echo $?` -> 0) — the set_str path does this via st0.
+				local ec = errchk(st)
+				local ecs = ec ~= "" and ("; " .. ec) or ""
 				blocks[p] = d
 					.. emit_set(st.name, numeric_word(st.rhs) .. "LL", lifted)
+					.. "; sh.status = 0"
+					.. ecs
 					.. ua
 					.. ("; pc = %d"):format(after)
 			elseif EF.has_attr or EF.has_nameref then -- readonly / array[0] / -i,-l,-u / nameref write-through
