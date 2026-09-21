@@ -2933,7 +2933,145 @@ local function printf_conv(full, conv, arg)
 end
 -- The full printf engine. `argv[start..]` are the data args; the format is reused
 -- until they're exhausted. Returns (output, status).
+-- printf format parse, MEMOIZED by format string (pure function of `fmt`). Backslash
+-- escapes are static, so they fold into literal-string tokens; each %-conversion becomes a
+-- {conv/strftime, spec, width|dynw, prec|dynp} token. The executor (sh_printf) then walks the
+-- cached token list instead of re-scanning the format every call — the common `printf FMT …`
+-- in a loop re-uses the same FMT. Bounded by a flush so a long-lived daemon can't grow it.
+local _pf_cache, _pf_n = {}, 0
+local function printf_parse(fmt)
+	local toks, lit = {}, {}
+	local function flush()
+		if lit[1] then
+			toks[#toks + 1] = table.concat(lit)
+			lit = {}
+		end
+	end
+	local i, n = 1, #fmt
+	while i <= n do
+		local c = fmt:sub(i, i)
+		if c == "\\" then -- format-level backslash escapes -> static literal chars
+			local d = fmt:sub(i + 1, i + 1)
+			if d == "n" then
+				lit[#lit + 1] = "\n"
+				i = i + 2
+			elseif d == "t" then
+				lit[#lit + 1] = "\t"
+				i = i + 2
+			elseif d == "r" then
+				lit[#lit + 1] = "\r"
+				i = i + 2
+			elseif d == "\\" then
+				lit[#lit + 1] = "\\"
+				i = i + 2
+			elseif d == "a" then
+				lit[#lit + 1] = "\7"
+				i = i + 2
+			elseif d == "b" then
+				lit[#lit + 1] = "\8"
+				i = i + 2
+			elseif d == "f" then
+				lit[#lit + 1] = "\12"
+				i = i + 2
+			elseif d == "v" then
+				lit[#lit + 1] = "\11"
+				i = i + 2
+			elseif d == "x" then
+				local h = fmt:match("^%x%x?", i + 2)
+				if h then
+					lit[#lit + 1] = string.char(tonumber(h, 16))
+					i = i + 2 + #h
+				else
+					lit[#lit + 1] = "\\"
+					i = i + 1
+				end
+			elseif d == "u" or d == "U" then
+				local h = fmt:match(d == "u" and "^%x%x?%x?%x?" or "^%x%x?%x?%x?%x?%x?%x?%x?", i + 2)
+				if h then
+					lit[#lit + 1] = rt.utf8_char(tonumber(h, 16))
+					i = i + 2 + #h
+				else
+					lit[#lit + 1] = "\\"
+					i = i + 1
+				end
+			elseif d:match("[0-7]") then
+				local o = fmt:match("^[0-7][0-7]?[0-7]?", i + 1)
+				lit[#lit + 1] = string.char(tonumber(o, 8) % 256)
+				i = i + 1 + #o
+			else
+				lit[#lit + 1] = "\\"
+				i = i + 1
+			end
+		elseif c == "%" then
+			local j = i + 1
+			if fmt:sub(j, j) == "%" then
+				lit[#lit + 1] = "%"
+				i = j + 1
+			else
+				flush()
+				local spec = "%"
+				while fmt:sub(j, j):match("[-+ #0]") do
+					spec = spec .. fmt:sub(j, j)
+					j = j + 1
+				end
+				local width, dynw = "", false
+				if fmt:sub(j, j) == "*" then
+					dynw = true
+					j = j + 1
+				else
+					while fmt:sub(j, j):match("%d") do
+						width = width .. fmt:sub(j, j)
+						j = j + 1
+					end
+				end
+				local prec, dynp = nil, false
+				if fmt:sub(j, j) == "." then
+					j = j + 1
+					prec = ""
+					if fmt:sub(j, j) == "*" then
+						dynp = true
+						j = j + 1
+					else
+						while fmt:sub(j, j):match("%d") do
+							prec = prec .. fmt:sub(j, j)
+							j = j + 1
+						end
+					end
+				end
+				while fmt:sub(j, j):match("[lhLjzt]") do
+					j = j + 1
+				end
+				if fmt:sub(j, j) == "(" then -- %(FORMAT)T strftime
+					local close = fmt:find(")", j + 1, true)
+					local tfmt = fmt:sub(j + 1, (close or j + 1) - 1)
+					j = (close or j) + 1
+					toks[#toks + 1] =
+						{ strftime = true, spec = spec, width = width, dynw = dynw, prec = prec, dynp = dynp, tfmt = tfmt }
+					i = j + 1
+				else
+					toks[#toks + 1] =
+						{ conv = fmt:sub(j, j), spec = spec, width = width, dynw = dynw, prec = prec, dynp = dynp }
+					i = j + 1
+				end
+			end
+		else
+			lit[#lit + 1] = c
+			i = i + 1
+		end
+	end
+	flush()
+	return toks
+end
 local function sh_printf(fmt, argv, start)
+	local toks = _pf_cache[fmt]
+	if not toks then
+		toks = printf_parse(fmt)
+		if _pf_n >= 512 then
+			_pf_cache, _pf_n = {}, 0
+		end
+		_pf_cache[fmt] = toks
+		_pf_n = _pf_n + 1
+	end
 	local out, status, ai = {}, 0, start
 	local nargs = #argv
 	local function nextarg()
@@ -2945,154 +3083,60 @@ local function sh_printf(fmt, argv, start)
 	end
 	repeat
 		local pass_start = ai
-		local i, n = 1, #fmt
-		while i <= n do
-			local c = fmt:sub(i, i)
-			if c == "\\" then -- format-level backslash escapes (\n \t \\ \ooo \xHH …)
-				local d = fmt:sub(i + 1, i + 1)
-				if d == "n" then
-					out[#out + 1] = "\n"
-					i = i + 2
-				elseif d == "t" then
-					out[#out + 1] = "\t"
-					i = i + 2
-				elseif d == "r" then
-					out[#out + 1] = "\r"
-					i = i + 2
-				elseif d == "\\" then
-					out[#out + 1] = "\\"
-					i = i + 2
-				elseif d == "a" then
-					out[#out + 1] = "\7"
-					i = i + 2
-				elseif d == "b" then
-					out[#out + 1] = "\8"
-					i = i + 2
-				elseif d == "f" then
-					out[#out + 1] = "\12"
-					i = i + 2
-				elseif d == "v" then
-					out[#out + 1] = "\11"
-					i = i + 2
-				elseif d == "x" then
-					local h = fmt:match("^%x%x?", i + 2)
-					if h then
-						out[#out + 1] = string.char(tonumber(h, 16))
-						i = i + 2 + #h
-					else
-						out[#out + 1] = "\\"
-						i = i + 1
-					end
-				elseif d == "u" or d == "U" then -- \uHHHH / \UHHHHHHHH code point -> UTF-8
-					local h = fmt:match(d == "u" and "^%x%x?%x?%x?" or "^%x%x?%x?%x?%x?%x?%x?%x?", i + 2)
-					if h then
-						out[#out + 1] = rt.utf8_char(tonumber(h, 16))
-						i = i + 2 + #h
-					else
-						out[#out + 1] = "\\"
-						i = i + 1
-					end
-				elseif d:match("[0-7]") then
-					local o = fmt:match("^[0-7][0-7]?[0-7]?", i + 1)
-					out[#out + 1] = string.char(tonumber(o, 8) % 256)
-					i = i + 1 + #o
-				else
-					out[#out + 1] = "\\"
-					i = i + 1
-				end
-			elseif c == "%" then
-				local j = i + 1
-				if fmt:sub(j, j) == "%" then
-					out[#out + 1] = "%"
-					i = j + 1
-				else
-					local spec = "%"
-					while fmt:sub(j, j):match("[-+ #0]") do
-						spec = spec .. fmt:sub(j, j)
-						j = j + 1
-					end
-					local width = ""
-					if fmt:sub(j, j) == "*" then
-						local w = tonumber((printf_int(nextarg())))
-						width = tostring(math.floor(w))
-						j = j + 1
-					else
-						while fmt:sub(j, j):match("%d") do
-							width = width .. fmt:sub(j, j)
-							j = j + 1
-						end
-					end
-					local prec = nil
-					if fmt:sub(j, j) == "." then
-						j = j + 1
-						prec = ""
-						if fmt:sub(j, j) == "*" then
-							local p = tonumber((printf_int(nextarg())))
-							prec = tostring(math.floor(p))
-							j = j + 1
-						else
-							while fmt:sub(j, j):match("%d") do
-								prec = prec .. fmt:sub(j, j)
-								j = j + 1
-							end
-						end
-					end
-					while fmt:sub(j, j):match("[lhLjzt]") do
-						j = j + 1
-					end -- length mods (ignored)
-					if fmt:sub(j, j) == "(" then -- %(FORMAT)T strftime
-						local close = fmt:find(")", j + 1, true)
-						local tfmt = fmt:sub(j + 1, (close or j + 1) - 1)
-						j = (close or j) + 1 -- now at 'T'
-						local arg = nextarg()
-						local epoch = (arg == "" or arg == "-1") and os.time() or (tonumber(arg) or os.time())
-						local sres = os.date(tfmt, epoch) or ""
-						-- bash formats into a fixed 128-byte buffer; a result that doesn't fit
-						-- yields the empty string (see spec's strftime-truncation case).
-						if #sres >= 128 then
-							sres = ""
-						end
-						if prec then
-							sres = sres:sub(1, tonumber(prec))
-						end
-						out[#out + 1] = string.format("%" .. (spec:sub(2)) .. width .. "s", sres)
-						i = j + 1
-					else
-						local conv = fmt:sub(j, j)
-						local full = spec .. width .. (prec and ("." .. prec) or "")
-						if conv == "s" then
-							out[#out + 1] = string.format(
-								(spec:gsub("0", "", 1)) .. width .. (prec and ("." .. prec) or "") .. "s",
-								nextarg()
-							)
-						elseif conv == "c" then -- first char of the (string) argument
-							out[#out + 1] = string.format("%" .. spec:sub(2) .. width .. "s", nextarg():sub(1, 1))
-						elseif conv == "b" then
-							local bs, bstop = rt.ansi_unescape(nextarg(), "b") -- %b: \NNN & \0NNN; \c stops ALL output
-							out[#out + 1] = string.format("%" .. spec:sub(2) .. width .. "s", bs)
-							if bstop then
-								return table.concat(out), status
-							end
-						elseif conv == "q" then
-							local s = printf_q(nextarg())
-							out[#out + 1] = width ~= "" and string.format("%" .. spec:sub(2) .. width .. "s", s) or s
-						else
-							local r, ok = printf_conv(full, conv, nextarg())
-							if not ok then
-								status = 1
-							end
-							if r == nil then
-								io.stderr:write("curse: printf: `" .. conv .. "': invalid conversion specification\n")
-								status = 1
-							end
-							out[#out + 1] = r or ""
-						end
-						i = j + 1
-					end
-				end
+		for t = 1, #toks do
+			local tk = toks[t]
+			if type(tk) == "string" then -- literal chunk
+				out[#out + 1] = tk
 			else
-				out[#out + 1] = c
-				i = i + 1
+				local spec, width, prec = tk.spec, tk.width, tk.prec
+				if tk.dynw then
+					width = tostring(math.floor(tonumber((printf_int(nextarg())))))
+				end
+				if tk.dynp then
+					prec = tostring(math.floor(tonumber((printf_int(nextarg())))))
+				end
+				if tk.strftime then
+					local arg = nextarg()
+					local epoch = (arg == "" or arg == "-1") and os.time() or (tonumber(arg) or os.time())
+					local sres = os.date(tk.tfmt, epoch) or ""
+					if #sres >= 128 then
+						sres = ""
+					end
+					if prec then
+						sres = sres:sub(1, tonumber(prec))
+					end
+					out[#out + 1] = string.format("%" .. spec:sub(2) .. width .. "s", sres)
+				else
+					local conv = tk.conv
+					local full = spec .. width .. (prec and ("." .. prec) or "")
+					if conv == "s" then
+						out[#out + 1] = string.format(
+							(spec:gsub("0", "", 1)) .. width .. (prec and ("." .. prec) or "") .. "s",
+							nextarg()
+						)
+					elseif conv == "c" then
+						out[#out + 1] = string.format("%" .. spec:sub(2) .. width .. "s", nextarg():sub(1, 1))
+					elseif conv == "b" then
+						local bs, bstop = rt.ansi_unescape(nextarg(), "b")
+						out[#out + 1] = string.format("%" .. spec:sub(2) .. width .. "s", bs)
+						if bstop then
+							return table.concat(out), status
+						end
+					elseif conv == "q" then
+						local s = printf_q(nextarg())
+						out[#out + 1] = width ~= "" and string.format("%" .. spec:sub(2) .. width .. "s", s) or s
+					else
+						local r, ok = printf_conv(full, conv, nextarg())
+						if not ok then
+							status = 1
+						end
+						if r == nil then
+							io.stderr:write("curse: printf: `" .. conv .. "': invalid conversion specification\n")
+							status = 1
+						end
+						out[#out + 1] = r or ""
+					end
+				end
 			end
 		end
 	until ai > nargs or ai == pass_start
