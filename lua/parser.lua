@@ -1170,6 +1170,36 @@ function M.parse_heredoc(body, is_body)
 	return { k = "word", parts = parts }
 end
 
+-- The default/alternate word of a ${x-word} / ${x:-word} / … that sits INSIDE DOUBLE
+-- QUOTES follows double-quoted rules: single quotes are literal, a backslash is kept
+-- except before $ ` " \ (and \} -> a literal }, \<newline> is a line continuation), and
+-- a syntactic inner " is dropped (`"${x:-"a b"}"` -> `a b`). Shared by the interpreter's
+-- pexp default expansion and the compiled tier so both render such a default identically.
+function M.parse_default_quoted(txt)
+	local out, k, m = {}, 1, #txt
+	while k <= m do
+		local ch = txt:sub(k, k)
+		if ch == "\\" then
+			local nx2 = txt:sub(k + 1, k + 1)
+			if nx2 == "\n" then
+				k = k + 2 -- backslash-newline: line continuation (removed)
+			elseif nx2 == "}" then
+				out[#out + 1] = "}"
+				k = k + 2 -- \} in a ${…} word is a literal }
+			else
+				out[#out + 1] = txt:sub(k, k + 1)
+				k = k + 2
+			end
+		elseif ch == '"' then
+			k = k + 1 -- drop the syntactic inner quote
+		else
+			out[#out + 1] = ch
+			k = k + 1
+		end
+	end
+	return M.parse_heredoc(table.concat(out))
+end
+
 -- Parse a [[ … ]] token list into a boolean-expression AST:
 --   {kind="and"/"or", l, r} | {kind="not", e} | {kind="str", word}
 --   {kind="unary", op, word} | {kind="binary", op, l, r, rq}

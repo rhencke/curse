@@ -1143,28 +1143,7 @@ local function expand_part_str(sh, p, assign)
 			if not p.q then
 				return P.parse_word(txt)
 			end
-			local out, k, m = {}, 1, #txt
-			while k <= m do
-				local ch = txt:sub(k, k)
-				if ch == "\\" then
-					local nx2 = txt:sub(k + 1, k + 1)
-					if nx2 == "\n" then
-						k = k + 2 -- backslash-newline: line continuation (removed)
-					elseif nx2 == "}" then
-						out[#out + 1] = "}"
-						k = k + 2 -- \} in a ${…} word is a literal }
-					else
-						out[#out + 1] = txt:sub(k, k + 1)
-						k = k + 2
-					end
-				elseif ch == '"' then
-					k = k + 1 -- drop the syntactic inner quote
-				else
-					out[#out + 1] = ch
-					k = k + 1
-				end
-			end
-			return P.parse_heredoc(table.concat(out))
+			return P.parse_default_quoted(txt)
 		end
 		local arg
 		if TESTOP[pe.op] then

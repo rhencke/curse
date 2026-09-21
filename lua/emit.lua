@@ -785,7 +785,7 @@ local function emitable_word(w)
 		if EF.has_nameref and p.pexp then
 			return false
 		end
-		if p.pexp and not pexp_compilable(p.pexp) then
+		if p.pexp and not pexp_compilable(p.pexp, p.q) then
 			return false
 		end
 		if p.procsub then
@@ -1402,7 +1402,7 @@ emit_word = function(w, lifted)
 		elseif p.cmdsub then -- $( … ): COMPILE the inner (known at compile time) and run it captured
 			parts[#parts + 1] = compile_cmdsub(p.cmdsub, p.backtick, lifted)
 		elseif p.pexp then
-			if not pexp_compilable(p.pexp) then
+			if not pexp_compilable(p.pexp, p.q) then
 				error("curse-nocompile: ${..} operator")
 			end -- interp handles it
 			parts[#parts + 1] = pexp_scalar(p.pexp, lifted)
@@ -1632,7 +1632,7 @@ local function strop_pat_ok(pe)
 	end
 	return emit_pattern_glob(pe.arg or "", {}) ~= nil and pexp_literal_arg(pe.arg2)
 end
-function pexp_compilable(pe)
+function pexp_compilable(pe, quoted)
 	if pe.via_indirect then
 		return false
 	end -- ${!ref} indirection (its own path)
@@ -1693,15 +1693,15 @@ function pexp_compilable(pe)
 	end -- ${x@Q}/@U/@L/@E … (not @P/@a)
 	if PEXP_DEFAULT[pe.op] then
 		-- default/alternate/assign/error: compile when the default word is emit_word-able. The
-		-- default is lazy (Lua short-circuit). Only a QUOTED context reaches pexp_scalar
-		-- (field_word rejects an unquoted one — its field-wise default splitting needs the interp
-		-- word engine). The default word's tilde (word- vs assign-context), backslash escapes,
-		-- and inner quoting (`"${x:-'c d'}"`) differ from emit_word — reject those chars so only
-		-- a plain / $var / $(…) default (where emit_word matches interp's word expansion) compiles.
-		if pe.arg and pe.arg:find("[~\\'\"]") then
+		-- default is lazy (Lua short-circuit). A QUOTED ${x:-word} default follows double-quoted
+		-- rules — parse_default_quoted renders its ~ \ ' " exactly as interp's pw does — so admit
+		-- those chars there. An UNQUOTED default with ~ \ ' " would field-split differently, so
+		-- keep delegating it (quoted false, or a conservative caller that passes no context).
+		local P = require("parser")
+		if not quoted and pe.arg and pe.arg:find("[~\\'\"]") then
 			return false
 		end
-		local ok, w = pcall(require("parser").parse_word, pe.arg or "")
+		local ok, w = pcall(quoted and P.parse_default_quoted or P.parse_word, pe.arg or "")
 		return ok and emitable_word(w) or false
 	end
 	if pe.op == "sub" then
@@ -1824,7 +1824,12 @@ function pexp_scalar(pe, lifted)
 		-- exempt); the default word is expanded lazily via Lua short-circuit (a side-effecting
 		-- $(…) default runs only when its branch is taken). - / + test set-ness, :- / :+ test
 		-- non-emptiness.
-		local def = emit_word(require("parser").parse_word(pe.arg or ""), lifted)
+		-- A default with ~ \ ' " only reaches here in a QUOTED context (pexp_compilable gates
+		-- the unquoted one out), where it follows double-quoted rules — parse it as interp's pw
+		-- does. A plain / $var / $(…) default is identical either way, so keep parse_word for it.
+		local P = require("parser")
+		local dparse = (pe.arg and pe.arg:find("[~\\'\"]")) and P.parse_default_quoted or P.parse_word
+		local def = emit_word(dparse(pe.arg or ""), lifted)
 		local getv = lifted[pe.name] and ("rt.i64_to_str(%s)"):format(lname(pe.name)) or ("sh:get(%q)"):format(pe.name)
 		if pe.op == ":-" then
 			return ('(function() local __d = %s; return __d ~= "" and __d or %s end)()'):format(getv, def)
