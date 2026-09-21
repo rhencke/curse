@@ -4152,6 +4152,71 @@ function M.assign_element(sh, name, raw, expanded, value, append)
 	sh:set_str("_", "") -- a bare assignment resets $_ (bash); status stays the RHS's (emit set 0 first)
 end
 
+-- Shared readonly guard for the compiled element-assign paths (assign_element_i / _x). Returns
+-- true if the assignment must be ABORTED (name is readonly) — the caller then returns; raises for
+-- the fatal (posix / -c / non-prefix) cases exactly like assign_element.
+local function elem_readonly_abort(sh, name)
+	local rb = sh.vars[sh:deref(name)]
+	if not (rb and rb.ro) then
+		return false
+	end
+	io.stderr:write("curse: " .. name .. ": readonly variable\n")
+	sh.status = 1
+	if sh.opt_c or sh.opt_posix then
+		error({ __curse_exit = 1 })
+	end
+	if sh.applying_prefix then
+		return true
+	end
+	error({ __curse_exit = 1, __curse_lineabort = true })
+end
+-- INDEXED element assign with the key ALREADY arith-evaluated NATIVELY by the compiled tier
+-- (from lifted locals, so a loop variable is CURRENT — arith_str(sh, raw) would read the stale
+-- sh.vars copy). `keyi` is the int64 arith value; only reached for a non-assoc array (the emitter
+-- gates on is_assoc). Bug fixed: `a[i]=…` in a `for ((;;))` loop with a lifted `i`.
+function M.assign_element_i(sh, name, keyi, value, append)
+	if elem_readonly_abort(sh, name) then
+		return
+	end
+	if not sh:array_set(name, to_arr_key(keyi), value, append) then
+		io.stderr:write("curse: " .. name .. ": bad array subscript\n")
+		sh.status = 1
+		sh.assign_err = true
+		return
+	end
+	sh:set_str("_", "")
+end
+-- Element assign whose subscript is a WORD EXPANSION (`a[$i]=…`): `src` is the ALREADY
+-- word-expanded subscript value (built by emit_word, so it reads lifted locals). An assoc uses
+-- it verbatim as the key; an indexed array arith-evaluates it (with the same error handling as
+-- assign_element) — arith'ing the VALUE, not the raw `$i`, so a lifted loop var is current.
+function M.assign_element_x(sh, name, src, value, append)
+	if elem_readonly_abort(sh, name) then
+		return
+	end
+	local key
+	if sh:is_assoc(name) then
+		key = src
+	elseif src:match("^%s*$") then
+		key = 0
+	else
+		local ok, v = pcall(M.arith_str, sh, src)
+		if not ok then
+			io.stderr:write("curse: " .. src .. ": syntax error in expression\n")
+			sh.status = 1
+			return
+		end
+		key = to_arr_key(v)
+	end
+	if not sh:array_set(name, key, value, append) then
+		io.stderr:write("curse: " .. name .. ": bad array subscript\n")
+		sh.status = 1
+		sh.assign_err = true
+		return
+	end
+	sh:set_str("_", "")
+end
+
 -- Resolve a subscript to its array KEY for the compiled tier, exactly like assign_element /
 -- interp's array_key: an ASSOC uses the word-expanded subscript (`expanded`, built by emit_word
 -- for the caller); an INDEXED array arith-evaluates the RAW subscript (empty -> 0). A subscript

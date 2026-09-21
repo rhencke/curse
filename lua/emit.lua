@@ -2494,6 +2494,27 @@ local function arith_can_error(e, lifted)
 		or arith_can_error(e.b, lifted)
 end
 
+-- Decide how the compiled tier computes an INDEXED element-assign subscript key. Hung on EF so
+-- build_cfg (at the 60-upvalue cap) needs NO new upvalue. Returns (mode, keystr):
+--   "native"+emit_value : bare arith subscript reading lifted locals (fixes a[i]= in a lifted-var
+--       loop); only for a NON-assoc array (caller gates on is_assoc). Gated to lifted/error-free.
+--   "xexp"  : the subscript word EXPANDS ($i) -> expand natively then arith the VALUE.
+--   "raw"   : literal non-arith (a[\'3\']) / non-lifted var -> the raw arith_str path (correct
+--       when sh.vars is authoritative; also preserves a bash quote syntax error).
+EF.elem_keyexpr = function(st, iw, lifted)
+	local ia = safe_arith(st.index)
+	if arith_value_ok(ia) and not arith_side_effect(ia) and not not_compilable(ia)
+		and not arith_reads_unsafe(ia) and not arith_can_error(ia, lifted) then
+		return "native", emit_value(ia, lifted)
+	end
+	for _, pp in ipairs(iw.parts) do
+		if pp.var or pp.pexp or pp.param or pp.special or pp.arith or pp.arithast then
+			return "xexp"
+		end
+	end
+	return "raw"
+end
+
 -- Can this arith raise a THROWN error (as opposed to a flagged read fault)? Only
 -- ÷0 / mod-0 / negative ** do — via rt.idiv/imod/ipow. Those need a pcall to catch;
 -- everything else (non-lifted reads) records sh.arithfault without throwing, so the
@@ -3544,16 +3565,26 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
 				-- subscript/RHS overwrites it), then the element assign; assign_element leaves status.
 				local ec = errchk(st)
 				local ecs = ec ~= "" and ("; " .. ec) or ""
-				blocks[p] = d
-					.. ("sh.status = 0; rt.assign_element(sh, %q, %q, %s, %s, %s)%s; pc = %d"):format(
-						st.name,
-						st.index,
-						emit_word(iw, lifted),
-						rhsval(),
-						tostring(st.append and true or false),
-						ecs,
-						after
-					)
+				local append = tostring(st.append and true or false)
+				local expw = emit_word(iw, lifted)
+				-- Compute the INDEXED subscript key from lifted locals (arith_str(sh, raw) reads the STALE
+				-- sh.vars copy, so `a[i]=…` in a `for ((;;))` loop mis-keyed every write). Decision hung on
+				-- EF.elem_keyexpr so build_cfg (at the 60-upvalue cap) takes no new upvalue.
+				local kmode, kstr = EF.elem_keyexpr(st, iw, lifted)
+				if kmode == "native" then -- a[i]/a[i+1]/a[3]: native key (reads lifted); assoc uses the raw subscript
+					blocks[p] = d
+						.. ("sh.status = 0; if sh:is_assoc(%q) then rt.assign_element(sh, %q, %q, %s, %s, %s) else rt.assign_element_i(sh, %q, %s, %s, %s) end%s; pc = %d"):format(
+							st.name, st.name, st.index, expw, rhsval(), append,
+							st.name, kstr, rhsval(), append, ecs, after)
+				elseif kmode == "xexp" then -- a[$i]: arith the natively-expanded (lifted-aware) VALUE
+					blocks[p] = d
+						.. ("sh.status = 0; rt.assign_element_x(sh, %q, %s, %s, %s)%s; pc = %d"):format(
+							st.name, expw, rhsval(), append, ecs, after)
+				else -- literal non-arith (a[\'3\']) / non-lifted: the raw arith_str path (sh.vars authoritative)
+					blocks[p] = d
+						.. ("sh.status = 0; rt.assign_element(sh, %q, %q, %s, %s, %s)%s; pc = %d"):format(
+							st.name, st.index, expw, rhsval(), append, ecs, after)
+				end
 				return p
 			end
 			if st.append and not st.arith then -- scalar name+=value: rt.append_scalar picks concat /
