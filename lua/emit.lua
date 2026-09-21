@@ -4313,10 +4313,10 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
 				end
 				local si = #ei > 0 and (table.concat(ei, "; ") .. "; ") or ""
 				local so = #eo > 0 and ("; " .. table.concat(eo, "; ")) or ""
-				body = ("if sh.functions[%q] then %sI.exec_stmt(sh, %s, __noop)%s else sh:exec(%s) end"):format(
+				body = ("if sh.functions[%q] then %srt.call_dynamic_fn(sh, {%s})%s else sh:exec(%s) end"):format(
 					cmd,
 					si,
-					ser(st),
+					table.concat(allargs, ", "),
 					so,
 					table.concat(allargs, ", ")
 				)

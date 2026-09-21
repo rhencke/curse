@@ -4983,6 +4983,22 @@ function M.builtin(sh, argv, hook)
 	return require(BUILTIN_LAZY[cmd])(sh, cmd, argv, hook or _noop)
 end
 
+-- A command word that was NOT a funcdef at compile time but resolves, at RUNTIME, to a
+-- shell function (installed by eval/source or a nested def). The argv is already expanded
+-- by the compiled field engine; dispatch it through exec_simple, which finds the function
+-- and runs it via run_function — a COMPILED fn_x closure runs natively, an interp AST body
+-- (one that eval/source defined) runs through exec_list until that definition site itself
+-- compiles. No statement re-interpretation (no I.exec_stmt): only resolve+call is shared,
+-- the words are compiled. xtrace mirrors the delegated path so `set -x` doesn't regress;
+-- $_ / PIPESTATUS / errexit stay with the emitted wrapper around this call.
+function M.call_dynamic_fn(sh, argv)
+	local I = require("interp")
+	if sh.opt_x then
+		I.xtrace(sh, argv)
+	end
+	return I.exec_simple(sh, argv, _noop)
+end
+
 -- A DYNAMIC command word (`$cmd`/`${x}`/… — the first word resolves late, argv already
 -- built by the compiled field engine) dispatched through the command runner. The command
 -- is genuinely unknown at compile time (function / builtin / external), so resolution
