@@ -2194,7 +2194,10 @@ local function make_parser(src, sh)
 		end
 		i = q
 		ws()
-		local raw = word()
+		-- stop_paren: a redirect target is a metacharacter-terminated word, so `)` ends it
+		-- — `(cmd >&7)` / `(cmd >f)` must read `7`/`f` and leave `)` to close the subshell,
+		-- not swallow it into the target (which unbalanced the parse and dropped the pipe).
+		local raw = word(true)
 		-- a redirection with NO word (`echo >`, `cmd <;`) is a syntax error in bash
 		-- (status 2). A quoted empty target (`> ''`) is a real, empty filename — that's
 		-- a runtime failure, not a parse error — so key on the raw word being absent.
