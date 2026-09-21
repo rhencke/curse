@@ -3688,27 +3688,45 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
 			-- `local a=(…)` / `declare a=(…)`: the array value lives in st.arrayargs, which
 			-- the native builtin paths don't render — interp does the scope-aware array assign.
 			if st.arrayargs then
-				-- Native slice: a TOP-LEVEL `declare`/`typeset NAME=(…)` whose only flag is -a
-				-- or -A (or none). declare_assoc sets the assoc attribute; rt.arrayassign then
-				-- stores the elements by exactly interp's do_arrayassign logic (both key on
-				-- is_assoc), building the item values with the field engine — no exec_stmt. $_
-				-- becomes the target name (bash). Combos with -i/-r/-x/-n/-g, `local`/`readonly`/
-				-- `export`, multiple targets, a redirect, or a nameref program keep interp's fuller
-				-- declare handling (they still delegate below).
+				-- Native path: `declare`/`typeset`/`local NAME=(…)` whose flags are only -a/-A
+				-- (indexed/assoc) and/or -r (readonly). Reproduces interp's declare array branch
+				-- exactly: localVar for an in-function declaration (bash makes it local), then
+				-- declare_assoc for the assoc attribute, then rt.arrayassign for the store (both
+				-- key on is_assoc — the runtime twin of do_arrayassign), then readonly LAST. The
+				-- element values build with the field engine — no exec_stmt. $_ becomes the target
+				-- name (bash). Combos with -i/-x/-n/-g/-p/-l/-u, `export`/`readonly`, multiple
+				-- targets, a redirect, or a nameref program keep interp's fuller declare handling.
 				local aa = st.arrayargs
-				local flag = #st.words == 2
-					and st.words[2].parts[1]
-					and #st.words[2].parts == 1
-					and st.words[2].parts[1].lit
-				local flagok = (#st.words == 1) or (flag == "-a") or (flag == "-A")
+				local isassoc, isro, flagsok = false, false, true
+				for j = 2, #st.words do
+					local w = st.words[j]
+					local lit = #w.parts == 1 and w.parts[1].lit
+					if not (lit and #lit >= 2 and lit:sub(1, 1) == "-" and lit ~= "--") then
+						flagsok = false -- a bare name / value word / `--` / combined non-flag: delegate
+						break
+					end
+					for c in lit:sub(2):gmatch(".") do
+						if c == "A" then
+							isassoc = true
+						elseif c == "r" then
+							isro = true
+						elseif c ~= "a" then -- -a is the indexed default; any other letter -> delegate
+							flagsok = false
+						end
+					end
+					if not flagsok then
+						break
+					end
+				end
+				local as_local = (cmd == "local") or ((cmd == "declare" or cmd == "typeset") and not toplevel)
 				if
-					(cmd == "declare" or cmd == "typeset")
-					and toplevel
+					(cmd == "declare" or cmd == "typeset" or cmd == "local")
+					and not (cmd == "local" and toplevel) -- `local` outside a function is an error (interp)
 					and not st.assigns
 					and not redir_apply
 					and not EF.has_nameref
 					and #aa == 1
-					and flagok
+					and flagsok
 					and arrayassign_ok({ name = aa[1].name, append = aa[1].append, elems = aa[1].elems }, lifted)
 				then
 					local a1 = aa[1]
@@ -3726,15 +3744,21 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
 					end
 					local ec = errchk(st)
 					local ecs = ec ~= "" and ("; " .. ec) or ""
-					local assocpre = (flag == "-A") and ("sh:declare_assoc(%q); "):format(a1.name) or ""
+					local pre = as_local and ("sh:localVar(%q); "):format(a1.name) or ""
+					if isassoc then
+						pre = pre .. ("sh:declare_assoc(%q); "):format(a1.name)
+					end
+					local ro = isro and ("; sh:mark_readonly(%q)"):format(a1.name) or ""
 					blocks[p] = dbg(st)
 						.. "do "
-						.. assocpre
+						.. pre
 						.. table.concat(parts, "; ")
-						.. ("; rt.arrayassign(sh, %q, __it, %s) end"):format(
+						.. ("; rt.arrayassign(sh, %q, __it, %s)"):format(
 							a1.name,
 							tostring(a1.append and true or false)
 						)
+						.. ro
+						.. " end"
 						.. ('; sh:set_str("_", %q)'):format(a1.name)
 						.. ecs
 						.. ("; pc = %d"):format(after)

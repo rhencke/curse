@@ -2192,6 +2192,15 @@ function Shell:attr_string(name)
 	return s
 end
 
+-- Mark a variable readonly (declare -r / readonly, applied AFTER its value is assigned —
+-- a fresh `declare -r a=(…)` assigns, then locks). No-op if the name has no binding.
+function Shell:mark_readonly(name)
+	local b = self.vars[self:deref(name)]
+	if b then
+		b.ro = true
+	end
+end
+
 -- String value of a var (materialize from the cached int64 if needed).
 function Shell:get(name)
 	name = self:deref(name)
