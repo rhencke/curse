@@ -5011,6 +5011,35 @@ function M.call_dynamic_fn(sh, argv)
 	return I.exec_simple(sh, argv, _noop)
 end
 
+-- `eval CODE`: COMPILE the joined code string at runtime (fragment mode — its top-level
+-- return/break/continue/exit RAISE, so they cross back to this eval's delegated cf-wrapper)
+-- and run it in the CURRENT shell (shared sh: assignments, functions, $? all persist). No
+-- exec_stmt tree-walk. Code that can't compile — aliases (line-at-a-time expansion), a
+-- syntax error (run the valid prefix, then stop), or a construct emit still delegates —
+-- falls back to the interpreter's incremental eval (b_eval), which is the oracle for those.
+-- argv is the already-expanded command words {"eval", …}; run_compiled shares sh and does
+-- NOT finish_run (no EXIT trap), so signals propagate to the caller untouched.
+function M.eval(sh, argv)
+	local a2 = argv[2]
+	if a2 and a2 ~= "-" and a2 ~= "--" and a2:sub(1, 1) == "-" then
+		io.stderr:write("curse: eval: " .. a2 .. ": invalid option\n")
+		sh.status = 2
+		return
+	end
+	local start = (a2 == "--") and 3 or 2
+	local code = table.concat({ unpack(argv, start) }, " ")
+	if not code:match("%S") then
+		sh.status = 0
+		return
+	end
+	local mod = require("tier").try_fragment(code)
+	if mod then
+		require("tier").run_compiled(mod, sh, nil)
+	else
+		require("b_eval")(sh, "eval", argv, nil, nil)
+	end
+end
+
 -- A DYNAMIC command word (`$cmd`/`${x}`/… — the first word resolves late, argv already
 -- built by the compiled field engine) dispatched through the command runner. The command
 -- is genuinely unknown at compile time (function / builtin / external), so resolution

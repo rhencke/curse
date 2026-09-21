@@ -3400,7 +3400,14 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
 				local p = newpc()
 				local d = dbg(st) -- DEBUG fires before break/continue too (it's a command)
 				if #loopstack == 0 then
-					blocks[p] = d .. ("sh.status = 0; pc = %d"):format(after) -- no-op outside a loop
+					if EF.fragment and toplevel and #subexit == 0 then
+						-- eval/source fragment: break/continue with no enclosing loop IN the fragment
+						-- targets the CALLER's loop -- raise the signal (level) for the enclosing
+						-- delegated cf-wrapper, exactly as interp's break/continue do.
+						blocks[p] = d .. ("error({ __curse_%s = %d })"):format(cf_op, lvl)
+					else
+						blocks[p] = d .. ("sh.status = 0; pc = %d"):format(after) -- no-op outside a loop
+					end
 				else
 					local idx = #loopstack - (lvl - 1)
 					if idx < 1 then
@@ -3415,7 +3422,7 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
 			-- `return` at the top level is an error (status 2 + diagnostic, but execution
 			-- continues) — not a program exit. A compiled top level is always the main
 			-- script (source runs through interp), so delegate and let interp diagnose.
-			if toplevel then
+			if toplevel and not EF.fragment then
 				return delegate(st, after)
 			end
 			-- return [N] (incl. \return / builtin return / command return): set $? and exit
@@ -3423,27 +3430,31 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
 			-- inside a subshell, `return` exits the subshell (subshell_exit) with the
 			-- status; otherwise it exits the function/CFG at DONE.
 			local retpc = subexit[#subexit] or DONE
+			-- eval/source fragment top level: `return` propagates to the CALLER (a delegated
+			-- eval's cf-wrapper) as a raised signal, like interp; a return inside a compiled
+			-- subshell (subexit) still jumps locally.
+			local frag_return = EF.fragment and toplevel and #subexit == 0
+			local retjmp = frag_return and "error({ __curse_return = sh.status })" or ("pc = %d"):format(retpc)
 			local aw = st.words[cf_arg]
 			if not st.words[cf_arg + 1] then -- at most one status WORD (pre-split)
 				local d = dbg(st) -- DEBUG fires before return too
 				if not aw then -- `return` with no arg → previous status
 					local p = newpc()
-					blocks[p] = d .. ("pc = %d"):format(retpc)
+					blocks[p] = d .. retjmp
 					return p
 				elseif word_safe(aw) then -- one field (literal/quoted): `return ""` → 2, `return 42` → 42
 					local p = newpc()
 					blocks[p] = d
-						.. ("sh.status = rt.return_status(sh, %s); pc = %d"):format(emit_word(aw, lifted), retpc)
+						.. ("sh.status = rt.return_status(sh, %s); "):format(emit_word(aw, lifted)) .. retjmp
 					return p
 				elseif field_word(aw, lifted) then -- unquoted expansion: split — 0 fields → $?, else 1st field
 					local fw = field_word(aw, lifted)
 					local p = newpc()
 					blocks[p] = d
-						.. ("do local __f = rt.field_split(sh, %s, %s); if #__f > 0 then sh.status = rt.return_status(sh, __f[1]) end end; pc = %d"):format(
+						.. ("do local __f = rt.field_split(sh, %s, %s); if #__f > 0 then sh.status = rt.return_status(sh, __f[1]) end end; "):format(
 							fw.expr,
-							tostring(fw.split),
-							retpc
-						)
+							tostring(fw.split)
+						) .. retjmp
 					return p
 				end -- else (pexp/${…}): not intercepted — falls through (emit deopts to interp, which is correct)
 			end
@@ -3880,6 +3891,26 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
 							redir = bi_redir,
 						}
 					)
+				end
+			end
+			-- `eval CODE…`: COMPILE the joined code at runtime (rt.eval, fragment mode) rather than
+			-- exec_stmt-ing it — the args expand through the field engine here, and rt.eval tiers the
+			-- resulting string (falling back to the interpreter for aliases / a syntax error / a
+			-- construct emit still delegates). delegate's cf-wrapper catches a return/break/continue/
+			-- exit the eval'd code raises; opts.redir applies a redirect around the call.
+			if cmd == "eval" and not st.assigns then
+				local argvbody = field_argv(st.words, 1, lifted, nil, nil)
+				local ev_redir = nil
+				if argvbody and st.redirs then
+					ev_redir = redir_conds(st, nil)
+				end
+				if argvbody and not (st.redirs and not ev_redir) then
+					return delegate(st, after, {
+						prelude = argvbody,
+						callee = "rt.eval",
+						callargs = "sh, __a",
+						redir = ev_redir,
+					})
 				end
 			end
 			-- `declare`/`typeset` INSIDE a function (no -g) make each name local, exactly like
@@ -5280,14 +5311,22 @@ local function scan_alias(stmts)
 	end
 	return false
 end
-function M.emit(ast)
+function M.emit(ast, opts)
 	emit_frags, emit_frag_n = {}, 0 -- compiled `$(…)` fragments (cs_N closures) collected during build
+	-- Fragment mode (eval/source, compiled at runtime): the code runs in the CALLER's
+	-- execution context, so a top-level return/break/continue must RAISE its signal for
+	-- the enclosing (delegated) cf-wrapper to catch, not jump to this fragment's own DONE.
+	EF.fragment = opts and opts.fragment or false
 	if scan_alias(ast.stmts) then
 		error("curse-nocompile: alias expansion needs line-at-a-time parse")
 	end
-	EF.has_attr = scan_attr(ast.stmts) -- gate compiled attribute-aware scalar assign
+	-- A fragment runs in the CALLER's context, where any var may carry an attribute
+	-- (readonly/integer/case/nameref) the fragment's own code can't see, so force the
+	-- attribute- and nameref-aware assign paths (they do the readonly check, int coercion,
+	-- nameref write-through). Otherwise a compiled `eval "x=v"` would skip readonly, etc.
+	EF.has_attr = EF.fragment or scan_attr(ast.stmts) -- gate compiled attribute-aware scalar assign
 	EF.has_dyncode = scan_dyncode(ast.stmts) -- eval/source present → a $(…) can't assume its body's names are externals
-	EF.has_nameref = scan_nameref(ast.stmts) -- declare -n present → delegate scalar assigns
+	EF.has_nameref = EF.fragment or scan_nameref(ast.stmts) -- declare -n present → delegate scalar assigns
 	EF.has_err = scan_trap(ast.stmts, { ERR = 1 }) -- gate compiled ERR-trap firing
 	EF.has_debug = scan_trap(ast.stmts, { DEBUG = 1 }) -- gate compiled DEBUG-trap firing
 	EF.funcstack = reads_debugstack(ast.stmts) -- gate FUNCNAME/BASH_SOURCE/BASH_LINENO stacks
@@ -5360,7 +5399,9 @@ function M.emit(ast)
 	-- lookup, no desync) — it can't be register-held across a loop, but such vars
 	-- are updated per-call, not per-hot-iteration. Every fn_x is still emitted (for
 	-- indirect/dynamic dispatch).
-	local lifted = analyze_lift(ast)
+	-- No lifting in a fragment: a lifted native-int64 local would neither see nor sync the
+	-- caller's real sh var (which may be readonly/exported), so keep every var in sh.
+	local lifted = EF.fragment and {} or analyze_lift(ast)
 	local funcTouched = {}
 	collect_funcvars(ast.stmts, funcTouched, inlinable)
 	local upvals, runlocals = {}, {}

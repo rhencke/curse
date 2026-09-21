@@ -17,6 +17,39 @@ function M.compile(ast)
 	return assert(load(E.emit(ast), "=curse:compiled"))()
 end
 
+-- Compile a runtime code string (eval / source) as a FRAGMENT: emit with fragment=true so a
+-- TOP-LEVEL return/break/continue RAISES its signal (the caller's delegated cf-wrapper
+-- catches it) instead of jumping to this unit's own DONE. Returns an instantiated module, or
+-- nil when the code can't compile — a parse (syntax) error, alias use (needs line-at-a-time
+-- expansion), or any construct emit still delegates. The caller then falls back to the
+-- interpreter, which handles those correctly (and incrementally). No caching: eval strings
+-- are usually one-shot, and content-hashing every one would churn the cache.
+function M.try_fragment(code)
+	local pok, ast = pcall(P.parse, code)
+	-- A syntax error (P.parse sets ast.perr and/or emits a `parse_error` statement, or
+	-- throws): the interpreter is the oracle for it — it runs the valid PREFIX then reports
+	-- the error with bash's status — so bail to the fallback rather than compile a fragment
+	-- that would raise the parse error at runtime and abort the caller.
+	if not pok or type(ast) ~= "table" or ast.perr then
+		return nil
+	end
+	for _, st in ipairs(ast.stmts or {}) do
+		if st.t == "parse_error" then
+			return nil
+		end
+	end
+	local ok, chunk = pcall(function()
+		return load(E.emit(ast, { fragment = true }), "=curse:eval")
+	end)
+	if ok and chunk then
+		local built, mod = pcall(chunk)
+		if built and type(mod) == "table" and mod.run then
+			return mod
+		end
+	end
+	return nil
+end
+
 -- resume descriptor {kind,id} -> the pc to enter the compiled CFG at.
 local function resume_pc(mod, r)
 	return (r.kind == "loop") and mod.loopPc[r.id] or mod.stmtPc[r.id]
