@@ -3688,6 +3688,58 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
 			-- `local a=(…)` / `declare a=(…)`: the array value lives in st.arrayargs, which
 			-- the native builtin paths don't render — interp does the scope-aware array assign.
 			if st.arrayargs then
+				-- Native slice: a TOP-LEVEL `declare`/`typeset NAME=(…)` whose only flag is -a
+				-- or -A (or none). declare_assoc sets the assoc attribute; rt.arrayassign then
+				-- stores the elements by exactly interp's do_arrayassign logic (both key on
+				-- is_assoc), building the item values with the field engine — no exec_stmt. $_
+				-- becomes the target name (bash). Combos with -i/-r/-x/-n/-g, `local`/`readonly`/
+				-- `export`, multiple targets, a redirect, or a nameref program keep interp's fuller
+				-- declare handling (they still delegate below).
+				local aa = st.arrayargs
+				local flag = #st.words == 2
+					and st.words[2].parts[1]
+					and #st.words[2].parts == 1
+					and st.words[2].parts[1].lit
+				local flagok = (#st.words == 1) or (flag == "-a") or (flag == "-A")
+				if
+					(cmd == "declare" or cmd == "typeset")
+					and toplevel
+					and not st.assigns
+					and not redir_apply
+					and not EF.has_nameref
+					and #aa == 1
+					and flagok
+					and arrayassign_ok({ name = aa[1].name, append = aa[1].append, elems = aa[1].elems }, lifted)
+				then
+					local a1 = aa[1]
+					local p = newpc()
+					local parts = { "local __it = {}" }
+					for _, e in ipairs(a1.elems) do
+						if e.key ~= nil then
+							local fl = unq_full_lit(e.word)
+							local valx = (fl and fl:find("~", 1, true)) and ("rt.tilde_assign(sh, %q)"):format(fl)
+								or emit_word(e.word, lifted)
+							parts[#parts + 1] = ("__it[#__it+1] = {key=%q, op=%q, val=%s}"):format(e.key, e.op, valx)
+						elseif not empty_word(e.word) then
+							parts[#parts + 1] = emit_fields_into("__it", e.word, lifted, "{val=%s}")
+						end
+					end
+					local ec = errchk(st)
+					local ecs = ec ~= "" and ("; " .. ec) or ""
+					local assocpre = (flag == "-A") and ("sh:declare_assoc(%q); "):format(a1.name) or ""
+					blocks[p] = dbg(st)
+						.. "do "
+						.. assocpre
+						.. table.concat(parts, "; ")
+						.. ("; rt.arrayassign(sh, %q, __it, %s) end"):format(
+							a1.name,
+							tostring(a1.append and true or false)
+						)
+						.. ('; sh:set_str("_", %q)'):format(a1.name)
+						.. ecs
+						.. ("; pc = %d"):format(after)
+					return p
+				end
 				return delegate(st, after)
 			end
 			-- DYNAMIC command word (first word not a compile-time literal — `$cmd`, `${x}`, …):
