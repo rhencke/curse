@@ -5389,6 +5389,51 @@ local function test_binary(x, op, y)
 	end
 	return false
 end
+-- The 0/1/2/3-arg POSIX cases WITHOUT the recursive-descent parser or its per-call
+-- closures — this is the vast majority of `[ … ]`/test, and do_test's closures (7 per
+-- call, mutually recursive so the JIT can't sink them) were a top allocation source.
+-- An EXACT transcription of do_test's one_arg/two_args/three_args (pos threaded as a
+-- plain local); test_unary/test_binary may throw __test_syntax, so the caller pcalls it.
+local function test_simple(sh, args, lo, n)
+	if n <= 0 then
+		return false
+	end
+	if n == 1 then
+		return args[lo] ~= ""
+	end
+	if n == 2 then
+		if args[lo] == "!" then
+			return not (args[lo + 1] ~= "")
+		end
+		if TEST_UNOPS[args[lo]] then
+			return test_unary(sh, args[lo], args[lo + 1])
+		end
+		error({ __test_syntax = args[lo] .. ": unary operator expected" })
+	end
+	-- n == 3
+	if TEST_BINOPS[args[lo + 1]] then
+		return test_binary(args[lo], args[lo + 1], args[lo + 2])
+	end
+	if args[lo + 1] == "-a" then
+		return (args[lo] ~= "") and (args[lo + 2] ~= "")
+	end
+	if args[lo + 1] == "-o" then
+		return (args[lo] ~= "") or (args[lo + 2] ~= "")
+	end
+	if args[lo] == "!" then -- `! X Y` = not two_args(X, Y)
+		if args[lo + 1] == "!" then
+			return args[lo + 2] ~= "" -- ! ! Y  ->  Y is non-empty
+		end
+		if TEST_UNOPS[args[lo + 1]] then
+			return not test_unary(sh, args[lo + 1], args[lo + 2])
+		end
+		error({ __test_syntax = args[lo + 1] .. ": unary operator expected" })
+	end
+	if args[lo] == "(" and args[lo + 2] == ")" then
+		return args[lo + 1] ~= ""
+	end
+	error({ __test_syntax = args[lo + 1] .. ": binary operator expected" })
+end
 -- Evaluate a `test`/`[` argument list (already expanded): count-based dispatch (POSIX
 -- 1/2/3-arg special cases) then a recursive-descent parser (or->and->term, `-o` lowest /
 -- `-a` / `!` / `( )`), consuming terms strictly left-to-right so `-o`/`-a` can be an
@@ -5403,6 +5448,16 @@ local function do_test(sh, args)
 		hi = hi - 1
 	end
 	local n = hi - lo + 1
+	-- Fast path: 0-3 args need no recursive parser (no closures, no allocation).
+	if n <= 3 then
+		local ok, v = pcall(test_simple, sh, args, lo, n)
+		if not ok then
+			sh.status = 2
+			return
+		end
+		sh.status = v and 0 or 1
+		return
+	end
 	local pos = lo
 	local expr_, and_, term_
 	local function one_arg()
