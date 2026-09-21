@@ -5136,7 +5136,9 @@ function M.var_is_set(sh, nm)
 	if b and b.arr then
 		return sh:is_elem_set(dn, sh:is_assoc(dn) and "0" or 0)
 	end -- bare array -> [0]
-	return b ~= nil or sh:special_get(nm) ~= ""
+	-- A declared-but-VALUELESS scalar (`declare x` / `declare -i z` / `local l`) is NOT -v (bash);
+	-- only a box that actually holds a value (incl. the empty string `x=`) counts as set.
+	return (b ~= nil and (b.s ~= nil or b.n ~= nil)) or sh:special_get(nm) ~= ""
 end
 
 -- Set-ness for the ${x-word}/${x+word} default/alternate ops: a var is "set" only when it
