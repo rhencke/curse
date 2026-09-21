@@ -1582,10 +1582,11 @@ local PEXP_STROP = {
 	[","] = 1,
 	[",,"] = 1,
 }
--- ${x@OP} transforms apply_str_op implements directly on the scalar value (bash 5.x):
--- Q/K/k shell-quote, U/u/L case-fold, E ANSI-unescape. @P (prompt) and @a/@A (attributes)
--- are NOT here — they need interp's expand_param — so they still delegate.
-local PEXP_AT = { Q = 1, K = 1, k = 1, U = 1, u = 1, L = 1, E = 1 }
+-- ${x@OP} transforms compiled natively (bash 5.x): Q/K/k shell-quote, U/u/L case-fold,
+-- E ANSI-unescape (via apply_str_op on the scalar value), and `a` the attribute letters
+-- (via sh:attr_string, special-cased in pexp_scalar). @P (prompt) and @A (declare repr)
+-- still need interp's expand_param, so they delegate.
+local PEXP_AT = { Q = 1, K = 1, k = 1, U = 1, u = 1, L = 1, E = 1, a = 1 }
 -- Default/alternate ops. Quoted -> pexp_scalar; unquoted scalar -> field_word renders the
 -- pexp value and the outer field_split splits it (the default word's own quoting is gated
 -- out of the compilable set, so scalar-value + split == bash's field-wise default).
@@ -1744,8 +1745,8 @@ local function array_multi_op(pe)
 		return true
 	end -- bare ${a[@]} / ${a[*]} (bare $@/$* is p.special, not here)
 	if pe.op == "@" then
-		return PEXP_AT[pe.arg] and true or false
-	end -- ${a[@]@Q} … (not @a/@P)
+		return PEXP_AT[pe.arg] and pe.arg ~= "a" and true or false
+	end -- ${a[@]@Q} … (@a stays with interp: a per-element attr string, not an apply_str_op)
 	if pe.op == "sub" then
 		return pexp_word_args_ok(pe)
 	end -- ${a[@]:off:len} slice
@@ -1761,6 +1762,13 @@ local function array_multi_op(pe)
 end
 -- Lua expr for a compilable pexp's scalar string value (assumes pexp_compilable).
 function pexp_scalar(pe, lifted)
+	-- ${x@a} / ${x[i]@a}: the variable's attribute letters, read straight from its binding
+	-- (attr_string). Independent of value set-ness — a declared valueless assoc still reports
+	-- `A` — and never get_u, which would trip set -u on an unset element. The element and
+	-- scalar forms alike report the whole variable's attributes (bash).
+	if pe.op == "@" and pe.arg == "a" then
+		return ("sh:attr_string(%q)"):format(pe.name)
+	end
 	local val
 	if pe.index == "@" or pe.index == "*" then -- ${#a[@]}: array element COUNT (op is len, gated)
 		return ("tostring(sh:array_count(%q))"):format(pe.name)
