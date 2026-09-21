@@ -2694,25 +2694,29 @@ local function fmt_decl(sh, name)
 	if b.ref then -- bash shows the export letter on a nameref as `declare -nx`
 		return "declare -n" .. (os.getenv(name) ~= nil and "x" or "") .. " " .. name .. "=" .. decl_quote(b.s or "")
 	end
-	if b.assoc then
+	if b.assoc or b.arr then
+		-- array/assoc flag letters, bash order: a/A then i(integer) r(readonly) x(export).
+		-- Export shows from the ATTRIBUTE (an array is never in the process env, unlike a
+		-- scalar), verified: `declare -aix` -> `declare -aix`, `declare -Air` -> `declare -Air`.
+		local fl = (b.assoc and "A" or "a")
+			.. (b.int and "i" or "")
+			.. (b.ro and "r" or "")
+			.. (b.exported and "x" or "")
 		local parts = {}
 		for _, k in ipairs(sh:array_indices(name)) do
 			parts[#parts + 1] = "[" .. tostring(k) .. "]=" .. decl_quote(sh:array_get(name, k))
 		end
-		if #parts == 0 then
-			return b.empty_decl and ("declare -A " .. name) or ("declare -A " .. name .. "=()")
-		end
-		return "declare -A " .. name .. "=(" .. table.concat(parts, " ") .. " )"
-	elseif b.arr then
-		local parts = {}
-		for _, k in ipairs(sh:array_indices(name)) do
-			parts[#parts + 1] = "[" .. tostring(k) .. "]=" .. decl_quote(sh:array_get(name, k))
+		if b.assoc then
+			if #parts == 0 then
+				return b.empty_decl and ("declare -" .. fl .. " " .. name) or ("declare -" .. fl .. " " .. name .. "=()")
+			end
+			return "declare -" .. fl .. " " .. name .. "=(" .. table.concat(parts, " ") .. " )"
 		end
 		-- declared with `declare -a` but never assigned (not even `a=()`) -> no =value
 		if #parts == 0 and b.empty_decl then
-			return "declare -a " .. name
+			return "declare -" .. fl .. " " .. name
 		end
-		return "declare -a " .. name .. "=(" .. table.concat(parts, " ") .. ")"
+		return "declare -" .. fl .. " " .. name .. "=(" .. table.concat(parts, " ") .. ")"
 	else
 		-- attribute letters in bash's canonical order: integer, readonly, export, lower,
 		-- upper (verified: `declare -irx` -> `declare -irx`, `declare -xl` -> `declare -xl`).
