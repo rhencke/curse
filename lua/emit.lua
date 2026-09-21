@@ -2005,10 +2005,11 @@ local function emit_seg(p, i, lifted)
 			tostring(p.q or false)
 		)
 	end
-	if p.pexp and p.pexp.op == "prefix" then -- ${!pre@}: the set of variable NAMES with the prefix,
-		-- as a multi-element segment (each name its own field) — interp's var_prefix_names. The `*`
-		-- form (${!pre*}) is gated out upstream (bug #627 empty-IFS join quirk, like ${!a[*]}).
-		return ("{multi=true,star=false,q=%s,elems=sh:var_prefix_names(%q)}"):format(
+	if p.pexp and p.pexp.op == "prefix" then -- ${!pre@}/${!pre*}: the set of variable NAMES with the
+		-- prefix, as a multi-element segment (each name its own field) — interp's var_prefix_names.
+		-- The `*` form joins with IFS[0] in a quoted context (rt.expand_fields, like ${a[*]}).
+		return ("{multi=true,star=%s,q=%s,elems=sh:var_prefix_names(%q)}"):format(
+			tostring(p.pexp.star and true or false),
 			tostring(p.q or false),
 			p.pexp.name
 		)
@@ -2159,7 +2160,7 @@ function mixed_expandable(w, lifted)
 				array_multi_op(p.pexp)
 				or indirect_ok(p.pexp)
 				or pexp_compilable(p.pexp)
-				or (p.pexp.op == "prefix" and not p.pexp.star)
+				or p.pexp.op == "prefix"
 			)
 		then
 			return false
@@ -2197,7 +2198,7 @@ function seg_native(w, lifted)
 				array_multi_op(p.pexp)
 				or indirect_ok(p.pexp)
 				or pexp_compilable(p.pexp)
-				or (p.pexp.op == "prefix" and not p.pexp.star)
+				or p.pexp.op == "prefix"
 			)
 		then -- ${a[@]}, ${!ref}, scalar ${..} op, or ${!pre@} name-prefix (a ${…}-OP may deref an element-nameref: delegate in nameref programs)
 		else
