@@ -2714,10 +2714,11 @@ local function fmt_decl(sh, name)
 		end
 		return "declare -a " .. name .. "=(" .. table.concat(parts, " ") .. ")"
 	else
-		-- attribute letters in bash's order: -rxilu (readonly/export/integer/lower/upper)
-		local a = (b.ro and "r" or "")
+		-- attribute letters in bash's canonical order: integer, readonly, export, lower,
+		-- upper (verified: `declare -irx` -> `declare -irx`, `declare -xl` -> `declare -xl`).
+		local a = (b.int and "i" or "")
+			.. (b.ro and "r" or "")
 			.. (os.getenv(name) ~= nil and "x" or "")
-			.. (b.int and "i" or "")
 			.. (b.lower and "l" or "")
 			.. (b.upper and "u" or "")
 		local pre = "declare " .. (a == "" and "--" or "-" .. a) .. " " .. name

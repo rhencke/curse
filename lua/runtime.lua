@@ -2162,20 +2162,23 @@ function Shell:attr_string(name)
 	if not b then
 		return ""
 	end
+	-- bash's canonical attribute order (declare -p and ${x@a} share it): array/assoc,
+	-- integer, readonly, export, lower, upper, nameref. Verified against bash 5:
+	-- `declare -aixr` -> `airx`, `declare -rxil` -> `irxl`.
 	local s = ""
 	if b.assoc then
 		s = s .. "A"
 	elseif b.arr then
 		s = s .. "a"
 	end
+	if b.int then
+		s = s .. "i"
+	end
 	if b.ro then
 		s = s .. "r"
 	end
 	if b.exported then
 		s = s .. "x"
-	end
-	if b.int then
-		s = s .. "i"
 	end
 	if b.lower then
 		s = s .. "l"
