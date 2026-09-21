@@ -69,6 +69,30 @@ ffi.cdef([[
 ]])
 local C = ffi.C
 
+-- Keep the daemon's OWN descriptors out of the low range a script freely redirects.
+-- A worker serves in-process (no per-request fork), so its lock / listen socket / /dev/null
+-- / per-request control socket sit at fds 3-6 — exactly where scripts put their own
+-- redirections (`exec 3<file`, `read <&6`). A script touching one corrupts the daemon: a
+-- read on the live control socket consumed the reply protocol and hung the client for the
+-- whole request timeout (oil redirect#2). Move each to a high, close-on-exec fd (F_DUPFD_
+-- CLOEXEC = 1030; CLOEXEC also keeps it out of any external command the script execs).
+-- fcntl (declared variadic by runtime.lua) needs its F_DUPFD arg as a REAL int: a bare Lua
+-- number goes through a variadic call as a double, so F_DUPFD reads garbage for the minimum
+-- and hands back a LOW fd — silently defeating the move. A boxed int cdata is passed as int.
+local F_DUPFD_CLOEXEC = 1030 -- Linux: F_LINUX_SPECIFIC_BASE(1024)+6
+local FD_HIGH_MIN = ffi.new("int", 200) -- well above any fd a script redirects to
+local function fd_move_high(fd)
+	if fd < 0 then
+		return fd
+	end
+	local hi = C.fcntl(fd, F_DUPFD_CLOEXEC, FD_HIGH_MIN)
+	if hi >= 0 then
+		C.close(fd)
+		return hi
+	end
+	return fd
+end
+
 local AF_UNIX, SOCK_STREAM = 1, 1
 local SOL_SOCKET, SO_PEERCRED, SO_RCVTIMEO = 1, 17, 20
 local SCM_RIGHTS = 1
@@ -260,6 +284,11 @@ local function worker_main(lfd, my_uid, ctx)
 				C._exit(1)
 			end -- unexpected: parent replenishes
 		else
+			-- The accepted control socket lands low (the daemon's other fds are now high),
+			-- so move it high too before recvmsg/serve: a script's `read <&6` on the live
+			-- connection would otherwise corrupt the reply protocol and hang the client for the
+			-- request timeout (oil redirect#2: 10s vs bash's 3ms).
+			cfd = fd_move_high(cfd)
 			-- SO_PEERCRED: reject any peer that isn't us (defense-in-depth).
 			credlen[0] = ffi.sizeof("struct curse_ucred")
 			C.getsockopt(cfd, SOL_SOCKET, SO_PEERCRED, cred, credlen)
@@ -338,6 +367,7 @@ local function serve()
 		end
 		os.exit(0) -- another cursed already owns the instance
 	end
+	lock = fd_move_high(lock) -- the flock rides the shared OFD, so it survives the dup+close
 
 	local lfd = C.socket(AF_UNIX, SOCK_STREAM, 0)
 	if lfd < 0 then
@@ -357,6 +387,7 @@ local function serve()
 		log("listen() failed")
 		os.exit(1)
 	end
+	lfd = fd_move_high(lfd) -- workers (forked) inherit the high listen fd and accept() on it
 
 	-- Idle self-exit: workers' accept() honors this SO_RCVTIMEO (inherited via fork),
 	-- so an idle worker returns EAGAIN and _exit(WORKER_IDLE); the parent drains.
@@ -376,7 +407,7 @@ local function serve()
 	C.umask(orig_umask) -- read-and-restore
 	local empty_sigset = ffi.new("uint8_t[1024]")
 	C.sigemptyset(empty_sigset)
-	local devnull = C.open("/dev/null", O_RDWR, 0)
+	local devnull = fd_move_high(C.open("/dev/null", O_RDWR, 0))
 	-- SHARED activity clock (mmap MAP_SHARED|ANON): persistent workers don't _exit per
 	-- request, so the parent can't infer "still busy" from worker exits like the fork
 	-- model did. Each worker stamps os.time() here after serving; the parent reads it to
