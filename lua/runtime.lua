@@ -4865,25 +4865,40 @@ function Shell:echo(...)
 	-- escapes, -E disables them (bash). Same flag handling as the interp echo builtin,
 	-- so compiled and interpreted echo agree.
 	local n = select("#", ...)
-	local args = { ... }
-	local j, nonl, esc = 1, false, false
-	while j <= n and type(args[j]) == "string" and args[j]:match("^%-[neE]+$") do
-		for ch in args[j]:sub(2):gmatch(".") do
-			if ch == "n" then
-				nonl = true
-			elseif ch == "e" then
-				esc = true
-			elseif ch == "E" then
-				esc = false
+	local nonl, esc = false, false
+	-- Build the output string. Fast paths avoid the {...} pack + buf table + concat that
+	-- dominate echo's cost (and GC) — the common `echo "one string"` has no -neE flag and a
+	-- single (quoted) arg, so it needs neither. Only a leading -flag or multiple args pay them.
+	local s
+	local first = nil
+	if n >= 1 then
+		first = select(1, ...)
+	end
+	if type(first) == "string" and first:match("^%-[neE]+$") then
+		local args = { ... }
+		local j = 1
+		while j <= n and type(args[j]) == "string" and args[j]:match("^%-[neE]+$") do
+			for ch in args[j]:sub(2):gmatch(".") do
+				if ch == "n" then
+					nonl = true
+				elseif ch == "e" then
+					esc = true
+				elseif ch == "E" then
+					esc = false
+				end
 			end
+			j = j + 1
 		end
-		j = j + 1
+		s = table.concat(args, " ", j, n)
+	elseif n <= 1 then
+		s = first ~= nil and tostring(first) or "" -- common: one (quoted) arg — no table, no concat
+	else
+		local buf = { ... }
+		for k = 1, n do
+			buf[k] = tostring(buf[k])
+		end
+		s = table.concat(buf, " ")
 	end
-	local buf = {}
-	for k = j, n do
-		buf[#buf + 1] = tostring(args[k])
-	end
-	local s = table.concat(buf, " ")
 	local stopped
 	if esc then
 		s, stopped = M.ansi_unescape(s)
