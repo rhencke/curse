@@ -3913,6 +3913,24 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
 					})
 				end
 			end
+			-- `source FILE`/`. FILE`: run the file in the current shell, COMPILED (rt.source) —
+			-- same fragment mode as eval, plus positional-param setup and the RETURN trap; it
+			-- falls back to the interpreter for a missing/dir file, aliases, or a syntax error.
+			if (cmd == "source" or cmd == ".") and st.words[2] and not st.assigns then
+				local argvbody = field_argv(st.words, 1, lifted, nil, nil)
+				local sr_redir = nil
+				if argvbody and st.redirs then
+					sr_redir = redir_conds(st, nil)
+				end
+				if argvbody and not (st.redirs and not sr_redir) then
+					return delegate(st, after, {
+						prelude = argvbody,
+						callee = "rt.source",
+						callargs = "sh, __a",
+						redir = sr_redir,
+					})
+				end
+			end
 			-- `declare`/`typeset` INSIDE a function (no -g) make each name local, exactly like
 			-- `local` (bash) — so route a plain one through the native local path. A flag (incl.
 			-- -g), an array value (st.arrayargs delegated above), or `a[i]=` fails the plain check

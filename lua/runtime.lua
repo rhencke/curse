@@ -5040,6 +5040,82 @@ function M.eval(sh, argv)
 	end
 end
 
+-- `source FILE [args]` / `. FILE [args]`: run FILE in the CURRENT shell, COMPILED as a
+-- fragment (return/break/continue/exit propagate; scope shared) with $1.. set to the args.
+-- Anything the compiled path can't handle — a missing/directory file, an alias or syntax
+-- error or an unsupported construct in the file — defers to the interpreter's b_source, the
+-- oracle (it also owns the diagnostics). A `return` ends the source (caught here); break/
+-- continue/exit propagate to the caller; the RETURN trap fires after, like b_source.
+function M.source(sh, argv)
+	local I = require("interp")
+	local Ii = I._int
+	local j = 2
+	if argv[j] == "--" then
+		j = j + 1
+	end
+	local name = argv[j]
+	if not name then
+		return require("b_source")(sh, argv[1], argv, nil, nil) -- usage error: let b_source diagnose
+	end
+	local file = name
+	if not name:find("/", 1, true) then
+		for dir in (sh:get("PATH") .. ":"):gmatch("([^:]*):") do
+			local cand = (dir == "" and "." or dir) .. "/" .. name
+			if Ii.file_test("-f", cand) then
+				file = cand
+				break
+			end
+		end
+	end
+	if Ii.file_test("-d", file) then
+		return require("b_source")(sh, argv[1], argv, nil, nil) -- directory: b_source diagnoses
+	end
+	local f = io.open(file, "r")
+	if not f then
+		return require("b_source")(sh, argv[1], argv, nil, nil) -- not found: b_source diagnoses
+	end
+	local code = f:read("*a")
+	f:close()
+	local mod = require("tier").try_fragment(code)
+	if not mod then
+		return require("b_source")(sh, argv[1], argv, nil, nil) -- alias / syntax error / uncompilable
+	end
+	-- Compiled path: swap in the file's positional params, run, restore. `return` in the
+	-- file surfaces as __curse_return (fragment mode) and ends the source; exit/break/
+	-- continue propagate past here to the caller's cf-wrapper, as bash's shared-context
+	-- source does.
+	local savep, savenp = sh.params, sh.nparams
+	if #argv > j then
+		sh.params, sh.nparams = {}, 0
+		for k = j + 1, #argv do
+			sh.nparams = sh.nparams + 1
+			sh.params[sh.nparams] = argv[k]
+		end
+	end
+	sh.sourcedepth = (sh.sourcedepth or 0) + 1 -- a `return` is valid while sourcing
+	local rok, err = pcall(require("tier").run_compiled, mod, sh, nil)
+	sh.sourcedepth = sh.sourcedepth - 1
+	if #argv > j then
+		sh.params, sh.nparams = savep, savenp
+	end
+	if not rok then
+		if type(err) == "table" and err.__curse_return then
+			sh.status = err.__curse_return
+		else
+			error(err) -- exit / break / continue propagate
+		end
+	end
+	-- `.`/source fires the RETURN trap on return (any outcome but the usage error).
+	local trap = sh.traps and sh.traps.RETURN
+	if trap and trap ~= "" and not sh.in_return_trap then
+		sh.in_return_trap = true
+		local sv = sh.status
+		Ii.run_trap(sh, trap)
+		sh.status = sv
+		sh.in_return_trap = false
+	end
+end
+
 -- A DYNAMIC command word (`$cmd`/`${x}`/… — the first word resolves late, argv already
 -- built by the compiled field engine) dispatched through the command runner. The command
 -- is genuinely unknown at compile time (function / builtin / external), so resolution
