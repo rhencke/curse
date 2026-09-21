@@ -134,6 +134,17 @@ command -v dash >/dev/null 2>&1 && avail+=(dash)
 avail+=(curse-cold curse-hot)   # curse via daemon: cold (tiered miss) then hot (.bc hit)
 if [ -n "$SHELLS_SEL" ]; then SHELLS="bash,$SHELLS_SEL"; else SHELLS="$(IFS=,; echo "${avail[*]}")"; fi
 
+# Bound runaway output so one misbehaving test can't fill the disk. The per-unit `timeout`
+# only kills the curse CLIENT; the resident daemon worker holds the client's output fd
+# (dup'd onto its stdout) and keeps running — so a script that writes without end (e.g. a
+# mishandled `cat </dev/zero | true`, which should SIGPIPE but doesn't) writes UNBOUNDED to
+# the capture file, past any wall-clock timeout (observed: 91 GB). RLIMIT_FSIZE makes the
+# kernel raise SIGXFSZ the moment any output file crosses the cap, killing the writer —
+# bash/dash, or a daemon worker (which the pool then replenishes). Inherited by every child
+# (the daemon launched below, and the xargs-spawned --run-unit workers). 256 MiB is ~256x
+# the largest real spec output; override with H_FSIZE_KB (KiB) if a legit test needs more.
+ulimit -f "${H_FSIZE_KB:-262144}" 2>/dev/null || true
+
 workdir="$(mktemp -d "${TMPDIR:-/tmp}/curse-conf.XXXXXX")"
 trap 'rm -rf "$workdir"' EXIT
 mkdir -p "$workdir/units" "$workdir/cwd" "$workdir/res" "$workdir/snip" "$workdir/bin"
