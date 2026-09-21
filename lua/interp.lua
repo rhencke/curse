@@ -1608,7 +1608,10 @@ local function multi_elems(sh, p) -- returns element list, star?
 			end
 			els = out
 		elseif pe.op and pe.op ~= ":-" and pe.op ~= "-" and pe.op ~= ":+" and pe.op ~= "+" then
-			local arg = pe.arg and expand_word(sh, P.parse_word(pe.arg)) or ""
+			-- strip/subst/case per element: the PATTERN is quote-aware (a quoted `'*'` is a literal
+			-- `*`, not a glob) — expand_pattern, like the scalar path (getpattern in bash). Only the
+			-- replacement (arg2) is plain quote-removal (expand_word).
+			local arg = pe.arg and expand_pattern(sh, P.parse_word(pe.arg)) or ""
 			local arg2 = pe.arg2 and expand_word(sh, P.parse_word(pe.arg2)) or nil
 			local out = {}
 			for i, v in ipairs(els) do
