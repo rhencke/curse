@@ -204,13 +204,20 @@ build_oil() {
   for f in "$d"/*.test.sh; do [ -e "$f" ] || continue
     local base; base="$(basename "$f" .test.sh)"; matches "$base" || continue
     # awk: only files whose `## compare_shells:` names bash; one snippet per ####
-    # case, dropping ## metadata and ## STDOUT:/## END expected-output blocks;
+    # case, dropping ## metadata and every ## …STDOUT:/…STDERR: expected-output block;
     # skip cases marked `## N-I bash` (bash doesn't implement -> not a bash target).
+    # An expected-output block is opened by ANY `## …STDOUT:`/`## …STDERR:` header,
+    # INCLUDING a shell-qualified one like `## N-I zsh STDOUT:` or `## OK dash STDOUT:`.
+    # Matching that opener BEFORE the `## (END|OK|BUG|N-I)` closer is essential: a
+    # qualified header matches both, and if the closer wins the block never opens, so
+    # its lines leak into the snippet as CODE — e.g. `yes ^` (the `yes` command) then
+    # spews forever, ballooning the captured output to gigabytes. (Fixed: was a real
+    # disk-exhaustion bug that corrupted ~28% of oil snippets with stray expected text.)
     awk -v OUT="$workdir/snip" -v B="$base" '
       /^## compare_shells:/ { if ($0 ~ /bash/) targets=1 }
       /^#### / { flush(); n++; code=""; skip=0; incase=1; inblock=0; next }
       !incase { next }
-      /^## STDOUT:/ { inblock=1; next }
+      /^## .*(STDOUT|STDERR):[ \t]*$/ { if ($0 ~ /^## N-I bash/) skip=1; inblock=1; next }
       /^## (END|OK|BUG|N-I)/ { if ($0 ~ /^## N-I bash/) skip=1; inblock=0; next }
       inblock { next }
       /^## / { next }
