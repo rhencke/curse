@@ -76,7 +76,7 @@ return function(sh, cmd, args, hook, tcb)
 			end
 			if sigstart > #args then -- an action with no signal spec is a usage error
 				io.stderr:write("curse: trap: usage: trap [-lp] [[arg] signal_spec ...]\n")
-				sh.status = 1
+				sh.status = 2
 				return
 			end
 			local ok = true

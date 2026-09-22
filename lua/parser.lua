@@ -863,6 +863,9 @@ end
 
 -- Parse a $… expansion at position i of string w; add(part) tagging it with the
 -- quoted flag q; returns the next index. (q drives word-splitting downstream.)
+-- ${x:-$'…'} inside "…": bash 5.2 DOES expand ANSI-C quoting in a quoted default word
+-- (parse_default_quoted sets this while parsing it); elsewhere in "…" `$'` is literal.
+local DQ_ANSI = false
 local function parse_dollar(w, i, add, q)
 	local nx = w:sub(i + 1, i + 1)
 	if w:sub(i + 1, i + 2) == "((" and dparen_is_arith(w, i + 3) then
@@ -892,6 +895,10 @@ local function parse_dollar(w, i, add, q)
 	elseif nx == '"' then
 		-- $"…" locale translation: with no catalog it's just the double-quoted string.
 		return i + 1 -- skip the `$`; the caller parses the following "…" normally
+	elseif nx == "'" and q and not DQ_ANSI then
+		-- inside "…" (or a heredoc body) `$'` is just a literal `$` followed by text
+		add({ lit = "$", q = true })
+		return i + 1
 	elseif nx == "'" then
 		-- $'…' ANSI-C quoting: a literal string with backslash escapes, no expansion.
 		local j, buf = i + 2, {}
@@ -1034,16 +1041,23 @@ local function parse_word(w)
 					local _, nj = grab_dparen(w, j + 3)
 					j = nj
 				elseif d == "$" and w:sub(j + 1, j + 1) == "(" then
-					j = j + 2
-					local dep = 1
-					while j <= #w and dep > 0 do
-						local cc = w:sub(j, j)
-						if cc == "(" then
-							dep = dep + 1
-						elseif cc == ")" then
-							dep = dep - 1
+					-- the $(…) body has its OWN quoting (`"$(echo ")")"`): use the quote/case-
+					-- aware scanner; an unterminated body falls back to plain paren counting
+					local ok, nj = pcall(scan_cmdsub, w, j + 2)
+					if ok and nj then
+						j = nj
+					else
+						j = j + 2
+						local dep = 1
+						while j <= #w and dep > 0 do
+							local cc = w:sub(j, j)
+							if cc == "(" then
+								dep = dep + 1
+							elseif cc == ")" then
+								dep = dep - 1
+							end
+							j = j + 1
 						end
-						j = j + 1
 					end
 				elseif d == "$" and w:sub(j + 1, j + 1) == "{" then -- ${...}: inner \ ' " and {} nesting
 					j = scan_braces(w, j + 1)
@@ -1083,19 +1097,27 @@ local function parse_word(w)
 			add({ cmdsub = table.concat(buf), q = false, backtick = true, aenv = ALIAS_ENV })
 			i = j + 1
 		elseif (c == "<" or c == ">") and w:sub(i + 1, i + 1) == "(" then
-			-- <(cmd) / >(cmd) process substitution: capture the balanced inner command.
-			local j, d = i + 2, 1
-			while j <= #w and d > 0 do
-				local cc = w:sub(j, j)
-				if cc == "(" then
-					d = d + 1
-				elseif cc == ")" then
-					d = d - 1
-					if d == 0 then
-						break
+			-- <(cmd) / >(cmd) process substitution: capture the inner command — its body has
+			-- its own quoting/case syntax, so use the $(…) scanner (plain counting if unclosed)
+			local j
+			local ok, nj = pcall(scan_cmdsub, w, i + 2)
+			if ok and nj then
+				j = nj - 1 -- index of the closing `)`
+			else
+				local d
+				j, d = i + 2, 1
+				while j <= #w and d > 0 do
+					local cc = w:sub(j, j)
+					if cc == "(" then
+						d = d + 1
+					elseif cc == ")" then
+						d = d - 1
+						if d == 0 then
+							break
+						end
 					end
+					j = j + 1
 				end
-				j = j + 1
 			end
 			add({ procsub = w:sub(i + 2, j - 1), dir = c, q = false })
 			i = j + 1
@@ -1216,12 +1238,42 @@ function M.parse_default_quoted(txt)
 			end
 		elseif ch == '"' then
 			k = k + 1 -- drop the syntactic inner quote
+		elseif ch == "$" and (txt:sub(k + 1, k + 1) == "(" or txt:sub(k + 1, k + 1) == "{") then
+			-- a nested $(…)/$((…))/${…} keeps its OWN quoting (`${u:-$(echo "p)q")}`): copy it
+			-- verbatim rather than dropping the quotes inside it
+			local ok, nj
+			if txt:sub(k + 1, k + 1) == "(" then
+				ok, nj = pcall(scan_cmdsub, txt, k + 2)
+			else
+				ok, nj = pcall(scan_braces, txt, k + 1)
+			end
+			if ok and nj and nj > k then
+				out[#out + 1] = txt:sub(k, nj - 1)
+				k = nj
+			else
+				out[#out + 1] = ch
+				k = k + 1
+			end
+		elseif ch == "`" then
+			local e = k + 1
+			while e <= m and txt:sub(e, e) ~= "`" do
+				e = e + (txt:sub(e, e) == "\\" and 2 or 1)
+			end
+			out[#out + 1] = txt:sub(k, e)
+			k = e + 1
 		else
 			out[#out + 1] = ch
 			k = k + 1
 		end
 	end
-	return M.parse_heredoc(table.concat(out))
+	local saved = DQ_ANSI
+	DQ_ANSI = true
+	local ok, r = pcall(M.parse_heredoc, table.concat(out))
+	DQ_ANSI = saved
+	if not ok then
+		error(r, 0)
+	end
+	return r
 end
 
 -- Parse a [[ … ]] token list into a boolean-expression AST:
@@ -2037,18 +2089,9 @@ local function make_parser(src, sh, aenv)
 			elseif c == "$" and src:sub(i + 1, i + 1) == "(" then
 				i = scan_cmdsub(src, i + 2) -- case/quote/nesting-aware boundary (errors if unclosed)
 			elseif (c == "<" or c == ">") and src:sub(i + 1, i + 1) == "(" then
-				-- <(cmd) / >(cmd) process substitution: part of the word (balanced parens)
-				i = i + 2
-				local d = 1
-				while i <= n and d > 0 do
-					local cc = src:sub(i, i)
-					if cc == "(" then
-						d = d + 1
-					elseif cc == ")" then
-						d = d - 1
-					end
-					i = i + 1
-				end
+				-- <(cmd) / >(cmd) process substitution: part of the word — scanned like $(…)
+				-- (its body has its own quoting / case syntax)
+				i = scan_cmdsub(src, i + 2)
 			elseif c:match("[?*+@!]") and src:sub(i + 1, i + 1) == "(" then
 				-- extglob ?(..) *(..) +(..) @(..) !(..): part of the word, not a subshell
 				i = i + 2
@@ -2285,7 +2328,7 @@ local function make_parser(src, sh, aenv)
 			ws()
 			i = i + 8
 			ws()
-			local s, e = src:find("^[%w_][%w_%.%-:+@/!#]*", i)
+			local s, e = src:find("^[%w_:%.+@/][%w_%.%-:+@/!#]*", i)
 			if not s then
 				error("function needs a name")
 			end
@@ -2309,7 +2352,7 @@ local function make_parser(src, sh, aenv)
 			-- (`func-name=ext () { … }`), as long as the name doesn't END in `=` — that
 			-- is an array/scalar assignment (`a=()`, `x=`), which the assignment path
 			-- handles instead (and `a=(` is caught there before we get here anyway).
-			local s, e = src:find("^[%w_][%w_%.%-:+@/!#=]*", i)
+			local s, e = src:find("^[%w_:%.+@/][%w_%.%-:+@/!#=]*", i)
 			if s and src:sub(e, e) ~= "=" then
 				local j = e + 1
 				while src:sub(j, j):match("[ \t]") do
@@ -2371,12 +2414,14 @@ local function make_parser(src, sh, aenv)
 			end
 		end
 		-- for (( init; cond; step )) ; do BODY done   OR   for NAME in WORDS; do … done
-		if peekword() == "for" then
+		-- `select NAME [in WORDS]; do …; done` shares the for-in header/body grammar
+		if peekword() == "for" or peekword() == "select" then
+			local issel = peekword() == "select"
 			local ln = line
 			ws()
-			i = i + 3
+			i = i + (issel and 6 or 3)
 			ws()
-			if src:sub(i, i + 1) == "((" then
+			if not issel and src:sub(i, i + 1) == "((" then
 				local body, ni = grab_dparen(src, i + 2)
 				i = ni
 				local a, b, c = body:match("^(.-);(.-);(.-)$")
@@ -2477,7 +2522,7 @@ local function make_parser(src, sh, aenv)
 				error("syntax error near `done'")
 			end -- bash: empty do/done is invalid
 			return {
-				t = "forin",
+				t = issel and "select" or "forin",
 				id = id,
 				line = ln,
 				name = name,

@@ -3249,6 +3249,17 @@ end
 -- which the sh scope handles instead). Scans EVERYWHERE, including function
 -- bodies — a var shared between the top level and a function still lifts, because
 -- the upvalue is one real variable both see (no hash lookup, no desync).
+-- Variables the SHELL itself reads or writes behind the program's back (getopts updates
+-- OPTIND/OPTARG and reads OPTERR, read/select set REPLY, set -x reads BASH_XTRACEFD, calls
+-- check FUNCNEST, read -t reads TMOUT, …, plus the dynamic specials): a native register copy
+-- would desync from sh.vars, so they are never lifted even when only assigned numbers.
+local NO_LIFT = {}
+for _, n in ipairs({ "OPTIND", "OPTARG", "OPTERR", "REPLY", "SECONDS", "RANDOM", "SRANDOM",
+	"LINENO", "HISTCMD", "HISTSIZE", "HISTFILESIZE", "TMOUT", "COLUMNS", "LINES", "FUNCNEST",
+	"BASH_XTRACEFD", "SHLVL", "PPID", "UID", "EUID", "BASHPID", "BASH_SUBSHELL", "EPOCHSECONDS",
+	"EPOCHREALTIME", "BASH_ARGC", "COMP_CWORD", "COMP_POINT", "IFS", "_" }) do
+	NO_LIFT[n] = true
+end
 analyze_lift = function(ast)
 	-- A nameref program writes THROUGH namerefs (name=value -> some other var) via
 	-- rt.assign_scalar, which has no lifted-local to update — so an int64 local would desync.
@@ -3359,6 +3370,9 @@ analyze_lift = function(ast)
 		end
 	end
 	scan(ast.stmts)
+	for n in pairs(NO_LIFT) do
+		disq[n] = true
+	end
 	local lifted = {}
 	for n in pairs(assigned) do
 		if not disq[n] and not localed[n] then
@@ -3849,7 +3863,7 @@ H.funcdef = function(cx, st, after)
 		return cx.delegate(st, after)
 	end
 	local p = cx.newpc()
-	if not st.name:match("^[%w_][%w_%.%-:+@/!#=]*$") then -- name is an expansion (`$foo-bar()`):
+	if not st.name:match("^[%w_:%.+@/][%w_%.%-:+@/!#=]*$") then -- name is an expansion (`$foo-bar()`):
 		cx.blocks[p] = ("io.stderr:write(%q); sh.status = 1; pc = %d") -- non-fatal runtime error (bash)
 			:format("curse: `" .. st.name .. "': not a valid identifier\n", after)
 	elseif cx.funcflags[st.name] then
@@ -4573,6 +4587,8 @@ simple_compiled = function(cx, st, after)
 			-- PIPESTATUS after a simple command is a one-element array of its status
 			-- (bash), like the static-dispatch path below; gated on the program reading it.
 			local ps = EF.pipestatus and '; sh:array_assign("PIPESTATUS", {tostring(sh.status)}, false)' or ""
+			-- $_ = the last argument (the command name when there are none), after the call
+			ps = ("; sh:set_str('_', #__a > 0 and __a[#__a] or %q)"):format(cmd or "") .. ps
 			if redir_apply then
 				-- bash order: expand the words (side-effecting cmdsubs run) BEFORE the
 				-- redirects are applied, so `cmd $(read f) > f` reads f before it's
@@ -4670,7 +4686,16 @@ simple_compiled = function(cx, st, after)
 			end
 			pb[j - 1] = { int = intExpr, str = strExpr }
 		end
-		return cx.flatten_list(subst_list(cx.inlinefns[cmd], pb), after)
+		-- $_ after the call is the call's LAST argument (or the name), expanded BEFORE the
+		-- body runs (which may change it): capture it, splice the body, then set $_.
+		local us = cx.newloopvar()
+		local lastw = st.words[#st.words]
+		local post = cx.newpc()
+		cx.blocks[post] = ('sh:set_str("_", %s); pc = %d'):format(us, after)
+		local bodyentry = cx.flatten_list(subst_list(cx.inlinefns[cmd], pb), post)
+		local pre = cx.newpc()
+		cx.blocks[pre] = ("%s = %s; pc = %d"):format(us, emit_word(lastw, cx.lifted), bodyentry)
+		return pre
 	end
 	local p = cx.newpc()
 	local args = {}
@@ -4927,7 +4952,9 @@ H.whilec = function(cx, st, after)
 		cx.loopstack[#cx.loopstack + 1] = { brk = after, cont = condp }
 		local bodyentry = cx.flatten_list(st.body, condp)
 		cx.loopstack[#cx.loopstack] = nil
-		cx.blocks[condp] = ("if %s then pc = %d else pc = %d end"):format(
+		-- DEBUG fires before each evaluation of the condition command (bash)
+		local cst = type(st.cond) == "table" and st.cond[1] or nil
+		cx.blocks[condp] = (cst and dbg(cst) or "") .. ("if %s then pc = %d else pc = %d end"):format(
 			emit_bool(arith, cx.lifted),
 			bodyentry,
 			after
@@ -4950,7 +4977,8 @@ H.whilec = function(cx, st, after)
 		local bodyentry = cx.flatten_list(st.body, bodysave)
 		cx.loopstack[#cx.loopstack] = nil
 		cx.blocks[bodysave] = ("%s = sh.status; pc = %d"):format(lv, condp)
-		cx.blocks[condp] = ("sh.status = (%s) and 0 or 1; if sh.status %s 0 then pc = %d else pc = %d end"):format(
+		local cst = type(st.cond) == "table" and st.cond[1] or nil
+		cx.blocks[condp] = (cst and dbg(cst) or "") .. ("sh.status = (%s) and 0 or 1; if sh.status %s 0 then pc = %d else pc = %d end"):format(
 			emit_bool(tarith, cx.lifted),
 			st.negate and "~=" or "==",
 			bodyentry,

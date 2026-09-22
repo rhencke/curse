@@ -317,7 +317,8 @@ local function fmt_set_var(name, b)
 		end
 		return ("%s=(%s)"):format(name, table.concat(parts, " "))
 	else
-		return name .. "=" .. sq(b.s ~= nil and b.s or (b.n ~= nil and rt.i64_to_str(b.n) or ""))
+		local v = b.s ~= nil and b.s or (b.n ~= nil and rt.i64_to_str(b.n) or "")
+		return name .. "=" .. (v == "" and "" or sq(v)) -- `set` shows an empty value bare (bash)
 	end
 end
 
@@ -2534,7 +2535,9 @@ end
 -- in two phases: expand every RHS against the OLD array state first, then evaluate
 -- indices left-to-right against the array as it is being built.
 local function do_arrayassign(sh, st)
-	local isassoc = sh:is_assoc(st.name)
+	-- through a nameref (`local -n r=arr; r+=(x)`) the literal lands in the referenced array
+	local name = sh:deref(st.name)
+	local isassoc = sh:is_assoc(name)
 	local anykeyed = false
 	for _, e in ipairs(st.elems) do
 		if e.key ~= nil then
@@ -2564,13 +2567,13 @@ local function do_arrayassign(sh, st)
 	-- (post-clear) value, and `a+=(...)` keeps the normal "append to current" too.
 	local snap
 	if not st.append then -- plain assignment resets the array (keep assoc-ness)
-		local b = sh.vars[st.name]
+		local b = sh.vars[name]
 		if isassoc then
 			snap = b and b.arr or nil
 		end
 		if not b then
-			sh:array_assign(st.name, {}, false)
-			b = sh.vars[st.name]
+			sh:array_assign(name, {}, false)
+			b = sh.vars[name]
 		end
 		b.arr = {}
 		b.s = nil
@@ -2584,23 +2587,23 @@ local function do_arrayassign(sh, st)
 		if anykeyed then -- keyed elements assigned; bare ones are an error in bash (skip)
 			for _, it in ipairs(items) do
 				if it.key ~= nil then
-					local idx = array_key(sh, st.name, it.key)
+					local idx = array_key(sh, name, it.key)
 					if it.op == "+=" and not st.append then -- append to the pre-statement value (see snap)
-						sh:array_set(st.name, idx, (snap and snap[idx] or "") .. it.val, false)
+						sh:array_set(name, idx, (snap and snap[idx] or "") .. it.val, false)
 					else
-						sh:array_set(st.name, idx, it.val, it.op == "+=")
+						sh:array_set(name, idx, it.val, it.op == "+=")
 					end
 				end
 			end
 		else -- all-bare assoc: alternating key value pairs
 			for k = 1, #items, 2 do
-				sh:array_set(st.name, items[k].val, items[k + 1] and items[k + 1].val or "", false)
+				sh:array_set(name, items[k].val, items[k + 1] and items[k + 1].val or "", false)
 			end
 		end
 	else
 		local auto = 0
 		if st.append then
-			local mx, b = -1, sh.vars[st.name]
+			local mx, b = -1, sh.vars[name]
 			if b and b.s ~= nil and not b.arr then
 				b.arr = { [0] = b.s }
 				b.s = nil
@@ -2617,11 +2620,11 @@ local function do_arrayassign(sh, st)
 		end
 		for _, it in ipairs(items) do
 			if it.key ~= nil then
-				local idx = array_key(sh, st.name, it.key)
-				sh:array_set(st.name, idx, it.val, it.op == "+=") -- indexed += appends to CURRENT (unlike assoc)
+				local idx = array_key(sh, name, it.key)
+				sh:array_set(name, idx, it.val, it.op == "+=") -- indexed += appends to CURRENT (unlike assoc)
 				auto = idx + 1
 			else
-				sh:array_set(st.name, auto, it.val, false)
+				sh:array_set(name, auto, it.val, false)
 				auto = auto + 1
 			end
 		end
@@ -2629,9 +2632,9 @@ local function do_arrayassign(sh, st)
 	-- An array can't live in the process environment: converting a variable to an
 	-- array drops it from the env (so a child sees nothing), though bash keeps the
 	-- export ATTRIBUTE on the shell variable itself.
-	local b = sh.vars[st.name]
+	local b = sh.vars[name]
 	if b and b.exported then
-		C.unsetenv(st.name)
+		C.unsetenv(name)
 	end
 end
 M.do_arrayassign = do_arrayassign
@@ -3128,11 +3131,11 @@ local function sh_printf(fmt, argv, start)
 						if not ok then
 							status = 1
 						end
-						if r == nil then
+						if r == nil then -- invalid conversion: bash reports it and STOPS the output there
 							io.stderr:write("curse: printf: `" .. conv .. "': invalid conversion specification\n")
-							status = 1
+							return table.concat(out), 1
 						end
-						out[#out + 1] = r or ""
+						out[#out + 1] = r
 					end
 				end
 			end
@@ -3355,11 +3358,11 @@ local function exec_simple(sh, args, hook, no_func)
 			elseif (sh.loopdepth or 0) > 0 then
 				error({ __curse_break = 1 })
 			end
-		elseif args[2] and not tonumber(args[2]) then -- non-numeric arg: error 128, still breaks one level
+		elseif args[2] and not tonumber(args[2]) then -- non-numeric count: FATAL (status 128) in a
 			io.stderr:write("curse: break: " .. args[2] .. ": numeric argument required\n")
-			sh.status = 128
-			if (sh.loopdepth or 0) > 0 then
-				error({ __curse_break = 1 })
+			sh.status = 128 -- non-interactive shell (bash exits); interactive just aborts it
+			if not sh.opt_i then
+				error({ __curse_exit = 128 })
 			end
 		else
 			sh.status = 0
@@ -3376,11 +3379,11 @@ local function exec_simple(sh, args, hook, no_func)
 			elseif (sh.loopdepth or 0) > 0 then
 				error({ __curse_break = 1 })
 			end
-		elseif args[2] and not tonumber(args[2]) then
+		elseif args[2] and not tonumber(args[2]) then -- non-numeric count: fatal, like break
 			io.stderr:write("curse: continue: " .. args[2] .. ": numeric argument required\n")
 			sh.status = 128
-			if (sh.loopdepth or 0) > 0 then
-				error({ __curse_continue = 1 })
+			if not sh.opt_i then
+				error({ __curse_exit = 128 })
 			end
 		else
 			sh.status = 0
@@ -3751,6 +3754,7 @@ local COMPOUND_REDIR = {
 	whilec = true,
 	forc = true,
 	forin = true,
+	["select"] = true,
 	["if"] = true,
 	case = true,
 	arithcmd = true,
@@ -4074,7 +4078,7 @@ exec_stmt = function(sh, st, hook)
 		-- a funcdef whose name is an expansion (`$foo-bar()`) is a NON-fatal runtime
 		-- error (bash: status 1) — the name was captured raw by the parser. bash is
 		-- otherwise lenient (a literal `=` in the name is fine: `func-name=ext`).
-		if not st.name:match("^[%w_][%w_%.%-:+@/!#=]*$") then
+		if not st.name:match("^[%w_:%.+@/][%w_%.%-:+@/!#=]*$") then
 			io.stderr:write("curse: `" .. st.name .. "': not a valid identifier\n")
 			sh.status = 1
 			return
@@ -4144,11 +4148,9 @@ exec_stmt = function(sh, st, hook)
 			-- bash applies `abc=def > /nonexistent` regardless (only the status is 1).
 			if st.assigns then
 				for _, a in ipairs(st.assigns) do
-					if a.raw then
-						sh:set_str(a.name, a.raw)
-					else
-						exec_stmt(sh, a, hook)
-					end
+					-- NAME=(…) is a literal only as a command PREFIX; with no command left after
+					-- expansion (`a=(1 2) 2>/dev/null`, `a=(x) $empty`) it's an array assignment
+					exec_stmt(sh, a, hook)
 				end
 			else -- a bare $(...) / redirection: status is the last cmdsub's, else 0
 				local hadcs = false
@@ -4900,6 +4902,74 @@ exec_stmt = function(sh, st, hook)
 			bodystatus = sh.status
 			if act == "break" then
 				break
+			end
+		end
+		sh.loopdepth = sh.loopdepth - 1
+		sh.status = bodystatus
+	elseif t == "select" then
+		-- select NAME [in WORDS]: print the numbered menu + $PS3 to stderr, read a line from
+		-- stdin (EOF ends the loop); an empty line redisplays the menu; otherwise REPLY=line,
+		-- NAME=the chosen item (or empty when it isn't a valid number), run the body.
+		if not st.name:match("^[%a_][%w_]*$") then
+			io.stderr:write("curse: `" .. st.name .. "': not a valid identifier\n")
+			sh.status = 1
+			return
+		end
+		local list = {}
+		for _, w in ipairs(st.words) do
+			local fs = expand_to_fields(sh, w)
+			for k = 1, #fs do
+				list[#list + 1] = fs[k]
+			end
+		end
+		if #list == 0 then
+			sh.status = 0
+			return
+		end
+		local function menu()
+			local width = #tostring(#list)
+			for k, item in ipairs(list) do
+				io.stderr:write(("%" .. width .. "d) %s\n"):format(k, item))
+			end
+		end
+		local function readline()
+			local buf = {}
+			while true do
+				local ch = fd_getc(0)
+				if ch == nil then
+					return #buf > 0 and table.concat(buf) or nil
+				end
+				if ch == "\n" then
+					return table.concat(buf)
+				end
+				buf[#buf + 1] = ch
+			end
+		end
+		local bodystatus = 0
+		sh.loopdepth = (sh.loopdepth or 0) + 1
+		menu()
+		while true do
+			hook("loop", st.id)
+			io.flush()
+			io.stderr:write(sh.vars["PS3"] and sh:get("PS3") or "#? ")
+			local line = readline()
+			if line == nil then -- EOF: end the loop (bash prints a newline — to STDOUT — status 1)
+				sh.out("\n")
+				bodystatus = 1
+				break
+			end
+			if line == "" then
+				menu()
+			else
+				sh:set_str("REPLY", line)
+				local nsel = line:match("^%s*(%d+)%s*$")
+				nsel = nsel and tonumber(nsel)
+				sh:set_str(st.name, (nsel and list[nsel]) or "")
+				local act = run_loop_body(sh, st.body, hook)
+				bodystatus = sh.status
+				if act == "break" then
+					break
+				end
 			end
 		end
 		sh.loopdepth = sh.loopdepth - 1

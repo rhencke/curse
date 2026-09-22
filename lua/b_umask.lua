@@ -35,8 +35,8 @@ return function(sh, cmd, args, hook, tcb)
 		local cur = tonumber(C.umask(0)) % 512
 		C.umask(cur)
 		if badflag then
-			io.stderr:write("curse: umask: invalid option\n")
-			sh.status = 1
+			io.stderr:write("curse: umask: invalid option\numask: usage: umask [-p] [-S] [mode]\n")
+			sh.status = 2 -- a usage error (bash)
 		elseif #pos == 0 then -- bash ignores extra args; it uses only the first MODE
 			local body = sflag and umask_symbolic(cur) or string.format("%04o", cur)
 			sh:echo(pflag and ("umask " .. (sflag and "-S " or "") .. body) or body)

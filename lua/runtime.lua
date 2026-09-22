@@ -129,7 +129,12 @@ function Shell.new()
 	-- feature-detection (`test -n "$BASH_VERSION"`, `[[ $BASH_VERSION == 5* ]]`)
 	-- works. A normal var: scripts can reassign or `unset` it (bash).
 	if sh.vars["BASH_VERSION"] == nil then
-		sh:set_str("BASH_VERSION", "5.2.0(1)-release")
+		sh:set_str("BASH_VERSION", "5.2.37(1)-release")
+	end
+	-- BASH_VERSINFO: the readonly array form (major minor patch build release machtype)
+	if sh.vars["BASH_VERSINFO"] == nil then
+		sh:array_assign("BASH_VERSINFO", { "5", "2", "37", "1", "release", "x86_64-pc-linux-gnu" }, false)
+		sh.vars["BASH_VERSINFO"].ro = true
 	end
 	return sh
 end
@@ -4813,7 +4818,26 @@ function M.glob_expand(pattern, opts)
 				return base .. "/" .. name
 			end
 		end
-		if seg == "**" and opts.globstar and not islast then
+		if seg == "**" and opts.globstar and islast then
+			-- a FINAL `**` matches every file and directory at any depth below the base
+			-- (plus the base itself as `dir/` — the zero-level match — when there is one)
+			for _, base in ipairs(cur) do
+				if base ~= "" and base ~= "/" then
+					nxt[#nxt + 1] = base .. "/"
+				end
+				for _, dir in ipairs(rec_dirs(base, opts.dotglob)) do
+					if dir ~= base then
+						nxt[#nxt + 1] = dir
+					end
+					for _, name in ipairs(scan_seg(dir, "*", opts.dotglob, opts.skipdots)) do
+						local path = joined(dir, name)
+						if not is_dir(path) then
+							nxt[#nxt + 1] = path
+						end
+					end
+				end
+			end
+		elseif seg == "**" and opts.globstar and not islast then
 			-- an intermediate `**/` matches zero or more directory levels
 			for _, base in ipairs(cur) do
 				for _, dir in ipairs(rec_dirs(base, opts.dotglob)) do
@@ -4842,6 +4866,20 @@ function M.glob_expand(pattern, opts)
 	end
 	if #cur == 0 then
 		return nil
+	end
+	-- a pattern ending in `/` (`*/`, `**/`) matches DIRECTORIES only, shown with the slash
+	if pattern:sub(-1) == "/" then
+		local dirs = {}
+		for _, p in ipairs(cur) do
+			local d = p:sub(-1) == "/" and p:sub(1, -2) or p
+			if d ~= "" and is_dir(d) then
+				dirs[#dirs + 1] = d .. "/"
+			end
+		end
+		cur = dirs
+		if #cur == 0 then
+			return nil
+		end
 	end
 	table.sort(cur, M.coll_lt)
 	-- dedup: multiple `**` segments can reach the same path more than once
@@ -6665,7 +6703,36 @@ end
 function M.var_is_set(sh, nm)
 	local base, sub = nm:match("^([%a_][%w_]*)%[(.+)%]$")
 	if base then
-		local key = sh:is_assoc(base) and sub or M.to_arr_key(M.arith_str(sh, sub))
+		local b = sh.vars[sh:deref(base)]
+		if (sub == "@" or sub == "*") and not sh:is_assoc(base) then -- `-v a[@]`: any element
+			-- (an ASSOCIATIVE array's `m[@]` is the literal key "@" — bash)
+			if b and b.arr then
+				return next(b.arr) ~= nil
+			end
+			return b ~= nil and (b.s ~= nil or b.n ~= nil)
+		end
+		local key
+		if sh:is_assoc(base) then
+			-- an associative subscript is word-expanded (`test -v 'm[$k]'` looks up $k's value)
+			key = sub
+			if sub:find("[$`\\'\"]") then
+				key = require("interp")._int.array_key(sh, base, sub)
+			end
+		else
+			key = M.to_arr_key(M.arith_str(sh, sub))
+		end
+		if type(key) == "number" and key < 0 and b and b.arr then -- negative: from the end
+			local max = -1
+			for k in pairs(b.arr) do
+				if type(k) == "number" and k > max then
+					max = k
+				end
+			end
+			key = max + 1 + key
+			if key < 0 then
+				return false
+			end
+		end
 		return sh:is_elem_set(base, key)
 	end
 	if nm:match("^%d+$") then
