@@ -1612,6 +1612,13 @@ local ARRAY_DEFAULT = { [":-"] = 1, ["-"] = 1, [":+"] = 1, ["+"] = 1 }
 local function pexp_literal_arg(a)
 	return a == nil or not a:find("[%$`~\\\"']")
 end
+-- A strip/subst/case PATTERN safe to pass VERBATIM to apply_str_op, whose glob_to_ere treats a
+-- backslash escape \c as a literal c — exactly like interp. Allows a backslash (the escape), but
+-- excludes $ ` (expansion), ~ (bash tilde-expands a pattern), and ' " (a quoted metachar must
+-- match literally — that needs the mask-aware emit_pattern_glob, not a verbatim pass).
+local function pat_verbatim_ok(a)
+	return a == nil or not a:find("[%$`~\"']")
+end
 -- The op's word arg(s) (a slice off/len, or a default word) are compilable when each is an
 -- emit_word-able word free of ~ \ ' " (so emit_word == interp's expand_word and the arith
 -- eval / field-split runs on the identical expanded string). Shared by the scalar
@@ -1635,8 +1642,8 @@ end
 -- replacement's `&`/`\&` matched-text semantics differ from a plain value's. Shared by the
 -- scalar and array-element strop gates.
 local function strop_pat_ok(pe)
-	if pexp_literal_arg(pe.arg) and pexp_literal_arg(pe.arg2) then
-		return true
+	if pat_verbatim_ok(pe.arg) and pexp_literal_arg(pe.arg2) then
+		return true -- literal pattern (incl. \* \? \/ glob-escapes) passed verbatim to apply_str_op
 	end
 	if pe.arg and pe.arg:find("[~\\]") then
 		return false
@@ -1927,7 +1934,7 @@ function pexp_scalar(pe, lifted)
 	-- strip/subst/case (PEXP_STROP): a plain literal pattern is passed verbatim (apply_str_op
 	-- globs it); a dynamic/quoted pattern is rendered mask-aware via emit_pattern_glob to the
 	-- expanded glob string. Replacement (arg2) is literal (pexp_compilable gated it).
-	if not pexp_literal_arg(pe.arg) then
+	if not pat_verbatim_ok(pe.arg) then
 		return ("sh:apply_str_op(%q, %s, %s, %q)"):format(
 			pe.op,
 			val,
