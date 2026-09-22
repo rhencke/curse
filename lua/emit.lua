@@ -516,7 +516,12 @@ local function arith_elem_ok(e)
 	-- gate on idxraw (the RAW subscript), not e.idx: a QUOTED subscript (`A['x']`) sets idxraw but
 	-- leaves e.idx nil (its arith parse is skipped), yet it's still an element read rt.array_key
 	-- resolves (assoc: dequoted word; indexed: arith_str(raw), which errors on a single quote).
-	if type(e) ~= "table" or e.k ~= "var" or type(e.idxraw) ~= "string" then
+	-- A `var` node is an element READ ($(( a[i] ))); an asgn/post/pre node is an element WRITE
+	-- (`(( a[i] = … ))`, `(( a[i]++ ))`) — both carry name+idxraw and compile via rt.arith_elem_*.
+	if type(e) ~= "table" or type(e.idxraw) ~= "string" then
+		return false
+	end
+	if e.k ~= "var" and e.k ~= "asgn" and e.k ~= "post" and e.k ~= "pre" then
 		return false
 	end
 	if type(e.name) ~= "string" or not e.name:match("^[%a_][%w_]*$") or COMPILE_UNSAFE_VAR[e.name] then
