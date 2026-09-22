@@ -1318,6 +1318,88 @@ local function cmdsub_nofork_ok(stmts)
 	end
 	return true
 end
+
+-- Fork-forcing per-subshell specials: their value/identity differs in a real child,
+-- so a subshell that READS one must genuinely fork (see runtime subshell_run).
+local SUBSHELL_FORK_VARS = { BASHPID = 1, BASH_SUBSHELL = 1, RANDOM = 1, SRANDOM = 1 }
+local function word_forces_fork(w)
+	if not w or not w.parts then return false end
+	for _, p in ipairs(w.parts) do
+		if p.var and SUBSHELL_FORK_VARS[p.var] then return true end
+		if p.name and SUBSHELL_FORK_VARS[p.name] then return true end
+		if p.arith and (p.arith:find("BASHPID", 1, true) or p.arith:find("BASH_SUBSHELL", 1, true)
+			or p.arith:find("RANDOM", 1, true)) then return true end
+	end
+	return false
+end
+local function words_force_fork(ws)
+	if not ws then return false end
+	for _, w in ipairs(ws) do if w and word_forces_fork(w) then return true end end
+	return false
+end
+-- Can a subshell body run IN-PROCESS (checkpoint/restore) rather than fork? Only when
+-- nothing in it needs a real child process: no `exec`, no background `&`, no funcdef,
+-- no user-function CALL (a function may exec/& — conservative in v1), and no read of a
+-- per-subshell special. `set` is gated by the caller (body_runs_set) and traps by the
+-- program-wide EF flags. Nested subshells and $(…) are their OWN scope — opaque here
+-- (each self-gates). Any unrecognized statement type forks, to stay safe.
+local subshell_stmt_inproc_ok
+local function subshell_list_inproc_ok(list, ff)
+	ff = ff or (emit_frag_ctx and emit_frag_ctx.funcflags) or {} -- caller passes {} for a nested list
+	for _, st in ipairs(list) do
+		if not subshell_stmt_inproc_ok(st, ff) then return false end
+	end
+	return true
+end
+function subshell_stmt_inproc_ok(st, ff)
+	local t = st.t
+	if t == "background" or t == "funcdef" then return false end
+	if t == "subshell" then return true end -- its own scope; self-gates
+	if t == "simple" then
+		local w1 = st.words and st.words[1]
+		local c = w1 and w1.parts[1] and #w1.parts == 1 and w1.parts[1].lit
+		if c == "exec" then return false end
+		if c and ff[c] then return false end -- user-function call
+		if words_force_fork(st.words) then return false end
+		if st.assigns then
+			for _, a in ipairs(st.assigns) do if a.rhs and word_forces_fork(a.rhs) then return false end end
+		end
+		return true
+	elseif t == "assign" then
+		return not (st.rhs and word_forces_fork(st.rhs))
+	elseif t == "assignlist" or t == "arrayassign" then
+		return not words_force_fork(st.words)
+	elseif t == "pipeline" then
+		return subshell_list_inproc_ok(st.cmds, ff)
+	elseif t == "andor" then
+		for _, it in ipairs(st.items) do if not subshell_stmt_inproc_ok(it.cmd, ff) then return false end end
+		return true
+	elseif t == "if" then
+		for _, cl in ipairs(st.clauses) do
+			if not subshell_list_inproc_ok(cl.cond, ff) then return false end
+			if not subshell_list_inproc_ok(cl.body, ff) then return false end
+		end
+		return true
+	elseif t == "case" then
+		if word_forces_fork(st.subject) then return false end
+		for _, cl in ipairs(st.clauses) do
+			if not subshell_list_inproc_ok(cl.body, ff) then return false end
+		end
+		return true
+	elseif t == "whilec" then
+		return subshell_list_inproc_ok(st.cond, ff) and subshell_list_inproc_ok(st.body, ff)
+	elseif t == "forin" then
+		return not words_force_fork(st.words) and subshell_list_inproc_ok(st.body, ff)
+	elseif t == "forc" then
+		return subshell_list_inproc_ok(st.body, ff)
+	elseif t == "group" then
+		return subshell_list_inproc_ok(st.body, ff)
+	elseif t == "arithcmd" or t == "dbracket" then
+		return true -- test/arith: no exec/funccall (a special there only affects isolated state)
+	end
+	return false -- unknown type: fork to be safe
+end
+EF.subshell_inproc_ok = subshell_list_inproc_ok -- flatten_stmt calls it via EF (upvalue cap)
 local function compile_cmdsub(src, backtick, lifted)
 	local fallback = ("sh:capture_src(%q%s)"):format(src, backtick and ", true" or "")
 	local pok, ast = pcall(require("parser").parse, src)
@@ -5125,6 +5207,36 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
 			-- reproduce — delegate the whole subshell (interp forks + enforces it).
 			if body_runs_set(st.body) then
 				return delegate(st, after)
+			end
+			-- IN-PROCESS (no fork): the fat-LuaJIT fork dominates subshell cost. When the body
+			-- needs no real child — no trap/ERR/DEBUG program, no eval/source, and it runs no
+			-- exec/&/user-function-call and reads no per-subshell special ($RANDOM/$BASHPID/…) —
+			-- run it as a CHECKPOINTED fragment (rt subshell_run copy-isolates every escaping
+			-- piece of shell state). The fragment RAISES exit/return (caught by subshell_run),
+			-- so subshell_exit_pc is cleared around its build. Anything else falls through to the
+			-- fork path below (still correct). break/continue can't cross into it — subshell_run's
+			-- fragment has its own loopstack, like the fork body.
+			if not (EF.has_err or EF.has_debug or EF.has_trap)
+				and not EF.has_dyncode
+				and #st.body > 0
+				and EF.subshell_inproc_ok(st.body)
+			then
+				local saved_ssx = EF.subshell_exit_pc
+				EF.subshell_exit_pc = nil
+				local id = emit_fragment(st.body)
+				EF.subshell_exit_pc = saved_ssx
+				if id then
+					local p = newpc()
+					local ec = errchk(st)
+					local ecs = ec ~= "" and ("; " .. ec) or ""
+					if sub_redir then
+						blocks[p] = ("local __rs = {}; if %s then sh:subshell_run(cs_%d, __rs) else rt.redir_restore(__rs); sh.status = 1 end%s; pc = %d"):format(
+							sub_redir, id, ecs, after)
+					else
+						blocks[p] = ("sh:subshell_run(cs_%d)%s; pc = %d"):format(id, ecs, after)
+					end
+					return p
+				end
 			end
 			-- errexit INHERITED at entry is now COMPILED: the forked child runs the body with
 			-- errchk guards that exit the SUBSHELL on a failing command (EF.subshell_exit_pc, set

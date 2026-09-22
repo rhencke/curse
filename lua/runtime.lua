@@ -1243,6 +1243,108 @@ function Shell:capture_inproc(backtick, runner)
 	return (table.concat(buf):gsub("%z", ""):gsub("\n+$", ""))
 end
 
+-- Deep-copy a variable box (every attribute flag + fresh array/order tables) so an
+-- in-process subshell mutates its OWN copy, never the parent's box. The parent boxes
+-- stay pristine, so a `local`/tempenv shadow that still references one is valid after
+-- the subshell restores.
+local function copybox(b)
+	local nb = {
+		s = b.s, n = b.n, assoc = b.assoc, exported = b.exported, ref = b.ref,
+		lower = b.lower, upper = b.upper, ro = b.ro, int = b.int, empty_decl = b.empty_decl,
+	}
+	if b.arr then
+		local a = {}
+		for k, v in pairs(b.arr) do a[k] = v end
+		nb.arr = a
+	end
+	if b.order then
+		local o = {}
+		for k, v in pairs(b.order) do o[k] = v end
+		nb.order = o
+	end
+	return nb
+end
+local function shallowcopy(t)
+	if t == nil then return nil end
+	local c = {}
+	for k, v in pairs(t) do c[k] = v end
+	return c
+end
+
+-- Run a subshell body `runner(sh)` IN-PROCESS (no fork) — the compiled tier's
+-- fork-free `( … )`. A forked subshell gets isolation for free from copy-on-write;
+-- here we reproduce it by CHECKPOINTING every piece of shell state the body may
+-- change and must not leak, then restoring it on EVERY exit path. The emit gate only
+-- routes a body here when this is exact: no trap/ERR/DEBUG, no eval/source, no `set`,
+-- no `exec`, no background `&`, no user-function call, no `$BASHPID`/`$BASH_SUBSHELL`/
+-- `$RANDOM` (all of those still fork). `saves` (optional) holds the subshell's own
+-- applied redirects, restored here too. Var boxes are DEEP-copied (parent boxes
+-- untouched, so any local/tempenv box reference stays valid); the process environ is
+-- re-synced for exported names, and cwd/umask are put back with real syscalls.
+function Shell:subshell_run(runner, saves)
+	local orig_vars = self.vars
+	local copy = {}
+	for k, b in pairs(orig_vars) do copy[k] = copybox(b) end
+	self.vars = copy
+	local exset = {}
+	for name, b in pairs(orig_vars) do
+		if b.exported then exset[name] = true end
+	end
+	local pcopy = {}
+	for i = 1, self.nparams do pcopy[i] = self.params[i] end
+	local cwd = self:phys_cwd()
+	local um = C.umask(0)
+	C.umask(um)
+	local sv_params, sv_np = self.params, self.nparams
+	local sv_out, sv_line = self.out, self.cur_line
+	local sv_ld, sv_ne = self.loopdepth, self.noerr
+	local sv_shopt, sv_alias, sv_fns = self.shopt, self.aliases, self.functions
+	local sv_dirstack, sv_hash, sv_getopts = self.dirstack, self.hashcache, self.getopts_cur
+	self.params = pcopy
+	self.shopt = shallowcopy(self.shopt) or {}
+	self.aliases = shallowcopy(self.aliases) or {}
+	self.functions = shallowcopy(self.functions) or {}
+	self.dirstack = shallowcopy(self.dirstack)
+	self.hashcache = shallowcopy(self.hashcache)
+	self.in_subprogram = (self.in_subprogram or 0) + 1
+	self.loopdepth = 0
+
+	local ok, err = pcall(runner, self)
+	local status = self.status
+	local rethrow
+	if not ok then
+		if type(err) == "table" and (err.__curse_exit or err.__curse_return) then
+			status = err.__curse_exit or err.__curse_return
+		elseif type(err) == "table" and err.__curse_lineabort then
+			status = 1
+		else
+			rethrow = err
+		end
+	end
+
+	if saves then M.redir_restore(saves) end
+	self.vars = orig_vars
+	self.params, self.nparams = sv_params, sv_np
+	self.out, self.cur_line = sv_out, sv_line
+	self.loopdepth, self.noerr = sv_ld, sv_ne
+	self.shopt, self.aliases, self.functions = sv_shopt, sv_alias, sv_fns
+	self.dirstack, self.hashcache, self.getopts_cur = sv_dirstack, sv_hash, sv_getopts
+	self.in_subprogram = self.in_subprogram - 1
+	if cwd ~= "" then C.chdir(cwd) end
+	C.umask(um)
+	-- Re-sync the process environ: drop names the body newly exported, then restore
+	-- every name exported at entry to its parent value (covers changed + unset-in-sub).
+	for name, b in pairs(copy) do
+		if b.exported and not exset[name] then C.unsetenv(name) end
+	end
+	for name in pairs(exset) do
+		C.setenv(name, self:get(name) or "", 1)
+	end
+
+	if rethrow then error(rethrow) end
+	self.status = status
+end
+
 -- Compiled-tier command substitution: run a compiled cmdsub fragment `cs_fn(sh)`
 -- (the inner program, compiled at emit time). `mustfork` — computed statically by
 -- emit: the body mutates shell state, calls a user function, or reads $BASHPID —
