@@ -3968,23 +3968,30 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
 				-- readonly operand fails with $?=1, a set -a local is exported — so no
 				-- whole-program blanket is needed here.)
 				local plain = #st.words >= 2
+				-- declare/typeset (not `local`) whose operands are ONLY -flags and bare NAMEs
+				-- (no `name=value`, no `a[i]=`, no expansion) route to the rt.builtin path
+				-- below (decl_in_fn), which honors -p/-A/-i/… and localizes via a calldepth
+				-- bump. `declare -pa`, `declare -A m`, `declare -i n` inside a function or a
+				-- pipeline-stage fragment. `local` has no such native flag path, so it still
+				-- delegates when not plain.
+				local flagsonly = (cmd == "declare" or cmd == "typeset") and #st.words >= 2
 				for j = 2, #st.words do
 					local p1 = st.words[j].parts[1]
 					local lit = p1 and p1.lit
+					local single = #st.words[j].parts == 1
 					if
 						not (
 							lit
-							and (
-								lit:match("^[%a_][%w_]*%+?=")
-								or (lit:match("^[%a_][%w_]*$") and #st.words[j].parts == 1)
-							)
+							and (lit:match("^[%a_][%w_]*%+?=") or (lit:match("^[%a_][%w_]*$") and single))
 						)
 					then
 						plain = false
-						break
+					end
+					if not (lit and single and (lit:match("^%-%a+$") or lit:match("^[%a_][%w_]*$"))) then
+						flagsonly = false
 					end
 				end
-				if not plain then
+				if not plain and not flagsonly then
 					return delegate(st, after)
 				end
 			end
@@ -4084,13 +4091,29 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
 			-- but rt.builtin does not — so an in-function `declare -A d` would leak to global.
 			-- At top level there is no local scope, so the native dispatch is exact.
 			local DECL_BUILTIN = { export = 1, declare = 1, readonly = 1, typeset = 1 }
-			local decl_native = DECL_BUILTIN[cmd] and toplevel and not st.arrayargs
+			-- declare/typeset ALSO compile inside a function (no array value, no `name=value`
+			-- literal below): b_export makes each name local when sh.calldepth>0, which the
+			-- dispatch bumps to 1 (matching the delegate's calldepth guard). The frame itself
+			-- is pushed by the caller — func_flags marks any declare/typeset body `locals`.
+			-- export/readonly don't localize, so they stay top-level-only here (no seam bucket).
+			local decl_in_fn = false
+			if (cmd == "declare" or cmd == "typeset") and not toplevel and not st.arrayargs then
+				for j = 2, #st.words do
+					local p1 = st.words[j].parts[1]
+					if p1 and p1.lit and p1.lit:match("^%-%a") then
+						decl_in_fn = true
+						break
+					end
+				end
+			end
+			local decl_native = (DECL_BUILTIN[cmd] and toplevel and not st.arrayargs) or decl_in_fn
 			if decl_native then
 				for j = 2, #st.words do
 					local p1 = st.words[j].parts[1]
 					local lit = p1 and p1.lit
 					if lit and (lit:match("^[%a_][%w_]*%+?=") or lit:match("^[%a_][%w_]*%b[]%+?=")) then
 						decl_native = false
+						decl_in_fn = false
 						break
 					end
 				end
@@ -4184,6 +4207,12 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
 					local ecs = ec ~= "" and ("; " .. ec) or ""
 					local d = dbg(st) -- DEBUG fires before the command and its expansions
 					local lastarg = "if #__a > 0 then sh:set_str('_', __a[#__a]) end" -- $_ = last arg (bash)
+					-- In-function declare/typeset: bump calldepth (save/restore) so b_export
+					-- localizes each name, exactly as the delegate's cf-wrapper does. Elsewhere
+					-- (top level, other builtins) this is a plain dispatch.
+					local bcall = decl_in_fn
+							and "do local __sc = sh.calldepth; if (sh.calldepth or 0) < 1 then sh.calldepth = 1 end; rt.builtin(sh, __a, __noop); sh.calldepth = __sc end"
+						or "rt.builtin(sh, __a, __noop)"
 					if redir_apply then
 						-- a REDIRECTED builtin (`printf x > f`, `read v < f`, `type ls > f`): install the
 						-- redirs, run it (its output/input now on the target fd), then io.flush BEFORE
@@ -4192,8 +4221,9 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
 						-- status 1, like bash's sh_chkwrite.
 						blocks[p] = d
 							.. builder
-							.. ("; do local __rs = {}; if %s then sh.write_err = nil; rt.builtin(sh, __a, __noop); io.flush() else sh.status = 1 end; rt.redir_restore(__rs); if sh.write_err then sh.status = 1 end end; %s%s; pc = %d"):format(
+							.. ("; do local __rs = {}; if %s then sh.write_err = nil; %s; io.flush() else sh.status = 1 end; rt.redir_restore(__rs); if sh.write_err then sh.status = 1 end end; %s%s; pc = %d"):format(
 								redir_apply,
+								bcall,
 								lastarg,
 								ecs,
 								after
@@ -4201,7 +4231,7 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
 					else
 						blocks[p] = d
 							.. builder
-							.. "; rt.builtin(sh, __a, __noop); "
+							.. ("; %s; "):format(bcall)
 							.. lastarg
 							.. ecs
 							.. ("; pc = %d"):format(after)
