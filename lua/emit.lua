@@ -4217,21 +4217,27 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
 					return p
 				end
 			end
-			-- `VAR=val … BUILTIN args` (prefix env): evaluate each scalar prefix value in the
+			-- `VAR=val … cmd args` (prefix env): evaluate each scalar prefix value in the
 			-- CURRENT env (bash/interp agree a sibling prefix isn't visible, and the args also
 			-- expand pre-prefix), then apply them as an exported tempenv via rt.run_prefix, run
-			-- the builtin (which sees the temp values, e.g. `IFS=: read`), and restore. Gated to
-			-- an rt.builtin-dispatchable builtin — the code/scope builtins (EXEC_SIMPLE_SKIP:
-			-- eval/declare/local/…) and the statically-native ones (NATIVE_BUILTIN: echo/[/:/…)
-			-- keep interp's fuller prefix handling. An array-element/array-literal/append prefix,
-			-- an unrenderable value or argv, or an uncompilable redirect also delegates.
+			-- the command (a builtin sees the temp values, e.g. `IFS=: read`; a forked external
+			-- inherits them via the setenv, e.g. `MSG=hi sh -c …`), and restore. Handles a
+			-- static BUILTIN or a static EXTERNAL name; the code/scope builtins (EXEC_SIMPLE_SKIP:
+			-- eval/declare/local/…), the statically-native ones (NATIVE_BUILTIN: echo/[/:/…), a
+			-- function, and a dynamic command word keep interp's fuller prefix handling. An
+			-- array-element/array-literal/append prefix, or an unrenderable value/argv, delegates.
+			local px_builtin = cmd and require("interp").BUILTINS[cmd]
+			local px_external = cmd
+				and not px_builtin
+				and not (inlinefns and inlinefns[cmd])
+				and not funcflags[cmd]
 			if
 				st.assigns
 				and cmd
 				and not NATIVE_BUILTIN[cmd]
 				and not EXEC_SIMPLE_SKIP[cmd]
 				and not isfunc
-				and require("interp").BUILTINS[cmd]
+				and (px_builtin or px_external)
 			then
 				local pnames, pvals, pok = {}, {}, true
 				for _, a in ipairs(st.assigns) do
@@ -4253,11 +4259,21 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
 					local ecs = ec ~= "" and ("; " .. ec) or ""
 					local d = dbg(st)
 					local lastarg = "if #__a > 0 then sh:set_str('_', __a[#__a]) end"
-					local dispatch = redir_apply
-							and ("do local __rs = {}; if %s then sh.write_err = nil; rt.builtin(sh, __a, __noop); io.flush() else sh.status = 1 end; rt.redir_restore(__rs); if sh.write_err then sh.status = 1 end end"):format(
-								redir_apply
-							)
-						or "rt.builtin(sh, __a, __noop)"
+					local run = px_builtin and "rt.builtin(sh, __a, __noop)" or "sh:exec(unpack(__a))"
+					local dispatch
+					if not redir_apply then
+						dispatch = run
+					elseif px_builtin then -- a builtin's buffered output must reach the target fd before restore
+						dispatch = ("do local __rs = {}; if %s then sh.write_err = nil; %s; io.flush() else sh.status = 1 end; rt.redir_restore(__rs); if sh.write_err then sh.status = 1 end end"):format(
+							redir_apply,
+							run
+						)
+					else -- external: it runs with its own fds, a failed redirect is $?=1
+						dispatch = ("do local __rs = {}; if %s then %s else sh.status = 1 end; rt.redir_restore(__rs) end"):format(
+							redir_apply,
+							run
+						)
+					end
 					-- __pv (prefix values) FIRST, then __a (argv) — both in the pre-prefix env,
 					-- in bash's left-to-right order — then apply + run + restore via rt.run_prefix.
 					blocks[p] = d
