@@ -4422,6 +4422,26 @@ local function is_dir(path)
 	end
 	return bit.band(ffi.cast("uint32_t *", stbuf_g + 24)[0], 0xF000) == 0x4000
 end
+-- Non-dot entry names of directory `path` (what `ls -1` lists), unsorted; {} if unreadable.
+function M.dir_names(path)
+	local out = {}
+	local d = ffi.C.opendir(path)
+	if d == nil then
+		return out
+	end
+	while true do
+		local e = ffi.C.readdir(d)
+		if e == nil then
+			break
+		end
+		local name = ffi.string(ffi.cast("const char *", e) + 19)
+		if name:sub(1, 1) ~= "." then
+			out[#out + 1] = name
+		end
+	end
+	ffi.C.closedir(d)
+	return out
+end
 -- globstar `**`: every directory at or under `base` (recursively), including base
 -- itself (the zero-level case) — the prefixes an intermediate `**/` descends into.
 local function rec_dirs(base, dotglob)

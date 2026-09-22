@@ -294,14 +294,10 @@ return function(sh, cmd, args, hook)
 						local pfx = prefix or ""
 						for dir in (sh:get("PATH") .. ":"):gmatch("([^:]*):") do
 							local d = (dir == "" and "." or dir)
-							local p = io.popen and io.popen("ls -1 '" .. d .. "' 2>/dev/null")
-							if p then
-								for name in p:lines() do
-									if name:sub(1, #pfx) == pfx and C.access(d .. "/" .. name, 1) == 0 then
-										add(name)
-									end
+							for _, name in ipairs(rt.dir_names(d)) do
+								if name:sub(1, #pfx) == pfx and C.access(d .. "/" .. name, 1) == 0 then
+									add(name)
 								end
-								p:close()
 							end
 						end
 					end
