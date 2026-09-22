@@ -88,8 +88,10 @@ if [ "${1:-}" = --run-unit ]; then
       bash) printf '%s\tbash\tORACLE\t%s\t%s\n' "$corpus" "$bdur" "$testid" >> "$res" ;;
       dash|curse-cold|curse-hot)
         run=$sh; [ "$sh" = dash ] || run=curse
-        prep; _s=$(now_us); one "$run" >"$ofile" 2>/dev/null; st=$?
-        emit_row "$sh" "$(cat "$ofile" 2>/dev/null)" "$st" "$(( $(now_us) - _s ))" ;;
+        # stop the clock BEFORE emit_row: its "$(cat …)" argument expands first and
+        # would bill a fork+exec of cat to this shell (the bash oracle's time excludes it)
+        prep; _s=$(now_us); one "$run" >"$ofile" 2>/dev/null; st=$?; dur=$(( $(now_us) - _s ))
+        emit_row "$sh" "$(cat "$ofile" 2>/dev/null)" "$st" "$dur" ;;
     esac
   done
   exit 0

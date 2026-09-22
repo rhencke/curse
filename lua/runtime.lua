@@ -4450,6 +4450,36 @@ local function is_dir(path)
 	end
 	return bit.band(ffi.cast("uint32_t *", stbuf_g + 24)[0], 0xF000) == 0x4000
 end
+-- `time [-p] pipeline` (compiled tier): push the start clocks, run, then report elapsed
+-- real/user/sys to stderr in bash's format (same as interp's exec_stmt `timed` branch).
+ffi.cdef("struct curse_rt_timeval { long tv_sec; long tv_usec; };"
+	.. "int curse_rt_gettimeofday(struct curse_rt_timeval *tv, void *tz) asm(\"gettimeofday\");")
+local _tv = ffi.new("struct curse_rt_timeval")
+local function wall_secs()
+	C.curse_rt_gettimeofday(_tv, nil)
+	return tonumber(_tv.tv_sec) + tonumber(_tv.tv_usec) * 1e-6
+end
+function M.time_push(sh)
+	local st = sh._tstack or {}
+	sh._tstack = st
+	st[#st + 1] = { wall_secs(), os.clock() }
+end
+function M.time_report(sh, posix)
+	local st = sh._tstack
+	local t0 = st and table.remove(st)
+	if not t0 then
+		return
+	end
+	local real, cpu = wall_secs() - t0[1], os.clock() - t0[2]
+	local function fmt(x)
+		return ("%dm%.3fs"):format(math.floor(x / 60), x % 60)
+	end
+	if posix then
+		io.stderr:write(("real %.2f\nuser %.2f\nsys %.2f\n"):format(real, cpu, 0))
+	else
+		io.stderr:write(("\nreal\t%s\nuser\t%s\nsys\t%s\n"):format(fmt(real), fmt(cpu), fmt(0)))
+	end
+end
 -- Non-dot entry names of directory `path` (what `ls -1` lists), unsorted; {} if unreadable.
 function M.dir_names(path)
 	local out = {}

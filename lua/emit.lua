@@ -1258,8 +1258,15 @@ end
 -- Compile `stmts` into an inline fragment closure cs_N (reads sh directly, lift set
 -- {}) and return its id, or nil if the body hits a compiler gap. Shared by $(…),
 -- background, and pipeline stages — the compiled tier's "run this subprogram" unit.
-local function emit_fragment(stmts, neg, liftset)
+local function emit_fragment(stmts, neg, liftset, cfraise)
 	local saved_tl, saved_neg, saved_line = emit_toplevel, emit_neg_ctx, EF.cur_line
+	-- `cfraise` ({loop=, func=}): the fragment is the BODY of a compound run in the current
+	-- shell (a redirected `{ …; } >f` / `for … done <f`), so a break/continue with no loop
+	-- of its own, or a return, must reach the CALLER's loop/function: raise the signal for
+	-- the caller's delegate cf-wrapper. Scoped to this fragment only (a fragment nested in
+	-- it — a subshell, a pipeline stage — resets it).
+	local saved_cf = EF.cf_raise
+	EF.cf_raise = cfraise
 	if neg then
 		emit_neg_ctx = true
 	end -- `! cmd`: exempt its own errexit (see errchk)
@@ -1274,6 +1281,7 @@ local function emit_fragment(stmts, neg, liftset)
 	-- their copy; a lifted local would neither see nor sync the caller's real sh var).
 	local bok, cfg = pcall(build_cfg, stmts, liftset or {}, emit_frag_ctx.funcflags, inlfns, false)
 	emit_toplevel, emit_neg_ctx, EF.cur_line = saved_tl, saved_neg, saved_line
+	EF.cf_raise = saved_cf
 	if not bok then
 		return nil
 	end
@@ -3473,7 +3481,18 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
 	-- wrapper's control-flow-signal translation: opts.prelude is emitted first (e.g. building
 	-- __a, a native argv), and opts.callee(opts.callargs) replaces I.exec_stmt(sh, ser(st)).
 	-- Used by the dynamic command word (rt.exec_dynamic on a field-engine-built argv).
+	local redirected_compound -- forward: defined with the redirect compilers below
 	local function delegate(st, after, opts)
+		-- a redirected compound (`for … done <f`) compiles its body instead of delegating
+		if not opts and st.redirs then
+			local rp = redirected_compound(st, after)
+			if rp then
+				return rp
+			end
+		end
+		if EF.stats and not opts then -- opt-in census of what still delegates (tools/…)
+			EF.stats[#EF.stats + 1] = st.t .. "@" .. debug.getinfo(2, "l").currentline
+		end
 		local p = newpc()
 		local prelude = opts and opts.prelude
 		local callee = (opts and opts.callee) or "I.exec_stmt"
@@ -3482,8 +3501,13 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
 		for n in pairs(lifted) do
 			sync_in[#sync_in + 1] = ("sh:aset(%q, %s)"):format(n, lname(n))
 		end
+		-- opts.upv_keep: the callee is a fragment compiled WITH the upvalue lift set — it
+		-- wrote those upvalues directly, so reloading them from sh would clobber its writes.
+		local keep = opts and opts.upv_keep and EF.lifted_set or {}
 		for n in pairs(lifted) do
-			sync_out[#sync_out + 1] = ("%s = sh:aget(%q)"):format(lname(n), n)
+			if not keep[n] then
+				sync_out[#sync_out + 1] = ("%s = sh:aget(%q)"):format(lname(n), n)
+			end
 		end
 		-- errexit: a delegated errexit-relevant statement (interp's exec_stmt doesn't
 		-- fire it — exec_list does) gets the guard here. Compounds (if/for/case) fire
@@ -3502,7 +3526,23 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
 		-- opts.redir (a redir_conds expression) wraps the compiled callee in install/restore:
 		-- the redirs apply around the dispatch (a failed one -> status 1, no call), then restore.
 		local redir = opts and opts.redir
+		-- opts.redir_body: the callee is a compound's compiled BODY. Like interp's compound
+		-- redirect: builtins write the (redirected) fd 1 directly while it runs, the fds are
+		-- restored even when the body raises (exit / errexit / a break-continue-return signal),
+		-- and a failed redirect runs opts.redir_fail (ERR/errexit) instead of the body.
+		local rbody = opts and opts.redir_body
+		local so_in = rbody and rbody.stdout and "sh.out = io.write; " or ""
+		local rfail = rbody and rbody.fail and ("; " .. rbody.fail) or ""
 		local function callwrap()
+			if rbody then
+				return ("do local __rs, __so = {}, sh.out; if %s then %slocal __ok, __e = pcall(%s, %s); sh.out = __so; rt.redir_restore(__rs); if not __ok then error(__e, 0) end else rt.redir_restore(__rs); sh.status = 1%s end end"):format(
+					redir,
+					so_in,
+					callee,
+					callargs,
+					rfail
+				)
+			end
 			if redir then
 				return ("do local __rs = {}; if %s then %s(%s) else sh.status = 1 end; rt.redir_restore(__rs) end"):format(
 					redir,
@@ -3545,9 +3585,17 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
 		if redir then
 			-- install the redirs, run the dispatch (still under pcall so a break/continue/return
 			-- signal is caught below) only if they succeeded, then restore — regardless of signal.
-			o[#o + 1] = "local __rs = {}; local __ok, __e = true, nil"
-			o[#o + 1] = ("if %s then __ok, __e = pcall(%s, %s) else sh.status = 1 end"):format(redir, callee, callargs)
+			o[#o + 1] = "local __rs, __so, __rf = {}, sh.out, false; local __ok, __e = true, nil"
+			o[#o + 1] = ("if %s then %s__ok, __e = pcall(%s, %s); sh.out = __so else sh.status = 1; __rf = true end"):format(
+				redir,
+				so_in,
+				callee,
+				callargs
+			)
 			o[#o + 1] = "rt.redir_restore(__rs)"
+			if rfail ~= "" then -- after the restore: the ERR handler / errexit sees the original fds
+				o[#o + 1] = "if __rf then " .. rfail:sub(3) .. " end"
+			end
 		else
 			o[#o + 1] = ("local __ok, __e = pcall(%s, %s)"):format(callee, callargs)
 		end
@@ -3677,12 +3725,107 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
 		return table.concat(conds, " and ")
 	end
 
+	-- A compound command with trailing redirects (`for … done <f`, `{ …; } >out`, `if …
+	-- fi 2>/dev/null`): compile its BODY as a fragment and run it in the current shell
+	-- between install/restore of the redirs — no interpreter. break/continue/return in the
+	-- body raise to delegate()'s cf-wrapper (cfraise), which jumps like the keyword would.
+	-- nil -> caller falls back (uncompilable redir, traps, or a shape the fragment can't carry).
+	local REDIR_COMPOUND = { forc = 1, whilec = 1, forin = 1, ["if"] = 1, andor = 1, group = 1, case = 1 }
+	local function has_node(node, pred)
+		if type(node) ~= "table" then
+			return false
+		end
+		if pred(node) then
+			return true
+		end
+		for _, v in pairs(node) do
+			if type(v) == "table" and has_node(v, pred) then
+				return true
+			end
+		end
+		return false
+	end
+	local function is_funcdef(n)
+		return n.t == "funcdef"
+	end
+	local function is_return(n)
+		if n.t ~= "simple" or not n.words then
+			return false
+		end
+		local w1 = n.words[1]
+		local c = w1 and w1.parts and w1.parts[1] and w1.parts[1].lit
+		return c == "return" or c == "builtin" or c == "command" or c == "eval" or c == "source" or c == "."
+	end
+	local function stdout_redir(rd)
+		for _, r in ipairs(rd) do
+			if
+				not r.fdvar
+				and (
+					r.op == "outboth"
+					or r.op == "appboth"
+					or (r.fd == 1 and (r.op == "out" or r.op == "app" or r.op == "clobber" or r.op == "dup" or r.op == "rw"))
+				)
+			then
+				return true
+			end
+		end
+		return false
+	end
+	function redirected_compound(st, after)
+		if not REDIR_COMPOUND[st.t] or EF.has_trap or EF.has_debug or EF.has_err then
+			return nil
+		end
+		local conds = redir_conds(st, nil)
+		if not conds then
+			return nil
+		end
+		-- hoisted function bodies must not inherit the raise scope; a top-level `return`
+		-- (error + continue in bash) or a return reached via builtin/command/eval keeps
+		-- interp's handling.
+		if has_node(st, is_funcdef) or (toplevel and has_node(st, is_return)) then
+			return nil
+		end
+		local body = {}
+		for k, v in pairs(st) do
+			body[k] = v
+		end
+		body.redirs = nil
+		local id = emit_fragment({ body }, false, EF.lifted_set, { loop = #loopstack > 0, func = not toplevel })
+		if not id then
+			return nil
+		end
+		local exitfail = EF.subshell_exit_pc and "rt.subshell_exit(1)" or "error({ __curse_exit = 1 })"
+		return delegate(st, after, {
+			callee = "cs_" .. id,
+			callargs = "sh",
+			redir = conds,
+			upv_keep = true,
+			redir_body = {
+				stdout = stdout_redir(st.redirs),
+				fail = ("if sh.opt_e and sh.noerr == 0 then %s end"):format(exitfail),
+			},
+		})
+	end
+
 	-- Build blocks for `st`; its exit flows to pc `after`. Returns st's entry pc.
 	local function flatten_stmt(st, after)
 		local t = st.t
 		if st.line then
 			EF.cur_line = st.line
 		end -- for $LINENO (compile-time constant)
+		-- `time [-p] pipeline`: start clocks, run the statement itself, report to stderr.
+		if st.timed then
+			local inner = {}
+			for k, v in pairs(st) do
+				inner[k] = v
+			end
+			inner.timed, inner.timed_p = nil, nil
+			local pe = newpc()
+			blocks[pe] = ("rt.time_report(sh, %s); pc = %d"):format(tostring(st.timed_p == true), after)
+			local p0 = newpc()
+			blocks[p0] = ("rt.time_push(sh); pc = %d"):format(flatten_list({ inner }, pe))
+			return p0
+		end
 		-- break / continue [N]: a compile-time jump to the Nth enclosing loop's exit or
 		-- re-test point. Both set $?=0 (bash). Outside any loop it's a no-op. A
 		-- non-literal level (`break $n`) is rare — delegate it.
@@ -3701,7 +3844,7 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
 				local p = newpc()
 				local d = dbg(st) -- DEBUG fires before break/continue too (it's a command)
 				if #loopstack == 0 then
-					if EF.fragment and toplevel and #subexit == 0 then
+					if ((EF.fragment and toplevel) or (EF.cf_raise and EF.cf_raise.loop)) and #subexit == 0 then
 						-- eval/source fragment: break/continue with no enclosing loop IN the fragment
 						-- targets the CALLER's loop -- raise the signal (level) for the enclosing
 						-- delegated cf-wrapper, exactly as interp's break/continue do.
@@ -3734,7 +3877,7 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
 			-- eval/source fragment top level: `return` propagates to the CALLER (a delegated
 			-- eval's cf-wrapper) as a raised signal, like interp; a return inside a compiled
 			-- subshell (subexit) still jumps locally.
-			local frag_return = EF.fragment and toplevel and #subexit == 0
+			local frag_return = ((EF.fragment and toplevel) or (EF.cf_raise and EF.cf_raise.func)) and #subexit == 0
 			local retjmp = frag_return and "error({ __curse_return = sh.status })" or ("pc = %d"):format(retpc)
 			local aw = st.words[cf_arg]
 			if not st.words[cf_arg + 1] then -- at most one status WORD (pre-split)
@@ -6100,4 +6243,5 @@ function M.emit(ast, opts)
 	return table.concat(o, "\n") .. "\n"
 end
 
+M.EF = EF
 return M
