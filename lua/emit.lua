@@ -3831,6 +3831,23 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
 			-- cf-signal wrapper and opts.redir. A flag form (`command -v`, `command -p`) delegates.
 			if cmd == "command" and st.words[2] and not st.assigns then
 				local w2 = st.words[2].parts[1]
+				-- `command -v/-V NAME…`: a pure lookup query (alias/keyword/builtin/function/PATH)
+				-- -> rt.command_query, exactly interp's branch; no execution, so no exec_stmt.
+				if w2 and #st.words[2].parts == 1 and (w2.lit == "-v" or w2.lit == "-V") and st.words[3] then
+					local qbody = field_argv(st.words, 1, lifted, nil, nil)
+					local q_redir = nil
+					if qbody and st.redirs then
+						q_redir = redir_conds(st, nil)
+					end
+					if qbody and not (st.redirs and not q_redir) then
+						return delegate(st, after, {
+							prelude = qbody,
+							callee = "rt.command_query",
+							callargs = "sh, __a",
+							redir = q_redir,
+						})
+					end
+				end
 				if not (w2 and w2.lit and w2.lit:sub(1, 1) == "-") then -- not a flag / --
 					local argvbody = field_argv(st.words, 2, lifted, nil, nil)
 					local cmd_redir = nil

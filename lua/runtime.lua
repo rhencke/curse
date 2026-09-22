@@ -5040,6 +5040,47 @@ function M.eval(sh, argv)
 	end
 end
 
+-- `command -v NAME…` / `command -V NAME…`: a lookup query (is NAME an alias/keyword/
+-- builtin/function/PATH file?) — no execution, so compile it to this rt.* dispatch instead
+-- of delegating. name_type is the runtime resolver interp uses; the argv is already expanded
+-- by the field engine. Mirrors interp's command -v/-V branch exactly (status 0 if ANY name
+-- resolved). Combined/other flags stay with the interpreter.
+function M.command_query(sh, argv)
+	local I = require("interp")._int
+	local verbose = argv[2] == "-V"
+	local anyfound = false
+	for j = 3, #argv do
+		local k, p = I.name_type(sh, argv[j])
+		if not k then
+			if verbose then
+				io.stderr:write("curse: command: " .. argv[j] .. ": not found\n")
+			end
+		else
+			anyfound = true
+			if verbose then
+				if k == "alias" then
+					sh:echo(argv[j] .. " is aliased to `" .. sh.aliases[argv[j]] .. "'")
+				elseif k == "file" then
+					sh:echo(argv[j] .. " is " .. p)
+				elseif k == "function" then
+					sh:echo(argv[j] .. " is a function")
+					local d = I.func_body_text(sh, argv[j])
+					if d then
+						sh:echo(d)
+					end
+				elseif k == "keyword" then
+					sh:echo(argv[j] .. " is a shell keyword")
+				else
+					sh:echo(argv[j] .. " is a shell builtin")
+				end
+			else
+				sh:echo(k == "file" and p or argv[j])
+			end
+		end
+	end
+	sh.status = anyfound and 0 or 1
+end
+
 -- `source FILE [args]` / `. FILE [args]`: run FILE in the CURRENT shell, COMPILED as a
 -- fragment (return/break/continue/exit propagate; scope shared) with $1.. set to the args.
 -- Anything the compiled path can't handle — a missing/directory file, an alias or syntax
