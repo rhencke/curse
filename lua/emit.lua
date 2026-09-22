@@ -719,12 +719,21 @@ local function errchk(st) -- the guard statement for `st`, or "" when errexit ne
 	if not (st and ERREXIT_TYPES[st.t] and not st.negate) then
 		return ""
 	end
+	-- Inside a compiled subshell body, an errexit failure exits the SUBSHELL (rt.subshell_exit —
+	-- _exit with the status, like the body's normal boundary), NOT the whole shell: raising
+	-- __curse_exit would unwind to the parent's finish_run and wrongly run the shell's EXIT trap
+	-- in the forked child. noerr (raised for a condition subshell) suppresses it, as always.
+	local exitfail = EF.subshell_exit_pc and "rt.subshell_exit(sh.status)" or "error({ __curse_exit = sh.status })"
 	if EF.has_err then -- ERR trap fires on the same condition as errexit; set $LINENO to this
 		-- command's line, fire ERR (fire_err_trap scopes by calldepth/in_subprogram — inside a
 		-- function/subshell only under errtrace), THEN errexit (bash order).
-		return ("if sh.noerr == 0 and sh.status ~= 0 then sh.cur_line = %d; I.fire_err_trap(sh); if sh.opt_e then error({ __curse_exit = sh.status }) end end"):format(
-			st.line or 0
+		return ("if sh.noerr == 0 and sh.status ~= 0 then sh.cur_line = %d; I.fire_err_trap(sh); if sh.opt_e then %s end end"):format(
+			st.line or 0,
+			exitfail
 		)
+	end
+	if EF.subshell_exit_pc then
+		return ("if sh.opt_e and sh.noerr == 0 and sh.status ~= 0 then %s end"):format(exitfail)
 	end
 	return ERRCHK
 end
@@ -5049,10 +5058,13 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
 			if body_runs_set(st.body) then
 				return delegate(st, after)
 			end
-			-- Under errexit INHERITED at entry, likewise delegate at runtime (the fork +
-			-- errexit enforcement happen in the interpreter). errexit is off in the
-			-- hot-loop case, so the compiled fork+body path still applies for speed.
-			local delpc = delegate(st, after)
+			-- errexit INHERITED at entry is now COMPILED: the forked child runs the body with
+			-- errchk guards that exit the SUBSHELL on a failing command (EF.subshell_exit_pc, set
+			-- below), and a condition subshell auto-suppresses via the inherited sh.noerr (the
+			-- enclosing if/while/&&/|| already raised it). A trap program keeps delegating the
+			-- errexit case (ERR/DEBUG per-command + a forked child's trap reset are interp-side).
+			local errexit_deleg = EF.has_err or EF.has_debug or EF.has_trap
+			local delpc = errexit_deleg and delegate(st, after) or nil
 			local exitpc = newpc()
 			blocks[exitpc] = "rt.subshell_exit(sh.status or 0)"
 			-- A subshell is a fork: break/continue inside it target only loops WITHIN the
@@ -5061,13 +5073,16 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
 			-- bash), then restore it for the parent's control flow.
 			local saved_loops = loopstack
 			loopstack = {}
+			local saved_ssx = EF.subshell_exit_pc -- errchk in the body exits THIS subshell (restored after)
+			EF.subshell_exit_pc = exitpc
 			subexit[#subexit + 1] = exitpc -- `return` in the body exits THIS subshell
 			local bodyentry = flatten_list(st.body, exitpc)
 			subexit[#subexit] = nil
+			EF.subshell_exit_pc = saved_ssx
 			loopstack = saved_loops
 			local p = newpc()
-			-- ERR trap after a failing subshell (`( exit 42 )`) fires in the PARENT; the
-			-- errexit path already delegated above, so this errchk only fires ERR (opt_e false).
+			-- errexit/ERR after a failing subshell fires in the PARENT — this errchk uses the
+			-- ENCLOSING context (restored above): exits the enclosing subshell (if any) or the shell.
 			local ec = errchk(st)
 			local ecs = ec ~= "" and ("; " .. ec) or ""
 			-- The forked child sets sh._ff = the subshell's exit pc, so a lineabort raised in the
@@ -5080,12 +5095,18 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
 			local child = sub_redir
 					and ("sh._ff = %d; local __rs = {}; local _ = %s; pc = %d"):format(exitpc, sub_redir, bodyentry)
 				or ("sh._ff = %d; pc = %d"):format(exitpc, bodyentry)
-			blocks[p] = ("if sh.opt_e then pc = %d else local __pid = rt.subshell_fork(sh); if __pid == 0 then %s else sh.status = rt.subshell_wait(__pid)%s; pc = %d end end"):format(
-				delpc,
+			local fork = ("local __pid = rt.subshell_fork(sh); if __pid == 0 then %s else sh.status = rt.subshell_wait(__pid)%s; pc = %d end"):format(
 				child,
 				ecs,
 				after
 			)
+			-- Non-trap program: always fork (errexit handled in the child via subshell-exit errchk).
+			-- Trap program: under errexit, delegate (delpc) — ERR/DEBUG per-command semantics are interp-side.
+			if errexit_deleg then
+				blocks[p] = ("if sh.opt_e then pc = %d else %s end"):format(delpc, fork)
+			else
+				blocks[p] = fork
+			end
 			return p
 		elseif t == "group" then
 			-- { list; }: not a subshell — just a sequence in the current shell. Flatten the
