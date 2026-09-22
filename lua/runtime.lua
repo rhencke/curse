@@ -518,22 +518,50 @@ end
 M.co_task = co_task
 -- Save a copy of `fd` for a later restore — the way bash does: close-on-exec (a
 -- spawned child must never inherit the shell's saved copy; e.g. a saved dup of a
--- pipe's write end would keep that pipe's reader from ever seeing EOF) and at fd >= 10
--- (so it can't collide with a user redirect of fds 3-9). -1 if `fd` isn't open.
-function M.save_fd(fd)
-	return C.curse_co_fcntl3(fd, 1030, 10) -- F_DUPFD_CLOEXEC
+-- pipe's write end would keep that pipe's reader from ever seeing EOF) and at fd >= FD_BASE
+-- (so it can't collide with any fd a script redirects or allocates). -1 if `fd` isn't open.
+--
+-- WHERE: far above anything a script names. bash keeps its own fds near 255 and hands
+-- out `{var}` fds from 10 up, and a script may redirect any number it likes — so the
+-- shell's plumbing starts at FD_BASE (4096; under a small RLIMIT_NOFILE, 256 below the
+-- soft limit). Not higher: fork/spawn copies the fd table up to the highest OPEN fd, so a
+-- six-digit fd would tax every external. If a script's `ulimit -n` puts FD_BASE out of
+-- reach (EINVAL), fall back to >= 10, then to any fd.
+local FD_BASE = 4096
+do
+	ffi.cdef("struct curse_rt_rlimit { unsigned long cur, max; };"
+		.. "int curse_rt_getrlimit(int res, struct curse_rt_rlimit *r) asm(\"getrlimit\");")
+	local rl = ffi.new("struct curse_rt_rlimit")
+	if C.curse_rt_getrlimit(7, rl) == 0 and rl.cur < FD_BASE + 256 then -- RLIMIT_NOFILE
+		FD_BASE = math.max(10, tonumber(rl.cur) - 256)
+	end
 end
--- Move an internal fd out of the user range: a CLOEXEC copy at >= 10, original closed.
+M.FD_BASE = FD_BASE
+local function dup_hi(fd)
+	local d = C.curse_co_fcntl3(fd, 1030, FD_BASE) -- F_DUPFD_CLOEXEC
+	if d < 0 and fd >= 0 and ffi.errno() ~= 9 then -- not EBADF: the base is out of reach
+		d = C.curse_co_fcntl3(fd, 1030, 10)
+		if d < 0 and ffi.errno() ~= 9 then
+			d = C.curse_co_fcntl3(fd, 1030, 0)
+		end
+	end
+	return d
+end
+M.dup_hi = dup_hi
+function M.save_fd(fd)
+	return dup_hi(fd)
+end
+-- Move an internal fd out of the user range: a CLOEXEC copy at FD_BASE+, original closed.
 local function fd_hi(fd)
-	if fd < 0 or fd >= 10 then
+	if fd < 0 or fd >= FD_BASE then
 		return fd
 	end
-	local d = C.curse_co_fcntl3(fd, 1030, 10)
+	local d = dup_hi(fd)
 	C.close(fd)
 	return d
 end
 -- pipe() for the shell's OWN plumbing (capture pipes, stage pipes): both ends at
--- >= 10 and close-on-exec, like bash — so they can't be clobbered by (or clobber) a
+-- >= FD_BASE and close-on-exec, like bash — so they can't be clobbered by (or clobber) a
 -- user redirect of fds 3-9, never leak into a spawned external (a leaked write end
 -- starves its reader of EOF), and survive a pipeline stage's per-switch fd swap.
 -- A child that needs one dup2s it onto 0/1, which clears CLOEXEC there.
@@ -1811,8 +1839,8 @@ local function env_same(a, b) -- same entries, pointer for pointer?
 		i = i + 1
 	end
 end
-local function co_cx(ctx, fd) -- CLOEXEC dup >= 10, tracked so a forked child can drop it
-	local d = C.curse_co_fcntl3(fd, 1030, 10) -- F_DUPFD_CLOEXEC
+local function co_cx(ctx, fd) -- CLOEXEC dup >= FD_BASE, tracked so a forked child can drop it
+	local d = dup_hi(fd)
 	if d >= 0 then
 		ctx.fds[d] = true
 	end

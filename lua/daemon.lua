@@ -49,6 +49,9 @@ ffi.cdef([[
   int fork(void);
   int dup2(int a, int b);
   long syscall(long number, ...);
+  struct curse_d_rlimit { unsigned long cur, max; };
+  int curse_d_getrlimit(int res, struct curse_d_rlimit *r) asm("getrlimit");
+  int curse_d_setrlimit(int res, const struct curse_d_rlimit *r) asm("setrlimit");
   struct curse_d_pollfd { int fd; short events; short revents; };
   int curse_d_poll(struct curse_d_pollfd *fds, unsigned long n, int timeout) asm("poll");
   int chdir(const char *path);
@@ -83,7 +86,11 @@ local C = ffi.C
 -- number goes through a variadic call as a double, so F_DUPFD reads garbage for the minimum
 -- and hands back a LOW fd — silently defeating the move. A boxed int cdata is passed as int.
 local F_DUPFD_CLOEXEC = 1030 -- Linux: F_LINUX_SPECIFIC_BASE(1024)+6
-local FD_HIGH_MIN = ffi.new("int", 200) -- well above any fd a script redirects to
+-- The daemon's own few fds sit in [D_LO, D_HI), just under the shell's internal range
+-- (rt.FD_BASE): far above anything a script redirects to or `{var}`-allocates.
+local D_LO = math.max(3, rt.FD_BASE - 64)
+local D_HI = rt.FD_BASE
+local FD_HIGH_MIN = ffi.new("int", D_LO)
 local function fd_move_high(fd)
 	if fd < 0 then
 		return fd
@@ -248,11 +255,28 @@ local function serve_request(cfd, req, fds, ctx)
 		C.dup2(ctx.devnull, 1)
 		C.dup2(ctx.devnull, 2)
 	end
-	-- ...and every other script-visible fd: a user `exec 3>file` must not persist into the
-	-- next request, nor may a shell-internal save (>= 10) a raise skipped restoring. The
-	-- daemon's own fds all live at >= 200 (fd_move_high), so one close_range covers it.
-	C.syscall(436, ffi.new("int", 3), ffi.new("int", 199), ffi.new("int", 0)) -- close_range
+	-- ...and every other fd: a user `exec 3>file` must not persist into the next request,
+	-- nor may a shell-internal save (>= rt.FD_BASE) a raise skipped restoring. Everything
+	-- but the daemon's own [D_LO, D_HI) goes.
+	C.syscall(436, ffi.new("int", 3), ffi.new("int", D_LO - 1), ffi.new("int", 0)) -- close_range
+	C.syscall(436, ffi.new("unsigned int", D_HI), ffi.new("unsigned int", 0xFFFFFFFF), ffi.new("int", 0))
+	-- ...and resource limits: a script's `ulimit -n 6` would otherwise cap every later
+	-- request on this worker (fds can't be moved high -> plumbing collides). A lowered
+	-- SOFT limit is restored; a lowered HARD limit can't be raised again unprivileged, so
+	-- the worker RETIRES after this request and the parent spawns a clean one.
+	local retire = false
+	local cur = ffi.new("struct curse_d_rlimit")
+	for res, orig in pairs(ctx.rlimits) do
+		if C.curse_d_getrlimit(res, cur) == 0 and (cur.cur ~= orig.cur or cur.max ~= orig.max) then
+			if cur.max < orig.max then
+				retire = true
+			else
+				C.curse_d_setrlimit(res, orig)
+			end
+		end
+	end
 	ctx.active[0] = os.time() -- stamp the shared activity clock (drives the parent's idle-drain)
+	return retire
 end
 
 local WORKER_IDLE = 99 -- worker exit code meaning "accept() timed out" (parent may drain)
@@ -281,6 +305,7 @@ local function worker_main(lfd, my_uid, ctx, slot)
 	local credlen = ffi.new("unsigned int[1]")
 	local served = 0
 	while true do
+		local retire = false
 		local cfd = C.accept(lfd, nil, nil)
 		if cfd < 0 then
 			local e = ffi.errno()
@@ -334,11 +359,14 @@ local function worker_main(lfd, my_uid, ctx, slot)
 						end
 						C.close(cfd)
 					else
-						serve_request(cfd, req, fds, ctx)
+						retire = serve_request(cfd, req, fds, ctx)
 					end
 				end
 			end
 			ctx.busy[slot] = 0
+			if retire then
+				C._exit(0) -- not WORKER_IDLE: the parent replenishes the pool
+			end
 			served = served + 1
 			if served % 64 == 0 then
 				collectgarbage("collect")
@@ -428,7 +456,22 @@ local function serve()
 	-- parent see when EVERY worker is serving, so a nested request isn't stranded.
 	local MAXW = 256
 	local busy = ffi.cast("int *", C.mmap(nil, 4 * MAXW, PROT_RW, MAP_SHARED_ANON, -1, 0))
-	local ctx = { umask = orig_umask, empty_sigset = empty_sigset, devnull = devnull, active = active, busy = busy }
+	-- The resource limits every request starts from (RLIMIT_CPU .. RLIMIT_RTTIME).
+	local rlimits = {}
+	for res = 0, 15 do
+		local r = ffi.new("struct curse_d_rlimit")
+		if C.curse_d_getrlimit(res, r) == 0 then
+			rlimits[res] = r
+		end
+	end
+	local ctx = {
+		umask = orig_umask,
+		empty_sigset = empty_sigset,
+		devnull = devnull,
+		active = active,
+		busy = busy,
+		rlimits = rlimits,
+	}
 
 	-- PERSISTENT PREFORK POOL: POOL warm workers blocked in accept(), each serving many
 	-- requests IN-PROCESS with no per-request fork. The kernel wakes exactly one worker
