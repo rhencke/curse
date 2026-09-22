@@ -1337,8 +1337,12 @@ local SUBSHELL_FORK_VARS = { BASHPID = 1, BASH_SUBSHELL = 1, RANDOM = 1, SRANDOM
 -- reachable set is unknowable, and the in-process capture can't reproduce a forked child's fd
 -- view (e.g. a builtin's `2>&1` error output), so fork them (per-command, so it's caught even
 -- inside a function body, unlike the program-wide has_dyncode gate).
+-- (3) `wait`: a subshell/stage can't wait for the PARENT's jobs (not its children), but
+-- in-process they ARE this process's children — it would block on them. (Its own `&` jobs
+-- already force a fork.)
 local SUBSHELL_FORK_BUILTINS = {
 	exec = 1, ulimit = 1, enable = 1, disable = 1, set = 1, eval = 1, source = 1, ["."] = 1,
+	wait = 1,
 }
 local function word_forces_fork(w)
 	if not w or not w.parts then return false end
@@ -3112,48 +3116,6 @@ local function analyze_lift(ast)
 	end
 	return lifted
 end
-
--- Which functions can a pipeline stage NOT call while running IN-PROCESS under the
--- coroutine scheduler? Everything subshell-unsafe, plus any function that touches a
--- lifted var: a stage fragment keeps vars in its own cloned sh, but such a function's
--- fn_x reads/writes the SHARED v_x upvalue — concurrent stages (and the parent) would
--- see each other's writes. Such a stage forks instead. Propagated to callers.
-local function compute_pipe_unsafe(stmts, funcflags, lifted, sub_unsafe)
-	local unsafe = {}
-	for name in pairs(sub_unsafe) do
-		unsafe[name] = true
-	end
-	local bodies = {}
-	for _, st in ipairs(stmts) do
-		if st.t == "funcdef" and funcflags[st.name] then
-			bodies[st.name] = st.body
-		end
-	end
-	for name, body in pairs(bodies) do
-		if not unsafe[name] and next(lifted) then
-			local touched = {}
-			collect_names(body, touched)
-			for v in pairs(touched) do
-				if lifted[v] then
-					unsafe[name] = true
-					break
-				end
-			end
-		end
-	end
-	local changed = true
-	while changed do
-		changed = false
-		for name, body in pairs(bodies) do
-			if not unsafe[name] and not EF.subshell_inproc_ok(body, unsafe) then
-				unsafe[name] = true
-				changed = true
-			end
-		end
-	end
-	return unsafe
-end
-EF.compute_pipe_unsafe = compute_pipe_unsafe -- M.emit calls it via EF (upvalue cap)
 
 -- Does a function need a positional-param swap / a `local` frame? A call to a
 -- function that needs neither is emitted bare (fn_x(sh)); one that needs only
@@ -5452,15 +5414,20 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
 				-- it as a negated fragment so its OWN errexit is exempt (bash), while a called
 				-- function's internal errexit still fires (fn_x). Real pipe stages (n>=2) fork,
 				-- so they compile normally (a stage's errexit just exits its own child).
-				local id = emit_fragment({ st.cmds[i] }, n == 1 and st.negate)
+				-- compiled WITH the upval lift set: a stage and the functions it calls share
+				-- `v_x`; the scheduler swaps those upvalues per stage like its fds.
+				local id = emit_fragment({ st.cmds[i] }, n == 1 and st.negate, EF.lifted_set)
 				if not id then
 					return delegate(st, after)
 				end
 				frags[i] = "cs_" .. id
 			end
-			local reload = {}
+			local reload = {} -- run-local lifted vars only: stages keep those in sh (a lastpipe
+			-- stage writes the shell's own); upvalues are swapped/restored by the scheduler
 			for nm in pairs(lifted) do
-				reload[#reload + 1] = ("%s = sh:aget(%q)"):format(lname(nm), nm)
+				if not EF.lifted_set[nm] then
+					reload[#reload + 1] = ("%s = sh:aget(%q)"):format(lname(nm), nm)
+				end
 			end
 			local post = #reload > 0 and ("; " .. table.concat(reload, "; ")) or ""
 			local p = newpc()
@@ -5469,16 +5436,17 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
 			local ec = st.negate and "" or errchk(st)
 			local ecs = ec ~= "" and ("; " .. ec) or ""
 			-- Per stage: run IN-PROCESS under the coroutine scheduler, or fork (a stage that
-			-- needs a real child, or calls a function writing a shared lifted upvalue).
+			-- needs a real child: exec, ulimit, set, eval, … — EF.sub_unsafe_fn).
 			local inproc = {}
 			for i = 1, n do
 				inproc[i] = tostring(n >= 2 and not EF.has_dyncode
-					and EF.subshell_inproc_ok({ st.cmds[i] }, EF.pipe_unsafe_fn))
+					and EF.subshell_inproc_ok({ st.cmds[i] }))
 			end
 			blocks[p] = dbg(st)
 				.. lifted_flush(lifted)
-				.. ("sh:run_pipeline({%s}, %s, {%s})"):format(
-					table.concat(frags, ", "), st.negate and "true" or "false", table.concat(inproc, ", "))
+				.. ("sh:run_pipeline({%s}, %s, {%s}%s)"):format(
+					table.concat(frags, ", "), st.negate and "true" or "false", table.concat(inproc, ", "),
+					(EF.lifted_names and #EF.lifted_names > 0) and ", __upv_get, __upv_set" or "")
 				.. post
 				.. ecs
 				.. ("; pc = %d"):format(after)
@@ -6007,7 +5975,6 @@ function M.emit(ast, opts)
 		end
 		EF.sub_unsafe_fn = unsafe
 	end
-	EF.pipe_unsafe_fn = EF.compute_pipe_unsafe(ast.stmts, funcflags, lifted, EF.sub_unsafe_fn)
 	local upvals, runlocals = {}, {}
 	for n in pairs(lifted) do
 		if funcTouched[n] then
@@ -6058,6 +6025,9 @@ function M.emit(ast, opts)
 		local vlist, slist = table.concat(vs, ", "), table.concat(sav, ", ")
 		o[#o + 1] = ("local function __iso_cmdsub(sh, cs, bt) local %s = %s; local __o = sh:capture_compiled_iso(cs, bt); %s = %s; return __o end"):format(
 			slist, vlist, vlist, slist)
+		-- ...and for the pipeline scheduler, which swaps them per stage at context switch.
+		o[#o + 1] = ("local function __upv_get() return %s end"):format(vlist)
+		o[#o + 1] = ("local function __upv_set(%s) %s = %s end"):format(slist, vlist, slist)
 	end
 	local decls = {}
 	for name in pairs(funcflags) do

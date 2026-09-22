@@ -1779,248 +1779,275 @@ local function env_copy(envp)
 	return a
 end
 local _co_cwdbuf = ffi.new("char[4096]")
-local _co_pst = ffi.new("int[2]")
+local function cwd_str()
+	local p = C.curse_co_getcwd(_co_cwdbuf, 4096)
+	return p ~= nil and ffi.string(p) or nil
+end
+local function env_same(a, b) -- same entries, pointer for pointer?
+	local i = 0
+	while true do
+		if a[i] ~= b[i] then
+			return false
+		end
+		if a[i] == nil then
+			return true
+		end
+		i = i + 1
+	end
+end
+local function co_cx(ctx, fd) -- CLOEXEC dup >= 10, tracked so a forked child can drop it
+	local d = C.curse_co_fcntl3(fd, 1030, 10) -- F_DUPFD_CLOEXEC
+	if d >= 0 then
+		ctx.fds[d] = true
+	end
+	return d
+end
+local function co_cl(ctx, fd)
+	if fd and fd >= 0 and ctx.fds[fd] then
+		ctx.fds[fd] = nil
+		C.close(fd)
+	end
+end
 
--- Run the pipeline under the scheduler. `inproc[i]` (decided at compile time): run
--- stage i in-process; otherwise it forks (a stage that needs a real child — exec,
--- ulimit, set, eval, … — see EF.pipe_unsafe_fn), still scheduled uniformly: its
--- task forks from inside the coroutine and waits on a pidfd. Returns nil (caller
--- falls back to the legacy fork path) if the scheduler can't be set up.
-function Shell:run_pipeline_co(stage_fns, inproc)
+-- Launch one pipeline invocation as a GROUP of tasks in scheduler `ctx`. `base` is the
+-- state the pipeline starts from (fds 0-9, environ, cwd, umask, lifted upvalues): the
+-- parent shell's for a top-level pipeline, the running stage's for a nested one. Each
+-- task starts from a copy of it; stage i's fd 0/1 are rewired to the stage pipes.
+local function co_launch(ctx, self, stage_fns, inproc, base, lastpipe, upv)
 	local n = #stage_fns
-	real_flush()
-	local ctx = { tasks = {}, bycoro = {}, fds = {} }
-	local function cx(fd) -- CLOEXEC dup >= 3, tracked so a forked child can drop it
-		local d = C.curse_co_fcntl3(fd, 1030, 10) -- F_DUPFD_CLOEXEC, clear of user fds 3-9
-		if d >= 0 then
-			ctx.fds[d] = true
+	local g = { n = n, alive = 0, status = {}, base = base, upv = upv }
+	local ins, outs = { base.fd[0] }, {}
+	local pst = ffi.new("int[2]")
+	local made = {}
+	local function fail()
+		for _, fd in ipairs(made) do
+			co_cl(ctx, fd)
 		end
-		return d
-	end
-	local function cl(fd)
-		if fd and fd >= 0 then
-			ctx.fds[fd] = nil
-			C.close(fd)
-		end
-	end
-	local o0, o1, o2 = cx(0), cx(1), cx(2)
-	if o0 < 0 or o1 < 0 or o2 < 0 then -- a std fd is closed (`<&-`): leave it to the fork path
-		cl(o0)
-		cl(o1)
-		cl(o2)
 		return nil
 	end
-	local ins, outs = { o0 }, {}
 	for i = 1, n - 1 do
-		if M.pipe_hi(_co_pst) ~= 0 then
-			for fd in pairs(ctx.fds) do
-				C.close(fd)
+		if M.pipe_hi(pst) ~= 0 then
+			return fail()
+		end
+		ctx.fds[pst[0]], ctx.fds[pst[1]] = true, true
+		made[#made + 1], made[#made + 2] = pst[0], pst[1]
+		outs[i], ins[i + 1] = pst[1], pst[0]
+	end
+	-- Output captured into a Lua buffer (a buffered `$()`): the last stage writes a pipe
+	-- that a DRAIN task empties into the capture as the data arrives.
+	local drain_r, drain_out
+	if self.capturing and self.out ~= io.write and not CO_OUTS[self.out] then
+		if M.pipe_hi(pst) ~= 0 then
+			return fail()
+		end
+		ctx.fds[pst[0]], ctx.fds[pst[1]] = true, true
+		made[#made + 1], made[#made + 2] = pst[0], pst[1]
+		drain_r, drain_out, outs[n] = pst[0], self.out, pst[1]
+	else
+		outs[n] = base.fd[1]
+	end
+	local function newtask(i, fd0, fd1)
+		local t = { i = i, g = g, fd = {}, sv = {}, own = {}, cwd = base.cwd, um = base.um, buf = {}, nbuf = 0, nbytes = 0 }
+		for k = 0, 9 do
+			t.fd[k] = base.fd[k]
+		end
+		t.fd[0], t.fd[1] = fd0, fd1
+		t.env = env_copy(base.env)
+		ctx.envs[#ctx.envs + 1] = t.env
+		if upv then
+			t.upv = { unpack(base.upv, 1, upv.n) }
+		end
+		return t
+	end
+	local function add(t, body)
+		t.co = coroutine.create(body)
+		ctx.bycoro[t.co] = t
+		ctx.runnable[#ctx.runnable + 1] = t
+		g.alive = g.alive + 1
+	end
+	local function stage_body(fn, sh, t)
+		return function()
+			local ok, err = pcall(fn, sh)
+			if not ok and type(err) == "table" and err.__curse_sigpipe then
+				return 141
 			end
-			return nil
+			M.child_status(sh, ok, err)
+			local fok, ferr = pcall(task_flush, t)
+			if not fok and type(ferr) == "table" and ferr.__curse_sigpipe then
+				return 141
+			end
+			return sh.status or 0
 		end
-		ctx.fds[_co_pst[0]], ctx.fds[_co_pst[1]] = true, true
-		outs[i], ins[i + 1] = _co_pst[1], _co_pst[0]
 	end
-	outs[n] = o1
-	-- The parent's user fds 3-9 too: a stage's `3>&-`/`5<&0`/`exec`-free redirect of a
-	-- high user fd is per-stage state (a forked stage owned its fd table), so fds 0-9 are
-	-- all swapped at context switch; pfd[k] is what's parked in between (-1: closed).
-	local pfd = { [0] = o0, o1, o2 }
-	for k = 3, 9 do
-		pfd[k] = cx(k)
-	end
-	local penv = C.environ
-	local pcwd = self:phys_cwd()
-	local pum = C.curse_co_umask(0)
-	C.curse_co_umask(pum)
-	ctx.oldmask = ffi.new("uint8_t[128]")
-	C.sigprocmask(0, _co_sigpipe, ctx.oldmask) -- SIG_BLOCK: a dead reader is EPIPE, not our death
-	local envs = {}
 	for i = 1, n do
-		local t = { i = i, fd = { [0] = ins[i], outs[i], o2 }, sv = {}, cwd = pcwd, um = pum, buf = {}, nbuf = 0, nbytes = 0 }
-		for k = 3, 9 do
-			t.fd[k] = pfd[k]
+		local t = newtask(i, ins[i], outs[i])
+		if ins[i] ~= base.fd[0] then
+			t.own[#t.own + 1] = ins[i]
 		end
-		t.env = env_copy(penv)
-		envs[i] = t.env
+		if outs[i] ~= base.fd[1] then
+			t.own[#t.own + 1] = outs[i]
+		end
 		local fn = stage_fns[i]
-		if inproc[i] then
+		if lastpipe and i == n then
+			-- `shopt -s lastpipe`: the last stage runs IN the shell itself (its side effects
+			-- persist). Its clones-to-be were all taken above, so rebinding out is safe.
+			g.lp, g.lp_out = t, self.out
+			self.out = make_out(t)
+			add(t, stage_body(fn, self, t))
+		elseif inproc[i] then
 			local sh = self:stage_clone()
 			sh.out = make_out(t)
-			t.co = coroutine.create(function()
-				local ok, err = pcall(fn, sh)
-				if not ok and type(err) == "table" and err.__curse_sigpipe then
-					return 141
-				end
-				M.child_status(sh, ok, err)
-				local fok, ferr = pcall(task_flush, t)
-				if not fok and type(ferr) == "table" and ferr.__curse_sigpipe then
-					return 141
-				end
-				return sh.status or 0
-			end)
-		else
-			local parent = self
-			t.co = coroutine.create(function()
+			add(t, stage_body(fn, sh, t))
+		else -- needs a real child: fork from inside the task, wait on a pidfd
+			add(t, function()
 				local pid = M.fork()
-				if pid == 0 then -- the child owns fd 0/1/2 as installed for this stage
-					parent.in_pipestage = (parent.in_pipestage or 0) + 1
+				if pid == 0 then -- the child owns fds 0-9 as installed for this stage
+					self.in_pipestage = (self.in_pipestage or 0) + 1
 					local ok, err = pcall(function()
-						parent.out = io.write
-						fn(parent)
+						self.out = io.write
+						fn(self)
 					end)
-					M.child_status(parent, ok, err)
+					M.child_status(self, ok, err)
 					io.flush()
-					C._exit(parent.status or 0)
+					C._exit(self.status or 0)
 				end
 				local st = ffi.new("int[1]")
 				M.wait_child(pid, st, 0)
 				return M.wexit(st[0])
 			end)
 		end
-		ctx.tasks[i] = t
-		ctx.bycoro[t.co] = t
 	end
+	if drain_r then
+		local t = newtask(0, base.fd[0], base.fd[1])
+		t.own[1], t.drain = drain_r, true
+		add(t, function()
+			local rbuf = ffi.new("char[65536]")
+			while true do
+				M.co_block(drain_r, POLLIN)
+				local nr = tonumber(C.read(drain_r, rbuf, 65536))
+				if not nr or nr <= 0 then
+					break
+				end
+				drain_out(ffi.string(rbuf, nr))
+			end
+			return 0
+		end)
+	end
+	return g
+end
 
-	local status, alive, cur_cwd = {}, n, pcwd
-	local runnable = {}
-	for i = 1, n do
-		runnable[i] = ctx.tasks[i]
-	end
-	local pf = ffi.new("struct curse_co_pollfd[?]", n)
-	CO = ctx
-	local ok_all, err_all = pcall(function()
-		while alive > 0 do
-			for _, t in ipairs(runnable) do
-				for fd = 0, 9 do -- install the stage's fds 0-9 (-1: it had closed it)
-					if t.fd[fd] >= 0 then
-						C.dup2(t.fd[fd], fd)
-					else
-						C.close(fd)
-					end
-				end
-				C.environ = t.env
-				if t.cwd ~= cur_cwd then
-					C.curse_co_chdir(t.cwd)
-					cur_cwd = t.cwd
-				end
-				C.curse_co_umask(t.um)
-				local rok, a, b = coroutine.resume(t.co)
-				-- save the stage's process state, then park on the parent's
-				t.env = C.environ
-				t.um = C.curse_co_umask(pum)
-				C.environ = penv
-				local p = C.curse_co_getcwd(_co_cwdbuf, 4096)
-				if p ~= nil then
-					cur_cwd = ffi.string(p)
-				end
-				if coroutine.status(t.co) == "dead" then
-					if not rok then -- an internal error escaped the stage's own pcall
-						io.stderr:write("curse: pipeline stage: " .. tostring(a) .. "\n")
-					end
-					status[t.i] = rok and (a or 0) or 1
-					t.done, t.wait = true, nil
-					alive = alive - 1
-				else
-					t.cwd = cur_cwd
-					for fd = 0, 9 do -- the stage's CURRENT fds 0-9 (a redirect may be active)
-						cl(t.sv[fd])
-						local d = cx(fd)
-						t.sv[fd], t.fd[fd] = d, d
-					end
-					t.wait, t.wev = a, b
-				end
-				for fd = 0, 9 do -- park on the parent's fds
-					if pfd[fd] >= 0 then
-						C.dup2(pfd[fd], fd)
-					else
-						C.close(fd)
-					end
-				end
-				if cur_cwd ~= pcwd then
-					C.curse_co_chdir(pcwd)
-					cur_cwd = pcwd
-				end
-				if t.done then -- release its pipe ends: EOF downstream, EPIPE upstream
-					for fd = 0, 9 do
-						cl(t.sv[fd])
-					end
-					if ins[t.i] ~= o0 then
-						cl(ins[t.i])
-					end
-					if outs[t.i] ~= o1 then
-						cl(outs[t.i])
-					end
-				end
-			end
-			if alive == 0 then
-				break
-			end
-			local cnt, tick = 0, false
-			for i = 1, n do
-				local t = ctx.tasks[i]
-				if not t.done then
-					local w = t.wait
-					if w == -1 then
-						tick = true
-					else
-						if w <= 2 then
-							w = t.fd[w] -- a std fd: poll the stage's own saved copy
-						end
-						pf[cnt].fd, pf[cnt].events, pf[cnt].revents = w, t.wev, 0
-						cnt = cnt + 1
-					end
-				end
-			end
-			local r = C.curse_co_poll(pf, cnt, tick and 10 or -1)
-			runnable = {}
-			local k = 0
-			for i = 1, n do
-				local t = ctx.tasks[i]
-				if not t.done then
-					if t.wait == -1 then
-						if tick then
-							runnable[#runnable + 1] = t
-						end
-					else
-						if r > 0 and pf[k].revents ~= 0 then
-							runnable[#runnable + 1] = t
-						end
-						k = k + 1
-					end
-				end
-			end
-		end
-	end)
-	CO = nil
-	for fd = 0, 9 do
-		if pfd[fd] >= 0 then
-			C.dup2(pfd[fd], fd)
+-- Resume one task with its process state installed; afterwards save its state and park
+-- the process on the top-level parent's (P) — so between resumes no stale copy of any
+-- stage's pipe end is live on fds 0-9, and the parent's view is intact.
+local function co_resume(ctx, t)
+	local P = ctx.P
+	for fd = 0, 9 do -- install the stage's fds 0-9 (-1: it had closed it)
+		if t.fd[fd] >= 0 then
+			C.dup2(t.fd[fd], fd)
 		else
 			C.close(fd)
 		end
 	end
-	C.environ = penv
-	C.curse_co_umask(pum)
-	if cur_cwd ~= pcwd then
-		C.curse_co_chdir(pcwd)
+	C.environ = t.env
+	if t.cwd ~= ctx.cur_cwd then
+		C.curse_co_chdir(t.cwd)
+		ctx.cur_cwd = t.cwd
 	end
-	for fd in pairs(ctx.fds) do
-		C.close(fd)
+	C.curse_co_umask(t.um)
+	local g = t.g
+	if g.upv then
+		g.upv.set(unpack(t.upv, 1, g.upv.n))
 	end
-	C.curse_co_sigtimedwait(_co_sigpipe, nil, _co_zero_ts) -- drop a SIGPIPE still pending
-	C.sigprocmask(2, ctx.oldmask, nil)
-	for i = 1, n do
-		C.curse_co_free(envs[i])
+	local rok, a, b = coroutine.resume(t.co)
+	-- save the stage's process state
+	t.env = C.environ
+	t.um = C.curse_co_umask(P.um)
+	C.environ = P.env
+	t.cwd = cwd_str() or ctx.cur_cwd
+	ctx.cur_cwd = t.cwd
+	if g.upv then
+		t.upv = { g.upv.get() }
 	end
-	if not ok_all then
-		error(err_all)
+	local dead = coroutine.status(t.co) == "dead"
+	if not dead or t == g.lp then -- its CURRENT fds 0-9 (a redirect may be active; lastpipe keeps them)
+		for fd = 0, 9 do
+			co_cl(ctx, t.sv[fd])
+			local d = co_cx(ctx, fd)
+			t.sv[fd], t.fd[fd] = d, d
+		end
+	end
+	for fd = 0, 9 do -- park on the parent's fds
+		if P.fd[fd] >= 0 then
+			C.dup2(P.fd[fd], fd)
+		else
+			C.close(fd)
+		end
+	end
+	if ctx.cur_cwd ~= P.cwd then
+		C.curse_co_chdir(P.cwd)
+		ctx.cur_cwd = P.cwd
+	end
+	if dead then
+		if not rok then -- an internal error escaped the stage's own pcall
+			io.stderr:write("curse: pipeline stage: " .. tostring(a) .. "\n")
+		end
+		if not t.drain then
+			g.status[t.i] = rok and (a or 0) or 1
+		end
+		t.done, t.wait = true, nil
+		ctx.bycoro[t.co] = nil
+		if t ~= g.lp then
+			for fd = 0, 9 do
+				co_cl(ctx, t.sv[fd])
+			end
+		end
+		for _, fd in ipairs(t.own) do -- release its pipe ends: EOF downstream, EPIPE upstream
+			co_cl(ctx, fd)
+		end
+		g.alive = g.alive - 1
+		if g.alive == 0 and g.waiter then -- a stage waiting on this nested pipeline
+			ctx.runnable[#ctx.runnable + 1] = g.waiter
+			g.waiter.wait = nil
+		end
+	elseif type(a) == "table" then -- waiting on a nested pipeline group
+		t.wait = a
+	else
+		t.wait, t.wev = a, b
+	end
+end
+
+-- Finish a group: adopt a lastpipe stage's state into the (now current) shell, set
+-- $PIPESTATUS/$?.
+local function co_finish(ctx, self, g)
+	local lp = g.lp
+	if lp then
+		self.out = g.lp_out
+		for k = 3, 9 do -- fds the last stage opened/closed persist, like the shell's own
+			if lp.fd[k] >= 0 then
+				C.dup2(lp.fd[k], k)
+			else
+				C.close(k)
+			end
+		end
+		for k = 0, 9 do
+			co_cl(ctx, lp.sv[k])
+		end
+		C.environ = env_same(lp.env, g.base.env) and g.base.env or lp.env
+		local cw = cwd_str()
+		if lp.cwd ~= cw then
+			C.curse_co_chdir(lp.cwd)
+		end
+		ctx.cur_cwd = lp.cwd
+		C.curse_co_umask(lp.um)
+		if g.upv then
+			g.upv.set(unpack(lp.upv, 1, g.upv.n))
+		end
 	end
 	local last, pipe, pstat = 0, 0, {}
-	for k = 1, n do
-		local est = status[k] or 0
+	for k = 1, g.n do
+		local est = g.status[k] or 0
 		pstat[k] = tostring(est)
-		if k == n then
+		if k == g.n then
 			last = est
 		end
 		if est ~= 0 then
@@ -2029,20 +2056,176 @@ function Shell:run_pipeline_co(stage_fns, inproc)
 	end
 	self:array_assign("PIPESTATUS", pstat, false)
 	self.status = self.opt_pipefail and pipe or last
-	return true
 end
 
-function Shell:run_pipeline(stage_fns, negate, inproc)
+-- Run the pipeline under the scheduler. `inproc[i]` (compile time): run stage i
+-- in-process; otherwise it forks (a stage that needs a real child — exec, ulimit,
+-- set, eval, … see EF.sub_unsafe_fn), scheduled uniformly. `upv_get/upv_set` (when the
+-- module has lifted upvalues) let the scheduler swap them per stage like fds. A
+-- pipeline nested inside a running stage joins the SAME scheduler as a new group and
+-- that stage waits on it. Returns nil (caller falls back to forking) on setup failure.
+function Shell:run_pipeline_co(stage_fns, inproc, lastpipe, upv_get, upv_set)
+	local upv
+	if upv_get then
+		upv = { get = upv_get, set = upv_set, n = select("#", upv_get()) }
+	end
+	if CO then -- nested: the running stage launches a group and waits on it
+		local T = co_task()
+		if not T then
+			return nil
+		end
+		local ctx = CO
+		pre_yield(T) -- T's buffered output must precede its sub-stages'
+		local base = { fd = {}, env = C.environ, cwd = cwd_str() or ctx.cur_cwd }
+		for k = 0, 9 do
+			base.fd[k] = co_cx(ctx, k)
+		end
+		base.um = C.curse_co_umask(0)
+		C.curse_co_umask(base.um)
+		if upv then
+			base.upv = { upv_get() }
+		end
+		local g = co_launch(ctx, self, stage_fns, inproc, base, lastpipe, upv)
+		if g and g.alive > 0 then
+			g.waiter = T
+			coroutine.yield(g)
+		end
+		for k = 0, 9 do
+			co_cl(ctx, base.fd[k])
+		end
+		if not g then
+			return nil
+		end
+		co_finish(ctx, self, g)
+		return true
+	end
+
+	real_flush()
+	local ctx = { bycoro = {}, fds = {}, envs = {}, runnable = {} }
+	local P = { fd = {}, env = C.environ, cwd = self:phys_cwd() }
+	for k = 0, 9 do
+		P.fd[k] = co_cx(ctx, k)
+	end
+	if P.fd[0] < 0 or P.fd[1] < 0 or P.fd[2] < 0 then -- a std fd is closed: fork path
+		for fd in pairs(ctx.fds) do
+			C.close(fd)
+		end
+		return nil
+	end
+	P.um = C.curse_co_umask(0)
+	C.curse_co_umask(P.um)
+	if upv then
+		P.upv = { upv_get() }
+	end
+	ctx.P, ctx.cur_cwd = P, P.cwd
+	ctx.oldmask = ffi.new("uint8_t[128]")
+	C.sigprocmask(0, _co_sigpipe, ctx.oldmask) -- SIG_BLOCK: a dead reader is EPIPE, not our death
+	CO = ctx
+	local g
+	local ok_all, err_all = pcall(function()
+		g = co_launch(ctx, self, stage_fns, inproc, P, lastpipe, upv)
+		if not g then
+			return
+		end
+		local pf, pfn = nil, 0
+		while g.alive > 0 do
+			local runnable = ctx.runnable
+			ctx.runnable = {}
+			for _, t in ipairs(runnable) do
+				co_resume(ctx, t)
+			end
+			if g.alive == 0 then
+				break
+			end
+			if #ctx.runnable == 0 then -- nothing ready to run: wait in poll
+				local waiting, tick = {}, false
+				for _, t in pairs(ctx.bycoro) do
+					if not t.done and t.wait ~= nil and type(t.wait) ~= "table" then
+						if t.wait == -1 then
+							tick = true
+						end
+						waiting[#waiting + 1] = t
+					end
+				end
+				if #waiting > pfn then
+					pfn = #waiting * 2
+					pf = ffi.new("struct curse_co_pollfd[?]", pfn)
+				end
+				local cnt = 0
+				for _, t in ipairs(waiting) do
+					if t.wait ~= -1 then
+						local w = t.wait
+						if w <= 9 then
+							w = t.fd[w] -- a user-range fd: poll the stage's own saved copy
+						end
+						pf[cnt].fd, pf[cnt].events, pf[cnt].revents = w, t.wev, 0
+						cnt = cnt + 1
+					end
+				end
+				local r = C.curse_co_poll(pf, cnt, tick and 10 or -1)
+				local k = 0
+				for _, t in ipairs(waiting) do
+					if t.wait == -1 then
+						if tick then
+							t.wait = nil
+							ctx.runnable[#ctx.runnable + 1] = t
+						end
+					else
+						if r > 0 and pf[k].revents ~= 0 then
+							t.wait = nil
+							ctx.runnable[#ctx.runnable + 1] = t
+						end
+						k = k + 1
+					end
+				end
+			end
+		end
+	end)
+	CO = nil
+	for fd = 0, 9 do -- the parent's fds back (a lastpipe stage's 3-9 are adopted below)
+		if P.fd[fd] >= 0 then
+			C.dup2(P.fd[fd], fd)
+		else
+			C.close(fd)
+		end
+	end
+	C.environ = P.env
+	C.curse_co_umask(P.um)
+	if cwd_str() ~= P.cwd then
+		C.curse_co_chdir(P.cwd)
+	end
+	ctx.cur_cwd = P.cwd
+	if ok_all and g then
+		co_finish(ctx, self, g)
+		if upv and not g.lp then
+			upv.set(unpack(P.upv, 1, upv.n)) -- stages swapped them; the parent's are back
+		end
+	elseif upv then
+		upv.set(unpack(P.upv, 1, upv.n))
+	end
+	for fd in pairs(ctx.fds) do
+		C.close(fd)
+	end
+	C.curse_co_sigtimedwait(_co_sigpipe, nil, _co_zero_ts) -- drop a SIGPIPE still pending
+	C.sigprocmask(2, ctx.oldmask, nil)
+	for _, e in ipairs(ctx.envs) do
+		if e ~= C.environ then -- (a lastpipe stage's environ may now BE the shell's)
+			C.curse_co_free(e)
+		end
+	end
+	if not ok_all then
+		error(err_all)
+	end
+	return g ~= nil or nil
+end
+
+function Shell:run_pipeline(stage_fns, negate, inproc, upv_get, upv_set)
 	local nst = #stage_fns
 	if nst == 1 then -- defensive: a single stage (emit delegates `! cmd` for exact errexit)
 		stage_fns[1](self)
 	elseif
 		inproc
-		and not CO -- a pipeline nested inside a stage uses the fork path (its waits yield)
-		and self.out == io.write
-		and not self.capturing
-		and not (self.shopt.lastpipe and not self.opt_i)
-		and self:run_pipeline_co(stage_fns, inproc)
+		and self:run_pipeline_co(stage_fns, inproc, self.shopt.lastpipe and not self.opt_i, upv_get, upv_set)
 	then -- ran under the coroutine scheduler (status/PIPESTATUS set)
 	else
 		io.flush() -- flush parent stdio so forked stages don't duplicate buffered output

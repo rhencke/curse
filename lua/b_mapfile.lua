@@ -52,20 +52,28 @@ return function(sh, cmd, args, hook, tcb)
 		if args[j] then
 			arr = args[j]
 		end
-		local all, buf = {}, {}
+		-- Read ALL of fd 0 (mapfile consumes to EOF; -n/-s apply afterwards), in raw
+		-- unbuffered chunks: C stdio would keep bytes of THIS stdin buffered for whoever
+		-- reads fd 0 next (a pipeline swaps fd 0 per stage), and a blocking read inside a
+		-- pipeline stage must yield instead of stalling the stage that feeds it.
+		local chunks, rbuf = {}, ffi.new("char[65536]")
 		while true do
-			local c = io.read(1)
-			if c == nil then
-				if #buf > 0 then
-					all[#all + 1] = table.concat(buf)
-				end
+			rt.co_block(0, 1)
+			local nr = tonumber(C.read(0, rbuf, 65536))
+			if not nr or nr <= 0 then
 				break
 			end
-			buf[#buf + 1] = c
-			if c == dch then
-				all[#all + 1] = strip and table.concat(buf):sub(1, -2) or table.concat(buf)
-				buf = {}
+			chunks[#chunks + 1] = ffi.string(rbuf, nr)
+		end
+		local data, all, pos = table.concat(chunks), {}, 1
+		while pos <= #data do
+			local e = data:find(dch, pos, true)
+			if not e then
+				all[#all + 1] = data:sub(pos)
+				break
 			end
+			all[#all + 1] = strip and data:sub(pos, e - 1) or data:sub(pos, e)
+			pos = e + 1
 		end
 		-- -s skips leading items; -n caps the count taken after the skip.
 		local lines = {}
