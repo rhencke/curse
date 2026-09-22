@@ -3493,8 +3493,20 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
 		if t == "dbracket" then
 			-- [[ ]] : compile the and/or/not tree + leaf comparisons natively; $? = 0/1.
 			-- Any leaf the compiler can't render (mixed-quote glob, procsub) -> delegate.
+			-- A redirect (`[[ … ]] 2>/dev/null`) is applied around the evaluation and
+			-- restored after (its only effect is to steer leaf/regex error output).
+			local db_redir = nil
 			if st.redirs then
-				return delegate(st, after)
+				db_redir = redir_conds(st, nil)
+				if not db_redir then
+					return delegate(st, after)
+				end
+			end
+			local function db_wrap(sbody) -- sbody sets sh.status; wrap in the redirect when present
+				if not db_redir then
+					return sbody
+				end
+				return ("do local __rs = {}; if %s then %s else sh.status = 1 end; rt.redir_restore(__rs) end"):format(db_redir, sbody)
 			end
 			-- `[[ L =~ R ]]` as the SOLE condition: emit_dbracket can't express =~ (it has a
 			-- BASH_REMATCH side effect AND a tri-state status — 0 match / 1 no-match / 2 bad
@@ -3509,12 +3521,14 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
 					local ec = errchk(st)
 					local ecs = ec ~= "" and ("; " .. ec) or ""
 					blocks[p] = d
-						.. ('do local __c, __bad = rt.regex_captures(%s, %s, (sh.shopt.nocasematch and true or nil)); if __bad then sh.status = 2 else sh:array_assign("BASH_REMATCH", __c or {}, false); sh.status = __c and 0 or 1 end end%s; pc = %d'):format(
-							emit_word(st.expr.l, lifted),
-							re,
-							ecs,
-							after
+						.. db_wrap(
+							('do local __c, __bad = rt.regex_captures(%s, %s, (sh.shopt.nocasematch and true or nil)); if __bad then sh.status = 2 else sh:array_assign("BASH_REMATCH", __c or {}, false); sh.status = __c and 0 or 1 end end'):format(
+								emit_word(st.expr.l, lifted),
+								re
+							)
 						)
+						.. ecs
+						.. ("; pc = %d"):format(after)
 					return p
 				end
 			end
@@ -3526,7 +3540,10 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
 			local d = dbg(st)
 			local ec = errchk(st)
 			local ecs = ec ~= "" and ("; " .. ec) or ""
-			blocks[p] = d .. ("sh.status = (%s) and 0 or 1%s; pc = %d"):format(cond, ecs, after)
+			blocks[p] = d
+				.. db_wrap(("sh.status = (%s) and 0 or 1"):format(cond))
+				.. ecs
+				.. ("; pc = %d"):format(after)
 			return p
 		end
 		if DELEGATE[t] then
@@ -4539,9 +4556,15 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
 			-- (( expr )): evaluate expr WITH side effects natively (assignments, ++/--,
 			-- comma), then $? = (result != 0) ? 0 : 1 — bash's arith-command status. No
 			-- delegation; the interpreter is only used for the parts the emitter can't
-			-- render (array subscripts, embedded $-expansion, $LINENO/$_, redirects).
+			-- render (array subscripts, embedded $-expansion, $LINENO/$_).
+			-- A redirect (`(( … )) 2>/dev/null`) is applied around the eval and restored
+			-- after (its only effect is to steer a div0/error message).
+			local ac_redir = nil
 			if st.redirs then
-				return delegate(st, after)
+				ac_redir = redir_conds(st, nil)
+				if not ac_redir then
+					return delegate(st, after)
+				end
 			end
 			if not arith_stmt_ok(st.expr) then
 				return delegate(st, after)
@@ -4554,33 +4577,32 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
 			arith_varread = "rt.arith_read(sh, %q)" -- nounset+recursive-eval reads
 			local code = emit_arith_into("__ar", st.expr, lifted)
 			arith_varread = saved
+			local sbody -- the status-setting body (redirect-wrapped below when present)
 			if arith_can_div_fault(st.expr) then
 				-- ÷0 / mod-0 / negative ** THROW a non-fatal matherr — catch it (and any
 				-- flagged read fault) as $?=1 and continue, like interp; re-raise anything else.
-				blocks[p] = d
-					.. (
-						"do local __ia = sh.in_arithcmd; sh.arithfault = false; sh.in_arithcmd = true; local __ok, __v = pcall(function() local __ar = 0LL; %s; return (__ar ~= 0LL) and 0 or 1 end); sh.in_arithcmd = __ia; "
-						.. "if not __ok then if type(__v) == 'table' and __v.__curse_matherr then sh.status = 1 else error(__v) end "
-						.. "elseif sh.arithfault then sh.status = 1 else sh.status = __v end end%s; pc = %d"
-					):format(code, ecs, after)
+				sbody = (
+					"do local __ia = sh.in_arithcmd; sh.arithfault = false; sh.in_arithcmd = true; local __ok, __v = pcall(function() local __ar = 0LL; %s; return (__ar ~= 0LL) and 0 or 1 end); sh.in_arithcmd = __ia; "
+					.. "if not __ok then if type(__v) == 'table' and __v.__curse_matherr then sh.status = 1 else error(__v) end "
+					.. "elseif sh.arithfault then sh.status = 1 else sh.status = __v end end"
+				):format(code)
 			elseif arith_can_error(st.expr, lifted) then
 				-- a non-lifted read may fault; INSIDE the (( )) command arith_read records it in
 				-- sh.arithfault WITHOUT throwing (sh.in_arithcmd gates that), so no per-iteration
 				-- pcall/closure — the accumulator stays JIT-native.
-				blocks[p] = d
-					.. ("do local __ia = sh.in_arithcmd; sh.arithfault = false; sh.in_arithcmd = true; local __ar = 0LL; %s; sh.in_arithcmd = __ia; sh.status = sh.arithfault and 1 or ((__ar ~= 0LL) and 0 or 1) end%s; pc = %d"):format(
-						code,
-						ecs,
-						after
-					)
+				sbody = ("do local __ia = sh.in_arithcmd; sh.arithfault = false; sh.in_arithcmd = true; local __ar = 0LL; %s; sh.in_arithcmd = __ia; sh.status = sh.arithfault and 1 or ((__ar ~= 0LL) and 0 or 1) end"):format(
+					code
+				)
 			else -- provably error-free (lifted ints, +-*/comparisons): inline, JIT-native
-				blocks[p] = d
-					.. ("do local __ar = 0LL; %s; sh.status = (__ar ~= 0LL) and 0 or 1 end%s; pc = %d"):format(
-						code,
-						ecs,
-						after
-					)
+				sbody = ("do local __ar = 0LL; %s; sh.status = (__ar ~= 0LL) and 0 or 1 end"):format(code)
 			end
+			if ac_redir then -- install redirs, run, restore; a failed redirect is $?=1 (bash)
+				sbody = ("do local __rs = {}; if %s then %s else sh.status = 1 end; rt.redir_restore(__rs) end"):format(
+					ac_redir,
+					sbody
+				)
+			end
+			blocks[p] = d .. sbody .. ecs .. ("; pc = %d"):format(after)
 			return p
 		elseif t == "forc" then
 			if st.redirs then
