@@ -548,12 +548,14 @@ local function arith_side_effect(e)
 	-- xpandleaf (${…}), comma, and a NON-compilable array subscript aren't compiled natively —
 	-- treat like a side effect so the word/stmt delegates. A FAST xpand ($name only) and a
 	-- read-only array element (arith_elem_ok) ARE compiled, so they aren't side effects.
-	if e.k == "xpandleaf" or e.k == "comma" or (e.idxraw and not arith_elem_ok(e)) then
+	if e.k == "xpandleaf" or (e.idxraw and not arith_elem_ok(e)) then
 		return true
 	end
 	if e.k == "xpand" then
 		return not xpand_fast(e.raw)
 	end
+	-- comma falls through: a pure `(a, b)` is side-effect-free (recurse into l/r); a
+	-- side-effecting operand is detected by the recursion below.
 	return arith_side_effect(e.e)
 		or arith_side_effect(e.l)
 		or arith_side_effect(e.r)
@@ -571,9 +573,9 @@ local function not_compilable(e)
 	-- arith_perr = a deferred arith PARSE error (`(( i = '3' ))`): only the interpreter
 	-- renders it (prints bash's "syntax error in expression" + aborts the line), so the
 	-- enclosing loop/statement must delegate — else emit_value throws an uncaught error.
-	if e.k == "xpandleaf" or e.k == "comma" or e.k == "arith_perr" or (e.idxraw and not arith_elem_ok(e)) then
+	if e.k == "xpandleaf" or e.k == "arith_perr" or (e.idxraw and not arith_elem_ok(e)) then
 		return true
-	end
+	end -- comma recurses (emit_value / emit_arith_into render the sequence)
 	if e.k == "xpand" then
 		return not xpand_fast(e.raw)
 	end -- a fast $name xpand compiles
@@ -959,6 +961,9 @@ emit_value = function(e, lifted)
 	if k == "raw" then
 		return e.code
 	end -- a pre-computed Lua expr (inlined param binding)
+	if k == "comma" then -- (a, b): evaluate a for its effect, then b is the value (bash sequence op)
+		return ("(function() local _ = %s; return %s end)()"):format(emit_value(e.l, lifted), emit_value(e.r, lifted))
+	end
 	if k == "var" and e.name == "LINENO" then
 		return (tostring(EF.cur_line or 0) .. "LL")
 	end -- compile-time line
@@ -1084,6 +1089,9 @@ local function emit_set(name, valexpr, lifted)
 end
 
 local function emit_arith_stmt(e, lifted)
+	if e.k == "comma" then -- `for (( i=0, j=5; …; i++, j-- ))`: run each operand for its effect
+		return emit_arith_stmt(e.l, lifted) .. "; " .. emit_arith_stmt(e.r, lifted)
+	end
 	if e.k == "asgn" then
 		local v = emit_value(e.e, lifted)
 		if e.op == "=" then
@@ -1096,7 +1104,9 @@ local function emit_arith_stmt(e, lifted)
 		local cur = lifted[e.name] and lname(e.name) or ("sh:aget(%q)"):format(e.name)
 		return emit_set(e.name, ("(%s + %dLL)"):format(cur, e.d), lifted)
 	end
-	error("emit: statement position not supported for arith node " .. tostring(e.k))
+	-- element write (`a[i]=…`) or a pure value in statement position (e.g. a comma operand):
+	-- run it for its effect via emit_arith_into with a throwaway destination.
+	return ("do local __d; %s end"):format(emit_arith_into("__d", e, lifted))
 end
 
 -- ---- recursive-value arith: native compile of a var's VALUE re-evaluated as arith ----
