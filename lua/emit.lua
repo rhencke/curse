@@ -1258,6 +1258,7 @@ end
 -- Compile `stmts` into an inline fragment closure cs_N (reads sh directly, lift set
 -- {}) and return its id, or nil if the body hits a compiler gap. Shared by $(…),
 -- background, and pipeline stages — the compiled tier's "run this subprogram" unit.
+local collect_names, analyze_lift -- forward: defined with the lift analysis below
 local function emit_fragment(stmts, neg, liftset, cfraise)
 	local saved_tl, saved_neg, saved_line = emit_toplevel, emit_neg_ctx, EF.cur_line
 	-- `cfraise` ({loop=, func=}): the fragment is the BODY of a compound run in the current
@@ -1265,8 +1266,53 @@ local function emit_fragment(stmts, neg, liftset, cfraise)
 	-- of its own, or a return, must reach the CALLER's loop/function: raise the signal for
 	-- the caller's delegate cf-wrapper. Scoped to this fragment only (a fragment nested in
 	-- it — a subshell, a pipeline stage — resets it).
-	local saved_cf = EF.cf_raise
+	local saved_cf, saved_cff = EF.cf_raise, EF.cf_flush
 	EF.cf_raise = cfraise
+	-- `ownlocals`: run-local lifted vars the body uses, held as REGISTER locals of the
+	-- fragment function (seeded from sh on entry, flushed on exit — like run()), so a hot
+	-- loop inside it stays native instead of going through sh. A raised break/continue/
+	-- return leaves the function early, so it flushes them first (EF.cf_flush).
+	EF.cf_flush = nil
+	-- every fragment: the run-local lifted vars its statements touch (callers flush those
+	-- to sh before running any fragment, and reload after one that runs in the shell).
+	local ownlocals = {}
+	if EF.runlocal_set and next(EF.runlocal_set) then
+		local seen = {} -- run-local lifted vars the body references
+		collect_names(stmts, seen)
+		for n in pairs(seen) do
+			if EF.runlocal_set[n] and not (liftset and liftset[n]) then
+				ownlocals[#ownlocals + 1] = n
+			end
+		end
+	end
+	-- vars assigned ONLY inside this fragment (not lifted program-wide) that are safe to hold
+	-- natively here: numerically assigned within it, and cleared program-wide (frag_lift_ok)
+	if EF.frag_lift_ok then
+		local have = {}
+		for _, n in ipairs(ownlocals) do
+			have[n] = true
+		end
+		for n in pairs((analyze_lift({ stmts = stmts }))) do
+			if not have[n] and not (liftset and liftset[n]) and not (EF.runlocal_set and EF.runlocal_set[n])
+				and not (EF.lifted_set and EF.lifted_set[n]) and EF.frag_lift_ok(n)
+			then
+				ownlocals[#ownlocals + 1] = n
+			end
+		end
+	end
+	table.sort(ownlocals)
+	if #ownlocals > 0 then
+		local ls, fl = {}, {}
+		for k in pairs(liftset or {}) do
+			ls[k] = true
+		end
+		for _, n in ipairs(ownlocals) do
+			ls[n] = true
+			fl[#fl + 1] = ("sh:aset(%q, %s); "):format(n, lname(n))
+		end
+		liftset = ls
+		EF.cf_flush = table.concat(fl)
+	end
 	if neg then
 		emit_neg_ctx = true
 	end -- `! cmd`: exempt its own errexit (see errchk)
@@ -1281,12 +1327,12 @@ local function emit_fragment(stmts, neg, liftset, cfraise)
 	-- their copy; a lifted local would neither see nor sync the caller's real sh var).
 	local bok, cfg = pcall(build_cfg, stmts, liftset or {}, emit_frag_ctx.funcflags, inlfns, false)
 	emit_toplevel, emit_neg_ctx, EF.cur_line = saved_tl, saved_neg, saved_line
-	EF.cf_raise = saved_cf
+	EF.cf_raise, EF.cf_flush = saved_cf, saved_cff
 	if not bok then
 		return nil
 	end
 	emit_frag_n = emit_frag_n + 1
-	emit_frags[#emit_frags + 1] = assemble(cfg, ("cs_%d = function(sh)"):format(emit_frag_n), {})
+	emit_frags[#emit_frags + 1] = assemble(cfg, ("cs_%d = function(sh)"):format(emit_frag_n), { runlocals = ownlocals })
 	return emit_frag_n
 end
 
@@ -2941,7 +2987,7 @@ local function collect_word(w, set)
 		end
 	end
 end
-local function collect_names(stmts, set)
+collect_names = function(stmts, set)
 	for _, st in ipairs(stmts) do
 		if st.t == "assign" then
 			set[st.name] = true
@@ -3011,7 +3057,7 @@ end
 -- which the sh scope handles instead). Scans EVERYWHERE, including function
 -- bodies — a var shared between the top level and a function still lifts, because
 -- the upvalue is one real variable both see (no hash lookup, no desync).
-local function analyze_lift(ast)
+analyze_lift = function(ast)
 	-- A nameref program writes THROUGH namerefs (name=value -> some other var) via
 	-- rt.assign_scalar, which has no lifted-local to update — so an int64 local would desync.
 	-- Nameref programs are rare/cold; disable lifting so every var is sh-authoritative.
@@ -3127,7 +3173,7 @@ local function analyze_lift(ast)
 			lifted[n] = true
 		end
 	end
-	return lifted
+	return lifted, disq, localed
 end
 
 -- Does a function need a positional-param swap / a `local` frame? A call to a
@@ -3848,7 +3894,7 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
 						-- eval/source fragment: break/continue with no enclosing loop IN the fragment
 						-- targets the CALLER's loop -- raise the signal (level) for the enclosing
 						-- delegated cf-wrapper, exactly as interp's break/continue do.
-						blocks[p] = d .. ("error({ __curse_%s = %d })"):format(cf_op, lvl)
+						blocks[p] = d .. (EF.cf_flush or "") .. ("error({ __curse_%s = %d })"):format(cf_op, lvl)
 					else
 						blocks[p] = d .. ("sh.status = 0; pc = %d"):format(after) -- no-op outside a loop
 					end
@@ -3878,7 +3924,8 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
 			-- eval's cf-wrapper) as a raised signal, like interp; a return inside a compiled
 			-- subshell (subexit) still jumps locally.
 			local frag_return = ((EF.fragment and toplevel) or (EF.cf_raise and EF.cf_raise.func)) and #subexit == 0
-			local retjmp = frag_return and "error({ __curse_return = sh.status })" or ("pc = %d"):format(retpc)
+			local retjmp = frag_return and ((EF.cf_flush or "") .. "error({ __curse_return = sh.status })")
+				or ("pc = %d"):format(retpc)
 			local aw = st.words[cf_arg]
 			if not st.words[cf_arg + 1] then -- at most one status WORD (pre-split)
 				local d = dbg(st) -- DEBUG fires before return too
@@ -6129,9 +6176,22 @@ function M.emit(ast, opts)
 	-- indirect/dynamic dispatch).
 	-- No lifting in a fragment: a lifted native-int64 local would neither see nor sync the
 	-- caller's real sh var (which may be readonly/exported), so keep every var in sh.
-	local lifted = EF.fragment and {} or analyze_lift(ast)
+	local lifted, lift_disq, lift_localed = {}, {}, {}
+	if not EF.fragment then
+		lifted, lift_disq, lift_localed = analyze_lift(ast)
+	end
 	local funcTouched = {}
 	collect_funcvars(ast.stmts, funcTouched, inlinable)
+	-- Fragment-local lifting (emit_fragment): a var assigned only inside fragments
+	-- (subshell / $(…) / pipeline-stage bodies) never lifts in run(), but can be a
+	-- register local of the fragment if nothing anywhere makes its value non-numeric
+	-- (disq/local'd) and no function reads it via sh. Off with eval/source/namerefs.
+	EF.frag_lift_ok = nil
+	if not EF.fragment and not EF.has_nameref and not scan_dyncode(ast.stmts) then
+		EF.frag_lift_ok = function(n)
+			return not lift_disq[n] and not lift_localed[n] and not funcTouched[n]
+		end
+	end
 
 	-- Subshell in-process call-graph safety. A `( … )` that calls a user function runs
 	-- fork-free IFF the function needs no real child: no exec/&/special/dynamic-command,
@@ -6182,6 +6242,10 @@ function M.emit(ast, opts)
 	-- and it stays register-allocated in run() — no hot-loop cost for lift-only programs.
 	EF.lifted_set = upset
 	EF.lifted_names = upvals
+	EF.runlocal_set = {}
+	for _, n in ipairs(runlocals) do
+		EF.runlocal_set[n] = true
+	end
 
 	emit_frag_ctx = { funcflags = funcflags, inlinefns = inlinefns } -- context for compile_cmdsub's build_cfg
 
