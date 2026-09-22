@@ -4164,18 +4164,28 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
 			-- literal below): b_export makes each name local when sh.calldepth>0, which the
 			-- dispatch bumps to 1 (matching the delegate's calldepth guard). The frame itself
 			-- is pushed by the caller — func_flags marks any declare/typeset body `locals`.
-			-- export/readonly don't localize, so they stay top-level-only here (no seam bucket).
+			-- decl_in_fn: a flagged declare/typeset in a function/fragment LOCALIZES each name, so the
+			-- dispatch bumps calldepth. decl_list: export/readonly (which NEVER localize) and a bare
+			-- `declare`/`typeset` LISTING (no operands) — pure query/global ops safe via rt.builtin in
+			-- any context, no bump. A `name=value` literal still delegates (handled below / literal path).
 			local decl_in_fn = false
-			if (cmd == "declare" or cmd == "typeset") and not toplevel and not st.arrayargs then
-				for j = 2, #st.words do
-					local p1 = st.words[j].parts[1]
-					if p1 and p1.lit and p1.lit:match("^%-%a") then
-						decl_in_fn = true
-						break
+			local decl_list = false
+			if not toplevel and not st.arrayargs then
+				if cmd == "export" or cmd == "readonly" then
+					decl_list = true
+				elseif (cmd == "declare" or cmd == "typeset") and #st.words == 1 then
+					decl_list = true -- bare `declare`/`typeset`: list variables, no name to localize
+				elseif cmd == "declare" or cmd == "typeset" then
+					for j = 2, #st.words do
+						local p1 = st.words[j].parts[1]
+						if p1 and p1.lit and p1.lit:match("^%-%a") then
+							decl_in_fn = true
+							break
+						end
 					end
 				end
 			end
-			local decl_native = (DECL_BUILTIN[cmd] and toplevel and not st.arrayargs) or decl_in_fn
+			local decl_native = (DECL_BUILTIN[cmd] and toplevel and not st.arrayargs) or decl_in_fn or decl_list
 			if decl_native then
 				for j = 2, #st.words do
 					local p1 = st.words[j].parts[1]
@@ -4183,6 +4193,7 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
 					if lit and (lit:match("^[%a_][%w_]*%+?=") or lit:match("^[%a_][%w_]*%b[]%+?=")) then
 						decl_native = false
 						decl_in_fn = false
+						decl_list = false
 						break
 					end
 				end
