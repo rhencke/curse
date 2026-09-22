@@ -2420,11 +2420,8 @@ local function static_key(key)
 	return table.concat(o)
 end
 EF.static_key = static_key -- flatten_stmt references it at the array-literal emit sites (upvalue cap)
-local function arrayassign_ok(st, lifted, allow_nameref)
-	-- allow_nameref: an explicit `declare -a/-A NAME=(…)` REDECLARES the name as an array — a
-	-- DIRECT write (interp does the same: it does not write through a nameref for an array
-	-- assign), so it is parity-safe in a nameref program. A plain `NAME=(…)` keeps the gate.
-	if st.index or (EF.has_nameref and not allow_nameref) then
+local function arrayassign_ok(st, lifted)
+	if st.index or EF.has_nameref then
 		return false
 	end
 	for _, e in ipairs(st.elems) do
@@ -3885,9 +3882,10 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
 					and not (cmd == "local" and toplevel) -- `local` outside a function is an error (interp)
 					and not st.assigns
 					and not redir_apply
+					and not EF.has_nameref
 					and #aa == 1
 					and flagsok
-					and arrayassign_ok({ name = aa[1].name, append = aa[1].append, elems = aa[1].elems }, lifted, true)
+					and arrayassign_ok({ name = aa[1].name, append = aa[1].append, elems = aa[1].elems }, lifted)
 				then
 					local a1 = aa[1]
 					local p = newpc()
