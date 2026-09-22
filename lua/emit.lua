@@ -1832,7 +1832,7 @@ local function array_multi_op(pe)
 	if pe.op == "indices" then
 		return pe.index == "@" and not pe.drop
 	end
-	return PEXP_STROP[pe.op] and pexp_literal_arg(pe.arg) and pexp_literal_arg(pe.arg2) or false
+	return PEXP_STROP[pe.op] and strop_pat_ok(pe) or false -- quoted/backslash pattern renders via emit_pattern_glob
 end
 -- Lua expr for a compilable pexp's scalar string value (assumes pexp_compilable).
 function pexp_scalar(pe, lifted)
@@ -2151,7 +2151,13 @@ local function emit_seg(p, i, lifted)
 			end -- :+
 			elems = ("(function() local __e = %s; %s end)()"):format(elems, body)
 		elseif pe.op then -- per-element string-op (strip/subst/case/@Q…): map apply_str_op
-			elems = ("rt.array_op_values(sh, %s, %q, %q, %q)"):format(elems, pe.op, pe.arg or "", pe.arg2 or "")
+			-- a STROP pattern with a quoted/backslash metachar renders mask-aware (emit_pattern_glob),
+			-- exactly like the scalar strop; a verbatim-safe pattern (and every @-transform letter)
+			-- passes through literally.
+			local pg = (PEXP_STROP[pe.op] and not pat_verbatim_ok(pe.arg))
+					and emit_pattern_glob(pe.arg or "", lifted)
+				or ("%q"):format(pe.arg or "")
+			elems = ("rt.array_op_values(sh, %s, %q, %s, %q)"):format(elems, pe.op, pg, pe.arg2 or "")
 		end
 		return ("{multi=true,star=%s,q=%s,elems=%s}"):format(
 			tostring(pe.index == "*" or pe.name == "*"),
