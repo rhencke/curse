@@ -1464,10 +1464,62 @@ end
 -- plain EXTERNAL (a separate process — cannot touch the parent shell). Anything else
 -- (a non-pure builtin, a function, a dynamic/compound/assigning body) keeps forking.
 -- Missing a builtin from the pure set only costs a fork (never correctness).
+-- The rt.names_static guard expression for a set of command names: this module's
+-- compiled functions must still be registered as themselves; any other name must not
+-- have become a function.
+local function names_guard(list)
+	local ff = (emit_frag_ctx and emit_frag_ctx.funcflags) or {}
+	local plain, fn, fv = {}, {}, {}
+	for _, c in ipairs(list) do
+		if ff[c] then
+			fn[#fn + 1] = ("%q"):format(c)
+			fv[#fv + 1] = fnlname(c)
+		else
+			plain[#plain + 1] = ("%q"):format(c)
+		end
+	end
+	if #fn == 0 then
+		return ("rt.names_static(sh, {%s})"):format(table.concat(plain, ", "))
+	end
+	return ("rt.names_static(sh, {%s}, {%s}, {%s})"):format(
+		table.concat(plain, ", "),
+		table.concat(fn, ", "),
+		table.concat(fv, ", ")
+	)
+end
+-- The literal command names a body runs (every simple command, at any depth) — what
+-- rt.names_static re-checks at runtime in an eval/source program. nil if none needed.
+local function dyn_guard(stmts)
+	if not EF.has_dyncode then
+		return nil
+	end
+	local names, seen = {}, {}
+	local function walk(node)
+		if type(node) ~= "table" then
+			return
+		end
+		if node.t == "simple" and node.words and node.words[1] then
+			local w1 = node.words[1]
+			local c = w1.parts and #w1.parts == 1 and w1.parts[1].lit
+			if c and not seen[c] then
+				seen[c] = true
+				names[#names + 1] = c
+			end
+		end
+		for _, v in pairs(node) do
+			if type(v) == "table" then
+				walk(v)
+			end
+		end
+	end
+	walk(stmts)
+	table.sort(names)
+	return names_guard(names)
+end
 local PURE_BUILTIN_CMDSUB = { echo = 1, printf = 1, ["true"] = 1, ["false"] = 1,
 	[":"] = 1, pwd = 1, test = 1, ["["] = 1, exit = 1 }
 local function cmdsub_nofork_ok(stmts)
-	if EF.has_dyncode or #stmts == 0 then return false end
+	if #stmts == 0 then return false end
 	local BUILTINS = require("interp").BUILTINS
 	local ff = (emit_frag_ctx and emit_frag_ctx.funcflags) or {}
 	for _, st in ipairs(stmts) do
@@ -1636,7 +1688,6 @@ local function compile_cmdsub(src, backtick, lifted, aenv)
 	local bt = backtick and "true" or "false"
 	local isolated = not cmdsub_nofork_ok(ast.stmts)
 		and not EF.inproc_trap_block
-		and not EF.has_dyncode
 		and #ast.stmts > 0
 		and EF.subshell_inproc_ok(ast.stmts)
 	local id = emit_fragment(ast.stmts, nil, isolated and EF.lifted_set or nil)
@@ -1644,6 +1695,7 @@ local function compile_cmdsub(src, backtick, lifted, aenv)
 		return fallback
 	end -- compiler gap (curse-nocompile): to be closed upstream
 	local call
+	local forked = ("sh:capture_compiled(cs_%d, true, %s)"):format(id, bt)
 	if isolated then
 		call = (EF.lifted_names and #EF.lifted_names > 0)
 				and ("__iso_cmdsub(sh, cs_%d, %s)"):format(id, bt)
@@ -1651,7 +1703,12 @@ local function compile_cmdsub(src, backtick, lifted, aenv)
 	elseif cmdsub_nofork_ok(ast.stmts) then
 		call = ("sh:capture_compiled(cs_%d, false, %s)"):format(id, bt)
 	else
-		call = ("sh:capture_compiled(cs_%d, true, %s)"):format(id, bt)
+		call = forked
+	end
+	-- eval/source program: in-process only while the body's names are still the static ones
+	local guard = call ~= forked and dyn_guard(ast.stmts)
+	if guard then
+		call = ("(%s and %s or %s)"):format(guard, call, forked)
 	end
 	local flush = lifted_flush(lifted)
 	if flush ~= "" then
@@ -3771,7 +3828,7 @@ H.funcdef = function(cx, st, after)
 		cx.blocks[p] = ("io.stderr:write(%q); sh.status = 1; pc = %d") -- non-fatal runtime error (bash)
 			:format("curse: `" .. st.name .. "': not a valid identifier\n", after)
 	elseif cx.funcflags[st.name] then
-		cx.blocks[p] = ("sh.functions[%q] = %s; pc = %d"):format(st.name, EF.upv_wrapped(fnlname(st.name)), after)
+		cx.blocks[p] = ("sh.functions[%q] = rt.mark_compiled(%s, %s); pc = %d"):format(st.name, EF.upv_wrapped(fnlname(st.name)), fnlname(st.name), after)
 	else
 		cx.blocks[p] = ("pc = %d"):format(after)
 	end
@@ -3779,7 +3836,24 @@ H.funcdef = function(cx, st, after)
 end
 
 -- statement handler: simple (split out of flatten_stmt; see H)
+-- In an eval/source program a command name can be (re)defined as a function at RUNTIME
+-- (`eval 'true(){ …; }'`, a compiled function replaced by eval) — which the compiled call
+-- (native builtin / direct fn_x / external spawn) wouldn't see. Guard each literal command:
+-- still static (rt.names_static) -> the compiled code; else the interpreter's live dispatch.
+local simple_compiled
 H.simple = function(cx, st, after)
+	local p = simple_compiled(cx, st, after)
+	local w1 = EF.has_dyncode and st.words and st.words[1]
+	local c = w1 and w1.parts and #w1.parts == 1 and w1.parts[1].lit
+	if not c then
+		return p
+	end
+	local dp = cx.delegate(st, after, { callee = "I.exec_stmt", callargs = ("sh, %s, __noop"):format(ser(st)) })
+	local g = cx.newpc()
+	cx.blocks[g] = ("if %s then pc = %d else pc = %d end"):format(names_guard({ c }), p, dp)
+	return g
+end
+simple_compiled = function(cx, st, after)
 	local t = st.t
 	local cmd = st.words[1] and full_lit(st.words[1]) -- full literal → \-escaped builtins (\exit, \echo) dispatch
 	if cmd and emit_redir_funcs[cmd] then
@@ -5097,8 +5171,8 @@ H.subshell = function(cx, st, after)
 	-- so subshell_exit_pc is cleared around its build. Anything else falls through to the
 	-- fork path below (still correct). break/continue can't cross into it — subshell_run's
 	-- fragment has its own loopstack, like the fork body.
+	local inproc_pc = nil -- eval/source program: in-process branch behind a runtime name guard
 	if not EF.inproc_trap_block
-		and not EF.has_dyncode
 		and #st.body > 0
 		and EF.subshell_inproc_ok(st.body)
 	then
@@ -5133,7 +5207,10 @@ H.subshell = function(cx, st, after)
 			else
 				cx.blocks[p] = ("%ssh:subshell_run(cs_%d)%s%s; pc = %d"):format(swpre, id, swpost, ecs, after)
 			end
-			return p
+			if not EF.has_dyncode then
+				return p
+			end
+			inproc_pc = p
 		end
 	end
 	-- errexit INHERITED at entry is now COMPILED: the forked child runs the body with
@@ -5184,6 +5261,11 @@ H.subshell = function(cx, st, after)
 		cx.blocks[p] = ("if sh.opt_e then pc = %d else %s end"):format(delpc, fork)
 	else
 		cx.blocks[p] = fork
+	end
+	if inproc_pc then
+		local g = cx.newpc()
+		cx.blocks[g] = ("if %s then pc = %d else pc = %d end"):format(dyn_guard(st.body), inproc_pc, p)
+		return g
 	end
 	return p
 end
@@ -5248,8 +5330,8 @@ H.pipeline = function(cx, st, after)
 	-- needs a real child: exec, ulimit, set, eval, … — EF.sub_unsafe_fn).
 	local inproc = {}
 	for i = 1, n do
-		inproc[i] = tostring(n >= 2 and not EF.has_dyncode
-			and EF.subshell_inproc_ok({ st.cmds[i] }))
+		local ok = n >= 2 and EF.subshell_inproc_ok({ st.cmds[i] })
+		inproc[i] = ok and (dyn_guard({ st.cmds[i] }) or "true") or "false"
 	end
 	cx.blocks[p] = dbg(st)
 		.. lifted_flush(cx.lifted)
@@ -6159,7 +6241,7 @@ assemble = function(cfg, sig, opts)
 	-- register compiled function closures into sh.functions so the interpreter
 	-- (reached via delegation) can call them too — full interp/compiled interop.
 	for _, n in ipairs(opts.register or {}) do
-		o[#o + 1] = ("  sh.functions[%q] = %s"):format(n, EF.upv_wrapped(fnlname(n)))
+		o[#o + 1] = ("  sh.functions[%q] = rt.mark_compiled(%s, %s)"):format(n, EF.upv_wrapped(fnlname(n)), fnlname(n))
 	end
 	-- verbatim definition source for `declare -f`/`type` (parity with the interpreter)
 	if opts.funcsrc and next(opts.funcsrc) then

@@ -1580,6 +1580,33 @@ local function sub_checkpoint(self)
 	local of, ov = opt_fields(), {}
 	for i = 1, #of do ov[i] = self[of[i]] end
 	cp.opts = ov
+	-- The dynamic-scope layers behind the visible vars — `local` shadow records and
+	-- tempenv bindings — are mutated by `unset` (which REVEALS the next layer: drops the
+	-- record / marks the tempenv consumed and installs its box). Give the body private
+	-- copies (records AND the shadowed boxes they hold) so neither escapes.
+	cp.savedstack, cp.tenv = self.savedstack, self.tenv
+	local ss = {}
+	for d, rec in pairs(self.savedstack) do
+		if rec then
+			local r2 = {}
+			for name, e in pairs(rec) do
+				local e2 = shallowcopy(e)
+				if e2.box then e2.box = copybox(e2.box) end
+				r2[name] = e2
+			end
+			ss[d] = r2
+		else
+			ss[d] = rec
+		end
+	end
+	self.savedstack = ss
+	local te = {}
+	for k = 1, #self.tenv do
+		local e2 = shallowcopy(self.tenv[k])
+		if e2.box then e2.box = copybox(e2.box) end
+		te[k] = e2
+	end
+	self.tenv = te
 	self.params = pcopy
 	self.shopt = shallowcopy(self.shopt) or {}
 	self.functions = shallowcopy(self.functions) or {}
@@ -1595,6 +1622,7 @@ local function sub_restore(self, cp)
 	self.dirstack, self.hashcache, self.getopts_state = cp.dirstack, cp.hashcache, cp.getopts
 	local of, ov = opt_fields(), cp.opts
 	for i = 1, #of do self[of[i]] = ov[i] end
+	self.savedstack, self.tenv = cp.savedstack, cp.tenv
 	if cp.cwd ~= "" then C.chdir(cp.cwd) end
 	C.umask(cp.um)
 	-- Re-sync the process environ: drop names the body newly exported, then restore
@@ -4592,6 +4620,34 @@ function M.time_report(sh, posix)
 	else
 		io.stderr:write(("\nreal\t%s\nuser\t%s\nsys\t%s\n"):format(fmt(real), fmt(cpu), fmt(0)))
 	end
+end
+-- Compiled functions installed into sh.functions, keyed to the fn_x they wrap (weak).
+-- In a program with eval/source a command name can be (re)defined at RUNTIME, which a
+-- compiled call site (direct fn_x / native builtin / external spawn) wouldn't see.
+-- names_static(sh, plain, fnames, fvals) is the call-site guard: every `plain` name
+-- (builtin/external at compile time) must have NO function now, and every `fnames[i]`
+-- must still be the registration of exactly `fvals[i]` (this module's fn_x).
+M.COMPILED_ORIG = setmetatable({}, { __mode = "k" })
+function M.mark_compiled(f, orig)
+	M.COMPILED_ORIG[f] = orig or f
+	return f
+end
+function M.names_static(sh, plain, fnames, fvals)
+	local fns = sh.functions
+	for i = 1, #plain do
+		if fns[plain[i]] ~= nil then
+			return false
+		end
+	end
+	if fnames then
+		for i = 1, #fnames do
+			local f = fns[fnames[i]]
+			if f == nil or M.COMPILED_ORIG[f] ~= fvals[i] then
+				return false
+			end
+		end
+	end
+	return true
 end
 -- Non-dot entry names of directory `path` (what `ls -1` lists), unsorted; {} if unreadable.
 function M.dir_names(path)
