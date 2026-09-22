@@ -4217,6 +4217,62 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
 					return p
 				end
 			end
+			-- `VAR=val … BUILTIN args` (prefix env): evaluate each scalar prefix value in the
+			-- CURRENT env (bash/interp agree a sibling prefix isn't visible, and the args also
+			-- expand pre-prefix), then apply them as an exported tempenv via rt.run_prefix, run
+			-- the builtin (which sees the temp values, e.g. `IFS=: read`), and restore. Gated to
+			-- an rt.builtin-dispatchable builtin — the code/scope builtins (EXEC_SIMPLE_SKIP:
+			-- eval/declare/local/…) and the statically-native ones (NATIVE_BUILTIN: echo/[/:/…)
+			-- keep interp's fuller prefix handling. An array-element/array-literal/append prefix,
+			-- an unrenderable value or argv, or an uncompilable redirect also delegates.
+			if
+				st.assigns
+				and cmd
+				and not NATIVE_BUILTIN[cmd]
+				and not EXEC_SIMPLE_SKIP[cmd]
+				and not isfunc
+				and require("interp").BUILTINS[cmd]
+			then
+				local pnames, pvals, pok = {}, {}, true
+				for _, a in ipairs(st.assigns) do
+					if a.index or a.raw or a.append or not a.rhs or not emitable_word(a.rhs) then
+						pok = false
+						break
+					end
+					pnames[#pnames + 1] = ("%q"):format(a.name)
+					-- assignment-context value: an all-literal ~ colon-expands (rt.tilde_assign),
+					-- else the ordinary word value (no split — assignment RHS).
+					local fl = unq_full_lit(a.rhs)
+					pvals[#pvals + 1] = (fl and fl:find("~", 1, true)) and ("rt.tilde_assign(sh, %q)"):format(fl)
+						or emit_word(a.rhs, lifted)
+				end
+				local builder = pok and field_argv(st.words, 1, lifted, "rt.cstr(%s)")
+				if pok and builder then
+					local p = newpc()
+					local ec = errchk(st)
+					local ecs = ec ~= "" and ("; " .. ec) or ""
+					local d = dbg(st)
+					local lastarg = "if #__a > 0 then sh:set_str('_', __a[#__a]) end"
+					local dispatch = redir_apply
+							and ("do local __rs = {}; if %s then sh.write_err = nil; rt.builtin(sh, __a, __noop); io.flush() else sh.status = 1 end; rt.redir_restore(__rs); if sh.write_err then sh.status = 1 end end"):format(
+								redir_apply
+							)
+						or "rt.builtin(sh, __a, __noop)"
+					-- __pv (prefix values) FIRST, then __a (argv) — both in the pre-prefix env,
+					-- in bash's left-to-right order — then apply + run + restore via rt.run_prefix.
+					blocks[p] = d
+						.. ("local __pv = { %s }; "):format(table.concat(pvals, ", "))
+						.. builder
+						.. ("; rt.run_prefix(sh, { %s }, __pv, function() %s end); "):format(
+							table.concat(pnames, ", "),
+							dispatch
+						)
+						.. lastarg
+						.. ecs
+						.. ("; pc = %d"):format(after)
+					return p
+				end
+			end
 			if
 				cmd
 				and st.assigns == nil

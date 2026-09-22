@@ -4995,6 +4995,52 @@ function M.builtin(sh, argv, hook)
 	return require(BUILTIN_LAZY[cmd])(sh, cmd, argv, hook or _noop)
 end
 
+-- `VAR=val … cmd` prefix env for the COMPILED tier: apply each already-expanded scalar
+-- prefix value as an EXPORTED tempenv for the duration of `runfn`, then restore — the
+-- twin of interp's prefix-assign path (exec_stmt's st.assigns branch). Each binding is
+-- pushed onto sh.tenv (LIFO, with the prior box + process-env value saved) so an `unset`
+-- inside the command reveals the shadowed value beneath (bash dynamic scope) and a
+-- `local` in a called function absorbs only its own frame's tempenv; a consumed entry is
+-- skipped on restore. Values are evaluated by the caller BEFORE this runs (in the
+-- pre-command environment — bash and interp agree a sibling prefix is NOT visible).
+function M.run_prefix(sh, names, vals, runfn)
+	local base = #sh.tenv
+	for i = 1, #names do
+		local name = names[i]
+		local b = sh.vars[name] -- copy the box: set_str below mutates in place
+		sh.vseq = sh.vseq + 1
+		sh.tenv[#sh.tenv + 1] = {
+			name = name,
+			env = os.getenv(name),
+			consumed = false,
+			seq = sh.vseq,
+			box = b
+					and { s = b.s, n = b.n, arr = b.arr, assoc = b.assoc, order = b.order, exported = b.exported, ro = b.ro, ref = b.ref }
+				or false,
+		}
+		sh:set_str(name, vals[i])
+		C.setenv(name, sh:get(name), 1)
+	end
+	sh.tenv_call_base = base -- a DIRECT function call tags these with its frame (local absorption)
+	local ok, err = pcall(runfn)
+	sh.tenv_call_base = nil
+	for k = #sh.tenv, base + 1, -1 do
+		local s = sh.tenv[k]
+		sh.tenv[k] = nil
+		if not s.consumed then -- an `unset` inside the command already revealed it
+			sh.vars[s.name] = s.box or nil
+			if s.env then
+				C.setenv(s.name, s.env, 1)
+			else
+				C.unsetenv(s.name)
+			end
+		end
+	end
+	if not ok then
+		error(err)
+	end
+end
+
 -- A command word that was NOT a funcdef at compile time but resolves, at RUNTIME, to a
 -- shell function (installed by eval/source or a nested def). The argv is already expanded
 -- by the compiled field engine; dispatch it through exec_simple, which finds the function
