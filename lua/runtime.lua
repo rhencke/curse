@@ -1403,7 +1403,7 @@ end
 -- for pure bodies (no stderr/2>&1 to worry about); the fd path is for isolated mutating
 -- $() where a builtin may redirect its diagnostics into the capture. A temp file (not a
 -- pipe) means no self-deadlock when the body out-writes the pipe buffer in one process.
-function Shell:capture_inproc(backtick, runner, capfd)
+function Shell:capture_inproc(backtick, runner, capfd, ctx)
 	local buf, tmp, save1
 	if capfd then
 		io.flush()
@@ -1448,6 +1448,14 @@ function Shell:capture_inproc(backtick, runner, capfd)
 		self.aliases = c
 	end
 	local ok, err = pcall(runner, self)
+	if ctx and ctx.child then -- late-forked: this process IS the $(…) child; its fd 1 is the
+		M.child_status(self, ok, err) -- shared temp file, so just end with the body's status
+		M.late_child_exit(self, ctx, self.status)
+	end
+	if not ok and ctx and type(err) == "table" and err.__curse_latefork == ctx then
+		ok, err = true, nil -- the late-forked child ran the rest (its output is in the temp file)
+		self.status = ctx.status
+	end
 	self.aliases = saved_aliases -- discard aliases defined inside $()
 	self.cur_line = saved_line
 	self.opt_e = savede
@@ -1558,6 +1566,7 @@ local function opt_fields()
 	end
 	return OPT_FIELDS
 end
+local iso_push, iso_pop
 local function sub_checkpoint(self)
 	local orig_vars = self.vars
 	local copy = {}
@@ -1640,6 +1649,67 @@ end
 -- (unlike $()), writes to the live stdout, and its own applied redirects (`saves`) are
 -- restored here too. exit/return/div0 in the body become the subshell's status. The emit
 -- gate keeps genuinely-forking bodies (trap/exec/&/set/ulimit/$BASHPID/…) on the fork path.
+-- LATE FORK. An in-process subshell/$(…) runs optimistically in this process; the first
+-- operation that genuinely needs its own process (exec, ulimit, trap, enable, wait, `&`,
+-- a dynamic $BASHPID/$RANDOM read — see need_process) forks RIGHT THERE: everything so far
+-- happened inside the checkpoint, i.e. exactly the state a real subshell has at this point,
+-- so the child simply continues (it IS the subshell now) and _exits at the boundary; the
+-- parent waits, unwinds to the boundary with the child's status and restores. iso_ctx is
+-- the stack of active in-process isolation contexts (innermost last).
+iso_push = function(sh)
+	local ctx = {}
+	local st = sh.iso_ctx
+	if not st then
+		st = {}
+		sh.iso_ctx = st
+	end
+	st[#st + 1] = ctx
+	return ctx
+end
+iso_pop = function(sh, ctx)
+	local st = sh.iso_ctx
+	if st and st[#st] == ctx then
+		st[#st] = nil
+	end
+end
+function M.need_process(sh)
+	local st = sh.iso_ctx
+	local ctx = st and st[#st]
+	if not ctx or ctx.child or CO then
+		return
+	end
+	io.flush()
+	local pid = M.fork()
+	if pid == 0 then
+		ctx.child = true
+		ctx.inherited_exit = sh.traps and sh.traps.EXIT -- the PARENT's; a subshell doesn't run it
+		sh.subshell_child = true -- anything unwinding past the boundary still ends this child
+		return
+	end
+	local stb = ffi.new("int[1]")
+	M.wait_child(pid, stb, 0)
+	ctx.status = M.wexit(stb[0])
+	error({ __curse_latefork = ctx }, 0)
+end
+-- The late-forked child reached its subshell boundary: run an EXIT trap the SUBSHELL set
+-- (not the inherited parent one), then end with the subshell's status.
+function M.late_child_exit(sh, ctx, status)
+	local h = sh.traps and sh.traps.EXIT
+	if h and h ~= "" and h ~= ctx.inherited_exit and not sh.in_exit_trap then
+		sh.in_exit_trap = true
+		sh.status = status
+		pcall(require("interp").run_trap_str, sh, h)
+	end
+	io.flush()
+	C._exit(status or 0)
+end
+-- Inside a pipeline stage (a scheduler coroutine) a late fork can't be taken — the stage's
+-- buffered stdout and the scheduler don't survive into a child — so bodies that rely on it
+-- take the fork path up front there (emit checks this).
+function M.in_stage()
+	return CO ~= nil
+end
+
 function Shell:subshell_run(runner, saves)
 	local cp = sub_checkpoint(self)
 	local sv_out, sv_line = self.out, self.cur_line
@@ -1648,7 +1718,9 @@ function Shell:subshell_run(runner, saves)
 	self.in_subprogram = (self.in_subprogram or 0) + 1
 	self.loopdepth = 0
 
+	local ctx = iso_push(self)
 	local ok, err = pcall(runner, self)
+	iso_pop(self, ctx)
 	local status = self.status
 	local rethrow
 	if not ok then
@@ -1656,9 +1728,14 @@ function Shell:subshell_run(runner, saves)
 			status = err.__curse_exit or err.__curse_return
 		elseif type(err) == "table" and err.__curse_lineabort then
 			status = 1
+		elseif type(err) == "table" and err.__curse_latefork == ctx then
+			status = ctx.status -- the late-forked child ran the rest of the body
 		else
 			rethrow = err
 		end
+	end
+	if ctx.child then -- late-forked: this process IS the subshell; it ends here
+		M.late_child_exit(self, ctx, status)
 	end
 
 	if saves then M.redir_restore(saves) end
@@ -1680,8 +1757,13 @@ end
 -- fork path. Returns the captured string.
 function Shell:capture_compiled_iso(cs_fn, backtick)
 	local cp = sub_checkpoint(self)
-	local out = self:capture_inproc(backtick, cs_fn, true) -- fd-level capture: `2>&1` on a builtin works
+	local ctx = iso_push(self)
+	local ok, out = pcall(self.capture_inproc, self, backtick, cs_fn, true, ctx) -- fd-level capture
+	iso_pop(self, ctx)
 	sub_restore(self, cp)
+	if not ok then
+		error(out, 0)
+	end
 	return out
 end
 
@@ -1760,6 +1842,7 @@ end
 -- forked child exactly: unresolvable name (the child prints the error), a no-shebang
 -- script, or xtrace (the child traces).
 function Shell:spawn_bg(args, cmdstr)
+	M.need_process(self) -- in an in-process subshell the job must be the subshell's child
 	local n = #args
 	if n == 0 or args[1] == "" or self.opt_x or self.exec_argv0 then
 		return false
@@ -1806,6 +1889,7 @@ function Shell:spawn_bg(args, cmdstr)
 end
 
 function Shell:run_background(cmd_fn, cmdstr, exec_tail)
+	M.need_process(self)
 	io.flush()
 	local pid = M.fork()
 	if pid == 0 then
@@ -3103,6 +3187,7 @@ function Shell:special_get(name)
 		return tostring(self.nparams)
 	end
 	if name == "RANDOM" then
+		M.need_process(self) -- a subshell's RANDOM stream must not advance the parent's
 		return tostring(math.random(0, 32767))
 	end
 	-- $PWD is a real tracked variable (see :pwd / import_env); once unset it reads
@@ -3117,6 +3202,7 @@ function Shell:special_get(name)
 		return tostring(tonumber(ffi.C.geteuid()))
 	end
 	if name == "BASHPID" then
+		M.need_process(self) -- an in-process subshell must really be its own process
 		return tostring(tonumber(ffi.C.getpid()))
 	end -- fresh: changes in subshells
 	if name == "FUNCNAME" then
@@ -6198,10 +6284,17 @@ local _noop = function() end
 -- eval/source) may shadow the builtin at runtime; that command isn't known at
 -- compile time, so defer it to the bootstrap dispatcher, which decides function vs
 -- (posix-)special-builtin exactly as an interpreted run would.
+-- builtins that need a real process when run inside an in-process subshell/$(…) (their
+-- effect is process-global: fds/process image, rlimits, signal dispositions, the builtin
+-- table, waiting on the subshell's own children) — shared with interp's dispatch
+M.LATE_FORK_BUILTIN = { exec = 1, ulimit = 1, trap = 1, enable = 1, wait = 1, fg = 1, bg = 1 }
 function M.builtin(sh, argv, hook)
 	local cmd = argv[1]
 	if sh.functions[cmd] then
 		return require("interp").exec_simple(sh, argv, hook or _noop)
+	end
+	if M.LATE_FORK_BUILTIN[cmd] and sh.iso_ctx and sh.iso_ctx[1] then
+		M.need_process(sh)
 	end
 	return require(BUILTIN_LAZY[cmd])(sh, cmd, argv, hook or _noop)
 end
@@ -6440,8 +6533,19 @@ function M.exec_dynamic(sh, argv, hook, hadcs, no_func)
 	if sh.exec_tail and (sh.functions[argv[1]] or I.BUILTINS[argv[1]] or (sh.aliases and sh.aliases[argv[1]])) then
 		sh.exec_tail = nil
 	end
-	-- no_func (the `command` prefix): run argv skipping SHELL FUNCTION lookup (builtin/external only).
-	I.exec_simple(sh, argv, hook or _noop, no_func)
+	-- `exec` is a STATEMENT-level builtin in the interpreter (it rewires/replaces the process),
+	-- which exec_simple doesn't dispatch: run the already-expanded words as a quoted-literal
+	-- statement through exec_stmt (`c=exec; $c cmd`).
+	if argv[1] == "exec" and (no_func or not sh.functions.exec) then
+		local words = {}
+		for i = 1, n do
+			words[i] = { k = "word", parts = { { lit = argv[i], q = true } } }
+		end
+		I.exec_stmt(sh, { t = "simple", words = words, line = sh.cur_line }, hook or _noop)
+	else
+		-- no_func (the `command` prefix): run argv skipping SHELL FUNCTION lookup (builtin/external only).
+		I.exec_simple(sh, argv, hook or _noop, no_func)
+	end
 	if sh.write_err then
 		sh.status = 1
 	end

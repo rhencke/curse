@@ -2328,6 +2328,7 @@ end
 -- (name -> module). exec_simple routes these through require() instead of its
 -- inline dispatch, so a cold script that never uses them never loads their code.
 local BUILTIN_LAZY = rt.BUILTIN_LAZY -- one source of truth (runtime); shared with the compiled tier
+local LATE_FORK_BUILTIN = rt.LATE_FORK_BUILTIN
 local BUILTINS = {
 	echo = 1,
 	[":"] = 1,
@@ -3329,6 +3330,12 @@ local function exec_simple(sh, args, hook, no_func)
 	-- Rarely-used builtins live in lazily-loaded feature modules (kept out of the
 	-- cold path). Route them there before the inline dispatch; require caches, so a
 	-- feature loads at most once. A user function of the same name already won above.
+	-- inside an in-process subshell/$(…), a builtin that needs its own process (fds/process
+	-- image, rlimits, signal dispositions, the builtin table, waiting on its own children)
+	-- late-forks first (rt.need_process): from here on this runs in a real child
+	if LATE_FORK_BUILTIN[cmd] and sh.iso_ctx and sh.iso_ctx[1] then
+		rt.need_process(sh)
+	end
 	local lz = BUILTIN_LAZY[cmd]
 	if lz then
 		return require(lz)(sh, cmd, args, hook, tcb)
@@ -4178,6 +4185,11 @@ exec_stmt = function(sh, st, hook)
 		-- command it just rewires the shell's own fds (e.g. `exec 3>file`); with a
 		-- command it replaces the shell process with that command.
 		if args[1] == "exec" then
+			-- in an in-process subshell/$(…) the fds/process image are process-global: become
+			-- a real child first (rt.need_process) unless a function shadows `exec`
+			if not sh.functions.exec and sh.iso_ctx and sh.iso_ctx[1] then
+				rt.need_process(sh)
+			end
 			io.flush()
 			local ok = true
 			if st.redirs then
@@ -4561,6 +4573,7 @@ exec_stmt = function(sh, st, hook)
 		sh.status = rt.wexit(stbuf[0])
 	elseif t == "background" then
 		-- cmd & : fork, run in the child; parent records $! and continues (status 0).
+		rt.need_process(sh) -- in an in-process subshell, the job must be the subshell's child
 		io.flush()
 		-- Block signals across the fork + the child's disposition reset so an immediate
 		-- `kill -SIG $!` can't be delivered to the child before it clears its traps (bash).
@@ -5033,6 +5046,9 @@ fire_err = function(sh)
 	end
 end
 M.fire_err_trap = fire_err_trap -- compiled tier fires ERR after a failing native command
+M.run_trap_str = function(sh, code) -- a late-forked subshell child runs its own EXIT trap
+	return run_trap(sh, code)
+end
 
 -- (`return N` status is now rt.return_status — a pure runtime primitive the compiled
 -- tier calls directly.)

@@ -1594,14 +1594,20 @@ local function subshell_list_inproc_ok(list, unsafe)
 end
 function subshell_stmt_inproc_ok(st, unsafe)
 	local t = st.t
-	if t == "background" or t == "funcdef" then return false end
+	-- EF.late_gate: the LATE-FORK gate (in-process subshell / $(…), not a pipeline stage) —
+	-- anything that needs a real process forks at runtime right there (rt.need_process),
+	-- so eval/source, exec/ulimit/trap/wait, `&`, dynamic words and any function are fine.
+	if t == "funcdef" then return false end
+	if t == "background" then return EF.late_gate and subshell_stmt_inproc_ok(st.cmd, unsafe) or false end
 	if t == "subshell" then return true end -- its own scope; self-gates
 	if t == "simple" then
 		local w1 = st.words and st.words[1]
 		local c = w1 and w1.parts[1] and #w1.parts == 1 and w1.parts[1].lit
-		if not c then return false end -- dynamic command word: could be exec / an unsafe fn
-		if SUBSHELL_FORK_BUILTINS[c] then return false end -- process-global mutator (exec/ulimit/set/…)
-		if unsafe[c] then return false end -- call to a subshell-unsafe user function
+		if not c and not EF.late_gate then return false end -- dynamic word: could be exec / an unsafe fn
+		if c and not EF.late_gate then
+			if SUBSHELL_FORK_BUILTINS[c] then return false end -- process-global mutator (exec/ulimit/…)
+			if unsafe[c] then return false end -- call to a subshell-unsafe user function
+		end
 		if words_force_fork(st.words) then return false end
 		if st.assigns then
 			for _, a in ipairs(st.assigns) do if a.rhs and word_forces_fork(a.rhs) then return false end end
@@ -1642,6 +1648,12 @@ function subshell_stmt_inproc_ok(st, unsafe)
 	return false -- unknown type: fork to be safe
 end
 EF.subshell_inproc_ok = subshell_list_inproc_ok -- flatten_stmt calls it via EF (upvalue cap)
+EF.subshell_late_ok = function(list)
+	EF.late_gate = true
+	local ok = subshell_list_inproc_ok(list, {})
+	EF.late_gate = false
+	return ok
+end
 -- How the interpreter should reach a compiled function: through __upv_wrap when the
 -- module has lifted upvalues (see M.emit), else the closure itself.
 EF.upv_wrapped = function(fname)
@@ -1686,10 +1698,11 @@ local function compile_cmdsub(src, backtick, lifted, aenv)
 	-- real child. The isolated fragment lifts the same upvalues as functions (EF.lifted_set)
 	-- so a called function and the body share `v_x`; __iso_cmdsub swap-saves them.
 	local bt = backtick and "true" or "false"
+	local strict = EF.subshell_inproc_ok(ast.stmts)
 	local isolated = not cmdsub_nofork_ok(ast.stmts)
 		and not EF.inproc_trap_block
 		and #ast.stmts > 0
-		and EF.subshell_inproc_ok(ast.stmts)
+		and (strict or EF.subshell_late_ok(ast.stmts))
 	local id = emit_fragment(ast.stmts, nil, isolated and EF.lifted_set or nil)
 	if not id then
 		return fallback
@@ -1705,8 +1718,14 @@ local function compile_cmdsub(src, backtick, lifted, aenv)
 	else
 		call = forked
 	end
-	-- eval/source program: in-process only while the body's names are still the static ones
+	-- eval/source program: in-process only while the body's names are still the static ones;
+	-- a body relying on late fork can't take it inside a pipeline stage
 	local guard = call ~= forked and dyn_guard(ast.stmts)
+	if isolated and not strict then
+		guard = "not rt.in_stage()"
+	elseif guard then
+		guard = "(not rt.in_stage() or " .. guard .. ")"
+	end
 	if guard then
 		call = ("(%s and %s or %s)"):format(guard, call, forked)
 	end
@@ -4162,7 +4181,7 @@ simple_compiled = function(cx, st, after)
 		if re then
 			local p = cx.newpc()
 			cx.blocks[p] = dbg(st)
-				.. ("do local __rs = {}; sh.status = (%s) and 0 or 1 end; pc = %d"):format(re, after)
+				.. ("do rt.need_process(sh); local __rs = {}; sh.status = (%s) and 0 or 1 end; pc = %d"):format(re, after)
 			return p
 		end
 	end
@@ -5171,11 +5190,10 @@ H.subshell = function(cx, st, after)
 	-- so subshell_exit_pc is cleared around its build. Anything else falls through to the
 	-- fork path below (still correct). break/continue can't cross into it — subshell_run's
 	-- fragment has its own loopstack, like the fork body.
-	local inproc_pc = nil -- eval/source program: in-process branch behind a runtime name guard
-	if not EF.inproc_trap_block
-		and #st.body > 0
-		and EF.subshell_inproc_ok(st.body)
-	then
+	local inproc_pc = nil -- in-process branch behind a runtime guard (see below)
+	local strict = #st.body > 0 and EF.subshell_inproc_ok(st.body)
+	local late = not strict and #st.body > 0 and EF.subshell_late_ok(st.body)
+	if not EF.inproc_trap_block and (strict or late) then
 		local saved_ssx = EF.subshell_exit_pc
 		EF.subshell_exit_pc = nil
 		-- Compile the body WITH the program lift set so it shares the module's lifted
@@ -5207,7 +5225,7 @@ H.subshell = function(cx, st, after)
 			else
 				cx.blocks[p] = ("%ssh:subshell_run(cs_%d)%s%s; pc = %d"):format(swpre, id, swpost, ecs, after)
 			end
-			if not EF.has_dyncode then
+			if strict and not EF.has_dyncode then
 				return p
 			end
 			inproc_pc = p
@@ -5263,8 +5281,10 @@ H.subshell = function(cx, st, after)
 		cx.blocks[p] = fork
 	end
 	if inproc_pc then
+		-- late-fork body: not inside a pipeline stage; eval/source program: names still static
+		local cond = late and "not rt.in_stage()" or ("(not rt.in_stage() or %s)"):format(dyn_guard(st.body))
 		local g = cx.newpc()
-		cx.blocks[g] = ("if %s then pc = %d else pc = %d end"):format(dyn_guard(st.body), inproc_pc, p)
+		cx.blocks[g] = ("if %s then pc = %d else pc = %d end"):format(cond, inproc_pc, p)
 		return g
 	end
 	return p
