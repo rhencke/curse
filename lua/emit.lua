@@ -3113,6 +3113,47 @@ local function analyze_lift(ast)
 	return lifted
 end
 
+-- Which functions can a pipeline stage NOT call while running IN-PROCESS under the
+-- coroutine scheduler? Everything subshell-unsafe, plus any function that touches a
+-- lifted var: a stage fragment keeps vars in its own cloned sh, but such a function's
+-- fn_x reads/writes the SHARED v_x upvalue — concurrent stages (and the parent) would
+-- see each other's writes. Such a stage forks instead. Propagated to callers.
+local function compute_pipe_unsafe(stmts, funcflags, lifted, sub_unsafe)
+	local unsafe = {}
+	for name in pairs(sub_unsafe) do
+		unsafe[name] = true
+	end
+	local bodies = {}
+	for _, st in ipairs(stmts) do
+		if st.t == "funcdef" and funcflags[st.name] then
+			bodies[st.name] = st.body
+		end
+	end
+	for name, body in pairs(bodies) do
+		if not unsafe[name] and next(lifted) then
+			local touched = {}
+			collect_names(body, touched)
+			for v in pairs(touched) do
+				if lifted[v] then
+					unsafe[name] = true
+					break
+				end
+			end
+		end
+	end
+	local changed = true
+	while changed do
+		changed = false
+		for name, body in pairs(bodies) do
+			if not unsafe[name] and not EF.subshell_inproc_ok(body, unsafe) then
+				unsafe[name] = true
+				changed = true
+			end
+		end
+	end
+	return unsafe
+end
+EF.compute_pipe_unsafe = compute_pipe_unsafe -- M.emit calls it via EF (upvalue cap)
 
 -- Does a function need a positional-param swap / a `local` frame? A call to a
 -- function that needs neither is emitted bare (fn_x(sh)); one that needs only
@@ -5427,9 +5468,17 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
 			-- ignored when the return value is inverted with !), regardless of the negated status.
 			local ec = st.negate and "" or errchk(st)
 			local ecs = ec ~= "" and ("; " .. ec) or ""
+			-- Per stage: run IN-PROCESS under the coroutine scheduler, or fork (a stage that
+			-- needs a real child, or calls a function writing a shared lifted upvalue).
+			local inproc = {}
+			for i = 1, n do
+				inproc[i] = tostring(n >= 2 and not EF.has_dyncode
+					and EF.subshell_inproc_ok({ st.cmds[i] }, EF.pipe_unsafe_fn))
+			end
 			blocks[p] = dbg(st)
 				.. lifted_flush(lifted)
-				.. ("sh:run_pipeline({%s}, %s)"):format(table.concat(frags, ", "), st.negate and "true" or "false")
+				.. ("sh:run_pipeline({%s}, %s, {%s})"):format(
+					table.concat(frags, ", "), st.negate and "true" or "false", table.concat(inproc, ", "))
 				.. post
 				.. ecs
 				.. ("; pc = %d"):format(after)
@@ -5958,6 +6007,7 @@ function M.emit(ast, opts)
 		end
 		EF.sub_unsafe_fn = unsafe
 	end
+	EF.pipe_unsafe_fn = EF.compute_pipe_unsafe(ast.stmts, funcflags, lifted, EF.sub_unsafe_fn)
 	local upvals, runlocals = {}, {}
 	for n in pairs(lifted) do
 		if funcTouched[n] then

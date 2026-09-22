@@ -471,8 +471,158 @@ ffi.cdef([[
   int strcoll(const char *s1, const char *s2);
   size_t strxfrm(char *dest, const char *src, size_t n);
   char *ttyname(int fd);
+  /* Coroutine pipeline scheduler (asm-aliased so interp's own declarations of the
+     same libc symbols never collide — LuaJIT refuses a redefinition). */
+  struct curse_co_pollfd { int fd; short events; short revents; };
+  struct curse_co_ts { long tv_sec; long tv_nsec; };
+  int curse_co_poll(struct curse_co_pollfd *fds, unsigned long nfds, int timeout) asm("poll");
+  int curse_co_pipe2(int *fds, int flags) asm("pipe2");
+  int curse_co_fcntl3(int fd, int cmd, int arg) asm("fcntl");
+  long curse_co_syscall(long nr, long a, long b) asm("syscall");
+  int curse_co_sigaddset(void *set, int sig) asm("sigaddset");
+  int curse_co_sigtimedwait(const void *set, void *info, const struct curse_co_ts *ts) asm("sigtimedwait");
+  int curse_co_chdir(const char *path) asm("chdir");
+  unsigned int curse_co_umask(unsigned int mask) asm("umask");
+  char *curse_co_getcwd(char *buf, unsigned long size) asm("getcwd");
+  void *curse_co_malloc(unsigned long n) asm("malloc");
+  void curse_co_free(void *p) asm("free");
+  long curse_co_write(int fd, const void *buf, unsigned long n) asm("write");
 ]])
 local C = ffi.C
+
+-- ---- Coroutine pipeline scheduler: blocking primitives ---------------------
+-- A pipeline's SHELL-SIDE stages run as cooperative coroutines inside this one
+-- process (externals stay real processes, running concurrently); stages talk over
+-- real kernel pipes. Only one stage runs at a time, so process-global state is
+-- swapped at context-switch time (fd 0/1/2, environ, cwd, umask — see the
+-- scheduler). The one hard rule: nothing a stage does may BLOCK the process, or a
+-- sibling it depends on starves and the pipeline deadlocks. So every blocking
+-- point routes through these: inside a stage they YIELD to the scheduler's poll
+-- loop until ready; outside one (CO == nil) they are no-ops / plain syscalls.
+local CO = nil -- the active scheduler context (nil when no coroutine pipeline runs)
+local CO_OUTS = setmetatable({}, { __mode = "k" }) -- stage stdout writers (fd-1 backed)
+local POLLIN, POLLOUT = 1, 4
+local _co_pfd = ffi.new("struct curse_co_pollfd[1]")
+local function fd_would_block(fd, ev)
+	_co_pfd[0].fd, _co_pfd[0].events, _co_pfd[0].revents = fd, ev, 0
+	return C.curse_co_poll(_co_pfd, 1, 0) == 0 -- nothing ready (POLLHUP/POLLERR count as ready)
+end
+-- The running stage task, or nil (main thread, a forked child, or no scheduler).
+local function co_task()
+	if not CO then
+		return nil
+	end
+	local co = coroutine.running()
+	return co and CO.bycoro[co] or nil
+end
+M.co_task = co_task
+-- Save a copy of `fd` for a later restore — the way bash does: close-on-exec (a
+-- spawned child must never inherit the shell's saved copy; e.g. a saved dup of a
+-- pipe's write end would keep that pipe's reader from ever seeing EOF) and at fd >= 10
+-- (so it can't collide with a user redirect of fds 3-9). -1 if `fd` isn't open.
+function M.save_fd(fd)
+	return C.curse_co_fcntl3(fd, 1030, 10) -- F_DUPFD_CLOEXEC
+end
+-- Move an internal fd out of the user range: a CLOEXEC copy at >= 10, original closed.
+local function fd_hi(fd)
+	if fd < 0 or fd >= 10 then
+		return fd
+	end
+	local d = C.curse_co_fcntl3(fd, 1030, 10)
+	C.close(fd)
+	return d
+end
+-- pipe() for the shell's OWN plumbing (capture pipes, stage pipes): both ends at
+-- >= 10 and close-on-exec, like bash — so they can't be clobbered by (or clobber) a
+-- user redirect of fds 3-9, never leak into a spawned external (a leaked write end
+-- starves its reader of EOF), and survive a pipeline stage's per-switch fd swap.
+-- A child that needs one dup2s it onto 0/1, which clears CLOEXEC there.
+local _hi_pipe = ffi.new("int[2]")
+function M.pipe_hi(fds)
+	if C.curse_co_pipe2(_hi_pipe, 0x80000) ~= 0 then
+		return -1
+	end
+	fds[0], fds[1] = fd_hi(_hi_pipe[0]), fd_hi(_hi_pipe[1])
+	return 0
+end
+local task_flush -- forward: flush a task's buffered stdout (defined with the scheduler)
+local real_flush = io.flush
+-- Park-safety before a yield: nothing buffered may be left in stdio or the task's
+-- stdout buffer, because while parked fd 1 belongs to some OTHER stage.
+local function pre_yield(t)
+	if not t.flushing then
+		task_flush(t)
+	end
+	real_flush()
+end
+-- Wait until `fd` is ready for `ev` (POLLIN/POLLOUT). A no-op outside a stage.
+function M.co_block(fd, ev)
+	local t = co_task()
+	if not t then
+		return
+	end
+	while fd_would_block(fd, ev) do
+		pre_yield(t)
+		coroutine.yield(fd, ev)
+	end
+end
+-- waitpid that yields inside a stage (via a pollable pidfd) instead of stalling
+-- every sibling. `flags` other than 0 (WNOHANG, …) are passed straight through.
+function M.wait_child(pid, stbuf, flags)
+	flags = flags or 0
+	local t = flags == 0 and co_task() or nil
+	if t then
+		local pfd = tonumber(C.curse_co_syscall(434, pid, 0)) -- pidfd_open
+		if pfd and pfd >= 0 then
+			pfd = fd_hi(pfd) -- out of the user fd range: it lives across a yield
+		end
+		if pfd and pfd >= 0 then
+			while fd_would_block(pfd, POLLIN) do
+				pre_yield(t)
+				coroutine.yield(pfd, POLLIN)
+			end
+			C.close(pfd)
+		else -- no pidfd (old kernel): poll WNOHANG on a scheduler tick
+			while C.waitpid(pid, stbuf, 1) == 0 do
+				pre_yield(t)
+				coroutine.yield(-1, 0)
+			end
+			return pid
+		end
+	end
+	return C.waitpid(pid, stbuf, flags)
+end
+-- fork() for every shell-side fork site. Inside a stage it first flushes that
+-- stage's stdout (ordering), and the CHILD leaves the scheduler: it drops every
+-- pipe/save fd the scheduler holds (a stray copy of a write end would starve a
+-- reader of EOF), unblocks SIGPIPE, and forgets CO — so it never yields and runs
+-- to its own _exit like any forked child.
+function M.fork()
+	local t = co_task()
+	if t then
+		pre_yield(t)
+	end
+	local pid = C.fork()
+	if pid == 0 and CO then
+		for fd in pairs(CO.fds) do
+			C.close(fd)
+		end
+		C.sigprocmask(2, CO.oldmask, nil) -- SIG_SETMASK: SIGPIPE back to the pre-pipeline mask
+		CO = nil
+	end
+	return pid
+end
+-- io.flush is the shell's universal "about to move/hand off fd 1" hook (redirect
+-- apply/restore, spawn, fork all call it), so extend it to also drain the running
+-- stage's stdout buffer — keeping builtin output correctly ordered around
+-- redirects without touching every call site.
+io.flush = function(...)
+	local t = CO and co_task()
+	if t and not t.flushing then
+		task_flush(t)
+	end
+	return real_flush(...)
+end
 
 -- ---- Locale (glibc-delegated, like bash) ----------------------------------
 -- A C program starts in the "C" locale until setlocale(LC_ALL,"") is called, so
@@ -628,7 +778,7 @@ end
 -- so a forked child running the body honors interp/bg-compile/OSR like any code.
 function M.subshell_fork(sh) -- returns pid (0 in the child, which is set up here)
 	io.flush() -- flush buffered parent stdout so the fork doesn't duplicate it
-	local pid = C.fork()
+	local pid = M.fork()
 	if pid == 0 then
 		sh.in_subprogram = (sh.in_subprogram or 0) + 1 -- ERR trap won't fire here (sans errtrace)
 		sh.loopdepth = 0 -- an enclosing loop isn't ours to break/continue
@@ -638,7 +788,7 @@ function M.subshell_fork(sh) -- returns pid (0 in the child, which is set up her
 end
 local _ss_st = ffi.new("int[1]")
 function M.subshell_wait(pid)
-	C.waitpid(pid, _ss_st, 0)
+	M.wait_child(pid, _ss_st, 0)
 	return M.wexit(_ss_st[0])
 end
 function M.subshell_exit(status)
@@ -670,7 +820,7 @@ end
 function M.redir_apply(sh, op, fd, target, saves)
 	io.flush() -- flush buffered stdout before moving fds (else it lands in the new target)
 	local function backup(f)
-		saves[#saves + 1] = { fd = f, saved = C.dup(f) }
+		saves[#saves + 1] = { fd = f, saved = M.save_fd(f) }
 	end
 	local function open_out(path) -- honor noclobber (set -C) for a truncating '>'
 		if not sh.opt_C then
@@ -853,12 +1003,12 @@ end
 -- ENOEXEC fallback for the streaming (non-capturing) path: fd 1 is already the
 -- destination, so just fork a child that runs the script and inherits fd 1.
 function Shell:run_noexec(path, args, n)
-	local pid = C.fork()
+	local pid = M.fork()
 	if pid == 0 then
 		self:exec_script_child(path, args, n)
 	end
 	local st = ffi.new("int[1]")
-	C.waitpid(pid, st, 0)
+	M.wait_child(pid, st, 0)
 	self.status = M.wexit(st[0])
 end
 
@@ -871,7 +1021,7 @@ end
 -- caller until after the spawn, then destroyed) or nil when no trap is active.
 local SPAWN_SETSIGMASK = 0x08 -- POSIX_SPAWN_SETSIGMASK (glibc)
 local function child_spawnattr(self)
-	if not (self.sigtraps and next(self.sigtraps)) then
+	if not (self.sigtraps and next(self.sigtraps)) and not CO then -- CO: SIGPIPE is blocked
 		return nil
 	end
 	local attr = ffi.new("uint8_t[1024]") -- opaque posix_spawnattr_t; over-allocate
@@ -918,8 +1068,8 @@ function Shell:exec(...)
 	-- pipeline stage): let the child write STRAIGHT to fd 1 (inherit fds) instead
 	-- of buffering all its output — so an unbounded producer (`cat /dev/zero | …`)
 	-- streams and SIGPIPE propagates, and there's no 2x-memory capture.
-	if self.out == io.write then
-		io.flush() -- our own buffered stdout must reach fd 1 before the child writes
+	if self.out == io.write or CO_OUTS[self.out] then
+		io.flush() -- our own buffered stdout (and a pipeline stage's) must reach fd 1 first
 		local pidp = ffi.new("curse_pid_t[1]")
 		local attr = child_spawnattr(self)
 		local rc = C.posix_spawnp(pidp, execpath, nil, attr, ffi.cast("char *const *", argv), C.environ)
@@ -937,12 +1087,12 @@ function Shell:exec(...)
 			return
 		end
 		local st = ffi.new("int[1]")
-		C.waitpid(pidp[0], st, 0)
+		M.wait_child(pidp[0], st, 0)
 		self.status = M.wexit(st[0])
 		return
 	end
 	local fds = ffi.new("int[2]")
-	if C.pipe(fds) ~= 0 then
+	if M.pipe_hi(fds) ~= 0 then
 		self.status = 127
 		return
 	end
@@ -962,7 +1112,7 @@ function Shell:exec(...)
 	C.posix_spawn_file_actions_destroy(fa)
 	local pid = pidp[0]
 	if rc == 8 then -- ENOEXEC: no-shebang script — run it through our interpreter in a
-		pid = C.fork() -- child, with its stdout dup'd onto the capture pipe's write end.
+		pid = M.fork() -- child, with its stdout dup'd onto the capture pipe's write end.
 		if pid == 0 then
 			C.dup2(wfd, 1)
 			C.close(wfd)
@@ -980,6 +1130,7 @@ function Shell:exec(...)
 	local buf = ffi.new("char[65536]")
 	local chunks = {}
 	while true do
+		M.co_block(rfd, POLLIN)
 		local nr = C.read(rfd, buf, 65536)
 		if nr <= 0 then
 			break
@@ -988,7 +1139,7 @@ function Shell:exec(...)
 	end
 	C.close(rfd)
 	local st = ffi.new("int[1]")
-	C.waitpid(pid, st, 0)
+	M.wait_child(pid, st, 0)
 	self.status = M.wexit(st[0])
 	local out = table.concat(chunks)
 	if out ~= "" then
@@ -1011,10 +1162,10 @@ function Shell:capture_forked(ast, runner)
 	end
 	io.flush()
 	local pfd = ffi.new("int[2]")
-	if C.pipe(pfd) ~= 0 then
+	if M.pipe_hi(pfd) ~= 0 then
 		return nil
 	end -- caller falls back to in-process
-	local pid = C.fork()
+	local pid = M.fork()
 	if pid == 0 then
 		C.close(pfd[0])
 		C.dup2(pfd[1], 1)
@@ -1031,6 +1182,7 @@ function Shell:capture_forked(ast, runner)
 	C.close(pfd[1])
 	local chunks, rbuf = {}, ffi.new("char[8192]")
 	while true do
+		M.co_block(pfd[0], POLLIN)
 		local nr = tonumber(C.read(pfd[0], rbuf, 8192))
 		if not nr or nr <= 0 then
 			break
@@ -1039,7 +1191,7 @@ function Shell:capture_forked(ast, runner)
 	end
 	C.close(pfd[0])
 	local stbuf = ffi.new("int[1]")
-	C.waitpid(pid, stbuf, 0)
+	M.wait_child(pid, stbuf, 0)
 	self.status = M.wexit(stbuf[0])
 	self.last_cmdsub_status = self.status -- like capture_inproc: for an empty-argv command's status
 	return (table.concat(chunks):gsub("%z", ""):gsub("\n+$", ""))
@@ -1207,7 +1359,7 @@ function Shell:capture_inproc(backtick, runner, capfd)
 		if tfd < 0 then
 			capfd = false
 		else
-			save1 = C.dup(1)
+			save1 = M.save_fd(1)
 			C.dup2(tfd, 1)
 			C.close(tfd)
 		end
@@ -1487,7 +1639,7 @@ end
 -- only, gated by emit to trap-free programs (so the child needs no signal reset).
 function Shell:run_background(cmd_fn, cmdstr)
 	io.flush()
-	local pid = C.fork()
+	local pid = M.fork()
 	if pid == 0 then
 		local dn = C.open("/dev/null", 0, 0)
 		if dn >= 0 then
@@ -1516,10 +1668,382 @@ end
 -- or runs in the current shell under `shopt -s lastpipe`. Sets $PIPESTATUS and applies
 -- `!` negation. Compiled tier only (gated by emit to no trap/DEBUG/ERR — so no signal
 -- reset or per-stage trap firing is needed here). `stage_fns` are cs_N fragments.
-function Shell:run_pipeline(stage_fns, negate)
+-- ---- Coroutine pipeline scheduler -------------------------------------------
+-- `a | b | c` with NO fork per shell-side stage: each stage is a coroutine running
+-- its compiled fragment on its own cloned shell, externals stay real processes
+-- running concurrently, and stages are connected by real kernel pipes. Only one
+-- stage runs at a time, so the process-global state a forked stage would own —
+-- fd 0/1/2, environ, cwd, umask — is INSTALLED on resume and SAVED on yield (the
+-- swap game at context-switch granularity); between resumes everything is
+-- PARKED on the parent's values, which also guarantees no stale fd-1 copy keeps a
+-- reader from seeing EOF. A stage that would block (pipe full/empty, child not
+-- exited) yields to a poll() loop — see M.co_block / M.wait_child / M.fork.
+M.CO_OUTS = CO_OUTS
+local _co_sigpipe = ffi.new("uint8_t[128]") -- sigset_t {SIGPIPE}
+C.sigemptyset(_co_sigpipe)
+C.curse_co_sigaddset(_co_sigpipe, 13)
+local _co_zero_ts = ffi.new("struct curse_co_ts", 0, 0)
+
+-- Drain a stage's buffered stdout to its fd 1 (whatever fd 1 is right now — a
+-- redirect inside the stage included). Writes are <= 4096 after POLLOUT, so a
+-- write never blocks on a pipe (a free slot always fits a PIPE_BUF write). SIGPIPE
+-- is blocked for the scheduler's lifetime, so a vanished reader surfaces as EPIPE:
+-- consume the pending signal and end the stage the way SIGPIPE ends a forked one.
+task_flush = function(t)
+	if t.nbuf == 0 then
+		return
+	end
+	local data = table.concat(t.buf, "", 1, t.nbuf)
+	t.buf, t.nbuf, t.nbytes = {}, 0, 0
+	t.flushing = true
+	local p, off, len = ffi.cast("const char *", data), 0, #data
+	while off < len do
+		M.co_block(1, POLLOUT)
+		local chunk = len - off
+		if chunk > 4096 then
+			chunk = 4096
+		end
+		local w = tonumber(C.curse_co_write(1, p + off, chunk))
+		if w >= 0 then
+			off = off + w
+		else
+			local e = ffi.errno()
+			if e == 32 then -- EPIPE
+				C.curse_co_sigtimedwait(_co_sigpipe, nil, _co_zero_ts)
+				t.flushing = false
+				error({ __curse_sigpipe = true })
+			elseif e ~= 4 and e ~= 11 then -- not EINTR/EAGAIN: drop (like a failed io.write)
+				break
+			end
+		end
+	end
+	t.flushing = false
+end
+local function make_out(t)
+	local f = function(...)
+		local k = t.nbuf
+		for i = 1, select("#", ...) do
+			local s = tostring((select(i, ...)))
+			k = k + 1
+			t.buf[k] = s
+			t.nbytes = t.nbytes + #s
+		end
+		t.nbuf = k
+		if t.nbytes >= 4096 then
+			task_flush(t)
+		end
+	end
+	CO_OUTS[f] = true
+	return f
+end
+-- A stage's private shell: a subshell's worth of isolation for the Lua-side state
+-- (process-global state is swapped by the scheduler instead). Every table field is
+-- shallow-copied so container mutations stay local; variable boxes are mutated in
+-- place, so they're deep-copied; the per-depth param pools are reused in place by
+-- pushParams, so a stage gets fresh ones.
+function Shell:stage_clone()
+	local c = setmetatable({}, getmetatable(self))
+	for k, v in pairs(self) do
+		c[k] = type(v) == "table" and shallowcopy(v) or v
+	end
+	local vars = {}
+	for k, b in pairs(self.vars) do
+		vars[k] = copybox(b)
+	end
+	c.vars = vars
+	for d, rec in pairs(c.savedstack) do
+		if type(rec) == "table" then
+			c.savedstack[d] = shallowcopy(rec)
+		end
+	end
+	for k = 1, #c.tenv do
+		c.tenv[k] = shallowcopy(c.tenv[k])
+	end
+	c.argpool = {}
+	-- (jobs stays a COPY of the parent's table: bash lets a pipeline stage SEE the
+	-- parent's jobs — `jobs | wc -l` — as a forked stage's copy-on-write view did.)
+	c.in_pipestage = (self.in_pipestage or 0) + 1
+	c.loopdepth = 0
+	c.capturing = nil
+	return c
+end
+local function env_copy(envp)
+	local n = 0
+	while envp[n] ~= nil do
+		n = n + 1
+	end
+	local a = ffi.cast("char **", C.curse_co_malloc((n + 1) * 8))
+	for i = 0, n do
+		a[i] = envp[i]
+	end
+	return a
+end
+local _co_cwdbuf = ffi.new("char[4096]")
+local _co_pst = ffi.new("int[2]")
+
+-- Run the pipeline under the scheduler. `inproc[i]` (decided at compile time): run
+-- stage i in-process; otherwise it forks (a stage that needs a real child — exec,
+-- ulimit, set, eval, … — see EF.pipe_unsafe_fn), still scheduled uniformly: its
+-- task forks from inside the coroutine and waits on a pidfd. Returns nil (caller
+-- falls back to the legacy fork path) if the scheduler can't be set up.
+function Shell:run_pipeline_co(stage_fns, inproc)
+	local n = #stage_fns
+	real_flush()
+	local ctx = { tasks = {}, bycoro = {}, fds = {} }
+	local function cx(fd) -- CLOEXEC dup >= 3, tracked so a forked child can drop it
+		local d = C.curse_co_fcntl3(fd, 1030, 10) -- F_DUPFD_CLOEXEC, clear of user fds 3-9
+		if d >= 0 then
+			ctx.fds[d] = true
+		end
+		return d
+	end
+	local function cl(fd)
+		if fd and fd >= 0 then
+			ctx.fds[fd] = nil
+			C.close(fd)
+		end
+	end
+	local o0, o1, o2 = cx(0), cx(1), cx(2)
+	if o0 < 0 or o1 < 0 or o2 < 0 then -- a std fd is closed (`<&-`): leave it to the fork path
+		cl(o0)
+		cl(o1)
+		cl(o2)
+		return nil
+	end
+	local ins, outs = { o0 }, {}
+	for i = 1, n - 1 do
+		if M.pipe_hi(_co_pst) ~= 0 then
+			for fd in pairs(ctx.fds) do
+				C.close(fd)
+			end
+			return nil
+		end
+		ctx.fds[_co_pst[0]], ctx.fds[_co_pst[1]] = true, true
+		outs[i], ins[i + 1] = _co_pst[1], _co_pst[0]
+	end
+	outs[n] = o1
+	-- The parent's user fds 3-9 too: a stage's `3>&-`/`5<&0`/`exec`-free redirect of a
+	-- high user fd is per-stage state (a forked stage owned its fd table), so fds 0-9 are
+	-- all swapped at context switch; pfd[k] is what's parked in between (-1: closed).
+	local pfd = { [0] = o0, o1, o2 }
+	for k = 3, 9 do
+		pfd[k] = cx(k)
+	end
+	local penv = C.environ
+	local pcwd = self:phys_cwd()
+	local pum = C.curse_co_umask(0)
+	C.curse_co_umask(pum)
+	ctx.oldmask = ffi.new("uint8_t[128]")
+	C.sigprocmask(0, _co_sigpipe, ctx.oldmask) -- SIG_BLOCK: a dead reader is EPIPE, not our death
+	local envs = {}
+	for i = 1, n do
+		local t = { i = i, fd = { [0] = ins[i], outs[i], o2 }, sv = {}, cwd = pcwd, um = pum, buf = {}, nbuf = 0, nbytes = 0 }
+		for k = 3, 9 do
+			t.fd[k] = pfd[k]
+		end
+		t.env = env_copy(penv)
+		envs[i] = t.env
+		local fn = stage_fns[i]
+		if inproc[i] then
+			local sh = self:stage_clone()
+			sh.out = make_out(t)
+			t.co = coroutine.create(function()
+				local ok, err = pcall(fn, sh)
+				if not ok and type(err) == "table" and err.__curse_sigpipe then
+					return 141
+				end
+				M.child_status(sh, ok, err)
+				local fok, ferr = pcall(task_flush, t)
+				if not fok and type(ferr) == "table" and ferr.__curse_sigpipe then
+					return 141
+				end
+				return sh.status or 0
+			end)
+		else
+			local parent = self
+			t.co = coroutine.create(function()
+				local pid = M.fork()
+				if pid == 0 then -- the child owns fd 0/1/2 as installed for this stage
+					parent.in_pipestage = (parent.in_pipestage or 0) + 1
+					local ok, err = pcall(function()
+						parent.out = io.write
+						fn(parent)
+					end)
+					M.child_status(parent, ok, err)
+					io.flush()
+					C._exit(parent.status or 0)
+				end
+				local st = ffi.new("int[1]")
+				M.wait_child(pid, st, 0)
+				return M.wexit(st[0])
+			end)
+		end
+		ctx.tasks[i] = t
+		ctx.bycoro[t.co] = t
+	end
+
+	local status, alive, cur_cwd = {}, n, pcwd
+	local runnable = {}
+	for i = 1, n do
+		runnable[i] = ctx.tasks[i]
+	end
+	local pf = ffi.new("struct curse_co_pollfd[?]", n)
+	CO = ctx
+	local ok_all, err_all = pcall(function()
+		while alive > 0 do
+			for _, t in ipairs(runnable) do
+				for fd = 0, 9 do -- install the stage's fds 0-9 (-1: it had closed it)
+					if t.fd[fd] >= 0 then
+						C.dup2(t.fd[fd], fd)
+					else
+						C.close(fd)
+					end
+				end
+				C.environ = t.env
+				if t.cwd ~= cur_cwd then
+					C.curse_co_chdir(t.cwd)
+					cur_cwd = t.cwd
+				end
+				C.curse_co_umask(t.um)
+				local rok, a, b = coroutine.resume(t.co)
+				-- save the stage's process state, then park on the parent's
+				t.env = C.environ
+				t.um = C.curse_co_umask(pum)
+				C.environ = penv
+				local p = C.curse_co_getcwd(_co_cwdbuf, 4096)
+				if p ~= nil then
+					cur_cwd = ffi.string(p)
+				end
+				if coroutine.status(t.co) == "dead" then
+					if not rok then -- an internal error escaped the stage's own pcall
+						io.stderr:write("curse: pipeline stage: " .. tostring(a) .. "\n")
+					end
+					status[t.i] = rok and (a or 0) or 1
+					t.done, t.wait = true, nil
+					alive = alive - 1
+				else
+					t.cwd = cur_cwd
+					for fd = 0, 9 do -- the stage's CURRENT fds 0-9 (a redirect may be active)
+						cl(t.sv[fd])
+						local d = cx(fd)
+						t.sv[fd], t.fd[fd] = d, d
+					end
+					t.wait, t.wev = a, b
+				end
+				for fd = 0, 9 do -- park on the parent's fds
+					if pfd[fd] >= 0 then
+						C.dup2(pfd[fd], fd)
+					else
+						C.close(fd)
+					end
+				end
+				if cur_cwd ~= pcwd then
+					C.curse_co_chdir(pcwd)
+					cur_cwd = pcwd
+				end
+				if t.done then -- release its pipe ends: EOF downstream, EPIPE upstream
+					for fd = 0, 9 do
+						cl(t.sv[fd])
+					end
+					if ins[t.i] ~= o0 then
+						cl(ins[t.i])
+					end
+					if outs[t.i] ~= o1 then
+						cl(outs[t.i])
+					end
+				end
+			end
+			if alive == 0 then
+				break
+			end
+			local cnt, tick = 0, false
+			for i = 1, n do
+				local t = ctx.tasks[i]
+				if not t.done then
+					local w = t.wait
+					if w == -1 then
+						tick = true
+					else
+						if w <= 2 then
+							w = t.fd[w] -- a std fd: poll the stage's own saved copy
+						end
+						pf[cnt].fd, pf[cnt].events, pf[cnt].revents = w, t.wev, 0
+						cnt = cnt + 1
+					end
+				end
+			end
+			local r = C.curse_co_poll(pf, cnt, tick and 10 or -1)
+			runnable = {}
+			local k = 0
+			for i = 1, n do
+				local t = ctx.tasks[i]
+				if not t.done then
+					if t.wait == -1 then
+						if tick then
+							runnable[#runnable + 1] = t
+						end
+					else
+						if r > 0 and pf[k].revents ~= 0 then
+							runnable[#runnable + 1] = t
+						end
+						k = k + 1
+					end
+				end
+			end
+		end
+	end)
+	CO = nil
+	for fd = 0, 9 do
+		if pfd[fd] >= 0 then
+			C.dup2(pfd[fd], fd)
+		else
+			C.close(fd)
+		end
+	end
+	C.environ = penv
+	C.curse_co_umask(pum)
+	if cur_cwd ~= pcwd then
+		C.curse_co_chdir(pcwd)
+	end
+	for fd in pairs(ctx.fds) do
+		C.close(fd)
+	end
+	C.curse_co_sigtimedwait(_co_sigpipe, nil, _co_zero_ts) -- drop a SIGPIPE still pending
+	C.sigprocmask(2, ctx.oldmask, nil)
+	for i = 1, n do
+		C.curse_co_free(envs[i])
+	end
+	if not ok_all then
+		error(err_all)
+	end
+	local last, pipe, pstat = 0, 0, {}
+	for k = 1, n do
+		local est = status[k] or 0
+		pstat[k] = tostring(est)
+		if k == n then
+			last = est
+		end
+		if est ~= 0 then
+			pipe = est
+		end
+	end
+	self:array_assign("PIPESTATUS", pstat, false)
+	self.status = self.opt_pipefail and pipe or last
+	return true
+end
+
+function Shell:run_pipeline(stage_fns, negate, inproc)
 	local nst = #stage_fns
 	if nst == 1 then -- defensive: a single stage (emit delegates `! cmd` for exact errexit)
 		stage_fns[1](self)
+	elseif
+		inproc
+		and not CO -- a pipeline nested inside a stage uses the fork path (its waits yield)
+		and self.out == io.write
+		and not self.capturing
+		and not (self.shopt.lastpipe and not self.opt_i)
+		and self:run_pipeline_co(stage_fns, inproc)
+	then -- ran under the coroutine scheduler (status/PIPESTATUS set)
 	else
 		io.flush() -- flush parent stdio so forked stages don't duplicate buffered output
 		local lastpipe = self.shopt.lastpipe and not self.opt_i and nst >= 2
@@ -1528,11 +2052,11 @@ function Shell:run_pipeline(stage_fns, negate)
 			local rd, wr = -1, -1
 			if k < nst then
 				local p = ffi.new("int[2]")
-				C.pipe(p)
+				M.pipe_hi(p)
 				rd, wr = p[0], p[1]
 			end
 			if k == nst and lastpipe then -- last stage runs in the current shell (side effects persist)
-				local save0 = C.dup(0)
+				local save0 = M.save_fd(0)
 				if prev_read >= 0 then
 					C.dup2(prev_read, 0)
 					C.close(prev_read)
@@ -1554,8 +2078,8 @@ function Shell:run_pipeline(stage_fns, negate)
 				pids[k] = -1
 			elseif k == nst and self.capturing then -- inside $(…): drain last stage into the capture buffer
 				local cp = ffi.new("int[2]")
-				C.pipe(cp)
-				local pid = C.fork()
+				M.pipe_hi(cp)
+				local pid = M.fork()
 				if pid == 0 then
 					self.in_pipestage = (self.in_pipestage or 0) + 1
 					local ok, err = pcall(function()
@@ -1581,6 +2105,7 @@ function Shell:run_pipeline(stage_fns, negate)
 				C.close(cp[1])
 				local chunks, rbuf = {}, ffi.new("char[65536]")
 				while true do
+					M.co_block(cp[0], POLLIN)
 					local n = tonumber(C.read(cp[0], rbuf, 65536))
 					if n <= 0 then
 						break
@@ -1590,7 +2115,7 @@ function Shell:run_pipeline(stage_fns, negate)
 				C.close(cp[0])
 				self.out(table.concat(chunks))
 			else
-				local pid = C.fork()
+				local pid = M.fork()
 				if pid == 0 then
 					self.in_pipestage = (self.in_pipestage or 0) + 1
 					local ok, err = pcall(function()
@@ -1632,7 +2157,7 @@ function Shell:run_pipeline(stage_fns, negate)
 			if pids[k] == -1 then
 				est = inline_status or 0 -- ran inline (lastpipe)
 			else
-				C.waitpid(pids[k], stbuf, 0)
+				M.wait_child(pids[k], stbuf, 0)
 				est = M.wexit(stbuf[0])
 			end
 			pstat[k] = tostring(est)

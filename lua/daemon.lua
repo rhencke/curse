@@ -48,6 +48,7 @@ ffi.cdef([[
   long write(int fd, const void *buf, unsigned long n);
   int fork(void);
   int dup2(int a, int b);
+  long syscall(long number, ...);
   int chdir(const char *path);
   int unlink(const char *path);
   int chmod(const char *path, unsigned int mode);
@@ -245,6 +246,10 @@ local function serve_request(cfd, req, fds, ctx)
 		C.dup2(ctx.devnull, 1)
 		C.dup2(ctx.devnull, 2)
 	end
+	-- ...and every other script-visible fd: a user `exec 3>file` must not persist into the
+	-- next request, nor may a shell-internal save (>= 10) a raise skipped restoring. The
+	-- daemon's own fds all live at >= 200 (fd_move_high), so one close_range covers it.
+	C.syscall(436, ffi.new("int", 3), ffi.new("int", 199), ffi.new("int", 0)) -- close_range
 	ctx.active[0] = os.time() -- stamp the shared activity clock (drives the parent's idle-drain)
 end
 

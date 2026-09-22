@@ -457,6 +457,7 @@ end
 -- stream, breaking a subsequent read from the same underlying fd).
 local rd1 = ffi.new("char[1]")
 local function fd_getc(fd)
+	rt.co_block(fd, 1) -- inside a pipeline stage: yield, don't stall the siblings
 	local n = C.read(fd, rd1, 1)
 	if n == 1 then
 		return string.char(rd1[0] % 256)
@@ -2072,7 +2073,7 @@ local function apply_redirs(sh, redirs)
 	local persist = {}
 	local function backup(fd)
 		if not persist[fd] then
-			save[#save + 1] = { fd = fd, saved = C.dup(fd) }
+			save[#save + 1] = { fd = fd, saved = rt.save_fd(fd) }
 		end
 	end
 	-- redirect targets are word-expanded at runtime (e.g. `> $TMP/f`, `>& $myfd`).
@@ -3658,7 +3659,7 @@ local function drain_procsub(sh, np, nf)
 			io.flush()
 			-- Run the >(cmd) body in a forked child through curse's OWN interpreter
 			-- (never `sh -c`, which would recurse once curse is /bin/sh), stdin from temp.
-			local pid = C.fork()
+			local pid = rt.fork()
 			if pid == 0 then
 				reset_child_sigtraps(sh) -- caught signal traps revert to default in the >(…) subshell
 				local fd = C.open(ps.file, 0, 0) -- O_RDONLY
@@ -3676,7 +3677,7 @@ local function drain_procsub(sh, np, nf)
 				C._exit(sh.status or 0)
 			end
 			local stbuf = ffi.new("int[1]")
-			C.waitpid(pid, stbuf, 0)
+			rt.wait_child(pid, stbuf, 0)
 		end
 		for i = #pend, np + 1, -1 do
 			pend[i] = nil
@@ -4510,11 +4511,11 @@ exec_stmt = function(sh, st, hook)
 		local pfd
 		if cap then
 			pfd = ffi.new("int[2]")
-			if C.pipe(pfd) ~= 0 then
+			if rt.pipe_hi(pfd) ~= 0 then
 				cap = false
 			end
 		end
-		local pid = C.fork()
+		local pid = rt.fork()
 		if pid == 0 then
 			if cap then
 				C.close(pfd[0])
@@ -4546,6 +4547,7 @@ exec_stmt = function(sh, st, hook)
 			C.close(pfd[1])
 			local rbuf = ffi.new("char[8192]")
 			while true do
+				rt.co_block(pfd[0], 1)
 				local nr = tonumber(C.read(pfd[0], rbuf, 8192))
 				if not nr or nr <= 0 then
 					break
@@ -4555,7 +4557,7 @@ exec_stmt = function(sh, st, hook)
 			C.close(pfd[0])
 		end
 		local stbuf = ffi.new("int[1]")
-		C.waitpid(pid, stbuf, 0)
+		rt.wait_child(pid, stbuf, 0)
 		sh.status = rt.wexit(stbuf[0])
 	elseif t == "background" then
 		-- cmd & : fork, run in the child; parent records $! and continues (status 0).
@@ -4563,7 +4565,7 @@ exec_stmt = function(sh, st, hook)
 		-- Block signals across the fork + the child's disposition reset so an immediate
 		-- `kill -SIG $!` can't be delivered to the child before it clears its traps (bash).
 		C.curse_sig_hold(1)
-		local pid = C.fork()
+		local pid = rt.fork()
 		if pid == 0 then
 			-- Without job control, an async command's stdin is /dev/null (bash), so it
 			-- can't steal the terminal — and it must not inherit a redirect it didn't ask for.
@@ -4703,11 +4705,11 @@ exec_stmt = function(sh, st, hook)
 				local rd, wr = -1, -1
 				if k < nst then
 					local p = ffi.new("int[2]")
-					C.pipe(p)
+					rt.pipe_hi(p)
 					rd, wr = p[0], p[1]
 				end
 				if k == nst and lastpipe then
-					local save0 = C.dup(0)
+					local save0 = rt.save_fd(0)
 					if prev_read >= 0 then
 						C.dup2(prev_read, 0)
 						C.close(prev_read)
@@ -4731,8 +4733,8 @@ exec_stmt = function(sh, st, hook)
 					-- inside $(...): the last stage's stdout must land in the capture buffer,
 					-- not the shell's real fd 1. Wire it to a pipe the parent drains into sh.out.
 					local cp = ffi.new("int[2]")
-					C.pipe(cp)
-					local pid = C.fork()
+					rt.pipe_hi(cp)
+					local pid = rt.fork()
 					if pid == 0 then
 						reset_child_sigtraps(sh) -- caught signal traps revert to default in a pipeline stage
 						sh.in_pipestage = (sh.in_pipestage or 0) + 1 -- a forked stage re-runs neither DEBUG nor ERR
@@ -4759,6 +4761,7 @@ exec_stmt = function(sh, st, hook)
 					C.close(cp[1]) -- parent keeps only the read end; drain to EOF before waitpid
 					local chunks, rbuf = {}, ffi.new("char[65536]")
 					while true do
+						rt.co_block(cp[0], 1)
 						local n = tonumber(C.read(cp[0], rbuf, 65536))
 						if n <= 0 then
 							break
@@ -4768,7 +4771,7 @@ exec_stmt = function(sh, st, hook)
 					C.close(cp[0])
 					sh.out(table.concat(chunks))
 				else
-					local pid = C.fork()
+					local pid = rt.fork()
 					if pid == 0 then
 						reset_child_sigtraps(sh) -- caught signal traps revert to default in a pipeline stage
 						sh.in_pipestage = (sh.in_pipestage or 0) + 1 -- a forked stage re-runs neither DEBUG nor ERR
@@ -4811,7 +4814,7 @@ exec_stmt = function(sh, st, hook)
 				if pids[k] == -1 then
 					est = inline_status or 0 -- ran inline (lastpipe)
 				else
-					C.waitpid(pids[k], stbuf, 0)
+					rt.wait_child(pids[k], stbuf, 0)
 					est = rt.wexit(stbuf[0])
 				end
 				pstat[k] = tostring(est)
