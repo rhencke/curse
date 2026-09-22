@@ -1731,7 +1731,17 @@ end
 -- NAME), default/alternate (a set-ness test on the name), an element ${a[i]..}, and array
 -- count — those need name/isset resolution the value read doesn't give, so they delegate.
 local function pexp_nameref_valop(pe)
-	return not pe.index and (pe.op == "len" or pe.op == "sub" or PEXP_STROP[pe.op]) and pexp_compilable(pe)
+	-- ${#a[@]} count and a bare element read ${a[i]}/${m[k]} resolve the (possibly-nameref) NAME
+	-- via sh:deref at runtime — a no-op for a plain var, the target for a whole-array/assoc
+	-- nameref — then read; pexp_scalar renders them deref-aware. (Bare ${a[@]}/${a[*]} multi is
+	-- array_multi_op, handled by emit_seg.)
+	if pe.index == "@" or pe.index == "*" then
+		return pe.op == "len" and pexp_compilable(pe)
+	end
+	if pe.index then
+		return pe.op == nil and pexp_compilable(pe)
+	end
+	return (pe.op == "len" or pe.op == "sub" or PEXP_STROP[pe.op]) and pexp_compilable(pe)
 end
 -- ${a[@]OP} / ${a[*]OP}: a per-element string-op over the whole array, compiled by
 -- mapping apply_str_op via rt.array_op_values — exactly interp's generic per-element
@@ -1791,13 +1801,14 @@ function pexp_scalar(pe, lifted)
 		return ("sh:attr_string(%q)"):format(pe.name)
 	end
 	local val
+	local ename = EF.has_nameref and ("sh:deref(%q)"):format(pe.name) or ("%q"):format(pe.name) -- a nameref array read resolves to its target
 	if pe.index == "@" or pe.index == "*" then -- ${#a[@]}: array element COUNT (op is len, gated)
-		return ("tostring(sh:array_count(%q))"):format(pe.name)
+		return ("tostring(sh:array_count(%s))"):format(ename)
 	elseif pe.index then -- ${name[sub]…}: read the element; a read-only op (below) then applies to it.
 		-- Pass BOTH the raw subscript (arith-evaluated for an indexed array) and its word-expanded
 		-- form (the assoc key); rt.array_elem picks per the array's type, matching interp's array_key.
 		local expanded = emit_word(require("parser").parse_word(pe.index), lifted)
-		val = ("rt.array_elem(sh, %q, %q, %s)"):format(pe.name, pe.index, expanded)
+		val = ("rt.array_elem(sh, %s, %q, %s)"):format(ename, pe.index, expanded)
 		if pe.op == nil then
 			return val
 		end
@@ -2060,18 +2071,22 @@ local function emit_seg(p, i, lifted)
 	if p.pexp then -- ${a[@]} / ${a[*]}: array elements as a multi-element segment (gated)
 		local pe = p.pexp
 		local positional = (pe.name == "@" or pe.name == "*") -- ${@OP}/${*OP} vs ${a[@]OP}
+		-- A nameref array read resolves to its target (sh:deref: no-op for a plain var, the target
+		-- for a whole-array nameref); positional $@/$* is not a var name, so never deref it.
+		local aname = (EF.has_nameref and not positional) and ("sh:deref(%q)"):format(pe.name)
+			or ("%q"):format(pe.name)
 		-- Element source: positional params ($1.. — plus $0 for a slice, whose offset is
 		-- indexed) or the array's values.
 		local elems = positional and (pe.op == "sub" and "sh:paramListSub()" or "sh:paramList()")
-			or ("sh:array_values(%q)"):format(pe.name)
+			or ("sh:array_values(%s)"):format(aname)
 		if pe.op == "indices" then -- ${!a[@]}: the keys/indices, not the values
-			elems = ("rt.array_index_strs(sh, %q)"):format(pe.name)
+			elems = ("rt.array_index_strs(sh, %s)"):format(aname)
 		elseif pe.op == "sub" then -- ${a[@]:off:len} / ${@:off:len} slice: arith off/len, then select
 			local P = require("parser")
 			local off = ("(rt.arith_int(sh, %s) or 0)"):format(emit_word(P.parse_word(pe.arg or ""), lifted))
 			local len = pe.arg2 and ("(rt.arith_int(sh, %s) or 0)"):format(emit_word(P.parse_word(pe.arg2), lifted))
 				or "nil"
-			elems = ("rt.array_slice_values(sh, %q, %s, %s, %s)"):format(pe.name, elems, off, len)
+			elems = ("rt.array_slice_values(sh, %s, %s, %s, %s)"):format(aname, elems, off, len)
 		elseif ARRAY_DEFAULT[pe.op] then -- ${a[@]:-def}/-/:+/+ : the value list, or the default
 			-- as a SINGLE field (rt.expand_fields then splits/keeps it per the outer q, exactly
 			-- bash's field-wise default). null test grounded in bash string_list_dollar_at/_star:
@@ -2189,7 +2204,8 @@ function mixed_expandable(w, lifted)
 				indirect_ok(p.pexp)
 				or p.pexp.op == "prefix"
 				or pexp_nameref_valop(p.pexp)
-				or (not EF.has_nameref and (array_multi_op(p.pexp) or pexp_compilable(p.pexp)))
+				or array_multi_op(p.pexp)
+				or (not EF.has_nameref and pexp_compilable(p.pexp))
 			)
 		then
 			return false
@@ -2226,7 +2242,8 @@ function seg_native(w, lifted)
 				indirect_ok(p.pexp) -- ${!ref}: rt.indirect_elems bootstraps interp's nameref-aware indirect resolution
 				or p.pexp.op == "prefix" -- ${!pre@}: name-matching, reads no potential-nameref value
 				or pexp_nameref_valop(p.pexp) -- ${#ref}/${ref:o:l}/${ref#p}…: value read is nameref-aware
-				or (not EF.has_nameref and (array_multi_op(p.pexp) or pexp_compilable(p.pexp)))
+				or array_multi_op(p.pexp) -- ${a[@]}/${a[*]}…: array read resolves the name via sh:deref
+				or (not EF.has_nameref and pexp_compilable(p.pexp))
 			)
 		then -- indirect/prefix resolve NAMES (nameref-safe); a whole-array ${a[@]} or a scalar ${..}-OP
 			-- reads the var DIRECTLY (would miss an element-nameref deref), so those stay non-nameref-only
