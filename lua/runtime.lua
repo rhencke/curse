@@ -2126,6 +2126,7 @@ local function co_finish(ctx, self, g)
 	end
 	self:array_assign("PIPESTATUS", pstat, false)
 	self.status = self.opt_pipefail and pipe or last
+	self.last_stage_status = last -- (the ERR quirk for a failing `( … )` last stage)
 end
 
 -- Run the pipeline under the scheduler. `inproc[i]` (compile time): run stage i
@@ -2423,6 +2424,7 @@ function Shell:run_pipeline(stage_fns, negate, inproc, upv_get, upv_set)
 		end
 		self:array_assign("PIPESTATUS", pstat, false)
 		self.status = self.opt_pipefail and pipe or last
+		self.last_stage_status = last
 	end
 	if negate then
 		self.status = (self.status == 0) and 1 or 0

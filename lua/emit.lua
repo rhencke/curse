@@ -342,6 +342,86 @@ local function scan_any_trap(stmts)
 	return false
 end
 
+-- Does the program trap a REAL signal (or use a trap spec it can't read statically)?
+-- Pseudo-signal traps (EXIT/ERR/DEBUG/RETURN) fire synchronously and are already scoped
+-- per subshell/stage/$(…) by the runtime (in_subprogram/in_pipestage/calldepth), so they
+-- don't stop those running in-process; a real signal can arrive asynchronously while an
+-- in-process body runs on a copied state, so any such trap keeps them on the fork path.
+local PSEUDO_SIG = { EXIT = 1, ["0"] = 1, ERR = 1, DEBUG = 1, RETURN = 1, SIGEXIT = 1 }
+local function trap_cmd_sigs_pseudo(st)
+	local words = {}
+	for j = 2, #st.words do
+		local w = st.words[j]
+		local lit = ""
+		for _, p in ipairs(w.parts or {}) do
+			if p.lit == nil then
+				return false -- a dynamic word: can't tell what it traps
+			end
+			lit = lit .. p.lit
+		end
+		words[#words + 1] = lit
+	end
+	local k = 1
+	while words[k] and words[k]:match("^%-") and words[k] ~= "-" do
+		if words[k] ~= "-p" and words[k] ~= "-l" and words[k] ~= "--" then
+			return false
+		end
+		k = k + 1
+	end
+	local rest = {}
+	for j = k, #words do
+		rest[#rest + 1] = words[j]
+	end
+	-- `trap ACTION SIG…` (first word is the action) or `trap SIG` (reset); check every
+	-- word that could be a signal spec
+	local from = #rest >= 2 and 2 or 1
+	for j = from, #rest do
+		if not PSEUDO_SIG[rest[j]:upper()] then
+			return false
+		end
+	end
+	return true
+end
+local function scan_sigtrap(node)
+	if type(node) ~= "table" then
+		return false
+	end
+	if node.t == "simple" and node.words and node.words[1] and node.words[1].parts[1]
+		and node.words[1].parts[1].lit == "trap" and not trap_cmd_sigs_pseudo(node)
+	then
+		return true
+	end
+	for _, v in pairs(node) do
+		if type(v) == "table" and scan_sigtrap(v) then
+			return true
+		end
+	end
+	return false
+end
+-- functrace (set -T / -o functrace) extends DEBUG into subshells, which compiled
+-- fragments don't hook — keep those programs on the delegated path.
+local function scan_functrace(node)
+	if type(node) ~= "table" then
+		return false
+	end
+	if node.t == "simple" and node.words and node.words[1] and node.words[1].parts[1]
+		and node.words[1].parts[1].lit == "set"
+	then
+		for j = 2, #node.words do
+			local l = node.words[j].parts[1] and node.words[j].parts[1].lit
+			if not l or l == "functrace" or (l:match("^[-+]%a*$") and l:find("T", 1, true)) then
+				return true
+			end
+		end
+	end
+	for _, v in pairs(node) do
+		if type(v) == "table" and scan_functrace(v) then
+			return true
+		end
+	end
+	return false
+end
+
 local function scan_trap(stmts, sigs)
 	for _, st in ipairs(stmts or {}) do
 		if st.t == "simple" and st.words[1] and st.words[1].parts[1] and st.words[1].parts[1].lit == "trap" then
@@ -1426,6 +1506,7 @@ local SUBSHELL_FORK_VARS = { BASHPID = 1, BASH_SUBSHELL = 1, RANDOM = 1, SRANDOM
 local SUBSHELL_FORK_BUILTINS = {
 	exec = 1, ulimit = 1, enable = 1, disable = 1, eval = 1, source = 1, ["."] = 1,
 	wait = 1,
+	trap = 1, -- trap tables (and a real signal's disposition) aren't checkpointed
 }
 local function word_forces_fork(w)
 	if not w or not w.parts then return false end
@@ -1554,7 +1635,7 @@ local function compile_cmdsub(src, backtick, lifted, aenv)
 	-- so a called function and the body share `v_x`; __iso_cmdsub swap-saves them.
 	local bt = backtick and "true" or "false"
 	local isolated = not cmdsub_nofork_ok(ast.stmts)
-		and not (EF.has_err or EF.has_debug or EF.has_trap)
+		and not EF.inproc_trap_block
 		and not EF.has_dyncode
 		and #ast.stmts > 0
 		and EF.subshell_inproc_ok(ast.stmts)
@@ -5016,7 +5097,7 @@ H.subshell = function(cx, st, after)
 	-- so subshell_exit_pc is cleared around its build. Anything else falls through to the
 	-- fork path below (still correct). break/continue can't cross into it — subshell_run's
 	-- fragment has its own loopstack, like the fork body.
-	if not (EF.has_err or EF.has_debug or EF.has_trap)
+	if not EF.inproc_trap_block
 		and not EF.has_dyncode
 		and #st.body > 0
 		and EF.subshell_inproc_ok(st.body)
@@ -5126,7 +5207,8 @@ H.pipeline = function(cx, st, after)
 	-- no trap/DEBUG/ERR (a forked stage otherwise resets signal traps / re-fires
 	-- per-stage traps — interp-side). Flush lifted before (stages read sh) and reload
 	-- after (a lastpipe last stage runs in-process and may write).
-	if EF.has_trap or EF.has_debug or EF.has_err then
+	-- DEBUG fires per pipeline element in bash (interp models it); compiled stages don't hook it
+	if EF.inproc_trap_block or EF.has_debug then
 		return cx.delegate(st, after)
 	end
 	local n = #st.cmds
@@ -5157,6 +5239,11 @@ H.pipeline = function(cx, st, after)
 	-- ignored when the return value is inverted with !), regardless of the negated status.
 	local ec = st.negate and "" or errchk(st)
 	local ecs = ec ~= "" and ("; " .. ec) or ""
+	-- bash quirk (execute_cmd.c): a failing `( … )` LAST stage runs ERR itself, on top of the
+	-- pipeline's own ERR — keyed on that subshell's status, not the pipeline's `!`.
+	if EF.has_err and n >= 2 and st.cmds[n].t == "subshell" then
+		ecs = "; if sh.noerr == 0 and (sh.last_stage_status or 0) ~= 0 then I.fire_err_trap(sh) end" .. ecs
+	end
 	-- Per stage: run IN-PROCESS under the coroutine scheduler, or fork (a stage that
 	-- needs a real child: exec, ulimit, set, eval, … — EF.sub_unsafe_fn).
 	local inproc = {}
@@ -5671,7 +5758,8 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
 		return false
 	end
 	function cx.redirected_compound(st, after)
-		if not cx.REDIR_COMPOUND[st.t] or EF.has_trap or EF.has_debug or EF.has_err then
+		-- DEBUG: the body fragment has no per-command DEBUG hooks (dbg is top-level only)
+		if not cx.REDIR_COMPOUND[st.t] or EF.inproc_trap_block or EF.has_debug then
 			return nil
 		end
 		local conds = cx.redir_conds(st, nil)
@@ -5694,6 +5782,9 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
 			return nil
 		end
 		local exitfail = EF.subshell_exit_pc and "rt.subshell_exit(1)" or "error({ __curse_exit = 1 })"
+		-- a failed redirect on a compound fires ERR (interp's compound-redirect path does)
+		-- ($LINENO is NOT updated for the redirect — bash reports the last command's line)
+		local errfire = EF.has_err and "if sh.noerr == 0 then I.fire_err_trap(sh) end; " or ""
 		return cx.delegate(st, after, {
 			callee = "cs_" .. id,
 			callargs = "sh",
@@ -5701,7 +5792,7 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
 			upv_keep = true,
 			redir_body = {
 				stdout = cx.stdout_redir(st.redirs),
-				fail = ("if sh.opt_e and sh.noerr == 0 then %s end"):format(exitfail),
+				fail = ("%sif sh.opt_e and sh.noerr == 0 then %s end"):format(errfire, exitfail),
 			},
 		})
 	end
@@ -6234,6 +6325,9 @@ function M.emit(ast, opts)
 	EF.funcstack = reads_debugstack(ast.stmts) -- gate FUNCNAME/BASH_SOURCE/BASH_LINENO stacks
 	EF.pipestatus = reads_var(ast.stmts, "PIPESTATUS") -- gate $PIPESTATUS after simple cmds
 	EF.has_trap = scan_any_trap(ast.stmts) -- gate compiled `&`/pipeline (forked child resets signal traps)
+	-- in-process subshell/$(…)/pipeline-stage gate: only a REAL-signal trap (or DEBUG under
+	-- functrace, which reaches into subshells) keeps them forked/delegated
+	EF.inproc_trap_block = scan_sigtrap(ast.stmts) or (EF.has_debug and scan_functrace(ast.stmts))
 	local funcflags, inlinable, inlinefns = {}, {}, {}
 	-- With a DEBUG/ERR trap, DON'T inline: an inlined body runs at the caller's level,
 	-- where its commands would fire DEBUG/ERR that bash scopes to the (un-entered)
