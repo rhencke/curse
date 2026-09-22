@@ -1191,14 +1191,39 @@ end
 -- the interp path passes exec_list, the compiled path a compiled fragment. Errors
 -- follow bash: a syntax error is fatal to the containing command (contained for
 -- backticks), and exit/return set the sub's status.
-function Shell:capture_inproc(backtick, runner)
-	local buf = {}
-	local saved = self.out
-	self.out = function(x)
-		buf[#buf + 1] = x
+-- `capfd`: capture at the FD level — point fd 1 at a temp file so a builtin's stdout
+-- (via sh.out=io.write), an external's stdout (inherited fd 1), AND a redirect like
+-- `2>&1` (kernel dup of fd 2 onto fd 1) all land in the SAME sink, in order — exactly
+-- like a forked child, but without the fork. The default (buffer) is faster and is used
+-- for pure bodies (no stderr/2>&1 to worry about); the fd path is for isolated mutating
+-- $() where a builtin may redirect its diagnostics into the capture. A temp file (not a
+-- pipe) means no self-deadlock when the body out-writes the pipe buffer in one process.
+function Shell:capture_inproc(backtick, runner, capfd)
+	local buf, tmp, save1
+	if capfd then
+		io.flush()
+		tmp = os.tmpname()
+		local tfd = C.open(tmp, 577, 384) -- O_WRONLY|O_CREAT|O_TRUNC, 0600
+		if tfd < 0 then
+			capfd = false
+		else
+			save1 = C.dup(1)
+			C.dup2(tfd, 1)
+			C.close(tfd)
+		end
 	end
+	local saved = self.out
 	local saved_cap = self.capturing
-	self.capturing = true -- last pipeline stage drains into buf
+	if capfd then
+		self.out = io.write -- builtins write to fd 1 (= temp file); externals inherit it
+		self.capturing = nil -- fd 1 IS the sink, so don't also drain into a Lua buffer
+	else
+		buf = {}
+		self.out = function(x)
+			buf[#buf + 1] = x
+		end
+		self.capturing = true -- last pipeline stage drains into buf
+	end
 	self.in_subprogram = (self.in_subprogram or 0) + 1 -- $(...) is a subprogram: ERR trap suppressed
 	local saved_ld = self.loopdepth
 	self.loopdepth = 0 -- break/continue don't cross into $(...)
@@ -1225,22 +1250,42 @@ function Shell:capture_inproc(backtick, runner)
 	self.in_subprogram = self.in_subprogram - 1
 	self.capturing = saved_cap
 	self.out = saved
+	if capfd then
+		io.flush()
+		C.dup2(save1, 1)
+		C.close(save1) -- put the real fd 1 back before reading the temp file
+	end
+	local function readcap() -- the captured bytes, from the buffer or the temp file
+		if not capfd then
+			return table.concat(buf)
+		end
+		local f = io.open(tmp, "r")
+		local c = f and f:read("*a") or ""
+		if f then
+			f:close()
+		end
+		os.remove(tmp)
+		return c
+	end
 	if not ok then
 		if type(err) == "table" and err.__curse_parseerr then
 			if backtick then
 				self.status = 1
+				readcap()
 				return ""
 			end -- backtick: contained (non-fatal)
+			readcap() -- drop the temp file, then propagate
 			error(err) -- a SYNTAX error inside $(…) is fatal to the whole containing command (bash)
 		elseif type(err) == "table" and (err.__curse_exit or err.__curse_return) then
 			self.status = err.__curse_exit or err.__curse_return
 		else
+			readcap()
 			error(err)
 		end
 	end
 	self.last_cmdsub_status = self.status -- for a command whose argv is empty after expansion
 	-- bash strips NUL bytes from command-substitution output ("ignored null byte")
-	return (table.concat(buf):gsub("%z", ""):gsub("\n+$", ""))
+	return (readcap():gsub("%z", ""):gsub("\n+$", ""))
 end
 
 -- Deep-copy a variable box (every attribute flag + fresh array/order tables) so an
@@ -1271,17 +1316,14 @@ local function shallowcopy(t)
 	return c
 end
 
--- Run a subshell body `runner(sh)` IN-PROCESS (no fork) — the compiled tier's
--- fork-free `( … )`. A forked subshell gets isolation for free from copy-on-write;
--- here we reproduce it by CHECKPOINTING every piece of shell state the body may
--- change and must not leak, then restoring it on EVERY exit path. The emit gate only
--- routes a body here when this is exact: no trap/ERR/DEBUG, no eval/source, no `set`,
--- no `exec`, no background `&`, no user-function call, no `$BASHPID`/`$BASH_SUBSHELL`/
--- `$RANDOM` (all of those still fork). `saves` (optional) holds the subshell's own
--- applied redirects, restored here too. Var boxes are DEEP-copied (parent boxes
--- untouched, so any local/tempenv box reference stays valid); the process environ is
--- re-synced for exported names, and cwd/umask are put back with real syscalls.
-function Shell:subshell_run(runner, saves)
+-- CHECKPOINT the process/shell state a forked subprogram (`( … )` or `$(…)`) isolates
+-- for free but an in-process run would leak: variables (DEEP-copied boxes — the copy is
+-- the WORKING table, the ORIGINAL boxes stay pristine so any local/tempenv box reference
+-- stays valid), positional params, shopt, functions, dirstack, hashcache, getopts state,
+-- cwd + umask (via real syscalls). Returns a token for sub_restore. NOT here (each caller
+-- differs): out, opt_e, in_subprogram, loopdepth, noerr, aliases, cur_line, and the
+-- process environ — which sub_restore re-syncs for exported names.
+local function sub_checkpoint(self)
 	local orig_vars = self.vars
 	local copy = {}
 	for k, b in pairs(orig_vars) do copy[k] = copybox(b) end
@@ -1292,20 +1334,48 @@ function Shell:subshell_run(runner, saves)
 	end
 	local pcopy = {}
 	for i = 1, self.nparams do pcopy[i] = self.params[i] end
-	local cwd = self:phys_cwd()
-	local um = C.umask(0)
-	C.umask(um)
-	local sv_params, sv_np = self.params, self.nparams
-	local sv_out, sv_line = self.out, self.cur_line
-	local sv_ld, sv_ne = self.loopdepth, self.noerr
-	local sv_shopt, sv_alias, sv_fns = self.shopt, self.aliases, self.functions
-	local sv_dirstack, sv_hash, sv_getopts = self.dirstack, self.hashcache, self.getopts_cur
+	local cp = {
+		orig_vars = orig_vars, copy = copy, exset = exset,
+		params = self.params, nparams = self.nparams,
+		shopt = self.shopt, functions = self.functions,
+		dirstack = self.dirstack, hashcache = self.hashcache, getopts = self.getopts_cur,
+		cwd = self:phys_cwd(), um = C.umask(0),
+	}
+	C.umask(cp.um)
 	self.params = pcopy
 	self.shopt = shallowcopy(self.shopt) or {}
-	self.aliases = shallowcopy(self.aliases) or {}
 	self.functions = shallowcopy(self.functions) or {}
 	self.dirstack = shallowcopy(self.dirstack)
 	self.hashcache = shallowcopy(self.hashcache)
+	return cp
+end
+local function sub_restore(self, cp)
+	self.vars = cp.orig_vars
+	self.params, self.nparams = cp.params, cp.nparams
+	self.shopt, self.functions = cp.shopt, cp.functions
+	self.dirstack, self.hashcache, self.getopts_cur = cp.dirstack, cp.hashcache, cp.getopts
+	if cp.cwd ~= "" then C.chdir(cp.cwd) end
+	C.umask(cp.um)
+	-- Re-sync the process environ: drop names the body newly exported, then restore
+	-- every name exported at entry to its parent value (covers changed + unset-in-sub).
+	for name, b in pairs(cp.copy) do
+		if b.exported and not cp.exset[name] then C.unsetenv(name) end
+	end
+	for name in pairs(cp.exset) do
+		C.setenv(name, self:get(name) or "", 1)
+	end
+end
+
+-- Run a subshell body `runner(sh)` IN-PROCESS (no fork) — the compiled tier's fork-free
+-- `( … )`. sub_checkpoint/restore reproduce a fork's isolation; a subshell keeps errexit
+-- (unlike $()), writes to the live stdout, and its own applied redirects (`saves`) are
+-- restored here too. exit/return/div0 in the body become the subshell's status. The emit
+-- gate keeps genuinely-forking bodies (trap/exec/&/set/ulimit/$BASHPID/…) on the fork path.
+function Shell:subshell_run(runner, saves)
+	local cp = sub_checkpoint(self)
+	local sv_out, sv_line = self.out, self.cur_line
+	local sv_ld, sv_ne, sv_alias = self.loopdepth, self.noerr, self.aliases
+	self.aliases = shallowcopy(self.aliases) or {}
 	self.in_subprogram = (self.in_subprogram or 0) + 1
 	self.loopdepth = 0
 
@@ -1323,26 +1393,27 @@ function Shell:subshell_run(runner, saves)
 	end
 
 	if saves then M.redir_restore(saves) end
-	self.vars = orig_vars
-	self.params, self.nparams = sv_params, sv_np
 	self.out, self.cur_line = sv_out, sv_line
-	self.loopdepth, self.noerr = sv_ld, sv_ne
-	self.shopt, self.aliases, self.functions = sv_shopt, sv_alias, sv_fns
-	self.dirstack, self.hashcache, self.getopts_cur = sv_dirstack, sv_hash, sv_getopts
+	self.loopdepth, self.noerr, self.aliases = sv_ld, sv_ne, sv_alias
 	self.in_subprogram = self.in_subprogram - 1
-	if cwd ~= "" then C.chdir(cwd) end
-	C.umask(um)
-	-- Re-sync the process environ: drop names the body newly exported, then restore
-	-- every name exported at entry to its parent value (covers changed + unset-in-sub).
-	for name, b in pairs(copy) do
-		if b.exported and not exset[name] then C.unsetenv(name) end
-	end
-	for name in pairs(exset) do
-		C.setenv(name, self:get(name) or "", 1)
-	end
-
+	sub_restore(self, cp)
 	if rethrow then error(rethrow) end
 	self.status = status
+end
+
+-- Compiled `$(…)` whose body MUTATES shell state but needs no real child: run it
+-- in-process with FULL isolation (sub_checkpoint/restore) instead of forking the fat
+-- worker. capture_inproc supplies the $()-specific light state (stdout→buffer, errexit
+-- OFF unless inherit_errexit, aliases, in_subprogram, cur_line, trailing-newline/NUL
+-- strip, exit/return→status); the heavy checkpoint wraps it. The emit gate keeps a body
+-- that forks a real child (exec/&/$BASHPID/set/ulimit/…) or would desync a lifted upvalue
+-- (a lifted-touching function — no swap is possible in this expression context) on the
+-- fork path. Returns the captured string.
+function Shell:capture_compiled_iso(cs_fn, backtick)
+	local cp = sub_checkpoint(self)
+	local out = self:capture_inproc(backtick, cs_fn, true) -- fd-level capture: `2>&1` on a builtin works
+	sub_restore(self, cp)
+	return out
 end
 
 -- Compiled-tier command substitution: run a compiled cmdsub fragment `cs_fn(sh)`
