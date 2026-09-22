@@ -2158,22 +2158,17 @@ function mixed_expandable(w, lifted)
 		if p.arith or p.arithast or p.cmdsub or p.procsub then
 			return false
 		end
-		-- In a nameref program a ${…}-OP read may deref an element-nameref (which the
-		-- native pexp renderers do not handle): delegate any pexp. A plain var part is
-		-- fine — it renders via rt.nameref_read (emit_scalar_val).
-		if EF.has_nameref and p.pexp then
-			return false
-		end
 		-- a bare ${a[@]}/${a[*]} array expansion is a multi-element segment seg_native renders;
 		-- a scalar ${..} op (len/subst/strip/default/substring/@Q) renders via pexp_scalar; the
-		-- ${!ref} indirect via the bootstrap. Anything else (a non-compilable ${…}) still delegates.
+		-- ${!ref} indirect / ${!pre@} prefix via the bootstrap. indirect+prefix resolve NAMES so
+		-- they are nameref-safe; a whole-array ${a[@]} or a scalar ${..}-OP reads the var DIRECTLY
+		-- (would miss an element-nameref deref) so those stay non-nameref-only; anything else delegates.
 		if
 			p.pexp
 			and not (
-				array_multi_op(p.pexp)
-				or indirect_ok(p.pexp)
-				or pexp_compilable(p.pexp)
+				indirect_ok(p.pexp)
 				or p.pexp.op == "prefix"
+				or (not EF.has_nameref and (array_multi_op(p.pexp) or pexp_compilable(p.pexp)))
 			)
 		then
 			return false
@@ -2205,15 +2200,14 @@ function seg_native(w, lifted)
 		elseif p.special == "#" or p.special == "?" or p.special == "$" or p.special == "!" or p.special == "-" then -- scalar specials
 		elseif p.special == "@" or p.special == "*" then -- $@/$*: multi-element (emit_seg renders it)
 		elseif
-			not EF.has_nameref
-			and p.pexp
+			p.pexp
 			and (
-				array_multi_op(p.pexp)
-				or indirect_ok(p.pexp)
-				or pexp_compilable(p.pexp)
-				or p.pexp.op == "prefix"
+				indirect_ok(p.pexp) -- ${!ref}: rt.indirect_elems bootstraps interp's nameref-aware indirect resolution
+				or p.pexp.op == "prefix" -- ${!pre@}: name-matching, reads no potential-nameref value
+				or (not EF.has_nameref and (array_multi_op(p.pexp) or pexp_compilable(p.pexp)))
 			)
-		then -- ${a[@]}, ${!ref}, scalar ${..} op, or ${!pre@} name-prefix (a ${…}-OP may deref an element-nameref: delegate in nameref programs)
+		then -- indirect/prefix resolve NAMES (nameref-safe); a whole-array ${a[@]} or a scalar ${..}-OP
+			-- reads the var DIRECTLY (would miss an element-nameref deref), so those stay non-nameref-only
 		else
 			return false
 		end -- other pexp, cmdsub, arith, procsub, or anything unknown
