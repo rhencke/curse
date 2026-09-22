@@ -767,9 +767,10 @@ local function fnwrap(cmd, line, s)
 	end
 	return pre .. s .. post
 end
--- Special params emit_word knows how to render; any OTHER `$special` (e.g. `$-`,
--- the option string) must delegate, or emit_word would silently render it empty.
-local RENDERABLE_SPECIAL = { ["#"] = 1, ["@"] = 1, ["*"] = 1, ["?"] = 1, ["$"] = 1, ["!"] = 1 }
+-- Special params emit_word knows how to render (`$-` is the option string, via
+-- sh:dash_flags); any OTHER `$special` must delegate, or emit_word would render it
+-- empty. A ${#…} LENGTH of one of these still delegates (see emitable_word).
+local RENDERABLE_SPECIAL = { ["#"] = 1, ["@"] = 1, ["*"] = 1, ["?"] = 1, ["$"] = 1, ["!"] = 1, ["-"] = 1 }
 -- A word emit_word can render (no ${..op..} pexp, no side-effecting arith, no
 -- unhandled special param).
 -- An empty brace alternative (`{X,,Y,}`) parses to a ZERO-PART word. bash removes it
@@ -798,7 +799,10 @@ local function emitable_word(w)
 		end -- <(cmd)/>(cmd): needs the interp's temp-file setup
 		if p.special and not RENDERABLE_SPECIAL[p.special] then
 			return false
-		end -- e.g. $-
+		end
+		if p.special and p.lenof then
+			return false
+		end -- ${#-}/${#?}: LENGTH of a special's value — the scalar renderers emit the value, so delegate
 		-- pure value arith renders via emit_value; a side-effecting one (x++/x=…/x+=…) via
 		-- emit_arith_into in an IIFE, provided the side effect is top-level (arith_word_ok).
 		if p.arith then
@@ -1393,6 +1397,8 @@ emit_word = function(w, lifted)
 				parts[#parts + 1] = "tostring(sh:pid())"
 			elseif p.special == "!" then
 				parts[#parts + 1] = '(sh.last_bg_pid or "")'
+			elseif p.special == "-" then
+				parts[#parts + 1] = "sh:dash_flags()" -- $-: the current single-char option flags
 			end
 		elseif p.arithast then -- a pre-parsed+substituted arith AST (inlined word)
 			local saved = arith_varread
@@ -1983,6 +1989,8 @@ local function emit_scalar_val(p, i, lifted, tilde)
 		return "tostring(sh:pid())"
 	elseif p.special == "!" then
 		return '(sh.last_bg_pid or "")'
+	elseif p.special == "-" then
+		return "sh:dash_flags()" -- $-: current single-char option flags
 	end
 	error("curse-nocompile: mixed-word segment") -- unreachable given seg_native
 end
@@ -2194,7 +2202,7 @@ function seg_native(w, lifted)
 				return false
 			end -- a nameref-program var reads via rt.nameref_read (emit_scalar_val)
 		elseif p.param then -- $1..$9 positional: ok
-		elseif p.special == "#" or p.special == "?" or p.special == "$" or p.special == "!" then -- scalar specials
+		elseif p.special == "#" or p.special == "?" or p.special == "$" or p.special == "!" or p.special == "-" then -- scalar specials
 		elseif p.special == "@" or p.special == "*" then -- $@/$*: multi-element (emit_seg renders it)
 		elseif
 			not EF.has_nameref
