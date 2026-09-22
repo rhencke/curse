@@ -3314,6 +3314,17 @@ function Shell:is_nameref(name)
 	return b and b.ref
 end
 -- ${var@a}: the variable's attribute flags, in bash's order (aA r x i l u n).
+-- ${x@a} in compiled code: under set -u a variable with NO VALUE is unbound (bash — even
+-- a declared-but-valueless one).
+function Shell:attr_string_u(name)
+	local b = self.vars[self:deref(name)]
+	local has = b and (b.s ~= nil or b.n ~= nil or (b.arr and next(b.arr) ~= nil))
+	if self.opt_u and not has and self:special_get(name) == "" then
+		io.stderr:write("curse: " .. name .. ": unbound variable\n")
+		error({ __curse_exit = self.opt_c and 127 or 1, __curse_lineabort = self.opt_i or nil })
+	end
+	return self:attr_string(name)
+end
 function Shell:attr_string(name)
 	local b = self.vars[self:deref(name)]
 	if not b then
@@ -5824,6 +5835,12 @@ function Shell:expand_param(pe, arg, arg2, idxnum)
 	end
 	arg = arg or ""
 	if op == "@" then -- ${x@OP} transforms
+		-- under set -u a variable with no value is unbound for every transform, @a included
+		-- (even a declared-but-valueless one: `declare -A m; ${m@a}` fails — bash)
+		if self.opt_u and not isset then
+			io.stderr:write("curse: " .. name .. ": unbound variable\n")
+			error({ __curse_exit = self.opt_c and 127 or 1, __curse_lineabort = self.opt_i or nil })
+		end
 		-- @a reports the VARIABLE's attributes (e.g. `A` for a declared assoc array),
 		-- so it's non-empty even when the scalar view (a[0]) is unset; the other
 		-- transforms yield empty on an unset var.

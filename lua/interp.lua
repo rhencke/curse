@@ -4246,7 +4246,9 @@ exec_stmt = function(sh, st, hook)
 				end
 				exec_simple(sh, rest, hook)
 				io.flush()
-				os.exit(sh.status or 0)
+				-- the command REPLACES the shell: end with its status, no EXIT trap (bash). Not
+				-- os.exit — in the daemon that would kill the worker before it replies.
+				error({ __curse_exit = sh.status or 0, __curse_noexittrap = true })
 			else
 				sh.status = ok and 0 or 1
 			end
@@ -5190,6 +5192,15 @@ end
 M.exec_list = exec_list
 
 -- Run a trap handler string; returns true if it called exit (which wins).
+local function shallow_noexit(t)
+	local c = {}
+	for k, v in pairs(t) do
+		if k ~= "EXIT" then
+			c[k] = v
+		end
+	end
+	return c
+end
 local function finish(sh, ok, err)
 	if sh.subshell_child then -- a compiled subshell's forked child: end it here (rt.subshell_fork)
 		child_status(sh, ok, err)
@@ -5197,6 +5208,9 @@ local function finish(sh, ok, err)
 		C._exit(sh.status or 0)
 	end
 	if not ok then
+		if type(err) == "table" and err.__curse_noexittrap then
+			sh.traps = sh.traps and shallow_noexit(sh.traps) -- `exec cmd`: the process is gone
+		end
 		if type(err) == "table" and err.__curse_exit then
 			sh.exit_requested = true -- (the REPL stops reading)
 			sh.status = err.__curse_exit

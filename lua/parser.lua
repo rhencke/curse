@@ -1864,6 +1864,15 @@ local function make_parser(src, sh, aenv)
 			-- value recursion below still accumulates into the fresh guard.
 			alias_seen = {}
 		end
+		-- a `\<newline>` continuation (plus blanks) before the word is just whitespace: skip
+		-- it so a trailing-blank alias chain continues onto the next line
+		while src:sub(i, i + 1) == "\\\n" do
+			i = i + 2
+			line = line + 1
+			while src:sub(i, i):match("[ \t]") do
+				i = i + 1
+			end
+		end
 		local expanded = false
 		while true do
 			local rs, re = src:find("^[^ \t\n|&;()<>'\"`\\$]+", i)
@@ -2473,6 +2482,8 @@ local function make_parser(src, sh, aenv)
 			-- for NAME in WORDS. Capture NAME as a whole token (not just a valid
 			-- identifier): bash accepts `for i.j`/`for -` at PARSE time and reports the
 			-- invalid name as a non-fatal RUNTIME error (status 1), so the interp checks.
+			-- (each header word can come from a trailing-blank alias chain: `FOR eye IN …`)
+			try_alias(false)
 			local s, e = src:find("^[^%s;#()]+", i)
 			if not s then
 				error("subset: for needs a name or ((")
@@ -2496,10 +2507,12 @@ local function make_parser(src, sh, aenv)
 				end
 			end
 			local words = {}
+			try_alias(false)
 			if peekword() == "in" then
 				i = i + 2
 				while true do
 					ws()
+					try_alias(false)
 					local c = src:sub(i, i)
 					if c == ";" or c == "\n" or c == "" or c == "#" then
 						break

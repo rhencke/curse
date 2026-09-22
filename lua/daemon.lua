@@ -246,6 +246,7 @@ local function dispatch(sh, args)
 	end
 	if args[i] and not from_stdin then
 		local path = args[i]
+		sh.argv0 = path -- $0 is the script path (bash)
 		for j = i + 1, n do
 			sh.params[#sh.params + 1] = args[j]
 			sh.nparams = sh.nparams + 1

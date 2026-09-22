@@ -1554,6 +1554,9 @@ local function cmdsub_nofork_ok(stmts)
 	for _, st in ipairs(stmts) do
 		if st.t ~= "simple" then return false end
 		if st.assigns then return false end -- prefix env / assignment prefix mutates
+		-- a redirect (`echo x 1>&2`) must reach the real fds: only the isolated fd-level capture
+		-- path sends a builtin's redirected output where it belongs
+		if st.redirs then return false end
 		local w1 = st.words and st.words[1]
 		local c = w1 and w1.parts[1] and #w1.parts == 1 and w1.parts[1].lit
 		if not c then return false end -- no/dynamic command word (or assignment-only line)
@@ -2241,7 +2244,7 @@ function pexp_scalar(pe, lifted)
 	-- `A` — and never get_u, which would trip set -u on an unset element. The element and
 	-- scalar forms alike report the whole variable's attributes (bash).
 	if pe.op == "@" and pe.arg == "a" then
-		return ("sh:attr_string(%q)"):format(pe.name)
+		return ("sh:attr_string_u(%q)"):format(pe.name)
 	end
 	local val
 	local ename = EF.has_nameref and ("sh:deref(%q)"):format(pe.name) or ("%q"):format(pe.name) -- a nameref array read resolves to its target
