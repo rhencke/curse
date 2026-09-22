@@ -49,6 +49,10 @@ ffi.cdef([[
   int fork(void);
   int dup2(int a, int b);
   long syscall(long number, ...);
+  typedef struct _IO_FILE curse_d_FILE;
+  extern curse_d_FILE *stdin;
+  void curse_d_fpurge(curse_d_FILE *fp) asm("__fpurge");
+  void clearerr(curse_d_FILE *fp);
   struct curse_d_rlimit { unsigned long cur, max; };
   int curse_d_getrlimit(int res, struct curse_d_rlimit *r) asm("getrlimit");
   int curse_d_setrlimit(int res, const struct curse_d_rlimit *r) asm("setrlimit");
@@ -174,26 +178,90 @@ end
 
 -- Decide what to run from an argv shaped like sh's: `-c CODE [name args…]`, or a
 -- script path. Sets positional params. Returns (kind, payload).
+-- The invocation's options, as run.lua takes them: `-c CODE [name [args…]]`, set flags
+-- (`-e`/`+e`, `-o NAME`/`+o NAME`, `-O shopt`), `-i` (interactive), `-s`/no script (read the
+-- program from stdin), `--posix`, rc-file flags (ignored), `--`, then SCRIPT [args…].
+-- Returns kind ("code" | "file" | "stdin" | "repl"), payload.
+local LONG_IGNORED = { ["--norc"] = 1, ["--noprofile"] = 1, ["--login"] = 1, ["-l"] = 1, ["--noediting"] = 1 }
 local function dispatch(sh, args)
 	-- args[1] is the program name (argv[0]); real args start at 2.
-	local i = 2
-	if args[i] == "-c" then
-		local code = args[i + 1] or ""
+	local i, n = 2, #args
+	local code, from_stdin = nil, false
+	while i <= n do
+		local a = args[i]
+		if a == "--" then
+			i = i + 1
+			break
+		elseif a == "-c" then
+			code = args[i + 1] or ""
+			i = i + 2
+			break
+		elseif LONG_IGNORED[a] then
+			i = i + 1
+		elseif a == "--posix" then
+			sh.opt_posix = true
+			i = i + 1
+		elseif a == "--rcfile" or a == "--init-file" then
+			i = i + 2
+		elseif (a == "-o" or a == "+o") and args[i + 1] then
+			local f = rt.SETOPT[args[i + 1]]
+			if f then
+				sh[f] = (a == "-o")
+			end
+			i = i + 2
+		elseif (a == "-O" or a == "+O") and args[i + 1] then
+			sh.shopt[args[i + 1]] = (a == "-O")
+			i = i + 2
+		elseif a:match("^[-+]%a+$") then -- clustered single-letter flags (-ex, +u, -i, -s)
+			local on = a:sub(1, 1) == "-"
+			for ch in a:sub(2):gmatch(".") do
+				if ch == "i" then
+					sh.opt_i = on
+				elseif ch == "s" then
+					from_stdin = true
+				elseif ch == "c" then
+					code = args[i + 1] or ""
+				elseif rt.SETFLAG[ch] then
+					sh[rt.SETFLAG[ch]] = on
+				end
+			end
+			i = i + (a:find("c", 2, true) and 2 or 1)
+			if code then
+				break
+			end
+		else
+			break
+		end
+	end
+	if code then
 		-- sh -c CODE [name [args…]]: name is $0, rest are $1..
-		for j = i + 3, #args do
+		if args[i] then
+			sh.argv0 = args[i]
+		end
+		for j = i + 1, n do
 			sh.params[#sh.params + 1] = args[j]
 			sh.nparams = sh.nparams + 1
 		end
 		return "code", code
-	elseif args[i] then
+	end
+	if args[i] and not from_stdin then
 		local path = args[i]
-		for j = i + 1, #args do
+		for j = i + 1, n do
 			sh.params[#sh.params + 1] = args[j]
 			sh.nparams = sh.nparams + 1
 		end
 		return "file", path
 	end
-	return "code", "" -- no args: nothing to do
+	-- no script: the program comes from stdin (positional args with -s)
+	for j = i, n do
+		sh.params[#sh.params + 1] = args[j]
+		sh.nparams = sh.nparams + 1
+	end
+	if sh.opt_i or C.isatty(0) == 1 then
+		sh.opt_i = true
+		return "repl", nil
+	end
+	return "stdin", nil
 end
 
 -- Serve ONE request on the caller's fds, reply with the status, and RETURN so the
@@ -213,6 +281,9 @@ local function serve_request(cfd, req, fds, ctx)
 	if fds[3] then
 		C.dup2(fds[3], 2)
 	end
+	-- stdio's `stdin` buffer / EOF flag belong to the PREVIOUS caller's fd 0: drop them
+	C.curse_d_fpurge(C.stdin)
+	C.clearerr(C.stdin)
 	for _, f in ipairs(fds) do
 		if f > 2 then
 			C.close(f)
@@ -230,7 +301,14 @@ local function serve_request(cfd, req, fds, ctx)
 	-- (status 1) instead of failing silently.
 	local ok = xpcall(function()
 		local kind, payload = dispatch(sh, req.args)
-		if kind == "code" then
+		if kind == "repl" then
+			if sh.vars.PS1 == nil then
+				sh:set_str("PS1", "\\s-\\v\\$ ")
+			end
+			require("repl").run(sh)
+		elseif kind == "stdin" then
+			require("repl").run(sh) -- non-interactive: line at a time from fd 0 (bash)
+		elseif kind == "code" then
 			Tier.run_tiered(payload, sh)
 		else
 			local f = io.open(payload, "r")

@@ -1002,7 +1002,8 @@ array_key = function(sh, name, index_raw)
 	end)
 	if not ok then
 		io.stderr:write("curse: " .. index_raw .. ": syntax error in expression\n")
-		error({ __curse_exit = 1, __curse_experr = true })
+		-- an expansion error discards the rest of the top-level line (bash jump_to_top_level)
+		error({ __curse_exit = 1, __curse_lineabort = true })
 	end
 	return v
 end
@@ -1106,17 +1107,10 @@ local function expand_part_str(sh, p, assign)
 		local pe = p.pexp
 		if pe.op == "badsubst" then -- ${x|html} and other unrecognized ${…} forms
 			sherr(sh, "curse: ${" .. (pe.raw or pe.name or "") .. "}: bad substitution\n")
-			error({ __curse_exit = 1, __curse_experr = true }) -- fails the command, non-fatal
+			error({ __curse_exit = 1, __curse_lineabort = true }) -- discards the rest of the line (bash)
 		end
 		if pe.op == "@" and pe.arg == "P" then -- ${x@P}: decode prompt escapes, then expand
-			local decoded = sh:prompt_escapes(sh:get_u(pe.name)) -- get_u: honor set -u
-			-- The decode output is already final; only re-expand it for $var/$(…)/`…`
-			-- (promptvars). Re-parsing as a word otherwise eats decoded backslashes
-			-- (e.g. `\x55` -> `\x55`, a lone `\` stays `\`), which bash keeps.
-			if not decoded:find("[$`]") then
-				return decoded
-			end
-			return expand_word(sh, P.parse_word(decoded))
+			return M.prompt_string(sh, sh:get_u(pe.name)) -- get_u: honor set -u
 		end
 		if pe.op == "indirect" then -- ${!ref} / ${!ref OP}: resolve the name, then expand it
 			local ip = indirect_part(sh, pe)
@@ -1371,7 +1365,7 @@ indirect_part = function(sh, pe)
 		if sh.opt_u then
 			error({ __curse_exit = sh.opt_c and 127 or 1, __curse_lineabort = sh.opt_i or nil })
 		end
-		error({ __curse_exit = 1, __curse_experr = true })
+		error({ __curse_exit = 1, __curse_lineabort = true })
 	end
 	-- ${!ref} to a special parameter: $?, $$, $!, $#, $-, $N, $@, $*
 	if not pe.iop then
@@ -1387,7 +1381,7 @@ indirect_part = function(sh, pe)
 	local base = tname:match("^[%a_][%w_]*")
 	if not base or (#tname > #base and tname:sub(#base + 1, #base + 1) ~= "[") then
 		io.stderr:write("curse: " .. tname .. ": invalid variable name\n")
-		error({ __curse_exit = 1, __curse_experr = true })
+		error({ __curse_exit = 1, __curse_lineabort = true })
 	end
 	local ok, part = pcall(P.parse_paramexp, tname .. (pe.iop or ""))
 	-- Mark the reconstructed part as coming through indirection: bash's `:-`/`:+`
@@ -1474,9 +1468,9 @@ local function multi_elems(sh, p) -- returns element list, star?
 			end
 			return { expand_word(sh, w) }
 		end
-		if pe.op == "badsubst" then -- e.g. ${a[@]:} (empty offset): fails the command, non-fatal
+		if pe.op == "badsubst" then -- e.g. ${a[@]:} (empty offset): discards the rest of the line
 			sherr(sh, "curse: ${" .. (pe.raw or pe.name or "") .. "}: bad substitution\n")
-			error({ __curse_exit = 1, __curse_experr = true })
+			error({ __curse_exit = 1, __curse_lineabort = true })
 		end
 		if pe.op == "indirect" then -- ${!ref} where ref names an array / $@ / subscript
 			local ip = indirect_part(sh, pe)
@@ -2366,6 +2360,8 @@ local BUILTINS = {
 	unalias = 1,
 	shopt = 1,
 	wait = 1,
+	fg = 1,
+	bg = 1,
 	trap = 1,
 	mapfile = 1,
 	readarray = 1,
@@ -2642,7 +2638,11 @@ M.do_arrayassign = do_arrayassign
 -- so the compiled tier runs it as a runtime primitive instead of delegating to exec_stmt.
 function M.run_arrayassign(sh, st)
 	local rb = sh.vars[sh:deref(st.name)]
-	if st.index then
+	local nb = sh.vars[st.name]
+	if nb and nb.ref and nb.s and nb.s:find("[", 1, true) then -- nameref to an element/`a[@]`
+		io.stderr:write("curse: `" .. nb.s .. "': not a valid identifier\n")
+		sh.status = 1
+	elseif st.index then
 		io.stderr:write("curse: " .. st.name .. "[" .. st.index .. "]: cannot assign list to array member\n")
 		sh.status = 1
 	elseif rb and rb.ro then
@@ -3297,7 +3297,7 @@ local function xtrace_quote(w)
 	end
 	return rt.shell_quote(w)
 end
-local function xtrace(sh, args)
+local function xtrace(sh, args, prequoted)
 	local ps4 = sh:get("PS4")
 	if ps4 == "" then
 		ps4 = "+ "
@@ -3310,7 +3310,7 @@ local function xtrace(sh, args)
 	end -- repeat PS4[0] by depth
 	local parts = {}
 	for i = 1, #args do
-		parts[i] = xtrace_quote(args[i])
+		parts[i] = prequoted and args[i] or xtrace_quote(args[i])
 	end
 	io.stderr:write(pre .. table.concat(parts, " ") .. "\n")
 end
@@ -3994,6 +3994,16 @@ exec_stmt = function(sh, st, hook)
 				end -- a real error (exit, nounset, matherr) propagates
 			end
 		end
+		-- set -x: trace the assignment with its expanded value (`+ x=5`, `+ a[1]=v`)
+		if sh.opt_x and not st.append then
+			local v
+			if st.index then
+				v = sh:get(st.name .. "[" .. st.index .. "]") or ""
+			else
+				v = sh:get(st.name) or ""
+			end
+			xtrace(sh, { (st.index and (st.name .. "[" .. st.index .. "]") or st.name) .. "=" .. (v == "" and "" or xtrace_quote(v)) }, true)
+		end
 		-- set -a (allexport): a plain scalar assignment auto-exports the variable
 		if sh.opt_a and not st.index then
 			local b = sh.vars[sh:deref(st.name)]
@@ -4053,7 +4063,12 @@ exec_stmt = function(sh, st, hook)
 		sh:set_str("_", "") -- a bare assignment resets $_ to empty (bash)
 	elseif t == "arrayassign" then
 		local rb = sh.vars[sh:deref(st.name)]
-		if st.index then -- `a[0]=(1 2)`: can't assign a list to an array MEMBER (bash)
+		local nb = sh.vars[st.name]
+		if nb and nb.ref and nb.s and nb.s:find("[", 1, true) then
+			-- a nameref to an element/`a[@]`: an array literal can't be written through it
+			io.stderr:write("curse: `" .. nb.s .. "': not a valid identifier\n")
+			sh.status = 1
+		elseif st.index then -- `a[0]=(1 2)`: can't assign a list to an array MEMBER (bash)
 			io.stderr:write("curse: " .. st.name .. "[" .. st.index .. "]: cannot assign list to array member\n")
 			sh.status = 1
 		elseif rb and rb.ro then -- readonly array: reject the (re)assignment
@@ -4607,7 +4622,7 @@ exec_stmt = function(sh, st, hook)
 		while c1 and (c1.t == "pipeline") and c1.cmds do
 			c1 = c1.cmds[1]
 		end
-		local cmdstr = (c1 and c1.words and c1.words[1] and c1.words[1].parts[1] and c1.words[1].parts[1].lit) or "job"
+		local cmdstr = st.text or (c1 and c1.words and c1.words[1] and c1.words[1].parts[1] and c1.words[1].parts[1].lit) or "job"
 		job_add(sh, pid, cmdstr)
 		sh.bg_pids = sh.bg_pids or {}
 		sh.bg_pids[#sh.bg_pids + 1] = pid
@@ -5116,6 +5131,16 @@ fire_err = function(sh)
 	end
 end
 M.fire_err_trap = fire_err_trap -- compiled tier fires ERR after a failing native command
+-- A prompt string (PS1/PS2/… and ${x@P}): decode the backslash escapes, then (promptvars)
+-- expand $var/$(…)/`…`. Only re-parse when there IS an expansion: re-parsing otherwise eats
+-- decoded backslashes (a kept unknown escape `\x55`, a lone `\`), which bash keeps.
+M.prompt_string = function(sh, s)
+	local decoded = sh:prompt_escapes(s or "")
+	if not decoded:find("[$`]") then
+		return decoded
+	end
+	return expand_word(sh, P.parse_word(decoded))
+end
 M.run_trap_str = function(sh, code) -- a late-forked subshell child runs its own EXIT trap
 	return run_trap(sh, code)
 end
@@ -5173,6 +5198,7 @@ local function finish(sh, ok, err)
 	end
 	if not ok then
 		if type(err) == "table" and err.__curse_exit then
+			sh.exit_requested = true -- (the REPL stops reading)
 			sh.status = err.__curse_exit
 		elseif type(err) == "table" and err.__curse_return then
 			sh.status = err.__curse_return
@@ -5181,7 +5207,14 @@ local function finish(sh, ok, err)
 		end
 	end
 	-- EXIT trap: runs once with $? = the final status; its own status is ignored
-	-- unless it calls exit (bash semantics).
+	-- unless it calls exit (bash semantics). A REPL/stdin session runs many chunks
+	-- through here and fires it once at the very end instead (defer_exit_trap).
+	if sh.defer_exit_trap then
+		return
+	end
+	M.run_exit_trap(sh)
+end
+M.run_exit_trap = function(sh)
 	local h = sh.traps and sh.traps.EXIT
 	if h and h ~= "" and not sh.in_exit_trap then
 		sh.in_exit_trap = true

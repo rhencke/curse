@@ -4175,8 +4175,9 @@ local function glob_conv(glob, pn, patsub)
 	local out, i, n = {}, 1, #glob
 	while i <= n do
 		local c = glob:sub(i, i)
+		-- an extglob group must CLOSE: an unterminated `*([` is just `*` + literal `([` (bash)
+		local d, j = 1, i + 2
 		if EXTOP[c] and glob:sub(i + 1, i + 1) == "(" then
-			local d, j = 1, i + 2
 			while j <= n and d > 0 do
 				local cc = glob:sub(j, j)
 				if cc == "(" then
@@ -4189,6 +4190,8 @@ local function glob_conv(glob, pn, patsub)
 				end
 				j = j + 1
 			end
+		end
+		if EXTOP[c] and glob:sub(i + 1, i + 1) == "(" and d == 0 then
 			local arms = split_arms(glob:sub(i + 2, j - 1))
 			local conv = {}
 			for _, a in ipairs(arms) do
@@ -5923,7 +5926,9 @@ function Shell:prompt_escapes(s)
 				n = "\n",
 				r = "\r",
 				["\\"] = "\\",
-				["$"] = (self:special_get("EUID") == "0" and "#" or "$"),
+				-- `\$` decodes to `\$` for a non-root user: the promptvars expansion that
+				-- follows removes the backslash (so `\\\$` -> `\` `\$` -> `\$`, as bash)
+				["$"] = (self:special_get("EUID") == "0" and "#" or "\\$"),
 				t = os.date("%H:%M:%S"),
 				T = os.date("%I:%M:%S"),
 				["@"] = os.date("%I:%M %p"),
@@ -5931,10 +5936,18 @@ function Shell:prompt_escapes(s)
 				d = os.date("%a %b %d"),
 				s = self.shellname or "bash",
 				v = "5.2",
-				V = "5.2.0",
+				V = "5.2.37",
 				["!"] = "1",
 				["#"] = "1",
-				j = "0",
+				j = (function() -- number of jobs the shell is managing
+					local nj = 0
+					for _, jb in ipairs(self.jobs or {}) do
+						if not jb.done then
+							nj = nj + 1
+						end
+					end
+					return tostring(nj)
+				end)(),
 			})[d]
 			if d == "[" or d == "]" then
 				i = i + 2 -- non-printing markers: drop
@@ -6299,6 +6312,8 @@ local BUILTIN_LAZY = {
 	source = "b_source",
 	["."] = "b_source",
 	wait = "b_wait",
+	fg = "b_fg",
+	bg = "b_fg",
 	fc = "b_fc",
 	bind = "b_bind",
 	shopt = "b_shopt",

@@ -46,21 +46,49 @@ local function read_line(prompt)
 	if interactive and stderr_tty then
 		io.stderr:write(prompt)
 	end
+	if not istty then
+		-- piped/redirected program text: read fd 0 RAW, one byte at a time (like bash on a
+		-- non-seekable input), so a command the script runs — `read`, `cat`, a child — sees
+		-- exactly the input after the current line (stdio would have buffered it away)
+		local buf = {}
+		while true do
+			local ch = interp._int.fd_getc(0)
+			if ch == nil then
+				return #buf > 0 and table.concat(buf) or nil
+			end
+			if ch == "\n" then
+				return table.concat(buf)
+			end
+			buf[#buf + 1] = ch
+		end
+	end
 	return io.read("*l")
 end
 
 -- Does `buf` have an obviously-unterminated construct, so the REPL should keep
 -- reading (PS2) instead of running it? Shared with interp.source_file (rc-file
 -- completeness). See interp.incomplete_input.
-local needs_more = interp.incomplete_input
+local function needs_more(buf)
+	if interp.incomplete_input(buf) then
+		return true
+	end
+	-- the real parser decides the rest (`f() {`, `{ echo`, `echo $(ls`, …)
+	local ok, r = pcall(require("parser").parse, buf)
+	local perr = (not ok and tostring(r)) or (r and r.stmts and r.stmts[1] and r.stmts[1].t == "parse_error"
+		and tostring(r.stmts[1].msg)) or ""
+	return perr:find("unexpected end of file", 1, true) ~= nil
+end
 
 -- Expand PS1/PS2 escapes for the prompt via the shared, full prompt decoder.
 local function prompt_of(sh, var, default)
-	return sh:prompt_escapes(sh.vars[var] and sh:get(var) or default)
+	return interp.prompt_string(sh, sh.vars[var] and sh:get(var) or default)
 end
 
 local M = {}
 function M.run(sh)
+	-- re-probe the tty state per run: a resident daemon worker serves many callers' fds
+	istty = ffi.C.isatty(0) == 1
+	stderr_tty = ffi.C.isatty(2) == 1
 	interactive = istty or (sh and sh.opt_i) or false -- prompts print for `-i` even off a tty
 	-- Persist $HISTFILE across the session (load now, write at exit) — but only when
 	-- it was EXPLICITLY set (env/script), never the ~/.bash_history default, so a
@@ -87,6 +115,7 @@ function M.run(sh)
 		end)
 	end
 	local buf = ""
+	sh.defer_exit_trap = true -- the EXIT trap fires once, when the session ends
 	while true do
 		if buf == "" then -- before each PRIMARY prompt, bash runs $PROMPT_COMMAND
 			local ok, err = pcall(interp.run_prompt_command, sh)
@@ -102,6 +131,10 @@ function M.run(sh)
 			if interactive and stderr_tty then
 				io.stderr:write("\n")
 			end -- newline to stderr, like the prompt
+			if buf:match("%S") then -- an unfinished command at EOF: run it so the syntax error shows
+				pcall(interp.run_lazy, sh, buf)
+				io.flush()
+			end
 			break
 		end
 		buf = (buf == "") and line or (buf .. "\n" .. line)
@@ -122,8 +155,9 @@ function M.run(sh)
 						RL.add_history(buf)
 					end
 				end
+				sh.exit_requested = nil
 				local ok, err = pcall(interp.run_lazy, sh, buf)
-				if not ok and type(err) == "table" and err.__curse_exit then
+				if sh.exit_requested or (not ok and type(err) == "table" and err.__curse_exit) then
 					io.flush()
 					break -- `exit` in the REPL
 				elseif not ok then
@@ -134,6 +168,9 @@ function M.run(sh)
 			buf = ""
 		end
 	end
+	sh.defer_exit_trap = nil
+	pcall(interp.run_exit_trap, sh)
+	io.flush()
 	if histfile then -- write the session's history back to an explicit $HISTFILE
 		-- `shopt -s histappend` appends the session's list to the file; otherwise it
 		-- overwrites (bash). (HISTSIZE has already trimmed the in-memory list.)

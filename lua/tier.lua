@@ -214,6 +214,9 @@ end
 -- BASH_ENV file), that assumption is off for scripts that define aliases — or for every
 -- script when some are already defined — so interpret instead (always correct).
 local function alias_mismatch(mod, sh)
+	if sh.opt_x or sh.opt_v then -- started tracing (-x, inherited SHELLOPTS): interp traces
+		return true
+	end
 	if not (sh.shopt and sh.shopt.expand_aliases) then
 		return false
 	end

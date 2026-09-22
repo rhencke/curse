@@ -46,6 +46,7 @@ local lazy_mods = {
 	"b_eval",
 	"b_source",
 	"b_wait",
+	"b_fg",
 	"b_fc",
 	"b_bind",
 	"b_shopt",

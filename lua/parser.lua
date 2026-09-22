@@ -402,6 +402,7 @@ end
 -- Scan a ${…} starting at the `{` (index `bi`) in `s`, returning the index just
 -- past the matching `}`. Respects backslash escapes, '…'/"…" quoting (so a `}`
 -- inside quotes doesn't close), and nested `{…}` — unlike a naive find("}").
+local scan_cmdsub -- forward (defined below; scan_braces skips $(…) bodies with it)
 local function scan_braces(s, bi)
 	local i, ns, depth = bi + 1, #s, 1
 	while i <= ns and depth > 0 do
@@ -421,8 +422,15 @@ local function scan_braces(s, bi)
 			end
 			i = i + 1
 		elseif c == "{" then
-			depth = depth + 1
+			-- only a nested `${` opens a level; a bare `{` is an ordinary char, so
+			-- `${X//a/{x,y,z}}` ends at the FIRST `}` (bash: replacement `{x,y,z`, then `}`)
+			if s:sub(i - 1, i - 1) == "$" then
+				depth = depth + 1
+			end
 			i = i + 1
+		elseif c == "$" and s:sub(i + 1, i + 1) == "(" then
+			local ok, nj = pcall(scan_cmdsub, s, i + 2) -- a `}` inside $(…) doesn't close
+			i = (ok and nj) or (i + 1)
 		elseif c == "}" then
 			depth = depth - 1
 			i = i + 1
@@ -657,7 +665,6 @@ M.parse_paramexp = parse_paramexp
 -- the closing `)`. Understands single/double/ANSI-C quotes, backslash escapes,
 -- nested $()/${ }/$(( ))/backticks, and — crucially — `case … esac`, whose
 -- pattern-terminating `)` does NOT close the substitution (`$(case x in x) …;; esac)`).
-local scan_cmdsub
 scan_cmdsub = function(src, j)
 	local n = #src
 	local pdepth = 0 -- nested subshell / group / extglob paren depth
@@ -1710,6 +1717,7 @@ local function make_parser(src, sh, aenv)
 	-- pairs with a later `}`/`)`, `|` forms a real pipeline, and a trailing blank
 	-- makes the following word alias-eligible too.
 	local alias_on = false -- shopt expand_aliases state (from source)
+	local extglob_on = false -- shopt extglob state (from source; the live sh.shopt when interpreting)
 	local aliases = {} -- name -> value (from parsed `alias` commands)
 	if aenv then -- a nested body ($(…)) starts from its enclosing line's static state
 		alias_on = true
@@ -1767,6 +1775,8 @@ local function make_parser(src, sh, aenv)
 				elseif a == "-q" or a == "-p" or a == "-o" then -- flags, ignore
 				elseif a == "expand_aliases" and set ~= nil then
 					alias_on = set
+				elseif a == "extglob" and set ~= nil then
+					extglob_on = set
 				end
 			end
 		elseif cmd == "alias" then
@@ -2712,6 +2722,15 @@ local function make_parser(src, sh, aenv)
 					end
 					toks[#toks + 1] = src:sub(rs, i - 1)
 					quoted[#toks] = false
+				elseif src:sub(i, i + 1) == "!(" and not (sh and sh.shopt and sh.shopt.extglob or (not sh and extglob_on))
+					and (toks[#toks] == nil or toks[#toks] == "&&" or toks[#toks] == "||" or toks[#toks] == "!" or toks[#toks] == "(")
+				then
+					-- (only where `!` can be the negation operator: an operand after == etc. is a
+					-- pattern, and bash matches extglob patterns in [[ ]] regardless)
+					-- without extglob, `[[ !(…) ]]` is the `!` operator applied to a ( … ) group
+					toks[#toks + 1] = "!"
+					quoted[#toks] = false
+					i = i + 1
 				else
 					local before = i
 					local w = word(true, true) -- split on <,>,(,) operators (no spaces needed in [[ ]])
@@ -3284,6 +3303,10 @@ local function make_parser(src, sh, aenv)
 			negate = true
 			i = i + 2
 			ws()
+		elseif src:sub(i, i + 1) == "!(" and not (sh and sh.shopt and sh.shopt.extglob or (not sh and extglob_on)) then
+			-- without extglob, `!(cmds)` is `!` negating a ( … ) subshell, not a pattern word
+			negate = true
+			i = i + 1
 		end
 		local first = parse_command()
 		local cmds = { first }
@@ -3347,6 +3370,7 @@ local function make_parser(src, sh, aenv)
 	-- and-or list: pipeline [ (&& | ||) pipeline ]*  ; a lone `&` (background) is
 	-- accepted and run in the foreground for now.
 	parse_stmt = function()
+		local cstart = i -- job text for `jobs`/`fg` (the command as written, sans `&`)
 		local head = parse_pipeline()
 		local items, bg = nil, false
 		while true do
@@ -3382,7 +3406,8 @@ local function make_parser(src, sh, aenv)
 		end
 		local node = items and { t = "andor", items = items } or head
 		if bg then
-			return { t = "background", cmd = node }
+			local text = src:sub(cstart, i - 2):gsub("^%s+", ""):gsub("%s+$", "")
+			return { t = "background", cmd = node, text = text }
 		end
 		return node
 	end

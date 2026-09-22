@@ -327,8 +327,7 @@ if arg[ai] == nil then
 		source_rc(sh) -- --rcfile sourced before the interactive session
 		require("repl").run(sh)
 	else
-		local src = io.read("*a") or ""
-		interp.run_lazy(sh, src)
+		require("repl").run(sh) -- non-interactive: line at a time from fd 0 (bash)
 	end
 	io.flush()
 	os.exit(sh.status or 0)

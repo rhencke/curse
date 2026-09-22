@@ -404,6 +404,29 @@ local function scan_sigtrap(node)
 	end
 	return false
 end
+-- Can the program turn on xtrace/verbose? (`set -x`/`-v` in any cluster, `set -o xtrace/
+-- verbose`, or a non-literal `set` argument that might.)
+local function scan_xtrace(node)
+	if type(node) ~= "table" then
+		return false
+	end
+	if node.t == "simple" and node.words and node.words[1] and node.words[1].parts[1]
+		and node.words[1].parts[1].lit == "set"
+	then
+		for j = 2, #node.words do
+			local l = node.words[j].parts[1] and #node.words[j].parts == 1 and node.words[j].parts[1].lit
+			if not l or l == "xtrace" or l == "verbose" or (l:match("^%-%a+$") and l:find("[xv]", 2)) then
+				return true
+			end
+		end
+	end
+	for _, v in pairs(node) do
+		if type(v) == "table" and scan_xtrace(v) then
+			return true
+		end
+	end
+	return false
+end
 -- functrace (set -T / -o functrace) extends DEBUG into subshells, which compiled
 -- fragments don't hook — keep those programs on the delegated path.
 local function scan_functrace(node)
@@ -5427,7 +5450,7 @@ H.background = function(cx, st, after)
 	while c1 and c1.t == "pipeline" and c1.cmds do
 		c1 = c1.cmds[1]
 	end
-	local cmdstr = (c1 and c1.words and c1.words[1] and c1.words[1].parts[1] and c1.words[1].parts[1].lit)
+	local cmdstr = st.text or (c1 and c1.words and c1.words[1] and c1.words[1].parts[1] and c1.words[1].parts[1].lit)
 		or "job"
 	-- a lone simple command naming an EXTERNAL (not a builtin/function) is the child's
 	-- last act: the child execs it in place instead of spawning (bash does the same)
@@ -6499,6 +6522,11 @@ function M.emit(ast, opts)
 	-- execution context, so a top-level return/break/continue must RAISE its signal for
 	-- the enclosing (delegated) cf-wrapper to catch, not jump to this fragment's own DONE.
 	EF.fragment = opts and opts.fragment or false
+	-- xtrace/verbose (`set -x`, `set -o xtrace`, `set -v`) trace per command; the compiled
+	-- tier has no trace hooks, so such a program stays in the interpreter (which traces).
+	if scan_xtrace(ast.stmts) then
+		error("curse-nocompile: xtrace")
+	end
 	local alias_kind = scan_alias(ast.stmts)
 	if alias_kind == "dynamic" or (alias_kind == "static" and scan_dyncode(ast.stmts)) then
 		error("curse-nocompile: alias expansion needs line-at-a-time parse")
