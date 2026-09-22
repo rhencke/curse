@@ -35,7 +35,10 @@ return function(sh, cmd, args, hook, tcb)
 			end
 		end
 		local optind = math.max(1, math.floor(tonumber(sh:get("OPTIND")) or 1))
-		local cur = sh.getopts_cur or 1
+		-- The in-argument position belongs to THIS OPTIND box: a local OPTIND starts fresh
+		-- and the caller's resumes on return; any assignment to OPTIND resets it (bash).
+		local ob = sh.vars[sh:deref("OPTIND")]
+		local cur = (sh.getopts_state and ob and sh.getopts_state[ob]) or 1
 		-- A leftover OPTIND pointing past a now-shorter argument list (e.g. after a
 		-- fresh `set --`) is exhausted: bash returns EOF and clamps OPTIND to
 		-- nargs+1 (getopt.c: `sh_optind >= argc` -> `sh_optind = argc`, argc =
@@ -99,14 +102,15 @@ return function(sh, cmd, args, hook, tcb)
 				end
 			end
 		end
-		sh.getopts_cur = cur
-		sh:set_str("OPTIND", tostring(optind))
+		sh:set_str("OPTIND", tostring(optind)) -- (resets the position: record it after)
+		sh.getopts_state = sh.getopts_state or setmetatable({}, { __mode = "k" })
+		sh.getopts_state[sh.vars[sh:deref("OPTIND")]] = cur ~= 1 and cur or nil
 		local valid = vname:match("^[%a_][%w_]*$") -- an invalid NAME -> status 1, var not set
 		if res.done then
 			if valid then
 				sh:set_str(vname, "?")
 			end
-			sh.getopts_cur = 1
+			sh.getopts_state[sh.vars[sh:deref("OPTIND")]] = nil
 			sh.vars["OPTARG"] = nil
 			sh.status = 1 -- end of options: OPTARG unset
 		else

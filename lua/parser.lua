@@ -2854,6 +2854,11 @@ local function make_parser(src, sh)
 				if c == "\n" then
 					line = line + 1
 					i = i + 1
+				elseif c == "#" then
+					-- a comment runs to end of line (words never start here: ws() just ran)
+					while i <= n and src:sub(i, i) ~= "\n" do
+						i = i + 1
+					end
 				elseif c == "" then
 					break
 				elseif c == "(" then

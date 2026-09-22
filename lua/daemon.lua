@@ -49,6 +49,8 @@ ffi.cdef([[
   int fork(void);
   int dup2(int a, int b);
   long syscall(long number, ...);
+  struct curse_d_pollfd { int fd; short events; short revents; };
+  int curse_d_poll(struct curse_d_pollfd *fds, unsigned long n, int timeout) asm("poll");
   int chdir(const char *path);
   int unlink(const char *path);
   int chmod(const char *path, unsigned int mode);
@@ -263,7 +265,7 @@ local WORKER_IDLE = 99 -- worker exit code meaning "accept() timed out" (parent 
 -- gets warmer as it actually serves requests. accept() honors the listen socket's
 -- SO_RCVTIMEO, so a worker idle for `idle`s _exit(WORKER_IDLE) and the parent drains
 -- the pool (checking the shared activity clock, since serving no longer signals it).
-local function worker_main(lfd, my_uid, ctx)
+local function worker_main(lfd, my_uid, ctx, slot)
 	-- PRE-FAULT the heap once BEFORE the first accept: a forked child's first Shell.new
 	-- pays ~480us of cold page faults; a throwaway Shell.new + GC now makes those pages
 	-- resident so every per-request Shell.new reuses them at ~48us.
@@ -289,6 +291,7 @@ local function worker_main(lfd, my_uid, ctx)
 				C._exit(1)
 			end -- unexpected: parent replenishes
 		else
+			ctx.busy[slot] = 1 -- serving: the parent counts busy slots to detect saturation
 			-- The accepted control socket lands low (the daemon's other fds are now high),
 			-- so move it high too before recvmsg/serve: a script's `read <&6` on the live
 			-- connection would otherwise corrupt the reply protocol and hang the client for the
@@ -335,6 +338,7 @@ local function worker_main(lfd, my_uid, ctx)
 					end
 				end
 			end
+			ctx.busy[slot] = 0
 			served = served + 1
 			if served % 64 == 0 then
 				collectgarbage("collect")
@@ -420,7 +424,11 @@ local function serve()
 	local PROT_RW, MAP_SHARED_ANON = 3, 0x21 -- PROT_READ|WRITE, MAP_SHARED|MAP_ANONYMOUS
 	local active = ffi.cast("long *", C.mmap(nil, 8, PROT_RW, MAP_SHARED_ANON, -1, 0))
 	active[0] = os.time()
-	local ctx = { umask = orig_umask, empty_sigset = empty_sigset, devnull = devnull, active = active }
+	-- SHARED per-worker busy flags (one slot per worker, single writer each): lets the
+	-- parent see when EVERY worker is serving, so a nested request isn't stranded.
+	local MAXW = 256
+	local busy = ffi.cast("int *", C.mmap(nil, 4 * MAXW, PROT_RW, MAP_SHARED_ANON, -1, 0))
+	local ctx = { umask = orig_umask, empty_sigset = empty_sigset, devnull = devnull, active = active, busy = busy }
 
 	-- PERSISTENT PREFORK POOL: POOL warm workers blocked in accept(), each serving many
 	-- requests IN-PROCESS with no per-request fork. The kernel wakes exactly one worker
@@ -444,15 +452,35 @@ local function serve()
 			.. ")"
 	)
 
-	local live = 0
+	-- ELASTIC beyond POOL: a script running in a worker can itself run curse (`$THIS_SH`,
+	-- `sh -c` with curse as sh, a curse-shebang script) — that nested request needs ANOTHER
+	-- worker while its parent's worker waits on it. With every worker busy the connection
+	-- would sit in the backlog forever (a deadlock at nesting depth >= POOL, e.g. the bash
+	-- suite's alias1.sub under a 1-worker pool). So the parent watches the listen socket:
+	-- a connection pending while every live worker is busy forks an OVERFLOW worker (up to
+	-- MAXW). Overflow workers idle out like any other and aren't replenished past POOL, so
+	-- the pool shrinks back on its own.
+	local live, pidslot, used = 0, {}, {}
 	local function spawn()
+		local slot
+		for i = 0, MAXW - 1 do
+			if not used[i] then
+				slot = i
+				break
+			end
+		end
+		if not slot then
+			return
+		end
+		busy[slot] = 0
 		local pid = C.fork()
 		if pid == 0 then
-			worker_main(lfd, my_uid, ctx)
+			worker_main(lfd, my_uid, ctx, slot)
 			C._exit(0)
 		end -- worker_main loops (persistent)
 		if pid > 0 then
 			live = live + 1
+			used[slot], pidslot[pid] = true, slot
 		end
 	end
 	for _ = 1, POOL do
@@ -460,23 +488,50 @@ local function serve()
 	end
 
 	local st = ffi.new("int[1]")
+	local lp = ffi.new("struct curse_d_pollfd[1]")
 	while live > 0 do
-		local pid = tonumber(C.waitpid(-1, st, 0)) -- a worker only exits on idle-timeout or crash
-		if pid > 0 then
-			live = live - 1
-			local code = math.floor(tonumber(st[0]) / 256) % 256
-			if code == WORKER_IDLE then
-				-- Idled out. Replenish only if the pool has served recently (shared clock);
-				-- once the whole daemon has been idle >= `idle`, stop -> pool drains to 0 -> exit.
-				if os.time() - tonumber(active[0]) < idle and live < POOL then
-					spawn()
+		while true do -- reap exited workers (a worker only exits on idle-timeout or crash)
+			local pid = tonumber(C.waitpid(-1, st, WNOHANG))
+			if not pid or pid <= 0 then
+				break
+			end
+			local slot = pidslot[pid]
+			if slot then
+				pidslot[pid], used[slot] = nil, nil
+				busy[slot] = 0
+				live = live - 1
+				local code = math.floor(tonumber(st[0]) / 256) % 256
+				if code == WORKER_IDLE then
+					-- Idled out. Replenish only if the pool has served recently (shared clock);
+					-- once the whole daemon has been idle >= `idle`, stop -> pool drains to 0 -> exit.
+					if os.time() - tonumber(active[0]) < idle and live < POOL then
+						spawn()
+					end
+				else
+					-- a CRASH (or transient failure): keep the pool full.
+					active[0] = os.time()
+					if live < POOL then
+						spawn()
+					end
 				end
+			end
+		end
+		if live == 0 then
+			break
+		end
+		lp[0].fd, lp[0].events, lp[0].revents = lfd, 1, 0
+		if C.curse_d_poll(lp, 1, 1000) > 0 then -- a connection is pending
+			local nbusy = 0
+			for slot in pairs(used) do
+				if busy[slot] ~= 0 then
+					nbusy = nbusy + 1
+				end
+			end
+			if nbusy >= live and live < MAXW then
+				spawn() -- nobody free to accept it: grow
+				C.curse_d_poll(nil, 0, 20) -- let the new worker reach accept()
 			else
-				-- a CRASH (or transient failure): keep the pool full.
-				active[0] = os.time()
-				if live < POOL then
-					spawn()
-				end
+				C.curse_d_poll(nil, 0, 2) -- an idle worker is taking it; don't spin
 			end
 		end
 	end

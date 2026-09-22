@@ -1461,6 +1461,20 @@ local function copybox(b)
 	end
 	return nb
 end
+-- getopts' in-argument position lives per OPTIND BOX (so a function-local OPTIND has its
+-- own and the caller's comes back on return, as in bash). Re-key it onto copied boxes.
+function M.getopts_remap(st, from, to)
+	if not st then
+		return nil
+	end
+	local r = setmetatable({}, { __mode = "k" })
+	for name, b in pairs(from) do
+		if st[b] and to[name] then
+			r[to[name]] = st[b]
+		end
+	end
+	return r
+end
 local function shallowcopy(t)
 	if t == nil then return nil end
 	local c = {}
@@ -1490,13 +1504,14 @@ local function sub_checkpoint(self)
 		orig_vars = orig_vars, copy = copy, exset = exset,
 		params = self.params, nparams = self.nparams,
 		shopt = self.shopt, functions = self.functions,
-		dirstack = self.dirstack, hashcache = self.hashcache, getopts = self.getopts_cur,
+		dirstack = self.dirstack, hashcache = self.hashcache, getopts = self.getopts_state,
 		cwd = self:phys_cwd(), um = C.umask(0),
 	}
 	C.umask(cp.um)
 	self.params = pcopy
 	self.shopt = shallowcopy(self.shopt) or {}
 	self.functions = shallowcopy(self.functions) or {}
+	self.getopts_state = M.getopts_remap(self.getopts_state, orig_vars, copy)
 	self.dirstack = shallowcopy(self.dirstack)
 	self.hashcache = shallowcopy(self.hashcache)
 	return cp
@@ -1505,7 +1520,7 @@ local function sub_restore(self, cp)
 	self.vars = cp.orig_vars
 	self.params, self.nparams = cp.params, cp.nparams
 	self.shopt, self.functions = cp.shopt, cp.functions
-	self.dirstack, self.hashcache, self.getopts_cur = cp.dirstack, cp.hashcache, cp.getopts
+	self.dirstack, self.hashcache, self.getopts_state = cp.dirstack, cp.hashcache, cp.getopts
 	if cp.cwd ~= "" then C.chdir(cp.cwd) end
 	C.umask(cp.um)
 	-- Re-sync the process environ: drop names the body newly exported, then restore
@@ -1751,6 +1766,7 @@ function Shell:stage_clone()
 		vars[k] = copybox(b)
 	end
 	c.vars = vars
+	c.getopts_state = M.getopts_remap(self.getopts_state, self.vars, vars)
 	for d, rec in pairs(c.savedstack) do
 		if type(rec) == "table" then
 			c.savedstack[d] = shallowcopy(rec)
@@ -3212,6 +3228,9 @@ function Shell:set_str(name, s)
 	local b = box(dn, self.vars)
 	b.s = s
 	b.n = nil
+	if dn == "OPTIND" and self.getopts_state then
+		self.getopts_state[b] = nil -- assigning OPTIND resets getopts' in-argument position (bash)
+	end
 	if b.exported then
 		C.setenv(dn, s, 1)
 	end -- keep the env in sync
@@ -3296,7 +3315,11 @@ end
 
 -- Arithmetic write: store the int64, defer the string (lazy).
 function Shell:aset(name, n)
-	local b = box(self:deref(name), self.vars)
+	local dn = self:deref(name)
+	local b = box(dn, self.vars)
+	if dn == "OPTIND" and self.getopts_state then
+		self.getopts_state[b] = nil
+	end
 	if b.arr then
 		b.arr[b.assoc and "0" or 0] = i64_to_str(i64(n))
 		return i64(n)

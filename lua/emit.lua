@@ -1426,6 +1426,11 @@ function subshell_stmt_inproc_ok(st, unsafe)
 	return false -- unknown type: fork to be safe
 end
 EF.subshell_inproc_ok = subshell_list_inproc_ok -- flatten_stmt calls it via EF (upvalue cap)
+-- How the interpreter should reach a compiled function: through __upv_wrap when the
+-- module has lifted upvalues (see M.emit), else the closure itself.
+EF.upv_wrapped = function(fname)
+	return (EF.lifted_names and #EF.lifted_names > 0) and ("__upv_wrap(" .. fname .. ")") or fname
+end
 local function compile_cmdsub(src, backtick, lifted)
 	local fallback = ("sh:capture_src(%q%s)"):format(src, backtick and ", true" or "")
 	local pok, ast = pcall(require("parser").parse, src)
@@ -4005,7 +4010,7 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
 				blocks[p] = ("io.stderr:write(%q); sh.status = 1; pc = %d") -- non-fatal runtime error (bash)
 					:format("curse: `" .. st.name .. "': not a valid identifier\n", after)
 			elseif funcflags[st.name] then
-				blocks[p] = ("sh.functions[%q] = %s; pc = %d"):format(st.name, fnlname(st.name), after)
+				blocks[p] = ("sh.functions[%q] = %s; pc = %d"):format(st.name, EF.upv_wrapped(fnlname(st.name)), after)
 			else
 				blocks[p] = ("pc = %d"):format(after)
 			end
@@ -5694,7 +5699,7 @@ assemble = function(cfg, sig, opts)
 	-- register compiled function closures into sh.functions so the interpreter
 	-- (reached via delegation) can call them too — full interp/compiled interop.
 	for _, n in ipairs(opts.register or {}) do
-		o[#o + 1] = ("  sh.functions[%q] = %s"):format(n, fnlname(n))
+		o[#o + 1] = ("  sh.functions[%q] = %s"):format(n, EF.upv_wrapped(fnlname(n)))
 	end
 	-- verbatim definition source for `declare -f`/`type` (parity with the interpreter)
 	if opts.funcsrc and next(opts.funcsrc) then
@@ -6028,6 +6033,21 @@ function M.emit(ast, opts)
 		-- ...and for the pipeline scheduler, which swaps them per stage at context switch.
 		o[#o + 1] = ("local function __upv_get() return %s end"):format(vlist)
 		o[#o + 1] = ("local function __upv_set(%s) %s = %s end"):format(slist, vlist, slist)
+		-- The INTERPRETER's entry into a compiled function (what sh.functions holds). Lifted
+		-- upvalues are authoritative only while compiled code runs; whenever the interpreter
+		-- is running (a delegated loop/eval/dynamic call — compiled code flushed them to sh
+		-- first), sh.vars is the live view. So a call FROM the interpreter seeds the upvalues
+		-- from sh on entry and flushes them back on exit (errors too). Without this a stale
+		-- upvalue clobbers the interp's live value — e.g. a delegated `for ((x=…; x++))` whose
+		-- body calls a compiled function that flushes before an eval: x never advances.
+		-- Compiled-to-compiled calls use fn_x directly (fast path, upvalues already live).
+		local seed, flush = {}, {}
+		for _, nm in ipairs(upvals) do
+			seed[#seed + 1] = ("%s = sh:aget(%q)"):format(lname(nm), nm)
+			flush[#flush + 1] = ("sh:aset(%q, %s)"):format(nm, lname(nm))
+		end
+		o[#o + 1] = ("local function __upv_wrap(f) return function(sh, ...) %s; local ok, e = pcall(f, sh, ...); %s; if not ok then error(e, 0) end end end"):format(
+			table.concat(seed, "; "), table.concat(flush, "; "))
 	end
 	local decls = {}
 	for name in pairs(funcflags) do
