@@ -2227,9 +2227,18 @@ end
 -- reads like IFS/HOME that must not trip nounset.)
 function Shell:get_u(name)
 	-- A declared-but-value-less box (`local foo` / `declare x`) is still UNSET for
-	-- nounset purposes, so treat it like a missing var.
+	-- nounset purposes, so treat it like a missing var. `$x` reads ${x[0]}, so an
+	-- array whose element 0 is unset (a bare `declare -a x` / `local -a x`, or a
+	-- sparse array with no [0]) is likewise unbound — not merely because b.arr exists.
 	local b = self.vars[self:deref(name)]
-	local unset = b == nil or (b.s == nil and b.n == nil and b.arr == nil)
+	local unset
+	if b == nil then
+		unset = true
+	elseif b.arr then
+		unset = (b.assoc and b.arr["0"] or b.arr[0]) == nil
+	else
+		unset = b.s == nil and b.n == nil
+	end
 	if self.opt_u and unset and self:special_get(name) == "" and name ~= "@" and name ~= "*" then
 		io.stderr:write("curse: " .. name .. ": unbound variable\n")
 		error({ __curse_exit = self.opt_c and 127 or 1, __curse_lineabort = self.opt_i or nil })
@@ -4316,6 +4325,9 @@ function M.append_scalar(sh, name, value)
 		sh:array_set(name, require("interp")._int.array_key(sh, name, "0"), value, true)
 	elseif b and b.int then
 		sh:aset(name, sh:aget(name) + M.arith_str(sh, value))
+	elseif b and (b.lower or b.upper) then -- declare -l/-u: case-fold the appended result
+		local v = sh:get(name) .. value
+		sh:set_str(name, b.lower and v:lower() or v:upper())
 	else
 		sh:set_str(name, sh:get(name) .. value)
 	end

@@ -21,6 +21,7 @@ return function(sh, cmd, args, hook, tcb)
 		-- local [-naA] [+n] NAME[=val]…: shadow the var in this scope, honoring
 		-- nameref (-n), indexed (-a) and associative (-A) attributes.
 		local nref, assoc, plusn, rest, lok = false, false, false, {}, true
+		local iattr, lattr, uattr, aattr, rattr = false, false, false, false, false
 		for j = 2, #args do
 			local a = args[j]
 			if a == "--" then
@@ -31,6 +32,21 @@ return function(sh, cmd, args, hook, tcb)
 				if a:find("A") then
 					assoc = true
 				end
+				if a:find("a") then
+					aattr = true
+				end
+				if a:find("i") then
+					iattr = true
+				end
+				if a:find("l") then
+					lattr = true
+				end
+				if a:find("u") then
+					uattr = true
+				end
+				if a:find("r") then
+					rattr = true
+				end
 			elseif a:sub(1, 1) == "+" and #a > 1 then
 				if a:find("n") then
 					plusn = true
@@ -39,7 +55,8 @@ return function(sh, cmd, args, hook, tcb)
 				rest[#rest + 1] = a
 			end
 		end
-		if #rest == 0 and not (nref or assoc or plusn) then
+		local attrs = nref or assoc or plusn or iattr or lattr or uattr or aattr or rattr
+		if #rest == 0 and not attrs then
 			-- bare `local` / `local -p`: list this frame's local variables (bash format)
 			local saved, names = sh.savedstack[sh.pd], {}
 			if saved then
@@ -55,7 +72,7 @@ return function(sh, cmd, args, hook, tcb)
 				end
 			end
 			sh.status = 0
-		elseif not (nref or assoc or plusn) then
+		elseif not attrs then
 			for _, a in ipairs(rest) do
 				local anm, sub, aop, aval = a:match("^([%a_][%w_]*)%[(.-)%](%+?=)(.*)$")
 				if anm then -- local a[i]=v : create the element in a local array
@@ -91,33 +108,53 @@ return function(sh, cmd, args, hook, tcb)
 				local nm, val = a:match("^([%a_][%w_]*)=(.*)$")
 				local vname = nm or a
 				sh:localVar(vname)
-				if nm then
-					if nref then
-						if not sh:make_nameref(nm, val) then
-							io.stderr:write(
-								"curse: local: `" .. (val or "") .. "': invalid variable name for name reference\n"
-							)
-							lok = false
-						end
-					else
-						if assoc then
-							sh:declare_assoc(nm)
-						end
-						sh:set_str(nm, val)
-					end
-				elseif plusn then
-					sh:unref(vname)
-				elseif nref then
-					if not sh:make_nameref(vname) then
+				if nref then
+					if not sh:make_nameref(nm or vname, val) then
 						io.stderr:write(
 							"curse: local: `"
-								.. (sh.vars[vname] and sh.vars[vname].s or "")
+								.. (nm and (val or "") or (sh.vars[vname] and sh.vars[vname].s or ""))
 								.. "': invalid variable name for name reference\n"
 						)
 						lok = false
 					end
-				elseif assoc then
-					sh:declare_assoc(vname)
+				elseif plusn then
+					sh:unref(vname)
+				else
+					-- -A/-a/-i/-l/-u/-r (mirrors declare in a function): apply the value arith-evaluated
+					-- for -i, case-folded for -l/-u, else the plain string; then any -r readonly mark.
+					if assoc then
+						sh:declare_assoc(vname)
+					elseif aattr then
+						local b = sh.vars[vname] or {}
+						if not b.assoc then
+							b.arr = b.arr or {}
+						end
+						sh.vars[vname] = b
+					end
+					if nm then
+						if iattr then
+							sh:aset(nm, eval(sh, P.arith(val)))
+							sh.vars[nm].int = true
+						elseif lattr or uattr then
+							sh:set_str(nm, lattr and val:lower() or val:upper())
+							sh.vars[nm].lower = lattr or nil
+							sh.vars[nm].upper = uattr or nil
+						elseif not (assoc or aattr) then
+							sh:set_str(nm, val)
+						end
+					elseif iattr or lattr or uattr then
+						local b = sh.vars[vname] or {}
+						b.int = iattr or b.int
+						b.lower = lattr or b.lower
+						b.upper = uattr or b.upper
+						sh.vars[vname] = b
+					end
+					if rattr then
+						local b = sh.vars[sh:deref(vname)]
+						if b then
+							b.ro = true
+						end
+					end
 				end
 			end
 		end

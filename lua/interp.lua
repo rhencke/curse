@@ -1018,7 +1018,16 @@ local function expand_part_str(sh, p, assign)
 			return expand_word(sh, P.parse_word("${" .. rb.s .. "}"))
 		end
 		local b = sh.vars[sh:deref(p.var)]
-		local unset = b == nil or (b.s == nil and b.n == nil and b.arr == nil)
+		-- `$x` reads ${x[0]}, so an array whose element 0 is unset (a bare `declare -a x`, a
+		-- sparse array with no [0]) is unbound — not merely because b.arr exists.
+		local unset
+		if b == nil then
+			unset = true
+		elseif b.arr then
+			unset = (b.assoc and b.arr["0"] or b.arr[0]) == nil
+		else
+			unset = b.s == nil and b.n == nil
+		end
 		if sh.opt_u and unset and sh:special_get(p.var) == "" then
 			io.stderr:write("curse: " .. p.var .. ": unbound variable\n")
 			error({ __curse_exit = sh.opt_c and 127 or 1, __curse_lineabort = sh.opt_i or nil })
@@ -3938,6 +3947,9 @@ exec_stmt = function(sh, st, hook)
 						sh:array_set(st.name, array_key(sh, st.name, "0"), expand_assign_word(sh, st.rhs), true)
 					elseif b and b.int then -- integer var: += is arithmetic addition
 						sh:aset(st.name, sh:aget(st.name) + eval(sh, P.arith(expand_word(sh, st.rhs))))
+					elseif b and (b.lower or b.upper) then -- declare -l/-u: case-fold the appended result
+						local v = sh:get(st.name) .. expand_assign_word(sh, st.rhs)
+						sh:set_str(st.name, b.lower and v:lower() or v:upper())
 					else
 						sh:set_str(st.name, sh:get(st.name) .. expand_assign_word(sh, st.rhs))
 					end
