@@ -5262,6 +5262,10 @@ H.pipeline = function(cx, st, after)
 	return p
 end
 
+-- ${…} operators with no side effect and no error output (safe to expand in the PARENT
+-- for a spawned `ext args &`): plain, defaults/alternates, trims, replacements, case ops
+local BG_PURE_PEXP = { [""] = 1, ["-"] = 1, [":-"] = 1, ["+"] = 1, [":+"] = 1, ["#"] = 1, ["##"] = 1,
+	["%"] = 1, ["%%"] = 1, ["/"] = 1, ["//"] = 1, ["^"] = 1, ["^^"] = 1, [","] = 1, [",,"] = 1 }
 -- statement handler: background (split out of flatten_stmt; see H)
 H.background = function(cx, st, after)
 	local t = st.t
@@ -5270,10 +5274,16 @@ H.background = function(cx, st, after)
 	-- subprogram). Gated to trap-free programs — a forked child otherwise resets caught
 	-- signal traps (interp-side signal machinery). Flush lifted operands so the child
 	-- (which reads sh) sees current values; no reload (the parent's copy is unaffected).
-	if EF.has_trap then
+	-- a REAL-signal trap must be reset in the child (interp's signal machinery); pseudo
+	-- traps don't reach it (no EXIT on _exit, ERR/DEBUG scoped out by in_subprogram)
+	if EF.inproc_trap_block then
 		return cx.delegate(st, after)
 	end
-	local id = emit_fragment({ st.cmd })
+	-- bash doesn't run ERR (even under errtrace) for the async job's OWN top command —
+	-- only for commands nested in a job that's a group/subshell/… — so a simple/pipeline
+	-- job compiles with its direct command errexit/ERR-exempt (as `! cmd` does).
+	local topexempt = st.cmd.t == "simple" or st.cmd.t == "pipeline"
+	local id = emit_fragment({ st.cmd }, topexempt)
 	if not id then
 		return cx.delegate(st, after)
 	end
@@ -5283,10 +5293,55 @@ H.background = function(cx, st, after)
 	end
 	local cmdstr = (c1 and c1.words and c1.words[1] and c1.words[1].parts[1] and c1.words[1].parts[1].lit)
 		or "job"
+	-- a lone simple command naming an EXTERNAL (not a builtin/function) is the child's
+	-- last act: the child execs it in place instead of spawning (bash does the same)
+	local ext = false
+	local sc = st.cmd
+	if sc.t == "simple" and sc.words and sc.words[1] then
+		local c = full_lit(sc.words[1])
+		if c == nil then
+			ext = true -- dynamic word: rt.exec_dynamic disarms it unless it resolves to an external
+		else
+			ext = c ~= "" and not cx.funcflags[c] and not (cx.inlinefns and cx.inlinefns[c])
+				and not require("interp").BUILTINS[c] and not emit_redir_funcs[c]
+		end
+	end
+	-- Fast path: a literal external whose words are PURE (bash expands them in the child,
+	-- so nothing with a side effect — $(…), ${x:=…}, arith assignment — may move to the
+	-- parent) and no redirects/assignments: build argv here and spawn, no fork at all. A
+	-- raise while expanding (set -u) or a spawn the runtime declines takes the fork path.
+	local spawn = nil
+	if ext and not sc.redirs and not sc.assigns then
+		local pure = true
+		for _, w in ipairs(sc.words) do
+			for _, pt in ipairs(w.parts or {}) do
+				if pt.cmdsub or pt.procsub or pt.backtick or pt.arithast
+					or (pt.arith and (not safe_arith(pt.arith) or arith_side_effect(safe_arith(pt.arith))))
+					or (pt.pexp and not BG_PURE_PEXP[pt.pexp.op or ""])
+					or pt.special == "!" or pt.special == "_"
+				then
+					pure = false
+				end
+			end
+		end
+		if pure then
+			local builder = field_argv(sc.words, 1, cx.lifted, "rt.cstr(%s)")
+			if builder then
+				spawn = builder
+			end
+		end
+	end
+	local fork = ("sh:run_background(cs_%d, %q%s)"):format(id, cmdstr, ext and ", true" or "")
+	local body = fork
+	if spawn then
+		body = ("do local __ok, __a = pcall(function() %s; return __a end); if not (__ok and sh:spawn_bg(__a, %q)) then %s end end"):format(
+			spawn,
+			cmdstr,
+			fork
+		)
+	end
 	local p = cx.newpc()
-	cx.blocks[p] = dbg(st)
-		.. lifted_flush(cx.lifted)
-		.. ("sh:run_background(cs_%d, %q); pc = %d"):format(id, cmdstr, after)
+	cx.blocks[p] = dbg(st) .. lifted_flush(cx.lifted) .. body .. ("; pc = %d"):format(after)
 	return p
 end
 

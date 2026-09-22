@@ -434,6 +434,7 @@ ffi.cdef([[
   int posix_spawn_file_actions_destroy(void *fa);
   int posix_spawn_file_actions_adddup2(void *fa, int fd, int newfd);
   int posix_spawn_file_actions_addclose(void *fa, int fd);
+  int posix_spawn_file_actions_addopen(void *fa, int fd, const char *path, int oflag, unsigned int mode);
   int posix_spawnattr_init(void *attr);
   int posix_spawnattr_destroy(void *attr);
   int posix_spawnattr_setflags(void *attr, short flags);
@@ -1068,6 +1069,9 @@ local function child_spawnattr(self)
 	return attr
 end
 
+ffi.cdef("int curse_rt_execve(const char *path, char *const argv[], char *const envp[]) asm(\"execve\");")
+local _exec_emptyset = ffi.new("uint8_t[1024]")
+C.sigemptyset(_exec_emptyset)
 function Shell:exec(...)
 	local args = { ... }
 	local n = #args
@@ -1103,6 +1107,22 @@ function Shell:exec(...)
 	-- streams and SIGPIPE propagates, and there's no 2x-memory capture.
 	if self.out == io.write or CO_OUTS[self.out] then
 		io.flush() -- our own buffered stdout (and a pipeline stage's) must reach fd 1 first
+		-- exec_tail: this external is the LAST thing a forked child does (`cmd &`), so replace
+		-- the child with it — one process, like bash — instead of spawning a grandchild and
+		-- waiting. Same signal state a spawned child gets (clean mask; caught handlers reset
+		-- by execve itself). Returns only on failure.
+		if self.exec_tail and self.exec_tail == C.getpid() then -- armed by THIS process only
+			self.exec_tail = nil
+			C.sigprocmask(2, _exec_emptyset, nil) -- SIG_SETMASK
+			C.curse_rt_execve(execpath, ffi.cast("char *const *", argv), C.environ)
+			local e = ffi.errno()
+			if e == 8 then -- ENOEXEC: no-shebang script — run it through our interpreter
+				return self:run_noexec(execpath, args, n)
+			end
+			self:errmsg("curse: " .. tostring(args[1]) .. (e == 2 and ": command not found\n" or ": Permission denied\n"))
+			self.status = (e == 2) and 127 or 126
+			return
+		end
 		local pidp = ffi.new("curse_pid_t[1]")
 		local attr = child_spawnattr(self)
 		local rc = C.posix_spawnp(pidp, execpath, nil, attr, ffi.cast("char *const *", argv), C.environ)
@@ -1706,10 +1726,64 @@ end
 -- redirected to /dev/null (async, can't steal the terminal) as a subprogram (ERR
 -- suppressed); the parent records $! + the job and returns status 0. Compiled tier
 -- only, gated by emit to trap-free programs (so the child needs no signal reset).
-function Shell:run_background(cmd_fn, cmdstr)
+-- `ext args… &` where the args are side-effect-free: the parent already built argv, so
+-- SPAWN the job directly (vfork-fast, stdin </dev/null) — no fork of this (large)
+-- process at all. Returns false (caller forks instead) when it can't reproduce the
+-- forked child exactly: unresolvable name (the child prints the error), a no-shebang
+-- script, or xtrace (the child traces).
+function Shell:spawn_bg(args, cmdstr)
+	local n = #args
+	if n == 0 or args[1] == "" or self.opt_x or self.exec_argv0 then
+		return false
+	end
+	-- a (dynamic) word that names a function/builtin/alias runs shell code: fork for it
+	local I = package.loaded.interp
+	if self.functions[args[1]] or (I and I.BUILTINS[args[1]]) or (self.aliases and self.aliases[args[1]]) then
+		return false
+	end
+	local execpath = args[1]
+	if not execpath:find("/", 1, true) then
+		execpath = self:resolve_cmd(execpath)
+		if not execpath then
+			return false
+		end
+	end
+	local argv = ffi.new("const char*[?]", n + 1)
+	local anchor = {}
+	for i = 1, n do
+		anchor[i] = tostring(args[i])
+		argv[i - 1] = anchor[i]
+	end
+	argv[n] = nil
+	io.flush()
+	local fa = ffi.new("uint8_t[1024]")
+	C.posix_spawn_file_actions_init(fa)
+	C.posix_spawn_file_actions_addopen(fa, 0, "/dev/null", 0, 0) -- async job: stdin </dev/null
+	local pidp = ffi.new("curse_pid_t[1]")
+	local attr = child_spawnattr(self)
+	local rc = C.posix_spawnp(pidp, execpath, fa, attr, ffi.cast("char *const *", argv), C.environ)
+	if attr then
+		C.posix_spawnattr_destroy(attr)
+	end
+	C.posix_spawn_file_actions_destroy(fa)
+	if rc ~= 0 then
+		return false
+	end
+	local pid = tonumber(pidp[0])
+	M.job_add(self, pid, cmdstr)
+	self.bg_pids = self.bg_pids or {}
+	self.bg_pids[#self.bg_pids + 1] = pid
+	self.status = 0
+	return true
+end
+
+function Shell:run_background(cmd_fn, cmdstr, exec_tail)
 	io.flush()
 	local pid = M.fork()
 	if pid == 0 then
+		-- a lone external: exec it in place (Shell:exec). Keyed to this child's pid so a
+		-- process forked while evaluating the words (a forked $(…)) never inherits it.
+		self.exec_tail = exec_tail and C.getpid() or nil
 		local dn = C.open("/dev/null", 0, 0)
 		if dn >= 0 then
 			C.dup2(dn, 0)
@@ -2984,6 +3058,17 @@ function Shell:pid()
 	return pid_cache
 end
 function Shell:special_get(name)
+	-- the one-char specials as the BASE of an operator form (${?:-x} ${$:+y} ${-+z} ${!-w});
+	-- the bare $? $$ $- $! go through their own dedicated nodes
+	if name == "?" then
+		return tostring(self.status)
+	elseif name == "$" then
+		return tostring(self:pid())
+	elseif name == "!" then
+		return self.last_bg_pid or ""
+	elseif name == "-" then
+		return self:dash_flags()
+	end
 	-- $# as a base value for an operator form (`${##2}` = $# with a `#2` strip); the
 	-- bare ${#}/${#@} count and ${#var} length go through their own dedicated nodes.
 	if name == "#" then
@@ -6293,6 +6378,11 @@ function M.exec_dynamic(sh, argv, hook, hadcs, no_func)
 	sh.write_err = nil
 	if sh.opt_x then
 		I.xtrace(sh, argv)
+	end
+	-- a `cmd &` child armed to exec its lone external in place: only if the word resolved
+	-- to an external (a function/builtin runs more than one command — keep the child)
+	if sh.exec_tail and (sh.functions[argv[1]] or I.BUILTINS[argv[1]] or (sh.aliases and sh.aliases[argv[1]])) then
+		sh.exec_tail = nil
 	end
 	-- no_func (the `command` prefix): run argv skipping SHELL FUNCTION lookup (builtin/external only).
 	I.exec_simple(sh, argv, hook or _noop, no_func)

@@ -457,7 +457,18 @@ local function parse_paramexp(inner)
 		return { special = inner }
 	end
 	local indices, lenpfx, sharp_op = false, false, nil
-	if inner:sub(1, 1) == "!" then
+	-- ${?:-x} ${$:+y} ${-+z} ${!:-w}: a one-char SPECIAL parameter followed by an operator
+	-- (`${!` + an operator char is $!, not the indirect prefix). Parsed like a named param.
+	local special_op = nil
+	do
+		local c1, c2 = inner:sub(1, 1), inner:sub(2, 2)
+		if (c1 == "?" or c1 == "$" or c1 == "-" or c1 == "!") and c2 ~= "" and c2:match("[:%-+=?]") then
+			special_op = c1
+		end
+	end
+	if special_op then
+		sharp_op = nil
+	elseif inner:sub(1, 1) == "!" then
 		indices = true
 		inner = inner:sub(2) -- ${!a[@]}
 		-- after `!` (indirect/keys) another prefix operator is a bad substitution
@@ -483,7 +494,9 @@ local function parse_paramexp(inner)
 		end
 	end
 	local name, rest
-	if sharp_op then
+	if special_op then
+		name, rest = special_op, inner:sub(2)
+	elseif sharp_op then
 		name, rest = "#", sharp_op
 	else
 		name, rest = inner:match("^([%a_][%w_]*)(.*)$")
