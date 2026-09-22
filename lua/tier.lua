@@ -22,9 +22,27 @@ end
 -- catches it) instead of jumping to this unit's own DONE. Returns an instantiated module, or
 -- nil when the code can't compile — a parse (syntax) error, alias use (needs line-at-a-time
 -- expansion), or any construct emit still delegates. The caller then falls back to the
--- interpreter, which handles those correctly (and incrementally). No caching: eval strings
--- are usually one-shot, and content-hashing every one would churn the cache.
+-- interpreter, which handles those correctly (and incrementally). Memoized by text below.
+-- Compiled eval/source fragments, keyed by their exact text: a resident worker re-running a
+-- script (or a loop re-running the same `eval "$cmd"`) reuses the module instead of paying
+-- parse + emit + load each time. The result is a pure function of the text (fragment mode
+-- compiles with no program-level assumptions), and a fragment module is re-runnable like
+-- any cached top-level module. Bounded: cleared wholesale when it fills.
+local frag_cache, frag_n, FRAG_MAX = {}, 0, 512
 function M.try_fragment(code)
+	local hit = frag_cache[code]
+	if hit ~= nil then
+		return hit or nil
+	end
+	local mod = M.compile_fragment(code)
+	if frag_n >= FRAG_MAX then
+		frag_cache, frag_n = {}, 0
+	end
+	frag_cache[code] = mod or false
+	frag_n = frag_n + 1
+	return mod
+end
+function M.compile_fragment(code)
 	local pok, ast = pcall(P.parse, code)
 	-- A syntax error (P.parse sets ast.perr and/or emits a `parse_error` statement, or
 	-- throws): the interpreter is the oracle for it — it runs the valid PREFIX then reports
