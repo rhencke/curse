@@ -1566,11 +1566,24 @@ local function emit_dbracket(node, lifted)
 			return nil
 		end -- BASH_REMATCH side effect + status-2 -> interp
 		if op == "==" or op == "=" or op == "!=" then
-			if not node.rq then -- an unquoted RHS is a glob; mixed quoting can't be told apart -> delegate
+			if not node.rq then
+				-- an unquoted RHS is a glob; a MIXED-quoted RHS (`a\?b`, `a"*"b`) needs a mask-aware
+				-- render — plain emit_word loses which metachars are quoted (literal) vs active. Render
+				-- it with emit_pattern_glob_word (quoted metachar -> escaped) and glob-match.
+				local mixed = false
 				for _, p in ipairs(node.r.parts) do
 					if p.q then
+						mixed = true
+						break
+					end
+				end
+				if mixed then
+					local g = EF.emit_pattern_glob_word(node.r, lifted)
+					if not g then
 						return nil
 					end
+					local m = ("rt.glob_match(%s, %s, (sh.shopt.nocasematch and true or nil))"):format(l, g)
+					return op == "!=" and ("(not " .. m .. ")") or m
 				end
 			end
 			local eq = ("rt.dbracket_eq(sh, %s, %s, %s)"):format(
@@ -2294,11 +2307,9 @@ EF.seg_native = seg_native
 -- runtime, quoted ones wrapped in rt.glob_quote. Returns nil (→ keep I.case_match) for a
 -- part emit can't render here: cmdsub/arith/${…}-op/$@/$*/length/CFG-unsafe special.
 local CASE_GLOBSPECIAL = "[%*%?%[%]\\%(%)%|%+%@%!]"
-emit_pattern_glob = function(pat, lifted)
-	local ok, w = pcall(require("parser").parse_word, pat)
-	if not ok then
-		return nil
-	end
+-- Word-based core (shared by the string API below and the [[ == ]] RHS): render an
+-- already-parsed word to its quote-aware glob expression, or nil if a part can't render here.
+local function emit_pattern_glob_word(w, lifted)
 	local out = {}
 	for i, p in ipairs(w.parts) do
 		if p.lenof or p.cmdsub or p.arith or p.arithast or p.pexp or p.procsub then
@@ -2326,6 +2337,14 @@ emit_pattern_glob = function(pat, lifted)
 	end
 	return table.concat(out, " .. ")
 end
+emit_pattern_glob = function(pat, lifted)
+	local ok, w = pcall(require("parser").parse_word, pat)
+	if not ok then
+		return nil
+	end
+	return emit_pattern_glob_word(w, lifted)
+end
+EF.emit_pattern_glob_word = emit_pattern_glob_word -- for the dbracket == RHS (flatten_stmt is at the upvalue cap)
 -- Render a `[[ L =~ R ]]` RHS word to its ERE string (interp's expand_regex): an unquoted
 -- literal or expansion keeps ERE metachars ACTIVE; a quoted part is ERE-escaped (matched
 -- literally). Returns nil (delegate) for a part emit can't render (cmdsub/arith/${..}-op/
