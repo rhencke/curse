@@ -2397,6 +2397,29 @@ end
 -- a LITERAL subscript (no $/`/quote — so rt.arrayassign resolves it with no word engine:
 -- assoc verbatim, indexed via arith_str) and an emit_word-able value. An `a[i]=(…)`
 -- list-to-member error, a brace-de-keyed element, or a nameref program keep I.run_arrayassign.
+-- A keyed array subscript that resolves to a STATIC literal at compile time: a plain literal,
+-- or a fully-quoted key (`['a+1']`, `["k k"]`) whose quotes we strip now. Returns the unquoted
+-- literal, or nil for a dynamic subscript ($/`/mixed expansion) that must delegate. For an assoc
+-- array the result IS the key; for an indexed array rt.arrayassign arith-evaluates it (so a
+-- quoted `['3']` becomes 3, exactly like the unquoted form) — matching interp's array_key.
+local function static_key(key)
+	if not key:find("[%$`'\"\\]") then
+		return key -- already a plain literal (may be an arith expr for an indexed array)
+	end
+	local ok, w = pcall(require("parser").parse_word, key)
+	if not ok then
+		return nil
+	end
+	local o = {} -- concatenate every part's (quote-removed) literal; nil if any part expands
+	for _, p in ipairs(w.parts) do
+		if p.lit == nil then
+			return nil -- a var/cmdsub/arith/pexp part: dynamic subscript, delegate
+		end
+		o[#o + 1] = p.lit
+	end
+	return table.concat(o)
+end
+EF.static_key = static_key -- flatten_stmt references it at the array-literal emit sites (upvalue cap)
 local function arrayassign_ok(st, lifted)
 	if st.index or EF.has_nameref then
 		return false
@@ -2406,13 +2429,13 @@ local function arrayassign_ok(st, lifted)
 			return false
 		end -- `[k]=` value brace-expands (de-keyed): interp
 		if e.key ~= nil then
-			if e.key:find("[%$`'\"]") then
+			if static_key(e.key) == nil then
 				return false
-			end -- dynamic subscript -> interp
+			end -- dynamic subscript ($/`/mixed) -> interp; a quoted-literal key is unquoted below
 			-- A side-effecting arith in a KEYED element's subscript or value (`[100+i++]=$((i++))`)
 			-- has a subtle eval order — bash evaluates ALL the values, THEN all the keys — that the
 			-- straight-line compiled arrayassign can't reproduce. Delegate (interp gets the order).
-			if arith_side_effect(safe_arith(e.key)) then
+			if arith_side_effect(safe_arith(static_key(e.key))) then
 				return false
 			end
 			for _, p in ipairs(e.word.parts) do
@@ -3872,7 +3895,7 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
 							local fl = unq_full_lit(e.word)
 							local valx = (fl and fl:find("~", 1, true)) and ("rt.tilde_assign(sh, %q)"):format(fl)
 								or emit_word(e.word, lifted)
-							parts[#parts + 1] = ("__it[#__it+1] = {key=%q, op=%q, val=%s}"):format(e.key, e.op, valx)
+							parts[#parts + 1] = ("__it[#__it+1] = {key=%q, op=%q, val=%s}"):format(EF.static_key(e.key), e.op, valx)
 						elseif not empty_word(e.word) then
 							parts[#parts + 1] = emit_fields_into("__it", e.word, lifted, "{val=%s}")
 						end
@@ -5228,7 +5251,7 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
 						local fl = unq_full_lit(e.word)
 						local valx = (fl and fl:find("~", 1, true)) and ("rt.tilde_assign(sh, %q)"):format(fl)
 							or emit_word(e.word, lifted)
-						parts[#parts + 1] = ("__it[#__it+1] = {key=%q, op=%q, val=%s}"):format(e.key, e.op, valx)
+						parts[#parts + 1] = ("__it[#__it+1] = {key=%q, op=%q, val=%s}"):format(EF.static_key(e.key), e.op, valx)
 					elseif not empty_word(e.word) then
 						parts[#parts + 1] = emit_fields_into("__it", e.word, lifted, "{val=%s}")
 					end
