@@ -4056,6 +4056,25 @@ end
 -- the PRE-statement value (snap); a literal key resolves natively (assoc verbatim, indexed
 -- via arith_str); reset unless appending; assoc all-bare = alternating key/value pairs;
 -- indexed = auto-index from 0 (or max+1 appending, scalar->[0]); then drop from the env.
+-- `declare -a/-A NAME=(…)` cannot CHANGE an existing array's kind (bash): an -A on an
+-- existing indexed array, or -a on an existing associative one, is an error (status 1, no
+-- assignment) — mirrors interp's b_export conversion check. Returns true (having reported it)
+-- when the compiled declare-array block must be skipped. `cmd` is declare/typeset/local.
+function M.array_convert_err(sh, name, isassoc, cmd)
+	local b = sh.vars[sh:deref(name)]
+	if isassoc then
+		if b and b.arr and not b.assoc then
+			io.stderr:write("curse: " .. cmd .. ": " .. name .. ": cannot convert indexed to associative array\n")
+			sh.status = 1
+			return true
+		end
+	elseif b and b.assoc then
+		io.stderr:write("curse: " .. cmd .. ": " .. name .. ": cannot convert associative to indexed array\n")
+		sh.status = 1
+		return true
+	end
+	return false
+end
 function M.arrayassign(sh, name, items, append)
 	local rb = sh.vars[sh:deref(name)]
 	if rb and rb.ro then

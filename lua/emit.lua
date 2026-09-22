@@ -2420,8 +2420,12 @@ local function static_key(key)
 	return table.concat(o)
 end
 EF.static_key = static_key -- flatten_stmt references it at the array-literal emit sites (upvalue cap)
-local function arrayassign_ok(st, lifted)
-	if st.index or EF.has_nameref then
+local function arrayassign_ok(st, lifted, allow_nameref)
+	-- allow_nameref: an explicit `declare -a/-A NAME=(…)` REDECLARES the name as an array — a
+	-- DIRECT write matching interp (which also doesn't write through a nameref for an array
+	-- assign), and rt.array_convert_err now enforces the indexed<->assoc conversion rule the
+	-- gate used to defer via delegation, so it is parity-safe in a nameref program / eval fragment.
+	if st.index or (EF.has_nameref and not allow_nameref) then
 		return false
 	end
 	for _, e in ipairs(st.elems) do
@@ -3882,10 +3886,9 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
 					and not (cmd == "local" and toplevel) -- `local` outside a function is an error (interp)
 					and not st.assigns
 					and not redir_apply
-					and not EF.has_nameref
 					and #aa == 1
 					and flagsok
-					and arrayassign_ok({ name = aa[1].name, append = aa[1].append, elems = aa[1].elems }, lifted)
+					and arrayassign_ok({ name = aa[1].name, append = aa[1].append, elems = aa[1].elems }, lifted, true)
 				then
 					local a1 = aa[1]
 					local p = newpc()
@@ -3908,7 +3911,14 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
 					end
 					local ro = isro and ("; sh:mark_readonly(%q)"):format(a1.name) or ""
 					blocks[p] = dbg(st)
-						.. "do "
+						-- bash forbids CHANGING an existing array's kind (-A on indexed / -a on assoc):
+						-- status 1, and the RHS values are NOT evaluated (interp assigns the literal only
+						-- when status==0). Gate the whole assign (values included) on the conversion check.
+						.. ("do if not rt.array_convert_err(sh, %q, %s, %q) then "):format(
+							a1.name,
+							tostring(isassoc),
+							cmd
+						)
 						.. pre
 						.. table.concat(parts, "; ")
 						.. ("; rt.arrayassign(sh, %q, __it, %s)"):format(
@@ -3916,7 +3926,7 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
 							tostring(a1.append and true or false)
 						)
 						.. ro
-						.. " end"
+						.. " end end"
 						.. ('; sh:set_str("_", %q)'):format(a1.name)
 						.. ecs
 						.. ("; pc = %d"):format(after)
