@@ -811,6 +811,11 @@ function M.subshell_fork(sh) -- returns pid (0 in the child, which is set up her
 		sh.in_subprogram = (sh.in_subprogram or 0) + 1 -- ERR trap won't fire here (sans errtrace)
 		sh.loopdepth = 0 -- an enclosing loop isn't ours to break/continue
 		sh.out = io.write
+		-- The child runs its body as inline CFG states (no pcall of its own), so an `exit`/
+		-- fatal error raised by the RUNTIME (not an errchk jump) unwinds to the top-level
+		-- finish: that must end THIS child (like subshell_exit), never return into the
+		-- caller of the run (in the daemon: the request loop, which would reply as the worker).
+		sh.subshell_child = true
 	end
 	return pid
 end
@@ -1517,6 +1522,22 @@ end
 -- cwd + umask (via real syscalls). Returns a token for sub_restore. NOT here (each caller
 -- differs): out, opt_e, in_subprogram, loopdepth, noerr, aliases, cur_line, and the
 -- process environ — which sub_restore re-syncs for exported names.
+-- Every `set` option field (set -e/-u/-x/-o pipefail/…): a subshell's `set` changes only
+-- these (plus params, checkpointed too), so snapshotting them lets `set` run in-process.
+local OPT_FIELDS
+local function opt_fields()
+	if not OPT_FIELDS then
+		local seen = {}
+		OPT_FIELDS = {}
+		for _, f in pairs(M.SETOPT) do
+			if not seen[f] then seen[f] = true; OPT_FIELDS[#OPT_FIELDS + 1] = f end
+		end
+		for _, f in pairs(M.SETFLAG) do
+			if not seen[f] then seen[f] = true; OPT_FIELDS[#OPT_FIELDS + 1] = f end
+		end
+	end
+	return OPT_FIELDS
+end
 local function sub_checkpoint(self)
 	local orig_vars = self.vars
 	local copy = {}
@@ -1536,6 +1557,9 @@ local function sub_checkpoint(self)
 		cwd = self:phys_cwd(), um = C.umask(0),
 	}
 	C.umask(cp.um)
+	local of, ov = opt_fields(), {}
+	for i = 1, #of do ov[i] = self[of[i]] end
+	cp.opts = ov
 	self.params = pcopy
 	self.shopt = shallowcopy(self.shopt) or {}
 	self.functions = shallowcopy(self.functions) or {}
@@ -1549,6 +1573,8 @@ local function sub_restore(self, cp)
 	self.params, self.nparams = cp.params, cp.nparams
 	self.shopt, self.functions = cp.shopt, cp.functions
 	self.dirstack, self.hashcache, self.getopts_state = cp.dirstack, cp.hashcache, cp.getopts
+	local of, ov = opt_fields(), cp.opts
+	for i = 1, #of do self[of[i]] = ov[i] end
 	if cp.cwd ~= "" then C.chdir(cp.cwd) end
 	C.umask(cp.um)
 	-- Re-sync the process environ: drop names the body newly exported, then restore

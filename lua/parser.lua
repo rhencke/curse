@@ -5,6 +5,11 @@
 -- Loops get a stable numeric `id` so the tier layer can name a
 -- resume safepoint.
 local M = {}
+-- The STATIC alias state (sh-less compile parse) in effect for the line being parsed:
+-- { tab = name->value } while expand_aliases is on, else nil. Stamped onto every
+-- $(…)/`…` part (`aenv`) so the compiler's later parse of that body expands the same
+-- aliases the enclosing line saw — the body is re-parsed from text, detached from here.
+local ALIAS_ENV = nil
 
 -- ---- arithmetic expression parser (precedence climbing over a string) ----
 -- AST: {k="num",v}, {k="var",name}, {k="bin",op,l,r}, {k="un",op,e},
@@ -869,7 +874,7 @@ local function parse_dollar(w, i, add, q)
 		return j + 1
 	elseif nx == "(" then
 		local je = scan_cmdsub(w, i + 2) -- index just past the closing `)` (case/quote/nesting aware)
-		add({ cmdsub = w:sub(i + 2, je - 2), q = q })
+		add({ cmdsub = w:sub(i + 2, je - 2), q = q, aenv = ALIAS_ENV })
 		return je
 	elseif nx == '"' then
 		-- $"…" locale translation: with no catalog it's just the double-quoted string.
@@ -951,7 +956,7 @@ local function parse_dquote(inner, add, heredoc)
 					j = j + 1
 				end
 			end
-			add({ cmdsub = table.concat(buf), q = true, backtick = true })
+			add({ cmdsub = table.concat(buf), q = true, backtick = true, aenv = ALIAS_ENV })
 			i = j + 1
 		else
 			local s, e = inner:find("^[^$\\`]+", i)
@@ -1062,7 +1067,7 @@ local function parse_word(w)
 					j = j + 1
 				end
 			end
-			add({ cmdsub = table.concat(buf), q = false, backtick = true })
+			add({ cmdsub = table.concat(buf), q = false, backtick = true, aenv = ALIAS_ENV })
 			i = j + 1
 		elseif (c == "<" or c == ">") and w:sub(i + 1, i + 1) == "(" then
 			-- <(cmd) / >(cmd) process substitution: capture the balanced inner command.
@@ -1162,11 +1167,17 @@ end
 -- `is_body` true for a real heredoc body (where " is an ordinary char, so `\"`
 -- stays literal); false/omitted for a double-quoted-context reuse (a quoted
 -- ${x-default} word), where `\"` escapes to " like inside "…".
-function M.parse_heredoc(body, is_body)
+function M.parse_heredoc(body, is_body, aenv)
 	local parts = {}
-	parse_dquote(body, function(p)
+	local saved = ALIAS_ENV
+	ALIAS_ENV = aenv -- its $(…) parts carry the heredoc line's static alias state
+	local ok, err = pcall(parse_dquote, body, function(p)
 		parts[#parts + 1] = p
 	end, is_body)
+	ALIAS_ENV = saved
+	if not ok then
+		error(err, 0)
+	end
 	return { k = "word", parts = parts }
 end
 
@@ -1622,7 +1633,7 @@ local function dequote_word(w)
 	return table.concat(out)
 end
 
-local function make_parser(src, sh)
+local function make_parser(src, sh, aenv)
 	local i, n, line = 1, #src, 1
 	local loopId = 0
 	local heredocs_pending = {} -- heredoc redirs awaiting their body (filled at line end)
@@ -1635,6 +1646,15 @@ local function make_parser(src, sh)
 	-- makes the following word alias-eligible too.
 	local alias_on = false -- shopt expand_aliases state (from source)
 	local aliases = {} -- name -> value (from parsed `alias` commands)
+	if aenv then -- a nested body ($(…)) starts from its enclosing line's static state
+		alias_on = true
+		for k, v in pairs(aenv.tab) do
+			aliases[k] = v
+		end
+	end
+	-- bash parses a whole line before running any of it, so an alias/unalias/shopt on a
+	-- line takes effect from the NEXT line: queue them, apply at the next line's start.
+	local alias_pending = {}
 	local alias_seen -- names being expanded now (recursion guard)
 	local alias_next = false -- next word is eligible (prev value ended blank)
 	local alias_tail = nil -- byte position just past the current expansion
@@ -1668,13 +1688,7 @@ local function make_parser(src, sh)
 	end
 	-- Record alias-affecting builtins as they are parsed so later words expand
 	-- (source-tracking; only needed for the sh-less compile path).
-	local function record_alias_state(node)
-		if sh then
-			return
-		end
-		if not (node and node.t == "simple" and node.words and node.words[1]) then
-			return
-		end
+	local function apply_alias_state(node)
 		local w1 = node.words[1].parts
 		local cmd = (#w1 == 1 and not w1[1].q and w1[1].lit) or nil
 		if cmd == "shopt" then
@@ -1723,6 +1737,38 @@ local function make_parser(src, sh)
 					aliases[a] = nil
 				end
 			end
+		end
+	end
+	local function record_alias_state(node)
+		if sh then
+			return
+		end
+		if not (node and node.t == "simple" and node.words and node.words[1]) then
+			return
+		end
+		alias_pending[#alias_pending + 1] = node
+	end
+	-- Line boundary (sh-less): apply the previous line's alias changes, then publish the
+	-- static state for this line's $(…) parts.
+	local function alias_line_start()
+		if sh then
+			ALIAS_ENV = nil
+			return
+		end
+		if #alias_pending > 0 then
+			for _, node in ipairs(alias_pending) do
+				apply_alias_state(node)
+			end
+			alias_pending = {}
+		end
+		if alias_on then
+			local tab = {}
+			for k, v in pairs(aliases) do
+				tab[k] = v
+			end
+			ALIAS_ENV = { tab = tab }
+		else
+			ALIAS_ENV = nil
 		end
 	end
 	-- Try to expand an alias at the current position. `cmdpos` = command position
@@ -1808,6 +1854,7 @@ local function make_parser(src, sh)
 				blines[#blines + 1] = lstr
 			end
 			hd.body = #blines > 0 and (table.concat(blines, "\n") .. "\n") or ""
+			hd.aenv = ALIAS_ENV -- the compiler re-parses an expanding body later (parse_heredoc)
 		end
 		heredocs_pending = {}
 	end
@@ -3364,6 +3411,7 @@ local function make_parser(src, sh)
 		if done then
 			return nil
 		end
+		alias_line_start()
 		skipblank() -- blank lines, comments, and pending heredocs
 		if i > n then
 			done = true
@@ -3465,8 +3513,9 @@ end
 -- program, and by callers that want the AST). An optional `sh` makes alias
 -- expansion consult the live runtime table (for eval/source/$() at runtime); the
 -- compiler passes none, so it tracks aliases deterministically from source.
-function M.parse(src, sh)
-	local nextf = make_parser(src, sh) -- yields logical-line groups { stmts, perr }
+function M.parse(src, sh, aenv)
+	local saved_env = ALIAS_ENV
+	local nextf = make_parser(src, sh, aenv) -- yields logical-line groups { stmts, perr }
 	local stmts, lines = {}, {}
 	while true do
 		local lg = nextf()
@@ -3486,6 +3535,7 @@ function M.parse(src, sh)
 			stmts[#stmts + 1] = st
 		end
 	end
+	ALIAS_ENV = saved_env
 	return { stmts = stmts, lines = lines }
 end
 

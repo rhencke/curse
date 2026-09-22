@@ -226,7 +226,9 @@ local function serve_request(cfd, req, fds, ctx)
 	-- A FRESH Shell.new (imports the caller's env exactly), cheap because the pages are
 	-- warm (worker_main pre-faulted once, and a persistent worker never re-forks).
 	local sh = rt.Shell.new()
-	local ok = pcall(function()
+	-- A Lua error escaping the run is a curse BUG: report it on the request's stderr
+	-- (status 1) instead of failing silently.
+	local ok = xpcall(function()
 		local kind, payload = dispatch(sh, req.args)
 		if kind == "code" then
 			Tier.run_tiered(payload, sh)
@@ -241,6 +243,9 @@ local function serve_request(cfd, req, fds, ctx)
 				sh.status = 127
 			end
 		end
+	end, function(e)
+		io.stderr:write("curse: internal error: " .. tostring(e) .. "\n" .. debug.traceback() .. "\n")
+		return e
 	end)
 	io.flush()
 	local status = ok and (sh.status or 0) or 1 -- a Lua error (never a script `exit`, which

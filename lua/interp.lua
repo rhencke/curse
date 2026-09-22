@@ -5080,6 +5080,11 @@ M.exec_list = exec_list
 
 -- Run a trap handler string; returns true if it called exit (which wins).
 local function finish(sh, ok, err)
+	if sh.subshell_child then -- a compiled subshell's forked child: end it here (rt.subshell_fork)
+		child_status(sh, ok, err)
+		io.flush()
+		C._exit(sh.status or 0)
+	end
 	if not ok then
 		if type(err) == "table" and err.__curse_exit then
 			sh.status = err.__curse_exit

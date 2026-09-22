@@ -1349,7 +1349,7 @@ local SUBSHELL_FORK_VARS = { BASHPID = 1, BASH_SUBSHELL = 1, RANDOM = 1, SRANDOM
 -- in-process they ARE this process's children — it would block on them. (Its own `&` jobs
 -- already force a fork.)
 local SUBSHELL_FORK_BUILTINS = {
-	exec = 1, ulimit = 1, enable = 1, disable = 1, set = 1, eval = 1, source = 1, ["."] = 1,
+	exec = 1, ulimit = 1, enable = 1, disable = 1, eval = 1, source = 1, ["."] = 1,
 	wait = 1,
 }
 local function word_forces_fork(w)
@@ -1439,9 +1439,9 @@ EF.subshell_inproc_ok = subshell_list_inproc_ok -- flatten_stmt calls it via EF 
 EF.upv_wrapped = function(fname)
 	return (EF.lifted_names and #EF.lifted_names > 0) and ("__upv_wrap(" .. fname .. ")") or fname
 end
-local function compile_cmdsub(src, backtick, lifted)
+local function compile_cmdsub(src, backtick, lifted, aenv)
 	local fallback = ("sh:capture_src(%q%s)"):format(src, backtick and ", true" or "")
-	local pok, ast = pcall(require("parser").parse, src)
+	local pok, ast = pcall(require("parser").parse, src, nil, aenv)
 	if not pok or type(ast) ~= "table" or ast.stmts == nil then
 		return fallback
 	end -- syntax error
@@ -1569,7 +1569,7 @@ emit_word = function(w, lifted)
 			parts[#parts + 1] = emit_arith_word(safe_arith(p.arith), lifted)
 			arith_varread = saved
 		elseif p.cmdsub then -- $( … ): COMPILE the inner (known at compile time) and run it captured
-			parts[#parts + 1] = compile_cmdsub(p.cmdsub, p.backtick, lifted)
+			parts[#parts + 1] = compile_cmdsub(p.cmdsub, p.backtick, lifted, p.aenv)
 		elseif p.pexp then
 			if not pexp_compilable(p.pexp, p.q) then
 				error("curse-nocompile: ${..} operator")
@@ -3698,7 +3698,7 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
 				-- ($var/$(cmd)/arith, no split/glob): parse it in heredoc mode and render with emit_word,
 				-- exactly interp's expand_word(parse_heredoc(body, true)). A part emit_word can't render
 				-- (procsub/nameref/$LINENO/…) fails emitable_word -> delegate.
-				local ok, w = pcall(P.parse_heredoc, r.body or "", true)
+				local ok, w = pcall(P.parse_heredoc, r.body or "", true, r.aenv)
 				if not (ok and emitable_word(w)) then
 					return nil
 				end
@@ -5439,9 +5439,6 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
 			-- A body that toggles options with `set` (e.g. `set -e` mid-body) needs the
 			-- interpreter's per-command semantics, which the straight-line sub-CFG can't
 			-- reproduce — delegate the whole subshell (interp forks + enforces it).
-			if body_runs_set(st.body) then
-				return delegate(st, after)
-			end
 			-- IN-PROCESS (no fork): the fat-LuaJIT fork dominates subshell cost. When the body
 			-- needs no real child — no trap/ERR/DEBUG program, no eval/source, and it runs no
 			-- exec/&/user-function-call and reads no per-subshell special ($RANDOM/$BASHPID/…) —
@@ -5959,50 +5956,86 @@ local function assert_compilable(stmts)
 	end
 end
 
--- Does the program define/use aliases? Alias expansion is a PARSE-time in-context
--- splice, and it depends on line-at-a-time reading: an alias defined on a line does
--- NOT expand its own line, and a dynamically-built alias (`alias "$x"`) is only
--- known once the alias builtin runs. A whole-file compile parse can't honor either,
--- so it would mis-expand — refuse to compile (the interpreter's lazy per-line parse
--- gets it right), matching the tiered deploy which stays in interp for such scripts.
-local function scan_alias(stmts)
-	for _, st in ipairs(stmts or {}) do
-		if st.t == "simple" and st.words[1] then
-			local c = st.words[1].parts[1] and #st.words[1].parts == 1 and st.words[1].parts[1].lit
-			if c == "alias" or c == "unalias" then
-				return true
-			end
-			if c == "shopt" then
-				for j = 2, #st.words do
-					local l = st.words[j].parts[1] and st.words[j].parts[1].lit
-					if l == "expand_aliases" then
-						return true
-					end
-				end
+-- Aliases compile when their effect is STATICALLY known. The parser (sh-less) expands
+-- them as a function of the source text: alias/unalias/`shopt ±s expand_aliases` apply from
+-- the NEXT line (bash parses a line before running it), and each $(…) body carries the
+-- alias state of its line. That model is exact only when every alias-affecting command is
+-- a TOP-LEVEL simple command (runs unconditionally, in order) with fully literal operands,
+-- and no eval/source can add more. Anything else — inside a function/compound/pipeline,
+-- `alias "$x"`, `shopt -s $opt`, eval/source — refuses (the interpreter's live per-line
+-- parse gets it right). Returns: "none" (no alias use), "static", or "dynamic".
+local ALIAS_CMDS = { alias = 1, unalias = 1, shopt = 1 }
+local function static_lit(w)
+	if not w or not w.parts then
+		return false
+	end
+	for _, p in ipairs(w.parts) do
+		if p.lit == nil then
+			return false
+		end
+	end
+	return true
+end
+local function alias_cmd(st)
+	if st.t ~= "simple" or not st.words or not st.words[1] then
+		return nil
+	end
+	local w1 = st.words[1].parts
+	local c = #w1 == 1 and not w1[1].q and w1[1].lit
+	if not c or not ALIAS_CMDS[c] then
+		return nil
+	end
+	if c == "shopt" then -- only an expand_aliases toggle is alias-affecting
+		local hit, dyn = false, false
+		for j = 2, #st.words do
+			if not static_lit(st.words[j]) then
+				dyn = true
+			elseif st.words[j].parts[1].lit == "expand_aliases" then
+				hit = true
 			end
 		end
-		if st.body and scan_alias(st.body) then
+		if not (hit or dyn) then
+			return nil
+		end
+		return dyn and "dynamic" or "static"
+	end
+	for j = 2, #st.words do
+		if not static_lit(st.words[j]) then
+			return "dynamic"
+		end
+	end
+	return "static"
+end
+local function scan_alias_nested(node)
+	if type(node) ~= "table" then
+		return false
+	end
+	if node.t == "simple" and alias_cmd(node) then
+		return true
+	end
+	for _, v in pairs(node) do
+		if type(v) == "table" and scan_alias_nested(v) then
 			return true
-		end
-		if st.clauses then
-			for _, cl in ipairs(st.clauses) do
-				if scan_alias(cl.body) then
-					return true
-				end
-			end
-		end
-		if st.cmds and scan_alias(st.cmds) then
-			return true
-		end
-		if st.items then
-			for _, it in ipairs(st.items) do
-				if it.cmd and scan_alias({ it.cmd }) then
-					return true
-				end
-			end
 		end
 	end
 	return false
+end
+local function scan_alias(stmts)
+	local kind = "none"
+	for _, st in ipairs(stmts or {}) do
+		local a = alias_cmd(st)
+		if a == "dynamic" then
+			return "dynamic"
+		elseif a == "static" then
+			kind = "static"
+			if st.redirs or st.assigns then
+				return "dynamic" -- `alias x=y >f` / `X=1 alias …`: keep it simple
+			end
+		elseif st.t ~= "simple" and scan_alias_nested(st) then
+			return "dynamic" -- conditional / function-scoped / pipeline-stage alias command
+		end
+	end
+	return kind
 end
 function M.emit(ast, opts)
 	emit_frags, emit_frag_n = {}, 0 -- compiled `$(…)` fragments (cs_N closures) collected during build
@@ -6010,9 +6043,11 @@ function M.emit(ast, opts)
 	-- execution context, so a top-level return/break/continue must RAISE its signal for
 	-- the enclosing (delegated) cf-wrapper to catch, not jump to this fragment's own DONE.
 	EF.fragment = opts and opts.fragment or false
-	if scan_alias(ast.stmts) then
+	local alias_kind = scan_alias(ast.stmts)
+	if alias_kind == "dynamic" or (alias_kind == "static" and scan_dyncode(ast.stmts)) then
 		error("curse-nocompile: alias expansion needs line-at-a-time parse")
 	end
+	EF.alias_static = alias_kind == "static"
 	-- A fragment runs in the CALLER's context, where any var may carry an attribute
 	-- (readonly/integer/case/nameref) the fragment's own code can't see, so force the
 	-- attribute- and nameref-aware assign paths (they do the readonly check, int coercion,
@@ -6239,7 +6274,9 @@ function M.emit(ast, opts)
 		"local function run(sh, pc)",
 		{ runlocals = runlocals, upvals = upvals, toplevel = true, funcsrc = funcsrc, funcline = funcline }
 	)
-	o[#o + 1] = "return { run = run, loopPc = loopPc, stmtPc = stmtPc }"
+	o[#o + 1] = ("return { run = run, loopPc = loopPc, stmtPc = stmtPc%s }"):format(
+		EF.alias_static and ", alias_static = true" or ""
+	)
 	return table.concat(o, "\n") .. "\n"
 end
 

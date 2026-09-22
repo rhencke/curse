@@ -191,11 +191,26 @@ local function modcache_put(path, m)
 	modcache[path] = m; modcache_n = modcache_n + 1
 end
 
+-- A compiled module bakes in the alias expansion a from-scratch parse would do. If the
+-- shell STARTS with aliases already in play (`-O expand_aliases`, or aliases from an rc/
+-- BASH_ENV file), that assumption is off for scripts that define aliases — or for every
+-- script when some are already defined — so interpret instead (always correct).
+local function alias_mismatch(mod, sh)
+	if not (sh.shopt and sh.shopt.expand_aliases) then
+		return false
+	end
+	return mod.alias_static or (sh.aliases and next(sh.aliases) ~= nil)
+end
+
 function M.run_tiered(src, sh)
 	local Cache = require("cache")
 	local path = Cache.artifact_path(src)
 	if path then
 		local cached = modcache_get(path)
+		if cached and alias_mismatch(cached, sh) then
+			I.run_lazy(sh, src)
+			return sh, "interp"
+		end
 		if cached then -- in-process hit: no disk read, no module rebuild
 			I.finish_run(sh, function()
 				M.run_compiled(cached, sh, nil)
@@ -204,6 +219,10 @@ function M.run_tiered(src, sh)
 		end
 	end
 	local mod = Cache.load(path)
+	if mod and alias_mismatch(mod, sh) then
+		I.run_lazy(sh, src)
+		return sh, "interp"
+	end
 	if mod then
 		if path then modcache_put(path, mod) end -- memoize the instantiated module
 		I.finish_run(sh, function()
@@ -218,7 +237,7 @@ function M.run_tiered(src, sh)
 		local chunk = load(code, "=curse:compiled")
 		if chunk then
 			local built, m = pcall(chunk)
-			if built and type(m) == "table" and m.run then
+			if built and type(m) == "table" and m.run and not alias_mismatch(m, sh) then
 				local okd, bc = pcall(string.dump, chunk, true)
 				Cache.store(path, okd and bc or code) -- populate for the next (warm) run
 				if path then modcache_put(path, m) end -- and keep it in-process for this worker
@@ -226,7 +245,7 @@ function M.run_tiered(src, sh)
 			end
 		end
 	end
-	I.run(sh, P.parse(src)) -- fallback: always correct
+	I.run_lazy(sh, src) -- fallback: the interpreter's line-at-a-time parse, always correct
 	return sh, "interp"
 end
 
