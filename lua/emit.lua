@@ -372,6 +372,12 @@ local function trap_cmd_sigs_pseudo(st)
 	for j = k, #words do
 		rest[#rest + 1] = words[j]
 	end
+	-- `trap - SIG…` (reset to default) and `trap '' SIG…` (ignore) install no HANDLER — an
+	-- ignored disposition is inherited by real subshells anyway — so only a real action on a
+	-- real signal can deliver asynchronously into an in-process body.
+	if #rest >= 2 and (rest[1] == "-" or rest[1] == "") then
+		return true
+	end
 	-- `trap ACTION SIG…` (first word is the action) or `trap SIG` (reset); check every
 	-- word that could be a signal spec
 	local from = #rest >= 2 and 2 or 1

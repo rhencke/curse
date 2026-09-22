@@ -509,6 +509,10 @@ local function serve()
 	-- MAXW). Overflow workers idle out like any other and aren't replenished past POOL, so
 	-- the pool shrinks back on its own.
 	local live, pidslot, used = 0, {}, {}
+	-- A pidfd per worker (readable once it exits), polled with the listen socket, so a worker
+	-- that exits — retired after a request lowered a hard rlimit, crashed — is replaced RIGHT
+	-- AWAY instead of on the next connection (which would otherwise wait for the fork).
+	local pidfds = {} -- slot -> pidfd
 	local function spawn()
 		local slot
 		for i = 0, MAXW - 1 do
@@ -523,12 +527,19 @@ local function serve()
 		busy[slot] = 0
 		local pid = C.fork()
 		if pid == 0 then
+			for _, pfd in pairs(pidfds) do -- siblings' pidfds are the parent's business
+				C.close(pfd)
+			end
 			worker_main(lfd, my_uid, ctx, slot)
 			C._exit(0)
 		end -- worker_main loops (persistent)
 		if pid > 0 then
 			live = live + 1
 			used[slot], pidslot[pid] = true, slot
+			local pfd = tonumber(C.syscall(434, ffi.new("int", pid), ffi.new("unsigned int", 0))) -- pidfd_open
+			if pfd and pfd >= 0 then
+				pidfds[slot] = pfd
+			end
 		end
 	end
 	for _ = 1, POOL do
@@ -536,7 +547,7 @@ local function serve()
 	end
 
 	local st = ffi.new("int[1]")
-	local lp = ffi.new("struct curse_d_pollfd[1]")
+	local lp = ffi.new("struct curse_d_pollfd[?]", MAXW + 1)
 	while live > 0 do
 		while true do -- reap exited workers (a worker only exits on idle-timeout or crash)
 			local pid = tonumber(C.waitpid(-1, st, WNOHANG))
@@ -546,6 +557,10 @@ local function serve()
 			local slot = pidslot[pid]
 			if slot then
 				pidslot[pid], used[slot] = nil, nil
+				if pidfds[slot] then
+					C.close(pidfds[slot])
+					pidfds[slot] = nil
+				end
 				busy[slot] = 0
 				live = live - 1
 				local code = math.floor(tonumber(st[0]) / 256) % 256
@@ -568,7 +583,13 @@ local function serve()
 			break
 		end
 		lp[0].fd, lp[0].events, lp[0].revents = lfd, 1, 0
-		if C.curse_d_poll(lp, 1, 1000) > 0 then -- a connection is pending
+		local np = 1
+		for _, pfd in pairs(pidfds) do
+			lp[np].fd, lp[np].events, lp[np].revents = pfd, 1, 0
+			np = np + 1
+		end
+		-- a worker exit (pidfd readable) just loops back to the reap/respawn above
+		if C.curse_d_poll(lp, np, 1000) > 0 and lp[0].revents ~= 0 then -- a connection is pending
 			local nbusy = 0
 			for slot in pairs(used) do
 				if busy[slot] ~= 0 then
