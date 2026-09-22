@@ -1258,7 +1258,7 @@ end
 -- Compile `stmts` into an inline fragment closure cs_N (reads sh directly, lift set
 -- {}) and return its id, or nil if the body hits a compiler gap. Shared by $(…),
 -- background, and pipeline stages — the compiled tier's "run this subprogram" unit.
-local function emit_fragment(stmts, neg)
+local function emit_fragment(stmts, neg, liftset)
 	local saved_tl, saved_neg, saved_line = emit_toplevel, emit_neg_ctx, EF.cur_line
 	if neg then
 		emit_neg_ctx = true
@@ -1266,7 +1266,13 @@ local function emit_fragment(stmts, neg)
 	-- a `!`-inverted command must NOT inline a called function (its body keeps its own
 	-- errexit, checked in fn_x — which is built separately, unaffected by emit_neg_ctx).
 	local inlfns = neg and {} or emit_frag_ctx.inlinefns
-	local bok, cfg = pcall(build_cfg, stmts, {}, emit_frag_ctx.funcflags, inlfns, false)
+	-- `liftset` (in-process subshell only): compile the fragment WITH the program's lift
+	-- set so it reads/writes the SAME native-int64 upvalues as the module's functions —
+	-- otherwise the fragment (sh.vars) and a called function (v_x upvalue) desync. The
+	-- caller does the swap-save/restore of those upvalues for isolation. Other fragments
+	-- ($(…)/pipeline/background) pass nil: they keep every var in sh (forked children own
+	-- their copy; a lifted local would neither see nor sync the caller's real sh var).
+	local bok, cfg = pcall(build_cfg, stmts, liftset or {}, emit_frag_ctx.funcflags, inlfns, false)
 	emit_toplevel, emit_neg_ctx, EF.cur_line = saved_tl, saved_neg, saved_line
 	if not bok then
 		return nil
@@ -1322,6 +1328,12 @@ end
 -- Fork-forcing per-subshell specials: their value/identity differs in a real child,
 -- so a subshell that READS one must genuinely fork (see runtime subshell_run).
 local SUBSHELL_FORK_VARS = { BASHPID = 1, BASH_SUBSHELL = 1, RANDOM = 1, SRANDOM = 1 }
+-- Builtins that mutate PROCESS-GLOBAL state a fork isolates for free but subshell_run
+-- does NOT checkpoint: `exec` (fds/process image), `ulimit` (rlimits), `enable`/`disable`
+-- (the builtin table), and `set` (the shell -o options — `body_runs_set` only catches it
+-- in the DIRECT body, so this also covers `set` reached through a called function via the
+-- unsafe-fn fixpoint). A subshell that runs one of these — directly or in a callee — forks.
+local SUBSHELL_FORK_BUILTINS = { exec = 1, ulimit = 1, enable = 1, disable = 1, set = 1 }
 local function word_forces_fork(w)
 	if not w or not w.parts then return false end
 	for _, p in ipairs(w.parts) do
@@ -1338,28 +1350,32 @@ local function words_force_fork(ws)
 	return false
 end
 -- Can a subshell body run IN-PROCESS (checkpoint/restore) rather than fork? Only when
--- nothing in it needs a real child process: no `exec`, no background `&`, no funcdef,
--- no user-function CALL (a function may exec/& — conservative in v1), and no read of a
--- per-subshell special. `set` is gated by the caller (body_runs_set) and traps by the
--- program-wide EF flags. Nested subshells and $(…) are their OWN scope — opaque here
--- (each self-gates). Any unrecognized statement type forks, to stay safe.
+-- nothing in it needs a REAL child process: no `exec`, no background `&`, no funcdef,
+-- no dynamic command word (could resolve to exec/an unsafe function), no read of a
+-- per-subshell special, and no call to a SUBSHELL-UNSAFE function (`unsafe` — those that
+-- transitively exec/&/read-a-special; M.emit's call-graph fixpoint computes it). A SAFE
+-- function call runs in-process: its shell-var mutations land in subshell_run's var-copy
+-- and its native-int64 (lifted) mutations are swap-saved/restored by the caller, so state
+-- has full parity. `set` is gated by the caller (body_runs_set); traps by program-wide EF.
+-- Nested subshells and $(…) are their OWN scope — opaque here (each self-gates).
 local subshell_stmt_inproc_ok
-local function subshell_list_inproc_ok(list, ff)
-	ff = ff or (emit_frag_ctx and emit_frag_ctx.funcflags) or {} -- caller passes {} for a nested list
+local function subshell_list_inproc_ok(list, unsafe)
+	unsafe = unsafe or EF.sub_unsafe_fn or {}
 	for _, st in ipairs(list) do
-		if not subshell_stmt_inproc_ok(st, ff) then return false end
+		if not subshell_stmt_inproc_ok(st, unsafe) then return false end
 	end
 	return true
 end
-function subshell_stmt_inproc_ok(st, ff)
+function subshell_stmt_inproc_ok(st, unsafe)
 	local t = st.t
 	if t == "background" or t == "funcdef" then return false end
 	if t == "subshell" then return true end -- its own scope; self-gates
 	if t == "simple" then
 		local w1 = st.words and st.words[1]
 		local c = w1 and w1.parts[1] and #w1.parts == 1 and w1.parts[1].lit
-		if c == "exec" then return false end
-		if c and ff[c] then return false end -- user-function call
+		if not c then return false end -- dynamic command word: could be exec / an unsafe fn
+		if SUBSHELL_FORK_BUILTINS[c] then return false end -- process-global mutator (exec/ulimit/set/…)
+		if unsafe[c] then return false end -- call to a subshell-unsafe user function
 		if words_force_fork(st.words) then return false end
 		if st.assigns then
 			for _, a in ipairs(st.assigns) do if a.rhs and word_forces_fork(a.rhs) then return false end end
@@ -1370,36 +1386,66 @@ function subshell_stmt_inproc_ok(st, ff)
 	elseif t == "assignlist" or t == "arrayassign" then
 		return not words_force_fork(st.words)
 	elseif t == "pipeline" then
-		return subshell_list_inproc_ok(st.cmds, ff)
+		return subshell_list_inproc_ok(st.cmds, unsafe)
 	elseif t == "andor" then
-		for _, it in ipairs(st.items) do if not subshell_stmt_inproc_ok(it.cmd, ff) then return false end end
+		for _, it in ipairs(st.items) do if not subshell_stmt_inproc_ok(it.cmd, unsafe) then return false end end
 		return true
 	elseif t == "if" then
 		for _, cl in ipairs(st.clauses) do
-			if not subshell_list_inproc_ok(cl.cond, ff) then return false end
-			if not subshell_list_inproc_ok(cl.body, ff) then return false end
+			if not subshell_list_inproc_ok(cl.cond, unsafe) then return false end
+			if not subshell_list_inproc_ok(cl.body, unsafe) then return false end
 		end
 		return true
 	elseif t == "case" then
 		if word_forces_fork(st.subject) then return false end
 		for _, cl in ipairs(st.clauses) do
-			if not subshell_list_inproc_ok(cl.body, ff) then return false end
+			if not subshell_list_inproc_ok(cl.body, unsafe) then return false end
 		end
 		return true
 	elseif t == "whilec" then
-		return subshell_list_inproc_ok(st.cond, ff) and subshell_list_inproc_ok(st.body, ff)
+		return subshell_list_inproc_ok(st.cond, unsafe) and subshell_list_inproc_ok(st.body, unsafe)
 	elseif t == "forin" then
-		return not words_force_fork(st.words) and subshell_list_inproc_ok(st.body, ff)
+		return not words_force_fork(st.words) and subshell_list_inproc_ok(st.body, unsafe)
 	elseif t == "forc" then
-		return subshell_list_inproc_ok(st.body, ff)
+		return subshell_list_inproc_ok(st.body, unsafe)
 	elseif t == "group" then
-		return subshell_list_inproc_ok(st.body, ff)
+		return subshell_list_inproc_ok(st.body, unsafe)
 	elseif t == "arithcmd" or t == "dbracket" then
 		return true -- test/arith: no exec/funccall (a special there only affects isolated state)
 	end
 	return false -- unknown type: fork to be safe
 end
 EF.subshell_inproc_ok = subshell_list_inproc_ok -- flatten_stmt calls it via EF (upvalue cap)
+-- Does the program contain ANY subshell that will run in-process? (Needs EF.sub_unsafe_fn
+-- set first.) If so, every lifted native-int64 var must be a module upvalue so the
+-- in-process fragment can reach it — see the run-local/upval split in M.emit. This is a
+-- superset of what actually compiles in-process (it can't foresee an emit_fragment gap or
+-- an uncompilable redirect), which only ever over-forces upvals — never misses one.
+local function scan_inproc_subshell(stmts)
+	for _, st in ipairs(stmts) do
+		local t = st.t
+		if t == "subshell" then
+			if #st.body > 0 and not body_runs_set(st.body) and subshell_list_inproc_ok(st.body) then
+				return true
+			end
+			if scan_inproc_subshell(st.body) then return true end
+		elseif t == "pipeline" then
+			if scan_inproc_subshell(st.cmds) then return true end
+		elseif t == "andor" then
+			for _, it in ipairs(st.items) do if scan_inproc_subshell({ it.cmd }) then return true end end
+		elseif t == "if" then
+			for _, cl in ipairs(st.clauses) do
+				if scan_inproc_subshell(cl.cond) or scan_inproc_subshell(cl.body) then return true end
+			end
+		elseif t == "case" then
+			for _, cl in ipairs(st.clauses) do if scan_inproc_subshell(cl.body) then return true end end
+		elseif st.body then
+			if scan_inproc_subshell(st.body) then return true end
+		end
+	end
+	return false
+end
+EF.scan_inproc_subshell = scan_inproc_subshell -- M.emit calls it via EF (upvalue cap)
 local function compile_cmdsub(src, backtick, lifted)
 	local fallback = ("sh:capture_src(%q%s)"):format(src, backtick and ", true" or "")
 	local pok, ast = pcall(require("parser").parse, src)
@@ -2962,6 +3008,46 @@ local function analyze_lift(ast)
 		return {}
 	end
 	local assigned, disq, localed = {}, {}, {}
+	-- A subshell can run IN-PROCESS, where an upval-lifted var lives in v_x but `unset`/
+	-- `declare`/`readonly`/`export`/`typeset`/an indexed-or-array assign all act on sh.vars —
+	-- so such a var would desync. Disqualify it from lifting (only the DISQUALIFIERS matter
+	-- here; a plain arith assign inside the subshell is fine — the fragment shares the upval).
+	-- Not added to `assigned`, so a subshell-only var still never lifts (no spurious flush).
+	local function disq_scan(stmts)
+		for _, st in ipairs(stmts) do
+			local t = st.t
+			if t == "assign" then
+				if st.index or st.append or (not st.arith and not (st.rhs and numeric_word(st.rhs))) then
+					disq[st.name] = true
+				end
+			elseif t == "arrayassign" then
+				disq[st.name] = true
+			elseif t == "simple" then
+				local cmd = st.words[1] and st.words[1].parts[1] and st.words[1].parts[1].lit
+				if cmd == "local" or cmd == "readonly" or cmd == "declare" or cmd == "typeset"
+					or cmd == "export" or cmd == "unset" then
+					for j = 2, #st.words do
+						local p1 = st.words[j].parts[1]
+						local nm = p1 and p1.lit and p1.lit:match("^([%a_][%w_]*)")
+						if nm then disq[nm] = true end
+					end
+				end
+			elseif t == "forin" then
+				disq[st.name] = true
+				disq_scan(st.body)
+			elseif t == "pipeline" then
+				disq_scan(st.cmds)
+			elseif t == "andor" then
+				for _, it in ipairs(st.items) do disq_scan({ it.cmd }) end
+			elseif t == "if" then
+				for _, cl in ipairs(st.clauses) do disq_scan(cl.cond); disq_scan(cl.body) end
+			elseif t == "case" then
+				for _, cl in ipairs(st.clauses) do disq_scan(cl.body) end
+			elseif st.body then
+				disq_scan(st.body)
+			end
+		end
+	end
 	local function scan(stmts)
 		for _, st in ipairs(stmts) do
 			if st.t == "assign" then
@@ -3018,6 +3104,8 @@ local function analyze_lift(ast)
 				end
 			elseif st.t == "funcdef" then
 				scan(st.body)
+			elseif st.t == "subshell" or st.t == "group" then
+				disq_scan(st.body) -- in-process subshell: disqualify vars it unset/attributes
 			end
 		end
 	end
@@ -5219,21 +5307,39 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
 			if not (EF.has_err or EF.has_debug or EF.has_trap)
 				and not EF.has_dyncode
 				and #st.body > 0
+				and (EF.lifted_set ~= nil or not EF.has_lifted)
 				and EF.subshell_inproc_ok(st.body)
 			then
 				local saved_ssx = EF.subshell_exit_pc
 				EF.subshell_exit_pc = nil
-				local id = emit_fragment(st.body)
+				-- Compile the body WITH the program lift set so it shares the module's lifted
+				-- upvalues with any function it calls (no sh.vars-vs-upvalue desync).
+				local id = emit_fragment(st.body, nil, EF.lifted_set)
 				EF.subshell_exit_pc = saved_ssx
 				if id then
 					local p = newpc()
 					local ec = errchk(st)
 					local ecs = ec ~= "" and ("; " .. ec) or ""
+					-- Swap game: save every lifted upvalue, run the (isolating) subshell, then
+					-- restore — so a body/function mutation to a native-int64 var never escapes.
+					-- subshell_run swallows exit/return, so the restore always runs.
+					local swpre, swpost = "", ""
+					local ln = EF.lifted_names or {}
+					if #ln > 0 then
+						local sav, vs = {}, {}
+						for i, n in ipairs(ln) do
+							sav[i] = "__sv" .. i
+							vs[i] = lname(n)
+						end
+						local vlist = table.concat(vs, ", ")
+						swpre = ("local %s = %s; "):format(table.concat(sav, ", "), vlist)
+						swpost = ("; %s = %s"):format(vlist, table.concat(sav, ", "))
+					end
 					if sub_redir then
-						blocks[p] = ("local __rs = {}; if %s then sh:subshell_run(cs_%d, __rs) else rt.redir_restore(__rs); sh.status = 1 end%s; pc = %d"):format(
-							sub_redir, id, ecs, after)
+						blocks[p] = ("%slocal __rs = {}; if %s then sh:subshell_run(cs_%d, __rs) else rt.redir_restore(__rs); sh.status = 1 end%s%s; pc = %d"):format(
+							swpre, sub_redir, id, swpost, ecs, after)
 					else
-						blocks[p] = ("sh:subshell_run(cs_%d)%s; pc = %d"):format(id, ecs, after)
+						blocks[p] = ("%ssh:subshell_run(cs_%d)%s%s; pc = %d"):format(swpre, id, swpost, ecs, after)
 					end
 					return p
 				end
@@ -5832,6 +5938,32 @@ function M.emit(ast, opts)
 	local lifted = EF.fragment and {} or analyze_lift(ast)
 	local funcTouched = {}
 	collect_funcvars(ast.stmts, funcTouched, inlinable)
+
+	-- Subshell in-process call-graph safety. A `( … )` that calls a user function runs
+	-- fork-free IFF the function needs no real child: no exec/&/special/dynamic-command,
+	-- and it only calls other SAFE functions. Its shell-var mutations are copy-isolated by
+	-- subshell_run; its native-int64 (lifted) mutations are swap-saved by the caller — so
+	-- state has full parity. Delegated functions (redef/nested/builtin-shadow) run via the
+	-- interpreter and may do anything → unsafe. Monotone fixpoint over the compiled funcdefs.
+	do
+		local unsafe = {}
+		for name in pairs(emit_redir_funcs) do unsafe[name] = true end
+		local bodies = {}
+		for _, st in ipairs(ast.stmts) do
+			if st.t == "funcdef" and funcflags[st.name] then bodies[st.name] = st.body end
+		end
+		local changed = true
+		while changed do
+			changed = false
+			for name, body in pairs(bodies) do
+				if not unsafe[name] and not EF.subshell_inproc_ok(body, unsafe) then
+					unsafe[name] = true
+					changed = true
+				end
+			end
+		end
+		EF.sub_unsafe_fn = unsafe
+	end
 	local upvals, runlocals = {}, {}
 	for n in pairs(lifted) do
 		if funcTouched[n] then
@@ -5846,6 +5978,19 @@ function M.emit(ast, opts)
 	for _, n in ipairs(upvals) do
 		upset[n] = true
 	end
+	-- In-process subshell native-int64 handling. An in-process `( … )` fragment must share
+	-- the SAME storage for a lifted var as any function it calls, or the two desync. Only
+	-- UPVAL-lifted vars (funcTouched) are visible to both the fragment closure and an fn_x,
+	-- so the fragment lifts exactly those (EF.lifted_set = upset), and the caller swap-saves
+	-- them around the run for isolation (EF.lifted_names). A RUN-LOCAL lifted var is touched
+	-- by no out-of-line function, so the fragment keeps it in sh (subshell_run copy-isolates
+	-- it) and it stays register-allocated in run() — no perf hit for subshell-free hot loops.
+	local has_inproc_subshell = not (EF.has_err or EF.has_debug or EF.has_trap or EF.has_dyncode)
+		and not EF.fragment
+		and EF.scan_inproc_subshell(ast.stmts)
+	EF.lifted_set = has_inproc_subshell and upset or nil
+	EF.lifted_names = upvals -- swap-save/restore list for in-process subshells (the upvals)
+	EF.has_lifted = #upvals > 0 -- a nil lifted_set is only unsafe in-process when an upval could desync
 
 	emit_frag_ctx = { funcflags = funcflags, inlinefns = inlinefns } -- context for compile_cmdsub's build_cfg
 
