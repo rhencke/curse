@@ -153,7 +153,7 @@ end
 -- "$*" in a string context: params joined by IFS[0] (space if IFS unset, nothing
 -- if IFS is set but empty) — bash. "$@" always joins by a literal space.
 function Shell:paramsStar()
-	return self:paramsJoin(self.vars["IFS"] and self:get("IFS"):sub(1, 1) or " ")
+	return self:paramsJoin(self.vars["IFS"] and M.ifs_first(self:get("IFS")) or " ")
 end
 -- The positional params as a fresh 1-based list (for the field engine's $@/$* segments).
 function Shell:paramList()
@@ -1513,7 +1513,7 @@ end
 local function copybox(b)
 	local nb = {
 		s = b.s, n = b.n, assoc = b.assoc, exported = b.exported, ref = b.ref,
-		lower = b.lower, upper = b.upper, ro = b.ro, int = b.int, empty_decl = b.empty_decl,
+		lower = b.lower, upper = b.upper, cap = b.cap, ro = b.ro, int = b.int, empty_decl = b.empty_decl,
 	}
 	if b.arr then
 		local a = {}
@@ -2126,11 +2126,16 @@ local function co_launch(ctx, self, stage_fns, inproc, base, lastpipe, upv)
 		ctx.runnable[#ctx.runnable + 1] = t
 		g.alive = g.alive + 1
 	end
-	local function stage_body(fn, sh, t)
+	local function stage_body(fn, sh, t, islp)
 		return function()
 			local ok, err = pcall(fn, sh)
 			if not ok and type(err) == "table" and err.__curse_sigpipe then
 				return 141
+			end
+			-- the lastpipe stage IS the shell: its `exit`/`return` leaves the shell/function
+			-- (re-raised once the pipeline finishes)
+			if islp and not ok and type(err) == "table" and (err.__curse_exit or err.__curse_return) then
+				g.lp_raise = err
 			end
 			M.child_status(sh, ok, err)
 			local fok, ferr = pcall(task_flush, t)
@@ -2154,7 +2159,7 @@ local function co_launch(ctx, self, stage_fns, inproc, base, lastpipe, upv)
 			-- persist). Its clones-to-be were all taken above, so rebinding out is safe.
 			g.lp, g.lp_out = t, self.out
 			self.out = make_out(t)
-			add(t, stage_body(fn, self, t))
+			add(t, stage_body(fn, self, t, true))
 		elseif inproc[i] then
 			local sh = self:stage_clone()
 			sh.out = make_out(t)
@@ -2359,6 +2364,9 @@ function Shell:run_pipeline_co(stage_fns, inproc, lastpipe, upv_get, upv_set)
 			return nil
 		end
 		co_finish(ctx, self, g)
+		if g.lp_raise then -- the lastpipe stage exited/returned: so does the shell/function
+			error(g.lp_raise, 0)
+		end
 		return true
 	end
 
@@ -2459,6 +2467,9 @@ function Shell:run_pipeline_co(stage_fns, inproc, lastpipe, upv_get, upv_set)
 	ctx.cur_cwd = P.cwd
 	if ok_all and g then
 		co_finish(ctx, self, g)
+		if g.lp_raise then -- the lastpipe stage exited/returned: so does the shell/function
+			error(g.lp_raise, 0)
+		end
 		if upv and not g.lp then
 			upv.set(unpack(P.upv, 1, upv.n)) -- stages swapped them; the parent's are back
 		end
@@ -3200,6 +3211,17 @@ function Shell:special_get(name)
 	if name == "PPID" then
 		return tostring(tonumber(ffi.C.getppid()))
 	end
+	if name == "EPOCHSECONDS" then
+		return tostring(os.time())
+	end
+	if name == "EPOCHREALTIME" then
+		local tv = ffi.new("struct curse_rt_timeval")
+		C.curse_rt_gettimeofday(tv, nil)
+		return ("%d.%06d"):format(tonumber(tv.tv_sec), tonumber(tv.tv_usec))
+	end
+	if name == "BASH_ARGV0" then -- reads as $0 (assigning it sets $0: set_str)
+		return self.argv0 or ""
+	end
 	if name == "UID" then
 		return tostring(tonumber(ffi.C.getuid()))
 	end
@@ -3354,6 +3376,9 @@ function Shell:attr_string(name)
 	if b.upper then
 		s = s .. "u"
 	end
+	if b.cap then
+		s = s .. "c"
+	end
 	if b.ref then
 		s = s .. "n"
 	end
@@ -3497,10 +3522,20 @@ function Shell:set_str(name, s)
 	end -- bash vars are C strings: cut at NUL
 	local dn = self:deref(name)
 	local b = box(dn, self.vars)
+	if b.lower then -- declare -l / -u / -c: the value is case-folded on every assignment
+		s = s:lower()
+	elseif b.upper then
+		s = s:upper()
+	elseif b.cap then
+		s = s:sub(1, 1):upper() .. s:sub(2):lower()
+	end
 	b.s = s
 	b.n = nil
 	if dn == "OPTIND" and self.getopts_state then
 		self.getopts_state[b] = nil -- assigning OPTIND resets getopts' in-argument position (bash)
+	end
+	if dn == "BASH_ARGV0" then
+		self.argv0 = s -- assigning BASH_ARGV0 sets $0 (bash)
 	end
 	if b.exported then
 		C.setenv(dn, s, 1)
@@ -3588,6 +3623,11 @@ end
 function Shell:aset(name, n)
 	local dn = self:deref(name)
 	local b = box(dn, self.vars)
+	if b.ro then -- an arithmetic write to a readonly var is an arith error (bash): `((x=5))`/let
+		-- fail with status 1, a `$((x++))` expansion discards the rest of the line
+		io.stderr:write("curse: " .. dn .. ": readonly variable\n")
+		error({ __curse_exit = 1, __curse_matherr = true, __curse_lineabort = true })
+	end
 	if dn == "OPTIND" and self.getopts_state then
 		self.getopts_state[b] = nil
 	end
@@ -4754,6 +4794,17 @@ function M.names_static(sh, plain, fnames, fvals)
 	end
 	return true
 end
+-- The first CHARACTER of IFS (the "$*" / "${a[*]}" join separator): a whole multibyte
+-- character in a UTF-8 locale (IFS=é joins with é, not its first byte).
+function M.ifs_first(ifs)
+	if ifs == "" then
+		return ""
+	end
+	if ifs:byte(1) >= 0x80 and M.lc_mb_cur_max() > 1 then
+		return ifs:sub(1, M.mb_charlen(ifs, 1))
+	end
+	return ifs:sub(1, 1)
+end
 -- Non-dot entry names of directory `path` (what `ls -1` lists), unsorted; {} if unreadable.
 function M.dir_names(path)
 	local out = {}
@@ -5196,7 +5247,7 @@ function M.expand_fields(sh, segs)
 			local els = seg.elems
 			if seg.q then
 				if seg.star then
-					add(table.concat(els, ifs:sub(1, 1)), false)
+					add(table.concat(els, M.ifs_first(ifs)), false)
 				else
 					for k = 1, #els do
 						if k > 1 then
@@ -5213,7 +5264,7 @@ function M.expand_fields(sh, segs)
 					feed_split(els[k])
 				end
 			else
-				feed_split(table.concat(els, ifs:sub(1, 1)))
+				feed_split(table.concat(els, M.ifs_first(ifs)))
 			end
 		elseif seg.split then
 			feed_split(seg.s)
@@ -6854,7 +6905,7 @@ end
 -- ${a[*]:-…} / ${*:-…} null test for the QUOTED-star form: the IFS[0]-joined string is
 -- non-empty (interp multi_elems `star and p.q` branch). Empty IFS joins with no separator.
 function M.ifs_join_ne(sh, els)
-	local sep = sh.vars["IFS"] and sh:get("IFS"):sub(1, 1) or " "
+	local sep = sh.vars["IFS"] and M.ifs_first(sh:get("IFS")) or " "
 	return table.concat(els, sep) ~= ""
 end
 

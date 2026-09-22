@@ -25,10 +25,11 @@ return function(sh, cmd, args, hook, tcb)
 		local doexport, assoc, printmode, nref, plusn = (cmd == "export"), false, false, false, false
 		local plusx, gflag, unexport = false, false, false
 		local funcnames, funcbody, iattr, lattr, uattr, rattr, aattr = false, false, false, false, false, false, false
+		local cattr = false -- declare -c: capitalize (first char upper, rest lower)
 		local rest = {}
 		-- Valid attribute letters per command; any other letter is an invalid option
 		-- (bash: status 2, or 1 for `local`). export/readonly accept a narrower set.
-		local VALID = (cmd == "export" or cmd == "readonly") and "afnpA" or "aAfFgilnprtuxI"
+		local VALID = (cmd == "export" or cmd == "readonly") and "afnpA" or "aAcfFgilnprtuxI"
 		local opterr, endopts = nil, false
 		for j = 2, #args do
 			local a = args[j]
@@ -76,6 +77,9 @@ return function(sh, cmd, args, hook, tcb)
 				end
 				if a:find("u") then
 					uattr = true
+				end
+				if a:find("c") then
+					cattr = true
 				end
 				if a:find("r") then
 					rattr = true
@@ -276,11 +280,12 @@ return function(sh, cmd, args, hook, tcb)
 							sh:aset(nm, eval(sh, P.arith(val)))
 						end
 						sh.vars[nm].int = true
-					elseif lattr or uattr then -- declare -l/-u: lower/upper case attribute
-						local nv = lattr and val:lower() or val:upper()
-						sh:set_str(nm, ap and (sh:get(nm) .. nv) or nv)
+					elseif lattr or uattr or cattr then -- declare -l/-u/-c: case attribute (set_str folds)
+						sh.vars[nm] = sh.vars[nm] or {}
 						sh.vars[nm].lower = lattr or nil
 						sh.vars[nm].upper = uattr or nil
+						sh.vars[nm].cap = cattr or nil
+						sh:set_str(nm, ap and (sh:get(nm) .. val) or val)
 					else
 						local eb = sh.vars[sh:deref(nm)]
 						if eb and eb.arr and not eb.assoc and not assoc then -- scalar (+)= on an indexed array -> element 0
@@ -330,10 +335,11 @@ return function(sh, cmd, args, hook, tcb)
 					elseif iattr then
 						sh.vars[a] = sh.vars[a] or {}
 						sh.vars[a].int = true
-					elseif lattr or uattr then
+					elseif lattr or uattr or cattr then
 						sh.vars[a] = sh.vars[a] or {}
 						sh.vars[a].lower = lattr or nil
 						sh.vars[a].upper = uattr or nil
+						sh.vars[a].cap = cattr or nil
 					elseif assoc and cmd ~= "readonly" then -- bash forbids converting an existing indexed array to associative
 						-- (`readonly -A` with NO value does NOT apply the attribute — bash then
 						-- shows just `declare -r`, so let it fall through to the plain-var branch)

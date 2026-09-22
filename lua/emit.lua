@@ -4882,7 +4882,9 @@ H.arithcmd = function(cx, st, after)
 	local code = emit_arith_into("__ar", st.expr, cx.lifted)
 	arith_varread = saved
 	local sbody -- the status-setting body (redirect-wrapped below when present)
-	if arith_can_div_fault(st.expr) then
+	-- (a write to a READONLY var raises the same matherr — only possible in a program that
+	-- sets attributes, so ordinary `((i++))` loops keep the inline form)
+	if arith_can_div_fault(st.expr) or (EF.has_attr and arith_side_effect(st.expr)) then
 		-- ÷0 / mod-0 / negative ** THROW a non-fatal matherr — catch it (and any
 		-- flagged read fault) as $?=1 and continue, like interp; re-raise anything else.
 		sbody = (
@@ -6017,6 +6019,9 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
 	-- Build blocks for `st`; its exit flows to pc `after`. Returns st's entry pc.
 	function cx.flatten_stmt(st, after)
 		local t = st.t
+		if t == "noop" then
+			return after
+		end
 		if st.line then
 			EF.cur_line = st.line
 		end -- for $LINENO (compile-time constant)

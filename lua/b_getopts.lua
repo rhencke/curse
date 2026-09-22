@@ -20,6 +20,19 @@ return function(sh, cmd, args, hook, tcb)
 	if cmd == "getopts" then
 		-- getopts OPTSTRING NAME [args…]: parse one option per call using OPTIND (+ an
 		-- internal char cursor for bundled opts); sets NAME, OPTARG; status 1 when done.
+		-- getopts optstring name [arg …]: too few args, or an option to getopts itself
+		-- (`getopts -a …`), is a usage error — status 2 (bash)
+		if args[2] and args[2]:match("^%-.") and args[2] ~= "--" then
+			io.stderr:write("curse: getopts: " .. args[2]:sub(1, 2) .. ": invalid option\n")
+			io.stderr:write("getopts: usage: getopts optstring name [arg ...]\n")
+			sh.status = 2
+			return
+		end
+		if #args < 3 then
+			io.stderr:write("getopts: usage: getopts optstring name [arg ...]\n")
+			sh.status = 2
+			return
+		end
 		local spec, vname = args[2] or "", args[3] or "?"
 		local silent = spec:sub(1, 1) == ":"
 		local src_get, src_n

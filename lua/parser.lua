@@ -1890,12 +1890,37 @@ local function make_parser(src, sh, aenv)
 			end
 			alias_seen[cand] = true
 			local L = re - rs + 1
-			src = src:sub(1, rs - 1) .. val .. src:sub(re + 1)
+			-- the end of an expansion delimits the token (bash mk_alexpansion adds a space) —
+			-- `alias foo='echo 0'; foo>&2` is `echo 0 >&2`, not `echo 0>&2` — except after a
+			-- trailing backslash, which quotes the next input char (`alias a='… \'; a|cat`)
+			local ins = val
+			if ins ~= "" and not ins:match("[ \t\\]$") then
+				-- …and not when the value ends INSIDE an open quote (`alias foo="echo 'Err:"`):
+				-- the quoted string continues into the following input
+				local q, k = nil, 1
+				while k <= #ins do
+					local ch = ins:sub(k, k)
+					if q == "'" then
+						if ch == "'" then q = nil end
+					elseif q == '"' then
+						if ch == "\\" then k = k + 1 elseif ch == '"' then q = nil end
+					elseif ch == "\\" then
+						k = k + 1
+					elseif ch == "'" or ch == '"' then
+						q = ch
+					end
+					k = k + 1
+				end
+				if not q then
+					ins = ins .. " "
+				end
+			end
+			src = src:sub(1, rs - 1) .. ins .. src:sub(re + 1)
 			n = #src
 			if alias_tail == nil then
-				alias_tail = rs + #val
+				alias_tail = rs + #ins
 			else
-				alias_tail = alias_tail + (#val - L)
+				alias_tail = alias_tail + (#ins - L)
 			end
 			alias_next = val:match("[ \t]$") ~= nil
 			expanded = true
@@ -2339,6 +2364,14 @@ local function make_parser(src, sh, aenv)
 		alias_next = false
 		alias_tail = nil
 		try_alias(true)
+		-- an alias that expanded to a comment (`alias c=#`): the rest of the line is a comment
+		-- and there is NO command ($? unchanged)
+		if src:sub(i, i) == "#" then
+			while i <= n and src:sub(i, i) ~= "\n" do
+				i = i + 1
+			end
+			return { t = "noop", line = line }
+		end
 		local dstart, dline = i, line -- byte offset + line where this command (hence a funcdef) begins
 		-- function NAME [()] { … }   or   NAME() { … }
 		-- Function names may contain far more than identifier chars (bash: `show-len`,
@@ -3142,7 +3175,8 @@ local function make_parser(src, sh, aenv)
 			-- empty value (`X= cmd`) must stay empty, not absorb the next word as `word()`
 			-- (which skips blanks) would. Only read when a value actually follows.
 			local c0 = src:sub(i, i)
-			if c0 == "" or c0:match("[ \t\n;&|)#]") then
+			-- (`#` right after `=` is part of the value — `D=#abcd` — not a comment)
+			if c0 == "" or c0:match("[ \t\n;&|)]") then
 				return { t = "assign", name = name, index = subidx, append = (op == "+="), rhs = parse_word("") }
 			end
 			local raw = word(true) -- stop at unquoted ) so `(x=2)` closes the subshell

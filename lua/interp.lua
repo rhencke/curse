@@ -161,7 +161,14 @@ local function sq(s)
 	if s == "" then
 		return "''"
 	end
-	if s:match("^[%w_,.:/@%%+=%-]+$") then
+	if s == "'" then
+		return "\\'" -- bash's sh_single_quote special case
+	end
+	-- bash's sh_contains_shell_metas: blanks, quotes, and the metacharacters anywhere; `~`
+	-- only at the start or after `=`/`:`; `#` only at the start. Otherwise the value is bare.
+	local metas = s:find("[ \t\n'\"\\|&;()<>!{}*%[%]?^$`]") or s:sub(1, 1) == "#" or s:sub(1, 1) == "~"
+		or s:find("[=:]~")
+	if not metas and not s:find("[%c\128-\255]") then
 		return s
 	end
 	return rt.shell_quote(s)
@@ -740,7 +747,14 @@ eval = function(sh, e)
 				error(r)
 			end
 		end
-		return eval(sh, P.arith(expand_word(sh, P.parse_word(e.raw)), true))
+		local text = expand_word(sh, P.parse_word(e.raw))
+		local pok, ast = pcall(P.arith, text, true)
+		if not pok then -- the EXPANDED text isn't valid arithmetic: an arith error (bash), not a crash
+			local tok = text:match("^%s*(.-)%s*$")
+			io.stderr:write("curse: " .. tok .. ": syntax error in expression\n")
+			error({ __curse_exit = 1, __curse_matherr = true, __curse_lineabort = true })
+		end
+		return eval(sh, ast)
 	end
 	if k == "xpandleaf" then -- an opaque ${…} operand: expand it; a non-numeric value must
 		local v = expand_word(sh, P.parse_word(e.raw)) -- take bash's textual substitution path
@@ -1047,7 +1061,7 @@ local function expand_part_str(sh, p, assign)
 		if p.special == "#" then
 			v = tostring(sh.nparams)
 		elseif p.special == "*" then -- $* joins on the first IFS char; $@ always on a space
-			v = sh:paramsJoin(sh.vars["IFS"] and sh:get("IFS"):sub(1, 1) or " ")
+			v = sh:paramsJoin(sh.vars["IFS"] and rt.ifs_first(sh:get("IFS")) or " ")
 		elseif p.special == "@" then
 			v = sh:paramsJoin(" ")
 		elseif p.special == "?" then
@@ -1562,7 +1576,7 @@ local function multi_elems(sh, p) -- returns element list, star?
 			if pe.via_indirect then
 				ne = #els > 0 -- indirect array :-/:+ tests element COUNT, not emptiness (bash)
 			elseif star and p.q then
-				ne = table.concat(els, sh.vars["IFS"] and sh:get("IFS"):sub(1, 1) or " ") ~= ""
+				ne = table.concat(els, sh.vars["IFS"] and rt.ifs_first(sh:get("IFS")) or " ") ~= ""
 			else
 				ne = #els > 1 or (els[1] ~= nil and els[1] ~= "")
 			end
@@ -1771,7 +1785,7 @@ local function expand_to_fields(sh, w)
 			local els, star, qforced = multi_elems(sh, p) -- qforced: a quoted multi alternate
 			if p.q or qforced then
 				if star then -- "$*" / "${a[*]}" join with the first char of IFS
-					local sep = sh.vars["IFS"] and sh:get("IFS"):sub(1, 1) or " "
+					local sep = sh.vars["IFS"] and rt.ifs_first(sh:get("IFS")) or " "
 					add(table.concat(els, sep), false)
 				else
 					for k = 1, #els do
@@ -1793,7 +1807,7 @@ local function expand_to_fields(sh, w)
 					-- BEFORE word-splitting even under IFS='' (unlike `$*`/`${a[*]}`, which
 					-- stay per-element there). Join with IFS[0]; when IFS is empty the prefix
 					-- form concatenates but the KEYS form falls back to a space (bug #627).
-					local sep = sh.vars["IFS"] and sh:get("IFS"):sub(1, 1) or " "
+					local sep = sh.vars["IFS"] and rt.ifs_first(sh:get("IFS")) or " "
 					if sep == "" and pe.op == "indices" then
 						sep = " "
 					end
@@ -1806,7 +1820,7 @@ local function expand_to_fields(sh, w)
 						feed_split(els[k])
 					end
 				else
-					feed_split(table.concat(els, ifs:sub(1, 1)))
+					feed_split(table.concat(els, rt.ifs_first(ifs)))
 				end
 			end
 		elseif
@@ -2718,6 +2732,7 @@ local function fmt_decl(sh, name)
 			.. (os.getenv(name) ~= nil and "x" or "")
 			.. (b.lower and "l" or "")
 			.. (b.upper and "u" or "")
+			.. (b.cap and "c" or "")
 		local pre = "declare " .. (a == "" and "--" or "-" .. a) .. " " .. name
 		if b.s == nil and b.n == nil then
 			return pre
@@ -3810,6 +3825,9 @@ end
 local exec_stmt
 exec_stmt = function(sh, st, hook)
 	local t = st.t
+	if t == "noop" then -- (a command that alias-expanded to a comment)
+		return
+	end
 	-- `time [-p] pipeline` reserved word: run the pipeline (with its own type/negate
 	-- preserved for errexit), then report elapsed real/user/sys to STDERR like bash.
 	if st.timed then
@@ -4726,6 +4744,7 @@ exec_stmt = function(sh, st, hook)
 			-- shell (no fork), so its side effects — e.g. `read var` — persist.
 			local lastpipe = sh.shopt.lastpipe and not sh.opt_i and nst >= 2
 			local pids, prev_read, inline_status = {}, -1, nil
+			local lp_raise = nil
 			for k = 1, nst do
 				-- DEBUG fires before each stage IN THE PARENT (bash: a forked stage's child
 				-- does NOT fire it), but only for a stage that is itself a DEBUG-firing node
@@ -4756,6 +4775,9 @@ exec_stmt = function(sh, st, hook)
 					C.close(save0)
 					if not ok and type(err) == "table" then
 						sh.status = err.__curse_exit or err.__curse_return or sh.status
+						if err.__curse_exit or err.__curse_return then
+							lp_raise = err -- this stage IS the shell: re-raise once the others are reaped
+						end
 					elseif not ok then
 						error(err)
 					end
@@ -4867,6 +4889,9 @@ exec_stmt = function(sh, st, hook)
 			-- last stage does not (only the pipeline fires).
 			if cmds[nst] and cmds[nst].t == "subshell" and last ~= 0 and sh.noerr == 0 then
 				fire_err_trap(sh)
+			end
+			if lp_raise then -- the lastpipe stage exited/returned: so does the shell/function
+				error(lp_raise, 0)
 			end
 		end
 		if st.negate then
