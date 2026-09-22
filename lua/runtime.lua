@@ -2245,6 +2245,35 @@ end
 function M.nameref_read(sh, name)
 	return require("interp")._int.expand_part_str(sh, { var = name })
 end
+-- ${#name} length in a nameref program. bash's parameter_brace_expand_length follows the
+-- nameref to a target VARIABLE (find_variable): a scalar/whole-array/assoc target yields the
+-- length of its value (or element [0]), but a target that is an array/assoc ELEMENT (the ref
+-- string carries a subscript) has no scalar value_cell there, so the length is 0 — a quirk
+-- distinct from ${name#op}, which does the full element deref. Follow the chain: if it ends at
+-- an element ref, 0; otherwise the derefed value's codepoint length (nameref_read = the same
+-- full deref, which for a scalar/whole-array/assoc target is exactly the length source).
+function M.nameref_len(sh, name)
+	local seen, n = nil, name
+	for _ = 1, 100 do
+		local b = sh.vars[n]
+		if not b or not b.ref or b.s == nil or b.s == "" then
+			break
+		end
+		if b.s:find("[", 1, true) then
+			return 0 -- target is an array/assoc element ref
+		end
+		if not b.s:match("^[%a_][%w_]*$") then
+			break -- invalid target name: the ref reads as its own value
+		end
+		if seen and seen[b.s] then
+			break -- ref cycle
+		end
+		seen = seen or {}
+		seen[n] = true
+		n = b.s
+	end
+	return M.mb_strlen(M.nameref_read(sh, name))
+end
 -- Capture-aware error write: inside a `$(...)` capture with `2>&1` active, route
 -- the message into the capture buffer (self.out) so it's captured like bash;
 -- otherwise to real stderr. Mirrors interp's sherr for runtime-side messages.

@@ -1723,6 +1723,16 @@ function pexp_compilable(pe, quoted)
 	end -- strip #/##/%/%% , subst /,// , case-fold ^/^^/,/,,
 	return false
 end
+-- A SCALAR ${..}-OP whose ONLY variable read is the value — length (${#x}), substring
+-- (${x:o:l}), and the strip/subst/case pattern ops — is safe inside a nameref program:
+-- pexp_scalar reads that value nameref-aware (rt.nameref_read = interp's expand_part_str,
+-- the FULL nameref deref incl. an element/assoc target, matching bash's ${x#op}/${#x} on a
+-- scalar/whole-array/assoc nameref). Excludes ${x@..} (reads the var's attrs/set-ness BY
+-- NAME), default/alternate (a set-ness test on the name), an element ${a[i]..}, and array
+-- count — those need name/isset resolution the value read doesn't give, so they delegate.
+local function pexp_nameref_valop(pe)
+	return not pe.index and (pe.op == "len" or pe.op == "sub" or PEXP_STROP[pe.op]) and pexp_compilable(pe)
+end
 -- ${a[@]OP} / ${a[*]OP}: a per-element string-op over the whole array, compiled by
 -- mapping apply_str_op via rt.array_op_values — exactly interp's generic per-element
 -- path (interp.lua multi_elems). Admits the bare expansion (no op) and the string
@@ -1821,10 +1831,20 @@ function pexp_scalar(pe, lifted)
 				expanded
 			)
 		end
+	elseif EF.has_nameref then
+		-- nameref program: read the value through the nameref (rt.nameref_read = interp's
+		-- expand_part_str, following the ref incl. an element/assoc target). Only value-ops
+		-- (len/sub/strip/subst/case) reach here in a nameref program (pexp_nameref_valop).
+		val = ("rt.nameref_read(sh, %q)"):format(pe.name)
 	else
 		val = lifted[pe.name] and ("rt.i64_to_str(%s)"):format(lname(pe.name)) or ("sh:get_u(%q)"):format(pe.name) -- get_u: an unset var trips set -u, like bash
 	end
 	if pe.op == "len" then
+		-- ${#name}: in a nameref program, bash's length shortcut treats an element-target
+		-- nameref as length 0 (rt.nameref_len) — distinct from the value read above.
+		if EF.has_nameref and not pe.index then
+			return ("tostring(rt.nameref_len(sh, %q))"):format(pe.name)
+		end
 		return ("tostring(rt.mb_strlen(%s))"):format(val)
 	end -- ${#x}: codepoint length
 	if pe.op == "@" then
@@ -2168,6 +2188,7 @@ function mixed_expandable(w, lifted)
 			and not (
 				indirect_ok(p.pexp)
 				or p.pexp.op == "prefix"
+				or pexp_nameref_valop(p.pexp)
 				or (not EF.has_nameref and (array_multi_op(p.pexp) or pexp_compilable(p.pexp)))
 			)
 		then
@@ -2204,6 +2225,7 @@ function seg_native(w, lifted)
 			and (
 				indirect_ok(p.pexp) -- ${!ref}: rt.indirect_elems bootstraps interp's nameref-aware indirect resolution
 				or p.pexp.op == "prefix" -- ${!pre@}: name-matching, reads no potential-nameref value
+				or pexp_nameref_valop(p.pexp) -- ${#ref}/${ref:o:l}/${ref#p}…: value read is nameref-aware
 				or (not EF.has_nameref and (array_multi_op(p.pexp) or pexp_compilable(p.pexp)))
 			)
 		then -- indirect/prefix resolve NAMES (nameref-safe); a whole-array ${a[@]} or a scalar ${..}-OP
