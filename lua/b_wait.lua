@@ -75,6 +75,14 @@ return function(sh, cmd, args, hook, tcb)
 		for j = k, #args do
 			specs[#specs + 1] = args[j]
 		end
+		if pvar then -- (bash unsets VAR first: a readonly one stops it right here)
+			local pb = sh.vars[sh:deref(pvar)]
+			if pb and pb.ro then
+				io.stderr:write("curse: wait: " .. sh:deref(pvar) .. ": cannot unset: readonly variable\n")
+				sh.status = 1
+				return
+			end
+		end
 		sh.jobs = sh.jobs or {}
 		local waited -- the pid whose status we return (for -p)
 		if nflag and #specs > 0 then
@@ -172,8 +180,16 @@ return function(sh, cmd, args, hook, tcb)
 					if found then
 						last = job_reap(sh, found) or 127
 						report(found)
+					elseif C.waitpid(pid, stbuf, 1) == 0 or (sh.procsub_status and sh.procsub_status[pid]) then
+						last = reap(pid) -- (a live child we don't list, or a finished procsub)
 					else
-						last = reap(pid)
+						local r = C.waitpid(pid, stbuf, 1) -- (WNOHANG)
+						if r == pid then
+							last = rt.wexit(stbuf[0])
+						else
+							io.stderr:write("curse: wait: pid " .. pid .. " is not a child of this shell\n")
+							last = 127
+						end
 					end
 				else -- a bare non-pid/non-jobspec word: status 1 alone, 127 under -n
 					io.stderr:write("curse: wait: `" .. s .. "': not a pid or valid job spec\n")

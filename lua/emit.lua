@@ -2478,14 +2478,16 @@ function pexp_scalar(pe, lifted)
 				def
 			)
 		end
+		local noword = pe.arg == nil or pe.arg == "" -- (bash's own words then)
 		if pe.op == ":?" then
 			return ('(function() local __d = %s; return __d ~= "" and __d or rt.param_error(sh, %q, %s) end)()'):format(
 				getv,
 				pe.name,
-				def
+				noword and '"parameter null or not set"' or def
 			)
 		end
-		return ("(rt.var_has_value(sh, %q) and %s or rt.param_error(sh, %q, %s))"):format(pe.name, getv, pe.name, def) -- ?
+		return ("(rt.var_has_value(sh, %q) and %s or rt.param_error(sh, %q, %s))"):format(pe.name, getv, pe.name,
+			noword and '"parameter not set"' or def) -- ?
 	end
 	if pe.op == "sub" then -- ${v:off:len}: arith-eval off/len (nil-coerced to 0 for a present
 		-- operand, like interp), then substr by codepoint via apply_str_op("sub").
@@ -5013,8 +5015,17 @@ simple_compiled = function(cx, st, after)
 		return cx.delegate(st, after)
 	end
 	if cmd == "return" then -- exit the current CFG (function or top level)
+		local w2 = st.words[2]
+		if w2 and #w2.parts == 1 and w2.parts[1].lit == "--" and not w2.parts[1].q then
+			w2 = st.words[3] -- (`return -- N`)
+			if st.words[4] then
+				return cx.delegate(st, after)
+			end
+		elseif st.words[3] then -- (too many arguments: interp discards the command)
+			return cx.delegate(st, after)
+		end
 		local p = cx.newpc()
-		local n = st.words[2] and ("tonumber(%s)"):format(emit_word(st.words[2], cx.lifted)) or "sh.status"
+		local n = w2 and ("rt.return_code(sh, %s)"):format(emit_word(w2, cx.lifted)) or "sh.status"
 		cx.blocks[p] = ("sh.status = (%s) or 0; pc = %d"):format(n, cx.DONE)
 		return p
 	end

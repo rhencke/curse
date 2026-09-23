@@ -89,7 +89,16 @@ return function(sh, cmd, args, hook)
 					actions[#actions + 1] = SHORT[ch]
 				end
 				j = j + 1
+			elseif a == "--" then
+				if prefix == nil then
+					prefix = args[j + 1]
+				end
+				break
 			elseif a:sub(1, 1) == "-" and #a > 1 then
+				local badl = a:match("[^abcdefgjksuvoAGWFCXPS]", 2)
+				if badl then
+					return rt.bad_option(sh, "compgen", "-" .. badl)
+				end
 				j = j + 1
 			else
 				if prefix == nil then
@@ -503,20 +512,80 @@ return function(sh, cmd, args, hook)
 			end
 		end
 	elseif cmd == "compopt" then
-		-- only valid inside a completion function; we don't run those, so: usage-error
-		-- on a bad -o value (2), else "not in completion function" (1).
-		for k = 2, #args do
-			if args[k] == "-o" or args[k] == "+o" then
-				local v = args[k + 1]
-				local OK =
-					{ default = 1, nospace = 1, filenames = 1, dirnames = 1, bashdefault = 1, plusdirs = 1, nosort = 1 }
-				if not OK[v] then
-					io.stderr:write("curse: compopt: invalid option name\n")
-					sh.status = 2
-					return
+		-- compopt [-o|+o OPT] [-DEI] [NAME …]: change a spec's options. Outside a completion
+		-- function (curse never runs one) it needs a NAME with a spec (bash's compopt.def).
+		local OK = { bashdefault = 1, default = 1, dirnames = 1, filenames = 1, noquote = 1, nosort = 1,
+			nospace = 1, plusdirs = 1 }
+		local on, off, special = {}, {}, {}
+		local k = 2
+		while args[k] and args[k]:match("^[-+].") do
+			local a = args[k]
+			k = k + 1
+			if a == "--" then
+				break
+			end
+			local i = 2
+			while i <= #a do
+				local f = a:sub(i, i)
+				i = i + 1
+				if f == "o" then
+					local v = a:sub(i) ~= "" and a:sub(i) or args[k]
+					if a:sub(i) == "" then
+						k = k + 1
+					end
+					if v == nil then
+						io.stderr:write("curse: compopt: -o: option requires an argument\n" .. rt.usage("compopt"))
+						sh.status = 2
+						return
+					end
+					if not OK[v] then
+						io.stderr:write("curse: compopt: " .. v .. ": invalid option name\n")
+						sh.status = 2
+						return
+					end
+					if a:sub(1, 1) == "+" then
+						off[#off + 1] = v
+					else
+						on[#on + 1] = v
+					end
+					break
+				elseif a:sub(1, 1) == "-" and (f == "D" or f == "E" or f == "I") then
+					special[#special + 1] = f == "D" and "_DefaultCmD_" or f == "E" and "_EmptycmD_" or "_InitialWorD_"
+				else
+					return rt.bad_option(sh, "compopt", a:sub(1, 1) .. f)
 				end
 			end
 		end
-		sh.status = 1
+		local names = special
+		for j = k, #args do
+			names[#names + 1] = args[j]
+		end
+		if #names == 0 then
+			io.stderr:write("curse: compopt: not currently executing completion function\n")
+			sh.status = 1
+			return
+		end
+		sh.status = 0
+		local tab = sh.complete or {}
+		for _, n in ipairs(names) do
+			local cs = tab[n]
+			if not cs then
+				io.stderr:write("curse: compopt: " .. n .. ": no completion specification\n")
+				sh.status = 1
+			else
+				local opts = {}
+				for o in pairs(cs.opts) do
+					opts[o] = true
+				end
+				for _, o in ipairs(on) do
+					opts[o] = true
+				end
+				for _, o in ipairs(off) do
+					opts[o] = nil
+				end
+				cs.opts = opts
+			end
+		end
+		return
 	end
 end

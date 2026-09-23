@@ -18,20 +18,10 @@ local C, P = I.C, I.P
 
 return function(sh, cmd, args, hook, tcb)
 	if cmd == "local" then
-		if sh.pd == 0 and (sh.calldepth or 0) == 0 then -- (no function; bash checks after the options)
-			local j = 2
-			while args[j] and args[j]:match("^[-+].") and args[j] ~= "--" do
-				local bad = args[j]:match("[^aAfFgiIlnprtux]", 2)
-				if bad then
-					break
-				end
-				j = j + 1
-			end
-			if not (args[j] and args[j]:match("^[-+].") and args[j] ~= "--") then
-				io.stderr:write("curse: local: can only be used in a function\n")
-				sh.status = 1
-				return
-			end
+		if sh.pd == 0 and (sh.calldepth or 0) == 0 then -- (no function: checked before anything)
+			io.stderr:write("curse: local: can only be used in a function\n")
+			sh.status = 1
+			return
 		end
 		-- local [-naA] [+n] NAME[=val]…: shadow the var in this scope, honoring
 		-- nameref (-n), indexed (-a) and associative (-A) attributes.

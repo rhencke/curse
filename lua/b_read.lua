@@ -43,6 +43,11 @@ return function(sh, cmd, args, hook, tcb)
 							return args[j + 1]
 						end
 					end
+					if f:match("[adinNptu]") and k == #a and args[j + 1] == nil then
+						io.stderr:write("curse: read: -" .. f .. ": option requires an argument\n" .. rt.usage("read"))
+						sh.status = 2
+						return
+					end
 					if f == "r" then
 						raw = true
 						k = k + 1
@@ -62,14 +67,29 @@ return function(sh, cmd, args, hook, tcb)
 					elseif f == "a" then
 						arr = takearg()
 					elseif f == "u" then
-						ufd = tonumber(takearg()) or 0
+						local v = takearg()
+						ufd = v:match("^%s*[+-]?%d+%s*$") and tonumber(v)
+						if not ufd or ufd < 0 then
+							io.stderr:write("curse: read: " .. v .. ": invalid file descriptor specification\n")
+							sh.status = 1
+							return
+						end
+						if C.fcntl(ufd, 1) < 0 then -- F_GETFD: not open
+							io.stderr:write("curse: read: " .. v .. ": invalid file descriptor: Bad file descriptor\n")
+							sh.status = 1
+							return
+						end
+					elseif f == "i" then
+						takearg() -- (the readline default text: no readline here)
 					elseif f == "p" then
 						takearg() -- prompt: consume + ignore (non-interactive)
 					elseif f == "t" then
 						tmout = takearg() -- timeout (only -t 0 is honored below)
-					else
+					elseif f == "s" or f == "e" then -- (no echo / readline: no terminal editing here)
 						k = k + 1
-					end -- -s etc.: ignore
+					else
+						return rt.bad_option(sh, "read", "-" .. f)
+					end
 				end
 				j = j + advance
 			else

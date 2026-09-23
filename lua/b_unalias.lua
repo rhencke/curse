@@ -27,7 +27,8 @@ return function(sh, cmd, args, hook, tcb)
 		end
 		if #args < 2 then
 			io.stderr:write("unalias: usage: unalias [-a] name [name ...]\n")
-			ok = false
+			sh.status = 2
+			return
 		elseif args[2] == "-a" then
 			sh.aliases = {}
 		else

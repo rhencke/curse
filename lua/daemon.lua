@@ -447,6 +447,7 @@ local WORKER_IDLE = 99 -- worker exit code meaning "accept() timed out" (parent 
 -- the pool (checking the shared activity clock, since serving no longer signals it).
 local function worker_main(lfd, my_uid, ctx, slot)
 	ctx.worker_pid = tonumber(C.getpid()) -- (see serve_request's forked-descendant guard)
+	rt.daemon_worker = true
 	-- PRE-FAULT the heap once BEFORE the first accept: a forked child's first Shell.new
 	-- pays ~480us of cold page faults; a throwaway Shell.new + GC now makes those pages
 	-- resident so every per-request Shell.new reuses them at ~48us.

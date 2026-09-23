@@ -802,8 +802,8 @@ parse_paramexp = function(inner)
 	if lenpfx then
 		-- ${#x} / ${#a[@]} only; a trailing operator (${#a[0]/1/x}) can't combine with
 		-- the length prefix — bash rejects it as a bad substitution.
-		if rest ~= "" then
-			return { pexp = { name = name, op = "badsubst", raw = "#" .. inner } }
+		if rest ~= "" then -- (`${#@x}` is the fatal kind: bash reads it as a bad ${@…} transform)
+			return { pexp = { name = name, op = "badsubst", raw = "#" .. inner, fatal = name == "@" or nil } }
 		end
 		return { pexp = { name = name, op = "len", index = index } }
 	end
@@ -852,8 +852,8 @@ parse_paramexp = function(inner)
 	elseif one == "," then
 		return P({ op = ",", arg = rest:sub(2) })
 	elseif one == "@" then -- ${x@Q/U/u/L/E/…}: exactly one operator letter, else bad
-		if not rest:match("^@[QEPAKaUuLk]$") then
-			return P({ op = "badsubst", raw = name .. (index and "[" .. index .. "]" or "") .. rest })
+		if not rest:match("^@[QEPAKaUuLk]$") then -- (checked only on a set value: `xform`)
+			return P({ op = "badsubst", xform = true, raw = name .. (index and "[" .. index .. "]" or "") .. rest })
 		end
 		return P({ op = "@", arg = rest:sub(2) })
 	elseif one == ":" then

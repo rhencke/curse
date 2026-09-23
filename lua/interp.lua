@@ -682,24 +682,26 @@ arith_resolve = function(sh, s)
 	if looks_numeric(s) then
 		return rt.arith_num(s)
 	end
-	sh.arith_depth = (sh.arith_depth or 0) + 1
-	if sh.arith_depth > 40 then
-		sh.arith_depth = sh.arith_depth - 1
-		return i64(0)
-	end -- cycle guard
 	local ok, ast = pcall(P.arith, s)
-	sh.arith_depth = sh.arith_depth - 1 -- balanced BEFORE any error unwinds past here
-	if not ok then -- the value is not a valid arith expression (e.g. "12 34", "1+"): a
-		-- non-fatal syntax error — fails the containing command, script continues.
+	if not ok then -- the value is not a valid arith expression (e.g. "12 34", "1+"): an
+		-- arith error — the command fails and (bash) the rest of the line is discarded
 		io.stderr:write("curse: " .. P.arith_errmsg(s, ast) .. "\n")
-		error({ __curse_exit = 1, __curse_matherr = true, __curse_experr = true })
+		error({ __curse_exit = 1, __curse_matherr = true, __curse_experr = true, __curse_lineabort = true })
+	end
+	-- a value naming itself (x=x, or a=b b=a): bash's expression recursion limit
+	local depth = (sh.arith_depth or 0) + 1
+	if depth > 1024 then
+		io.stderr:write("curse: " .. P.arith_errmsg(s, { msg = "expression recursion level exceeded", tok = s }) .. "\n")
+		error({ __curse_exit = 1, __curse_matherr = true, __curse_experr = true, __curse_lineabort = true })
 	end
 	-- A nested bad value (rare: `s=t; t='1 2'`) stays swallowed as 0, matching the
 	-- previous behavior; but a genuine arith error during eval (syntax/math, e.g. a
 	-- bad subscript) propagates so the command fails like bash instead of yielding 0.
 	local sv = in_expanded_text
 	in_expanded_text = true -- (a value is expansion output: its subscripts expand unquoted)
+	sh.arith_depth = depth
 	local ok2, v = pcall(eval, sh, ast)
+	sh.arith_depth = depth - 1
 	in_expanded_text = sv
 	if not ok2 then
 		if type(v) == "table" and (v.__curse_experr or v.__curse_matherr) then
@@ -1305,6 +1307,24 @@ local function expand_part_str(sh, p, assign)
 	elseif p.pexp then
 		local pe = p.pexp
 		if pe.op == "badsubst" then -- ${x|html} and other unrecognized ${…} forms
+			if pe.fatal then
+				sherr(sh, "curse: ${" .. (pe.raw or pe.name or "") .. "}: bad substitution\n")
+				error({ __curse_exit = sh.opt_c and 127 or 1, __curse_lineabort = sh.opt_i or nil })
+			end
+			if pe.xform then -- ${x@Z}: nothing to transform on an unset x; else FATAL (bash)
+				local set
+				if pe.index then
+					local k, b = array_key(sh, pe.name, pe.index), sh.vars[sh:deref(pe.name)]
+					set = b and b.arr and b.arr[k] ~= nil or (not (b and b.arr) and k == 0 and rt.var_has_value(sh, pe.name))
+				else
+					set = rt.var_has_value(sh, pe.name)
+				end
+				if not set then
+					return ""
+				end
+				sherr(sh, "curse: ${" .. (pe.raw or pe.name or "") .. "}: bad substitution\n")
+				error({ __curse_exit = sh.opt_c and 127 or 1, __curse_lineabort = sh.opt_i or nil })
+			end
 			sherr(sh, "curse: ${" .. (pe.raw or pe.name or "") .. "}: bad substitution\n")
 			error({ __curse_exit = 1, __curse_lineabort = true }) -- discards the rest of the line (bash)
 		end
@@ -1372,7 +1392,7 @@ local function expand_part_str(sh, p, assign)
 		if TESTOP[pe.op] then
 			-- In an assignment RHS the default word gets the after-`:` tilde rule too
 			-- (`x=${undef-~:~}` -> HOME:HOME), so use the assignment-aware expander.
-			arg = pe.arg and function()
+			arg = pe.arg and pe.arg ~= "" and function() -- (no word: nil, for ${x?}'s own message)
 				if assign then
 					return expand_assign_word(sh, pw(pe.arg))
 				end
@@ -2771,6 +2791,7 @@ local BUILTINS = {
 	["return"] = 1,
 	exit = 1,
 	logout = 1,
+	suspend = 1,
 	cd = 1,
 	unset = 1,
 	export = 1,
@@ -4004,20 +4025,14 @@ local function exec_simple(sh, args, hook, no_func)
 				io.stderr:write("curse: break: only meaningful in a `for', `while', or `until' loop\n")
 			end
 			sh.status = 0
-		elseif args[3] ~= nil then -- too many arguments: usage error; bash still BREAKS the loop
-			io.stderr:write("curse: break: too many arguments\n")
-			sh.status = 1
-			if sh.opt_c then
-				error({ __curse_exit = 1 })
-			elseif (sh.loopdepth or 0) > 0 then
-				error({ __curse_break = 1 })
-			end
 		elseif args[2] and not tonumber(args[2]) then -- non-numeric count: FATAL (status 128) in a
 			io.stderr:write("curse: break: " .. args[2] .. ": numeric argument required\n")
 			sh.status = 128 -- non-interactive shell (bash exits); interactive just aborts it
 			if not sh.opt_i then
 				error({ __curse_exit = 128 })
 			end
+		elseif args[3] ~= nil then -- (the count is checked first — bash's get_numeric_arg)
+			rt.too_many(sh, "break")
 		elseif args[2] and tonumber(args[2]) <= 0 then -- (bash: reported, and ALL the loops end)
 			io.stderr:write("curse: break: " .. args[2] .. ": loop count out of range\n")
 			sh.status = 1
@@ -4035,20 +4050,14 @@ local function exec_simple(sh, args, hook, no_func)
 				io.stderr:write("curse: continue: only meaningful in a `for', `while', or `until' loop\n")
 			end
 			sh.status = 0
-		elseif args[3] ~= nil then -- too many arguments: bash BREAKS the loop (not continue!)
-			io.stderr:write("curse: continue: too many arguments\n")
-			sh.status = 1
-			if sh.opt_c then
-				error({ __curse_exit = 1 })
-			elseif (sh.loopdepth or 0) > 0 then
-				error({ __curse_break = 1 })
-			end
 		elseif args[2] and not tonumber(args[2]) then -- non-numeric count: fatal, like break
 			io.stderr:write("curse: continue: " .. args[2] .. ": numeric argument required\n")
 			sh.status = 128
 			if not sh.opt_i then
 				error({ __curse_exit = 128 })
 			end
+		elseif args[3] ~= nil then -- (the count is checked first — bash's get_numeric_arg)
+			rt.too_many(sh, "continue")
 		elseif args[2] and tonumber(args[2]) <= 0 then -- (bash: reported, and ALL the loops end)
 			io.stderr:write("curse: continue: " .. args[2] .. ": loop count out of range\n")
 			sh.status = 1
@@ -4062,17 +4071,14 @@ local function exec_simple(sh, args, hook, no_func)
 	elseif cmd == "return" then
 		-- (the argument is checked first: too many aborts the line, a non-number is 2)
 		local ra = args[2] == "--" and 3 or 2
-		if args[ra + 1] ~= nil then
-			io.stderr:write("curse: return: too many arguments\n")
-			sh.status = 1
-			error({ __curse_exit = 1, __curse_lineabort = not sh.opt_c or nil })
-		end
 		local rcode
-		if args[ra] ~= nil then
+		if args[ra] ~= nil then -- (bash's get_exitstat: the number, then no_args)
 			rcode = args[ra]:match("^%s*[+-]?%d+%s*$") and tonumber(args[ra]) % 256
 			if not rcode then
 				io.stderr:write("curse: return: " .. args[ra] .. ": numeric argument required\n")
 				rcode = 2
+			elseif args[ra + 1] ~= nil then
+				rt.too_many(sh, "return")
 			end
 		end
 		-- `return` is only valid inside a function, a sourced script, or a trap;
@@ -4087,16 +4093,15 @@ local function exec_simple(sh, args, hook, no_func)
 		end
 		error({ __curse_return = rcode or sh.status })
 	elseif cmd == "exit" then
-		if #args > 2 then
-			io.stderr:write("curse: exit: too many arguments\n")
-			sh.status = 1
-			return
-		end -- bash: non-fatal
-		if args[2] and not tonumber(args[2]) then
-			io.stderr:write("curse: exit: " .. args[2] .. ": numeric argument required\n")
+		local ea = args[2] == "--" and 3 or 2
+		if args[ea] and not args[ea]:match("^%s*[+-]?%d+%s*$") then -- (get_exitstat: the number
+			io.stderr:write("curse: exit: " .. args[ea] .. ": numeric argument required\n")
 			error({ __curse_exit = 2 })
 		end
-		local code = args[2] and (tonumber(args[2]) % 256) or sh.status
+		if args[ea + 1] ~= nil then -- first, then too many: the command is discarded)
+			rt.too_many(sh, "exit")
+		end
+		local code = args[ea] and (tonumber(args[ea]) % 256) or sh.status
 		-- inside a function, bash runs the EXIT trap right here, with the function's frame
 		-- still active (`trap 'echo $FUNCNAME' EXIT; f() { exit; }; f` prints f)
 		if sh:in_function() and not sh.in_exit_trap and not rt.exit_trap_inherited
@@ -4140,7 +4145,8 @@ local function exec_simple(sh, args, hook, no_func)
 				end
 			end
 		end
-		sh.status = anyfound and 0 or 1 -- bash: 0 if ANY name resolved (multiple names swallow misses)
+		sh.status = (anyfound or not args[3]) and 0 or 1 -- bash: 0 if ANY name resolved (multiple names
+		-- swallow misses; no name at all is 0)
 	elseif cmd == "command" then
 		local j, usep, vflag = 2, false, nil
 		while args[j] and args[j]:match("^%-.") and args[j] ~= "--" do
@@ -5074,7 +5080,7 @@ exec_stmt = function(sh, st, hook)
 		-- WHOLE simple command with status 1 but is non-fatal: the script continues.
 		local eok, eerr = pcall(expand_args, sh, st, args, is_assign)
 		if not eok then
-			if type(eerr) == "table" and eerr.__curse_experr then
+			if type(eerr) == "table" and eerr.__curse_experr and not eerr.__curse_lineabort then
 				rt.posix_arith_fatal(sh, eerr)
 				sh.status = 1
 				if sh.opt_e then
@@ -6078,7 +6084,7 @@ exec_stmt = function(sh, st, hook)
 			end
 		end)
 		if not eok then
-			if type(eerr) == "table" and eerr.__curse_experr then
+			if type(eerr) == "table" and eerr.__curse_experr and not eerr.__curse_lineabort then
 				sh.status = 1
 				if sh.opt_e then
 					error({ __curse_exit = 1 })

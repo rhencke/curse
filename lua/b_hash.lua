@@ -24,6 +24,7 @@ return function(sh, cmd, args, hook, tcb)
 		sh.hashcache = sh.hashcache or {}
 		local rflag, names, j = false, {}, 2
 		local ppath
+		local dflag, tflag, lflag = false, false, false
 		while args[j] and args[j]:sub(1, 1) == "-" and #args[j] > 1 do
 			if args[j] == "--" then
 				j = j + 1
@@ -39,9 +40,23 @@ return function(sh, cmd, args, hook, tcb)
 			if args[j]:find("r") then
 				rflag = true
 			end
+			dflag = dflag or args[j]:find("d", 2, true) ~= nil
+			tflag = tflag or args[j]:find("t", 2, true) ~= nil
+			lflag = lflag or args[j]:find("l", 2, true) ~= nil
 			if args[j]:find("p") then -- -p PATH NAME: remember NAME at PATH (unchecked)
 				ppath = args[j + 1]
 				j = j + 1
+				if ppath == nil then
+					io.stderr:write("curse: hash: -p: option requires an argument\n" .. rt.usage("hash"))
+					sh.status = 2
+					return
+				end
+			end
+			local dt = args[j]:match("[dt]")
+			if dt and args[j + 1] == nil then -- (-d/-t need names)
+				io.stderr:write("curse: hash: -" .. dt .. ": option requires an argument\n")
+				sh.status = 1
+				return
 			end
 			j = j + 1
 		end
@@ -74,7 +89,26 @@ return function(sh, cmd, args, hook, tcb)
 				sh.hashcache[k] = nil
 			end
 		end
-		if #names > 0 then
+		if #names > 0 and (dflag or tflag) then
+			sh.status = 0
+			if dflag and not next(sh.hashcache) then -- (bash: nothing to remove from, quietly)
+				return
+			end
+			for _, nm in ipairs(names) do
+				local e = sh.hashcache[nm]
+				if e and tflag then
+					e.hits = e.hits + 1 -- (a lookup counts, as phash_search does)
+				end
+				if not e then
+					io.stderr:write("curse: hash: " .. nm .. ": not found\n")
+					sh.status = 1
+				elseif dflag then
+					sh.hashcache[nm] = nil
+				else -- -t: the remembered path (NAME<TAB>PATH for several — bash)
+					sh:echo((#names > 1 and (nm .. "\t") or "") .. e.path)
+				end
+			end
+		elseif #names > 0 then
 			sh.status = 0
 			for _, nm in ipairs(names) do
 				if not nm:find("/", 1, true) and not sh:resolve_cmd(nm) then
@@ -96,7 +130,11 @@ return function(sh, cmd, args, hook, tcb)
 				end
 				return (hc[a].seq or 0) > (hc[z].seq or 0)
 			end)
-			if #ks > 0 then
+			if lflag then -- (reusable input; nothing at all for an empty table)
+				for _, k in ipairs(ks) do
+					sh:echo("builtin hash -p " .. sh.hashcache[k].path .. " " .. k)
+				end
+			elseif #ks > 0 then
 				sh:echo("hits\tcommand")
 				for _, k in ipairs(ks) do
 					sh:echo(("%4d\t%s"):format(sh.hashcache[k].hits, sh.hashcache[k].path))

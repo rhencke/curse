@@ -22,6 +22,37 @@ return function(sh, cmd, args, hook, tcb)
 		-- readline introspection + binding via FFI (same library bash links ->
 		-- identical output, no tty needed). Shell-command bindings (-x/-X) are kept
 		-- curse-side, per keymap, in bash's `"keyseq": "cmd"` format.
+		if not sh.opt_i then -- (bash says so first, whatever the arguments)
+			io.stderr:write("curse: bind: warning: line editing not enabled\n")
+		end
+		do -- bash's getopt "lvpVPsSXf:q:u:m:r:x:": bad letters and missing arguments
+			local k = 2
+			while args[k] and args[k]:match("^%-.") and args[k] ~= "--" do
+				local a = args[k]
+				k = k + 1
+				for ci = 2, #a do
+					local f = a:sub(ci, ci)
+					if f:match("[fqumrx]") then
+						if ci == #a then
+							if args[k] == nil then
+								io.stderr:write("curse: bind: -" .. f .. ": option requires an argument\n" .. rt.usage("bind"))
+								sh.status = 2
+								return
+							end
+							if f == "x" and not args[k]:match('^%s*"') then
+								io.stderr:write("curse: bind: " .. args[k] .. ": first non-whitespace character is not `\"'\n")
+								sh.status = 1
+								return
+							end
+							k = k + 1
+						end
+						break
+					elseif not f:match("[lvpVPsSX]") then
+						return rt.bad_option(sh, "bind", "-" .. f)
+					end
+				end
+			end
+		end
 		local j = 2
 		local keymap = "emacs" -- -m KEYMAP selects the keymap for -x/-X (default emacs)
 		if args[j] == "-m" then

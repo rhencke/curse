@@ -171,9 +171,7 @@ return function(sh, cmd, args)
 				return
 			end
 			if rest[2] then
-				io.stderr:write("curse: history: too many arguments\n")
-				sh.status = 1
-				return
+				require("runtime").too_many(sh, "history") -- (the command is discarded)
 			end
 			limit = math.abs(limit)
 		end

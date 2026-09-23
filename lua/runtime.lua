@@ -4433,6 +4433,22 @@ function M.usage(cmd)
 	end
 	return ""
 end
+-- `return N`'s status (bash's get_exitstat): N mod 256, or 2 with a message for a non-number.
+function M.return_code(sh, s)
+	local n = s:match("^%s*[+-]?%d+%s*$") and tonumber(s)
+	if not n then
+		io.stderr:write("curse: return: " .. s .. ": numeric argument required\n")
+		return 2
+	end
+	return n % 256
+end
+-- bash's no_args: `CMD: too many arguments`, and the whole current command is discarded
+-- (the rest of the line; all of a -c string).
+function M.too_many(sh, cmd)
+	io.stderr:write("curse: " .. cmd .. ": too many arguments\n")
+	sh.status = 1
+	error({ __curse_exit = 1, __curse_lineabort = not sh.opt_c or nil })
+end
 -- bash's internal_getopt rejection: `CMD: -X: invalid option` + the usage line, status 2.
 function M.bad_option(sh, cmd, opt)
 	io.stderr:write("curse: " .. cmd .. ": " .. opt .. ": invalid option\n" .. M.usage(cmd))
@@ -7711,15 +7727,15 @@ function Shell:expand_param(pe, arg, arg2, idxnum)
 		return val
 	end
 	if op == ":?" then
-		if val == "" then
-			io.stderr:write("curse: " .. name .. ": " .. A() .. "\n")
+		if val == "" then -- (no word at all: bash's own words)
+			io.stderr:write("curse: " .. name .. ": " .. ((arg == nil or arg == "") and "parameter null or not set" or A()) .. "\n")
 			error({ __curse_exit = self.opt_c and 127 or 1, __curse_lineabort = self.opt_i or nil })
 		end
 		return val
 	end
 	if op == "?" then
 		if not isset then
-			io.stderr:write("curse: " .. name .. ": " .. A() .. "\n")
+			io.stderr:write("curse: " .. name .. ": " .. ((arg == nil or arg == "") and "parameter not set" or A()) .. "\n")
 			error({ __curse_exit = self.opt_c and 127 or 1, __curse_lineabort = self.opt_i or nil })
 		end
 		return val
@@ -7748,6 +7764,9 @@ function Shell:expand_param(pe, arg, arg2, idxnum)
 			local at = self:attr_string(name)
 			return (at ~= "" and ("declare -" .. at .. " ") or "") .. name .. "=" .. M.shell_quote(val)
 		end
+	end
+	if op == "sub" and not isset then -- (an unset value has no substring to check)
+		return ""
 	end
 	return self:apply_str_op(op, val, arg, arg2, pe.arg2)
 end
@@ -8308,6 +8327,7 @@ local BUILTIN_LAZY = {
 	["local"] = "b_local",
 	help = "b_help",
 	logout = "b_logout",
+	suspend = "b_suspend",
 }
 M.BUILTIN_LAZY = BUILTIN_LAZY
 local _noop = function() end
@@ -8690,16 +8710,16 @@ function M.arith_read(sh, name)
 			_acache[s] = fn
 		end
 		if fn then
-			-- Mirror arith_read∘arith_resolve exactly: a depth guard (bash cycle protection;
-			-- 40 matches interp's arith_resolve, shared via sh.arith_depth across the seam),
+			-- Mirror arith_read∘arith_resolve exactly: a depth guard (bash's expression
+			-- recursion limit, 1024 as interp's arith_resolve, shared via sh.arith_depth),
 			-- a nested bad value swallowed to 0, and a real matherr/experr mapped to a
 			-- non-fatal $?=1 inside (( )) (sh.arithfault flag) or a line-abort in a word $((…)).
 			local ok, v = pcall(function()
+				if (sh.arith_depth or 0) >= 1024 then -- (said by the outermost level, below)
+					error({ __curse_exit = 1, __curse_matherr = true, __curse_experr = true, __curse_lineabort = true,
+						__curse_recur = s })
+				end
 				sh.arith_depth = (sh.arith_depth or 0) + 1
-				if sh.arith_depth > 40 then
-					sh.arith_depth = sh.arith_depth - 1
-					return i64(0)
-				end -- cycle guard
 				local ok2, r = pcall(fn, sh)
 				sh.arith_depth = sh.arith_depth - 1
 				if not ok2 then
@@ -8714,6 +8734,14 @@ function M.arith_read(sh, name)
 				return v
 			end
 			if type(v) == "table" and (v.__curse_matherr or v.__curse_experr) then
+				if v.__curse_recur then
+					if (sh.arith_depth or 0) > 0 then
+						error(v, 0) -- (up to the outermost read, where the line is still known)
+					end
+					io.stderr:write("curse: " .. require("parser").arith_errmsg(v.__curse_recur,
+						{ msg = "expression recursion level exceeded", tok = v.__curse_recur }) .. "\n")
+					v.__curse_recur = nil
+				end
 				if sh.in_arithcmd then
 					sh.arithfault = true
 					return i64(0)
@@ -8994,6 +9022,25 @@ end
 function M.array_slice_values(sh, name, els, off, len, ltxt)
 	off = off or 0
 	if len ~= nil and len < 0 then
+		-- (bash's verify_substring_values: an offset past the end is just empty — checked
+		-- before the length; $@ counts $0, an indexed array is its highest index)
+		local pos = name == "@" or name == "*"
+		if not pos and #els == 0 then
+			return {}
+		end
+		local total
+		if pos then
+			total = sh.nparams + 1
+		elseif sh:is_assoc(name) then
+			total = #els
+		else
+			local idx = sh:array_indices(name)
+			total = idx[#idx] ~= nil and tonumber(key_i64(idx[#idx])) or 0
+		end
+		local o = off < 0 and off + total or off
+		if o < 0 or o > total then
+			return {}
+		end
 		io.stderr:write("curse: " .. (ltxt or len) .. ": substring expression < 0\n")
 		error({ __curse_exit = 1, __curse_lineabort = true })
 	end
