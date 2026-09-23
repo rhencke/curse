@@ -4737,6 +4737,7 @@ exec_stmt = function(sh, st, hook)
 	if st.redirs and COMPOUND_REDIR[t] then
 		local rd = st.redirs
 		local pnp, pnf = procsub_mark(sh) -- a >() redirect target drains after the whole command
+		local line0 = sh.cur_line
 		if st.top and rd[1].line and not (sh.in_trap and sh.in_trap > 0) then
 			sh.cur_line = rd[1].line -- (a top-level one's errors are at its end; nested, bash
 		end -- hasn't moved the line on from the enclosing command's)
@@ -4744,6 +4745,7 @@ exec_stmt = function(sh, st, hook)
 		if not ok then
 			sh.status = 1
 			restore_redirs(save)
+			sh.cur_line = line0 -- (its ERR trap: bash hasn't updated $LINENO for the redirect)
 			-- a failed redirect on a compound fires the ERR trap (and, under errexit,
 			-- exits) — bash; the body never ran, so nothing else fires it.
 			if sh.noerr == 0 then

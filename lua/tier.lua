@@ -90,7 +90,10 @@ end
 
 -- resume descriptor {kind,id} -> the pc to enter the compiled CFG at.
 local function resume_pc(mod, r)
-	return (r.kind == "loop") and mod.loopPc[r.id] or mod.stmtPc[r.id]
+	if r.kind == "loop" then
+		return mod.loopPc[r.id] -- (nil: that loop has no resume point — never a statement's)
+	end
+	return mod.stmtPc[r.id]
 end
 
 -- Run the compiled module with the interp's line-abort semantics: a div0/failglob
@@ -254,6 +257,7 @@ local function alias_mismatch(mod, sh)
 	return mod.alias_static or (sh.aliases and next(sh.aliases) ~= nil)
 end
 
+local compile_first, compile_store
 local LOOP_WORDS = { "while", "until", "for", "select", "function" }
 local function may_loop(src)
 	for _, w in ipairs(LOOP_WORDS) do
@@ -264,6 +268,59 @@ local function may_loop(src)
 	return src:find("%(%s*%)") ~= nil -- (a `name()` funcdef)
 end
 local deferred = {}
+-- (loop iterations before an interpreted cold run compiles and switches; CURSE_HOT_LOOP
+-- overrides — 1 stress-tests OSR at every top-level loop)
+local HOT_LOOP = tonumber(os.getenv("CURSE_HOT_LOOP") or "") or 100
+-- Must a miss compile BEFORE it runs? Only when it can get hot inside a function call — a
+-- loop in a function body, or a function that calls itself — where the interpreter can't
+-- switch to compiled code mid-call. Anything else can switch at a hot top-level loop.
+local LOOPS = { whilec = 1, forin = 1, forc = 1, select = 1 }
+function compile_first(ast)
+	local found = false
+	local function walk(t, fname, d)
+		if found or d > 300 then
+			return
+		end
+		if t.t == "funcdef" then
+			fname = t.name
+		end
+		if fname then
+			if LOOPS[t.t] then
+				found = true
+				return
+			end
+			local w = t.t == "simple" and t.words and t.words[1]
+			local p = w and w.parts and w.parts[1]
+			if p and p.lit == fname then
+				found = true
+				return
+			end
+		end
+		for _, v in pairs(t) do
+			if type(v) == "table" then
+				walk(v, fname, d + 1)
+			end
+		end
+	end
+	walk(ast.stmts, nil, 0)
+	return found
+end
+-- emit + load + store (disk cache and this worker's) — nil if the emitter can't.
+function compile_store(path, ast, sh)
+	local ok, code = pcall(E.emit, ast)
+	local chunk = ok and load(code, "=curse:compiled")
+	if not chunk then
+		return nil
+	end
+	local built, m = pcall(chunk)
+	if not (built and type(m) == "table" and m.run) or alias_mismatch(m, sh) then
+		return nil
+	end
+	local okd, bc = pcall(string.dump, chunk, true)
+	require("cache").store(path, okd and bc or code)
+	modcache_put(path, m)
+	return m
+end
 -- Compile + store the scripts that ran interpreted on a miss (the daemon calls this once
 -- the client has its reply).
 function M.compile_deferred()
@@ -320,20 +377,47 @@ function M.run_tiered(src, sh)
 		I.run_lazy(sh, src)
 		return sh, "interp-deferred"
 	end
-	local ok, code = pcall(function()
-		return E.emit(P.parse(src))
-	end)
-	if ok then
-		local chunk = load(code, "=curse:compiled")
-		if chunk then
-			local built, m = pcall(chunk)
-			if built and type(m) == "table" and m.run and not alias_mismatch(m, sh) then
-				local okd, bc = pcall(string.dump, chunk, true)
-				Cache.store(path, okd and bc or code) -- populate for the next (warm) run
-				if path then modcache_put(path, m) end -- and keep it in-process for this worker
-				return M.run_mod(m, sh, src, 0) -- interp -> OSR fall-over
+	local pok, ast = pcall(P.parse, src)
+	if path and pok and type(ast) == "table" and ast.stmts and not compile_first(ast) then
+		-- It can only get hot in a TOP-LEVEL loop, where the interpreter can switch: run it
+		-- interpreted; a loop that turns hot compiles it right then and continues compiled
+		-- (OSR at that loop); one that never does is compiled after the reply.
+		local mod, resume, count = nil, nil, 0
+		local hook = function(kind, id)
+			if kind ~= "loop" then
+				return
+			end
+			count = count + 1
+			if count < HOT_LOOP or resume or sh.calldepth ~= 0 or (sh.traps and (sh.traps.DEBUG or sh.traps.RETURN)) then
+				return
+			end
+			if mod == nil then
+				mod = compile_store(path, ast, sh) or false
+			end
+			local pc = mod and resume_pc(mod, { kind = kind, id = id })
+			if pc then -- (no module — the emitter declined, or aliases now in play: stay put)
+				resume = { kind = kind, id = id }
+				error({ __curse_switch = true })
 			end
 		end
+		local ok, err = pcall(I.run_lazy, sh, src, hook)
+		if ok then
+			if mod == nil then
+				deferred[#deferred + 1] = { path = path, src = src }
+			end
+			return sh, "interp-deferred"
+		end
+		if type(err) == "table" and err.__curse_switch and mod then
+			I.finish_run(sh, function()
+				M.run_compiled(mod, sh, resume_pc(mod, resume))
+			end)
+			return sh, "cold-osr"
+		end
+		error(err)
+	end
+	local m = pok and path and compile_store(path, ast, sh)
+	if m then
+		return M.run_mod(m, sh, src, 0) -- interp -> OSR fall-over
 	end
 	I.run_lazy(sh, src) -- fallback: the interpreter's line-at-a-time parse, always correct
 	return sh, "interp"
