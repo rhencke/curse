@@ -162,6 +162,12 @@ do
 				a = pfx .. a:sub(8)
 			end
 		end
+		-- (what was echoed before a diagnostic reaches a shared fd first, as bash's does —
+		-- the stdio buffer, or an in-process pipeline stage's)
+		io.stdout:flush()
+		if M.flush_stage_out then
+			M.flush_stage_out(sh)
+		end
 		return real:write(a)
 	end
 	io.stderr = proxy
@@ -2682,8 +2688,16 @@ local function make_out(t)
 			task_flush(t)
 		end
 	end
-	CO_OUTS[f] = true
+	CO_OUTS[f] = t -- (its task: a diagnostic flushes what's buffered first)
 	return f
+end
+-- Before a diagnostic: push out what the current pipeline stage has buffered (so both
+-- reach a shared fd in the order they were made, as bash's unbuffered output does).
+function M.flush_stage_out(sh)
+	local t = sh and CO_OUTS[sh.out] or co_task()
+	if type(t) == "table" and t.nbuf > 0 and not t.flushing then
+		task_flush(t)
+	end
 end
 -- A stage's private shell: a subshell's worth of isolation for the Lua-side state
 -- (process-global state is swapped by the scheduler instead). Every table field is
@@ -6339,6 +6353,7 @@ skipname = function(pat, dname, dotglob, skipdots)
 	end
 	return false
 end
+local glob_icase = false -- (shopt -s nocaseglob, for the glob_expand in progress)
 local function scan_seg(dir, seg, dotglob, skipdots)
 	local scan = (dir == "" and ".") or dir
 	local d = ffi.C.opendir(scan)
@@ -6349,7 +6364,7 @@ local function scan_seg(dir, seg, dotglob, skipdots)
 	-- precompiled ERE.
 	local neg = seg:find("!(", 1, true) ~= nil
 	if not neg then
-		if ffi.C.regcomp(regbuf, glob_to_ere(seg), REG_EXTENDED + REG_NOSUB) ~= 0 then
+		if ffi.C.regcomp(regbuf, glob_to_ere(seg), REG_EXTENDED + REG_NOSUB + (glob_icase and REG_ICASE or 0)) ~= 0 then
 			ffi.C.closedir(d)
 			return {}
 		end
@@ -6371,13 +6386,13 @@ local function scan_seg(dir, seg, dotglob, skipdots)
 		-- globskipdots off; a leading-dot name otherwise needs `.`-pattern or dotglob.
 		local dotdot = name == "." or name == ".."
 		if xseg then
-			if not skipname(seg, name, dotglob, skipdots) and M.ext_match(name, seg, false, xfl) then
+			if not skipname(seg, name, dotglob, skipdots) and M.ext_match(name, seg, glob_icase, xfl) then
 				out[#out + 1] = name
 			end
 		elseif (not dotdot or (not skipdots and hidden)) and (name:sub(1, 1) ~= "." or hidden or dotglob) then
 			local m
 			if neg then
-				m = M.ext_match(name, seg) -- (explicit if: a false ext_match must NOT fall to regexec on an uncompiled regbuf)
+				m = M.ext_match(name, seg, glob_icase) -- (explicit if: a false ext_match must NOT fall to regexec on an uncompiled regbuf)
 			else
 				m = ffi.C.regexec(regbuf, name, 0, nil, 0) == 0
 			end
@@ -6598,6 +6613,7 @@ end
 -- `*`/`?` also match leading-dot names (set by dotglob / a non-null GLOBIGNORE).
 function M.glob_expand(pattern, opts)
 	opts = opts or {}
+	glob_icase = opts.nocase and true or false
 	if not (pattern:find("[*?%[]") or pattern:find("[?*+@!]%(")) then
 		return nil
 	end
@@ -6881,7 +6897,7 @@ function M.field_split(sh, value, split)
 	end
 	for _, s in ipairs(fields) do
 		if not noglob and glob_active(s) then
-			local m = M.glob_expand(s, { dotglob = dotglob, skipdots = skipdots, globstar = globstar })
+			local m = M.glob_expand(s, { dotglob = dotglob, skipdots = skipdots, globstar = globstar, nocase = sh.shopt.nocaseglob })
 			if m and gipats then
 				local filt = {}
 				for _, x in ipairs(m) do
@@ -7111,7 +7127,7 @@ function M.expand_fields(sh, segs)
 	end
 	for _, f in ipairs(fields) do
 		if not noglob and f.unq and glob_active(f) then
-			local m = M.glob_expand(glob_pat(f), { dotglob = dotglob, skipdots = skipdots, globstar = globstar })
+			local m = M.glob_expand(glob_pat(f), { dotglob = dotglob, skipdots = skipdots, globstar = globstar, nocase = sh.shopt.nocaseglob })
 			if m and gipats then
 				local filt = {}
 				for _, x in ipairs(m) do

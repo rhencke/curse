@@ -2311,6 +2311,7 @@ local function expand_to_fields(sh, w)
 					dotglob = dotglob,
 					skipdots = giset or shopt_on(sh, "globskipdots"),
 					globstar = shopt_on(sh, "globstar"),
+					nocase = shopt_on(sh, "nocaseglob"),
 				}
 			)
 			if m and gipats then
@@ -3843,10 +3844,11 @@ local function run_function(sh, cmd, fn, args, hook, tenv_base)
 	end
 	-- RETURN trap: fires as the function returns, still in ITS context (FUNCNAME, the
 	-- definition's $LINENO), preserving its exit status. A top-level RETURN trap is NOT
-	-- inherited by a function unless functrace (`set -T`) is on (bash) — a sourced
-	-- script's return fires it regardless (see the `.`/source builtin) — and a function
-	-- run by the DEBUG trap doesn't fire it.
-	local rt_h = (sh.opt_functrace or (sh.fn_trace and sh.fn_trace[cmd])) and sh.traps and sh.traps.RETURN
+	-- inherited by a function unless functrace (`set -T`) is on (bash: rt.debug_enter hid
+	-- it) — so one present now is inherited or was SET during this call, and fires — a
+	-- sourced script's return fires it regardless (see the `.`/source builtin) — and a
+	-- function run by the DEBUG trap doesn't fire it.
+	local rt_h = sh.traps and sh.traps.RETURN
 	if ok and rt_h and rt_h ~= "" and not sh.in_return_trap and not sh.in_debug then
 		sh.in_return_trap = true
 		local saved = sh.status
@@ -5959,7 +5961,9 @@ exec_stmt = function(sh, st, hook)
 						prev_read = -1
 					end
 					local savedout = sh.out
-					sh.out = io.write
+					if not sh.capturing then -- (inside $(…) the stage's output is the capture's)
+						sh.out = io.write
+					end
 					local ok, err = pcall(exec_stmt, sh, cmds[k], hook)
 					io.flush()
 					sh.out = savedout

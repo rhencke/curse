@@ -4171,24 +4171,23 @@ H.funcdef = function(cx, st, after)
 	-- Register the (hoisted) closure into sh.functions when the DEFINITION runs, not
 	-- at load — so a function doesn't "exist" (declare -f / delegated call / prefix
 	-- assign) before its def line (bash). Direct compiled calls use the hoisted local
-	-- regardless. Nested funcdefs (not in funcflags) stay a no-op for now.
+	-- regardless. A nested funcdef (not in funcflags: inside `$( )`, `a && f(){…}`, a
+	-- pipeline stage …) has no hoisted closure: interp defines it, when it runs.
 	-- def-redirect and redefined funcs: interp registers the def (with func_redirs, or
 	-- in program order for a redefinition) — the compiled fn_x can't represent either.
-	if st.redirs or emit_redir_funcs[st.name] then
+	if st.redirs or emit_redir_funcs[st.name] or not cx.funcflags[st.name] then
 		return cx.delegate(st, after)
 	end
 	local p = cx.newpc()
 	if not st.name:match("^[%w_:%.+@/%%%^~,!][%w_%.%-:+@/!#=%%%^~,]*$") then -- name is an expansion (`$foo-bar()`):
 		cx.blocks[p] = ("io.stderr:write(%q); sh.status = 1; pc = %d") -- non-fatal runtime error (bash)
 			:format("curse: `" .. st.name .. "': not a valid identifier\n", after)
-	elseif cx.funcflags[st.name] then
+	else
 		cx.blocks[p] = (st.name:match("^[%a_][%w_]*$") and "" -- (posix: a non-identifier name is fatal)
 			or ("if sh.opt_posix and not sh.opt_i then rt.err_at(sh, %s, %q); error({ __curse_exit = 2 }) end; ")
 				:format(st.top and tostring(st.eline) or "nil", "curse: `" .. st.name .. "': not a valid identifier\n"))
 			.. ("if sh.fn_ro and sh.fn_ro[%q] then rt.err_at(sh, %s, %q); sh.status = 1 else sh.functions[%q] = rt.mark_compiled(%s, %s) end; pc = %d"):format(
 			st.name, st.top and tostring(st.eline) or "nil", "curse: " .. st.name .. ": readonly function\n", st.name, EF.upv_wrapped(fnlname(st.name)), fnlname(st.name), after)
-	else
-		cx.blocks[p] = ("pc = %d"):format(after)
 	end
 	return p
 end
@@ -7009,6 +7008,11 @@ function M.emit(ast, opts)
 	-- tier has no trace hooks, so such a program stays in the interpreter (which traces).
 	if scan_xtrace(ast.stmts) then
 		error("curse-nocompile: xtrace")
+	end
+	-- a RETURN trap fires as each function returns (one set during a call, or inherited
+	-- under functrace): interp's run_function does that; compiled calls don't
+	if scan_trap(ast.stmts, { RETURN = 1 }) then
+		error("curse-nocompile: RETURN trap")
 	end
 	local alias_kind = scan_alias(ast.stmts)
 	if alias_kind == "dynamic" or (alias_kind == "static" and scan_dyncode(ast.stmts)) then
