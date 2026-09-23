@@ -110,8 +110,5 @@ return function(sh, cmd, args, hook, tcb)
 		if print_dir then
 			sh:echo(newpwd)
 		end
-		if sh.dirstack then
-			sh.dirstack[1] = newpwd
-		end
 	end
 end

@@ -1924,6 +1924,16 @@ function M.child_status(sh, ok, err)
 	end
 end
 
+-- Does a redirection list redirect standard input?
+function M.redirs_stdin(rd)
+	for _, r in ipairs(rd) do
+		local op = r.op
+		if (r.fd or 0) == 0 and (op == "in" or op == "heredoc" or op == "herestring" or op == "dupin" or op == "rw") then
+			return true
+		end
+	end
+	return false
+end
 -- `for NAME in …` with NAME readonly: bash reports it, status 1, and runs no iteration
 function M.for_var_ro(sh, name)
 	local b = sh.vars[sh:deref(name)]
@@ -2104,7 +2114,9 @@ function Shell:spawn_bg(args, cmdstr)
 	io.flush()
 	local fa = ffi.new("uint8_t[1024]")
 	C.posix_spawn_file_actions_init(fa)
-	C.posix_spawn_file_actions_addopen(fa, 0, "/dev/null", 0, 0) -- async job: stdin </dev/null
+	if (self.stdin_redir or 0) == 0 then -- async job: stdin </dev/null (unless redirected around it)
+		C.posix_spawn_file_actions_addopen(fa, 0, "/dev/null", 0, 0)
+	end
 	C.setenv("_", execpath, 1) -- (the program's `_` is its path, as in Shell:exec)
 	local pidp = ffi.new("curse_pid_t[1]")
 	local attr = child_spawnattr(self)
@@ -2132,7 +2144,7 @@ function Shell:run_background(cmd_fn, cmdstr, exec_tail)
 		-- a lone external: exec it in place (Shell:exec). Keyed to this child's pid so a
 		-- process forked while evaluating the words (a forked $(…)) never inherits it.
 		self.exec_tail = exec_tail and C.getpid() or nil
-		local dn = C.open("/dev/null", 0, 0)
+		local dn = (self.stdin_redir or 0) == 0 and C.open("/dev/null", 0, 0) or -1
 		if dn >= 0 then
 			C.dup2(dn, 0)
 			C.close(dn)
@@ -3334,6 +3346,17 @@ function M.tilde_prefix(sh, s)
 	if r == "+" or r:sub(1, 2) == "+/" or r:sub(1, 2) == "+:" then
 		return sh:pwd() .. r:sub(2)
 	end
+	-- ~N / ~+N / ~-N: an entry of the directory stack (N from the top, -N from the bottom)
+	local sign, num, tail = r:match("^([+-]?)(%d+)(.*)$")
+	if num and (tail == "" or tail:sub(1, 1) == "/" or tail:sub(1, 1) == ":") then
+		local ds = sh:dirstack_array()
+		local n = tonumber(num)
+		local e = (sign == "-") and ds[#ds - n] or ds[n + 1]
+		if e then
+			return e .. tail
+		end
+		return s
+	end
 	if r == "-" or r:sub(1, 2) == "-/" or r:sub(1, 2) == "-:" then
 		local o = sh:get("OLDPWD")
 		return o ~= "" and (o .. r:sub(2)) or s
@@ -3979,6 +4002,13 @@ function Shell:array_assign(name, values, append)
 		return -- (see set_str)
 	end
 	local b = box(self:deref(name), self.vars)
+	if b.int then -- declare -i array: each element is evaluated arithmetically (bash)
+		local ev = {}
+		for i = 1, #values do
+			ev[i] = M.i64_to_str(M.arith_str(self, values[i]))
+		end
+		values = ev
+	end
 	if append and b.arr then
 		local base = arr_max(b.arr) + 1
 		for i = 1, #values do
@@ -4006,6 +4036,16 @@ function Shell:array_set(name, key, val, append)
 	if val:find("\0", 1, true) then
 		val = M.cstr(val)
 	end -- C-string element: cut at NUL
+	if name == "DIRSTACK" and not self.vars.DIRSTACK then -- rewrite an existing stack entry
+		local k = tonumber(key)
+		local ds = self.dirstack or {}
+		local i = k and (#ds - k + 1) -- DIRSTACK[k] (k >= 1) is the k-th entry below the cwd
+		if i and k >= 1 and ds[i] then
+			ds[i] = append and (ds[i] .. val) or val
+			self.dirstack = ds
+		end
+		return true
+	end
 	local b = box(self:deref(name), self.vars)
 	if not b.arr then
 		b.arr = {}
@@ -4022,7 +4062,13 @@ function Shell:array_set(name, key, val, append)
 	if b.assoc and b.arr[key] == nil then
 		b.order[#b.order + 1] = key
 	end
-	if append then
+	if b.int then -- declare -i array: elements are arithmetic (+= adds) — bash
+		local v = M.arith_str(self, val)
+		if append then
+			v = M.arith_str(self, b.arr[key] or "0") + v
+		end
+		b.arr[key] = M.i64_to_str(v)
+	elseif append then
 		b.arr[key] = (b.arr[key] or "") .. val
 	else
 		b.arr[key] = val
@@ -4067,7 +4113,21 @@ function Shell:bash_lineno_array()
 	t[#t + 1] = "0"
 	return t
 end
-local VIRT_ARR = { FUNCNAME = "funcname_array", BASH_SOURCE = "bash_source_array", BASH_LINENO = "bash_lineno_array" }
+-- DIRSTACK: the directory stack, full paths, [0] always the current directory (bash)
+function Shell:dirstack_array() -- (sh.dirstack: the entries below the cwd, bottom first)
+	local ds = self.dirstack or {}
+	local t = { self:pwd() }
+	for k = #ds, 1, -1 do
+		t[#t + 1] = ds[k]
+	end
+	return t
+end
+local VIRT_ARR = {
+	FUNCNAME = "funcname_array",
+	BASH_SOURCE = "bash_source_array",
+	BASH_LINENO = "bash_lineno_array",
+	DIRSTACK = "dirstack_array",
+}
 function Shell:array_get(name, key)
 	if VIRT_ARR[name] then
 		return self[VIRT_ARR[name]](self)[(tonumber(key) or 0) + 1] or ""
@@ -4653,8 +4713,9 @@ local function glob_conv(glob, pn, patsub)
 							-- [:ascii:] (bash) isn't a regcomp class: its range instead
 							members[#members + 1] = (cls == "[:ascii:]") and "\1-\127" or cls
 							j = e + 2
-						else
-							members[#members + 1] = cj
+						else -- an unterminated `[:`: the `[` drops out, the rest are members
+							-- (bash: `[[:alpha]` matches h, not [ — and a kept `[:` would make
+							-- regcomp reject the whole class)
 							j = j + 1
 						end
 					elseif nx == "-" and glob:sub(j + 2, j + 2) ~= "]" and glob:sub(j + 2, j + 2) ~= ""
@@ -5121,6 +5182,64 @@ function M.time_push(sh)
 	sh._tstack = st
 	st[#st + 1] = { wall_secs(), os.clock() }
 end
+-- The `time` report as bash formats it: $TIMEFORMAT (default `\nreal\t%3lR\nuser\t%3lU\n
+-- sys\t%3lS`; `time -p` uses the POSIX form) — %[p][l]R/U/S (p digits, l = MmS.FFs),
+-- %P (CPU percentage), %%. An empty TIMEFORMAT prints nothing.
+function M.time_text(sh, real, user, sys, posix)
+	local fmt
+	if posix then
+		fmt = "real %2R\nuser %2U\nsys %2S"
+	elseif sh.vars.TIMEFORMAT then
+		fmt = sh:get("TIMEFORMAT")
+		if fmt == "" then
+			return ""
+		end
+	else
+		fmt = "\nreal\t%3lR\nuser\t%3lU\nsys\t%3lS"
+	end
+	local out, i, n = {}, 1, #fmt
+	while i <= n do
+		local c = fmt:sub(i, i)
+		if c == "%" and i < n then
+			local j, prec, long = i + 1, 3, false
+			local d = fmt:sub(j, j)
+			if d == "%" then
+				out[#out + 1] = "%"
+				i = j + 1
+			else
+				if d:match("%d") then
+					prec = math.min(3, tonumber(d))
+					j = j + 1
+					d = fmt:sub(j, j)
+				end
+				if d == "l" then
+					long = true
+					j = j + 1
+					d = fmt:sub(j, j)
+				end
+				local v = (d == "R" and real) or (d == "U" and user) or (d == "S" and sys)
+				if d == "P" then
+					v = real > 0 and ((user + sys) * 100 / real) or 0
+				end
+				if v then
+					if long and d ~= "P" then
+						out[#out + 1] = ("%dm%." .. prec .. "fs"):format(math.floor(v / 60), v % 60)
+					else
+						out[#out + 1] = ("%." .. prec .. "f"):format(v)
+					end
+					i = j + 1
+				else
+					out[#out + 1] = c
+					i = i + 1
+				end
+			end
+		else
+			out[#out + 1] = c
+			i = i + 1
+		end
+	end
+	return table.concat(out) .. "\n"
+end
 function M.time_report(sh, posix)
 	local st = sh._tstack
 	local t0 = st and table.remove(st)
@@ -5128,14 +5247,7 @@ function M.time_report(sh, posix)
 		return
 	end
 	local real, cpu = wall_secs() - t0[1], os.clock() - t0[2]
-	local function fmt(x)
-		return ("%dm%.3fs"):format(math.floor(x / 60), x % 60)
-	end
-	if posix then
-		io.stderr:write(("real %.2f\nuser %.2f\nsys %.2f\n"):format(real, cpu, 0))
-	else
-		io.stderr:write(("\nreal\t%s\nuser\t%s\nsys\t%s\n"):format(fmt(real), fmt(cpu), fmt(0)))
-	end
+	io.stderr:write(M.time_text(sh, real, cpu, 0, posix))
 end
 -- Compiled functions installed into sh.functions, keyed to the fn_x they wrap (weak).
 -- In a program with eval/source a command name can be (re)defined at RUNTIME, which a
@@ -5795,7 +5907,20 @@ function M.array_convert_err(sh, name, isassoc, cmd)
 	end
 	return false
 end
+local arrayassign_body
+-- an expression error in a subscript (`a=([x y]=1)`) fails just this assignment, status 1,
+-- like interp's arrayassign (errexit is the caller's errchk)
 function M.arrayassign(sh, name, items, append)
+	local ok, err = pcall(arrayassign_body, sh, name, items, append)
+	if not ok then
+		if type(err) == "table" and err.__curse_experr then
+			sh.status = 1
+			return
+		end
+		error(err, 0)
+	end
+end
+arrayassign_body = function(sh, name, items, append)
 	local rb = sh.vars[sh:deref(name)]
 	if rb and rb.ro then
 		io.stderr:write("curse: " .. name .. ": readonly variable\n")
@@ -6034,8 +6159,8 @@ function M.append_scalar(sh, name, value)
 	end
 	if b and b.arr then
 		sh:array_set(name, require("interp")._int.array_key(sh, name, "0"), value, true)
-	elseif b and b.int then
-		sh:aset(name, sh:aget(name) + M.arith_str(sh, value))
+	elseif b and b.int then -- (the old value is evaluated too, as bash does)
+		sh:aset(name, M.arith_str(sh, sh:get(name)) + M.arith_str(sh, value))
 	elseif b and (b.lower or b.upper) then -- declare -l/-u: case-fold the appended result
 		local v = sh:get(name) .. value
 		sh:set_str(name, b.lower and v:lower() or v:upper())
@@ -6610,10 +6735,10 @@ function M.ansi_unescape(s, mode)
 			elseif d == "\\" then
 				out[#out + 1] = "\\"
 				i = i + 2
-			elseif d == "'" then
+			elseif ansi_c and d == "'" then -- (only $'…' knows \' and \"; echo -e / %b keep them)
 				out[#out + 1] = "'"
 				i = i + 2
-			elseif d == '"' then
+			elseif ansi_c and d == '"' then
 				out[#out + 1] = '"'
 				i = i + 2
 			elseif d == "a" then

@@ -427,6 +427,9 @@ local function worker_main(lfd, my_uid, ctx, slot)
 			-- SO_PEERCRED: reject any peer that isn't us (defense-in-depth).
 			credlen[0] = ffi.sizeof("struct curse_ucred")
 			C.getsockopt(cfd, SOL_SOCKET, SO_PEERCRED, cred, credlen)
+			if cred[0].pid > 1 then
+				ctx.busy[slot] = cred[0].pid -- (the parent kills this worker if that client dies)
+			end
 			if my_uid and cred[0].uid ~= my_uid then
 				C.close(cfd)
 			else
@@ -687,7 +690,18 @@ local function serve()
 			np = np + 1
 		end
 		-- a worker exit (pidfd readable) just loops back to the reap/respawn above
-		if C.curse_d_poll(lp, np, 1000) > 0 and lp[0].revents ~= 0 then -- a connection is pending
+		local pr = C.curse_d_poll(lp, np, 1000)
+		-- A worker whose CLIENT has died (killed by a timeout, ^C…) is still running an
+		-- abandoned request: kill it (the reap above respawns it) — otherwise it holds its
+		-- slot, and every later request queues behind it.
+		for pid, slot in pairs(pidslot) do
+			local cpid = busy[slot]
+			if cpid > 1 and C.kill(cpid, 0) ~= 0 and ffi.errno() == 3 then -- ESRCH
+				busy[slot] = 0
+				C.kill(pid, 9)
+			end
+		end
+		if pr > 0 and lp[0].revents ~= 0 then -- a connection is pending
 			local nbusy = 0
 			for slot in pairs(used) do
 				if busy[slot] ~= 0 then

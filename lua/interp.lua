@@ -1641,6 +1641,10 @@ local function multi_elems(sh, p) -- returns element list, star?
 			else
 				return {}, star
 			end
+		elseif pe.op == "@" and pe.arg == "A" and pe.name ~= "@" and pe.name ~= "*" then
+			-- ${a[@]@A}: the whole array as the declaration that recreates it (one word)
+			local d = M._int.fmt_decl(sh, pe.name)
+			return d and { d } or {}, star
 		elseif pe.op == "@" and pe.arg == "a" then -- ${a[@]@a}: the variable's attribute string, per element
 			local attr = sh:attr_string(pe.name)
 			local out = {}
@@ -1869,32 +1873,73 @@ local function expand_to_fields(sh, w)
 		elseif
 			p.pexp
 			and not p.q
-			and (p.pexp.op == ":-" or p.pexp.op == "-")
+			and (p.pexp.op == ":-" or p.pexp.op == "-" or p.pexp.op == ":+" or p.pexp.op == "+")
 			and not p.pexp.index
 			and p.pexp.name ~= "@"
 			and p.pexp.name ~= "*"
 		then
-			-- unquoted ${x:-word}/-: when the WORD branch is taken, the word's OWN quoting
-			-- governs splitting (bash), so expand it field-wise rather than as a flat string.
+			-- unquoted ${x:-word}/-/:+/+: when the WORD branch is taken, the word's OWN quoting
+			-- governs splitting (bash), so expand it field-wise rather than as a flat string —
+			-- and a quoted "$@"/"${a[@]}" in it keeps its separate words (${1+"$@"})
 			local pe = p.pexp
 			local b = sh.vars[sh:deref(pe.name)]
 			local hasval = b ~= nil and (b.s ~= nil or b.n ~= nil or b.arr ~= nil) or sh:special_get(pe.name) ~= ""
-			local useword = (pe.op == ":-" and sh:get(pe.name) == "") or (pe.op == "-" and not hasval)
+			local pn = tonumber(pe.name) -- a positional parameter is set when within $#
+			if pn then
+				hasval = pn == 0 or pn <= sh.nparams
+			end
+			local nonnull = sh:get(pe.name) ~= ""
+			local useword
+			if pe.op == ":-" then
+				useword = not nonnull
+			elseif pe.op == "-" then
+				useword = not hasval
+			elseif pe.op == ":+" then
+				useword = nonnull
+			else
+				useword = hasval
+			end
 			if useword and pe.arg then
 				-- expand the default's parts: a QUOTED part is one atomic (sub)field, an
 				-- unquoted part word-splits — so 'a b' stays one field but a b splits.
 				for k, sp in ipairs(P.parse_word(pe.arg).parts) do
-					local s = expand_part_str(sh, sp)
-					if k == 1 and sp.lit ~= nil and not sp.q then
-						s = tilde_prefix(sh, s)
-					end -- word-initial ~
-					if sp.q then
-						add(s, false)
+					if sp.q and is_multi(sh, sp) then
+						local els, star = multi_elems(sh, sp)
+						if star then
+							add(table.concat(els, sh.vars["IFS"] and rt.ifs_first(sh:get("IFS")) or " "), false)
+						else
+							for e = 1, #els do
+								if e > 1 then
+									brk()
+								end
+								add(els[e], false)
+							end
+						end
+					elseif is_multi(sh, sp) then -- unquoted $@/$*: as at the top level of a word
+						local els = multi_elems(sh, sp)
+						if ifs == "" then
+							for e = 1, #els do
+								if e > 1 then
+									brk()
+								end
+								feed_split(els[e])
+							end
+						else
+							feed_split(table.concat(els, rt.ifs_first(ifs)))
+						end
 					else
-						feed_split(s)
+						local s = expand_part_str(sh, sp)
+						if k == 1 and sp.lit ~= nil and not sp.q then
+							s = tilde_prefix(sh, s)
+						end -- word-initial ~
+						if sp.q then
+							add(s, false)
+						else
+							feed_split(s)
+						end
 					end
 				end
-			else
+			elseif pe.op == ":-" or pe.op == "-" then
 				feed_split(sh:get(pe.name))
 			end
 		else
@@ -2162,12 +2207,38 @@ local function apply_redirs(sh, redirs)
 	for _, r in ipairs(redirs) do
 		-- `{var}>…`: allocate a fresh fd (>=10), store it in `var`, and redirect there.
 		-- `{var}>&-` instead closes the fd already stored in `var` (no allocation).
+		-- {v} or an array element {a[i]}: where the allocated fd number is stored/read
+		local fvn, fvs = nil, nil
+		if r.fdvar then
+			fvn, fvs = r.fdvar:match("^([%a_][%w_]*)%[(.*)%]$")
+		end
+		local function fdvar_get()
+			if fvn then
+				return sh:array_get(fvn, array_key(sh, fvn, fvs))
+			end
+			return sh:get(r.fdvar)
+		end
+		local function fdvar_set(v)
+			if fvn then
+				sh:array_set(fvn, array_key(sh, fvn, fvs), v, false)
+			else
+				sh:set_str(r.fdvar, v)
+			end
+		end
+		local fdb = r.fdvar and sh.vars[sh:deref(fvn or r.fdvar)]
+		if fdb and fdb.ro and not ((r.op == "dup" or r.op == "dupin") and r.target == "-") then
+			-- `{v}>…` with v readonly: bash refuses (no fd is allocated) and the command fails
+			io.stderr:write("curse: " .. r.fdvar .. ": readonly variable\n")
+			io.stderr:write("curse: " .. r.fdvar .. ": cannot assign fd to variable\n")
+			ok = false
+			break
+		end
 		if r.fdvar then
 			if (r.op == "dup" or r.op == "dupin") and r.target == "-" then
-				r = setmetatable({ fd = tonumber(sh:get(r.fdvar)) or -1 }, { __index = r })
+				r = setmetatable({ fd = tonumber(fdvar_get()) or -1 }, { __index = r })
 			else
 				local nf = alloc_fd()
-				sh:set_str(r.fdvar, tostring(nf))
+				fdvar_set(tostring(nf))
 				persist[nf] = true
 				r = setmetatable({ fd = nf }, { __index = r }) -- shadow r.fd, inherit op/target
 			end
@@ -2302,7 +2373,8 @@ local function apply_redirs(sh, redirs)
 					-- dup-based backup would otherwise reuse a just-closed source fd number,
 					-- making a stale `>&N` spuriously succeed (fd N reopened as the backup).
 					if C.fcntl(m, 1) == -1 then -- F_GETFD on a closed fd returns -1 (EBADF)
-						io.stderr:write("curse: " .. tv .. ": Bad file descriptor\n")
+						-- (bash names the target as written: `$v: Bad file descriptor`)
+						io.stderr:write("curse: " .. (r.target or tv) .. ": Bad file descriptor\n")
 						ok = false
 					else
 						backup(r.fd)
@@ -2739,7 +2811,12 @@ local function fmt_decl(sh, name)
 			.. (b.exported and "x" or "")
 		local parts = {}
 		for _, k in ipairs(sh:array_indices(name)) do
-			parts[#parts + 1] = "[" .. tostring(k) .. "]=" .. decl_quote(sh:array_get(name, k))
+			local ks = tostring(k)
+			-- an assoc key with shell metacharacters (or control chars) is quoted like a value
+			if b.assoc and (ks == "" or ks:find("[^%w_%%+,./:@%-]")) then
+				ks = decl_quote(ks)
+			end
+			parts[#parts + 1] = "[" .. ks .. "]=" .. decl_quote(sh:array_get(name, k))
 		end
 		if b.assoc then
 			if #parts == 0 then
@@ -3020,6 +3097,12 @@ local function printf_parse(fmt)
 			elseif d == "v" then
 				lit[#lit + 1] = "\11"
 				i = i + 2
+			elseif d == "'" or d == '"' or d == "?" then -- (the format knows these; %b doesn't)
+				lit[#lit + 1] = d
+				i = i + 2
+			elseif d == "e" or d == "E" then
+				lit[#lit + 1] = "\27"
+				i = i + 2
 			elseif d == "x" then
 				local h = fmt:match("^%x%x?", i + 2)
 				if h then
@@ -3055,7 +3138,10 @@ local function printf_parse(fmt)
 				flush()
 				local spec = "%"
 				while fmt:sub(j, j):match("[-+ #0]") do
-					spec = spec .. fmt:sub(j, j)
+					local fl = fmt:sub(j, j)
+					if not spec:find(fl, 2, true) then -- (each flag once: `%000…0d` is `%0d`)
+						spec = spec .. fl
+					end
 					j = j + 1
 				end
 				local width, dynw = "", false
@@ -3085,13 +3171,34 @@ local function printf_parse(fmt)
 				while fmt:sub(j, j):match("[lhLjzt]") do
 					j = j + 1
 				end
-				if fmt:sub(j, j) == "(" then -- %(FORMAT)T strftime
-					local close = fmt:find(")", j + 1, true)
-					local tfmt = fmt:sub(j + 1, (close or j + 1) - 1)
-					j = (close or j) + 1
-					toks[#toks + 1] =
-						{ strftime = true, spec = spec, width = width, dynw = dynw, prec = prec, dynp = dynp, tfmt = tfmt }
-					i = j + 1
+				if fmt:sub(j, j) == "(" then -- %(FORMAT)T strftime (parens inside FORMAT nest)
+					local depth, close = 1, nil
+					for q = j + 1, n do
+						local ch = fmt:sub(q, q)
+						if ch == "(" then
+							depth = depth + 1
+						elseif ch == ")" then
+							depth = depth - 1
+							if depth == 0 then
+								close = q
+								break
+							end
+						end
+					end
+					if close and fmt:sub(close + 1, close + 1) == "T" then
+						local tfmt = fmt:sub(j + 1, close - 1)
+						if tfmt == "" then
+							tfmt = "%X" -- (an empty format is the locale's time, bash)
+						end
+						toks[#toks + 1] =
+							{ strftime = true, spec = spec, width = width, dynw = dynw, prec = prec, dynp = dynp, tfmt = tfmt }
+						i = close + 2
+					else -- not a %(…)T: bash warns and prints it as written
+						local stop = close and close + 1 or n
+						io.stderr:write("curse: printf: `" .. fmt:sub(stop, stop) .. "': invalid time format specification\n")
+						lit[#lit + 1] = fmt:sub(i, stop)
+						i = stop + 1
+					end
 				else
 					toks[#toks + 1] =
 						{ conv = fmt:sub(j, j), spec = spec, width = width, dynw = dynw, prec = prec, dynp = dynp }
@@ -3106,7 +3213,8 @@ local function printf_parse(fmt)
 	flush()
 	return toks
 end
-local function sh_printf(fmt, argv, start)
+-- `nsets` (optional): collects %n requests as { name, byte-count-so-far } for the caller
+local function sh_printf(fmt, argv, start, nsets)
 	local toks = _pf_cache[fmt]
 	if not toks then
 		toks = printf_parse(fmt)
@@ -3152,8 +3260,21 @@ local function sh_printf(fmt, argv, start)
 					out[#out + 1] = string.format("%" .. spec:sub(2) .. width .. "s", sres)
 				else
 					local conv = tk.conv
+					-- a width past what string.format takes (2 digits): format without it, pad after
+					local bigw = tonumber(width)
+					if bigw and bigw > 99 then
+						width = ""
+					else
+						bigw = nil
+					end
 					local full = spec .. width .. (prec and ("." .. prec) or "")
-					if conv == "s" then
+					if conv == "n" then -- %n: store the number of bytes written so far in NAME
+						local nm = nextarg()
+						if nsets then
+							nsets[#nsets + 1] = { nm, #table.concat(out) }
+						end
+						out[#out + 1] = ""
+					elseif conv == "s" then
 						out[#out + 1] = string.format(
 							(spec:gsub("0", "", 1)) .. width .. (prec and ("." .. prec) or "") .. "s",
 							nextarg()
@@ -3162,7 +3283,9 @@ local function sh_printf(fmt, argv, start)
 						out[#out + 1] = string.format("%" .. spec:sub(2) .. width .. "s", nextarg():sub(1, 1))
 					elseif conv == "b" then
 						local bs, bstop = rt.ansi_unescape(nextarg(), "b")
-						out[#out + 1] = string.format("%" .. spec:sub(2) .. width .. "s", bs)
+						-- (width AND precision apply to the expanded string, like %s)
+						out[#out + 1] = string.format(
+							(spec:gsub("0", "", 1)) .. width .. (prec and ("." .. prec) or "") .. "s", bs)
 						if bstop then
 							return table.concat(out), status
 						end
@@ -3179,6 +3302,18 @@ local function sh_printf(fmt, argv, start)
 							return table.concat(out), 1
 						end
 						out[#out + 1] = r
+					end
+					local s = bigw and out[#out]
+					if s and #s < bigw then
+						if spec:find("-", 1, true) then
+							s = s .. (" "):rep(bigw - #s)
+						elseif spec:find("0", 1, true) and not prec and conv:match("[diouxXeEfFgGaA]") then
+							local pre, rest = s:match("^([+%- ]?0?[xX]?)(.*)$")
+							s = pre .. ("0"):rep(bigw - #s) .. rest
+						else
+							s = (" "):rep(bigw - #s) .. s
+						end
+						out[#out] = s
 					end
 				end
 			end
@@ -3703,7 +3838,13 @@ end
 -- tree as native Lua (short-circuit) and calls these for the leaves, with operands
 -- computed natively via emit_word — genuine compilation, not an AST re-walk.
 function M.dbracket_arith(sh, s)
-	return eval(sh, P.arith(s == "" and "0" or s))
+	local ok, ast = pcall(P.arith, s == "" and "0" or s)
+	if not ok then -- not an arithmetic expression: a shell error (fails the command), never
+		-- a raw Lua error out of compiled code
+		io.stderr:write("curse: " .. s .. ": syntax error in expression\n")
+		error({ __curse_exit = 1, __curse_matherr = true, __curse_experr = true })
+	end
+	return eval(sh, ast)
 end -- -eq/-lt… operand
 function M.dbracket_unary(sh, op, val)
 	return unary(sh, op, val)
@@ -3887,9 +4028,6 @@ local function wall_secs()
 	C.gettimeofday(tv_now, nil)
 	return tonumber(tv_now.tv_sec) + tonumber(tv_now.tv_usec) * 1e-6
 end
-local function fmt_time(s)
-	return ("%dm%.3fs"):format(math.floor(s / 60), s % 60)
-end
 
 local exec_stmt
 exec_stmt = function(sh, st, hook)
@@ -3905,11 +4043,7 @@ exec_stmt = function(sh, st, hook)
 		local ok, err = pcall(exec_stmt, sh, st, hook)
 		local real, cpu = wall_secs() - r0, os.clock() - c0
 		st.timed = true
-		if st.timed_p then
-			io.stderr:write(("real %.2f\nuser %.2f\nsys %.2f\n"):format(real, cpu, 0))
-		else
-			io.stderr:write(("\nreal\t%s\nuser\t%s\nsys\t%s\n"):format(fmt_time(real), fmt_time(cpu), fmt_time(0)))
-		end
+		io.stderr:write(rt.time_text(sh, real, cpu, 0, st.timed_p))
 		if not ok then
 			error(err)
 		end
@@ -3962,8 +4096,16 @@ exec_stmt = function(sh, st, hook)
 		if redirs_touch_stdout(rd) then
 			sh.out = io.write
 		end
+		-- an async command inside keeps this stdin instead of /dev/null (bash's stdin_redir)
+		local inr = rt.redirs_stdin(rd)
+		if inr then
+			sh.stdin_redir = (sh.stdin_redir or 0) + 1
+		end
 		st.redirs = nil
 		local pok, err = pcall(exec_stmt, sh, st, hook)
+		if inr then
+			sh.stdin_redir = sh.stdin_redir - 1
+		end
 		st.redirs = rd
 		io.flush()
 		sh.out = savedout
@@ -4060,8 +4202,9 @@ exec_stmt = function(sh, st, hook)
 					local b = sh.vars[sh:deref(st.name)]
 					if b and b.arr then -- `name+=value` on an array appends to element 0 (bash)
 						sh:array_set(st.name, array_key(sh, st.name, "0"), expand_assign_word(sh, st.rhs), true)
-					elseif b and b.int then -- integer var: += is arithmetic addition
-						sh:aset(st.name, sh:aget(st.name) + eval(sh, P.arith(expand_word(sh, st.rhs))))
+					elseif b and b.int then -- integer var: += is arithmetic addition (the old value
+						-- is itself evaluated: `b=4+1; typeset -i b; b+=37` is 42 — bash)
+						sh:aset(st.name, rt.arith_str(sh, sh:get(st.name)) + eval(sh, P.arith(expand_word(sh, st.rhs))))
 					elseif b and (b.lower or b.upper) then -- declare -l/-u: case-fold the appended result
 						local v = sh:get(st.name) .. expand_assign_word(sh, st.rhs)
 						sh:set_str(st.name, b.lower and v:lower() or v:upper())
@@ -4767,7 +4910,8 @@ exec_stmt = function(sh, st, hook)
 		if pid == 0 then
 			-- Without job control, an async command's stdin is /dev/null (bash), so it
 			-- can't steal the terminal — and it must not inherit a redirect it didn't ask for.
-			local dn = C.open("/dev/null", 0, 0)
+			-- (unless an enclosing command redirected stdin: then the job reads that — bash)
+			local dn = (sh.stdin_redir or 0) == 0 and C.open("/dev/null", 0, 0) or -1
 			if dn >= 0 then
 				C.dup2(dn, 0)
 				C.close(dn)

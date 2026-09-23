@@ -25,7 +25,12 @@ return function(sh, cmd, args, hook, tcb)
 				io.stderr:write("curse: printf: -v: option requires an argument\n")
 				sh.status = 2
 			else
-				local res, st = sh_printf(args[4] or "", args, 5)
+				local nsets = {}
+				local fi = args[4] == "--" and 5 or 4 -- (`printf -v VAR -- FMT …`)
+				local res, st = sh_printf(args[fi] or "", args, fi + 1, nsets)
+				for _, ns in ipairs(nsets) do
+					sh:set_str(ns[1], tostring(ns[2]))
+				end
 				-- target may be NAME or NAME[SUBSCRIPT]
 				local nm, sub = target:match("^([%a_][%w_]*)%[(.*)%]$")
 				if nm then
@@ -53,7 +58,11 @@ return function(sh, cmd, args, hook, tcb)
 				io.stderr:write("curse: printf: usage: printf [-v var] format [arguments]\n")
 				sh.status = 2
 			else
-				local res, st = sh_printf(args[fi], args, fi + 1)
+				local nsets = {}
+				local res, st = sh_printf(args[fi], args, fi + 1, nsets)
+				for _, ns in ipairs(nsets) do
+					sh:set_str(ns[1], tostring(ns[2]))
+				end
 				sh.out(res)
 				if sh.out == io.write and not io.flush() then
 					sh.write_err = true

@@ -1010,6 +1010,17 @@ local function strip_contin(w)
 			local e = w:find("'", i + 1, true) or n
 			o[#o + 1] = w:sub(i, e)
 			i = e + 1
+		elseif c == "$" and w:sub(i + 1, i + 1) == "(" and w:sub(i + 2, i + 2) ~= "(" then
+			-- a $(…) body is its own program: the inner parse handles its continuations
+			-- (a quoted heredoc in it keeps a literal \<newline>)
+			local ok, e = pcall(scan_cmdsub, w, i + 2)
+			if ok and e then
+				o[#o + 1] = w:sub(i, e - 1)
+				i = e
+			else
+				o[#o + 1] = c
+				i = i + 1
+			end
 		elseif c == "\\" then
 			if w:sub(i + 1, i + 1) == "\n" then
 				i = i + 2 -- continuation: drop both
@@ -1131,7 +1142,9 @@ local function parse_word(w)
 			i = j + 1
 		elseif c == "\\" then -- backslash escape: literal next char (newline = continuation)
 			local nx = w:sub(i + 1, i + 1)
-			if nx == "\n" or nx == "" then -- line continuation / trailing backslash: drop
+			if nx == "\n" then -- line continuation: drop
+			elseif nx == "" then -- a backslash ending the input is itself literal (bash: `a\`)
+				add({ lit = "\\", q = true })
 			else
 				add({ lit = nx, q = true })
 			end
@@ -2334,7 +2347,7 @@ local function make_parser(src, sh, aenv)
 		end
 		-- `{var}>…` names a fd: bash allocates a fd (>=10) and stores it in `var`.
 		-- Only when `{var}` is immediately followed by a redirection operator.
-		local fdvar = src:match("^{([%a_][%w_]*)}[<>]", p)
+		local fdvar = src:match("^{([%a_][%w_]*)}[<>]", p) or src:match("^{([%a_][%w_]*%b[])}[<>]", p)
 		local fd = not fdvar and src:match("^%d+", p) or nil
 		local q = fdvar and (p + #fdvar + 2) or (fd and (p + #fd) or p)
 		local c = src:sub(q, q)
@@ -2372,7 +2385,7 @@ local function make_parser(src, sh, aenv)
 				end
 				i = q
 				ws()
-				local draw = word()
+				local draw = strip_contin(word()) -- (`<<\EOT\<newline>4` is EOT4)
 				-- ANY quoting anywhere in the delimiter word makes the body literal (bash);
 				-- the delimiter itself is the word with all quotes removed.
 				local quoted = draw:find("['\"\\]") ~= nil
@@ -3457,26 +3470,49 @@ local function make_parser(src, sh, aenv)
 		-- `time [-p]` reserved word may precede the (optionally `!`-negated) pipeline;
 		-- it's a keyword only as a standalone word (followed by whitespace/newline).
 		local timed, timed_p = false, false
-		if src:sub(i, i + 3) == "time" and src:sub(i + 4, i + 4):match("[ \t\n]") then
-			timed = true
-			i = i + 4
-			ws()
-			while src:sub(i, i + 1) == "-p" and src:sub(i + 2, i + 2):match("[ \t\n]") do
-				timed_p = true
-				i = i + 2
+		local function bang_at(k) -- a `!` word: followed by a blank, a separator, or the end
+			return src:sub(k, k) == "!" and (src:sub(k + 1, k + 1) == "" or src:sub(k + 1, k + 1):match("[ \t\n;&|)]"))
+		end
+		local function time_at(k) -- the `time` reserved word (a standalone word)
+			return src:sub(k, k + 3) == "time" and (src:sub(k + 4, k + 4) == "" or src:sub(k + 4, k + 4):match("[ \t\n;&|]"))
+		end
+		-- `time [-p]` and `!` may precede a pipeline in any order and repeat (bash's grammar:
+		-- `! time cmd`, `time ! cmd`, `time time cmd`); each `!` toggles the inversion
+		local sawbang = false
+		while true do
+			if time_at(i) then
+				timed = true
+				i = i + 4
 				ws()
+				while src:sub(i, i + 1) == "-p" and src:sub(i + 2, i + 2):match("[ \t\n]") do
+					timed_p = true
+					i = i + 2
+					ws()
+				end
+				if timed_p and src:sub(i, i + 1) == "--" and src:sub(i + 2, i + 2):match("[ \t\n]") then
+					i = i + 2 -- `time -p -- cmd`: the options end
+					ws()
+				end
+			elseif bang_at(i) then
+				negate = not negate
+				sawbang = true
+				i = i + 1
+				ws()
+			else
+				break
 			end
 		end
-		if src:sub(i, i):match("!") and src:sub(i + 1, i + 1):match("[ \t]") then
-			-- each `!` toggles (`! ! cmd` is cmd — bash's parser flips the invert flag)
-			while src:sub(i, i) == "!" and src:sub(i + 1, i + 1):match("[ \t]") do
-				negate = not negate
-				i = i + 2
-				ws()
+		do
+			local c = src:sub(i, i)
+			if (sawbang or timed) and (c == "" or c:match("[\n;&|)]")) then
+				-- a bare `!` / `time` applies to an EMPTY pipeline (`!` alone is status 1) — bash
+				return { t = "pipeline", cmds = { { t = "noop", line = ln } }, negate = negate, line = ln,
+					timed = timed or nil, timed_p = timed_p or nil }
 			end
-		elseif src:sub(i, i + 1) == "!(" and not (sh and sh.shopt and sh.shopt.extglob or (not sh and extglob_on)) then
+		end
+		if src:sub(i, i + 1) == "!(" and not (sh and sh.shopt and sh.shopt.extglob or (not sh and extglob_on)) then
 			-- without extglob, `!(cmds)` is `!` negating a ( … ) subshell, not a pattern word
-			negate = true
+			negate = not negate
 			i = i + 1
 		end
 		local first = parse_command()

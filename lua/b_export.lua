@@ -338,8 +338,8 @@ return function(sh, cmd, args, hook, tcb)
 							allok = false
 						end
 					elseif iattr then -- declare -i: arith-evaluate the value, mark integer
-						if ap then
-							sh:aset(nm, sh:aget(nm) + eval(sh, P.arith(val)))
+						if ap then -- (the old value is evaluated as an expression too)
+							sh:aset(nm, rt.arith_str(sh, sh:get(nm)) + eval(sh, P.arith(val)))
 						else
 							sh:aset(nm, eval(sh, P.arith(val)))
 						end
@@ -358,7 +358,12 @@ return function(sh, cmd, args, hook, tcb)
 							if assoc then
 								sh:declare_assoc(nm)
 							end
-							sh:set_str(nm, ap and (sh:get(nm) .. val) or val)
+							if eb and eb.int and not assoc then -- an integer var stays arithmetic
+								local v = rt.arith_str(sh, val)
+								sh:aset(nm, ap and (rt.arith_str(sh, sh:get(nm)) + v) or v)
+							else
+								sh:set_str(nm, ap and (sh:get(nm) .. val) or val)
+							end
 						end
 					end
 					local bb = sh.vars[sh:deref(nm)]

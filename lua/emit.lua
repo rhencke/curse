@@ -2088,6 +2088,9 @@ local function pexp_word_args_ok(pe)
 		if a:find("[~\\'\"]") then
 			return false
 		end
+		if a:find("%$[@*]") or a:find("%${[@*]") or a:find("%[[@*]%]") then
+			return false -- a multi-word operand ($@, $*, ${a[@]}): interp keeps its fields
+		end
 		local ok, w = pcall(require("parser").parse_word, a)
 		return ok and emitable_word(w) or false
 	end
@@ -2176,6 +2179,10 @@ function pexp_compilable(pe, quoted)
 		if not quoted and pe.arg and pe.arg:find("[~\\'\"]") then
 			return false
 		end
+		-- an unquoted multi-word default ($@, $*, ${a[@]}) keeps its own fields (interp)
+		if not quoted and pe.arg and (pe.arg:find("%$[@*]") or pe.arg:find("%${[@*]") or pe.arg:find("%[[@*]%]")) then
+			return false
+		end
 		local ok, w = pcall(quoted and P.parse_default_quoted or P.parse_word, pe.arg or "")
 		return ok and emitable_word(w) or false
 	end
@@ -2244,8 +2251,9 @@ local function array_multi_op(pe)
 		return true
 	end -- bare ${a[@]} / ${a[*]} (bare $@/$* is p.special, not here)
 	if pe.op == "@" then
-		return PEXP_AT[pe.arg] and pe.arg ~= "a" and true or false
-	end -- ${a[@]@Q} … (@a stays with interp: a per-element attr string, not an apply_str_op)
+		return PEXP_AT[pe.arg] and pe.arg ~= "a" and not (is_arr and pe.arg == "A") and true or false
+	end -- ${a[@]@Q} … (@a — a per-element attr string — and ${a[@]@A} — the whole array's
+	-- declaration — stay with interp: neither is a per-element apply_str_op)
 	if pe.op == "sub" then
 		return pexp_word_args_ok(pe)
 	end -- ${a[@]:off:len} slice
@@ -5785,15 +5793,18 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
 		-- restored even when the body raises (exit / errexit / a break-continue-return signal),
 		-- and a failed redirect runs opts.redir_fail (ERR/errexit) instead of the body.
 		local rbody = opts and opts.redir_body
-		local so_in = rbody and rbody.stdout and "sh.out = io.write; " or ""
+		local so_in = (rbody and rbody.stdout and "sh.out = io.write; " or "")
+			.. (rbody and rbody.stdin and "sh.stdin_redir = (sh.stdin_redir or 0) + 1; " or "")
+		local si_out = rbody and rbody.stdin and "sh.stdin_redir = sh.stdin_redir - 1; " or ""
 		local rfail = rbody and rbody.fail and ("; " .. rbody.fail) or ""
 		local function callwrap()
 			if rbody then
-				return ("do local __rs, __so = {}, sh.out; if %s then %slocal __ok, __e = pcall(%s, %s); sh.out = __so; rt.redir_restore(__rs); if not __ok then error(__e, 0) end else rt.redir_restore(__rs); sh.status = 1%s end end"):format(
+				return ("do local __rs, __so = {}, sh.out; if %s then %slocal __ok, __e = pcall(%s, %s); %ssh.out = __so; rt.redir_restore(__rs); if not __ok then error(__e, 0) end else rt.redir_restore(__rs); sh.status = 1%s end end"):format(
 					redir,
 					so_in,
 					callee,
 					callargs,
+					si_out,
 					rfail
 				)
 			end
@@ -6060,6 +6071,7 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
 			upv_keep = true,
 			redir_body = {
 				stdout = cx.stdout_redir(st.redirs),
+				stdin = require("runtime").redirs_stdin(st.redirs), -- (async jobs inside keep it)
 				fail = ("%sif sh.opt_e and sh.noerr == 0 then %s end"):format(errfire, exitfail),
 			},
 		})

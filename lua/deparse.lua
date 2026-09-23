@@ -209,7 +209,7 @@ conv = function(st)
 		end
 		return { k = "simple", words = ws }
 	elseif t == "pipeline" then
-		c = chain(st.cmds, "|", conv)
+		c = chain(st.cmds, "|", conv) or { k = "simple", words = {} } -- (a bare `!` / `time`)
 		if st.negate then
 			c.invert = not c.invert -- (`! ! cmd` cancels, as bash's parser toggles it)
 		end
