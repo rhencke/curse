@@ -458,6 +458,10 @@ local function scan_xtrace(node)
 				or (l:match("^%-%a+$") and l:find("[xvrk]", 2)) then
 				return true
 			end
+			-- a first non-option word (`set x $i`) or `--` makes the rest positional params
+			if l == "--" or l == "-" or not l:match("^[-+]") then
+				break
+			end
 		end
 	end
 	for _, v in pairs(node) do
@@ -3518,6 +3522,16 @@ analyze_lift = function(ast)
 				for _, cl in ipairs(st.clauses) do
 					scan(cl.body)
 				end
+			elseif st.t == "case" then -- (disqualify only: a non-numeric `x=…` in a clause
+				for _, cl in ipairs(st.clauses) do -- keeps x off the lift set)
+					disq_scan(cl.body)
+				end
+			elseif st.t == "andor" then
+				for _, it in ipairs(st.items) do
+					disq_scan({ it.cmd })
+				end
+			elseif st.t == "pipeline" then
+				disq_scan(st.cmds) -- (stages are subshells: their assignments don't lift anything)
 			elseif st.t == "funcdef" then
 				scan(st.body)
 			elseif st.t == "subshell" or st.t == "group" then
@@ -3558,9 +3572,50 @@ analyze_lift = function(ast)
 		end
 	end
 	spb_walk(ast.stmts)
+	-- A lifted var is a native int64 that can't be UNSET, so it must never be observed
+	-- before its first assignment (`if …; then e=1; fi; echo "$e"` would print 0). Lift only
+	-- a var whose FIRST mention in program order is an unconditional top-level numeric
+	-- assignment (or a `for ((v=…` initializer): it is always set before anything reads it.
+	local function mentions(node, nm, seen)
+		if type(node) == "string" then
+			return node:find("%f[%w_]" .. nm .. "%f[^%w_]") ~= nil
+		end
+		if type(node) ~= "table" or seen[node] then
+			return false
+		end
+		seen[node] = true
+		for _, v in pairs(node) do
+			if mentions(v, nm, seen) then
+				return true
+			end
+		end
+		return false
+	end
+	-- In program order within `stmts`: "set" if nm is unconditionally assigned before any
+	-- other mention, "bad" if mentioned first some other way, nil if not mentioned. A
+	-- function definition is fine to pass over when its OWN body sets nm first (every call
+	-- assigns before reading); a body that reads first makes the var unliftable.
+	local function first_use(stmts, nm)
+		for _, st in ipairs(stmts) do
+			if st.t == "assign" and st.name == nm and not st.index then
+				return "set" -- (numeric: anything else was disqualified above)
+			end
+			if st.t == "forc" and st.init and st.init.k == "asgn" and st.init.name == nm then
+				return "set"
+			end
+			if st.t == "funcdef" then
+				if mentions(st.body, nm, {}) and first_use(st.body, nm) ~= "set" then
+					return "bad"
+				end
+			elseif mentions(st, nm, {}) then
+				return "bad"
+			end
+		end
+		return nil
+	end
 	local lifted = {}
 	for n in pairs(assigned) do
-		if not disq[n] and not localed[n] then
+		if not disq[n] and not localed[n] and first_use(ast.stmts, n) ~= "bad" then
 			lifted[n] = true
 		end
 	end

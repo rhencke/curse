@@ -588,6 +588,9 @@ function M.ifs_split(ifs, s)
 			i = i + 2
 		elseif inifs(c) then
 			if isws(c) then
+				-- (LEADING whitespace is just ignored: a `:` right after it still ends an
+				-- empty first field — IFS=': ' splits " :" into one empty field)
+				local leading = cur == nil and #fields == 0
 				if cur ~= nil then
 					brk()
 				end
@@ -595,7 +598,7 @@ function M.ifs_split(ifs, s)
 				while i <= n and isws(s:sub(i, i)) do
 					i = i + 1
 				end
-				if i <= n and inifs(s:sub(i, i)) and not isws(s:sub(i, i)) then
+				if not leading and i <= n and inifs(s:sub(i, i)) and not isws(s:sub(i, i)) then
 					i = i + 1
 					while i <= n and isws(s:sub(i, i)) do
 						i = i + 1
@@ -1344,7 +1347,7 @@ function Shell:exec(...)
 	if not args[1]:find("/", 1, true) then
 		execpath = self:resolve_cmd(args[1])
 		if not execpath then
-			self:errmsg("curse: " .. args[1] .. ": command not found\n")
+			self:errmsg("curse: " .. (self.exec_builtin and "exec: " or "") .. args[1] .. (self.exec_builtin and ": not found\n" or ": command not found\n"))
 			self.status = 127
 			return
 		end
@@ -1381,7 +1384,7 @@ function Shell:exec(...)
 			if e == 8 then -- ENOEXEC: no-shebang script — run it through our interpreter
 				return self:run_noexec(execpath, args, n)
 			end
-			self:errmsg("curse: " .. tostring(args[1]) .. (e == 2 and ": command not found\n" or ": Permission denied\n"))
+			self:errmsg("curse: " .. (self.exec_builtin and "exec: " or "") .. tostring(args[1]) .. (e == 2 and (self.exec_builtin and ": not found\n" or ": command not found\n") or ": Permission denied\n"))
 			self.status = (e == 2) and 127 or 126
 			return
 		end
@@ -1396,7 +1399,7 @@ function Shell:exec(...)
 		end -- no shebang: run as a script
 		if rc ~= 0 then
 			self:errmsg(
-				"curse: " .. tostring(args[1]) .. (rc == 2 and ": command not found\n" or ": Permission denied\n")
+				"curse: " .. (self.exec_builtin and "exec: " or "") .. tostring(args[1]) .. (rc == 2 and (self.exec_builtin and ": not found\n" or ": command not found\n") or ": Permission denied\n")
 			)
 			self.status = (rc == 2) and 127 or 126
 			return
@@ -1438,7 +1441,7 @@ function Shell:exec(...)
 	C.close(wfd)
 	if rc ~= 0 and rc ~= 8 then -- ENOENT -> "command not found" (127); else can't-execute (126)
 		C.close(rfd)
-		self:errmsg("curse: " .. tostring(args[1]) .. (rc == 2 and ": command not found\n" or ": Permission denied\n"))
+		self:errmsg("curse: " .. (self.exec_builtin and "exec: " or "") .. tostring(args[1]) .. (rc == 2 and (self.exec_builtin and ": not found\n" or ": command not found\n") or ": Permission denied\n"))
 		self.status = (rc == 2) and 127 or 126
 		return
 	end
@@ -2082,6 +2085,10 @@ function Shell:subshell_run(runner, saves)
 	end
 	if ctx.child then -- late-forked: this process IS the subshell; it ends here
 		M.late_child_exit(self, ctx, status)
+	elseif C.getpid() ~= ctx.pid then
+		-- a process forked deeper inside (a nested subshell's child) unwound out to here:
+		-- it ends now, never resuming the script as a copy of the shell
+		M.child_exit(self, status or 0)
 	end
 
 	if saves then M.redir_restore(saves) end
@@ -2105,6 +2112,10 @@ function Shell:capture_compiled_iso(cs_fn, backtick)
 	local cp = sub_checkpoint(self)
 	local ctx = iso_push(self)
 	local ok, out = pcall(self.capture_inproc, self, backtick, cs_fn, true, ctx) -- fd-level capture
+	if C.getpid() ~= ctx.pid then -- (a forked descendant unwound out: it ends here)
+		M.child_status(self, ok, out)
+		M.child_exit(self, self.status or 0)
+	end
 	iso_pop(self, ctx)
 	sub_restore(self, cp)
 	if not ok then
@@ -2642,7 +2653,14 @@ local function co_launch(ctx, self, stage_fns, inproc, base, lastpipe, upv)
 	end
 	local function stage_body(fn, sh, t, islp)
 		return function()
+			local mypid = C.getpid()
 			local ok, err = pcall(fn, sh)
+			if C.getpid() ~= mypid then
+				-- a process FORKED inside this stage (a subshell's child, `( exec … )`) unwound
+				-- out of it: it must end here, never resume this pipeline as a copy of the shell
+				M.child_status(sh, ok, err)
+				M.child_exit(sh, sh.status or 0)
+			end
 			if not ok and type(err) == "table" and err.__curse_sigpipe then
 				return 141
 			end
@@ -5996,6 +6014,9 @@ function M.field_split(sh, value, split)
 			local c = cl == 1 and v:sub(i, i) or v:sub(i, i + cl - 1)
 			if inifs(c) then
 				if isws(c) then
+					-- (LEADING whitespace is just ignored: a `:` right after it still ends an
+					-- empty first field — IFS=': ' splits " :" into one empty field)
+					local leading = cur == nil and #fields == 0
 					if cur ~= nil then
 						brk()
 					end
@@ -6003,7 +6024,7 @@ function M.field_split(sh, value, split)
 					while i <= n and isws(v:sub(i, i)) do
 						i = i + 1
 					end
-					if i <= n then
+					if i <= n and not leading then
 						local nl = clen(v, i)
 						local nc = nl == 1 and v:sub(i, i) or v:sub(i, i + nl - 1)
 						if inifs(nc) and not isws(nc) then
@@ -6195,6 +6216,9 @@ function M.expand_fields(sh, segs)
 			local c = cl == 1 and v:sub(i, i) or v:sub(i, i + cl - 1)
 			if inifs(c) then
 				if isws(c) then
+					-- (LEADING whitespace is just ignored: a `:` right after it still ends an
+					-- empty first field — IFS=': ' splits " :" into one empty field)
+					local leading = cur == nil and #fields == 0
 					if cur ~= nil then
 						brk()
 					end
@@ -6202,7 +6226,7 @@ function M.expand_fields(sh, segs)
 					while i <= n and isws(v:sub(i, i)) do
 						i = i + 1
 					end
-					if i <= n then
+					if i <= n and not leading then
 						local nl = clen(v, i)
 						local nc = nl == 1 and v:sub(i, i) or v:sub(i, i + nl - 1)
 						if inifs(nc) and not isws(nc) then

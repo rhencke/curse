@@ -1933,6 +1933,9 @@ local function expand_to_fields(sh, w)
 			local c = cl == 1 and v:sub(i, i) or v:sub(i, i + cl - 1)
 			if inifs(c) then
 				if isws(c) then -- whitespace IFS chars are always single-byte
+					-- (LEADING whitespace is just ignored: a `:` right after it still ends an
+					-- empty first field — IFS=': ' splits " :" into one empty field)
+					local leading = cur == nil and #fields == 0
 					if cur ~= nil then
 						brk()
 					end
@@ -1940,7 +1943,7 @@ local function expand_to_fields(sh, w)
 					while i <= n and isws(v:sub(i, i)) do
 						i = i + 1
 					end
-					if i <= n then
+					if i <= n and not leading then
 						local nl = clen(v, i)
 						local nc = nl == 1 and v:sub(i, i) or v:sub(i, i + nl - 1)
 						if inifs(nc) and not isws(nc) then
@@ -4785,11 +4788,10 @@ exec_stmt = function(sh, st, hook)
 				if argv0 then
 					sh.exec_argv0 = argv0
 				end -- exec -a NAME: override the child's argv[0]
-				if cflag then
-					C.clearenv()
+				if cflag then -- (after the prefix bindings too: `FOO=BAR exec -c cmd` passes nothing)
 					sh.exec_noenv = true -- (not even `_`)
 				end
-				if st.assigns then -- prefix bindings become the exec'd command's environment (bash)
+				if st.assigns and not cflag then -- prefix bindings become the exec'd command's environment (bash)
 					for _, a in ipairs(st.assigns) do
 						if a.raw then
 							sh:set_str(a.name, a.raw)
@@ -4802,7 +4804,15 @@ exec_stmt = function(sh, st, hook)
 						end
 					end
 				end
-				exec_simple(sh, rest, hook)
+				if cflag then
+					C.clearenv()
+				end
+				sh.exec_builtin = true -- (a lookup failure reads `exec: NAME: not found`, bash)
+				local eok, eerr = pcall(exec_simple, sh, rest, hook)
+				sh.exec_builtin = nil
+				if not eok then
+					error(eerr, 0)
+				end
 				io.flush()
 				-- the command REPLACES the shell: end with its status, no EXIT trap (bash). Not
 				-- os.exit — in the daemon that would kill the worker before it replies.

@@ -354,6 +354,13 @@ local function serve_request(cfd, req, fds, ctx)
 	end)
 	io.flush()
 	local status = ok and (sh.status or 0) or 1 -- a Lua error (never a script `exit`, which
+	-- A FORKED DESCENDANT of this worker (a subshell/stage child) must never get here: if
+	-- one unwinds this far (e.g. a failed `exec` in a forked pipeline stage), it would
+	-- answer the client and then loop back into accept() as an untracked rogue worker,
+	-- corrupting the pool's busy accounting. It just ends, with its status.
+	if tonumber(C.getpid()) ~= ctx.worker_pid then
+		C._exit(status % 256)
+	end
 	local sbuf = ffi.new("int32_t[1]", status) -- finish_run maps to $?) becomes status 1
 	C.write(cfd, sbuf, 4)
 	C.close(cfd)
@@ -404,6 +411,7 @@ local WORKER_IDLE = 99 -- worker exit code meaning "accept() timed out" (parent 
 -- SO_RCVTIMEO, so a worker idle for `idle`s _exit(WORKER_IDLE) and the parent drains
 -- the pool (checking the shared activity clock, since serving no longer signals it).
 local function worker_main(lfd, my_uid, ctx, slot)
+	ctx.worker_pid = tonumber(C.getpid()) -- (see serve_request's forked-descendant guard)
 	-- PRE-FAULT the heap once BEFORE the first accept: a forked child's first Shell.new
 	-- pays ~480us of cold page faults; a throwaway Shell.new + GC now makes those pages
 	-- resident so every per-request Shell.new reuses them at ~48us.
