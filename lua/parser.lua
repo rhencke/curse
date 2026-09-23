@@ -4421,7 +4421,9 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs)
 			end
 			warns = {}
 		end
-		return { stmts = stmts }
+		-- (pos/pline: where reading stopped — a reader that takes over the rest of the
+		-- input line by line, for command history, resumes there)
+		return { stmts = stmts, pos = i, pline = line, src = src }
 	end
 	-- a syntax error also reports the offending input line (bash's second message line)
 	return function()

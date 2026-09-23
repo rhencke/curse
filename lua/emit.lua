@@ -449,6 +449,9 @@ local function scan_xtrace(node)
 	if node.lit == "extdebug" then
 		return true -- extdebug: a DEBUG trap may skip commands (interp's run_debug handles it)
 	end
+	if node.lit == "history" or node.lit == "histexpand" or node.lit == "fc" then
+		return true -- command history is recorded (and `!` expanded) by interp's line reader
+	end
 	if node.lit and node.lit:find("BASH_COMMAND", 1, true) then
 		return true -- $BASH_COMMAND (often read in a trap string) tracks interp's statements
 	end
@@ -460,7 +463,7 @@ local function scan_xtrace(node)
 			-- (restricted mode too: its checks live only on the interpreter's paths)
 			-- (set -k: interp re-reads NAME=value words anywhere as assignments)
 			if not l or l == "xtrace" or l == "verbose" or l == "restricted" or l == "keyword"
-				or (l:match("^%-%a+$") and l:find("[xvrk]", 2)) then
+				or (l:match("^%-%a+$") and l:find("[xvrkH]", 2)) then
 				return true
 			end
 			-- a first non-option word (`set x $i`) or `--` makes the rest positional params

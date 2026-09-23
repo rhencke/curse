@@ -61,6 +61,7 @@ local lazy_mods = {
 	"b_local",
 	"b_help",
 	"deparse", -- function printing (declare -f / type): only when something is printed
+	"hist", -- command history + `!` expansion: only when a script turns history on
 }
 
 -- Wrap each core module's source in a package.preload closure. `require("x")` then

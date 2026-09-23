@@ -19,7 +19,13 @@ local M = {}
 -- import it back so interp and the set/shopt builtins (via _int) keep using these names.
 local SETOPTS, SETOPT, SETFLAG, SETDEFAULT, opt_on = rt.SETOPTS, rt.SETOPT, rt.SETFLAG, rt.SETDEFAULT, rt.opt_on
 local function set_opt(sh, field, on)
+	local was = sh[field]
 	sh[field] = on
+	-- `set -o history` in a script: bash's load_history (HISTSIZE/HISTFILESIZE defaults,
+	-- then $HISTFILE) when nothing was recorded yet this session
+	if field == "opt_history" and on and was ~= true and not sh.opt_i then
+		require("hist").load(sh)
+	end
 	-- bash's set_ignoreeof: `set -o ignoreeof` binds IGNOREEOF=10, `set +o` unsets it
 	if field == "opt_ignoreeof" then
 		if on then
@@ -4742,9 +4748,7 @@ exec_stmt = function(sh, st, hook)
 			local nsz = tonumber(sh:get(st.name))
 			if nsz and nsz >= 0 then
 				if st.name == "HISTSIZE" and sh.history then
-					while #sh.history > nsz do
-						table.remove(sh.history, 1)
-					end
+					require("hist").stifle(sh) -- (the oldest go; numbering moves on)
 				elseif st.name == "HISTFILESIZE" then
 					local hf = sh:get("HISTFILE")
 					if hf and hf ~= "" then
@@ -6316,6 +6320,183 @@ end
 -- tokenizes past an `exit` — so a hybrid shell+binary installer just works with
 -- no special-casing. `hook("stmt", k)` fires per top-level statement (same k as
 -- the eager AST, so tier OSR-by-stmt still lines up).
+-- Run one logical line (a parser group) the way the shell runs its own input.
+local function run_group(sh, lg, hook, k)
+	-- bash parses a whole LOGICAL LINE (a `simple_list` up to a top-level newline)
+	-- before executing any of it, so a syntax error ANYWHERE on the line means the
+	-- line runs nothing (retroactive). Handle that first.
+	if lg.perr then
+		-- A RECOVERABLE parse error (invalid `NAME=( … )` array-literal element) is
+		-- reported but NON-fatal: the assignment is dropped (var stays unset) and the
+		-- script continues, like bash. Any other syntax error runs nothing + exits 2.
+		if lg.perr.recoverable then
+			M.report_recoverable(sh, lg.perr)
+		else
+			exec_stmt(sh, lg.perr, hook)
+		end -- raises __curse_exit=2 (bash exits)
+	end
+	for _, st in ipairs(lg.stmts) do
+		k = k + 1
+		hook("stmt", k)
+		local ok, err = pcall(exec_stmt, sh, st, hook)
+		if not ok then
+			-- a fatal WORD-context expansion (div0 in $((…)), failglob no-match) aborts
+			-- the REST of this line; under `set -e` it exits the shell like any failure
+			if type(err) == "table" and err.__curse_lineabort then
+				if sh.opt_e then
+					error(err)
+				end
+				rt.posix_arith_fatal(sh, err)
+				sh.status = 1
+				break
+			else
+				error(err)
+			end
+		else
+			if errexit_stmt(sh, st) then
+				fire_err(sh)
+			end
+			-- (signal traps are delivered by the async VM hook — no per-statement poll)
+		end
+	end
+	return k
+end
+
+-- Does BUF still need more lines to be a complete command (the REPL's test)?
+local function needs_more(buf)
+	local bs = buf:match("(\\*)$")
+	if #bs % 2 == 1 then -- (a trailing unescaped backslash continues the line)
+		return true
+	end
+	local ok, r = pcall(P.parse, buf)
+	local perr = (not ok and tostring(r)) or (r and r.stmts and r.stmts[1] and r.stmts[1].t == "parse_error"
+		and tostring(r.stmts[1].msg)) or ""
+	return perr:find("unexpected end of file", 1, true) ~= nil or perr:find("unexpected EOF", 1, true) ~= nil
+end
+
+-- the here-document delimiters a line opens (`<<EOF`, `<<-'EOF'`), outside quotes
+local function heredoc_opens(line)
+	local out, i, n, q = {}, 1, #line, nil
+	while i <= n do
+		local c = line:sub(i, i)
+		if q then
+			if c == q then
+				q = nil
+			elseif c == "\\" and q == '"' then
+				i = i + 1
+			end
+		elseif c == "\\" then
+			i = i + 1
+		elseif c == "'" or c == '"' or c == "`" then
+			q = c
+		elseif c == "#" and (i == 1 or line:sub(i - 1, i - 1):match("[%s;&|()]")) then
+			break
+		elseif line:sub(i, i + 1) == "<<" and line:sub(i + 2, i + 2) ~= "<" then
+			local j = i + 2
+			local strip = line:sub(j, j) == "-"
+			if strip then
+				j = j + 1
+			end
+			j = line:match("^[ \t]*()", j)
+			local w = line:match("^[^%s;&|()<>]+", j)
+			if w then
+				out[#out + 1] = { word = (w:gsub("[\\'\"]", "")), strip = strip }
+				i = j + #w - 1
+			end
+		end
+		i = i + 1
+	end
+	return out
+end
+
+-- The rest of the script once command history is on (`set -o history` / `set -H`): read
+-- it the way bash's reader does, one physical line at a time — history-expand each line
+-- (not here-document bodies), record it (cmdhist joins a multi-line command into one
+-- entry), and run each complete command as soon as it has been read.
+local function run_history_lines(sh, text, line1, hook, k)
+	local H = require("hist")
+	local pos, lnum, n = 1, line1, #text
+	local buf, bufline, st, hdq = {}, line1, {}, {}
+	local function flush()
+		if #buf == 0 then
+			return
+		end
+		local code = table.concat(buf, "\n")
+		buf = {}
+		local nf = P.open(code, sh, bufline)
+		while true do
+			local lg = nf()
+			if lg == nil then
+				break
+			end
+			k = run_group(sh, lg, hook, k)
+		end
+	end
+	while pos <= n do
+		local e = text:find("\n", pos, true) or (n + 1)
+		local line = text:sub(pos, e - 1)
+		pos = e + 1
+		local this = lnum
+		lnum = lnum + 1
+		if #buf == 0 then
+			st, bufline = {}, this
+		end
+		if #hdq > 0 then -- a here-document body line: no expansion, kept as read
+			if H.enabled(sh) then
+				H.read_line(sh, st, line, true)
+			end
+			buf[#buf + 1] = line
+			local d = hdq[1]
+			if (d.strip and (line:gsub("^\t+", "")) or line) == d.word then
+				table.remove(hdq, 1)
+			end
+		else
+			local keep = true
+			local hx = H.expanding(sh) and H.chars(sh)
+			if hx and (line:find(hx, 1, true) or line:sub(1, 1) == select(2, H.chars(sh))) then
+				sh.cur_line = this
+				-- (inside a multi-line command, `!!` is the command before it: the entry
+				-- this command is being recorded into is set aside while expanding)
+				local hl, held = H.list(sh), nil
+				if #buf > 0 and st.first_saved then
+					held = table.remove(hl)
+				end
+				local code, out = H.expand(sh, line)
+				if held then
+					hl[#hl + 1] = held
+				end
+				if code < 0 then
+					io.stderr:write("curse: " .. out .. "\n")
+					keep = false
+				elseif code == 2 then -- `:p`: print it and add it to the history, don't run it
+					io.stderr:write(out .. "\n")
+					if H.enabled(sh) and out ~= "" then
+						H.read_line(sh, st, out, false)
+					end
+					keep = false
+				elseif code == 1 then
+					io.stderr:write(out .. "\n")
+					line = out
+				end
+			end
+			if keep then
+				if line ~= "" and H.enabled(sh) then
+					H.read_line(sh, st, line, false)
+				end
+				buf[#buf + 1] = line
+				for _, d in ipairs(heredoc_opens(line)) do
+					hdq[#hdq + 1] = d
+				end
+			end
+		end
+		if #hdq == 0 and #buf > 0 and not needs_more(table.concat(buf, "\n")) then
+			flush()
+		end
+	end
+	flush()
+	return k
+end
+
 function M.run_lazy(sh, src, hook)
 	hook = hook or function() end
 	local nextf = P.open(src, sh) -- sh: alias expansion uses the live alias table
@@ -6328,42 +6509,19 @@ function M.run_lazy(sh, src, hook)
 				if lg == nil then
 					break
 				end
-				-- bash parses a whole LOGICAL LINE (a `simple_list` up to a top-level newline)
-				-- before executing any of it, so a syntax error ANYWHERE on the line means the
-				-- line runs nothing (retroactive). Handle that first.
-				if lg.perr then
-					-- A RECOVERABLE parse error (invalid `NAME=( … )` array-literal element) is
-					-- reported but NON-fatal: the assignment is dropped (var stays unset) and the
-					-- script continues, like bash. Any other syntax error runs nothing + exits 2.
-					if lg.perr.recoverable then
-						M.report_recoverable(sh, lg.perr)
-					else
-						exec_stmt(sh, lg.perr, hook)
-					end -- raises __curse_exit=2 (bash exits)
-				end
-				for _, st in ipairs(lg.stmts) do
-					k = k + 1
-					hook("stmt", k)
-					local ok, err = pcall(exec_stmt, sh, st, hook)
-					if not ok then
-						-- a fatal WORD-context expansion (div0 in $((…)), failglob no-match) aborts
-						-- the REST of this line; under `set -e` it exits the shell like any failure
-						if type(err) == "table" and err.__curse_lineabort then
-							if sh.opt_e then
-								error(err)
-							end
-							rt.posix_arith_fatal(sh, err)
-							sh.status = 1
-							break
-						else
-							error(err)
-						end
-					else
-						if errexit_stmt(sh, st) then
-							fire_err(sh)
-						end
-						-- (signal traps are delivered by the async VM hook — no per-statement poll)
+				k = run_group(sh, lg, hook, k)
+				-- `set -o history` / `set -H` just took effect: the rest of the script is
+				-- read line by line (recorded, `!`-expanded) from where parsing stopped
+				if lg.pos and (sh.opt_history == true or sh.opt_H == true) and not sh.opt_i then
+					local s, p, pl = lg.src, lg.pos, lg.pline
+					if s:sub(p, p) == "#" then
+						p = s:find("\n", p, true) or (#s + 1)
 					end
+					if s:sub(p, p) == "\n" then
+						p, pl = p + 1, pl + 1
+					end
+					run_history_lines(sh, s:sub(p), pl, hook, k)
+					break
 				end
 			end
 		end)
