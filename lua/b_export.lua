@@ -32,7 +32,7 @@ return function(sh, cmd, args, hook, tcb)
 		-- Valid attribute letters per command; any other letter is an invalid option
 		-- (bash: status 2, or 1 for `local`). export/readonly accept a narrower set.
 		local VALID = (cmd == "export" or cmd == "readonly") and "afnpA" or "aAcfFgilnprtuxI"
-		local opterr, endopts = nil, false
+		local opterr, endopts, ro_n = nil, false, false
 		for j = 2, #args do
 			local a = args[j]
 			if a == "--" then
@@ -61,6 +61,8 @@ return function(sh, cmd, args, hook, tcb)
 				if a:find("n") then
 					if cmd == "export" then
 						unexport = true
+					elseif cmd == "readonly" then
+						ro_n = true -- (bash: "remove" readonly — which it never does)
 					else
 						nref = true
 					end
@@ -122,8 +124,24 @@ return function(sh, cmd, args, hook, tcb)
 			end
 		end
 		if opterr then -- an unknown attribute letter: bash prints usage and fails (status 2)
-			io.stderr:write("curse: " .. cmd .. ": -" .. opterr .. ": invalid option\n")
+			io.stderr:write("curse: " .. cmd .. ": -" .. opterr .. ": invalid option\n" .. rt.usage(cmd))
 			sh.status = 2
+			return
+		end
+		if ro_n and not (funcnames or funcbody or printmode) then -- `readonly -n NAME[=V]`:
+			local st = 0 -- just the assignments, no attribute
+			for _, a in ipairs(rest) do
+				local nm, v = a:match("^([^=]*)=(.*)$")
+				if v and (not nm:match("^[%a_][%w_]*$") or rt.ro_refuse(sh, nm)) then
+					if not nm:match("^[%a_][%w_]*$") then
+						io.stderr:write("curse: readonly: `" .. a .. "': not a valid identifier\n")
+					end
+					st = 1
+				elseif v then
+					sh:set_str(nm, v)
+				end
+			end
+			sh.status = st
 			return
 		end
 		-- listing a subset of variables (bare `declare`/`export`/`readonly`, or with
@@ -254,6 +272,11 @@ return function(sh, cmd, args, hook, tcb)
 				return "declare -f" .. (fro[nm] and "r" or "") .. (ftr[nm] and "t" or "") .. (fx[nm] and "x" or "") .. " " .. nm
 			end
 			for _, nm in ipairs(names) do
+				if nm:find("=", 1, true) then -- (bash stops right there)
+					io.stderr:write("curse: " .. cmd .. ": cannot use `-f' to make functions\n")
+					sh.status = 1
+					return
+				end
 				-- `declare -f NAME` prints the verbatim definition (captured at parse time);
 				-- `declare -F NAME` prints just NAME; bare `declare -F` prints `declare -f NAME`.
 				if sh.functions[nm] then

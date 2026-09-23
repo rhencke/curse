@@ -19,40 +19,51 @@ local C, P = I.C, I.P
 return function(sh, cmd, args, hook, tcb)
 	if cmd == "trap" then
 		-- trap [-p] [ACTION] SIG…  (subset: registers/prints; only EXIT actually fires)
-		local j, pflag = 2, false
-		if args[j] == "-l" then -- list signal names (NN) SIGNAME)
-			sh.out(rt.signal_list(NUMSIG))
-			sh.status = 0
-			return
-		end
-		if args[j] == "-p" then
-			pflag = true
+		local j, pflag, lflag = 2, false, false
+		while args[j] and args[j]:match("^%-.") and args[j] ~= "--" do -- (getopt "lp")
+			if not args[j]:match("^%-[lp]+$") then
+				io.stderr:write("curse: trap: -" .. args[j]:match("^%-[lp]*(.)") .. ": invalid option\n")
+				io.stderr:write("trap: usage: trap [-lp] [[arg] signal_spec ...]\n")
+				sh.status = 2
+				return
+			end
+			lflag = lflag or args[j]:find("l", 2, true) ~= nil
+			pflag = pflag or args[j]:find("p", 2, true) ~= nil
 			j = j + 1
 		end
 		if args[j] == "--" then
 			j = j + 1
 		end
+		if lflag then -- list signal names (NN) SIGNAME)
+			sh.out(rt.signal_list(NUMSIG))
+			sh.status = 0
+			return
+		end
 		if pflag or j > #args then -- print traps (all, or the named signals) in signal order
 			local list = {}
+			local st = 0
 			if j <= #args then -- print only the named signals
 				for k = j, #args do
 					local c = canon_sig(args[k])
-					if c and sh.traps[c] then
-						list[#list + 1] = c
+					if not c then
+						io.stderr:write("curse: trap: " .. args[k] .. ": invalid signal specification\n")
+						st = 1
+					elseif sh.traps[c] then -- (named: shown as they come, like bash)
+						sh:echo("trap -- '" .. sh.traps[c] .. "' " .. c)
 					end
 				end
 			else
 				for canon in pairs(sh.traps) do
 					list[#list + 1] = canon
 				end
+				table.sort(list, function(a, b)
+					return sig_order(a) < sig_order(b)
+				end)
 			end
-			table.sort(list, function(a, b)
-				return sig_order(a) < sig_order(b)
-			end)
 			for _, canon in ipairs(list) do
 				sh:echo("trap -- '" .. sh.traps[canon] .. "' " .. canon)
 			end
-			sh.status = 0
+			sh.status = st
 		elseif args[j]:sub(1, 1) == "-" and args[j] ~= "-" then -- a stray -flag (e.g. `trap -1`)
 			io.stderr:write("curse: trap: " .. args[j]:sub(1, 2) .. ": invalid option\n")
 			io.stderr:write("trap: usage: trap [-lp] [[arg] signal_spec ...]\n")

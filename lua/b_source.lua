@@ -24,8 +24,13 @@ return function(sh, cmd, args, hook, tcb)
 		-- A name with no slash is looked up in $PATH (files only, dirs skipped), then
 		-- falls back to the bare name; `--` ends options.
 		local j = 2
+		local usage = cmd .. ": usage: " .. cmd .. " filename [arguments]\n"
 		if args[j] == "--" then
 			j = j + 1
+		elseif args[j] and args[j]:match("^%-.") then -- (bash's no_options: no option letters)
+			io.stderr:write("curse: " .. cmd .. ": " .. args[j]:sub(1, 2) .. ": invalid option\n" .. usage)
+			sh.status = 2
+			return
 		end
 		local name = args[j]
 		if name and name:find("/", 1, true) and rt.restricted(sh, cmd .. ": " .. name .. ": restricted") then
@@ -47,7 +52,7 @@ return function(sh, cmd, args, hook, tcb)
 		local do_return = name ~= nil
 		local dsave -- (the DEBUG trap, hidden while the file runs: rt.source_debug_hide)
 		if not name then
-			io.stderr:write("curse: " .. cmd .. ": filename argument required\n")
+			io.stderr:write("curse: " .. cmd .. ": filename argument required\n" .. usage)
 			sh.status = 2
 		elseif file_test("-d", file) then
 			io.stderr:write("curse: " .. cmd .. ": " .. name .. ": is a directory\n")

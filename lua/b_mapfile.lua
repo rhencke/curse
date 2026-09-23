@@ -152,6 +152,10 @@ return function(sh, cmd, args, hook, tcb)
 				end
 			end
 		end
+		if rt.ro_refuse(sh, arr) then
+			sh.status = 1
+			return
+		end
 		local start = seekable and C.curse_mf_lseek(fd, 0, 1) or 0
 		for _ = 1, nskip do
 			if not getline() then

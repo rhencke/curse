@@ -31,7 +31,10 @@ return function(sh, cmd, args, hook, tcb)
 		else
 			local nn = tonumber(args[2]) or 1
 			if nn < 0 or nn > sh.nparams then
-				sh.status = 1 -- out of range: no-op, status 1 (bash)
+				if nn < 0 or sh.shopt.shift_verbose then -- (else a silent no-op, status 1)
+					io.stderr:write("curse: shift: " .. args[2] .. ": shift count out of range\n")
+				end
+				sh.status = 1
 			else
 				for k = 1, sh.nparams - nn do
 					sh.params[k] = sh.params[k + nn]

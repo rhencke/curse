@@ -14,6 +14,10 @@ return function(sh, cmd, args)
 	end
 	local a = args[j]
 	if a == nil then
+		if not at("BASH_LINENO", 0) then -- (no frames at all: -c's top level)
+			sh.status = 1
+			return
+		end
 		sh:echo((at("BASH_LINENO", 0) or "NULL") .. " " .. (at("BASH_SOURCE", 1) or "NULL"))
 		sh.status = 0
 		return

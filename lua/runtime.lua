@@ -127,7 +127,7 @@ function M.err_prefix(sh)
 	if name == "" then
 		name = sh.argv0 or "bash"
 	end
-	local ln = current_line(sh)
+	local ln = sh.force_line or current_line(sh)
 	if sh.in_perr and sh.perr_label then -- (a syntax error in eval'd text: `NAME: eval: line N:`)
 		name = name .. ": " .. sh.perr_label
 	elseif sh.in_perr and sh.opt_c and not sh.cur_source then
@@ -1365,6 +1365,42 @@ local function child_spawnattr(self)
 	return attr
 end
 
+-- An async command without job control runs with SIGINT/SIGQUIT ignored (bash's
+-- setup_async_signals): a forked child just sets that.
+function M.async_child_signals(sh)
+	if not sh.opt_m then
+		C.curse_sig_ignore(2)
+		C.curse_sig_ignore(3)
+	end
+end
+-- A spawned one inherits it: the parent ignores both across the spawn, with them blocked
+-- so none is lost meanwhile (a pending one is delivered to the restored disposition).
+local _aq_set, _aq_old = ffi.new("uint8_t[1024]"), ffi.new("uint8_t[1024]")
+local _aq_sa2, _aq_sa3 = ffi.new("uint8_t[256]"), ffi.new("uint8_t[256]")
+C.sigemptyset(_aq_set)
+C.curse_co_sigaddset(_aq_set, 2)
+C.curse_co_sigaddset(_aq_set, 3)
+local function async_spawn_hold(attr)
+	C.sigprocmask(0, _aq_set, _aq_old) -- SIG_BLOCK
+	C.curse_rt_sigaction(2, nil, _aq_sa2)
+	C.curse_rt_sigaction(3, nil, _aq_sa3)
+	C.curse_sig_ignore(2)
+	C.curse_sig_ignore(3)
+	if not attr then -- (the child's mask: the one from before the block)
+		attr = ffi.new("uint8_t[1024]")
+		if C.posix_spawnattr_init(attr) ~= 0 then
+			return nil
+		end
+		C.posix_spawnattr_setsigmask(attr, _aq_old)
+		C.posix_spawnattr_setflags(attr, SPAWN_SETSIGMASK)
+	end
+	return attr
+end
+local function async_spawn_release()
+	C.curse_rt_sigaction(2, _aq_sa2, nil)
+	C.curse_rt_sigaction(3, _aq_sa3, nil)
+	C.sigprocmask(2, _aq_old, nil) -- SIG_SETMASK
+end
 ffi.cdef("int curse_rt_execve(const char *path, char *const argv[], char *const envp[]) asm(\"execve\");")
 local _exec_emptyset = ffi.new("uint8_t[1024]")
 C.sigemptyset(_exec_emptyset)
@@ -2523,7 +2559,14 @@ function Shell:spawn_bg(args, cmdstr)
 	C.setenv("_", execpath, 1) -- (the program's `_` is its path, as in Shell:exec)
 	local pidp = ffi.new("curse_pid_t[1]")
 	local attr = child_spawnattr(self)
+	local hold = not self.opt_m
+	if hold then
+		attr = async_spawn_hold(attr)
+	end
 	local rc = C.posix_spawnp(pidp, execpath, fa, attr, ffi.cast("char *const *", argv), C.environ)
+	if hold then
+		async_spawn_release()
+	end
 	if attr then
 		C.posix_spawnattr_destroy(attr)
 	end
@@ -2552,6 +2595,7 @@ function Shell:run_background(cmd_fn, cmdstr, exec_tail)
 			C.dup2(dn, 0)
 			C.close(dn)
 		end
+		M.async_child_signals(self)
 		self.in_subprogram = (self.in_subprogram or 0) + 1
 		self.loopdepth = 0
 		local ok, err = pcall(function()
@@ -4223,6 +4267,25 @@ function M.make_restricted(sh)
 end
 -- The restricted-shell refusal for `what` (bash's wording), status 1. Returns true when
 -- `sh` is restricted (the caller then skips the operation).
+-- A restricted shell may only (re)hash a command to a name found by a $PATH search
+-- (bash's assign_hashcmd / hash -p): else `NAME: not found`, false.
+function M.restricted_hash_ok(sh, what, value)
+	if not sh.opt_r then
+		return true
+	end
+	if value:find("/", 1, true) then
+		return not M.restricted(sh, what .. value .. ": restricted")
+	end
+	for dir in ((sh:get("PATH") or "") .. ":"):gmatch("([^:]*):") do
+		local cand = (dir == "" and "." or dir) .. "/" .. value
+		if M.file_test("-x", cand) and not M.file_test("-d", cand) then
+			return true
+		end
+	end
+	io.stderr:write("curse: " .. what .. value .. ": not found\n")
+	sh.status = 1
+	return false
+end
 function M.restricted(sh, what)
 	if not sh.opt_r then
 		return false
@@ -4355,12 +4418,47 @@ function M.split_array_ref(s, sh)
 	end
 	return nil
 end
+-- A diagnostic reported at line LN rather than the current one.
+function M.err_at(sh, ln, msg)
+	sh.force_line = ln
+	io.stderr:write(msg)
+	sh.force_line = nil
+end
+-- A builtin's usage line, as bash prints it after an option error (help's synopsis).
+function M.usage(cmd)
+	for _, t in ipairs(require("helpdata")) do
+		if t[1] == cmd then
+			return cmd .. ": usage: " .. t[2] .. "\n"
+		end
+	end
+	return ""
+end
+-- The file a function being defined now belongs to (its ${BASH_SOURCE[0]} and error
+-- label): the file being sourced, else the script — but under -c there is none, and bash
+-- calls it "environment".
+function M.def_source(sh)
+	return sh.cur_source or (sh.opt_c and "environment") or sh.argv0 or ""
+end
+-- A builtin about to assign NAME: a readonly one is refused with bash's message (true).
+function M.ro_refuse(sh, name)
+	local dn = sh:deref(name)
+	local b = sh.vars[dn]
+	if b and b.ro then
+		io.stderr:write("curse: " .. dn .. ": readonly variable\n")
+		return true
+	end
+	return false
+end
 -- A builtin assigning to a NAME it was given (read, printf -v, …): a plain name or an array
 -- element; anything else is `cmd: `A[]]': not a valid identifier` (status 1). false = refused.
 function M.assign_ref(sh, cmd, ref, value)
 	local name, sub = M.split_array_ref(ref, sh)
 	if not name then
 		io.stderr:write("curse: " .. cmd .. ": `" .. ref .. "': not a valid identifier\n")
+		sh.status = 1
+		return false
+	end
+	if M.ro_refuse(sh, name) then
 		sh.status = 1
 		return false
 	end
@@ -4788,6 +4886,9 @@ function Shell:array_set(name, key, val, append)
 		if b.virt == "aliases" then
 			self.aliases[key] = append and ((self.aliases[key] or "") .. val) or val
 		else
+			if not M.restricted_hash_ok(self, "", val) then
+				return true -- (reported; nothing hashed)
+			end
 			self.hashcache = self.hashcache or {}
 			M.hash_seq = M.hash_seq + 1
 			self.hashcache[key] = { path = val, hits = 0, seq = M.hash_seq }
@@ -4864,6 +4965,9 @@ function Shell:bash_source_array()
 	for i = 1, #ss do
 		t[#t + 1] = ss[i]
 	end
+	if self.opt_c then -- (-c: no script, so no bottom frame — bash)
+		t[#t] = nil
+	end
 	return t
 end
 function Shell:bash_lineno_array()
@@ -4872,7 +4976,9 @@ function Shell:bash_lineno_array()
 	for i = 1, #ls do
 		t[i] = tostring(ls[i])
 	end
-	t[#t + 1] = "0"
+	if not self.opt_c then
+		t[#t + 1] = "0"
+	end
 	return t
 end
 -- DIRSTACK: the directory stack, full paths, [0] always the current directory (bash)
@@ -8195,6 +8301,7 @@ local BUILTIN_LAZY = {
 	shift = "b_shift",
 	["local"] = "b_local",
 	help = "b_help",
+	logout = "b_logout",
 }
 M.BUILTIN_LAZY = BUILTIN_LAZY
 local _noop = function() end
@@ -8407,7 +8514,7 @@ function M.source(sh, argv)
 		j = j + 1
 	end
 	local name = argv[j]
-	if not name then
+	if not name or (j == 2 and name:match("^%-.")) then
 		return require("b_source")(sh, argv[1], argv, nil, nil) -- usage error: let b_source diagnose
 	end
 	local file = name

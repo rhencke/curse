@@ -573,6 +573,16 @@ local SIGDESC = {
 	[7] = "Bus error",
 	[8] = "Floating point exception",
 	[9] = "Killed",
+	[10] = "User defined signal 1",
+	[12] = "User defined signal 2",
+	[16] = "Stack fault",
+	[24] = "CPU time limit exceeded",
+	[25] = "File size limit exceeded",
+	[26] = "Virtual timer expired",
+	[27] = "Profiling timer expired",
+	[29] = "I/O possible",
+	[30] = "Power failure",
+	[31] = "Bad system call",
 	[11] = "Segmentation fault",
 	[13] = "Broken pipe",
 	[14] = "Alarm clock",
@@ -2760,6 +2770,7 @@ local BUILTINS = {
 	test = 1,
 	["return"] = 1,
 	exit = 1,
+	logout = 1,
 	cd = 1,
 	unset = 1,
 	export = 1,
@@ -3220,56 +3231,54 @@ local function umask_symbolic(cur)
 		.. perms_str(bit.band(allowed, 7))
 end
 -- Parse a umask MODE (octal like 0022, or symbolic like u=rwx,go=rx) against the
--- current mask; returns the new mask, or nil on a syntax error.
+-- current mask, as bash's umask.def: returns the new mask, or nil and bash's message.
+local UMASK_WHO = { u = 448, g = 56, o = 7, a = 511 }
+local UMASK_PERM = { r = 292, w = 146, x = 73 }
 local function parse_umask(s, cur)
-	if s == "" then
-		return nil
+	if s:match("^%d") then
+		local v = s:match("^[0-7]+$") and tonumber(s, 8)
+		if not v or v > 4095 then -- (bash's read_octal: up to 07777, then masked)
+			return nil, s .. ": octal number out of range"
+		end
+		return v % 512
 	end
-	if s:match("^[0-7]+$") then
-		local v = tonumber(s, 8)
-		if v > 511 then
-			return nil
-		end -- > 0777: out of range (bash errors; it doesn't truncate)
-		return v
+	local bits = bit.band(bit.bnot(cur), 511) -- symbolic works on the allowed perms
+	local i = 1
+	while true do
+		local who, perm = 0, 0
+		while UMASK_WHO[s:sub(i, i)] do
+			who = bit.bor(who, UMASK_WHO[s:sub(i, i)])
+			i = i + 1
+		end
+		local op = s:sub(i, i)
+		i = i + 1
+		if op ~= "+" and op ~= "-" and op ~= "=" then
+			return nil, "`" .. (op == "" and "\0" or op) .. "': invalid symbolic mode operator"
+		end
+		while UMASK_PERM[s:sub(i, i)] do
+			perm = bit.bor(perm, UMASK_PERM[s:sub(i, i)])
+			i = i + 1
+		end
+		local c = s:sub(i, i)
+		if c ~= "" and c ~= "," then
+			return nil, "`" .. c .. "': invalid symbolic mode character"
+		end
+		if who ~= 0 then
+			perm = bit.band(perm, who)
+		end
+		if op == "+" then
+			bits = bit.bor(bits, perm)
+		elseif op == "-" then
+			bits = bit.band(bits, bit.bnot(perm))
+		else
+			bits = bit.bor(bit.band(bits, bit.bnot(who == 0 and 511 or who)), perm)
+		end
+		if c == "" then
+			break
+		end
+		i = i + 1
 	end
-	local allowed = bit.band(bit.bnot(cur), 511) -- symbolic works on allowed perms
-	-- iterate clauses INCLUDING empty ones (`u-r,,u-r`) so an empty clause is a
-	-- syntax error, not silently skipped (gmatch "[^,]+" would drop it).
-	for clause in (s .. ","):gmatch("([^,]*),") do
-		local who, op, perms = clause:match("^([ugoa]*)([=+-])([rwx]*)$")
-		if not who then
-			return nil
-		end
-		local pv = 0
-		for ch in perms:gmatch(".") do
-			pv = bit.bor(pv, ch == "r" and 4 or ch == "w" and 2 or 1)
-		end
-		if who == "" then
-			who = "a"
-		end
-		local whos = {}
-		for c in who:gmatch(".") do
-			if c == "a" then
-				whos = { "u", "g", "o" }
-				break
-			else
-				whos[#whos + 1] = c
-			end
-		end
-		for _, wc in ipairs(whos) do
-			local sh4 = wc == "u" and 6 or wc == "g" and 3 or 0
-			local cbits = bit.band(bit.rshift(allowed, sh4), 7)
-			if op == "=" then
-				cbits = pv
-			elseif op == "+" then
-				cbits = bit.bor(cbits, pv)
-			else
-				cbits = bit.band(cbits, bit.band(bit.bnot(pv), 7))
-			end
-			allowed = bit.bor(bit.band(allowed, bit.band(bit.bnot(bit.lshift(7, sh4)), 511)), bit.lshift(cbits, sh4))
-		end
-	end
-	return bit.band(bit.bnot(allowed), 511)
+	return bit.band(bit.bnot(bits), 511)
 end
 
 -- ---- printf (native, bash-compatible) ----
@@ -3965,11 +3974,18 @@ local function exec_simple(sh, args, hook, no_func)
 			if not sh.opt_i then
 				error({ __curse_exit = 128 })
 			end
+		elseif (sh.loopdepth or 0) == 0 then -- (bash: said, not an error, status 0)
+			if not sh.opt_posix then
+				io.stderr:write("curse: break: only meaningful in a `for', `while', or `until' loop\n")
+			end
+			sh.status = 0
+		elseif args[2] and tonumber(args[2]) <= 0 then -- (bash: reported, and ALL the loops end)
+			io.stderr:write("curse: break: " .. args[2] .. ": loop count out of range\n")
+			sh.status = 1
+			error({ __curse_break = sh.loopdepth, __curse_status = 1 })
 		else
 			sh.status = 0
-			if (sh.loopdepth or 0) > 0 then
-				error({ __curse_break = tonumber(args[2]) or 1 })
-			end
+			error({ __curse_break = math.min(tonumber(args[2]) or 1, sh.loopdepth) })
 		end
 	elseif cmd == "continue" then
 		if args[3] ~= nil then -- too many arguments: bash BREAKS the loop (not continue!)
@@ -3986,11 +4002,18 @@ local function exec_simple(sh, args, hook, no_func)
 			if not sh.opt_i then
 				error({ __curse_exit = 128 })
 			end
+		elseif (sh.loopdepth or 0) == 0 then -- (bash: said, not an error, status 0)
+			if not sh.opt_posix then
+				io.stderr:write("curse: continue: only meaningful in a `for', `while', or `until' loop\n")
+			end
+			sh.status = 0
+		elseif args[2] and tonumber(args[2]) <= 0 then -- (bash: reported, and ALL the loops end)
+			io.stderr:write("curse: continue: " .. args[2] .. ": loop count out of range\n")
+			sh.status = 1
+			error({ __curse_break = sh.loopdepth, __curse_status = 1 })
 		else
 			sh.status = 0
-			if (sh.loopdepth or 0) > 0 then
-				error({ __curse_continue = tonumber(args[2]) or 1 })
-			end
+			error({ __curse_continue = math.min(tonumber(args[2]) or 1, sh.loopdepth) })
 		end
 	elseif cmd == "[" or cmd == "test" then
 		do_test(sh, args)
@@ -4066,15 +4089,27 @@ local function exec_simple(sh, args, hook, no_func)
 		end
 		sh.status = anyfound and 0 or 1 -- bash: 0 if ANY name resolved (multiple names swallow misses)
 	elseif cmd == "command" then
-		local j, usep = 2, false
-		while args[j] == "-p" or args[j] == "-v" or args[j] == "-V" do
-			if args[j] == "-p" then
-				usep = true
+		local j, usep, vflag = 2, false, nil
+		while args[j] and args[j]:match("^%-.") and args[j] ~= "--" do
+			for k = 2, #args[j] do
+				local f = args[j]:sub(k, k)
+				if f == "p" then
+					usep = true
+				elseif f == "v" or f == "V" then
+					vflag = (vflag == "-V" or f == "V") and "-V" or "-v"
+				else
+					io.stderr:write("curse: command: -" .. f .. ": invalid option\n" .. rt.usage("command"))
+					sh.status = 2
+					return
+				end
 			end
 			j = j + 1
 		end
 		if args[j] == "--" then -- (end of options)
 			j = j + 1
+		end
+		if vflag and not usep then -- (`command -vV NAME`: the -v/-V lookup above)
+			return exec_simple(sh, { "command", vflag, unpack(args, j) }, hook, true)
 		end
 		-- a special builtin run through `command` loses its fatal-error property (posix)
 		local svc = sh.via_command
@@ -4091,7 +4126,7 @@ local function exec_simple(sh, args, hook, no_func)
 			local oldenv, oldbox = os.getenv("PATH"), sh.vars["PATH"]
 			sh:set_str("PATH", DEFPATH)
 			C.setenv("PATH", DEFPATH, 1)
-			local ok, err = pcall(exec_simple, sh, { unpack(args, j) }, hook, true)
+			local ok, err = pcall(exec_simple, sh, vflag and { "command", vflag, unpack(args, j) } or { unpack(args, j) }, hook, true)
 			sh.vars["PATH"] = oldbox
 			if oldenv then
 				C.setenv("PATH", oldenv, 1)
@@ -4611,7 +4646,8 @@ exec_stmt = function(sh, st, hook)
 		end
 		return
 	end
-	if st.line and not (sh.in_trap and sh.in_trap > 0 and (sh.calldepth or 0) == sh.trap_calldepth) then
+	-- (a function definition leaves the line alone — bash)
+	if st.line and t ~= "funcdef" and not (sh.in_trap and sh.in_trap > 0 and (sh.calldepth or 0) == sh.trap_calldepth) then
 		-- a simple command's line is where its SECOND token ended (bash's yacc lookahead:
 		-- `nope "x<NL>y"` errors on line 2); cline records that
 		sh.cur_line = t == "simple" and st.cline or st.line
@@ -4854,9 +4890,11 @@ exec_stmt = function(sh, st, hook)
 		elseif st.index then -- `a[0]=(1 2)`: can't assign a list to an array MEMBER (bash)
 			io.stderr:write("curse: " .. st.name .. "[" .. st.index .. "]: cannot assign list to array member\n")
 			sh.status = 1
-		elseif rb and rb.ro then -- readonly array: reject the (re)assignment
+		elseif rb and rb.ro then -- readonly array: reject the (re)assignment — and, like a
+			-- scalar's, abort the rest of the line (fatal under -c/posix)
 			io.stderr:write("curse: " .. st.name .. ": readonly variable\n")
 			sh.status = 1
+			error({ __curse_exit = 1, __curse_lineabort = not (sh.opt_c or sh.opt_posix) or nil })
 		else
 			-- a failglob no-match inside `a=(*.ZZ)` fails the assignment non-fatally (bash)
 			local aok, aerr = pcall(do_arrayassign, sh, st)
@@ -4876,13 +4914,17 @@ exec_stmt = function(sh, st, hook)
 		-- a funcdef whose name is an expansion (`$foo-bar()`) is a NON-fatal runtime
 		-- error (bash: status 1) — the name was captured raw by the parser. bash is
 		-- otherwise lenient (a literal `=` in the name is fine: `func-name=ext`).
-		if not st.name:match("^[%w_:%.+@/%%%^~,][%w_%.%-:+@/!#=%%%^~,]*$") then
-			io.stderr:write("curse: `" .. st.name .. "': not a valid identifier\n")
+		local badname = not st.name:match("^[%w_:%.+@/%%%^~,!][%w_%.%-:+@/!#=%%%^~,]*$")
+		if badname or (sh.opt_posix and not st.name:match("^[%a_][%w_]*$")) then
+			rt.err_at(sh, st.top and st.eline, "curse: `" .. st.name .. "': not a valid identifier\n")
 			sh.status = 1
+			if not badname and not sh.opt_i then -- (posix: a fatal error)
+				error({ __curse_exit = 2 })
+			end
 			return
 		end
 		if sh.fn_ro and sh.fn_ro[st.name] then -- `readonly -f`: can't be redefined
-			io.stderr:write("curse: " .. st.name .. ": readonly function\n")
+			rt.err_at(sh, st.top and st.eline, "curse: " .. st.name .. ": readonly function\n")
 			sh.status = 1
 			return
 		end
@@ -4907,7 +4949,7 @@ exec_stmt = function(sh, st, hook)
 		sh.func_bline = sh.func_bline or {}
 		sh.func_bline[st.name] = st.bline
 		sh.func_file = sh.func_file or {}
-		sh.func_file[st.name] = sh.cur_source or sh.argv0 or ""
+		sh.func_file[st.name] = rt.def_source(sh)
 		sh.status = 0
 	elseif t == "assignlist" then
 		-- a bad array subscript / bad-subst in one binding aborts the REST of the list
@@ -5607,6 +5649,7 @@ exec_stmt = function(sh, st, hook)
 				C.close(dn)
 			end
 			reset_child_sigtraps(sh) -- caught signal traps revert to default in the async subshell
+			rt.async_child_signals(sh)
 			C.curse_sig_hold(0) -- dispositions set: safe to receive signals now
 			sh.in_subprogram = (sh.in_subprogram or 0) + 1 -- async subprogram: ERR trap won't fire (sans errtrace)
 			sh.loopdepth = 0

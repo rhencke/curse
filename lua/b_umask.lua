@@ -51,9 +51,9 @@ return function(sh, cmd, args, hook, tcb)
 			sh:echo(pflag and ("umask " .. (sflag and "-S " or "") .. body) or body)
 			sh.status = 0
 		else
-			local m = parse_umask(pos[1], cur)
+			local m, err = parse_umask(pos[1], cur)
 			if m == nil then
-				io.stderr:write("curse: umask: `" .. pos[1] .. "': invalid symbolic mode\n")
+				io.stderr:write("curse: umask: " .. err .. "\n")
 				sh.status = 1
 			else
 				C.umask(m)

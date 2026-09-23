@@ -939,7 +939,10 @@ scan_cmdsub = function(src, j, onwarn)
 			local closed = false
 			for _, hd in ipairs(hdp) do
 				while true do
-					if i > n then
+					if i > n then -- (bash warns about the heredoc first, at the last line)
+						if onwarn then
+							onwarn(rpos, n, hd.delim)
+						end
 						error("unexpected EOF while looking for matching `)'")
 					end
 					local le = src:find("\n", i, true) or (n + 1)
@@ -2826,6 +2829,7 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs)
 			deftext = deftext,
 			line = dline,
 			bline = bline,
+			eline = line, -- (where it ends: a readonly function's redefinition is reported there)
 			subbody = subbody, -- `f() ( … )`: redirections belong to that subshell (declare -f)
 			redirs = (#redirs > 0 and redirs or nil),
 		}
@@ -3010,7 +3014,7 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs)
 			ws()
 			i = i + 8
 			ws()
-			local s, e = src:find("^[%w_:%.+@/%%%^~,][%w_%.%-:+@/!#=%%%^~,]*", i)
+			local s, e = src:find("^[%w_:%.+@/%%%^~,!][%w_%.%-:+@/!#=%%%^~,]*", i)
 			if not s then
 				error("function needs a name")
 			end
@@ -4431,6 +4435,9 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs)
 					stmts = stmts,
 					perr = { t = "parse_error", line = line, msg = "syntax error near `" .. tok .. "'" },
 				}
+			end
+			if st.t == "funcdef" then
+				st.top = true -- (not nested in a compound: its errors report its END line)
 			end
 			stmts[#stmts + 1] = st
 			skip_inline()

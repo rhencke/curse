@@ -17,6 +17,15 @@ local do_arrayassign, eval, fmt_decl, fmt_set_var = I.do_arrayassign, I.eval, I.
 local C, P = I.C, I.P
 local job_resolve, SIGDESC = I.job_resolve, I.SIGDESC
 
+-- a waited job that a signal killed: bash's `PID Desc  command` line (not for the
+-- signals a script expects to end things: INT, PIPE, TERM)
+local function report(j)
+	local d = j.sig and j.sig ~= 2 and j.sig ~= 13 and j.sig ~= 15 and SIGDESC[j.sig]
+	if d then
+		io.stderr:write("curse: " .. j.pid .. " " .. ("%-24s"):format(d) .. (j.cmd or "") .. "\n")
+	end
+end
+
 return function(sh, cmd, args, hook, tcb)
 	if cmd == "wait" then
 		-- wait [-n] [pid…]: reap background jobs. With pids, return the last one's
@@ -133,9 +142,7 @@ return function(sh, cmd, args, hook, tcb)
 						last = 127
 					else
 						last, waited = job_reap(sh, j) or 127, j.pid
-						if j.sig and SIGDESC[j.sig] then
-							io.stderr:write(SIGDESC[j.sig] .. "\n")
-						end
+						report(j)
 					end
 				elseif s:match("^%d+$") then
 					local pid, found = tonumber(s), nil
@@ -147,9 +154,7 @@ return function(sh, cmd, args, hook, tcb)
 					waited = pid
 					if found then
 						last = job_reap(sh, found) or 127
-						if found.sig and SIGDESC[found.sig] then
-							io.stderr:write(SIGDESC[found.sig] .. "\n")
-						end
+						report(found)
 					else
 						last = reap(pid)
 					end
@@ -161,7 +166,10 @@ return function(sh, cmd, args, hook, tcb)
 			sh.status = last
 		else -- wait for all jobs
 			for _, j in ipairs(sh.jobs) do
-				job_reap(sh, j)
+				if not j.done then
+					job_reap(sh, j)
+					report(j)
+				end
 			end
 			if sh.bg_pids then
 				for _, p in ipairs(sh.bg_pids) do

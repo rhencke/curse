@@ -163,6 +163,10 @@ return function(sh, cmd, args, hook, tcb)
 			if res.err and not quiet then
 				io.stderr:write((sh.argv0 or "curse") .. ": " .. res.err .. "\n")
 			end
+			if valid and rt.ro_refuse(sh, vname) then
+				sh.status = 2
+				return
+			end
 			if valid then
 				rt.assign_ctx = "getopts"
 				sh:set_str(vname, optarg_ro and "?" or res.opt)

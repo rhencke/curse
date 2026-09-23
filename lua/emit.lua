@@ -4176,12 +4176,15 @@ H.funcdef = function(cx, st, after)
 		return cx.delegate(st, after)
 	end
 	local p = cx.newpc()
-	if not st.name:match("^[%w_:%.+@/%%%^~,][%w_%.%-:+@/!#=%%%^~,]*$") then -- name is an expansion (`$foo-bar()`):
+	if not st.name:match("^[%w_:%.+@/%%%^~,!][%w_%.%-:+@/!#=%%%^~,]*$") then -- name is an expansion (`$foo-bar()`):
 		cx.blocks[p] = ("io.stderr:write(%q); sh.status = 1; pc = %d") -- non-fatal runtime error (bash)
 			:format("curse: `" .. st.name .. "': not a valid identifier\n", after)
 	elseif cx.funcflags[st.name] then
-		cx.blocks[p] = ("if sh.fn_ro and sh.fn_ro[%q] then io.stderr:write(%q); sh.status = 1 else sh.functions[%q] = rt.mark_compiled(%s, %s) end; pc = %d"):format(
-			st.name, "curse: " .. st.name .. ": readonly function\n", st.name, EF.upv_wrapped(fnlname(st.name)), fnlname(st.name), after)
+		cx.blocks[p] = (st.name:match("^[%a_][%w_]*$") and "" -- (posix: a non-identifier name is fatal)
+			or ("if sh.opt_posix and not sh.opt_i then rt.err_at(sh, %s, %q); error({ __curse_exit = 2 }) end; ")
+				:format(st.top and tostring(st.eline) or "nil", "curse: `" .. st.name .. "': not a valid identifier\n"))
+			.. ("if sh.fn_ro and sh.fn_ro[%q] then rt.err_at(sh, %s, %q); sh.status = 1 else sh.functions[%q] = rt.mark_compiled(%s, %s) end; pc = %d"):format(
+			st.name, st.top and tostring(st.eline) or "nil", "curse: " .. st.name .. ": readonly function\n", st.name, EF.upv_wrapped(fnlname(st.name)), fnlname(st.name), after)
 	else
 		cx.blocks[p] = ("pc = %d"):format(after)
 	end
@@ -4495,6 +4498,9 @@ simple_compiled = function(cx, st, after)
 	-- an array element `a[i]=`, or LIST (bare `local`). Delegate anything else to
 	-- interp's full `local`, which also errors a bad name and skips a readonly
 	-- (matching bash). Done BEFORE the simple-stmt's newpc so no pc is orphaned.
+	if cmd == "local" and cx.toplevel then -- (outside a function: interp's error — unless a
+		return cx.delegate(st, after) -- function is sourcing this file)
+	end
 	if as_local then
 		-- (readonly / set -a are handled per-name at runtime by sh:localAssign — a
 		-- readonly operand fails with $?=1, a set -a local is exported — so no
@@ -4839,7 +4845,7 @@ simple_compiled = function(cx, st, after)
 			-- In-function declare/typeset: bump calldepth (save/restore) so b_export
 			-- localizes each name, exactly as the delegate's cf-wrapper does. Elsewhere
 			-- (top level, other builtins) this is a plain dispatch.
-			local bcall = decl_in_fn
+			local bcall = (decl_in_fn or (not cx.toplevel and (cmd == "command" or cmd == "builtin")))
 					and "do local __sc = sh.calldepth; if (sh.calldepth or 0) < 1 then sh.calldepth = 1 end; rt.builtin(sh, __a, __noop); sh.calldepth = __sc end"
 				or "rt.builtin(sh, __a, __noop)"
 			if redir_apply then
@@ -6773,7 +6779,7 @@ assemble = function(cfg, sig, opts)
 	if opts.funcline and next(opts.funcline) then
 		o[#o + 1] = "  sh.func_line = sh.func_line or {}; sh.func_file = sh.func_file or {}; sh.func_bline = sh.func_bline or {}"
 		for n, ln in spairs(opts.funcline) do
-			o[#o + 1] = ('  sh.func_line[%q] = %d; sh.func_bline[%q] = %d; sh.func_file[%q] = sh.cur_source or sh.argv0 or ""'):format(
+			o[#o + 1] = ('  sh.func_line[%q] = %d; sh.func_bline[%q] = %d; sh.func_file[%q] = rt.def_source(sh)'):format(
 				n, ln[1], n, ln[2], n)
 		end
 	end

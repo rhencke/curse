@@ -182,6 +182,9 @@ return function(sh, cmd, args, hook, tcb)
 				io.stderr:write("curse: read: `" .. aref .. "': not a valid identifier\n")
 				sh.status = 1
 				return
+			elseif arr and rt.ro_refuse(sh, arr) then
+				sh.status = 1
+				return
 			elseif arr then
 				sh:array_assign(arr, rt.ifs_split(ifs, line), false)
 			elseif ndelim then -- -N: no IFS processing; first var gets everything, rest empty
@@ -189,21 +192,20 @@ return function(sh, cmd, args, hook, tcb)
 				if #vars == 0 then
 					sh:set_str("REPLY", plain)
 				else
-					rt.assign_ref(sh, "read", vars[1], plain)
-					for k = 2, #vars do
-						rt.assign_ref(sh, "read", vars[k], "")
+					for k = 1, #vars do
+						if not rt.assign_ref(sh, "read", vars[k], k == 1 and plain or "") then
+							return
+						end
 					end
 				end
 			elseif #vars == 0 then
 				sh:set_str("REPLY", (line:gsub("\1(.)", "%1"))) -- REPLY: raw line, unescape CTLESC markers
 			else
 				local fields = read_split(ifs, line, #vars)
-				local ok = true
-				for k = 1, #vars do
-					ok = rt.assign_ref(sh, "read", vars[k], fields[k] or "") and ok
-				end
-				if not ok then
-					return -- (status 1: a name that isn't a variable reference)
+				for k = 1, #vars do -- (the first refused name ends it, status 1 — bash)
+					if not rt.assign_ref(sh, "read", vars[k], fields[k] or "") then
+						return
+					end
 				end
 			end
 			sh.status = had_nl and 0 or 1

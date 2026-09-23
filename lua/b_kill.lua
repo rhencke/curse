@@ -65,41 +65,59 @@ return function(sh, cmd, args, hook, tcb)
 				end
 				return SIGNUM[(spec or ""):upper():gsub("^SIG", "")] -- names are case-insensitive
 			end
-			if args[j] == "-n" then
-				sig = resolve_sig(args[j + 1])
-				bad = sig == nil and (args[j + 1] or "") or nil
-				j = j + 2
-			elseif args[j] == "-s" then
-				sig = resolve_sig(args[j + 1])
-				bad = sig == nil and (args[j + 1] or "") or nil
-				j = j + 2
-			elseif args[j] == "--" then
-				j = j + 1
-			elseif args[j] and args[j]:match("^%-.") then
-				local s = args[j]:sub(2)
-				sig = resolve_sig(s)
-				bad = sig == nil and s or nil
-				j = j + 1
+			while args[j] and args[j]:match("^%-.") do -- (bash: options until a non-option)
+				local a = args[j]
+				if a == "--" then
+					j = j + 1
+					break
+				elseif a == "-n" or a == "-s" then
+					if args[j + 1] == nil then
+						io.stderr:write("curse: kill: " .. a .. ": option requires an argument\n")
+						sh.status = 1
+						return
+					end
+					sig = resolve_sig(args[j + 1])
+					bad = sig == nil and args[j + 1] or nil
+					j = j + 2
+				else
+					sig = resolve_sig(a:sub(2))
+					bad = sig == nil and a:sub(2) or nil
+					j = j + 1
+				end
+				if bad then
+					io.stderr:write("curse: kill: " .. bad .. ": invalid signal specification\n")
+					sh.status = 1
+					return
+				end
 			end
-			if bad then
-				io.stderr:write("curse: kill: " .. bad .. ": invalid signal specification\n")
-				sh.status = 1
+			if args[j] == nil then
+				io.stderr:write(rt.usage("kill"))
+				sh.status = 2
 				return
 			end
 			local allok = true
 			for k = j, #args do
 				local target = args[k]
-				local pid = tonumber(target)
-				if not pid and target:sub(1, 1) == "%" then -- %-jobspec: resolve to its pid
-					local jb = job_resolve(sh, target)
-					if jb then
-						pid = jb.pid
-					else
-						io.stderr:write("curse: kill: " .. target .. ": no such job\n")
+				local pid = target:match("^%s*[+-]?%d+%s*$") and tonumber(target)
+				if pid then
+					if C.kill(pid, sig) ~= 0 then
+						io.stderr:write("curse: kill: (" .. pid .. ") - " .. ffi.string(C.strerror(ffi.errno())) .. "\n")
+						allok = false
 					end
-				end
-				if not (pid and C.kill(pid, sig) == 0) then
+				elseif target == "" then
+					io.stderr:write("curse: kill: `': not a pid or valid job spec\n")
 					allok = false
+				elseif target:sub(1, 1) ~= "%" then
+					io.stderr:write("curse: kill: " .. target .. ": arguments must be process or job IDs\n")
+					allok = false
+				else -- %-jobspec: resolve to its pid
+					local jb = job_resolve(sh, target)
+					if not jb then
+						io.stderr:write("curse: kill: " .. target .. ": no such job\n")
+						allok = false
+					elseif C.kill(jb.pid, sig) ~= 0 then
+						allok = false
+					end
 				end
 			end
 			sh.status = allok and 0 or 1

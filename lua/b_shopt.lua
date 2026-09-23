@@ -69,6 +69,9 @@ return function(sh, cmd, args, hook, tcb)
 			io.stderr:write("curse: shopt: " .. bad .. ": invalid option\n")
 			io.stderr:write("shopt: usage: shopt [-pqsu] [-o] [optname ...]\n")
 			sh.status = 2
+		elseif set_ and unset_ then
+			io.stderr:write("curse: shopt: cannot set and unset shell options simultaneously\n")
+			sh.status = 1
 		elseif oflag and #names == 0 then -- list the set -o options (-s/-u: only on/off ones)
 			for _, ent in ipairs(SETOPTS) do
 				local on = opt_on(sh, ent[2])

@@ -21,7 +21,7 @@ return function(sh, cmd, args, hook, tcb)
 	if cmd == "eval" then
 		-- eval [--]: join args, parse, run in the CURRENT shell (return/exit propagate).
 		if args[2] and args[2] ~= "-" and args[2] ~= "--" and args[2]:sub(1, 1) == "-" then
-			io.stderr:write("curse: eval: " .. args[2] .. ": invalid option\n")
+			io.stderr:write("curse: eval: " .. args[2]:sub(1, 2) .. ": invalid option\n" .. rt.usage("eval"))
 			sh.status = 2
 		else
 			local start = (args[2] == "--") and 3 or 2

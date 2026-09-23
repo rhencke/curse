@@ -18,11 +18,53 @@ local C, P = I.C, I.P
 
 return function(sh, cmd, args, hook, tcb)
 	if cmd == "local" then
+		if sh.pd == 0 and (sh.calldepth or 0) == 0 then -- (no function; bash checks after the options)
+			local j = 2
+			while args[j] and args[j]:match("^[-+].") and args[j] ~= "--" do
+				local bad = args[j]:match("[^aAfFgiIlnprtux]", 2)
+				if bad then
+					break
+				end
+				j = j + 1
+			end
+			if not (args[j] and args[j]:match("^[-+].") and args[j] ~= "--") then
+				io.stderr:write("curse: local: can only be used in a function\n")
+				sh.status = 1
+				return
+			end
+		end
 		-- local [-naA] [+n] NAME[=val]…: shadow the var in this scope, honoring
 		-- nameref (-n), indexed (-a) and associative (-A) attributes.
 		local nref, assoc, plusn, rest, lok = false, false, false, {}, true
 		local iattr, lattr, uattr, aattr, rattr = false, false, false, false, false
 		local inherit, pflag = false, false
+		for j = 2, #args do -- (bash's option pass first: a bad letter rejects the lot)
+			local a = args[j]
+			if a == "--" or not a:match("^[-+].") then
+				break
+			end
+			local bad = a:match("[^aAfFgiIlnprtux]", 2)
+			if bad then
+				io.stderr:write("curse: local: " .. a:sub(1, 1) .. bad .. ": invalid option\n")
+				io.stderr:write("local: usage: local [option] name[=value] ...\n")
+				sh.status = 2
+				return
+			end
+			if a:find("[fF]") and a:sub(1, 1) == "-" then -- (functions: never made, only looked up)
+				local st = 0
+				for k = j + 1, #args do
+					if args[k]:find("=", 1, true) then
+						io.stderr:write("curse: local: cannot use `-f' to make functions\n")
+						st = 1
+						break
+					elseif not sh.functions[args[k]] then
+						st = 1
+					end
+				end
+				sh.status = st
+				return
+			end
+		end
 		for j = 2, #args do
 			local a = args[j]
 			if a == "--" then

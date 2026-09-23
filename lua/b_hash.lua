@@ -51,7 +51,7 @@ return function(sh, cmd, args, hook, tcb)
 			return
 		end
 		if ppath then
-			if ppath:find("/", 1, true) and rt.restricted(sh, "hash: " .. ppath .. ": restricted") then
+			if not rt.restricted_hash_ok(sh, "hash: ", ppath) then
 				return
 			end
 			local cur = sh:get("PATH")

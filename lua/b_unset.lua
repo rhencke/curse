@@ -21,6 +21,33 @@ return function(sh, cmd, args, hook, tcb)
 		local fmode, vmode, nmode = false, false, false -- -f: functions only; -v: vars only; neither: var then function
 		-- -n: a nameref ITSELF, not its target
 		sh.status = 0
+		-- (the leading options first, as bash's internal_getopt reads them)
+		for j = 2, #args do
+			local a = args[j]
+			if a == "--" or a:sub(1, 1) ~= "-" or a == "-" then
+				break
+			end
+			for k = 2, #a do
+				local f = a:sub(k, k)
+				if f == "f" then
+					fmode = true
+				elseif f == "v" then
+					vmode = true
+				elseif f == "n" then
+					nmode = true
+				else
+					io.stderr:write("curse: unset: -" .. f .. ": invalid option\n")
+					io.stderr:write("unset: usage: unset [-f] [-v] [-n] [name ...]\n")
+					sh.status = 2
+					return
+				end
+			end
+		end
+		if fmode and vmode then
+			io.stderr:write("curse: unset: cannot simultaneously unset a function and a variable\n")
+			sh.status = 1
+			return
+		end
 		for j = 2, #args do
 			local a = args[j]
 			if a == "-f" then

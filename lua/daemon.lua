@@ -367,14 +367,20 @@ local function serve_request(cfd, req, fds, ctx)
 		elseif kind == "code" then
 			Tier.run_tiered(payload, sh)
 		else
-			local f = io.open(payload, "r")
+			-- (bash: a missing script is `ARGV0: PATH: No such file or directory`, 127; any
+			-- other open failure 126, a directory labeled with the path itself; errexit: 1)
+			local f, err, errno = io.open(payload, "r")
+			local s = f and f:read("*a")
 			if f then
-				local s = f:read("*a")
 				f:close()
+			end
+			if s then
 				Tier.run_tiered(s, sh)
 			else
-				io.stderr:write("curse: cannot open " .. payload .. "\n")
-				sh.status = 127
+				local label = f and payload or (req.args[1] or "bash")
+				io.stderr:write(label .. ": " .. payload .. ": "
+					.. (f and "Is a directory" or (err or ""):match(": ([^:]+)$") or "No such file or directory") .. "\n")
+				sh.status = sh.opt_e and 1 or (not f and errno == 2) and 127 or 126
 			end
 		end
 	end, function(e)
