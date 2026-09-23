@@ -1227,7 +1227,7 @@ local function expand_part_str(sh, p, assign)
 		if p.special == "#" then
 			v = tostring(sh.nparams)
 		elseif p.special == "*" then -- $* joins on the first IFS char; $@ always on a space
-			v = sh:paramsJoin(sh.vars["IFS"] and rt.ifs_first(sh:get("IFS")) or " ")
+			v = sh:paramsJoin(rt.ifs_sep(sh))
 		elseif p.special == "@" then
 			v = sh:paramsJoin(" ")
 		elseif p.special == "?" then
@@ -1356,7 +1356,7 @@ local function expand_part_str(sh, p, assign)
 			-- ${a[*]OP} / ${*OP} in a scalar context (assignment RHS, case word) joins its
 			-- (per-element transformed) values with IFS[0], like "$*" (bash)
 			local els = multi_elems(sh, p)
-			return table.concat(els, sh.vars["IFS"] and rt.ifs_first(sh:get("IFS")) or " ")
+			return table.concat(els, rt.ifs_sep(sh))
 		end
 		local subkey
 		if pe.index and pe.index ~= "@" and pe.index ~= "*" then
@@ -1848,7 +1848,7 @@ multi_elems = function(sh, p) -- returns element list, star?
 			if pe.via_indirect then
 				ne = #els > 0 -- indirect array :-/:+ tests element COUNT, not emptiness (bash)
 			elseif star and p.q then
-				ne = table.concat(els, sh.vars["IFS"] and rt.ifs_first(sh:get("IFS")) or " ") ~= ""
+				ne = table.concat(els, rt.ifs_sep(sh)) ~= ""
 			else
 				ne = #els > 1 or (els[1] ~= nil and els[1] ~= "")
 			end
@@ -2003,7 +2003,7 @@ local function expand_to_fields(sh, w)
 	-- while literal/quoted chars are never delimiters. This is what bash does, and
 	-- it handles concatenation ($x-, pre$x) and custom IFS correctly. Fields also
 	-- track `unq` for glob eligibility (quoted glob chars stay literal).
-	local ifs = sh.vars["IFS"] and sh:get("IFS") or " \t\n"
+	local ifs = (rt.ifs(sh) or " \t\n")
 	-- IFS is a SET of characters; a delimiter may be multibyte (`IFS=ç`), so index by
 	-- whole codepoint, not byte (byte-indexing splits ç's two bytes as two delimiters).
 	-- Memoize the parse keyed on the IFS string: it changes rarely but this runs per
@@ -2098,7 +2098,7 @@ local function expand_to_fields(sh, w)
 			local els, star, qforced = multi_elems(sh, p) -- qforced: a quoted multi alternate
 			if p.q or qforced then
 				if star then -- "$*" / "${a[*]}" join with the first char of IFS
-					local sep = sh.vars["IFS"] and rt.ifs_first(sh:get("IFS")) or " "
+					local sep = rt.ifs_sep(sh)
 					add(table.concat(els, sep), false)
 				else
 					for k = 1, #els do
@@ -2120,7 +2120,7 @@ local function expand_to_fields(sh, w)
 					-- BEFORE word-splitting even under IFS='' (unlike `$*`/`${a[*]}`, which
 					-- stay per-element there). Join with IFS[0]; when IFS is empty the prefix
 					-- form concatenates but the KEYS form falls back to a space (bug #627).
-					local sep = sh.vars["IFS"] and rt.ifs_first(sh:get("IFS")) or " "
+					local sep = rt.ifs_sep(sh)
 					if sep == "" and pe.op == "indices" then
 						sep = " "
 					end
@@ -2178,7 +2178,7 @@ local function expand_to_fields(sh, w)
 					if sp.q and is_multi(sh, sp) then
 						local els, star = multi_elems(sh, sp)
 						if star then
-							add(table.concat(els, sh.vars["IFS"] and rt.ifs_first(sh:get("IFS")) or " "), false)
+							add(table.concat(els, rt.ifs_sep(sh)), false)
 						else
 							for e = 1, #els do
 								if e > 1 then

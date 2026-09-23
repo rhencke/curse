@@ -166,7 +166,7 @@ return function(sh, cmd, args, hook)
 					-- (`a\:b`, `'a:b'` → one word); it never globs. Build the string with a
 					-- per-char "protected" mask (chars from a quoted part), then split where the
 					-- mask is clear; empty fields are dropped.
-					local ifs = sh.vars["IFS"] and sh:get("IFS") or " \t\n"
+					local ifs = (rt.ifs(sh) or " \t\n")
 					local ifsset = {}
 					for k = 1, #ifs do
 						ifsset[ifs:sub(k, k)] = true

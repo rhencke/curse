@@ -260,7 +260,7 @@ end
 -- "$*" in a string context: params joined by IFS[0] (space if IFS unset, nothing
 -- if IFS is set but empty) — bash. "$@" always joins by a literal space.
 function Shell:paramsStar()
-	return self:paramsJoin(self.vars["IFS"] and M.ifs_first(self:get("IFS")) or " ")
+	return self:paramsJoin(M.ifs_sep(self))
 end
 -- The positional params as a fresh 1-based list (for the field engine's $@/$* segments).
 function Shell:paramList()
@@ -6574,6 +6574,19 @@ function M.names_static(sh, plain, fnames, fvals)
 end
 -- The first CHARACTER of IFS (the "$*" / "${a[*]}" join separator): a whole multibyte
 -- character in a UTF-8 locale (IFS=é joins with é, not its first byte).
+-- $IFS as splitting sees it: nil when unset — or declared with no value (`local IFS`),
+-- which bash treats the same (default splitting, " " joining)
+function M.ifs(sh)
+	local b = sh.vars.IFS
+	if b and (b.s ~= nil or b.n ~= nil) then
+		return sh:get("IFS")
+	end
+	return nil
+end
+function M.ifs_sep(sh) -- the "$*" joiner
+	local v = M.ifs(sh)
+	return v and M.ifs_first(v) or " "
+end
 function M.ifs_first(ifs)
 	if ifs == "" then
 		return ""
@@ -6782,7 +6795,7 @@ function M.field_split(sh, value, split)
 		-- (`IFS=ç`), so index by whole codepoint. Whitespace runs collapse, and a single
 		-- non-whitespace delimiter (optionally surrounded by whitespace) ends a field.
 		fields = {}
-		local ifs = sh.vars["IFS"] and sh:get("IFS") or " \t\n"
+		local ifs = (M.ifs(sh) or " \t\n")
 		local ifsset = {}
 		for _, ch in ipairs(M.mb_chars(ifs)) do
 			ifsset[ch.s] = true
@@ -6971,7 +6984,7 @@ end
 -- element) parts are NOT in this subset — those stay on expand_to_fields. Kept
 -- byte-for-byte in lockstep with expand_to_fields' feed_split/add + glob tail.
 function M.expand_fields(sh, segs)
-	local ifs = sh.vars["IFS"] and sh:get("IFS") or " \t\n"
+	local ifs = (M.ifs(sh) or " \t\n")
 	-- Memoize the IFS char-set parse (shared with expand_to_fields via sh._ifscache).
 	local ic = sh._ifscache
 	if not ic or ic.ifs ~= ifs then
@@ -9041,7 +9054,7 @@ end
 -- ${a[*]:-…} / ${*:-…} null test for the QUOTED-star form: the IFS[0]-joined string is
 -- non-empty (interp multi_elems `star and p.q` branch). Empty IFS joins with no separator.
 function M.ifs_join_ne(sh, els)
-	local sep = sh.vars["IFS"] and M.ifs_first(sh:get("IFS")) or " "
+	local sep = M.ifs_sep(sh)
 	return table.concat(els, sep) ~= ""
 end
 
