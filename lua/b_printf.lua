@@ -19,6 +19,26 @@ local C, P = I.C, I.P
 return function(sh, cmd, args, hook, tcb)
 	if cmd == "printf" then
 		-- printf [-v VAR] FMT [ARGS…] — native, bash-compatible.
+		if args[2] and args[2]:match("^%-.") and args[2] ~= "--" and args[2] ~= "-v" then
+			-- (getopt: `-vNAME`, or an invalid option letter)
+			local a = args[2]
+			if a:sub(2, 2) ~= "v" then
+				return rt.bad_option(sh, "printf", a:sub(1, 2))
+			end
+			local t = { "printf", "-v", a:sub(3) }
+			for k = 3, #args do
+				t[#t + 1] = args[k]
+			end
+			args = t
+		end
+		if args[2] == "-v" and (args[3] == nil or args[args[4] == "--" and 5 or 4] == nil) then
+			if args[3] == nil then
+				io.stderr:write("curse: printf: -v: option requires an argument\n")
+			end
+			io.stderr:write(rt.usage("printf"))
+			sh.status = 2
+			return
+		end
 		if args[2] == "-v" then
 			local target = args[3]
 			if target == nil then
@@ -71,7 +91,7 @@ return function(sh, cmd, args, hook, tcb)
 				fi = fi + 1
 			end -- end of options
 			if args[fi] == nil then
-				io.stderr:write("printf: usage: printf [-v var] format [arguments]\n")
+				io.stderr:write(rt.usage("printf"))
 				sh.status = 2
 			else
 				local nsets = {}

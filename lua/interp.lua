@@ -3996,7 +3996,15 @@ local function exec_simple(sh, args, hook, no_func)
 	elseif cmd == "false" then
 		sh.status = 1
 	elseif cmd == "break" then -- outside a loop: a no-op (bash), not a fatal unwind
-		if args[3] ~= nil then -- too many arguments: usage error; bash still BREAKS the loop
+		if args[2] == "--" then
+			table.remove(args, 2)
+		end
+		if (sh.loopdepth or 0) == 0 then -- (checked first — bash: said, not an error, status 0)
+			if not sh.opt_posix then
+				io.stderr:write("curse: break: only meaningful in a `for', `while', or `until' loop\n")
+			end
+			sh.status = 0
+		elseif args[3] ~= nil then -- too many arguments: usage error; bash still BREAKS the loop
 			io.stderr:write("curse: break: too many arguments\n")
 			sh.status = 1
 			if sh.opt_c then
@@ -4010,11 +4018,6 @@ local function exec_simple(sh, args, hook, no_func)
 			if not sh.opt_i then
 				error({ __curse_exit = 128 })
 			end
-		elseif (sh.loopdepth or 0) == 0 then -- (bash: said, not an error, status 0)
-			if not sh.opt_posix then
-				io.stderr:write("curse: break: only meaningful in a `for', `while', or `until' loop\n")
-			end
-			sh.status = 0
 		elseif args[2] and tonumber(args[2]) <= 0 then -- (bash: reported, and ALL the loops end)
 			io.stderr:write("curse: break: " .. args[2] .. ": loop count out of range\n")
 			sh.status = 1
@@ -4024,7 +4027,15 @@ local function exec_simple(sh, args, hook, no_func)
 			error({ __curse_break = math.min(tonumber(args[2]) or 1, sh.loopdepth) })
 		end
 	elseif cmd == "continue" then
-		if args[3] ~= nil then -- too many arguments: bash BREAKS the loop (not continue!)
+		if args[2] == "--" then
+			table.remove(args, 2)
+		end
+		if (sh.loopdepth or 0) == 0 then -- (checked first — bash: said, not an error, status 0)
+			if not sh.opt_posix then
+				io.stderr:write("curse: continue: only meaningful in a `for', `while', or `until' loop\n")
+			end
+			sh.status = 0
+		elseif args[3] ~= nil then -- too many arguments: bash BREAKS the loop (not continue!)
 			io.stderr:write("curse: continue: too many arguments\n")
 			sh.status = 1
 			if sh.opt_c then
@@ -4038,11 +4049,6 @@ local function exec_simple(sh, args, hook, no_func)
 			if not sh.opt_i then
 				error({ __curse_exit = 128 })
 			end
-		elseif (sh.loopdepth or 0) == 0 then -- (bash: said, not an error, status 0)
-			if not sh.opt_posix then
-				io.stderr:write("curse: continue: only meaningful in a `for', `while', or `until' loop\n")
-			end
-			sh.status = 0
 		elseif args[2] and tonumber(args[2]) <= 0 then -- (bash: reported, and ALL the loops end)
 			io.stderr:write("curse: continue: " .. args[2] .. ": loop count out of range\n")
 			sh.status = 1
@@ -4054,6 +4060,21 @@ local function exec_simple(sh, args, hook, no_func)
 	elseif cmd == "[" or cmd == "test" then
 		do_test(sh, args)
 	elseif cmd == "return" then
+		-- (the argument is checked first: too many aborts the line, a non-number is 2)
+		local ra = args[2] == "--" and 3 or 2
+		if args[ra + 1] ~= nil then
+			io.stderr:write("curse: return: too many arguments\n")
+			sh.status = 1
+			error({ __curse_exit = 1, __curse_lineabort = not sh.opt_c or nil })
+		end
+		local rcode
+		if args[ra] ~= nil then
+			rcode = args[ra]:match("^%s*[+-]?%d+%s*$") and tonumber(args[ra]) % 256
+			if not rcode then
+				io.stderr:write("curse: return: " .. args[ra] .. ": numeric argument required\n")
+				rcode = 2
+			end
+		end
 		-- `return` is only valid inside a function, a sourced script, or a trap;
 		-- elsewhere bash reports an error (status 2) but keeps running (no unwind).
 		if (sh.calldepth or 0) == 0 and (sh.sourcedepth or 0) == 0 and (sh.in_trap or 0) == 0 then
@@ -4064,11 +4085,7 @@ local function exec_simple(sh, args, hook, no_func)
 			end
 			return
 		end
-		if args[2] and not tonumber(args[2]) then
-			io.stderr:write("curse: return: " .. args[2] .. ": numeric argument required\n")
-			error({ __curse_return = 2 })
-		end
-		error({ __curse_return = args[2] and (tonumber(args[2]) % 256) or sh.status })
+		error({ __curse_return = rcode or sh.status })
 	elseif cmd == "exit" then
 		if #args > 2 then
 			io.stderr:write("curse: exit: too many arguments\n")
@@ -6552,6 +6569,27 @@ end
 -- it the way bash's reader does, one physical line at a time — history-expand each line
 -- (not here-document bodies), record it (cmdhist joins a multi-line command into one
 -- entry), and run each complete command as soon as it has been read.
+-- set -v for text parsed a logical line at a time (eval, source): echo each line of TEXT
+-- once the parser has read into it — through line UPTO (1-based, relative to TEXT; nil =
+-- all of it). `st` carries what's been echoed.
+local function v_echo(sh, text, upto, st)
+	if not sh.opt_v then
+		return
+	end
+	if not st.lines then
+		st.lines, st.done = {}, st.done or 0
+		for l in (text:sub(-1) == "\n" and text or text .. "\n"):gmatch("([^\n]*)\n") do
+			st.lines[#st.lines + 1] = l
+		end
+	end
+	upto = math.min(upto or #st.lines, #st.lines)
+	for k = st.done + 1, upto do
+		io.stderr:write(st.lines[k], "\n")
+	end
+	st.done = math.max(st.done, upto)
+end
+M.v_echo = v_echo
+
 local function run_history_lines(sh, text, line1, hook, k)
 	local H = require("hist")
 	local pos, lnum, n = 1, line1, #text
@@ -6575,6 +6613,9 @@ local function run_history_lines(sh, text, line1, hook, k)
 		local e = text:find("\n", pos, true) or (n + 1)
 		local line = text:sub(pos, e - 1)
 		pos = e + 1
+		if sh.opt_v then -- set -v: each input line is echoed as it's read (bash)
+			io.stderr:write(line, "\n")
+		end
 		local this = lnum
 		lnum = lnum + 1
 		if #buf == 0 then
@@ -6643,15 +6684,20 @@ function M.run_lazy(sh, src, hook)
 		sh,
 		pcall(function()
 			local k = 0
+			if sh.opt_v and not sh.opt_i then -- (`bash -v`: read line by line from the start)
+				run_history_lines(sh, src, 1, hook, k)
+				return
+			end
 			while true do
 				local lg = nextf()
 				if lg == nil then
 					break
 				end
 				k = run_group(sh, lg, hook, k)
-				-- `set -o history` / `set -H` just took effect: the rest of the script is
-				-- read line by line (recorded, `!`-expanded) from where parsing stopped
-				if lg.pos and (sh.opt_history == true or sh.opt_H == true) and not sh.opt_i then
+				-- `set -o history` / `set -H` / `set -v` just took effect: the rest of the
+				-- script is read line by line (recorded, `!`-expanded, echoed) from where
+				-- parsing stopped
+				if lg.pos and (sh.opt_history == true or sh.opt_H == true or sh.opt_v == true) and not sh.opt_i then
 					local s, p, pl = lg.src, lg.pos, lg.pline
 					if s:sub(p, p) == "#" then
 						p = s:find("\n", p, true) or (#s + 1)
@@ -6891,6 +6937,8 @@ M._int = {
 	func_body_text = func_body_text,
 	func_export_text = func_export_text,
 	exec_list = exec_list,
+	run_history_lines = run_history_lines,
+	exec_stmt = exec_stmt,
 	statbuf = statbuf,
 	statbuf2 = statbuf2,
 	run_trap = run_trap,

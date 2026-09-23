@@ -22,6 +22,8 @@ return function(sh, cmd, args, hook, tcb)
 		local j = 2
 		if args[j] == "--" then
 			j = j + 1
+		elseif args[j] and args[j]:match("^%-.") then -- (no options)
+			return rt.bad_option(sh, "builtin", args[j]:sub(1, 2))
 		end
 		if args[j] == nil then
 			sh.status = 0

@@ -35,12 +35,12 @@ return function(sh, cmd, args, hook, tcb, as)
 				operands[#operands + 1] = a
 				j = j + 1
 			elseif a:match("^%-[LPe@]+$") then
-				if a:find("P") then
-					physical = true
-				elseif a:find("L") then
-					physical = false
+				for f in a:gmatch("[LP]") do -- (the last of -L/-P wins)
+					physical = f == "P"
 				end
 				j = j + 1
+			elseif a:match("^%-.") and who == "cd" then
+				return rt.bad_option(sh, "cd", "-" .. a:match("^%-[LPe@]*(.)"))
 			else
 				break
 			end

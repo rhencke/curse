@@ -97,10 +97,15 @@ return function(sh, cmd, args, hook, tcb)
 					sh.xdepth = (sxd or 0) + 1
 					local rok, err = pcall(function()
 						local nextf = P.open(src, sh)
+						local vst = {}
 						while true do
 							local lg = nextf()
 							if lg == nil then
+								M.v_echo(sh, src, nil, vst)
 								break
+							end
+							if sh.opt_v and lg.pline then
+								M.v_echo(sh, src, lg.pline, vst)
 							end
 							if lg.perr then
 								error({ __curse_parseerr = true })

@@ -89,9 +89,7 @@ return function(sh, cmd, args, hook, tcb)
 					elseif RES[f] then
 						flags[#flags + 1] = f
 					else
-						io.stderr:write("curse: ulimit: -" .. f .. ": invalid option\n")
-						sh.status = 2
-						return
+						return rt.bad_option(sh, "ulimit", "-" .. f)
 					end
 				end
 				j = j + 1

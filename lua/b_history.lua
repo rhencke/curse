@@ -79,10 +79,11 @@ return function(sh, cmd, args)
 		return
 	end
 	sh.status = 0
-	if flags.c then
+	if flags.c then -- (readline's clear_history: numbering starts over too)
 		for k = #h, 1, -1 do
 			h[k] = nil
 		end
+		sh.hist_base = 1
 		if #rest == 0 then
 			return
 		end

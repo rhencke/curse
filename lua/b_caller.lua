@@ -8,16 +8,18 @@ return function(sh, cmd, args)
 	local function at(name, k) -- ${name[k]}, or nil
 		return sh:array_values(name)[k + 1]
 	end
+	if not at("BASH_LINENO", 0) then -- (no frames at all — -c's top level: before anything)
+		sh.status = 1
+		return
+	end
 	local j = 2
 	if args[j] == "--" then
 		j = j + 1
+	elseif args[j] and args[j]:match("^%-.") then -- (no options: `-5` is one too)
+		return require("runtime").bad_option(sh, "caller", args[j]:sub(1, 2))
 	end
 	local a = args[j]
 	if a == nil then
-		if not at("BASH_LINENO", 0) then -- (no frames at all: -c's top level)
-			sh.status = 1
-			return
-		end
 		sh:echo((at("BASH_LINENO", 0) or "NULL") .. " " .. (at("BASH_SOURCE", 1) or "NULL"))
 		sh.status = 0
 		return

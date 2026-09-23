@@ -21,6 +21,19 @@ return function(sh, cmd, args, hook, tcb)
 		-- jobs [-p|-l|-r]: list active background jobs (one line each). Refresh done
 		-- state non-blockingly first so finished jobs drop off (bash removes them).
 		local pflag, lflag = false, false
+		if args[2] == "-x" then -- jobs -x CMD ARGS: run CMD with each jobspec as its pid
+			local t = {}
+			for k = 3, #args do
+				local a = args[k]
+				local jb = a:sub(1, 1) == "%" and I.job_resolve(sh, a) -- (an unknown one stays as is)
+				t[#t + 1] = jb and tostring(jb.pid) or a
+			end
+			if #t == 0 then
+				sh.status = 0
+				return
+			end
+			return I.exec_simple(sh, t, hook)
+		end
 		for k = 2, #args do
 			local a = args[k]
 			if a == "-p" then
@@ -29,9 +42,7 @@ return function(sh, cmd, args, hook, tcb)
 				lflag = true
 			elseif a == "-r" or a == "-s" or a == "-n" then -- filters: accept
 			elseif a:sub(1, 1) == "-" and #a > 1 then
-				io.stderr:write("curse: jobs: " .. a .. ": invalid option\n")
-				sh.status = 2
-				return
+				return rt.bad_option(sh, "jobs", "-" .. a:match("^%-[lnprs]*(.)"))
 			end
 		end
 		local sb = ffi.new("int[1]")

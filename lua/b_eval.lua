@@ -36,10 +36,15 @@ return function(sh, cmd, args, hook, tcb)
 				local ok, err = pcall(function()
 					local ln = rt.current_line(sh)
 					local nextf = P.open(code, sh, ln > 0 and ln or nil)
+					local vst = {}
 					while true do
 						local lg = nextf()
 						if lg == nil then
+							require("interp").v_echo(sh, code, nil, vst)
 							break
+						end
+						if sh.opt_v and lg.pline then
+							require("interp").v_echo(sh, code, lg.pline - (ln > 0 and ln or 1) + 1, vst)
 						end
 						if lg.perr then -- syntax error on the line: run nothing on it (bash), status 2
 							-- (reported as the shell's own syntax errors are, labelled `eval:`)

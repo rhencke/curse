@@ -19,12 +19,18 @@ local statbuf, statbuf2 = I.statbuf, I.statbuf2
 
 return function(sh, cmd, args, hook, tcb)
 	if cmd == "pwd" then
-		local phys = false
-		for j = 2, #args do
-			if args[j]:find("P") then
-				phys = true
-			elseif args[j]:find("L") then
-				phys = false
+		local phys = sh.opt_P or false -- (set -P)
+		for j = 2, #args do -- (options until `--` or an operand; the last of -L/-P wins)
+			local a = args[j]
+			if a == "--" or not a:match("^%-.") then
+				break
+			end
+			local bad = a:match("[^LP]", 2)
+			if bad then
+				return rt.bad_option(sh, "pwd", "-" .. bad)
+			end
+			for f in a:gmatch("[LP]") do
+				phys = f == "P"
 			end
 		end
 		local out

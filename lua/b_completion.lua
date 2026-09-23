@@ -401,9 +401,7 @@ return function(sh, cmd, args, hook)
 					end
 					any = true
 				else
-					io.stderr:write("curse: complete: -" .. f .. ": invalid option\n")
-					sh.status = 2
-					return
+					return rt.bad_option(sh, "complete", "-" .. f)
 				end
 			end
 		end

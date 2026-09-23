@@ -4433,6 +4433,11 @@ function M.usage(cmd)
 	end
 	return ""
 end
+-- bash's internal_getopt rejection: `CMD: -X: invalid option` + the usage line, status 2.
+function M.bad_option(sh, cmd, opt)
+	io.stderr:write("curse: " .. cmd .. ": " .. opt .. ": invalid option\n" .. M.usage(cmd))
+	sh.status = 2
+end
 -- The file a function being defined now belongs to (its ${BASH_SOURCE[0]} and error
 -- label): the file being sourced, else the script — but under -c there is none, and bash
 -- calls it "environment".

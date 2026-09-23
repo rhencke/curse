@@ -25,8 +25,8 @@ return function(sh, cmd, args, hook, tcb)
 					.. "\n"
 			)
 			sh.status = 1
-			if sh.opt_c then
-				error({ __curse_exit = 1 })
+			if args[3] ~= nil then -- (too many: the rest of the line is abandoned)
+				error({ __curse_exit = 1, __curse_lineabort = not sh.opt_c or nil })
 			end
 		else
 			local nn = tonumber(args[2]) or 1

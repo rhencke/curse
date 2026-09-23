@@ -58,11 +58,12 @@ while true do
 	elseif a == "-x" or a == "+x" then
 		presets[#presets + 1] = { f = "opt_x", on = a == "-x" }
 		ai = ai + 1
+	elseif a == "-v" or a == "+v" then
+		presets[#presets + 1] = { f = "opt_v", on = a == "-v" }
+		ai = ai + 1
 	elseif
 		a == "-l"
 		or a == "--login"
-		or a == "-v"
-		or a == "+v"
 		or a == "-s"
 		or a == "-B"
 		or a == "+B"
@@ -107,6 +108,8 @@ while true do
 				presets[#presets + 1] = { f = "opt_u", on = true }
 			elseif f == "x" then
 				presets[#presets + 1] = { f = "opt_x", on = true }
+			elseif f == "v" then
+				presets[#presets + 1] = { f = "opt_v", on = true }
 			elseif f == "C" then
 				presets[#presets + 1] = { f = "opt_C", on = true }
 			elseif f == "i" then
@@ -119,7 +122,7 @@ while true do
 				presets[#presets + 1] = { shopt = arg[wi], on = true }
 			elseif f == "c" then
 				has_c = true
-			end -- l/v/s/B/h: accepted no-ops
+			end -- l/s/B/h: accepted no-ops
 		end
 		ai = wi + 1
 		if has_c then
@@ -238,11 +241,12 @@ local function opt_consume(a, nexta)
 	elseif a == "-x" or a == "+x" then
 		presets[#presets + 1] = { f = "opt_x", on = a == "-x" }
 		return 1
+	elseif a == "-v" or a == "+v" then
+		presets[#presets + 1] = { f = "opt_v", on = a == "-v" }
+		return 1
 	elseif
 		a == "-l"
 		or a == "--login"
-		or a == "-v"
-		or a == "+v"
 		or a == "-s"
 		or a == "-B"
 		or a == "+B"
