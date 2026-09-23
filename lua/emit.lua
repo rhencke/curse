@@ -1715,10 +1715,10 @@ end
 EF.upv_wrapped = function(fname)
 	return (EF.lifted_names and #EF.lifted_names > 0) and ("__upv_wrap(" .. fname .. ")") or fname
 end
-local function compile_cmdsub(src, backtick, lifted, aenv, noalias)
+local function compile_cmdsub(src, backtick, lifted, aenv, noalias, posix)
 	local fallback = ("sh:capture_src(%q%s)"):format(src, noalias and ", " .. tostring(backtick or false) .. ", true"
 		or (backtick and ", true" or ""))
-	local pok, ast = pcall(require("parser").parse, src, nil, aenv, noalias)
+	local pok, ast = pcall(require("parser").parse, src, nil, aenv, noalias, posix)
 	if not pok or type(ast) ~= "table" or ast.stmts == nil then
 		return fallback
 	end -- syntax error
@@ -1859,7 +1859,7 @@ emit_word = function(w, lifted)
 			parts[#parts + 1] = emit_arith_word(safe_arith(p.arith), lifted)
 			arith_varread = saved
 		elseif p.cmdsub then -- $( … ): COMPILE the inner (known at compile time) and run it captured
-			parts[#parts + 1] = compile_cmdsub(p.cmdsub, p.backtick, lifted, p.aenv, p.noalias)
+			parts[#parts + 1] = compile_cmdsub(p.cmdsub, p.backtick, lifted, p.aenv, p.noalias, p.posix)
 		elseif p.pexp then
 			if not pexp_compilable(p.pexp, p.q) then
 				error("curse-nocompile: ${..} operator")
@@ -2187,7 +2187,7 @@ function pexp_compilable(pe, quoted)
 		if not quoted and pe.arg and (pe.arg:find("%$[@*]") or pe.arg:find("%${[@*]") or pe.arg:find("%[[@*]%]")) then
 			return false
 		end
-		local ok, w = pcall(quoted and P.parse_default_quoted or P.parse_word, pe.arg or "")
+		local ok, w = pcall(quoted and P.parse_default_quoted or P.parse_word, pe.arg or "", pe.hd)
 		return ok and emitable_word(w) or false
 	end
 	if pe.op == "sub" then
@@ -2351,7 +2351,7 @@ function pexp_scalar(pe, lifted)
 		-- does. A plain / $var / $(…) default is identical either way, so keep parse_word for it.
 		local P = require("parser")
 		local dparse = (pe.arg and pe.arg:find("[~\\'\"]")) and P.parse_default_quoted or P.parse_word
-		local def = emit_word(dparse(pe.arg or ""), lifted)
+		local def = emit_word(dparse(pe.arg or "", pe.hd), lifted)
 		local getv = lifted[pe.name] and ("rt.i64_to_str(%s)"):format(lname(pe.name)) or ("sh:get(%q)"):format(pe.name)
 		if pe.op == ":-" then
 			return ('(function() local __d = %s; return __d ~= "" and __d or %s end)()'):format(getv, def)

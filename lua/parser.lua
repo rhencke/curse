@@ -14,6 +14,9 @@ local ALIAS_ENV = nil
 -- parse_comsub): their parts carry `noalias`, so the body's later re-parse doesn't expand
 -- the already-substituted text a second time.
 local COMSUB_PREX = false
+-- Posix mode for the line being parsed: inside a double-quoted ${…}, a `'` is an ordinary
+-- character (bash: `set -o posix; echo "${IFS+'bar} baz"` prints 'bar baz).
+local POSIX_DQ = false
 
 -- ---- arithmetic expression parser (precedence climbing over a string) ----
 -- AST: {k="num",v}, {k="var",name}, {k="bin",op,l,r}, {k="un",op,e},
@@ -407,13 +410,21 @@ end
 -- past the matching `}`. Respects backslash escapes, '…'/"…" quoting (so a `}`
 -- inside quotes doesn't close), and nested `{…}` — unlike a naive find("}").
 local scan_cmdsub -- forward (defined below; scan_braces skips $(…) bodies with it)
-local function scan_braces(s, bi)
+local dparen_is_arith -- forward (defined below)
+local function scan_braces(s, bi, dq)
 	local i, ns, depth = bi + 1, #s, 1
+	local sq_lit = dq and POSIX_DQ
 	while i <= ns and depth > 0 do
 		local c = s:sub(i, i)
 		if c == "\\" then
 			i = i + 2
-		elseif c == "'" then
+		elseif c == "$" and s:sub(i + 1, i + 1) == "'" then -- $'…': a \' inside doesn't close it
+			i = i + 2
+			while i <= ns and s:sub(i, i) ~= "'" do
+				i = i + (s:sub(i, i) == "\\" and 2 or 1)
+			end
+			i = i + 1
+		elseif c == "'" and not sq_lit then
 			i = i + 1
 			while i <= ns and s:sub(i, i) ~= "'" do
 				i = i + 1
@@ -445,7 +456,8 @@ local function scan_braces(s, bi)
 	return i
 end
 
-local function parse_paramexp(inner)
+local parse_paramexp
+parse_paramexp = function(inner)
 	if inner == "" then
 		return { lit = "" }
 	end
@@ -456,8 +468,20 @@ local function parse_paramexp(inner)
 	-- only a `(` as the very first inner char is rejected.)
 	do
 		local c1 = inner:sub(1, 1)
-		if c1 == " " or c1 == "\t" or c1 == "\n" or c1 == "|" or c1 == "(" then
-			return { pexp = { op = "badsubst", raw = inner } }
+		if c1 == " " or c1 == "\t" or c1 == "\n" or c1 == "|" or c1 == "(" or c1 == "'" then
+			-- (bash has already translated any $'…' in the text it reports)
+			local raw = inner:gsub("%$'([^'\\]*)'", "'%1'")
+			return { pexp = { op = "badsubst", raw = raw } }
+		end
+		-- a $'…' name is quote-removed first (bash: `${$'x1'%t}` is `${x1%t}`)
+		if inner:sub(1, 2) == "$'" then
+			local k = 3
+			while k <= #inner and inner:sub(k, k) ~= "'" do
+				k = k + (inner:sub(k, k) == "\\" and 2 or 1)
+			end
+			if k <= #inner then
+				return parse_paramexp(require("runtime").ansi_unescape(inner:sub(3, k - 1), true) .. inner:sub(k + 1))
+			end
 		end
 	end
 	if inner == "#" then
@@ -676,6 +700,7 @@ scan_cmdsub = function(src, j)
 	local patp = 0 -- paren depth WITHIN the current case pattern
 	local patstart = false -- at the very start of a pattern (a leading `(` is optional)
 	local wstart = true -- next char begins a word (for `#` comments and keywords)
+	local hdp = {} -- heredocs opened on the current line: { delim, strip }
 	local i = j
 	local function skipq(close) -- skip from a quote at i to just past `close`, honoring `\`
 		local k = i + 1
@@ -690,11 +715,50 @@ scan_cmdsub = function(src, j)
 	end
 	while i <= n do
 		local c = src:sub(i, i)
-		if c == " " or c == "\t" or c == "\n" then
+		if c == "\n" and #hdp > 0 then
+			-- heredoc bodies follow this line: they're text, not syntax. bash (parse_comsub):
+			-- a body line that starts with the delimiter then `)` also ends it (`EOF)`), the
+			-- `)` then closing the $(; a missing delimiter swallows the rest (unclosed $().
+			i = i + 1
+			local closed = false
+			for _, hd in ipairs(hdp) do
+				while true do
+					if i > n then
+						error("syntax error: unexpected end of file")
+					end
+					local le = src:find("\n", i, true) or (n + 1)
+					local lstr = src:sub(i, le - 1)
+					local lead = hd.strip and #lstr:match("^\t*") or 0
+					local body = lstr:sub(lead + 1)
+					if body == hd.delim then
+						i = le + 1
+						break
+					end
+					local rest = body:sub(1, #hd.delim) == hd.delim and body:sub(#hd.delim + 1)
+					local pb = rest and rest:match("^[ \t]*()%)")
+					if pb then
+						i = i + lead + #hd.delim + pb - 1 -- at the `)`
+						closed = true
+						break
+					end
+					i = le + 1
+				end
+				if closed then
+					break
+				end
+			end
+			hdp = {}
+			wstart = true
+		elseif c == " " or c == "\t" or c == "\n" then
 			i = i + 1
 			wstart = true
 		elseif c == "\\" then
 			i = i + 2
+			wstart = false
+		elseif c == "(" and wstart and src:sub(i + 1, i + 1) == "(" and cst[#cst] ~= "pat"
+			and dparen_is_arith(src, i + 2) then
+			local _, ni = grab_dparen(src, i + 2) -- ((…)) arithmetic: its `<<` is a shift
+			i = ni
 			wstart = false
 		elseif c == ";" then
 			if src:sub(i, i + 1) == ";;" then
@@ -738,7 +802,7 @@ scan_cmdsub = function(src, j)
 				elseif d == "$" and src:sub(i + 1, i + 1) == "(" then
 					i = scan_cmdsub(src, i + 2)
 				elseif d == "$" and src:sub(i + 1, i + 1) == "{" then
-					i = scan_braces(src, i + 1)
+					i = scan_braces(src, i + 1, true)
 				elseif d == "`" then
 					i = i + 1
 					while i <= n and src:sub(i, i) ~= "`" do
@@ -808,13 +872,48 @@ scan_cmdsub = function(src, j)
 			else
 				return i + 1
 			end -- the `)` that closes the $(
+		elseif c == "<" and src:sub(i + 1, i + 1) == "<" and src:sub(i + 2, i + 2) ~= "<" then
+			-- `<<[-]WORD`: note the (quote-removed) delimiter; its body follows the line
+			local k = i + 2
+			local strip = src:sub(k, k) == "-"
+			if strip then
+				k = k + 1
+			end
+			while src:sub(k, k):match("^[ \t]$") do
+				k = k + 1
+			end
+			local d = {}
+			while k <= n do
+				local ch = src:sub(k, k)
+				if ch == "\\" then
+					if src:sub(k + 1, k + 1) ~= "\n" then -- (`\<newline>` is a continuation)
+						d[#d + 1] = src:sub(k + 1, k + 1)
+					end
+					k = k + 2
+				elseif ch == "'" or ch == '"' then
+					local e = src:find(ch, k + 1, true) or n
+					d[#d + 1] = src:sub(k + 1, e - 1)
+					k = e + 1
+				elseif ch:match("^[ \t\n;&|()<>]$") then
+					break
+				else
+					d[#d + 1] = ch
+					k = k + 1
+				end
+			end
+			if #d > 0 then
+				hdp[#hdp + 1] = { delim = table.concat(d), strip = strip }
+			end
+			i = k
+			wstart = false
 		elseif c == "<" or c == ">" then
-			i = i + 1
+			i = i + (src:sub(i, i + 2) == "<<<" and 3 or 1) -- (a here-string isn't a heredoc)
 			wstart = false
 		else
 			local a, b = src:find("^[^ \t\n;&|()<>'\"`$#\\]+", i)
 			if not a then
 				i = i + 1
+				wstart = false -- (`$#`: a `#` inside a word isn't a comment)
 			else
 				local wd, was = src:sub(a, b), wstart
 				wstart = false
@@ -839,7 +938,7 @@ end
 -- `$((` is arithmetic ONLY when it's a balanced `$(( expr ))` — the paren balance
 -- first returns to 0 at a `)` immediately followed by another `)`. Otherwise the
 -- first `(` opened a subshell (`$( (…) )`, #2337). Quote-aware.
-local function dparen_is_arith(w, j0)
+dparen_is_arith = function(w, j0)
 	local depth, j, n = 0, j0, #w
 	while j <= n do
 		local c = w:sub(j, j)
@@ -901,7 +1000,7 @@ local function parse_dollar(w, i, add, q)
 		return j + 1
 	elseif nx == "(" then
 		local je = scan_cmdsub(w, i + 2) -- index just past the closing `)` (case/quote/nesting aware)
-		add({ cmdsub = w:sub(i + 2, je - 2), q = q, aenv = ALIAS_ENV, noalias = COMSUB_PREX or nil })
+		add({ cmdsub = w:sub(i + 2, je - 2), q = q, aenv = ALIAS_ENV, noalias = COMSUB_PREX or nil, posix = POSIX_DQ or nil })
 		return je
 	elseif nx == '"' then
 		-- $"…" locale translation: with no catalog it's just the double-quoted string.
@@ -930,7 +1029,7 @@ local function parse_dollar(w, i, add, q)
 	elseif nx == "{" then
 		-- find the MATCHING } — honoring \-escapes, '…'/"…" quoting, and nested ${…}
 		-- so `${var#\}}`, `${var-'}'}`, `${a:-${b}}` take the right inner text.
-		local endp = scan_braces(w, i + 1) -- index just past the closing }
+		local endp = scan_braces(w, i + 1, q) -- index just past the closing }
 		local part = parse_paramexp(w:sub(i + 2, endp - 2))
 		part.q = q
 		add(part)
@@ -973,7 +1072,13 @@ local function parse_dquote(inner, add, heredoc)
 				i = i + 1
 			end
 		elseif c == "$" then
-			i = parse_dollar(inner, i, add, true)
+			-- (a heredoc body's ${x-word} keeps a $'…' in word literal — bash)
+			i = parse_dollar(inner, i, heredoc and function(p)
+				if p.pexp then
+					p.pexp.hd = true
+				end
+				add(p)
+			end or add, true)
 		elseif c == "`" then -- `cmd` command substitution inside "…"
 			-- within a backtick INSIDE double quotes, `\` also escapes `"` (unlike the
 			-- `$()` form) — bash unwraps `\"`→`"`, so `"`echo \"hi\"`"` runs `echo "hi"`.
@@ -1085,7 +1190,7 @@ local function parse_word(w)
 						end
 					end
 				elseif d == "$" and w:sub(j + 1, j + 1) == "{" then -- ${...}: inner \ ' " and {} nesting
-					j = scan_braces(w, j + 1)
+					j = scan_braces(w, j + 1, true)
 				elseif d == "`" then
 					j = j + 1
 					while j <= #w and w:sub(j, j) ~= "`" do
@@ -1207,7 +1312,7 @@ do
 	local wcache, wn = {}, 0
 	local wimpl = parse_word
 	parse_word = function(src)
-		if type(src) == "string" and not COMSUB_PREX then
+		if type(src) == "string" and not COMSUB_PREX and not POSIX_DQ then
 			local hit = wcache[src]
 			if hit ~= nil then
 				return hit
@@ -1252,7 +1357,7 @@ end
 -- except before $ ` " \ (and \} -> a literal }, \<newline> is a line continuation), and
 -- a syntactic inner " is dropped (`"${x:-"a b"}"` -> `a b`). Shared by the interpreter's
 -- pexp default expansion and the compiled tier so both render such a default identically.
-function M.parse_default_quoted(txt)
+function M.parse_default_quoted(txt, heredoc)
 	local out, k, m = {}, 1, #txt
 	while k <= m do
 		local ch = txt:sub(k, k)
@@ -1298,7 +1403,7 @@ function M.parse_default_quoted(txt)
 		end
 	end
 	local saved = DQ_ANSI
-	DQ_ANSI = true
+	DQ_ANSI = not heredoc
 	local ok, r = pcall(M.parse_heredoc, table.concat(out))
 	DQ_ANSI = saved
 	if not ok then
@@ -1787,7 +1892,7 @@ local function dequote_word(w)
 	return table.concat(out)
 end
 
-local function make_parser(src, sh, aenv, noalias)
+local function make_parser(src, sh, aenv, noalias, posix)
 	local i, n, line = 1, #src, 1
 	local loopId = 0
 	local heredocs_pending = {} -- heredoc redirs awaiting their body (filled at line end)
@@ -1799,7 +1904,7 @@ local function make_parser(src, sh, aenv, noalias)
 	-- pairs with a later `}`/`)`, `|` forms a real pipeline, and a trailing blank
 	-- makes the following word alias-eligible too.
 	local alias_on = false -- shopt expand_aliases state (from source)
-	local posix_on = false -- set -o posix state (from source; sh.opt_posix when interpreting)
+	local posix_on = posix or false -- set -o posix state (from source; sh.opt_posix when interpreting)
 	local extglob_on = false -- shopt extglob state (from source; the live sh.shopt when interpreting)
 	local aliases = {} -- name -> value (from parsed `alias` commands)
 	if aenv then -- a nested body ($(…)) starts from its enclosing line's static state
@@ -1924,6 +2029,7 @@ local function make_parser(src, sh, aenv, noalias)
 			-- posix mode (live sh): a $(…) is parsed as it is read, expanding aliases in it
 			local on, tab = alias_state()
 			COMSUB_PREX = noalias or (sh.opt_posix and on and tab ~= nil and next(tab) ~= nil) or false
+			POSIX_DQ = sh.opt_posix or false
 			return
 		end
 		if #alias_pending > 0 then
@@ -1942,6 +2048,7 @@ local function make_parser(src, sh, aenv, noalias)
 			ALIAS_ENV = nil
 		end
 		COMSUB_PREX = noalias or (posix_on and alias_on and next(aliases) ~= nil) or false
+		POSIX_DQ = posix_on
 	end
 	-- Try to expand an alias at the current position. `cmdpos` = command position
 	-- (always eligible); otherwise eligible only via trailing-blank chaining, and
@@ -2055,7 +2162,22 @@ local function make_parser(src, sh, aenv, noalias)
 				end
 				i = le + 1
 				line = line + 1
+				-- unquoted delimiter: `\<newline>` joins lines before the delimiter check (bash)
+				while hd.expand and le <= n and #lstr:match("\\*$") % 2 == 1 do
+					le = src:find("\n", i, true) or (n + 1)
+					local nxt = src:sub(i, le - 1)
+					if hd.strip then
+						nxt = nxt:gsub("^\t+", "")
+					end
+					lstr = lstr:sub(1, -2) .. nxt
+					i = le + 1
+					line = line + 1
+				end
 				if lstr == hd.delim then
+					break
+				end
+				-- a $(…) body's final `DELIM )` line reached here as `DELIM ` (see scan_cmdsub)
+				if le > n and lstr:match("^(.-)[ \t]+$") == hd.delim then
 					break
 				end
 				blines[#blines + 1] = lstr
@@ -2187,7 +2309,7 @@ local function make_parser(src, sh, aenv, noalias)
 							i = scan_cmdsub(src, i + 2) -- case/quote/nesting-aware boundary
 						end
 					elseif d == "$" and src:sub(i + 1, i + 1) == "{" then
-						i = scan_braces(src, i + 1) -- ${…}: inner \ ' " and nested {} don't close it
+						i = scan_braces(src, i + 1, true) -- ${…}: inner \ ' " and nested {} don't close it
 					elseif d == "`" then
 						i = i + 1
 						while i <= n and src:sub(i, i) ~= "`" do
@@ -2344,7 +2466,10 @@ local function make_parser(src, sh, aenv, noalias)
 		local bline = line -- the body's first line (a traced call's entry DEBUG reports it)
 		if src:sub(i, i) == "(" then
 			i = i + 1
-			local body = parse_stmts({ [")"] = true })
+			local body, pterm = parse_stmts({ [")"] = true })
+			if pterm ~= ")" then
+				error("syntax error: unexpected end of file") -- unclosed ( )
+			end
 			return { { t = "subshell", line = bline, body = body } }, bline, true
 		end
 		return brace_group(), bline
@@ -2437,7 +2562,8 @@ local function make_parser(src, sh, aenv, noalias)
 				local r = {
 					op = "heredoc",
 					fd = fd and tonumber(fd) or 0,
-					delim = dequote_word(draw),
+					-- (`<<-`: the delimiter's own leading tabs go too, like each line's)
+					delim = strip and (dequote_word(draw):gsub("^\t+", "")) or dequote_word(draw),
 					rawdelim = draw, -- as written (`declare -f` prints it so)
 					expand = not quoted,
 					strip = strip,
@@ -3018,7 +3144,10 @@ local function make_parser(src, sh, aenv, noalias)
 		end
 		if src:sub(i, i) == "(" then
 			i = i + 1
-			local body = parse_stmts({ [")"] = true })
+			local body, pterm = parse_stmts({ [")"] = true })
+			if pterm ~= ")" then
+				error("syntax error: unexpected end of file") -- unclosed ( )
+			end
 			local redirs = {}
 			while true do
 				ws()
@@ -3896,9 +4025,9 @@ end
 -- program, and by callers that want the AST). An optional `sh` makes alias
 -- expansion consult the live runtime table (for eval/source/$() at runtime); the
 -- compiler passes none, so it tracks aliases deterministically from source.
-function M.parse(src, sh, aenv, noalias)
-	local saved_env, sprex = ALIAS_ENV, COMSUB_PREX
-	local nextf = make_parser(src, sh, aenv, noalias) -- yields logical-line groups { stmts, perr }
+function M.parse(src, sh, aenv, noalias, posix)
+	local saved_env, sprex, spdq = ALIAS_ENV, COMSUB_PREX, POSIX_DQ
+	local nextf = make_parser(src, sh, aenv, noalias, posix) -- yields logical-line groups { stmts, perr }
 	local stmts, lines = {}, {}
 	while true do
 		local lg = nextf()
@@ -3918,7 +4047,7 @@ function M.parse(src, sh, aenv, noalias)
 			stmts[#stmts + 1] = st
 		end
 	end
-	ALIAS_ENV, COMSUB_PREX = saved_env, sprex
+	ALIAS_ENV, COMSUB_PREX, POSIX_DQ = saved_env, sprex, spdq
 	return { stmts = stmts, lines = lines }
 end
 

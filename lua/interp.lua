@@ -1186,7 +1186,7 @@ local function expand_part_str(sh, p, assign)
 			if not p.q then
 				return P.parse_word(txt)
 			end
-			return P.parse_default_quoted(txt)
+			return P.parse_default_quoted(txt, pe.hd)
 		end
 		local arg
 		if TESTOP[pe.op] then
@@ -2347,9 +2347,22 @@ local function apply_redirs(sh, redirs)
 				end
 			end
 		elseif r.op == "heredoc" then
-			local body = r.expand and expand_word(sh, P.parse_heredoc(r.body or "", true)) or (r.body or "")
-			backup(r.fd or 0)
-			feed_stdin(r.fd or 0, body)
+			local body = r.body or ""
+			local hok = true
+			if r.expand then
+				-- an unterminated $( in the body fails the redirection (bash: status 1)
+				local pok, pw = pcall(P.parse_heredoc, body, true)
+				if pok then
+					body = expand_word(sh, pw)
+				else
+					io.stderr:write("curse: command substitution: unexpected EOF while looking for matching `)'\n")
+					hok, ok = false, false
+				end
+			end
+			if hok then
+				backup(r.fd or 0)
+				feed_stdin(r.fd or 0, body)
+			end
 		elseif r.op == "herestring" then
 			local body = expand_word(sh, P.parse_word(r.word or "")) .. "\n"
 			backup(r.fd or 0)

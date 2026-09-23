@@ -50,8 +50,8 @@ return function(sh, cmd, args, hook, tcb)
 						delim = takearg() or "\n"
 					elseif f == "n" or f == "N" then -- char count; a non-numeric arg is an error (not a hang)
 						local v = takearg()
-						nchars = tonumber(v)
-						if not nchars then
+						nchars = v and v:match("^%s*[+-]?%d+%s*$") and tonumber(v) or nil
+						if not nchars or nchars < 0 then -- (bash: legal_number, and not negative)
 							io.stderr:write("curse: read: " .. tostring(v) .. ": invalid number\n")
 							sh.status = 1
 							return
@@ -173,9 +173,9 @@ return function(sh, cmd, args, hook, tcb)
 			end
 			line = (got or timed_out) and table.concat(buf) or nil
 		end
-		if line == nil then
-			sh.status = 1 -- EOF: nothing read
-		else
+		do
+			-- EOF with nothing read still assigns (empty values) and returns 1 (bash)
+			line = line or ""
 			local ifs = sh.vars["IFS"] and sh:get("IFS") or " \t\n"
 			if arr then
 				sh:array_assign(arr, rt.ifs_split(ifs, line), false)

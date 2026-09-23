@@ -4927,8 +4927,13 @@ end
 -- ERE conversion) — literals / `*` / `?` / `[…]` are matched positionally too so
 -- it composes with the operators. Used only for patterns containing `!(`; plain
 -- extglob still goes through the faster glob_to_ere path.
-function M.ext_match(str, pat, icase)
+-- `fl` (glob only): { period = true } — a leading `.` matches only explicitly (FNM_PERIOD,
+-- dotglob off); { dotdot = true } — `.`/`..` only explicitly (FNM_DOTDOT). Both apply at
+-- the START of `str` only, as in bash's sm_loop.
+function M.ext_match(str, pat, icase, fl)
 	local plen, slen = #pat, #str
+	local lead_dot = fl and str:sub(1, 1) == "."
+	local is_dd = fl and fl.dotdot and (str == "." or str == "..")
 	local ceq = icase and function(a, b)
 		return a:lower() == b:lower()
 	end or function(a, b)
@@ -4969,12 +4974,13 @@ function M.ext_match(str, pat, icase)
 		end
 		local c, nc = pat:sub(pi, pi), pat:sub(pi + 1, pi + 1)
 		local ge = EXTOP[c] and nc == "(" and group_end(pi)
+		local atstart = si == 1 and fl -- (flags matter only at the string's start)
 		if ge and ge <= plen then
 			local alts = split_alts(pat:sub(pi + 2, ge - 1))
 			local rest = ge + 1
-			local function altfull(seg)
+			local function altfull(seg, from)
 				for _, a in ipairs(alts) do
-					if M.ext_match(seg, a, icase) then
+					if M.ext_match(seg, a, icase, from == 1 and fl or nil) then
 						return true
 					end
 				end
@@ -4982,7 +4988,7 @@ function M.ext_match(str, pat, icase)
 			end
 			if c == "@" then
 				for j = si - 1, slen do
-					if altfull(str:sub(si, j)) and m(j + 1, rest) then
+					if altfull(str:sub(si, j), si) and m(j + 1, rest) then
 						return true
 					end
 				end
@@ -4991,14 +4997,20 @@ function M.ext_match(str, pat, icase)
 					return true
 				end
 				for j = si, slen do
-					if altfull(str:sub(si, j)) and m(j + 1, rest) then
+					if altfull(str:sub(si, j), si) and m(j + 1, rest) then
 						return true
 					end
 				end
 			elseif c == "!" then
 				for j = si - 1, slen do
-					if not altfull(str:sub(si, j)) and m(j + 1, rest) then
-						return true
+					if not altfull(str:sub(si, j), si) then
+						-- no arm matched, yet a leading dot still needs explicit matching
+						if atstart and ((fl.period and lead_dot) or is_dd) then
+							return false
+						end
+						if m(j + 1, rest) then
+							return true
+						end
 					end
 				end
 			else -- `*` (zero or more) or `+` (one or more)
@@ -5007,7 +5019,7 @@ function M.ext_match(str, pat, icase)
 						return true
 					end
 					for j = pos, slen do
-						if altfull(str:sub(pos, j)) and rep(j + 1, count + 1) then
+						if altfull(str:sub(pos, j), pos) and rep(j + 1, count + 1) then
 							return true
 						end
 					end
@@ -5018,6 +5030,8 @@ function M.ext_match(str, pat, icase)
 			return false
 		elseif c == "\\" then
 			return si <= slen and ceq(str:sub(si, si), nc) and m(si + 1, pi + 2)
+		elseif atstart and (c == "*" or c == "?" or c == "[") and ((fl.period and lead_dot) or is_dd) then
+			return false -- `*`/`?`/`[…]` can't match a leading `.` (FNM_PERIOD / FNM_DOTDOT)
 		elseif c == "*" then
 			for j = si - 1, slen do
 				if m(j + 1, pi + 1) then
@@ -5215,41 +5229,114 @@ end
 -- Scan one directory for entries matching a single glob segment. `dir` is the
 -- directory to open ("" == cwd). Returns a list of matching base names (unsorted).
 -- `dotglob` controls whether names beginning with `.` match a non-`.`-initial glob.
--- An extglob segment's arms that name a leading `.` explicitly (`@(*|.!(|.))` -> `@(.!(|.))`):
--- with dotglob off a dot file may match only through one of those (bash). nil if none.
-local function dot_arms(seg)
-	local op = seg:sub(1, 1)
-	if not (EXTOP[op] and seg:sub(2, 2) == "(") then
+-- bash's glob_patscan: from `i`, the index just past the `)` closing the current group (or,
+-- with delim `|`, past the next top-level `|`), bracket/escape aware; nil if unterminated.
+local function patscan(p, i, delim)
+	local pnest, bnest, skip, cchar, bfirst = 0, 0, false, nil, nil
+	local n = #p
+	if i > n then
 		return nil
 	end
-	local d, j = 1, 3
-	while j <= #seg do
-		local c = seg:sub(j, j)
-		if c == "\\" then
-			j = j + 1
+	for k = i, n do
+		local c = p:sub(k, k)
+		if skip then
+			skip = false
+		elseif c == "\\" then
+			skip = true
+		elseif c == "[" then
+			if bnest == 0 then
+				bfirst = k + 1
+				local f = p:sub(bfirst, bfirst)
+				if f == "!" or f == "^" then
+					bfirst = bfirst + 1
+				end
+				bnest = bnest + 1
+			elseif p:sub(k + 1, k + 1):match("^[:.=]$") then
+				cchar = p:sub(k + 1, k + 1)
+			end
+		elseif c == "]" then
+			if bnest > 0 then
+				if cchar and p:sub(k - 1, k - 1) == cchar then
+					cchar = nil
+				elseif k ~= bfirst then
+					bnest = bnest - 1
+					bfirst = nil
+				end
+			end
 		elseif c == "(" then
-			d = d + 1
+			if bnest == 0 then
+				pnest = pnest + 1
+			end
 		elseif c == ")" then
-			d = d - 1
-			if d == 0 then
-				break
+			if bnest == 0 then
+				if pnest <= 0 then
+					return k + 1
+				end
+				pnest = pnest - 1
+			end
+		elseif c == "|" then
+			if bnest == 0 and pnest == 0 and delim == "|" then
+				return k + 1
 			end
 		end
-		j = j + 1
 	end
-	if d ~= 0 then
-		return nil
+	return nil
+end
+-- bash's skipname / extglob_skipname (lib/glob/glob.c): should directory entry `dname` be
+-- skipped outright for pattern `pat`? (Mostly: does a leading `.` get matched explicitly.)
+local skipname
+local function extglob_skipname(pat, dname, dotglob, skipdots)
+	local wild = pat:sub(1, 1) == "*" or pat:sub(1, 1) == "?"
+	local pp, se = 3, #pat + 1
+	local pe = patscan(pat, pp, nil)
+	if not pe then
+		return false
 	end
-	local keep = {}
-	for _, a in ipairs(split_arms(seg:sub(3, j - 1))) do
-		if a:sub(1, 1) == "." then
-			keep[#keep + 1] = a
+	if pe == se and pat:sub(pe - 1, pe - 1) == ")" and not pat:find("|", pp, true) then
+		return skipname(pat:sub(pp, pe - 2), dname, dotglob, skipdots)
+	end
+	local r
+	while true do
+		local t = patscan(pat, pp, "|")
+		if not t or t > pe then
+			break
+		end
+		local sub = pat:sub(pp, t - 2)
+		if pat:sub(t - 1, t - 1) == ")" and pat:sub(pp):match("^[?*+@!]%(") then
+			sub = pat:sub(pp) -- (a nested extglob arm: bash leaves it unterminated)
+		end
+		r = skipname(sub, dname, dotglob, skipdots)
+		if not r then
+			return false
+		end
+		pp = t
+		if pp == pe then
+			break
 		end
 	end
-	if #keep == 0 then
-		return nil
+	if pp == se then
+		return r
 	end
-	return op .. "(" .. table.concat(keep, "|") .. ")" .. seg:sub(j + 1)
+	if wild and pe <= #pat then -- can match zero instances: the rest decides
+		return skipname(pat:sub(pe), dname, dotglob, skipdots)
+	end
+	return true
+end
+skipname = function(pat, dname, dotglob, skipdots)
+	if pat:match("^[?*+@!]%(") then
+		return extglob_skipname(pat, dname, dotglob, skipdots)
+	end
+	local dd = dname == "." or dname == ".."
+	if skipdots and dd then
+		return true
+	end
+	local pdot = pat:sub(1, 1) == "." or pat:sub(1, 2) == "\\."
+	if dotglob and not pdot and dd then
+		return true
+	elseif not dotglob and dname:sub(1, 1) == "." and not pdot then
+		return true
+	end
+	return false
 end
 local function scan_seg(dir, seg, dotglob, skipdots)
 	local scan = (dir == "" and ".") or dir
@@ -5267,8 +5354,11 @@ local function scan_seg(dir, seg, dotglob, skipdots)
 		end
 	end
 	local hidden = seg:sub(1, 1) == "."
-	local dotseg = not hidden and not dotglob and dot_arms(seg)
 	skipdots = skipdots ~= false -- default: skip . and .. (globskipdots on)
+	-- an extglob segment matches like bash's glob_vector: skipname, then strmatch with
+	-- FNM_PERIOD (dotglob off) or FNM_DOTDOT (on)
+	local xseg = seg:find("[?*+@!]%(") ~= nil
+	local xfl = xseg and (dotglob and { dotdot = true } or { period = true })
 	local out = {}
 	while true do
 		local e = ffi.C.readdir(d)
@@ -5279,8 +5369,8 @@ local function scan_seg(dir, seg, dotglob, skipdots)
 		-- . and .. are matched only by an explicit leading-dot pattern with
 		-- globskipdots off; a leading-dot name otherwise needs `.`-pattern or dotglob.
 		local dotdot = name == "." or name == ".."
-		if dotseg and not dotdot and name:sub(1, 1) == "." then
-			if M.ext_match(name, dotseg) then -- (a dot file, through an explicit `.` arm)
+		if xseg then
+			if not skipname(seg, name, dotglob, skipdots) and M.ext_match(name, seg, false, xfl) then
 				out[#out + 1] = name
 			end
 		elseif (not dotdot or (not skipdots and hidden)) and (name:sub(1, 1) ~= "." or hidden or dotglob) then
@@ -6853,9 +6943,12 @@ function M.ansi_unescape(s, mode)
 				if x == "" then
 					out[#out + 1] = "\\c"
 					i = i + 2
-				else
-					out[#out + 1] = string.char(x:byte() % 32)
+				else -- (TOCTRL: `?` is DEL; `\c\\` consumes the escaped backslash)
+					out[#out + 1] = x == "?" and "\127" or string.char(x:upper():byte() % 32)
 					i = i + 3
+					if x == "\\" and s:sub(i, i) == "\\" then
+						i = i + 1
+					end
 				end
 			elseif d == "u" or d == "U" then -- \uXXXX / \UXXXXXXXX code point (echo -e and $'…')
 				local hex = s:match(d == "u" and "^%x%x?%x?%x?" or "^%x%x?%x?%x?%x?%x?%x?%x?", i + 2)
