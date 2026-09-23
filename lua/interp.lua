@@ -1262,49 +1262,40 @@ local function expand_part_str(sh, p, assign)
 		-- the shell's end of it (bash: 63, then 62, …) — a real pipe, so the data is read
 		-- once and a reader can start before the writer ends. The end stays open (and is
 		-- inherited) until the command it was expanded for finishes (drain_procsub).
-		rt.need_process(sh)
-		io.flush()
+		-- (in-process: a background task — Shell:bg_launch — whose stdout/stdin is the
+		-- pipe's other end)
 		local pfd = ffi.new("int[2]")
-		if C.pipe(pfd) ~= 0 then
+		if rt.pipe_hi(pfd) ~= 0 then -- (high: the job must not start with a copy of our end)
 			return "/dev/null"
 		end
 		local mine, theirs = pfd[p.dir == "<" and 0 or 1], pfd[p.dir == "<" and 1 or 0]
-		local pid = rt.fork()
-		if pid == 0 then
-			C.close(mine)
-			C.dup2(theirs, p.dir == "<" and 1 or 0)
-			C.close(theirs)
-			reset_child_sigtraps(sh) -- caught signal traps revert to default in the subshell
-			sh.in_subprogram = (sh.in_subprogram or 0) + 1
-			sh.out = io.write
-			local ok, err = pcall(function()
-				local stmts = P.parse(p.procsub).stmts
-				local s1 = #stmts == 1 and stmts[1]
-				if s1 and s1.t == "simple" and #(s1.words or {}) == 0 and s1.redirs and #s1.redirs == 1
-					and s1.redirs[1].op == "in" and not s1.assigns then
-					-- <(< file): the file's contents, like $(< file) (bash 5.2)
-					local path = M.expand_assign_word(sh, P.parse_word(s1.redirs[1].target or ""))
-					local f = io.open(path, "rb")
-					if f then
-						io.write(f:read("*a") or "")
-						f:close()
-						sh.status = 0
-					else
-						io.stderr:write("curse: " .. path .. ": No such file or directory\n")
-						sh.status = 1
-					end
-					return
+		local body = p.procsub
+		local job = sh:bg_launch(function(ssh)
+			local stmts = P.parse(body).stmts
+			local s1 = #stmts == 1 and stmts[1]
+			if s1 and s1.t == "simple" and #(s1.words or {}) == 0 and s1.redirs and #s1.redirs == 1
+				and s1.redirs[1].op == "in" and not s1.assigns then
+				-- <(< file): the file's contents, like $(< file) (bash 5.2)
+				local path = M.expand_assign_word(ssh, P.parse_word(s1.redirs[1].target or ""))
+				local f = io.open(path, "rb")
+				if f then
+					ssh.out(f:read("*a") or "")
+					f:close()
+					ssh.status = 0
+				else
+					io.stderr:write("curse: " .. path .. ": No such file or directory\n")
+					ssh.status = 1
 				end
-				M.exec_list(sh, stmts, function() end, false)
-			end)
-			rt.child_status(sh, ok, err)
-			rt.child_exit(sh, sh.status or 0) -- (never returns into the parent's script)
-		end
+				return
+			end
+			M.exec_list(ssh, stmts, NOHOOK, false)
+		end, "procsub", false, false, nil, nil,
+			{ fds = { [p.dir == "<" and 1 or 0] = theirs }, keepstdin = true, nojob = true })
 		C.close(theirs)
 		local fd = rt.fd_below(mine, 64)
+		rt.fd_owner[fd] = sh -- (only this shell's own spawns inherit it)
 		sh.procsub_files = sh.procsub_files or {}
-		sh.procsub_files[#sh.procsub_files + 1] = { fd = fd, pid = pid }
-		sh.last_bg_pid = tostring(pid) -- $! is the last process substitution (bash)
+		sh.procsub_files[#sh.procsub_files + 1] = { fd = fd, pid = job and job.pid or 0, g = job and job.g }
 		return "/dev/fd/" .. fd
 	elseif p.cmdsub then
 		return sh:capture_src(p.cmdsub, p.backtick, p.noalias)
@@ -3926,6 +3917,9 @@ local function job_reap(sh, job, nohang)
 		end
 		local st = job.g.status[1] or 0
 		job.done, job.status = true, st
+		if sh.coprocs then
+			rt.coproc_dispose(sh, job.pid)
+		end
 		if st > 128 and job.g.killed then
 			job.sig = st - 128
 		end
@@ -4527,11 +4521,18 @@ local function drain_procsub(sh, np, nf)
 	local stbuf = ffi.new("int[1]")
 	for i = nf + 1, #files do
 		C.close(files[i].fd)
+		rt.fd_owner[files[i].fd] = nil
 	end
 	sh.procsub_status = {} -- (the latest ones, for a later `wait $!`)
 	for i = nf + 1, #files do
-		rt.wait_child(files[i].pid, stbuf, 0)
-		sh.procsub_status[files[i].pid] = rt.wexit(stbuf[0])
+		local g = files[i].g
+		if g then -- (in-process)
+			rt.wait_groups({ g })
+			sh.procsub_status[files[i].pid] = g.status[1] or 0
+		else
+			rt.wait_child(files[i].pid, stbuf, 0)
+			sh.procsub_status[files[i].pid] = rt.wexit(stbuf[0])
+		end
 	end
 	for i = #files, nf + 1, -1 do
 		files[i] = nil
@@ -5753,51 +5754,29 @@ exec_stmt = function(sh, st, hook)
 			sh.status = 1
 			return
 		end
-		rt.need_process(sh)
 		sh.coprocs = sh.coprocs or {}
 		for opid, cp in pairs(sh.coprocs) do -- (bash: one at a time is supported; warn, go on)
 			io.stderr:write(("curse: warning: execute_coproc: coproc [%d:%s] still exists\n"):format(opid, cp.name))
 		end
-		io.flush()
+		-- in-process: a background task (Shell:bg_launch) with its stdin/stdout on the pipes
 		local rp, wp = ffi.new("int[2]"), ffi.new("int[2]")
-		C.pipe(rp)
-		C.pipe(wp)
-		local r0, r1 = rt.fd_below(rp[0], 64), rt.fd_below(rp[1], 64)
+		rt.pipe_hi(rp)
+		rt.pipe_hi(wp)
+		local r0, r1 = rt.fd_below(rp[0], 64), rt.fd_below(rp[1], 64) -- (bash's numbering: 63 60)
 		local w0, w1 = rt.fd_below(wp[0], 64), rt.fd_below(wp[1], 64)
-		C.curse_sig_hold(1)
-		local pid = rt.fork()
-		if pid == 0 then
-			C.dup2(w0, 0)
-			C.dup2(r1, 1)
-			for _, fd in ipairs({ r0, r1, w0, w1 }) do
-				C.close(fd)
-			end
-			for _, cp in pairs(sh.coprocs) do -- (an older coproc's ends aren't this one's)
-				C.close(cp.r)
-				C.close(cp.w)
-			end
-			sh.coprocs = nil
-			reset_child_sigtraps(sh)
-			C.curse_sig_hold(0)
-			sh.in_subprogram = (sh.in_subprogram or 0) + 1
-			sh.loopdepth = 0
-			local ok, err = pcall(function()
-				sh.out = io.write
-				exec_stmt(sh, st.cmd, hook)
-			end)
-			child_status(sh, ok, err)
-			rt.child_exit(sh, sh.status or 0)
-		end
-		C.curse_sig_hold(0)
-		C.close(r1)
-		C.close(w0)
 		C.fcntl(r0, 2, 1) -- F_SETFD FD_CLOEXEC: nothing the shell runs inherits these
 		C.fcntl(w1, 2, 1)
+		local cmd = st.cmd
+		local job = sh:bg_launch(function(ssh)
+			ssh.coprocs = nil -- (an older coproc's ends aren't this one's)
+			exec_stmt(ssh, cmd, NOHOOK)
+		end, "coproc " .. st.name, cmd.t == "subshell", cmd.t == "simple", nil, nil,
+			{ fds = { [0] = w0, [1] = r1 } })
+		C.close(r1)
+		C.close(w0)
+		local pid = job and job.pid or 0
 		rt.coproc_setvars(sh, st.name, r0, w1, pid)
-		sh.coprocs[pid] = { name = st.name, r = r0, w = w1 }
-		job_add(sh, pid, "coproc " .. st.name)
-		sh.bg_pids = sh.bg_pids or {}
-		sh.bg_pids[#sh.bg_pids + 1] = pid
+		sh.coprocs[pid] = { name = st.name, r = r0, w = w1, g = job and job.g }
 		sh.status = 0
 	elseif t == "arithcmd" then
 		-- A `(( expr ))` command (standalone or as an if/while condition) is NOT fatal

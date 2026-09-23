@@ -399,7 +399,15 @@ local function serve_request(cfd, req, fds, ctx)
 	local sbuf = ffi.new("int32_t[1]", status) -- finish_run maps to $?) becomes status 1
 	C.write(cfd, sbuf, 4)
 	C.close(cfd)
-	pcall(rt.sched_drain) -- background jobs outlive the script (the client has its status)
+	-- Background jobs outlive the script (the client has its status): this worker finishes
+	-- them, then RETIRES — its slot reads -1 meanwhile (busy for the pool's saturation
+	-- count, so a replacement is spawned on demand; never "client gone", so not killed)
+	local drained = false
+	if rt.sched_live() then
+		ctx.busy[ctx.slot] = -1
+		pcall(rt.sched_drain)
+		drained = true
+	end
 	pcall(Tier.compile_deferred) -- (off the caller's clock: see tier.run_tiered)
 	-- SCRUB per-request process state (the fork boundary used to do this):
 	C.umask(ctx.umask) -- a script's `umask` doesn't persist
@@ -422,7 +430,7 @@ local function serve_request(cfd, req, fds, ctx)
 	-- request on this worker (fds can't be moved high -> plumbing collides). A lowered
 	-- SOFT limit is restored; a lowered HARD limit can't be raised again unprivileged, so
 	-- the worker RETIRES after this request and the parent spawns a clean one.
-	local retire = false
+	local retire = drained -- (a worker that ran leftover jobs retires: its state is theirs)
 	local cur = ffi.new("struct curse_d_rlimit")
 	for res, orig in pairs(ctx.rlimits) do
 		if C.curse_d_getrlimit(res, cur) == 0 and (cur.cur ~= orig.cur or cur.max ~= orig.max) then
@@ -449,6 +457,7 @@ local WORKER_IDLE = 99 -- worker exit code meaning "accept() timed out" (parent 
 -- the pool (checking the shared activity clock, since serving no longer signals it).
 local function worker_main(lfd, my_uid, ctx, slot)
 	ctx.worker_pid = tonumber(C.getpid()) -- (see serve_request's forked-descendant guard)
+	ctx.slot = slot
 	rt.daemon_worker = true
 	-- PRE-FAULT the heap once BEFORE the first accept: a forked child's first Shell.new
 	-- pays ~480us of cold page faults; a throwaway Shell.new + GC now makes those pages

@@ -1172,6 +1172,23 @@ local _redir_stat = ffi.new("char[144]") -- struct stat scratch (st_mode at +24)
 -- data or its writer's hangup (so its first read isn't a spurious EOF); a writer retries
 -- until a reader is there (ENXIO until then).
 local _ropen_st = ffi.new("char[144]")
+-- Low fds the shell hands out by NUMBER (a process substitution's /dev/fd/63) are open in
+-- the one process every in-process subshell shares: an external spawned by a DIFFERENT
+-- shell (a background job, a stage) must not inherit one — `tee >(wc -c)`: wc would hold a
+-- writer on its own input. fd -> the shell it belongs to; foreign_fa closes the others'.
+M.fd_owner = {}
+function M.foreign_fa(self, fa)
+	for fd, owner in pairs(M.fd_owner) do
+		if owner ~= self and C.fcntl(fd, 1) >= 0 then
+			if not fa then
+				fa = ffi.new("uint8_t[1024]")
+				C.posix_spawn_file_actions_init(fa)
+			end
+			C.posix_spawn_file_actions_addclose(fa, fd)
+		end
+	end
+	return fa
+end
 ffi.cdef("int curse_rt_fstat(int fd, void *buf) asm(\"fstat\");")
 -- An open fd's file identity ("dev:ino"), or nil.
 function M.fd_ident(fd)
@@ -1238,9 +1255,7 @@ function M.ropen(path, flags, mode)
 	end
 	C.fcntl(fd, 4, ffi.cast("int", bit.band(C.fcntl(fd, 3), bit.bnot(2048)))) -- F_SETFL: blocking again
 	if acc == 0 then
-		while fd_would_block(fd, POLLIN) do
-			tick()
-		end
+		M.co_block(fd, POLLIN) -- (a task yields on it; the shell runs the scheduler until it's ready)
 	end
 	return fd
 end
@@ -1487,16 +1502,43 @@ function Shell:exec_script_child(path, args, n)
 	C._exit(child.status or 0)
 end
 
--- ENOEXEC fallback for the streaming (non-capturing) path: fd 1 is already the
--- destination, so just fork a child that runs the script and inherits fd 1.
-function Shell:run_noexec(path, args, n)
-	local pid = M.fork()
-	if pid == 0 then
-		self:exec_script_child(path, args, n)
+-- A no-shebang script runs as a FRESH shell would (bash's reinitialized child: only the
+-- exported environment, its own vars/functions/traps) — in-process: a new Shell, run
+-- inside an isolation context of ours (its stack shared) so the process-global state the
+-- script changes (cwd, umask, environ, fds, traps, rlimits) is put back when it ends.
+-- `out`: where its stdout goes (a capture's sink), else fd 1.
+function Shell:run_script_inproc(path, args, n, out)
+	local f = io.open(path, "r")
+	local src = f and f:read("*a") or ""
+	if f then
+		f:close()
 	end
-	local st = ffi.new("int[1]")
-	M.wait_child(pid, st, 0)
-	self.status = M.wexit(st[0])
+	local child = Shell.new()
+	child.argv0, child.out = args[1], out or io.write
+	child.capturing = out and true or nil
+	child.shopt.globskipdots = self.shopt.globskipdots -- (reset_shopt_options keeps it)
+	M.startup_ignored(child) -- a new shell: what's ignored now stays ignored
+	if child.fimports then
+		M.import_functions(child)
+	end
+	for k = 2, n do
+		child.nparams = child.nparams + 1
+		child.params[child.nparams] = args[k]
+	end
+	local csh = M.cur_shell
+	self:subshell_run(function()
+		child.iso_ctx = self.iso_ctx -- (its process-state saves land in our context)
+		child.subdepth = self.subdepth
+		M.cur_shell = child
+		pcall(require("interp").run_lazy, child, src)
+		M.cur_shell = csh
+		io.flush()
+	end)
+	M.cur_shell = csh
+	self.status = child.status or 0
+end
+function Shell:run_noexec(path, args, n)
+	self:run_script_inproc(path, args, n)
 end
 
 -- When signal traps are active the shell BLOCKS the trapped signals (so it can
@@ -1640,7 +1682,11 @@ function Shell:exec(...)
 		end
 		local pidp = ffi.new("curse_pid_t[1]")
 		local attr = child_spawnattr(self)
-		local rc = C.posix_spawnp(pidp, execpath, nil, attr, ffi.cast("char *const *", argv), C.environ)
+		local fa = M.foreign_fa(self, nil)
+		local rc = C.posix_spawnp(pidp, execpath, fa, attr, ffi.cast("char *const *", argv), C.environ)
+		if fa then
+			C.posix_spawn_file_actions_destroy(fa)
+		end
 		if attr then
 			C.posix_spawnattr_destroy(attr)
 		end
@@ -1671,6 +1717,7 @@ function Shell:exec(...)
 	C.posix_spawn_file_actions_init(fa)
 	C.posix_spawn_file_actions_adddup2(fa, wfd, 1)
 	C.posix_spawn_file_actions_addclose(fa, rfd)
+	M.foreign_fa(self, fa)
 	local pidp = ffi.new("curse_pid_t[1]")
 	local attr = child_spawnattr(self)
 	local rc = C.posix_spawnp(pidp, execpath, fa, attr, ffi.cast("char *const *", argv), C.environ)
@@ -1679,14 +1726,11 @@ function Shell:exec(...)
 	end
 	C.posix_spawn_file_actions_destroy(fa)
 	local pid = pidp[0]
-	if rc == 8 then -- ENOEXEC: no-shebang script — run it through our interpreter in a
-		pid = M.fork() -- child, with its stdout dup'd onto the capture pipe's write end.
-		if pid == 0 then
-			C.dup2(wfd, 1)
-			C.close(wfd)
-			C.close(rfd)
-			self:exec_script_child(execpath, args, n)
-		end
+	if rc == 8 then -- ENOEXEC: no-shebang script — our interpreter runs it, into the capture
+		C.close(wfd)
+		C.close(rfd)
+		self:run_script_inproc(execpath, args, n, self.out)
+		return
 	end
 	C.close(wfd)
 	if rc ~= 0 and rc ~= 8 then -- ENOENT -> "command not found" (127); else can't-execute (126)
@@ -2289,6 +2333,7 @@ function M.iso_save_traps(sh)
 		return
 	end
 	ctx.traps = {
+		owner = sh, -- (whose tables these are: a no-#! script's fresh shell shares our context)
 		traps = sh.traps, sigtraps = sh.sigtraps, inh = M.exit_trap_inherited,
 		esp = sh.err_trap_sp, run = rawget(_G, "__curse_sigrun"), inexit = sh.in_exit_trap,
 	}
@@ -2445,10 +2490,11 @@ end
 local function iso_undo(sh, ctx)
 	if ctx.traps then
 		local sv = ctx.traps
+		local o = sv.owner or sh
 		local I = package.loaded.interp
 		local SIGNUM = I and I._int.SIGNUM or {}
 		local seen = {}
-		for canon in pairs(sh.sigtraps or {}) do
+		for canon in pairs(o.sigtraps or {}) do
 			seen[canon] = true
 		end
 		for canon in pairs(sv.sigtraps or {}) do
@@ -2468,8 +2514,8 @@ local function iso_undo(sh, ctx)
 				end
 			end
 		end
-		sh.traps, sh.sigtraps = sv.traps, sv.sigtraps
-		M.exit_trap_inherited, sh.err_trap_sp, sh.in_exit_trap = sv.inh, sv.esp, sv.inexit
+		o.traps, o.sigtraps = sv.traps, sv.sigtraps
+		M.exit_trap_inherited, o.err_trap_sp, o.in_exit_trap = sv.inh, sv.esp, sv.inexit
 		_G.__curse_sigrun = sv.run
 	end
 	M.iso_restore_fds(ctx)
@@ -2516,7 +2562,8 @@ end
 -- The EXIT trap a subshell set itself runs when it ends (never an inherited one, nor
 -- after `exec CMD`); `exit N` inside it sets the status. Returns the status.
 function M.iso_exit_trap(sh, ctx, status, err)
-	if not (ctx and ctx.traps) or M.exit_trap_inherited or (type(err) == "table" and err.__curse_noexittrap) then
+	if not (ctx and ctx.traps) or (ctx.traps.owner or sh) ~= sh or M.exit_trap_inherited
+		or (type(err) == "table" and err.__curse_noexittrap) then
 		return status
 	end
 	local h = sh.traps and sh.traps.EXIT
@@ -3055,8 +3102,17 @@ end
 -- NAME; the interpreter polls for that between commands while any coproc exists.
 function M.coproc_poll(sh)
 	local sb = ffi.new("int[1]")
-	for pid in pairs(sh.coprocs) do
-		if C.waitpid(pid, sb, 1) == pid then -- WNOHANG
+	for pid, cp in pairs(sh.coprocs) do
+		if cp.g then -- (in-process)
+			if cp.g.done then
+				for _, j in ipairs(sh.jobs or {}) do
+					if j.pid == pid and not j.done then
+						j.done, j.status = true, cp.g.status[1] or 0
+					end
+				end
+				M.coproc_dispose(sh, pid)
+			end
+		elseif C.waitpid(pid, sb, 1) == pid then -- WNOHANG
 			for _, j in ipairs(sh.jobs or {}) do
 				if j.pid == pid and not j.done then
 					j.done, j.status = true, M.wexit(sb[0])
@@ -3218,6 +3274,7 @@ function Shell:spawn_bg(args, cmdstr)
 	if (self.stdin_redir or 0) == 0 then -- async job: stdin </dev/null (unless redirected around it)
 		C.posix_spawn_file_actions_addopen(fa, 0, "/dev/null", 0, 0)
 	end
+	M.foreign_fa(self, fa)
 	C.setenv("_", execpath, 1) -- (the program's `_` is its path, as in Shell:exec)
 	local pidp = ffi.new("curse_pid_t[1]")
 	local attr = child_spawnattr(self)
@@ -3626,12 +3683,17 @@ local function co_resume(ctx, t)
 			end
 		end
 	end
+	local csh = M.cur_shell -- (its diagnostics carry ITS line: see M.err_prefix)
+	if t.sh then
+		M.cur_shell = t.sh
+	end
 	if t.pending and t.started then
 		rok, a, b = coroutine.resume(t.co, SIGMARK)
 	else
 		t.started = true
 		rok, a, b = coroutine.resume(t.co)
 	end
+	M.cur_shell = csh
 	if g.bg and not g.base_closed then
 		-- (a background job's starting copies were only needed to start it: from here its
 		-- own saved state holds what it uses, and no stale copy keeps a pipe open)
@@ -3822,12 +3884,6 @@ function Shell:run_pipeline_co(stage_fns, inproc, lastpipe, upv_get, upv_set)
 	local P = { fd = {}, env = C.environ, cwd = self:phys_cwd() }
 	for k = 0, 9 do
 		P.fd[k] = co_cx(ctx, k)
-	end
-	if P.fd[0] < 0 or P.fd[1] < 0 or P.fd[2] < 0 then -- a std fd is closed: fork path
-		for k = 0, 9 do
-			co_cl(ctx, P.fd[k])
-		end
-		return nil
 	end
 	P.um = C.curse_co_umask(0)
 	C.curse_co_umask(P.um)
@@ -4133,7 +4189,9 @@ function M.bg_tail_stmt(cmd)
 		words = { { k = "word", parts = { { lit = "exec", q = false } }, src = "exec" } } }
 	return { t = "andor", line = cmd.line, items = { { cmd = ex }, { op = "&&", cmd = bare } } }
 end
-function Shell:bg_launch(fn, cmdstr, flat, simple, upv_get, upv_set)
+-- opts (optional): fds = { [k] = fd } starts it with fd k = a dup of fd (a process
+-- substitution's pipe end); keepstdin (no </dev/null); nojob (not in the job table).
+function Shell:bg_launch(fn, cmdstr, flat, simple, upv_get, upv_set, opts)
 	local ctx = sched_get()
 	local upv
 	if upv_get then
@@ -4151,7 +4209,13 @@ function Shell:bg_launch(fn, cmdstr, flat, simple, upv_get, upv_set)
 		base.fd[k] = co_cx(ctx, k)
 	end
 	local piped = t0 and t0.i and t0.i > 1 -- (in a later pipeline stage: stdin is that pipe)
-	if not self.opt_m and (self.stdin_redir or 0) == 0 and not piped then -- (async: stdin </dev/null)
+	opts = opts or {}
+	for k, fd in pairs(opts.fds or {}) do
+		co_cl(ctx, base.fd[k])
+		base.fd[k] = co_cx(ctx, fd)
+	end
+	if not self.opt_m and (self.stdin_redir or 0) == 0 and not piped and not opts.keepstdin
+		and not (opts.fds and opts.fds[0]) then -- (async: stdin </dev/null)
 		co_cl(ctx, base.fd[0])
 		local dn = C.open("/dev/null", 0, 0)
 		base.fd[0] = dn >= 0 and co_cx(ctx, dn) or -1
@@ -4201,6 +4265,10 @@ function Shell:bg_launch(fn, cmdstr, flat, simple, upv_get, upv_set)
 	end
 	if self.cap_jobs and holds then
 		self.cap_jobs[#self.cap_jobs + 1] = g
+	end
+	if opts.nojob then
+		self.last_bg_pid = tostring(vpid)
+		return { pid = vpid, g = g }
 	end
 	local job = M.job_add(self, vpid, cmdstr)
 	job.g = g
