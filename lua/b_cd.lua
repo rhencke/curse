@@ -96,7 +96,7 @@ return function(sh, cmd, args, hook, tcb)
 		-- path so the process and $PWD agree logically (e.g. `cd symlink/..` lands in
 		-- the symlink's textual parent, not its physical one).
 		if C.chdir(dir) ~= 0 then
-			io.stderr:write("curse: cd: " .. dir .. ": No such file or directory\n")
+			io.stderr:write("curse: cd: " .. rt.err_name(dir) .. ": No such file or directory\n")
 			sh.status = 1
 			return
 		end

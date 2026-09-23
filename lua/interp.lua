@@ -3556,13 +3556,15 @@ local function printf_parse(fmt)
 end
 -- `nsets` (optional): collects %n requests as { name, byte-count-so-far } for the caller
 local function sh_printf(fmt, argv, start, nsets)
-	local toks = _pf_cache[fmt]
+	-- (a \u/\U escape's bytes depend on the locale: key those formats by its generation)
+	local key = fmt:find("\\[uU]") and (rt.locale_gen .. "\0" .. fmt) or fmt
+	local toks = _pf_cache[key]
 	if not toks then
 		toks = printf_parse(fmt)
 		if _pf_n >= 512 then
 			_pf_cache, _pf_n = {}, 0
 		end
-		_pf_cache[fmt] = toks
+		_pf_cache[key] = toks
 		_pf_n = _pf_n + 1
 	end
 	local out, status, ai = {}, 0, start
@@ -4897,9 +4899,6 @@ exec_stmt = function(sh, st, hook)
 				st2.assigns = as
 				st = st2
 			end
-		end
-		if sh.coprocs and next(sh.coprocs) then
-			rt.coproc_poll(sh) -- a coproc that finished is reaped now (bash: on SIGCHLD)
 		end
 		local pnp, pnf = procsub_mark(sh) -- drain only <()/>() this command registers
 		-- Alias expansion is done in the PARSER (a source-deterministic in-context

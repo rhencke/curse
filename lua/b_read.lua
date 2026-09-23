@@ -211,5 +211,10 @@ return function(sh, cmd, args, hook, tcb)
 		if timed_out then
 			sh.status = 142
 		end
+		if sh.coprocs and next(sh.coprocs) then -- (a blocking read is where bash has seen a
+			local st = sh.status -- finished coproc's SIGCHLD and reaped it)
+			rt.coproc_poll(sh)
+			sh.status = st
+		end
 	end
 end

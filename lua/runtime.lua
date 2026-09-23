@@ -69,6 +69,16 @@ function M.shell_quote(s)
 	return table.concat(out)
 end
 
+-- A name in a diagnostic (`NAME: command not found`, `cd: NAME: …`): bash ANSI-C quotes
+-- it when it holds a non-printable or invalid character (ansic_shouldquote), else as is.
+function M.err_name(s)
+	if not s:find("[%z\1-\31\127-\255]") then
+		return s
+	end
+	local q = M.shell_quote(s)
+	return q:sub(1, 2) == "$'" and q or s
+end
+
 local Shell = {}
 Shell.__index = Shell
 M.Shell = Shell
@@ -977,6 +987,7 @@ function M.mb_chars(s)
 		if r == 0 or r > (n - i) then
 			r = 1
 			wc = nil
+			ffi.fill(_mb_st, ffi.sizeof(_mb_st)) -- (an incomplete sequence leaves the state mid-char)
 		end -- bad byte: no codepoint
 		out[#out + 1] = { s = s:sub(i + 1, i + r), wc = wc }
 		i = i + r
@@ -1365,7 +1376,7 @@ function Shell:exec(...)
 	if not args[1]:find("/", 1, true) then
 		execpath = self:resolve_cmd(args[1])
 		if not execpath then
-			self:errmsg("curse: " .. (self.exec_builtin and "exec: " or "") .. args[1] .. (self.exec_builtin and ": not found\n" or ": command not found\n"))
+			self:errmsg("curse: " .. (self.exec_builtin and "exec: " or "") .. M.err_name(args[1]) .. (self.exec_builtin and ": not found\n" or ": command not found\n"))
 			self.status = 127
 			return
 		end
@@ -1402,7 +1413,7 @@ function Shell:exec(...)
 			if e == 8 then -- ENOEXEC: no-shebang script — run it through our interpreter
 				return self:run_noexec(execpath, args, n)
 			end
-			self:errmsg("curse: " .. (self.exec_builtin and "exec: " or "") .. tostring(args[1]) .. (e == 2 and (self.exec_builtin and ": not found\n" or ": command not found\n") or ": Permission denied\n"))
+			self:errmsg("curse: " .. (self.exec_builtin and "exec: " or "") .. M.err_name(tostring(args[1])) .. (e == 2 and (self.exec_builtin and ": not found\n" or ": command not found\n") or ": Permission denied\n"))
 			self.status = (e == 2) and 127 or 126
 			return
 		end
@@ -1417,7 +1428,7 @@ function Shell:exec(...)
 		end -- no shebang: run as a script
 		if rc ~= 0 then
 			self:errmsg(
-				"curse: " .. (self.exec_builtin and "exec: " or "") .. tostring(args[1]) .. (rc == 2 and (self.exec_builtin and ": not found\n" or ": command not found\n") or ": Permission denied\n")
+				"curse: " .. (self.exec_builtin and "exec: " or "") .. M.err_name(tostring(args[1])) .. (rc == 2 and (self.exec_builtin and ": not found\n" or ": command not found\n") or ": Permission denied\n")
 			)
 			self.status = (rc == 2) and 127 or 126
 			return
@@ -1459,7 +1470,7 @@ function Shell:exec(...)
 	C.close(wfd)
 	if rc ~= 0 and rc ~= 8 then -- ENOENT -> "command not found" (127); else can't-execute (126)
 		C.close(rfd)
-		self:errmsg("curse: " .. (self.exec_builtin and "exec: " or "") .. tostring(args[1]) .. (rc == 2 and (self.exec_builtin and ": not found\n" or ": command not found\n") or ": Permission denied\n"))
+		self:errmsg("curse: " .. (self.exec_builtin and "exec: " or "") .. M.err_name(tostring(args[1])) .. (rc == 2 and (self.exec_builtin and ": not found\n" or ": command not found\n") or ": Permission denied\n"))
 		self.status = (rc == 2) and 127 or 126
 		return
 	end
@@ -5266,14 +5277,48 @@ local function strip_regex(val, glob, prefix, longest)
 	ffi.C.regfree(rb)
 	return res
 end
-local function strip_prefix(val, glob, longest)
+-- bash matches a pattern BYTE-wise when the string or the pattern isn't valid in the
+-- multibyte locale (xstrmatch's fallback): `case $euro in *$'\202'*)` matches a byte of it.
+function M.mb_invalid(s)
+	if lc_mb_cur_max <= 1 or not s:find("[\128-\255]") then
+		return false
+	end
+	for _, ch in ipairs(M.mb_chars(s)) do
+		if not ch.wc then
+			return true
+		end
+	end
+	return false
+end
+function M.bytewise(fn, ...)
+	local cur = C.setlocale(0, nil)
+	local saved = cur ~= nil and ffi.string(cur) or "C"
+	C.setlocale(0, "C")
+	local smb = lc_mb_cur_max
+	lc_mb_cur_max = 1
+	local ok, a, b = pcall(fn, ...)
+	C.setlocale(0, saved)
+	lc_mb_cur_max = smb
+	if not ok then
+		error(a, 0)
+	end
+	return a, b
+end
+local strip_prefix, strip_suffix
+function strip_prefix(val, glob, longest)
+	if lc_mb_cur_max > 1 and (M.mb_invalid(val) or M.mb_invalid(glob)) then
+		return M.bytewise(strip_prefix, val, glob, longest)
+	end
 	local r, ok = fast_strip(val, glob, true, longest)
 	if ok then
 		return r
 	end
 	return strip_regex(val, glob, true, longest)
 end
-local function strip_suffix(val, glob, longest)
+function strip_suffix(val, glob, longest)
+	if lc_mb_cur_max > 1 and (M.mb_invalid(val) or M.mb_invalid(glob)) then
+		return M.bytewise(strip_suffix, val, glob, longest)
+	end
 	local r, ok = fast_strip(val, glob, false, longest)
 	if ok then
 		return r
@@ -5845,6 +5890,9 @@ function M.glob_match(s, glob, icase)
 		if kind == "*" then -- pre*post
 			return #s >= #pre + #post and s:sub(1, #pre) == pre and (post == "" or s:sub(#s - #post + 1) == post)
 		end
+	end
+	if lc_mb_cur_max > 1 and (M.mb_invalid(s) or M.mb_invalid(glob)) then
+		return M.bytewise(M.glob_match, s, glob, icase)
 	end
 	if glob:find("!(", 1, true) then
 		return M.ext_match(s, glob, icase)
@@ -7750,18 +7798,29 @@ end
 function M.utf8_char(cp)
 	if cp < 0x80 then
 		return string.char(cp)
-	elseif cp < 0x800 then
-		return string.char(0xC0 + math.floor(cp / 64), 0x80 + cp % 64)
-	elseif cp < 0x10000 then
-		return string.char(0xE0 + math.floor(cp / 4096), 0x80 + math.floor(cp / 64) % 64, 0x80 + cp % 64)
-	else
-		return string.char(
-			0xF0 + math.floor(cp / 262144),
-			0x80 + math.floor(cp / 4096) % 64,
-			0x80 + math.floor(cp / 64) % 64,
-			0x80 + cp % 64
-		)
+	elseif cp >= 0x80000000 then
+		return "" -- (beyond what bash's u32toutf8 encodes)
+	elseif lc_mb_cur_max == 1 then -- a non-UTF-8 locale can't hold it: bash spells it out
+		return cp > 0xFFFF and ("\\U%08X"):format(cp) or ("\\u%04X"):format(cp)
 	end
+	-- UTF-8, with bash's 5- and 6-byte forms for code points past 0x1FFFFF
+	local n, lead = 2, 0xC0
+	if cp >= 0x4000000 then
+		n, lead = 6, 0xFC
+	elseif cp >= 0x200000 then
+		n, lead = 5, 0xF8
+	elseif cp >= 0x10000 then
+		n, lead = 4, 0xF0
+	elseif cp >= 0x800 then
+		n, lead = 3, 0xE0
+	end
+	local b = {}
+	for k = n, 2, -1 do
+		b[k] = 0x80 + cp % 64
+		cp = math.floor(cp / 64)
+	end
+	b[1] = lead + cp
+	return string.char(unpack(b))
 end
 
 -- `ansi_c` (true for $'…') enables \cX control chars and \u/\U code points; the
@@ -7790,25 +7849,7 @@ function M.ansi_unescape(s, mode)
 			elseif d == "u" or d == "U" then -- \uXXXX / \UXXXXXXXX code point (echo -e and $'…')
 				local hex = s:match(d == "u" and "^%x%x?%x?%x?" or "^%x%x?%x?%x?%x?%x?%x?%x?", i + 2)
 				if hex then
-					local cp = tonumber(hex, 16)
-					local u = {}
-					if cp < 0x80 then
-						u = { cp }
-					elseif cp < 0x800 then
-						u = { 0xC0 + math.floor(cp / 64), 0x80 + cp % 64 }
-					elseif cp < 0x10000 then
-						u = { 0xE0 + math.floor(cp / 4096), 0x80 + math.floor(cp / 64) % 64, 0x80 + cp % 64 }
-					else
-						u = {
-							0xF0 + math.floor(cp / 262144),
-							0x80 + math.floor(cp / 4096) % 64,
-							0x80 + math.floor(cp / 64) % 64,
-							0x80 + cp % 64,
-						}
-					end
-					for _, b in ipairs(u) do
-						out[#out + 1] = string.char(b)
-					end
+					out[#out + 1] = M.utf8_char(tonumber(hex, 16))
 					i = i + 2 + #hex
 				else
 					out[#out + 1] = "\\" .. d
@@ -8052,6 +8093,7 @@ function M.run_prefix(sh, names, vals, runfn)
 	sh.tenv_call_base = base -- a DIRECT function call tags these with its frame (local absorption)
 	local ok, err = pcall(runfn)
 	sh.tenv_call_base = nil
+	local relocale = false
 	for k = #sh.tenv, base + 1, -1 do
 		local s = sh.tenv[k]
 		sh.tenv[k] = nil
@@ -8062,7 +8104,11 @@ function M.run_prefix(sh, names, vals, runfn)
 			else
 				C.unsetenv(s.name)
 			end
+			relocale = relocale or LOCALE_VARS[s.name] ~= nil
 		end
+	end
+	if relocale then -- (`LC_CTYPE=C cmd`: the locale follows the variable back)
+		M.reset_locale(sh)
 	end
 	if not ok then
 		error(err)
