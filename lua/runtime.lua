@@ -7204,7 +7204,8 @@ arrayassign_body = function(sh, name, items, append)
 		end
 	end
 	local function keyof(kt)
-		return isassoc and kt or M.to_arr_key(M.arith_str(sh, kt))
+		-- (an indexed subscript loses bash's CTLESC bytes, e.g. from a $'\001' in it)
+		return isassoc and kt or M.to_arr_key(M.arith_str(sh, (kt:gsub("\1", ""))))
 	end
 	local snap
 	if not append then -- plain assignment resets the array (keeps assoc-ness)
@@ -9000,13 +9001,13 @@ function M.array_slice_values(sh, name, els, off, len, ltxt)
 	end
 	if name ~= "@" and name ~= "*" and not sh:is_assoc(name) then
 		local idx = sh:array_indices(name)
-		if off < 0 then
-			off = (idx[#idx] or -1) + 1 + off
+		if off < 0 then -- (int64: an index can be up to 2^63-1, beyond a double's exactness)
+			off = (idx[#idx] ~= nil and key_i64(idx[#idx]) or i64(-1)) + 1 + off
 		end
 		local out = {}
 		if off >= 0 then -- an out-of-bounds negative offset (off < 0 here) is empty
 			for i = 1, #idx do
-				if idx[i] >= off then
+				if key_i64(idx[i]) >= off then
 					out[#out + 1] = els[i]
 				end
 			end

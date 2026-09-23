@@ -3605,6 +3605,19 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs)
 						end
 						patstr[#patstr + 1] = src:sub(i, i)
 						i = i + 1
+					elseif c == "$" and src:sub(i + 1, i + 1) == "(" and src:sub(i + 2, i + 2) ~= "(" then
+						-- a $( … ) in a pattern: its body is checked as it's read (bash's
+						-- parse_comsub — which doesn't inherit the case-pattern state)
+						local je = scan_cmdsub(src, i + 2)
+						local cbody = src:sub(i + 2, je - 2)
+						if not alias_on and not cbody:find("[@!+*?]%(") and not cbody:find("<<", 1, true) then
+							local cerr = comsub_syntax(cbody)
+							if cerr then
+								error(cerr)
+							end
+						end
+						patstr[#patstr + 1] = src:sub(i, je - 1)
+						i = je
 					else
 						if c == "(" then
 							depth = depth + 1
@@ -3994,7 +4007,7 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs)
 		-- position on its own (or a bare `}`), is a misplaced-token syntax error.
 		do
 			local MISPLACED =
-				{ ["then"] = 1, ["else"] = 1, ["elif"] = 1, ["fi"] = 1, ["do"] = 1, ["done"] = 1, ["esac"] = 1 }
+				{ ["then"] = 1, ["else"] = 1, ["elif"] = 1, ["fi"] = 1, ["do"] = 1, ["done"] = 1, ["esac"] = 1, ["in"] = 1 }
 			local pwm = peekword()
 			if MISPLACED[pwm] or (src:sub(i, i) == "}" and (i + 1 > n or src:sub(i + 1, i + 1):match("[ \t\n;)]"))) then
 				error("syntax error near `" .. (pwm ~= "" and pwm or "}") .. "'")

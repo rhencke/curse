@@ -38,29 +38,46 @@ return function(sh, cmd, args, hook, tcb)
 			end
 			return rt.wexit(stbuf[0])
 		end
-		local nflag, specs, bad = false, {}, false
+		local nflag, specs = false, {}
 		local pvar -- -p VAR: the pid whose status is returned lands in VAR
 		local k = 2
-		while k <= #args do
+		while args[k] and args[k]:match("^%-.") do -- (options end at `--` or an operand)
 			local a = args[k]
-			if a == "-p" then
-				k = k + 1
-				pvar = args[k]
-			elseif a == "-n" then
-				nflag = true
-			elseif a == "-f" then -- accept (we always block until done anyway)
-			elseif a:sub(1, 1) == "-" and #a > 1 then
-				bad = true
-			else
-				specs[#specs + 1] = a
-			end
 			k = k + 1
+			if a == "--" then
+				break
+			end
+			local ci = 2
+			while ci <= #a do
+				local f = a:sub(ci, ci)
+				ci = ci + 1
+				if f == "n" then
+					nflag = true
+				elseif f == "f" then -- (accepted: we always block until done anyway)
+				elseif f == "p" then
+					pvar = a:sub(ci) ~= "" and a:sub(ci) or args[k]
+					if a:sub(ci) == "" then
+						k = k + 1
+					end
+					if pvar == nil then
+						io.stderr:write("curse: wait: -p: option requires an argument\n" .. rt.usage("wait"))
+						sh.status = 2
+						return
+					end
+					break
+				else
+					io.stderr:write("curse: wait: -" .. f .. ": invalid option\n" .. rt.usage("wait"))
+					sh.status = 2
+					return
+				end
+			end
+		end
+		for j = k, #args do
+			specs[#specs + 1] = args[j]
 		end
 		sh.jobs = sh.jobs or {}
 		local waited -- the pid whose status we return (for -p)
-		if bad then
-			sh.status = 2
-		elseif nflag and #specs > 0 then
+		if nflag and #specs > 0 then
 			-- -n with jobs: whichever LISTED job finishes first (others that end are recorded)
 			-- (only jobs not yet waited for count; bash forgets a job once wait returns it)
 			local want = {}

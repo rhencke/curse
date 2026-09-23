@@ -2969,6 +2969,42 @@ local function arrayassign_items(sh, st, isassoc)
 	end
 	return items
 end
+-- An array literal's `[SUB]=`: quote removal of '…' and $'…' (translated, bash's CTLESC
+-- bytes dropped) before the arithmetic; "…" and \x are left to it.
+local function literal_sub(k)
+	if not k:find("'", 1, true) then
+		return (k:gsub("\1", ""))
+	end
+	local out, i, n, dq = {}, 1, #k, false
+	while i <= n do
+		local c = k:sub(i, i)
+		if c == "\\" then
+			out[#out + 1] = k:sub(i, i + 1)
+			i = i + 2
+		elseif c == '"' then
+			dq = not dq
+			out[#out + 1] = c
+			i = i + 1
+		elseif not dq and c == "'" then
+			local e = k:find("'", i + 1, true) or n + 1
+			out[#out + 1] = k:sub(i + 1, e - 1)
+			i = e + 1
+		elseif not dq and c == "$" and k:sub(i + 1, i + 1) == "'" then
+			local j, buf = i + 2, {}
+			while j <= n and k:sub(j, j) ~= "'" do
+				local l = k:sub(j, j) == "\\" and 2 or 1
+				buf[#buf + 1] = k:sub(j, j + l - 1)
+				j = j + l
+			end
+			out[#out + 1] = (rt.ansi_unescape(table.concat(buf), true):gsub("\1", ""))
+			i = j + 1
+		else
+			out[#out + 1] = c
+			i = i + 1
+		end
+	end
+	return table.concat(out)
+end
 local function do_arrayassign(sh, st)
 	-- through a nameref (`local -n r=arr; r+=(x)`) the literal lands in the referenced array
 	local name = sh:deref(st.name)
@@ -3057,7 +3093,7 @@ local function do_arrayassign(sh, st)
 				elseif it.key == "*" or it.key == "@" then
 					io.stderr:write("curse: " .. src .. ": cannot assign to non-numeric index\n")
 				else
-					local idx = array_key(sh, name, it.key)
+					local idx = array_key(sh, name, literal_sub(it.key))
 					-- (indexed += appends to CURRENT, unlike assoc; a negative index past the
 					-- start fails)
 					if sh:array_set(name, idx, it.val, it.op == "+=") then
