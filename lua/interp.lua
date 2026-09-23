@@ -771,7 +771,7 @@ function M.arith_textual_eval(sh, raw, depth0)
 	local text = arith_expand_text(sh, raw, depth0)
 	local pok, ast = pcall(P.arith, text, "strict")
 	if not pok then -- the EXPANDED text isn't valid arithmetic: an arith error (bash), not a crash
-		io.stderr:write("curse: " .. P.arith_errmsg(text, ast) .. "\n")
+		io.stderr:write("curse: " .. P.arith_errmsg(text, ast, depth0 ~= nil) .. "\n")
 		error({ __curse_exit = 1, __curse_matherr = true, __curse_lineabort = true })
 	end
 	-- (this text is expansion OUTPUT: a `$key` subscript in it expands at evaluation, as

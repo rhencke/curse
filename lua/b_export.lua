@@ -392,6 +392,12 @@ return function(sh, cmd, args, hook, tcb)
 					if assoc then
 						sh:declare_assoc(nm)
 					end
+					if lattr or uattr or cattr or iattr then -- (the elements take the attributes)
+						local ab = sh.vars[sh:deref(nm)] or {}
+						sh.vars[sh:deref(nm)] = ab
+						ab.lower, ab.upper, ab.cap = lattr or nil, uattr or nil, cattr or nil
+						ab.int = iattr or ab.int
+					end
 					local ast = P.parse(nm .. (op == "+=" and "+=" or "=") .. val)
 					local st1 = ast.stmts[1]
 					if st1 and st1.t == "arrayassign" then
@@ -410,6 +416,13 @@ return function(sh, cmd, args, hook, tcb)
 						if not sh:nameref_decl(cmd, nm, val, localize) then
 							allok = false
 						end
+					elseif iattr and aattr and not assoc then -- declare -ai a=EXPR: element 0, integer
+						local v = M.arith_eval_str(sh, val)
+						if ap then
+							v = rt.arith_str(sh, sh:array_get(nm, 0)) + v
+						end
+						sh:array_set(nm, 0, rt.i64_to_str(v), false)
+						sh.vars[sh:deref(nm)].int = true
 					elseif iattr then -- declare -i: arith-evaluate the value, mark integer
 						if ap then -- (the old value is evaluated as an expression too)
 							sh:aset(nm, rt.arith_str(sh, sh:get(nm)) + M.arith_eval_str(sh, val))
@@ -422,15 +435,22 @@ return function(sh, cmd, args, hook, tcb)
 						sh.vars[nm].lower = lattr or nil
 						sh.vars[nm].upper = uattr or nil
 						sh.vars[nm].cap = cattr or nil
-						sh:set_str(nm, ap and (sh:get(nm) .. val) or val)
+						if sh.vars[nm].arr then -- (an array's element 0, folded by array_set)
+							sh:array_set(nm, sh.vars[nm].assoc and "0" or 0, val, ap)
+						else
+							sh:set_str(nm, ap and (sh:get(nm) .. val) or val)
+						end
 					else
 						local eb = sh.vars[sh:deref(nm)]
-						if eb and eb.arr and not eb.assoc and not assoc then -- scalar (+)= on an indexed array -> element 0
+						if ((eb and eb.arr and not eb.assoc) or aattr) and not assoc then
+							-- scalar (+)= on an indexed array (or `declare -a f=x`) -> element 0
 							sh:array_set(nm, array_key(sh, nm, "0"), val, ap)
-						else
+						elseif assoc or (eb and eb.assoc) then -- …an associative one: key "0"
 							if assoc then
 								sh:declare_assoc(nm)
 							end
+							sh:array_set(nm, "0", val, ap)
+						else
 							if eb and eb.int and not assoc then -- an integer var stays arithmetic
 								local v = rt.arith_str(sh, val)
 								sh:aset(nm, ap and (rt.arith_str(sh, sh:get(nm)) + v) or v)
@@ -603,7 +623,10 @@ return function(sh, cmd, args, hook, tcb)
 					end
 					-- bash creates the element for declare/typeset/local, but NOT via a
 					-- deferred `readonly a[i]=v` / `export a[i]=v` (those fail, status 1).
-					if anm and (aattr or assoc) and (cmd == "declare" or cmd == "typeset")
+					if anm and sub == "" then -- `declare a[]=x`
+						io.stderr:write("curse: " .. anm .. "[]: bad array subscript\n")
+						allok = false
+					elseif anm and (aattr or assoc) and (cmd == "declare" or cmd == "typeset")
 						and aval:sub(1, 1) == "(" and aval:sub(-1) == ")" then
 						-- `declare -a e[10]='(test)'`: a compound value assigns the whole array
 						-- (bash ignores the subscript)
@@ -621,6 +644,10 @@ return function(sh, cmd, args, hook, tcb)
 						io.stderr:write("curse: " .. cmd .. ": " .. anm .. "[" .. sub .. "]: reference variable cannot be an array\n")
 						allok = false
 					elseif anm and (cmd == "declare" or cmd == "typeset") then
+						if aval:sub(1, 1) == "(" and aval:sub(-1) == ")" and sh.vars[sh:deref(anm)] == nil then
+							-- (bash warns only when it's creating the array here)
+							io.stderr:write("curse: warning: " .. anm .. "[" .. sub .. "]=" .. aval .. ": quoted compound array assignment deprecated\n")
+						end
 						if localize then
 							sh:localVar(anm)
 						end

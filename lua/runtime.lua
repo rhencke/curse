@@ -4278,6 +4278,11 @@ function M.assign_ref(sh, cmd, ref, value)
 		sh:array_set(name, key, value, false)
 		return true
 	end
+	local b = sh.vars[sh:deref(name)]
+	if b and b.arr and not b.ref then -- (an array NAME gets element 0, like `x=v`)
+		sh:array_set(name, b.assoc and "0" or 0, value, false)
+		return true
+	end
 	return sh:set_str(name, value) ~= false
 end
 -- $! : under set -u, unbound until a background job exists (bash names the bare form

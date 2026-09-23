@@ -66,7 +66,7 @@ return function(sh, cmd, args, hook, tcb)
 						end
 					elseif eb and eb.arr then -- real indexed/assoc array: unset one element
 						if not sh:array_unset(nm, ukey()) then
-							io.stderr:write("curse: unset: " .. a .. ": bad array subscript\n")
+							io.stderr:write("curse: unset: [" .. sub .. "]: bad array subscript\n")
 							sh.status = 1
 						end
 					elseif eb and array_key(sh, nm, sub) == 0 then

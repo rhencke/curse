@@ -461,11 +461,16 @@ M.arith = arith
 -- `[CMD: ]EXPR: MSG (error token is "TOK")` — EXPR loses only its leading blanks. CMD is
 -- bash's this_command_name: `((`, `let`, `[[` while those evaluate (M.arith_cmd).
 M.arith_cmd = nil
-function M.arith_errmsg(expr, err)
-	local t = tostring(type(err) == "table" and err.expr or expr or ""):gsub("^%s+", "")
+-- `subscript`: the text is a subscript's quoted expansion — bash shows only its \[ \] escapes
+-- (the rest it protects invisibly), so drop ours before `$ ` " ' ~`
+local function shown(s, subscript)
+	return subscript and (s:gsub("\\([$`\"'~])", "%1")) or s
+end
+function M.arith_errmsg(expr, err, subscript)
+	local t = shown(tostring(type(err) == "table" and err.expr or expr or ""):gsub("^%s+", ""), subscript)
 	local pre = M.arith_cmd and (M.arith_cmd .. ": ") or ""
 	if type(err) == "table" and err.msg then
-		return pre .. t .. ": " .. err.msg .. ' (error token is "' .. (err.tok or "") .. '")'
+		return pre .. t .. ": " .. err.msg .. ' (error token is "' .. shown(err.tok or "", subscript) .. '")'
 	end
 	return pre .. t .. ": syntax error in expression"
 end
@@ -3619,14 +3624,16 @@ local function make_parser(src, sh, aenv, noalias, posix, line0)
 					end
 				elseif c == "" then
 					break
-				elseif c == "&" or c == ";" or c == "|" then
+				elseif c == "&" or c == ";" or c == "|" or ((c == "<" or c == ">") and src:sub(i + 1, i + 1) ~= "(") then
 					-- a control operator inside the list (`a=(x & y)`): bash's recoverable
 					-- syntax error at that token, which discards the rest of the LINE — later
 					-- lines of a multi-line literal then parse as ordinary commands (bash)
+					-- (the token is the whole operator: `<>`, `>>`, `&&`, …)
+					local tok = src:match("^[<>]+", i) or src:match("^[&|;][&|;]?", i) or c
 					while i <= n and src:sub(i, i) ~= "\n" do
 						i = i + 1
 					end
-					error({ __curse_arraylit = true, tok = c })
+					error({ __curse_arraylit = true, tok = tok })
 				elseif c == "(" then
 					-- an ELEMENT can't be `(` (a nested `()`, as in `a=( inside=() )`): bash
 					-- reports a syntax error but the assignment is NON-fatal (the var stays
@@ -3818,6 +3825,14 @@ local function make_parser(src, sh, aenv, noalias, posix, line0)
 			if src:sub(i, i) == "(" then -- array literal
 				local pstart = i
 				local elems = parse_array_elems()
+				local nx = src:sub(i, i)
+				if nx ~= "" and not nx:match("[%s;&|)<>]") then
+					-- `a=(4*3)/2`: text goes on past the `)` — then it's one ORDINARY word
+					-- (bash), assigned as a string (an integer var evaluates it)
+					local head = src:sub(pstart, i - 1)
+					local raw = head .. word(true)
+					return { t = "assign", name = name, index = subidx, append = (op == "+="), rhs = parse_word(raw) }
+				end
 				-- raw parenthesized text: a NAME=(…) used as a command PREFIX is a literal
 				-- string in bash (arrays can't be env bindings), decided at exec time.
 				return {
@@ -3963,24 +3978,34 @@ local function make_parser(src, sh, aenv, noalias, posix, line0)
 					-- whole (balanced, quote-aware) and parse it as a single word.
 					local st, depth = i, 0
 					i = i + #src:match("^[%a_][%w_]*%+?=", i) -- past NAME(+)=; now on `(`
-					repeat
-						local ch = src:sub(i, i)
-						if ch == "(" then
-							depth = depth + 1
-						elseif ch == ")" then
-							depth = depth - 1
-						elseif ch == "\\" then
-							i = i + 1
-						elseif ch == "'" or ch == '"' then
-							local close = src:find(ch == "'" and "'" or '[\\"]', i + 1)
-							while close and ch == '"' and src:sub(close, close) == "\\" do
-								close = src:find('[\\"]', close + 2)
+					if cmd1.lit == "eval" then
+						-- eval: read it with the array-literal reader (it knows every quoting and
+						-- `${…}` nesting), keeping just the raw text as the word
+						parse_array_elems()
+						depth = 0
+					else
+						repeat
+							local ch = src:sub(i, i)
+							if ch == "(" then
+								depth = depth + 1
+							elseif ch == ")" then
+								depth = depth - 1
+							elseif ch == "\\" then
+								i = i + 1
+							elseif ch == "'" or ch == '"' then
+								local close = src:find(ch == "'" and "'" or '[\\"]', i + 1)
+								while close and ch == '"' and src:sub(close, close) == "\\" do
+									close = src:find('[\\"]', close + 2)
+								end
+								i = close or n
 							end
-							i = close or n
-						end
-						i = i + 1
-					until depth == 0 or i > n
-					words[#words + 1] = parse_word(src:sub(st, i - 1))
+							i = i + 1
+						until depth == 0 or i > n
+					end
+					local head, nx = src:sub(st, i - 1), src:sub(i, i)
+					-- (`let a=(4*3)/2`: the word goes on past the `)`)
+					local more = (nx ~= "" and not nx:match("[%s;&|)<>]")) and word(true) or ""
+					words[#words + 1] = parse_word(head .. more)
 				else
 					local w = word(true) -- stop at unquoted ( ) so `cmd)` ends at the subshell close
 					if w == "" then
