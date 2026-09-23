@@ -1476,10 +1476,10 @@ local collect_names, analyze_lift -- forward: defined with the lift analysis bel
 -- An INLINABLE function's vars don't count as function-touched (its calls are spliced
 -- in), so they may be run()-locals; a call that ISN'T spliced (field-split arguments)
 -- runs fn_x, which works on sh — so hand it those locals and take back what it changed.
-local function inl_sync(cmd, call)
+local function inl_sync(cmd, call, cx)
 	local body = EF.inlinefns and EF.inlinefns[cmd]
-	if not body or not EF.runlocal_set then
-		return call
+	if not body or not EF.runlocal_set or not (cx and cx.toplevel) then
+		return call -- (only run() holds run-locals; a function body reads sh)
 	end
 	local names = {}
 	collect_names(body, names)
@@ -3355,68 +3355,90 @@ local function numeric_word(w)
 end
 
 -- collect every variable NAME referenced in an arith node / word / stmt list.
-local function collect_arith(e, set)
+local function collect_arith(e, set) -- (every variable an arith tree names, any node shape)
 	if type(e) ~= "table" then
 		return
 	end
-	if e.k == "var" or e.k == "asgn" or e.k == "post" or e.k == "pre" then
+	if type(e.name) == "string" then
 		set[e.name] = true
 	end
-	collect_arith(e.e, set)
-	collect_arith(e.l, set)
-	collect_arith(e.r, set)
+	for _, v in pairs(e) do
+		if type(v) == "table" then
+			collect_arith(v, set)
+		end
+	end
 end
 local function collect_word(w, set)
-	for _, p in ipairs(w.parts) do
+	for _, p in ipairs(w.parts or {}) do
 		if p.var then
 			set[p.var] = true
 		elseif p.arith then
 			collect_arith(safe_arith(p.arith), set)
+		elseif p.pexp then
+			local pe = p.pexp
+			if type(pe.name) == "string" then
+				set[pe.name] = true
+			end
+			for _, a in ipairs({ pe.arg, pe.arg2 }) do -- (`${x:-$y}`: the word reads y)
+				if type(a) == "string" and a:find("[%$`]") then
+					local ok, aw = pcall(require("parser").parse_word, a)
+					if ok and aw then
+						collect_word(aw, set)
+					end
+				end
+			end
 		end
 	end
 end
+-- Every variable a statement list assigns or reads — walking EVERY node shape (&&/||
+-- lists, pipelines, groups, (( )), case bodies, …): a lifted var one of these touches
+-- must stay in sync, so missing one is a wrong answer, not a slow one.
 collect_names = function(stmts, set)
-	for _, st in ipairs(stmts) do
-		if st.t == "assign" then
-			set[st.name] = true
-			if st.arith then
-				collect_arith(st.arith, set)
-			elseif st.rhs then
-				collect_word(st.rhs, set)
+	local function walk(node)
+		if type(node) ~= "table" then
+			return
+		end
+		if node.k == "word" or (node.parts and not node.t) then
+			collect_word(node, set)
+			return
+		end
+		local t = node.t
+		if t == "assign" or t == "arrayassign" then
+			if type(node.name) == "string" then
+				set[node.name] = true
 			end
-		elseif st.t == "simple" then
-			for j = 2, #st.words do
-				collect_word(st.words[j], set)
+			if node.arith then
+				collect_arith(node.arith, set)
 			end
-			local cmd = st.words[1] and st.words[1].parts[1] and st.words[1].parts[1].lit
-			if cmd == "local" then
-				for j = 2, #st.words do
-					local p1 = st.words[j].parts[1]
+		elseif t == "arithcmd" then
+			collect_arith(node.expr, set)
+		elseif t == "forc" then
+			collect_arith(node.init, set)
+			collect_arith(cond_arith(node.cond), set)
+			collect_arith(node.step, set)
+		elseif (t == "forin" or t == "select") and type(node.name) == "string" then
+			set[node.name] = true
+		elseif t == "simple" then
+			local cmd = node.words and node.words[1] and node.words[1].parts[1] and node.words[1].parts[1].lit
+			if cmd == "local" or cmd == "declare" or cmd == "typeset" or cmd == "read" or cmd == "unset"
+				or cmd == "export" or cmd == "readonly" or cmd == "let" or cmd == "printf" or cmd == "mapfile" then
+				for j = 2, #node.words do -- (names these builtins set)
+					local p1 = node.words[j].parts[1]
 					local nm = p1 and p1.lit and p1.lit:match("^([%a_][%w_]*)")
 					if nm then
 						set[nm] = true
 					end
 				end
 			end
-		elseif st.t == "forc" or st.t == "whilec" then
-			collect_arith(st.init, set)
-			collect_arith(cond_arith(st.cond), set)
-			collect_arith(st.step, set)
-			collect_names(st.body, set)
-		elseif st.t == "forin" then
-			set[st.name] = true
-			for _, w in ipairs(st.words) do
-				collect_word(w, set)
-			end
-			collect_names(st.body, set)
-		elseif st.t == "if" then
-			for _, cl in ipairs(st.clauses) do
-				collect_arith(cond_arith(cl.cond), set)
-				collect_names(cl.body, set)
-			end
-		elseif st.t == "funcdef" then
-			collect_names(st.body, set)
 		end
+		for k, v in pairs(node) do
+			if type(v) == "table" and k ~= "arith" and k ~= "init" and k ~= "step" and not (t == "arithcmd" and k == "expr") then
+				walk(v)
+			end
+		end
+	end
+	for _, st in ipairs(stmts) do
+		walk(st)
 	end
 end
 -- every var touched by a NON-INLINABLE function body (those keep an out-of-line
@@ -4934,10 +4956,10 @@ simple_compiled = function(cx, st, after)
 					st.line,
 					ff.locals and ("sh:pushCall(unpack(__a)); %s(sh); sh:popCall()"):format(fnlname(cmd))
 						or ("sh:pushParams(unpack(__a)); %s(sh); sh:popParams()"):format(fnlname(cmd))
-				))
+				), cx)
 			elseif cx.funcflags[cmd] then -- bare function (references NO positional params): build argv
 				from = 2 -- to run the args' side effects, then a bare call (params unread)
-				call = inl_sync(cmd, fnwrap(cmd, st.line, ("%s(sh)"):format(fnlname(cmd))))
+				call = inl_sync(cmd, fnwrap(cmd, st.line, ("%s(sh)"):format(fnlname(cmd))), cx)
 			elseif
 				cmd ~= nil
 				and not NATIVE_BUILTIN[cmd]
@@ -5158,6 +5180,7 @@ simple_compiled = function(cx, st, after)
 		else -- neither: bare call, no allocation
 			body = fnwrap(cmd, st.line, ("%s(sh)"):format(fnlname(cmd)))
 		end
+		body = inl_sync(cmd, body, cx)
 	else -- external command — OR a function DEFINED AT RUNTIME (via source/eval).
 		local allargs = {}
 		for j = 1, #st.words do
