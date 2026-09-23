@@ -4646,6 +4646,35 @@ local COLLSYM = {
 	["grave-accent"] = "`", ["left-brace"] = "{", ["left-curly-bracket"] = "{",
 	["vertical-line"] = "|", ["right-brace"] = "}", ["right-curly-bracket"] = "}", tilde = "~",
 }
+-- The index of the `]` closing the bracket expression whose `[` is at p[i] — a leading
+-- `!`/`^` and a first `]` are members; [:class:] / [.coll.] / [=equiv=] are skipped
+-- whole; nil when it never closes.
+local function bracket_end(p, i)
+	local j, n = i + 1, #p
+	if p:sub(j, j) == "!" or p:sub(j, j) == "^" then
+		j = j + 1
+	end
+	if p:sub(j, j) == "]" then
+		j = j + 1
+	end
+	while j <= n do
+		local c = p:sub(j, j)
+		if c == "]" then
+			return j
+		end
+		local nx = p:sub(j + 1, j + 1)
+		local e = c == "[" and (nx == ":" or nx == "." or nx == "=") and p:find(nx .. "]", j + 2, true)
+		if e then
+			j = e + 2
+		elseif c == "\\" then
+			j = j + 2
+		else
+			j = j + 1
+		end
+	end
+	return nil
+end
+M.bracket_end = bracket_end
 local POSIX_CLASS = {}
 for c in ("alnum alpha blank cntrl digit graph lower print punct space upper xdigit"):gmatch("%a+") do
 	POSIX_CLASS[c] = true
@@ -4664,14 +4693,7 @@ local function glob_conv(glob, pn, patsub)
 				if cc == "\\" then
 					j = j + 1 -- (an escaped char)
 				elseif cc == "[" then -- a bracket expression: its `)` doesn't close the group
-					local k = j + 1
-					if glob:sub(k, k) == "!" or glob:sub(k, k) == "^" then
-						k = k + 1
-					end
-					if glob:sub(k, k) == "]" then
-						k = k + 1
-					end
-					local close = glob:find("]", k, true)
+					local close = bracket_end(glob, j)
 					if not close then
 						d = -1 -- an unclosed `[` swallows the rest: the group never closes (bash)
 						break
@@ -4894,14 +4916,7 @@ function M.ext_match(str, pat, icase)
 			if cc == "\\" then
 				j = j + 2
 			elseif cc == "[" then -- a bracket expression: its `)` doesn't close the group
-				local k = j + 1
-				if pat:sub(k, k) == "!" or pat:sub(k, k) == "^" then
-					k = k + 1
-				end
-				if pat:sub(k, k) == "]" then
-					k = k + 1
-				end
-				local close = pat:find("]", k, true)
+				local close = bracket_end(pat, j)
 				if not close then
 					return nil -- an unclosed `[` swallows the rest (bash)
 				end
@@ -4987,17 +5002,8 @@ function M.ext_match(str, pat, icase)
 		elseif c == "?" then
 			return si <= slen and m(si + 1, pi + 1)
 		elseif c == "[" then
-			local j = pi + 1
-			if pat:sub(j, j) == "!" or pat:sub(j, j) == "^" then
-				j = j + 1
-			end
-			if pat:sub(j, j) == "]" then
-				j = j + 1
-			end
-			while j <= plen and pat:sub(j, j) ~= "]" do
-				j = j + 1
-			end
-			if pat:sub(j, j) ~= "]" then -- unclosed `[` is a literal `[`
+			local j = bracket_end(pat, pi)
+			if not j then -- unclosed `[` is a literal `[`
 				return si <= slen and str:sub(si, si) == "[" and m(si + 1, pi + 1)
 			end
 			if si <= slen and M.regex_match(str:sub(si, si), "^" .. glob_conv(pat:sub(pi, j)) .. "$", icase) then
@@ -5183,6 +5189,42 @@ end
 -- Scan one directory for entries matching a single glob segment. `dir` is the
 -- directory to open ("" == cwd). Returns a list of matching base names (unsorted).
 -- `dotglob` controls whether names beginning with `.` match a non-`.`-initial glob.
+-- An extglob segment's arms that name a leading `.` explicitly (`@(*|.!(|.))` -> `@(.!(|.))`):
+-- with dotglob off a dot file may match only through one of those (bash). nil if none.
+local function dot_arms(seg)
+	local op = seg:sub(1, 1)
+	if not (EXTOP[op] and seg:sub(2, 2) == "(") then
+		return nil
+	end
+	local d, j = 1, 3
+	while j <= #seg do
+		local c = seg:sub(j, j)
+		if c == "\\" then
+			j = j + 1
+		elseif c == "(" then
+			d = d + 1
+		elseif c == ")" then
+			d = d - 1
+			if d == 0 then
+				break
+			end
+		end
+		j = j + 1
+	end
+	if d ~= 0 then
+		return nil
+	end
+	local keep = {}
+	for _, a in ipairs(split_arms(seg:sub(3, j - 1))) do
+		if a:sub(1, 1) == "." then
+			keep[#keep + 1] = a
+		end
+	end
+	if #keep == 0 then
+		return nil
+	end
+	return op .. "(" .. table.concat(keep, "|") .. ")" .. seg:sub(j + 1)
+end
 local function scan_seg(dir, seg, dotglob, skipdots)
 	local scan = (dir == "" and ".") or dir
 	local d = ffi.C.opendir(scan)
@@ -5199,6 +5241,7 @@ local function scan_seg(dir, seg, dotglob, skipdots)
 		end
 	end
 	local hidden = seg:sub(1, 1) == "."
+	local dotseg = not hidden and not dotglob and dot_arms(seg)
 	skipdots = skipdots ~= false -- default: skip . and .. (globskipdots on)
 	local out = {}
 	while true do
@@ -5210,7 +5253,11 @@ local function scan_seg(dir, seg, dotglob, skipdots)
 		-- . and .. are matched only by an explicit leading-dot pattern with
 		-- globskipdots off; a leading-dot name otherwise needs `.`-pattern or dotglob.
 		local dotdot = name == "." or name == ".."
-		if (not dotdot or (not skipdots and hidden)) and (name:sub(1, 1) ~= "." or hidden or dotglob) then
+		if dotseg and not dotdot and name:sub(1, 1) == "." then
+			if M.ext_match(name, dotseg) then -- (a dot file, through an explicit `.` arm)
+				out[#out + 1] = name
+			end
+		elseif (not dotdot or (not skipdots and hidden)) and (name:sub(1, 1) ~= "." or hidden or dotglob) then
 			local m
 			if neg then
 				m = M.ext_match(name, seg) -- (explicit if: a false ext_match must NOT fall to regexec on an uncompiled regbuf)
