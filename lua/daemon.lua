@@ -397,6 +397,15 @@ local function serve_request(cfd, req, fds, ctx)
 	if tonumber(C.getpid()) ~= ctx.worker_pid then
 		C._exit(status % 256)
 	end
+	-- A forked `&` job would have been running all along; ours only runs when the shell
+	-- blocks. Give live jobs a short slice BEFORE the reply, so `echo a & echo b` has
+	-- written both lines by the time the caller reads the output (as bash's child has).
+	if rt.sched_live() then
+		pcall(rt.sched_pump, { deadline = rt.wall_secs() + 0.002, untilf = function()
+			return not rt.sched_live()
+		end })
+		io.flush()
+	end
 	local sbuf = ffi.new("int32_t[1]", status) -- finish_run maps to $?) becomes status 1
 	C.write(cfd, sbuf, 4)
 	C.close(cfd)

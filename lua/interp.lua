@@ -5,6 +5,7 @@
 -- when the compiled Lua is ready, unwinding here so execution can jump into the
 -- compiled code from exactly this point (state is already in `sh`).
 local rt = require("runtime")
+local PREEMPT = rt.preempt_flag -- (raised when a background job's CPU slice runs out: see rt.preempt)
 local P = require("parser") -- parser has no load-time dep on interp, so this is cycle-safe
 local i64 = rt.i64
 local ffi = require("ffi")
@@ -2082,9 +2083,17 @@ local function expand_to_fields(sh, w)
 						i = i + 1
 					end
 				end
-			else
-				add(c, true)
+			else -- add the whole run of non-IFS chars at once (per-char add is O(n²))
+				local i0 = i
 				i = i + cl
+				while i <= n do
+					cl = clen(v, i)
+					if inifs(cl == 1 and v:sub(i, i) or v:sub(i, i + cl - 1)) then
+						break
+					end
+					i = i + cl
+				end
+				add(v:sub(i0, i - 1), true)
 			end
 		end
 	end
@@ -5608,6 +5617,9 @@ exec_stmt = function(sh, st, hook)
 			end
 			while true do
 				hook("loop", st.id)
+				if PREEMPT[0] ~= 0 then
+					rt.preempt()
+				end
 				if st.cond then
 					fdbg()
 					if not truth(ev(st.cond, 2)) then
@@ -5643,6 +5655,9 @@ exec_stmt = function(sh, st, hook)
 		sh.loopdepth = (sh.loopdepth or 0) + 1
 		while true do
 			hook("loop", st.id)
+			if PREEMPT[0] ~= 0 then
+				rt.preempt()
+			end
 			-- a break/continue in the CONDITION affects this loop too (bash)
 			sh.noerr = sh.noerr + 1
 			local cok, cerr = pcall(exec_list, sh, st.cond, hook, false)
@@ -6002,6 +6017,9 @@ exec_stmt = function(sh, st, hook)
 		while true do
 			sh.forstate[st.id] = fs
 			hook("loop", st.id)
+			if PREEMPT[0] ~= 0 then
+				rt.preempt()
+			end
 			fs.idx = fs.idx + 1
 			if fs.idx > #fs.list then
 				break
@@ -6081,6 +6099,9 @@ exec_stmt = function(sh, st, hook)
 		menu()
 		while true do
 			hook("loop", st.id)
+			if PREEMPT[0] ~= 0 then
+				rt.preempt()
+			end
 			io.flush()
 			io.stderr:write(sh.vars["PS3"] and sh:get("PS3") or "#? ")
 			local line = readline()

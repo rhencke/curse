@@ -156,10 +156,30 @@ index af50e5c1..91736c2f 100644
    void *gdbjit_entry;	/* GDB JIT entry. */
  #endif
 diff --git a/src/lj_trace.c b/src/lj_trace.c
-index 24a1f7e4..2f590b42 100644
+index 24a1f7e4..bdb806fa 100644
 --- a/src/lj_trace.c
 +++ b/src/lj_trace.c
-@@ -883,9 +883,62 @@ static TraceNo trace_exit_find(jit_State *J, MCode *pc)
+@@ -273,6 +273,9 @@ void lj_trace_flushproto(global_State *g, GCproto *pt)
+ }
+ 
+ /* Flush all traces. */
++#ifdef CURSE_SIG_DESTRUCTIVE
++static MCode *curse_patched_back;  /* (curse: see curse_sig_patch_trace) */
++#endif
+ int lj_trace_flushall(lua_State *L)
+ {
+   jit_State *J = L2J(L);
+@@ -294,6 +297,9 @@ int lj_trace_flushall(lua_State *L)
+   /* Clear penalty cache. */
+   memset(J->penalty, 0, sizeof(J->penalty));
+   /* Free the whole machine code and invalidate all exit stub groups. */
++#ifdef CURSE_SIG_DESTRUCTIVE
++  curse_patched_back = NULL;  /* (a pending patch's code is gone with it) */
++#endif
+   lj_mcode_free(J);
+   memset(J->exitstubgroup, 0, sizeof(J->exitstubgroup));
+   lj_vmevent_send(J2G(J), TRACE,
+@@ -883,9 +889,66 @@ static TraceNo trace_exit_find(jit_State *J, MCode *pc)
  #endif
  
  /* A trace exited. Restore interpreter state. */
@@ -193,11 +213,15 @@ index 24a1f7e4..2f590b42 100644
 +  g = G(L);
 +  vs = (int32_t)g->vmstate;
 +  if (vs <= 0) return;               /* Not currently executing a trace. */
-+  if (curse_patched_back) return;    /* One outstanding patch at a time. */
 +  J = G2J(g);
 +  T = traceref(J, (TraceNo)vs);
 +  if (!T || !T->loopback) return;    /* No patchable loop back-edge. */
 +  bk = T->loopback; ex = T->loopexit;
++  if (curse_patched_back == bk) return;  /* Already armed on this loop. */
++  if (curse_patched_back) {  /* A stale patch (its trace never ran again): undo it. */
++    memcpy(curse_patched_back, curse_patched_orig, 5);
++    curse_patched_back = NULL;
++  }
 +  pg = (intptr_t)sysconf(_SC_PAGESIZE);
 +  a = ((intptr_t)bk) & ~(pg-1);
 +  b = (((intptr_t)bk + 5 + pg-1) & ~(pg-1));

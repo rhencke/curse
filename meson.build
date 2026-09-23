@@ -43,8 +43,12 @@ vm = custom_target('luajit-vm',
     '--out',   '@OUTDIR@',
     '--jobs',  '4',
     get_option('pgo') ? '--pgo' : '--no-pgo'],
-  # (curse's own C additions: editing them must rebuild the VM)
-  depend_files:     [lj_src / 'src' / 'lib_cursesys.c', lj_src / 'src' / 'lib_cursesig.c'],
+  # (curse's own C additions, and the LuaJIT files curse.patch modifies: editing
+  # them must rebuild the VM)
+  depend_files:     [lj_src / 'src' / 'lib_cursesys.c', lj_src / 'src' / 'lib_cursesig.c',
+                     lj_src / 'src' / 'lj_trace.c', lj_src / 'src' / 'lj_asm.c',
+                     lj_src / 'src' / 'lj_asm_x86.h', lj_src / 'src' / 'lj_clib.c',
+                     lj_src / 'src' / 'lj_jit.h', lj_src / 'src' / 'luajit.c'],
   console:          true,
   build_by_default: true,
   install:          true,

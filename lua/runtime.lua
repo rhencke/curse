@@ -838,6 +838,7 @@ function M.pipe_hi(fds)
 	return 0
 end
 local task_flush -- forward: flush a task's buffered stdout (defined with the scheduler)
+local task_signals -- forward: deliver a task's pending signals (see M.vkill)
 local real_flush = io.flush
 -- Park-safety before a yield: nothing buffered may be left in stdio or the task's
 -- stdout buffer, because while parked fd 1 belongs to some OTHER stage.
@@ -847,8 +848,38 @@ local function pre_yield(t)
 	end
 	real_flush()
 end
+-- Preemption of a background job that computes without blocking (lib_cursesig.c): while
+-- one runs, a CPU-time slice is armed; when it runs out the flag is raised, and the job
+-- yields at its next loop head (the interpreter's and compiled code's loops check it) —
+-- so `while :; do :; done &` can't starve the shell. Only at loop heads: mid-statement,
+-- shared scratch state (match buffers, …) could be in use.
+pcall(ffi.cdef, "int *curse_preempt_flagp(void); int curse_preempt_arm(long usec);")
+local PREEMPT, preempt_arm
+do
+	local ok, p = pcall(function()
+		return C.curse_preempt_flagp()
+	end)
+	if ok and p ~= nil then
+		PREEMPT, preempt_arm = p, C.curse_preempt_arm
+	else -- (a VM without curse's C additions: no slices)
+		PREEMPT, preempt_arm = ffi.new("int[1]"), function()
+			return -1
+		end
+	end
+end
+M.preempt_flag = PREEMPT
+local PREEMPT_USEC = 10000
+function M.preempt()
+	PREEMPT[0] = 0
+	local t = co_task()
+	if t then
+		pre_yield(t)
+		if coroutine.yield() == SIGMARK then -- (no values: co_resume queues it as runnable again)
+			task_signals(t)
+		end
+	end
+end
 -- Wait until `fd` is ready for `ev` (POLLIN/POLLOUT). A no-op outside a stage.
-local task_signals -- forward: deliver a task's pending signals (see M.vkill)
 function M.co_block(fd, ev)
 	local t = co_task()
 	if not t then
@@ -973,7 +1004,9 @@ end
 -- precedence per category: LC_ALL overrides; else LC_<category>; else LANG. An
 -- invalid locale name makes setlocale return NULL and leaves the prior locale in
 -- place (bash warns and continues) — so we never clobber a good locale.
+local re_locale_changed = function() end -- (defined with the regex cache below)
 M.locale_gen = 0 -- bumped per reset: an in-process subshell that changed it re-applies on exit
+local re_lockey, lk = "", {}
 function M.reset_locale(sh)
 	M.locale_gen = M.locale_gen + 1
 	local all = sh.vars["LC_ALL"] and sh:get("LC_ALL")
@@ -999,9 +1032,17 @@ function M.reset_locale(sh)
 		end
 		for _, v in ipairs(cands) do
 			if C.setlocale(cat, v) ~= nil then
+				if cat == 0 or cat == 3 then
+					lk[cat] = v
+				end
 				break
 			end
 		end
+	end
+	local k = lk[0] .. "\0" .. lk[3]
+	if k ~= re_lockey then
+		re_lockey = k
+		re_locale_changed()
 	end
 	lc_mb_cur_max = tonumber(C.__ctype_get_mb_cur_max()) or 1
 end
@@ -3685,11 +3726,16 @@ local function co_resume(ctx, t)
 	if t.sh then
 		M.cur_shell = t.sh
 	end
+	local armed = g.bg and preempt_arm(PREEMPT_USEC) == 0
 	if t.pending and t.started then
 		rok, a, b = coroutine.resume(t.co, SIGMARK)
 	else
 		t.started = true
 		rok, a, b = coroutine.resume(t.co)
+	end
+	if armed then
+		preempt_arm(0)
+		PREEMPT[0] = 0
 	end
 	M.cur_shell = csh
 	if g.bg and not g.base_closed then
@@ -3767,6 +3813,10 @@ local function co_resume(ctx, t)
 		end
 	elseif type(a) == "table" then -- waiting on a nested pipeline group
 		t.wait = a
+	elseif a == nil then -- preempted (M.preempt): runnable again, after the others
+		t.wait = nil
+		ctx.runnable[#ctx.runnable + 1] = t
+		ctx.npre = true
 	else
 		t.wait, t.wev = a, b
 	end
@@ -4025,7 +4075,12 @@ function M.sched_pump(w)
 			if w.untilf and w.untilf() then
 				return
 			end
-			if #ctx.runnable == 0 then
+			-- a job preempted this round is runnable again at once; still poll (without
+			-- blocking) so the waiter's fd, its deadline, and jobs waiting on I/O get their
+			-- turn — a computing job must not starve them
+			local busy = #ctx.runnable > 0
+			if not busy or ctx.npre then
+				ctx.npre = nil
 				local waiting, tick = {}, false
 				for _, t in pairs(ctx.bycoro) do
 					if not t.done and t.wait ~= nil and type(t.wait) ~= "table" then
@@ -4036,7 +4091,7 @@ function M.sched_pump(w)
 					end
 				end
 				local blocking = w.fd or w.untilf or w.deadline
-				if not blocking and #waiting == 0 then
+				if not blocking and (#waiting == 0 or busy) then
 					return -- (a plain pump: only what could run right now)
 				end
 				if #waiting + 1 > pfn then
@@ -4064,7 +4119,7 @@ function M.sched_pump(w)
 					end
 				end
 				local tmo = -1
-				if not blocking then
+				if not blocking or busy then
 					tmo = 0
 				elseif tick then
 					tmo = 10
@@ -4491,6 +4546,9 @@ local function str_to_i64(s)
 	if s == nil or s == "" then
 		return i64(0)
 	end
+	if #s <= 15 and not s:find("[^0-9]") then -- (plain short decimal: exact as a double)
+		return i64(tonumber(s))
+	end
 	local sign, digits = s:match("^%s*([%-+]?)(%d+)")
 	if digits == nil then
 		return i64(0)
@@ -4555,6 +4613,10 @@ end
 local function arith_num(s)
 	if s == nil or s == "" then
 		return i64(0)
+	end
+	local c1 = s:byte(1)
+	if c1 >= 49 and c1 <= 57 and #s <= 15 and not s:find("[^0-9]") then -- plain decimal, no
+		return i64(tonumber(s)) -- leading 0 (octal) — exact as a double; the common case
 	end
 	s = s:match("^%s*(.-)%s*$")
 	local sign = 1
@@ -6656,10 +6718,10 @@ local function strip_regex(val, glob, prefix, longest)
 		end
 		return val
 	end
-	local rb = ffi.new("char[512]") -- own regex_t (regbuf local is declared later in the file)
-	if ffi.C.regcomp(rb, M.glob_to_ere(glob), 1 + 8) ~= 0 then
+	local rb = M.re_get(M.glob_to_ere(glob), 1 + 8) -- REG_EXTENDED|REG_NOSUB
+	if not rb then
 		return val
-	end -- REG_EXTENDED|REG_NOSUB
+	end
 	local function m(s)
 		return ffi.C.regexec(rb, s, 0, nil, 0) == 0
 	end
@@ -6697,7 +6759,6 @@ local function strip_regex(val, glob, prefix, longest)
 			end
 		end
 	end
-	ffi.C.regfree(rb)
 	return res
 end
 -- bash matches a pattern BYTE-wise when the string or the pattern isn't valid in the
@@ -6719,9 +6780,11 @@ function M.bytewise(fn, ...)
 	C.setlocale(0, "C")
 	local smb = lc_mb_cur_max
 	lc_mb_cur_max = 1
+	re_locale_changed()
 	local ok, a, b = pcall(fn, ...)
 	C.setlocale(0, saved)
 	lc_mb_cur_max = smb
+	re_locale_changed()
 	if not ok then
 		error(a, 0)
 	end
@@ -6807,7 +6870,32 @@ ffi.cdef([[
   int closedir(void *dirp);
 ]])
 local REG_EXTENDED, REG_NOSUB, REG_ICASE = 1, 8, 2
-local regbuf = ffi.new("char[512]") -- opaque regex_t (glibc ~64B; over-allocate)
+-- Compiled-regex cache: a `case`/[[ ]]/glob pattern in a loop would otherwise
+-- regcomp+regfree per test. regcomp bakes in LC_CTYPE/LC_COLLATE, so the cache is
+-- keyed by the locale (re_lockey, set by reset_locale/bytewise) and dropped when it
+-- changes. Entries are GC-owned (ffi.gc regfree); `false` caches a failed compile.
+local re_cache, re_n = {}, 0
+local function re_get(ere, flags)
+	local key = flags .. ":" .. ere
+	local rb = re_cache[key]
+	if rb == nil then
+		rb = ffi.new("char[512]") -- opaque regex_t (glibc ~64B; over-allocate)
+		if ffi.C.regcomp(rb, ere, flags) ~= 0 then
+			rb = false
+		else
+			rb = ffi.gc(rb, ffi.C.regfree)
+		end
+		if re_n >= 512 then
+			re_cache, re_n = {}, 0
+		end
+		re_cache[key], re_n = rb, re_n + 1
+	end
+	return rb
+end
+M.re_get = re_get
+re_locale_changed = function()
+	re_cache, re_n = {}, 0
+end
 
 -- Convert a shell glob to a POSIX ERE, anchored. Char classes carry over (with
 -- [!..] -> [^..]); regex-special chars elsewhere are escaped.
@@ -7073,12 +7161,8 @@ end
 -- Match `s` against a POSIX ERE. `anchored_glob` false = raw ERE (=~), true = a
 -- glob already converted to an anchored ERE. Returns boolean.
 function M.regex_match(s, ere, icase)
-	if ffi.C.regcomp(regbuf, ere, REG_EXTENDED + REG_NOSUB + (icase and REG_ICASE or 0)) ~= 0 then
-		return false
-	end
-	local rc = ffi.C.regexec(regbuf, s, 0, nil, 0)
-	ffi.C.regfree(regbuf)
-	return rc == 0
+	local rb = re_get(ere, REG_EXTENDED + REG_NOSUB + (icase and REG_ICASE or 0))
+	return rb and ffi.C.regexec(rb, s, 0, nil, 0) == 0 or false
 end
 local function split_alts(s) -- top-level `|` split (paren/bracket-aware)
 	local alts, depth, cur, i, n = {}, 0, {}, 1, #s
@@ -7280,11 +7364,11 @@ local pmatch = ffi.new("struct { int rm_so; int rm_eo; }[?]", NMATCH)
 function M.regex_captures(s, ere, icase)
 	-- second return = "invalid regex" (regcomp failed): [[ =~ ]] must report status
 	-- 2 for that, distinct from a valid regex that simply does not match (nil, nil).
-	if ffi.C.regcomp(regbuf, ere, REG_EXTENDED + (icase and REG_ICASE or 0)) ~= 0 then
+	local rb = re_get(ere, REG_EXTENDED + (icase and REG_ICASE or 0))
+	if not rb then
 		return nil, true
 	end
-	local rc = ffi.C.regexec(regbuf, s, NMATCH, pmatch, 0)
-	ffi.C.regfree(regbuf)
+	local rc = ffi.C.regexec(rb, s, NMATCH, pmatch, 0)
 	if rc ~= 0 then
 		return nil
 	end
@@ -7401,13 +7485,14 @@ function M.subst_glob(val, glob, repl, all, icase, rx)
 	else
 		ere = "(" .. ere .. ")"
 	end
-	if ffi.C.regcomp(regbuf, ere, REG_EXTENDED + (icase and REG_ICASE or 0)) ~= 0 then
+	local rb = re_get(ere, REG_EXTENDED + (icase and REG_ICASE or 0))
+	if not rb then
 		return val
 	end
 	local out, pos, n, prev_end = {}, 0, #val, -1
 	while pos <= n do
 		local sub = val:sub(pos + 1)
-		if ffi.C.regexec(regbuf, sub, 1, pmatch, pos > 0 and REG_NOTBOL or 0) ~= 0 then
+		if ffi.C.regexec(rb, sub, 1, pmatch, pos > 0 and REG_NOTBOL or 0) ~= 0 then
 			break
 		end
 		local so, eo = pmatch[0].rm_so, pmatch[0].rm_eo
@@ -7428,12 +7513,10 @@ function M.subst_glob(val, glob, repl, all, icase, rx)
 			end -- empty match: keep one char
 			if not all or anchor then
 				out[#out + 1] = val:sub(pos + 1)
-				ffi.C.regfree(regbuf)
 				return table.concat(out)
 			end
 		end
 	end
-	ffi.C.regfree(regbuf)
 	out[#out + 1] = val:sub(pos + 1)
 	return table.concat(out)
 end
@@ -7560,8 +7643,10 @@ local function scan_seg(dir, seg, dotglob, skipdots)
 	-- a `!()` segment needs the split matcher (per entry); everything else uses one
 	-- precompiled ERE.
 	local neg = seg:find("!(", 1, true) ~= nil
+	local rb
 	if not neg then
-		if ffi.C.regcomp(regbuf, glob_to_ere(seg), REG_EXTENDED + REG_NOSUB + (glob_icase and REG_ICASE or 0)) ~= 0 then
+		rb = re_get(glob_to_ere(seg), REG_EXTENDED + REG_NOSUB + (glob_icase and REG_ICASE or 0))
+		if not rb then
 			ffi.C.closedir(d)
 			return {}
 		end
@@ -7591,15 +7676,12 @@ local function scan_seg(dir, seg, dotglob, skipdots)
 			if neg then
 				m = M.ext_match(name, seg, glob_icase) -- (explicit if: a false ext_match must NOT fall to regexec on an uncompiled regbuf)
 			else
-				m = ffi.C.regexec(regbuf, name, 0, nil, 0) == 0
+				m = ffi.C.regexec(rb, name, 0, nil, 0) == 0
 			end
 			if m then
 				out[#out + 1] = name
 			end
 		end
-	end
-	if not neg then
-		ffi.C.regfree(regbuf)
 	end
 	ffi.C.closedir(d)
 	return out
@@ -10388,6 +10470,9 @@ end
 -- `test` numeric operands are plain DECIMAL integers (leading 0 is NOT octal; 0x/N#/arith
 -- rejected) — an invalid one is a syntax error.
 local function test_int(s)
+	if #s <= 15 and #s > 0 and not s:find("[^0-9]") then -- (plain decimal: leading 0 is
+		return i64(tonumber(s)) -- still decimal for test)
+	end
 	local d = s:match("^%s*([+-]?%d+)%s*$")
 	if not d then
 		error({ __test_syntax = ("%s: integer expression expected"):format(s) })

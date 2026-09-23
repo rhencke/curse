@@ -17,6 +17,40 @@ local do_arrayassign, eval, fmt_decl, fmt_set_var = I.do_arrayassign, I.eval, I.
 local C, P = I.C, I.P
 local exec_list = I.exec_list
 
+-- Parsed single-line eval strings (a loop's `eval "$x=…"` re-parses the same text
+-- every pass). Keyed on everything the parse depends on: text, line, extglob,
+-- posix; skipped while aliases are live (the parse would depend on the table) and
+-- for heredocs (the parse may warn). Values: the list of line groups.
+local eval_cache, eval_n = {}, 0
+local function eval_groups(sh, code, ln)
+	if code:find("\n", 1, true) or code:find("<<", 1, true) or #code > 2048
+		or (sh.shopt and sh.shopt.expand_aliases and sh.aliases and next(sh.aliases)) then
+		return nil
+	end
+	local key = code .. "\0" .. ln .. (sh.shopt and sh.shopt.extglob and "x" or "-") .. (sh.opt_posix and "p" or "-")
+	local lgs = eval_cache[key]
+	if not lgs then
+		lgs = {}
+		local nextf = P.open(code, sh, ln > 0 and ln or nil)
+		while true do
+			local lg = nextf()
+			if lg == nil then
+				break
+			end
+			lgs[#lgs + 1] = lg
+		end
+		if eval_n >= 256 then
+			eval_cache, eval_n = {}, 0
+		end
+		eval_cache[key], eval_n = lgs, eval_n + 1
+	end
+	local i = 0
+	return function()
+		i = i + 1
+		return lgs[i]
+	end
+end
+
 return function(sh, cmd, args, hook, tcb)
 	if cmd == "eval" then
 		-- eval [--]: join args, parse, run in the CURRENT shell (return/exit propagate).
@@ -35,7 +69,7 @@ return function(sh, cmd, args, hook, tcb)
 				sh.xdepth = (sxd or 0) + 1
 				local ok, err = pcall(function()
 					local ln = rt.current_line(sh)
-					local nextf = P.open(code, sh, ln > 0 and ln or nil)
+					local nextf = eval_groups(sh, code, ln) or P.open(code, sh, ln > 0 and ln or nil)
 					local vst = {}
 					while true do
 						local lg = nextf()

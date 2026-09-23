@@ -21,6 +21,7 @@
 #include <unistd.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <sys/time.h>
 
 static volatile sig_atomic_t curse_sig_num;  /* the signal to deliver at the next safepoint */
 static volatile pid_t curse_sig_pid;         /* pid that scheduled the hook (fork guard) */
@@ -123,6 +124,57 @@ void curse_sig_hold(int hold)
   sigset_t all;
   sigfillset(&all);
   sigprocmask(hold ? SIG_BLOCK : SIG_UNBLOCK, &all, (sigset_t *)0);
+}
+
+/* Preemption of in-process background jobs (curse runs `&` as coroutines). A job
+ * that computes without blocking never yields, so the shell and its other jobs
+ * would starve (`while :; do :; done & sleep 1; kill $!` would hang). While a job
+ * runs, the scheduler arms a one-shot CPU-time timer (ITIMER_VIRTUAL: only time
+ * actually spent computing counts); its handler raises a flag that the job checks
+ * at every loop head (interp and compiled code), yielding back to the scheduler.
+ * A JIT trace hoists that check out of its loop, so the handler also patches the
+ * running trace's back-edge to force the exit (as a trap signal does). SA_RESTART:
+ * the tick must not EINTR the job's syscalls. */
+static volatile int curse_preempt_flag;
+
+static void curse_preempt_onsignal(int s)
+{
+  (void)s;
+  curse_preempt_flag = 1;
+#ifdef CURSE_SIG_DESTRUCTIVE
+  { extern void curse_sig_patch_trace(void); curse_sig_patch_trace(); }
+#endif
+}
+
+int *curse_preempt_flagp(void)
+{
+  return (int *)&curse_preempt_flag;
+}
+
+/* Arm (usec > 0) or disarm (0) the slice. The handler is (re)installed over the
+ * default disposition (a daemon worker resets dispositions between requests); a
+ * script's own `trap … VTALRM` or `trap '' VTALRM` keeps the signal, and there are
+ * no slices (-1). */
+int curse_preempt_arm(long usec)
+{
+  struct itimerval it;
+  if (usec > 0) {
+    struct sigaction cur;
+    if (sigaction(SIGVTALRM, (struct sigaction *)0, &cur) != 0) return -1;
+    if (cur.sa_handler != curse_preempt_onsignal) {
+      struct sigaction sa;
+      if (cur.sa_handler != SIG_DFL) return -1;
+      memset(&sa, 0, sizeof sa);
+      sa.sa_handler = curse_preempt_onsignal;
+      sigemptyset(&sa.sa_mask);
+      sa.sa_flags = SA_RESTART;
+      if (sigaction(SIGVTALRM, &sa, (struct sigaction *)0) != 0) return -1;
+    }
+  }
+  memset(&it, 0, sizeof it);
+  it.it_value.tv_sec = usec / 1000000;
+  it.it_value.tv_usec = usec % 1000000;
+  return setitimer(ITIMER_VIRTUAL, &it, (struct itimerval *)0);
 }
 
 /* printf's floating conversions the way bash does them: the argument parsed as a long

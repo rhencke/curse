@@ -6975,8 +6975,15 @@ assemble = function(cfg, sig, opts)
 		o[#o + 1] = ("  pc = pc or %d"):format(cfg.entry)
 	end
 	o[#o + 1] = "  while true do"
+	-- a loop's head checks for preemption (a background job whose CPU slice ran out
+	-- yields there: rt.preempt) — in a trace the load is hoisted, ~free
+	local heads = {}
+	for _, hp in pairs(cfg.loopPc or {}) do
+		heads[hp] = true
+	end
 	for p = 0, cfg.npc - 1 do
-		o[#o + 1] = ("    %s pc == %d then %s"):format(p == 0 and "if" or "elseif", p, cfg.blocks[p])
+		o[#o + 1] = ("    %s pc == %d then %s%s"):format(p == 0 and "if" or "elseif", p,
+			heads[p] and "if __pre[0] ~= 0 then rt.preempt() end " or "", cfg.blocks[p])
 	end
 	o[#o + 1] = "    end"
 	o[#o + 1] = "  end"
@@ -7342,6 +7349,7 @@ function M.emit(ast, opts)
 		'local I = require("interp")',
 		'local bit = require("bit")',
 		"local __noop = function() end",
+		"local __pre = rt.preempt_flag",
 	}
 	if #upvals > 0 then
 		local vs = {}
