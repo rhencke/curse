@@ -238,6 +238,11 @@ local function word_reads_debugstack(w)
 end
 local function reads_debugstack(stmts)
 	for _, st in ipairs(stmts or {}) do
+		-- a sourced file can read them out of sight: keep the frames for it
+		local p1 = st.t == "simple" and st.words and st.words[1] and st.words[1].parts[1]
+		if p1 and (p1.lit == "source" or p1.lit == ".") then
+			return true
+		end
 		if st.words then
 			for _, w in ipairs(st.words) do
 				if word_reads_debugstack(w) then
@@ -1718,7 +1723,7 @@ end
 local function compile_cmdsub(src, backtick, lifted, aenv, noalias, posix)
 	local fallback = ("sh:capture_src(%q%s)"):format(src, noalias and ", " .. tostring(backtick or false) .. ", true"
 		or (backtick and ", true" or ""))
-	local pok, ast = pcall(require("parser").parse, src, nil, aenv, noalias, posix)
+	local pok, ast = pcall(require("parser").parse, src, nil, aenv, noalias, posix, EF.cur_cline or EF.cur_line)
 	if not pok or type(ast) ~= "table" or ast.stmts == nil then
 		return fallback
 	end -- syntax error
@@ -5767,6 +5772,7 @@ H.case = function(cx, st, after)
 	end
 	if st.line then
 		EF.cur_line = st.line
+		EF.cur_cline = st.cline or st.line
 	end -- clause flattening moved it; restore for $LINENO in the subject
 	local subjp = cx.newpc()
 	cx.blocks[subjp] = dbg(st)
@@ -5782,7 +5788,15 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
 	-- per-CFG compile state, passed explicitly to the module-level statement handlers (H)
 	local cx = { stmts = stmts, lifted = lifted, funcflags = funcflags, inlinefns = inlinefns, toplevel = toplevel }
 	emit_toplevel = cx.toplevel and true or false -- gates top-level-only ERR firing (see errchk)
-	cx.blocks = {}
+	-- each block remembers the source line being compiled when it was written (cx.pcline)
+	local pcline = {}
+	cx.pcline = pcline
+	cx.blocks = setmetatable({}, {
+		__newindex = function(t, k, v)
+			rawset(t, k, v)
+			pcline[k] = EF.cur_line
+		end,
+	})
 	cx.loopPc, cx.stmtPc = {}, {}
 	cx.npc = 0
 	function cx.newpc()
@@ -6164,6 +6178,7 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
 		end
 		if st.line then
 			EF.cur_line = st.line
+			EF.cur_cline = st.cline or st.line
 		end -- for $LINENO (compile-time constant)
 		-- `time [-p] pipeline`: start clocks, run the statement itself, report to stderr.
 		if st.timed then
@@ -6438,6 +6453,7 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
 		end
 		return {
 			blocks = cx.blocks,
+			pcline = cx.pcline,
 			npc = cx.npc,
 			entry = mark[1] or cx.DONE,
 			loopPc = cx.loopPc,
@@ -6447,6 +6463,7 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
 	end
 	return {
 		blocks = cx.blocks,
+		pcline = cx.pcline,
 		npc = cx.npc,
 		entry = cx.stmtPc[1] or cx.DONE,
 		loopPc = cx.loopPc,
@@ -6464,6 +6481,11 @@ end
 assemble = function(cfg, sig, opts)
 	opts = opts or {}
 	local o = { sig }
+	-- `pc` is local slot 2 in every dispatch function (a param of run; the FIRST local of a
+	-- fn_x / cs_N body): rt's error prefix reads it off the stack to find the line
+	if not opts.toplevel then
+		o[#o + 1] = ("  local pc = %d"):format(cfg.entry)
+	end
 	-- register compiled function closures into sh.functions so the interpreter
 	-- (reached via delegation) can call them too — full interp/compiled interop.
 	for _, n in ipairs(opts.register or {}) do
@@ -6499,7 +6521,9 @@ assemble = function(cfg, sig, opts)
 	-- lineabort thrown from compiled code is caught by the tier's retry wrapper, which
 	-- re-enters run at sh._ff — the markers wrote lifted state + sh._ff back per
 	-- top-level statement, so no closure/upvalue boxing (which would slow hot loops).
-	o[#o + 1] = opts.toplevel and ("  pc = pc or %d"):format(cfg.entry) or ("  local pc = %d"):format(cfg.entry)
+	if opts.toplevel then
+		o[#o + 1] = ("  pc = pc or %d"):format(cfg.entry)
+	end
 	o[#o + 1] = "  while true do"
 	for p = 0, cfg.npc - 1 do
 		o[#o + 1] = ("    %s pc == %d then %s"):format(p == 0 and "if" or "elseif", p, cfg.blocks[p])
@@ -6513,6 +6537,20 @@ assemble = function(cfg, sig, opts)
 		o[#o + 1] = ("  sh:aset(%q, %s)"):format(n, lname(n))
 	end
 	o[#o + 1] = "end"
+	-- pc -> source line, for error-message prefixes (read only on the error path)
+	local fname = sig:match("^local function ([%w_]+)") or sig:match("^([%w_]+) = function")
+	if fname and cfg.pcline then
+		local lt = {}
+		for p = 0, cfg.npc - 1 do
+			local ln = cfg.pcline[p]
+			if ln and ln > 0 then
+				lt[#lt + 1] = ("[%d]=%d"):format(p, ln)
+			end
+		end
+		if #lt > 0 then
+			o[#o + 1] = ("rt.pcline(%s, {%s})"):format(fname, table.concat(lt, ","))
+		end
+	end
 	return table.concat(o, "\n")
 end
 

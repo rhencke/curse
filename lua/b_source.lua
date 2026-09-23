@@ -69,6 +69,7 @@ return function(sh, cmd, args, hook, tcb)
 						end
 					end
 					sh.sourcedepth = (sh.sourcedepth or 0) + 1 -- a `return` is valid while sourcing
+					local sframe = rt.source_enter(sh, name) -- (BASH_SOURCE/BASH_LINENO/FUNCNAME frame)
 					-- Run the file the way the shell runs its own input: LAZILY through the
 					-- sh-aware parser, so aliases defined earlier expand later and a `return`
 					-- ends the file. A syntax error stops after the valid prefix (bash),
@@ -100,6 +101,7 @@ return function(sh, cmd, args, hook, tcb)
 						end
 					end)
 					sh.sourcedepth = sh.sourcedepth - 1
+					rt.source_leave(sh, sframe)
 					if #args > j then
 						sh.params, sh.nparams = savep, savenp
 					end

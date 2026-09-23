@@ -3372,6 +3372,12 @@ local function run_function(sh, cmd, fn, args, hook, tenv_base)
 	table.insert(sh.linestack, 1, sh.cur_line or 0)
 	sh.srcstack = sh.srcstack or {}
 	table.insert(sh.srcstack, 1, sh.cur_source or sh.argv0 or "")
+	-- ${BASH_SOURCE[0]} in the body is the file the function was DEFINED in
+	local saved_src = sh.cur_source
+	local deffile = sh.func_file and sh.func_file[cmd]
+	if deffile and deffile ~= "" then
+		sh.cur_source = deffile
+	end
 	local saved_ld = sh.loopdepth
 	sh.loopdepth = 0 -- break/continue don't cross into a function
 	local dbg_saved = rt.debug_enter(sh, cmd)
@@ -3403,6 +3409,7 @@ local function run_function(sh, cmd, fn, args, hook, tenv_base)
 	table.remove(sh.funcstack, 1)
 	table.remove(sh.linestack, 1)
 	table.remove(sh.srcstack, 1)
+	sh.cur_source = saved_src
 	sh:popCall()
 	sh.calldepth = sh.calldepth - 1
 	sh.cur_line = savedline -- back in the caller: $LINENO (e.g. for a top-level ERR trap) is the call site
@@ -4143,6 +4150,7 @@ exec_stmt = function(sh, st, hook)
 	end
 	if st.line and not (sh.in_trap and sh.in_trap > 0 and (sh.calldepth or 0) == sh.trap_calldepth) then
 		sh.cur_line = st.line
+		sh.cur_cline = st.cline or st.line -- (where its $(…) bodies number from)
 	end -- $LINENO: frozen at the trapped line for the trap's own commands (not in a
 	-- function the trap calls, whose lines count as usual — bash)
 	if t == "assign" then
@@ -4896,7 +4904,20 @@ exec_stmt = function(sh, st, hook)
 		else
 			-- Reached the unparseable tail (e.g. a makeself binary payload) — bash would
 			-- syntax-error here too. If an earlier exit fired, we never get here.
-			io.stderr:write("curse: syntax error" .. (st.line and (": line " .. st.line) or "") .. "\n")
+			-- bash's form: `syntax error near unexpected token `X'` (or `syntax error:
+			-- unexpected end of file`), then the offending line as `…'
+			local msg = tostring(st.msg or "syntax error"):gsub("^.-:%d+: ", "")
+			msg = msg:gsub("^syntax error near `", "syntax error near unexpected token `")
+			if not msg:find("^syntax error") and not msg:find("^unexpected EOF") then
+				msg = "syntax error: " .. msg
+			end
+			if st.line then
+				sh.cur_line = st.line
+			end
+			io.stderr:write("curse: " .. msg .. "\n")
+			if st.text and msg:find("near unexpected token", 1, true) then
+				io.stderr:write("curse: `" .. st.text .. "'\n")
+			end
 			error({ __curse_exit = 2, __curse_parseerr = true })
 		end
 	elseif t == "group" then
@@ -5702,6 +5723,7 @@ M.run_exit_trap = function(sh)
 	if h and h ~= "" and not sh.in_exit_trap then
 		sh.in_exit_trap = true
 		local saved = sh.status
+		sh.cur_line = 1 -- (bash: the EXIT trap's $LINENO counts from 1)
 		if not run_trap(sh, h) then
 			sh.status = saved
 		end
@@ -6016,4 +6038,5 @@ M._int = {
 	rt = rt,
 }
 
+rt.INTERP_FRAMES[exec_stmt] = true -- (error prefixes: sh.cur_line is current under it)
 return M

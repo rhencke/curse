@@ -76,7 +76,7 @@ local function needs_more(buf)
 	local ok, r = pcall(require("parser").parse, buf)
 	local perr = (not ok and tostring(r)) or (r and r.stmts and r.stmts[1] and r.stmts[1].t == "parse_error"
 		and tostring(r.stmts[1].msg)) or ""
-	return perr:find("unexpected end of file", 1, true) ~= nil
+	return perr:find("unexpected end of file", 1, true) ~= nil or perr:find("unexpected EOF", 1, true) ~= nil
 end
 
 -- Expand PS1/PS2 escapes for the prompt via the shared, full prompt decoder.

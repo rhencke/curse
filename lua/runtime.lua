@@ -74,6 +74,84 @@ local Shell = {}
 Shell.__index = Shell
 M.Shell = Shell
 
+-- ---- error-message prefix ------------------------------------------------------------
+-- Every shell diagnostic is written as "curse: msg". bash prefixes it with
+-- `${BASH_SOURCE[0]:-$0}: line N: ` (error.c error_prolog; just `NAME: ` interactively),
+-- so stderr is wrapped once and the leading "curse: " is rewritten at write time — the
+-- one place that knows the shell's current source and line.
+-- The compiled tier keeps its pc in a register, so the line is recovered on this (cold)
+-- path from the Lua stack: every pc-dispatch function registers its pc -> line table
+-- (M.pcline) and holds `pc` in local slot 2 (stripped bytecode still exposes slot values).
+M.PCLINE = setmetatable({}, { __mode = "k" })
+function M.pcline(f, t)
+	M.PCLINE[f] = t
+end
+M.INTERP_FRAMES = setmetatable({}, { __mode = "k" }) -- interp functions that keep sh.cur_line
+local function current_line(sh)
+	local getinfo, getlocal = debug.getinfo, debug.getlocal
+	for level = 3, 200 do
+		local info = getinfo(level, "f")
+		if not info then
+			break
+		end
+		local f = info.func
+		if M.INTERP_FRAMES[f] then
+			break -- the interpreter is innermost: its sh.cur_line is current
+		end
+		local t = M.PCLINE[f]
+		if t then
+			local _, pc = getlocal(level, 2)
+			local ln = t[pc]
+			if ln and ln > 0 then
+				return ln
+			end
+		end
+	end
+	return sh.cur_line or 0
+end
+function M.err_prefix(sh)
+	if sh.opt_i then
+		return (sh.shellname or "bash") .. ": "
+	end
+	local name = sh.cur_source or sh.argv0 or sh.shellname or "bash"
+	if name == "" then
+		name = sh.argv0 or "bash"
+	end
+	local ln = current_line(sh)
+	if ln > 0 then
+		return name .. ": line " .. ln .. ": "
+	end
+	return name .. ": "
+end
+do
+	local real = io.stderr
+	local proxy = setmetatable({}, {
+		__index = function(_, k)
+			local v = real[k]
+			if type(v) == "function" then
+				return function(self, ...)
+					return v(real, ...)
+				end
+			end
+			return v
+		end,
+	})
+	function proxy:write(a, ...)
+		if select("#", ...) > 0 then
+			a = table.concat({ a, ... })
+		end
+		local sh = M.cur_shell
+		if sh and type(a) == "string" and a:sub(1, 7) == "curse: " then
+			local ok, pfx = pcall(M.err_prefix, sh)
+			if ok then
+				a = pfx .. a:sub(8)
+			end
+		end
+		return real:write(a)
+	end
+	io.stderr = proxy
+end
+
 local seeded = false
 function Shell.new()
 	if not seeded then
@@ -117,6 +195,7 @@ function Shell.new()
 		vseq = 0, -- monotonic counter ordering local/tempenv shadow layers
 		calldepth = 0, -- interpreter-only OSR gate (managed at the interp call site)
 	}, Shell)
+	M.cur_shell = sh -- (the error-prefix rewrite reads the live shell's source/line)
 	sh:import_env()
 	M.reset_locale(sh) -- adopt $LANG/$LC_* (bash calls setlocale at startup)
 	if sh.vars["OPTIND"] == nil then
@@ -1387,7 +1466,7 @@ function Shell:capture_src(src, backtick, noalias)
 	-- `echo A``echo "``B` prints "AB" and exits 0). Backticks are parsed lazily at
 	-- expansion time, so a throw here (e.g. an unterminated quote) is contained.
 	-- self: $()/`` expand aliases from the live table (unless already expanded as read)
-	local pok, parsed = pcall(P.parse, src, self, nil, noalias)
+	local pok, parsed = pcall(P.parse, src, self, nil, noalias, nil, self.cur_cline or self.cur_line)
 	if not pok then
 		if backtick then
 			io.stderr:write("curse: command substitution: " .. tostring(parsed) .. "\n")
@@ -1834,6 +1913,7 @@ function M.child_exit(sh, status)
 	if h and h ~= "" and not M.exit_trap_inherited and not sh.in_exit_trap then
 		sh.in_exit_trap = true
 		sh.status = status
+		sh.cur_line = 1 -- (bash: the EXIT trap's $LINENO counts from 1)
 		local ok, r = pcall(require("interp").run_trap_str, sh, h)
 		if ok and r then
 			status = sh.status -- `exit N` in the trap wins
@@ -3868,6 +3948,9 @@ end
 -- otherwise to real stderr. Mirrors interp's sherr for runtime-side messages.
 function Shell:errmsg(msg)
 	if self.capturing and (self.err2out or 0) > 0 then
+		if msg:sub(1, 7) == "curse: " then
+			msg = M.err_prefix(self) .. msg:sub(8)
+		end
 		self.out(msg)
 	else
 		io.stderr:write(msg)
@@ -7313,6 +7396,29 @@ end
 -- error or an unsupported construct in the file — defers to the interpreter's b_source, the
 -- oracle (it also owns the diagnostics). A `return` ends the source (caught here); break/
 -- continue/exit propagate to the caller; the RETURN trap fires after, like b_source.
+-- `source`'s call frame (bash): ${BASH_SOURCE[0]} is the file as named, BASH_LINENO gets
+-- the `source` line, FUNCNAME gains "source" only inside a function. Shared by both tiers.
+function M.source_enter(sh, name)
+	local fr = { src = sh.cur_source, line = sh.cur_line }
+	sh.srcstack = sh.srcstack or {}
+	table.insert(sh.srcstack, 1, sh.cur_source or sh.argv0 or "")
+	sh.linestack = sh.linestack or {}
+	table.insert(sh.linestack, 1, current_line(sh))
+	if sh.funcstack and #sh.funcstack > 0 then
+		table.insert(sh.funcstack, 1, "source")
+		fr.fn = true
+	end
+	sh.cur_source = name
+	return fr
+end
+function M.source_leave(sh, fr)
+	table.remove(sh.srcstack, 1)
+	table.remove(sh.linestack, 1)
+	if fr.fn then
+		table.remove(sh.funcstack, 1)
+	end
+	sh.cur_source, sh.cur_line = fr.src, fr.line
+end
 function M.source(sh, argv)
 	local I = require("interp")
 	local Ii = I._int
@@ -7360,7 +7466,9 @@ function M.source(sh, argv)
 		end
 	end
 	sh.sourcedepth = (sh.sourcedepth or 0) + 1 -- a `return` is valid while sourcing
+	local fr = M.source_enter(sh, name)
 	local rok, err = pcall(require("tier").run_compiled, mod, sh, nil)
+	M.source_leave(sh, fr)
 	sh.sourcedepth = sh.sourcedepth - 1
 	if #argv > j then
 		sh.params, sh.nparams = savep, savenp

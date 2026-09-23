@@ -724,7 +724,7 @@ scan_cmdsub = function(src, j)
 			for _, hd in ipairs(hdp) do
 				while true do
 					if i > n then
-						error("syntax error: unexpected end of file")
+						error("unexpected EOF while looking for matching `)'")
 					end
 					local le = src:find("\n", i, true) or (n + 1)
 					local lstr = src:sub(i, le - 1)
@@ -932,7 +932,7 @@ scan_cmdsub = function(src, j)
 			end
 		end
 	end
-	error("syntax error: unexpected end of file") -- unclosed $(
+	error("unexpected EOF while looking for matching `)'") -- unclosed $(
 end
 
 -- `$((` is arithmetic ONLY when it's a balanced `$(( expr ))` — the paren balance
@@ -1892,8 +1892,11 @@ local function dequote_word(w)
 	return table.concat(out)
 end
 
-local function make_parser(src, sh, aenv, noalias, posix)
+local function make_parser(src, sh, aenv, noalias, posix, line0)
 	local i, n, line = 1, #src, 1
+	if line0 then -- a $(…) body numbers from its command's line; leading newlines don't count
+		line = line0 - #(src:match("^[ \t\n]*"):gsub("[^\n]", ""))
+	end
 	local loopId = 0
 	local heredocs_pending = {} -- heredoc redirs awaiting their body (filled at line end)
 	-- Alias expansion, done here in the PARSER as a deterministic function of the
@@ -2282,7 +2285,7 @@ local function make_parser(src, sh, aenv, noalias, posix)
 	end
 	local function word(stop_paren, stop_cmp) -- read one shell word, keeping quotes and $(( )) / ${ } / $( ) balanced
 		ws()
-		local start = i
+		local start, line0 = i, line
 		while i <= n do
 			local c = src:sub(i, i)
 			if c == "\\" then -- backslash escapes the next char (incl. metachars/space)
@@ -2325,7 +2328,7 @@ local function make_parser(src, sh, aenv, noalias, posix)
 					end
 				end
 				if i > n then
-					error("syntax error: unexpected end of file")
+					error("unexpected EOF while looking for matching `\"'")
 				end -- unterminated "
 				i = i + 1 -- past closing quote
 			elseif c == "'" then -- single quotes: everything literal, no escapes
@@ -2334,7 +2337,7 @@ local function make_parser(src, sh, aenv, noalias, posix)
 					i = i + 1
 				end
 				if i > n then
-					error("syntax error: unexpected end of file")
+					error("unexpected EOF while looking for matching `''")
 				end -- unterminated '
 				i = i + 1 -- past closing quote
 			elseif c == "$" and src:sub(i + 1, i + 1) == "'" then
@@ -2348,7 +2351,7 @@ local function make_parser(src, sh, aenv, noalias, posix)
 					end
 				end
 				if i > n then
-					error("syntax error: unexpected end of file")
+					error("unexpected EOF while looking for matching `''")
 				end -- unterminated $'
 				i = i + 1
 			elseif c == "$" and src:sub(i + 1, i + 2) == "((" and dparen_is_arith(src, i + 3) then
@@ -2404,7 +2407,7 @@ local function make_parser(src, sh, aenv, noalias, posix)
 					end
 				end
 				if i > n then
-					error("syntax error: unexpected end of file")
+					error("unexpected EOF while looking for matching ``'")
 				end -- unclosed backtick
 				i = i + 1
 			elseif c:match("[ \t\n;]") then
@@ -2413,7 +2416,10 @@ local function make_parser(src, sh, aenv, noalias, posix)
 				i = i + 1
 			end
 		end
-		return src:sub(start, i - 1)
+		-- every newline the word spans ($(…) bodies, quotes, continuations) advances the line
+		local w = src:sub(start, i - 1)
+		line = line0 + select(2, w:gsub("\n", ""))
+		return w
 	end
 
 	local function peekword()
@@ -2436,7 +2442,11 @@ local function make_parser(src, sh, aenv, noalias, posix)
 		if peekword() == "do" then
 			i = i + 2
 		end
-		return parse_stmts({ done = true })
+		local body, term = parse_stmts({ done = true })
+		if term ~= "done" then
+			error("syntax error: unexpected end of file") -- (no done)
+		end
+		return body, term
 	end
 	brace_group = function() -- parse `{ stmts }` (a function body / group)
 		ws()
@@ -2911,11 +2921,11 @@ local function make_parser(src, sh, aenv, noalias, posix)
 			local id = loopId
 			local cond, t1 = parse_stmts({ ["do"] = true })
 			if t1 ~= "do" then
-				error("syntax error: `" .. kind .. "' expected `do'")
+				error(t1 == nil and "syntax error: unexpected end of file" or ("syntax error: `" .. kind .. "' expected `do'"))
 			end
 			local body_stmts, t2 = parse_stmts({ done = true })
 			if t2 ~= "done" then
-				error("syntax error: `" .. kind .. "' expected `done'")
+				error(t2 == nil and "syntax error: unexpected end of file" or ("syntax error: `" .. kind .. "' expected `done'"))
 			end
 			if #body_stmts == 0 then
 				error("syntax error near `done'")
@@ -2940,7 +2950,7 @@ local function make_parser(src, sh, aenv, noalias, posix)
 				local cond = parse_stmts({ ["then"] = true })
 				local body, term = parse_stmts({ elif = true, ["else"] = true, fi = true })
 				if #body == 0 then
-					error("syntax error near `" .. term .. "'")
+					error(term and ("syntax error near `" .. term .. "'") or "syntax error: unexpected end of file")
 				end -- bash: empty then/elif body
 				clauses[#clauses + 1] = { cond = cond, body = body }
 				if term == "else" then
@@ -2953,7 +2963,7 @@ local function make_parser(src, sh, aenv, noalias, posix)
 				elseif term == "fi" then
 					break
 				elseif term ~= "elif" then
-					error("if: missing fi")
+					error("syntax error: unexpected end of file") -- (no fi)
 				end
 			end
 			return { t = "if", line = ln, clauses = clauses, redirs = tail_redirs() }
@@ -3570,7 +3580,13 @@ local function make_parser(src, sh, aenv, noalias, posix)
 		-- simple command: WORD WORD ...
 		local words = {}
 		local arrayargs = nil -- `NAME=(...)` args to a declaration builtin
+		-- cline: the line once the SECOND element is read (bash's yacc lookahead: the line a
+		-- simple command runs "at", which its $(…) bodies number from)
+		local cline
 		while i <= n do
+			if not cline and #words + #assigns + #redirs >= 2 then
+				cline = line
+			end
 			local c = src:sub(i, i)
 			local r = parse_redir() -- also catches &> before the & break below
 			if r then
@@ -3651,9 +3667,11 @@ local function make_parser(src, sh, aenv, noalias, posix)
 				words[k] = { k = w.k, parts = w.parts, src = w.src, plainarg = true }
 			end
 		end
+		cline = cline or line
 		local node = {
 			t = "simple",
 			line = ln,
+			cline = cline ~= ln and cline or nil,
 			words = words,
 			redirs = (#redirs > 0 and redirs or nil),
 			assigns = (#assigns > 0 and assigns or nil),
@@ -4018,16 +4036,35 @@ local function make_parser(src, sh, aenv, noalias, posix)
 		end -- read bodies after the line
 		return { stmts = stmts }
 	end
-	return next_line
+	-- a syntax error also reports the offending input line (bash's second message line)
+	return function()
+		local lg = next_line()
+		if lg and lg.perr then
+			local m = tostring(lg.perr.msg or "")
+			if m:find("unexpected end of file", 1, true) or m:find("matching `)'", 1, true) then
+				lg.perr.line = select(2, src:gsub("\n", "")) + (src:sub(-1) == "\n" and 1 or 2)
+			end
+		end
+		if lg and lg.perr and lg.perr.text == nil and i <= n then
+			local p = src:sub(i, i) == "\n" and i - 1 or i
+			local b = p
+			while b > 1 and src:sub(b - 1, b - 1) ~= "\n" do
+				b = b - 1
+			end
+			local e = src:find("\n", p, true) or (n + 1)
+			lg.perr.text = src:sub(b, e - 1)
+		end
+		return lg
+	end
 end
 
 -- Eager full parse -> { stmts } (used by the compiler, which needs the whole
 -- program, and by callers that want the AST). An optional `sh` makes alias
 -- expansion consult the live runtime table (for eval/source/$() at runtime); the
 -- compiler passes none, so it tracks aliases deterministically from source.
-function M.parse(src, sh, aenv, noalias, posix)
+function M.parse(src, sh, aenv, noalias, posix, line0)
 	local saved_env, sprex, spdq = ALIAS_ENV, COMSUB_PREX, POSIX_DQ
-	local nextf = make_parser(src, sh, aenv, noalias, posix) -- yields logical-line groups { stmts, perr }
+	local nextf = make_parser(src, sh, aenv, noalias, posix, line0) -- yields logical-line groups { stmts, perr }
 	local stmts, lines = {}, {}
 	while true do
 		local lg = nextf()
