@@ -254,6 +254,36 @@ local function alias_mismatch(mod, sh)
 	return mod.alias_static or (sh.aliases and next(sh.aliases) ~= nil)
 end
 
+local LOOP_WORDS = { "while", "until", "for", "select", "function" }
+local function may_loop(src)
+	for _, w in ipairs(LOOP_WORDS) do
+		if src:find("%f[%w_]" .. w .. "%f[^%w_]") then
+			return true
+		end
+	end
+	return src:find("%(%s*%)") ~= nil -- (a `name()` funcdef)
+end
+local deferred = {}
+-- Compile + store the scripts that ran interpreted on a miss (the daemon calls this once
+-- the client has its reply).
+function M.compile_deferred()
+	local Cache = require("cache")
+	while #deferred > 0 do
+		local d = table.remove(deferred)
+		local ok, code = pcall(function()
+			return E.emit(P.parse(d.src))
+		end)
+		local chunk = ok and load(code, "=curse:compiled")
+		if chunk then
+			local built, m = pcall(chunk)
+			if built and type(m) == "table" and m.run then
+				local okd, bc = pcall(string.dump, chunk, true)
+				Cache.store(d.path, okd and bc or code)
+				modcache_put(d.path, m)
+			end
+		end
+	end
+end
 function M.run_tiered(src, sh)
 	local Cache = require("cache")
 	local path = Cache.artifact_path(src)
@@ -281,6 +311,14 @@ function M.run_tiered(src, sh)
 			M.run_compiled(mod, sh, nil)
 		end)
 		return sh, "warm"
+	end
+	-- A miss on a script that can't get hot (no loop, no function: a conservative scan of
+	-- the text) runs in the interpreter right away; it's compiled after the reply
+	-- (M.compile_deferred) so the NEXT run is a warm hit, and no caller waits for it.
+	if path and not may_loop(src) then
+		deferred[#deferred + 1] = { path = path, src = src }
+		I.run_lazy(sh, src)
+		return sh, "interp-deferred"
 	end
 	local ok, code = pcall(function()
 		return E.emit(P.parse(src))

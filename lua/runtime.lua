@@ -749,6 +749,21 @@ local C = ffi.C
 -- point routes through these: inside a stage they YIELD to the scheduler's poll
 -- loop until ready; outside one (CO == nil) they are no-ops / plain syscalls.
 local CO = nil -- the active scheduler context (nil when no coroutine pipeline runs)
+-- The scheduler context itself PERSISTS while any task lives (a background job outlives the
+-- statement that started it): pipelines and `&` jobs share it. CO is set only while the
+-- scheduler is actually running tasks.
+local SCHED = nil
+local function sched_get()
+	if not SCHED then
+		SCHED = { bycoro = {}, fds = {}, envs = {}, runnable = {} }
+	end
+	return SCHED
+end
+local function sched_live()
+	return SCHED ~= nil and next(SCHED.bycoro) ~= nil
+end
+M.sched_live = sched_live
+local SIGMARK = {} -- (a yield resumed with this: signals are pending for the task)
 local CO_OUTS = setmetatable({}, { __mode = "k" }) -- stage stdout writers (fd-1 backed)
 local POLLIN, POLLOUT = 1, 4
 local _co_pfd = ffi.new("struct curse_co_pollfd[1]")
@@ -833,14 +848,20 @@ local function pre_yield(t)
 	real_flush()
 end
 -- Wait until `fd` is ready for `ev` (POLLIN/POLLOUT). A no-op outside a stage.
+local task_signals -- forward: deliver a task's pending signals (see M.vkill)
 function M.co_block(fd, ev)
 	local t = co_task()
 	if not t then
+		if sched_live() and fd_would_block(fd, ev) then
+			M.sched_pump({ fd = fd, ev = ev }) -- (background jobs run while the shell waits)
+		end
 		return
 	end
 	while fd_would_block(fd, ev) do
 		pre_yield(t)
-		coroutine.yield(fd, ev)
+		if coroutine.yield(fd, ev) == SIGMARK then
+			task_signals(t)
+		end
 	end
 end
 -- waitpid that yields inside a stage (via a pollable pidfd) instead of stalling
@@ -848,21 +869,40 @@ end
 function M.wait_child(pid, stbuf, flags)
 	flags = flags or 0
 	local t = flags == 0 and co_task() or nil
-	if t then
+	if t or (flags == 0 and sched_live()) then
 		local pfd = tonumber(C.curse_co_syscall(434, pid, 0)) -- pidfd_open
 		if pfd and pfd >= 0 then
 			pfd = fd_hi(pfd) -- out of the user fd range: it lives across a yield
 		end
 		if pfd and pfd >= 0 then
+			if not t then -- the shell itself waits: background jobs run meanwhile
+				if fd_would_block(pfd, POLLIN) then
+					M.sched_pump({ fd = pfd, ev = POLLIN })
+				end
+				C.close(pfd)
+				return C.waitpid(pid, stbuf, flags)
+			end
+			t.child_pid = pid -- (`kill` of a simple-command job reaches this child: see task_kill)
 			while fd_would_block(pfd, POLLIN) do
 				pre_yield(t)
-				coroutine.yield(pfd, POLLIN)
+				if coroutine.yield(pfd, POLLIN) == SIGMARK then
+					local ok, err = pcall(task_signals, t)
+					if not ok then -- (the task dies: its child lives on, reaped as an orphan)
+						C.close(pfd)
+						t.child_pid = nil
+						M.internal_pids[pid] = true
+						error(err, 0)
+					end
+				end
 			end
+			t.child_pid = nil
 			C.close(pfd)
-		else -- no pidfd (old kernel): poll WNOHANG on a scheduler tick
+		elseif t then -- no pidfd (old kernel): poll WNOHANG on a scheduler tick
 			while C.waitpid(pid, stbuf, 1) == 0 do
 				pre_yield(t)
-				coroutine.yield(-1, 0)
+				if coroutine.yield(-1, 0) == SIGMARK then
+					task_signals(t)
+				end
 			end
 			return pid
 		end
@@ -894,12 +934,14 @@ function M.fork()
 		M.exit_trap_inherited = true
 		M.fork_depth = M.fork_depth + 1 -- ($BASH_SUBSHELL)
 	end
-	if pid == 0 and CO then
-		for fd in pairs(CO.fds) do
+	if pid == 0 and (CO or SCHED) then
+		for fd in pairs((CO or SCHED).fds) do
 			C.close(fd)
 		end
-		C.sigprocmask(2, CO.oldmask, nil) -- SIG_SETMASK: SIGPIPE back to the pre-pipeline mask
-		CO = nil
+		if CO then
+			C.sigprocmask(2, CO.oldmask, nil) -- SIG_SETMASK: SIGPIPE back to the pre-pipeline mask
+		end
+		CO, SCHED = nil, nil -- (the child runs no tasks: they are the parent's)
 	end
 	return pid
 end
@@ -1124,6 +1166,84 @@ end
 -- (literal file target, digit/`-` dup target, heredoc/herestring body); dynamic
 -- field-engine targets, `exec` (which must PERSIST), and fd moves are delegated.
 local _redir_stat = ffi.new("char[144]") -- struct stat scratch (st_mode at +24)
+-- open() for a redirection target. Opening a FIFO blocks until its other end opens — and
+-- with that other end in THIS process (a background job, a pipeline stage) it never
+-- would: open non-blocking and wait by running the scheduler instead. A reader waits for
+-- data or its writer's hangup (so its first read isn't a spurious EOF); a writer retries
+-- until a reader is there (ENXIO until then).
+local _ropen_st = ffi.new("char[144]")
+ffi.cdef("int curse_rt_fstat(int fd, void *buf) asm(\"fstat\");")
+-- An open fd's file identity ("dev:ino"), or nil.
+function M.fd_ident(fd)
+	if C.curse_rt_fstat(fd, _ropen_st) ~= 0 then
+		return nil
+	end
+	local u = ffi.cast("uint64_t *", _ropen_st)
+	return tostring(u[0]) .. ":" .. tostring(u[1])
+end
+-- A file the shell itself reads whole (`source`, `$(< file)`): like io.open(path, "r"),
+-- but a FIFO whose writer may be in this process is read through M.ropen + M.co_block.
+function M.open_read(path)
+	if not (CO or sched_live()) or C.curse_rt_stat(path, _ropen_st) ~= 0
+		or bit.band(ffi.cast("uint32_t *", _ropen_st + 24)[0], 0xF000) ~= 0x1000 then
+		return io.open(path, "r")
+	end
+	local fd = M.ropen(path, 0, 0)
+	if fd < 0 then
+		return nil
+	end
+	local chunks, buf = {}, ffi.new("char[8192]")
+	while true do
+		M.co_block(fd, POLLIN)
+		local n = tonumber(C.read(fd, buf, 8192))
+		if not n or n <= 0 then
+			break
+		end
+		chunks[#chunks + 1] = ffi.string(buf, n)
+	end
+	C.close(fd)
+	local text = table.concat(chunks)
+	return { read = function() return text end, close = function() end }
+end
+function M.ropen(path, flags, mode)
+	if not (CO or sched_live()) or C.curse_rt_stat(path, _ropen_st) ~= 0
+		or bit.band(ffi.cast("uint32_t *", _ropen_st + 24)[0], 0xF000) ~= 0x1000 then -- S_IFIFO
+		return C.open(path, flags, mode)
+	end
+	local acc = bit.band(flags, 3)
+	if acc == 2 then -- O_RDWR never blocks
+		return C.open(path, flags, mode)
+	end
+	local t = co_task()
+	local function tick()
+		if t then
+			pre_yield(t)
+			if coroutine.yield(-1, 0) == SIGMARK then
+				task_signals(t)
+			end
+		else
+			M.sched_pump({ deadline = M.wall_secs() + 0.01 })
+		end
+	end
+	local fd
+	while true do
+		fd = C.open(path, bit.bor(flags, 2048), mode) -- O_NONBLOCK
+		if fd >= 0 or acc == 0 or ffi.errno() ~= 6 then -- (ENXIO: no reader yet)
+			break
+		end
+		tick()
+	end
+	if fd < 0 then
+		return fd
+	end
+	C.fcntl(fd, 4, ffi.cast("int", bit.band(C.fcntl(fd, 3), bit.bnot(2048)))) -- F_SETFL: blocking again
+	if acc == 0 then
+		while fd_would_block(fd, POLLIN) do
+			tick()
+		end
+	end
+	return fd
+end
 local function _temp_fd(content) -- write body to a temp file, return an O_RDONLY fd
 	local tmp = os.tmpname()
 	local w = io.open(tmp, "w")
@@ -1150,9 +1270,9 @@ function M.redir_apply(sh, op, fd, target, saves)
 	end
 	local function open_out(path) -- honor noclobber (set -C) for a truncating '>'
 		if not sh.opt_C then
-			return C.open(path, 577, 438)
+			return M.ropen(path, 577, 438)
 		end -- O_WRONLY|O_CREAT|O_TRUNC
-		local h = C.open(path, 705, 438) -- + O_EXCL
+		local h = M.ropen(path, 705, 438) -- + O_EXCL
 		if h >= 0 then
 			return h
 		end
@@ -1160,13 +1280,13 @@ function M.redir_apply(sh, op, fd, target, saves)
 			C.curse_rt_stat(path, _redir_stat) == 0
 			and bit.band(ffi.cast("uint32_t *", _redir_stat + 24)[0], 0xF000) ~= 0x8000
 		then
-			return C.open(path, 1, 438) -- existing NON-regular (e.g. /dev/null): plain O_WRONLY
+			return M.ropen(path, 1, 438) -- existing NON-regular (e.g. /dev/null): plain O_WRONLY
 		end
 		return -1
 	end
 	if op == "out" or op == "clobber" then
 		backup(fd)
-		local h = (op == "out") and open_out(target) or C.open(target, 577, 438)
+		local h = (op == "out") and open_out(target) or M.ropen(target, 577, 438)
 		if h < 0 then
 			M.open_fail(sh, target)
 			return false
@@ -1177,7 +1297,7 @@ function M.redir_apply(sh, op, fd, target, saves)
 		end
 	elseif op == "app" then
 		backup(fd)
-		local h = C.open(target, 1089, 438) -- O_WRONLY|O_CREAT|O_APPEND
+		local h = M.ropen(target, 1089, 438) -- O_WRONLY|O_CREAT|O_APPEND
 		if h < 0 then
 			M.open_fail(sh, target)
 			return false
@@ -1188,7 +1308,7 @@ function M.redir_apply(sh, op, fd, target, saves)
 		end
 	elseif op == "in" then
 		backup(fd)
-		local h = C.open(target, 0, 0) -- O_RDONLY
+		local h = M.ropen(target, 0, 0) -- O_RDONLY
 		if h < 0 then
 			M.open_fail(sh, target)
 			return false
@@ -1227,7 +1347,7 @@ function M.redir_apply(sh, op, fd, target, saves)
 	elseif op == "outboth" or op == "appboth" then -- &> / &>>
 		backup(1)
 		backup(2)
-		local h = (op == "appboth") and C.open(target, 1089, 438) or open_out(target)
+		local h = (op == "appboth") and M.ropen(target, 1089, 438) or open_out(target)
 		if h < 0 then
 			M.open_fail(sh, target)
 			return false
@@ -1760,7 +1880,7 @@ function Shell:capture_src(src, backtick, noalias)
 				return ""
 			end
 			local path = fs[1]
-			local f = path ~= "" and io.open(path, "r")
+			local f = path ~= "" and M.open_read(path)
 			if f then
 				local c = f:read("*a") or ""
 				f:close()
@@ -1828,6 +1948,8 @@ function Shell:capture_inproc(backtick, runner, capfd, ctx)
 			C.close(tfd)
 		end
 	end
+	local sv_sink = self.cap_sink
+	self.cap_sink = capfd and M.fd_ident(1) or nil
 	local saved = self.out
 	local saved_cap = self.capturing
 	if capfd then
@@ -1861,8 +1983,14 @@ function Shell:capture_inproc(backtick, runner, capfd, ctx)
 	local sv_xd, sv_depth = self.xdepth, self.subdepth
 	self.xdepth = (sv_xd or 0) + 1 -- xtrace: PS4's first char repeats per $(…) level
 	self.subdepth = (sv_depth or 0) + 1
+	local sv_cj = self.cap_jobs
+	self.cap_jobs = {}
 	cap_enter()
 	local ok, err = pcall(runner, self)
+	if #self.cap_jobs > 0 then
+		M.wait_groups(self.cap_jobs)
+	end
+	self.cap_jobs, self.cap_sink = sv_cj, sv_sink
 	if cap_pid == C.getpid() then
 		cap_depth = cap_depth - 1 -- (a held signal is raised once the capture is done, below)
 	end
@@ -2129,7 +2257,7 @@ M.iso_cur = iso_cur
 -- resource limits, the $RANDOM stream.
 function M.iso_save_fds(sh)
 	local ctx = iso_cur(sh)
-	if not ctx or ctx.fds then
+	if not ctx or ctx.fds or ctx.task_fds then -- (a task's fds are its own: nothing to restore)
 		return
 	end
 	io.flush()
@@ -2412,8 +2540,13 @@ end
 
 -- `kill` aimed at a virtual pid: the in-process subshell gets the signal. Returns false
 -- when no such (live) subshell exists.
+M.vpid_tasks = setmetatable({}, { __mode = "v" })
 function M.vkill(sh, pid, sig)
 	local ctx = M.vpid_ctx[pid]
+	local bt = (ctx and ctx.task) or M.vpid_tasks[pid]
+	if bt then -- a background job
+		return M.task_kill(bt, sig)
+	end
 	local st = sh.iso_ctx
 	local at
 	for i = st and #st or 0, 1, -1 do
@@ -2737,7 +2870,7 @@ end
 -- read, no fork. NUL bytes stripped, trailing newlines stripped, status 0; a missing
 -- file is status 1 + diagnostic. The compiled tier calls this with the expanded path.
 function Shell:capture_file(path)
-	local f = path ~= "" and io.open(path, "r")
+	local f = path ~= "" and M.open_read(path)
 	if f then
 		local c = f:read("*a") or ""
 		f:close()
@@ -3056,7 +3189,6 @@ function M.reap_internal(pid)
 end
 
 function Shell:spawn_bg(args, cmdstr)
-	M.need_process(self) -- in an in-process subshell the job must be the subshell's child
 	local n = #args
 	if n == 0 or args[1] == "" or self.opt_x or self.exec_argv0 then
 		return false
@@ -3112,32 +3244,9 @@ function Shell:spawn_bg(args, cmdstr)
 	return true
 end
 
-function Shell:run_background(cmd_fn, cmdstr, exec_tail)
-	M.need_process(self)
-	io.flush()
-	local pid = M.fork()
-	if pid == 0 then
-		-- a lone external: exec it in place (Shell:exec). Keyed to this child's pid so a
-		-- process forked while evaluating the words (a forked $(…)) never inherits it.
-		self.exec_tail = exec_tail and C.getpid() or nil
-		local dn = (self.stdin_redir or 0) == 0 and C.open("/dev/null", 0, 0) or -1
-		if dn >= 0 then
-			C.dup2(dn, 0)
-			C.close(dn)
-		end
-		M.async_child_signals(self)
-		self.in_subprogram = (self.in_subprogram or 0) + 1
-		self.loopdepth = 0
-		local ok, err = pcall(function()
-			self.out = io.write
-			cmd_fn(self)
-		end)
-		M.child_status(self, ok, err)
-		M.child_exit(self, self.status or 0)
-	end
-	M.job_add(self, pid, cmdstr)
-	self.bg_pids = self.bg_pids or {}
-	self.bg_pids[#self.bg_pids + 1] = pid
+function Shell:run_background(cmd_fn, cmdstr, exec_tail, flat, simple)
+	-- (in-process: a background task — see Shell:bg_launch)
+	self:bg_launch(cmd_fn, cmdstr, flat, simple)
 	self.status = 0
 end
 
@@ -3363,6 +3472,13 @@ local function co_launch(ctx, self, stage_fns, inproc, base, lastpipe, upv)
 		return function()
 			local mypid = C.getpid()
 			local ctx = not islp and iso_push(sh) -- (a stage is an in-process subshell)
+			if ctx then
+				ctx.task_fds = true
+			end
+			if ctx and g.bg then -- (a background job: $BASHPID = its $!, and `kill $!` finds it)
+				ctx.vpid, ctx.task = g.vpid, t
+				M.vpid_ctx[g.vpid] = ctx
+			end
 			local ok, err = pcall(fn, sh)
 			if C.getpid() ~= mypid then
 				-- a process FORKED inside this stage (a subshell's child, `( exec … )`) unwound
@@ -3373,6 +3489,7 @@ local function co_launch(ctx, self, stage_fns, inproc, base, lastpipe, upv)
 			if ctx then
 				if not ok and type(err) == "table" and err.__curse_vsig == ctx then
 					err = { __curse_exit = 128 + err.sig }
+					g.killed = true
 				end
 				local cst = ok and sh.status or (type(err) == "table" and (err.__curse_exit or err.__curse_return))
 				if cst then
@@ -3422,6 +3539,7 @@ local function co_launch(ctx, self, stage_fns, inproc, base, lastpipe, upv)
 				sh.subdepth = sh.subdepth - 1 -- command that runs no shell code isn't counted)
 			end
 			sh.out = make_out(t)
+			t.sh = sh
 			add(t, stage_body(fn, sh, t))
 		else -- needs a real child: fork from inside the task, wait on a pidfd
 			add(t, function()
@@ -3482,7 +3600,47 @@ local function co_resume(ctx, t)
 	if g.upv then
 		g.upv.set(unpack(t.upv, 1, g.upv.n))
 	end
-	local rok, a, b = coroutine.resume(t.co)
+	local rok, a, b
+	if t.pending and not t.started then -- (signalled before it ever ran: default action,
+		local sig -- unless the shell ignores that signal — then so does the job)
+		local sh = t.sh
+		for _, sg in ipairs(t.pending) do
+			local nm = package.loaded.interp and package.loaded.interp._int.NUMSIG[sg]
+			local c = nm and ("SIG" .. nm)
+			if not (sh and c and sh.sigtraps and sh.sigtraps[c] and sh.traps[c] == "") and sg ~= 0
+				and not (sg >= 17 and sg <= 23) and sg ~= 28 then
+				sig = sig or sg
+			end
+		end
+		t.pending = nil
+		if sig then
+			t.started = true
+			ctx.bycoro[t.co] = nil
+			t.co = coroutine.create(function()
+				return 128 + sig
+			end)
+			ctx.bycoro[t.co] = t
+			t.g.killed = true
+			if t.g.vpid then
+				M.vpid_tasks[t.g.vpid] = nil
+			end
+		end
+	end
+	if t.pending and t.started then
+		rok, a, b = coroutine.resume(t.co, SIGMARK)
+	else
+		t.started = true
+		rok, a, b = coroutine.resume(t.co)
+	end
+	if g.bg and not g.base_closed then
+		-- (a background job's starting copies were only needed to start it: from here its
+		-- own saved state holds what it uses, and no stale copy keeps a pipe open)
+		g.base_closed = true
+		for k = 0, 9 do
+			co_cl(ctx, g.base.fd[k])
+			g.base.fd[k] = -1
+		end
+	end
 	-- save the stage's process state
 	t.env = C.environ
 	t.um = C.curse_co_umask(P.um)
@@ -3534,6 +3692,12 @@ local function co_resume(ctx, t)
 			co_cl(ctx, fd)
 		end
 		g.alive = g.alive - 1
+		if g.alive == 0 and g.bg then -- a background job ended: its starting fds go too
+			for k = 0, 9 do
+				co_cl(ctx, g.base.fd[k])
+			end
+			g.done = true
+		end
 		if g.alive == 0 and g.waiter then -- a stage waiting on this nested pipeline
 			ctx.runnable[#ctx.runnable + 1] = g.waiter
 			g.waiter.wait = nil
@@ -3588,6 +3752,26 @@ local function co_finish(ctx, self, g)
 	self.last_stage_status = last -- (the ERR quirk for a failing `( … )` last stage)
 end
 
+-- The shell leaves the scheduler: its snapshot's fd copies go; with no task left alive the
+-- whole context is released (every tracked fd, the environ copies).
+local function sched_release(ctx, P)
+	for k = 0, 9 do
+		co_cl(ctx, P.fd[k])
+	end
+	C.curse_co_sigtimedwait(_co_sigpipe, nil, _co_zero_ts) -- drop a SIGPIPE still pending
+	C.sigprocmask(2, ctx.oldmask, nil)
+	if next(ctx.bycoro) == nil and ctx == SCHED then
+		for fd in pairs(ctx.fds) do
+			C.close(fd)
+		end
+		for _, e in ipairs(ctx.envs) do
+			if e ~= C.environ then -- (a lastpipe stage's environ may now BE the shell's)
+				C.curse_co_free(e)
+			end
+		end
+		SCHED = nil
+	end
+end
 -- Run the pipeline under the scheduler. `inproc[i]` (compile time): run stage i
 -- in-process; otherwise it forks (a stage that needs a real child — exec, ulimit,
 -- set, eval, … see EF.sub_unsafe_fn), scheduled uniformly. `upv_get/upv_set` (when the
@@ -3634,14 +3818,14 @@ function Shell:run_pipeline_co(stage_fns, inproc, lastpipe, upv_get, upv_set)
 	end
 
 	real_flush()
-	local ctx = { bycoro = {}, fds = {}, envs = {}, runnable = {} }
+	local ctx = sched_get() -- (shared with any live background jobs)
 	local P = { fd = {}, env = C.environ, cwd = self:phys_cwd() }
 	for k = 0, 9 do
 		P.fd[k] = co_cx(ctx, k)
 	end
 	if P.fd[0] < 0 or P.fd[1] < 0 or P.fd[2] < 0 then -- a std fd is closed: fork path
-		for fd in pairs(ctx.fds) do
-			C.close(fd)
+		for k = 0, 9 do
+			co_cl(ctx, P.fd[k])
 		end
 		return nil
 	end
@@ -3739,20 +3923,329 @@ function Shell:run_pipeline_co(stage_fns, inproc, lastpipe, upv_get, upv_set)
 	elseif upv then
 		upv.set(unpack(P.upv, 1, upv.n))
 	end
-	for fd in pairs(ctx.fds) do
-		C.close(fd)
-	end
-	C.curse_co_sigtimedwait(_co_sigpipe, nil, _co_zero_ts) -- drop a SIGPIPE still pending
-	C.sigprocmask(2, ctx.oldmask, nil)
-	for _, e in ipairs(ctx.envs) do
-		if e ~= C.environ then -- (a lastpipe stage's environ may now BE the shell's)
-			C.curse_co_free(e)
-		end
-	end
+	sched_release(ctx, P)
 	if not ok_all then
 		error(err_all)
 	end
 	return g ~= nil or nil
+end
+
+-- ---- Background jobs, in-process -------------------------------------------
+-- `cmd &` is a one-stage task group in the persistent scheduler, started from the
+-- launcher's current fds/environ/cwd/umask (stdin </dev/null without job control) and
+-- NOT waited for. Its tasks run whenever the shell would block — M.co_block,
+-- M.wait_child, M.fd_wait, `wait`, the script's end (M.sched_drain) — and alongside any
+-- pipeline. $! is a virtual pid (also the job's $BASHPID); `kill $!` delivers to it.
+--
+-- The shell (not itself a task) runs the scheduler until `w` holds: w.fd ready for w.ev,
+-- w.deadline passed, w.until() true — or, with none given, until nothing can run now.
+-- Returns true when w.fd became ready.
+function M.sched_pump(w)
+	local ctx = SCHED
+	if CO or not ctx or next(ctx.bycoro) == nil then
+		return false
+	end
+	real_flush()
+	local P = { fd = {}, env = C.environ, cwd = cwd_str() or "." }
+	for k = 0, 9 do
+		P.fd[k] = co_cx(ctx, k)
+	end
+	P.um = C.curse_co_umask(0)
+	C.curse_co_umask(P.um)
+	ctx.P, ctx.cur_cwd = P, P.cwd
+	ctx.oldmask = ffi.new("uint8_t[128]")
+	C.sigprocmask(0, _co_sigpipe, ctx.oldmask)
+	CO = ctx
+	local ready = false
+	local ok, err = pcall(function()
+		local pf, pfn = nil, 0
+		while true do
+			local runnable = ctx.runnable
+			ctx.runnable = {}
+			for _, t in ipairs(runnable) do
+				co_resume(ctx, t)
+			end
+			if w.untilf and w.untilf() then
+				return
+			end
+			if #ctx.runnable == 0 then
+				local waiting, tick = {}, false
+				for _, t in pairs(ctx.bycoro) do
+					if not t.done and t.wait ~= nil and type(t.wait) ~= "table" then
+						if t.wait == -1 then
+							tick = true
+						end
+						waiting[#waiting + 1] = t
+					end
+				end
+				local blocking = w.fd or w.untilf or w.deadline
+				if not blocking and #waiting == 0 then
+					return -- (a plain pump: only what could run right now)
+				end
+				if #waiting + 1 > pfn then
+					pfn = (#waiting + 1) * 2
+					pf = ffi.new("struct curse_co_pollfd[?]", pfn)
+				end
+				local cnt = 0
+				if w.fd then
+					local f = w.fd
+					if f <= 9 then
+						f = P.fd[f] -- (the shell's own fd, parked meanwhile)
+					end
+					pf[0].fd, pf[0].events, pf[0].revents = f, w.ev or POLLIN, 0
+					cnt = 1
+				end
+				local base = cnt
+				for _, t in ipairs(waiting) do
+					if t.wait ~= -1 then
+						local wf = t.wait
+						if wf <= 9 then
+							wf = t.fd[wf]
+						end
+						pf[cnt].fd, pf[cnt].events, pf[cnt].revents = wf, t.wev, 0
+						cnt = cnt + 1
+					end
+				end
+				local tmo = -1
+				if not blocking then
+					tmo = 0
+				elseif tick then
+					tmo = 10
+				end
+				if w.deadline then
+					local left = math.max(0, math.ceil((w.deadline - M.wall_secs()) * 1000))
+					tmo = (tmo < 0 or left < tmo) and left or tmo
+				end
+				if cnt == 0 and tmo < 0 then
+					return -- (nothing to wait on: never block forever)
+				end
+				local r = C.curse_co_poll(pf, cnt, tmo)
+				if w.fd and r > 0 and pf[0].revents ~= 0 then
+					ready = true
+					return
+				end
+				local k = base
+				for _, t in ipairs(waiting) do
+					if t.wait == -1 then
+						if tick then
+							t.wait = nil
+							ctx.runnable[#ctx.runnable + 1] = t
+						end
+					else
+						if r > 0 and pf[k].revents ~= 0 then
+							t.wait = nil
+							ctx.runnable[#ctx.runnable + 1] = t
+						end
+						k = k + 1
+					end
+				end
+				if w.deadline and M.wall_secs() >= w.deadline then
+					return
+				end
+				if not blocking and #ctx.runnable == 0 then
+					return
+				end
+			end
+		end
+	end)
+	CO = nil
+	for fd = 0, 9 do -- the shell's own state back
+		if P.fd[fd] >= 0 then
+			C.dup2(P.fd[fd], fd)
+		else
+			C.close(fd)
+		end
+	end
+	C.environ = P.env
+	C.curse_co_umask(P.um)
+	if cwd_str() ~= P.cwd then
+		C.curse_co_chdir(P.cwd)
+	end
+	ctx.cur_cwd = P.cwd
+	sched_release(ctx, P)
+	if not ok then
+		error(err, 0)
+	end
+	return ready
+end
+-- Wait until every task group in `gs` has ended: inside a task, by yielding on each (the
+-- scheduler requeues a group's waiter when it ends); from the shell, by pumping.
+function M.wait_groups(gs)
+	local t = co_task()
+	for _, g in ipairs(gs) do
+		while not g.done do
+			if t then
+				g.waiter = t
+				pre_yield(t)
+				if coroutine.yield(g) == SIGMARK then
+					task_signals(t)
+				end
+			else
+				M.sched_pump({ untilf = function()
+					return g.done
+				end })
+				if not g.done and not sched_live() then
+					break
+				end
+			end
+		end
+	end
+end
+-- Run every background job to its end (the script is over; bash would leave them
+-- running — in-process they must finish before this process can).
+function M.sched_drain()
+	if sched_live() and not CO then
+		-- the shell is done with its stdin/out/err: let go of them first, so a caller
+		-- reading our output sees EOF unless a job itself still holds it (as with bash,
+		-- whose exited shell holds nothing) — jobs install their own copies to run
+		real_flush()
+		local dn = C.open("/dev/null", 2, 0)
+		if dn >= 0 then
+			for fd = 0, 2 do
+				C.dup2(dn, fd)
+			end
+			C.close(dn)
+		end
+		for fd = 3, 9 do -- (and whatever else it had open for itself)
+			C.close(fd)
+		end
+	end
+	while sched_live() and not CO do
+		M.sched_pump({ untilf = function()
+			return next(SCHED.bycoro) == nil
+		end })
+	end
+end
+
+-- A simple-command job with redirections applies them as `exec` would (no saved originals
+-- to hold a pipe open while it runs — the job ends with the command, like bash's child
+-- that execs it): `exec REDIRS && CMD`. Returns cmd itself when it has none.
+function M.bg_tail_stmt(cmd)
+	if cmd.t ~= "simple" or not cmd.redirs or #cmd.redirs == 0 or not cmd.words or #cmd.words == 0 then
+		return cmd
+	end
+	local bare = {}
+	for k, v in pairs(cmd) do
+		bare[k] = v
+	end
+	bare.redirs = nil
+	local ex = { t = "simple", line = cmd.line, redirs = cmd.redirs,
+		words = { { k = "word", parts = { { lit = "exec", q = false } }, src = "exec" } } }
+	return { t = "andor", line = cmd.line, items = { { cmd = ex }, { op = "&&", cmd = bare } } }
+end
+function Shell:bg_launch(fn, cmdstr, flat, simple, upv_get, upv_set)
+	local ctx = sched_get()
+	local upv
+	if upv_get then
+		upv = { get = upv_get, set = upv_set, n = select("#", upv_get()) }
+	end
+	local t0 = co_task()
+	if t0 then
+		pre_yield(t0)
+	else
+		real_flush()
+	end
+	-- its starting state: the launcher's current one (inside a task, fds 0-9 ARE that task's)
+	local base = { fd = {}, env = C.environ, cwd = cwd_str() or "." }
+	for k = 0, 9 do
+		base.fd[k] = co_cx(ctx, k)
+	end
+	local piped = t0 and t0.i and t0.i > 1 -- (in a later pipeline stage: stdin is that pipe)
+	if not self.opt_m and (self.stdin_redir or 0) == 0 and not piped then -- (async: stdin </dev/null)
+		co_cl(ctx, base.fd[0])
+		local dn = C.open("/dev/null", 0, 0)
+		base.fd[0] = dn >= 0 and co_cx(ctx, dn) or -1
+		if dn >= 0 then
+			C.close(dn)
+		end
+	end
+	base.um = C.curse_co_umask(0)
+	C.curse_co_umask(base.um)
+	if upv then
+		base.upv = { upv_get() }
+	end
+	local vpid = M.alloc_vpid()
+	local g = co_launch(ctx, self, { fn }, { flat and "flat" or true }, base, false, upv)
+	if not g then
+		for k = 0, 9 do
+			co_cl(ctx, base.fd[k])
+		end
+		return nil
+	end
+	g.bg, g.vpid, g.simple = true, vpid, simple
+	for _, t in pairs(ctx.bycoro) do
+		if t.g == g then
+			M.vpid_tasks[vpid] = t -- (`kill $!` before it has even run)
+		end
+	end
+	local bufcap = self.capturing and self.out ~= io.write and not CO_OUTS[self.out]
+	for _, t in pairs(ctx.bycoro) do
+		if t.g == g and t.sh then
+			t.sh.in_pipestage = (t.sh.in_pipestage or 1) - 1 -- (not a pipeline stage: an async list)
+			t.sh.in_subprogram = (t.sh.in_subprogram or 0) + 1
+			t.sh.loopdepth = 0
+			if bufcap then -- inside a buffered $(…): its output is the substitution's too
+				t.sh.out, t.sh.capturing = self.out, true
+			end
+		end
+	end
+	-- (a $(…) ends only when the jobs HOLDING its output have — it reads to EOF, as bash's
+	-- pipe does; a job whose fds don't include the capture isn't waited for)
+	local holds = bufcap
+	if not holds and self.cap_sink then
+		for k = 0, 9 do
+			if base.fd[k] >= 0 and M.fd_ident(base.fd[k]) == self.cap_sink then
+				holds = true
+			end
+		end
+	end
+	if self.cap_jobs and holds then
+		self.cap_jobs[#self.cap_jobs + 1] = g
+	end
+	local job = M.job_add(self, vpid, cmdstr)
+	job.g = g
+	self.bg_pids = self.bg_pids or {}
+	self.bg_pids[#self.bg_pids + 1] = vpid
+	self.status = 0
+	return job
+end
+
+-- Signals `kill` aimed at a background job's virtual pid: delivered when the task
+-- resumes (its yield returns SIGMARK): its own trap runs, an ignored one does nothing, the
+-- default action ends the job (128+sig) via the iso context's unwinding.
+task_signals = function(t)
+	local sigs = t.pending
+	t.pending = nil
+	local ctx = t.sh and t.sh.iso_ctx and t.sh.iso_ctx[1]
+	for _, sig in ipairs(sigs or {}) do
+		if ctx then
+			M.iso_signal(t.sh, ctx, sig)
+		end
+	end
+end
+function M.task_kill(t, sig)
+	if t.done then
+		return false
+	end
+	if sig == 0 then
+		return true
+	end
+	-- a simple command's job IS its command (bash execs it in the job's process): a
+	-- running external takes the signal itself, and the job ends with its status
+	if t.g.simple and t.child_pid then
+		t.g.killed = true -- (for `wait`'s report, should the command die of it)
+		return C.kill(t.child_pid, sig) == 0
+	end
+	t.pending = t.pending or {}
+	t.pending[#t.pending + 1] = sig
+	if t.wait ~= nil and type(t.wait) ~= "table" then -- wake it
+		t.wait = nil
+		local ctx = SCHED
+		if ctx then
+			ctx.runnable[#ctx.runnable + 1] = t
+		end
+	end
+	return true
 end
 
 local run_pipeline_body
@@ -7004,6 +7497,9 @@ M.wall_secs = wall_secs
 -- `read -t`: wait until `fd` is readable (data, EOF or error) or the wall-clock
 -- `deadline` passes; false on timeout. Inside a pipeline stage it yields on the
 -- scheduler's 10ms tick instead of stalling its siblings.
+ffi.cdef("struct curse_rt_timespec { long tv_sec; long tv_nsec; };"
+	.. "int curse_rt_ppoll(void *fds, unsigned long nfds, const struct curse_rt_timespec *ts, const void *mask) asm(\"ppoll\");")
+local _ppoll_ts = ffi.new("struct curse_rt_timespec")
 function M.fd_wait(fd, deadline)
 	local t = co_task()
 	while fd_would_block(fd, POLLIN) do
@@ -7013,10 +7509,16 @@ function M.fd_wait(fd, deadline)
 		end
 		if t then
 			pre_yield(t)
-			coroutine.yield(-1, 0)
+			if coroutine.yield(-1, 0) == SIGMARK then
+				task_signals(t)
+			end
+		elseif sched_live() then -- (background jobs run while the shell waits)
+			M.sched_pump({ fd = fd, ev = POLLIN, deadline = deadline })
 		else
 			_co_pfd[0].fd, _co_pfd[0].events, _co_pfd[0].revents = fd, POLLIN, 0
-			C.curse_co_poll(_co_pfd, 1, math.ceil(left * 1000))
+			local sec = math.floor(left) -- (ppoll: a sub-millisecond `read -t` isn't rounded up)
+			_ppoll_ts.tv_sec, _ppoll_ts.tv_nsec = sec, math.floor((left - sec) * 1e9)
+			C.curse_rt_ppoll(_co_pfd, 1, _ppoll_ts, nil)
 		end
 	end
 	return true
@@ -7406,9 +7908,17 @@ function M.field_split(sh, value, split)
 						i = i + 1
 					end
 				end
-			else
-				cur = (cur or "") .. c
-				i = i + cl
+			else -- (a run of non-IFS characters joins the field in one piece: linear, not n^2)
+				local j = i + cl
+				while j <= n do
+					local jl = clen(v, j)
+					if inifs(jl == 1 and v:sub(j, j) or v:sub(j, j + jl - 1)) then
+						break
+					end
+					j = j + jl
+				end
+				cur = (cur or "") .. v:sub(i, j - 1)
+				i = j
 			end
 		end
 		brk()
@@ -9172,7 +9682,7 @@ function M.source(sh, argv)
 	if Ii.file_test("-d", file) then
 		return require("b_source")(sh, argv[1], argv, nil, nil) -- directory: b_source diagnoses
 	end
-	local f = io.open(file, "r")
+	local f = M.open_read(file)
 	if not f then
 		return require("b_source")(sh, argv[1], argv, nil, nil) -- not found: b_source diagnoses
 	end

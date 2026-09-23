@@ -19,11 +19,14 @@ local job_resolve, SIGDESC = I.job_resolve, I.SIGDESC
 -- reap any child, skipping the shell's own helpers (rt.internal_pids: not jobs)
 local function wait_any(stbuf)
 	while true do
-		local r = C.waitpid(-1, stbuf, 0)
-		if r < 0 or not rt.internal_pids[r] then
+		local r = C.waitpid(-1, stbuf, rt.sched_live() and 1 or 0) -- (WNOHANG while tasks run)
+		if r == 0 then -- nothing yet: let the background jobs run a while
+			rt.sched_pump({ deadline = rt.wall_secs() + 0.01 })
+		elseif r < 0 or not rt.internal_pids[r] then
 			return r
+		else
+			rt.internal_pids[r] = nil
 		end
-		rt.internal_pids[r] = nil
 	end
 end
 
@@ -36,6 +39,64 @@ local function report(j)
 	end
 end
 
+-- The first of `jobs` to end (nil if none can): in-process jobs end in the scheduler, real
+-- children through waitpid — whichever comes first.
+local function wait_first(sh, jobs, stbuf)
+	while true do
+		local anyg, anyreal = false, false
+		for _, j in ipairs(jobs) do
+			if not j.done then
+				job_reap(sh, j, true)
+			end
+			if j.done then
+				return j
+			end
+			if j.g then
+				anyg = true
+			else
+				anyreal = true
+			end
+		end
+		if anyg then
+			rt.sched_pump({
+				untilf = function()
+					for _, j in ipairs(jobs) do
+						if j.g and j.g.done then
+							return true
+						end
+					end
+					return false
+				end,
+				deadline = anyreal and (rt.wall_secs() + 0.01) or nil,
+			})
+			if not anyreal and not rt.sched_live() then
+				for _, j in ipairs(jobs) do
+					job_reap(sh, j, true)
+					if j.done then
+						return j
+					end
+				end
+				return nil
+			end
+		elseif anyreal then
+			local r = wait_any(stbuf)
+			if r < 0 then
+				return nil
+			end
+			local est = rt.wexit(stbuf[0])
+			for _, j in ipairs(sh.jobs) do
+				if j.pid == r then
+					j.done, j.status = true, est
+					if sh.coprocs then
+						rt.coproc_dispose(sh, r)
+					end
+				end
+			end
+		else
+			return nil
+		end
+	end
+end
 local wait_builtin
 local function wait_entry(sh, cmd, args, hook, tcb)
 	-- in a pipeline stage / $(…), the parent's jobs are listed but aren't children: `wait`
@@ -73,7 +134,7 @@ wait_builtin = function(sh, cmd, args, hook, tcb)
 		-- status; with none, wait for all (status 0); an invalid arg is status 1.
 		local stbuf = ffi.new("int[1]")
 		local function reap(pid)
-			if C.waitpid(pid, stbuf, 0) < 0 then
+			if rt.wait_child(pid, stbuf, 0) < 0 then
 				-- a process substitution already reaped when its command finished
 				return sh.procsub_status and sh.procsub_status[pid] or 127
 			end
@@ -153,50 +214,32 @@ wait_builtin = function(sh, cmd, args, hook, tcb)
 					break
 				end
 			end
-			while not waited and next(want) do
-				local r = wait_any(stbuf)
-				if r < 0 then
-					break
-				end
-				local est = rt.wexit(stbuf[0])
+			if not waited and next(want) then
+				local list = {}
 				for _, j in ipairs(sh.jobs) do
-					if j.pid == r then
-						j.done, j.status = true, est
+					if want[j.pid] then
+						list[#list + 1] = j
 					end
 				end
-				if want[r] then
-					sh.status, waited = est, r
-					for _, j in ipairs(sh.jobs) do
-						if j.pid == r then
-							j.waited = true
-						end
-					end
+				local j = wait_first(sh, list, stbuf)
+				if j then
+					sh.status, waited = j.status or 0, j.pid
+					j.waited = true
 				end
 			end
 		elseif nflag and #specs == 0 then
 			-- wait for the NEXT job to finish (127 if there are none to wait for)
-			local active = false
+			local list = {}
 			for _, j in ipairs(sh.jobs) do
 				if not j.done then
-					active = true
-					break
+					list[#list + 1] = j
 				end
 			end
-			if not active then
+			local j = #list > 0 and wait_first(sh, list, stbuf)
+			if not j then
 				sh.status = 127
 			else
-				local r = wait_any(stbuf)
-				local est = rt.wexit(stbuf[0])
-				for _, j in ipairs(sh.jobs) do
-					if j.pid == r then
-						j.done = true
-						j.status = est
-						if sh.coprocs then
-							rt.coproc_dispose(sh, r)
-						end
-					end
-				end
-				sh.status, waited = est, r
+				sh.status, waited = j.status or 0, j.pid
 			end
 		elseif #specs > 0 then
 			local last = 0

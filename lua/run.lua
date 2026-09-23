@@ -319,6 +319,8 @@ if arg[ai] == "-c" or arg[ai] == "+c" then
 	source_rc(sh) -- interactive: --rcfile is sourced before the command string
 	interp.run_lazy(sh, code)
 	io.flush()
+	require("runtime").sched_drain() -- (background jobs finish before the process can)
+	io.flush()
 	os.exit(sh.status or 0)
 end
 
@@ -343,6 +345,8 @@ if arg[ai] == nil then
 	else
 		require("repl").run(sh) -- non-interactive: line at a time from fd 0 (bash)
 	end
+	io.flush()
+	require("runtime").sched_drain() -- (background jobs finish before the process can)
 	io.flush()
 	os.exit(sh.status or 0)
 end
@@ -452,5 +456,6 @@ end
 
 -- Propagate $? as the process exit code (so `exit N`, `false`, etc. are visible
 -- to the caller — and to the spec runner). Flush buffered stdout first.
+require("runtime").sched_drain() -- (background jobs finish before the process can)
 io.flush()
 os.exit(sh and sh.status or 0)

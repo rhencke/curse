@@ -399,6 +399,8 @@ local function serve_request(cfd, req, fds, ctx)
 	local sbuf = ffi.new("int32_t[1]", status) -- finish_run maps to $?) becomes status 1
 	C.write(cfd, sbuf, 4)
 	C.close(cfd)
+	pcall(rt.sched_drain) -- background jobs outlive the script (the client has its status)
+	pcall(Tier.compile_deferred) -- (off the caller's clock: see tier.run_tiered)
 	-- SCRUB per-request process state (the fork boundary used to do this):
 	C.umask(ctx.umask) -- a script's `umask` doesn't persist
 	C.sigprocmask(2, ctx.empty_sigset, nil) -- SIG_SETMASK: clear any trap-blocked signals

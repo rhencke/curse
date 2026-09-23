@@ -1543,12 +1543,19 @@ do
 	local wcache, wn = {}, 0
 	local wimpl = parse_word
 	parse_word = function(src)
-		if type(src) == "string" and not COMSUB_PREX and not POSIX_DQ then
+		-- (a $(…)/`…` part records the static alias state it was parsed under: memoize only
+		-- where that can't differ — no alias state, or no substitution in the word)
+		if type(src) == "string" and not COMSUB_PREX and not POSIX_DQ
+			and (ALIAS_ENV == nil or not src:find("[$`]")) then
 			local hit = wcache[src]
 			if hit ~= nil then
 				return hit
 			end
 			local w = wimpl(src)
+			local p1 = #w.parts == 1 and w.parts[1]
+			if p1 and p1.lit and not p1.q and not p1.lit:find("[\\$`'\"~*?%[+@!%z]") then
+				w.plain = true -- (one unquoted literal: nothing to expand, split or glob)
+			end
 			if wn >= MEMO_CAP then
 				wcache = {}
 				wn = 0
@@ -2002,7 +2009,8 @@ local function stream_factors(factors, emit)
 			local r = f.range
 			for k = 0, range_count(r) - 1 do
 				local v = (r.a <= r.b) and (r.a + k * r.step) or (r.a - k * r.step)
-				go(idx + 1, acc .. (r.char and brace_char(v) or (r.width and pad_num(v, r.width) or (tostring(v):gsub("LL$", "")))))
+				go(idx + 1, acc .. (r.char and brace_char(v) or (r.width and pad_num(v, r.width)
+					or (type(v) == "number" and tostring(v) or (tostring(v):gsub("LL$", ""))))))
 				if stopped then
 					return
 				end
@@ -2082,10 +2090,36 @@ local AFTER_COMPOUND = {
 	["esac"] = 1, [";;"] = 1,
 }
 
+local INTWORD = {} -- (integer -> its literal word: ranges repeat, and allocation dominates)
 local function add_word(words, w)
 	local factors = brace_factors(w)
 	if not factors then
 		words[#words + 1] = parse_word(w)
+		return
+	end
+	local r = #factors == 1 and factors[1].range
+	if r and not r.char and not r.width and type(r.a) == "number" and type(r.b) == "number"
+		and math.abs(r.a) < 1e14 and math.abs(r.b) < 1e14 then
+		-- a lone numeric range ({0..N}, {9..1..2}): its words straight from the loop
+		local cnt = math.min(range_count(r), BRACE_CAP)
+		local step = r.a <= r.b and r.step or -r.step
+		local v = r.a
+		local nw = #words
+		for k = 1, cnt do
+			local wd = INTWORD[v] -- (words are shared read-only, like the parse_word memo's)
+			if not wd then
+				wd = { k = "word", parts = { { lit = tostring(v), q = false } }, src = false, plain = true, fresh = true }
+				if v > -1e6 and v < 1e6 then
+					INTWORD[v] = wd
+				end
+			end
+			if k == 1 then -- (the first carries the source text: `declare -f` shows `{0..N}`)
+				wd = { k = "word", parts = wd.parts, src = w, plain = true, fresh = true }
+			end
+			nw = nw + 1
+			words[nw] = wd
+			v = v + step
+		end
 		return
 	end
 	local n = 0
@@ -2093,8 +2127,12 @@ local function add_word(words, w)
 		-- (the source text belongs to the unexpanded word: the first expansion carries it,
 		-- the rest print nothing — `declare -f` shows `{a,b}` as written. A COPY: parsed
 		-- words are memoized and shared.)
-		local pw = parse_word(x)
-		words[#words + 1] = { k = pw.k, parts = pw.parts, src = n == 0 and w or false }
+		if x ~= "" and not x:find("[^%w_%-%.,/+:=@%%]") then -- plain text: the literal word as is
+			words[#words + 1] = { k = "word", parts = { { lit = x, q = false } }, src = n == 0 and w or false }
+		else
+			local pw = parse_word(x)
+			words[#words + 1] = { k = pw.k, parts = pw.parts, src = n == 0 and w or false }
+		end
 		n = n + 1
 		return n >= BRACE_CAP -- true -> stop the stream
 	end)
@@ -4184,7 +4222,11 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs)
 		if not (c1 and c1.lit and not c1.q and #words[1].parts == 1 and DECL_BUILTINS[c1.lit]) then
 			for k = 2, #words do
 				local w = words[k] -- (a copy: parsed words are memoized and shared)
-				words[k] = { k = w.k, parts = w.parts, src = w.src, plainarg = true }
+				if w.fresh then
+					w.plainarg = true
+				else
+					words[k] = { k = w.k, parts = w.parts, src = w.src, plainarg = true, plain = w.plain }
+				end
 			end
 		end
 		cline = cline or line

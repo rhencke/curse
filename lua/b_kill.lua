@@ -99,7 +99,7 @@ return function(sh, cmd, args, hook, tcb)
 			for k = j, #args do
 				local target = args[k]
 				local pid = target:match("^%s*[+-]?%d+%s*$") and tonumber(target)
-				if pid and rt.vpid_ctx[pid] then -- an in-process subshell's $BASHPID
+				if pid and (rt.vpid_ctx[pid] or rt.vpid_tasks[pid]) then -- an in-process subshell or job
 					if not rt.vkill(sh, pid, sig) then
 						io.stderr:write("curse: kill: (" .. pid .. ") - No such process\n")
 						allok = false
@@ -120,6 +120,10 @@ return function(sh, cmd, args, hook, tcb)
 					if not jb then
 						io.stderr:write("curse: kill: " .. target .. ": no such job\n")
 						allok = false
+					elseif rt.vpid_ctx[jb.pid] or rt.vpid_tasks[jb.pid] then -- (an in-process job)
+						if not rt.vkill(sh, jb.pid, sig) then
+							allok = false
+						end
 					elseif C.kill(jb.pid, sig) ~= 0 then
 						allok = false
 					end

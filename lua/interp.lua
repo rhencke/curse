@@ -1960,6 +1960,9 @@ end
 -- active, `[` only with a later `]`. Conservative — never reports inactive for a
 -- real glob — so the caller may safely skip pathname expansion when it's false.
 local function str_glob_active(s)
+	if not s:find("[*?%[+@!]") then -- (the common word: no glob character at all)
+		return false
+	end
 	local open = false
 	for i = 1, #s do
 		local c = s:sub(i, i)
@@ -2404,15 +2407,15 @@ end
 -- (/dev/null, fifos, devices). Returns the fd, or -1 on a noclobber clobber error.
 local function open_out(sh, path, mode)
 	if not sh.opt_C then
-		return C.open(path, 577, mode)
+		return rt.ropen(path, 577, mode)
 	end -- O_WRONLY|O_CREAT|O_TRUNC
-	local f = C.open(path, 705, mode) -- + O_EXCL
+	local f = rt.ropen(path, 705, mode) -- + O_EXCL
 	if f >= 0 then
 		return f
 	end
 	local ok, rc = pcall(C.curse_stat, path, statbuf) -- O_EXCL failed: allow non-regular
 	if ok and rc == 0 and bit.band(ffi.cast("uint32_t *", statbuf + 24)[0], 0xF000) ~= 0x8000 then
-		return C.open(path, 1, mode) -- not S_IFREG -> plain O_WRONLY (no truncate)
+		return rt.ropen(path, 1, mode) -- not S_IFREG -> plain O_WRONLY (no truncate)
 	end
 	return -1
 end
@@ -2489,7 +2492,7 @@ local function apply_redirs(sh, redirs, cname) -- cname: the command (names {v} 
 			-- — after it opened (so created) an output file
 			if r.op == "out" or r.op == "clobber" or r.op == "app" then
 				local okp, path = pcall(tgt, r)
-				local f = okp and path ~= "" and C.open(path, r.op == "app" and 1089 or 577, 438)
+				local f = okp and path ~= "" and rt.ropen(path, r.op == "app" and 1089 or 577, 438)
 				if f and f >= 0 then
 					C.close(f)
 				end
@@ -2555,7 +2558,7 @@ local function apply_redirs(sh, redirs, cname) -- cname: the command (names {v} 
 				ok = false
 			else
 				backup(r.fd)
-				local f = C.open(t, 577, 438)
+				local f = rt.ropen(t, 577, 438)
 				if f < 0 then
 					rt.open_fail(sh, t)
 				end
@@ -2571,7 +2574,7 @@ local function apply_redirs(sh, redirs, cname) -- cname: the command (names {v} 
 				ok = false
 			else
 				backup(r.fd)
-				local f = C.open(t, 1089, 438)
+				local f = rt.ropen(t, 1089, 438)
 				if f < 0 then
 					rt.open_fail(sh, t)
 				end
@@ -2587,7 +2590,7 @@ local function apply_redirs(sh, redirs, cname) -- cname: the command (names {v} 
 				ok = false
 			else
 				backup(r.fd)
-				local f = C.open(t, 0, 0)
+				local f = rt.ropen(t, 0, 0)
 				if f < 0 then
 					rt.open_fail(sh, t)
 				end
@@ -2603,7 +2606,7 @@ local function apply_redirs(sh, redirs, cname) -- cname: the command (names {v} 
 				ok = false
 			else
 				backup(r.fd)
-				local f = C.open(t, 66, 438)
+				local f = rt.ropen(t, 66, 438)
 				if f < 0 then
 					rt.open_fail(sh, t)
 				end
@@ -2639,7 +2642,7 @@ local function apply_redirs(sh, redirs, cname) -- cname: the command (names {v} 
 			else
 				backup(1)
 				backup(2)
-				local f = C.open(t, 1089, 438)
+				local f = rt.ropen(t, 1089, 438)
 				if f < 0 then
 					rt.open_fail(sh, t)
 				end
@@ -2727,7 +2730,7 @@ local function apply_redirs(sh, redirs, cname) -- cname: the command (names {v} 
 				elseif r.op == "dup" and tv ~= "" then -- `>&word` (non-number): open the file for
 					backup(r.fd)
 					backup(2)
-					local f = C.open(tv, sh.opt_C and 705 or 577, 438) -- both stdout AND stderr
+					local f = rt.ropen(tv, sh.opt_C and 705 or 577, 438) -- both stdout AND stderr
 					if f >= 0 then
 						C.dup2(f, r.fd)
 						C.dup2(f, 2)
@@ -3912,8 +3915,24 @@ local function job_reap(sh, job, nohang)
 	if job.done then
 		return job.status
 	end
+	if job.g then -- an in-process background job
+		if nohang then
+			rt.sched_pump({})
+		else
+			rt.wait_groups({ job.g })
+		end
+		if not job.g.done then
+			return nil
+		end
+		local st = job.g.status[1] or 0
+		job.done, job.status = true, st
+		if st > 128 and job.g.killed then
+			job.sig = st - 128
+		end
+		return st
+	end
 	local sb = ffi.new("int[1]")
-	local r = C.waitpid(job.pid, sb, nohang and WNOHANG or 0)
+	local r = rt.wait_child(job.pid, sb, nohang and WNOHANG or 0) -- (background tasks run meanwhile)
 	if r > 0 then
 		job.done = true
 		job.status = rt.wexit(sb[0])
@@ -4325,13 +4344,15 @@ local function eval_dbracket(sh, node)
 		return unary(sh, node.op, v)
 	end
 	if k == "binary" then
-		local l, r, op, textual
+		local l, r, op, textual, rtextual
 		op = node.op
 		if DB_ARITH_OP[op] and node.l.src and node.r.src then
-			textual = true
 			-- bash 5.2 expands an arithmetic operator's operands like $((…)): no process
-			-- substitution, and subscripts quoted (`index[7<(4+2)]` is arithmetic)
-			l, r = arith_expand_text(sh, node.l.src), arith_expand_text(sh, node.r.src)
+			-- substitution, and subscripts quoted (`index[7<(4+2)]` is arithmetic) — but
+			-- quotes are removed first (`[[ '3' -eq 3 ]]`): a quoted operand is a plain word
+			textual, rtextual = not node.l.src:find("['\"\\]"), not node.r.src:find("['\"\\]")
+			l = textual and arith_expand_text(sh, node.l.src) or dbracket_word(sh, node.l)
+			r = rtextual and arith_expand_text(sh, node.r.src) or dbracket_word(sh, node.r)
 		else
 			l, r = dbracket_word(sh, node.l), dbracket_word(sh, node.r)
 		end
@@ -4383,7 +4404,7 @@ local function eval_dbracket(sh, node)
 			-- [[ ]] arithmetic comparisons evaluate each side as an arith EXPRESSION
 			-- (bash: [[ 1+2 -eq 3 ]] is true), unlike `test` which needs integer literals.
 			local nl = M.dbracket_arith(sh, l, textual)
-			local nr = M.dbracket_arith(sh, r, textual)
+			local nr = M.dbracket_arith(sh, r, rtextual)
 			if op == "-eq" then
 				return nl == nr
 			elseif op == "-ne" then
@@ -4561,6 +4582,8 @@ local function expand_args(sh, st, args, is_assign)
 			args[#args + 1] = rt.cstr(ref)
 		elseif wi > 1 and is_assign == true and p1 and p1.lit and p1.lit:match("^[%a_][%w_]*%+?=") then
 			args[#args + 1] = rt.cstr(expand_assign_word(sh, w, true)) -- name=value word: no glob, ~ after =/:
+		elseif w.plain then
+			args[#args + 1] = p1.lit -- (a plain unquoted literal: nothing to expand, split or glob)
 		else
 			local fs = expand_to_fields(sh, w)
 			for k = 1, #fs do
@@ -5707,36 +5730,8 @@ exec_stmt = function(sh, st, hook)
 			error(err, 0)
 		end
 	elseif t == "background" then
-		-- cmd & : fork, run in the child; parent records $! and continues (status 0).
-		rt.need_process(sh) -- in an in-process subshell, the job must be the subshell's child
-		io.flush()
-		-- Block signals across the fork + the child's disposition reset so an immediate
-		-- `kill -SIG $!` can't be delivered to the child before it clears its traps (bash).
-		C.curse_sig_hold(1)
-		local pid = rt.fork()
-		if pid == 0 then
-			-- Without job control, an async command's stdin is /dev/null (bash), so it
-			-- can't steal the terminal — and it must not inherit a redirect it didn't ask for.
-			-- (unless an enclosing command redirected stdin: then the job reads that — bash)
-			local dn = (sh.stdin_redir or 0) == 0 and C.open("/dev/null", 0, 0) or -1
-			if dn >= 0 then
-				C.dup2(dn, 0)
-				C.close(dn)
-			end
-			reset_child_sigtraps(sh) -- caught signal traps revert to default in the async subshell
-			rt.async_child_signals(sh)
-			C.curse_sig_hold(0) -- dispositions set: safe to receive signals now
-			sh.in_subprogram = (sh.in_subprogram or 0) + 1 -- async subprogram: ERR trap won't fire (sans errtrace)
-			sh.loopdepth = 0
-			local ok, err = pcall(function()
-				sh.out = io.write
-				exec_stmt(sh, st.cmd, hook)
-			end)
-			child_status(sh, ok, err)
-			rt.child_exit(sh, sh.status or 0) -- its own EXIT trap, flush, _exit
-		end
-		C.curse_sig_hold(0) -- parent: unblock
-		-- register the job (for `jobs`/`wait %spec`/`wait -n`); best-effort command text
+		-- cmd & : runs IN-PROCESS as a background task (rt: Shell:bg_launch) — a subshell
+		-- the scheduler runs whenever the shell waits; $! is its virtual pid, status 0.
 		local c1 = st.cmd
 		while c1 and (c1.t == "pipeline") and c1.cmds do
 			c1 = c1.cmds[1]
@@ -5744,9 +5739,11 @@ exec_stmt = function(sh, st, hook)
 		local dtext = require("deparse").command_text(st.cmd) -- (bash prints the job as print_cmd.c does)
 		local cmdstr = (dtext ~= "" and dtext) or st.text
 			or (c1 and c1.words and c1.words[1] and c1.words[1].parts[1] and c1.words[1].parts[1].lit) or "job"
-		job_add(sh, pid, cmdstr)
-		sh.bg_pids = sh.bg_pids or {}
-		sh.bg_pids[#sh.bg_pids + 1] = pid
+		local cmd = st.cmd
+		local run = rt.bg_tail_stmt(cmd)
+		sh:bg_launch(function(ssh)
+			exec_stmt(ssh, run, NOHOOK)
+		end, cmdstr, cmd.t == "subshell", cmd.t == "simple")
 		sh.status = 0
 	elseif t == "coproc" then
 		-- coproc NAME cmd: run cmd asynchronously with its stdin/stdout on two pipes whose

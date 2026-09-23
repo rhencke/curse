@@ -61,7 +61,7 @@ return function(sh, cmd, args, hook, tcb)
 			local pre = sh.source_preread -- (the compiled tier's rt.source already read it)
 			sh.source_preread = nil
 			local f = pre and pre.file == file and { read = function() return pre.code end, close = function() end }
-				or io.open(file, "r")
+				or rt.open_read(file)
 			if not f then -- (bash names just the file; in posix mode it's fatal — a special
 				-- builtin, unless run through `command` — and a $PATH miss is "file not found")
 				if sh.opt_posix and not name:find("/", 1, true) then

@@ -5843,7 +5843,7 @@ H.background = function(cx, st, after)
 	-- only for commands nested in a job that's a group/subshell/… — so a simple/pipeline
 	-- job compiles with its direct command errexit/ERR-exempt (as `! cmd` does).
 	local topexempt = st.cmd.t == "simple" or st.cmd.t == "pipeline"
-	local id = emit_fragment({ st.cmd }, topexempt)
+	local id = emit_fragment({ require("runtime").bg_tail_stmt(st.cmd) }, topexempt)
 	if not id then
 		return cx.delegate(st, after)
 	end
@@ -5893,7 +5893,8 @@ H.background = function(cx, st, after)
 			end
 		end
 	end
-	local fork = ("sh:run_background(cs_%d, %q%s)"):format(id, cmdstr, ext and ", true" or "")
+	local fork = ("sh:run_background(cs_%d, %q, %s, %s, %s)"):format(id, cmdstr, ext and "true" or "false",
+		st.cmd.t == "subshell" and "true" or "false", st.cmd.t == "simple" and "true" or "false")
 	local body = fork
 	if spawn then
 		body = ("do local __ok, __a = pcall(function() %s; return __a end); if not (__ok and sh:spawn_bg(__a, %q)) then %s end end"):format(
