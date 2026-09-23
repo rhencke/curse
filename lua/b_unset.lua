@@ -18,7 +18,8 @@ local C, P = I.C, I.P
 
 return function(sh, cmd, args, hook, tcb)
 	if cmd == "unset" then
-		local fmode, vmode = false, false -- -f: functions only; -v: vars only; neither: var then function
+		local fmode, vmode, nmode = false, false, false -- -f: functions only; -v: vars only; neither: var then function
+		-- -n: a nameref ITSELF, not its target
 		sh.status = 0
 		for j = 2, #args do
 			local a = args[j]
@@ -26,6 +27,8 @@ return function(sh, cmd, args, hook, tcb)
 				fmode = true
 			elseif a == "-v" then
 				vmode = true
+			elseif a == "-n" then
+				nmode = true
 			elseif a:sub(1, 1) == "-" and #a > 1 then -- other flags: ignore
 			elseif fmode then
 				if sh.fn_ro and sh.fn_ro[a] and sh.functions[a] then
@@ -57,13 +60,16 @@ return function(sh, cmd, args, hook, tcb)
 					-- eb == nil: `name[sub]` with no such variable is a no-op (status 0)
 				end
 				if nm == nil then
-					local dn = sh:deref(a)
+					local dn = nmode and a or sh:deref(a)
+					if nmode and not (sh.vars[a] and sh.vars[a].ref) then
+						goto next_arg -- `unset -n` leaves a variable that isn't a nameref alone (bash)
+					end
 					if dn == "RANDOM" then
 						sh.random_plain = true -- (unset RANDOM loses its special meaning — bash)
 					end
 					local b = sh.vars[dn]
 					if b and b.ro then -- readonly: cannot unset (bash: status 1, keep it)
-						io.stderr:write("curse: unset: " .. a .. ": cannot unset: readonly variable\n")
+						io.stderr:write("curse: unset: " .. dn .. ": cannot unset: readonly variable\n")
 						sh.status = 1
 					elseif b ~= nil or vmode then
 						-- bash dynamic-scope unset: when the var is NOT local to the CURRENT
@@ -124,7 +130,7 @@ return function(sh, cmd, args, hook, tcb)
 							sh.vars[dn] = nil
 						end
 						if not env_done then
-							C.unsetenv(a)
+							C.unsetenv(dn)
 						end -- drop from the process env too
 						if rt.LOCALE_VARS[dn] then
 							rt.reset_locale(sh)
@@ -144,6 +150,7 @@ return function(sh, cmd, args, hook, tcb)
 					end
 				end
 			end
+			::next_arg::
 		end
 	end
 end

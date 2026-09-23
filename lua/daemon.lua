@@ -242,6 +242,7 @@ local function dispatch(sh, args)
 	end
 	if code then
 		-- sh -c CODE [name [args…]]: name is $0, rest are $1..
+		sh.opt_c = true -- (as run.lua: -c's exit statuses, no `main` FUNCNAME frame, …)
 		if args[i] then
 			sh.argv0 = args[i]
 		end

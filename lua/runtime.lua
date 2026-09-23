@@ -2217,8 +2217,27 @@ function M.redirs_stdin(rd)
 	return false
 end
 -- `for NAME in …` with NAME readonly: bash reports it, status 1, and runs no iteration
+-- `for NAME in …` assigns each word; a NAMEREF loop variable is instead re-pointed at
+-- each word in turn (bash: the words name the variables to reference). false = the
+-- assignment failed, which ends the loop (status 1) as in bash.
+function M.for_assign(sh, name, v)
+	local b = sh.vars[name]
+	if b and b.ref then
+		if not M.ref_target_ok(v) then
+			M.bad_ref_target(v)
+			sh.status = 1
+			return false
+		end
+		b.s = v
+		return true
+	end
+	return sh:set_str(name, v) ~= false
+end
 function M.for_var_ro(sh, name)
-	local b = sh.vars[sh:deref(name)]
+	local b = sh.vars[name] -- (a nameref loop var re-points itself: ITS readonly-ness counts)
+	if not (b and b.ref) then
+		b = sh.vars[sh:deref(name)]
+	end
 	if b and b.ro then
 		io.stderr:write("curse: " .. name .. ": readonly variable\n")
 		sh.status = 1
@@ -2251,7 +2270,27 @@ function M.fd_below(fd, lim)
 	end
 	return fd
 end
--- The coproc `pid` was reaped: bash closes the shell's ends and unsets NAME / NAME_PID.
+-- NAME=(read-fd write-fd) and NAME_PID, as bash's coproc_setvars: a readonly NAME (through
+-- a nameref, its target) is reported and nothing is set; a readonly NAME_PID is reported.
+function M.coproc_setvars(sh, name, r, w, pid)
+	local dn = sh:deref(name)
+	local b = sh.vars[dn]
+	if b and b.ro then
+		io.stderr:write("curse: " .. dn .. ": readonly variable\n")
+		return
+	end
+	sh:array_assign(name, { tostring(r), tostring(w) }, false)
+	local pn = name .. "_PID"
+	local pdn = sh:deref(pn)
+	local pb = sh.vars[pdn]
+	if pb and pb.ro then
+		io.stderr:write("curse: " .. pdn .. ": readonly variable\n")
+	else
+		sh:set_str(pn, tostring(pid))
+	end
+end
+-- The coproc `pid` was reaped: bash closes the shell's ends and unsets NAME (through a
+-- nameref; a readonly one is reported and kept) and NAME_PID (itself, readonly or not).
 function M.coproc_dispose(sh, pid)
 	local cp = sh.coprocs and sh.coprocs[pid]
 	if not cp then
@@ -2263,7 +2302,13 @@ function M.coproc_dispose(sh, pid)
 			C.close(fd)
 		end
 	end
-	sh.vars[cp.name], sh.vars[cp.name .. "_PID"] = nil, nil
+	local dn = sh:deref(cp.name)
+	if sh.vars[dn] and sh.vars[dn].ro then
+		io.stderr:write("curse: " .. dn .. ": cannot unset: readonly variable\n")
+	else
+		sh.vars[dn] = nil
+	end
+	sh.vars[cp.name .. "_PID"] = nil
 end
 -- bash reaps a finished coproc as soon as SIGCHLD arrives, closing its fds and unsetting
 -- NAME; the interpreter polls for that between commands while any coproc exists.
@@ -3866,13 +3911,18 @@ function Shell:deref(name)
 		if not b or not b.ref or b.s == nil or b.s == "" then
 			return name
 		end
-		local t = b.s
-		local br = t:find("[", 1, true)
-		local tname = br and t:sub(1, br - 1) or t
-		-- An invalid target name (e.g. `#`, `1`, `$1`) isn't a real reference: reading
-		-- the nameref yields its own stored string, so resolve to the nameref itself.
-		if not tname:match("^[%a_][%w_]*$") then
-			return name
+		local tname
+		if b.outer then
+			tname = b.outer -- (a function's self-named ref: the SHADOWED var's alias)
+		else
+			local t = b.s
+			local br = t:find("[", 1, true)
+			tname = br and t:sub(1, br - 1) or t
+			-- An invalid target name (e.g. `#`, `1`, `$1`) isn't a real reference: reading
+			-- the nameref yields its own stored string, so resolve to the nameref itself.
+			if not tname:match("^[%a_][%w_]*$") then
+				return name
+			end
 		end
 		-- mutually recursive namerefs (ref1->ref2->ref1) resolve to nothing in bash
 		if seen and seen[tname] then
@@ -3884,26 +3934,54 @@ function Shell:deref(name)
 	end
 	return name
 end
+-- The `base[sub]` a nameref CHAIN ends at (`one -> qux -> 'bar[3]'`), or nil when it ends
+-- at a whole variable (plain :deref covers that).
+function Shell:deref_elem(name)
+	for _ = 1, 100 do
+		local b = self.vars[name]
+		if not b or not b.ref or b.s == nil or b.s == "" then
+			return nil
+		end
+		if b.s:find("[", 1, true) then
+			return b.s
+		end
+		name = b.s
+	end
+end
 -- Mark `name` as a nameref (declare -n); target is the referenced variable name.
 -- A nameref target (when one is given) must be a plain identifier, optionally
 -- with a subscript (`ref`, `a[0]`, `a[@]`); bash rejects `@`, `*`, `1`, `a b`,
 -- `a-b`, empty, … as "invalid variable name for name reference". Returns false
 -- (leaving the var untouched) so the caller can report the error + status 1. A
 -- nil target (`typeset -n ref` converting an existing var) is NOT validated.
-function Shell:make_nameref(name, target)
+function Shell:make_nameref(name, target, selfok)
 	local function valid(t)
 		return t:match("^[%a_][%w_]*$") or t:match("^[%a_][%w_]*%[.+%]$")
 	end
+	local ob = self.vars[name]
+	if ob and ob.arr and not ob.ref then
+		return false, "array" -- (an array can't become a reference)
+	end
+	if ob and ob.ro and not ob.ref then
+		return false, "ro"
+	end
+	if not selfok and (target or (ob and ob.s)) == name then
+		return false, "self"
+	end
 	if target ~= nil then
+		if target == "" then
+			return false, "empty" -- (`declare -n r=""`: bash's "not a valid identifier")
+		end
 		if not valid(target) then
 			return false
-		end -- explicit target (empty/@/*/1/… rejected)
+		end -- explicit target (@/*/1/… rejected)
 	else
 		-- converting an existing var: its current value becomes the target — bash
 		-- rejects the conversion if that value is not a valid target (a non-empty
 		-- invalid one; an unset/empty var makes a valid deferred nameref).
 		local b = self.vars[name]
-		if b and b.s and b.s ~= "" and not valid(b.s) then
+		local cur = b and (b.s or (b.n and M.i64_to_str(b.n))) -- (`((r=0))` left a number)
+		if cur and not valid(cur) then -- (an EMPTY value too: `r=""; declare -n r`)
 			return false
 		end
 	end
@@ -3916,10 +3994,51 @@ function Shell:make_nameref(name, target)
 	end
 	return true
 end
+-- declare/typeset/local -n NAME[=TARGET]: make the nameref, reporting bash's errors;
+-- false = it failed (status 1). `inlocal`: in a function a self reference only warns
+-- (twice, as bash) and is made anyway.
+function Shell:nameref_decl(cmd, name, target, inlocal)
+	local ok, why = self:make_nameref(name, target)
+	if ok then
+		return true
+	end
+	if why == "self" and inlocal then
+		io.stderr:write("curse: " .. cmd .. ": warning: " .. name .. ": circular name reference\n")
+		io.stderr:write("curse: warning: " .. name .. ": circular name reference\n")
+		self:make_nameref(name, target, true)
+		-- …and it references the SHADOWED `name` (the caller's / global one): alias that
+		-- saved box under a hidden name the ref follows (b.outer), so reads and writes hit
+		-- the binding restored on return; the alias itself goes away with this frame.
+		local saved = self.savedstack[self.pd]
+		local e = saved and saved[name]
+		if e then
+			e.box = e.box or {}
+			local alias = name .. "\0" .. self.pd
+			self.vars[alias] = e.box
+			saved[alias] = saved[alias] or { box = false, seq = e.seq }
+			self.vars[name].outer = alias
+		end
+		return true
+	elseif why == "self" then
+		io.stderr:write("curse: " .. cmd .. ": " .. name .. ": nameref variable self references not allowed\n")
+	elseif why == "array" then
+		io.stderr:write("curse: " .. cmd .. ": " .. name .. ": reference variable cannot be an array\n")
+	elseif why == "ro" then
+		io.stderr:write("curse: " .. cmd .. ": " .. name .. ": readonly variable\n")
+	elseif why == "empty" then
+		M.bad_ref_target("", cmd)
+	else
+		local ob = self.vars[name]
+		local t = target or (ob and (ob.s or (ob.n and M.i64_to_str(ob.n)))) or ""
+		io.stderr:write("curse: " .. cmd .. ": `" .. t .. "': invalid variable name for name reference\n")
+	end
+	return false
+end
 function Shell:unref(name)
 	local b = self.vars[name]
 	if b then
 		b.ref = nil
+		b.outer = nil
 	end
 end
 function Shell:is_nameref(name)
@@ -3937,6 +4056,17 @@ function Shell:attr_string_u(name)
 		error({ __curse_exit = self.opt_c and 127 or 1, __curse_lineabort = self.opt_i or nil })
 	end
 	return self:attr_string(name)
+end
+-- declared (`declare -r v`, `declare -a a`) but never given a value
+function Shell:declared_unset(name)
+	local b = self.vars[self:deref(name)]
+	if not b then
+		return false
+	end
+	if b.arr then
+		return b.empty_decl and next(b.arr) == nil or false
+	end
+	return b.s == nil and b.n == nil
 end
 function Shell:attr_string(name)
 	local b = self.vars[self:deref(name)]
@@ -4033,6 +4163,15 @@ end
 -- The compiled backend uses this for word expansion so it matches the interp,
 -- which checks nounset at the same point. (:get itself is used for internal
 -- reads like IFS/HOME that must not trip nounset.)
+-- $N / ${N} in compiled code: under set -u a missing positional is unbound (bash names
+-- the bare form `$9`, the braced one `9`)
+function Shell:param_u(n, braced)
+	if self.opt_u and n > self.nparams then
+		io.stderr:write("curse: " .. (braced and "" or "$") .. n .. ": unbound variable\n")
+		error({ __curse_exit = self.opt_c and 127 or 1, __curse_lineabort = self.opt_i or nil })
+	end
+	return self:param(n)
+end
 function Shell:get_u(name)
 	-- A declared-but-value-less box (`local foo` / `declare x`) is still UNSET for
 	-- nounset purposes, so treat it like a missing var. `$x` reads ${x[0]}, so an
@@ -4134,6 +4273,27 @@ local LOCALE_VARS = {
 }
 M.LOCALE_VARS = LOCALE_VARS
 
+-- A nameref with no (valid) target takes an assigned value AS its target, and bash rejects
+-- one that isn't a variable name — named by the assigning builtin, M.assign_ctx (bash's
+-- this_command_name: "declare", "printf", …; nil for a plain assignment).
+function M.ref_target_ok(s)
+	return s:match("^[%a_][%w_]*$") or s:match("^[%a_][%w_]*%[.+%]$")
+end
+local ref_target_ok = M.ref_target_ok
+function M.bad_ref_target(v, ctx)
+	io.stderr:write("curse: " .. (ctx and (ctx .. ": ") or "") .. "`" .. v .. "': not a valid identifier\n")
+end
+-- declare -l / -u / -c: a value is case-folded on every assignment (scalar or element)
+local function case_fold(b, s)
+	if b.lower then
+		return s:lower()
+	elseif b.upper then
+		return s:upper()
+	elseif b.cap then
+		return s:sub(1, 1):upper() .. s:sub(2):lower()
+	end
+	return s
+end
 function Shell:set_str(name, s)
 	if s:find("\0", 1, true) then
 		s = M.cstr(s)
@@ -4143,12 +4303,13 @@ function Shell:set_str(name, s)
 		return -- assignments to FUNCNAME have no effect (bash): it's the call stack
 	end
 	local b = box(dn, self.vars)
-	if b.lower then -- declare -l / -u / -c: the value is case-folded on every assignment
-		s = s:lower()
-	elseif b.upper then
-		s = s:upper()
-	elseif b.cap then
-		s = s:sub(1, 1):upper() .. s:sub(2):lower()
+	if b.ref and not ref_target_ok(s) then
+		M.bad_ref_target(s, M.assign_ctx)
+		self.status = 1
+		return false -- (the one failure a caller may check: a loop stops, as bash's)
+	end
+	if b.lower or b.upper or b.cap then
+		s = case_fold(b, s)
 	end
 	b.s = s
 	b.n = nil
@@ -4265,6 +4426,10 @@ function Shell:aset(name, n)
 		io.stderr:write("curse: " .. dn .. ": readonly variable\n")
 		error({ __curse_exit = 1, __curse_matherr = true, __curse_lineabort = true })
 	end
+	if b.ref then -- a number is never a nameref target (`declare -n r; ((r=0))`)
+		M.bad_ref_target(i64_to_str(i64(n)), require("parser").arith_cmd)
+		error({ __curse_exit = 1, __curse_matherr = true })
+	end
 	if dn == "OPTIND" and self.getopts_state then
 		self.getopts_state[b] = nil
 	end
@@ -4318,10 +4483,20 @@ function Shell:array_assign(name, values, append)
 		return -- (see set_str)
 	end
 	local b = box(self:deref(name), self.vars)
+	if b.ref then -- a nameref with no target becomes the array itself (bash warns)
+		io.stderr:write("curse: warning: " .. name .. ": removing nameref attribute\n")
+		b.ref, b.s = nil, nil
+	end
 	if b.int then -- declare -i array: each element is evaluated arithmetically (bash)
 		local ev = {}
 		for i = 1, #values do
 			ev[i] = M.i64_to_str(M.arith_str(self, values[i]))
+		end
+		values = ev
+	elseif b.lower or b.upper or b.cap then
+		local ev = {}
+		for i = 1, #values do
+			ev[i] = case_fold(b, values[i])
 		end
 		values = ev
 	end
@@ -4385,9 +4560,9 @@ function Shell:array_set(name, key, val, append)
 		end
 		b.arr[key] = M.i64_to_str(v)
 	elseif append then
-		b.arr[key] = (b.arr[key] or "") .. val
+		b.arr[key] = case_fold(b, (b.arr[key] or "") .. val)
 	else
-		b.arr[key] = val
+		b.arr[key] = case_fold(b, val)
 	end
 	return true
 end
@@ -4818,7 +4993,7 @@ local function substr(val, off, len)
 			o = n + o
 		end
 		if o < 0 then
-			o = 0
+			return "" -- (a negative offset past the start: bash yields nothing)
 		end
 		local last = n
 		if len and len ~= "" then
@@ -4837,7 +5012,7 @@ local function substr(val, off, len)
 		o = n + o
 	end
 	if o < 0 then
-		o = 0
+		return ""
 	end
 	local last = n
 	if len and len ~= "" then
@@ -5383,16 +5558,36 @@ local REG_NOTBOL = 1
 -- regex engine (real char classes, extglob, leftmost-longest), not weak Lua
 -- patterns. `all` replaces every match; a leading # / % on `glob` anchors the
 -- match at the start / end. An empty pattern is a no-op (matches bash).
-function M.subst_glob(val, glob, repl, all)
-	local anchor
-	if glob:sub(1, 1) == "#" then
+-- shopt patsub_replacement (bash's strcreplace(rep, '&', m, 2)): in the replacement `&` is
+-- the matched text, `\&` a literal `&`, `\\` a literal `\`. The caller's replacement is
+-- quote-marked: a QUOTED `&`/`\` arrives backslash-escaped (quote_string_for_repl).
+local function repl_amp(rep, m)
+	return (rep:gsub("\\?[&\\]", function(t)
+		if t == "&" then
+			return m
+		elseif #t == 2 then
+			return t:sub(2)
+		end
+	end))
+end
+-- does the replacement use `&` at all (bash's shouldexp_replacement)?
+function M.repl_expands(rep)
+	return rep:find("&", 1, true) ~= nil or rep:find("\\\\") ~= nil
+end
+function M.subst_glob(val, glob, repl, all, icase, rx)
+	local anchor -- (only `${x/#p/r}`/`${x/%p/r}` anchor: after `//` a `#`/`%` is literal)
+	local c1 = not all and glob:sub(1, 1)
+	if c1 == "#" then
 		glob = glob:sub(2)
 		anchor = "^"
-	elseif glob:sub(1, 1) == "%" then
+	elseif c1 == "%" then
 		glob = glob:sub(2)
 		anchor = "$"
 	end
 	if glob == "" then -- empty pattern: no-op, except an anchored one inserts repl
+		if rx then
+			repl = repl_amp(repl, "")
+		end
 		if anchor == "^" then
 			return repl .. val
 		elseif anchor == "$" then
@@ -5402,8 +5597,11 @@ function M.subst_glob(val, glob, repl, all)
 	end
 	-- Literal pattern (no glob metachars): plain byte find/replace, no regex — the
 	-- common `${x//-/_}` / `${x//,/ }` case (regex is left for real globs).
-	if not glob:find("[%*%?%[\\]") and not glob:find("[@!+?*]%(") then
+	if not icase and not glob:find("[%*%?%[\\]") and not glob:find("[@!+?*]%(") then
 		local plen = #glob
+		if rx then -- (every match is the literal pattern itself)
+			repl = repl_amp(repl, glob)
+		end
 		if anchor == "^" then
 			return val:sub(1, plen) == glob and (repl .. val:sub(plen + 1)) or val
 		elseif anchor == "$" then
@@ -5433,7 +5631,7 @@ function M.subst_glob(val, glob, repl, all)
 	else
 		ere = "(" .. ere .. ")"
 	end
-	if ffi.C.regcomp(regbuf, ere, REG_EXTENDED) ~= 0 then
+	if ffi.C.regcomp(regbuf, ere, REG_EXTENDED + (icase and REG_ICASE or 0)) ~= 0 then
 		return val
 	end
 	local out, pos, n, prev_end = {}, 0, #val, -1
@@ -5450,7 +5648,7 @@ function M.subst_glob(val, glob, repl, all)
 			pos = pos + so + 1
 		else
 			out[#out + 1] = sub:sub(1, so) -- text before the match
-			out[#out + 1] = repl
+			out[#out + 1] = rx and repl_amp(repl, sub:sub(so + 1, eo)) or repl
 			prev_end = pos + eo
 			if eo > so then
 				pos = pos + eo
@@ -6835,13 +7033,15 @@ function Shell:expand_param(pe, arg, arg2, idxnum)
 		return arg or ""
 	end
 	-- set -u (nounset): a bare reference to an unset variable errors and exits. The
-	-- unset-handling ops (:- - :+ + := = :? ?) and $@/$* are exempt.
+	-- unset-handling ops (:- - :+ + := = :? ?) and $@/$* are exempt (and @-transforms,
+	-- which apply their own rule below).
 	if
 		self.opt_u
 		and not isset
 		and not (name == "@" or name == "*")
 		and index ~= "@"
 		and index ~= "*"
+		and op ~= "@"
 		and op ~= ":-"
 		and op ~= "-"
 		and op ~= ":+"
@@ -6852,12 +7052,16 @@ function Shell:expand_param(pe, arg, arg2, idxnum)
 		and op ~= "?"
 		and self:special_get(name) == ""
 	then
-		io.stderr:write("curse: " .. name .. ": unbound variable\n")
+		io.stderr:write("curse: " .. (pe.uname or name) .. ": unbound variable\n")
 		error({ __curse_exit = self.opt_c and 127 or 1, __curse_lineabort = self.opt_i or nil })
 	end
 	-- := / = write back to the SAME target that was read: an array element when
 	-- subscripted (${a[0]=x} must populate a[0]), else the scalar variable.
 	local function assign_default(v)
+		if not name:match("^[%a_]") then -- ${6=x} ${@=x}: bash aborts the line
+			io.stderr:write("curse: $" .. name .. ": cannot assign in this way\n")
+			error({ __curse_exit = 1, __curse_lineabort = true })
+		end
 		if index and index ~= "@" and index ~= "*" then
 			self:array_set(name, idxnum or 0, v)
 			return v
@@ -6910,9 +7114,11 @@ function Shell:expand_param(pe, arg, arg2, idxnum)
 	arg = arg or ""
 	if op == "@" then -- ${x@OP} transforms
 		-- under set -u a variable with no value is unbound for every transform, @a included
-		-- (even a declared-but-valueless one: `declare -A m; ${m@a}` fails — bash)
-		if self.opt_u and not isset then
-			io.stderr:write("curse: " .. name .. ": unbound variable\n")
+		-- (even a declared-but-valueless one: `declare -A m; ${m@a}` fails — bash); @a/@A
+		-- accept an array with any element, the others need its [0]
+		local b = self.opt_u and not isset and (arg == "a" or arg == "A") and self.vars[self:deref(name)]
+		if self.opt_u and not isset and not (b and b.arr and next(b.arr) ~= nil) then
+			io.stderr:write("curse: " .. (pe.uname or name) .. ": unbound variable\n")
 			error({ __curse_exit = self.opt_c and 127 or 1, __curse_lineabort = self.opt_i or nil })
 		end
 		-- @a reports the VARIABLE's attributes (e.g. `A` for a declared assoc array),
@@ -6921,15 +7127,16 @@ function Shell:expand_param(pe, arg, arg2, idxnum)
 		if arg == "a" then
 			return self:attr_string(name)
 		end
-		if not isset then
-			return ""
+		if not isset then -- (valueless but with attributes: `declare -r v`, an array w/o [0])
+			local at = arg == "A" and self:attr_string(name) or ""
+			return at ~= "" and ("declare -" .. at .. " " .. name) or ""
 		end
 		if arg == "A" then -- declare-able form (with the attributes, when it has any: bash)
 			local at = self:attr_string(name)
 			return (at ~= "" and ("declare -" .. at .. " ") or "") .. name .. "=" .. M.shell_quote(val)
 		end
 	end
-	return self:apply_str_op(op, val, arg, arg2)
+	return self:apply_str_op(op, val, arg, arg2, pe.arg2)
 end
 
 -- Shell-quote a string so it round-trips through eval (single-quote form).
@@ -7117,7 +7324,27 @@ local function fold_case(val, pat, upper, all)
 	end
 	return table.concat(out)
 end
-function Shell:apply_str_op(op, val, arg, arg2)
+-- ${v:off:len} with a negative len that ends before off: bash's "substring expression < 0"
+-- (naming the length as written, `ltxt`) abandons the line
+local function substr_check(val, off, len, ltxt)
+	local l = tonumber(len)
+	if not l or l >= 0 then
+		return
+	end
+	local n = M.mb_strlen(val)
+	local o = tonumber(off) or 0
+	if o < 0 then
+		o = n + o
+	end
+	if o < 0 or o > n then
+		return -- (an out-of-range offset is an empty result, checked first)
+	end
+	if n + l < o then
+		io.stderr:write("curse: " .. (ltxt or len) .. ": substring expression < 0\n")
+		error({ __curse_exit = 1, __curse_lineabort = true })
+	end
+end
+function Shell:apply_str_op(op, val, arg, arg2, ltxt)
 	arg = arg or ""
 	if op == "@" then -- ${x@Q}/@U/@u/@L/@E/@K/@k (bash 5.x transforms)
 		if arg == "Q" or arg == "K" or arg == "k" then
@@ -7149,13 +7376,13 @@ function Shell:apply_str_op(op, val, arg, arg2)
 	if op == "%%" then
 		return strip_suffix(val, arg, true)
 	end
-	if op == "/" then
-		return M.subst_glob(val, arg, arg2 or "", false)
-	end
-	if op == "//" then
-		return M.subst_glob(val, arg, arg2 or "", true)
+	if op == "/" or op == "//" then -- (nocasematch folds case here too, bash 5.2)
+		arg2 = arg2 or ""
+		local rx = self.shopt.patsub_replacement and M.repl_expands(arg2)
+		return M.subst_glob(val, arg, arg2, op == "//", self.shopt.nocasematch, rx)
 	end
 	if op == "sub" then
+		substr_check(val, arg, arg2, ltxt)
 		return substr(val, arg, arg2)
 	end
 	-- ${x^^PAT}/${x,,PAT}: fold every char matching glob PAT (default ? = any);
@@ -7457,6 +7684,9 @@ function M.run_prefix(sh, names, vals, runfn)
 					and { s = b.s, n = b.n, arr = b.arr, assoc = b.assoc, order = b.order, exported = b.exported, ro = b.ro, ref = b.ref }
 				or false,
 		}
+		if b and b.ref then -- a NAMEREF's prefix binding is a plain temporary (target untouched)
+			sh.vars[name] = {}
+		end
 		sh:set_str(name, vals[i])
 		C.setenv(name, sh:get(name), 1)
 	end
@@ -7874,20 +8104,33 @@ function M.arith_str(sh, s)
 	return require("interp").arith_eval_str(sh, s)
 end
 
--- ${v:off:len} slice offset/length: arith-evaluate the already-expanded expression
--- string LENIENTLY — a parse/eval error falls back to tonumber(s) or 0, exactly interp's
--- arith_int (interp.lua). Returns a Lua number, or nil for empty/nil input (the caller
--- coerces nil->0 for a present operand). Shares the arith_str evaluator (native
--- compile_arith_value, interp bootstrap for the dynamic slow path — no new seam).
-function M.arith_int(sh, s)
+-- ${v:off:len} / ${a[@]:off:len} offset/length: arith-evaluate the already-expanded
+-- string STRICTLY, like bash — an error names the variable (`HOME: }: syntax error:
+-- operand expected …`) and abandons the command's line. Returns a Lua number, or nil for
+-- empty/nil input (the caller coerces nil->0 for a present operand).
+-- the parameter as bash names it in such errors: `a[@]`, `a[0]`, `HOME`
+function M.pe_label(pe)
+	return pe.index and (pe.name .. "[" .. pe.index .. "]") or pe.name
+end
+function M.substr_arith(sh, name, s)
 	if s == nil or s == "" then
 		return nil
 	end
-	local ok, v = pcall(M.arith_str, sh, s)
-	if ok then
-		return tonumber(v)
+	if M.looks_numeric(s) then
+		return tonumber(M.arith_num(s))
 	end
-	return tonumber(s) or 0
+	local P = require("parser")
+	local sv = P.arith_cmd
+	P.arith_cmd = name
+	local ok, v = pcall(M.arith_str, sh, s)
+	P.arith_cmd = sv
+	if not ok then
+		if type(v) == "table" and v.__curse_matherr then
+			error({ __curse_exit = 1, __curse_lineabort = true })
+		end
+		error(v, 0)
+	end
+	return tonumber(v)
 end
 -- `[[ -v NAME ]]` / `[[ -v a[i] ]]`: is the variable (or array element) set? interp's
 -- var_is_set twin. `nm` is already word-expanded, so an array subscript is a plain literal
@@ -8032,12 +8275,19 @@ end
 -- array_indices); off/len are already arith-evaluated (len nil = no length given). An
 -- indexed (possibly sparse) array selects by INDEX VALUE (elements whose index >= off; a
 -- negative off counts from highest index + 1); $@/$* and assoc are position-based (assoc
--- has bash's :0==:1 off-by-one). A negative length is a FATAL expansion error.
-function M.array_slice_values(sh, name, els, off, len)
+-- has bash's :0==:1 off-by-one). A negative length is a line-aborting expansion error.
+function M.array_slice_values(sh, name, els, off, len, ltxt)
 	off = off or 0
 	if len ~= nil and len < 0 then
-		io.stderr:write("curse: " .. len .. ": substring expression < 0\n")
-		error({ __curse_exit = 1 })
+		io.stderr:write("curse: " .. (ltxt or len) .. ": substring expression < 0\n")
+		error({ __curse_exit = 1, __curse_lineabort = true })
+	end
+	if name ~= "@" and name ~= "*" then
+		-- a SCALAR through [@]/[*] slices its value as a string (`${v[@]:3}` = ${v:3})
+		local b = sh.vars[sh:deref(name)]
+		if b and b.arr == nil and b.s ~= nil then
+			return { substr(b.s, off, len) }
+		end
 	end
 	if name ~= "@" and name ~= "*" and not sh:is_assoc(name) then
 		local idx = sh:array_indices(name)
@@ -8411,8 +8661,10 @@ function M.assign_scalar(sh, name, value)
 			io.stderr:write("curse: warning: " .. name .. ": circular name reference\n")
 			sh.status = 1
 			return
+		elseif direct.outer then -- (a function's self-named ref: bash warns, then writes)
+			io.stderr:write("curse: warning: " .. name .. ": circular name reference\n")
 		end
-		local nbase, nsub = direct.s:match("^([%a_][%w_]*)%[(.+)%]$")
+		local nbase, nsub = (sh:deref_elem(name) or ""):match("^([%a_][%w_]*)%[(.+)%]$")
 		if nbase then
 			local rb = sh.vars[nbase]
 			if rb and rb.ro then -- through a nameref: readonly is non-fatal (bash)
@@ -8431,7 +8683,7 @@ function M.assign_scalar(sh, name, value)
 	end
 	local b = sh.vars[sh:deref(name)]
 	if b and b.ro then
-		io.stderr:write("curse: " .. name .. ": readonly variable\n")
+		io.stderr:write("curse: " .. sh:deref(name) .. ": readonly variable\n") -- (a ref's target)
 		sh.status = 1
 		if direct and direct.ref then
 			return

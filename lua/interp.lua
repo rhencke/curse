@@ -631,11 +631,11 @@ local tilde_prefix -- forward (word-initial ~ expansion; defined below, used in 
 local expand_word -- forward (used by eval's $-deferred arith and expand_part_str)
 local expand_assign_word -- forward (assignment-RHS expander; ${-default} tilde ctx)
 local expand_pattern -- forward (quote-aware glob-pattern expansion for ${v/…} etc.)
+local expand_repl -- forward (${v/pat/REPL} replacement expansion)
 local indirect_part -- forward (${!ref} target resolution, re-parsed to a part)
 local eval -- arithmetic evaluator (forward decl)
 local arith_resolve -- var-value-as-arith-expression resolver (forward decl)
 local arith_key -- array subscript in arith: string key for assoc, number for indexed
-local arith_int -- forward: arith-eval a slice offset/length string
 local run_trap -- trap-handler runner (forward decl; defined near the bottom)
 local fire_err -- ERR-trap + errexit enforcement (forward decl; defined near exec_list)
 local fire_err_trap -- the ERR-trap half of fire_err WITHOUT errexit-exit (used inside handlers)
@@ -1124,10 +1124,15 @@ local function expand_part_str(sh, p, assign)
 		-- a nameref whose target has a subscript (`typeset -n ref='a[2]'`) reads as
 		-- ${a[2]} — deref only yields the base name, so expand the target here.
 		local rb = sh.vars[p.var]
-		if rb and rb.ref and rb.s and rb.s:find("[", 1, true) then
-			return expand_word(sh, P.parse_word("${" .. rb.s .. "}"))
+		local et = rb and rb.ref and sh:deref_elem(p.var)
+		if et then -- (at the end of a ref chain too: one -> qux -> 'bar[3]')
+			return expand_word(sh, P.parse_word("${" .. et .. "}"))
 		end
-		local b = sh.vars[sh:deref(p.var)]
+		local dn = sh:deref(p.var)
+		if dn == "" then -- a circular ref chain reads as nothing, with bash's warning
+			io.stderr:write("curse: warning: " .. p.var .. ": circular name reference\n")
+		end
+		local b = sh.vars[dn]
 		-- `$x` reads ${x[0]}, so an array whose element 0 is unset (a bare `declare -a x`, a
 		-- sparse array with no [0]) is unbound — not merely because b.arr exists.
 		local unset
@@ -1139,13 +1144,13 @@ local function expand_part_str(sh, p, assign)
 			unset = b.s == nil and b.n == nil
 		end
 		if sh.opt_u and unset and sh:special_get(p.var) == "" then
-			io.stderr:write("curse: " .. p.var .. ": unbound variable\n")
+			io.stderr:write("curse: " .. (p.uname or p.var) .. ": unbound variable\n")
 			error({ __curse_exit = sh.opt_c and 127 or 1, __curse_lineabort = sh.opt_i or nil })
 		end
 		return sh:get(p.var)
 	elseif p.param then
 		if sh.opt_u and p.param > sh.nparams then
-			io.stderr:write("curse: " .. p.param .. ": unbound variable\n")
+			io.stderr:write("curse: " .. (p.braced and "" or "$") .. p.param .. ": unbound variable\n")
 			error({ __curse_exit = sh.opt_c and 127 or 1, __curse_lineabort = sh.opt_i or nil })
 		end
 		return sh:param(p.param)
@@ -1243,6 +1248,16 @@ local function expand_part_str(sh, p, assign)
 		if pe.op == "@" and pe.arg == "P" then -- ${x@P}: decode prompt escapes, then expand
 			return M.prompt_string(sh, sh:get_u(pe.name)) -- get_u: honor set -u
 		end
+		-- ${ref OP…} through a nameref to an ELEMENT (`declare -n f='a[1]'`) operates on
+		-- that element, not the base's [0]: retarget the expansion at it
+		local rb = not pe.index and pe.op ~= "indirect" and pe.op ~= "len" and type(pe.name) == "string" and sh.vars[pe.name]
+		local et = rb and rb.ref and sh:deref_elem(pe.name)
+		if et then
+			local eb, esub = et:match("^([%a_][%w_]*)%[(.+)%]$")
+			if eb then
+				pe = setmetatable({ name = eb, index = esub }, { __index = pe })
+			end
+		end
 		if pe.op == "indirect" then -- ${!ref} / ${!ref OP}: resolve the name, then expand it
 			local ip = indirect_part(sh, pe)
 			if not ip then
@@ -1294,18 +1309,15 @@ local function expand_part_str(sh, p, assign)
 		else
 			arg = pe.arg and (patmode and expand_pattern or expand_word)(sh, P.parse_word(pe.arg), true) or nil
 		end
-		local arg2 = pe.arg2 and expand_word(sh, P.parse_word(pe.arg2)) or nil
+		local arg2 = pe.arg2 and pe.op ~= "sub" and expand_repl(sh, P.parse_word(pe.arg2)) or nil
 		if pe.op == "sub" then -- ${v:off:len}: offset/length are arithmetic expressions,
 			-- expanded the arithmetic way (bash: `${s:A[$k]}` quotes $k inside the subscript)
-			arg = pe.arg and tostring(arith_int(sh, arith_expand_text(sh, pe.arg)) or 0) or nil
-			arg2 = pe.arg2 and tostring(arith_int(sh, arith_expand_text(sh, pe.arg2)) or 0) or nil
+			arg = pe.arg and tostring(rt.substr_arith(sh, rt.pe_label(pe), arith_expand_text(sh, pe.arg)) or 0) or nil
+			arg2 = pe.arg2 and tostring(rt.substr_arith(sh, rt.pe_label(pe), arith_expand_text(sh, pe.arg2)) or 0) or nil
 		elseif not TESTOP[pe.op] then
 			-- a word-initial ~ in a pattern / replacement expands (${p//~/z}, ${p#~/x})
 			if type(arg) == "string" then
 				arg = tilde_prefix(sh, arg)
-			end
-			if arg2 then
-				arg2 = tilde_prefix(sh, arg2)
 			end
 		end
 		return sh:expand_param(pe, arg, arg2, subkey)
@@ -1439,6 +1451,30 @@ local function expand_escaped(sh, w, charclass)
 	end
 	return table.concat(buf)
 end
+-- ${v/pat/REPL} replacement: a word-initial UNQUOTED `~` tilde-expands (even inside "…",
+-- bash); with shopt patsub_replacement a QUOTED `&`/`\` — and the tilde's directory — is
+-- backslash-marked so apply_str_op's `&` substitution leaves it literal (bash's
+-- quote_string_for_repl).
+local REPL_META = "[&\\]"
+expand_repl = function(sh, w)
+	local amp = sh.shopt.patsub_replacement
+	local buf = {}
+	for i, p in ipairs(w.parts) do
+		local s = expand_part_str(sh, p)
+		if p.q then
+			s = amp and s:gsub(REPL_META, "\\%0") or s
+		elseif i == 1 and p.lit and s:sub(1, 1) == "~" then
+			local t = tilde_prefix(sh, s)
+			if amp and t ~= s then
+				local tail = s:match("^~[^/]*(.*)$") or ""
+				t = t:sub(1, #t - #tail):gsub(REPL_META, "\\%0") .. tail
+			end
+			s = t
+		end
+		buf[#buf + 1] = s
+	end
+	return table.concat(buf)
+end
 -- glob PATTERN context (${v/pat/repl}, case, [[ == ]]): glob metacharacters.
 local PAT_META = "[%*%?%[%]\\%(%)%|%+%@%!]"
 expand_pattern = function(sh, w)
@@ -1539,6 +1575,10 @@ indirect_part = function(sh, pe)
 		end
 		if pe.name:match("^%d+$") then
 			tname = sh:param(tonumber(pe.name)) -- ${!1}: positional
+		elseif pe.name == "#" then
+			tname = tostring(sh.nparams) -- ${!#}: the last positional (or $0)
+		elseif pe.name == "@" or pe.name == "*" then
+			tname = sh:paramsJoin(" ") -- ${!@}: the params joined name the target
 		else
 			tname = (b and b.ref and b.s) or sh:get(pe.name)
 		end
@@ -1552,11 +1592,11 @@ indirect_part = function(sh, pe)
 		if pe.name and pe.name:match("^%d+$") then
 			return nil
 		end
-		local bb = pe.name and sh.vars[pe.name]
+		local bb = pe.name and sh.vars[sh:deref(pe.name)] -- (through a nameref: its target)
 		if bb and (bb.s ~= nil or bb.n ~= nil or bb.arr ~= nil) then
 			return nil
 		end
-		io.stderr:write("curse: " .. (pe.name or "") .. ": invalid indirect expansion\n")
+		io.stderr:write("curse: " .. (pe.name and rt.pe_label(pe) or "") .. ": invalid indirect expansion\n")
 		if sh.opt_u then
 			error({ __curse_exit = sh.opt_c and 127 or 1, __curse_lineabort = sh.opt_i or nil })
 		end
@@ -1586,6 +1626,14 @@ indirect_part = function(sh, pe)
 	if ok and part and part.pexp then
 		part.pexp.via_indirect = true
 	end
+	-- set -u names the REFERENCE, as written: `!bar: unbound variable`
+	local uname = "!" .. rt.pe_label(pe)
+	if ok and part then
+		part.uname = uname
+		if part.pexp then
+			part.pexp.uname = uname
+		end
+	end
 	return ok and part or nil
 end
 local is_multi
@@ -1605,40 +1653,6 @@ is_multi = function(sh, p)
 	end
 	-- $@/$* live in pexp.name (e.g. ${@:1}); array [@]/[*] live in pexp.index
 	return p.pexp.index == "@" or p.pexp.index == "*" or p.pexp.name == "@" or p.pexp.name == "*"
-end
--- arith-evaluate a slice offset/length expression (e.g. "i-4", "(-4)", "2").
-arith_int = function(sh, s)
-	if s == nil or s == "" then
-		return nil
-	end
-	local ok, v = pcall(function()
-		return tonumber(rt.i64_to_str(eval(sh, P.arith(s))))
-	end)
-	return (ok and v) or tonumber(s) or 0
-end
--- ${a[@]:off:len}: select elements by (0-based, negatives-from-end) offset/length.
-local function array_slice(els, off, len)
-	local n = #els
-	off = off or 0
-	-- a negative offset counts from the end; if it reaches past the start, bash
-	-- yields an EMPTY slice (not the whole array — don't clamp to 0).
-	if off < 0 then
-		off = n + off
-		if off < 0 then
-			return {}
-		end
-	end
-	local last = n
-	if len ~= nil then
-		last = (len < 0) and (n + len) or (off + len)
-	end
-	local out = {}
-	for i = off, last - 1 do
-		if els[i + 1] ~= nil then
-			out[#out + 1] = els[i + 1]
-		end
-	end
-	return out
 end
 local function multi_elems(sh, p) -- returns element list, star?
 	if p.pexp then
@@ -1704,47 +1718,18 @@ local function multi_elems(sh, p) -- returns element list, star?
 			els = sh:array_values(pe.name)
 		end
 		if pe.op == "sub" then -- array slice
-			local off = arith_int(sh, pe.arg and expand_word(sh, P.parse_word(pe.arg)) or nil) or 0
+			local off = rt.substr_arith(sh, rt.pe_label(pe), pe.arg and arith_expand_text(sh, pe.arg) or nil) or 0
 			-- a PRESENT length (even empty, `${a[@]:0:}`) is a count; empty means 0.
-			local len = pe.arg2 and (arith_int(sh, expand_word(sh, P.parse_word(pe.arg2))) or 0) or nil
-			-- Unlike a scalar substring, a NEGATIVE length over @/*/array/assoc is a
-			-- fatal expansion error in bash (aborts the script with status 1).
-			if len and len < 0 then
-				io.stderr:write("curse: " .. len .. ": substring expression < 0\n")
-				error({ __curse_exit = 1 })
+			local len = pe.arg2 and (rt.substr_arith(sh, rt.pe_label(pe), arith_expand_text(sh, pe.arg2)) or 0) or nil
+			els = rt.array_slice_values(sh, pe.name, els, off, len, pe.arg2)
+		elseif (pe.op == "=" or pe.op == ":=") and #els == 0 then
+			-- ${@=x} / ${a[@]=x}: nothing to assign to — bash aborts the line
+			if pe.name == "@" or pe.name == "*" then
+				io.stderr:write("curse: $" .. pe.name .. ": cannot assign in this way\n")
+			else
+				io.stderr:write("curse: " .. rt.pe_label(pe) .. ": bad array subscript\n")
 			end
-			if pe.name ~= "@" and pe.name ~= "*" and not sh:is_assoc(pe.name) then
-				-- indexed (possibly sparse) array: select by INDEX VALUE (elements whose
-				-- index >= off), length is a COUNT. A negative offset counts from the
-				-- highest index + 1 (bash), not from the element count.
-				local idx = sh:array_indices(pe.name)
-				if off < 0 then
-					off = (idx[#idx] or -1) + 1 + off
-				end
-				local out = {}
-				if off >= 0 then -- an out-of-bounds negative offset (off < 0 here) is empty
-					for i = 1, #idx do
-						if idx[i] >= off then
-							out[#out + 1] = els[i]
-						end
-					end
-					if len ~= nil then
-						local t = {}
-						for i = 1, math.min(len, #out) do
-							t[i] = out[i]
-						end
-						out = t
-					end
-				end
-				els = out
-			else -- $@/$* and assoc: position-based
-				-- bash's assoc-array slice has an off-by-one quirk: offset N starts at
-				-- element N-1 (so :0 and :1 give the same slice). $@/$* are normal.
-				if off > 0 and sh:is_assoc(pe.name) then
-					off = off - 1
-				end
-				els = array_slice(els, off, len)
-			end
+			error({ __curse_exit = 1, __curse_lineabort = true })
 		elseif pe.op == "-" and #els == 0 then -- unset/empty array: the default
 			local d, ds, dq = defval(pe.arg)
 			return d, (dq ~= nil and ds or star), dq
@@ -1782,20 +1767,52 @@ local function multi_elems(sh, p) -- returns element list, star?
 		elseif pe.op == "@" and pe.arg == "A" and pe.name ~= "@" and pe.name ~= "*" then
 			-- ${a[@]@A}: the whole array as the declaration that recreates it (one word)
 			local d = M._int.fmt_decl(sh, pe.name)
+			if sh:declared_unset(pe.name) and sh:attr_string(pe.name) == "" then
+				d = nil -- (`declare v` alone: nothing to recreate)
+			end
 			return d and { d } or {}, star
+		elseif pe.op == "@" and pe.arg == "A" then
+			-- ${@@A}: the `set -- 'p1' 'p2' …` words that recreate the positional params
+			local out = {}
+			if #els > 0 then
+				out[1], out[2] = "set", "--"
+				for i = 1, #els do
+					out[i + 2] = sh:apply_str_op("@", els[i], "Q")
+				end
+			end
+			els = out
+		elseif (pe.op == "@" and (pe.arg == "K" or pe.arg == "k")) and pe.name ~= "@" and pe.name ~= "*" then
+			if pe.arg == "k" then -- ${a[@]@k}: key and value as separate words, alternating
+				local out, idx = {}, sh:array_indices(pe.name)
+				for i = 1, #idx do
+					out[#out + 1] = tostring(idx[i])
+					out[#out + 1] = els[i]
+				end
+				return out, star
+			end
+			-- ${a[@]@K}: ONE word of `key "value"` pairs (assoc's has a trailing blank, bash)
+			if #els == 0 then
+				return {}, star
+			end
+			local parts = M._int.decl_elems(sh, pe.name, '%s %s')
+			return { table.concat(parts, " ") .. (sh:is_assoc(pe.name) and " " or "") }, star
 		elseif pe.op == "@" and pe.arg == "a" then -- ${a[@]@a}: the variable's attribute string, per element
 			local attr = sh:attr_string(pe.name)
 			local out = {}
 			for i = 1, #els do
 				out[i] = attr
 			end
+			-- a declared-but-valueless var (`declare -r v`) still reports its attributes once
+			if #els == 0 and attr ~= "" and sh:declared_unset(pe.name) then
+				out[1] = attr
+			end
 			els = out
 		elseif pe.op and pe.op ~= ":-" and pe.op ~= "-" and pe.op ~= ":+" and pe.op ~= "+" then
 			-- strip/subst/case per element: the PATTERN is quote-aware (a quoted `'*'` is a literal
 			-- `*`, not a glob) — expand_pattern, like the scalar path (getpattern in bash). Only the
-			-- replacement (arg2) is plain quote-removal (expand_word).
+			-- replacement (arg2) expands via expand_repl (tilde + patsub_replacement marking).
 			local arg = pe.arg and expand_pattern(sh, P.parse_word(pe.arg)) or ""
-			local arg2 = pe.arg2 and expand_word(sh, P.parse_word(pe.arg2)) or nil
+			local arg2 = pe.arg2 and expand_repl(sh, P.parse_word(pe.arg2)) or nil
 			local out = {}
 			for i, v in ipairs(els) do
 				out[i] = sh:apply_str_op(pe.op, v, arg, arg2)
@@ -2280,7 +2297,7 @@ local function open_out(sh, path, mode)
 	end
 	return -1
 end
-local function apply_redirs(sh, redirs)
+local function apply_redirs(sh, redirs, cname) -- cname: the command (names {v} errors)
 	io.flush() -- flush pending stdout BEFORE moving fds, else buffered output from a
 	-- prior command would be redirected into (and lost to) the new target
 	local save, ok = {}, true
@@ -2336,12 +2353,15 @@ local function apply_redirs(sh, redirs)
 			end
 			return sh:get(r.fdvar)
 		end
-		local function fdvar_set(v)
+		local function fdvar_set(v) -- false: the variable refused it (a bad nameref target)
 			if fvn then
 				sh:array_set(fvn, array_key(sh, fvn, fvs), v, false)
-			else
-				sh:set_str(r.fdvar, v)
+				return true
 			end
+			rt.assign_ctx = cname
+			local set = sh:set_str(r.fdvar, v)
+			rt.assign_ctx = nil
+			return set ~= false
 		end
 		local fdb = r.fdvar and sh.vars[sh:deref(fvn or r.fdvar)]
 		if fdb and fdb.ro and not ((r.op == "dup" or r.op == "dupin") and r.target == "-") then
@@ -2356,7 +2376,11 @@ local function apply_redirs(sh, redirs)
 				r = setmetatable({ fd = tonumber(fdvar_get()) or -1 }, { __index = r })
 			else
 				local nf = alloc_fd()
-				fdvar_set(tostring(nf))
+				if not fdvar_set(tostring(nf)) then -- (nf is only a free number: nothing opened)
+					io.stderr:write("curse: " .. r.fdvar .. ": cannot assign fd to variable\n")
+					ok = false
+					break
+				end
 				persist[nf] = true
 				r = setmetatable({ fd = nf }, { __index = r }) -- shadow r.fd, inherit op/target
 			end
@@ -2950,6 +2974,21 @@ local function decl_quote(s)
 	s = s:gsub("\\", "\\\\"):gsub('"', '\\"'):gsub("%$", "\\$"):gsub("`", "\\`")
 	return '"' .. s .. '"'
 end
+-- An array's elements as declare-p `fmt` (key, quoted value) strings: `[k]="v"` for
+-- declare -p, `k "v"` for ${a[@]@K}.
+local function decl_elems(sh, name, fmt)
+	local assoc, parts = sh:is_assoc(name), {}
+	for _, k in ipairs(sh:array_indices(name)) do
+		local ks = tostring(k)
+		-- an assoc key with shell metacharacters (or control chars) is quoted like a value
+		-- (and a key that is just `@` or `*`: bash's ALL_ELEMENT_SUB check)
+		if assoc and (ks == "" or ks == "@" or ks == "*" or ks:find("[^%w_%%+,./:@%-]")) then
+			ks = decl_quote(ks)
+		end
+		parts[#parts + 1] = fmt:format(ks, decl_quote(sh:array_get(name, k)))
+	end
+	return parts
+end
 -- Format one variable as a `declare -p` line, or nil if it is unset.
 local function fmt_decl(sh, name)
 	-- SHELLOPTS/BASHOPTS are readonly, exported, derived specials with no var box.
@@ -2964,23 +3003,10 @@ local function fmt_decl(sh, name)
 		return "declare -n" .. (os.getenv(name) ~= nil and "x" or "") .. " " .. name .. "=" .. decl_quote(b.s or "")
 	end
 	if b.assoc or b.arr then
-		-- array/assoc flag letters, bash order: a/A then i(integer) r(readonly) x(export).
-		-- Export shows from the ATTRIBUTE (an array is never in the process env, unlike a
-		-- scalar), verified: `declare -aix` -> `declare -aix`, `declare -Air` -> `declare -Air`.
-		local fl = (b.assoc and "A" or "a")
-			.. (b.int and "i" or "")
-			.. (b.ro and "r" or "")
-			.. (b.exported and "x" or "")
-		local parts = {}
-		for _, k in ipairs(sh:array_indices(name)) do
-			local ks = tostring(k)
-			-- an assoc key with shell metacharacters (or control chars) is quoted like a value
-			-- (and a key that is just `@` or `*`: bash's ALL_ELEMENT_SUB check)
-			if b.assoc and (ks == "" or ks == "@" or ks == "*" or ks:find("[^%w_%%+,./:@%-]")) then
-				ks = decl_quote(ks)
-			end
-			parts[#parts + 1] = "[" .. ks .. "]=" .. decl_quote(sh:array_get(name, k))
-		end
+		-- array/assoc flag letters in bash order (a/A i r x l u); export shows from the
+		-- ATTRIBUTE (an array is never in the process env, unlike a scalar).
+		local fl = sh:attr_string(name)
+		local parts = decl_elems(sh, name, "[%s]=%s")
 		if b.assoc then
 			if #parts == 0 then
 				return b.empty_decl and ("declare -" .. fl .. " " .. name) or ("declare -" .. fl .. " " .. name .. "=()")
@@ -4348,8 +4374,10 @@ exec_stmt = function(sh, st, hook)
 					io.stderr:write("curse: warning: " .. st.name .. ": circular name reference\n")
 					sh.status = 1
 					return
+				elseif nb.outer then -- (a function's self-named ref: bash warns, then writes)
+					io.stderr:write("curse: warning: " .. st.name .. ": circular name reference\n")
 				end
-				nref_base, nref_sub = nb.s:match("^([%a_][%w_]*)%[(.+)%]$")
+				nref_base, nref_sub = (sh:deref_elem(st.name) or ""):match("^([%a_][%w_]*)%[(.+)%]$")
 			end
 		end
 		-- `ref[i]=` where ref is a nameref TO a subscripted element (`a[0]`) would be
@@ -4363,7 +4391,8 @@ exec_stmt = function(sh, st, hook)
 			end
 		end
 		if rb and rb.ro then -- readonly: reject the assignment (status 1); fatal in `sh -c`
-			io.stderr:write("curse: " .. st.name .. ": readonly variable\n") -- or posix mode.
+			-- (or posix mode). Through a nameref bash names the TARGET.
+			io.stderr:write("curse: " .. sh:deref(st.name) .. ": readonly variable\n")
 			sh.status = 1
 			if sh.opt_c or sh.opt_posix then
 				error({ __curse_exit = 1 })
@@ -4739,7 +4768,7 @@ exec_stmt = function(sh, st, hook)
 			io.flush()
 			local ok = true
 			if st.redirs then
-				_, ok = apply_redirs(sh, st.redirs)
+				_, ok = apply_redirs(sh, st.redirs, "exec")
 				if sh.coprocs then
 					rt.coproc_fdcheck(sh) -- a coproc end it closed/moved reads as -1
 				end
@@ -4841,7 +4870,7 @@ exec_stmt = function(sh, st, hook)
 						shadow[#shadow + 1] = { te.name, sh.vars[te.name] }
 						sh.vars[te.name] = te.box or nil
 					end
-					local rok, a1, a2 = pcall(apply_redirs, sh, st.redirs)
+					local rok, a1, a2 = pcall(apply_redirs, sh, st.redirs, args[1])
 					for i = #shadow, 1, -1 do
 						sh.vars[shadow[i][1]] = shadow[i][2]
 					end
@@ -4850,7 +4879,7 @@ exec_stmt = function(sh, st, hook)
 					end
 					save, ok = a1, a2
 				else
-					save, ok = apply_redirs(sh, st.redirs)
+					save, ok = apply_redirs(sh, st.redirs, args[1])
 				end
 				if not ok then
 					sh.status = 1
@@ -4971,6 +5000,9 @@ exec_stmt = function(sh, st, hook)
 							ref = b.ref,
 						} or false,
 					}
+					if b and b.ref then -- a NAMEREF's prefix binding is a plain temporary of its own
+						sh.vars[a.name] = {} -- (bash: the target is untouched; restored below)
+					end
 					if a.raw then -- NAME=(…) as a command prefix is a literal string, not an array (bash)
 						sh:set_str(a.name, a.raw)
 						C.setenv(a.name, a.raw, 1)
@@ -5278,6 +5310,11 @@ exec_stmt = function(sh, st, hook)
 	elseif t == "coproc" then
 		-- coproc NAME cmd: run cmd asynchronously with its stdin/stdout on two pipes whose
 		-- other ends the shell keeps as NAME=(read-fd write-fd); NAME_PID and $! = its pid.
+		if not st.name:match("^[%a_][%w_]*$") then -- `coproc @ {…}`
+			io.stderr:write("curse: `" .. st.name .. "': not a valid identifier\n")
+			sh.status = 1
+			return
+		end
 		rt.need_process(sh)
 		sh.coprocs = sh.coprocs or {}
 		for opid, cp in pairs(sh.coprocs) do -- (bash: one at a time is supported; warn, go on)
@@ -5318,8 +5355,7 @@ exec_stmt = function(sh, st, hook)
 		C.close(w0)
 		C.fcntl(r0, 2, 1) -- F_SETFD FD_CLOEXEC: nothing the shell runs inherits these
 		C.fcntl(w1, 2, 1)
-		sh:array_assign(st.name, { tostring(r0), tostring(w1) }, false)
-		sh:set_str(st.name .. "_PID", tostring(pid))
+		rt.coproc_setvars(sh, st.name, r0, w1, pid)
 		sh.coprocs[pid] = { name = st.name, r = r0, w = w1 }
 		job_add(sh, pid, "coproc " .. st.name)
 		sh.bg_pids = sh.bg_pids or {}
@@ -5649,7 +5685,10 @@ exec_stmt = function(sh, st, hook)
 				end
 				xtrace_line(sh, "for " .. st.name .. " in " .. table.concat(ws, " "))
 			end
-			sh:set_str(st.name, fs.list[fs.idx])
+			if not rt.for_assign(sh, st.name, fs.list[fs.idx]) then
+				bodystatus = 1
+				break
+			end
 			local act = run_loop_body(sh, st.body, hook)
 			bodystatus = sh.status
 			if act == "break" then
@@ -5725,7 +5764,10 @@ exec_stmt = function(sh, st, hook)
 				sh:set_str("REPLY", line)
 				local nsel = line:match("^%s*(%d+)%s*$")
 				nsel = nsel and tonumber(nsel)
-				sh:set_str(st.name, (nsel and list[nsel]) or "")
+				if sh:set_str(st.name, (nsel and list[nsel]) or "") == false then
+					bodystatus = 1
+					break
+				end
 				local act = run_loop_body(sh, st.body, hook)
 				bodystatus = sh.status
 				if act == "break" then
@@ -6270,6 +6312,7 @@ M._int = {
 	do_arrayassign = do_arrayassign,
 	eval = eval,
 	fmt_decl = fmt_decl,
+	decl_elems = decl_elems,
 	fmt_set_var = fmt_set_var,
 	logical_canon = logical_canon,
 	opt_on = opt_on,

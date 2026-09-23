@@ -94,11 +94,11 @@ while true do
 	elseif a == "--rcfile" then
 		rcfile = arg[ai + 1]
 		ai = ai + 2
-	elseif a and a:match("^%-[eiuxCoOlvsBh]+$") and #a > 2 then
-		-- bundled short flags: `-eu`, `-oo errexit noglob`, `-ex` … (bash bundles
-		-- single-char options; each `o`/`O` in the bundle takes the NEXT word as its
-		-- argument, consumed left-to-right).
-		local wi = ai
+	elseif a and a:match("^%-[eiuxCoOlvsBhc]+$") and #a > 2 then
+		-- bundled short flags: `-eu`, `-oo errexit noglob`, `-ex`, `-uc CMD` … (bash
+		-- bundles single-char options; each `o`/`O` in the bundle takes the NEXT word as
+		-- its argument, consumed left-to-right; a `c` is re-queued as a plain `-c`).
+		local wi, has_c = ai, false
 		for k = 2, #a do
 			local f = a:sub(k, k)
 			if f == "e" then
@@ -117,9 +117,15 @@ while true do
 			elseif f == "O" then
 				wi = wi + 1
 				presets[#presets + 1] = { shopt = arg[wi], on = true }
+			elseif f == "c" then
+				has_c = true
 			end -- l/v/s/B/h: accepted no-ops
 		end
 		ai = wi + 1
+		if has_c then
+			ai = ai - 1
+			arg[ai] = "-c" -- (the bundle's last consumed word slot now holds the -c)
+		end
 	elseif a and a:sub(1, 2) == "--" then
 		-- an unrecognized long option (e.g. bash rejects `--rcdir`) is a usage error
 		io.stderr:write("curse: " .. a .. ": invalid option\n")

@@ -45,8 +45,10 @@ return function(sh, cmd, args, hook, tcb)
 					io.stderr:write("curse: printf: `" .. target .. "': bad array subscript\n")
 					sh.status = 2
 				else
-					sh:set_str(target, res)
 					sh.status = st
+					rt.assign_ctx = "printf" -- (a bad nameref target fails it: status 1)
+					sh:set_str(target, res)
+					rt.assign_ctx = nil
 				end
 			end
 		else

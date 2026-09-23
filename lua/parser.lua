@@ -566,6 +566,12 @@ local function scan_braces(s, bi, dq)
 		elseif c == "$" and s:sub(i + 1, i + 1) == "(" then
 			local ok, nj = pcall(scan_cmdsub, s, i + 2) -- a `}` inside $(…) doesn't close
 			i = (ok and nj) or (i + 1)
+		elseif c == "`" then -- …nor one inside `…`
+			i = i + 1
+			while i <= ns and s:sub(i, i) ~= "`" do
+				i = i + (s:sub(i, i) == "\\" and 2 or 1)
+			end
+			i = i + 1
 		elseif c == "}" then
 			depth = depth - 1
 			i = i + 1
@@ -618,8 +624,16 @@ parse_paramexp = function(inner)
 	local special_op = nil
 	do
 		local c1, c2 = inner:sub(1, 1), inner:sub(2, 2)
-		if (c1 == "?" or c1 == "$" or c1 == "-" or c1 == "!") and c2 ~= "" and c2:match("[:%-+=?]") then
+		-- (`$ ? -` take the other operators too; `${!#}`/`${!@}` keep `!` as the indirect
+		-- prefix; bash rejects case modification on `?`/`-` but not on `$`)
+		if
+			(c1 == "?" or c1 == "$" or c1 == "-" or c1 == "!") and c2 ~= "" and c2:match("[:%-+=?]")
+			or (c1 == "?" or c1 == "$" or c1 == "-") and c2 ~= "" and c2:match("[#%%/@]")
+			or c1 == "$" and c2 ~= "" and c2:match("[%^,]")
+		then
 			special_op = c1
+		elseif (c1 == "?" or c1 == "-") and c2 ~= "" and c2:match("[%^,]") then
+			return { pexp = { op = "badsubst", raw = inner } }
 		end
 	end
 	if special_op then
@@ -629,9 +643,16 @@ parse_paramexp = function(inner)
 		inner = inner:sub(2) -- ${!a[@]}
 		-- after `!` (indirect/keys) another prefix operator is a bad substitution
 		-- (`${!!x}`, `${!#x}` are not valid — bash errors).
+		if inner == "#" then
+			return { pexp = { name = "#", op = "indirect" } } -- ${!#}: the last positional
+		end
 		if inner:sub(1, 1) == "!" or inner:sub(1, 1) == "#" then
 			return { pexp = { op = "badsubst", raw = "!" .. inner } }
 		end
+	elseif inner:match("^#[:%-=?+%%/^,@]") and (#inner > 2 or inner == "#:") then
+		-- ${#-x} ${#:+y} ${#%0} ${#:}: `$#` with an operator (the one-char `${#-}` / `${#?}`
+		-- are LENGTHS of $- / $?, below)
+		sharp_op = inner:sub(2)
 	elseif inner:sub(1, 2) == "##" and #inner > 2 then
 		-- ${##X…}: two leading #, then more → the parameter is `#` ($#) and the rest
 		-- is an operator (strip etc.) applied to its value (`${##2}` = ${#} with `#2`
@@ -668,7 +689,8 @@ parse_paramexp = function(inner)
 		-- bash (fails the command, status 1). Multi-char inners are left to the
 		-- lenient var fallback (ksh funsubs `${ …}`/`${| …}`, special-param-plus-op
 		-- like ${?@a} tolerated as empty), to match curse's prior behavior.
-		if #inner == 1 then
+		-- A special `$ ? -` followed by a non-operator (`${$(…)}`, `${?x}`) is one too.
+		if #inner == 1 or inner:match("^[%$?%-]") then
 			return { pexp = { op = "badsubst", raw = inner } }
 		end
 		return { var = inner }
@@ -710,7 +732,13 @@ parse_paramexp = function(inner)
 			return { pexp = { name = name, op = "indices", index = index } }
 		end
 		if rest == "*" or rest == "@" then
+			if not name:match("^[%a_]") then -- ${!1*} ${!@*}: prefix forms need a NAME
+				return { pexp = { op = "badsubst", raw = "!" .. inner } }
+			end
 			return { pexp = { name = name, op = "prefix", star = (rest == "*") } }
+		end
+		if rest ~= "" and not rest:match("^[:%-=?+#%%/^,@]") then -- ${!_Q* } ${!a x}
+			return { pexp = { op = "badsubst", raw = "!" .. inner } }
 		end
 		-- ${!ref OP arg}: capture the trailing operator to apply to the resolved target
 		return { pexp = { name = name, op = "indirect", index = index, iop = (rest ~= "" and rest or nil) } }
@@ -728,7 +756,7 @@ parse_paramexp = function(inner)
 			return { pexp = { name = name, index = index } }
 		end -- ${a[i]}
 		if name:match("^%d+$") then
-			return { param = tonumber(name) }
+			return { param = tonumber(name), braced = true } -- (set -u names it `9`, not `$9`)
 		end
 		if name == "@" or name == "*" then
 			return { special = name }
@@ -767,8 +795,11 @@ parse_paramexp = function(inner)
 		return P({ op = ",,", arg = rest:sub(3) })
 	elseif one == "," then
 		return P({ op = ",", arg = rest:sub(2) })
-	elseif one == "@" then
-		return P({ op = "@", arg = rest:sub(2) }) -- ${x@Q/U/u/L/E}
+	elseif one == "@" then -- ${x@Q/U/u/L/E/…}: exactly one operator letter, else bad
+		if not rest:match("^@[QEPAKaUuLk]$") then
+			return P({ op = "badsubst", raw = name .. (index and "[" .. index .. "]" or "") .. rest })
+		end
+		return P({ op = "@", arg = rest:sub(2) })
 	elseif one == ":" then
 		local body = rest:sub(2)
 		if body == "" then
@@ -2738,6 +2769,11 @@ local function make_parser(src, sh, aenv, noalias, posix, line0)
 		-- Only when `{var}` is immediately followed by a redirection operator.
 		local fdvar = src:match("^{([%a_][%w_]*)}[<>]", p) or src:match("^{([%a_][%w_]*%b[])}[<>]", p)
 		local fd = not fdvar and src:match("^%d+", p) or nil
+		-- a digit prefix that doesn't fit an int isn't an fd: `111…111<f` is a command WORD
+		-- followed by `<f` (bash's read_token_word legal_number/INT_MAX test)
+		if fd and (#fd > 10 or tonumber(fd) > 2147483647) then
+			return nil
+		end
 		local q = fdvar and (p + #fdvar + 2) or (fd and (p + #fd) or p)
 		local c = src:sub(q, q)
 		local op, tfd
@@ -2876,7 +2912,8 @@ local function make_parser(src, sh, aenv, noalias, posix, line0)
 			end
 			local name = "COPROC"
 			if not compound_at(i) then
-				local s, e = src:find("^[%a_][%w_]*", i)
+				-- (any word: an invalid NAME — `coproc @ {…}` — is a runtime error, bash)
+				local s, e = src:find("^[^%s;&|()<>]+", i)
 				if s then
 					local k = e + 1
 					while src:sub(k, k):match("[ \t]") do
@@ -3851,11 +3888,15 @@ local function make_parser(src, sh, aenv, noalias, posix, line0)
 					-- (src/pos: the arg as written and where it sat among the words, for `declare -f`)
 					arrayargs[#arrayargs + 1] =
 						{ name = an, elems = elems, append = (ap == "+"), src = src:sub(a0, i - 1), pos = #words + 1 }
-				elseif cmd1 and cmd1.lit == "let" and src:match("^[%a_][%w_]*%+?=%(", i) then
-					-- `let x=( 1 )`: bash reads a `NAME=( … )` arg to `let` as ONE balanced-
-					-- paren ARITH word (the `( )` group; it is NOT an array literal), so the
-					-- let builtin evaluates `x = (1)`. Capture NAME=( … ) whole (naive paren
-					-- balance — arith rarely quotes a paren) and parse it as a literal word.
+				elseif
+					cmd1
+					and (cmd1.lit == "let" or cmd1.lit == "eval")
+					and src:match("^[%a_][%w_]*%+?=%(", i)
+				then
+					-- `let x=( 1 )` / `eval a=( "$v" )`: bash reads a `NAME=( … )` arg to these
+					-- as ONE word, parens and blanks included (not an array literal here):
+					-- let evaluates `x = (1)`, eval re-parses the text. Capture NAME=( … )
+					-- whole (balanced, quote-aware) and parse it as a single word.
 					local st, depth = i, 0
 					i = i + #src:match("^[%a_][%w_]*%+?=", i) -- past NAME(+)=; now on `(`
 					repeat
@@ -3864,6 +3905,14 @@ local function make_parser(src, sh, aenv, noalias, posix, line0)
 							depth = depth + 1
 						elseif ch == ")" then
 							depth = depth - 1
+						elseif ch == "\\" then
+							i = i + 1
+						elseif ch == "'" or ch == '"' then
+							local close = src:find(ch == "'" and "'" or '[\\"]', i + 1)
+							while close and ch == '"' and src:sub(close, close) == "\\" do
+								close = src:find('[\\"]', close + 2)
+							end
+							i = close or n
 						end
 						i = i + 1
 					until depth == 0 or i > n

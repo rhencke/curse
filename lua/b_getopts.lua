@@ -150,11 +150,13 @@ return function(sh, cmd, args, hook, tcb)
 			elseif res.err or res.clr then
 				optarg_set(nil)
 			end
-			if valid then
-				sh:set_str(vname, optarg_ro and "?" or res.opt)
+			if res.err then -- (bash's sh_getopt: `$0: illegal option -- h`, no line number)
+				io.stderr:write((sh.argv0 or "curse") .. ": " .. res.err .. "\n")
 			end
-			if res.err then
-				io.stderr:write("curse: " .. res.err .. "\n")
+			if valid then
+				rt.assign_ctx = "getopts"
+				sh:set_str(vname, optarg_ro and "?" or res.opt)
+				rt.assign_ctx = nil
 			end
 			sh.status = valid and 0 or 1
 		end

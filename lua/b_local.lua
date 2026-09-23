@@ -126,12 +126,7 @@ return function(sh, cmd, args, hook, tcb)
 				local vname = nm or a
 				sh:localVar(vname)
 				if nref then
-					if not sh:make_nameref(nm or vname, val) then
-						io.stderr:write(
-							"curse: local: `"
-								.. (nm and (val or "") or (sh.vars[vname] and sh.vars[vname].s or ""))
-								.. "': invalid variable name for name reference\n"
-						)
+					if not sh:nameref_decl("local", nm or vname, val, true) then
 						lok = false
 					end
 				elseif plusn then

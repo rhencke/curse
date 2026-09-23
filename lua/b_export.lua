@@ -292,6 +292,7 @@ return function(sh, cmd, args, hook, tcb)
 				sh.status = allok and 0 or 1
 			end
 		else
+			rt.assign_ctx = cmd -- (a bad nameref target is `declare: `/': not a valid identifier')
 			local roattr = (cmd == "readonly") or rattr
 			-- `declare`/`typeset` in a function make each name LOCAL (like `local`),
 			-- unless -g; `export`/`readonly` always act on the global var (bash).
@@ -339,9 +340,13 @@ return function(sh, cmd, args, hook, tcb)
 					goto continue
 				end
 				local nm, op, val = a:match("^([%a_][%w_]*)(%+?=)(.*)$")
-				if nm and sh.vars[sh:deref(nm)] and sh.vars[sh:deref(nm)].ro then
+				-- (`declare -n ref=x` re-points the ref: the REF's own readonly-ness counts)
+				local rov = nm and sh.vars[nref and nm or sh:deref(nm)]
+				if rov and rov.ro then
 					-- reassigning a readonly variable is rejected (bash: `typeset +r r=v` too)
-					io.stderr:write("curse: " .. cmd .. ": " .. nm .. ": readonly variable\n")
+					-- (declare/typeset name themselves; export/readonly don't, like bash)
+					local pfx = (cmd == "export" or cmd == "readonly") and "" or (cmd .. ": ")
+					io.stderr:write("curse: " .. pfx .. nm .. ": readonly variable\n")
 					allok = false
 				elseif nm and (aattr or assoc) and val:sub(1, 1) == "(" and val:sub(-1) == ")" then
 					-- dynamic array literal: `declare -a "x=(1 2 3)"` (the -a/-A flag is required)
@@ -366,14 +371,7 @@ return function(sh, cmd, args, hook, tcb)
 					end
 					local ap = (op == "+=")
 					if nref then
-						if not sh:make_nameref(nm, val) then
-							io.stderr:write(
-								"curse: "
-									.. cmd
-									.. ": `"
-									.. (val or "")
-									.. "': invalid variable name for name reference\n"
-							)
+						if not sh:nameref_decl(cmd, nm, val, localize) then
 							allok = false
 						end
 					elseif iattr then -- declare -i: arith-evaluate the value, mark integer
@@ -423,6 +421,9 @@ return function(sh, cmd, args, hook, tcb)
 							C.setenv(nm, xval, 1)
 						end
 					end
+					if plusn then -- `typeset +n ref=v`: v went THROUGH the ref; then it's plain
+						sh:unref(nm)
+					end
 				elseif a:match("^[%a_][%w_]*$") then
 					if localize then
 						sh:localVar(a)
@@ -430,24 +431,19 @@ return function(sh, cmd, args, hook, tcb)
 					if plusn then
 						sh:unref(a)
 					elseif nref then
-						if not sh:make_nameref(a) then -- existing value is an invalid nameref target
-							io.stderr:write(
-								"curse: "
-									.. cmd
-									.. ": `"
-									.. (sh.vars[a] and sh.vars[a].s or "")
-									.. "': invalid variable name for name reference\n"
-							)
+						if not sh:nameref_decl(cmd, a, nil, localize) then -- (an invalid existing value…)
 							allok = false
 						end
 					elseif iattr and not ((assoc or aattr) and cmd ~= "readonly") then
-						sh.vars[a] = sh.vars[a] or {}
-						sh.vars[a].int = true
+						local dn = sh:deref(a) -- (through a nameref: the target, created if need be)
+						sh.vars[dn] = sh.vars[dn] or {}
+						sh.vars[dn].int = true
 					elseif (lattr or uattr or cattr) and not ((assoc or aattr) and cmd ~= "readonly") then
-						sh.vars[a] = sh.vars[a] or {}
-						sh.vars[a].lower = lattr or nil
-						sh.vars[a].upper = uattr or nil
-						sh.vars[a].cap = cattr or nil
+						local dn = sh:deref(a)
+						sh.vars[dn] = sh.vars[dn] or {}
+						sh.vars[dn].lower = lattr or nil
+						sh.vars[dn].upper = uattr or nil
+						sh.vars[dn].cap = cattr or nil
 					elseif assoc and cmd ~= "readonly" then -- bash forbids converting an existing indexed array to associative
 						-- (`readonly -A` with NO value does NOT apply the attribute — bash then
 						-- shows just `declare -r`, so let it fall through to the plain-var branch)
@@ -494,6 +490,10 @@ return function(sh, cmd, args, hook, tcb)
 						sh.vars[a] = sh.vars[a] or {}
 					end -- `declare x` (or `readonly -a/-A` with no value) creates a declared-but-unset var
 					local bb = sh.vars[sh:deref(a)]
+					if not bb and not nref and (roattr or doexport) then -- `readonly ref`: the
+						bb = {} -- nameref's (unset) target gets the attribute, and so exists
+						sh.vars[sh:deref(a)] = bb
+					end
 					if bb and (assoc or aattr) and cmd ~= "readonly" and not nref then -- (`declare -Ai`: both)
 						if iattr then
 							bb.int = true
@@ -546,7 +546,10 @@ return function(sh, cmd, args, hook, tcb)
 					end
 					-- bash creates the element for declare/typeset/local, but NOT via a
 					-- deferred `readonly a[i]=v` / `export a[i]=v` (those fail, status 1).
-					if anm and (cmd == "declare" or cmd == "typeset") then
+					if anm and nref then -- `declare -n a[3]=x`
+						io.stderr:write("curse: " .. cmd .. ": " .. anm .. "[" .. sub .. "]: reference variable cannot be an array\n")
+						allok = false
+					elseif anm and (cmd == "declare" or cmd == "typeset") then
 						if localize then
 							sh:localVar(anm)
 						end
@@ -564,6 +567,7 @@ return function(sh, cmd, args, hook, tcb)
 				end
 				::continue::
 			end
+			rt.assign_ctx = nil
 			if unswap then
 				if sh.arrayargs_pending then
 					sh.pending_unswap = unswap -- (interp assigns the NAME=(…) literals next)

@@ -1866,7 +1866,7 @@ emit_word = function(w, lifted)
 				or lifted[p.var] and ("rt.i64_to_str(%s)"):format(lname(p.var))
 				or ("sh:get_u(%q)"):format(p.var)
 		elseif p.param then
-			parts[#parts + 1] = ("sh:param(%d)"):format(p.param)
+			parts[#parts + 1] = ("sh:param_u(%d, %s)"):format(p.param, tostring(p.braced or false))
 		elseif p.special then
 			if p.special == "#" then
 				parts[#parts + 1] = "tostring(sh.nparams)"
@@ -2300,9 +2300,11 @@ local function array_multi_op(pe)
 		return true
 	end -- bare ${a[@]} / ${a[*]} (bare $@/$* is p.special, not here)
 	if pe.op == "@" then
-		return PEXP_AT[pe.arg] and pe.arg ~= "a" and not (is_arr and pe.arg == "A") and true or false
-	end -- ${a[@]@Q} … (@a — a per-element attr string — and ${a[@]@A} — the whole array's
-	-- declaration — stay with interp: neither is a per-element apply_str_op)
+		return PEXP_AT[pe.arg] and pe.arg ~= "a" and not (is_arr and (pe.arg == "A" or pe.arg == "K" or pe.arg == "k"))
+			and true
+			or false
+	end -- ${a[@]@Q} … (@a — a per-element attr string — and ${a[@]@A/@K/@k} — whole-array
+	-- declaration / key-value forms — stay with interp: none is a per-element apply_str_op)
 	if pe.op == "sub" then
 		return pexp_word_args_ok(pe)
 	end -- ${a[@]:off:len} slice
@@ -2438,12 +2440,12 @@ function pexp_scalar(pe, lifted)
 	if pe.op == "sub" then -- ${v:off:len}: arith-eval off/len (nil-coerced to 0 for a present
 		-- operand, like interp), then substr by codepoint via apply_str_op("sub").
 		local P = require("parser")
-		local off = ("(rt.arith_int(sh, %s) or 0)"):format(emit_word(P.parse_word(pe.arg or ""), lifted))
+		local off = ("(rt.substr_arith(sh, %q, %s) or 0)"):format(require("runtime").pe_label(pe), emit_word(P.parse_word(pe.arg or ""), lifted))
 		if pe.arg2 == nil then
 			return ('sh:apply_str_op("sub", %s, %s)'):format(val, off)
 		end
-		local len = ("(rt.arith_int(sh, %s) or 0)"):format(emit_word(P.parse_word(pe.arg2), lifted))
-		return ('sh:apply_str_op("sub", %s, %s, %s)'):format(val, off, len)
+		local len = ("(rt.substr_arith(sh, %q, %s) or 0)"):format(require("runtime").pe_label(pe), emit_word(P.parse_word(pe.arg2), lifted))
+		return ('sh:apply_str_op("sub", %s, %s, %s, %q)'):format(val, off, len, pe.arg2)
 	end
 	-- strip/subst/case (PEXP_STROP): a plain literal pattern is passed verbatim (apply_str_op
 	-- globs it); a dynamic/quoted pattern is rendered mask-aware via emit_pattern_glob to the
@@ -2537,7 +2539,7 @@ local function emit_scalar_val(p, i, lifted, tilde, w)
 			or lifted[p.var] and ("rt.i64_to_str(%s)"):format(lname(p.var))
 			or ("sh:get_u(%q)"):format(p.var)
 	elseif p.param then
-		return ("sh:param(%d)"):format(p.param)
+		return ("sh:param_u(%d, %s)"):format(p.param, tostring(p.braced or false))
 	elseif p.special == "#" then
 		return "tostring(sh.nparams)"
 	elseif p.special == "?" then
@@ -2609,10 +2611,10 @@ local function emit_seg(p, i, lifted, w)
 			elems = ("rt.array_index_strs(sh, %s)"):format(aname)
 		elseif pe.op == "sub" then -- ${a[@]:off:len} / ${@:off:len} slice: arith off/len, then select
 			local P = require("parser")
-			local off = ("(rt.arith_int(sh, %s) or 0)"):format(emit_word(P.parse_word(pe.arg or ""), lifted))
-			local len = pe.arg2 and ("(rt.arith_int(sh, %s) or 0)"):format(emit_word(P.parse_word(pe.arg2), lifted))
+			local off = ("(rt.substr_arith(sh, %q, %s) or 0)"):format(require("runtime").pe_label(pe), emit_word(P.parse_word(pe.arg or ""), lifted))
+			local len = pe.arg2 and ("(rt.substr_arith(sh, %q, %s) or 0)"):format(require("runtime").pe_label(pe), emit_word(P.parse_word(pe.arg2), lifted))
 				or "nil"
-			elems = ("rt.array_slice_values(sh, %s, %s, %s, %s)"):format(aname, elems, off, len)
+			elems = ("rt.array_slice_values(sh, %s, %s, %s, %s, %q)"):format(aname, elems, off, len, pe.arg2 or "")
 		elseif ARRAY_DEFAULT[pe.op] then -- ${a[@]:-def}/-/:+/+ : the value list, or the default
 			-- as a SINGLE field (rt.expand_fields then splits/keeps it per the outer q, exactly
 			-- bash's field-wise default). null test grounded in bash string_list_dollar_at/_star:
@@ -5361,13 +5363,26 @@ H.forin = function(cx, st, after)
 		cx.blocks[initp] = ("if rt.for_var_ro(sh, %q) then pc = %d else %s end"):format(st.name, after, cx.blocks[initp])
 	end
 	-- DEBUG fires at the `for` header before each iteration (bash), with an element present.
-	cx.blocks[advp] = ("local fs = sh.forstate[%d]; fs.idx = fs.idx + 1; if fs.idx > #fs.list then pc = %d else sh:set_str(%q, fs.list[fs.idx]); %spc = %d end"):format(
-		st.id,
-		after,
-		st.name,
-		dbg(st),
-		bodyentry
-	)
+	-- (a nameref program: rt.for_assign re-points a nameref loop variable, and a failed
+	-- assignment — a bad target — ends the loop with status 1)
+	if EF.has_nameref then
+		cx.blocks[advp] = ("local fs = sh.forstate[%d]; fs.idx = fs.idx + 1; if fs.idx > #fs.list then pc = %d elseif not rt.for_assign(sh, %q, fs.list[fs.idx]) then sh.status = 1; pc = %d else %spc = %d end"):format(
+			st.id,
+			after,
+			st.name,
+			after,
+			dbg(st),
+			bodyentry
+		)
+	else
+		cx.blocks[advp] = ("local fs = sh.forstate[%d]; fs.idx = fs.idx + 1; if fs.idx > #fs.list then pc = %d else sh:set_str(%q, fs.list[fs.idx]); %spc = %d end"):format(
+			st.id,
+			after,
+			st.name,
+			dbg(st),
+			bodyentry
+		)
+	end
 	return initp
 end
 
