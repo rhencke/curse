@@ -4171,6 +4171,58 @@ function M.posix_arith_fatal(sh, err)
 		error({ __curse_exit = sh.opt_c and 127 or 1 }, 0)
 	end
 end
+-- bash's shell_compatibility_level from $BASH_COMPAT (`5.1` or `51`); 52 when unset/invalid
+function M.compat_level(sh)
+	local v = sh:get("BASH_COMPAT")
+	local a, b = v:match("^(%d)%.(%d)$")
+	local n = a and tonumber(a .. b) or (v:match("^%d%d$") and tonumber(v))
+	return n or 52
+end
+-- bash's valid_array_reference: `NAME`, or `NAME[SUB]` whose subscript's brackets balance
+-- exactly to the end (`A[]]` is not one). Returns name, sub (nil for a plain name), or nil.
+function M.split_array_ref(s)
+	local name, rest = s:match("^([%a_][%w_]*)(.*)$")
+	if not name then
+		return nil
+	end
+	if rest == "" then
+		return name
+	end
+	if rest:sub(1, 1) ~= "[" then
+		return nil
+	end
+	local depth, n = 0, #rest
+	for i = 1, n do
+		local c = rest:sub(i, i)
+		if c == "[" then
+			depth = depth + 1
+		elseif c == "]" then
+			depth = depth - 1
+			if depth == 0 then
+				if i ~= n or i == 2 then
+					return nil -- (text after the subscript, or an empty one)
+				end
+				return name, rest:sub(2, n - 1)
+			end
+		end
+	end
+	return nil
+end
+-- A builtin assigning to a NAME it was given (read, printf -v, …): a plain name or an array
+-- element; anything else is `cmd: `A[]]': not a valid identifier` (status 1). false = refused.
+function M.assign_ref(sh, cmd, ref, value)
+	local name, sub = M.split_array_ref(ref)
+	if not name then
+		io.stderr:write("curse: " .. cmd .. ": `" .. ref .. "': not a valid identifier\n")
+		sh.status = 1
+		return false
+	end
+	if sub then
+		sh:array_set(name, require("interp")._int.array_key(sh, name, sub), value, false)
+		return true
+	end
+	return sh:set_str(name, value) ~= false
+end
 -- $! : under set -u, unbound until a background job exists (bash names the bare form
 -- `$!`, the braced one `!`)
 function M.last_bg_u(sh, braced)
@@ -4571,6 +4623,7 @@ function Shell:array_set(name, key, val, append)
 	if b.assoc and b.arr[key] == nil then
 		b.order[#b.order + 1] = key
 	end
+	b.empty_decl = nil -- (it has had an element: emptied later, it shows as `=()`)
 	if b.int then -- declare -i array: elements are arithmetic (+= adds) — bash
 		local v = M.arith_str(self, val)
 		if append then
@@ -4682,6 +4735,14 @@ function Shell:array_unset(name, key)
 	local k = norm_key(b, key)
 	if type(k) == "number" and k < 0 then
 		return false
+	end
+	if b.assoc and b.arr[k] ~= nil and b.order then -- (and out of the insertion order: a
+		for i = #b.order, 1, -1 do -- re-set key is new, not listed twice)
+			if b.order[i] == k then
+				table.remove(b.order, i)
+				break
+			end
+		end
 	end
 	b.arr[k] = nil
 	return true
@@ -6848,7 +6909,17 @@ function M.assign_element_x(sh, name, src, value, append)
 	elseif src:match("^%s*$") then
 		key = 0
 	else
-		local ok, v = pcall(M.arith_str, sh, src)
+		local ok, v
+		if src:find("[$`]") then -- (the subscript is EXPANDED text: a `$(` in the value is
+			-- just a character to the arithmetic, never run — interp's EXP_EXPANDED parse)
+			local P = require("parser")
+			local sc, sx = P.arith_cmd, sh.arith_expanded
+			P.arith_cmd, sh.arith_expanded = nil, true
+			ok, v = pcall(require("interp").arith_eval_str, sh, src)
+			P.arith_cmd, sh.arith_expanded = sc, sx
+		else
+			ok, v = pcall(M.arith_str, sh, src)
+		end
 		if not ok then
 			if not (type(v) == "table" and v.__curse_matherr) then -- (arith_str reported it)
 
@@ -6873,6 +6944,7 @@ end
 -- interp's array_key: an ASSOC uses the word-expanded subscript (`expanded`, built by emit_word
 -- for the caller); an INDEXED array arith-evaluates the RAW subscript (empty -> 0). A subscript
 -- arith syntax error (`${a['3']}`) becomes the tier's non-fatal lineabort (interp's experr).
+local SUBSCRIPT_AST = {} -- raw subscript text -> parsed arith (bounded by the program text)
 function M.array_key(sh, name, raw, expanded)
 	if sh:is_assoc(name) then
 		return expanded
@@ -6880,18 +6952,25 @@ function M.array_key(sh, name, raw, expanded)
 	if raw:match("^%s*$") then
 		return 0
 	end
-	local ok, v = pcall(function()
-		return M.to_arr_key(M.arith_str(sh, raw))
-	end)
-	if not ok then
-		if not (type(v) == "table" and v.__curse_matherr) then -- (arith_str reported it)
-
-			io.stderr:write("curse: " .. require("parser").arith_errmsg(raw, v) .. "\n")
-
+	-- the parsed subscript is cached per raw text; interp's arith_key evaluates it (natively
+	-- when it can; a non-numeric $name takes bash's textual path, quoted as a subscript) and
+	-- makes any error abandon the line
+	local idx = SUBSCRIPT_AST[raw]
+	if idx == nil then
+		if raw:find("[$`]") then -- (an expansion: the deferred node that knows bash's text rules)
+			idx = { k = "xpand", raw = raw }
+		else
+			local pok, ast = pcall(require("parser").arith, raw, true)
+			idx = pok and ast or false
 		end
+		SUBSCRIPT_AST[raw] = idx
+	end
+	if not idx then
+		local _, perr = pcall(require("parser").arith, raw)
+		io.stderr:write("curse: " .. require("parser").arith_errmsg(raw, perr) .. "\n")
 		error({ __curse_exit = 1, __curse_lineabort = true })
 	end
-	return v
+	return require("interp")._int.arith_key(sh, name, idx, raw)
 end
 
 -- Scalar `name+=value` (non-index) for the compiled tier, exactly interp's append path: an
@@ -8046,8 +8125,8 @@ function M.db_arith(sh, s)
 	if ok then
 		return v
 	end
-	if type(v) == "table" and v.__curse_matherr then
-		sh.db_err = true
+	if type(v) == "table" and v.__curse_matherr and not v.__curse_subscript then -- (a
+		sh.db_err = true -- subscript's error abandons the line instead)
 		return i64(0)
 	end
 	error(v, 0)
@@ -8155,7 +8234,7 @@ end
 -- (no $): an ASSOC key is used verbatim, an INDEXED subscript is arith-evaluated via
 -- rt.arith_str (native; a nested-subscript operand defers through arith_str's seam). A
 -- bare array name tests element 0 (like bash); a digit is a positional parameter.
-function M.var_is_set(sh, nm)
+function M.var_is_set(sh, nm, expanded)
 	local base, sub = nm:match("^([%a_][%w_]*)%[(.+)%]$")
 	if base then
 		local b = sh.vars[sh:deref(base)]
@@ -8169,8 +8248,9 @@ function M.var_is_set(sh, nm)
 		local key
 		if sh:is_assoc(base) then
 			-- an associative subscript is word-expanded (`test -v 'm[$k]'` looks up $k's value)
+			-- — except in [[ -v ]], whose word was expanded already (`expanded`): literal then
 			key = sub
-			if sub:find("[$`\\'\"]") then
+			if not (expanded or sh.shopt.assoc_expand_once) and sub:find("[$`\\'\"]") then
 				key = require("interp")._int.array_key(sh, base, sub)
 			end
 		else
@@ -8512,12 +8592,18 @@ end
 -- 1/2/3-arg special cases) then a recursive-descent parser (or->and->term, `-o` lowest /
 -- `-a` / `!` / `( )`), consuming terms strictly left-to-right so `-o`/`-a` can be an
 -- OPERAND where one is expected.
+-- a test/[ syntax error: bash's `test: a: binary operator expected` (status 2)
+local function test_error(sh, args, e)
+	if type(e) == "table" and e.__test_syntax then
+		io.stderr:write("curse: " .. args[1] .. ": " .. e.__test_syntax .. "\n")
+	end
+	sh.status = 2
+end
 local function do_test(sh, args)
 	local lo, hi = 2, #args
 	if args[1] == "[" then
 		if args[hi] ~= "]" then
-			sh.status = 2
-			return
+			return test_error(sh, args, { __test_syntax = "missing `]'" })
 		end
 		hi = hi - 1
 	end
@@ -8526,8 +8612,21 @@ local function do_test(sh, args)
 	if n <= 3 then
 		local ok, v = pcall(test_simple, sh, args, lo, n)
 		if not ok then
-			sh.status = 2
-			return
+			return test_error(sh, args, v)
+		end
+		sh.status = v and 0 or 1
+		return
+	end
+	-- four args (POSIX, as bash): `! A B C` negates the three-arg test, `( A B )` is the
+	-- two-arg one; otherwise the full expression parser
+	if n == 4 and (args[lo] == "!" or (args[lo] == "(" and args[hi] == ")")) then
+		local neg = args[lo] == "!"
+		local ok, v = pcall(test_simple, sh, args, lo + 1, neg and 3 or 2)
+		if not ok then
+			return test_error(sh, args, v)
+		end
+		if neg then
+			v = not v
 		end
 		sh.status = v and 0 or 1
 		return
@@ -8643,8 +8742,7 @@ local function do_test(sh, args)
 		end
 	end)
 	if not ok then
-		sh.status = 2
-		return
+		return test_error(sh, args, res)
 	end
 	sh.status = res and 0 or 1
 end

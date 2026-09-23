@@ -562,7 +562,10 @@ return function(sh, cmd, args, hook, tcb)
 						if roattr and bb then
 							bb.ro = true
 						end
-					else
+					else -- (`A[]]=X`: no valid subscript; `readonly a[1]=v`: not assignable here)
+						io.stderr:write(
+							"curse: " .. cmd .. ": `" .. (anm and (anm .. "[" .. sub .. "]") or a) .. "': not a valid identifier\n"
+						)
 						allok = false
 					end
 				else -- a token that isn't a valid name (`FOO-BAR`, `1x`, …): bash errors

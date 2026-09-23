@@ -761,7 +761,13 @@ local function not_compilable(e)
 		return true
 	end -- comma recurses (emit_value / emit_arith_into render the sequence)
 	if e.k == "xpand" then
-		return not xpand_fast(e.raw)
+		if not xpand_fast(e.raw) then
+			return true
+		end
+		-- a fast xpand renders as a VALUE: one whose native tree assigns (`a[$k]=7`,
+		-- `$x++`) can't, so the word delegates
+		local ok, nat = pcall(require("parser").arith, e.raw, true)
+		return not ok or arith_side_effect(nat) or not_compilable(nat)
 	end -- a fast $name xpand compiles
 	return not_compilable(e.e)
 		or not_compilable(e.l)
@@ -2025,7 +2031,7 @@ emit_dbracket_node = function(node, lifted)
 		-- a literal -> rt.var_is_set is native. -o (shell option) still needs SETOPT/opt_on ->
 		-- interp seam. Every other unary is a file predicate -> the pure-FFI runtime primitive.
 		if op == "-v" then
-			return ("rt.var_is_set(sh, %s)"):format(val)
+			return ("rt.var_is_set(sh, %s, true)"):format(val)
 		end
 		if op == "-o" then
 			return ("I.dbracket_unary(sh, %q, %s)"):format(op, val)
@@ -2139,6 +2145,10 @@ local function pexp_word_args_ok(pe)
 		end
 		if a:find("%$[@*]") or a:find("%${[@*]") or a:find("%[[@*]%]") then
 			return false -- a multi-word operand ($@, $*, ${a[@]}): interp keeps its fields
+		end
+		if a:find("%[[^%]]*[$`]") then
+			return false -- an expansion INSIDE a subscript (`A[$k]`): its value is quoted the
+			-- arithmetic way (interp's arith_expand_text), not re-expanded after emit_word
 		end
 		local ok, w = pcall(require("parser").parse_word, a)
 		return ok and emitable_word(w) or false
@@ -4465,6 +4475,20 @@ simple_compiled = function(cx, st, after)
 			return cx.delegate(st, after)
 		end
 	end
+	-- `unset map["$key"]`: the quoted subscript parts must not be expanded twice — interp's
+	-- expand_args protects them (unset_arrayref); delegate rather than duplicate that
+	if cmd == "unset" then
+		for j = 2, #st.words do
+			local ps = st.words[j].parts
+			if ps[1] and ps[1].lit and not ps[1].q and ps[1].lit:match("^[%a_][%w_]*%[") then
+				for k = 2, #ps do
+					if ps[k].q then
+						return cx.delegate(st, after)
+					end
+				end
+			end
+		end
+	end
 	-- `exec` with ONLY redirects and no command word (`exec > log`, `exec 3< f`,
 	-- `exec 2>&1`): a PERSISTENT redirect — apply the redirs to the shell's own fds and do
 	-- NOT restore (they outlive the statement), status 0 / 1 on failure, exactly interp's
@@ -5136,7 +5160,7 @@ H.arithcmd = function(cx, st, after)
 		-- flagged read fault) as $?=1 and continue, like interp; re-raise anything else.
 		sbody = (
 			"do local __ia = sh.in_arithcmd; sh.arithfault = false; sh.in_arithcmd = true; local __ok, __v = pcall(function() local __ar = 0LL; %s; return (__ar ~= 0LL) and 0 or 1 end); sh.in_arithcmd = __ia; "
-			.. "if not __ok then if type(__v) == 'table' and __v.__curse_matherr then sh.status = 1 else error(__v) end "
+			.. "if not __ok then if type(__v) == 'table' and __v.__curse_matherr and not __v.__curse_subscript then sh.status = 1 else error(__v) end "
 			.. "elseif sh.arithfault then sh.status = 1 else sh.status = __v end end"
 		):format(code)
 	elseif arith_can_error(st.expr, cx.lifted) then

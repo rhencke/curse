@@ -184,17 +184,21 @@ return function(sh, cmd, args, hook, tcb)
 				if #vars == 0 then
 					sh:set_str("REPLY", plain)
 				else
-					sh:set_str(vars[1], plain)
+					rt.assign_ref(sh, "read", vars[1], plain)
 					for k = 2, #vars do
-						sh:set_str(vars[k], "")
+						rt.assign_ref(sh, "read", vars[k], "")
 					end
 				end
 			elseif #vars == 0 then
 				sh:set_str("REPLY", (line:gsub("\1(.)", "%1"))) -- REPLY: raw line, unescape CTLESC markers
 			else
 				local fields = read_split(ifs, line, #vars)
+				local ok = true
 				for k = 1, #vars do
-					sh:set_str(vars[k], fields[k] or "")
+					ok = rt.assign_ref(sh, "read", vars[k], fields[k] or "") and ok
+				end
+				if not ok then
+					return -- (status 1: a name that isn't a variable reference)
 				end
 			end
 			sh.status = had_nl and 0 or 1

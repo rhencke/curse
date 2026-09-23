@@ -636,6 +636,8 @@ local indirect_part -- forward (${!ref} target resolution, re-parsed to a part)
 local eval -- arithmetic evaluator (forward decl)
 local arith_resolve -- var-value-as-arith-expression resolver (forward decl)
 local arith_key -- array subscript in arith: string key for assoc, number for indexed
+local xpand_subdepth -- 1 while arith_key evaluates an xpand subscript (see arith_key)
+local in_expanded_text -- evaluating arith_textual_eval's expanded text (see there)
 local run_trap -- trap-handler runner (forward decl; defined near the bottom)
 local fire_err -- ERR-trap + errexit enforcement (forward decl; defined near exec_list)
 local fire_err_trap -- the ERR-trap half of fire_err WITHOUT errexit-exit (used inside handlers)
@@ -667,7 +669,10 @@ arith_resolve = function(sh, s)
 	-- A nested bad value (rare: `s=t; t='1 2'`) stays swallowed as 0, matching the
 	-- previous behavior; but a genuine arith error during eval (syntax/math, e.g. a
 	-- bad subscript) propagates so the command fails like bash instead of yielding 0.
+	local sv = in_expanded_text
+	in_expanded_text = true -- (a value is expansion output: its subscripts expand unquoted)
 	local ok2, v = pcall(eval, sh, ast)
+	in_expanded_text = sv
 	if not ok2 then
 		if type(v) == "table" and (v.__curse_experr or v.__curse_matherr) then
 			error(v)
@@ -703,8 +708,8 @@ end
 -- characters and backslashes stay as they are (a `\` still stops the `$` after it from
 -- expanding: `(( '\$(cmd)' ))` runs nothing); `"` drops. Each $…/`…` expansion is
 -- substituted as literal text.
-local function arith_expand_text(sh, raw)
-	local out, k, n, depth = {}, 1, #raw, 0
+local function arith_expand_text(sh, raw, depth0) -- depth0: 1 = the text IS a subscript
+	local out, k, n, depth = {}, 1, #raw, depth0 or 0
 	while k <= n do
 		local c = raw:sub(k, k)
 		if c == "\\" then
@@ -728,7 +733,8 @@ local function arith_expand_text(sh, raw)
 				local ok, ni = pcall(P.scan_cmdsub, raw, k + 2)
 				e = ok and ni - 1 or n
 			elseif nx == "{" then
-				e = P.scan_braces(raw, k + 1) - 1
+				local ok, ni = pcall(P.scan_braces, raw, k + 1)
+				e = ok and ni - 1 or n
 			else
 				e = select(2, raw:find("^[%a_][%w_]*", k + 1)) or (nx:match("^[%d@*#?$!%-]$") and k + 1) or k
 			end
@@ -750,14 +756,23 @@ local function arith_expand_text(sh, raw)
 	end
 	return table.concat(out)
 end
-function M.arith_textual_eval(sh, raw)
-	local text = arith_expand_text(sh, raw)
+function M.arith_textual_eval(sh, raw, depth0)
+	local text = arith_expand_text(sh, raw, depth0)
 	local pok, ast = pcall(P.arith, text, "strict")
 	if not pok then -- the EXPANDED text isn't valid arithmetic: an arith error (bash), not a crash
 		io.stderr:write("curse: " .. P.arith_errmsg(text, ast) .. "\n")
 		error({ __curse_exit = 1, __curse_matherr = true, __curse_lineabort = true })
 	end
-	return eval(sh, ast)
+	-- (this text is expansion OUTPUT: a `$key` subscript in it expands at evaluation, as
+	-- bash's evalexp does — unquoted, unlike one written in the source; see arith_key)
+	local sv = in_expanded_text
+	in_expanded_text = true
+	local ok, v = pcall(eval, sh, ast)
+	in_expanded_text = sv
+	if not ok then
+		error(v, 0)
+	end
+	return v
 end
 eval = function(sh, e)
 	local k = e.k
@@ -830,7 +845,9 @@ eval = function(sh, e)
 				error(r)
 			end
 		end
-		return M.arith_textual_eval(sh, e.raw)
+		local sd = xpand_subdepth
+		xpand_subdepth = nil -- (only this node is the subscript; nested ones say so themselves)
+		return M.arith_textual_eval(sh, e.raw, sd)
 	end
 	if k == "xpandleaf" then -- an opaque ${…} operand: expand it; a non-numeric value must
 		local v = expand_word(sh, P.parse_word(e.raw)) -- take bash's textual substitution path
@@ -1032,7 +1049,7 @@ function M.arith_read(sh, name)
 		return v
 	end
 	if type(v) == "table" and (v.__curse_matherr or v.__curse_experr) then
-		if sh.in_arithcmd then
+		if sh.in_arithcmd and not v.__curse_subscript then -- (a subscript's error aborts)
 			sh.arithfault = true
 			return i64(0)
 		end
@@ -1077,9 +1094,18 @@ arith_key = function(sh, name, idxexpr, idxraw)
 		P.arith_cmd = sv
 		error({ __curse_exit = 1, __curse_matherr = true, __curse_experr = true })
 	end
+	-- (an expansion in the subscript that needs bash's textual substitution is quoted as
+	-- within a subscript: an error shows `0\],b\[1` — the xpand node reads this)
+	local sd = xpand_subdepth
+	xpand_subdepth = idxexpr.k == "xpand" and not in_expanded_text and 1 or nil
 	local ok, v = pcall(eval, sh, idxexpr)
+	xpand_subdepth = sd
 	P.arith_cmd = sv
 	if not ok then
+		if type(v) == "table" and v.__curse_matherr and not v.__curse_subscript then
+			-- a subscript's error abandons the whole line, even from (( )) or [[ ]] (bash)
+			v = { __curse_exit = 1, __curse_matherr = true, __curse_lineabort = true, __curse_subscript = true }
+		end
 		error(v, 0)
 	end
 	return rt.to_arr_key(v)
@@ -3950,6 +3976,7 @@ local function dbracket_trace(sh, text)
 	xtrace_line(sh, "[[ " .. (sh.dbneg and "! " or "") .. text .. " ]]")
 	sh.dbneg = nil
 end
+local DB_ARITH_OP = { ["-eq"] = 1, ["-ne"] = 1, ["-lt"] = 1, ["-le"] = 1, ["-gt"] = 1, ["-ge"] = 1 }
 local function eval_dbracket(sh, node)
 	local k = node.kind
 	if k == "and" then
@@ -3976,7 +4003,7 @@ local function eval_dbracket(sh, node)
 		if sh.opt_x then
 			dbracket_trace(sh, "-v " .. v)
 		end
-		return var_is_set(sh, v)
+		return var_is_set(sh, v, true)
 	end
 	if k == "unary" then
 		local v = dbracket_word(sh, node.word)
@@ -3986,7 +4013,16 @@ local function eval_dbracket(sh, node)
 		return unary(sh, node.op, v)
 	end
 	if k == "binary" then
-		local l, r, op = dbracket_word(sh, node.l), dbracket_word(sh, node.r), node.op
+		local l, r, op, textual
+		op = node.op
+		if DB_ARITH_OP[op] and node.l.src and node.r.src then
+			textual = true
+			-- bash 5.2 expands an arithmetic operator's operands like $((…)): no process
+			-- substitution, and subscripts quoted (`index[7<(4+2)]` is arithmetic)
+			l, r = arith_expand_text(sh, node.l.src), arith_expand_text(sh, node.r.src)
+		else
+			l, r = dbracket_word(sh, node.l), dbracket_word(sh, node.r)
+		end
 		if sh.opt_x then
 			dbracket_trace(sh, l .. " " .. op .. " " .. r)
 		end
@@ -4034,8 +4070,8 @@ local function eval_dbracket(sh, node)
 		elseif op == "-eq" or op == "-ne" or op == "-lt" or op == "-le" or op == "-gt" or op == "-ge" then
 			-- [[ ]] arithmetic comparisons evaluate each side as an arith EXPRESSION
 			-- (bash: [[ 1+2 -eq 3 ]] is true), unlike `test` which needs integer literals.
-			local nl = M.dbracket_arith(sh, l)
-			local nr = M.dbracket_arith(sh, r)
+			local nl = M.dbracket_arith(sh, l, textual)
+			local nr = M.dbracket_arith(sh, r, textual)
 			if op == "-eq" then
 				return nl == nr
 			elseif op == "-ne" then
@@ -4069,11 +4105,25 @@ function M.arith_eval_str(sh, s)
 	end
 	return eval(sh, ast)
 end
-function M.dbracket_arith(sh, s)
+function M.dbracket_arith(sh, s, textual)
 	local sv, sx = P.arith_cmd, sh.arith_expanded
 	P.arith_cmd = "[["
-	sh.arith_expanded = true -- (the operand was expanded already: subscripts aren't again)
-	local ok, v = pcall(M.arith_eval_str, sh, s)
+	-- (a word-expanded operand: its subscripts aren't expanded again; a textual one is
+	-- arith_expand_text output, whose escaped subscripts the evaluator dequotes as $((…)))
+	sh.arith_expanded = not textual
+	local ok, v
+	if textual then -- (arith_expand_text output: its subscript escapes need the strict parse)
+		ok, v = pcall(function()
+			local pok, ast = pcall(P.arith, s == "" and "0" or s, "strict")
+			if not pok then
+				io.stderr:write("curse: " .. P.arith_errmsg(s, ast) .. "\n")
+				error({ __curse_exit = 1, __curse_matherr = true, __curse_experr = true })
+			end
+			return eval(sh, ast)
+		end)
+	else
+		ok, v = pcall(M.arith_eval_str, sh, s)
+	end
 	P.arith_cmd, sh.arith_expanded = sv, sx
 	if not ok then
 		error(v, 0)
@@ -4162,10 +4212,36 @@ end
 -- per-command closure) so it can be pcall'd directly without allocating. When the
 -- command is a static declaration builtin, `name=value` words are assignment words
 -- (no split/glob); everything else goes through the field engine.
+-- `unset map["$key"]`: bash 5.2 doesn't expand a subscript's QUOTED parts a second time
+-- (unset expands the subscript itself) — protect their expansions with backslashes, which
+-- array_key's expansion then removes. Only after an unquoted `NAME[`; nil = not this form.
+local function unset_arrayref(sh, w)
+	local p1 = w.parts[1]
+	if not (p1 and p1.lit and not p1.q and p1.lit:match("^[%a_][%w_]*%[")) then
+		return nil
+	end
+	local quoted
+	for i = 2, #w.parts do
+		quoted = quoted or w.parts[i].q
+	end
+	if not quoted then
+		return nil
+	end
+	local buf = {}
+	for i, p in ipairs(w.parts) do
+		local v = expand_part_str(sh, p)
+		buf[i] = (i > 1 and p.q) and v:gsub("[\\$`\"']", "\\%0") or v
+	end
+	return table.concat(buf)
+end
 local function expand_args(sh, st, args, is_assign)
+	local unset_cmd = is_assign == "unset"
 	for wi, w in ipairs(st.words) do
 		local p1 = w.parts[1]
-		if wi > 1 and is_assign and p1 and p1.lit and p1.lit:match("^[%a_][%w_]*%+?=") then
+		local ref = unset_cmd and wi > 1 and unset_arrayref(sh, w)
+		if ref then
+			args[#args + 1] = rt.cstr(ref)
+		elseif wi > 1 and is_assign == true and p1 and p1.lit and p1.lit:match("^[%a_][%w_]*%+?=") then
 			args[#args + 1] = rt.cstr(expand_assign_word(sh, w, true)) -- name=value word: no glob, ~ after =/:
 		else
 			local fs = expand_to_fields(sh, w)
@@ -4679,7 +4755,7 @@ exec_stmt = function(sh, st, hook)
 		local cw1 = st.words[1]
 		local cw1lit = cw1 and #cw1.parts == 1 and cw1.parts[1].lit ~= nil and not cw1.parts[1].q and cw1.parts[1].lit
 			or nil
-		local is_assign = cw1lit ~= nil and ASSIGN_CMD[cw1lit] ~= nil
+		local is_assign = cw1lit ~= nil and ASSIGN_CMD[cw1lit] ~= nil or (cw1lit == "unset" and "unset")
 		local args = {}
 		-- A word-expansion error (bad substitution, invalid indirect name) aborts the
 		-- WHOLE simple command with status 1 but is non-fatal: the script continues.
@@ -5384,7 +5460,7 @@ exec_stmt = function(sh, st, hook)
 		P.arith_cmd = sv
 		if ok then
 			sh.status = truth(v) and 0 or 1
-		elseif type(v) == "table" and v.__curse_matherr then
+		elseif type(v) == "table" and v.__curse_matherr and not v.__curse_subscript then
 			sh.status = 1
 		else
 			error(v)
@@ -5405,7 +5481,7 @@ exec_stmt = function(sh, st, hook)
 			sh.status = v and 0 or 1
 		elseif type(v) == "table" and v.__curse_regexerr then
 			sh.status = 2
-		elseif type(v) == "table" and v.__curse_matherr then
+		elseif type(v) == "table" and v.__curse_matherr and not v.__curse_subscript then
 			sh.status = 1
 		else
 			error(v)
@@ -6316,6 +6392,7 @@ M._int = {
 	SIGNUM = SIGNUM,
 	NUMSIG = NUMSIG,
 	array_key = array_key,
+	arith_key = arith_key,
 	arith_resolve = arith_resolve,
 	arith_nounset = arith_nounset,
 	sh_printf = sh_printf,

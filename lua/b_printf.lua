@@ -37,6 +37,12 @@ return function(sh, cmd, args, hook, tcb)
 					if sub == "" then
 						io.stderr:write("curse: printf: `" .. target .. "': bad array subscript\n")
 						sh.status = 2
+					elseif (sub == "@" or sub == "*") and not sh:is_assoc(nm) then
+						io.stderr:write("curse: " .. target .. ": bad array subscript\n")
+						sh.status = 1
+					elseif not rt.split_array_ref(target) then -- (`A[]]`: brackets don't balance)
+						io.stderr:write("curse: printf: `" .. target .. "': not a valid identifier\n")
+						sh.status = 2
 					else
 						sh:array_set(nm, array_key(sh, nm, sub), res, false)
 						sh.status = st

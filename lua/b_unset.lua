@@ -41,12 +41,31 @@ return function(sh, cmd, args, hook, tcb)
 						rt.fexport_sync(sh, a)
 					end
 				end
+			elseif vmode and not rt.split_array_ref(a) then -- `unset -v 'a b'` (bare unset
+				-- quietly tries a function of that name instead)
+				io.stderr:write("curse: unset: `" .. a .. "': not a valid identifier\n")
+				sh.status = 1
 			else
 				local nm, sub = a:match("^([%a_][%w_]*)%[(.+)%]$")
+				local function ukey() -- (the argument is expanded already: under
+					-- assoc_expand_once an associative subscript isn't expanded again)
+					if sh.shopt.assoc_expand_once and sh:is_assoc(nm) then
+						return sub
+					end
+					return array_key(sh, nm, sub)
+				end
 				if nm then
 					local eb = sh.vars[sh:deref(nm)]
-					if eb and eb.arr then -- real indexed/assoc array: unset one element
-						if not sh:array_unset(nm, array_key(sh, nm, sub)) then
+					if (sub == "@" or sub == "*") and eb and eb.arr and (rt.compat_level(sh) <= 51 or not eb.assoc) then
+						-- `unset a[@]`: bash 5.2 empties an indexed array (an assoc's `@` is a
+						-- key); at compat 5.1 either is unset whole
+						if rt.compat_level(sh) <= 51 then
+							a, nm = nm, nil
+						else
+							eb.arr = {}
+						end
+					elseif eb and eb.arr then -- real indexed/assoc array: unset one element
+						if not sh:array_unset(nm, ukey()) then
 							io.stderr:write("curse: unset: " .. a .. ": bad array subscript\n")
 							sh.status = 1
 						end
