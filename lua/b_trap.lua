@@ -54,7 +54,8 @@ return function(sh, cmd, args, hook, tcb)
 			end
 			sh.status = 0
 		elseif args[j]:sub(1, 1) == "-" and args[j] ~= "-" then -- a stray -flag (e.g. `trap -1`)
-			io.stderr:write("curse: trap: " .. args[j] .. ": invalid option\n")
+			io.stderr:write("curse: trap: " .. args[j]:sub(1, 2) .. ": invalid option\n")
+			io.stderr:write("trap: usage: trap [-lp] [[arg] signal_spec ...]\n")
 			sh.status = 2
 		else
 			-- bash: reset-mode (all tokens are signals to reset) only when the first
@@ -68,7 +69,7 @@ return function(sh, cmd, args, hook, tcb)
 				action, sigstart = args[j], j + 1
 			end
 			if sigstart > #args then -- an action with no signal spec is a usage error
-				io.stderr:write("curse: trap: usage: trap [-lp] [[arg] signal_spec ...]\n")
+				io.stderr:write("trap: usage: trap [-lp] [[arg] signal_spec ...]\n")
 				sh.status = 2
 				return
 			end

@@ -67,7 +67,7 @@ return function(sh, cmd, args, hook, tcb)
 				fi = fi + 1
 			end -- end of options
 			if args[fi] == nil then
-				io.stderr:write("curse: printf: usage: printf [-v var] format [arguments]\n")
+				io.stderr:write("printf: usage: printf [-v var] format [arguments]\n")
 				sh.status = 2
 			else
 				local nsets = {}
@@ -76,9 +76,9 @@ return function(sh, cmd, args, hook, tcb)
 					sh:set_str(ns[1], tostring(ns[2]))
 				end
 				sh.out(res)
-				if sh.out == io.write and not io.flush() then
-					sh.write_err = true
-				end -- full disk etc.
+				if sh.out == io.write then
+					rt.chkwrite(sh, "printf") -- (a failed write is reported, status 1)
+				end
 				sh.status = st
 			end
 		end

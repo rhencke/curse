@@ -1792,6 +1792,11 @@ local function compile_cmdsub(src, backtick, lifted, aenv, noalias, posix)
 		then
 			-- compile the path word and read the file directly — no interp
 			local wok, pw = pcall(require("parser").parse_word, st.redirs[1].target or "")
+			for _, p in ipairs(wok and pw.parts or {}) do -- (a glob in the file word: interp)
+				if p.lit and not p.q and p.lit:find("[*?[]") then
+					wok = false
+				end
+			end
 			if wok then
 				local eok, pathexpr = pcall(emit_word, pw, lifted)
 				if eok then
@@ -4881,7 +4886,7 @@ simple_compiled = function(cx, st, after)
 			local from, wrap, call, prefix
 			if cmd == "echo" then
 				from = 2
-				call = "sh:echo(unpack(__a))"
+				call = "sh:echo_cmd(unpack(__a))"
 			elseif cmd == "test" or cmd == "[" then -- the [ / test command word is a literal (dispatched by
 				from = 2
 				wrap = "rt.cstr(%s)"
@@ -5044,7 +5049,7 @@ simple_compiled = function(cx, st, after)
 	end
 	local body
 	if cmd == "echo" then
-		body = "sh:echo(" .. table.concat(args, ", ") .. ")"
+		body = "sh:echo_cmd(" .. table.concat(args, ", ") .. ")"
 	elseif cmd == ":" or cmd == "true" or cmd == "false" then
 		-- :/true/false ignore their args but bash still EXPANDS them, so a side-effecting arg
 		-- (`: $((a/=3))`, `: "${x:=d}"`, `: "$(cmd)"`) must run. Evaluate the argv, discard it.

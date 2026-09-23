@@ -52,7 +52,7 @@ return function(sh, cmd, args, hook, tcb)
 		sh.status = 1
 	end
 	local function cd_to(dir) -- through the cd builtin (PWD/OLDPWD, errors) — `cd -- dir`
-		require("b_cd")(sh, "cd", { "cd", "--", dir }, hook)
+		require("b_cd")(sh, "cd", { "cd", "--", dir }, hook, nil, cmd)
 		return sh.status == 0
 	end
 	local function dirs(argl)

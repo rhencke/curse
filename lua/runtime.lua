@@ -1653,7 +1653,20 @@ function Shell:capture_src(src, backtick, noalias)
 			and #st.redirs == 1
 			and st.redirs[1].op == "in"
 		then
-			local path = I.expand_assign_word(self, P.parse_word(st.redirs[1].target or ""))
+			-- (the file word expands like a redirection target: globbed, except in posix
+			-- mode, and it must name exactly one file)
+			local raw = st.redirs[1].target or ""
+			local eok, fs = M.redir_noglob(self, I.expand_to_fields, self, P.parse_word(raw))
+			if not eok then
+				self.status = 1
+				return ""
+			end
+			if #fs ~= 1 then
+				io.stderr:write("curse: " .. raw .. ": ambiguous redirect\n")
+				self.status = 1
+				return ""
+			end
+			local path = fs[1]
 			local f = path ~= "" and io.open(path, "r")
 			if f then
 				local c = f:read("*a") or ""
@@ -7913,6 +7926,9 @@ function M.ansi_unescape(s, mode)
 					out[#out + 1] = string.char(tonumber(hex, 16))
 					i = i + 2 + #hex
 				else
+					if mode == "b" then -- (printf %b warns, as bash's)
+						io.stderr:write("curse: printf: missing hex digit for \\x\n")
+					end
 					out[#out + 1] = "\\x"
 					i = i + 2
 				end
@@ -7990,11 +8006,52 @@ function Shell:echo(...)
 	-- because the parent flushes b before the just-forked child is scheduled. Only
 	-- when writing to the real fd (not into a $()/pipe capture buffer). A flush
 	-- error (e.g. a full disk) is a write error -> status 1, like bash's sh_chkwrite.
-	local werr = (self.out == io.write) and not io.flush() -- flush error (e.g. full disk) here
-	if werr then
-		self.write_err = true
+	local werr = false
+	if self.out == io.write then
+		local ok, m = io.flush()
+		if not ok then
+			werr, self.write_err, self.write_errmsg = true, true, m
+			M.clear_stdout_err()
+		end
 	end
 	self.status = werr and 1 or 0 -- a write error is status 1, like bash's sh_chkwrite
+end
+
+pcall(ffi.cdef, [[
+  void curse_rt_clearerr(void *fp) asm("clearerr");
+  extern void *curse_rt_stdout asm("stdout");
+]])
+-- after a failed write, stdout's sticky error flag must go, or every later flush fails too
+function M.clear_stdout_err()
+	pcall(function()
+		C.curse_rt_clearerr(C.curse_rt_stdout)
+	end)
+end
+-- The `echo` BUILTIN (compiled call sites): Shell:echo, then bash's sh_chkwrite report
+-- of a failed write. (Other builtins print through Shell:echo silently.)
+function Shell:echo_cmd(...)
+	self.write_err = nil
+	self:echo(...)
+	if self.write_err and self.out == io.write then
+		M.chkwrite_report(self, "echo", self.write_errmsg)
+	end
+end
+-- bash's sh_chkwrite: flush a builtin's output; a failure (full disk, a read-only fd) is
+-- reported as `NAME: write error: REASON` and flagged (the command's status becomes 1).
+-- Returns true when the write went through.
+function M.chkwrite(sh, name)
+	local ok, m = io.flush()
+	if ok then
+		return true
+	end
+	M.clear_stdout_err()
+	M.chkwrite_report(sh, name, m)
+	return false
+end
+function M.chkwrite_report(sh, name, m)
+	sh.write_err = true
+	local why = (m or ""):match(":%s*([^:]+)$") or m or "Bad file descriptor"
+	io.stderr:write("curse: " .. name .. ": write error: " .. why .. "\n")
 end
 
 -- Builtin registry (name -> lazily-loaded module). The interpreter shares this

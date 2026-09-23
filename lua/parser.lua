@@ -1720,10 +1720,10 @@ local function brace_skip_quoted(s, i)
 	local c = s:sub(i, i)
 	if c == "\\" then
 		return i + 2
-	elseif c == "'" or c == '"' then
+	elseif c == "'" or c == '"' or c == "`" then
 		local j = i + 1
 		while j <= #s and s:sub(j, j) ~= c do
-			j = j + ((c == '"' and s:sub(j, j) == "\\") and 2 or 1)
+			j = j + ((c ~= "'" and s:sub(j, j) == "\\") and 2 or 1)
 		end
 		return j + 1
 	end
@@ -1844,6 +1844,13 @@ local function brace_factors(s)
 				litbuf[#litbuf + 1] = c
 				i = i + 1
 			end
+		elseif c == "`" then -- a `…` command substitution is copied whole (its braces are its own)
+			local j = i + 1
+			while j <= #s and s:sub(j, j) ~= "`" do
+				j = j + (s:sub(j, j) == "\\" and 2 or 1)
+			end
+			litbuf[#litbuf + 1] = s:sub(i, j)
+			i = j + 1
 		elseif c == "$" and s:sub(i + 1, i + 1) == "{" then
 			-- ${…} is a parameter expansion, NOT brace expansion — copy it verbatim.
 			local e = s:find("}", i + 2, true) or #s

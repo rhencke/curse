@@ -17,8 +17,9 @@ local do_arrayassign, eval, fmt_decl, fmt_set_var = I.do_arrayassign, I.eval, I.
 local C, P = I.C, I.P
 local logical_canon = I.logical_canon
 
-return function(sh, cmd, args, hook, tcb)
+return function(sh, cmd, args, hook, tcb, as)
 	if cmd == "cd" then
+		local who = as or "cd" -- (pushd/popd run cd under their own name in its errors)
 		if rt.restricted(sh, "cd: restricted") then
 			return
 		end
@@ -96,7 +97,9 @@ return function(sh, cmd, args, hook, tcb)
 		-- path so the process and $PWD agree logically (e.g. `cd symlink/..` lands in
 		-- the symlink's textual parent, not its physical one).
 		if C.chdir(dir) ~= 0 then
-			io.stderr:write("curse: cd: " .. rt.err_name(dir) .. ": No such file or directory\n")
+			local e = ffi.errno()
+			io.stderr:write("curse: " .. who .. ": " .. rt.err_name(dir) .. ": "
+				.. (e ~= 0 and ffi.string(C.strerror(e)) or "No such file or directory") .. "\n")
 			sh.status = 1
 			return
 		end

@@ -128,12 +128,24 @@ int main(int argc, char **argv, char **envp) {
             sigign |= 1u << (s - 1);
     }
     off = put_u32(buf, off, cap, sigign);
+    /* Trailer: the other fds the script inherits (3..63, open and not close-on-exec, not
+     * our own socket) — `cmd 3<&0` must see fd 3 — sent after 0,1,2 with their numbers. */
+    int extra[64];
+    int nextra = 0;
+    for (int f = 3; f < 64; f++) {
+        if (f == fd) continue;
+        int fl = fcntl(f, F_GETFD);
+        if (fl >= 0 && !(fl & FD_CLOEXEC)) extra[nextra++] = f;
+    }
+    off = put_u32(buf, off, cap, (uint32_t)nextra);
+    for (int i = 0; i < nextra && off >= 0; i++)
+        off = put_u32(buf, off, cap, (uint32_t)extra[i]);
     if (off < 0) { close(fd); fallback(argv); } /* request too big -> run directly */
 
-    /* Send the request with fds 0,1,2 attached as SCM_RIGHTS ancillary data. */
+    /* Send the request with fds 0,1,2 (then the extras) attached as SCM_RIGHTS data. */
     struct iovec iov = { buf, (size_t)off };
     union {
-        char b[CMSG_SPACE(3 * sizeof(int))];
+        char b[CMSG_SPACE(67 * sizeof(int))];
         struct cmsghdr align;
     } ctrl;
     memset(&ctrl, 0, sizeof ctrl);
@@ -142,13 +154,14 @@ int main(int argc, char **argv, char **envp) {
     msg.msg_iov = &iov;
     msg.msg_iovlen = 1;
     msg.msg_control = ctrl.b;
-    msg.msg_controllen = sizeof ctrl.b;
+    msg.msg_controllen = CMSG_SPACE((3 + nextra) * sizeof(int));
     struct cmsghdr *cm = CMSG_FIRSTHDR(&msg);
     cm->cmsg_level = SOL_SOCKET;
     cm->cmsg_type = SCM_RIGHTS;
-    cm->cmsg_len = CMSG_LEN(3 * sizeof(int));
-    int passfds[3] = { 0, 1, 2 };
-    memcpy(CMSG_DATA(cm), passfds, sizeof passfds);
+    cm->cmsg_len = CMSG_LEN((3 + nextra) * sizeof(int));
+    int passfds[67] = { 0, 1, 2 };
+    for (int i = 0; i < nextra; i++) passfds[3 + i] = extra[i];
+    memcpy(CMSG_DATA(cm), passfds, (3 + nextra) * sizeof(int));
 
     if (sendmsg(fd, &msg, 0) < 0) { close(fd); fallback(argv); }
 

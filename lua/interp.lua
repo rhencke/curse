@@ -731,7 +731,9 @@ local function arith_expand_text(sh, raw, depth0) -- depth0: 1 = the text IS a s
 	while k <= n do
 		local c = raw:sub(k, k)
 		if c == "\\" then
-			out[#out + 1] = raw:sub(k, k + 1)
+			-- (the text is expanded as in double quotes: at top level `\$` is a `$`, …)
+			local nx = raw:sub(k + 1, k + 1)
+			out[#out + 1] = (depth == 0 and nx:match('^[$`\\"]$')) and nx or raw:sub(k, k + 1)
 			k = k + 2
 		elseif c == '"' then
 			k = k + 1
@@ -3457,6 +3459,7 @@ local function printf_parse(fmt)
 					lit[#lit + 1] = string.char(tonumber(h, 16))
 					i = i + 2 + #h
 				else
+					io.stderr:write("curse: printf: missing hex digit for \\x\n")
 					lit[#lit + 1] = "\\"
 					i = i + 1
 				end
@@ -3543,7 +3546,7 @@ local function printf_parse(fmt)
 						i = close + 2
 					else -- not a %(…)T: bash warns and prints it as written
 						local stop = close and close + 1 or n
-						io.stderr:write("curse: printf: `" .. fmt:sub(stop, stop) .. "': invalid time format specification\n")
+						io.stderr:write("curse: printf: warning: `" .. fmt:sub(stop, stop) .. "': invalid time format specification\n")
 						lit[#lit + 1] = fmt:sub(i, stop)
 						i = stop + 1
 					end
@@ -3599,7 +3602,9 @@ local function sh_printf(fmt, argv, start, nsets)
 				end
 				if tk.strftime then
 					local arg = nextarg()
-					local epoch = (arg == "" or arg == "-1") and os.time() or (tonumber(arg) or os.time())
+					-- (-1: now; -2: when the shell started, bash's shell_start_time)
+					local epoch = (arg == "" or arg == "-1") and os.time()
+						or (arg == "-2" and (rt.cur_shell and rt.cur_shell.start_time or os.time())) or (tonumber(arg) or os.time())
 					local sres = os.date(tk.tfmt, epoch) or ""
 					if #sres >= 128 then
 						sres = ""
@@ -3643,12 +3648,18 @@ local function sh_printf(fmt, argv, start, nsets)
 						local s = printf_q(nextarg())
 						out[#out + 1] = width ~= "" and string.format("%" .. spec:sub(2) .. width .. "s", s) or s
 					else
-						local r, ok = printf_conv(full, conv, nextarg())
+						if conv == "" then -- the format ended inside a conversion (`%10`)
+							io.stderr:write("curse: printf: `" .. full .. "': missing format character\n")
+							return table.concat(out), 1
+						end
+						local a = nextarg()
+						local r, ok = printf_conv(full, conv, a)
 						if not ok then
+							io.stderr:write("curse: printf: " .. a .. ": invalid number\n")
 							status = 1
 						end
 						if r == nil then -- invalid conversion: bash reports it and STOPS the output there
-							io.stderr:write("curse: printf: `" .. conv .. "': invalid conversion specification\n")
+							io.stderr:write("curse: printf: `" .. conv .. "': invalid format character\n")
 							return table.concat(out), 1
 						end
 						out[#out + 1] = r

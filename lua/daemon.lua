@@ -166,7 +166,16 @@ local function parse_request(s)
 	if pos + 3 <= #s then
 		sigign, pos = rd_u32(s, pos)
 	end
-	return { args = args, cwd = cwd, env = env, sigign = sigign }
+	-- optional trailer: the numbers of the extra inherited fds passed after 0,1,2
+	local extra = {}
+	if pos + 3 <= #s then
+		local n
+		n, pos = rd_u32(s, pos)
+		for i = 1, n do
+			extra[i], pos = rd_u32(s, pos)
+		end
+	end
+	return { args = args, cwd = cwd, env = env, sigign = sigign, extra = extra }
 end
 
 -- Replace the worker's environment with the caller's, so os.getenv() (libc
@@ -296,9 +305,25 @@ local function serve_request(cfd, req, fds, ctx)
 	-- stdio's `stdin` buffer / EOF flag belong to the PREVIOUS caller's fd 0: drop them
 	C.curse_d_fpurge(C.stdin)
 	C.clearerr(C.stdin)
+	-- the caller's other inherited fds go back to their own numbers (`cmd 3<&0`): park
+	-- each received copy clear of the targets first, so none overwrites another
+	local parked = {}
+	for i, target in ipairs(req.extra or {}) do
+		local f = fds[3 + i]
+		if f then
+			parked[i] = C.fcntl(f, F_DUPFD_CLOEXEC, ffi.new("int", 64))
+		end
+	end
 	for _, f in ipairs(fds) do
 		if f > 2 then
 			C.close(f)
+		end
+	end
+	for i, target in ipairs(req.extra or {}) do
+		local t = parked[i]
+		if t and t >= 0 then
+			C.dup2(t, target) -- (dup2 clears close-on-exec: the script's commands inherit it)
+			C.close(t)
 		end
 	end
 	if req.cwd and req.cwd ~= "" then
@@ -426,7 +451,7 @@ local function worker_main(lfd, my_uid, ctx, slot)
 	end
 	collectgarbage("collect")
 	local iobuf = ffi.new("char[?]", 65536)
-	local ctrl = ffi.new("char[64]")
+	local ctrl = ffi.new("char[512]") -- (fds 0,1,2 + up to 64 inherited extras)
 	local cred = ffi.new("struct curse_ucred[1]")
 	local credlen = ffi.new("unsigned int[1]")
 	local served = 0
@@ -466,7 +491,7 @@ local function worker_main(lfd, my_uid, ctx, slot)
 				msg[0].iov = iov
 				msg[0].iovlen = 1
 				msg[0].control = ctrl
-				msg[0].controllen = 64
+				msg[0].controllen = 512
 				local n = tonumber(C.recvmsg(cfd, msg, 0))
 				if n <= 0 then
 					C.close(cfd)

@@ -27,7 +27,16 @@ return function(sh, cmd, args, hook, tcb)
 			elseif a == "-p" then
 				pflag = true -- print in a form that can be eval'd
 			elseif a:sub(1, 1) == "-" and #a > 1 then
-				badflag = true
+				for k = 2, #a do -- (combined flags; the first bad letter is reported)
+					local f = a:sub(k, k)
+					if f == "S" then
+						sflag = true
+					elseif f == "p" then
+						pflag = true
+					elseif not badflag then
+						badflag = "-" .. f
+					end
+				end
 			else
 				pos[#pos + 1] = a
 			end
@@ -35,7 +44,7 @@ return function(sh, cmd, args, hook, tcb)
 		local cur = tonumber(C.umask(0)) % 512
 		C.umask(cur)
 		if badflag then
-			io.stderr:write("curse: umask: invalid option\numask: usage: umask [-p] [-S] [mode]\n")
+			io.stderr:write("curse: umask: " .. badflag .. ": invalid option\numask: usage: umask [-p] [-S] [mode]\n")
 			sh.status = 2 -- a usage error (bash)
 		elseif #pos == 0 then -- bash ignores extra args; it uses only the first MODE
 			local body = sflag and umask_symbolic(cur) or string.format("%04o", cur)
