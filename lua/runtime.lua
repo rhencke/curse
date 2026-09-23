@@ -1015,6 +1015,19 @@ end
 -- Re-encode a codepoint to bytes in the current locale (wcrtomb); on failure keep
 -- the original bytes. Used to write back a case-folded character.
 local _mb_buf = ffi.new("char[16]")
+-- is the current LC_CTYPE UTF-8? (cached per locale generation)
+local _utf8_gen, _utf8 = -1, false
+function M.lc_utf8()
+	if _utf8_gen ~= M.locale_gen then
+		_utf8_gen = M.locale_gen
+		_utf8 = false
+		if lc_mb_cur_max > 1 then
+			ffi.fill(_mb_st, ffi.sizeof(_mb_st))
+			_utf8 = tonumber(C.wcrtomb(_mb_buf, 0xE9, _mb_st)) == 2 and ffi.string(_mb_buf, 2) == "\195\169"
+		end
+	end
+	return _utf8
+end
 function M.wc_to_bytes(wc, orig)
 	if lc_mb_cur_max <= 1 then
 		return string.char(wc % 256)
@@ -2446,7 +2459,7 @@ function M.job_add(sh, pid, cmdstr)
 			maxid = j.id
 		end
 	end
-	local job = { id = maxid + 1, pid = pid, cmd = cmdstr or "", done = false }
+	local job = { id = maxid + 1, pid = pid, cmd = cmdstr or "", done = false, nojc = not sh.opt_m or nil }
 	sh.jobs[#sh.jobs + 1] = job
 	sh.last_bg_pid = tostring(pid)
 	return job
@@ -7800,7 +7813,12 @@ function M.utf8_char(cp)
 		return string.char(cp)
 	elseif cp >= 0x80000000 then
 		return "" -- (beyond what bash's u32toutf8 encodes)
-	elseif lc_mb_cur_max == 1 then -- a non-UTF-8 locale can't hold it: bash spells it out
+	elseif not M.lc_utf8() then -- another charset (Big5, Latin-1…): convert, or spell it out
+		ffi.fill(_mb_st, ffi.sizeof(_mb_st)) -- when the locale can't hold it (bash)
+		local r = tonumber(C.wcrtomb(_mb_buf, cp, _mb_st))
+		if r > 0 and r <= 16 then
+			return ffi.string(_mb_buf, r)
+		end
 		return cp > 0xFFFF and ("\\U%08X"):format(cp) or ("\\u%04X"):format(cp)
 	end
 	-- UTF-8, with bash's 5- and 6-byte forms for code points past 0x1FFFFF
@@ -7984,6 +8002,7 @@ local BUILTIN_LAZY = {
 	echo = "b_echo",
 	enable = "b_enable",
 	caller = "b_caller",
+	disown = "b_fg",
 	compgen = "b_completion",
 	complete = "b_completion",
 	compopt = "b_completion",

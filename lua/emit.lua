@@ -5796,7 +5796,9 @@ H.background = function(cx, st, after)
 	while c1 and c1.t == "pipeline" and c1.cmds do
 		c1 = c1.cmds[1]
 	end
-	local cmdstr = st.text or (c1 and c1.words and c1.words[1] and c1.words[1].parts[1] and c1.words[1].parts[1].lit)
+	local dtext = require("deparse").command_text(st.cmd) -- (the job as bash's print_cmd.c shows it)
+	local cmdstr = (dtext ~= "" and dtext) or st.text
+		or (c1 and c1.words and c1.words[1] and c1.words[1].parts[1] and c1.words[1].parts[1].lit)
 		or "job"
 	-- a lone simple command naming an EXTERNAL (not a builtin/function) is the child's
 	-- last act: the child execs it in place instead of spawning (bash does the same)

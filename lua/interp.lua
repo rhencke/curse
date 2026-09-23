@@ -2735,6 +2735,7 @@ local BUILTINS = {
 	echo = 1,
 	enable = 1,
 	caller = 1,
+	disown = 1,
 	[":"] = 1,
 	["true"] = 1,
 	["false"] = 1,
@@ -5562,7 +5563,9 @@ exec_stmt = function(sh, st, hook)
 		while c1 and (c1.t == "pipeline") and c1.cmds do
 			c1 = c1.cmds[1]
 		end
-		local cmdstr = st.text or (c1 and c1.words and c1.words[1] and c1.words[1].parts[1] and c1.words[1].parts[1].lit) or "job"
+		local dtext = require("deparse").command_text(st.cmd) -- (bash prints the job as print_cmd.c does)
+		local cmdstr = (dtext ~= "" and dtext) or st.text
+			or (c1 and c1.words and c1.words[1] and c1.words[1].parts[1] and c1.words[1].parts[1].lit) or "job"
 		job_add(sh, pid, cmdstr)
 		sh.bg_pids = sh.bg_pids or {}
 		sh.bg_pids[#sh.bg_pids + 1] = pid

@@ -327,59 +327,181 @@ return function(sh, cmd, args, hook)
 			sh.status = (not werr and #out > 0) and 0 or 1
 		end
 	elseif cmd == "complete" then
-		-- complete [-p] [opts] [name…]: store/print completion specs (registration only)
-		if args[2] == nil or args[2] == "-p" then
-			local ns = {}
-			for n in pairs(sh.complete or {}) do
-				ns[#ns + 1] = n
+		-- complete [-abcdefgjksuv] [-pr] [-DEI] [-o opt] [-A action] [-G/-W/-F/-C/-X/-P/-S arg]
+		-- [name …]: register, print (-p / no args) or remove (-r) completion specs. Specs
+		-- are listed in bash's hash-table order (512 FNV-1 buckets, newest first per bucket)
+		-- and printed as print_one_completion does.
+		local ACT_LETTER = {
+			a = "alias", b = "builtin", c = "command", d = "directory", e = "export", f = "file",
+			g = "group", j = "job", k = "keyword", s = "service", u = "user", v = "variable",
+		}
+		local ACTIONS = {
+			alias = 1, arrayvar = 1, binding = 1, builtin = 1, command = 1, directory = 1, disabled = 1,
+			enabled = 1, export = 1, file = 1, ["function"] = 1, group = 1, helptopic = 1, hostname = 1,
+			job = 1, keyword = 1, running = 1, service = 1, setopt = 1, shopt = 1, signal = 1,
+			stopped = 1, user = 1, variable = 1,
+		}
+		local COPTS = { "bashdefault", "default", "dirnames", "filenames", "noquote", "nosort", "nospace", "plusdirs" }
+		local COPT_OK = {}
+		for _, o in ipairs(COPTS) do
+			COPT_OK[o] = true
+		end
+		local spec = { opts = {}, acts = {} }
+		local pflag, rflag, any = false, false, false
+		local k = 2
+		while args[k] and args[k]:sub(1, 1) == "-" and args[k] ~= "-" do
+			local a = args[k]
+			k = k + 1
+			if a == "--" then
+				break
 			end
-			table.sort(ns)
-			for _, n in ipairs(ns) do
-				sh:echo(sh.complete[n] .. " " .. n)
-			end
-			sh.status = 0
-		else
-			-- split trailing NAMEs from the option part; -F/-C etc. with no name is a
-			-- usage error UNLESS -D/-E/-I (default/empty/initial-word) is given.
-			local opts, cmds, catchall = { "complete" }, {}, false
-			local k = 2
-			while args[k] do
-				local a = args[k]
-				if
-					a == "-F"
-					or a == "-C"
-					or a == "-W"
-					or a == "-A"
-					or a == "-o"
-					or a == "-P"
-					or a == "-S"
-					or a == "-X"
-					or a == "-G"
-				then
-					opts[#opts + 1] = a
-					opts[#opts + 1] = sq(args[k + 1] or "")
-					k = k + 2
-				elseif a == "-D" or a == "-E" or a == "-I" then
-					catchall = true
-					opts[#opts + 1] = a
-					k = k + 1
-				elseif a:sub(1, 1) == "-" then
-					opts[#opts + 1] = a
-					k = k + 1
+			local i = 2
+			while i <= #a do
+				local f = a:sub(i, i)
+				i = i + 1
+				if ACT_LETTER[f] then
+					spec.acts[ACT_LETTER[f]] = true
+					any = true
+				elseif f == "p" then
+					pflag = true
+				elseif f == "r" then
+					rflag = true
+				elseif f == "D" or f == "E" or f == "I" then
+					spec[f] = true
+					any = true
+				elseif f == "o" or f == "A" or f == "G" or f == "W" or f == "F" or f == "C" or f == "X"
+					or f == "P" or f == "S" then
+					local v = a:sub(i)
+					if v == "" then
+						v = args[k]
+						k = k + 1
+					end
+					i = #a + 1
+					if v == nil then
+						io.stderr:write("curse: complete: -" .. f .. ": option requires an argument\n")
+						sh.status = 2
+						return
+					end
+					if f == "o" then
+						if not COPT_OK[v] then
+							io.stderr:write("curse: complete: " .. v .. ": invalid option name\n")
+							sh.status = 2
+							return
+						end
+						spec.opts[v] = true
+					elseif f == "A" then
+						if not ACTIONS[v] then
+							io.stderr:write("curse: complete: " .. v .. ": invalid action name\n")
+							sh.status = 2
+							return
+						end
+						spec.acts[v] = true
+					else
+						spec[f] = v
+					end
+					any = true
 				else
-					cmds[#cmds + 1] = a
-					k = k + 1
+					io.stderr:write("curse: complete: -" .. f .. ": invalid option\n")
+					sh.status = 2
+					return
 				end
 			end
-			if #cmds == 0 and not catchall then
-				io.stderr:write("curse: complete: usage error\n")
-				sh.status = 2
-			else
-				sh.complete = sh.complete or {}
-				for _, c in ipairs(cmds) do
-					sh.complete[c] = table.concat(opts, " ")
+		end
+		local names = {}
+		for j = k, #args do
+			names[#names + 1] = args[j]
+		end
+		sh.complete = sh.complete or {}
+		local tab = sh.complete
+		local function sq1(v)
+			return "'" .. v:gsub("'", "'\\''") .. "'"
+		end
+		local function line(name, cs)
+			local o = { "complete" }
+			for _, c in ipairs(COPTS) do
+				if cs.opts[c] then
+					o[#o + 1] = "-o " .. c
 				end
-				sh.status = 0
+			end
+			for _, l in ipairs({ "a", "b", "c", "d", "e", "f", "g", "j", "k", "s", "u", "v" }) do
+				if cs.acts[ACT_LETTER[l]] then
+					o[#o + 1] = "-" .. l
+				end
+			end
+			for _, act in ipairs({ "arrayvar", "binding", "disabled", "enabled", "function", "helptopic",
+				"hostname", "running", "setopt", "shopt", "signal", "stopped" }) do
+				if cs.acts[act] then
+					o[#o + 1] = "-A " .. act
+				end
+			end
+			for _, f in ipairs({ "G", "W", "P", "S", "X", "C" }) do
+				if cs[f] then
+					o[#o + 1] = "-" .. f .. " " .. sq1(cs[f])
+				end
+			end
+			if cs.F then
+				o[#o + 1] = "-F " .. cs.F
+			end
+			for _, f in ipairs({ "D", "E", "I" }) do
+				if cs[f] then
+					o[#o + 1] = "-" .. f
+				end
+			end
+			o[#o + 1] = name
+			return table.concat(o, " ")
+		end
+		local function listing()
+			local ns = {}
+			for n, cs in pairs(tab) do
+				ns[#ns + 1] = { n = n, b = rt.assoc_bucket(n, 512), seq = cs.seq }
+			end
+			table.sort(ns, function(x, y)
+				if x.b ~= y.b then
+					return x.b < y.b
+				end
+				return x.seq > y.seq
+			end)
+			return ns
+		end
+		sh.status = 0
+		if rflag then
+			if #names == 0 then
+				sh.complete = {}
+			end
+			for _, n in ipairs(names) do
+				if tab[n] then
+					tab[n] = nil
+				else
+					io.stderr:write("curse: complete: " .. n .. ": no completion specification\n")
+					sh.status = 1
+				end
+			end
+		elseif pflag or (#names == 0 and not any) then
+			if #names == 0 then
+				for _, e in ipairs(listing()) do
+					sh:echo(line(e.n, tab[e.n]))
+				end
+			end
+			for _, n in ipairs(names) do
+				if tab[n] then
+					sh:echo(line(n, tab[n]))
+				else
+					io.stderr:write("curse: complete: " .. n .. ": no completion specification\n")
+					sh.status = 1
+				end
+			end
+		elseif #names == 0 and not (spec.D or spec.E or spec.I) then
+			io.stderr:write("curse: complete: usage error\n")
+			sh.status = 2
+		else
+			for _, n in ipairs(names) do
+				local old = tab[n]
+				rt.complete_seq = (rt.complete_seq or 0) + 1
+				local cs = { opts = spec.opts, acts = spec.acts, seq = old and old.seq or rt.complete_seq }
+				for _, f in ipairs({ "G", "W", "P", "S", "X", "C", "F", "D", "E", "I" }) do
+					cs[f] = spec[f]
+				end
+				tab[n] = cs
 			end
 		end
 	elseif cmd == "compopt" then
