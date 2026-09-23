@@ -171,6 +171,9 @@ local DEFAULT_PS1 = [[${debian_chroot:+($debian_chroot)}\u@\h:\w\$ ]]
 local function apply(s)
 	s.shellname = SHELLNAME
 	rt.startup_ignored(s) -- signals ignored at entry stay ignored (untrappable)
+	if s.fimports then
+		rt.import_functions(s) -- exported functions (BASH_FUNC_name%%) from the environment
+	end
 	if SH_IS_POSIX then
 		s.opt_posix = true
 	end

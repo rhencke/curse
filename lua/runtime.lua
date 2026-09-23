@@ -1043,6 +1043,9 @@ function Shell:exec_script_child(path, args, n)
 	local child = Shell.new()
 	child.argv0, child.out = args[1], io.write
 	M.startup_ignored(child) -- a new shell: what's ignored now stays ignored
+	if child.fimports then
+		M.import_functions(child)
+	end
 	for k = 2, n do
 		child.nparams = child.nparams + 1
 		child.params[child.nparams] = args[k]
@@ -1120,6 +1123,7 @@ function Shell:exec(...)
 		argv[i - 1] = anchor[i]
 	end
 	argv[n] = nil
+	C.setenv("_", execpath, 1) -- a program sees `_` = its own path (bash), not the shell's $_
 	if self.exec_argv0 then
 		anchor.a0 = tostring(self.exec_argv0)
 		argv[0] = anchor.a0
@@ -1914,6 +1918,112 @@ function M.child_status(sh, ok, err)
 	end
 end
 
+-- ---- coprocesses (`coproc [NAME] cmd`) -------------------------------------------
+-- The shell keeps one end of each of the two pipes: NAME=(read-fd write-fd), NAME_PID.
+-- Like bash, each pipe end first moves to the highest FREE fd below 64 (move_to_high_fd),
+-- so a lone coproc is `63 60` (the read pipe takes 63/62, the write pipe 61/60).
+function M.fd_below(fd, lim)
+	for t = lim - 1, 10, -1 do
+		if C.curse_co_fcntl3(t, 1, 0) < 0 and C.dup2(fd, t) == t then -- F_GETFD fails: free
+			C.close(fd)
+			return t
+		end
+	end
+	return fd
+end
+-- The coproc `pid` was reaped: bash closes the shell's ends and unsets NAME / NAME_PID.
+function M.coproc_dispose(sh, pid)
+	local cp = sh.coprocs and sh.coprocs[pid]
+	if not cp then
+		return
+	end
+	sh.coprocs[pid] = nil
+	for _, fd in ipairs({ cp.r, cp.w }) do
+		if fd >= 0 then
+			C.close(fd)
+		end
+	end
+	sh.vars[cp.name], sh.vars[cp.name .. "_PID"] = nil, nil
+end
+-- bash reaps a finished coproc as soon as SIGCHLD arrives, closing its fds and unsetting
+-- NAME; the interpreter polls for that between commands while any coproc exists.
+function M.coproc_poll(sh)
+	local sb = ffi.new("int[1]")
+	for pid in pairs(sh.coprocs) do
+		if C.waitpid(pid, sb, 1) == pid then -- WNOHANG
+			for _, j in ipairs(sh.jobs or {}) do
+				if j.pid == pid and not j.done then
+					j.done, j.status = true, M.wexit(sb[0])
+				end
+			end
+			M.coproc_dispose(sh, pid)
+		end
+	end
+end
+-- After the shell rewires its fds (exec redirections): an end the coproc no longer has
+-- open in the shell (closed, or moved away with `N<&fd-`) reads as -1 in NAME (bash).
+function M.coproc_fdcheck(sh)
+	for _, cp in pairs(sh.coprocs) do
+		local r = (cp.r >= 0 and C.curse_co_fcntl3(cp.r, 1, 0) < 0) and -1 or cp.r
+		local w = (cp.w >= 0 and C.curse_co_fcntl3(cp.w, 1, 0) < 0) and -1 or cp.w
+		if r ~= cp.r or w ~= cp.w then
+			cp.r, cp.w = r, w
+			sh:array_assign(cp.name, { tostring(r), tostring(w) }, false)
+		end
+	end
+end
+
+-- ---- exported functions (`export -f`) ------------------------------------------------
+-- A function travels in the environment as BASH_FUNC_name%%=() { … } (bash's layout);
+-- the variable is rewritten whenever the definition or the export attribute changes.
+function M.fexport_sync(sh, name)
+	local key = "BASH_FUNC_" .. name .. "%%"
+	local txt
+	if sh.fexport and sh.fexport[name] and sh.functions[name] then
+		txt = require("interp")._int.func_export_text(sh, name)
+	end
+	if txt then
+		C.setenv(key, txt, 1)
+	else
+		C.unsetenv(key)
+	end
+end
+-- A new shell imports each BASH_FUNC_name%% whose value is EXACTLY one definition of
+-- `name` — anything trailing it (`() { :; }; echo BAD`, CVE-2014-6271 and kin) or a
+-- malformed body is rejected (bash: "error importing function definition").
+function M.import_functions(sh)
+	local list = sh.fimports
+	sh.fimports = nil
+	if not list then
+		return
+	end
+	local P = require("parser")
+	for _, f in ipairs(list) do
+		local name, val = f[1], f[2]
+		local src = name .. " " .. val
+		local ok, ast = false, nil
+		-- (a path-like name is never imported: `/bin/echo` must stay the program)
+		if val:sub(1, 4) == "() {" and not name:find("/", 1, true) then
+			ok, ast = pcall(P.parse, src)
+		end
+		local st = ok and type(ast) == "table" and not ast.perr and #ast.stmts == 1 and ast.stmts[1]
+		if st and st.t == "funcdef" and st.name == name and st.deftext
+			and st.deftext:gsub("%s+$", "") == src:gsub("%s+$", "") then
+			sh.functions[name] = st.body
+			sh.func_redirs = sh.func_redirs or {}
+			sh.func_redirs[name] = st.redirs
+			sh.func_src = sh.func_src or {}
+			sh.func_src[name] = nil
+			sh.func_def = sh.func_def or {}
+			sh.func_def[name] = st
+			sh.fexport = sh.fexport or {}
+			sh.fexport[name] = true
+		else
+			io.stderr:write("curse: error importing function definition for `" .. name .. "'\n")
+		end
+	end
+end
+
 -- Register a background job (for `jobs`/`wait %spec`/`wait -n`) and set $!.
 function M.job_add(sh, pid, cmdstr)
 	sh.jobs = sh.jobs or {}
@@ -1967,6 +2077,7 @@ function Shell:spawn_bg(args, cmdstr)
 	local fa = ffi.new("uint8_t[1024]")
 	C.posix_spawn_file_actions_init(fa)
 	C.posix_spawn_file_actions_addopen(fa, 0, "/dev/null", 0, 0) -- async job: stdin </dev/null
+	C.setenv("_", execpath, 1) -- (the program's `_` is its path, as in Shell:exec)
 	local pidp = ffi.new("curse_pid_t[1]")
 	local attr = child_spawnattr(self)
 	local rc = C.posix_spawnp(pidp, execpath, fa, attr, ffi.cast("char *const *", argv), C.environ)
@@ -3668,6 +3779,9 @@ function Shell:set_str(name, s)
 		s = M.cstr(s)
 	end -- bash vars are C strings: cut at NUL
 	local dn = self:deref(name)
+	if dn == "FUNCNAME" then
+		return -- assignments to FUNCNAME have no effect (bash): it's the call stack
+	end
 	local b = box(dn, self.vars)
 	if b.lower then -- declare -l / -u / -c: the value is case-folded on every assignment
 		s = s:lower()
@@ -3721,6 +3835,7 @@ function Shell:import_env()
 			elseif
 				k == "UID"
 				or k == "EUID"
+				or k == "_" -- (a child's `_` is the program's path, set at each exec — not $_)
 				or k == "PPID" -- shell-computed, not from env
 				or k == "BASHOPTS"
 			then -- readonly, derived live from the option state
@@ -3730,6 +3845,9 @@ function Shell:import_env()
 			elseif k:match("^[%a_][%w_]*$") then
 				self:set_str(k, s:sub(eq + 1))
 				self.vars[k].exported = true -- inherited env vars are exported (bash)
+			elseif k:match("^BASH_FUNC_.+%%%%$") then -- an exported function (M.import_functions)
+				self.fimports = self.fimports or {}
+				self.fimports[#self.fimports + 1] = { k:sub(11, -3), s:sub(eq + 1) }
 			end
 		end
 		i = i + 1
@@ -3821,6 +3939,9 @@ function Shell:is_assoc(name)
 end
 
 function Shell:array_assign(name, values, append)
+	if self:deref(name) == "FUNCNAME" then
+		return -- (see set_str)
+	end
 	local b = box(self:deref(name), self.vars)
 	if append and b.arr then
 		local base = arr_max(b.arr) + 1

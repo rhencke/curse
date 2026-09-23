@@ -2447,68 +2447,35 @@ local KEYWORDS = {
 	["coproc"] = 1,
 }
 
--- Deparse a function body AST into bash's canonical single-function form, as
--- `declare -f`, `type NAME`, and `command -V NAME` all print it:
---     NAME () \n{ \n    stmt\n    stmt\n}
--- (header has a trailing space, `{ ` a trailing space, body indented 4 spaces).
--- We only render the shapes we can reproduce byte-for-byte — a plain simple
--- command of unquoted literal words — and return nil for anything else, so
--- callers fall back to the verbatim definition text (never worse than before).
-local function deparse_plain_word(w)
-	if w.k ~= "word" or not w.parts or #w.parts == 0 then
-		return nil
-	end
-	local out = {}
-	for _, p in ipairs(w.parts) do
-		for k in pairs(p) do
-			if k ~= "lit" and k ~= "q" then
-				return nil
-			end
-		end
-		if p.q ~= false or type(p.lit) ~= "string" then
-			return nil
-		end
-		out[#out + 1] = p.lit
-	end
-	return table.concat(out)
-end
-local function deparse_stmt(st)
-	if st.t ~= "simple" or not st.words or #st.words == 0 then
-		return nil
-	end
-	if (st.redirs and #st.redirs > 0) or (st.assigns and #st.assigns > 0) then
-		return nil
-	end
-	local ws = {}
-	for _, w in ipairs(st.words) do
-		local s = deparse_plain_word(w)
-		if not s then
-			return nil
-		end
-		ws[#ws + 1] = s
-	end
-	return table.concat(ws, " ")
-end
-local function deparse_func(name, body)
-	if type(body) ~= "table" or #body == 0 then
-		return nil
-	end
-	local lines = {}
-	for _, st in ipairs(body) do
-		local s = deparse_stmt(st)
-		if not s then
-			return nil
-		end
-		lines[#lines + 1] = "    " .. s
-	end
-	return name .. " () \n{ \n" .. table.concat(lines, "\n") .. "\n}"
+-- A function's text as bash prints it (`declare -f`, `type`, `command -V`): the
+-- print_cmd.c-exact deparse (deparse.lua, loaded only when something is printed), falling
+-- back to the verbatim definition text for a construct it can't reproduce.
+local function deparse_func(name, st)
+	return require("deparse").func(name, st.body, st.redirs, st.subbody) or st.deftext
 end
 M.deparse_func = deparse_func -- also used by emit.lua at compile time (parity)
 -- The stored function body text for `declare -f`/`type`/`command -V`: the
 -- bash-canonical deparse, computed at DEFINITION time in both tiers (so interp
 -- and compiled print identically) and falling back to the verbatim source.
-local function func_body_text(sh, name)
-	return sh.func_src and sh.func_src[name]
+-- An exported function's environment text (BASH_FUNC_name%%): re-parse the printed
+-- definition (every function has one — compiled ones embed it) and print it flat.
+local func_body_text
+local function func_export_text(sh, name)
+	local txt = func_body_text(sh, name)
+	local ok, ast = pcall(P.parse, txt or "")
+	local st = ok and type(ast) == "table" and ast.stmts and ast.stmts[1]
+	if not (st and st.t == "funcdef") then
+		return nil
+	end
+	return require("deparse").export_text(st)
+end
+func_body_text = function(sh, name)
+	local src = sh.func_src and sh.func_src[name]
+	if src == nil and sh.func_def and sh.func_def[name] then -- deparsed on first print
+		src = deparse_func(name, sh.func_def[name])
+		sh.func_src[name] = src
+	end
+	return src
 end
 
 -- Find `name` in PATH (existence, F_OK — bash's type/command-v report a
@@ -3286,6 +3253,9 @@ local function job_reap(sh, job, nohang)
 	if r > 0 then
 		job.done = true
 		job.status = rt.wexit(sb[0])
+		if sh.coprocs then
+			rt.coproc_dispose(sh, job.pid)
+		end
 		local s = bit.band(sb[0], 0x7f)
 		if s ~= 0 and s ~= 0x7f then
 			job.sig = s
@@ -4151,7 +4121,7 @@ exec_stmt = function(sh, st, hook)
 		-- a funcdef whose name is an expansion (`$foo-bar()`) is a NON-fatal runtime
 		-- error (bash: status 1) — the name was captured raw by the parser. bash is
 		-- otherwise lenient (a literal `=` in the name is fine: `func-name=ext`).
-		if not st.name:match("^[%w_:%.+@/][%w_%.%-:+@/!#=]*$") then
+		if not st.name:match("^[%w_:%.+@/%%%^~,][%w_%.%-:+@/!#=%%%^~,]*$") then
 			io.stderr:write("curse: `" .. st.name .. "': not a valid identifier\n")
 			sh.status = 1
 			return
@@ -4165,7 +4135,12 @@ exec_stmt = function(sh, st, hook)
 		sh.func_redirs = sh.func_redirs or {}
 		sh.func_redirs[st.name] = st.redirs -- `f(){ … } >&2`
 		sh.func_src = sh.func_src or {}
-		sh.func_src[st.name] = deparse_func(st.name, st.body) or st.deftext -- canonical body for declare -f
+		sh.func_src[st.name] = nil -- printed text: deparsed from the definition on demand
+		sh.func_def = sh.func_def or {}
+		sh.func_def[st.name] = st
+		if sh.fexport and sh.fexport[st.name] then
+			rt.fexport_sync(sh, st.name) -- a redefinition re-exports the new body
+		end
 		-- definition site for `declare -F` under extdebug (name line file)
 		sh.func_line = sh.func_line or {}
 		sh.func_line[st.name] = st.line
@@ -4186,6 +4161,9 @@ exec_stmt = function(sh, st, hook)
 		end
 		sh.status = 0
 	elseif t == "simple" then
+		if sh.coprocs and next(sh.coprocs) then
+			rt.coproc_poll(sh) -- a coproc that finished is reaped now (bash: on SIGCHLD)
+		end
 		local pnp, pnf = procsub_mark(sh) -- drain only <()/>() this command registers
 		-- Alias expansion is done in the PARSER (a source-deterministic in-context
 		-- splice — see make_parser), so the tree reaching here is already expanded and
@@ -4271,6 +4249,9 @@ exec_stmt = function(sh, st, hook)
 			local ok = true
 			if st.redirs then
 				_, ok = apply_redirs(sh, st.redirs)
+				if sh.coprocs then
+					rt.coproc_fdcheck(sh) -- a coproc end it closed/moved reads as -1
+				end
 			end
 			-- exec [-a name] [--] [cmd…]
 			local k, argv0 = 2, nil
@@ -4687,6 +4668,56 @@ exec_stmt = function(sh, st, hook)
 		end
 		local cmdstr = st.text or (c1 and c1.words and c1.words[1] and c1.words[1].parts[1] and c1.words[1].parts[1].lit) or "job"
 		job_add(sh, pid, cmdstr)
+		sh.bg_pids = sh.bg_pids or {}
+		sh.bg_pids[#sh.bg_pids + 1] = pid
+		sh.status = 0
+	elseif t == "coproc" then
+		-- coproc NAME cmd: run cmd asynchronously with its stdin/stdout on two pipes whose
+		-- other ends the shell keeps as NAME=(read-fd write-fd); NAME_PID and $! = its pid.
+		rt.need_process(sh)
+		sh.coprocs = sh.coprocs or {}
+		for opid, cp in pairs(sh.coprocs) do -- (bash: one at a time is supported; warn, go on)
+			io.stderr:write(("curse: warning: execute_coproc: coproc [%d:%s] still exists\n"):format(opid, cp.name))
+		end
+		io.flush()
+		local rp, wp = ffi.new("int[2]"), ffi.new("int[2]")
+		C.pipe(rp)
+		C.pipe(wp)
+		local r0, r1 = rt.fd_below(rp[0], 64), rt.fd_below(rp[1], 64)
+		local w0, w1 = rt.fd_below(wp[0], 64), rt.fd_below(wp[1], 64)
+		C.curse_sig_hold(1)
+		local pid = rt.fork()
+		if pid == 0 then
+			C.dup2(w0, 0)
+			C.dup2(r1, 1)
+			for _, fd in ipairs({ r0, r1, w0, w1 }) do
+				C.close(fd)
+			end
+			for _, cp in pairs(sh.coprocs) do -- (an older coproc's ends aren't this one's)
+				C.close(cp.r)
+				C.close(cp.w)
+			end
+			sh.coprocs = nil
+			reset_child_sigtraps(sh)
+			C.curse_sig_hold(0)
+			sh.in_subprogram = (sh.in_subprogram or 0) + 1
+			sh.loopdepth = 0
+			local ok, err = pcall(function()
+				sh.out = io.write
+				exec_stmt(sh, st.cmd, hook)
+			end)
+			child_status(sh, ok, err)
+			rt.child_exit(sh, sh.status or 0)
+		end
+		C.curse_sig_hold(0)
+		C.close(r1)
+		C.close(w0)
+		C.fcntl(r0, 2, 1) -- F_SETFD FD_CLOEXEC: nothing the shell runs inherits these
+		C.fcntl(w1, 2, 1)
+		sh:array_assign(st.name, { tostring(r0), tostring(w1) }, false)
+		sh:set_str(st.name .. "_PID", tostring(pid))
+		sh.coprocs[pid] = { name = st.name, r = r0, w = w1 }
+		job_add(sh, pid, "coproc " .. st.name)
 		sh.bg_pids = sh.bg_pids or {}
 		sh.bg_pids[#sh.bg_pids + 1] = pid
 		sh.status = 0
@@ -5604,6 +5635,7 @@ M._int = {
 	SETFLAG = SETFLAG,
 	SETOPT = SETOPT,
 	func_body_text = func_body_text,
+	func_export_text = func_export_text,
 	exec_list = exec_list,
 	statbuf = statbuf,
 	statbuf2 = statbuf2,

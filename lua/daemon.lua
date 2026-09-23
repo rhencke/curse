@@ -309,6 +309,9 @@ local function serve_request(cfd, req, fds, ctx)
 		rt.sig_apply_mask(req.sigign)
 	end
 	rt.startup_ignored(sh, req.sigign)
+	if sh.fimports then
+		rt.import_functions(sh) -- exported functions (BASH_FUNC_name%%) from the caller's env
+	end
 	-- A Lua error escaping the run is a curse BUG: report it on the request's stderr
 	-- (status 1) instead of failing silently.
 	local ok = xpcall(function()

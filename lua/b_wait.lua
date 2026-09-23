@@ -61,6 +61,9 @@ return function(sh, cmd, args, hook, tcb)
 					if j.pid == r then
 						j.done = true
 						j.status = est
+						if sh.coprocs then
+							rt.coproc_dispose(sh, r)
+						end
 					end
 				end
 				sh.status = est

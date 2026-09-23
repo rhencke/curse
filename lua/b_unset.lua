@@ -29,6 +29,10 @@ return function(sh, cmd, args, hook, tcb)
 			elseif a:sub(1, 1) == "-" and #a > 1 then -- other flags: ignore
 			elseif fmode then
 				sh.functions[a] = nil
+				if sh.fexport and sh.fexport[a] then -- (it leaves the environment too)
+					sh.fexport[a] = nil
+					rt.fexport_sync(sh, a)
+				end
 			else
 				local nm, sub = a:match("^([%a_][%w_]*)%[(.+)%]$")
 				if nm then
@@ -111,6 +115,10 @@ return function(sh, cmd, args, hook, tcb)
 						end -- re-apply locale (bash)
 					elseif sh.functions[a] then
 						sh.functions[a] = nil -- plain unset falls back to a function
+						if sh.fexport and sh.fexport[a] then
+							sh.fexport[a] = nil
+							rt.fexport_sync(sh, a)
+						end
 					end
 				end
 			end

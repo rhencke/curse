@@ -178,14 +178,37 @@ return function(sh, cmd, args, hook, tcb)
 				end
 			end
 			sh.status = allok and 0 or 1
+		elseif (funcnames or funcbody) and #rest > 0 and (cmd == "export" or doexport or unexport or plusx) then
+			-- `export -f NAME…` / `declare -fx NAME…` (`-n`/`+x`: un-export): the function
+			-- goes into the environment as BASH_FUNC_NAME%% (rt.fexport_sync)
+			local allok = true
+			for _, nm in ipairs(rest) do
+				if nm:find("=", 1, true) then -- (NAME=… can't be an environment function)
+					io.stderr:write("curse: " .. cmd .. ": " .. nm .. ": cannot export\n")
+					allok = false
+				elseif sh.functions[nm] then
+					sh.fexport = sh.fexport or {}
+					sh.fexport[nm] = not (unexport or plusx) or nil
+					rt.fexport_sync(sh, nm)
+				else
+					io.stderr:write("curse: " .. cmd .. ": " .. nm .. ": not a function\n")
+					allok = false
+				end
+			end
+			sh.status = allok and 0 or 1
 		elseif funcnames or funcbody then
 			-- declare -F [name…] lists `declare -f NAME`; -f prints bodies (not
 			-- reconstructed here) — either way the exit status signals existence.
+			-- With no names, an exported function's listing is marked `declare -fx NAME`,
+			-- and -x (or `export -f`) lists only the exported ones.
 			local names, allok, named = rest, true, #rest > 0
+			local fx = sh.fexport or {}
 			if #names == 0 then
 				names = {}
 				for k in pairs(sh.functions) do
-					names[#names + 1] = k
+					if not (doexport or cmd == "export") or fx[k] then
+						names[#names + 1] = k
+					end
 				end
 				table.sort(names)
 			end
@@ -198,6 +221,9 @@ return function(sh, cmd, args, hook, tcb)
 						if d then
 							sh:echo(d)
 						end
+						if not named and fx[nm] then
+							sh:echo("declare -fx " .. nm)
+						end
 					elseif funcnames then
 						if named and sh.shopt.extdebug then -- extdebug: `name line file`
 							sh:echo(
@@ -208,7 +234,7 @@ return function(sh, cmd, args, hook, tcb)
 									.. (sh.func_file and sh.func_file[nm] or "")
 							)
 						else
-							sh:echo(named and nm or ("declare -f " .. nm))
+							sh:echo(named and nm or ((fx[nm] and "declare -fx " or "declare -f ") .. nm))
 						end
 					end
 				else

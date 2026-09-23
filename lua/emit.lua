@@ -416,6 +416,9 @@ local function scan_xtrace(node)
 	if type(node) ~= "table" then
 		return false
 	end
+	if node.t == "coproc" then -- a coproc is reaped asynchronously (bash's SIGCHLD); only the
+		return true -- interpreter polls for it between commands (rt.coproc_poll)
+	end
 	if node.t == "simple" and node.words and node.words[1] and node.words[1].parts[1]
 		and node.words[1].parts[1].lit == "set"
 	then
@@ -1631,7 +1634,7 @@ end
 local subshell_stmt_inproc_ok
 local function subshell_list_inproc_ok(list, unsafe)
 	unsafe = unsafe or EF.sub_unsafe_fn or {}
-	for _, st in ipairs(list) do
+	for _, st in ipairs(list or {}) do -- (nil: an if's final `else` clause has no cond)
 		if not subshell_stmt_inproc_ok(st, unsafe) then return false end
 	end
 	return true
@@ -3301,7 +3304,7 @@ local NO_LIFT = {}
 for _, n in ipairs({ "OPTIND", "OPTARG", "OPTERR", "REPLY", "SECONDS", "RANDOM", "SRANDOM",
 	"LINENO", "HISTCMD", "HISTSIZE", "HISTFILESIZE", "TMOUT", "COLUMNS", "LINES", "FUNCNEST",
 	"BASH_XTRACEFD", "SHLVL", "PPID", "UID", "EUID", "BASHPID", "BASH_SUBSHELL", "EPOCHSECONDS",
-	"EPOCHREALTIME", "BASH_ARGC", "COMP_CWORD", "COMP_POINT", "IFS", "_" }) do
+	"EPOCHREALTIME", "BASH_ARGC", "COMP_CWORD", "COMP_POINT", "IFS", "_", "FUNCNAME" }) do
 	NO_LIFT[n] = true
 end
 analyze_lift = function(ast)
@@ -3925,7 +3928,7 @@ H.funcdef = function(cx, st, after)
 		return cx.delegate(st, after)
 	end
 	local p = cx.newpc()
-	if not st.name:match("^[%w_:%.+@/][%w_%.%-:+@/!#=]*$") then -- name is an expansion (`$foo-bar()`):
+	if not st.name:match("^[%w_:%.+@/%%%^~,][%w_%.%-:+@/!#=%%%^~,]*$") then -- name is an expansion (`$foo-bar()`):
 		cx.blocks[p] = ("io.stderr:write(%q); sh.status = 1; pc = %d") -- non-fatal runtime error (bash)
 			:format("curse: `" .. st.name .. "': not a valid identifier\n", after)
 	elseif cx.funcflags[st.name] then
@@ -4263,7 +4266,7 @@ simple_compiled = function(cx, st, after)
 		if re then
 			local p = cx.newpc()
 			cx.blocks[p] = dbg(st)
-				.. ("do rt.need_process(sh); local __rs = {}; sh.status = (%s) and 0 or 1 end; pc = %d"):format(re, after)
+				.. ("do rt.need_process(sh); local __rs = {}; sh.status = (%s) and 0 or 1; if sh.coprocs then rt.coproc_fdcheck(sh) end end; pc = %d"):format(re, after)
 			return p
 		end
 	end
@@ -6794,7 +6797,7 @@ function M.emit(ast, opts)
 	local funcsrc, funcline = {}, {} -- name -> verbatim definition text / def line (top-level funcdefs)
 	for _, st in ipairs(ast.stmts) do
 		if st.t == "funcdef" and st.deftext then
-			funcsrc[st.name] = require("interp").deparse_func(st.name, st.body) or st.deftext
+			funcsrc[st.name] = require("interp").deparse_func(st.name, st)
 		end
 		if st.t == "funcdef" and st.line then
 			funcline[st.name] = { st.line, st.bline or st.line }

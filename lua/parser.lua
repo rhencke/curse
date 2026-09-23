@@ -1026,6 +1026,7 @@ local function strip_contin(w)
 end
 
 local function parse_word(w)
+	local src = w -- as written (`declare -f` prints words so)
 	w = strip_contin(w)
 	local parts = {}
 	local function add(p)
@@ -1146,9 +1147,10 @@ local function parse_word(w)
 			end
 		end
 	end
-	return { k = "word", parts = parts }
+	return { k = "word", parts = parts, src = src }
 end
 M.parse_word = parse_word
+M.scan_cmdsub = scan_cmdsub
 
 -- Memoize the runtime-facing parsers. The interpreter re-parses the SAME arith
 -- expressions and words on every loop iteration — $(( … )), array subscripts,
@@ -1326,6 +1328,7 @@ local function parse_dbracket(toks, quoted)
 			else
 				serr = true
 			end
+			e.paren = (e.paren or 0) + 1 -- (for `declare -f`, which prints the grouping)
 			return e
 		end
 		if t and t:match("^%-[a-zA-Z]$") then -- unary file/string test
@@ -1675,6 +1678,15 @@ M.BRACE_CAP = BRACE_CAP
 -- Declaration builtins: `NAME=(...)` in their argument position is an array
 -- literal (like a prefix assignment), not a scalar word + subshell.
 local DECL_BUILTINS = { declare = 1, typeset = 1, ["local"] = 1, readonly = 1, export = 1 }
+-- compound commands, and the words that may directly follow one (see parse_pipeline)
+local COMPOUND_T = {
+	group = 1, subshell = 1, ["if"] = 1, whilec = 1, forin = 1, forc = 1, select = 1,
+	case = 1, arithcmd = 1, dbracket = 1, funcdef = 1,
+}
+local AFTER_COMPOUND = {
+	["}"] = 1, ["then"] = 1, ["else"] = 1, ["elif"] = 1, ["fi"] = 1, ["do"] = 1, ["done"] = 1,
+	["esac"] = 1, [";;"] = 1,
+}
 
 local function add_word(words, w)
 	local factors = brace_factors(w)
@@ -1684,7 +1696,11 @@ local function add_word(words, w)
 	end
 	local n = 0
 	stream_factors(factors, function(x)
-		words[#words + 1] = parse_word(x)
+		-- (the source text belongs to the unexpanded word: the first expansion carries it,
+		-- the rest print nothing — `declare -f` shows `{a,b}` as written. A COPY: parsed
+		-- words are memoized and shared.)
+		local pw = parse_word(x)
+		words[#words + 1] = { k = pw.k, parts = pw.parts, src = n == 0 and w or false }
 		n = n + 1
 		return n >= BRACE_CAP -- true -> stop the stream
 	end)
@@ -2215,7 +2231,20 @@ local function make_parser(src, sh, aenv)
 		return w
 	end
 
-	local function brace_group() -- parse `{ stmts }` (a function body / group)
+	local brace_group
+	-- A for/select body: `do … done`, or bash's `{ … }` alternative
+	-- (`for ((i=0; i<3; i++)) { echo $i; }`, `for x in a b; { …; }`).
+	local function loop_body()
+		skipsep()
+		if src:sub(i, i) == "{" then
+			return brace_group()
+		end
+		if peekword() == "do" then
+			i = i + 2
+		end
+		return parse_stmts({ done = true })
+	end
+	brace_group = function() -- parse `{ stmts }` (a function body / group)
 		ws()
 		if src:sub(i, i) ~= "{" then
 			error("expected { for function body")
@@ -2244,14 +2273,14 @@ local function make_parser(src, sh, aenv)
 		if src:sub(i, i) == "(" then
 			i = i + 1
 			local body = parse_stmts({ [")"] = true })
-			return { { t = "subshell", line = bline, body = body } }, bline
+			return { { t = "subshell", line = bline, body = body } }, bline, true
 		end
 		return brace_group(), bline
 	end
 	-- A function definition, with any trailing redirects (`f() { … } >&2`) that apply
 	-- to the whole body on every call.
 	local function funcdef_node(nm, dstart, dline)
-		local body, bline = func_body()
+		local body, bline, subbody = func_body()
 		-- capture the definition's exact source text (name/`function` through the
 		-- closing `}`) so `declare -f`/`type`/`command -V` can recover it verbatim,
 		-- no deparser needed. `src` here is the whole script or the -c/stdin string.
@@ -2273,6 +2302,7 @@ local function make_parser(src, sh, aenv)
 			deftext = deftext,
 			line = dline,
 			bline = bline,
+			subbody = subbody, -- `f() ( … )`: redirections belong to that subshell (declare -f)
 			redirs = (#redirs > 0 and redirs or nil),
 		}
 	end
@@ -2336,10 +2366,14 @@ local function make_parser(src, sh, aenv)
 					op = "heredoc",
 					fd = fd and tonumber(fd) or 0,
 					delim = dequote_word(draw),
+					rawdelim = draw, -- as written (`declare -f` prints it so)
 					expand = not quoted,
 					strip = strip,
 					fdvar = fdvar,
 				}
+				if #heredocs_pending >= 16 then -- (bash's HEREDOC_MAX: a fatal syntax error)
+					error("maximum here-document count exceeded")
+				end
 				heredocs_pending[#heredocs_pending + 1] = r
 				return r
 			end
@@ -2382,7 +2416,7 @@ local function make_parser(src, sh, aenv)
 		if raw == "" then
 			error("syntax error near `" .. (src:sub(i, i) == "" and "newline" or src:sub(i, i)) .. "'")
 		end
-		return { fd = tfd, op = op, target = unquote(raw), fdvar = fdvar }
+		return { fd = tfd, op = op, target = unquote(raw), src = raw, fdvar = fdvar } -- (src: `declare -f`)
 	end
 
 	local function parse_command()
@@ -2404,6 +2438,36 @@ local function make_parser(src, sh, aenv)
 			return { t = "noop", line = line }
 		end
 		local dstart, dline = i, line -- byte offset + line where this command (hence a funcdef) begins
+		-- coproc [NAME] compound-command | coproc simple-command: an async command wired to
+		-- the shell by two pipes. A NAME (default COPROC) is only allowed before a COMPOUND
+		-- command — before a simple one, that word is the command (bash).
+		if peekword() == "coproc" and src:sub(i + 6, i + 6):match("[ \t]") then
+			ws()
+			i = i + 6
+			ws()
+			local function compound_at(p)
+				local c = src:sub(p, p)
+				if c == "{" or c == "(" or src:sub(p, p + 1) == "[[" then
+					return true
+				end
+				local w = src:match("^[%a_][%w_]*", p)
+				return w == "while" or w == "until" or w == "for" or w == "if" or w == "case" or w == "select"
+			end
+			local name = "COPROC"
+			if not compound_at(i) then
+				local s, e = src:find("^[%a_][%w_]*", i)
+				if s then
+					local k = e + 1
+					while src:sub(k, k):match("[ \t]") do
+						k = k + 1
+					end
+					if k > e + 1 and compound_at(k) then
+						name, i = src:sub(s, e), k
+					end
+				end
+			end
+			return { t = "coproc", name = name, cmd = parse_command(), line = dline }
+		end
 		-- function NAME [()] { … }   or   NAME() { … }
 		-- Function names may contain far more than identifier chars (bash: `show-len`,
 		-- `git-foo`, `a.b`), so match a run of non-metacharacter word bytes here.
@@ -2411,7 +2475,7 @@ local function make_parser(src, sh, aenv)
 			ws()
 			i = i + 8
 			ws()
-			local s, e = src:find("^[%w_:%.+@/][%w_%.%-:+@/!#]*", i)
+			local s, e = src:find("^[%w_:%.+@/%%%^~,][%w_%.%-:+@/!#=%%%^~,]*", i)
 			if not s then
 				error("function needs a name")
 			end
@@ -2435,7 +2499,7 @@ local function make_parser(src, sh, aenv)
 			-- (`func-name=ext () { … }`), as long as the name doesn't END in `=` — that
 			-- is an array/scalar assignment (`a=()`, `x=`), which the assignment path
 			-- handles instead (and `a=(` is caught there before we get here anyway).
-			local s, e = src:find("^[%w_:%.+@/][%w_%.%-:+@/!#=]*", i)
+			local s, e = src:find("^[%w_:%.+@/%%%^~,][%w_%.%-:+@/!#=%%%^~,]*", i)
 			if s and src:sub(e, e) ~= "=" then
 				local j = e + 1
 				while src:sub(j, j):match("[ \t]") do
@@ -2513,11 +2577,7 @@ local function make_parser(src, sh, aenv)
 				end
 				loopId = loopId + 1
 				local id = loopId
-				skipsep()
-				if peekword() == "do" then
-					i = i + 2
-				end
-				local body_stmts = parse_stmts({ done = true })
+				local body_stmts = loop_body()
 				-- Parse each arith slot eagerly, but a SYNTAX ERROR in a slot (`i='3'`,
 				-- `++'i'`) is deferred to runtime — bash reports such an error when the loop
 				-- executes and runs zero iterations non-fatally, rather than failing to parse
@@ -2539,6 +2599,7 @@ local function make_parser(src, sh, aenv)
 					init = parith(a),
 					cond = parith(b),
 					step = parith(c),
+					src = { a, b, c }, -- the slots as written (`declare -f` prints them)
 					body = body_stmts,
 					redirs = tail_redirs(),
 				}
@@ -2600,11 +2661,7 @@ local function make_parser(src, sh, aenv)
 			end
 			loopId = loopId + 1
 			local id = loopId
-			skipsep()
-			if peekword() == "do" then
-				i = i + 2
-			end
-			local body_stmts = parse_stmts({ done = true })
+			local body_stmts = loop_body()
 			if #body_stmts == 0 then
 				error("syntax error near `done'")
 			end -- bash: empty do/done is invalid
@@ -2719,7 +2776,13 @@ local function make_parser(src, sh, aenv)
 				-- so defer the parse failure to eval (caught by the arithcmd handler) rather
 				-- than aborting the whole parse.
 				local ok, e = pcall(arith, body)
-				return { t = "arithcmd", line = line, expr = ok and e or { k = "matherr" }, redirs = tail_redirs() }
+				return {
+					t = "arithcmd",
+					line = line,
+					expr = ok and e or { k = "matherr" },
+					src = body, -- as written (`declare -f` prints it)
+					redirs = tail_redirs(),
+				}
 			end
 			-- not arith: fall through to the subshell parser below (i still at the first `(`)
 		end
@@ -3212,7 +3275,7 @@ local function make_parser(src, sh, aenv)
 			end
 			local raw = word(true) -- stop at unquoted ) so `(x=2)` closes the subshell
 			if not subidx and op == "=" and raw:sub(1, 3) == "$((" and raw:sub(-2) == "))" then
-				return { t = "assign", name = name, arith = arith(raw:sub(4, -3)) }
+				return { t = "assign", name = name, arith = arith(raw:sub(4, -3)), rhssrc = raw } -- (rhssrc: declare -f)
 			end
 			return { t = "assign", name = name, index = subidx, append = (op == "+="), rhs = parse_word(raw) }
 		end
@@ -3307,9 +3370,13 @@ local function make_parser(src, sh, aenv)
 					an, ap = src:match("^([%a_][%w_]*)(%+?)=%(", i)
 				end
 				if an then
+					local a0 = i
 					i = i + #an + #ap + 1 -- past NAME (+) = ; now on `(`
 					arrayargs = arrayargs or {}
-					arrayargs[#arrayargs + 1] = { name = an, elems = parse_array_elems(), append = (ap == "+") }
+					local elems = parse_array_elems()
+					-- (src/pos: the arg as written and where it sat among the words, for `declare -f`)
+					arrayargs[#arrayargs + 1] =
+						{ name = an, elems = elems, append = (ap == "+"), src = src:sub(a0, i - 1), pos = #words + 1 }
 				elseif cmd1 and cmd1.lit == "let" and src:match("^[%a_][%w_]*%+?=%(", i) then
 					-- `let x=( 1 )`: bash reads a `NAME=( … )` arg to `let` as ONE balanced-
 					-- paren ARITH word (the `( )` group; it is NOT an array literal), so the
@@ -3352,7 +3419,8 @@ local function make_parser(src, sh, aenv)
 		local c1 = words[1] and words[1].parts and words[1].parts[1]
 		if not (c1 and c1.lit and not c1.q and #words[1].parts == 1 and DECL_BUILTINS[c1.lit]) then
 			for k = 2, #words do
-				words[k].plainarg = true
+				local w = words[k] -- (a copy: parsed words are memoized and shared)
+				words[k] = { k = w.k, parts = w.parts, src = w.src, plainarg = true }
 			end
 		end
 		local node = {
@@ -3385,10 +3453,13 @@ local function make_parser(src, sh, aenv)
 				ws()
 			end
 		end
-		if src:sub(i, i + 1) == "! " then
-			negate = true
-			i = i + 2
-			ws()
+		if src:sub(i, i):match("!") and src:sub(i + 1, i + 1):match("[ \t]") then
+			-- each `!` toggles (`! ! cmd` is cmd — bash's parser flips the invert flag)
+			while src:sub(i, i) == "!" and src:sub(i + 1, i + 1):match("[ \t]") do
+				negate = not negate
+				i = i + 2
+				ws()
+			end
 		elseif src:sub(i, i + 1) == "!(" and not (sh and sh.shopt and sh.shopt.extglob or (not sh and extglob_on)) then
 			-- without extglob, `!(cmds)` is `!` negating a ( … ) subshell, not a pattern word
 			negate = true
@@ -3405,6 +3476,16 @@ local function make_parser(src, sh, aenv)
 				i = i + 2
 				line = line + 1
 				ws()
+			end
+			-- After a COMPOUND command (and its redirections) only an operator, a separator
+			-- or a reserved word that continues the enclosing construct may follow: a word
+			-- there is a syntax error (bash: `{ :; } echo`, `f() { :; } >x { echo; }`).
+			local last = cmds[#cmds]
+			if last and COMPOUND_T[last.t] and src:sub(i, i) ~= "#" then
+				local w = src:match("^[^%s;&|()<>]+", i)
+				if w and not AFTER_COMPOUND[w] then
+					error("syntax error near unexpected token `" .. w .. "'")
+				end
 			end
 			-- a single `|` (not `||`) chains another command into the pipeline
 			if src:sub(i, i) == "|" and src:sub(i + 1, i + 1) ~= "|" then

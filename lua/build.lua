@@ -58,6 +58,7 @@ local lazy_mods = {
 	"b_shift",
 	"b_local",
 	"b_help",
+	"deparse", -- function printing (declare -f / type): only when something is printed
 }
 
 -- Wrap each core module's source in a package.preload closure. `require("x")` then
