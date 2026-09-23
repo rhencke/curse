@@ -3875,6 +3875,13 @@ end
 -- one xtrace line: $PS4 (its first char repeated per call depth) + `text`
 local function xtrace_line(sh, text)
 	local ps4 = sh:get("PS4")
+	if ps4:find("[$`\\]") then -- (PS4 is expanded like a prompt, untraced: `+[$LINENO] `)
+		local sx, st = sh.opt_x, sh.status
+		sh.opt_x = false
+		local ok, v = pcall(M.prompt_string, sh, ps4)
+		sh.opt_x, sh.status = sx, st
+		ps4 = ok and v or ps4
+	end
 	if ps4 == "" then
 		ps4 = "+ "
 	end
@@ -4692,12 +4699,22 @@ exec_stmt = function(sh, st, hook)
 			-- A bad substitution / invalid indirect in the RHS fails the assignment but is
 			-- NON-fatal (bash: `x=${bad|y}` leaves x unset, status 1, script continues) —
 			-- like a bad-subst in a command word. Catch it around the RHS expansion.
+			-- (the expanded right-hand side, kept for set -x's `name+=value` trace)
+			sh.x_rhs = nil
+			local function rhs_a()
+				sh.x_rhs = expand_assign_word(sh, st.rhs)
+				return sh.x_rhs
+			end
+			local function rhs_w()
+				sh.x_rhs = expand_word(sh, st.rhs)
+				return sh.x_rhs
+			end
 			local aok, aerr = pcall(function()
 				if nref_base then
 					sh:array_set(
 						nref_base,
 						array_key(sh, nref_base, nref_sub),
-						expand_assign_word(sh, st.rhs),
+						rhs_a(),
 						st.append
 					)
 				elseif st.index then
@@ -4705,7 +4722,7 @@ exec_stmt = function(sh, st, hook)
 						not sh:array_set(
 							st.name,
 							array_key(sh, st.name, st.index),
-							expand_assign_word(sh, st.rhs),
+							rhs_a(),
 							st.append
 						)
 					then
@@ -4716,26 +4733,26 @@ exec_stmt = function(sh, st, hook)
 				elseif st.append then
 					local b = sh.vars[sh:deref(st.name)]
 					if b and b.arr then -- `name+=value` on an array appends to element 0 (bash)
-						sh:array_set(st.name, array_key(sh, st.name, "0"), expand_assign_word(sh, st.rhs), true)
+						sh:array_set(st.name, array_key(sh, st.name, "0"), rhs_a(), true)
 					elseif b and b.int then -- integer var: += is arithmetic addition (the old value
 						-- is itself evaluated: `b=4+1; typeset -i b; b+=37` is 42 — bash)
-						sh:aset(st.name, rt.arith_str(sh, sh:get(st.name)) + M.arith_eval_str(sh, expand_word(sh, st.rhs)))
+						sh:aset(st.name, rt.arith_str(sh, sh:get(st.name)) + M.arith_eval_str(sh, rhs_w()))
 					elseif b and (b.lower or b.upper) then -- declare -l/-u: case-fold the appended result
-						local v = sh:get(st.name) .. expand_assign_word(sh, st.rhs)
+						local v = sh:get(st.name) .. rhs_a()
 						sh:set_str(st.name, b.lower and v:lower() or v:upper())
 					else
-						sh:set_str(st.name, sh:get(st.name) .. expand_assign_word(sh, st.rhs))
+						sh:set_str(st.name, sh:get(st.name) .. rhs_a())
 					end
 				else
 					local b = sh.vars[sh:deref(st.name)]
 					if b and b.arr then -- plain `name=value` on an array var writes element 0 (bash)
-						sh:array_set(st.name, array_key(sh, st.name, "0"), expand_assign_word(sh, st.rhs), false)
+						sh:array_set(st.name, array_key(sh, st.name, "0"), rhs_a(), false)
 					elseif b and b.int and not b.ref then -- integer var (declare -i): assign arith-evaluates
-						sh:aset(st.name, M.arith_eval_str(sh, expand_word(sh, st.rhs)))
+						sh:aset(st.name, M.arith_eval_str(sh, rhs_w()))
 					elseif b and (b.lower or b.upper) then -- declare -l/-u: case-fold on assign
-						local v = expand_assign_word(sh, st.rhs)
+						local v = rhs_a()
 						sh:set_str(st.name, b.lower and v:lower() or v:upper())
-					elseif sh:set_str(st.name, expand_assign_word(sh, st.rhs)) == false and not sh.applying_prefix then
+					elseif sh:set_str(st.name, rhs_a()) == false and not sh.applying_prefix then
 						error({ __curse_exit = 1, __curse_lineabort = true }) -- (a bad nameref target)
 					end
 				end
@@ -4756,6 +4773,10 @@ exec_stmt = function(sh, st, hook)
 			end
 		end
 		-- set -x: trace the assignment with its expanded value (`+ x=5`, `+ a[1]=v`)
+		if sh.opt_x and st.append and sh.x_rhs then -- `+ foo+=two` (bash traces the appended text)
+			xtrace(sh, { (st.index and (st.name .. "[" .. st.index .. "]") or st.name) .. "+="
+				.. (sh.x_rhs == "" and "" or xtrace_quote(sh.x_rhs)) }, true)
+		end
 		if sh.opt_x and not st.append then
 			local v
 			if st.index then
@@ -4821,6 +4842,9 @@ exec_stmt = function(sh, st, hook)
 		end
 		sh:set_str("_", "") -- a bare assignment resets $_ to empty (bash)
 	elseif t == "arrayassign" then
+		if sh.opt_x and st.raw then -- (bash traces an array literal as written: `+ a=(1 "b c")`)
+			xtrace_line(sh, st.name .. (st.append and "+=" or "=") .. st.raw)
+		end
 		local rb = sh.vars[sh:deref(st.name)]
 		local nb = sh.vars[st.name]
 		if nb and nb.ref and nb.s and nb.s:find("[", 1, true) then
@@ -5383,7 +5407,7 @@ exec_stmt = function(sh, st, hook)
 			sh.cur_line = st.line -- $LINENO inside the for(( init/cond/step is the `for` line (bash),
 			-- not whatever line the body last ran (the cond re-evals per iteration)
 			if sh.opt_x and st.src then
-				arith_trace(sh, (st.src[slot]:match("^%s*(.-)%s*$")))
+				arith_trace(sh, (st.src[slot]:match("^%s*(.-)$"))) -- (bash keeps a trailing blank)
 			end
 			if node.k == "arith_perr" then
 				local sv = P.arith_cmd
@@ -6143,6 +6167,8 @@ run_trap = function(sh, code)
 	local saved_tcd = sh.trap_calldepth
 	sh.trap_calldepth = sh.calldepth or 0
 	sh.in_trap = (sh.in_trap or 0) + 1
+	local sxd = sh.xdepth -- (a handler's commands trace one level deeper: `++ cmd`, bash)
+	sh.xdepth = (sxd or 0) + 1
 	local ok, err = pcall(function()
 		for _, st in ipairs(P.parse(code).stmts) do
 			exec_stmt(sh, st, function() end)
@@ -6167,6 +6193,7 @@ run_trap = function(sh, code)
 		end
 	end)
 	sh.in_trap = sh.in_trap - 1
+	sh.xdepth = sxd
 	sh.trap_calldepth = saved_tcd
 	sh.cur_line = savedline
 	if not ok then

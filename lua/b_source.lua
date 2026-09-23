@@ -88,6 +88,8 @@ return function(sh, cmd, args, hook, tcb)
 					-- sh-aware parser, so aliases defined earlier expand later and a `return`
 					-- ends the file. A syntax error stops after the valid prefix (bash),
 					-- reported as status 2 without halting the shell.
+					local sxd = sh.xdepth -- (a sourced file traces one level deeper, bash)
+					sh.xdepth = (sxd or 0) + 1
 					local rok, err = pcall(function()
 						local nextf = P.open(src, sh)
 						while true do
@@ -114,6 +116,7 @@ return function(sh, cmd, args, hook, tcb)
 							end
 						end
 					end)
+					sh.xdepth = sxd
 					sh.sourcedepth = sh.sourcedepth - 1
 					rt.source_leave(sh, sframe)
 					if #args > j and sh.params == ownp then -- (params the file SET itself stay: bash)

@@ -542,6 +542,40 @@ end
 -- past the matching `}`. Respects backslash escapes, '…'/"…" quoting (so a `}`
 -- inside quotes doesn't close), and nested `{…}` — unlike a naive find("}").
 local scan_cmdsub -- forward (defined below; scan_braces skips $(…) bodies with it)
+-- bash 5.2 parses a $( … ) body as it reads the word, so a syntax error in it fails the
+-- whole enclosing line, reported with the OUTER line: the body's first real syntax error
+-- (a premature end means its `)` came too soon), or nil. Cached by body text.
+local comsub_err_cache, comsub_err_n = {}, 0
+local function comsub_syntax(body)
+	local hit = comsub_err_cache[body]
+	if hit ~= nil then
+		return hit or nil
+	end
+	local err = false
+	local ok, ast = pcall(M.parse, body)
+	if not ok then
+		err = type(ast) == "table" and (ast.msg or "syntax error") or tostring(ast)
+	elseif ast and ast.stmts then
+		for _, st in ipairs(ast.stmts) do
+			if st.t == "parse_error" and not st.recoverable then
+				err = tostring(st.msg or "syntax error")
+				break
+			end
+		end
+	end
+	if err then
+		err = err:gsub("^[%w%._/%-]+:%d+: ", "") -- (a Lua error position isn't part of it)
+		if err:find("unexpected end of file", 1, true) or err:find("unexpected EOF", 1, true) then
+			err = "syntax error near `)'"
+		end
+	end
+	if comsub_err_n >= 512 then
+		comsub_err_cache, comsub_err_n = {}, 0
+	end
+	comsub_err_cache[body] = err
+	comsub_err_n = comsub_err_n + 1
+	return err or nil
+end
 local dparen_is_arith -- forward (defined below)
 local function scan_braces(s, bi, dq)
 	local i, ns, depth = bi + 1, #s, 1
@@ -703,7 +737,7 @@ parse_paramexp = function(inner)
 		-- like ${?@a} tolerated as empty), to match curse's prior behavior.
 		-- A special `$ ? -` followed by a non-operator (`${$(…)}`, `${?x}`) is one too.
 		if #inner == 1 or inner:match("^[%$?%-]") then
-			return { pexp = { op = "badsubst", raw = inner } }
+			return { pexp = { op = "badsubst", raw = (lenpfx and "#" or "") .. inner } } -- (${#/} as written)
 		end
 		return { var = inner }
 	end
@@ -2106,6 +2140,7 @@ end
 local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs)
 	local i, n, line = 1, #src, lineabs or 1
 	local firstline = lineabs or 1 -- (the text's first line: an EOF error counts from it)
+	local orig_src = src -- (alias expansion splices into src; an error echoes the line as written)
 	if line0 then -- a $(…) body numbers from its command's line; leading newlines don't count
 		line = line0 - #(src:match("^[ \t\n]*"):gsub("[^\n]", ""))
 	end
@@ -2613,6 +2648,17 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs)
 					prex_comsub()
 				else
 					local je, hdp = scan_cmdsub(src, i + 2, hdwarn) -- case/quote/nesting-aware boundary (errors if unclosed)
+					local cbody = src:sub(i + 2, je - 2)
+					-- (not when the static parse could be wrong: aliases in play, extglob
+					-- patterns, here-documents)
+					if not hdp and not alias_on and src:sub(i + 2, i + 2) ~= "(" and not cbody:find("[@!+*?]%(")
+						and not cbody:find("<<", 1, true)
+						and not (sh and sh.shopt and sh.shopt.expand_aliases and sh.aliases and next(sh.aliases)) then
+						local cerr = comsub_syntax(cbody)
+						if cerr then
+							error(cerr)
+						end
+					end
 					if hdp then
 						-- `$(cat <<EOF)` then the body on the following lines (bash): move those
 						-- lines (through each delimiter) inside the $( … ) text
@@ -4467,6 +4513,17 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs)
 			end
 			local e = src:find("\n", p, true) or (n + 1)
 			lg.perr.text = src:sub(b, e - 1)
+			if src ~= orig_src and lg.perr.line and not line0 then -- (the line before an alias
+				local k = lg.perr.line - firstline + 1 -- was spliced into it: bash's `math1)')
+				local ln = 0
+				for l in (orig_src .. "\n"):gmatch("([^\n]*)\n") do
+					ln = ln + 1
+					if ln == k then
+						lg.perr.text = l
+						break
+					end
+				end
+			end
 		end
 		return lg
 	end

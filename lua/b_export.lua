@@ -534,6 +534,7 @@ return function(sh, cmd, args, hook, tcb)
 						elseif doexport or sh.opt_a then
 							xb.exported = true
 							C.setenv(nm, xval, 1)
+							if nm == "TZ" then rt.tzset() end
 						end
 					end
 					if plusn then -- `typeset +n ref=v`: v went THROUGH the ref; then it's plain
@@ -683,6 +684,9 @@ return function(sh, cmd, args, hook, tcb)
 							bb.exported = true -- `export U` defers the env until U gets a value (bash)
 							if bb.s ~= nil or bb.n ~= nil then -- (through a nameref: the target's name)
 								C.setenv(nref and a or sh:deref(a), sh:get(a), 1)
+								if a == "TZ" then
+									rt.tzset()
+								end
 							end
 						end
 					end

@@ -4557,6 +4557,9 @@ function Shell:set_str(name, s)
 	end
 	if b.exported then
 		C.setenv(dn, s, 1)
+		if dn == "TZ" then -- (bash's sv_tz: an exported TZ takes effect at once)
+			M.tzset()
+		end
 	end -- keep the env in sync
 	if LOCALE_VARS[dn] then
 		M.reset_locale(self)
@@ -4911,7 +4914,43 @@ function Shell:bash_argc_array()
 	end
 	return t
 end
+-- GROUPS: the process's groups as bash's initialize_group_array orders them (getgroups,
+-- with the primary gid swapped into slot 0, or put there if missing)
+pcall(ffi.cdef, "int getgroups(int size, unsigned int *list); unsigned int getgid(void);")
+local groups_cache
+function Shell:groups_array()
+	if not groups_cache then
+		local t = {}
+		pcall(function()
+			local n = C.getgroups(0, nil)
+			local buf = ffi.new("unsigned int[?]", math.max(n, 1))
+			n = C.getgroups(n, buf)
+			for k = 0, n - 1 do
+				t[#t + 1] = tonumber(buf[k])
+			end
+			local gid = tonumber(C.getgid())
+			local at
+			for k, g in ipairs(t) do
+				if g == gid then
+					at = k
+					break
+				end
+			end
+			if not at then
+				table.insert(t, 1, gid)
+			elseif at ~= 1 then
+				t[at], t[1] = t[1], gid
+			end
+		end)
+		for k, g in ipairs(t) do
+			t[k] = tostring(g)
+		end
+		groups_cache = t
+	end
+	return groups_cache
+end
 local VIRT_ARR = {
+	GROUPS = "groups_array",
 	BASH_ARGV = "bash_argv_array",
 	BASH_ARGC = "bash_argc_array",
 	FUNCNAME = "funcname_array",
@@ -8060,6 +8099,12 @@ pcall(ffi.cdef, [[
   void curse_rt_clearerr(void *fp) asm("clearerr");
   extern void *curse_rt_stdout asm("stdout");
 ]])
+pcall(ffi.cdef, "void tzset(void);")
+function M.tzset()
+	pcall(function()
+		C.tzset()
+	end)
+end
 -- after a failed write, stdout's sticky error flag must go, or every later flush fails too
 function M.clear_stdout_err()
 	pcall(function()
@@ -9147,8 +9192,9 @@ local function do_test(sh, args)
 		if args[pos] == "(" then
 			pos = pos + 1
 			local v = expr_()
-			if args[pos] ~= ")" then
-				error({ __test_syntax = "`)' expected" })
+			if args[pos] ~= ")" then -- (whatever came instead is named — for `[` even its `]`)
+				local f = args[pos]
+				error({ __test_syntax = f and ("`)' expected, found " .. f) or "`)' expected" })
 			end
 			pos = pos + 1
 			return v
@@ -9194,8 +9240,10 @@ local function do_test(sh, args)
 			return three_args()
 		else
 			local v = expr_()
-			if pos <= hi then
-				error({ __test_syntax = "too many arguments" })
+			if pos <= hi then -- (a leftover `-op` is named: bash's test.c)
+				local left = args[pos] or ""
+				error({ __test_syntax = left:sub(1, 1) == "-" and ("syntax error: `" .. left .. "' unexpected")
+					or "too many arguments" })
 			end
 			return v
 		end
