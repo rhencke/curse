@@ -4695,13 +4695,13 @@ function M.bad_ref_target(v, ctx)
 	io.stderr:write("curse: " .. (ctx and (ctx .. ": ") or "") .. "`" .. v .. "': not a valid identifier\n")
 end
 -- declare -l / -u / -c: a value is case-folded on every assignment (scalar or element)
-local function case_fold(b, s)
+local function case_fold(b, s) -- (declare -l/-u/-c: the locale's folding, per character)
 	if b.lower then
-		return s:lower()
+		return M.fold_case(s, nil, false, true)
 	elseif b.upper then
-		return s:upper()
+		return M.fold_case(s, nil, true, true)
 	elseif b.cap then
-		return s:sub(1, 1):upper() .. s:sub(2):lower()
+		return M.fold_case(M.fold_case(s, nil, false, true), nil, true, false)
 	end
 	return s
 end
@@ -8041,6 +8041,7 @@ local function fold_case(val, pat, upper, all)
 	end
 	return table.concat(out)
 end
+M.fold_case = fold_case
 -- ${v:off:len} with a negative len that ends before off: bash's "substring expression < 0"
 -- (naming the length as written, `ltxt`) abandons the line
 local function substr_check(val, off, len, ltxt)

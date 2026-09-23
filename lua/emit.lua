@@ -1473,6 +1473,25 @@ end
 -- {}) and return its id, or nil if the body hits a compiler gap. Shared by $(…),
 -- background, and pipeline stages — the compiled tier's "run this subprogram" unit.
 local collect_names, analyze_lift -- forward: defined with the lift analysis below
+-- An INLINABLE function's vars don't count as function-touched (its calls are spliced
+-- in), so they may be run()-locals; a call that ISN'T spliced (field-split arguments)
+-- runs fn_x, which works on sh — so hand it those locals and take back what it changed.
+local function inl_sync(cmd, call)
+	local body = EF.inlinefns and EF.inlinefns[cmd]
+	if not body or not EF.runlocal_set then
+		return call
+	end
+	local names = {}
+	collect_names(body, names)
+	local pre, post = {}, {}
+	for n in spairs(names) do
+		if EF.runlocal_set[n] then
+			pre[#pre + 1] = ("sh:aset(%q, %s); "):format(n, lname(n))
+			post[#post + 1] = ("; %s = sh:aget(%q)"):format(lname(n), n)
+		end
+	end
+	return table.concat(pre) .. call .. table.concat(post)
+end
 local function emit_fragment(stmts, neg, liftset, cfraise)
 	local saved_tl, saved_neg, saved_line = emit_toplevel, emit_neg_ctx, EF.cur_line
 	-- `cfraise` ({loop=, func=}): the fragment is the BODY of a compound run in the current
@@ -4910,15 +4929,15 @@ simple_compiled = function(cx, st, after)
 			elseif cx.funcflags[cmd] and (cx.funcflags[cmd].locals or cx.funcflags[cmd].params) then
 				from = 2
 				local ff = cx.funcflags[cmd]
-				call = fnwrap(
+				call = inl_sync(cmd, fnwrap(
 					cmd,
 					st.line,
 					ff.locals and ("sh:pushCall(unpack(__a)); %s(sh); sh:popCall()"):format(fnlname(cmd))
 						or ("sh:pushParams(unpack(__a)); %s(sh); sh:popParams()"):format(fnlname(cmd))
-				)
+				))
 			elseif cx.funcflags[cmd] then -- bare function (references NO positional params): build argv
 				from = 2 -- to run the args' side effects, then a bare call (params unread)
-				call = fnwrap(cmd, st.line, ("%s(sh)"):format(fnlname(cmd)))
+				call = inl_sync(cmd, fnwrap(cmd, st.line, ("%s(sh)"):format(fnlname(cmd))))
 			elseif
 				cmd ~= nil
 				and not NATIVE_BUILTIN[cmd]
@@ -6766,6 +6785,7 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
 			loopPc = cx.loopPc,
 			stmtPc = cx.stmtPc,
 			loopvars = cx.loopvars,
+			forlocals = cx.forlocals,
 		}
 	end
 	return {
@@ -7111,6 +7131,7 @@ function M.emit(ast, opts)
 			end
 		end
 	end
+	EF.inlinefns = inlinefns -- (inl_sync: a non-spliced call of one of these)
 	-- Lift purely-arith vars to native int64. A var touched by no OUT-OF-LINE
 	-- function becomes a run()-LOCAL (register-allocated — fast in hot loops); a
 	-- direct call to an inlinable function is spliced in, so its var access counts
