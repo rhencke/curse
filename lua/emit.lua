@@ -3699,87 +3699,42 @@ local function scan_dbracket(e, f)
 end
 local function func_flags(body)
 	local f = { params = false, locals = false }
-	local function scan(stmts)
-		for _, st in ipairs(stmts) do
+	-- Every node, at any depth (&&/|| lists, pipelines, `&` jobs, array literals, (( )),
+	-- heredoc/redirect targets …): a miss here calls the function WITHOUT its arguments.
+	any_node(body, function(st)
+		if st.t then
 			scan_redir_params(st, f) -- $@/$n in any redirect target also needs the frame
-			if st.t == "simple" then
-				local cmd = st.words[1] and st.words[1].parts[1] and st.words[1].parts[1].lit
-				-- declare/typeset inside a function make their names LOCAL (bash), like `local`,
-				-- so the call needs a real frame (pushCall) — else a delegated `declare x=1`
-				-- writes the GLOBAL. `declare -g` still targets the global (interp honors -g
-				-- inside the frame), so treating any declare/typeset as frame-needing is safe.
-				if cmd == "local" or cmd == "declare" or cmd == "typeset" then
-					f.locals = true
-				end
-				-- getopts parses $@ and shift mutates it — both implicitly need the callee's
-				-- positional params (no $-word to trigger scan_word_param), so force the swap.
-				if cmd == "getopts" or cmd == "shift" then
-					f.params = true
-				end
-				-- eval / source / . run an OPAQUE string (or file) against the live frame — it
-				-- can reference $@/$n and declare locals (`eval 'local v=$*'`), which the scan
-				-- can't see, so conservatively give the callee a full frame (params + locals).
-				if cmd == "eval" or cmd == "source" or cmd == "." then
-					f.params = true
-					f.locals = true
-				end
-				for j = 2, #st.words do
-					scan_word_param(st.words[j], f)
-				end
-			elseif st.t == "assign" then
-				if st.arith then
-					scan_arith_param(st.arith, f)
-				elseif st.rhs then
-					scan_word_param(st.rhs, f)
-				end
-			elseif st.t == "forc" or st.t == "whilec" then
-				scan_arith_param(st.init, f)
-				scan_arith_param(cond_arith(st.cond), f)
-				scan_arith_param(st.step, f)
-				if type(st.cond) == "table" and st.cond[1] then
-					scan(st.cond)
-				end -- COMMAND condition (a stmt list)
-				scan(st.body)
-			elseif st.t == "forin" then
-				for _, w in ipairs(st.words) do
-					scan_word_param(w, f)
-				end
-				scan(st.body)
-			elseif st.t == "if" then
-				for _, cl in ipairs(st.clauses) do
-					scan_arith_param(cond_arith(cl.cond), f)
-					if type(cl.cond) == "table" and cl.cond[1] then
-						scan(cl.cond)
-					end -- COMMAND condition
-					scan(cl.body)
-				end
-			-- Compound bodies also reference $@/$*/$n and define locals — a function whose
-			-- body is a pipeline (`f(){ echo "$1" | od; }`), case, group, subshell, or &&/||
-			-- list needs the param swap / frame just as much. Missing these dispatched the
-			-- function bare, so $1 inside the pipeline saw the CALLER's (empty) params.
-			elseif st.t == "pipeline" then
-				scan(st.cmds or {})
-			elseif st.t == "andor" then
-				for _, it in ipairs(st.items or {}) do
-					if it.cmd then
-						scan({ it.cmd })
-					end
-				end
-			elseif st.t == "case" then
-				if st.subject then
-					scan_word_param(st.subject, f)
-				end
-				for _, cl in ipairs(st.clauses or {}) do
-					scan(cl.body or {})
-				end
-			elseif st.t == "group" or st.t == "subshell" then
-				scan(st.body or {})
-			elseif st.t == "dbracket" then
-				scan_dbracket(st.expr, f) -- $@/$n inside [[ … ]]
-			end
 		end
-	end
-	scan(body)
+		if st.t == "simple" then
+			local cmd = st.words and st.words[1] and st.words[1].parts[1] and st.words[1].parts[1].lit
+			-- declare/typeset inside a function make their names LOCAL (bash), like `local`,
+			-- so the call needs a real frame (pushCall) — else a delegated `declare x=1`
+			-- writes the GLOBAL. `declare -g` still targets the global (interp honors -g
+			-- inside the frame), so treating any declare/typeset as frame-needing is safe.
+			if cmd == "local" or cmd == "declare" or cmd == "typeset" then
+				f.locals = true
+			end
+			-- getopts parses $@ and shift mutates it — both implicitly need the callee's
+			-- positional params (no $-word to trigger scan_word_param), so force the swap.
+			if cmd == "getopts" or cmd == "shift" then
+				f.params = true
+			end
+			-- eval / source / . run an OPAQUE string (or file) against the live frame — it
+			-- can reference $@/$n and declare locals (`eval 'local v=$*'`), which the scan
+			-- can't see, so conservatively give the callee a full frame (params + locals).
+			if cmd == "eval" or cmd == "source" or cmd == "." then
+				f.params = true
+				f.locals = true
+			end
+		elseif st.t == "dbracket" then
+			scan_dbracket(st.expr, f) -- $@/$n inside [[ … ]]
+		elseif st.parts ~= nil and st.t == nil then -- a word
+			scan_word_param(st, f)
+		elseif st.k ~= nil then -- an arith node ((( … )), x=$(( … )), for (( … )))
+			scan_arith_param(st, f)
+		end
+		return false -- (keep walking)
+	end)
 	return f
 end
 
