@@ -1676,6 +1676,7 @@ EF.upv_wrapped = function(fname)
 	return (EF.lifted_names and #EF.lifted_names > 0) and ("__upv_wrap(" .. fname .. ")") or fname
 end
 local compile_cmdsub_inner
+local func_locals
 -- (compiling the body moves the compile-time line: put it back for the enclosing command)
 local function compile_cmdsub(...)
 	local l, cl, ln, cil = EF.cur_line, EF.cur_cline, EF.cur_loopn, EF.cs_in_loop
@@ -3695,6 +3696,102 @@ analyze_lift = function(ast)
 	return lifted, disq, localed
 end
 
+-- A function's own integer locals, lifted into registers of its compiled body: the names
+-- its LEADING `local NAME=INT` statements declare, when nothing else could see them in sh —
+-- dynamic scoping lets a callee read a caller's locals, so the body may call no user
+-- function (nor anything that runs code or names variables at runtime: eval/source/trap/
+-- declare/set/…, a dynamic command word, ${!ref}) and hold no subshell/redirected compound;
+-- and they must pass the same lift analysis as any var (numeric-only assignments, no
+-- writer builtins, …). Pipelines/$(…)/delegated statements flush and reload them.
+local FL_REJECT = { eval = 1, source = 1, ["."] = 1, trap = 1, declare = 1, typeset = 1, export = 1,
+	readonly = 1, unset = 1, set = 1, ["local"] = 1, compgen = 1, exec = 1, command = 1, builtin = 1,
+	shopt = 1, enable = 1, alias = 1, unalias = 1, hash = 1, type = 1 }
+function func_locals(fst, funcflags)
+	local body, names, k = fst.body, {}, 1
+	while body[k] and body[k].t == "simple" and not body[k].redirs and not body[k].assigns do
+		local w1 = body[k].words and body[k].words[1]
+		if not (w1 and full_lit(w1) == "local") then
+			break
+		end
+		for j = 2, #body[k].words do
+			-- (canonical decimal only: `local v=010` must keep its text — `$v` is 010, not 8)
+			local nm, v = (full_lit(body[k].words[j]) or ""):match("^([%a_][%w_]*)=(%-?%d+)$")
+			if nm and #v < 16 and (v == "0" or v:match("^%-?[1-9]%d*$")) then
+				names[#names + 1] = nm
+			end
+		end
+		k = k + 1
+	end
+	if #names == 0 then
+		return {}
+	end
+	local rest = {}
+	for i = k, #body do
+		rest[#rest + 1] = body[i]
+	end
+	local bad = any_node(rest, function(n)
+		if n.t == "subshell" or n.t == "funcdef" or n.t == "coproc" or n.procsub then
+			return true
+		end
+		if n.t ~= "simple" and n.redirs then
+			return true -- (a redirected compound)
+		end
+		if n.pexp and (n.pexp.op == "indirect" or n.pexp.op == "prefix") then
+			return true
+		end
+		if n.t == "simple" and n.words and n.words[1] then
+			local c = full_lit(n.words[1])
+			if not c or FL_REJECT[c] or funcflags[c] then
+				return true
+			end
+		end
+		return false
+	end)
+	if bad then
+		return {}
+	end
+	local _, disq = analyze_lift({ stmts = body })
+	if not disq then
+		return {}
+	end
+	local out = {}
+	for _, nm in ipairs(names) do
+		if not disq[nm] and not NO_LIFT[nm] and not (EF.ro_names and EF.ro_names[nm]) then
+			out[#out + 1] = nm
+		end
+	end
+	table.sort(out)
+	return out
+end
+-- Names the program makes readonly anywhere: a `local` of one fails, so it never lifts.
+local function readonly_names(stmts)
+	local ro = {}
+	any_node(stmts, function(n)
+		local w = n.t == "simple" and n.words
+		local c = w and w[1] and full_lit(w[1])
+		if c == "readonly" or c == "declare" or c == "typeset" or c == "local" then
+			local isro = c == "readonly"
+			for j = 2, #w do
+				local a = full_lit(w[j]) or ""
+				if a:match("^%-[%a]*r") then
+					isro = true
+				end
+			end
+			if isro then
+				for j = 2, #w do
+					local nm = (full_lit(w[j]) or ""):match("^([%a_][%w_]*)")
+					if nm then
+						ro[nm] = true
+					end
+				end
+			end
+		end
+		return false
+	end)
+	return ro
+end
+EF.readonly_names = readonly_names
+
 -- Does a function need a positional-param swap / a `local` frame? A call to a
 -- function that needs neither is emitted bare (fn_x(sh)); one that needs only
 -- params uses the lightweight pushParams; only `local` needs the full frame.
@@ -5104,6 +5201,13 @@ simple_compiled = function(cx, st, after)
 				.. "; local __lok = true; "
 				.. table.concat(calls, "; ")
 				.. "; sh.status = __lok and 0 or 1"
+			-- a function's lifted locals (func_locals): their registers take the new values
+			for j = 2, #st.words do
+				local nm = (unq_full_lit(st.words[j]) or ""):match("^([%a_][%w_]*)=")
+				if nm and EF.fn_locals and EF.fn_locals[nm] and cx.lifted[nm] then
+					body = body .. ("; %s = sh:aget(%q)"):format(lname(nm), nm)
+				end
+			end
 		end
 	elseif cmd == "test" or cmd == "[" then
 		-- [ EXPR ] / test EXPR: the operator/arity are compile-time known; compute the
@@ -6841,6 +6945,11 @@ assemble = function(cfg, sig, opts)
 	for _, n in ipairs(opts.runlocals or {}) do
 		o[#o + 1] = ("  local %s = sh:aget(%q)"):format(lname(n), n)
 	end
+	-- a function's lifted locals: loaded by their `local` statement, never written back (the
+	-- call's local frame is dropped on return; a `local` that failed — readonly — isn't ours)
+	for _, n in ipairs(opts.fnlocals or {}) do
+		o[#o + 1] = ("  local %s = 0LL"):format(lname(n))
+	end
 	for _, n in ipairs(opts.upvals or {}) do
 		o[#o + 1] = ("  %s = sh:aget(%q)"):format(lname(n), n)
 	end
@@ -7063,6 +7172,7 @@ function M.emit(ast, opts)
 	-- nameref write-through). Otherwise a compiled `eval "x=v"` would skip readonly, etc.
 	EF.has_attr = EF.fragment or scan_attr(ast.stmts) -- gate compiled attribute-aware scalar assign
 	EF.has_dyncode = scan_dyncode(ast.stmts) -- eval/source present → a $(…) can't assume its body's names are externals
+	EF.ro_names = nil -- (this program's readonly names: computed on first need — func_locals)
 	EF.has_nameref = EF.fragment or scan_nameref(ast.stmts) -- declare -n present → delegate scalar assigns
 	EF.has_err = scan_trap(ast.stmts, { ERR = 1 }) -- gate compiled ERR-trap firing
 	EF.has_debug = scan_trap(ast.stmts, { DEBUG = 1 }) -- gate compiled DEBUG-trap firing
@@ -7270,8 +7380,24 @@ function M.emit(ast, opts)
 		if st.t == "funcdef" then
 			-- keep every fn_x (indirect/dynamic dispatch); it can't see run-locals, so
 			-- it lifts only the shared upvalues and is sh-direct for the rest.
-			local cfg = build_cfg(st.body, upset, funcflags, inlinefns)
-			fndefs[#fndefs + 1] = assemble(cfg, fnlname(st.name) .. " = function(sh)", { shname = st.name })
+			-- its own `local` integers lift into registers of fn_x (func_locals)
+			EF.ro_names = EF.ro_names or EF.readonly_names(ast.stmts)
+			local fl = func_locals(st, funcflags)
+			local ls = upset
+			if #fl > 0 then
+				ls = {}
+				for k in pairs(upset) do
+					ls[k] = true
+				end
+				for _, n in ipairs(fl) do
+					ls[n] = true
+				end
+			end
+			local sv_fl = EF.fn_locals
+			EF.fn_locals = #fl > 0 and ls or nil
+			local cfg = build_cfg(st.body, ls, funcflags, inlinefns)
+			EF.fn_locals = sv_fl
+			fndefs[#fndefs + 1] = assemble(cfg, fnlname(st.name) .. " = function(sh)", { shname = st.name, fnlocals = fl })
 		end
 	end
 	local funcsrc, funcline = {}, {} -- name -> verbatim definition text / def line (top-level funcdefs)
