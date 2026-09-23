@@ -41,8 +41,9 @@ local function may_repeat(code)
 		or code:find("%f[%w_]for%f[^%w_]") or code:find("%f[%w_]select%f[^%w_]")
 		or code:find("%f[%w_]function%f[^%w_]") or code:find("%(%s*%)")
 end
-function M.try_fragment(code)
-	local hit = frag_cache[code]
+function M.try_fragment(code, line1) -- line1: an eval's own line, which its code numbers from
+	local key = line1 and (line1 .. "\0" .. code) or code
+	local hit = frag_cache[key]
 	if hit ~= nil and hit ~= 0 then
 		return hit or nil
 	end
@@ -50,19 +51,19 @@ function M.try_fragment(code)
 	if hit == nil and not may_repeat(code) then
 		mod = 0 -- seen once: interpret now, compile if it recurs
 	else
-		mod = M.compile_fragment(code) or false
+		mod = M.compile_fragment(code, line1) or false
 	end
 	if frag_n >= FRAG_MAX then
 		frag_cache, frag_n = {}, 0
 	end
-	if frag_cache[code] == nil then
+	if frag_cache[key] == nil then
 		frag_n = frag_n + 1
 	end
-	frag_cache[code] = mod
+	frag_cache[key] = mod
 	return mod ~= 0 and mod or nil
 end
-function M.compile_fragment(code)
-	local pok, ast = pcall(P.parse, code)
+function M.compile_fragment(code, line1)
+	local pok, ast = pcall(P.parse, code, nil, nil, nil, nil, nil, line1)
 	-- A syntax error (P.parse sets ast.perr and/or emits a `parse_error` statement, or
 	-- throws): the interpreter is the oracle for it — it runs the valid PREFIX then reports
 	-- the error with bash's status — so bail to the fallback rather than compile a fragment

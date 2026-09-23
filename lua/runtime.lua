@@ -108,6 +108,7 @@ local function current_line(sh)
 	end
 	return sh.cur_line or 0
 end
+M.current_line = current_line
 function M.err_prefix(sh)
 	if sh.opt_i then
 		return (sh.shellname or "bash") .. ": "
@@ -117,6 +118,9 @@ function M.err_prefix(sh)
 		name = sh.argv0 or "bash"
 	end
 	local ln = current_line(sh)
+	if sh.in_perr and sh.opt_c and not sh.cur_source then
+		name = name .. ": -c"
+	end
 	if ln > 0 then
 		return name .. ": line " .. ln .. ": "
 	end
@@ -8046,7 +8050,8 @@ function M.eval(sh, argv)
 		sh.status = 0
 		return
 	end
-	local mod = require("tier").try_fragment(code)
+	local ln = current_line(sh)
+	local mod = require("tier").try_fragment(code, ln > 0 and ln or nil)
 	if mod then
 		require("tier").run_compiled(mod, sh, nil)
 	else

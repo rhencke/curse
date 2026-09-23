@@ -2340,9 +2340,14 @@ end
 -- then skips the command and reports failure).
 -- Lowest free fd >= 10 (bash allocates named-fd redirs here); F_GETFD=1 on a
 -- closed fd returns -1 (EBADF).
+local nofile_rl = ffi.new("struct curse_rlimit[1]")
 local function alloc_fd()
 	for fd = 10, 250 do
 		if C.fcntl(fd, 1) == -1 then
+			-- (bash's fcntl(F_DUPFD, 10) fails EINVAL past RLIMIT_NOFILE: `ulimit -n 6`)
+			if C.getrlimit(7, nofile_rl) == 0 and nofile_rl[0].rlim_cur <= fd then
+				return -1
+			end
 			return fd
 		end
 	end
@@ -2434,6 +2439,14 @@ local function apply_redirs(sh, redirs, cname) -- cname: the command (names {v} 
 		local fdb = r.fdvar and sh.vars[sh:deref(fvn or r.fdvar)]
 		if fdb and fdb.ro and not ((r.op == "dup" or r.op == "dupin") and r.target == "-") then
 			-- `{v}>…` with v readonly: bash refuses (no fd is allocated) and the command fails
+			-- — after it opened (so created) an output file
+			if r.op == "out" or r.op == "clobber" or r.op == "app" then
+				local okp, path = pcall(tgt, r)
+				local f = okp and path ~= "" and C.open(path, r.op == "app" and 1089 or 577, 438)
+				if f and f >= 0 then
+					C.close(f)
+				end
+			end
 			io.stderr:write("curse: " .. r.fdvar .. ": readonly variable\n")
 			io.stderr:write("curse: " .. r.fdvar .. ": cannot assign fd to variable\n")
 			ok = false
@@ -2441,9 +2454,21 @@ local function apply_redirs(sh, redirs, cname) -- cname: the command (names {v} 
 		end
 		if r.fdvar then
 			if (r.op == "dup" or r.op == "dupin") and r.target == "-" then
-				r = setmetatable({ fd = tonumber(fdvar_get()) or -1 }, { __index = r })
+				local cur = fdvar_get()
+				if cur == nil or cur == "" then -- (`{v}>&-` with v unset/empty: bash)
+					io.stderr:write("curse: " .. r.fdvar .. ": ambiguous redirect\n")
+					ok = false
+					break
+				end
+				r = setmetatable({ fd = tonumber(cur) or -1 }, { __index = r })
 			else
 				local nf = alloc_fd()
+				if nf < 0 then
+					io.stderr:write((rt.err_prefix(sh):gsub("line %d+: $", "")) .. "redirection error: cannot duplicate fd: Invalid argument\n")
+					io.stderr:write("curse: " .. (r.target or "") .. ": Invalid argument\n")
+					ok = false
+					break
+				end
 				if not fdvar_set(tostring(nf)) then -- (nf is only a free number: nothing opened)
 					io.stderr:write("curse: " .. r.fdvar .. ": cannot assign fd to variable\n")
 					ok = false
@@ -5426,10 +5451,12 @@ exec_stmt = function(sh, st, hook)
 			if st.line then
 				sh.cur_line = st.line
 			end
+			sh.in_perr = true -- (a `-c` string's syntax errors name it: `bash: -c: line 1:`)
 			io.stderr:write("curse: " .. msg .. "\n")
-			if st.text and msg:find("near unexpected token", 1, true) then
-				io.stderr:write("curse: `" .. st.text .. "'\n")
+			if st.text and (st.showtext or msg:find("near unexpected token", 1, true)) then
+				io.stderr:write("curse: " .. (st.showtext and "syntax error: " or "") .. "`" .. st.text .. "'\n")
 			end
+			sh.in_perr = nil
 			error({ __curse_exit = 2, __curse_parseerr = true })
 		end
 	elseif t == "group" then

@@ -63,7 +63,7 @@ if [ "${1:-}" = --run-unit ]; then
       # CLIENT's env per request, so $ucache (per-unit) selects the compile cache:
       # first curse run misses (cold), second hits (hot).
       curse) ( cd "$cwd" && XDG_RUNTIME_DIR="$H_XDG_RUNTIME" XDG_CACHE_HOME="$ucache" \
-                 CURSE_FALLBACK="$H_FALLBACK" THIS_SH="$H_CLIENT" \
+                 CURSE_FALLBACK="$H_FALLBACK" THIS_SH="$H_THIS_SH" \
                  timeout "$H_TIMEOUT" "$H_CLIENT" "$runscript" </dev/null ) ;;
     esac
   }
@@ -161,6 +161,9 @@ mkdir -p "$workdir/units" "$workdir/cwd" "$workdir/res" "$workdir/snip" "$workdi
 H_XDG_RUNTIME="$workdir/xdg"; mkdir -p "$H_XDG_RUNTIME"; chmod 700 "$H_XDG_RUNTIME"
 H_XDG_CACHE="$workdir/cache"; mkdir -p "$H_XDG_CACHE"   # daemon default; workers override per-unit ($ucache)
 H_CLIENT="$REPO/build/curse-client"
+# THIS_SH for curse is the client under the name `bash`, as the oracle's is: tests that
+# print its basename (type.tests: `hash -p /tmp/$SHBASE $SHBASE`) then compare equal.
+H_THIS_SH="$workdir/bin/bash"; mkdir -p "$workdir/bin"; ln -sf "$H_CLIENT" "$H_THIS_SH"
 # A fallback that FAILS loudly, so a dropped daemon shows up as curse errors, never a
 # silent dash run masquerading as curse.
 H_FALLBACK="$workdir/bin/no-daemon"
@@ -272,7 +275,7 @@ fi
 
 echo "harness: $total tests × [${SHELLS//,/ }]  (jobs=$JOBS, timeout=${H_TIMEOUT}s)"
 export H_TIMEOUT H_SHELLS="$SHELLS"
-export H_CLIENT H_XDG_RUNTIME H_XDG_CACHE H_FALLBACK
+export H_CLIENT H_THIS_SH H_XDG_RUNTIME H_XDG_CACHE H_FALLBACK
 seq 1 "$total" | xargs -P "$JOBS" -I{} "$0" --run-unit "$workdir" {}
 
 # ------------------------------ scoreboard -----------------------------------

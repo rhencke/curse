@@ -32,7 +32,8 @@ return function(sh, cmd, args, hook, tcb)
 				-- at that point after the valid prefix has run (bash), and return/exit/
 				-- break/continue propagate out. Alias expansion sees the live table (sh).
 				local ok, err = pcall(function()
-					local nextf = P.open(code, sh)
+					local ln = rt.current_line(sh)
+					local nextf = P.open(code, sh, ln > 0 and ln or nil)
 					while true do
 						local lg = nextf()
 						if lg == nil then

@@ -223,6 +223,8 @@ conv = function(st)
 		c = { k = "group", body = conv_list(st.body) }
 	elseif t == "subshell" then
 		c = { k = "subshell", body = conv_list(st.body) }
+	elseif t == "coproc" then
+		c = { k = "coproc", name = st.name or "COPROC", body = conv(st.cmd) }
 	elseif t == "if" then
 		local function from(k)
 			local cl = st.clauses[k]
@@ -533,6 +535,10 @@ make = function(p, c)
 			cprintf(p, " ")
 		end
 		cprintf(p, "}")
+	elseif k == "coproc" then -- (print_cmd.c: the command follows unindented)
+		cprintf(p, "coproc " .. c.name .. " ")
+		p.skip = p.skip + 1
+		make(p, c.body)
 	elseif k == "subshell" then
 		cprintf(p, "( ")
 		p.skip = p.skip + 1

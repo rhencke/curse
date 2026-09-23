@@ -2096,8 +2096,8 @@ local function dequote_word(w)
 	return table.concat(out)
 end
 
-local function make_parser(src, sh, aenv, noalias, posix, line0)
-	local i, n, line = 1, #src, 1
+local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs)
+	local i, n, line = 1, #src, lineabs or 1
 	if line0 then -- a $(…) body numbers from its command's line; leading newlines don't count
 		line = line0 - #(src:match("^[ \t\n]*"):gsub("[^\n]", ""))
 	end
@@ -3073,9 +3073,12 @@ local function make_parser(src, sh, aenv, noalias, posix, line0)
 					end
 				end
 				slots[#slots + 1] = body:sub(k0)
-				if #slots ~= 3 then
-					error(#slots < 3 and "syntax error: arithmetic expression required"
-						or "syntax error: `;' unexpected")
+				if #slots ~= 3 then -- (bash then shows the whole `(( … ))')
+					error({
+						__curse_perr = true,
+						msg = #slots < 3 and "syntax error: arithmetic expression required" or "syntax error: `;' unexpected",
+						text = "((" .. body .. "))",
+					})
 				end
 				local a, b, c = slots[1], slots[2], slots[3]
 				loopId = loopId + 1
@@ -4345,7 +4348,10 @@ local function make_parser(src, sh, aenv, noalias, posix, line0)
 					perr = {
 						t = "parse_error",
 						line = recover and line or startline, -- (a recoverable one: the token's line)
-						msg = recover and ("syntax error near `" .. (st.tok or "(") .. "'") or tostring(st),
+						msg = recover and ("syntax error near `" .. (st.tok or "(") .. "'")
+							or (type(st) == "table" and st.__curse_perr and st.msg) or tostring(st),
+						text = type(st) == "table" and st.__curse_perr and st.text or nil,
+						showtext = type(st) == "table" and st.__curse_perr and st.text and true or nil,
 						recoverable = recover or nil,
 					},
 				}
@@ -4447,9 +4453,9 @@ end
 -- program, and by callers that want the AST). An optional `sh` makes alias
 -- expansion consult the live runtime table (for eval/source/$() at runtime); the
 -- compiler passes none, so it tracks aliases deterministically from source.
-function M.parse(src, sh, aenv, noalias, posix, line0)
+function M.parse(src, sh, aenv, noalias, posix, line0, line1)
 	local saved_env, sprex, spdq = ALIAS_ENV, COMSUB_PREX, POSIX_DQ
-	local nextf = make_parser(src, sh, aenv, noalias, posix, line0) -- yields logical-line groups { stmts, perr }
+	local nextf = make_parser(src, sh, aenv, noalias, posix, line0, line1) -- yields logical-line groups { stmts, perr }
 	local stmts, lines = {}, {}
 	while true do
 		local lg = nextf()
@@ -4477,8 +4483,10 @@ end
 -- per call (nil at EOF). The interpreter uses this for instant start on large
 -- scripts and to never tokenize past an `exit` (hybrid installers). `sh` (present
 -- when interpreting) makes alias expansion use the live runtime alias table.
-function M.open(src, sh)
-	return make_parser(src, sh)
+-- `line1`: the line the text's first line is (eval: the eval command's own line — bash
+-- numbers eval'd code, and functions it defines, from there)
+function M.open(src, sh, line1)
+	return make_parser(src, sh, nil, nil, nil, nil, line1)
 end
 
 return M
