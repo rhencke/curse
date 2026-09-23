@@ -289,13 +289,11 @@ return function(sh, cmd, args, hook, tcb)
 		elseif #rest == 0 then -- no operands: list matching declarations (declare -p, or bare)
 			list_decls()
 			sh.status = 0
-		elseif printmode then
+		elseif printmode and cmd ~= "readonly" and cmd ~= "export" then
 			-- Only `declare`/`typeset -p NAME` prints a named declaration; `readonly -p
-			-- NAME` and `export -p NAME` (with operands) print nothing (bash quirk — the
-			-- no-operand forms still list all, handled above).
-			if cmd == "readonly" or cmd == "export" then
-				sh.status = 0
-			else
+			-- NAME` and `export -p NAME` (with operands) print nothing and just apply the
+			-- attribute (bash quirk — the no-operand forms list all, handled above).
+			do
 				local allok = true
 				for _, nm in ipairs(rest) do
 					local d = fmt_decl(sh, nm)

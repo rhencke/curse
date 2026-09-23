@@ -452,6 +452,9 @@ local function scan_xtrace(node)
 	if node.lit == "history" or node.lit == "histexpand" or node.lit == "fc" then
 		return true -- command history is recorded (and `!` expanded) by interp's line reader
 	end
+	if node.lit and node.lit:find("\\#", 1, true) then
+		return true -- a prompt's \# (command number) counts interp's top-level commands
+	end
 	if node.lit and node.lit:find("BASH_COMMAND", 1, true) then
 		return true -- $BASH_COMMAND (often read in a trap string) tracks interp's statements
 	end

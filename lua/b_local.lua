@@ -22,7 +22,7 @@ return function(sh, cmd, args, hook, tcb)
 		-- nameref (-n), indexed (-a) and associative (-A) attributes.
 		local nref, assoc, plusn, rest, lok = false, false, false, {}, true
 		local iattr, lattr, uattr, aattr, rattr = false, false, false, false, false
-		local inherit = false
+		local inherit, pflag = false, false
 		for j = 2, #args do
 			local a = args[j]
 			if a == "--" then
@@ -58,6 +58,9 @@ return function(sh, cmd, args, hook, tcb)
 				if a:find("r") then
 					rattr = true
 				end
+				if a:find("p") then
+					pflag = true
+				end
 				if a:find("I") then
 					inherit = true -- (-I: the local starts as a copy of the outer var)
 				end
@@ -70,6 +73,17 @@ return function(sh, cmd, args, hook, tcb)
 			end
 		end
 		local attrs = nref or assoc or plusn or iattr or lattr or uattr or aattr or rattr
+		if pflag and #rest > 0 and not attrs then -- `local -p NAME…`: those of this frame's locals
+			local saved = sh.savedstack[sh.pd]
+			for _, nm in ipairs(rest) do
+				local d = saved and saved[nm] ~= nil and fmt_decl(sh, nm)
+				if d then
+					sh:echo(d)
+				end
+			end
+			sh.status = 0
+			return
+		end
 		if #rest == 0 and not attrs then
 			-- bare `local` / `local -p`: list this frame's local variables (bash format)
 			local saved, names = sh.savedstack[sh.pd], {}

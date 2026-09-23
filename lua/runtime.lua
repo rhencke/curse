@@ -7633,8 +7633,9 @@ function Shell:prompt_escapes(s)
 				s = self.shellname or "bash",
 				v = "5.2",
 				V = "5.2.37",
-				["!"] = "1",
-				["#"] = "1",
+				-- \! the history number of this command; \# the command number
+				["!"] = tostring(self.history and #self.history > 0 and (self.hist_base or 1) + #self.history - 1 or 1),
+				["#"] = tostring(self.cmd_number or 1),
 				j = (function() -- number of jobs the shell is managing
 					local nj = 0
 					for _, jb in ipairs(self.jobs or {}) do
@@ -7667,10 +7668,10 @@ function Shell:prompt_escapes(s)
 				out[#out + 1] = M.hostname()
 				i = i + 2
 			elseif d == "D" and s:sub(i + 2, i + 2) == "{" then -- \D{strftime}
-				local close = s:find("}", i + 3, true)
-				local fmt = s:sub(i + 3, (close or i + 2) - 1)
+				local close = s:find("}", i + 3, true) or (#s + 1) -- (unclosed: the rest is the format)
+				local fmt = s:sub(i + 3, close - 1)
 				out[#out + 1] = os.date(fmt ~= "" and fmt or "%X")
-				i = (close or i + 2) + 1
+				i = close + 1
 			elseif simple then
 				out[#out + 1] = simple
 				i = i + 2

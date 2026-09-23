@@ -6322,6 +6322,7 @@ end
 -- the eager AST, so tier OSR-by-stmt still lines up).
 -- Run one logical line (a parser group) the way the shell runs its own input.
 local function run_group(sh, lg, hook, k)
+	sh.cmd_number = (sh.cmd_number or 0) + 1 -- (the prompt's \#)
 	-- bash parses a whole LOGICAL LINE (a `simple_list` up to a top-level newline)
 	-- before executing any of it, so a syntax error ANYWHERE on the line means the
 	-- line runs nothing (retroactive). Handle that first.
