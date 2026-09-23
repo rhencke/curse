@@ -69,6 +69,23 @@ end
 local BUILTIN_RO = { UID = 1, EUID = 1, PPID = 1, BASH_VERSINFO = 1, SHELLOPTS = 1, BASHOPTS = 1 }
 local EF = {} -- emit-time program flags, grouped so a function referencing several stays one upvalue
 EF.has_attr = false
+-- Does any node of the tree (every statement, word, arith node — at any depth: &&/||
+-- lists, pipelines, conditions, bodies) satisfy `pred`? The program scanners below gate
+-- whole code paths on "X appears anywhere", so they must not miss a node shape.
+local function any_node(node, pred)
+	if type(node) ~= "table" then
+		return false
+	end
+	if pred(node) then
+		return true
+	end
+	for _, v in pairs(node) do
+		if type(v) == "table" and any_node(v, pred) then
+			return true
+		end
+	end
+	return false
+end
 local function makes_attr(st)
 	if st.t == "arrayassign" then
 		return true
@@ -102,22 +119,9 @@ local function makes_attr(st)
 	return false
 end
 local function scan_attr(stmts)
-	for _, st in ipairs(stmts or {}) do
-		if makes_attr(st) then
-			return true
-		end
-		if st.body and scan_attr(st.body) then
-			return true
-		end
-		if st.clauses then
-			for _, cl in ipairs(st.clauses) do
-				if scan_attr(cl.body) then
-					return true
-				end
-			end
-		end
-	end
-	return false
+	return any_node(stmts, function(n)
+		return n.t ~= nil and makes_attr(n)
+	end)
 end
 -- Does the program create a nameref (declare/typeset/local -n)? A plain `name=value`
 -- assignment then WRITES THROUGH the nameref (to a var, an array/assoc element, or a
@@ -139,14 +143,9 @@ local function makes_dyncode(st)
 	return c == "eval" or c == "source" or c == "."
 end
 local function scan_dyncode(stmts)
-	for _, st in ipairs(stmts or {}) do
-		if makes_dyncode(st) then return true end
-		if st.body and scan_dyncode(st.body) then return true end
-		if st.clauses then for _, cl in ipairs(st.clauses) do if scan_dyncode(cl.body) then return true end end end
-		if st.cmds and scan_dyncode(st.cmds) then return true end
-		if st.items then for _, it in ipairs(st.items) do if it.cmd and scan_dyncode({ it.cmd }) then return true end end end
-	end
-	return false
+	return any_node(stmts, function(n)
+		return n.t == "simple" and makes_dyncode(n)
+	end)
 end
 local function makes_nameref(st)
 	if st.t ~= "simple" or not st.words[1] then
@@ -168,32 +167,9 @@ local function makes_nameref(st)
 	return false
 end
 local function scan_nameref(stmts)
-	for _, st in ipairs(stmts or {}) do
-		if makes_nameref(st) then
-			return true
-		end
-		if st.body and scan_nameref(st.body) then
-			return true
-		end
-		if st.clauses then
-			for _, cl in ipairs(st.clauses) do
-				if scan_nameref(cl.body) then
-					return true
-				end
-			end
-		end
-		if st.cmds and scan_nameref(st.cmds) then
-			return true
-		end
-		if st.items then
-			for _, it in ipairs(st.items) do
-				if it.cmd and scan_nameref({ it.cmd }) then
-					return true
-				end
-			end
-		end
-	end
-	return false
+	return any_node(stmts, function(n)
+		return n.t == "simple" and makes_nameref(n)
+	end)
 end
 -- Does any word in the program READ a call-stack var (FUNCNAME/BASH_SOURCE/BASH_LINENO)?
 -- Gates funcstack/linestack/srcstack maintenance around compiled calls (else zero cost).
@@ -252,80 +228,38 @@ local function word_reads_debugstack(w)
 	return false
 end
 local function reads_debugstack(stmts)
-	for _, st in ipairs(stmts or {}) do
-		-- a sourced file can read them out of sight: keep the frames for it; and a
-		-- `declare -A NAME=(…)` names the running function in its conversion error
-		local p1 = st.t == "simple" and st.words and st.words[1] and st.words[1].parts[1]
-		if p1 and (p1.lit == "source" or p1.lit == "." or p1.lit == "caller") then
-			return true
-		end
-		if p1 and st.arrayargs and (p1.lit == "declare" or p1.lit == "typeset" or p1.lit == "local") then
-			return true
-		end
-		if st.words then
-			for _, w in ipairs(st.words) do
-				if word_reads_debugstack(w) then
-					return true
-				end
+	return any_node(stmts, function(st)
+		if st.t == "simple" then
+			-- a sourced file can read them out of sight: keep the frames for it; and a
+			-- `declare -A NAME=(…)` names the running function in its conversion error
+			local p1 = st.words and st.words[1] and st.words[1].parts[1]
+			if p1 and (p1.lit == "source" or p1.lit == "." or p1.lit == "caller") then
+				return true
+			end
+			if p1 and st.arrayargs and (p1.lit == "declare" or p1.lit == "typeset" or p1.lit == "local") then
+				return true
 			end
 		end
-		-- (( … )) command reads the same vars through arith var nodes; st.expr is an
-		-- already-parsed arith AST (NOT a source string), so walk it directly.
-		if st.t == "arithcmd" and st.expr and arith_reads_debugstack(st.expr) then
-			return true
+		if st.parts ~= nil and st.t == nil then -- a word
+			return word_reads_debugstack(st)
 		end
-		if st.rhs and word_reads_debugstack(st.rhs) then
-			return true
-		end -- x=$((BASH_LINENO))
-		if st.arith and arith_reads_debugstack(st.arith) then
-			return true
-		end -- x=$(( … )) parsed
-		if st.body and reads_debugstack(st.body) then
-			return true
-		end
-		if st.clauses then
-			for _, cl in ipairs(st.clauses) do
-				if reads_debugstack(cl.body) then
-					return true
-				end
-			end
-		end
-	end
-	return false
+		return st.k == "var" and DEBUGSTACK_VAR[st.name] ~= nil -- (an arith node: (( … )), x=$(( … )))
+	end)
 end
 
 -- Does any word READ variable `name` (as $name or ${name…})? Gates per-command
 -- maintenance of otherwise-free-to-skip specials ($_ last-arg, $PIPESTATUS).
 local function reads_var(stmts, name)
-	for _, st in ipairs(stmts or {}) do
-		if st.words then
-			for _, w in ipairs(st.words) do
-				for _, p in ipairs(w.parts) do
-					if p.var == name or (p.pexp and p.pexp.name == name) then
-						return true
-					end
-				end
-			end
-		end
-		if st.rhs then
-			for _, p in ipairs(st.rhs.parts) do
+	return any_node(stmts, function(n)
+		return (n.parts ~= nil and n.t == nil and (function()
+			for _, p in ipairs(n.parts) do
 				if p.var == name or (p.pexp and p.pexp.name == name) then
 					return true
 				end
 			end
-		end
-		if st.body and reads_var(st.body, name) then
-			return true
-		end
-		if st.clauses then
-			for _, cl in ipairs(st.clauses) do
-				if reads_var(cl.body, name) then
-					return true
-				end
-			end
-		end
-	end
-	return false
+			return false
+		end)()) or (n.k == "var" and n.name == name)
+	end)
 end
 
 -- Does the program install a `trap … SIG` for one of `sigs` (a set of names)? Used
@@ -335,41 +269,10 @@ end
 -- has no traps at all, so the child needs no signal machinery. Recurses broadly
 -- (body/clauses/cmd/cmds/items) so a trap anywhere is seen.
 local function scan_any_trap(stmts)
-	for _, st in ipairs(stmts or {}) do
-		if
-			st.t == "simple"
-			and st.words
-			and st.words[1]
-			and st.words[1].parts[1]
+	return any_node(stmts, function(st)
+		return st.t == "simple" and st.words and st.words[1] and st.words[1].parts[1]
 			and st.words[1].parts[1].lit == "trap"
-		then
-			return true
-		end
-		if st.body and scan_any_trap(st.body) then
-			return true
-		end
-		if st.cmd and scan_any_trap({ st.cmd }) then
-			return true
-		end
-		if st.cmds and scan_any_trap(st.cmds) then
-			return true
-		end
-		if st.items then
-			for _, it in ipairs(st.items) do
-				if it.cmd and scan_any_trap({ it.cmd }) then
-					return true
-				end
-			end
-		end
-		if st.clauses then
-			for _, cl in ipairs(st.clauses) do
-				if scan_any_trap(cl.body) then
-					return true
-				end
-			end
-		end
-	end
-	return false
+	end)
 end
 
 -- Does the program trap a REAL signal (or use a trap spec it can't read statically)?
@@ -507,8 +410,9 @@ local function scan_functrace(node)
 end
 
 local function scan_trap(stmts, sigs)
-	for _, st in ipairs(stmts or {}) do
-		if st.t == "simple" and st.words[1] and st.words[1].parts[1] and st.words[1].parts[1].lit == "trap" then
+	return any_node(stmts, function(st)
+		if st.t == "simple" and st.words and st.words[1] and st.words[1].parts[1]
+			and st.words[1].parts[1].lit == "trap" then
 			for j = 2, #st.words do
 				local l = st.words[j].parts[1] and st.words[j].parts[1].lit
 				if l and sigs[l] then
@@ -516,18 +420,8 @@ local function scan_trap(stmts, sigs)
 				end
 			end
 		end
-		if st.body and scan_trap(st.body, sigs) then
-			return true
-		end
-		if st.clauses then
-			for _, cl in ipairs(st.clauses) do
-				if scan_trap(cl.body, sigs) then
-					return true
-				end
-			end
-		end
-	end
-	return false
+		return false
+	end)
 end
 
 -- Collect literal names targeted by `unset` (skipping -f/-v flags) anywhere in the
