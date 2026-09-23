@@ -1715,9 +1715,10 @@ end
 EF.upv_wrapped = function(fname)
 	return (EF.lifted_names and #EF.lifted_names > 0) and ("__upv_wrap(" .. fname .. ")") or fname
 end
-local function compile_cmdsub(src, backtick, lifted, aenv)
-	local fallback = ("sh:capture_src(%q%s)"):format(src, backtick and ", true" or "")
-	local pok, ast = pcall(require("parser").parse, src, nil, aenv)
+local function compile_cmdsub(src, backtick, lifted, aenv, noalias)
+	local fallback = ("sh:capture_src(%q%s)"):format(src, noalias and ", " .. tostring(backtick or false) .. ", true"
+		or (backtick and ", true" or ""))
+	local pok, ast = pcall(require("parser").parse, src, nil, aenv, noalias)
 	if not pok or type(ast) ~= "table" or ast.stmts == nil then
 		return fallback
 	end -- syntax error
@@ -1858,7 +1859,7 @@ emit_word = function(w, lifted)
 			parts[#parts + 1] = emit_arith_word(safe_arith(p.arith), lifted)
 			arith_varread = saved
 		elseif p.cmdsub then -- $( … ): COMPILE the inner (known at compile time) and run it captured
-			parts[#parts + 1] = compile_cmdsub(p.cmdsub, p.backtick, lifted, p.aenv)
+			parts[#parts + 1] = compile_cmdsub(p.cmdsub, p.backtick, lifted, p.aenv, p.noalias)
 		elseif p.pexp then
 			if not pexp_compilable(p.pexp, p.q) then
 				error("curse-nocompile: ${..} operator")
@@ -3317,12 +3318,18 @@ end
 -- OPTIND/OPTARG and reads OPTERR, read/select set REPLY, set -x reads BASH_XTRACEFD, calls
 -- check FUNCNEST, read -t reads TMOUT, …, plus the dynamic specials): a native register copy
 -- would desync from sh.vars, so they are never lifted even when only assigned numbers.
+local VAR_WRITERS = { read = 1, printf = 1, getopts = 1, let = 1, mapfile = 1, readarray = 1,
+	wait = 1 }
 local NO_LIFT = {}
 for _, n in ipairs({ "OPTIND", "OPTARG", "OPTERR", "REPLY", "SECONDS", "RANDOM", "SRANDOM",
 	"LINENO", "HISTCMD", "HISTSIZE", "HISTFILESIZE", "TMOUT", "COLUMNS", "LINES", "FUNCNEST",
 	"BASH_XTRACEFD", "SHLVL", "PPID", "UID", "EUID", "BASHPID", "BASH_SUBSHELL", "EPOCHSECONDS",
-	"EPOCHREALTIME", "BASH_ARGC", "COMP_CWORD", "COMP_POINT", "IFS", "_", "FUNCNAME" }) do
+	"EPOCHREALTIME", "BASH_ARGC", "COMP_CWORD", "COMP_POINT", "IFS", "_", "FUNCNAME",
+	"POSIXLY_CORRECT" }) do
 	NO_LIFT[n] = true
+end
+for n in pairs(require("runtime").LOCALE_VARS) do
+	NO_LIFT[n] = true -- (sh:set_str re-applies the locale; a lifted flush wouldn't)
 end
 analyze_lift = function(ast)
 	-- A nameref program writes THROUGH namerefs (name=value -> some other var) via
@@ -3332,6 +3339,37 @@ analyze_lift = function(ast)
 		return {}
 	end
 	local assigned, disq, localed = {}, {}, {}
+	-- builtins that WRITE a named var through sh (read, printf -v, getopts, let, …): the
+	-- write bypasses a native local, so any name among their literal args never lifts
+	-- (over-disqualifying an option word is harmless). `let` assigns inside its expressions.
+	local function writer_disq(st)
+		local w1 = 1
+		local p1 = st.words[w1] and st.words[w1].parts[1]
+		while p1 and (p1.lit == "command" or p1.lit == "builtin") do
+			w1 = w1 + 1
+			p1 = st.words[w1] and st.words[w1].parts[1]
+		end
+		local cmd = p1 and p1.lit
+		if not VAR_WRITERS[cmd] then
+			return
+		end
+		for j = w1 + 1, #st.words do
+			for _, p in ipairs(st.words[j].parts) do
+				if p.lit then
+					if cmd == "let" then
+						for nm in p.lit:gmatch("[%a_][%w_]*") do
+							disq[nm] = true
+						end
+					else
+						local nm = p.lit:match("^([%a_][%w_]*)")
+						if nm then
+							disq[nm] = true
+						end
+					end
+				end
+			end
+		end
+	end
 	-- A subshell can run IN-PROCESS, where an upval-lifted var lives in v_x but `unset`/
 	-- `declare`/`readonly`/`export`/`typeset`/an indexed-or-array assign all act on sh.vars —
 	-- so such a var would desync. Disqualify it from lifting (only the DISQUALIFIERS matter
@@ -3443,6 +3481,11 @@ analyze_lift = function(ast)
 	local function spb_walk(node)
 		if type(node) ~= "table" then
 			return
+		end
+		if node.t == "simple" and node.words then
+			writer_disq(node)
+		elseif node.t == "select" and node.name then
+			disq[node.name] = true
 		end
 		if node.t == "simple" and node.assigns and node.words and node.words[1] then
 			local p1 = node.words[1].parts and node.words[1].parts[1]
@@ -4160,7 +4203,8 @@ simple_compiled = function(cx, st, after)
 				})
 			end
 		end
-		if not (w2 and w2.lit and w2.lit:sub(1, 1) == "-") then -- not a flag / --
+		-- (`command exec >f`: exec's redirections persist — interp's exec branch handles it)
+		if not (w2 and w2.lit and (w2.lit:sub(1, 1) == "-" or w2.lit == "exec")) then -- not a flag / --
 			local argvbody = field_argv(st.words, 2, cx.lifted, nil, nil)
 			local cmd_redir = nil
 			if argvbody and st.redirs then

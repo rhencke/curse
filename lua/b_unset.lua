@@ -118,6 +118,9 @@ return function(sh, cmd, args, hook, tcb)
 						if rt.LOCALE_VARS[dn] then
 							rt.reset_locale(sh)
 						end -- re-apply locale (bash)
+						if dn == "POSIXLY_CORRECT" then
+							sh.opt_posix = false -- (sv_strict_posix: unsetting it leaves posix mode)
+						end
 					elseif sh.functions[a] then
 						sh.functions[a] = nil -- plain unset falls back to a function
 						if sh.fexport and sh.fexport[a] then

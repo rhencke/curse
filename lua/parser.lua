@@ -10,6 +10,10 @@ local M = {}
 -- $(…)/`…` part (`aenv`) so the compiler's later parse of that body expands the same
 -- aliases the enclosing line saw — the body is re-parsed from text, detached from here.
 local ALIAS_ENV = nil
+-- True while parsing a line whose $(…) bodies were alias-expanded AS READ (bash's posix-mode
+-- parse_comsub): their parts carry `noalias`, so the body's later re-parse doesn't expand
+-- the already-substituted text a second time.
+local COMSUB_PREX = false
 
 -- ---- arithmetic expression parser (precedence climbing over a string) ----
 -- AST: {k="num",v}, {k="var",name}, {k="bin",op,l,r}, {k="un",op,e},
@@ -897,7 +901,7 @@ local function parse_dollar(w, i, add, q)
 		return j + 1
 	elseif nx == "(" then
 		local je = scan_cmdsub(w, i + 2) -- index just past the closing `)` (case/quote/nesting aware)
-		add({ cmdsub = w:sub(i + 2, je - 2), q = q, aenv = ALIAS_ENV })
+		add({ cmdsub = w:sub(i + 2, je - 2), q = q, aenv = ALIAS_ENV, noalias = COMSUB_PREX or nil })
 		return je
 	elseif nx == '"' then
 		-- $"…" locale translation: with no catalog it's just the double-quoted string.
@@ -1203,7 +1207,7 @@ do
 	local wcache, wn = {}, 0
 	local wimpl = parse_word
 	parse_word = function(src)
-		if type(src) == "string" then
+		if type(src) == "string" and not COMSUB_PREX then
 			local hit = wcache[src]
 			if hit ~= nil then
 				return hit
@@ -1230,12 +1234,13 @@ end
 -- ${x-default} word), where `\"` escapes to " like inside "…".
 function M.parse_heredoc(body, is_body, aenv)
 	local parts = {}
-	local saved = ALIAS_ENV
+	local saved, sprex = ALIAS_ENV, COMSUB_PREX
 	ALIAS_ENV = aenv -- its $(…) parts carry the heredoc line's static alias state
+	COMSUB_PREX = false
 	local ok, err = pcall(parse_dquote, body, function(p)
 		parts[#parts + 1] = p
 	end, is_body)
-	ALIAS_ENV = saved
+	ALIAS_ENV, COMSUB_PREX = saved, sprex
 	if not ok then
 		error(err, 0)
 	end
@@ -1782,7 +1787,7 @@ local function dequote_word(w)
 	return table.concat(out)
 end
 
-local function make_parser(src, sh, aenv)
+local function make_parser(src, sh, aenv, noalias)
 	local i, n, line = 1, #src, 1
 	local loopId = 0
 	local heredocs_pending = {} -- heredoc redirs awaiting their body (filled at line end)
@@ -1794,6 +1799,7 @@ local function make_parser(src, sh, aenv)
 	-- pairs with a later `}`/`)`, `|` forms a real pipeline, and a trailing blank
 	-- makes the following word alias-eligible too.
 	local alias_on = false -- shopt expand_aliases state (from source)
+	local posix_on = false -- set -o posix state (from source; sh.opt_posix when interpreting)
 	local extglob_on = false -- shopt extglob state (from source; the live sh.shopt when interpreting)
 	local aliases = {} -- name -> value (from parsed `alias` commands)
 	if aenv then -- a nested body ($(…)) starts from its enclosing line's static state
@@ -1831,6 +1837,9 @@ local function make_parser(src, sh, aenv)
 	-- the same state from source deterministically, so the static common case
 	-- compiles to the identical tree.
 	local function alias_state()
+		if noalias then
+			return false
+		end
 		if sh then
 			return sh.shopt and sh.shopt.expand_aliases, sh.aliases
 		end
@@ -1889,6 +1898,13 @@ local function make_parser(src, sh, aenv)
 					aliases[a] = nil
 				end
 			end
+		elseif cmd == "set" then -- `set -o posix` / `set +o posix` (posix-mode $(…) parsing)
+			for k = 2, #node.words - 1 do
+				local a, b = static_word(node.words[k]), static_word(node.words[k + 1])
+				if (a == "-o" or a == "+o") and b == "posix" then
+					posix_on = a == "-o"
+				end
+			end
 		end
 	end
 	local function record_alias_state(node)
@@ -1905,6 +1921,9 @@ local function make_parser(src, sh, aenv)
 	local function alias_line_start()
 		if sh then
 			ALIAS_ENV = nil
+			-- posix mode (live sh): a $(…) is parsed as it is read, expanding aliases in it
+			local on, tab = alias_state()
+			COMSUB_PREX = noalias or (sh.opt_posix and on and tab ~= nil and next(tab) ~= nil) or false
 			return
 		end
 		if #alias_pending > 0 then
@@ -1922,6 +1941,7 @@ local function make_parser(src, sh, aenv)
 		else
 			ALIAS_ENV = nil
 		end
+		COMSUB_PREX = noalias or (posix_on and alias_on and next(aliases) ~= nil) or false
 	end
 	-- Try to expand an alias at the current position. `cmdpos` = command position
 	-- (always eligible); otherwise eligible only via trailing-blank chaining, and
@@ -1971,7 +1991,8 @@ local function make_parser(src, sh, aenv)
 			-- `alias foo='echo 0'; foo>&2` is `echo 0 >&2`, not `echo 0>&2` — except after a
 			-- trailing backslash, which quotes the next input char (`alias a='… \'; a|cat`)
 			local ins = val
-			if ins ~= "" and not ins:match("[ \t\\]$") then
+			-- (shell_getc: none after a blank, newline or metachar — `alias s='echo 8 )'`)
+			if ins ~= "" and not ins:match("[ \t\n\\|&;()<>]$") then
 				-- …and not when the value ends INSIDE an open quote (`alias foo="echo 'Err:"`):
 				-- the quoted string continues into the following input
 				local q, k = nil, 1
@@ -2126,6 +2147,17 @@ local function make_parser(src, sh, aenv)
 		end
 		return nil
 	end
+	local parse_stmts
+	local cmd_prex -- position whose command-word alias parse_stmts already expanded
+	-- bash's posix-mode parse_comsub: read a $( … ) body with the real parser (from i just
+	-- past `$(`), so an alias in it expands in context — its value can hold the closing `)`
+	-- (or a `case` whose `pat)` must not close). The expanded text lands in src.
+	local function prex_comsub()
+		local _, term = parse_stmts({ [")"] = true })
+		if term ~= ")" then
+			error("syntax error: unexpected end of file")
+		end
+	end
 	local function word(stop_paren, stop_cmp) -- read one shell word, keeping quotes and $(( )) / ${ } / $( ) balanced
 		ws()
 		local start = i
@@ -2148,7 +2180,12 @@ local function make_parser(src, sh, aenv)
 						local _, ni = grab_dparen(src, i + 3)
 						i = ni
 					elseif d == "$" and src:sub(i + 1, i + 1) == "(" then
-						i = scan_cmdsub(src, i + 2) -- case/quote/nesting-aware boundary
+						if COMSUB_PREX and not noalias then
+							i = i + 2
+							prex_comsub()
+						else
+							i = scan_cmdsub(src, i + 2) -- case/quote/nesting-aware boundary
+						end
 					elseif d == "$" and src:sub(i + 1, i + 1) == "{" then
 						i = scan_braces(src, i + 1) -- ${…}: inner \ ' " and nested {} don't close it
 					elseif d == "`" then
@@ -2208,7 +2245,12 @@ local function make_parser(src, sh, aenv)
 					i = i + 1
 				end
 			elseif c == "$" and src:sub(i + 1, i + 1) == "(" then
-				i = scan_cmdsub(src, i + 2) -- case/quote/nesting-aware boundary (errors if unclosed)
+				if COMSUB_PREX and not noalias then
+					i = i + 2
+					prex_comsub()
+				else
+					i = scan_cmdsub(src, i + 2) -- case/quote/nesting-aware boundary (errors if unclosed)
+				end
 			elseif (c == "<" or c == ">") and src:sub(i + 1, i + 1) == "(" then
 				-- <(cmd) / >(cmd) process substitution: part of the word — scanned like $(…)
 				-- (its body has its own quoting / case syntax)
@@ -2252,7 +2294,6 @@ local function make_parser(src, sh, aenv)
 		return src:sub(start, i - 1)
 	end
 
-	local parse_stmts
 	local function peekword()
 		local save = i
 		ws()
@@ -2456,10 +2497,14 @@ local function make_parser(src, sh, aenv)
 		-- place (handles a compound-command alias like LEFT='{' before dispatch; the
 		-- command-word case with leading assignments/redirects re-runs in the simple
 		-- loop, sharing this guard so a self-referential alias can't loop).
-		alias_seen = {}
-		alias_next = false
-		alias_tail = nil
-		try_alias(true)
+		if cmd_prex == i then
+			cmd_prex = nil -- parse_stmts already expanded this command word
+		else
+			alias_seen = {}
+			alias_next = false
+			alias_tail = nil
+			try_alias(true)
+		end
 		-- an alias that expanded to a comment (`alias c=#`): the rest of the line is a comment
 		-- and there is NO command ($? unchanged)
 		if src:sub(i, i) == "#" then
@@ -2602,10 +2647,33 @@ local function make_parser(src, sh, aenv)
 			if not issel and src:sub(i, i + 1) == "((" then
 				local body, ni = grab_dparen(src, i + 2)
 				i = ni
-				local a, b, c = body:match("^(.-);(.-);(.-)$")
-				if not a then
-					error("for ((;;)) needs two ';'")
+				-- split the header at its top-level `;`s — not inside quotes, $(…), ${…}
+				local slots, k0, k, bn = {}, 1, 1, #body
+				while k <= bn do
+					local ch = body:sub(k, k)
+					if ch == "\\" then
+						k = k + 2
+					elseif ch == "'" or ch == '"' or ch == "`" then
+						local e = body:find(ch, k + 1, true)
+						k = (e or bn) + 1
+					elseif ch == "$" and body:sub(k + 1, k + 1) == "(" then
+						k = scan_cmdsub(body, k + 2)
+					elseif ch == "$" and body:sub(k + 1, k + 1) == "{" then
+						k = scan_braces(body, k + 1)
+					elseif ch == ";" then
+						slots[#slots + 1] = body:sub(k0, k - 1)
+						k0 = k + 1
+						k = k + 1
+					else
+						k = k + 1
+					end
 				end
+				slots[#slots + 1] = body:sub(k0)
+				if #slots ~= 3 then
+					error(#slots < 3 and "syntax error: arithmetic expression required"
+						or "syntax error: `;' unexpected")
+				end
+				local a, b, c = slots[1], slots[2], slots[3]
 				loopId = loopId + 1
 				local id = loopId
 				local body_stmts = loop_body()
@@ -3643,6 +3711,15 @@ local function make_parser(src, sh, aenv)
 			if i > n then
 				return stmts, nil
 			end
+			if next(stopset) ~= nil and cmd_prex ~= i then
+				-- the command word may be an alias for the terminator (`alias DONE='}'`):
+				-- expand it before looking for one; parse_command then won't re-expand
+				alias_seen = {}
+				alias_next = false
+				alias_tail = nil
+				try_alias(true)
+				cmd_prex = i
+			end
 			if stopset["}"] and src:sub(i, i) == "}" then
 				i = i + 1
 				return stmts, "}"
@@ -3775,7 +3852,9 @@ local function make_parser(src, sh, aenv)
 				elseif i > n or c == "\n" or c == "#" then
 					break
 				else
-					local bsx = bare_sep_tok()
+					-- a stray `)` ends nothing here: the whole line is a syntax error (bash
+					-- runs none of `echo hi )`)
+					local bsx = bare_sep_tok() or (c == ")" and ")") or nil
 					if bsx then
 						done = true
 						return {
@@ -3817,9 +3896,9 @@ end
 -- program, and by callers that want the AST). An optional `sh` makes alias
 -- expansion consult the live runtime table (for eval/source/$() at runtime); the
 -- compiler passes none, so it tracks aliases deterministically from source.
-function M.parse(src, sh, aenv)
-	local saved_env = ALIAS_ENV
-	local nextf = make_parser(src, sh, aenv) -- yields logical-line groups { stmts, perr }
+function M.parse(src, sh, aenv, noalias)
+	local saved_env, sprex = ALIAS_ENV, COMSUB_PREX
+	local nextf = make_parser(src, sh, aenv, noalias) -- yields logical-line groups { stmts, perr }
 	local stmts, lines = {}, {}
 	while true do
 		local lg = nextf()
@@ -3839,7 +3918,7 @@ function M.parse(src, sh, aenv)
 			stmts[#stmts + 1] = st
 		end
 	end
-	ALIAS_ENV = saved_env
+	ALIAS_ENV, COMSUB_PREX = saved_env, sprex
 	return { stmts = stmts, lines = lines }
 end
 

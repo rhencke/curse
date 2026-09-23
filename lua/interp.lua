@@ -1140,7 +1140,7 @@ local function expand_part_str(sh, p, assign)
 		sh.last_bg_pid = tostring(pid) -- $! is the last process substitution (bash)
 		return "/dev/fd/" .. fd
 	elseif p.cmdsub then
-		return sh:capture_src(p.cmdsub, p.backtick)
+		return sh:capture_src(p.cmdsub, p.backtick, p.noalias)
 	elseif p.pexp then
 		local pe = p.pexp
 		if pe.op == "badsubst" then -- ${x|html} and other unrecognized ${…} forms
@@ -2167,7 +2167,7 @@ local function apply_redirs(sh, redirs)
 		end
 		-- expansion can also fail non-fatally (e.g. failglob no-match): the redirect
 		-- then fails (status 1) rather than aborting the script.
-		local eok, fs = pcall(expand_to_fields, sh, P.parse_word(raw))
+		local eok, fs = rt.redir_noglob(sh, expand_to_fields, sh, P.parse_word(raw))
 		if not eok then
 			return nil
 		end
@@ -2235,6 +2235,9 @@ local function apply_redirs(sh, redirs)
 			else
 				backup(r.fd)
 				local f = open_out(sh, t, 438)
+				if f < 0 then
+					rt.open_fail(sh, t)
+				end
 				if f >= 0 then
 					place_fd(f, r.fd)
 				else
@@ -2248,6 +2251,9 @@ local function apply_redirs(sh, redirs)
 			else
 				backup(r.fd)
 				local f = C.open(t, 577, 438)
+				if f < 0 then
+					rt.open_fail(sh, t)
+				end
 				if f >= 0 then
 					place_fd(f, r.fd)
 				else
@@ -2261,6 +2267,9 @@ local function apply_redirs(sh, redirs)
 			else
 				backup(r.fd)
 				local f = C.open(t, 1089, 438)
+				if f < 0 then
+					rt.open_fail(sh, t)
+				end
 				if f >= 0 then
 					place_fd(f, r.fd)
 				else
@@ -2274,6 +2283,9 @@ local function apply_redirs(sh, redirs)
 			else
 				backup(r.fd)
 				local f = C.open(t, 0, 0)
+				if f < 0 then
+					rt.open_fail(sh, t)
+				end
 				if f >= 0 then
 					place_fd(f, r.fd)
 				else
@@ -2287,6 +2299,9 @@ local function apply_redirs(sh, redirs)
 			else
 				backup(r.fd)
 				local f = C.open(t, 66, 438)
+				if f < 0 then
+					rt.open_fail(sh, t)
+				end
 				if f >= 0 then
 					place_fd(f, r.fd)
 				else
@@ -2301,6 +2316,9 @@ local function apply_redirs(sh, redirs)
 				backup(1)
 				backup(2)
 				local f = open_out(sh, t, 438)
+				if f < 0 then
+					rt.open_fail(sh, t)
+				end
 				if f >= 0 then
 					C.dup2(f, 1)
 					C.dup2(f, 2)
@@ -2317,6 +2335,9 @@ local function apply_redirs(sh, redirs)
 				backup(1)
 				backup(2)
 				local f = C.open(t, 1089, 438)
+				if f < 0 then
+					rt.open_fail(sh, t)
+				end
 				if f >= 0 then
 					C.dup2(f, 1)
 					C.dup2(f, 2)
@@ -4460,6 +4481,9 @@ exec_stmt = function(sh, st, hook)
 		-- `exec [redirs] [cmd…]`: redirections are permanent (not restored). With no
 		-- command it just rewires the shell's own fds (e.g. `exec 3>file`); with a
 		-- command it replaces the shell process with that command.
+		while (args[1] == "command" or args[1] == "builtin") and args[2] == "exec" and not sh.functions[args[1]] do
+			table.remove(args, 1) -- `command exec 2>f`: still exec, its redirections persist
+		end
 		if args[1] == "exec" then
 			-- in an in-process subshell/$(…) the fds/process image are process-global: become
 			-- a real child first (rt.need_process) unless a function shadows `exec`
@@ -4545,6 +4569,7 @@ exec_stmt = function(sh, st, hook)
 			end
 			return
 		end
+		local tenv_base -- set while this command's prefix bindings sit on sh.tenv
 		local function run_cmd()
 			sh.write_err = nil -- a builtin sets this on an output write error (e.g. full disk)
 			-- `set -x` trace: BEFORE the command's own redirects, so `cmd 2>file` doesn't
@@ -4553,7 +4578,27 @@ exec_stmt = function(sh, st, hook)
 				xtrace(sh, args)
 			end
 			if st.redirs then
-				local save, ok = apply_redirs(sh, st.redirs)
+				local save, ok
+				if tenv_base and #sh.tenv > tenv_base then
+					-- the redirections don't see the command's own prefix bindings (bash:
+					-- `a=2 cmd >&$a` uses the outer a) — unshadow them while they expand
+					local shadow = {}
+					for k = #sh.tenv, tenv_base + 1, -1 do
+						local te = sh.tenv[k]
+						shadow[#shadow + 1] = { te.name, sh.vars[te.name] }
+						sh.vars[te.name] = te.box or nil
+					end
+					local rok, a1, a2 = pcall(apply_redirs, sh, st.redirs)
+					for i = #shadow, 1, -1 do
+						sh.vars[shadow[i][1]] = shadow[i][2]
+					end
+					if not rok then
+						error(a1)
+					end
+					save, ok = a1, a2
+				else
+					save, ok = apply_redirs(sh, st.redirs)
+				end
 				if not ok then
 					sh.status = 1
 					restore_redirs(save) -- open failed: skip the command
@@ -4685,7 +4730,9 @@ exec_stmt = function(sh, st, hook)
 			-- mark these entries so a DIRECT function call (not `eval`/a builtin) can tag
 			-- them with its frame: `local x` absorbs only its OWN call's tempenv.
 			sh.tenv_call_base = base
+			tenv_base = base
 			local ok, err = pcall(run_cmd)
+			tenv_base = nil
 			sh.tenv_call_base = nil
 			local relocale = false
 			for k = #sh.tenv, base + 1, -1 do

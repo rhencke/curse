@@ -452,6 +452,7 @@ ffi.cdef([[
   int dup2(int oldfd, int newfd);
   int dup(int oldfd);
   int open(const char *path, int flags, int mode);
+  char *strerror(int errnum);
   int fcntl(int fd, int cmd, ...);
   int fork(void);
   void _exit(int status);
@@ -870,6 +871,13 @@ local function _temp_fd(content) -- write body to a temp file, return an O_RDONL
 	os.remove(tmp) -- the open fd keeps the inode alive
 	return f
 end
+-- A redirection's open failed: bash's message, from errno (read right after the open).
+-- noclobber's O_EXCL miss on a regular file is "cannot overwrite existing file".
+function M.open_fail(sh, path)
+	local e = ffi.errno()
+	local msg = (e == 17 and sh.opt_C) and "cannot overwrite existing file" or ffi.string(C.strerror(e))
+	io.stderr:write("curse: " .. path .. ": " .. msg .. "\n")
+end
 function M.redir_apply(sh, op, fd, target, saves)
 	io.flush() -- flush buffered stdout before moving fds (else it lands in the new target)
 	local function backup(f)
@@ -895,6 +903,7 @@ function M.redir_apply(sh, op, fd, target, saves)
 		backup(fd)
 		local h = (op == "out") and open_out(target) or C.open(target, 577, 438)
 		if h < 0 then
+			M.open_fail(sh, target)
 			return false
 		end
 		if h ~= fd then
@@ -905,6 +914,7 @@ function M.redir_apply(sh, op, fd, target, saves)
 		backup(fd)
 		local h = C.open(target, 1089, 438) -- O_WRONLY|O_CREAT|O_APPEND
 		if h < 0 then
+			M.open_fail(sh, target)
 			return false
 		end
 		if h ~= fd then
@@ -915,6 +925,7 @@ function M.redir_apply(sh, op, fd, target, saves)
 		backup(fd)
 		local h = C.open(target, 0, 0) -- O_RDONLY
 		if h < 0 then
+			M.open_fail(sh, target)
 			return false
 		end
 		if h ~= fd then
@@ -925,6 +936,7 @@ function M.redir_apply(sh, op, fd, target, saves)
 		backup(fd)
 		local h = C.open(target, 66, 438) -- O_RDWR|O_CREAT
 		if h < 0 then
+			M.open_fail(sh, target)
 			return false
 		end
 		if h ~= fd then
@@ -951,6 +963,7 @@ function M.redir_apply(sh, op, fd, target, saves)
 		backup(2)
 		local h = (op == "appboth") and C.open(target, 1089, 438) or open_out(target)
 		if h < 0 then
+			M.open_fail(sh, target)
 			return false
 		end
 		C.dup2(h, 1)
@@ -990,8 +1003,18 @@ end
 -- tier hands the mask-aware segments; expand them, require EXACTLY one field (else "ambiguous
 -- redirect", status 1), then apply — matching interp's ftgt. A raise during expansion (failglob,
 -- set -u) fails the redirect non-fatally, as interp's pcall does.
+-- A posix-mode non-interactive shell doesn't glob a redirection target (bash).
+function M.redir_noglob(sh, f, ...)
+	if not (sh.opt_posix and not sh.opt_i) or sh.opt_f then
+		return pcall(f, ...)
+	end
+	sh.opt_f = true
+	local ok, fs = pcall(f, ...)
+	sh.opt_f = false
+	return ok, fs
+end
 function M.redir_apply_expand(sh, op, fd, segs, raw, saves)
-	local ok, fs = pcall(M.expand_fields, sh, segs)
+	local ok, fs = M.redir_noglob(sh, M.expand_fields, sh, segs)
 	if not ok then
 		return false
 	end
@@ -1356,14 +1379,15 @@ local function capture_pure(sh, st)
 	return false -- if/while/for/case/subshell/group/funcdef/background/arithcmd: fork
 end
 
-function Shell:capture_src(src, backtick)
+function Shell:capture_src(src, backtick, noalias)
 	local P = require("parser")
 	local I = require("interp")
 	-- A SYNTAX error in the body: bash makes `$(…)` fatal to the whole containing
 	-- command, but a backtick `…` only PRINTS the error and yields "" (non-fatal —
 	-- `echo A``echo "``B` prints "AB" and exits 0). Backticks are parsed lazily at
 	-- expansion time, so a throw here (e.g. an unterminated quote) is contained.
-	local pok, parsed = pcall(P.parse, src, self) -- self: $()/`` expand aliases from the live table
+	-- self: $()/`` expand aliases from the live table (unless already expanded as read)
+	local pok, parsed = pcall(P.parse, src, self, nil, noalias)
 	if not pok then
 		if backtick then
 			io.stderr:write("curse: command substitution: " .. tostring(parsed) .. "\n")
@@ -3902,6 +3926,8 @@ function Shell:set_str(name, s)
 	end
 	if dn == "BASH_ARGV0" then
 		self.argv0 = s -- assigning BASH_ARGV0 sets $0 (bash)
+	elseif dn == "POSIXLY_CORRECT" then
+		self.opt_posix = true -- (bash's sv_strict_posix: setting it enters posix mode)
 	end
 	if b.exported then
 		C.setenv(dn, s, 1)
@@ -6468,15 +6494,11 @@ function Shell:expand_param(pe, arg, arg2, idxnum)
 	local function assign_default(v)
 		if index and index ~= "@" and index ~= "*" then
 			self:array_set(name, idxnum or 0, v)
-		else
-			-- a bare name that IS an array writes element 0 (bash), not a scalar shadow
-			local b = self.vars[self:deref(name)]
-			if b and b.arr then
-				self:array_set(name, 0, v)
-			else
-				self:set_str(name, v)
-			end
+			return v
 		end
+		-- a bare name that IS an array writes element 0 (bash), not a scalar shadow; the
+		-- var's attributes apply (declare -i/-u/-l) and the expansion is the stored value
+		return M.assign_default(self, name, v)
 	end
 	if op == "len" then
 		return tostring(M.mb_strlen(val))
@@ -6495,17 +6517,13 @@ function Shell:expand_param(pe, arg, arg2, idxnum)
 	end
 	if op == ":=" then
 		if val == "" then
-			local v = A()
-			assign_default(v)
-			return v
+			return assign_default(A())
 		end
 		return val
 	end
 	if op == "=" then
 		if not isset then
-			local v = A()
-			assign_default(v)
-			return v
+			return assign_default(A())
 		end
 		return val
 	end
@@ -7494,13 +7512,9 @@ end
 -- scalar/bare-array name — pexp_compilable never compiles a subscripted target), returning
 -- the value. A bare name that IS an array writes element 0.
 function M.assign_default(sh, name, v)
-	local b = sh.vars[sh:deref(name)]
-	if b and b.arr then
-		sh:array_set(name, 0, v)
-	else
-		sh:set_str(name, v)
-	end
-	return v
+	-- through the var's attributes (declare -i / -u / -l): the expansion is the STORED value
+	M.assign_scalar(sh, name, v)
+	return sh:get(name)
 end
 -- ${x:?word}/${x?word}: the value was empty/unset — print the message and abort (exits
 -- under -c/posix, else line-abort), exactly as interp's expand_param.
