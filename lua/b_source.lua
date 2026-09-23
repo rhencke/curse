@@ -45,6 +45,7 @@ return function(sh, cmd, args, hook, tcb)
 		-- the no-argument usage error (directory/not-found/syntax-error/success all
 		-- fire), regardless of functrace; an `exit` in the file propagates and skips it.
 		local do_return = name ~= nil
+		local dsave -- (the DEBUG trap, hidden while the file runs: rt.source_debug_hide)
 		if not name then
 			io.stderr:write("curse: " .. cmd .. ": filename argument required\n")
 			sh.status = 2
@@ -82,6 +83,7 @@ return function(sh, cmd, args, hook, tcb)
 					local ownp = sh.params -- (a `set --` in the file replaces this table)
 					sh.sourcedepth = (sh.sourcedepth or 0) + 1 -- a `return` is valid while sourcing
 					local sframe = rt.source_enter(sh, name) -- (BASH_SOURCE/BASH_LINENO/FUNCNAME frame)
+					dsave = rt.source_debug_hide(sh)
 					-- Run the file the way the shell runs its own input: LAZILY through the
 					-- sh-aware parser, so aliases defined earlier expand later and a `return`
 					-- ends the file. A syntax error stops after the valid prefix (bash),
@@ -123,6 +125,7 @@ return function(sh, cmd, args, hook, tcb)
 						elseif type(err) == "table" and err.__curse_parseerr then
 							sh.status = 2 -- a syntax error in the file: source returns 2, doesn't halt the shell (bash)
 						else
+							rt.source_debug_restore(sh, dsave)
 							error(err)
 						end -- a real `exit` propagates (skips the RETURN trap)
 					end
@@ -130,14 +133,15 @@ return function(sh, cmd, args, hook, tcb)
 			end
 		end
 		if do_return then
-			local rt = sh.traps and sh.traps.RETURN
-			if rt and rt ~= "" and not sh.in_return_trap then
+			local rh = sh.traps and sh.traps.RETURN
+			if rh and rh ~= "" and not sh.in_return_trap then
 				sh.in_return_trap = true
 				local sv = sh.status
-				run_trap(sh, rt)
+				run_trap(sh, rh)
 				sh.status = sv
 				sh.in_return_trap = false
 			end
 		end
+		rt.source_debug_restore(sh, dsave)
 	end
 end

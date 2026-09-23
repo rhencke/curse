@@ -2036,22 +2036,32 @@ end
 -- traced (`declare -ft`) nor under functrace does NOT inherit the DEBUG trap — it's cleared
 -- for the call and put back on return, unless the body set its own (which then persists).
 -- So a trap set INSIDE the function fires for the rest of it. Returns the saved handler.
+-- A function without functrace (`set -T` / `declare -ft`) doesn't inherit the DEBUG
+-- and RETURN traps: they're hidden for its body (bash's execute_function) and restored on
+-- the way out. Returns what debug_leave puts back.
 function M.debug_enter(sh, name)
-	local d = sh.traps.DEBUG
-	if d == nil then
+	local d, r = sh.traps.DEBUG, sh.traps.RETURN
+	if d == nil and r == nil then
 		return nil
 	end
 	if sh.opt_functrace or (sh.fn_trace and sh.fn_trace[name]) then
 		-- inherited: it also fires once on ENTRY, at the definition's line (bash)
-		require("interp").run_debug(sh, sh.func_bline and sh.func_bline[name] or nil)
+		if d ~= nil then
+			require("interp").run_debug(sh, sh.func_bline and sh.func_bline[name] or nil)
+		end
 		return nil
 	end
-	sh.traps.DEBUG = nil
-	return d
+	sh.traps.DEBUG, sh.traps.RETURN = nil, nil
+	return { d = d, r = r }
 end
 function M.debug_leave(sh, saved)
-	if saved ~= nil and sh.traps.DEBUG == nil then
-		sh.traps.DEBUG = saved
+	if saved ~= nil then
+		if saved.d ~= nil and sh.traps.DEBUG == nil then
+			sh.traps.DEBUG = saved.d
+		end
+		if saved.r ~= nil and sh.traps.RETURN == nil then
+			sh.traps.RETURN = saved.r
+		end
 	end
 end
 function M.child_exit(sh, status)
@@ -3895,7 +3905,7 @@ function Shell:special_get(name)
 		return tostring(tonumber(ffi.C.getpid()))
 	end -- fresh: changes in subshells
 	if name == "FUNCNAME" then
-		return (self.funcstack and self.funcstack[1]) or ""
+		return self:in_function() and self.funcstack[1] or ""
 	end
 	if name == "BASH_SOURCE" then
 		return self:bash_source_array()[1] or ""
@@ -4756,9 +4766,22 @@ function Shell:array_set(name, key, val, append)
 end
 -- FUNCNAME is a virtual array: the call stack innermost-first, then "main"
 -- (empty at the top level). funcstack[1] is the innermost function.
+-- A real function frame is on the call stack (`source` pushes a frame too, but bash's
+-- FUNCNAME stays unset in a file sourced at the top level).
+function Shell:in_function()
+	local fs = self.funcstack
+	if fs then
+		for i = 1, #fs do
+			if fs[i] ~= "source" then
+				return true
+			end
+		end
+	end
+	return false
+end
 function Shell:funcname_array()
 	local fs = self.funcstack
-	if not fs or #fs == 0 then
+	if not fs or #fs == 0 or not self:in_function() then
 		return {}
 	end
 	local t = {}
@@ -4801,7 +4824,39 @@ function Shell:dirstack_array() -- (sh.dirstack: the entries below the cwd, bott
 	end
 	return t
 end
+-- BASH_ARGV / BASH_ARGC (bash maintains them only under extdebug): every frame's
+-- positional parameters, innermost frame first and each frame's own args reversed; and
+-- each frame's count.
+function Shell:frame_params()
+	local fr = { { self.params, self.nparams } }
+	for d = self.pd, 1, -1 do
+		fr[#fr + 1] = { self.paramstack[d], self.npstack[d] }
+	end
+	return fr
+end
+function Shell:bash_argv_array()
+	local t = {}
+	if self.shopt.extdebug then
+		for _, f in ipairs(self:frame_params()) do
+			for k = f[2] or 0, 1, -1 do
+				t[#t + 1] = f[1][k] or ""
+			end
+		end
+	end
+	return t
+end
+function Shell:bash_argc_array()
+	local t = {}
+	if self.shopt.extdebug then
+		for _, f in ipairs(self:frame_params()) do
+			t[#t + 1] = tostring(f[2] or 0)
+		end
+	end
+	return t
+end
 local VIRT_ARR = {
+	BASH_ARGV = "bash_argv_array",
+	BASH_ARGC = "bash_argc_array",
 	FUNCNAME = "funcname_array",
 	BASH_SOURCE = "bash_source_array",
 	BASH_LINENO = "bash_lineno_array",
@@ -6852,7 +6907,7 @@ end
 -- then again by the builtin, status 1; at top level just `NAME: …`, status 0. A plain
 -- `declare -A NAME` reports `declare: NAME: …`, status 1. Returns the status.
 function M.array_convert_msg(sh, cmd, name, what, compound)
-	local fn = sh.funcstack and sh.funcstack[1]
+	local fn = sh:in_function() and sh.funcstack[1]
 	if compound and not fn then -- (and the rest of the line is abandoned)
 		io.stderr:write("curse: " .. name .. ": cannot convert " .. what .. "\n")
 		error({ __curse_exit = 1, __curse_lineabort = true })
@@ -7887,6 +7942,7 @@ end
 local BUILTIN_LAZY = {
 	echo = "b_echo",
 	enable = "b_enable",
+	caller = "b_caller",
 	compgen = "b_completion",
 	complete = "b_completion",
 	compopt = "b_completion",
@@ -8109,17 +8165,16 @@ end
 -- oracle (it also owns the diagnostics). A `return` ends the source (caught here); break/
 -- continue/exit propagate to the caller; the RETURN trap fires after, like b_source.
 -- `source`'s call frame (bash): ${BASH_SOURCE[0]} is the file as named, BASH_LINENO gets
--- the `source` line, FUNCNAME gains "source" only inside a function. Shared by both tiers.
+-- the `source` line, FUNCNAME gains "source" (shown only inside a function). Shared by both tiers.
 function M.source_enter(sh, name)
 	local fr = { src = sh.cur_source, line = sh.cur_line }
 	sh.srcstack = sh.srcstack or {}
 	table.insert(sh.srcstack, 1, sh.cur_source or sh.argv0 or "")
 	sh.linestack = sh.linestack or {}
 	table.insert(sh.linestack, 1, current_line(sh))
-	if sh.funcstack and #sh.funcstack > 0 then
-		table.insert(sh.funcstack, 1, "source")
-		fr.fn = true
-	end
+	sh.funcstack = sh.funcstack or {}
+	table.insert(sh.funcstack, 1, "source") -- (FUNCNAME shows it only inside a function)
+	fr.fn = true
 	sh.cur_source = name
 	return fr
 end
@@ -8182,6 +8237,7 @@ function M.source(sh, argv)
 	local ownp = sh.params -- (a `set --` in the file replaces this table)
 	sh.sourcedepth = (sh.sourcedepth or 0) + 1 -- a `return` is valid while sourcing
 	local fr = M.source_enter(sh, name)
+	local dsave = M.source_debug_hide(sh)
 	local rok, err = pcall(require("tier").run_compiled, mod, sh, nil)
 	M.source_leave(sh, fr)
 	sh.sourcedepth = sh.sourcedepth - 1
@@ -8192,6 +8248,7 @@ function M.source(sh, argv)
 		if type(err) == "table" and err.__curse_return then
 			sh.status = err.__curse_return
 		else
+			M.source_debug_restore(sh, dsave)
 			error(err) -- exit / break / continue propagate
 		end
 	end
@@ -8203,6 +8260,21 @@ function M.source(sh, argv)
 		Ii.run_trap(sh, trap)
 		sh.status = sv
 		sh.in_return_trap = false
+	end
+	M.source_debug_restore(sh, dsave)
+end
+-- A sourced file isn't traced by the DEBUG trap (nor is its RETURN trap run) unless
+-- functrace is on, like a function body (bash).
+function M.source_debug_hide(sh)
+	local d = sh.traps and sh.traps.DEBUG
+	if d ~= nil and not sh.opt_functrace then
+		sh.traps.DEBUG = nil
+		return d
+	end
+end
+function M.source_debug_restore(sh, d)
+	if d ~= nil and sh.traps.DEBUG == nil then
+		sh.traps.DEBUG = d
 	end
 end
 

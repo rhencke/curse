@@ -228,7 +228,7 @@ local function word_reads_debugstack(w)
 		-- code in a STRING (a trap handler, an eval'd string) is expanded at runtime:
 		-- a literal naming one of the stacks may read it there
 		if p.lit and (p.lit:find("FUNCNAME", 1, true) or p.lit:find("BASH_SOURCE", 1, true)
-			or p.lit:find("BASH_LINENO", 1, true)) then
+			or p.lit:find("BASH_LINENO", 1, true) or p.lit:find("caller", 1, true)) then
 			return true
 		end
 		-- p.arith is a source string; arith() can THROW on a malformed expr (only the
@@ -243,6 +243,11 @@ local function word_reads_debugstack(w)
 		if p.arithast and arith_reads_debugstack(p.arithast) then
 			return true
 		end
+		local cs = p.cmdsub or p.procsub -- (a $(…)/`…` body runs in this shell's frames)
+		if type(cs) == "string" and (cs:find("FUNCNAME", 1, true) or cs:find("BASH_SOURCE", 1, true)
+			or cs:find("BASH_LINENO", 1, true) or cs:find("caller", 1, true)) then
+			return true
+		end
 	end
 	return false
 end
@@ -251,7 +256,7 @@ local function reads_debugstack(stmts)
 		-- a sourced file can read them out of sight: keep the frames for it; and a
 		-- `declare -A NAME=(…)` names the running function in its conversion error
 		local p1 = st.t == "simple" and st.words and st.words[1] and st.words[1].parts[1]
-		if p1 and (p1.lit == "source" or p1.lit == ".") then
+		if p1 and (p1.lit == "source" or p1.lit == "." or p1.lit == "caller") then
 			return true
 		end
 		if p1 and st.arrayargs and (p1.lit == "declare" or p1.lit == "typeset" or p1.lit == "local") then

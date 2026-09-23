@@ -2734,6 +2734,7 @@ local LATE_FORK_BUILTIN = rt.LATE_FORK_BUILTIN
 local BUILTINS = {
 	echo = 1,
 	enable = 1,
+	caller = 1,
 	[":"] = 1,
 	["true"] = 1,
 	["false"] = 1,
@@ -3729,6 +3730,24 @@ local function run_function(sh, cmd, fn, args, hook, tenv_base)
 		restore_redirs(rsave)
 	end
 	sh.loopdepth = saved_ld
+	if not ok and type(err) == "table" and err.__curse_return then
+		sh.status = err.__curse_return
+		ok, err = true, nil
+	end
+	-- RETURN trap: fires as the function returns, still in ITS context (FUNCNAME, the
+	-- definition's $LINENO), preserving its exit status. A top-level RETURN trap is NOT
+	-- inherited by a function unless functrace (`set -T`) is on (bash) — a sourced
+	-- script's return fires it regardless (see the `.`/source builtin) — and a function
+	-- run by the DEBUG trap doesn't fire it.
+	local rt_h = (sh.opt_functrace or (sh.fn_trace and sh.fn_trace[cmd])) and sh.traps and sh.traps.RETURN
+	if ok and rt_h and rt_h ~= "" and not sh.in_return_trap and not sh.in_debug then
+		sh.in_return_trap = true
+		local saved = sh.status
+		sh.cur_line = sh.func_bline and sh.func_bline[cmd] or sh.cur_line
+		run_trap(sh, rt_h)
+		sh.status = saved
+		sh.in_return_trap = false
+	end
 	rt.debug_leave(sh, dbg_saved)
 	table.remove(sh.funcstack, 1)
 	table.remove(sh.linestack, 1)
@@ -3743,18 +3762,6 @@ local function run_function(sh, cmd, fn, args, hook, tenv_base)
 		else
 			error(err)
 		end
-	end
-	-- RETURN trap: fires after the function body returns (in the caller's scope),
-	-- preserving the function's exit status. A top-level RETURN trap is NOT inherited
-	-- by a function unless functrace (`set -T`) is on (bash) — a sourced script's
-	-- return fires it regardless (see the `.`/source builtin).
-	local rt_h = (sh.opt_functrace or (sh.fn_trace and sh.fn_trace[cmd])) and sh.traps and sh.traps.RETURN
-	if rt_h and rt_h ~= "" and not sh.in_return_trap then
-		sh.in_return_trap = true
-		local saved = sh.status
-		run_trap(sh, rt_h)
-		sh.status = saved
-		sh.in_return_trap = false
 	end
 end
 
@@ -3980,7 +3987,7 @@ local function exec_simple(sh, args, hook, no_func)
 		local code = args[2] and (tonumber(args[2]) % 256) or sh.status
 		-- inside a function, bash runs the EXIT trap right here, with the function's frame
 		-- still active (`trap 'echo $FUNCNAME' EXIT; f() { exit; }; f` prints f)
-		if sh.funcstack and #sh.funcstack > 0 and not sh.in_exit_trap and not rt.exit_trap_inherited
+		if sh:in_function() and not sh.in_exit_trap and not rt.exit_trap_inherited
 			and sh.traps and sh.traps.EXIT and sh.traps.EXIT ~= "" then
 			sh.status = code
 			M.run_exit_trap(sh)
@@ -4523,7 +4530,7 @@ exec_stmt = function(sh, st, hook)
 			if not (sh.in_trap and sh.in_trap > 0) then
 				sh.cur_cmd = st -- $BASH_COMMAND (a trap's own commands don't replace it)
 			end
-			if run_debug(sh, (sh.in_trap and sh.in_trap > 0) and sh.cur_line or st.line) then
+			if run_debug(sh, (sh.in_trap and sh.in_trap > 0 and (sh.calldepth or 0) == sh.trap_calldepth) and sh.cur_line or st.line) then
 				return -- extdebug: the DEBUG trap said skip it
 			end
 		end
@@ -5333,7 +5340,7 @@ exec_stmt = function(sh, st, hook)
 		-- DEBUG fires (at the `for` line) before the init, before EACH condition
 		-- evaluation, and before EACH step — bash's `[6][6][7]…` per-iteration pattern.
 		local function fdbg()
-			run_debug(sh, (sh.in_trap and sh.in_trap > 0) and sh.cur_line or st.line)
+			run_debug(sh, (sh.in_trap and sh.in_trap > 0 and (sh.calldepth or 0) == sh.trap_calldepth) and sh.cur_line or st.line)
 		end
 		-- A slot whose arith failed to parse (`i='3'`) was deferred: bash reports the
 		-- error at RUNTIME and runs the loop zero (or partial) iterations, non-fatally.
@@ -5750,7 +5757,7 @@ exec_stmt = function(sh, st, hook)
 					if not (sh.in_trap and sh.in_trap > 0) then
 						sh.cur_cmd = cmds[k] -- $BASH_COMMAND: this stage
 					end
-					run_debug(sh, (sh.in_trap and sh.in_trap > 0) and sh.cur_line or (cmds[k].line or st.line))
+					run_debug(sh, (sh.in_trap and sh.in_trap > 0 and (sh.calldepth or 0) == sh.trap_calldepth) and sh.cur_line or (cmds[k].line or st.line))
 				end
 				local rd, wr = -1, -1
 				if k < nst then
