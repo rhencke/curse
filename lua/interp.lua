@@ -527,6 +527,15 @@ local SIGNUM = {
 	PWR = 30,
 	SYS = 31,
 }
+-- the real-time signals, named as bash (glibc) lists them: RTMIN, RTMIN+1…+15,
+-- RTMAX-14…-1, RTMAX (34…64 on Linux)
+SIGNUM.RTMIN, SIGNUM.RTMAX = 34, 64
+for k = 1, 15 do
+	SIGNUM["RTMIN+" .. k] = 34 + k
+end
+for k = 1, 14 do
+	SIGNUM["RTMAX-" .. k] = 64 - k
+end
 local NUMSIG = {}
 for k, v in pairs(SIGNUM) do
 	NUMSIG[v] = k
@@ -2075,7 +2084,13 @@ local function expand_to_fields(sh, w)
 			-- and a quoted "$@"/"${a[@]}" in it keeps its separate words (${1+"$@"})
 			local pe = p.pexp
 			local b = sh.vars[sh:deref(pe.name)]
-			local hasval = b ~= nil and (b.s ~= nil or b.n ~= nil or b.arr ~= nil) or sh:special_get(pe.name) ~= ""
+			local hasval -- (an array is "set" by its [0], as expand_param decides)
+			if b and b.arr then
+				hasval = b.arr[0] ~= nil or b.arr["0"] ~= nil
+			else
+				hasval = b ~= nil and (b.s ~= nil or b.n ~= nil)
+			end
+			hasval = hasval or sh:special_get(pe.name) ~= ""
 			local pn = tonumber(pe.name) -- a positional parameter is set when within $#
 			if pn then
 				hasval = pn == 0 or pn <= sh.nparams
@@ -2672,6 +2687,7 @@ local BUILTIN_LAZY = rt.BUILTIN_LAZY -- one source of truth (runtime); shared wi
 local LATE_FORK_BUILTIN = rt.LATE_FORK_BUILTIN
 local BUILTINS = {
 	echo = 1,
+	enable = 1,
 	[":"] = 1,
 	["true"] = 1,
 	["false"] = 1,
@@ -2832,7 +2848,7 @@ local function name_type(sh, name, nofunc)
 	if not nofunc and sh.functions[name] then
 		return "function"
 	end -- `type -f` skips functions
-	if BUILTINS[name] then
+	if BUILTINS[name] and not (sh.disabled_builtins and sh.disabled_builtins[name]) then
 		return "builtin"
 	end
 	-- a remembered location (`hash`, `hash -p`, or an earlier run) wins, and counts a hit
@@ -2912,9 +2928,11 @@ local function do_arrayassign(sh, st)
 		end
 	end
 	if isassoc then
-		if anykeyed then -- keyed elements assigned; bare ones are an error in bash (skip)
+		if anykeyed then -- keyed elements assigned; a bare one is an error (reported, skipped)
 			for _, it in ipairs(items) do
-				if it.key ~= nil then
+				if it.key == nil then
+					io.stderr:write("curse: " .. name .. ": " .. it.val .. ": must use subscript when assigning associative array\n")
+				else
 					local idx = array_key(sh, name, it.key)
 					if it.op == "+=" and not st.append then -- append to the pre-statement value (see snap)
 						sh:array_set(name, idx, (snap and snap[idx] or "") .. it.val, false)
@@ -3774,6 +3792,9 @@ local function exec_simple(sh, args, hook, no_func)
 	-- inside an in-process subshell/$(…), a builtin that needs its own process (fds/process
 	-- image, rlimits, signal dispositions, the builtin table, waiting on its own children)
 	-- late-forks first (rt.need_process): from here on this runs in a real child
+	if cmd ~= nil and sh.disabled_builtins and sh.disabled_builtins[cmd] then
+		return sh:exec(unpack(args)) -- `enable -n NAME`: found on $PATH instead
+	end
 	if LATE_FORK_BUILTIN[cmd] and sh.iso_ctx and sh.iso_ctx[1] then
 		rt.need_process(sh)
 	end
@@ -3910,6 +3931,12 @@ local function exec_simple(sh, args, hook, no_func)
 			end
 			j = j + 1
 		end
+		if args[j] == "--" then -- (end of options)
+			j = j + 1
+		end
+		-- a special builtin run through `command` loses its fatal-error property (posix)
+		local svc = sh.via_command
+		sh.via_command = true
 		if usep and rt.restricted(sh, "command: -p: restricted") then
 			return
 		end
@@ -3929,12 +3956,18 @@ local function exec_simple(sh, args, hook, no_func)
 			else
 				C.unsetenv("PATH")
 			end
+			sh.via_command = svc
 			if not ok then
 				error(err)
 			end
 		else
-			exec_simple(sh, { unpack(args, j) }, hook, true)
+			local ok, err = pcall(exec_simple, sh, { unpack(args, j) }, hook, true)
+			sh.via_command = svc
+			if not ok then
+				error(err, 0)
+			end
 		end -- run rest, skipping FUNCTION lookup
+		sh.via_command = svc
 	elseif sh.functions[cmd] and not no_func then
 		run_function(sh, cmd, sh.functions[cmd], args, hook)
 	else
@@ -5097,6 +5130,12 @@ exec_stmt = function(sh, st, hook)
 						exec_stmt(sh, a, hook)
 						sh.applying_prefix = nil
 						C.setenv(a.name, sh:get(a.name), 1)
+					end
+					do -- (a prefix binding is in the environment: `declare -p` shows -x)
+						local nb = sh.vars[sh:deref(a.name)]
+						if nb then
+							nb.exported = true
+						end
 					end
 				end
 			end

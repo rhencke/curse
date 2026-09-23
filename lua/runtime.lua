@@ -835,11 +835,15 @@ end
 -- pipe/save fd the scheduler holds (a stray copy of a write end would starve a
 -- reader of EOF), unblocks SIGPIPE, and forgets CO — so it never yields and runs
 -- to its own _exit like any forked child.
+-- $$ is the MAIN shell's pid in every subshell: fixed before the first fork, so a child
+-- never computes its own (Shell:pid)
+local pid_cache
 function M.fork()
 	local t = co_task()
 	if t then
 		pre_yield(t)
 	end
+	pid_cache = pid_cache or tonumber(C.getpid())
 	local pid = C.fork()
 	if pid == 0 then
 		-- every forked child is a subshell: it doesn't run the EXIT trap it inherited
@@ -1332,7 +1336,12 @@ C.sigemptyset(_exec_emptyset)
 function Shell:exec(...)
 	local args = { ... }
 	local n = #args
-	if n == 0 or args[1] == "" then
+	if n == 0 then
+		self.status = 127
+		return
+	end
+	if args[1] == "" then -- (`''` names no file: bash's ": command not found")
+		self:errmsg("curse: " .. (self.exec_builtin and "exec: " or "") .. (self.exec_builtin and ": not found\n" or ": command not found\n"))
 		self.status = 127
 		return
 	end
@@ -3808,7 +3817,6 @@ function Shell:pwd()
 	end
 	return self:phys_cwd()
 end
-local pid_cache
 function Shell:pid()
 	if not pid_cache then
 		pid_cache = tonumber(ffi.C.getpid())
@@ -4170,6 +4178,30 @@ function M.posix_arith_fatal(sh, err)
 	if sh.opt_posix and not sh.opt_i and err.__curse_matherr then
 		error({ __curse_exit = sh.opt_c and 127 or 1 }, 0)
 	end
+end
+-- `kill -l` / `trap -l`: bash's display_signal_list — `%2d) SIGNAME` five to a line,
+-- tab-separated (so a short last line ends in a tab), from a number -> name table
+function M.signal_list(numsig)
+	local nums = {}
+	for n in pairs(numsig) do
+		nums[#nums + 1] = n
+	end
+	table.sort(nums)
+	local out, col = {}, 0
+	for _, n in ipairs(nums) do
+		out[#out + 1] = ("%2d) SIG%s"):format(n, numsig[n])
+		col = col + 1
+		if col < 5 then
+			out[#out + 1] = "\t"
+		else
+			out[#out + 1] = "\n"
+			col = 0
+		end
+	end
+	if col ~= 0 then
+		out[#out + 1] = "\n"
+	end
+	return table.concat(out)
 end
 -- bash's shell_compatibility_level from $BASH_COMPAT (`5.1` or `51`); 52 when unset/invalid
 function M.compat_level(sh)
@@ -6757,9 +6789,11 @@ arrayassign_body = function(sh, name, items, append)
 		end
 	end
 	if isassoc then
-		if anykeyed then -- keyed elements assigned; bare ones are an error in bash (skip)
+		if anykeyed then -- keyed elements assigned; a bare one is an error (reported, skipped)
 			for _, it in ipairs(items) do
-				if it.key ~= nil then
+				if it.key == nil then
+					io.stderr:write("curse: " .. name .. ": " .. it.val .. ": must use subscript when assigning associative array\n")
+				else
 					local idx = keyof(it.key)
 					if it.op == "+=" and not append then
 						sh:array_set(name, idx, (snap and snap[idx] or "") .. it.val, false)
@@ -7631,7 +7665,7 @@ function Shell:echo(...)
 	-- escapes, -E disables them (bash). Same flag handling as the interp echo builtin,
 	-- so compiled and interpreted echo agree.
 	local n = select("#", ...)
-	local nonl, esc = false, false
+	local nonl, esc = false, self.shopt.xpg_echo and true or false -- (xpg_echo: -e by default)
 	-- Build the output string. Fast paths avoid the {...} pack + buf table + concat that
 	-- dominate echo's cost (and GC) — the common `echo "one string"` has no -neE flag and a
 	-- single (quoted) arg, so it needs neither. Only a leading -flag or multiple args pay them.
@@ -7689,6 +7723,7 @@ end
 -- table (interp aliases rt.BUILTIN_LAZY), so there is one source of truth.
 local BUILTIN_LAZY = {
 	echo = "b_echo",
+	enable = "b_enable",
 	compgen = "b_completion",
 	complete = "b_completion",
 	compopt = "b_completion",
@@ -7786,6 +7821,10 @@ function M.run_prefix(sh, names, vals, runfn)
 		end
 		sh:set_str(name, vals[i])
 		C.setenv(name, sh:get(name), 1)
+		local nb = sh.vars[sh:deref(name)] -- (in the environment: `declare -p` shows -x)
+		if nb then
+			nb.exported = true
+		end
 	end
 	sh.tenv_call_base = base -- a DIRECT function call tags these with its frame (local absorption)
 	local ok, err = pcall(runfn)
@@ -7955,8 +7994,10 @@ function M.source(sh, argv)
 	local code = f:read("*a")
 	f:close()
 	local mod = require("tier").try_fragment(code)
-	if not mod then
-		return require("b_source")(sh, argv[1], argv, nil, nil) -- alias / syntax error / uncompilable
+	if not mod then -- alias / syntax error / uncompilable: b_source runs the text it was handed
+		-- (never re-opening the file — a FIFO or /dev/stdin can only be read once)
+		sh.source_preread = { file = file, code = code }
+		return require("b_source")(sh, argv[1], argv, nil, nil)
 	end
 	-- Compiled path: swap in the file's positional params, run, restore. `return` in the
 	-- file surfaces as __curse_return (fragment mode) and ends the source; exit/break/
@@ -7970,12 +8011,13 @@ function M.source(sh, argv)
 			sh.params[sh.nparams] = argv[k]
 		end
 	end
+	local ownp = sh.params -- (a `set --` in the file replaces this table)
 	sh.sourcedepth = (sh.sourcedepth or 0) + 1 -- a `return` is valid while sourcing
 	local fr = M.source_enter(sh, name)
 	local rok, err = pcall(require("tier").run_compiled, mod, sh, nil)
 	M.source_leave(sh, fr)
 	sh.sourcedepth = sh.sourcedepth - 1
-	if #argv > j then
+	if #argv > j and sh.params == ownp then -- (params the file SET itself stay: bash)
 		sh.params, sh.nparams = savep, savenp
 	end
 	if not rok then
@@ -8031,8 +8073,17 @@ function M.exec_dynamic(sh, argv, hook, hadcs, no_func)
 			words[i] = { k = "word", parts = { { lit = argv[i], q = true } } }
 		end
 		I.exec_stmt(sh, { t = "simple", words = words, line = sh.cur_line }, hook or _noop)
+	elseif no_func then
+		-- the `command` prefix: run argv skipping SHELL FUNCTION lookup (builtin/external only),
+		-- a special builtin losing its fatal errors (interp's command builtin: via_command)
+		local svc = sh.via_command
+		sh.via_command = true
+		local ok, err = pcall(I.exec_simple, sh, argv, hook or _noop, no_func)
+		sh.via_command = svc
+		if not ok then
+			error(err, 0)
+		end
 	else
-		-- no_func (the `command` prefix): run argv skipping SHELL FUNCTION lookup (builtin/external only).
 		I.exec_simple(sh, argv, hook or _noop, no_func)
 	end
 	if sh.write_err then

@@ -21,14 +21,7 @@ return function(sh, cmd, args, hook, tcb)
 		-- trap [-p] [ACTION] SIG…  (subset: registers/prints; only EXIT actually fires)
 		local j, pflag = 2, false
 		if args[j] == "-l" then -- list signal names (NN) SIGNAME)
-			local nums = {}
-			for n in pairs(NUMSIG) do
-				nums[#nums + 1] = n
-			end
-			table.sort(nums)
-			for _, n in ipairs(nums) do
-				sh:echo(("%2d) SIG%s"):format(n, NUMSIG[n]))
-			end
+			sh.out(rt.signal_list(NUMSIG))
 			sh.status = 0
 			return
 		end

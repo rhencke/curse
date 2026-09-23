@@ -3630,7 +3630,38 @@ local function make_parser(src, sh, aenv, noalias, posix, line0)
 					end
 					error({ __curse_arraylit = true })
 				else
-					local w = word(true)
+					-- `[foo bar]=v`: a subscript is read as one unit, blanks and all, when a
+					-- `=`/`+=` follows its closing `]` (bash's compound-assignment reader)
+					local pre = ""
+					if c == "[" then
+						local depth, k = 0, i
+						while k <= n do
+							local ch = src:sub(k, k)
+							if ch == "\\" then
+								k = k + 2
+							elseif ch == "'" or ch == '"' then
+								local e = src:find(ch, k + 1, true)
+								k = (e or n) + 1
+							elseif ch == "\n" then
+								break
+							else
+								if ch == "[" then
+									depth = depth + 1
+								elseif ch == "]" then
+									depth = depth - 1
+									if depth == 0 then
+										break
+									end
+								end
+								k = k + 1
+							end
+						end
+						if src:sub(k, k) == "]" and (src:sub(k + 1, k + 1) == "=" or src:sub(k + 1, k + 2) == "+=") then
+							pre = src:sub(i, k)
+							i = k + 1
+						end
+					end
+					local w = pre .. word(true)
 					if w == "" then
 						break
 					end

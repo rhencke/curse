@@ -265,6 +265,9 @@ return function(sh, cmd, args, hook, tcb)
 						end
 					end
 				else
+					if printmode and funcbody then -- (`declare -f -p NAME` says so; -f alone is quiet)
+						io.stderr:write("curse: " .. cmd .. ": " .. nm .. ": not found\n")
+					end
 					allok = false
 				end
 			end

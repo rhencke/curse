@@ -27,6 +27,7 @@ local lazy_mods = {
 	"b_completion",
 	"b_ulimit",
 	"b_times",
+	"b_enable",
 	"b_alias",
 	"b_unalias",
 	"b_umask",

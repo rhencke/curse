@@ -29,6 +29,13 @@ return function(sh, cmd, args, hook, tcb)
 				j = j + 1
 				break
 			end
+			local bad = args[j]:sub(2):match("[^lrpdt]")
+			if bad then
+				io.stderr:write("curse: hash: -" .. bad .. ": invalid option\n")
+				io.stderr:write("hash: usage: hash [-lr] [-p pathname] [-dt] [name ...]\n")
+				sh.status = 2
+				return
+			end
 			if args[j]:find("r") then
 				rflag = true
 			end
@@ -37,6 +44,11 @@ return function(sh, cmd, args, hook, tcb)
 				j = j + 1
 			end
 			j = j + 1
+		end
+		if sh.opt_h == false then -- set +h: no command hashing at all
+			io.stderr:write("curse: hash: hashing disabled\n")
+			sh.status = 1
+			return
 		end
 		if ppath then
 			if ppath:find("/", 1, true) and rt.restricted(sh, "hash: " .. ppath .. ": restricted") then
@@ -80,6 +92,8 @@ return function(sh, cmd, args, hook, tcb)
 				for _, k in ipairs(ks) do
 					sh:echo(("%4d\t%s"):format(sh.hashcache[k].hits, sh.hashcache[k].path))
 				end
+			else
+				sh:echo("hash: hash table empty") -- (bash says so on stdout)
 			end
 			sh.status = 0
 		else

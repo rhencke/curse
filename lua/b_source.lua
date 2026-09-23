@@ -52,10 +52,21 @@ return function(sh, cmd, args, hook, tcb)
 			io.stderr:write("curse: " .. cmd .. ": " .. name .. ": is a directory\n")
 			sh.status = 1
 		else
-			local f = io.open(file, "r")
-			if not f then
-				io.stderr:write("curse: " .. cmd .. ": " .. name .. ": No such file or directory\n")
+			local pre = sh.source_preread -- (the compiled tier's rt.source already read it)
+			sh.source_preread = nil
+			local f = pre and pre.file == file and { read = function() return pre.code end, close = function() end }
+				or io.open(file, "r")
+			if not f then -- (bash names just the file; in posix mode it's fatal — a special
+				-- builtin, unless run through `command` — and a $PATH miss is "file not found")
+				if sh.opt_posix and not name:find("/", 1, true) then
+					io.stderr:write("curse: " .. cmd .. ": " .. name .. ": file not found\n")
+				else
+					io.stderr:write("curse: " .. name .. ": No such file or directory\n")
+				end
 				sh.status = 1
+				if sh.opt_posix and not sh.opt_i and not sh.via_command then
+					error({ __curse_exit = 1 })
+				end
 			else
 				local src = f:read("*a")
 				f:close()
@@ -68,6 +79,7 @@ return function(sh, cmd, args, hook, tcb)
 							sh.params[sh.nparams] = args[k]
 						end
 					end
+					local ownp = sh.params -- (a `set --` in the file replaces this table)
 					sh.sourcedepth = (sh.sourcedepth or 0) + 1 -- a `return` is valid while sourcing
 					local sframe = rt.source_enter(sh, name) -- (BASH_SOURCE/BASH_LINENO/FUNCNAME frame)
 					-- Run the file the way the shell runs its own input: LAZILY through the
@@ -102,7 +114,7 @@ return function(sh, cmd, args, hook, tcb)
 					end)
 					sh.sourcedepth = sh.sourcedepth - 1
 					rt.source_leave(sh, sframe)
-					if #args > j then
+					if #args > j and sh.params == ownp then -- (params the file SET itself stay: bash)
 						sh.params, sh.nparams = savep, savenp
 					end
 					if not rok then

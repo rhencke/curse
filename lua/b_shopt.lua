@@ -50,15 +50,33 @@ return function(sh, cmd, args, hook, tcb)
 				if a:find("p") then
 					pflag = true
 				end
-			elseif a:sub(1, 2) == "--" then
-				badopt = true -- long opts are Oil syntax; bash errors
+			elseif a:sub(1, 1) == "-" and #a > 1 then
+				badopt = badopt or a -- (`-z`, and long opts, are invalid options — bash)
 			else
 				names[#names + 1] = a
 			end
 		end
+		-- one option in the requested form (-p: a reusable command; else two columns)
+		local function show(nm, on, cmdform)
+			if pflag then
+				sh.out(cmdform)
+			else
+				sh.out(("%-15s\t%s\n"):format(nm, on and "on" or "off"))
+			end
+		end
 		if badopt then
-			io.stderr:write("curse: shopt: invalid option\n")
-			sh.status = 1
+			local bad = badopt:sub(1, 2) == "--" and badopt or ("-" .. (badopt:match("^%-[suqpo]*(.)") or ""))
+			io.stderr:write("curse: shopt: " .. bad .. ": invalid option\n")
+			io.stderr:write("shopt: usage: shopt [-pqsu] [-o] [optname ...]\n")
+			sh.status = 2
+		elseif oflag and #names == 0 then -- list the set -o options (-s/-u: only on/off ones)
+			for _, ent in ipairs(SETOPTS) do
+				local on = opt_on(sh, ent[2])
+				if not (set_ and not on) and not (unset_ and on) then
+					show(ent[1], on, ("set %so %s\n"):format(on and "-" or "+", ent[1]))
+				end
+			end
+			sh.status = 0
 		elseif oflag then -- shopt -o: the `set -o` options
 			if set_ or unset_ then
 				local allok = true
@@ -84,7 +102,8 @@ return function(sh, cmd, args, hook, tcb)
 				local allok = true
 				for _, nm in ipairs(names) do
 					if not SETOPT[nm] then
-						allok = false -- unknown: skipped, drops status
+						io.stderr:write("curse: shopt: " .. nm .. ": invalid option name\n")
+						allok = false
 					else
 						local on = opt_on(sh, SETOPT[nm])
 						if not on then
@@ -101,7 +120,7 @@ return function(sh, cmd, args, hook, tcb)
 				end
 				sh.status = allok and 0 or 1
 			end
-		elseif set_ or unset_ then
+		elseif (set_ or unset_) and #names > 0 then
 			-- -s/-u NAMES: unknown names error (status 1) but valid ones still apply.
 			local allok = true
 			for _, nm in ipairs(names) do
@@ -113,16 +132,20 @@ return function(sh, cmd, args, hook, tcb)
 				end
 			end
 			sh.status = allok and 0 or 1
-		elseif #names == 0 then -- print all options (query/-p; same 2-col/`shopt -s` form)
+		elseif #names == 0 then -- list the options (-s/-u: only the on/off ones)
 			for _, nm in ipairs(SHOPT_ORDER) do
-				sh.out(("shopt %s%s\n"):format(shopt_on(sh, nm) and "-s " or "-u ", nm))
+				local on = shopt_on(sh, nm)
+				if not (set_ and not on) and not (unset_ and on) then
+					show(nm, on, ("shopt %s%s\n"):format(on and "-s " or "-u ", nm))
+				end
 			end
 			sh.status = 0
 		else -- query / print named: invalid names skipped, drop status to 1
 			local allok = true
 			for _, nm in ipairs(names) do
 				if SHOPT_DEFAULT[nm] == nil then
-					allok = false -- unknown: not printed
+					io.stderr:write("curse: shopt: " .. nm .. ": invalid shell option name\n")
+					allok = false
 				else
 					local on = shopt_on(sh, nm)
 					if not on then

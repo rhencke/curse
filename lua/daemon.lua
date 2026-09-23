@@ -247,9 +247,8 @@ local function dispatch(sh, args)
 	if code then
 		-- sh -c CODE [name [args…]]: name is $0, rest are $1..
 		sh.opt_c = true -- (as run.lua: -c's exit statuses, no `main` FUNCNAME frame, …)
-		if args[i] then
-			sh.argv0 = args[i]
-		end
+		-- $0 is the name argument, else the shell's own argv[0] (`exec -a NAME sh -c …`)
+		sh.argv0 = args[i] or args[1] or sh.argv0
 		for j = i + 1, n do
 			sh.params[#sh.params + 1] = args[j]
 			sh.nparams = sh.nparams + 1

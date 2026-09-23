@@ -5,7 +5,7 @@ local rt = require("runtime")
 return function(sh, cmd, args, hook, tcb)
 	if cmd == "echo" then
 		-- echo [-neE] ARGS: -n suppresses the newline, -e interprets backslash escapes.
-		local j, nonl, esc = 2, false, false
+		local j, nonl, esc = 2, false, sh.shopt.xpg_echo and true or false -- (xpg_echo: -e by default)
 		while args[j] and args[j]:match("^%-[neE]+$") do
 			for ch in args[j]:sub(2):gmatch(".") do
 				if ch == "n" then

@@ -21,22 +21,7 @@ return function(sh, cmd, args, hook, tcb)
 	if cmd == "kill" then
 		if args[2] == "-l" or args[2] == "-L" then -- list / translate signal names<->numbers
 			if #args == 2 then
-				local nums = {}
-				for n in pairs(NUMSIG) do
-					nums[#nums + 1] = n
-				end
-				table.sort(nums)
-				local line = {}
-				for _, n in ipairs(nums) do
-					line[#line + 1] = ("%2d) SIG%-8s"):format(n, NUMSIG[n])
-					if #line == 5 then
-						sh:echo((table.concat(line):gsub("%s+$", "")))
-						line = {}
-					end
-				end
-				if #line > 0 then
-					sh:echo((table.concat(line):gsub("%s+$", "")))
-				end
+				sh.out(rt.signal_list(NUMSIG))
 				sh.status = 0
 			else
 				local allok = true
