@@ -352,6 +352,7 @@ ffi.cdef([[
   int setenv(const char *name, const char *value, int overwrite);
   int unsetenv(const char *name);
   void _exit(int status);
+  int clearenv(void);
   unsigned int umask(unsigned int mask);
   long read(int fd, void *buf, unsigned long count);
   unsigned long confstr(int name, char *buf, unsigned long len);
@@ -1090,31 +1091,54 @@ local function expand_part_str(sh, p, assign)
 		end
 		return rt.i64_to_str(eval(sh, p.arith_ast))
 	elseif p.procsub then
-		-- <(cmd)/>(cmd): substitute a filename. <( ) runs the command and captures its
-		-- output to a temp file whose path is the word; >( ) makes a temp file the word
-		-- and feeds it to the command AFTER the outer command runs (sh.procsub_pending).
-		local tmp = os.tmpname()
-		if p.dir == "<" then
-			local out = sh:capture_src(p.procsub)
-			local f = io.open(tmp, "w")
-			if f then
-				f:write(out)
-				if out ~= "" then
-					f:write("\n")
-				end
-				f:close()
-			end
-		else
-			sh.procsub_pending = sh.procsub_pending or {}
-			sh.procsub_pending[#sh.procsub_pending + 1] = { file = tmp, cmd = p.procsub }
-			local f = io.open(tmp, "w")
-			if f then
-				f:close()
-			end
+		-- <(cmd) / >(cmd): run cmd asynchronously on a pipe and substitute /dev/fd/N for
+		-- the shell's end of it (bash: 63, then 62, …) — a real pipe, so the data is read
+		-- once and a reader can start before the writer ends. The end stays open (and is
+		-- inherited) until the command it was expanded for finishes (drain_procsub).
+		rt.need_process(sh)
+		io.flush()
+		local pfd = ffi.new("int[2]")
+		if C.pipe(pfd) ~= 0 then
+			return "/dev/null"
 		end
+		local mine, theirs = pfd[p.dir == "<" and 0 or 1], pfd[p.dir == "<" and 1 or 0]
+		local pid = rt.fork()
+		if pid == 0 then
+			C.close(mine)
+			C.dup2(theirs, p.dir == "<" and 1 or 0)
+			C.close(theirs)
+			reset_child_sigtraps(sh) -- caught signal traps revert to default in the subshell
+			sh.in_subprogram = (sh.in_subprogram or 0) + 1
+			sh.out = io.write
+			local ok, err = pcall(function()
+				local stmts = P.parse(p.procsub).stmts
+				local s1 = #stmts == 1 and stmts[1]
+				if s1 and s1.t == "simple" and #(s1.words or {}) == 0 and s1.redirs and #s1.redirs == 1
+					and s1.redirs[1].op == "in" and not s1.assigns then
+					-- <(< file): the file's contents, like $(< file) (bash 5.2)
+					local path = M.expand_assign_word(sh, P.parse_word(s1.redirs[1].target or ""))
+					local f = io.open(path, "rb")
+					if f then
+						io.write(f:read("*a") or "")
+						f:close()
+						sh.status = 0
+					else
+						io.stderr:write("curse: " .. path .. ": No such file or directory\n")
+						sh.status = 1
+					end
+					return
+				end
+				M.exec_list(sh, stmts, function() end, false)
+			end)
+			rt.child_status(sh, ok, err)
+			rt.child_exit(sh, sh.status or 0) -- (never returns into the parent's script)
+		end
+		C.close(theirs)
+		local fd = rt.fd_below(mine, 64)
 		sh.procsub_files = sh.procsub_files or {}
-		sh.procsub_files[#sh.procsub_files + 1] = tmp
-		return tmp
+		sh.procsub_files[#sh.procsub_files + 1] = { fd = fd, pid = pid }
+		sh.last_bg_pid = tostring(pid) -- $! is the last process substitution (bash)
+		return "/dev/fd/" .. fd
 	elseif p.cmdsub then
 		return sh:capture_src(p.cmdsub, p.backtick)
 	elseif p.pexp then
@@ -1168,12 +1192,14 @@ local function expand_part_str(sh, p, assign)
 		if TESTOP[pe.op] then
 			-- In an assignment RHS the default word gets the after-`:` tilde rule too
 			-- (`x=${undef-~:~}` -> HOME:HOME), so use the assignment-aware expander.
-			local wexp = assign and expand_assign_word or expand_word
 			arg = pe.arg and function()
-				return wexp(sh, pw(pe.arg))
+				if assign then
+					return expand_assign_word(sh, pw(pe.arg))
+				end
+				return expand_word(sh, pw(pe.arg), true)
 			end or nil
 		else
-			arg = pe.arg and (patmode and expand_pattern or expand_word)(sh, P.parse_word(pe.arg)) or nil
+			arg = pe.arg and (patmode and expand_pattern or expand_word)(sh, P.parse_word(pe.arg), true) or nil
 		end
 		local arg2 = pe.arg2 and expand_word(sh, P.parse_word(pe.arg2)) or nil
 		if pe.op == "sub" then -- ${v:off:len}: offset/length are arithmetic expressions
@@ -1265,12 +1291,14 @@ function M.assign_scalar(sh, name, value)
 	end
 end
 
-expand_word = function(sh, w)
+-- `noassign`: a ${…} operand — only a word-initial ~ expands there, never the `NAME=…:~`
+-- assignment form (bash: `${x:=P=~/b}` keeps its tildes)
+expand_word = function(sh, w, noassign)
 	local buf = {}
 	for k, p in ipairs(w.parts) do
 		local s = expand_part_str(sh, p)
 		if k == 1 and p.lit ~= nil and not p.q then
-			s = tilde_word_initial(sh, s, #w.parts > 1)
+			s = tilde_word_initial(sh, s, #w.parts > 1, noassign)
 		end
 		buf[#buf + 1] = s
 	end
@@ -1495,7 +1523,7 @@ local function multi_elems(sh, p) -- returns element list, star?
 				local e, s = multi_elems(sh, part)
 				return e, s, part.q
 			end
-			return { expand_word(sh, w) }
+			return { expand_word(sh, w, true) }
 		end
 		if pe.op == "badsubst" then -- e.g. ${a[@]:} (empty offset): discards the rest of the line
 			sherr(sh, "curse: ${" .. (pe.raw or pe.name or "") .. "}: bad substitution\n")
@@ -3317,22 +3345,38 @@ local function xtrace_quote(w)
 	end
 	return rt.shell_quote(w)
 end
-local function xtrace(sh, args, prequoted)
+-- one xtrace line: $PS4 (its first char repeated per call depth) + `text`
+local function xtrace_line(sh, text)
 	local ps4 = sh:get("PS4")
 	if ps4 == "" then
 		ps4 = "+ "
 	end
 	local lead = ps4:sub(1, 1)
-	local depth = (sh.calldepth or 0)
+	local depth = (sh.xdepth or 0) -- nesting of $(…) (not function calls or subshells)
 	local pre = ps4
 	if lead ~= "" and depth > 0 then
 		pre = lead:rep(depth) .. ps4
-	end -- repeat PS4[0] by depth
+	end
+	M.xtrace_write(sh, pre .. text .. "\n")
+end
+M.xtrace_line = xtrace_line
+local function xtrace(sh, args, prequoted)
 	local parts = {}
 	for i = 1, #args do
 		parts[i] = prequoted and args[i] or xtrace_quote(args[i])
 	end
-	io.stderr:write(pre .. table.concat(parts, " ") .. "\n")
+	xtrace_line(sh, table.concat(parts, " "))
+end
+-- xtrace output goes to fd $BASH_XTRACEFD when that's set to an open fd (bash), else stderr
+M.xtrace_write = function(sh, s)
+	local fd = sh.vars.BASH_XTRACEFD and tonumber(sh:get("BASH_XTRACEFD"))
+	if fd and fd ~= 2 and fd >= 0 and fd == math.floor(fd) then
+		io.flush() -- (our buffered stdout first: fd 1 may be the trace fd)
+		if rt.fd_write(fd, s) then
+			return
+		end
+	end
+	io.stderr:write(s)
 end
 
 local function exec_simple(sh, args, hook, no_func)
@@ -3419,6 +3463,9 @@ local function exec_simple(sh, args, hook, no_func)
 		if (sh.calldepth or 0) == 0 and (sh.sourcedepth or 0) == 0 and (sh.in_trap or 0) == 0 then
 			io.stderr:write("curse: return: can only `return' from a function or sourced script\n")
 			sh.status = 2
+			if sh.opt_posix and not sh.opt_i then -- a special builtin's error ends a posix shell
+				error({ __curse_exit = 2 })
+			end
 			return
 		end
 		if args[2] and not tonumber(args[2]) then
@@ -3534,6 +3581,18 @@ local function dbracket_pattern(sh, w)
 	end
 	return p
 end
+-- xtrace: each [[ ]] test primary is traced as it's evaluated, operands expanded (bash)
+-- xtrace of an arithmetic text ((( )), a for (( )) slot): expanded like a "…" string first
+local function arith_trace(sh, s)
+	if s:find("[$`]") then
+		s = expand_word(sh, P.parse_heredoc(s, false))
+	end
+	xtrace_line(sh, "(( " .. s .. " ))")
+end
+local function dbracket_trace(sh, text)
+	xtrace_line(sh, "[[ " .. (sh.dbneg and "! " or "") .. text .. " ]]")
+	sh.dbneg = nil
+end
 local function eval_dbracket(sh, node)
 	local k = node.kind
 	if k == "and" then
@@ -3543,19 +3602,37 @@ local function eval_dbracket(sh, node)
 		return eval_dbracket(sh, node.l) or eval_dbracket(sh, node.r)
 	end
 	if k == "not" then
+		if sh.opt_x and node.e.kind ~= "and" and node.e.kind ~= "or" and node.e.kind ~= "not" then
+			sh.dbneg = true -- (xtrace: a negated test prints as `[[ ! … ]]`)
+		end
 		return not eval_dbracket(sh, node.e)
 	end
 	if k == "str" then
-		return dbracket_word(sh, node.word) ~= ""
+		local v = dbracket_word(sh, node.word)
+		if sh.opt_x then
+			dbracket_trace(sh, "-n " .. v)
+		end
+		return v ~= ""
 	end
 	if k == "unary" and node.op == "-v" then
-		return var_is_set(sh, expand_word(sh, node.word))
+		local v = expand_word(sh, node.word)
+		if sh.opt_x then
+			dbracket_trace(sh, "-v " .. v)
+		end
+		return var_is_set(sh, v)
 	end
 	if k == "unary" then
-		return unary(sh, node.op, dbracket_word(sh, node.word))
+		local v = dbracket_word(sh, node.word)
+		if sh.opt_x then
+			dbracket_trace(sh, node.op .. " " .. v)
+		end
+		return unary(sh, node.op, v)
 	end
 	if k == "binary" then
 		local l, r, op = dbracket_word(sh, node.l), dbracket_word(sh, node.r), node.op
+		if sh.opt_x then
+			dbracket_trace(sh, l .. " " .. op .. " " .. r)
+		end
 		local ic = sh.shopt.nocasematch and true or nil -- shopt -s nocasematch: case-insensitive
 		if op == "==" or op == "=" then
 			if node.rq and not ic then
@@ -3616,7 +3693,7 @@ local function eval_dbracket(sh, node)
 				return nl >= nr
 			end
 		else
-			return binary(l, op, r)
+			return binary(l, op, r, true)
 		end -- < > (string comparisons)
 	end
 	return false
@@ -3632,7 +3709,7 @@ function M.dbracket_unary(sh, op, val)
 	return unary(sh, op, val)
 end -- file tests, -o, -v, -z/-n
 function M.dbracket_bincmp(l, op, r)
-	return binary(l, op, r)
+	return binary(l, op, r, true)
 end -- -nt/-ot/-ef
 local function glob_escape(s)
 	return (s:gsub("[%*%?%[%]\\]", "\\%0"))
@@ -3679,56 +3756,30 @@ local child_status = rt.child_status -- (moved to runtime; shared with the compi
 local function procsub_mark(sh)
 	return (sh.procsub_pending and #sh.procsub_pending or 0), (sh.procsub_files and #sh.procsub_files or 0)
 end
--- Process-substitution cleanup, run after the command a <()/>() was attached to:
--- feed each new >(cmd) its temp file, then remove the temp files it created. Only
--- entries added since the (np,nf) mark are handled; gated to the outer level.
+-- Process-substitution cleanup, run after the command a <()/>() was attached to: close
+-- the shell's end of each pipe it created (a >(cmd) then sees EOF; an unread <(cmd)
+-- writer gets EPIPE) and reap the child. Only entries added since the mark.
 local function drain_procsub(sh, np, nf)
-	np, nf = np or 0, nf or 0
-	if (sh.in_subprogram or 0) ~= 0 then
+	nf = nf or 0
+	local files = sh.procsub_files
+	if not files or #files <= nf then
 		return
 	end
-	local pend = sh.procsub_pending
-	if pend then
-		for i = np + 1, #pend do
-			local ps = pend[i]
-			io.flush()
-			-- Run the >(cmd) body in a forked child through curse's OWN interpreter
-			-- (never `sh -c`, which would recurse once curse is /bin/sh), stdin from temp.
-			local pid = rt.fork()
-			if pid == 0 then
-				reset_child_sigtraps(sh) -- caught signal traps revert to default in the >(…) subshell
-				local fd = C.open(ps.file, 0, 0) -- O_RDONLY
-				if fd >= 0 then
-					C.dup2(fd, 0)
-					C.close(fd)
-				end
-				sh.in_subprogram = (sh.in_subprogram or 0) + 1
-				sh.out = io.write
-				local ok, err = pcall(function()
-					exec_list(sh, P.parse(ps.cmd).stmts, function() end, false)
-				end)
-				child_status(sh, ok, err)
-				rt.child_exit(sh, sh.status or 0) -- its own EXIT trap, flush, _exit
-			end
-			local stbuf = ffi.new("int[1]")
-			rt.wait_child(pid, stbuf, 0)
-		end
-		for i = #pend, np + 1, -1 do
-			pend[i] = nil
-		end
-		if #pend == 0 then
-			sh.procsub_pending = nil
-		end
+	io.flush()
+	local stbuf = ffi.new("int[1]")
+	for i = nf + 1, #files do
+		C.close(files[i].fd)
 	end
-	local files = sh.procsub_files
-	if files then
-		for i = #files, nf + 1, -1 do
-			os.remove(files[i])
-			files[i] = nil
-		end
-		if #files == 0 then
-			sh.procsub_files = nil
-		end
+	sh.procsub_status = {} -- (the latest ones, for a later `wait $!`)
+	for i = nf + 1, #files do
+		rt.wait_child(files[i].pid, stbuf, 0)
+		sh.procsub_status[files[i].pid] = rt.wexit(stbuf[0])
+	end
+	for i = #files, nf + 1, -1 do
+		files[i] = nil
+	end
+	if #files == 0 then
+		sh.procsub_files = nil
 	end
 end
 
@@ -3820,6 +3871,14 @@ local function run_debug(sh, line)
 	if sh.opt_e and trap_status ~= 0 then
 		error({ __curse_exit = trap_status })
 	end
+	-- shopt -s extdebug: a non-zero DEBUG status skips the command; 2 inside a function
+	-- or sourced file acts as a `return` from it (bash)
+	if trap_status ~= 0 and sh.shopt.extdebug then
+		if trap_status == 2 and ((sh.calldepth or 0) > 0 or (sh.sourcedepth or 0) > 0) then
+			error({ __curse_return = sh.status })
+		end
+		return true
+	end
 end
 M.run_debug = run_debug -- compiled tier fires DEBUG before each native command
 
@@ -3866,7 +3925,22 @@ exec_stmt = function(sh, st, hook)
 	-- handlers (bash) — only the DEBUG handler itself suppresses it (run_debug's
 	-- in_debug guard). Inside any trap the reported line is the frozen (trapped) one.
 	if DEBUG_FIRE[t] then
-		run_debug(sh, (sh.in_trap and sh.in_trap > 0) and sh.cur_line or st.line)
+		-- a command's own prefix assignment (run through here by its simple command) is
+		-- part of that command: no DEBUG of its own, and $BASH_COMMAND stays the command
+		local cc, own = sh.cur_cmd, false
+		if t == "assign" and cc and cc.assigns then
+			for _, a in ipairs(cc.assigns) do
+				own = own or a == st
+			end
+		end
+		if not own then
+			if not (sh.in_trap and sh.in_trap > 0) then
+				sh.cur_cmd = st -- $BASH_COMMAND (a trap's own commands don't replace it)
+			end
+			if run_debug(sh, (sh.in_trap and sh.in_trap > 0) and sh.cur_line or st.line) then
+				return -- extdebug: the DEBUG trap said skip it
+			end
+		end
 	end
 	-- redirs trailing a compound command: apply around the whole thing, then run it
 	-- with redirs temporarily detached (so this guard doesn't re-fire).
@@ -3900,9 +3974,10 @@ exec_stmt = function(sh, st, hook)
 		end
 		return
 	end
-	if st.line and not (sh.in_trap and sh.in_trap > 0) then
+	if st.line and not (sh.in_trap and sh.in_trap > 0 and (sh.calldepth or 0) == sh.trap_calldepth) then
 		sh.cur_line = st.line
-	end -- $LINENO (frozen in traps)
+	end -- $LINENO: frozen at the trapped line for the trap's own commands (not in a
+	-- function the trap calls, whose lines count as usual — bash)
 	if t == "assign" then
 		if st.name == "SHELLOPTS" or st.name == "BASHOPTS" then -- readonly specials (bash)
 			io.stderr:write("curse: " .. st.name .. ": readonly variable\n")
@@ -4126,6 +4201,11 @@ exec_stmt = function(sh, st, hook)
 			sh.status = 1
 			return
 		end
+		if sh.fn_ro and sh.fn_ro[st.name] then -- `readonly -f`: can't be redefined
+			io.stderr:write("curse: " .. st.name .. ": readonly function\n")
+			sh.status = 1
+			return
+		end
 		if sh.opt_posix and SPECIAL_BUILTIN[st.name] then -- posix: can't shadow a special builtin
 			io.stderr:write("curse: `" .. st.name .. "': is a special builtin\n")
 			sh.status = 2
@@ -4232,9 +4312,16 @@ exec_stmt = function(sh, st, hook)
 			-- listing and so `local`/`declare` establishes the scope + attributes). The
 			-- actual array assignment happens AFTER the builtin runs (below), so it lands
 			-- in the freshly-declared/local variable.
+			local wasro -- (a name ALREADY readonly: its literal isn't assigned, bash errors)
 			for _, aa in ipairs(st.arrayargs) do
 				args[#args + 1] = aa.name
+				local b = sh.vars[sh:deref(aa.name)]
+				if b and b.ro and args[1] ~= "local" then
+					wasro = wasro or {}
+					wasro[aa] = true
+				end
 			end
+			sh.arrayargs_ro = wasro
 		end
 		-- `exec [redirs] [cmd…]`: redirections are permanent (not restored). With no
 		-- command it just rewires the shell's own fds (e.g. `exec 3>file`); with a
@@ -4253,18 +4340,37 @@ exec_stmt = function(sh, st, hook)
 					rt.coproc_fdcheck(sh) -- a coproc end it closed/moved reads as -1
 				end
 			end
-			-- exec [-a name] [--] [cmd…]
-			local k, argv0 = 2, nil
-			while args[k] == "-a" or args[k] == "--" or (args[k] and args[k]:sub(1, 2) == "-a") do
-				if args[k] == "--" then
-					k = k + 1
+			-- exec [-cl] [-a name] [--] [cmd…]: -c empty environment, -l login ($0 gets a
+			-- leading -), -a NAME as $0. Another option is a usage error (status 2).
+			local k, argv0, cflag, lflag = 2, nil, false, false
+			while args[k] and args[k]:sub(1, 1) == "-" and args[k] ~= "-" do
+				local a = args[k]
+				k = k + 1
+				if a == "--" then
 					break
-				elseif args[k] == "-a" then
-					argv0 = args[k + 1]
-					k = k + 2
-				else
-					argv0 = args[k]:sub(3)
-					k = k + 1
+				end
+				local j = 2
+				while j <= #a do
+					local f = a:sub(j, j)
+					if f == "c" then
+						cflag = true
+					elseif f == "l" then
+						lflag = true
+					elseif f == "a" then
+						if j < #a then
+							argv0 = a:sub(j + 1)
+						else
+							argv0 = args[k]
+							k = k + 1
+						end
+						break
+					else
+						io.stderr:write("curse: exec: -" .. f .. ": invalid option\n")
+						io.stderr:write("exec: usage: exec [-cl] [-a name] [command [argument ...]] [redirection ...]\n")
+						sh.status = 2
+						return
+					end
+					j = j + 1
 				end
 			end
 			if k <= #args and rt.restricted(sh, "exec: restricted") then
@@ -4272,9 +4378,16 @@ exec_stmt = function(sh, st, hook)
 			end
 			if k <= #args then
 				local rest = { unpack(args, k) }
+				if lflag then
+					argv0 = "-" .. (argv0 or rest[1]:match("[^/]*$"))
+				end
 				if argv0 then
 					sh.exec_argv0 = argv0
 				end -- exec -a NAME: override the child's argv[0]
+				if cflag then
+					C.clearenv()
+					sh.exec_noenv = true -- (not even `_`)
+				end
 				if st.assigns then -- prefix bindings become the exec'd command's environment (bash)
 					for _, a in ipairs(st.assigns) do
 						if a.raw then
@@ -4456,8 +4569,15 @@ exec_stmt = function(sh, st, hook)
 		-- Skip when the builtin failed (e.g. a rejected -A/-a type change): the array
 		-- must stay untouched, not be mangled by the literal.
 		if st.arrayargs and sh.status == 0 then
+			local wasro = sh.arrayargs_ro
+			sh.arrayargs_ro = nil
 			for _, aa in ipairs(st.arrayargs) do
-				do_arrayassign(sh, aa)
+				if wasro and wasro[aa] then
+					io.stderr:write("curse: " .. aa.name .. ": readonly variable\n")
+					sh.status = 1
+				else
+					do_arrayassign(sh, aa)
+				end
 			end
 		end
 		-- $_ : the last argument (after expansion) of the command just run.
@@ -4475,9 +4595,12 @@ exec_stmt = function(sh, st, hook)
 		end
 		-- A slot whose arith failed to parse (`i='3'`) was deferred: bash reports the
 		-- error at RUNTIME and runs the loop zero (or partial) iterations, non-fatally.
-		local function ev(node)
+		local function ev(node, slot)
 			sh.cur_line = st.line -- $LINENO inside the for(( init/cond/step is the `for` line (bash),
 			-- not whatever line the body last ran (the cond re-evals per iteration)
+			if sh.opt_x and st.src then
+				arith_trace(sh, (st.src[slot]:match("^%s*(.-)%s*$")))
+			end
 			if node.k == "arith_perr" then
 				io.stderr:write("curse: " .. (node.raw:match("^%s*(.-)%s*$")) .. ": syntax error in expression\n")
 				error({ __curse_exit = 1, __curse_experr = true })
@@ -4489,13 +4612,13 @@ exec_stmt = function(sh, st, hook)
 		local cok, cerr = pcall(function()
 			if st.init then
 				fdbg()
-				ev(st.init)
+				ev(st.init, 1)
 			end
 			while true do
 				hook("loop", st.id)
 				if st.cond then
 					fdbg()
-					if not truth(ev(st.cond)) then
+					if not truth(ev(st.cond, 2)) then
 						break
 					end
 				end
@@ -4506,7 +4629,7 @@ exec_stmt = function(sh, st, hook)
 				end
 				if st.step then
 					fdbg()
-					ev(st.step)
+					ev(st.step, 3)
 				end -- continue still runs the step
 			end
 		end)
@@ -4725,6 +4848,9 @@ exec_stmt = function(sh, st, hook)
 		-- A `(( expr ))` command (standalone or as an if/while condition) is NOT fatal
 		-- on a division-by-zero — it just yields status 1 and execution continues
 		-- (unlike a `$(( ))` word expansion, which aborts the command list).
+		if sh.opt_x and st.src then
+			arith_trace(sh, st.src)
+		end
 		local ok, v = pcall(eval, sh, st.expr)
 		if ok then
 			sh.status = truth(v) and 0 or 1
@@ -4755,6 +4881,9 @@ exec_stmt = function(sh, st, hook)
 			error(v)
 		end
 	elseif t == "case" then
+		if sh.opt_x and st.subject.src then
+			xtrace_line(sh, "case " .. st.subject.src .. " in") -- (as written: bash)
+		end
 		local subj = expand_word(sh, st.subject)
 		local fall = false -- carrying a `;&` fall-through into the next clause
 		sh.status = 0
@@ -4838,6 +4967,9 @@ exec_stmt = function(sh, st, hook)
 				-- — a `{ }`/compound stage fires nothing (`{ …; } | cat` fires once, for cat).
 				-- The lastpipe in-process stage fires via its own exec_stmt instead.
 				if DEBUG_FIRE[cmds[k].t] and not (k == nst and lastpipe) then
+					if not (sh.in_trap and sh.in_trap > 0) then
+						sh.cur_cmd = cmds[k] -- $BASH_COMMAND: this stage
+					end
 					run_debug(sh, (sh.in_trap and sh.in_trap > 0) and sh.cur_line or (cmds[k].line or st.line))
 				end
 				local rd, wr = -1, -1
@@ -5010,6 +5142,9 @@ exec_stmt = function(sh, st, hook)
 			end
 			error(eerr)
 		end
+		if rt.for_var_ro(sh, st.name) then
+			return
+		end
 		sh.forstate[st.id] = { list = list, idx = 0 }
 		local bodystatus = 0
 		sh.loopdepth = (sh.loopdepth or 0) + 1
@@ -5021,6 +5156,15 @@ exec_stmt = function(sh, st, hook)
 				break
 			end
 			run_debug(sh, st.line) -- DEBUG fires at the `for` header before each iteration
+			if sh.opt_x then -- the header as written, each iteration (bash)
+				local ws = {}
+				for _, w in ipairs(st.words) do
+					if w.src then
+						ws[#ws + 1] = w.src
+					end
+				end
+				xtrace_line(sh, "for " .. st.name .. " in " .. table.concat(ws, " "))
+			end
 			sh:set_str(st.name, fs.list[fs.idx])
 			local act = run_loop_body(sh, st.body, hook)
 			bodystatus = sh.status
@@ -5071,6 +5215,15 @@ exec_stmt = function(sh, st, hook)
 		end
 		local bodystatus = 0
 		sh.loopdepth = (sh.loopdepth or 0) + 1
+		if sh.opt_x then
+			local ws = {}
+			for _, w in ipairs(st.words) do
+				if w.src then
+					ws[#ws + 1] = w.src
+				end
+			end
+			xtrace_line(sh, "select " .. st.name .. " in " .. table.concat(ws, " "))
+		end
 		menu()
 		while true do
 			hook("loop", st.id)
@@ -5156,6 +5309,8 @@ end
 -- failing command's line, not the handler's). Returns true if it called exit.
 run_trap = function(sh, code)
 	local exited, savedline = false, sh.cur_line
+	local saved_tcd = sh.trap_calldepth
+	sh.trap_calldepth = sh.calldepth or 0
 	sh.in_trap = (sh.in_trap or 0) + 1
 	local ok, err = pcall(function()
 		for _, st in ipairs(P.parse(code).stmts) do
@@ -5181,6 +5336,7 @@ run_trap = function(sh, code)
 		end
 	end)
 	sh.in_trap = sh.in_trap - 1
+	sh.trap_calldepth = saved_tcd
 	sh.cur_line = savedline
 	if not ok then
 		if type(err) == "table" and err.__curse_parseerr then -- syntax error in the trap code: warned, non-fatal, doesn't exit or change status (bash)

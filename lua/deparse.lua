@@ -658,6 +658,23 @@ function M.export_text(st)
 	return nil
 end
 
+-- $BASH_COMMAND: the command being run, printed as bash prints it ("" if unprintable)
+function M.command_text(st)
+	local ok, r = pcall(function()
+		local p = new_printer()
+		make(p, conv(st))
+		deferred_pending(p, "")
+		return table.concat(p.buf)
+	end)
+	if ok then
+		return r or ""
+	end
+	if r ~= UNSUPPORTED then
+		error(r, 0)
+	end
+	return ""
+end
+
 local RESERVED = {}
 for w in ("if then else elif fi case esac for select while until do done in function time { } ! [[ ]] coproc"):gmatch("%S+") do
 	RESERVED[w] = true

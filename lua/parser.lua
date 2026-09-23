@@ -1436,6 +1436,20 @@ local function split_top_comma(inner)
 	parts[#parts + 1] = inner:sub(start)
 	return parts
 end
+-- A character from a {x..y} range, as word TEXT (the expansion is re-parsed as a word):
+-- shell-special characters must stay literal (`{Z..a}` yields ` literally), and a `\`
+-- comes out as an empty argument (bash's quote removal of the lone backslash).
+local function brace_char(v)
+	local ch = string.char(v)
+	if ch == "\\" then
+		return "''"
+	end
+	if ch:match("[`'\"$;&|<>() \t]") then
+		return "\\" .. ch
+	end
+	return ch
+end
+
 -- classify the inside of a {…}: a numeric/char range (symbolic) or a comma list
 -- (raw alternatives, possibly themselves containing braces), or nil (not a brace).
 -- bash zero-pads a numeric range to the widest endpoint iff either endpoint has
@@ -1608,7 +1622,7 @@ local function stream_factors(factors, emit)
 			local r = f.range
 			for k = 0, range_count(r) - 1 do
 				local v = (r.a <= r.b) and (r.a + k * r.step) or (r.a - k * r.step)
-				go(idx + 1, acc .. (r.char and string.char(v) or (r.width and pad_num(v, r.width) or tostring(v))))
+				go(idx + 1, acc .. (r.char and brace_char(v) or (r.width and pad_num(v, r.width) or tostring(v))))
 				if stopped then
 					return
 				end

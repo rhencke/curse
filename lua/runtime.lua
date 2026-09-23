@@ -1123,7 +1123,9 @@ function Shell:exec(...)
 		argv[i - 1] = anchor[i]
 	end
 	argv[n] = nil
-	C.setenv("_", execpath, 1) -- a program sees `_` = its own path (bash), not the shell's $_
+	if not self.exec_noenv then
+		C.setenv("_", execpath, 1) -- a program sees `_` = its own path (bash), not the shell's $_
+	end
 	if self.exec_argv0 then
 		anchor.a0 = tostring(self.exec_argv0)
 		argv[0] = anchor.a0
@@ -1252,6 +1254,7 @@ function Shell:capture_forked(ast, runner)
 		C.close(pfd[1])
 		self.out = io.write
 		self.in_subprogram = (self.in_subprogram or 0) + 1
+		self.xdepth = (self.xdepth or 0) + 1 -- (xtrace: one more $(…) level)
 		local ok, err = pcall(runner, self)
 		if not ok and type(err) == "table" and (err.__curse_exit or err.__curse_return) then
 			self.status = err.__curse_exit or err.__curse_return
@@ -1473,7 +1476,10 @@ function Shell:capture_inproc(backtick, runner, capfd, ctx)
 		end
 		self.aliases = c
 	end
+	local sv_xd = self.xdepth
+	self.xdepth = (sv_xd or 0) + 1 -- xtrace: PS4's first char repeats per $(…) level
 	local ok, err = pcall(runner, self)
+	self.xdepth = sv_xd
 	if ctx and ctx.child then -- late-forked: this process IS the $(…) child; its fd 1 is the
 		M.child_status(self, ok, err) -- shared temp file, so just end with the body's status
 		M.late_child_exit(self, ctx, self.status)
@@ -1918,6 +1924,28 @@ function M.child_status(sh, ok, err)
 	end
 end
 
+-- `for NAME in …` with NAME readonly: bash reports it, status 1, and runs no iteration
+function M.for_var_ro(sh, name)
+	local b = sh.vars[sh:deref(name)]
+	if b and b.ro then
+		io.stderr:write("curse: " .. name .. ": readonly variable\n")
+		sh.status = 1
+		return true
+	end
+	return false
+end
+-- write all of `s` to a raw fd; false if the fd isn't writable (EBADF…)
+function M.fd_write(fd, s)
+	local off = 0
+	while off < #s do
+		local n = tonumber(C.curse_co_write(fd, ffi.cast("const char *", s) + off, #s - off))
+		if not n or n < 0 then
+			return false
+		end
+		off = off + n
+	end
+	return true
+end
 -- ---- coprocesses (`coproc [NAME] cmd`) -------------------------------------------
 -- The shell keeps one end of each of the two pipes: NAME=(read-fd write-fd), NAME_PID.
 -- Like bash, each pipe end first moves to the highest FREE fd below 64 (move_to_high_fd),
@@ -3193,6 +3221,11 @@ function M.file_test(op, path)
 	if op == "-G" then
 		return ffi.cast("uint32_t *", _ft_a + 32)[0] == C.getegid()
 	end -- st_gid
+	if op == "-N" then -- modified since last read: mtime newer than atime
+		local as, an = ffi.cast("int64_t *", _ft_a + 72)[0], ffi.cast("int64_t *", _ft_a + 80)[0]
+		local ms, mn = ffi.cast("int64_t *", _ft_a + 88)[0], ffi.cast("int64_t *", _ft_a + 96)[0]
+		return ms > as or (ms == as and mn > an)
+	end
 	return false
 end
 function M.file_bincmp(op, x, y)
@@ -3447,6 +3480,9 @@ function Shell:special_get(name)
 	end
 	if name == "EPOCHSECONDS" then
 		return tostring(os.time())
+	end
+	if name == "BASH_COMMAND" then
+		return self.cur_cmd and require("deparse").command_text(self.cur_cmd) or ""
 	end
 	if name == "EPOCHREALTIME" then
 		local tv = ffi.new("struct curse_rt_timeval")
@@ -7381,7 +7417,8 @@ local TEST_UNOPS = {}
 for w in ("-a -b -c -d -e -f -g -h -k -p -r -s -t -u -w -x -G -L -N -O -R -S -o -v -z -n"):gmatch("%S+") do
 	TEST_UNOPS[w] = 1
 end
-local function test_binary(x, op, y)
+-- `locale`: [[ ]] orders < / > by LC_COLLATE; test / [ by plain byte (ASCII) order (bash)
+local function test_binary(x, op, y, locale)
 	if op == "=" or op == "==" then
 		return x == y
 	end
@@ -7389,10 +7426,16 @@ local function test_binary(x, op, y)
 		return x ~= y
 	end
 	if op == "<" then
-		return M.coll_lt(x, y)
-	end -- string compare by LC_COLLATE (bash)
+		if locale then
+			return M.coll_lt(x, y)
+		end
+		return x < y
+	end
 	if op == ">" then
-		return M.coll_lt(y, x)
+		if locale then
+			return M.coll_lt(y, x)
+		end
+		return y < x
 	end
 	if op == "-ot" or op == "-nt" or op == "-ef" then
 		return M.file_bincmp(op, x, y)

@@ -24,7 +24,8 @@ return function(sh, cmd, args, hook, tcb)
 		local stbuf = ffi.new("int[1]")
 		local function reap(pid)
 			if C.waitpid(pid, stbuf, 0) < 0 then
-				return 127
+				-- a process substitution already reaped when its command finished
+				return sh.procsub_status and sh.procsub_status[pid] or 127
 			end
 			return rt.wexit(stbuf[0])
 		end

@@ -419,6 +419,12 @@ local function scan_xtrace(node)
 	if node.t == "coproc" then -- a coproc is reaped asynchronously (bash's SIGCHLD); only the
 		return true -- interpreter polls for it between commands (rt.coproc_poll)
 	end
+	if node.lit == "extdebug" then
+		return true -- extdebug: a DEBUG trap may skip commands (interp's run_debug handles it)
+	end
+	if node.lit and node.lit:find("BASH_COMMAND", 1, true) then
+		return true -- $BASH_COMMAND (often read in a trap string) tracks interp's statements
+	end
 	if node.t == "simple" and node.words and node.words[1] and node.words[1].parts[1]
 		and node.words[1].parts[1].lit == "set"
 	then
@@ -3932,7 +3938,8 @@ H.funcdef = function(cx, st, after)
 		cx.blocks[p] = ("io.stderr:write(%q); sh.status = 1; pc = %d") -- non-fatal runtime error (bash)
 			:format("curse: `" .. st.name .. "': not a valid identifier\n", after)
 	elseif cx.funcflags[st.name] then
-		cx.blocks[p] = ("sh.functions[%q] = rt.mark_compiled(%s, %s); pc = %d"):format(st.name, EF.upv_wrapped(fnlname(st.name)), fnlname(st.name), after)
+		cx.blocks[p] = ("if sh.fn_ro and sh.fn_ro[%q] then io.stderr:write(%q); sh.status = 1 else sh.functions[%q] = rt.mark_compiled(%s, %s) end; pc = %d"):format(
+			st.name, "curse: " .. st.name .. ": readonly function\n", st.name, EF.upv_wrapped(fnlname(st.name)), fnlname(st.name), after)
 	else
 		cx.blocks[p] = ("pc = %d"):format(after)
 	end
@@ -5130,6 +5137,9 @@ H.forin = function(cx, st, after)
 	end
 	parts[#parts + 1] = ("sh.forstate[%d] = {list=__l, idx=0}"):format(st.id)
 	cx.blocks[initp] = table.concat(parts, "; ") .. ("; pc = %d"):format(advp)
+	if EF.has_attr then -- a readonly loop variable: bash reports it and runs no iteration
+		cx.blocks[initp] = ("if rt.for_var_ro(sh, %q) then pc = %d else %s end"):format(st.name, after, cx.blocks[initp])
+	end
 	-- DEBUG fires at the `for` header before each iteration (bash), with an element present.
 	cx.blocks[advp] = ("local fs = sh.forstate[%d]; fs.idx = fs.idx + 1; if fs.idx > #fs.list then pc = %d else sh:set_str(%q, fs.list[fs.idx]); %spc = %d end"):format(
 		st.id,

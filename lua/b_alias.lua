@@ -25,6 +25,12 @@ return function(sh, cmd, args, hook, tcb)
 			listall = true
 			j = j + 1
 		end
+		if args[j] and args[j]:match("^%-[^-]") then -- an unknown option: usage error (status 2)
+			io.stderr:write("curse: alias: " .. args[j]:sub(1, 2) .. ": invalid option\n")
+			io.stderr:write("alias: usage: alias [-p] [name[=value] ... ]\n")
+			sh.status = 2
+			return
+		end
 		if args[j] == "--" then
 			j = j + 1
 		end

@@ -24,7 +24,7 @@ return function(sh, cmd, args, hook, tcb)
 		-- -p prints declarations.
 		local doexport, assoc, printmode, nref, plusn = (cmd == "export"), false, false, false, false
 		local plusx, gflag, unexport = false, false, false
-		local tattr, plust = false, false -- -t / +t: the function trace attribute
+		local tattr, plust, plusr = false, false, false -- -t / +t: the function trace attribute
 		local funcnames, funcbody, iattr, lattr, uattr, rattr, aattr = false, false, false, false, false, false, false
 		local cattr = false -- declare -c: capitalize (first char upper, rest lower)
 		local rest = {}
@@ -104,6 +104,9 @@ return function(sh, cmd, args, hook, tcb)
 				if a:find("t") then
 					plust = true
 				end
+				if a:find("r") then
+					plusr = true
+				end
 			else
 				rest[#rest + 1] = a
 			end
@@ -165,34 +168,46 @@ return function(sh, cmd, args, hook, tcb)
 				end
 			end
 		end
-		if (funcnames or funcbody) and (tattr or plust) and #rest > 0 then
-			-- `declare -ft NAME…` / `+t`: SET the trace attribute (a traced function inherits
-			-- the DEBUG/RETURN traps, like functrace for just it) — nothing is printed
+		local fnbad = (funcnames or funcbody)
+			and (aattr and "a" or assoc and "A" or iattr and "i" or lattr and "l" or uattr and "u" or cattr and "c" or nref and "n")
+		if fnbad then -- an attribute a function can't have (bash: status 1)
+			io.stderr:write("curse: " .. cmd .. ": -" .. fnbad .. ": invalid option\n")
+			sh.status = 1
+			return
+		end
+		local fattr = tattr or plust or rattr or plusr or doexport or unexport or plusx
+			or cmd == "readonly" or cmd == "export"
+		if (funcnames or funcbody) and #rest > 0 and fattr then
+			-- set function attributes (nothing printed): -t trace (inherits DEBUG/RETURN),
+			-- -r readonly (can't be redefined or unset), -x export (the function goes into
+			-- the environment as BASH_FUNC_NAME%% — rt.fexport_sync; -n/+x un-exports)
 			local allok = true
 			for _, nm in ipairs(rest) do
-				if sh.functions[nm] then
-					sh.fn_trace = sh.fn_trace or {}
-					sh.fn_trace[nm] = tattr or nil
-				else
-					allok = false
-				end
-			end
-			sh.status = allok and 0 or 1
-		elseif (funcnames or funcbody) and #rest > 0 and (cmd == "export" or doexport or unexport or plusx) then
-			-- `export -f NAME…` / `declare -fx NAME…` (`-n`/`+x`: un-export): the function
-			-- goes into the environment as BASH_FUNC_NAME%% (rt.fexport_sync)
-			local allok = true
-			for _, nm in ipairs(rest) do
-				if nm:find("=", 1, true) then -- (NAME=… can't be an environment function)
+				if (cmd == "export" or doexport) and nm:find("=", 1, true) then
 					io.stderr:write("curse: " .. cmd .. ": " .. nm .. ": cannot export\n")
 					allok = false
-				elseif sh.functions[nm] then
-					sh.fexport = sh.fexport or {}
-					sh.fexport[nm] = not (unexport or plusx) or nil
-					rt.fexport_sync(sh, nm)
-				else
-					io.stderr:write("curse: " .. cmd .. ": " .. nm .. ": not a function\n")
+				elseif not sh.functions[nm] then
+					if cmd == "export" or doexport then
+						io.stderr:write("curse: " .. cmd .. ": " .. nm .. ": not a function\n")
+					end
 					allok = false
+				elseif plusr and sh.fn_ro and sh.fn_ro[nm] then
+					io.stderr:write("curse: " .. cmd .. ": " .. nm .. ": readonly function\n")
+					allok = false
+				else
+					if tattr or plust then
+						sh.fn_trace = sh.fn_trace or {}
+						sh.fn_trace[nm] = tattr or nil
+					end
+					if rattr or cmd == "readonly" then
+						sh.fn_ro = sh.fn_ro or {}
+						sh.fn_ro[nm] = true
+					end
+					if cmd == "export" or doexport or unexport or plusx then
+						sh.fexport = sh.fexport or {}
+						sh.fexport[nm] = not (unexport or plusx) or nil
+						rt.fexport_sync(sh, nm)
+					end
 				end
 			end
 			sh.status = allok and 0 or 1
@@ -202,15 +217,18 @@ return function(sh, cmd, args, hook, tcb)
 			-- With no names, an exported function's listing is marked `declare -fx NAME`,
 			-- and -x (or `export -f`) lists only the exported ones.
 			local names, allok, named = rest, true, #rest > 0
-			local fx = sh.fexport or {}
-			if #names == 0 then
+			local fx, fro, ftr = sh.fexport or {}, sh.fn_ro or {}, sh.fn_trace or {}
+			if #names == 0 then -- (-x / -r / `export -f` / `readonly -f`: only those)
 				names = {}
 				for k in pairs(sh.functions) do
-					if not (doexport or cmd == "export") or fx[k] then
+					if (not (doexport or cmd == "export") or fx[k]) and (not (rattr or cmd == "readonly") or fro[k]) then
 						names[#names + 1] = k
 					end
 				end
 				table.sort(names)
+			end
+			local function fdecl(nm) -- `declare -f[r][t][x] NAME`
+				return "declare -f" .. (fro[nm] and "r" or "") .. (ftr[nm] and "t" or "") .. (fx[nm] and "x" or "") .. " " .. nm
 			end
 			for _, nm in ipairs(names) do
 				-- `declare -f NAME` prints the verbatim definition (captured at parse time);
@@ -221,8 +239,8 @@ return function(sh, cmd, args, hook, tcb)
 						if d then
 							sh:echo(d)
 						end
-						if not named and fx[nm] then
-							sh:echo("declare -fx " .. nm)
+						if not named and (fx[nm] or fro[nm] or ftr[nm]) then
+							sh:echo(fdecl(nm))
 						end
 					elseif funcnames then
 						if named and sh.shopt.extdebug then -- extdebug: `name line file`
@@ -234,7 +252,7 @@ return function(sh, cmd, args, hook, tcb)
 									.. (sh.func_file and sh.func_file[nm] or "")
 							)
 						else
-							sh:echo(named and nm or ((fx[nm] and "declare -fx " or "declare -f ") .. nm))
+							sh:echo(named and nm or fdecl(nm))
 						end
 					end
 				else

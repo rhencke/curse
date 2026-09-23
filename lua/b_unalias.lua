@@ -19,6 +19,12 @@ local C, P = I.C, I.P
 return function(sh, cmd, args, hook, tcb)
 	if cmd == "unalias" then
 		local ok = true
+		if args[2] and args[2]:match("^%-[^a-]") then -- an unknown option: usage error (status 2)
+			io.stderr:write("curse: unalias: " .. args[2]:sub(1, 2) .. ": invalid option\n")
+			io.stderr:write("unalias: usage: unalias [-a] name [name ...]\n")
+			sh.status = 2
+			return
+		end
 		if #args < 2 then
 			io.stderr:write("curse: unalias: usage: unalias [-a] name [name ...]\n")
 			ok = false

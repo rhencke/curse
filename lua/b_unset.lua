@@ -28,10 +28,15 @@ return function(sh, cmd, args, hook, tcb)
 				vmode = true
 			elseif a:sub(1, 1) == "-" and #a > 1 then -- other flags: ignore
 			elseif fmode then
-				sh.functions[a] = nil
-				if sh.fexport and sh.fexport[a] then -- (it leaves the environment too)
-					sh.fexport[a] = nil
-					rt.fexport_sync(sh, a)
+				if sh.fn_ro and sh.fn_ro[a] and sh.functions[a] then
+					io.stderr:write("curse: unset: " .. a .. ": cannot unset: readonly function\n")
+					sh.status = 1
+				else
+					sh.functions[a] = nil
+					if sh.fexport and sh.fexport[a] then -- (it leaves the environment too)
+						sh.fexport[a] = nil
+						rt.fexport_sync(sh, a)
+					end
 				end
 			else
 				local nm, sub = a:match("^([%a_][%w_]*)%[(.+)%]$")
