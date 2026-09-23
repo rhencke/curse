@@ -3025,7 +3025,12 @@ local function printf_conv(full, conv, arg)
 		or conv == "A"
 	then
 		local v, ok = printf_float(arg)
-		return string.format(full .. (conv == "F" and "f" or conv), v), ok
+		local r = string.format(full .. (conv == "F" and "f" or conv), v)
+		local dp = rt.decimal_point() -- (the locale's radix character: `1,0000` under de_DE)
+		if dp ~= "." then
+			r = r:gsub("%.", dp, 1)
+		end
+		return r, ok
 	end
 	return nil, true -- unknown conversion
 end
@@ -3305,6 +3310,15 @@ end
 -- A function OVERRIDES a builtin of the same name in bash, so this is dispatched
 -- before the builtin table (except via `command`, which passes no_func).
 local function run_function(sh, cmd, fn, args, hook, tenv_base)
+	-- $FUNCNEST: past that many nested calls, the call fails (status 1) — bash
+	if sh.vars.FUNCNEST then
+		local lim = tonumber(sh:get("FUNCNEST"))
+		if lim and lim > 0 and (sh.calldepth or 0) >= lim then
+			io.stderr:write("curse: " .. cmd .. ": maximum function nesting level exceeded (" .. lim .. ")\n")
+			sh.status = 1
+			return
+		end
+	end
 	local savedline = sh.cur_line -- the call-site line: $LINENO is restored to it on return
 	sh.calldepth = sh.calldepth + 1 -- OSR gate: no handoff inside a call
 	sh:pushCall(unpack(args, 2))
@@ -4597,6 +4611,13 @@ exec_stmt = function(sh, st, hook)
 				end
 			end
 			for _, a in ipairs(st.assigns) do
+				-- it propagates through any temporary binding of the name (`var=30 f` where
+				-- f does `var=20 return`): that binding's end mustn't restore the old value
+				for _, te in ipairs(sh.tenv) do
+					if te.name == a.name then
+						te.consumed = true
+					end
+				end
 				if a.raw then
 					sh:set_str(a.name, a.raw)
 				else
@@ -4666,6 +4687,7 @@ exec_stmt = function(sh, st, hook)
 			sh.tenv_call_base = base
 			local ok, err = pcall(run_cmd)
 			sh.tenv_call_base = nil
+			local relocale = false
 			for k = #sh.tenv, base + 1, -1 do
 				local s = sh.tenv[k]
 				sh.tenv[k] = nil
@@ -4676,7 +4698,11 @@ exec_stmt = function(sh, st, hook)
 					else
 						C.unsetenv(s.name)
 					end
+					relocale = relocale or s.name == "LANG" or s.name:sub(1, 3) == "LC_"
 				end
+			end
+			if relocale then -- (`LANG=C cmd`: the locale follows the variable back)
+				rt.reset_locale(sh)
 			end
 			if not ok then
 				error(err)
@@ -5876,6 +5902,7 @@ end
 -- reference; a feature module aliases them to the same names and copies its
 -- branch bodies verbatim.
 M._int = {
+	SPECIAL_BUILTIN = SPECIAL_BUILTIN,
 	exec_simple = exec_simple,
 	expand_part_str = expand_part_str,
 	tilde_word_initial = tilde_word_initial,

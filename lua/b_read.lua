@@ -153,6 +153,20 @@ return function(sh, cmd, args, hook, tcb)
 				elseif c == "\1" then
 					buf[#buf + 1] = "\1\1" -- DOUBLE a real CTLESC byte so it
 					-- survives the \1-marker unescape below
+				elseif nchars and c:byte() >= 0xC0 and rt.lc_mb_cur_max() > 1 then
+					-- -n/-N count CHARACTERS in a multibyte locale: take the rest of a UTF-8
+					-- sequence along with its lead byte (one buf entry = one character)
+					local b = c:byte()
+					local more = (b >= 0xF0 and 3) or (b >= 0xE0 and 2) or 1
+					local ch = { c }
+					for _ = 1, more do
+						local d = getc()
+						if d == nil then
+							break
+						end
+						ch[#ch + 1] = d
+					end
+					buf[#buf + 1] = table.concat(ch)
 				else
 					buf[#buf + 1] = c
 				end

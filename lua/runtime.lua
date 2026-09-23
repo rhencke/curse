@@ -679,7 +679,9 @@ end
 -- precedence per category: LC_ALL overrides; else LC_<category>; else LANG. An
 -- invalid locale name makes setlocale return NULL and leaves the prior locale in
 -- place (bash warns and continues) — so we never clobber a good locale.
+M.locale_gen = 0 -- bumped per reset: an in-process subshell that changed it re-applies on exit
 function M.reset_locale(sh)
+	M.locale_gen = M.locale_gen + 1
 	local all = sh.vars["LC_ALL"] and sh:get("LC_ALL")
 	local lang = sh.vars["LANG"] and sh:get("LANG")
 	for name, cat in pairs(LC_CATEGORIES) do
@@ -710,6 +712,14 @@ function M.reset_locale(sh)
 	lc_mb_cur_max = tonumber(C.__ctype_get_mb_cur_max()) or 1
 end
 M.LC_CATEGORIES = LC_CATEGORIES
+-- The LC_NUMERIC decimal point (reset_locale applies the category) — LuaJIT's own number
+-- formatting always writes ".", so printf's float conversions substitute this.
+ffi.cdef("struct curse_lconv { char *decimal_point; }; struct curse_lconv *localeconv(void);")
+function M.decimal_point()
+	local lc = C.localeconv()
+	local dp = lc ~= nil and lc.decimal_point ~= nil and ffi.string(lc.decimal_point) or "."
+	return dp ~= "" and dp or "."
+end
 
 -- Count CHARACTERS (codepoints) in a byte string using the current LC_CTYPE, the
 -- way bash's MB_STRLEN does: single-byte locale -> byte length; else walk with
@@ -1614,7 +1624,7 @@ local function sub_checkpoint(self)
 		orig_vars = orig_vars, copy = copy, exset = exset,
 		params = self.params, nparams = self.nparams,
 		shopt = self.shopt, functions = self.functions,
-		dirstack = self.dirstack, hashcache = self.hashcache, getopts = self.getopts_state,
+		locale_gen = M.locale_gen, dirstack = self.dirstack, hashcache = self.hashcache, getopts = self.getopts_state,
 		cwd = self:phys_cwd(), um = C.umask(0),
 	}
 	C.umask(cp.um)
@@ -1658,6 +1668,9 @@ local function sub_checkpoint(self)
 end
 local function sub_restore(self, cp)
 	self.vars = cp.orig_vars
+	if cp.locale_gen ~= M.locale_gen then -- (`(LANG=C; …)`: setlocale is process-wide)
+		M.reset_locale(self)
+	end
 	self.params, self.nparams = cp.params, cp.nparams
 	self.shopt, self.functions = cp.shopt, cp.functions
 	self.dirstack, self.hashcache, self.getopts_state = cp.dirstack, cp.hashcache, cp.getopts
@@ -2076,9 +2089,10 @@ function M.import_functions(sh)
 		if val:sub(1, 4) == "() {" and not name:find("/", 1, true) then
 			ok, ast = pcall(P.parse, src)
 		end
+		-- (exactly ONE statement: anything after the definition — `; echo BAD` — is a second
+		-- statement, and a word glued after the body is a syntax error)
 		local st = ok and type(ast) == "table" and not ast.perr and #ast.stmts == 1 and ast.stmts[1]
-		if st and st.t == "funcdef" and st.name == name and st.deftext
-			and st.deftext:gsub("%s+$", "") == src:gsub("%s+$", "") then
+		if st and st.t == "funcdef" and st.name == name then
 			sh.functions[name] = st.body
 			sh.func_redirs = sh.func_redirs or {}
 			sh.func_redirs[name] = st.redirs

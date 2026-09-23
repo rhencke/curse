@@ -419,6 +419,9 @@ local function scan_xtrace(node)
 	if node.t == "coproc" then -- a coproc is reaped asynchronously (bash's SIGCHLD); only the
 		return true -- interpreter polls for it between commands (rt.coproc_poll)
 	end
+	if node.name == "FUNCNEST" or node.var == "FUNCNEST" then
+		return true -- $FUNCNEST limits call depth: interp's run_function counts it
+	end
 	if node.lit == "extdebug" then
 		return true -- extdebug: a DEBUG trap may skip commands (interp's run_debug handles it)
 	end
@@ -3434,6 +3437,30 @@ analyze_lift = function(ast)
 	for n in pairs(NO_LIFT) do
 		disq[n] = true
 	end
+	-- `var=x return` / `var=x :` on a special builtin: under posix the assignment persists,
+	-- written by the interpreter (delegated) — keep those vars in sh.vars
+	local SPB = require("interp")._int.SPECIAL_BUILTIN
+	local function spb_walk(node)
+		if type(node) ~= "table" then
+			return
+		end
+		if node.t == "simple" and node.assigns and node.words and node.words[1] then
+			local p1 = node.words[1].parts and node.words[1].parts[1]
+			if p1 and p1.lit and SPB[p1.lit] then
+				for _, a in ipairs(node.assigns) do
+					if a.name then
+						disq[a.name] = true
+					end
+				end
+			end
+		end
+		for _, v in pairs(node) do
+			if type(v) == "table" then
+				spb_walk(v)
+			end
+		end
+	end
+	spb_walk(ast.stmts)
 	local lifted = {}
 	for n in pairs(assigned) do
 		if not disq[n] and not localed[n] then
@@ -3683,6 +3710,9 @@ local function inlinable_body(body)
 			local cmd = st.words[1] and st.words[1].parts[1] and st.words[1].parts[1].lit
 			if not (cmd == "echo" or cmd == ":" or cmd == "true" or cmd == "false") then
 				return false
+			end
+			if cmd == ":" and st.assigns and #st.assigns > 0 then
+				return false -- (`var=x :` — a special builtin's prefix assignment; see simple_compiled)
 			end
 			for j = 2, #st.words do
 				if word_varargs(st.words[j]) then
@@ -3975,6 +4005,11 @@ end
 simple_compiled = function(cx, st, after)
 	local t = st.t
 	local cmd = st.words[1] and full_lit(st.words[1]) -- full literal → \-escaped builtins (\exit, \echo) dispatch
+	-- `var=x return` / `var=x :` …: under set -o posix a special builtin's prefix
+	-- assignments PERSIST — interp decides that at run time (opt_posix)
+	if cmd and st.assigns and #st.assigns > 0 and require("interp")._int.SPECIAL_BUILTIN[cmd] then
+		return cx.delegate(st, after)
+	end
 	if cmd and emit_redir_funcs[cmd] then
 		return cx.delegate(st, after)
 	end -- call to a def-redirect func
@@ -6139,7 +6174,8 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
 			-- `return` at the top level is an error (status 2 + diagnostic, but execution
 			-- continues) — not a program exit. A compiled top level is always the main
 			-- script (source runs through interp), so delegate and let interp diagnose.
-			if cx.toplevel and not EF.fragment then
+			-- (`var=x return`: a posix-persistent prefix assignment — interp does that too)
+			if (cx.toplevel and not EF.fragment) or (st.assigns and #st.assigns > 0) then
 				return cx.delegate(st, after)
 			end
 			-- return [N] (incl. \return / builtin return / command return): set $? and exit
