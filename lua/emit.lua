@@ -6915,7 +6915,9 @@ assemble = function(cfg, sig, opts)
 	local o = { sig }
 	-- `pc` is local slot 2 in every dispatch function (a param of run; the FIRST local of a
 	-- fn_x / cs_N body): rt's error prefix reads it off the stack to find the line
-	if not opts.toplevel then
+	if opts.fnresume then -- fn_x(sh, pc): an interpreted call may continue here at a loop
+		o[#o + 1] = "  local __resume = pc ~= nil"
+	elseif not opts.toplevel then
 		o[#o + 1] = ("  local pc = %d"):format(cfg.entry)
 	end
 	if cfg.forlocals and #cfg.forlocals > 0 then -- (this activation's for-in loop states)
@@ -6949,6 +6951,14 @@ assemble = function(cfg, sig, opts)
 	-- call's local frame is dropped on return; a `local` that failed — readonly — isn't ours)
 	for _, n in ipairs(opts.fnlocals or {}) do
 		o[#o + 1] = ("  local %s = 0LL"):format(lname(n))
+	end
+	if opts.fnresume then -- (resumed mid-call: its lifted locals come from sh; else the entry)
+		local seeds = {}
+		for _, n in ipairs(opts.fnlocals or {}) do
+			seeds[#seeds + 1] = ("%s = sh:aget(%q)"):format(lname(n), n)
+		end
+		o[#o + 1] = ("  if __resume then %s else pc = %d end"):format(
+			#seeds > 0 and table.concat(seeds, "; ") or "", cfg.entry)
 	end
 	for _, n in ipairs(opts.upvals or {}) do
 		o[#o + 1] = ("  %s = sh:aget(%q)"):format(lname(n), n)
@@ -7376,6 +7386,7 @@ function M.emit(ast, opts)
 	-- fn_x bodies (build_cfg may register compiled `$(…)` fragments as a side effect, so
 	-- assemble them into a buffer and splice after the forward-declaration line below).
 	local fndefs = {}
+	local fnloop, fnsrc = {}, {} -- (for OSR into a call the interpreter is running: tier)
 	for _, st in ipairs(ast.stmts) do
 		if st.t == "funcdef" then
 			-- keep every fn_x (indirect/dynamic dispatch); it can't see run-locals, so
@@ -7397,7 +7408,12 @@ function M.emit(ast, opts)
 			EF.fn_locals = #fl > 0 and ls or nil
 			local cfg = build_cfg(st.body, ls, funcflags, inlinefns)
 			EF.fn_locals = sv_fl
-			fndefs[#fndefs + 1] = assemble(cfg, fnlname(st.name) .. " = function(sh)", { shname = st.name, fnlocals = fl })
+			fndefs[#fndefs + 1] = assemble(cfg, fnlname(st.name) .. " = function(sh, pc)",
+				{ shname = st.name, fnlocals = fl, fnresume = true })
+			if next(cfg.loopPc) and not fnloop[st.name] then
+				fnloop[st.name] = cfg.loopPc
+				fnsrc[st.name] = require("interp").deparse_func(st.name, st)
+			end
 		end
 	end
 	local funcsrc, funcline = {}, {} -- name -> verbatim definition text / def line (top-level funcdefs)
@@ -7432,8 +7448,14 @@ function M.emit(ast, opts)
 		"local function run(sh, pc)",
 		{ runlocals = runlocals, upvals = upvals, toplevel = true, funcsrc = funcsrc, funcline = funcline }
 	)
-	o[#o + 1] = ("return { run = run, loopPc = loopPc, stmtPc = stmtPc%s }"):format(
-		EF.alias_static and ", alias_static = true" or ""
+	local fl = {}
+	for name, lp in spairs(fnloop) do
+		fl[#fl + 1] = ("[%q] = { pcs = %s, src = %q, fn = %s }"):format(name, serialize(lp), fnsrc[name],
+			EF.upv_wrapped(fnlname(name)))
+	end
+	o[#o + 1] = ("return { run = run, loopPc = loopPc, stmtPc = stmtPc%s%s }"):format(
+		EF.alias_static and ", alias_static = true" or "",
+		#fl > 0 and (", fnLoop = { " .. table.concat(fl, ", ") .. " }") or ""
 	)
 	return table.concat(o, "\n") .. "\n"
 end

@@ -3854,6 +3854,11 @@ local function run_function(sh, cmd, fn, args, hook, tenv_base)
 		ok, err = pcall(fn, sh) -- a COMPILED function closure
 	else
 		ok, err = pcall(exec_list, sh, fn, hook, false)
+		-- the tier compiled this function while a loop in it ran hot: the rest of THIS call
+		-- continues compiled from that loop (err.pc), in the frame already set up here
+		if not ok and type(err) == "table" and err.__curse_fnswitch and err.depth == sh.calldepth then
+			ok, err = pcall(err.fn, sh, err.pc)
+		end
 	end -- an interp AST body
 	if fr then
 		io.flush()
@@ -5779,6 +5784,14 @@ exec_stmt = function(sh, st, hook)
 		local pid = job and job.pid or 0
 		rt.coproc_setvars(sh, st.name, r0, w1, pid)
 		sh.coprocs[pid] = { name = st.name, r = r0, w = w1, g = job and job.g }
+		if job and job.g then
+			job.g.on_done = function(g)
+				job.done, job.status = true, g.status[1] or 0
+				if sh.coprocs and sh.coprocs[pid] then
+					rt.coproc_dispose(sh, pid)
+				end
+			end
+		end
 		sh.status = 0
 	elseif t == "arithcmd" then
 		-- A `(( expr ))` command (standalone or as an if/while condition) is NOT fatal

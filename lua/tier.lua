@@ -257,7 +257,7 @@ local function alias_mismatch(mod, sh)
 	return mod.alias_static or (sh.aliases and next(sh.aliases) ~= nil)
 end
 
-local compile_first, compile_store
+local compile_store
 
 local LOOP_WORDS = { "while", "until", "for", "select", "function" }
 local function may_loop(src)
@@ -272,42 +272,18 @@ local deferred = {}
 -- (loop iterations before an interpreted cold run compiles and switches; CURSE_HOT_LOOP
 -- overrides — 1 stress-tests OSR at every top-level loop)
 local HOT_LOOP = tonumber(os.getenv("CURSE_HOT_LOOP") or "") or 100
--- Must a miss compile BEFORE it runs? Only when it can get hot inside a function call — a
--- loop in a function body, or a function that calls itself — where the interpreter can't
--- switch to compiled code mid-call. Anything else can switch at a hot top-level loop.
-local LOOPS = { whilec = 1, forin = 1, forc = 1, select = 1 }
-function compile_first(ast)
-	local found = false
-	local function walk(t, fname, d)
-		if found or d > 300 then
-			return
-		end
-		if t.t == "funcdef" then
-			fname = t.name
-		end
-		if fname then
-			if LOOPS[t.t] then
-				found = true
-				return
-			end
-			local w = t.t == "simple" and t.words and t.words[1]
-			local p = w and w.parts and w.parts[1]
-			if p and p.lit == fname then
-				found = true
-				return
-			end
-		end
-		for _, v in pairs(t) do
-			if type(v) == "table" then
-				walk(v, fname, d + 1)
-			end
-		end
+-- emit + load + store (disk cache and this worker's) — nil if the emitter can't. With
+-- `later`, the disk write waits for M.flush_stores (a compile MID-RUN happens under the
+-- script's own limits — `ulimit -f 1` would kill the process with SIGXFSZ).
+local pending_stores = {}
+function M.flush_stores()
+	local Cache = require("cache")
+	while #pending_stores > 0 do
+		local ps = table.remove(pending_stores)
+		pcall(Cache.store, ps[1], ps[2])
 	end
-	walk(ast.stmts, nil, 0)
-	return found
 end
--- emit + load + store (disk cache and this worker's) — nil if the emitter can't.
-function compile_store(path, ast, sh)
+function compile_store(path, ast, sh, later)
 	local ok, code = pcall(E.emit, ast)
 	local chunk = ok and load(code, "=curse:compiled")
 	if not chunk then
@@ -318,13 +294,20 @@ function compile_store(path, ast, sh)
 		return nil
 	end
 	local okd, bc = pcall(string.dump, chunk, true)
-	require("cache").store(path, okd and bc or code)
+	if later then
+		pending_stores[#pending_stores + 1] = { path, okd and bc or code }
+	else
+		require("cache").store(path, okd and bc or code)
+	end
 	modcache_put(path, m)
 	return m
 end
 -- Compile + store the scripts that ran interpreted on a miss (the daemon calls this once
--- the client has its reply).
-function M.compile_deferred()
+-- the client has its reply — a worker does it one at a time, while nobody waits).
+function M.has_deferred()
+	return #deferred > 0
+end
+function M.compile_deferred(one)
 	local Cache = require("cache")
 	while #deferred > 0 do
 		local d = table.remove(deferred)
@@ -339,6 +322,9 @@ function M.compile_deferred()
 				Cache.store(d.path, okd and bc or code)
 				modcache_put(d.path, m)
 			end
+		end
+		if one then
+			return
 		end
 	end
 end
@@ -378,26 +364,49 @@ function M.run_tiered(src, sh)
 		I.run_lazy(sh, src)
 		return sh, "interp-deferred"
 	end
-	-- (the classification parse is needed only when a function could hold the loop: with no
-	-- funcdef in the text, go straight to the interpreter — the compile parses if it's hot)
-	local nofunc = not (src:find("(", 1, true) and src:find("%(%s*%)")) and not src:find("%f[%w_]function%f[^%w_]")
-	local pok, ast
-	if nofunc then
-		pok = true
-	else
-		pok, ast = pcall(P.parse, src)
-	end
-	if path and pok and (nofunc or (type(ast) == "table" and ast.stmts and not compile_first(ast))) then
-		-- It can only get hot in a TOP-LEVEL loop, where the interpreter can switch: run it
-		-- interpreted; a loop that turns hot compiles it right then and continues compiled
-		-- (OSR at that loop); one that never does is compiled after the reply.
+	local ast -- (parsed for the compile, only if a loop gets hot)
+	if path then
+		-- Run it interpreted; a loop that turns hot compiles the script right then and
+		-- continues compiled from that loop — at the top level (OSR into run), or inside a
+		-- function call (interp run_function continues the call in the compiled function).
+		-- A script that never gets hot is compiled after the reply.
 		local mod, resume, count = nil, nil, 0
+		local fnseen = {} -- (function name -> its switch verdict, checked once)
 		local hook = function(kind, id)
 			if kind ~= "loop" then
 				return
 			end
 			count = count + 1
-			if count < HOT_LOOP or resume or sh.calldepth ~= 0 or (sh.traps and (sh.traps.DEBUG or sh.traps.RETURN)) then
+			if count < HOT_LOOP or resume or (sh.traps and (sh.traps.DEBUG or sh.traps.RETURN)) then
+				return
+			end
+			if sh.calldepth ~= 0 then
+				-- a hot loop inside a function call: compile, and continue THIS call
+				-- compiled from the loop (interp run_function catches the switch) — when the
+				-- running definition is the one compiled (a redefinition isn't)
+				if mod == nil then
+					if not ast then
+						local okp, a = pcall(P.parse, src)
+						ast = okp and a or nil
+					end
+					mod = ast and compile_store(path, ast, sh, true) or false
+				end
+				local fname = sh.funcstack and sh.funcstack[1]
+				local fl = mod and mod.fnLoop and fname and mod.fnLoop[fname]
+				if not fl then
+					return
+				end
+				local verdict = fnseen[fname]
+				if verdict == nil then
+					local def = sh.func_def and sh.func_def[fname]
+					verdict = def and type(sh.functions[fname]) == "table"
+						and I.deparse_func(fname, def) == fl.src or false
+					fnseen[fname] = verdict
+				end
+				local fpc = verdict and fl.pcs[id]
+				if fpc then
+					error({ __curse_fnswitch = true, fn = fl.fn, pc = fpc, depth = sh.calldepth }, 0)
+				end
 				return
 			end
 			if mod == nil then
@@ -405,7 +414,7 @@ function M.run_tiered(src, sh)
 					local okp, a = pcall(P.parse, src)
 					ast = okp and a or nil
 				end
-				mod = ast and compile_store(path, ast, sh) or false
+				mod = ast and compile_store(path, ast, sh, true) or false
 			end
 			local pc = mod and resume_pc(mod, { kind = kind, id = id })
 			if pc then -- (no module — the emitter declined, or aliases now in play: stay put)
@@ -428,11 +437,7 @@ function M.run_tiered(src, sh)
 		end
 		error(err)
 	end
-	local m = pok and path and ast and compile_store(path, ast, sh)
-	if m then
-		return M.run_mod(m, sh, src, 0) -- interp -> OSR fall-over
-	end
-	I.run_lazy(sh, src) -- fallback: the interpreter's line-at-a-time parse, always correct
+	I.run_lazy(sh, src) -- (no cache path: the interpreter's line-at-a-time parse)
 	return sh, "interp"
 end
 

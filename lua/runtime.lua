@@ -3757,6 +3757,9 @@ local function co_resume(ctx, t)
 				co_cl(ctx, g.base.fd[k])
 			end
 			g.done = true
+			if g.on_done then -- (a coproc: disposed as it dies — bash's SIGCHLD reaping)
+				pcall(g.on_done, g)
+			end
 		end
 		if g.alive == 0 and g.waiter then -- a stage waiting on this nested pipeline
 			ctx.runnable[#ctx.runnable + 1] = g.waiter

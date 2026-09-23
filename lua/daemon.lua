@@ -409,7 +409,6 @@ local function serve_request(cfd, req, fds, ctx)
 		pcall(rt.sched_drain)
 		drained = true
 	end
-	pcall(Tier.compile_deferred) -- (off the caller's clock: see tier.run_tiered)
 	-- SCRUB per-request process state (the fork boundary used to do this):
 	C.umask(ctx.umask) -- a script's `umask` doesn't persist
 	C.sigprocmask(2, ctx.empty_sigset, nil) -- SIG_SETMASK: clear any trap-blocked signals
@@ -531,8 +530,19 @@ local function worker_main(lfd, my_uid, ctx, slot)
 	local cred = ffi.new("struct curse_ucred[1]")
 	local credlen = ffi.new("unsigned int[1]")
 	local served = 0
+	local idlepf = ffi.new("struct curse_d_pollfd[1]")
 	while true do
 		local retire = false
+		-- idle time: compile what ran interpreted (tier.run_tiered), one at a time, only
+		-- while no connection waits — a request never queues behind a compile
+		pcall(Tier.flush_stores) -- (the modules compiled mid-run: written now, off its limits)
+		while Tier.has_deferred() do
+			idlepf[0].fd, idlepf[0].events, idlepf[0].revents = lfd, 1, 0
+			if C.curse_d_poll(idlepf, 1, 0) > 0 then
+				break
+			end
+			pcall(Tier.compile_deferred, true)
+		end
 		local cfd = C.accept(lfd, nil, nil)
 		if cfd < 0 then
 			local e = ffi.errno()
