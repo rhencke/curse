@@ -1684,10 +1684,15 @@ local compile_cmdsub_inner
 -- (compiling the body moves the compile-time line: put it back for the enclosing command)
 local function compile_cmdsub(...)
 	local l, cl, ln, cil = EF.cur_line, EF.cur_cline, EF.cur_loopn, EF.cs_in_loop
-	-- (a `$( … )` inside a loop knows it: a break/continue in its body ends the substitution)
+	local cif, cia, inf = EF.cs_in_func, EF.cs_active, EF.cur_infunc
+	-- (a `$( … )` inside a loop knows it: a break/continue in its body ends the substitution;
+	-- inside a function, a `return` there ends it — at the top level that's an error)
 	EF.cs_in_loop = (EF.cur_loopn or 0) > 0 or cil
+	EF.cs_in_func = EF.cur_infunc or cif
+	EF.cs_active = true
 	local r = { compile_cmdsub_inner(...) }
 	EF.cur_line, EF.cur_cline, EF.cur_loopn, EF.cs_in_loop = l, cl, ln, cil
+	EF.cs_in_func, EF.cs_active, EF.cur_infunc = cif, cia, inf
 	return unpack(r)
 end
 function compile_cmdsub_inner(src, backtick, lifted, aenv, noalias, posix)
@@ -6067,6 +6072,13 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
 		-- calldepth are set to the compile-time nesting first, so the interpreter's break/
 		-- continue/return actually FIRE (they gate on "is there an enclosing loop/func").
 		local inloop, infunc = #cx.loopstack > 0, not cx.toplevel
+		-- a `$( … )` body is a CFG of its own, but its return/break/continue belong to where
+		-- the substitution sits: a function (or not), a loop (or not)
+		local cs_ld
+		if EF.cs_active and not inloop then
+			infunc = infunc and EF.cs_in_func and true or false
+			cs_ld = EF.cs_in_loop and 1 or 0
+		end
 		-- opts.redir (a redir_conds expression) wraps the compiled callee in install/restore:
 		-- the redirs apply around the dispatch (a failed one -> status 1, no call), then restore.
 		local redir = opts and opts.redir
@@ -6103,6 +6115,9 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
 			local out = {}
 			for _, s in ipairs(sync_in) do
 				out[#out + 1] = s
+			end
+			if cs_ld then -- (a raised break/continue leaves the $( … ): its capture restores this)
+				out[#out + 1] = ("sh.loopdepth = %d"):format(cs_ld)
 			end
 			if prelude then
 				out[#out + 1] = prelude
@@ -6372,7 +6387,8 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
 		if t == "noop" then
 			return after
 		end
-		EF.cur_loopn = #cx.loopstack -- (compile_cmdsub: is this command inside a loop)
+		EF.cur_loopn = #cx.loopstack -- (compile_cmdsub: is this command inside a loop …
+		EF.cur_infunc = not cx.toplevel -- … or a function)
 		if st.line then
 			cx.prev_line = EF.cur_line -- (the command before: a redirected compound's errors)
 			EF.cur_line = t == "simple" and st.cline or st.line -- (a simple command: interp's rule)
@@ -6435,7 +6451,8 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
 			-- continues) — not a program exit. A compiled top level is always the main
 			-- script (source runs through interp), so delegate and let interp diagnose.
 			-- (`var=x return`: a posix-persistent prefix assignment — interp does that too)
-			if (cx.toplevel and not EF.fragment) or (st.assigns and #st.assigns > 0) then
+			if (cx.toplevel and not EF.fragment) or (st.assigns and #st.assigns > 0)
+				or (EF.cs_active and not EF.cs_in_func and #cx.subexit == 0) then -- ($(return) at top)
 				return cx.delegate(st, after)
 			end
 			-- return [N] (incl. \return / builtin return / command return): set $? and exit
