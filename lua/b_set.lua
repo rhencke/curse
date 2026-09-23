@@ -28,7 +28,8 @@ return function(sh, cmd, args, hook, tcb)
 			table.sort(names)
 			for _, nm in ipairs(names) do
 				local b = sh.vars[nm]
-				if b and not (b.s == nil and b.n == nil and b.arr == nil) then
+				-- (a declared-but-never-assigned array isn't listed either)
+				if b and not (b.s == nil and b.n == nil and b.arr == nil) and not (b.empty_decl and b.arr and next(b.arr) == nil) then
 					sh.out(fmt_set_var(nm, b) .. "\n")
 				end
 			end

@@ -41,7 +41,7 @@ return function(sh, cmd, args, hook, tcb)
 						rt.fexport_sync(sh, a)
 					end
 				end
-			elseif vmode and not rt.split_array_ref(a) then -- `unset -v 'a b'` (bare unset
+			elseif vmode and not rt.split_array_ref(a, sh) then -- `unset -v 'a b'` (bare unset
 				-- quietly tries a function of that name instead)
 				io.stderr:write("curse: unset: `" .. a .. "': not a valid identifier\n")
 				sh.status = 1
@@ -73,7 +73,7 @@ return function(sh, cmd, args, hook, tcb)
 						a = nm
 						nm = nil -- `name[0]` on a scalar unsets the whole variable
 					elseif eb then -- non-array with a non-zero subscript (bash: "not an array")
-						io.stderr:write("curse: unset: " .. a .. ": not an array\n")
+						io.stderr:write("curse: unset: " .. nm .. ": not an array variable\n")
 						sh.status = 1
 					end
 					-- eb == nil: `name[sub]` with no such variable is a no-op (status 0)

@@ -4230,7 +4230,19 @@ simple_compiled = function(cx, st, after)
 						or emit_word(e.word, cx.lifted)
 					parts[#parts + 1] = ("__it[#__it+1] = {key=%q, op=%q, val=%s}"):format(EF.static_key(e.key), e.op, valx)
 				elseif not empty_word(e.word) then
-					parts[#parts + 1] = emit_fields_into("__it", e.word, cx.lifted, "{val=%s}")
+					-- an assoc's key/value words don't split or glob (see H.arrayassign)
+					if isassoc then
+						parts[#parts + 1] = ("__it[#__it+1] = {val=%s}"):format(emit_word(e.word, cx.lifted))
+					else
+						if not parts.asq then -- (asked once per statement)
+							parts.asq = true
+							parts[#parts + 1] = ("local __as = sh:is_assoc(%q)"):format(a1.name)
+						end
+						parts[#parts + 1] = ("if __as then __it[#__it+1] = {val=%s} else %s end"):format(
+							emit_word(e.word, cx.lifted),
+							emit_fields_into("__it", e.word, cx.lifted, "{val=%s}")
+						)
+					end
 				end
 			end
 			local ec = errchk(st)
@@ -5836,7 +5848,21 @@ H.arrayassign = function(cx, st, after)
 					or emit_word(e.word, cx.lifted)
 				parts[#parts + 1] = ("__it[#__it+1] = {key=%q, op=%q, val=%s}"):format(EF.static_key(e.key), e.op, valx)
 			elseif not empty_word(e.word) then
-				parts[#parts + 1] = emit_fields_into("__it", e.word, cx.lifted, "{val=%s}")
+				-- a bare word field-splits and globs for an INDEXED target, but is one plain word
+				-- in an ASSOCIATIVE key/value list (bash) — which one is only known at run time
+				local fields = emit_fields_into("__it", e.word, cx.lifted, "{val=%s}")
+				if unq_full_lit(e.word) and not unq_full_lit(e.word):find("[%*%?%[]") then
+					parts[#parts + 1] = fields -- (a plain literal is the same either way)
+				else
+					if not parts.asq then -- (asked once per statement)
+						parts.asq = true
+						parts[#parts + 1] = ("local __as = sh:is_assoc(%q)"):format(st.name)
+					end
+					parts[#parts + 1] = ("if __as then __it[#__it+1] = {val=%s} else %s end"):format(
+						emit_word(e.word, cx.lifted),
+						fields
+					)
+				end
 			end
 		end
 		local ec = errchk(st)
@@ -5894,13 +5920,39 @@ H.case = function(cx, st, after)
 	local sv = cx.newloopvar()
 	local n = #st.clauses
 	local matchentry, bodyentry = {}, {}
+	-- a matching body still sees the PREVIOUS $? (bash); the case's status is its last
+	-- executed body's — 0 if that was empty or nothing matched. `ran` records whether the
+	-- last body taken was non-empty (a ;;& can fall off the end after one).
+	-- (only a ;;& can reach "no match" after a body ran, so only then is `ran` needed —
+	-- each is a real local, and a big script's cases must stay under Lua's local limit)
+	local ran
+	for _, cl in ipairs(st.clauses) do
+		if cl.term == "test" then
+			ran = cx.newloopvar()
+			break
+		end
+	end
+	local nomatch = cx.newpc()
+	cx.blocks[nomatch] = (ran and ("if not %s then sh.status = 0 end; "):format(ran) or "sh.status = 0; ")
+		.. ("pc = %d"):format(after)
 	for i = n, 1, -1 do -- back-to-front so forward targets (next body/match) already exist
 		local cl = st.clauses[i]
 		local btarget = (cl.term == "fall" and (i < n and bodyentry[i + 1] or after))
 			or (cl.term == "test" and (i < n and matchentry[i + 1] or after))
 			or after
-		bodyentry[i] = cx.flatten_list(cl.body, btarget)
-		local nextmatch = (i < n) and matchentry[i + 1] or after
+		-- an empty body that ENDS the case (;;) leaves 0 (the last executed body's status);
+		-- ;& / ;;& pass through, the previous $? still visible (bash)
+		if #cl.body == 0 and cl.term ~= "fall" and cl.term ~= "test" then
+			bodyentry[i] = cx.newpc()
+			cx.blocks[bodyentry[i]] = ("sh.status = 0; pc = %d"):format(btarget)
+		elseif ran then
+			local first = cx.flatten_list(cl.body, btarget)
+			bodyentry[i] = cx.newpc()
+			cx.blocks[bodyentry[i]] = ("%s = %s; pc = %d"):format(ran, tostring(#cl.body > 0), first)
+		else
+			bodyentry[i] = cx.flatten_list(cl.body, btarget)
+		end
+		local nextmatch = (i < n) and matchentry[i + 1] or nomatch
 		-- Compile each pattern's glob-form and match natively (rt.glob_match); a clause
 		-- with a pattern emit can't render (cmdsub/arith/${…}-op/$@/$*) keeps I.case_match.
 		local globs, allok = {}, true
@@ -5943,10 +5995,11 @@ H.case = function(cx, st, after)
 	end -- clause flattening moved it; restore for $LINENO in the subject
 	local subjp = cx.newpc()
 	cx.blocks[subjp] = dbg(st)
-		.. ("%s = %s; sh.status = 0; pc = %d"):format(
+		.. ("%s = %s; %spc = %d"):format(
 			sv,
 			emit_word(st.subject, cx.lifted),
-			n > 0 and matchentry[1] or after
+			ran and (ran .. " = false; ") or "",
+			n > 0 and matchentry[1] or nomatch
 		)
 	return subjp
 end

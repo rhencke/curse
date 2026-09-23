@@ -219,6 +219,8 @@ function Shell.new()
 		sh:array_assign("BASH_VERSINFO", { "5", "2", "37", "1", "release", "x86_64-pc-linux-gnu" }, false)
 		sh.vars["BASH_VERSINFO"].ro = true
 	end
+	sh.vars.BASH_ALIASES = M.virt_assoc(sh, "aliases")
+	sh.vars.BASH_CMDS = M.virt_assoc(sh, "cmds")
 	return sh
 end
 
@@ -1787,6 +1789,9 @@ end
 -- stay pristine, so a `local`/tempenv shadow that still references one is valid after
 -- the subshell restores.
 local function copybox(b)
+	if rawget(b, "virt") then
+		return b -- (a view of the alias/hash tables, which are checkpointed themselves)
+	end
 	local nb = {
 		s = b.s, n = b.n, assoc = b.assoc, exported = b.exported, ref = b.ref,
 		lower = b.lower, upper = b.upper, cap = b.cap, ro = b.ro, int = b.int, empty_decl = b.empty_decl,
@@ -3801,7 +3806,8 @@ function Shell:resolve_cmd(name)
 			and bit.band(ffi.cast("uint32_t *", stbuf_a + 24)[0], 0xF000) ~= 0x4000
 		then -- not a dir
 			self.hashcache = self.hashcache or {}
-			self.hashcache[name] = { path = cand, hits = 1 }
+			M.hash_seq = M.hash_seq + 1
+			self.hashcache[name] = { path = cand, hits = 1, seq = M.hash_seq }
 			return cand
 		end
 	end
@@ -4215,7 +4221,7 @@ function M.compat_level(sh)
 end
 -- bash's valid_array_reference: `NAME`, or `NAME[SUB]` whose subscript's brackets balance
 -- exactly to the end (`A[]]` is not one). Returns name, sub (nil for a plain name), or nil.
-function M.split_array_ref(s)
+function M.split_array_ref(s, sh)
 	local name, rest = s:match("^([%a_][%w_]*)(.*)$")
 	if not name then
 		return nil
@@ -4226,10 +4232,23 @@ function M.split_array_ref(s)
 	if rest:sub(1, 1) ~= "[" then
 		return nil
 	end
-	local depth, n = 0, #rest
-	for i = 1, n do
+	-- under assoc_expand_once an assoc's subscript is all between the first `[` and the
+	-- LAST `]` (`A[]]` is key `]`) — bash's VA_ONEWORD
+	if sh and sh.shopt.assoc_expand_once and #rest > 2 and rest:sub(-1) == "]" and sh:is_assoc(name) then
+		return name, rest:sub(2, -2)
+	end
+	local depth, n, i = 0, #rest, 1
+	while i <= n do -- (quote-aware, like bash's skipsubscript: an unclosed quote is invalid)
 		local c = rest:sub(i, i)
-		if c == "[" then
+		if c == "\\" then
+			i = i + 1
+		elseif c == "'" or c == '"' then
+			local e = rest:find(c, i + 1, true)
+			if not e then
+				return nil
+			end
+			i = e
+		elseif c == "[" then
 			depth = depth + 1
 		elseif c == "]" then
 			depth = depth - 1
@@ -4240,20 +4259,23 @@ function M.split_array_ref(s)
 				return name, rest:sub(2, n - 1)
 			end
 		end
+		i = i + 1
 	end
 	return nil
 end
 -- A builtin assigning to a NAME it was given (read, printf -v, …): a plain name or an array
 -- element; anything else is `cmd: `A[]]': not a valid identifier` (status 1). false = refused.
 function M.assign_ref(sh, cmd, ref, value)
-	local name, sub = M.split_array_ref(ref)
+	local name, sub = M.split_array_ref(ref, sh)
 	if not name then
 		io.stderr:write("curse: " .. cmd .. ": `" .. ref .. "': not a valid identifier\n")
 		sh.status = 1
 		return false
 	end
 	if sub then
-		sh:array_set(name, require("interp")._int.array_key(sh, name, sub), value, false)
+		local key = (sh.shopt.assoc_expand_once and sh:is_assoc(name)) and sub
+			or require("interp")._int.array_key(sh, name, sub)
+		sh:array_set(name, key, value, false)
 		return true
 	end
 	return sh:set_str(name, value) ~= false
@@ -4643,6 +4665,18 @@ function Shell:array_set(name, key, val, append)
 		return true
 	end
 	local b = box(self:deref(name), self.vars)
+	if rawget(b, "virt") then -- BASH_ALIASES[k]=v / BASH_CMDS[k]=v: an alias / a hashed path
+		key = tostring(key)
+		if b.virt == "aliases" then
+			self.aliases[key] = append and ((self.aliases[key] or "") .. val) or val
+		else
+			self.hashcache = self.hashcache or {}
+			M.hash_seq = M.hash_seq + 1
+			self.hashcache[key] = { path = val, hits = 0, seq = M.hash_seq }
+			self.hashpath = self:get("PATH")
+		end
+		return true
+	end
 	if not b.arr then
 		b.arr = {}
 		if b.s then
@@ -4764,6 +4798,13 @@ end
 -- (bash: `unset a[-2]` on a 1-element array is an error).
 function Shell:array_unset(name, key)
 	local b = self.vars[self:deref(name)]
+	if b and rawget(b, "virt") then -- (unset BASH_ALIASES[k]: drop the alias / hash entry)
+		local src = b.virt == "aliases" and self.aliases or self.hashcache
+		if src then
+			src[tostring(key)] = nil
+		end
+		return true
+	end
 	if not (b and b.arr) then
 		return true
 	end
@@ -4797,6 +4838,7 @@ local function assoc_bucket(key, nb)
 	end
 	return tonumber(h % i64(nb or 1024))
 end
+M.assoc_bucket = assoc_bucket
 
 function Shell:array_indices(name)
 	if VIRT_ARR[name] then
@@ -4825,6 +4867,40 @@ function Shell:array_indices(name)
 		return { 0 }
 	end
 	return {}
+end
+-- BASH_ALIASES / BASH_CMDS: bash's dynamic assoc views of the alias table and the command
+-- hash table. The box computes `arr`/`order` from them on every access (so it never goes
+-- stale, in a subshell too), iterating in their own tables' bucket order (64 / 256).
+M.hash_seq = 0
+local VIRT_ASSOC_MT = {
+	__index = function(b, k)
+		if k ~= "arr" and k ~= "order" then
+			return nil
+		end
+		local sh, arr, keys = b.vsh, {}, {}
+		if b.virt == "aliases" then
+			for name, v in pairs(sh.aliases or {}) do
+				arr[name], keys[#keys + 1] = v, name
+			end
+			table.sort(keys)
+		else
+			local hc = sh.hashcache or {}
+			for name, e in pairs(hc) do
+				arr[name], keys[#keys + 1] = e.path, name
+			end
+			table.sort(keys, function(a, z)
+				local sa, sz = hc[a].seq or 0, hc[z].seq or 0
+				if sa ~= sz then
+					return sa < sz
+				end
+				return a < z
+			end)
+		end
+		return k == "arr" and arr or keys
+	end,
+}
+function M.virt_assoc(sh, which)
+	return setmetatable({ assoc = true, virt = which, vsh = sh, nbuckets = which == "aliases" and 64 or 256 }, VIRT_ASSOC_MT)
 end
 -- an assoc box's keys in bash's hash-table order (see assoc_bucket)
 function M.assoc_keys(b)
@@ -6737,6 +6813,11 @@ function M.array_convert_msg(sh, cmd, name, what, compound)
 end
 function M.array_convert_err(sh, name, isassoc, cmd)
 	local b = sh.vars[sh:deref(name)]
+	if b and b.ro and b.arr and (b.assoc and true or false) ~= (isassoc and true or false) then
+		io.stderr:write("curse: " .. name .. ": readonly variable\n") -- (reported before conversion)
+		sh.status = 1
+		return true
+	end
 	if isassoc then
 		if b and b.arr and not b.assoc then
 			sh.status = M.array_convert_msg(sh, cmd, name, "indexed to associative array", true)
@@ -6813,7 +6894,11 @@ arrayassign_body = function(sh, name, items, append)
 			end
 		else -- all-bare assoc literal: alternating key value pairs
 			for k = 1, #items, 2 do
-				sh:array_set(name, items[k].val, items[k + 1] and items[k + 1].val or "", false)
+				if items[k].val == "" then -- (an empty key: bash reports it and skips the pair)
+					io.stderr:write('curse: "": bad array subscript\n')
+				else
+					sh:array_set(name, items[k].val, items[k + 1] and items[k + 1].val or "", false)
+				end
 			end
 		end
 	else
@@ -6836,9 +6921,20 @@ arrayassign_body = function(sh, name, items, append)
 		end
 		for _, it in ipairs(items) do
 			if it.key ~= nil then
-				local idx = keyof(it.key)
-				sh:array_set(name, idx, it.val, it.op == "+=")
-				auto = idx + 1 -- indexed += appends to CURRENT
+				-- a bad element is reported (as written) and skipped (interp's do_arrayassign)
+				local src = "[" .. it.key .. "]" .. (it.op or "=") .. it.val
+				if it.key:match("^%s*$") then
+					io.stderr:write("curse: " .. src .. ": bad array subscript\n")
+				elseif it.key == "*" or it.key == "@" then
+					io.stderr:write("curse: " .. src .. ": cannot assign to non-numeric index\n")
+				else
+					local idx = keyof(it.key)
+					if sh:array_set(name, idx, it.val, it.op == "+=") then
+						auto = idx + 1 -- indexed += appends to CURRENT
+					else
+						io.stderr:write("curse: " .. src .. ": bad array subscript\n")
+					end
+				end
 			else
 				sh:array_set(name, auto, it.val, false)
 				auto = auto + 1
@@ -6880,6 +6976,9 @@ function M.assign_element(sh, name, raw, expanded, value, append)
 		key = expanded
 	elseif raw:match("^%s*$") then
 		key = 0
+	elseif raw == "@" or raw == "*" then -- (`ia[@]=x`: interp's array_key says so too)
+		io.stderr:write("curse: " .. name .. "[" .. raw .. "]: bad array subscript\n")
+		error({ __curse_exit = 1, __curse_lineabort = true })
 	else
 		local ok, v = pcall(function()
 			return M.to_arr_key(M.arith_str(sh, raw))

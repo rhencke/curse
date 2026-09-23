@@ -26,8 +26,9 @@ return function(sh, cmd, args, hook, tcb)
 			sh.status = 1
 		else
 			local last, failed = 0, false
-			local sv = P.arith_cmd
+			local sv, sl = P.arith_cmd, sh.arith_let
 			P.arith_cmd = "let" -- (bash's this_command_name in the error text)
+			sh.arith_let = true -- (its text is already expanded: see arith_key)
 			for k = 2, #args do
 				local ok, v = pcall(function()
 					local pok, ast = pcall(P.arith, args[k], "strict") -- (args are already expanded)
@@ -39,7 +40,7 @@ return function(sh, cmd, args, hook, tcb)
 				end)
 				if not ok then
 					if not (type(v) == "table" and v.__curse_matherr) then
-						P.arith_cmd = sv
+						P.arith_cmd, sh.arith_let = sv, sl
 						error(v)
 					end
 					failed = true -- an arith error ends let (status 1), like bash's longjmp
@@ -47,7 +48,7 @@ return function(sh, cmd, args, hook, tcb)
 				end
 				last = tonumber(rt.i64_to_str(v)) or 0
 			end
-			P.arith_cmd = sv
+			P.arith_cmd, sh.arith_let = sv, sl
 			sh.status = (not failed and last ~= 0) and 0 or 1
 		end
 	end

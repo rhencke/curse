@@ -60,7 +60,8 @@ return function(sh, cmd, args, hook, tcb)
 				sh.hashpath = cur
 			end
 			for k = j, #args do
-				sh.hashcache[args[k]] = { path = ppath, hits = 0 }
+				rt.hash_seq = rt.hash_seq + 1
+				sh.hashcache[args[k]] = { path = ppath, hits = 0, seq = rt.hash_seq }
 			end
 			sh.status = 0
 			return
@@ -82,11 +83,19 @@ return function(sh, cmd, args, hook, tcb)
 				end
 			end
 		elseif not rflag then -- bare `hash`: print the cache (bash format)
+			-- (bash lists its 256-bucket hash table: by bucket, newest first within one)
 			local ks = {}
 			for k in pairs(sh.hashcache) do
 				ks[#ks + 1] = k
 			end
-			table.sort(ks)
+			local hc = sh.hashcache
+			table.sort(ks, function(a, z)
+				local ba, bz = rt.assoc_bucket(a, 256), rt.assoc_bucket(z, 256)
+				if ba ~= bz then
+					return ba < bz
+				end
+				return (hc[a].seq or 0) > (hc[z].seq or 0)
+			end)
 			if #ks > 0 then
 				sh:echo("hits\tcommand")
 				for _, k in ipairs(ks) do

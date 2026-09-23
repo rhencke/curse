@@ -128,33 +128,21 @@ return function(sh, cmd, args, hook, tcb)
 		end
 		-- listing a subset of variables (bare `declare`/`export`/`readonly`, or with
 		-- -p and no names): the builtin + attribute flags select which vars to print.
-		local function decl_match(nm, b)
+		local function decl_match(nm, b) -- (every attribute asked for must hold: -ar = both)
 			if not b then
 				return false
 			end
-			if cmd == "readonly" or rattr then
-				return b.ro
+			if (cmd == "readonly" or rattr) and not b.ro then
+				return false
 			end
-			if cmd == "export" or doexport then
-				return b.exported
+			if (cmd == "export" or doexport) and not b.exported then
+				return false
 			end
-			if nref then
-				return b.ref
+			if (nref and not b.ref) or (assoc and not b.assoc) or (aattr and not (b.arr and not b.assoc)) then
+				return false
 			end
-			if assoc then
-				return b.assoc
-			end
-			if aattr then
-				return b.arr and not b.assoc
-			end
-			if iattr then
-				return b.int
-			end
-			if lattr then
-				return b.lower
-			end
-			if uattr then
-				return b.upper
+			if (iattr and not b.int) or (lattr and not b.lower) or (uattr and not b.upper) then
+				return false
 			end
 			return true
 		end
@@ -176,11 +164,27 @@ return function(sh, cmd, args, hook, tcb)
 					names[#names + 1] = nm
 				end
 			end
+			if not bare then -- (the dynamic arrays, as bash lists them: `declare -a`, `declare -p`)
+				for nm in pairs(M.DYN_ARRAYS) do
+					if sh.vars[nm] == nil then
+						virt[nm] = { arr = {} }
+						names[#names + 1] = nm
+					end
+				end
+			end
 			table.sort(names)
 			for _, nm in ipairs(names) do
 				local box = sh.vars[nm] or virt[nm]
 				if decl_match(nm, box) then
 					local d = bare and fmt_set_var(nm, box) or fmt_decl(sh, nm)
+					if d and sh.opt_posix and (cmd == "readonly" or cmd == "export") then
+						-- posix mode lists `readonly [-a|-A] name=value` / `export …` (bash)
+						local fl, rest = d:match("^declare %-(%S*) (.*)$")
+						if fl then
+							local kind = fl:match("[aA]")
+							d = cmd .. (kind and (" -" .. kind) or "") .. " " .. rest
+						end
+					end
 					if d then
 						sh:echo(d)
 					end
@@ -370,7 +374,17 @@ return function(sh, cmd, args, hook, tcb)
 					local pfx = (cmd == "export" or cmd == "readonly") and "" or (cmd .. ": ")
 					io.stderr:write("curse: " .. pfx .. nm .. ": readonly variable\n")
 					allok = false
-				elseif nm and (aattr or assoc) and val:sub(1, 1) == "(" and val:sub(-1) == ")" then
+				elseif
+					nm
+					and (
+						aattr
+						or assoc
+						or ((cmd == "declare" or cmd == "typeset") and sh.vars[sh:deref(nm)] and sh.vars[sh:deref(nm)].arr)
+					)
+					and val:sub(1, 1) == "("
+					and val:sub(-1) == ")"
+				then -- (declare also for a name that's ALREADY an array: `declare a='(1 2)'`;
+					-- readonly/export keep such a quoted value literal)
 					-- dynamic array literal: `declare -a "x=(1 2 3)"` (the -a/-A flag is required)
 					if localize then
 						sh:localVar(nm)
@@ -468,7 +482,9 @@ return function(sh, cmd, args, hook, tcb)
 						sh.vars[dn].lower = lattr or nil
 						sh.vars[dn].upper = uattr or nil
 						sh.vars[dn].cap = cattr or nil
-					elseif assoc and cmd ~= "readonly" then -- bash forbids converting an existing indexed array to associative
+					elseif assoc and (cmd ~= "readonly" or (sh.arrayargs_pending and sh.arrayargs_pending[a])) then
+						-- (readonly -A applies the attribute only with a compound value)
+						-- bash forbids converting an existing indexed array to associative
 						-- (`readonly -A` with NO value does NOT apply the attribute — bash then
 						-- shows just `declare -r`, so let it fall through to the plain-var branch)
 						local b = sh.vars[sh:deref(a)]
@@ -490,7 +506,14 @@ return function(sh, cmd, args, hook, tcb)
 						end
 					elseif aattr and cmd ~= "readonly" then -- `declare -a`: mark an (empty) indexed array; convert a scalar to [0]
 						local b = sh.vars[a] or {}
-						if b.assoc then -- …and the reverse conversion is forbidden too
+						if b.ro and b.assoc then -- (readonly is reported before any conversion)
+							io.stderr:write("curse: " .. a .. ": readonly variable\n")
+							allok = false
+							if sh.arrayargs_pending and sh.arrayargs_pending[a] then
+								sh.arrayargs_pending.skip = sh.arrayargs_pending.skip or {}
+								sh.arrayargs_pending.skip[a] = true
+							end
+						elseif b.assoc then -- …and the reverse conversion is forbidden too
 							local compound = sh.arrayargs_pending and sh.arrayargs_pending[a]
 							if rt.array_convert_msg(sh, cmd, a, "associative to indexed array", compound) ~= 0 then
 								allok = false
@@ -569,10 +592,32 @@ return function(sh, cmd, args, hook, tcb)
 								anm, sub, aop, aval = nm, rest:sub(1, close - 1), "=", after:sub(2)
 							end
 						end
+						if not anm and not close and sh.shopt.assoc_expand_once then -- (a quoted `[`
+							-- in the source subscript — declare m["foo[bar"]=v — left brackets
+							-- unbalanced: under assoc_expand_once it ends at the first ]=)
+							local s2, op2, v2 = rest:match("^(.-)%](%+?=)(.*)$")
+							if s2 and s2 ~= "" then
+								anm, sub, aop, aval = nm, s2, op2, v2
+							end
+						end
 					end
 					-- bash creates the element for declare/typeset/local, but NOT via a
 					-- deferred `readonly a[i]=v` / `export a[i]=v` (those fail, status 1).
-					if anm and nref then -- `declare -n a[3]=x`
+					if anm and (aattr or assoc) and (cmd == "declare" or cmd == "typeset")
+						and aval:sub(1, 1) == "(" and aval:sub(-1) == ")" then
+						-- `declare -a e[10]='(test)'`: a compound value assigns the whole array
+						-- (bash ignores the subscript)
+						if localize then
+							sh:localVar(anm)
+						end
+						if assoc then
+							sh:declare_assoc(anm)
+						end
+						local st1 = P.parse(anm .. (aop == "+=" and "+=" or "=") .. aval).stmts[1]
+						if st1 and st1.t == "arrayassign" then
+							M.do_arrayassign(sh, st1)
+						end
+					elseif anm and nref then -- `declare -n a[3]=x`
 						io.stderr:write("curse: " .. cmd .. ": " .. anm .. "[" .. sub .. "]: reference variable cannot be an array\n")
 						allok = false
 					elseif anm and (cmd == "declare" or cmd == "typeset") then

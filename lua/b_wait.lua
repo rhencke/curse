@@ -30,9 +30,14 @@ return function(sh, cmd, args, hook, tcb)
 			return rt.wexit(stbuf[0])
 		end
 		local nflag, specs, bad = false, {}, false
-		for k = 2, #args do
+		local pvar -- -p VAR: the pid whose status is returned lands in VAR
+		local k = 2
+		while k <= #args do
 			local a = args[k]
-			if a == "-n" then
+			if a == "-p" then
+				k = k + 1
+				pvar = args[k]
+			elseif a == "-n" then
 				nflag = true
 			elseif a == "-f" then -- accept (we always block until done anyway)
 			elseif a:sub(1, 1) == "-" and #a > 1 then
@@ -40,10 +45,59 @@ return function(sh, cmd, args, hook, tcb)
 			else
 				specs[#specs + 1] = a
 			end
+			k = k + 1
 		end
 		sh.jobs = sh.jobs or {}
+		local waited -- the pid whose status we return (for -p)
 		if bad then
 			sh.status = 2
+		elseif nflag and #specs > 0 then
+			-- -n with jobs: whichever LISTED job finishes first (others that end are recorded)
+			-- (only jobs not yet waited for count; bash forgets a job once wait returns it)
+			local want = {}
+			for _, sp in ipairs(specs) do
+				local j = sp:sub(1, 1) == "%" and job_resolve(sh, sp)
+				local pid = j and j.pid or tonumber(sp)
+				local live
+				for _, jj in ipairs(sh.jobs) do
+					if jj.pid == pid and not jj.waited then
+						live = jj
+					end
+				end
+				if live then
+					want[pid] = true
+				else
+					io.stderr:write("curse: wait: " .. sp .. ": no such job\n")
+				end
+			end
+			sh.status = 127
+			for _, j in ipairs(sh.jobs) do -- (one already finished answers at once)
+				if want[j.pid] and j.done then
+					sh.status, waited = j.status or 0, j.pid
+					j.waited = true
+					break
+				end
+			end
+			while not waited and next(want) do
+				local r = C.waitpid(-1, stbuf, 0)
+				if r < 0 then
+					break
+				end
+				local est = rt.wexit(stbuf[0])
+				for _, j in ipairs(sh.jobs) do
+					if j.pid == r then
+						j.done, j.status = true, est
+					end
+				end
+				if want[r] then
+					sh.status, waited = est, r
+					for _, j in ipairs(sh.jobs) do
+						if j.pid == r then
+							j.waited = true
+						end
+					end
+				end
+			end
 		elseif nflag and #specs == 0 then
 			-- wait for the NEXT job to finish (127 if there are none to wait for)
 			local active = false
@@ -67,7 +121,7 @@ return function(sh, cmd, args, hook, tcb)
 						end
 					end
 				end
-				sh.status = est
+				sh.status, waited = est, r
 			end
 		elseif #specs > 0 then
 			local last = 0
@@ -78,7 +132,7 @@ return function(sh, cmd, args, hook, tcb)
 						io.stderr:write("curse: wait: " .. s .. ": no such job\n")
 						last = 127
 					else
-						last = job_reap(sh, j) or 127
+						last, waited = job_reap(sh, j) or 127, j.pid
 						if j.sig and SIGDESC[j.sig] then
 							io.stderr:write(SIGDESC[j.sig] .. "\n")
 						end
@@ -90,6 +144,7 @@ return function(sh, cmd, args, hook, tcb)
 							found = j
 						end
 					end
+					waited = pid
 					if found then
 						last = job_reap(sh, found) or 127
 						if found.sig and SIGDESC[found.sig] then
@@ -115,6 +170,11 @@ return function(sh, cmd, args, hook, tcb)
 				sh.bg_pids = {}
 			end
 			sh.status = 0
+		end
+		if pvar and waited then
+			local st = sh.status
+			rt.assign_ref(sh, "wait", pvar, tostring(waited))
+			sh.status = st
 		end
 	end
 end

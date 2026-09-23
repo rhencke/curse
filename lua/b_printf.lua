@@ -33,7 +33,11 @@ return function(sh, cmd, args, hook, tcb)
 				end
 				-- target may be NAME or NAME[SUBSCRIPT]
 				local nm, sub = target:match("^([%a_][%w_]*)%[(.*)%]$")
-				if nm then
+				local once = nm and sh.shopt.assoc_expand_once and sh:is_assoc(nm) -- (A[]] is key ])
+				if once and sub ~= "" then
+					sh:array_set(nm, sub, res, false)
+					sh.status = st
+				elseif nm then
 					if sub == "" then
 						io.stderr:write("curse: printf: `" .. target .. "': bad array subscript\n")
 						sh.status = 2

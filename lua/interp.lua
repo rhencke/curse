@@ -308,8 +308,14 @@ local function read_split(ifs, line, nvars)
 end
 -- `set` (no args) one-line rendering of a variable box.
 local function fmt_set_var(name, b)
+	if rawget(b, "virt") then
+		return name .. "=()" -- (BASH_ALIASES/BASH_CMDS: bash's `set` shows their unbuilt cell)
+	end
 	if b.assoc and b.arr then
 		local keys = rt.assoc_keys(b) -- (bash's hash order, as declare -p)
+		if #keys == 0 then
+			return name .. "=()"
+		end
 		local parts = {}
 		for _, k in ipairs(keys) do
 			local kq = tostring(k):match("^[%w_]+$") and tostring(k) or ('"' .. tostring(k):gsub('"', '\\"') .. '"')
@@ -1089,6 +1095,9 @@ arith_key = function(sh, name, idxexpr, idxraw)
 		if sh.arith_expanded then -- (already-expanded text, e.g. a [[ -eq ]] operand: the key
 			return idxraw or "" -- is taken literally — bash's EXP_EXPANDED)
 		end
+		if sh.arith_let and sh.shopt.assoc_expand_once and not (idxraw or ""):find("[$`]") then
+			return idxraw or "" -- (let's argument was expanded once already: `a[80's]` is literal)
+		end
 		return array_key(sh, name, idxraw or "")
 	end
 	-- (bash evaluates a subscript with this_command_name cleared: no `((: ` in its errors)
@@ -1128,6 +1137,10 @@ array_key = function(sh, name, index_raw)
 	-- a SINGLE quote is a syntax error (`a['3']` -> status 1, assignment skipped).
 	if index_raw:match("^%s*$") then
 		return 0
+	end
+	if index_raw == "@" or index_raw == "*" then -- (`ia[@]=x`: no such element of an indexed array)
+		io.stderr:write("curse: " .. name .. "[" .. index_raw .. "]: bad array subscript\n")
+		error({ __curse_exit = 1, __curse_lineabort = true })
 	end
 	local sv = P.arith_cmd
 	P.arith_cmd = nil -- (a subscript's errors carry no command name: bash)
@@ -2877,8 +2890,12 @@ local function arrayassign_items(sh, st, isassoc)
 			-- bare: a genuine bare element, OR an indexed keyed element whose value
 			-- brace-expands (bash de-keys it — `[k]=` becomes literal in each bare word).
 			for _, bw in ipairs(e.brace_bare or { e.word }) do
-				for _, f in ipairs(expand_to_fields(sh, bw)) do
-					items[#items + 1] = { key = nil, op = "=", val = f }
+				if isassoc then -- (an assoc's key/value words: no splitting or globbing — bash)
+					items[#items + 1] = { key = nil, op = "=", val = expand_assign_word(sh, bw) }
+				else
+					for _, f in ipairs(expand_to_fields(sh, bw)) do
+						items[#items + 1] = { key = nil, op = "=", val = f }
+					end
 				end
 			end
 		end
@@ -2939,7 +2956,11 @@ local function do_arrayassign(sh, st)
 			end
 		else -- all-bare assoc: alternating key value pairs
 			for k = 1, #items, 2 do
-				sh:array_set(name, items[k].val, items[k + 1] and items[k + 1].val or "", false)
+				if items[k].val == "" then -- (an empty key: bash reports it and skips the pair)
+					io.stderr:write('curse: "": bad array subscript\n')
+				else
+					sh:array_set(name, items[k].val, items[k + 1] and items[k + 1].val or "", false)
+				end
 			end
 		end
 	else
@@ -2962,9 +2983,22 @@ local function do_arrayassign(sh, st)
 		end
 		for _, it in ipairs(items) do
 			if it.key ~= nil then
-				local idx = array_key(sh, name, it.key)
-				sh:array_set(name, idx, it.val, it.op == "+=") -- indexed += appends to CURRENT (unlike assoc)
-				auto = idx + 1
+				-- a bad element is reported (as written) and skipped; the rest still land
+				local src = "[" .. it.key .. "]" .. (it.op or "=") .. it.val
+				if it.key:match("^%s*$") then
+					io.stderr:write("curse: " .. src .. ": bad array subscript\n")
+				elseif it.key == "*" or it.key == "@" then
+					io.stderr:write("curse: " .. src .. ": cannot assign to non-numeric index\n")
+				else
+					local idx = array_key(sh, name, it.key)
+					-- (indexed += appends to CURRENT, unlike assoc; a negative index past the
+					-- start fails)
+					if sh:array_set(name, idx, it.val, it.op == "+=") then
+						auto = idx + 1
+					else
+						io.stderr:write("curse: " .. src .. ": bad array subscript\n")
+					end
+				end
 			else
 				sh:array_set(name, auto, it.val, false)
 				auto = auto + 1
@@ -3028,13 +3062,29 @@ local function decl_elems(sh, name, fmt)
 		local ks = tostring(k)
 		-- an assoc key with shell metacharacters (or control chars) is quoted like a value
 		-- (and a key that is just `@` or `*`: bash's ALL_ELEMENT_SUB check)
-		if assoc and (ks == "" or ks == "@" or ks == "*" or ks:find("[^%w_%%+,./:@%-]")) then
+		if assoc and (ks == "" or ks == "@" or ks == "*" or ks:find("[^%w_%%+,./:@=%-]")) then
 			ks = decl_quote(ks)
 		end
 		parts[#parts + 1] = fmt:format(ks, decl_quote(sh:array_get(name, k)))
 	end
 	return parts
 end
+-- A recoverable parse error (a bad `NAME=( … )` element): bash's syntax-error report — the
+-- token, then the line — but the script goes on (status 1)
+function M.report_recoverable(sh, perr)
+	if perr.line then
+		sh.cur_line = perr.line
+	end
+	local msg = tostring(perr.msg or "syntax error"):gsub("^syntax error near `", "syntax error near unexpected token `")
+	io.stderr:write("curse: " .. msg .. "\n")
+	if perr.text then
+		io.stderr:write("curse: `" .. perr.text .. "'\n")
+	end
+	sh.status = 1
+end
+-- the dynamic arrays bash lists among its variables (curse computes them on demand)
+local DYN_ARRAYS = { BASH_ARGC = 1, BASH_ARGV = 1, BASH_LINENO = 1, BASH_SOURCE = 1, DIRSTACK = 1, FUNCNAME = 1, GROUPS = 1 }
+M.DYN_ARRAYS = DYN_ARRAYS
 -- Format one variable as a `declare -p` line, or nil if it is unset.
 local function fmt_decl(sh, name)
 	-- SHELLOPTS/BASHOPTS are readonly, exported, derived specials with no var box.
@@ -3042,6 +3092,19 @@ local function fmt_decl(sh, name)
 		return "declare -r " .. name .. "=" .. decl_quote(sh:special_get(name))
 	end
 	local b = sh.vars[name]
+	if b == nil and DYN_ARRAYS[name] then -- (bash's dynamic arrays: FUNCNAME, BASH_SOURCE, …)
+		local vals, parts = sh:array_values(name), {}
+		if name == "DIRSTACK" and not (sh.dirstack and #sh.dirstack > 0) then
+			vals = {} -- (bash shows an unused stack as `()`, though ${DIRSTACK[0]} is the cwd)
+		end
+		for i, v in ipairs(vals) do
+			parts[i] = "[" .. (i - 1) .. "]=" .. decl_quote(v)
+		end
+		if #parts == 0 then -- (an empty FUNCNAME — outside any function — has no value at all)
+			return name == "FUNCNAME" and "declare -a FUNCNAME" or ("declare -a " .. name .. "=()")
+		end
+		return "declare -a " .. name .. "=(" .. table.concat(parts, " ") .. ")"
+	end
 	if b == nil then
 		return nil
 	end
@@ -4245,6 +4308,9 @@ end
 -- (unset expands the subscript itself) — protect their expansions with backslashes, which
 -- array_key's expansion then removes. Only after an unquoted `NAME[`; nil = not this form.
 local function unset_arrayref(sh, w)
+	if sh.shopt.assoc_expand_once then
+		return nil -- (unset takes the subscript literally then: nothing to protect)
+	end
 	local p1 = w.parts[1]
 	if not (p1 and p1.lit and not p1.q and p1.lit:match("^[%a_][%w_]*%[")) then
 		return nil
@@ -4472,7 +4538,7 @@ exec_stmt = function(sh, st, hook)
 			return
 		end
 		if st.index == "" then -- `a[]=v`: empty subscript is a bad array subscript (bash: status 1, no assign)
-			io.stderr:write("curse: `" .. st.name .. "[]': bad array subscript\n")
+			io.stderr:write("curse: " .. st.name .. "[]: bad array subscript\n")
 			sh.status = 1
 			return
 		end
@@ -5305,8 +5371,7 @@ exec_stmt = function(sh, st, hook)
 		-- (bash). This matches run_lazy's handling, so the compiled path (which reaches
 		-- a parse_error via delegation) behaves the same as the interpreter.
 		if st.recoverable then
-			io.stderr:write("curse: " .. (st.msg or "syntax error") .. "\n")
-			sh.status = 1
+			M.report_recoverable(sh, st)
 		else
 			-- Reached the unparseable tail (e.g. a makeself binary payload) — bash would
 			-- syntax-error here too. If an earlier exit fired, we never get here.
@@ -5527,7 +5592,9 @@ exec_stmt = function(sh, st, hook)
 		end
 		local subj = expand_word(sh, st.subject)
 		local fall = false -- carrying a `;&` fall-through into the next clause
-		sh.status = 0
+		-- a matching body still sees the PREVIOUS $? (bash); the case's status is its LAST
+		-- executed body's, 0 when that body is empty or nothing matched
+		local lastempty = true
 		for _, cl in ipairs(st.clauses) do
 			local matched = fall
 			if not matched then
@@ -5540,6 +5607,7 @@ exec_stmt = function(sh, st, hook)
 				end
 			end
 			if matched then
+				lastempty = #cl.body == 0
 				exec_list(sh, cl.body, hook, false)
 				if cl.term == "fall" then
 					fall = true -- ;& : run the next clause's body too
@@ -5549,6 +5617,9 @@ exec_stmt = function(sh, st, hook)
 					break
 				end -- ;; : done
 			end
+		end
+		if lastempty then
+			sh.status = 0
 		end
 	elseif t == "andor" then
 		-- run each pipeline, short-circuiting on the running exit status
@@ -6188,8 +6259,7 @@ function M.run_lazy(sh, src, hook)
 					-- reported but NON-fatal: the assignment is dropped (var stays unset) and the
 					-- script continues, like bash. Any other syntax error runs nothing + exits 2.
 					if lg.perr.recoverable then
-						io.stderr:write("curse: " .. (lg.perr.msg or "syntax error") .. "\n")
-						sh.status = 1
+						M.report_recoverable(sh, lg.perr)
 					else
 						exec_stmt(sh, lg.perr, hook)
 					end -- raises __curse_exit=2 (bash exits)

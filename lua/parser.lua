@@ -3619,6 +3619,14 @@ local function make_parser(src, sh, aenv, noalias, posix, line0)
 					end
 				elseif c == "" then
 					break
+				elseif c == "&" or c == ";" or c == "|" then
+					-- a control operator inside the list (`a=(x & y)`): bash's recoverable
+					-- syntax error at that token, which discards the rest of the LINE — later
+					-- lines of a multi-line literal then parse as ordinary commands (bash)
+					while i <= n and src:sub(i, i) ~= "\n" do
+						i = i + 1
+					end
+					error({ __curse_arraylit = true, tok = c })
 				elseif c == "(" then
 					-- an ELEMENT can't be `(` (a nested `()`, as in `a=( inside=() )`): bash
 					-- reports a syntax error but the assignment is NON-fatal (the var stays
@@ -3649,9 +3657,14 @@ local function make_parser(src, sh, aenv, noalias, posix, line0)
 							local ch = src:sub(k, k)
 							if ch == "\\" then
 								k = k + 2
-							elseif ch == "'" or ch == '"' then
-								local e = src:find(ch, k + 1, true)
-								k = (e or n) + 1
+							elseif ch == "'" then
+								k = (src:find("'", k + 1, true) or n) + 1
+							elseif ch == '"' then -- (a \" inside doesn't close it)
+								k = k + 1
+								while k <= n and src:sub(k, k) ~= '"' do
+									k = k + (src:sub(k, k) == "\\" and 2 or 1)
+								end
+								k = k + 1
 							elseif ch == "\n" then
 								break
 							else
@@ -3677,10 +3690,19 @@ local function make_parser(src, sh, aenv, noalias, posix, line0)
 					end
 					local keyraw, eop, rhs = nil, "=", w
 					if w:sub(1, 1) == "[" then
-						local depth, close = 0, nil
-						for j = 1, #w do
+						local depth, close, j = 0, nil, 1 -- (brackets inside quotes don't count)
+						while j <= #w do
 							local ch = w:sub(j, j)
-							if ch == "[" then
+							if ch == "\\" then
+								j = j + 1
+							elseif ch == "'" then
+								j = w:find("'", j + 1, true) or #w
+							elseif ch == '"' then
+								j = j + 1
+								while j <= #w and w:sub(j, j) ~= '"' do
+									j = j + (w:sub(j, j) == "\\" and 2 or 1)
+								end
+							elseif ch == "[" then
 								depth = depth + 1
 							elseif ch == "]" then
 								depth = depth - 1
@@ -3689,6 +3711,7 @@ local function make_parser(src, sh, aenv, noalias, posix, line0)
 									break
 								end
 							end
+							j = j + 1
 						end
 						if close then
 							local after = w:sub(close + 1)
@@ -4289,8 +4312,8 @@ local function make_parser(src, sh, aenv, noalias, posix, line0)
 					stmts = stmts,
 					perr = {
 						t = "parse_error",
-						line = startline,
-						msg = recover and "syntax error near `('" or tostring(st),
+						line = recover and line or startline, -- (a recoverable one: the token's line)
+						msg = recover and ("syntax error near `" .. (st.tok or "(") .. "'") or tostring(st),
 						recoverable = recover or nil,
 					},
 				}
