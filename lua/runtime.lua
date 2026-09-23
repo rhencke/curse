@@ -4542,11 +4542,27 @@ end
 
 -- Parse a bash-ish scalar string to int64 (leading integer, else 0). bash's
 -- real recursive/base rules come later; the arith-loop subset only needs this.
+-- A plain short decimal (1-15 digits, nothing else): exact as a double. A byte loop,
+-- not a pattern — LuaJIT compiles it (it doesn't compile string patterns).
+local function short_digits(s)
+	local n = #s
+	if n == 0 or n > 15 then
+		return false
+	end
+	for k = 1, n do
+		local c = s:byte(k)
+		if c < 48 or c > 57 then
+			return false
+		end
+	end
+	return true
+end
+M.short_digits = short_digits
 local function str_to_i64(s)
 	if s == nil or s == "" then
 		return i64(0)
 	end
-	if #s <= 15 and not s:find("[^0-9]") then -- (plain short decimal: exact as a double)
+	if short_digits(s) then
 		return i64(tonumber(s))
 	end
 	local sign, digits = s:match("^%s*([%-+]?)(%d+)")
@@ -4615,7 +4631,7 @@ local function arith_num(s)
 		return i64(0)
 	end
 	local c1 = s:byte(1)
-	if c1 >= 49 and c1 <= 57 and #s <= 15 and not s:find("[^0-9]") then -- plain decimal, no
+	if c1 >= 49 and c1 <= 57 and short_digits(s) then -- plain decimal, no
 		return i64(tonumber(s)) -- leading 0 (octal) — exact as a double; the common case
 	end
 	s = s:match("^%s*(.-)%s*$")
@@ -4711,6 +4727,10 @@ end
 
 -- int64 -> decimal string with no cdata "LL" suffix (what bash would print).
 local function i64_to_str(n)
+	local d = tonumber(n)
+	if d > -1e14 and d < 1e14 then -- (exact as a double, printed without an exponent)
+		return tostring(d)
+	end
 	return (tostring(n):gsub("LL$", ""))
 end
 M.i64_to_str = i64_to_str
@@ -10470,7 +10490,7 @@ end
 -- `test` numeric operands are plain DECIMAL integers (leading 0 is NOT octal; 0x/N#/arith
 -- rejected) — an invalid one is a syntax error.
 local function test_int(s)
-	if #s <= 15 and #s > 0 and not s:find("[^0-9]") then -- (plain decimal: leading 0 is
+	if short_digits(s) then -- (plain decimal: leading 0 is
 		return i64(tonumber(s)) -- still decimal for test)
 	end
 	local d = s:match("^%s*([+-]?%d+)%s*$")

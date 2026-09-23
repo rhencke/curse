@@ -420,7 +420,13 @@ elseif mode == "tiered" then
 	apply(sh)
 	sh.argv0 = script
 	setparams(sh)
-	T.run_background(script, { luajit = os.getenv("CURSE_LUAJIT") or "luajit", sh = sh })
+	-- the daemon's own path: interpret, and switch to compiled code where a loop turns
+	-- hot (compiled into the shared cache, so the next run starts compiled)
+	local f = assert(io.open(script, "r"))
+	local src = f:read("*a")
+	f:close()
+	T.run_tiered(src, sh)
+	pcall(T.flush_stores)
 else
 	local f = assert(io.open(script, "r"))
 	local src = f:read("*a")

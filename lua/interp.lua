@@ -1187,7 +1187,162 @@ end
 
 -- Expand ONE part to its string value (a multi-element @/* part is joined here;
 -- expand_to_fields treats those specially for word-splitting).
-local function expand_part_str(sh, p, assign)
+-- (the branches that make closures live in their own functions: a closure capturing
+-- `sh` would make every return of expand_part_str close an upvalue — NYI for the JIT,
+-- so the plain $var / literal paths could never compile)
+local expand_part_str -- (forward: the ${…} branch recurses into it)
+local function expand_procsub(sh, p)
+	-- <(cmd) / >(cmd): run cmd asynchronously on a pipe and substitute /dev/fd/N for
+	-- the shell's end of it (bash: 63, then 62, …) — a real pipe, so the data is read
+	-- once and a reader can start before the writer ends. The end stays open (and is
+	-- inherited) until the command it was expanded for finishes (drain_procsub).
+	-- (in-process: a background task — Shell:bg_launch — whose stdout/stdin is the
+	-- pipe's other end)
+	local pfd = ffi.new("int[2]")
+	if rt.pipe_hi(pfd) ~= 0 then -- (high: the job must not start with a copy of our end)
+		return "/dev/null"
+	end
+	local mine, theirs = pfd[p.dir == "<" and 0 or 1], pfd[p.dir == "<" and 1 or 0]
+	local body = p.procsub
+	local job = sh:bg_launch(function(ssh)
+		local stmts = P.parse(body).stmts
+		local s1 = #stmts == 1 and stmts[1]
+		if s1 and s1.t == "simple" and #(s1.words or {}) == 0 and s1.redirs and #s1.redirs == 1
+			and s1.redirs[1].op == "in" and not s1.assigns then
+			-- <(< file): the file's contents, like $(< file) (bash 5.2)
+			local path = M.expand_assign_word(ssh, P.parse_word(s1.redirs[1].target or ""))
+			local f = io.open(path, "rb")
+			if f then
+				ssh.out(f:read("*a") or "")
+				f:close()
+				ssh.status = 0
+			else
+				io.stderr:write("curse: " .. path .. ": No such file or directory\n")
+				ssh.status = 1
+			end
+			return
+		end
+		M.exec_list(ssh, stmts, NOHOOK, false)
+	end, "procsub", false, false, nil, nil,
+		{ fds = { [p.dir == "<" and 1 or 0] = theirs }, keepstdin = true, nojob = true })
+	C.close(theirs)
+	local fd = rt.fd_below(mine, 64)
+	rt.fd_owner[fd] = sh -- (only this shell's own spawns inherit it)
+	sh.procsub_files = sh.procsub_files or {}
+	sh.procsub_files[#sh.procsub_files + 1] = { fd = fd, pid = job and job.pid or 0, g = job and job.g }
+	return "/dev/fd/" .. fd
+end
+local function expand_pexp(sh, p, assign)
+	local pe = p.pexp
+	if pe.op == "badsubst" then -- ${x|html} and other unrecognized ${…} forms
+		if pe.fatal then
+			sherr(sh, "curse: ${" .. (pe.raw or pe.name or "") .. "}: bad substitution\n")
+			error({ __curse_exit = sh.opt_c and 127 or 1, __curse_lineabort = sh.opt_i or nil })
+		end
+		if pe.xform then -- ${x@Z}: nothing to transform on an unset x; else FATAL (bash)
+			local set
+			if pe.index then
+				local k, b = array_key(sh, pe.name, pe.index), sh.vars[sh:deref(pe.name)]
+				set = b and b.arr and b.arr[k] ~= nil or (not (b and b.arr) and k == 0 and rt.var_has_value(sh, pe.name))
+			else
+				set = rt.var_has_value(sh, pe.name)
+			end
+			if not set then
+				return ""
+			end
+			sherr(sh, "curse: ${" .. (pe.raw or pe.name or "") .. "}: bad substitution\n")
+			error({ __curse_exit = sh.opt_c and 127 or 1, __curse_lineabort = sh.opt_i or nil })
+		end
+		sherr(sh, "curse: ${" .. (pe.raw or pe.name or "") .. "}: bad substitution\n")
+		error({ __curse_exit = 1, __curse_lineabort = true }) -- discards the rest of the line (bash)
+	end
+	if pe.op == "@" and pe.arg == "P" then -- ${x@P}: decode prompt escapes, then expand
+		return M.prompt_string(sh, sh:get_u(pe.name)) -- get_u: honor set -u
+	end
+	-- ${ref OP…} through a nameref to an ELEMENT (`declare -n f='a[1]'`) operates on
+	-- that element, not the base's [0]: retarget the expansion at it
+	local rb = not pe.index and pe.op ~= "indirect" and pe.op ~= "len" and type(pe.name) == "string" and sh.vars[pe.name]
+	local et = rb and rb.ref and sh:deref_elem(pe.name)
+	if et then
+		local eb, esub = et:match("^([%a_][%w_]*)%[(.+)%]$")
+		if eb then
+			pe = setmetatable({ name = eb, index = esub }, { __index = pe })
+		end
+	end
+	if pe.op == "indirect" then -- ${!ref} / ${!ref OP}: resolve the name, then expand it
+		local ip = indirect_part(sh, pe)
+		if not ip then
+			return ""
+		end
+		ip.q = p.q
+		return expand_part_str(sh, ip)
+	end
+	if (pe.index == "*" or pe.name == "*") and pe.op ~= "prefix" and pe.op ~= "indices" and pe.op ~= "len" then
+		-- ${a[*]OP} / ${*OP} in a scalar context (assignment RHS, case word) joins its
+		-- (per-element transformed) values with IFS[0], like "$*" (bash)
+		local els = multi_elems(sh, p)
+		return table.concat(els, rt.ifs_sep(sh))
+	end
+	local subkey
+	if pe.index and pe.index ~= "@" and pe.index ~= "*" then
+		subkey = array_key(sh, pe.name, pe.index)
+		if type(subkey) == "number" and subkey < 0 and pe.op ~= "len" then
+			rt.elem_read_check(sh, pe.name, subkey)
+		end
+	end
+	-- pattern-context ops (strip #/##/%/%%, subst /,//) treat quoted metachars
+	-- literally; everything else (defaults :-/-, etc.) is an ordinary value.
+	local patmode = pe.op == "/"
+		or pe.op == "//"
+		or pe.op == "#"
+		or pe.op == "##"
+		or pe.op == "%"
+		or pe.op == "%%"
+		or pe.op == "^"
+		or pe.op == "^^"
+		or pe.op == ","
+		or pe.op == ",," -- case-fold pattern
+	-- The word for -/:-/+/:+/=/:=/?/:? is only expanded WHEN USED (bash: a default
+	-- with side effects like $((i++)) runs only if the branch is taken). Pass a thunk.
+	-- (TESTOP is a module-level constant.)
+	-- When the ${…} is inside double quotes, its default/alternate word follows
+	-- double-quoted rules: single quotes are literal and a backslash is kept
+	-- except before $ ` " \ (parse_heredoc has exactly these semantics). An inner
+	-- double quote is syntactic (part of the outer quote), so `"${x:-"a b"}"`
+	-- yields `a b` — strip the unescaped `"` before the heredoc-style parse.
+	local function pw(txt)
+		if not p.q then
+			return P.parse_word(txt)
+		end
+		return P.parse_default_quoted(txt, pe.hd)
+	end
+	local arg
+	if TESTOP[pe.op] then
+		-- In an assignment RHS the default word gets the after-`:` tilde rule too
+		-- (`x=${undef-~:~}` -> HOME:HOME), so use the assignment-aware expander.
+		arg = pe.arg and pe.arg ~= "" and function() -- (no word: nil, for ${x?}'s own message)
+			if assign then
+				return expand_assign_word(sh, pw(pe.arg))
+			end
+			return expand_word(sh, pw(pe.arg), true)
+		end or nil
+	else
+		arg = pe.arg and (patmode and expand_pattern or expand_word)(sh, P.parse_word(pe.arg), true) or nil
+	end
+	local arg2 = pe.arg2 and pe.op ~= "sub" and expand_repl(sh, P.parse_word(pe.arg2)) or nil
+	if pe.op == "sub" then -- ${v:off:len}: offset/length are arithmetic expressions,
+		-- expanded the arithmetic way (bash: `${s:A[$k]}` quotes $k inside the subscript)
+		arg = pe.arg and tostring(rt.substr_arith(sh, rt.pe_label(pe), arith_expand_text(sh, pe.arg)) or 0) or nil
+		arg2 = pe.arg2 and tostring(rt.substr_arith(sh, rt.pe_label(pe), arith_expand_text(sh, pe.arg2)) or 0) or nil
+	elseif not TESTOP[pe.op] then
+		-- a word-initial ~ in a pattern / replacement expands (${p//~/z}, ${p#~/x})
+		if type(arg) == "string" then
+			arg = tilde_prefix(sh, arg)
+		end
+	end
+	return sh:expand_param(pe, arg, arg2, subkey)
+end
+expand_part_str = function(sh, p, assign)
 	if p.lit ~= nil then
 		return p.lit
 	elseif p.var then
@@ -1259,156 +1414,11 @@ local function expand_part_str(sh, p, assign)
 		end
 		return rt.i64_to_str(eval(sh, p.arith_ast))
 	elseif p.procsub then
-		-- <(cmd) / >(cmd): run cmd asynchronously on a pipe and substitute /dev/fd/N for
-		-- the shell's end of it (bash: 63, then 62, …) — a real pipe, so the data is read
-		-- once and a reader can start before the writer ends. The end stays open (and is
-		-- inherited) until the command it was expanded for finishes (drain_procsub).
-		-- (in-process: a background task — Shell:bg_launch — whose stdout/stdin is the
-		-- pipe's other end)
-		local pfd = ffi.new("int[2]")
-		if rt.pipe_hi(pfd) ~= 0 then -- (high: the job must not start with a copy of our end)
-			return "/dev/null"
-		end
-		local mine, theirs = pfd[p.dir == "<" and 0 or 1], pfd[p.dir == "<" and 1 or 0]
-		local body = p.procsub
-		local job = sh:bg_launch(function(ssh)
-			local stmts = P.parse(body).stmts
-			local s1 = #stmts == 1 and stmts[1]
-			if s1 and s1.t == "simple" and #(s1.words or {}) == 0 and s1.redirs and #s1.redirs == 1
-				and s1.redirs[1].op == "in" and not s1.assigns then
-				-- <(< file): the file's contents, like $(< file) (bash 5.2)
-				local path = M.expand_assign_word(ssh, P.parse_word(s1.redirs[1].target or ""))
-				local f = io.open(path, "rb")
-				if f then
-					ssh.out(f:read("*a") or "")
-					f:close()
-					ssh.status = 0
-				else
-					io.stderr:write("curse: " .. path .. ": No such file or directory\n")
-					ssh.status = 1
-				end
-				return
-			end
-			M.exec_list(ssh, stmts, NOHOOK, false)
-		end, "procsub", false, false, nil, nil,
-			{ fds = { [p.dir == "<" and 1 or 0] = theirs }, keepstdin = true, nojob = true })
-		C.close(theirs)
-		local fd = rt.fd_below(mine, 64)
-		rt.fd_owner[fd] = sh -- (only this shell's own spawns inherit it)
-		sh.procsub_files = sh.procsub_files or {}
-		sh.procsub_files[#sh.procsub_files + 1] = { fd = fd, pid = job and job.pid or 0, g = job and job.g }
-		return "/dev/fd/" .. fd
+		return expand_procsub(sh, p)
 	elseif p.cmdsub then
 		return sh:capture_src(p.cmdsub, p.backtick, p.noalias)
 	elseif p.pexp then
-		local pe = p.pexp
-		if pe.op == "badsubst" then -- ${x|html} and other unrecognized ${…} forms
-			if pe.fatal then
-				sherr(sh, "curse: ${" .. (pe.raw or pe.name or "") .. "}: bad substitution\n")
-				error({ __curse_exit = sh.opt_c and 127 or 1, __curse_lineabort = sh.opt_i or nil })
-			end
-			if pe.xform then -- ${x@Z}: nothing to transform on an unset x; else FATAL (bash)
-				local set
-				if pe.index then
-					local k, b = array_key(sh, pe.name, pe.index), sh.vars[sh:deref(pe.name)]
-					set = b and b.arr and b.arr[k] ~= nil or (not (b and b.arr) and k == 0 and rt.var_has_value(sh, pe.name))
-				else
-					set = rt.var_has_value(sh, pe.name)
-				end
-				if not set then
-					return ""
-				end
-				sherr(sh, "curse: ${" .. (pe.raw or pe.name or "") .. "}: bad substitution\n")
-				error({ __curse_exit = sh.opt_c and 127 or 1, __curse_lineabort = sh.opt_i or nil })
-			end
-			sherr(sh, "curse: ${" .. (pe.raw or pe.name or "") .. "}: bad substitution\n")
-			error({ __curse_exit = 1, __curse_lineabort = true }) -- discards the rest of the line (bash)
-		end
-		if pe.op == "@" and pe.arg == "P" then -- ${x@P}: decode prompt escapes, then expand
-			return M.prompt_string(sh, sh:get_u(pe.name)) -- get_u: honor set -u
-		end
-		-- ${ref OP…} through a nameref to an ELEMENT (`declare -n f='a[1]'`) operates on
-		-- that element, not the base's [0]: retarget the expansion at it
-		local rb = not pe.index and pe.op ~= "indirect" and pe.op ~= "len" and type(pe.name) == "string" and sh.vars[pe.name]
-		local et = rb and rb.ref and sh:deref_elem(pe.name)
-		if et then
-			local eb, esub = et:match("^([%a_][%w_]*)%[(.+)%]$")
-			if eb then
-				pe = setmetatable({ name = eb, index = esub }, { __index = pe })
-			end
-		end
-		if pe.op == "indirect" then -- ${!ref} / ${!ref OP}: resolve the name, then expand it
-			local ip = indirect_part(sh, pe)
-			if not ip then
-				return ""
-			end
-			ip.q = p.q
-			return expand_part_str(sh, ip)
-		end
-		if (pe.index == "*" or pe.name == "*") and pe.op ~= "prefix" and pe.op ~= "indices" and pe.op ~= "len" then
-			-- ${a[*]OP} / ${*OP} in a scalar context (assignment RHS, case word) joins its
-			-- (per-element transformed) values with IFS[0], like "$*" (bash)
-			local els = multi_elems(sh, p)
-			return table.concat(els, rt.ifs_sep(sh))
-		end
-		local subkey
-		if pe.index and pe.index ~= "@" and pe.index ~= "*" then
-			subkey = array_key(sh, pe.name, pe.index)
-			if type(subkey) == "number" and subkey < 0 and pe.op ~= "len" then
-				rt.elem_read_check(sh, pe.name, subkey)
-			end
-		end
-		-- pattern-context ops (strip #/##/%/%%, subst /,//) treat quoted metachars
-		-- literally; everything else (defaults :-/-, etc.) is an ordinary value.
-		local patmode = pe.op == "/"
-			or pe.op == "//"
-			or pe.op == "#"
-			or pe.op == "##"
-			or pe.op == "%"
-			or pe.op == "%%"
-			or pe.op == "^"
-			or pe.op == "^^"
-			or pe.op == ","
-			or pe.op == ",," -- case-fold pattern
-		-- The word for -/:-/+/:+/=/:=/?/:? is only expanded WHEN USED (bash: a default
-		-- with side effects like $((i++)) runs only if the branch is taken). Pass a thunk.
-		-- (TESTOP is a module-level constant.)
-		-- When the ${…} is inside double quotes, its default/alternate word follows
-		-- double-quoted rules: single quotes are literal and a backslash is kept
-		-- except before $ ` " \ (parse_heredoc has exactly these semantics). An inner
-		-- double quote is syntactic (part of the outer quote), so `"${x:-"a b"}"`
-		-- yields `a b` — strip the unescaped `"` before the heredoc-style parse.
-		local function pw(txt)
-			if not p.q then
-				return P.parse_word(txt)
-			end
-			return P.parse_default_quoted(txt, pe.hd)
-		end
-		local arg
-		if TESTOP[pe.op] then
-			-- In an assignment RHS the default word gets the after-`:` tilde rule too
-			-- (`x=${undef-~:~}` -> HOME:HOME), so use the assignment-aware expander.
-			arg = pe.arg and pe.arg ~= "" and function() -- (no word: nil, for ${x?}'s own message)
-				if assign then
-					return expand_assign_word(sh, pw(pe.arg))
-				end
-				return expand_word(sh, pw(pe.arg), true)
-			end or nil
-		else
-			arg = pe.arg and (patmode and expand_pattern or expand_word)(sh, P.parse_word(pe.arg), true) or nil
-		end
-		local arg2 = pe.arg2 and pe.op ~= "sub" and expand_repl(sh, P.parse_word(pe.arg2)) or nil
-		if pe.op == "sub" then -- ${v:off:len}: offset/length are arithmetic expressions,
-			-- expanded the arithmetic way (bash: `${s:A[$k]}` quotes $k inside the subscript)
-			arg = pe.arg and tostring(rt.substr_arith(sh, rt.pe_label(pe), arith_expand_text(sh, pe.arg)) or 0) or nil
-			arg2 = pe.arg2 and tostring(rt.substr_arith(sh, rt.pe_label(pe), arith_expand_text(sh, pe.arg2)) or 0) or nil
-		elseif not TESTOP[pe.op] then
-			-- a word-initial ~ in a pattern / replacement expands (${p//~/z}, ${p#~/x})
-			if type(arg) == "string" then
-				arg = tilde_prefix(sh, arg)
-			end
-		end
-		return sh:expand_param(pe, arg, arg2, subkey)
+		return expand_pexp(sh, p, assign)
 	end
 	return ""
 end
@@ -1951,8 +1961,21 @@ end
 -- bash glob_pattern_p on a plain (already-expanded) string: `*`/`?` always
 -- active, `[` only with a later `]`. Conservative — never reports inactive for a
 -- real glob — so the caller may safely skip pathname expansion when it's false.
+local GLOB_CH = { [42] = true, [63] = true, [91] = true, [43] = true, [64] = true, [33] = true } -- * ? [ + @ !
 local function str_glob_active(s)
-	if not s:find("[*?%[+@!]") then -- (the common word: no glob character at all)
+	local n = #s
+	if n <= 32 then -- (the common word: no glob character at all — a byte loop the JIT
+		local any = false -- compiles; a pattern it doesn't)
+		for k = 1, n do
+			if GLOB_CH[s:byte(k)] then
+				any = true
+				break
+			end
+		end
+		if not any then
+			return false
+		end
+	elseif not s:find("[*?%[+@!]") then
 		return false
 	end
 	local open = false
@@ -1975,6 +1998,9 @@ local function str_glob_active(s)
 	return false
 end
 
+local expand_fields_full -- (the general path, below: the fast paths stay in a function
+-- with no closures, so the JIT can compile them — a closure over `sh` would make every
+-- return close an upvalue, NYI)
 local function expand_to_fields(sh, w)
 	-- Fast path: a single literal part — the common shape of command words (`[`,
 	-- operators, numbers, most argv). No expansion, no IFS split, and (when it has
@@ -1992,8 +2018,27 @@ local function expand_to_fields(sh, w)
 			if not s:find("~", 1, true) and (sh.opt_f or not str_glob_active(s)) then
 				return { s }
 			end
+		elseif p.var and not p.q then
+			-- ...and a lone unquoted `$name` of a plain set scalar (`[ $i -lt $n ]`): no
+			-- default-IFS whitespace and no active glob -> one field, as is. (Anything else
+			-- takes the full path; re-reading a plain variable there has no side effects.)
+			local b = sh.vars[p.var]
+			if b and not b.ref and not b.arr and not b.outer and (b.s ~= nil or b.n ~= nil) then
+				local s = sh:get(p.var)
+				if s == "" then
+					return {}
+				end
+				local ifs = rt.ifs(sh)
+				if (ifs == nil or ifs == " \t\n") and not s:find("[ \t\n]")
+					and (sh.opt_f or not str_glob_active(s)) then
+					return { s }
+				end
+			end
 		end
 	end
+	return expand_fields_full(sh, w)
+end
+expand_fields_full = function(sh, w)
 	-- Concatenate-then-split model: build the word left to right, splitting the
 	-- chars that came from UNQUOTED expansions on $IFS (default: space/tab/newline),
 	-- while literal/quoted chars are never delimiters. This is what bash does, and
@@ -4700,6 +4745,65 @@ local function wall_secs()
 end
 
 local exec_stmt
+-- A variable assignment's store (exec_stmt runs it under pcall): module-level, not
+-- per-statement closures — closure creation is NYI for the JIT, and every `x=…` in a
+-- loop made three. The expanded right-hand side is kept in sh.x_rhs (set -x).
+local function assign_rhs_a(sh, st)
+	sh.x_rhs = expand_assign_word(sh, st.rhs)
+	return sh.x_rhs
+end
+local function assign_rhs_w(sh, st)
+	sh.x_rhs = expand_word(sh, st.rhs)
+	return sh.x_rhs
+end
+local function assign_body(sh, st, nref_base, nref_sub)
+	if nref_base then
+		sh:array_set(
+			nref_base,
+			array_key(sh, nref_base, nref_sub),
+			assign_rhs_a(sh, st),
+			st.append
+		)
+	elseif st.index then
+		if
+			not sh:array_set(
+				st.name,
+				array_key(sh, st.name, st.index),
+				assign_rhs_a(sh, st),
+				st.append
+			)
+		then
+			error({ __curse_badsub = true })
+		end
+	elseif st.arith then
+		sh:aset(st.name, eval(sh, st.arith))
+	elseif st.append then
+		local b = sh.vars[sh:deref(st.name)]
+		if b and b.arr then -- `name+=value` on an array appends to element 0 (bash)
+			sh:array_set(st.name, array_key(sh, st.name, "0"), assign_rhs_a(sh, st), true)
+		elseif b and b.int then -- integer var: += is arithmetic addition (the old value
+			-- is itself evaluated: `b=4+1; typeset -i b; b+=37` is 42 — bash)
+			sh:aset(st.name, rt.arith_str(sh, sh:get(st.name)) + M.arith_eval_str(sh, assign_rhs_w(sh, st)))
+		elseif b and (b.lower or b.upper) then -- declare -l/-u: case-fold the appended result
+			local v = sh:get(st.name) .. assign_rhs_a(sh, st)
+			sh:set_str(st.name, b.lower and v:lower() or v:upper())
+		else
+			sh:set_str(st.name, sh:get(st.name) .. assign_rhs_a(sh, st))
+		end
+	else
+		local b = sh.vars[sh:deref(st.name)]
+		if b and b.arr then -- plain `name=value` on an array var writes element 0 (bash)
+			sh:array_set(st.name, array_key(sh, st.name, "0"), assign_rhs_a(sh, st), false)
+		elseif b and b.int and not b.ref then -- integer var (declare -i): assign arith-evaluates
+			sh:aset(st.name, M.arith_eval_str(sh, assign_rhs_w(sh, st)))
+		elseif b and (b.lower or b.upper) then -- declare -l/-u: case-fold on assign
+			local v = assign_rhs_a(sh, st)
+			sh:set_str(st.name, b.lower and v:lower() or v:upper())
+		elseif sh:set_str(st.name, assign_rhs_a(sh, st)) == false and not sh.applying_prefix then
+			error({ __curse_exit = 1, __curse_lineabort = true }) -- (a bad nameref target)
+		end
+	end
+end
 exec_stmt = function(sh, st, hook)
 	local t = st.t
 	if t == "noop" then -- (a command that alias-expanded to a comment)
@@ -4882,62 +4986,7 @@ exec_stmt = function(sh, st, hook)
 			-- like a bad-subst in a command word. Catch it around the RHS expansion.
 			-- (the expanded right-hand side, kept for set -x's `name+=value` trace)
 			sh.x_rhs = nil
-			local function rhs_a()
-				sh.x_rhs = expand_assign_word(sh, st.rhs)
-				return sh.x_rhs
-			end
-			local function rhs_w()
-				sh.x_rhs = expand_word(sh, st.rhs)
-				return sh.x_rhs
-			end
-			local aok, aerr = pcall(function()
-				if nref_base then
-					sh:array_set(
-						nref_base,
-						array_key(sh, nref_base, nref_sub),
-						rhs_a(),
-						st.append
-					)
-				elseif st.index then
-					if
-						not sh:array_set(
-							st.name,
-							array_key(sh, st.name, st.index),
-							rhs_a(),
-							st.append
-						)
-					then
-						error({ __curse_badsub = true })
-					end
-				elseif st.arith then
-					sh:aset(st.name, eval(sh, st.arith))
-				elseif st.append then
-					local b = sh.vars[sh:deref(st.name)]
-					if b and b.arr then -- `name+=value` on an array appends to element 0 (bash)
-						sh:array_set(st.name, array_key(sh, st.name, "0"), rhs_a(), true)
-					elseif b and b.int then -- integer var: += is arithmetic addition (the old value
-						-- is itself evaluated: `b=4+1; typeset -i b; b+=37` is 42 — bash)
-						sh:aset(st.name, rt.arith_str(sh, sh:get(st.name)) + M.arith_eval_str(sh, rhs_w()))
-					elseif b and (b.lower or b.upper) then -- declare -l/-u: case-fold the appended result
-						local v = sh:get(st.name) .. rhs_a()
-						sh:set_str(st.name, b.lower and v:lower() or v:upper())
-					else
-						sh:set_str(st.name, sh:get(st.name) .. rhs_a())
-					end
-				else
-					local b = sh.vars[sh:deref(st.name)]
-					if b and b.arr then -- plain `name=value` on an array var writes element 0 (bash)
-						sh:array_set(st.name, array_key(sh, st.name, "0"), rhs_a(), false)
-					elseif b and b.int and not b.ref then -- integer var (declare -i): assign arith-evaluates
-						sh:aset(st.name, M.arith_eval_str(sh, rhs_w()))
-					elseif b and (b.lower or b.upper) then -- declare -l/-u: case-fold on assign
-						local v = rhs_a()
-						sh:set_str(st.name, b.lower and v:lower() or v:upper())
-					elseif sh:set_str(st.name, rhs_a()) == false and not sh.applying_prefix then
-						error({ __curse_exit = 1, __curse_lineabort = true }) -- (a bad nameref target)
-					end
-				end
-			end)
+			local aok, aerr = pcall(assign_body, sh, st, nref_base, nref_sub)
 			if not aok then
 				if type(aerr) == "table" and aerr.__curse_badsub then -- (`c[-5]=v`: aborts the line)
 					io.stderr:write("curse: " .. st.name .. "[" .. tostring(st.index) .. "]: bad array subscript\n")

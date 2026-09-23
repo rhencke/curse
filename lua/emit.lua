@@ -4353,7 +4353,7 @@ simple_compiled = function(cx, st, after)
 			(cmd == "declare" or cmd == "typeset" or cmd == "local")
 			and not (cmd == "local" and cx.toplevel) -- `local` outside a function is an error (interp)
 			and not st.assigns
-			and not redir_apply
+			and not (st.redirs and #st.redirs > 0) -- (a redirected one takes the general path)
 			and #aa == 1
 			and flagsok
 			and arrayassign_ok({ name = aa[1].name, append = aa[1].append, elems = aa[1].elems }, cx.lifted, true)
