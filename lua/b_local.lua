@@ -27,7 +27,7 @@ return function(sh, cmd, args, hook, tcb)
 		-- nameref (-n), indexed (-a) and associative (-A) attributes.
 		local nref, assoc, plusn, rest, lok = false, false, false, {}, true
 		local iattr, lattr, uattr, aattr, rattr = false, false, false, false, false
-		local inherit, pflag = false, false
+		local inherit, pflag, tattr = false, false, false
 		for j = 2, #args do -- (bash's option pass first: a bad letter rejects the lot)
 			local a = args[j]
 			if a == "--" or not a:match("^[-+].") then
@@ -90,6 +90,9 @@ return function(sh, cmd, args, hook, tcb)
 				if a:find("r") then
 					rattr = true
 				end
+				if a:find("t") then
+					tattr = true
+				end
 				if a:find("p") then
 					pflag = true
 				end
@@ -104,7 +107,7 @@ return function(sh, cmd, args, hook, tcb)
 				rest[#rest + 1] = a
 			end
 		end
-		local attrs = nref or assoc or plusn or iattr or lattr or uattr or aattr or rattr
+		local attrs = nref or assoc or plusn or iattr or lattr or uattr or aattr or rattr or tattr
 		if pflag and #rest > 0 and not attrs then -- `local -p NAME…`: those of this frame's locals
 			local saved = sh.savedstack[sh.pd]
 			for _, nm in ipairs(rest) do
@@ -217,6 +220,9 @@ return function(sh, cmd, args, hook, tcb)
 						b.lower = lattr or b.lower
 						b.upper = uattr or b.upper
 						sh.vars[vname] = b
+					end
+					if tattr and sh.vars[vname] then
+						sh.vars[vname].trace = true
 					end
 					if rattr then
 						local b = sh.vars[sh:deref(vname)]

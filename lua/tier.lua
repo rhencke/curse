@@ -315,7 +315,7 @@ function M.run_background(script_path, opts)
 
 	local out = os.tmpname() .. ".curse.lua"
 	os.remove(out)
-	os.execute(("%s lua/transpile.lua %q %q >/dev/null 2>&1 &"):format(luajit, script_path, out))
+	local tpid = rt.spawn_internal({ luajit, "lua/transpile.lua", script_path, out })
 
 	local poll_every = opts.poll_every or 4096
 	local count, resume, mod = 0, nil, nil
@@ -339,6 +339,7 @@ function M.run_background(script_path, opts)
 			end
 			cf:close()
 			mod = assert(loadfile(out))() -- fully written (atomic rename)
+			rt.reap_internal(tpid)
 		end
 		-- OSR only where THIS context has a resume pc: the top level, or a forked child
 		-- (subshell) into its OWN bounded fragment. A delegated context has no pc, so
@@ -360,6 +361,7 @@ function M.run_background(script_path, opts)
 
 	local ok, err = pcall(I.run_lazy, sh, src, hook)
 	os.remove(out)
+	rt.reap_internal(tpid)
 	if ok then
 		return sh, "interp-only", count
 	end

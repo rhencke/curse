@@ -2580,6 +2580,39 @@ end
 -- process at all. Returns false (caller forks instead) when it can't reproduce the
 -- forked child exactly: unresolvable name (the child prints the error), a no-shebang
 -- script, or xtrace (the child traces).
+-- The shell's OWN helper processes (the tiered driver's background transpiler): spawned
+-- directly (never through /bin/sh), output to /dev/null, and marked so `wait`/`wait -n`
+-- — which reap with waitpid(-1) — skip them rather than mistake one for a job.
+M.internal_pids = {}
+function M.spawn_internal(argv_t)
+	local n = #argv_t
+	local argv = ffi.new("const char*[?]", n + 1)
+	for i = 1, n do
+		argv[i - 1] = argv_t[i]
+	end
+	argv[n] = nil
+	local fa = ffi.new("uint8_t[1024]")
+	C.posix_spawn_file_actions_init(fa)
+	C.posix_spawn_file_actions_addopen(fa, 0, "/dev/null", 0, 0)
+	C.posix_spawn_file_actions_addopen(fa, 1, "/dev/null", 1, 0)
+	C.posix_spawn_file_actions_addopen(fa, 2, "/dev/null", 1, 0)
+	local pidp = ffi.new("curse_pid_t[1]")
+	local rc = C.posix_spawnp(pidp, argv_t[1], fa, nil, ffi.cast("char *const *", argv), C.environ)
+	C.posix_spawn_file_actions_destroy(fa)
+	if rc ~= 0 then
+		return nil
+	end
+	local pid = tonumber(pidp[0])
+	M.internal_pids[pid] = true
+	return pid
+end
+-- reap an internal helper if it has finished (never blocks)
+function M.reap_internal(pid)
+	if pid and M.internal_pids[pid] and C.waitpid(pid, nil, 1) == pid then -- (WNOHANG)
+		M.internal_pids[pid] = nil
+	end
+end
+
 function Shell:spawn_bg(args, cmdstr)
 	M.need_process(self) -- in an in-process subshell the job must be the subshell's child
 	local n = #args
@@ -4299,6 +4332,9 @@ function Shell:attr_string(name)
 	end
 	if b.ro then
 		s = s .. "r"
+	end
+	if b.trace then
+		s = s .. "t"
 	end
 	if b.exported then
 		s = s .. "x"

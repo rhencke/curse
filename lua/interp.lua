@@ -621,6 +621,7 @@ end
 -- the entry from sh.sigtraps (which drives firing) and unblock the signal. A
 -- signal set to be ignored (`trap '' SIG`) keeps both its ignore disposition and
 -- its display.
+local function NOHOOK() end -- (an OSR hook that never switches)
 local function reset_child_sigtraps(sh)
 	if not sh.sigtraps then
 		return
@@ -3273,6 +3274,7 @@ local function fmt_decl(sh, name)
 		-- upper (verified: `declare -irx` -> `declare -irx`, `declare -xl` -> `declare -xl`).
 		local a = (b.int and "i" or "")
 			.. (b.ro and "r" or "")
+			.. (b.trace and "t" or "")
 			.. (b.exported and "x" or "") -- (the attribute: an unexported local may shadow an env value)
 			.. (b.lower and "l" or "")
 			.. (b.upper and "u" or "")
@@ -5677,70 +5679,30 @@ exec_stmt = function(sh, st, hook)
 		-- st.redirs is already detached.
 		exec_list(sh, st.body, hook, false)
 	elseif t == "subshell" then
-		-- ( list ) runs in a forked child: env/var changes don't escape, like bash
-		io.flush() -- flush parent stdio so the fork doesn't duplicate buffered output
-		-- Inside a $(…) capture, the child's stdout must reach the capture buffer, not
-		-- the real fd 1 (a forked subshell would otherwise LEAK past the in-process
-		-- capture) — route it through a pipe the parent drains into sh.out. A stdout
-		-- redirect in the body still overrides fd 1 in the child (pipe drains empty).
-		local cap = sh.capturing and true
-		local pfd
-		if cap then
-			pfd = ffi.new("int[2]")
-			if rt.pipe_hi(pfd) ~= 0 then
-				cap = false
-			end
-		end
-		local pid = rt.fork()
-		if pid == 0 then
-			if cap then
-				C.close(pfd[0])
-				C.dup2(pfd[1], 1)
-				C.close(pfd[1])
-			end
-			reset_child_sigtraps(sh) -- caught signal traps revert to default in a subshell
-			sh.in_subprogram = (sh.in_subprogram or 0) + 1 -- ERR trap won't fire here (sans errtrace)
-			sh.loopdepth = 0 -- a loop enclosing this subshell isn't ours to break/continue
-			local ok, err = pcall(function()
-				if st.redirs then
-					if st.top and st.redirs[1].line and not (sh.in_trap and sh.in_trap > 0) then
-						sh.cur_line = st.redirs[1].line
-					end
-					local _, rok = apply_redirs(sh, st.redirs)
-					if rok == false then -- (a failed redirect: the body never runs, status 1)
-						sh.status = 1
-						return
-					end
+		-- ( list ) runs IN-PROCESS: rt.subshell_run checkpoints what a fork would isolate
+		-- (vars, params, functions, cwd, …) and restores it after. (A no-op OSR hook inside:
+		-- a switch into compiled code mustn't unwind past the checkpoint.)
+		local saves
+		local ok, err = pcall(sh.subshell_run, sh, function(sh)
+			if st.redirs then
+				if st.top and st.redirs[1].line and not (sh.in_trap and sh.in_trap > 0) then
+					sh.cur_line = st.redirs[1].line
 				end
-				sh.out = io.write
-				exec_list(sh, st.body, hook, false)
-			end)
-			-- Tiered handoff INSIDE the child: the compiled artifact is ready, so this
-			-- child OSRs into its OWN bounded fragment (the subshell's compiled sub-CFG,
-			-- which _exits at the boundary) instead of interpreting the rest. The child
-			-- honors interp/bg-compile/OSR like any code — it just jumps to the right pc.
-			if not ok and type(err) == "table" and err.__curse_switch then
-				err.osr()
-			end
-			child_status(sh, ok, err)
-			rt.child_exit(sh, sh.status or 0) -- its own EXIT trap, flush, _exit
-		end
-		if cap then -- parent: drain the child's stdout into the capture buffer, then reap
-			C.close(pfd[1])
-			local rbuf = ffi.new("char[8192]")
-			while true do
-				rt.co_block(pfd[0], 1)
-				local nr = tonumber(C.read(pfd[0], rbuf, 8192))
-				if not nr or nr <= 0 then
-					break
+				local sv, rok = apply_redirs(sh, st.redirs)
+				saves = sv
+				if rok == false then -- (a failed redirect: the body never runs, status 1)
+					sh.status = 1
+					return
 				end
-				sh.out(ffi.string(rbuf, nr))
 			end
-			C.close(pfd[0])
+			exec_list(sh, st.body, NOHOOK, false)
+		end)
+		if saves then
+			restore_redirs(saves)
 		end
-		local stbuf = ffi.new("int[1]")
-		rt.wait_child(pid, stbuf, 0)
-		sh.status = rt.wexit(stbuf[0])
+		if not ok then
+			error(err, 0)
+		end
 	elseif t == "background" then
 		-- cmd & : fork, run in the child; parent records $! and continues (status 0).
 		rt.need_process(sh) -- in an in-process subshell, the job must be the subshell's child

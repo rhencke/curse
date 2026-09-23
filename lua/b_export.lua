@@ -298,7 +298,7 @@ return function(sh, cmd, args, hook, tcb)
 									.. (sh.func_file and sh.func_file[nm] or "")
 							)
 						else
-							sh:echo(named and nm or fdecl(nm))
+							sh:echo((named and not printmode) and nm or fdecl(nm))
 						end
 					end
 				else
@@ -509,7 +509,11 @@ return function(sh, cmd, args, hook, tcb)
 						else
 							sh:aset(nm, M.arith_eval_str(sh, val))
 						end
-						sh.vars[sh:deref(nm)].int = true -- (through a nameref: its target)
+						local ib = sh.vars[sh:deref(nm)] -- (through a nameref: its target)
+						ib.int = true
+						if lattr or uattr or cattr then -- (`declare -il`: both shown)
+							ib.lower, ib.upper, ib.cap = lattr or nil, uattr or nil, cattr or nil
+						end
 					elseif lattr or uattr or cattr then -- declare -l/-u/-c: case attribute (set_str folds)
 						sh.vars[nm] = sh.vars[nm] or {}
 						sh.vars[nm].lower = lattr or nil
@@ -621,6 +625,10 @@ return function(sh, cmd, args, hook, tcb)
 						local dn = sh:deref(a) -- (through a nameref: the target, created if need be)
 						sh.vars[dn] = sh.vars[dn] or {}
 						sh.vars[dn].int = true
+						if lattr or uattr or cattr then
+							local ib = sh.vars[dn]
+							ib.lower, ib.upper, ib.cap = lattr or nil, uattr or nil, cattr or nil
+						end
 					elseif (lattr or uattr or cattr) and not ((assoc or aattr) and cmd ~= "readonly") then
 						local dn = sh:deref(a)
 						sh.vars[dn] = sh.vars[dn] or {}
@@ -816,6 +824,10 @@ return function(sh, cmd, args, hook, tcb)
 						pb.lower = not plusattr.l and pb.lower or nil
 						pb.upper = not plusattr.u and pb.upper or nil
 						pb.cap = not plusattr.c and pb.cap or nil
+					end
+					local tb = pname and (nref and sh.vars[pname] or pb)
+					if tb and (tattr or plust) and not funcnames then -- (-t on a variable: shown, no effect)
+						tb.trace = tattr or nil
 					end
 					if pb and plusarr and pb.arr and ((plusarr == "A") == (pb.assoc == true)) then
 						io.stderr:write("curse: " .. cmd .. ": " .. pname .. ": cannot destroy array variables in this way\n")

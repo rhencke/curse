@@ -16,6 +16,16 @@ local array_key, sh_printf, fd_getc, fd_ready, read_split =
 local do_arrayassign, eval, fmt_decl, fmt_set_var = I.do_arrayassign, I.eval, I.fmt_decl, I.fmt_set_var
 local C, P = I.C, I.P
 local job_resolve, SIGDESC = I.job_resolve, I.SIGDESC
+-- reap any child, skipping the shell's own helpers (rt.internal_pids: not jobs)
+local function wait_any(stbuf)
+	while true do
+		local r = C.waitpid(-1, stbuf, 0)
+		if r < 0 or not rt.internal_pids[r] then
+			return r
+		end
+		rt.internal_pids[r] = nil
+	end
+end
 
 -- a waited job that a signal killed: bash's `PID Desc  command` line (not for the
 -- signals a script expects to end things: INT, PIPE, TERM)
@@ -113,7 +123,7 @@ return function(sh, cmd, args, hook, tcb)
 				end
 			end
 			while not waited and next(want) do
-				local r = C.waitpid(-1, stbuf, 0)
+				local r = wait_any(stbuf)
 				if r < 0 then
 					break
 				end
@@ -144,7 +154,7 @@ return function(sh, cmd, args, hook, tcb)
 			if not active then
 				sh.status = 127
 			else
-				local r = C.waitpid(-1, stbuf, 0)
+				local r = wait_any(stbuf)
 				local est = rt.wexit(stbuf[0])
 				for _, j in ipairs(sh.jobs) do
 					if j.pid == r then

@@ -44,6 +44,10 @@ return function(sh, cmd, args, hook, tcb)
 			if target == nil then
 				io.stderr:write("curse: printf: -v: option requires an argument\n")
 				sh.status = 2
+			elseif not (target:match("^[%a_][%w_]*$") or target:match("^[%a_][%w_]*%[.+%]$") and (rt.split_array_ref(target)
+				or rt.split_array_ref(target, sh))) then
+				io.stderr:write("curse: printf: `" .. target .. "': not a valid identifier\n")
+				sh.status = 2
 			else
 				local nsets = {}
 				local fi = args[4] == "--" and 5 or 4 -- (`printf -v VAR -- FMT …`)
@@ -62,22 +66,13 @@ return function(sh, cmd, args, hook, tcb)
 					sh:array_set(nm, sub, res, false)
 					sh.status = st
 				elseif nm then
-					if sub == "" then
-						io.stderr:write("curse: printf: `" .. target .. "': bad array subscript\n")
-						sh.status = 2
-					elseif (sub == "@" or sub == "*") and not sh:is_assoc(nm) then
+					if (sub == "@" or sub == "*") and not sh:is_assoc(nm) then
 						io.stderr:write("curse: " .. target .. ": bad array subscript\n")
 						sh.status = 1
-					elseif not rt.split_array_ref(target) then -- (`A[]]`: brackets don't balance)
-						io.stderr:write("curse: printf: `" .. target .. "': not a valid identifier\n")
-						sh.status = 2
 					else
 						sh:array_set(nm, array_key(sh, nm, sub), res, false)
 						sh.status = st
 					end
-				elseif target:find("%[") then -- malformed subscript like `a[`
-					io.stderr:write("curse: printf: `" .. target .. "': bad array subscript\n")
-					sh.status = 2
 				else
 					sh.status = st
 					rt.assign_ctx = "printf" -- (a bad nameref target fails it: status 1)

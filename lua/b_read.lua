@@ -207,7 +207,8 @@ return function(sh, cmd, args, hook, tcb)
 			-- EOF with nothing read still assigns (empty values) and returns 1 (bash)
 			line = line or ""
 			local ifs = (rt.ifs(sh) or " \t\n")
-			local aref = arr and sh.vars[arr] and sh.vars[arr].ref and sh:deref_elem(arr)
+			local aref = arr and (not arr:match("^[%a_][%w_]*$") and arr
+				or sh.vars[arr] and sh.vars[arr].ref and sh:deref_elem(arr))
 			if aref then -- (-a through a nameref to an ELEMENT: not an array name — bash)
 				io.stderr:write("curse: read: `" .. aref .. "': not a valid identifier\n")
 				sh.status = 1
