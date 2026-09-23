@@ -91,6 +91,7 @@ extern char curse_sig_default[];
 extern char curse_sig_ignore[];
 extern char curse_sig_clearpending[];
 extern char curse_sig_hold[];
+extern char curse_ldfmt[];
 typedef struct { const char *name; void *addr; } curse_sym_t;
 static const curse_sym_t curse_syms[] = {
   { "environ", (void*)&environ },
@@ -99,6 +100,7 @@ static const curse_sym_t curse_syms[] = {
   { "curse_sig_ignore", (void*)curse_sig_ignore },
   { "curse_sig_clearpending", (void*)curse_sig_clearpending },
   { "curse_sig_hold", (void*)curse_sig_hold },
+  { "curse_ldfmt", (void*)curse_ldfmt },
   { "accept", (void*)accept },
   { "access", (void*)access },
   { "bind", (void*)bind },

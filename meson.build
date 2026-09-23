@@ -43,6 +43,8 @@ vm = custom_target('luajit-vm',
     '--out',   '@OUTDIR@',
     '--jobs',  '4',
     get_option('pgo') ? '--pgo' : '--no-pgo'],
+  # (curse's own C additions: editing them must rebuild the VM)
+  depend_files:     [lj_src / 'src' / 'lib_cursesys.c', lj_src / 'src' / 'lib_cursesig.c'],
   console:          true,
   build_by_default: true,
   install:          true,

@@ -3365,6 +3365,22 @@ local function char_value(s)
 	local ch = rt.mb_chars(s)[1]
 	return (ch and ch.wc) or s:byte(1)
 end
+-- snprintf of a long double parsed from `num` (lib_cursesig.c's curse_ldfmt), or nil when
+-- the text isn't wholly a number (a `'c` char value, junk: the double path handles those)
+ffi.cdef("int curse_ldfmt(char *out, int n, const char *fmt, const char *num, int *end_ok);")
+local ldbuf, ldn, ldok = ffi.new("char[512]"), 512, ffi.new("int[1]")
+local function ld_format(fmt, num) -- -> text, whole (strtold took all of it) | nil
+	local w = C.curse_ldfmt(ldbuf, ldn, fmt, num, ldok)
+	if ldok[0] < 0 or w < 0 then
+		return nil
+	end
+	if w >= ldn then -- (a wide/precise conversion: grow and redo)
+		ldn = w + 1
+		ldbuf = ffi.new("char[?]", ldn)
+		C.curse_ldfmt(ldbuf, ldn, fmt, num, ldok)
+	end
+	return ffi.string(ldbuf, w), ldok[0] == 1
+end
 local function printf_int(s, uns)
 	if s == nil or s == "" then
 		return 0, true
@@ -3481,6 +3497,17 @@ local function printf_conv(full, conv, arg)
 		or conv == "A"
 	then
 		local v, ok = printf_float(arg)
+		-- bash parses the argument as a LONG double and prints with `L` (0.1 is exact to
+		-- 20 places, 1 is 0x8p-3): the C helper does both when the text is a plain number
+		-- (the C library applies the locale's decimal point itself; a partly-numeric
+		-- argument prints its numeric prefix, and is reported)
+		local c1 = type(arg) == "string" and arg:sub(1, 1)
+		if c1 and c1 ~= "" and c1 ~= "'" and c1 ~= '"' then
+			local r, whole = ld_format(full .. "L" .. conv, arg)
+			if r then
+				return r, whole
+			end
+		end
 		local r = string.format(full .. (conv == "F" and "f" or conv), v)
 		local dp = rt.decimal_point() -- (the locale's radix character: `1,0000` under de_DE)
 		if dp ~= "." then

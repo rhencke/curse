@@ -6858,8 +6858,9 @@ assemble = function(cfg, sig, opts)
 				lt[#lt + 1] = ("[%d]=%d"):format(p, ln)
 			end
 		end
-		if #lt > 0 then
-			o[#o + 1] = ("rt.pcline(%s, {%s})"):format(fname, table.concat(lt, ","))
+		if #lt > 0 then -- (a function's also names itself: its errors carry its file's label)
+			o[#o + 1] = ("rt.pcline(%s, {%s}%s)"):format(fname, table.concat(lt, ","),
+				opts.shname and (", %q"):format(opts.shname) or "")
 		end
 	end
 	return table.concat(o, "\n")
@@ -7247,7 +7248,7 @@ function M.emit(ast, opts)
 			-- keep every fn_x (indirect/dynamic dispatch); it can't see run-locals, so
 			-- it lifts only the shared upvalues and is sh-direct for the rest.
 			local cfg = build_cfg(st.body, upset, funcflags, inlinefns)
-			fndefs[#fndefs + 1] = assemble(cfg, fnlname(st.name) .. " = function(sh)", {})
+			fndefs[#fndefs + 1] = assemble(cfg, fnlname(st.name) .. " = function(sh)", { shname = st.name })
 		end
 	end
 	local funcsrc, funcline = {}, {} -- name -> verbatim definition text / def line (top-level funcdefs)

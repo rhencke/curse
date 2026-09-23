@@ -92,12 +92,17 @@ M.Shell = Shell
 -- path from the Lua stack: every pc-dispatch function registers its pc -> line table
 -- (M.pcline) and holds `pc` in local slot 2 (stripped bytecode still exposes slot values).
 M.PCLINE = setmetatable({}, { __mode = "k" })
-function M.pcline(f, t)
+M.PCNAME = setmetatable({}, { __mode = "k" }) -- compiled fn_x -> the shell function's name
+function M.pcline(f, t, name)
 	M.PCLINE[f] = t
+	M.PCNAME[f] = name
 end
 M.INTERP_FRAMES = setmetatable({}, { __mode = "k" }) -- interp functions that keep sh.cur_line
+-- (second result: the innermost compiled shell function running, if any — its file
+-- labels the message, as interp's run_function makes it sh.cur_source)
 local function current_line(sh)
 	local getinfo, getlocal = debug.getinfo, debug.getlocal
+	local line
 	for level = 3, 200 do
 		local info = getinfo(level, "f")
 		if not info then
@@ -109,14 +114,19 @@ local function current_line(sh)
 		end
 		local t = M.PCLINE[f]
 		if t then
-			local _, pc = getlocal(level, 2)
-			local ln = t[pc]
-			if ln and ln > 0 then
-				return ln
+			if not line then
+				local _, pc = getlocal(level, 2)
+				local ln = t[pc]
+				if ln and ln > 0 then
+					line = ln
+				end
+			end
+			if line and M.PCNAME[f] then
+				return line, M.PCNAME[f]
 			end
 		end
 	end
-	return sh.cur_line or 0
+	return line or sh.cur_line or 0
 end
 M.current_line = current_line
 function M.err_prefix(sh)
@@ -127,7 +137,12 @@ function M.err_prefix(sh)
 	if name == "" then
 		name = sh.argv0 or "bash"
 	end
-	local ln = sh.force_line or current_line(sh)
+	local ln, fnm = current_line(sh)
+	ln = sh.force_line or ln
+	local ff = fnm and sh.func_file and sh.func_file[fnm]
+	if ff and ff ~= "" then
+		name = ff
+	end
 	if sh.in_perr and sh.perr_label then -- (a syntax error in eval'd text: `NAME: eval: line N:`)
 		name = name .. ": " .. sh.perr_label
 	elseif sh.in_perr and sh.opt_c and not sh.cur_source then
@@ -8586,7 +8601,7 @@ function M.source_enter(sh, name)
 	sh.srcstack = sh.srcstack or {}
 	table.insert(sh.srcstack, 1, sh.cur_source or sh.argv0 or "")
 	sh.linestack = sh.linestack or {}
-	table.insert(sh.linestack, 1, current_line(sh))
+	table.insert(sh.linestack, 1, (current_line(sh)))
 	sh.funcstack = sh.funcstack or {}
 	table.insert(sh.funcstack, 1, "source") -- (FUNCNAME shows it only inside a function)
 	fr.fn = true

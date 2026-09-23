@@ -19,6 +19,8 @@
 #include <signal.h>
 #include <string.h>
 #include <unistd.h>
+#include <stdio.h>
+#include <stdlib.h>
 
 static volatile sig_atomic_t curse_sig_num;  /* the signal to deliver at the next safepoint */
 static volatile pid_t curse_sig_pid;         /* pid that scheduled the hook (fork guard) */
@@ -121,4 +123,17 @@ void curse_sig_hold(int hold)
   sigset_t all;
   sigfillset(&all);
   sigprocmask(hold ? SIG_BLOCK : SIG_UNBLOCK, &all, (sigset_t *)0);
+}
+
+/* printf's floating conversions the way bash does them: the argument parsed as a long
+ * double (strtold, in the current LC_NUMERIC) and formatted with the `L` length
+ * modifier. LuaJIT's FFI has no long double, so `fmt` (e.g. "%.20Lf") and the number's
+ * text go through here. Returns snprintf's result; *end_ok is 1 when strtold consumed
+ * all of `num`, 0 when only a prefix (bash still prints that value), -1 when none. */
+int curse_ldfmt(char *out, int n, const char *fmt, const char *num, int *end_ok)
+{
+  char *end;
+  long double v = strtold(num, &end);
+  if (end_ok) *end_ok = end == num ? -1 : (*end == '\0' ? 1 : 0);
+  return snprintf(out, (size_t)n, fmt, v);
 }
