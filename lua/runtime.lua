@@ -296,6 +296,57 @@ end
 
 -- Full call boundary (functions that use `local`): params pool + a lazy shadow
 -- record (allocated only if a `local` actually shadows something).
+-- `declare -g NAME…` inside a function acts on the GLOBAL NAME even when a caller's
+-- `local` shadows it. Dynamic scope keeps the global in the LOWEST frame that saved the
+-- name: expose those bindings in sh.vars, and return a function that stores them back
+-- and re-shadows (so the caller's locals are untouched).
+function Shell:global_swap(names)
+	local recs = {}
+	for _, nm in ipairs(names) do
+		for d = 0, self.pd or 0 do
+			local sv = self.savedstack[d]
+			if sv and sv[nm] ~= nil then
+				recs[#recs + 1] = { sv = sv, nm = nm, cur = self.vars[nm] }
+				self.vars[nm] = sv[nm].box or nil
+				break
+			end
+		end
+	end
+	return function()
+		for i = #recs, 1, -1 do
+			local r = recs[i]
+			r.sv[r.nm].box = self.vars[r.nm] or false
+			self.vars[r.nm] = r.cur
+		end
+	end
+end
+-- The environment entry for `name` after its export attribute changed: bash builds a
+-- child's environment from the EXPORTED variables with values, innermost first — so a
+-- non-exported (or value-less) local leaves a shadowed exported global's value in place.
+function Shell:env_resync(name)
+	local function val(b)
+		if b and b.exported and not b.arr and (b.s ~= nil or b.n ~= nil) then
+			return b.s or M.i64_to_str(b.n)
+		end
+	end
+	local v = val(self.vars[name])
+	if v == nil then
+		for d = self.pd or 0, 0, -1 do
+			local sv = self.savedstack[d]
+			if sv and sv[name] ~= nil then
+				v = val(sv[name].box or nil)
+				if v ~= nil or not (sv[name].box and sv[name].box.exported) then
+					break
+				end
+			end
+		end
+	end
+	if v ~= nil then
+		ffi.C.setenv(name, v, 1)
+	else
+		ffi.C.unsetenv(name)
+	end
+end
 function Shell:pushCall(...)
 	self:pushParams(...)
 	self.savedstack[self.pd] = false
@@ -346,7 +397,13 @@ function Shell:popCall()
 			self.vars[name] = old or nil -- false => was absent
 			-- An exported local (`local x; export x`) had a function-scoped env entry;
 			-- revert it on return — restore the outer var's env value, or drop it (bash).
-			if cur and cur.exported then
+			if rec.absorbed then -- (it took over a call-prefix tempenv: its env goes back too)
+				if rec.env then
+					ffi.C.setenv(name, rec.env, 1)
+				else
+					ffi.C.unsetenv(name)
+				end
+			elseif cur and cur.exported then
 				if old and old.exported then
 					ffi.C.setenv(name, self:get(name) or "", 1)
 				else
@@ -355,6 +412,17 @@ function Shell:popCall()
 			end
 		end
 		self.savedstack[d] = false
+	end
+	-- `local -` in this call: the set options go back to their state at that point
+	local lo = self.local_opts and self.local_opts[d]
+	if lo then
+		self.local_opts[d] = nil
+		local set_opt = require("interp")._int.set_opt
+		for f, e in pairs(lo) do
+			if self[f] ~= e.v then
+				set_opt(self, f, e.v)
+			end
+		end
 	end
 	self:popParams()
 end
@@ -388,8 +456,9 @@ function Shell:localVar(name, has_init)
 			end
 		end
 		self.vseq = self.vseq + 1
-		if te and te.frame == self.pd then
-			saved[name] = { box = te.box, seq = self.vseq }
+		if te and (te.frame == self.pd or te.decl_pd == self.pd) then
+			-- (absorbed: the tempenv's env entry is reverted when this local goes away)
+			saved[name] = { box = te.box, seq = self.vseq, absorbed = true, env = te.env }
 			te.consumed = true
 		else
 			saved[name] = { box = self.vars[name] or false, seq = self.vseq }
@@ -400,19 +469,51 @@ function Shell:localVar(name, has_init)
 		else
 			self.vars[name] = {}
 		end
+		-- a local of an EXPORTED name is exported too (bash): once it has a value, children
+		-- see it (`export foo=abc; f() { local foo=x; printenv foo; }` prints x)
+		local ob = saved[name].box
+		if (ob and ob.exported) or te then -- (a tempenv binding is in the environment too)
+			self.vars[name].exported = true
+		end
+		-- `local -I`: start as a copy of the outer variable — value and attributes, but
+		-- not a nameref (bash)
+		if (self.local_inherit or (self.shopt and self.shopt.localvar_inherit)) and ob and not ob.ref then
+			local nb = self.vars[name]
+			for k, v in pairs(ob) do
+				nb[k] = v
+			end
+			if ob.arr then
+				nb.arr = {}
+				for k, v in pairs(ob.arr) do
+					nb.arr[k] = v
+				end
+			end
+			if ob.order then
+				nb.order = { unpack(ob.order) }
+			end
+		end
 	end
 end
 
--- one `local` operand: `name`, `name=value`, or `name+=value` (value expanded).
--- `+=` appends to the value AFTER localizing (bash: appends to the new local, not
--- the shadowed outer one). Returns false (else true) when the name is READONLY: bash
--- fails that operand (message + `local` returns 1) WITHOUT shadowing it or changing
--- the value, and continues with the rest — so the caller ORs the results into $?.
 -- `local NAME=(…)` over a READONLY NAME: bash's compound assignment fails first, then
 -- local's own error; nothing is created (status 1). True when that happened.
+-- Does `local NAME` hit a readonly it may not shadow? Only a readonly GLOBAL blocks it;
+-- a readonly local of an enclosing function can be shadowed (bash).
+function Shell:is_global_ro(name)
+	local b = self.vars[name]
+	if not (b and b.ro) then
+		return false
+	end
+	for d = self.pd or 0, 0, -1 do
+		local sv = self.savedstack[d]
+		if sv and sv[name] ~= nil then
+			return false -- (a caller's local)
+		end
+	end
+	return true
+end
 function M.local_ro(sh, name)
-	local b = sh.vars[name]
-	if b and b.ro then
+	if sh:is_global_ro(name) then
 		sh:errmsg("curse: " .. name .. ": readonly variable\n")
 		sh:errmsg("curse: local: " .. name .. ": readonly variable\n")
 		sh.status = 1
@@ -420,13 +521,17 @@ function M.local_ro(sh, name)
 	end
 	return false
 end
+-- one `local` operand: `name`, `name=value`, or `name+=value` (value expanded).
+-- `+=` appends to the value AFTER localizing (bash: appends to the new local, not
+-- the shadowed outer one). Returns false (else true) when the name is READONLY: bash
+-- fails that operand (message + `local` returns 1) WITHOUT shadowing it or changing
+-- the value, and continues with the rest — so the caller ORs the results into $?.
 function Shell:localAssign(arg)
 	local nm, op, val = arg:match("^([%a_][%w_]*)(%+?=)(.*)$")
 	local name = nm or arg
 	-- readonly NAME: no shadow, no assignment (the readonly global stays visible in the
 	-- frame). Message routes through any 2>&1 capture, exactly like interp.
-	local eb = self.vars[name]
-	if eb and eb.ro then
+	if self:is_global_ro(name) then
 		self:errmsg("curse: local: " .. name .. ": readonly variable\n")
 		return false
 	end
@@ -1727,6 +1832,7 @@ local function opt_fields()
 	end
 	return OPT_FIELDS
 end
+M.opt_fields = opt_fields
 local iso_push, iso_pop
 local function sub_checkpoint(self)
 	local orig_vars = self.vars
@@ -4035,6 +4141,8 @@ function Shell:set_str(name, s)
 		self.argv0 = s -- assigning BASH_ARGV0 sets $0 (bash)
 	elseif dn == "POSIXLY_CORRECT" then
 		self.opt_posix = true -- (bash's sv_strict_posix: setting it enters posix mode)
+	elseif dn == "IGNOREEOF" then
+		self.opt_ignoreeof = true -- (sv_ignoreeof: any value turns ignoreeof on)
 	elseif dn == "RANDOM" and not self.random_plain then
 		-- assigning seeds the generator; RANDOM itself stays dynamic (bash assign_random)
 		local n = s:match("^%s*[+-]?%d+%s*$") and tonumber(s)
@@ -6269,17 +6377,31 @@ end
 -- existing indexed array, or -a on an existing associative one, is an error (status 1, no
 -- assignment) — mirrors interp's b_export conversion check. Returns true (having reported it)
 -- when the compiled declare-array block must be skipped. `cmd` is declare/typeset/local.
+-- The conversion error text (bash): with a compound value `NAME=(…)` it's reported by the
+-- array assignment first — named by the running FUNCTION (bash's this_command_name) and
+-- then again by the builtin, status 1; at top level just `NAME: …`, status 0. A plain
+-- `declare -A NAME` reports `declare: NAME: …`, status 1. Returns the status.
+function M.array_convert_msg(sh, cmd, name, what, compound)
+	local fn = sh.funcstack and sh.funcstack[1]
+	if compound and not fn then -- (and the rest of the line is abandoned)
+		io.stderr:write("curse: " .. name .. ": cannot convert " .. what .. "\n")
+		error({ __curse_exit = 1, __curse_lineabort = true })
+	end
+	if compound then
+		io.stderr:write("curse: " .. fn .. ": " .. name .. ": cannot convert " .. what .. "\n")
+	end
+	io.stderr:write("curse: " .. cmd .. ": " .. name .. ": cannot convert " .. what .. "\n")
+	return 1
+end
 function M.array_convert_err(sh, name, isassoc, cmd)
 	local b = sh.vars[sh:deref(name)]
 	if isassoc then
 		if b and b.arr and not b.assoc then
-			io.stderr:write("curse: " .. cmd .. ": " .. name .. ": cannot convert indexed to associative array\n")
-			sh.status = 1
+			sh.status = M.array_convert_msg(sh, cmd, name, "indexed to associative array", true)
 			return true
 		end
 	elseif b and b.assoc then
-		io.stderr:write("curse: " .. cmd .. ": " .. name .. ": cannot convert associative to indexed array\n")
-		sh.status = 1
+		sh.status = M.array_convert_msg(sh, cmd, name, "associative to indexed array", true)
 		return true
 	end
 	return false
@@ -6778,9 +6900,10 @@ function Shell:expand_param(pe, arg, arg2, idxnum)
 		if not isset then
 			return ""
 		end
-		if arg == "A" then
-			return name .. "=" .. M.shell_quote(val)
-		end -- declare-able form
+		if arg == "A" then -- declare-able form (with the attributes, when it has any: bash)
+			local at = self:attr_string(name)
+			return (at ~= "" and ("declare -" .. at .. " ") or "") .. name .. "=" .. M.shell_quote(val)
+		end
 	end
 	return self:apply_str_op(op, val, arg, arg2)
 end

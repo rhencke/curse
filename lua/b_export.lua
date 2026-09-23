@@ -296,8 +296,38 @@ return function(sh, cmd, args, hook, tcb)
 			-- `declare`/`typeset` in a function make each name LOCAL (like `local`),
 			-- unless -g; `export`/`readonly` always act on the global var (bash).
 			local localize = (cmd == "declare" or cmd == "typeset") and not gflag and (sh.calldepth or 0) > 0
+			local unswap
+			if gflag and (sh.calldepth or 0) > 0 then -- (act on the globals, past any caller's locals)
+				local gnames = {}
+				for _, a in ipairs(rest) do
+					gnames[#gnames + 1] = a:match("^([%a_][%w_]*)")
+				end
+				unswap = sh:global_swap(gnames)
+			end
 			local allok = true
 			for _, a in ipairs(rest) do
+				-- exporting / readonly-ing a name bound by a command-prefix tempenv (`y=5 f`
+				-- with `export y` in f, `x=4 export x`) makes that binding PERMANENT (bash's
+				-- att_propagate): it isn't restored when the command ends, and isn't localized
+				local tnm = (doexport or roattr) and not unexport and a:match("^([%a_][%w_]*)")
+				local propagated = false
+				if tnm then
+					for k = #sh.tenv, 1, -1 do
+						local te = sh.tenv[k]
+						-- (a function-local declaration's OWN prefix is absorbed by the local
+						-- instead: `var=value declare -x var` in f leaves the global alone)
+						if not te.consumed and te.name == tnm and not (localize and te.decl_pd == sh.pd) then
+							te.consumed = true
+							propagated = true
+							local pb = sh.vars[tnm]
+							if pb then
+								pb.exported = true -- (a command-prefix binding is in the environment)
+							end
+							break
+						end
+					end
+				end
+				local localize = localize and not propagated
 				if a == "SHELLOPTS" and (doexport or roattr) and not unexport and not plusx then
 					-- $SHELLOPTS is a dynamic special (special_get), not a stored var: mark
 					-- it exported and sync the env NOW (set_opt keeps it current after), so
@@ -387,7 +417,7 @@ return function(sh, cmd, args, hook, tcb)
 					if xb then
 						if unexport or plusx then
 							xb.exported = nil
-							C.unsetenv(nm)
+							sh:env_resync(nm) -- (a shadowed exported global keeps its env value)
 						elseif doexport or sh.opt_a then
 							xb.exported = true
 							C.setenv(nm, xval, 1)
@@ -423,10 +453,14 @@ return function(sh, cmd, args, hook, tcb)
 						-- shows just `declare -r`, so let it fall through to the plain-var branch)
 						local b = sh.vars[sh:deref(a)]
 						if b and b.arr and not b.assoc then
-							io.stderr:write(
-								"curse: " .. cmd .. ": " .. a .. ": cannot convert indexed to associative array\n"
-							)
-							allok = false
+							local compound = sh.arrayargs_pending and sh.arrayargs_pending[a]
+							if rt.array_convert_msg(sh, cmd, a, "indexed to associative array", compound) ~= 0 then
+								allok = false
+							end
+							if compound then
+								sh.arrayargs_pending.skip = sh.arrayargs_pending.skip or {}
+								sh.arrayargs_pending.skip[a] = true -- (its literal isn't assigned)
+							end
 						else
 							local fresh = b == nil or (b.arr == nil and b.s == nil and b.n == nil)
 							sh:declare_assoc(a)
@@ -437,10 +471,14 @@ return function(sh, cmd, args, hook, tcb)
 					elseif aattr and cmd ~= "readonly" then -- `declare -a`: mark an (empty) indexed array; convert a scalar to [0]
 						local b = sh.vars[a] or {}
 						if b.assoc then -- …and the reverse conversion is forbidden too
-							io.stderr:write(
-								"curse: " .. cmd .. ": " .. a .. ": cannot convert associative to indexed array\n"
-							)
-							allok = false
+							local compound = sh.arrayargs_pending and sh.arrayargs_pending[a]
+							if rt.array_convert_msg(sh, cmd, a, "associative to indexed array", compound) ~= 0 then
+								allok = false
+							end
+							if compound then
+								sh.arrayargs_pending.skip = sh.arrayargs_pending.skip or {}
+								sh.arrayargs_pending.skip[a] = true -- (its literal isn't assigned)
+							end
 						else
 							sh.vars[a] = b
 							if b.s ~= nil and not b.arr then
@@ -462,7 +500,7 @@ return function(sh, cmd, args, hook, tcb)
 					if bb then
 						if unexport or plusx then
 							bb.exported = nil
-							C.unsetenv(a)
+							sh:env_resync(a) -- (a shadowed exported global keeps its env value)
 						elseif doexport then
 							bb.exported = true -- `export U` defers the env until U gets a value (bash)
 							if bb.s ~= nil or bb.n ~= nil then
@@ -517,6 +555,13 @@ return function(sh, cmd, args, hook, tcb)
 					allok = false
 				end
 				::continue::
+			end
+			if unswap then
+				if sh.arrayargs_pending then
+					sh.pending_unswap = unswap -- (interp assigns the NAME=(…) literals next)
+				else
+					unswap()
+				end
 			end
 			sh.status = allok and 0 or 1
 		end

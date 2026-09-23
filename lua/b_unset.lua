@@ -112,7 +112,15 @@ return function(sh, cmd, args, hook, tcb)
 								env_done = true
 							end
 						end
-						if not revealed then
+						local here = sh.savedstack[sh.pd] and sh.savedstack[sh.pd][dn] ~= nil
+						if not revealed and here and b then
+							-- a local of THIS call stays a (value-less) local, attributes kept:
+							-- `local v=x; unset v; declare -p v` -> `declare -- v` (bash)
+							sh.vars[dn] = { exported = b.exported, int = b.int, lower = b.lower,
+								upper = b.upper, cap = b.cap }
+							sh:env_resync(dn)
+							env_done = true
+						elseif not revealed then
 							sh.vars[dn] = nil
 						end
 						if not env_done then
@@ -121,6 +129,9 @@ return function(sh, cmd, args, hook, tcb)
 						if rt.LOCALE_VARS[dn] then
 							rt.reset_locale(sh)
 						end -- re-apply locale (bash)
+						if dn == "IGNOREEOF" then
+							sh.opt_ignoreeof = false -- (sv_ignoreeof)
+						end
 						if dn == "POSIXLY_CORRECT" then
 							sh.opt_posix = false -- (sv_strict_posix: unsetting it leaves posix mode)
 						end

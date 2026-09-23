@@ -20,6 +20,16 @@ local M = {}
 local SETOPTS, SETOPT, SETFLAG, SETDEFAULT, opt_on = rt.SETOPTS, rt.SETOPT, rt.SETFLAG, rt.SETDEFAULT, rt.opt_on
 local function set_opt(sh, field, on)
 	sh[field] = on
+	-- bash's set_ignoreeof: `set -o ignoreeof` binds IGNOREEOF=10, `set +o` unsets it
+	if field == "opt_ignoreeof" then
+		if on then
+			if sh.vars.IGNOREEOF == nil then
+				sh:set_str("IGNOREEOF", "10")
+			end
+		else
+			sh.vars.IGNOREEOF = nil
+		end
+	end
 	-- emacs and vi line-editing modes are mutually exclusive.
 	if on and field == "opt_emacs" then
 		sh.opt_vi = false
@@ -2715,17 +2725,10 @@ end
 -- Execute an array literal assignment `name=(...)` / `name+=(...)`. bash evaluates
 -- in two phases: expand every RHS against the OLD array state first, then evaluate
 -- indices left-to-right against the array as it is being built.
-local function do_arrayassign(sh, st)
-	-- through a nameref (`local -n r=arr; r+=(x)`) the literal lands in the referenced array
-	local name = sh:deref(st.name)
-	local isassoc = sh:is_assoc(name)
-	local anykeyed = false
-	for _, e in ipairs(st.elems) do
-		if e.key ~= nil then
-			anykeyed = true
-			break
-		end
-	end
+-- A compound literal's expanded elements ({key?, op, val}). A declaration builtin's
+-- `NAME=(…)` is expanded BEFORE the builtin runs (bash: `local -a arr=("${arr[@]}")`
+-- copies the OUTER arr), so exec_stmt pre-computes them into sh.arrayargs_pre[st].
+local function arrayassign_items(sh, st, isassoc)
 	local items = {}
 	for _, e in ipairs(st.elems) do
 		if e.key ~= nil and not (e.brace_bare and not isassoc) then
@@ -2740,6 +2743,23 @@ local function do_arrayassign(sh, st)
 				end
 			end
 		end
+	end
+	return items
+end
+local function do_arrayassign(sh, st)
+	-- through a nameref (`local -n r=arr; r+=(x)`) the literal lands in the referenced array
+	local name = sh:deref(st.name)
+	local isassoc = sh:is_assoc(name)
+	local anykeyed = false
+	for _, e in ipairs(st.elems) do
+		if e.key ~= nil then
+			anykeyed = true
+			break
+		end
+	end
+	local items = sh.arrayargs_pre and sh.arrayargs_pre[st] or arrayassign_items(sh, st, isassoc)
+	if st.append and sh.vars[name] then
+		sh.vars[name].empty_decl = nil -- (`a+=()` counts as an assignment: shows =())
 	end
 	-- bash quirk (ASSOCIATIVE arrays only): inside a `=` (not `+=`) compound literal, a
 	-- `[k]+=v` element appends to the value a[k] had BEFORE the whole statement — NOT the
@@ -2906,7 +2926,7 @@ local function fmt_decl(sh, name)
 		-- upper (verified: `declare -irx` -> `declare -irx`, `declare -xl` -> `declare -xl`).
 		local a = (b.int and "i" or "")
 			.. (b.ro and "r" or "")
-			.. (os.getenv(name) ~= nil and "x" or "")
+			.. (b.exported and "x" or "") -- (the attribute: an unexported local may shadow an env value)
 			.. (b.lower and "l" or "")
 			.. (b.upper and "u" or "")
 			.. (b.cap and "c" or "")
@@ -3707,7 +3727,16 @@ local function exec_simple(sh, args, hook, no_func)
 			io.stderr:write("curse: exit: " .. args[2] .. ": numeric argument required\n")
 			error({ __curse_exit = 2 })
 		end
-		error({ __curse_exit = args[2] and (tonumber(args[2]) % 256) or sh.status })
+		local code = args[2] and (tonumber(args[2]) % 256) or sh.status
+		-- inside a function, bash runs the EXIT trap right here, with the function's frame
+		-- still active (`trap 'echo $FUNCNAME' EXIT; f() { exit; }; f` prints f)
+		if sh.funcstack and #sh.funcstack > 0 and not sh.in_exit_trap and not rt.exit_trap_inherited
+			and sh.traps and sh.traps.EXIT and sh.traps.EXIT ~= "" then
+			sh.status = code
+			M.run_exit_trap(sh)
+			code = sh.status
+		end
+		error({ __curse_exit = code })
 	elseif cmd == "command" and (args[2] == "-v" or args[2] == "-V") then
 		local verbose = args[2] == "-V"
 		local anyfound = false
@@ -4602,12 +4631,26 @@ exec_stmt = function(sh, st, hook)
 				if b and b.ro and args[1] ~= "local" then
 					wasro = wasro or {}
 					wasro[aa] = true
-				elseif b and b.ro then
+				elseif b and b.ro and sh:is_global_ro(sh:deref(aa.name)) then
 					-- `local ro=(…)`: bash's compound assignment fails first, then local's own error
 					io.stderr:write("curse: " .. aa.name .. ": readonly variable\n")
 				end
 			end
 			sh.arrayargs_ro = wasro
+			-- (names with a NAME=(…) literal: declare -g keeps its global view until they're
+			-- assigned, and a failed kind conversion reports/skips them bash's way)
+			sh.arrayargs_pending = {}
+			local wantassoc = false
+			for k = 2, #args do
+				if args[k]:match("^%-%a*A") then
+					wantassoc = true
+				end
+			end
+			sh.arrayargs_pre = {}
+			for _, aa in ipairs(st.arrayargs) do
+				sh.arrayargs_pending[aa.name] = true
+				sh.arrayargs_pre[aa] = arrayassign_items(sh, aa, wantassoc or sh:is_assoc(sh:deref(aa.name)))
+			end
 		end
 		-- `exec [redirs] [cmd…]`: redirections are permanent (not restored). With no
 		-- command it just rewires the shell's own fds (e.g. `exec 3>file`); with a
@@ -4836,6 +4879,8 @@ exec_stmt = function(sh, st, hook)
 						env = os.getenv(a.name),
 						consumed = false,
 						seq = sh.vseq,
+						-- (`z=y typeset z` in a function: the local it makes absorbs this binding)
+						decl_pd = (args[1] == "local" or args[1] == "declare" or args[1] == "typeset") and sh.pd or nil,
 						box = b and {
 							s = b.s,
 							n = b.n,
@@ -4892,17 +4937,26 @@ exec_stmt = function(sh, st, hook)
 		-- `local a=(…)` / `declare -A a=(…)` lands in the now-local/assoc variable.
 		-- Skip when the builtin failed (e.g. a rejected -A/-a type change): the array
 		-- must stay untouched, not be mangled by the literal.
+		local aaskip = sh.arrayargs_pending and sh.arrayargs_pending.skip
 		if st.arrayargs and sh.status == 0 then
 			local wasro = sh.arrayargs_ro
 			sh.arrayargs_ro = nil
 			for _, aa in ipairs(st.arrayargs) do
-				if wasro and wasro[aa] then
+				if aaskip and aaskip[aa.name] then -- (a rejected kind conversion: untouched)
+				elseif wasro and wasro[aa] then
 					io.stderr:write("curse: " .. aa.name .. ": readonly variable\n")
 					sh.status = 1
 				else
 					do_arrayassign(sh, aa)
 				end
 			end
+		end
+		sh.arrayargs_pending = nil
+		sh.arrayargs_pre = nil
+		if sh.pending_unswap then -- (declare -g: back to the caller's locals)
+			local f = sh.pending_unswap
+			sh.pending_unswap = nil
+			f()
 		end
 		-- $_ : the last argument (after expansion) of the command just run.
 		if #args > 0 then

@@ -22,9 +22,20 @@ return function(sh, cmd, args, hook, tcb)
 		-- nameref (-n), indexed (-a) and associative (-A) attributes.
 		local nref, assoc, plusn, rest, lok = false, false, false, {}, true
 		local iattr, lattr, uattr, aattr, rattr = false, false, false, false, false
+		local inherit = false
 		for j = 2, #args do
 			local a = args[j]
 			if a == "--" then
+			elseif a == "-" then
+				-- `local -`: the set options become local to this call (restored by popCall)
+				sh.local_opts = sh.local_opts or {}
+				if not sh.local_opts[sh.pd] then
+					local snap = {}
+					for _, f in ipairs(rt.opt_fields()) do
+						snap[f] = { v = sh[f] } -- (exact: nil means "the default")
+					end
+					sh.local_opts[sh.pd] = snap
+				end
 			elseif a:sub(1, 1) == "-" and #a > 1 then
 				if a:find("n") then
 					nref = true
@@ -46,6 +57,9 @@ return function(sh, cmd, args, hook, tcb)
 				end
 				if a:find("r") then
 					rattr = true
+				end
+				if a:find("I") then
+					inherit = true -- (-I: the local starts as a copy of the outer var)
 				end
 			elseif a:sub(1, 1) == "+" and #a > 1 then
 				if a:find("n") then
@@ -72,7 +86,10 @@ return function(sh, cmd, args, hook, tcb)
 				end
 			end
 			sh.status = 0
-		elseif not attrs then
+			return
+		end
+		sh.local_inherit = inherit or nil -- (read by Shell:localVar; cleared below)
+		if not attrs then
 			for _, a in ipairs(rest) do
 				local anm, sub, aop, aval = a:match("^([%a_][%w_]*)%[(.-)%](%+?=)(.*)$")
 				if anm then -- local a[i]=v : create the element in a local array
@@ -84,8 +101,7 @@ return function(sh, cmd, args, hook, tcb)
 				elseif
 					(function()
 						local ln = a:match("^([%a_][%w_]*)")
-						local lb = ln and sh.vars[sh:deref(ln)]
-						return lb and lb.ro
+						return ln and sh:is_global_ro(sh:deref(ln))
 					end)()
 				then
 					-- a readonly var can't be localized (bash errors, skips it, continues)
@@ -105,7 +121,8 @@ return function(sh, cmd, args, hook, tcb)
 			end
 		else
 			for _, a in ipairs(rest) do
-				local nm, val = a:match("^([%a_][%w_]*)=(.*)$")
+				local nm, ap, val = a:match("^([%a_][%w_]*)(%+?)=(.*)$")
+				ap = ap == "+"
 				local vname = nm or a
 				sh:localVar(vname)
 				if nref then
@@ -127,6 +144,10 @@ return function(sh, cmd, args, hook, tcb)
 					elseif aattr then
 						local b = sh.vars[vname] or {}
 						if not b.assoc then
+							if b.s ~= nil and not b.arr then -- (an inherited scalar becomes [0])
+								b.arr = { [0] = b.s }
+								b.s, b.n = nil, nil
+							end
 							b.arr = b.arr or {}
 						end
 						sh.vars[vname] = b
@@ -139,8 +160,10 @@ return function(sh, cmd, args, hook, tcb)
 							sh:set_str(nm, lattr and val:lower() or val:upper())
 							sh.vars[nm].lower = lattr or nil
 							sh.vars[nm].upper = uattr or nil
-						elseif not (assoc or aattr) then
-							sh:set_str(nm, val)
+						elseif aattr and not assoc then -- `local -a a=v` / `a+=v`: element 0
+							sh:array_set(nm, 0, val, ap)
+						elseif not (assoc or aattr) then -- (an existing array local takes it as [0])
+							rt.assign_scalar(sh, nm, ap and (sh:get(nm) .. val) or val)
 						end
 					elseif iattr or lattr or uattr then
 						local b = sh.vars[vname] or {}
@@ -158,6 +181,7 @@ return function(sh, cmd, args, hook, tcb)
 				end
 			end
 		end
+		sh.local_inherit = nil
 		sh.status = lok and 0 or 1
 	end
 end

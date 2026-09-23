@@ -248,9 +248,13 @@ local function word_reads_debugstack(w)
 end
 local function reads_debugstack(stmts)
 	for _, st in ipairs(stmts or {}) do
-		-- a sourced file can read them out of sight: keep the frames for it
+		-- a sourced file can read them out of sight: keep the frames for it; and a
+		-- `declare -A NAME=(…)` names the running function in its conversion error
 		local p1 = st.t == "simple" and st.words and st.words[1] and st.words[1].parts[1]
 		if p1 and (p1.lit == "source" or p1.lit == ".") then
+			return true
+		end
+		if p1 and st.arrayargs and (p1.lit == "declare" or p1.lit == "typeset" or p1.lit == "local") then
 			return true
 		end
 		if st.words then
@@ -3375,7 +3379,7 @@ for _, n in ipairs({ "OPTIND", "OPTARG", "OPTERR", "REPLY", "SECONDS", "RANDOM",
 	"LINENO", "HISTCMD", "HISTSIZE", "HISTFILESIZE", "TMOUT", "COLUMNS", "LINES", "FUNCNEST",
 	"BASH_XTRACEFD", "SHLVL", "PPID", "UID", "EUID", "BASHPID", "BASH_SUBSHELL", "EPOCHSECONDS",
 	"EPOCHREALTIME", "BASH_ARGC", "COMP_CWORD", "COMP_POINT", "IFS", "_", "FUNCNAME",
-	"POSIXLY_CORRECT" }) do
+	"POSIXLY_CORRECT", "IGNOREEOF", "BASH_ARGV0" }) do
 	NO_LIFT[n] = true
 end
 for n in pairs(require("runtime").LOCALE_VARS) do
@@ -4179,9 +4183,11 @@ simple_compiled = function(cx, st, after)
 					cmd,
 					as_local and (" and not rt.local_ro(sh, %q)"):format(a1.name) or ""
 				)
-				.. pre
+				-- (the values are expanded BEFORE localizing: `local -a arr=("${arr[@]}")`)
 				.. table.concat(parts, "; ")
-				.. ("; rt.arrayassign(sh, %q, __it, %s)"):format(
+				.. "; "
+				.. pre -- (empty, or ends in "; ")
+				.. ("rt.arrayassign(sh, %q, __it, %s)"):format(
 					a1.name,
 					tostring(a1.append and true or false)
 				)
