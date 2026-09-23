@@ -4163,6 +4163,24 @@ end
 -- The compiled backend uses this for word expansion so it matches the interp,
 -- which checks nounset at the same point. (:get itself is used for internal
 -- reads like IFS/HOME that must not trip nounset.)
+-- In posix mode an arithmetic EXPANSION error exits a non-interactive shell (bash's
+-- posixly_correct FORCE_EOF) instead of abandoning the line: raise that exit for a
+-- caught line-abort `err`, else return.
+function M.posix_arith_fatal(sh, err)
+	if sh.opt_posix and not sh.opt_i and err.__curse_matherr then
+		error({ __curse_exit = sh.opt_c and 127 or 1 }, 0)
+	end
+end
+-- $! : under set -u, unbound until a background job exists (bash names the bare form
+-- `$!`, the braced one `!`)
+function M.last_bg_u(sh, braced)
+	local v = sh.last_bg_pid
+	if v == nil and sh.opt_u then
+		io.stderr:write("curse: " .. (braced and "!" or "$!") .. ": unbound variable\n")
+		error({ __curse_exit = sh.opt_c and 127 or 1, __curse_lineabort = sh.opt_i or nil })
+	end
+	return v or ""
+end
 -- $N / ${N} in compiled code: under set -u a missing positional is unbound (bash names
 -- the bare form `$9`, the braced one `9`)
 function Shell:param_u(n, braced)

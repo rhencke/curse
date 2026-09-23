@@ -104,6 +104,7 @@ function M.run_compiled(mod, sh, pc)
 			return
 		end
 		if type(err) == "table" and err.__curse_lineabort and not sh.opt_e then
+			rt.posix_arith_fatal(sh, err)
 			sh.status = 1
 			pc = sh._ff
 		else

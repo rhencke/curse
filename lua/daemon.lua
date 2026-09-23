@@ -193,6 +193,10 @@ local LONG_IGNORED = { ["--norc"] = 1, ["--noprofile"] = 1, ["--login"] = 1, ["-
 local function dispatch(sh, args)
 	-- args[1] is the program name (argv[0]); real args start at 2.
 	local i, n = 2, #args
+	local base = (args[1] or ""):match("[^/]+$")
+	if base == "sh" or base == "dash" or base == "ash" then
+		sh.opt_posix = true -- (invoked as sh: posix mode, as run.lua's SH_IS_POSIX)
+	end
 	local code, from_stdin = nil, false
 	while i <= n do
 		local a = args[i]

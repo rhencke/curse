@@ -1879,7 +1879,7 @@ emit_word = function(w, lifted)
 			elseif p.special == "$" then
 				parts[#parts + 1] = "tostring(sh:pid())"
 			elseif p.special == "!" then
-				parts[#parts + 1] = '(sh.last_bg_pid or "")'
+				parts[#parts + 1] = ("rt.last_bg_u(sh, %s)"):format(tostring(p.braced or false))
 			elseif p.special == "-" then
 				parts[#parts + 1] = "sh:dash_flags()" -- $-: the current single-char option flags
 			end
@@ -2547,7 +2547,7 @@ local function emit_scalar_val(p, i, lifted, tilde, w)
 	elseif p.special == "$" then
 		return "tostring(sh:pid())"
 	elseif p.special == "!" then
-		return '(sh.last_bg_pid or "")'
+		return ("rt.last_bg_u(sh, %s)"):format(tostring(p.braced or false))
 	elseif p.special == "-" then
 		return "sh:dash_flags()" -- $-: current single-char option flags
 	end
@@ -6320,7 +6320,7 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
 			return after
 		end
 		if st.line then
-			EF.cur_line = st.line
+			EF.cur_line = t == "simple" and st.cline or st.line -- (a simple command: interp's rule)
 			EF.cur_cline = st.cline or st.line
 		end -- for $LINENO (compile-time constant)
 		-- `time [-p] pipeline`: start clocks, run the statement itself, report to stderr.

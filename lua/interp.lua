@@ -1167,7 +1167,7 @@ local function expand_part_str(sh, p, assign)
 		elseif p.special == "$" then
 			v = tostring(sh:pid())
 		elseif p.special == "!" then
-			v = sh.last_bg_pid or ""
+			v = p.lenof and (sh.last_bg_pid or "") or rt.last_bg_u(sh, p.braced)
 		elseif p.special == "-" then
 			v = sh:dash_flags()
 		else
@@ -1722,6 +1722,12 @@ local function multi_elems(sh, p) -- returns element list, star?
 			-- a PRESENT length (even empty, `${a[@]:0:}`) is a count; empty means 0.
 			local len = pe.arg2 and (rt.substr_arith(sh, rt.pe_label(pe), arith_expand_text(sh, pe.arg2)) or 0) or nil
 			els = rt.array_slice_values(sh, pe.name, els, off, len, pe.arg2)
+		elseif (pe.op == "?" or pe.op == ":?") and (#els == 0 or (pe.op == ":?" and #els == 1 and els[1] == "")) then
+			-- ${@?} ${a[@]:?msg}: no elements (or, for :?, a lone empty one) is the error
+			local msg = pe.arg and pe.arg ~= "" and expand_word(sh, P.parse_word(pe.arg))
+				or (pe.op == "?" and "parameter not set" or "parameter null or not set")
+			io.stderr:write("curse: " .. rt.pe_label(pe) .. ": " .. msg .. "\n")
+			error({ __curse_exit = sh.opt_c and 127 or 1, __curse_lineabort = sh.opt_i or nil })
 		elseif (pe.op == "=" or pe.op == ":=") and #els == 0 then
 			-- ${@=x} / ${a[@]=x}: nothing to assign to — bash aborts the line
 			if pe.name == "@" or pe.name == "*" then
@@ -3000,7 +3006,8 @@ local function fmt_decl(sh, name)
 		return nil
 	end
 	if b.ref then -- bash shows the export letter on a nameref as `declare -nx`
-		return "declare -n" .. (os.getenv(name) ~= nil and "x" or "") .. " " .. name .. "=" .. decl_quote(b.s or "")
+		local pre = "declare -n" .. (os.getenv(name) ~= nil and "x" or "") .. (b.ro and "r" or "") .. " " .. name
+		return b.s == nil and pre or (pre .. "=" .. decl_quote(b.s)) -- (no target yet: no =)
 	end
 	if b.assoc or b.arr then
 		-- array/assoc flag letters in bash order (a/A i r x l u); export shows from the
@@ -4344,7 +4351,9 @@ exec_stmt = function(sh, st, hook)
 		return
 	end
 	if st.line and not (sh.in_trap and sh.in_trap > 0 and (sh.calldepth or 0) == sh.trap_calldepth) then
-		sh.cur_line = st.line
+		-- a simple command's line is where its SECOND token ended (bash's yacc lookahead:
+		-- `nope "x<NL>y"` errors on line 2); cline records that
+		sh.cur_line = t == "simple" and st.cline or st.line
 		sh.cur_cline = st.cline or st.line -- (where its $(…) bodies number from)
 	end -- $LINENO: frozen at the trapped line for the trap's own commands (not in a
 	-- function the trap calls, whose lines count as usual — bash)
@@ -4677,6 +4686,7 @@ exec_stmt = function(sh, st, hook)
 		local eok, eerr = pcall(expand_args, sh, st, args, is_assign)
 		if not eok then
 			if type(eerr) == "table" and eerr.__curse_experr then
+				rt.posix_arith_fatal(sh, eerr)
 				sh.status = 1
 				if sh.opt_e then
 					error({ __curse_exit = 1 })
@@ -6084,6 +6094,7 @@ function M.run_lazy(sh, src, hook)
 							if sh.opt_e then
 								error(err)
 							end
+							rt.posix_arith_fatal(sh, err)
 							sh.status = 1
 							break
 						else
@@ -6131,6 +6142,7 @@ function M.run_prompt_command(sh, hook)
 					if type(serr) == "table" and serr.__curse_exit and not serr.__curse_lineabort then
 						error(serr)
 					elseif type(serr) == "table" and serr.__curse_lineabort then
+						rt.posix_arith_fatal(sh, serr)
 						sh.status = 1
 						break
 					else
@@ -6267,6 +6279,7 @@ function M.source_file(sh, path, hook)
 					if sh.opt_e then
 						error(serr)
 					end
+					rt.posix_arith_fatal(sh, serr)
 					sh.status = 1
 					break
 				else

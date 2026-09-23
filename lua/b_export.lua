@@ -404,9 +404,11 @@ return function(sh, cmd, args, hook, tcb)
 						end
 					end
 					local bb = sh.vars[sh:deref(nm)]
-					if roattr and bb and not nref then
+					if roattr and nref and sh.vars[nm] and sh.vars[nm].ref then
+						sh.vars[nm].ro = true -- (with -n, -r makes the REFERENCE readonly: `-nr`)
+					elseif roattr and bb and not nref then
 						bb.ro = true
-					end -- bash ignores -r when -n is given
+					end
 					-- export attribute: -n / +x clear it (keep the value), else export sets it.
 					-- A nameref exports the nameref BOX itself, and its env value is the TARGET
 					-- NAME it points at (`declare -nx ref=x` -> env ref="x"), not the deref value.
@@ -502,9 +504,11 @@ return function(sh, cmd, args, hook, tcb)
 							bb.lower, bb.upper, bb.cap = lattr or nil, uattr or nil, cattr or nil
 						end
 					end
-					if roattr and bb and not nref then
+					if roattr and nref and sh.vars[a] and sh.vars[a].ref then
+						sh.vars[a].ro = true -- (with -n, -r makes the REFERENCE readonly)
+					elseif roattr and bb and not nref then
 						bb.ro = true
-					end -- bash ignores -r when -n is given
+					end
 					if bb then
 						if unexport or plusx then
 							bb.exported = nil

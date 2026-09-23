@@ -534,28 +534,29 @@ local dparen_is_arith -- forward (defined below)
 local function scan_braces(s, bi, dq)
 	local i, ns, depth = bi + 1, #s, 1
 	local sq_lit = dq and POSIX_DQ
+	-- running off the end inside a quote names that quote; inside the braces, `}` (bash)
+	local function skip_to(q, esc)
+		while i <= ns and s:sub(i, i) ~= q do
+			i = i + ((esc and s:sub(i, i) == "\\") and 2 or 1)
+		end
+		if i > ns then
+			error("unexpected EOF while looking for matching `" .. q .. "'")
+		end
+		i = i + 1
+	end
 	while i <= ns and depth > 0 do
 		local c = s:sub(i, i)
 		if c == "\\" then
 			i = i + 2
 		elseif c == "$" and s:sub(i + 1, i + 1) == "'" then -- $'…': a \' inside doesn't close it
 			i = i + 2
-			while i <= ns and s:sub(i, i) ~= "'" do
-				i = i + (s:sub(i, i) == "\\" and 2 or 1)
-			end
-			i = i + 1
+			skip_to("'", true)
 		elseif c == "'" and not sq_lit then
 			i = i + 1
-			while i <= ns and s:sub(i, i) ~= "'" do
-				i = i + 1
-			end
-			i = i + 1
+			skip_to("'", false)
 		elseif c == '"' then
 			i = i + 1
-			while i <= ns and s:sub(i, i) ~= '"' do
-				i = i + (s:sub(i, i) == "\\" and 2 or 1)
-			end
-			i = i + 1
+			skip_to('"', true)
 		elseif c == "{" then
 			-- only a nested `${` opens a level; a bare `{` is an ordinary char, so
 			-- `${X//a/{x,y,z}}` ends at the FIRST `}` (bash: replacement `{x,y,z`, then `}`)
@@ -564,20 +565,19 @@ local function scan_braces(s, bi, dq)
 			end
 			i = i + 1
 		elseif c == "$" and s:sub(i + 1, i + 1) == "(" then
-			local ok, nj = pcall(scan_cmdsub, s, i + 2) -- a `}` inside $(…) doesn't close
-			i = (ok and nj) or (i + 1)
+			i = scan_cmdsub(s, i + 2) -- a `}` inside $(…) doesn't close (unclosed: its error)
 		elseif c == "`" then -- …nor one inside `…`
 			i = i + 1
-			while i <= ns and s:sub(i, i) ~= "`" do
-				i = i + (s:sub(i, i) == "\\" and 2 or 1)
-			end
-			i = i + 1
+			skip_to("`", true)
 		elseif c == "}" then
 			depth = depth - 1
 			i = i + 1
 		else
 			i = i + 1
 		end
+	end
+	if depth > 0 then
+		error("unexpected EOF while looking for matching `}'")
 	end
 	return i
 end
@@ -616,7 +616,7 @@ parse_paramexp = function(inner)
 	-- ${-} ${?} ${$} ${!}: the special one-char parameters (like their bare $-, $?,
 	-- $$, $! forms). Handled here so `!` isn't mistaken for the indirect prefix.
 	if inner == "-" or inner == "?" or inner == "$" or inner == "!" then
-		return { special = inner }
+		return { special = inner, braced = true }
 	end
 	local indices, lenpfx, sharp_op = false, false, nil
 	-- ${?:-x} ${$:+y} ${-+z} ${!:-w}: a one-char SPECIAL parameter followed by an operator
