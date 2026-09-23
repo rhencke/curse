@@ -38,6 +38,10 @@ return function(sh, cmd, args, hook, tcb)
 		-- leaves OPTARG alone, and the call fails with NAME set to `?`
 		local optarg_ro = false
 		local function optarg_set(v)
+			if v == nil then -- (bash's unbind_variable_noref: OPTARG itself goes, readonly or
+				sh.vars.OPTARG = nil -- a nameref, silently)
+				return
+			end
 			local b = sh.vars[sh:deref("OPTARG")]
 			if b and b.ro then
 				if not optarg_ro then
@@ -137,6 +141,9 @@ return function(sh, cmd, args, hook, tcb)
 		sh.getopts_state = sh.getopts_state or setmetatable({}, { __mode = "k" })
 		sh.getopts_state[sh.vars[sh:deref("OPTIND")]] = cur ~= 1 and cur or nil
 		local valid = vname:match("^[%a_][%w_]*$") -- an invalid NAME -> status 1, var not set
+		if not valid then
+			io.stderr:write("curse: getopts: `" .. vname .. "': not a valid identifier\n")
+		end
 		if res.done then
 			if valid then
 				sh:set_str(vname, "?")
@@ -150,7 +157,10 @@ return function(sh, cmd, args, hook, tcb)
 			elseif res.err or res.clr then
 				optarg_set(nil)
 			end
-			if res.err then -- (bash's sh_getopt: `$0: illegal option -- h`, no line number)
+			-- (bash's sh_getopt: `$0: illegal option -- h`, no line number; OPTERR=0 silences it)
+			local oe = sh.vars.OPTERR and sh:get("OPTERR") or "" -- (bash: atoi($OPTERR), unset/empty = 1)
+			local quiet = oe ~= "" and (tonumber(oe:match("^%s*([+-]?%d+)") or "0") or 0) == 0
+			if res.err and not quiet then
 				io.stderr:write((sh.argv0 or "curse") .. ": " .. res.err .. "\n")
 			end
 			if valid then

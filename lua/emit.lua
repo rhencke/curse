@@ -1767,7 +1767,15 @@ end
 EF.upv_wrapped = function(fname)
 	return (EF.lifted_names and #EF.lifted_names > 0) and ("__upv_wrap(" .. fname .. ")") or fname
 end
-local function compile_cmdsub(src, backtick, lifted, aenv, noalias, posix)
+local compile_cmdsub_inner
+-- (compiling the body moves the compile-time line: put it back for the enclosing command)
+local function compile_cmdsub(...)
+	local l, cl = EF.cur_line, EF.cur_cline
+	local r = { compile_cmdsub_inner(...) }
+	EF.cur_line, EF.cur_cline = l, cl
+	return unpack(r)
+end
+function compile_cmdsub_inner(src, backtick, lifted, aenv, noalias, posix)
 	local fallback = ("sh:capture_src(%q%s)"):format(src, noalias and ", " .. tostring(backtick or false) .. ", true"
 		or (backtick and ", true" or ""))
 	local pok, ast = pcall(require("parser").parse, src, nil, aenv, noalias, posix, EF.cur_cline or EF.cur_line)
@@ -5147,6 +5155,11 @@ simple_compiled = function(cx, st, after)
 	local ec = errchk(st) -- errexit after a failing native simple command
 	local ecs = ec ~= "" and ("; " .. ec) or ""
 	local u = und(st, cx.lifted) -- $_ = this command's last arg (bash), for the NEXT command
+	if cmd == "echo" and u ~= "" and body:sub(1, 12) == "sh:echo_cmd(" then
+		-- (echo sets $_ from the argv it already built: the last word isn't evaluated twice)
+		body = "sh:echo_cmd_u(" .. body:sub(13)
+		u = ""
+	end
 	-- PIPESTATUS after a simple command is a one-element array of its status (bash);
 	-- set BEFORE errchk so an ERR trap sees it. Gated on the program reading it.
 	local ps = EF.pipestatus and '; sh:array_assign("PIPESTATUS", {tostring(sh.status)}, false)' or ""

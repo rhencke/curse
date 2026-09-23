@@ -40,7 +40,13 @@ return function(sh, cmd, args, hook, tcb)
 							break
 						end
 						if lg.perr then -- syntax error on the line: run nothing on it (bash), status 2
-							io.stderr:write("curse: eval: syntax error\n")
+							-- (reported as the shell's own syntax errors are, labelled `eval:`)
+							sh.perr_label = "eval"
+							local pok, perr = pcall(require("interp").exec_stmt, sh, lg.perr, hook)
+							sh.perr_label = nil
+							if not pok and not (type(perr) == "table" and perr.__curse_parseerr) then
+								error(perr)
+							end
 							sh.status = 2
 							return
 						end

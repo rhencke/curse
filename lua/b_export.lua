@@ -206,7 +206,7 @@ return function(sh, cmd, args, hook, tcb)
 			-- the environment as BASH_FUNC_NAME%% — rt.fexport_sync; -n/+x un-exports)
 			local allok = true
 			for _, nm in ipairs(rest) do
-				if (cmd == "export" or doexport) and nm:find("=", 1, true) then
+				if (cmd == "export" or doexport) and (nm:find("=", 1, true) or nm:find("/", 1, true)) then
 					io.stderr:write("curse: " .. cmd .. ": " .. nm .. ": cannot export\n")
 					allok = false
 				elseif not sh.functions[nm] then
@@ -389,7 +389,10 @@ return function(sh, cmd, args, hook, tcb)
 				if rov and rov.ro then
 					-- reassigning a readonly variable is rejected (bash: `typeset +r r=v` too)
 					-- (declare/typeset name themselves; export/readonly don't, like bash)
-					local pfx = (cmd == "export" or cmd == "readonly") and "" or (cmd .. ": ")
+					-- (…but with -a/-A the array assignment code reports it, naming the builtin:
+					-- `readonly: r: readonly variable`)
+					local compound = aattr or assoc
+					local pfx = ((cmd == "export" or cmd == "readonly") and not compound) and "" or (cmd .. ": ")
 					io.stderr:write("curse: " .. pfx .. nm .. ": readonly variable\n")
 					allok = false
 				elseif

@@ -2105,6 +2105,7 @@ end
 
 local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs)
 	local i, n, line = 1, #src, lineabs or 1
+	local firstline = lineabs or 1 -- (the text's first line: an EOF error counts from it)
 	if line0 then -- a $(…) body numbers from its command's line; leading newlines don't count
 		line = line0 - #(src:match("^[ \t\n]*"):gsub("[^\n]", ""))
 	end
@@ -2719,8 +2720,9 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs)
 	end
 	brace_group = function() -- parse `{ stmts }` (a function body / group)
 		ws()
-		if src:sub(i, i) ~= "{" then
-			error("expected { for function body")
+		if src:sub(i, i) ~= "{" then -- (bash: the token found instead)
+			local tok = peekword() or src:sub(i, i)
+			error("syntax error near `" .. (tok ~= "" and tok or "newline") .. "'")
 		end
 		i = i + 1
 		local stmts, term = parse_stmts({ ["}"] = true })
@@ -3000,6 +3002,14 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs)
 					end
 					if src:sub(k, k) == ")" then
 						local nm = src:sub(s, e)
+						-- (a reserved word can't be a NAME() function name: bash stops at the
+						-- token its grammar didn't expect there)
+						local RW = { ["for"] = "(", ["select"] = "(", ["if"] = ")", ["while"] = ")",
+							["until"] = ")", ["do"] = "do", ["done"] = "done", ["then"] = "then",
+							["else"] = "else", ["elif"] = "elif", ["fi"] = "fi", ["esac"] = "esac" }
+						if RW[nm] then
+							error("syntax error near `" .. RW[nm] .. "'")
+						end
 						i = k + 1
 						return funcdef_node(nm, dstart, dline)
 					end
@@ -3470,8 +3480,8 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs)
 			end
 			if peekword() == "in" then
 				i = i + 2
-			else
-				error("syntax error: `case' expected `in'")
+			else -- (bash: the token that isn't `in`)
+				error("syntax error near `" .. (peekword() or src:sub(i, i)) .. "'")
 			end -- ysh `case (x) { }` etc. rejected
 			-- separator skipper that STOPS at ;; (so a clause body ends there)
 			local function skip_sep()
@@ -4272,12 +4282,14 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs)
 			end
 			local before = i
 			local st = parse_stmt()
+			if i == before then
+				-- no progress: a stray metacharacter/keyword in command position (`)`, `}`,
+				-- `do`, …) — a syntax error, and a guard against an infinite loop (even when
+				-- an empty statement came back: `then ) fi` would spin forever)
+				error("syntax error near `" .. src:sub(i, i) .. "'")
+			end
 			if st then
 				stmts[#stmts + 1] = st
-			elseif i == before then
-				-- no progress: a stray metacharacter/keyword in command position (`)`, `}`,
-				-- `do`, …) — a syntax error, and a guard against an infinite loop.
-				error("syntax error near `" .. src:sub(i, i) .. "'")
 			end
 			-- consume this statement's single trailing `;` (its terminator), so the next
 			-- iteration lands on a genuine command position; `&`/newlines are handled by
@@ -4354,7 +4366,8 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs)
 					stmts = stmts,
 					perr = {
 						t = "parse_error",
-						line = recover and line or startline, -- (a recoverable one: the token's line)
+						-- (a recoverable one, or a `near TOKEN` one: the token's line)
+						line = (recover or (type(st) == "string" and st:find("near `", 1, true))) and line or startline,
 						msg = recover and ("syntax error near `" .. (st.tok or "(") .. "'")
 							or (type(st) == "table" and st.__curse_perr and st.msg) or tostring(st),
 						text = type(st) == "table" and st.__curse_perr and st.text or nil,
@@ -4442,7 +4455,8 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs)
 		if lg and lg.perr then
 			local m = tostring(lg.perr.msg or "")
 			if m:find("unexpected end of file", 1, true) or m:find("matching `)'", 1, true) then
-				lg.perr.line = select(2, src:gsub("\n", "")) + (src:sub(-1) == "\n" and 1 or 2)
+				lg.perr.line = firstline - 1 + select(2, src:gsub("\n", "")) + (src:sub(-1) == "\n" and 1 or 2)
+					+ (((src:match("(\\*)$") or ""):len() % 2 == 1) and 1 or 0) -- (a trailing `\` continues)
 			end
 		end
 		if lg and lg.perr and lg.perr.text == nil and i <= n then

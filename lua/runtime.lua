@@ -128,7 +128,9 @@ function M.err_prefix(sh)
 		name = sh.argv0 or "bash"
 	end
 	local ln = current_line(sh)
-	if sh.in_perr and sh.opt_c and not sh.cur_source then
+	if sh.in_perr and sh.perr_label then -- (a syntax error in eval'd text: `NAME: eval: line N:`)
+		name = name .. ": " .. sh.perr_label
+	elseif sh.in_perr and sh.opt_c and not sh.cur_source then
 		name = name .. ": -c"
 	end
 	if ln > 0 then
@@ -4745,6 +4747,24 @@ local function norm_key(b, key)
 	end
 	return key
 end
+-- A negative subscript past the start of indexed array NAME (`c[-5]` with 2 elements)?
+function M.neg_oob(sh, name, key)
+	if type(key) ~= "number" or key >= 0 then
+		return false
+	end
+	local b = sh.vars[sh:deref(name)]
+	if b and b.assoc then
+		return false
+	end
+	local mx = (b and b.arr) and arr_max(b.arr) or ((b and (b.s or b.n)) and i64(0) or i64(-1))
+	return mx + 1 + key < 0
+end
+-- ${a[-N]} past the start: bash warns (`a: bad array subscript`) and expands to nothing
+function M.elem_read_check(sh, name, key)
+	if M.neg_oob(sh, name, key) then
+		io.stderr:write("curse: " .. name .. ": bad array subscript\n")
+	end
+end
 function Shell:array_set(name, key, val, append)
 	if val:find("\0", 1, true) then
 		val = M.cstr(val)
@@ -7136,8 +7156,20 @@ end
 -- (to_arr_key(arith_str)). Readonly -> reject (status 1, line-abort like interp); a bad
 -- subscript (negative out of range) -> status 1, non-fatal. Gated at emit to non-nameref
 -- programs and a non-empty, emit_word-able subscript.
+-- a negative subscript past the start: `NAME[SUB]: bad array subscript`, the line aborted —
+-- reported before readonly-ness, since bash evaluates the subscript first
+local function neg_oob_abort(sh, name, key, sub)
+	if type(key) == "number" and key < 0 and M.neg_oob(sh, name, key) then
+		io.stderr:write("curse: " .. name .. "[" .. sub .. "]: bad array subscript\n")
+		sh.status = 1
+		error({ __curse_exit = 1, __curse_lineabort = true })
+	end
+end
 function M.assign_element(sh, name, raw, expanded, value, append)
 	local rb = sh.vars[sh:deref(name)]
+	if rb and rb.ro and rb.arr and not rb.assoc and raw:find("-", 1, true) then
+		neg_oob_abort(sh, name, M.array_key(sh, name, raw, expanded), raw)
+	end
 	if rb and rb.ro then
 		io.stderr:write("curse: " .. name .. ": readonly variable\n")
 		sh.status = 1
@@ -7176,7 +7208,7 @@ function M.assign_element(sh, name, raw, expanded, value, append)
 		key = v
 	end
 	if not sh:array_set(name, key, value, append) then
-		io.stderr:write("curse: " .. name .. ": bad array subscript\n")
+		neg_oob_abort(sh, name, key, raw)
 		sh.status = 1
 		sh.assign_err = true
 		return
@@ -7207,11 +7239,14 @@ end
 -- sh.vars copy). `keyi` is the int64 arith value; only reached for a non-assoc array (the emitter
 -- gates on is_assoc). Bug fixed: `a[i]=…` in a `for ((;;))` loop with a lifted `i`.
 function M.assign_element_i(sh, name, keyi, value, append)
+	if keyi < 0 then
+		neg_oob_abort(sh, name, to_arr_key(keyi), M.i64_to_str(keyi))
+	end
 	if elem_readonly_abort(sh, name) then
 		return
 	end
 	if not sh:array_set(name, to_arr_key(keyi), value, append) then
-		io.stderr:write("curse: " .. name .. ": bad array subscript\n")
+		neg_oob_abort(sh, name, to_arr_key(keyi), M.i64_to_str(keyi))
 		sh.status = 1
 		sh.assign_err = true
 		return
@@ -7255,7 +7290,7 @@ function M.assign_element_x(sh, name, src, value, append)
 		key = to_arr_key(v)
 	end
 	if not sh:array_set(name, key, value, append) then
-		io.stderr:write("curse: " .. name .. ": bad array subscript\n")
+		neg_oob_abort(sh, name, key, src)
 		sh.status = 1
 		sh.assign_err = true
 		return
@@ -7329,7 +7364,11 @@ end
 -- key, then defer to Shell:expand_param — the SAME element read + set -u nounset + isset path
 -- the interpreter uses, so the value matches exactly.
 function M.array_elem(sh, name, raw, expanded)
-	return sh:expand_param({ name = name, index = raw }, nil, nil, M.array_key(sh, name, raw, expanded))
+	local key = M.array_key(sh, name, raw, expanded)
+	if type(key) == "number" and key < 0 then
+		M.elem_read_check(sh, name, key)
+	end
+	return sh:expand_param({ name = name, index = raw }, nil, nil, key)
 end
 
 -- Read an array/assoc ELEMENT in ARITHMETIC context (`$(( a[i] ))`), exactly interp's arith
@@ -8035,6 +8074,12 @@ function Shell:echo_cmd(...)
 	if self.write_err and self.out == io.write then
 		M.chkwrite_report(self, "echo", self.write_errmsg)
 	end
+end
+-- …and $_ = its last argument (for a program that reads $_)
+function Shell:echo_cmd_u(...)
+	local n = select("#", ...)
+	self:echo_cmd(...)
+	self:set_str("_", n > 0 and (select(n, ...)) or "echo")
 end
 -- bash's sh_chkwrite: flush a builtin's output; a failure (full disk, a read-only fd) is
 -- reported as `NAME: write error: REASON` and flagged (the command's status becomes 1).

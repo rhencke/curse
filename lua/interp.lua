@@ -1328,6 +1328,9 @@ local function expand_part_str(sh, p, assign)
 		local subkey
 		if pe.index and pe.index ~= "@" and pe.index ~= "*" then
 			subkey = array_key(sh, pe.name, pe.index)
+			if type(subkey) == "number" and subkey < 0 and pe.op ~= "len" then
+				rt.elem_read_check(sh, pe.name, subkey)
+			end
 		end
 		-- pattern-context ops (strip #/##/%/%%, subst /,//) treat quoted metachars
 		-- literally; everything else (defaults :-/-, etc.) is an ordinary value.
@@ -2621,7 +2624,13 @@ local function apply_redirs(sh, redirs, cname) -- cname: the command (names {v} 
 				if pok then
 					body = expand_word(sh, pw)
 				else
-					io.stderr:write("curse: command substitution: unexpected EOF while looking for matching `)'\n")
+					-- (bash names it `NAME: command substitution: line N:`, N the line the
+					-- here-document ended on)
+					local sl = sh.cur_line
+					sh.in_perr, sh.perr_label = true, "command substitution"
+					sh.cur_line = (sl or 1) + select(2, body:gsub("\n", "")) + 1
+					io.stderr:write("curse: unexpected EOF while looking for matching `)'\n")
+					sh.in_perr, sh.perr_label, sh.cur_line = nil, nil, sl
 					hok, ok = false, false
 				end
 			end
@@ -4654,6 +4663,17 @@ exec_stmt = function(sh, st, hook)
 				error({ __curse_exit = 1, __curse_lineabort = true })
 			end
 		end
+		-- a negative subscript past the start is reported before readonly-ness (bash
+		-- evaluates the subscript first): `c[-2]: bad array subscript`, line aborted
+		-- (only for a READONLY array — else the assignment itself evaluates it, once)
+		if st.index and not st.arith and rb and rb.ro and rb.arr and not rb.assoc and st.index:find("-", 1, true) then
+			local k = array_key(sh, st.name, st.index)
+			if rt.neg_oob(sh, st.name, k) then
+				io.stderr:write("curse: " .. st.name .. "[" .. st.index .. "]: bad array subscript\n")
+				sh.status = 1
+				error({ __curse_exit = 1, __curse_lineabort = true })
+			end
+		end
 		if rb and rb.ro then -- readonly: reject the assignment (status 1); fatal in `sh -c`
 			-- (or posix mode). Through a nameref bash names the TARGET.
 			io.stderr:write("curse: " .. sh:deref(st.name) .. ": readonly variable\n")
@@ -4721,11 +4741,11 @@ exec_stmt = function(sh, st, hook)
 				end
 			end)
 			if not aok then
-				if type(aerr) == "table" and aerr.__curse_badsub then
-					io.stderr:write("curse: " .. st.name .. ": bad array subscript\n")
+				if type(aerr) == "table" and aerr.__curse_badsub then -- (`c[-5]=v`: aborts the line)
+					io.stderr:write("curse: " .. st.name .. "[" .. tostring(st.index) .. "]: bad array subscript\n")
 					sh.status = 1
 					sh.assign_err = true
-					return
+					error({ __curse_exit = 1, __curse_lineabort = true })
 				elseif type(aerr) == "table" and aerr.__curse_experr and not aerr.__curse_lineabort then
 					sh.status = 1
 					sh.assign_err = true
@@ -5467,7 +5487,8 @@ exec_stmt = function(sh, st, hook)
 			-- unexpected end of file`), then the offending line as `…'
 			local msg = tostring(st.msg or "syntax error"):gsub("^.-:%d+: ", "")
 			msg = msg:gsub("^syntax error near `", "syntax error near unexpected token `")
-			if not msg:find("^syntax error") and not msg:find("^unexpected EOF") then
+			if not msg:find("^syntax error") and not msg:find("^unexpected EOF")
+				and not msg:find("^maximum here%-document count exceeded") then
 				msg = "syntax error: " .. msg
 			end
 			if st.line then
