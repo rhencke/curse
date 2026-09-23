@@ -258,14 +258,15 @@ local function alias_mismatch(mod, sh)
 end
 
 local compile_first, compile_store
+
 local LOOP_WORDS = { "while", "until", "for", "select", "function" }
 local function may_loop(src)
 	for _, w in ipairs(LOOP_WORDS) do
-		if src:find("%f[%w_]" .. w .. "%f[^%w_]") then
+		if src:find(w, 1, true) and src:find("%f[%w_]" .. w .. "%f[^%w_]") then -- (plain first: cheap)
 			return true
 		end
 	end
-	return src:find("%(%s*%)") ~= nil -- (a `name()` funcdef)
+	return src:find("(", 1, true) ~= nil and src:find("%(%s*%)") ~= nil -- (a `name()` funcdef)
 end
 local deferred = {}
 -- (loop iterations before an interpreted cold run compiles and switches; CURSE_HOT_LOOP

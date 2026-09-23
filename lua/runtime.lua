@@ -1694,9 +1694,7 @@ function Shell:exec(...)
 			return self:run_noexec(execpath, args, n)
 		end -- no shebang: run as a script
 		if rc ~= 0 then
-			self:errmsg(
-				"curse: " .. (self.exec_builtin and "exec: " or "") .. M.err_name(tostring(args[1])) .. (rc == 2 and (self.exec_builtin and ": not found\n" or ": command not found\n") or ": Permission denied\n")
-			)
+			self:errmsg(M.spawn_errmsg(self, args[1], execpath, rc))
 			self.status = (rc == 2) and 127 or 126
 			return
 		end
@@ -1735,7 +1733,7 @@ function Shell:exec(...)
 	C.close(wfd)
 	if rc ~= 0 and rc ~= 8 then -- ENOENT -> "command not found" (127); else can't-execute (126)
 		C.close(rfd)
-		self:errmsg("curse: " .. (self.exec_builtin and "exec: " or "") .. M.err_name(tostring(args[1])) .. (rc == 2 and (self.exec_builtin and ": not found\n" or ": command not found\n") or ": Permission denied\n"))
+		self:errmsg(M.spawn_errmsg(self, args[1], execpath, rc))
 		self.status = (rc == 2) and 127 or 126
 		return
 	end
@@ -5018,6 +5016,55 @@ end
 -- executable, non-directory match (like execvp) — and cache it (bash's command
 -- hash). The cache survives filesystem changes under a STABLE $PATH (only
 -- `hash -r` clears it then), but CHANGING $PATH invalidates it — bash rehashes.
+-- Found commands, shared by every shell this PROCESS runs (a daemon worker serves many
+-- scripts): keyed by the PATH string, valid while no PATH directory has changed (an added
+-- or removed file changes its directory's mtime) — re-checked once per request (daemon:
+-- M.path_epoch). Only positive results, like bash's hash; a PATH with a relative entry
+-- (cwd-dependent) isn't cached.
+M.path_epoch = 0
+local path_cache
+local PC = { key = nil, map = {}, sig = nil, epoch = -1 }
+local function path_sig(curpath)
+	local t = {}
+	for dir in (curpath .. ":"):gmatch("([^:]*):") do
+		if ffi.C.curse_rt_stat(dir, stbuf_a) == 0 then
+			local u = ffi.cast("int64_t *", stbuf_a)
+			t[#t + 1] = tostring(u[11]) .. "." .. tostring(u[12]) -- st_mtim (sec, nsec)
+		else
+			t[#t + 1] = "-"
+		end
+	end
+	return table.concat(t, ",")
+end
+function path_cache(curpath)
+	if curpath:find("^:") or curpath:find("::", 1, true) or curpath:find(":$") or curpath:find("%f[^:][^/]") then
+		return nil -- (a relative entry)
+	end
+	if PC.key ~= curpath then
+		PC.key, PC.map, PC.sig, PC.epoch = curpath, {}, path_sig(curpath), M.path_epoch
+	elseif PC.epoch ~= M.path_epoch then
+		PC.epoch = M.path_epoch
+		local sg = path_sig(curpath)
+		if sg ~= PC.sig then
+			PC.map, PC.sig = {}, sg
+		end
+	end
+	return PC
+end
+-- The diagnostic for a spawn that failed with errno `rc`. A PATH/hash-resolved command
+-- whose file then fails ENOENT is named by its PATH (bash: the hashed file is gone, or
+-- — the file exists — its interpreter is: "cannot execute: required file not found").
+function M.spawn_errmsg(self, name, execpath, rc)
+	local pre = "curse: " .. (self.exec_builtin and "exec: " or "")
+	if rc == 2 and not self.exec_builtin and execpath then
+		local shown = tostring(name):find("/", 1, true) and M.err_name(tostring(name)) or execpath
+		if ffi.C.access(execpath, 0) == 0 then
+			return pre .. shown .. ": cannot execute: required file not found\n"
+		end
+		return pre .. shown .. ": No such file or directory\n"
+	end
+	return pre .. M.err_name(tostring(name)) .. (rc == 2 and (self.exec_builtin and ": not found\n" or ": command not found\n") or ": Permission denied\n")
+end
 function Shell:resolve_cmd(name)
 	local curpath = self:get("PATH")
 	if self.hashpath and self.hashpath ~= curpath then
@@ -5029,20 +5076,30 @@ function Shell:resolve_cmd(name)
 		c.hits = c.hits + 1
 		return c.path
 	end
-	for dir in (curpath .. ":"):gmatch("([^:]*):") do
-		local cand = (dir == "" and "." or dir) .. "/" .. name
-		if
-			ffi.C.access(cand, 1) == 0
-			and ffi.C.curse_rt_stat(cand, stbuf_a) == 0 -- 1 == X_OK
-			and bit.band(ffi.cast("uint32_t *", stbuf_a + 24)[0], 0xF000) ~= 0x4000
-		then -- not a dir
-			self.hashcache = self.hashcache or {}
-			M.hash_seq = M.hash_seq + 1
-			self.hashcache[name] = { path = cand, hits = 1, seq = M.hash_seq }
-			return cand
+	local pc = path_cache(curpath)
+	local cand = pc and pc.map[name]
+	if not cand then
+		for dir in (curpath .. ":"):gmatch("([^:]*):") do
+			local cd = (dir == "" and "." or dir) .. "/" .. name
+			if
+				ffi.C.access(cd, 1) == 0
+				and ffi.C.curse_rt_stat(cd, stbuf_a) == 0 -- 1 == X_OK
+				and bit.band(ffi.cast("uint32_t *", stbuf_a + 24)[0], 0xF000) ~= 0x4000
+			then -- not a dir
+				cand = cd
+				break
+			end
+		end
+		if cand and pc then
+			pc.map[name] = cand
 		end
 	end
-	return nil
+	if cand then
+		self.hashcache = self.hashcache or {}
+		M.hash_seq = M.hash_seq + 1
+		self.hashcache[name] = { path = cand, hits = 1, seq = M.hash_seq }
+	end
+	return cand
 end
 function Shell:phys_cwd()
 	local p = ffi.C.getcwd(scratch, 4096)

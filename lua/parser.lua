@@ -1388,7 +1388,7 @@ local function parse_word(w)
 		local c = w:sub(i, i)
 		if c == "'" then -- single quotes: literal, no expansion
 			local e = w:find("'", i + 1, true) or #w + 1
-			add({ lit = w:sub(i + 1, e - 1), q = true })
+			parts[#parts + 1] = { lit = w:sub(i + 1, e - 1), q = true }
 			i = e + 1
 		elseif c == '"' then -- double quotes: expand inside; skip $(..)/$((..))/${..}/`..`
 			local j = i + 1 -- so their inner " isn't the close
@@ -1437,7 +1437,7 @@ local function parse_word(w)
 			local before = #parts
 			parse_dquote(w:sub(i + 1, j - 1), add)
 			if #parts == before then
-				add({ lit = "", q = true })
+				parts[#parts + 1] = { lit = "", q = true }
 			end -- empty "" is still a field
 			i = j + 1
 		elseif c == "$" then
@@ -1455,7 +1455,7 @@ local function parse_word(w)
 					j = j + 1
 				end
 			end
-			add({ cmdsub = table.concat(buf), q = false, backtick = true, aenv = ALIAS_ENV })
+			parts[#parts + 1] = { cmdsub = table.concat(buf), q = false, backtick = true, aenv = ALIAS_ENV }
 			i = j + 1
 		elseif (c == "<" or c == ">") and w:sub(i + 1, i + 1) == "(" then
 			-- <(cmd) / >(cmd) process substitution: capture the inner command — its body has
@@ -1480,24 +1480,24 @@ local function parse_word(w)
 					j = j + 1
 				end
 			end
-			add({ procsub = w:sub(i + 2, j - 1), dir = c, q = false })
+			parts[#parts + 1] = { procsub = w:sub(i + 2, j - 1), dir = c, q = false }
 			i = j + 1
 		elseif c == "\\" then -- backslash escape: literal next char (newline = continuation)
 			local nx = w:sub(i + 1, i + 1)
 			if nx == "\n" then -- line continuation: drop
 			elseif nx == "" then -- a backslash ending the input is itself literal (bash: `a\`)
-				add({ lit = "\\", q = true })
+				parts[#parts + 1] = { lit = "\\", q = true }
 			else
-				add({ lit = nx, q = true })
+				parts[#parts + 1] = { lit = nx, q = true }
 			end
 			i = i + 2
 		else
 			local s, e = w:find("^[^$'\"`\\<>]+", i)
 			if not s then
-				add({ lit = w:sub(i, i), q = false })
+				parts[#parts + 1] = { lit = w:sub(i, i), q = false }
 				i = i + 1
 			else
-				add({ lit = w:sub(s, e), q = false })
+				parts[#parts + 1] = { lit = w:sub(s, e), q = false }
 				i = e + 1
 			end
 		end
@@ -1866,6 +1866,9 @@ local function classify_brace(inner)
 end
 -- Parse a raw word into factors, or nil if it has no expandable brace.
 local function brace_factors(s)
+	if not s:find("{", 1, true) then
+		return nil -- (the common word: no brace at all)
+	end
 	local factors, litbuf, any = {}, {}, false
 	local function flush()
 		if #litbuf > 0 then
@@ -2183,6 +2186,8 @@ local function dequote_word(w)
 	return table.concat(out)
 end
 
+-- the characters a word scan must look at (anything else just continues the word)
+local WORD_SPECIAL = "[\\()\"'$<>|&`; \t\n?*+@!]"
 local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs)
 	local i, n, line = 1, #src, lineabs or 1
 	local firstline = lineabs or 1 -- (the text's first line: an EOF error counts from it)
@@ -2597,17 +2602,29 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs)
 			error("syntax error: unexpected end of file")
 		end
 	end
-	local function word(stop_paren, stop_cmp) -- read one shell word, keeping quotes and $(( )) / ${ } / $( ) balanced
-		ws()
-		local start, line0, lfix = i, line, 0
-		local function hdwarn(rp, dp, d) -- (see scan_cmdsub's onwarn)
+	-- scan_cmdsub's onwarn for a word starting at `start` on line `line0` (built only where a
+	-- $( ) needs it: a closure per word would keep the word scan out of the JIT)
+	local function hdwarn_for(start, line0)
+		return function(rp, dp, d)
 			local function at(p)
 				return line0 + select(2, src:sub(start, p - 1):gsub("\n", ""))
 			end
 			warns[#warns + 1] = { t = "warn", line = at(dp),
 				msg = ("warning: here-document at line %d delimited by end-of-file (wanted `%s')"):format(at(rp), d) }
 		end
+	end
+	local function word(stop_paren, stop_cmp) -- read one shell word, keeping quotes and $(( )) / ${ } / $( ) balanced
+		ws()
+		local start, line0, lfix = i, line, 0
 		while i <= n do
+			-- (a run of ordinary characters is part of the word: jump to the next one that
+			-- could matter — one find instead of a per-character pattern test)
+			local j = src:find(WORD_SPECIAL, i)
+			if not j then
+				i = n + 1
+				break
+			end
+			i = j
 			local c = src:sub(i, i)
 			if c == "\\" then -- backslash escapes the next char (incl. metachars/space)
 				if src:sub(i + 1, i + 1) == "\n" then
@@ -2630,7 +2647,7 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs)
 							i = i + 2
 							prex_comsub()
 						else
-							i = scan_cmdsub(src, i + 2, hdwarn) -- case/quote/nesting-aware boundary
+							i = scan_cmdsub(src, i + 2, hdwarn_for(start, line0)) -- case/quote/nesting-aware boundary
 						end
 					elseif d == "$" and src:sub(i + 1, i + 1) == "{" then
 						i = scan_braces(src, i + 1, true) -- ${…}: inner \ ' " and nested {} don't close it
@@ -2695,7 +2712,7 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs)
 					i = i + 2
 					prex_comsub()
 				else
-					local je, hdp = scan_cmdsub(src, i + 2, hdwarn) -- case/quote/nesting-aware boundary (errors if unclosed)
+					local je, hdp = scan_cmdsub(src, i + 2, hdwarn_for(start, line0)) -- case/quote/nesting-aware boundary (errors if unclosed)
 					local cbody = src:sub(i + 2, je - 2)
 					-- (not when the static parse could be wrong: aliases in play, extglob
 					-- patterns, here-documents)
@@ -2744,7 +2761,7 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs)
 				-- <(cmd) / >(cmd) process substitution: part of the word — scanned like $(…)
 				-- (its body has its own quoting / case syntax)
 				i = scan_cmdsub(src, i + 2)
-			elseif c:match("[?*+@!]") and src:sub(i + 1, i + 1) == "(" then
+			elseif (c == "?" or c == "*" or c == "+" or c == "@" or c == "!") and src:sub(i + 1, i + 1) == "(" then
 				-- extglob ?(..) *(..) +(..) @(..) !(..): part of the word, not a subshell
 				i = i + 2
 				local d = 1
@@ -2774,7 +2791,7 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs)
 					error("unexpected EOF while looking for matching ``'")
 				end -- unclosed backtick
 				i = i + 1
-			elseif c:match("[ \t\n;]") then
+			elseif c == " " or c == "\t" or c == "\n" or c == ";" then
 				break
 			else
 				i = i + 1
@@ -3003,6 +3020,279 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs)
 			error("syntax error near `" .. (src:sub(i, i) == "" and "newline" or src:sub(i, i)) .. "'")
 		end
 		return { fd = tfd, op = op, target = unquote(raw), src = raw, fdvar = fdvar, line = line } -- (src: `declare -f`)
+	end
+
+	-- Parse ONE assignment at the cursor (NAME=… / NAME[i]=… / NAME+=… /
+	-- NAME=(array)); returns an assign node, or nil (cursor unchanged) if there
+	-- isn't one. Used for both statements and leading prefix assignments.
+	-- Parse an array literal `( elem elem … )` with `i` positioned ON the `(`.
+	-- Each element is `value` or `[sub]=value` / `[sub]+=value`; the subscript may
+	-- nest brackets (`[a[0]]=x`). Consumes through the closing `)`.
+	local function parse_array_elems()
+		i = i + 1
+		local elems = {}
+		local line0, closed = line, false
+		while i <= n do
+			ws()
+			local c = src:sub(i, i)
+			if c == ")" then
+				i = i + 1
+				closed = true
+				break
+			end
+			if c == "\n" then
+				line = line + 1
+				i = i + 1
+			elseif c == "#" then
+				-- a comment runs to end of line (words never start here: ws() just ran)
+				while i <= n and src:sub(i, i) ~= "\n" do
+					i = i + 1
+				end
+			elseif c == "" then
+				break
+			elseif c == "&" or c == ";" or c == "|" or ((c == "<" or c == ">") and src:sub(i + 1, i + 1) ~= "(") then
+				-- a control operator inside the list (`a=(x & y)`): bash's recoverable
+				-- syntax error at that token, which discards the rest of the LINE — later
+				-- lines of a multi-line literal then parse as ordinary commands (bash)
+				-- (the token is the whole operator: `<>`, `>>`, `&&`, …)
+				local tok = src:match("^[<>]+", i) or src:match("^[&|;][&|;]?", i) or c
+				while i <= n and src:sub(i, i) ~= "\n" do
+					i = i + 1
+				end
+				error({ __curse_arraylit = true, tok = tok })
+			elseif c == "(" then
+				-- an ELEMENT can't be `(` (a nested `()`, as in `a=( inside=() )`): bash
+				-- reports a syntax error but the assignment is NON-fatal (the var stays
+				-- unset, the script CONTINUES). Resync past the outer `)` that closes the
+				-- array, then raise a RECOVERABLE error the line-parser marks as such.
+				local depth = 0
+				while i <= n do
+					local ch = src:sub(i, i)
+					if ch == "(" then
+						depth = depth + 1
+					elseif ch == ")" then
+						depth = depth - 1
+						if depth < 0 then
+							i = i + 1
+							break
+						end
+					end
+					i = i + 1
+				end
+				error({ __curse_arraylit = true })
+			else
+				-- `[foo bar]=v`: a subscript is read as one unit, blanks and all, when a
+				-- `=`/`+=` follows its closing `]` (bash's compound-assignment reader)
+				local pre = ""
+				if c == "[" then
+					local depth, k = 0, i
+					while k <= n do
+						local ch = src:sub(k, k)
+						if ch == "\\" then
+							k = k + 2
+						elseif ch == "'" then
+							k = (src:find("'", k + 1, true) or n) + 1
+						elseif ch == '"' then -- (a \" inside doesn't close it)
+							k = k + 1
+							while k <= n and src:sub(k, k) ~= '"' do
+								k = k + (src:sub(k, k) == "\\" and 2 or 1)
+							end
+							k = k + 1
+						elseif ch == "\n" then
+							break
+						else
+							if ch == "[" then
+								depth = depth + 1
+							elseif ch == "]" then
+								depth = depth - 1
+								if depth == 0 then
+									break
+								end
+							end
+							k = k + 1
+						end
+					end
+					if src:sub(k, k) == "]" and (src:sub(k + 1, k + 1) == "=" or src:sub(k + 1, k + 2) == "+=") then
+						pre = src:sub(i, k)
+						i = k + 1
+					end
+				end
+				local w = pre .. word(true)
+				if w == "" then
+					break
+				end
+				local keyraw, eop, rhs = nil, "=", w
+				if w:sub(1, 1) == "[" then
+					local depth, close, j = 0, nil, 1 -- (brackets inside quotes don't count)
+					while j <= #w do
+						local ch = w:sub(j, j)
+						if ch == "\\" then
+							j = j + 1
+						elseif ch == "'" then
+							j = w:find("'", j + 1, true) or #w
+						elseif ch == '"' then
+							j = j + 1
+							while j <= #w and w:sub(j, j) ~= '"' do
+								j = j + (w:sub(j, j) == "\\" and 2 or 1)
+							end
+						elseif ch == "[" then
+							depth = depth + 1
+						elseif ch == "]" then
+							depth = depth - 1
+							if depth == 0 then
+								close = j
+								break
+							end
+						end
+						j = j + 1
+					end
+					if close then
+						local after = w:sub(close + 1)
+						if after:sub(1, 2) == "+=" then
+							keyraw = w:sub(2, close - 1)
+							eop = "+="
+							rhs = after:sub(3)
+						elseif after:sub(1, 1) == "=" then
+							keyraw = w:sub(2, close - 1)
+							eop = "="
+							rhs = after:sub(2)
+						end
+					end
+				end
+				if keyraw == nil then
+					-- bare element: brace-expand into multiple elements ({1..9}, {a,b})
+					local factors = brace_factors(rhs)
+					if factors then
+						stream_factors(factors, function(x)
+							elems[#elems + 1] = { key = nil, op = "=", word = parse_word(x) }
+							return #elems >= BRACE_CAP
+						end)
+					else
+						elems[#elems + 1] = { key = nil, op = "=", word = parse_word(rhs) }
+					end
+				else
+					-- KEYED element. bash brace-expands the value only for an INDEXED array,
+					-- where a multi-word expansion also DE-KEYS it (`a=([k]=-{a,b}-)` ->
+					-- [0]="[k]=-a-" [1]="[k]=-b-"); an ASSOCIATIVE array keeps it keyed and
+					-- literal (`declare -A a; a=([k]=-{a,b}-)` -> a[k]="-{a,b}-"). The array
+					-- type isn't known until runtime, so precompute the brace-expanded BARE
+					-- words of the whole token and let do_arrayassign pick (indexed -> bare).
+					local elem = { key = keyraw, op = eop, word = parse_word(rhs) }
+					local factors = brace_factors(w)
+					if factors then
+						elem.brace_bare = {}
+						stream_factors(factors, function(x)
+							elem.brace_bare[#elem.brace_bare + 1] = parse_word(x)
+							return #elem.brace_bare >= BRACE_CAP
+						end)
+					end
+					elems[#elems + 1] = elem
+				end
+			end
+		end
+		if not closed then -- (never closed: bash's error, at the line it began on)
+			line = line0
+			comsub_eof = false
+			error("unexpected EOF while looking for matching `)'")
+		end
+		return elems
+	end
+
+	local function try_assign()
+		local name = src:match("^([%a_][%w_]*)", i)
+		if not name then
+			return nil
+		end
+		local p = i + #name
+		local subidx = nil
+		if src:sub(p, p) == "[" then
+			-- find the MATCHING ] (subscript may contain nested [ ] via ${a[i]}); quoted
+			-- text and escapes don't count (`A[']']=10` has the key `]`)
+			local depth, q = 1, p + 1
+			while q <= n and depth > 0 do
+				local ch = src:sub(q, q)
+				if ch == "\\" then
+					q = q + 1
+				elseif ch == "'" then
+					q = (src:find("'", q + 1, true) or n)
+				elseif ch == '"' then
+					local e = q + 1
+					while e <= n and src:sub(e, e) ~= '"' do
+						e = e + (src:sub(e, e) == "\\" and 2 or 1)
+					end
+					q = e
+				elseif ch == "$" and src:sub(q + 1, q + 1) == "(" then
+					local ok, nq = pcall(scan_cmdsub, src, q + 2)
+					q = ok and nq - 1 or q
+				elseif ch == "$" and src:sub(q + 1, q + 1) == "{" then
+					q = scan_braces(src, q + 1) - 1
+				elseif ch == "[" then
+					depth = depth + 1
+				elseif ch == "]" then
+					depth = depth - 1
+				end
+				if depth == 0 then
+					break
+				end
+				q = q + 1
+			end
+			if depth == 0 and src:sub(q + 1, q + 1):match("[+=]") then
+				subidx = src:sub(p + 1, q - 1)
+				p = q + 1
+			end
+		end
+		local op = nil
+		if src:sub(p, p + 1) == "+=" then
+			op = "+="
+			p = p + 2
+		elseif src:sub(p, p) == "=" then
+			op = "="
+			p = p + 1
+		end
+		if not op then
+			return nil
+		end
+		i = p
+		if src:sub(i, i) == "(" then -- array literal
+			local pstart = i
+			local elems = parse_array_elems()
+			local nx = src:sub(i, i)
+			if nx ~= "" and not nx:match("[%s;&|)<>]") then
+				-- `a=(4*3)/2`: text goes on past the `)` — then it's one ORDINARY word
+				-- (bash), assigned as a string (an integer var evaluates it)
+				local head = src:sub(pstart, i - 1)
+				local raw = head .. word(true)
+				return { t = "assign", name = name, index = subidx, append = (op == "+="), rhs = parse_word(raw) }
+			end
+			-- raw parenthesized text: a NAME=(…) used as a command PREFIX is a literal
+			-- string in bash (arrays can't be env bindings), decided at exec time.
+			return {
+				t = "arrayassign",
+				name = name,
+				elems = elems,
+				append = (op == "+="),
+				raw = src:sub(pstart, i - 1),
+				index = subidx,
+			}
+		end
+		-- The value is read from right after `=` with NO leading-whitespace skip: an
+		-- empty value (`X= cmd`) must stay empty, not absorb the next word as `word()`
+		-- (which skips blanks) would. Only read when a value actually follows.
+		local c0 = src:sub(i, i)
+		-- (`#` right after `=` is part of the value — `D=#abcd` — not a comment)
+		if c0 == "" or c0:match("[ \t\n;&|)]") then
+			return { t = "assign", name = name, index = subidx, append = (op == "+="), rhs = parse_word("") }
+		end
+		local raw = word(true) -- stop at unquoted ) so `(x=2)` closes the subshell
+		if not subidx and op == "=" and raw:sub(1, 3) == "$((" and raw:sub(-2) == "))" then
+			-- (a bad expression — or `$((1))$((2))` — takes the word path: its error is a
+			-- runtime one, reported when the assignment runs)
+			local aok, ae = pcall(arith, raw:sub(4, -3))
+			if aok then
+				return { t = "assign", name = name, arith = ae, rhssrc = raw } -- (rhssrc: declare -f)
+			end
+		end
+		return { t = "assign", name = name, index = subidx, append = (op == "+="), rhs = parse_word(raw) }
 	end
 
 	local function parse_command()
@@ -3781,278 +4071,6 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs)
 			end
 			return { t = "case", line = ln, subject = subject, clauses = clauses, redirs = tail_redirs() }
 		end
-		-- Parse ONE assignment at the cursor (NAME=… / NAME[i]=… / NAME+=… /
-		-- NAME=(array)); returns an assign node, or nil (cursor unchanged) if there
-		-- isn't one. Used for both statements and leading prefix assignments.
-		-- Parse an array literal `( elem elem … )` with `i` positioned ON the `(`.
-		-- Each element is `value` or `[sub]=value` / `[sub]+=value`; the subscript may
-		-- nest brackets (`[a[0]]=x`). Consumes through the closing `)`.
-		local function parse_array_elems()
-			i = i + 1
-			local elems = {}
-			local line0, closed = line, false
-			while i <= n do
-				ws()
-				local c = src:sub(i, i)
-				if c == ")" then
-					i = i + 1
-					closed = true
-					break
-				end
-				if c == "\n" then
-					line = line + 1
-					i = i + 1
-				elseif c == "#" then
-					-- a comment runs to end of line (words never start here: ws() just ran)
-					while i <= n and src:sub(i, i) ~= "\n" do
-						i = i + 1
-					end
-				elseif c == "" then
-					break
-				elseif c == "&" or c == ";" or c == "|" or ((c == "<" or c == ">") and src:sub(i + 1, i + 1) ~= "(") then
-					-- a control operator inside the list (`a=(x & y)`): bash's recoverable
-					-- syntax error at that token, which discards the rest of the LINE — later
-					-- lines of a multi-line literal then parse as ordinary commands (bash)
-					-- (the token is the whole operator: `<>`, `>>`, `&&`, …)
-					local tok = src:match("^[<>]+", i) or src:match("^[&|;][&|;]?", i) or c
-					while i <= n and src:sub(i, i) ~= "\n" do
-						i = i + 1
-					end
-					error({ __curse_arraylit = true, tok = tok })
-				elseif c == "(" then
-					-- an ELEMENT can't be `(` (a nested `()`, as in `a=( inside=() )`): bash
-					-- reports a syntax error but the assignment is NON-fatal (the var stays
-					-- unset, the script CONTINUES). Resync past the outer `)` that closes the
-					-- array, then raise a RECOVERABLE error the line-parser marks as such.
-					local depth = 0
-					while i <= n do
-						local ch = src:sub(i, i)
-						if ch == "(" then
-							depth = depth + 1
-						elseif ch == ")" then
-							depth = depth - 1
-							if depth < 0 then
-								i = i + 1
-								break
-							end
-						end
-						i = i + 1
-					end
-					error({ __curse_arraylit = true })
-				else
-					-- `[foo bar]=v`: a subscript is read as one unit, blanks and all, when a
-					-- `=`/`+=` follows its closing `]` (bash's compound-assignment reader)
-					local pre = ""
-					if c == "[" then
-						local depth, k = 0, i
-						while k <= n do
-							local ch = src:sub(k, k)
-							if ch == "\\" then
-								k = k + 2
-							elseif ch == "'" then
-								k = (src:find("'", k + 1, true) or n) + 1
-							elseif ch == '"' then -- (a \" inside doesn't close it)
-								k = k + 1
-								while k <= n and src:sub(k, k) ~= '"' do
-									k = k + (src:sub(k, k) == "\\" and 2 or 1)
-								end
-								k = k + 1
-							elseif ch == "\n" then
-								break
-							else
-								if ch == "[" then
-									depth = depth + 1
-								elseif ch == "]" then
-									depth = depth - 1
-									if depth == 0 then
-										break
-									end
-								end
-								k = k + 1
-							end
-						end
-						if src:sub(k, k) == "]" and (src:sub(k + 1, k + 1) == "=" or src:sub(k + 1, k + 2) == "+=") then
-							pre = src:sub(i, k)
-							i = k + 1
-						end
-					end
-					local w = pre .. word(true)
-					if w == "" then
-						break
-					end
-					local keyraw, eop, rhs = nil, "=", w
-					if w:sub(1, 1) == "[" then
-						local depth, close, j = 0, nil, 1 -- (brackets inside quotes don't count)
-						while j <= #w do
-							local ch = w:sub(j, j)
-							if ch == "\\" then
-								j = j + 1
-							elseif ch == "'" then
-								j = w:find("'", j + 1, true) or #w
-							elseif ch == '"' then
-								j = j + 1
-								while j <= #w and w:sub(j, j) ~= '"' do
-									j = j + (w:sub(j, j) == "\\" and 2 or 1)
-								end
-							elseif ch == "[" then
-								depth = depth + 1
-							elseif ch == "]" then
-								depth = depth - 1
-								if depth == 0 then
-									close = j
-									break
-								end
-							end
-							j = j + 1
-						end
-						if close then
-							local after = w:sub(close + 1)
-							if after:sub(1, 2) == "+=" then
-								keyraw = w:sub(2, close - 1)
-								eop = "+="
-								rhs = after:sub(3)
-							elseif after:sub(1, 1) == "=" then
-								keyraw = w:sub(2, close - 1)
-								eop = "="
-								rhs = after:sub(2)
-							end
-						end
-					end
-					if keyraw == nil then
-						-- bare element: brace-expand into multiple elements ({1..9}, {a,b})
-						local factors = brace_factors(rhs)
-						if factors then
-							stream_factors(factors, function(x)
-								elems[#elems + 1] = { key = nil, op = "=", word = parse_word(x) }
-								return #elems >= BRACE_CAP
-							end)
-						else
-							elems[#elems + 1] = { key = nil, op = "=", word = parse_word(rhs) }
-						end
-					else
-						-- KEYED element. bash brace-expands the value only for an INDEXED array,
-						-- where a multi-word expansion also DE-KEYS it (`a=([k]=-{a,b}-)` ->
-						-- [0]="[k]=-a-" [1]="[k]=-b-"); an ASSOCIATIVE array keeps it keyed and
-						-- literal (`declare -A a; a=([k]=-{a,b}-)` -> a[k]="-{a,b}-"). The array
-						-- type isn't known until runtime, so precompute the brace-expanded BARE
-						-- words of the whole token and let do_arrayassign pick (indexed -> bare).
-						local elem = { key = keyraw, op = eop, word = parse_word(rhs) }
-						local factors = brace_factors(w)
-						if factors then
-							elem.brace_bare = {}
-							stream_factors(factors, function(x)
-								elem.brace_bare[#elem.brace_bare + 1] = parse_word(x)
-								return #elem.brace_bare >= BRACE_CAP
-							end)
-						end
-						elems[#elems + 1] = elem
-					end
-				end
-			end
-			if not closed then -- (never closed: bash's error, at the line it began on)
-				line = line0
-				comsub_eof = false
-				error("unexpected EOF while looking for matching `)'")
-			end
-			return elems
-		end
-
-		local function try_assign()
-			local name = src:match("^([%a_][%w_]*)", i)
-			if not name then
-				return nil
-			end
-			local p = i + #name
-			local subidx = nil
-			if src:sub(p, p) == "[" then
-				-- find the MATCHING ] (subscript may contain nested [ ] via ${a[i]}); quoted
-				-- text and escapes don't count (`A[']']=10` has the key `]`)
-				local depth, q = 1, p + 1
-				while q <= n and depth > 0 do
-					local ch = src:sub(q, q)
-					if ch == "\\" then
-						q = q + 1
-					elseif ch == "'" then
-						q = (src:find("'", q + 1, true) or n)
-					elseif ch == '"' then
-						local e = q + 1
-						while e <= n and src:sub(e, e) ~= '"' do
-							e = e + (src:sub(e, e) == "\\" and 2 or 1)
-						end
-						q = e
-					elseif ch == "$" and src:sub(q + 1, q + 1) == "(" then
-						local ok, nq = pcall(scan_cmdsub, src, q + 2)
-						q = ok and nq - 1 or q
-					elseif ch == "$" and src:sub(q + 1, q + 1) == "{" then
-						q = scan_braces(src, q + 1) - 1
-					elseif ch == "[" then
-						depth = depth + 1
-					elseif ch == "]" then
-						depth = depth - 1
-					end
-					if depth == 0 then
-						break
-					end
-					q = q + 1
-				end
-				if depth == 0 and src:sub(q + 1, q + 1):match("[+=]") then
-					subidx = src:sub(p + 1, q - 1)
-					p = q + 1
-				end
-			end
-			local op = nil
-			if src:sub(p, p + 1) == "+=" then
-				op = "+="
-				p = p + 2
-			elseif src:sub(p, p) == "=" then
-				op = "="
-				p = p + 1
-			end
-			if not op then
-				return nil
-			end
-			i = p
-			if src:sub(i, i) == "(" then -- array literal
-				local pstart = i
-				local elems = parse_array_elems()
-				local nx = src:sub(i, i)
-				if nx ~= "" and not nx:match("[%s;&|)<>]") then
-					-- `a=(4*3)/2`: text goes on past the `)` — then it's one ORDINARY word
-					-- (bash), assigned as a string (an integer var evaluates it)
-					local head = src:sub(pstart, i - 1)
-					local raw = head .. word(true)
-					return { t = "assign", name = name, index = subidx, append = (op == "+="), rhs = parse_word(raw) }
-				end
-				-- raw parenthesized text: a NAME=(…) used as a command PREFIX is a literal
-				-- string in bash (arrays can't be env bindings), decided at exec time.
-				return {
-					t = "arrayassign",
-					name = name,
-					elems = elems,
-					append = (op == "+="),
-					raw = src:sub(pstart, i - 1),
-					index = subidx,
-				}
-			end
-			-- The value is read from right after `=` with NO leading-whitespace skip: an
-			-- empty value (`X= cmd`) must stay empty, not absorb the next word as `word()`
-			-- (which skips blanks) would. Only read when a value actually follows.
-			local c0 = src:sub(i, i)
-			-- (`#` right after `=` is part of the value — `D=#abcd` — not a comment)
-			if c0 == "" or c0:match("[ \t\n;&|)]") then
-				return { t = "assign", name = name, index = subidx, append = (op == "+="), rhs = parse_word("") }
-			end
-			local raw = word(true) -- stop at unquoted ) so `(x=2)` closes the subshell
-			if not subidx and op == "=" and raw:sub(1, 3) == "$((" and raw:sub(-2) == "))" then
-				-- (a bad expression — or `$((1))$((2))` — takes the word path: its error is a
-				-- runtime one, reported when the assignment runs)
-				local aok, ae = pcall(arith, raw:sub(4, -3))
-				if aok then
-					return { t = "assign", name = name, arith = ae, rhssrc = raw } -- (rhssrc: declare -f)
-				end
-			end
-			return { t = "assign", name = name, index = subidx, append = (op == "+="), rhs = parse_word(raw) }
-		end
 
 		-- leading assignments AND redirects (bash allows them interleaved before the
 		-- command: `FOO=1 >f BAR=2 cmd`), forming the prefix for a following command,
@@ -4259,6 +4277,12 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs)
 			error("syntax error near `" .. c .. "'")
 		end
 	end
+	local function bang_at(k) -- a `!` word: followed by a blank, a separator, or the end
+		return src:sub(k, k) == "!" and (src:sub(k + 1, k + 1) == "" or src:sub(k + 1, k + 1):match("[ \t\n;&|)]"))
+	end
+	local function time_at(k) -- the `time` reserved word (a standalone word)
+		return src:sub(k, k + 3) == "time" and (src:sub(k + 4, k + 4) == "" or src:sub(k + 4, k + 4):match("[ \t\n;&|]"))
+	end
 	local function parse_pipeline()
 		ws()
 		local ln = line
@@ -4266,12 +4290,6 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs)
 		-- `time [-p]` reserved word may precede the (optionally `!`-negated) pipeline;
 		-- it's a keyword only as a standalone word (followed by whitespace/newline).
 		local timed, timed_p = false, false
-		local function bang_at(k) -- a `!` word: followed by a blank, a separator, or the end
-			return src:sub(k, k) == "!" and (src:sub(k + 1, k + 1) == "" or src:sub(k + 1, k + 1):match("[ \t\n;&|)]"))
-		end
-		local function time_at(k) -- the `time` reserved word (a standalone word)
-			return src:sub(k, k + 3) == "time" and (src:sub(k + 4, k + 4) == "" or src:sub(k + 4, k + 4):match("[ \t\n;&|]"))
-		end
 		-- `time [-p]` and `!` may precede a pipeline in any order and repeat (bash's grammar:
 		-- `! time cmd`, `time ! cmd`, `time time cmd`); each `!` toggles the inversion
 		local sawbang = false

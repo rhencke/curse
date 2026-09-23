@@ -293,6 +293,7 @@ end
 -- request below, and shell VARIABLE state is a brand-new Shell.new — so nothing bleeds
 -- between requests (torture-tested: 8000 varied requests, zero state/fd leaks).
 local function serve_request(cfd, req, fds, ctx)
+	rt.path_epoch = rt.path_epoch + 1 -- (the command-lookup cache re-checks PATH once per request)
 	if fds[1] then
 		C.dup2(fds[1], 0)
 	end
