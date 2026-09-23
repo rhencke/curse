@@ -329,6 +329,11 @@ return function(sh, cmd, args, hook, tcb)
 				local mkarr = false
 				if (cmd == "declare" or cmd == "typeset") and not a:find("=", 1, true) then
 					local base = a:match("^([%a_][%w_]*)%[.*%]$")
+					if base and nref then -- (`declare -n a[3]`)
+						io.stderr:write("curse: " .. cmd .. ": " .. a .. ": reference variable cannot be an array\n")
+						allok = false
+						goto continue
+					end
 					if base then
 						a, mkarr = base, true
 					end
@@ -365,7 +370,22 @@ return function(sh, cmd, args, hook, tcb)
 					end
 					goto continue
 				end
+				if (aattr or assoc) and not nref and not localize and not a:find("[", 1, true) then
+					-- `declare -n foo; declare -a foo`: a VALUELESS nameref becomes the array
+					local vn = a:match("^([%a_][%w_]*)")
+					local vb = vn and sh.vars[vn]
+					if vb and vb.ref and vb.s == nil and not vb.ro then
+						sh.vars[vn] = nil
+					end
+				end
 				local nm, op, val = a:match("^([%a_][%w_]*)(%+?=)(.*)$")
+				do
+					local db = nm and not nref and not plusn and sh.vars[nm]
+					if db and db.ref and db.s and not db.ro and (localize or aattr or assoc)
+						and db.s:match("^[%a_][%w_]*$") and sh:deref(nm) ~= "" then
+						nm = sh:deref(nm) -- (`local -a ref=(…)`, ref -> var: declares the target)
+					end
+				end
 				-- (`declare -n ref=x` re-points the ref: the REF's own readonly-ness counts)
 				local rov = nm and sh.vars[nref and nm or sh:deref(nm)]
 				if rov and rov.ro then
@@ -379,7 +399,7 @@ return function(sh, cmd, args, hook, tcb)
 					and (
 						aattr
 						or assoc
-						or ((cmd == "declare" or cmd == "typeset") and sh.vars[sh:deref(nm)] and sh.vars[sh:deref(nm)].arr)
+						or ((cmd == "declare" or cmd == "typeset") and not nref and sh.vars[sh:deref(nm)] and sh.vars[sh:deref(nm)].arr)
 					)
 					and val:sub(1, 1) == "("
 					and val:sub(-1) == ")"
@@ -407,13 +427,49 @@ return function(sh, cmd, args, hook, tcb)
 					if roattr and bb then
 						bb.ro = true
 					end
+				elseif nm and not nref and op == "=" and sh.vars[nm] and sh.vars[nm].ref
+					and sh.vars[nm].s == nil and not aattr and not assoc
+					and (not localize or (sh.savedstack[sh.pd] and sh.savedstack[sh.pd][nm] ~= nil)) then
+					-- a VALUELESS nameref takes the value as its target, unevaluated (bash: even
+					-- under -i); a bad target fails the declare — a global nameref is then gone,
+					-- a function's own local one stays
+					if rt.ref_target_ok(val) then
+						sh.vars[nm].s = val
+					elseif localize then
+						io.stderr:write("curse: " .. cmd .. ": `" .. val .. "': invalid variable name for name reference\n")
+						allok = false
+					else
+						rt.bad_ref_target(val, cmd)
+						sh.vars[nm] = nil
+						allok = false
+					end
 				elseif nm then
+					local selfsub = not nref and not localize and sh:self_elem_unref(nm)
+					if selfsub then -- (a -> b -> 'a[1]': a becomes an array; see self_elem_unref)
+						sh:array_set(nm, array_key(sh, nm, selfsub), val, op == "+=")
+						goto continue
+					end
+					local eb, esub = (not nref and sh.vars[nm] and sh.vars[nm].ref and sh:deref_elem(nm) or "")
+						:match("^([%a_][%w_]*)%[(.+)%]$")
+					if eb then -- (`typeset ref=4` with ref -> XXX[0]: writes that element)
+						sh:array_set(eb, array_key(sh, eb, esub), val, op == "+=")
+						goto continue
+					end
 					if localize then
 						sh:localVar(nm)
 					end
 					local ap = (op == "+=")
-					if nref then
-						if not sh:nameref_decl(cmd, nm, val, localize) then
+					if nref and iattr then -- (`declare -in b=v`: bash fails it, silently, status 1)
+						allok = false
+					elseif nref then
+						local nb = sh.vars[nm]
+						if ap and nb and nb.ref then -- `-n ref+=x`: appends to the reference itself
+							val = (nb.s or "") .. val
+						end
+						if ap and val:match("^[^[]*") == nm then -- (bash names no builtin here)
+							io.stderr:write("curse: " .. nm .. ": nameref variable self references not allowed\n")
+							allok = false
+						elseif not sh:nameref_decl(cmd, nm, val, localize) then
 							allok = false
 						end
 					elseif iattr and aattr and not assoc then -- declare -ai a=EXPR: element 0, integer
@@ -429,7 +485,7 @@ return function(sh, cmd, args, hook, tcb)
 						else
 							sh:aset(nm, M.arith_eval_str(sh, val))
 						end
-						sh.vars[nm].int = true
+						sh.vars[sh:deref(nm)].int = true -- (through a nameref: its target)
 					elseif lattr or uattr or cattr then -- declare -l/-u/-c: case attribute (set_str folds)
 						sh.vars[nm] = sh.vars[nm] or {}
 						sh.vars[nm].lower = lattr or nil
@@ -482,15 +538,59 @@ return function(sh, cmd, args, hook, tcb)
 					if plusn then -- `typeset +n ref=v`: v went THROUGH the ref; then it's plain
 						sh:unref(nm)
 					end
+				elseif roattr and not nref and not plusn and sh.vars[a] and sh.vars[a].ref
+					and (sh.vars[a].s or ""):find("[", 1, true) then
+					-- `readonly ref` through a nameref to an ELEMENT (ref=var[0]) (bash)
+					io.stderr:write("curse: " .. cmd .. ": `" .. sh.vars[a].s .. "': not a valid identifier\n")
+					allok = false
 				elseif a:match("^[%a_][%w_]*$") then
+					local db = sh.vars[a]
+					if db and db.ref and db.s and not db.ro and not nref and not plusn and not plusr
+						and (aattr or assoc or localize) and db.s:match("^[%a_][%w_]*$") and sh:deref(a) ~= "" then
+						-- `declare [-a] ref` (ref -> var) declares the TARGET (a function-local
+						-- var when in a function), leaving the nameref as it is (bash)
+						a = sh:deref(a)
+						db = sh.vars[a]
+					end
+					-- a readonly nameref can't lose -n (once it has a target) nor -r (bash)
+					if db and db.ref and db.ro and ((plusn and db.s ~= nil) or (nref and plusr)) then
+						io.stderr:write("curse: " .. cmd .. ": " .. a .. ": readonly variable\n")
+						allok = false
+						goto continue
+					end
+					if (assoc or aattr) and not nref and db and db.ref and sh:deref_elem(a) then
+						goto continue -- (`declare -A ref`, ref -> XXX[0]: nothing to convert — bash)
+					end
+					if plusr and not nref and not (db and db.ref and db.s == nil) then
+						-- `+r` can't lift readonly — through a nameref, from its target — and
+						-- declares a missing target (`declare +r ref` -> `declare -- bar`)
+						local dn = sh:deref(a)
+						local tb = sh.vars[dn]
+						if tb and tb.ro then
+							io.stderr:write("curse: " .. cmd .. ": " .. dn .. ": readonly variable\n")
+							allok = false
+							goto continue
+						elseif not tb and dn ~= "" then
+							sh.vars[dn] = {}
+						end
+					end
 					if localize then
 						sh:localVar(a)
 					end
 					if plusn then
 						sh:unref(a)
+					elseif nref and sh.arrayargs_pending and sh.arrayargs_pending[a] then
+						-- `declare -n r=(…)`: an array can't be a reference — the literal is
+						-- still assigned, to a plain array (bash)
+						io.stderr:write("curse: " .. cmd .. ": " .. a .. ": reference variable cannot be an array\n")
+						allok = false
+						sh.arrayargs_pending.force = sh.arrayargs_pending.force or {}
+						sh.arrayargs_pending.force[a] = true
 					elseif nref then
 						if not sh:nameref_decl(cmd, a, nil, localize) then -- (an invalid existing value…)
 							allok = false
+						elseif iattr then -- (`declare -ni ref`: the reference itself takes -i)
+							sh.vars[a].int = true
 						end
 					elseif iattr and not ((assoc or aattr) and cmd ~= "readonly") then
 						local dn = sh:deref(a) -- (through a nameref: the target, created if need be)
@@ -580,8 +680,8 @@ return function(sh, cmd, args, hook, tcb)
 							sh:env_resync(a) -- (a shadowed exported global keeps its env value)
 						elseif doexport then
 							bb.exported = true -- `export U` defers the env until U gets a value (bash)
-							if bb.s ~= nil or bb.n ~= nil then
-								C.setenv(a, sh:get(a), 1)
+							if bb.s ~= nil or bb.n ~= nil then -- (through a nameref: the target's name)
+								C.setenv(nref and a or sh:deref(a), sh:get(a), 1)
 							end
 						end
 					end
@@ -651,6 +751,14 @@ return function(sh, cmd, args, hook, tcb)
 						if localize then
 							sh:localVar(anm)
 						end
+						local rb = sh.vars[anm]
+						if rb and rb.ref then -- (`declare ref[1]=v`: the nameref becomes the array)
+							io.stderr:write("curse: warning: " .. anm .. ": removing nameref attribute\n")
+							sh.vars[anm] = { exported = rb.exported }
+						end
+						if assoc and not sh:is_assoc(anm) then -- (`declare -A m[k]=v` makes m assoc)
+							sh:declare_assoc(anm)
+						end
 						sh:array_set(anm, array_key(sh, anm, sub), aval, aop == "+=")
 						local bb = sh.vars[sh:deref(anm)]
 						if roattr and bb then
@@ -671,7 +779,8 @@ return function(sh, cmd, args, hook, tcb)
 					local pb = pname and sh.vars[sh:deref(pname)]
 					if mkarr and pname and not assoc and not (pb and pb.arr) then
 						pb = pb or {}
-						pb.arr, pb.s, pb.n, pb.empty_decl = pb.arr or {}, nil, nil, true
+						local v0 = pb.s or (pb.n and rt.i64_to_str(pb.n)) -- (a scalar becomes [0]: bash)
+						pb.arr, pb.s, pb.n, pb.empty_decl = pb.arr or (v0 and { [0] = v0 }) or {}, nil, nil, v0 == nil or nil
 						sh.vars[sh:deref(pname)] = pb
 					end
 					if pb and plusattr then

@@ -124,6 +124,11 @@ return function(sh, cmd, args, hook, tcb)
 				local nm, ap, val = a:match("^([%a_][%w_]*)(%+?)=(.*)$")
 				ap = ap == "+"
 				local vname = nm or a
+				local db = not nref and not plusn and sh.vars[vname]
+				if db and db.ref and db.s and db.s:match("^[%a_][%w_]*$") and sh:deref(vname) ~= "" then
+					vname = sh:deref(vname) -- (`local -a ref`, ref -> var: a local var, not the ref)
+					nm = nm and vname
+				end
 				sh:localVar(vname)
 				if nref then
 					if not sh:nameref_decl("local", nm or vname, val, true) then

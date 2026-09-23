@@ -177,7 +177,12 @@ return function(sh, cmd, args, hook, tcb)
 			-- EOF with nothing read still assigns (empty values) and returns 1 (bash)
 			line = line or ""
 			local ifs = sh.vars["IFS"] and sh:get("IFS") or " \t\n"
-			if arr then
+			local aref = arr and sh.vars[arr] and sh.vars[arr].ref and sh:deref_elem(arr)
+			if aref then -- (-a through a nameref to an ELEMENT: not an array name — bash)
+				io.stderr:write("curse: read: `" .. aref .. "': not a valid identifier\n")
+				sh.status = 1
+				return
+			elseif arr then
 				sh:array_assign(arr, rt.ifs_split(ifs, line), false)
 			elseif ndelim then -- -N: no IFS processing; first var gets everything, rest empty
 				local plain = line:gsub("\1(.)", "%1") -- \1x -> x (unescape); \1\1 -> \1 (literal CTLESC)

@@ -110,6 +110,10 @@ return function(sh, cmd, args, hook, tcb)
 		if not arr:match("^[%a_][%w_]*$") then
 			return berr("`" .. arr .. "': not a valid identifier")
 		end
+		local aref = sh.vars[arr] and sh.vars[arr].ref and sh:deref_elem(arr)
+		if aref then -- (through a nameref to an ELEMENT: not an array name — bash)
+			return berr("`" .. aref .. "': not a valid identifier")
+		end
 		if sh:is_assoc(arr) then
 			return berr(arr .. ": not an indexed array")
 		end

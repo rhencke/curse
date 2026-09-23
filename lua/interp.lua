@@ -643,6 +643,7 @@ local expand_word -- forward (used by eval's $-deferred arith and expand_part_st
 local expand_assign_word -- forward (assignment-RHS expander; ${-default} tilde ctx)
 local expand_pattern -- forward (quote-aware glob-pattern expansion for ${v/…} etc.)
 local expand_repl -- forward (${v/pat/REPL} replacement expansion)
+local is_multi, multi_elems -- forward (defined with the field expander)
 local indirect_part -- forward (${!ref} target resolution, re-parsed to a part)
 local eval -- arithmetic evaluator (forward decl)
 local arith_resolve -- var-value-as-arith-expression resolver (forward decl)
@@ -1135,8 +1136,8 @@ array_key = function(sh, name, index_raw)
 	-- defer/xpand handles $()/$vars) rather than word-expanding it first, so bash's
 	-- arith quote rules apply — a double-quote PAIR strips to its content (`a["3"]`),
 	-- a SINGLE quote is a syntax error (`a['3']` -> status 1, assignment skipped).
-	if index_raw:match("^%s*$") then
-		return 0
+	if index_raw:match("^%s*$") or index_raw:match('^%s*"%s*"%s*$') then
+		return 0 -- (a blank subscript, double-quoted or not, is 0)
 	end
 	if index_raw == "@" or index_raw == "*" then -- (`ia[@]=x`: no such element of an indexed array)
 		io.stderr:write("curse: " .. name .. "[" .. index_raw .. "]: bad array subscript\n")
@@ -1173,9 +1174,9 @@ local function expand_part_str(sh, p, assign)
 			return expand_word(sh, P.parse_word("${" .. et .. "}"))
 		end
 		local dn = sh:deref(p.var)
-		if dn == "" then -- a circular ref chain reads as nothing, with bash's warning
-			io.stderr:write("curse: warning: " .. p.var .. ": circular name reference\n")
-		end
+		if dn == "" or (rb and rb.outer) then -- a circular ref chain reads as nothing, with bash's
+			io.stderr:write("curse: warning: " .. p.var .. ": circular name reference\n") -- warning
+		end -- (a function's self-named ref warns too, then reads the shadowed var)
 		local b = sh.vars[dn]
 		-- `$x` reads ${x[0]}, so an array whose element 0 is unset (a bare `declare -a x`, a
 		-- sparse array with no [0]) is unbound — not merely because b.arr exists.
@@ -1310,6 +1311,12 @@ local function expand_part_str(sh, p, assign)
 			ip.q = p.q
 			return expand_part_str(sh, ip)
 		end
+		if (pe.index == "*" or pe.name == "*") and pe.op ~= "prefix" and pe.op ~= "indices" and pe.op ~= "len" then
+			-- ${a[*]OP} / ${*OP} in a scalar context (assignment RHS, case word) joins its
+			-- (per-element transformed) values with IFS[0], like "$*" (bash)
+			local els = multi_elems(sh, p)
+			return table.concat(els, sh.vars["IFS"] and rt.ifs_first(sh:get("IFS")) or " ")
+		end
 		local subkey
 		if pe.index and pe.index ~= "@" and pe.index ~= "*" then
 			subkey = array_key(sh, pe.name, pe.index)
@@ -1425,12 +1432,12 @@ function M.assign_scalar(sh, name, value)
 	end
 	if b and b.arr then
 		sh:array_set(name, array_key(sh, name, "0"), value, false)
-	elseif b and b.int then
+	elseif b and b.int and not b.ref then
 		sh:aset(name, M.arith_eval_str(sh, value))
 	elseif b and (b.lower or b.upper) then
 		sh:set_str(name, b.lower and value:lower() or value:upper())
-	else
-		sh:set_str(name, value)
+	elseif sh:set_str(name, value) == false then -- (a valueless nameref given a bad target)
+		error({ __curse_exit = 1, __curse_lineabort = true })
 	end
 	if sh.opt_a then -- set -a (allexport): a plain scalar assignment auto-exports (bash)
 		local nb = sh.vars[sh:deref(name)]
@@ -1680,7 +1687,6 @@ indirect_part = function(sh, pe)
 	end
 	return ok and part or nil
 end
-local is_multi
 is_multi = function(sh, p)
 	if not p.pexp then
 		return p.special == "@" or p.special == "*"
@@ -1698,7 +1704,7 @@ is_multi = function(sh, p)
 	-- $@/$* live in pexp.name (e.g. ${@:1}); array [@]/[*] live in pexp.index
 	return p.pexp.index == "@" or p.pexp.index == "*" or p.pexp.name == "@" or p.pexp.name == "*"
 end
-local function multi_elems(sh, p) -- returns element list, star?
+multi_elems = function(sh, p) -- returns element list, star?
 	if p.pexp then
 		local pe = p.pexp
 		local star = (pe.index == "*" or pe.name == "*") -- $* / ${*:…} join when quoted
@@ -1773,7 +1779,13 @@ local function multi_elems(sh, p) -- returns element list, star?
 			io.stderr:write("curse: " .. rt.pe_label(pe) .. ": " .. msg .. "\n")
 			error({ __curse_exit = sh.opt_c and 127 or 1, __curse_lineabort = sh.opt_i or nil })
 		elseif (pe.op == "=" or pe.op == ":=") and #els == 0 then
-			-- ${@=x} / ${a[@]=x}: nothing to assign to — bash aborts the line
+			-- ${@=x} / ${a[@]=x}: nothing to assign to — bash aborts the line. An ASSOC
+			-- takes `@`/`*` as a literal key (bash: ${A[@]:=foo} sets A[@])
+			if pe.index and sh:is_assoc(pe.name) then
+				local v = pe.arg and expand_word(sh, P.parse_word(pe.arg), true) or ""
+				sh:array_set(pe.name, pe.index, v)
+				return { sh:array_get(pe.name, pe.index) or "" }, star
+			end
 			if pe.name == "@" or pe.name == "*" then
 				io.stderr:write("curse: $" .. pe.name .. ": cannot assign in this way\n")
 			else
@@ -3109,7 +3121,10 @@ local function fmt_decl(sh, name)
 		return nil
 	end
 	if b.ref then -- bash shows the export letter on a nameref as `declare -nx`
-		local pre = "declare -n" .. (os.getenv(name) ~= nil and "x" or "") .. (b.ro and "r" or "") .. " " .. name
+		-- (bash's order around the n: `-inl`, `-nrx`, `-ntu`)
+		local pre = "declare -" .. (b.int and "i" or "") .. "n" .. (b.ro and "r" or "") .. (b.trace and "t" or "")
+			.. ((os.getenv(name) ~= nil or b.exported) and "x" or "") .. (b.lower and "l" or "")
+			.. (b.upper and "u" or "") .. (b.cap and "c" or "") .. " " .. name
 		return b.s == nil and pre or (pre .. "=" .. decl_quote(b.s)) -- (no target yet: no =)
 	end
 	if b.assoc or b.arr then
@@ -4330,6 +4345,9 @@ local function unset_arrayref(sh, w)
 	return table.concat(buf)
 end
 local function expand_args(sh, st, args, is_assign)
+	if sh.arrayref_args then
+		sh.arrayref_args = nil -- (the previous command's: see rt.mark_arrayref)
+	end
 	local unset_cmd = is_assign == "unset"
 	for wi, w in ipairs(st.words) do
 		local p1 = w.parts[1]
@@ -4343,6 +4361,10 @@ local function expand_args(sh, st, args, is_assign)
 			for k = 1, #fs do
 				args[#args + 1] = rt.cstr(fs[k])
 			end -- argv entries are C strings: cut at NUL
+			if #fs == 1 and wi > 1 and p1 and p1.lit and not p1.q and #w.parts > 1 and sh.shopt.assoc_expand_once
+				and p1.lit:match("^[%a_][%w_]*%[") then
+				rt.mark_arrayref(sh, fs[1])
+			end
 		end
 	end
 end
@@ -4548,12 +4570,18 @@ exec_stmt = function(sh, st, hook)
 		local nref_base, nref_sub
 		if not st.index and not st.arith then
 			local nb = sh.vars[st.name]
-			if nb and nb.ref and nb.s then
+			local selfsub = nb and nb.ref and nb.s and sh:self_elem_unref(st.name)
+			if selfsub then
+				nref_base, nref_sub = st.name, selfsub
+			elseif nb and nb.ref and nb.s then
 				-- a nameref cycle (ref1->ref2->ref1) derefs to "" — bash detects it on write
 				if nb.s ~= "" and sh:deref(st.name) == "" then
 					io.stderr:write("curse: warning: " .. st.name .. ": circular name reference\n")
 					sh.status = 1
 					return
+				elseif nb.outer and nb.s:find("[", 1, true) then -- (`local -n a='a[0]'`: bash
+					io.stderr:write("curse: `" .. nb.s .. "': not a valid identifier\n") -- rejects it)
+					error({ __curse_exit = 1, __curse_lineabort = true })
 				elseif nb.outer then -- (a function's self-named ref: bash warns, then writes)
 					io.stderr:write("curse: warning: " .. st.name .. ": circular name reference\n")
 				end
@@ -4568,6 +4596,10 @@ exec_stmt = function(sh, st, hook)
 				io.stderr:write("curse: `" .. nb.s .. "': not a valid identifier\n")
 				sh.status = 1
 				return
+			end
+			if nb and nb.ref and nb.s == nil and not nb.arr then -- (a valueless nameref: no target)
+				io.stderr:write("curse: `': not a valid identifier\n")
+				error({ __curse_exit = 1, __curse_lineabort = true })
 			end
 		end
 		if rb and rb.ro then -- readonly: reject the assignment (status 1); fatal in `sh -c`
@@ -4626,13 +4658,13 @@ exec_stmt = function(sh, st, hook)
 					local b = sh.vars[sh:deref(st.name)]
 					if b and b.arr then -- plain `name=value` on an array var writes element 0 (bash)
 						sh:array_set(st.name, array_key(sh, st.name, "0"), expand_assign_word(sh, st.rhs), false)
-					elseif b and b.int then -- integer var (declare -i): assign arith-evaluates
+					elseif b and b.int and not b.ref then -- integer var (declare -i): assign arith-evaluates
 						sh:aset(st.name, M.arith_eval_str(sh, expand_word(sh, st.rhs)))
 					elseif b and (b.lower or b.upper) then -- declare -l/-u: case-fold on assign
 						local v = expand_assign_word(sh, st.rhs)
 						sh:set_str(st.name, b.lower and v:lower() or v:upper())
-					else
-						sh:set_str(st.name, expand_assign_word(sh, st.rhs))
+					elseif sh:set_str(st.name, expand_assign_word(sh, st.rhs)) == false and not sh.applying_prefix then
+						error({ __curse_exit = 1, __curse_lineabort = true }) -- (a bad nameref target)
 					end
 				end
 			end)
@@ -5161,6 +5193,12 @@ exec_stmt = function(sh, st, hook)
 					-- command still runs, non-fatal). Skip it entirely — no tenv, no mutation.
 					io.stderr:write("curse: `" .. a.name .. "[" .. tostring(a.index) .. "]': not a valid identifier\n")
 				else
+					local rb = sh.vars[a.name]
+					if rb and rb.ref and rb.s and rb.s:match("^[%a_][%w_]*$") and sh:deref(a.name) ~= "" then
+						-- through a nameref WITH a target, the binding is the target's (bash:
+						-- `ref=x cmd` exports var=x; ref itself is untouched)
+						a = setmetatable({ name = sh:deref(a.name) }, { __index = a })
+					end
 					local b = sh.vars[a.name] -- COPY the box: exec_stmt mutates it in place
 					sh.vseq = sh.vseq + 1
 					sh.tenv[#sh.tenv + 1] = {
@@ -5236,11 +5274,14 @@ exec_stmt = function(sh, st, hook)
 		-- Skip when the builtin failed (e.g. a rejected -A/-a type change): the array
 		-- must stay untouched, not be mangled by the literal.
 		local aaskip = sh.arrayargs_pending and sh.arrayargs_pending.skip
-		if st.arrayargs and sh.status == 0 then
+		local aaforce = sh.arrayargs_pending and sh.arrayargs_pending.force -- (assigned even so)
+		if st.arrayargs and (sh.status == 0 or aaforce) then
 			local wasro = sh.arrayargs_ro
 			sh.arrayargs_ro = nil
+			local failed = sh.status ~= 0
 			for _, aa in ipairs(st.arrayargs) do
-				if aaskip and aaskip[aa.name] then -- (a rejected kind conversion: untouched)
+				if failed and not aaforce[aa.name] then
+				elseif aaskip and aaskip[aa.name] then -- (a rejected kind conversion: untouched)
 				elseif wasro and wasro[aa] then
 					io.stderr:write("curse: " .. aa.name .. ": readonly variable\n")
 					sh.status = 1

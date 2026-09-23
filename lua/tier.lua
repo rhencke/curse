@@ -98,12 +98,22 @@ end
 -- markers) with $?=1. Under `set -e` it exits like any failed command. Keeping this
 -- retry OUT of the generated run() lets pc/lifted stay fast locals (no closure).
 function M.run_compiled(mod, sh, pc)
+	local pd0, cd0, fs0 = sh.pd, sh.calldepth, sh.funcstack and #sh.funcstack or 0
 	while true do
 		local ok, err = pcall(mod.run, sh, pc)
 		if ok then
 			return
 		end
 		if type(err) == "table" and err.__curse_lineabort and not sh.opt_e then
+			-- a lineabort from inside a function call unwinds its frames (locals, params,
+			-- FUNCNAME) — the compiled call sites pop them only on a normal return
+			while sh.pd > pd0 do
+				sh:popCall()
+			end
+			while sh.funcstack and #sh.funcstack > fs0 do
+				sh:leaveFunc()
+			end
+			sh.calldepth = cd0
 			rt.posix_arith_fatal(sh, err)
 			sh.status = 1
 			pc = sh._ff

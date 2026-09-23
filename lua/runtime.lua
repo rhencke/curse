@@ -2290,6 +2290,11 @@ end
 -- NAME=(read-fd write-fd) and NAME_PID, as bash's coproc_setvars: a readonly NAME (through
 -- a nameref, its target) is reported and nothing is set; a readonly NAME_PID is reported.
 function M.coproc_setvars(sh, name, r, w, pid)
+	local et = sh.vars[name] and sh.vars[name].ref and sh:deref_elem(name)
+	if et then -- (a nameref to an ELEMENT can't hold the fd array)
+		io.stderr:write("curse: `" .. et .. "': not a valid identifier\n")
+		return
+	end
 	local dn = sh:deref(name)
 	local b = sh.vars[dn]
 	if b and b.ro then
@@ -3951,6 +3956,18 @@ function Shell:deref(name)
 	end
 	return name
 end
+-- A nameref chain that ends at an ELEMENT of the nameref itself (a -> b -> 'a[1]'): bash
+-- warns, drops the nameref attribute and writes that element. Returns the subscript then.
+function Shell:self_elem_unref(name)
+	local b = self.vars[name]
+	local et = b and b.ref and not b.outer and b.s and not b.s:find("[", 1, true) and self:deref_elem(name)
+	local sub = et and et:match("^" .. name .. "%[(.+)%]$")
+	if sub then
+		io.stderr:write("curse: warning: " .. name .. ": removing nameref attribute\n")
+		self.vars[name] = nil
+	end
+	return sub
+end
 -- The `base[sub]` a nameref CHAIN ends at (`one -> qux -> 'bar[3]'`), or nil when it ends
 -- at a whole variable (plain :deref covers that).
 function Shell:deref_elem(name)
@@ -3976,13 +3993,16 @@ function Shell:make_nameref(name, target, selfok)
 		return t:match("^[%a_][%w_]*$") or t:match("^[%a_][%w_]*%[.+%]$")
 	end
 	local ob = self.vars[name]
+	if target ~= nil and target ~= "" and not valid(target) and ob and ob.arr and not ob.ref then
+		return false -- (a bad target is reported before the array conflict: bash)
+	end
 	if ob and ob.arr and not ob.ref then
 		return false, "array" -- (an array can't become a reference)
 	end
 	if ob and ob.ro and not ob.ref then
 		return false, "ro"
 	end
-	if not selfok and (target or (ob and ob.s)) == name then
+	if not selfok and ((target or (ob and ob.s)) or ""):match("^[^[]*") == name then -- (`a[0]` too)
 		return false, "self"
 	end
 	if target ~= nil then
@@ -4003,6 +4023,9 @@ function Shell:make_nameref(name, target, selfok)
 		end
 	end
 	local b = box(name, self.vars)
+	if not b.ref then -- (a plain var becoming a nameref loses its value attributes: bash)
+		b.int, b.lower, b.upper, b.cap = nil, nil, nil, nil
+	end
 	b.ref = true
 	if target ~= nil then
 		b.s = target
@@ -4221,6 +4244,18 @@ function M.compat_level(sh)
 end
 -- bash's valid_array_reference: `NAME`, or `NAME[SUB]` whose subscript's brackets balance
 -- exactly to the end (`A[]]` is not one). Returns name, sub (nil for a plain name), or nil.
+-- An argument that was an UNQUOTED `NAME[…$x…]` word (under assoc_expand_once): bash knows
+-- its subscript is everything up to the final `]`, whatever the expansion put there
+-- (`read A[$k]` with k=']'), unlike the same text quoted ("A[$k]" -> invalid `A[]]`).
+function M.mark_arrayref(sh, s)
+	local t = sh.arrayref_args
+	if not t then
+		t = {}
+		sh.arrayref_args = t
+	end
+	t[s] = true
+	return s
+end
 function M.split_array_ref(s, sh)
 	local name, rest = s:match("^([%a_][%w_]*)(.*)$")
 	if not name then
@@ -4232,15 +4267,19 @@ function M.split_array_ref(s, sh)
 	if rest:sub(1, 1) ~= "[" then
 		return nil
 	end
-	-- under assoc_expand_once an assoc's subscript is all between the first `[` and the
-	-- LAST `]` (`A[]]` is key `]`) — bash's VA_ONEWORD
-	if sh and sh.shopt.assoc_expand_once and #rest > 2 and rest:sub(-1) == "]" and sh:is_assoc(name) then
+	local ar = sh and sh.arrayref_args
+	if ar and ar[s] and #rest > 2 and rest:sub(-1) == "]" and sh.shopt.assoc_expand_once
+		and sh:is_assoc(name) then
 		return name, rest:sub(2, -2)
 	end
+	-- under assoc_expand_once an assoc's (already expanded) subscript isn't quote-scanned:
+	-- only the brackets balance (`A[']` is key ', `A[]]` is invalid) — bash's VA_NOEXPAND
+	local raw = sh and sh.shopt.assoc_expand_once and sh:is_assoc(name)
 	local depth, n, i = 0, #rest, 1
 	while i <= n do -- (quote-aware, like bash's skipsubscript: an unclosed quote is invalid)
 		local c = rest:sub(i, i)
-		if c == "\\" then
+		if raw and c ~= "[" and c ~= "]" then -- (a plain char)
+		elseif c == "\\" then
 			i = i + 1
 		elseif c == "'" or c == '"' then
 			local e = rest:find(c, i + 1, true)
@@ -6785,6 +6824,10 @@ function M.expand_fields(sh, segs)
 			out[#out + 1] = f.s
 		end
 	end
+	if #out == 1 and #segs > 1 and sh.shopt.assoc_expand_once and segs[1].unq and not segs[1].split
+		and segs[1].s:match("^[%a_][%w_]*%[") then
+		M.mark_arrayref(sh, out[1]) -- (an unquoted NAME[$k] argument: see mark_arrayref)
+	end
 	return out
 end
 
@@ -6979,7 +7022,7 @@ function M.assign_element(sh, name, raw, expanded, value, append)
 	local key
 	if sh:is_assoc(name) then
 		key = expanded
-	elseif raw:match("^%s*$") then
+	elseif raw:match("^%s*$") or raw:match('^%s*"%s*"%s*$') then -- (a blank subscript is 0)
 		key = 0
 	elseif raw == "@" or raw == "*" then -- (`ia[@]=x`: interp's array_key says so too)
 		io.stderr:write("curse: " .. name .. "[" .. raw .. "]: bad array subscript\n")
@@ -7094,6 +7137,9 @@ end
 local SUBSCRIPT_AST = {} -- raw subscript text -> parsed arith (bounded by the program text)
 function M.array_key(sh, name, raw, expanded)
 	if sh:is_assoc(name) then
+		if type(expanded) == "function" then -- (emit's subscript_word: a side-effecting key)
+			return expanded()
+		end
 		return expanded
 	end
 	if raw:match("^%s*$") then
@@ -7308,7 +7354,7 @@ function Shell:expand_param(pe, arg, arg2, idxnum)
 		end
 		if index and index ~= "@" and index ~= "*" then
 			self:array_set(name, idxnum or 0, v)
-			return v
+			return self:array_get(name, idxnum or 0) or v -- (as stored: -i / -u / -l applied)
 		end
 		-- a bare name that IS an array writes element 0 (bash), not a scalar shadow; the
 		-- var's attributes apply (declare -i/-u/-l) and the expansion is the stored value
@@ -7918,6 +7964,10 @@ function M.run_prefix(sh, names, vals, runfn)
 	local base = #sh.tenv
 	for i = 1, #names do
 		local name = names[i]
+		local rb = sh.vars[name]
+		if rb and rb.ref and rb.s and rb.s:match("^[%a_][%w_]*$") and sh:deref(name) ~= "" then
+			name = sh:deref(name) -- (through a nameref with a target: the target's binding)
+		end
 		local b = sh.vars[name] -- copy the box: set_str below mutates in place
 		sh.vseq = sh.vseq + 1
 		sh.tenv[#sh.tenv + 1] = {
@@ -8936,11 +8986,19 @@ function M.assign_scalar(sh, name, value)
 	-- nameref write-through (interp assign path): a cycle (ref -> … -> ref) is a non-fatal
 	-- warning; a nameref whose value carries a SUBSCRIPT (declare -n ref='a[2]') writes to
 	-- that element, not the base's [0] that a plain deref would give.
+	local selfsub = direct and direct.ref and direct.s and sh:self_elem_unref(name)
+	if selfsub then
+		sh:array_set(name, require("interp")._int.array_key(sh, name, selfsub), value, false)
+		return
+	end
 	if direct and direct.ref and direct.s and direct.s ~= "" then
 		if sh:deref(name) == "" then
 			io.stderr:write("curse: warning: " .. name .. ": circular name reference\n")
 			sh.status = 1
 			return
+		elseif direct.outer and direct.s:find("[", 1, true) then -- (`local -n a='a[0]'`)
+			io.stderr:write("curse: `" .. direct.s .. "': not a valid identifier\n")
+			error({ __curse_exit = 1, __curse_lineabort = true })
 		elseif direct.outer then -- (a function's self-named ref: bash warns, then writes)
 			io.stderr:write("curse: warning: " .. name .. ": circular name reference\n")
 		end
@@ -8975,12 +9033,12 @@ function M.assign_scalar(sh, name, value)
 	end
 	if b and b.arr then
 		sh:array_set(name, sh:is_assoc(name) and "0" or 0, value, false) -- a=x on an array -> a[0]
-	elseif b and b.int then
+	elseif b and b.int and not b.ref then
 		sh:aset(name, M.arith_str(sh, value)) -- declare -i: RHS is arithmetic
 	elseif b and (b.lower or b.upper) then
 		sh:set_str(name, b.lower and value:lower() or value:upper())
-	else
-		sh:set_str(name, value)
+	elseif sh:set_str(name, value) == false then -- (a valueless nameref given a bad target)
+		error({ __curse_exit = 1, __curse_lineabort = true })
 	end
 	if sh.opt_a then -- set -a (allexport): a plain scalar assignment auto-exports (bash)
 		local nb = sh.vars[sh:deref(name)]

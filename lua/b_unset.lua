@@ -46,6 +46,11 @@ return function(sh, cmd, args, hook, tcb)
 				io.stderr:write("curse: unset: `" .. a .. "': not a valid identifier\n")
 				sh.status = 1
 			else
+				local viaref
+				if not nmode and a:match("^[%a_][%w_]*$") and sh.vars[a] and sh.vars[a].ref then
+					viaref = sh:deref_elem(a) -- (a nameref to an ELEMENT unsets that element)
+					a = viaref or a
+				end
 				local nm, sub = a:match("^([%a_][%w_]*)%[(.+)%]$")
 				local function ukey() -- (the argument is expanded already: under
 					-- assoc_expand_once an associative subscript isn't expanded again)
@@ -72,7 +77,7 @@ return function(sh, cmd, args, hook, tcb)
 					elseif eb and array_key(sh, nm, sub) == 0 then
 						a = nm
 						nm = nil -- `name[0]` on a scalar unsets the whole variable
-					elseif eb then -- non-array with a non-zero subscript (bash: "not an array")
+					elseif eb and not viaref then -- non-array, non-zero subscript (bash: "not an array")
 						io.stderr:write("curse: unset: " .. nm .. ": not an array variable\n")
 						sh.status = 1
 					end

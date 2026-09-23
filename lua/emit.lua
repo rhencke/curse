@@ -985,7 +985,7 @@ local RENDERABLE_SPECIAL = { ["#"] = 1, ["@"] = 1, ["*"] = 1, ["?"] = 1, ["$"] =
 local function empty_word(w)
 	return #w.parts == 0
 end
-local pexp_compilable, pexp_scalar, emit_pattern_glob -- fwd decl (defined after COMPILE_UNSAFE_VAR)
+local pexp_compilable, pexp_scalar, emit_pattern_glob, subscript_word -- fwd decl (defined after COMPILE_UNSAFE_VAR)
 local function emitable_word(w)
 	for _, p in ipairs(w.parts) do
 		-- In a program that declares a nameref, a `${ref…}` OPERATOR read (default,
@@ -1173,7 +1173,7 @@ emit_value = function(e, lifted)
 		return ("rt.arith_read_elem(sh, %q, %q, %s)"):format(
 			e.name,
 			e.idxraw,
-			emit_word(require("parser").parse_word(e.idxraw), lifted)
+			subscript_word(e.idxraw, lifted)
 		)
 	end
 	if k == "var" then
@@ -1933,6 +1933,11 @@ local function und(st, lifted)
 			if p.cmdsub or p.procsub or p.arith or p.arithast then
 				return ""
 			end
+			-- (likewise a subscript with a side effect: ${d[c++]}, ${d[$((c++))]})
+			local ix = p.pexp and p.pexp.index
+			if ix and (ix:find("[$`]") or ix:find("++", 1, true) or ix:find("--", 1, true) or ix:find("=", 1, true)) then
+				return ""
+			end
 		end
 	end
 	local v = last and emit_word(last, lifted) or '""'
@@ -2328,6 +2333,17 @@ local function array_multi_op(pe)
 	end
 	return PEXP_STROP[pe.op] and strop_pat_ok(pe) or false -- quoted/backslash pattern renders via emit_pattern_glob
 end
+-- A subscript's word-expanded form, which rt.array_key uses only as an ASSOC key (an indexed
+-- array re-reads the raw text arithmetically). One with a $(…)/$((…))/`…` side effect is passed
+-- as a thunk, so `${d[$((c++))]}` on an indexed array increments once, not twice.
+function subscript_word(raw, lifted)
+	local w = emit_word(require("parser").parse_word(raw), lifted)
+	if raw:find("$(", 1, true) or raw:find("`", 1, true) then
+		return "function() return " .. w .. " end"
+	end
+	return w
+end
+
 -- Lua expr for a compilable pexp's scalar string value (assumes pexp_compilable).
 function pexp_scalar(pe, lifted)
 	-- ${x@a} / ${x[i]@a}: the variable's attribute letters, read straight from its binding
@@ -2344,7 +2360,7 @@ function pexp_scalar(pe, lifted)
 	elseif pe.index then -- ${name[sub]…}: read the element; a read-only op (below) then applies to it.
 		-- Pass BOTH the raw subscript (arith-evaluated for an indexed array) and its word-expanded
 		-- form (the assoc key); rt.array_elem picks per the array's type, matching interp's array_key.
-		local expanded = emit_word(require("parser").parse_word(pe.index), lifted)
+		local expanded = subscript_word(pe.index, lifted)
 		val = ("rt.array_elem(sh, %s, %q, %s)"):format(ename, pe.index, expanded)
 		if pe.op == nil then
 			return val

@@ -31,7 +31,7 @@ return function(sh, cmd, args, hook, tcb)
 			sh.arith_let = true -- (its text is already expanded: see arith_key)
 			for k = 2, #args do
 				local ok, v = pcall(function()
-					local pok, ast = pcall(P.arith, args[k], "strict") -- (args are already expanded)
+					local pok, ast = pcall(P.arith, args[k], "let") -- (args are already expanded)
 					if not pok then
 						io.stderr:write("curse: " .. P.arith_errmsg(args[k], ast) .. "\n")
 						error({ __curse_exit = 1, __curse_matherr = true })

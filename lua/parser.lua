@@ -75,7 +75,11 @@ local function arith(src, nodefer)
 	-- bash strips matched double-quote PAIRS inside arithmetic (`$(( "1+2" * 3 ))`
 	-- -> 1+2*3), keeping the content; a lone unmatched `"` is left in place so the
 	-- tokenizer reports the error bash does. (Single quotes are never stripped.)
-	if src:find('"', 1, true) then
+	-- (`let`'s arguments were already expanded and quote-removed: bash strips nothing
+	-- more — `let 'x="1"+2'` is an error and an assoc_expand_once key keeps its quotes)
+	if nodefer == "let" then
+		nodefer = "strict"
+	elseif src:find('"', 1, true) then
 		local o, open = {}, false
 		for k = 1, #src do
 			local ch = src:sub(k, k)
@@ -92,6 +96,9 @@ local function arith(src, nodefer)
 			end
 		end
 		src = table.concat(o)
+		if src:match("^%s*$") then -- (`$(( "" ))`, a quoted blank subscript: 0 too)
+			return { k = "num", v = "0" }
+		end
 	end
 	local i, n = 1, #src
 	-- bash's lasttp: where the most recently read token starts (bash reads one token
@@ -1473,7 +1480,7 @@ do
 	local aimpl = arith
 	arith = function(src, nodefer)
 		if type(src) == "string" then
-			local key = (nodefer == "expanded" and "\3" or nodefer == "strict" and "\2" or nodefer and "\1" or "\0") .. src
+			local key = (nodefer == "expanded" and "\3" or nodefer == "strict" and "\2" or nodefer == "let" and "\4" or nodefer and "\1" or "\0") .. src
 			local hit = acache[key]
 			if hit ~= nil then
 				return hit
