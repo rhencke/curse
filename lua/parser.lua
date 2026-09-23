@@ -975,7 +975,9 @@ local function parse_dquote(inner, add, heredoc)
 			-- `$()` form) — bash unwraps `\"`→`"`, so `"`echo \"hi\"`"` runs `echo "hi"`.
 			local j, buf = i + 1, {}
 			while j <= #inner and inner:sub(j, j) ~= "`" do
-				if inner:sub(j, j) == "\\" and inner:sub(j + 1, j + 1):match('[`$\\"]') then
+				if inner:sub(j, j) == "\\" and inner:sub(j + 1, j + 1) == "\n" then
+					j = j + 2 -- (backquotes drop a \<newline> too, even inside its '…' — POSIX)
+				elseif inner:sub(j, j) == "\\" and inner:sub(j + 1, j + 1):match('[`$\\"]') then
 					buf[#buf + 1] = inner:sub(j + 1, j + 1)
 					j = j + 2
 				else
@@ -1105,7 +1107,9 @@ local function parse_word(w)
 		elseif c == "`" then -- `cmd` command substitution
 			local j, buf = i + 1, {}
 			while j <= #w and w:sub(j, j) ~= "`" do
-				if w:sub(j, j) == "\\" and w:sub(j + 1, j + 1):match("[`$\\]") then
+				if w:sub(j, j) == "\\" and w:sub(j + 1, j + 1) == "\n" then
+					j = j + 2 -- (backquotes drop a \<newline> too, even inside its '…' — POSIX)
+				elseif w:sub(j, j) == "\\" and w:sub(j + 1, j + 1):match("[`$\\]") then
 					buf[#buf + 1] = w:sub(j + 1, j + 1)
 					j = j + 2
 				else

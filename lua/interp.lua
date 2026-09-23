@@ -1705,6 +1705,8 @@ local function str_glob_active(s)
 			return true
 		elseif c == "[" then
 			open = true
+		elseif c == "/" then
+			open = false -- (a bracket expression can't span a `/`)
 		elseif c == "]" then
 			if open then
 				return true
@@ -2016,32 +2018,7 @@ local function expand_to_fields(sh, w)
 	-- (unmasked) `]` closes it — a lone `[` (e.g. the `[` test builtin) is literal,
 	-- so it must NOT trigger a directory scan. Mirrors glob_conv's own "no closing
 	-- ] → literal [" rule; keeping them in sync avoids pointless per-word globbing.
-	local function glob_active(f)
-		local s, q = f.s, f.q
-		local open = false
-		for i = 1, #s do
-			if not q or q:sub(i, i) == "0" then
-				local c = s:sub(i, i)
-				if c == "*" or c == "?" then
-					return true
-				end
-				if c == "[" then
-					open = true
-				elseif c == "]" then
-					if open then
-						return true
-					end
-				elseif
-					(c == "+" or c == "@" or c == "!")
-					and s:sub(i + 1, i + 1) == "("
-					and (not q or q:sub(i + 1, i + 1) == "0")
-				then
-					return true
-				end
-			end
-		end
-		return false
-	end
+	local glob_active = rt.field_glob_active
 	-- build the glob pattern: a masked (quoted) glob-special char is backslash-escaped
 	-- so glob_conv treats it literally; the stored value f.s is left byte-for-byte intact.
 	local function glob_pat(f)

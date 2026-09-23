@@ -1924,6 +1924,38 @@ function M.child_status(sh, ok, err)
 	end
 end
 
+-- Is a field (value `s`, quote mask `q`: "1" = quoted byte) a pattern — a glob
+-- metacharacter at an unquoted position? bash's glob_pattern_p: `*`/`?`/extglob always;
+-- `[` only with a closing `]` (and no `/` between); an unquoted `\` from an expansion
+-- escapes the next char (bash 5.2: `a\?` from a variable isn't a pattern).
+function M.field_glob_active(f)
+	local s, q = f.s, f.q
+	local open, esc = false, false
+	for i = 1, #s do
+		if esc then
+			esc = false
+		elseif not q or q:sub(i, i) == "0" then
+			local c = s:sub(i, i)
+			if c == "\\" then
+				esc = true
+			elseif c == "*" or c == "?" then
+				return true
+			elseif c == "[" then
+				open = true
+			elseif c == "/" then
+				open = false
+			elseif c == "]" then
+				if open then
+					return true
+				end
+			elseif (c == "+" or c == "@" or c == "!") and s:sub(i + 1, i + 1) == "("
+				and (not q or q:sub(i + 1, i + 1) == "0") then
+				return true
+			end
+		end
+	end
+	return false
+end
 -- Does a redirection list redirect standard input?
 function M.redirs_stdin(rd)
 	for _, r in ipairs(rd) do
@@ -4600,6 +4632,10 @@ local COLLSYM = {
 	["grave-accent"] = "`", ["left-brace"] = "{", ["left-curly-bracket"] = "{",
 	["vertical-line"] = "|", ["right-brace"] = "}", ["right-curly-bracket"] = "}", tilde = "~",
 }
+local POSIX_CLASS = {}
+for c in ("alnum alpha blank cntrl digit graph lower print punct space upper xdigit"):gmatch("%a+") do
+	POSIX_CLASS[c] = true
+end
 local function glob_conv(glob, pn, patsub)
 	local star = pn and "[^/]*" or ".*"
 	local qmark = pn and "[^/]" or "."
@@ -4611,7 +4647,23 @@ local function glob_conv(glob, pn, patsub)
 		if EXTOP[c] and glob:sub(i + 1, i + 1) == "(" then
 			while j <= n and d > 0 do
 				local cc = glob:sub(j, j)
-				if cc == "(" then
+				if cc == "\\" then
+					j = j + 1 -- (an escaped char)
+				elseif cc == "[" then -- a bracket expression: its `)` doesn't close the group
+					local k = j + 1
+					if glob:sub(k, k) == "!" or glob:sub(k, k) == "^" then
+						k = k + 1
+					end
+					if glob:sub(k, k) == "]" then
+						k = k + 1
+					end
+					local close = glob:find("]", k, true)
+					if not close then
+						d = -1 -- an unclosed `[` swallows the rest: the group never closes (bash)
+						break
+					end
+					j = close
+				elseif cc == "(" then
 					d = d + 1
 				elseif cc == ")" then
 					d = d - 1
@@ -4710,8 +4762,18 @@ local function glob_conv(glob, pn, patsub)
 						local e = glob:find(nx .. "]", j + 2, true)
 						if e then
 							local cls = glob:sub(j, e + 1)
-							-- [:ascii:] (bash) isn't a regcomp class: its range instead
-							members[#members + 1] = (cls == "[:ascii:]") and "\1-\127" or cls
+							if nx == ":" then
+								local cname = glob:sub(j + 2, e - 1)
+								if cname == "ascii" then -- (bash's; not a regcomp class: its range)
+									members[#members + 1] = "\1-\127"
+								elseif cname == "word" then -- (bash's: alnum + _)
+									members[#members + 1] = "[:alnum:]_"
+								elseif POSIX_CLASS[cname] then
+									members[#members + 1] = cls
+								end -- an unknown class name matches nothing; the rest still match
+							else
+								members[#members + 1] = cls
+							end
 							j = e + 2
 						else -- an unterminated `[:`: the `[` drops out, the rest are members
 							-- (bash: `[[:alpha]` matches h, not [ — and a kept `[:` would make
@@ -4811,12 +4873,25 @@ function M.ext_match(str, pat, icase)
 		return a == b
 	end
 	-- index of the `)` closing an extglob group whose op is at `gi` (`(` at gi+1)
-	local function group_end(gi)
+	local function group_end(gi) -- (nil: the group never closes — then it's literal text)
 		local d, j = 1, gi + 2
 		while j <= plen do
 			local cc = pat:sub(j, j)
 			if cc == "\\" then
 				j = j + 2
+			elseif cc == "[" then -- a bracket expression: its `)` doesn't close the group
+				local k = j + 1
+				if pat:sub(k, k) == "!" or pat:sub(k, k) == "^" then
+					k = k + 1
+				end
+				if pat:sub(k, k) == "]" then
+					k = k + 1
+				end
+				local close = pat:find("]", k, true)
+				if not close then
+					return nil -- an unclosed `[` swallows the rest (bash)
+				end
+				j = close + 1
 			elseif cc == "(" then
 				d = d + 1
 				j = j + 1
@@ -4838,8 +4913,8 @@ function M.ext_match(str, pat, icase)
 			return si > slen
 		end
 		local c, nc = pat:sub(pi, pi), pat:sub(pi + 1, pi + 1)
-		if EXTOP[c] and nc == "(" then
-			local ge = group_end(pi)
+		local ge = EXTOP[c] and nc == "(" and group_end(pi)
+		if ge and ge <= plen then
 			local alts = split_alts(pat:sub(pi + 2, ge - 1))
 			local rest = ge + 1
 			local function altfull(seg)
@@ -5310,6 +5385,10 @@ function M.dir_names(path)
 end
 -- globstar `**`: every directory at or under `base` (recursively), including base
 -- itself (the zero-level case) — the prefixes an intermediate `**/` descends into.
+local _lst = ffi.new("uint8_t[144]")
+local function is_symlink(path)
+	return C.curse_rt_lstat(path, _lst) == 0 and bit.band(ffi.cast("uint32_t *", _lst + 24)[0], 0xF000) == 0xA000
+end
 local function rec_dirs(base, dotglob)
 	local out = { base }
 	local d = ffi.C.opendir(base == "" and "." or base)
@@ -5324,7 +5403,7 @@ local function rec_dirs(base, dotglob)
 		local name = ffi.string(ffi.cast("const char *", e) + 19)
 		if name ~= "." and name ~= ".." and (name:sub(1, 1) ~= "." or dotglob) then
 			local path = base == "" and name or (base == "/" and "/" .. name or base .. "/" .. name)
-			if is_dir(path) then
+			if is_dir(path) and not is_symlink(path) then -- (`**` doesn't follow symlinked dirs)
 				for _, sd in ipairs(rec_dirs(path, dotglob)) do
 					out[#out + 1] = sd
 				end
@@ -5353,9 +5432,27 @@ function M.glob_expand(pattern, opts)
 		return nil
 	end
 	local cur = { abs and "/" or "" } -- accumulated path prefixes (dir, "" == cwd)
+	-- the bases came through a pattern segment: a final `**` then lists each base as itself
+	-- (`**/a/**` -> a, …) rather than as `dir/` (`a/**` -> a/, …)
+	local prev_glob = false
+	local collapsed = {} -- segment index -> it absorbed a preceding `**`
+	if opts.globstar then -- adjacent `**` segments are one (`**/**/a` is `**/a` — bash)
+		local k = 2
+		while k <= #segs do
+			if segs[k] == "**" and segs[k - 1] == "**" then
+				table.remove(segs, k)
+				collapsed[k - 1] = true
+			else
+				k = k + 1
+			end
+		end
+	end
 	for si, seg in ipairs(segs) do
 		local isglob = seg:find("[*?%[]") or seg:find("[?*+@!]%(")
 		local islast = si == #segs
+		if collapsed[si] then -- (the absorbed `**` counts as a pattern before this one)
+			prev_glob = true
+		end
 		local nxt = {}
 		local function joined(base, name)
 			if base == "" then
@@ -5369,18 +5466,21 @@ function M.glob_expand(pattern, opts)
 		if seg == "**" and opts.globstar and islast then
 			-- a FINAL `**` matches every file and directory at any depth below the base
 			-- (plus the base itself as `dir/` — the zero-level match — when there is one)
+			local function add(pth)
+				nxt[#nxt + 1] = pth
+			end
 			for _, base in ipairs(cur) do
-				if base ~= "" and base ~= "/" then
-					nxt[#nxt + 1] = base .. "/"
+				if base ~= "" and base ~= "/" and is_dir(base) then -- (a base built from a literal may not exist)
+					add(prev_glob and base or (base .. "/"))
 				end
 				for _, dir in ipairs(rec_dirs(base, opts.dotglob)) do
 					if dir ~= base then
-						nxt[#nxt + 1] = dir
+						add(dir)
 					end
 					for _, name in ipairs(scan_seg(dir, "*", opts.dotglob, opts.skipdots)) do
 						local path = joined(dir, name)
-						if not is_dir(path) then
-							nxt[#nxt + 1] = path
+						if not is_dir(path) or is_symlink(path) then -- (a symlinked dir: an entry, not descended)
+							add(path)
 						end
 					end
 				end
@@ -5394,9 +5494,18 @@ function M.glob_expand(pattern, opts)
 			end
 		elseif not isglob then
 			-- literal segment: append; a nonexistent intermediate dir yields nothing
-			-- next round (opendir fails), so no explicit stat needed.
+			-- next round (opendir fails), so no explicit stat needed. Its backslash escapes
+			-- are removed (`./t\mp/*` names ./tmp — bash).
+			-- (a `\` before the `/` that ended it — `./tmp\/a/*` — goes too; in a GLOB segment
+			-- it stays, so `tm[p]\/…` matches nothing — bash)
+			local lit = seg:find("\\", 1, true) and seg:gsub("\\(.)", "%1"):gsub("\\$", "") or seg
 			for _, base in ipairs(cur) do
-				nxt[#nxt + 1] = joined(base, seg)
+				local path = joined(base, lit)
+				-- a trailing literal (`*/.`) must name something reachable: a directory that
+				-- isn't searchable yields no `dir/.` (bash stats the result)
+				if not islast or C.curse_rt_lstat(path, _lst) == 0 then
+					nxt[#nxt + 1] = path
+				end
 			end
 		else
 			for _, base in ipairs(cur) do
@@ -5407,6 +5516,7 @@ function M.glob_expand(pattern, opts)
 				end
 			end
 		end
+		prev_glob = prev_glob or isglob and true or false
 		cur = nxt
 		if #cur == 0 then
 			return nil
@@ -5430,15 +5540,7 @@ function M.glob_expand(pattern, opts)
 		end
 	end
 	table.sort(cur, M.coll_lt)
-	-- dedup: multiple `**` segments can reach the same path more than once
-	local seen, dedup = {}, {}
-	for _, p in ipairs(cur) do
-		if not seen[p] then
-			seen[p] = true
-			dedup[#dedup + 1] = p
-		end
-	end
-	return dedup
+	return cur -- (a path reached twice — `**/a/**` — is listed twice, as bash does)
 end
 
 -- Field engine, SPLIT path. The compiled tiers call this on the already-computed
@@ -5579,6 +5681,9 @@ function M.field_split(sh, value, split)
 				return true
 			elseif c == "[" then
 				open = true
+				i = i + 1
+			elseif c == "/" then
+				open = false -- (a bracket expression can't span a `/`)
 				i = i + 1
 			elseif c == "]" then
 				if open then
@@ -5807,30 +5912,7 @@ function M.expand_fields(sh, segs)
 		["|"] = 1,
 	}
 	local function glob_active(f) -- glob metachar at a NON-masked (glob-active) position?
-		local s, q = f.s, f.q
-		local open = false
-		for i = 1, #s do
-			if not q or q:sub(i, i) == "0" then
-				local c = s:sub(i, i)
-				if c == "*" or c == "?" then
-					return true
-				end
-				if c == "[" then
-					open = true
-				elseif c == "]" then
-					if open then
-						return true
-					end
-				elseif
-					(c == "+" or c == "@" or c == "!")
-					and s:sub(i + 1, i + 1) == "("
-					and (not q or q:sub(i + 1, i + 1) == "0")
-				then
-					return true
-				end
-			end
-		end
-		return false
+		return M.field_glob_active(f)
 	end
 	local function glob_pat(f) -- backslash-escape masked (quoted) glob-special chars
 		if not f.q or not f.q:find("1") then
