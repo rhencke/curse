@@ -1683,9 +1683,11 @@ end
 local compile_cmdsub_inner
 -- (compiling the body moves the compile-time line: put it back for the enclosing command)
 local function compile_cmdsub(...)
-	local l, cl = EF.cur_line, EF.cur_cline
+	local l, cl, ln, cil = EF.cur_line, EF.cur_cline, EF.cur_loopn, EF.cs_in_loop
+	-- (a `$( … )` inside a loop knows it: a break/continue in its body ends the substitution)
+	EF.cs_in_loop = (EF.cur_loopn or 0) > 0 or cil
 	local r = { compile_cmdsub_inner(...) }
-	EF.cur_line, EF.cur_cline = l, cl
+	EF.cur_line, EF.cur_cline, EF.cur_loopn, EF.cs_in_loop = l, cl, ln, cil
 	return unpack(r)
 end
 function compile_cmdsub_inner(src, backtick, lifted, aenv, noalias, posix)
@@ -1712,7 +1714,7 @@ function compile_cmdsub_inner(src, backtick, lifted, aenv, noalias, posix)
 			and st.redirs[1].op == "in"
 		then
 			-- compile the path word and read the file directly — no interp
-			local wok, pw = pcall(require("parser").parse_word, st.redirs[1].target or "")
+			local wok, pw = pcall(require("parser").parse_word, st.redirs[1].src or st.redirs[1].target or "")
 			for _, p in ipairs(wok and pw.parts or {}) do -- (a glob in the file word: interp)
 				if p.lit and not p.q and p.lit:find("[*?[]") then
 					wok = false
@@ -6370,6 +6372,7 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
 		if t == "noop" then
 			return after
 		end
+		EF.cur_loopn = #cx.loopstack -- (compile_cmdsub: is this command inside a loop)
 		if st.line then
 			cx.prev_line = EF.cur_line -- (the command before: a redirected compound's errors)
 			EF.cur_line = t == "simple" and st.cline or st.line -- (a simple command: interp's rule)
@@ -6411,8 +6414,11 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
 						-- targets the CALLER's loop -- raise the signal (level) for the enclosing
 						-- delegated cf-wrapper, exactly as interp's break/continue do.
 						cx.blocks[p] = d .. (EF.cf_flush or "") .. ("error({ __curse_%s = %d })"):format(cf_op, lvl)
-					else
-						cx.blocks[p] = d .. ("sh.status = 0; pc = %d"):format(after) -- no-op outside a loop
+					elseif EF.cs_in_loop and #cx.subexit == 0 then -- (in a `$( … )` inside a loop: ends it)
+						cx.blocks[p] = d .. ("error({ __curse_%s = %d })"):format(cf_op, lvl)
+					else -- outside any loop: bash says so (status 0) and carries on
+						cx.blocks[p] = d .. ("if not sh.opt_posix then io.stderr:write(%q) end; sh.status = 0; pc = %d"):format(
+							"curse: " .. cf_op .. ": only meaningful in a `for', `while', or `until' loop\n", after)
 					end
 				else
 					local idx = #cx.loopstack - (lvl - 1)

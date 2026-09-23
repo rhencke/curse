@@ -1605,9 +1605,14 @@ function Shell:capture_forked(ast, runner)
 		self.out = io.write
 		self.in_subprogram = (self.in_subprogram or 0) + 1
 		self.xdepth = (self.xdepth or 0) + 1 -- (xtrace: one more $(…) level)
+		if not (self.opt_posix or (self.shopt and self.shopt.inherit_errexit)) then
+			self.opt_e = false -- (errexit isn't inherited without inherit_errexit — bash)
+		end
 		local ok, err = pcall(runner, self)
 		if not ok and type(err) == "table" and (err.__curse_exit or err.__curse_return) then
 			self.status = err.__curse_exit or err.__curse_return
+		elseif not ok and type(err) == "table" and (err.__curse_break or err.__curse_continue) then
+			self.status = err.__curse_status or 0 -- (a loop's break/continue ends the $(…))
 		end
 		M.child_exit(self, self.status or 0)
 	end
@@ -1823,8 +1828,8 @@ function Shell:capture_inproc(backtick, runner, capfd, ctx)
 		self.capturing = true -- last pipeline stage drains into buf
 	end
 	self.in_subprogram = (self.in_subprogram or 0) + 1 -- $(...) is a subprogram: ERR trap suppressed
-	local saved_ld = self.loopdepth
-	self.loopdepth = 0 -- break/continue don't cross into $(...)
+	local saved_ld = self.loopdepth -- ($(…) inside a loop knows it: a break/continue there
+	-- ends the substitution, as it ends a `( … )` — bash)
 	local savede = self.opt_e
 	if not (self.opt_posix or (self.shopt and self.shopt.inherit_errexit)) then
 		self.opt_e = false
@@ -1887,6 +1892,8 @@ function Shell:capture_inproc(backtick, runner, capfd, ctx)
 			error(err) -- a SYNTAX error inside $(…) is fatal to the whole containing command (bash)
 		elseif type(err) == "table" and (err.__curse_exit or err.__curse_return) then
 			self.status = err.__curse_exit or err.__curse_return
+		elseif type(err) == "table" and (err.__curse_break or err.__curse_continue) then
+			self.status = err.__curse_status or 0 -- (it just ends the substitution)
 		else
 			readcap()
 			error(err)
