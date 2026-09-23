@@ -4058,6 +4058,18 @@ function Shell:special_get(name)
 	if name == "LINENO" then
 		return tostring(self.cur_line or 0)
 	end
+	if name == "SRANDOM" then -- 32 random bits from the system (bash's getrandom)
+		M.urandom = M.urandom or io.open("/dev/urandom", "rb")
+		local b = M.urandom and M.urandom:read(4)
+		if b and #b == 4 then
+			local a1, a2, a3, a4 = b:byte(1, 4)
+			return tostring(((a1 * 256 + a2) * 256 + a3) * 256 + a4)
+		end
+		return tostring(math.random(0, 4294967295))
+	end
+	if name == "HISTCMD" then -- the history number of the command now running
+		return tostring((self.hist_base or 1) + #(self.history or {}) - 1)
+	end
 	return ""
 end
 
@@ -4683,8 +4695,9 @@ function Shell:set_str(name, s)
 		s = M.cstr(s)
 	end -- bash vars are C strings: cut at NUL
 	local dn = self:deref(name)
-	if dn == "FUNCNAME" then
-		return -- assignments to FUNCNAME have no effect (bash): it's the call stack
+	if dn == "FUNCNAME" or dn == "SRANDOM" or (dn == "LINENO" and not self.vars.LINENO) then
+		return -- assignments to these have no effect (bash): the call stack, fresh random
+		-- bits, the line now running
 	end
 	local b = box(dn, self.vars)
 	if b.ref and not ref_target_ok(s) then
