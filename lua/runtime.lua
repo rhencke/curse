@@ -8,6 +8,12 @@
 local ffi = require("ffi")
 local i64 = ffi.typeof("int64_t")
 
+-- JIT limits: curse (interpreter + runtime + emitter, all traced in one long-lived
+-- worker) outgrows LuaJIT's default 1000 traces, and hitting the cap FLUSHES EVERY
+-- trace — each request then re-records the hot paths (measured ~0.6ms/request on the
+-- cases corpus). Machine code is allocated as used, so a high cap costs nothing idle.
+pcall(jit.opt.start, "maxtrace=8000", "maxmcode=8192")
+
 local M = {}
 M.i64 = i64
 -- Single-quote a string for reuse as shell input: 'x' with embedded ' -> '\''.
