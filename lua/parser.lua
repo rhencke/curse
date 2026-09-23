@@ -693,7 +693,10 @@ M.parse_paramexp = parse_paramexp
 -- the closing `)`. Understands single/double/ANSI-C quotes, backslash escapes,
 -- nested $()/${ }/$(( ))/backticks, and — crucially — `case … esac`, whose
 -- pattern-terminating `)` does NOT close the substitution (`$(case x in x) …;; esac)`).
-scan_cmdsub = function(src, j)
+-- `onwarn(rpos, dpos, delim)` (optional): a heredoc in the body was ended by the `DELIM)`
+-- form — bash warns "delimited by end-of-file"; rpos = the newline where its body reading
+-- began, dpos = the closing `)` (the caller turns them into line numbers).
+scan_cmdsub = function(src, j, onwarn)
 	local n = #src
 	local pdepth = 0 -- nested subshell / group / extglob paren depth
 	local cst = {} -- stack of enclosing `case` phases: "in"|"pat"|"body"
@@ -716,6 +719,7 @@ scan_cmdsub = function(src, j)
 	while i <= n do
 		local c = src:sub(i, i)
 		if c == "\n" and #hdp > 0 then
+			local rpos = i
 			-- heredoc bodies follow this line: they're text, not syntax. bash (parse_comsub):
 			-- a body line that starts with the delimiter then `)` also ends it (`EOF)`), the
 			-- `)` then closing the $(; a missing delimiter swallows the rest (unclosed $().
@@ -739,6 +743,9 @@ scan_cmdsub = function(src, j)
 					if pb then
 						i = i + lead + #hd.delim + pb - 1 -- at the `)`
 						closed = true
+						if onwarn then
+							onwarn(rpos, i, hd.delim)
+						end
 						break
 					end
 					i = le + 1
@@ -800,7 +807,7 @@ scan_cmdsub = function(src, j)
 					local _, ni = grab_dparen(src, i + 3)
 					i = ni
 				elseif d == "$" and src:sub(i + 1, i + 1) == "(" then
-					i = scan_cmdsub(src, i + 2)
+					i = scan_cmdsub(src, i + 2, onwarn)
 				elseif d == "$" and src:sub(i + 1, i + 1) == "{" then
 					i = scan_braces(src, i + 1, true)
 				elseif d == "`" then
@@ -830,7 +837,7 @@ scan_cmdsub = function(src, j)
 			wstart = false
 			patstart = false
 		elseif c == "$" and src:sub(i + 1, i + 1) == "(" then
-			i = scan_cmdsub(src, i + 2)
+			i = scan_cmdsub(src, i + 2, onwarn)
 			wstart = false
 			patstart = false
 		elseif c == "$" and src:sub(i + 1, i + 1) == "{" then
@@ -870,7 +877,9 @@ scan_cmdsub = function(src, j)
 				i = i + 1
 				wstart = false
 			else
-				return i + 1
+				-- (heredocs opened on this last line read their bodies from the lines
+				-- AFTER it — the caller splices them in; see word())
+				return i + 1, (#hdp > 0 and hdp or nil)
 			end -- the `)` that closes the $(
 		elseif c == "<" and src:sub(i + 1, i + 1) == "<" and src:sub(i + 2, i + 2) ~= "<" then
 			-- `<<[-]WORD`: note the (quote-removed) delimiter; its body follows the line
@@ -1899,6 +1908,7 @@ local function make_parser(src, sh, aenv, noalias, posix, line0)
 	end
 	local loopId = 0
 	local heredocs_pending = {} -- heredoc redirs awaiting their body (filled at line end)
+	local warns = {} -- parse-time warnings, run as `warn` statements ahead of their line
 	-- Alias expansion, done here in the PARSER as a deterministic function of the
 	-- source text (recognizing `shopt -s/-u expand_aliases`, `alias`, `unalias` as
 	-- they are parsed), so the interpreter and the behind-the-scenes compiler both
@@ -2151,12 +2161,14 @@ local function make_parser(src, sh, aenv, noalias, posix, line0)
 		while i <= n and src:sub(i, i) ~= "\n" do
 			i = i + 1
 		end -- to end of command line
+		local rline, nread = line, 0 -- (bash's warning lines: where reading began, + lines read)
 		if i <= n then
 			i = i + 1
 			line = line + 1
 		end
 		for _, hd in ipairs(heredocs_pending) do
 			local blines = {}
+			local found = false
 			while i <= n do
 				local le = src:find("\n", i, true) or (n + 1)
 				local lstr = src:sub(i, le - 1)
@@ -2165,6 +2177,7 @@ local function make_parser(src, sh, aenv, noalias, posix, line0)
 				end
 				i = le + 1
 				line = line + 1
+				nread = nread + 1
 				-- unquoted delimiter: `\<newline>` joins lines before the delimiter check (bash)
 				while hd.expand and le <= n and #lstr:match("\\*$") % 2 == 1 do
 					le = src:find("\n", i, true) or (n + 1)
@@ -2177,22 +2190,37 @@ local function make_parser(src, sh, aenv, noalias, posix, line0)
 					line = line + 1
 				end
 				if lstr == hd.delim then
+					found = true
 					break
 				end
 				-- a $(…) body's final `DELIM )` line reached here as `DELIM ` (see scan_cmdsub)
 				if le > n and lstr:match("^(.-)[ \t]+$") == hd.delim then
+					found = true
 					break
 				end
 				blines[#blines + 1] = lstr
+			end
+			if not found then
+				warns[#warns + 1] = { t = "warn", line = rline + nread,
+					msg = ("warning: here-document at line %d delimited by end-of-file (wanted `%s')"):format(rline, hd.delim) }
 			end
 			hd.body = #blines > 0 and (table.concat(blines, "\n") .. "\n") or ""
 			hd.aenv = ALIAS_ENV -- the compiler re-parses an expanding body later (parse_heredoc)
 		end
 		heredocs_pending = {}
 	end
-	local function ws() -- skip spaces/tabs (not newlines)
-		while i <= n and src:sub(i, i):match("[ \t]") do
-			i = i + 1
+	local function ws() -- skip spaces/tabs (not newlines) — and `\<newline>` continuations,
+		-- which bash removes from the input before tokenizing (`a | \<nl>(cat)`)
+		while i <= n do
+			local c = src:sub(i, i)
+			if c == " " or c == "\t" then
+				i = i + 1
+			elseif c == "\\" and src:sub(i + 1, i + 1) == "\n" then
+				i = i + 2
+				line = line + 1
+			else
+				break
+			end
 		end
 	end
 	local parse_redir -- forward (defined in make_parser body)
@@ -2285,7 +2313,14 @@ local function make_parser(src, sh, aenv, noalias, posix, line0)
 	end
 	local function word(stop_paren, stop_cmp) -- read one shell word, keeping quotes and $(( )) / ${ } / $( ) balanced
 		ws()
-		local start, line0 = i, line
+		local start, line0, lfix = i, line, 0
+		local function hdwarn(rp, dp, d) -- (see scan_cmdsub's onwarn)
+			local function at(p)
+				return line0 + select(2, src:sub(start, p - 1):gsub("\n", ""))
+			end
+			warns[#warns + 1] = { t = "warn", line = at(dp),
+				msg = ("warning: here-document at line %d delimited by end-of-file (wanted `%s')"):format(at(rp), d) }
+		end
 		while i <= n do
 			local c = src:sub(i, i)
 			if c == "\\" then -- backslash escapes the next char (incl. metachars/space)
@@ -2309,7 +2344,7 @@ local function make_parser(src, sh, aenv, noalias, posix, line0)
 							i = i + 2
 							prex_comsub()
 						else
-							i = scan_cmdsub(src, i + 2) -- case/quote/nesting-aware boundary
+							i = scan_cmdsub(src, i + 2, hdwarn) -- case/quote/nesting-aware boundary
 						end
 					elseif d == "$" and src:sub(i + 1, i + 1) == "{" then
 						i = scan_braces(src, i + 1, true) -- ${…}: inner \ ' " and nested {} don't close it
@@ -2374,7 +2409,39 @@ local function make_parser(src, sh, aenv, noalias, posix, line0)
 					i = i + 2
 					prex_comsub()
 				else
-					i = scan_cmdsub(src, i + 2) -- case/quote/nesting-aware boundary (errors if unclosed)
+					local je, hdp = scan_cmdsub(src, i + 2, hdwarn) -- case/quote/nesting-aware boundary (errors if unclosed)
+					if hdp then
+						-- `$(cat <<EOF)` then the body on the following lines (bash): move those
+						-- lines (through each delimiter) inside the $( … ) text
+						local nl = src:find("\n", je, true)
+						if nl then
+							local k = nl + 1
+							for _, hd in ipairs(hdp) do
+								while k <= n do
+									local le = src:find("\n", k, true) or (n + 1)
+									local l = src:sub(k, le - 1)
+									if hd.strip then
+										l = l:gsub("^\t+", "")
+									end
+									k = le + 1
+									if l == hd.delim then
+										break
+									end
+								end
+							end
+							local body = src:sub(nl + 1, k - 1)
+							if body:sub(-1) ~= "\n" then
+								body = body .. "\n"
+							end
+							src = src:sub(1, je - 2) .. "\n" .. body .. src:sub(je - 1, nl) .. src:sub(k)
+							n = #src
+							je = je + 1 + #body
+							lfix = lfix - 1 -- (that inserted newline isn't a source line)
+							warns[#warns + 1] = { t = "warn", line = line,
+								msg = ("warning: command substitution: %d unterminated here-document"):format(#hdp) }
+						end
+					end
+					i = je
 				end
 			elseif (c == "<" or c == ">") and src:sub(i + 1, i + 1) == "(" then
 				-- <(cmd) / >(cmd) process substitution: part of the word — scanned like $(…)
@@ -2418,7 +2485,7 @@ local function make_parser(src, sh, aenv, noalias, posix, line0)
 		end
 		-- every newline the word spans ($(…) bodies, quotes, continuations) advances the line
 		local w = src:sub(start, i - 1)
-		line = line0 + select(2, w:gsub("\n", ""))
+		line = line0 + select(2, w:gsub("\n", "")) + lfix
 		return w
 	end
 
@@ -4034,11 +4101,21 @@ local function make_parser(src, sh, aenv, noalias, posix, line0)
 		if #heredocs_pending > 0 then
 			collect_heredocs()
 		end -- read bodies after the line
+		if #warns > 0 then
+			for k = #warns, 1, -1 do
+				table.insert(stmts, 1, warns[k])
+			end
+			warns = {}
+		end
 		return { stmts = stmts }
 	end
 	-- a syntax error also reports the offending input line (bash's second message line)
 	return function()
 		local lg = next_line()
+		if lg and lg.perr and #warns > 0 then -- (warnings read before the error still show)
+			lg.perr.warns = warns
+			warns = {}
+		end
 		if lg and lg.perr then
 			local m = tostring(lg.perr.msg or "")
 			if m:find("unexpected end of file", 1, true) or m:find("matching `)'", 1, true) then

@@ -4893,7 +4893,14 @@ exec_stmt = function(sh, st, hook)
 		end
 		sh.loopdepth = sh.loopdepth - 1
 		sh.status = bodystatus
+	elseif t == "warn" then -- a parse-time warning (heredoc at EOF, …), shown before its line runs
+		sh.cur_line = st.line
+		io.stderr:write("curse: " .. st.msg .. "\n")
 	elseif t == "parse_error" then
+		for _, w in ipairs(st.warns or {}) do
+			sh.cur_line = w.line
+			io.stderr:write("curse: " .. w.msg .. "\n")
+		end
 		-- A RECOVERABLE parse error (an invalid `NAME=( … )` array-literal element) is
 		-- reported but NON-fatal: the assignment is dropped and the script continues
 		-- (bash). This matches run_lazy's handling, so the compiled path (which reaches
