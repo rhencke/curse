@@ -446,6 +446,63 @@ local function serve_request(cfd, req, fds, ctx)
 	return retire
 end
 
+-- Warm the PARENT before the pool forks (the workers inherit it copy-on-write): load every
+-- lazily-required module (a builtin's module would otherwise load on its first use in
+-- EACH worker) and run a representative builtins-only script through the tiered path —
+-- interpreted, switched, compiled and warm — so the hot paths already have JIT traces.
+local WARM_SRC = [==[
+f() { local i=0 s=0; while [ $i -lt 300 ]; do s=$((s+i%7)); i=$((i+1)); done; echo "$s"; }
+f >/dev/null
+a=(one two three); declare -A m=([k]=v [x]=y); a+=(four); echo "${a[@]} ${#a[@]} ${m[k]} ${!m[@]}" >/dev/null
+for w in alpha beta gamma; do case $w in a*) x=${w^^};; b*) x=${w#b};; *) x=${w//a/A};; esac; done
+s="hello world"; [[ $s == h* && ${#s} -gt 3 ]] && t=${s:2:3}; printf '%s-%d
+' "$t" 42 >/dev/null
+while read -r l; do n=$l; done <<< $'1
+2
+3'
+x=$(echo sub; echo two); y=$( (echo inner) ); z=`echo bq`
+echo "p" | { read q; echo "$q"; } >/dev/null; echo a b c | while read -a arr; do :; done
+set -- p1 p2 p3; shift; for p; do :; done; OPTIND=1; while getopts "ab:" o -a -b v; do :; done
+mapfile -t lines <<< $'x
+y'; test -n "$x"; [ "$y" = inner ]; type echo >/dev/null; declare -p a >/dev/null
+trap 'e=1' USR1; trap - USR1; (( j = 3 * 4 )); let k=j+1; export W=1; unset W; readonly R0=1 2>/dev/null
+{ echo g; } 2>/dev/null >/dev/null; ( cd / && pwd ) >/dev/null; : ${u:-def} ${v:=set}
+]==]
+local function warm_parent()
+	for _, m in pairs(rt.BUILTIN_LAZY or {}) do
+		pcall(require, m)
+	end
+	for _, m in ipairs({ "deparse", "hist", "helpdata", "emit", "parser", "interp", "b_eval", "b_source" }) do
+		pcall(require, m)
+	end
+	local dn = C.open("/dev/null", 2, 0)
+	local sv = {}
+	for fd = 0, 2 do -- (its output goes nowhere)
+		sv[fd] = rt.save_fd(fd)
+		if dn >= 0 then
+			C.dup2(dn, fd)
+		end
+	end
+	local cwd = rt.Shell.new():phys_cwd()
+	for i = 1, 4 do
+		local sh = rt.Shell.new()
+		pcall(Tier.run_tiered, WARM_SRC .. "\n# warm " .. (i % 2), sh) -- (a miss, then warm hits)
+		pcall(Tier.compile_deferred)
+		pcall(rt.sched_drain)
+		io.flush()
+	end
+	C.chdir(cwd)
+	for fd = 0, 2 do
+		if sv[fd] >= 0 then
+			C.dup2(sv[fd], fd)
+			C.close(sv[fd])
+		end
+	end
+	if dn >= 0 then
+		C.close(dn)
+	end
+	collectgarbage("collect")
+end
 local WORKER_IDLE = 99 -- worker exit code meaning "accept() timed out" (parent may drain)
 
 -- A PERSISTENT pre-forked worker: block in accept() on the shared listen socket,
@@ -712,6 +769,7 @@ local function serve()
 			end
 		end
 	end
+	warm_parent()
 	for _ = 1, POOL do
 		spawn()
 	end

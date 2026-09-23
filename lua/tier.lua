@@ -378,8 +378,16 @@ function M.run_tiered(src, sh)
 		I.run_lazy(sh, src)
 		return sh, "interp-deferred"
 	end
-	local pok, ast = pcall(P.parse, src)
-	if path and pok and type(ast) == "table" and ast.stmts and not compile_first(ast) then
+	-- (the classification parse is needed only when a function could hold the loop: with no
+	-- funcdef in the text, go straight to the interpreter — the compile parses if it's hot)
+	local nofunc = not (src:find("(", 1, true) and src:find("%(%s*%)")) and not src:find("%f[%w_]function%f[^%w_]")
+	local pok, ast
+	if nofunc then
+		pok = true
+	else
+		pok, ast = pcall(P.parse, src)
+	end
+	if path and pok and (nofunc or (type(ast) == "table" and ast.stmts and not compile_first(ast))) then
 		-- It can only get hot in a TOP-LEVEL loop, where the interpreter can switch: run it
 		-- interpreted; a loop that turns hot compiles it right then and continues compiled
 		-- (OSR at that loop); one that never does is compiled after the reply.
@@ -393,7 +401,11 @@ function M.run_tiered(src, sh)
 				return
 			end
 			if mod == nil then
-				mod = compile_store(path, ast, sh) or false
+				if not ast then
+					local okp, a = pcall(P.parse, src)
+					ast = okp and a or nil
+				end
+				mod = ast and compile_store(path, ast, sh) or false
 			end
 			local pc = mod and resume_pc(mod, { kind = kind, id = id })
 			if pc then -- (no module — the emitter declined, or aliases now in play: stay put)
@@ -416,7 +428,7 @@ function M.run_tiered(src, sh)
 		end
 		error(err)
 	end
-	local m = pok and path and compile_store(path, ast, sh)
+	local m = pok and path and ast and compile_store(path, ast, sh)
 	if m then
 		return M.run_mod(m, sh, src, 0) -- interp -> OSR fall-over
 	end

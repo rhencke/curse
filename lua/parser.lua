@@ -580,32 +580,33 @@ local function comsub_syntax(body)
 	return err or nil
 end
 local dparen_is_arith -- forward (defined below)
+-- (scan_braces: skip to just past the closing quote `q`, honoring \ when `esc`; running off
+-- the end inside a quote names that quote)
+local function skip_to(s, i, ns, q, esc)
+	while i <= ns and s:sub(i, i) ~= q do
+		i = i + ((esc and s:sub(i, i) == "\\") and 2 or 1)
+	end
+	if i > ns then
+		error("unexpected EOF while looking for matching `" .. q .. "'")
+	end
+	return i + 1
+end
 local function scan_braces(s, bi, dq)
 	local i, ns, depth = bi + 1, #s, 1
 	local sq_lit = dq and POSIX_DQ
-	-- running off the end inside a quote names that quote; inside the braces, `}` (bash)
-	local function skip_to(q, esc)
-		while i <= ns and s:sub(i, i) ~= q do
-			i = i + ((esc and s:sub(i, i) == "\\") and 2 or 1)
-		end
-		if i > ns then
-			error("unexpected EOF while looking for matching `" .. q .. "'")
-		end
-		i = i + 1
-	end
 	while i <= ns and depth > 0 do
 		local c = s:sub(i, i)
 		if c == "\\" then
 			i = i + 2
 		elseif c == "$" and s:sub(i + 1, i + 1) == "'" then -- $'…': a \' inside doesn't close it
 			i = i + 2
-			skip_to("'", true)
+			i = skip_to(s, i, ns, "'", true)
 		elseif c == "'" and not sq_lit then
 			i = i + 1
-			skip_to("'", false)
+			i = skip_to(s, i, ns, "'", false)
 		elseif c == '"' then
 			i = i + 1
-			skip_to('"', true)
+			i = skip_to(s, i, ns, '"', true)
 		elseif c == "{" then
 			-- only a nested `${` opens a level; a bare `{` is an ordinary char, so
 			-- `${X//a/{x,y,z}}` ends at the FIRST `}` (bash: replacement `{x,y,z`, then `}`)
@@ -617,7 +618,7 @@ local function scan_braces(s, bi, dq)
 			i = scan_cmdsub(s, i + 2) -- a `}` inside $(…) doesn't close (unclosed: its error)
 		elseif c == "`" then -- …nor one inside `…`
 			i = i + 1
-			skip_to("`", true)
+			i = skip_to(s, i, ns, "`", true)
 		elseif c == "}" then
 			depth = depth - 1
 			i = i + 1
@@ -1866,8 +1867,8 @@ local function classify_brace(inner)
 end
 -- Parse a raw word into factors, or nil if it has no expandable brace.
 local function brace_factors(s)
-	if not s:find("{", 1, true) then
-		return nil -- (the common word: no brace at all)
+	if not s:find("{", 1, true) or not s:gsub("%${", ""):find("{", 1, true) then
+		return nil -- (the common word: no brace at all, or only ${…} ones)
 	end
 	local factors, litbuf, any = {}, {}, false
 	local function flush()
@@ -2186,6 +2187,10 @@ local function dequote_word(w)
 	return table.concat(out)
 end
 
+-- a space or tab (a plain compare: string patterns keep the tokenizer out of the JIT)
+local function is_blank(ch)
+	return ch == " " or ch == "\t"
+end
 -- the characters a word scan must look at (anything else just continues the word)
 local WORD_SPECIAL = "[\\()\"'$<>|&`; \t\n?*+@!]"
 local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs)
@@ -2375,7 +2380,7 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs)
 		while src:sub(i, i + 1) == "\\\n" do
 			i = i + 2
 			line = line + 1
-			while src:sub(i, i):match("[ \t]") do
+			while is_blank(src:sub(i, i)) do
 				i = i + 1
 			end
 		end
@@ -2501,10 +2506,8 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs)
 	local function ws() -- skip spaces/tabs (not newlines) — and `\<newline>` continuations,
 		-- which bash removes from the input before tokenizing (`a | \<nl>(cat)`)
 		while i <= n do
-			local c = src:sub(i, i)
-			if c == " " or c == "\t" then
-				i = i + 1
-			elseif c == "\\" and src:sub(i + 1, i + 1) == "\n" then
+			i = src:find("[^ \t]", i) or (n + 1) -- (a run of blanks at once)
+			if i <= n and src:byte(i) == 92 and src:byte(i + 1) == 10 then -- `\<newline>`
 				i = i + 2
 				line = line + 1
 			else
@@ -2799,16 +2802,24 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs)
 		end
 		-- every newline the word spans ($(…) bodies, quotes, continuations) advances the line
 		local w = src:sub(start, i - 1)
-		line = line0 + select(2, w:gsub("\n", "")) + lfix
+		line = line0 + (w:find("\n", 1, true) and select(2, w:gsub("\n", "")) or 0) + lfix
 		return w
 	end
 
+	-- (memoized by position: the parser peeks the same spot again and again for keywords;
+	-- a hit re-applies ws's line effect so nothing observable changes)
+	local pk_i, pk_src, pk_w, pk_dl
 	local function peekword()
-		local save = i
+		if pk_i == i and pk_src == src then
+			line = line + pk_dl
+			return pk_w
+		end
+		local save, l0 = i, line
 		ws()
 		local s, e = src:find("^[%a_][%w_]*", i)
 		local w = s and src:sub(s, e) or nil
 		i = save
+		pk_i, pk_src, pk_w, pk_dl = save, src, w, line - l0
 		return w
 	end
 
@@ -2907,6 +2918,10 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs)
 	-- [N]> [N]>> [N]< >&M N>&M &> [N]>&- ; heredocs (<<) are left to parse_command.
 	parse_redir = function()
 		local p = i
+		local b0 = src:byte(p) -- (only a digit, `{`, `<`, `>` or `&` can start one)
+		if not b0 or not ((b0 >= 48 and b0 <= 57) or b0 == 123 or b0 == 60 or b0 == 62 or b0 == 38) then
+			return nil
+		end
 		-- `<(…)` / `>(…)` are process substitutions (word parts), not redirections.
 		if src:sub(p, p + 1) == "<(" or src:sub(p, p + 1) == ">(" then
 			return nil
@@ -3321,7 +3336,7 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs)
 		-- coproc [NAME] compound-command | coproc simple-command: an async command wired to
 		-- the shell by two pipes. A NAME (default COPROC) is only allowed before a COMPOUND
 		-- command — before a simple one, that word is the command (bash).
-		if peekword() == "coproc" and src:sub(i + 6, i + 6):match("[ \t]") then
+		if peekword() == "coproc" and is_blank(src:sub(i + 6, i + 6)) then
 			ws()
 			i = i + 6
 			ws()
@@ -3339,7 +3354,7 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs)
 				local s, e = src:find("^[^%s;&|()<>]+", i)
 				if s then
 					local k = e + 1
-					while src:sub(k, k):match("[ \t]") do
+					while is_blank(src:sub(k, k)) do
 						k = k + 1
 					end
 					if k > e + 1 and compound_at(k) then
@@ -3370,7 +3385,7 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs)
 			-- optional `( )` (bash: `function f () { … }`, spaces allowed between parens)
 			if src:sub(i, i) == "(" then
 				local k = i + 1
-				while src:sub(k, k):match("[ \t]") do
+				while is_blank(src:sub(k, k)) do
 					k = k + 1
 				end
 				if src:sub(k, k) == ")" then
@@ -3387,13 +3402,13 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs)
 			local s, e = src:find("^[%w_:%.+@/%%%^~,][%w_%.%-:+@/!#=%%%^~,]*", i)
 			if s and src:sub(e, e) ~= "=" then
 				local j = e + 1
-				while src:sub(j, j):match("[ \t]") do
+				while is_blank(src:sub(j, j)) do
 					j = j + 1
 				end
 				-- NAME ( ) — a space is allowed between the parens (bash: `fun ( ) { … }`)
 				if src:sub(j, j) == "(" then
 					local k = j + 1
-					while src:sub(k, k):match("[ \t]") do
+					while is_blank(src:sub(k, k)) do
 						k = k + 1
 					end
 					if src:sub(k, k) == ")" then
@@ -3416,7 +3431,8 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs)
 		-- parses it and reports "not a valid identifier" at RUNTIME (status 1), not a
 		-- parse error. Scan the word (balancing $()); if it's `$`-bearing and followed
 		-- by `()`, treat it as a funcdef with that (invalid) name.
-		do
+		local d1 = src:find("[$ \t\n(;&|<>]", i) -- (no `$` before the word ends: can't be one)
+		if d1 and src:sub(d1, d1) == "$" then
 			local j, depth = i, 0
 			while j <= n do
 				local c = src:sub(j, j)
@@ -3437,12 +3453,12 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs)
 			end
 			if j > i and src:sub(i, j - 1):find("$", 1, true) then
 				local k = j
-				while src:sub(k, k):match("[ \t]") do
+				while is_blank(src:sub(k, k)) do
 					k = k + 1
 				end
 				if src:sub(k, k) == "(" then
 					local m = k + 1
-					while src:sub(m, m):match("[ \t]") do
+					while is_blank(src:sub(m, m)) do
 						m = m + 1
 					end
 					if src:sub(m, m) == ")" then
@@ -3726,7 +3742,7 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs)
 			-- not arith: fall through to the subshell parser below (i still at the first `(`)
 		end
 		-- [[ EXPR ]] conditional (no word-splitting; == is glob, =~ is regex)
-		if src:sub(i, i + 1) == "[[" and src:sub(i + 2, i + 2):match("[ \t]") then
+		if src:sub(i, i + 1) == "[[" and is_blank(src:sub(i + 2, i + 2)) then
 			i = i + 2
 			local toks, quoted = {}, {}
 			while true do
@@ -3962,9 +3978,9 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs)
 					if c == ")" and depth == 0 then
 						break
 					end
-					if depth == 0 and c:match("[ \t]") then -- (between words only `|` or `)`)
+					if depth == 0 and is_blank(c) then -- (between words only `|` or `)`)
 						local k = i
-						while src:sub(k, k):match("[ \t]") do
+						while is_blank(src:sub(k, k)) do
 							k = k + 1
 						end
 						local prev = table.concat(patstr):match("(%S)%s*$")
@@ -4155,7 +4171,7 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs)
 				error("syntax error near `('")
 			elseif c == "\n" or c == ";" or c == "#" or c == "&" or c == "|" or c == "(" or c == ")" then
 				break -- ( ) are metacharacters (subshell bounds)
-			elseif c:match("[ \t]") then
+			elseif is_blank(c) then
 				ws()
 			else
 				-- Expand the command word here too (it can follow leading assignments or
