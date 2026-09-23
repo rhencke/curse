@@ -5897,7 +5897,17 @@ exec_stmt = function(sh, st, hook)
 				go = (sh.status ~= 0)
 			end -- "||"
 			if go then
-				exec_stmt(sh, it.cmd, hook)
+				if k < #st.items then -- (a non-final operand ignores errexit throughout — in a
+					-- function it calls too — as a condition does)
+					sh.noerr = sh.noerr + 1
+					local ok, err = pcall(exec_stmt, sh, it.cmd, hook)
+					sh.noerr = sh.noerr - 1
+					if not ok then
+						error(err, 0)
+					end
+				else
+					exec_stmt(sh, it.cmd, hook)
+				end
 			end
 			if k == #st.items then
 				ran_last = go
@@ -6367,8 +6377,15 @@ fire_err_trap = function(sh)
 	local h = sh.traps and sh.traps.ERR
 	-- ERR is not re-run inside a forked pipeline stage (bash fires it ONCE for the
 	-- whole pipeline, in the parent); errtrace still extends it to functions/subshells.
-	local errscope = sh.opt_errtrace
-		or ((sh.calldepth or 0) == 0 and (sh.in_subprogram or 0) == 0 and (sh.in_pipestage or 0) == 0)
+	-- (not inherited by functions/subshells — but one SET in a function or subshell
+	-- fires there, as bash's trap is active in the context that set it)
+	-- (functions hide it on entry — rt.debug_enter; a subshell doesn't inherit it either)
+	local sp = sh.in_subprogram or 0
+	local errscope = sh.opt_errtrace or ((sh.in_pipestage or 0) == 0 and (sp == 0 or sp == sh.err_trap_sp))
+	if sh.err_skip then -- (the failing call set the trap itself: bash sampled none before it)
+		sh.err_skip = nil
+		return
+	end
 	if h and h ~= "" and not sh.in_err_trap and errscope then
 		sh.in_err_trap = true
 		local saved = sh.status

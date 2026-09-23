@@ -98,6 +98,9 @@ return function(sh, cmd, args, hook, tcb)
 					else
 						sh.traps[canon] = action
 					end
+					if canon == "ERR" then -- (it fires where it was set: see interp's fire_err_trap)
+						sh.err_trap_sp = sh.in_subprogram or 0
+					end
 					if canon == "EXIT" then
 						rt.exit_trap_inherited = nil -- this (sub)shell's own EXIT trap now
 					end

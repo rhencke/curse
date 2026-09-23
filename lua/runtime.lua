@@ -1433,6 +1433,19 @@ function Shell:exec(...)
 	if not args[1]:find("/", 1, true) then
 		execpath = self:resolve_cmd(args[1])
 		if not execpath then
+			-- bash: a defined command_not_found_handle runs instead, in a separate execution
+			-- environment, with the command and its arguments; its status is the command's
+			if not self.exec_builtin and self.functions.command_not_found_handle and not self.in_cnf_handle then
+				self.in_cnf_handle = true -- (a miss inside the handler itself is just reported)
+				local ok, err = pcall(self.subshell_run, self, function(sh)
+					require("interp")._int.exec_simple(sh, { "command_not_found_handle", unpack(args, 1, n) }, function() end)
+				end)
+				self.in_cnf_handle = nil
+				if not ok then
+					error(err, 0)
+				end
+				return
+			end
 			self:errmsg("curse: " .. (self.exec_builtin and "exec: " or "") .. M.err_name(args[1]) .. (self.exec_builtin and ": not found\n" or ": command not found\n"))
 			self.status = 127
 			return
@@ -2121,19 +2134,27 @@ end
 -- and RETURN traps: they're hidden for its body (bash's execute_function) and restored on
 -- the way out. Returns what debug_leave puts back.
 function M.debug_enter(sh, name)
-	local d, r = sh.traps.DEBUG, sh.traps.RETURN
-	if d == nil and r == nil then
+	local d, r, e = sh.traps.DEBUG, sh.traps.RETURN, sh.traps.ERR
+	sh.err_skip = nil
+	if d == nil and r == nil and e == nil then
 		return nil
+	end
+	-- ERR likewise, unless errtrace (`set -E`) — and bash samples it BEFORE a command runs,
+	-- so one the call itself sets doesn't fire for the call (e0: it existed before)
+	local saved = { e0 = e }
+	if e ~= nil and not sh.opt_errtrace then
+		sh.traps.ERR, saved.e = nil, e
 	end
 	if sh.opt_functrace or (sh.fn_trace and sh.fn_trace[name]) then
 		-- inherited: it also fires once on ENTRY, at the definition's line (bash)
 		if d ~= nil then
 			require("interp").run_debug(sh, sh.func_bline and sh.func_bline[name] or nil)
 		end
-		return nil
+		return saved
 	end
 	sh.traps.DEBUG, sh.traps.RETURN = nil, nil
-	return { d = d, r = r }
+	saved.d, saved.r = d, r
+	return saved
 end
 function M.debug_leave(sh, saved)
 	if saved ~= nil then
@@ -2143,6 +2164,12 @@ function M.debug_leave(sh, saved)
 		if saved.r ~= nil and sh.traps.RETURN == nil then
 			sh.traps.RETURN = saved.r
 		end
+		if saved.e ~= nil and sh.traps.ERR == nil then
+			sh.traps.ERR = saved.e
+		end
+	end
+	if not (saved and saved.e0) and sh.traps.ERR and sh.status ~= 0 and sh.noerr == 0 then
+		sh.err_skip = true -- (set during this call: no ERR for the call's own failure)
 	end
 end
 function M.child_exit(sh, status)

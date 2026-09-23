@@ -977,7 +977,7 @@ local function fnwrap(cmd, line, s)
 		pre = pre .. "sh.calldepth = sh.calldepth + 1; "
 		post = post .. "; sh.calldepth = sh.calldepth - 1"
 	end
-	if EF.has_debug then -- the callee doesn't inherit DEBUG (rt.debug_enter)
+	if EF.has_debug or EF.has_err then -- the callee doesn't inherit DEBUG/ERR (rt.debug_enter)
 		pre = pre .. ("local __dbg = rt.debug_enter(sh, %q); "):format(cmd)
 		post = post .. "; rt.debug_leave(sh, __dbg)"
 	end
