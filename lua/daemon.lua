@@ -305,6 +305,18 @@ local function serve_request(cfd, req, fds, ctx)
 	-- A FRESH Shell.new (imports the caller's env exactly), cheap because the pages are
 	-- warm (worker_main pre-faulted once, and a persistent worker never re-forks).
 	local sh = rt.Shell.new()
+	-- $PPID is the CLIENT's parent (the shell that ran curse), not this worker's
+	if ctx.client_pid and ctx.client_pid > 1 then
+		local f = io.open("/proc/" .. ctx.client_pid .. "/stat", "r")
+		local st = f and f:read("*l")
+		if f then
+			f:close()
+		end
+		local pp = st and st:match("%) %S+ (%d+)")
+		if pp and sh.vars.PPID then
+			sh.vars.PPID.s = pp
+		end
+	end
 	if req.sigign ~= ctx.sigign then -- (the common case — same as the worker's — costs nothing)
 		rt.sig_apply_mask(req.sigign)
 	end
@@ -430,6 +442,7 @@ local function worker_main(lfd, my_uid, ctx, slot)
 			if cred[0].pid > 1 then
 				ctx.busy[slot] = cred[0].pid -- (the parent kills this worker if that client dies)
 			end
+			ctx.client_pid = cred[0].pid
 			if my_uid and cred[0].uid ~= my_uid then
 				C.close(cfd)
 			else

@@ -25,14 +25,30 @@ return function(sh, cmd, args, hook, tcb)
 			io.stderr:write("curse: let: expression expected\n")
 			sh.status = 1
 		else
-			local last = 0
+			local last, failed = 0, false
+			local sv = P.arith_cmd
+			P.arith_cmd = "let" -- (bash's this_command_name in the error text)
 			for k = 2, #args do
 				local ok, v = pcall(function()
-					return eval(sh, P.arith(args[k]))
+					local pok, ast = pcall(P.arith, args[k], "strict") -- (args are already expanded)
+					if not pok then
+						io.stderr:write("curse: " .. P.arith_errmsg(args[k], ast) .. "\n")
+						error({ __curse_exit = 1, __curse_matherr = true })
+					end
+					return eval(sh, ast)
 				end)
-				last = ok and tonumber(rt.i64_to_str(v)) or 0
+				if not ok then
+					if not (type(v) == "table" and v.__curse_matherr) then
+						P.arith_cmd = sv
+						error(v)
+					end
+					failed = true -- an arith error ends let (status 1), like bash's longjmp
+					break
+				end
+				last = tonumber(rt.i64_to_str(v)) or 0
 			end
-			sh.status = (last ~= 0) and 0 or 1
+			P.arith_cmd = sv
+			sh.status = (not failed and last ~= 0) and 0 or 1
 		end
 	end
 end

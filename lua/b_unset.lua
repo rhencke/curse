@@ -58,6 +58,9 @@ return function(sh, cmd, args, hook, tcb)
 				end
 				if nm == nil then
 					local dn = sh:deref(a)
+					if dn == "RANDOM" then
+						sh.random_plain = true -- (unset RANDOM loses its special meaning — bash)
+					end
 					local b = sh.vars[dn]
 					if b and b.ro then -- readonly: cannot unset (bash: status 1, keep it)
 						io.stderr:write("curse: unset: " .. a .. ": cannot unset: readonly variable\n")

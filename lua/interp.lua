@@ -651,7 +651,7 @@ arith_resolve = function(sh, s)
 	sh.arith_depth = sh.arith_depth - 1 -- balanced BEFORE any error unwinds past here
 	if not ok then -- the value is not a valid arith expression (e.g. "12 34", "1+"): a
 		-- non-fatal syntax error — fails the containing command, script continues.
-		io.stderr:write("curse: " .. s .. ": syntax error in expression\n")
+		io.stderr:write("curse: " .. P.arith_errmsg(s, ast) .. "\n")
 		error({ __curse_exit = 1, __curse_matherr = true, __curse_experr = true })
 	end
 	-- A nested bad value (rare: `s=t; t='1 2'`) stays swallowed as 0, matching the
@@ -670,8 +670,10 @@ end
 -- Division/modulo by zero is a fatal arithmetic error (bash aborts the current
 -- command with status 1 and a diagnostic). Tagged __curse_matherr so a caller
 -- that runs code in a protected context (compgen -F) can recover from it.
-local function arith_div0()
-	io.stderr:write("curse: division by 0\n")
+local function arith_div0(e, msg)
+	-- bash's evalerror text: the expression and the lookahead token (parser: etxt/etok)
+	msg = msg or "division by 0"
+	io.stderr:write("curse: " .. (e and e.etxt and P.arith_errmsg(e.etxt, { msg = msg, tok = e.etok }) or msg) .. "\n")
 	error({ __curse_exit = 1, __curse_matherr = true, __curse_lineabort = true })
 end
 
@@ -685,10 +687,21 @@ local function arith_nounset(sh, name)
 	end
 end
 
+-- bash's textual path for arithmetic with expansions: expand the raw text, then parse
+-- the RESULT as plain arithmetic (a `$` left in it is an error). Shared by both tiers.
+function M.arith_textual_eval(sh, raw)
+	local text = expand_word(sh, P.parse_word(raw))
+	local pok, ast = pcall(P.arith, text, "strict")
+	if not pok then -- the EXPANDED text isn't valid arithmetic: an arith error (bash), not a crash
+		io.stderr:write("curse: " .. P.arith_errmsg(text, ast) .. "\n")
+		error({ __curse_exit = 1, __curse_matherr = true, __curse_lineabort = true })
+	end
+	return eval(sh, ast)
+end
 eval = function(sh, e)
 	local k = e.k
 	if k == "matherr" then -- a deferred arith parse error (bad lvalue): non-fatal in (( ))
-		io.stderr:write("curse: arithmetic syntax error\n")
+		io.stderr:write("curse: " .. P.arith_errmsg(e.raw or "", e.err) .. "\n")
 		error({ __curse_exit = 1, __curse_matherr = true })
 	end
 	if k == "num" then
@@ -730,16 +743,24 @@ eval = function(sh, e)
 		-- expand-and-reparse per iteration. Fall back to bash's textual substitution
 		-- (expand the raw, re-parse the result) only when a value isn't a simple operand.
 		if e.fast == nil then
+			-- ($name is expanded BEFORE evaluation in bash: if the expression also assigns,
+			-- an in-order native read could see the new value — take the textual path)
+			local assigns = rt.xpand_self_assign(e.raw)
 			e.fast = not (
-				e.raw:find("%$%(")
+				assigns
+				or e.raw:find("\\", 1, true)
+				or e.raw:find("%$%(")
 				or e.raw:find("`")
 				or e.raw:find("%$[^%w_{]")
 				or e.raw:find("[%w_]%$")
 				or e.raw:find("}[%w_#]")
 			)
 		end
-		if e.fast then
-			e.native = e.native or P.arith(e.raw, true)
+		if e.fast and e.native == nil then
+			local nok, nat = pcall(P.arith, e.raw, true)
+			e.native = nok and nat or false -- (unparseable raw: the textual path reports it)
+		end
+		if e.fast and e.native then
 			local ok, r = pcall(eval, sh, e.native)
 			if ok then
 				return r
@@ -748,14 +769,7 @@ eval = function(sh, e)
 				error(r)
 			end
 		end
-		local text = expand_word(sh, P.parse_word(e.raw))
-		local pok, ast = pcall(P.arith, text, true)
-		if not pok then -- the EXPANDED text isn't valid arithmetic: an arith error (bash), not a crash
-			local tok = text:match("^%s*(.-)%s*$")
-			io.stderr:write("curse: " .. tok .. ": syntax error in expression\n")
-			error({ __curse_exit = 1, __curse_matherr = true, __curse_lineabort = true })
-		end
-		return eval(sh, ast)
+		return M.arith_textual_eval(sh, e.raw)
 	end
 	if k == "xpandleaf" then -- an opaque ${…} operand: expand it; a non-numeric value must
 		local v = expand_word(sh, P.parse_word(e.raw)) -- take bash's textual substitution path
@@ -807,13 +821,13 @@ eval = function(sh, e)
 		end
 		if op == "/" then
 			if r == i64(0) then
-				arith_div0()
+				arith_div0(e)
 			end
 			return l / r
 		end
 		if op == "%" then
 			if r == i64(0) then
-				arith_div0()
+				arith_div0(e)
 			end
 			return l % r
 		end
@@ -853,8 +867,7 @@ eval = function(sh, e)
 		if op == "**" then
 			local base, n, res = l, tonumber(r), i64(1)
 			if n < 0 then -- bash disallows a negative exponent (fatal arith error)
-				io.stderr:write("curse: exponent less than 0\n")
-				error({ __curse_exit = 1, __curse_matherr = true })
+				arith_div0(e, "exponent less than 0")
 			end
 			for _ = 1, n do
 				res = res * base
@@ -863,8 +876,8 @@ eval = function(sh, e)
 		end
 	end
 	if k == "asgn" then
+		local v = eval(sh, e.e) -- (bash evaluates the value BEFORE the lvalue's subscript)
 		local iv = e.idxraw and arith_key(sh, e.name, e.idx, e.idxraw) or nil
-		local v = eval(sh, e.e)
 		if e.op ~= "=" then
 			arith_nounset(sh, e.name) -- `x += …` reads x first
 			local cur = iv and rt.arith_num(sh:array_get(e.name, iv)) or sh:aget(e.name)
@@ -877,12 +890,12 @@ eval = function(sh, e)
 				v = cur * v
 			elseif o == "/" then
 				if v == i64(0) then
-					arith_div0()
+					arith_div0(e)
 				end
 				v = cur / v
 			elseif o == "%" then
 				if v == i64(0) then
-					arith_div0()
+					arith_div0(e)
 				end
 				v = cur % v
 			elseif o == "&" then
@@ -980,7 +993,7 @@ function M.arith_isnum(sh, name)
 	return looks_numeric(sh:get(name)) ~= nil
 end
 function M.arith_textual(sh, raw)
-	return eval(sh, P.arith(expand_word(sh, P.parse_word(raw)), true))
+	return M.arith_textual_eval(sh, raw)
 end
 
 -- An array subscript used in arithmetic: an associative array takes the
@@ -993,7 +1006,7 @@ arith_key = function(sh, name, idxexpr, idxraw)
 		return array_key(sh, name, idxraw or "")
 	end
 	if idxexpr == nil then -- a non-arith subscript (e.g. quoted) on a NON-assoc array
-		io.stderr:write("curse: " .. (idxraw or "") .. ": syntax error in expression\n")
+		io.stderr:write("curse: " .. P.arith_errmsg(idxraw or "", select(2, pcall(P.arith, idxraw or ""))) .. "\n")
 		error({ __curse_exit = 1, __curse_matherr = true, __curse_experr = true })
 	end
 	return rt.to_arr_key(eval(sh, idxexpr))
@@ -1016,7 +1029,9 @@ array_key = function(sh, name, index_raw)
 		return rt.to_arr_key(eval(sh, P.arith(index_raw)))
 	end)
 	if not ok then
-		io.stderr:write("curse: " .. index_raw .. ": syntax error in expression\n")
+		if not (type(v) == "table" and v.__curse_matherr) then -- (an eval error already said so)
+			io.stderr:write("curse: " .. P.arith_errmsg(index_raw, v) .. "\n")
+		end
 		-- an expansion error discards the rest of the top-level line (bash jump_to_top_level)
 		error({ __curse_exit = 1, __curse_lineabort = true })
 	end
@@ -1084,8 +1099,9 @@ local function expand_part_str(sh, p, assign)
 		if not p.arith_ast then -- same $((…)) shouldn't re-parse it)
 			local ok, ast = pcall(P.arith, p.arith)
 			if not ok then -- a syntax error in $(( )) fails the command, non-fatally (bash)
-				io.stderr:write("curse: " .. p.arith .. ": syntax error in expression\n")
-				error({ __curse_exit = 1, __curse_matherr = true, __curse_experr = true })
+				io.stderr:write("curse: " .. P.arith_errmsg(p.arith, ast) .. "\n")
+				-- (an expansion error: bash discards the rest of the line)
+				error({ __curse_exit = 1, __curse_matherr = true, __curse_experr = true, __curse_lineabort = true })
 			end
 			p.arith_ast = ast
 		end
@@ -1276,7 +1292,7 @@ function M.assign_scalar(sh, name, value)
 	if b and b.arr then
 		sh:array_set(name, array_key(sh, name, "0"), value, false)
 	elseif b and b.int then
-		sh:aset(name, eval(sh, P.arith(value)))
+		sh:aset(name, M.arith_eval_str(sh, value))
 	elseif b and (b.lower or b.upper) then
 		sh:set_str(name, b.lower and value:lower() or value:upper())
 	else
@@ -1376,8 +1392,52 @@ function M.case_match(sh, subj, pats)
 	return false
 end
 -- `=~` regex context: ERE metacharacters.
+-- Quoted text is escaped to match literally — except INSIDE a bracket expression, where
+-- bash inserts it raw (`["."]` is `[.]`, `[\.]` too; `[']']` is `[]]`), so the builder
+-- tracks bracket state through the unquoted text.
+local REGEX_META = "[%.%^%$%*%+%?%(%)%[%]%{%}%|\\]"
 local function expand_regex(sh, w)
-	return expand_escaped(sh, w, "[%.%^%$%*%+%?%(%)%[%]%{%}%|\\]")
+	local buf, inbr, brstart = {}, false, false
+	for _, p in ipairs(w.parts) do
+		local s = expand_part_str(sh, p)
+		if p.q then
+			if inbr then
+				if s ~= "" then
+					brstart = false
+				end
+			else
+				s = s:gsub(REGEX_META, "\\%0")
+			end
+			buf[#buf + 1] = s
+		else
+			local k, n = 1, #s
+			while k <= n do
+				local ch = s:sub(k, k)
+				if not inbr then
+					if ch == "\\" then
+						k = k + 1 -- (an escaped char is literal, outside brackets)
+					elseif ch == "[" then
+						inbr, brstart = true, true
+					end
+				elseif brstart and ch == "^" then
+					-- (still at the start: a following `]` is literal)
+				elseif brstart and ch == "]" then
+					brstart = false
+				elseif ch == "[" and s:sub(k + 1, k + 1):match("^[:.=]$") then
+					local close = s:find(s:sub(k + 1, k + 1) .. "]", k + 2, true)
+					k = close and close + 1 or k
+					brstart = false
+				elseif ch == "]" then
+					inbr = false
+				else
+					brstart = false
+				end
+				k = k + 1
+			end
+			buf[#buf + 1] = s
+		end
+	end
+	return table.concat(buf)
 end
 
 -- A part that expands to multiple elements: $@ / $* / ${a[@]} / ${a[*]} /
@@ -2778,7 +2838,7 @@ function M.run_arrayassign(sh, st)
 		if aok then
 			sh.status = 0
 			sh:set_str("_", "")
-		elseif type(aerr) == "table" and aerr.__curse_experr then
+		elseif type(aerr) == "table" and aerr.__curse_experr and not aerr.__curse_lineabort then
 			sh.status = 1
 			if sh.opt_e then
 				error({ __curse_exit = 1 })
@@ -2824,7 +2884,8 @@ local function fmt_decl(sh, name)
 		for _, k in ipairs(sh:array_indices(name)) do
 			local ks = tostring(k)
 			-- an assoc key with shell metacharacters (or control chars) is quoted like a value
-			if b.assoc and (ks == "" or ks:find("[^%w_%%+,./:@%-]")) then
+			-- (and a key that is just `@` or `*`: bash's ALL_ELEMENT_SUB check)
+			if b.assoc and (ks == "" or ks == "@" or ks == "*" or ks:find("[^%w_%%+,./:@%-]")) then
 				ks = decl_quote(ks)
 			end
 			parts[#parts + 1] = "[" .. ks .. "]=" .. decl_quote(sh:array_get(name, k))
@@ -3010,12 +3071,8 @@ local function printf_q(s)
 			else
 				for i = 1, #ch.s do
 					local ch2, b = ch.s:sub(i, i), ch.s:byte(i)
-					if ch2 == "\n" then
-						out[#out + 1] = "\\n"
-					elseif ch2 == "\t" then
-						out[#out + 1] = "\\t"
-					elseif ch2 == "\r" then
-						out[#out + 1] = "\\r"
+					if rt.ANSIC_ESC[b] then -- (bash's ansic_quote: \E \a \v \b \f \n \r \t)
+						out[#out + 1] = rt.ANSIC_ESC[b]
 					elseif b < 32 or b >= 127 then
 						out[#out + 1] = string.format("\\%03o", b)
 					elseif ch2 == "'" then
@@ -3844,8 +3901,8 @@ local function eval_dbracket(sh, node)
 		elseif op == "-eq" or op == "-ne" or op == "-lt" or op == "-le" or op == "-gt" or op == "-ge" then
 			-- [[ ]] arithmetic comparisons evaluate each side as an arith EXPRESSION
 			-- (bash: [[ 1+2 -eq 3 ]] is true), unlike `test` which needs integer literals.
-			local nl = eval(sh, P.arith(l == "" and "0" or l))
-			local nr = eval(sh, P.arith(r == "" and "0" or r))
+			local nl = M.dbracket_arith(sh, l)
+			local nr = M.dbracket_arith(sh, r)
 			if op == "-eq" then
 				return nl == nr
 			elseif op == "-ne" then
@@ -3869,14 +3926,25 @@ end
 -- Compiled-tier [[ ]] leaf primitives: the compiled backend renders the and/or/not
 -- tree as native Lua (short-circuit) and calls these for the leaves, with operands
 -- computed natively via emit_word — genuine compilation, not an AST re-walk.
-function M.dbracket_arith(sh, s)
+-- Evaluate an expression STRING (a value re-read as arithmetic): a parse error is a shell
+-- arith error (fails the command), never a raw Lua error out of compiled code.
+function M.arith_eval_str(sh, s)
 	local ok, ast = pcall(P.arith, s == "" and "0" or s)
-	if not ok then -- not an arithmetic expression: a shell error (fails the command), never
-		-- a raw Lua error out of compiled code
-		io.stderr:write("curse: " .. s .. ": syntax error in expression\n")
+	if not ok then
+		io.stderr:write("curse: " .. P.arith_errmsg(s, ast) .. "\n")
 		error({ __curse_exit = 1, __curse_matherr = true, __curse_experr = true })
 	end
 	return eval(sh, ast)
+end
+function M.dbracket_arith(sh, s)
+	local sv = P.arith_cmd
+	P.arith_cmd = "[["
+	local ok, v = pcall(M.arith_eval_str, sh, s)
+	P.arith_cmd = sv
+	if not ok then
+		error(v, 0)
+	end
+	return v
 end -- -eq/-lt… operand
 function M.dbracket_unary(sh, op, val)
 	return unary(sh, op, val)
@@ -4237,7 +4305,7 @@ exec_stmt = function(sh, st, hook)
 						sh:array_set(st.name, array_key(sh, st.name, "0"), expand_assign_word(sh, st.rhs), true)
 					elseif b and b.int then -- integer var: += is arithmetic addition (the old value
 						-- is itself evaluated: `b=4+1; typeset -i b; b+=37` is 42 — bash)
-						sh:aset(st.name, rt.arith_str(sh, sh:get(st.name)) + eval(sh, P.arith(expand_word(sh, st.rhs))))
+						sh:aset(st.name, rt.arith_str(sh, sh:get(st.name)) + M.arith_eval_str(sh, expand_word(sh, st.rhs)))
 					elseif b and (b.lower or b.upper) then -- declare -l/-u: case-fold the appended result
 						local v = sh:get(st.name) .. expand_assign_word(sh, st.rhs)
 						sh:set_str(st.name, b.lower and v:lower() or v:upper())
@@ -4249,7 +4317,7 @@ exec_stmt = function(sh, st, hook)
 					if b and b.arr then -- plain `name=value` on an array var writes element 0 (bash)
 						sh:array_set(st.name, array_key(sh, st.name, "0"), expand_assign_word(sh, st.rhs), false)
 					elseif b and b.int then -- integer var (declare -i): assign arith-evaluates
-						sh:aset(st.name, eval(sh, P.arith(expand_word(sh, st.rhs))))
+						sh:aset(st.name, M.arith_eval_str(sh, expand_word(sh, st.rhs)))
 					elseif b and (b.lower or b.upper) then -- declare -l/-u: case-fold on assign
 						local v = expand_assign_word(sh, st.rhs)
 						sh:set_str(st.name, b.lower and v:lower() or v:upper())
@@ -4264,7 +4332,7 @@ exec_stmt = function(sh, st, hook)
 					sh.status = 1
 					sh.assign_err = true
 					return
-				elseif type(aerr) == "table" and aerr.__curse_experr then
+				elseif type(aerr) == "table" and aerr.__curse_experr and not aerr.__curse_lineabort then
 					sh.status = 1
 					sh.assign_err = true
 					return -- bad-subst RHS: non-fatal
@@ -4359,7 +4427,7 @@ exec_stmt = function(sh, st, hook)
 			if aok then
 				sh.status = 0
 				sh:set_str("_", "")
-			elseif type(aerr) == "table" and aerr.__curse_experr then
+			elseif type(aerr) == "table" and aerr.__curse_experr and not aerr.__curse_lineabort then
 				sh.status = 1
 				if sh.opt_e then
 					error({ __curse_exit = 1 })
@@ -4417,6 +4485,45 @@ exec_stmt = function(sh, st, hook)
 		end
 		sh.status = 0
 	elseif t == "simple" then
+		if sh.opt_k and st.words then
+			-- set -k (keyword): an assignment-shaped word ANYWHERE is an assignment for the
+			-- command, not only before its name (bash)
+			local keep, extra
+			for _, w in ipairs(st.words) do
+				local p1 = w.parts and w.parts[1]
+				if p1 and p1.lit and not p1.q and w.src and p1.lit:match("^[%a_][%w_]*%+?=") then
+					local ok, a = pcall(function()
+						return P.parse(w.src).stmts[1]
+					end)
+					if ok and a and a.t == "assign" then
+						extra = extra or {}
+						extra[#extra + 1] = a
+					else
+						keep = keep or {}
+						keep[#keep + 1] = w
+					end
+				else
+					keep = keep or {}
+					keep[#keep + 1] = w
+				end
+			end
+			if extra then
+				local st2 = {}
+				for k2, v in pairs(st) do
+					st2[k2] = v
+				end
+				st2.words = keep or {}
+				local as = {}
+				for _, a in ipairs(st.assigns or {}) do
+					as[#as + 1] = a
+				end
+				for _, a in ipairs(extra) do
+					as[#as + 1] = a
+				end
+				st2.assigns = as
+				st = st2
+			end
+		end
 		if sh.coprocs and next(sh.coprocs) then
 			rt.coproc_poll(sh) -- a coproc that finished is reaped now (bash: on SIGCHLD)
 		end
@@ -4495,6 +4602,9 @@ exec_stmt = function(sh, st, hook)
 				if b and b.ro and args[1] ~= "local" then
 					wasro = wasro or {}
 					wasro[aa] = true
+				elseif b and b.ro then
+					-- `local ro=(…)`: bash's compound assignment fails first, then local's own error
+					io.stderr:write("curse: " .. aa.name .. ": readonly variable\n")
 				end
 			end
 			sh.arrayargs_ro = wasro
@@ -4816,7 +4926,10 @@ exec_stmt = function(sh, st, hook)
 				arith_trace(sh, (st.src[slot]:match("^%s*(.-)%s*$")))
 			end
 			if node.k == "arith_perr" then
-				io.stderr:write("curse: " .. (node.raw:match("^%s*(.-)%s*$")) .. ": syntax error in expression\n")
+				local sv = P.arith_cmd
+				P.arith_cmd = "(("
+				io.stderr:write("curse: " .. P.arith_errmsg(node.raw, select(2, pcall(P.arith, node.raw))) .. "\n")
+				P.arith_cmd = sv
 				error({ __curse_exit = 1, __curse_experr = true })
 			end
 			return eval(sh, node)
@@ -5086,7 +5199,10 @@ exec_stmt = function(sh, st, hook)
 		if sh.opt_x and st.src then
 			arith_trace(sh, st.src)
 		end
+		local sv = P.arith_cmd
+		P.arith_cmd = "((" -- (bash's this_command_name in its error messages)
 		local ok, v = pcall(eval, sh, st.expr)
+		P.arith_cmd = sv
 		if ok then
 			sh.status = truth(v) and 0 or 1
 		elseif type(v) == "table" and v.__curse_matherr then

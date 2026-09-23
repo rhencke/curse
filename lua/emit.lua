@@ -65,6 +65,8 @@ end
 -- assignments. When false, compiled scalar assignments are a bare sh:set_str (zero
 -- hot-path cost); when true they route through I.assign_scalar. A var attributed via
 -- eval is rare and simply unguarded — no worse than before.
+-- variables the shell itself makes readonly (bash): UID=… etc. is an error
+local BUILTIN_RO = { UID = 1, EUID = 1, PPID = 1, BASH_VERSINFO = 1, SHELLOPTS = 1, BASHOPTS = 1 }
 local EF = {} -- emit-time program flags, grouped so a function referencing several stays one upvalue
 EF.has_attr = false
 local function makes_attr(st)
@@ -74,6 +76,14 @@ local function makes_attr(st)
 	if st.t == "assign" and st.index then
 		return true
 	end -- a[i]=… makes/extends an array
+	if (st.t == "assign" or st.t == "simple") and st.name and BUILTIN_RO[st.name] then
+		return true -- assigning a shell-readonly var (UID=…) must be rejected: guarded path
+	end
+	for _, a in ipairs(st.assigns or {}) do
+		if BUILTIN_RO[a.name] then
+			return true
+		end
+	end
 	if st.t ~= "simple" or not st.words[1] then
 		return false
 	end
@@ -439,8 +449,9 @@ local function scan_xtrace(node)
 		for j = 2, #node.words do
 			local l = node.words[j].parts[1] and #node.words[j].parts == 1 and node.words[j].parts[1].lit
 			-- (restricted mode too: its checks live only on the interpreter's paths)
-			if not l or l == "xtrace" or l == "verbose" or l == "restricted"
-				or (l:match("^%-%a+$") and l:find("[xvr]", 2)) then
+			-- (set -k: interp re-reads NAME=value words anywhere as assignments)
+			if not l or l == "xtrace" or l == "verbose" or l == "restricted" or l == "keyword"
+				or (l:match("^%-%a+$") and l:find("[xvrk]", 2)) then
 				return true
 			end
 		end
@@ -630,7 +641,9 @@ end
 -- native tree, read each $name like a var, and guard non-lifted operands (see emit_value).
 local function xpand_fast(raw)
 	if
-		raw:find("%$%(")
+		require("runtime").xpand_self_assign(raw) -- (see interp's xpand)
+		or raw:find("%$%(")
+		or raw:find("\\", 1, true) -- (`\$x` is a literal `$`: the interp's textual path errors)
 		or raw:find("`")
 		or raw:find("%${")
 		or raw:find("%$[^%w_]")
@@ -1116,7 +1129,15 @@ end
 local build_cfg, assemble, emit_word
 local emit_frags, emit_frag_ctx, emit_frag_n
 
-local emit_value, emit_arith_into
+local emit_value, emit_arith_into, etxt_args, arith_binop
+-- the error-text args for rt.idiv/imod/ipow (bash's evalerror expression + token), with
+-- the enclosing command's name baked in (`((: `) since compiled code keeps no context
+etxt_args = function(e)
+	if not (e and e.etxt) then
+		return ""
+	end
+	return (", %q, %q"):format((EF.acmd and (EF.acmd .. ": ") or "") .. e.etxt, e.etok or "")
+end
 emit_value = function(e, lifted)
 	local k = e.k
 	if k == "num" then
@@ -1205,10 +1226,10 @@ emit_value = function(e, lifted)
 			return "(" .. l .. " " .. op .. " " .. r .. ")"
 		end
 		if op == "/" then
-			return ("rt.idiv(%s, %s)"):format(l, r)
+			return ("rt.idiv(%s, %s%s)"):format(l, r, etxt_args(e))
 		end -- fatal on /0
 		if op == "%" then
-			return ("rt.imod(%s, %s)"):format(l, r)
+			return ("rt.imod(%s, %s%s)"):format(l, r, etxt_args(e))
 		end
 		if CMP[op] then
 			return "((" .. l .. " " .. CMP[op] .. " " .. r .. ") and 1LL or 0LL)"
@@ -1235,7 +1256,7 @@ emit_value = function(e, lifted)
 			return ("bit.arshift(%s, tonumber(%s) %% 64)"):format(l, r)
 		end
 		if op == "**" then
-			return ("rt.ipow(%s, %s)"):format(l, r)
+			return ("rt.ipow(%s, %s%s)"):format(l, r, etxt_args(e))
 		end
 	end
 	error("emit: value position not supported for node " .. tostring(k))
@@ -1265,7 +1286,8 @@ local function emit_arith_stmt(e, lifted)
 			return emit_set(e.name, v, lifted)
 		end
 		local cur = lifted[e.name] and lname(e.name) or ("sh:aget(%q)"):format(e.name)
-		return emit_set(e.name, ("(%s %s (%s))"):format(cur, e.op:sub(1, 1), v), lifted)
+		-- (`x /= 0` must fault like bash, `<<=` is a shift: the shared op renderer)
+		return emit_set(e.name, arith_binop(e.op:sub(1, -2), cur, "(" .. v .. ")", e), lifted)
 	end
 	if e.k == "post" or e.k == "pre" then
 		local cur = lifted[e.name] and lname(e.name) or ("sh:aget(%q)"):format(e.name)
@@ -1312,15 +1334,15 @@ local function arith_native_ok(e)
 end
 -- Render an arithmetic binary op (same op->expr mapping as emit_value's `bin`); shared
 -- by emit_avalue's bin node and its compound-assignment (`x <<= y`).
-local function arith_binop(op, l, r)
+arith_binop = function(op, l, r, node)
 	if op == "+" or op == "-" or op == "*" then
 		return "(" .. l .. " " .. op .. " " .. r .. ")"
 	end
 	if op == "/" then
-		return ("rt.idiv(%s, %s)"):format(l, r)
+		return ("rt.idiv(%s, %s%s)"):format(l, r, etxt_args(node))
 	end
 	if op == "%" then
-		return ("rt.imod(%s, %s)"):format(l, r)
+		return ("rt.imod(%s, %s%s)"):format(l, r, etxt_args(node))
 	end
 	if op == "&" then
 		return ("bit.band(%s, %s)"):format(l, r)
@@ -1338,7 +1360,7 @@ local function arith_binop(op, l, r)
 		return ("bit.arshift(%s, tonumber(%s) %% 64)"):format(l, r)
 	end
 	if op == "**" then
-		return ("rt.ipow(%s, %s)"):format(l, r)
+		return ("rt.ipow(%s, %s%s)"):format(l, r, etxt_args(node))
 	end
 	error("arith_binop: unsupported " .. tostring(op))
 end
@@ -1391,7 +1413,7 @@ emit_avalue = function(e)
 		if CMP[op] then
 			return "((" .. l .. " " .. CMP[op] .. " " .. r .. ") and 1LL or 0LL)"
 		end
-		return arith_binop(op, l, r)
+		return arith_binop(op, l, r, e)
 	end
 	-- asgn/post/pre are gated out by arith_native_ok (their nounset + lifted-var write
 	-- semantics stay on the interp bootstrap), so they never reach here.
@@ -1947,20 +1969,30 @@ end
 -- delegates the whole [[ ]]). No word splitting happens in [[ ]], so emit_word (a
 -- scalar concat) is exactly the operand value.
 local ARITH_CMP = { ["-eq"] = "==", ["-ne"] = "~=", ["-lt"] = "<", ["-le"] = "<=", ["-gt"] = ">", ["-ge"] = ">=" }
+local emit_dbracket_node
+-- A [[ ]] with an arithmetic comparison: an operand's arith error makes the whole test
+-- false (status 1, bash) — rt.db_arith flags it, rt.db_ok reads the flag (no pcall).
 local function emit_dbracket(node, lifted)
+	local code = emit_dbracket_node(node, lifted)
+	if code and code:find("rt.db_arith(", 1, true) then
+		return "rt.db_ok(sh, " .. code .. ")"
+	end
+	return code
+end
+emit_dbracket_node = function(node, lifted)
 	local k = node.kind
 	if k == "and" or k == "or" then
-		local a = emit_dbracket(node.l, lifted)
+		local a = emit_dbracket_node(node.l, lifted)
 		if not a then
 			return nil
 		end
-		local b = emit_dbracket(node.r, lifted)
+		local b = emit_dbracket_node(node.r, lifted)
 		if not b then
 			return nil
 		end
 		return "(" .. a .. (k == "and" and " and " or " or ") .. b .. ")"
 	elseif k == "not" then
-		local e = emit_dbracket(node.e, lifted)
+		local e = emit_dbracket_node(node.e, lifted)
 		if not e then
 			return nil
 		end
@@ -2027,7 +2059,7 @@ local function emit_dbracket(node, lifted)
 			)
 			return op == "!=" and ("(not " .. eq .. ")") or eq
 		elseif ARITH_CMP[op] then
-			return ("(rt.arith_str(sh, %s) %s rt.arith_str(sh, %s))"):format(
+			return ("(rt.db_arith(sh, %s) %s rt.db_arith(sh, %s))"):format(
 				l,
 				ARITH_CMP[op],
 				emit_word(node.r, lifted)
@@ -2807,6 +2839,19 @@ EF.emit_pattern_glob_word = emit_pattern_glob_word -- for the dbracket == RHS (f
 -- from the =~ block — reuses its existing EF upvalue instead of adding one (the 60-upvalue cap).
 local REGEX_SPECIAL = "[%.%^%$%*%+%?%(%)%[%]%{%}%|\\]"
 EF.emit_regex_glob = function(w, lifted)
+	-- quoted text inside a bracket expression is inserted raw (interp's expand_regex tracks
+	-- the bracket state): a word mixing an unquoted `[` with quoting takes that path
+	local hasq, hasbr = false, false
+	for _, p in ipairs(w.parts) do
+		if p.q then
+			hasq = true
+		elseif p.lit and p.lit:find("[", 1, true) then
+			hasbr = true
+		end
+	end
+	if hasq and hasbr then
+		return nil
+	end
 	for i, p in ipairs(w.parts) do
 		if p.lenof or p.cmdsub or p.arith or p.arithast or p.pexp or p.procsub then
 			return nil
@@ -3011,7 +3056,7 @@ emit_arith_into = function(dst, e, lifted)
 			)
 		elseif k == "asgn" then -- a[i] OP= e: read old (__o), apply the binop, store
 			local newv =
-				emit_value({ k = "bin", op = e.op:sub(1, #e.op - 1), l = { k = "raw", code = "__o" }, r = e.e }, lifted)
+				emit_value({ k = "bin", op = e.op:sub(1, #e.op - 1), l = { k = "raw", code = "__o" }, r = e.e, etxt = e.etxt, etok = e.etok }, lifted)
 			return ("%s = rt.arith_elem_write(sh, %s, true, function(__o) return %s end)"):format(
 				dst,
 				elem_args(e),
@@ -3026,7 +3071,7 @@ emit_arith_into = function(dst, e, lifted)
 			rhs = emit_value(e.e, lifted) -- pure define: no read of the target
 		else
 			local cur = lifted[e.name] and lname(e.name) or (arith_varread):format(e.name) -- compound reads first
-			rhs = emit_value({ k = "bin", op = e.op:sub(1, #e.op - 1), l = { k = "raw", code = cur }, r = e.e }, lifted)
+			rhs = emit_value({ k = "bin", op = e.op:sub(1, #e.op - 1), l = { k = "raw", code = cur }, r = e.e, etxt = e.etxt, etok = e.etok }, lifted)
 		end
 		if lifted[e.name] then
 			return ("%s = %s; %s = %s"):format(lname(e.name), rhs, dst, lname(e.name))
@@ -3979,7 +4024,7 @@ H.assign = function(cx, st, after)
 		local ec = errchk(st)
 		local ecs = ec ~= "" and ("; " .. ec) or ""
 		cx.blocks[p] = d
-			.. ("sh.status = 0; rt.assign_scalar(sh, %q, %s)%s%s; pc = %d"):format(
+			.. ("sh.status = 0; rt.assign_scalar_x(sh, %q, %s)%s%s; pc = %d"):format(
 				st.name,
 				rhsval(),
 				ecs,
@@ -4128,10 +4173,11 @@ simple_compiled = function(cx, st, after)
 				-- bash forbids CHANGING an existing array's kind (-A on indexed / -a on assoc):
 				-- status 1, and the RHS values are NOT evaluated (interp assigns the literal only
 				-- when status==0). Gate the whole assign (values included) on the conversion check.
-				.. ("do if not rt.array_convert_err(sh, %q, %s, %q) then "):format(
+				.. ("do if not rt.array_convert_err(sh, %q, %s, %q)%s then "):format(
 					a1.name,
 					tostring(isassoc),
-					cmd
+					cmd,
+					as_local and (" and not rt.local_ro(sh, %q)"):format(a1.name) or ""
 				)
 				.. pre
 				.. table.concat(parts, "; ")
@@ -5222,11 +5268,32 @@ H.forin = function(cx, st, after)
 	cx.loopstack[#cx.loopstack] = nil
 	-- init: expand the word list ONCE into sh.forstate[id] (so OSR resumes it)
 	local parts = { "local __l = {}" }
+	-- a long run of plain literal words (`for i in {1..4000}`) becomes ONE constant table:
+	-- thousands of separate appends overflow LuaJIT's per-block jump range
+	local run = {}
+	local function flush_run()
+		if #run > 32 then
+			parts[#parts + 1] = ("for _, __v in ipairs({%s}) do __l[#__l+1] = __v end"):format(table.concat(run, ","))
+		else
+			for _, e in ipairs(run) do
+				parts[#parts + 1] = "__l[#__l+1] = " .. e
+			end
+		end
+		run = {}
+	end
 	for _, w in ipairs(st.words) do
 		if not empty_word(w) then
-			parts[#parts + 1] = emit_fields_into("__l", w, cx.lifted)
+			local code = emit_fields_into("__l", w, cx.lifted)
+			local lit = code:match('^__l%[#__l%+1%] = (%("[^"\\]*"%))$')
+			if lit then
+				run[#run + 1] = lit
+			else
+				flush_run()
+				parts[#parts + 1] = code
+			end
 		end
 	end
+	flush_run()
 	parts[#parts + 1] = ("sh.forstate[%d] = {list=__l, idx=0}"):format(st.id)
 	cx.blocks[initp] = table.concat(parts, "; ") .. ("; pc = %d"):format(advp)
 	if EF.has_attr then -- a readonly loop variable: bash reports it and runs no iteration
@@ -6364,7 +6431,10 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
 		elseif t == "simple" then
 			return H.simple(cx, st, after)
 		elseif t == "arithcmd" then
-			return H.arithcmd(cx, st, after)
+			EF.acmd = "((" -- (bash's this_command_name, baked into its arith error texts)
+			local r = H.arithcmd(cx, st, after)
+			EF.acmd = nil
+			return r
 		elseif t == "forc" then
 			return H.forc(cx, st, after)
 		elseif t == "whilec" then

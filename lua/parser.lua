@@ -94,9 +94,17 @@ local function arith(src, nodefer)
 		src = table.concat(o)
 	end
 	local i, n = 1, #src
+	-- bash's lasttp: where the most recently read token starts (bash reads one token
+	-- ahead, and each check here looks at the next token after skip()). An error names
+	-- the text from there on: `4+` -> operand expected (error token is "+").
+	local lasttp
+	local etxt = src:gsub("^%s+", "") -- (the expression as bash's errors print it)
 	local function skip()
 		while i <= n and src:sub(i, i):match("%s") do
 			i = i + 1
+		end
+		if i <= n then
+			lasttp = i
 		end
 	end
 	local function peek()
@@ -115,12 +123,18 @@ local function arith(src, nodefer)
 		return false
 	end
 	local parseExpr
+	-- raise one of bash's expr.c errors (a structured error; M.arith_errmsg renders it)
+	local function aerr(msg)
+		error({ __curse_arith = true, msg = msg, tok = lasttp and src:sub(lasttp) or "" }, 0)
+	end
+	local ARITHOP = "[%+%-%*/%%<>=!&|%^~%?:,%(%)]"
 
 	local function ident()
 		skip()
 		local s, e = src:find("^[%a_][%w_]*", i)
 		if not s then
-			error("arith: expected name at '" .. src:sub(i) .. "'")
+			-- a stray non-operator char where an operand belongs, or nothing at all
+			aerr("syntax error: operand expected")
 		end
 		i = e + 1
 		return src:sub(s, e)
@@ -133,6 +147,8 @@ local function arith(src, nodefer)
 	-- used verbatim for ASSOCIATIVE arrays, whose (( )) subscript is a literal
 	-- string key. It's also parsed as arith (best-effort) for the indexed case.
 	local function nameSub()
+		skip()
+		local ns = i
 		local nm = ident()
 		if starts("[") then
 			local rs = i + 1
@@ -150,7 +166,7 @@ local function arith(src, nodefer)
 				j = j + 1
 			end
 			if depth ~= 0 then
-				error("arith: expected ]")
+				error({ __curse_arith = true, msg = "bad array subscript", tok = src:sub(ns) }, 0)
 			end
 			local raw = src:sub(rs, j - 1)
 			i = j + 1 -- past the ]
@@ -160,16 +176,27 @@ local function arith(src, nodefer)
 		return nm, nil, nil
 	end
 
-	local function primary()
+	-- `asgn`: an assignment may start here — only at the head of a lowest-precedence
+	-- expression (bash: assignment binds loosest, so `0 && B=42` is an error)
+	local function primary(asgn)
 		skip()
 		local c = src:sub(i, i)
 		if c == "(" then
 			i = i + 1
 			local e = parseComma()
 			if not eat(")") then
-				error("arith: expected )")
+				aerr("missing `)'")
 			end
 			return e
+		end
+		if (starts("++") or starts("--")) and not src:find("^[%+%-][%+%-]%s*[%a_]", i) then
+			-- not a pre-increment (no name follows): two unary signs (bash: `++5` is 5)
+			local sign = src:sub(i, i)
+			i = i + 1
+			if sign == "+" then
+				return primary()
+			end
+			return { k = "un", op = "-", e = primary() }
 		end
 		if eat("++") then
 			local nm, idx, ir = nameSub()
@@ -196,6 +223,9 @@ local function arith(src, nodefer)
 			return { k = "un", op = "~", e = primary() }
 		end
 		if c == "$" then
+			if nodefer == "strict" then -- already-expanded text: a `$` left in it is just bad
+				aerr("syntax error: operand expected")
+			end
 			i = i + 1
 			local d = src:sub(i, i)
 			if d:match("%d") then
@@ -224,19 +254,55 @@ local function arith(src, nodefer)
 			return { k = "var", name = ident(), dollar = true } -- $name: value substituted textually (eval checks)
 		end
 		if c:match("%d") then
-			-- base#digits / 0xHEX / decimal-or-octal
-			local s, e = src:find("^%d+#[%w@_]+", i)
-			if not s then
-				s, e = src:find("^0[xX]%x+", i)
+			-- a number token is bash's: a digit then [alnum # @ _]* (base#digits, 0xHEX,
+			-- octal, decimal), validated like bash's strlong so its errors match
+			local s0, e = src:find("^%d[%w#@_]*", i)
+			local v = src:sub(s0, e)
+			local function nerr(m)
+				error({ __curse_arith = true, msg = m, tok = v, expr = v }, 0)
 			end
-			if not s then
-				s, e = src:find("^%d+", i)
+			local base, foundbase, val, k = 10, false, 0, 1
+			if v:sub(1, 1) == "0" and #v > 1 then
+				k = 2
+				if v:sub(2, 2) == "x" or v:sub(2, 2) == "X" then
+					base, k = 16, 3
+				else
+					base = 8
+				end
+				foundbase = true
 			end
-			local v = src:sub(s, e)
-			-- a leading-0 literal is octal, so a digit 8/9 is invalid (bash: "value too
-			-- great for base"); reject it here so $(( 083 )) is a syntax error, not 83.
-			if v:match("^0%d") and not v:lower():match("^0x") and v:find("[89]") then
-				error("arith: invalid octal constant '" .. v .. "'")
+			while k <= #v do
+				local ch = v:sub(k, k)
+				if ch == "#" then
+					if foundbase then
+						nerr("invalid number")
+					end
+					if val < 2 or val > 64 then
+						nerr("invalid arithmetic base")
+					end
+					base, val, foundbase = val, 0, true
+					if not v:sub(k + 1, k + 1):match("^[%w@_]$") then
+						nerr("invalid integer constant")
+					end
+				else
+					local d
+					if ch:match("%d") then
+						d = tonumber(ch)
+					elseif ch:match("%l") then
+						d = ch:byte() - 87
+					elseif ch:match("%u") then
+						d = ch:byte() - (base <= 36 and 55 or 29)
+					elseif ch == "@" then
+						d = 62
+					else
+						d = 63
+					end
+					if d >= base then
+						nerr("value too great for base")
+					end
+					val = val * base + d
+				end
+				k = k + 1
 			end
 			i = e + 1
 			return { k = "num", v = v }
@@ -253,13 +319,18 @@ local function arith(src, nodefer)
 			return { k = "post", name = name, idx = idx, idxraw = ir, d = -1 }
 		end
 		-- assignment operators (3-char shifts before their 2-char prefixes)
-		for _, op in ipairs({ "<<=", ">>=", "+=", "-=", "*=", "/=", "%=", "&=", "^=", "|=" }) do
+		for _, op in ipairs(asgn and { "<<=", ">>=", "+=", "-=", "*=", "/=", "%=", "&=", "^=", "|=" } or {}) do
 			if starts(op) then
 				i = i + #op
-				return { k = "asgn", name = name, idx = idx, idxraw = ir, op = op, e = parseExpr(0) }
+				local node = { k = "asgn", name = name, idx = idx, idxraw = ir, op = op, e = parseExpr(0) }
+				if op == "/=" or op == "%=" then
+					skip()
+					node.etxt, node.etok = etxt, lasttp and src:sub(lasttp) or ""
+				end
+				return node
 			end
 		end
-		if starts("=") and src:sub(i + 1, i + 1) ~= "=" then
+		if asgn and starts("=") and src:sub(i + 1, i + 1) ~= "=" then
 			i = i + 1
 			return { k = "asgn", name = name, idx = idx, idxraw = ir, op = "=", e = parseExpr(0) }
 		end
@@ -294,6 +365,10 @@ local function arith(src, nodefer)
 
 	local function nextOp()
 		skip()
+		-- `+=`, `<<=`, …: one assignment token (bash's tokenizer), never a binary op
+		if src:find("^[%+%-%*/%%&|%^]=", i) or src:find("^<<=", i) or src:find("^>>=", i) then
+			return nil
+		end
 		for _, op in ipairs(OPS) do
 			if src:sub(i, i + #op - 1) == op then
 				-- don't consume assignment "=" as comparison; "=" alone handled in primary
@@ -303,8 +378,8 @@ local function arith(src, nodefer)
 		return nil
 	end
 
-	parseExpr = function(minprec)
-		local left = primary()
+	parseExpr = function(minprec, noasgn)
+		local left = primary(minprec == 0 and not noasgn)
 		while true do
 			local op = nextOp()
 			if op == nil then
@@ -317,15 +392,27 @@ local function arith(src, nodefer)
 			i = i + #op
 			local right = parseExpr(op == "**" and prec or prec + 1) -- ** is right-assoc
 			left = { k = "bin", op = op, l = left, r = right }
+			if op == "/" or op == "%" or op == "**" then
+				-- (for bash's eval-time error text: the expression, and the lookahead token
+				-- after the right operand — `4 / 0 ` -> error token "0 ")
+				skip()
+				left.etxt, left.etok = etxt, lasttp and src:sub(lasttp) or ""
+			end
 		end
 		-- ternary c ? a : b (lowest precedence, right-assoc) — only at the top level
 		if minprec == 0 and peek() == "?" then
 			i = i + 1
+			if peek() == ":" or i > n then
+				aerr("expression expected")
+			end
 			local a = parseExpr(0)
 			if not eat(":") then
-				error("arith: expected : in ?:")
+				aerr("`:' expected for conditional expression")
 			end
-			local b = parseExpr(0)
+			if peek() == "" then
+				aerr("expression expected")
+			end
+			local b = parseExpr(0, true) -- (the else-branch is a conditional, not an assignment)
 			left = { k = "tern", c = left, a = a, b = b }
 		end
 		return left
@@ -344,11 +431,31 @@ local function arith(src, nodefer)
 	local e = parseComma()
 	skip()
 	if i <= n then
-		error("arith: trailing input '" .. src:sub(i) .. "'")
+		local c = src:sub(i, i)
+		if (c == "=" and src:sub(i + 1, i + 1) ~= "=") or src:find("^[%+%-%*/%%&|%^]=", i) or src:find("^<<=", i)
+			or src:find("^>>=", i) then
+			aerr("attempted assignment to non-variable")
+		elseif not c:match(ARITHOP) and not c:match("[%w_$]") then
+			aerr("syntax error: invalid arithmetic operator") -- (after an operand: `1 @ 2`)
+		end
+		aerr("syntax error in expression")
 	end
 	return e
 end
 M.arith = arith
+-- bash's evalerror text for an arithmetic error `err` (a structured parse error from
+-- arith(), or anything else = a generic syntax error) in expression `expr`:
+-- `[CMD: ]EXPR: MSG (error token is "TOK")` — EXPR loses only its leading blanks. CMD is
+-- bash's this_command_name: `((`, `let`, `[[` while those evaluate (M.arith_cmd).
+M.arith_cmd = nil
+function M.arith_errmsg(expr, err)
+	local t = tostring(type(err) == "table" and err.expr or expr or ""):gsub("^%s+", "")
+	local pre = M.arith_cmd and (M.arith_cmd .. ": ") or ""
+	if type(err) == "table" and err.msg then
+		return pre .. t .. ": " .. err.msg .. ' (error token is "' .. (err.tok or "") .. '")'
+	end
+	return pre .. t .. ": syntax error in expression"
+end
 
 -- ---- statement parser ----
 -- Captures a balanced `((` … `))` starting just after the opening `((`.
@@ -664,6 +771,11 @@ parse_paramexp = function(inner)
 			local ch = body:sub(k, k)
 			if ch == "\\" then
 				k = k + 2
+			elseif ch == "$" and body:sub(k + 1, k + 1) == "{" then
+				k = scan_braces(body, k + 1) -- a nested ${…}'s `:` isn't the separator
+			elseif ch == "$" and body:sub(k + 1, k + 1) == "(" then
+				local ok, nk = pcall(scan_cmdsub, body, k + 2)
+				k = ok and nk or k + 1
 			elseif ch == "?" then
 				skipcol = skipcol + 1
 				k = k + 1
@@ -1300,7 +1412,7 @@ do
 	local aimpl = arith
 	arith = function(src, nodefer)
 		if type(src) == "string" then
-			local key = (nodefer and "\1" or "\0") .. src
+			local key = (nodefer == "strict" and "\2" or nodefer and "\1" or "\0") .. src
 			local hit = acache[key]
 			if hit ~= nil then
 				return hit
@@ -1596,13 +1708,21 @@ local function num_pad_width(a, b)
 	end
 	return nil
 end
+-- a range endpoint: a Lua number when exact, else int64 (`{9223372036854775805..…}`)
+local function range_num(d)
+	if #d:gsub("^-", ""):gsub("^0+", "") <= 15 then
+		return tonumber(d)
+	end
+	local f = loadstring("return " .. d .. "LL")
+	return f and f() or tonumber(d)
+end
 local function classify_brace(inner)
 	local a2, b2, s2 = inner:match("^(-?%d+)%.%.(-?%d+)%.%.(-?%d+)$")
 	if a2 then
 		return {
 			range = {
-				a = tonumber(a2),
-				b = tonumber(b2),
+				a = range_num(a2),
+				b = range_num(b2),
 				step = math.max(1, math.abs(tonumber(s2))),
 				char = false,
 				width = num_pad_width(a2, b2),
@@ -1611,7 +1731,7 @@ local function classify_brace(inner)
 	end
 	local a, b = inner:match("^(-?%d+)%.%.(-?%d+)$")
 	if a then
-		return { range = { a = tonumber(a), b = tonumber(b), step = 1, char = false, width = num_pad_width(a, b) } }
+		return { range = { a = range_num(a), b = range_num(b), step = 1, char = false, width = num_pad_width(a, b) } }
 	end
 	local ca3, cb3, cs3 = inner:match("^(%a)%.%.(%a)%.%.(-?%d+)$")
 	if ca3 then
@@ -1726,9 +1846,16 @@ M.brace_factors = brace_factors
 
 local brace_stream -- forward (mutually recursive with itself over nested alts)
 local function range_count(r)
+	if type(r.a) == "cdata" or type(r.b) == "cdata" then
+		local d = r.b > r.a and r.b - r.a or r.a - r.b
+		return tonumber(d / r.step) + 1
+	end
 	return math.floor(math.abs(r.b - r.a) / r.step) + 1
 end
 local function pad_num(v, w) -- zero-pad |v| to width w digits, keeping the sign
+	if type(v) == "cdata" then
+		return (tostring(v):gsub("LL$", ""))
+	end
 	local d = tostring(math.abs(v))
 	if #d < w then
 		d = string.rep("0", w - #d) .. d
@@ -1758,7 +1885,7 @@ local function stream_factors(factors, emit)
 			local r = f.range
 			for k = 0, range_count(r) - 1 do
 				local v = (r.a <= r.b) and (r.a + k * r.step) or (r.a - k * r.step)
-				go(idx + 1, acc .. (r.char and brace_char(v) or (r.width and pad_num(v, r.width) or tostring(v))))
+				go(idx + 1, acc .. (r.char and brace_char(v) or (r.width and pad_num(v, r.width) or (tostring(v):gsub("LL$", "")))))
 				if stopped then
 					return
 				end
@@ -3081,7 +3208,7 @@ local function make_parser(src, sh, aenv, noalias, posix, line0)
 				return {
 					t = "arithcmd",
 					line = line,
-					expr = ok and e or { k = "matherr" },
+					expr = ok and e or { k = "matherr", err = e, raw = body },
 					src = body, -- as written (`declare -f` prints it)
 					redirs = tail_redirs(),
 				}
@@ -3580,7 +3707,12 @@ local function make_parser(src, sh, aenv, noalias, posix, line0)
 			end
 			local raw = word(true) -- stop at unquoted ) so `(x=2)` closes the subshell
 			if not subidx and op == "=" and raw:sub(1, 3) == "$((" and raw:sub(-2) == "))" then
-				return { t = "assign", name = name, arith = arith(raw:sub(4, -3)), rhssrc = raw } -- (rhssrc: declare -f)
+				-- (a bad expression — or `$((1))$((2))` — takes the word path: its error is a
+				-- runtime one, reported when the assignment runs)
+				local aok, ae = pcall(arith, raw:sub(4, -3))
+				if aok then
+					return { t = "assign", name = name, arith = ae, rhssrc = raw } -- (rhssrc: declare -f)
+				end
 			end
 			return { t = "assign", name = name, index = subidx, append = (op == "+="), rhs = parse_word(raw) }
 		end

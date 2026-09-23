@@ -158,10 +158,19 @@ return function(sh, cmd, args, hook, tcb)
 			for nm in pairs(sh.vars) do
 				names[#names + 1] = nm
 			end
+			-- SHELLOPTS / BASHOPTS are derived live (not stored) but list as readonly vars
+			local virt = {}
+			for _, nm in ipairs({ "SHELLOPTS", "BASHOPTS" }) do
+				if sh.vars[nm] == nil then
+					virt[nm] = { s = sh:get(nm), ro = true }
+					names[#names + 1] = nm
+				end
+			end
 			table.sort(names)
 			for _, nm in ipairs(names) do
-				if decl_match(nm, sh.vars[nm]) then
-					local d = bare and fmt_set_var(nm, sh.vars[nm]) or fmt_decl(sh, nm)
+				local box = sh.vars[nm] or virt[nm]
+				if decl_match(nm, box) then
+					local d = bare and fmt_set_var(nm, box) or fmt_decl(sh, nm)
 					if d then
 						sh:echo(d)
 					end
@@ -339,9 +348,9 @@ return function(sh, cmd, args, hook, tcb)
 						end
 					elseif iattr then -- declare -i: arith-evaluate the value, mark integer
 						if ap then -- (the old value is evaluated as an expression too)
-							sh:aset(nm, rt.arith_str(sh, sh:get(nm)) + eval(sh, P.arith(val)))
+							sh:aset(nm, rt.arith_str(sh, sh:get(nm)) + M.arith_eval_str(sh, val))
 						else
-							sh:aset(nm, eval(sh, P.arith(val)))
+							sh:aset(nm, M.arith_eval_str(sh, val))
 						end
 						sh.vars[nm].int = true
 					elseif lattr or uattr or cattr then -- declare -l/-u/-c: case attribute (set_str folds)

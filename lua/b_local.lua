@@ -133,7 +133,7 @@ return function(sh, cmd, args, hook, tcb)
 					end
 					if nm then
 						if iattr then
-							sh:aset(nm, eval(sh, P.arith(val)))
+							sh:aset(nm, M.arith_eval_str(sh, val))
 							sh.vars[nm].int = true
 						elseif lattr or uattr then
 							sh:set_str(nm, lattr and val:lower() or val:upper())

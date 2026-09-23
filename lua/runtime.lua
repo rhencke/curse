@@ -19,6 +19,8 @@ M.i64 = i64
 -- with multibyte chars) uses a plain single-quote; only a control/non-printable
 -- byte forces the $'…' form, and inside it printable codepoints stay raw (per the
 -- locale via iswprint) while control/bad bytes are escaped. Byte-identical to bash.
+local ANSIC_ESC = { [27] = "\\E", [7] = "\\a", [11] = "\\v", [8] = "\\b", [12] = "\\f", [10] = "\\n", [13] = "\\r", [9] = "\\t" }
+M.ANSIC_ESC = ANSIC_ESC
 function M.shell_quote(s)
 	if not s:find("[%z\1-\31\127-\255]") then
 		return "'" .. s:gsub("'", "'\\''") .. "'"
@@ -48,12 +50,9 @@ function M.shell_quote(s)
 		else
 			for i = 1, #ch.s do -- control char / non-printable / bad byte: escape each byte
 				local b = ch.s:byte(i)
-				if b == 10 then
-					out[#out + 1] = "\\n"
-				elseif b == 9 then
-					out[#out + 1] = "\\t"
-				elseif b == 13 then
-					out[#out + 1] = "\\r"
+				local esc = ANSIC_ESC[b] -- (bash's ansic_quote: \E \a \v \b \f \n \r \t)
+				if esc then
+					out[#out + 1] = esc
 				elseif b == 92 then
 					out[#out + 1] = "\\\\"
 				elseif b == 39 then
@@ -197,6 +196,11 @@ function Shell.new()
 	}, Shell)
 	M.cur_shell = sh -- (the error-prefix rewrite reads the live shell's source/line)
 	sh:import_env()
+	-- UID / EUID / PPID are real readonly integer variables in bash (set once at startup, so a
+	-- subshell keeps the shell's PPID); the daemon re-points PPID at its client's parent
+	for _, kv in ipairs({ { "UID", ffi.C.getuid() }, { "EUID", ffi.C.geteuid() }, { "PPID", ffi.C.getppid() } }) do
+		sh.vars[kv[1]] = { s = tostring(tonumber(kv[2])), ro = true, int = true }
+	end
 	M.reset_locale(sh) -- adopt $LANG/$LC_* (bash calls setlocale at startup)
 	if sh.vars["OPTIND"] == nil then
 		sh:set_str("OPTIND", "1")
@@ -404,6 +408,18 @@ end
 -- the shadowed outer one). Returns false (else true) when the name is READONLY: bash
 -- fails that operand (message + `local` returns 1) WITHOUT shadowing it or changing
 -- the value, and continues with the rest — so the caller ORs the results into $?.
+-- `local NAME=(…)` over a READONLY NAME: bash's compound assignment fails first, then
+-- local's own error; nothing is created (status 1). True when that happened.
+function M.local_ro(sh, name)
+	local b = sh.vars[name]
+	if b and b.ro then
+		sh:errmsg("curse: " .. name .. ": readonly variable\n")
+		sh:errmsg("curse: local: " .. name .. ": readonly variable\n")
+		sh.status = 1
+		return true
+	end
+	return false
+end
 function Shell:localAssign(arg)
 	local nm, op, val = arg:match("^([%a_][%w_]*)(%+?=)(.*)$")
 	local name = nm or arg
@@ -3174,11 +3190,10 @@ M.arith_num = arith_num
 -- own, guarding the negative exponent before it reaches here). bash disallows a
 -- negative exponent: throw the same non-fatal matherr div0 does (lineabort so a
 -- word-context $(( )) aborts the command; matherr so a (( )) pcall maps it to $?=1).
-function M.ipow(base, exp)
+function M.ipow(base, exp, etxt, etok)
 	local n = tonumber(exp)
 	if n < 0 then
-		io.stderr:write("curse: exponent less than 0\n")
-		error({ __curse_exit = 1, __curse_matherr = true, __curse_lineabort = true })
+		M.arith_fault(etxt, etok, "exponent less than 0")
 	end
 	local r = i64(1)
 	for _ = 1, n do
@@ -3191,19 +3206,25 @@ end
 -- __curse_matherr lets a protected caller (compgen -F) recover; __curse_lineabort
 -- makes run_lazy fast-forward past the rest of the current input LINE (bash's
 -- line-oriented abort). Shared by both tiers so the compiled path faults alike.
-local function div0()
-	io.stderr:write("curse: division by 0\n")
+-- (etxt/etok: the expression + bash's error token, baked in by the compiler when known)
+local function div0(etxt, etok, msg)
+	msg = msg or "division by 0"
+	if etxt then
+		msg = require("parser").arith_errmsg(etxt, { msg = msg, tok = etok })
+	end
+	io.stderr:write("curse: " .. msg .. "\n")
 	error({ __curse_exit = 1, __curse_matherr = true, __curse_lineabort = true })
 end
-function M.idiv(l, r)
+M.arith_fault = div0
+function M.idiv(l, r, etxt, etok)
 	if r == i64(0) then
-		div0()
+		div0(etxt, etok)
 	end
 	return l / r
 end
-function M.imod(l, r)
+function M.imod(l, r, etxt, etok)
 	if r == i64(0) then
-		div0()
+		div0(etxt, etok)
 	end
 	return l % r
 end
@@ -3643,8 +3664,11 @@ function Shell:special_get(name)
 		return tostring(self.nparams)
 	end
 	if name == "RANDOM" then
+		if self.random_plain then
+			return "" -- (after `unset RANDOM` it is an ordinary variable)
+		end
 		M.need_process(self) -- a subshell's RANDOM stream must not advance the parent's
-		return tostring(math.random(0, 32767))
+		return tostring(M.random_next(self))
 	end
 	-- $PWD is a real tracked variable (see :pwd / import_env); once unset it reads
 	-- empty like any other var, so special_get does NOT fall back to getcwd here.
@@ -4011,6 +4035,14 @@ function Shell:set_str(name, s)
 		self.argv0 = s -- assigning BASH_ARGV0 sets $0 (bash)
 	elseif dn == "POSIXLY_CORRECT" then
 		self.opt_posix = true -- (bash's sv_strict_posix: setting it enters posix mode)
+	elseif dn == "RANDOM" and not self.random_plain then
+		-- assigning seeds the generator; RANDOM itself stays dynamic (bash assign_random)
+		local n = s:match("^%s*[+-]?%d+%s*$") and tonumber(s)
+		if n then
+			M.random_seed(self, n)
+		end
+		self.vars.RANDOM = nil
+		return
 	end
 	if b.exported then
 		C.setenv(dn, s, 1)
@@ -4137,6 +4169,9 @@ end
 -- note: real bash iterates in hash order; insertion order matches the common cases).
 function Shell:declare_assoc(name)
 	local b = box(self:deref(name), self.vars)
+	if not b.assoc and (b.s ~= nil or b.n ~= nil) then
+		b.nbuckets = 128 -- (bash's convert_var_to_assoc: hash_create(0) = 128 buckets, not 1024)
+	end
 	b.assoc = true
 	b.arr = b.arr or {}
 	b.order = b.order or {}
@@ -4339,13 +4374,13 @@ end
 -- match bash. int64 keeps the 32-bit multiply
 -- exact (a plain Lua double would lose precision past 2^53).
 local FNV32_OFFSET, FNV32_PRIME, U32 = i64(2166136261), i64(16777619), i64(4294967296)
-local function assoc_bucket(key)
+local function assoc_bucket(key, nb)
 	local h = FNV32_OFFSET
 	for j = 1, #key do
 		h = (h * FNV32_PRIME) % U32 -- FNV-1: multiply first…
 		h = bit.bxor(h, i64(key:byte(j))) -- …then xor the byte
 	end
-	return tonumber(h % i64(1024))
+	return tonumber(h % i64(nb or 1024))
 end
 
 function Shell:array_indices(name)
@@ -4362,7 +4397,7 @@ function Shell:array_indices(name)
 		local live = {}
 		for idx, k in ipairs(b.order) do
 			if b.arr[k] ~= nil then
-				live[#live + 1] = { k = k, i = idx, bkt = assoc_bucket(k) }
+				live[#live + 1] = { k = k, i = idx, bkt = assoc_bucket(k, b.nbuckets) }
 			end
 		end
 		table.sort(live, function(a, z)
@@ -6384,7 +6419,11 @@ function M.assign_element(sh, name, raw, expanded, value, append)
 			return M.to_arr_key(M.arith_str(sh, raw))
 		end)
 		if not ok then
-			io.stderr:write("curse: " .. raw .. ": syntax error in expression\n")
+			if not (type(v) == "table" and v.__curse_matherr) then -- (arith_str reported it)
+
+				io.stderr:write("curse: " .. require("parser").arith_errmsg(raw, v) .. "\n")
+
+			end
 			sh.status = 1
 			return
 		end
@@ -6449,7 +6488,11 @@ function M.assign_element_x(sh, name, src, value, append)
 	else
 		local ok, v = pcall(M.arith_str, sh, src)
 		if not ok then
-			io.stderr:write("curse: " .. src .. ": syntax error in expression\n")
+			if not (type(v) == "table" and v.__curse_matherr) then -- (arith_str reported it)
+
+				io.stderr:write("curse: " .. require("parser").arith_errmsg(src, v) .. "\n")
+
+			end
 			sh.status = 1
 			return
 		end
@@ -6479,7 +6522,11 @@ function M.array_key(sh, name, raw, expanded)
 		return M.to_arr_key(M.arith_str(sh, raw))
 	end)
 	if not ok then
-		io.stderr:write("curse: " .. raw .. ": syntax error in expression\n")
+		if not (type(v) == "table" and v.__curse_matherr) then -- (arith_str reported it)
+
+			io.stderr:write("curse: " .. require("parser").arith_errmsg(raw, v) .. "\n")
+
+		end
 		error({ __curse_exit = 1, __curse_lineabort = true })
 	end
 	return v
@@ -6746,54 +6793,38 @@ local shell_quote = M.shell_quote
 -- $- : the current option flags. h/B are always on (like bash); set flags and the
 -- -i/-c invocation modes are appended in bash-ish order.
 function Shell:dash_flags()
-	-- $- in bash's canonical flag order: a b e f h k m n u v x B C i c (h and B are
-	-- on by default here). Only flags actually set appear.
-	local s = ""
-	if self.opt_a then
-		s = s .. "a"
+	-- $- in bash's shell_flags order (flags.c which_set_flags): a b e f h i k m n p r t u v x
+	-- B C E H P T, then c. hashall/braceexpand default on; histexpand shows only when set
+	-- explicitly or interactive (bash turns it off for scripts).
+	local function on(f)
+		local v = self[f]
+		if v == nil then
+			return M.SETDEFAULT[f] or false
+		end
+		return v
 	end
-	if self.opt_b then
-		s = s .. "b"
+	local t = {}
+	for _, fl in ipairs({ { "a", "opt_a" }, { "b", "opt_b" }, { "e", "opt_e" }, { "f", "opt_f" },
+		{ "h", "opt_h" }, { "i", "opt_i" }, { "k", "opt_k" }, { "m", "opt_m" }, { "n", "opt_n" },
+		{ "p", "opt_p" }, { "r", "opt_r" }, { "t", "opt_t" }, { "u", "opt_u" }, { "v", "opt_v" },
+		{ "x", "opt_x" }, { "B", "opt_B" }, { "C", "opt_C" }, { "E", "opt_errtrace" } }) do
+		if on(fl[2]) then
+			t[#t + 1] = fl[1]
+		end
 	end
-	if self.opt_e then
-		s = s .. "e"
+	if self.opt_H == true or (self.opt_H == nil and self.opt_i) then
+		t[#t + 1] = "H"
 	end
-	if self.opt_f then
-		s = s .. "f"
+	if on("opt_P") then
+		t[#t + 1] = "P"
 	end
-	s = s .. "h"
-	if self.opt_k then
-		s = s .. "k"
-	end
-	if self.opt_m then
-		s = s .. "m"
-	end
-	if self.opt_n then
-		s = s .. "n"
-	end
-	if self.opt_r then
-		s = s .. "r"
-	end
-	if self.opt_u then
-		s = s .. "u"
-	end
-	if self.opt_v then
-		s = s .. "v"
-	end
-	if self.opt_x then
-		s = s .. "x"
-	end
-	s = s .. "B"
-	if self.opt_C then
-		s = s .. "C"
-	end
-	if self.opt_i then
-		s = s .. "i"
+	if on("opt_functrace") then
+		t[#t + 1] = "T"
 	end
 	if self.opt_c then
-		s = s .. "c"
+		t[#t + 1] = "c"
 	end
-	return s
+	return table.concat(t)
 end
 
 -- System hostname (for \h/\H): $HOSTNAME if set, else /proc/sys/kernel/hostname.
@@ -7542,11 +7573,13 @@ end
 -- expression like x="1+2"), an unset var (set -u), or a blank value falls to the
 -- interpreter's full arith_read, which recursively parses+evals the value's TEXT:
 -- genuinely dynamic (the value isn't known at compile time), so it is the bootstrap.
+-- (only forms that can't fail: `08`, `2#44`, `0#4`… take the validating parse, which
+-- reports bash's errors)
 function M.looks_numeric(s)
-	return s:match("^%s*[+-]?%d+%s*$")
+	return s:match("^%s*[+-]?[1-9]%d*%s*$")
+		or s:match("^%s*[+-]?0%s*$")
 		or s:match("^%s*[+-]?0[xX]%x+%s*$")
 		or s:match("^%s*[+-]?0[0-7]+%s*$")
-		or s:match("^%s*%d+#[%w@_]+%s*$")
 end
 local _acache = {} -- value-string -> compiled fn(sh) | false (uncompilable; keep the seam)
 function M.arith_read(sh, name)
@@ -7608,6 +7641,73 @@ end
 -- under the shared cycle guard). A subscript/$-form it can't compile defers to the interp
 -- evaluator (interp.dbracket_arith = eval(P.arith(s)), empty->0), which also raises the
 -- same math/syntax error the caller's codegen maps to a failing status.
+-- [[ … -eq … ]] operands (compiled): arith_str, but an arith error flags sh.db_err (the
+-- enclosing rt.db_ok turns the test false) instead of unwinding — no pcall on the fast path
+function M.db_arith(sh, s)
+	if M.looks_numeric(s) then
+		return M.arith_num(s)
+	end
+	local ok, v = pcall(require("interp").dbracket_arith, sh, s)
+	if ok then
+		return v
+	end
+	if type(v) == "table" and v.__curse_matherr then
+		sh.db_err = true
+		return i64(0)
+	end
+	error(v, 0)
+end
+function M.db_ok(sh, b)
+	if sh.db_err then
+		sh.db_err = nil
+		return false
+	end
+	return b
+end
+-- bash's $RANDOM (lib/sh/random.c): the Park–Miller minimal standard LCG, 16-bit folded,
+-- never repeating the previous value; `RANDOM=n` seeds it; a subshell reseeds on first use.
+local function intrand32(last)
+	local r = (last == 0) and 123459876 or last
+	local h = math.floor(r / 127773)
+	local l = r - 127773 * h
+	local t = 16807 * l - 2836 * h
+	return t < 0 and t + 0x7fffffff or t
+end
+function M.random_seed(sh, v)
+	sh.rseed = v % 4294967296
+	sh.rlast = 0
+	sh.rpid = tonumber(ffi.C.getpid())
+end
+function M.random_next(sh)
+	local pid = tonumber(ffi.C.getpid())
+	if sh.rpid ~= pid then -- first use in this process (startup, or a forked subshell)
+		sh.rseed = (os.time() * 1000003 + pid * 7919 + math.floor(os.clock() * 1e6)) % 2147483647
+		sh.rlast = 0
+		sh.rpid = pid
+	end
+	local rv
+	repeat
+		sh.rseed = intrand32(sh.rseed)
+		rv = bit.band(bit.bxor(bit.rshift(sh.rseed, 16), bit.band(sh.rseed, 65535)), 32767)
+	until rv ~= sh.rlast
+	sh.rlast = rv
+	return rv
+end
+-- Does arithmetic text assign a variable it ALSO reads as `$name`? bash expands every
+-- $name before evaluating, so an in-order native read could see the new value; such an
+-- expression takes the textual path (`x=x[1], x[1]=$x`). `sum += $i` stays native.
+function M.xpand_self_assign(raw)
+	for nm in raw:gmatch("%$([%a_][%w_]*)") do
+		local f = "%f[%w_]" .. nm
+		if raw:find(f .. "%s*[%+%-%*/%%&|%^]?=[^=]") or raw:find(f .. "%s*<<=") or raw:find(f .. "%s*>>=")
+			or raw:find(f .. "%s*%[[^%]]*%]%s*[%+%-%*/%%&|%^]?=[^=]")
+			or raw:find(f .. "%s*%+%+") or raw:find(f .. "%s*%-%-")
+			or raw:find("%+%+%s*" .. nm .. "%f[^%w_]") or raw:find("%-%-%s*" .. nm .. "%f[^%w_]") then
+			return true
+		end
+	end
+	return false
+end
 function M.arith_str(sh, s)
 	if s == "" then
 		return i64(0)
@@ -7617,13 +7717,14 @@ function M.arith_str(sh, s)
 	end
 	local fn = _acache[s]
 	if fn == nil then
-		fn = require("emit").compile_arith_value(s) or false
+		local cok, f = pcall(require("emit").compile_arith_value, s)
+		fn = cok and f or false
 		_acache[s] = fn
 	end
 	if fn then
 		return fn(sh)
 	end
-	return require("interp").dbracket_arith(sh, s)
+	return require("interp").arith_eval_str(sh, s)
 end
 
 -- ${v:off:len} slice offset/length: arith-evaluate the already-expanded expression
@@ -8141,6 +8242,18 @@ M.TEST_BINOPS, M.TEST_UNOPS, M.do_test = TEST_BINOPS, TEST_UNOPS, do_test
 -- under -c/posix); an array target assigns element [0]; an integer var arith-evaluates
 -- the value (rt.arith_str — native, subscript/$-form via the interp seam); -l/-u fold
 -- case; else a plain string set. `set -a` auto-exports a plain scalar. No array_key.
+-- A compiled attributed assignment: like interp's assign statement, an expansion/arith
+-- error in it (declare -i x; x='4+') fails just this assignment (status 1), non-fatally.
+function M.assign_scalar_x(sh, name, value)
+	local ok, e = pcall(M.assign_scalar, sh, name, value)
+	if not ok then
+		if type(e) == "table" and e.__curse_experr and not e.__curse_lineabort then
+			sh.status = 1
+			return
+		end
+		error(e, 0)
+	end
+end
 function M.assign_scalar(sh, name, value)
 	local direct = sh.vars[name]
 	-- nameref write-through (interp assign path): a cycle (ref -> … -> ref) is a non-fatal
