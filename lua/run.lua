@@ -170,6 +170,7 @@ local SH_IS_POSIX = SHELLNAME == "sh" or SHELLNAME == "dash" or SHELLNAME == "as
 local DEFAULT_PS1 = [[${debian_chroot:+($debian_chroot)}\u@\h:\w\$ ]]
 local function apply(s)
 	s.shellname = SHELLNAME
+	rt.startup_ignored(s) -- signals ignored at entry stay ignored (untrappable)
 	if SH_IS_POSIX then
 		s.opt_posix = true
 	end

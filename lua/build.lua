@@ -88,6 +88,21 @@ for _, m in ipairs(lazy_mods) do
 		m
 	)
 end
+-- The build's identity for the compile cache (cache.lua): a content hash of everything
+-- bundled, so artifacts from a different build are clean misses, never miscompiles.
+do
+	local ffi = require("ffi")
+	local u64 = ffi.typeof("uint64_t")
+	local h, prime = u64(14695981039346656037ULL), u64(1099511628211ULL)
+	for i = 1, #parts do
+		local s = parts[i]
+		local p = ffi.cast("const uint8_t*", s)
+		for k = 0, #s - 1 do
+			h = bit.bxor(h, u64(p[k])) * prime
+		end
+	end
+	table.insert(parts, 1, ("package.preload[\"curse_buildid\"] = function() return %q end\n"):format(bit.tohex(h)))
+end
 local bundle_src = table.concat(parts)
 
 local chunk = assert(loadstring(bundle_src, "=curse.bundle"))

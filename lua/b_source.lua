@@ -28,6 +28,9 @@ return function(sh, cmd, args, hook, tcb)
 			j = j + 1
 		end
 		local name = args[j]
+		if name and name:find("/", 1, true) and rt.restricted(sh, cmd .. ": " .. name .. ": restricted") then
+			return
+		end
 		local file = name
 		if name and not name:find("/", 1, true) then
 			for dir in (sh:get("PATH") .. ":"):gmatch("([^:]*):") do

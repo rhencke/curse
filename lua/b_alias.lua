@@ -20,10 +20,15 @@ return function(sh, cmd, args, hook, tcb)
 	if cmd == "alias" then
 		-- alias [name[=value] …]: define or print aliases.
 		local j, ok, printed = 2, true, false
+		local listall = false
+		while args[j] == "-p" do -- `-p`: list them all (then handle any operands)
+			listall = true
+			j = j + 1
+		end
 		if args[j] == "--" then
 			j = j + 1
 		end
-		if j > #args then -- print all, sorted
+		if listall or j > #args then -- print all, sorted
 			local ns = {}
 			for k in pairs(sh.aliases) do
 				ns[#ns + 1] = k
@@ -33,7 +38,8 @@ return function(sh, cmd, args, hook, tcb)
 				sh:echo("alias " .. k .. "='" .. sh.aliases[k] .. "'")
 			end
 			sh.status = 0
-		else
+		end
+		if j <= #args then
 			for k = j, #args do
 				local nm, val = args[k]:match("^([^=]+)=(.*)$")
 				if nm then

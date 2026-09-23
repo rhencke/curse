@@ -28,19 +28,38 @@ end
 -- parse + emit + load each time. The result is a pure function of the text (fragment mode
 -- compiles with no program-level assumptions), and a fragment module is re-runnable like
 -- any cached top-level module. Bounded: cleared wholesale when it fills.
+--
+-- Tiering: compiling pays parse + emit + load up front, which only earns out for code that
+-- runs more than once. Text that can't repeat internally (no loop keyword, no function
+-- definition) runs in the interpreter on its FIRST sighting (nil here) and compiles when
+-- the same text comes back — so a loop eval'ing ever-changing strings (`eval "echo
+-- {0..$c}"`) never compiles a thing it won't reuse. The pre-scan is textual (cheap, no
+-- second parse); a false positive merely compiles eagerly, as before.
 local frag_cache, frag_n, FRAG_MAX = {}, 0, 512
+local function may_repeat(code)
+	return code:find("%f[%w_]while%f[^%w_]") or code:find("%f[%w_]until%f[^%w_]")
+		or code:find("%f[%w_]for%f[^%w_]") or code:find("%f[%w_]select%f[^%w_]")
+		or code:find("%f[%w_]function%f[^%w_]") or code:find("%(%s*%)")
+end
 function M.try_fragment(code)
 	local hit = frag_cache[code]
-	if hit ~= nil then
+	if hit ~= nil and hit ~= 0 then
 		return hit or nil
 	end
-	local mod = M.compile_fragment(code)
+	local mod = false
+	if hit == nil and not may_repeat(code) then
+		mod = 0 -- seen once: interpret now, compile if it recurs
+	else
+		mod = M.compile_fragment(code) or false
+	end
 	if frag_n >= FRAG_MAX then
 		frag_cache, frag_n = {}, 0
 	end
-	frag_cache[code] = mod or false
-	frag_n = frag_n + 1
-	return mod
+	if frag_cache[code] == nil then
+		frag_n = frag_n + 1
+	end
+	frag_cache[code] = mod
+	return mod ~= 0 and mod or nil
 end
 function M.compile_fragment(code)
 	local pok, ast = pcall(P.parse, code)

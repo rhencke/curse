@@ -23,11 +23,35 @@ return function(sh, cmd, args, hook, tcb)
 		-- later PATH change — see Shell:resolve_cmd.)
 		sh.hashcache = sh.hashcache or {}
 		local rflag, names, j = false, {}, 2
+		local ppath
 		while args[j] and args[j]:sub(1, 1) == "-" and #args[j] > 1 do
+			if args[j] == "--" then
+				j = j + 1
+				break
+			end
 			if args[j]:find("r") then
 				rflag = true
 			end
+			if args[j]:find("p") then -- -p PATH NAME: remember NAME at PATH (unchecked)
+				ppath = args[j + 1]
+				j = j + 1
+			end
 			j = j + 1
+		end
+		if ppath then
+			if ppath:find("/", 1, true) and rt.restricted(sh, "hash: " .. ppath .. ": restricted") then
+				return
+			end
+			local cur = sh:get("PATH")
+			if sh.hashpath ~= cur then -- (the table belongs to the current $PATH)
+				sh.hashcache = {}
+				sh.hashpath = cur
+			end
+			for k = j, #args do
+				sh.hashcache[args[k]] = { path = ppath, hits = 0 }
+			end
+			sh.status = 0
+			return
 		end
 		for k = j, #args do
 			names[#names + 1] = args[k]

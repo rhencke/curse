@@ -82,6 +82,32 @@ return function(sh, cmd, args, hook, tcb)
 			sh.status = fd_ready(ufd) and 0 or 1
 			return
 		end
+		-- -t SECS (or a positive $TMOUT): give up at the deadline with status 128+ALRM,
+		-- keeping whatever partial input arrived (bash)
+		local deadline
+		if tmout == nil and sh.vars["TMOUT"] then
+			local tm = tonumber(sh:get("TMOUT"))
+			if tm and tm > 0 then
+				tmout = tm
+			end
+		end
+		if tmout ~= nil then
+			local secs = tonumber(tmout)
+			if not secs or secs < 0 or tostring(tmout):match("^%s*0[xX]") then
+				io.stderr:write("curse: read: " .. tostring(tmout) .. ": invalid timeout specification\n")
+				sh.status = 1
+				return
+			end
+			deadline = rt.wall_secs() + secs
+		end
+		local timed_out = false
+		local function getc()
+			if deadline and not rt.fd_wait(ufd, deadline) then
+				timed_out = true
+				return nil
+			end
+			return fd_getc(ufd)
+		end
 		local vars = {}
 		for k = j, #args do
 			vars[#vars + 1] = args[k]
@@ -99,7 +125,7 @@ return function(sh, cmd, args, hook, tcb)
 					had_nl = true
 					break
 				end -- -n/-N char limit reached
-				local c = fd_getc(ufd)
+				local c = getc()
 				if c == nil then
 					had_nl = false
 					break
@@ -108,9 +134,11 @@ return function(sh, cmd, args, hook, tcb)
 				if not raw and c == "\\" then
 					-- \<newline> is a line continuation (splice); other \x escapes the char
 					-- (marked with \1 so IFS splitting treats it as literal, bash's CTLESC).
-					local d = fd_getc(ufd)
+					local d = getc()
 					if d == nil then
-						buf[#buf + 1] = "\\"
+						if not timed_out then
+							buf[#buf + 1] = "\\"
+						end
 						had_nl = false
 						break
 					end
@@ -129,7 +157,7 @@ return function(sh, cmd, args, hook, tcb)
 					buf[#buf + 1] = c
 				end
 			end
-			line = got and table.concat(buf) or nil
+			line = (got or timed_out) and table.concat(buf) or nil
 		end
 		if line == nil then
 			sh.status = 1 -- EOF: nothing read
@@ -156,6 +184,9 @@ return function(sh, cmd, args, hook, tcb)
 				end
 			end
 			sh.status = had_nl and 0 or 1
+		end
+		if timed_out then
+			sh.status = 142
 		end
 	end
 end

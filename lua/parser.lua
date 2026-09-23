@@ -1395,17 +1395,39 @@ M.parse_dbracket = parse_dbracket
 -- to literal — the expansion always happens, just lazily when it's large.
 local BRACE_CAP = 100000
 
+-- Skip a quoted string or a backslash escape at `i` in `s` (brace syntax is inert inside
+-- them: `{abc\,def}`, `{x,\{a}`, `{"a,b",c}`); returns the index after it, or nil.
+local function brace_skip_quoted(s, i)
+	local c = s:sub(i, i)
+	if c == "\\" then
+		return i + 2
+	elseif c == "'" or c == '"' then
+		local j = i + 1
+		while j <= #s and s:sub(j, j) ~= c do
+			j = j + ((c == '"' and s:sub(j, j) == "\\") and 2 or 1)
+		end
+		return j + 1
+	end
+	return nil
+end
 local function split_top_comma(inner)
 	local parts, depth, start = {}, 0, 1
-	for i = 1, #inner do
+	local i = 1
+	while i <= #inner do
 		local c = inner:sub(i, i)
-		if c == "{" then
-			depth = depth + 1
-		elseif c == "}" then
-			depth = depth - 1
-		elseif c == "," and depth == 0 then
-			parts[#parts + 1] = inner:sub(start, i - 1)
-			start = i + 1
+		local skip = brace_skip_quoted(inner, i)
+		if skip then
+			i = skip
+		else
+			if c == "{" then
+				depth = depth + 1
+			elseif c == "}" then
+				depth = depth - 1
+			elseif c == "," and depth == 0 then
+				parts[#parts + 1] = inner:sub(start, i - 1)
+				start = i + 1
+			end
+			i = i + 1
 		end
 	end
 	parts[#parts + 1] = inner:sub(start)
@@ -1507,15 +1529,20 @@ local function brace_factors(s)
 			local d, j = 1, i + 1
 			while j <= #s and d > 0 do
 				local cc = s:sub(j, j)
-				if cc == "{" then
-					d = d + 1
-				elseif cc == "}" then
-					d = d - 1
+				local skip = brace_skip_quoted(s, j)
+				if skip then
+					j = skip
+				else
+					if cc == "{" then
+						d = d + 1
+					elseif cc == "}" then
+						d = d - 1
+					end
+					if d == 0 then
+						break
+					end
+					j = j + 1
 				end
-				if d == 0 then
-					break
-				end
-				j = j + 1
 			end
 			if d == 0 then
 				local f = classify_brace(s:sub(i + 1, j - 1))
@@ -1523,10 +1550,13 @@ local function brace_factors(s)
 					flush()
 					factors[#factors + 1] = f
 					any = true
+					i = j + 1
 				else
-					litbuf[#litbuf + 1] = s:sub(i, j)
+					-- not an expansion itself: its `{` is literal, but braces INSIDE it still
+					-- expand (`a-{b{d,e}}-c` -> a-{bd}-c a-{be}-c); its `}` is met as a plain char
+					litbuf[#litbuf + 1] = "{"
+					i = i + 1
 				end
-				i = j + 1
 			else
 				litbuf[#litbuf + 1] = c
 				i = i + 1
@@ -2210,18 +2240,18 @@ local function make_parser(src, sh, aenv)
 			i = i + 1
 			ws()
 		end -- bash allows newlines before the body
+		local bline = line -- the body's first line (a traced call's entry DEBUG reports it)
 		if src:sub(i, i) == "(" then
-			local ln = line
 			i = i + 1
 			local body = parse_stmts({ [")"] = true })
-			return { { t = "subshell", line = ln, body = body } }
+			return { { t = "subshell", line = bline, body = body } }, bline
 		end
-		return brace_group()
+		return brace_group(), bline
 	end
 	-- A function definition, with any trailing redirects (`f() { … } >&2`) that apply
 	-- to the whole body on every call.
 	local function funcdef_node(nm, dstart, dline)
-		local body = func_body()
+		local body, bline = func_body()
 		-- capture the definition's exact source text (name/`function` through the
 		-- closing `}`) so `declare -f`/`type`/`command -V` can recover it verbatim,
 		-- no deparser needed. `src` here is the whole script or the -c/stdin string.
@@ -2242,6 +2272,7 @@ local function make_parser(src, sh, aenv)
 			body = body,
 			deftext = deftext,
 			line = dline,
+			bline = bline,
 			redirs = (#redirs > 0 and redirs or nil),
 		}
 	end
@@ -3315,7 +3346,15 @@ local function make_parser(src, sh, aenv)
 			end
 			return { t = "assignlist", line = ln, list = assigns }
 		end
-		-- a command follows: any leading assignments are its temporary (exported) env
+		-- a command follows: any leading assignments are its temporary (exported) env.
+		-- Arguments of a command that is NOT a declaration builtin are `plainarg`: in posix
+		-- mode their `NAME=~` shape doesn't tilde-expand (only real assignment words do).
+		local c1 = words[1] and words[1].parts and words[1].parts[1]
+		if not (c1 and c1.lit and not c1.q and #words[1].parts == 1 and DECL_BUILTINS[c1.lit]) then
+			for k = 2, #words do
+				words[k].plainarg = true
+			end
+		end
 		local node = {
 			t = "simple",
 			line = ln,

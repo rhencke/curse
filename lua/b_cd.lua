@@ -19,6 +19,9 @@ local logical_canon = I.logical_canon
 
 return function(sh, cmd, args, hook, tcb)
 	if cmd == "cd" then
+		if rt.restricted(sh, "cd: restricted") then
+			return
+		end
 		local prev = sh:pwd()
 		-- parse leading -L/-P/-e/-@ flags and a `--`, then the directory operand.
 		local operands, j, physical = {}, 2, false

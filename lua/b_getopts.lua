@@ -34,6 +34,24 @@ return function(sh, cmd, args, hook, tcb)
 			return
 		end
 		local spec, vname = args[2] or "", args[3] or "?"
+		-- OPTARG writes honor readonly (directly or through a nameref): bash reports it,
+		-- leaves OPTARG alone, and the call fails with NAME set to `?`
+		local optarg_ro = false
+		local function optarg_set(v)
+			local b = sh.vars[sh:deref("OPTARG")]
+			if b and b.ro then
+				if not optarg_ro then
+					io.stderr:write("curse: " .. sh:deref("OPTARG") .. ": readonly variable\n")
+				end
+				optarg_ro = true
+				return
+			end
+			if v == nil then
+				sh.vars[sh:deref("OPTARG")] = nil
+			else
+				sh:set_str("OPTARG", v)
+			end
+		end
 		local silent = spec:sub(1, 1) == ":"
 		local src_get, src_n
 		if #args >= 4 then
@@ -86,14 +104,14 @@ return function(sh, cmd, args, hook, tcb)
 					elseif spec:sub(pos + 1, pos + 1) == ":" then -- takes an argument
 						local rest = word:sub(2 + cur)
 						if rest ~= "" then
-							sh:set_str("OPTARG", rest)
+							optarg_set(rest)
 							optind = optind + 1
 							cur = 1
 							res = { opt = oc }
 						else
 							local a = (optind + 1) <= src_n and src_get(optind + 1) or nil
 							if a then
-								sh:set_str("OPTARG", a)
+								optarg_set(a)
 								optind = optind + 2
 								cur = 1
 								res = { opt = oc }
@@ -124,16 +142,16 @@ return function(sh, cmd, args, hook, tcb)
 				sh:set_str(vname, "?")
 			end
 			sh.getopts_state[sh.vars[sh:deref("OPTIND")]] = nil
-			sh.vars["OPTARG"] = nil
+			optarg_set(nil)
 			sh.status = 1 -- end of options: OPTARG unset
 		else
-			if valid then
-				sh:set_str(vname, res.opt)
-			end
 			if res.arg ~= nil then
-				sh:set_str("OPTARG", res.arg)
+				optarg_set(res.arg)
 			elseif res.err or res.clr then
-				sh.vars["OPTARG"] = nil
+				optarg_set(nil)
+			end
+			if valid then
+				sh:set_str(vname, optarg_ro and "?" or res.opt)
 			end
 			if res.err then
 				io.stderr:write("curse: " .. res.err .. "\n")

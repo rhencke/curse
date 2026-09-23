@@ -57,9 +57,12 @@ return function(sh, cmd, args, hook, tcb)
 					end
 					j = j + 1
 				else
-					if SETOPT[o] then
-						set_opt(sh, SETOPT[o], on)
+					if not SETOPT[o] then
+						io.stderr:write("curse: set: " .. o .. ": invalid option name\n")
+						sh.status = 2
+						return
 					end
+					set_opt(sh, SETOPT[o], on)
 					j = j + 2
 				end
 			elseif a == "-" then -- bare `-`: turn off -v/-x and STOP option processing; any
@@ -72,8 +75,22 @@ return function(sh, cmd, args, hook, tcb)
 				j = j + 1 -- bare `+`: an ignored no-op flag; keep scanning
 			elseif a:match("^[-+][a-zA-Z]+$") then -- short flag bundle: -eu, +u, …
 				local on = a:sub(1, 1) == "-"
+				-- the whole bundle is validated first: one bad letter applies none (bash).
+				-- A restricted shell can't be unrestricted: `+r` is then invalid.
 				for f in a:sub(2):gmatch(".") do
-					if SETFLAG[f] then
+					if not SETFLAG[f] or (f == "r" and not on and sh.opt_r) then
+						io.stderr:write("curse: set: " .. a:sub(1, 1) .. f .. ": invalid option\n")
+						io.stderr:write("set: usage: set [-abefhkmnptuvxBCEHPT] [-o option-name] [--] [-] [arg ...]\n")
+						sh.status = 2
+						return
+					end
+				end
+				for f in a:sub(2):gmatch(".") do
+					if f == "r" then
+						if on and not sh.opt_r then
+							rt.make_restricted(sh)
+						end
+					else
 						set_opt(sh, SETFLAG[f], on)
 					end
 				end

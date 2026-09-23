@@ -25,6 +25,7 @@
 #include <fcntl.h>
 #include <sys/socket.h>
 #include <sys/un.h>
+#include <signal.h>
 #include <stdint.h>
 
 #define CURSE_MAGIC 0x43555253u /* "CURS" */
@@ -117,6 +118,16 @@ int main(int argc, char **argv, char **envp) {
     off = put_u32(buf, off, cap, (uint32_t)nenv);
     for (int i = 0; i < nenv && off >= 0; i++)
         off = put_bytes(buf, off, cap, envp[i], (uint32_t)strlen(envp[i]));
+    /* Trailer: the signals this process ignores (bit n-1 = signal n). The script must
+     * inherit them (ignored at entry stays ignored), but the worker doesn't share our
+     * dispositions — so send them. */
+    uint32_t sigign = 0;
+    for (int s = 1; s < 32; s++) {
+        struct sigaction sa;
+        if (s != SIGKILL && s != SIGSTOP && sigaction(s, NULL, &sa) == 0 && sa.sa_handler == SIG_IGN)
+            sigign |= 1u << (s - 1);
+    }
+    off = put_u32(buf, off, cap, sigign);
     if (off < 0) { close(fd); fallback(argv); } /* request too big -> run directly */
 
     /* Send the request with fds 0,1,2 attached as SCM_RIGHTS ancillary data. */

@@ -45,6 +45,31 @@ local stamp = ("curse%s-%s-%s"):format(
 	(jit and jit.arch or "?")
 )
 M.stamp = stamp
+-- ...and the exact curse BUILD: compiled code calls straight into runtime/interp internals,
+-- so an artifact emitted by one build can be wrong under another even at the same version.
+-- The bundle carries its content hash (build.lua -> curse_buildid); from sources, hash the
+-- modules the emitted code touches — lazily, on the first cache lookup only.
+local build_stamp
+local function full_stamp()
+	if build_stamp then
+		return build_stamp
+	end
+	local ok, bid = pcall(require, "curse_buildid")
+	if not ok or type(bid) ~= "string" then
+		local acc = {}
+		for _, m in ipairs({ "emit", "runtime", "interp", "tier", "parser" }) do
+			local path = package.searchpath(m, package.path)
+			local f = path and io.open(path, "rb")
+			if f then
+				acc[#acc + 1] = f:read("*a")
+				f:close()
+			end
+		end
+		bid = M.hash(table.concat(acc, "\0"))
+	end
+	build_stamp = stamp .. "-" .. bid
+	return build_stamp
+end
 
 -- FNV-1a 64-bit over the raw bytes (fast, non-cryptographic). Fine for a per-uid
 -- cache; a shared/root-owned prewarm cache that crosses a trust boundary should
@@ -97,7 +122,7 @@ function M.artifact_path(src)
 	-- bytecode skips the Lua parser (~11x faster to load: 3us vs 38us for a small
 	-- script), which is the dominant cost of a warm cache hit. The distinct
 	-- extension also makes pre-existing source-form `.lua` entries clean misses.
-	return root .. "/" .. stamp .. "/" .. M.hash(src) .. ".bc"
+	return root .. "/" .. full_stamp() .. "/" .. M.hash(src) .. ".bc"
 end
 
 -- Load a cached artifact into a module { run, loopPc, stmtPc }, or nil on any

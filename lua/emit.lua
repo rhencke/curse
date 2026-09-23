@@ -215,6 +215,12 @@ local function word_reads_debugstack(w)
 		if p.pexp and (p.pexp.op == "indirect" or p.pexp.via_indirect) then
 			return true
 		end
+		-- code in a STRING (a trap handler, an eval'd string) is expanded at runtime:
+		-- a literal naming one of the stacks may read it there
+		if p.lit and (p.lit:find("FUNCNAME", 1, true) or p.lit:find("BASH_SOURCE", 1, true)
+			or p.lit:find("BASH_LINENO", 1, true)) then
+			return true
+		end
 		-- p.arith is a source string; arith() can THROW on a malformed expr (only the
 		-- parser's own `parith` wrapper turns that into arith_perr), so pcall it — a
 		-- parse failure just means "no debugstack ref here" (the stmt delegates anyway).
@@ -415,7 +421,9 @@ local function scan_xtrace(node)
 	then
 		for j = 2, #node.words do
 			local l = node.words[j].parts[1] and #node.words[j].parts == 1 and node.words[j].parts[1].lit
-			if not l or l == "xtrace" or l == "verbose" or (l:match("^%-%a+$") and l:find("[xv]", 2)) then
+			-- (restricted mode too: its checks live only on the interpreter's paths)
+			if not l or l == "xtrace" or l == "verbose" or l == "restricted"
+				or (l:match("^%-%a+$") and l:find("[xvr]", 2)) then
 				return true
 			end
 		end
@@ -863,7 +871,7 @@ local function errchk(st) -- the guard statement for `st`, or "" when errexit ne
 	-- _exit with the status, like the body's normal boundary), NOT the whole shell: raising
 	-- __curse_exit would unwind to the parent's finish_run and wrongly run the shell's EXIT trap
 	-- in the forked child. noerr (raised for a condition subshell) suppresses it, as always.
-	local exitfail = EF.subshell_exit_pc and "rt.subshell_exit(sh.status)" or "error({ __curse_exit = sh.status })"
+	local exitfail = EF.subshell_exit_pc and "rt.subshell_exit(sh.status, sh)" or "error({ __curse_exit = sh.status })"
 	if EF.has_err then -- ERR trap fires on the same condition as errexit; set $LINENO to this
 		-- command's line, fire ERR (fire_err_trap scopes by calldepth/in_subprogram — inside a
 		-- function/subshell only under errtrace), THEN errexit (bash order).
@@ -913,6 +921,10 @@ local function fnwrap(cmd, line, s)
 	if EF.has_err or EF.has_debug then
 		pre = pre .. "sh.calldepth = sh.calldepth + 1; "
 		post = post .. "; sh.calldepth = sh.calldepth - 1"
+	end
+	if EF.has_debug then -- the callee doesn't inherit DEBUG (rt.debug_enter)
+		pre = pre .. ("local __dbg = rt.debug_enter(sh, %q); "):format(cmd)
+		post = post .. "; rt.debug_leave(sh, __dbg)"
 	end
 	return pre .. s .. post
 end
@@ -1793,7 +1805,8 @@ emit_word = function(w, lifted)
 			-- ($HOME/getpwnam/$PWD, each `:`-segment after NAME=). Only a genuine LITERAL ~
 			-- triggers — a tilde from a variable's value never expands (bash), and this part
 			-- is a literal, so no over-expansion. ~ mid-word (not after NAME=) stays literal.
-			parts[#parts + 1] = ("rt.tilde_word_initial(sh, %q)"):format(p.lit)
+			parts[#parts + 1] = ("rt.tilde_word_initial(sh, %q, %s, %s)"):format(
+				p.lit, tostring(#w.parts > 1), w.plainarg and "sh.opt_posix" or "false")
 		elseif p.lit then
 			parts[#parts + 1] = ("%q"):format(p.lit)
 		elseif p.raw then
@@ -2438,14 +2451,15 @@ local mixed_expandable, seg_native
 -- Render ONE part of a mixed word to its scalar value expression — the same per-part
 -- computation as emit_word, restricted to the scalar subset seg_native admits.
 -- `tilde` enables word-initial ~ expansion for an unquoted literal at part index 1.
-local function emit_scalar_val(p, i, lifted, tilde)
+local function emit_scalar_val(p, i, lifted, tilde, w)
 	if p.lit ~= nil then
 		if
 			tilde
 			and i == 1
 			and (p.lit:sub(1, 1) == "~" or (p.lit:find("~", 1, true) and p.lit:match("^[%a_][%w_]*%+?=") ~= nil))
 		then
-			return ("rt.tilde_word_initial(sh, %q)"):format(p.lit)
+			return ("rt.tilde_word_initial(sh, %q, %s, %s)"):format(p.lit, tostring(w ~= nil and #w.parts > 1),
+				(w and w.plainarg) and "sh.opt_posix" or "false")
 		end
 		return ("%q"):format(p.lit)
 	elseif p.raw then
@@ -2477,7 +2491,7 @@ end
 --   quoted            -> add(s, false): literal, no split, no glob
 --   unquoted literal  -> add(s, true):  glob-active, no split (word-initial ~)
 --   unquoted $expand  -> feed_split(s): word-split on $IFS, then glob each field
-local function emit_seg(p, i, lifted)
+local function emit_seg(p, i, lifted, w)
 	if p.special == "@" or p.special == "*" then -- $@ / $*: a multi-element segment
 		return ("{multi=true,star=%s,q=%s,elems=sh:paramList()}"):format(
 			tostring(p.special == "*"),
@@ -2571,7 +2585,7 @@ local function emit_seg(p, i, lifted)
 	if p.q then
 		return ("{s=%s,split=false,unq=false}"):format(emit_scalar_val(p, i, lifted, false))
 	elseif p.lit ~= nil then
-		return ("{s=%s,split=false,unq=true}"):format(emit_scalar_val(p, i, lifted, true))
+		return ("{s=%s,split=false,unq=true}"):format(emit_scalar_val(p, i, lifted, true, w))
 	end
 	return ("{s=%s,split=true,unq=true}"):format(emit_scalar_val(p, i, lifted, false))
 end
@@ -2605,7 +2619,7 @@ local function emit_fields_into(tbl, w, lifted, wrap)
 	if seg_native(w, lifted) then
 		local segs = {}
 		for i, p in ipairs(w.parts) do
-			segs[#segs + 1] = emit_seg(p, i, lifted)
+			segs[#segs + 1] = emit_seg(p, i, lifted, w)
 		end
 		return ("do local __f = rt.expand_fields(sh, {%s}); for __i=1,#__f do %s[#%s+1]=%s end end"):format(
 			table.concat(segs, ", "),
@@ -2719,6 +2733,10 @@ local CASE_GLOBSPECIAL = "[%*%?%[%]\\%(%)%|%+%@%!]"
 -- Word-based core (shared by the string API below and the [[ == ]] RHS): render an
 -- already-parsed word to its quote-aware glob expression, or nil if a part can't render here.
 local function emit_pattern_glob_word(w, lifted)
+	local p1 = w.parts[1]
+	if p1 and p1.lit and not p1.q and p1.lit:sub(1, 1) == "~" then
+		return nil -- a word-initial tilde: interp's expand_pattern expands it (runtime HOME)
+	end
 	local out = {}
 	for i, p in ipairs(w.parts) do
 		if p.lenof or p.cmdsub or p.arith or p.arithast or p.pexp or p.procsub then
@@ -3779,6 +3797,24 @@ H.assign = function(cx, st, after)
 		local fl = unq_full_lit(st.rhs)
 		if fl and fl:find("~", 1, true) then
 			return ("rt.tilde_assign(sh, %q)"):format(fl)
+		end
+		-- a MIXED rhs (`d=~:"q"~`): each unquoted literal gets the assignment tilde rule —
+		-- its first segment continues the previous part, and a slash-less last segment
+		-- runs into the next part (both stay literal)
+		local np, tl = #st.rhs.parts, false
+		for _, pp in ipairs(st.rhs.parts) do
+			tl = tl or (pp.lit and not pp.q and pp.lit:find("~", 1, true))
+		end
+		if tl then
+			local out = {}
+			for i, pp in ipairs(st.rhs.parts) do
+				if pp.lit and not pp.q and pp.lit:find("~", 1, true) then
+					out[i] = ("rt.tilde_assign(sh, %q, %s, %s)"):format(pp.lit, tostring(i < np), tostring(i > 1))
+				else
+					out[i] = "(" .. emit_word({ parts = { pp } }, cx.lifted) .. ")"
+				end
+			end
+			return table.concat(out, " .. ")
 		end
 		return emit_word(st.rhs, cx.lifted)
 	end
@@ -5301,7 +5337,7 @@ H.subshell = function(cx, st, after)
 	local errexit_deleg = EF.has_err or EF.has_debug or EF.has_trap
 	local delpc = errexit_deleg and cx.delegate(st, after) or nil
 	local exitpc = cx.newpc()
-	cx.blocks[exitpc] = "rt.subshell_exit(sh.status or 0)"
+	cx.blocks[exitpc] = "rt.subshell_exit(sh.status or 0, sh)"
 	-- A subshell is a fork: break/continue inside it target only loops WITHIN the
 	-- subshell, never the parent's. Hide the enclosing loopstack while flattening
 	-- the body (a break/continue with no in-subshell loop becomes a no-op, like
@@ -5379,9 +5415,9 @@ H.pipeline = function(cx, st, after)
 	local frags = {}
 	for i = 1, n do
 		-- nst==1 is `! cmd` (a single negated command run in the current shell): compile
-		-- it as a negated fragment so its OWN errexit is exempt (bash), while a called
-		-- function's internal errexit still fires (fn_x). Real pipe stages (n>=2) fork,
-		-- so they compile normally (a stage's errexit just exits its own child).
+		-- it as a negated fragment so its OWN errexit is exempt; run_pipeline also raises
+		-- noerr for a negated pipeline under errexit, so errexit inside anything it calls (a
+		-- function, an eval) is ignored too (bash). Real pipe stages (n>=2) compile normally.
 		-- compiled WITH the upval lift set: a stage and the functions it calls share
 		-- `v_x`; the scheduler swaps those upvalues per stage like its fds.
 		local id = emit_fragment({ st.cmds[i] }, n == 1 and st.negate, EF.lifted_set)
@@ -5882,7 +5918,7 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
 			end -- cmdsub/arith/procsub/nameref target: delegate
 			local segs = {}
 			for i, p in ipairs(w.parts) do
-				segs[#segs + 1] = emit_seg(p, i, cx.lifted)
+				segs[#segs + 1] = emit_seg(p, i, cx.lifted, w)
 			end
 			return ("rt.redir_apply_expand(sh, %q, %d, {%s}, %q, __rs)"):format(op, fd, table.concat(segs, ", "), t)
 		elseif op == "dup" or op == "dupin" then
@@ -6000,7 +6036,7 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
 		if not id then
 			return nil
 		end
-		local exitfail = EF.subshell_exit_pc and "rt.subshell_exit(1)" or "error({ __curse_exit = 1 })"
+		local exitfail = EF.subshell_exit_pc and "rt.subshell_exit(1, sh)" or "error({ __curse_exit = 1 })"
 		-- a failed redirect on a compound fires ERR (interp's compound-redirect path does)
 		-- ($LINENO is NOT updated for the redirect — bash reports the last command's line)
 		local errfire = EF.has_err and "if sh.noerr == 0 then I.fire_err_trap(sh) end; " or ""
@@ -6338,9 +6374,10 @@ assemble = function(cfg, sig, opts)
 	-- definition line/file for `declare -F` under extdebug (name line file). The file is
 	-- the runtime source (a compiled top level is the main script or a sourced file).
 	if opts.funcline and next(opts.funcline) then
-		o[#o + 1] = "  sh.func_line = sh.func_line or {}; sh.func_file = sh.func_file or {}"
+		o[#o + 1] = "  sh.func_line = sh.func_line or {}; sh.func_file = sh.func_file or {}; sh.func_bline = sh.func_bline or {}"
 		for n, ln in spairs(opts.funcline) do
-			o[#o + 1] = ('  sh.func_line[%q] = %d; sh.func_file[%q] = sh.cur_source or sh.argv0 or ""'):format(n, ln, n)
+			o[#o + 1] = ('  sh.func_line[%q] = %d; sh.func_bline[%q] = %d; sh.func_file[%q] = sh.cur_source or sh.argv0 or ""'):format(
+				n, ln[1], n, ln[2], n)
 		end
 	end
 	for _, n in ipairs(opts.runlocals or {}) do
@@ -6760,7 +6797,7 @@ function M.emit(ast, opts)
 			funcsrc[st.name] = require("interp").deparse_func(st.name, st.body) or st.deftext
 		end
 		if st.t == "funcdef" and st.line then
-			funcline[st.name] = st.line
+			funcline[st.name] = { st.line, st.bline or st.line }
 		end -- declare -F under extdebug
 	end
 	local top = build_cfg(ast.stmts, lifted, funcflags, inlinefns, true)

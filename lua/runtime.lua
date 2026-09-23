@@ -637,6 +637,11 @@ function M.fork()
 		pre_yield(t)
 	end
 	local pid = C.fork()
+	if pid == 0 then
+		-- every forked child is a subshell: it doesn't run the EXIT trap it inherited
+		-- (bash) — only one it sets itself (`trap … EXIT` clears this; see child_exit)
+		M.exit_trap_inherited = true
+	end
 	if pid == 0 and CO then
 		for fd in pairs(CO.fds) do
 			C.close(fd)
@@ -830,9 +835,8 @@ function M.subshell_wait(pid)
 	M.wait_child(pid, _ss_st, 0)
 	return M.wexit(_ss_st[0])
 end
-function M.subshell_exit(status)
-	io.flush()
-	C._exit(status or 0)
+function M.subshell_exit(status, sh)
+	M.child_exit(sh, status)
 end
 
 -- Redirections, GENUINELY COMPILED. The compiler knows each redirect's operator +
@@ -1018,6 +1022,14 @@ function Shell:exec_script_child(path, args, n)
 		local set = ffi.new("uint8_t[1024]")
 		C.sigemptyset(set)
 		C.sigprocmask(2, set, nil) -- SIG_SETMASK
+		-- as an exec would: caught signals revert to default (ignored ones stay ignored)
+		local I = require("interp")._int
+		for canon in pairs(self.sigtraps) do
+			local num = self.traps[canon] ~= "" and I.SIGNUM[canon:match("^SIG(.+)$") or ""]
+			if num then
+				I.block_sig(num, false)
+			end
+		end
 	end
 	local f = io.open(path, "r")
 	local src = f and f:read("*a") or ""
@@ -1030,6 +1042,7 @@ function Shell:exec_script_child(path, args, n)
 	-- self, so a non-exported `x=1; ./script` doesn't leak x into the script.
 	local child = Shell.new()
 	child.argv0, child.out = args[1], io.write
+	M.startup_ignored(child) -- a new shell: what's ignored now stays ignored
 	for k = 2, n do
 		child.nparams = child.nparams + 1
 		child.params[child.nparams] = args[k]
@@ -1087,6 +1100,11 @@ function Shell:exec(...)
 	-- Resolve a bare name to its (cached) $PATH location, but keep argv[0] = the
 	-- name as typed. A command with a `/` is exec'd directly.
 	local execpath = args[1]
+	if self.opt_r and execpath:find("/", 1, true) then
+		self:errmsg("curse: " .. execpath .. ": restricted: cannot specify `/' in command names\n")
+		self.status = 1
+		return
+	end
 	if not args[1]:find("/", 1, true) then
 		execpath = self:resolve_cmd(args[1])
 		if not execpath then
@@ -1234,8 +1252,7 @@ function Shell:capture_forked(ast, runner)
 		if not ok and type(err) == "table" and (err.__curse_exit or err.__curse_return) then
 			self.status = err.__curse_exit or err.__curse_return
 		end
-		io.flush()
-		C._exit(self.status or 0)
+		M.child_exit(self, self.status or 0)
 	end
 	C.close(pfd[1])
 	local chunks, rbuf = {}, ffi.new("char[8192]")
@@ -1438,7 +1455,7 @@ function Shell:capture_inproc(backtick, runner, capfd, ctx)
 	local saved_ld = self.loopdepth
 	self.loopdepth = 0 -- break/continue don't cross into $(...)
 	local savede = self.opt_e
-	if not (self.shopt and self.shopt.inherit_errexit) then
+	if not (self.opt_posix or (self.shopt and self.shopt.inherit_errexit)) then
 		self.opt_e = false
 	end
 	local saved_line = self.cur_line -- $LINENO: the sub's internal lines don't leak out
@@ -1662,7 +1679,9 @@ end
 -- parent waits, unwinds to the boundary with the child's status and restores. iso_ctx is
 -- the stack of active in-process isolation contexts (innermost last).
 iso_push = function(sh)
-	local ctx = {}
+	-- the pid that runs this context in-process: a process forked later (a real subshell /
+	-- $(…) / stage / job) inherits the stack but is ALREADY its own process
+	local ctx = { pid = C.getpid() }
 	local st = sh.iso_ctx
 	if not st then
 		st = {}
@@ -1680,14 +1699,13 @@ end
 function M.need_process(sh)
 	local st = sh.iso_ctx
 	local ctx = st and st[#st]
-	if not ctx or ctx.child or CO then
+	if not ctx or ctx.child or CO or ctx.pid ~= C.getpid() then
 		return
 	end
 	io.flush()
 	local pid = M.fork()
 	if pid == 0 then
 		ctx.child = true
-		ctx.inherited_exit = sh.traps and sh.traps.EXIT -- the PARENT's; a subshell doesn't run it
 		sh.subshell_child = true -- anything unwinding past the boundary still ends this child
 		return
 	end
@@ -1696,17 +1714,91 @@ function M.need_process(sh)
 	ctx.status = M.wexit(stb[0])
 	error({ __curse_latefork = ctx }, 0)
 end
--- The late-forked child reached its subshell boundary: run an EXIT trap the SUBSHELL set
--- (not the inherited parent one), then end with the subshell's status.
-function M.late_child_exit(sh, ctx, status)
-	local h = sh.traps and sh.traps.EXIT
-	if h and h ~= "" and h ~= ctx.inherited_exit and not sh.in_exit_trap then
+-- A forked subshell child ends: run an EXIT trap the SUBSHELL set (never the inherited
+-- parent one), with $? = its status, then _exit.
+-- Signals IGNORED when the shell starts can't be trapped or reset (bash), and `trap` lists
+-- them as `trap -- '' SIGx`. `mask` (bit n-1 = signal n) comes from the daemon client (the
+-- caller's dispositions, which a resident worker doesn't share); without it, read this
+-- process's own (a direct run, or a no-shebang script's forked child).
+ffi.cdef("int curse_rt_sigaction(int sig, const void *act, void *old) asm(\"sigaction\");")
+local _sa_buf = ffi.new("uint8_t[256]") -- struct sigaction (sa_handler first)
+-- This process's ignored signals as a mask (bit n-1 = signal n).
+function M.sig_ign_mask()
+	local mask = 0
+	for n = 1, 31 do
+		if n ~= 9 and n ~= 19 and C.curse_rt_sigaction(n, nil, _sa_buf) == 0
+			and ffi.cast("intptr_t *", _sa_buf)[0] == 1 then -- SIG_IGN
+			mask = bit.bor(mask, bit.lshift(1, n - 1))
+		end
+	end
+	return mask
+end
+-- Set every catchable signal's disposition to exactly `mask`: ignored or default.
+function M.sig_apply_mask(mask)
+	for n = 1, 31 do
+		if n ~= 9 and n ~= 19 then
+			if bit.band(mask, bit.lshift(1, n - 1)) ~= 0 then
+				C.curse_sig_ignore(n)
+			else
+				C.curse_sig_default(n)
+			end
+		end
+	end
+end
+function M.startup_ignored(sh, mask)
+	mask = mask or M.sig_ign_mask()
+	if mask == 0 then
+		return
+	end
+	local NUMSIG = require("interp")._int.NUMSIG
+	for n = 1, 31 do
+		if bit.band(mask, bit.lshift(1, n - 1)) ~= 0 and NUMSIG[n] then
+			local canon = "SIG" .. NUMSIG[n]
+			sh.sig_ign_start = sh.sig_ign_start or {}
+			sh.sig_ign_start[canon] = true
+			sh.traps[canon] = ""
+		end
+	end
+end
+-- DEBUG trap across a function call (bash execute_function): a function that is neither
+-- traced (`declare -ft`) nor under functrace does NOT inherit the DEBUG trap — it's cleared
+-- for the call and put back on return, unless the body set its own (which then persists).
+-- So a trap set INSIDE the function fires for the rest of it. Returns the saved handler.
+function M.debug_enter(sh, name)
+	local d = sh.traps.DEBUG
+	if d == nil then
+		return nil
+	end
+	if sh.opt_functrace or (sh.fn_trace and sh.fn_trace[name]) then
+		-- inherited: it also fires once on ENTRY, at the definition's line (bash)
+		require("interp").run_debug(sh, sh.func_bline and sh.func_bline[name] or nil)
+		return nil
+	end
+	sh.traps.DEBUG = nil
+	return d
+end
+function M.debug_leave(sh, saved)
+	if saved ~= nil and sh.traps.DEBUG == nil then
+		sh.traps.DEBUG = saved
+	end
+end
+function M.child_exit(sh, status)
+	local h = sh and sh.traps and sh.traps.EXIT
+	if h and h ~= "" and not M.exit_trap_inherited and not sh.in_exit_trap then
 		sh.in_exit_trap = true
 		sh.status = status
-		pcall(require("interp").run_trap_str, sh, h)
+		local ok, r = pcall(require("interp").run_trap_str, sh, h)
+		if ok and r then
+			status = sh.status -- `exit N` in the trap wins
+		elseif not ok and type(r) == "table" and r.__curse_exit then
+			status = r.__curse_exit
+		end
 	end
 	io.flush()
 	C._exit(status or 0)
+end
+function M.late_child_exit(sh, ctx, status)
+	M.child_exit(sh, status)
 end
 -- Inside a pipeline stage (a scheduler coroutine) a late fork can't be taken — the stage's
 -- buffered stdout and the scheduler don't survive into a child — so bodies that rely on it
@@ -1800,7 +1892,7 @@ function Shell:capture_compiled(cs_fn, mustfork, backtick)
 		-- command sub (unless inherit_errexit), and ERR is suppressed (in_subprogram). Set
 		-- these before the fork (the child copies them); restore in the parent after.
 		local savede = self.opt_e
-		if not (self.shopt and self.shopt.inherit_errexit) then
+		if not (self.opt_posix or (self.shopt and self.shopt.inherit_errexit)) then
 			self.opt_e = false
 		end
 		self.in_subprogram = (self.in_subprogram or 0) + 1
@@ -1913,8 +2005,7 @@ function Shell:run_background(cmd_fn, cmdstr, exec_tail)
 			cmd_fn(self)
 		end)
 		M.child_status(self, ok, err)
-		io.flush()
-		C._exit(self.status or 0)
+		M.child_exit(self, self.status or 0)
 	end
 	M.job_add(self, pid, cmdstr)
 	self.bg_pids = self.bg_pids or {}
@@ -2174,8 +2265,7 @@ local function co_launch(ctx, self, stage_fns, inproc, base, lastpipe, upv)
 						fn(self)
 					end)
 					M.child_status(self, ok, err)
-					io.flush()
-					C._exit(self.status or 0)
+					M.child_exit(self, self.status or 0)
 				end
 				local st = ffi.new("int[1]")
 				M.wait_child(pid, st, 0)
@@ -2492,7 +2582,23 @@ function Shell:run_pipeline_co(stage_fns, inproc, lastpipe, upv_get, upv_set)
 	return g ~= nil or nil
 end
 
+local run_pipeline_body
+-- `! pipeline` with errexit ON: errexit is ignored for everything it runs — a called
+-- function, an eval, a subshell (bash adds CMD_IGNORE_RETURN, like a condition) — so run
+-- it with noerr raised, restored on unwind. (With errexit OFF bash doesn't: a `set -e`
+-- inside a called function then takes effect.)
 function Shell:run_pipeline(stage_fns, negate, inproc, upv_get, upv_set)
+	if not (negate and self.opt_e) then
+		return run_pipeline_body(self, stage_fns, negate, inproc, upv_get, upv_set)
+	end
+	self.noerr = self.noerr + 1
+	local ok, err = pcall(run_pipeline_body, self, stage_fns, negate, inproc, upv_get, upv_set)
+	self.noerr = self.noerr - 1
+	if not ok then
+		error(err, 0)
+	end
+end
+run_pipeline_body = function(self, stage_fns, negate, inproc, upv_get, upv_set)
 	local nst = #stage_fns
 	if nst == 1 then -- defensive: a single stage (emit delegates `! cmd` for exact errexit)
 		stage_fns[1](self)
@@ -2550,8 +2656,7 @@ function Shell:run_pipeline(stage_fns, negate, inproc, upv_get, upv_set)
 						stage_fns[k](self)
 					end)
 					M.child_status(self, ok, err)
-					io.flush()
-					C._exit(self.status or 0)
+					M.child_exit(self, self.status or 0)
 				end
 				pids[k] = pid
 				if prev_read >= 0 then
@@ -2590,8 +2695,7 @@ function Shell:run_pipeline(stage_fns, negate, inproc, upv_get, upv_set)
 						stage_fns[k](self)
 					end)
 					M.child_status(self, ok, err)
-					io.flush()
-					C._exit(self.status or 0)
+					M.child_exit(self, self.status or 0)
 				end
 				pids[k] = pid
 				if prev_read >= 0 then
@@ -2896,6 +3000,7 @@ M.SETFLAG = {
 	p = "opt_p",
 	T = "opt_functrace",
 	E = "opt_errtrace",
+	r = "opt_r", -- restricted (no long -o name; can't be turned back off)
 }
 -- options that default ON (nil field state == off for the rest).
 M.SETDEFAULT = { opt_B = true, opt_h = true, opt_H = true, opt_history = true, opt_icomments = true }
@@ -3100,13 +3205,22 @@ function M.tilde_prefix(sh, s)
 	return s
 end
 
-function M.tilde_assign(sh, s)
+-- `more`: further (quoted/expansion) parts follow this literal, so a LAST segment with
+-- no `/` has its tilde-prefix running into them — not a pure literal, so no expansion.
+-- `cont`: this literal continues text before it (a later part of the word), so its first
+-- segment isn't at a segment start and never expands.
+function M.tilde_assign(sh, s, more, cont)
 	if not s:find("~", 1, true) then
 		return s
 	end -- fast path: nothing to expand
 	local segs = {}
 	for seg in (s .. ":"):gmatch("([^:]*):") do
-		segs[#segs + 1] = M.tilde_prefix(sh, seg)
+		segs[#segs + 1] = seg
+	end
+	for k = cont and 2 or 1, #segs do
+		if not (more and k == #segs and not segs[k]:find("/", 1, true)) then
+			segs[k] = M.tilde_prefix(sh, segs[k])
+		end
 	end
 	return table.concat(segs, ":")
 end
@@ -3115,10 +3229,19 @@ end
 -- `NAME=value` (a valid identifier before `=`) as if it were an assignment RHS —
 -- at the value start and after each `:` — even for a plain command argument
 -- (`echo x=~`). Otherwise only a leading `~` expands.
-function M.tilde_word_initial(sh, s)
+-- `more`: other parts follow this literal in the word (see tilde_assign) — a prefix with
+-- no `/` then includes quoted/expanded text (`~""`, `~$USER`) and stays literal (bash).
+-- `noassign`: don't treat `NAME=` specially (posix mode, a non-declaration command).
+function M.tilde_word_initial(sh, s, more, noassign)
 	local pre, rest = s:match("^([%a_][%w_]*%+?=)(.*)$")
 	if pre then
-		return pre .. M.tilde_assign(sh, rest)
+		if noassign then
+			return s
+		end
+		return pre .. M.tilde_assign(sh, rest, more)
+	end
+	if more and not s:find("/", 1, true) then
+		return s
 	end
 	return M.tilde_prefix(sh, s)
 end
@@ -3392,6 +3515,30 @@ function Shell:mark_readonly(name)
 	if b then
 		b.ro = true
 	end
+end
+
+-- `set -r`: restricted from here on (never back). The variables that could escape the
+-- restriction become readonly — set or not (bash maybe_make_restricted).
+function M.make_restricted(sh)
+	sh.opt_r = true
+	for _, n in ipairs({ "SHELL", "PATH", "HISTFILE", "ENV", "BASH_ENV" }) do
+		local b = sh.vars[n]
+		if b then
+			b.ro = true
+		else
+			sh.vars[n] = { ro = true }
+		end
+	end
+end
+-- The restricted-shell refusal for `what` (bash's wording), status 1. Returns true when
+-- `sh` is restricted (the caller then skips the operation).
+function M.restricted(sh, what)
+	if not sh.opt_r then
+		return false
+	end
+	io.stderr:write("curse: " .. what .. "\n")
+	sh.status = 1
+	return true
 end
 
 -- String value of a var (materialize from the cached int64 if needed).
@@ -4220,6 +4367,22 @@ local EXTOP = { ["?"] = true, ["*"] = true, ["+"] = true, ["@"] = true, ["!"] = 
 -- `patsub` (only ${v/pat/repl} passes it): a bash quirk unique to the substitution
 -- matcher — `]` right after `[^`/`[!` CLOSES an empty negated class (which matches
 -- nothing), whereas #/%/case/glob treat that `]` as a literal member.
+-- POSIX portable-character-set names for collating symbols `[.name.]` (bash collsyms.h)
+local COLLSYM = {
+	NUL = "\0", tab = "\t", newline = "\n", ["vertical-tab"] = "\v", ["form-feed"] = "\f",
+	["carriage-return"] = "\r", space = " ", ["exclamation-mark"] = "!", ["quotation-mark"] = '"',
+	["number-sign"] = "#", ["dollar-sign"] = "$", ["percent-sign"] = "%", ampersand = "&",
+	apostrophe = "'", ["left-parenthesis"] = "(", ["right-parenthesis"] = ")", asterisk = "*",
+	["plus-sign"] = "+", comma = ",", hyphen = "-", ["hyphen-minus"] = "-", period = ".",
+	["full-stop"] = ".", slash = "/", solidus = "/", zero = "0", one = "1", two = "2", three = "3",
+	four = "4", five = "5", six = "6", seven = "7", eight = "8", nine = "9", colon = ":",
+	semicolon = ";", ["less-than-sign"] = "<", ["equals-sign"] = "=", ["greater-than-sign"] = ">",
+	["question-mark"] = "?", ["commercial-at"] = "@", ["left-square-bracket"] = "[",
+	backslash = "\\", ["reverse-solidus"] = "\\", ["right-square-bracket"] = "]",
+	circumflex = "^", ["circumflex-accent"] = "^", underscore = "_", ["low-line"] = "_",
+	["grave-accent"] = "`", ["left-brace"] = "{", ["left-curly-bracket"] = "{",
+	["vertical-line"] = "|", ["right-brace"] = "}", ["right-curly-bracket"] = "}", tilde = "~",
+}
 local function glob_conv(glob, pn, patsub)
 	local star = pn and "[^/]*" or ".*"
 	local qmark = pn and "[^/]" or "."
@@ -4277,6 +4440,7 @@ local function glob_conv(glob, pn, patsub)
 			i = i + 1
 		elseif c == "[" then
 			local j, neg, has_rb, members = i + 1, false, false, {}
+			local never = false -- an invalid collating symbol started a range: matches nothing
 			if glob:sub(j, j) == "!" or glob:sub(j, j) == "^" then
 				neg = true
 				j = j + 1
@@ -4305,16 +4469,41 @@ local function glob_conv(glob, pn, patsub)
 							members[#members + 1] = nx
 							j = j + 2
 						end -- ERE: backslash isn't special in a class
+					elseif cj == "[" and nx == "." and glob:find(".]", j + 2, true) then
+						-- [.name.] collating symbol: a single char, or a POSIX character name;
+						-- an unknown multi-char name matches nothing — as a range START it
+						-- invalidates the whole bracket, as a range END it drops that range
+						local e = glob:find(".]", j + 2, true)
+						local name = glob:sub(j + 2, e - 1)
+						local ch = (#name == 1) and name or COLLSYM[name]
+						j = e + 2
+						if ch then
+							members[#members + 1] = "[." .. ch .. ".]"
+						elseif glob:sub(j, j) == "-" and glob:sub(j + 1, j + 1) ~= "]" then
+							-- invalid range START: drop the range (skip `-` and its end)
+							j = j + 1
+							local ee = glob:sub(j, j + 1) == "[." and glob:find(".]", j + 2, true)
+							j = ee and (ee + 2) or (j + 1)
+						elseif members[#members] == "-" and #members >= 2 then
+							members[#members] = nil -- the `-`
+							members[#members] = nil -- the range start
+						end
 					elseif cj == "[" and (nx == ":" or nx == "." or nx == "=") then
 						-- POSIX [:class:] / [.coll.] / [=equiv=]: copy through its own close
 						local e = glob:find(nx .. "]", j + 2, true)
 						if e then
-							members[#members + 1] = glob:sub(j, e + 1)
+							local cls = glob:sub(j, e + 1)
+							-- [:ascii:] (bash) isn't a regcomp class: its range instead
+							members[#members + 1] = (cls == "[:ascii:]") and "\1-\127" or cls
 							j = e + 2
 						else
 							members[#members + 1] = cj
 							j = j + 1
 						end
+					elseif nx == "-" and glob:sub(j + 2, j + 2) ~= "]" and glob:sub(j + 2, j + 2) ~= ""
+						and glob:sub(j + 2, j + 3) ~= "[." and glob:sub(j + 2, j + 2):byte() < cj:byte()
+					then
+						j = j + 3 -- a reversed range (`a-Z`) matches nothing: drop it (regcomp rejects it)
 					else
 						members[#members + 1] = cj
 						j = j + 1
@@ -4326,7 +4515,11 @@ local function glob_conv(glob, pn, patsub)
 					i = i + 1
 				else
 					-- ERE class: a literal ] must come FIRST (right after [ or [^).
-					out[#out + 1] = "[" .. (neg and "^" or "") .. (has_rb and "]" or "") .. table.concat(members) .. "]"
+					if never or (#members == 0 and not has_rb) then
+						out[#out + 1] = "[^\1-\255]" -- matches nothing (no NUL in a shell string)
+					else
+						out[#out + 1] = "[" .. (neg and "^" or "") .. (has_rb and "]" or "") .. table.concat(members) .. "]"
+					end
 					i = j + 1
 				end
 			end
@@ -4744,6 +4937,27 @@ local _tv = ffi.new("struct curse_rt_timeval")
 local function wall_secs()
 	C.curse_rt_gettimeofday(_tv, nil)
 	return tonumber(_tv.tv_sec) + tonumber(_tv.tv_usec) * 1e-6
+end
+M.wall_secs = wall_secs
+-- `read -t`: wait until `fd` is readable (data, EOF or error) or the wall-clock
+-- `deadline` passes; false on timeout. Inside a pipeline stage it yields on the
+-- scheduler's 10ms tick instead of stalling its siblings.
+function M.fd_wait(fd, deadline)
+	local t = co_task()
+	while fd_would_block(fd, POLLIN) do
+		local left = deadline - wall_secs()
+		if left <= 0 then
+			return false
+		end
+		if t then
+			pre_yield(t)
+			coroutine.yield(-1, 0)
+		else
+			_co_pfd[0].fd, _co_pfd[0].events, _co_pfd[0].revents = fd, POLLIN, 0
+			C.curse_co_poll(_co_pfd, 1, math.ceil(left * 1000))
+		end
+	end
+	return true
 end
 function M.time_push(sh)
 	local st = sh._tstack or {}
@@ -5941,6 +6155,9 @@ function Shell:dash_flags()
 	if self.opt_n then
 		s = s .. "n"
 	end
+	if self.opt_r then
+		s = s .. "r"
+	end
 	if self.opt_u then
 		s = s .. "u"
 	end
@@ -6521,7 +6738,7 @@ function M.command_query(sh, argv)
 	local verbose = argv[2] == "-V"
 	local anyfound = false
 	for j = 3, #argv do
-		local k, p = I.name_type(sh, argv[j])
+		local k, p, hashed = I.name_type(sh, argv[j])
 		if not k then
 			if verbose then
 				io.stderr:write("curse: command: " .. argv[j] .. ": not found\n")
@@ -6532,7 +6749,7 @@ function M.command_query(sh, argv)
 				if k == "alias" then
 					sh:echo(argv[j] .. " is aliased to `" .. sh.aliases[argv[j]] .. "'")
 				elseif k == "file" then
-					sh:echo(argv[j] .. " is " .. p)
+					sh:echo(argv[j] .. (hashed and " is hashed (" .. p .. ")" or " is " .. p))
 				elseif k == "function" then
 					sh:echo(argv[j] .. " is a function")
 					local d = I.func_body_text(sh, argv[j])
@@ -6544,6 +6761,8 @@ function M.command_query(sh, argv)
 				else
 					sh:echo(argv[j] .. " is a shell builtin")
 				end
+			elseif k == "alias" then
+				sh:echo("alias " .. argv[j] .. "='" .. sh.aliases[argv[j]] .. "'")
 			else
 				sh:echo(k == "file" and p or argv[j])
 			end

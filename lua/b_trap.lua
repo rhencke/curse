@@ -85,29 +85,42 @@ return function(sh, cmd, args, hook, tcb)
 				if not canon then
 					io.stderr:write("curse: trap: " .. args[k] .. ": invalid signal specification\n")
 					ok = false
-				elseif action == "-" then
-					sh.traps[canon] = nil
+				elseif sh.sig_ign_start and sh.sig_ign_start[canon] then
+					-- ignored when the shell started: can't be trapped or reset (bash), silently
 				else
-					sh.traps[canon] = action
-				end
-				-- a REAL signal (not EXIT/DEBUG/RETURN/ERR): install curse's async handler
-				-- (block_sig(num,true)); it schedules a VM hook that runs the trap at the next
-				-- safepoint (no polling). Resetting restores the default disposition.
-				-- sh.sigtraps counts active signal traps.
-				local num = canon and SIGNUM[canon:match("^SIG(.+)$") or ""]
-				if num and num ~= 9 and num ~= 19 then -- KILL/STOP can't be trapped
-					local had = sh.sigtraps and sh.sigtraps[canon]
-					if action == "-" and had then
-						block_sig(num, false)
-						sh.sigtraps[canon] = nil
-					elseif action ~= "-" and not had then
-						sh.sigtraps = sh.sigtraps or {}
-						sh.sigtraps[canon] = true
-						block_sig(num, true)
-						-- the C signal hook calls this global with the signal number to run its
-						-- trap directly (bound to the shell that owns the traps).
-						_G.__curse_sigrun = function(s)
-							M.run_signal(sh, s)
+					if action == "-" then
+						sh.traps[canon] = nil
+					else
+						sh.traps[canon] = action
+					end
+					if canon == "EXIT" then
+						rt.exit_trap_inherited = nil -- this (sub)shell's own EXIT trap now
+					end
+					-- a REAL signal (not EXIT/DEBUG/RETURN/ERR): the process disposition follows
+					-- the trap — `''` is a real SIG_IGN (so children and exec'd programs inherit
+					-- it, as in bash), a command installs curse's async handler (it schedules a
+					-- VM hook that runs the trap at the next safepoint — no polling), `-` restores
+					-- the default. sh.sigtraps holds the signals with a non-default disposition.
+					local num = SIGNUM[canon:match("^SIG(.+)$") or ""]
+					if num and num ~= 9 and num ~= 19 then -- KILL/STOP can't be trapped
+						if action == "-" then
+							if sh.sigtraps and sh.sigtraps[canon] then
+								block_sig(num, false)
+								sh.sigtraps[canon] = nil
+							end
+						else
+							sh.sigtraps = sh.sigtraps or {}
+							sh.sigtraps[canon] = true
+							if action == "" then
+								C.curse_sig_ignore(num)
+							else
+								block_sig(num, true)
+								-- the C signal hook calls this global with the signal number to run
+								-- its trap directly (bound to the shell that owns the traps).
+								_G.__curse_sigrun = function(s)
+									M.run_signal(sh, s)
+								end
+							end
 						end
 					end
 				end

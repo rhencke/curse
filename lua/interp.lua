@@ -1270,7 +1270,7 @@ expand_word = function(sh, w)
 	for k, p in ipairs(w.parts) do
 		local s = expand_part_str(sh, p)
 		if k == 1 and p.lit ~= nil and not p.q then
-			s = tilde_word_initial(sh, s)
+			s = tilde_word_initial(sh, s, #w.parts > 1)
 		end
 		buf[#buf + 1] = s
 	end
@@ -1288,11 +1288,12 @@ expand_assign_word = function(sh, w, peel_name)
 	for i, p in ipairs(w.parts) do
 		local s = expand_part_str(sh, p, true) -- assignment context: ${-default} tilde after ':'
 		if p.lit ~= nil and not p.q then
+			local more = i < #w.parts -- a prefix without `/` runs into the next part: literal
 			if peel_name and i == 1 then
 				local pre, rest = s:match("^([%a_][%w_]*%+?=)(.*)$")
-				s = pre and (pre .. tilde_assign(sh, rest)) or tilde_assign(sh, s)
+				s = pre and (pre .. tilde_assign(sh, rest, more)) or tilde_assign(sh, s, more)
 			else
-				s = tilde_assign(sh, s)
+				s = tilde_assign(sh, s, more, i > 1) -- (a later part continues the text before it)
 			end
 		end
 		buf[#buf + 1] = s
@@ -1317,8 +1318,22 @@ local function expand_escaped(sh, w, charclass)
 	return table.concat(buf)
 end
 -- glob PATTERN context (${v/pat/repl}, case, [[ == ]]): glob metacharacters.
+local PAT_META = "[%*%?%[%]\\%(%)%|%+%@%!]"
 expand_pattern = function(sh, w)
-	return expand_escaped(sh, w, "[%*%?%[%]\\%(%)%|%+%@%!]")
+	-- a word-initial `~` tilde-expands (bash: `case ~ in ~)`), and the directory it
+	-- yields matches literally
+	local p1 = w.parts[1]
+	if p1 and p1.lit and not p1.q and p1.lit:sub(1, 1) == "~" then
+		local s = expand_part_str(sh, p1)
+		local t = tilde_word_initial(sh, s, #w.parts > 1, true)
+		if t ~= s then
+			local rest = expand_escaped(sh, { parts = { unpack(w.parts, 2) } }, PAT_META)
+			local tail = s:match("^~[^/]*(.*)$") or ""
+			local dir = t:sub(1, #t - #tail)
+			return dir:gsub(PAT_META, "\\%0") .. tail .. rest
+		end
+	end
+	return expand_escaped(sh, w, PAT_META)
 end
 -- Does `subj` match any of the case-clause pattern strings? The compiled tier's case
 -- codegen dispatches clauses natively but matches through this shared helper (vars in
@@ -1857,7 +1872,9 @@ local function expand_to_fields(sh, w)
 		else
 			local s = expand_part_str(sh, p)
 			if pi == 1 and p.lit ~= nil and not p.q then
-				s = tilde_word_initial(sh, s)
+				-- (posix: `NAME=` args tilde-expand only for declaration builtins — parser
+				-- marks the other commands' args `plainarg`)
+				s = tilde_word_initial(sh, s, #w.parts > 1, sh.opt_posix and w.plainarg)
 			end -- word-initial / NAME= ~
 			if p.q or p.lit ~= nil then
 				add(s, not p.q)
@@ -2108,6 +2125,10 @@ local function apply_redirs(sh, redirs)
 			io.stderr:write("curse: " .. raw .. ": ambiguous redirect\n")
 			return nil
 		end
+		if sh.opt_r and r.op ~= "in" then -- restricted: no output to files (fd dups still work)
+			io.stderr:write("curse: " .. fs[1] .. ": restricted: cannot redirect output\n")
+			return nil
+		end
 		return fs[1]
 	end
 	for _, r in ipairs(redirs) do
@@ -2270,6 +2291,9 @@ local function apply_redirs(sh, redirs)
 							sh.err2out = (sh.err2out or 0) + 1
 						end
 					end
+				elseif r.op == "dup" and tv ~= "" and sh.opt_r then
+					io.stderr:write("curse: " .. tv .. ": restricted: cannot redirect output\n")
+					ok = false
 				elseif r.op == "dup" and tv ~= "" then -- `>&word` (non-number): open the file for
 					backup(r.fd)
 					backup(2)
@@ -2522,7 +2546,9 @@ local function find_in_path(name)
 	return find_all_in_path(name)[1]
 end
 local function name_type(sh, name, nofunc)
-	if sh.aliases[name] then
+	-- an alias only counts while aliases expand (bash: a non-interactive shell has
+	-- expand_aliases off, so `type m` doesn't see `alias m=…`)
+	if sh.aliases[name] and (sh.shopt.expand_aliases or sh.opt_i) then
 		return "alias"
 	end
 	if KEYWORDS[name] then
@@ -2533,6 +2559,13 @@ local function name_type(sh, name, nofunc)
 	end -- `type -f` skips functions
 	if BUILTINS[name] then
 		return "builtin"
+	end
+	-- a remembered location (`hash`, `hash -p`, or an earlier run) wins, and counts a hit
+	-- (bash: `type` reports it "hashed"); the table empties when $PATH changes
+	local hc = not name:find("/", 1, true) and sh.hashcache and sh.hashcache[name]
+	if hc and sh.hashpath == sh:get("PATH") then
+		hc.hits = hc.hits + 1
+		return "file", hc.path, true
 	end
 	local p = find_in_path(name)
 	if p then
@@ -3186,6 +3219,7 @@ local function run_function(sh, cmd, fn, args, hook, tenv_base)
 	table.insert(sh.srcstack, 1, sh.cur_source or sh.argv0 or "")
 	local saved_ld = sh.loopdepth
 	sh.loopdepth = 0 -- break/continue don't cross into a function
+	local dbg_saved = rt.debug_enter(sh, cmd)
 	-- Redirects on the definition (`f(){ … } >&2`) apply to the whole body per call.
 	local fr = sh.func_redirs and sh.func_redirs[cmd]
 	local rsave, rsavedout, rok
@@ -3210,6 +3244,7 @@ local function run_function(sh, cmd, fn, args, hook, tenv_base)
 		restore_redirs(rsave)
 	end
 	sh.loopdepth = saved_ld
+	rt.debug_leave(sh, dbg_saved)
 	table.remove(sh.funcstack, 1)
 	table.remove(sh.linestack, 1)
 	table.remove(sh.srcstack, 1)
@@ -3227,7 +3262,7 @@ local function run_function(sh, cmd, fn, args, hook, tenv_base)
 	-- preserving the function's exit status. A top-level RETURN trap is NOT inherited
 	-- by a function unless functrace (`set -T`) is on (bash) — a sourced script's
 	-- return fires it regardless (see the `.`/source builtin).
-	local rt_h = sh.opt_functrace and sh.traps and sh.traps.RETURN
+	local rt_h = (sh.opt_functrace or (sh.fn_trace and sh.fn_trace[cmd])) and sh.traps and sh.traps.RETURN
 	if rt_h and rt_h ~= "" and not sh.in_return_trap then
 		sh.in_return_trap = true
 		local saved = sh.status
@@ -3436,7 +3471,7 @@ local function exec_simple(sh, args, hook, no_func)
 		local verbose = args[2] == "-V"
 		local anyfound = false
 		for j = 3, #args do
-			local k, p = name_type(sh, args[j])
+			local k, p, hashed = name_type(sh, args[j])
 			if not k then
 				if verbose then
 					io.stderr:write("curse: command: " .. args[j] .. ": not found\n")
@@ -3447,7 +3482,7 @@ local function exec_simple(sh, args, hook, no_func)
 					if k == "alias" then
 						sh:echo(args[j] .. " is aliased to `" .. sh.aliases[args[j]] .. "'")
 					elseif k == "file" then
-						sh:echo(args[j] .. " is " .. p)
+						sh:echo(args[j] .. (hashed and " is hashed (" .. p .. ")" or " is " .. p))
 					elseif k == "function" then
 						sh:echo(args[j] .. " is a function")
 						local d = func_body_text(sh, args[j])
@@ -3459,6 +3494,8 @@ local function exec_simple(sh, args, hook, no_func)
 					else
 						sh:echo(args[j] .. " is a shell builtin")
 					end
+				elseif k == "alias" then
+					sh:echo("alias " .. args[j] .. "='" .. sh.aliases[args[j]] .. "'")
 				else
 					sh:echo(k == "file" and p or args[j])
 				end
@@ -3472,6 +3509,9 @@ local function exec_simple(sh, args, hook, no_func)
 				usep = true
 			end
 			j = j + 1
+		end
+		if usep and rt.restricted(sh, "command: -p: restricted") then
+			return
 		end
 		if args[j] == nil then
 			sh.status = 0
@@ -3698,8 +3738,7 @@ local function drain_procsub(sh, np, nf)
 					exec_list(sh, P.parse(ps.cmd).stmts, function() end, false)
 				end)
 				child_status(sh, ok, err)
-				io.flush()
-				C._exit(sh.status or 0)
+				rt.child_exit(sh, sh.status or 0) -- its own EXIT trap, flush, _exit
 			end
 			local stbuf = ffi.new("int[1]")
 			rt.wait_child(pid, stbuf, 0)
@@ -3788,9 +3827,10 @@ local function run_debug(sh, line)
 	if not h or h == "" or sh.in_debug or (sh.in_pipestage or 0) > 0 then
 		return
 	end
-	-- DEBUG fires only at the current level (bash): not for commands inside a
-	-- function call, or a subshell/command substitution — unless functrace extends it.
-	if not sh.opt_functrace and ((sh.calldepth or 0) > 0 or (sh.in_subprogram or 0) > 0) then
+	-- DEBUG doesn't reach into a subshell/command substitution unless functrace extends it.
+	-- (A function call hides it at entry instead — rt.debug_enter — so one the function
+	-- sets itself still fires in its body.)
+	if not sh.opt_functrace and (sh.in_subprogram or 0) > 0 then
 		return
 	end
 	sh.in_debug = true
@@ -4129,6 +4169,8 @@ exec_stmt = function(sh, st, hook)
 		-- definition site for `declare -F` under extdebug (name line file)
 		sh.func_line = sh.func_line or {}
 		sh.func_line[st.name] = st.line
+		sh.func_bline = sh.func_bline or {}
+		sh.func_bline[st.name] = st.bline
 		sh.func_file = sh.func_file or {}
 		sh.func_file[st.name] = sh.cur_source or sh.argv0 or ""
 		sh.status = 0
@@ -4243,6 +4285,9 @@ exec_stmt = function(sh, st, hook)
 					argv0 = args[k]:sub(3)
 					k = k + 1
 				end
+			end
+			if k <= #args and rt.restricted(sh, "exec: restricted") then
+				return
 			end
 			if k <= #args then
 				local rest = { unpack(args, k) }
@@ -4589,8 +4634,7 @@ exec_stmt = function(sh, st, hook)
 				err.osr()
 			end
 			child_status(sh, ok, err)
-			io.flush() -- flush BEFORE _exit (which doesn't); exit/error skips an inline flush
-			C._exit(sh.status or 0)
+			rt.child_exit(sh, sh.status or 0) -- its own EXIT trap, flush, _exit
 		end
 		if cap then -- parent: drain the child's stdout into the capture buffer, then reap
 			C.close(pfd[1])
@@ -4633,8 +4677,7 @@ exec_stmt = function(sh, st, hook)
 				exec_stmt(sh, st.cmd, hook)
 			end)
 			child_status(sh, ok, err)
-			io.flush()
-			C._exit(sh.status or 0)
+			rt.child_exit(sh, sh.status or 0) -- its own EXIT trap, flush, _exit
 		end
 		C.curse_sig_hold(0) -- parent: unblock
 		-- register the job (for `jobs`/`wait %spec`/`wait -n`); best-effort command text
@@ -4730,6 +4773,19 @@ exec_stmt = function(sh, st, hook)
 		if ran_last and sh.noerr == 0 and sh.status ~= 0 then
 			fire_err(sh)
 		end
+	elseif t == "pipeline" and st.negate then
+		-- `! pipeline`: with errexit ON, everything it runs ignores errexit (bash adds
+		-- CMD_IGNORE_RETURN, like a condition), e.g. `! eval false`. With it OFF there's no
+		-- ignoring, so a `set -e` inside a called function takes effect (bash quirk). Run it
+		-- un-negated (noerr restored however it unwinds), then invert the status.
+		local ign = sh.opt_e and 1 or 0
+		sh.noerr = sh.noerr + ign
+		local ok, err = pcall(exec_stmt, sh, setmetatable({ negate = false }, { __index = st }), hook)
+		sh.noerr = sh.noerr - ign
+		if not ok then
+			error(err, 0)
+		end
+		sh.status = (sh.status == 0) and 1 or 0
 	elseif t == "pipeline" then
 		-- fork a child per stage wired by pipes; the last stage's exit status is the
 		-- pipeline's. Each child is guarded so a failure can never return into the
@@ -4804,8 +4860,7 @@ exec_stmt = function(sh, st, hook)
 							exec_stmt(sh, cmds[k], hook)
 						end)
 						child_status(sh, ok, err)
-						io.flush()
-						C._exit(sh.status or 0)
+						rt.child_exit(sh, sh.status or 0) -- its own EXIT trap, flush, _exit
 					end
 					pids[k] = pid
 					if prev_read >= 0 then
@@ -4845,8 +4900,7 @@ exec_stmt = function(sh, st, hook)
 							exec_stmt(sh, cmds[k], hook)
 						end)
 						child_status(sh, ok, err)
-						io.flush() -- before _exit (exit/error in the stage would skip an inline flush)
-						C._exit(sh.status or 0)
+						rt.child_exit(sh, sh.status or 0) -- its own EXIT trap, flush, _exit
 					end
 					pids[k] = pid
 					if prev_read >= 0 then
@@ -4893,9 +4947,6 @@ exec_stmt = function(sh, st, hook)
 			if lp_raise then -- the lastpipe stage exited/returned: so does the shell/function
 				error(lp_raise, 0)
 			end
-		end
-		if st.negate then
-			sh.status = (sh.status == 0) and 1 or 0
 		end
 	elseif t == "forin" then
 		-- an invalid loop-variable name (`for i.j`/`for -`) is a NON-fatal runtime
@@ -5229,8 +5280,7 @@ end
 local function finish(sh, ok, err)
 	if sh.subshell_child then -- a compiled subshell's forked child: end it here (rt.subshell_fork)
 		child_status(sh, ok, err)
-		io.flush()
-		C._exit(sh.status or 0)
+		rt.child_exit(sh, sh.status or 0)
 	end
 	if not ok then
 		if type(err) == "table" and err.__curse_noexittrap then

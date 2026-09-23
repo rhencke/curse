@@ -24,6 +24,7 @@ return function(sh, cmd, args, hook, tcb)
 		-- -p prints declarations.
 		local doexport, assoc, printmode, nref, plusn = (cmd == "export"), false, false, false, false
 		local plusx, gflag, unexport = false, false, false
+		local tattr, plust = false, false -- -t / +t: the function trace attribute
 		local funcnames, funcbody, iattr, lattr, uattr, rattr, aattr = false, false, false, false, false, false, false
 		local cattr = false -- declare -c: capitalize (first char upper, rest lower)
 		local rest = {}
@@ -90,6 +91,9 @@ return function(sh, cmd, args, hook, tcb)
 				if a:find("g") then
 					gflag = true
 				end
+				if a:find("t") then
+					tattr = true
+				end
 			elseif not endopts and a:sub(1, 1) == "+" and #a > 1 then
 				if a:find("n") then
 					plusn = true
@@ -97,6 +101,9 @@ return function(sh, cmd, args, hook, tcb)
 				if a:find("x") then
 					plusx = true
 				end -- +x: drop the export attribute
+				if a:find("t") then
+					plust = true
+				end
 			else
 				rest[#rest + 1] = a
 			end
@@ -158,7 +165,20 @@ return function(sh, cmd, args, hook, tcb)
 				end
 			end
 		end
-		if funcnames or funcbody then
+		if (funcnames or funcbody) and (tattr or plust) and #rest > 0 then
+			-- `declare -ft NAME…` / `+t`: SET the trace attribute (a traced function inherits
+			-- the DEBUG/RETURN traps, like functrace for just it) — nothing is printed
+			local allok = true
+			for _, nm in ipairs(rest) do
+				if sh.functions[nm] then
+					sh.fn_trace = sh.fn_trace or {}
+					sh.fn_trace[nm] = tattr or nil
+				else
+					allok = false
+				end
+			end
+			sh.status = allok and 0 or 1
+		elseif funcnames or funcbody then
 			-- declare -F [name…] lists `declare -f NAME`; -f prints bodies (not
 			-- reconstructed here) — either way the exit status signals existence.
 			local names, allok, named = rest, true, #rest > 0

@@ -23,6 +23,17 @@ return function(sh, cmd, args, hook, tcb)
 		local tflag, pflag, Pflag, fflag, aflag, j0 = false, false, false, false, false, 2
 		while args[j0] and args[j0]:sub(1, 1) == "-" and #args[j0] > 1 do
 			local f = args[j0]
+			if f == "--" then
+				j0 = j0 + 1
+				break
+			end
+			local bad = f:sub(2):match("[^afptP]")
+			if bad then -- an unknown option: usage error, nothing looked up (bash)
+				io.stderr:write("curse: type: -" .. bad .. ": invalid option\n")
+				io.stderr:write("type: usage: type [-afptP] name [name ...]\n")
+				sh.status = 2
+				return
+			end
 			if f:find("t") then
 				tflag = true
 			end
@@ -64,8 +75,11 @@ return function(sh, cmd, args, hook, tcb)
 					if k == "file" then
 						sh:echo(p)
 					end
+					if not k then
+						allok = false
+					end
 				end
-				if not name_type(sh, nm, fflag) then
+				if aflag and not name_type(sh, nm, fflag) then
 					allok = false
 				end
 			elseif tflag then
@@ -77,7 +91,7 @@ return function(sh, cmd, args, hook, tcb)
 				end
 			elseif aflag then -- every location, in resolution order
 				local found = false
-				if sh.aliases[nm] then
+				if sh.aliases[nm] and (sh.shopt.expand_aliases or sh.opt_i) then
 					sh:echo(nm .. " is aliased to `" .. sh.aliases[nm] .. "'")
 					found = true
 				end
@@ -106,14 +120,14 @@ return function(sh, cmd, args, hook, tcb)
 					io.stderr:write("curse: type: " .. nm .. ": not found\n")
 				end
 			else -- sentence form
-				local k, p = name_type(sh, nm, fflag)
+				local k, p, hashed = name_type(sh, nm, fflag)
 				if not k then
 					allok = false
 					io.stderr:write("curse: type: " .. nm .. ": not found\n")
 				elseif k == "alias" then
 					sh:echo(nm .. " is aliased to `" .. sh.aliases[nm] .. "'")
 				elseif k == "file" then
-					sh:echo(nm .. " is " .. p)
+					sh:echo(nm .. (hashed and " is hashed (" .. p .. ")" or " is " .. p))
 				elseif k == "function" then
 					sh:echo(nm .. " is a function")
 					local d = func_body_text(sh, nm)

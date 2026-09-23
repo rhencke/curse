@@ -159,7 +159,14 @@ local function parse_request(s)
 	for i = 1, nenv do
 		env[i], pos = rd_bytes(s, pos)
 	end
-	return { args = args, cwd = cwd, env = env }
+	-- optional trailer: the caller's IGNORED signals (bit n-1 = signal n) — a resident
+	-- worker doesn't share the caller's dispositions, but the script must (bash: ignored
+	-- at entry stays ignored, untrappable, and inherited by what it runs)
+	local sigign = 0
+	if pos + 3 <= #s then
+		sigign, pos = rd_u32(s, pos)
+	end
+	return { args = args, cwd = cwd, env = env, sigign = sigign }
 end
 
 -- Replace the worker's environment with the caller's, so os.getenv() (libc
@@ -298,6 +305,10 @@ local function serve_request(cfd, req, fds, ctx)
 	-- A FRESH Shell.new (imports the caller's env exactly), cheap because the pages are
 	-- warm (worker_main pre-faulted once, and a persistent worker never re-forks).
 	local sh = rt.Shell.new()
+	if req.sigign ~= ctx.sigign then -- (the common case — same as the worker's — costs nothing)
+		rt.sig_apply_mask(req.sigign)
+	end
+	rt.startup_ignored(sh, req.sigign)
 	-- A Lua error escaping the run is a curse BUG: report it on the request's stderr
 	-- (status 1) instead of failing silently.
 	local ok = xpcall(function()
@@ -334,6 +345,10 @@ local function serve_request(cfd, req, fds, ctx)
 	-- SCRUB per-request process state (the fork boundary used to do this):
 	C.umask(ctx.umask) -- a script's `umask` doesn't persist
 	C.sigprocmask(2, ctx.empty_sigset, nil) -- SIG_SETMASK: clear any trap-blocked signals
+	-- dispositions back to the worker's own (drops trap handlers) — only if touched
+	if req.sigign ~= ctx.sigign or (sh.sigtraps and next(sh.sigtraps)) then
+		rt.sig_apply_mask(ctx.sigign)
+	end
 	if ctx.devnull >= 0 then
 		C.dup2(ctx.devnull, 0)
 		C.dup2(ctx.devnull, 1)
@@ -551,6 +566,7 @@ local function serve()
 	local ctx = {
 		umask = orig_umask,
 		empty_sigset = empty_sigset,
+		sigign = rt.sig_ign_mask(), -- the worker's own ignored signals (restored per request)
 		devnull = devnull,
 		active = active,
 		busy = busy,
