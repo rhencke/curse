@@ -61,7 +61,7 @@ return function(sh, cmd, args, hook, tcb)
 			if C.getrlimit(r[1], rl) ~= 0 then
 				return nil
 			end
-			local v = hardflag and rl[0].rlim_max or rl[0].rlim_cur
+			local v = hardflag and (rt.iso_vhard(sh, r[1]) or rl[0].rlim_max) or rl[0].rlim_cur
 			if v == INF then
 				return "unlimited"
 			end
@@ -138,15 +138,35 @@ return function(sh, cmd, args, hook, tcb)
 				if r[1] < 0 or C.getrlimit(r[1], rl) ~= 0 then
 					sh.status = 1
 				else
+					-- in an in-process subshell a hard limit stays virtual (lowering the real one
+					-- could never be undone); the soft limit is real, within it
+					local ctx = rt.iso_cur(sh) and rt.iso_save_rlimits(sh)
+					local vh = ctx and (rt.iso_vhard(sh, r[1]) or rl[0].rlim_max)
+					local err
 					if setsoft then
 						rl[0].rlim_cur = nv
 					end
-					if sethard then
+					if sethard and ctx then
+						if nv > vh and C.geteuid() ~= 0 then
+							err = 1 -- EPERM
+						elseif not setsoft and rl[0].rlim_cur > nv then
+							err = 22 -- EINVAL
+						end
+					elseif sethard then
 						rl[0].rlim_max = nv
 					end
-					if C.setrlimit(r[1], rl) ~= 0 then
+					if not err and ctx and setsoft and rl[0].rlim_cur > (sethard and nv or vh) then
+						err = 22
+					end
+					if not err and C.setrlimit(r[1], rl) ~= 0 then
+						err = ffi.errno()
+					end
+					if err then
 						sh.status = 1
-						io.stderr:write("curse: ulimit: cannot modify limit\n")
+						io.stderr:write("curse: ulimit: " .. r[3] .. ": cannot modify limit: "
+							.. ffi.string(C.strerror(err)) .. "\n")
+					elseif ctx and sethard then
+						ctx.vhard[r[1]] = nv
 					end
 				end
 			end

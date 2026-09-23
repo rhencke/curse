@@ -1668,13 +1668,8 @@ function subshell_stmt_inproc_ok(st, unsafe)
 	end
 	return false -- unknown type: fork to be safe
 end
-EF.subshell_inproc_ok = subshell_list_inproc_ok -- flatten_stmt calls it via EF (upvalue cap)
-EF.subshell_late_ok = function(list)
-	EF.late_gate = true
-	local ok = subshell_list_inproc_ok(list, {})
-	EF.late_gate = false
-	return ok
-end
+EF.subshell_inproc_ok = function() return true end -- XXX in-process always: gate retired
+EF.subshell_late_ok = function() return true end
 -- How the interpreter should reach a compiled function: through __upv_wrap when the
 -- module has lifted upvalues (see M.emit), else the closure itself.
 EF.upv_wrapped = function(fname)
@@ -3945,20 +3940,43 @@ local function subst_word(w, pb)
 	end
 	return { k = "word", parts = parts }
 end
+-- (each statement is COPIED with its params substituted — its redirects, prefix
+-- assignments and line stay: inlinable_body admits only redirects that read no params)
 local function subst_list(body, pb)
 	local out = {}
 	for _, st in ipairs(body) do
+		local c = {}
+		for k, v in pairs(st) do
+			c[k] = v
+		end
 		if st.t == "assign" then
-			out[#out + 1] = st.arith
-					and { t = "assign", name = st.name, arith = subst_arith(st.arith, pb), line = st.line }
-				or { t = "assign", name = st.name, rhs = subst_word(st.rhs, pb), line = st.line }
+			if st.arith then
+				c.arith = subst_arith(st.arith, pb)
+			else
+				c.rhs = subst_word(st.rhs, pb)
+			end
 		elseif st.t == "simple" then
 			local words = {}
 			for _, w in ipairs(st.words) do
 				words[#words + 1] = subst_word(w, pb)
 			end
-			out[#out + 1] = { t = "simple", words = words, line = st.line } -- keep line for $LINENO
+			c.words = words
+			if st.assigns then
+				local as = {}
+				for i, a in ipairs(st.assigns) do
+					local a2 = {}
+					for k, v in pairs(a) do
+						a2[k] = v
+					end
+					if a.rhs then
+						a2.rhs = subst_word(a.rhs, pb)
+					end
+					as[i] = a2
+				end
+				c.assigns = as
+			end
 		end
+		out[#out + 1] = c
 	end
 	return out
 end
@@ -4536,7 +4554,7 @@ simple_compiled = function(cx, st, after)
 		if re then
 			local p = cx.newpc()
 			cx.blocks[p] = dbg(st)
-				.. ("do rt.need_process(sh); local __rs = {}; sh.status = (%s) and 0 or 1; if sh.coprocs then rt.coproc_fdcheck(sh) end end; pc = %d"):format(re, after)
+				.. ("do rt.iso_save_fds(sh); local __rs = {}; sh.status = (%s) and 0 or 1; rt.redir_discard(__rs); if sh.coprocs then rt.coproc_fdcheck(sh) end end; pc = %d"):format(re, after)
 			return p
 		end
 	end
@@ -5787,7 +5805,11 @@ H.pipeline = function(cx, st, after)
 	local inproc = {}
 	for i = 1, n do
 		local ok = n >= 2 and EF.subshell_inproc_ok({ st.cmds[i] })
-		inproc[i] = ok and (dyn_guard({ st.cmds[i] }) or "true") or "false"
+		local yes = require("runtime").stage_flat(st.cmds[i], function(c)
+			return cx.funcflags[c] or (cx.inlinefns and cx.inlinefns[c])
+		end) and '"flat"' or "true"
+		local g = ok and dyn_guard({ st.cmds[i] })
+		inproc[i] = ok and (g and ("(%s) and %s"):format(g, yes) or yes) or "false"
 	end
 	cx.blocks[p] = dbg(st)
 		.. lifted_flush(cx.lifted)
@@ -5814,7 +5836,7 @@ H.background = function(cx, st, after)
 	-- (which reads sh) sees current values; no reload (the parent's copy is unaffected).
 	-- a REAL-signal trap must be reset in the child (interp's signal machinery); pseudo
 	-- traps don't reach it (no EXIT on _exit, ERR/DEBUG scoped out by in_subprogram)
-	if EF.inproc_trap_block then
+	if EF.bg_trap_block then
 		return cx.delegate(st, after)
 	end
 	-- bash doesn't run ERR (even under errtrace) for the async job's OWN top command —
@@ -7048,7 +7070,9 @@ function M.emit(ast, opts)
 	EF.has_trap = scan_any_trap(ast.stmts) -- gate compiled `&`/pipeline (forked child resets signal traps)
 	-- in-process subshell/$(…)/pipeline-stage gate: only a REAL-signal trap (or DEBUG under
 	-- functrace, which reaches into subshells) keeps them forked/delegated
-	EF.inproc_trap_block = scan_sigtrap(ast.stmts) or (EF.has_debug and scan_functrace(ast.stmts))
+	EF.inproc_trap_block = EF.has_debug and scan_functrace(ast.stmts)
+	-- (`&` still forks: a real-signal trap must be reset in its child — interp's machinery)
+	EF.bg_trap_block = scan_sigtrap(ast.stmts) or EF.inproc_trap_block
 	local funcflags, inlinable, inlinefns = {}, {}, {}
 	-- With a DEBUG/ERR trap, DON'T inline: an inlined body runs at the caller's level,
 	-- where its commands would fire DEBUG/ERR that bash scopes to the (un-entered)

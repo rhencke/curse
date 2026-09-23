@@ -262,7 +262,8 @@ return function(sh, cmd, args, hook, tcb)
 			if #names == 0 then -- (-x / -r / `export -f` / `readonly -f`: only those)
 				names = {}
 				for k in pairs(sh.functions) do
-					if (not (doexport or cmd == "export") or fx[k]) and (not (rattr or cmd == "readonly") or fro[k]) then
+					if (not (doexport or cmd == "export") or fx[k]) and (not (rattr or cmd == "readonly") or fro[k])
+						and (not tattr or ftr[k]) then
 						names[#names + 1] = k
 					end
 				end

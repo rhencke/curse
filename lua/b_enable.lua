@@ -81,9 +81,9 @@ return function(sh, cmd, args)
 		table.sort(names)
 		for _, n in ipairs(names) do
 			if all then
-				io.write(off[n] and "enable -n " or "enable ", n, "\n")
+				sh.out((off[n] and "enable -n " or "enable ") .. n .. "\n")
 			elseif disable == (off[n] ~= nil) then -- -n lists the disabled ones
-				io.write(disable and "enable -n " or "enable ", n, "\n")
+				sh.out((disable and "enable -n " or "enable ") .. n .. "\n")
 			end
 		end
 		sh.status = 0

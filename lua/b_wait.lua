@@ -36,7 +36,38 @@ local function report(j)
 	end
 end
 
-return function(sh, cmd, args, hook, tcb)
+local wait_builtin
+local function wait_entry(sh, cmd, args, hook, tcb)
+	-- in a pipeline stage / $(…), the parent's jobs are listed but aren't children: `wait`
+	-- sees only the subshell's own
+	local foreign = cmd == "wait" and sh.foreign_pids
+	if not foreign or not next(foreign) then
+		return wait_builtin(sh, cmd, args, hook, tcb)
+	end
+	local all, mine = sh.jobs or {}, {}
+	for _, j in ipairs(all) do
+		if not foreign[j.pid] then
+			mine[#mine + 1] = j
+		end
+	end
+	sh.jobs = mine
+	local ok, err = pcall(wait_builtin, sh, cmd, args, hook, tcb)
+	local out = {}
+	for _, j in ipairs(all) do
+		if foreign[j.pid] then
+			out[#out + 1] = j
+		end
+	end
+	for _, j in ipairs(sh.jobs or {}) do
+		out[#out + 1] = j
+	end
+	sh.jobs = out
+	if not ok then
+		error(err, 0)
+	end
+end
+
+wait_builtin = function(sh, cmd, args, hook, tcb)
 	if cmd == "wait" then
 		-- wait [-n] [pid…]: reap background jobs. With pids, return the last one's
 		-- status; with none, wait for all (status 0); an invalid arg is status 1.
@@ -229,3 +260,5 @@ return function(sh, cmd, args, hook, tcb)
 		end
 	end
 end
+
+return wait_entry

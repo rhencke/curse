@@ -93,6 +93,7 @@ return function(sh, cmd, args, hook, tcb)
 				elseif sh.sig_ign_start and sh.sig_ign_start[canon] then
 					-- ignored when the shell started: can't be trapped or reset (bash), silently
 				else
+					rt.iso_trap_changed(sh) -- (a subshell's first change drops what it inherited)
 					if action == "-" then
 						sh.traps[canon] = nil
 					else

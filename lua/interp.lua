@@ -2791,7 +2791,7 @@ end
 -- (name -> module). exec_simple routes these through require() instead of its
 -- inline dispatch, so a cold script that never uses them never loads their code.
 local BUILTIN_LAZY = rt.BUILTIN_LAZY -- one source of truth (runtime); shared with the compiled tier
-local LATE_FORK_BUILTIN = rt.LATE_FORK_BUILTIN
+local ISO_BUILTIN = rt.ISO_BUILTIN
 local BUILTINS = {
 	echo = 1,
 	enable = 1,
@@ -4040,14 +4040,14 @@ local function exec_simple(sh, args, hook, no_func)
 	-- Rarely-used builtins live in lazily-loaded feature modules (kept out of the
 	-- cold path). Route them there before the inline dispatch; require caches, so a
 	-- feature loads at most once. A user function of the same name already won above.
-	-- inside an in-process subshell/$(…), a builtin that needs its own process (fds/process
-	-- image, rlimits, signal dispositions, the builtin table, waiting on its own children)
-	-- late-forks first (rt.need_process): from here on this runs in a real child
+	-- inside an in-process subshell/$(…), a builtin that changes process-global state (fds,
+	-- environ, rlimits, signal dispositions) saves it first (rt.ISO_BUILTIN)
 	if cmd ~= nil and sh.disabled_builtins and sh.disabled_builtins[cmd] then
 		return sh:exec(unpack(args)) -- `enable -n NAME`: found on $PATH instead
 	end
-	if LATE_FORK_BUILTIN[cmd] and sh.iso_ctx and sh.iso_ctx[1] then
-		rt.need_process(sh)
+	local prep = ISO_BUILTIN[cmd] -- (in an in-process subshell: save the process state it changes)
+	if prep then
+		prep(sh)
 	end
 	local lz = BUILTIN_LAZY[cmd]
 	if lz then
@@ -4147,7 +4147,7 @@ local function exec_simple(sh, args, hook, no_func)
 		local code = args[ea] and (tonumber(args[ea]) % 256) or sh.status
 		-- inside a function, bash runs the EXIT trap right here, with the function's frame
 		-- still active (`trap 'echo $FUNCNAME' EXIT; f() { exit; }; f` prints f)
-		if sh:in_function() and not sh.in_exit_trap and not rt.exit_trap_inherited
+		if sh:in_function() and not sh.in_exit_trap and rt.exit_trap_own(sh)
 			and sh.traps and sh.traps.EXIT and sh.traps.EXIT ~= "" then
 			sh.status = code
 			M.run_exit_trap(sh)
@@ -5211,15 +5211,18 @@ exec_stmt = function(sh, st, hook)
 			table.remove(args, 1) -- `command exec 2>f`: still exec, its redirections persist
 		end
 		if args[1] == "exec" then
-			-- in an in-process subshell/$(…) the fds/process image are process-global: become
-			-- a real child first (rt.need_process) unless a function shadows `exec`
-			if not sh.functions.exec and sh.iso_ctx and sh.iso_ctx[1] then
-				rt.need_process(sh)
-			end
+			-- in an in-process subshell/$(…) fds and the environ are process-global: save them
+			-- (restored when it ends); `exec CMD` runs CMD, then ends the subshell
+			rt.iso_save_fds(sh)
+			rt.iso_save_env(sh)
 			io.flush()
 			local ok = true
 			if st.redirs then
-				_, ok = apply_redirs(sh, st.redirs, "exec")
+				local sv
+				sv, ok = apply_redirs(sh, st.redirs, "exec")
+				if type(sv) == "table" then -- (they persist: the saved originals are dropped)
+					rt.redir_discard(sv)
+				end
 				if sh.coprocs then
 					rt.coproc_fdcheck(sh) -- a coproc end it closed/moved reads as -1
 				end
@@ -5921,170 +5924,49 @@ exec_stmt = function(sh, st, hook)
 		end
 		sh.status = (sh.status == 0) and 1 or 0
 	elseif t == "pipeline" then
-		-- fork a child per stage wired by pipes; the last stage's exit status is the
-		-- pipeline's. Each child is guarded so a failure can never return into the
-		-- interpreter and fork-bomb. The last stage's stdout goes to the shell's fd 1,
-		-- except inside $(...) (sh.capturing) where it is drained into the capture buffer.
+		-- a | b | c: the stages run IN-PROCESS under the runtime's coroutine scheduler (each on
+		-- its own shell clone, joined by real pipes; external commands are real processes).
+		-- It sets $?/PIPESTATUS, drains the last stage into a $(…) capture, and runs a
+		-- `shopt -s lastpipe` last stage in this shell. (No OSR hook inside a stage: a switch
+		-- must not unwind out of its coroutine.)
 		local cmds, nst = st.cmds, #st.cmds
 		if nst == 1 then
 			exec_stmt(sh, cmds[1], hook) -- just a `! cmd` negation, no real pipe
 		else
-			io.flush() -- flush parent stdio so forked stages don't duplicate buffered output
-			-- shopt -s lastpipe (non-interactive): the LAST stage runs in the CURRENT
-			-- shell (no fork), so its side effects — e.g. `read var` — persist.
-			local lastpipe = sh.shopt.lastpipe and not sh.opt_i and nst >= 2
-			local pids, prev_read, inline_status = {}, -1, nil
-			local lp_raise = nil
+			local lastpipe = sh.shopt.lastpipe and not sh.opt_i
+			local fns, inproc = {}, {}
 			for k = 1, nst do
-				-- DEBUG fires before each stage IN THE PARENT (bash: a forked stage's child
-				-- does NOT fire it), but only for a stage that is itself a DEBUG-firing node
-				-- — a `{ }`/compound stage fires nothing (`{ …; } | cat` fires once, for cat).
-				-- The lastpipe in-process stage fires via its own exec_stmt instead.
-				if DEBUG_FIRE[cmds[k].t] and not (k == nst and lastpipe) then
+				-- DEBUG fires before each stage IN THE PARENT (bash: the stage itself does NOT
+				-- fire it), but only for a stage that is itself a DEBUG-firing node — a
+				-- `{ }`/compound stage fires nothing (`{ …; } | cat` fires once, for cat). The
+				-- lastpipe stage fires via its own exec_stmt instead.
+				local inshell = k == nst and lastpipe
+				if DEBUG_FIRE[cmds[k].t] and not inshell then
 					if not (sh.in_trap and sh.in_trap > 0) then
 						sh.cur_cmd = cmds[k] -- $BASH_COMMAND: this stage
 					end
 					run_debug(sh, (sh.in_trap and sh.in_trap > 0 and (sh.calldepth or 0) == sh.trap_calldepth) and sh.cur_line or (cmds[k].line or st.line))
 				end
-				local rd, wr = -1, -1
-				if k < nst then
-					local p = ffi.new("int[2]")
-					rt.pipe_hi(p)
-					rd, wr = p[0], p[1]
+				local stage = cmds[k]
+				fns[k] = function(ssh)
+					if not inshell then -- a stage re-runs neither DEBUG nor ERR
+						ssh.in_pipestage = (ssh.in_pipestage or 0) + 1
+					end
+					exec_stmt(ssh, stage, NOHOOK)
 				end
-				if k == nst and lastpipe then
-					local save0 = rt.save_fd(0)
-					if prev_read >= 0 then
-						C.dup2(prev_read, 0)
-						C.close(prev_read)
-						prev_read = -1
-					end
-					local savedout = sh.out
-					if not sh.capturing then -- (inside $(…) the stage's output is the capture's)
-						sh.out = io.write
-					end
-					local ok, err = pcall(exec_stmt, sh, cmds[k], hook)
-					io.flush()
-					sh.out = savedout
-					C.dup2(save0, 0)
-					C.close(save0)
-					if not ok and type(err) == "table" then
-						sh.status = err.__curse_exit or err.__curse_return or sh.status
-						if err.__curse_exit or err.__curse_return then
-							lp_raise = err -- this stage IS the shell: re-raise once the others are reaped
-						end
-					elseif not ok then
-						error(err)
-					end
-					inline_status = sh.status or 0
-					pids[k] = -1
-				elseif k == nst and sh.capturing then
-					-- inside $(...): the last stage's stdout must land in the capture buffer,
-					-- not the shell's real fd 1. Wire it to a pipe the parent drains into sh.out.
-					local cp = ffi.new("int[2]")
-					rt.pipe_hi(cp)
-					local pid = rt.fork()
-					if pid == 0 then
-						reset_child_sigtraps(sh) -- caught signal traps revert to default in a pipeline stage
-						sh.in_pipestage = (sh.in_pipestage or 0) + 1 -- a forked stage re-runs neither DEBUG nor ERR
-						local ok, err = pcall(function()
-							if prev_read >= 0 then
-								C.dup2(prev_read, 0)
-								C.close(prev_read)
-							end
-							C.dup2(cp[1], 1)
-							C.close(cp[1])
-							C.close(cp[0])
-							sh.out = io.write
-							exec_stmt(sh, cmds[k], hook)
-						end)
-						child_status(sh, ok, err)
-						rt.child_exit(sh, sh.status or 0) -- its own EXIT trap, flush, _exit
-					end
-					pids[k] = pid
-					if prev_read >= 0 then
-						C.close(prev_read)
-						prev_read = -1
-					end
-					C.close(cp[1]) -- parent keeps only the read end; drain to EOF before waitpid
-					local chunks, rbuf = {}, ffi.new("char[65536]")
-					while true do
-						rt.co_block(cp[0], 1)
-						local n = tonumber(C.read(cp[0], rbuf, 65536))
-						if n <= 0 then
-							break
-						end
-						chunks[#chunks + 1] = ffi.string(rbuf, n)
-					end
-					C.close(cp[0])
-					sh.out(table.concat(chunks))
-				else
-					local pid = rt.fork()
-					if pid == 0 then
-						reset_child_sigtraps(sh) -- caught signal traps revert to default in a pipeline stage
-						sh.in_pipestage = (sh.in_pipestage or 0) + 1 -- a forked stage re-runs neither DEBUG nor ERR
-						local ok, err = pcall(function()
-							if prev_read >= 0 then
-								C.dup2(prev_read, 0)
-								C.close(prev_read)
-							end
-							if wr >= 0 then
-								C.dup2(wr, 1)
-								C.close(wr)
-							end
-							if rd >= 0 then
-								C.close(rd)
-							end
-							sh.out = io.write -- this stage writes to its fd 1 (the pipe / terminal)
-							exec_stmt(sh, cmds[k], hook)
-						end)
-						child_status(sh, ok, err)
-						rt.child_exit(sh, sh.status or 0) -- its own EXIT trap, flush, _exit
-					end
-					pids[k] = pid
-					if prev_read >= 0 then
-						C.close(prev_read)
-					end
-					if wr >= 0 then
-						C.close(wr)
-					end
-					prev_read = rd
-				end
+				inproc[k] = rt.stage_flat(stage, function(c)
+					return sh.functions[c] ~= nil
+				end) and "flat" or true
 			end
-			if prev_read >= 0 then
-				C.close(prev_read)
-			end
-			local stbuf = ffi.new("int[1]")
-			local last, pipe, pstat = 0, 0, {}
-			for k = 1, nst do
-				local est
-				if pids[k] == -1 then
-					est = inline_status or 0 -- ran inline (lastpipe)
-				else
-					rt.wait_child(pids[k], stbuf, 0)
-					est = rt.wexit(stbuf[0])
-				end
-				pstat[k] = tostring(est)
-				if k == nst then
-					last = est
-				end
-				if est ~= 0 then
-					pipe = est
-				end -- rightmost non-zero (for pipefail)
-			end
-			sh:array_assign("PIPESTATUS", pstat, false) -- ${PIPESTATUS[@]}
-			sh.status = sh.opt_pipefail and pipe or last
+			sh:run_pipeline(fns, false, inproc)
 			-- bash quirk (execute_cmd.c:720): the LAST stage of a pipeline, when it is a
 			-- subshell `(…)` that failed, runs the ERR trap for that subshell — on top of
 			-- the pipeline's own ERR fire — so `(false)|(false)` triggers ERR twice. It
 			-- keys on the subshell's OWN failure (not the pipeline's `!`, which applies to
 			-- the pipeline), so `! (false)|(false)` still fires it once. A group/simple
 			-- last stage does not (only the pipeline fires).
-			if cmds[nst] and cmds[nst].t == "subshell" and last ~= 0 and sh.noerr == 0 then
+			if cmds[nst] and cmds[nst].t == "subshell" and (sh.last_stage_status or 0) ~= 0 and sh.noerr == 0 then
 				fire_err_trap(sh)
-			end
-			if lp_raise then -- the lastpipe stage exited/returned: so does the shell/function
-				error(lp_raise, 0)
 			end
 		end
 	elseif t == "forin" then
@@ -6413,10 +6295,13 @@ end
 -- serialized (the hook re-arms and runs it after this returns), never nested. A
 -- signal trap doesn't change $? unless it exits/returns; `exit` in the handler
 -- propagates to exit the shell (bash).
-local function run_signal(sh, signum)
+local function run_signal(sh, signum, direct)
 	if sh.in_trap and sh.in_trap > 0 then
 		return
 	end -- don't run a trap inside a trap
+	if not direct and rt.defer_signal(sh, signum) then
+		return -- (the parent's: runs once the in-process subshell has ended)
+	end
 	local h = sh.traps and sh.traps["SIG" .. (NUMSIG[signum] or "")]
 	if not h or h == "" then
 		return

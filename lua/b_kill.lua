@@ -99,7 +99,12 @@ return function(sh, cmd, args, hook, tcb)
 			for k = j, #args do
 				local target = args[k]
 				local pid = target:match("^%s*[+-]?%d+%s*$") and tonumber(target)
-				if pid then
+				if pid and rt.vpid_ctx[pid] then -- an in-process subshell's $BASHPID
+					if not rt.vkill(sh, pid, sig) then
+						io.stderr:write("curse: kill: (" .. pid .. ") - No such process\n")
+						allok = false
+					end
+				elseif pid then
 					if C.kill(pid, sig) ~= 0 then
 						io.stderr:write("curse: kill: (" .. pid .. ") - " .. ffi.string(C.strerror(ffi.errno())) .. "\n")
 						allok = false
