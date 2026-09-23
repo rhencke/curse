@@ -3539,6 +3539,61 @@ analyze_lift = function(ast)
 	for n in pairs(NO_LIFT) do
 		disq[n] = true
 	end
+	-- A trap's action runs through the interpreter, on sh.vars, at points the compiled code
+	-- can't see (a signal mid-loop, DEBUG/ERR per command): whatever it names can't live in
+	-- a native local. An action that isn't a literal could name anything: lift nothing.
+	local trap_opaque = false
+	any_node(ast.stmts, function(st)
+		local w1 = st.t == "simple" and st.words and st.words[1]
+		if w1 and full_lit(w1) == "trap" then
+			local j = 2
+			while st.words[j] and (full_lit(st.words[j]) or ""):match("^%-") do
+				j = j + 1
+			end
+			local act = st.words[j] and full_lit(st.words[j])
+			if st.words[j] and not act then
+				trap_opaque = true
+			elseif act and act ~= "" and act ~= "-" then
+				local ok, tast = pcall(require("parser").parse, act)
+				if ok and tast and tast.stmts then
+					local names = {}
+					collect_names(tast.stmts, names)
+					-- (it calls one of the program's functions: count every function body's
+					-- variables — they call each other freely)
+					if any_node(tast.stmts, function(n)
+						local c = n.t == "simple" and n.words and n.words[1] and full_lit(n.words[1])
+						return c and any_node(ast.stmts, function(d)
+							return d.t == "funcdef" and d.name == c
+						end)
+					end) then
+						any_node(ast.stmts, function(d)
+							if d.t == "funcdef" then
+								collect_names(d.body, names)
+							end
+							return false
+						end)
+					end
+					for nm in pairs(names) do
+						disq[nm] = true
+					end
+					if any_node(tast.stmts, function(n)
+						local c = n.t == "simple" and n.words and n.words[1] and full_lit(n.words[1])
+						return c == "eval" or c == "source" or c == "." or (n.t == "simple" and n.words and n.words[1] and not c)
+					end) then
+						trap_opaque = true -- (it runs code it names only at runtime)
+					end
+				else
+					trap_opaque = true
+				end
+			end
+		end
+		return false
+	end)
+	if trap_opaque then
+		for nm in pairs(assigned) do
+			disq[nm] = true
+		end
+	end
 	-- `var=x return` / `var=x :` on a special builtin: under posix the assignment persists,
 	-- written by the interpreter (delegated) — keep those vars in sh.vars
 	local SPB = require("interp")._int.SPECIAL_BUILTIN
