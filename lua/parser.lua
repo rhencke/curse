@@ -2950,7 +2950,7 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs)
 		if raw == "" then
 			error("syntax error near `" .. (src:sub(i, i) == "" and "newline" or src:sub(i, i)) .. "'")
 		end
-		return { fd = tfd, op = op, target = unquote(raw), src = raw, fdvar = fdvar } -- (src: `declare -f`)
+		return { fd = tfd, op = op, target = unquote(raw), src = raw, fdvar = fdvar, line = line } -- (src: `declare -f`)
 	end
 
 	local function parse_command()
@@ -4449,7 +4449,7 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs)
 					perr = { t = "parse_error", line = line, msg = "syntax error near `" .. tok .. "'" },
 				}
 			end
-			if st.t == "funcdef" then
+			if st.t == "funcdef" or st.redirs then
 				st.top = true -- (not nested in a compound: its errors report its END line)
 			end
 			stmts[#stmts + 1] = st

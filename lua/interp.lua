@@ -489,7 +489,10 @@ local function fd_getc(fd)
 	if n == 1 then
 		return string.char(rd1[0] % 256)
 	end
-	return nil -- EOF or error
+	if n < 0 then -- (an error, not EOF: its errno — `read < /` is EISDIR)
+		return nil, ffi.errno()
+	end
+	return nil -- EOF
 end
 -- `read -t 0`: is a read on `fd` ready (data available OR EOF), so it wouldn't
 -- block? poll with a 0 timeout (POLLIN=1); >0 means ready (POLLIN or POLLHUP).
@@ -2431,7 +2434,8 @@ local function apply_redirs(sh, redirs, cname) -- cname: the command (names {v} 
 	-- A FILE redirect target is glob-expanded and word-split like any word; bash
 	-- requires it to resolve to EXACTLY ONE word, else "ambiguous redirect".
 	local function ftgt(r)
-		local raw = r.target or ""
+		-- (the word as written: r.target has its outer quotes stripped, `"$f"` -> `$f`)
+		local raw = r.src or r.target or ""
 		-- bash brace-expands the target too; more than one word -> ambiguous redirect.
 		if P.brace_count(raw) > 1 then
 			io.stderr:write("curse: " .. raw .. ": ambiguous redirect\n")
@@ -2707,6 +2711,14 @@ local function apply_redirs(sh, redirs, cname) -- cname: the command (names {v} 
 							sh.err2out = (sh.err2out or 0) + 1
 						end
 					end
+				elseif tv == "" then -- (bash names the target as written — or, off the default
+					-- fd, the fd itself)
+					local dfl = r.fd == (r.op == "dupin" and 0 or 1)
+					io.stderr:write("curse: " .. (dfl and (r.src or r.target) or tostring(r.fd)) .. ": Bad file descriptor\n")
+					ok = false
+				elseif r.op == "dupin" or r.fd ~= 1 then -- (only `>&file` means `&>file`)
+					io.stderr:write("curse: " .. tv .. ": ambiguous redirect\n")
+					ok = false
 				elseif r.op == "dup" and tv ~= "" and sh.opt_r then
 					io.stderr:write("curse: " .. tv .. ": restricted: cannot redirect output\n")
 					ok = false
@@ -4670,6 +4682,9 @@ exec_stmt = function(sh, st, hook)
 	if st.redirs and COMPOUND_REDIR[t] then
 		local rd = st.redirs
 		local pnp, pnf = procsub_mark(sh) -- a >() redirect target drains after the whole command
+		if st.top and rd[1].line and not (sh.in_trap and sh.in_trap > 0) then
+			sh.cur_line = rd[1].line -- (a top-level one's errors are at its end; nested, bash
+		end -- hasn't moved the line on from the enclosing command's)
 		local save, ok = apply_redirs(sh, rd)
 		if not ok then
 			sh.status = 1
@@ -5659,7 +5674,14 @@ exec_stmt = function(sh, st, hook)
 			sh.loopdepth = 0 -- a loop enclosing this subshell isn't ours to break/continue
 			local ok, err = pcall(function()
 				if st.redirs then
-					apply_redirs(sh, st.redirs)
+					if st.top and st.redirs[1].line and not (sh.in_trap and sh.in_trap > 0) then
+						sh.cur_line = st.redirs[1].line
+					end
+					local _, rok = apply_redirs(sh, st.redirs)
+					if rok == false then -- (a failed redirect: the body never runs, status 1)
+						sh.status = 1
+						return
+					end
 				end
 				sh.out = io.write
 				exec_list(sh, st.body, hook, false)

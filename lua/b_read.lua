@@ -121,12 +121,17 @@ return function(sh, cmd, args, hook, tcb)
 			deadline = rt.wall_secs() + secs
 		end
 		local timed_out = false
+		local rerr -- a read(2) failure (not EINTR/EAGAIN): bash reports it and assigns nothing
 		local function getc()
 			if deadline and not rt.fd_wait(ufd, deadline) then
 				timed_out = true
 				return nil
 			end
-			return fd_getc(ufd)
+			local c, e = fd_getc(ufd)
+			if e and e ~= 4 and e ~= 11 then
+				rerr = e
+			end
+			return c
 		end
 		local vars = {}
 		for k = j, #args do
@@ -148,6 +153,11 @@ return function(sh, cmd, args, hook, tcb)
 				local c = getc()
 				if c == nil then
 					had_nl = false
+					if rerr then
+						io.stderr:write("curse: read: read error: " .. ufd .. ": " .. ffi.string(C.strerror(rerr)) .. "\n")
+						sh.status = 1
+						return
+					end
 					break
 				end
 				got = true

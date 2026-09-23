@@ -1693,7 +1693,7 @@ function Shell:capture_src(src, backtick, noalias)
 		then
 			-- (the file word expands like a redirection target: globbed, except in posix
 			-- mode, and it must name exactly one file)
-			local raw = st.redirs[1].target or ""
+			local raw = st.redirs[1].src or st.redirs[1].target or "" -- (as written: quotes kept)
 			local eok, fs = M.redir_noglob(self, I.expand_to_fields, self, P.parse_word(raw))
 			if not eok then
 				self.status = 1

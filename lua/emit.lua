@@ -6303,11 +6303,12 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
 		end
 		local op, fd = r.op, r.fd or 0
 		if cx.REDIR_FILE[op] then
-			local t = r.target or ""
+			-- (the word as written: r.target has its outer quotes stripped, `"$f"` -> `$f`)
+			local t = r.src or r.target or ""
 			if t == "" then
 				return nil
 			end
-			if not t:find("[%$`%*%?%[~{()]") then -- static literal path
+			if not t:find("[%$`%*%?%[~{()'\"\\]") then -- static literal path
 				return ("rt.redir_apply(sh, %q, %d, %q, __rs)"):format(op, fd, t)
 			end
 			if t:find("{", 1, true) then
@@ -6441,7 +6442,11 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
 		-- a failed redirect on a compound fires ERR (interp's compound-redirect path does)
 		-- ($LINENO is NOT updated for the redirect — bash reports the last command's line)
 		local errfire = EF.has_err and "if sh.noerr == 0 then I.fire_err_trap(sh) end; " or ""
-		return cx.delegate(st, after, {
+		-- (a redirect error names the line bash is at: a top-level compound's end, else the
+		-- command before it — a compound doesn't move the line itself)
+		local sl = EF.cur_line
+		EF.cur_line = st.top and st.redirs[1].line or cx.prev_line or sl
+		local p = cx.delegate(st, after, {
 			callee = "cs_" .. id,
 			callargs = "sh",
 			redir = conds,
@@ -6452,6 +6457,8 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
 				fail = ("%sif sh.opt_e and sh.noerr == 0 then %s end"):format(errfire, exitfail),
 			},
 		})
+		EF.cur_line = sl
+		return p
 	end
 
 	-- Build blocks for `st`; its exit flows to pc `after`. Returns st's entry pc.
@@ -6461,6 +6468,7 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
 			return after
 		end
 		if st.line then
+			cx.prev_line = EF.cur_line -- (the command before: a redirected compound's errors)
 			EF.cur_line = t == "simple" and st.cline or st.line -- (a simple command: interp's rule)
 			EF.cur_cline = st.cline or st.line
 		end -- for $LINENO (compile-time constant)
