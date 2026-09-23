@@ -2780,6 +2780,9 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs)
 		if term ~= "}" then
 			error("syntax error: unexpected end of file")
 		end
+		if #stmts == 0 then
+			error("syntax error near `}'") -- (`f() { }`: bash)
+		end
 		return stmts
 	end
 
@@ -3261,6 +3264,9 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs)
 			if t1 ~= "do" then
 				error(t1 == nil and "syntax error: unexpected end of file" or ("syntax error: `" .. kind .. "' expected `do'"))
 			end
+			if #cond == 0 then
+				error("syntax error near `do'") -- (an empty condition: bash)
+			end
 			local body_stmts, t2 = parse_stmts({ done = true })
 			if t2 ~= "done" then
 				error(t2 == nil and "syntax error: unexpected end of file" or ("syntax error: `" .. kind .. "' expected `done'"))
@@ -3285,7 +3291,10 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs)
 			i = i + 2
 			local clauses = {}
 			while true do
-				local cond = parse_stmts({ ["then"] = true })
+				local cond, ct = parse_stmts({ ["then"] = true })
+				if #cond == 0 and ct == "then" then
+					error("syntax error near `then'") -- (an empty condition: bash)
+				end
 				local body, term = parse_stmts({ elif = true, ["else"] = true, fi = true })
 				if #body == 0 then
 					error(term and ("syntax error near `" .. term .. "'") or "syntax error: unexpected end of file")
@@ -3478,6 +3487,9 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs)
 			if term ~= "}" then
 				error("syntax error: unexpected end of file")
 			end -- unclosed { }
+			if #body == 0 then
+				error("syntax error near `}'") -- (`{ }`: bash)
+			end
 			local redirs = {}
 			while true do
 				ws()
@@ -4525,8 +4537,11 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs)
 					+ (((src:match("(\\*)$") or ""):len() % 2 == 1) and 1 or 0) -- (a trailing `\` continues)
 			end
 		end
-		if lg and lg.perr and lg.perr.text == nil and i <= n then
-			local p = src:sub(i, i) == "\n" and i - 1 or i
+		-- (the line is shown for an unexpected token even when that token ended the input)
+		if lg and lg.perr and lg.perr.text == nil and n > 0 and (i <= n
+			or not tostring(lg.perr.msg or ""):find("unexpected end of file", 1, true)) then
+			local p = math.min(i, n)
+			p = src:sub(p, p) == "\n" and p - 1 or p
 			local b = p
 			while b > 1 and src:sub(b - 1, b - 1) ~= "\n" do
 				b = b - 1
