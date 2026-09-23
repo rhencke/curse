@@ -150,12 +150,25 @@ local function arith(src, nodefer)
 		skip()
 		local ns = i
 		local nm = ident()
+		if nodefer == "expanded" and starts("[") then
+			-- already-expanded text (bash's EXP_EXPANDED): the subscript runs to the LAST `]`
+			-- (`assoc[]]`, `assoc[x],b[$(…)]` take the key literally, nothing re-expands)
+			local close = src:match(".*()%]")
+			if close and close > i then
+				local raw = src:sub(i + 1, close - 1)
+				i = close + 1
+				local ok, idx = pcall(arith, raw, "expanded")
+				return nm, (ok and idx) or nil, raw
+			end
+		end
 		if starts("[") then
 			local rs = i + 1
 			local depth, j = 1, i + 1
 			while j <= n and depth > 0 do
 				local ch = src:sub(j, j)
-				if ch == "[" then
+				if ch == "\\" then
+					j = j + 1 -- (an escaped char, e.g. a quoted `\]` in an expanded key)
+				elseif ch == "[" then
 					depth = depth + 1
 				elseif ch == "]" then
 					depth = depth - 1
@@ -223,7 +236,7 @@ local function arith(src, nodefer)
 			return { k = "un", op = "~", e = primary() }
 		end
 		if c == "$" then
-			if nodefer == "strict" then -- already-expanded text: a `$` left in it is just bad
+			if nodefer == "strict" or nodefer == "expanded" then -- already-expanded text: a `$` left in it is just bad
 				aerr("syntax error: operand expected")
 			end
 			i = i + 1
@@ -1398,6 +1411,8 @@ local function parse_word(w)
 end
 M.parse_word = parse_word
 M.scan_cmdsub = scan_cmdsub
+M.scan_braces = scan_braces
+M.grab_dparen = grab_dparen
 
 -- Memoize the runtime-facing parsers. The interpreter re-parses the SAME arith
 -- expressions and words on every loop iteration — $(( … )), array subscripts,
@@ -1412,7 +1427,7 @@ do
 	local aimpl = arith
 	arith = function(src, nodefer)
 		if type(src) == "string" then
-			local key = (nodefer == "strict" and "\2" or nodefer and "\1" or "\0") .. src
+			local key = (nodefer == "expanded" and "\3" or nodefer == "strict" and "\2" or nodefer and "\1" or "\0") .. src
 			local hit = acache[key]
 			if hit ~= nil then
 				return hit
@@ -3652,11 +3667,27 @@ local function make_parser(src, sh, aenv, noalias, posix, line0)
 			local p = i + #name
 			local subidx = nil
 			if src:sub(p, p) == "[" then
-				-- find the MATCHING ] (subscript may contain nested [ ] via ${a[i]})
+				-- find the MATCHING ] (subscript may contain nested [ ] via ${a[i]}); quoted
+				-- text and escapes don't count (`A[']']=10` has the key `]`)
 				local depth, q = 1, p + 1
 				while q <= n and depth > 0 do
 					local ch = src:sub(q, q)
-					if ch == "[" then
+					if ch == "\\" then
+						q = q + 1
+					elseif ch == "'" then
+						q = (src:find("'", q + 1, true) or n)
+					elseif ch == '"' then
+						local e = q + 1
+						while e <= n and src:sub(e, e) ~= '"' do
+							e = e + (src:sub(e, e) == "\\" and 2 or 1)
+						end
+						q = e
+					elseif ch == "$" and src:sub(q + 1, q + 1) == "(" then
+						local ok, nq = pcall(scan_cmdsub, src, q + 2)
+						q = ok and nq - 1 or q
+					elseif ch == "$" and src:sub(q + 1, q + 1) == "{" then
+						q = scan_braces(src, q + 1) - 1
+					elseif ch == "[" then
 						depth = depth + 1
 					elseif ch == "]" then
 						depth = depth - 1

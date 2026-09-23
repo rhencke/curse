@@ -15,80 +15,169 @@ local array_key, sh_printf, fd_getc, fd_ready, read_split =
 	I.array_key, I.sh_printf, I.fd_getc, I.fd_ready, I.read_split
 local do_arrayassign, eval, fmt_decl, fmt_set_var = I.do_arrayassign, I.eval, I.fmt_decl, I.fmt_set_var
 local C, P = I.C, I.P
+pcall(ffi.cdef, "long curse_mf_lseek(int fd, long off, int whence) asm(\"lseek\");")
 
 return function(sh, cmd, args, hook, tcb)
 	if cmd == "mapfile" or cmd == "readarray" then
-		-- mapfile [-t] [-d delim] [ARRAY]: read stdin lines into ARRAY (default MAPFILE)
-		local strip, arr, j, dch = false, "MAPFILE", 2, "\n"
-		local nmax, origin, skip = nil, nil, 0
+		-- a port of bash's builtins/mapfile.def: mapfile [-d delim] [-n count] [-O origin]
+		-- [-s count] [-t] [-u fd] [-C callback [-c quantum]] [array]
+		local function berr(msg, code)
+			io.stderr:write("curse: " .. cmd .. ": " .. msg .. "\n")
+			sh.status = code or 1
+		end
+		local function legal(v)
+			return v and v:match("^%s*[+-]?%d+%s*$") and tonumber(v) or nil
+		end
+		local fd, lines, origin, nskip, quantum, callback = 0, 0, 0, 0, 5000, nil
+		local clear, chop, dch = true, false, "\n"
+		local j = 2
 		while args[j] do
 			local a = args[j]
-			if a == "-t" then
-				strip = true
+			if a == "--" then
 				j = j + 1
-			elseif a == "-d" then
-				dch = (args[j + 1] or "\n"):sub(1, 1)
-				if dch == "" then
-					dch = "\0"
+				break
+			end
+			if a:sub(1, 1) ~= "-" or #a < 2 then
+				break
+			end
+			local k = 2
+			while k <= #a do
+				local o = a:sub(k, k)
+				if o == "t" then
+					chop = true
+					k = k + 1
+				elseif o:match("[dunOCcs]") then
+					local v = a:sub(k + 1)
+					if v == "" then
+						j = j + 1
+						v = args[j]
+						if v == nil then
+							berr("-" .. o .. ": option requires an argument", 2)
+							io.stderr:write(cmd .. ": usage: " .. cmd .. " [-d delim] [-n count] [-O origin] [-s count] [-t] [-u fd] [-C callback] [-c quantum] [array]\n")
+							return
+						end
+					end
+					local n = legal(v)
+					if o == "d" then
+						dch = v:sub(1, 1)
+						if dch == "" then
+							dch = "\0"
+						end
+					elseif o == "u" then
+						if not n or n < 0 then
+							return berr(v .. ": invalid file descriptor specification")
+						end
+						if C.fcntl(n, 1) == -1 then -- F_GETFD
+							return berr(n .. ": invalid file descriptor: Bad file descriptor")
+						end
+						fd = n
+					elseif o == "n" then
+						if not n or n < 0 then
+							return berr(v .. ": invalid line count")
+						end
+						lines = n
+					elseif o == "O" then
+						if not n or n < 0 then
+							return berr(v .. ": invalid array origin")
+						end
+						origin, clear = n, false
+					elseif o == "C" then
+						callback = v
+					elseif o == "c" then
+						if not n or n <= 0 then
+							return berr(v .. ": invalid callback quantum")
+						end
+						quantum = n
+					elseif o == "s" then
+						if not n or n < 0 then
+							return berr(v .. ": invalid line count")
+						end
+						nskip = n
+					end
+					k = #a + 1
+				else
+					berr("-" .. o .. ": invalid option", 2)
+					io.stderr:write(cmd .. ": usage: " .. cmd .. " [-d delim] [-n count] [-O origin] [-s count] [-t] [-u fd] [-C callback] [-c quantum] [array]\n")
+					return
 				end
-				j = j + 2
-			elseif a == "-n" then
-				nmax = tonumber(args[j + 1]) or 0
-				j = j + 2 -- read at most N
-			elseif a == "-O" then
-				origin = tonumber(args[j + 1]) or 0
-				j = j + 2 -- store from index N (keep the rest)
-			elseif a == "-s" then
-				skip = tonumber(args[j + 1]) or 0
-				j = j + 2 -- discard the first N
-			elseif a == "-u" or a == "-c" or a == "-C" then
-				j = j + 2
-			elseif a:sub(1, 1) == "-" and #a > 1 then
-				j = j + 1
-			else
+			end
+			j = j + 1
+		end
+		local arr = args[j] or "MAPFILE"
+		if arr == "" then
+			return berr("empty array variable name", 2)
+		end
+		if not arr:match("^[%a_][%w_]*$") then
+			return berr("`" .. arr .. "': not a valid identifier")
+		end
+		if sh:is_assoc(arr) then
+			return berr(arr .. ": not an indexed array")
+		end
+		-- Lines come off `fd` one at a time, leaving the rest unread for whoever reads next
+		-- (bash's zgetline): a seekable fd reads ahead in chunks then seeks back to just past
+		-- the last line taken; a pipe reads unbuffered. A pipeline stage yields while blocked.
+		local seekable = C.curse_mf_lseek(fd, 0, 1) >= 0
+		local buf, bpos, eof = "", 1, false
+		local rbuf = ffi.new("char[?]", seekable and 65536 or 1)
+		local consumed = 0 -- bytes handed out (to seek back to on a seekable fd)
+		local function getline()
+			while true do
+				local e = buf:find(dch, bpos, true)
+				if e then
+					local l = buf:sub(bpos, e)
+					consumed = consumed + (e - bpos + 1)
+					bpos = e + 1
+					return l
+				end
+				if eof then
+					if bpos <= #buf then
+						local l = buf:sub(bpos)
+						consumed = consumed + #l
+						bpos = #buf + 1
+						return l
+					end
+					return nil
+				end
+				rt.co_block(fd, 1)
+				local nr = tonumber(C.read(fd, rbuf, seekable and 65536 or 1))
+				if not nr or nr <= 0 then
+					eof = true
+				else
+					buf = buf:sub(bpos) .. ffi.string(rbuf, nr)
+					bpos = 1
+				end
+			end
+		end
+		local start = seekable and C.curse_mf_lseek(fd, 0, 1) or 0
+		for _ = 1, nskip do
+			if not getline() then
 				break
 			end
 		end
-		if args[j] then
-			arr = args[j]
+		if clear then
+			sh:array_assign(arr, {}, false)
 		end
-		-- Read ALL of fd 0 (mapfile consumes to EOF; -n/-s apply afterwards), in raw
-		-- unbuffered chunks: C stdio would keep bytes of THIS stdin buffered for whoever
-		-- reads fd 0 next (a pipeline swaps fd 0 per stage), and a blocking read inside a
-		-- pipeline stage must yield instead of stalling the stage that feeds it.
-		local chunks, rbuf = {}, ffi.new("char[65536]")
+		local idx, count = origin, 1
 		while true do
-			rt.co_block(0, 1)
-			local nr = tonumber(C.read(0, rbuf, 65536))
-			if not nr or nr <= 0 then
+			local l = getline()
+			if l == nil then
 				break
 			end
-			chunks[#chunks + 1] = ffi.string(rbuf, nr)
-		end
-		local data, all, pos = table.concat(chunks), {}, 1
-		while pos <= #data do
-			local e = data:find(dch, pos, true)
-			if not e then
-				all[#all + 1] = data:sub(pos)
+			if chop and l:sub(-1) == dch then
+				l = l:sub(1, -2)
+			end
+			if callback and count % quantum == 0 then
+				rt.eval(sh, { "eval", callback .. " " .. idx .. " " .. sq(l) })
+			end
+			sh:array_set(arr, idx, l, false)
+			idx = idx + 1
+			count = count + 1
+			if lines ~= 0 and count > lines then
 				break
 			end
-			all[#all + 1] = strip and data:sub(pos, e - 1) or data:sub(pos, e)
-			pos = e + 1
 		end
-		-- -s skips leading items; -n caps the count taken after the skip.
-		local lines = {}
-		for k = skip + 1, #all do
-			if nmax and nmax > 0 and #lines >= nmax then
-				break
-			end
-			lines[#lines + 1] = all[k]
-		end
-		if origin then -- -O: overwrite from `origin`, leaving earlier elements intact
-			for k, ln in ipairs(lines) do
-				sh:array_set(arr, origin + k - 1, ln, false)
-			end
-		else
-			sh:array_assign(arr, lines, false)
+		if seekable then
+			C.curse_mf_lseek(fd, start + consumed, 0) -- (the unread rest stays for the next reader)
 		end
 		sh.status = 0
 	end

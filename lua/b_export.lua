@@ -440,10 +440,10 @@ return function(sh, cmd, args, hook, tcb)
 							)
 							allok = false
 						end
-					elseif iattr then
+					elseif iattr and not ((assoc or aattr) and cmd ~= "readonly") then
 						sh.vars[a] = sh.vars[a] or {}
 						sh.vars[a].int = true
-					elseif lattr or uattr or cattr then
+					elseif (lattr or uattr or cattr) and not ((assoc or aattr) and cmd ~= "readonly") then
 						sh.vars[a] = sh.vars[a] or {}
 						sh.vars[a].lower = lattr or nil
 						sh.vars[a].upper = uattr or nil
@@ -494,6 +494,14 @@ return function(sh, cmd, args, hook, tcb)
 						sh.vars[a] = sh.vars[a] or {}
 					end -- `declare x` (or `readonly -a/-A` with no value) creates a declared-but-unset var
 					local bb = sh.vars[sh:deref(a)]
+					if bb and (assoc or aattr) and cmd ~= "readonly" and not nref then -- (`declare -Ai`: both)
+						if iattr then
+							bb.int = true
+						end
+						if lattr or uattr or cattr then
+							bb.lower, bb.upper, bb.cap = lattr or nil, uattr or nil, cattr or nil
+						end
+					end
 					if roattr and bb and not nref then
 						bb.ro = true
 					end -- bash ignores -r when -n is given

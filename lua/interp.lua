@@ -699,8 +699,59 @@ end
 
 -- bash's textual path for arithmetic with expansions: expand the raw text, then parse
 -- the RESULT as plain arithmetic (a `$` left in it is an error). Shared by both tiers.
+-- bash's expand_arith_string: the text is expanded as if double-quoted, but quote
+-- characters and backslashes stay as they are (a `\` still stops the `$` after it from
+-- expanding: `(( '\$(cmd)' ))` runs nothing); `"` drops. Each $…/`…` expansion is
+-- substituted as literal text.
+local function arith_expand_text(sh, raw)
+	local out, k, n, depth = {}, 1, #raw, 0
+	while k <= n do
+		local c = raw:sub(k, k)
+		if c == "\\" then
+			out[#out + 1] = raw:sub(k, k + 1)
+			k = k + 2
+		elseif c == '"' then
+			k = k + 1
+		elseif c == "[" or c == "]" then -- (subscript depth, for the quoting below)
+			depth = math.max(0, depth + (c == "[" and 1 or -1))
+			out[#out + 1] = c
+			k = k + 1
+		elseif c == "$" or c == "`" then
+			local e
+			local nx = raw:sub(k + 1, k + 1)
+			if c == "`" then
+				e = raw:find("`", k + 1, true) or n
+			elseif raw:sub(k + 1, k + 2) == "((" then
+				local _, ni = P.grab_dparen(raw, k + 3)
+				e = ni - 1
+			elseif nx == "(" then
+				local ok, ni = pcall(P.scan_cmdsub, raw, k + 2)
+				e = ok and ni - 1 or n
+			elseif nx == "{" then
+				e = P.scan_braces(raw, k + 1) - 1
+			else
+				e = select(2, raw:find("^[%a_][%w_]*", k + 1)) or (nx:match("^[%d@*#?$!%-]$") and k + 1) or k
+			end
+			local chunk = raw:sub(k, e)
+			local v = e > k and expand_word(sh, P.parse_word('"' .. chunk .. '"')) or chunk
+			-- inside a SUBSCRIPT an expansion's value is backslash-quoted against
+			-- re-evaluation, as bash does for ] [ $ ` \ " ' ~ (`(( a[$k]++ ))` keys the
+			-- literal text of $k); at top level `(( $expr ))` re-reads it as arithmetic
+			if depth > 0 and e > k then
+				v = v:gsub("[%]%[%$`\\\"'~]", "\\%0")
+			end
+			out[#out + 1] = v
+			k = e + 1
+		else
+			local e = (raw:find('[\\"$`%[%]]', k) or (n + 1)) - 1
+			out[#out + 1] = raw:sub(k, e)
+			k = e + 1
+		end
+	end
+	return table.concat(out)
+end
 function M.arith_textual_eval(sh, raw)
-	local text = expand_word(sh, P.parse_word(raw))
+	local text = arith_expand_text(sh, raw)
 	local pok, ast = pcall(P.arith, text, "strict")
 	if not pok then -- the EXPANDED text isn't valid arithmetic: an arith error (bash), not a crash
 		io.stderr:write("curse: " .. P.arith_errmsg(text, ast) .. "\n")
@@ -1013,13 +1064,25 @@ arith_key = function(sh, name, idxexpr, idxraw)
 	-- expanded and quote-removed), NOT an arith expression: `A[K]` -> key "K",
 	-- `A[$k]` -> the value of k, `A['x']` -> "x". Reuse the normal key resolver.
 	if sh:is_assoc(name) then
+		if sh.arith_expanded then -- (already-expanded text, e.g. a [[ -eq ]] operand: the key
+			return idxraw or "" -- is taken literally — bash's EXP_EXPANDED)
+		end
 		return array_key(sh, name, idxraw or "")
 	end
+	-- (bash evaluates a subscript with this_command_name cleared: no `((: ` in its errors)
+	local sv = P.arith_cmd
+	P.arith_cmd = nil
 	if idxexpr == nil then -- a non-arith subscript (e.g. quoted) on a NON-assoc array
 		io.stderr:write("curse: " .. P.arith_errmsg(idxraw or "", select(2, pcall(P.arith, idxraw or ""))) .. "\n")
+		P.arith_cmd = sv
 		error({ __curse_exit = 1, __curse_matherr = true, __curse_experr = true })
 	end
-	return rt.to_arr_key(eval(sh, idxexpr))
+	local ok, v = pcall(eval, sh, idxexpr)
+	P.arith_cmd = sv
+	if not ok then
+		error(v, 0)
+	end
+	return rt.to_arr_key(v)
 end
 
 -- Resolve an array subscript to a key: a string (word-expanded) for an
@@ -1035,6 +1098,8 @@ array_key = function(sh, name, index_raw)
 	if index_raw:match("^%s*$") then
 		return 0
 	end
+	local sv = P.arith_cmd
+	P.arith_cmd = nil -- (a subscript's errors carry no command name: bash)
 	local ok, v = pcall(function()
 		return rt.to_arr_key(eval(sh, P.arith(index_raw)))
 	end)
@@ -1042,9 +1107,11 @@ array_key = function(sh, name, index_raw)
 		if not (type(v) == "table" and v.__curse_matherr) then -- (an eval error already said so)
 			io.stderr:write("curse: " .. P.arith_errmsg(index_raw, v) .. "\n")
 		end
+		P.arith_cmd = sv
 		-- an expansion error discards the rest of the top-level line (bash jump_to_top_level)
 		error({ __curse_exit = 1, __curse_lineabort = true })
 	end
+	P.arith_cmd = sv
 	return v
 end
 
@@ -1228,9 +1295,10 @@ local function expand_part_str(sh, p, assign)
 			arg = pe.arg and (patmode and expand_pattern or expand_word)(sh, P.parse_word(pe.arg), true) or nil
 		end
 		local arg2 = pe.arg2 and expand_word(sh, P.parse_word(pe.arg2)) or nil
-		if pe.op == "sub" then -- ${v:off:len}: offset/length are arithmetic expressions
-			arg = arg and tostring(arith_int(sh, arg) or 0) or nil
-			arg2 = arg2 and tostring(arith_int(sh, arg2) or 0) or nil
+		if pe.op == "sub" then -- ${v:off:len}: offset/length are arithmetic expressions,
+			-- expanded the arithmetic way (bash: `${s:A[$k]}` quotes $k inside the subscript)
+			arg = pe.arg and tostring(arith_int(sh, arith_expand_text(sh, pe.arg)) or 0) or nil
+			arg2 = pe.arg2 and tostring(arith_int(sh, arith_expand_text(sh, pe.arg2)) or 0) or nil
 		elseif not TESTOP[pe.op] then
 			-- a word-initial ~ in a pattern / replacement expands (${p//~/z}, ${p#~/x})
 			if type(arg) == "string" then
@@ -3958,7 +4026,7 @@ end
 -- Evaluate an expression STRING (a value re-read as arithmetic): a parse error is a shell
 -- arith error (fails the command), never a raw Lua error out of compiled code.
 function M.arith_eval_str(sh, s)
-	local ok, ast = pcall(P.arith, s == "" and "0" or s)
+	local ok, ast = pcall(P.arith, s == "" and "0" or s, sh.arith_expanded and "expanded" or nil)
 	if not ok then
 		io.stderr:write("curse: " .. P.arith_errmsg(s, ast) .. "\n")
 		error({ __curse_exit = 1, __curse_matherr = true, __curse_experr = true })
@@ -3966,10 +4034,11 @@ function M.arith_eval_str(sh, s)
 	return eval(sh, ast)
 end
 function M.dbracket_arith(sh, s)
-	local sv = P.arith_cmd
+	local sv, sx = P.arith_cmd, sh.arith_expanded
 	P.arith_cmd = "[["
+	sh.arith_expanded = true -- (the operand was expanded already: subscripts aren't again)
 	local ok, v = pcall(M.arith_eval_str, sh, s)
-	P.arith_cmd = sv
+	P.arith_cmd, sh.arith_expanded = sv, sx
 	if not ok then
 		error(v, 0)
 	end
