@@ -5454,7 +5454,20 @@ H.forin = function(cx, st, after)
 		end
 	end
 	flush_run()
-	parts[#parts + 1] = ("sh.forstate[%d] = {list=__l, idx=0}"):format(st.id)
+	-- The loop state lives in a LOCAL of this function activation (a recursive call, or a
+	-- $( … ) fragment running a loop with the same id, must not clobber it), published in
+	-- sh.forstate[id] for an OSR entry — which adopts it (below). Capped: a function has
+	-- only so many Lua locals.
+	cx.forlocals = cx.forlocals or {}
+	local fsl = #cx.forlocals < 48 and ("__fs" .. st.id) or nil
+	if fsl and not cx.forlocals[fsl] then
+		cx.forlocals[#cx.forlocals + 1] = fsl
+		cx.forlocals[fsl] = true
+	end
+	parts[#parts + 1] = fsl and ("%s = {list=__l, idx=0}; sh.forstate[%d] = %s"):format(fsl, st.id, fsl)
+		or ("sh.forstate[%d] = {list=__l, idx=0}"):format(st.id)
+	local getfs = fsl and ("local fs = %s or sh.forstate[%d]; %s = fs"):format(fsl, st.id, fsl)
+		or ("local fs = sh.forstate[%d]"):format(st.id)
 	cx.blocks[initp] = table.concat(parts, "; ") .. ("; pc = %d"):format(advp)
 	if EF.has_attr then -- a readonly loop variable: bash reports it and runs no iteration
 		cx.blocks[initp] = ("if rt.for_var_ro(sh, %q) then pc = %d else %s end"):format(st.name, after, cx.blocks[initp])
@@ -5463,8 +5476,8 @@ H.forin = function(cx, st, after)
 	-- (a nameref program: rt.for_assign re-points a nameref loop variable, and a failed
 	-- assignment — a bad target — ends the loop with status 1)
 	if EF.has_nameref then
-		cx.blocks[advp] = ("local fs = sh.forstate[%d]; fs.idx = fs.idx + 1; if fs.idx > #fs.list then pc = %d elseif not rt.for_assign(sh, %q, fs.list[fs.idx]) then sh.status = 1; pc = %d else %spc = %d end"):format(
-			st.id,
+		cx.blocks[advp] = ("%s; fs.idx = fs.idx + 1; if fs.idx > #fs.list then pc = %d elseif not rt.for_assign(sh, %q, fs.list[fs.idx]) then sh.status = 1; pc = %d else %spc = %d end"):format(
+			getfs,
 			after,
 			st.name,
 			after,
@@ -5472,8 +5485,8 @@ H.forin = function(cx, st, after)
 			bodyentry
 		)
 	else
-		cx.blocks[advp] = ("local fs = sh.forstate[%d]; fs.idx = fs.idx + 1; if fs.idx > #fs.list then pc = %d else sh:set_str(%q, fs.list[fs.idx]); %spc = %d end"):format(
-			st.id,
+		cx.blocks[advp] = ("%s; fs.idx = fs.idx + 1; if fs.idx > #fs.list then pc = %d else sh:set_str(%q, fs.list[fs.idx]); %spc = %d end"):format(
+			getfs,
 			after,
 			st.name,
 			dbg(st),
@@ -6763,6 +6776,7 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
 		loopPc = cx.loopPc,
 		stmtPc = cx.stmtPc,
 		loopvars = cx.loopvars,
+		forlocals = cx.forlocals,
 	}
 end
 
@@ -6779,6 +6793,9 @@ assemble = function(cfg, sig, opts)
 	-- fn_x / cs_N body): rt's error prefix reads it off the stack to find the line
 	if not opts.toplevel then
 		o[#o + 1] = ("  local pc = %d"):format(cfg.entry)
+	end
+	if cfg.forlocals and #cfg.forlocals > 0 then -- (this activation's for-in loop states)
+		o[#o + 1] = "  local " .. table.concat(cfg.forlocals, ", ")
 	end
 	-- register compiled function closures into sh.functions so the interpreter
 	-- (reached via delegation) can call them too — full interp/compiled interop.

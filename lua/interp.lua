@@ -6122,12 +6122,14 @@ exec_stmt = function(sh, st, hook)
 		if rt.for_var_ro(sh, st.name) then
 			return
 		end
-		sh.forstate[st.id] = { list = list, idx = 0 }
+		-- (this activation's state: a recursive call re-running this loop must not clobber
+		-- it; republished before each OSR point, so a switch resumes THIS loop)
+		local fs = { list = list, idx = 0 }
 		local bodystatus = 0
 		sh.loopdepth = (sh.loopdepth or 0) + 1
 		while true do
+			sh.forstate[st.id] = fs
 			hook("loop", st.id)
-			local fs = sh.forstate[st.id]
 			fs.idx = fs.idx + 1
 			if fs.idx > #fs.list then
 				break
