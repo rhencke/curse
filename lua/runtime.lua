@@ -1282,6 +1282,9 @@ function Shell:exec_script_child(path, args, n)
 	-- self, so a non-exported `x=1; ./script` doesn't leak x into the script.
 	local child = Shell.new()
 	child.argv0, child.out = args[1], io.write
+	-- (bash's reinitialized no-#! child resets its shopt options, all but globskipdots,
+	-- which reset_shopt_options leaves as the parent had it)
+	child.shopt.globskipdots = self.shopt.globskipdots
 	M.startup_ignored(child) -- a new shell: what's ignored now stays ignored
 	if child.fimports then
 		M.import_functions(child)
@@ -4806,6 +4809,26 @@ function Shell:array_indices(name)
 	end
 	local b = self.vars[self:deref(name)]
 	if b and b.assoc then
+		return M.assoc_keys(b)
+	end
+	if b and b.arr then
+		local t = {}
+		for k in pairs(b.arr) do
+			t[#t + 1] = k
+		end
+		table.sort(t, function(a, z)
+			return key_i64(a) < key_i64(z)
+		end)
+		return t -- int64 order (mixed number/string keys)
+	end
+	if b and (b.s ~= nil or b.n ~= nil) then
+		return { 0 }
+	end
+	return {}
+end
+-- an assoc box's keys in bash's hash-table order (see assoc_bucket)
+function M.assoc_keys(b)
+	do
 		local live = {}
 		for idx, k in ipairs(b.order) do
 			if b.arr[k] ~= nil then
@@ -4825,20 +4848,6 @@ function Shell:array_indices(name)
 		end
 		return t
 	end
-	if b and b.arr then
-		local t = {}
-		for k in pairs(b.arr) do
-			t[#t + 1] = k
-		end
-		table.sort(t, function(a, z)
-			return key_i64(a) < key_i64(z)
-		end)
-		return t -- int64 order (mixed number/string keys)
-	end
-	if b and (b.s ~= nil or b.n ~= nil) then
-		return { 0 }
-	end
-	return {}
 end
 function Shell:array_values(name)
 	if VIRT_ARR[name] then

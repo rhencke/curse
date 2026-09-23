@@ -51,8 +51,11 @@ if [ "${1:-}" = --run-unit ]; then
     case "$sh" in
       # stdin < /dev/null so a `read`/`select` with no input gets EOF instead of
       # blocking (which, in the daemon, would hang a persistent worker until timeout).
-      bash)  ( cd "$cwd" && THIS_SH=bash timeout "$H_TIMEOUT" bash "$runscript" </dev/null ) ;;
-      dash)  ( cd "$cwd" && THIS_SH=dash timeout "$H_TIMEOUT" dash "$runscript" </dev/null ) ;;
+      # THIS_SH is the shell's full path, as bash's own suite runs it: tests copy it
+      # (`cp ${THIS_SH} $TMPDIR/sh`) and write it into `#!${THIS_SH}` lines, which a bare
+      # name can't satisfy — the oracle would fail those checks by itself.
+      bash)  ( cd "$cwd" && THIS_SH="$(command -v bash)" timeout "$H_TIMEOUT" bash "$runscript" </dev/null ) ;;
+      dash)  ( cd "$cwd" && THIS_SH="$(command -v dash)" timeout "$H_TIMEOUT" dash "$runscript" </dev/null ) ;;
       # curse via the resident daemon: the C client hands the script to cursed, which
       # tiers on a cache miss (interp -> OSR + store .bc) or loads the .bc on a hit.
       # THIS_SH=client so bash-suite self-reinvokes hit the daemon too; fallback fails

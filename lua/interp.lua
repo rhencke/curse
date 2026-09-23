@@ -309,11 +309,7 @@ end
 -- `set` (no args) one-line rendering of a variable box.
 local function fmt_set_var(name, b)
 	if b.assoc and b.arr then
-		local keys = {}
-		for k in pairs(b.arr) do
-			keys[#keys + 1] = k
-		end
-		table.sort(keys)
+		local keys = rt.assoc_keys(b) -- (bash's hash order, as declare -p)
 		local parts = {}
 		for _, k in ipairs(keys) do
 			local kq = tostring(k):match("^[%w_]+$") and tostring(k) or ('"' .. tostring(k):gsub('"', '\\"') .. '"')

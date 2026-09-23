@@ -698,11 +698,20 @@ parse_paramexp = function(inner)
 	-- optional [subscript]
 	local index = nil
 	if rest:sub(1, 1) == "[" then
-		-- balance nested brackets so `${a[a[0]]}` takes `a[0]` as the subscript, not `a[0`
-		local depth, close = 0, nil
-		for k = 1, #rest do
+		-- balance nested brackets so `${a[a[0]]}` takes `a[0]` as the subscript, not `a[0`;
+		-- a quoted or escaped `]` doesn't close it (`${m["a]a"]}`, `${m[\]]}`)
+		local depth, close, k = 0, nil, 1
+		while k <= #rest do
 			local ch = rest:sub(k, k)
-			if ch == "[" then
+			if ch == "\\" then
+				k = k + 1
+			elseif (ch == "'" or ch == '"') and depth > 0 then
+				local e = rest:find(ch, k + 1, true)
+				while e and ch == '"' and rest:sub(e - 1, e - 1) == "\\" do
+					e = rest:find(ch, e + 1, true)
+				end
+				k = e or #rest
+			elseif ch == "[" then
 				depth = depth + 1
 			elseif ch == "]" then
 				depth = depth - 1
@@ -711,6 +720,7 @@ parse_paramexp = function(inner)
 					break
 				end
 			end
+			k = k + 1
 		end
 		if close then
 			index = rest:sub(2, close - 1)

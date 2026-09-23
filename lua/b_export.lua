@@ -27,6 +27,7 @@ return function(sh, cmd, args, hook, tcb)
 		local tattr, plust, plusr = false, false, false -- -t / +t: the function trace attribute
 		local funcnames, funcbody, iattr, lattr, uattr, rattr, aattr = false, false, false, false, false, false, false
 		local cattr = false -- declare -c: capitalize (first char upper, rest lower)
+		local plusattr, plusarr -- +i/+l/+u/+c; +a/+A (an array can't be made scalar)
 		local rest = {}
 		-- Valid attribute letters per command; any other letter is an invalid option
 		-- (bash: status 2, or 1 for `local`). export/readonly accept a narrower set.
@@ -106,6 +107,15 @@ return function(sh, cmd, args, hook, tcb)
 				end
 				if a:find("r") then
 					plusr = true
+				end
+				for ch in a:sub(2):gmatch("[iluc]") do -- +i/+l/+u/+c: drop that attribute
+					plusattr = plusattr or {}
+					plusattr[ch] = true
+				end
+				if a:find("A") then
+					plusarr = "A"
+				elseif a:find("a") then
+					plusarr = "a"
 				end
 			else
 				rest[#rest + 1] = a
@@ -310,6 +320,15 @@ return function(sh, cmd, args, hook, tcb)
 			end
 			local allok = true
 			for _, a in ipairs(rest) do
+				-- `declare -A c[200]` / `declare x[3]`: an element form with no value declares
+				-- the array itself (bash ignores the subscript)
+				local mkarr = false
+				if (cmd == "declare" or cmd == "typeset") and not a:find("=", 1, true) then
+					local base = a:match("^([%a_][%w_]*)%[.*%]$")
+					if base then
+						a, mkarr = base, true
+					end
+				end
 				-- exporting / readonly-ing a name bound by a command-prefix tempenv (`y=5 f`
 				-- with `export y` in f, `x=4 export x`) makes that binding PERMANENT (bash's
 				-- att_propagate): it isn't restored when the command ends, and isn't localized
@@ -574,6 +593,25 @@ return function(sh, cmd, args, hook, tcb)
 				else -- a token that isn't a valid name (`FOO-BAR`, `1x`, …): bash errors
 					io.stderr:write("curse: " .. cmd .. ": `" .. a .. "': not a valid identifier\n")
 					allok = false
+				end
+				do
+					local pname = a:match("^([%a_][%w_]*)")
+					local pb = pname and sh.vars[sh:deref(pname)]
+					if mkarr and pname and not assoc and not (pb and pb.arr) then
+						pb = pb or {}
+						pb.arr, pb.s, pb.n, pb.empty_decl = pb.arr or {}, nil, nil, true
+						sh.vars[sh:deref(pname)] = pb
+					end
+					if pb and plusattr then
+						pb.int = not plusattr.i and pb.int or nil
+						pb.lower = not plusattr.l and pb.lower or nil
+						pb.upper = not plusattr.u and pb.upper or nil
+						pb.cap = not plusattr.c and pb.cap or nil
+					end
+					if pb and plusarr and pb.arr and ((plusarr == "A") == (pb.assoc == true)) then
+						io.stderr:write("curse: " .. cmd .. ": " .. pname .. ": cannot destroy array variables in this way\n")
+						allok = false
+					end
 				end
 				::continue::
 			end
