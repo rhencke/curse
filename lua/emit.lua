@@ -3539,6 +3539,33 @@ analyze_lift = function(ast)
 	for n in pairs(NO_LIFT) do
 		disq[n] = true
 	end
+	-- Arithmetic TEXT the runtime evaluates on sh.vars (array subscripts, substring offsets,
+	-- `a[i]=` indices): a name in it is read — and may be written (`${a[n++]}`) — there,
+	-- behind any native local. Every identifier in such text stays in sh.
+	local function disq_text(t) -- (only text that can WRITE: ++, --, an assignment operator)
+		if type(t) == "string" and (t:find("++", 1, true) or t:find("--", 1, true)
+			or t:gsub("[=!<>]=", ""):find("=", 1, true) or t:find("[$`]")) then
+			for nm in t:gmatch("[%a_][%w_]*") do
+				disq[nm] = true
+			end
+		end
+	end
+	any_node(ast.stmts, function(n)
+		if n.t == "assign" or n.t == "arrayassign" then
+			disq_text(n.index)
+		end
+		if n.pexp then
+			disq_text(n.pexp.index)
+			if n.pexp.op == "sub" then
+				disq_text(n.pexp.arg)
+				disq_text(n.pexp.arg2)
+			end
+		end
+		if n.key ~= nil then -- (an array literal's `[k]=` element)
+			disq_text(n.key)
+		end
+		return false
+	end)
 	-- A trap's action runs through the interpreter, on sh.vars, at points the compiled code
 	-- can't see (a signal mid-loop, DEBUG/ERR per command): whatever it names can't live in
 	-- a native local. An action that isn't a literal could name anything: lift nothing.
