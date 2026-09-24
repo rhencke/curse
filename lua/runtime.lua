@@ -5138,6 +5138,65 @@ function Shell:phys_cwd()
 	local p = ffi.C.getcwd(scratch, 4096)
 	return p ~= nil and ffi.string(p) or ""
 end
+-- The physical cwd, kept under a `//` root when the logical path LOGICAL has one
+-- (bash's sh_physpath preserves exactly two leading slashes: `cd -P //; pwd -P`).
+function M.phys_under(sh, logical)
+	local p = sh:phys_cwd()
+	if logical:byte(2) == 47 and logical:byte(1) == 47 and logical:byte(3) ~= 47 then
+		return "/" .. p
+	end
+	return p
+end
+-- Prompt \w / \W (bash's parse.y): \W is the basename (`/` stays `/`) unless $PWD is
+-- $HOME; otherwise a $HOME prefix at a path boundary becomes `~` (a HOME of `/` never
+-- does). Both then go through trim_pathname: keep any `~` prefix and the last
+-- $PROMPT_DIRTRIM components, the middle shown as `...` (never when that saves <= 3).
+function M.prompt_dir(sh, base)
+	local dir = sh:pwd()
+	local hb = sh.vars["HOME"]
+	local home = hb and hb.s
+	if base and dir ~= home then
+		if dir ~= "/" and dir ~= "//" then
+			dir = dir:gsub(".*/", "")
+		end
+	elseif home and #home > 1 and dir:sub(1, #home) == home then
+		local c = dir:byte(#home + 1)
+		if c == nil or c == 47 then
+			dir = "~" .. dir:sub(#home + 1)
+		end
+	end
+	local tb = sh.vars["PROMPT_DIRTRIM"]
+	local n = tb and tb.s and tonumber(tb.s:match("^%s*([+-]?%d+)%s*$"))
+	if not n or n <= 0 or dir == "" then
+		return dir
+	end
+	local b = 1 -- start of the trimmable part (after a `~user/` prefix)
+	if dir:byte(1) == 126 then
+		local sl = dir:find("/", 1, true)
+		b = sl and sl + 1 or #dir + 1
+	end
+	if b > #dir then
+		return dir
+	end
+	local _, ndirs = dir:sub(b):gsub("/", "")
+	if ndirs < n then
+		return dir
+	end
+	local t = dir:byte(#dir) == 47 and #dir + 1 or #dir
+	while t > b do
+		if dir:byte(t) == 47 then
+			n = n - 1
+			if n == 0 then
+				break
+			end
+		end
+		t = t - 1
+	end
+	if t == b or t - b <= 3 then
+		return dir
+	end
+	return dir:sub(1, b - 1) .. "..." .. dir:sub(t)
+end
 -- Logical current directory: the tracked $PWD (may keep a symlinked name), else
 -- the physical cwd. `pwd`, `cd`'s bookkeeping, tilde `~+` and prompts use this.
 function Shell:pwd()
@@ -9371,6 +9430,16 @@ function M.hostname()
 	end
 	return _hostname
 end
+-- promptvars (or posix): the decoded prompt is then expanded as if double-quoted, so
+-- text that comes from outside the prompt (\w, \W, \s, \h, \H, \D) is quoted for it —
+-- a directory named `$(cmd)` shows as such and never runs (bash's
+-- sh_backslash_quote_for_double_quotes).
+function M.prompt_expands(sh)
+	return sh.shopt.promptvars ~= false or sh.opt_posix
+end
+local function pq(sh, v)
+	return M.prompt_expands(sh) and (v:gsub('[$`"\\]', "\\%0")) or v
+end
 function Shell:prompt_escapes(s)
 	local out, i, n = {}, 1, #s
 	while i <= n do
@@ -9385,13 +9454,13 @@ function Shell:prompt_escapes(s)
 				["\\"] = "\\",
 				-- `\$` decodes to `\$` for a non-root user: the promptvars expansion that
 				-- follows removes the backslash (so `\\\$` -> `\` `\$` -> `\$`, as bash)
-				["$"] = (self:special_get("EUID") == "0" and "#" or "\\$"),
+				["$"] = (self:special_get("EUID") == "0" and "#" or M.prompt_expands(self) and "\\$" or "$"),
 				t = os.date("%H:%M:%S"),
 				T = os.date("%I:%M:%S"),
 				["@"] = os.date("%I:%M %p"),
 				A = os.date("%H:%M"),
 				d = os.date("%a %b %d"),
-				s = self.shellname or "bash",
+				s = pq(self, self.shellname or "bash"),
 				v = "5.2",
 				V = "5.2.37",
 				-- \! the history number of this command; \# the command number
@@ -9413,25 +9482,22 @@ function Shell:prompt_escapes(s)
 				local tn = C.isatty(0) == 1 and C.ttyname(0) or nil
 				out[#out + 1] = tn ~= nil and (ffi.string(tn):gsub(".*/", "")) or "tty"
 				i = i + 2
-			elseif d == "w" then
-				out[#out + 1] = self:pwd()
-				i = i + 2
-			elseif d == "W" then
-				out[#out + 1] = (self:pwd():gsub(".*/", ""))
+			elseif d == "w" or d == "W" then
+				out[#out + 1] = pq(self, M.prompt_dir(self, d == "W"))
 				i = i + 2
 			elseif d == "u" then
 				out[#out + 1] = os.getenv("USER") or "user"
 				i = i + 2
 			elseif d == "h" then
-				out[#out + 1] = M.hostname():gsub("%..*$", "")
+				out[#out + 1] = pq(self, (M.hostname():gsub("%..*$", "")))
 				i = i + 2
 			elseif d == "H" then
-				out[#out + 1] = M.hostname()
+				out[#out + 1] = pq(self, M.hostname())
 				i = i + 2
 			elseif d == "D" and s:sub(i + 2, i + 2) == "{" then -- \D{strftime}
 				local close = s:find("}", i + 3, true) or (#s + 1) -- (unclosed: the rest is the format)
 				local fmt = s:sub(i + 3, close - 1)
-				out[#out + 1] = os.date(fmt ~= "" and fmt or "%X")
+				out[#out + 1] = pq(self, os.date(fmt ~= "" and fmt or "%X"))
 				i = close + 1
 			elseif simple then
 				out[#out + 1] = simple

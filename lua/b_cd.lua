@@ -90,7 +90,8 @@ return function(sh, cmd, args, hook, tcb, as)
 			end
 		end
 		-- logical target: resolve . and .. against $PWD textually (unless -P)
-		local logical = logical_canon(dir:sub(1, 1) == "/" and dir or (prev .. "/" .. dir))
+		local logical = logical_canon(dir:sub(1, 1) == "/" and dir
+			or (prev:sub(-1) == "/" and prev .. dir or prev .. "/" .. dir))
 		-- bash chdir's the LITERAL operand first — this validates that every path
 		-- component really exists, so `cd nonexistent/..` is an error even though `..`
 		-- would textually cancel it. In logical mode it then moves to the canonicalized
@@ -107,7 +108,7 @@ return function(sh, cmd, args, hook, tcb, as)
 			C.chdir(logical)
 		end
 		sh.status = 0
-		local newpwd = physical and sh:phys_cwd() or logical
+		local newpwd = physical and rt.phys_under(sh, logical) or logical
 		sh:export_str("OLDPWD", prev)
 		sh:export_str("PWD", newpwd)
 		if print_dir then

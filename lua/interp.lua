@@ -1506,7 +1506,8 @@ M.tilde_prefix = tilde_prefix
 
 -- Canonicalize an absolute path string LOGICALLY: resolve `.`/`..` textually,
 -- without following symlinks (bash's default -L `cd` semantics — `..` pops the
--- previous name even when it is a symlink).
+-- previous name even when it is a symlink). Exactly two leading slashes survive
+-- (POSIX leaves `//` implementation-defined; bash keeps it, `///` is `/`).
 local function logical_canon(path)
 	local parts = {}
 	for seg in path:gmatch("[^/]+") do
@@ -1519,7 +1520,8 @@ local function logical_canon(path)
 			parts[#parts + 1] = seg
 		end
 	end
-	return "/" .. table.concat(parts, "/")
+	local root = (path:byte(2) == 47 and path:byte(3) ~= 47) and "//" or "/"
+	return root .. table.concat(parts, "/")
 end
 
 -- Assignment-RHS and word-initial tilde expansion also live in runtime.lua; interp
@@ -6477,14 +6479,14 @@ fire_err = function(sh)
 end
 M.fire_err_trap = fire_err_trap -- compiled tier fires ERR after a failing native command
 -- A prompt string (PS1/PS2/… and ${x@P}): decode the backslash escapes, then (promptvars)
--- expand $var/$(…)/`…`. Only re-parse when there IS an expansion: re-parsing otherwise eats
--- decoded backslashes (a kept unknown escape `\x55`, a lone `\`), which bash keeps.
+-- expand it as if double-quoted — $var/$(…)/`…`, `\` escaping only $ ` " \ (bash's
+-- Q_DOUBLE_QUOTES; a bare `"` is literal, so the heredoc-style body parse).
 M.prompt_string = function(sh, s)
 	local decoded = sh:prompt_escapes(s or "")
-	if not decoded:find("[$`]") then
+	if not decoded:find("[$`\\]") or not rt.prompt_expands(sh) then
 		return decoded
 	end
-	return expand_word(sh, P.parse_word(decoded))
+	return expand_word(sh, P.parse_heredoc(decoded, false, nil, true))
 end
 M.run_trap_str = function(sh, code) -- a late-forked subshell child runs its own EXIT trap
 	return run_trap(sh, code)

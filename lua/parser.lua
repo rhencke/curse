@@ -1284,7 +1284,11 @@ end
 
 -- Parse the inside of a "…" (everything is quoted): $ expansions + literals,
 -- honoring \$ \" \\ \` escapes.
-local function parse_dquote(inner, add, heredoc)
+-- heredoc: a heredoc body (`"` is ordinary, `\"` stays). bt_keep: a `\"` inside a
+-- `…` stays too — true for a heredoc body AND for a prompt string (bash expands both
+-- with Q_DOUBLE_QUOTES, which unwraps `\"` only in a real "…" word's backquotes).
+local function parse_dquote(inner, add, heredoc, bt_keep)
+	bt_keep = bt_keep or heredoc
 	local i = 1
 	while i <= #inner do
 		local c = inner:sub(i, i)
@@ -1311,12 +1315,13 @@ local function parse_dquote(inner, add, heredoc)
 			end or add, true)
 		elseif c == "`" then -- `cmd` command substitution inside "…"
 			-- within a backtick INSIDE double quotes, `\` also escapes `"` (unlike the
-			-- `$()` form) — bash unwraps `\"`→`"`, so `"`echo \"hi\"`"` runs `echo "hi"`.
+			-- `$()` form) — bash unwraps `\"`→`"`, so `"`echo \"hi\"`"` runs `echo "hi"`
+			-- (not in a heredoc body or a prompt: `\"` reaches the command as is).
 			local j, buf = i + 1, {}
 			while j <= #inner and inner:sub(j, j) ~= "`" do
 				if inner:sub(j, j) == "\\" and inner:sub(j + 1, j + 1) == "\n" then
 					j = j + 2 -- (backquotes drop a \<newline> too, even inside its '…' — POSIX)
-				elseif inner:sub(j, j) == "\\" and inner:sub(j + 1, j + 1):match('[`$\\"]') then
+				elseif inner:sub(j, j) == "\\" and inner:sub(j + 1, j + 1):match(bt_keep and "[`$\\]" or '[`$\\"]') then
 					buf[#buf + 1] = inner:sub(j + 1, j + 1)
 					j = j + 2
 				else
@@ -1576,14 +1581,14 @@ end
 -- `is_body` true for a real heredoc body (where " is an ordinary char, so `\"`
 -- stays literal); false/omitted for a double-quoted-context reuse (a quoted
 -- ${x-default} word), where `\"` escapes to " like inside "…".
-function M.parse_heredoc(body, is_body, aenv)
+function M.parse_heredoc(body, is_body, aenv, prompt)
 	local parts = {}
 	local saved, sprex = ALIAS_ENV, COMSUB_PREX
 	ALIAS_ENV = aenv -- its $(…) parts carry the heredoc line's static alias state
 	COMSUB_PREX = false
 	local ok, err = pcall(parse_dquote, body, function(p)
 		parts[#parts + 1] = p
-	end, is_body)
+	end, is_body, prompt)
 	ALIAS_ENV, COMSUB_PREX = saved, sprex
 	if not ok then
 		error(err, 0)

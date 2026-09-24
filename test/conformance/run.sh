@@ -56,9 +56,12 @@ if [ "${1:-}" = --run-unit ]; then
       # name can't satisfy — the oracle would fail those checks by itself.
       # (every shell gets the SAME environment as curse's run below — XDG_*, CURSE_FALLBACK
       # — or a test that lists it, `env | grep HOME`, would differ by the harness alone)
-      bash)  ( cd "$cwd" && XDG_RUNTIME_DIR="$H_XDG_RUNTIME" XDG_CACHE_HOME="$ucache" CURSE_FALLBACK="$H_FALLBACK" \
+      # TMP and HOME point into the unit's own cwd, as oil's spec runner provides $TMP:
+      # tests that `cd $TMP` or `cd ~` then create and delete files would otherwise
+      # race each other (and every shell) in the real home directory.
+      bash)  ( cd "$cwd" && TMP="$cwd" HOME="$cwd" XDG_RUNTIME_DIR="$H_XDG_RUNTIME" XDG_CACHE_HOME="$ucache" CURSE_FALLBACK="$H_FALLBACK" \
                  THIS_SH="$(command -v bash)" timeout "$H_TIMEOUT" bash "$runscript" </dev/null ) ;;
-      dash)  ( cd "$cwd" && XDG_RUNTIME_DIR="$H_XDG_RUNTIME" XDG_CACHE_HOME="$ucache" CURSE_FALLBACK="$H_FALLBACK" \
+      dash)  ( cd "$cwd" && TMP="$cwd" HOME="$cwd" XDG_RUNTIME_DIR="$H_XDG_RUNTIME" XDG_CACHE_HOME="$ucache" CURSE_FALLBACK="$H_FALLBACK" \
                  THIS_SH="$(command -v dash)" timeout "$H_TIMEOUT" dash "$runscript" </dev/null ) ;;
       # curse via the resident daemon: the C client hands the script to cursed, which
       # tiers on a cache miss (interp -> OSR + store .bc) or loads the .bc on a hit.
@@ -66,7 +69,7 @@ if [ "${1:-}" = --run-unit ]; then
       # loudly so a dropped daemon can't masquerade as dash. The daemon reads the
       # CLIENT's env per request, so $ucache (per-unit) selects the compile cache:
       # first curse run misses (cold), second hits (hot).
-      curse) ( cd "$cwd" && XDG_RUNTIME_DIR="$H_XDG_RUNTIME" XDG_CACHE_HOME="$ucache" \
+      curse) ( cd "$cwd" && TMP="$cwd" HOME="$cwd" XDG_RUNTIME_DIR="$H_XDG_RUNTIME" XDG_CACHE_HOME="$ucache" \
                  CURSE_FALLBACK="$H_FALLBACK" THIS_SH="$H_THIS_SH" \
                  timeout "$H_TIMEOUT" "$H_CLIENT" "$runscript" </dev/null ) ;;
     esac

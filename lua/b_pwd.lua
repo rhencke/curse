@@ -35,7 +35,7 @@ return function(sh, cmd, args, hook, tcb)
 		end
 		local out
 		if phys then
-			out = sh:phys_cwd()
+			out = rt.phys_under(sh, sh:pwd())
 		else
 			-- pwd -L (default): use $PWD only when it actually names the current directory
 			-- (an absolute path with the same dev+inode as "."); a lied-about `PWD=foo`
