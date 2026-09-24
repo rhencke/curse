@@ -2114,6 +2114,7 @@ local function add_word(words, w)
 		local step = r.a <= r.b and r.step or -r.step
 		local v = r.a
 		local nw = #words
+		local first = nw + 1
 		for k = 1, cnt do
 			local wd = INTWORD[v] -- (words are shared read-only, like the parse_word memo's)
 			if not wd then
@@ -2129,9 +2130,13 @@ local function add_word(words, w)
 			words[nw] = wd
 			v = v + step
 		end
+		if words[first] then
+			words[first].bx = { raw = w, n = cnt }
+		end
 		return
 	end
 	local n = 0
+	local first = #words + 1
 	stream_factors(factors, function(x)
 		-- (the source text belongs to the unexpanded word: the first expansion carries it,
 		-- the rest print nothing — `declare -f` shows `{a,b}` as written. A COPY: parsed
@@ -2145,6 +2150,33 @@ local function add_word(words, w)
 		n = n + 1
 		return n >= BRACE_CAP -- true -> stop the stream
 	end)
+	if words[first] then -- (`set +B` at run time: the n words go back to the one raw word)
+		words[first].bx = { raw = w, n = n }
+	end
+end
+-- A word list as parsed with brace expansion OFF (`set +B`, which bash consults at
+-- expansion time): each brace-expanded run collapses back to its one literal word.
+local unbraced = setmetatable({}, { __mode = "k" })
+function M.unbrace_words(words)
+	local u = unbraced[words]
+	if u then
+		return u
+	end
+	u = {}
+	local i = 1
+	while i <= #words do
+		local w = words[i]
+		if w.bx then
+			local pw = parse_word(w.bx.raw)
+			u[#u + 1] = { k = pw.k, parts = pw.parts, src = w.bx.raw, plain = pw.plain }
+			i = i + w.bx.n
+		else
+			u[#u + 1] = w
+			i = i + 1
+		end
+	end
+	unbraced[words] = u
+	return u
 end
 
 -- strip surrounding quotes from a raw shell word (subset: whole-word "…" or '…')
@@ -4279,7 +4311,7 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs)
 				if w.fresh then
 					w.plainarg = true
 				else
-					words[k] = { k = w.k, parts = w.parts, src = w.src, plainarg = true, plain = w.plain }
+					words[k] = { k = w.k, parts = w.parts, src = w.src, plainarg = true, plain = w.plain, bx = w.bx }
 				end
 			end
 		end

@@ -6270,6 +6270,7 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
 	-- subshell with that status (like `exit`), so it targets this — not the function's
 	-- DONE, which in the forked child would return PAST the subshell.
 	cx.subexit = {}
+	cx.bx_guarded = {} -- (statements already given their `set +B` guard)
 
 
 
@@ -6658,6 +6659,20 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
 			local p0 = cx.newpc()
 			cx.blocks[p0] = ("rt.time_push(sh); pc = %d"):format(cx.flatten_list({ inner }, pe))
 			return p0
+		end
+		-- a brace-expanded word list: `set +B` (checked at run time, like bash) runs the
+		-- statement through interp, whose expansion puts the raw words back
+		if (t == "simple" or t == "forin") and not cx.bx_guarded[st] then
+			for _, w in ipairs(st.words) do
+				if w.bx then
+					cx.bx_guarded[st] = true
+					local pn = cx.flatten_stmt(st, after)
+					local pd = cx.delegate(st, after)
+					local p = cx.newpc()
+					cx.blocks[p] = ("if sh.opt_B == false then pc = %d else pc = %d end"):format(pd, pn)
+					return p
+				end
+			end
 		end
 		-- break / continue [N]: a compile-time jump to the Nth enclosing loop's exit or
 		-- re-test point. Both set $?=0 (bash). Outside any loop it's a no-op. A

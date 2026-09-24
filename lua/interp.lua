@@ -4942,7 +4942,11 @@ local function expand_args(sh, st, args, is_assign)
 		sh.arrayref_args = nil -- (the previous command's: see rt.mark_arrayref)
 	end
 	local unset_cmd = is_assign == "unset"
-	for wi, w in ipairs(st.words) do
+	local words = st.words
+	if sh.opt_B == false then -- (`set +B`: no brace expansion)
+		words = P.unbrace_words(words)
+	end
+	for wi, w in ipairs(words) do
 		local p1 = w.parts[1]
 		local ref = unset_cmd and wi > 1 and unset_arrayref(sh, w)
 		if ref then
@@ -6360,7 +6364,7 @@ exec_stmt = function(sh, st, hook)
 		-- a failglob no-match while expanding the word list fails the `for` non-fatally
 		-- (status 1, no iterations), like bash — not an abort.
 		local eok, eerr = pcall(function()
-			for _, w in ipairs(st.words) do
+			for _, w in ipairs(sh.opt_B == false and P.unbrace_words(st.words) or st.words) do
 				local fs = expand_to_fields(sh, w)
 				for k = 1, #fs do
 					list[#list + 1] = fs[k]
