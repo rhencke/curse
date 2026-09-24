@@ -10273,6 +10273,25 @@ function M.source_leave(sh, fr)
 	end
 	sh.cur_source, sh.cur_line = fr.src, fr.line
 end
+-- The file `.`/source reads for NAME (bash's source.def): a name with a slash as is;
+-- else, with shopt sourcepath (the default), the first regular file of that name in
+-- $PATH; else (or with none found) the name itself, in the current directory.
+function M.source_path(sh, name)
+	if not name:find("/", 1, true) and sh.shopt.sourcepath ~= false then
+		local file_test = require("interp")._int.file_test
+		for dir in (sh:get("PATH") .. ":"):gmatch("([^:]*):") do
+			local cand = (dir == "" and "." or dir) .. "/" .. name
+			if file_test("-f", cand) then
+				return cand
+			end
+		end
+	end
+	return name
+end
+-- A file with no commands (blank or comments only): sourcing it sets $? to 0
+function M.source_empty(code)
+	return not code:gsub("#[^\n]*", ""):find("%S")
+end
 function M.source(sh, argv, line)
 	local I = require("interp")
 	local Ii = I._int
@@ -10284,16 +10303,7 @@ function M.source(sh, argv, line)
 	if not name or (j == 2 and name:match("^%-.")) then
 		return require("b_source")(sh, argv[1], argv, nil, nil) -- usage error: let b_source diagnose
 	end
-	local file = name
-	if not name:find("/", 1, true) then
-		for dir in (sh:get("PATH") .. ":"):gmatch("([^:]*):") do
-			local cand = (dir == "" and "." or dir) .. "/" .. name
-			if Ii.file_test("-f", cand) then
-				file = cand
-				break
-			end
-		end
-	end
+	local file = M.source_path(sh, name)
 	if Ii.file_test("-d", file) then
 		return require("b_source")(sh, argv[1], argv, nil, nil) -- directory: b_source diagnoses
 	end
@@ -10303,8 +10313,8 @@ function M.source(sh, argv, line)
 	end
 	local code = f:read("*a")
 	f:close()
-	local mod = require("tier").try_fragment(code)
-	if not mod then -- alias / syntax error / uncompilable: b_source runs the text it was handed
+	local mod = not M.source_empty(code) and require("tier").try_fragment(code)
+	if not mod then -- alias / syntax error / uncompilable / empty: b_source runs the text it was handed
 		-- (never re-opening the file — a FIFO or /dev/stdin can only be read once)
 		sh.source_preread = { file = file, code = code }
 		return require("b_source")(sh, argv[1], argv, nil, nil)
@@ -10328,7 +10338,8 @@ function M.source(sh, argv, line)
 	local rok, err = pcall(require("tier").run_compiled, mod, sh, nil)
 	M.source_leave(sh, fr)
 	sh.sourcedepth = sh.sourcedepth - 1
-	if #argv > j and sh.params == ownp then -- (params the file SET itself stay: bash)
+	-- (params the file SET itself stay — but not inside a function: bash's maybe_pop_dollar_vars)
+	if #argv > j and (sh.params == ownp or sh:in_function()) then
 		sh.params, sh.nparams = savep, savenp
 	end
 	if not rok then

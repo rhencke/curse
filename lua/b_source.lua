@@ -36,16 +36,7 @@ return function(sh, cmd, args, hook, tcb)
 		if name and name:find("/", 1, true) and rt.restricted(sh, cmd .. ": " .. name .. ": restricted") then
 			return
 		end
-		local file = name
-		if name and not name:find("/", 1, true) then
-			for dir in (sh:get("PATH") .. ":"):gmatch("([^:]*):") do
-				local cand = (dir == "" and "." or dir) .. "/" .. name
-				if file_test("-f", cand) then
-					file = cand
-					break
-				end
-			end
-		end
+		local file = name and rt.source_path(sh, name)
 		-- `.`/source fires the RETURN trap when it returns — for EVERY outcome except
 		-- the no-argument usage error (directory/not-found/syntax-error/success all
 		-- fire), regardless of functrace; an `exit` in the file propagates and skips it.
@@ -107,9 +98,14 @@ return function(sh, cmd, args, hook, tcb)
 							if sh.opt_v and lg.pline then
 								M.v_echo(sh, src, lg.pline, vst)
 							end
-							if lg.perr then
-								error({ __curse_parseerr = true })
-							end -- syntax error: source returns 2
+							if lg.perr then -- syntax error: reported (bash's message), source returns 2
+								if lg.perr.recoverable then
+									M.report_recoverable(sh, lg.perr)
+								else
+									pcall(I.exec_stmt, sh, lg.perr, hook) -- (it would exit: the file just ends)
+									error({ __curse_parseerr = true })
+								end
+							end
 							for _, st in ipairs(lg.stmts) do
 								local sok, serr = pcall(exec_list, sh, { st }, hook, false)
 								if not sok then
@@ -129,8 +125,12 @@ return function(sh, cmd, args, hook, tcb)
 					sh.xdepth = sxd
 					sh.sourcedepth = sh.sourcedepth - 1
 					rt.source_leave(sh, sframe)
-					if #args > j and sh.params == ownp then -- (params the file SET itself stay: bash)
+					-- (params the file SET itself stay — but not in a function: maybe_pop_dollar_vars)
+					if #args > j and (sh.params == ownp or sh:in_function()) then
 						sh.params, sh.nparams = savep, savenp
+					end
+					if rok and rt.source_empty(src) then
+						sh.status = 0 -- (a file with no commands)
 					end
 					if not rok then
 						if type(err) == "table" and err.__curse_return then
