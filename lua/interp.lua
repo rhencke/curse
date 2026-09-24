@@ -5573,13 +5573,21 @@ exec_stmt = function(sh, st, hook)
 			-- listing and so `local`/`declare` establishes the scope + attributes). The
 			-- actual array assignment happens AFTER the builtin runs (below), so it lands
 			-- in the freshly-declared/local variable.
-			local wasro -- (a name ALREADY readonly: its literal isn't assigned, bash errors)
+			-- A name ALREADY readonly: bash's compound assignment fails as the words expand,
+			-- before the builtin runs — `ra: readonly variable`, the rest of the line
+			-- abandoned — unless the builtin makes a new local (a function's declare/local)
+			local dcl, glob = args[1], false
+			for k = 2, #args do
+				glob = glob or args[k]:match("^%-%a*[gG]") ~= nil
+			end
+			local localize = dcl == "local" or ((dcl == "declare" or dcl == "typeset") and (sh.calldepth or 0) > 0 and not glob)
 			for _, aa in ipairs(st.arrayargs) do
 				args[#args + 1] = aa.name
 				local b = sh.vars[sh:deref(aa.name)]
-				if b and b.ro and args[1] ~= "local" then
-					wasro = wasro or {}
-					wasro[aa] = true
+				if b and b.ro and not localize then
+					io.stderr:write("curse: " .. aa.name .. ": readonly variable\n")
+					sh.status = 1
+					error({ __curse_exit = 1, __curse_lineabort = true })
 				elseif b and b.ro and sh:is_global_ro(sh:deref(aa.name)) then
 					-- `local ro=(…)`: bash's compound assignment fails first, then local's own error
 					-- (the first under this_command_name — still the calling FUNCTION's name)
@@ -5587,7 +5595,6 @@ exec_stmt = function(sh, st, hook)
 					io.stderr:write("curse: " .. (fnm and (fnm .. ": ") or "") .. aa.name .. ": readonly variable\n")
 				end
 			end
-			sh.arrayargs_ro = wasro
 			-- (names with a NAME=(…) literal: declare -g keeps its global view until they're
 			-- assigned, and a failed kind conversion reports/skips them bash's way)
 			sh.arrayargs_pending = {}
@@ -5927,15 +5934,10 @@ exec_stmt = function(sh, st, hook)
 		local aaskip = sh.arrayargs_pending and sh.arrayargs_pending.skip
 		local aaforce = sh.arrayargs_pending and sh.arrayargs_pending.force -- (assigned even so)
 		if st.arrayargs and (sh.status == 0 or aaforce) then
-			local wasro = sh.arrayargs_ro
-			sh.arrayargs_ro = nil
 			local failed = sh.status ~= 0
 			for _, aa in ipairs(st.arrayargs) do
 				if failed and not aaforce[aa.name] then
 				elseif aaskip and aaskip[aa.name] then -- (a rejected kind conversion: untouched)
-				elseif wasro and wasro[aa] then
-					io.stderr:write("curse: " .. aa.name .. ": readonly variable\n")
-					sh.status = 1
 				else
 					do_arrayassign(sh, aa)
 				end

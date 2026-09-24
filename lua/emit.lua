@@ -4431,11 +4431,13 @@ simple_compiled = function(cx, st, after)
 				-- bash forbids CHANGING an existing array's kind (-A on indexed / -a on assoc):
 				-- status 1, and the RHS values are NOT evaluated (interp assigns the literal only
 				-- when status==0). Gate the whole assign (values included) on the conversion check.
+				-- (a readonly target: a global declare's compound assignment aborts the line)
+				.. (as_local and "" or ("rt.array_ro_abort(sh, %q); "):format(a1.name))
 				.. ("do if not rt.array_convert_err(sh, %q, %s, %q)%s then "):format(
 					a1.name,
 					tostring(isassoc),
 					cmd,
-					as_local and (" and not rt.local_ro(sh, %q)"):format(a1.name) or ""
+					as_local and (" and not rt.local_ro(sh, %q, %q)"):format(a1.name, cmd) or ""
 				)
 				-- (the values are expanded BEFORE localizing: `local -a arr=("${arr[@]}")`)
 				.. table.concat(parts, "; ")

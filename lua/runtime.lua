@@ -559,6 +559,16 @@ function Shell:is_global_ro(name)
 end
 -- `local` outside any function (a compiled subshell / pipeline stage / $( ) at the top
 -- level runs it natively): bash's "can only be used in a function", status 1
+-- `declare ra=(…)` (not making a local) on a readonly array: bash's compound assignment
+-- fails as the words expand — before the builtin — and the rest of the line is abandoned
+function M.array_ro_abort(sh, name)
+	local b = sh.vars[sh:deref(name)]
+	if b and b.ro then
+		sh:errmsg("curse: " .. name .. ": readonly variable\n")
+		sh.status = 1
+		error({ __curse_exit = 1, __curse_lineabort = true })
+	end
+end
 function M.local_nofn(sh)
 	if sh.pd == 0 and (sh.calldepth or 0) == 0 then
 		sh:errmsg("curse: local: can only be used in a function\n")
@@ -567,11 +577,11 @@ function M.local_nofn(sh)
 	end
 	return false
 end
-function M.local_ro(sh, name)
+function M.local_ro(sh, name, cmd)
 	if sh:is_global_ro(name) then -- (the compound assignment's error names the FUNCTION: bash's
 		local fnm = sh.funcstack and sh.funcstack[1] -- this_command_name still holds it)
 		sh:errmsg("curse: " .. (fnm and (fnm .. ": ") or "") .. name .. ": readonly variable\n")
-		sh:errmsg("curse: local: " .. name .. ": readonly variable\n")
+		sh:errmsg("curse: " .. (cmd or "local") .. ": " .. name .. ": readonly variable\n")
 		sh.status = 1
 		return true
 	end

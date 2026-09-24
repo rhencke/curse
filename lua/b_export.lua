@@ -161,30 +161,37 @@ return function(sh, cmd, args, hook, tcb)
 		end
 		-- listing a subset of variables (bare `declare`/`export`/`readonly`, or with
 		-- -p and no names): the builtin + attribute flags select which vars to print.
-		local function decl_match(nm, b) -- (every attribute asked for must hold: -ar = both)
+		-- (setattr.def set_or_show_attributes: -a/-A select arrays only; of the other
+		-- attributes asked for, ANY one qualifies — `declare -rt` lists -r or -t vars)
+		local function decl_match(nm, b)
 			if not b then
 				return false
 			end
-			if (cmd == "readonly" or rattr) and not b.ro then
+			if aattr then
+				if not (b.arr and not b.assoc) then
+					return false
+				end
+			elseif assoc and not b.assoc then
 				return false
 			end
-			if (cmd == "export" or doexport) and not b.exported then
-				return false
+			local ro, ex = cmd == "readonly" or rattr, cmd == "export" or doexport
+			local asked = ro or ex or nref or iattr or lattr or uattr or tattr or cattr or (aattr and assoc)
+			if not asked then
+				return true
 			end
-			if (nref and not b.ref) or (assoc and not b.assoc) or (aattr and not (b.arr and not b.assoc)) then
-				return false
-			end
-			if (iattr and not b.int) or (lattr and not b.lower) or (uattr and not b.upper) then
-				return false
-			end
-			return true
+			return (ro and b.ro) or (ex and b.exported) or (nref and b.ref) or (iattr and b.int)
+				or (lattr and b.lower) or (uattr and b.upper) or (tattr and b.trace) or (cattr and b.cap)
+				or (aattr and assoc and b.assoc) or false
 		end
 		local function list_decls()
 			-- plain `declare`/`typeset` (no attribute flags, no -p) prints bare
 			-- `name=value` like `set`; with a flag or -p it prints `declare -X name=…`.
 			local bare = (cmd == "declare" or cmd == "typeset")
 				and not printmode
-				and not (doexport or rattr or iattr or lattr or uattr or aattr or assoc or nref)
+				and not (doexport or rattr or iattr or lattr or uattr or aattr or assoc or nref or tattr or cattr)
+			if bare then -- (no attribute: bash's `return set_builtin (NULL)`)
+				return require("b_set")(sh, "set", { "set" }, hook, tcb)
+			end
 			local names = {}
 			for nm in pairs(sh.vars) do
 				names[#names + 1] = nm
@@ -295,13 +302,17 @@ return function(sh, cmd, args, hook, tcb)
 				end
 				-- `declare -f NAME` prints the verbatim definition (captured at parse time);
 				-- `declare -F NAME` prints just NAME; bare `declare -F` prints `declare -f NAME`.
-				if sh.functions[nm] then
-					if funcbody then
+				if named and sh.opt_posix and not nm:match("^[%a_][%w_]*$") then
+					-- (posix mode: a function name must be an identifier to be looked up)
+					io.stderr:write("curse: " .. cmd .. ": `" .. nm .. "': not a valid identifier\n")
+					allok = false
+				elseif sh.functions[nm] then
+					if funcbody and not funcnames then -- (-F wins: bash's nodefs)
 						local d = func_body_text(sh, nm)
 						if d then
 							sh:echo(d)
 						end
-						if not named and (fx[nm] or fro[nm] or ftr[nm]) then
+						if (not named or printmode) and (fx[nm] or fro[nm] or ftr[nm]) then
 							sh:echo(fdecl(nm))
 						end
 					elseif funcnames then
@@ -799,6 +810,9 @@ return function(sh, cmd, args, hook, tcb)
 					-- deferred `readonly a[i]=v` / `export a[i]=v` (those fail, status 1).
 					if anm and sub == "" then -- `declare a[]=x`
 						io.stderr:write("curse: " .. anm .. "[]: bad array subscript\n")
+						allok = false
+					elseif anm and isdecl and ro_blocks(sh:deref(anm)) then -- (`declare ra[1]=3`)
+						io.stderr:write("curse: " .. cmd .. ": " .. anm .. ": readonly variable\n")
 						allok = false
 					elseif anm and (aattr or assoc) and isdecl
 						and aval:sub(1, 1) == "(" and aval:sub(-1) == ")" then
