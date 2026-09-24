@@ -4467,35 +4467,27 @@ local function exec_simple(sh, args, hook, no_func)
 		local ra = args[2] == "--" and 3 or 2
 		local rcode
 		if args[ra] ~= nil then -- (bash's get_exitstat: the number, then no_args)
-			rcode = args[ra]:match("^%s*[+-]?%d+%s*$") and tonumber(args[ra]) % 256
-			if not rcode then
-				io.stderr:write("curse: return: " .. args[ra] .. ": numeric argument required\n")
-				rcode = 2
-			elseif args[ra + 1] ~= nil then
+			rcode = rt.return_status(sh, args[ra])
+			if rt.legal_i64(args[ra]) and args[ra + 1] ~= nil then
 				rt.too_many(sh, "return")
 			end
 		end
 		-- `return` is only valid inside a function, a sourced script, or a trap;
 		-- elsewhere bash reports an error (status 2) but keeps running (no unwind).
-		if (sh.calldepth or 0) == 0 and (sh.sourcedepth or 0) == 0 and (sh.in_trap or 0) == 0 then
-			io.stderr:write("curse: return: can only `return' from a function or sourced script\n")
-			sh.status = 2
-			if sh.opt_posix and not sh.opt_i then -- a special builtin's error ends a posix shell
-				error({ __curse_exit = 2 })
-			end
+		if rt.return_outside(sh) then
 			return
 		end
-		error({ __curse_return = rcode or sh.status })
+		error({ __curse_return = rcode or rt.return_default(sh) })
 	elseif cmd == "exit" then
 		local ea = args[2] == "--" and 3 or 2
-		if args[ea] and not args[ea]:match("^%s*[+-]?%d+%s*$") then -- (get_exitstat: the number
+		if args[ea] and not rt.legal_i64(args[ea]) then -- (get_exitstat: the number
 			io.stderr:write("curse: exit: " .. args[ea] .. ": numeric argument required\n")
 			error({ __curse_exit = 2 })
 		end
 		if args[ea + 1] ~= nil then -- first, then too many: the command is discarded)
 			rt.too_many(sh, "exit")
 		end
-		local code = args[ea] and (tonumber(args[ea]) % 256) or sh.status
+		local code = rt.return_status(sh, args[ea], "exit")
 		-- inside a function, bash runs the EXIT trap right here, with the function's frame
 		-- still active (`trap 'echo $FUNCNAME' EXIT; f() { exit; }; f` prints f)
 		if sh:in_function() and not sh.in_exit_trap and rt.exit_trap_own(sh)
@@ -6557,8 +6549,9 @@ end
 -- failing command's line, not the handler's). Returns true if it called exit.
 run_trap = function(sh, code)
 	local exited, savedline = false, sh.cur_line
-	local saved_tcd = sh.trap_calldepth
+	local saved_tcd, saved_ts = sh.trap_calldepth, sh.trap_saved
 	sh.trap_calldepth = sh.calldepth or 0
+	sh.trap_saved = sh.status -- (bash's trap_saved_exit_value: see rt.return_default)
 	sh.in_trap = (sh.in_trap or 0) + 1
 	local sxd = sh.xdepth -- (a handler's commands trace one level deeper: `++ cmd`, bash)
 	sh.xdepth = (sxd or 0) + 1
@@ -6587,7 +6580,7 @@ run_trap = function(sh, code)
 	end)
 	sh.in_trap = sh.in_trap - 1
 	sh.xdepth = sxd
-	sh.trap_calldepth = saved_tcd
+	sh.trap_calldepth, sh.trap_saved = saved_tcd, saved_ts
 	sh.cur_line = savedline
 	if not ok then
 		if type(err) == "table" and err.__curse_parseerr then -- syntax error in the trap code: warned, non-fatal, doesn't exit or change status (bash)

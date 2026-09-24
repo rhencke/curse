@@ -105,6 +105,9 @@ return function(sh, cmd, args, hook, tcb)
 						allok = false
 					end
 				elseif pid then
+					if pid == C.getpid() and sig ~= 0 then -- (to ourselves: taken once kill is done)
+						rt.self_sig_hold(sig)
+					end
 					if C.kill(pid, sig) ~= 0 then
 						io.stderr:write("curse: kill: (" .. pid .. ") - " .. ffi.string(C.strerror(ffi.errno())) .. "\n")
 						allok = false
@@ -130,6 +133,7 @@ return function(sh, cmd, args, hook, tcb)
 				end
 			end
 			sh.status = allok and 0 or 1
+			rt.self_sig_release()
 		end
 	end
 end

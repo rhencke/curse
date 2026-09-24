@@ -1687,6 +1687,28 @@ end
 
 -- An async command without job control runs with SIGINT/SIGQUIT ignored (bash's
 -- setup_async_signals): a forked child just sets that.
+-- `kill -SIG $$` from the shell itself: bash takes the signal after the builtin has
+-- finished (its trap sees kill's status 0), so hold it blocked across the send; release
+-- restores the previous mask, which delivers it. (Only SIG is touched: the scheduler
+-- keeps SIGPIPE blocked meanwhile.)
+do
+	local set, old, held = ffi.new("uint8_t[1024]"), ffi.new("uint8_t[1024]"), false
+	function M.self_sig_hold(sig)
+		if held then
+			return
+		end
+		C.sigemptyset(set)
+		C.curse_co_sigaddset(set, sig)
+		C.sigprocmask(0, set, old) -- SIG_BLOCK
+		held = true
+	end
+	function M.self_sig_release()
+		if held then
+			held = false
+			C.sigprocmask(2, old, nil) -- SIG_SETMASK
+		end
+	end
+end
 function M.async_child_signals(sh)
 	if not sh.opt_m then
 		C.curse_sig_ignore(2)
@@ -4597,14 +4619,41 @@ end
 -- tier calls directly (no interp).
 function M.return_status(sh, value, name)
 	if value == nil then
-		return sh.status
+		return name == "exit" and M.exit_default(sh) or M.return_default(sh)
 	end
-	local n = tonumber(value)
+	local n = M.legal_i64(value) -- (get_exitstat: legal_number, then & 255)
 	if not n then
 		io.stderr:write("curse: " .. (name or "return") .. ": " .. value .. ": numeric argument required\n")
 		return 2
 	end
-	return n % 256
+	return tonumber(bit.band(n, 255))
+end
+-- A bare `return` in a trap handler (not DEBUG) — or in a function it calls — gives the
+-- status from before the trap ran; a bare `exit` does so only in the EXIT trap (bash's
+-- trap_saved_exit_value, builtins/common.c get_exitstat / exit.def).
+function M.return_default(sh)
+	if (sh.in_trap or 0) > 0 and not sh.in_debug and sh.trap_saved ~= nil then
+		return sh.trap_saved
+	end
+	return sh.status
+end
+function M.exit_default(sh)
+	if sh.in_exit_trap and sh.trap_saved ~= nil then
+		return sh.trap_saved
+	end
+	return sh.status
+end
+-- `return` where no function or sourced script is running: reported, status 2 (bash)
+function M.return_outside(sh)
+	if (sh.calldepth or 0) == 0 and (sh.sourcedepth or 0) == 0 and (sh.in_trap or 0) == 0 then
+		io.stderr:write("curse: return: can only `return' from a function or sourced script\n")
+		sh.status = 2
+		if sh.opt_posix and not sh.opt_i then -- a special builtin's error ends a posix shell
+			error({ __curse_exit = 2 })
+		end
+		return true
+	end
+	return false
 end
 
 -- Arithmetic numeric literal / value: like str_to_i64 but with bash arith bases —

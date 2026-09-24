@@ -5896,6 +5896,13 @@ H.pipeline = function(cx, st, after)
 	local n = #st.cmds
 	local frags = {}
 	for i = 1, n do
+		-- a `return` stage at the top level (no function can be running): the interpreter
+		-- reports it (bash: "can only `return' …", status 2) — a stage fragment can't tell
+		if cx.toplevel and not EF.fragment and resolve_cf({ t = "simple", words = st.cmds[i].words or {} }) == "return" then
+			return cx.delegate(st, after)
+		end
+	end
+	for i = 1, n do
 		-- nst==1 is `! cmd` (a single negated command run in the current shell): compile
 		-- it as a negated fragment so its OWN errexit is exempt; run_pipeline also raises
 		-- noerr for a negated pipeline under errexit, so errexit inside anything it calls (a
@@ -6718,12 +6725,16 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
 			local frag_return = ((EF.fragment and cx.toplevel) or (EF.cf_raise and EF.cf_raise.func)) and #cx.subexit == 0
 			local retjmp = frag_return and ((EF.cf_flush or "") .. "error({ __curse_return = sh.status })")
 				or ("pc = %d"):format(retpc)
+			if frag_return and not (EF.cf_raise and EF.cf_raise.func) then -- (a stage/eval fragment
+				-- at top level: maybe no function is running — then bash's diagnostic, status 2)
+				retjmp = ("if rt.return_outside(sh) then pc = %d else %s end"):format(after, retjmp)
+			end
 			local aw = st.words[cf_arg]
 			if not st.words[cf_arg + 1] then -- at most one status WORD (pre-split)
 				local d = dbg(st) -- DEBUG fires before return too
-				if not aw then -- `return` with no arg → previous status
+				if not aw then -- `return` with no arg → previous status (in a trap: its entry status)
 					local p = cx.newpc()
-					cx.blocks[p] = d .. retjmp
+					cx.blocks[p] = d .. "sh.status = rt.return_default(sh); " .. retjmp
 					return p
 				elseif word_safe(aw) then -- one field (literal/quoted): `return ""` → 2, `return 42` → 42
 					local p = cx.newpc()
@@ -6755,7 +6766,7 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
 				local statusexpr = aw
 						and word_safe(aw)
 						and ('rt.return_status(sh, %s, "exit")'):format(emit_word(aw, cx.lifted))
-					or (not aw and "sh.status")
+					or (not aw and "rt.exit_default(sh)")
 					or nil
 				if statusexpr then
 					local p = cx.newpc()
