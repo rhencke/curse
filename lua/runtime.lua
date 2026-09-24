@@ -4541,6 +4541,23 @@ local function str_to_i64(s)
 	return n
 end
 M.str_to_i64 = str_to_i64
+-- bash's legal_number (general.c): strtoimax base 10 — leading isspace, an optional sign,
+-- digits — then only blanks (space/tab); empty, junk, `0x10`, `1e2` and intmax overflow
+-- are not numbers. Returns the value, or nil.
+function M.legal_number(s)
+	if type(s) ~= "string" then
+		return nil
+	end
+	local sign, digits, rest = s:match("^[ \t\n\v\f\r]*([+-]?)(%d+)(.*)$")
+	if not digits or (rest ~= "" and not rest:match("^[ \t]*$")) then
+		return nil
+	end
+	local d = digits:match("^0*(%d-)$")
+	if #d > 19 or (#d == 19 and d > (sign == "-" and "9223372036854775808" or "9223372036854775807")) then
+		return nil -- (ERANGE)
+	end
+	return tonumber(sign .. digits)
+end
 
 -- `return [n]` status: no arg -> current $?; a numeric arg -> n mod 256; a
 -- non-numeric arg -> 2 + diagnostic (bash). A pure runtime primitive the compiled
