@@ -1176,30 +1176,6 @@ function M.coll_lt(a, b)
 	end
 	return a < b
 end
--- Subshell fork helpers for the COMPILED path: a `( … )` is compiled as fork + a
--- bounded body sub-CFG that _exits at its boundary (so it never runs the top-level
--- continuation), while the parent waits — the same design as the interp subshell,
--- so a forked child running the body honors interp/bg-compile/OSR like any code.
-function M.subshell_fork(sh) -- returns pid (0 in the child, which is set up here)
-	io.flush() -- flush buffered parent stdout so the fork doesn't duplicate it
-	local pid = M.fork()
-	if pid == 0 then
-		sh.in_subprogram = (sh.in_subprogram or 0) + 1 -- ERR trap won't fire here (sans errtrace)
-		sh.loopdepth = 0 -- an enclosing loop isn't ours to break/continue
-		sh.out = io.write
-		-- The child runs its body as inline CFG states (no pcall of its own), so an `exit`/
-		-- fatal error raised by the RUNTIME (not an errchk jump) unwinds to the top-level
-		-- finish: that must end THIS child (like subshell_exit), never return into the
-		-- caller of the run (in the daemon: the request loop, which would reply as the worker).
-		sh.subshell_child = true
-	end
-	return pid
-end
-local _ss_st = ffi.new("int[1]")
-function M.subshell_wait(pid)
-	M.wait_child(pid, _ss_st, 0)
-	return M.wexit(_ss_st[0])
-end
 function M.subshell_exit(status, sh)
 	M.child_exit(sh, status)
 end
@@ -1631,53 +1607,6 @@ function M.wexit(s)
 	return bit.rshift(bit.band(s, 0xff00), 8)
 end
 
--- Child side of the ENOEXEC fallback: an executable file with no shebang is a
--- shell script (bash runs it as one), so resolve it via $PATH exactly as the
--- failed execvp would, then run it through our own interpreter and _exit. fd 1
--- must already point where the script's stdout should go. Never returns.
-function Shell:exec_script_child(path, args, n)
-	-- This forked child inherited the parent's blocked signal mask (set while a
-	-- trap is active). Reset to empty so the child is interruptible.
-	if self.sigtraps and next(self.sigtraps) then
-		local set = ffi.new("uint8_t[1024]")
-		C.sigemptyset(set)
-		C.sigprocmask(2, set, nil) -- SIG_SETMASK
-		-- as an exec would: caught signals revert to default (ignored ones stay ignored)
-		local I = require("interp")._int
-		for canon in pairs(self.sigtraps) do
-			local num = self.traps[canon] ~= "" and I.SIGNUM[canon:match("^SIG(.+)$") or ""]
-			if num then
-				I.block_sig(num, false)
-			end
-		end
-	end
-	M.rd_gen = M.rd_gen + 1 -- (the script may be a shared input, /dev/stdin)
-	local f = io.open(path, "r")
-	local src = f and f:read("*a") or ""
-	if f then
-		f:close()
-	end
-	-- A no-shebang script is exec'd as a FRESH process: it sees only the exported
-	-- environment, NOT the parent's in-memory shell vars/functions/traps. Build a
-	-- new shell (import_env populates it from the environment) rather than reusing
-	-- self, so a non-exported `x=1; ./script` doesn't leak x into the script.
-	local child = Shell.new()
-	child.argv0, child.out = args[1], io.write
-	-- (bash's reinitialized no-#! child resets its shopt options, all but globskipdots,
-	-- which reset_shopt_options leaves as the parent had it)
-	child.shopt.globskipdots = self.shopt.globskipdots
-	M.startup_ignored(child) -- a new shell: what's ignored now stays ignored
-	if child.fimports then
-		M.import_functions(child)
-	end
-	for k = 2, n do
-		child.nparams = child.nparams + 1
-		child.params[child.nparams] = args[k]
-	end
-	pcall(require("interp").run_lazy, child, src)
-	io.flush()
-	C._exit(child.status or 0)
-end
 
 -- A no-shebang script runs as a FRESH shell would (bash's reinitialized child: only the
 -- exported environment, its own vars/functions/traps) — in-process: a new Shell, run
@@ -1937,60 +1866,6 @@ function Shell:exec(...)
 	end
 end
 
--- Command substitution `$(...)`: run the inner program capturing stdout, with
--- trailing newlines stripped (bash). Interpreted (it's I/O-bound, not hot), so
--- it handles builtins, externals, and (in interp mode) functions uniformly.
--- `$(…)` runs in a forked child (CoW — the child already holds all state), so it
--- gets FULL subshell isolation for free (vars, set-flags, fds, cwd, umask, traps,
--- functions, $BASHPID) exactly like bash — which manual in-process save/restore
--- can't reliably do. Output is captured through a pipe, like the subshell path.
--- `runner(self)` executes the body (default: interpret `ast.stmts`); the compiled
--- tier passes a runner that runs a compiled cmdsub fragment instead.
-function Shell:capture_forked(ast, runner)
-	runner = runner or function(self)
-		return require("interp").exec_list(self, ast.stmts, function() end, true)
-	end
-	io.flush()
-	local pfd = ffi.new("int[2]")
-	if M.pipe_hi(pfd) ~= 0 then
-		return nil
-	end -- caller falls back to in-process
-	local pid = M.fork()
-	if pid == 0 then
-		C.close(pfd[0])
-		C.dup2(pfd[1], 1)
-		C.close(pfd[1])
-		self.out = io.write
-		self.in_subprogram = (self.in_subprogram or 0) + 1
-		self.xdepth = (self.xdepth or 0) + 1 -- (xtrace: one more $(…) level)
-		if not (self.opt_posix or (self.shopt and self.shopt.inherit_errexit)) then
-			self.opt_e = false -- (errexit isn't inherited without inherit_errexit — bash)
-		end
-		local ok, err = pcall(runner, self)
-		if not ok and type(err) == "table" and (err.__curse_exit or err.__curse_return) then
-			self.status = err.__curse_exit or err.__curse_return
-		elseif not ok and type(err) == "table" and (err.__curse_break or err.__curse_continue) then
-			self.status = err.__curse_status or 0 -- (a loop's break/continue ends the $(…))
-		end
-		M.child_exit(self, self.status or 0)
-	end
-	C.close(pfd[1])
-	local chunks, rbuf = {}, ffi.new("char[8192]")
-	while true do
-		M.co_block(pfd[0], POLLIN)
-		local nr = tonumber(C.read(pfd[0], rbuf, 8192))
-		if not nr or nr <= 0 then
-			break
-		end
-		chunks[#chunks + 1] = ffi.string(rbuf, nr)
-	end
-	C.close(pfd[0])
-	local stbuf = ffi.new("int[1]")
-	M.wait_child(pid, stbuf, 0)
-	self.status = M.wexit(stbuf[0])
-	self.last_cmdsub_status = self.status -- like capture_inproc: for an empty-argv command's status
-	return (table.concat(chunks):gsub("%z", ""):gsub("\n+$", ""))
-end
 -- A `$(…)` body is "pure" (no shell-state side effects, so safe to run in-process
 -- for speed) when every command is a plain external/non-mutating-builtin call with
 -- no assignments, no mutating builtin, no user-function call, and no control flow.
@@ -2218,15 +2093,7 @@ function Shell:capture_inproc(backtick, runner, capfd, ctx)
 		cap_depth = cap_depth - 1 -- (a held signal is raised once the capture is done, below)
 	end
 	self.xdepth, self.subdepth = sv_xd, sv_depth
-	if ctx and ctx.child then -- late-forked: this process IS the $(…) child; its fd 1 is the
-		M.child_status(self, ok, err) -- shared temp file, so just end with the body's status
-		M.late_child_exit(self, ctx, self.status)
-	end
-	if not ok and ctx and type(err) == "table" and err.__curse_latefork == ctx then
-		ok, err = true, nil -- the late-forked child ran the rest (its output is in the temp file)
-		self.status = ctx.status
-	end
-	if ctx and not ctx.child and ctx.pid == C.getpid() then
+	if ctx and ctx.pid == C.getpid() then
 		if not ok and type(err) == "table" and err.__curse_vsig == ctx then
 			err = { __curse_exit = 128 + err.sig } -- (`kill $BASHPID`: the substitution dies)
 		end
@@ -2468,7 +2335,7 @@ end
 local function iso_cur(sh)
 	local st = sh.iso_ctx
 	local ctx = st and st[#st]
-	if ctx and not ctx.child and ctx.pid == C.getpid() then
+	if ctx and ctx.pid == C.getpid() then
 		return ctx
 	end
 end
@@ -2732,7 +2599,7 @@ iso_pop = function(sh, ctx)
 	if st and st[#st] == ctx then
 		st[#st] = nil
 	end
-	if ctx.pid == C.getpid() and not ctx.child then
+	if ctx.pid == C.getpid() then
 		iso_undo(sh, ctx)
 		flush_deferred(sh)
 	end
@@ -2814,25 +2681,6 @@ function M.iso_signal(sh, ctx, sig)
 		return I.run_signal(sh, sig, true)
 	end
 	error({ __curse_vsig = ctx, sig = sig }, 0) -- the default action: the subshell dies
-end
-function M.need_process(sh)
-	local st = sh.iso_ctx
-	local ctx = st and st[#st]
-	if not ctx or ctx.child or CO or ctx.pid ~= C.getpid() then
-		return
-	end
-	io.flush()
-	local pid = M.fork()
-	if pid == 0 then
-		M.fork_depth = M.fork_depth - 1 -- (the context was counted in-process)
-		ctx.child = true
-		sh.subshell_child = true -- anything unwinding past the boundary still ends this child
-		return
-	end
-	local stb = ffi.new("int[1]")
-	M.wait_child(pid, stb, 0)
-	ctx.status = M.wexit(stb[0])
-	error({ __curse_latefork = ctx }, 0)
 end
 -- A forked subshell child ends: run an EXIT trap the SUBSHELL set (never the inherited
 -- parent one), with $? = its status, then _exit.
@@ -2942,15 +2790,6 @@ function M.child_exit(sh, status)
 	io.flush()
 	C._exit(status or 0)
 end
-function M.late_child_exit(sh, ctx, status)
-	M.child_exit(sh, status)
-end
--- Inside a pipeline stage (a scheduler coroutine) a late fork can't be taken — the stage's
--- buffered stdout and the scheduler don't survive into a child — so bodies that rely on it
--- take the fork path up front there (emit checks this).
-function M.in_stage()
-	return CO ~= nil
-end
 
 function Shell:subshell_run(runner, saves)
 	local cp = sub_checkpoint(self)
@@ -2972,8 +2811,6 @@ function Shell:subshell_run(runner, saves)
 			status = err.__curse_exit or err.__curse_return
 		elseif type(err) == "table" and err.__curse_lineabort then
 			status = 1
-		elseif type(err) == "table" and err.__curse_latefork == ctx then
-			status = ctx.status -- the late-forked child ran the rest of the body
 		elseif type(err) == "table" and err.__curse_vsig == ctx then
 			status = 128 + err.sig -- killed: reported as bash reports a dead foreground child
 			local I = package.loaded.interp
@@ -2985,7 +2822,7 @@ function Shell:subshell_run(runner, saves)
 			rethrow = err
 		end
 	end
-	if not rethrow and not ctx.child and ctx.pid == C.getpid() then
+	if not rethrow and ctx.pid == C.getpid() then
 		status = M.iso_exit_trap(self, ctx, status, err)
 	end
 	iso_pop(self, ctx)
@@ -2995,9 +2832,7 @@ function Shell:subshell_run(runner, saves)
 		end
 	end
 	self.jobs = sv_jobs
-	if ctx.child then -- late-forked: this process IS the subshell; it ends here
-		M.late_child_exit(self, ctx, status)
-	elseif C.getpid() ~= ctx.pid then
+	if C.getpid() ~= ctx.pid then
 		-- a process forked deeper inside (a nested subshell's child) unwound out to here:
 		-- it ends now, never resuming the script as a copy of the shell
 		M.child_exit(self, status or 0)
@@ -3108,23 +2943,7 @@ function Shell:capture_file(path)
 	return ""
 end
 
-function Shell:capture_compiled(cs_fn, mustfork, backtick)
-	if mustfork then
-		-- The forked child must inherit the $() isolation: errexit is NOT inherited into a
-		-- command sub (unless inherit_errexit), and ERR is suppressed (in_subprogram). Set
-		-- these before the fork (the child copies them); restore in the parent after.
-		local savede = self.opt_e
-		if not (self.opt_posix or (self.shopt and self.shopt.inherit_errexit)) then
-			self.opt_e = false
-		end
-		self.in_subprogram = (self.in_subprogram or 0) + 1
-		local out = self:capture_forked(nil, cs_fn)
-		self.in_subprogram = self.in_subprogram - 1
-		self.opt_e = savede
-		if out ~= nil then
-			return out
-		end -- fork failed: fall through to in-process
-	end
+function Shell:capture_compiled(cs_fn, _, backtick) -- (2nd arg: a retired fork flag)
 	return self:capture_inproc(backtick, cs_fn)
 end
 
@@ -3771,7 +3590,7 @@ local function co_launch(ctx, self, stage_fns, inproc, base, lastpipe, upv)
 				self.out = make_out(t)
 			end
 			add(t, stage_body(fn, self, t, true))
-		elseif inproc[i] then
+		else -- (every stage runs in-process: a task with its own isolated shell)
 			local sh = self:stage_clone()
 			if inproc[i] == "flat" then -- ($BASH_SUBSHELL: a `( … )` stage counts once; a simple
 				sh.subdepth = sh.subdepth - 1 -- command that runs no shell code isn't counted)
@@ -3779,22 +3598,6 @@ local function co_launch(ctx, self, stage_fns, inproc, base, lastpipe, upv)
 			sh.out = make_out(t)
 			t.sh = sh
 			add(t, stage_body(fn, sh, t))
-		else -- needs a real child: fork from inside the task, wait on a pidfd
-			add(t, function()
-				local pid = M.fork()
-				if pid == 0 then -- the child owns fds 0-9 as installed for this stage
-					self.in_pipestage = (self.in_pipestage or 0) + 1
-					local ok, err = pcall(function()
-						self.out = io.write
-						fn(self)
-					end)
-					M.child_status(self, ok, err)
-					M.child_exit(self, self.status or 0)
-				end
-				local st = ffi.new("int[1]")
-				M.wait_child(pid, st, 0)
-				return M.wexit(st[0])
-			end)
 		end
 	end
 	if drain_r then
