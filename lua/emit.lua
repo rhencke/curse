@@ -1833,17 +1833,9 @@ end
 -- delegates the whole [[ ]]). No word splitting happens in [[ ]], so emit_word (a
 -- scalar concat) is exactly the operand value.
 local ARITH_CMP = { ["-eq"] = "==", ["-ne"] = "~=", ["-lt"] = "<", ["-le"] = "<=", ["-gt"] = ">", ["-ge"] = ">=" }
-local emit_dbracket_node
--- A [[ ]] with an arithmetic comparison: an operand's arith error makes the whole test
--- false (status 1, bash) — rt.db_arith flags it, rt.db_ok reads the flag (no pcall).
-local function emit_dbracket(node, lifted)
-	local code = emit_dbracket_node(node, lifted)
-	if code and code:find("rt.db_arith(", 1, true) then
-		return "rt.db_ok(sh, " .. code .. ")"
-	end
-	return code
-end
-emit_dbracket_node = function(node, lifted)
+-- (an arithmetic comparison leaf: an operand's arith error makes THAT primary false —
+-- bash's arithcomp; `||`/`!` go on — rt.db_arith flags it, the leaf's rt.db_ok reads it)
+local function emit_dbracket_node(node, lifted)
 	local k = node.kind
 	if k == "and" or k == "or" then
 		local a = emit_dbracket_node(node.l, lifted)
@@ -1882,6 +1874,9 @@ emit_dbracket_node = function(node, lifted)
 		-- interp seam. Every other unary is a file predicate -> the pure-FFI runtime primitive.
 		if op == "-v" then
 			return ("rt.var_is_set(sh, %s, true)"):format(val)
+		end
+		if op == "-R" then
+			return ("rt.var_is_nameref(sh, %s)"):format(val)
 		end
 		if op == "-o" then
 			return ("I.dbracket_unary(sh, %q, %s)"):format(op, val)
@@ -1923,7 +1918,7 @@ emit_dbracket_node = function(node, lifted)
 			)
 			return op == "!=" and ("(not " .. eq .. ")") or eq
 		elseif ARITH_CMP[op] then
-			return ("(rt.db_arith(sh, %s) %s rt.db_arith(sh, %s))"):format(
+			return ("rt.db_ok(sh, rt.db_arith(sh, %s) %s rt.db_arith(sh, %s))"):format(
 				l,
 				ARITH_CMP[op],
 				emit_word(node.r, lifted)
@@ -3143,6 +3138,12 @@ local function test_operand_arith(w, lifted)
 		return { k = "var", name = p.var }
 	end
 	if p.lit and p.lit:match("^[+-]?%d+$") then
+		-- (only an int64-range literal: bash's legal_number rejects ERANGE with status 2,
+		-- and an NNN…LL past 2^64 would not even parse — the do_test path reports it)
+		local d = p.lit:match("^[+-]?0*(%d-)$")
+		if #d > 19 or (#d == 19 and d > (p.lit:byte(1) == 45 and "9223372036854775808" or "9223372036854775807")) then
+			return nil
+		end
 		return { k = "num", v = p.lit }
 	end
 	if p.arithast then
@@ -4197,8 +4198,21 @@ H.assign = function(cx, st, after)
 		return emit_word(st.rhs, cx.lifted)
 	end
 	local ua = '; sh:set_str("_", "")' -- a bare assignment resets $_ (bash)
-	if st.index then -- a[i]=v / a[i]+=v: status 0 first (so a plain RHS is 0; a cmdsub in the
-		-- subscript/RHS overwrites it), then the element assign; assign_element leaves status.
+	-- $? after an assignment: the RHS's last cmdsub status, else 0 — but the RHS (then the
+	-- subscript, as bash's assign_array_element does) is evaluated FIRST, so `st=$?` / `a+=$?` /
+	-- `a[$?]=x` read the PREVIOUS status; only then is it reset to 0 (when the RHS has no
+	-- cmdsub), and the assign helpers set 1 on failure. Values ride in do-block locals.
+	local hascmd = false
+	if st.rhs then
+		for _, pp in ipairs(st.rhs.parts) do
+			if pp.cmdsub then
+				hascmd = true
+				break
+			end
+		end
+	end
+	local st0 = hascmd and "" or "sh.status = 0; "
+	if st.index then -- a[i]=v / a[i]+=v (assign_element leaves status unless it fails)
 		local ec = errchk(st)
 		local ecs = ec ~= "" and ("; " .. ec) or ""
 		local append = tostring(st.append and true or false)
@@ -4209,17 +4223,17 @@ H.assign = function(cx, st, after)
 		local kmode, kstr = EF.elem_keyexpr(st, iw, cx.lifted)
 		if kmode == "native" then -- a[i]/a[i+1]/a[3]: native key (reads lifted); assoc uses the raw subscript
 			cx.blocks[p] = d
-				.. ("sh.status = 0; if sh:is_assoc(%q) then rt.assign_element(sh, %q, %q, %s, %s, %s) else rt.assign_element_i(sh, %q, %s, %s, %s) end%s; pc = %d"):format(
-					st.name, st.name, st.index, expw, rhsval(), append,
-					st.name, kstr, rhsval(), append, ecs, after)
+				.. ("do local v_ = %s; if sh:is_assoc(%q) then local k_ = %s; %srt.assign_element(sh, %q, %q, k_, v_, %s) else local k_ = %s; %srt.assign_element_i(sh, %q, k_, v_, %s) end end%s; pc = %d"):format(
+					rhsval(), st.name, expw, st0, st.name, st.index, append,
+					kstr, st0, st.name, append, ecs, after)
 		elseif kmode == "xexp" then -- a[$i]: arith the natively-expanded (lifted-aware) VALUE
 			cx.blocks[p] = d
-				.. ("sh.status = 0; rt.assign_element_x(sh, %q, %s, %s, %s)%s; pc = %d"):format(
-					st.name, expw, rhsval(), append, ecs, after)
+				.. ("do local v_ = %s; local k_ = %s; %srt.assign_element_x(sh, %q, k_, v_, %s) end%s; pc = %d"):format(
+					rhsval(), expw, st0, st.name, append, ecs, after)
 		else -- literal non-arith (a[\'3\']) / non-lifted: the raw arith_str path (sh.vars authoritative)
 			cx.blocks[p] = d
-				.. ("sh.status = 0; rt.assign_element(sh, %q, %q, %s, %s, %s)%s; pc = %d"):format(
-					st.name, st.index, expw, rhsval(), append, ecs, after)
+				.. ("do local v_ = %s; local k_ = %s; %srt.assign_element(sh, %q, %q, k_, v_, %s) end%s; pc = %d"):format(
+					rhsval(), expw, st0, st.name, st.index, append, ecs, after)
 		end
 		return p
 	end
@@ -4228,9 +4242,10 @@ H.assign = function(cx, st, after)
 		local ec = errchk(st)
 		local ecs = ec ~= "" and ("; " .. ec) or ""
 		cx.blocks[p] = d
-			.. ("sh.status = 0; rt.append_scalar(sh, %q, %s)%s%s; pc = %d"):format(
-				st.name,
+			.. ("do local v_ = %s; %srt.append_scalar(sh, %q, v_) end%s%s; pc = %d"):format(
 				rhsval(),
+				st0,
+				st.name,
 				ecs,
 				ua,
 				after
@@ -4257,14 +4272,15 @@ H.assign = function(cx, st, after)
 			.. ua
 			.. ("; pc = %d"):format(after)
 	elseif EF.has_attr or EF.has_nameref then -- readonly / array[0] / -i,-l,-u / nameref write-through
-		-- status 0 first so a plain RHS yields 0 (a cmdsub RHS overwrites it), then
+		-- RHS first, then status 0 unless it has a cmdsub (see above), then
 		-- assign_scalar (readonly reject + nameref/cycle/subscript write-through); errchk applies.
 		local ec = errchk(st)
 		local ecs = ec ~= "" and ("; " .. ec) or ""
 		cx.blocks[p] = d
-			.. ("sh.status = 0; rt.assign_scalar_x(sh, %q, %s)%s%s; pc = %d"):format(
-				st.name,
+			.. ("do local v_ = %s; %srt.assign_scalar_x(sh, %q, v_) end%s%s; pc = %d"):format(
 				rhsval(),
+				st0,
+				st.name,
 				ecs,
 				ua,
 				after
@@ -4275,17 +4291,7 @@ H.assign = function(cx, st, after)
 		-- only when the RHS has no cmdsub; then errchk fires ERR/errexit (`x=$(false)`).
 		local ec = errchk(st)
 		local ecs = ec ~= "" and ("; " .. ec) or ""
-		local hascmd = false
-		if st.rhs then
-			for _, pp in ipairs(st.rhs.parts) do
-				if pp.cmdsub then
-					hascmd = true
-					break
-				end
-			end
-		end
-		local st0 = hascmd and "" or "; sh.status = 0"
-		cx.blocks[p] = d .. ("sh:set_str(%q, %s)%s%s%s; pc = %d"):format(st.name, rhsval(), st0, ecs, ua, after)
+		cx.blocks[p] = d .. ("sh:set_str(%q, %s)%s%s%s; pc = %d"):format(st.name, rhsval(), hascmd and "" or "; sh.status = 0", ecs, ua, after)
 	end
 	return p
 end
@@ -6804,7 +6810,7 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
 					return p
 				end
 			end
-			local cond = emit_dbracket(st.expr, cx.lifted)
+			local cond = emit_dbracket_node(st.expr, cx.lifted)
 			if not cond then
 				return cx.delegate(st, after)
 			end
