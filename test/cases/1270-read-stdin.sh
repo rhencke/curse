@@ -33,5 +33,5 @@ printf 'm1\nm2\n' | { s=$(read c; echo "$c"); echo "csub:$s"; read d; echo "afte
 # read -t 0 polls availability without consuming; a positive timeout on an
 # exhausted/empty stream reports EOF.
 read -t 0 < /dev/null; echo "poll_null=$?"
-echo foo | { read -t 0; echo "poll_reply=[$REPLY] $?"; }
+{ read -t 0; echo "poll_reply=[$REPLY] $?"; } <<< foo  # (a here-string: input is surely there)
 read -t 0.5 < /dev/null; echo "timed=$?"
