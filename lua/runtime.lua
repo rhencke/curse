@@ -1068,7 +1068,7 @@ end
 local _mb_wc = ffi.new("int[1]")
 local _mb_st = ffi.new("curse_mbstate_t")
 function M.mb_strlen(s)
-	if lc_mb_cur_max <= 1 then
+	if lc_mb_cur_max <= 1 or not s:find("[\128-\255]") then -- (ASCII: a char per byte)
 		return #s
 	end
 	ffi.fill(_mb_st, ffi.sizeof(_mb_st))
@@ -1090,7 +1090,7 @@ end
 -- entry per byte (wc = the byte value).
 function M.mb_chars(s)
 	local out, n = {}, #s
-	if lc_mb_cur_max <= 1 then
+	if lc_mb_cur_max <= 1 or not s:find("[\128-\255]") then -- (ASCII: a char per byte)
 		for k = 1, n do
 			out[k] = { s = s:sub(k, k), wc = s:byte(k) }
 		end
@@ -1410,7 +1410,28 @@ function M.ropen(path, flags, mode)
 	end
 	return fd
 end
-local function _temp_fd(content) -- write body to a temp file, return an O_RDONLY fd
+local _temp_fd
+do
+local _hd_pipe = ffi.new("int[2]")
+_temp_fd = function(content) -- the body on an O_RDONLY fd
+	-- (like bash 5.2: a body that fits the pipe buffer goes through a pipe — no temp file;
+	-- a larger one would block the write, so it takes a temp file)
+	if #content < 65536 and C.pipe(_hd_pipe) == 0 then
+		local r, w = _hd_pipe[0], _hd_pipe[1]
+		local off, n = 0, #content
+		while off < n do
+			local k = tonumber(C.curse_co_write(w, ffi.cast("const char *", content) + off, n - off))
+			if k <= 0 then
+				if not (k < 0 and ffi.errno() == 4) then
+					break
+				end
+			else
+				off = off + k
+			end
+		end
+		C.close(w)
+		return r
+	end
 	local tmp = os.tmpname()
 	local w = io.open(tmp, "w")
 	if not w then
@@ -1421,6 +1442,10 @@ local function _temp_fd(content) -- write body to a temp file, return an O_RDONL
 	local f = C.open(tmp, 0, 0) -- O_RDONLY
 	os.remove(tmp) -- the open fd keeps the inode alive
 	return f
+end
+end
+function M.body_fd(content) -- (the interpreter's here-docs too)
+	return _temp_fd(content)
 end
 -- A redirection's open failed: bash's message, from errno (read right after the open).
 -- noclobber's O_EXCL miss on a regular file is "cannot overwrite existing file".
@@ -7015,7 +7040,7 @@ local function substr(val, off, len)
 	-- and length count codepoints, not bytes (byte-equivalent under LC_ALL=C).
 	-- ASCII/single-byte fast path: codepoint == byte, so slice directly with the same
 	-- offset/length math — no mb_chars char-table.
-	if lc_mb_cur_max <= 1 then
+	if lc_mb_cur_max <= 1 or not val:find("[\128-\255]") then -- (bytes are chars: ASCII)
 		local n = #val
 		local o = tonumber(off) or 0
 		if o < 0 then

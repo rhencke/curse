@@ -2301,6 +2301,33 @@ function subscript_word(raw, lifted)
 end
 
 -- Lua expr for a compilable pexp's scalar string value (assumes pexp_compilable).
+-- A ${v:off:len} operand that is plain literal arithmetic (`i%20`, ` -3`, `n+1`) that
+-- can't fail — no side effect, no division but by a non-zero literal — compiles to a
+-- native value; anything else takes rt.substr_arith (expansion, bash's error labels).
+local function substr_safe(e)
+	if type(e) ~= "table" then
+		return true
+	end
+	if e.k == "bin" and (e.op == "/" or e.op == "%") and not (e.r and e.r.k == "num" and tonumber(e.r.v) ~= 0) then
+		return false
+	end
+	for _, f in ipairs({ "e", "l", "r", "c", "a", "b" }) do
+		if not substr_safe(e[f]) then
+			return false
+		end
+	end
+	return true
+end
+local function substr_native(txt, lifted)
+	if not txt or txt == "" or txt:find("[^%w_ %%%*%+%-%(%)<>=!&|%^~?:]") then
+		return nil
+	end
+	local ok, ast = pcall(require("parser").arith, txt, true)
+	if not ok or type(ast) ~= "table" or not_compilable(ast) or arith_side_effect(ast) or not substr_safe(ast) then
+		return nil
+	end
+	return ("tonumber(%s)"):format(emit_value(ast, lifted))
+end
 function pexp_scalar(pe, lifted)
 	-- ${x@a} / ${x[i]@a}: the variable's attribute letters, read straight from its binding
 	-- (attr_string). Independent of value set-ness — a declared valueless assoc still reports
@@ -2424,11 +2451,13 @@ function pexp_scalar(pe, lifted)
 	if pe.op == "sub" then -- ${v:off:len}: arith-eval off/len (nil-coerced to 0 for a present
 		-- operand, like interp), then substr by codepoint via apply_str_op("sub").
 		local P = require("parser")
-		local off = ("(rt.substr_arith(sh, %q, %s) or 0)"):format(require("runtime").pe_label(pe), emit_word(P.parse_word(pe.arg or ""), lifted))
+		local off = substr_native(pe.arg, lifted)
+			or ("(rt.substr_arith(sh, %q, %s) or 0)"):format(require("runtime").pe_label(pe), emit_word(P.parse_word(pe.arg or ""), lifted))
 		if pe.arg2 == nil then
 			return ('sh:apply_str_op("sub", %s, %s)'):format(val, off)
 		end
-		local len = ("(rt.substr_arith(sh, %q, %s) or 0)"):format(require("runtime").pe_label(pe), emit_word(P.parse_word(pe.arg2), lifted))
+		local len = substr_native(pe.arg2, lifted)
+			or ("(rt.substr_arith(sh, %q, %s) or 0)"):format(require("runtime").pe_label(pe), emit_word(P.parse_word(pe.arg2), lifted))
 		return ('sh:apply_str_op("sub", %s, %s, %s, %q)'):format(val, off, len, pe.arg2)
 	end
 	-- strip/subst/case (PEXP_STROP): a plain literal pattern is passed verbatim (apply_str_op
@@ -2955,15 +2984,36 @@ end
 -- each final field. Used for commands whose args word-split/glob.
 local function field_argv(words, from, lifted, wrap, prefix)
 	local out = { prefix and ("local __a = {" .. prefix .. "}") or "local __a = {}" }
+	-- a long run of plain literal words (`printf x {1..70000}`) becomes ONE constant table:
+	-- one statement per word overflows LuaJIT's jump range (as for-in lists do)
+	local run = {}
+	local function flush_run()
+		if #run > 32 then
+			out[#out + 1] = ("for _, __v in ipairs({%s}) do __a[#__a+1] = __v end"):format(table.concat(run, ","))
+		else
+			for _, e in ipairs(run) do
+				out[#out + 1] = "__a[#__a+1] = rt.cstr(" .. e .. ")"
+			end
+		end
+		run = {}
+	end
 	for j = from, #words do
 		local w = words[j]
 		if not empty_word(w) then -- an empty brace alternative ({X,,Y,}) adds no arg
 			if not word_safe(w) and not field_word(w, lifted) and not mixed_expandable(w, lifted) then
 				return nil
 			end
-			out[#out + 1] = emit_fields_into("__a", w, lifted, wrap)
+			local code = emit_fields_into("__a", w, lifted, wrap)
+			local lit = code:match('^__a%[#__a%+1%] = rt%.cstr%((%("[^"\\]*"%))%)$')
+			if lit then
+				run[#run + 1] = lit
+			else
+				flush_run()
+				out[#out + 1] = code
+			end
 		end
 	end
+	flush_run()
 	return table.concat(out, "; ")
 end
 

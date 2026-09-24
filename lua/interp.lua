@@ -2512,18 +2512,11 @@ local function place_fd(f, fd)
 		C.close(f)
 	end
 end
-local function feed_stdin(fd, body)
-	local tmp = os.tmpname()
-	local w = io.open(tmp, "w")
-	if w then
-		w:write(body)
-		w:close()
-	end
-	local f = C.open(tmp, 0, 0)
+local function feed_stdin(fd, body) -- (a pipe for a small body, like bash: rt.body_fd)
+	local f = rt.body_fd(body)
 	if f >= 0 then
 		place_fd(f, fd)
 	end
-	os.remove(tmp)
 end
 -- Apply redirections, backing up each touched fd (any fd, not just 0/1/2) so it
 -- can be restored. Returns (save, ok); ok is false when an open() failed (bash
