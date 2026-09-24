@@ -557,9 +557,20 @@ function Shell:is_global_ro(name)
 	end
 	return true
 end
+-- `local` outside any function (a compiled subshell / pipeline stage / $( ) at the top
+-- level runs it natively): bash's "can only be used in a function", status 1
+function M.local_nofn(sh)
+	if sh.pd == 0 and (sh.calldepth or 0) == 0 then
+		sh:errmsg("curse: local: can only be used in a function\n")
+		sh.status = 1
+		return true
+	end
+	return false
+end
 function M.local_ro(sh, name)
-	if sh:is_global_ro(name) then
-		sh:errmsg("curse: " .. name .. ": readonly variable\n")
+	if sh:is_global_ro(name) then -- (the compound assignment's error names the FUNCTION: bash's
+		local fnm = sh.funcstack and sh.funcstack[1] -- this_command_name still holds it)
+		sh:errmsg("curse: " .. (fnm and (fnm .. ": ") or "") .. name .. ": readonly variable\n")
 		sh:errmsg("curse: local: " .. name .. ": readonly variable\n")
 		sh.status = 1
 		return true
@@ -571,18 +582,37 @@ end
 -- the shadowed outer one). Returns false (else true) when the name is READONLY: bash
 -- fails that operand (message + `local` returns 1) WITHOUT shadowing it or changing
 -- the value, and continues with the rest — so the caller ORs the results into $?.
-function Shell:localAssign(arg)
+function Shell:localAssign(arg, cmd)
 	local nm, op, val = arg:match("^([%a_][%w_]*)(%+?=)(.*)$")
 	local name = nm or arg
 	-- readonly NAME: no shadow, no assignment (the readonly global stays visible in the
-	-- frame). Message routes through any 2>&1 capture, exactly like interp.
-	if self:is_global_ro(name) then
-		self:errmsg("curse: local: " .. name .. ": readonly variable\n")
+	-- frame) — nor for a readonly local of this same scope (`local -r x; local x=2`: bash's
+	-- make_local_variable returns it, and the assignment fails). Message routes through
+	-- any 2>&1 capture, exactly like interp.
+	local own = self.savedstack[self.pd]
+	local ob = self.vars[name]
+	if self:is_global_ro(name) or (nm and ob and ob.ro and own and own[name] ~= nil) then
+		self:errmsg("curse: " .. (cmd or "local") .. ": " .. name .. ": readonly variable\n")
 		return false
 	end
 	if nm then
+		local again = own and own[nm] ~= nil -- (already local here: it keeps its attributes)
 		self:localVar(nm, true)
-		self:set_str(nm, op == "+=" and (self:get(nm) .. val) or val)
+		local b = again and self.vars[nm]
+		if b and (b.int or b.lower or b.upper or b.cap or b.arr or b.ref) then
+			-- an attributed local assigns like `name=value` / `name+=value` (declare -i
+			-- arithmetic — its errors naming the builtin — case folding, element 0)
+			local P = require("parser")
+			local sv = P.arith_cmd
+			P.arith_cmd = cmd or "local"
+			local ok, e = pcall(op == "+=" and M.append_scalar or M.assign_scalar, self, nm, val)
+			P.arith_cmd = sv
+			if not ok then
+				error(e, 0)
+			end
+		else
+			self:set_str(nm, op == "+=" and (self:get(nm) .. val) or val)
+		end
 	else
 		self:localVar(arg)
 	end

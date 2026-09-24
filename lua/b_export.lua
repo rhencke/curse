@@ -18,12 +18,16 @@ local func_body_text = I.func_body_text
 local C, P = I.C, I.P
 
 return function(sh, cmd, args, hook, tcb)
-	if cmd == "export" or cmd == "declare" or cmd == "typeset" or cmd == "readonly" then
+	if cmd == "export" or cmd == "declare" or cmd == "typeset" or cmd == "readonly" or cmd == "local" then
+		-- (`local` comes here from b_local — after its own option check, listing and -p —
+		-- for bash's declare_internal(list, local_var=1): every operand becomes a local)
+		local isdecl = cmd == "declare" or cmd == "typeset" or cmd == "local"
 		-- export/declare [-Apx] NAME[=val]…: set the var; export/-x also pushes it to
 		-- the process env so posix_spawn children inherit it. -A marks associative,
 		-- -p prints declarations.
 		local doexport, assoc, printmode, nref, plusn = (cmd == "export"), false, false, false, false
 		local plusx, gflag, unexport = false, false, false
+		local chklocal = false -- -G: like -g, but a local at the current scope is used (bash)
 		local tattr, plust, plusr = false, false, false -- -t / +t: the function trace attribute
 		local funcnames, funcbody, iattr, lattr, uattr, rattr, aattr = false, false, false, false, false, false, false
 		local cattr = false -- declare -c: capitalize (first char upper, rest lower)
@@ -31,7 +35,7 @@ return function(sh, cmd, args, hook, tcb)
 		local rest = {}
 		-- Valid attribute letters per command; any other letter is an invalid option
 		-- (bash: status 2, or 1 for `local`). export/readonly accept a narrower set.
-		local VALID = (cmd == "export" or cmd == "readonly") and "afnpA" or "aAcfFgilnprtuxI"
+		local VALID = (cmd == "export" or cmd == "readonly") and "afnpA" or "aAcfFgGilnprtuxI"
 		local opterr, endopts, ro_n = nil, false, false
 		for j = 2, #args do
 			local a = args[j]
@@ -91,8 +95,9 @@ return function(sh, cmd, args, hook, tcb)
 				if a:find("a") then
 					aattr = true
 				end
-				if a:find("g") then
+				if a:find("[gG]") then
 					gflag = true
+					chklocal = chklocal or a:find("G") ~= nil
 				end
 				if a:find("t") then
 					tattr = true
@@ -100,6 +105,9 @@ return function(sh, cmd, args, hook, tcb)
 			elseif not endopts and a:sub(1, 1) == "+" and #a > 1 then
 				if a:find("n") then
 					plusn = true
+				end
+				if a:find("p") then -- (`+p` is still -p: bash's pflag++ ignores the sign)
+					printmode = true
 				end
 				if a:find("x") then
 					plusx = true
@@ -122,6 +130,13 @@ return function(sh, cmd, args, hook, tcb)
 			else
 				rest[#rest + 1] = a
 			end
+		end
+		-- -c/-l/-u each turn the other two off (declare.def's flags_off): two of them cancel
+		-- out, and the var loses all three (`declare -lu a=AbC` -> `declare -- a="AbC"`)
+		if ((lattr and 1 or 0) + (uattr and 1 or 0) + (cattr and 1 or 0)) >= 2 then
+			lattr, uattr, cattr = false, false, false
+			plusattr = plusattr or {}
+			plusattr.l, plusattr.u, plusattr.c = true, true, true
 		end
 		if opterr then -- an unknown attribute letter: bash prints usage and fails (status 2)
 			io.stderr:write("curse: " .. cmd .. ": -" .. opterr .. ": invalid option\n" .. rt.usage(cmd))
@@ -209,8 +224,8 @@ return function(sh, cmd, args, hook, tcb)
 				end
 			end
 		end
-		local fnbad = (funcnames or funcbody)
-			and (aattr and "a" or assoc and "A" or iattr and "i" or lattr and "l" or uattr and "u" or cattr and "c" or nref and "n")
+		local fnbad = (funcnames or funcbody) -- (declare.def reports -n, then -i, -A, -a)
+			and (nref and "n" or iattr and "i" or assoc and "A" or aattr and "a")
 		if fnbad then -- an attribute a function can't have (bash: status 1)
 			io.stderr:write("curse: " .. cmd .. ": -" .. fnbad .. ": invalid option\n")
 			sh.status = 1
@@ -335,21 +350,38 @@ return function(sh, cmd, args, hook, tcb)
 			local roattr = (cmd == "readonly") or rattr
 			-- `declare`/`typeset` in a function make each name LOCAL (like `local`),
 			-- unless -g; `export`/`readonly` always act on the global var (bash).
-			local localize = (cmd == "declare" or cmd == "typeset") and not gflag and (sh.calldepth or 0) > 0
+			local localize = isdecl and not gflag and ((sh.calldepth or 0) > 0 or cmd == "local")
 			local unswap
 			if gflag and (sh.calldepth or 0) > 0 then -- (act on the globals, past any caller's locals)
 				local gnames = {}
+				local own = chklocal and sh.savedstack[sh.pd]
 				for _, a in ipairs(rest) do
-					gnames[#gnames + 1] = a:match("^([%a_][%w_]*)")
+					local gn = a:match("^([%a_][%w_]*)")
+					if not (own and gn and own[gn] ~= nil) then -- (-G: this scope's local wins)
+						gnames[#gnames + 1] = gn
+					end
 				end
 				unswap = sh:global_swap(gnames)
 			end
 			local allok = true
+			-- make_local_variable (variables.c): a readonly GLOBAL can't be made local, and a
+			-- readonly local of this very scope stays itself (its reassignment fails); a
+			-- caller's readonly local is just shadowed
+			local function ro_blocks(name)
+				local b = sh.vars[name]
+				if not (b and b.ro) then
+					return false
+				elseif not localize or sh:is_global_ro(name) then
+					return true
+				end
+				local own = sh.savedstack[sh.pd]
+				return own ~= nil and own[name] ~= nil
+			end
 			for _, a in ipairs(rest) do
 				-- `declare -A c[200]` / `declare x[3]`: an element form with no value declares
 				-- the array itself (bash ignores the subscript)
 				local mkarr = false
-				if (cmd == "declare" or cmd == "typeset") and not a:find("=", 1, true) then
+				if isdecl and not a:find("=", 1, true) then
 					local base = a:match("^([%a_][%w_]*)%[.*%]$")
 					if base and nref then -- (`declare -n a[3]`)
 						io.stderr:write("curse: " .. cmd .. ": " .. a .. ": reference variable cannot be an array\n")
@@ -410,7 +442,7 @@ return function(sh, cmd, args, hook, tcb)
 				end
 				-- (`declare -n ref=x` re-points the ref: the REF's own readonly-ness counts)
 				local rov = nm and sh.vars[nref and nm or sh:deref(nm)]
-				if rov and rov.ro then
+				if rov and rov.ro and (not localize or ro_blocks(nref and nm or sh:deref(nm))) then
 					-- reassigning a readonly variable is rejected (bash: `typeset +r r=v` too)
 					-- (declare/typeset name themselves; export/readonly don't, like bash)
 					-- (…but with -a/-A the array assignment code reports it, naming the builtin:
@@ -424,7 +456,7 @@ return function(sh, cmd, args, hook, tcb)
 					and (
 						aattr
 						or assoc
-						or ((cmd == "declare" or cmd == "typeset") and not nref and sh.vars[sh:deref(nm)] and sh.vars[sh:deref(nm)].arr)
+						or (isdecl and not nref and sh.vars[sh:deref(nm)] and sh.vars[sh:deref(nm)].arr)
 					)
 					and val:sub(1, 1) == "("
 					and val:sub(-1) == ")"
@@ -574,6 +606,11 @@ return function(sh, cmd, args, hook, tcb)
 					io.stderr:write("curse: " .. cmd .. ": `" .. sh.vars[a].s .. "': not a valid identifier\n")
 					allok = false
 				elseif a:match("^[%a_][%w_]*$") then
+					if localize and sh:is_global_ro(a) then -- (this scope's own: re-declared as is)
+						io.stderr:write("curse: " .. cmd .. ": " .. a .. ": readonly variable\n")
+						allok = false
+						goto continue
+					end
 					local db = sh.vars[a]
 					if db and db.ref and db.s and not db.ro and not nref and not plusn and not plusr
 						and (aattr or assoc or localize) and db.s:match("^[%a_][%w_]*$") and sh:deref(a) ~= "" then
@@ -763,7 +800,7 @@ return function(sh, cmd, args, hook, tcb)
 					if anm and sub == "" then -- `declare a[]=x`
 						io.stderr:write("curse: " .. anm .. "[]: bad array subscript\n")
 						allok = false
-					elseif anm and (aattr or assoc) and (cmd == "declare" or cmd == "typeset")
+					elseif anm and (aattr or assoc) and isdecl
 						and aval:sub(1, 1) == "(" and aval:sub(-1) == ")" then
 						-- `declare -a e[10]='(test)'`: a compound value assigns the whole array
 						-- (bash ignores the subscript)
@@ -780,7 +817,7 @@ return function(sh, cmd, args, hook, tcb)
 					elseif anm and nref then -- `declare -n a[3]=x`
 						io.stderr:write("curse: " .. cmd .. ": " .. anm .. "[" .. sub .. "]: reference variable cannot be an array\n")
 						allok = false
-					elseif anm and (cmd == "declare" or cmd == "typeset") then
+					elseif anm and isdecl then
 						if aval:sub(1, 1) == "(" and aval:sub(-1) == ")" and sh.vars[sh:deref(anm)] == nil then
 							-- (bash warns only when it's creating the array here)
 							io.stderr:write("curse: warning: " .. anm .. "[" .. sub .. "]=" .. aval .. ": quoted compound array assignment deprecated\n")

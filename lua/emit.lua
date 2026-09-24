@@ -5248,19 +5248,23 @@ simple_compiled = function(cx, st, after)
 				tmps[#tmps + 1] = ("local %s = %s"):format(tn, av)
 				-- localAssign returns false for a READONLY name (message + that operand fails);
 				-- `local` returns 1 if ANY operand failed, else 0 — the others still localize.
-				calls[#calls + 1] = ("__lok = (sh:localAssign(%s) ~= false) and __lok"):format(tn)
+				calls[#calls + 1] = ("__lok = (sh:localAssign(%s, %q) ~= false) and __lok"):format(tn, cmd)
 			end
 		end
 		if #calls == 0 then
 			body = "sh.status = 0"
+			if cmd == "local" then -- (a `local` reached outside any function: interp's error)
+				body = "if not rt.local_nofn(sh) then sh.status = 0 end"
+			end
 		else
 			body = table.concat(tmps, "; ")
-				.. "; local __lok = true; "
+				.. (cmd == "local" and "; if not rt.local_nofn(sh) then " or "; do ")
+				.. "local __lok = true; "
 				.. table.concat(calls, "; ")
-				.. "; sh.status = __lok and 0 or 1"
+				.. "; sh.status = __lok and 0 or 1 end"
 			-- a function's lifted locals (func_locals): their registers take the new values
 			for j = 2, #st.words do
-				local nm = (unq_full_lit(st.words[j]) or ""):match("^([%a_][%w_]*)=")
+				local nm = (unq_full_lit(st.words[j]) or ""):match("^([%a_][%w_]*)%+?=")
 				if nm and EF.fn_locals and EF.fn_locals[nm] and cx.lifted[nm] then
 					body = body .. ("; %s = sh:aget(%q)"):format(lname(nm), nm)
 				end

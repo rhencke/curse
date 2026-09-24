@@ -5582,7 +5582,9 @@ exec_stmt = function(sh, st, hook)
 					wasro[aa] = true
 				elseif b and b.ro and sh:is_global_ro(sh:deref(aa.name)) then
 					-- `local ro=(…)`: bash's compound assignment fails first, then local's own error
-					io.stderr:write("curse: " .. aa.name .. ": readonly variable\n")
+					-- (the first under this_command_name — still the calling FUNCTION's name)
+					local fnm = sh.funcstack and sh.funcstack[1]
+					io.stderr:write("curse: " .. (fnm and (fnm .. ": ") or "") .. aa.name .. ": readonly variable\n")
 				end
 			end
 			sh.arrayargs_ro = wasro
