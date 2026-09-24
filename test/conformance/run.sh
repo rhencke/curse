@@ -54,8 +54,12 @@ if [ "${1:-}" = --run-unit ]; then
       # THIS_SH is the shell's full path, as bash's own suite runs it: tests copy it
       # (`cp ${THIS_SH} $TMPDIR/sh`) and write it into `#!${THIS_SH}` lines, which a bare
       # name can't satisfy — the oracle would fail those checks by itself.
-      bash)  ( cd "$cwd" && THIS_SH="$(command -v bash)" timeout "$H_TIMEOUT" bash "$runscript" </dev/null ) ;;
-      dash)  ( cd "$cwd" && THIS_SH="$(command -v dash)" timeout "$H_TIMEOUT" dash "$runscript" </dev/null ) ;;
+      # (every shell gets the SAME environment as curse's run below — XDG_*, CURSE_FALLBACK
+      # — or a test that lists it, `env | grep HOME`, would differ by the harness alone)
+      bash)  ( cd "$cwd" && XDG_RUNTIME_DIR="$H_XDG_RUNTIME" XDG_CACHE_HOME="$ucache" CURSE_FALLBACK="$H_FALLBACK" \
+                 THIS_SH="$(command -v bash)" timeout "$H_TIMEOUT" bash "$runscript" </dev/null ) ;;
+      dash)  ( cd "$cwd" && XDG_RUNTIME_DIR="$H_XDG_RUNTIME" XDG_CACHE_HOME="$ucache" CURSE_FALLBACK="$H_FALLBACK" \
+                 THIS_SH="$(command -v dash)" timeout "$H_TIMEOUT" dash "$runscript" </dev/null ) ;;
       # curse via the resident daemon: the C client hands the script to cursed, which
       # tiers on a cache miss (interp -> OSR + store .bc) or loads the .bc on a hit.
       # THIS_SH=client so bash-suite self-reinvokes hit the daemon too; fallback fails
@@ -81,6 +85,11 @@ if [ "${1:-}" = --run-unit ]; then
     if [ "$1" = dash ] && [ "$3" -eq 2 ] && [ "$bst" -ne 2 ]; then v=NA
     elif [ "$2" = "$bout" ] && [ "$3" -eq "$bst" ]; then v=PASS; fi
     printf '%s\t%s\t%s\t%s\t%s\n' "$corpus" "$1" "$v" "$4" "$testid" >> "$res"
+    # H_DIFF_DIR=dir: keep a failing test's expected (bash) and actual output + statuses
+    if [ "$v" = FAIL ] && [ -n "${H_DIFF_DIR:-}" ]; then
+      printf '%s\n[status %s]\n' "$bout" "$bst" > "$H_DIFF_DIR/$testid.expected"
+      printf '%s\n[status %s]\n' "$2" "$3" > "$H_DIFF_DIR/$testid.$1"
+    fi
   }
   # result row: corpus \t shell \t verdict \t duration_us \t testid
   prep; _s=$(now_us); one bash >"$ofile" 2>/dev/null; bst=$?; bdur=$(( $(now_us) - _s )); bout=$(cat "$ofile" 2>/dev/null)

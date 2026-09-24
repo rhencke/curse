@@ -5497,7 +5497,10 @@ exec_stmt = function(sh, st, hook)
 					C.clearenv()
 				end
 				sh.exec_builtin = true -- (a lookup failure reads `exec: NAME: not found`, bash)
+				local sd = rt.shlvl_delta
+				rt.shlvl_delta = -1 -- (the command replaces the shell: bash lowers SHLVL for it)
 				local eok, eerr = pcall(exec_simple, sh, rest, hook)
+				rt.shlvl_delta = sd
 				sh.exec_builtin = nil
 				if not eok then
 					error(eerr, 0)

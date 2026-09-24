@@ -1778,7 +1778,7 @@ function Shell:exec(...)
 		if self.exec_tail and self.exec_tail == C.getpid() then -- armed by THIS process only
 			self.exec_tail = nil
 			C.sigprocmask(2, _exec_emptyset, nil) -- SIG_SETMASK
-			C.curse_rt_execve(execpath, ffi.cast("char *const *", argv), C.environ)
+			C.curse_rt_execve(execpath, ffi.cast("char *const *", argv), M.child_env())
 			local e = ffi.errno()
 			if e == 8 then -- ENOEXEC: no-shebang script — run it through our interpreter
 				return self:run_noexec(execpath, args, n)
@@ -1791,7 +1791,8 @@ function Shell:exec(...)
 		local attr = child_spawnattr(self)
 		local fa = M.foreign_fa(self, nil)
 		M.rd_gen = M.rd_gen + 1 -- (a new process may read our input: see M.pipe_cache)
-		local rc = C.posix_spawnp(pidp, execpath, fa, attr, ffi.cast("char *const *", argv), C.environ)
+		local cenv = M.child_env() -- (bash's order; kept alive across the call)
+		local rc = C.posix_spawnp(pidp, execpath, fa, attr, ffi.cast("char *const *", argv), cenv)
 		if fa then
 			C.posix_spawn_file_actions_destroy(fa)
 		end
@@ -1827,7 +1828,8 @@ function Shell:exec(...)
 	local pidp = ffi.new("curse_pid_t[1]")
 	local attr = child_spawnattr(self)
 	M.rd_gen = M.rd_gen + 1 -- (a new process may read our input: see M.pipe_cache)
-	local rc = C.posix_spawnp(pidp, execpath, fa, attr, ffi.cast("char *const *", argv), C.environ)
+	local cenv = M.child_env() -- (bash's order; kept alive across the call)
+	local rc = C.posix_spawnp(pidp, execpath, fa, attr, ffi.cast("char *const *", argv), cenv)
 	if attr then
 		C.posix_spawnattr_destroy(attr)
 	end
@@ -3282,7 +3284,8 @@ function Shell:spawn_bg(args, cmdstr)
 		attr = async_spawn_hold(attr)
 	end
 	M.rd_gen = M.rd_gen + 1 -- (a new process may read our input: see M.pipe_cache)
-	local rc = C.posix_spawnp(pidp, execpath, fa, attr, ffi.cast("char *const *", argv), C.environ)
+	local cenv = M.child_env() -- (bash's order; kept alive across the call)
+	local rc = C.posix_spawnp(pidp, execpath, fa, attr, ffi.cast("char *const *", argv), cenv)
 	if hold then
 		async_spawn_release()
 	end
@@ -6465,6 +6468,80 @@ local function assoc_bucket(key, nb)
 	return tonumber(h % i64(nb or 1024))
 end
 M.assoc_bucket = assoc_bucket
+-- $SHLVL: a new shell raises it (bash's adjust_shell_level at startup: a non-number is 0,
+-- below 0 is 0, 1000 and up warns and resets to 1), exported.
+M.shlvl_delta = 0
+function M.shlvl_start(sh)
+	local b = sh.vars.SHLVL
+	local v = b and sh:get("SHLVL") or ""
+	local n = v:match("^%s*[+-]?%d+%s*$") and tonumber(v) or 0
+	n = n + 1
+	if n < 0 then
+		n = 0
+	elseif n >= 1000 then
+		io.stderr:write(("curse: warning: shell level (%d) too high, resetting to 1\n"):format(n))
+		n = 1
+	end
+	sh:set_str("SHLVL", tostring(n))
+	local nb = sh.vars.SHLVL
+	if nb and not nb.exported then
+		nb.exported = true
+	end
+	C.setenv("SHLVL", tostring(n), 1)
+end
+-- A child's environment in bash's order: bash builds it by walking its variable hash
+-- table — the same FNV-1 / 1024-bucket order, the newest variable first within a
+-- bucket — and appends `_` last. The process environ is (re)ordered that way at each
+-- spawn: its entries in bucket order, a later (newer) entry first within a bucket.
+do
+	local bucket_of = setmetatable({}, { __mode = "k" }) -- name -> bucket (names recur)
+	local nbuckets_cache = 0
+	function M.child_env()
+		local env = C.environ
+		local items, n = {}, 0
+		if env == nil then -- (cleared: `exec -c`)
+			local empty = ffi.new("char *[1]")
+			return empty
+		end
+		while env[n] ~= nil do
+			local s = ffi.string(env[n])
+			local name = s:match("^[^=]*")
+			local b = bucket_of[name]
+			if not b then
+				b = assoc_bucket(name, 1024)
+				if nbuckets_cache > 4096 then
+					bucket_of, nbuckets_cache = {}, 0
+				end
+				bucket_of[name], nbuckets_cache = b, nbuckets_cache + 1
+			end
+			items[n + 1] = { p = env[n], b = name == "_" and 1e9 or b, i = n }
+			n = n + 1
+		end
+		local d = M.shlvl_delta
+		if d ~= 0 then -- (the command REPLACES this shell — `exec cmd`: bash lowers SHLVL first)
+			for k = 1, n do
+				local s = ffi.string(items[k].p)
+				if s:sub(1, 6) == "SHLVL=" then
+					local lv = (tonumber(s:sub(7)) or 0) + d
+					M._shlvl_anchor = "SHLVL=" .. tostring(lv < 0 and 0 or lv)
+					items[k].p = ffi.cast("char *", M._shlvl_anchor)
+				end
+			end
+		end
+		table.sort(items, function(x, y)
+			if x.b ~= y.b then
+				return x.b < y.b
+			end
+			return x.i > y.i
+		end)
+		local arr = ffi.new("char *[?]", n + 1)
+		for k = 1, n do
+			arr[k - 1] = items[k].p
+		end
+		arr[n] = nil
+		return arr
+	end
+end
 
 function Shell:array_indices(name)
 	if VIRT_ARR[name] then
