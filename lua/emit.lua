@@ -6743,8 +6743,12 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
 			-- eval's cf-wrapper) as a raised signal, like interp; a return inside a compiled
 			-- subshell (subexit) still jumps locally.
 			local frag_return = ((EF.fragment and cx.toplevel) or (EF.cf_raise and EF.cf_raise.func)) and #cx.subexit == 0
-			local retjmp = frag_return and ((EF.cf_flush or "") .. "error({ __curse_return = sh.status })")
+			-- (raised, `return N` leaves $? as it was — the RETURN trap of the `.` sees that —
+			-- and carries N: return.def sets only return_catch_value)
+			local retjmp = frag_return
+					and ((EF.cf_flush or "") .. "do local __r = sh.status; sh.status = __ps; error({ __curse_return = __r }) end")
 				or ("pc = %d"):format(retpc)
+			local ps = frag_return and "local __ps = sh.status; " or ""
 			if frag_return and not (EF.cf_raise and EF.cf_raise.func) then -- (a stage/eval fragment
 				-- at top level: maybe no function is running — then bash's diagnostic, status 2)
 				retjmp = ("if rt.return_outside(sh) then pc = %d else %s end"):format(after, retjmp)
@@ -6754,17 +6758,17 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
 				local d = dbg(st) -- DEBUG fires before return too
 				if not aw then -- `return` with no arg → previous status (in a trap: its entry status)
 					local p = cx.newpc()
-					cx.blocks[p] = d .. "sh.status = rt.return_default(sh); " .. retjmp
+					cx.blocks[p] = d .. ps .. "sh.status = rt.return_default(sh); " .. retjmp
 					return p
 				elseif word_safe(aw) then -- one field (literal/quoted): `return ""` → 2, `return 42` → 42
 					local p = cx.newpc()
-					cx.blocks[p] = d
+					cx.blocks[p] = d .. ps
 						.. ("sh.status = rt.return_status(sh, %s); "):format(emit_word(aw, cx.lifted)) .. retjmp
 					return p
 				elseif field_word(aw, cx.lifted) then -- unquoted expansion: split — 0 fields → $?, else 1st field
 					local fw = field_word(aw, cx.lifted)
 					local p = cx.newpc()
-					cx.blocks[p] = d
+					cx.blocks[p] = d .. ps
 						.. ("do local __f = rt.field_split(sh, %s, %s); if #__f > 0 then sh.status = rt.return_status(sh, __f[1]) end end; "):format(
 							fw.expr,
 							tostring(fw.split)

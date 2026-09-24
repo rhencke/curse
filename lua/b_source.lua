@@ -52,6 +52,7 @@ return function(sh, cmd, args, hook, tcb)
 		local do_return = name ~= nil
 		local dsave -- (the DEBUG trap, hidden while the file runs: rt.source_debug_hide)
 		local e0 = sh.traps and sh.traps.ERR -- (the ERR trap before it: rt.source_err_sample)
+		local rret -- (a `return N` ending the file: $? once the RETURN trap has run)
 		if not name then
 			io.stderr:write("curse: " .. cmd .. ": filename argument required\n" .. usage)
 			sh.status = 2
@@ -135,7 +136,7 @@ return function(sh, cmd, args, hook, tcb)
 					end
 					if not rok then
 						if type(err) == "table" and err.__curse_return then
-							sh.status = err.__curse_return
+							rret = err.__curse_return
 						elseif type(err) == "table" and err.__curse_parseerr then
 							sh.status = 2 -- a syntax error in the file: source returns 2, doesn't halt the shell (bash)
 						else
@@ -155,6 +156,9 @@ return function(sh, cmd, args, hook, tcb)
 				sh.status = sv
 				sh.in_return_trap = false
 			end
+		end
+		if rret then
+			sh.status = rret
 		end
 		rt.source_debug_restore(sh, dsave)
 		rt.source_err_sample(sh, e0)

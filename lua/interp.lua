@@ -4216,8 +4216,11 @@ local function run_function(sh, cmd, fn, args, hook, tenv_base)
 		restore_redirs(rsave)
 	end
 	sh.loopdepth = saved_ld
+	-- `return N` sets the function's status but not $? (return.def: only return_catch_value),
+	-- so the RETURN trap sees the status from before it; N is $? once the trap has run
+	local rret
 	if not ok and type(err) == "table" and err.__curse_return then
-		sh.status = err.__curse_return
+		rret = err.__curse_return
 		ok, err = true, nil
 	end
 	-- RETURN trap: fires as the function returns, still in ITS context (FUNCNAME, the
@@ -4235,6 +4238,9 @@ local function run_function(sh, cmd, fn, args, hook, tenv_base)
 		run_trap(sh, rt_h)
 		sh.status = saved
 		sh.in_return_trap = false
+	end
+	if rret then
+		sh.status = rret
 	end
 	rt.debug_leave(sh, dbg_saved)
 	table.remove(sh.funcstack, 1)
@@ -5031,7 +5037,6 @@ local function run_debug(sh, line)
 	sh.status = saved
 	sh.in_debug = false
 	if rret then -- `return` in the DEBUG trap returns from the running function
-		sh.status = rret
 		error({ __curse_return = rret })
 	end
 	-- `exit` in a DEBUG trap exits the shell; a non-zero DEBUG return under errexit
@@ -6668,7 +6673,6 @@ fire_err_trap = function(sh)
 		sh.status = saved
 		sh.in_err_trap = false
 		if rret then -- `trap 'return N' ERR`: the failing command's function returns N
-			sh.status = rret
 			error({ __curse_return = rret })
 		end
 	end
@@ -6723,6 +6727,7 @@ local function run_signal(sh, signum, direct)
 		error({ __curse_exit = sh.status })
 	end -- `exit` in the trap exits the shell
 	if rret then -- `return` in the handler returns from the interrupted function
+		sh.status = saved
 		error({ __curse_return = rret })
 	end
 	sh.status = saved -- otherwise $? is preserved across the signal

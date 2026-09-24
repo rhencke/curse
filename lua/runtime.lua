@@ -10381,9 +10381,10 @@ function M.source(sh, argv, line)
 	if #argv > j and sh.params == ownp then -- (params the file SET itself stay: bash)
 		sh.params, sh.nparams = savep, savenp
 	end
+	local rret -- (`return N` doesn't set $? — the RETURN trap sees the status before it)
 	if not rok then
 		if type(err) == "table" and err.__curse_return then
-			sh.status = err.__curse_return
+			rret = err.__curse_return
 		else
 			M.source_debug_restore(sh, dsave)
 			error(err) -- exit / break / continue propagate
@@ -10397,6 +10398,9 @@ function M.source(sh, argv, line)
 		Ii.run_trap(sh, trap)
 		sh.status = sv
 		sh.in_return_trap = false
+	end
+	if rret then
+		sh.status = rret
 	end
 	M.source_debug_restore(sh, dsave)
 	M.source_err_sample(sh, e0)
