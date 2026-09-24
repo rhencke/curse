@@ -391,6 +391,10 @@ return function(sh, cmd, args, hook, tcb)
 						C.setenv("SHELLOPTS", sh:shellopts(), 1)
 					end
 					goto continue
+				elseif a == "SHELLOPTS" and (unexport or plusx) and sh.shellopts_exported then
+					sh.shellopts_exported = nil -- (`export -n SHELLOPTS`: out of the environment)
+					C.unsetenv("SHELLOPTS")
+					goto continue
 				end
 				if (aattr or assoc) and not nref and not localize and not a:find("[", 1, true) then
 					-- `declare -n foo; declare -a foo`: a VALUELESS nameref becomes the array

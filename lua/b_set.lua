@@ -17,6 +17,19 @@ local do_arrayassign, eval, fmt_decl, fmt_set_var = I.do_arrayassign, I.eval, I.
 local C, P = I.C, I.P
 local opt_on, set_opt, SETFLAG, SETOPT = I.opt_on, I.set_opt, I.SETFLAG, I.SETOPT
 
+-- `set -o` (aligned on/off) or `set +o` (reproducible `set ±o NAME`): list_minus_o_opts
+local function list_o(sh, plus)
+	for _, ent in ipairs(SETOPTS) do
+		if plus then
+			sh.out(("set %so %s\n"):format(opt_on(sh, ent[2]) and "-" or "+", ent[1]))
+		else
+			sh.out(("%-15s\t%s\n"):format(ent[1], opt_on(sh, ent[2]) and "on" or "off"))
+		end
+	end
+end
+
+local USAGE = "set: usage: set [-abefhkmnptuvxBCEHPT] [-o option-name] [--] [-] [arg ...]\n"
+
 return function(sh, cmd, args, hook, tcb)
 	if cmd == "set" then
 		-- set [-e|+e|-o NAME|+o NAME|…] [--] [ARGS…]: options then positional params
@@ -33,72 +46,112 @@ return function(sh, cmd, args, hook, tcb)
 					sh.out(fmt_set_var(nm, b) .. "\n")
 				end
 			end
+			-- then the functions, outside posix mode (print_all_shell_variables)
+			if not sh.opt_posix then
+				names = {}
+				for nm in pairs(sh.functions) do
+					names[#names + 1] = nm
+				end
+				table.sort(names)
+				for _, nm in ipairs(names) do
+					local d = I.func_body_text(sh, nm)
+					if d then
+						sh.out(d .. "\n")
+					end
+				end
+			end
 			sh.status = 0
+			if sh.out == io.write then
+				rt.chkwrite(sh, "set") -- (sh_chkwrite: a closed stdout is status 1)
+			end
 			return
 		end
-		-- `force` (only `--`) replaces the positional params even when none follow; a
-		-- lone `-`/`+` merely stops option processing, so `set + -` leaves them alone.
-		local j, force = 2, false
+		-- bash validates every flag argument first (internal_getopt over "+abefhikmnprtuvx
+		-- BCEHPTo;"), so one bad letter anywhere applies none of them. `o` takes the rest
+		-- of its word or a following non-option word as its (unchecked) name.
+		local j = 2
 		while j <= #args do
 			local a = args[j]
-			if a == "--" then
-				force = true
-				j = j + 1
+			local c1 = a:sub(1, 1)
+			if (c1 ~= "-" and c1 ~= "+") or #a == 1 or a == "--" then
 				break
-			elseif a == "-o" or a == "+o" then
-				local o, on = args[j + 1], (a == "-o")
-				if o == nil then
-					-- `set -o`: list options aligned; `set +o`: reproducible `set ±o NAME`.
-					for _, ent in ipairs(SETOPTS) do
-						if on then
-							sh.out(("%-15s\t%s\n"):format(ent[1], opt_on(sh, ent[2]) and "on" or "off"))
-						else
-							sh.out(("set %so %s\n"):format(opt_on(sh, ent[2]) and "-" or "+", ent[1]))
+			elseif a == "--help" then
+				return rt.builtin_help(sh, "set")
+			end
+			local nxt = j + 1
+			for k = 2, #a do
+				local f = a:sub(k, k)
+				if f == "o" then
+					if k == #a then
+						local w = args[j + 1]
+						if w and not ((w:sub(1, 1) == "-" or w:sub(1, 1) == "+") and #w > 1) then
+							nxt = j + 2
 						end
 					end
-					j = j + 1
-				else
-					if not SETOPT[o] then
-						io.stderr:write("curse: set: " .. o .. ": invalid option name\n")
-						sh.status = 2
-						return
-					end
-					set_opt(sh, SETOPT[o], on)
-					j = j + 2
+					break
+				elseif f == "i" or not SETFLAG[f] then
+					-- `set -?` prints the usage but succeeds (list_optopt == '?')
+					io.stderr:write("curse: set: " .. c1 .. f .. ": invalid option\n" .. USAGE)
+					sh.status = f == "?" and 0 or 2
+					return
 				end
-			elseif a == "-" then -- bare `-`: turn off -v/-x and STOP option processing; any
-				-- remaining args become params, but with none the params are left unchanged.
-				set_opt(sh, "opt_v", false)
-				set_opt(sh, "opt_x", false)
+			end
+			j = nxt
+		end
+		-- then the flags apply, left to right (set_builtin's second loop)
+		local status = 0
+		local force = false -- only `--` replaces the params even when none follow
+		j = 2
+		while j <= #args do
+			local a = args[j]
+			local on = a:sub(1, 1)
+			if on == "-" and (#a == 1 or a == "--") then
 				j = j + 1
+				if a == "--" then
+					force = true
+				else -- bare `-`: turn off -v/-x and stop option processing (obsolescent)
+					set_opt(sh, "opt_v", false)
+					set_opt(sh, "opt_x", false)
+				end
 				break
-			elseif a == "+" then
-				j = j + 1 -- bare `+`: an ignored no-op flag; keep scanning
-			elseif a:match("^[-+][a-zA-Z]+$") then -- short flag bundle: -eu, +u, …
-				local on = a:sub(1, 1) == "-"
-				-- the whole bundle is validated first: one bad letter applies none (bash).
-				-- A restricted shell can't be unrestricted: `+r` is then invalid.
-				for f in a:sub(2):gmatch(".") do
-					if not SETFLAG[f] or (f == "r" and not on and sh.opt_r) then
-						io.stderr:write("curse: set: " .. a:sub(1, 1) .. f .. ": invalid option\n")
-						io.stderr:write("set: usage: set [-abefhkmnptuvxBCEHPT] [-o option-name] [--] [-] [arg ...]\n")
-						sh.status = 2
-						return
-					end
-				end
-				for f in a:sub(2):gmatch(".") do
-					if f == "r" then
-						if on and not sh.opt_r then
-							rt.make_restricted(sh)
-						end
-					else
-						set_opt(sh, SETFLAG[f], on)
-					end
-				end
-				j = j + 1
-			else
+			elseif on ~= "-" and on ~= "+" then
 				break
 			end
+			on = on == "-"
+			for k = 2, #a do
+				local f = a:sub(k, k)
+				if f == "o" then
+					local o = args[j + 1]
+					local o1 = o and o:sub(1, 1)
+					if o == nil or o == "" or o1 == "-" or o1 == "+" then
+						-- no name (or a flag-like word, left in place): list, and carry on
+						list_o(sh, not on)
+						if o == nil and sh.out == io.write and not rt.chkwrite(sh, "set") then
+							status = 1
+						end
+					else
+						j = j + 1 -- (the name is consumed)
+						if not SETOPT[o] then
+							io.stderr:write("curse: set: " .. o .. ": invalid option name\n")
+							sh.status = 2
+							return
+						end
+						set_opt(sh, SETOPT[o], on)
+					end
+				elseif f == "r" then
+					-- a restricted shell can't be unrestricted (change_flag's FLAG_ERROR)
+					if not on and sh.opt_r then
+						io.stderr:write("curse: set: +r: invalid option\n" .. USAGE)
+						sh.status = 1
+						return
+					elseif on and not sh.opt_r then
+						rt.make_restricted(sh)
+					end
+				else
+					set_opt(sh, SETFLAG[f], on)
+				end
+			end
+			j = j + 1
 		end
 		if force or j <= #args then
 			local np, n = {}, 0
@@ -109,6 +162,6 @@ return function(sh, cmd, args, hook, tcb)
 			sh.params = np
 			sh.nparams = n
 		end
-		sh.status = 0
+		sh.status = status
 	end
 end

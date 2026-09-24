@@ -27,14 +27,26 @@ local function set_opt(sh, field, on)
 	if field == "opt_history" and on and was ~= true and not sh.opt_i then
 		require("hist").load(sh)
 	end
-	-- bash's set_ignoreeof: `set -o ignoreeof` binds IGNOREEOF=10, `set +o` unsets it
+	-- bash's set_ignoreeof: `set -o ignoreeof` binds IGNOREEOF=10, `set +o` unsets it;
+	-- either way a lowercase `ignoreeof` variable goes
 	if field == "opt_ignoreeof" then
+		if sh.vars.ignoreeof then
+			sh.vars.ignoreeof = nil
+			ffi.C.unsetenv("ignoreeof")
+		end
 		if on then
-			if sh.vars.IGNOREEOF == nil then
-				sh:set_str("IGNOREEOF", "10")
-			end
+			sh:set_str("IGNOREEOF", "10")
 		else
 			sh.vars.IGNOREEOF = nil
+			ffi.C.unsetenv("IGNOREEOF")
+		end
+	-- bash's set_posix_mode: -o posix binds POSIXLY_CORRECT=y, +o posix unbinds it
+	elseif field == "opt_posix" and (on and true or false) ~= (was and true or false) then
+		if on then
+			sh:set_str("POSIXLY_CORRECT", "y")
+		else
+			sh.vars.POSIXLY_CORRECT = nil
+			ffi.C.unsetenv("POSIXLY_CORRECT")
 		end
 	end
 	-- emacs and vi line-editing modes are mutually exclusive.
@@ -2609,7 +2621,8 @@ local function apply_redirs(sh, redirs, cname) -- cname: the command (names {v} 
 			io.stderr:write("curse: " .. raw .. ": ambiguous redirect\n")
 			return nil
 		end
-		if sh.opt_r and r.op ~= "in" then -- restricted: no output to files (fd dups still work)
+		if sh.opt_r and r.op ~= "in" and r.op ~= "dup" and r.op ~= "dupin" then
+			-- restricted: no output to files (fd dups still work; `>&file` is refused below)
 			io.stderr:write("curse: " .. fs[1] .. ": restricted: cannot redirect output\n")
 			return nil
 		end
@@ -3383,7 +3396,8 @@ M.DYN_ARRAYS = DYN_ARRAYS
 local function fmt_decl(sh, name)
 	-- SHELLOPTS/BASHOPTS are readonly, exported, derived specials with no var box.
 	if (name == "SHELLOPTS" or name == "BASHOPTS") and sh.shellopts then
-		return "declare -r " .. name .. "=" .. decl_quote(sh:special_get(name))
+		local x = name == "SHELLOPTS" and sh.shellopts_exported and "x" or ""
+		return "declare -r" .. x .. " " .. name .. "=" .. decl_quote(sh:special_get(name))
 	end
 	local b = sh.vars[name]
 	if b == nil and DYN_ARRAYS[name] then -- (bash's dynamic arrays: FUNCNAME, BASH_SOURCE, …)
@@ -5045,7 +5059,11 @@ local function expand_args(sh, st, args, is_assign)
 		sh.arrayref_args = nil -- (the previous command's: see rt.mark_arrayref)
 	end
 	local unset_cmd = is_assign == "unset"
-	for wi, w in ipairs(st.words) do
+	local words = st.words
+	if sh.opt_B == false then -- (`set +B`: no brace expansion)
+		words = P.unbrace_words(words)
+	end
+	for wi, w in ipairs(words) do
 		local p1 = w.parts[1]
 		local ref = unset_cmd and wi > 1 and unset_arrayref(sh, w)
 		if ref then
@@ -5323,7 +5341,10 @@ exec_stmt = function(sh, st, hook)
 			if sh.opt_c or sh.opt_posix then
 				error({ __curse_exit = 1 })
 			end
-			return
+			if sh.applying_prefix then -- (as any readonly: a prefix is non-fatal, a
+				return -- standalone assignment aborts the rest of the line)
+			end
+			error({ __curse_exit = 1, __curse_lineabort = true })
 		end
 		if st.index == "" then -- `a[]=v`: empty subscript is a bad array subscript (bash: status 1, no assign)
 			io.stderr:write("curse: " .. st.name .. "[]: bad array subscript\n")
@@ -6463,7 +6484,7 @@ exec_stmt = function(sh, st, hook)
 		-- a failglob no-match while expanding the word list fails the `for` non-fatally
 		-- (status 1, no iterations), like bash — not an abort.
 		local eok, eerr = pcall(function()
-			for _, w in ipairs(st.words) do
+			for _, w in ipairs(sh.opt_B == false and P.unbrace_words(st.words) or st.words) do
 				local fs = expand_to_fields(sh, w)
 				for k = 1, #fs do
 					list[#list + 1] = fs[k]
