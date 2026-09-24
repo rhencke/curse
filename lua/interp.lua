@@ -6704,13 +6704,14 @@ end
 -- Run the trap for the signal `signum` that the async handler delivered via the VM
 -- hook (lib_cursesig.c). No pending queue — the hook hands us exactly the signal
 -- that fired. run_trap bumps sh.in_trap so a signal arriving DURING the handler is
--- serialized (the hook re-arms and runs it after this returns), never nested. A
+-- serialized (the hook re-arms and runs it after this returns) — except one the handler
+-- sent itself with `kill`, which runs nested, as in bash (rt.self_sig_release). A
 -- signal trap doesn't change $? unless it exits/returns; `exit` in the handler
 -- propagates to exit the shell (bash).
-local function run_signal(sh, signum, direct)
-	if sh.in_trap and sh.in_trap > 0 then
+local function run_signal(sh, signum, direct, nested)
+	if not nested and sh.in_trap and sh.in_trap > 0 then
 		return
-	end -- don't run a trap inside a trap
+	end -- don't run a trap inside a trap (unless taken synchronously: rt.self_sig_release)
 	if not direct and rt.defer_signal(sh, signum) then
 		return -- (the parent's: runs once the in-process subshell has ended)
 	end

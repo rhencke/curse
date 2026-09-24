@@ -133,7 +133,7 @@ return function(sh, cmd, args, hook, tcb)
 				end
 			end
 			sh.status = allok and 0 or 1
-			rt.self_sig_release()
+			rt.self_sig_release(sh)
 		end
 	end
 end

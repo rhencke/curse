@@ -1692,7 +1692,8 @@ end
 -- restores the previous mask, which delivers it. (Only SIG is touched: the scheduler
 -- keeps SIGPIPE blocked meanwhile.)
 do
-	local set, old, held = ffi.new("uint8_t[1024]"), ffi.new("uint8_t[1024]"), false
+	local set, old, held, hsig = ffi.new("uint8_t[1024]"), ffi.new("uint8_t[1024]"), false, 0
+	local zero_ts = ffi.new("struct curse_co_ts", 0, 0)
 	function M.self_sig_hold(sig)
 		if held then
 			return
@@ -1700,12 +1701,21 @@ do
 		C.sigemptyset(set)
 		C.curse_co_sigaddset(set, sig)
 		C.sigprocmask(0, set, old) -- SIG_BLOCK
-		held = true
+		held, hsig = true, sig
 	end
-	function M.self_sig_release()
+	-- Inside a trap handler the async delivery can't run another trap until the handler is
+	-- done (the VM hook doesn't nest), but bash runs it right away, nested — even the same
+	-- signal's own. So there, take the pending signal off the queue and run its trap here.
+	function M.self_sig_release(sh)
 		if held then
 			held = false
+			local h = sh and (sh.in_trap or 0) > 0 and sh.traps
+				and sh.traps["SIG" .. (require("interp")._int.NUMSIG[hsig] or "")]
+			local take = h and h ~= "" and C.curse_co_sigtimedwait(set, nil, zero_ts) == hsig
 			C.sigprocmask(2, old, nil) -- SIG_SETMASK
+			if take then
+				require("interp").run_signal(sh, hsig, false, true)
+			end
 		end
 	end
 end
