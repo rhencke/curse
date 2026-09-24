@@ -51,6 +51,7 @@ return function(sh, cmd, args, hook, tcb)
 		-- fire), regardless of functrace; an `exit` in the file propagates and skips it.
 		local do_return = name ~= nil
 		local dsave -- (the DEBUG trap, hidden while the file runs: rt.source_debug_hide)
+		local e0 = sh.traps and sh.traps.ERR -- (the ERR trap before it: rt.source_err_sample)
 		if not name then
 			io.stderr:write("curse: " .. cmd .. ": filename argument required\n" .. usage)
 			sh.status = 2
@@ -156,5 +157,6 @@ return function(sh, cmd, args, hook, tcb)
 			end
 		end
 		rt.source_debug_restore(sh, dsave)
+		rt.source_err_sample(sh, e0)
 	end
 end

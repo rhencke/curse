@@ -5008,10 +5008,14 @@ local function run_debug(sh, line)
 	if line then
 		sh.cur_line = line
 	end
-	local exited = run_trap(sh, h)
+	local exited, rret = run_trap(sh, h)
 	local trap_status = sh.status
 	sh.status = saved
 	sh.in_debug = false
+	if rret then -- `return` in the DEBUG trap returns from the running function
+		sh.status = rret
+		error({ __curse_return = rret })
+	end
 	-- `exit` in a DEBUG trap exits the shell; a non-zero DEBUG return under errexit
 	-- also exits (skipping the command), matching bash.
 	if exited then
@@ -6546,9 +6550,13 @@ do
 end
 
 -- Run a trap handler string; preserves $LINENO (so an ERR/EXIT trap sees the
--- failing command's line, not the handler's). Returns true if it called exit.
+-- failing command's line, not the handler's). Returns true if it called exit; and, when
+-- the handler ran `return N` while a function or sourced script is running, N as a 2nd
+-- result: the CALLER (once it has undone its own state) raises it, so the return ends
+-- that function/source — bash's _run_trap_internal longjmps to return_catch (trap.c).
+-- (Not for the EXIT/RETURN traps: their callers keep the status.)
 run_trap = function(sh, code)
-	local exited, savedline = false, sh.cur_line
+	local exited, savedline, rret = false, sh.cur_line, nil
 	local saved_tcd, saved_ts = sh.trap_calldepth, sh.trap_saved
 	sh.trap_calldepth = sh.calldepth or 0
 	sh.trap_saved = sh.status -- (bash's trap_saved_exit_value: see rt.return_default)
@@ -6589,11 +6597,14 @@ run_trap = function(sh, code)
 			exited = true
 		elseif type(err) == "table" and err.__curse_return then
 			sh.status = err.__curse_return -- `return N` in a trap sets its status
+			if (sh.calldepth or 0) > 0 or (sh.sourcedepth or 0) > 0 then
+				rret = err.__curse_return
+			end
 		else
 			error(err)
 		end -- a real error propagates
 	end
-	return exited
+	return exited, rret
 end
 
 -- A statement that just failed and is subject to ERR/errexit: a bare
@@ -6635,9 +6646,13 @@ fire_err_trap = function(sh)
 	if h and h ~= "" and not sh.in_err_trap and errscope then
 		sh.in_err_trap = true
 		local saved = sh.status
-		run_trap(sh, h)
+		local _, rret = run_trap(sh, h)
 		sh.status = saved
 		sh.in_err_trap = false
+		if rret then -- `trap 'return N' ERR`: the failing command's function returns N
+			sh.status = rret
+			error({ __curse_return = rret })
+		end
 	end
 end
 fire_err = function(sh)
@@ -6684,11 +6699,14 @@ local function run_signal(sh, signum, direct)
 	-- an asynchronously-delivered signal handler reports $LINENO = 1 (bash).
 	local saved, sl = sh.status, sh.cur_line
 	sh.cur_line = 1
-	local exited = run_trap(sh, h)
+	local exited, rret = run_trap(sh, h)
 	sh.cur_line = sl
 	if exited then
 		error({ __curse_exit = sh.status })
 	end -- `exit` in the trap exits the shell
+	if rret then -- `return` in the handler returns from the interrupted function
+		error({ __curse_return = rret })
+	end
 	sh.status = saved -- otherwise $? is preserved across the signal
 end
 M.run_signal = run_signal

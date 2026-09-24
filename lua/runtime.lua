@@ -4643,9 +4643,25 @@ function M.exit_default(sh)
 	end
 	return sh.status
 end
--- `return` where no function or sourced script is running: reported, status 2 (bash)
+-- A compiled function (fn_x) in a program with traps: a trap handler's `return N` raised
+-- while its body runs natively ends this call with status N (interp's run_function and the
+-- delegated-statement wrappers catch it the same way). bash: execute_function's return_catch.
+function M.catch_return(f)
+	return function(sh, pc)
+		local ok, e = pcall(f, sh, pc)
+		if not ok then
+			if type(e) == "table" and e.__curse_return ~= nil then
+				sh.status = e.__curse_return
+			else
+				error(e, 0)
+			end
+		end
+	end
+end
+-- `return` where no function or sourced script is running: reported, status 2 (bash) —
+-- also in a trap handler that runs at the top level (return.def: no return_catch_flag)
 function M.return_outside(sh)
-	if (sh.calldepth or 0) == 0 and (sh.sourcedepth or 0) == 0 and (sh.in_trap or 0) == 0 then
+	if (sh.calldepth or 0) == 0 and (sh.sourcedepth or 0) == 0 then
 		io.stderr:write("curse: return: can only `return' from a function or sourced script\n")
 		sh.status = 2
 		if sh.opt_posix and not sh.opt_i then -- a special builtin's error ends a posix shell
@@ -10323,7 +10339,7 @@ function M.source(sh, argv, line)
 	local ownp = sh.params -- (a `set --` in the file replaces this table)
 	sh.sourcedepth = (sh.sourcedepth or 0) + 1 -- a `return` is valid while sourcing
 	local fr = M.source_enter(sh, name, line)
-	local dsave = M.source_debug_hide(sh)
+	local dsave, e0 = M.source_debug_hide(sh), sh.traps and sh.traps.ERR
 	local rok, err = pcall(require("tier").run_compiled, mod, sh, nil)
 	M.source_leave(sh, fr)
 	sh.sourcedepth = sh.sourcedepth - 1
@@ -10348,6 +10364,7 @@ function M.source(sh, argv, line)
 		sh.in_return_trap = false
 	end
 	M.source_debug_restore(sh, dsave)
+	M.source_err_sample(sh, e0)
 end
 -- A sourced file isn't traced by the DEBUG trap (nor is its RETURN trap run) unless
 -- functrace is on, like a function body (bash).
@@ -10361,6 +10378,13 @@ end
 function M.source_debug_restore(sh, d)
 	if d ~= nil and sh.traps.DEBUG == nil then
 		sh.traps.DEBUG = d
+	end
+end
+-- bash samples the ERR trap BEFORE a command runs (execute_cmd.c was_error_trap): a `.`
+-- whose file set the trap (e0: the one before it) doesn't fire it for its own failure.
+function M.source_err_sample(sh, e0)
+	if e0 == nil and sh.traps and sh.traps.ERR and sh.status ~= 0 and sh.noerr == 0 then
+		sh.err_skip = true
 	end
 end
 

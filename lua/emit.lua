@@ -423,6 +423,25 @@ local function scan_trap(stmts, sigs)
 		return false
 	end)
 end
+-- A trap whose action may `break`/`continue` (a literal part of it names one): the handler
+-- then acts on the loop it interrupted (bash's loop_level is global), which needs
+-- sh.loopdepth and a catch around every loop body — only the interpreter's loops have them.
+local function scan_trap_loopctl(stmts)
+	return any_node(stmts, function(st)
+		if st.t == "simple" and st.words and st.words[1] and st.words[1].parts[1]
+			and st.words[1].parts[1].lit == "trap" then
+			for j = 2, #st.words do
+				for _, p in ipairs(st.words[j].parts) do
+					local l = p.lit
+					if l and (l:find("%f[%w_]break%f[^%w_]") or l:find("%f[%w_]continue%f[^%w_]")) then
+						return true
+					end
+				end
+			end
+		end
+		return false
+	end)
+end
 
 -- Collect literal names targeted by `unset` (skipping -f/-v flags) anywhere in the
 -- program. A function whose name is unset must dispatch through sh.functions so the
@@ -850,6 +869,7 @@ EF.has_debug = false -- program installs a DEBUG trap → fire it before each co
 EF.funcstack = false -- program reads $FUNCNAME → maintain sh.funcstack around calls
 EF.pipestatus = false -- program reads $PIPESTATUS → set it (=(status)) after each simple cmd
 EF.has_trap = false -- program installs any trap → a forked `&`/pipeline child must reset caught signal traps
+EF.trap_ret = false -- a trap handler's `return` may end a compiled function → fn_x catches it (rt.catch_return)
 local emit_redir_funcs = {} -- funcs with a definition redirect (`f(){…} >&2`): delegate them + their calls
 local emit_multidef = {} -- names defined by more than one top-level funcdef: a single hoisted
 -- fn_x can't represent the sequential redefinition (a call between two defs must see the FIRST
@@ -879,7 +899,7 @@ local function fnwrap(cmd, line, s)
 		pre = ("sh:enterFunc(%q, %d); "):format(cmd, line or 0)
 		post = "; sh:leaveFunc()"
 	end
-	if EF.has_err or EF.has_debug then
+	if EF.has_err or EF.has_debug or EF.trap_ret then
 		pre = pre .. "sh.calldepth = sh.calldepth + 1; "
 		post = post .. "; sh.calldepth = sh.calldepth - 1"
 	end
@@ -7297,6 +7317,9 @@ function M.emit(ast, opts)
 	if scan_trap(ast.stmts, { RETURN = 1 }) then
 		error("curse-nocompile: RETURN trap")
 	end
+	if scan_trap_loopctl(ast.stmts) then
+		error("curse-nocompile: break/continue in a trap")
+	end
 	local alias_kind = scan_alias(ast.stmts)
 	if alias_kind == "dynamic" or (alias_kind == "static" and scan_dyncode(ast.stmts)) then
 		error("curse-nocompile: alias expansion needs line-at-a-time parse")
@@ -7326,7 +7349,12 @@ function M.emit(ast, opts)
 	-- where its commands would fire DEBUG/ERR that bash scopes to the (un-entered)
 	-- function. A normal call fires the trap once at the call site and keeps the body
 	-- silent (its build_cfg is non-toplevel).
-	local no_inline = EF.has_err or EF.has_debug or EF.funcstack
+	-- A trap handler's `return` (ERR/DEBUG/a signal) returns from the function it
+	-- interrupted: natively-run statements have no per-statement catch, so each fn_x
+	-- catches it (rt.catch_return) and calls track calldepth — which tells run_trap and
+	-- `return` that a function is running. Any trap (or eval/source, which may set one).
+	EF.trap_ret = EF.has_trap or EF.has_dyncode
+	local no_inline = EF.has_err or EF.has_debug or EF.funcstack or EF.trap_ret
 	emit_redir_funcs = {}
 	emit_multidef = {}
 	do -- a name defined by more than one top-level funcdef can't be a single hoisted fn_x;
@@ -7532,6 +7560,9 @@ function M.emit(ast, opts)
 			EF.fn_locals = sv_fl
 			fndefs[#fndefs + 1] = assemble(cfg, fnlname(st.name) .. " = function(sh, pc)",
 				{ shname = st.name, fnlocals = fl, fnresume = true })
+			if EF.trap_ret then -- (a trap handler's `return` raised mid-body ends THIS call)
+				fndefs[#fndefs + 1] = ("%s = rt.catch_return(%s)"):format(fnlname(st.name), fnlname(st.name))
+			end
 			if next(cfg.loopPc) and not fnloop[st.name] and ndefs[st.name] == 1 then
 				fnloop[st.name] = cfg.loopPc
 				fnsrc[st.name] = require("interp").deparse_func(st.name, st)
