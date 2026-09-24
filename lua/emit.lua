@@ -6945,6 +6945,10 @@ end
 -- fast in hot loops). opts.upvals: lifted vars declared at module level (shared
 -- as upvalues with functions) — seeded/written-back but not re-declared. Both are
 -- seeded from `sh` on entry and written back on exit (run() only).
+-- (dispatch-chain sizes, in generated source bytes: past the first, blocks are chained
+-- through trampolines; a segment keeps every jump well inside LuaJIT's range)
+local DISPATCH_CHAIN_MAX = tonumber(os.getenv("CURSE_DISPATCH_MAX") or "") or 60000
+local DISPATCH_SEG = tonumber(os.getenv("CURSE_DISPATCH_SEG") or "") or 12000
 assemble = function(cfg, sig, opts)
 	opts = opts or {}
 	local o = { sig }
@@ -7016,13 +7020,60 @@ assemble = function(cfg, sig, opts)
 	for _, hp in pairs(cfg.loopPc or {}) do
 		heads[hp] = true
 	end
+	local total, huge = 0, false
 	for p = 0, cfg.npc - 1 do
-		o[#o + 1] = ("    %s pc == %d then %s%s"):format(p == 0 and "if" or "elseif", p,
-			heads[p] and "if __pre[0] ~= 0 then rt.preempt() end " or "", cfg.blocks[p])
+		total = total + #cfg.blocks[p]
 	end
-	o[#o + 1] = '    else error("curse: internal error: no block for pc " .. tostring(pc)) -- (never spin)'
-	o[#o + 1] = "    end"
-	o[#o + 1] = "  end"
+	if total <= DISPATCH_CHAIN_MAX then
+		for p = 0, cfg.npc - 1 do
+			o[#o + 1] = ("    %s pc == %d then %s%s"):format(p == 0 and "if" or "elseif", p,
+				heads[p] and "if __pre[0] ~= 0 then rt.preempt() end " or "", cfg.blocks[p])
+		end
+		o[#o + 1] = '    else error("curse: internal error: no block for pc " .. tostring(pc)) -- (never spin)'
+		o[#o + 1] = "    end"
+	else
+		-- A huge program: jumps across the whole dispatch (each elseif branch to the chain's
+		-- end, the loop's end back to its top) would exceed LuaJIT's range. So the blocks
+		-- form SEGMENTS and the loop-back goes through trampolines — a label at each
+		-- segment boundary, hopped over in normal flow:
+		--   goto __sK  ::__b(K+1):: goto __bK  ::__sK::
+		-- A block loops back to the start of its own segment (__bK), which chains back to
+		-- __b1, the top. DONE (the `break` block) does the function's epilogue (write the
+		-- lifted locals back) and returns there — no jump to the end.
+		o[#o] = "  ::__b1::" -- (in place of the `while true do`)
+		local epi = {}
+		for _, n in ipairs(opts.runlocals or {}) do
+			epi[#epi + 1] = ("sh:aset(%q, %s)"):format(n, lname(n))
+		end
+		for _, n in ipairs(opts.upvals or {}) do
+			epi[#epi + 1] = ("sh:aset(%q, %s)"):format(n, lname(n))
+		end
+		epi[#epi + 1] = "return"
+		local seg, acc, done_pc = 1, 0, nil
+		for p = 0, cfg.npc - 1 do
+			local b = cfg.blocks[p]
+			if b == "break" then
+				done_pc = p -- (tested LAST, right before the function's end: a `return` jumps to
+				-- the end to close upvalues, which must stay in range too)
+			else
+				o[#o + 1] = ("    if pc == %d then do %s%s end goto __b%d end"):format(p,
+					heads[p] and "if __pre[0] ~= 0 then rt.preempt() end " or "", b, seg)
+			end
+			acc = acc + #b
+			if acc > DISPATCH_SEG and p < cfg.npc - 1 then
+				o[#o + 1] = ("    goto __s%d ::__b%d:: goto __b%d ::__s%d::"):format(seg, seg + 1, seg, seg)
+				seg, acc = seg + 1, 0
+			end
+		end
+		if done_pc then
+			o[#o + 1] = ("    if pc == %d then %s end"):format(done_pc, table.concat(epi, "; "))
+		end
+		o[#o + 1] = '    error("curse: internal error: no block for pc " .. tostring(pc)) -- (never spin)'
+		huge = true
+	end
+	if not huge then
+		o[#o + 1] = "  end"
+	end
 	for _, n in ipairs(opts.runlocals or {}) do
 		o[#o + 1] = ("  sh:aset(%q, %s)"):format(n, lname(n))
 	end
