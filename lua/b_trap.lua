@@ -18,12 +18,18 @@ local C, P = I.C, I.P
 
 return function(sh, cmd, args, hook, tcb)
 	if cmd == "trap" then
-		-- trap [-p] [ACTION] SIG…  (subset: registers/prints; only EXIT actually fires)
+		-- trap [-lp] [[ACTION] SIG…]  (bash builtins/trap.def)
 		local j, pflag, lflag = 2, false, false
+		local usage = "trap: usage: trap [-lp] [[arg] signal_spec ...]\n"
 		while args[j] and args[j]:match("^%-.") and args[j] ~= "--" do -- (getopt "lp")
+			if args[j] == "--help" then -- (CASE_HELPOPT: the builtin's help, status 2)
+				require("b_help")(sh, "help", { "help", "trap" })
+				sh.status = 2
+				return
+			end
 			if not args[j]:match("^%-[lp]+$") then
 				io.stderr:write("curse: trap: -" .. args[j]:match("^%-[lp]*(.)") .. ": invalid option\n")
-				io.stderr:write("trap: usage: trap [-lp] [[arg] signal_spec ...]\n")
+				io.stderr:write(usage)
 				sh.status = 2
 				return
 			end
@@ -39,51 +45,74 @@ return function(sh, cmd, args, hook, tcb)
 			sh.status = 0
 			return
 		end
+		-- showtrap: the action via sh_single_quote; a name bash has no name for prints as its
+		-- number; posix mode drops the SIG prefix. `trap -p` in posix mode (show_default)
+		-- also lists untrapped signals, as `-`.
+		local posix = sh.opt_posix
+		local function show(canon, dflt)
+			local t = sh.traps[canon]
+			if t == nil then
+				if not dflt then
+					return
+				end
+				t = "-"
+			elseif t == "'" then
+				t = "\\'"
+			else
+				t = "'" .. t:gsub("'", "'\\''") .. "'"
+			end
+			if posix then
+				canon = canon:gsub("^SIG", "")
+			end
+			sh:echo("trap -- " .. t .. " " .. canon)
+		end
 		if pflag or j > #args then -- print traps (all, or the named signals) in signal order
-			local list = {}
 			local st = 0
-			if j <= #args then -- print only the named signals
+			local dflt = pflag and posix
+			if j <= #args then -- print only the named signals, as they come
 				for k = j, #args do
 					local c = canon_sig(args[k])
 					if not c then
 						io.stderr:write("curse: trap: " .. args[k] .. ": invalid signal specification\n")
 						st = 1
-					elseif sh.traps[c] then -- (named: shown as they come, like bash)
-						sh:echo("trap -- '" .. sh.traps[c] .. "' " .. c)
+					else
+						show(c, dflt)
 					end
 				end
 			else
+				local list = {}
 				for canon in pairs(sh.traps) do
 					list[#list + 1] = canon
 				end
 				table.sort(list, function(a, b)
 					return sig_order(a) < sig_order(b)
 				end)
-			end
-			for _, canon in ipairs(list) do
-				sh:echo("trap -- '" .. sh.traps[canon] .. "' " .. canon)
+				for _, canon in ipairs(list) do
+					show(canon, false)
+				end
 			end
 			sh.status = st
-		elseif args[j]:sub(1, 1) == "-" and args[j] ~= "-" then -- a stray -flag (e.g. `trap -1`)
-			io.stderr:write("curse: trap: " .. args[j]:sub(1, 2) .. ": invalid option\n")
-			io.stderr:write("trap: usage: trap [-lp] [[arg] signal_spec ...]\n")
-			sh.status = 2
 		else
-			-- bash: reset-mode (all tokens are signals to reset) only when the first
-			-- token is a NUMERIC signal (`trap 0 2`) or the sole arg and a valid signal
-			-- (`trap TERM`); a NAME first token is the action, even a name that happens
-			-- to be a signal (`trap INT EXIT` runs `INT` at EXIT; `trap err ERR`).
+			-- The first word is the action unless it's an all-digit valid signal (`trap 0 2`:
+			-- reset them all) or — not in posix mode — the sole word and a valid signal (`trap
+			-- TERM`); a NAME first word with signals after is the action (`trap INT EXIT`).
+			local first = args[j]
 			local action, sigstart
-			if canon_sig(args[j]) and (#args == j or args[j]:match("^%d+$")) then
+			if first:match("^%d+$") and canon_sig(first) then
+				action, sigstart = "-", j
+			elseif not posix and first ~= "-" and #args == j and canon_sig(first) then
 				action, sigstart = "-", j
 			else
-				action, sigstart = args[j], j + 1
+				action, sigstart = first, j + 1
 			end
 			if sigstart > #args then -- an action with no signal spec is a usage error
-				io.stderr:write("trap: usage: trap [-lp] [[arg] signal_spec ...]\n")
+				io.stderr:write(usage)
 				sh.status = 2
 				return
 			end
+			-- a subshell's first set/reset drops the trap strings it inherited — before the
+			-- specs are even decoded (trap.def: SUBSHELL_RESETTRAP → free_trap_strings)
+			rt.iso_trap_changed(sh)
 			local ok = true
 			for k = sigstart, #args do
 				local canon = canon_sig(args[k])
@@ -93,7 +122,6 @@ return function(sh, cmd, args, hook, tcb)
 				elseif sh.sig_ign_start and sh.sig_ign_start[canon] then
 					-- ignored when the shell started: can't be trapped or reset (bash), silently
 				else
-					rt.iso_trap_changed(sh) -- (a subshell's first change drops what it inherited)
 					if action == "-" then
 						sh.traps[canon] = nil
 					else

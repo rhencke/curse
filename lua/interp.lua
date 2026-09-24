@@ -657,27 +657,44 @@ local SIGDESC = {
 	[14] = "Alarm clock",
 	[15] = "Terminated",
 }
+-- A trap's signal spec (bash's decode_signal with DSIG_NOCASE|DSIG_SIGPREFIX, trap.c): a
+-- legal_number 0..64 (blanks/sign/leading zeros ok; 0 = EXIT), [SIG]RTMIN+N for N 0..30,
+-- or a name with or without SIG (EXIT/DEBUG/ERR/RETURN only bare). Returns the canonical
+-- key: EXIT/DEBUG/ERR/RETURN, SIG<name>, or the plain number for one with no name (32, 33).
 local function canon_sig(s)
-	s = s:upper()
-	if s == "0" or s == "EXIT" then
-		return "EXIT"
+	local n = rt.legal_number(s)
+	if n then
+		if n < 0 or n > 64 then
+			return nil
+		end
+		if n == 0 then
+			return "EXIT"
+		end
+		local nm = NUMSIG[n]
+		return nm and ("SIG" .. nm) or tostring(n)
 	end
-	if s == "ERR" or s == "DEBUG" or s == "RETURN" then
+	s = s:upper()
+	if s == "EXIT" or s == "ERR" or s == "DEBUG" or s == "RETURN" then
 		return s
 	end
-	s = s:gsub("^SIG", "")
-	if s:match("^%d+$") then
-		local nm = NUMSIG[tonumber(s)]
-		return nm and ("SIG" .. nm) or nil
+	local rtn = s:match("^SIGRTMIN%+(.*)$") or s:match("^RTMIN%+(.*)$")
+	if rtn then
+		n = rt.legal_number(rtn)
+		return n and n >= 0 and n <= 30 and ("SIG" .. NUMSIG[SIGNUM.RTMIN + n]) or nil
 	end
+	s = s:gsub("^SIG", "")
 	return SIGNUM[s] and ("SIG" .. s) or nil
 end
-local function sig_order(canon) -- for printing: EXIT=0, then by signal number
-	if canon == "EXIT" then
-		return 0
+-- for printing: EXIT=0, then by signal number, then DEBUG, ERR, RETURN (bash's trap_list
+-- slots NSIG, NSIG+1, NSIG+2 — trap.h DEBUG_TRAP/ERROR_TRAP/RETURN_TRAP)
+local PSEUDO_ORDER = { EXIT = 0, DEBUG = 65, ERR = 66, RETURN = 67 }
+local function sig_order(canon)
+	local o = PSEUDO_ORDER[canon]
+	if o then
+		return o
 	end
 	local nm = canon:gsub("^SIG", "")
-	return SIGNUM[nm] or 99
+	return SIGNUM[nm] or tonumber(nm) or 99
 end
 -- A forked subshell (background `&`, `( )`, a pipeline stage, `>(…)`) resets
 -- CAUGHT signal traps to their default DISPOSITION, like bash — the handler no
