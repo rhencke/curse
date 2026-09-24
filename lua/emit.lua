@@ -2875,7 +2875,8 @@ local function field_argv(words, from, lifted, wrap, prefix)
 	local run = {}
 	local function flush_run()
 		if #run > 32 then
-			out[#out + 1] = ("for _, __v in ipairs({%s}) do __a[#__a+1] = __v end"):format(table.concat(run, ","))
+			out[#out + 1] = ("do local __k = %s; for __i = 1, #__k do __a[#__a+1] = __k[__i] end end"):format(
+				EF.konst(run))
 		else
 			for _, e in ipairs(run) do
 				out[#out + 1] = "__a[#__a+1] = rt.cstr(" .. e .. ")"
@@ -2885,7 +2886,10 @@ local function field_argv(words, from, lifted, wrap, prefix)
 	end
 	for j = from, #words do
 		local w = words[j]
-		if not empty_word(w) then -- an empty brace alternative ({X,,Y,}) adds no arg
+		local lit = w.plain and w.parts[1].lit
+		if lit and lit ~= "" then -- (a plain unquoted literal — `{1..70000}`'s words: as is)
+			run[#run + 1] = ("%q"):format(lit)
+		elseif not empty_word(w) then -- an empty brace alternative ({X,,Y,}) adds no arg
 			if not word_safe(w) and not field_word(w, lifted) and not mixed_expandable(w, lifted) then
 				return nil
 			end
@@ -5599,7 +5603,8 @@ H.forin = function(cx, st, after)
 	local run = {}
 	local function flush_run()
 		if #run > 32 then
-			parts[#parts + 1] = ("for _, __v in ipairs({%s}) do __l[#__l+1] = __v end"):format(table.concat(run, ","))
+			parts[#parts + 1] = ("do local __k = %s; for __i = 1, #__k do __l[#__l+1] = __k[__i] end end"):format(
+				EF.konst(run))
 		else
 			for _, e in ipairs(run) do
 				parts[#parts + 1] = "__l[#__l+1] = " .. e
@@ -7193,7 +7198,17 @@ local function scan_alias(stmts)
 	end
 	return kind
 end
+-- A long literal list (argv words, a `for` list) becomes a module-level constant: one
+-- table `__K` (a single upvalue — LuaJIT caps a function at 60) built once when the
+-- module loads, instead of a table constructor inline in the dispatch loop, rebuilt on
+-- every run of the statement (and past LuaJIT's jump range when huge).
+function EF.konst(items)
+	local k = EF.konsts
+	k[#k + 1] = "{" .. table.concat(items, ",") .. "}"
+	return ("__K[%d]"):format(#k)
+end
 function M.emit(ast, opts)
+	EF.konsts = {}
 	emit_frags, emit_frag_n = {}, 0 -- compiled `$(…)` fragments (cs_N closures) collected during build
 	-- Fragment mode (eval/source, compiled at runtime): the code runs in the CALLER's
 	-- execution context, so a top-level return/break/continue must RAISE its signal for
@@ -7500,6 +7515,9 @@ function M.emit(ast, opts)
 		#fl > 0 and (", fnLoop = { " .. table.concat(fl, ", ") .. " }") or "",
 		#fc > 0 and (", fnCall = { " .. table.concat(fc, ", ") .. " }") or ""
 	)
+	if #EF.konsts > 0 then -- (after the header, before any function that reads it)
+		table.insert(o, 6, "local __K = {" .. table.concat(EF.konsts, ",\n") .. "}")
+	end
 	return table.concat(o, "\n") .. "\n"
 end
 
