@@ -306,6 +306,7 @@ return function(sh, cmd, args, hook, tcb)
 					-- (posix mode: a function name must be an identifier to be looked up)
 					io.stderr:write("curse: " .. cmd .. ": `" .. nm .. "': not a valid identifier\n")
 					allok = false
+					sh.badassign = true
 				elseif sh.functions[nm] then
 					if funcbody and not funcnames then -- (-F wins: bash's nodefs)
 						local d = func_body_text(sh, nm)
@@ -374,7 +375,7 @@ return function(sh, cmd, args, hook, tcb)
 				end
 				unswap = sh:global_swap(gnames)
 			end
-			local allok = true
+			local allok, badassign = true, false
 			-- make_local_variable (variables.c): a readonly GLOBAL can't be made local, and a
 			-- readonly local of this very scope stays itself (its reassignment fails); a
 			-- caller's readonly local is just shadowed
@@ -461,6 +462,7 @@ return function(sh, cmd, args, hook, tcb)
 					local compound = aattr or assoc
 					local pfx = ((cmd == "export" or cmd == "readonly") and not compound) and "" or (cmd .. ": ")
 					io.stderr:write("curse: " .. pfx .. nm .. ": readonly variable\n")
+					badassign = true -- (declare.def assign_error: EX_BADASSIGN)
 					allok = false
 				elseif
 					nm
@@ -501,13 +503,20 @@ return function(sh, cmd, args, hook, tcb)
 					-- a VALUELESS nameref takes the value as its target, unevaluated (bash: even
 					-- under -i); a bad target fails the declare — a global nameref is then gone,
 					-- a function's own local one stays
-					if rt.ref_target_ok(val) then
+					if val == nm and not localize then -- (a global one naming itself: bash drops it)
+						io.stderr:write("curse: " .. nm .. ": nameref variable self references not allowed\n")
+						badassign = true -- (declare.def assign_error: EX_BADASSIGN)
+						sh.vars[nm] = nil
+						allok = false
+					elseif rt.ref_target_ok(val) then
 						sh.vars[nm].s = val
 					elseif localize then
 						io.stderr:write("curse: " .. cmd .. ": `" .. val .. "': invalid variable name for name reference\n")
+						badassign = true -- (declare.def assign_error: EX_BADASSIGN)
 						allok = false
 					else
 						rt.bad_ref_target(val, cmd)
+						badassign = true -- (declare.def assign_error: EX_BADASSIGN)
 						sh.vars[nm] = nil
 						allok = false
 					end
@@ -536,8 +545,10 @@ return function(sh, cmd, args, hook, tcb)
 						end
 						if ap and val:match("^[^[]*") == nm then -- (bash names no builtin here)
 							io.stderr:write("curse: " .. nm .. ": nameref variable self references not allowed\n")
+							badassign = true -- (declare.def assign_error: EX_BADASSIGN)
 							allok = false
 						elseif not sh:nameref_decl(cmd, nm, val, localize) then
+							badassign = true -- (declare.def assign_error: EX_BADASSIGN)
 							allok = false
 						end
 					elseif iattr and aattr and not assoc then -- declare -ai a=EXPR: element 0, integer
@@ -810,9 +821,11 @@ return function(sh, cmd, args, hook, tcb)
 					-- deferred `readonly a[i]=v` / `export a[i]=v` (those fail, status 1).
 					if anm and sub == "" then -- `declare a[]=x`
 						io.stderr:write("curse: " .. anm .. "[]: bad array subscript\n")
+						badassign = true -- (declare.def assign_error: EX_BADASSIGN)
 						allok = false
 					elseif anm and isdecl and ro_blocks(sh:deref(anm)) then -- (`declare ra[1]=3`)
 						io.stderr:write("curse: " .. cmd .. ": " .. anm .. ": readonly variable\n")
+						badassign = true -- (declare.def assign_error: EX_BADASSIGN)
 						allok = false
 					elseif anm and (aattr or assoc) and isdecl
 						and aval:sub(1, 1) == "(" and aval:sub(-1) == ")" then
@@ -847,6 +860,14 @@ return function(sh, cmd, args, hook, tcb)
 						if assoc and not sh:is_assoc(anm) then -- (`declare -A m[k]=v` makes m assoc)
 							sh:declare_assoc(anm)
 						end
+						if (sub == "@" or sub == "*") and not sh:is_assoc(anm) then
+							-- (declare's ASS_ALLOWALLSUB: the element assignment fails, status 1,
+							-- but — unlike a plain `a[@]=x` — the line goes on)
+							io.stderr:write("curse: " .. anm .. "[" .. sub .. "]: bad array subscript\n")
+							badassign = true
+							allok = false
+							goto continue
+						end
 						sh:array_set(anm, array_key(sh, anm, sub), aval, aop == "+=")
 						local bb = sh.vars[sh:deref(anm)]
 						if roattr and bb then
@@ -856,10 +877,12 @@ return function(sh, cmd, args, hook, tcb)
 						io.stderr:write(
 							"curse: " .. cmd .. ": `" .. (anm and (anm .. "[" .. sub .. "]") or a) .. "': not a valid identifier\n"
 						)
+						badassign = true -- (declare.def assign_error: EX_BADASSIGN)
 						allok = false
 					end
 				else -- a token that isn't a valid name (`FOO-BAR`, `1x`, …): bash errors
 					io.stderr:write("curse: " .. cmd .. ": `" .. a .. "': not a valid identifier\n")
+					badassign = true -- (declare.def assign_error: EX_BADASSIGN)
 					allok = false
 				end
 				do
@@ -889,6 +912,9 @@ return function(sh, cmd, args, hook, tcb)
 				::continue::
 			end
 			rt.assign_ctx = nil
+			if badassign and isdecl then -- (exit status 4 as a pipeline stage: see rt stage_body)
+				sh.badassign = true
+			end
 			if unswap then
 				if sh.arrayargs_pending then
 					sh.pending_unswap = unswap -- (interp assigns the NAME=(…) literals next)

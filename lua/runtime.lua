@@ -603,6 +603,9 @@ function Shell:localAssign(arg, cmd)
 	local ob = self.vars[name]
 	if self:is_global_ro(name) or (nm and ob and ob.ro and own and own[name] ~= nil) then
 		self:errmsg("curse: " .. (cmd or "local") .. ": " .. name .. ": readonly variable\n")
+		if nm then -- (a value for a readonly var: EX_BADASSIGN — see stage_body)
+			self.badassign = true
+		end
 		return false
 	end
 	if nm then
@@ -3610,6 +3613,7 @@ local function co_launch(ctx, self, stage_fns, inproc, base, lastpipe, upv)
 				ctx.vpid, ctx.task = g.vpid, t
 				M.vpid_ctx[g.vpid] = ctx
 			end
+			sh.badassign = nil
 			local ok, err = pcall(fn, sh)
 			if C.getpid() ~= mypid then
 				-- a process FORKED inside this stage (a subshell's child, `( exec … )`) unwound
@@ -3644,6 +3648,12 @@ local function co_launch(ctx, self, stage_fns, inproc, base, lastpipe, upv)
 			if not fok and type(ferr) == "table" and ferr.__curse_sigpipe then
 				return 141
 			end
+			-- a declaration builtin's assignment error returns EX_BADASSIGN (260), which the
+			-- shell maps to 1 — except as a forked simple command's exit status: 260 & 255 = 4
+			-- (an "sflat" stage runs no shell code of its own: the flag is the builtin's)
+			if t.simple and ok and sh.status == 1 and sh.badassign then
+				return 4
+			end
 			return sh.status or 0
 		end
 	end
@@ -3675,6 +3685,7 @@ local function co_launch(ctx, self, stage_fns, inproc, base, lastpipe, upv)
 			end
 			sh.out = make_out(t)
 			t.sh = sh
+			t.simple = kind == "sflat"
 			add(t, stage_body(fn, sh, t))
 		end
 	end
@@ -8838,7 +8849,19 @@ function M.array_convert_msg(sh, cmd, name, what, compound)
 	io.stderr:write("curse: " .. cmd .. ": " .. name .. ": cannot convert " .. what .. "\n")
 	return 1
 end
+-- An empty associative key in a compound literal, as bash reports it: a declaration
+-- builtin's literal was expanded and requoted (`['']='x'`), a plain one is shown as
+-- written (`[""]=y`, `[$k]=w`)
+function M.empty_key_src(sh, it)
+	if sh.arrayargs_pending or it.decl then
+		return "['']" .. (it.op or "=") .. "'" .. it.val:gsub("'", "'\\''") .. "'"
+	end
+	return "[" .. (it.rawkey or it.key) .. "]" .. (it.op or "=") .. (it.src or it.val)
+end
 function M.array_convert_err(sh, name, isassoc, cmd)
+	if isassoc == nil then -- (neither -a nor -A: the literal takes the array's own kind)
+		return false
+	end
 	local b = sh.vars[sh:deref(name)]
 	if b and b.ro and b.arr and (b.assoc and true or false) ~= (isassoc and true or false) then
 		io.stderr:write("curse: " .. name .. ": readonly variable\n") -- (reported before conversion)
@@ -8870,7 +8893,11 @@ function M.arrayassign(sh, name, items, append)
 	end
 end
 arrayassign_body = function(sh, name, items, append)
-	local rb = sh.vars[sh:deref(name)]
+	-- through a nameref (`declare -n r=t; declare -a r=(…)`) the literal lands in the
+	-- referenced array, as interp's do_arrayassign
+	local dn = sh:deref(name)
+	name = dn ~= "" and dn or name
+	local rb = sh.vars[name]
 	if rb and rb.ro then
 		io.stderr:write("curse: " .. name .. ": readonly variable\n")
 		sh.status = 1
@@ -8913,7 +8940,9 @@ arrayassign_body = function(sh, name, items, append)
 					io.stderr:write("curse: " .. name .. ": " .. it.val .. ": must use subscript when assigning associative array\n")
 				else
 					local idx = keyof(it.key)
-					if it.op == "+=" and not append then
+					if idx == "" then -- (an empty key: reported and skipped, like interp's)
+						io.stderr:write("curse: " .. M.empty_key_src(sh, it) .. ": bad array subscript\n")
+					elseif it.op == "+=" and not append then
 						sh:array_set(name, idx, (snap and snap[idx] or "") .. it.val, false)
 					else
 						sh:array_set(name, idx, it.val, it.op == "+=")
@@ -9010,6 +9039,11 @@ function M.assign_element(sh, name, raw, expanded, value, append)
 	local key
 	if sh:is_assoc(name) then
 		key = expanded
+		if key == "" then -- (an associative array has no "" key)
+			io.stderr:write("curse: " .. name .. "[" .. raw .. "]: bad array subscript\n")
+			sh.status = 1
+			error({ __curse_exit = 1, __curse_lineabort = true })
+		end
 	elseif raw:match("^%s*$") or raw:match('^%s*"%s*"%s*$') then -- (a blank subscript is 0)
 		key = 0
 	elseif raw == "@" or raw == "*" then -- (`ia[@]=x`: interp's array_key says so too)

@@ -161,6 +161,7 @@ return function(sh, cmd, args, hook, tcb)
 			elseif not (a:match("^[%a_][%w_]*$") or a:match("^[%a_][%w_]*%+?=") or a:find("[", 1, true)) then
 				io.stderr:write("curse: local: `" .. a .. "': not a valid identifier\n")
 				lok = false
+				sh.badassign = true -- (EX_BADASSIGN: see rt stage_body)
 			elseif not sh:localAssign(a, "local") then
 				lok = false -- (a readonly var can't be localized: bash errors, skips it, continues)
 			end

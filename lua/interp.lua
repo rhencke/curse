@@ -3131,7 +3131,7 @@ local function arrayassign_items(sh, st, isassoc)
 	for _, e in ipairs(st.elems) do
 		if e.key ~= nil and not (e.brace_bare and not isassoc) then
 			-- keyed: an associative array (always keyed), or an indexed key with no brace.
-			items[#items + 1] = { key = e.key, op = e.op, val = expand_assign_word(sh, e.word) }
+			items[#items + 1] = { key = e.key, op = e.op, val = expand_assign_word(sh, e.word), src = e.word.src }
 		else
 			-- bare: a genuine bare element, OR an indexed keyed element whose value
 			-- brace-expands (bash de-keys it — `[k]=` becomes literal in each bare word).
@@ -3229,7 +3229,10 @@ local function do_arrayassign(sh, st)
 					io.stderr:write("curse: " .. name .. ": " .. it.val .. ": must use subscript when assigning associative array\n")
 				else
 					local idx = array_key(sh, name, it.key)
-					if it.op == "+=" and not st.append then -- append to the pre-statement value (see snap)
+					if idx == "" then -- (an empty key: reported as written — by declare, requoted —
+						-- and skipped; the rest still land)
+						io.stderr:write("curse: " .. rt.empty_key_src(sh, it) .. ": bad array subscript\n")
+					elseif it.op == "+=" and not st.append then -- append to the pre-statement value (see snap)
 						sh:array_set(name, idx, (snap and snap[idx] or "") .. it.val, false)
 					else
 						sh:array_set(name, idx, it.val, it.op == "+=")
@@ -5072,14 +5075,11 @@ local function assign_body(sh, st, nref_base, nref_sub)
 			st.append
 		)
 	elseif st.index then
-		if
-			not sh:array_set(
-				st.name,
-				array_key(sh, st.name, st.index),
-				assign_rhs_a(sh, st),
-				st.append
-			)
-		then
+		local key = array_key(sh, st.name, st.index)
+		if key == "" and sh:is_assoc(st.name) then -- (an associative array has no "" key)
+			error({ __curse_badsub = true })
+		end
+		if not sh:array_set(st.name, key, assign_rhs_a(sh, st), st.append) then
 			error({ __curse_badsub = true })
 		end
 	elseif st.arith then
