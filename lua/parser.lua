@@ -4756,11 +4756,15 @@ function M.parse(src, sh, aenv, noalias, posix, line0, line1)
 		-- own statements: a non-recoverable error then aborts (exit 2) before they run,
 		-- and a recoverable one (bad array literal) reports + continues to them — the
 		-- same order run_lazy uses, so the compiler and interpreter agree.
+		local first = #stmts + 1
 		if lg.perr then
 			stmts[#stmts + 1] = lg.perr
 		end
 		for _, st in ipairs(lg.stmts) do
 			stmts[#stmts + 1] = st
+		end
+		if stmts[first] then -- (the first statement of a line group: where a line abort resumes)
+			stmts[first].lgstart = true
 		end
 	end
 	ALIAS_ENV, COMSUB_PREX, POSIX_DQ = saved_env, sprex, spdq

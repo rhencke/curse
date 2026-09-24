@@ -88,9 +88,14 @@ return function(sh, cmd, args, hook, tcb)
 				end
 			else
 				sh.status = st
-				rt.assign_ctx = "printf" -- (a bad nameref target fails it: status 1)
-				sh:set_str(target, res)
-				rt.assign_ctx = nil
+				local tb = sh.vars[sh:deref(target)]
+				if tb and (tb.int or tb.lower or tb.upper) and not tb.arr then
+					rt.assign_ref(sh, "printf", target, res) -- (bound like an assignment: bash)
+				else
+					rt.assign_ctx = "printf" -- (a bad nameref target fails it: status 1)
+					sh:set_str(target, res)
+					rt.assign_ctx = nil
+				end
 			end
 		else
 			local nsets = {}

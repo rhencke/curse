@@ -5655,8 +5655,9 @@ H.forin = function(cx, st, after)
 	-- DEBUG fires at the `for` header before each iteration (bash), with an element present.
 	-- (no iteration at all: the loop's status is 0 — else it's the last body command's)
 	-- (a nameref program: rt.for_assign re-points a nameref loop variable, and a failed
-	-- assignment — a bad target — ends the loop with status 1)
-	if EF.has_nameref then
+	-- assignment — a bad target — ends the loop with status 1; an attributed program's
+	-- loop variable binds through declare -i/-l/-u)
+	if EF.has_nameref or EF.has_attr then
 		cx.blocks[advp] = ("%s; fs.idx = fs.idx + 1; if fs.idx > #fs.list then if fs.idx == 1 then sh.status = 0 end; pc = %d elseif not rt.for_assign(sh, %q, fs.list[fs.idx]) then sh.status = 1; pc = %d else %spc = %d end"):format(
 			getfs,
 			after,
@@ -6904,10 +6905,16 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
 			wb[#wb + 1] = ("sh:aset(%q, %s)"):format(n, lname(n))
 		end
 		local wbs = #wb > 0 and (table.concat(wb, "; ") .. "; ") or ""
+		-- (a line abort resumes at the next LINE GROUP — the parser's complete command:
+		-- `eval "…<newline>…"; echo` is one — else, with no groups recorded, a new line)
+		local lgs = false
+		for k = 1, #stmts do
+			lgs = lgs or stmts[k].lgstart or false
+		end
 		for k = 1, #stmts do
 			local ff = cx.DONE
 			for j = k + 1, #stmts do
-				if (stmts[j].line or 0) > (stmts[k].line or 0) then
+				if lgs and stmts[j].lgstart or not lgs and (stmts[j].line or 0) > (stmts[k].line or 0) then
 					ff = mark[j]
 					break
 				end

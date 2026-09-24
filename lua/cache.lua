@@ -202,7 +202,7 @@ local function run_compiled(mod, sh, pc)
 		if ok then
 			return
 		end
-		if type(err) == "table" and err.__curse_lineabort and not sh.opt_e then
+		if type(err) == "table" and err.__curse_lineabort and (not sh.opt_e or err.__curse_discard) then
 			sh.status = 1
 			pc = sh._ff
 		else

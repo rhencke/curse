@@ -498,17 +498,17 @@ return function(sh, cmd, args, hook, tcb)
 							allok = false
 						end
 					elseif iattr and aattr and not assoc then -- declare -ai a=EXPR: element 0, integer
-						local v = M.arith_eval_str(sh, val)
+						local v = rt.int_value_as(sh, cmd, val, M.arith_eval_str)
 						if ap then
-							v = rt.arith_str(sh, sh:array_get(nm, 0)) + v
+							v = rt.int_value_as(sh, cmd, sh:array_get(nm, 0) or "") + v
 						end
 						sh:array_set(nm, 0, rt.i64_to_str(v), false)
 						sh.vars[sh:deref(nm)].int = true
 					elseif iattr then -- declare -i: arith-evaluate the value, mark integer
 						if ap then -- (the old value is evaluated as an expression too)
-							sh:aset(nm, rt.arith_str(sh, sh:get(nm)) + M.arith_eval_str(sh, val))
+							sh:aset(nm, rt.int_value_as(sh, cmd, sh:get(nm)) + rt.int_value_as(sh, cmd, val, M.arith_eval_str))
 						else
-							sh:aset(nm, M.arith_eval_str(sh, val))
+							sh:aset(nm, rt.int_value_as(sh, cmd, val, M.arith_eval_str))
 						end
 						local ib = sh.vars[sh:deref(nm)] -- (through a nameref: its target)
 						ib.int = true
@@ -537,8 +537,8 @@ return function(sh, cmd, args, hook, tcb)
 							sh:array_set(nm, "0", val, ap)
 						else
 							if eb and eb.int and not assoc then -- an integer var stays arithmetic
-								local v = rt.arith_str(sh, val)
-								sh:aset(nm, ap and (rt.arith_str(sh, sh:get(nm)) + v) or v)
+								local v = rt.int_value_as(sh, cmd, val)
+								sh:aset(nm, ap and (rt.int_value_as(sh, cmd, sh:get(nm)) + v) or v)
 							else
 								sh:set_str(nm, ap and (sh:get(nm) .. val) or val)
 							end
