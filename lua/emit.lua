@@ -503,6 +503,8 @@ end
 -- Serialize an arbitrary AST node (plain tables of strings/numbers/bools) to a
 -- Lua literal, so a cold statement can be baked into the compiled source and run
 -- by the shared interpreter (delegation). No cycles/functions in the AST.
+-- (a loop's source span and its run-time tiering state: never part of the program)
+local SER_SKIP = { _srcs = true, _s0 = true, _s1 = true, _h1 = true, _frag = true, _hits = true }
 local function ser(v)
 	local t = type(v)
 	if t == "string" then
@@ -522,7 +524,7 @@ local function ser(v)
 		parts[#parts + 1] = ser(v[i])
 	end
 	for k, val in spairs(v) do
-		if type(k) ~= "number" or k < 1 or k > n or k ~= math.floor(k) then
+		if (type(k) ~= "number" or k < 1 or k > n or k ~= math.floor(k)) and not SER_SKIP[k] then
 			parts[#parts + 1] = ("[%s]=%s"):format(ser(k), ser(val))
 		end
 	end
@@ -3233,6 +3235,55 @@ local function test_as_arith(cond, lifted)
 	return { k = "bin", op = op, l = l, r = r }
 end
 
+-- ...and when an operand is a plain (non-lifted) variable: {cmd, op, A, B} Lua exprs for
+-- rt.test_icmp — a native compare when its value is a plain decimal at run time, else
+-- the generic test on its fields. nil when neither shape fits.
+local function test_as_varcmp(cond, lifted)
+	if type(cond) ~= "table" or cond.k or #cond ~= 1 then
+		return nil
+	end
+	local st = cond[1]
+	if not st or st.t ~= "simple" or st.redirs or st.assigns then
+		return nil
+	end
+	local w = st.words
+	local function lit1(x)
+		return x and x.parts[1] and #x.parts == 1 and x.parts[1].lit
+	end
+	local cmd, A, opw, B = lit1(w[1]), nil, nil, nil
+	if cmd == "[" and #w == 5 and lit1(w[5]) == "]" then
+		A, opw, B = w[2], w[3], w[4]
+	elseif cmd == "test" and #w == 4 then
+		A, opw, B = w[2], w[3], w[4]
+	else
+		return nil
+	end
+	local op = lit1(opw)
+	if not TEST_ARITH_OP[op or ""] then
+		return nil
+	end
+	local nvar = 0
+	local function opnd(x)
+		if #x.parts == 1 then
+			local p = x.parts[1]
+			if p.var and not lifted[p.var] and not p.index and not p.pexp and p.var:match("^[%a_][%w_]*$") then
+				nvar = nvar + 1
+				return ("rt.test_opnd(sh, %q, %s)"):format(p.var, p.q and "true" or "false")
+			end
+		end
+		local e = test_operand_arith(x, lifted)
+		if not e or not_compilable(e) or arith_side_effect(e) then
+			return nil
+		end
+		return emit_value(e, lifted)
+	end
+	local a, b = opnd(A), opnd(B)
+	if not a or not b or nvar == 0 then
+		return nil
+	end
+	return { cmd = cmd, op = op, a = a, b = b }
+end
+
 -- A word that is exactly one DECIMAL integer literal -> its digits (else nil). A
 -- leading-zero literal (`017`) is REJECTED: bash keeps the string and reads it as
 -- OCTAL only in arithmetic, but appending "LL" would make Lua parse it as decimal
@@ -4097,6 +4148,20 @@ H.assign = function(cx, st, after)
 	-- A nameref ELEMENT/append/arith assign (ref[i]=, ref+=, ref=$((…))) needs interp's
 	-- fuller handling, so delegate those; a plain scalar ref=value compiles.
 	if EF.has_nameref and (st.index or st.append or st.arith) then
+		if EF.fragment and not EF.frag_nameref and st.arith and not st.index and not st.append then
+			-- a fragment only ASSUMES namerefs could exist: native when the var is a plain
+			-- scalar at run time (rt.plain_scalar), else interp's full assign
+			EF.has_nameref = false
+			local ok, pn = pcall(H.assign, cx, st, after)
+			EF.has_nameref = true
+			if not ok then
+				error(pn, 0)
+			end
+			local pd = cx.delegate(st, after)
+			local pg = cx.newpc()
+			cx.blocks[pg] = ("if rt.plain_scalar(sh, %q) then pc = %d else pc = %d end"):format(st.name, pn, pd)
+			return pg
+		end
 		return cx.delegate(st, after)
 	end
 	-- Assigning these fires a side effect only interp's assign implements (resize
@@ -5440,7 +5505,8 @@ H.whilec = function(cx, st, after)
 	-- Keeps [ ]'s own $? (0/1) for the body's first command AND the loop's
 	-- last-body exit status (lv), exactly like the command-condition path below.
 	local tarith = test_as_arith(st.cond, cx.lifted)
-	if tarith then
+	local tvar = not tarith and test_as_varcmp(st.cond, cx.lifted)
+	if tarith or tvar then
 		local lv = cx.newloopvar()
 		local condp = cx.newpc()
 		cx.loopPc[st.id] = condp
@@ -5452,8 +5518,17 @@ H.whilec = function(cx, st, after)
 		cx.loopstack[#cx.loopstack] = nil
 		cx.blocks[bodysave] = ("%s = sh.status; pc = %d"):format(lv, condp)
 		local cst = type(st.cond) == "table" and st.cond[1] or nil
-		cx.blocks[condp] = (cst and dbg(cst) or "") .. ("sh.status = (%s) and 0 or 1; if sh.status %s 0 then pc = %d else pc = %d end"):format(
-			emit_bool(tarith, cx.lifted),
+		local stexpr
+		if tarith then -- ($_ is the test's last argument: `]`, or test's right operand)
+			local tw = st.cond[1].words
+			local lastw = tw[#tw]
+			stexpr = ("sh.status = (%s) and 0 or 1; sh:set_str(\"_\", %s)"):format(emit_bool(tarith, cx.lifted),
+				emit_word(lastw, cx.lifted))
+		else
+			stexpr = ("rt.test_icmp(sh, %s, %q, %s, %q)"):format(tvar.a, tvar.op, tvar.b, tvar.cmd)
+		end
+		cx.blocks[condp] = (cst and dbg(cst) or "") .. ("%s; if sh.status %s 0 then pc = %d else pc = %d end"):format(
+			stexpr,
 			st.negate and "~=" or "==",
 			bodyentry,
 			exitp
@@ -6651,7 +6726,14 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
 						idx = 1
 					end
 					local tgt = (cf_op == "break") and cx.loopstack[idx].brk or cx.loopstack[idx].cont
-					cx.blocks[p] = d .. ("sh.status = 0; pc = %d"):format(tgt)
+					if EF.fragment and lvl > #cx.loopstack and #cx.subexit == 0 then
+						-- (an eval / hot-loop fragment inside the caller's loops: the levels past
+						-- its own reach them — bash counts across; with none, it clamps)
+						cx.blocks[p] = d .. ("if sh.loopdepth > 0 then %serror({ __curse_%s = %d }) end; sh.status = 0; pc = %d"):format(
+							EF.cf_flush or "", cf_op, lvl - #cx.loopstack, tgt)
+					else
+						cx.blocks[p] = d .. ("sh.status = 0; pc = %d"):format(tgt)
+					end
 				end
 				return p
 			end
@@ -6985,6 +7067,7 @@ assemble = function(cfg, sig, opts)
 		o[#o + 1] = ("    %s pc == %d then %s%s"):format(p == 0 and "if" or "elseif", p,
 			heads[p] and "if __pre[0] ~= 0 then rt.preempt() end " or "", cfg.blocks[p])
 	end
+	o[#o + 1] = '    else error("curse: internal error: no block for pc " .. tostring(pc)) -- (never spin)'
 	o[#o + 1] = "    end"
 	o[#o + 1] = "  end"
 	for _, n in ipairs(opts.runlocals or {}) do
@@ -7190,6 +7273,7 @@ function M.emit(ast, opts)
 	EF.has_attr = EF.fragment or scan_attr(ast.stmts) -- gate compiled attribute-aware scalar assign
 	EF.has_dyncode = scan_dyncode(ast.stmts) -- eval/source present → a $(…) can't assume its body's names are externals
 	EF.ro_names = nil -- (this program's readonly names: computed on first need — func_locals)
+	EF.frag_nameref = EF.fragment and scan_nameref(ast.stmts) -- (the fragment's own text)
 	EF.has_nameref = EF.fragment or scan_nameref(ast.stmts) -- declare -n present → delegate scalar assigns
 	EF.has_err = scan_trap(ast.stmts, { ERR = 1 }) -- gate compiled ERR-trap firing
 	EF.has_debug = scan_trap(ast.stmts, { DEBUG = 1 }) -- gate compiled DEBUG-trap firing
@@ -7395,6 +7479,25 @@ function M.emit(ast, opts)
 	-- assemble them into a buffer and splice after the forward-declaration line below).
 	local fndefs = {}
 	local fnloop, fnsrc = {}, {} -- (for OSR into a call the interpreter is running: tier)
+	-- A name defined more than once shares one fn_x (the last definition wins), so a
+	-- switch could run a loop pc of one body in another's CFG — never matching a
+	-- block, spinning forever. Only a name with ONE definition anywhere is resumable.
+	local ndefs = {}
+	local function count_defs(t, seen)
+		if type(t) ~= "table" or seen[t] then
+			return
+		end
+		seen[t] = true
+		if t.t == "funcdef" and t.name then
+			ndefs[t.name] = (ndefs[t.name] or 0) + 1
+		end
+		for k, v in pairs(t) do
+			if type(v) == "table" and k ~= "_srcs" then
+				count_defs(v, seen)
+			end
+		end
+	end
+	count_defs(ast.stmts, {})
 	for _, st in ipairs(ast.stmts) do
 		if st.t == "funcdef" then
 			-- keep every fn_x (indirect/dynamic dispatch); it can't see run-locals, so
@@ -7418,7 +7521,7 @@ function M.emit(ast, opts)
 			EF.fn_locals = sv_fl
 			fndefs[#fndefs + 1] = assemble(cfg, fnlname(st.name) .. " = function(sh, pc)",
 				{ shname = st.name, fnlocals = fl, fnresume = true })
-			if next(cfg.loopPc) and not fnloop[st.name] then
+			if next(cfg.loopPc) and not fnloop[st.name] and ndefs[st.name] == 1 then
 				fnloop[st.name] = cfg.loopPc
 				fnsrc[st.name] = require("interp").deparse_func(st.name, st)
 			end

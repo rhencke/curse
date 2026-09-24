@@ -3512,7 +3512,9 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs)
 				local a, b, c = slots[1], slots[2], slots[3]
 				loopId = loopId + 1
 				local id = loopId
+				local h1 = i -- (past the header: a hot loop's fragment re-states it without init)
 				local body_stmts = loop_body()
+				local s1 = i - 1
 				-- Parse each arith slot eagerly, but a SYNTAX ERROR in a slot (`i='3'`,
 				-- `++'i'`) is deferred to runtime — bash reports such an error when the loop
 				-- executes and runs zero iterations non-fatally, rather than failing to parse
@@ -3537,6 +3539,9 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs)
 					src = { a, b, c }, -- the slots as written (`declare -f` prints them)
 					body = body_stmts,
 					redirs = tail_redirs(),
+					_srcs = src,
+					_h1 = h1,
+					_s1 = s1,
 				}
 			end
 			-- for NAME in WORDS. Capture NAME as a whole token (not just a valid
@@ -3626,6 +3631,7 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs)
 		if peekword() == "while" or peekword() == "until" then
 			local kind = peekword()
 			local ln = line
+			local s0 = i -- (the loop's source span: a hot loop is compiled from its own text)
 			i = i + #kind
 			loopId = loopId + 1
 			local id = loopId
@@ -3643,6 +3649,7 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs)
 			if #body_stmts == 0 then
 				error("syntax error near `done'")
 			end -- bash: empty do/done is invalid
+			local s1 = i - 1
 			return {
 				t = "whilec",
 				id = id,
@@ -3651,6 +3658,9 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs)
 				body = body_stmts,
 				negate = (kind == "until"),
 				redirs = tail_redirs(),
+				_srcs = src,
+				_s0 = s0,
+				_s1 = s1,
 			}
 		end
 		-- if COND; then BODY [elif COND; then BODY]* [else BODY] fi — COND is a

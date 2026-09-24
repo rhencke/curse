@@ -259,6 +259,7 @@ end
 
 local compile_store
 
+
 local LOOP_WORDS = { "while", "until", "for", "select", "function" }
 local function may_loop(src)
 	for _, w in ipairs(LOOP_WORDS) do
@@ -272,6 +273,65 @@ local deferred = {}
 -- (loop iterations before an interpreted cold run compiles and switches; CURSE_HOT_LOOP
 -- overrides — 1 stress-tests OSR at every top-level loop)
 local HOT_LOOP = tonumber(os.getenv("CURSE_HOT_LOOP") or "") or 100
+-- A hot loop where neither OSR applies — inside a subshell, $(…), a pipeline stage, a
+-- background job, or a function the module can't continue — is compiled ALONE, from its
+-- own source text, and run in place of the rest of the interpreted loop. At the loop head
+-- that is exact: a while/until re-tests its condition, and a (( ; ; )) loop re-states
+-- its header without the init already run. Cached on the node (false: declined).
+local function loop_fragment(st)
+	local frag = st._frag
+	if frag ~= nil then
+		return frag
+	end
+	st._frag = false
+	local srcs = st._srcs
+	if not srcs then
+		return false
+	end
+	local code
+	if st.t == "whilec" then
+		code = srcs:sub(st._s0, st._s1)
+	elseif st.t == "forc" and st.src then
+		code = "for ((;" .. (st.src[2] or "") .. ";" .. (st.src[3] or "") .. "))" .. srcs:sub(st._h1, st._s1)
+	else
+		return false
+	end
+	st._frag = M.compile_fragment(code, st.line) or false
+	return st._frag
+end
+-- (the interp's SUBHOOK forwards to this: loop fragments only, never a program switch)
+function M.frag_hook(kind, id, st, sh)
+	if kind == "loop" and sh and not (sh.traps and (sh.traps.DEBUG or sh.traps.RETURN)) then
+		return M.loop_osr(sh, st)
+	end
+end
+-- Run the rest of loop `st` compiled, if it's hot enough and compiles: true (+ the
+-- control-flow error the fragment raised, for the interp loop to rethrow after its
+-- own cleanup), or nil to keep interpreting.
+function M.loop_osr(sh, st)
+	if not st or (st.t ~= "whilec" and st.t ~= "forc") then
+		return nil
+	end
+	local hits = (st._hits or 0) + 1
+	st._hits = hits
+	if hits < HOT_LOOP then
+		return nil
+	end
+	local mod = loop_fragment(st)
+	if not mod then
+		return nil
+	end
+	-- (sh.loopdepth counts the loops AROUND the fragment: its own interp frame is out)
+	local ld = sh.loopdepth
+	sh.loopdepth = ld - 1
+	local ok, err = pcall(M.run_compiled, mod, sh, nil)
+	sh.loopdepth = ld
+	if ok then
+		return true
+	end
+	return true, err
+end
+I.frag_hook = M.frag_hook -- (the interpreter's isolated contexts tier their hot loops)
 -- emit + load + store (disk cache and this worker's) — nil if the emitter can't. With
 -- `later`, the disk write waits for M.flush_stores (a compile MID-RUN happens under the
 -- script's own limits — `ulimit -f 1` would kill the process with SIGXFSZ).
@@ -372,7 +432,7 @@ function M.run_tiered(src, sh)
 		-- A script that never gets hot is compiled after the reply.
 		local mod, resume, count = nil, nil, 0
 		local fnseen = {} -- (function name -> its switch verdict, checked once)
-		local hook = function(kind, id)
+		local hook = function(kind, id, st)
 			if kind ~= "loop" then
 				return
 			end
@@ -394,7 +454,7 @@ function M.run_tiered(src, sh)
 				local fname = sh.funcstack and sh.funcstack[1]
 				local fl = mod and mod.fnLoop and fname and mod.fnLoop[fname]
 				if not fl then
-					return
+					return M.loop_osr(sh, st)
 				end
 				local verdict = fnseen[fname]
 				if verdict == nil then
@@ -407,7 +467,7 @@ function M.run_tiered(src, sh)
 				if fpc then
 					error({ __curse_fnswitch = true, fn = fl.fn, pc = fpc, depth = sh.calldepth }, 0)
 				end
-				return
+				return M.loop_osr(sh, st)
 			end
 			if mod == nil then
 				if not ast then
@@ -421,6 +481,7 @@ function M.run_tiered(src, sh)
 				resume = { kind = kind, id = id }
 				error({ __curse_switch = true })
 			end
+			return M.loop_osr(sh, st) -- (a loop the module can't resume: a subshell's, …)
 		end
 		local ok, err = pcall(I.run_lazy, sh, src, hook)
 		if ok then

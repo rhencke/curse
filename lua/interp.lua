@@ -654,6 +654,15 @@ end
 -- signal set to be ignored (`trap '' SIG`) keeps both its ignore disposition and
 -- its display.
 local function NOHOOK() end -- (an OSR hook that never switches)
+-- The hook for an isolated context (subshell, $(…), pipeline stage, background job):
+-- no switch of the whole program (it mustn't unwind past the context's checkpoint), but
+-- a hot loop may still run compiled on its own — tier installs M.frag_hook when loaded.
+local function SUBHOOK(kind, id, st, sh)
+	local f = M.frag_hook
+	if f then
+		return f(kind, id, st, sh)
+	end
+end
 local function reset_child_sigtraps(sh)
 	if not sh.sigtraps then
 		return
@@ -1253,7 +1262,7 @@ local function expand_procsub(sh, p)
 			end
 			return
 		end
-		M.exec_list(ssh, stmts, NOHOOK, false)
+		M.exec_list(ssh, stmts, SUBHOOK, false)
 	end, "procsub", false, false, nil, nil,
 		{ fds = { [p.dir == "<" and 1 or 0] = theirs }, keepstdin = true, nojob = true })
 	C.close(theirs)
@@ -5696,7 +5705,14 @@ exec_stmt = function(sh, st, hook)
 				ev(st.init, 1)
 			end
 			while true do
-				hook("loop", st.id)
+				local hr, herr = hook("loop", st.id, st, sh)
+				if hr then -- (the rest of the loop ran compiled: see tier's loop fragments)
+					if herr ~= nil then
+						error(herr, 0)
+					end
+					bodystatus = sh.status
+					break
+				end
 				if PREEMPT[0] ~= 0 then
 					rt.preempt()
 				end
@@ -5734,7 +5750,15 @@ exec_stmt = function(sh, st, hook)
 		local bodystatus = 0
 		sh.loopdepth = (sh.loopdepth or 0) + 1
 		while true do
-			hook("loop", st.id)
+			local hr, herr = hook("loop", st.id, st, sh)
+			if hr then -- (the rest of the loop ran compiled: see tier's loop fragments)
+				if herr ~= nil then
+					sh.loopdepth = sh.loopdepth - 1
+					error(herr, 0)
+				end
+				bodystatus = sh.status
+				break
+			end
 			if PREEMPT[0] ~= 0 then
 				rt.preempt()
 			end
@@ -5824,7 +5848,7 @@ exec_stmt = function(sh, st, hook)
 					return
 				end
 			end
-			exec_list(sh, st.body, NOHOOK, false)
+			exec_list(sh, st.body, SUBHOOK, false)
 		end)
 		if saves then
 			restore_redirs(saves)
@@ -5845,7 +5869,7 @@ exec_stmt = function(sh, st, hook)
 		local cmd = st.cmd
 		local run = rt.bg_tail_stmt(cmd)
 		sh:bg_launch(function(ssh)
-			exec_stmt(ssh, run, NOHOOK)
+			exec_stmt(ssh, run, SUBHOOK)
 		end, cmdstr, cmd.t == "subshell", cmd.t == "simple")
 		sh.status = 0
 	elseif t == "coproc" then
@@ -5871,7 +5895,7 @@ exec_stmt = function(sh, st, hook)
 		local cmd = st.cmd
 		local job = sh:bg_launch(function(ssh)
 			ssh.coprocs = nil -- (an older coproc's ends aren't this one's)
-			exec_stmt(ssh, cmd, NOHOOK)
+			exec_stmt(ssh, cmd, SUBHOOK)
 		end, "coproc " .. st.name, cmd.t == "subshell", cmd.t == "simple", nil, nil,
 			{ fds = { [0] = w0, [1] = r1 } })
 		C.close(r1)
@@ -6038,7 +6062,7 @@ exec_stmt = function(sh, st, hook)
 					if not inshell then -- a stage re-runs neither DEBUG nor ERR
 						ssh.in_pipestage = (ssh.in_pipestage or 0) + 1
 					end
-					exec_stmt(ssh, stage, NOHOOK)
+					exec_stmt(ssh, stage, SUBHOOK)
 				end
 				inproc[k] = rt.stage_flat(stage, function(c)
 					return sh.functions[c] ~= nil
@@ -6912,6 +6936,7 @@ end
 -- build.lua lazy_mods). These are the interp locals the extracted builtins
 -- reference; a feature module aliases them to the same names and copies its
 -- branch bodies verbatim.
+M.SUBHOOK = SUBHOOK -- ($(…) bodies run from runtime use it too)
 M._int = {
 	SPECIAL_BUILTIN = SPECIAL_BUILTIN,
 	exec_simple = exec_simple,

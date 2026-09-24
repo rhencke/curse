@@ -2073,7 +2073,8 @@ function Shell:capture_src(src, backtick, noalias)
 	-- light path propagates via __curse_parseerr)
 	if iso and not has_perr then
 		return self:capture_compiled_iso(function(self)
-			return require("interp").exec_list(self, ast.stmts, function() end, true)
+			local Iq = require("interp")
+			return Iq.exec_list(self, ast.stmts, Iq.SUBHOOK, true)
 		end, backtick)
 	end
 	-- Run via exec_list (NOT interp.run): an `exit`/`return` inside $() ends only
@@ -6137,6 +6138,12 @@ function Shell:import_env()
 end
 
 -- Arithmetic write: store the int64, defer the string (lazy).
+-- A compiled fragment (eval, a hot loop) can't see the whole program, so it can't know a
+-- name is never a nameref / readonly / array: its native arith assign checks at run time.
+function M.plain_scalar(sh, name)
+	local b = sh.vars[name]
+	return b == nil or not (b.ref or b.ro or b.arr)
+end
 function Shell:aset(name, n)
 	local dn = self:deref(name)
 	local b = box(dn, self.vars)
@@ -10856,6 +10863,54 @@ local function do_test(sh, args)
 end
 M.test_unary, M.test_binary, M.test_int = test_unary, test_binary, test_int
 M.TEST_BINOPS, M.TEST_UNOPS, M.do_test = TEST_BINOPS, TEST_UNOPS, do_test
+-- A compiled `[ A -op B ]` whose operand is a plain (non-lifted) variable: its value as an
+-- int64 when it is a plain decimal (the common case: a native compare), else its fields
+-- exactly as the generic path expands them (unquoted: word-split), for do_test.
+function M.test_opnd(sh, name, quoted)
+	local v = M.nameref_read(sh, name)
+	if short_digits(v) then
+		return i64(tonumber(v))
+	end
+	if quoted then
+		return { v }
+	end
+	return M.field_split(sh, v, true)
+end
+local TEST_CMP = {
+	["-eq"] = function(a, b) return a == b end,
+	["-ne"] = function(a, b) return a ~= b end,
+	["-lt"] = function(a, b) return a < b end,
+	["-le"] = function(a, b) return a <= b end,
+	["-gt"] = function(a, b) return a > b end,
+	["-ge"] = function(a, b) return a >= b end,
+}
+-- ...and the test itself: sets and returns $? (0/1; the generic path's 2 + message on a
+-- non-integer operand). `cmd` is "[" or "test".
+function M.test_icmp(sh, a, op, b, cmd)
+	if type(a) == "cdata" and type(b) == "cdata" then
+		sh.status = TEST_CMP[op](a, b) and 0 or 1
+		sh:set_str("_", cmd == "[" and "]" or i64_to_str(b))
+		return sh.status
+	end
+	local argv = { cmd }
+	for _, x in ipairs({ a, false, b }) do
+		if x == false then
+			argv[#argv + 1] = op
+		elseif type(x) == "cdata" then
+			argv[#argv + 1] = i64_to_str(x)
+		else
+			for k = 1, #x do
+				argv[#argv + 1] = M.cstr(x[k])
+			end
+		end
+	end
+	if cmd == "[" then
+		argv[#argv + 1] = "]"
+	end
+	do_test(sh, argv)
+	sh:set_str("_", argv[#argv])
+	return sh.status
+end
 
 -- Attribute-aware scalar assignment (interp's assign_scalar twin, for the EF.has_attr
 -- compiled path): the RHS `value` is already word-expanded. A readonly target errors
