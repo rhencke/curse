@@ -248,6 +248,7 @@ function Shell.new()
 	if sh.vars["OPTIND"] == nil then
 		sh:set_str("OPTIND", "1")
 	end -- bash: OPTIND starts at 1
+	sh.vars.OPTIND.int = true -- (an integer variable: `declare -p OPTIND` is -i)
 	if sh.vars["HOSTNAME"] == nil then
 		sh:set_str("HOSTNAME", M.hostname())
 	end

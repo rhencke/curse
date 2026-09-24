@@ -211,6 +211,13 @@ return function(sh, cmd, args, hook, tcb)
 						names[#names + 1] = nm
 					end
 				end
+				-- …and the integer dynamic scalars (`declare -p -i`)
+				for _, nm in ipairs({ "BASHPID", "HISTCMD", "RANDOM", "SRANDOM" }) do
+					if sh.vars[nm] == nil then
+						virt[nm] = { int = true, s = "" }
+						names[#names + 1] = nm
+					end
+				end
 			end
 			table.sort(names)
 			for _, nm in ipairs(names) do

@@ -3371,6 +3371,10 @@ end
 -- the dynamic arrays bash lists among its variables (curse computes them on demand)
 local DYN_ARRAYS = { BASH_ARGC = 1, BASH_ARGV = 1, BASH_LINENO = 1, BASH_SOURCE = 1, DIRSTACK = 1, FUNCNAME = 1, GROUPS = 1 }
 M.DYN_ARRAYS = DYN_ARRAYS
+-- bash's dynamic scalars (computed on read, no var box here) and their attributes
+local DYN_SCALARS = { BASHPID = "i", HISTCMD = "i", RANDOM = "i", SRANDOM = "i", SECONDS = "i", LINENO = "-",
+	EPOCHSECONDS = "-", EPOCHREALTIME = "-", BASH_SUBSHELL = "-", BASH_COMMAND = "-" }
+M.DYN_SCALARS = DYN_SCALARS
 -- Format one variable as a `declare -p` line, or nil if it is unset.
 local function fmt_decl(sh, name)
 	-- SHELLOPTS/BASHOPTS are readonly, exported, derived specials with no var box.
@@ -3390,6 +3394,9 @@ local function fmt_decl(sh, name)
 			return name == "FUNCNAME" and "declare -a FUNCNAME" or ("declare -a " .. name .. "=()")
 		end
 		return "declare -a " .. name .. "=(" .. table.concat(parts, " ") .. ")"
+	end
+	if b == nil and DYN_SCALARS[name] then
+		return "declare -" .. DYN_SCALARS[name] .. " " .. name .. "=" .. decl_quote(sh:get(name) or "")
 	end
 	if b == nil then
 		return nil
