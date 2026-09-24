@@ -9760,6 +9760,9 @@ function M.ansi_unescape(s, mode)
 					out[#out + 1] = M.utf8_char(tonumber(hex, 16))
 					i = i + 2 + #hex
 				else
+					if mode == "b" then -- (printf %b warns, as bash's tescape)
+						io.stderr:write("curse: printf: missing unicode digit for \\" .. d .. "\n")
+					end
 					out[#out + 1] = "\\" .. d
 					i = i + 2
 				end
