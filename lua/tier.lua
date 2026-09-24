@@ -452,7 +452,35 @@ function M.run_tiered(src, sh)
 		-- A script that never gets hot is compiled after the reply.
 		local mod, resume, count = nil, nil, 0
 		local fnseen = {} -- (function name -> its switch verdict, checked once)
-		local hook = function(kind, id, st)
+		local calls = {} -- (function name -> calls interpreted so far)
+		local hook = function(kind, id, st, csh)
+			if kind == "call" then
+				-- a hot function (recursion, or called in a loop the switch can't take): the
+				-- compiled version runs its later calls — when the running definition is the
+				-- one compiled (checked once per definition node)
+				local n = (calls[id] or 0) + 1
+				calls[id] = n
+				if n < HOT_LOOP or not st or (sh.traps and (sh.traps.DEBUG or sh.traps.RETURN)) then
+					return nil
+				end
+				if mod == nil then
+					if not ast then
+						local okp, a = pcall(P.parse, src)
+						ast = okp and a or nil
+					end
+					mod = ast and compile_store(path, ast, sh, true) or false
+				end
+				local fc = mod and mod.fnCall and mod.fnCall[id]
+				if not fc then
+					return nil
+				end
+				local verdict = fnseen[st]
+				if verdict == nil then
+					verdict = type(sh.functions[id]) == "table" and I.deparse_func(id, st) == fc.src or false
+					fnseen[st] = verdict
+				end
+				return verdict and fc.fn or nil
+			end
 			if kind ~= "loop" then
 				return
 			end
@@ -476,12 +504,11 @@ function M.run_tiered(src, sh)
 				if not fl then
 					return M.loop_osr(sh, st)
 				end
-				local verdict = fnseen[fname]
-				if verdict == nil then
-					local def = sh.func_def and sh.func_def[fname]
-					verdict = def and type(sh.functions[fname]) == "table"
-						and I.deparse_func(fname, def) == fl.src or false
-					fnseen[fname] = verdict
+				local def = sh.func_def and sh.func_def[fname]
+				local verdict = def and fnseen[def]
+				if def and verdict == nil then -- (per definition node: a redefinition is re-checked)
+					verdict = type(sh.functions[fname]) == "table" and I.deparse_func(fname, def) == fl.src or false
+					fnseen[def] = verdict
 				end
 				local fpc = verdict and fl.pcs[id]
 				if fpc then

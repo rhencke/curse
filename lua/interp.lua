@@ -4018,7 +4018,13 @@ local function run_function(sh, cmd, fn, args, hook, tenv_base)
 	elseif type(fn) == "function" then
 		ok, err = pcall(fn, sh) -- a COMPILED function closure
 	else
-		ok, err = pcall(exec_list, sh, fn, hook, false)
+		-- a hot function in a cold run: its compiled version, once the tier has it
+		local cfn = hook("call", cmd, sh.func_def and sh.func_def[cmd], sh)
+		if cfn then
+			ok, err = pcall(cfn, sh)
+		else
+			ok, err = pcall(exec_list, sh, fn, hook, false)
+		end
 		-- the tier compiled this function while a loop in it ran hot: the rest of THIS call
 		-- continues compiled from that loop (err.pc), in the frame already set up here
 		if not ok and type(err) == "table" and err.__curse_fnswitch and err.depth == sh.calldepth then

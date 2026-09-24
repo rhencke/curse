@@ -5057,6 +5057,15 @@ simple_compiled = function(cx, st, after)
 				.. lastarg
 				.. ecs
 				.. ("; pc = %d"):format(after)
+			if not px_builtin then
+				-- (an external name — unless a function by that name exists at run time: a
+				-- fragment can't see the program's funcdefs, eval/source can define one; the
+				-- interpreter then runs the call with its prefix env)
+				local pd = cx.delegate(st, after)
+				local pg = cx.newpc()
+				cx.blocks[pg] = ("if sh.functions[%q] then pc = %d else pc = %d end"):format(cmd, pd, p)
+				return pg
+			end
 			return p
 		end
 	end
@@ -5159,7 +5168,18 @@ simple_compiled = function(cx, st, after)
 				and not require("interp").BUILTINS[cmd]
 			then
 				from = 1
-				call = "sh:exec(unpack(__a))" -- external, static command name
+				-- external — unless a function by that name exists at run time (a fragment
+				-- can't see the program's funcdefs; eval/source/an imported function can
+				-- define one): then the interpreter's call path, lifted vars synced around it
+				local ei, eo = {}, {}
+				for n in spairs(cx.lifted) do
+					ei[#ei + 1] = ("sh:aset(%q, %s)"):format(n, lname(n))
+					eo[#eo + 1] = ("%s = sh:aget(%q)"):format(lname(n), n)
+				end
+				call = ("if sh.functions[%q] then %srt.call_dynamic_fn(sh, __a)%s else sh:exec(unpack(__a)) end"):format(
+					cmd,
+					#ei > 0 and (table.concat(ei, "; ") .. "; ") or "",
+					#eo > 0 and ("; " .. table.concat(eo, "; ")) or "")
 			else
 				return cx.delegate(st, after)
 			end
@@ -7568,7 +7588,7 @@ function M.emit(ast, opts)
 	-- fn_x bodies (build_cfg may register compiled `$(…)` fragments as a side effect, so
 	-- assemble them into a buffer and splice after the forward-declaration line below).
 	local fndefs = {}
-	local fnloop, fnsrc = {}, {} -- (for OSR into a call the interpreter is running: tier)
+	local fnloop, fnsrc, fncall = {}, {}, {} -- (for OSR into a call the interpreter is running: tier)
 	-- A name defined more than once shares one fn_x (the last definition wins), so a
 	-- switch could run a loop pc of one body in another's CFG — never matching a
 	-- block, spinning forever. Only a name with ONE definition anywhere is resumable.
@@ -7615,6 +7635,10 @@ function M.emit(ast, opts)
 				fnloop[st.name] = cfg.loopPc
 				fnsrc[st.name] = require("interp").deparse_func(st.name, st)
 			end
+			if ndefs[st.name] == 1 then -- (a hot CALL of it runs compiled: tier)
+				fncall[st.name] = true
+				fnsrc[st.name] = fnsrc[st.name] or require("interp").deparse_func(st.name, st)
+			end
 		end
 	end
 	local funcsrc, funcline = {}, {} -- name -> verbatim definition text / def line (top-level funcdefs)
@@ -7654,9 +7678,14 @@ function M.emit(ast, opts)
 		fl[#fl + 1] = ("[%q] = { pcs = %s, src = %q, fn = %s }"):format(name, serialize(lp), fnsrc[name],
 			EF.upv_wrapped(fnlname(name)))
 	end
-	o[#o + 1] = ("return { run = run, loopPc = loopPc, stmtPc = stmtPc%s%s }"):format(
+	local fc = {}
+	for name in spairs(fncall) do
+		fc[#fc + 1] = ("[%q] = { src = %q, fn = %s }"):format(name, fnsrc[name], EF.upv_wrapped(fnlname(name)))
+	end
+	o[#o + 1] = ("return { run = run, loopPc = loopPc, stmtPc = stmtPc%s%s%s }"):format(
 		EF.alias_static and ", alias_static = true" or "",
-		#fl > 0 and (", fnLoop = { " .. table.concat(fl, ", ") .. " }") or ""
+		#fl > 0 and (", fnLoop = { " .. table.concat(fl, ", ") .. " }") or "",
+		#fc > 0 and (", fnCall = { " .. table.concat(fc, ", ") .. " }") or ""
 	)
 	return table.concat(o, "\n") .. "\n"
 end
