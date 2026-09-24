@@ -21,6 +21,9 @@ return function(sh, cmd, args, hook, tcb)
 		-- let EXPR…: evaluate each as arithmetic (assignments take effect). Status is
 		-- 0 if the LAST expression is non-zero, else 1; a bad/empty expression or no
 		-- args is also status 1 (an arith error is non-fatal, like `(( ))`).
+		if args[2] == "--" then -- (a leading `--` is skipped: ISOPTION)
+			table.remove(args, 2)
+		end
 		if #args < 2 then
 			io.stderr:write("curse: let: expression expected\n")
 			sh.status = 1
