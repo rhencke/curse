@@ -5453,18 +5453,28 @@ H.forc = function(cx, st, after)
 	cx.blocks[stepp] = d
 		.. (st.step and emit_arith_stmt(st.step, cx.lifted) .. "; " or "")
 		.. ("pc = %d"):format(condp)
+	-- (a loop that runs no iteration has status 0; else its last body command's — `ran`
+	-- says which, reset each time the loop is entered; 1 at an OSR entry, which skips the
+	-- reset — that loop has been iterating in the interpreter)
+	local ran = cx.newloopvar(1)
+	local bodyp, exitp = cx.newpc(), cx.newpc()
+	cx.blocks[bodyp] = ("%s = 1; pc = %d"):format(ran, bodyentry)
+	cx.blocks[exitp] = ("if %s == 0 then sh.status = 0 end; pc = %d"):format(ran, after)
 	cx.blocks[condp] = d
 		.. ("if %s then pc = %d else pc = %d end"):format(
 			st.cond and emit_bool(st.cond, cx.lifted) or "true",
-			bodyentry,
-			after
+			bodyp,
+			exitp
 		)
+	local ep = cx.newpc()
 	if st.init then
 		local ip = cx.newpc()
 		cx.blocks[ip] = d .. emit_arith_stmt(st.init, cx.lifted) .. ("; pc = %d"):format(condp)
-		return ip
+		cx.blocks[ep] = ("%s = 0; pc = %d"):format(ran, ip)
+	else
+		cx.blocks[ep] = ("%s = 0; pc = %d"):format(ran, condp)
 	end
-	return condp
+	return ep
 end
 
 -- statement handler: whilec (split out of flatten_stmt; see H)
@@ -5650,10 +5660,11 @@ H.forin = function(cx, st, after)
 		cx.blocks[initp] = ("if rt.for_var_ro(sh, %q) then pc = %d else %s end"):format(st.name, after, cx.blocks[initp])
 	end
 	-- DEBUG fires at the `for` header before each iteration (bash), with an element present.
+	-- (no iteration at all: the loop's status is 0 — else it's the last body command's)
 	-- (a nameref program: rt.for_assign re-points a nameref loop variable, and a failed
 	-- assignment — a bad target — ends the loop with status 1)
 	if EF.has_nameref then
-		cx.blocks[advp] = ("%s; fs.idx = fs.idx + 1; if fs.idx > #fs.list then pc = %d elseif not rt.for_assign(sh, %q, fs.list[fs.idx]) then sh.status = 1; pc = %d else %spc = %d end"):format(
+		cx.blocks[advp] = ("%s; fs.idx = fs.idx + 1; if fs.idx > #fs.list then if fs.idx == 1 then sh.status = 0 end; pc = %d elseif not rt.for_assign(sh, %q, fs.list[fs.idx]) then sh.status = 1; pc = %d else %spc = %d end"):format(
 			getfs,
 			after,
 			st.name,
@@ -5662,7 +5673,7 @@ H.forin = function(cx, st, after)
 			bodyentry
 		)
 	else
-		cx.blocks[advp] = ("%s; fs.idx = fs.idx + 1; if fs.idx > #fs.list then pc = %d else sh:set_str(%q, fs.list[fs.idx]); %spc = %d end"):format(
+		cx.blocks[advp] = ("%s; fs.idx = fs.idx + 1; if fs.idx > #fs.list then if fs.idx == 1 then sh.status = 0 end; pc = %d else sh:set_str(%q, fs.list[fs.idx]); %spc = %d end"):format(
 			getfs,
 			after,
 			st.name,
@@ -6292,10 +6303,14 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
 	-- jumps (no runtime unwind). loopvars are run()-level status holders (one per
 	-- command-condition while), declared 0 and used to give the loop bash's exit
 	-- status (last body command, or 0). Both are returned for assemble to declare.
-	cx.loopstack, cx.loopvars = {}, {}
-	function cx.newloopvar()
+	cx.loopstack, cx.loopvars, cx.loopinit = {}, {}, nil
+	function cx.newloopvar(init) -- (init: its value on entry to run — else 0)
 		local v = "__lw" .. #cx.loopvars
 		cx.loopvars[#cx.loopvars + 1] = v
+		if init then
+			cx.loopinit = cx.loopinit or {}
+			cx.loopinit[v] = init
+		end
 		return v
 	end
 	-- Stack of subshell exit pcs (subshell_exit). `return` inside a subshell exits the
@@ -6971,6 +6986,7 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
 			loopPc = cx.loopPc,
 			stmtPc = cx.stmtPc,
 			loopvars = cx.loopvars,
+			loopinit = cx.loopinit,
 			forlocals = cx.forlocals,
 		}
 	end
@@ -6982,6 +6998,7 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
 		loopPc = cx.loopPc,
 		stmtPc = cx.stmtPc,
 		loopvars = cx.loopvars,
+		loopinit = cx.loopinit,
 		forlocals = cx.forlocals,
 	}
 end
@@ -7047,7 +7064,7 @@ assemble = function(cfg, sig, opts)
 	end
 	-- per-loop status holders (while-command loops): plain native locals, init 0.
 	for _, v in ipairs(cfg.loopvars or {}) do
-		o[#o + 1] = ("  local %s = 0"):format(v)
+		o[#o + 1] = ("  local %s = %s"):format(v, cfg.loopinit and cfg.loopinit[v] or 0)
 	end
 	-- pc stays a plain LOCAL (register-allocated, fast in hot loops). A div0/failglob
 	-- lineabort thrown from compiled code is caught by the tier's retry wrapper, which
