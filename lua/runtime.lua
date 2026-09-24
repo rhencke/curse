@@ -1693,7 +1693,8 @@ end
 -- restores the previous mask, which delivers it. (Only SIG is touched: the scheduler
 -- keeps SIGPIPE blocked meanwhile.)
 do
-	local set, old, held = ffi.new("uint8_t[1024]"), ffi.new("uint8_t[1024]"), false
+	local set, old, held, hsig = ffi.new("uint8_t[1024]"), ffi.new("uint8_t[1024]"), false, 0
+	local zero_ts = ffi.new("struct curse_co_ts", 0, 0)
 	function M.self_sig_hold(sig)
 		if held then
 			return
@@ -1701,12 +1702,21 @@ do
 		C.sigemptyset(set)
 		C.curse_co_sigaddset(set, sig)
 		C.sigprocmask(0, set, old) -- SIG_BLOCK
-		held = true
+		held, hsig = true, sig
 	end
-	function M.self_sig_release()
+	-- Inside a trap handler the async delivery can't run another trap until the handler is
+	-- done (the VM hook doesn't nest), but bash runs it right away, nested — even the same
+	-- signal's own. So there, take the pending signal off the queue and run its trap here.
+	function M.self_sig_release(sh)
 		if held then
 			held = false
+			local h = sh and (sh.in_trap or 0) > 0 and sh.traps
+				and sh.traps["SIG" .. (require("interp")._int.NUMSIG[hsig] or "")]
+			local take = h and h ~= "" and C.curse_co_sigtimedwait(set, nil, zero_ts) == hsig
 			C.sigprocmask(2, old, nil) -- SIG_SETMASK
+			if take then
+				require("interp").run_signal(sh, hsig, false, true)
+			end
 		end
 	end
 end
@@ -2420,7 +2430,8 @@ function M.iso_save_traps(sh)
 	ctx.traps = {
 		owner = sh, -- (whose tables these are: a no-#! script's fresh shell shares our context)
 		traps = sh.traps, sigtraps = sh.sigtraps, inh = M.exit_trap_inherited,
-		esp = sh.err_trap_sp, run = rawget(_G, "__curse_sigrun"), inexit = sh.in_exit_trap,
+		esp = sh.err_trap_sp, dsp = sh.dbg_trap_sp, rsp = sh.ret_trap_sp,
+		run = rawget(_G, "__curse_sigrun"), inexit = sh.in_exit_trap,
 	}
 	sh.traps = shallowcopy(sh.traps) or {}
 	local kept
@@ -2601,6 +2612,7 @@ local function iso_undo(sh, ctx)
 		end
 		o.traps, o.sigtraps = sv.traps, sv.sigtraps
 		M.exit_trap_inherited, o.err_trap_sp, o.in_exit_trap = sv.inh, sv.esp, sv.inexit
+		o.dbg_trap_sp, o.ret_trap_sp = sv.dsp, sv.rsp
 		_G.__curse_sigrun = sv.run
 	end
 	M.iso_restore_fds(ctx)
@@ -2780,9 +2792,24 @@ function M.debug_enter(sh, name)
 	if d == nil and r == nil and e == nil then
 		return nil
 	end
+	-- In a subshell/$( ) the ones it inherited aren't TRAPPED (only listed), so there's
+	-- nothing to hide — execute_function's TRAP_STRING is NULL for them. (Also: the table
+	-- may still be the parent's, not yet copied — iso_save_traps.)
+	local e0 = e
+	if (sh.in_subprogram or 0) > 0 then
+		if d ~= nil and not M.pseudo_trapped(sh, "DEBUG") then
+			d = nil
+		end
+		if r ~= nil and not M.pseudo_trapped(sh, "RETURN") then
+			r = nil
+		end
+		if e ~= nil and not M.pseudo_trapped(sh, "ERR") then
+			e = nil
+		end
+	end
 	-- ERR likewise, unless errtrace (`set -E`) — and bash samples it BEFORE a command runs,
 	-- so one the call itself sets doesn't fire for the call (e0: it existed before)
-	local saved = { e0 = e }
+	local saved = { e0 = e0 }
 	if e ~= nil and not sh.opt_errtrace then
 		sh.traps.ERR, saved.e = nil, e
 	end
@@ -2793,9 +2820,27 @@ function M.debug_enter(sh, name)
 		end
 		return saved
 	end
-	sh.traps.DEBUG, sh.traps.RETURN = nil, nil
+	if d ~= nil then
+		sh.traps.DEBUG = nil
+	end
+	if r ~= nil then
+		sh.traps.RETURN = nil
+	end
 	saved.d, saved.r = d, r
 	return saved
+end
+-- Is the DEBUG/RETURN/ERR trap live here? A subshell or $( ) inherits their strings (listed
+-- by `trap`) but not the trapping — unless functrace (DEBUG, RETURN) / errtrace (ERR) is on
+-- — so only one set at this subshell level is (trap.c reset_or_restore_signal_handlers).
+function M.pseudo_trapped(sh, name)
+	local sp = sh.in_subprogram or 0
+	if sp == 0 then
+		return true
+	end
+	if name == "ERR" then
+		return sh.opt_errtrace or sp == sh.err_trap_sp
+	end
+	return sh.opt_functrace or sp == (name == "DEBUG" and sh.dbg_trap_sp or sh.ret_trap_sp)
 end
 function M.debug_leave(sh, saved)
 	if saved ~= nil then
@@ -4644,9 +4689,25 @@ function M.exit_default(sh)
 	end
 	return sh.status
 end
--- `return` where no function or sourced script is running: reported, status 2 (bash)
+-- A compiled function (fn_x) in a program with traps: a trap handler's `return N` raised
+-- while its body runs natively ends this call with status N (interp's run_function and the
+-- delegated-statement wrappers catch it the same way). bash: execute_function's return_catch.
+function M.catch_return(f)
+	return function(sh, pc)
+		local ok, e = pcall(f, sh, pc)
+		if not ok then
+			if type(e) == "table" and e.__curse_return ~= nil then
+				sh.status = e.__curse_return
+			else
+				error(e, 0)
+			end
+		end
+	end
+end
+-- `return` where no function or sourced script is running: reported, status 2 (bash) —
+-- also in a trap handler that runs at the top level (return.def: no return_catch_flag)
 function M.return_outside(sh)
-	if (sh.calldepth or 0) == 0 and (sh.sourcedepth or 0) == 0 and (sh.in_trap or 0) == 0 then
+	if (sh.calldepth or 0) == 0 and (sh.sourcedepth or 0) == 0 then
 		io.stderr:write("curse: return: can only `return' from a function or sourced script\n")
 		sh.status = 2
 		if sh.opt_posix and not sh.opt_i then -- a special builtin's error ends a posix shell
@@ -10378,7 +10439,7 @@ function M.source(sh, argv, line)
 	local ownp = sh.params -- (a `set --` in the file replaces this table)
 	sh.sourcedepth = (sh.sourcedepth or 0) + 1 -- a `return` is valid while sourcing
 	local fr = M.source_enter(sh, name, line)
-	local dsave = M.source_debug_hide(sh)
+	local dsave, e0 = M.source_debug_hide(sh), sh.traps and sh.traps.ERR
 	local rok, err = pcall(require("tier").run_compiled, mod, sh, nil)
 	M.source_leave(sh, fr)
 	sh.sourcedepth = sh.sourcedepth - 1
@@ -10386,9 +10447,10 @@ function M.source(sh, argv, line)
 	if #argv > j and (sh.params == ownp or sh:in_function()) then
 		sh.params, sh.nparams = savep, savenp
 	end
+	local rret -- (`return N` doesn't set $? — the RETURN trap sees the status before it)
 	if not rok then
 		if type(err) == "table" and err.__curse_return then
-			sh.status = err.__curse_return
+			rret = err.__curse_return
 		else
 			M.source_debug_restore(sh, dsave)
 			error(err) -- exit / break / continue propagate
@@ -10396,14 +10458,18 @@ function M.source(sh, argv, line)
 	end
 	-- `.`/source fires the RETURN trap on return (any outcome but the usage error).
 	local trap = sh.traps and sh.traps.RETURN
-	if trap and trap ~= "" and not sh.in_return_trap then
+	if trap and trap ~= "" and not sh.in_return_trap and M.pseudo_trapped(sh, "RETURN") then
 		sh.in_return_trap = true
 		local sv = sh.status
 		Ii.run_trap(sh, trap)
 		sh.status = sv
 		sh.in_return_trap = false
 	end
+	if rret then
+		sh.status = rret
+	end
 	M.source_debug_restore(sh, dsave)
+	M.source_err_sample(sh, e0)
 end
 -- A sourced file isn't traced by the DEBUG trap (nor is its RETURN trap run) unless
 -- functrace is on, like a function body (bash).
@@ -10417,6 +10483,13 @@ end
 function M.source_debug_restore(sh, d)
 	if d ~= nil and sh.traps.DEBUG == nil then
 		sh.traps.DEBUG = d
+	end
+end
+-- bash samples the ERR trap BEFORE a command runs (execute_cmd.c was_error_trap): a `.`
+-- whose file set the trap (e0: the one before it) doesn't fire it for its own failure.
+function M.source_err_sample(sh, e0)
+	if e0 == nil and sh.traps and sh.traps.ERR and sh.status ~= 0 and sh.noerr == 0 then
+		sh.err_skip = true
 	end
 end
 

@@ -657,27 +657,44 @@ local SIGDESC = {
 	[14] = "Alarm clock",
 	[15] = "Terminated",
 }
+-- A trap's signal spec (bash's decode_signal with DSIG_NOCASE|DSIG_SIGPREFIX, trap.c): a
+-- legal_number 0..64 (blanks/sign/leading zeros ok; 0 = EXIT), [SIG]RTMIN+N for N 0..30,
+-- or a name with or without SIG (EXIT/DEBUG/ERR/RETURN only bare). Returns the canonical
+-- key: EXIT/DEBUG/ERR/RETURN, SIG<name>, or the plain number for one with no name (32, 33).
 local function canon_sig(s)
-	s = s:upper()
-	if s == "0" or s == "EXIT" then
-		return "EXIT"
+	local n = rt.legal_number(s)
+	if n then
+		if n < 0 or n > 64 then
+			return nil
+		end
+		if n == 0 then
+			return "EXIT"
+		end
+		local nm = NUMSIG[n]
+		return nm and ("SIG" .. nm) or tostring(n)
 	end
-	if s == "ERR" or s == "DEBUG" or s == "RETURN" then
+	s = s:upper()
+	if s == "EXIT" or s == "ERR" or s == "DEBUG" or s == "RETURN" then
 		return s
 	end
-	s = s:gsub("^SIG", "")
-	if s:match("^%d+$") then
-		local nm = NUMSIG[tonumber(s)]
-		return nm and ("SIG" .. nm) or nil
+	local rtn = s:match("^SIGRTMIN%+(.*)$") or s:match("^RTMIN%+(.*)$")
+	if rtn then
+		n = rt.legal_number(rtn)
+		return n and n >= 0 and n <= 30 and ("SIG" .. NUMSIG[SIGNUM.RTMIN + n]) or nil
 	end
+	s = s:gsub("^SIG", "")
 	return SIGNUM[s] and ("SIG" .. s) or nil
 end
-local function sig_order(canon) -- for printing: EXIT=0, then by signal number
-	if canon == "EXIT" then
-		return 0
+-- for printing: EXIT=0, then by signal number, then DEBUG, ERR, RETURN (bash's trap_list
+-- slots NSIG, NSIG+1, NSIG+2 — trap.h DEBUG_TRAP/ERROR_TRAP/RETURN_TRAP)
+local PSEUDO_ORDER = { EXIT = 0, DEBUG = 65, ERR = 66, RETURN = 67 }
+local function sig_order(canon)
+	local o = PSEUDO_ORDER[canon]
+	if o then
+		return o
 	end
 	local nm = canon:gsub("^SIG", "")
-	return SIGNUM[nm] or 99
+	return SIGNUM[nm] or tonumber(nm) or 99
 end
 -- A forked subshell (background `&`, `( )`, a pipeline stage, `>(…)`) resets
 -- CAUGHT signal traps to their default DISPOSITION, like bash — the handler no
@@ -4199,8 +4216,11 @@ local function run_function(sh, cmd, fn, args, hook, tenv_base)
 		restore_redirs(rsave)
 	end
 	sh.loopdepth = saved_ld
+	-- `return N` sets the function's status but not $? (return.def: only return_catch_value),
+	-- so the RETURN trap sees the status from before it; N is $? once the trap has run
+	local rret
 	if not ok and type(err) == "table" and err.__curse_return then
-		sh.status = err.__curse_return
+		rret = err.__curse_return
 		ok, err = true, nil
 	end
 	-- RETURN trap: fires as the function returns, still in ITS context (FUNCNAME, the
@@ -4210,13 +4230,17 @@ local function run_function(sh, cmd, fn, args, hook, tenv_base)
 	-- sourced script's return fires it regardless (see the `.`/source builtin) — and a
 	-- function run by the DEBUG trap doesn't fire it.
 	local rt_h = sh.traps and sh.traps.RETURN
-	if ok and rt_h and rt_h ~= "" and not sh.in_return_trap and not sh.in_debug then
+	if ok and rt_h and rt_h ~= "" and not sh.in_return_trap and not sh.in_debug
+		and ((sh.in_subprogram or 0) == 0 or rt.pseudo_trapped(sh, "RETURN")) then -- (in a subshell, one it set)
 		sh.in_return_trap = true
 		local saved = sh.status
 		sh.cur_line = sh.func_bline and sh.func_bline[cmd] or sh.cur_line
 		run_trap(sh, rt_h)
 		sh.status = saved
 		sh.in_return_trap = false
+	end
+	if rret then
+		sh.status = rret
 	end
 	rt.debug_leave(sh, dbg_saved)
 	table.remove(sh.funcstack, 1)
@@ -5093,18 +5117,21 @@ local function run_debug(sh, line)
 	-- DEBUG doesn't reach into a subshell/command substitution unless functrace extends it.
 	-- (A function call hides it at entry instead — rt.debug_enter — so one the function
 	-- sets itself still fires in its body.)
-	if not sh.opt_functrace and (sh.in_subprogram or 0) > 0 then
-		return
+	if (sh.in_subprogram or 0) > 0 and not rt.pseudo_trapped(sh, "DEBUG") then
+		return -- (one the subshell set itself is live there)
 	end
 	sh.in_debug = true
 	local saved = sh.status
 	if line then
 		sh.cur_line = line
 	end
-	local exited = run_trap(sh, h)
+	local exited, rret = run_trap(sh, h)
 	local trap_status = sh.status
 	sh.status = saved
 	sh.in_debug = false
+	if rret then -- `return` in the DEBUG trap returns from the running function
+		error({ __curse_return = rret })
+	end
 	-- `exit` in a DEBUG trap exits the shell; a non-zero DEBUG return under errexit
 	-- also exits (skipping the command), matching bash.
 	if exited then
@@ -6639,9 +6666,13 @@ do
 end
 
 -- Run a trap handler string; preserves $LINENO (so an ERR/EXIT trap sees the
--- failing command's line, not the handler's). Returns true if it called exit.
+-- failing command's line, not the handler's). Returns true if it called exit; and, when
+-- the handler ran `return N` while a function or sourced script is running, N as a 2nd
+-- result: the CALLER (once it has undone its own state) raises it, so the return ends
+-- that function/source — bash's _run_trap_internal longjmps to return_catch (trap.c).
+-- (Not for the EXIT/RETURN traps: their callers keep the status.)
 run_trap = function(sh, code)
-	local exited, savedline = false, sh.cur_line
+	local exited, savedline, rret = false, sh.cur_line, nil
 	local saved_tcd, saved_ts = sh.trap_calldepth, sh.trap_saved
 	sh.trap_calldepth = sh.calldepth or 0
 	sh.trap_saved = sh.status -- (bash's trap_saved_exit_value: see rt.return_default)
@@ -6682,11 +6713,14 @@ run_trap = function(sh, code)
 			exited = true
 		elseif type(err) == "table" and err.__curse_return then
 			sh.status = err.__curse_return -- `return N` in a trap sets its status
+			if (sh.calldepth or 0) > 0 or (sh.sourcedepth or 0) > 0 then
+				rret = err.__curse_return
+			end
 		else
 			error(err)
 		end -- a real error propagates
 	end
-	return exited
+	return exited, rret
 end
 
 -- A statement that just failed and is subject to ERR/errexit: a bare
@@ -6728,9 +6762,12 @@ fire_err_trap = function(sh)
 	if h and h ~= "" and not sh.in_err_trap and errscope then
 		sh.in_err_trap = true
 		local saved = sh.status
-		run_trap(sh, h)
+		local _, rret = run_trap(sh, h)
 		sh.status = saved
 		sh.in_err_trap = false
+		if rret then -- `trap 'return N' ERR`: the failing command's function returns N
+			error({ __curse_return = rret })
+		end
 	end
 end
 fire_err = function(sh)
@@ -6760,13 +6797,14 @@ end
 -- Run the trap for the signal `signum` that the async handler delivered via the VM
 -- hook (lib_cursesig.c). No pending queue — the hook hands us exactly the signal
 -- that fired. run_trap bumps sh.in_trap so a signal arriving DURING the handler is
--- serialized (the hook re-arms and runs it after this returns), never nested. A
+-- serialized (the hook re-arms and runs it after this returns) — except one the handler
+-- sent itself with `kill`, which runs nested, as in bash (rt.self_sig_release). A
 -- signal trap doesn't change $? unless it exits/returns; `exit` in the handler
 -- propagates to exit the shell (bash).
-local function run_signal(sh, signum, direct)
-	if sh.in_trap and sh.in_trap > 0 then
+local function run_signal(sh, signum, direct, nested)
+	if not nested and sh.in_trap and sh.in_trap > 0 then
 		return
-	end -- don't run a trap inside a trap
+	end -- don't run a trap inside a trap (unless taken synchronously: rt.self_sig_release)
 	if not direct and rt.defer_signal(sh, signum) then
 		return -- (the parent's: runs once the in-process subshell has ended)
 	end
@@ -6777,11 +6815,15 @@ local function run_signal(sh, signum, direct)
 	-- an asynchronously-delivered signal handler reports $LINENO = 1 (bash).
 	local saved, sl = sh.status, sh.cur_line
 	sh.cur_line = 1
-	local exited = run_trap(sh, h)
+	local exited, rret = run_trap(sh, h)
 	sh.cur_line = sl
 	if exited then
 		error({ __curse_exit = sh.status })
 	end -- `exit` in the trap exits the shell
+	if rret then -- `return` in the handler returns from the interrupted function
+		sh.status = saved
+		error({ __curse_return = rret })
+	end
 	sh.status = saved -- otherwise $? is preserved across the signal
 end
 M.run_signal = run_signal
