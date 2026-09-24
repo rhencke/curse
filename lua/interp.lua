@@ -199,7 +199,38 @@ end
 -- backslash-escaped character (see the read builtin): a marked char is LITERAL —
 -- it is part of a field and never a delimiter — and the marker is dropped from
 -- the value. Split into an array of {ch, esc} cells, then apply IFS to those.
+local rs_pats = {} -- IFS -> { sep, non, tail } for the fast path (false: not whitespace-only)
 local function read_split(ifs, line, nvars)
+	-- the common case: an IFS of whitespace only, no escaped chars — fields are runs of
+	-- non-IFS; the last var gets the rest with trailing IFS stripped (as below)
+	local pat = rs_pats[ifs]
+	if pat == nil then
+		pat = ifs ~= "" and not ifs:find("[^ \t\n]")
+			and { "[" .. ifs .. "]", "[^" .. ifs .. "]", "^(.-)[" .. ifs .. "]*$" } or false
+		rs_pats[ifs] = pat
+	end
+	if pat and not line:find("\1", 1, true) then
+		local sep, non = pat[1], pat[2]
+		local out = {}
+		local pos = line:find(non)
+		for v = 1, nvars - 1 do
+			if not pos then
+				break
+			end
+			local e = line:find(sep, pos)
+			if not e then
+				out[v] = line:sub(pos)
+				pos = nil
+				break
+			end
+			out[v] = line:sub(pos, e - 1)
+			pos = line:find(non, e)
+		end
+		if pos then
+			out[nvars] = line:match(pat[3], pos)
+		end
+		return out
+	end
 	local wsset, ifsset = {}, {}
 	for c in ifs:gmatch(".") do
 		ifsset[c] = true

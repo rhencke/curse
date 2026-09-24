@@ -1245,6 +1245,80 @@ function M.fd_ident(fd)
 	local u = ffi.cast("uint64_t *", _ropen_st)
 	return tostring(u[0]) .. ":" .. tostring(u[1])
 end
+-- `read`'s fast paths: a regular file may be read in chunks and rewound to just past
+-- the line (bash's lseek-back); from a pipe/socket/tty it must go a byte at a time, but
+-- FIONREAD says how many bytes are already there — those reads can't block.
+ffi.cdef([[
+  long curse_rt_lseek(int fd, long off, int whence) asm("lseek");
+  int curse_rt_ioctl_int(int fd, unsigned long req, int *out) asm("ioctl");
+]])
+-- "reg" (regular file), "fifo" (pipe), or nil (anything else / not open)
+function M.fd_kind(fd)
+	if C.curse_rt_fstat(fd, _ropen_st) ~= 0 then
+		return nil
+	end
+	local m = bit.band(ffi.cast("uint32_t *", _ropen_st + 24)[0], 0xF000)
+	return m == 0x8000 and "reg" or m == 0x1000 and "fifo" or nil
+end
+-- Peek at what's waiting in pipe `fd` WITHOUT consuming it: tee(2) duplicates up to
+-- `max` bytes into a private pipe, drained into `buf`. So `read` finds the line end in
+-- one call, then reads exactly the line (bash reads a pipe a byte at a time). Returns
+-- the bytes; "" at EOF; nil when the pipe is empty for now; false if it can't peek.
+-- The private pipe is made per daemon request (the scrub closes the shell's fds).
+ffi.cdef("long curse_rt_tee(int fdin, int fdout, size_t len, unsigned int flags) asm(\"tee\");")
+local peek_r, peek_w, peek_epoch = -1, -1, nil
+local _peek_p = ffi.new("int[2]")
+function M.pipe_peek(fd, buf, max)
+	if peek_epoch ~= M.path_epoch or peek_r < 0 then
+		if M.pipe_hi(_peek_p) ~= 0 then
+			return false
+		end
+		peek_r, peek_w, peek_epoch = _peek_p[0], _peek_p[1], M.path_epoch
+	end
+	local n = tonumber(C.curse_rt_tee(fd, peek_w, max, 2)) -- SPLICE_F_NONBLOCK
+	if n == 0 then
+		return ""
+	elseif n < 0 then
+		return ffi.errno() == 11 and nil or false -- (EAGAIN: empty; else: not peekable)
+	end
+	local got = 0
+	while got < n do
+		local r = tonumber(C.read(peek_r, buf + got, n - got))
+		if r <= 0 then
+			if r < 0 and ffi.errno() == 4 then -- EINTR
+				r = 0
+			else
+				return false
+			end
+		end
+		got = got + r
+	end
+	return ffi.string(buf, n)
+end
+-- Consume exactly `n` bytes from `fd` (just peeked, so they're there).
+function M.read_exact(fd, buf, n)
+	while n > 0 do
+		local r = tonumber(C.read(fd, buf, n))
+		if r <= 0 then
+			if not (r < 0 and ffi.errno() == 4) then
+				return false
+			end
+		else
+			n = n - r
+		end
+	end
+	return true
+end
+local _avail = ffi.new("int[1]")
+function M.fd_avail(fd)
+	if C.curse_rt_ioctl_int(fd, 0x541B, _avail) ~= 0 then -- FIONREAD
+		return 0
+	end
+	return _avail[0]
+end
+function M.fd_rewind(fd, n)
+	return C.curse_rt_lseek(fd, -n, 1) -- SEEK_CUR
+end
 -- A file the shell itself reads whole (`source`, `$(< file)`): like io.open(path, "r"),
 -- but a FIFO whose writer may be in this process is read through M.ropen + M.co_block.
 function M.open_read(path)
