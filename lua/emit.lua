@@ -1019,6 +1019,9 @@ end
 local function hard_cf(stmts, in_cond)
 	for _, st in ipairs(stmts or {}) do
 		local op, argoff = resolve_cf(st)
+		if not op and in_cond and st.t == "simple" and st.redirs and st.words then
+			op = resolve_cf({ t = "simple", words = st.words }) -- (`while break 2>/dev/null`)
+		end
 		if op == "break" or op == "continue" then
 			if in_cond then
 				return true
@@ -5922,9 +5925,10 @@ H.pipeline = function(cx, st, after)
 	-- its compiled form: then the whole pipeline goes to the interpreter (in-process too).
 	local inproc, guards = {}, {}
 	for i = 1, n do
-		inproc[i] = require("runtime").stage_flat(st.cmds[i], function(c)
+		local kind = require("runtime").stage_kind(st.cmds[i], function(c)
 			return cx.funcflags[c] or (cx.inlinefns and cx.inlinefns[c])
-		end) and '"flat"' or "true"
+		end)
+		inproc[i] = kind == true and "true" or ('"' .. kind .. '"')
 		local g = dyn_guard({ st.cmds[i] })
 		if g then
 			guards[#guards + 1] = "(" .. g .. ")"

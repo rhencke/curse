@@ -4259,7 +4259,7 @@ local function exec_simple(sh, args, hook, no_func)
 				io.stderr:write("curse: break: only meaningful in a `for', `while', or `until' loop\n")
 			end
 			sh.status = 0
-		elseif args[2] and not tonumber(args[2]) then -- non-numeric count: FATAL (status 128) in a
+		elseif args[2] and not rt.legal_number(args[2]) then -- non-numeric count: FATAL (status 128) in a
 			io.stderr:write("curse: break: " .. args[2] .. ": numeric argument required\n")
 			sh.status = 128 -- non-interactive shell (bash exits); interactive just aborts it
 			if not sh.opt_i then
@@ -4267,13 +4267,13 @@ local function exec_simple(sh, args, hook, no_func)
 			end
 		elseif args[3] ~= nil then -- (the count is checked first — bash's get_numeric_arg)
 			rt.too_many(sh, "break")
-		elseif args[2] and tonumber(args[2]) <= 0 then -- (bash: reported, and ALL the loops end)
+		elseif args[2] and rt.legal_number(args[2]) <= 0 then -- (bash: reported, and ALL the loops end)
 			io.stderr:write("curse: break: " .. args[2] .. ": loop count out of range\n")
 			sh.status = 1
 			error({ __curse_break = sh.loopdepth, __curse_status = 1 })
 		else
 			sh.status = 0
-			error({ __curse_break = math.min(tonumber(args[2]) or 1, sh.loopdepth) })
+			error({ __curse_break = math.min(rt.legal_number(args[2]) or 1, sh.loopdepth) })
 		end
 	elseif cmd == "continue" then
 		if args[2] == "--" then
@@ -4284,7 +4284,7 @@ local function exec_simple(sh, args, hook, no_func)
 				io.stderr:write("curse: continue: only meaningful in a `for', `while', or `until' loop\n")
 			end
 			sh.status = 0
-		elseif args[2] and not tonumber(args[2]) then -- non-numeric count: fatal, like break
+		elseif args[2] and not rt.legal_number(args[2]) then -- non-numeric count: fatal, like break
 			io.stderr:write("curse: continue: " .. args[2] .. ": numeric argument required\n")
 			sh.status = 128
 			if not sh.opt_i then
@@ -4292,13 +4292,13 @@ local function exec_simple(sh, args, hook, no_func)
 			end
 		elseif args[3] ~= nil then -- (the count is checked first — bash's get_numeric_arg)
 			rt.too_many(sh, "continue")
-		elseif args[2] and tonumber(args[2]) <= 0 then -- (bash: reported, and ALL the loops end)
+		elseif args[2] and rt.legal_number(args[2]) <= 0 then -- (bash: reported, and ALL the loops end)
 			io.stderr:write("curse: continue: " .. args[2] .. ": loop count out of range\n")
 			sh.status = 1
 			error({ __curse_break = sh.loopdepth, __curse_status = 1 })
 		else
 			sh.status = 0
-			error({ __curse_continue = math.min(tonumber(args[2]) or 1, sh.loopdepth) })
+			error({ __curse_continue = math.min(rt.legal_number(args[2]) or 1, sh.loopdepth) })
 		end
 	elseif cmd == "[" or cmd == "test" then
 		do_test(sh, args)
@@ -4654,25 +4654,33 @@ end
 
 -- Run a loop body, catching break/continue (decrementing multi-level n and
 -- re-raising when it targets an outer loop). Returns "break", "continue", or nil.
-local function run_loop_body(sh, body, hook)
-	local ok, err = pcall(exec_list, sh, body, hook, false)
-	if ok then
-		return nil
-	end
+-- Anything that leaves the loop from here (an outer break/continue, exit, return, an
+-- aborted line) first gives back the loop's level: the loop's own decrement is skipped.
+local function loop_signal(sh, err)
 	if type(err) == "table" then
 		if err.__curse_break then
 			if err.__curse_break > 1 then
+				sh.loopdepth = sh.loopdepth - 1
 				error({ __curse_break = err.__curse_break - 1 })
 			end
 			return "break"
 		elseif err.__curse_continue then
 			if err.__curse_continue > 1 then
+				sh.loopdepth = sh.loopdepth - 1
 				error({ __curse_continue = err.__curse_continue - 1 })
 			end
 			return "continue"
 		end
 	end
-	error(err) -- exit/return/real error propagates
+	sh.loopdepth = sh.loopdepth - 1
+	error(err, 0) -- exit/return/real error propagates
+end
+local function run_loop_body(sh, body, hook)
+	local ok, err = pcall(exec_list, sh, body, hook, false)
+	if ok then
+		return nil
+	end
+	return loop_signal(sh, err)
 end
 
 -- In a forked child (subshell/background/pipeline stage), translate an exit/return
@@ -5848,15 +5856,9 @@ exec_stmt = function(sh, st, hook)
 			sh.noerr = sh.noerr + 1
 			local cok, cerr = pcall(exec_list, sh, st.cond, hook, false)
 			sh.noerr = sh.noerr - 1
-			if not cok then
-				if type(cerr) == "table" and cerr.__curse_break then
-					break
-				elseif type(cerr) == "table" and cerr.__curse_continue then -- fallthrough to re-test
-				else
-					sh.loopdepth = sh.loopdepth - 1
-					error(cerr)
-				end
-			end
+			if not cok and loop_signal(sh, cerr) == "break" then
+				break
+			end -- (continue: fall through to re-test)
 			local go = (sh.status == 0)
 			if st.negate then
 				go = not go
@@ -6146,9 +6148,9 @@ exec_stmt = function(sh, st, hook)
 					end
 					exec_stmt(ssh, stage, SUBHOOK)
 				end
-				inproc[k] = rt.stage_flat(stage, function(c)
+				inproc[k] = rt.stage_kind(stage, function(c)
 					return sh.functions[c] ~= nil
-				end) and "flat" or true
+				end)
 			end
 			sh:run_pipeline(fns, false, inproc)
 			-- bash quirk (execute_cmd.c:720): the LAST stage of a pipeline, when it is a

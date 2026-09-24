@@ -2876,6 +2876,17 @@ end
 -- subshell), and a simple command that runs no shell code (not a function, eval, source, …)
 -- expands its words at the pipeline's own level. `isfn(name)`: is it a function?
 local STAGE_CODE_BUILTINS = { eval = 1, source = 1, ["."] = 1 }
+-- A pipeline stage's marker for run_pipeline: "flat" (not counted in $BASH_SUBSHELL, see
+-- stage_flat) or true — and for a SIMPLE command "sflat" / "simple": it keeps the loop
+-- level (bash forks it straight from execute_simple_command, where only execute_in_subshell
+-- — `( … )`, a compound stage — resets loop_level: `break | cat` in a loop is silent).
+function M.stage_kind(st, isfn)
+	local flat = M.stage_flat(st, isfn)
+	if st.t == "simple" then
+		return flat and "sflat" or "simple"
+	end
+	return flat and "flat" or true
+end
 function M.stage_flat(st, isfn)
 	if st.t == "subshell" then
 		return true
@@ -3609,8 +3620,12 @@ local function co_launch(ctx, self, stage_fns, inproc, base, lastpipe, upv)
 			add(t, stage_body(fn, self, t, true))
 		else -- (every stage runs in-process: a task with its own isolated shell)
 			local sh = self:stage_clone()
-			if inproc[i] == "flat" then -- ($BASH_SUBSHELL: a `( … )` stage counts once; a simple
-				sh.subdepth = sh.subdepth - 1 -- command that runs no shell code isn't counted)
+			local kind = inproc[i]
+			if kind == "flat" or kind == "sflat" then -- ($BASH_SUBSHELL: a `( … )` stage counts
+				sh.subdepth = sh.subdepth - 1 -- once; a simple command running no shell code, not at all)
+			end
+			if kind == "sflat" or kind == "simple" then
+				sh.loopdepth = self.loopdepth -- (see stage_kind)
 			end
 			sh.out = make_out(t)
 			t.sh = sh
@@ -4265,7 +4280,7 @@ function Shell:bg_launch(fn, cmdstr, flat, simple, upv_get, upv_set, opts)
 		if t.g == g and t.sh then
 			t.sh.in_pipestage = (t.sh.in_pipestage or 1) - 1 -- (not a pipeline stage: an async list)
 			t.sh.in_subprogram = (t.sh.in_subprogram or 0) + 1
-			t.sh.loopdepth = 0
+			t.sh.loopdepth = g.simple and self.loopdepth or 0 -- (a simple job keeps it: stage_kind)
 			if bufcap then -- inside a buffered $(…): its output is the substitution's too
 				t.sh.out, t.sh.capturing = self.out, true
 			end
