@@ -143,6 +143,7 @@ return function(sh, cmd, args, hook, tcb)
 					return nil
 				end
 				rt.co_block(fd, 1)
+				rt.rd_gen = rt.rd_gen + 1 -- (see rt.pipe_cache)
 				local nr = tonumber(C.read(fd, rbuf, seekable and 65536 or 1))
 				if not nr or nr <= 0 then
 					eof = true

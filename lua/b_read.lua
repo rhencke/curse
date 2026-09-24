@@ -23,6 +23,11 @@ local rdbuf = ffi.new("char[?]", RDBUF)
 -- NYI for the JIT, and `read` runs once per line of a `while read` loop)
 -- An arg-taking flag at a[k] takes the attached rest of the word, else the next word
 -- (then the option word advances by 2); either way it ends the bundle.
+-- Does a run of input need per-char handling (a NUL, a CTLESC byte, or — without -r — a
+-- backslash)? Plain finds, which the JIT compiles (a pattern it doesn't).
+local function needs_chars(seg, raw)
+	return seg:find("\0", 1, true) or seg:find("\1", 1, true) or (not raw and seg:find("\\", 1, true))
+end
 local function takearg(a, k, args, j, advance)
 	local r = a:sub(k + 1)
 	if r ~= "" then
@@ -35,6 +40,12 @@ end
 -- otherwise a byte at a time, without a readiness poll per byte while FIONREAD says
 -- bytes are waiting. nil at EOF / timeout / error (st.timed_out / st.rerr say which).
 local function getc(st)
+	local pc = st.pc
+	if pc and pc.pb ~= "" then -- (bytes of this pipe we already hold: see rt.pipe_cache)
+		local c = pc.pb:sub(1, 1)
+		pc.pb = pc.pb:sub(2)
+		return c
+	end
 	local ufd = st.ufd
 	local chunk = st.chunk
 	if chunk then
@@ -67,6 +78,7 @@ local function getc(st)
 			st.avail = rt.fd_avail(ufd)
 		end
 		if st.avail > 0 then
+			rt.rd_gen = rt.rd_gen + 1
 			local n = C.read(ufd, rdbuf, 1)
 			if n == 1 then
 				st.avail = st.avail - 1
@@ -189,14 +201,15 @@ return function(sh, cmd, args, hook, tcb)
 			deadline = rt.wall_secs() + secs
 		end
 		-- (no deadline) a regular file: chunked reads; a pipe: peeked for the line end
-		local st = { ufd = ufd, chunk = nil, ci = 1, avail = 0, deadline = deadline, timed_out = false, rerr = nil }
+		local st = { ufd = ufd, chunk = nil, ci = 1, avail = 0, deadline = deadline, timed_out = false, rerr = nil, pc = nil }
 		local fifo = false
 		if not deadline then
-			local kind = rt.fd_kind(ufd)
+			local kind, dev, ino = rt.fd_kind(ufd)
 			if kind == "reg" then
 				st.chunk = ""
 			elseif kind == "fifo" then
 				fifo = true -- (peek for the line end: rt.pipe_peek)
+				st.pc = rt.pipe_cache(dev, ino)
 			end
 		end
 		local vars = {}
@@ -211,7 +224,6 @@ return function(sh, cmd, args, hook, tcb)
 		local dch = delim == nil and "\n" or (delim == "" and "\0" or delim:sub(1, 1))
 		do
 			local buf, got = {}, false
-			local plainpat = raw and "[%z\1]" or "[%z\1\\]"
 			while true do
 				-- a chunked (regular-file) read: take the run up to the delimiter at once
 				-- when it needs no per-char handling (no backslash, NUL, CTLESC)
@@ -228,7 +240,7 @@ return function(sh, cmd, args, hook, tcb)
 						local e = st.chunk:find(dch, st.ci, true)
 						local stop = e and e - 1 or #st.chunk
 						local seg = st.chunk:sub(st.ci, stop)
-						if not seg:find(plainpat) then
+						if not needs_chars(seg, raw) then
 							bulk = true
 							if #seg > 0 then
 								buf[#buf + 1] = seg
@@ -242,27 +254,40 @@ return function(sh, cmd, args, hook, tcb)
 						end
 					end
 				end
-				if fifo and not nchars then
-					local data = rt.pipe_peek(ufd, rdbuf, RDBUF)
-					if data == false then
-						fifo = false
-					elseif data and data ~= "" then -- (nil: empty for now, "" EOF: the byte path)
-						local e = data:find(dch, 1, true)
-						local seg = e and data:sub(1, e - 1) or data
-						if seg:find(plainpat) then
-							fifo = false -- (escapes/NULs on this line: byte at a time)
-						elseif rt.read_exact(ufd, rdbuf, e or #data) then
-							bulk = true
-							if #seg > 0 then
-								buf[#buf + 1] = seg
-								got = true
-							end
-							if e then
-								got, had_nl = true, true
-								break
-							end
-						else
+				if fifo and not nchars and st.pc.pb == "" then
+					local pc = st.pc
+					if pc.pos > #pc.data then -- (nothing peeked left: peek again)
+						local d = rt.pipe_peek(ufd, rdbuf, RDBUF)
+						if d == false then
 							fifo = false
+						elseif d and d ~= "" then -- (nil: empty for now, "" EOF: the byte path)
+							pc.data, pc.pos = d, 1
+						end
+					end
+					if fifo and pc.pos <= #pc.data then
+						local data, p0 = pc.data, pc.pos
+						local e = data:find(dch, p0, true)
+						local stop = e or #data
+						local seg = data:sub(p0, e and e - 1 or stop)
+						if needs_chars(seg, raw) then
+							fifo = false -- (escapes/NULs on this line: byte at a time)
+							pc.data, pc.pos = "", 1
+						else
+							local rd = rt.read_n(ufd, rdbuf, stop - p0 + 1)
+							if rd == data:sub(p0, stop) then
+								pc.pos = stop + 1
+								bulk = true
+								if #seg > 0 then
+									buf[#buf + 1] = seg
+									got = true
+								end
+								if e then
+									got, had_nl = true, true
+									break
+								end
+							else -- (a concurrent reader took from this pipe: what we read is ours)
+								pc.data, pc.pos, pc.pb = "", 1, rd
+							end
 						end
 					end
 				end

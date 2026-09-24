@@ -1253,12 +1253,41 @@ ffi.cdef([[
   int curse_rt_ioctl_int(int fd, unsigned long req, int *out) asm("ioctl");
 ]])
 -- "reg" (regular file), "fifo" (pipe), or nil (anything else / not open)
-function M.fd_kind(fd)
+function M.fd_kind(fd) -- (+ its dev, ino)
 	if C.curse_rt_fstat(fd, _ropen_st) ~= 0 then
 		return nil
 	end
 	local m = bit.band(ffi.cast("uint32_t *", _ropen_st + 24)[0], 0xF000)
-	return m == 0x8000 and "reg" or m == 0x1000 and "fifo" or nil
+	local u = ffi.cast("uint64_t *", _ropen_st)
+	return m == 0x8000 and "reg" or m == 0x1000 and "fifo" or nil, tonumber(u[0]), tonumber(u[1])
+end
+-- What `read` peeked from a pipe but hasn't consumed yet is still at the pipe's head —
+-- unless something else read from it since. So the peek is kept (one pipe at a time) and
+-- the next line is read straight from it, while M.rd_gen is unchanged: it is bumped by
+-- every external spawn and every other read of an input fd in this shell. A mismatch
+-- (a concurrent reader raced us) leaves what was read in `pb`: ours, delivered first.
+M.rd_gen = 0
+local PCACHE = { data = "", pos = 1, pb = "" }
+function M.pipe_cache(dev, ino)
+	local c = PCACHE
+	if c.dev ~= dev or c.ino ~= ino or c.epoch ~= M.path_epoch then
+		c.dev, c.ino, c.epoch, c.pb = dev, ino, M.path_epoch, ""
+		c.data, c.pos, c.gen = "", 1, M.rd_gen
+	elseif c.gen ~= M.rd_gen then
+		c.data, c.pos, c.gen = "", 1, M.rd_gen
+	end
+	return c
+end
+-- One read of up to `n` bytes (retrying EINTR only: never waits for more), as a string.
+function M.read_n(fd, buf, n)
+	while true do
+		local r = tonumber(C.read(fd, buf, n))
+		if r >= 0 then
+			return ffi.string(buf, r)
+		elseif ffi.errno() ~= 4 then
+			return ""
+		end
+	end
 end
 -- Peek at what's waiting in pipe `fd` WITHOUT consuming it: tee(2) duplicates up to
 -- `max` bytes into a private pipe, drained into `buf`. So `read` finds the line end in
@@ -1322,6 +1351,7 @@ end
 -- A file the shell itself reads whole (`source`, `$(< file)`): like io.open(path, "r"),
 -- but a FIFO whose writer may be in this process is read through M.ropen + M.co_block.
 function M.open_read(path)
+	M.rd_gen = M.rd_gen + 1 -- (`source /dev/stdin`, `$(< /dev/stdin)`: reads a shared input)
 	if not (CO or sched_live()) or C.curse_rt_stat(path, _ropen_st) ~= 0
 		or bit.band(ffi.cast("uint32_t *", _ropen_st + 24)[0], 0xF000) ~= 0x1000 then
 		return io.open(path, "r")
@@ -1596,6 +1626,7 @@ function Shell:exec_script_child(path, args, n)
 			end
 		end
 	end
+	M.rd_gen = M.rd_gen + 1 -- (the script may be a shared input, /dev/stdin)
 	local f = io.open(path, "r")
 	local src = f and f:read("*a") or ""
 	if f then
@@ -1629,6 +1660,7 @@ end
 -- script changes (cwd, umask, environ, fds, traps, rlimits) is put back when it ends.
 -- `out`: where its stdout goes (a capture's sink), else fd 1.
 function Shell:run_script_inproc(path, args, n, out)
+	M.rd_gen = M.rd_gen + 1 -- (the script may be a shared input, /dev/stdin)
 	local f = io.open(path, "r")
 	local src = f and f:read("*a") or ""
 	if f then
@@ -1804,6 +1836,7 @@ function Shell:exec(...)
 		local pidp = ffi.new("curse_pid_t[1]")
 		local attr = child_spawnattr(self)
 		local fa = M.foreign_fa(self, nil)
+		M.rd_gen = M.rd_gen + 1 -- (a new process may read our input: see M.pipe_cache)
 		local rc = C.posix_spawnp(pidp, execpath, fa, attr, ffi.cast("char *const *", argv), C.environ)
 		if fa then
 			C.posix_spawn_file_actions_destroy(fa)
@@ -1839,6 +1872,7 @@ function Shell:exec(...)
 	M.foreign_fa(self, fa)
 	local pidp = ffi.new("curse_pid_t[1]")
 	local attr = child_spawnattr(self)
+	M.rd_gen = M.rd_gen + 1 -- (a new process may read our input: see M.pipe_cache)
 	local rc = C.posix_spawnp(pidp, execpath, fa, attr, ffi.cast("char *const *", argv), C.environ)
 	if attr then
 		C.posix_spawnattr_destroy(attr)
@@ -3348,6 +3382,7 @@ function M.spawn_internal(argv_t)
 	C.posix_spawn_file_actions_addopen(fa, 1, "/dev/null", 1, 0)
 	C.posix_spawn_file_actions_addopen(fa, 2, "/dev/null", 1, 0)
 	local pidp = ffi.new("curse_pid_t[1]")
+	M.rd_gen = M.rd_gen + 1
 	local rc = C.posix_spawnp(pidp, argv_t[1], fa, nil, ffi.cast("char *const *", argv), C.environ)
 	C.posix_spawn_file_actions_destroy(fa)
 	if rc ~= 0 then
@@ -3402,6 +3437,7 @@ function Shell:spawn_bg(args, cmdstr)
 	if hold then
 		attr = async_spawn_hold(attr)
 	end
+	M.rd_gen = M.rd_gen + 1 -- (a new process may read our input: see M.pipe_cache)
 	local rc = C.posix_spawnp(pidp, execpath, fa, attr, ffi.cast("char *const *", argv), C.environ)
 	if hold then
 		async_spawn_release()
@@ -5745,8 +5781,15 @@ function M.mark_arrayref(sh, s)
 	t[s] = true
 	return s
 end
+local plain_names, n_plain = {}, 0 -- (a memo: a valid bare NAME, the common case)
 function M.split_array_ref(s, sh)
+	if plain_names[s] then
+		return s
+	end
 	local name, rest = s:match("^([%a_][%w_]*)(.*)$")
+	if name and rest == "" and n_plain < 4096 then
+		plain_names[s], n_plain = true, n_plain + 1
+	end
 	if not name then
 		return nil
 	end

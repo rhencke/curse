@@ -210,6 +210,12 @@ local function read_split(ifs, line, nvars)
 		rs_pats[ifs] = pat
 	end
 	if pat and not line:find("\1", 1, true) then
+		if nvars == 1 then -- (one var: the line minus leading/trailing IFS whitespace)
+			local b1, b2 = line:byte(1), line:byte(-1)
+			if not b1 or not (ifs:find(string.char(b1), 1, true) or ifs:find(string.char(b2), 1, true)) then
+				return { line }
+			end
+		end
 		local sep, non = pat[1], pat[2]
 		local out = {}
 		local pos = line:find(non)
@@ -517,6 +523,7 @@ end
 local rd1 = ffi.new("char[1]")
 local function fd_getc(fd)
 	rt.co_block(fd, 1) -- inside a pipeline stage: yield, don't stall the siblings
+	rt.rd_gen = rt.rd_gen + 1 -- (a read `read` didn't peek: see rt.pipe_cache)
 	local n = C.read(fd, rd1, 1)
 	if n == 1 then
 		return string.char(rd1[0] % 256)
