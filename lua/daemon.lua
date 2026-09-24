@@ -788,8 +788,12 @@ local function serve()
 			end
 		end
 	end
+	-- One worker BEFORE the warm-up (~40ms): the request that auto-started the daemon is
+	-- served right away by it (unwarmed, it warms as it serves) instead of waiting; the
+	-- rest of the pool forks from the warmed parent.
+	spawn()
 	warm_parent()
-	for _ = 1, POOL do
+	for _ = 2, POOL do
 		spawn()
 	end
 
