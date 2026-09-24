@@ -27,7 +27,8 @@ return function(sh, cmd, args, hook, tcb)
 		end
 		if args[j] == nil then
 			sh.status = 0
-		elseif BUILTINS[args[j]] then
+		elseif BUILTINS[args[j]] and not (sh.disabled_builtins and sh.disabled_builtins[args[j]]) then
+			-- (a builtin disabled with `enable -n` isn't one: bash's find_shell_builtin)
 			exec_simple(sh, { unpack(args, j) }, hook, true) -- skip functions
 		else
 			io.stderr:write("curse: builtin: " .. args[j] .. ": not a shell builtin\n")
