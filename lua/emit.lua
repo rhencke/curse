@@ -427,10 +427,32 @@ end
 -- Collect literal names targeted by `unset` (skipping -f/-v flags) anywhere in the
 -- program. A function whose name is unset must dispatch through sh.functions so the
 -- call AFTER the unset fails (127) — a hoisted fn_x would still be callable.
+-- $LINENO: the current line as a compile-time constant; once `unset LINENO` stripped its
+-- magic it is an ordinary variable (bash)
+local function lineno_expr()
+	return ("(sh.unset_specials and sh.unset_specials.LINENO and sh:get('LINENO') or %q)"):format(
+		tostring(EF.cur_line or 0))
+end
+-- A non-literal command word (`c=unset; $c f`) or an `unset` passed on as an argument
+-- (`run unset f`, to a function that runs "$@") may unset any literal name after it too.
+local function lit_word(w)
+	return #w.parts == 1 and w.parts[1].lit
+end
+local function unset_from(st)
+	if not lit_word(st.words[1]) then
+		return 2
+	end
+	for j = 1, #st.words do
+		if lit_word(st.words[j]) == "unset" then
+			return j + 1
+		end
+	end
+end
 local function collect_unset(stmts, set)
 	for _, st in ipairs(stmts or {}) do
-		if st.t == "simple" and st.words[1] and st.words[1].parts[1] and st.words[1].parts[1].lit == "unset" then
-			for j = 2, #st.words do
+		local from = st.t == "simple" and st.words[1] and unset_from(st)
+		if from then
+			for j = from, #st.words do
 				local l = st.words[j].parts[1] and #st.words[j].parts == 1 and st.words[j].parts[1].lit
 				if l and l:sub(1, 1) ~= "-" then
 					set[l] = true
@@ -1086,9 +1108,10 @@ emit_value = function(e, lifted)
 	if k == "comma" then -- (a, b): evaluate a for its effect, then b is the value (bash sequence op)
 		return ("(function() local _ = %s; return %s end)()"):format(emit_value(e.l, lifted), emit_value(e.r, lifted))
 	end
-	if k == "var" and e.name == "LINENO" then
-		return (tostring(EF.cur_line or 0) .. "LL")
-	end -- compile-time line
+	if k == "var" and e.name == "LINENO" then -- compile-time line (unless `unset LINENO`)
+		return ("(sh.unset_specials and sh.unset_specials.LINENO and sh:aget('LINENO') or %sLL)"):format(
+			tostring(EF.cur_line or 0))
+	end
 	if k == "var" and e.idxraw then -- $(( a[i] )): array/assoc element read (gated by arith_elem_ok)
 		return ("rt.arith_read_elem(sh, %q, %q, %s)"):format(
 			e.name,
@@ -1711,7 +1734,7 @@ emit_word = function(w, lifted)
 		elseif p.raw then
 			parts[#parts + 1] = p.raw -- pre-computed Lua string expr (inlined param)
 		elseif p.var == "LINENO" then -- $LINENO: the current source line, a compile-time constant
-			parts[#parts + 1] = ("%q"):format(tostring(EF.cur_line or 0))
+			parts[#parts + 1] = lineno_expr()
 		elseif p.var then
 			parts[#parts + 1] = EF.has_nameref and ("rt.nameref_read(sh, %q)"):format(p.var)
 				or lifted[p.var] and ("rt.i64_to_str(%s)"):format(lname(p.var))
@@ -2430,7 +2453,7 @@ local function emit_scalar_val(p, i, lifted, tilde, w)
 	elseif p.raw then
 		return p.raw
 	elseif p.var == "LINENO" then -- $LINENO: its value is the current source line, known at compile time
-		return ("%q"):format(tostring(EF.cur_line or 0))
+		return lineno_expr()
 	elseif p.var then
 		return EF.has_nameref and ("rt.nameref_read(sh, %q)"):format(p.var)
 			or lifted[p.var] and ("rt.i64_to_str(%s)"):format(lname(p.var))
@@ -3419,6 +3442,18 @@ analyze_lift = function(ast)
 		end
 		local cmd = p1 and p1.lit
 		if not VAR_WRITERS[cmd] then
+			-- a dynamic command word (`c=unset; $c q`) or an unset handed on as an argument
+			-- (`run unset q`) may unset a literal name after it (unset_from)
+			local from = st.words[1] and unset_from(st)
+			if from then
+				for j = from, #st.words do
+					local nm = lit_word(st.words[j])
+					nm = nm and nm:match("^[%a_][%w_]*$")
+					if nm then
+						disq[nm] = true
+					end
+				end
+			end
 			return
 		end
 		for j = w1 + 1, #st.words do
@@ -3911,6 +3946,12 @@ local function func_flags(body)
 			-- writes the GLOBAL. `declare -g` still targets the global (interp honors -g
 			-- inside the frame), so treating any declare/typeset as frame-needing is safe.
 			if cmd == "local" or cmd == "declare" or cmd == "typeset" then
+				f.locals = true
+			end
+			-- unset (literal, or maybe behind a dynamic command word) acts on "this frame's
+			-- local" vs a caller's (it unsets in place vs reveals the next outer value), so
+			-- the callee needs its own frame to tell them apart
+			if cmd == "unset" or (st.words and st.words[1] and not lit_word(st.words[1])) then
 				f.locals = true
 			end
 			-- getopts parses $@ and shift mutates it — both implicitly need the callee's

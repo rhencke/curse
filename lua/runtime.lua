@@ -1783,7 +1783,11 @@ function Shell:exec(...)
 				end
 				return
 			end
-			self:errmsg("curse: " .. (self.exec_builtin and "exec: " or "") .. M.err_name(args[1]) .. (self.exec_builtin and ": not found\n" or ": command not found\n"))
+			-- (an unset/empty PATH searches only the cwd: bash then tries the bare name
+			-- as a file, which is "No such file or directory")
+			self:errmsg("curse: " .. (self.exec_builtin and "exec: " or "") .. M.err_name(args[1])
+				.. (self.exec_builtin and ": not found\n" or self:get("PATH") == "" and ": No such file or directory\n"
+					or ": command not found\n"))
 			self.status = 127
 			return
 		end
@@ -2281,7 +2285,10 @@ local function sub_checkpoint(self)
 		shopt = self.shopt, functions = self.functions,
 		locale_gen = M.locale_gen, dirstack = self.dirstack, hashcache = self.hashcache, getopts = self.getopts_state,
 		cwd = self:phys_cwd(), um = C.umask(0), disabled = self.disabled_builtins,
+		fn_ro = self.fn_ro, unset_specials = self.unset_specials, random_plain = self.random_plain,
+		shellopts_exported = self.shellopts_exported,
 	}
+	self.fn_ro, self.unset_specials = shallowcopy(self.fn_ro), shallowcopy(self.unset_specials)
 	self.disabled_builtins = shallowcopy(self.disabled_builtins)
 	C.umask(cp.um)
 	local of, ov = opt_fields(), {}
@@ -2334,6 +2341,8 @@ local function sub_restore(self, cp)
 	for i = 1, #of do self[of[i]] = ov[i] end
 	self.savedstack, self.tenv = cp.savedstack, cp.tenv
 	self.disabled_builtins = cp.disabled
+	self.fn_ro, self.unset_specials, self.random_plain = cp.fn_ro, cp.unset_specials, cp.random_plain
+	self.shellopts_exported = cp.shellopts_exported
 	if cp.cwd ~= "" then C.chdir(cp.cwd) end
 	C.umask(cp.um)
 	-- Re-sync the process environ: drop names the body newly exported, then restore
@@ -5327,6 +5336,12 @@ function Shell:pid()
 	end
 	return pid_cache
 end
+-- The dynamic variables `unset` strips of their magic for good (bash's unset of a
+-- dynamic var removes the variable and its hooks): special_get then reads them as unset.
+M.DYN_SPECIAL = { SECONDS = true, LINENO = true, BASHPID = true, EPOCHSECONDS = true,
+	EPOCHREALTIME = true, SRANDOM = true, BASH_SUBSHELL = true, HISTCMD = true, BASH_COMMAND = true,
+	BASH_ARGV0 = true, FUNCNAME = true, BASH_SOURCE = true, BASH_LINENO = true, OSTYPE = true,
+	MACHTYPE = true, HOSTTYPE = true }
 function Shell:special_get(name)
 	-- the one-char specials as the BASE of an operator form (${?:-x} ${$:+y} ${-+z} ${!-w});
 	-- the bare $? $$ $- $! go through their own dedicated nodes
@@ -5343,6 +5358,10 @@ function Shell:special_get(name)
 	-- bare ${#}/${#@} count and ${#var} length go through their own dedicated nodes.
 	if name == "#" then
 		return tostring(self.nparams)
+	end
+	local us = self.unset_specials
+	if us and us[name] then
+		return ""
 	end
 	if name == "RANDOM" then
 		if self.random_plain then
@@ -6081,7 +6100,8 @@ function Shell:set_str(name, s)
 		s = M.cstr(s)
 	end -- bash vars are C strings: cut at NUL
 	local dn = self:deref(name)
-	if dn == "FUNCNAME" or dn == "SRANDOM" or (dn == "LINENO" and not self.vars.LINENO) then
+	if (dn == "FUNCNAME" or dn == "SRANDOM" or (dn == "LINENO" and not self.vars.LINENO))
+		and not (self.unset_specials and self.unset_specials[dn]) then
 		return -- assignments to these have no effect (bash): the call stack, fresh random
 		-- bits, the line now running
 	end
@@ -6099,7 +6119,7 @@ function Shell:set_str(name, s)
 	if dn == "OPTIND" and self.getopts_state then
 		self.getopts_state[b] = nil -- assigning OPTIND resets getopts' in-argument position (bash)
 	end
-	if dn == "BASH_ARGV0" then
+	if dn == "BASH_ARGV0" and not (self.unset_specials and self.unset_specials.BASH_ARGV0) then
 		self.argv0 = s -- assigning BASH_ARGV0 sets $0 (bash)
 	elseif dn == "POSIXLY_CORRECT" then
 		self.opt_posix = true -- (bash's sv_strict_posix: setting it enters posix mode)
