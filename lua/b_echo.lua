@@ -6,7 +6,9 @@ return function(sh, cmd, args, hook, tcb)
 	if cmd == "echo" then
 		-- echo [-neE] ARGS: -n suppresses the newline, -e interprets backslash escapes.
 		local j, nonl, esc = 2, false, sh.shopt.xpg_echo and true or false -- (xpg_echo: -e by default)
-		while args[j] and args[j]:match("^%-[neE]+$") do
+		-- (posix + xpg_echo: no options at all — `echo -n` prints `-n`, as bash)
+		local opts = not (esc and sh.opt_posix)
+		while opts and args[j] and args[j]:match("^%-[neE]+$") do
 			for ch in args[j]:sub(2):gmatch(".") do
 				if ch == "n" then
 					nonl = true

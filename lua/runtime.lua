@@ -1432,6 +1432,13 @@ function M.open_fail(sh, path)
 end
 function M.redir_apply(sh, op, fd, target, saves)
 	io.flush() -- flush buffered stdout before moving fds (else it lands in the new target)
+	-- In a pipeline stage, builtins write the redirected fd 1 directly while it's moved (as
+	-- the interpreter does): the stage's buffer would reach it only at restore, too late
+	-- for a write error (`echo x >/dev/full | …`) to be seen and reported by the command.
+	if (fd == 1 or op == "outboth" or op == "appboth") and not saves.out_sh and CO_OUTS[sh.out] then
+		saves.out_sh, saves.out = sh, sh.out
+		sh.out = io.write
+	end
 	local function backup(f)
 		saves[#saves + 1] = { fd = f, saved = M.save_fd(f) }
 	end
@@ -1540,6 +1547,10 @@ end
 -- `exec REDIRS`: the redirections persist, so the saved originals are just dropped (a kept
 -- copy of a pipe's write end would hold its reader's EOF off forever)
 function M.redir_discard(saves)
+	if saves.out_sh then
+		io.flush()
+		saves.out_sh.out, saves.out_sh = saves.out, nil
+	end
 	for i = #saves, 1, -1 do
 		if saves[i].saved >= 0 then
 			C.close(saves[i].saved)
@@ -1549,6 +1560,9 @@ function M.redir_discard(saves)
 end
 function M.redir_restore(saves)
 	io.flush()
+	if saves.out_sh then
+		saves.out_sh.out, saves.out_sh = saves.out, nil
+	end
 	-- s.saved >= 0: the fd was open — restore it. s.saved < 0 (C.dup failed): the fd was NOT
 	-- open before, so CLOSE it rather than dup2(-1) which leaks it (matches interp restore_redirs).
 	for i = #saves, 1, -1 do
@@ -9783,7 +9797,8 @@ function Shell:echo(...)
 	if n >= 1 then
 		first = select(1, ...)
 	end
-	if type(first) == "string" and first:match("^%-[neE]+$") then
+	-- (posix + xpg_echo: no options at all — `echo -n` prints `-n`, as bash)
+	if type(first) == "string" and first:match("^%-[neE]+$") and not (esc and self.opt_posix) then
 		local args = { ... }
 		local j = 1
 		while j <= n and type(args[j]) == "string" and args[j]:match("^%-[neE]+$") do

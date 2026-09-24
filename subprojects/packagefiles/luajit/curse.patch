@@ -140,6 +140,42 @@ index 283b6e42..62c231ef 100644
    return p;
  }
  
+diff --git a/src/lj_ffrecord.c b/src/lj_ffrecord.c
+index 41dee1ca..6874da79 100644
+--- a/src/lj_ffrecord.c
++++ b/src/lj_ffrecord.c
+@@ -1579,7 +1579,14 @@ static TRef recff_io_fp(jit_State *J, TRef *udp, int32_t id)
+ 
+ static void LJ_FASTCALL recff_io_write(jit_State *J, RecordFFData *rd)
+ {
+-  TRef ud, fp = recff_io_fp(J, &ud, rd->data);
++  TRef ud, fp;
++  if (results_wanted(J) != 0) {
++    /* curse: a failing result guard exits to the interpreter, which REPEATS the call
++    ** (a second write). Stitch instead: the interpreter makes the call exactly once. */
++    recff_nyi(J, rd);
++    return;
++  }
++  fp = recff_io_fp(J, &ud, rd->data);
+   TRef zero = lj_ir_kint(J, 0);
+   TRef one = lj_ir_kint(J, 1);
+   ptrdiff_t i = rd->data == 0 ? 1 : 0;
+@@ -1606,7 +1613,14 @@ static void LJ_FASTCALL recff_io_write(jit_State *J, RecordFFData *rd)
+ 
+ static void LJ_FASTCALL recff_io_flush(jit_State *J, RecordFFData *rd)
+ {
+-  TRef ud, fp = recff_io_fp(J, &ud, rd->data);
++  TRef ud, fp;
++  if (results_wanted(J) != 0) {
++    /* curse: as io.write — a repeated fflush after a failed one returns 0 (glibc
++    ** discards the buffer), so the error would be lost. Stitch around the call. */
++    recff_nyi(J, rd);
++    return;
++  }
++  fp = recff_io_fp(J, &ud, rd->data);
+   TRef tr = lj_ir_call(J, IRCALL_fflush, fp);
+   if (results_wanted(J) != 0)  /* Check result only if not ignored. */
+     emitir(IRTGI(IR_EQ), tr, lj_ir_kint(J, 0));
 diff --git a/src/lj_jit.h b/src/lj_jit.h
 index af50e5c1..91736c2f 100644
 --- a/src/lj_jit.h
