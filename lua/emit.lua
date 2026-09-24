@@ -7229,7 +7229,7 @@ end
 -- and no eval/source can add more. Anything else — inside a function/compound/pipeline,
 -- `alias "$x"`, `shopt -s $opt`, eval/source — refuses (the interpreter's live per-line
 -- parse gets it right). Returns: "none" (no alias use), "static", or "dynamic".
-local ALIAS_CMDS = { alias = 1, unalias = 1, shopt = 1 }
+local ALIAS_CMDS = { alias = 1, unalias = 1, shopt = 1, set = 1 }
 local function static_lit(w)
 	if not w or not w.parts then
 		return false
@@ -7250,12 +7250,18 @@ local function alias_cmd(st)
 	if not c or not ALIAS_CMDS[c] then
 		return nil
 	end
-	if c == "shopt" then -- only an expand_aliases toggle is alias-affecting
+	if c == "shopt" or c == "set" then -- only an expand_aliases (or posix: it sets that) toggle
 		local hit, dyn = false, false
+		local key = c == "shopt" and "expand_aliases" or "posix"
 		for j = 2, #st.words do
 			if not static_lit(st.words[j]) then
-				dyn = true
-			elseif st.words[j].parts[1].lit == "expand_aliases" then
+				-- (`set -- $x` is no toggle: only an unknown word after -o/+o may be one)
+				local pw = st.words[j - 1]
+				local prev = c == "set" and static_lit(pw) and pw.parts[1] and pw.parts[1].lit
+				if c == "shopt" or prev == "-o" or prev == "+o" then
+					dyn = true
+				end
+			elseif st.words[j].parts[1] and st.words[j].parts[1].lit == key then
 				hit = true
 			end
 		end

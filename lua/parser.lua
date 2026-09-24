@@ -2300,7 +2300,8 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs)
 							end
 							rest[#rest + 1] = w.parts[p].lit
 						end
-						if ok and name ~= "" then
+						-- (legal_alias_name: no shellbreak/quote/`$`/`/` char — b_alias.lua)
+						if ok and name ~= "" and not name:find("[ \t\n()<>;&|'\"`\\$/]") then
 							aliases[name] = table.concat(rest)
 						end
 					end
@@ -2320,6 +2321,7 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs)
 				local a, b = static_word(node.words[k]), static_word(node.words[k + 1])
 				if (a == "-o" or a == "+o") and b == "posix" then
 					posix_on = a == "-o"
+					alias_on = posix_on -- (posix_initialize: on sets expand_aliases, off resets it)
 				end
 			end
 		end
