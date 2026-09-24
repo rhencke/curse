@@ -3536,12 +3536,20 @@ local function printf_int(s, uns)
 		return char_value(s:sub(2)), true
 	end
 	-- strtoll semantics (NOT shell arithmetic): skip leading blanks, read a single
-	-- [sign] hex/octal/decimal integer, and any leftover (trailing chars OR blanks,
-	-- and no base#N) makes it invalid — bash still prints the parsed value, status 1.
+	-- [sign] hex/binary/octal/decimal integer, and any leftover (trailing chars OR
+	-- blanks, and no base#N) makes it invalid — bash still prints the parsed value,
+	-- status 1. (glibc's C23 strtoimax, which bash is built against, takes 0b binary.)
 	local rest = s:gsub("^[ \t\n]+", "")
-	local tok = rest:match("^[%+%-]?0[xX]%x+") -- 0x hex
-		or rest:match("^[%+%-]?0[0-7]*") -- 0 / 0NNN octal
-		or rest:match("^[%+%-]?%d+") -- decimal
+	local tok, base = rest:match("^[%+%-]?0[xX]%x+"), 0 -- 0x hex
+	if not tok then
+		local sg, bin = rest:match("^([%+%-]?)0[bB]([01]+)") -- 0b binary
+		if bin then
+			tok, base = sg .. bin, 2
+		else
+			tok = rest:match("^[%+%-]?0[0-7]*") -- 0 / 0NNN octal
+				or rest:match("^[%+%-]?%d+") -- decimal
+		end
+	end
 	if not tok then
 		return 0, false
 	end -- no digits at all ("xyz") -> 0, invalid
@@ -3549,11 +3557,12 @@ local function printf_int(s, uns)
 	-- strtoull wraps a negative modulo 2^64), exactly matching bash's printf. Cast
 	-- to the int64_t/uint64_t typedefs so string.format formats them directly.
 	ffi.errno(0)
-	local v = uns and u64(C.strtoull(tok, nil, 0)) or i64(C.strtoll(tok, nil, 0))
+	local v = uns and u64(C.strtoull(tok, nil, base)) or i64(C.strtoll(tok, nil, base))
 	if ffi.errno() == 34 then -- ERANGE: bash warns (the clamped value prints, status 0)
 		pf_range = s -- (sh_printf reports it, in order with the output)
 	end
-	return v, (rest:sub(#tok + 1) == "") -- fully consumed?
+	local used = base == 2 and #tok + 2 or #tok -- (the 0b isn't in the token)
+	return v, (rest:sub(used + 1) == "") -- fully consumed?
 end
 -- A floating printf argument (for %f/%e/%g): C strtod semantics via tonumber.
 local function printf_float(s)
@@ -3570,9 +3579,8 @@ local function printf_float(s)
 	end
 	return 0, false
 end
--- width/precision for %s or a %(…)T result via string.format on a plain string.
--- printf %q: quote so the result re-reads as the same word (bash style: backslash-
--- escape metacharacters/whitespace; $'…' when control chars are present).
+-- printf %q: quote so the result re-reads as the same word (bash: ansic_quote's $'…'
+-- when a control/non-printable char is present, else sh_backslash_quote)
 local function printf_q(s)
 	if s == "" then
 		return "''"
@@ -3619,61 +3627,30 @@ local function printf_q(s)
 		out[#out + 1] = "'"
 		return table.concat(out)
 	end
-	if s:match("^[%w_@%%%+%-%./,:=^]+$") then
+	-- sh_backslash_quote (lib/sh/shquote.c, flags 3): bstab's bytes anywhere, a leading
+	-- `#`, and a `~` that leads or follows `:`/`=`; multibyte bytes are kept raw
+	if not s:find("[\t\n !\"#$&'()*,;<>?%[\\%]^`{|}~]") then
 		return s
 	end -- nothing to quote: bare
-	-- backslash-escape shell metacharacters; printable multibyte bytes are kept raw
-	return (s:gsub("[%s\"'\\|&;<>()$`?*%[%]#~=!{}^]", "\\%0"))
-end
--- Format one numeric %-conversion from a raw arg string. Returns (string, ok).
-local function printf_conv(full, conv, arg)
-	if conv == "d" or conv == "i" then
-		local v, ok = printf_int(arg)
-		return string.format(full .. "d", v), ok
-	elseif conv == "u" then
-		local v, ok = printf_int(arg, true)
-		return string.format(full .. "u", v), ok
-	elseif conv == "o" or conv == "x" or conv == "X" then
-		local v, ok = printf_int(arg, true)
-		return string.format(full .. conv, v), ok
-	elseif
-		conv == "f"
-		or conv == "F"
-		or conv == "e"
-		or conv == "E"
-		or conv == "g"
-		or conv == "G"
-		or conv == "a"
-		or conv == "A"
-	then
-		local v, ok = printf_float(arg)
-		-- bash parses the argument as a LONG double and prints with `L` (0.1 is exact to
-		-- 20 places, 1 is 0x8p-3): the C helper does both when the text is a plain number
-		-- (the C library applies the locale's decimal point itself; a partly-numeric
-		-- argument prints its numeric prefix, and is reported)
-		local c1 = type(arg) == "string" and arg:sub(1, 1)
-		if c1 and c1 ~= "" and c1 ~= "'" and c1 ~= '"' then
-			local r, whole = ld_format(full .. "L" .. conv, arg)
-			if r then
-				return r, whole
-			end
-		end
-		local r = string.format(full .. (conv == "F" and "f" or conv), v)
-		local dp = rt.decimal_point() -- (the locale's radix character: `1,0000` under de_DE)
-		if dp ~= "." then
-			r = r:gsub("%.", dp, 1)
-		end
-		return r, ok
+	local r = s:gsub("[\t\n !\"$&'()*,;<>?%[\\%]^`{|}]", "\\%0")
+	if r:find("~", 1, true) then
+		r = r:gsub("([:=])~", "%1\\~")
 	end
-	return nil, true -- unknown conversion
+	local b = r:byte(1)
+	if b == 35 or b == 126 then -- (# and ~ at the start)
+		r = "\\" .. r
+	end
+	return r
 end
 -- The full printf engine. `argv[start..]` are the data args; the format is reused
 -- until they're exhausted. Returns (output, status).
 -- printf format parse, MEMOIZED by format string (pure function of `fmt`). Backslash
 -- escapes are static, so they fold into literal-string tokens; each %-conversion becomes a
--- {conv/strftime, spec, width|dynw, prec|dynp} token. The executor (sh_printf) then walks the
--- cached token list instead of re-scanning the format every call — the common `printf FMT …`
--- in a loop re-uses the same FMT. Bounded by a flush so a long-lived daemon can't grow it.
+-- {conv/strftime, spec, width|dynw, prec|dynp} token, and a diagnostic the format itself
+-- causes (`\x` with no digits) a {diag} token, so it's reported on every run, in order.
+-- The executor (sh_printf) then walks the cached token list instead of re-scanning the
+-- format every call — the common `printf FMT …` in a loop re-uses the same FMT. Bounded by
+-- a flush so a long-lived daemon can't grow it.
 local _pf_cache, _pf_n = {}, 0
 local function printf_parse(fmt)
 	local toks, lit = {}, {}
@@ -3724,7 +3701,8 @@ local function printf_parse(fmt)
 					lit[#lit + 1] = string.char(tonumber(h, 16))
 					i = i + 2 + #h
 				else
-					io.stderr:write("curse: printf: missing hex digit for \\x\n")
+					flush()
+					toks[#toks + 1] = { diag = "missing hex digit for \\x" }
 					lit[#lit + 1] = "\\"
 					i = i + 1
 				end
@@ -3733,7 +3711,9 @@ local function printf_parse(fmt)
 				if h then
 					lit[#lit + 1] = rt.utf8_char(tonumber(h, 16))
 					i = i + 2 + #h
-				else
+				else -- (tescape)
+					flush()
+					toks[#toks + 1] = { diag = "missing unicode digit for \\" .. d }
 					lit[#lit + 1] = "\\"
 					i = i + 1
 				end
@@ -3752,10 +3732,12 @@ local function printf_parse(fmt)
 				i = j + 1
 			else
 				flush()
-				local spec = "%"
-				while fmt:sub(j, j):match("[-+ #0]") do
+				local spec, grp = "%", false
+				while fmt:sub(j, j):match("[-+ #0']") do -- (bash's SKIP1)
 					local fl = fmt:sub(j, j)
-					if not spec:find(fl, 2, true) then -- (each flag once: `%000…0d` is `%0d`)
+					if fl == "'" then -- (thousands grouping: only the C library's floats take it)
+						grp = true
+					elseif not spec:find(fl, 2, true) then -- (each flag once: `%000…0d` is `%0d`)
 						spec = spec .. fl
 					end
 					j = j + 1
@@ -3784,7 +3766,9 @@ local function printf_parse(fmt)
 						end
 					end
 				end
+				local lmod = false -- (an `L` modifier: floats stay long double in posix mode)
 				while fmt:sub(j, j):match("[lhLjzt]") do
+					lmod = lmod or fmt:sub(j, j) == "L"
 					j = j + 1
 				end
 				if fmt:sub(j, j) == "(" then -- %(FORMAT)T strftime (parens inside FORMAT nest)
@@ -3809,15 +3793,26 @@ local function printf_parse(fmt)
 						toks[#toks + 1] =
 							{ strftime = true, spec = spec, width = width, dynw = dynw, prec = prec, dynp = dynp, tfmt = tfmt }
 						i = close + 2
-					else -- not a %(…)T: bash warns and prints it as written
+					else -- not a %(…)T: bash warns, prints the `%`, and rescans from after it
 						local stop = close and close + 1 or n
-						io.stderr:write("curse: printf: warning: `" .. fmt:sub(stop, stop) .. "': invalid time format specification\n")
-						lit[#lit + 1] = fmt:sub(i, stop)
-						i = stop + 1
+						toks[#toks + 1] = { diag = "warning: `" .. fmt:sub(stop, stop) .. "': invalid time format specification" }
+						lit[#lit + 1] = "%"
+						i = i + 1
 					end
 				else
-					toks[#toks + 1] =
-						{ conv = fmt:sub(j, j), spec = spec, width = width, dynw = dynw, prec = prec, dynp = dynp }
+					local conv = fmt:sub(j, j)
+					local tk = { conv = conv, spec = spec, width = width, dynw = dynw, prec = prec, dynp = dynp, lmod = lmod, grp = grp }
+					-- (the conversion spec string.format takes: literal width/precision of
+					-- at most two digits; anything else is built per call)
+					if not (dynw or dynp) and #width <= 2 and #(prec or "") <= 2 then
+						tk.full = spec .. width .. (prec and ("." .. prec) or "")
+					end
+					if conv == "" then -- the format ended inside a conversion: bash names it all
+						tk.miss = fmt:sub(i)
+					elseif conv == "n" then
+						toks.hasn = true
+					end
+					toks[#toks + 1] = tk
 					i = j + 1
 				end
 			end
@@ -3839,8 +3834,172 @@ local function pf_next(ps)
 	end
 	return v or ""
 end
--- `fsh`: printing to the shell's stdout — output so far is flushed before a diagnostic,
--- so the two interleave as bash's do
+-- The printf helpers below live in one table (interp.lua's main chunk is near LuaJIT's
+-- local-variable limit); all but pf.str are off the common path.
+local pf = {}
+-- printstr: %s/%b/%q/%c/%(…)T text with a width (space-padded, `-` left-justifies) and a
+-- precision in bytes (`%.s`: a null digit string is zero)
+function pf.str(spec, width, prec, s)
+	if prec then
+		local p = tonumber(prec) or 0
+		if p < #s then
+			s = s:sub(1, p)
+		end
+	end
+	local w = tonumber(width)
+	if w and w > #s then
+		if spec:find("-", 1, true) then
+			return s .. (" "):rep(w - #s)
+		end
+		return (" "):rep(w - #s) .. s
+	end
+	return s
+end
+-- bash's stdout is line-buffered (shell.c: sh_setlinebuf): at a diagnostic, output
+-- through the last newline has been written, a partial line has not
+function pf.flush_lines(ps)
+	local out = ps.out
+	if not ps.fsh or not out[1] then
+		return
+	end
+	local s = table.concat(out)
+	for k = #out, 1, -1 do
+		out[k] = nil
+	end
+	local nl = nil
+	for k = #s, 1, -1 do
+		if s:byte(k) == 10 then
+			nl = k
+			break
+		end
+	end
+	if nl then
+		ps.fsh.out(s:sub(1, nl))
+		ps.flushed = ps.flushed + nl
+		s = s:sub(nl + 1)
+	end
+	if s ~= "" then
+		out[1] = s
+	end
+end
+function pf.diag(ps, msg)
+	pf.flush_lines(ps)
+	io.stderr:write("curse: printf: " .. msg .. "\n")
+end
+-- sh_invalidnum (builtins/common.c)
+function pf.badnum(ps, s)
+	local msg = "invalid number"
+	if s:match("^0%d") then
+		msg = "invalid octal number"
+	elseif s:sub(1, 2) == "0x" then
+		msg = "invalid hex number"
+	end
+	pf.diag(ps, s .. ": " .. msg)
+	ps.st = 1
+end
+-- getintmax/getuintmax: the argument's value; bad text is reported (its numeric prefix
+-- still counts), an out-of-range one warned about (clamped)
+function pf.intarg(ps, a, uns)
+	local v, ok = printf_int(a, uns)
+	if not ok then
+		pf.badnum(ps, a)
+	elseif pf_range then
+		pf.diag(ps, "warning: " .. pf_range .. ": Numerical result out of range")
+	end
+	pf_range = nil
+	return v
+end
+-- getint, for a `*` width/precision: getintmax clamped to an int — a warning that names
+-- the word AFTER it (bash has already stepped past the number), or, for the last
+-- argument, the value truncated to 32 bits
+function pf.getint(ps)
+	local a = ps.argv[ps.ai]
+	if a == nil then
+		return 0
+	end
+	ps.ai = ps.ai + 1
+	local v = pf.intarg(ps, a)
+	local nxt = ps.argv[ps.ai]
+	if nxt == nil then
+		return tonumber(ffi.cast("int32_t", v))
+	end
+	if v > 2147483647 or v < -2147483648 then
+		pf.diag(ps, "warning: " .. nxt .. ": Numerical result out of range")
+		return v > 0 and 2147483647 or -2147483648
+	end
+	return tonumber(v)
+end
+-- an integer conversion whose width/precision string.format can't take (> 2 digits):
+-- format the bare number, then zero-extend to the precision and pad to the width
+function pf.bigint(spec, width, prec, conv, v)
+	local p = tonumber(prec)
+	local fl = spec:gsub("[-0]", "")
+	local s
+	if p and p <= 99 then
+		s = string.format(fl .. "." .. p .. conv, v)
+	else
+		s = string.format(fl .. conv, v)
+		if p then
+			local pre = s:match("^[+%- ]?") .. ((conv == "x" or conv == "X") and s:match("^[+%- ]?(0[xX])") or "")
+			local digits = s:sub(#pre + 1)
+			if #digits < p then
+				s = pre .. ("0"):rep(p - #digits) .. digits
+			end
+		end
+	end
+	local w = tonumber(width) or 0
+	if #s < w then
+		if spec:find("-", 1, true) then
+			s = s .. (" "):rep(w - #s)
+		elseif spec:find("0", 1, true) and not p then
+			local pre, rest = s:match("^([+%- ]?0?[xX]?)(.*)$")
+			if pre:match("0$") and not (conv == "x" or conv == "X") then -- (octal's `#` 0 is a digit)
+				pre, rest = pre:sub(1, -2), "0" .. rest
+			end
+			s = pre .. ("0"):rep(w - #s) .. rest
+		else
+			s = (" "):rep(w - #s) .. s
+		end
+	end
+	return s
+end
+-- %f/%e/%g/%a: bash parses the argument as a LONG double and prints with `L` (0.1 is
+-- exact to 20 places, 1 is 0x8p-3) — except in posix mode without an `L` modifier,
+-- where it's a double. The C helper does the long-double case when the text is a plain
+-- number (the C library applies the locale's decimal point and `'` grouping itself; a
+-- partly-numeric argument prints its numeric prefix, and is reported).
+-- (`full`: the spec string.format takes, nil when the width/precision is too wide)
+function pf.float(ps, tk, full, spec, width, prec, conv, arg)
+	local long = full or (spec .. width .. (prec and ("." .. prec) or ""))
+	local cfull = tk.grp and ("%'" .. long:sub(2)) or long
+	local posix = not tk.lmod and rt.cur_shell and rt.cur_shell.opt_posix
+	local c1 = arg:sub(1, 1)
+	if not posix and c1 ~= "" and c1 ~= "'" and c1 ~= '"' then
+		local r, whole = ld_format(cfull .. "L" .. conv, arg)
+		if r then
+			if not whole then
+				pf.badnum(ps, arg)
+			end
+			return r
+		end
+	end
+	local v, ok = printf_float(arg)
+	if not ok then
+		pf.badnum(ps, arg)
+	end
+	if full and not tk.grp then
+		local r = string.format(full .. conv, v)
+		local dp = rt.decimal_point() -- (the locale's radix character: `1,0000` under de_DE)
+		if dp ~= "." then
+			r = r:gsub("%.", dp, 1)
+		end
+		return r
+	end
+	-- (a wide one: the double's exact hex text through the long-double helper)
+	return (ld_format(cfull .. "L" .. conv, string.format("%a", v)))
+end
+-- `fsh`: printing to the shell's stdout — before a diagnostic, the output's complete
+-- lines are written first, so the two interleave as bash's line-buffered stdout does
 local function sh_printf(fmt, argv, start, nsets, fsh)
 	-- (a \u/\U escape's bytes depend on the locale: key those formats by its generation)
 	local key = fmt:find("\\[uU]") and (rt.locale_gen .. "\0" .. fmt) or fmt
@@ -3853,112 +4012,113 @@ local function sh_printf(fmt, argv, start, nsets, fsh)
 		_pf_cache[key] = toks
 		_pf_n = _pf_n + 1
 	end
-	local out, status = {}, 0
-	local ps = { argv = argv, ai = start } -- (the argument cursor: pf_next)
+	local out = {}
+	-- (the argument cursor, pf_next; the pending output; bytes written ahead of it; status)
+	local ps = { argv = argv, ai = start, out = out, fsh = fsh, flushed = 0, st = 0 }
 	local nargs = #argv
 	repeat
 		local pass_start = ps.ai
+		local base = toks.hasn and ps.flushed + #table.concat(out) -- (%n counts from each pass's start)
 		for t = 1, #toks do
 			local tk = toks[t]
 			if type(tk) == "string" then -- literal chunk
 				out[#out + 1] = tk
+			elseif tk.diag then
+				pf.diag(ps, tk.diag)
 			else
-				local spec, width, prec = tk.spec, tk.width, tk.prec
-				if tk.dynw then
-					width = tostring(math.floor(tonumber((printf_int(pf_next(ps))))))
+				local spec, width, prec, full = tk.spec, tk.width, tk.prec, tk.full
+				if tk.dynw or tk.dynp then
+					if tk.dynw then
+						local w = pf.getint(ps)
+						if w < 0 then -- (a negative `*` width left-justifies)
+							w = -w
+							if not spec:find("-", 1, true) then
+								spec = spec .. "-"
+							end
+						end
+						width = tostring(w)
+					end
+					if tk.dynp then
+						local p = pf.getint(ps)
+						prec = p >= 0 and tostring(p) or nil -- (a negative one is as if absent)
+					end
+					if #width <= 2 and #(prec or "") <= 2 then
+						full = spec .. width .. (prec and ("." .. prec) or "")
+					end
 				end
-				if tk.dynp then
-					prec = tostring(math.floor(tonumber((printf_int(pf_next(ps))))))
-				end
-				if tk.strftime then
-					local arg = pf_next(ps)
-					-- (-1: now; -2: when the shell started, bash's shell_start_time)
-					local epoch = (arg == "" or arg == "-1") and os.time()
-						or (arg == "-2" and (rt.cur_shell and rt.cur_shell.start_time or os.time())) or (tonumber(arg) or os.time())
-					local sres = os.date(tk.tfmt, epoch) or ""
+				local conv = tk.conv
+				if conv == "s" then
+					local a = pf_next(ps)
+					out[#out + 1] = (width == "" and not prec) and a or pf.str(spec, width, prec, a)
+				elseif conv == "d" or conv == "i" or conv == "u" or conv == "o" or conv == "x" or conv == "X" then
+					local v = pf.intarg(ps, pf_next(ps), conv ~= "d" and conv ~= "i")
+					conv = conv == "i" and "d" or conv
+					out[#out + 1] = full and string.format(full .. conv, v) or pf.bigint(spec, width, prec, conv, v)
+				elseif tk.strftime then
+					-- the argument is getintmax'd; none at all is -1: now (-2: when the shell
+					-- started, bash's shell_start_time)
+					local epoch = -1
+					if ps.argv[ps.ai] ~= nil then
+						epoch = pf.intarg(ps, pf_next(ps))
+					end
+					if epoch == -1 then
+						epoch = os.time()
+					elseif epoch == -2 then
+						epoch = rt.cur_shell and rt.cur_shell.start_time or os.time()
+					end
+					-- (a time localtime can't represent is the epoch)
+					local sres = os.date(tk.tfmt, tonumber(epoch)) or os.date(tk.tfmt, 0) or ""
 					if #sres >= 128 then
 						sres = ""
 					end
-					if prec then
-						sres = sres:sub(1, tonumber(prec))
-					end
-					out[#out + 1] = string.format("%" .. spec:sub(2) .. width .. "s", sres)
-				else
-					local conv = tk.conv
-					-- a width past what string.format takes (2 digits): format without it, pad after
-					local bigw = tonumber(width)
-					if bigw and bigw > 99 then
-						width = ""
-					else
-						bigw = nil
-					end
-					local full = spec .. width .. (prec and ("." .. prec) or "")
-					if conv == "n" then -- %n: store the number of bytes written so far in NAME
-						local nm = pf_next(ps)
+					out[#out + 1] = pf.str(spec, width, prec, sres)
+				elseif conv == "f" or conv == "F" or conv == "e" or conv == "E" or conv == "g" or conv == "G"
+					or conv == "a" or conv == "A" then
+					out[#out + 1] = pf.float(ps, tk, full, spec, width, prec, conv, pf_next(ps))
+				elseif conv == "n" then -- %n: store the number of bytes written so far in NAME
+					local nm = pf_next(ps)
+					if nm ~= "" then
+						if not nm:match("^[%a_][%w_]*$") then -- (legal_identifier: no array element)
+							pf.diag(ps, "`" .. nm .. "': not a valid identifier")
+							return table.concat(out), 1
+						end
 						if nsets then
-							nsets[#nsets + 1] = { nm, #table.concat(out) }
+							nsets[#nsets + 1] = { nm, ps.flushed + #table.concat(out) - base }
 						end
-						out[#out + 1] = ""
-					elseif conv == "s" then
-						out[#out + 1] = string.format(
-							(spec:gsub("0", "", 1)) .. width .. (prec and ("." .. prec) or "") .. "s",
-							pf_next(ps)
-						)
-					elseif conv == "c" then
-						out[#out + 1] = string.format("%" .. spec:sub(2) .. width .. "s", pf_next(ps):sub(1, 1))
-					elseif conv == "b" then
-						local bs, bstop = rt.ansi_unescape(pf_next(ps), "b")
-						-- (width AND precision apply to the expanded string, like %s)
-						out[#out + 1] = string.format(
-							(spec:gsub("0", "", 1)) .. width .. (prec and ("." .. prec) or "") .. "s", bs)
-						if bstop then
-							return table.concat(out), status
-						end
-					elseif conv == "q" then
-						local s = printf_q(pf_next(ps))
-						out[#out + 1] = width ~= "" and string.format("%" .. spec:sub(2) .. width .. "s", s) or s
-					else
-						if conv == "" then -- the format ended inside a conversion (`%10`)
-							io.stderr:write("curse: printf: `" .. full .. "': missing format character\n")
-							return table.concat(out), 1
-						end
-						local a = pf_next(ps)
-						local r, ok = printf_conv(full, conv, a)
-						if (not ok or pf_range) and fsh and #out > 0 then
-							fsh.out(table.concat(out))
-							out = {}
-						end
-						if pf_range then
-							io.stderr:write("curse: printf: warning: " .. pf_range .. ": Numerical result out of range\n")
-							pf_range = nil
-						end
-						if not ok then
-							io.stderr:write("curse: printf: " .. a .. ": invalid number\n")
-							status = 1
-						end
-						if r == nil then -- invalid conversion: bash reports it and STOPS the output there
-							io.stderr:write("curse: printf: `" .. conv .. "': invalid format character\n")
-							return table.concat(out), 1
-						end
-						out[#out + 1] = r
 					end
-					local s = bigw and out[#out]
-					if s and #s < bigw then
-						if spec:find("-", 1, true) then
-							s = s .. (" "):rep(bigw - #s)
-						elseif spec:find("0", 1, true) and not prec and conv:match("[diouxXeEfFgGaA]") then
-							local pre, rest = s:match("^([+%- ]?0?[xX]?)(.*)$")
-							s = pre .. ("0"):rep(bigw - #s) .. rest
-						else
-							s = (" "):rep(bigw - #s) .. s
-						end
-						out[#out] = s
+				elseif conv == "c" then -- (a missing or empty argument is a NUL byte)
+					local c = pf_next(ps):sub(1, 1)
+					out[#out + 1] = pf.str(spec, width, nil, c == "" and "\0" or c)
+				elseif conv == "b" then
+					local a = pf_next(ps)
+					if fsh and a:find("\\[xuU]") then -- (a diagnostic may come: complete lines first)
+						pf.flush_lines(ps)
 					end
+					local bs, bstop = rt.ansi_unescape(a, "b")
+					-- (width AND precision apply to the expanded string, like %s)
+					out[#out + 1] = pf.str(spec, width, prec, bs)
+					if bstop then
+						return table.concat(out), ps.st
+					end
+				elseif conv == "q" then -- (the precision cuts the QUOTED text)
+					out[#out + 1] = pf.str(spec, width, prec, printf_q(pf_next(ps)))
+				elseif conv == "Q" then -- (a literal precision cuts the raw text; the quoted is whole)
+					local a = pf_next(ps)
+					if prec and prec ~= "" and not tk.dynp then
+						a = a:sub(1, tonumber(prec))
+					end
+					out[#out + 1] = pf.str(spec, width, nil, printf_q(a))
+				elseif conv == "" then -- the format ended inside a conversion (`%10`)
+					pf.diag(ps, "`" .. tk.miss .. "': missing format character")
+					return table.concat(out), 1
+				else -- invalid conversion: bash reports it and STOPS the output there
+					pf.diag(ps, "`" .. conv .. "': invalid format character")
+					return table.concat(out), 1
 				end
 			end
 		end
 	until ps.ai > nargs or ps.ai == pass_start
-	return table.concat(out), status
+	return table.concat(out), ps.st
 end
 
 -- Dispatch one already-expanded simple command (no redirs — the caller sets those
