@@ -90,7 +90,7 @@ return function(sh, cmd, args, hook, tcb)
 				sh.status = 2
 			else
 				local nsets = {}
-				local res, st = sh_printf(args[fi], args, fi + 1, nsets)
+				local res, st = sh_printf(args[fi], args, fi + 1, nsets, sh)
 				for _, ns in ipairs(nsets) do
 					sh:set_str(ns[1], tostring(ns[2]))
 				end

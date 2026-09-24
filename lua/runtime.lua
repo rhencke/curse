@@ -8248,7 +8248,34 @@ end
 -- the whole value came from ONE unquoted source, every char is split- and
 -- glob-active (no per-char quote mask needed). Kept byte-for-byte in lockstep with
 -- expand_to_fields' feed_split + glob tail (interp.lua).
+do
+local FS_PLAIN = {} -- (bytes that neither split on the default IFS nor glob)
+for c = 0, 255 do
+	FS_PLAIN[c] = true
+end
+for c in (" \t\n*?[]\\+@!(") :gmatch(".") do
+	FS_PLAIN[c:byte()] = false
+end
 function M.field_split(sh, value, split)
+	local n = #value
+	if n <= 64 then -- the common short word ($i, $name): one field, as is — no IFS/glob setup
+		local ifs0 = M.ifs(sh)
+		if ifs0 == nil or ifs0 == " \t\n" then
+			if n == 0 then
+				return split and {} or { value }
+			end
+			local plain = true
+			for k = 1, n do
+				if not FS_PLAIN[value:byte(k)] then
+					plain = false
+					break
+				end
+			end
+			if plain then
+				return { value }
+			end
+		end
+	end
 	local fields
 	if split then
 		-- word-split on $IFS. IFS is a SET of chars; a delimiter may be multibyte
@@ -8438,6 +8465,7 @@ function M.field_split(sh, value, split)
 		end
 	end
 	return out
+end
 end
 
 -- Mask-aware field split + glob for a MIXED word (`foo$x`, `x=$i`, `$?.txt`) — the
@@ -10102,12 +10130,12 @@ end
 -- continue/exit propagate to the caller; the RETURN trap fires after, like b_source.
 -- `source`'s call frame (bash): ${BASH_SOURCE[0]} is the file as named, BASH_LINENO gets
 -- the `source` line, FUNCNAME gains "source" (shown only inside a function). Shared by both tiers.
-function M.source_enter(sh, name)
+function M.source_enter(sh, name, line) -- line: the `source` command's (else found on the stack)
 	local fr = { src = sh.cur_source, line = sh.cur_line }
 	sh.srcstack = sh.srcstack or {}
 	table.insert(sh.srcstack, 1, sh.cur_source or sh.argv0 or "")
 	sh.linestack = sh.linestack or {}
-	table.insert(sh.linestack, 1, (current_line(sh)))
+	table.insert(sh.linestack, 1, line or (current_line(sh)))
 	sh.funcstack = sh.funcstack or {}
 	table.insert(sh.funcstack, 1, "source") -- (FUNCNAME shows it only inside a function)
 	fr.fn = true
@@ -10122,7 +10150,7 @@ function M.source_leave(sh, fr)
 	end
 	sh.cur_source, sh.cur_line = fr.src, fr.line
 end
-function M.source(sh, argv)
+function M.source(sh, argv, line)
 	local I = require("interp")
 	local Ii = I._int
 	local j = 2
@@ -10172,7 +10200,7 @@ function M.source(sh, argv)
 	end
 	local ownp = sh.params -- (a `set --` in the file replaces this table)
 	sh.sourcedepth = (sh.sourcedepth or 0) + 1 -- a `return` is valid while sourcing
-	local fr = M.source_enter(sh, name)
+	local fr = M.source_enter(sh, name, line)
 	local dsave = M.source_debug_hide(sh)
 	local rok, err = pcall(require("tier").run_compiled, mod, sh, nil)
 	M.source_leave(sh, fr)

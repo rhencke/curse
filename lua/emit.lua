@@ -4657,7 +4657,7 @@ simple_compiled = function(cx, st, after)
 			return cx.delegate(st, after, {
 				prelude = argvbody,
 				callee = "rt.source",
-				callargs = "sh, __a",
+				callargs = st.line and ("sh, __a, %d"):format(st.line) or "sh, __a", -- (its line: BASH_LINENO)
 				redir = sr_redir,
 			})
 		end

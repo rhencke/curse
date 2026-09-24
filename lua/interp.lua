@@ -3527,9 +3527,14 @@ local function ld_format(fmt, num) -- -> text, whole (strtold took all of it) | 
 	end
 	return ffi.string(ldbuf, w), ldok[0] == 1
 end
+local pf_range -- (an out-of-range printf number, for sh_printf's warning)
 local function printf_int(s, uns)
 	if s == nil or s == "" then
 		return 0, true
+	end
+	if s:byte(1) ~= 48 and rt.short_digits(s) then -- (a plain decimal; a leading 0 is octal)
+		local d = tonumber(s)
+		return uns and u64(d) or i64(d), true
 	end
 	local c = s:sub(1, 1)
 	if c == "'" or c == '"' then
@@ -3548,7 +3553,11 @@ local function printf_int(s, uns)
 	-- libc strtoll/strtoull clamp out-of-range values to the type limits (and
 	-- strtoull wraps a negative modulo 2^64), exactly matching bash's printf. Cast
 	-- to the int64_t/uint64_t typedefs so string.format formats them directly.
+	ffi.errno(0)
 	local v = uns and u64(C.strtoull(tok, nil, 0)) or i64(C.strtoll(tok, nil, 0))
+	if ffi.errno() == 34 then -- ERANGE: bash warns (the clamped value prints, status 0)
+		pf_range = s -- (sh_printf reports it, in order with the output)
+	end
 	return v, (rest:sub(#tok + 1) == "") -- fully consumed?
 end
 -- A floating printf argument (for %f/%e/%g): C strtod semantics via tonumber.
@@ -3826,7 +3835,18 @@ local function printf_parse(fmt)
 	return toks
 end
 -- `nsets` (optional): collects %n requests as { name, byte-count-so-far } for the caller
-local function sh_printf(fmt, argv, start, nsets)
+-- the next printf argument ("" past the end): a module-level function, not a closure per
+-- call (closure creation keeps sh_printf out of the JIT)
+local function pf_next(ps)
+	local v = ps.argv[ps.ai]
+	if v ~= nil then
+		ps.ai = ps.ai + 1
+	end
+	return v or ""
+end
+-- `fsh`: printing to the shell's stdout — output so far is flushed before a diagnostic,
+-- so the two interleave as bash's do
+local function sh_printf(fmt, argv, start, nsets, fsh)
 	-- (a \u/\U escape's bytes depend on the locale: key those formats by its generation)
 	local key = fmt:find("\\[uU]") and (rt.locale_gen .. "\0" .. fmt) or fmt
 	local toks = _pf_cache[key]
@@ -3838,17 +3858,11 @@ local function sh_printf(fmt, argv, start, nsets)
 		_pf_cache[key] = toks
 		_pf_n = _pf_n + 1
 	end
-	local out, status, ai = {}, 0, start
+	local out, status = {}, 0
+	local ps = { argv = argv, ai = start } -- (the argument cursor: pf_next)
 	local nargs = #argv
-	local function nextarg()
-		local v = argv[ai]
-		if v ~= nil then
-			ai = ai + 1
-		end
-		return v or ""
-	end
 	repeat
-		local pass_start = ai
+		local pass_start = ps.ai
 		for t = 1, #toks do
 			local tk = toks[t]
 			if type(tk) == "string" then -- literal chunk
@@ -3856,13 +3870,13 @@ local function sh_printf(fmt, argv, start, nsets)
 			else
 				local spec, width, prec = tk.spec, tk.width, tk.prec
 				if tk.dynw then
-					width = tostring(math.floor(tonumber((printf_int(nextarg())))))
+					width = tostring(math.floor(tonumber((printf_int(pf_next(ps))))))
 				end
 				if tk.dynp then
-					prec = tostring(math.floor(tonumber((printf_int(nextarg())))))
+					prec = tostring(math.floor(tonumber((printf_int(pf_next(ps))))))
 				end
 				if tk.strftime then
-					local arg = nextarg()
+					local arg = pf_next(ps)
 					-- (-1: now; -2: when the shell started, bash's shell_start_time)
 					local epoch = (arg == "" or arg == "-1") and os.time()
 						or (arg == "-2" and (rt.cur_shell and rt.cur_shell.start_time or os.time())) or (tonumber(arg) or os.time())
@@ -3885,7 +3899,7 @@ local function sh_printf(fmt, argv, start, nsets)
 					end
 					local full = spec .. width .. (prec and ("." .. prec) or "")
 					if conv == "n" then -- %n: store the number of bytes written so far in NAME
-						local nm = nextarg()
+						local nm = pf_next(ps)
 						if nsets then
 							nsets[#nsets + 1] = { nm, #table.concat(out) }
 						end
@@ -3893,12 +3907,12 @@ local function sh_printf(fmt, argv, start, nsets)
 					elseif conv == "s" then
 						out[#out + 1] = string.format(
 							(spec:gsub("0", "", 1)) .. width .. (prec and ("." .. prec) or "") .. "s",
-							nextarg()
+							pf_next(ps)
 						)
 					elseif conv == "c" then
-						out[#out + 1] = string.format("%" .. spec:sub(2) .. width .. "s", nextarg():sub(1, 1))
+						out[#out + 1] = string.format("%" .. spec:sub(2) .. width .. "s", pf_next(ps):sub(1, 1))
 					elseif conv == "b" then
-						local bs, bstop = rt.ansi_unescape(nextarg(), "b")
+						local bs, bstop = rt.ansi_unescape(pf_next(ps), "b")
 						-- (width AND precision apply to the expanded string, like %s)
 						out[#out + 1] = string.format(
 							(spec:gsub("0", "", 1)) .. width .. (prec and ("." .. prec) or "") .. "s", bs)
@@ -3906,15 +3920,23 @@ local function sh_printf(fmt, argv, start, nsets)
 							return table.concat(out), status
 						end
 					elseif conv == "q" then
-						local s = printf_q(nextarg())
+						local s = printf_q(pf_next(ps))
 						out[#out + 1] = width ~= "" and string.format("%" .. spec:sub(2) .. width .. "s", s) or s
 					else
 						if conv == "" then -- the format ended inside a conversion (`%10`)
 							io.stderr:write("curse: printf: `" .. full .. "': missing format character\n")
 							return table.concat(out), 1
 						end
-						local a = nextarg()
+						local a = pf_next(ps)
 						local r, ok = printf_conv(full, conv, a)
+						if (not ok or pf_range) and fsh and #out > 0 then
+							fsh.out(table.concat(out))
+							out = {}
+						end
+						if pf_range then
+							io.stderr:write("curse: printf: warning: " .. pf_range .. ": Numerical result out of range\n")
+							pf_range = nil
+						end
 						if not ok then
 							io.stderr:write("curse: printf: " .. a .. ": invalid number\n")
 							status = 1
@@ -3940,7 +3962,7 @@ local function sh_printf(fmt, argv, start, nsets)
 				end
 			end
 		end
-	until ai > nargs or ai == pass_start
+	until ps.ai > nargs or ps.ai == pass_start
 	return table.concat(out), status
 end
 
