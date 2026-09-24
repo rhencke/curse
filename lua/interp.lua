@@ -200,7 +200,7 @@ end
 -- it is part of a field and never a delimiter — and the marker is dropped from
 -- the value. Split into an array of {ch, esc} cells, then apply IFS to those.
 local rs_pats = {} -- IFS -> { sep, non, tail } for the fast path (false: not whitespace-only)
-local function read_split(ifs, line, nvars)
+local function read_split(ifs, line, nvars, nomark) -- (nomark: \1 is plain — read's skip_ctlesc)
 	-- the common case: an IFS of whitespace only, no escaped chars — fields are runs of
 	-- non-IFS; the last var gets the rest with trailing IFS stripped (as below)
 	local pat = rs_pats[ifs]
@@ -214,7 +214,7 @@ local function read_split(ifs, line, nvars)
 		end
 		rs_pats[ifs] = pat
 	end
-	if pat and pat.nows and not line:find("\1", 1, true) then
+	if pat and pat.nows and (nomark or not line:find("\1", 1, true)) then
 		-- an IFS of non-whitespace delimiters only: each one ends a field (empty fields
 		-- kept); the last var gets the raw rest — minus a lone trailing delimiter when
 		-- that rest is a single field (bash, as below)
@@ -236,7 +236,7 @@ local function read_split(ifs, line, nvars)
 		end
 		return out
 	end
-	if pat and not line:find("\1", 1, true) then
+	if pat and (nomark or not line:find("\1", 1, true)) then
 		if nvars == 1 then -- (one var: the line minus leading/trailing IFS whitespace)
 			local b1, b2 = line:byte(1), line:byte(-1)
 			if not b1 or not (ifs:find(string.char(b1), 1, true) or ifs:find(string.char(b2), 1, true)) then
@@ -274,7 +274,7 @@ local function read_split(ifs, line, nvars)
 	local cells, p, m = {}, 1, #line
 	while p <= m do
 		local c = line:sub(p, p)
-		if c == "\1" and p < m then
+		if c == "\1" and p < m and not nomark then
 			cells[#cells + 1] = { ch = line:sub(p + 1, p + 1), esc = true }
 			p = p + 2
 		else

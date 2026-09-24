@@ -611,7 +611,7 @@ end
 -- Bash-correct standalone IFS split (for `read`): whitespace-IFS runs collapse and
 -- trim edges; each non-whitespace-IFS char delimits (empty fields allowed), with a
 -- trailing delimiter not adding a trailing empty.
-function M.ifs_split(ifs, s)
+function M.ifs_split(ifs, s, nomark) -- (nomark: \1 is not an escape marker — read's skip_ctlesc)
 	local fields, cur = {}, nil
 	local function isws(c)
 		return c == " " or c == "\t" or c == "\n"
@@ -628,7 +628,7 @@ function M.ifs_split(ifs, s)
 	local i, n = 1, #s
 	while i <= n do
 		local c = s:sub(i, i)
-		if c == "\1" and i < n then -- CTLESC: next char is literal (read backslash-escape)
+		if c == "\1" and i < n and not nomark then -- CTLESC: next char is literal (read backslash-escape)
 			cur = (cur or "") .. s:sub(i + 1, i + 1)
 			i = i + 2
 		elseif inifs(c) then
@@ -4558,6 +4558,15 @@ function M.legal_number(s)
 	end
 	return tonumber(sign .. digits)
 end
+-- bash's sh_invalidnum wording for a bad number S (builtins/common.c)
+function M.invalidnum_msg(s)
+	if s:match("^0%d") then
+		return "invalid octal number"
+	elseif s:match("^0x") then
+		return "invalid hex number"
+	end
+	return "invalid number"
+end
 
 -- `return [n]` status: no arg -> current $?; a numeric arg -> n mod 256; a
 -- non-numeric arg -> 2 + diagnostic (bash). A pure runtime primitive the compiled
@@ -5826,12 +5835,18 @@ function M.assign_ref(sh, cmd, ref, value)
 		sh:array_set(name, key, value, false)
 		return true
 	end
-	local b = sh.vars[sh:deref(name)]
-	if b and b.arr and not b.ref then -- (an array NAME gets element 0, like `x=v`)
-		sh:array_set(name, b.assoc and "0" or 0, value, false)
-		return true
+	-- a plain name assigns like `name=value`: through a nameref (to an element, too), to
+	-- element 0 of an array, arithmetic for declare -i (its errors name the builtin: bash's
+	-- this_command_name), case-folded for -l/-u
+	local P = require("parser")
+	local sv = P.arith_cmd
+	P.arith_cmd = cmd
+	local ok, e = pcall(M.assign_scalar, sh, name, value)
+	P.arith_cmd = sv
+	if not ok then
+		error(e, 0)
 	end
-	return sh:set_str(name, value) ~= false
+	return true
 end
 -- $! : under set -u, unbound until a background job exists (bash names the bare form
 -- `$!`, the braced one `!`)

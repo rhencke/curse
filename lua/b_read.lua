@@ -93,6 +93,41 @@ local function getc(st)
 	end
 	return c
 end
+-- bash's uconvert (lib/sh/uconvert.c) for -t / $TMOUT: [+-]DIGITS[.DIGITS] — no blanks, no
+-- exponent; "" is 0; past six fraction digits the rest is unchecked. Seconds, or nil.
+local function uconvert(s)
+	local sign, ip, rest = s:match("^([+-]?)(%d*)(.*)$")
+	if rest ~= "" then
+		local fr = rest:match("^%.(%d*)")
+		if not fr or (#fr < 6 and #rest > #fr + 1) then
+			return nil
+		end
+		ip = (ip ~= "" and ip or "0") .. "." .. fr
+	end
+	local v = tonumber(ip ~= "" and ip or "0")
+	return sign == "-" and -v or v
+end
+-- The rest of a UTF-8 sequence whose lead byte `c` was just read (-n/-N count chars)
+local function mb_rest(st, c)
+	local b = c:byte()
+	local more = (b >= 0xF0 and 3) or (b >= 0xE0 and 2) or 1
+	local ch = { c }
+	for _ = 1, more do
+		local d = getc(st)
+		if d == nil then
+			break
+		end
+		ch[#ch + 1] = d
+	end
+	return table.concat(ch)
+end
+-- -n / -N / -u take a legal_number that fits an int
+local function int_arg(v)
+	local n = v and rt.legal_number(v)
+	if n and n >= 0 and n <= 2147483647 then
+		return n
+	end
+end
 local function unread(st) -- give back what a chunked read took past the line
 	local chunk, ci = st.chunk, st.ci
 	if chunk and ci <= #chunk then
@@ -132,9 +167,9 @@ return function(sh, cmd, args, hook, tcb)
 					elseif f == "n" or f == "N" then -- char count; a non-numeric arg is an error (not a hang)
 						local v
 						v, k, advance = takearg(a, k, args, j, advance)
-						nchars = v and v:match("^%s*[+-]?%d+%s*$") and tonumber(v) or nil
-						if not nchars or nchars < 0 then -- (bash: legal_number, and not negative)
-							io.stderr:write("curse: read: " .. tostring(v) .. ": invalid number\n")
+						nchars = int_arg(v)
+						if not nchars then -- (bash: legal_number, not negative, an int; sh_invalidnum)
+							io.stderr:write("curse: read: " .. tostring(v) .. ": " .. rt.invalidnum_msg(v or "") .. "\n")
 							sh.status = 1
 							return
 						end
@@ -146,14 +181,14 @@ return function(sh, cmd, args, hook, tcb)
 					elseif f == "u" then
 						local v
 						v, k, advance = takearg(a, k, args, j, advance)
-						ufd = v:match("^%s*[+-]?%d+%s*$") and tonumber(v)
-						if not ufd or ufd < 0 then
+						ufd = int_arg(v)
+						if not ufd then
 							io.stderr:write("curse: read: " .. v .. ": invalid file descriptor specification\n")
 							sh.status = 1
 							return
 						end
 						if C.fcntl(ufd, 1) < 0 then -- F_GETFD: not open
-							io.stderr:write("curse: read: " .. v .. ": invalid file descriptor: Bad file descriptor\n")
+							io.stderr:write("curse: read: " .. ufd .. ": invalid file descriptor: Bad file descriptor\n")
 							sh.status = 1
 							return
 						end
@@ -164,7 +199,14 @@ return function(sh, cmd, args, hook, tcb)
 						local _
 						_, k, advance = takearg(a, k, args, j, advance) -- prompt: consume + ignore (non-interactive)
 					elseif f == "t" then
-						tmout, k, advance = takearg(a, k, args, j, advance) -- timeout (only -t 0 is honored below)
+						local v
+						v, k, advance = takearg(a, k, args, j, advance)
+						tmout = uconvert(v)
+						if not tmout or tmout < 0 then
+							io.stderr:write("curse: read: " .. v .. ": invalid timeout specification\n")
+							sh.status = 1
+							return
+						end
 					elseif f == "s" or f == "e" then -- (no echo / readline: no terminal editing here)
 						k = k + 1
 					else
@@ -178,27 +220,28 @@ return function(sh, cmd, args, hook, tcb)
 		end
 		-- `read -t 0`: don't read anything — just report whether input is available
 		-- on the fd (bash: status 0 if a read wouldn't block, non-zero otherwise).
-		if tmout and tonumber(tmout) == 0 then
+		if tmout == 0 then
 			sh.status = fd_ready(ufd) and 0 or 1
+			return
+		end
+		-- the first name is checked before any input is read (bash): nothing is consumed
+		local v1 = args[j]
+		if v1 ~= nil and not v1:match("^[%a_][%w_]*$") and not rt.split_array_ref(v1, sh) then
+			io.stderr:write("curse: read: `" .. v1 .. "': not a valid identifier\n")
+			sh.status = 1
 			return
 		end
 		-- -t SECS (or a positive $TMOUT): give up at the deadline with status 128+ALRM,
 		-- keeping whatever partial input arrived (bash)
 		local deadline
 		if tmout == nil and sh.vars["TMOUT"] then
-			local tm = tonumber(sh:get("TMOUT"))
+			local tm = uconvert(sh:get("TMOUT")) -- (invalid: no timeout)
 			if tm and tm > 0 then
 				tmout = tm
 			end
 		end
-		if tmout ~= nil then
-			local secs = tonumber(tmout)
-			if not secs or secs < 0 or tostring(tmout):match("^%s*0[xX]") then
-				io.stderr:write("curse: read: " .. tostring(tmout) .. ": invalid timeout specification\n")
-				sh.status = 1
-				return
-			end
-			deadline = rt.wall_secs() + secs
+		if tmout then
+			deadline = rt.wall_secs() + tmout
 		end
 		-- (no deadline) a regular file: chunked reads; a pipe: peeked for the line end
 		local st = { ufd = ufd, chunk = nil, ci = 1, avail = 0, deadline = deadline, timed_out = false, rerr = nil, pc = nil }
@@ -216,12 +259,19 @@ return function(sh, cmd, args, hook, tcb)
 		for k = j, #args do
 			vars[#vars + 1] = args[k]
 		end
-		local line, had_nl = nil, true
+		local line, had_nl, got_zero = nil, true, nil
 		-- Read from `ufd` one byte at a time (never over-reading past the terminator),
 		-- honoring -r (backslash escaping), -d DELIM, and -n/-N char counts. `dch` is
 		-- the record delimiter: the line terminator (\n) unless -d overrode it; -N
 		-- ignores the delimiter entirely.
 		local dch = delim == nil and "\n" or (delim == "" and "\0" or delim:sub(1, 1))
+		-- an IFS containing CTLESC (\1): bash then marks nothing (skip_ctlesc) — an escaped
+		-- char is plain (splittable) input, and a \1 byte is just an IFS character
+		local ifs = rt.ifs(sh) or " \t\n"
+		local nomark = not ndelim and ifs:find("\1", 1, true) ~= nil
+		if nchars == 0 then -- `-n 0`: a zero-byte read, which can still fail (bash)
+			got_zero = C.read(ufd, rdbuf, 0) >= 0
+		end
 		do
 			local buf, got = {}, false
 			while true do
@@ -293,7 +343,7 @@ return function(sh, cmd, args, hook, tcb)
 				end
 				if not bulk then
 				if nchars and #buf >= nchars then
-					had_nl = true
+					had_nl = got_zero ~= false
 					break
 				end -- -n/-N char limit reached
 				local c = getc(st)
@@ -312,38 +362,28 @@ return function(sh, cmd, args, hook, tcb)
 					-- \<newline> is a line continuation (splice); other \x escapes the char
 					-- (marked with \1 so IFS splitting treats it as literal, bash's CTLESC).
 					local d = getc(st)
-					if d == nil then
-						if not st.timed_out then
-							buf[#buf + 1] = "\\"
-						end
+					if d == nil then -- (a backslash at EOF is dropped: bash's dequoted CTLESC)
 						had_nl = false
 						break
 					end
 					if d == "\n" then -- swallow both (continuation), unless -N counts raw
 					else
-						buf[#buf + 1] = "\1" .. d
+						if nchars and d:byte() >= 0xC0 and rt.lc_mb_cur_max() > 1 then
+							d = mb_rest(st, d) -- (an escaped multibyte char is one char)
+						end
+						buf[#buf + 1] = nomark and d or "\1" .. d
 					end
 				elseif not ndelim and c == dch then
 					had_nl = true
 					break -- -N ignores the delimiter
 				elseif c == "\0" then -- bash strips NUL bytes from read input (keeps the rest)
-				elseif c == "\1" then
+				elseif c == "\1" and not nomark then
 					buf[#buf + 1] = "\1\1" -- DOUBLE a real CTLESC byte so it
 					-- survives the \1-marker unescape below
 				elseif nchars and c:byte() >= 0xC0 and rt.lc_mb_cur_max() > 1 then
 					-- -n/-N count CHARACTERS in a multibyte locale: take the rest of a UTF-8
 					-- sequence along with its lead byte (one buf entry = one character)
-					local b = c:byte()
-					local more = (b >= 0xF0 and 3) or (b >= 0xE0 and 2) or 1
-					local ch = { c }
-					for _ = 1, more do
-						local d = getc(st)
-						if d == nil then
-							break
-						end
-						ch[#ch + 1] = d
-					end
-					buf[#buf + 1] = table.concat(ch)
+					buf[#buf + 1] = mb_rest(st, c)
 				else
 					buf[#buf + 1] = c
 				end
@@ -355,7 +395,6 @@ return function(sh, cmd, args, hook, tcb)
 		do
 			-- EOF with nothing read still assigns (empty values) and returns 1 (bash)
 			line = line or ""
-			local ifs = (rt.ifs(sh) or " \t\n")
 			local aref = arr and (not arr:match("^[%a_][%w_]*$") and arr
 				or sh.vars[arr] and sh.vars[arr].ref and sh:deref_elem(arr))
 			if aref then -- (-a through a nameref to an ELEMENT: not an array name — bash)
@@ -365,12 +404,18 @@ return function(sh, cmd, args, hook, tcb)
 			elseif arr and rt.ro_refuse(sh, arr) then
 				sh.status = 1
 				return
+			elseif arr and sh:is_assoc(arr) then
+				io.stderr:write("curse: read: " .. arr .. ": not an indexed array\n")
+				sh.status = 1
+				return
 			elseif arr then
-				sh:array_assign(arr, rt.ifs_split(ifs, line), false)
+				sh:array_assign(arr, rt.ifs_split(ifs, line, nomark), false)
 			elseif ndelim then -- -N: no IFS processing; first var gets everything, rest empty
 				local plain = line:gsub("\1(.)", "%1") -- \1x -> x (unescape); \1\1 -> \1 (literal CTLESC)
 				if #vars == 0 then
-					sh:set_str("REPLY", plain)
+					if not rt.assign_ref(sh, "read", "REPLY", plain) then
+						return
+					end
 				else
 					for k = 1, #vars do
 						if not rt.assign_ref(sh, "read", vars[k], k == 1 and plain or "") then
@@ -378,10 +423,12 @@ return function(sh, cmd, args, hook, tcb)
 						end
 					end
 				end
-			elseif #vars == 0 then
-				sh:set_str("REPLY", (line:gsub("\1(.)", "%1"))) -- REPLY: raw line, unescape CTLESC markers
+			elseif #vars == 0 then -- REPLY: the raw line, CTLESC markers unescaped
+				if not rt.assign_ref(sh, "read", "REPLY", nomark and line or (line:gsub("\1(.)", "%1"))) then
+					return
+				end
 			else
-				local fields = read_split(ifs, line, #vars)
+				local fields = read_split(ifs, line, #vars, nomark)
 				for k = 1, #vars do -- (the first refused name ends it, status 1 — bash)
 					if not rt.assign_ref(sh, "read", vars[k], fields[k] or "") then
 						return
