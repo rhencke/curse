@@ -16,52 +16,66 @@ local array_key, sh_printf, fd_getc, fd_ready, read_split =
 local do_arrayassign, eval, fmt_decl, fmt_set_var = I.do_arrayassign, I.eval, I.fmt_decl, I.fmt_set_var
 local C, P = I.C, I.P
 
+-- bash's bind_variable from getopts (getopts.def): honors the target's attributes (an
+-- integer evaluates, an array gets element 0, a nameref writes through); a readonly one
+-- is reported. getopts_bind_variable (NAME) takes only a plain identifier: 0 / 1 / 2.
+local function bind_name(sh, name, value)
+	if not name:match("^[%a_][%w_]*$") then
+		io.stderr:write("curse: getopts: `" .. name .. "': not a valid identifier\n")
+		return 1
+	end
+	return rt.assign_ref(sh, "getopts", name, value) and 0 or 2
+end
+local function bind_optarg(sh, value) -- value nil: OPTARG declared with no value (bash: NULL)
+	if value ~= nil then -- (a refused OPTARG is only reported: getopts' status is NAME's)
+		local st = sh.status
+		rt.assign_ref(sh, "getopts", "OPTARG", value)
+		sh.status = st
+		return
+	end
+	local dn = sh:deref("OPTARG")
+	local b = sh.vars[dn]
+	if b and b.ro then
+		io.stderr:write("curse: " .. dn .. ": readonly variable\n")
+	elseif b and not b.arr then
+		b.s, b.n = nil, nil
+	elseif not b then
+		sh.vars[dn] = {}
+	end
+end
+local function unbind_optarg(sh) -- (bash's unbind_variable_noref: OPTARG itself goes)
+	sh.vars.OPTARG = nil
+end
+
 return function(sh, cmd, args, hook, tcb)
 	if cmd == "getopts" then
-		-- getopts OPTSTRING NAME [args…]: parse one option per call using OPTIND (+ an
-		-- internal char cursor for bundled opts); sets NAME, OPTARG; status 1 when done.
-		-- getopts optstring name [arg …]: too few args, or an option to getopts itself
-		-- (`getopts -a …`), is a usage error — status 2 (bash)
-		if args[2] and args[2]:match("^%-.") and args[2] ~= "--" then
+		-- getopts OPTSTRING NAME [args…] (bash's getopts.def + sh_getopt): one option per call.
+		-- An option to getopts itself is a usage error (status 2); `--` ends them.
+		local a0 = 2
+		if args[2] == "--" then
+			a0 = 3
+		elseif args[2] and args[2]:match("^%-.") then
 			io.stderr:write("curse: getopts: " .. args[2]:sub(1, 2) .. ": invalid option\n")
 			io.stderr:write("getopts: usage: getopts optstring name [arg ...]\n")
 			sh.status = 2
 			return
 		end
-		if #args < 3 then
+		if #args < a0 + 1 then
 			io.stderr:write("getopts: usage: getopts optstring name [arg ...]\n")
 			sh.status = 2
 			return
 		end
-		local spec, vname = args[2] or "", args[3] or "?"
-		-- OPTARG writes honor readonly (directly or through a nameref): bash reports it,
-		-- leaves OPTARG alone, and the call fails with NAME set to `?`
-		local optarg_ro = false
-		local function optarg_set(v)
-			if v == nil then -- (bash's unbind_variable_noref: OPTARG itself goes, readonly or
-				sh.vars.OPTARG = nil -- a nameref, silently)
-				return
-			end
-			local b = sh.vars[sh:deref("OPTARG")]
-			if b and b.ro then
-				if not optarg_ro then
-					io.stderr:write("curse: " .. sh:deref("OPTARG") .. ": readonly variable\n")
-				end
-				optarg_ro = true
-				return
-			end
-			if v == nil then
-				sh.vars[sh:deref("OPTARG")] = nil
-			else
-				sh:set_str("OPTARG", v)
-			end
-		end
+		local spec, vname = args[a0], args[a0 + 1]
+		-- a leading `:` is silent mode (special_error), and is stripped once: the rest is
+		-- sh_getopt's optstring (so in `::a:` a missing argument returns `:` — a success)
 		local silent = spec:sub(1, 1) == ":"
+		local optstr = silent and spec:sub(2) or spec
 		local src_get, src_n
-		if #args >= 4 then
-			src_n = #args - 3
+		if #args >= a0 + 2 then
+			local base = a0 + 1
+			src_n = #args - base
 			src_get = function(k)
-				return args[k + 3]
+				return args[k + base]
 			end
 		else
 			src_n = sh.nparams
@@ -69,11 +83,19 @@ return function(sh, cmd, args, hook, tcb)
 				return sh.params[k]
 			end
 		end
-		local optind = math.max(1, math.floor(tonumber(sh:get("OPTIND")) or 1))
-		-- The in-argument position belongs to THIS OPTIND box: a local OPTIND starts fresh
-		-- and the caller's resumes on return; any assignment to OPTIND resets it (bash).
+		-- The scan position (sh_optind + the in-word cursor) belongs to THIS OPTIND box: a
+		-- local OPTIND starts fresh and the caller's resumes on return; assigning OPTIND
+		-- resets it (bash's sv_optind). Else it continues where it was, even when OPTIND
+		-- couldn't be written (readonly).
 		local ob = sh.vars[sh:deref("OPTIND")]
-		local cur = (sh.getopts_state and ob and sh.getopts_state[ob]) or 1
+		local stt = sh.getopts_state and ob and sh.getopts_state[ob]
+		local optind, cur
+		if stt then
+			optind, cur = stt.optind, stt.cur
+		else
+			optind = math.max(1, math.floor(tonumber(sh:get("OPTIND")) or 1))
+			cur = 1
+		end
 		-- A leftover OPTIND pointing past a now-shorter argument list (e.g. after a
 		-- fresh `set --`) is exhausted: bash returns EOF and clamps OPTIND to
 		-- nargs+1 (getopt.c: `sh_optind >= argc` -> `sh_optind = argc`, argc =
@@ -82,97 +104,101 @@ return function(sh, cmd, args, hook, tcb)
 			optind = src_n + 1
 			cur = 1
 		end
-		local res
+		-- (sh_getopt: `$0: illegal option -- h`, no line number; OPTERR=0 or silent mode
+		-- silences it — bash's sh_opterr, atoi($OPTERR))
+		local oe = sh.vars.OPTERR and sh:get("OPTERR") or ""
+		local quiet = silent or (oe ~= "" and (tonumber(oe:match("^%s*([+-]?%d+)") or "0") or 0) == 0)
+		local res -- { kind = "eof" | "invalid" | "missing" | "ok", opt, arg }
 		while not res do
 			local word = optind <= src_n and src_get(optind) or nil
 			if not word or word == "-" or word:sub(1, 1) ~= "-" then
-				res = { done = true }
+				res = { kind = "eof" }
 			elseif word == "--" then
 				optind = optind + 1
-				res = { done = true }
+				res = { kind = "eof" }
 			else
 				local oc = word:sub(1 + cur, 1 + cur)
 				if oc == "" then
 					optind = optind + 1
 					cur = 1
 				else
-					local pos = spec:find(oc, 1, true)
+					local pos = optstr:find(oc, 1, true)
 					if not pos or oc == ":" then
 						cur = cur + 1
 						if 1 + cur > #word then
 							optind = optind + 1
 							cur = 1
 						end
-						res =
-							{ opt = "?", arg = silent and oc or nil, err = not silent and ("illegal option -- " .. oc) }
-					elseif spec:sub(pos + 1, pos + 1) == ":" then -- takes an argument
+						if not quiet then
+							io.stderr:write((sh.argv0 or "curse") .. ": illegal option -- " .. oc .. "\n")
+						end
+						res = { kind = "invalid", opt = oc }
+					elseif optstr:sub(pos + 1, pos + 1) == ":" then -- takes an argument
 						local rest = word:sub(2 + cur)
 						if rest ~= "" then
-							optarg_set(rest)
-							optind = optind + 1
-							cur = 1
-							res = { opt = oc }
+							optind, cur = optind + 1, 1
+							res = { kind = "ok", opt = oc, arg = rest }
+						elseif (optind + 1) <= src_n then
+							res = { kind = "ok", opt = oc, arg = src_get(optind + 1) }
+							optind, cur = optind + 2, 1
 						else
-							local a = (optind + 1) <= src_n and src_get(optind + 1) or nil
-							if a then
-								optarg_set(a)
-								optind = optind + 2
-								cur = 1
-								res = { opt = oc }
-							else
-								optind = optind + 1
-								cur = 1
-								res = silent and { opt = ":", arg = oc }
-									or { opt = "?", err = "option requires an argument -- " .. oc }
+							optind, cur = optind + 1, 1
+							if not quiet then
+								io.stderr:write((sh.argv0 or "curse") .. ": option requires an argument -- " .. oc .. "\n")
 							end
+							-- (an optstring still starting with `:` makes sh_getopt return `:`: a
+							-- plain success with an empty OPTARG)
+							res = optstr:sub(1, 1) == ":" and { kind = "ok", opt = ":", arg = "" }
+								or { kind = "missing", opt = oc }
 						end
-					else -- flag, no argument
+					else -- flag, no argument: OPTARG is left declared with no value
 						cur = cur + 1
 						if 1 + cur > #word then
-							optind = optind + 1
-							cur = 1
+							optind, cur = optind + 1, 1
 						end
-						res = { opt = oc, clr = true } -- a no-arg option UNSETS OPTARG (bash)
+						res = { kind = "ok", opt = oc }
 					end
 				end
 			end
 		end
-		sh:set_str("OPTIND", tostring(optind)) -- (resets the position: record it after)
-		sh.getopts_state = sh.getopts_state or setmetatable({}, { __mode = "k" })
-		sh.getopts_state[sh.vars[sh:deref("OPTIND")]] = cur ~= 1 and cur or nil
-		local valid = vname:match("^[%a_][%w_]*$") -- an invalid NAME -> status 1, var not set
-		if not valid then
-			io.stderr:write("curse: getopts: `" .. vname .. "': not a valid identifier\n")
-		end
-		if res.done then
-			if valid then
-				sh:set_str(vname, "?")
-			end
-			sh.getopts_state[sh.vars[sh:deref("OPTIND")]] = nil
-			optarg_set(nil)
-			sh.status = 1 -- end of options: OPTARG unset
+		-- OPTIND is written every call (bash: to handle `--` skipping); readonly -> reported
+		local obn = sh:deref("OPTIND")
+		local ob2 = sh.vars[obn]
+		if ob2 and ob2.ro then
+			io.stderr:write("curse: " .. obn .. ": readonly variable\n")
 		else
-			if res.arg ~= nil then
-				optarg_set(res.arg)
-			elseif res.err or res.clr then
-				optarg_set(nil)
+			rt.assign_ref(sh, "getopts", "OPTIND", tostring(optind)) -- (resets the state: set after)
+		end
+		sh.getopts_state = sh.getopts_state or setmetatable({}, { __mode = "k" })
+		local box = sh.vars[sh:deref("OPTIND")]
+		if box then
+			sh.getopts_state[box] = res.kind ~= "eof" and { optind = optind, cur = cur } or nil
+		end
+		local k = res.kind
+		if k == "eof" then
+			unbind_optarg(sh)
+			bind_name(sh, vname, "?")
+			sh.status = 1
+		elseif k == "invalid" then
+			sh.status = bind_name(sh, vname, "?")
+			if silent then
+				bind_optarg(sh, res.opt)
+			else
+				unbind_optarg(sh)
 			end
-			-- (bash's sh_getopt: `$0: illegal option -- h`, no line number; OPTERR=0 silences it)
-			local oe = sh.vars.OPTERR and sh:get("OPTERR") or "" -- (bash: atoi($OPTERR), unset/empty = 1)
-			local quiet = oe ~= "" and (tonumber(oe:match("^%s*([+-]?%d+)") or "0") or 0) == 0
-			if res.err and not quiet then
-				io.stderr:write((sh.argv0 or "curse") .. ": " .. res.err .. "\n")
+		elseif k == "missing" then
+			if silent then
+				sh.status = bind_name(sh, vname, ":")
+				bind_optarg(sh, res.opt)
+			else
+				sh.status = bind_name(sh, vname, "?")
+				unbind_optarg(sh)
 			end
-			if valid and rt.ro_refuse(sh, vname) then
-				sh.status = 2
-				return
-			end
-			if valid then
-				rt.assign_ctx = "getopts"
-				sh:set_str(vname, optarg_ro and "?" or res.opt)
-				rt.assign_ctx = nil
-			end
-			sh.status = valid and 0 or 1
+		else
+			bind_optarg(sh, res.arg)
+			rt.assign_ctx = "getopts"
+			sh.status = bind_name(sh, vname, res.opt)
+			rt.assign_ctx = nil
 		end
 	end
 end

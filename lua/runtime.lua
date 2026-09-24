@@ -245,9 +245,10 @@ function Shell.new()
 		sh.vars[kv[1]] = { s = tostring(tonumber(kv[2])), ro = true, int = true }
 	end
 	M.reset_locale(sh) -- adopt $LANG/$LC_* (bash calls setlocale at startup)
-	if sh.vars["OPTIND"] == nil then
-		sh:set_str("OPTIND", "1")
-	end -- bash: OPTIND starts at 1
+	-- bash (variables.c): OPTIND=1, an integer, and OPTERR=1 — whatever the environment said
+	sh:set_str("OPTIND", "1")
+	sh.vars.OPTIND.int = true
+	sh:set_str("OPTERR", "1")
 	if sh.vars["HOSTNAME"] == nil then
 		sh:set_str("HOSTNAME", M.hostname())
 	end
