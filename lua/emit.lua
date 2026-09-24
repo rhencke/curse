@@ -1475,7 +1475,7 @@ local function emit_fragment(stmts, neg, liftset, cfraise)
 		return nil
 	end
 	emit_frag_n = emit_frag_n + 1
-	emit_frags[#emit_frags + 1] = assemble(cfg, ("cs_%d = function(sh)"):format(emit_frag_n), { runlocals = ownlocals })
+	emit_frags[#emit_frags + 1] = assemble(cfg, ("__CS[%d] = function(sh)"):format(emit_frag_n), { runlocals = ownlocals })
 	return emit_frag_n
 end
 
@@ -1656,10 +1656,10 @@ function compile_cmdsub_inner(src, backtick, lifted, aenv, noalias, posix)
 	local forked = fallback
 	if isolated then
 		call = (EF.lifted_names and #EF.lifted_names > 0)
-				and ("__iso_cmdsub(sh, cs_%d, %s)"):format(id, bt)
-			or ("sh:capture_compiled_iso(cs_%d, %s)"):format(id, bt)
+				and ("__iso_cmdsub(sh, __CS[%d], %s)"):format(id, bt)
+			or ("sh:capture_compiled_iso(__CS[%d], %s)"):format(id, bt)
 	elseif cmdsub_nofork_ok(ast.stmts) then
-		call = ("sh:capture_compiled(cs_%d, false, %s)"):format(id, bt)
+		call = ("sh:capture_compiled(__CS[%d], false, %s)"):format(id, bt)
 	else
 		call = forked
 	end
@@ -5836,10 +5836,10 @@ H.subshell = function(cx, st, after)
 				swpost = ("; %s = %s"):format(vlist, table.concat(sav, ", "))
 			end
 			if sub_redir then
-				cx.blocks[p] = ("%slocal __rs = {}; if %s then sh:subshell_run(cs_%d, __rs) else rt.redir_restore(__rs); sh.status = 1 end%s%s; pc = %d"):format(
+				cx.blocks[p] = ("%slocal __rs = {}; if %s then sh:subshell_run(__CS[%d], __rs) else rt.redir_restore(__rs); sh.status = 1 end%s%s; pc = %d"):format(
 					swpre, sub_redir, id, swpost, ecs, after)
 			else
-				cx.blocks[p] = ("%ssh:subshell_run(cs_%d)%s%s; pc = %d"):format(swpre, id, swpost, ecs, after)
+				cx.blocks[p] = ("%ssh:subshell_run(__CS[%d])%s%s; pc = %d"):format(swpre, id, swpost, ecs, after)
 			end
 			if not EF.has_dyncode then
 				return p
@@ -5897,7 +5897,7 @@ H.pipeline = function(cx, st, after)
 		if not id then
 			return cx.delegate(st, after)
 		end
-		frags[i] = "cs_" .. id
+		frags[i] = "__CS[" .. id .. "]"
 	end
 	local reload = {} -- run-local lifted vars only: stages keep those in sh (a lastpipe
 	-- stage writes the shell's own); upvalues are swapped/restored by the scheduler
@@ -6019,7 +6019,7 @@ H.background = function(cx, st, after)
 			end
 		end
 	end
-	local fork = ("sh:run_background(cs_%d, %q, %s, %s, %s)"):format(id, cmdstr, ext and "true" or "false",
+	local fork = ("sh:run_background(__CS[%d], %q, %s, %s, %s)"):format(id, cmdstr, ext and "true" or "false",
 		st.cmd.t == "subshell" and "true" or "false", st.cmd.t == "simple" and "true" or "false")
 	local body = fork
 	if spawn then
@@ -6602,7 +6602,7 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
 		local sl = EF.cur_line
 		EF.cur_line = st.top and st.redirs[1].line or cx.prev_line or sl
 		local p = cx.delegate(st, after, {
-			callee = "cs_" .. id,
+			callee = "__CS[" .. id .. "]",
 			callargs = "sh",
 			redir = conds,
 			upv_keep = true,
@@ -7032,6 +7032,7 @@ assemble = function(cfg, sig, opts)
 	o[#o + 1] = "end"
 	-- pc -> source line, for error-message prefixes (read only on the error path)
 	local fname = sig:match("^local function ([%w_]+)") or sig:match("^([%w_]+) = function")
+		or sig:match("^(__CS%[%d+%]) = function")
 	if fname and cfg.pcline then
 		local lt = {}
 		for p = 0, cfg.npc - 1 do
@@ -7479,11 +7480,12 @@ function M.emit(ast, opts)
 		end -- declare -F under extdebug
 	end
 	local top = build_cfg(ast.stmts, lifted, funcflags, inlinefns, true)
-	-- Every compiled `$(…)` fragment is now registered (from fn_x bodies + the top level).
-	-- Forward-declare each cs_N alongside the fn_x names so run/fn_x/nested fragments can
-	-- close over them, then emit the fn_x and fragment definitions (order-independent).
-	for i = 1, emit_frag_n do
-		decls[#decls + 1] = "cs_" .. i
+	-- Every compiled `$(…)` / subshell fragment is now registered (from fn_x bodies + the
+	-- top level). They live in ONE table __CS (a function referencing many fragments costs
+	-- a single upvalue — LuaJIT caps a function at 60; one local per fragment hit it), so
+	-- run/fn_x/nested fragments share it; then the fn_x and fragment definitions follow.
+	if emit_frag_n > 0 then
+		o[#o + 1] = "local __CS = {}"
 	end
 	if #decls > 0 then
 		o[#o + 1] = "local " .. table.concat(decls, ", ")
