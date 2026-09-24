@@ -19,128 +19,75 @@ local C, P = I.C, I.P
 
 return function(sh, cmd, args, hook, tcb)
 	if cmd == "type" then
-		-- type [-t|-p|-P] NAME…  (-t type word; -p path-if-file; -P force PATH search)
-		local tflag, pflag, Pflag, fflag, aflag, j0 = false, false, false, false, false, 2
-		while args[j0] and args[j0]:sub(1, 1) == "-" and #args[j0] > 1 do
-			local f = args[j0]
-			if f == "--" then
-				j0 = j0 + 1
+		-- type [-afptP] NAME… (bash's type.def): -t the kind, -p a file's path, -P a forced
+		-- $PATH search, -a every location, -f no functions; the last of -t/-p/-P decides the
+		-- output. The obsolete -type/--type, -path/--path, -all/--all are rewritten first —
+		-- over the whole leading run of dash words, so `type -- -type` asks for `-t`.
+		local words = {}
+		for k = 2, #args do
+			words[#words + 1] = args[k]
+		end
+		for k = 1, #words do
+			local w = words[k]
+			if w:sub(1, 1) ~= "-" then
 				break
 			end
-			local bad = f:sub(2):match("[^afptP]")
-			if bad then -- an unknown option: usage error, nothing looked up (bash)
-				io.stderr:write("curse: type: -" .. bad .. ": invalid option\n")
-				io.stderr:write("type: usage: type [-afptP] name [name ...]\n")
-				sh.status = 2
-				return
+			local f = w:sub(2)
+			if f == "type" or f == "-type" then
+				words[k] = "-t"
+			elseif f == "path" or f == "-path" then
+				words[k] = "-p"
+			elseif f == "all" or f == "-all" then
+				words[k] = "-a"
 			end
-			if f:find("t") then
-				tflag = true
-			end
-			if f:find("p") then
-				pflag = true
-			end
-			if f:find("P") then
-				Pflag = true
-			end
-			if f:find("f") then
-				fflag = true
-			end -- -f: suppress shell-function lookup
-			if f:find("a") then
-				aflag = true
-			end -- -a: list ALL locations (each PATH file too)
+		end
+		local fl = { short = true }
+		local j0 = 1
+		while words[j0] and words[j0]:sub(1, 1) == "-" and #words[j0] > 1 do
+			local w = words[j0]
 			j0 = j0 + 1
+			if w == "--" then
+				break
+			end
+			for k = 2, #w do
+				local f = w:sub(k, k)
+				if f == "a" then
+					fl.all = true
+				elseif f == "f" then
+					fl.nofunc = true
+				elseif f == "p" then
+					fl.path_only, fl.type, fl.short = true, false, false
+				elseif f == "t" then
+					fl.type, fl.path_only, fl.short = true, false, false
+				elseif f == "P" then
+					fl.path_only, fl.force, fl.type, fl.short = true, true, false, false
+				else -- an unknown option: usage error, nothing looked up (bash)
+					io.stderr:write("curse: type: -" .. f .. ": invalid option\n")
+					io.stderr:write("type: usage: type [-afptP] name [name ...]\n")
+					sh.status = 2
+					return
+				end
+			end
 		end
 		local allok = true
-		for j = j0, #args do
-			local nm = args[j]
-			if Pflag then -- force PATH search (all files with -a, else the first)
-				local ps = find_all_in_path(nm)
-				if #ps == 0 then
-					allok = false
-				elseif aflag then
-					for _, p in ipairs(ps) do
-						sh:echo(p)
-					end
-				else
-					sh:echo(ps[1])
-				end
-			elseif pflag then -- print path(s); status tracks whether the name resolves at all
-				if aflag then
-					for _, p in ipairs(find_all_in_path(nm)) do
-						sh:echo(p)
-					end
-				else
-					local k, p = name_type(sh, nm, fflag)
-					if k == "file" then
-						sh:echo(p)
-					end
-					if not k then
-						allok = false
-					end
-				end
-				if aflag and not name_type(sh, nm, fflag) then
-					allok = false
-				end
-			elseif tflag then
-				local k = name_type(sh, nm, fflag)
-				if k then
-					sh:echo(k)
-				else
-					allok = false
-				end
-			elseif aflag then -- every location, in resolution order
-				local found = false
-				if sh.aliases[nm] and (sh.shopt.expand_aliases or sh.opt_i) then
-					sh:echo(nm .. " is aliased to `" .. sh.aliases[nm] .. "'")
-					found = true
-				end
-				if KEYWORDS[nm] then
-					sh:echo(nm .. " is a shell keyword")
-					found = true
-				end
-				if not fflag and sh.functions[nm] then
-					sh:echo(nm .. " is a function")
-					local d = func_body_text(sh, nm)
-					if d then
-						sh:echo(d)
-					end -- canonical (or verbatim) body
-					found = true
-				end
-				if BUILTINS[nm] then
-					sh:echo(nm .. " is a shell builtin")
-					found = true
-				end
-				for _, p in ipairs(find_all_in_path(nm)) do
-					sh:echo(nm .. " is " .. p)
-					found = true
-				end
-				if not found then
-					allok = false
+		sh.write_err = nil
+		for j = j0, #words do
+			local nm = words[j]
+			if not I.describe(sh, nm, fl) then
+				allok = false
+				if not (fl.path_only or fl.type) then
 					io.stderr:write("curse: type: " .. nm .. ": not found\n")
-				end
-			else -- sentence form
-				local k, p, hashed = name_type(sh, nm, fflag)
-				if not k then
-					allok = false
-					io.stderr:write("curse: type: " .. nm .. ": not found\n")
-				elseif k == "alias" then
-					sh:echo(nm .. " is aliased to `" .. sh.aliases[nm] .. "'")
-				elseif k == "file" then
-					sh:echo(nm .. (hashed and " is hashed (" .. p .. ")" or " is " .. p))
-				elseif k == "function" then
-					sh:echo(nm .. " is a function")
-					local d = func_body_text(sh, nm)
-					if d then
-						sh:echo(d)
-					end -- canonical (or verbatim) body
-				elseif k == "keyword" then
-					sh:echo(nm .. " is a shell keyword")
-				else
-					sh:echo(nm .. " is a shell builtin")
 				end
 			end
 		end
 		sh.status = allok and 0 or 1
+		if sh.out == io.write then -- (sh_chkwrite: a failed write is reported, status 1)
+			if sh.write_err then
+				rt.chkwrite_report(sh, "type", sh.write_errmsg)
+				sh.status = 1
+			elseif not rt.chkwrite(sh, "type") then
+				sh.status = 1
+			end
+		end
 	end
 end

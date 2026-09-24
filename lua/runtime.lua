@@ -5213,7 +5213,48 @@ function M.spawn_errmsg(self, name, execpath, rc)
 	end
 	return pre .. M.err_name(tostring(name)) .. (rc == 2 and (self.exec_builtin and ": not found\n" or ": command not found\n") or ": Permission denied\n")
 end
+-- PATHSTR's elements as bash's extract_colon_unit yields them ("" = the current directory):
+-- a leading `:` and each `::` give one empty element, a trailing `:` one more
+-- (`d1::` is d1 and "", `d1:::` d1, "" and "").
+function M.path_units(s)
+	local out, p, len = {}, 0, #s -- (p: bash's 0-based *p_index)
+	while p < len do
+		local i = p
+		if i > 0 and s:byte(i + 1) == 58 then
+			i = i + 1
+		end
+		local start = i
+		while i < len and s:byte(i + 1) ~= 58 do
+			i = i + 1
+		end
+		p = i
+		if i == start then
+			if i < len then
+				p = p + 1
+			end
+			out[#out + 1] = ""
+		else
+			out[#out + 1] = s:sub(start + 1, i)
+		end
+	end
+	return out
+end
+-- The first executable, non-directory NAME along PATHSTR (no hashing), or nil
+function M.path_find(pathstr, name)
+	for dir in (pathstr .. ":"):gmatch("([^:]*):") do
+		local cd = (dir == "" and "." or dir) .. "/" .. name
+		if ffi.C.access(cd, 1) == 0 and ffi.C.curse_rt_stat(cd, stbuf_a) == 0 -- 1 == X_OK
+			and bit.band(ffi.cast("uint32_t *", stbuf_a + 24)[0], 0xF000) ~= 0x4000 then
+			return cd
+		end
+	end
+end
 function Shell:resolve_cmd(name)
+	local pl = self.path_lookup
+	if pl then -- (`command -p`: the standard path for this ONE lookup — no hashing, no $PATH change)
+		self.path_lookup = nil
+		return M.path_find(pl, name)
+	end
 	local curpath = self:get("PATH")
 	if self.hashpath and self.hashpath ~= curpath then
 		self.hashcache = {}
@@ -10313,7 +10354,10 @@ function M.source(sh, argv, line)
 	end
 	local code = f:read("*a")
 	f:close()
-	local mod = not M.source_empty(code) and require("tier").try_fragment(code)
+	-- (a DEBUG trap that reaches into the file — functrace — needs per-command hooks the
+	-- file's own compile doesn't have: the interpreter runs it then)
+	local dbg_in = sh.opt_functrace and sh.traps and sh.traps.DEBUG and sh.traps.DEBUG ~= ""
+	local mod = not dbg_in and not M.source_empty(code) and require("tier").try_fragment(code)
 	if not mod then -- alias / syntax error / uncompilable / empty: b_source runs the text it was handed
 		-- (never re-opening the file — a FIFO or /dev/stdin can only be read once)
 		sh.source_preread = { file = file, code = code }

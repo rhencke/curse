@@ -6297,6 +6297,13 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
 		local p = cx.newpc()
 		local prelude = opts and opts.prelude
 		local callee = (opts and opts.callee) or "I.exec_stmt"
+		if callee ~= "I.exec_stmt" and st.t == "simple" then -- (a native callee — rt.eval,
+			-- rt.source, …: DEBUG fires before it, as the interpreter's exec_stmt would)
+			local d = dbg(st)
+			if d ~= "" then
+				prelude = d .. (prelude or "")
+			end
+		end
 		local callargs = (opts and opts.callargs) or ("sh, %s, __noop"):format(ser(st))
 		local sync_in, sync_out = {}, {}
 		for n in spairs(cx.lifted) do

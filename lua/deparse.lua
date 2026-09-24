@@ -535,8 +535,9 @@ make = function(p, c)
 			cprintf(p, " ")
 		end
 		cprintf(p, "}")
-	elseif k == "coproc" then -- (print_cmd.c: the command follows unindented)
-		cprintf(p, "coproc " .. c.name .. " ")
+	elseif k == "coproc" then -- (print_cmd.c: the command follows unindented; bash 5.2.37 names
+		-- only a compound one — a simple command's coproc is always the default COPROC)
+		cprintf(p, c.body and c.body.k == "simple" and "coproc " or ("coproc " .. c.name .. " "))
 		p.skip = p.skip + 1
 		make(p, c.body)
 	elseif k == "subshell" then

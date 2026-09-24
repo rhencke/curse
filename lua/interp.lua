@@ -4373,6 +4373,144 @@ M.xtrace_write = function(sh, s)
 	io.stderr:write(s)
 end
 
+-- bash's describe_command (type.def), for `type` and `command -v/-V`. FL: all, short (the
+-- sentence), reuse (command -v), type (-t), path_only (-p), force (-P), nofunc (-f),
+-- abspath (command -V: a relative hit made absolute), stdpath (command -p). Order: alias,
+-- keyword, function, builtin, then a file — an absolute name, the hash table, $PATH (an
+-- empty element is the current directory). Returns whether anything was found.
+local function d_execable(p) -- (file_status FS_EXECABLE: +x and not a directory)
+	return C.access(p, 1) == 0 and not file_test("-d", p)
+end
+local function d_path(pathstr, name, exec_only, all) -- FS_EXEC_PREFERRED / FS_EXEC_ONLY
+	local hits, fallback = {}, nil
+	for _, dir in ipairs(rt.path_units(pathstr)) do
+		local p = (dir == "" and "." or dir) .. "/" .. name
+		if d_execable(p) then
+			hits[#hits + 1] = p
+			if not all then
+				return hits
+			end
+		elseif not exec_only and not fallback and C.access(p, 0) == 0 and not file_test("-d", p) then
+			fallback = p
+		end
+	end
+	if #hits == 0 and fallback then
+		hits[1] = fallback
+	end
+	return hits
+end
+local function describe(sh, nm, fl)
+	local found = false
+	local function say(typeword, sentence, reusable)
+		if fl.type then
+			sh:echo(typeword)
+		elseif fl.short then
+			sh:echo(sentence)
+		elseif reusable and (fl.reuse or (fl.path_only and typeword == "file")) then
+			sh:echo(reusable)
+		end
+	end
+	if not fl.force then
+		local av = sh.aliases[nm]
+		if av and (sh.shopt.expand_aliases or sh.opt_i) then
+			say("alias", nm .. " is aliased to `" .. av .. "'",
+				"alias " .. nm .. "=" .. (av == "'" and "\\'" or "'" .. av:gsub("'", "'\\''") .. "'"))
+			if not fl.all then
+				return true
+			end
+			found = true
+		end
+		if KEYWORDS[nm] then
+			say("keyword", nm .. " is a shell keyword", nm)
+			if not fl.all then
+				return true
+			end
+			found = true
+		end
+		if not fl.nofunc and sh.functions[nm] then
+			if fl.short then
+				sh:echo(nm .. " is a function")
+				local d = func_body_text(sh, nm)
+				if d then
+					sh:echo(d)
+				end -- canonical (or verbatim) body
+			else
+				say("function", nil, nm)
+			end
+			if not fl.all then
+				return true
+			end
+			found = true
+		end
+		if BUILTINS[nm] and not (sh.disabled_builtins and sh.disabled_builtins[nm]) then
+			say("builtin", nm .. ((sh.opt_posix and SPECIAL_BUILTIN[nm]) and " is a special shell builtin"
+				or " is a shell builtin"), nm)
+			if not fl.all then
+				return true
+			end
+			found = true
+		end
+	end
+	if nm:find("/", 1, true) and d_execable(nm) then -- (an absolute program: no hash, no $PATH)
+		say("file", nm .. " is " .. nm, nm)
+		return true
+	end
+	if not fl.all or fl.force then -- the hash table (bash's phash_search: a relative entry as ./…)
+		local hc = not nm:find("/", 1, true) and sh.hashcache and sh.hashcache[nm]
+		if hc and sh.hashpath == sh:get("PATH") then
+			hc.hits = hc.hits + 1
+			local p = hc.path
+			if p:sub(1, 1) ~= "/" and p:sub(1, 2) ~= "./" and d_execable("./" .. p) then
+				p = "./" .. p
+			end
+			say("file", nm .. " is hashed (" .. p .. ")", p)
+			return true
+		end
+	end
+	local hits
+	if fl.stdpath then
+		hits = d_path(std_path(), nm, false, false)
+	else
+		hits = d_path(sh:get("PATH"), nm, fl.all, fl.all)
+	end
+	for _, p in ipairs(hits) do
+		if p == nm or sh.opt_posix then -- (posix: only executables; relative made absolute)
+			if not d_execable(p) then
+				if not fl.all then
+					break
+				end
+				p = nil
+			elseif p:sub(1, 1) ~= "/" and (fl.reuse or fl.path_only or fl.short) then
+				p = sh:pwd():gsub("/$", "") .. "/" .. (fl.abspath and p:gsub("^%./", "") or p)
+			end
+		elseif fl.abspath and p:sub(1, 1) ~= "/" then
+			p = sh:pwd():gsub("/$", "") .. "/" .. p:gsub("^%./", "")
+		end
+		if p then
+			found = true
+			say("file", nm .. " is " .. p, p)
+			if not fl.all then
+				break
+			end
+		end
+	end
+	return found
+end
+-- `command -v/-V NAME…` (command.def): -v reusable, -V the sentence with absolute paths
+-- (and "not found"); -p the standard path. Status 0 if any name resolved (or none given).
+local function command_describe(sh, args, j, verbose, usep)
+	local anyfound = false
+	local fl = { reuse = not verbose, short = verbose, abspath = verbose, stdpath = usep }
+	for k = j, #args do
+		if describe(sh, args[k], fl) then
+			anyfound = true
+		elseif verbose then
+			io.stderr:write("curse: command: " .. args[k] .. ": not found\n")
+		end
+	end
+	sh.status = (anyfound or not args[j]) and 0 or 1
+	sh.write_err = nil -- (command.def has no sh_chkwrite: a failed write doesn't change $?)
+end
 local function exec_simple(sh, args, hook, no_func)
 	local cmd = args[1]
 	-- Consume any pending tempenv-call marker (set by exec_stmt for `x=v cmd`): only
@@ -4497,43 +4635,9 @@ local function exec_simple(sh, args, hook, no_func)
 			code = sh.status
 		end
 		error({ __curse_exit = code })
-	elseif cmd == "command" and (args[2] == "-v" or args[2] == "-V") then
-		local verbose = args[2] == "-V"
-		local anyfound = false
-		for j = 3, #args do
-			local k, p, hashed = name_type(sh, args[j])
-			if not k then
-				if verbose then
-					io.stderr:write("curse: command: " .. args[j] .. ": not found\n")
-				end
-			else
-				anyfound = true
-				if verbose then
-					if k == "alias" then
-						sh:echo(args[j] .. " is aliased to `" .. sh.aliases[args[j]] .. "'")
-					elseif k == "file" then
-						sh:echo(args[j] .. (hashed and " is hashed (" .. p .. ")" or " is " .. p))
-					elseif k == "function" then
-						sh:echo(args[j] .. " is a function")
-						local d = func_body_text(sh, args[j])
-						if d then
-							sh:echo(d)
-						end -- canonical (or verbatim) body
-					elseif k == "keyword" then
-						sh:echo(args[j] .. " is a shell keyword")
-					else
-						sh:echo(args[j] .. " is a shell builtin")
-					end
-				elseif k == "alias" then
-					sh:echo("alias " .. args[j] .. "='" .. sh.aliases[args[j]] .. "'")
-				else
-					sh:echo(k == "file" and p or args[j])
-				end
-			end
-		end
-		sh.status = (anyfound or not args[3]) and 0 or 1 -- bash: 0 if ANY name resolved (multiple names
-		-- swallow misses; no name at all is 0)
 	elseif cmd == "command" then
+		-- command [-pVv] NAME [ARG…] (bash's command.def): options up to `--`, the last of
+		-- -v/-V wins; -p finds NAME along the standard PATH (lookup only: $PATH stays).
 		local j, usep, vflag = 2, false, nil
 		while args[j] and args[j]:match("^%-.") and args[j] ~= "--" do
 			for k = 2, #args[j] do
@@ -4541,7 +4645,7 @@ local function exec_simple(sh, args, hook, no_func)
 				if f == "p" then
 					usep = true
 				elseif f == "v" or f == "V" then
-					vflag = (vflag == "-V" or f == "V") and "-V" or "-v"
+					vflag = f
 				else
 					io.stderr:write("curse: command: -" .. f .. ": invalid option\n" .. rt.usage("command"))
 					sh.status = 2
@@ -4553,8 +4657,9 @@ local function exec_simple(sh, args, hook, no_func)
 		if args[j] == "--" then -- (end of options)
 			j = j + 1
 		end
-		if vflag and not usep then -- (`command -vV NAME`: the -v/-V lookup above)
-			return exec_simple(sh, { "command", vflag, unpack(args, j) }, hook, true)
+		if vflag then
+			command_describe(sh, args, j, vflag == "V", usep)
+			return
 		end
 		-- a special builtin run through `command` loses its fatal-error property (posix)
 		local svc = sh.via_command
@@ -4564,26 +4669,14 @@ local function exec_simple(sh, args, hook, no_func)
 		end
 		if args[j] == nil then
 			sh.status = 0
-		elseif usep then
-			-- -p: resolve against the standard-utility PATH (confstr _CS_PATH), not the
-			-- caller's $PATH. Temporarily swap it (env + var) around the command.
-			local DEFPATH = std_path()
-			local oldenv, oldbox = os.getenv("PATH"), sh.vars["PATH"]
-			sh:set_str("PATH", DEFPATH)
-			C.setenv("PATH", DEFPATH, 1)
-			local ok, err = pcall(exec_simple, sh, vflag and { "command", vflag, unpack(args, j) } or { unpack(args, j) }, hook, true)
-			sh.vars["PATH"] = oldbox
-			if oldenv then
-				C.setenv("PATH", oldenv, 1)
-			else
-				C.unsetenv("PATH")
-			end
-			sh.via_command = svc
-			if not ok then
-				error(err)
-			end
 		else
+			local sv_pl = sh.path_lookup
+			local kd = usep and name_type(sh, args[j], true)
+			if usep and (kd == "file" or not kd) then -- (not a builtin: find it along the
+				sh.path_lookup = std_path() -- standard path — for this one lookup)
+			end
 			local ok, err = pcall(exec_simple, sh, { unpack(args, j) }, hook, true)
+			sh.path_lookup = sv_pl
 			sh.via_command = svc
 			if not ok then
 				error(err, 0)
@@ -7240,6 +7333,7 @@ M._int = {
 	exec_list = exec_list,
 	run_history_lines = run_history_lines,
 	exec_stmt = exec_stmt,
+	describe = describe,
 	statbuf = statbuf,
 	statbuf2 = statbuf2,
 	run_trap = run_trap,
