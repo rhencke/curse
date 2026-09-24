@@ -554,7 +554,17 @@ end
 -- A deferred xpand whose raw uses ONLY $name/$digit expansions (no ${…}, $(…), `…`,
 -- $*/$@/… specials, or a glued name$): the CFG CAN compile it — parse the raw as a
 -- native tree, read each $name like a var, and guard non-lifted operands (see emit_value).
+-- `${#name}` of a plain name inside $((…)) is always a number, so it reads natively: the
+-- raw text is parsed with each replaced by a reserved identifier, which emit_value
+-- renders as rt.var_len (other ${…} forms stay on the interpreter's textual path).
+local function xpand_lens(raw)
+	return (raw:gsub("%${#([%a_][%w_]*)}", "__curse_len_%1"))
+end
 local function xpand_fast(raw)
+	if raw:find("}[%w_#%${]") or raw:find("[%w_]%${") then -- (text glued to a ${…}: textual)
+		return false
+	end
+	raw = xpand_lens(raw)
 	if
 		require("runtime").xpand_self_assign(raw) -- (see interp's xpand)
 		or raw:find("%$%(")
@@ -673,7 +683,7 @@ local function not_compilable(e)
 		end
 		-- a fast xpand renders as a VALUE: one whose native tree assigns (`a[$k]=7`,
 		-- `$x++`) can't, so the word delegates
-		local ok, nat = pcall(require("parser").arith, e.raw, true)
+		local ok, nat = pcall(require("parser").arith, xpand_lens(e.raw), true)
 		return not ok or arith_side_effect(nat) or not_compilable(nat)
 	end -- a fast $name xpand compiles
 	return not_compilable(e.e)
@@ -1084,6 +1094,10 @@ emit_value = function(e, lifted)
 		)
 	end
 	if k == "var" then
+		local ln = e.name:match("^__curse_len_(.+)$") -- (a ${#name}: see xpand_lens)
+		if ln then
+			return ("rt.var_len(sh, %q)"):format(ln)
+		end
 		return lifted[e.name] and lname(e.name) or (arith_varread):format(e.name)
 	end
 	if k == "param" then
@@ -1096,7 +1110,7 @@ emit_value = function(e, lifted)
 		-- `(( $i < n ))` compiles to pure native code. A NON-lifted $name is guarded: if its
 		-- value isn't numeric, bash re-associates operators, so fall back to the interpreter's
 		-- textual substitution (rt.arith_textual). Only reached for a fast xpand (not_compilable).
-		local ok, native = pcall(require("parser").arith, e.raw, true)
+		local ok, native = pcall(require("parser").arith, xpand_lens(e.raw), true)
 		if not ok then
 			return ("rt.arith_textual(sh, %q)"):format(e.raw)
 		end

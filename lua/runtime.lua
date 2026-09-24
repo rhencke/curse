@@ -6183,6 +6183,22 @@ end
 -- Arithmetic write: store the int64, defer the string (lazy).
 -- A compiled fragment (eval, a hot loop) can't see the whole program, so it can't know a
 -- name is never a nameref / readonly / array: its native arith assign checks at run time.
+-- ${#name} as an int64 (compiled arithmetic): a plain scalar's character count, else
+-- the interpreter's expansion of it (arrays, namerefs, set -u).
+function M.var_len(sh, name)
+	local b = sh.vars[name]
+	if b and not b.ref and not b.arr then
+		local s = b.s
+		if s == nil and b.n ~= nil then
+			s = i64_to_str(b.n)
+		end
+		if s then
+			return i64(M.mb_strlen(s))
+		end
+	end
+	local w = require("parser").parse_word("${#" .. name .. "}")
+	return i64(tonumber(require("interp")._int.expand_part_str(sh, w.parts[1])) or 0)
+end
 function M.plain_scalar(sh, name)
 	local b = sh.vars[name]
 	return b == nil or not (b.ref or b.ro or b.arr)
@@ -6204,6 +6220,9 @@ function Shell:aset(name, n)
 	end
 	if b.arr then
 		b.arr[b.assoc and "0" or 0] = i64_to_str(i64(n))
+		if not b.assoc then
+			M.arr_max_note(b.arr, 0)
+		end
 		return i64(n)
 	end -- (( a = n )) hits a[0]
 	b.n = i64(n)
@@ -6214,15 +6233,39 @@ end
 -- ---- indexed arrays ----
 -- Stored in the var box as b.arr = { [0]=…, [1]=… } (0-based, may be sparse, to
 -- match bash). A plain scalar has no b.arr; reading $a is ${a[0]}.
-local function arr_max(arr)
-	local m = i64(-1)
+-- The highest index, cached per array TABLE (a new table starts uncached): `a+=(x)` in
+-- a loop scanned every key each time — quadratic. Writers in place keep it right:
+-- array_set raises it, an element unset drops it, the others below update it.
+local arr_max
+do
+local ARR_MAX = setmetatable({}, { __mode = "k" })
+arr_max = function(arr)
+	local m = ARR_MAX[arr]
+	if m then
+		return m
+	end
+	m = i64(-1)
 	for k in pairs(arr) do
 		local ki = key_i64(k)
 		if ki > m then
 			m = ki
 		end
 	end
+	ARR_MAX[arr] = m
 	return m
+end
+function M.arr_max_note(arr, key) -- (key was just set in arr)
+	local m = ARR_MAX[arr]
+	if m then
+		local ki = key_i64(key)
+		if ki > m then
+			ARR_MAX[arr] = ki
+		end
+	end
+end
+function M.arr_max_drop(arr) -- (an element went: maybe the highest)
+	ARR_MAX[arr] = nil
+end
 end
 
 -- `declare -A name`: mark as associative (string keys, insertion-order iteration —
@@ -6272,7 +6315,9 @@ function Shell:array_assign(name, values, append)
 	if append and b.arr then
 		local base = arr_max(b.arr) + 1
 		for i = 1, #values do
-			b.arr[base + i - 1] = values[i]
+			local k = to_arr_key(base + i - 1)
+			b.arr[k] = values[i]
+			M.arr_max_note(b.arr, k)
 		end
 	else
 		b.arr = {}
@@ -6366,6 +6411,9 @@ function Shell:array_set(name, key, val, append)
 		b.arr[key] = case_fold(b, (b.arr[key] or "") .. val)
 	else
 		b.arr[key] = case_fold(b, val)
+	end
+	if not b.assoc then
+		M.arr_max_note(b.arr, key)
 	end
 	return true
 end
@@ -6570,6 +6618,7 @@ function Shell:array_unset(name, key)
 		end
 	end
 	b.arr[k] = nil
+	M.arr_max_drop(b.arr) -- (maybe the highest: recount on demand)
 	return true
 end
 -- bash iterates an assoc array in HASH-TABLE order, not insertion order: the
@@ -8754,11 +8803,7 @@ arrayassign_body = function(sh, name, items, append)
 				b.n = nil
 			end -- scalar -> [0]
 			if b and b.arr then
-				for kk in pairs(b.arr) do
-					if kk > mx then
-						mx = kk
-					end
-				end
+				mx = tonumber(arr_max(b.arr)) -- (cached: see arr_max)
 			end
 			auto = mx + 1
 		end
@@ -8980,6 +9025,65 @@ end
 -- ARRAY var appends value to element 0, an INTEGER var (declare -i) arithmetic-adds it, and a
 -- plain/unset scalar string-concatenates. A readonly var is rejected (status 1, line-abort like
 -- a standalone assignment). Gated at emit to non-nameref programs with an emit_word-able rhs.
+-- `s+=piece` in a loop copied the whole value each time (a new Lua string: quadratic).
+-- A plain variable being appended to instead holds its value in a string.buffer, with
+-- `s` ABSENT from the box: reading b.s builds (and caches) the string; ANY write to b.s
+-- (a new value, or nil to unset) drops the buffer first — so every other reader and
+-- writer of the box works unchanged.
+local append_lazy
+do
+local SBUF = require("string.buffer")
+local LAZY_STR = {
+	__index = function(t, k)
+		if k == "s" then
+			local sb = rawget(t, "_sb")
+			if sb and rawget(t, "n") == nil then
+				local v = rawget(t, "_sbv")
+				if not v then
+					v = sb:tostring()
+					rawset(t, "_sbv", v)
+				end
+				return v
+			end
+		end
+		return nil
+	end,
+	__newindex = function(t, k, v)
+		if k == "s" then
+			rawset(t, "_sb", nil)
+			rawset(t, "_sbv", nil)
+		end
+		rawset(t, k, v)
+	end,
+}
+local APPEND_SPECIAL = { OPTIND = true, BASH_ARGV0 = true, POSIXLY_CORRECT = true, IGNOREEOF = true,
+	RANDOM = true, SRANDOM = true, LINENO = true, FUNCNAME = true, TZ = true }
+append_lazy = function(sh, dn, b, value)
+	if b.ref or b.arr or b.int or b.lower or b.upper or b.cap or b.exported or rawget(b, "virt")
+		or APPEND_SPECIAL[dn] or LOCALE_VARS[dn] or value:find("\0", 1, true) then
+		return false
+	end
+	local mt = getmetatable(b)
+	if mt ~= nil and mt ~= LAZY_STR then
+		return false
+	end
+	local sb = rawget(b, "_sb")
+	if not (sb and rawget(b, "s") == nil and rawget(b, "n") == nil) then
+		local cur = sh:get(dn)
+		sb = SBUF.new()
+		sb:put(cur)
+		rawset(b, "s", nil)
+		rawset(b, "n", nil)
+		rawset(b, "_sb", sb)
+		if mt == nil then
+			setmetatable(b, LAZY_STR)
+		end
+	end
+	sb:put(value)
+	rawset(b, "_sbv", nil)
+	return true
+end
+end
 function M.append_scalar(sh, name, value)
 	local b = sh.vars[sh:deref(name)]
 	if b and b.ro then
@@ -8997,7 +9101,7 @@ function M.append_scalar(sh, name, value)
 	elseif b and (b.lower or b.upper) then -- declare -l/-u: case-fold the appended result
 		local v = sh:get(name) .. value
 		sh:set_str(name, b.lower and v:lower() or v:upper())
-	else
+	elseif not (b and append_lazy(sh, sh:deref(name), b, value)) then
 		sh:set_str(name, sh:get(name) .. value)
 	end
 end

@@ -205,9 +205,36 @@ local function read_split(ifs, line, nvars)
 	-- non-IFS; the last var gets the rest with trailing IFS stripped (as below)
 	local pat = rs_pats[ifs]
 	if pat == nil then
-		pat = ifs ~= "" and not ifs:find("[^ \t\n]")
-			and { "[" .. ifs .. "]", "[^" .. ifs .. "]", "^(.-)[" .. ifs .. "]*$" } or false
+		if ifs ~= "" and not ifs:find("[^ \t\n]") then
+			pat = { "[" .. ifs .. "]", "[^" .. ifs .. "]", "^(.-)[" .. ifs .. "]*$" }
+		elseif ifs ~= "" and not ifs:find("[ \t\n\128-\255%z]") then -- (no whitespace)
+			pat = { "[" .. ifs:gsub("%W", "%%%0") .. "]", nows = true }
+		else
+			pat = false
+		end
 		rs_pats[ifs] = pat
+	end
+	if pat and pat.nows and not line:find("\1", 1, true) then
+		-- an IFS of non-whitespace delimiters only: each one ends a field (empty fields
+		-- kept); the last var gets the raw rest — minus a lone trailing delimiter when
+		-- that rest is a single field (bash, as below)
+		local sep, out, pos = pat[1], {}, 1
+		for v = 1, nvars - 1 do
+			local e = line:find(sep, pos)
+			if not e then
+				out[v] = line:sub(pos)
+				pos = nil
+				break
+			end
+			out[v] = line:sub(pos, e - 1)
+			pos = e + 1
+		end
+		if pos then
+			local rest = line:sub(pos)
+			local e = rest:find(sep)
+			out[nvars] = (e and e == #rest) and rest:sub(1, e - 1) or rest
+		end
+		return out
 	end
 	if pat and not line:find("\1", 1, true) then
 		if nvars == 1 then -- (one var: the line minus leading/trailing IFS whitespace)
@@ -4857,7 +4884,7 @@ local function assign_body(sh, st, nref_base, nref_sub)
 			local v = sh:get(st.name) .. assign_rhs_a(sh, st)
 			sh:set_str(st.name, b.lower and v:lower() or v:upper())
 		else
-			sh:set_str(st.name, sh:get(st.name) .. assign_rhs_a(sh, st))
+			rt.append_scalar(sh, st.name, assign_rhs_a(sh, st)) -- (buffered: see rt.append_scalar)
 		end
 	else
 		local b = sh.vars[sh:deref(st.name)]
