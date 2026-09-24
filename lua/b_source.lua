@@ -148,7 +148,7 @@ return function(sh, cmd, args, hook, tcb)
 		end
 		if do_return then
 			local rh = sh.traps and sh.traps.RETURN
-			if rh and rh ~= "" and not sh.in_return_trap then
+			if rh and rh ~= "" and not sh.in_return_trap and rt.pseudo_trapped(sh, "RETURN") then
 				sh.in_return_trap = true
 				local sv = sh.status
 				run_trap(sh, rh)

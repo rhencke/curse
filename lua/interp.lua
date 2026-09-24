@@ -4210,7 +4210,8 @@ local function run_function(sh, cmd, fn, args, hook, tenv_base)
 	-- sourced script's return fires it regardless (see the `.`/source builtin) — and a
 	-- function run by the DEBUG trap doesn't fire it.
 	local rt_h = sh.traps and sh.traps.RETURN
-	if ok and rt_h and rt_h ~= "" and not sh.in_return_trap and not sh.in_debug then
+	if ok and rt_h and rt_h ~= "" and not sh.in_return_trap and not sh.in_debug
+		and ((sh.in_subprogram or 0) == 0 or rt.pseudo_trapped(sh, "RETURN")) then -- (in a subshell, one it set)
 		sh.in_return_trap = true
 		local saved = sh.status
 		sh.cur_line = sh.func_bline and sh.func_bline[cmd] or sh.cur_line
@@ -5000,8 +5001,8 @@ local function run_debug(sh, line)
 	-- DEBUG doesn't reach into a subshell/command substitution unless functrace extends it.
 	-- (A function call hides it at entry instead — rt.debug_enter — so one the function
 	-- sets itself still fires in its body.)
-	if not sh.opt_functrace and (sh.in_subprogram or 0) > 0 then
-		return
+	if (sh.in_subprogram or 0) > 0 and not rt.pseudo_trapped(sh, "DEBUG") then
+		return -- (one the subshell set itself is live there)
 	end
 	sh.in_debug = true
 	local saved = sh.status

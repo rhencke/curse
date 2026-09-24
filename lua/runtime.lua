@@ -2419,7 +2419,8 @@ function M.iso_save_traps(sh)
 	ctx.traps = {
 		owner = sh, -- (whose tables these are: a no-#! script's fresh shell shares our context)
 		traps = sh.traps, sigtraps = sh.sigtraps, inh = M.exit_trap_inherited,
-		esp = sh.err_trap_sp, run = rawget(_G, "__curse_sigrun"), inexit = sh.in_exit_trap,
+		esp = sh.err_trap_sp, dsp = sh.dbg_trap_sp, rsp = sh.ret_trap_sp,
+		run = rawget(_G, "__curse_sigrun"), inexit = sh.in_exit_trap,
 	}
 	sh.traps = shallowcopy(sh.traps) or {}
 	local kept
@@ -2600,6 +2601,7 @@ local function iso_undo(sh, ctx)
 		end
 		o.traps, o.sigtraps = sv.traps, sv.sigtraps
 		M.exit_trap_inherited, o.err_trap_sp, o.in_exit_trap = sv.inh, sv.esp, sv.inexit
+		o.dbg_trap_sp, o.ret_trap_sp = sv.dsp, sv.rsp
 		_G.__curse_sigrun = sv.run
 	end
 	M.iso_restore_fds(ctx)
@@ -2779,9 +2781,24 @@ function M.debug_enter(sh, name)
 	if d == nil and r == nil and e == nil then
 		return nil
 	end
+	-- In a subshell/$( ) the ones it inherited aren't TRAPPED (only listed), so there's
+	-- nothing to hide — execute_function's TRAP_STRING is NULL for them. (Also: the table
+	-- may still be the parent's, not yet copied — iso_save_traps.)
+	local e0 = e
+	if (sh.in_subprogram or 0) > 0 then
+		if d ~= nil and not M.pseudo_trapped(sh, "DEBUG") then
+			d = nil
+		end
+		if r ~= nil and not M.pseudo_trapped(sh, "RETURN") then
+			r = nil
+		end
+		if e ~= nil and not M.pseudo_trapped(sh, "ERR") then
+			e = nil
+		end
+	end
 	-- ERR likewise, unless errtrace (`set -E`) — and bash samples it BEFORE a command runs,
 	-- so one the call itself sets doesn't fire for the call (e0: it existed before)
-	local saved = { e0 = e }
+	local saved = { e0 = e0 }
 	if e ~= nil and not sh.opt_errtrace then
 		sh.traps.ERR, saved.e = nil, e
 	end
@@ -2792,9 +2809,27 @@ function M.debug_enter(sh, name)
 		end
 		return saved
 	end
-	sh.traps.DEBUG, sh.traps.RETURN = nil, nil
+	if d ~= nil then
+		sh.traps.DEBUG = nil
+	end
+	if r ~= nil then
+		sh.traps.RETURN = nil
+	end
 	saved.d, saved.r = d, r
 	return saved
+end
+-- Is the DEBUG/RETURN/ERR trap live here? A subshell or $( ) inherits their strings (listed
+-- by `trap`) but not the trapping — unless functrace (DEBUG, RETURN) / errtrace (ERR) is on
+-- — so only one set at this subshell level is (trap.c reset_or_restore_signal_handlers).
+function M.pseudo_trapped(sh, name)
+	local sp = sh.in_subprogram or 0
+	if sp == 0 then
+		return true
+	end
+	if name == "ERR" then
+		return sh.opt_errtrace or sp == sh.err_trap_sp
+	end
+	return sh.opt_functrace or sp == (name == "DEBUG" and sh.dbg_trap_sp or sh.ret_trap_sp)
 end
 function M.debug_leave(sh, saved)
 	if saved ~= nil then
@@ -10356,7 +10391,7 @@ function M.source(sh, argv, line)
 	end
 	-- `.`/source fires the RETURN trap on return (any outcome but the usage error).
 	local trap = sh.traps and sh.traps.RETURN
-	if trap and trap ~= "" and not sh.in_return_trap then
+	if trap and trap ~= "" and not sh.in_return_trap and M.pseudo_trapped(sh, "RETURN") then
 		sh.in_return_trap = true
 		local sv = sh.status
 		Ii.run_trap(sh, trap)
