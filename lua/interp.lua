@@ -4575,8 +4575,22 @@ local function eval_dbracket(sh, node)
 		elseif op == "-eq" or op == "-ne" or op == "-lt" or op == "-le" or op == "-gt" or op == "-ge" then
 			-- [[ ]] arithmetic comparisons evaluate each side as an arith EXPRESSION
 			-- (bash: [[ 1+2 -eq 3 ]] is true), unlike `test` which needs integer literals.
-			local nl = M.dbracket_arith(sh, l, textual)
-			local nr = M.dbracket_arith(sh, r, rtextual)
+			-- An operand's arith error makes just THIS primary false (bash's arithcomp:
+			-- `if (expok == 0) return FALSE`, the right side then unevaluated); `||`/`!`
+			-- go on. A subscript error still abandons the line.
+			local ok, nl = pcall(M.dbracket_arith, sh, l, textual)
+			local nr
+			if ok then
+				ok, nr = pcall(M.dbracket_arith, sh, r, rtextual)
+			else
+				nr = nl
+			end
+			if not ok then
+				if type(nr) == "table" and nr.__curse_matherr and not nr.__curse_subscript then
+					return false
+				end
+				error(nr, 0)
+			end
 			if op == "-eq" then
 				return nl == nr
 			elseif op == "-ne" then

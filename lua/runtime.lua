@@ -4558,6 +4558,26 @@ function M.legal_number(s)
 	end
 	return tonumber(sign .. digits)
 end
+-- legal_number returning the EXACT int64 (test's -eq/-lt…, -v N, -t N compare past 2^53),
+-- or nil: the same acceptance (isspace lead, sign, digits, blank tail, no ERANGE).
+function M.legal_i64(s)
+	if type(s) ~= "string" then
+		return nil
+	end
+	local sign, digits, rest = s:match("^[ \t\n\v\f\r]*([+-]?)(%d+)(.*)$")
+	if not digits or (rest ~= "" and not rest:match("^[ \t]*$")) then
+		return nil
+	end
+	local d = digits:match("^0*(%d-)$")
+	if #d > 19 or (#d == 19 and d > (sign == "-" and "9223372036854775808" or "9223372036854775807")) then
+		return nil -- (ERANGE)
+	end
+	local n = i64(0) -- (accumulated negative: -2^63 has no positive twin)
+	for i = 1, #d do
+		n = n * 10LL - i64(d:byte(i) - 48)
+	end
+	return sign == "-" and n or -n
+end
 
 -- `return [n]` status: no arg -> current $?; a numeric arg -> n mod 256; a
 -- non-numeric arg -> 2 + diagnostic (bash). A pure runtime primitive the compiled
@@ -4834,9 +4854,10 @@ function M.file_test(op, path)
 	if op == "-x" then
 		return C.access(path, 1) == 0
 	end
-	if op == "-t" then
-		return C.isatty(tonumber(path) or -1) == 1
-	end -- fd is a terminal
+	if op == "-t" then -- fd is a terminal: a legal_number that survives the (int) cast
+		local n = M.legal_i64(path)
+		return n ~= nil and n >= -2147483648LL and n <= 2147483647LL and C.isatty(tonumber(n)) == 1
+	end
 	local statfn = (op == "-h" or op == "-L") and C.curse_rt_lstat or C.curse_rt_stat
 	local ok, rc = pcall(statfn, path, _ft_a)
 	if not ok or rc ~= 0 then
@@ -10420,8 +10441,12 @@ end
 -- evaluator (interp.dbracket_arith = eval(P.arith(s)), empty->0), which also raises the
 -- same math/syntax error the caller's codegen maps to a failing status.
 -- [[ … -eq … ]] operands (compiled): arith_str, but an arith error flags sh.db_err (the
--- enclosing rt.db_ok turns the test false) instead of unwinding — no pcall on the fast path
+-- comparison's enclosing rt.db_ok turns THAT primary false) instead of unwinding — no pcall
+-- on the fast path. Once flagged, the right operand is not evaluated (bash's arithcomp).
 function M.db_arith(sh, s)
+	if sh.db_err then
+		return i64(0)
+	end
 	if M.looks_numeric(s) then
 		return M.arith_num(s)
 	end
@@ -10540,6 +10565,11 @@ end
 -- (no $): an ASSOC key is used verbatim, an INDEXED subscript is arith-evaluated via
 -- rt.arith_str (native; a nested-subscript operand defers through arith_str's seam). A
 -- bare array name tests element 0 (like bash); a digit is a positional parameter.
+-- test's -R (test.c unary_test 'R'): find_variable_noref — the name ITSELF is a set nameref.
+function M.var_is_nameref(sh, nm)
+	local b = sh.vars[nm]
+	return b ~= nil and b.ref and b.s ~= nil or false
+end
 function M.var_is_set(sh, nm, expanded)
 	local base, sub = nm:match("^([%a_][%w_]*)%[(.+)%]$")
 	if base then
@@ -10576,9 +10606,10 @@ function M.var_is_set(sh, nm, expanded)
 		end
 		return sh:is_elem_set(base, key)
 	end
-	if nm:match("^%d+$") then
-		return tonumber(nm) <= sh.nparams
-	end -- positional param
+	local pn = (nm:byte(1) or 65) < 65 and M.legal_i64(nm) -- positional: any legal_number (test.c `-v n`)
+	if pn then
+		return pn >= 0 and pn <= sh.nparams
+	end
 	local dn = sh:deref(nm)
 	local b = sh.vars[dn]
 	if b and b.arr then
@@ -10788,6 +10819,9 @@ local function test_unary(sh, op, x)
 	if op == "-v" then
 		return sh and M.var_is_set(sh, x) or false
 	end -- variable/element is set
+	if op == "-R" then
+		return sh and M.var_is_nameref(sh, x) or false
+	end
 	return M.file_test(op, x) -- -e/-f/-d/-r/-w/-x/-s…
 end
 -- `test` numeric operands are plain DECIMAL integers (leading 0 is NOT octal; 0x/N#/arith
@@ -10796,11 +10830,11 @@ local function test_int(s)
 	if short_digits(s) then -- (plain decimal: leading 0 is
 		return i64(tonumber(s)) -- still decimal for test)
 	end
-	local d = s:match("^%s*([+-]?%d+)%s*$")
-	if not d then
+	local n = M.legal_i64(s) -- (bash's legal_number: exact int64, base 10, ERANGE rejected)
+	if not n then
 		error({ __test_syntax = ("%s: integer expression expected"):format(s) })
 	end
-	return M.str_to_i64(d) -- exact int64, base-10, like bash's test
+	return n
 end
 local TEST_BINOPS = {
 	["="] = 1,
@@ -11029,6 +11063,10 @@ local function do_test(sh, args)
 			return v
 		end
 		if pos + 1 <= hi and TEST_UNOPS[args[pos]] then
+			if args[pos] == "-t" and not M.legal_i64(args[pos + 1]) then
+				pos = pos + 1 -- (test.c unary_operator: `-t` takes its operand only if it is a
+				return false -- number; else it is false and the word is left for the parser)
+			end
 			local v = test_unary(sh, args[pos], args[pos + 1])
 			pos = pos + 2
 			return v

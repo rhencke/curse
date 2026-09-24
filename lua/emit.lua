@@ -1830,17 +1830,9 @@ end
 -- delegates the whole [[ ]]). No word splitting happens in [[ ]], so emit_word (a
 -- scalar concat) is exactly the operand value.
 local ARITH_CMP = { ["-eq"] = "==", ["-ne"] = "~=", ["-lt"] = "<", ["-le"] = "<=", ["-gt"] = ">", ["-ge"] = ">=" }
-local emit_dbracket_node
--- A [[ ]] with an arithmetic comparison: an operand's arith error makes the whole test
--- false (status 1, bash) — rt.db_arith flags it, rt.db_ok reads the flag (no pcall).
-local function emit_dbracket(node, lifted)
-	local code = emit_dbracket_node(node, lifted)
-	if code and code:find("rt.db_arith(", 1, true) then
-		return "rt.db_ok(sh, " .. code .. ")"
-	end
-	return code
-end
-emit_dbracket_node = function(node, lifted)
+-- (an arithmetic comparison leaf: an operand's arith error makes THAT primary false —
+-- bash's arithcomp; `||`/`!` go on — rt.db_arith flags it, the leaf's rt.db_ok reads it)
+local function emit_dbracket_node(node, lifted)
 	local k = node.kind
 	if k == "and" or k == "or" then
 		local a = emit_dbracket_node(node.l, lifted)
@@ -1879,6 +1871,9 @@ emit_dbracket_node = function(node, lifted)
 		-- interp seam. Every other unary is a file predicate -> the pure-FFI runtime primitive.
 		if op == "-v" then
 			return ("rt.var_is_set(sh, %s, true)"):format(val)
+		end
+		if op == "-R" then
+			return ("rt.var_is_nameref(sh, %s)"):format(val)
 		end
 		if op == "-o" then
 			return ("I.dbracket_unary(sh, %q, %s)"):format(op, val)
@@ -1920,7 +1915,7 @@ emit_dbracket_node = function(node, lifted)
 			)
 			return op == "!=" and ("(not " .. eq .. ")") or eq
 		elseif ARITH_CMP[op] then
-			return ("(rt.db_arith(sh, %s) %s rt.db_arith(sh, %s))"):format(
+			return ("rt.db_ok(sh, rt.db_arith(sh, %s) %s rt.db_arith(sh, %s))"):format(
 				l,
 				ARITH_CMP[op],
 				emit_word(node.r, lifted)
@@ -3140,6 +3135,12 @@ local function test_operand_arith(w, lifted)
 		return { k = "var", name = p.var }
 	end
 	if p.lit and p.lit:match("^[+-]?%d+$") then
+		-- (only an int64-range literal: bash's legal_number rejects ERANGE with status 2,
+		-- and an NNN…LL past 2^64 would not even parse — the do_test path reports it)
+		local d = p.lit:match("^[+-]?0*(%d-)$")
+		if #d > 19 or (#d == 19 and d > (p.lit:byte(1) == 45 and "9223372036854775808" or "9223372036854775807")) then
+			return nil
+		end
 		return { k = "num", v = p.lit }
 	end
 	if p.arithast then
@@ -6805,7 +6806,7 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
 					return p
 				end
 			end
-			local cond = emit_dbracket(st.expr, cx.lifted)
+			local cond = emit_dbracket_node(st.expr, cx.lifted)
 			if not cond then
 				return cx.delegate(st, after)
 			end
