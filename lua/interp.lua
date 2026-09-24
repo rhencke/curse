@@ -2065,6 +2065,23 @@ local function expand_to_fields(sh, w)
 			if not s:find("~", 1, true) and (sh.opt_f or not str_glob_active(s)) then
 				return { s }
 			end
+		elseif p.cmdsub and not p.q then
+			-- ...a lone unquoted $(…) (`for x in $(seq N)`): split on the default IFS at C
+			-- speed; if a field would glob, the general path takes the value (it ran once)
+			local v = expand_part_str(sh, p)
+			local ifs = rt.ifs(sh)
+			if ifs == nil or ifs == " \t\n" then
+				local out, n = {}, 0
+				for f in v:gmatch("[^ \t\n]+") do
+					if not sh.opt_f and str_glob_active(f) then
+						return expand_fields_full(sh, w, v)
+					end
+					n = n + 1
+					out[n] = f
+				end
+				return out
+			end
+			return expand_fields_full(sh, w, v)
 		elseif p.var and not p.q then
 			-- ...and a lone unquoted `$name` of a plain set scalar (`[ $i -lt $n ]`): no
 			-- default-IFS whitespace and no active glob -> one field, as is. (Anything else
@@ -2085,7 +2102,7 @@ local function expand_to_fields(sh, w)
 	end
 	return expand_fields_full(sh, w)
 end
-expand_fields_full = function(sh, w)
+expand_fields_full = function(sh, w, pre1) -- pre1: part 1 already expanded (a $(…) ran)
 	-- Concatenate-then-split model: build the word left to right, splitting the
 	-- chars that came from UNQUOTED expansions on $IFS (default: space/tab/newline),
 	-- while literal/quoted chars are never delimiters. This is what bash does, and
@@ -2311,7 +2328,12 @@ expand_fields_full = function(sh, w)
 				feed_split(sh:get(pe.name))
 			end
 		else
-			local s = expand_part_str(sh, p)
+			local s
+			if pi == 1 and pre1 ~= nil then
+				s = pre1
+			else
+				s = expand_part_str(sh, p)
+			end
 			if pi == 1 and p.lit ~= nil and not p.q then
 				-- (posix: `NAME=` args tilde-expand only for declaration builtins — parser
 				-- marks the other commands' args `plainarg`)
@@ -6127,7 +6149,15 @@ exec_stmt = function(sh, st, hook)
 		sh.loopdepth = (sh.loopdepth or 0) + 1
 		while true do
 			sh.forstate[st.id] = fs
-			hook("loop", st.id)
+			local hr, herr = hook("loop", st.id, st, sh)
+			if hr then -- (the rest of the loop ran compiled: see tier's loop fragments)
+				if herr ~= nil then
+					sh.loopdepth = sh.loopdepth - 1
+					error(herr, 0)
+				end
+				bodystatus = sh.status
+				break
+			end
 			if PREEMPT[0] ~= 0 then
 				rt.preempt()
 			end

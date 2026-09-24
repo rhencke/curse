@@ -289,14 +289,25 @@ local function loop_fragment(st)
 		return false
 	end
 	local code
-	if st.t == "whilec" then
+	if st.t == "whilec" or st.t == "forin" then
 		code = srcs:sub(st._s0, st._s1)
 	elseif st.t == "forc" and st.src then
 		code = "for ((;" .. (st.src[2] or "") .. ";" .. (st.src[3] or "") .. "))" .. srcs:sub(st._h1, st._s1)
 	else
 		return false
 	end
-	st._frag = M.compile_fragment(code, st.line) or false
+	local mod = M.compile_fragment(code, st.line)
+	if mod and st.t == "forin" then
+		-- entered at the loop's resume point, adopting the interpreter's list + position
+		-- (sh.forstate) under the fragment's own id for that loop: its first
+		local fid = 1
+		if not (mod.loopPc and mod.loopPc[fid]) then
+			mod = nil -- (the emitter delegated the loop: no resume point)
+		else
+			st._fid = fid
+		end
+	end
+	st._frag = mod or false
 	return st._frag
 end
 -- (the interp's SUBHOOK forwards to this: loop fragments only, never a program switch)
@@ -309,7 +320,7 @@ end
 -- control-flow error the fragment raised, for the interp loop to rethrow after its
 -- own cleanup), or nil to keep interpreting.
 function M.loop_osr(sh, st)
-	if not st or (st.t ~= "whilec" and st.t ~= "forc") then
+	if not st or (st.t ~= "whilec" and st.t ~= "forc" and st.t ~= "forin") then
 		return nil
 	end
 	local hits = (st._hits or 0) + 1
@@ -324,7 +335,16 @@ function M.loop_osr(sh, st)
 	-- (sh.loopdepth counts the loops AROUND the fragment: its own interp frame is out)
 	local ld = sh.loopdepth
 	sh.loopdepth = ld - 1
-	local ok, err = pcall(M.run_compiled, mod, sh, nil)
+	local ok, err
+	if st._fid then -- a `for … in`: continue its list where the interpreter is
+		local fid = st._fid
+		local saved = sh.forstate[fid]
+		sh.forstate[fid] = sh.forstate[st.id]
+		ok, err = pcall(M.run_compiled, mod, sh, mod.loopPc[fid])
+		sh.forstate[fid] = saved
+	else
+		ok, err = pcall(M.run_compiled, mod, sh, nil)
+	end
 	sh.loopdepth = ld
 	if ok then
 		return true

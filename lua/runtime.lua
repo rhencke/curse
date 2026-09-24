@@ -10180,6 +10180,17 @@ function M.looks_numeric(s)
 end
 local _acache = {} -- value-string -> compiled fn(sh) | false (uncompilable; keep the seam)
 function M.arith_read(sh, name)
+	local b = sh.vars[name]
+	if b and not b.ref and not b.arr then -- (a plain scalar: its int64, or a plain decimal)
+		local n = b.n
+		if n ~= nil then
+			return n
+		end
+		local bs = b.s
+		if bs and short_digits(bs) and (bs:byte(1) ~= 48 or #bs == 1) then -- (010 is octal)
+			return i64(tonumber(bs))
+		end
+	end
 	local s = sh:get(name)
 	if s ~= nil and M.looks_numeric(s) then
 		return M.arith_num(s)

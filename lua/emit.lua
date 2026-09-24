@@ -504,7 +504,7 @@ end
 -- Lua literal, so a cold statement can be baked into the compiled source and run
 -- by the shared interpreter (delegation). No cycles/functions in the AST.
 -- (a loop's source span and its run-time tiering state: never part of the program)
-local SER_SKIP = { _srcs = true, _s0 = true, _s1 = true, _h1 = true, _frag = true, _hits = true }
+local SER_SKIP = { _srcs = true, _s0 = true, _s1 = true, _h1 = true, _frag = true, _hits = true, _fid = true }
 local function ser(v)
 	local t = type(v)
 	if t == "string" then

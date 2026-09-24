@@ -3475,6 +3475,7 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs)
 			local issel = peekword() == "select"
 			local ln = line
 			ws()
+			local s0 = i -- (the loop's source span: see the whilec node)
 			i = i + (issel and 6 or 3)
 			ws()
 			if not issel and src:sub(i, i + 1) == "((" then
@@ -3615,6 +3616,7 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs)
 			if #body_stmts == 0 then
 				error("syntax error near `done'")
 			end -- bash: empty do/done is invalid
+			local s1 = i - 1
 			return {
 				t = issel and "select" or "forin",
 				id = id,
@@ -3623,6 +3625,9 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs)
 				words = words,
 				body = body_stmts,
 				redirs = tail_redirs(),
+				_srcs = src,
+				_s0 = s0,
+				_s1 = s1,
 			}
 		end
 		-- while/until COND; do BODY; done  — COND is a command list; the loop runs
