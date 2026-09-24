@@ -3334,6 +3334,15 @@ local function test_as_varcmp(cond, lifted)
 				nvar = nvar + 1
 				return ("rt.test_opnd(sh, %q, %s)"):format(p.var, p.q and "true" or "false")
 			end
+			if p.special == "#" then -- ($#: always a plain count)
+				nvar = nvar + 1
+				return "(sh.nparams + 0LL)"
+			end
+			if p.param then -- $1…
+				nvar = nvar + 1
+				return ("rt.test_opnd_param(sh, %d, %s, %s)"):format(p.param, p.q and "true" or "false",
+					tostring(p.braced or false))
+			end
 		end
 		local e = test_operand_arith(x, lifted)
 		if not e or not_compilable(e) or arith_side_effect(e) then

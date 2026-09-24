@@ -8281,6 +8281,23 @@ end
 for c in (" \t\n*?[]\\+@!(") :gmatch(".") do
 	FS_PLAIN[c:byte()] = false
 end
+-- a short value that neither splits on the default IFS nor globs (one field, as is)
+function M.plain_field(sh, value)
+	local n = #value
+	if n > 64 then
+		return false
+	end
+	local ifs0 = M.ifs(sh)
+	if not (ifs0 == nil or ifs0 == " \t\n") then
+		return false
+	end
+	for k = 1, n do
+		if not FS_PLAIN[value:byte(k)] then
+			return false
+		end
+	end
+	return true
+end
 function M.field_split(sh, value, split)
 	local n = #value
 	if n <= 64 then -- the common short word ($i, $name): one field, as is — no IFS/glob setup
@@ -8505,6 +8522,16 @@ end
 -- element) parts are NOT in this subset — those stay on expand_to_fields. Kept
 -- byte-for-byte in lockstep with expand_to_fields' feed_split/add + glob tail.
 function M.expand_fields(sh, segs)
+	local s1 = #segs == 1 and segs[1]
+	if s1 and s1.multi and s1.q and not s1.star then -- a lone "$@" / "${a[@]}": its elements
+		return s1.elems
+	end
+	if s1 and not s1.multi and s1.s and M.plain_field(sh, s1.s) then -- (one plain word: as is)
+		if s1.s == "" and s1.split then
+			return {}
+		end
+		return { s1.s }
+	end
 	local ifs = (M.ifs(sh) or " \t\n")
 	-- Memoize the IFS char-set parse (shared with expand_to_fields via sh._ifscache).
 	local ic = sh._ifscache
@@ -11079,6 +11106,16 @@ M.TEST_BINOPS, M.TEST_UNOPS, M.do_test = TEST_BINOPS, TEST_UNOPS, do_test
 -- exactly as the generic path expands them (unquoted: word-split), for do_test.
 function M.test_opnd(sh, name, quoted)
 	local v = M.nameref_read(sh, name)
+	if short_digits(v) then
+		return i64(tonumber(v))
+	end
+	if quoted then
+		return { v }
+	end
+	return M.field_split(sh, v, true)
+end
+function M.test_opnd_param(sh, n, quoted, braced) -- (test_opnd for $n: sh:param_u, as words)
+	local v = sh:param_u(n, braced)
 	if short_digits(v) then
 		return i64(tonumber(v))
 	end
