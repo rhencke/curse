@@ -4887,15 +4887,15 @@ M.SETFLAG = {
 	r = "opt_r", -- restricted (no long -o name; can't be turned back off)
 }
 -- options that default ON (nil field state == off for the rest).
-M.SETDEFAULT = { opt_B = true, opt_h = true, opt_H = true, opt_history = true, opt_icomments = true }
+M.SETDEFAULT = { opt_B = true, opt_h = true, opt_icomments = true }
 function M.opt_on(sh, field)
 	local v = sh[field]
 	if v ~= nil then
 		return v
 	end
-	if field == "opt_emacs" then
+	if field == "opt_emacs" or field == "opt_H" or field == "opt_history" then
 		return sh.opt_i and true or false
-	end -- emacs on only when interactive
+	end -- emacs/histexpand/history are on only when interactive
 	return M.SETDEFAULT[field] or false
 end
 
@@ -5853,6 +5853,18 @@ function M.usage(cmd)
 		end
 	end
 	return ""
+end
+-- bash's builtin_help (`CMD --help`): help's synopsis and long text, status 2 (EX_USAGE).
+function M.builtin_help(sh, cmd)
+	for _, t in ipairs(require("helpdata")) do
+		if t[1] == cmd then
+			sh.out(cmd .. ": " .. t[2] .. "\n")
+			for _, l in ipairs(t[3]) do
+				sh.out("    " .. l .. "\n")
+			end
+		end
+	end
+	sh.status = 2
 end
 -- `return N`'s status (bash's get_exitstat): N mod 256, or 2 with a message for a non-number.
 function M.return_code(sh, s)
