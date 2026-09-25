@@ -2026,10 +2026,9 @@ multi_elems = function(sh, p) -- returns element list, star?
 			end
 			if pe.name == "@" or pe.name == "*" then
 				io.stderr:write("curse: $" .. pe.name .. ": cannot assign in this way\n")
-			else
-				io.stderr:write("curse: " .. rt.pe_label(pe) .. ": bad array subscript\n")
+				error({ __curse_exit = 1, __curse_lineabort = true })
 			end
-			error({ __curse_exit = 1, __curse_lineabort = true })
+			rt.assign_default_fail(sh, rt.pe_label(pe), "bad array subscript")
 		elseif pe.op == "-" and #els == 0 then -- unset/empty array: the default
 			local d, ds, dq = defval(pe.arg)
 			return d, (dq ~= nil and ds or star), dq
@@ -7106,7 +7105,7 @@ local function run_group(sh, lg, hook, k)
 					error(err)
 				end
 				rt.posix_arith_fatal(sh, err)
-				sh.status = 1
+				sh.status = err.__curse_badusage and not sh.opt_c and 2 or 1 -- (a failed ${x:=w})
 				break
 			else
 				error(err)

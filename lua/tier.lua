@@ -124,7 +124,7 @@ function M.run_compiled(mod, sh, pc, nested)
 				error(err, 0)
 			end
 			rt.posix_arith_fatal(sh, err)
-			sh.status = 1
+			sh.status = not nested and err.__curse_badusage and not sh.opt_c and 2 or 1 -- (a failed ${x:=w})
 			pc = sh._ff
 		else
 			error(err)

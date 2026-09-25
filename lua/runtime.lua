@@ -2971,7 +2971,9 @@ function Shell:subshell_run(runner, saves, paren)
 	local status = self.status
 	local rethrow
 	if not ok then
-		if type(err) == "table" and (err.__curse_exit or err.__curse_return) then
+		if type(err) == "table" and err.__curse_badusage and paren and not self.opt_e then
+			status = 2 -- (a failed ${x:=w} discards the `( )` child's line: EX_BADUSAGE; a $(…) says 1)
+		elseif type(err) == "table" and (err.__curse_exit or err.__curse_return) then
 			status = err.__curse_exit or err.__curse_return
 		elseif type(err) == "table" and err.__curse_lineabort then
 			status = 1
@@ -9896,6 +9898,10 @@ function Shell:expand_param(pe, arg, arg2, idxnum)
 			error({ __curse_exit = 1, __curse_lineabort = true })
 		end
 		if index and index ~= "@" and index ~= "*" then
+			local ab = self.vars[self:deref(name)]
+			if ab and ab.ro then
+				M.assign_default_fail(self, self:deref(name), "readonly variable")
+			end
 			self:array_set(name, idxnum or 0, v)
 			return self:array_get(name, idxnum or 0) or v -- (as stored: -i / -u / -l applied)
 		end
@@ -11370,7 +11376,23 @@ end
 -- ${x:=word}/${x=word}: assign the default to the variable (bash's assign_default for a
 -- scalar/bare-array name — pexp_compilable never compiles a subscripted target), returning
 -- the value. A bare name that IS an array writes element 0.
+-- A ${x:=w} / ${a[i]=w} whose assignment fails (a readonly target, or a bad array
+-- subscript): parameter_brace_expand_rhs's expansion error — the line is discarded with
+-- $? = 2 (EX_BADUSAGE; parse_and_execute callers — eval, source, -c, $(…) — report 1),
+-- or under posix the shell exits.
+function M.assign_default_fail(sh, what, msg)
+	io.stderr:write("curse: " .. what .. ": " .. msg .. "\n")
+	if sh.opt_posix then
+		error({ __curse_exit = 1 })
+	end
+	error({ __curse_exit = 1, __curse_lineabort = true, __curse_badusage = true })
+end
 function M.assign_default(sh, name, v)
+	local dn = sh:deref(name)
+	local b = sh.vars[dn]
+	if b and b.ro and not (sh.vars[name] or b).ref then
+		M.assign_default_fail(sh, dn, "readonly variable")
+	end
 	-- through the var's attributes (declare -i / -u / -l): the expansion is the STORED value
 	M.assign_scalar(sh, name, v)
 	return sh:get(name)
