@@ -1638,6 +1638,23 @@ local function parse_word(w)
 end
 M.parse_word = parse_word
 M.scan_cmdsub = scan_cmdsub
+-- bash's fork optimization (execute_in_subshell / optimize_connection_fork /
+-- parse_and_execute's should_suppress_fork): the last command of a ( … ) or $( … ) body —
+-- a plain simple command, the last of a `;`/&&/|| list — is exec'd in place of the
+-- subshell. Marked for the runtime ($SHLVL: rt.exec_tail_lvl): 2 = always (alone in a
+-- `( … )`, redirections and all), 1 = unless a trap must still run (no redirections).
+function M.mark_tail(body, paren)
+	local n = body and #body or 0
+	local last = body and body[n]
+	local alone = n == 1
+	if last and last.t == "andor" then
+		last, alone = last.items[#last.items].cmd, false
+	end
+	if last and last.t == "simple" and not last.timed and ((alone and paren) or not last.redirs)
+		and not (n > 1 and body[n - 1].t == "background") then
+		last.shtail = (alone and paren) and 2 or 1
+	end
+end
 M.scan_braces = scan_braces
 M.grab_dparen = grab_dparen
 
@@ -3226,6 +3243,7 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs)
 			if #body == 0 then
 				error("syntax error near `)'") -- (`f() ( )`: bash)
 			end
+			M.mark_tail(body, true)
 			return { { t = "subshell", line = bline, body = body } }, bline, true
 		end
 		return brace_group(), bline
@@ -4286,6 +4304,7 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs)
 					break
 				end
 			end
+			M.mark_tail(body, true)
 			return { t = "subshell", line = line, body = body, redirs = (#redirs > 0 and redirs or nil) }
 		end
 		-- case WORD in  PAT|PAT) BODY ;;  … esac
@@ -4714,8 +4733,11 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs)
 					i = i + 2
 					ws()
 				end
-				if timed_p and src:sub(i, i + 1) == "--" and src:sub(i + 2, i + 2):match("[ \t\n]") then
-					i = i + 2 -- `time -p -- cmd`: the options end
+				if src:sub(i, i + 1) == "--" and src:sub(i + 2, i + 2):match("^[ \t\n]?$") then
+					-- `time -- cmd` / `time -p -- cmd`: the options end — parse.y's TIMEIGN,
+					-- which also selects the POSIX format (CMD_TIME_POSIX)
+					timed_p = true
+					i = i + 2
 					ws()
 				end
 			elseif bang_at(i) then

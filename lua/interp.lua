@@ -6010,6 +6010,7 @@ exec_stmt = function(sh, st, hook)
 			sh.status = sh.ncs ~= ncs0 and sh.last_cmdsub_status or 0
 		end
 		sh:set_str("_", "") -- a bare assignment resets $_ to empty (bash)
+		sh:array_assign("PIPESTATUS", { tostring(sh.status) }, false) -- (PIPESTATUS: this null command's status)
 	elseif t == "arrayassign" then
 		if sh.opt_x and st.raw then -- (bash traces an array literal as written: `+ a=(1 "b c")`)
 			xtrace_line(sh, st.name .. (st.append and "+=" or "=") .. st.raw)
@@ -6036,6 +6037,7 @@ exec_stmt = function(sh, st, hook)
 			if aok then
 				sh.status = sh.ncs ~= ncs0 and sh.last_cmdsub_status or 0 -- (`a=( $(exit 3) )`: 3)
 				sh:set_str("_", "")
+				sh:array_assign("PIPESTATUS", { tostring(sh.status) }, false)
 			elseif type(aerr) == "table" and aerr.__curse_experr and not aerr.__curse_lineabort then
 				sh.status = 1
 				if sh.opt_e then
@@ -6101,7 +6103,11 @@ exec_stmt = function(sh, st, hook)
 		end
 		-- status: the LAST command substitution's, else 0 (execute_null_command)
 		sh.status = sh.ncs ~= ncs0 and sh.last_cmdsub_status or 0
+		sh:array_assign("PIPESTATUS", { tostring(sh.status) }, false)
 	elseif t == "simple" then
+		if st.shtail then -- (the last command of a ( … ) / $( … ): rt.exec_tail_lvl)
+			sh.shlvl_tail = st.shtail == 2 and sh.pd or -1 - sh.pd
+		end
 		if sh.opt_k and st.words then
 			-- set -k (keyword): an assignment-shaped word ANYWHERE is an assignment for the
 			-- command, not only before its name (bash)
@@ -6198,6 +6204,7 @@ exec_stmt = function(sh, st, hook)
 				end
 				restore_redirs(save)
 			end
+			sh:array_assign("PIPESTATUS", { tostring(sh.status) }, false) -- (a null command's too)
 			return
 		end
 		if st.arrayargs then -- `declare -A a=(...)` / `local -a b=(...)` array literals
@@ -6659,6 +6666,9 @@ exec_stmt = function(sh, st, hook)
 		-- (vars, params, functions, cwd, …) and restores it after. (A no-op OSR hook inside:
 		-- a switch into compiled code mustn't unwind past the checkpoint.)
 		local saves
+		if sh.traps and sh.traps.ERR and not (sh.in_trap and sh.in_trap > 0) then
+			sh.cur_cmd = st -- ($BASH_COMMAND for an ERR trap it fires: the whole `( … )`)
+		end
 		local ok, err = pcall(sh.subshell_run, sh, function(sh)
 			if st.redirs then
 				if st.top and st.redirs[1].line and not (sh.in_trap and sh.in_trap > 0) then

@@ -415,6 +415,9 @@ end
 function Shell:pushCall(...)
 	self:pushParams(...)
 	self.savedstack[self.pd] = false
+	if self.shopt.extdebug then -- (BASH_ARGV/BASH_ARGC: this call's arguments, as passed)
+		M.bav_push(self, self.params, 1, self.nparams, self.pd)
+	end
 end
 
 -- $FUNCNAME / $BASH_LINENO / $BASH_SOURCE maintenance for the compiled tier: push the
@@ -477,6 +480,10 @@ function Shell:popCall()
 			end
 		end
 		self.savedstack[d] = false
+	end
+	local bv = self.bav
+	if bv and bv[#bv] and bv[#bv].d == d then
+		bv[#bv] = nil
 	end
 	-- `local -` in this call: the set options go back to their state at that point
 	local lo = self.local_opts and self.local_opts[d]
@@ -1789,6 +1796,22 @@ function Shell:run_script_inproc(path, args, n, out)
 	if f then
 		f:close()
 	end
+	do -- (check_binary_file: a NUL before the first newline in its first 80 bytes)
+		local z = src:find("\0", 1, true)
+		if z and z <= 80 then
+			local nl = src:find("\n", 1, true)
+			if not nl or nl > z then
+				self:errmsg("curse: " .. path .. ": cannot execute binary file: Exec format error\n")
+				if self.exec_builtin then -- (exec_builtin's file_error then, errno 0)
+					self:errmsg("curse: " .. path .. ": Success\n")
+				end
+				self.status = 126
+				return
+			end
+		end
+	end
+	local csh = M.cur_shell -- (before Shell.new, which makes the new shell current)
+	local depth = self.subdepth -- (a fresh shell: $BASH_SUBSHELL as it is here)
 	local child = Shell.new()
 	-- (`exec`'s script: $0 is its -a NAME, else the full pathname — shell_execve)
 	child.argv0, child.out = self.exec_builtin and (self.exec_script_a0 or path) or args[1], out or io.write
@@ -1802,18 +1825,21 @@ function Shell:run_script_inproc(path, args, n, out)
 		child.nparams = child.nparams + 1
 		child.params[child.nparams] = args[k]
 	end
-	local csh = M.cur_shell
 	local nous = M.env_drop_us -- (`exec`'s: the script's own commands get their `_`)
 	M.env_drop_us = false
+	local lvd = M.shlvl_delta -- (an exec'd command: $SHLVL lowered first, then the new shell's)
+	M.shlvl_delta = 0
 	self:subshell_run(function()
 		child.iso_ctx = self.iso_ctx -- (its process-state saves land in our context)
-		child.subdepth = self.subdepth
+		child.subdepth = depth
+		M.iso_save_env(child)
+		M.shlvl_start(child, lvd)
 		M.cur_shell = child
 		pcall(require("tier").run_tiered, src, child) -- (tiered like any script: cached compiled)
 		M.cur_shell = csh
 		io.flush()
 	end)
-	M.env_drop_us = nous
+	M.env_drop_us, M.shlvl_delta = nous, lvd
 	M.cur_shell = csh
 	self.status = child.status or 0
 end
@@ -1915,7 +1941,58 @@ end
 ffi.cdef("int curse_rt_execve(const char *path, char *const argv[], char *const envp[]) asm(\"execve\");")
 local _exec_emptyset = ffi.new("uint8_t[1024]")
 C.sigemptyset(_exec_emptyset)
+-- The last command of a ( … ) / $( … ) body (parser.mark_tail) that turns out to be an
+-- external command is exec'd by bash in place of the subshell's own process (CMD_NO_FORK),
+-- lowering $SHLVL first like `exec` (execute_disk_command's adjust_shell_level(-1)) — the
+-- one visible trace. A `cmd &` job's simple command or the lone command of a `( … )`
+-- always; otherwise not when a trap would still have to run (should_optimize_fork): an
+-- ERR trap (the subshell's own, or kept by errtrace), its own EXIT trap or caught signal.
+-- sh.shlvl_tail: the call depth that tail command runs at (a function it calls is deeper),
+-- as -1 - depth for the conditional kind.
+function M.exec_tail_lvl(sh, ...)
+	local tl = sh.shlvl_tail
+	sh.shlvl_tail = nil
+	if sh.in_trap and sh.in_trap > 0 then -- (a DEBUG trap's command before it: not this one)
+		local eok, err = pcall(sh.exec, sh, ...)
+		sh.shlvl_tail = tl
+		if not eok then
+			error(err, 0)
+		end
+		return
+	end
+	local ok = (tl < 0 and -1 - tl or tl) == sh.pd and not sh.exec_builtin
+	local tr = sh.traps
+	if ok and tl < 0 and tr then
+		local ctx = M.iso_cur(sh)
+		local own = ctx and ctx.traps -- (the subshell has set a trap of its own: see iso_save_traps)
+		if tr.ERR and (sh.opt_errtrace or (own and own.traps and own.traps.ERR ~= tr.ERR)) then
+			ok = false
+		elseif own and tr.EXIT and M.exit_trap_own(sh) then
+			ok = false
+		elseif own and sh.sigtraps then
+			for canon in pairs(sh.sigtraps) do
+				if tr[canon] and tr[canon] ~= "" then
+					ok = false
+					break
+				end
+			end
+		end
+	end
+	if not ok then
+		return sh:exec(...)
+	end
+	local d = M.shlvl_delta
+	M.shlvl_delta = d - 1
+	local eok, err = pcall(sh.exec, sh, ...)
+	M.shlvl_delta = d
+	if not eok then
+		error(err, 0)
+	end
+end
 function Shell:exec(...)
+	if self.shlvl_tail then
+		return M.exec_tail_lvl(self, ...)
+	end
 	local args = { ... }
 	local n = #args
 	if n == 0 then
@@ -1943,6 +2020,7 @@ function Shell:exec(...)
 			if not self.exec_builtin and self.functions.command_not_found_handle and not self.in_cnf_handle then
 				self.in_cnf_handle = true -- (a miss inside the handler itself is just reported)
 				local ok, err = pcall(self.subshell_run, self, function(sh)
+					sh.subdepth = sh.subdepth - 1 -- (the forked child of a simple command: no new level)
 					require("interp")._int.exec_simple(sh, { "command_not_found_handle", unpack(args, 1, n) }, function() end)
 				end)
 				self.in_cnf_handle = nil
@@ -1992,7 +2070,7 @@ function Shell:exec(...)
 			if e == 8 then -- ENOEXEC: no-shebang script — run it through our interpreter
 				return self:run_noexec(execpath, args, n)
 			end
-			self:errmsg("curse: " .. (self.exec_builtin and "exec: " or "") .. M.err_name(tostring(args[1])) .. (e == 2 and (self.exec_builtin and ": not found\n" or ": command not found\n") or ": Permission denied\n"))
+			self:errmsg(M.spawn_errmsg(self, args[1], execpath, e))
 			self.status = (e == 2) and 127 or 126
 			return
 		end
@@ -2155,6 +2233,9 @@ function Shell:capture_src(src, backtick, noalias, line0)
 	-- self: $()/`` expand aliases from the live table (unless already expanded as read)
 	-- (line0: compiled code's command line — its sh.cur_line isn't kept per command)
 	local pok, parsed = pcall(P.parse, src, self, nil, noalias, nil, line0 or self.cur_cline or self.cur_line)
+	if pok and type(parsed) == "table" then
+		P.mark_tail(parsed.stmts)
+	end
 	if not pok then
 		if backtick then
 			io.stderr:write("curse: command substitution: " .. tostring(parsed) .. "\n")
@@ -2220,7 +2301,7 @@ function Shell:capture_src(src, backtick, noalias, line0)
 	-- live alias table it parses with — none when read with aliases already expanded) — the
 	-- guarded slow path of a compiled $(…) and the backticks parsed at expansion time.
 	local ln = line0 or self.cur_cline or self.cur_line
-	local mod = require("tier").try_fragment(src, ln and ln > 0 and ln or nil, self, nil, nil, noalias)
+	local mod = require("tier").try_fragment(src, ln and ln > 0 and ln or nil, self, nil, "cmdsub", noalias)
 	if mod then
 		local run_compiled = require("tier").run_compiled
 		if (iso or not mod.nofork) and not has_perr then
@@ -2296,7 +2377,8 @@ function Shell:capture_inproc(backtick, runner, capfd, ctx)
 	if not (self.opt_posix or (self.shopt and self.shopt.inherit_errexit)) then
 		self.opt_e = false
 	end
-	local saved_line = self.cur_line -- $LINENO: the sub's internal lines don't leak out
+	local saved_line, saved_cc, saved_tl = self.cur_line, self.cur_cmd, self.shlvl_tail -- $LINENO: the sub's internal lines don't leak out
+	self.shlvl_tail = nil
 	-- $() is a child: it INHERITS the parent's aliases but its own alias/unalias
 	-- do not leak back out (bash). Give it an independent copy, restored after.
 	local saved_aliases = self.aliases
@@ -2336,7 +2418,7 @@ function Shell:capture_inproc(backtick, runner, capfd, ctx)
 		M.iso_restore_fds(ctx) -- (`exec 4>&1` in the body: undone while fd 1 is still the capture)
 	end
 	self.aliases = saved_aliases -- discard aliases defined inside $()
-	self.cur_line = saved_line
+	self.cur_line, self.cur_cmd, self.shlvl_tail = saved_line, saved_cc, saved_tl -- ($BASH_COMMAND: the child's was its own)
 	self.opt_e = savede
 	self.loopdepth = saved_ld
 	self.in_subprogram = self.in_subprogram - 1
@@ -2474,8 +2556,9 @@ local function sub_checkpoint(self)
 		locale_gen = M.locale_gen, dirstack = self.dirstack, hashcache = self.hashcache, getopts = self.getopts_state,
 		cwd = self:phys_cwd(), tcwd = self.tcwd, um = C.umask(0), disabled = self.disabled_builtins,
 		fn_ro = self.fn_ro, unset_specials = self.unset_specials, random_plain = self.random_plain,
-		shellopts_exported = self.shellopts_exported,
+		shellopts_exported = self.shellopts_exported, bav = self.bav,
 	}
+	self.bav = shallowcopy(self.bav)
 	self.fn_ro, self.unset_specials = shallowcopy(self.fn_ro), shallowcopy(self.unset_specials)
 	self.disabled_builtins = shallowcopy(self.disabled_builtins)
 	C.umask(cp.um)
@@ -2527,7 +2610,7 @@ local function sub_restore(self, cp)
 	self.dirstack, self.hashcache, self.getopts_state = cp.dirstack, cp.hashcache, cp.getopts
 	local of, ov = opt_fields(), cp.opts
 	for i = 1, #of do self[of[i]] = ov[i] end
-	self.savedstack, self.tenv = cp.savedstack, cp.tenv
+	self.savedstack, self.tenv, self.bav = cp.savedstack, cp.tenv, cp.bav
 	self.disabled_builtins = cp.disabled
 	self.fn_ro, self.unset_specials, self.random_plain = cp.fn_ro, cp.unset_specials, cp.random_plain
 	self.shellopts_exported = cp.shellopts_exported
@@ -3068,7 +3151,8 @@ end
 
 function Shell:subshell_run(runner, saves, paren)
 	local cp = sub_checkpoint(self)
-	local sv_out, sv_line = self.out, self.cur_line
+	local sv_out, sv_line, sv_cc, sv_tl = self.out, self.cur_line, self.cur_cmd, self.shlvl_tail
+	self.shlvl_tail = nil
 	local sv_ld, sv_ne, sv_alias = self.loopdepth, self.noerr, self.aliases
 	self.aliases = shallowcopy(self.aliases) or {}
 	self.in_subprogram = (self.in_subprogram or 0) + 1
@@ -3121,7 +3205,8 @@ function Shell:subshell_run(runner, saves, paren)
 	end
 
 	if saves then M.redir_restore(saves) end
-	self.out, self.cur_line = sv_out, sv_line
+	self.out, self.cur_line, self.cur_cmd = sv_out, sv_line, sv_cc -- ($BASH_COMMAND: the child's was its own)
+	self.shlvl_tail = sv_tl
 	self.loopdepth, self.noerr, self.aliases = sv_ld, sv_ne, sv_alias
 	self.in_subprogram = self.in_subprogram - 1
 	self.paren_sp = sv_psp
@@ -3630,7 +3715,10 @@ function Shell:spawn_bg(args, cmdstr)
 		attr = async_spawn_hold(attr)
 	end
 	M.rd_gen = M.rd_gen + 1 -- (a new process may read our input: see M.pipe_cache)
+	local lvd = M.shlvl_delta -- (bash execs the job's command in place of its child: SHLVL - 1)
+	M.shlvl_delta = lvd - 1
 	local cenv = M.child_env() -- (bash's order; kept alive across the call)
+	M.shlvl_delta = lvd
 	local rc = C.posix_spawnp(pidp, execpath, fa, attr, ffi.cast("char *const *", argv), cenv)
 	if hold then
 		async_spawn_release()
@@ -4641,6 +4729,9 @@ function Shell:bg_launch(fn, cmdstr, flat, simple, upv_get, upv_set, opts)
 			t.sh.in_pipestage = (t.sh.in_pipestage or 1) - 1 -- (not a pipeline stage: an async list)
 			t.sh.in_subprogram = (t.sh.in_subprogram or 0) + 1
 			t.sh.loopdepth = g.simple and self.loopdepth or 0 -- (a simple job keeps it: stage_kind)
+			if g.simple then -- (bash execs a `cmd &` job's external in place: rt.exec_tail_lvl)
+				t.sh.shlvl_tail = t.sh.pd
+			end
 			if bufcap then -- inside a buffered $(…): its output is the substitution's too
 				t.sh.out, t.sh.capturing = self.out, true
 			end
@@ -5702,6 +5793,15 @@ function path_cache(curpath)
 	end
 	return PC
 end
+-- `hash -r` forgets everything bash would have hashed, this process's found-command
+-- cache too (else a removed file is still "found"); `hash NAME` looks NAME up afresh.
+function M.path_cache_forget(name)
+	if name then
+		PC.map[name] = nil
+	else
+		PC.key, PC.map = nil, {}
+	end
+end
 -- The diagnostic for a spawn that failed with errno `rc`. A PATH/hash-resolved command
 -- whose file then fails ENOENT is named by its PATH (bash: the hashed file is gone, or
 -- — the file exists — its interpreter is: "cannot execute: required file not found").
@@ -5713,6 +5813,10 @@ function M.spawn_errmsg(self, name, execpath, rc)
 			return pre .. shown .. ": cannot execute: required file not found\n"
 		end
 		return pre .. shown .. ": No such file or directory\n"
+	end
+	if rc == 13 and execpath and not self.exec_builtin and ffi.C.curse_rt_stat(execpath, stbuf_a) == 0
+		and bit.band(ffi.cast("uint32_t *", stbuf_a + 24)[0], 0xF000) == 0x4000 then
+		return pre .. M.err_name(tostring(name)) .. ": Is a directory\n" -- (shell_execve: EISDIR)
 	end
 	return pre .. M.err_name(tostring(name)) .. (rc == 2 and (self.exec_builtin and ": not found\n" or ": command not found\n") or ": Permission denied\n")
 end
@@ -7218,33 +7322,50 @@ function Shell:dirstack_array() -- (sh.dirstack: the entries below the cwd, bott
 	end
 	return t
 end
--- BASH_ARGV / BASH_ARGC (bash maintains them only under extdebug): every frame's
--- positional parameters, innermost frame first and each frame's own args reversed; and
--- each frame's count.
-function Shell:frame_params()
-	local fr = { { self.params, self.nparams } }
-	for d = self.pd, 1, -1 do
-		fr[#fr + 1] = { self.paramstack[d], self.npstack[d] }
+-- BASH_ARGV / BASH_ARGC (bash maintains them only under extdebug): a stack of frames
+-- (sh.bav, innermost last), each a SNAPSHOT of the arguments a function call or `source`
+-- got, taken as it began (push_args) — a later `set --`/`shift` doesn't touch them. The
+-- bottom one is the positional parameters when extdebug was first turned on
+-- (init_bash_argv). Read innermost frame first, each frame's args reversed; the counts.
+-- f.d: the call depth whose return pops it (a source frame: -1, source_leave pops it).
+function M.bav_push(sh, list, i, j, d)
+	local f = { d = d, n = j - i + 1 }
+	for k = i, j do
+		f[k - i + 1] = list[k]
 	end
-	return fr
+	local bv = sh.bav
+	if not bv then
+		bv = {}
+		sh.bav = bv
+	end
+	bv[#bv + 1] = f
+	return f
+end
+function M.bav_init(sh)
+	if not sh.bav_init then
+		sh.bav_init = true
+		local f = { d = 0, n = sh.nparams }
+		for k = 1, sh.nparams do
+			f[k] = sh.params[k]
+		end
+		sh.bav = sh.bav or {}
+		table.insert(sh.bav, 1, f)
+	end
 end
 function Shell:bash_argv_array()
-	local t = {}
-	if self.shopt.extdebug then
-		for _, f in ipairs(self:frame_params()) do
-			for k = f[2] or 0, 1, -1 do
-				t[#t + 1] = f[1][k] or ""
-			end
+	local t, bv = {}, self.bav or {}
+	for i = #bv, 1, -1 do
+		local f = bv[i]
+		for k = f.n, 1, -1 do
+			t[#t + 1] = f[k] or ""
 		end
 	end
 	return t
 end
 function Shell:bash_argc_array()
-	local t = {}
-	if self.shopt.extdebug then
-		for _, f in ipairs(self:frame_params()) do
-			t[#t + 1] = tostring(f[2] or 0)
-		end
+	local t, bv = {}, self.bav or {}
+	for i = #bv, 1, -1 do
+		t[#t + 1] = tostring(bv[i].n)
 	end
 	return t
 end
@@ -7383,11 +7504,11 @@ M.assoc_bucket = assoc_bucket
 -- below 0 is 0, 1000 and up warns and resets to 1), exported.
 M.shlvl_delta = 0
 M.env_drop_us = false
-function M.shlvl_start(sh)
+function M.shlvl_start(sh, d) -- (d: an exec'd command's -1 first)
 	local b = sh.vars.SHLVL
 	local v = b and sh:get("SHLVL") or ""
 	local n = v:match("^%s*[+-]?%d+%s*$") and tonumber(v) or 0
-	n = n + 1
+	n = n + 1 + (d or 0)
 	if n < 0 then
 		n = 0
 	elseif n >= 1000 then
@@ -8849,16 +8970,23 @@ function M.time_text(sh, real, user, sys, posix)
 	else
 		fmt = "\nreal\t%3lR\nuser\t%3lU\nsys\t%3lS"
 	end
+	-- (print_formatted_time: %% and %P, else %[digit][l] then R/E/U/S; any other
+	-- character is an error that prints nothing else. A lone trailing % is literal.)
 	local out, i, n = {}, 1, #fmt
 	while i <= n do
 		local c = fmt:sub(i, i)
-		if c == "%" and i < n then
-			local j, prec, long = i + 1, 3, false
+		if c ~= "%" or i == n then
+			out[#out + 1] = c
+			i = i + 1
+		else
+			local j = i + 1
 			local d = fmt:sub(j, j)
 			if d == "%" then
 				out[#out + 1] = "%"
-				i = j + 1
+			elseif d == "P" then
+				out[#out + 1] = ("%.2f"):format(real > 0 and ((user + sys) * 100 / real) or 0)
 			else
+				local prec, long = 3, false
 				if d:match("%d") then
 					prec = math.min(3, tonumber(d))
 					j = j + 1
@@ -8869,25 +8997,18 @@ function M.time_text(sh, real, user, sys, posix)
 					j = j + 1
 					d = fmt:sub(j, j)
 				end
-				local v = (d == "R" and real) or (d == "U" and user) or (d == "S" and sys)
-				if d == "P" then
-					v = real > 0 and ((user + sys) * 100 / real) or 0
+				local v = ((d == "R" or d == "E") and real) or (d == "U" and user) or (d == "S" and sys)
+				if not v then
+					io.stderr:write("curse: TIMEFORMAT: `" .. d .. "': invalid format character\n")
+					return ""
 				end
-				if v then
-					if long and d ~= "P" then
-						out[#out + 1] = ("%dm%." .. prec .. "fs"):format(math.floor(v / 60), v % 60)
-					else
-						out[#out + 1] = ("%." .. prec .. "f"):format(v)
-					end
-					i = j + 1
+				if long then
+					out[#out + 1] = ("%dm%." .. prec .. "fs"):format(math.floor(v / 60), v % 60)
 				else
-					out[#out + 1] = c
-					i = i + 1
+					out[#out + 1] = ("%." .. prec .. "f"):format(v)
 				end
 			end
-		else
-			out[#out + 1] = c
-			i = i + 1
+			i = j + 1
 		end
 	end
 	return table.concat(out) .. "\n"
@@ -11415,7 +11536,18 @@ function M.eval(sh, argv)
 	end
 	return M.eval_run(sh, argv)
 end
+-- The compiled `eval`/`source` statements: then $_ is the command's own last argument
+-- (the command name when it has none), as after any simple command.
+function M.eval_u(sh, argv)
+	M.eval(sh, argv)
+	sh:set_str("_", argv[#argv])
+end
+function M.source_u(sh, argv, line)
+	M.source(sh, argv, line)
+	sh:set_str("_", argv[#argv])
+end
 function M.eval_run(sh, argv)
+	sh.shlvl_tail = nil -- (a builtin: the code it runs isn't exec'd in place)
 	local a2 = argv[2]
 	if a2 and a2 ~= "-" and a2 ~= "--" and a2:sub(1, 1) == "-" then
 		return require("b_eval")(sh, "eval", argv, _noop, nil) -- (the usage error: b_eval's)
@@ -11498,8 +11630,11 @@ end
 -- continue/exit propagate to the caller; the RETURN trap fires after, like b_source.
 -- `source`'s call frame (bash): ${BASH_SOURCE[0]} is the file as named, BASH_LINENO gets
 -- the `source` line, FUNCNAME gains "source" (shown only inside a function). Shared by both tiers.
-function M.source_enter(sh, name, line) -- line: the `source` command's (else found on the stack)
+function M.source_enter(sh, name, line, args, j) -- line: the `source` command's (else found on the stack)
 	local fr = { src = sh.cur_source, line = sh.cur_line }
+	if args and sh.shopt.extdebug then -- (BASH_ARGV: its arguments, else the file as named)
+		fr.bav = #args > j and M.bav_push(sh, args, j + 1, #args, -1) or M.bav_push(sh, args, j, j, -1)
+	end
 	sh.srcstack = sh.srcstack or {}
 	table.insert(sh.srcstack, 1, sh.cur_source or sh.argv0 or "")
 	sh.linestack = sh.linestack or {}
@@ -11511,6 +11646,15 @@ function M.source_enter(sh, name, line) -- line: the `source` command's (else fo
 	return fr
 end
 function M.source_leave(sh, fr)
+	local bv = fr.bav and sh.bav
+	if bv then
+		for i = #bv, 1, -1 do
+			if bv[i] == fr.bav then
+				table.remove(bv, i)
+				break
+			end
+		end
+	end
 	table.remove(sh.srcstack, 1)
 	table.remove(sh.linestack, 1)
 	if fr.fn then
@@ -11544,6 +11688,7 @@ function M.source(sh, argv, line)
 	return M.source_run(sh, argv, line)
 end
 function M.source_run(sh, argv, line)
+	sh.shlvl_tail = nil -- (a builtin: the code it runs isn't exec'd in place)
 	local I = require("interp")
 	local Ii = I._int
 	local j = 2
@@ -11588,7 +11733,7 @@ function M.source_run(sh, argv, line)
 	end
 	local ownp = sh.params -- (a `set --` in the file replaces this table)
 	sh.sourcedepth = (sh.sourcedepth or 0) + 1 -- a `return` is valid while sourcing
-	local fr = M.source_enter(sh, name, line)
+	local fr = M.source_enter(sh, name, line, argv, j)
 	local dsave, e0 = M.source_debug_hide(sh), sh.traps and sh.traps.ERR
 	local sxd = sh.xdepth -- (a sourced file traces one level deeper, as b_source)
 	sh.xdepth = (sxd or 0) + 1
@@ -11665,6 +11810,7 @@ function M.exec_dynamic(sh, argv, hook, hadcs, no_func)
 	-- one was performed (`$(exit 42)` -> 42, bare `false` -> 1), else 0 (bash) — matching interp.
 	if n == 0 then
 		sh.status = hadcs and (sh.last_cmdsub_status or 0) or 0
+		sh:array_assign("PIPESTATUS", { tostring(sh.status) }, false)
 		return
 	end
 	local I = require("interp")

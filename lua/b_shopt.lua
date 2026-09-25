@@ -134,6 +134,9 @@ return function(sh, cmd, args, hook, tcb)
 					sh.shopt[nm] = set_
 					if nm == "extdebug" then -- (shopt.c shopt_set_debug_mode: function and error
 						sh.opt_functrace, sh.opt_errtrace = set_, set_ -- tracing follow it)
+						if set_ then
+							rt.bav_init(sh) -- (BASH_ARGV's bottom frame: init_bash_argv)
+						end
 					end
 				end
 			end

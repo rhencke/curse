@@ -79,6 +79,7 @@ function M.try_fragment(code, line1, sh, now, label, noalias) -- line1: an eval'
 	-- line1 == false: a trap handler, whose commands keep the interrupted line;
 	-- label "eval": its syntax errors read `eval: line N:` and end just the eval)
 	local mode = trap_mode(sh) .. (line1 == false and "H" or "") .. (label == "eval" and "V" or "")
+		.. (label == "cmdsub" and "C" or "") -- (a $( … ) body: its last command is marked, P.mark_tail)
 	local asig = not noalias and alias_sig(sh) -- (noalias: text read with its aliases expanded)
 	local key = mode .. "\0" .. (asig and ("A" .. asig .. "\0") or "") .. (line1 and (line1 .. "\0" .. code) or code)
 	local hit = frag_cache[key]
@@ -115,6 +116,9 @@ function M.compile_fragment(code, line1, mode, atab)
 	-- reports and raises __curse_parseerr, which the caller (eval/source/trap) contains.
 	if not pok or type(ast) ~= "table" then
 		return nil
+	end
+	if mode and mode:find("C", 1, true) then
+		P.mark_tail(ast.stmts)
 	end
 	for k, st in ipairs(ast.stmts) do
 		if st.t == "parse_error" then
