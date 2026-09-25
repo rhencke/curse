@@ -380,10 +380,22 @@ return function(sh, cmd, args, hook, tcb)
 				elseif c == "\1" and not nomark then
 					buf[#buf + 1] = "\1\1" -- DOUBLE a real CTLESC byte so it
 					-- survives the \1-marker unescape below
-				elseif nchars and c:byte() >= 0xC0 and rt.lc_mb_cur_max() > 1 then
+				elseif nchars and c:byte() >= 0xC0 and rt.lc_mb_cur_max() > 1 and rt.lc_utf8() then
 					-- -n/-N count CHARACTERS in a multibyte locale: take the rest of a UTF-8
 					-- sequence along with its lead byte (one buf entry = one character)
 					buf[#buf + 1] = mb_rest(st, c)
+				elseif c:byte() >= 0x80 and rt.lc_mb_cur_max() > 1 and not rt.lc_utf8() then
+					-- (read_mbchar: a non-UTF-8 multibyte char — Big5's trail byte can be a `\`
+					-- — is read whole, so its bytes are never an escape or delimiter)
+					local ch = c
+					while #ch < 8 and rt.mb_incomplete(ch) do
+						local d = getc(st)
+						if d == nil then
+							break
+						end
+						ch = ch .. d
+					end
+					buf[#buf + 1] = ch
 				else
 					buf[#buf + 1] = c
 				end

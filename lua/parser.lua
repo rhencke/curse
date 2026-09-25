@@ -1352,7 +1352,11 @@ local function parse_dollar(w, i, add, q)
 				j = j + 1
 			end
 		end
-		add({ lit = require("runtime").ansi_unescape(table.concat(buf), true), q = true })
+		local raw = table.concat(buf)
+		-- (a \u/\U code point is encoded in the locale current when the line is parsed —
+		-- `ansic` keeps the source so the compiled tier encodes it when the line runs)
+		add({ lit = require("runtime").ansi_unescape(raw, true), q = true,
+			ansic = raw:find("\\[uU]%x") and raw or nil })
 		return j + 1
 	elseif nx == "{" then
 		-- find the MATCHING } — honoring \-escapes, '…'/"…" quoting, and nested ${…}
@@ -1977,7 +1981,15 @@ local function parse_dbracket(toks, quoted)
 			pos = pos + 1
 			local r = toks[pos]
 			pos = pos + 1
-			return { kind = "binary", op = op, l = parse_word(t), r = parse_word(r or ""), rq = quoted[pos - 1] }
+			local rw = parse_word(r or "")
+			local rq = quoted[pos - 1] -- (fully quoted: `"a"*` starts with a quote yet globs)
+			for _, p in ipairs(rq and rw.parts or {}) do
+				if not p.q then
+					rq = false
+					break
+				end
+			end
+			return { kind = "binary", op = op, l = parse_word(t), r = rw, rq = rq }
 		end
 		return { kind = "str", word = parse_word(t or "") }
 	end
