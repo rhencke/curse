@@ -1680,7 +1680,7 @@ end
 -- quote_string_for_repl).
 local REPL_META = "[&\\]"
 expand_repl = function(sh, w)
-	local amp = sh.shopt.patsub_replacement
+	local amp = sh.shopt.patsub_replacement ~= false -- (on by default)
 	local buf = {}
 	for i, p in ipairs(w.parts) do
 		local s = expand_part_str(sh, p)

@@ -10126,7 +10126,7 @@ function Shell:apply_str_op(op, val, arg, arg2, ltxt)
 	end
 	if op == "/" or op == "//" then -- (nocasematch folds case here too, bash 5.2)
 		arg2 = arg2 or ""
-		local rx = self.shopt.patsub_replacement and M.repl_expands(arg2)
+		local rx = self.shopt.patsub_replacement ~= false and M.repl_expands(arg2)
 		return M.subst_glob(val, arg, arg2, op == "//", self.shopt.nocasematch, rx)
 	end
 	if op == "sub" then

@@ -818,7 +818,7 @@ local function gen_compspec(sh, cs, word, hook)
 	if cs.G then -- (glob_filename: just the pattern — the word isn't used)
 		local m = rt.glob_expand(cs.G, {
 			dotglob = sh.shopt.dotglob,
-			skipdots = sh.shopt.globskipdots,
+			skipdots = sh.shopt.globskipdots ~= false,
 			globstar = sh.shopt.globstar,
 			nocase = sh.shopt.nocaseglob,
 		})
