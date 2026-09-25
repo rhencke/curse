@@ -937,6 +937,7 @@ end
 function EF.xta(lhs, v) -- an assignment `lhs` (`x=`, `a[i]+=`) of the expanded value v
 	return EF.xtrace and ("if sh.opt_x then %srt.xtrace_assign(sh, %q, %s) end "):format(EF.xln(), lhs, v) or ""
 end
+EF.has_return = false -- program may set a RETURN trap → compiled calls fire it (fnwrap)
 EF.funcstack = false -- program reads $FUNCNAME → maintain sh.funcstack around calls
 EF.pipestatus = false -- program reads $PIPESTATUS → set it (=(status)) after each simple cmd
 EF.has_trap = false -- program installs any trap → a forked `&`/pipeline child must reset caught signal traps
@@ -969,15 +970,21 @@ end
 -- neither applies. (Inline is disabled when a trap is present, so all calls come here.)
 local function fnwrap(cmd, line, s)
 	local pre, post = "", ""
+	-- a RETURN trap (set now, or one a function may set): it fires as the callee returns,
+	-- in its frame, and `return N` there parks N in sh.fret so the trap sees the $? from
+	-- before it (rt.fn_return); a top-level one is hidden from the callee (rt.debug_enter)
+	if EF.has_return then
+		post = ("; rt.fn_return(sh, %q)"):format(cmd)
+	end
 	if EF.funcstack then
 		pre = ("sh:enterFunc(%q, %d); "):format(cmd, line or 0)
-		post = "; sh:leaveFunc()"
+		post = post .. "; sh:leaveFunc()"
 	end
-	if EF.has_err or EF.has_debug or EF.trap_ret then
+	if EF.has_err or EF.has_debug or EF.trap_ret or EF.has_return then
 		pre = pre .. "sh.calldepth = sh.calldepth + 1; "
 		post = post .. "; sh.calldepth = sh.calldepth - 1"
 	end
-	if EF.has_debug or EF.has_err then -- the callee doesn't inherit DEBUG/ERR (rt.debug_enter)
+	if EF.has_debug or EF.has_err or EF.has_return then -- the callee doesn't inherit DEBUG/ERR/RETURN (rt.debug_enter)
 		pre = pre .. ("local __dbg = rt.debug_enter(sh, %q); "):format(cmd)
 		post = post .. "; rt.debug_leave(sh, __dbg)"
 	end
@@ -4704,6 +4711,11 @@ H.simple = function(cx, st, after)
 	return g
 end
 -- (control-flow builtins: a function can't usefully shadow them from outside a fragment)
+-- where a function body's `return N` puts N: sh.fret when a RETURN trap may see the call
+-- return (fnwrap's rt.fn_return applies it after the trap), else $? directly
+function EF.retset(cx, w2)
+	return (w2 and EF.has_return and #cx.subexit == 0 and not cx.toplevel and not cx.topcode) and "sh.fret" or "sh.status"
+end
 EF.FRAG_CF = { ["break"] = 1, ["continue"] = 1, ["return"] = 1, ["exit"] = 1 }
 -- A command dispatched by its EXPANDED argv (the first word resolves at run time — a
 -- dynamic `$cmd`, or a builtin name a function may shadow): the words built by the field
@@ -5594,13 +5606,13 @@ simple_compiled = function(cx, st, after)
 				xn[#xn + 1] = "__x" .. (j - 1)
 			end
 			local n = w2 and ("rt.return_code(sh, %s)"):format(xn[#xn]) or "sh.status"
-			cx.blocks[p] = ("do %s%ssh.status = (%s) or 0 end; pc = %d"):format(
+			cx.blocks[p] = ("do %s%s" .. EF.retset(cx, w2) .. " = (%s) or 0 end; pc = %d"):format(
 				#xa > 0 and ("local %s = %s; "):format(table.concat(xn, ", "), table.concat(xa, ", ")) or "",
 				EF.xtc("return", "{" .. table.concat(xn, ", ") .. "}"), n, cx.DONE)
 			return p
 		end
 		local n = w2 and ("rt.return_code(sh, %s)"):format(emit_word(w2, cx.lifted)) or "sh.status"
-		cx.blocks[p] = ("sh.status = (%s) or 0; pc = %d"):format(n, cx.DONE)
+		cx.blocks[p] = (EF.retset(cx, w2) .. " = (%s) or 0; pc = %d"):format(n, cx.DONE)
 		return p
 	end
 	if cx.inlinefns and cx.inlinefns[cmd] and not redir_apply then
@@ -7343,8 +7355,13 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
 					return p
 				elseif word_safe(aw) then -- one field (literal/quoted): `return ""` → 2, `return 42` → 42
 					local p = cx.newpc()
+					-- (a function's `return N` under a possible RETURN trap: N waits in sh.fret —
+					-- the trap sees the $? from before it; the call's epilogue applies it)
+					local fret = EF.has_return and not frag_return and #cx.subexit == 0
+						and not cx.toplevel and not cx.topcode
 					cx.blocks[p] = d .. ps
-						.. ("sh.status = rt.return_status(sh, %s); "):format(emit_word(aw, cx.lifted)) .. retjmp
+						.. (fret and "sh.fret = rt.return_status(sh, %s); " or "sh.status = rt.return_status(sh, %s); "):format(
+							emit_word(aw, cx.lifted)) .. retjmp
 					return p
 				elseif field_word(aw, cx.lifted) then -- unquoted expansion: split — 0 fields → $?, else 1st field
 					local fw = field_word(aw, cx.lifted)
@@ -7937,10 +7954,9 @@ function M.emit(ast, opts)
 	-- (or the shell started tracing: `bash -x script`, SHELLOPTS=xtrace — opts.xtrace)
 	EF.xtrace = xt or EF.fragment or scan_dyncode(ast.stmts) or (opts and opts.xtrace) or false
 	-- a RETURN trap fires as each function returns (one set during a call, or inherited
-	-- under functrace): interp's run_function does that; compiled calls don't
-	if scan_trap(ast.stmts, { RETURN = 1 }) then
-		error("curse-nocompile: RETURN trap")
-	end
+	-- under functrace): compiled calls run it (fnwrap) when the program may set one —
+	-- itself, or through eval/source code, or (a fragment) around it
+	EF.has_return = EF.fragment or scan_trap(ast.stmts, { RETURN = 1 }) or scan_dyncode(ast.stmts)
 	if scan_trap_loopctl(ast.stmts) then
 		error("curse-nocompile: break/continue in a trap")
 	end

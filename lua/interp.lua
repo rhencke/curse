@@ -4666,6 +4666,9 @@ local function run_function(sh, cmd, fn, args, hook, tenv_base)
 	-- `return N` sets the function's status but not $? (return.def: only return_catch_value),
 	-- so the RETURN trap sees the status from before it; N is $? once the trap has run
 	local rret
+	if ok and sh.fret then -- (a compiled body's `return N`, parked for the RETURN trap)
+		rret, sh.fret = sh.fret, nil
+	end
 	if not ok and type(err) == "table" and err.__curse_return then
 		rret = err.__curse_return
 		ok, err = true, nil
@@ -7076,7 +7079,8 @@ end
 local trap_seen, trap_seen_n = {}, 0 -- (handler texts run once: the next run compiles)
 -- (an INTERP_FRAMES runner: the compiled handler's error prefixes read sh.cur_line)
 local function run_trap_mod(mod, sh)
-	return require("tier").run_compiled(mod, sh, nil, true)
+	local r = require("tier").run_compiled(mod, sh, nil, true) -- (no tail call: this frame
+	return r -- must stay on the stack for rt.current_line to find)
 end
 rt.INTERP_FRAMES[run_trap_mod] = true
 run_trap = function(sh, code)

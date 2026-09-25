@@ -12563,5 +12563,29 @@ function M.xtrace_arrlit(sh, name, items)
 	end
 	M.xtrace_line(sh, name .. "=(" .. table.concat(o, " ") .. ")")
 end
+-- A compiled function call returning (fnwrap, in a program that may set a RETURN trap):
+-- the RETURN trap fires in the callee's frame — one present now was inherited (functrace)
+-- or set during the call — with the $? from before a `return N`, whose N (parked in
+-- sh.fret) is $? once the trap has run. Exactly interp's run_function epilogue.
+function M.fn_return(sh, name)
+	local fret = sh.fret
+	sh.fret = nil
+	local h = sh.traps and sh.traps.RETURN
+	if h and h ~= "" and not sh.in_return_trap and not sh.in_debug
+		and ((sh.in_subprogram or 0) == 0 or M.pseudo_trapped(sh, "RETURN")) then
+		sh.in_return_trap = true
+		local saved, sl = sh.status, sh.cur_line
+		sh.cur_line = sh.func_bline and sh.func_bline[name] or sh.cur_line
+		local ok, err = pcall(require("interp")._int.run_trap, sh, h)
+		sh.status, sh.cur_line = saved, sl
+		sh.in_return_trap = false
+		if not ok then
+			error(err, 0)
+		end
+	end
+	if fret then
+		sh.status = fret
+	end
+end
 
 return M
