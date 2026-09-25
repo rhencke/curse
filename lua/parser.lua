@@ -1542,6 +1542,22 @@ local function parse_word(w)
 			parse_dquote(w:sub(i + 1, j - 1), add)
 			if #parts == before then
 				parts[#parts + 1] = { lit = "", q = true }
+			elseif #parts > before + 1 then
+				-- a "…" holding "$@"/"${a[@]}" besides other parts: when the @ expands to no
+				-- words and the rest to empty, the whole segment is no word (subst.c: the
+				-- inner expand_word_internal returns NULL for "$e$@"), unlike "$e""$@". Tag the
+				-- segment's parts (dqat = its first part's index; dqend on its last).
+				for k = before + 1, #parts do
+					local pk = parts[k]
+					local pe = pk.pexp
+					if pk.special == "@" or (pe and (pe.name == "@" or pe.index == "@")) then
+						for k2 = before + 1, #parts do
+							parts[k2].dqat = before + 1
+						end
+						parts[#parts].dqend = true
+						break
+					end
+				end
 			end -- empty "" is still a field
 			for k = before + 1, #parts do -- (a bad ${…} in "…" reports the quoted text)
 				local pe = parts[k].pexp
@@ -3411,11 +3427,15 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs)
 					local factors = brace_factors(rhs)
 					if factors then
 						stream_factors(factors, function(x)
-							elems[#elems + 1] = { key = nil, op = "=", word = bq_word(x) }
+							local bw = bq_word(x)
+							bw.noassign = true -- (a bare element's `x=~` is not an assignment: no ~ after =)
+							elems[#elems + 1] = { key = nil, op = "=", word = bw }
 							return #elems >= BRACE_CAP
 						end)
 					else
-						elems[#elems + 1] = { key = nil, op = "=", word = parse_word(rhs) }
+						local bw = parse_word(rhs)
+						bw.noassign = true
+						elems[#elems + 1] = { key = nil, op = "=", word = bw }
 					end
 				else
 					-- KEYED element. bash brace-expands the value only for an INDEXED array,
@@ -3429,7 +3449,9 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs)
 					if factors then
 						elem.brace_bare = {}
 						stream_factors(factors, function(x)
-							elem.brace_bare[#elem.brace_bare + 1] = bq_word(x)
+							local bw = bq_word(x)
+							bw.noassign = true
+							elem.brace_bare[#elem.brace_bare + 1] = bw
 							return #elem.brace_bare >= BRACE_CAP
 						end)
 					end

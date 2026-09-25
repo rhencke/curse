@@ -1630,8 +1630,9 @@ local function expand_pexp(sh, p, assign)
 		arg = pe.arg and tostring(rt.substr_arith(sh, rt.pe_label(pe), arith_expand_text(sh, pe.arg)) or 0) or nil
 		arg2 = pe.arg2 and tostring(rt.substr_arith(sh, rt.pe_label(pe), arith_expand_text(sh, pe.arg2)) or 0) or nil
 	elseif not TESTOP[pe.op] then
-		-- a word-initial ~ in a pattern / replacement expands (${p//~/z}, ${p#~/x})
-		if type(arg) == "string" then
+		-- a word-initial ~ in a pattern / replacement expands (${p//~/z}, ${p#~/x}) — a
+		-- pattern's own (unquoted-only) tilde is expand_pattern's: a quoted `\~`/"~" is literal
+		if type(arg) == "string" and not patmode then
 			arg = tilde_prefix(sh, arg)
 		end
 	end
@@ -1898,13 +1899,47 @@ expand_pattern = function(sh, w)
 	end
 	return expand_escaped(sh, w, PAT_META)
 end
+-- A case-clause pattern: bash expands it as ONE word (execute_case_command:
+-- expand_word_leave_quoted, then es->word->word), so a quoted "$@"/"${a[@]}" contributes
+-- only its first element and ends the pattern there when more follow (`x"$@"y` with
+-- `a b` is `xa`) — except under IFS="", where the elements join with a space.
+local function case_pattern(sh, w)
+	local at = false
+	for _, p in ipairs(w.parts) do
+		if p.q and (p.special == "@" or (p.pexp and (p.pexp.name == "@" or p.pexp.index == "@"))) then
+			at = true
+			break
+		end
+	end
+	if not at or rt.ifs(sh) == "" then
+		return expand_pattern(sh, w)
+	end
+	local buf = {}
+	for _, p in ipairs(w.parts) do
+		if p.q and is_multi(sh, p) then
+			local els, star = multi_elems(sh, p)
+			if star then
+				buf[#buf + 1] = table.concat(els, rt.ifs_sep(sh)):gsub(PAT_META, "\\%0")
+			elseif #els > 0 then
+				buf[#buf + 1] = els[1]:gsub(PAT_META, "\\%0")
+				if #els > 1 then
+					break
+				end
+			end
+		else
+			local s = expand_part_str(sh, p)
+			buf[#buf + 1] = p.q and s:gsub(PAT_META, "\\%0") or s
+		end
+	end
+	return table.concat(buf)
+end
 -- Does `subj` match any of the case-clause pattern strings? The compiled tier's case
 -- codegen dispatches clauses natively but matches through this shared helper (vars in
 -- a pattern expand; quoted metachars stay literal), honoring shopt nocasematch.
 function M.case_match(sh, subj, pats)
 	local ic = sh.shopt.nocasematch and true or nil
 	for _, pat in ipairs(pats) do
-		if rt.glob_match(subj, expand_pattern(sh, P.parse_word(pat)), ic) then
+		if rt.glob_match(subj, case_pattern(sh, P.parse_word(pat)), ic) then
 			return true
 		end
 	end
@@ -2446,8 +2481,8 @@ expand_fields_full = function(sh, w, pre1) -- pre1: part 1 already expanded (a $
 		sh._ifscache = ic
 	end
 	local ifsset, mbifs = ic.set, ic.mbifs
-	local function isws(c)
-		return c == " " or c == "\t" or c == "\n"
+	local function isws(c) -- IFS whitespace only (subst.c ifs_whitespace): other whitespace is text
+		return (c == " " or c == "\t" or c == "\n") and ifsset[c]
 	end
 	local function inifs(c)
 		return c ~= "" and ifsset[c]
@@ -2529,11 +2564,18 @@ expand_fields_full = function(sh, w, pre1) -- pre1: part 1 already expanded (a $
 			end
 		end
 	end
+	local dq_null, dq_at -- (a "…" segment tagged dqat: an empty part seen / a "$@" gave no words)
 	for pi, p in ipairs(w.parts) do
 		if is_multi(sh, p) then
 			local els, star, qforced = multi_elems(sh, p) -- qforced: a quoted multi alternate
 			if p.q or qforced then
-				if star then -- "$*" / "${a[*]}" join with the first char of IFS
+				if p.dqat and #els == 0 then
+					if star then
+						dq_null = true
+					else
+						dq_at = true
+					end
+				elseif star then -- "$*" / "${a[*]}" join with the first char of IFS
 					local sep = rt.ifs_sep(sh)
 					add(table.concat(els, sep), false)
 				else
@@ -2687,13 +2729,27 @@ expand_fields_full = function(sh, w, pre1) -- pre1: part 1 already expanded (a $
 			if pi == 1 and p.lit ~= nil and not p.q then
 				-- (posix: `NAME=` args tilde-expand only for declaration builtins — parser
 				-- marks the other commands' args `plainarg`)
-				s = tilde_word_initial(sh, s, #w.parts > 1, sh.opt_posix and w.plainarg)
+				local s0 = s
+				s = tilde_word_initial(sh, s, #w.parts > 1, w.noassign or (sh.opt_posix and w.plainarg))
+				if s ~= s0 and s0:byte(1) == 126 then -- `~…`: the expansion is quoted text — never globbed
+					local tl = #s0 - (s0:find("[/:]") or #s0 + 1) + 1 -- (the text after the tilde-prefix)
+					add(s:sub(1, #s - tl), false)
+					s = s:sub(#s - tl + 1)
+				end
 			end -- word-initial / NAME= ~
-			if p.q or p.lit ~= nil then
+			if p.dqat and s == "" then
+				dq_null = true
+			elseif p.q or p.lit ~= nil then
 				add(s, not p.q)
 			else
 				feed_split(s)
 			end
+		end
+		if p.dqend then -- end of a "…$@…" segment: its empty parts make a null word unless "$@" was empty
+			if dq_null and not dq_at then
+				add("", false)
+			end
+			dq_null, dq_at = nil, nil
 		end
 	end
 	brk()
@@ -5634,11 +5690,14 @@ local function assign_body(sh, st, nref_base, nref_sub)
 			st.append
 		)
 	elseif st.index then
+		-- the VALUE expands before the subscript (bash assign_array_element: `a[$((i=5))]=$i`
+		-- stores the old $i; `a[$(exit 2)1]=$(exit 4)` leaves $? 2)
+		local v = assign_rhs_a(sh, st)
 		local key = array_key(sh, st.name, st.index)
 		if key == "" and sh:is_assoc(st.name) then -- (an associative array has no "" key)
 			error({ __curse_badsub = true })
 		end
-		if not sh:array_set(st.name, key, assign_rhs_a(sh, st), st.append) then
+		if not sh:array_set(st.name, key, v, st.append) then
 			error({ __curse_badsub = true })
 		end
 	elseif st.arith then
@@ -5770,6 +5829,7 @@ exec_stmt = function(sh, st, hook)
 	end -- $LINENO: frozen at the trapped line for the trap's own commands (not in a
 	-- function the trap calls, whose lines count as usual — bash)
 	if t == "assign" then
+		local ncs0 = sh.ncs
 		if st.name == "SHELLOPTS" or st.name == "BASHOPTS" then -- readonly specials (bash)
 			io.stderr:write("curse: " .. st.name .. ": readonly variable\n")
 			sh.status = 1
@@ -5925,19 +5985,9 @@ exec_stmt = function(sh, st, hook)
 		end
 		-- exit status of an assignment = the last command substitution's, else 0
 		-- (skip when it was a rejected readonly assignment, which already set status 1)
+		-- (sh.ncs counts substitutions performed — also ones nested in ${…}, a subscript)
 		if not (rb and rb.ro) then
-			local hascs = false
-			if st.rhs then
-				for _, p in ipairs(st.rhs.parts) do
-					if p.cmdsub then
-						hascs = true
-						break
-					end
-				end
-			end
-			if not hascs then
-				sh.status = 0
-			end
+			sh.status = sh.ncs ~= ncs0 and sh.last_cmdsub_status or 0
 		end
 		sh:set_str("_", "") -- a bare assignment resets $_ to empty (bash)
 	elseif t == "arrayassign" then
@@ -5961,9 +6011,10 @@ exec_stmt = function(sh, st, hook)
 			error({ __curse_exit = 1, __curse_lineabort = not (sh.opt_c or sh.opt_posix) or nil })
 		else
 			-- a failglob no-match inside `a=(*.ZZ)` fails the assignment non-fatally (bash)
+			local ncs0 = sh.ncs
 			local aok, aerr = pcall(do_arrayassign, sh, st)
 			if aok then
-				sh.status = 0
+				sh.status = sh.ncs ~= ncs0 and sh.last_cmdsub_status or 0 -- (`a=( $(exit 3) )`: 3)
 				sh:set_str("_", "")
 			elseif type(aerr) == "table" and aerr.__curse_experr and not aerr.__curse_lineabort then
 				sh.status = 1
@@ -6018,6 +6069,7 @@ exec_stmt = function(sh, st, hook)
 	elseif t == "assignlist" then
 		-- a bad array subscript / bad-subst in one binding aborts the REST of the list
 		-- (bash: `a=x b[0+]=y c=z` sets only a), keeping the error status.
+		local ncs0 = sh.ncs
 		for _, a in ipairs(st.list) do
 			sh.assign_err = nil
 			exec_stmt(sh, a, hook)
@@ -6025,7 +6077,8 @@ exec_stmt = function(sh, st, hook)
 				return
 			end
 		end
-		sh.status = 0
+		-- status: the LAST command substitution's, else 0 (execute_null_command)
+		sh.status = sh.ncs ~= ncs0 and sh.last_cmdsub_status or 0
 	elseif t == "simple" then
 		if sh.opt_k and st.words then
 			-- set -k (keyword): an assignment-shaped word ANYWHERE is an assignment for the
@@ -6081,6 +6134,7 @@ exec_stmt = function(sh, st, hook)
 			or nil
 		local is_assign = cw1lit ~= nil and ASSIGN_CMD[cw1lit] ~= nil or (cw1lit == "unset" and "unset")
 		local args = {}
+		local ncs0 = sh.ncs -- (a command substitution performed while expanding: see below)
 		-- A word-expansion error (bad substitution, invalid indirect name) aborts the
 		-- WHOLE simple command with status 1 but is non-fatal: the script continues.
 		local eok, eerr = pcall(expand_args, sh, st, args, is_assign)
@@ -6108,17 +6162,11 @@ exec_stmt = function(sh, st, hook)
 					-- expansion (`a=(1 2) 2>/dev/null`, `a=(x) $empty`) it's an array assignment
 					exec_stmt(sh, a, hook)
 				end
-			else -- a bare $(...) / redirection: status is the last cmdsub's, else 0
-				local hadcs = false
-				for _, w in ipairs(st.words) do
-					for _, p in ipairs(w.parts) do
-						if p.cmdsub then
-							hadcs = true
-							break
-						end
-					end
+				if sh.status == 0 and sh.ncs ~= ncs0 then -- (`x=1 $(exit 5)`: 5)
+					sh.status = sh.last_cmdsub_status
 				end
-				sh.status = hadcs and (sh.last_cmdsub_status or 0) or 0
+			else -- a bare $(...) / redirection: status is the last cmdsub's, else 0
+				sh.status = sh.ncs ~= ncs0 and sh.last_cmdsub_status or 0
 			end
 			-- a redirection with no command still opens/truncates its target (`> file`)
 			if st.redirs then
@@ -6744,7 +6792,7 @@ exec_stmt = function(sh, st, hook)
 			local matched = fall
 			if not matched then
 				for _, pat in ipairs(cl.pats) do
-					local g = expand_pattern(sh, P.parse_word(pat)) -- vars resolved; quoted metachars literal
+					local g = case_pattern(sh, P.parse_word(pat)) -- vars resolved; quoted metachars literal
 					if rt.glob_match(subj, g, sh.shopt.nocasematch and true or nil) then
 						matched = true
 						break

@@ -657,8 +657,8 @@ end
 -- trailing delimiter not adding a trailing empty.
 function M.ifs_split(ifs, s, nomark) -- (nomark: \1 is not an escape marker — read's skip_ctlesc)
 	local fields, cur = {}, nil
-	local function isws(c)
-		return c == " " or c == "\t" or c == "\n"
+	local function isws(c) -- IFS whitespace (subst.c ifs_whitespace): whitespace NOT in $IFS is ordinary text
+		return (c == " " or c == "\t" or c == "\n") and ifs:find(c, 1, true) ~= nil
 	end
 	local function inifs(c)
 		return c ~= "" and ifs:find(c, 1, true) ~= nil
@@ -2119,15 +2119,16 @@ function Shell:capture_src(src, backtick, noalias)
 		then
 			-- (the file word expands like a redirection target: globbed, except in posix
 			-- mode, and it must name exactly one file)
+			self.ncs = (self.ncs or 0) + 1 -- (a substitution performed: see capture_inproc)
 			local raw = st.redirs[1].src or st.redirs[1].target or "" -- (as written: quotes kept)
 			local eok, fs = M.redir_noglob(self, I.expand_to_fields, self, P.parse_word(raw))
 			if not eok then
-				self.status = 1
+				self.status, self.last_cmdsub_status = 1, 1
 				return ""
 			end
 			if #fs ~= 1 then
 				io.stderr:write("curse: " .. raw .. ": ambiguous redirect\n")
-				self.status = 1
+				self.status, self.last_cmdsub_status = 1, 1
 				return ""
 			end
 			local path = fs[1]
@@ -2135,11 +2136,11 @@ function Shell:capture_src(src, backtick, noalias)
 			if f then
 				local c = f:read("*a") or ""
 				f:close()
-				self.status = 0
-				return (c:gsub("%z", ""):gsub("\n+$", ""))
+				self.status, self.last_cmdsub_status = 0, 0
+				return (M.cmdsub_nul(c):gsub("\n+$", ""))
 			end
 			io.stderr:write("curse: " .. path .. ": No such file or directory\n")
-			self.status = 1
+			self.status, self.last_cmdsub_status = 1, 1
 			return ""
 		end
 	end
@@ -2303,8 +2304,9 @@ function Shell:capture_inproc(backtick, runner, capfd, ctx)
 		end
 	end
 	self.last_cmdsub_status = self.status -- for a command whose argv is empty after expansion
+	self.ncs = (self.ncs or 0) + 1 -- (substitutions performed: an assignment's status is the last one's)
 	-- bash strips NUL bytes from command-substitution output ("ignored null byte")
-	local r = readcap():gsub("%z", ""):gsub("\n+$", "")
+	local r = M.cmdsub_nul(readcap()):gsub("\n+$", "")
 	flush_deferred(self)
 	return r
 end
@@ -3147,16 +3149,27 @@ end
 -- $(< file) / `< file`: bash reads the file's contents (a faster $(cat file)) — a pure
 -- read, no fork. NUL bytes stripped, trailing newlines stripped, status 0; a missing
 -- file is status 1 + diagnostic. The compiled tier calls this with the expanded path.
+-- bash drops NUL bytes from a substitution's output, warning once per substitution
+-- (subst.c read_comsub)
+function M.cmdsub_nul(c)
+	if c:find("%z") then
+		io.stderr:write("curse: warning: command substitution: ignored null byte in input\n")
+		return (c:gsub("%z", ""))
+	end
+	return c
+end
 function Shell:capture_file(path)
 	local f = path ~= "" and M.open_read(path)
 	if f then
 		local c = f:read("*a") or ""
 		f:close()
 		self.status = 0
-		return (c:gsub("%z", ""):gsub("\n+$", ""))
+		self.last_cmdsub_status, self.ncs = 0, (self.ncs or 0) + 1
+		return (M.cmdsub_nul(c):gsub("\n+$", ""))
 	end
 	io.stderr:write("curse: " .. path .. ": No such file or directory\n")
 	self.status = 1
+	self.last_cmdsub_status, self.ncs = 1, (self.ncs or 0) + 1
 	return ""
 end
 
@@ -5367,17 +5380,29 @@ function M.tilde_prefix(sh, s)
 		if sh.vars[sh:deref("HOME")] ~= nil then
 			return sh:get("HOME") .. r
 		end
-		return s
+		local pw = M.pw_by_uid(tonumber(ffi.C.getuid())) -- (HOME unset: the user's passwd entry)
+		return pw and pw.dir ~= "" and (pw.dir .. r) or s
 	end
-	if r == "+" or r:sub(1, 2) == "+/" or r:sub(1, 2) == "+:" then
-		return sh:pwd() .. r:sub(2)
+	if r == "+" or r:sub(1, 2) == "+/" or r:sub(1, 2) == "+:" then -- ~+: $PWD's value (unset: literal)
+		if sh.vars[sh:deref("PWD")] == nil then
+			return s
+		end
+		return sh:get("PWD") .. r:sub(2)
 	end
-	-- ~N / ~+N / ~-N: an entry of the directory stack (N from the top, -N from the bottom)
+	-- ~N / ~+N / ~-N: an entry of the directory stack (N from the top, -N from the bottom);
+	-- the current-directory entry is $PWD's value (pushd.def get_dirstack_from_string)
 	local sign, num, tail = r:match("^([+-]?)(%d+)(.*)$")
 	if num and (tail == "" or tail:sub(1, 1) == "/" or tail:sub(1, 1) == ":") then
 		local ds = sh:dirstack_array()
 		local n = tonumber(num)
-		local e = (sign == "-") and ds[#ds - n] or ds[n + 1]
+		local i = (sign == "-") and #ds - n or n + 1
+		if i == 1 then
+			if sh.vars[sh:deref("PWD")] == nil then
+				return s
+			end
+			return sh:get("PWD") .. tail
+		end
+		local e = ds[i]
 		if e then
 			return e .. tail
 		end
@@ -5427,6 +5452,9 @@ end
 -- `noassign`: don't treat `NAME=` specially (posix mode, a non-declaration command).
 function M.tilde_word_initial(sh, s, more, noassign)
 	local pre, rest = s:match("^([%a_][%w_]*%+?=)(.*)$")
+	if not pre and s:find("]", 1, true) then -- (`a[1]=~`: a subscripted assignment word too)
+		pre, rest = s:match("^([%a_][%w_]*%b[]%+?=)(.*)$")
+	end
 	if pre then
 		if noassign then
 			return s
@@ -8620,6 +8648,14 @@ function M.ifs(sh)
 	end
 	return nil
 end
+function M.ifs_num(sh) -- does $IFS hold a char of an arith result (a digit or '-')?
+	local b = sh.vars.IFS
+	if not b or b.s == " \t\n" then -- (unset / the default: the common case, no sh:get)
+		return false
+	end
+	local v = M.ifs(sh)
+	return v ~= nil and v:find("[%d%-]") ~= nil
+end
 function M.ifs_sep(sh) -- the "$*" joiner
 	local v = M.ifs(sh)
 	return v and M.ifs_first(v) or " "
@@ -8882,8 +8918,8 @@ function M.field_split(sh, value, split)
 			ifsset[ch.s] = true
 		end
 		local mbifs = M.lc_mb_cur_max() > 1 and ifs:find("[\128-\255]") ~= nil
-		local function isws(c)
-			return c == " " or c == "\t" or c == "\n"
+		local function isws(c) -- IFS whitespace only (subst.c ifs_whitespace)
+			return (c == " " or c == "\t" or c == "\n") and ifsset[c]
 		end
 		local function inifs(c)
 			return c ~= "" and ifsset[c]
@@ -9073,6 +9109,12 @@ end
 -- "1"=masked) so `"$x"foo*` globs foo* but not $x's content. $@/$*/array (multi-
 -- element) parts are NOT in this subset — those stay on expand_to_fields. Kept
 -- byte-for-byte in lockstep with expand_to_fields' feed_split/add + glob tail.
+-- Tag a segment as part of a double-quoted "…" that holds "$@" (the parser's dqat/dqend):
+-- if the @ expands to no words and the rest to empty, the segment is no word at all.
+function M.dqseg(seg, dqend)
+	seg.dq, seg.dqend = true, dqend
+	return seg
+end
 function M.expand_fields(sh, segs)
 	local s1 = #segs == 1 and segs[1]
 	if s1 and s1.multi and s1.q and not s1.star then -- a lone "$@" / "${a[@]}": its elements
@@ -9096,8 +9138,8 @@ function M.expand_fields(sh, segs)
 		sh._ifscache = ic
 	end
 	local ifsset, mbifs = ic.set, ic.mbifs
-	local function isws(c)
-		return c == " " or c == "\t" or c == "\n"
+	local function isws(c) -- IFS whitespace only (subst.c ifs_whitespace)
+		return (c == " " or c == "\t" or c == "\n") and ifsset[c]
 	end
 	local function inifs(c)
 		return c ~= "" and ifsset[c]
@@ -9166,8 +9208,15 @@ function M.expand_fields(sh, segs)
 			end
 		end
 	end
+	local dq_null, dq_at -- (a "…$@…" segment's parts, rt.dqseg: as interp's expand_to_fields)
 	for _, seg in ipairs(segs) do
-		if seg.multi then
+		if seg.dq and (seg.multi and #seg.elems == 0 or seg.s == "") then
+			if seg.multi and not seg.star then
+				dq_at = true
+			else
+				dq_null = true
+			end
+		elseif seg.multi then
 			-- a $@ / $* part: multiple elements (seg.elems), joined/split per bash. Quoted
 			-- "$@" is one field PER element (each concatenates with the abutting text — the
 			-- first with what precedes, the last with what follows); quoted "$*" joins on
@@ -9198,6 +9247,12 @@ function M.expand_fields(sh, segs)
 			feed_split(seg.s)
 		else
 			add(seg.s, seg.unq)
+		end
+		if seg.dqend then -- end of a "…$@…" segment: empty parts make a null word unless "$@" was empty
+			if dq_null and not dq_at then
+				add("", false)
+			end
+			dq_null, dq_at = nil, nil
 		end
 	end
 	brk()
@@ -10495,6 +10550,18 @@ function M.ansi_unescape(s, mode)
 			elseif d == "v" then
 				out[#out + 1] = "\11"
 				i = i + 2
+			elseif d == "x" and ansi_c and s:byte(i + 2) == 123 then -- $'\x{HHH…}' (strtrans.c): any
+				-- number of hex digits, the low byte kept; the closing } is optional
+				local hex = s:match("^%x*", i + 3)
+				local c = 0
+				for k = 1, #hex do
+					c = (c * 16 + tonumber(hex:sub(k, k), 16)) % 256
+				end
+				out[#out + 1] = string.char(c)
+				i = i + 3 + #hex
+				if s:byte(i) == 125 then
+					i = i + 1
+				end
 			elseif d == "x" then
 				local hex = s:match("^%x%x?", i + 2)
 				if hex then
