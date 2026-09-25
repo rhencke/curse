@@ -7116,16 +7116,23 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
 			cx.blocks[p0] = ("rt.time_push(sh); pc = %d"):format(cx.flatten_list({ inner }, pe))
 			return p0
 		end
-		-- a brace-expanded word list: `set +B` (checked at run time, like bash) runs the
-		-- statement through interp, whose expansion puts the raw words back
+		-- a brace-expanded word list: under `set +B` (checked at run time, like bash) the raw
+		-- words stand — compile that shape too (the statement over parser.unbrace_words, as
+		-- interp's expand_args / for-in list take it) and pick one at run time
 		if (t == "simple" or t == "forin") and not cx.bx_guarded[st] then
 			for _, w in ipairs(st.words) do
 				if w.bx then
 					cx.bx_guarded[st] = true
 					local pn = cx.flatten_stmt(st, after)
-					local pd = cx.delegate(st, after)
+					local us = {}
+					for k, v in pairs(st) do
+						us[k] = v
+					end
+					us.words = cx.P.unbrace_words(st.words)
+					cx.bx_guarded[us] = true
+					local pu = cx.flatten_stmt(us, after)
 					local p = cx.newpc()
-					cx.blocks[p] = ("if sh.opt_B == false then pc = %d else pc = %d end"):format(pd, pn)
+					cx.blocks[p] = ("if sh.opt_B == false then pc = %d else pc = %d end"):format(pu, pn)
 					return p
 				end
 			end
