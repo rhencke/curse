@@ -106,7 +106,7 @@ return function(sh, cmd, args, hook, tcb)
 		end
 		local out = {}
 		if index_flag == 0 or (index_flag == 1 and desired == 0) then
-			local cwd = fmt(sh:pwd())
+			local cwd = fmt(sh:cwd())
 			out[#out + 1] = bit.band(vflag, 2) ~= 0 and ("%2d  %s"):format(0, cwd) or cwd
 			if index_flag ~= 0 then
 				sh:echo(table.concat(out))
@@ -153,7 +153,7 @@ return function(sh, cmd, args, hook, tcb)
 				return
 			end
 			local temp = pd[#pd]
-			pd[#pd] = sh:pwd()
+			pd[#pd] = sh:cwd()
 			return change_to_temp(temp)
 		end
 		local nocd, rotate, num = false, false, 0
@@ -187,7 +187,7 @@ return function(sh, cmd, args, hook, tcb)
 			i = i + 1
 		end
 		if rotate then -- rotate num times; the current directory counts as part of the stack
-			local temp = sh:pwd()
+			local temp = sh:cwd()
 			if num == 0 then
 				if nocd then
 					sh.status = 0
@@ -214,7 +214,7 @@ return function(sh, cmd, args, hook, tcb)
 			sh.status = 0
 			return
 		end
-		local cur = sh:pwd()
+		local cur = sh:cwd()
 		local dir = list[i]
 		if list[i + 1] ~= nil then -- (bash hands the rest to cd, which takes one directory)
 			sh:errmsg("curse: pushd: too many arguments\n")

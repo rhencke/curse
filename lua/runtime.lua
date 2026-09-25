@@ -2337,7 +2337,7 @@ local function sub_checkpoint(self)
 		params = self.params, nparams = self.nparams,
 		shopt = self.shopt, functions = self.functions,
 		locale_gen = M.locale_gen, dirstack = self.dirstack, hashcache = self.hashcache, getopts = self.getopts_state,
-		cwd = self:phys_cwd(), um = C.umask(0), disabled = self.disabled_builtins,
+		cwd = self:phys_cwd(), tcwd = self.tcwd, um = C.umask(0), disabled = self.disabled_builtins,
 		fn_ro = self.fn_ro, unset_specials = self.unset_specials, random_plain = self.random_plain,
 		shellopts_exported = self.shellopts_exported,
 	}
@@ -2397,6 +2397,7 @@ local function sub_restore(self, cp)
 	self.fn_ro, self.unset_specials, self.random_plain = cp.fn_ro, cp.unset_specials, cp.random_plain
 	self.shellopts_exported = cp.shellopts_exported
 	if cp.cwd ~= "" then C.chdir(cp.cwd) end
+	self.tcwd = cp.tcwd
 	C.umask(cp.um)
 	-- Re-sync the process environ: drop names the body newly exported, then restore
 	-- every name exported at entry to its parent value (covers changed + unset-in-sub).
@@ -5500,6 +5501,20 @@ function Shell:pwd()
 	end
 	return self:phys_cwd()
 end
+-- The shell's internal idea of the current directory (bash's
+-- the_current_working_directory): set by `cd` and at startup, separate from $PWD (which
+-- a script may assign freely). `pwd`, the directory stack and cd's relative paths use
+-- it; unknown, it is getcwd's answer (get_working_directory).
+function Shell:cwd()
+	local t = self.tcwd
+	if not t then
+		t = self:phys_cwd()
+		if t ~= "" then
+			self.tcwd = t
+		end
+	end
+	return t
+end
 function Shell:pid()
 	if not pid_cache then
 		pid_cache = tonumber(ffi.C.getpid())
@@ -6377,6 +6392,7 @@ function Shell:import_env()
 	local pwd = (env_pwd and env_pwd:sub(1, 1) == "/" and same_file(env_pwd, phys)) and env_pwd or phys
 	self:set_str("PWD", pwd)
 	self.vars["PWD"].exported = true
+	self.tcwd = pwd ~= "" and pwd or nil
 	if env_oldpwd then
 		self:set_str("OLDPWD", env_oldpwd)
 		self.vars["OLDPWD"].exported = true
@@ -6699,7 +6715,7 @@ end
 -- DIRSTACK: the directory stack, full paths, [0] always the current directory (bash)
 function Shell:dirstack_array() -- (sh.dirstack: the entries below the cwd, bottom first)
 	local ds = self.dirstack or {}
-	local t = { self:pwd() }
+	local t = { self:cwd() }
 	for k = #ds, 1, -1 do
 		t[#t + 1] = ds[k]
 	end

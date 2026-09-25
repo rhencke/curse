@@ -4546,10 +4546,10 @@ local function describe(sh, nm, fl)
 				end
 				p = nil
 			elseif p:sub(1, 1) ~= "/" and (fl.reuse or fl.path_only or fl.short) then
-				p = sh:pwd():gsub("/$", "") .. "/" .. (fl.abspath and p:gsub("^%./", "") or p)
+				p = sh:cwd():gsub("/$", "") .. "/" .. (fl.abspath and p:gsub("^%./", "") or p)
 			end
 		elseif fl.abspath and p:sub(1, 1) ~= "/" then
-			p = sh:pwd():gsub("/$", "") .. "/" .. p:gsub("^%./", "")
+			p = sh:cwd():gsub("/$", "") .. "/" .. p:gsub("^%./", "")
 		end
 		if p then
 			found = true
