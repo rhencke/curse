@@ -5651,7 +5651,7 @@ local function run_debug(sh, line)
 	-- or sourced file acts as a `return` from it (bash)
 	if trap_status ~= 0 and sh.shopt.extdebug then
 		if trap_status == 2 and ((sh.calldepth or 0) > 0 or (sh.sourcedepth or 0) > 0) then
-			error({ __curse_return = sh.status })
+			error({ __curse_return = trap_status }) -- (the function returns 2: bash)
 		end
 		return true
 	end

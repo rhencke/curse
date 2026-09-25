@@ -74,12 +74,12 @@ local function alias_sig(sh)
 	return sh._asig
 end
 M.alias_sig = alias_sig
-function M.try_fragment(code, line1, sh, now, label) -- line1: an eval's own line, which its code numbers from
+function M.try_fragment(code, line1, sh, now, label, noalias) -- line1: an eval's own line, which its code numbers from
 	-- (now: the caller already saw this code run — compile it on this first call;
 	-- line1 == false: a trap handler, whose commands keep the interrupted line;
 	-- label "eval": its syntax errors read `eval: line N:` and end just the eval)
 	local mode = trap_mode(sh) .. (line1 == false and "H" or "") .. (label == "eval" and "V" or "")
-	local asig = alias_sig(sh)
+	local asig = not noalias and alias_sig(sh) -- (noalias: text read with its aliases expanded)
 	local key = mode .. "\0" .. (asig and ("A" .. asig .. "\0") or "") .. (line1 and (line1 .. "\0" .. code) or code)
 	local hit = frag_cache[key]
 	if hit ~= nil and hit ~= 0 then
@@ -160,7 +160,9 @@ function M.run_compiled(mod, sh, pc, nested)
 		if ok then
 			return
 		end
-		if type(err) == "table" and err.__curse_lineabort and (not sh.opt_e or err.__curse_discard) then
+		if type(err) == "table" and err.__curse_dbgskip and err.cfg == "run" then
+			pc = err.__curse_dbgskip -- (extdebug: the DEBUG trap skipped a command — go on after it)
+		elseif type(err) == "table" and err.__curse_lineabort and (not sh.opt_e or err.__curse_discard) then
 			-- a lineabort from inside a function call unwinds its frames (locals, params,
 			-- FUNCNAME) — the compiled call sites pop them only on a normal return
 			while sh.pd > pd0 do

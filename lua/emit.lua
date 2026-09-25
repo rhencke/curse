@@ -352,7 +352,7 @@ local function scan_xtrace(node, acc)
 		acc.funcnest = true -- $FUNCNEST limits call depth: compiled calls count it (fnwrap)
 	end
 	if node.lit == "extdebug" then
-		return "extdebug" -- extdebug: a DEBUG trap may skip commands (interp's run_debug handles it)
+		acc.extdebug = true -- extdebug: a DEBUG trap may skip the command (rt.debug_x, dbg)
 	end
 	-- (LEXICAL needs — the program's text is read a line at a time by the interpreter's
 	-- reader, which records history, `!`-expands, echoes set -v lines and counts \#: the
@@ -407,7 +407,7 @@ local function scan_xtrace(node, acc)
 			end
 		end
 	end
-	return nil, acc.x, acc.lex, acc.funcnest, acc.bcmd, acc.enable, acc.k, acc.r
+	return nil, acc.x, acc.lex, acc.funcnest, acc.bcmd, acc.enable, acc.k, acc.r, acc.extdebug
 end
 -- functrace (set -T / -o functrace) extends DEBUG into subshells, which compiled
 -- fragments don't hook — keep those programs on the delegated path.
@@ -946,6 +946,10 @@ function EF.xta(lhs, v) -- an assignment `lhs` (`x=`, `a[i]+=`) of the expanded 
 end
 EF.has_return = false -- program may set a RETURN trap → compiled calls fire it (fnwrap)
 EF.bash_command = false -- program reads $BASH_COMMAND → each command records its text (dbg)
+EF.extdebug = false -- program may `shopt -s extdebug` → a DEBUG trap can skip a command (dbg)
+EF.dbg_after_of = {} -- (extdebug) statement -> its continuation pc, for the skip
+EF.DBG_SKIP = { simple = true, arithcmd = true, dbracket = true, assign = true, assignlist = true, case = true }
+EF.cur_cfg = "run" -- the CFG being built: `run`, or a function's (a skip resumes in its own)
 EF.keyword = false -- program may `set -k` → a command with a NAME=value word compiles both ways
 EF.enable = false -- program may run `enable -n` → a native builtin call checks it's still enabled
 EF.funcnest = false -- program may set $FUNCNEST → compiled calls check the call depth (fnwrap)
@@ -963,11 +967,24 @@ local emit_multidef = {} -- names defined by more than one top-level funcdef: a 
 -- wrongly fire without functrace — bash fires DEBUG once at the CALL site, which is a
 -- top-level command). Delegated commands fire DEBUG via interp's exec_stmt, so this is
 -- prepended ONLY to native blocks (exactly one fires).
-local function dbg(st)
+local function dbg(st, head)
 	-- $BASH_COMMAND: the command about to run, as bash prints it (a string here — the
-	-- interpreter records its node); a trap's own commands don't replace it
+	-- interpreter records its node); a trap's own commands don't replace it. A compound's
+	-- HEAD reads as its head: `for j in 1 2`, `((k<2))` per for-(( slot, `case w in `.
 	if EF.bash_command then
-		local bc = ("if (sh.in_trap or 0) == 0 then sh.cur_cmd = %q end; "):format(require("deparse").command_text(st))
+		local text = head
+		if not text and st.t == "forin" then
+			local ws = {}
+			for _, w in ipairs(st.words or {}) do
+				if w.src then
+					ws[#ws + 1] = w.src
+				end
+			end
+			text = "for " .. st.name .. " in " .. table.concat(ws, " ")
+		elseif not text and st.t == "case" and st.subject and st.subject.src then
+			text = "case " .. st.subject.src .. " in "
+		end
+		local bc = ("if (sh.in_trap or 0) == 0 then sh.cur_cmd = %q end; "):format(text or require("deparse").command_text(st))
 		EF.bash_command = false
 		local d = dbg(st)
 		EF.bash_command = true
@@ -975,6 +992,12 @@ local function dbg(st)
 	end
 	-- run_debug scopes by calldepth/in_subprogram (fires inside a function/subshell only
 	-- under functrace); calldepth is tracked in fnwrap when a DEBUG trap is present.
+	-- (shopt -s extdebug: a non-zero DEBUG status SKIPS the command — rt.debug_x raises
+	-- the statement's continuation pc for this CFG's catcher: run_compiled, rt.catch_dbgskip)
+	local skip = EF.has_debug and EF.extdebug and EF.frag_depth == 0 and EF.dbg_after_of[st]
+	if skip then
+		return ("rt.debug_x(sh, %d, %d, %q); "):format(st.line or 0, skip, EF.cur_cfg)
+	end
 	if EF.has_debug then
 		if EF.trapline and not EF.cur_infunc then -- (a handler's commands: the interrupted line)
 			return "I.run_debug(sh, sh.cur_line); "
@@ -1748,8 +1771,8 @@ local function compile_cmdsub(...)
 	return unpack(r)
 end
 function compile_cmdsub_inner(src, backtick, lifted, aenv, noalias, posix)
-	local fallback = ("sh:capture_src(%q%s)"):format(src, noalias and ", " .. tostring(backtick or false) .. ", true"
-		or (backtick and ", true" or ""))
+	local fallback = ("sh:capture_src(%q, %s, %s, %d)"):format(src, tostring(backtick or false),
+		tostring(noalias or false), EF.cur_cline or EF.cur_line or 0)
 	local pok, ast = pcall(require("parser").parse, src, nil, aenv, noalias, posix, EF.cur_cline or EF.cur_line)
 	if not pok or type(ast) ~= "table" or ast.stmts == nil then
 		return fallback
@@ -6092,10 +6115,13 @@ H.forc = function(cx, st, after)
 	cx.loopstack[#cx.loopstack + 1] = { brk = after, cont = stepp } -- break exits, continue steps
 	local bodyentry = cx.flatten_list(st.body, stepp)
 	cx.loopstack[#cx.loopstack] = nil
-	local d = dbg(st) -- DEBUG fires at the for(( header for the init, each cond, and each step (bash)
+	-- (with $BASH_COMMAND read, each slot's own DEBUG prefix carries its text: xs)
+	local d = not EF.bash_command and dbg(st) or "" -- DEBUG fires at the for(( header for the init, each cond, and each step (bash)
 	local function xs(slot) -- (set -x: each slot's `(( … ))` as it's evaluated)
 		local sv = st.src and st.src[slot]
-		return sv and EF.xtarith(sv:match("^%s*(.-)$"), cx.lifted) or ""
+		-- ($BASH_COMMAND reads the slot: its DEBUG prefix, for a program that reads it)
+		local ds = EF.bash_command and dbg(st, "((" .. (sv or "") .. "))") or ""
+		return ds .. (sv and EF.xtarith(sv:match("^%s*(.-)$"), cx.lifted) or "")
 	end
 	-- An init/cond/step that can fail (÷0, a bad value, …) evaluates like the (( )) command
 	-- (EF.arith_status, `((: ` texts) keeping $?; an error ends the loop with status 1 (bash's
@@ -6110,7 +6136,7 @@ H.forc = function(cx, st, after)
 	if st.step and arith_can_error(st.step, cx.lifted) then
 		cx.blocks[stepp] = d .. xs(3) .. guarded(st.step, ("pc = %d"):format(condp))
 	else
-		cx.blocks[stepp] = d .. (st.step and xs(3) or "")
+		cx.blocks[stepp] = d .. xs(3)
 			.. (st.step and emit_arith_stmt(st.step, cx.lifted) .. "; " or "")
 			.. ("pc = %d"):format(condp)
 	end
@@ -6124,7 +6150,7 @@ H.forc = function(cx, st, after)
 	if st.cond and arith_can_error(st.cond, cx.lifted) then
 		cx.blocks[condp] = d .. xs(2) .. guarded(st.cond, ("if __as == 0 then pc = %d else pc = %d end"):format(bodyp, exitp))
 	else
-		cx.blocks[condp] = d .. (st.cond and xs(2) or "")
+		cx.blocks[condp] = d .. xs(2)
 			.. ("if %s then pc = %d else pc = %d end"):format(
 				st.cond and emit_bool(st.cond, cx.lifted) or "true",
 				bodyp,
@@ -7392,6 +7418,9 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
 		if t == "noop" then
 			return after
 		end
+		if EF.extdebug and EF.DBG_SKIP[t] then
+			EF.dbg_after_of[st] = after -- (where a skipped command resumes: dbg)
+		end
 		EF.cur_loopn = #cx.loopstack -- (compile_cmdsub: is this command inside a loop …
 		EF.cur_infunc = not cx.toplevel and not cx.topcode -- … or a function)
 		if st.line then
@@ -8096,7 +8125,10 @@ function M.emit(ast, opts)
 	-- a program that can turn on xtrace (`set -x`, `set -o xtrace`, a dynamic `set` word)
 	-- carries per-command trace hooks (`if sh.opt_x then rt.xtrace…`); other machinery the
 	-- compiled tier lacks keeps the program interpreted (the reason names it)
-	local xwhy, xt, xlex, fnest, bcmd, enable, kw, restr = scan_xtrace(ast.stmts)
+	local xwhy, xt, xlex, fnest, bcmd, enable, kw, restr, extdbg = scan_xtrace(ast.stmts)
+	EF.extdebug = extdbg or false
+	EF.dbg_after_of = setmetatable({}, { __mode = "k" })
+	EF.cur_cfg = "run"
 	EF.keyword = kw or false
 	EF.bash_command = bcmd or false
 	-- (`enable -n NAME` here, or maybe in eval/source code or around a fragment: a native
@@ -8147,7 +8179,7 @@ function M.emit(ast, opts)
 	EF.has_trap = scan_any_trap(ast.stmts) -- gate compiled `&`/pipeline (forked child resets signal traps)
 	-- in-process subshell/$(…)/pipeline-stage gate: only a REAL-signal trap (or DEBUG under
 	-- functrace, which reaches into subshells) keeps them forked/delegated
-	EF.inproc_trap_block = EF.has_debug and (fo.functrace or scan_functrace(ast.stmts))
+	EF.inproc_trap_block = EF.has_debug and (fo.functrace or scan_functrace(ast.stmts) or EF.extdebug) -- (extdebug: functrace too)
 	-- (`&` still forks: a real-signal trap must be reset in its child — interp's machinery)
 	EF.bg_trap_block = scan_sigtrap(ast.stmts) or EF.inproc_trap_block
 	local funcflags, inlinable, inlinefns = {}, {}, {}
@@ -8215,6 +8247,13 @@ function M.emit(ast, opts)
 		end
 	end
 	EF.inlinefns = inlinefns -- (inl_sync: a non-spliced call of one of these)
+	-- extdebug keeps BASH_ARGV/BASH_ARGC: every call's parameters make a frame (pushCall)
+	if EF.extdebug then
+		for name, ff in pairs(funcflags) do
+			ff.locals = true
+			inlinable[name], inlinefns[name] = nil, nil
+		end
+	end
 	-- Lift purely-arith vars to native int64. A var touched by no OUT-OF-LINE
 	-- function becomes a run()-LOCAL (register-allocated — fast in hot loops); a
 	-- direct call to an inlinable function is spliced in, so its var access counts
@@ -8362,10 +8401,15 @@ function M.emit(ast, opts)
 			end
 			local sv_fl = EF.fn_locals
 			EF.fn_locals = #fl > 0 and ls or nil
+			EF.cur_cfg = fnlname(st.name)
 			local cfg = build_cfg(st.body, ls, funcflags, inlinefns)
+			EF.cur_cfg = "run"
 			EF.fn_locals = sv_fl
 			fndefs[#fndefs + 1] = assemble(cfg, fnlname(st.name) .. " = function(sh, pc)",
 				{ shname = st.name, fnlocals = fl, fnresume = true })
+			if EF.extdebug and EF.has_debug then -- (a DEBUG-skipped command resumes after itself)
+				fndefs[#fndefs + 1] = ("%s = rt.catch_dbgskip(%s, %q)"):format(fnlname(st.name), fnlname(st.name), fnlname(st.name))
+			end
 			if EF.trap_ret then -- (a trap handler's `return` raised mid-body ends THIS call)
 				fndefs[#fndefs + 1] = ("%s = rt.catch_return(%s)"):format(fnlname(st.name), fnlname(st.name))
 			end

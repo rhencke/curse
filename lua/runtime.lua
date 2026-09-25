@@ -2112,7 +2112,7 @@ local function capture_pure(sh, st)
 	return false -- if/while/for/case/subshell/group/funcdef/background/arithcmd: fork
 end
 
-function Shell:capture_src(src, backtick, noalias)
+function Shell:capture_src(src, backtick, noalias, line0)
 	local P = require("parser")
 	local I = require("interp")
 	-- A SYNTAX error in the body: bash makes `$(…)` fatal to the whole containing
@@ -2120,7 +2120,8 @@ function Shell:capture_src(src, backtick, noalias)
 	-- `echo A``echo "``B` prints "AB" and exits 0). Backticks are parsed lazily at
 	-- expansion time, so a throw here (e.g. an unterminated quote) is contained.
 	-- self: $()/`` expand aliases from the live table (unless already expanded as read)
-	local pok, parsed = pcall(P.parse, src, self, nil, noalias, nil, self.cur_cline or self.cur_line)
+	-- (line0: compiled code's command line — its sh.cur_line isn't kept per command)
+	local pok, parsed = pcall(P.parse, src, self, nil, noalias, nil, line0 or self.cur_cline or self.cur_line)
 	if not pok then
 		if backtick then
 			io.stderr:write("curse: command substitution: " .. tostring(parsed) .. "\n")
@@ -2182,14 +2183,11 @@ function Shell:capture_src(src, backtick, noalias)
 			iso = true
 		end
 	end
-	-- Text that recurs runs compiled (tier fragment keyed by text, line, trap state) — the
-	-- guarded slow path of a compiled $(…) and the backticks parsed at expansion time. (Not
-	-- while aliases are live: a fragment parses without the alias table.)
-	local mod
-	if noalias or not (self.shopt.expand_aliases and self.aliases and next(self.aliases)) then
-		local ln = self.cur_cline or self.cur_line
-		mod = require("tier").try_fragment(src, ln and ln > 0 and ln or nil, self)
-	end
+	-- Text that recurs runs compiled (tier fragment keyed by text, line, trap state and the
+	-- live alias table it parses with — none when read with aliases already expanded) — the
+	-- guarded slow path of a compiled $(…) and the backticks parsed at expansion time.
+	local ln = line0 or self.cur_cline or self.cur_line
+	local mod = require("tier").try_fragment(src, ln and ln > 0 and ln or nil, self, nil, nil, noalias)
 	if mod then
 		local run_compiled = require("tier").run_compiled
 		if (iso or not mod.nofork) and not has_perr then
@@ -12664,6 +12662,29 @@ end
 -- word expander — for an array element the compiled renderers can't express natively.
 function M.assign_word(sh, w)
 	return require("interp").expand_assign_word(sh, w)
+end
+-- shopt -s extdebug: the DEBUG trap before a compiled command; a non-zero status skips
+-- the command — raised as the pc it continues at, for the catcher of the CFG `cfg`
+-- (tier.run_compiled for `run`, rt.catch_dbgskip for a function's)
+function M.debug_x(sh, line, after, cfg)
+	if require("interp").run_debug(sh, line) then
+		error({ __curse_dbgskip = after, cfg = cfg }, 0)
+	end
+end
+function M.catch_dbgskip(f, name)
+	return function(sh, pc)
+		while true do
+			local ok, e = pcall(f, sh, pc)
+			if ok then
+				return
+			end
+			if type(e) == "table" and e.__curse_dbgskip and e.cfg == name then
+				pc = e.__curse_dbgskip
+			else
+				error(e, 0)
+			end
+		end
+	end
 end
 
 return M
