@@ -41,8 +41,22 @@ local function may_repeat(code)
 		or code:find("%f[%w_]for%f[^%w_]") or code:find("%f[%w_]select%f[^%w_]")
 		or code:find("%f[%w_]function%f[^%w_]") or code:find("%(%s*%)")
 end
-function M.try_fragment(code, line1) -- line1: an eval's own line, which its code numbers from
-	local key = line1 and (line1 .. "\0" .. code) or code
+-- A fragment runs inside a shell whose ERR/DEBUG traps (and functrace) its own text may
+-- not mention: compile their hooks in when they're set, keyed so each trap state gets its
+-- own monomorphic compile.
+local function trap_mode(sh)
+	local t = sh and sh.traps
+	if not t then
+		return ""
+	end
+	local e = t.ERR and t.ERR ~= "" and "E" or ""
+	local d = t.DEBUG and t.DEBUG ~= "" and (sh.opt_functrace and "T" or "D") or ""
+	return e .. d
+end
+M.trap_mode = trap_mode
+function M.try_fragment(code, line1, sh) -- line1: an eval's own line, which its code numbers from
+	local mode = trap_mode(sh)
+	local key = mode .. "\0" .. (line1 and (line1 .. "\0" .. code) or code)
 	local hit = frag_cache[key]
 	if hit ~= nil and hit ~= 0 then
 		return hit or nil
@@ -51,7 +65,7 @@ function M.try_fragment(code, line1) -- line1: an eval's own line, which its cod
 	if hit == nil and not may_repeat(code) then
 		mod = 0 -- seen once: interpret now, compile if it recurs
 	else
-		mod = M.compile_fragment(code, line1) or false
+		mod = M.compile_fragment(code, line1, mode) or false
 	end
 	if frag_n >= FRAG_MAX then
 		frag_cache, frag_n = {}, 0
@@ -62,7 +76,7 @@ function M.try_fragment(code, line1) -- line1: an eval's own line, which its cod
 	frag_cache[key] = mod
 	return mod ~= 0 and mod or nil
 end
-function M.compile_fragment(code, line1)
+function M.compile_fragment(code, line1, mode)
 	local pok, ast = pcall(P.parse, code, nil, nil, nil, nil, nil, line1)
 	-- A syntax error (P.parse sets ast.perr and/or emits a `parse_error` statement, or
 	-- throws): the interpreter is the oracle for it — it runs the valid PREFIX then reports
@@ -77,7 +91,9 @@ function M.compile_fragment(code, line1)
 		end
 	end
 	local ok, chunk = pcall(function()
-		return load(E.emit(ast, { fragment = true }), "=curse:eval")
+		mode = mode or ""
+		return load(E.emit(ast, { fragment = true, trap_err = mode:find("E", 1, true) ~= nil,
+			trap_debug = mode:find("[DT]") ~= nil, functrace = mode:find("T", 1, true) ~= nil }), "=curse:eval")
 	end)
 	if ok and chunk then
 		local built, mod = pcall(chunk)
@@ -283,12 +299,13 @@ local HOT_LOOP = tonumber(os.getenv("CURSE_HOT_LOOP") or "") or 100
 -- own source text, and run in place of the rest of the interpreted loop. At the loop head
 -- that is exact: a while/until re-tests its condition, and a (( ; ; )) loop re-states
 -- its header without the init already run. Cached on the node (false: declined).
-local function loop_fragment(st)
+local function loop_fragment(st, sh)
+	local mode = trap_mode(sh)
 	local frag = st._frag
-	if frag ~= nil then
+	if frag ~= nil and st._fragm == mode then
 		return frag
 	end
-	st._frag = false
+	st._frag, st._fragm = false, mode
 	local srcs = st._srcs
 	if not srcs then
 		return false
@@ -301,7 +318,7 @@ local function loop_fragment(st)
 	else
 		return false
 	end
-	local mod = M.compile_fragment(code, st.line)
+	local mod = M.compile_fragment(code, st.line, mode)
 	if mod and st.t == "forin" then
 		-- entered at the loop's resume point, adopting the interpreter's list + position
 		-- (sh.forstate) under the fragment's own id for that loop: its first
@@ -317,7 +334,7 @@ local function loop_fragment(st)
 end
 -- (the interp's SUBHOOK forwards to this: loop fragments only, never a program switch)
 function M.frag_hook(kind, id, st, sh)
-	if kind == "loop" and sh and not (sh.traps and (sh.traps.DEBUG or sh.traps.RETURN)) then
+	if kind == "loop" and sh and not (sh.traps and sh.traps.RETURN) then
 		return M.loop_osr(sh, st)
 	end
 end
@@ -333,7 +350,7 @@ function M.loop_osr(sh, st)
 	if hits < HOT_LOOP then
 		return nil
 	end
-	local mod = loop_fragment(st)
+	local mod = loop_fragment(st, sh)
 	if not mod then
 		return nil
 	end

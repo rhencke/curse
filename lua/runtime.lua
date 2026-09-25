@@ -11165,7 +11165,7 @@ function M.eval_run(sh, argv)
 		return
 	end
 	local ln = current_line(sh)
-	local mod = require("tier").try_fragment(code, ln > 0 and ln or nil)
+	local mod = require("tier").try_fragment(code, ln > 0 and ln or nil, sh)
 	if mod then
 		require("tier").run_compiled(mod, sh, nil, true)
 		sh.spb_err = nil -- (a builtin the code ran flagged its own: not eval's)
@@ -11291,10 +11291,8 @@ function M.source_run(sh, argv, line)
 	end
 	local code = f:read("*a")
 	f:close()
-	-- (a DEBUG trap that reaches into the file — functrace — needs per-command hooks the
-	-- file's own compile doesn't have: the interpreter runs it then)
-	local dbg_in = sh.opt_functrace and sh.traps and sh.traps.DEBUG and sh.traps.DEBUG ~= ""
-	local mod = not dbg_in and not M.source_empty(code) and require("tier").try_fragment(code)
+	-- (a DEBUG/ERR trap reaching into the file: tier compiles its hooks in — trap_mode)
+	local mod = not M.source_empty(code) and require("tier").try_fragment(code, nil, sh)
 	if not mod then -- alias / syntax error / uncompilable / empty: b_source runs the text it was handed
 		-- (never re-opening the file — a FIFO or /dev/stdin can only be read once)
 		sh.source_preread = { file = file, code = code }

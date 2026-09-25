@@ -7673,14 +7673,17 @@ function M.emit(ast, opts)
 	EF.ro_names = nil -- (this program's readonly names: computed on first need — func_locals)
 	EF.frag_nameref = EF.fragment and scan_nameref(ast.stmts) -- (the fragment's own text)
 	EF.has_nameref = EF.fragment or scan_nameref(ast.stmts) -- declare -n present → delegate scalar assigns
-	EF.has_err = scan_trap(ast.stmts, { ERR = 1 }) -- gate compiled ERR-trap firing
-	EF.has_debug = scan_trap(ast.stmts, { DEBUG = 1 }) -- gate compiled DEBUG-trap firing
+	-- (a runtime fragment — eval/source/a hot loop — also gets the hooks for the traps set
+	-- in the shell it compiles in: tier.trap_mode keys its cache by that state)
+	local fo = opts or {}
+	EF.has_err = fo.trap_err or scan_trap(ast.stmts, { ERR = 1 }) -- gate compiled ERR-trap firing
+	EF.has_debug = fo.trap_debug or scan_trap(ast.stmts, { DEBUG = 1 }) -- gate compiled DEBUG-trap firing
 	EF.funcstack = reads_debugstack(ast.stmts) -- gate FUNCNAME/BASH_SOURCE/BASH_LINENO stacks
 	EF.pipestatus = reads_var(ast.stmts, "PIPESTATUS") -- gate $PIPESTATUS after simple cmds
 	EF.has_trap = scan_any_trap(ast.stmts) -- gate compiled `&`/pipeline (forked child resets signal traps)
 	-- in-process subshell/$(…)/pipeline-stage gate: only a REAL-signal trap (or DEBUG under
 	-- functrace, which reaches into subshells) keeps them forked/delegated
-	EF.inproc_trap_block = EF.has_debug and scan_functrace(ast.stmts)
+	EF.inproc_trap_block = EF.has_debug and (fo.functrace or scan_functrace(ast.stmts))
 	-- (`&` still forks: a real-signal trap must be reset in its child — interp's machinery)
 	EF.bg_trap_block = scan_sigtrap(ast.stmts) or EF.inproc_trap_block
 	local funcflags, inlinable, inlinefns = {}, {}, {}
