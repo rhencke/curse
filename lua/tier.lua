@@ -13,8 +13,8 @@ local M = {}
 M.rt, M.parser, M.interp, M.emit = rt, P, I, E
 
 -- Compile source to a loaded module { run(sh,pc), loopPc={id->pc}, stmtPc={k->pc} }.
-function M.compile(ast)
-	return assert(load(E.emit(ast), "=curse:compiled"))()
+function M.compile(ast, opts)
+	return assert(load(E.emit(ast, opts), "=curse:compiled"))()
 end
 
 -- Compile a runtime code string (eval / source) as a FRAGMENT: emit with fragment=true so a
@@ -486,7 +486,7 @@ function M.flush_stores()
 	end
 end
 function compile_store(path, ast, sh, later)
-	local ok, code = pcall(E.emit, ast, sh.xt_start and { xtrace = true } or nil)
+	local ok, code = pcall(E.emit, ast, (sh.xt_start or sh.attr_start) and { xtrace = sh.xt_start, startattr = sh.attr_start } or nil)
 	local chunk = ok and load(code, "=curse:compiled")
 	if not chunk then
 		if not ok and M.lm_reason(code) then -- (the next run reads it a line at a time)
@@ -603,7 +603,7 @@ function M.compile_deferred(one)
 	while #deferred > 0 do
 		local d = table.remove(deferred)
 		local ok, code = pcall(function()
-			return E.emit(P.parse(d.src), d.xt and { xtrace = true } or nil)
+			return E.emit(P.parse(d.src), (d.xt or d.attr) and { xtrace = d.xt, startattr = d.attr } or nil)
 		end)
 		local chunk = ok and load(code, "=curse:compiled")
 		if chunk then
@@ -625,9 +625,13 @@ function M.run_tiered(src, sh)
 	local Cache = require("cache")
 	-- (a shell started under set -x runs a module compiled WITH trace hooks: its own key)
 	sh.xt_start = sh.opt_x or nil
+	-- (started allexport/restricted: plain assignments may export or be refused — a module
+	-- compiled for that, under its own key)
+	sh.attr_start = (sh.opt_a or sh.opt_r) or nil
 	sh.tier_start = { opt_x = sh.opt_x, opt_v = sh.opt_v, aliases = next(sh.aliases or {}) and { ["?"] = "" } or {},
 		shopt = { expand_aliases = sh.shopt and sh.shopt.expand_aliases } }
-	local path = Cache.artifact_path(sh.xt_start and (src .. "\0xtrace") or src)
+	local path = Cache.artifact_path((sh.xt_start or sh.attr_start)
+		and (src .. (sh.xt_start and "\0xtrace" or "") .. (sh.attr_start and "\0attr" or "")) or src)
 	if path then
 		local cached = modcache_get(path)
 		if cached and alias_mismatch(cached, sh) then -- (read a line at a time: each compiled)
@@ -666,7 +670,7 @@ function M.run_tiered(src, sh)
 	-- the text) runs in the interpreter right away; it's compiled after the reply
 	-- (M.compile_deferred) so the NEXT run is a warm hit, and no caller waits for it.
 	if path and not may_loop(src) then
-		deferred[#deferred + 1] = { path = path, src = src, xt = sh.xt_start }
+		deferred[#deferred + 1] = { path = path, src = src, xt = sh.xt_start, attr = sh.attr_start }
 		I.run_lazy(sh, src)
 		return sh, "interp-deferred"
 	end
@@ -774,7 +778,7 @@ function M.run_tiered(src, sh)
 		local ok, err = pcall(I.run_lazy, sh, src, hook)
 		if ok then
 			if mod == nil then
-				deferred[#deferred + 1] = { path = path, src = src, xt = sh.xt_start }
+				deferred[#deferred + 1] = { path = path, src = src, xt = sh.xt_start, attr = sh.attr_start }
 			end
 			return sh, "interp-deferred"
 		end
