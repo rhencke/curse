@@ -4645,7 +4645,11 @@ local function run_function(sh, cmd, fn, args, hook, tenv_base)
 		ok, err = pcall(fn, sh) -- a COMPILED function closure
 	else
 		-- a hot function in a cold run: its compiled version, once the tier has it
-		local cfn = hook("call", cmd, sh.func_def and sh.func_def[cmd], sh)
+		local def = sh.func_def and sh.func_def[cmd]
+		local cfn = hook("call", cmd, def, sh)
+		if not cfn and def and M.fn_hook then -- (tier loaded: a hot one compiles standalone)
+			cfn = M.fn_hook(sh, cmd, def)
+		end
 		if cfn then
 			ok, err = pcall(cfn, sh)
 		else
