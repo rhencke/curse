@@ -13018,4 +13018,55 @@ function M.hist_resize(sh, name)
 	end
 end
 
+-- `select NAME in WORDS; do …; done` for the compiled tier (interp's select branch): the
+-- menu goes to stderr; each round prints $PS3, reads a line from stdin — EOF ends the loop
+-- (a newline to stdout, status 1), an empty line redisplays the menu, anything else sets
+-- REPLY and NAME (the chosen item, or empty) and runs the body (the compiled loop).
+function M.select_menu(sh, list)
+	local width = #tostring(#list)
+	for k, item in ipairs(list) do
+		io.stderr:write(("%" .. width .. "d) %s\n"):format(k, item))
+	end
+end
+function M.select_next(sh, list, name)
+	local getc = require("interp")._int.fd_getc
+	while true do
+		if M.preempt_flag[0] ~= 0 then
+			M.preempt()
+		end
+		io.flush()
+		io.stderr:write(sh.vars["PS3"] and sh:get("PS3") or "#? ")
+		local buf, line = {}, nil
+		while true do
+			local ch = getc(0)
+			if ch == nil then
+				line = #buf > 0 and table.concat(buf) or nil
+				break
+			end
+			if ch == "\n" then
+				line = table.concat(buf)
+				break
+			end
+			buf[#buf + 1] = ch
+		end
+		if line == nil then
+			sh.out("\n")
+			sh.status = 1
+			return false
+		end
+		if line == "" then
+			M.select_menu(sh, list)
+		else
+			sh:set_str("REPLY", line)
+			local nsel = line:match("^%s*(%d+)%s*$")
+			nsel = nsel and tonumber(nsel)
+			if sh:set_str(name, (nsel and list[nsel]) or "") == false then
+				sh.status = 1
+				return false
+			end
+			return true
+		end
+	end
+end
+
 return M

@@ -6215,6 +6215,51 @@ H.forin = function(cx, st, after)
 	return initp
 end
 
+-- statement handler: select — a loop like for-in: the word list expands once (the field
+-- engine), rt.select_menu shows it, and each round rt.select_next prompts/reads/sets REPLY
+-- and NAME (false at EOF: status 1, the loop ends); the body is the compiled CFG, break/
+-- continue jump natively.
+H.select = function(cx, st, after)
+	if st.redirs or hard_cf(st.body) then -- (a redirected one: cx.delegate compiles it as a
+		return cx.delegate(st, after) -- redirected compound around this)
+	end
+	if not st.name:match("^[%a_][%w_]*$") then
+		local p = cx.newpc()
+		cx.blocks[p] = ("io.stderr:write(%q); sh.status = 1; pc = %d"):format(
+			"curse: `" .. st.name .. "': not a valid identifier\n", after)
+		return p
+	end
+	for _, w in ipairs(st.words) do
+		for _, pp in ipairs(w.parts) do
+			if pp.procsub then
+				return cx.delegate(st, after)
+			end
+		end
+	end
+	local initp = cx.newpc()
+	local advp = cx.newpc()
+	cx.loopPc[st.id] = advp
+	cx.loopstack[#cx.loopstack + 1] = { brk = after, cont = advp }
+	local bodyentry = cx.flatten_list(st.body, advp)
+	cx.loopstack[#cx.loopstack] = nil
+	local parts = { "local __l = {}" }
+	for _, w in ipairs(st.words) do
+		if not empty_word(w) then
+			if word_safe(w) or EF.arith_guard(w) or field_word(w, cx.lifted) or EF.seg_native(w, cx.lifted) then
+				parts[#parts + 1] = emit_fields_into("__l", w, cx.lifted)
+			else
+				parts[#parts + 1] = ("rt.xw_fields(sh, %s[1], __l)"):format(EF.konst({ ser(w) }))
+			end
+		end
+	end
+	parts[#parts + 1] = ("if #__l == 0 then sh.status = 0; pc = %d else sh.forstate[%d] = __l; rt.select_menu(sh, __l); pc = %d end"):format(
+		after, st.id, advp)
+	cx.blocks[initp] = table.concat(parts, "; ")
+	cx.blocks[advp] = ("if rt.select_next(sh, sh.forstate[%d], %q) then pc = %d else pc = %d end"):format(
+		st.id, st.name, bodyentry, after)
+	return initp
+end
+
 -- statement handler: if (split out of flatten_stmt; see H)
 H["if"] = function(cx, st, after)
 	local t = st.t
@@ -7113,7 +7158,7 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
 	-- between install/restore of the redirs — no interpreter. break/continue/return in the
 	-- body raise to delegate()'s cf-wrapper (cfraise), which jumps like the keyword would.
 	-- nil -> caller falls back (uncompilable redir, traps, or a shape the fragment can't carry).
-	cx.REDIR_COMPOUND = { forc = 1, whilec = 1, forin = 1, ["if"] = 1, andor = 1, group = 1, case = 1 }
+	cx.REDIR_COMPOUND = { forc = 1, whilec = 1, forin = 1, ["if"] = 1, andor = 1, group = 1, case = 1, ["select"] = 1 }
 	function cx.has_node(node, pred)
 		if type(node) ~= "table" then
 			return false
@@ -7276,7 +7321,12 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
 						idx = 1
 					end
 					local tgt = (cf_op == "break") and cx.loopstack[idx].brk or cx.loopstack[idx].cont
-					if EF.fragment and lvl > #cx.loopstack and #cx.subexit == 0 then
+					if EF.cf_raise and EF.cf_raise.loop and lvl > #cx.loopstack and #cx.subexit == 0 then
+						-- (the body of a redirected compound inside the caller's loops: the levels
+						-- past its own reach them — raised for the caller's cf-wrapper)
+						cx.blocks[p] = d .. (EF.cf_flush or "") .. ("sh.status = 0; error({ __curse_%s = %d })"):format(
+							cf_op, lvl - #cx.loopstack)
+					elseif EF.fragment and lvl > #cx.loopstack and #cx.subexit == 0 then
 						-- (an eval / hot-loop fragment inside the caller's loops: the levels past
 						-- its own reach them — bash counts across; with none, it clamps)
 						cx.blocks[p] = d .. ("if sh.loopdepth > 0 then %serror({ __curse_%s = %d }) end; sh.status = 0; pc = %d"):format(
@@ -7460,6 +7510,8 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
 			return H.arrayassign(cx, st, after)
 		elseif t == "case" then
 			return H.case(cx, st, after)
+		elseif t == "select" then
+			return H.select(cx, st, after)
 		else
 			return cx.delegate(st, after) -- unknown/cold statement: run it via the interpreter
 		end
