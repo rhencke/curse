@@ -4512,6 +4512,144 @@ end
 -- (`eval 'true(){ …; }'`, a compiled function replaced by eval) — which the compiled call
 -- (native builtin / direct fn_x / external spawn) wouldn't see. Guard each literal command:
 -- still static (rt.names_static) -> the compiled code; else the interpreter's live dispatch.
+-- NATIVE simple-command dispatch for a literal command name whose run needs the full
+-- simple-command machinery — a declaration builtin's assignment-context operands and
+-- NAME=(…) literals, prefix assignments (`x=1 f`, a posix special builtin's persistent
+-- ones), `unset A[$k]`, a word the specialized paths don't render: argv is built HERE (the
+-- field engine; a declaration builtin's `name=value` words in assignment context; a word the
+-- compiled engine can't render via the shared one-word expander), the prefix values in a
+-- `bind` closure (expanded in order, after argv, as bash does), and rt.simple_run does the
+-- bindings / NAME=(…) literals / command runner / $_ / PIPESTATUS — no exec_stmt. The
+-- delegate wrapper supplies DEBUG, the lifted-var sync, errexit and control-flow signals;
+-- opts.redir the redirections. nil: a shape this doesn't cover (exec, a process
+-- substitution, an uncompilable redirect) — the caller delegates.
+local SN_ASSIGN_CMD = { export = 1, declare = 1, typeset = 1, readonly = 1, ["local"] = 1 }
+EF.simple_native = function(cx, st, after, cmd)
+	if not cmd or not st.words[1] then
+		return nil
+	end
+	local lifted = cx.lifted
+	local w2 = st.words[2] and st.words[2].parts[1]
+	if cmd == "exec" or ((cmd == "command" or cmd == "builtin") and w2 and w2.lit == "exec") then
+		return nil -- (exec's redirections persist / it replaces the process)
+	end
+	local function hasps(w)
+		for _, p in ipairs(w.parts) do
+			if p.procsub then
+				return true
+			end
+		end
+		return false
+	end
+	local function K(w) -- (the word AST, a module-level constant)
+		return EF.konst({ ser(w) }) .. "[1]"
+	end
+	local w1 = st.words[1]
+	local p1 = w1.parts[1]
+	local cw1lit = #w1.parts == 1 and p1.lit ~= nil and not p1.q and p1.lit or nil
+	local isdecl = cw1lit and SN_ASSIGN_CMD[cw1lit]
+	local isunset = cw1lit == "unset"
+	local out = { isunset and "sh.arrayref_args = nil; local __a = {}" or "local __a = {}" }
+	for j, w in ipairs(st.words) do
+		if hasps(w) then
+			return nil
+		end
+		local q1 = w.parts[1]
+		if j > 1 and isdecl and q1 and q1.lit and q1.lit:match("^[%a_][%w_]*%+?=") then
+			local fl = unq_full_lit(w)
+			local htilde = false
+			for _, pp in ipairs(w.parts) do
+				htilde = htilde or (pp.lit and not pp.q and pp.lit:find("~", 1, true)) and true
+			end
+			local v
+			if fl and htilde then
+				local pfx = fl:match("^([%a_][%w_]*%+?=)")
+				v = ("rt.cstr(%q .. rt.tilde_assign(sh, %q))"):format(pfx, fl:sub(#pfx + 1))
+			elseif fl then
+				v = ("%q"):format(fl)
+			elseif not htilde and emitable_word(w) then
+				v = ("rt.cstr(%s)"):format(emit_word(w, lifted))
+			else
+				v = ("rt.xw_assign(sh, %s)"):format(K(w))
+			end
+			out[#out + 1] = "__a[#__a+1] = " .. v
+		elseif j > 1 and isunset and q1 and q1.lit and not q1.q and q1.lit:match("^[%a_][%w_]*%[") then
+			out[#out + 1] = ("rt.xw_unset(sh, %s, __a)"):format(K(w))
+		elseif empty_word(w) then -- (an empty brace alternative adds no field)
+		elseif w.plain then
+			out[#out + 1] = ("__a[#__a+1] = %q"):format(q1.lit)
+		elseif word_safe(w) or arith_guard(w) or field_word(w, lifted) or mixed_expandable(w, lifted) then
+			out[#out + 1] = emit_fields_into("__a", w, lifted, "rt.cstr(%s)")
+		else
+			out[#out + 1] = ("rt.xw_fields(sh, %s, __a)"):format(K(w))
+		end
+	end
+	local spec = {}
+	if st.arrayargs then
+		for _, aa in ipairs(st.arrayargs) do
+			for _, e in ipairs(aa.elems) do
+				if hasps(e.word) then
+					return nil
+				end
+			end
+		end
+		spec[#spec + 1] = "aas=" .. ser(st.arrayargs)
+	end
+	local bind
+	if st.assigns and #st.assigns > 0 then
+		local bs, names = {}, {}
+		for _, a in ipairs(st.assigns) do
+			if a.index then
+				bs[#bs + 1] = ("rt.pbind_bad(sh, %q, %q)"):format(a.name, tostring(a.index))
+			elseif a.raw then
+				names[#names + 1] = ("%q"):format(a.name)
+				bs[#bs + 1] = ("rt.pbind(sh, %q, nil, false, %q)"):format(a.name, a.raw)
+			elseif a.rhs then
+				if hasps(a.rhs) then
+					return nil
+				end
+				names[#names + 1] = ("%q"):format(a.name)
+				local fl = unq_full_lit(a.rhs)
+				local htilde = false
+				for _, pp in ipairs(a.rhs.parts) do
+					htilde = htilde or (pp.lit and not pp.q and pp.lit:find("~", 1, true)) and true
+				end
+				local v
+				if fl and htilde then
+					v = ("rt.tilde_assign(sh, %q)"):format(fl)
+				elseif not htilde and emitable_word(a.rhs) then
+					v = emit_word(a.rhs, lifted)
+				else
+					v = ("rt.xw_rhs(sh, %s)"):format(K(a.rhs))
+				end
+				bs[#bs + 1] = ("rt.pbind(sh, %q, %s, %s)"):format(a.name, v, tostring(a.append and true or false))
+			else
+				return nil
+			end
+		end
+		spec[#spec + 1] = "names={" .. table.concat(names, ",") .. "}"
+		bind = "function(sh) " .. table.concat(bs, "; ") .. " end"
+	end
+	if st.line then
+		spec[#spec + 1] = "line=" .. st.line
+	end
+	local redir
+	if st.redirs and #st.redirs > 0 then
+		redir = cx.redir_conds(st, cmd)
+		if not redir then
+			return nil
+		end
+		if require("interp")._int.redirs_touch_stdout(st.redirs) then
+			spec[#spec + 1] = "so=true"
+		end
+	end
+	return cx.delegate(st, after, {
+		prelude = table.concat(out, "; "),
+		callee = "rt.simple_run",
+		callargs = ("sh, __a, %s, %s, __noop"):format(EF.konst(spec), bind or "nil"),
+		redir = redir,
+	})
+end
 local simple_compiled
 H.simple = function(cx, st, after)
 	local ua = false -- a word with an unquoted $((…)), else one field (arith_guard)
@@ -4547,7 +4685,9 @@ H.simple = function(cx, st, after)
 	if not c then
 		return p
 	end
-	local dp = cx.delegate(st, after, { callee = "I.exec_stmt", callargs = ("sh, %s, __noop"):format(ser(st)) })
+	-- (a name shadowed at run time: the native simple-command runner dispatches it)
+	local dp = EF.simple_native(cx, st, after, full_lit(w1))
+		or cx.delegate(st, after, { callee = "I.exec_stmt", callargs = ("sh, %s, __noop"):format(ser(st)) })
 	local g = cx.newpc()
 	cx.blocks[g] = ("if %s then pc = %d else pc = %d end"):format(names_guard({ c }), p, dp)
 	return g
@@ -4558,7 +4698,7 @@ simple_compiled = function(cx, st, after)
 	-- `var=x return` / `var=x :` …: under set -o posix a special builtin's prefix
 	-- assignments PERSIST — interp decides that at run time (opt_posix)
 	if cmd and st.assigns and #st.assigns > 0 and require("interp")._int.SPECIAL_BUILTIN[cmd] then
-		return cx.delegate(st, after)
+		return EF.simple_native(cx, st, after, cmd) or cx.delegate(st, after)
 	end
 	if cmd and emit_redir_funcs[cmd] then
 		return cx.delegate(st, after)
@@ -4667,7 +4807,7 @@ simple_compiled = function(cx, st, after)
 				.. ("; pc = %d"):format(after)
 			return p
 		end
-		return cx.delegate(st, after)
+		return EF.simple_native(cx, st, after, cmd) or cx.delegate(st, after)
 	end
 	-- DYNAMIC command word (first word not a compile-time literal — `$cmd`, `${x}`, …):
 	-- the command STRUCTURE is a static simple-command; only the word is late-bound. Build
@@ -4848,7 +4988,7 @@ simple_compiled = function(cx, st, after)
 	-- interp's full `local`, which also errors a bad name and skips a readonly
 	-- (matching bash). Done BEFORE the simple-stmt's newpc so no pc is orphaned.
 	if cmd == "local" and cx.toplevel then -- (outside a function: interp's error — unless a
-		return cx.delegate(st, after) -- function is sourcing this file)
+		return EF.simple_native(cx, st, after, cmd) or cx.delegate(st, after) -- function is sourcing this file)
 	end
 	if as_local then
 		-- (readonly / set -a are handled per-name at runtime by sh:localAssign — a
@@ -4879,7 +5019,7 @@ simple_compiled = function(cx, st, after)
 			end
 		end
 		if not plain and not flagsonly then
-			return cx.delegate(st, after)
+			return EF.simple_native(cx, st, after, cmd) or cx.delegate(st, after)
 		end
 	end
 	-- `unset map["$key"]`: the quoted subscript parts must not be expanded twice — interp's
@@ -4892,7 +5032,7 @@ simple_compiled = function(cx, st, after)
 			if ps[1] and ps[1].lit and not ps[1].q and ps[1].lit:match("^[%a_][%w_]*%[") then
 				for k = 2, #ps do
 					if ps[k].q or ps[k].lit == nil then
-						return cx.delegate(st, after)
+						return EF.simple_native(cx, st, after, cmd) or cx.delegate(st, after)
 					end
 				end
 			end
@@ -5110,6 +5250,11 @@ simple_compiled = function(cx, st, after)
 				.. ("; pc = %d"):format(after)
 			return p
 		end
+		-- (any other declaration-builtin shape: the native simple-command runner)
+		local pn = EF.simple_native(cx, st, after, cmd)
+		if pn then
+			return pn
+		end
 	end
 	-- `VAR=val … cmd args` (prefix env): evaluate each scalar prefix value in the
 	-- CURRENT env (bash/interp agree a sibling prefix isn't visible, and the args also
@@ -5137,6 +5282,16 @@ simple_compiled = function(cx, st, after)
 		for _, a in ipairs(st.assigns) do
 			if a.index or a.raw or a.append or not a.rhs or not emitable_word(a.rhs) then
 				pok = false
+				break
+			end
+			-- (a value that may read an EARLIER prefix binding — `a=1 b=$a cmd` — sees it:
+			-- bash binds left to right; these values all expand up front, so rt.simple_run)
+			for _, pn in ipairs(pnames) do
+				if (a.rhs.src or ""):find(pn:sub(2, -2), 1, true) then
+					pok = false
+				end
+			end
+			if not pok then
 				break
 			end
 			pnames[#pnames + 1] = ("%q"):format(a.name)
@@ -5184,7 +5339,7 @@ simple_compiled = function(cx, st, after)
 				-- (an external name — unless a function by that name exists at run time: a
 				-- fragment can't see the program's funcdefs, eval/source can define one; the
 				-- interpreter then runs the call with its prefix env)
-				local pd = cx.delegate(st, after)
+				local pd = EF.simple_native(cx, st, after, cmd) or cx.delegate(st, after)
 				local pg = cx.newpc()
 				cx.blocks[pg] = ("if sh.functions[%q] then pc = %d else pc = %d end"):format(cmd, pd, p)
 				return pg
@@ -5378,7 +5533,7 @@ simple_compiled = function(cx, st, after)
 		end
 	end
 	if mustdeleg then
-		return cx.delegate(st, after)
+		return EF.simple_native(cx, st, after, cmd) or cx.delegate(st, after)
 	end
 	-- A DYNAMIC command word (`"$a"`, cmd is not a compile-time literal) must be
 	-- resolved at runtime against functions → builtins → externals, exactly as the

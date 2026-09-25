@@ -12378,4 +12378,373 @@ function M.arith_textual(sh, raw)
 	return require("interp").arith_textual(sh, raw)
 end
 
+-- ===== The compiled tier's simple-command runner =====
+-- A simple command whose NAME is a compile-time literal but whose run needs more than a
+-- bare builtin/external dispatch — a declaration builtin (`declare -A m=(…)`, `local -n
+-- r=x`, `export a=~/b`), a prefix assignment (`x=1 f`, posix `x=1 :`), a function with
+-- redirections — is compiled to: its argv built natively (the field engine; assignment-
+-- context words for a declaration builtin), then M.simple_run, the twin of the rest of
+-- interp exec_stmt's `simple` branch: the prefix bindings (tempenv, or persistent for a
+-- posix special builtin), a declaration builtin's NAME=(…) literals, the command runner
+-- (exec_simple: function / builtin / external), $_ and PIPESTATUS. Statement structure,
+-- control flow and redirections stay compiled (the caller's delegate wrapper / opts.redir).
+do
+	-- A word expansion error (bad substitution, invalid indirect …) aborts the whole simple
+	-- command, status 1, non-fatally (interp's expand_args pcall): an expander below flags
+	-- sh.xerr and M.simple_run skips the command.
+	function M.sr_xcontain(sh, e)
+		if type(e) == "table" and e.__curse_experr and not e.__curse_lineabort then
+			M.posix_arith_fatal(sh, e)
+			sh.xerr = true
+			return
+		end
+		error(e, 0)
+	end
+	-- the fields of one word the compiled engine doesn't render (a ${…} operator, …): the
+	-- shared one-word expander
+	function M.xw_fields(sh, w, into)
+		local ok, fs = pcall(require("interp").expand_to_fields, sh, w)
+		if not ok then
+			return M.sr_xcontain(sh, fs)
+		end
+		for k = 1, #fs do
+			into[#into + 1] = M.cstr(fs[k])
+		end
+	end
+	-- a declaration builtin's `name=value` argument (no split/glob, ~ after = and :)
+	function M.xw_assign(sh, w)
+		local ok, v = pcall(require("interp").expand_assign_word, sh, w, true)
+		if not ok then
+			M.sr_xcontain(sh, v)
+			return ""
+		end
+		return M.cstr(v)
+	end
+	-- `unset NAME[…]`: its quoted subscript parts are protected from a second expansion,
+	-- and an unquoted `NAME[…]` word names an element up to its final `]` (W_ARRAYREF) —
+	-- interp's expand_args unset branch
+	function M.xw_unset(sh, w, into)
+		local I = require("interp")._int
+		local ref = I.unset_arrayref(sh, w)
+		if ref then
+			into[#into + 1] = M.cstr(ref)
+		else
+			local n0 = #into
+			M.xw_fields(sh, w, into)
+			if #into == n0 + 1 and sh.shopt.assoc_expand_once then
+				M.mark_arrayref(sh, into[#into])
+			end
+		end
+		if w.src and w.src:sub(-1) == "]" and #into > 0 then
+			M.mark_arrayref(sh, into[#into])
+		end
+	end
+	-- a prefix assignment's value (assignment context); nil when its expansion failed
+	-- (interp: status 1, the binding keeps the old value, the command still runs)
+	function M.xw_rhs(sh, w)
+		local ok, v = pcall(require("interp").expand_assign_word, sh, w)
+		if not ok then
+			if type(v) == "table" and v.__curse_experr and not v.__curse_lineabort then
+				sh.status = 1
+				return nil
+			end
+			error(v, 0)
+		end
+		return v
+	end
+
+	-- One prefix binding `name=value` (value already expanded, nil = its expansion failed;
+	-- `append` for name+=value), in the mode M.simple_run set: a tempenv binding for the
+	-- command (restored after it), or a persistent exported one (posix special builtin).
+	function M.sr_pset(sh, name, value, append)
+		if value == nil then
+			return
+		end
+		local b = sh.vars[sh:deref(name)]
+		if b and b.ro then -- (a readonly prefix: reported, non-fatal — the command still runs)
+			io.stderr:write("curse: " .. sh:deref(name) .. ": readonly variable\n")
+			sh.status = 1
+			if sh.opt_c or sh.opt_posix then
+				error({ __curse_exit = 1 })
+			end
+			return
+		end
+		if append then -- (interp's assign_body `name+=value`)
+			if b and b.arr then
+				sh:array_set(name, sh:is_assoc(name) and "0" or 0, value, true)
+			elseif b and b.int and not b.ref then
+				sh:aset(name, M.int_value(sh, sh:get(name)) + M.int_value(sh, value))
+			elseif b and (b.lower or b.upper) then
+				local v = (sh:get(name) or "") .. value
+				sh:set_str(name, b.lower and v:lower() or v:upper())
+			else
+				M.append_scalar(sh, name, value)
+			end
+			return
+		end
+		if b and b.arr then
+			sh:array_set(name, sh:is_assoc(name) and "0" or 0, value, false)
+		elseif b and b.int and not b.ref then
+			sh:aset(name, M.int_value(sh, value))
+		elseif b and (b.lower or b.upper) then
+			sh:set_str(name, b.lower and value:lower() or value:upper())
+		else
+			sh:set_str(name, value)
+		end
+	end
+	function M.pbind(sh, name, value, append, raw)
+		local mode = sh.pb_mode
+		if mode == "persist" then
+			for _, te in ipairs(sh.tenv) do -- (it propagates through a temporary binding)
+				if te.name == name then
+					te.consumed = true
+				end
+			end
+			if raw then
+				sh:set_str(name, raw)
+			else
+				M.sr_pset(sh, name, value, append)
+			end
+			local b = sh.vars[sh:deref(name)]
+			if b then
+				b.exported = true
+			end
+			C.setenv(name, sh:get(name) or "", 1)
+			return
+		end
+		local rb = sh.vars[name]
+		if rb and rb.ref and rb.s and rb.s:match("^[%a_][%w_]*$") and sh:deref(name) ~= "" then
+			name = sh:deref(name) -- (through a nameref with a target: the target's binding)
+		end
+		local b = sh.vars[name] -- copy the box: the binding mutates it in place
+		sh.vseq = sh.vseq + 1
+		local cmd = sh.pb_cmd
+		sh.tenv[#sh.tenv + 1] = {
+			name = name,
+			env = os.getenv(name),
+			consumed = false,
+			seq = sh.vseq,
+			decl_pd = (cmd == "local" or cmd == "declare" or cmd == "typeset") and sh.pd or nil,
+			box = b and { s = b.s, n = b.n, arr = b.arr, assoc = b.assoc, order = b.order, exported = b.exported,
+				ro = b.ro, ref = b.ref, int = b.int, lower = b.lower, upper = b.upper, cap = b.cap, trace = b.trace }
+				or false,
+		}
+		-- a nameref's / -i/-l/-u/-c var's prefix binding is a plain temporary string (bash)
+		if b and (b.ref or ((b.int or b.lower or b.upper or b.cap) and not b.arr and not b.ro)) then
+			sh.vars[name] = {}
+		end
+		if raw then -- NAME=(…) as a command prefix is a literal string, not an array (bash)
+			sh:set_str(name, raw)
+			C.setenv(name, raw, 1)
+		else
+			M.sr_pset(sh, name, value, append)
+			C.setenv(name, sh:get(name) or "", 1)
+		end
+		sh.tenv[#sh.tenv].tval = sh:get(name)
+		local nb = sh.vars[sh:deref(name)]
+		if nb then
+			nb.exported = true
+		end
+	end
+	-- `a[i]=v cmd`: not a valid command-prefix binding — reported, skipped (the command runs)
+	function M.pbind_bad(sh, name, index)
+		io.stderr:write("curse: `" .. name .. "[" .. index .. "]': not a valid identifier\n")
+	end
+
+	-- a declaration builtin's NAME=(…) operands, before it runs: the names join argv (so the
+	-- builtin declares/localizes them), a readonly target fails the line, and each literal's
+	-- elements expand NOW (bash: `local -a arr=("${arr[@]}")` copies the outer arr)
+	function M.sr_aa_pre(sh, argv, aas)
+		local I = require("interp")._int
+		local dcl, glob = argv[1], false
+		for k = 2, #argv do
+			glob = glob or argv[k]:match("^%-%a*[gG]") ~= nil
+		end
+		local localize = dcl == "local" or ((dcl == "declare" or dcl == "typeset") and (sh.calldepth or 0) > 0 and not glob)
+		for _, aa in ipairs(aas) do
+			argv[#argv + 1] = aa.name
+			local b = sh.vars[sh:deref(aa.name)]
+			if b and b.ro and not localize then
+				io.stderr:write("curse: " .. aa.name .. ": readonly variable\n")
+				sh.status = 1
+				error({ __curse_exit = 1, __curse_lineabort = true })
+			elseif b and b.ro and sh:is_global_ro(sh:deref(aa.name)) then
+				local fnm = sh.funcstack and sh.funcstack[1]
+				io.stderr:write("curse: " .. (fnm and (fnm .. ": ") or "") .. aa.name .. ": readonly variable\n")
+			end
+		end
+		sh.arrayargs_pending = {}
+		local wantassoc = false
+		for k = 2, #argv do
+			if argv[k]:match("^%-%a*A") then
+				wantassoc = true
+			end
+		end
+		sh.arrayargs_pre = {}
+		for _, aa in ipairs(aas) do
+			sh.arrayargs_pending[aa.name] = true
+			sh.arrayargs_pre[aa] = I.arrayassign_items(sh, aa, wantassoc or sh:is_assoc(sh:deref(aa.name)))
+		end
+	end
+	-- … and after it: each literal lands in the now-declared (local/assoc) variable, unless
+	-- the builtin failed (a rejected -A/-a conversion leaves the array untouched)
+	function M.sr_aa_post(sh, aas)
+		local I = require("interp")._int
+		local pend = sh.arrayargs_pending
+		local aaskip = pend and pend.skip
+		local aaforce = pend and pend.force
+		if sh.status == 0 or aaforce then
+			local failed = sh.status ~= 0
+			for _, aa in ipairs(aas) do
+				if failed and not aaforce[aa.name] then
+				elseif aaskip and aaskip[aa.name] then
+				else
+					I.do_arrayassign(sh, aa)
+				end
+			end
+		end
+	end
+
+	-- the command runner; eval/source/. COMPILE their code (rt.eval / rt.source), as the
+	-- compiled tier's own eval/source statements do — unless a function shadows the name
+	function M.sr_dispatch(sh, argv, spec, hook)
+		local cmd = argv[1]
+		if (cmd == "eval" or cmd == "source" or cmd == ".")
+			and not (sh.functions[cmd] and not (sh.opt_posix and M.SPECIAL_BUILTIN[cmd]))
+			and not (sh.disabled_builtins and sh.disabled_builtins[cmd]) then
+			sh.tenv_call_base = nil -- (a function the code calls can't absorb these bindings)
+			if cmd == "eval" then
+				return M.eval(sh, argv)
+			end
+			if argv[2] then
+				return M.source(sh, argv, spec.line)
+			end
+		end
+		return require("interp").exec_simple(sh, argv, hook)
+	end
+	function M.sr_run_cmd(sh, argv, spec, hook)
+		sh.write_err = nil
+		local I = require("interp")
+		if sh.opt_x then
+			I.xtrace(sh, argv)
+		end
+		if spec.so then -- (a redirect moved stdout: builtins write the real fd 1)
+			local so = sh.out
+			sh.out = io.write
+			local ok, err = pcall(M.sr_dispatch, sh, argv, spec, hook)
+			io.flush()
+			sh.out = so
+			if not ok then
+				error(err, 0)
+			end
+		else
+			M.sr_dispatch(sh, argv, spec, hook)
+		end
+		if sh.write_err then
+			M.chkwrite_late(sh, argv[1])
+		end
+	end
+	function M.sr_unbind(sh, base, argv)
+		local relocale = false
+		local keeps = M.prefix_keeps(sh, argv)
+		for k = #sh.tenv, base + 1, -1 do
+			local s = sh.tenv[k]
+			sh.tenv[k] = nil
+			if not s.consumed then
+				local nv = keeps and sh:get(s.name)
+				sh.vars[s.name] = s.box or nil
+				if s.env then
+					C.setenv(s.name, s.env, 1)
+				else
+					C.unsetenv(s.name)
+				end
+				if nv and nv ~= s.tval then
+					sh:set_str(s.name, nv)
+				end
+				relocale = relocale or LOCALE_VARS[s.name] ~= nil
+			end
+		end
+		if relocale then
+			M.reset_locale(sh)
+		end
+	end
+	-- spec (a per-site constant): aas = the NAME=(…) operand ASTs; names = the prefix
+	-- assignment names; so = a redirect moves stdout. bind(sh) performs the prefix bindings
+	-- in order (each value expanded after the previous binding: bash's left-to-right).
+	function M.simple_run(sh, argv, spec, bind, hook)
+		hook = hook or _noop
+		if sh.xerr then -- a word expansion failed: the command doesn't run (status 1)
+			sh.xerr = nil
+			sh.status = 1
+			if sh.opt_e then
+				error({ __curse_exit = 1 })
+			end
+			return
+		end
+		local aas = spec.aas
+		if aas then
+			M.sr_aa_pre(sh, argv, aas)
+		end
+		local cmd = argv[1]
+		local ok, err = true, nil
+		if bind and sh.opt_posix and cmd and M.SPECIAL_BUILTIN[cmd] then
+			-- posix: a prefix assignment on a special builtin PERSISTS (and stays exported) —
+			-- except a var the builtin (`unset`) removes reverts to its prior value
+			local prior = {}
+			for _, name in ipairs(spec.names) do
+				if prior[name] == nil then
+					local b = sh.vars[name]
+					prior[name] = b and { s = b.s, n = b.n, arr = b.arr, assoc = b.assoc, order = b.order,
+						exported = b.exported, ro = b.ro, ref = b.ref } or false
+				end
+			end
+			local svm = sh.pb_mode
+			sh.pb_mode = "persist"
+			ok, err = pcall(bind, sh)
+			sh.pb_mode = svm
+			if ok then
+				ok, err = pcall(M.sr_run_cmd, sh, argv, spec, hook)
+			end
+			for name, box in pairs(prior) do
+				if sh.vars[name] == nil then
+					sh.vars[name] = box or nil
+				end
+			end
+		elseif bind then
+			local base = #sh.tenv
+			local svm, svc = sh.pb_mode, sh.pb_cmd
+			sh.pb_mode, sh.pb_cmd = "tenv", cmd
+			ok, err = pcall(bind, sh)
+			sh.pb_mode, sh.pb_cmd = svm, svc
+			if ok then
+				sh.tenv_call_base = base
+				ok, err = pcall(M.sr_run_cmd, sh, argv, spec, hook)
+				sh.tenv_call_base = nil
+			end
+			M.sr_unbind(sh, base, argv)
+		else
+			ok, err = pcall(M.sr_run_cmd, sh, argv, spec, hook)
+		end
+		if ok and aas then
+			ok, err = pcall(M.sr_aa_post, sh, aas)
+		end
+		if aas then
+			sh.arrayargs_pending = nil
+			sh.arrayargs_pre = nil
+		end
+		if sh.pending_unswap then -- (declare -g: back to the caller's locals)
+			local f = sh.pending_unswap
+			sh.pending_unswap = nil
+			f()
+		end
+		if not ok then
+			error(err, 0)
+		end
+		if #argv > 0 then
+			sh:set_str("_", argv[#argv])
+		end
+		sh:array_assign("PIPESTATUS", { tostring(sh.status) }, false)
+	end
+end
+
 return M
