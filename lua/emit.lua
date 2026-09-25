@@ -465,7 +465,12 @@ end
 -- call AFTER the unset fails (127) — a hoisted fn_x would still be callable.
 -- $LINENO: the current line as a compile-time constant; once `unset LINENO` stripped its
 -- magic it is an ordinary variable (bash)
+-- (a trap handler's own commands keep the line of the command it interrupted — interp's
+-- run_trap doesn't advance sh.cur_line at the trap's call depth: EF.trapline)
 local function lineno_expr()
+	if EF.trapline and not EF.cur_infunc then
+		return "(sh.unset_specials and sh.unset_specials.LINENO and sh:get('LINENO') or tostring(sh.cur_line or 0))"
+	end
 	return ("(sh.unset_specials and sh.unset_specials.LINENO and sh:get('LINENO') or %q)"):format(
 		tostring(EF.cur_line or 0))
 end
@@ -898,8 +903,8 @@ local function errchk(st) -- the guard statement for `st`, or "" when errexit ne
 	if EF.has_err then -- ERR trap fires on the same condition as errexit; set $LINENO to this
 		-- command's line, fire ERR (fire_err_trap scopes by calldepth/in_subprogram — inside a
 		-- function/subshell only under errtrace), THEN errexit (bash order).
-		return ("if sh.noerr == 0 and sh.status ~= 0 then sh.cur_line = %d; I.fire_err_trap(sh); if sh.opt_e then %s end end"):format(
-			st.line or 0,
+		return ("if sh.noerr == 0 and sh.status ~= 0 then %sI.fire_err_trap(sh); if sh.opt_e then %s end end"):format(
+			(EF.trapline and not EF.cur_infunc) and "" or ("sh.cur_line = %d; "):format(st.line or 0),
 			exitfail
 		)
 	end
@@ -913,8 +918,9 @@ EF.has_debug = false -- program installs a DEBUG trap → fire it before each co
 -- trace hook per command — `if sh.opt_x then rt.xtrace…` — placed where the interpreter
 -- traces: after the words expand, before the redirections. Every other program: "".
 EF.xtrace = false
-function EF.xln() -- (a PS4 like `+[$LINENO] ` reads the traced command's line)
-	return EF.cur_line and ("sh.cur_line = %d; "):format(EF.cur_line) or ""
+function EF.xln() -- (a PS4 like `+[$LINENO] ` reads the traced command's line — a trap
+	-- handler's commands keep the interrupted one)
+	return EF.cur_line and not EF.trapline and ("sh.cur_line = %d; "):format(EF.cur_line) or ""
 end
 function EF.xt(a) -- the command's full expanded argv (a Lua table expression)
 	return EF.xtrace and ("if sh.opt_x then %srt.xtrace(sh, %s) end "):format(EF.xln(), a) or ""
@@ -949,6 +955,9 @@ local function dbg(st)
 	-- run_debug scopes by calldepth/in_subprogram (fires inside a function/subshell only
 	-- under functrace); calldepth is tracked in fnwrap when a DEBUG trap is present.
 	if EF.has_debug then
+		if EF.trapline and not EF.cur_infunc then -- (a handler's commands: the interrupted line)
+			return "I.run_debug(sh, sh.cur_line); "
+		end
 		return ("I.run_debug(sh, %d); "):format(st.line or 0)
 	end
 	return ""
@@ -1184,6 +1193,9 @@ emit_value = function(e, lifted)
 		return ("(function() local _ = %s; return %s end)()"):format(emit_value(e.l, lifted), emit_value(e.r, lifted))
 	end
 	if k == "var" and e.name == "LINENO" then -- compile-time line (unless `unset LINENO`)
+		if EF.trapline and not EF.cur_infunc then
+			return "(sh.unset_specials and sh.unset_specials.LINENO and sh:aget('LINENO') or (0LL + (sh.cur_line or 0)))"
+		end
 		return ("(sh.unset_specials and sh.unset_specials.LINENO and sh:aget('LINENO') or %sLL)"):format(
 			tostring(EF.cur_line or 0))
 	end
@@ -7019,7 +7031,6 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
 
 	-- Statement types with no native compiled form yet -> always delegate.
 	cx.DELEGATE = {
-		parse_error = 1,
 		assignlist = 1,
 	}
 
@@ -7436,6 +7447,13 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
 		if cx.DELEGATE[t] then
 			return cx.delegate(st, after)
 		end
+		if t == "parse_error" or t == "warn" then -- (the report is data: rt prints it; a
+			-- fatal parse error raises its exit through the wrapper, lifted vars synced for EXIT)
+			return cx.delegate(st, after, {
+				callee = t == "warn" and "rt.warn_stmt" or "rt.parse_error_stmt",
+				callargs = ("sh, %s%s"):format(ser(st), EF.perr_label and (", %q"):format(EF.perr_label) or ""),
+			})
+		end
 		if t == "assign" then
 			return H.assign(cx, st, after)
 		elseif t == "funcdef" then
@@ -7709,7 +7727,8 @@ assemble = function(cfg, sig, opts)
 	-- pc -> source line, for error-message prefixes (read only on the error path)
 	local fname = sig:match("^local function ([%w_]+)") or sig:match("^([%w_]+) = function")
 		or sig:match("^(__CS%[%d+%]) = function")
-	if fname and cfg.pcline then
+	if fname and cfg.pcline and not (EF.trapline and fname == "run") then -- (a handler's
+		-- errors carry the interrupted line: sh.cur_line, via the INTERP_FRAMES runner)
 		local lt = {}
 		for p = 0, cfg.npc - 1 do
 			local ln = cfg.pcline[p]
@@ -7897,6 +7916,8 @@ function M.emit(ast, opts)
 	-- execution context, so a top-level return/break/continue must RAISE its signal for
 	-- the enclosing (delegated) cf-wrapper to catch, not jump to this fragment's own DONE.
 	EF.fragment = opts and opts.fragment or false
+	EF.trapline = opts and opts.trapline or false
+	EF.perr_label = opts and opts.perr_label or nil -- (an eval fragment's syntax errors: `eval: line N:`)
 	-- Line mode (tier.lm_exec): a fragment that is one logical line of the SCRIPT — its
 	-- parse (aliases, history) was done by the live reader, and its top level is the
 	-- script's own (a break/return there is the script's, not a caller's)
@@ -7938,14 +7959,17 @@ function M.emit(ast, opts)
 	EF.ro_names = nil -- (this program's readonly names: computed on first need — func_locals)
 	EF.frag_nameref = EF.fragment and scan_nameref(ast.stmts) -- (the fragment's own text)
 	EF.has_nameref = EF.fragment or scan_nameref(ast.stmts) -- declare -n present → delegate scalar assigns
-	EF.has_err = scan_trap(ast.stmts, { ERR = 1 }) -- gate compiled ERR-trap firing
-	EF.has_debug = scan_trap(ast.stmts, { DEBUG = 1 }) -- gate compiled DEBUG-trap firing
+	-- (a runtime fragment — eval/source/a hot loop — also gets the hooks for the traps set
+	-- in the shell it compiles in: tier.trap_mode keys its cache by that state)
+	local fo = opts or {}
+	EF.has_err = fo.trap_err or scan_trap(ast.stmts, { ERR = 1 }) -- gate compiled ERR-trap firing
+	EF.has_debug = fo.trap_debug or scan_trap(ast.stmts, { DEBUG = 1 }) -- gate compiled DEBUG-trap firing
 	EF.funcstack = reads_debugstack(ast.stmts) -- gate FUNCNAME/BASH_SOURCE/BASH_LINENO stacks
 	EF.pipestatus = reads_var(ast.stmts, "PIPESTATUS") -- gate $PIPESTATUS after simple cmds
 	EF.has_trap = scan_any_trap(ast.stmts) -- gate compiled `&`/pipeline (forked child resets signal traps)
 	-- in-process subshell/$(…)/pipeline-stage gate: only a REAL-signal trap (or DEBUG under
 	-- functrace, which reaches into subshells) keeps them forked/delegated
-	EF.inproc_trap_block = EF.has_debug and scan_functrace(ast.stmts)
+	EF.inproc_trap_block = EF.has_debug and (fo.functrace or scan_functrace(ast.stmts))
 	-- (`&` still forks: a real-signal trap must be reset in its child — interp's machinery)
 	EF.bg_trap_block = scan_sigtrap(ast.stmts) or EF.inproc_trap_block
 	local funcflags, inlinable, inlinefns = {}, {}, {}

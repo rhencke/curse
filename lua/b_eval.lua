@@ -71,6 +71,7 @@ return function(sh, cmd, args, hook, tcb)
 				local sxd = sh.xdepth -- (eval'd commands trace one level deeper: `++ cmd`, bash)
 				sh.xdepth = (sxd or 0) + 1
 				local badsyntax -- (EX_BADSYNTAX: like EX_USAGE from a special builtin — rt.spb_run)
+				local ran = false -- (a command ran before the error: not fatal — rt.perr_lead)
 				local ok, err = pcall(function()
 					local ln = rt.current_line(sh)
 					local nextf = eval_groups(sh, code, ln) or P.open(code, sh, ln > 0 and ln or nil)
@@ -93,10 +94,11 @@ return function(sh, cmd, args, hook, tcb)
 								error(perr)
 							end
 							sh.status = 2
-							badsyntax = true
+							badsyntax = not ran
 							return
 						end
 						for _, st in ipairs(lg.stmts) do
+							ran = ran or not rt.perr_neutral(st)
 							local sok, serr = pcall(exec_list, sh, { st }, hook, false) -- errexit + signals incl.
 							if not sok then
 								if type(serr) == "table" and serr.__curse_lineabort and not serr.__curse_discard then
