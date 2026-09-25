@@ -7441,7 +7441,8 @@ H.subshell = function(cx, st, after)
 				swpost = ("; %s = %s"):format(vlist, table.concat(sav, ", "))
 			end
 			-- (its text: the report if a signal kills it)
-			local stx = ("%q"):format(require("deparse").command_text(st))
+			local stx = ("%q"):format((st.bang and "! " or "") .. require("deparse").command_text(st))
+				.. (st.inplace and ", true" or "") -- (alone in a `( … )`: parser.mark_tail)
 			-- (bash waits for the forked child as a one-process job: setjstatus → PIPESTATUS)
 			if EF.pipestatus then
 				swpost = swpost .. '; sh:array_assign("PIPESTATUS", {tostring(sh.status)}, false)'

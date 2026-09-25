@@ -6915,7 +6915,7 @@ exec_stmt = function(sh, st, hook)
 				end
 			end
 			exec_list(sh, st.body, SUBHOOK, false)
-		end, nil, st) -- (st: its text, for the report if a signal kills it)
+		end, nil, st, st.inplace) -- (st: its text, for the report if a signal kills it)
 		if saves then
 			restore_redirs(saves)
 		end

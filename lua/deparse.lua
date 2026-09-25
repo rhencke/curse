@@ -226,7 +226,11 @@ conv = function(st)
 	elseif t == "group" then
 		c = { k = "group", body = conv_list(st.body) }
 	elseif t == "subshell" then
-		c = { k = "subshell", body = conv_list(st.body) }
+		local b = st.body
+		if #b == 1 and b[1].tw then -- (`time ( … )`: parser.untail's timed group is the body)
+			b = b[1].body
+		end
+		c = { k = "subshell", body = conv_list(b) }
 	elseif t == "coproc" then
 		c = { k = "coproc", name = st.name or "COPROC", body = conv(st.cmd) }
 	elseif t == "if" then
@@ -287,6 +291,8 @@ conv = function(st)
 	c.redirs = c.redirs or st.redirs
 	if st.timed then
 		c.time, c.time_p = true, st.timed_p
+	elseif st.ttimed then
+		c.time, c.time_p = true, st.ttimed == "p" or nil
 	end
 	return c
 end
