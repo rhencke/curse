@@ -1099,14 +1099,10 @@ eval = function(sh, e)
 			return bit.arshift(l, tonumber(r) % 64)
 		end
 		if op == "**" then
-			local base, n, res = l, tonumber(r), i64(1)
-			if n < 0 then -- bash disallows a negative exponent (fatal arith error)
+			if r < 0 then -- bash disallows a negative exponent (fatal arith error)
 				arith_div0(e, "exponent less than 0")
 			end
-			for _ = 1, n do
-				res = res * base
-			end
-			return res
+			return rt.ipow_raw(l, r)
 		end
 	end
 	if k == "asgn" then

@@ -4979,16 +4979,24 @@ M.arith_num = arith_num
 -- own, guarding the negative exponent before it reaches here). bash disallows a
 -- negative exponent: throw the same non-fatal matherr div0 does (lineabort so a
 -- word-context $(( )) aborts the command; matherr so a (( )) pcall maps it to $?=1).
-function M.ipow(base, exp, etxt, etok)
-	local n = tonumber(exp)
-	if n < 0 then
-		M.arith_fault(etxt, etok, "exponent less than 0")
-	end
-	local r = i64(1)
-	for _ = 1, n do
-		r = r * base
+-- bash's ipow (expr.c): square-and-multiply on wrapping int64 — `1 ** 3000000000` is
+-- instant (a multiply-n-times loop took forever)
+function M.ipow_raw(base, exp)
+	local r, b, e = i64(1), i64(base), i64(exp)
+	while e ~= 0 do
+		if bit.band(e, 1) ~= 0 then
+			r = r * b
+		end
+		e = bit.rshift(e, 1)
+		b = b * b
 	end
 	return r
+end
+function M.ipow(base, exp, etxt, etok)
+	if exp < 0 then
+		M.arith_fault(etxt, etok, "exponent less than 0")
+	end
+	return M.ipow_raw(base, exp)
 end
 
 -- Division/modulo with bash's fatal divide-by-zero (aborts the command, status 1).
