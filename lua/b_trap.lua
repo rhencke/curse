@@ -137,6 +137,7 @@ return function(sh, cmd, args, hook, tcb)
 					end
 					if canon == "ERR" then -- (it fires where it was set: see interp's fire_err_trap)
 						sh.err_trap_sp = sh.in_subprogram or 0
+						sh.err_trap_ps = sh.in_pipestage or 0 -- (and a stage fires one set in it)
 					elseif canon == "DEBUG" then -- (likewise: rt.pseudo_trapped)
 						sh.dbg_trap_sp = sh.in_subprogram or 0
 					elseif canon == "RETURN" then
