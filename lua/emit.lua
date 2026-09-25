@@ -452,7 +452,12 @@ end
 -- call AFTER the unset fails (127) — a hoisted fn_x would still be callable.
 -- $LINENO: the current line as a compile-time constant; once `unset LINENO` stripped its
 -- magic it is an ordinary variable (bash)
+-- (a trap handler's own commands keep the line of the command it interrupted — interp's
+-- run_trap doesn't advance sh.cur_line at the trap's call depth: EF.trapline)
 local function lineno_expr()
+	if EF.trapline and not EF.cur_infunc then
+		return "(sh.unset_specials and sh.unset_specials.LINENO and sh:get('LINENO') or tostring(sh.cur_line or 0))"
+	end
 	return ("(sh.unset_specials and sh.unset_specials.LINENO and sh:get('LINENO') or %q)"):format(
 		tostring(EF.cur_line or 0))
 end
@@ -885,8 +890,8 @@ local function errchk(st) -- the guard statement for `st`, or "" when errexit ne
 	if EF.has_err then -- ERR trap fires on the same condition as errexit; set $LINENO to this
 		-- command's line, fire ERR (fire_err_trap scopes by calldepth/in_subprogram — inside a
 		-- function/subshell only under errtrace), THEN errexit (bash order).
-		return ("if sh.noerr == 0 and sh.status ~= 0 then sh.cur_line = %d; I.fire_err_trap(sh); if sh.opt_e then %s end end"):format(
-			st.line or 0,
+		return ("if sh.noerr == 0 and sh.status ~= 0 then %sI.fire_err_trap(sh); if sh.opt_e then %s end end"):format(
+			(EF.trapline and not EF.cur_infunc) and "" or ("sh.cur_line = %d; "):format(st.line or 0),
 			exitfail
 		)
 	end
@@ -914,6 +919,9 @@ local function dbg(st)
 	-- run_debug scopes by calldepth/in_subprogram (fires inside a function/subshell only
 	-- under functrace); calldepth is tracked in fnwrap when a DEBUG trap is present.
 	if EF.has_debug then
+		if EF.trapline and not EF.cur_infunc then -- (a handler's commands: the interrupted line)
+			return "I.run_debug(sh, sh.cur_line); "
+		end
 		return ("I.run_debug(sh, %d); "):format(st.line or 0)
 	end
 	return ""
@@ -1149,6 +1157,9 @@ emit_value = function(e, lifted)
 		return ("(function() local _ = %s; return %s end)()"):format(emit_value(e.l, lifted), emit_value(e.r, lifted))
 	end
 	if k == "var" and e.name == "LINENO" then -- compile-time line (unless `unset LINENO`)
+		if EF.trapline and not EF.cur_infunc then
+			return "(sh.unset_specials and sh.unset_specials.LINENO and sh:aget('LINENO') or (0LL + (sh.cur_line or 0)))"
+		end
 		return ("(sh.unset_specials and sh.unset_specials.LINENO and sh:aget('LINENO') or %sLL)"):format(
 			tostring(EF.cur_line or 0))
 	end
@@ -7458,7 +7469,8 @@ assemble = function(cfg, sig, opts)
 	-- pc -> source line, for error-message prefixes (read only on the error path)
 	local fname = sig:match("^local function ([%w_]+)") or sig:match("^([%w_]+) = function")
 		or sig:match("^(__CS%[%d+%]) = function")
-	if fname and cfg.pcline then
+	if fname and cfg.pcline and not (EF.trapline and fname == "run") then -- (a handler's
+		-- errors carry the interrupted line: sh.cur_line, via the INTERP_FRAMES runner)
 		local lt = {}
 		for p = 0, cfg.npc - 1 do
 			local ln = cfg.pcline[p]
@@ -7646,6 +7658,7 @@ function M.emit(ast, opts)
 	-- execution context, so a top-level return/break/continue must RAISE its signal for
 	-- the enclosing (delegated) cf-wrapper to catch, not jump to this fragment's own DONE.
 	EF.fragment = opts and opts.fragment or false
+	EF.trapline = opts and opts.trapline or false
 	-- xtrace/verbose (`set -x`, `set -o xtrace`, `set -v`) trace per command; the compiled
 	-- tier has no trace hooks, so such a program stays in the interpreter (which traces).
 	if scan_xtrace(ast.stmts) then

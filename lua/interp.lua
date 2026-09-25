@@ -7106,6 +7106,12 @@ end
 -- result: the CALLER (once it has undone its own state) raises it, so the return ends
 -- that function/source — bash's _run_trap_internal longjmps to return_catch (trap.c).
 -- (Not for the EXIT/RETURN traps: their callers keep the status.)
+local trap_seen, trap_seen_n = {}, 0 -- (handler texts run once: the next run compiles)
+-- (an INTERP_FRAMES runner: the compiled handler's error prefixes read sh.cur_line)
+local function run_trap_mod(mod, sh)
+	return require("tier").run_compiled(mod, sh, nil, true)
+end
+rt.INTERP_FRAMES[run_trap_mod] = true
 run_trap = function(sh, code)
 	local exited, savedline, rret = false, sh.cur_line, nil
 	local saved_tcd, saved_ts = sh.trap_calldepth, sh.trap_saved
@@ -7114,8 +7120,24 @@ run_trap = function(sh, code)
 	sh.in_trap = (sh.in_trap or 0) + 1
 	local sxd = sh.xdepth -- (a handler's commands trace one level deeper: `++ cmd`, bash)
 	sh.xdepth = (sxd or 0) + 1
-	local stmts, k = P.parse(code).stmts, 0
+	-- A handler that runs again is compiled (tier fragment, keyed by its text and the trap
+	-- state): the first run interprets it, so a one-shot EXIT trap never loads the compiler.
+	local seen = trap_seen[code]
+	local mod
+	if seen then
+		mod = require("tier").try_fragment(code, false, sh, true)
+	else
+		trap_seen_n = trap_seen_n + 1
+		if trap_seen_n > 256 then
+			trap_seen, trap_seen_n = {}, 1
+		end
+		trap_seen[code] = true
+	end
+	local stmts, k = mod and {} or P.parse(code).stmts, 0
 	local function body()
+		if mod then -- (a line abort is contained by run_compiled: the rest of that line is skipped)
+			return run_trap_mod(mod, sh)
+		end
 		while k < #stmts do
 			k = k + 1
 			local st = stmts[k]

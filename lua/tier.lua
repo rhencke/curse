@@ -54,15 +54,17 @@ local function trap_mode(sh)
 	return e .. d
 end
 M.trap_mode = trap_mode
-function M.try_fragment(code, line1, sh) -- line1: an eval's own line, which its code numbers from
-	local mode = trap_mode(sh)
+function M.try_fragment(code, line1, sh, now) -- line1: an eval's own line, which its code numbers from
+	-- (now: the caller already saw this code run — compile it on this first call;
+	-- line1 == false: a trap handler, whose commands keep the interrupted line)
+	local mode = trap_mode(sh) .. (line1 == false and "H" or "")
 	local key = mode .. "\0" .. (line1 and (line1 .. "\0" .. code) or code)
 	local hit = frag_cache[key]
 	if hit ~= nil and hit ~= 0 then
 		return hit or nil
 	end
 	local mod = false
-	if hit == nil and not may_repeat(code) then
+	if hit == nil and not now and not may_repeat(code) then
 		mod = 0 -- seen once: interpret now, compile if it recurs
 	else
 		mod = M.compile_fragment(code, line1, mode) or false
@@ -92,7 +94,7 @@ function M.compile_fragment(code, line1, mode)
 	end
 	local ok, chunk = pcall(function()
 		mode = mode or ""
-		return load(E.emit(ast, { fragment = true, trap_err = mode:find("E", 1, true) ~= nil,
+		return load(E.emit(ast, { fragment = true, trapline = mode:find("H", 1, true) ~= nil, trap_err = mode:find("E", 1, true) ~= nil,
 			trap_debug = mode:find("[DT]") ~= nil, functrace = mode:find("T", 1, true) ~= nil }), "=curse:eval")
 	end)
 	if ok and chunk then
