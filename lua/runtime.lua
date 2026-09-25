@@ -5019,6 +5019,19 @@ function M.catch_return(f)
 end
 -- `return` where no function or sourced script is running: reported, status 2 (bash) —
 -- also in a trap handler that runs at the top level (return.def: no return_catch_flag)
+-- An array literal element's fields (a word the compiled engine can't render) from the
+-- shared one-word expander, as {val=…} items for rt.arrayassign_stmt
+function M.aa_fields(sh, w, into)
+	local fs = require("interp").expand_to_fields(sh, w)
+	for k = 1, #fs do
+		into[#into + 1] = { val = fs[k] }
+	end
+end
+-- A case pattern the compiled renderer can't take, as a glob: the shared pattern expander
+-- (vars expand, quoted metachars stay literal — interp's case_pattern)
+function M.case_glob(sh, w)
+	return require("interp").case_pattern(sh, w)
+end
 -- `for NAME` with an invalid NAME: reported, status 1, no iterations — fatal (status 2) to
 -- a non-interactive posix shell (execute_for_command)
 function M.for_badname(sh, name)
@@ -13193,7 +13206,28 @@ do
 			local a1, a2 = argv[1], argv[2]
 			if not (a1 == "exec" or ((a1 == "command" or a1 == "builtin") and a2 == "exec")) then
 				local rs = {}
-				if not rf(rs) then
+				-- (the redirections don't see the command's prefix bindings — bash expands
+				-- them outside its temporary environment: hide those while they're applied)
+				local tb, hid = sh.tenv_call_base, nil
+				if tb and #sh.tenv > tb then
+					hid = {}
+					for k = #sh.tenv, tb + 1, -1 do
+						local te = sh.tenv[k]
+						hid[#hid + 1] = { te.name, sh.vars[te.name] }
+						sh.vars[te.name] = te.box or nil
+					end
+				end
+				local rok, rres = pcall(rf, rs)
+				if hid then
+					for k = #hid, 1, -1 do
+						sh.vars[hid[k][1]] = hid[k][2]
+					end
+				end
+				if not rok then
+					M.redir_restore(rs)
+					error(rres, 0)
+				end
+				if not rres then
 					M.redir_restore(rs)
 					sh.status = 1
 					return

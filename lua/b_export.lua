@@ -469,6 +469,11 @@ return function(sh, cmd, args, hook, tcb)
 					end
 				end
 				local nm, op, val = a:match("^([%a_][%w_]*)(%+?=)(.*)$")
+				-- set -x: export/readonly trace each NAME=value they assign (bash's
+				-- do_assignment_no_expand xtraces it; declare/typeset/local don't)
+				if nm and sh.opt_x and (cmd == "export" or cmd == "readonly") and not (aattr or assoc) then
+					rt.xtrace_assign(sh, nm .. op, val)
+				end
 				do
 					local db = nm and not nref and not plusn and sh.vars[nm]
 					if db and db.ref and db.s and not db.ro and (localize or aattr or assoc)

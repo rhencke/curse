@@ -1109,6 +1109,7 @@ end
 -- (the call-stack / current-command specials: the compiled tier keeps them in sh only in a
 -- program that reads them — EF.funcstack: enterFunc/leaveFunc around calls; EF.bash_command:
 -- each command records its text — so the shared expander reads them right exactly then)
+EF.FB_VAR_OK = { FUNCNAME = 1, BASH_SOURCE = 1, BASH_LINENO = 1, BASH_COMMAND = 1, RANDOM = 1, SRANDOM = 1, SECONDS = 1 }
 local function fb_unsafe(w)
 	local src = w.src or ""
 	return (not EF.bash_command and src:find("BASH_COMMAND", 1, true)) or (not EF.funcstack
@@ -2097,7 +2098,9 @@ local ARITH_CMP = { ["-eq"] = "==", ["-ne"] = "~=", ["-lt"] = "<", ["-le"] = "<=
 -- RHS), lifted locals flushed to sh around it. nil when the word reads such a special.
 local function db_fallback(w, lifted, fn, arg)
 	for _, p in ipairs(w.parts) do
-		if p.var and (COMPILE_UNSAFE_VAR[p.var] and p.var ~= "LINENO") then
+		-- ($FUNCNAME/…/$BASH_COMMAND: kept in sh when the program reads them — fb_unsafe;
+		-- $RANDOM/$SECONDS the expander computes itself; $_ the compiled tier doesn't keep)
+		if p.var and (COMPILE_UNSAFE_VAR[p.var] and p.var ~= "LINENO" and not EF.FB_VAR_OK[p.var]) then
 			return nil
 		end
 	end
@@ -3313,6 +3316,19 @@ local function aa_keyword(key)
 	return ok and emitable_word(kw) and kw or nil
 end
 EF.aa_keyword, EF.aa_fieldable = aa_keyword, aa_fieldable
+-- (a word the compiled engine can't render expands through the shared one-word expander:
+-- EF.aa_fields for an element's fields, rt.assign_elem for a keyed value or subscript —
+-- unless it reads a lifted variable, which that expander wouldn't see)
+local function aa_fallback_ok(w, lifted)
+	local names = {}
+	EF.collect_word(w, names)
+	for n in pairs(names) do
+		if lifted[n] then
+			return false
+		end
+	end
+	return true
+end
 local function arrayassign_ok(st, lifted)
 	-- (a nameref is resolved at run time by rt.arrayassign, as interp's do_arrayassign; an
 	-- `a[i]=(…)` is H.arrayassign's own error path)
@@ -3321,19 +3337,34 @@ local function arrayassign_ok(st, lifted)
 	end
 	for _, e in ipairs(st.elems) do
 		if e.key ~= nil then
-			if aa_keyword(e.key) == nil or not emitable_word(e.word) then
-				return false
-			end
-			for _, bw in ipairs(e.brace_bare or {}) do -- (an indexed target de-keys it: fields)
-				if not aa_fieldable(bw, lifted) then
+			local kw = aa_keyword(e.key)
+			if kw == nil then
+				local ok, w = pcall(require("parser").parse_word, e.key)
+				if not ok or not aa_fallback_ok(w, lifted) then
 					return false
 				end
 			end
-		elseif e.op ~= "=" or not aa_fieldable(e.word, lifted) then
+			if not emitable_word(e.word) and not aa_fallback_ok(e.word, lifted) then
+				return false
+			end
+			for _, bw in ipairs(e.brace_bare or {}) do -- (an indexed target de-keys it: fields)
+				if not aa_fieldable(bw, lifted) and not aa_fallback_ok(bw, lifted) then
+					return false
+				end
+			end
+		elseif e.op ~= "=" or (not aa_fieldable(e.word, lifted) and not aa_fallback_ok(e.word, lifted)) then
 			return false
 		end
 	end
 	return true
+end
+-- An array element word's fields appended to `into` as {val=…} items: natively when the
+-- field engine takes it, else through the shared one-word expander (rt.aa_fields)
+function EF.aa_fields(into, w, lifted)
+	if aa_fieldable(w, lifted) then
+		return emit_fields_into(into, w, lifted, "{val=%s}")
+	end
+	return ("rt.aa_fields(sh, %s[1], %s)"):format(EF.konst({ ser(w) }), into)
 end
 -- (the declare/local/typeset literal path keeps the strict gate: literal keys only, no
 -- brace de-keying, no side-effecting arith)
@@ -5194,9 +5225,10 @@ EF.simple_native = function(cx, st, after, cmd)
 		end
 	elseif isexec and st.redirs then
 		spec[#spec + 1] = "eredirs=" .. ser(st.redirs)
-	elseif st.redirs and #st.redirs > 0 and EF.xtrace and st.arrayargs and not bind then
-		-- (set -x: a declaration's NAME=(…) literals trace once expanded, which the runner
-		-- does — so it applies the redirections itself, after the trace: rf)
+	elseif st.redirs and #st.redirs > 0 and EF.xtrace and ((st.arrayargs and not bind) or (bind and not st.arrayargs)) then
+		-- (set -x: a declaration's NAME=(…) literals trace once expanded, and a prefix
+		-- assignment as it binds, which the runner does — so it applies the redirections
+		-- itself, after the trace (bash traces to the stderr from before them): rf)
 		local rc = cx.redir_conds(st, cmd)
 		if not rc then
 			return nil
@@ -7516,10 +7548,13 @@ end
 
 -- statement handler: coproc — `coproc NAME cmd`: the COMPILED command runs as the
 -- coprocess (rt.coproc_start: the pipes, NAME/NAME_PID/$!, the reap), a background
--- fragment like `cmd &`'s; a program with a real-signal trap keeps the interpreter's.
+-- fragment like `cmd &`'s (in-process, as the interpreter's: a signal trap is no reason to differ).
 H.coproc = function(cx, st, after)
-	if EF.bg_trap_block or not st.name:match("^[%a_][%w_]*$") then
-		return cx.delegate(st, after) -- (an invalid NAME: interp reports it)
+	if not st.name:match("^[%a_][%w_]*$") then -- (`coproc @ {…}`: reported, status 1)
+		local p = cx.newpc()
+		cx.blocks[p] = dbg(st) .. ("io.stderr:write(%q); sh.status = 1; pc = %d"):format(
+			"curse: `" .. st.name .. "': not a valid identifier\n", after)
+		return p
 	end
 	local id = emit_fragment({ st.cmd }, false)
 	if not id then
@@ -7564,14 +7599,19 @@ H.arrayassign = function(cx, st, after)
 				local valx = (fl and fl:find("~", 1, true)) and ("rt.tilde_assign(sh, %q)"):format(fl)
 					or EF.assign_word_expr(e.word, cx.lifted)
 				local kw = EF.aa_keyword(e.key)
-				local keyx = kw and emit_word(kw, cx.lifted) or ("%q"):format(EF.static_key(e.key))
+				local keyx = kw and emit_word(kw, cx.lifted)
+				if kw == nil then -- (a subscript emit can't render: the shared expander)
+					keyx = ("rt.assign_elem(sh, %s[1])"):format(EF.konst({ ser(require("parser").parse_word(e.key)) }))
+				elseif not kw then
+					keyx = ("%q"):format(EF.static_key(e.key))
+				end
 				local item = ("do local __k = %s; __it[#__it+1] = {key=__k, op=%q, val=%s, src=%q, rawkey=%q} end"):format(
 					keyx, e.op, valx, e.word and e.word.src or "", e.key)
 				if e.brace_bare then -- an INDEXED target de-keys it: `[k]=` literal in each brace word
 					asq()
 					local bf = {}
 					for _, bw in ipairs(e.brace_bare) do
-						bf[#bf + 1] = emit_fields_into("__it", bw, cx.lifted, "{val=%s}")
+						bf[#bf + 1] = EF.aa_fields("__it", bw, cx.lifted)
 					end
 					item = ("if __as then %s else %s end"):format(item, table.concat(bf, "; "))
 				end
@@ -7579,7 +7619,7 @@ H.arrayassign = function(cx, st, after)
 			elseif not kvfirst and not empty_word(e.word) then
 				asq()
 				parts[#parts + 1] = ("if __as then __it[#__it+1] = {src=%q} else %s end"):format(
-					e.word.src, emit_fields_into("__it", e.word, cx.lifted, "{val=%s}"))
+					e.word.src, EF.aa_fields("__it", e.word, cx.lifted))
 			elseif not empty_word(e.word) then
 				-- a bare word field-splits and globs for an INDEXED target, but is one plain word
 				-- in an ASSOCIATIVE key/value list (bash) — which one is only known at run time.
@@ -7594,7 +7634,7 @@ H.arrayassign = function(cx, st, after)
 					parts[#parts + 1] = ("if __as then __it[#__it+1] = {val=%s%s} else %s end"):format(
 						EF.assign_word_expr(e.word, cx.lifted),
 						srcf,
-						emit_fields_into("__it", e.word, cx.lifted, "{val=%s}")
+						EF.aa_fields("__it", e.word, cx.lifted)
 					)
 				end
 			end
@@ -7694,9 +7734,26 @@ H.case = function(cx, st, after)
 		local nextmatch = (i < n) and matchentry[i + 1] or nomatch
 		-- Compile each pattern's glob-form and match natively (rt.glob_match); a clause
 		-- with a pattern emit can't render (cmdsub/arith/${…}-op/$@/$*) keeps I.case_match.
+		-- (one the pattern renderer can't take — a quoted "$@", a word-initial ~ — expands
+		-- through the shared pattern expander, rt.case_glob: lifted vars synced around it)
 		local globs, allok = {}, true
 		for _, pat in ipairs(cl.pats) do
 			local g = emit_pattern_glob(pat, cx.lifted)
+			if g == nil then
+				local ok, w = pcall(require("parser").parse_word, pat)
+				local names = {}
+				if ok then
+					EF.collect_word(w, names)
+				end
+				for nm in pairs(names) do
+					if cx.lifted[nm] then
+						ok = false
+					end
+				end
+				if ok then
+					g = ("rt.case_glob(sh, %s[1])"):format(EF.konst({ ser(w) }))
+				end
+			end
 			if g == nil then
 				allok = false
 				break

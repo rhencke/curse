@@ -1939,6 +1939,7 @@ end
 -- Does `subj` match any of the case-clause pattern strings? The compiled tier's case
 -- codegen dispatches clauses natively but matches through this shared helper (vars in
 -- a pattern expand; quoted metachars stay literal), honoring shopt nocasematch.
+M.case_pattern = case_pattern -- (rt.case_glob)
 function M.case_match(sh, subj, pats)
 	local ic = sh.shopt.nocasematch and true or nil
 	for _, pat in ipairs(pats) do
