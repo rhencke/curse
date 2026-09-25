@@ -5274,7 +5274,7 @@ local function dbracket_trace(sh, text)
 end
 -- The ERE text of a `=~` RHS word: bash tilde-expands a word-initial ~ and matches THAT
 -- expansion literally (a tilde prefix isn't part of the regex), the rest via expand_regex.
-local function regex_rhs(sh, rnode)
+function M.regex_rhs(sh, rnode)
 	if word_initial_tilde(rnode) then
 		local p1 = rnode.parts[1]
 		local tok, restlit = p1.lit:match("^(~[^/:]*)(.*)$")
@@ -5363,7 +5363,7 @@ local function eval_dbracket(sh, node)
 			-- bash also tilde-expands a word-initial ~ on the =~ RHS and matches THAT
 			-- expansion literally (a tilde prefix isn't part of the regex): split off the
 			-- ~-token, expand it, and re-expand it as a quoted (regex-escaped) segment.
-			local caps, bad = rt.regex_captures(l, regex_rhs(sh, node.r), ic) -- real POSIX ERE + BASH_REMATCH
+			local caps, bad = rt.regex_captures(l, M.regex_rhs(sh, node.r), ic) -- real POSIX ERE + BASH_REMATCH
 			if bad then
 				error({ __curse_regexerr = true })
 			end -- invalid regex -> [[ ]] status 2
@@ -5633,6 +5633,23 @@ local COMPOUND_REDIR = {
 -- A `pipeline` is NOT here: bash fires DEBUG once per STAGE (in the parent, before
 -- forking each), handled inline in the pipeline exec below.
 local DEBUG_FIRE = { simple = true, arithcmd = true, dbracket = true, assign = true, assignlist = true, case = true }
+-- A compound command's DEBUG fires at its HEAD, and $BASH_COMMAND reads as bash prints that
+-- head (print_for_command_head …): `for x in a b`, `select s in …`, `((i<3))`, `case w in`.
+-- head(sh, st, text): set it (not inside a trap); head(nil, st, kw): `kw NAME in WORDS`.
+local function head(sh, st, text)
+	if not sh then
+		local ws = {}
+		for _, w in ipairs(st.words or {}) do
+			if w.src then
+				ws[#ws + 1] = w.src
+			end
+		end
+		return text .. " " .. st.name .. " in " .. table.concat(ws, " ")
+	end
+	if not (sh.in_trap and sh.in_trap > 0) then
+		sh.cur_cmd = { t = "head", text = text }
+	end
+end
 local function run_debug(sh, line)
 	local h = sh.traps and sh.traps.DEBUG
 	if not h or h == "" or sh.in_debug or (sh.in_pipestage or 0) > 0 then
@@ -5773,8 +5790,8 @@ exec_stmt = function(sh, st, hook)
 		-- a command's own prefix assignment (run through here by its simple command) is
 		-- part of that command: no DEBUG of its own, and $BASH_COMMAND stays the command
 		local cc, own = sh.cur_cmd, false
-		if t == "assign" and cc and cc.assigns then
-			for _, a in ipairs(cc.assigns) do
+		if t == "assign" and cc and (cc.assigns or cc.list) then -- (or a binding of an assignlist)
+			for _, a in ipairs(cc.assigns or cc.list) do
 				own = own or a == st
 			end
 		end
@@ -5853,10 +5870,13 @@ exec_stmt = function(sh, st, hook)
 			end
 			error({ __curse_exit = 1, __curse_lineabort = true })
 		end
-		if st.index == "" then -- `a[]=v`: empty subscript is a bad array subscript (bash: status 1, no assign)
-			io.stderr:write("curse: " .. st.name .. "[]: bad array subscript\n")
-			sh.status = 1
-			return
+		if st.index == "" then -- `a[]=v`: empty subscript is a bad array subscript (bash: status 1, no
+			io.stderr:write("curse: " .. st.name .. "[]: bad array subscript\n") -- assign, the rest of
+			sh.status = 1 -- the line abandoned; as a prefix binding it's just skipped)
+			if sh.applying_prefix then
+				return
+			end
+			error({ __curse_exit = 1, __curse_lineabort = true })
 		end
 		local rb = sh.vars[sh:deref(st.name)]
 		-- A nameref whose target carries a subscript (declare -n ref='A[K]'): a plain
@@ -5872,6 +5892,7 @@ exec_stmt = function(sh, st, hook)
 				if nb.s ~= "" and sh:deref(st.name) == "" then
 					io.stderr:write("curse: warning: " .. st.name .. ": circular name reference\n")
 					sh.status = 1
+					sh.assign_err = true -- (the rest of an assignment list is abandoned)
 					return
 				elseif nb.outer and nb.s:find("[", 1, true) then -- (`local -n a='a[0]'`: bash
 					io.stderr:write("curse: `" .. nb.s .. "': not a valid identifier\n") -- rejects it)
@@ -6082,8 +6103,10 @@ exec_stmt = function(sh, st, hook)
 		-- a bad array subscript / bad-subst in one binding aborts the REST of the list
 		-- (bash: `a=x b[0+]=y c=z` sets only a), keeping the error status.
 		local ncs0 = sh.ncs
-		for _, a in ipairs(st.list) do
+		local cc0 = sh.cur_cmd -- (each binding is part of the list: no DEBUG of its own, even
+		for _, a in ipairs(st.list) do -- after a command substitution in an earlier one ran)
 			sh.assign_err = nil
+			sh.cur_cmd = cc0
 			exec_stmt(sh, a, hook)
 			if sh.assign_err then
 				return
@@ -6502,7 +6525,10 @@ exec_stmt = function(sh, st, hook)
 	elseif t == "forc" then
 		-- DEBUG fires (at the `for` line) before the init, before EACH condition
 		-- evaluation, and before EACH step — bash's `[6][6][7]…` per-iteration pattern.
-		local function fdbg()
+		local function fdbg(slot)
+			if sh.traps and sh.traps.DEBUG then
+				head(sh, st, "((" .. (st.src and st.src[slot] or "") .. "))")
+			end
 			run_debug(sh, (sh.in_trap and sh.in_trap > 0 and (sh.calldepth or 0) == sh.trap_calldepth) and sh.cur_line or st.line)
 		end
 		-- A slot whose arith failed to parse (`i='3'`) was deferred: bash reports the
@@ -6535,7 +6561,7 @@ exec_stmt = function(sh, st, hook)
 		sh.loopdepth = (sh.loopdepth or 0) + 1
 		local cok, cerr = pcall(function()
 			if st.init then
-				fdbg()
+				fdbg(1)
 				ev(st.init, 1)
 			end
 			while true do
@@ -6551,7 +6577,7 @@ exec_stmt = function(sh, st, hook)
 					rt.preempt()
 				end
 				if st.cond then
-					fdbg()
+					fdbg(2)
 					if not truth(ev(st.cond, 2)) then
 						break
 					end
@@ -6562,7 +6588,7 @@ exec_stmt = function(sh, st, hook)
 					break
 				end
 				if st.step then
-					fdbg()
+					fdbg(3)
 					ev(st.step, 3)
 				end -- continue still runs the step
 			end
@@ -6950,15 +6976,12 @@ exec_stmt = function(sh, st, hook)
 			if fs.idx > #fs.list then
 				break
 			end
+			if sh.traps and sh.traps.DEBUG then
+				head(sh, st, head(nil, st, "for"))
+			end
 			run_debug(sh, st.line) -- DEBUG fires at the `for` header before each iteration
 			if sh.opt_x then -- the header as written, each iteration (bash)
-				local ws = {}
-				for _, w in ipairs(st.words) do
-					if w.src then
-						ws[#ws + 1] = w.src
-					end
-				end
-				xtrace_line(sh, "for " .. st.name .. " in " .. table.concat(ws, " "))
+				xtrace_line(sh, head(nil, st, "for"))
 			end
 			if not rt.for_assign(sh, st.name, fs.list[fs.idx]) then
 				bodystatus = 1
@@ -7013,14 +7036,12 @@ exec_stmt = function(sh, st, hook)
 		end
 		local bodystatus = 0
 		sh.loopdepth = (sh.loopdepth or 0) + 1
+		if sh.traps and sh.traps.DEBUG then -- (once, before the menu: execute_select_command)
+			head(sh, st, head(nil, st, "select"))
+			run_debug(sh, (sh.in_trap and sh.in_trap > 0 and (sh.calldepth or 0) == sh.trap_calldepth) and sh.cur_line or st.line)
+		end
 		if sh.opt_x then
-			local ws = {}
-			for _, w in ipairs(st.words) do
-				if w.src then
-					ws[#ws + 1] = w.src
-				end
-			end
-			xtrace_line(sh, "select " .. st.name .. " in " .. table.concat(ws, " "))
+			xtrace_line(sh, head(nil, st, "select"))
 		end
 		menu()
 		while true do
@@ -7848,6 +7869,11 @@ M._int = {
 	fd_ready = fd_ready,
 	read_split = read_split,
 	do_arrayassign = do_arrayassign,
+	arrayassign_items = arrayassign_items,
+	expand_word = expand_word,
+	drain_procsub = drain_procsub,
+	xtrace_quote = xtrace_quote,
+	unset_arrayref = unset_arrayref,
 	eval = eval,
 	fmt_decl = fmt_decl,
 	decl_elems = decl_elems,
@@ -7866,7 +7892,6 @@ M._int = {
 	restore_redirs = restore_redirs,
 	drain_procsub = drain_procsub,
 	expand_word = expand_word,
-	regex_rhs = regex_rhs,
 	arith_expand_text = arith_expand_text,
 	dbracket_word = dbracket_word,
 	dbracket_pattern = dbracket_pattern,

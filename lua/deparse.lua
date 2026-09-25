@@ -667,6 +667,9 @@ end
 
 -- $BASH_COMMAND: the command being run, printed as bash prints it ("" if unprintable)
 function M.command_text(st)
+	if st.t == "head" then -- (a compound command's head, as its DEBUG trap sees it)
+		return st.text
+	end
 	local ok, r = pcall(function()
 		local p = new_printer()
 		make(p, conv(st))

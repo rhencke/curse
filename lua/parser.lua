@@ -3346,6 +3346,10 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs)
 			else
 				-- `[foo bar]=v`: a subscript is read as one unit, blanks and all, when a
 				-- `=`/`+=` follows its closing `]` (bash's compound-assignment reader)
+				-- A word that starts with `[` is read through its matching `]` as one unit —
+				-- blanks, newlines, even `)` and all (bash's parse_matched_pair in a compound
+				-- assignment): `[foo bar]=v`, or a bare `[2 3]` element. No `]` before EOF is a
+				-- syntax error (status 1), reported at the `[`'s line.
 				local pre = ""
 				if c == "[" then
 					local depth, k = 0, i
@@ -3361,8 +3365,15 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs)
 								k = k + (src:sub(k, k) == "\\" and 2 or 1)
 							end
 							k = k + 1
-						elseif ch == "\n" then
-							break
+						elseif ch == "`" then
+							k = k + 1
+							while k <= n and src:sub(k, k) ~= "`" do
+								k = k + (src:sub(k, k) == "\\" and 2 or 1)
+							end
+							k = k + 1
+						elseif ch == "$" and src:sub(k + 1, k + 1) == "(" then
+							local ok, e = pcall(scan_cmdsub, src, k + 2)
+							k = ok and e or k + 2
 						else
 							if ch == "[" then
 								depth = depth + 1
@@ -3375,12 +3386,19 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs)
 							k = k + 1
 						end
 					end
-					if src:sub(k, k) == "]" and (src:sub(k + 1, k + 1) == "=" or src:sub(k + 1, k + 2) == "+=") then
-						pre = src:sub(i, k)
-						i = k + 1
+					if src:sub(k, k) ~= "]" or k > n then
+						error({ __curse_perr = true, line = line, status = 1,
+							msg = "unexpected EOF while looking for matching `]'" })
 					end
+					pre = src:sub(i, k)
+					for p in pre:gmatch("()\n") do
+						if not (alias_nl and alias_nl[i + p - 1]) then line = line + 1 end
+					end
+					i = k + 1
 				end
-				local w = pre .. word(true)
+				-- (the word goes on past the `]` only if no blank/metachar ends it there)
+				local more = pre == "" or not src:sub(i, i):match("^[%s;&|<>()]?$")
+				local w = pre .. (more and word(true) or "")
 				if w == "" then
 					break
 				end
@@ -4857,9 +4875,11 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs)
 					perr = {
 						t = "parse_error",
 						-- (a recoverable one, or a `near TOKEN` one: the token's line)
-						line = (recover or (type(st) == "string" and st:find("near `", 1, true))) and line or startline,
+						line = (type(st) == "table" and st.__curse_perr and st.line)
+							or (recover or (type(st) == "string" and st:find("near `", 1, true))) and line or startline,
 						msg = recover and ("syntax error near `" .. (st.tok or "(") .. "'")
 							or (type(st) == "table" and st.__curse_perr and st.msg) or tostring(st),
+						status = type(st) == "table" and st.__curse_perr and st.status or nil, -- (else 2)
 						text = type(st) == "table" and st.__curse_perr and st.text or nil,
 						showtext = type(st) == "table" and st.__curse_perr and st.text and true or nil,
 						recoverable = recover or nil,

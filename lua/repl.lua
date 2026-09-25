@@ -156,7 +156,10 @@ function M.run(sh)
 					end
 				end
 				sh.exit_requested = nil
-				local ok, err = pcall(interp.run_lazy, sh, buf)
+				-- (a hot loop typed here runs compiled — the tier's fragment hook — and a hot
+				-- function compiles standalone: tier.fn_hot)
+				require("tier")
+				local ok, err = pcall(interp.run_lazy, sh, buf, interp.SUBHOOK)
 				if sh.exit_requested or (not ok and type(err) == "table" and err.__curse_exit) then
 					io.flush()
 					break -- `exit` in the REPL

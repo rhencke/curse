@@ -108,7 +108,7 @@ return function(sh, cmd, args, hook, tcb)
 									M.report_recoverable(sh, lg.perr)
 								else
 									pcall(I.exec_stmt, sh, lg.perr, hook) -- (it would exit: the file just ends)
-									error({ __curse_parseerr = true, lead = not ran })
+									error({ __curse_parseerr = true, lead = not ran, __curse_exit = lg.perr.status })
 								end
 							end
 							for _, st in ipairs(lg.stmts) do
@@ -143,7 +143,7 @@ return function(sh, cmd, args, hook, tcb)
 						if type(err) == "table" and err.__curse_return then
 							rret = err.__curse_return
 						elseif type(err) == "table" and err.__curse_parseerr then
-							sh.status = 2 -- a syntax error in the file: source returns 2, doesn't halt the shell (bash)
+							sh.status = err.__curse_exit or 2 -- a syntax error in the file: source returns 2, doesn't halt the shell (bash)
 							sh.spb_err = err.lead and 2 or nil -- (EX_BADSYNTAX halts a posix one: rt.perr_lead)
 						else
 							rt.source_debug_restore(sh, dsave)
