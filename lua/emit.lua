@@ -4480,6 +4480,44 @@ H.assign = function(cx, st, after)
 	return p
 end
 
+-- statement handler: assignlist — `a=1 b=$x c[2]=y` with no command. Each binding compiles
+-- as its own assignment statement, in order (a later one sees an earlier one); DEBUG fires once
+-- for the whole list and errexit/ERR judge only its final status, which is the LAST command
+-- substitution's (in any binding), else 0 (execute_null_command). A binding that fails (a bad
+-- subscript: sh.assign_err) abandons the rest of the list, keeping its error status.
+H.assignlist = function(cx, st, after)
+	local list = st.list
+	local n0 = cx.newloopvar() -- (a function-level local: sh.ncs when the list began)
+	local ec = errchk(st)
+	local ecs = ec ~= "" and ("; " .. ec) or ""
+	local fin = cx.newpc()
+	cx.blocks[fin] = ("sh.status = sh.ncs ~= %s and sh.last_cmdsub_status or 0%s; pc = %d"):format(n0, ecs, after)
+	local abort = cx.newpc()
+	cx.blocks[abort] = ("sh.assign_err = nil%s; pc = %d"):format(ecs, after)
+	local nxt = fin
+	local shd = EF.has_debug
+	EF.has_debug = false -- (the list's one DEBUG fires below)
+	for i = #list, 1, -1 do
+		local c = {}
+		for k, v in pairs(list[i]) do
+			c[k] = v
+		end
+		c.negate = true -- (no errexit of its own: the list's status decides)
+		local chk = cx.newpc()
+		cx.blocks[chk] = ("if sh.assign_err then pc = %d else pc = %d end"):format(abort, nxt)
+		local ok, pe = pcall(cx.flatten_stmt, c, chk)
+		if not ok then
+			EF.has_debug = shd
+			error(pe, 0)
+		end
+		nxt = pe
+	end
+	EF.has_debug = shd
+	local p = cx.newpc()
+	cx.blocks[p] = dbg(st) .. ("sh.assign_err = nil; %s = sh.ncs; pc = %d"):format(n0, nxt)
+	return p
+end
+
 -- statement handler: funcdef (split out of flatten_stmt; see H)
 H.funcdef = function(cx, st, after)
 	local t = st.t
@@ -5637,10 +5675,25 @@ simple_compiled = function(cx, st, after)
 		-- value into a temp before any localAssign so a later operand can't see an earlier
 		-- one's new binding. A `local NAME=foo:~` arg tilde-expands the RHS (all-literal only).
 		local tmps, calls = {}, {}
+		-- (a name this statement localizes into a function-local register reads its OUTER
+		-- value here — the register isn't loaded until its localAssign: `local l=1 k=$l`)
+		local vlift = cx.lifted
+		for j = 2, #st.words do
+			local nm = (unq_full_lit(st.words[j]) or ""):match("^([%a_][%w_]*)%+?=")
+			if nm and EF.fn_locals and EF.fn_locals[nm] and cx.lifted[nm] then
+				if vlift == cx.lifted then
+					vlift = {}
+					for k, v in pairs(cx.lifted) do
+						vlift[k] = v
+					end
+				end
+				vlift[nm] = nil
+			end
+		end
 		for j = 2, #st.words do
 			local aw = st.words[j]
 			if not empty_word(aw) then
-				local av = emit_word(aw, cx.lifted)
+				local av = emit_word(aw, vlift)
 				local fl = unq_full_lit(aw)
 				if fl and fl:find("~", 1, true) then
 					av = ("rt.tilde_word_initial(sh, %q)"):format(fl)
@@ -7352,6 +7405,9 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
 				.. ecs
 				.. ("; pc = %d"):format(after)
 			return p
+		end
+		if t == "assignlist" then
+			return H.assignlist(cx, st, after)
 		end
 		if cx.DELEGATE[t] then
 			return cx.delegate(st, after)

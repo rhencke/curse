@@ -5774,8 +5774,8 @@ exec_stmt = function(sh, st, hook)
 		-- a command's own prefix assignment (run through here by its simple command) is
 		-- part of that command: no DEBUG of its own, and $BASH_COMMAND stays the command
 		local cc, own = sh.cur_cmd, false
-		if t == "assign" and cc and cc.assigns then
-			for _, a in ipairs(cc.assigns) do
+		if t == "assign" and cc and (cc.assigns or cc.list) then -- (or a binding of an assignlist)
+			for _, a in ipairs(cc.assigns or cc.list) do
 				own = own or a == st
 			end
 		end
@@ -6083,8 +6083,10 @@ exec_stmt = function(sh, st, hook)
 		-- a bad array subscript / bad-subst in one binding aborts the REST of the list
 		-- (bash: `a=x b[0+]=y c=z` sets only a), keeping the error status.
 		local ncs0 = sh.ncs
-		for _, a in ipairs(st.list) do
+		local cc0 = sh.cur_cmd -- (each binding is part of the list: no DEBUG of its own, even
+		for _, a in ipairs(st.list) do -- after a command substitution in an earlier one ran)
 			sh.assign_err = nil
+			sh.cur_cmd = cc0
 			exec_stmt(sh, a, hook)
 			if sh.assign_err then
 				return
