@@ -678,6 +678,12 @@ local function arith_elem_ok(e)
 	if type(e.name) ~= "string" or not e.name:match("^[%a_][%w_]*$") or COMPILE_UNSAFE_VAR[e.name] then
 		return false
 	end
+	-- a subscript with its own side effect (`b[c++] = c`): bash evaluates an assignment's value
+	-- BEFORE the subscript, which the key-first runtime helpers don't reproduce
+	local sr = e.idxraw:gsub("[=!<>]=", "")
+	if sr:find("++", 1, true) or sr:find("--", 1, true) or sr:find("=", 1, true) then
+		return false
+	end
 	local ok, sw = pcall(require("parser").parse_word, e.idxraw)
 	if not ok then
 		return false
@@ -997,6 +1003,13 @@ local function emitable_word(w)
 	end
 	return true
 end
+-- (the call-stack / current-command specials: the interpreter maintains them per statement,
+-- the compiled tier does not keep them in sh — a word reading one keeps delegating)
+local function fb_unsafe(w)
+	local src = w.src or ""
+	return src:find("BASH_COMMAND", 1, true) or src:find("FUNCNAME", 1, true)
+		or src:find("BASH_SOURCE", 1, true) or src:find("BASH_LINENO", 1, true)
+end
 -- A word that a compiled command can use directly: emit_word-able AND with no
 -- unquoted expansion (would word-split) or unquoted glob char (would path-expand)
 -- — those need the interpreter's field engine, so the command is delegated.
@@ -1292,7 +1305,7 @@ local function emit_arith_stmt(e, lifted)
 	if e.k == "comma" then -- `for (( i=0, j=5; …; i++, j-- ))`: run each operand for its effect
 		return emit_arith_stmt(e.l, lifted) .. "; " .. emit_arith_stmt(e.r, lifted)
 	end
-	if e.k == "asgn" then
+	if e.k == "asgn" and not e.idxraw then -- (an element write `a[i]=…`: emit_arith_into below)
 		local v = emit_value(e.e, lifted)
 		if e.op == "=" then
 			return emit_set(e.name, v, lifted)
@@ -1301,7 +1314,7 @@ local function emit_arith_stmt(e, lifted)
 		-- (`x /= 0` must fault like bash, `<<=` is a shift: the shared op renderer)
 		return emit_set(e.name, arith_binop(e.op:sub(1, -2), cur, "(" .. v .. ")", e), lifted)
 	end
-	if e.k == "post" or e.k == "pre" then
+	if (e.k == "post" or e.k == "pre") and not e.idxraw then
 		local cur = lifted[e.name] and lname(e.name) or ("sh:aget(%q)"):format(e.name)
 		return emit_set(e.name, ("(%s + %dLL)"):format(cur, e.d), lifted)
 	end
@@ -1913,6 +1926,36 @@ end
 local ARITH_CMP = { ["-eq"] = "==", ["-ne"] = "~=", ["-lt"] = "<", ["-le"] = "<=", ["-gt"] = ">", ["-ge"] = ">=" }
 -- (an arithmetic comparison leaf: an operand's arith error makes THAT primary false —
 -- bash's arithcomp; `||`/`!` go on — rt.db_arith flags it, the leaf's rt.db_ok reads it)
+-- A [[ ]] operand emit_word can't render (an element read with a $(…) subscript, a
+-- ${…} operator emit refuses, …) that holds no CFG-unreproducible special: its value from
+-- the shared one-word expander (interp's dbracket_word — or dbracket_pattern for a glob
+-- RHS), lifted locals flushed to sh around it. nil when the word reads such a special.
+local function db_fallback(w, lifted, fn, arg)
+	for _, p in ipairs(w.parts) do
+		if p.var and (COMPILE_UNSAFE_VAR[p.var] and p.var ~= "LINENO") then
+			return nil
+		end
+	end
+	if fb_unsafe(w) then
+		return nil
+	end
+	local call = ("%s(sh, %s)"):format(fn, arg or (EF.konst({ ser(w) }) .. "[1]"))
+	local si, so = {}, {}
+	for n in spairs(lifted) do
+		si[#si + 1] = ("sh:aset(%q, %s); "):format(n, lname(n))
+		so[#so + 1] = ("%s = sh:aget(%q); "):format(lname(n), n)
+	end
+	if #si == 0 then
+		return call
+	end
+	return ("(function() %slocal __v = %s; %sreturn __v end)()"):format(table.concat(si), call, table.concat(so))
+end
+local function db_operand(w, lifted)
+	if db_word_ok(w) then
+		return emit_word(w, lifted)
+	end
+	return db_fallback(w, lifted, "rt.db_word")
+end
 local function emit_dbracket_node(node, lifted)
 	local k = node.kind
 	if k == "and" or k == "or" then
@@ -1932,15 +1975,16 @@ local function emit_dbracket_node(node, lifted)
 		end
 		return "(not " .. e .. ")"
 	elseif k == "str" then -- [[ $x ]] : true when non-empty
-		if not db_word_ok(node.word) then
+		local v = db_operand(node.word, lifted)
+		if not v then
 			return nil
 		end
-		return "(" .. emit_word(node.word, lifted) .. ' ~= "")'
+		return "(" .. v .. ' ~= "")'
 	elseif k == "unary" then
-		if not db_word_ok(node.word) then
+		local op, val = node.op, db_operand(node.word, lifted)
+		if not val then
 			return nil
 		end
-		local op, val = node.op, emit_word(node.word, lifted)
 		if op == "-z" then
 			return "(" .. val .. ' == "")'
 		end
@@ -1961,13 +2005,59 @@ local function emit_dbracket_node(node, lifted)
 		end
 		return ("rt.file_test(%q, %s)"):format(op, val)
 	elseif k == "binary" then
-		if not db_word_ok(node.l) or not db_word_ok(node.r) then
+		local op = node.op
+		if ARITH_CMP[op] and not (db_word_ok(node.l) and db_word_ok(node.r)) then
+			-- an operand emit can't render: bash 5.2 expands an arithmetic operator's operand
+			-- like $((…)) text (no process substitution, subscripts kept) unless it's quoted —
+			-- interp's arith_expand_text + dbracket_arith (rt.db_arith_text); a quoted one is a
+			-- plain word value (rt.db_word) read as arithmetic
+			local function side(w)
+				if db_word_ok(w) then
+					return ("rt.db_arith(sh, %s)"):format(emit_word(w, lifted))
+				end
+				if w.src and not w.src:find("['\"\\]") then
+					return db_fallback(w, lifted, "rt.db_arith_text", ("%q"):format(w.src))
+				end
+				local v = db_fallback(w, lifted, "rt.db_word")
+				return v and ("rt.db_arith(sh, %s)"):format(v)
+			end
+			local a, b = side(node.l), side(node.r)
+			if not (a and b) then
+				return nil
+			end
+			return ("rt.db_ok(sh, %s %s %s)"):format(a, ARITH_CMP[op], b)
+		end
+		local l = db_operand(node.l, lifted)
+		if not l then
 			return nil
 		end
-		local op, l = node.op, emit_word(node.l, lifted)
 		if op == "=~" then
-			return nil
-		end -- BASH_REMATCH side effect + status-2 -> interp
+			-- a nested =~ leaf: rt.db_regex sets BASH_REMATCH and answers the match; an invalid
+			-- regex raises __curse_regexerr, which the statement turns into status 2 (interp)
+			local re = EF.emit_regex_glob(node.r, lifted)
+				or db_fallback(node.r, lifted, "rt.db_regex_rhs") -- (a quoted part in a bracket, a ~, …)
+			if not re then
+				return nil
+			end
+			EF.db_regex = true
+			return ("rt.db_regex(sh, %s, %s)"):format(l, re)
+		end
+		if (op == "==" or op == "=" or op == "!=") and not node.rq and not db_word_ok(node.r) then
+			local g = db_fallback(node.r, lifted, "rt.db_pattern") -- (an unquoted RHS: a glob)
+			if not g then
+				return nil
+			end
+			local m = ("rt.glob_match(%s, %s, (sh.shopt.nocasematch and true or nil))"):format(l, g)
+			return op == "!=" and ("(not " .. m .. ")") or m
+		end
+		if not db_word_ok(node.r) then
+			local r = db_fallback(node.r, lifted, "rt.db_word")
+			if not r then
+				return nil
+			end
+			-- (a rendered operand: the common leaf code below reads emit_word(node.r))
+			node = setmetatable({ r = { parts = { { raw = r } } } }, { __index = node })
+		end
 		if op == "==" or op == "=" or op == "!=" then
 			if not node.rq then
 				-- an unquoted RHS is a glob; a MIXED-quoted RHS (`a\?b`, `a"*"b`) needs a mask-aware
@@ -2261,7 +2351,7 @@ end
 -- array re-reads the raw text arithmetically). One with a $(…)/$((…))/`…` side effect is passed
 -- as a thunk, so `${d[$((c++))]}` on an indexed array increments once, not twice.
 function subscript_word(raw, lifted)
-	local w = emit_word(require("parser").parse_word(raw), lifted)
+	local w = EF.sub_lsync(raw, lifted, emit_word(require("parser").parse_word(raw), lifted))
 	if raw:find("$(", 1, true) or raw:find("`", 1, true) then
 		return "function() return " .. w .. " end"
 	end
@@ -2507,6 +2597,23 @@ local function field_word(w, lifted)
 	return nil
 end
 
+-- An element subscript is evaluated by the runtime (rt.array_key: arith on the text for an
+-- indexed array), which reads variables from sh — so a LIFTED variable the subscript names
+-- (`a[i]` with i a native local) is flushed to sh first, in argument position: the
+-- `expanded` operand becomes rt.lsync(sh, <expanded>, "i", v_i, …), which stores and returns.
+function EF.sub_lsync(raw, lifted, expanded)
+	local pairs_, seen = {}, {}
+	for n in raw:gmatch("[%a_][%w_]*") do
+		if lifted[n] and not seen[n] then
+			seen[n] = true
+			pairs_[#pairs_ + 1] = ("%q, %s"):format(n, lname(n))
+		end
+	end
+	if #pairs_ == 0 then
+		return expanded
+	end
+	return ("rt.lsync(sh, %s, %s)"):format(expanded, table.concat(pairs_, ", "))
+end
 -- Forward: mixed_expandable and seg_native are defined just below, but the mixed
 -- branch of emit_fields_into (above them) needs to see them.
 local mixed_expandable, seg_native
@@ -2644,6 +2751,15 @@ local function emit_seg(p, i, lifted, w)
 			tostring(p.q or false),
 			elems
 		)
+	end
+	if p.cmdsub or p.arith or p.arithast then -- $(…) / $((…)): the value compiles (emit_word's
+		-- compile_cmdsub / native arith); quoted it is one literal segment, unquoted it word-splits
+		-- on $IFS then globs, like a bare $x (subst.c: expand_word_internal's comsub/arith cases)
+		local s = emit_word({ parts = { p } }, lifted)
+		if p.q then
+			return ("{s=%s,split=false,unq=false}"):format(s)
+		end
+		return ("{s=%s,split=true,unq=true}"):format(s)
 	end
 	if p.q then
 		return ("{s=%s,split=false,unq=false}"):format(emit_scalar_val(p, i, lifted, false))
@@ -2786,6 +2902,8 @@ function seg_native(w, lifted)
 		elseif p.param then -- $1..$9 positional: ok
 		elseif p.special == "#" or p.special == "?" or p.special == "$" or p.special == "!" or p.special == "-" then -- scalar specials
 		elseif p.special == "@" or p.special == "*" then -- $@/$*: multi-element (emit_seg renders it)
+		elseif p.cmdsub then -- $(…): compiled capture (compile_cmdsub), a scalar segment
+		elseif (p.arith or p.arithast) and emitable_word({ parts = { p } }) then -- a renderable $((…))
 		elseif
 			p.pexp
 			and (
@@ -2824,12 +2942,23 @@ local function emit_pattern_glob_word(w, lifted)
 	end
 	local out = {}
 	for i, p in ipairs(w.parts) do
-		if p.lenof or p.cmdsub or p.arith or p.arithast or p.pexp or p.procsub then
+		if p.lenof or p.procsub then
 			return nil
 		end
-		if p.special == "@" or p.special == "*" then
+		-- a pattern is expanded as ONE word: a quoted "$@"/"${a[@]}" contributes only its first
+		-- element (interp's case_pattern) — that stays with the shared matcher; $@ unquoted and
+		-- $* join like any scalar expansion
+		if p.q and (p.special == "@" or (p.pexp and (p.pexp.name == "@" or p.pexp.index == "@"))) then
 			return nil
-		end -- multi-element in a pattern
+		end
+		-- a ${…} operator renders via pexp_scalar (its default word gated free of quoting, so
+		-- its value's metachars are rightly active unquoted); not through a nameref
+		if p.pexp and (EF.has_nameref or not pexp_compilable(p.pexp, p.q)) then
+			return nil
+		end
+		if (p.arith and not emitable_word({ parts = { p } })) or (p.arithast and arith_side_effect(p.arithast)) then
+			return nil
+		end
 		if p.var and (COMPILE_UNSAFE_VAR[p.var] and p.var ~= "LINENO") then
 			return nil
 		end
@@ -2839,8 +2968,10 @@ local function emit_pattern_glob_word(w, lifted)
 				s = s:gsub(CASE_GLOBSPECIAL, "\\%0")
 			end -- quoted metachars -> literal
 			out[#out + 1] = ("%q"):format(s)
-		else -- var / param / raw / scalar special ($#/$?/$$/$!): value; escape if quoted
-			local v = emit_scalar_val(p, i, lifted, false)
+		else -- an expansion's value (var/param/special, $(…), $((…)), ${…}); escape it if quoted
+			local v = (p.cmdsub or p.arith or p.arithast or p.pexp or p.special == "@" or p.special == "*")
+					and emit_word({ parts = { p } }, lifted)
+				or emit_scalar_val(p, i, lifted, false)
 			out[#out + 1] = p.q and ("rt.glob_quote(%s)"):format(v) or v
 		end
 	end
@@ -3030,9 +3161,31 @@ local function arrayassign_decl_ok(st, lifted, allow_nameref)
 	return true
 end
 -- Build a `local __a = {...}` argv table for words[from..#words] (each field
--- split+globbed), or nil if any word needs the interpreter. `wrap` is applied to
--- each final field. Used for commands whose args word-split/glob.
-local function field_argv(words, from, lifted, wrap, prefix)
+-- split+globbed). `wrap` is applied to each final field. Used for commands whose args
+-- word-split/glob. A word shape no native renderer covers (a ${…} operator whose word
+-- holds "$@", a nested-side-effect or malformed $((…)), …) expands through the shared
+-- one-word expander rt.word_fields — the argv is then GUARDED: a word-expansion error
+-- bash contains (exec_simple's expand_args pcall) fails the command with $?=1, leaving
+-- `__a = false`, and the words after it are skipped. Callers that pass `guard_ok` get
+-- that shape (second result true) and must dispatch only `if __a`; others get nil.
+-- The guarded one-word-expander step for field_argv: flush the lifted locals to sh (a $(…)
+-- body may read any of them), run `call` (rt.word_fields / rt.assign_word on the serialized
+-- word), reload them (`${x:=v}`, `$((x=1))` write), then `push` the result into __a — or
+-- leave `__a = false` after a contained expansion error.
+local function fb_step(w, lifted, call, push, tbl)
+	local si, so = {}, {}
+	for n in spairs(lifted) do
+		si[#si + 1] = ("sh:aset(%q, %s); "):format(n, lname(n))
+		so[#so + 1] = ("%s = sh:aget(%q); "):format(lname(n), n)
+	end
+	local ln = (w.src or ""):find("LINENO", 1, true) and ("sh.cur_line = %d; "):format(EF.cur_line or 0) or ""
+	return ("do %s%slocal __f = %s(sh, %s[1]); %sif __f then %s else %s = false end end"):format(
+		table.concat(si), ln, call, EF.konst({ ser(w) }), table.concat(so), push, tbl or "__a")
+end
+-- `assign`: a declaration builtin's argv (export/declare/typeset/readonly/local): a word
+-- after the first whose leading literal is `NAME=`/`NAME+=` is an ASSIGNMENT word (interp's
+-- expand_args is_assign) — one field, no split/glob, tilde after `=`/`:`.
+local function field_argv(words, from, lifted, wrap, prefix, guard_ok, assign)
 	local out = { prefix and ("local __a = {" .. prefix .. "}") or "local __a = {}" }
 	-- a long run of plain literal words (`printf x {1..70000}`) becomes ONE constant table:
 	-- one statement per word overflows LuaJIT's jump range (as for-in lists do)
@@ -3048,27 +3201,55 @@ local function field_argv(words, from, lifted, wrap, prefix)
 		end
 		run = {}
 	end
+	local opens = 0
 	for j = from, #words do
 		local w = words[j]
 		local lit = w.plain and w.parts[1].lit
-		if lit and lit ~= "" then -- (a plain unquoted literal — `{1..70000}`'s words: as is)
+		local p1 = w.parts[1]
+		if assign and j > 1 and p1 and p1.lit and p1.lit:match("^[%a_][%w_]*%+?=") then
+			flush_run()
+			if emitable_word(w) and not (w.src or ""):find("~", 1, true) then
+				out[#out + 1] = ("__a[#__a+1] = rt.cstr(%s)"):format(emit_word(w, lifted))
+			elseif not guard_ok or fb_unsafe(w) then
+				return nil
+			else
+				out[#out + 1] = fb_step(w, lifted, "rt.assign_word", "__a[#__a+1] = rt.cstr(__f)")
+				out[#out + 1] = "if __a then"
+				opens = opens + 1
+			end
+		elseif lit and lit ~= "" then -- (a plain unquoted literal — `{1..70000}`'s words: as is)
 			run[#run + 1] = ("%q"):format(lit)
 		elseif not empty_word(w) then -- an empty brace alternative ({X,,Y,}) adds no arg
-			if not word_safe(w) and not arith_guard(w) and not field_word(w, lifted) and not mixed_expandable(w, lifted) then
+			if word_safe(w) or arith_guard(w) or field_word(w, lifted) or seg_native(w, lifted)
+				or (not guard_ok and mixed_expandable(w, lifted)) then
+				local code = emit_fields_into("__a", w, lifted, wrap)
+				local lit = code:match('^__a%[#__a%+1%] = rt%.cstr%((%("[^"\\]*"%))%)$')
+				if lit then
+					run[#run + 1] = lit
+				else
+					flush_run()
+					out[#out + 1] = code
+				end
+			elseif not guard_ok or fb_unsafe(w) then
 				return nil
-			end
-			local code = emit_fields_into("__a", w, lifted, wrap)
-			local lit = code:match('^__a%[#__a%+1%] = rt%.cstr%((%("[^"\\]*"%))%)$')
-			if lit then
-				run[#run + 1] = lit
 			else
 				flush_run()
-				out[#out + 1] = code
+				local W = wrap and wrap:format("__f[__i]") or "__f[__i]"
+				out[#out + 1] = fb_step(w, lifted, "rt.word_fields", ("for __i=1,#__f do __a[#__a+1]=%s end"):format(W))
+				out[#out + 1] = "if __a then"
+				opens = opens + 1
 			end
 		end
 	end
 	flush_run()
-	return table.concat(out, "; ")
+	local o = { out[1] }
+	for i = 2, #out do
+		o[#o + 1] = (out[i - 1] == "if __a then" and " " or "; ") .. out[i]
+	end
+	if out[#out] == "if __a then" then
+		o[#o + 1] = " "
+	end
+	return table.concat(o) .. string.rep(" end", opens), opens > 0
 end
 
 -- Arith usable in a VALUE position (what emit_value renders): pure, no side effect,
@@ -3146,7 +3327,8 @@ emit_arith_into = function(dst, e, lifted)
 	-- once and store through rt.arith_elem_write/_incr; the operator arithmetic stays in emit_value
 	-- via a compute closure over the OLD element value (__o).
 	local function elem_args(ee)
-		return ("%q, %q, %s"):format(ee.name, ee.idxraw, emit_word(require("parser").parse_word(ee.idxraw), lifted))
+		return ("%q, %q, %s"):format(ee.name, ee.idxraw,
+			EF.sub_lsync(ee.idxraw, lifted, emit_word(require("parser").parse_word(ee.idxraw), lifted)))
 	end
 	if (k == "asgn" or k == "pre" or k == "post") and e.idxraw then
 		if k == "asgn" and e.op == "=" then -- a[i] = e: no read
@@ -4782,6 +4964,18 @@ EF.simple_native = function(cx, st, after, cmd)
 end
 local simple_compiled
 H.simple = function(cx, st, after)
+	-- a command that creates <(…)/>(…): mark before it, drain (close the shell's pipe ends,
+	-- reap the children) after it — interp's procsub_mark/drain_procsub around exec_simple
+	if not cx.ps_guarded[st] and cx.has_procsub(st) then
+		cx.ps_guarded[st] = true
+		local v = cx.newloopvar()
+		local post = cx.newpc()
+		cx.blocks[post] = ("rt.procsub_drain(sh, %s); pc = %d"):format(v, after)
+		local body = cx.flatten_stmt(st, post)
+		local pre = cx.newpc()
+		cx.blocks[pre] = ("%s = rt.procsub_fmark(sh); pc = %d"):format(v, body)
+		return pre
+	end
 	local ua = false -- a word with an unquoted $((…)), else one field (arith_guard)
 	for _, w in ipairs(st.words or {}) do
 		if arith_guard(w) then
@@ -4825,6 +5019,9 @@ end
 simple_compiled = function(cx, st, after)
 	local t = st.t
 	local cmd = st.words[1] and full_lit(st.words[1]) -- full literal → \-escaped builtins (\exit, \echo) dispatch
+	if st.dynname then -- (H.simple's live-dispatch variant: take the dynamic-command-word path)
+		cmd = nil
+	end
 	-- `var=x return` / `var=x :` …: under set -o posix a special builtin's prefix
 	-- assignments PERSIST — interp decides that at run time (opt_posix)
 	if cmd and st.assigns and #st.assigns > 0 and require("interp")._int.SPECIAL_BUILTIN[cmd] then
@@ -4961,7 +5158,10 @@ simple_compiled = function(cx, st, after)
 				return pn
 			end
 		end
-		local argvbody = field_argv(st.words, 1, cx.lifted, nil, nil)
+		-- (a live-dispatched literal declaration name keeps its assignment words: expand_args)
+		local dn = st.dynname
+		local asg = dn == "export" or dn == "declare" or dn == "typeset" or dn == "readonly" or dn == "local"
+		local argvbody, argvbody_g = field_argv(st.words, 1, cx.lifted, nil, nil, true, asg)
 		local dyn_redir = nil
 		if argvbody and st.redirs then
 			dyn_redir = cx.redir_conds(st, nil) -- nil => uncompilable redir shape: fall through to full delegate
@@ -4987,6 +5187,7 @@ simple_compiled = function(cx, st, after)
 				after,
 				{
 					prelude = (not hadcs and dyncs) and ("sh.ncs0 = sh.ncs; " .. argvbody) or argvbody,
+					guard = argvbody_g,
 					callee = "rt.exec_dynamic",
 					callargs = ("sh, __a, __noop, %s"):format((not hadcs and dyncs) and "sh.ncs ~= sh.ncs0" or tostring(hadcs)),
 					redir = dyn_redir and cx.redir_ext(nil, dyn_redir),
@@ -5003,7 +5204,7 @@ simple_compiled = function(cx, st, after)
 		-- `command -v/-V NAME…`: a pure lookup query (alias/keyword/builtin/function/PATH)
 		-- -> rt.command_query, exactly interp's branch; no execution, so no exec_stmt.
 		if w2 and #st.words[2].parts == 1 and (w2.lit == "-v" or w2.lit == "-V") and st.words[3] then
-			local qbody = field_argv(st.words, 1, cx.lifted, nil, nil)
+			local qbody, qbody_g = field_argv(st.words, 1, cx.lifted, nil, nil, true)
 			local q_redir = nil
 			if qbody and st.redirs then
 				q_redir = cx.redir_conds(st, nil)
@@ -5011,6 +5212,7 @@ simple_compiled = function(cx, st, after)
 			if qbody and not (st.redirs and not q_redir) then
 				return cx.delegate(st, after, {
 					prelude = qbody,
+					guard = qbody_g,
 					callee = "rt.command_query",
 					callargs = "sh, __a",
 					redir = q_redir,
@@ -5019,7 +5221,7 @@ simple_compiled = function(cx, st, after)
 		end
 		-- (`command exec >f`: exec's redirections persist — interp's exec branch handles it)
 		if not (w2 and w2.lit and (w2.lit:sub(1, 1) == "-" or w2.lit == "exec")) then -- not a flag / --
-			local argvbody = field_argv(st.words, 2, cx.lifted, nil, nil)
+			local argvbody, argvbody_g = field_argv(st.words, 2, cx.lifted, nil, nil, true)
 			local cmd_redir = nil
 			if argvbody and st.redirs then
 				cmd_redir = cx.redir_conds(st, nil)
@@ -5042,6 +5244,7 @@ simple_compiled = function(cx, st, after)
 					after,
 					{
 						prelude = argvbody,
+						guard = argvbody_g,
 						callee = "rt.exec_dynamic",
 						callargs = ("sh, __a, __noop, %s, true"):format(tostring(hadcs)),
 						redir = cmd_redir,
@@ -5055,7 +5258,7 @@ simple_compiled = function(cx, st, after)
 	-- resolves "builtin" to the b_builtin builtin, which force-runs the rest as a builtin —
 	-- and reuses delegate's cf-signal wrapper (so `builtin break` in a loop jumps) + opts.redir.
 	if cmd == "builtin" and st.words[2] and not st.assigns then
-		local argvbody = field_argv(st.words, 1, cx.lifted, nil, nil)
+		local argvbody, argvbody_g = field_argv(st.words, 1, cx.lifted, nil, nil, true)
 		local bi_redir = nil
 		if argvbody and st.redirs then
 			bi_redir = cx.redir_conds(st, nil)
@@ -5078,6 +5281,7 @@ simple_compiled = function(cx, st, after)
 				after,
 				{
 					prelude = argvbody,
+					guard = argvbody_g,
 					callee = "rt.exec_dynamic",
 					callargs = ("sh, __a, __noop, %s"):format(tostring(hadcs)),
 					redir = bi_redir,
@@ -5091,7 +5295,7 @@ simple_compiled = function(cx, st, after)
 	-- construct emit still delegates). delegate's cf-wrapper catches a return/break/continue/
 	-- exit the eval'd code raises; opts.redir applies a redirect around the call.
 	if cmd == "eval" and not st.assigns then
-		local argvbody = field_argv(st.words, 1, cx.lifted, nil, nil)
+		local argvbody, argvbody_g = field_argv(st.words, 1, cx.lifted, nil, nil, true)
 		local ev_redir = nil
 		if argvbody and st.redirs then
 			ev_redir = cx.redir_conds(st, nil)
@@ -5099,6 +5303,7 @@ simple_compiled = function(cx, st, after)
 		if argvbody and not (st.redirs and not ev_redir) then
 			return cx.delegate(st, after, {
 				prelude = argvbody,
+				guard = argvbody_g,
 				callee = "rt.eval",
 				callargs = "sh, __a",
 				redir = ev_redir,
@@ -5109,7 +5314,7 @@ simple_compiled = function(cx, st, after)
 	-- same fragment mode as eval, plus positional-param setup and the RETURN trap; it
 	-- falls back to the interpreter for a missing/dir file, aliases, or a syntax error.
 	if (cmd == "source" or cmd == ".") and st.words[2] and not st.assigns then
-		local argvbody = field_argv(st.words, 1, cx.lifted, nil, nil)
+		local argvbody, argvbody_g = field_argv(st.words, 1, cx.lifted, nil, nil, true)
 		local sr_redir = nil
 		if argvbody and st.redirs then
 			sr_redir = cx.redir_conds(st, nil)
@@ -5117,6 +5322,7 @@ simple_compiled = function(cx, st, after)
 		if argvbody and not (st.redirs and not sr_redir) then
 			return cx.delegate(st, after, {
 				prelude = argvbody,
+				guard = argvbody_g,
 				callee = "rt.source",
 				callargs = st.line and ("sh, __a, %d"):format(st.line) or "sh, __a", -- (its line: BASH_LINENO)
 				redir = sr_redir,
@@ -5136,6 +5342,7 @@ simple_compiled = function(cx, st, after)
 	if cmd == "local" and cx.toplevel then -- (outside a function: interp's error — unless a
 		return EF.simple_native(cx, st, after, cmd) or cx.delegate(st, after) -- function is sourcing this file)
 	end
+	local local_nonplain = false
 	if as_local then
 		-- (readonly / set -a are handled per-name at runtime by sh:localAssign — a
 		-- readonly operand fails with $?=1, a set -a local is exported — so no
@@ -5165,7 +5372,7 @@ simple_compiled = function(cx, st, after)
 			end
 		end
 		if not plain and not flagsonly then
-			return EF.simple_native(cx, st, after, cmd) or cx.delegate(st, after)
+			local_nonplain = true -- (the general declaration path below, decl_gen — or delegate)
 		end
 	end
 	-- `unset map["$key"]`: the quoted subscript parts must not be expanded twice — interp's
@@ -5257,7 +5464,7 @@ simple_compiled = function(cx, st, after)
 	-- word-split (export/declare/readonly/local/typeset), code/control-flow builtins
 	-- (eval/source/./command/builtin/exit/return/break/continue). exec_stmt sets $_ to
 	-- the last arg; replicate that. Prefix-env (`x=v cmd`) keeps interp's tempenv binding.
-	-- `wait` needs interp's job-control context, so it still delegates. A REDIRECTED builtin
+	-- (`wait` runs here too: b_wait keeps the job table in sh.) A REDIRECTED builtin
 	-- IS compiled below (install redirs, run, flush-before-restore, honor a flagged write error).
 	local EXEC_SIMPLE_SKIP = {
 		export = 1,
@@ -5275,7 +5482,6 @@ simple_compiled = function(cx, st, after)
 		["break"] = 1,
 		["continue"] = 1,
 		exec = 1,
-		wait = 1,
 	}
 	-- Declaration builtins normally delegate because a LITERAL `name=value` arg must
 	-- expand its value in assignment context (no word-split/glob, tilde after =) —
@@ -5327,6 +5533,30 @@ simple_compiled = function(cx, st, after)
 				break
 			end
 		end
+	end
+	-- decl_gen: the GENERAL declaration-builtin path — any export/declare/typeset/readonly/
+	-- local the specialized paths (the native `local` registers, the top-level literal path
+	-- below, decl_native) don't take: argv built as interp's expand_args does (an assignment
+	-- word expands in assignment context — rt.assign_word when emit_word can't — the rest
+	-- split/glob), then b_export/b_local via rt.builtin, calldepth bumped in a function so
+	-- declare/typeset/local localize exactly as under delegation. An array value
+	-- (st.arrayargs), a prefix env, or a function by that name keep delegating.
+	local decl_gen = false
+	if (DECL_BUILTIN[cmd] or cmd == "local") and st.assigns == nil and not st.arrayargs and not isfunc
+		and not (cmd == "local" and cx.toplevel) and not decl_native then
+		if local_nonplain or not as_local then
+			decl_gen = true
+		else
+			for j = 2, #st.words do
+				if not emitable_word(st.words[j]) then
+					decl_gen = true
+					break
+				end
+			end
+		end
+	end
+	if local_nonplain and not decl_gen then
+		return cx.delegate(st, after)
 	end
 	-- Top-level declaration builtin WITH a literal `name=value` arg (`export FOO=bar`,
 	-- `declare -i n=5`, `export PATH=$PATH:/x`): build argv statically, expanding each
@@ -5452,7 +5682,10 @@ simple_compiled = function(cx, st, after)
 			pvals[#pvals + 1] = (fl and fl:find("~", 1, true)) and ("rt.tilde_assign(sh, %q)"):format(fl)
 				or emit_word(a.rhs, cx.lifted)
 		end
-		local builder = pok and field_argv(st.words, 1, cx.lifted, "rt.cstr(%s)")
+		local builder, bg
+		if pok then
+			builder, bg = field_argv(st.words, 1, cx.lifted, "rt.cstr(%s)", nil, true)
+		end
 		if pok and builder then
 			local p = cx.newpc()
 			local ec = errchk(st)
@@ -5460,18 +5693,24 @@ simple_compiled = function(cx, st, after)
 			local d = dbg(st)
 			local lastarg = "if #__a > 0 then sh:set_str('_', __a[#__a]) end"
 			local run = px_builtin and "rt.builtin(sh, __a, __noop)" or "sh:exec(unpack(__a))"
+			-- the prefix bindings run the command: rt.run_prefix
+			local prun = ("rt.run_prefix(sh, { %s }, __pv, function() %s%s end, __a)"):format(
+				table.concat(pnames, ", "), run, (px_builtin and redir_apply) and "; io.flush()" or "")
+			-- The redirections apply OUTSIDE the prefix bindings — they don't see them (bash: `a=2
+			-- cmd >&$a` uses the outer a; `IFS=/ read < <(…)` doesn't split /dev/fd/63), as
+			-- interp unshadows the tempenv while they expand.
 			local dispatch
 			if not redir_apply then
-				dispatch = run
+				dispatch = prun
 			elseif px_builtin then -- a builtin's buffered output must reach the target fd before restore
-				dispatch = ("do local __rs = {}; if %s then sh.write_err = nil; %s; io.flush() else sh.status = 1 end; rt.redir_restore(__rs); if sh.write_err then rt.chkwrite_late(sh, __a[1]) end end"):format(
+				dispatch = ("do local __rs = {}; if %s then sh.write_err = nil; %s else sh.status = 1 end; rt.redir_restore(__rs); if sh.write_err then rt.chkwrite_late(sh, __a[1]) end end"):format(
 					redir_apply,
-					run
+					prun
 				)
 			else -- external: it runs with its own fds, a failed redirect is $?=1
 				dispatch = ("do local __rs = {}; if %s then %s else sh.status = 1 end; rt.redir_restore(__rs) end"):format(
 					cx.redir_ext(nil, redir_apply),
-					run
+					prun
 				)
 			end
 			-- __pv (prefix values) FIRST, then __a (argv) — both in the pre-prefix env,
@@ -5479,12 +5718,11 @@ simple_compiled = function(cx, st, after)
 			cx.blocks[p] = d
 				.. ("local __pv = { %s }; "):format(table.concat(pvals, ", "))
 				.. builder
-				.. ("; rt.run_prefix(sh, { %s }, __pv, function() %s end, __a); "):format(
-					table.concat(pnames, ", "),
-					dispatch
-				)
+				.. (bg and "; if __a then " or "; ") -- (LuaJIT: no empty `then;`)
+				.. ("%s; "):format(dispatch)
 				.. lastarg
 				.. ecs
+				.. (bg and " end" or "")
 				.. ("; pc = %d"):format(after)
 			if not px_builtin then
 				-- (an external name — unless a function by that name exists at run time: a
@@ -5501,22 +5739,23 @@ simple_compiled = function(cx, st, after)
 	if
 		cmd
 		and st.assigns == nil
-		and not NATIVE_BUILTIN[cmd]
+		and (not NATIVE_BUILTIN[cmd] or decl_gen)
 		and not isfunc
-		and (not EXEC_SIMPLE_SKIP[cmd] or decl_native)
+		and (not EXEC_SIMPLE_SKIP[cmd] or decl_native or decl_gen)
 		and require("interp").BUILTINS[cmd]
 	then
-		local builder = field_argv(st.words, 1, cx.lifted, "rt.cstr(%s)") -- argv entries are C strings (cut at NUL, like interp's expand_args)
+		local builder, bg = field_argv(st.words, 1, cx.lifted, "rt.cstr(%s)", nil, true, decl_gen) -- argv entries are C strings (cut at NUL, like interp's expand_args)
 		if builder then
 			local p = cx.newpc()
 			local ec = errchk(st)
 			local ecs = ec ~= "" and ("; " .. ec) or ""
 			local d = dbg(st) -- DEBUG fires before the command and its expansions
 			local lastarg = "if #__a > 0 then sh:set_str('_', __a[#__a]) end" -- $_ = last arg (bash)
+				.. (EF.pipestatus and '; sh:array_assign("PIPESTATUS", {tostring(sh.status)}, false)' or "")
 			-- In-function declare/typeset: bump calldepth (save/restore) so b_export
 			-- localizes each name, exactly as the delegate's cf-wrapper does. Elsewhere
 			-- (top level, other builtins) this is a plain dispatch.
-			local bcall = (decl_in_fn or (not cx.toplevel and not cx.topcode and (cmd == "command" or cmd == "builtin")))
+			local bcall = ((decl_in_fn or decl_gen or cmd == "command" or cmd == "builtin") and not cx.toplevel and not cx.topcode)
 					and "do local __sc = sh.calldepth; if (sh.calldepth or 0) < 1 then sh.calldepth = 1 end; rt.builtin(sh, __a, __noop); sh.calldepth = __sc end"
 				or "rt.builtin(sh, __a, __noop)"
 			if redir_apply then
@@ -5527,23 +5766,29 @@ simple_compiled = function(cx, st, after)
 				-- status 1, like bash's sh_chkwrite.
 				cx.blocks[p] = d
 					.. builder
-					.. ("; do local __rs = {}; if %s then sh.write_err = nil; %s; io.flush() else sh.status = 1 end; rt.redir_restore(__rs); if sh.write_err then rt.chkwrite_late(sh, __a[1]) end end; %s%s; pc = %d"):format(
+					.. ("; %sdo local __rs = {}; if %s then sh.write_err = nil; %s; io.flush() else sh.status = 1 end; rt.redir_restore(__rs); if sh.write_err then rt.chkwrite_late(sh, __a[1]) end end; %s%s%s; pc = %d"):format(
+						bg and "if __a then " or "",
 						redir_apply,
 						bcall,
 						lastarg,
 						ecs,
+						bg and " end" or "",
 						after
 					)
 			else
 				cx.blocks[p] = d
 					.. builder
-					.. ("; %s; "):format(bcall)
+					.. ("; %s%s; "):format(bg and "if __a then " or "", bcall)
 					.. lastarg
 					.. ecs
+					.. (bg and " end" or "")
 					.. ("; pc = %d"):format(after)
 			end
 			return p
 		end
+	end
+	if decl_gen then -- (an argv word the builder refused: $FUNCNAME/…)
+		return cx.delegate(st, after)
 	end
 	-- FIELD-ENGINE path: an argument word-splits or globs, so argv is variable
 	-- length. Commands with a STATIC dispatch (echo, test/[, a named external, a
@@ -5572,6 +5817,10 @@ simple_compiled = function(cx, st, after)
 			if cmd == "echo" then
 				from = 2
 				call = "sh:echo_cmd(unpack(__a))"
+			elseif (cmd == ":" or cmd == "true" or cmd == "false") and not isfunc then
+				-- `: ${x:=v}` / `true $(…)`: the args expand for their side effects only
+				from = 2
+				call = cmd == "false" and "sh.status = 1" or "sh.status = 0"
 			elseif cmd == "test" or cmd == "[" then -- the [ / test command word is a literal (dispatched by
 				from = 2
 				wrap = "rt.cstr(%s)"
@@ -5615,7 +5864,7 @@ simple_compiled = function(cx, st, after)
 				return cx.delegate(st, after)
 			end
 			wrap = wrap or "rt.cstr(%s)" -- argv entries are C strings: cut each at NUL (bash/interp)
-			local builder = field_argv(st.words, from, cx.lifted, wrap, prefix)
+			local builder, bg = field_argv(st.words, from, cx.lifted, wrap, prefix, true)
 			if not builder then
 				return cx.delegate(st, after)
 			end
@@ -5634,15 +5883,18 @@ simple_compiled = function(cx, st, after)
 				-- truncated. Build argv first, then install redirs around the dispatch.
 				cx.blocks[p] = d
 					.. builder
-					.. ("; do local __rs = {}; if %s then %s else sh.status = 1 end; rt.redir_restore(__rs) end%s%s; pc = %d"):format(
+					.. ("; %sdo local __rs = {}; if %s then %s else sh.status = 1 end; rt.redir_restore(__rs) end%s%s%s; pc = %d"):format(
+						bg and "if __a then " or "",
 						cx.redir_ext(cmd, redir_apply),
 						call,
 						ps,
 						ecs,
+						bg and " end" or "",
 						after
 					)
 			else
-				cx.blocks[p] = d .. builder .. "; " .. call .. ps .. ecs .. ("; pc = %d"):format(after)
+				cx.blocks[p] = d .. builder .. "; " .. (bg and "if __a then " or "") .. call .. ps .. ecs
+					.. (bg and " end" or "") .. ("; pc = %d"):format(after)
 			end
 			return p
 		end
@@ -5984,14 +6236,31 @@ H.arithcmd = function(cx, st, after)
 			return cx.delegate(st, after)
 		end
 	end
+	local sbody
 	if not arith_stmt_ok(st.expr) then
-		return cx.delegate(st, after)
+		-- an expression the arith codegen doesn't render (a subscripted write, a nested side
+		-- effect, an embedded ${…}, a malformed one): the shared arith EVALUATOR runs it
+		-- (rt.arithcmd: interp's eval on the parsed tree, with (( ))'s status and error rules),
+		-- lifted locals flushed to sh before and reloaded after
+		local se = ser(st.expr)
+		if fb_unsafe({ src = se }) or se:find('"_"', 1, true) then -- ($FUNCNAME/$_…: interp keeps them)
+			return cx.delegate(st, after)
+		end
+		local si, so = {}, {}
+		for n in spairs(cx.lifted) do
+			si[#si + 1] = ("sh:aset(%q, %s); "):format(n, lname(n))
+			so[#so + 1] = ("; %s = sh:aget(%q)"):format(lname(n), n)
+		end
+		if se:find("LINENO", 1, true) then -- (the evaluator reads $LINENO from sh.cur_line)
+			si[#si + 1] = ("sh.cur_line = %d; "):format(EF.cur_line or 0)
+		end
+		sbody = ("%srt.arithcmd(sh, %s[1])%s"):format(table.concat(si), EF.konst({ se }), table.concat(so))
 	end
 	local p = cx.newpc()
 	local ec = errchk(st)
 	local ecs = ec ~= "" and ("; " .. ec) or ""
 	local d = dbg(st) -- DEBUG fires before the (( )) command (bash: DEBUG_FIRE.arithcmd)
-	local sbody = EF.arith_status(st.expr, cx.lifted) -- the status-setting body (redirect-wrapped below when present)
+	sbody = sbody or EF.arith_status(st.expr, cx.lifted) -- the status-setting body (redirect-wrapped below when present)
 	if ac_redir then -- install redirs, run, restore; a failed redirect is $?=1 (bash)
 		sbody = ("do local __rs = {}; if %s then %s else sh.status = 1 end; rt.redir_restore(__rs) end"):format(
 			ac_redir,
@@ -6011,16 +6280,30 @@ H.forc = function(cx, st, after)
 	if hard_cf(st.body) then
 		return cx.delegate(st, after)
 	end -- un-static break/continue
-	if
-		not_compilable(st.init)
-		or not_compilable(st.cond)
-		or not_compilable(st.step)
-		or arith_side_effect(st.cond) -- a side-effecting cond can't be an emit_bool expr
-		or arith_reads_unsafe(st.init)
-		or arith_reads_unsafe(st.cond)
-		or arith_reads_unsafe(st.step)
-	then
-		return cx.delegate(st, after) -- $LINENO/$RANDOM/… in the arith: interp reproduces the value
+	-- A slot the arith codegen can't render (an element write, a nested side effect, an
+	-- embedded ${…}, a malformed one, a side-effecting cond, $LINENO/$RANDOM/…) runs through
+	-- the shared arith evaluator (rt.arith_slot: interp's eval with the for (( ))-slot rules —
+	-- an error ends the loop with status 1), lifted locals flushed/reloaded around it. Only a
+	-- slot reading $FUNCNAME/$_/… (not kept in sh by the compiled tier) still delegates.
+	local fbslot = {}
+	for i, e in ipairs({ st.init or false, st.cond or false, st.step or false }) do
+		if e and (not_compilable(e) or arith_reads_unsafe(e) or (i == 2 and arith_side_effect(e))
+				or (i ~= 2 and not arith_stmt_ok(e))) then -- (as the (( )) statement gate)
+			local se = ser(e)
+			if fb_unsafe({ src = se }) or se:find('"_"', 1, true) then
+				return cx.delegate(st, after)
+			end
+			fbslot[i] = se
+		end
+	end
+	local function slot(i, okgo) -- the fallback slot's code: __v its value, else the loop ends
+		local si, so = {}, {}
+		for n in spairs(cx.lifted) do
+			si[#si + 1] = ("sh:aset(%q, %s); "):format(n, lname(n))
+			so[#so + 1] = ("%s = sh:aget(%q); "):format(lname(n), n)
+		end
+		return ("%slocal __ok, __v = rt.arith_slot(sh, %s[1], %d); %sif not __ok then sh.status = 1; if sh.opt_e then error({ __curse_exit = 1 }) end; pc = %d else %s end"):format(
+			table.concat(si), EF.konst({ fbslot[i] }), st.line or 0, table.concat(so), after, okgo)
 	end
 	local condp = cx.newpc()
 	cx.loopPc[st.id] = condp
@@ -6039,7 +6322,9 @@ H.forc = function(cx, st, after)
 		return ("local __st = sh.status; %s; local __as = sh.status; if sh.arithfault then sh.status = 1; pc = %d else sh.status = __st; %s end"):format(
 			code, after, okgo)
 	end
-	if st.step and arith_can_error(st.step, cx.lifted) then
+	if fbslot[3] then
+		cx.blocks[stepp] = d .. slot(3, ("pc = %d"):format(condp))
+	elseif st.step and arith_can_error(st.step, cx.lifted) then
 		cx.blocks[stepp] = d .. guarded(st.step, ("pc = %d"):format(condp))
 	else
 		cx.blocks[stepp] = d
@@ -6053,7 +6338,9 @@ H.forc = function(cx, st, after)
 	local bodyp, exitp = cx.newpc(), cx.newpc()
 	cx.blocks[bodyp] = ("%s = 1; pc = %d"):format(ran, bodyentry)
 	cx.blocks[exitp] = ("if %s == 0 then sh.status = 0 end; pc = %d"):format(ran, after)
-	if st.cond and arith_can_error(st.cond, cx.lifted) then
+	if fbslot[2] then
+		cx.blocks[condp] = d .. slot(2, ("if __v ~= 0 then pc = %d else pc = %d end"):format(bodyp, exitp))
+	elseif st.cond and arith_can_error(st.cond, cx.lifted) then
 		cx.blocks[condp] = d .. guarded(st.cond, ("if __as == 0 then pc = %d else pc = %d end"):format(bodyp, exitp))
 	else
 		cx.blocks[condp] = d
@@ -6066,7 +6353,9 @@ H.forc = function(cx, st, after)
 	local ep = cx.newpc()
 	if st.init then
 		local ip = cx.newpc()
-		if arith_can_error(st.init, cx.lifted) then
+		if fbslot[1] then
+			cx.blocks[ip] = d .. slot(1, ("pc = %d"):format(condp))
+		elseif arith_can_error(st.init, cx.lifted) then
 			cx.blocks[ip] = d .. guarded(st.init, ("pc = %d"):format(condp))
 		else
 			cx.blocks[ip] = d .. emit_arith_stmt(st.init, cx.lifted) .. ("; pc = %d"):format(condp)
@@ -6091,9 +6380,9 @@ H.whilec = function(cx, st, after)
 	end
 	local arith = cond_arith(st.cond)
 	if arith and arith_reads_unsafe(arith) then
-		-- a `(( ))` condition reading an unreproducible special ($LINENO/$RANDOM/…):
-		-- delegate the whole loop to interp, which reproduces the value.
-		return cx.delegate(st, after)
+		-- a `(( ))` condition reading a special ($LINENO/$RANDOM/…): no native fast path — the
+		-- condition compiles as the command it is (H.arithcmd's evaluator reads it from sh)
+		arith = nil
 	end
 	if arith and not st.negate and not not_compilable(arith) and not arith_side_effect(arith) then
 		-- fast path: a native arith condition `while (( expr ))` — no command run.
@@ -6193,6 +6482,7 @@ H.forin = function(cx, st, after)
 	if not st.name:match("^[%a_][%w_]*$") then
 		return cx.delegate(st, after)
 	end -- invalid loop var → interp errors
+	local fbw -- words expanded by rt.word_fields (a contained expansion error skips the loop, $?=1)
 	-- Each word expands to for-list fields exactly like a command argument: word_safe (one
 	-- field), a field_word (an unquoted expansion/glob the field engine splits+globs), or a
 	-- seg_native mixed word (rt.expand_fields — literal+$x, $@/$*, ${a[@]}, ${!a[@]}, scalar
@@ -6208,7 +6498,12 @@ H.forin = function(cx, st, after)
 			end
 		end
 		if not word_safe(w) and not EF.arith_guard(w) and not field_word(w, cx.lifted) and not EF.seg_native(w, cx.lifted) then
-			return cx.delegate(st, after)
+			-- (else the shared one-word expander, rt.word_fields — unless it reads $FUNCNAME/…)
+			if fb_unsafe(w) then
+				return cx.delegate(st, after)
+			end
+			fbw = fbw or {}
+			fbw[w] = true
 		end
 	end
 	local initp = cx.newpc()
@@ -6233,8 +6528,14 @@ H.forin = function(cx, st, after)
 		end
 		run = {}
 	end
+	local opens = 0
 	for _, w in ipairs(st.words) do
-		if not empty_word(w) then
+		if fbw and fbw[w] then
+			flush_run()
+			parts[#parts + 1] = fb_step(w, cx.lifted, "rt.word_fields", "for __i=1,#__f do __l[#__l+1]=__f[__i] end", "__l")
+				.. "; if __l then "
+			opens = opens + 1
+		elseif not empty_word(w) then
 			local code = emit_fields_into("__l", w, cx.lifted)
 			local lit = code:match('^__l%[#__l%+1%] = (%("[^"\\]*"%))$')
 			if lit then
@@ -6246,6 +6547,9 @@ H.forin = function(cx, st, after)
 		end
 	end
 	flush_run()
+	if opens > 0 then -- (after a contained expansion error __l is false: no loop, $? is 1)
+		parts[#parts + 1] = "local _ = nil" .. string.rep(" end", opens)
+	end
 	-- The loop state lives in a LOCAL of this function activation (a recursive call, or a
 	-- $( … ) fragment running a loop with the same id, must not clobber it), published in
 	-- sh.forstate[id] for an OSR entry — which adopts it (below). Capped: a function has
@@ -6260,7 +6564,12 @@ H.forin = function(cx, st, after)
 		or ("sh.forstate[%d] = {list=__l, idx=0}"):format(st.id)
 	local getfs = fsl and ("local fs = %s or sh.forstate[%d]; %s = fs"):format(fsl, st.id, fsl)
 		or ("local fs = sh.forstate[%d]"):format(st.id)
-	cx.blocks[initp] = table.concat(parts, "; ") .. ("; pc = %d"):format(advp)
+	if opens > 0 then
+		cx.blocks[initp] = table.concat(parts, "; "):gsub("if __l then ; ", "if __l then ")
+			.. ("; if not __l then pc = %d else pc = %d end"):format(after, advp)
+	else
+		cx.blocks[initp] = table.concat(parts, "; ") .. ("; pc = %d"):format(advp)
+	end
 	if EF.has_attr then -- a readonly loop variable: bash reports it and runs no iteration
 		cx.blocks[initp] = ("if rt.for_var_ro(sh, %q) then pc = %d else %s end"):format(st.name, after, cx.blocks[initp])
 	end
@@ -6471,7 +6780,6 @@ H.subshell = function(cx, st, after)
 	-- escaping piece of shell state). The fragment RAISES exit/return (caught by
 	-- subshell_run), so subshell_exit_pc is cleared around its build. break/continue can't
 	-- cross into it — the fragment has its own loopstack.
-	local inproc_pc = nil -- in-process branch behind a runtime guard (see below)
 	if not EF.inproc_trap_block and #st.body > 0 then
 		local saved_ssx = EF.subshell_exit_pc
 		EF.subshell_exit_pc = nil
@@ -6504,24 +6812,14 @@ H.subshell = function(cx, st, after)
 			else
 				cx.blocks[p] = ("%ssh:subshell_run(__CS[%d], nil, true)%s%s; pc = %d"):format(swpre, id, swpost, ecs, after)
 			end
-			if not EF.has_dyncode then
-				return p
-			end
-			inproc_pc = p
+			-- (in an eval/source program the body's simple commands guard their own names —
+			-- H.simple's live-dispatch variant — so the fragment stays valid as names change)
+			return p
 		end
 	end
 	-- Otherwise (no fragment, or its guard fails at run time) the interpreter runs the
 	-- subshell — in-process as well (subshell_run): a subshell never forks.
-	local p = cx.delegate(st, after)
-	if inproc_pc then
-		-- eval/source program: compiled only while the body's names are still the static
-		-- ones (else the interpreter, which resolves them live)
-		local cond = dyn_guard(st.body) or "true"
-		local g = cx.newpc()
-		cx.blocks[g] = ("if %s then pc = %d else pc = %d end"):format(cond, inproc_pc, p)
-		return g
-	end
-	return p
+	return cx.delegate(st, after)
 end
 
 -- statement handler: group (split out of flatten_stmt; see H)
@@ -6590,31 +6888,41 @@ H.pipeline = function(cx, st, after)
 	-- Every stage runs IN-PROCESS under the coroutine scheduler. In an eval/source program a
 	-- stage whose command names may have been redefined at run time (dyn_guard) can't trust
 	-- its compiled form: then the whole pipeline goes to the interpreter (in-process too).
-	local inproc, guards = {}, {}
+	-- (the stages' own simple commands guard their names — H.simple's live-dispatch variant —
+	-- so the fragments stay valid; only a stage's KIND may not: a name that became a function
+	-- can't run "flat". Then the same stages run with the kinds every name being a function
+	-- gives — the general, never-flat shapes.)
+	local inproc, dinproc, guards = {}, {}, {}
+	local function kq(kind)
+		return kind == true and "true" or ('"' .. kind .. '"')
+	end
 	for i = 1, n do
 		local kind = require("runtime").stage_kind(st.cmds[i], function(c)
 			return cx.funcflags[c] or (cx.inlinefns and cx.inlinefns[c])
 		end)
-		inproc[i] = kind == true and "true" or ('"' .. kind .. '"')
+		inproc[i] = kq(kind)
+		dinproc[i] = kq(require("runtime").stage_kind(st.cmds[i], function()
+			return true
+		end))
 		local g = dyn_guard({ st.cmds[i] })
 		if g then
 			guards[#guards + 1] = "(" .. g .. ")"
 		end
 	end
-	local gpre, gpost = "", ""
+	local kinds = ("{%s}"):format(table.concat(inproc, ", "))
 	if #guards > 0 then
-		local pd = cx.delegate(st, after)
-		gpre = ("if not (%s) then pc = %d else "):format(table.concat(guards, " and "), pd)
-		gpost = " end"
+		kinds = ("((%s) and %s or %s)"):format(table.concat(guards, " and "), EF.konst(inproc),
+			EF.konst(dinproc))
 	end
+	local gpre, gpost = "", ""
 	-- (`! cmd` ignores its OWN special-builtin failure: rt.spb_run)
 	local negspb = n == 1 and st.negate and st.cmds[1].t == "simple" and st.cmds[1].words
 		and st.cmds[1].words[1] and require("runtime").SPECIAL_BUILTIN[full_lit(st.cmds[1].words[1]) or ""]
 	cx.blocks[p] = gpre .. dbg(st)
 		.. lifted_flush(cx.lifted)
 		.. (negspb and "sh.spb_neg = true; " or "")
-		.. ("sh:run_pipeline({%s}, %s, {%s}%s)"):format(
-			table.concat(frags, ", "), st.negate and "true" or "false", table.concat(inproc, ", "),
+		.. ("sh:run_pipeline({%s}, %s, %s%s)"):format(
+			table.concat(frags, ", "), st.negate and "true" or "false", kinds,
 			(EF.lifted_names and #EF.lifted_names > 0) and ", __upv_get, __upv_set" or "")
 		.. (negspb and "; sh.spb_neg = nil" or "")
 		.. post
@@ -6828,7 +7136,9 @@ H.case = function(cx, st, after)
 	-- Subject must be emittable AND free of a dynamic special var ($LINENO/$_/…) whose value
 	-- the CFG can't reproduce — those run on the interp tier (compile-eventually), else the
 	-- native subject would read a wrong LINENO/etc.
-	if not db_word_ok(st.subject) then
+	local subj = db_word_ok(st.subject) and emit_word(st.subject, cx.lifted)
+		or db_fallback(st.subject, cx.lifted, "rt.word_str") -- (the shared one-word expander)
+	if not subj then
 		return cx.delegate(st, after)
 	end
 	local sv = cx.newloopvar()
@@ -6911,7 +7221,7 @@ H.case = function(cx, st, after)
 	cx.blocks[subjp] = dbg(st)
 		.. ("%s = %s; %spc = %d"):format(
 			sv,
-			emit_word(st.subject, cx.lifted),
+			subj,
 			ran and (ran .. " = false; ") or "",
 			n > 0 and matchentry[1] or nomatch
 		)
@@ -6967,6 +7277,34 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
 	-- DONE, which in the forked child would return PAST the subshell.
 	cx.subexit = {}
 	cx.bx_guarded = {} -- (statements already given their `set +B` guard)
+	cx.ps_guarded = {} -- (simple commands already given their <()/>() drain)
+	-- Does a simple command create a process substitution — a <(…)/>(…) word, prefix value
+	-- or redirection target? Its pipes are closed and its children reaped after the command.
+	function cx.has_procsub(st)
+		local function inw(w)
+			for _, p in ipairs(w and w.parts or {}) do
+				if p.procsub then
+					return true
+				end
+			end
+		end
+		for _, w in ipairs(st.words or {}) do
+			if inw(w) then
+				return true
+			end
+		end
+		for _, a in ipairs(st.assigns or {}) do
+			if inw(a.rhs) then
+				return true
+			end
+		end
+		for _, r in ipairs(st.redirs or {}) do
+			if ((r.src or r.target or "") .. (r.word or "")):find("[<>]%(") then
+				return true
+			end
+		end
+		return false
+	end
 
 
 
@@ -7049,7 +7387,8 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
 			.. (rbody and rbody.stdin and "sh.stdin_redir = (sh.stdin_redir or 0) + 1; " or "")
 		local si_out = rbody and rbody.stdin and "sh.stdin_redir = sh.stdin_redir - 1; " or ""
 		local rfail = rbody and rbody.fail and ("; " .. rbody.fail) or ""
-		local function callwrap()
+		local callwrap
+		callwrap = function()
 			if rbody then
 				return ("do local __rs, __so = {}, sh.out; if %s then %slocal __ok, __e = pcall(%s, %s); %ssh.out = __so; rt.redir_restore(__rs); if not __ok then error(__e, 0) end else rt.redir_restore(__rs); sh.status = 1%s end end"):format(
 					redir,
@@ -7068,6 +7407,19 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
 				)
 			end
 			return ("%s(%s)"):format(callee, callargs)
+		end
+		-- opts.guard: the prelude is a GUARDED argv (field_argv): after a contained word-expansion
+		-- error `__a` is false — $? is already 1 — and the command must not run (nor its ERR check)
+		local guard = opts and opts.guard
+		if guard then
+			local cw, gec = callwrap, ec
+			callwrap = function()
+				return ("if __a then %s%s end"):format(cw(), gec ~= "" and ("; " .. gec) or "")
+			end
+			ec = ""
+			if inloop or infunc then -- (the pcall form below: guard the call and the check)
+				ec = gec ~= "" and ("if __a then " .. gec .. " end") or ""
+			end
 		end
 		if not (inloop or infunc) then -- top level, no loop: nothing to catch (interp no-ops)
 			local out = {}
@@ -7106,18 +7458,21 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
 			-- install the redirs, run the dispatch (still under pcall so a break/continue/return
 			-- signal is caught below) only if they succeeded, then restore — regardless of signal.
 			o[#o + 1] = "local __rs, __so, __rf = {}, sh.out, false; local __ok, __e = true, nil"
-			o[#o + 1] = ("if %s then %s__ok, __e = pcall(%s, %s); sh.out = __so else sh.status = 1; __rf = true end"):format(
+			o[#o + 1] = ("%sif %s then %s__ok, __e = pcall(%s, %s); sh.out = __so else sh.status = 1; __rf = true end%s"):format(
+				guard and "if __a then " or "",
 				redir,
 				so_in,
 				callee,
-				callargs
+				callargs,
+				guard and " end" or ""
 			)
 			o[#o + 1] = "rt.redir_restore(__rs)"
 			if rfail ~= "" then -- after the restore: the ERR handler / errexit sees the original fds
 				o[#o + 1] = "if __rf then " .. rfail:sub(3) .. " end"
 			end
 		else
-			o[#o + 1] = ("local __ok, __e = pcall(%s, %s)"):format(callee, callargs)
+			o[#o + 1] = guard and ("local __ok, __e = true, nil; if __a then __ok, __e = pcall(%s, %s) end"):format(callee, callargs)
+				or ("local __ok, __e = pcall(%s, %s)"):format(callee, callargs)
 		end
 		o[#o + 1] = "sh.loopdepth, sh.calldepth = __sl, __sc"
 		o[#o + 1] = table.concat(sync_out, "; ")
@@ -7175,6 +7530,28 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
 	-- directly; an EXPANDABLE one ($/glob/~ etc.) hands mask-aware segments to redir_apply_expand
 	-- (field expansion + the ambiguous-redirect check at runtime).
 	function cx.redir_apply_expr(r)
+		local e = cx.redir_native_expr(r)
+		if e then
+			return e
+		end
+		-- Any other shape — a `{var}>` named fd, a fd MOVE (`>&5-`), a dup to an expanded fd
+		-- (`>&$fd`), a brace/cmdsub/arith target, an expanding heredoc emit_word can't render:
+		-- apply that ONE redirection with the shared redirection applier (interp's apply_redirs
+		-- on a one-element list — the redirect analogue of rt.word_fields), its fd saves joining
+		-- __rs so the compiled restore undoes them. Lifted locals are flushed to sh around it
+		-- (the target may read them, `{v}` / `${x:=f}` may write them).
+		local call = ("rt.redir_apply_one(sh, %s[1], __rs)"):format(EF.konst({ ser(r) }))
+		local si, so = {}, {}
+		for n in spairs(cx.lifted) do
+			si[#si + 1] = ("sh:aset(%q, %s); "):format(n, lname(n))
+			so[#so + 1] = ("%s = sh:aget(%q); "):format(lname(n), n)
+		end
+		if #si == 0 then
+			return call
+		end
+		return ("(function() %slocal __ok = %s; %sreturn __ok end)()"):format(table.concat(si), call, table.concat(so))
+	end
+	function cx.redir_native_expr(r)
 		if r.fdvar then
 			return nil
 		end
@@ -7332,6 +7709,13 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
 		-- command before it — a compound doesn't move the line itself)
 		local sl = EF.cur_line
 		EF.cur_line = st.top and st.redirs[1].line or cx.prev_line or sl
+		local ps, psv -- (a >(…) target: drained after the whole compound, as interp does)
+		if cx.has_procsub({ redirs = st.redirs }) then
+			psv = cx.newloopvar()
+			ps = cx.newpc()
+			cx.blocks[ps] = ("rt.procsub_drain(sh, %s); pc = %d"):format(psv, after)
+			after = ps
+		end
 		local p = cx.delegate(st, after, {
 			callee = "__CS[" .. id .. "]",
 			callargs = "sh",
@@ -7344,6 +7728,11 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
 			},
 		})
 		EF.cur_line = sl
+		if ps then
+			local pre = cx.newpc()
+			cx.blocks[pre] = ("%s = rt.procsub_fmark(sh); pc = %d"):format(psv, p)
+			return pre
+		end
 		return p
 	end
 
@@ -7373,16 +7762,23 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
 			cx.blocks[p0] = ("rt.time_push(sh); pc = %d"):format(cx.flatten_list({ inner }, pe))
 			return p0
 		end
-		-- a brace-expanded word list: `set +B` (checked at run time, like bash) runs the
-		-- statement through interp, whose expansion puts the raw words back
+		-- a brace-expanded word list: under `set +B` (checked at run time, like bash) the raw
+		-- words stand — compile that shape too (the statement over parser.unbrace_words, as
+		-- interp's expand_args / for-in list take it) and pick one at run time
 		if (t == "simple" or t == "forin") and not cx.bx_guarded[st] then
 			for _, w in ipairs(st.words) do
 				if w.bx then
 					cx.bx_guarded[st] = true
 					local pn = cx.flatten_stmt(st, after)
-					local pd = cx.delegate(st, after)
+					local us = {}
+					for k, v in pairs(st) do
+						us[k] = v
+					end
+					us.words = cx.P.unbrace_words(st.words)
+					cx.bx_guarded[us] = true
+					local pu = cx.flatten_stmt(us, after)
 					local p = cx.newpc()
-					cx.blocks[p] = ("if sh.opt_B == false then pc = %d else pc = %d end"):format(pd, pn)
+					cx.blocks[p] = ("if sh.opt_B == false then pc = %d else pc = %d end"):format(pu, pn)
 					return p
 				end
 			end
@@ -7544,7 +7940,7 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
 			-- rt.regex_captures (real POSIX ERE, exactly interp's path). The RHS is rendered
 			-- mask-aware by emit_regex_glob. A =~ nested inside and/or/not still delegates.
 			if st.expr.kind == "binary" and st.expr.op == "=~" and db_word_ok(st.expr.l) then
-				local re = EF.emit_regex_glob(st.expr.r, cx.lifted)
+				local re = EF.emit_regex_glob(st.expr.r, cx.lifted) -- (else the leaf path below)
 				if re then
 					local p = cx.newpc()
 					local d = dbg(st)
@@ -7562,6 +7958,13 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
 					return p
 				end
 			end
+			if st.expr and st.expr.kind == "syntaxerr" then -- a malformed [[ ]]: fatal syntax error
+				local p = cx.newpc() -- (bash aborts a non-interactive shell; interp's dbracket)
+				cx.blocks[p] = dbg(st) .. 'io.stderr:write("curse: syntax error in conditional expression\\n"); sh.status = 2; if not sh.opt_i then error({ __curse_exit = 2 }) end'
+					.. ("; pc = %d"):format(after)
+				return p
+			end
+			EF.db_regex = nil
 			local cond = emit_dbracket_node(st.expr, cx.lifted)
 			if not cond then
 				return cx.delegate(st, after)
@@ -7570,8 +7973,13 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
 			local d = dbg(st)
 			local ec = errchk(st)
 			local ecs = ec ~= "" and ("; " .. ec) or ""
+			local sbody = ("sh.status = (%s) and 0 or 1"):format(cond)
+			if EF.db_regex then -- (a nested =~ with an invalid regex: the whole [[ ]] is status 2)
+				sbody = ("do local __ok, __r = pcall(function() return %s end); if __ok then sh.status = __r and 0 or 1 elseif type(__r) == \"table\" and __r.__curse_regexerr then sh.status = 2 elseif type(__r) == \"table\" and __r.__curse_matherr and not __r.__curse_subscript then sh.status = 1 else error(__r, 0) end end"):format(cond)
+				EF.db_regex = nil
+			end
 			cx.blocks[p] = d
-				.. db_wrap(("sh.status = (%s) and 0 or 1"):format(cond))
+				.. db_wrap(sbody)
 				.. ecs
 				.. ("; pc = %d"):format(after)
 			return p
