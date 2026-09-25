@@ -54,10 +54,11 @@ local function trap_mode(sh)
 	return e .. d
 end
 M.trap_mode = trap_mode
-function M.try_fragment(code, line1, sh, now) -- line1: an eval's own line, which its code numbers from
+function M.try_fragment(code, line1, sh, now, label) -- line1: an eval's own line, which its code numbers from
 	-- (now: the caller already saw this code run — compile it on this first call;
-	-- line1 == false: a trap handler, whose commands keep the interrupted line)
-	local mode = trap_mode(sh) .. (line1 == false and "H" or "")
+	-- line1 == false: a trap handler, whose commands keep the interrupted line;
+	-- label "eval": its syntax errors read `eval: line N:` and end just the eval)
+	local mode = trap_mode(sh) .. (line1 == false and "H" or "") .. (label == "eval" and "V" or "")
 	local key = mode .. "\0" .. (line1 and (line1 .. "\0" .. code) or code)
 	local hit = frag_cache[key]
 	if hit ~= nil and hit ~= 0 then
@@ -79,22 +80,20 @@ function M.try_fragment(code, line1, sh, now) -- line1: an eval's own line, whic
 	return mod ~= 0 and mod or nil
 end
 function M.compile_fragment(code, line1, mode)
-	local pok, ast = pcall(P.parse, code, nil, nil, nil, nil, nil, line1)
-	-- A syntax error (P.parse sets ast.perr and/or emits a `parse_error` statement, or
-	-- throws): the interpreter is the oracle for it — it runs the valid PREFIX then reports
-	-- the error with bash's status — so bail to the fallback rather than compile a fragment
-	-- that would raise the parse error at runtime and abort the caller.
-	if not pok or type(ast) ~= "table" or ast.perr then
+	local pok, ast = pcall(P.parse, code, nil, nil, nil, nil, nil, line1 or nil)
+	-- A syntax error becomes a `parse_error` statement after the valid prefix: compiled, it
+	-- reports and raises __curse_parseerr, which the caller (eval/source/trap) contains.
+	if not pok or type(ast) ~= "table" then
 		return nil
 	end
-	for _, st in ipairs(ast.stmts or {}) do
+	for k, st in ipairs(ast.stmts) do
 		if st.t == "parse_error" then
-			return nil
+			st.lead = rt.perr_lead(ast.stmts, k) or nil
 		end
 	end
 	local ok, chunk = pcall(function()
 		mode = mode or ""
-		return load(E.emit(ast, { fragment = true, trapline = mode:find("H", 1, true) ~= nil, trap_err = mode:find("E", 1, true) ~= nil,
+		return load(E.emit(ast, { fragment = true, perr_label = mode:find("V", 1, true) and "eval", trapline = mode:find("H", 1, true) ~= nil, trap_err = mode:find("E", 1, true) ~= nil,
 			trap_debug = mode:find("[DT]") ~= nil, functrace = mode:find("T", 1, true) ~= nil }), "=curse:eval")
 	end)
 	if ok and chunk then

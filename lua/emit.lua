@@ -7193,7 +7193,7 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
 			-- fatal parse error raises its exit through the wrapper, lifted vars synced for EXIT)
 			return cx.delegate(st, after, {
 				callee = t == "warn" and "rt.warn_stmt" or "rt.parse_error_stmt",
-				callargs = ("sh, %s"):format(ser(st)),
+				callargs = ("sh, %s%s"):format(ser(st), EF.perr_label and (", %q"):format(EF.perr_label) or ""),
 			})
 		end
 		if t == "assign" then
@@ -7659,6 +7659,7 @@ function M.emit(ast, opts)
 	-- the enclosing (delegated) cf-wrapper to catch, not jump to this fragment's own DONE.
 	EF.fragment = opts and opts.fragment or false
 	EF.trapline = opts and opts.trapline or false
+	EF.perr_label = opts and opts.perr_label or nil -- (an eval fragment's syntax errors: `eval: line N:`)
 	-- xtrace/verbose (`set -x`, `set -o xtrace`, `set -v`) trace per command; the compiled
 	-- tier has no trace hooks, so such a program stays in the interpreter (which traces).
 	if scan_xtrace(ast.stmts) then

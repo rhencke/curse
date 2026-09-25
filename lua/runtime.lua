@@ -11113,13 +11113,19 @@ end
 -- payload) after the valid prefix ran — bash reports it there and exits 2. bash's form:
 -- `syntax error near unexpected token `X'` (or `syntax error: unexpected end of file`),
 -- then the offending line as `…'. Shared by both tiers (the compiled one calls it natively).
-function M.parse_error_stmt(sh, st)
+-- `label` "eval": an eval'd text's error reads `NAME: eval: line N:`, and even a recoverable
+-- one ends the eval (status 2, like b_eval) — the caller contains __curse_parseerr.
+function M.parse_error_stmt(sh, st, label)
 	for _, w in ipairs(st.warns or {}) do
 		sh.cur_line = w.line
 		io.stderr:write("curse: " .. w.msg .. "\n")
 	end
 	if st.recoverable then
-		return M.report_recoverable(sh, st)
+		M.report_recoverable(sh, st)
+		if label then
+			error({ __curse_exit = 2, __curse_parseerr = true })
+		end
+		return
 	end
 	local msg = tostring(st.msg or "syntax error"):gsub("^.-:%d+: ", "")
 	msg = msg:gsub("^syntax error near `", "syntax error near unexpected token `")
@@ -11131,12 +11137,29 @@ function M.parse_error_stmt(sh, st)
 		sh.cur_line = st.line
 	end
 	sh.in_perr = true -- (a `-c` string's syntax errors name it: `bash: -c: line 1:`)
+	local pl = sh.perr_label
+	sh.perr_label = label or pl
 	io.stderr:write("curse: " .. msg .. "\n")
 	if st.text and (st.showtext or msg:find("near unexpected token", 1, true)) then
 		io.stderr:write("curse: " .. (st.showtext and "syntax error: " or "") .. "`" .. st.text .. "'\n")
 	end
-	sh.in_perr = nil
-	error({ __curse_exit = 2, __curse_parseerr = true })
+	sh.in_perr, sh.perr_label = nil, pl
+	error({ __curse_exit = 2, __curse_parseerr = true, lead = st.lead })
+end
+-- bash's evalstring.c: an eval'd/sourced text's syntax error ends a posix shell only while
+-- this_shell_builtin is still that eval/source — no command ran in the text before it (a
+-- bare assignment doesn't count). Marks the statement (st.lead) for its caller's spb_err.
+function M.perr_neutral(st)
+	local t = st.t
+	return t == "assign" or t == "assignlist" or t == "parse_error" or t == "warn"
+end
+function M.perr_lead(stmts, k)
+	for i = 1, k - 1 do
+		if not M.perr_neutral(stmts[i]) then
+			return false
+		end
+	end
+	return true
 end
 
 -- `eval CODE`: COMPILE the joined code string at runtime (fragment mode — its top-level
@@ -11165,10 +11188,18 @@ function M.eval_run(sh, argv)
 		return
 	end
 	local ln = current_line(sh)
-	local mod = require("tier").try_fragment(code, ln > 0 and ln or nil, sh)
+	local mod = require("tier").try_fragment(code, ln > 0 and ln or nil, sh, nil, "eval")
 	if mod then
-		require("tier").run_compiled(mod, sh, nil, true)
+		local ok, err = pcall(require("tier").run_compiled, mod, sh, nil, true)
 		sh.spb_err = nil -- (a builtin the code ran flagged its own: not eval's)
+		if not ok then
+			if type(err) == "table" and err.__curse_parseerr then
+				sh.status = 2 -- a syntax error ends the eval, status 2 (EX_BADSYNTAX: rt.spb_run)
+				sh.spb_err = err.lead and 2 or nil
+			else
+				error(err, 0)
+			end
+		end
 	else
 		require("b_eval")(sh, "eval", argv, _noop, nil) -- (a hook: a called function asks it)
 	end
@@ -11316,6 +11347,10 @@ function M.source_run(sh, argv, line)
 	local dsave, e0 = M.source_debug_hide(sh), sh.traps and sh.traps.ERR
 	local rok, err = pcall(require("tier").run_compiled, mod, sh, nil, true)
 	sh.spb_err = nil -- (a builtin in the file flagged its own: not the source's)
+	if not rok and type(err) == "table" and err.__curse_parseerr then
+		rok = true -- a syntax error in the file: source returns 2, doesn't halt the shell (bash)
+		sh.status, sh.spb_err = 2, err.lead and 2 or nil -- (EX_BADSYNTAX halts a posix one: perr_lead)
+	end
 	M.source_leave(sh, fr)
 	sh.sourcedepth = sh.sourcedepth - 1
 	-- (params the file SET itself stay — but not inside a function: bash's maybe_pop_dollar_vars)

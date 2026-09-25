@@ -93,6 +93,7 @@ return function(sh, cmd, args, hook, tcb)
 					local rok, err = pcall(function()
 						local nextf = P.open(src, sh)
 						local vst = {}
+						local ran = false -- (a command ran before a syntax error: not fatal — rt.perr_lead)
 						while true do
 							local lg = nextf()
 							if lg == nil then
@@ -107,10 +108,11 @@ return function(sh, cmd, args, hook, tcb)
 									M.report_recoverable(sh, lg.perr)
 								else
 									pcall(I.exec_stmt, sh, lg.perr, hook) -- (it would exit: the file just ends)
-									error({ __curse_parseerr = true })
+									error({ __curse_parseerr = true, lead = not ran })
 								end
 							end
 							for _, st in ipairs(lg.stmts) do
+								ran = ran or not rt.perr_neutral(st)
 								local sok, serr = pcall(exec_list, sh, { st }, hook, false)
 								if not sok then
 									if type(serr) == "table" and serr.__curse_lineabort and not serr.__curse_discard then
@@ -142,7 +144,7 @@ return function(sh, cmd, args, hook, tcb)
 							rret = err.__curse_return
 						elseif type(err) == "table" and err.__curse_parseerr then
 							sh.status = 2 -- a syntax error in the file: source returns 2, doesn't halt the shell (bash)
-							sh.spb_err = 2 -- (…but EX_BADSYNTAX does halt a posix one: rt.spb_run)
+							sh.spb_err = err.lead and 2 or nil -- (EX_BADSYNTAX halts a posix one: rt.perr_lead)
 						else
 							rt.source_debug_restore(sh, dsave)
 							error(err)
