@@ -129,6 +129,9 @@ function M.compile_fragment(code, line1, mode, atab)
 	if ok and chunk then
 		local built, mod = pcall(chunk)
 		if built and type(mod) == "table" and mod.run then
+			-- (run as a $(…) body: the light buffer capture only when the compiler calls it
+			-- pure — a redirect like `>&2` needs the fd-level capture: rt capture_src)
+			mod.nofork = E.cmdsub_nofork_ok(ast.stmts) and #ast.stmts > 0
 			return mod
 		end
 	end

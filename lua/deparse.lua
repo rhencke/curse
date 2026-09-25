@@ -741,4 +741,5 @@ deparse_list = function(src)
 	return nil
 end
 
+M.norm_word = norm_word -- (a compound-literal word in an error: rt.compound_word_src)
 return M

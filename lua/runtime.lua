@@ -1771,7 +1771,7 @@ function Shell:run_script_inproc(path, args, n, out)
 		child.iso_ctx = self.iso_ctx -- (its process-state saves land in our context)
 		child.subdepth = self.subdepth
 		M.cur_shell = child
-		pcall(require("interp").run_lazy, child, src)
+		pcall(require("tier").run_tiered, src, child) -- (tiered like any script: cached compiled)
 		M.cur_shell = csh
 		io.flush()
 	end)
@@ -2187,7 +2187,7 @@ function Shell:capture_src(src, backtick, noalias)
 	end
 	if mod then
 		local run_compiled = require("tier").run_compiled
-		if iso and not has_perr then
+		if (iso or not mod.nofork) and not has_perr then
 			return self:capture_compiled_iso(function(self)
 				return run_compiled(mod, self, nil, true)
 			end, backtick)
@@ -2325,11 +2325,12 @@ function Shell:capture_inproc(backtick, runner, capfd, ctx)
 	end
 	if not ok then
 		if type(err) == "table" and err.__curse_parseerr then
-			if backtick then
-				self.status = 1
+			if backtick then -- contained (non-fatal): "", status 2 — an assignment's $?
+				self.status, self.last_cmdsub_status = 2, 2
+				self.ncs = (self.ncs or 0) + 1
 				readcap()
 				return ""
-			end -- backtick: contained (non-fatal)
+			end
 			readcap() -- drop the temp file, then propagate
 			error(err) -- a SYNTAX error inside $(…) is fatal to the whole containing command (bash)
 		elseif type(err) == "table" and (err.__curse_exit or err.__curse_return) then
@@ -9536,6 +9537,9 @@ function M.compound_word_src(sh, it)
 		end
 		s = table.concat(out)
 	end
+	if s:find("$(", 1, true) then -- (bash re-prints a $(…) body: `>&2` reads `1>&2`)
+		s = require("deparse").norm_word(s)
+	end
 	if sh.arrayargs_pending or it.decl then
 		return "'" .. s:gsub("'", "'\\''") .. "'"
 	end
@@ -9589,6 +9593,29 @@ function M.arrayassign(sh, name, items, append)
 		end
 		error(err, 0)
 	end
+end
+-- The `NAME=(…)` statement (not a declare's): a nameref to an element (or `a[@]`) can't
+-- take a list — `not a valid identifier`, status 1 (interp's run_arrayassign).
+function M.arrayassign_stmt(sh, name, items, append)
+	local nb = sh.vars[name]
+	if nb and nb.ref and nb.s and nb.s:find("[", 1, true) then
+		io.stderr:write("curse: `" .. nb.s .. "': not a valid identifier\n")
+		sh.status = 1
+		return
+	end
+	return M.arrayassign(sh, name, items, append)
+end
+-- `a[i]=(…)`: a list can't be assigned to one member — reported, and the line abandoned (bash).
+function M.arrayassign_member(sh, name, index)
+	local nb = sh.vars[name]
+	if nb and nb.ref and nb.s and nb.s:find("[", 1, true) then
+		io.stderr:write("curse: `" .. nb.s .. "': not a valid identifier\n")
+		sh.status = 1
+		return
+	end
+	io.stderr:write("curse: " .. name .. "[" .. index .. "]: cannot assign list to array member\n")
+	sh.status = 1
+	error({ __curse_exit = 1, __curse_lineabort = true })
 end
 arrayassign_body = function(sh, name, items, append)
 	-- through a nameref (`declare -n r=t; declare -a r=(…)`) the literal lands in the
