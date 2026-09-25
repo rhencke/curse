@@ -2614,6 +2614,7 @@ function EF.sub_lsync(raw, lifted, expanded)
 	end
 	return ("rt.lsync(sh, %s, %s)"):format(expanded, table.concat(pairs_, ", "))
 end
+local SEG_LEN_SPECIAL = { ["#"] = 1, ["?"] = 1, ["$"] = 1, ["!"] = 1, ["-"] = 1 }
 -- Forward: mixed_expandable and seg_native are defined just below, but the mixed
 -- branch of emit_fields_into (above them) needs to see them.
 local mixed_expandable, seg_native
@@ -2751,6 +2752,10 @@ local function emit_seg(p, i, lifted, w)
 			tostring(p.q or false),
 			elems
 		)
+	end
+	if p.lenof and p.special then -- ${##} ${#?} ${#$} ${#!} ${#-}: the special value's length
+		local v = p.special == "!" and "tostring(sh.last_bg_pid or \"\")" or emit_scalar_val(p, i, lifted, false)
+		return ("{s=tostring(rt.mb_strlen(%s)),split=%s,unq=%s}"):format(v, tostring(not p.q), tostring(not p.q))
 	end
 	if p.cmdsub or p.arith or p.arithast then -- $(…) / $((…)): the value compiles (emit_word's
 		-- compile_cmdsub / native arith); quoted it is one literal segment, unquoted it word-splits
@@ -2891,9 +2896,9 @@ end
 -- CFG-unreproducible special ($LINENO/$_/…).
 function seg_native(w, lifted)
 	for _, p in ipairs(w.parts) do
-		if p.lenof then
+		if p.lenof and not (p.special and SEG_LEN_SPECIAL[p.special]) then
 			return false
-		end -- ${#x}/${##}: length, not the plain value
+		end -- ${#x}: length, not the plain value (a scalar special's ${##}/${#?}/… emit_seg renders)
 		if p.lit ~= nil or p.raw then -- literal text / inlined-param string: ok
 		elseif p.var then
 			if COMPILE_UNSAFE_VAR[p.var] and p.var ~= "LINENO" then
@@ -4970,10 +4975,10 @@ H.simple = function(cx, st, after)
 		cx.ps_guarded[st] = true
 		local v = cx.newloopvar()
 		local post = cx.newpc()
-		cx.blocks[post] = ("rt.procsub_drain(sh, %s); pc = %d"):format(v, after)
+		cx.blocks[post] = ("rt.ps_drain(sh, %s); pc = %d"):format(v, after)
 		local body = cx.flatten_stmt(st, post)
 		local pre = cx.newpc()
-		cx.blocks[pre] = ("%s = rt.procsub_fmark(sh); pc = %d"):format(v, body)
+		cx.blocks[pre] = ("%s = rt.ps_mark(sh); pc = %d"):format(v, body)
 		return pre
 	end
 	local ua = false -- a word with an unquoted $((…)), else one field (arith_guard)
@@ -5019,9 +5024,6 @@ end
 simple_compiled = function(cx, st, after)
 	local t = st.t
 	local cmd = st.words[1] and full_lit(st.words[1]) -- full literal → \-escaped builtins (\exit, \echo) dispatch
-	if st.dynname then -- (H.simple's live-dispatch variant: take the dynamic-command-word path)
-		cmd = nil
-	end
 	-- `var=x return` / `var=x :` …: under set -o posix a special builtin's prefix
 	-- assignments PERSIST — interp decides that at run time (opt_posix)
 	if cmd and st.assigns and #st.assigns > 0 and require("interp")._int.SPECIAL_BUILTIN[cmd] then
@@ -5158,10 +5160,7 @@ simple_compiled = function(cx, st, after)
 				return pn
 			end
 		end
-		-- (a live-dispatched literal declaration name keeps its assignment words: expand_args)
-		local dn = st.dynname
-		local asg = dn == "export" or dn == "declare" or dn == "typeset" or dn == "readonly" or dn == "local"
-		local argvbody, argvbody_g = field_argv(st.words, 1, cx.lifted, nil, nil, true, asg)
+		local argvbody, argvbody_g = field_argv(st.words, 1, cx.lifted, nil, nil, true)
 		local dyn_redir = nil
 		if argvbody and st.redirs then
 			dyn_redir = cx.redir_conds(st, nil) -- nil => uncompilable redir shape: fall through to full delegate
@@ -5342,7 +5341,6 @@ simple_compiled = function(cx, st, after)
 	if cmd == "local" and cx.toplevel then -- (outside a function: interp's error — unless a
 		return EF.simple_native(cx, st, after, cmd) or cx.delegate(st, after) -- function is sourcing this file)
 	end
-	local local_nonplain = false
 	if as_local then
 		-- (readonly / set -a are handled per-name at runtime by sh:localAssign — a
 		-- readonly operand fails with $?=1, a set -a local is exported — so no
@@ -5372,7 +5370,7 @@ simple_compiled = function(cx, st, after)
 			end
 		end
 		if not plain and not flagsonly then
-			local_nonplain = true -- (the general declaration path below, decl_gen — or delegate)
+			return EF.simple_native(cx, st, after, cmd) or cx.delegate(st, after)
 		end
 	end
 	-- `unset map["$key"]`: the quoted subscript parts must not be expanded twice — interp's
@@ -5544,7 +5542,7 @@ simple_compiled = function(cx, st, after)
 	local decl_gen = false
 	if (DECL_BUILTIN[cmd] or cmd == "local") and st.assigns == nil and not st.arrayargs and not isfunc
 		and not (cmd == "local" and cx.toplevel) and not decl_native then
-		if local_nonplain or not as_local then
+		if not as_local then
 			decl_gen = true
 		else
 			for j = 2, #st.words do
@@ -5554,9 +5552,6 @@ simple_compiled = function(cx, st, after)
 				end
 			end
 		end
-	end
-	if local_nonplain and not decl_gen then
-		return cx.delegate(st, after)
 	end
 	-- Top-level declaration builtin WITH a literal `name=value` arg (`export FOO=bar`,
 	-- `declare -i n=5`, `export PATH=$PATH:/x`): build argv statically, expanding each
@@ -7713,7 +7708,7 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
 		if cx.has_procsub({ redirs = st.redirs }) then
 			psv = cx.newloopvar()
 			ps = cx.newpc()
-			cx.blocks[ps] = ("rt.procsub_drain(sh, %s); pc = %d"):format(psv, after)
+			cx.blocks[ps] = ("rt.ps_drain(sh, %s); pc = %d"):format(psv, after)
 			after = ps
 		end
 		local p = cx.delegate(st, after, {
@@ -7730,7 +7725,7 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
 		EF.cur_line = sl
 		if ps then
 			local pre = cx.newpc()
-			cx.blocks[pre] = ("%s = rt.procsub_fmark(sh); pc = %d"):format(psv, p)
+			cx.blocks[pre] = ("%s = rt.ps_mark(sh); pc = %d"):format(psv, p)
 			return pre
 		end
 		return p
