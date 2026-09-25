@@ -59,7 +59,9 @@ local function read_line(prompt)
 			if ch == "\n" then
 				return table.concat(buf)
 			end
-			buf[#buf + 1] = ch
+			if ch ~= "\0" then -- (shell_getc drops NUL bytes from the input)
+				buf[#buf + 1] = ch
+			end
 		end
 	end
 	return io.read("*l")
@@ -76,7 +78,16 @@ local function needs_more(buf)
 	local ok, r = pcall(require("parser").parse, buf)
 	local perr = (not ok and tostring(r)) or (r and r.stmts and r.stmts[1] and r.stmts[1].t == "parse_error"
 		and tostring(r.stmts[1].msg)) or ""
-	return perr:find("unexpected end of file", 1, true) ~= nil or perr:find("unexpected EOF", 1, true) ~= nil
+	if perr:find("unexpected end of file", 1, true) ~= nil or perr:find("unexpected EOF", 1, true) ~= nil then
+		return true
+	end
+	-- a here-document whose body hasn't all been read yet (`cat <<E` and no `E` line)
+	for _, st in ipairs(ok and r and r.stmts or {}) do
+		if st.t == "warn" and tostring(st.msg):find("delimited by end-of-file", 1, true) then
+			return true
+		end
+	end
+	return false
 end
 
 -- Expand PS1/PS2 escapes for the prompt via the shared, full prompt decoder.
@@ -115,6 +126,9 @@ function M.run(sh)
 		end)
 	end
 	local buf = ""
+	-- (a script read from stdin: each command runs with its real line numbers — lno is
+	-- the lines read so far, bline the line the command in `buf` starts on)
+	local lno, bline, eofs = 0, 1, 0
 	sh.defer_exit_trap = true -- the EXIT trap fires once, when the session ends
 	while true do
 		if buf == "" then -- before each PRIMARY prompt, bash runs $PROMPT_COMMAND
@@ -132,10 +146,26 @@ function M.run(sh)
 				io.stderr:write("\n")
 			end -- newline to stderr, like the prompt
 			if buf:match("%S") then -- an unfinished command at EOF: run it so the syntax error shows
-				pcall(interp.run_lazy, sh, buf)
+				-- (shell_getc ends the input with a newline: a final `\` is a continuation)
+				pcall(interp.run_lazy, sh, buf .. "\n", nil, not interactive and bline or nil)
 				io.flush()
+				buf = ""
+			elseif interactive and sh.opt_ignoreeof and buf == "" then
+				-- (bash's handle_eof_input_unit: $IGNOREEOF EOFs in a row are refused)
+				local lim = sh.vars.IGNOREEOF and sh:get("IGNOREEOF") or ""
+				lim = lim:match("^%d+$") and tonumber(lim) or 10
+				if eofs < lim then
+					eofs = eofs + 1
+					io.stderr:write('Use "' .. (sh.login_shell and "logout" or "exit") .. '" to leave the shell.\n')
+					goto continue
+				end
 			end
 			break
+		end
+		eofs = 0
+		lno = lno + 1
+		if buf == "" then
+			bline = lno
 		end
 		buf = (buf == "") and line or (buf .. "\n" .. line)
 		if buf:match("%S") and needs_more(buf) then
@@ -159,7 +189,7 @@ function M.run(sh)
 				-- (a hot loop typed here runs compiled — the tier's fragment hook — and a hot
 				-- function compiles standalone: tier.fn_hot)
 				require("tier")
-				local ok, err = pcall(interp.run_lazy, sh, buf, interp.SUBHOOK)
+				local ok, err = pcall(interp.run_lazy, sh, buf, interp.SUBHOOK, not interactive and bline or nil)
 				if sh.exit_requested or (not ok and type(err) == "table" and err.__curse_exit) then
 					io.flush()
 					break -- `exit` in the REPL
@@ -170,6 +200,7 @@ function M.run(sh)
 			end
 			buf = ""
 		end
+		::continue::
 	end
 	sh.defer_exit_trap = nil
 	pcall(interp.run_exit_trap, sh)

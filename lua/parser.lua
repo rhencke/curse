@@ -2555,6 +2555,7 @@ local function is_blank(ch)
 	return ch == " " or ch == "\t"
 end
 -- the characters a word scan must look at (anything else just continues the word)
+local LTR_SEEN = false -- a $"…" was read (M.parse: the program's lines translate as read)
 local WORD_SPECIAL = "[\\()\"'$<>|&`; \t\n?*+@!]"
 -- bash's reserved words (word_token_alist)
 local RESERVED = { ["if"] = true, ["then"] = true, ["else"] = true, ["elif"] = true, ["fi"] = true,
@@ -3085,7 +3086,7 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs, xg)
 	end
 	local function word(stop_paren, stop_cmp) -- read one shell word, keeping quotes and $(( )) / ${ } / $( ) balanced
 		ws()
-		local start, line0, lfix = i, line, 0
+		local start, line0, lfix, ldq = i, line, 0, nil
 		while i <= n do
 			-- (a run of ordinary characters is part of the word: jump to the next one that
 			-- could matter — one find instead of a per-character pattern test)
@@ -3103,7 +3104,12 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs, xg)
 				i = i + 2
 			elseif stop_paren and (c == ")" or c == "(") then
 				break
+			elseif c == "$" and src:byte(i + 1) == 34 then
+				i = i + 1
+				ldq = i -- (a $"…": its text is translated once the close is found)
+				LTR_SEEN = true
 			elseif c == '"' then -- double quotes: honor \" and skip $(..)/$((..))/`..`
+				local q0 = i
 				i = i + 1 -- (their inner " are not the close)
 				while i <= n and src:sub(i, i) ~= '"' do
 					local d = src:sub(i, i)
@@ -3142,6 +3148,16 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs, xg)
 					error("unexpected EOF while looking for matching `\"'")
 				end -- unterminated "
 				i = i + 1 -- past closing quote
+				if ldq == q0 and sh then
+					-- bash's locale_expand, as the line is READ (the locale and $TEXTDOMAIN
+					-- then in force): the translation replaces the text, still in "…"
+					local t = require("gettext").translate(sh, src:sub(q0 + 1, i - 2))
+					if t then
+						src = src:sub(1, q0) .. t .. src:sub(i - 1)
+						n = #src
+						i = q0 + #t + 2
+					end
+				end
 			elseif c == "'" then -- single quotes: everything literal, no escapes
 				i = i + 1
 				while i <= n and src:sub(i, i) ~= "'" do
@@ -3281,7 +3297,7 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs, xg)
 		ws()
 		local s, e = src:find("^[%a_][%w_]*", i)
 		-- (a reserved word is a whole token: `if=1`, `do.x`, `fi-2` are ordinary words)
-		local w = s and not src:find("^[^%s;&|()<>]", e + 1) and src:sub(s, e) or nil
+		local w = s and not src:find("^[^ \t\n;&|()<>]", e + 1) and src:sub(s, e) or nil
 		i = save
 		pk_i, pk_src, pk_w, pk_dl = save, src, w, line - l0
 		return w
@@ -3296,12 +3312,12 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs, xg)
 		if src:sub(i, i) == "{" then
 			return brace_group()
 		end
-		if peekword() == "do" and not src:sub(i + 2, i + 2):match("[^%s;&|()<>]") then
+		if peekword() == "do" and not src:sub(i + 2, i + 2):match("[^ \t\n;&|()<>]") then
 			i = i + 2
 		elseif i > n then
 			error("syntax error: unexpected end of file")
 		else -- (bash: the token where `do` or `{` belongs)
-			local tok = src:match("^[^%s;&|()<>]+", i) or src:match("^[;&|]+", i) or src:sub(i, i)
+			local tok = src:match("^[^ \t\n;&|()<>]+", i) or src:match("^[;&|]+", i) or src:sub(i, i)
 			error("syntax error near `" .. tok .. "'")
 		end
 		local body, term = parse_stmts({ done = true })
@@ -3315,8 +3331,8 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs, xg)
 		if i > n then
 			error("syntax error: unexpected end of file")
 		end
-		if src:sub(i, i) ~= "{" or src:find("^[^%s;&|()<>]", i + 1) then -- (bash: the token found instead)
-			local tok = src:match("^[^%s;&|()<>]+", i) or peekword() or src:sub(i, i)
+		if src:sub(i, i) ~= "{" or src:find("^[^ \t\n;&|()<>]", i + 1) then -- (bash: the token found instead)
+			local tok = src:match("^[^ \t\n;&|()<>]+", i) or peekword() or src:sub(i, i)
 			error("syntax error near `" .. (tok ~= "" and tok or "newline") .. "'")
 		end
 		i = i + 1
@@ -3346,7 +3362,7 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs, xg)
 		-- any compound command is a body (bash's function_body: shell_command): `f() if …
 		-- fi`, `f() for …`, `f() [[ … ]]`, `f() (( … ))`, `function f case … esac`
 		local kw = src:match("^[%a]+", i)
-		if (kw and FBODY_KW[kw] and not src:find("^[^%s;&|()<>]", i + #kw))
+		if (kw and FBODY_KW[kw] and not src:find("^[^ \t\n;&|()<>]", i + #kw))
 			or src:find("^%[%[[ \t\n]", i) or src:sub(i, i + 1) == "((" then
 			local node = parse_command()
 			if node.t ~= "subshell" then
@@ -3841,7 +3857,7 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs, xg)
 		-- coproc [NAME] compound-command | coproc simple-command: an async command wired to
 		-- the shell by two pipes. A NAME (default COPROC) is only allowed before a COMPOUND
 		-- command — before a simple one, that word is the command (bash).
-		if peekword() == "coproc" and not src:find("^[^%s;&|()<>]", i + 6) and src:sub(i, i + 5) == "coproc" then
+		if peekword() == "coproc" and not src:find("^[^ \t\n;&|()<>]", i + 6) and src:sub(i, i + 5) == "coproc" then
 			local k = i + 6
 			while is_blank(src:sub(k, k)) do
 				k = k + 1
@@ -3865,7 +3881,7 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs, xg)
 			local name = "COPROC"
 			if not compound_at(i) then
 				-- (any word: an invalid NAME — `coproc @ {…}` — is a runtime error, bash)
-				local s, e = src:find("^[^%s;&|()<>]+", i)
+				local s, e = src:find("^[^ \t\n;&|()<>]+", i)
 				-- (an assignment word is never the NAME: it starts a simple command)
 				if s and not src:find("^[%a_][%w_]*%+?=", s) and not src:find("^[%a_][%w_]*%b[]%+?=", s) then
 					local k = e + 1
@@ -4002,7 +4018,7 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs, xg)
 				if src:byte(ni - 1) ~= 41 then
 					-- `for ((…)` closed by a lone `)`: bash's parse_dparen fails and its re-read
 					-- as `(` tokens stops at the word after the `)`, else at the header's tail
-					local nx = src:match("^[ \t]*([^%s;&|()<>]+)", ni - 1)
+					local nx = src:match("^[ \t]*([^ \t\n;&|()<>]+)", ni - 1)
 					error({ __curse_perr = true, exact = true, line = line, msg = "syntax error near `"
 						.. (nx or ((body:match(".*(;.*)$") or ("((" .. body)) .. ")")) .. "'" }, 0)
 				end
@@ -4105,7 +4121,7 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs, xg)
 			local words = {}
 			try_alias(false)
 			do -- (after the name: `in`, `do`, or a separator — `for x y` is an error)
-				local pw, c = peekword() or src:match("^[^%s;&|()<>]+", i), src:sub(i, i)
+				local pw, c = peekword() or src:match("^[^ \t\n;&|()<>]+", i), src:sub(i, i)
 				if pw and pw ~= "" and pw ~= "in" and pw ~= "do" and not c:match("[;\n&|()]") and i <= n then
 					error("syntax error near `" .. pw .. "'")
 				end
@@ -4396,7 +4412,7 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs, xg)
 			return { t = "dbracket", line = line, expr = parse_dbracket(toks, quoted), redirs = tail_redirs() }
 		end
 		-- brace group { list; }  and subshell ( list )  — optional trailing redirs
-		if src:sub(i, i) == "{" and (i + 1 > n or src:find("^[%s;&|()<>]", i + 1)) then
+		if src:sub(i, i) == "{" and (i + 1 > n or src:find("^[ \t\n;&|()<>]", i + 1)) then
 			i = i + 1
 			local body, term = parse_stmts({ ["}"] = true })
 			if term ~= "}" then
@@ -4574,13 +4590,14 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs, xg)
 						local prev = table.concat(patstr):match("(%S)%s*$")
 						local nx = src:sub(k, k)
 						if prev and prev ~= "|" and nx ~= "" and nx ~= "|" and nx ~= ")" and nx ~= "\n" then
-							error("syntax error near `" .. (src:match("^[^%s;&|()<>]+", k) or nx) .. "'")
+							error("syntax error near `" .. (src:match("^[^ \t\n;&|()<>]+", k) or nx) .. "'")
 						end
 					end
 					if c == "\\" then -- a backslash escapes the next char (incl. a quote or `)`):
 						patstr[#patstr + 1] = src:sub(i, i + 1)
 						i = i + 2 -- copy both, don't treat `\'` as a quote
 					elseif c == "'" or c == '"' then
+						local q0, k0 = i, #patstr + 1
 						patstr[#patstr + 1] = c
 						i = i + 1
 						while i <= n and src:sub(i, i) ~= c do
@@ -4589,6 +4606,18 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs, xg)
 						end
 						if i > n then
 							error("unexpected EOF while looking for matching `" .. c .. "'")
+						end
+						if c == '"' and patstr[k0 - 1] == "$" then
+							LTR_SEEN = true
+						end
+						if c == '"' and sh and patstr[k0 - 1] == "$" then -- a $"…" pattern: translated
+							local t = require("gettext").translate(sh, src:sub(q0 + 1, i - 1))
+							if t then
+								for k = #patstr, k0 + 1, -1 do
+									patstr[k] = nil
+								end
+								patstr[k0 + 1] = t
+							end
 						end
 						patstr[#patstr + 1] = src:sub(i, i)
 						i = i + 1
@@ -4784,7 +4813,7 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs, xg)
 					end
 					local c2 = src:sub(k, k)
 					error("syntax error near `" .. ((c2 == "" or c2 == "\n") and "newline"
-						or src:match("^[^%s;&|()<>]+", k) or src:match("^[;&|<>]+", k) or c2) .. "'")
+						or src:match("^[^ \t\n;&|()<>]+", k) or src:match("^[;&|<>]+", k) or c2) .. "'")
 				end
 				error("syntax error near `('")
 			elseif c == "\n" or c == ";" or c == "#" or c == "&" or c == "|" or c == "(" or c == ")" then
@@ -4938,7 +4967,7 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs, xg)
 				timed = true
 				i = i + 4
 				ws()
-				while src:sub(i, i + 1) == "-p" and not src:find("^[^%s;&|()<>]", i + 2) do
+				while src:sub(i, i + 1) == "-p" and not src:find("^[^ \t\n;&|()<>]", i + 2) do
 					timed_p = true
 					i = i + 2
 					ws()
@@ -4989,7 +5018,7 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs, xg)
 			-- there is a syntax error (bash: `{ :; } echo`, `f() { :; } >x { echo; }`).
 			local last = cmds[#cmds]
 			if last and COMPOUND_T[last.t] and src:sub(i, i) ~= "#" then
-				local w = src:match("^[^%s;&|()<>]+", i)
+				local w = src:match("^[^ \t\n;&|()<>]+", i)
 				-- (a closing keyword only when it closes what's being read — at the top
 				-- level `while …; done done` is an error before anything runs)
 				if w and (not AFTER_COMPOUND[w] or not (cur_stopset and cur_stopset[w])) then
@@ -5117,8 +5146,8 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs, xg)
 				try_alias(true)
 				cmd_prex = i
 			end
-			if stopset["}"] and src:sub(i, i) == "}" then
-				i = i + 1
+			if stopset["}"] and src:sub(i, i) == "}" and not src:find("^[^ \t\n;&|()<>]", i + 1) then
+				i = i + 1 -- (a reserved word is a whole token: `}x`, `}\r` are ordinary words)
 				return stmts, "}"
 			end
 			if stopset[")"] and src:sub(i, i) == ")" then
@@ -5359,7 +5388,8 @@ end
 -- expansion consult the live runtime table (for eval/source/$() at runtime); the
 -- compiler passes none, so it tracks aliases deterministically from source.
 function M.parse(src, sh, aenv, noalias, posix, line0, line1, xg)
-	local saved_env, sprex, spdq = ALIAS_ENV, COMSUB_PREX, POSIX_DQ
+	local saved_env, sprex, spdq, sltr = ALIAS_ENV, COMSUB_PREX, POSIX_DQ, LTR_SEEN
+	LTR_SEEN = false
 	local nextf = make_parser(src, sh, aenv, noalias, posix, line0, line1, xg) -- yields logical-line groups { stmts, perr }
 	local stmts, lines = {}, {}
 	while true do
@@ -5385,7 +5415,10 @@ function M.parse(src, sh, aenv, noalias, posix, line0, line1, xg)
 		end
 	end
 	ALIAS_ENV, COMSUB_PREX, POSIX_DQ = saved_env, sprex, spdq
-	return { stmts = stmts, lines = lines }
+	-- (ltrans: a $"…" may be translated — by the live reader, as each line is read)
+	local ltrans = LTR_SEEN or nil
+	LTR_SEEN = sltr or LTR_SEEN
+	return { stmts = stmts, lines = lines, ltrans = ltrans }
 end
 
 -- Lazy/incremental parse: returns an iterator yielding one top-level statement

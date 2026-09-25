@@ -218,7 +218,7 @@ return function(sh, cmd, args, hook, tcb)
 							C.unsetenv(dn)
 						end -- drop from the process env too
 						if rt.LOCALE_VARS[dn] then
-							rt.reset_locale(sh)
+							rt.reset_locale(sh, dn)
 						end -- re-apply locale (bash)
 						if dn == "PATH" and sh.hashcache then
 							sh.hashcache = {} -- (sv_path: unsetting PATH flushes the hash table)
