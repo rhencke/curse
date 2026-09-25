@@ -930,6 +930,18 @@ function M.arith_textual_eval(sh, raw, depth0)
 	end
 	return v
 end
+-- The current value an `op=` / `++` / `--` reads: like a `var` node, a value that is an
+-- expression is evaluated recursively (`x="1+2"; (( x *= 2 ))` is 6 — expr.c expr_streval)
+local function arith_cur(sh, name, iv)
+	if iv then
+		return arith_resolve(sh, sh:array_get(name, iv))
+	end
+	local b = sh.vars[sh:deref(name)]
+	if b and b.n ~= nil and b.s == nil and not b.arr then
+		return b.n
+	end
+	return arith_resolve(sh, sh:get(name))
+end
 eval = function(sh, e)
 	local k = e.k
 	if k == "matherr" then -- a deferred arith parse error (bad lvalue): non-fatal in (( ))
@@ -1110,7 +1122,7 @@ eval = function(sh, e)
 		local iv = e.idxraw and arith_key(sh, e.name, e.idx, e.idxraw) or nil
 		if e.op ~= "=" then
 			arith_nounset(sh, e.name) -- `x += …` reads x first
-			local cur = iv and rt.arith_num(sh:array_get(e.name, iv)) or sh:aget(e.name)
+			local cur = arith_cur(sh, e.name, iv)
 			local o = e.op:sub(1, #e.op - 1) -- strip the trailing '=' (`<<=` -> `<<`)
 			if o == "+" then
 				v = cur + v
@@ -1150,11 +1162,11 @@ eval = function(sh, e)
 		arith_nounset(sh, e.name) -- x++ / x-- read x first
 		if e.idxraw then
 			local iv = arith_key(sh, e.name, e.idx, e.idxraw)
-			local cur = rt.arith_num(sh:array_get(e.name, iv))
+			local cur = arith_cur(sh, e.name, iv)
 			sh:array_set(e.name, iv, rt.i64_to_str(cur + i64(e.d)))
 			return cur
 		end
-		local cur = sh:aget(e.name)
+		local cur = arith_cur(sh, e.name)
 		sh:aset(e.name, cur + i64(e.d))
 		return cur
 	end
@@ -1162,11 +1174,11 @@ eval = function(sh, e)
 		arith_nounset(sh, e.name) -- ++x / --x read x first
 		if e.idxraw then
 			local iv = arith_key(sh, e.name, e.idx, e.idxraw)
-			local v = rt.arith_num(sh:array_get(e.name, iv)) + i64(e.d)
+			local v = arith_cur(sh, e.name, iv) + i64(e.d)
 			sh:array_set(e.name, iv, rt.i64_to_str(v))
 			return v
 		end
-		local v = sh:aget(e.name) + i64(e.d)
+		local v = arith_cur(sh, e.name) + i64(e.d)
 		return sh:aset(e.name, v)
 	end
 	error("interp: bad arith node " .. tostring(k))
@@ -6112,7 +6124,18 @@ exec_stmt = function(sh, st, hook)
 				P.arith_cmd = sv
 				error({ __curse_exit = 1, __curse_experr = true })
 			end
-			return eval(sh, node)
+			-- (an arithmetic error names `((` and ends the loop with status 1; the shell goes on)
+			local sv = P.arith_cmd
+			P.arith_cmd = "(("
+			local ok, v = pcall(eval, sh, node)
+			P.arith_cmd = sv
+			if not ok then
+				if type(v) == "table" and v.__curse_matherr and not v.__curse_subscript then
+					error({ __curse_exit = 1, __curse_experr = true })
+				end
+				error(v, 0)
+			end
+			return v
 		end
 		local bodystatus = 0 -- a loop's status is its last body command's (0 if none)
 		sh.loopdepth = (sh.loopdepth or 0) + 1

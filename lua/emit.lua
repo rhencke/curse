@@ -5486,7 +5486,7 @@ EF.arith_status = function(expr, lifted)
 		-- flagged read fault) as $?=1 and continue, like interp; re-raise anything else.
 		return (
 			"do local __ia = sh.in_arithcmd; sh.arithfault = false; sh.in_arithcmd = true; local __ok, __v = pcall(function() local __ar = 0LL; %s; return (__ar ~= 0LL) and 0 or 1 end); sh.in_arithcmd = __ia; "
-			.. "if not __ok then if type(__v) == 'table' and __v.__curse_matherr and not __v.__curse_subscript then sh.status = 1 else error(__v) end "
+			.. "if not __ok then if type(__v) == 'table' and __v.__curse_matherr and not __v.__curse_subscript then sh.status = 1; sh.arithfault = true else error(__v) end "
 			.. "elseif sh.arithfault then sh.status = 1 else sh.status = __v end end"
 		):format(code)
 	elseif arith_can_error(expr, lifted) then
@@ -5573,9 +5573,23 @@ H.forc = function(cx, st, after)
 	local bodyentry = cx.flatten_list(st.body, stepp)
 	cx.loopstack[#cx.loopstack] = nil
 	local d = dbg(st) -- DEBUG fires at the for(( header for the init, each cond, and each step (bash)
-	cx.blocks[stepp] = d
-		.. (st.step and emit_arith_stmt(st.step, cx.lifted) .. "; " or "")
-		.. ("pc = %d"):format(condp)
+	-- An init/cond/step that can fail (÷0, a bad value, …) evaluates like the (( )) command
+	-- (EF.arith_status, `((: ` texts) keeping $?; an error ends the loop with status 1 (bash's
+	-- execute_arith_for_command: expok == 0). Error-free arithmetic stays native.
+	local function guarded(e, okgo)
+		EF.acmd = "(("
+		local code = EF.arith_status(e, cx.lifted)
+		EF.acmd = nil
+		return ("local __st = sh.status; %s; local __as = sh.status; if sh.arithfault then sh.status = 1; pc = %d else sh.status = __st; %s end"):format(
+			code, after, okgo)
+	end
+	if st.step and arith_can_error(st.step, cx.lifted) then
+		cx.blocks[stepp] = d .. guarded(st.step, ("pc = %d"):format(condp))
+	else
+		cx.blocks[stepp] = d
+			.. (st.step and emit_arith_stmt(st.step, cx.lifted) .. "; " or "")
+			.. ("pc = %d"):format(condp)
+	end
 	-- (a loop that runs no iteration has status 0; else its last body command's — `ran`
 	-- says which, reset each time the loop is entered; 1 at an OSR entry, which skips the
 	-- reset — that loop has been iterating in the interpreter)
@@ -5583,16 +5597,24 @@ H.forc = function(cx, st, after)
 	local bodyp, exitp = cx.newpc(), cx.newpc()
 	cx.blocks[bodyp] = ("%s = 1; pc = %d"):format(ran, bodyentry)
 	cx.blocks[exitp] = ("if %s == 0 then sh.status = 0 end; pc = %d"):format(ran, after)
-	cx.blocks[condp] = d
-		.. ("if %s then pc = %d else pc = %d end"):format(
-			st.cond and emit_bool(st.cond, cx.lifted) or "true",
-			bodyp,
-			exitp
-		)
+	if st.cond and arith_can_error(st.cond, cx.lifted) then
+		cx.blocks[condp] = d .. guarded(st.cond, ("if __as == 0 then pc = %d else pc = %d end"):format(bodyp, exitp))
+	else
+		cx.blocks[condp] = d
+			.. ("if %s then pc = %d else pc = %d end"):format(
+				st.cond and emit_bool(st.cond, cx.lifted) or "true",
+				bodyp,
+				exitp
+			)
+	end
 	local ep = cx.newpc()
 	if st.init then
 		local ip = cx.newpc()
-		cx.blocks[ip] = d .. emit_arith_stmt(st.init, cx.lifted) .. ("; pc = %d"):format(condp)
+		if arith_can_error(st.init, cx.lifted) then
+			cx.blocks[ip] = d .. guarded(st.init, ("pc = %d"):format(condp))
+		else
+			cx.blocks[ip] = d .. emit_arith_stmt(st.init, cx.lifted) .. ("; pc = %d"):format(condp)
+		end
 		cx.blocks[ep] = ("%s = 0; pc = %d"):format(ran, ip)
 	else
 		cx.blocks[ep] = ("%s = 0; pc = %d"):format(ran, condp)
