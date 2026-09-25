@@ -2137,7 +2137,7 @@ function Shell:capture_src(src, backtick, noalias)
 				local c = f:read("*a") or ""
 				f:close()
 				self.status, self.last_cmdsub_status = 0, 0
-				return (c:gsub("%z", ""):gsub("\n+$", ""))
+				return (M.cmdsub_nul(c):gsub("\n+$", ""))
 			end
 			io.stderr:write("curse: " .. path .. ": No such file or directory\n")
 			self.status, self.last_cmdsub_status = 1, 1
@@ -2306,7 +2306,7 @@ function Shell:capture_inproc(backtick, runner, capfd, ctx)
 	self.last_cmdsub_status = self.status -- for a command whose argv is empty after expansion
 	self.ncs = (self.ncs or 0) + 1 -- (substitutions performed: an assignment's status is the last one's)
 	-- bash strips NUL bytes from command-substitution output ("ignored null byte")
-	local r = readcap():gsub("%z", ""):gsub("\n+$", "")
+	local r = M.cmdsub_nul(readcap()):gsub("\n+$", "")
 	flush_deferred(self)
 	return r
 end
@@ -3149,6 +3149,15 @@ end
 -- $(< file) / `< file`: bash reads the file's contents (a faster $(cat file)) — a pure
 -- read, no fork. NUL bytes stripped, trailing newlines stripped, status 0; a missing
 -- file is status 1 + diagnostic. The compiled tier calls this with the expanded path.
+-- bash drops NUL bytes from a substitution's output, warning once per substitution
+-- (subst.c read_comsub)
+function M.cmdsub_nul(c)
+	if c:find("%z") then
+		io.stderr:write("curse: warning: command substitution: ignored null byte in input\n")
+		return (c:gsub("%z", ""))
+	end
+	return c
+end
 function Shell:capture_file(path)
 	local f = path ~= "" and M.open_read(path)
 	if f then
@@ -3156,7 +3165,7 @@ function Shell:capture_file(path)
 		f:close()
 		self.status = 0
 		self.last_cmdsub_status, self.ncs = 0, (self.ncs or 0) + 1
-		return (c:gsub("%z", ""):gsub("\n+$", ""))
+		return (M.cmdsub_nul(c):gsub("\n+$", ""))
 	end
 	io.stderr:write("curse: " .. path .. ": No such file or directory\n")
 	self.status = 1
@@ -10541,6 +10550,18 @@ function M.ansi_unescape(s, mode)
 			elseif d == "v" then
 				out[#out + 1] = "\11"
 				i = i + 2
+			elseif d == "x" and ansi_c and s:byte(i + 2) == 123 then -- $'\x{HHH…}' (strtrans.c): any
+				-- number of hex digits, the low byte kept; the closing } is optional
+				local hex = s:match("^%x*", i + 3)
+				local c = 0
+				for k = 1, #hex do
+					c = (c * 16 + tonumber(hex:sub(k, k), 16)) % 256
+				end
+				out[#out + 1] = string.char(c)
+				i = i + 3 + #hex
+				if s:byte(i) == 125 then
+					i = i + 1
+				end
 			elseif d == "x" then
 				local hex = s:match("^%x%x?", i + 2)
 				if hex then
