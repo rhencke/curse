@@ -10204,8 +10204,13 @@ function Shell:apply_str_op(op, val, arg, arg2, ltxt)
 		if arg == "L" then
 			return fold_case(val, "?", false, true)
 		end -- downcase all
-		if arg == "E" then
-			return M.ansi_unescape(val)
+		if arg == "E" then -- like $'…' (ansiexpand: ansicstr flags 2), cut at a NUL
+			if not val:find("\\", 1, true) then
+				return val
+			end
+			local r = M.ansi_unescape(val, true)
+			local z = r:find("\0", 1, true)
+			return z and r:sub(1, z - 1) or r
 		end
 		return val
 	end
@@ -10332,8 +10337,8 @@ function M.ansi_unescape(s, mode)
 			elseif ansi_c and d == "'" then -- (only $'…' knows \' and \"; echo -e / %b keep them)
 				out[#out + 1] = "'"
 				i = i + 2
-			elseif ansi_c and d == '"' then
-				out[#out + 1] = '"'
+			elseif ansi_c and (d == '"' or d == "?") then
+				out[#out + 1] = d
 				i = i + 2
 			elseif d == "a" then
 				out[#out + 1] = "\7"
