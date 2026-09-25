@@ -1896,6 +1896,9 @@ end
 -- glob PATTERN context (${v/pat/repl}, case, [[ == ]]): glob metacharacters.
 local PAT_META = "[%*%?%[%]\\%(%)%|%+%@%!%-%^]"
 expand_pattern = function(sh, w, xt)
+	if xt == true then
+		xt = nil -- (a caller sharing expand_word's signature passes its `true` flag)
+	end
 	-- a word-initial `~` tilde-expands (bash: `case ~ in ~)`), and the directory it
 	-- yields matches literally
 	local p1 = w.parts[1]
