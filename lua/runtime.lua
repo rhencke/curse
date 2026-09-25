@@ -2557,6 +2557,7 @@ function M.iso_vhard(sh, res)
 			return v
 		end
 	end
+	return sh.iso_vhard_base and sh.iso_vhard_base[res] -- (a stage: its subshell's, stage_clone)
 end
 
 -- Virtual pids: $BASHPID of an in-process subshell. Above the kernel's pid_max, so no
@@ -3564,6 +3565,15 @@ function Shell:stage_clone()
 	end
 	c.subdepth = (self.subdepth or 0) + 1 -- (a stage is a subshell)
 	c.iso_ctx, c.stage_pid, c.vpid, c.rpid = {}, tonumber(C.getpid()), nil, nil
+	if self.iso_ctx and #self.iso_ctx > 0 then -- (a subshell's virtual hard limits stay in force in its stages)
+		local vb = self.iso_vhard_base and shallowcopy(self.iso_vhard_base) or {}
+		for _, ctx in ipairs(self.iso_ctx) do
+			for res, v in pairs(ctx.vhard or {}) do
+				vb[res] = v
+			end
+		end
+		c.iso_vhard_base = next(vb) and vb or nil
+	end
 	c.foreign_pids = M.foreign_jobs(self) -- (`jobs` lists the parent's; `wait` can't wait on them)
 	local vars = {}
 	for k, b in pairs(self.vars) do

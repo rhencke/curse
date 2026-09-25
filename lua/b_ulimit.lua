@@ -67,124 +67,125 @@ return function(sh, cmd, args, hook, tcb)
 			end
 			return (tostring(v / r[2]):gsub("[UuLl]+$", "")) -- drop LuaJIT's cdata "ULL" suffix
 		end
-		local flags, value = {}, nil
+		-- Options as bash's internal_getopt with ulimit's optstring: -a, -S/-H modifiers, and
+		-- each resource letter taking an OPTIONAL argument — the rest of its word, or the next
+		-- word unless that looks like an option (bash's `;`). Each (letter, arg) is a command.
+		local cmds, allmode = {}, false
 		local j = 2
-		while args[j] do
+		while args[j] and args[j]:sub(1, 1) == "-" and #args[j] > 1 do
 			local a = args[j]
+			j = j + 1
 			if a == "--" then
-				j = j + 1
-				break
-			elseif a == "-a" or a == "--all" then
-				flags = { "@all" }
-				j = j + 1
-			elseif a:sub(1, 1) == "-" and #a > 1 then
-				for k = 2, #a do
-					local f = a:sub(k, k)
-					if f == "a" then
-						flags = { "@all" }
-					elseif f == "H" then
-						hardflag = true
-					elseif f == "S" then
-						softflag = true
-					elseif RES[f] then
-						flags[#flags + 1] = f
-					else
-						return rt.bad_option(sh, "ulimit", "-" .. f)
-					end
-				end
-				j = j + 1
-			else
 				break
 			end
+			local k = 2
+			while k <= #a do
+				local f = a:sub(k, k)
+				if f == "a" then
+					allmode = true
+				elseif f == "H" then
+					hardflag = true
+				elseif f == "S" then
+					softflag = true
+				elseif RES[f] then
+					local arg
+					if k < #a then
+						arg, k = a:sub(k + 1), #a
+					elseif args[j] and not (args[j]:sub(1, 1) == "-" and #args[j] > 1) then
+						arg, j = args[j], j + 1
+					end
+					cmds[#cmds + 1] = { f = f, arg = arg }
+				else
+					return rt.bad_option(sh, "ulimit", "-" .. f)
+				end
+				k = k + 1
+			end
 		end
-		value = args[j] -- a trailing value; any further args are ignored (bash)
-		if #flags == 0 then
-			flags = { "f" }
-		end -- default resource is -f
-		local allmode = false
-		for _, f in ipairs(flags) do
-			allmode = allmode or f == "@all"
+		if not allmode then
+			if #cmds == 0 then -- (`ulimit N` is `ulimit -f N`)
+				cmds[1] = { f = "f", arg = args[j] }
+				j = j + 1
+			elseif args[j] and cmds[#cmds].arg == nil then -- (posix: an operand is the last
+				cmds[#cmds].arg = args[j] -- command's argument)
+			end
 		end
-		if allmode then
-			flags = { "@all" }
-		end
-		if allmode then
-			flags[#flags] = nil
-		end
-		if allmode then
-			value = nil
-		end -- `ulimit -a` ignores a trailing value (bash prints all, status 0)
-		if value ~= nil then -- SET each named resource
-			-- with neither -S nor -H, bash sets BOTH; -S sets soft, -H sets hard.
+		-- SET one resource (bash's ulimit_internal): with neither -S nor -H both limits
+		local function set_one(fl, value)
+			local r = RES[fl]
 			local setsoft, sethard = softflag or not hardflag, hardflag or not softflag
-			sh.status = 0
-			for _, fl in ipairs(flags) do
-				local r = RES[fl]
-				local nv
-				if value == "unlimited" then
-					nv = INF
-				elseif value:match("^%d+$") then
-					local num = tonumber(value)
-					if num == nil or num * r[2] > 9223372036854775807 then
-						sh.status = 0
-						return
-					end -- overflow: bash leaves it
-					nv = ffi.cast("uint64_t", num) * ffi.cast("uint64_t", r[2])
-				else
-					io.stderr:write("curse: ulimit: " .. value .. ": invalid number\n")
-					sh.status = 1
-					return
+			local nv
+			if value == "hard" or value == "soft" then
+				if C.getrlimit(r[1], rl) ~= 0 then
+					return false
 				end
-				if r[1] < 0 or C.getrlimit(r[1], rl) ~= 0 then
-					sh.status = 1
-				else
-					-- in an in-process subshell a hard limit stays virtual (lowering the real one
-					-- could never be undone); the soft limit is real, within it
-					local ctx = rt.iso_cur(sh) and rt.iso_save_rlimits(sh)
-					local vh = ctx and (rt.iso_vhard(sh, r[1]) or rl[0].rlim_max)
-					local err
-					if setsoft then
-						rl[0].rlim_cur = nv
-					end
-					if sethard and ctx then
-						if nv > vh and C.geteuid() ~= 0 then
-							err = 1 -- EPERM
-						elseif not setsoft and rl[0].rlim_cur > nv then
-							err = 22 -- EINVAL
-						end
-					elseif sethard then
-						rl[0].rlim_max = nv
-					end
-					if not err and ctx and setsoft and rl[0].rlim_cur > (sethard and nv or vh) then
-						err = 22
-					end
-					if not err and C.setrlimit(r[1], rl) ~= 0 then
-						err = ffi.errno()
-					end
-					if err then
+				nv = value == "hard" and (rt.iso_vhard(sh, r[1]) or rl[0].rlim_max) or rl[0].rlim_cur
+			elseif value == "unlimited" then
+				nv = INF
+			elseif value:match("^%d+$") then
+				local num = tonumber(value)
+				if num == nil or num * r[2] > 9223372036854775807 then
+					io.stderr:write("curse: ulimit: " .. value .. ": limit out of range\n")
+					return false
+				end
+				nv = ffi.cast("uint64_t", num) * ffi.cast("uint64_t", r[2])
+			else
+				io.stderr:write("curse: ulimit: " .. value .. ": " .. rt.invalidnum_msg(value) .. "\n")
+				return false
+			end
+			if r[1] < 0 or C.getrlimit(r[1], rl) ~= 0 then
+				return false
+			end
+			-- in an in-process subshell a hard limit stays virtual (lowering the real one
+			-- could never be undone); the soft limit is real, within it
+			local ctx = rt.iso_cur(sh) and rt.iso_save_rlimits(sh)
+			local vh = rt.iso_vhard(sh, r[1]) or rl[0].rlim_max
+			local virt = ctx or sh.iso_vhard_base
+			local err
+			if setsoft then
+				rl[0].rlim_cur = nv
+			end
+			if sethard and virt then
+				if nv > vh and C.geteuid() ~= 0 then
+					err = 1 -- EPERM
+				elseif not setsoft and rl[0].rlim_cur > nv then
+					err = 22 -- EINVAL
+				end
+			elseif sethard then
+				rl[0].rlim_max = nv
+			end
+			if not err and virt and setsoft and rl[0].rlim_cur > (sethard and nv or vh) then
+				err = 22
+			end
+			if not err and C.setrlimit(r[1], rl) ~= 0 then
+				err = ffi.errno()
+			end
+			if err then
+				io.stderr:write("curse: ulimit: " .. r[3] .. ": cannot modify limit: "
+					.. ffi.string(C.strerror(err)) .. "\n")
+				return false
+			elseif ctx and sethard then
+				ctx.vhard[r[1]] = nv
+			end
+			return true
+		end
+		if not allmode then
+			sh.status = 0
+			for _, c in ipairs(cmds) do -- (the first failure ends it: status 1)
+				if c.arg ~= nil then
+					if not set_one(c.f, c.arg) then
 						sh.status = 1
-						io.stderr:write("curse: ulimit: " .. r[3] .. ": cannot modify limit: "
-							.. ffi.string(C.strerror(err)) .. "\n")
-					elseif ctx and sethard then
-						ctx.vhard[r[1]] = nv
+						return
 					end
+				else
+					local v = report(c.f)
+					sh:echo(#cmds > 1 and line(c.f, v or "unlimited") or (v or "unlimited"))
 				end
 			end
-		elseif allmode then -- -a: list all
+		else -- -a: list all (a trailing value is ignored — bash prints all, status 0)
 			for _, fl in ipairs(AORDER) do
 				sh:echo(line(fl, report(fl) or "unlimited"))
 			end
 			sh.status = 0
-		else -- print one or more resources
-			sh.status = 0
-			for _, fl in ipairs(flags) do
-				local v = report(fl)
-				if #flags > 1 then
-					sh:echo(line(fl, v or "unlimited"))
-				else
-					sh:echo(v or "unlimited")
-				end
-			end
 		end
 	end
 end
