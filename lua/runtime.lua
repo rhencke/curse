@@ -6932,11 +6932,17 @@ function Shell:array_get(name, key)
 	end
 	return ""
 end
--- Sorted variable names beginning with `pfx` (for ${!pfx@} / ${!pfx*}).
+-- Sorted variable names beginning with `pfx` (for ${!pfx@} / ${!pfx*}). Only VISIBLE
+-- ones (all_visible_variables): a declared-but-valueless var (`declare v`, `declare -a
+-- a`) is skipped; an assigned empty array (`a=()`) is not.
 function Shell:var_prefix_names(pfx)
 	local t = {}
-	for k in pairs(self.vars) do
-		if k:sub(1, #pfx) == pfx then
+	for k, b in pairs(self.vars) do
+		if
+			k:sub(1, #pfx) == pfx
+			and not (b.s == nil and b.n == nil and b.arr == nil)
+			and not (b.empty_decl and b.arr and next(b.arr) == nil)
+		then
 			t[#t + 1] = k
 		end
 	end
@@ -9704,6 +9710,21 @@ function M.array_elem(sh, name, raw, expanded)
 	return sh:expand_param({ name = name, index = raw }, nil, nil, key)
 end
 
+-- ${#a[i]} / ${#a[@]} in compiled code: under set -u only a variable that doesn't exist
+-- at all is unbound (named bare, as array_length_reference does); an unset element of an
+-- existing array is length 0 — expand_param's exact rule.
+function M.elem_len(sh, name, raw, expanded)
+	if sh.opt_u then
+		return sh:expand_param({ name = name, index = raw, op = "len" }, nil, nil, M.array_key(sh, name, raw, expanded))
+	end
+	return tostring(M.mb_strlen(M.array_elem(sh, name, raw, expanded)))
+end
+function M.array_count_u(sh, name)
+	if sh.opt_u then
+		return sh:expand_param({ name = name, index = "@", op = "len" })
+	end
+	return tostring(sh:array_count(name))
+end
 -- Read an array/assoc ELEMENT in ARITHMETIC context (`$(( a[i] ))`), exactly interp's arith
 -- var-with-idx path (interp.lua ~448): a set -u check on the BASE var (arith_nounset — FATAL
 -- for an unset base, but an unset ELEMENT of a set array reads as 0), then arith_resolve the
@@ -9789,9 +9810,13 @@ function Shell:expand_param(pe, arg, arg2, idxnum)
 	end
 	local val, isset
 	if index == "@" or index == "*" then
-		if op == "len" then
+		if op == "len" then -- ${#a[@]}: set -u trips only on a variable that doesn't exist
+			if self.opt_u and self.vars[self:deref(name)] == nil and not VIRT_ARR[name] then
+				io.stderr:write("curse: " .. name .. ": unbound variable\n")
+				error({ __curse_exit = self.opt_c and 127 or 1, __curse_lineabort = self.opt_i or nil })
+			end
 			return tostring(self:array_count(name))
-		end -- ${#a[@]}
+		end
 		val = table.concat(self:array_values(name), " ")
 		isset = self:array_count(name) > 0
 	elseif index then
@@ -9846,8 +9871,12 @@ function Shell:expand_param(pe, arg, arg2, idxnum)
 		and op ~= ":?"
 		and op ~= "?"
 		and self:special_get(name) == ""
+		-- ${#a[3]} of an unset element of an existing array is just 0; with no such
+		-- variable at all set -u names the bare array (array_length_reference)
+		and not (op == "len" and index and self.vars[self:deref(name)] ~= nil)
 	then
-		io.stderr:write("curse: " .. (pe.uname or name) .. ": unbound variable\n")
+		local lbl = pe.uname or (op == "len" and name) or M.pe_label(pe)
+		io.stderr:write("curse: " .. lbl .. ": unbound variable\n")
 		error({ __curse_exit = self.opt_c and 127 or 1, __curse_lineabort = self.opt_i or nil })
 	end
 	-- := / = write back to the SAME target that was read: an array element when
@@ -9894,14 +9923,14 @@ function Shell:expand_param(pe, arg, arg2, idxnum)
 	end
 	if op == ":?" then
 		if val == "" then -- (no word at all: bash's own words)
-			io.stderr:write("curse: " .. name .. ": " .. ((arg == nil or arg == "") and "parameter null or not set" or A()) .. "\n")
+			io.stderr:write("curse: " .. (pe.uname or M.pe_label(pe)) .. ": " .. ((arg == nil or arg == "") and "parameter null or not set" or A()) .. "\n")
 			error({ __curse_exit = self.opt_c and 127 or 1, __curse_lineabort = self.opt_i or nil })
 		end
 		return val
 	end
 	if op == "?" then
 		if not isset then
-			io.stderr:write("curse: " .. name .. ": " .. ((arg == nil or arg == "") and "parameter not set" or A()) .. "\n")
+			io.stderr:write("curse: " .. (pe.uname or M.pe_label(pe)) .. ": " .. ((arg == nil or arg == "") and "parameter not set" or A()) .. "\n")
 			error({ __curse_exit = self.opt_c and 127 or 1, __curse_lineabort = self.opt_i or nil })
 		end
 		return val
@@ -9911,9 +9940,9 @@ function Shell:expand_param(pe, arg, arg2, idxnum)
 		-- under set -u a variable with no value is unbound for every transform, @a included
 		-- (even a declared-but-valueless one: `declare -A m; ${m@a}` fails — bash); @a/@A
 		-- accept an array with any element, the others need its [0]
-		local b = self.opt_u and not isset and (arg == "a" or arg == "A") and self.vars[self:deref(name)]
+		local b = self.opt_u and not isset and (arg == "a" or arg == "A") and not index and self.vars[self:deref(name)]
 		if self.opt_u and not isset and not (b and b.arr and next(b.arr) ~= nil) then
-			io.stderr:write("curse: " .. (pe.uname or name) .. ": unbound variable\n")
+			io.stderr:write("curse: " .. (pe.uname or M.pe_label(pe)) .. ": unbound variable\n")
 			error({ __curse_exit = self.opt_c and 127 or 1, __curse_lineabort = self.opt_i or nil })
 		end
 		-- @a reports the VARIABLE's attributes (e.g. `A` for a declared assoc array),

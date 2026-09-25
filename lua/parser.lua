@@ -696,6 +696,9 @@ parse_paramexp = function(inner)
 		if inner == "#" then
 			return { pexp = { name = "#", op = "indirect" } } -- ${!#}: the last positional
 		end
+		if inner:match("^#[:%-=?+#%%/@]") then -- ${!##} ${!#:-z}: an operator on the last
+			return { pexp = { name = "#", op = "indirect", iop = inner:sub(2) } } -- positional
+		end
 		if inner:sub(1, 1) == "!" or inner:sub(1, 1) == "#" then
 			return { pexp = { op = "badsubst", raw = "!" .. inner } }
 		end

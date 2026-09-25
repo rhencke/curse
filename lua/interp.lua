@@ -1784,6 +1784,24 @@ end
 -- ${!ref}: the name/expression `ref` indirects to (its value, or a nameref's
 -- target), with any trailing operator (iop) appended. Re-parsed into a part so
 -- the target can itself be an array (arr[@]), $@, a subscript, etc.
+-- ${!ref OP} whose ref has no value (an unset positional, `declare v`, `a=()`): OP still
+-- applies, to an unset parameter (`${!v:-z}` is z, `${!v:?e}` says `!v: e`). Built as a
+-- positional past $#, which is unset; nil (empty) when there is no operator.
+local function valueless_part(sh, pe)
+	if not pe.iop then
+		return nil
+	end
+	local ok, part = pcall(P.parse_paramexp, tostring(sh.nparams + 1) .. pe.iop)
+	if not ok or not part then
+		return nil
+	end
+	local uname = "!" .. rt.pe_label(pe)
+	part.uname = uname
+	if part.pexp then
+		part.pexp.uname = uname
+	end
+	return part
+end
 indirect_part = function(sh, pe)
 	local tname
 	if pe.index == "@" or pe.index == "*" then
@@ -1791,7 +1809,11 @@ indirect_part = function(sh, pe)
 		-- element derefs cleanly; several join to a name with spaces = invalid).
 		tname = table.concat(sh:array_values(pe.name), " ")
 	elseif pe.index then
-		tname = sh:array_get(pe.name, array_key(sh, pe.name, pe.index))
+		local key = array_key(sh, pe.name, pe.index)
+		tname = sh:array_get(pe.name, key)
+		if tname == "" and not sh:is_elem_set(pe.name, key) then
+			tname = nil -- (an unset element: no value, unlike a set empty one)
+		end
 	else
 		local b = sh.vars[pe.name]
 		-- ${!ref} on a NAMEREF is inverted: it yields the target NAME, not its value.
@@ -1814,12 +1836,29 @@ indirect_part = function(sh, pe)
 		-- under set -u, where the unset ref also trips nounset). A SET ref that merely
 		-- resolves to empty (an assoc's empty scalar, `${!A@a}`) expands to empty, and a
 		-- positional ref (`${!1}`) that is unset stays empty, as bash does.
-		if pe.name and pe.name:match("^%d+$") then
-			return nil
+		if pe.name and (pe.name:match("^%d+$") or pe.name == "@" or pe.name == "*") then
+			return valueless_part(sh, pe)
 		end
 		local bb = pe.name and sh.vars[sh:deref(pe.name)] -- (through a nameref: its target)
-		if bb and (bb.s ~= nil or bb.n ~= nil or bb.arr ~= nil) then
-			return nil
+		if bb and not bb.ref then
+			-- a ref whose VALUE is set but empty (`x=; ${!x}`, `a=(''); ${!a}`, an empty
+			-- element or ${!a[@]OP} over ('')) names no variable; one with no value at all
+			-- (`declare v`, `declare -A A`, `a=()`, an unset element) expands to empty
+			local setempty
+			if tname == nil then
+				setempty = false
+			elseif pe.index then
+				setempty = pe.index ~= "@" and pe.index ~= "*" or (bb.arr ~= nil and next(bb.arr) ~= nil)
+			elseif bb.arr then
+				setempty = (bb.assoc and bb.arr["0"] or bb.arr[0]) ~= nil
+			else
+				setempty = bb.s ~= nil or bb.n ~= nil
+			end
+			if setempty then
+				io.stderr:write("curse: : invalid variable name\n")
+				error({ __curse_exit = 1, __curse_lineabort = true })
+			end
+			return valueless_part(sh, pe)
 		end
 		io.stderr:write("curse: " .. (pe.name and rt.pe_label(pe) or "") .. ": invalid indirect expansion\n")
 		if sh.opt_u then
@@ -1828,20 +1867,45 @@ indirect_part = function(sh, pe)
 		error({ __curse_exit = 1, __curse_lineabort = true })
 	end
 	-- ${!ref} to a special parameter: $?, $$, $!, $#, $-, $N, $@, $*
+	local numeric = tname:match("^%d+$")
+	local special = #tname == 1 and tname:match("[%?%$!#%-@%*]")
 	if not pe.iop then
-		if tname:match("^%d+$") then
+		if numeric then
 			return { param = tonumber(tname) }
 		end
-		if #tname == 1 and tname:match("[%?%$!#%-@%*]") then
+		if special then
 			return { special = tname }
 		end
 	end
 	-- The resolved target must be a valid variable reference: an identifier,
-	-- optionally with a [subscript]. Anything else (spaces, `/`, …) is invalid.
-	local base = tname:match("^[%a_][%w_]*")
-	if not base or (#tname > #base and tname:sub(#base + 1, #base + 1) ~= "[") then
-		io.stderr:write("curse: " .. tname .. ": invalid variable name\n")
-		error({ __curse_exit = 1, __curse_lineabort = true })
+	-- optionally with ONE [subscript] ending the name (valid_array_reference).
+	-- Anything else (spaces, `/`, `a[`, `a[1]x`, `a[]`) is invalid.
+	local base = not numeric and not special and tname:match("^[%a_][%w_]*")
+	if not (numeric or special) then
+		local bad = not base
+		if not bad and #tname > #base then
+			if tname:sub(#base + 1, #base + 1) ~= "[" or tname:sub(-1) ~= "]" or #tname == #base + 2 then
+				bad = true
+			else -- the `[` must close exactly at the end
+				local depth = 0
+				for k = #base + 1, #tname do
+					local c = tname:byte(k)
+					if c == 91 then
+						depth = depth + 1
+					elseif c == 93 then
+						depth = depth - 1
+						if depth == 0 and k < #tname then
+							bad = true
+							break
+						end
+					end
+				end
+			end
+		end
+		if bad then
+			io.stderr:write("curse: " .. tname .. ": invalid variable name\n")
+			error({ __curse_exit = 1, __curse_lineabort = true })
+		end
 	end
 	local ok, part = pcall(P.parse_paramexp, tname .. (pe.iop or ""))
 	-- Mark the reconstructed part as coming through indirection: bash's `:-`/`:+`

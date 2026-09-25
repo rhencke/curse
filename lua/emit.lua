@@ -2272,17 +2272,20 @@ function pexp_scalar(pe, lifted)
 	-- (attr_string). Independent of value set-ness — a declared valueless assoc still reports
 	-- `A` — and never get_u, which would trip set -u on an unset element. The element and
 	-- scalar forms alike report the whole variable's attributes (bash).
-	if pe.op == "@" and pe.arg == "a" then
+	if pe.op == "@" and pe.arg == "a" and not (pe.index and pe.index ~= "@" and pe.index ~= "*") then
 		return ("sh:attr_string_u(%q)"):format(pe.name)
 	end
 	local val
 	local ename = EF.has_nameref and ("sh:deref(%q)"):format(pe.name) or ("%q"):format(pe.name) -- a nameref array read resolves to its target
 	if pe.index == "@" or pe.index == "*" then -- ${#a[@]}: array element COUNT (op is len, gated)
-		return ("tostring(sh:array_count(%s))"):format(ename)
+		return ("rt.array_count_u(sh, %s)"):format(ename)
 	elseif pe.index then -- ${name[sub]…}: read the element; a read-only op (below) then applies to it.
 		-- Pass BOTH the raw subscript (arith-evaluated for an indexed array) and its word-expanded
 		-- form (the assoc key); rt.array_elem picks per the array's type, matching interp's array_key.
 		local expanded = subscript_word(pe.index, lifted)
+		if pe.op == "len" then
+			return ("rt.elem_len(sh, %s, %q, %s)"):format(ename, pe.index, expanded)
+		end
 		val = ("rt.array_elem(sh, %s, %q, %s)"):format(ename, pe.index, expanded)
 		if pe.op == nil then
 			return val
