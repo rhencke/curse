@@ -181,6 +181,7 @@ local function apply(s)
 	s.shellname = SHELLNAME
 	rt.shlvl_start(s) -- (a new shell: $SHLVL + 1, exported)
 	rt.startup_ignored(s) -- signals ignored at entry stay ignored (untrappable)
+	rt.sig_setup(s) -- (SIGQUIT ignored; SIGINT's default, not luajit's `interrupted!`)
 	if s.fimports then
 		rt.import_functions(s) -- exported functions (BASH_FUNC_name%%) from the environment
 	end

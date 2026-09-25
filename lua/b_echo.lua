@@ -33,9 +33,11 @@ return function(sh, cmd, args, hook, tcb)
 		if not nonl and not stopped then
 			sh.out("\n")
 		end
-		if sh.out == io.write then
-			rt.chkwrite(sh, "echo") -- (full disk, a read-only fd: reported, status 1)
-		end
 		sh.status = 0
+		if sh.out == io.write or (sh.traps.SIGPIPE == "" and rt.CO_OUTS[sh.out]) then
+			if not rt.chkwrite(sh, "echo") then -- (full disk, a read-only fd: reported, status 1)
+				sh.status = 1
+			end
+		end
 	end
 end

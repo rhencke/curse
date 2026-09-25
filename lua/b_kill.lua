@@ -171,6 +171,9 @@ return function(sh, cmd, args, hook, tcb)
 		end
 		-- CONTINUE_AFTER_KILL_ERROR: every operand is tried; success if any one succeeded
 		local any = false
+		if sh.jobs and sh.jobs[1] then -- (a job that has ended is reaped — SIGCHLD — so no longer there)
+			rt.jobs_poll(sh)
+		end
 		for k = j, #args do
 			local target = args[k]
 			-- (legal_number, and it must fit a pid_t — bash: `pid_value == (pid_t)pid_value`;

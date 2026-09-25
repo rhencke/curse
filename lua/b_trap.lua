@@ -139,6 +139,9 @@ return function(sh, cmd, args, hook, tcb)
 					end
 					if canon == "EXIT" then
 						rt.exit_trap_inherited = nil -- this (sub)shell's own EXIT trap now
+						if not sh.opt_i then -- (the untrapped terminating signals: rt.termsig)
+							rt.sig_exit_trap(sh)
+						end
 					end
 					-- a REAL signal (not EXIT/DEBUG/RETURN/ERR): the process disposition follows
 					-- the trap — `''` is a real SIG_IGN (so children and exec'd programs inherit
@@ -146,11 +149,15 @@ return function(sh, cmd, args, hook, tcb)
 					-- VM hook that runs the trap at the next safepoint — no polling), `-` restores
 					-- the default. sh.sigtraps holds the signals with a non-default disposition.
 					local num = SIGNUM[canon:match("^SIG(.+)$") or ""]
+					local ic = rt.iso_cur(sh)
+					if num and ic and ic.igint and ic.igint[num] then
+						ic.igint[num] = nil -- (an async job's ignored SIGINT/SIGQUIT: the trap's now)
+					end
 					if num and num ~= 9 and num ~= 19 then -- KILL/STOP can't be trapped
 						if action == "-" then
 							if sh.sigtraps and sh.sigtraps[canon] then
-								block_sig(num, false)
 								sh.sigtraps[canon] = nil
+								rt.sig_untrapped(sh, num) -- (the default, or caught: rt.termsig)
 							end
 						else
 							sh.sigtraps = sh.sigtraps or {}

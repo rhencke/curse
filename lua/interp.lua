@@ -3382,6 +3382,9 @@ local function restore_redirs(save)
 			C.close(s.fd)
 		end
 	end
+	if rt.jobnote then -- (a job report waiting for the command's redirections to go)
+		rt.jobnote_flush()
+	end
 end
 -- Write a curse error message. Inside a `$(...)` capture where `2>&1` is active,
 -- route it into the capture buffer (sh.out) so it's captured like bash does;
@@ -4776,15 +4779,8 @@ local function job_reap(sh, job, nohang)
 		if not job.g.done then
 			return nil
 		end
-		local st = job.g.status[1] or 0
-		job.done, job.status = true, st
-		if sh.coprocs then
-			rt.coproc_dispose(sh, job.pid)
-		end
-		if st > 128 and job.g.killed then
-			job.sig = st - 128
-		end
-		return st
+		rt.job_done_g(sh, job)
+		return job.status
 	end
 	local sb = ffi.new("int[1]")
 	local r = rt.wait_child(job.pid, sb, nohang and WNOHANG or 0, not nohang and sh.in_wait and sh or nil) -- (background tasks run meanwhile)
@@ -5081,7 +5077,7 @@ local function exec_simple(sh, args, hook, no_func)
 	-- inside an in-process subshell/$(…), a builtin that changes process-global state (fds,
 	-- environ, rlimits, signal dispositions) saves it first (rt.ISO_BUILTIN)
 	if cmd ~= nil and sh.disabled_builtins and sh.disabled_builtins[cmd] then
-		return sh:exec(unpack(args)) -- `enable -n NAME`: found on $PATH instead
+		return sh:exec_t(args) -- `enable -n NAME`: found on $PATH instead
 	end
 	local prep = ISO_BUILTIN[cmd] -- (in an in-process subshell: save the process state it changes)
 	if prep then
@@ -5235,7 +5231,7 @@ local function exec_simple(sh, args, hook, no_func)
 	elseif sh.functions[cmd] and not no_func then
 		run_function(sh, cmd, sh.functions[cmd], args, hook)
 	else
-		sh:exec(unpack(args))
+		sh:exec_t(args)
 	end -- external command
 end
 
@@ -6745,7 +6741,7 @@ exec_stmt = function(sh, st, hook)
 				end
 			end
 			exec_list(sh, st.body, SUBHOOK, false)
-		end, nil, true)
+		end, nil, st) -- (st: its text, for the report if a signal kills it)
 		if saves then
 			restore_redirs(saves)
 		end
@@ -6947,7 +6943,7 @@ exec_stmt = function(sh, st, hook)
 					return sh.functions[c] ~= nil
 				end)
 			end
-			sh:run_pipeline(fns, false, inproc)
+			sh:run_pipeline(fns, false, inproc, nil, nil, cmds)
 			-- bash quirk (execute_cmd.c:720): the LAST stage of a pipeline, when it is a
 			-- subshell `(…)` that failed, runs the ERR trap for that subshell — on top of
 			-- the pipeline's own ERR fire — so `(false)|(false)` triggers ERR twice. It
@@ -7358,6 +7354,9 @@ local function run_signal(sh, signum, direct, nested)
 	end
 	local h = sh.traps and sh.traps["SIG" .. (NUMSIG[signum] or "")]
 	if not h or h == "" then
+		if not h and not direct then -- (caught untrapped: the EXIT trap, then death — rt.termsig)
+			rt.termsig(sh, signum)
+		end
 		return
 	end
 	-- an asynchronously-delivered signal handler reports $LINENO = 1 (bash).

@@ -6135,7 +6135,7 @@ simple_compiled = function(cx, st, after)
 			local ecs = ec ~= "" and ("; " .. ec) or ""
 			local d = dbg(st)
 			local lastarg = "if #__a > 0 then sh:set_str('_', __a[#__a]) end"
-			local run = px_builtin and "rt.builtin(sh, __a, __noop)" or "sh:exec(unpack(__a))"
+			local run = px_builtin and "rt.builtin(sh, __a, __noop)" or "sh:exec_t(__a)"
 			-- the prefix bindings run the command: rt.run_prefix
 			local prun = ("rt.run_prefix(sh, { %s }, __pv, function() %s%s end, __a)"):format(
 				table.concat(pnames, ", "), run, (px_builtin and redir_apply) and "; io.flush()" or "")
@@ -6248,7 +6248,10 @@ simple_compiled = function(cx, st, after)
 	-- operands; everything else (inline fn, interp-only builtin, prefix env,
 	-- dynamic command word) delegates.
 	if st.assigns == nil then
-		local anyfield = false
+		-- (a long argv — `echo {1..70000}` — goes through the argv table too: one argument
+		-- per word would overflow LuaJIT's call slots and jump range; field_argv chunks it)
+		local bigargv = #st.words > 200 and not as_local
+		local anyfield = bigargv
 		-- A `local`/in-function `declare` VALUE word (j>1) never word-splits or globs
 		-- (assignment context), so a merely-renderable value (`local x=$y`) is NOT a
 		-- field-engine word — gate it on emitable_word, letting it reach the native
@@ -6266,7 +6269,10 @@ simple_compiled = function(cx, st, after)
 		end
 		if anyfield then
 			local from, wrap, call, prefix
-			if cmd == "echo" then
+			if cmd == "echo" and bigargv then -- (the builtin takes the argv table as is)
+				from = 1
+				call = "rt.builtin(sh, __a, __noop)"
+			elseif cmd == "echo" then
 				from = 2
 				call = "sh:echo_cmd(unpack(__a))"
 			elseif (cmd == ":" or cmd == "true" or cmd == "false") and not isfunc then
@@ -6306,7 +6312,7 @@ simple_compiled = function(cx, st, after)
 					ei[#ei + 1] = ("sh:aset(%q, %s)"):format(n, lname(n))
 					eo[#eo + 1] = ("%s = sh:aget(%q)"):format(lname(n), n)
 				end
-				call = ("if sh.functions[%q] then %srt.call_dynamic_fn(sh, __a)%s else sh:exec(unpack(__a)) end"):format(
+				call = ("if sh.functions[%q] then %srt.call_dynamic_fn(sh, __a)%s else sh:exec_t(__a) end"):format(
 					cmd,
 					#ei > 0 and (table.concat(ei, "; ") .. "; ") or "",
 					#eo > 0 and ("; " .. table.concat(eo, "; ")) or "")
@@ -7364,11 +7370,13 @@ H.subshell = function(cx, st, after)
 				swpre = swpre .. ("local %s = %s; "):format(table.concat(sav, ", "), vlist)
 				swpost = ("; %s = %s"):format(vlist, table.concat(sav, ", "))
 			end
+			-- (its text: the report if a signal kills it)
+			local stx = ("%q"):format(require("deparse").command_text(st))
 			if sub_redir then
-				cx.blocks[p] = ("%slocal __rs = {}; if %s then sh:subshell_run(__CS[%d], __rs, true) else rt.redir_restore(__rs); sh.status = 1 end%s%s; pc = %d"):format(
-					swpre, sub_redir, id, swpost, ecs, after)
+				cx.blocks[p] = ("%slocal __rs = {}; if %s then sh:subshell_run(__CS[%d], __rs, %s) else rt.redir_restore(__rs); sh.status = 1 end%s%s; pc = %d"):format(
+					swpre, sub_redir, id, stx, swpost, ecs, after)
 			else
-				cx.blocks[p] = ("%ssh:subshell_run(__CS[%d], nil, true)%s%s; pc = %d"):format(swpre, id, swpost, ecs, after)
+				cx.blocks[p] = ("%ssh:subshell_run(__CS[%d], nil, %s)%s%s; pc = %d"):format(swpre, id, stx, swpost, ecs, after)
 			end
 			-- (in an eval/source program the body's simple commands guard their own names —
 			-- H.simple's live-dispatch variant — so the fragment stays valid as names change)
@@ -7462,6 +7470,14 @@ H.pipeline = function(cx, st, after)
 			EF.konst(dinproc))
 	end
 	local gpre, gpost = "", ""
+	local ptexts = "nil" -- (the stages' texts, for the job report of a pipeline a signal ends)
+	if n >= 2 then
+		local tx = {}
+		for k = 1, n do
+			tx[k] = ("%q"):format(require("deparse").command_text(st.cmds[k]))
+		end
+		ptexts = EF.konst(tx)
+	end
 	-- (`! cmd` ignores its OWN special-builtin failure: rt.spb_run)
 	local negspb = n == 1 and st.negate and st.cmds[1].t == "simple" and st.cmds[1].words
 		and st.cmds[1].words[1] and require("runtime").SPECIAL_BUILTIN[full_lit(st.cmds[1].words[1]) or ""]
@@ -7486,9 +7502,10 @@ H.pipeline = function(cx, st, after)
 	cx.blocks[p] = gpre .. (n >= 2 and table.concat(sdbg) or "")
 		.. lifted_flush(cx.lifted)
 		.. (negspb and "sh.spb_neg = true; " or "")
-		.. ("sh:run_pipeline({%s}, %s, %s%s)"):format(
+		.. ("sh:run_pipeline({%s}, %s, %s%s, %s)"):format(
 			table.concat(frags, ", "), st.negate and "true" or "false", kinds,
-			(EF.lifted_names and #EF.lifted_names > 0) and ", __upv_get, __upv_set" or "")
+			(EF.lifted_names and #EF.lifted_names > 0) and ", __upv_get, __upv_set" or ", nil, nil",
+			ptexts)
 		.. (negspb and "; sh.spb_neg = nil" or "")
 		.. post
 		.. ecs
@@ -7676,6 +7693,34 @@ H.arrayassign = function(cx, st, after)
 				end
 			end
 		end
+		do -- a long run of plain literal elements (`a=({1..70000})`): ONE constant table, as
+			-- field_argv does (a statement per element overflows LuaJIT's jump range)
+			local np, run = {}, {}
+			local function flush_run()
+				if #run > 32 then
+					np[#np + 1] = ("do local __k = %s; for __i = 1, #__k do __it[#__it+1] = {val=__k[__i]} end end")
+						:format(EF.konst(run))
+				else
+					for _, r in ipairs(run) do
+						np[#np + 1] = "__it[#__it+1] = {val=" .. r .. "}"
+					end
+				end
+				run = {}
+			end
+			for _, s in ipairs(parts) do
+				local lit = s:match('^__it%[#__it%+1%] = {val=(%("[^"\\]*"%))}$')
+				if lit then
+					run[#run + 1] = lit
+				else
+					flush_run()
+					np[#np + 1] = s
+				end
+			end
+			flush_run()
+			for i = 1, math.max(#parts, #np) do
+				parts[i] = np[i]
+			end
+		end
 		local ec = errchk(st)
 		local ecs = ec ~= "" and ("; " .. ec) or ""
 		-- $?: the last command substitution's status (`a=( $(exit 3) )`), else as arrayassign left it
@@ -7847,12 +7892,19 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
 	EF.frag_topcode = nil
 	emit_toplevel = cx.toplevel and true or false -- gates top-level-only ERR firing (see errchk)
 	-- each block remembers the source line being compiled when it was written (cx.pcline)
+	-- and, for a block that runs an external, the simple command's text (pcline.tx: a job
+	-- report names the command — rt.cmd_text)
 	local pcline = {}
 	cx.pcline = pcline
 	cx.blocks = setmetatable({}, {
 		__newindex = function(t, k, v)
 			rawset(t, k, v)
 			pcline[k] = EF.cur_line
+			if cx.cur_simple and type(v) == "string" and (v:find("sh:exec(", 1, true)
+				or v:find("sh:exec_t(", 1, true) or v:find("rt.exec_dynamic(", 1, true)) then
+				pcline.tx = pcline.tx or {}
+				pcline.tx[k] = cx.cur_simple
+			end
 		end,
 	})
 	cx.loopPc, cx.stmtPc = {}, {}
@@ -8368,6 +8420,7 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
 		if EF.extdebug and EF.DBG_SKIP[t] then
 			EF.dbg_after_of[st] = after -- (where a skipped command resumes: dbg)
 		end
+		cx.cur_simple = t == "simple" and st or nil -- (its external's text: cx.blocks)
 		EF.cur_loopn = #cx.loopstack -- (compile_cmdsub: is this command inside a loop …
 		EF.cur_infunc = not cx.toplevel and not cx.topcode -- … or a function)
 		if st.line then
@@ -8978,6 +9031,22 @@ assemble = function(cfg, sig, opts)
 			local ln = cfg.pcline[p]
 			if ln and ln > 0 then
 				lt[#lt + 1] = ("[%d]=%d"):format(p, ln)
+			end
+		end
+		if cfg.pcline.tx then -- (the texts of the commands that run externals: rt.cmd_text)
+			local dp, tx, rx = require("deparse"), {}, {}
+			for p = 0, cfg.npc - 1 do
+				local c = cfg.pcline.tx[p]
+				if c then
+					tx[#tx + 1] = ("[%d]=%q"):format(p, dp.command_text(c))
+					if c.redirs and #c.redirs > 0 then -- (rx: it has redirections of its own)
+						rx[#rx + 1] = ("[%d]=true"):format(p)
+					end
+				end
+			end
+			lt[#lt + 1] = "tx={" .. table.concat(tx, ",") .. "}"
+			if #rx > 0 then
+				lt[#lt + 1] = "rx={" .. table.concat(rx, ",") .. "}"
 			end
 		end
 		if #lt > 0 then -- (a function's also names itself: its errors carry its file's label)

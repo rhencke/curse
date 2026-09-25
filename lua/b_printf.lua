@@ -104,7 +104,8 @@ return function(sh, cmd, args, hook, tcb)
 				sh:set_str(ns[1], tostring(ns[2]))
 			end
 			sh.out(res)
-			if sh.out == io.write and not rt.chkwrite(sh, "printf") then
+			if (sh.out == io.write or (sh.traps.SIGPIPE == "" and rt.CO_OUTS[sh.out]))
+				and not rt.chkwrite(sh, "printf") then
 				st = 1 -- (a failed write is reported, status 1)
 			end
 			sh.status = st

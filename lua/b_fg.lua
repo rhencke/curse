@@ -66,8 +66,12 @@ local function disown(sh, args)
 	end
 	if not honly then
 		local gone = {}
+		sh.disowned = sh.disowned or {}
 		for _, jb in ipairs(victims) do
 			gone[jb] = true
+			-- (delete_job's bgp_add: `wait PID` answers from bgpids with the status it had
+			-- when disowned — 0 while it was still running — and doesn't wait)
+			sh.disowned[jb.pid] = jb.done and jb.status or 0
 		end
 		local keep = {}
 		for _, jb in ipairs(sh.jobs or {}) do
