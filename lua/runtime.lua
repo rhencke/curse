@@ -5800,7 +5800,8 @@ function Shell:special_get(name)
 		return tostring(os.time())
 	end
 	if name == "BASH_COMMAND" then
-		return self.cur_cmd and require("deparse").command_text(self.cur_cmd) or ""
+		local c = self.cur_cmd -- (compiled code records the text, the interpreter the node)
+		return c and (type(c) == "string" and c or require("deparse").command_text(c)) or ""
 	end
 	if name == "EPOCHREALTIME" then
 		local tv = ffi.new("struct curse_rt_timeval")
@@ -12605,6 +12606,18 @@ function M.fn_return(sh, name)
 	if fret then
 		sh.status = fret
 	end
+end
+-- $FUNCNEST: a compiled call past that many nested calls abandons the whole command
+-- line, status 1, as interp's run_function (bash's execute_function: "maximum function
+-- nesting level exceeded", jump_to_top_level DISCARD)
+function M.funcnest_over(sh, name)
+	local lim = tonumber(sh:get("FUNCNEST"))
+	if lim and lim > 0 and (sh.calldepth or 0) >= lim then
+		io.stderr:write("curse: " .. name .. ": maximum function nesting level exceeded (" .. lim .. ")\n")
+		sh.status = 1
+		error({ __curse_exit = 1, __curse_lineabort = true, __curse_discard = true })
+	end
+	return false
 end
 
 return M

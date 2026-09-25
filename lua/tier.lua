@@ -238,7 +238,8 @@ function M.run_mod(mod, sh, src, switch_after)
 	local count, resume = 0, nil
 	local hook = function(kind, id)
 		count = count + 1
-		if sh.traps and (sh.traps.DEBUG or sh.traps.RETURN) then
+		local t = sh.traps
+		if t and ((t.DEBUG and not mod.has_debug) or (t.RETURN and not mod.has_return)) then
 			return
 		end
 		if resume ~= nil or sh.calldepth ~= 0 or count <= switch_after then
@@ -368,7 +369,7 @@ local function loop_fragment(st, sh)
 end
 -- (the interp's SUBHOOK forwards to this: loop fragments only, never a program switch)
 function M.frag_hook(kind, id, st, sh)
-	if kind == "loop" and sh and not (sh.traps and sh.traps.RETURN) then
+	if kind == "loop" and sh then -- (a loop fragment carries RETURN-trap and trace hooks)
 		return M.loop_osr(sh, st)
 	end
 end
@@ -425,7 +426,7 @@ function M.fn_hot(sh, name, def)
 	end
 	local t = sh.traps
 	local mode = trap_mode(sh)
-	if (t and t.RETURN) or mode:find("T", 1, true) or sh.vars.FUNCNEST -- (compiled recursion doesn't count it)
+	if mode:find("T", 1, true)
 		or (sh.shopt.expand_aliases and sh.aliases and next(sh.aliases)) then
 		return nil
 	end
@@ -640,6 +641,21 @@ function M.run_tiered(src, sh)
 		local mod, resume, count = nil, nil, 0
 		local fnseen = {} -- (function name -> its switch verdict, checked once)
 		local calls = {} -- (function name -> calls interpreted so far)
+		-- (a DEBUG/RETURN trap now set: switch only into a module compiled with its hooks)
+		local function trap_blocked()
+			local t = sh.traps
+			if not (t and (t.DEBUG or t.RETURN)) then
+				return false
+			end
+			if mod == nil then
+				if not ast then
+					local okp, a = pcall(P.parse, src)
+					ast = okp and a or nil
+				end
+				mod = ast and compile_store(path, ast, sh, true) or false
+			end
+			return not mod or (t.DEBUG and not mod.has_debug) or (t.RETURN and not mod.has_return) or false
+		end
 		local hook = function(kind, id, st, csh)
 			if kind == "call" then
 				-- a hot function (recursion, or called in a loop the switch can't take): the
@@ -647,7 +663,7 @@ function M.run_tiered(src, sh)
 				-- one compiled (checked once per definition node)
 				local n = (calls[id] or 0) + 1
 				calls[id] = n
-				if n < HOT_LOOP or not st or (sh.traps and (sh.traps.DEBUG or sh.traps.RETURN)) then
+				if n < HOT_LOOP or not st or trap_blocked() then
 					return nil
 				end
 				if mod == nil then
@@ -672,7 +688,7 @@ function M.run_tiered(src, sh)
 				return
 			end
 			count = count + 1
-			if count < HOT_LOOP or resume or (sh.traps and (sh.traps.DEBUG or sh.traps.RETURN)) then
+			if count < HOT_LOOP or resume or trap_blocked() then
 				return
 			end
 			if sh.calldepth ~= 0 then

@@ -348,8 +348,8 @@ local function scan_xtrace(node, acc)
 	if node.t == "coproc" then -- a coproc is reaped asynchronously (bash's SIGCHLD); only the
 		return "coproc" -- interpreter polls for it between commands (rt.coproc_poll)
 	end
-	if node.name == "FUNCNEST" or node.var == "FUNCNEST" then
-		return "FUNCNEST" -- $FUNCNEST limits call depth: interp's run_function counts it
+	if node.name == "FUNCNEST" or node.var == "FUNCNEST" or (node.lit and node.lit:find("FUNCNEST", 1, true)) then
+		acc.funcnest = true -- $FUNCNEST limits call depth: compiled calls count it (fnwrap)
 	end
 	if node.lit == "extdebug" then
 		return "extdebug" -- extdebug: a DEBUG trap may skip commands (interp's run_debug handles it)
@@ -363,12 +363,13 @@ local function scan_xtrace(node, acc)
 	if node.lit and node.lit:find("\\#", 1, true) then
 		acc.lex = acc.lex or "prompt \\#" -- a prompt's \# (command number) counts the reader's lines
 	end
-	if node.lit and node.lit:find("BASH_COMMAND", 1, true) then
-		return "BASH_COMMAND" -- $BASH_COMMAND (often read in a trap string) tracks interp's statements
+	if (node.lit and node.lit:find("BASH_COMMAND", 1, true)) or node.var == "BASH_COMMAND"
+		or node.name == "BASH_COMMAND" then
+		acc.bcmd = true -- $BASH_COMMAND (often read in a trap string): each command records its text
 	end
 	if node.t == "simple" and node.words and node.words[1] and node.words[1].parts
 		and node.words[1].parts[1] and node.words[1].parts[1].lit == "enable" then
-		return "enable" -- `enable -n` disables builtins the compiled tier calls natively
+		acc.enable = true -- `enable -n` disables builtins: compiled builtin calls check (H.simple)
 	end
 	if node.t == "simple" and node.words and node.words[1] and node.words[1].parts[1]
 		and node.words[1].parts[1].lit == "set"
@@ -400,7 +401,7 @@ local function scan_xtrace(node, acc)
 			end
 		end
 	end
-	return nil, acc.x, acc.lex
+	return nil, acc.x, acc.lex, acc.funcnest, acc.bcmd, acc.enable
 end
 -- functrace (set -T / -o functrace) extends DEBUG into subshells, which compiled
 -- fragments don't hook — keep those programs on the delegated path.
@@ -938,6 +939,9 @@ function EF.xta(lhs, v) -- an assignment `lhs` (`x=`, `a[i]+=`) of the expanded 
 	return EF.xtrace and ("if sh.opt_x then %srt.xtrace_assign(sh, %q, %s) end "):format(EF.xln(), lhs, v) or ""
 end
 EF.has_return = false -- program may set a RETURN trap → compiled calls fire it (fnwrap)
+EF.bash_command = false -- program reads $BASH_COMMAND → each command records its text (dbg)
+EF.enable = false -- program may run `enable -n` → a native builtin call checks it's still enabled
+EF.funcnest = false -- program may set $FUNCNEST → compiled calls check the call depth (fnwrap)
 EF.funcstack = false -- program reads $FUNCNAME → maintain sh.funcstack around calls
 EF.pipestatus = false -- program reads $PIPESTATUS → set it (=(status)) after each simple cmd
 EF.has_trap = false -- program installs any trap → a forked `&`/pipeline child must reset caught signal traps
@@ -953,6 +957,15 @@ local emit_multidef = {} -- names defined by more than one top-level funcdef: a 
 -- top-level command). Delegated commands fire DEBUG via interp's exec_stmt, so this is
 -- prepended ONLY to native blocks (exactly one fires).
 local function dbg(st)
+	-- $BASH_COMMAND: the command about to run, as bash prints it (a string here — the
+	-- interpreter records its node); a trap's own commands don't replace it
+	if EF.bash_command then
+		local bc = ("if (sh.in_trap or 0) == 0 then sh.cur_cmd = %q end; "):format(require("deparse").command_text(st))
+		EF.bash_command = false
+		local d = dbg(st)
+		EF.bash_command = true
+		return bc .. d
+	end
 	-- run_debug scopes by calldepth/in_subprogram (fires inside a function/subshell only
 	-- under functrace); calldepth is tracked in fnwrap when a DEBUG trap is present.
 	if EF.has_debug then
@@ -980,13 +993,16 @@ local function fnwrap(cmd, line, s)
 		pre = ("sh:enterFunc(%q, %d); "):format(cmd, line or 0)
 		post = post .. "; sh:leaveFunc()"
 	end
-	if EF.has_err or EF.has_debug or EF.trap_ret or EF.has_return then
+	if EF.has_err or EF.has_debug or EF.trap_ret or EF.has_return or EF.funcnest then
 		pre = pre .. "sh.calldepth = sh.calldepth + 1; "
 		post = post .. "; sh.calldepth = sh.calldepth - 1"
 	end
 	if EF.has_debug or EF.has_err or EF.has_return then -- the callee doesn't inherit DEBUG/ERR/RETURN (rt.debug_enter)
 		pre = pre .. ("local __dbg = rt.debug_enter(sh, %q); "):format(cmd)
 		post = post .. "; rt.debug_leave(sh, __dbg)"
+	end
+	if EF.funcnest then -- (past $FUNCNEST nested calls the call fails: status 1)
+		return ("if sh.vars.FUNCNEST and rt.funcnest_over(sh, %q) then sh.status = 1 else %s%s%s end"):format(cmd, pre, s, post)
 	end
 	return pre .. s .. post
 end
@@ -1591,7 +1607,9 @@ local function emit_fragment(stmts, neg, liftset, cfraise)
 	-- ($(…)/pipeline/background) pass nil: they keep every var in sh (forked children own
 	-- their copy; a lifted local would neither see nor sync the caller's real sh var).
 	EF.frag_topcode = not EF.cur_infunc -- (read, and cleared, by this build_cfg)
+	EF.frag_depth = EF.frag_depth + 1 -- (a function's `return` in here isn't the call's: EF.retset)
 	local bok, cfg = pcall(build_cfg, stmts, liftset or {}, emit_frag_ctx.funcflags, inlfns, false)
+	EF.frag_depth = EF.frag_depth - 1
 	EF.frag_topcode = nil
 	emit_toplevel, emit_neg_ctx, EF.cur_line = saved_tl, saved_neg, saved_line
 	EF.cf_raise, EF.cf_flush = saved_cf, saved_cff
@@ -4688,15 +4706,18 @@ H.simple = function(cx, st, after)
 	-- A FRAGMENT (eval/source/trap code, a script line in line mode) can't see the functions
 	-- defined outside it: one shadowing a builtin (`true() {…}`, `echo() {…}`) must win at run
 	-- time — the argv built natively, dispatched through the command runner (rt.exec_dynamic)
-	if EF.fragment and not EF.has_dyncode and st.words and st.words[1] and not st.assigns then
+	-- So must a builtin that `enable -n` may have disabled (then it's looked up on $PATH).
+	if (EF.fragment or EF.enable) and st.words and st.words[1] and not st.assigns then
 		local c1 = #st.words[1].parts == 1 and st.words[1].parts[1].lit
 		if c1 and not st.words[1].parts[1].q and require("interp").BUILTINS[c1] and not EF.FRAG_CF[c1]
 			and not cx.funcflags[c1] and not (cx.inlinefns and cx.inlinefns[c1]) then
 			local dp = EF.dyn_dispatch(cx, st, after)
 			if dp then
 				local g = cx.newpc()
-				cx.blocks[g] = ("if sh.functions[%q] then pc = %d else pc = %d end"):format(c1, dp, p)
-				return g
+				local fnchk = (EF.fragment and not EF.has_dyncode) and ("sh.functions[%q] or "):format(c1) or ""
+				cx.blocks[g] = ("if %s(sh.disabled_builtins and sh.disabled_builtins[%q]) then pc = %d else pc = %d end"):format(
+					fnchk, c1, dp, p)
+				p = g -- (an eval/source program's function check still wraps it, below)
 			end
 		end
 	end
@@ -4714,8 +4735,10 @@ end
 -- where a function body's `return N` puts N: sh.fret when a RETURN trap may see the call
 -- return (fnwrap's rt.fn_return applies it after the trap), else $? directly
 function EF.retset(cx, w2)
-	return (w2 and EF.has_return and #cx.subexit == 0 and not cx.toplevel and not cx.topcode) and "sh.fret" or "sh.status"
+	return (w2 and EF.has_return and EF.frag_depth == 0 and #cx.subexit == 0 and not cx.toplevel and not cx.topcode)
+		and "sh.fret" or "sh.status"
 end
+EF.frag_depth = 0
 EF.FRAG_CF = { ["break"] = 1, ["continue"] = 1, ["return"] = 1, ["exit"] = 1 }
 -- A command dispatched by its EXPANDED argv (the first word resolves at run time — a
 -- dynamic `$cmd`, or a builtin name a function may shadow): the words built by the field
@@ -6059,8 +6082,8 @@ H.whilec = function(cx, st, after)
 	-- compare instead of building an argv table and running do_test each iteration.
 	-- Keeps [ ]'s own $? (0/1) for the body's first command AND the loop's
 	-- last-body exit status (lv), exactly like the command-condition path below.
-	local tarith = test_as_arith(st.cond, cx.lifted)
-	local tvar = not tarith and test_as_varcmp(st.cond, cx.lifted)
+	local tarith = not EF.enable and test_as_arith(st.cond, cx.lifted)
+	local tvar = not tarith and not EF.enable and test_as_varcmp(st.cond, cx.lifted)
 	if tarith or tvar then
 		local lv = cx.newloopvar()
 		local condp = cx.newpc()
@@ -6280,7 +6303,7 @@ H["if"] = function(cx, st, after)
 			condentry[i] = bentry[i] -- an `else` clause: its body runs unconditionally
 		else
 			local arith = cond_arith(cl.cond)
-			local tarith = not arith and test_as_arith(cl.cond, cx.lifted) -- `[ A -op B ]`, integer operands
+			local tarith = not arith and not EF.enable and test_as_arith(cl.cond, cx.lifted) -- `[ A -op B ]`, integer operands
 			if arith and not not_compilable(arith) and not arith_side_effect(arith) then
 				local cp = cx.newpc()
 				cx.blocks[cp] = EF.arith_branch(arith, cx.lifted, bentry[i], nxt, nil, cl.cond[1] and cl.cond[1].src)
@@ -7357,8 +7380,7 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
 					local p = cx.newpc()
 					-- (a function's `return N` under a possible RETURN trap: N waits in sh.fret —
 					-- the trap sees the $? from before it; the call's epilogue applies it)
-					local fret = EF.has_return and not frag_return and #cx.subexit == 0
-						and not cx.toplevel and not cx.topcode
+					local fret = not frag_return and EF.retset(cx, true) == "sh.fret"
 					cx.blocks[p] = d .. ps
 						.. (fret and "sh.fret = rt.return_status(sh, %s); " or "sh.status = rt.return_status(sh, %s); "):format(
 							emit_word(aw, cx.lifted)) .. retjmp
@@ -7928,6 +7950,7 @@ function EF.konst(items)
 end
 function M.emit(ast, opts)
 	EF.konsts = {}
+	EF.frag_depth = 0
 	emit_frags, emit_frag_n = {}, 0 -- compiled `$(…)` fragments (cs_N closures) collected during build
 	-- Fragment mode (eval/source, compiled at runtime): the code runs in the CALLER's
 	-- execution context, so a top-level return/break/continue must RAISE its signal for
@@ -7942,7 +7965,11 @@ function M.emit(ast, opts)
 	-- a program that can turn on xtrace (`set -x`, `set -o xtrace`, a dynamic `set` word)
 	-- carries per-command trace hooks (`if sh.opt_x then rt.xtrace…`); other machinery the
 	-- compiled tier lacks keeps the program interpreted (the reason names it)
-	local xwhy, xt, xlex = scan_xtrace(ast.stmts)
+	local xwhy, xt, xlex, fnest, bcmd, enable = scan_xtrace(ast.stmts)
+	EF.bash_command = bcmd or false
+	-- (`enable -n NAME` here, or maybe in eval/source code or around a fragment: a native
+	-- builtin call first checks the name is still a builtin)
+	EF.enable = enable or EF.fragment or scan_dyncode(ast.stmts)
 	if xwhy then
 		error("curse-nocompile: " .. xwhy)
 	end
@@ -7957,6 +7984,9 @@ function M.emit(ast, opts)
 	-- under functrace): compiled calls run it (fnwrap) when the program may set one —
 	-- itself, or through eval/source code, or (a fragment) around it
 	EF.has_return = EF.fragment or scan_trap(ast.stmts, { RETURN = 1 }) or scan_dyncode(ast.stmts)
+	-- $FUNCNEST (the program's, or one eval/source code or the caller may set): each
+	-- compiled call checks the depth first, as run_function does
+	EF.funcnest = fnest or EF.fragment or scan_dyncode(ast.stmts)
 	if scan_trap_loopctl(ast.stmts) then
 		error("curse-nocompile: break/continue in a trap")
 	end
@@ -8261,7 +8291,9 @@ function M.emit(ast, opts)
 	end
 	o[#o + 1] = ("return { run = run, loopPc = loopPc, stmtPc = stmtPc%s%s%s%s }"):format(
 		EF.alias_static and ", alias_static = true" or "",
-		EF.xtrace and ", xtrace = true" or "", -- (it traces: runnable under a starting set -x)
+		(EF.xtrace and ", xtrace = true" or "") -- (it traces: runnable under a starting set -x)
+			-- (its hooks: the tier may switch into it while such a trap is set)
+			.. (EF.has_debug and ", has_debug = true" or "") .. (EF.has_return and ", has_return = true" or ""),
 		#fl > 0 and (", fnLoop = { " .. table.concat(fl, ", ") .. " }") or "",
 		#fc > 0 and (", fnCall = { " .. table.concat(fc, ", ") .. " }") or ""
 	)

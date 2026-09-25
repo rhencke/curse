@@ -4596,11 +4596,14 @@ local function run_function(sh, cmd, fn, args, hook, tenv_base)
 		local lim = tonumber(sh:get("FUNCNEST"))
 		if lim and lim > 0 and (sh.calldepth or 0) >= lim then
 			io.stderr:write("curse: " .. cmd .. ": maximum function nesting level exceeded (" .. lim .. ")\n")
-			sh.status = 1
-			return
+			sh.status = 1 -- (bash: jump_to_top_level DISCARD — the rest of the command line goes)
+			error({ __curse_exit = 1, __curse_lineabort = true, __curse_discard = true })
 		end
 	end
 	local savedline = sh.cur_line -- the call-site line: $LINENO is restored to it on return
+	-- (an error out of compiled code called from here skips ITS frames' epilogues: the
+	-- depth, frames and stacks are unwound to these marks below)
+	local cd0, pd0, fs0 = sh.calldepth, sh.pd, sh.funcstack and #sh.funcstack or 0
 	sh.calldepth = sh.calldepth + 1 -- OSR gate: no handoff inside a call
 	sh:pushCall(unpack(args, 2))
 	-- Tempenv bindings applied as THIS call's prefix (`x=v func`) belong to this new
@@ -4695,6 +4698,17 @@ local function run_function(sh, cmd, fn, args, hook, tenv_base)
 	end
 	if rret then
 		sh.status = rret
+	end
+	if not ok then
+		while sh.pd > pd0 + 1 do
+			sh:popCall()
+		end
+		while #sh.funcstack > fs0 + 1 do
+			table.remove(sh.funcstack, 1)
+			table.remove(sh.linestack, 1)
+			table.remove(sh.srcstack, 1)
+		end
+		sh.calldepth = cd0 + 1
 	end
 	rt.debug_leave(sh, dbg_saved)
 	table.remove(sh.funcstack, 1)
