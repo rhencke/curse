@@ -12310,6 +12310,7 @@ function M.assign_scalar(sh, name, value)
 		if sh:deref(name) == "" then
 			io.stderr:write("curse: warning: " .. name .. ": circular name reference\n")
 			sh.status = 1
+			sh.assign_err = true -- (the rest of an assignment list is abandoned)
 			return
 		elseif direct.outer and direct.s:find("[", 1, true) then -- (`local -n a='a[0]'`)
 			io.stderr:write("curse: `" .. direct.s .. "': not a valid identifier\n")
@@ -12685,7 +12686,21 @@ do
 	-- spec (a per-site constant): aas = the NAME=(…) operand ASTs; names = the prefix
 	-- assignment names; so = a redirect moves stdout. bind(sh) performs the prefix bindings
 	-- in order (each value expanded after the previous binding: bash's left-to-right).
-	function M.simple_run(sh, argv, spec, bind, hook, n0)
+	function M.procsub_mark(sh) -- (the <(…)/>(…) a command registers: drained after it)
+		return (sh.procsub_pending and #sh.procsub_pending or 0), (sh.procsub_files and #sh.procsub_files or 0)
+	end
+	function M.simple_run(sh, argv, spec, bind, hook, n0, pm1, pm2)
+		if spec.ps then
+			local ok, err = pcall(M.sr_run, sh, argv, spec, bind, hook, n0)
+			require("interp")._int.drain_procsub(sh, pm1, pm2)
+			if not ok then
+				error(err, 0)
+			end
+			return
+		end
+		return M.sr_run(sh, argv, spec, bind, hook, n0)
+	end
+	function M.sr_run(sh, argv, spec, bind, hook, n0)
 		hook = hook or _noop
 		if sh.xerr then -- a word expansion failed: the command doesn't run (status 1)
 			sh.xerr = nil
@@ -12907,6 +12922,7 @@ function M.assign_full(sh, st)
 			if nb.s ~= "" and sh:deref(st.name) == "" then -- (a reference cycle: said on write)
 				io.stderr:write("curse: warning: " .. st.name .. ": circular name reference\n")
 				sh.status = 1
+				sh.assign_err = true
 				return
 			elseif nb.outer and nb.s:find("[", 1, true) then
 				io.stderr:write("curse: `" .. nb.s .. "': not a valid identifier\n")

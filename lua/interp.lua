@@ -5876,6 +5876,7 @@ exec_stmt = function(sh, st, hook)
 				if nb.s ~= "" and sh:deref(st.name) == "" then
 					io.stderr:write("curse: warning: " .. st.name .. ": circular name reference\n")
 					sh.status = 1
+					sh.assign_err = true -- (the rest of an assignment list is abandoned)
 					return
 				elseif nb.outer and nb.s:find("[", 1, true) then -- (`local -n a='a[0]'`: bash
 					io.stderr:write("curse: `" .. nb.s .. "': not a valid identifier\n") -- rejects it)
@@ -7865,6 +7866,7 @@ M._int = {
 	do_arrayassign = do_arrayassign,
 	arrayassign_items = arrayassign_items,
 	expand_word = expand_word,
+	drain_procsub = drain_procsub,
 	xtrace_quote = xtrace_quote,
 	unset_arrayref = unset_arrayref,
 	eval = eval,

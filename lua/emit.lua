@@ -4613,10 +4613,9 @@ EF.simple_native = function(cx, st, after, cmd)
 	local isdecl = cw1lit and SN_ASSIGN_CMD[cw1lit]
 	local isunset = cw1lit == "unset"
 	local out = { isunset and "sh.arrayref_args = nil; local __n0, __a = sh.ncs, {}" or "local __n0, __a = sh.ncs, {}" }
+	local anyps = false -- (a <(…)/>(…): drained after the command — rt.simple_run)
 	for j, w in ipairs(st.words) do
-		if hasps(w) then
-			return nil
-		end
+		anyps = anyps or hasps(w)
 		local q1 = w.parts[1]
 		if j > 1 and isdecl and q1 and q1.lit and q1.lit:match("^[%a_][%w_]*%+?=") then
 			local fl = unq_full_lit(w)
@@ -4630,7 +4629,7 @@ EF.simple_native = function(cx, st, after, cmd)
 				v = ("rt.cstr(%q .. rt.tilde_assign(sh, %q))"):format(pfx, fl:sub(#pfx + 1))
 			elseif fl then
 				v = ("%q"):format(fl)
-			elseif not htilde and emitable_word(w) then
+			elseif not htilde and emitable_word(w) then -- (emitable: no <(…)/>(…) part)
 				v = ("rt.cstr(%s)"):format(emit_word(w, lifted))
 			else
 				v = ("rt.xw_assign(sh, %s)"):format(K(w))
@@ -4641,7 +4640,7 @@ EF.simple_native = function(cx, st, after, cmd)
 		elseif empty_word(w) then -- (an empty brace alternative adds no field)
 		elseif w.plain then
 			out[#out + 1] = ("__a[#__a+1] = %q"):format(q1.lit)
-		elseif word_safe(w) or arith_guard(w) or field_word(w, lifted) or mixed_expandable(w, lifted) then
+		elseif not hasps(w) and (word_safe(w) or arith_guard(w) or field_word(w, lifted) or mixed_expandable(w, lifted)) then
 			out[#out + 1] = emit_fields_into("__a", w, lifted, "rt.cstr(%s)")
 		else
 			out[#out + 1] = ("rt.xw_fields(sh, %s, __a)"):format(K(w))
@@ -4651,9 +4650,7 @@ EF.simple_native = function(cx, st, after, cmd)
 	if st.arrayargs then
 		for _, aa in ipairs(st.arrayargs) do
 			for _, e in ipairs(aa.elems) do
-				if hasps(e.word) then
-					return nil
-				end
+				anyps = anyps or hasps(e.word)
 			end
 		end
 		spec[#spec + 1] = "aas=" .. ser(st.arrayargs)
@@ -4671,9 +4668,7 @@ EF.simple_native = function(cx, st, after, cmd)
 				names[#names + 1] = ("%q"):format(a.name)
 				bs[#bs + 1] = ("rt.pbind(sh, %q, nil, false, %q)"):format(a.name, a.raw)
 			elseif a.rhs then
-				if hasps(a.rhs) then
-					return nil
-				end
+				anyps = anyps or hasps(a.rhs)
 				names[#names + 1] = ("%q"):format(a.name)
 				local fl = unq_full_lit(a.rhs)
 				local htilde = false
@@ -4699,6 +4694,10 @@ EF.simple_native = function(cx, st, after, cmd)
 	if st.line then
 		spec[#spec + 1] = "line=" .. st.line
 	end
+	if anyps then
+		spec[#spec + 1] = "ps=true"
+		out[1] = "local __pm1, __pm2 = rt.procsub_mark(sh); " .. out[1]
+	end
 	local redir
 	if isexec and st.redirs then
 		spec[#spec + 1] = "eredirs=" .. ser(st.redirs)
@@ -4714,7 +4713,7 @@ EF.simple_native = function(cx, st, after, cmd)
 	return cx.delegate(st, after, {
 		prelude = table.concat(out, "; "),
 		callee = "rt.simple_run",
-		callargs = ("sh, __a, %s, %s, __noop, __n0"):format(EF.konst(spec), bind or "nil"),
+		callargs = ("sh, __a, %s, %s, __noop, __n0%s"):format(EF.konst(spec), bind or "nil", anyps and ", __pm1, __pm2" or ""),
 		redir = redir,
 	})
 end
@@ -5145,11 +5144,16 @@ simple_compiled = function(cx, st, after)
 	-- a redirect-ONLY command (`> file`, `< f`): no command runs; apply the redirs
 	-- (their open/truncate is the effect), status 0 (or 1 on failure), then restore.
 	-- BUT a prefix assignment with no command (`abc=def > f`) performs the assignment
-	-- in the current shell EVEN when the redirect fails — the native path here would
-	-- drop it, so delegate to interp, which applies the assignment then the redirect.
+	-- in the current shell EVEN when the redirect fails: compile the bindings as an
+	-- assignment list (one DEBUG, $? the last command substitution's), then the redirect
+	-- (a failure makes it 1), then errexit on that final status.
 	if not st.words[1] then
 		if st.assigns then
-			return cx.delegate(st, after)
+			local ec = errchk(st)
+			local pr = cx.newpc()
+			cx.blocks[pr] = ("do local __rs = {}; if not (%s) then sh.status = 1 end; rt.redir_restore(__rs) end%s; pc = %d"):format(
+				redir_apply or "true", ec ~= "" and ("; " .. ec) or "", after)
+			return H.assignlist(cx, { t = "assignlist", list = st.assigns, line = st.line, negate = true }, pr)
 		end
 		local p = cx.newpc()
 		cx.blocks[p] = dbg(st)
@@ -5172,8 +5176,8 @@ simple_compiled = function(cx, st, after)
 		["["] = 1,
 	}
 	local isfunc = (cx.inlinefns and cx.inlinefns[cmd]) or cx.funcflags[cmd]
-	if cmd == "return" and redir_apply then
-		return cx.delegate(st, after)
+	if cmd == "return" and redir_apply then -- (the runner's return, around the redirection)
+		return EF.simple_native(cx, st, after, cmd) or cx.delegate(st, after)
 	end -- rare; wrapper assumes a run body
 	-- Simple interp-only builtins (printf/set/shopt/umask/type/read/getopts/…): build
 	-- argv with the shared field engine and dispatch through exec_simple — the command
@@ -5626,10 +5630,10 @@ simple_compiled = function(cx, st, after)
 		if w2 and #w2.parts == 1 and w2.parts[1].lit == "--" and not w2.parts[1].q then
 			w2 = st.words[3] -- (`return -- N`)
 			if st.words[4] then
-				return cx.delegate(st, after)
+				return EF.simple_native(cx, st, after, cmd) or cx.delegate(st, after)
 			end
-		elseif st.words[3] then -- (too many arguments: interp discards the command)
-			return cx.delegate(st, after)
+		elseif st.words[3] then -- (too many arguments: the runner's return discards the command)
+			return EF.simple_native(cx, st, after, cmd) or cx.delegate(st, after)
 		end
 		local p = cx.newpc()
 		local n = w2 and ("rt.return_code(sh, %s)"):format(emit_word(w2, cx.lifted)) or "sh.status"
@@ -7366,6 +7370,10 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
 				retjmp = ("if rt.return_outside(sh) then pc = %d else %s end"):format(after, retjmp)
 			end
 			local aw = st.words[cf_arg]
+			if aw and full_lit(aw) == "--" and not aw.parts[1].q then -- (`return -- N`: end of options)
+				cf_arg = cf_arg + 1
+				aw = st.words[cf_arg]
+			end
 			if not st.words[cf_arg + 1] then -- at most one status WORD (pre-split)
 				local d = dbg(st) -- DEBUG fires before return too
 				if not aw then -- `return` with no arg → previous status (in a trap: its entry status)
