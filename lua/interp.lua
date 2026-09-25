@@ -5756,8 +5756,8 @@ exec_stmt = function(sh, st, hook)
 		-- a command's own prefix assignment (run through here by its simple command) is
 		-- part of that command: no DEBUG of its own, and $BASH_COMMAND stays the command
 		local cc, own = sh.cur_cmd, false
-		if t == "assign" and cc and cc.assigns then
-			for _, a in ipairs(cc.assigns) do
+		if t == "assign" and cc and (cc.assigns or cc.list) then -- (or a binding of an assignlist)
+			for _, a in ipairs(cc.assigns or cc.list) do
 				own = own or a == st
 			end
 		end
@@ -5836,10 +5836,13 @@ exec_stmt = function(sh, st, hook)
 			end
 			error({ __curse_exit = 1, __curse_lineabort = true })
 		end
-		if st.index == "" then -- `a[]=v`: empty subscript is a bad array subscript (bash: status 1, no assign)
-			io.stderr:write("curse: " .. st.name .. "[]: bad array subscript\n")
-			sh.status = 1
-			return
+		if st.index == "" then -- `a[]=v`: empty subscript is a bad array subscript (bash: status 1, no
+			io.stderr:write("curse: " .. st.name .. "[]: bad array subscript\n") -- assign, the rest of
+			sh.status = 1 -- the line abandoned; as a prefix binding it's just skipped)
+			if sh.applying_prefix then
+				return
+			end
+			error({ __curse_exit = 1, __curse_lineabort = true })
 		end
 		local rb = sh.vars[sh:deref(st.name)]
 		-- A nameref whose target carries a subscript (declare -n ref='A[K]'): a plain
@@ -5855,6 +5858,7 @@ exec_stmt = function(sh, st, hook)
 				if nb.s ~= "" and sh:deref(st.name) == "" then
 					io.stderr:write("curse: warning: " .. st.name .. ": circular name reference\n")
 					sh.status = 1
+					sh.assign_err = true -- (the rest of an assignment list is abandoned)
 					return
 				elseif nb.outer and nb.s:find("[", 1, true) then -- (`local -n a='a[0]'`: bash
 					io.stderr:write("curse: `" .. nb.s .. "': not a valid identifier\n") -- rejects it)
@@ -6071,8 +6075,10 @@ exec_stmt = function(sh, st, hook)
 		-- a bad array subscript / bad-subst in one binding aborts the REST of the list
 		-- (bash: `a=x b[0+]=y c=z` sets only a), keeping the error status.
 		local ncs0 = sh.ncs
-		for _, a in ipairs(st.list) do
+		local cc0 = sh.cur_cmd -- (each binding is part of the list: no DEBUG of its own, even
+		for _, a in ipairs(st.list) do -- after a command substitution in an earlier one ran)
 			sh.assign_err = nil
+			sh.cur_cmd = cc0
 			exec_stmt(sh, a, hook)
 			if sh.assign_err then
 				return
@@ -7821,6 +7827,11 @@ M._int = {
 	fd_ready = fd_ready,
 	read_split = read_split,
 	do_arrayassign = do_arrayassign,
+	arrayassign_items = arrayassign_items,
+	expand_word = expand_word,
+	drain_procsub = drain_procsub,
+	xtrace_quote = xtrace_quote,
+	unset_arrayref = unset_arrayref,
 	eval = eval,
 	fmt_decl = fmt_decl,
 	decl_elems = decl_elems,
