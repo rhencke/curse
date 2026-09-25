@@ -1771,7 +1771,7 @@ function Shell:run_script_inproc(path, args, n, out)
 		child.iso_ctx = self.iso_ctx -- (its process-state saves land in our context)
 		child.subdepth = self.subdepth
 		M.cur_shell = child
-		pcall(require("interp").run_lazy, child, src)
+		pcall(require("tier").run_tiered, src, child) -- (tiered like any script: cached compiled)
 		M.cur_shell = csh
 		io.flush()
 	end)
