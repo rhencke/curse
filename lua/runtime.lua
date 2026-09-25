@@ -6812,9 +6812,33 @@ function M.neg_oob(sh, name, key)
 	return mx + 1 + key_i64(key) < 0
 end
 -- ${a[-N]} past the start: bash warns (`a: bad array subscript`) and expands to nothing
+-- (an empty associative key too: bash's get_array_value, `${E['']}`)
 function M.elem_read_check(sh, name, key)
-	if M.neg_oob(sh, name, key) then
+	if key == "" then
+		local b = sh.vars[sh:deref(name)]
+		if b and b.assoc then
+			io.stderr:write("curse: " .. name .. ": bad array subscript\n")
+		end
+	elseif M.neg_oob(sh, name, key) then
 		io.stderr:write("curse: " .. name .. ": bad array subscript\n")
+	end
+end
+-- Does NAME hold a value (bash's !invisible_p: not `declare x` / `declare -A h` unassigned)?
+function M.var_visible(sh, name)
+	local b = sh.vars[sh:deref(name)]
+	return b ~= nil and (b.arr ~= nil or b.s ~= nil or b.n ~= nil) and not (b.empty_decl and b.arr and next(b.arr) == nil)
+end
+-- ${#a[SUB]} of a visible array (subst.c array_length_reference): a negative index before
+-- the start, or an empty associative key, is err_badarraysub on the subscript text and
+-- its `]` — an expansion error that abandons the line
+function M.len_badsub(sh, name, sub, key)
+	if not M.var_visible(sh, name) then
+		return
+	end
+	local b = sh.vars[sh:deref(name)]
+	if (key == "" and b.assoc) or M.neg_oob(sh, name, key) then
+		io.stderr:write("curse: " .. sub .. "]: bad array subscript\n")
+		error({ __curse_exit = 1, __curse_lineabort = true })
 	end
 end
 -- (`raw`: KEY is already an element's own key — an auto index that wrapped past INT64_MAX
@@ -9643,6 +9667,9 @@ function M.assign_element(sh, name, raw, expanded, value, append)
 			return M.to_arr_key(M.arith_str(sh, raw))
 		end)
 		if not ok then
+			if type(v) == "table" and v.__curse_unbound then
+				error(v, 0) -- (set -u: said already, and fatal as it is)
+			end
 			if not (type(v) == "table" and v.__curse_matherr) then -- (arith_str reported it)
 				io.stderr:write("curse: " .. require("parser").arith_errmsg(raw, v) .. "\n")
 			end
@@ -9724,6 +9751,9 @@ function M.assign_element_x(sh, name, src, value, append)
 			ok, v = pcall(M.arith_str, sh, src)
 		end
 		if not ok then
+			if type(v) == "table" and v.__curse_unbound then
+				error(v, 0) -- (set -u: said already, and fatal as it is)
+			end
 			if not (type(v) == "table" and v.__curse_matherr) then -- (arith_str reported it)
 				io.stderr:write("curse: " .. require("parser").arith_errmsg(src, v) .. "\n")
 			end
@@ -9867,9 +9897,7 @@ end
 -- the interpreter uses, so the value matches exactly.
 function M.array_elem(sh, name, raw, expanded)
 	local key = M.array_key(sh, name, raw, expanded)
-	if type(key) == "number" and key < 0 then
-		M.elem_read_check(sh, name, key)
-	end
+	M.elem_read_check(sh, name, key)
 	return sh:expand_param({ name = name, index = raw }, nil, nil, key)
 end
 
@@ -9877,19 +9905,14 @@ end
 -- "bad array subscript" (the read then goes on), as interp's expand_pexp does.
 function M.array_key_rc(sh, name, raw, expanded)
 	local key = M.array_key(sh, name, raw, expanded)
-	if type(key) == "number" and key < 0 then
-		M.elem_read_check(sh, name, key)
-	end
+	M.elem_read_check(sh, name, key)
 	return key
 end
 -- ${#a[i]} / ${#a[@]} in compiled code: under set -u only a variable that doesn't exist
 -- at all is unbound (named bare, as array_length_reference does); an unset element of an
 -- existing array is length 0 — expand_param's exact rule.
 function M.elem_len(sh, name, raw, expanded)
-	if sh.opt_u then
-		return sh:expand_param({ name = name, index = raw, op = "len" }, nil, nil, M.array_key(sh, name, raw, expanded))
-	end
-	return tostring(M.mb_strlen(M.array_elem(sh, name, raw, expanded)))
+	return sh:expand_param({ name = name, index = raw, op = "len" }, nil, nil, M.array_key(sh, name, raw, expanded))
 end
 -- Read an array/assoc ELEMENT in ARITHMETIC context (`$(( a[i] ))`), exactly interp's arith
 -- var-with-idx path (interp.lua ~448): a set -u check on the BASE var (arith_nounset — FATAL
@@ -10099,9 +10122,10 @@ function Shell:expand_param(pe, arg, arg2, idxnum)
 		and op ~= ":?"
 		and op ~= "?"
 		and self:special_get(name) == ""
-		-- ${#a[3]} of an unset element of an existing array is just 0; with no such
-		-- variable at all set -u names the bare array (array_length_reference)
-		and not (op == "len" and index and self.vars[self:deref(name)] ~= nil)
+		-- ${#a[3]} of an unset element of a visible array is just 0; with no such
+		-- variable (or an invisible one: `declare -A h`) set -u names the bare array
+		-- (array_length_reference)
+		and not (op == "len" and index and M.var_visible(self, name))
 	then
 		local lbl = pe.uname or (op == "len" and name) or M.pe_label(pe)
 		io.stderr:write("curse: " .. lbl .. ": unbound variable\n")
@@ -10127,6 +10151,9 @@ function Shell:expand_param(pe, arg, arg2, idxnum)
 		return M.assign_default(self, name, v)
 	end
 	if op == "len" then
+		if index then
+			M.len_badsub(self, name, index, idxnum or 0)
+		end
 		return tostring(M.mb_strlen(val))
 	end -- ${#v}: codepoints in the locale
 	if op == ":-" then
@@ -11586,17 +11613,9 @@ function M.var_is_set(sh, nm, expanded)
 		else
 			key = M.to_arr_key(M.arith_str(sh, sub))
 		end
-		if type(key) == "number" and key < 0 and b and b.arr then -- negative: from the end
-			local max = -1
-			for k in pairs(b.arr) do
-				if type(k) == "number" and k > max then
-					max = k
-				end
-			end
-			key = max + 1 + key
-			if key < 0 then
-				return false
-			end
+		if M.neg_oob(sh, base, key) then -- (negative counts from the end; before the start: bash's
+			io.stderr:write("curse: " .. base .. ": bad array subscript\n") -- get_array_value error)
+			return false
 		end
 		return sh:is_elem_set(base, key)
 	end

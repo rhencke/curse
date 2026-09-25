@@ -4810,13 +4810,15 @@ simple_compiled = function(cx, st, after)
 		end
 	end
 	-- `unset map["$key"]`: the quoted subscript parts must not be expanded twice — interp's
-	-- expand_args protects them (unset_arrayref); delegate rather than duplicate that
+	-- expand_args protects them (unset_arrayref); delegate rather than duplicate that. So does
+	-- any expanded `unset A[$k]`: its associative subscript runs to the final `]` whatever $k
+	-- holds (W_ARRAYREF — interp marks the argument).
 	if cmd == "unset" then
 		for j = 2, #st.words do
 			local ps = st.words[j].parts
 			if ps[1] and ps[1].lit and not ps[1].q and ps[1].lit:match("^[%a_][%w_]*%[") then
 				for k = 2, #ps do
-					if ps[k].q then
+					if ps[k].q or ps[k].lit == nil then
 						return cx.delegate(st, after)
 					end
 				end

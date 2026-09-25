@@ -1437,10 +1437,13 @@ array_key = function(sh, name, index_raw)
 		return rt.to_arr_key(eval(sh, P.arith(index_raw)))
 	end)
 	if not ok then
+		P.arith_cmd = sv
+		if type(v) == "table" and v.__curse_unbound then
+			error(v, 0) -- (set -u: said already, and fatal as it is — no syntax error on top)
+		end
 		if not (type(v) == "table" and v.__curse_matherr) then -- (an eval error already said so)
 			io.stderr:write("curse: " .. P.arith_errmsg(index_raw, v) .. "\n")
 		end
-		P.arith_cmd = sv
 		-- an expansion error discards the rest of the top-level line (bash jump_to_top_level
 		-- after top_level_cleanup: out of every function/eval/source level — rt.int_value)
 		error({ __curse_exit = 1, __curse_lineabort = true, __curse_discard = true })
@@ -1577,7 +1580,7 @@ local function expand_pexp(sh, p, assign)
 	local subkey
 	if pe.index and pe.index ~= "@" and pe.index ~= "*" then
 		subkey = array_key(sh, pe.name, pe.index)
-		if type(subkey) == "number" and subkey < 0 and pe.op ~= "len" then
+		if pe.op ~= "len" then
 			rt.elem_read_check(sh, pe.name, subkey)
 		end
 	end
@@ -1982,7 +1985,8 @@ local function valueless_part(sh, pe)
 	end
 	return part
 end
-indirect_part = function(sh, pe)
+-- (`quiet`: only probing the shape — is_multi — so a bad subscript isn't reported twice)
+indirect_part = function(sh, pe, quiet)
 	local tname
 	if pe.index == "@" or pe.index == "*" then
 		-- ${!name[@]OP}: the reference name is ${name[@]} space-joined (a single
@@ -1990,6 +1994,9 @@ indirect_part = function(sh, pe)
 		tname = table.concat(sh:array_values(pe.name), " ")
 	elseif pe.index then
 		local key = array_key(sh, pe.name, pe.index)
+		if not quiet then
+			rt.elem_read_check(sh, pe.name, key) -- (`${!b[-9]}`: b: bad array subscript)
+		end
 		tname = sh:array_get(pe.name, key)
 		if tname == "" and not sh:is_elem_set(pe.name, key) then
 			tname = nil -- (an unset element: no value, unlike a set empty one)
@@ -2116,7 +2123,7 @@ is_multi = function(sh, p)
 		return true
 	end -- ${!pfx@} / ${!pfx*}
 	if p.pexp.op == "indirect" then
-		local ip = indirect_part(sh, p.pexp)
+		local ip = indirect_part(sh, p.pexp, true)
 		return ip ~= nil and is_multi(sh, ip)
 	end
 	-- $@/$* live in pexp.name (e.g. ${@:1}); array [@]/[*] live in pexp.index
@@ -5535,6 +5542,12 @@ local function expand_args(sh, st, args, is_assign)
 				and p1.lit:match("^[%a_][%w_]*%[") then
 				rt.mark_arrayref(sh, fs[1])
 			end
+		end
+		-- (unset's W_ARRAYREF: an unquoted `NAME[…]` word — `unset A[$k]` / `unset A[\]]` —
+		-- names an associative element up to its final `]`; see b_unset)
+		if unset_cmd and wi > 1 and p1 and p1.lit and not p1.q and p1.lit:match("^[%a_][%w_]*%[")
+			and w.src and w.src:sub(-1) == "]" then
+			rt.mark_arrayref(sh, args[#args])
 		end
 	end
 end
