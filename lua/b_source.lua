@@ -111,7 +111,7 @@ return function(sh, cmd, args, hook, tcb)
 							for _, st in ipairs(lg.stmts) do
 								local sok, serr = pcall(exec_list, sh, { st }, hook, false)
 								if not sok then
-									if type(serr) == "table" and serr.__curse_lineabort then
+									if type(serr) == "table" and serr.__curse_lineabort and not serr.__curse_discard then
 										if sh.opt_e then
 											error(serr)
 										end

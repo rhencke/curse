@@ -1514,7 +1514,9 @@ local function emit_fragment(stmts, neg, liftset, cfraise)
 	-- caller does the swap-save/restore of those upvalues for isolation. Other fragments
 	-- ($(…)/pipeline/background) pass nil: they keep every var in sh (forked children own
 	-- their copy; a lifted local would neither see nor sync the caller's real sh var).
+	EF.frag_topcode = not EF.cur_infunc -- (read, and cleared, by this build_cfg)
 	local bok, cfg = pcall(build_cfg, stmts, liftset or {}, emit_frag_ctx.funcflags, inlfns, false)
+	EF.frag_topcode = nil
 	emit_toplevel, emit_neg_ctx, EF.cur_line = saved_tl, saved_neg, saved_line
 	EF.cf_raise, EF.cf_flush = saved_cf, saved_cff
 	if not bok then
@@ -4425,7 +4427,7 @@ simple_compiled = function(cx, st, after)
 		-- name (bash). Combos with -i/-x/-n/-g/-p/-l/-u, `export`/`readonly`, multiple
 		-- targets, a redirect, or a nameref program keep interp's fuller declare handling.
 		local aa = st.arrayargs
-		local isassoc, isro, flagsok = false, false, true
+		local isassoc, isro, flagsok, kindflag = false, false, true, false
 		for j = 2, #st.words do
 			local w = st.words[j]
 			local lit = #w.parts == 1 and w.parts[1].lit
@@ -4435,10 +4437,12 @@ simple_compiled = function(cx, st, after)
 			end
 			for c in lit:sub(2):gmatch(".") do
 				if c == "A" then
-					isassoc = true
+					isassoc, kindflag = true, true
 				elseif c == "r" then
 					isro = true
-				elseif c ~= "a" then -- -a is the indexed default; any other letter -> delegate
+				elseif c == "a" then
+					kindflag = true
+				else -- any other letter -> delegate
 					flagsok = false
 				end
 			end
@@ -4446,10 +4450,10 @@ simple_compiled = function(cx, st, after)
 				break
 			end
 		end
-		local as_local = (cmd == "local") or ((cmd == "declare" or cmd == "typeset") and not cx.toplevel)
+		local as_local = (cmd == "local") or ((cmd == "declare" or cmd == "typeset") and not cx.toplevel and not cx.topcode)
 		if
 			(cmd == "declare" or cmd == "typeset" or cmd == "local")
-			and not (cmd == "local" and cx.toplevel) -- `local` outside a function is an error (interp)
+			and not (cmd == "local" and (cx.toplevel or cx.topcode)) -- `local` outside a function is an error (interp)
 			and not st.assigns
 			and not (st.redirs and #st.redirs > 0) -- (a redirected one takes the general path)
 			and #aa == 1
@@ -4464,7 +4468,7 @@ simple_compiled = function(cx, st, after)
 					local fl = unq_full_lit(e.word)
 					local valx = (fl and fl:find("~", 1, true)) and ("rt.tilde_assign(sh, %q)"):format(fl)
 						or emit_word(e.word, cx.lifted)
-					parts[#parts + 1] = ("__it[#__it+1] = {key=%q, op=%q, val=%s}"):format(EF.static_key(e.key), e.op, valx)
+					parts[#parts + 1] = ("__it[#__it+1] = {key=%q, op=%q, val=%s, decl=true}"):format(EF.static_key(e.key), e.op, valx)
 				elseif not empty_word(e.word) then
 					-- an assoc's key/value words don't split or glob (see H.arrayassign)
 					if isassoc then
@@ -4492,11 +4496,13 @@ simple_compiled = function(cx, st, after)
 				-- bash forbids CHANGING an existing array's kind (-A on indexed / -a on assoc):
 				-- status 1, and the RHS values are NOT evaluated (interp assigns the literal only
 				-- when status==0). Gate the whole assign (values included) on the conversion check.
+				-- (a readonly target: a global declare's compound assignment aborts the line)
+				.. (as_local and "" or ("rt.array_ro_abort(sh, %q); "):format(a1.name))
 				.. ("do if not rt.array_convert_err(sh, %q, %s, %q)%s then "):format(
 					a1.name,
-					tostring(isassoc),
+					kindflag and tostring(isassoc) or "nil", -- (no -a/-A: no conversion check)
 					cmd,
-					as_local and (" and not rt.local_ro(sh, %q)"):format(a1.name) or ""
+					as_local and (" and not rt.local_ro(sh, %q, %q)"):format(a1.name, cmd) or ""
 				)
 				-- (the values are expanded BEFORE localizing: `local -a arr=("${arr[@]}")`)
 				.. table.concat(parts, "; ")
@@ -4685,7 +4691,7 @@ simple_compiled = function(cx, st, after)
 	-- `local` (bash) — so route a plain one through the native local path. A flag (incl.
 	-- -g), an array value (st.arrayargs delegated above), or `a[i]=` fails the plain check
 	-- below and delegates, as for local. At the top level declare stays a global (decl_native).
-	local as_local = cmd == "local" or ((cmd == "declare" or cmd == "typeset") and not cx.toplevel)
+	local as_local = cmd == "local" or ((cmd == "declare" or cmd == "typeset") and not cx.toplevel and not cx.topcode)
 	-- The native `local` fast path (sh:localAssign) handles ONLY a plain scalar
 	-- `local NAME[=val]`: it can't validate the name, honor a flag (-n/-A/-p), do
 	-- an array element `a[i]=`, or LIST (bare `local`). Delegate anything else to
@@ -4846,7 +4852,7 @@ simple_compiled = function(cx, st, after)
 	-- any context, no bump. A `name=value` literal still delegates (handled below / literal path).
 	local decl_in_fn = false
 	local decl_list = false
-	if not cx.toplevel and not st.arrayargs then
+	if not cx.toplevel and not cx.topcode and not st.arrayargs then
 		if cmd == "export" or cmd == "readonly" then
 			decl_list = true
 		elseif (cmd == "declare" or cmd == "typeset") and #st.words == 1 then
@@ -5047,7 +5053,7 @@ simple_compiled = function(cx, st, after)
 			-- In-function declare/typeset: bump calldepth (save/restore) so b_export
 			-- localizes each name, exactly as the delegate's cf-wrapper does. Elsewhere
 			-- (top level, other builtins) this is a plain dispatch.
-			local bcall = (decl_in_fn or (not cx.toplevel and (cmd == "command" or cmd == "builtin")))
+			local bcall = (decl_in_fn or (not cx.toplevel and not cx.topcode and (cmd == "command" or cmd == "builtin")))
 					and "do local __sc = sh.calldepth; if (sh.calldepth or 0) < 1 then sh.calldepth = 1 end; rt.builtin(sh, __a, __noop); sh.calldepth = __sc end"
 				or "rt.builtin(sh, __a, __noop)"
 			if redir_apply then
@@ -5309,19 +5315,23 @@ simple_compiled = function(cx, st, after)
 				tmps[#tmps + 1] = ("local %s = %s"):format(tn, av)
 				-- localAssign returns false for a READONLY name (message + that operand fails);
 				-- `local` returns 1 if ANY operand failed, else 0 — the others still localize.
-				calls[#calls + 1] = ("__lok = (sh:localAssign(%s) ~= false) and __lok"):format(tn)
+				calls[#calls + 1] = ("__lok = (sh:localAssign(%s, %q) ~= false) and __lok"):format(tn, cmd)
 			end
 		end
 		if #calls == 0 then
 			body = "sh.status = 0"
+			if cmd == "local" then -- (a `local` reached outside any function: interp's error)
+				body = "if not rt.local_nofn(sh) then sh.status = 0 end"
+			end
 		else
 			body = table.concat(tmps, "; ")
-				.. "; local __lok = true; "
+				.. (cmd == "local" and "; if not rt.local_nofn(sh) then " or "; do ")
+				.. "local __lok = true; "
 				.. table.concat(calls, "; ")
-				.. "; sh.status = __lok and 0 or 1"
+				.. "; sh.status = __lok and 0 or 1 end"
 			-- a function's lifted locals (func_locals): their registers take the new values
 			for j = 2, #st.words do
-				local nm = (unq_full_lit(st.words[j]) or ""):match("^([%a_][%w_]*)=")
+				local nm = (unq_full_lit(st.words[j]) or ""):match("^([%a_][%w_]*)%+?=")
 				if nm and EF.fn_locals and EF.fn_locals[nm] and cx.lifted[nm] then
 					body = body .. ("; %s = sh:aget(%q)"):format(lname(nm), nm)
 				end
@@ -5716,8 +5726,9 @@ H.forin = function(cx, st, after)
 	-- DEBUG fires at the `for` header before each iteration (bash), with an element present.
 	-- (no iteration at all: the loop's status is 0 — else it's the last body command's)
 	-- (a nameref program: rt.for_assign re-points a nameref loop variable, and a failed
-	-- assignment — a bad target — ends the loop with status 1)
-	if EF.has_nameref then
+	-- assignment — a bad target — ends the loop with status 1; an attributed program's
+	-- loop variable binds through declare -i/-l/-u)
+	if EF.has_nameref or EF.has_attr then
 		cx.blocks[advp] = ("%s; fs.idx = fs.idx + 1; if fs.idx > #fs.list then if fs.idx == 1 then sh.status = 0 end; pc = %d elseif not rt.for_assign(sh, %q, fs.list[fs.idx]) then sh.status = 1; pc = %d else %spc = %d end"):format(
 			getfs,
 			after,
@@ -6129,7 +6140,7 @@ H.arrayassign = function(cx, st, after)
 				local fl = unq_full_lit(e.word)
 				local valx = (fl and fl:find("~", 1, true)) and ("rt.tilde_assign(sh, %q)"):format(fl)
 					or emit_word(e.word, cx.lifted)
-				parts[#parts + 1] = ("__it[#__it+1] = {key=%q, op=%q, val=%s}"):format(EF.static_key(e.key), e.op, valx)
+				parts[#parts + 1] = ("__it[#__it+1] = {key=%q, op=%q, val=%s, src=%q, rawkey=%q}"):format(EF.static_key(e.key), e.op, valx, e.word and e.word.src or "", e.key)
 			elseif not empty_word(e.word) then
 				-- a bare word field-splits and globs for an INDEXED target, but is one plain word
 				-- in an ASSOCIATIVE key/value list (bash) — which one is only known at run time
@@ -6290,6 +6301,10 @@ end
 build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
 	-- per-CFG compile state, passed explicitly to the module-level statement handlers (H)
 	local cx = { stmts = stmts, lifted = lifted, funcflags = funcflags, inlinefns = inlinefns, toplevel = toplevel }
+	-- topcode: a fragment (pipeline stage, subshell, $( ), …) of code NOT in any function —
+	-- it runs at calldepth 0, so a `local`/`return` there is an error and a declare global
+	cx.topcode = not toplevel and EF.frag_topcode or nil
+	EF.frag_topcode = nil
 	emit_toplevel = cx.toplevel and true or false -- gates top-level-only ERR firing (see errchk)
 	-- each block remembers the source line being compiled when it was written (cx.pcline)
 	local pcline = {}
@@ -6392,7 +6407,7 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
 		-- into the native pc jump the corresponding literal keyword would make. loopdepth/
 		-- calldepth are set to the compile-time nesting first, so the interpreter's break/
 		-- continue/return actually FIRE (they gate on "is there an enclosing loop/func").
-		local inloop, infunc = #cx.loopstack > 0, not cx.toplevel
+		local inloop, infunc = #cx.loopstack > 0, not cx.toplevel and not cx.topcode
 		-- a `$( … )` body is a CFG of its own, but its return/break/continue belong to where
 		-- the substitution sits: a function (or not), a loop (or not)
 		local cs_ld
@@ -6675,7 +6690,7 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
 			body[k] = v
 		end
 		body.redirs = nil
-		local id = emit_fragment({ body }, false, EF.lifted_set, { loop = #cx.loopstack > 0, func = not cx.toplevel })
+		local id = emit_fragment({ body }, false, EF.lifted_set, { loop = #cx.loopstack > 0, func = not cx.toplevel and not cx.topcode })
 		if not id then
 			return nil
 		end
@@ -6709,7 +6724,7 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
 			return after
 		end
 		EF.cur_loopn = #cx.loopstack -- (compile_cmdsub: is this command inside a loop …
-		EF.cur_infunc = not cx.toplevel -- … or a function)
+		EF.cur_infunc = not cx.toplevel and not cx.topcode -- … or a function)
 		if st.line then
 			cx.prev_line = EF.cur_line -- (the command before: a redirected compound's errors)
 			EF.cur_line = t == "simple" and st.cline or st.line -- (a simple command: interp's rule)
@@ -7002,10 +7017,16 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
 			wb[#wb + 1] = ("sh:aset(%q, %s)"):format(n, lname(n))
 		end
 		local wbs = #wb > 0 and (table.concat(wb, "; ") .. "; ") or ""
+		-- (a line abort resumes at the next LINE GROUP — the parser's complete command:
+		-- `eval "…<newline>…"; echo` is one — else, with no groups recorded, a new line)
+		local lgs = false
+		for k = 1, #stmts do
+			lgs = lgs or stmts[k].lgstart or false
+		end
 		for k = 1, #stmts do
 			local ff = cx.DONE
 			for j = k + 1, #stmts do
-				if (stmts[j].line or 0) > (stmts[k].line or 0) then
+				if lgs and stmts[j].lgstart or not lgs and (stmts[j].line or 0) > (stmts[k].line or 0) then
 					ff = mark[j]
 					break
 				end

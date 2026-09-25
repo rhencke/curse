@@ -1235,7 +1235,9 @@ arith_key = function(sh, name, idxexpr, idxraw)
 	if idxexpr == nil then -- a non-arith subscript (e.g. quoted) on a NON-assoc array
 		io.stderr:write("curse: " .. P.arith_errmsg(idxraw or "", select(2, pcall(P.arith, idxraw or ""))) .. "\n")
 		P.arith_cmd = sv
-		error({ __curse_exit = 1, __curse_matherr = true, __curse_experr = true })
+		-- (array_expand_index: DISCARD, out of every eval/function level — see rt.int_value)
+		error({ __curse_exit = 1, __curse_matherr = true, __curse_experr = true, __curse_lineabort = true,
+			__curse_subscript = true, __curse_discard = true })
 	end
 	-- (an expansion in the subscript that needs bash's textual substitution is quoted as
 	-- within a subscript: an error shows `0\],b\[1` — the xpand node reads this)
@@ -1247,7 +1249,9 @@ arith_key = function(sh, name, idxexpr, idxraw)
 	if not ok then
 		if type(v) == "table" and v.__curse_matherr and not v.__curse_subscript then
 			-- a subscript's error abandons the whole line, even from (( )) or [[ ]] (bash)
-			v = { __curse_exit = 1, __curse_matherr = true, __curse_lineabort = true, __curse_subscript = true }
+			-- (arrayfunc.c array_expand_index: top_level_cleanup + DISCARD — see rt.int_value)
+			v = { __curse_exit = 1, __curse_matherr = true, __curse_lineabort = true, __curse_subscript = true,
+				__curse_discard = true }
 		end
 		error(v, 0)
 	end
@@ -1281,8 +1285,9 @@ array_key = function(sh, name, index_raw)
 			io.stderr:write("curse: " .. P.arith_errmsg(index_raw, v) .. "\n")
 		end
 		P.arith_cmd = sv
-		-- an expansion error discards the rest of the top-level line (bash jump_to_top_level)
-		error({ __curse_exit = 1, __curse_lineabort = true })
+		-- an expansion error discards the rest of the top-level line (bash jump_to_top_level
+		-- after top_level_cleanup: out of every function/eval/source level — rt.int_value)
+		error({ __curse_exit = 1, __curse_lineabort = true, __curse_discard = true })
 	end
 	P.arith_cmd = sv
 	return v
@@ -1585,7 +1590,7 @@ function M.assign_scalar(sh, name, value)
 	if b and b.arr then
 		sh:array_set(name, array_key(sh, name, "0"), value, false)
 	elseif b and b.int and not b.ref then
-		sh:aset(name, M.arith_eval_str(sh, value))
+		sh:aset(name, rt.int_value(sh, value, M.arith_eval_str))
 	elseif b and (b.lower or b.upper) then
 		sh:set_str(name, b.lower and value:lower() or value:upper())
 	elseif sh:set_str(name, value) == false then -- (a valueless nameref given a bad target)
@@ -3156,7 +3161,7 @@ local function arrayassign_items(sh, st, isassoc)
 	for _, e in ipairs(st.elems) do
 		if e.key ~= nil and not (e.brace_bare and not isassoc) then
 			-- keyed: an associative array (always keyed), or an indexed key with no brace.
-			items[#items + 1] = { key = e.key, op = e.op, val = expand_assign_word(sh, e.word) }
+			items[#items + 1] = { key = e.key, op = e.op, val = expand_assign_word(sh, e.word), src = e.word.src }
 		else
 			-- bare: a genuine bare element, OR an indexed keyed element whose value
 			-- brace-expands (bash de-keys it — `[k]=` becomes literal in each bare word).
@@ -3254,7 +3259,10 @@ local function do_arrayassign(sh, st)
 					io.stderr:write("curse: " .. name .. ": " .. it.val .. ": must use subscript when assigning associative array\n")
 				else
 					local idx = array_key(sh, name, it.key)
-					if it.op == "+=" and not st.append then -- append to the pre-statement value (see snap)
+					if idx == "" then -- (an empty key: reported as written — by declare, requoted —
+						-- and skipped; the rest still land)
+						io.stderr:write("curse: " .. rt.empty_key_src(sh, it) .. ": bad array subscript\n")
+					elseif it.op == "+=" and not st.append then -- append to the pre-statement value (see snap)
 						sh:array_set(name, idx, (snap and snap[idx] or "") .. it.val, false)
 					else
 						sh:array_set(name, idx, it.val, it.op == "+=")
@@ -3332,6 +3340,7 @@ function M.run_arrayassign(sh, st)
 	elseif st.index then
 		io.stderr:write("curse: " .. st.name .. "[" .. st.index .. "]: cannot assign list to array member\n")
 		sh.status = 1
+		error({ __curse_exit = 1, __curse_lineabort = true }) -- (and abandons the line: bash)
 	elseif rb and rb.ro then
 		io.stderr:write("curse: " .. st.name .. ": readonly variable\n")
 		sh.status = 1
@@ -3392,6 +3401,10 @@ end
 -- the dynamic arrays bash lists among its variables (curse computes them on demand)
 local DYN_ARRAYS = { BASH_ARGC = 1, BASH_ARGV = 1, BASH_LINENO = 1, BASH_SOURCE = 1, DIRSTACK = 1, FUNCNAME = 1, GROUPS = 1 }
 M.DYN_ARRAYS = DYN_ARRAYS
+-- bash's dynamic scalars (computed on read, no var box here) and their attributes
+local DYN_SCALARS = { BASHPID = "i", HISTCMD = "i", RANDOM = "i", SRANDOM = "i", SECONDS = "i", LINENO = "-",
+	EPOCHSECONDS = "-", EPOCHREALTIME = "-", BASH_SUBSHELL = "-", BASH_COMMAND = "-" }
+M.DYN_SCALARS = DYN_SCALARS
 -- Format one variable as a `declare -p` line, or nil if it is unset.
 local function fmt_decl(sh, name)
 	-- SHELLOPTS/BASHOPTS are readonly, exported, derived specials with no var box.
@@ -3412,6 +3425,9 @@ local function fmt_decl(sh, name)
 			return name == "FUNCNAME" and "declare -a FUNCNAME" or ("declare -a " .. name .. "=()")
 		end
 		return "declare -a " .. name .. "=(" .. table.concat(parts, " ") .. ")"
+	end
+	if b == nil and DYN_SCALARS[name] then
+		return "declare -" .. DYN_SCALARS[name] .. " " .. name .. "=" .. decl_quote(sh:get(name) or "")
 	end
 	if b == nil then
 		return nil
@@ -5196,14 +5212,11 @@ local function assign_body(sh, st, nref_base, nref_sub)
 			st.append
 		)
 	elseif st.index then
-		if
-			not sh:array_set(
-				st.name,
-				array_key(sh, st.name, st.index),
-				assign_rhs_a(sh, st),
-				st.append
-			)
-		then
+		local key = array_key(sh, st.name, st.index)
+		if key == "" and sh:is_assoc(st.name) then -- (an associative array has no "" key)
+			error({ __curse_badsub = true })
+		end
+		if not sh:array_set(st.name, key, assign_rhs_a(sh, st), st.append) then
 			error({ __curse_badsub = true })
 		end
 	elseif st.arith then
@@ -5214,7 +5227,7 @@ local function assign_body(sh, st, nref_base, nref_sub)
 			sh:array_set(st.name, array_key(sh, st.name, "0"), assign_rhs_a(sh, st), true)
 		elseif b and b.int then -- integer var: += is arithmetic addition (the old value
 			-- is itself evaluated: `b=4+1; typeset -i b; b+=37` is 42 — bash)
-			sh:aset(st.name, rt.arith_str(sh, sh:get(st.name)) + M.arith_eval_str(sh, assign_rhs_w(sh, st)))
+			sh:aset(st.name, rt.int_value(sh, sh:get(st.name)) + rt.int_value(sh, assign_rhs_w(sh, st), M.arith_eval_str))
 		elseif b and (b.lower or b.upper) then -- declare -l/-u: case-fold the appended result
 			local v = sh:get(st.name) .. assign_rhs_a(sh, st)
 			sh:set_str(st.name, b.lower and v:lower() or v:upper())
@@ -5226,7 +5239,7 @@ local function assign_body(sh, st, nref_base, nref_sub)
 		if b and b.arr then -- plain `name=value` on an array var writes element 0 (bash)
 			sh:array_set(st.name, array_key(sh, st.name, "0"), assign_rhs_a(sh, st), false)
 		elseif b and b.int and not b.ref then -- integer var (declare -i): assign arith-evaluates
-			sh:aset(st.name, M.arith_eval_str(sh, assign_rhs_w(sh, st)))
+			sh:aset(st.name, rt.int_value(sh, assign_rhs_w(sh, st), M.arith_eval_str))
 		elseif b and (b.lower or b.upper) then -- declare -l/-u: case-fold on assign
 			local v = assign_rhs_a(sh, st)
 			sh:set_str(st.name, b.lower and v:lower() or v:upper())
@@ -5518,6 +5531,7 @@ exec_stmt = function(sh, st, hook)
 		elseif st.index then -- `a[0]=(1 2)`: can't assign a list to an array MEMBER (bash)
 			io.stderr:write("curse: " .. st.name .. "[" .. st.index .. "]: cannot assign list to array member\n")
 			sh.status = 1
+			error({ __curse_exit = 1, __curse_lineabort = true }) -- (and abandons the line: bash)
 		elseif rb and rb.ro then -- readonly array: reject the (re)assignment — and, like a
 			-- scalar's, abort the rest of the line (fatal under -c/posix)
 			io.stderr:write("curse: " .. st.name .. ": readonly variable\n")
@@ -5699,19 +5713,28 @@ exec_stmt = function(sh, st, hook)
 			-- listing and so `local`/`declare` establishes the scope + attributes). The
 			-- actual array assignment happens AFTER the builtin runs (below), so it lands
 			-- in the freshly-declared/local variable.
-			local wasro -- (a name ALREADY readonly: its literal isn't assigned, bash errors)
+			-- A name ALREADY readonly: bash's compound assignment fails as the words expand,
+			-- before the builtin runs — `ra: readonly variable`, the rest of the line
+			-- abandoned — unless the builtin makes a new local (a function's declare/local)
+			local dcl, glob = args[1], false
+			for k = 2, #args do
+				glob = glob or args[k]:match("^%-%a*[gG]") ~= nil
+			end
+			local localize = dcl == "local" or ((dcl == "declare" or dcl == "typeset") and (sh.calldepth or 0) > 0 and not glob)
 			for _, aa in ipairs(st.arrayargs) do
 				args[#args + 1] = aa.name
 				local b = sh.vars[sh:deref(aa.name)]
-				if b and b.ro and args[1] ~= "local" then
-					wasro = wasro or {}
-					wasro[aa] = true
+				if b and b.ro and not localize then
+					io.stderr:write("curse: " .. aa.name .. ": readonly variable\n")
+					sh.status = 1
+					error({ __curse_exit = 1, __curse_lineabort = true })
 				elseif b and b.ro and sh:is_global_ro(sh:deref(aa.name)) then
 					-- `local ro=(…)`: bash's compound assignment fails first, then local's own error
-					io.stderr:write("curse: " .. aa.name .. ": readonly variable\n")
+					-- (the first under this_command_name — still the calling FUNCTION's name)
+					local fnm = sh.funcstack and sh.funcstack[1]
+					io.stderr:write("curse: " .. (fnm and (fnm .. ": ") or "") .. aa.name .. ": readonly variable\n")
 				end
 			end
-			sh.arrayargs_ro = wasro
 			-- (names with a NAME=(…) literal: declare -g keeps its global view until they're
 			-- assigned, and a failed kind conversion reports/skips them bash's way)
 			sh.arrayargs_pending = {}
@@ -5984,10 +6007,18 @@ exec_stmt = function(sh, st, hook)
 							exported = b.exported,
 							ro = b.ro,
 							ref = b.ref,
+							int = b.int,
+							lower = b.lower,
+							upper = b.upper,
+							cap = b.cap,
+							trace = b.trace,
 						} or false,
 					}
-					if b and b.ref then -- a NAMEREF's prefix binding is a plain temporary of its own
-						sh.vars[a.name] = {} -- (bash: the target is untouched; restored below)
+					-- a NAMEREF's prefix binding is a plain temporary of its own (bash: the target
+					-- is untouched; restored below), and so is an -i/-l/-u/-c var's: bash's tempenv
+					-- variable is a plain string (`i=1+1 cmd` passes "1+1")
+					if b and (b.ref or ((b.int or b.lower or b.upper or b.cap) and not b.arr and not b.ro)) then
+						sh.vars[a.name] = {}
 					end
 					if a.raw then -- NAME=(…) as a command prefix is a literal string, not an array (bash)
 						sh:set_str(a.name, a.raw)
@@ -6043,15 +6074,10 @@ exec_stmt = function(sh, st, hook)
 		local aaskip = sh.arrayargs_pending and sh.arrayargs_pending.skip
 		local aaforce = sh.arrayargs_pending and sh.arrayargs_pending.force -- (assigned even so)
 		if st.arrayargs and (sh.status == 0 or aaforce) then
-			local wasro = sh.arrayargs_ro
-			sh.arrayargs_ro = nil
 			local failed = sh.status ~= 0
 			for _, aa in ipairs(st.arrayargs) do
 				if failed and not aaforce[aa.name] then
 				elseif aaskip and aaskip[aa.name] then -- (a rejected kind conversion: untouched)
-				elseif wasro and wasro[aa] then
-					io.stderr:write("curse: " .. aa.name .. ": readonly variable\n")
-					sh.status = 1
 				else
 					do_arrayassign(sh, aa)
 				end
@@ -6700,8 +6726,11 @@ run_trap = function(sh, code)
 	sh.in_trap = (sh.in_trap or 0) + 1
 	local sxd = sh.xdepth -- (a handler's commands trace one level deeper: `++ cmd`, bash)
 	sh.xdepth = (sxd or 0) + 1
-	local ok, err = pcall(function()
-		for _, st in ipairs(P.parse(code).stmts) do
+	local stmts, k = P.parse(code).stmts, 0
+	local function body()
+		while k < #stmts do
+			k = k + 1
+			local st = stmts[k]
 			exec_stmt(sh, st, function() end)
 			-- a failed eligible command INSIDE a handler fires the ERR trap (bash), but
 			-- NOT the errexit-exit half; in_err_trap keeps the ERR handler from re-firing.
@@ -6722,13 +6751,25 @@ run_trap = function(sh, code)
 				fire_err_trap(sh)
 			end
 		end
-	end)
+	end
+	local ok, err = pcall(body)
+	-- (the handler is parse_and_execute'd: a line abort in it — a div0 — skips the rest of
+	-- that handler line only)
+	while not ok and type(err) == "table" and err.__curse_lineabort and not err.__curse_discard do
+		sh.status = 1
+		while k < #stmts and not stmts[k + 1].lgstart do
+			k = k + 1
+		end
+		ok, err = pcall(body)
+	end
 	sh.in_trap = sh.in_trap - 1
 	sh.xdepth = sxd
 	sh.trap_calldepth, sh.trap_saved = saved_tcd, saved_ts
 	sh.cur_line = savedline
 	if not ok then
-		if type(err) == "table" and err.__curse_parseerr then -- syntax error in the trap code: warned, non-fatal, doesn't exit or change status (bash)
+		if type(err) == "table" and err.__curse_discard then -- (bash's DISCARD: unwinds the
+			error(err, 0) -- handler and abandons the interrupted top-level command)
+		elseif type(err) == "table" and err.__curse_parseerr then -- syntax error in the trap code: warned, non-fatal, doesn't exit or change status (bash)
 		elseif type(err) == "table" and err.__curse_exit then
 			sh.status = err.__curse_exit
 			exited = true
@@ -6955,7 +6996,7 @@ local function run_group(sh, lg, hook, k)
 			-- a fatal WORD-context expansion (div0 in $((…)), failglob no-match) aborts
 			-- the REST of this line; under `set -e` it exits the shell like any failure
 			if type(err) == "table" and err.__curse_lineabort then
-				if sh.opt_e then
+				if sh.opt_e and not err.__curse_discard then
 					error(err)
 				end
 				rt.posix_arith_fatal(sh, err)
@@ -7333,7 +7374,7 @@ function M.source_file(sh, path, hook)
 			local sok, serr = pcall(exec_stmt, sh, st, hook)
 			if not sok then
 				if type(serr) == "table" and serr.__curse_lineabort then
-					if sh.opt_e then
+					if sh.opt_e and not serr.__curse_discard then
 						error(serr)
 					end
 					rt.posix_arith_fatal(sh, serr)

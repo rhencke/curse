@@ -101,14 +101,16 @@ end
 -- line (bash), so re-enter run at sh._ff (set by the per-top-level-statement
 -- markers) with $?=1. Under `set -e` it exits like any failed command. Keeping this
 -- retry OUT of the generated run() lets pc/lifted stay fast locals (no closure).
-function M.run_compiled(mod, sh, pc)
+-- `nested` (an eval/source/hot-loop fragment): a __curse_discard lineabort (bash's
+-- top_level_cleanup + DISCARD) is not contained here but unwinds to the top level.
+function M.run_compiled(mod, sh, pc, nested)
 	local pd0, cd0, fs0 = sh.pd, sh.calldepth, sh.funcstack and #sh.funcstack or 0
 	while true do
 		local ok, err = pcall(mod.run, sh, pc)
 		if ok then
 			return
 		end
-		if type(err) == "table" and err.__curse_lineabort and not sh.opt_e then
+		if type(err) == "table" and err.__curse_lineabort and (not sh.opt_e or err.__curse_discard) then
 			-- a lineabort from inside a function call unwinds its frames (locals, params,
 			-- FUNCNAME) — the compiled call sites pop them only on a normal return
 			while sh.pd > pd0 do
@@ -118,6 +120,9 @@ function M.run_compiled(mod, sh, pc)
 				sh:leaveFunc()
 			end
 			sh.calldepth = cd0
+			if nested and err.__curse_discard then
+				error(err, 0)
+			end
 			rt.posix_arith_fatal(sh, err)
 			sh.status = 1
 			pc = sh._ff
@@ -340,10 +345,10 @@ function M.loop_osr(sh, st)
 		local fid = st._fid
 		local saved = sh.forstate[fid]
 		sh.forstate[fid] = sh.forstate[st.id]
-		ok, err = pcall(M.run_compiled, mod, sh, mod.loopPc[fid])
+		ok, err = pcall(M.run_compiled, mod, sh, mod.loopPc[fid], true)
 		sh.forstate[fid] = saved
 	else
-		ok, err = pcall(M.run_compiled, mod, sh, nil)
+		ok, err = pcall(M.run_compiled, mod, sh, nil, true)
 	end
 	sh.loopdepth = ld
 	if ok then

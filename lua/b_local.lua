@@ -18,22 +18,28 @@ local C, P = I.C, I.P
 
 return function(sh, cmd, args, hook, tcb)
 	if cmd == "local" then
+		if args[2] == "--help" then -- (CASE_HELPOPT: before the function check, status 2)
+			require("b_help")(sh, "help", { "help", "local" }, hook, tcb)
+			sh.status = 2
+			return
+		end
 		if sh.pd == 0 and (sh.calldepth or 0) == 0 then -- (no function: checked before anything)
 			io.stderr:write("curse: local: can only be used in a function\n")
 			sh.status = 1
 			return
 		end
-		-- local [-naA] [+n] NAME[=val]…: shadow the var in this scope, honoring
-		-- nameref (-n), indexed (-a) and associative (-A) attributes.
-		local nref, assoc, plusn, rest, lok = false, false, false, {}, true
-		local iattr, lattr, uattr, aattr, rattr = false, false, false, false, false
-		local inherit, pflag, tattr = false, false, false
+		-- local is bash's declare_internal(list, local_var=1): the same options as declare,
+		-- every operand made local. Validate the options, handle -f/-F, the listing, -p and
+		-- `local -` here; a plain `local NAME[=value]…` takes the localAssign fast path, and
+		-- anything with an attribute goes through declare's code (b_export) as `local`.
+		local attrs, pflag, inherit, dash, rest = false, false, false, false, {}
+		local endopts = false
 		for j = 2, #args do -- (bash's option pass first: a bad letter rejects the lot)
 			local a = args[j]
-			if a == "--" or not a:match("^[-+].") then
+			if endopts or a == "--" or not a:match("^[-+].") then
 				break
 			end
-			local bad = a:match("[^aAfFgiIlnprtux]", 2)
+			local bad = a:match("[^aAcfFgGiIlnprtux]", 2)
 			if bad then
 				io.stderr:write("curse: local: " .. a:sub(1, 1) .. bad .. ": invalid option\n")
 				io.stderr:write("local: usage: local [option] name[=value] ...\n")
@@ -57,77 +63,61 @@ return function(sh, cmd, args, hook, tcb)
 		end
 		for j = 2, #args do
 			local a = args[j]
-			if a == "--" then
-			elseif a == "-" then
-				-- `local -`: the set options become local to this call (restored by popCall)
-				sh.local_opts = sh.local_opts or {}
-				if not sh.local_opts[sh.pd] then
-					local snap = {}
-					for _, f in ipairs(rt.opt_fields()) do
-						snap[f] = { v = sh[f] } -- (exact: nil means "the default")
-					end
-					sh.local_opts[sh.pd] = snap
-				end
-			elseif a:sub(1, 1) == "-" and #a > 1 then
-				if a:find("n") then
-					nref = true
-				end
-				if a:find("A") then
-					assoc = true
-				end
-				if a:find("a") then
-					aattr = true
-				end
-				if a:find("i") then
-					iattr = true
-				end
-				if a:find("l") then
-					lattr = true
-				end
-				if a:find("u") then
-					uattr = true
-				end
-				if a:find("r") then
-					rattr = true
-				end
-				if a:find("t") then
-					tattr = true
-				end
-				if a:find("p") then
+			if endopts then
+				rest[#rest + 1] = a
+			elseif a == "--" then
+				endopts = true
+			elseif a:match("^[-+].") then
+				if a:find("p") then -- (+p too: bash's pflag++ ignores the sign)
 					pflag = true
 				end
-				if a:find("I") then
+				if a:find("I") and a:sub(1, 1) == "-" then
 					inherit = true -- (-I: the local starts as a copy of the outer var)
 				end
-			elseif a:sub(1, 1) == "+" and #a > 1 then
-				if a:find("n") then
-					plusn = true
+				if a:find("[aAcgGilnrtux]") then
+					attrs = true
 				end
+				endopts = false
 			else
+				endopts = true -- (the first operand ends the options)
 				rest[#rest + 1] = a
 			end
+			dash = dash or (a == "-" and endopts)
 		end
-		local attrs = nref or assoc or plusn or iattr or lattr or uattr or aattr or rattr or tattr
-		if pflag and #rest > 0 and not attrs then -- `local -p NAME…`: those of this frame's locals
-			local saved = sh.savedstack[sh.pd]
+		local saved = sh.savedstack[sh.pd]
+		local opts_local = sh.local_opts and sh.local_opts[sh.pd]
+		if pflag and #rest > 0 then -- `local -p NAME…` (show_localname_attributes): this frame's
+			local ok = true
 			for _, nm in ipairs(rest) do
-				local d = saved and saved[nm] ~= nil and fmt_decl(sh, nm)
+				local d
+				if nm == "-" then
+					d = opts_local and "declare -- -" -- (the local `-` variable, valueless)
+				else
+					d = saved and saved[nm] ~= nil and fmt_decl(sh, nm)
+				end
 				if d then
 					sh:echo(d)
+				else
+					io.stderr:write("curse: local: " .. nm .. ": not found\n")
+					ok = false
 				end
 			end
-			sh.status = 0
+			sh.status = ok and 0 or 1
 			return
 		end
-		if #rest == 0 and not attrs then
-			-- bare `local` / `local -p`: list this frame's local variables (bash format)
-			local saved, names = sh.savedstack[sh.pd], {}
+		if #rest == 0 then
+			-- bare `local` / `local -p` / `local -i`: list this frame's local variables (bash
+			-- format), a local `-` (set options) first as `local -`
+			local names = {}
 			if saved then
 				for nm in pairs(saved) do
 					names[#names + 1] = nm
 				end
 			end
 			table.sort(names)
+			if opts_local then
+				sh:echo("local -")
+			end
 			for _, nm in ipairs(names) do
 				local d = fmt_decl(sh, nm)
 				if d then
@@ -137,100 +127,43 @@ return function(sh, cmd, args, hook, tcb)
 			sh.status = 0
 			return
 		end
+		if dash and not opts_local then
+			-- `local -`: the set options become local to this call (restored by popCall)
+			sh.local_opts = sh.local_opts or {}
+			local snap = {}
+			for _, f in ipairs(rt.opt_fields()) do
+				snap[f] = { v = sh[f] } -- (exact: nil means "the default")
+			end
+			sh.local_opts[sh.pd] = snap
+		end
 		sh.local_inherit = inherit or nil -- (read by Shell:localVar; cleared below)
-		if not attrs then
-			for _, a in ipairs(rest) do
-				local anm, sub, aop, aval = a:match("^([%a_][%w_]*)%[(.-)%](%+?=)(.*)$")
-				if anm then -- local a[i]=v : create the element in a local array
-					sh:localVar(anm)
-					sh:array_set(anm, array_key(sh, anm, sub), aval, aop == "+=")
-				elseif not (a:match("^[%a_][%w_]*$") or a:match("^[%a_][%w_]*%+?=") or a:find("[", 1, true)) then
-					io.stderr:write("curse: local: `" .. a .. "': not a valid identifier\n")
-					lok = false
-				elseif
-					(function()
-						local ln = a:match("^([%a_][%w_]*)")
-						return ln and sh:is_global_ro(sh:deref(ln))
-					end)()
-				then
-					-- a readonly var can't be localized (bash errors, skips it, continues)
-					io.stderr:write("curse: local: " .. a:match("^([%a_][%w_]*)") .. ": readonly variable\n")
-					lok = false
-				else
-					sh:localAssign(a)
-					if sh.opt_a then
-						local nm = a:match("^([%a_][%w_]*)")
-						local b = nm and sh.vars[sh:deref(nm)]
-						if b and not b.arr then
-							b.exported = true
-							C.setenv(nm, sh:get(nm), 1)
-						end
-					end
+		if attrs then
+			local dargs = {}
+			for j = 1, #args do
+				if args[j] ~= "-" then
+					dargs[#dargs + 1] = args[j]
 				end
 			end
-		else
-			for _, a in ipairs(rest) do
-				local nm, ap, val = a:match("^([%a_][%w_]*)(%+?)=(.*)$")
-				ap = ap == "+"
-				local vname = nm or a
-				local db = not nref and not plusn and sh.vars[vname]
-				if db and db.ref and db.s and db.s:match("^[%a_][%w_]*$") and sh:deref(vname) ~= "" then
-					vname = sh:deref(vname) -- (`local -a ref`, ref -> var: a local var, not the ref)
-					nm = nm and vname
-				end
-				sh:localVar(vname)
-				if nref then
-					if not sh:nameref_decl("local", nm or vname, val, true) then
-						lok = false
-					end
-				elseif plusn then
-					sh:unref(vname)
-				else
-					-- -A/-a/-i/-l/-u/-r (mirrors declare in a function): apply the value arith-evaluated
-					-- for -i, case-folded for -l/-u, else the plain string; then any -r readonly mark.
-					if assoc then
-						sh:declare_assoc(vname)
-					elseif aattr then
-						local b = sh.vars[vname] or {}
-						if not b.assoc then
-							if b.s ~= nil and not b.arr then -- (an inherited scalar becomes [0])
-								b.arr = { [0] = b.s }
-								b.s, b.n = nil, nil
-							end
-							b.arr = b.arr or {}
-						end
-						sh.vars[vname] = b
-					end
-					if nm then
-						if iattr then
-							sh:aset(nm, M.arith_eval_str(sh, val))
-							sh.vars[nm].int = true
-						elseif lattr or uattr then
-							sh:set_str(nm, lattr and val:lower() or val:upper())
-							sh.vars[nm].lower = lattr or nil
-							sh.vars[nm].upper = uattr or nil
-						elseif aattr and not assoc then -- `local -a a=v` / `a+=v`: element 0
-							sh:array_set(nm, 0, val, ap)
-						elseif not (assoc or aattr) then -- (an existing array local takes it as [0])
-							rt.assign_scalar(sh, nm, ap and (sh:get(nm) .. val) or val)
-						end
-					elseif iattr or lattr or uattr then
-						local b = sh.vars[vname] or {}
-						b.int = iattr or b.int
-						b.lower = lattr or b.lower
-						b.upper = uattr or b.upper
-						sh.vars[vname] = b
-					end
-					if tattr and sh.vars[vname] then
-						sh.vars[vname].trace = true
-					end
-					if rattr then
-						local b = sh.vars[sh:deref(vname)]
-						if b then
-							b.ro = true
-						end
-					end
-				end
+			local ok, err = pcall(require("b_export"), sh, "local", dargs, hook, tcb)
+			sh.local_inherit = nil
+			if not ok then
+				error(err, 0)
+			end
+			return
+		end
+		local lok = true
+		for _, a in ipairs(rest) do
+			local anm, sub, aop, aval = a:match("^([%a_][%w_]*)%[(.-)%](%+?=)(.*)$")
+			if a == "-" then
+			elseif anm then -- local a[i]=v : create the element in a local array
+				sh:localVar(anm)
+				sh:array_set(anm, array_key(sh, anm, sub), aval, aop == "+=")
+			elseif not (a:match("^[%a_][%w_]*$") or a:match("^[%a_][%w_]*%+?=") or a:find("[", 1, true)) then
+				io.stderr:write("curse: local: `" .. a .. "': not a valid identifier\n")
+				lok = false
+				sh.badassign = true -- (EX_BADASSIGN: see rt stage_body)
+			elseif not sh:localAssign(a, "local") then
+				lok = false -- (a readonly var can't be localized: bash errors, skips it, continues)
 			end
 		end
 		sh.local_inherit = nil

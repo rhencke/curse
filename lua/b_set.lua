@@ -33,14 +33,22 @@ local USAGE = "set: usage: set [-abefhkmnptuvxBCEHPT] [-o option-name] [--] [-] 
 return function(sh, cmd, args, hook, tcb)
 	if cmd == "set" then
 		-- set [-e|+e|-o NAME|+o NAME|…] [--] [ARGS…]: options then positional params
-		if #args == 1 then -- bare `set`: list all shell variables, sorted by name
-			local names = {}
+		if #args == 1 then -- bare `set` (and bare `declare`): all shell variables, sorted by
+			-- name, then — outside posix mode — every function's definition (bash's set_builtin)
+			local names, virt = {}, {}
 			for nm in pairs(sh.vars) do
 				names[#names + 1] = nm
 			end
+			-- SHELLOPTS / BASHOPTS are derived live (not stored) but are listed
+			for _, nm in ipairs({ "SHELLOPTS", "BASHOPTS" }) do
+				if sh.vars[nm] == nil then
+					virt[nm] = { s = sh:get(nm) }
+					names[#names + 1] = nm
+				end
+			end
 			table.sort(names)
 			for _, nm in ipairs(names) do
-				local b = sh.vars[nm]
+				local b = sh.vars[nm] or virt[nm]
 				-- (a declared-but-never-assigned array isn't listed either)
 				if b and not (b.s == nil and b.n == nil and b.arr == nil) and not (b.empty_decl and b.arr and next(b.arr) == nil) then
 					sh.out(fmt_set_var(nm, b) .. "\n")

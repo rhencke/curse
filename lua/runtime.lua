@@ -558,10 +558,31 @@ function Shell:is_global_ro(name)
 	end
 	return true
 end
-function M.local_ro(sh, name)
-	if sh:is_global_ro(name) then
+-- `local` outside any function (a compiled subshell / pipeline stage / $( ) at the top
+-- level runs it natively): bash's "can only be used in a function", status 1
+-- `declare ra=(…)` (not making a local) on a readonly array: bash's compound assignment
+-- fails as the words expand — before the builtin — and the rest of the line is abandoned
+function M.array_ro_abort(sh, name)
+	local b = sh.vars[sh:deref(name)]
+	if b and b.ro then
 		sh:errmsg("curse: " .. name .. ": readonly variable\n")
-		sh:errmsg("curse: local: " .. name .. ": readonly variable\n")
+		sh.status = 1
+		error({ __curse_exit = 1, __curse_lineabort = true })
+	end
+end
+function M.local_nofn(sh)
+	if sh.pd == 0 and (sh.calldepth or 0) == 0 then
+		sh:errmsg("curse: local: can only be used in a function\n")
+		sh.status = 1
+		return true
+	end
+	return false
+end
+function M.local_ro(sh, name, cmd)
+	if sh:is_global_ro(name) then -- (the compound assignment's error names the FUNCTION: bash's
+		local fnm = sh.funcstack and sh.funcstack[1] -- this_command_name still holds it)
+		sh:errmsg("curse: " .. (fnm and (fnm .. ": ") or "") .. name .. ": readonly variable\n")
+		sh:errmsg("curse: " .. (cmd or "local") .. ": " .. name .. ": readonly variable\n")
 		sh.status = 1
 		return true
 	end
@@ -572,18 +593,40 @@ end
 -- the shadowed outer one). Returns false (else true) when the name is READONLY: bash
 -- fails that operand (message + `local` returns 1) WITHOUT shadowing it or changing
 -- the value, and continues with the rest — so the caller ORs the results into $?.
-function Shell:localAssign(arg)
+function Shell:localAssign(arg, cmd)
 	local nm, op, val = arg:match("^([%a_][%w_]*)(%+?=)(.*)$")
 	local name = nm or arg
 	-- readonly NAME: no shadow, no assignment (the readonly global stays visible in the
-	-- frame). Message routes through any 2>&1 capture, exactly like interp.
-	if self:is_global_ro(name) then
-		self:errmsg("curse: local: " .. name .. ": readonly variable\n")
+	-- frame) — nor for a readonly local of this same scope (`local -r x; local x=2`: bash's
+	-- make_local_variable returns it, and the assignment fails). Message routes through
+	-- any 2>&1 capture, exactly like interp.
+	local own = self.savedstack[self.pd]
+	local ob = self.vars[name]
+	if self:is_global_ro(name) or (nm and ob and ob.ro and own and own[name] ~= nil) then
+		self:errmsg("curse: " .. (cmd or "local") .. ": " .. name .. ": readonly variable\n")
+		if nm then -- (a value for a readonly var: EX_BADASSIGN — see stage_body)
+			self.badassign = true
+		end
 		return false
 	end
 	if nm then
+		local again = own and own[nm] ~= nil -- (already local here: it keeps its attributes)
 		self:localVar(nm, true)
-		self:set_str(nm, op == "+=" and (self:get(nm) .. val) or val)
+		local b = again and self.vars[nm]
+		if b and (b.int or b.lower or b.upper or b.cap or b.arr or b.ref) then
+			-- an attributed local assigns like `name=value` / `name+=value` (declare -i
+			-- arithmetic — its errors naming the builtin — case folding, element 0)
+			local P = require("parser")
+			local sv = P.arith_cmd
+			P.arith_cmd = cmd or "local"
+			local ok, e = pcall(op == "+=" and M.append_scalar or M.assign_scalar, self, nm, val)
+			P.arith_cmd = sv
+			if not ok then
+				error(e, 0)
+			end
+		else
+			self:set_str(nm, op == "+=" and (self:get(nm) .. val) or val)
+		end
 	else
 		self:localVar(arg)
 	end
@@ -3116,6 +3159,11 @@ function M.for_assign(sh, name, v)
 		b.s = v
 		return true
 	end
+	-- (the loop variable is bound like an assignment: declare -i evaluates, -l/-u fold)
+	if b and (b.int or b.lower or b.upper) and not b.arr then
+		M.assign_scalar(sh, name, v)
+		return true
+	end
 	return sh:set_str(name, v) ~= false
 end
 function M.for_var_ro(sh, name)
@@ -3641,6 +3689,7 @@ local function co_launch(ctx, self, stage_fns, inproc, base, lastpipe, upv)
 				ctx.vpid, ctx.task = g.vpid, t
 				M.vpid_ctx[g.vpid] = ctx
 			end
+			sh.badassign = nil
 			local ok, err = pcall(fn, sh)
 			if C.getpid() ~= mypid then
 				-- a process FORKED inside this stage (a subshell's child, `( exec … )`) unwound
@@ -3675,6 +3724,12 @@ local function co_launch(ctx, self, stage_fns, inproc, base, lastpipe, upv)
 			if not fok and type(ferr) == "table" and ferr.__curse_sigpipe then
 				return 141
 			end
+			-- a declaration builtin's assignment error returns EX_BADASSIGN (260), which the
+			-- shell maps to 1 — except as a forked simple command's exit status: 260 & 255 = 4
+			-- (an "sflat" stage runs no shell code of its own: the flag is the builtin's)
+			if t.simple and ok and sh.status == 1 and sh.badassign then
+				return 4
+			end
 			return sh.status or 0
 		end
 	end
@@ -3706,6 +3761,7 @@ local function co_launch(ctx, self, stage_fns, inproc, base, lastpipe, upv)
 			end
 			sh.out = make_out(t)
 			t.sh = sh
+			t.simple = kind == "sflat"
 			add(t, stage_body(fn, sh, t))
 		end
 	end
@@ -6459,7 +6515,7 @@ function Shell:array_assign(name, values, append)
 	if b.int then -- declare -i array: each element is evaluated arithmetically (bash)
 		local ev = {}
 		for i = 1, #values do
-			ev[i] = M.i64_to_str(M.arith_str(self, values[i]))
+			ev[i] = M.i64_to_str(M.int_value(self, values[i]))
 		end
 		values = ev
 	elseif b.lower or b.upper or b.cap then
@@ -6559,9 +6615,9 @@ function Shell:array_set(name, key, val, append)
 	end
 	b.empty_decl = nil -- (it has had an element: emptied later, it shows as `=()`)
 	if b.int then -- declare -i array: elements are arithmetic (+= adds) — bash
-		local v = M.arith_str(self, val)
+		local v = M.int_value(self, val)
 		if append then
-			v = M.arith_str(self, b.arr[key] or "0") + v
+			v = M.int_value(self, b.arr[key] or "0") + v
 		end
 		b.arr[key] = M.i64_to_str(v)
 	elseif append then
@@ -8988,7 +9044,19 @@ function M.array_convert_msg(sh, cmd, name, what, compound)
 	io.stderr:write("curse: " .. cmd .. ": " .. name .. ": cannot convert " .. what .. "\n")
 	return 1
 end
+-- An empty associative key in a compound literal, as bash reports it: a declaration
+-- builtin's literal was expanded and requoted (`['']='x'`), a plain one is shown as
+-- written (`[""]=y`, `[$k]=w`)
+function M.empty_key_src(sh, it)
+	if sh.arrayargs_pending or it.decl then
+		return "['']" .. (it.op or "=") .. "'" .. it.val:gsub("'", "'\\''") .. "'"
+	end
+	return "[" .. (it.rawkey or it.key) .. "]" .. (it.op or "=") .. (it.src or it.val)
+end
 function M.array_convert_err(sh, name, isassoc, cmd)
+	if isassoc == nil then -- (neither -a nor -A: the literal takes the array's own kind)
+		return false
+	end
 	local b = sh.vars[sh:deref(name)]
 	if b and b.ro and b.arr and (b.assoc and true or false) ~= (isassoc and true or false) then
 		io.stderr:write("curse: " .. name .. ": readonly variable\n") -- (reported before conversion)
@@ -9020,7 +9088,11 @@ function M.arrayassign(sh, name, items, append)
 	end
 end
 arrayassign_body = function(sh, name, items, append)
-	local rb = sh.vars[sh:deref(name)]
+	-- through a nameref (`declare -n r=t; declare -a r=(…)`) the literal lands in the
+	-- referenced array, as interp's do_arrayassign
+	local dn = sh:deref(name)
+	name = dn ~= "" and dn or name
+	local rb = sh.vars[name]
 	if rb and rb.ro then
 		io.stderr:write("curse: " .. name .. ": readonly variable\n")
 		sh.status = 1
@@ -9063,7 +9135,9 @@ arrayassign_body = function(sh, name, items, append)
 					io.stderr:write("curse: " .. name .. ": " .. it.val .. ": must use subscript when assigning associative array\n")
 				else
 					local idx = keyof(it.key)
-					if it.op == "+=" and not append then
+					if idx == "" then -- (an empty key: reported and skipped, like interp's)
+						io.stderr:write("curse: " .. M.empty_key_src(sh, it) .. ": bad array subscript\n")
+					elseif it.op == "+=" and not append then
 						sh:array_set(name, idx, (snap and snap[idx] or "") .. it.val, false)
 					else
 						sh:array_set(name, idx, it.val, it.op == "+=")
@@ -9160,6 +9234,11 @@ function M.assign_element(sh, name, raw, expanded, value, append)
 	local key
 	if sh:is_assoc(name) then
 		key = expanded
+		if key == "" then -- (an associative array has no "" key)
+			io.stderr:write("curse: " .. name .. "[" .. raw .. "]: bad array subscript\n")
+			sh.status = 1
+			error({ __curse_exit = 1, __curse_lineabort = true })
+		end
 	elseif raw:match("^%s*$") or raw:match('^%s*"%s*"%s*$') then -- (a blank subscript is 0)
 		key = 0
 	elseif raw == "@" or raw == "*" then -- (`ia[@]=x`: interp's array_key says so too)
@@ -9171,12 +9250,10 @@ function M.assign_element(sh, name, raw, expanded, value, append)
 		end)
 		if not ok then
 			if not (type(v) == "table" and v.__curse_matherr) then -- (arith_str reported it)
-
 				io.stderr:write("curse: " .. require("parser").arith_errmsg(raw, v) .. "\n")
-
 			end
-			sh.status = 1
-			return
+			sh.status = 1 -- (array_expand_index: DISCARD, like interp's array_key)
+			error({ __curse_exit = 1, __curse_lineabort = true, __curse_discard = true })
 		end
 		key = v
 	end
@@ -9253,12 +9330,10 @@ function M.assign_element_x(sh, name, src, value, append)
 		end
 		if not ok then
 			if not (type(v) == "table" and v.__curse_matherr) then -- (arith_str reported it)
-
 				io.stderr:write("curse: " .. require("parser").arith_errmsg(src, v) .. "\n")
-
 			end
-			sh.status = 1
-			return
+			sh.status = 1 -- (array_expand_index: DISCARD, like interp's array_key)
+			error({ __curse_exit = 1, __curse_lineabort = true, __curse_discard = true })
 		end
 		key = to_arr_key(v)
 	end
@@ -9383,7 +9458,7 @@ function M.append_scalar(sh, name, value)
 	if b and b.arr then
 		sh:array_set(name, require("interp")._int.array_key(sh, name, "0"), value, true)
 	elseif b and b.int then -- (the old value is evaluated too, as bash does)
-		sh:aset(name, M.arith_str(sh, sh:get(name)) + M.arith_str(sh, value))
+		sh:aset(name, M.int_value(sh, sh:get(name)) + M.int_value(sh, value))
 	elseif b and (b.lower or b.upper) then -- declare -l/-u: case-fold the appended result
 		local v = sh:get(name) .. value
 		sh:set_str(name, b.lower and v:lower() or v:upper())
@@ -10264,10 +10339,13 @@ function M.run_prefix(sh, names, vals, runfn)
 			consumed = false,
 			seq = sh.vseq,
 			box = b
-					and { s = b.s, n = b.n, arr = b.arr, assoc = b.assoc, order = b.order, exported = b.exported, ro = b.ro, ref = b.ref }
+					and { s = b.s, n = b.n, arr = b.arr, assoc = b.assoc, order = b.order, exported = b.exported, ro = b.ro, ref = b.ref,
+						int = b.int, lower = b.lower, upper = b.upper, cap = b.cap, trace = b.trace }
 				or false,
 		}
-		if b and b.ref then -- a NAMEREF's prefix binding is a plain temporary (target untouched)
+		-- a NAMEREF's prefix binding is a plain temporary (target untouched), and so is an
+		-- -i/-l/-u/-c var's (bash's tempenv variable is a plain string: `i=1+1 cmd` gets "1+1")
+		if b and (b.ref or ((b.int or b.lower or b.upper or b.cap) and not b.arr and not b.ro)) then
 			sh.vars[name] = {}
 		end
 		sh:set_str(name, vals[i])
@@ -10342,7 +10420,7 @@ function M.eval(sh, argv)
 	local ln = current_line(sh)
 	local mod = require("tier").try_fragment(code, ln > 0 and ln or nil)
 	if mod then
-		require("tier").run_compiled(mod, sh, nil)
+		require("tier").run_compiled(mod, sh, nil, true)
 	else
 		require("b_eval")(sh, "eval", argv, nil, nil)
 	end
@@ -10484,7 +10562,7 @@ function M.source(sh, argv, line)
 	sh.sourcedepth = (sh.sourcedepth or 0) + 1 -- a `return` is valid while sourcing
 	local fr = M.source_enter(sh, name, line)
 	local dsave, e0 = M.source_debug_hide(sh), sh.traps and sh.traps.ERR
-	local rok, err = pcall(require("tier").run_compiled, mod, sh, nil)
+	local rok, err = pcall(require("tier").run_compiled, mod, sh, nil, true)
 	M.source_leave(sh, fr)
 	sh.sourcedepth = sh.sourcedepth - 1
 	-- (params the file SET itself stay — but not inside a function: bash's maybe_pop_dollar_vars)
@@ -10774,6 +10852,42 @@ function M.arith_str(sh, s)
 		return fn(sh)
 	end
 	return require("interp").arith_eval_str(sh, s)
+end
+-- The value of an INTEGER variable's assignment (declare -i): `s` evaluated by `ev`
+-- (default arith_str). bash's bind_variable evaluates it with evalexp, and a failure
+-- there is top_level_cleanup + jump_to_top_level(DISCARD) (variables.c): the whole
+-- TOP-LEVEL command is abandoned — every function, eval and source level unwinds
+-- (`__curse_discard`: those builtins don't contain it), a subshell exits 1, $? is 1,
+-- and neither set -e nor posix mode makes it fatal. A plain decimal takes no pcall.
+function M.int_value(sh, s, ev)
+	if short_digits(s) and (s:byte(1) ~= 48 or #s == 1) then -- (010 is octal)
+		return M.arith_num(s)
+	end
+	local ok, v = pcall(ev or M.arith_str, sh, s)
+	if ok then
+		return v
+	end
+	if type(v) == "table" and (v.__curse_matherr or v.__curse_experr) then
+		sh.status = 1
+		error({ __curse_exit = 1, __curse_lineabort = true, __curse_discard = true }, 0)
+	end
+	error(v, 0)
+end
+-- int_value inside a builtin (declare/local/export/readonly): its errors name the builtin
+-- (bash's this_command_name: `declare: 3 x: syntax error …`)
+function M.int_value_as(sh, cmd, s, ev)
+	if short_digits(s) and (s:byte(1) ~= 48 or #s == 1) then
+		return M.arith_num(s)
+	end
+	local P = require("parser")
+	local sv = P.arith_cmd
+	P.arith_cmd = cmd
+	local ok, v = pcall(M.int_value, sh, s, ev)
+	P.arith_cmd = sv
+	if not ok then
+		error(v, 0)
+	end
+	return v
 end
 
 -- ${v:off:len} / ${a[@]:off:len} offset/length: arith-evaluate the already-expanded
@@ -11491,7 +11605,7 @@ function M.assign_scalar(sh, name, value)
 	if b and b.arr then
 		sh:array_set(name, sh:is_assoc(name) and "0" or 0, value, false) -- a=x on an array -> a[0]
 	elseif b and b.int and not b.ref then
-		sh:aset(name, M.arith_str(sh, value)) -- declare -i: RHS is arithmetic
+		sh:aset(name, M.int_value(sh, value)) -- declare -i: RHS is arithmetic
 	elseif b and (b.lower or b.upper) then
 		sh:set_str(name, b.lower and value:lower() or value:upper())
 	elseif sh:set_str(name, value) == false then -- (a valueless nameref given a bad target)
