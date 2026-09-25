@@ -7865,6 +7865,7 @@ M._int = {
 	apply_redirs = apply_redirs,
 	restore_redirs = restore_redirs,
 	drain_procsub = drain_procsub,
+	expand_word = expand_word,
 	regex_rhs = regex_rhs,
 	arith_expand_text = arith_expand_text,
 	dbracket_word = dbracket_word,

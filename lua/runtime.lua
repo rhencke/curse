@@ -5406,6 +5406,9 @@ end
 function M.db_regex_rhs(sh, w)
 	return require("interp")._int.regex_rhs(sh, w)
 end
+function M.word_str(sh, w) -- (one word, no split/glob: interp's expand_word)
+	return require("interp")._int.expand_word(sh, w)
+end
 function M.db_word(sh, w)
 	return require("interp")._int.dbracket_word(sh, w)
 end
@@ -5443,6 +5446,30 @@ function M.lsync(sh, v, n1, v1, n2, v2, ...)
 		end
 	end
 	return v
+end
+-- One `for (( init; cond; step ))` slot the arith codegen can't render: the shared arith
+-- evaluator (interp's eval) under the slot rules of interp's forc — $LINENO is the `for` line,
+-- errors name `((`, a deferred parse error or a (non-subscript) arith error returns false (the
+-- loop then ends with status 1), anything else propagates. Returns ok, value.
+function M.arith_slot(sh, expr, line)
+	local I, P = require("interp"), require("parser")
+	sh.cur_line = line
+	local sv = P.arith_cmd
+	P.arith_cmd = "(("
+	local ok, v
+	if expr.k == "arith_perr" then
+		local _, perr = pcall(P.arith, expr.raw)
+		I._int.arith_pre(sh, perr)
+		io.stderr:write("curse: " .. P.arith_errmsg(expr.raw, perr) .. "\n")
+		ok = false
+	else
+		ok, v = pcall(I.eval, sh, expr)
+	end
+	P.arith_cmd = sv
+	if not ok and v ~= nil and not (type(v) == "table" and v.__curse_matherr and not v.__curse_subscript) then
+		error(v, 0)
+	end
+	return ok, v
 end
 function M.dbracket_eq(sh, l, r, rq)
 	local ic = sh.shopt.nocasematch and true or nil

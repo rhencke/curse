@@ -678,6 +678,12 @@ local function arith_elem_ok(e)
 	if type(e.name) ~= "string" or not e.name:match("^[%a_][%w_]*$") or COMPILE_UNSAFE_VAR[e.name] then
 		return false
 	end
+	-- a subscript with its own side effect (`b[c++] = c`): bash evaluates an assignment's value
+	-- BEFORE the subscript, which the key-first runtime helpers don't reproduce
+	local sr = e.idxraw:gsub("[=!<>]=", "")
+	if sr:find("++", 1, true) or sr:find("--", 1, true) or sr:find("=", 1, true) then
+		return false
+	end
 	local ok, sw = pcall(require("parser").parse_word, e.idxraw)
 	if not ok then
 		return false
@@ -1299,7 +1305,7 @@ local function emit_arith_stmt(e, lifted)
 	if e.k == "comma" then -- `for (( i=0, j=5; …; i++, j-- ))`: run each operand for its effect
 		return emit_arith_stmt(e.l, lifted) .. "; " .. emit_arith_stmt(e.r, lifted)
 	end
-	if e.k == "asgn" then
+	if e.k == "asgn" and not e.idxraw then -- (an element write `a[i]=…`: emit_arith_into below)
 		local v = emit_value(e.e, lifted)
 		if e.op == "=" then
 			return emit_set(e.name, v, lifted)
@@ -1308,7 +1314,7 @@ local function emit_arith_stmt(e, lifted)
 		-- (`x /= 0` must fault like bash, `<<=` is a shift: the shared op renderer)
 		return emit_set(e.name, arith_binop(e.op:sub(1, -2), cur, "(" .. v .. ")", e), lifted)
 	end
-	if e.k == "post" or e.k == "pre" then
+	if (e.k == "post" or e.k == "pre") and not e.idxraw then
 		local cur = lifted[e.name] and lname(e.name) or ("sh:aget(%q)"):format(e.name)
 		return emit_set(e.name, ("(%s + %dLL)"):format(cur, e.d), lifted)
 	end
@@ -3166,15 +3172,15 @@ end
 -- body may read any of them), run `call` (rt.word_fields / rt.assign_word on the serialized
 -- word), reload them (`${x:=v}`, `$((x=1))` write), then `push` the result into __a — or
 -- leave `__a = false` after a contained expansion error.
-local function fb_step(w, lifted, call, push)
+local function fb_step(w, lifted, call, push, tbl)
 	local si, so = {}, {}
 	for n in spairs(lifted) do
 		si[#si + 1] = ("sh:aset(%q, %s); "):format(n, lname(n))
 		so[#so + 1] = ("%s = sh:aget(%q); "):format(lname(n), n)
 	end
 	local ln = (w.src or ""):find("LINENO", 1, true) and ("sh.cur_line = %d; "):format(EF.cur_line or 0) or ""
-	return ("do %s%slocal __f = %s(sh, %s[1]); %sif __f then %s else __a = false end end"):format(
-		table.concat(si), ln, call, EF.konst({ ser(w) }), table.concat(so), push)
+	return ("do %s%slocal __f = %s(sh, %s[1]); %sif __f then %s else %s = false end end"):format(
+		table.concat(si), ln, call, EF.konst({ ser(w) }), table.concat(so), push, tbl or "__a")
 end
 -- `assign`: a declaration builtin's argv (export/declare/typeset/readonly/local): a word
 -- after the first whose leading literal is `NAME=`/`NAME+=` is an ASSIGNMENT word (interp's
@@ -6024,16 +6030,30 @@ H.forc = function(cx, st, after)
 	if hard_cf(st.body) then
 		return cx.delegate(st, after)
 	end -- un-static break/continue
-	if
-		not_compilable(st.init)
-		or not_compilable(st.cond)
-		or not_compilable(st.step)
-		or arith_side_effect(st.cond) -- a side-effecting cond can't be an emit_bool expr
-		or arith_reads_unsafe(st.init)
-		or arith_reads_unsafe(st.cond)
-		or arith_reads_unsafe(st.step)
-	then
-		return cx.delegate(st, after) -- $LINENO/$RANDOM/… in the arith: interp reproduces the value
+	-- A slot the arith codegen can't render (an element write, a nested side effect, an
+	-- embedded ${…}, a malformed one, a side-effecting cond, $LINENO/$RANDOM/…) runs through
+	-- the shared arith evaluator (rt.arith_slot: interp's eval with the for (( ))-slot rules —
+	-- an error ends the loop with status 1), lifted locals flushed/reloaded around it. Only a
+	-- slot reading $FUNCNAME/$_/… (not kept in sh by the compiled tier) still delegates.
+	local fbslot = {}
+	for i, e in ipairs({ st.init or false, st.cond or false, st.step or false }) do
+		if e and (not_compilable(e) or arith_reads_unsafe(e) or (i == 2 and arith_side_effect(e))
+				or (i ~= 2 and not arith_stmt_ok(e))) then -- (as the (( )) statement gate)
+			local se = ser(e)
+			if fb_unsafe({ src = se }) or se:find('"_"', 1, true) then
+				return cx.delegate(st, after)
+			end
+			fbslot[i] = se
+		end
+	end
+	local function slot(i, okgo) -- the fallback slot's code: __v its value, else the loop ends
+		local si, so = {}, {}
+		for n in spairs(cx.lifted) do
+			si[#si + 1] = ("sh:aset(%q, %s); "):format(n, lname(n))
+			so[#so + 1] = ("%s = sh:aget(%q); "):format(lname(n), n)
+		end
+		return ("%slocal __ok, __v = rt.arith_slot(sh, %s[1], %d); %sif not __ok then sh.status = 1; if sh.opt_e then error({ __curse_exit = 1 }) end; pc = %d else %s end"):format(
+			table.concat(si), EF.konst({ fbslot[i] }), st.line or 0, table.concat(so), after, okgo)
 	end
 	local condp = cx.newpc()
 	cx.loopPc[st.id] = condp
@@ -6052,7 +6072,9 @@ H.forc = function(cx, st, after)
 		return ("local __st = sh.status; %s; local __as = sh.status; if sh.arithfault then sh.status = 1; pc = %d else sh.status = __st; %s end"):format(
 			code, after, okgo)
 	end
-	if st.step and arith_can_error(st.step, cx.lifted) then
+	if fbslot[3] then
+		cx.blocks[stepp] = d .. slot(3, ("pc = %d"):format(condp))
+	elseif st.step and arith_can_error(st.step, cx.lifted) then
 		cx.blocks[stepp] = d .. guarded(st.step, ("pc = %d"):format(condp))
 	else
 		cx.blocks[stepp] = d
@@ -6066,7 +6088,9 @@ H.forc = function(cx, st, after)
 	local bodyp, exitp = cx.newpc(), cx.newpc()
 	cx.blocks[bodyp] = ("%s = 1; pc = %d"):format(ran, bodyentry)
 	cx.blocks[exitp] = ("if %s == 0 then sh.status = 0 end; pc = %d"):format(ran, after)
-	if st.cond and arith_can_error(st.cond, cx.lifted) then
+	if fbslot[2] then
+		cx.blocks[condp] = d .. slot(2, ("if __v ~= 0 then pc = %d else pc = %d end"):format(bodyp, exitp))
+	elseif st.cond and arith_can_error(st.cond, cx.lifted) then
 		cx.blocks[condp] = d .. guarded(st.cond, ("if __as == 0 then pc = %d else pc = %d end"):format(bodyp, exitp))
 	else
 		cx.blocks[condp] = d
@@ -6079,7 +6103,9 @@ H.forc = function(cx, st, after)
 	local ep = cx.newpc()
 	if st.init then
 		local ip = cx.newpc()
-		if arith_can_error(st.init, cx.lifted) then
+		if fbslot[1] then
+			cx.blocks[ip] = d .. slot(1, ("pc = %d"):format(condp))
+		elseif arith_can_error(st.init, cx.lifted) then
 			cx.blocks[ip] = d .. guarded(st.init, ("pc = %d"):format(condp))
 		else
 			cx.blocks[ip] = d .. emit_arith_stmt(st.init, cx.lifted) .. ("; pc = %d"):format(condp)
@@ -6104,9 +6130,9 @@ H.whilec = function(cx, st, after)
 	end
 	local arith = cond_arith(st.cond)
 	if arith and arith_reads_unsafe(arith) then
-		-- a `(( ))` condition reading an unreproducible special ($LINENO/$RANDOM/…):
-		-- delegate the whole loop to interp, which reproduces the value.
-		return cx.delegate(st, after)
+		-- a `(( ))` condition reading a special ($LINENO/$RANDOM/…): no native fast path — the
+		-- condition compiles as the command it is (H.arithcmd's evaluator reads it from sh)
+		arith = nil
 	end
 	if arith and not st.negate and not not_compilable(arith) and not arith_side_effect(arith) then
 		-- fast path: a native arith condition `while (( expr ))` — no command run.
@@ -6206,6 +6232,7 @@ H.forin = function(cx, st, after)
 	if not st.name:match("^[%a_][%w_]*$") then
 		return cx.delegate(st, after)
 	end -- invalid loop var → interp errors
+	local fbw -- words expanded by rt.word_fields (a contained expansion error skips the loop, $?=1)
 	-- Each word expands to for-list fields exactly like a command argument: word_safe (one
 	-- field), a field_word (an unquoted expansion/glob the field engine splits+globs), or a
 	-- seg_native mixed word (rt.expand_fields — literal+$x, $@/$*, ${a[@]}, ${!a[@]}, scalar
@@ -6221,7 +6248,12 @@ H.forin = function(cx, st, after)
 			end
 		end
 		if not word_safe(w) and not EF.arith_guard(w) and not field_word(w, cx.lifted) and not EF.seg_native(w, cx.lifted) then
-			return cx.delegate(st, after)
+			-- (else the shared one-word expander, rt.word_fields — unless it reads $FUNCNAME/…)
+			if fb_unsafe(w) then
+				return cx.delegate(st, after)
+			end
+			fbw = fbw or {}
+			fbw[w] = true
 		end
 	end
 	local initp = cx.newpc()
@@ -6246,8 +6278,14 @@ H.forin = function(cx, st, after)
 		end
 		run = {}
 	end
+	local opens = 0
 	for _, w in ipairs(st.words) do
-		if not empty_word(w) then
+		if fbw and fbw[w] then
+			flush_run()
+			parts[#parts + 1] = fb_step(w, cx.lifted, "rt.word_fields", "for __i=1,#__f do __l[#__l+1]=__f[__i] end", "__l")
+				.. "; if __l then "
+			opens = opens + 1
+		elseif not empty_word(w) then
 			local code = emit_fields_into("__l", w, cx.lifted)
 			local lit = code:match('^__l%[#__l%+1%] = (%("[^"\\]*"%))$')
 			if lit then
@@ -6259,6 +6297,9 @@ H.forin = function(cx, st, after)
 		end
 	end
 	flush_run()
+	if opens > 0 then -- (after a contained expansion error __l is false: no loop, $? is 1)
+		parts[#parts + 1] = "local _ = nil" .. string.rep(" end", opens)
+	end
 	-- The loop state lives in a LOCAL of this function activation (a recursive call, or a
 	-- $( … ) fragment running a loop with the same id, must not clobber it), published in
 	-- sh.forstate[id] for an OSR entry — which adopts it (below). Capped: a function has
@@ -6273,7 +6314,12 @@ H.forin = function(cx, st, after)
 		or ("sh.forstate[%d] = {list=__l, idx=0}"):format(st.id)
 	local getfs = fsl and ("local fs = %s or sh.forstate[%d]; %s = fs"):format(fsl, st.id, fsl)
 		or ("local fs = sh.forstate[%d]"):format(st.id)
-	cx.blocks[initp] = table.concat(parts, "; ") .. ("; pc = %d"):format(advp)
+	if opens > 0 then
+		cx.blocks[initp] = table.concat(parts, "; "):gsub("if __l then ; ", "if __l then ")
+			.. ("; if not __l then pc = %d else pc = %d end"):format(after, advp)
+	else
+		cx.blocks[initp] = table.concat(parts, "; ") .. ("; pc = %d"):format(advp)
+	end
 	if EF.has_attr then -- a readonly loop variable: bash reports it and runs no iteration
 		cx.blocks[initp] = ("if rt.for_var_ro(sh, %q) then pc = %d else %s end"):format(st.name, after, cx.blocks[initp])
 	end
@@ -6798,7 +6844,9 @@ H.case = function(cx, st, after)
 	-- Subject must be emittable AND free of a dynamic special var ($LINENO/$_/…) whose value
 	-- the CFG can't reproduce — those run on the interp tier (compile-eventually), else the
 	-- native subject would read a wrong LINENO/etc.
-	if not db_word_ok(st.subject) then
+	local subj = db_word_ok(st.subject) and emit_word(st.subject, cx.lifted)
+		or db_fallback(st.subject, cx.lifted, "rt.word_str") -- (the shared one-word expander)
+	if not subj then
 		return cx.delegate(st, after)
 	end
 	local sv = cx.newloopvar()
@@ -6881,7 +6929,7 @@ H.case = function(cx, st, after)
 	cx.blocks[subjp] = dbg(st)
 		.. ("%s = %s; %spc = %d"):format(
 			sv,
-			emit_word(st.subject, cx.lifted),
+			subj,
 			ran and (ran .. " = false; ") or "",
 			n > 0 and matchentry[1] or nomatch
 		)
@@ -7608,6 +7656,12 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
 						.. ("; pc = %d"):format(after)
 					return p
 				end
+			end
+			if st.expr and st.expr.kind == "syntaxerr" then -- a malformed [[ ]]: fatal syntax error
+				local p = cx.newpc() -- (bash aborts a non-interactive shell; interp's dbracket)
+				cx.blocks[p] = dbg(st) .. 'io.stderr:write("curse: syntax error in conditional expression\\n"); sh.status = 2; if not sh.opt_i then error({ __curse_exit = 2 }) end'
+					.. ("; pc = %d"):format(after)
+				return p
 			end
 			EF.db_regex = nil
 			local cond = emit_dbracket_node(st.expr, cx.lifted)
