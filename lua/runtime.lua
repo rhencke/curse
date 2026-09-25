@@ -10031,6 +10031,7 @@ end
 -- case, and the ${x@OP} transforms). Factored out so ${a[@]OP} can apply per element.
 -- Case-fold `val` per the ${x^PAT}/${x,,PAT} rules: `upper` picks the direction,
 -- `all` folds every matching char (else only the first). An empty PAT means "any".
+-- `upper` == "toggle" swaps each char's case (${x~}/${x~~}).
 local function fold_case(val, pat, upper, all)
 	if pat == nil or pat == "" then
 		pat = "?"
@@ -10043,7 +10044,7 @@ local function fold_case(val, pat, upper, all)
 	-- single-byte locale, folding is exactly string.upper/lower (Lua's toupper/tolower
 	-- is the same locale-aware per-byte fold) — no mb_chars char-table, no per-char
 	-- loop, no allocation. This is the common `${x^^}`/`${x,,}` case.
-	if lc_mb_cur_max <= 1 and any then
+	if lc_mb_cur_max <= 1 and any and upper ~= "toggle" then
 		local f = upper and string.upper or string.lower
 		if all then
 			return f(val)
@@ -10062,7 +10063,15 @@ local function fold_case(val, pat, upper, all)
 		local ch = chars[k]
 		local s = ch.s
 		if k <= limit and ch.wc and (any or M.glob_match(s, pat)) then
-			local w2 = upper and M.towupper(ch.wc) or M.towlower(ch.wc)
+			local w2
+			if upper == "toggle" then -- ${x~}/${x~~}: swap case (sh_modcase CASE_TOGGLE)
+				w2 = M.towupper(ch.wc)
+				if w2 == ch.wc then
+					w2 = M.towlower(ch.wc)
+				end
+			else
+				w2 = upper and M.towupper(ch.wc) or M.towlower(ch.wc)
+			end
 			if w2 ~= ch.wc then
 				s = M.wc_to_bytes(w2, ch.s)
 			end
@@ -10140,6 +10149,9 @@ function Shell:apply_str_op(op, val, arg, arg2, ltxt)
 	end
 	if op == "^" or op == "," then
 		return fold_case(val, arg, op == "^", false)
+	end
+	if op == "~~" or op == "~" then
+		return fold_case(val, arg, "toggle", op == "~~")
 	end
 	return val
 end

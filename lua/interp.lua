@@ -1421,7 +1421,9 @@ local function expand_pexp(sh, p, assign)
 		or pe.op == "^"
 		or pe.op == "^^"
 		or pe.op == ","
-		or pe.op == ",," -- case-fold pattern
+		or pe.op == ",,"
+		or pe.op == "~"
+		or pe.op == "~~" -- case-fold pattern
 	-- The word for -/:-/+/:+/=/:=/?/:? is only expanded WHEN USED (bash: a default
 	-- with side effects like $((i++)) runs only if the branch is taken). Pass a thunk.
 	-- (TESTOP is a module-level constant.)

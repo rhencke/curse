@@ -1998,6 +1998,8 @@ local PEXP_STROP = {
 	["^^"] = 1,
 	[","] = 1,
 	[",,"] = 1,
+	["~"] = 1,
+	["~~"] = 1,
 }
 -- ${x@OP} transforms compiled natively (bash 5.x): Q/K/k shell-quote, U/u/L case-fold,
 -- E ANSI-unescape (via apply_str_op on the scalar value), and `a` the attribute letters
@@ -6054,7 +6056,8 @@ end
 -- ${…} operators with no side effect and no error output (safe to expand in the PARENT
 -- for a spawned `ext args &`): plain, defaults/alternates, trims, replacements, case ops
 local BG_PURE_PEXP = { [""] = 1, ["-"] = 1, [":-"] = 1, ["+"] = 1, [":+"] = 1, ["#"] = 1, ["##"] = 1,
-	["%"] = 1, ["%%"] = 1, ["/"] = 1, ["//"] = 1, ["^"] = 1, ["^^"] = 1, [","] = 1, [",,"] = 1 }
+	["%"] = 1, ["%%"] = 1, ["/"] = 1, ["//"] = 1, ["^"] = 1, ["^^"] = 1, [","] = 1, [",,"] = 1,
+	["~"] = 1, ["~~"] = 1 }
 -- statement handler: background (split out of flatten_stmt; see H)
 H.background = function(cx, st, after)
 	local t = st.t

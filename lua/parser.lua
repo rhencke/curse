@@ -855,6 +855,10 @@ parse_paramexp = function(inner)
 		return P({ op = ",,", arg = rest:sub(3) })
 	elseif one == "," then
 		return P({ op = ",", arg = rest:sub(2) })
+	elseif two == "~~" then -- case toggle (parameter_brace_casemod CASE_TOGGLEALL)
+		return P({ op = "~~", arg = rest:sub(3) })
+	elseif one == "~" then
+		return P({ op = "~", arg = rest:sub(2) })
 	elseif one == "@" then -- ${x@Q/U/u/L/E/…}: exactly one operator letter, else bad
 		if not rest:match("^@[QEPAKaUuLk]$") then -- (checked only on a set value: `xform`)
 			return P({ op = "badsubst", xform = true, raw = name .. (index and "[" .. index .. "]" or "") .. rest })
