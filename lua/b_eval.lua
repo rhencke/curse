@@ -93,7 +93,7 @@ return function(sh, cmd, args, hook, tcb)
 							if not pok and not (type(perr) == "table" and perr.__curse_parseerr) then
 								error(perr)
 							end
-							sh.status = 2
+							sh.status = lg.perr.status or 2
 							badsyntax = not ran
 							return
 						end
