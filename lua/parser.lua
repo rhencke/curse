@@ -106,9 +106,11 @@ local function arith(src, nodefer)
 	-- the text from there on: `4+` -> operand expected (error token is "+").
 	local lasttp
 	local etxt = src:gsub("^%s+", "") -- (the expression as bash's errors print it)
-	local function skip()
-		while i <= n and src:sub(i, i):match("%s") do
+	local function skip() -- (expr.c's cr_whitespace: blank, tab, newline — not \r, \f, \v)
+		local c = src:byte(i)
+		while c == 32 or c == 9 or c == 10 do
 			i = i + 1
+			c = src:byte(i)
 		end
 		if i <= n then
 			lasttp = i
@@ -210,7 +212,7 @@ local function arith(src, nodefer)
 			end
 			return e
 		end
-		if (starts("++") or starts("--")) and not src:find("^[%+%-][%+%-]%s*[%a_]", i) then
+		if (starts("++") or starts("--")) and not src:find("^[%+%-][%+%-][ \t\n]*[%a_]", i) then
 			-- not a pre-increment (no name follows): two unary signs (bash: `++5` is 5)
 			local sign = src:sub(i, i)
 			i = i + 1
@@ -219,13 +221,15 @@ local function arith(src, nodefer)
 			end
 			return { k = "un", op = "-", e = primary() }
 		end
-		if eat("++") then
+		if starts("++") or starts("--") then
+			local d = src:sub(i, i) == "+" and 1 or -1
+			i = i + 2
 			local nm, idx, ir = nameSub()
-			return { k = "pre", name = nm, idx = idx, idxraw = ir, d = 1 }
-		end
-		if eat("--") then
-			local nm, idx, ir = nameSub()
-			return { k = "pre", name = nm, idx = idx, idxraw = ir, d = -1 }
+			-- (readtok: a `++`/`--` right after `++x` is `--x++` — "++: assignment requires lvalue")
+			if starts("++") or starts("--") then
+				aerr(src:sub(i, i + 1) .. ": assignment requires lvalue")
+			end
+			return { k = "pre", name = nm, idx = idx, idxraw = ir, d = d }
 		end
 		if c == "-" then
 			i = i + 1
@@ -389,6 +393,11 @@ local function arith(src, nodefer)
 		skip()
 		-- `+=`, `<<=`, …: one assignment token (bash's tokenizer), never a binary op
 		if src:find("^[%+%-%*/%%&|%^]=", i) or src:find("^<<=", i) or src:find("^>>=", i) then
+			return nil
+		end
+		-- `++`/`--` before a name is a pre-increment token (readtok), never `+ +`/`- -`:
+		-- after an operand (`3 --x`) it is a syntax error
+		if src:find("^%+%+[ \t\n]*[%a_]", i) or src:find("^%-%-[ \t\n]*[%a_]", i) then
 			return nil
 		end
 		for _, op in ipairs(OPS) do
