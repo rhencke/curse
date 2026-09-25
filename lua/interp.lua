@@ -4604,7 +4604,7 @@ local function run_function(sh, cmd, fn, args, hook, tenv_base)
 	local savedline = sh.cur_line -- the call-site line: $LINENO is restored to it on return
 	-- (an error out of compiled code called from here skips ITS frames' epilogues: the
 	-- depth, frames and stacks are unwound to these marks below)
-	local cd0, pd0, fs0 = sh.calldepth, sh.pd, sh.funcstack and #sh.funcstack or 0
+	local cd0, pd0, fs0, ne0 = sh.calldepth, sh.pd, sh.funcstack and #sh.funcstack or 0, sh.noerr
 	sh.calldepth = sh.calldepth + 1 -- OSR gate: no handoff inside a call
 	sh:pushCall(unpack(args, 2))
 	-- Tempenv bindings applied as THIS call's prefix (`x=v func`) belong to this new
@@ -4646,6 +4646,12 @@ local function run_function(sh, cmd, fn, args, hook, tenv_base)
 	if fr and rok == false then
 		sh.status = 1 -- a failed redirect skips the body (bash)
 	elseif type(fn) == "function" then
+		-- (one a fragment defined, compiled for another trap state: its recompile for this one)
+		local fm = sh.func_mode and sh.func_mode[cmd]
+		local f2 = fm and M.fn_remode and M.fn_remode(sh, cmd, fm)
+		if f2 then
+			fn = f2
+		end
 		ok, err = pcall(fn, sh) -- a COMPILED function closure
 	else
 		-- a hot function in a cold run: its compiled version, once the tier has it
@@ -4680,6 +4686,7 @@ local function run_function(sh, cmd, fn, args, hook, tenv_base)
 	if not ok and type(err) == "table" and err.__curse_return then
 		rret = err.__curse_return
 		ok, err = true, nil
+		sh.noerr = ne0 -- (a return raised mid-body — a trap's — skips a condition's noerr--)
 	end
 	-- RETURN trap: fires as the function returns, still in ITS context (FUNCNAME, the
 	-- definition's $LINENO), preserving its exit status. A top-level RETURN trap is NOT
@@ -7168,6 +7175,12 @@ run_trap = function(sh, code)
 		elseif type(err) == "table" and err.__curse_exit then
 			sh.status = err.__curse_exit
 			exited = true
+		elseif type(err) == "table" and (err.__curse_break or err.__curse_continue)
+			and sh.lc_depth and sh.lc_depth > 0 and sh.loopdepth == sh.lc_depth then
+			-- the interrupted loop is COMPILED: it acts on the break/continue after the
+			-- command that was running (its sh.loopctl checks), as bash's breaking/continuing
+			sh.status = 0
+			sh.loopctl = { kind = err.__curse_break and "break" or "continue", n = err.__curse_break or err.__curse_continue }
 		elseif type(err) == "table" and err.__curse_return then
 			sh.status = err.__curse_return -- `return N` in a trap sets its status
 			if (sh.calldepth or 0) > 0 or (sh.sourcedepth or 0) > 0 then

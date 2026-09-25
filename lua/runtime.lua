@@ -5005,9 +5005,11 @@ end
 -- delegated-statement wrappers catch it the same way). bash: execute_function's return_catch.
 function M.catch_return(f)
 	return function(sh, pc)
+		local ne0 = sh.noerr
 		local ok, e = pcall(f, sh, pc)
 		if not ok then
 			if type(e) == "table" and e.__curse_return ~= nil then
+				sh.noerr = ne0 -- (raised mid-body: a condition's noerr-- was skipped)
 				sh.status = e.__curse_return
 			else
 				error(e, 0)
@@ -13159,7 +13161,22 @@ do
 		end
 		return require("interp").exec_simple(sh, argv, hook)
 	end
-	function M.sr_run_cmd(sh, argv, spec, hook, rf)
+	-- set -x (unless the compiled caller traced it — spec.xt): before the redirections
+	function M.sr_trace(sh, argv, spec)
+		if spec.aas and sh.arrayargs_pre then -- (`+ b=('4' '5 6')` before `+ declare -a b`)
+			for _, aa in ipairs(spec.aas) do
+				if sh.arrayargs_pre[aa] then
+					M.xtrace_arrlit(sh, aa.name, sh.arrayargs_pre[aa])
+				end
+			end
+		end
+		M.xtrace(sh, argv)
+	end
+	function M.sr_run_cmd(sh, argv, spec, hook, rf, traced)
+		if sh.opt_x and not spec.xt and not traced then
+			M.sr_trace(sh, argv, spec)
+			traced = true
+		end
 		if rf then
 			local a1, a2 = argv[1], argv[2]
 			if not (a1 == "exec" or ((a1 == "command" or a1 == "builtin") and a2 == "exec")) then
@@ -13169,7 +13186,7 @@ do
 					sh.status = 1
 					return
 				end
-				local ok, err = pcall(M.sr_run_cmd, sh, argv, spec, hook)
+				local ok, err = pcall(M.sr_run_cmd, sh, argv, spec, hook, nil, traced)
 				io.flush()
 				M.redir_restore(rs)
 				if not ok then
@@ -13180,16 +13197,7 @@ do
 		end
 		sh.write_err = nil
 		local I = require("interp")
-		if sh.opt_x and not spec.xt then -- (xt: the compiled caller traced it, before its redirections)
-			if spec.aas and sh.arrayargs_pre then -- (`+ b=('4' '5 6')` before `+ declare -a b`)
-				for _, aa in ipairs(spec.aas) do
-					if sh.arrayargs_pre[aa] then
-						M.xtrace_arrlit(sh, aa.name, sh.arrayargs_pre[aa])
-					end
-				end
-			end
-			I.xtrace(sh, argv)
-		end
+
 		if spec.so then -- (a redirect moved stdout: builtins write the real fd 1)
 			local so = sh.out
 			sh.out = io.write
@@ -13638,6 +13646,11 @@ function M.select_next(sh, list, name)
 			return true
 		end
 	end
+end
+-- (a fragment's function: the trap mode its body compiled with, and its definition)
+function M.fn_mode(sh, name, mode, def)
+	sh.func_mode = sh.func_mode or {}
+	sh.func_mode[name] = { mode = mode, def = def }
 end
 
 return M

@@ -443,6 +443,29 @@ function M.fn_hot(sh, name, def)
 	return def._cfn or nil
 end
 I.fn_hook = M.fn_hot
+-- A function a fragment defined runs under a trap state its compile didn't see (a DEBUG/
+-- ERR trap set since, or cleared): compile its definition again for this state (cached on
+-- the definition per mode). nil: run it as it is.
+function M.fn_remode(sh, name, fm)
+	local mode = trap_mode(sh)
+	if fm.mode == mode then
+		return nil
+	end
+	local def = fm.def
+	if not (def and def.deftext) or (sh.shopt.expand_aliases and sh.aliases and next(sh.aliases)) then
+		return nil
+	end
+	def._rm = def._rm or {}
+	local f = def._rm[mode]
+	if f == nil then
+		local mod = M.compile_fragment(def.deftext, def.line, mode)
+		local fc = mod and mod.fnCall and mod.fnCall[name]
+		f = fc and fc.fn or false
+		def._rm[mode] = f
+	end
+	return f or nil
+end
+I.fn_remode = M.fn_remode
 -- emit + load + store (disk cache and this worker's) — nil if the emitter can't. With
 -- `later`, the disk write waits for M.flush_stores (a compile MID-RUN happens under the
 -- script's own limits — `ulimit -f 1` would kill the process with SIGXFSZ).
@@ -544,6 +567,9 @@ function M.lm_exec(sh, lg, k)
 		end
 	end
 	M.run_compiled(mod, sh, nil)
+	-- (a failing call that set the ERR trap skips ITS OWN ERR check — rt.debug_leave; a
+	-- line compiled before the trap existed has none to consume that, so it ends here)
+	sh.err_skip = nil
 	return k + #lg.stmts
 end
 I.lm_exec = M.lm_exec

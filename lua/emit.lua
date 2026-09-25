@@ -952,6 +952,8 @@ end
 function EF.xta(lhs, v) -- an assignment `lhs` (`x=`, `a[i]+=`) of the expanded value v
 	return EF.xtrace and ("if sh.opt_x then %srt.xtrace_assign(sh, %q, %s) end "):format(EF.xln(), lhs, v) or ""
 end
+EF.trap_loopctl = false -- a trap handler may break/continue → loops check sh.loopctl (flatten_list)
+EF.LC_LOOP = { forc = true, whilec = true, forin = true, select = true }
 EF.has_return = false -- program may set a RETURN trap → compiled calls fire it (fnwrap)
 EF.bash_command = false -- program reads $BASH_COMMAND → each command records its text (dbg)
 EF.extdebug = false -- program may `shopt -s extdebug` → a DEBUG trap can skip a command (dbg)
@@ -1038,6 +1040,10 @@ local function fnwrap(cmd, line, s)
 	if EF.has_debug or EF.has_err or EF.has_return then -- the callee doesn't inherit DEBUG/ERR/RETURN (rt.debug_enter)
 		pre = pre .. ("local __dbg = rt.debug_enter(sh, %q); "):format(cmd)
 		post = post .. "; rt.debug_leave(sh, __dbg)"
+	end
+	if EF.trap_loopctl then -- (a function starts outside any loop: bash's loop_level)
+		pre = "local __ld, __lc = sh.loopdepth, sh.lc_depth; sh.loopdepth, sh.lc_depth = 0, 0; " .. pre
+		post = post .. "; sh.loopdepth, sh.lc_depth = __ld, __lc"
 	end
 	if EF.funcnest then -- (past $FUNCNEST nested calls the call fails: status 1)
 		return ("if sh.vars.FUNCNEST and rt.funcnest_over(sh, %q) then sh.status = 1 else %s%s%s end"):format(cmd, pre, s, post)
@@ -5001,8 +5007,9 @@ H.funcdef = function(cx, st, after)
 			return cx.delegate(st, after)
 		end
 		local p = cx.newpc()
-		cx.blocks[p] = ("rt.def_function(sh, %s[1], %s); pc = %d"):format(
-			EF.konst({ ser(st) }), EF.upv_wrapped(("__CS[%d]"):format(id)), after)
+		local k = EF.konst({ ser(st) })
+		cx.blocks[p] = ("rt.def_function(sh, %s[1], %s); %spc = %d"):format(
+			k, EF.upv_wrapped(("__CS[%d]"):format(id)), EF.fnmode(st.name, k .. "[1]"), after)
 		return p
 	end
 	local p = cx.newpc()
@@ -5013,8 +5020,9 @@ H.funcdef = function(cx, st, after)
 		cx.blocks[p] = (st.name:match("^[%a_][%w_]*$") and "" -- (posix: a non-identifier name is fatal)
 			or ("if sh.opt_posix and not sh.opt_i then rt.err_at(sh, %s, %q); error({ __curse_exit = 2 }) end; ")
 				:format(st.top and tostring(st.eline) or "nil", "curse: `" .. st.name .. "': not a valid identifier\n"))
-			.. ("if sh.fn_ro and sh.fn_ro[%q] then rt.err_at(sh, %s, %q); sh.status = 1 else sh.functions[%q] = rt.mark_compiled(%s, %s) end; pc = %d"):format(
-			st.name, st.top and tostring(st.eline) or "nil", "curse: " .. st.name .. ": readonly function\n", st.name, EF.upv_wrapped(fnlname(st.name)), fnlname(st.name), after)
+			.. ("if sh.fn_ro and sh.fn_ro[%q] then rt.err_at(sh, %s, %q); sh.status = 1 else sh.functions[%q] = rt.mark_compiled(%s, %s); %s end; pc = %d"):format(
+			st.name, st.top and tostring(st.eline) or "nil", "curse: " .. st.name .. ": readonly function\n", st.name, EF.upv_wrapped(fnlname(st.name)), fnlname(st.name),
+			EF.fnmode(st.name, EF.fragment and (EF.konst({ ser(st) }) .. "[1]")), after)
 	end
 	return p
 end
@@ -5162,6 +5170,17 @@ EF.simple_native = function(cx, st, after, cmd)
 		end
 	elseif isexec and st.redirs then
 		spec[#spec + 1] = "eredirs=" .. ser(st.redirs)
+	elseif st.redirs and #st.redirs > 0 and EF.xtrace and st.arrayargs and not bind then
+		-- (set -x: a declaration's NAME=(…) literals trace once expanded, which the runner
+		-- does — so it applies the redirections itself, after the trace: rf)
+		local rc = cx.redir_conds(st, cmd)
+		if not rc then
+			return nil
+		end
+		rf = ("function(__rs) return %s end"):format(rc)
+		if require("interp")._int.redirs_touch_stdout(st.redirs) then
+			spec[#spec + 1] = "so=true"
+		end
 	elseif st.redirs and #st.redirs > 0 then
 		redir = cx.redir_conds(st, cmd)
 		if not redir then
@@ -5302,6 +5321,17 @@ end
 -- (control-flow builtins: a function can't usefully shadow them from outside a fragment)
 -- where a function body's `return N` puts N: sh.fret when a RETURN trap may see the call
 -- return (fnwrap's rt.fn_return applies it after the trap), else $? directly
+-- A function a FRAGMENT defines is compiled with the hooks of the traps set when the
+-- fragment compiled (tier.trap_mode): record that mode and the definition, so a call under
+-- another trap state recompiles it for that state (interp run_function -> tier.fn_remode).
+-- Any other definition clears a stale record.
+function EF.fnmode(name, defk)
+	if EF.fragment and defk then
+		local m = (EF.has_err and "E" or "") .. (EF.has_debug and (EF.functrace and "T" or "D") or "")
+		return ("rt.fn_mode(sh, %q, %q, %s); "):format(name, m, defk)
+	end
+	return ("if sh.func_mode then sh.func_mode[%q] = nil end; "):format(name)
+end
 function EF.retset(cx, w2)
 	return (w2 and EF.has_return and EF.frag_depth == 0 and #cx.subexit == 0 and not cx.toplevel and not cx.topcode)
 		and "sh.fret" or "sh.status"
@@ -7729,6 +7759,7 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
 	-- DONE, which in the forked child would return PAST the subshell.
 	cx.subexit = {}
 	cx.bx_guarded = {} -- (statements already given their `set +B` guard)
+	cx.lc_guarded = {} -- (loops already given their loop-depth marks: EF.trap_loopctl)
 	cx.ps_guarded = {} -- (simple commands already given their <()/>() drain)
 	-- Does a simple command create a process substitution — a <(…)/>(…) word, prefix value
 	-- or redirection target? Its pipes are closed and its children reaped after the command.
@@ -8260,7 +8291,13 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
 						-- eval/source fragment: break/continue with no enclosing loop IN the fragment
 						-- targets the CALLER's loop -- raise the signal (level) for the enclosing
 						-- delegated cf-wrapper, exactly as interp's break/continue do.
-						cx.blocks[p] = d .. (EF.cf_flush or "") .. ("error({ __curse_%s = %d })"):format(cf_op, lvl)
+						-- (no loop around the caller either — a trap handler run outside any loop, a
+						-- function's: bash says so, status 0, and goes on)
+						cx.blocks[p] = d .. ((EF.fragment and not EF.lm and cx.toplevel)
+							and ("if (sh.loopdepth or 0) == 0 then if not sh.opt_posix then io.stderr:write(%q) end; sh.status = 0; pc = %d else %s end"):format(
+								"curse: " .. cf_op .. ": only meaningful in a `for', `while', or `until' loop\n", after,
+								(EF.cf_flush or "") .. ("error({ __curse_%s = %d })"):format(cf_op, lvl))
+							or ((EF.cf_flush or "") .. ("error({ __curse_%s = %d })"):format(cf_op, lvl)))
 					elseif EF.cs_in_loop and #cx.subexit == 0 then -- (in a `$( … )` inside a loop: ends it)
 						cx.blocks[p] = d .. ("error({ __curse_%s = %d })"):format(cf_op, lvl)
 					else -- outside any loop: bash says so (status 0) and carries on
@@ -8460,6 +8497,19 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
 				callargs = ("sh, %s%s"):format(ser(st), EF.perr_label and (", %q"):format(EF.perr_label) or ""),
 			})
 		end
+		-- (a trap handler may break/continue: a loop keeps sh.loopdepth — the handler's
+		-- break raises only inside a loop — and sh.lc_depth, which marks that loop compiled:
+		-- the handler then leaves sh.loopctl for the loop's checks, cx.flatten_list)
+		if EF.trap_loopctl and EF.LC_LOOP[t] and not cx.lc_guarded[st] then
+			cx.lc_guarded[st] = true
+			local D = #cx.loopstack
+			local post = cx.newpc()
+			cx.blocks[post] = ("sh.loopdepth, sh.lc_depth = %d, %d; pc = %d"):format(D, D, after)
+			local entry = cx.flatten_stmt(st, post)
+			local pre = cx.newpc()
+			cx.blocks[pre] = ("sh.loopdepth, sh.lc_depth = %d, %d; pc = %d"):format(D + 1, D + 1, entry)
+			return pre
+		end
 		if t == "assign" then
 			return H.assign(cx, st, after)
 		elseif t == "funcdef" then
@@ -8505,7 +8555,19 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
 
 	cx.flatten_list = function(list, after)
 		local nextpc = after
+		local lp = EF.trap_loopctl and cx.loopstack[#cx.loopstack]
 		for k = #list, 1, -1 do
+			if lp then -- (after each command in a loop: a trap handler's break/continue lands)
+				if not lp.lch then
+					lp.lch = cx.newpc()
+					-- (the outermost loop of this CFG clamps a higher level, as bash)
+					cx.blocks[lp.lch] = ("local c = sh.loopctl; if c.n > 1 and %s then c.n = c.n - 1; pc = %d elseif c.kind == 'break' then sh.loopctl = nil; pc = %d else sh.loopctl = nil; pc = %d end"):format(
+						tostring(#cx.loopstack > 1), lp.brk, lp.brk, lp.cont)
+				end
+				local chk = cx.newpc()
+				cx.blocks[chk] = ("if sh.loopctl then pc = %d else pc = %d end"):format(lp.lch, nextpc)
+				nextpc = chk
+			end
 			nextpc = cx.flatten_stmt(list[k], nextpc)
 		end
 		return nextpc
@@ -8962,9 +9024,8 @@ function M.emit(ast, opts)
 	-- $FUNCNEST (the program's, or one eval/source code or the caller may set): each
 	-- compiled call checks the depth first, as run_function does
 	EF.funcnest = fnest or EF.fragment or scan_dyncode(ast.stmts)
-	if scan_trap_loopctl(ast.stmts) then
-		error("curse-nocompile: break/continue in a trap")
-	end
+	-- a trap handler that may break/continue: loops keep their depth and check for it
+	EF.trap_loopctl = EF.lm or (not EF.fragment and scan_trap_loopctl(ast.stmts))
 	-- (in line mode the live reader already expanded this line's aliases)
 	local alias_kind = EF.lm and "none" or scan_alias(ast.stmts)
 	if alias_kind == "dynamic" or (alias_kind == "static" and scan_dyncode(ast.stmts)) then
@@ -8983,6 +9044,7 @@ function M.emit(ast, opts)
 	-- (a runtime fragment — eval/source/a hot loop — also gets the hooks for the traps set
 	-- in the shell it compiles in: tier.trap_mode keys its cache by that state)
 	local fo = opts or {}
+	EF.functrace = fo.functrace or false
 	EF.has_err = fo.trap_err or scan_trap(ast.stmts, { ERR = 1 }) -- gate compiled ERR-trap firing
 	EF.has_debug = fo.trap_debug or scan_trap(ast.stmts, { DEBUG = 1 }) -- gate compiled DEBUG-trap firing
 	EF.funcstack = reads_debugstack(ast.stmts) -- gate FUNCNAME/BASH_SOURCE/BASH_LINENO stacks
