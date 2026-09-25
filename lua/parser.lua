@@ -25,6 +25,7 @@ local POSIX_DQ = false
 -- unused high bytes, and the tree gets them back (mb_hide / mb_restore). UTF-8 (every
 -- byte of a multibyte char >= 0x80) and single-byte locales never pay for it.
 local MBX = false
+local MB_BSL = nil -- (mb_hide's placeholder for a trail byte `\`, handed to the next make_parser)
 
 -- ---- arithmetic expression parser (precedence climbing over a string) ----
 -- AST: {k="num",v}, {k="var",name}, {k="bin",op,l,r}, {k="un",op,e},
@@ -1443,7 +1444,7 @@ local function parse_dquote(inner, add, heredoc, bt_keep)
 			-- "…" one in posix mode)
 			i = parse_dollar(inner, i, (heredoc or POSIX_DQ) and function(p)
 				if p.pexp then
-					p.pexp.hd = true
+					p.pexp.hd = heredoc and "hdoc" or true -- (parse_default_quoted tells them apart)
 					p.pexp.hdoc = heredoc or nil
 				elseif heredoc and p.special == "*" then
 					p.hdoc = true -- (a here-document's $* joins with a space: bash)
@@ -1692,6 +1693,21 @@ function M.mark_tail(body, paren)
 	if last and last.t == "simple" and not last.timed and ((alone and paren) or not last.redirs)
 		and not (n > 1 and body[n - 1].t == "background") then
 		last.shtail = (alone and paren) and 2 or 1
+		last.cstail = not paren or nil -- (a $( … ) body's: a function it calls passes it on)
+	end
+end
+-- …and a function called as a $( … ) body's tail passes that on to its own body's last
+-- command, the same shape (bash 5.2 optimizes the function's tail inside the comsub too):
+-- marked with the function's name (rt: sh.fntail_arm names the function so called).
+function M.mark_fntail(body, name)
+	local n = body and #body or 0
+	local last = body and body[n]
+	if last and last.t == "andor" then
+		last = last.items[#last.items].cmd
+	end
+	if last and last.t == "simple" and not last.timed and not last.redirs
+		and not (n > 1 and body[n - 1].t == "background") then
+		last.fntail = name
 	end
 end
 M.scan_braces = scan_braces
@@ -1884,7 +1900,10 @@ function M.parse_default_quoted(txt, heredoc)
 			k = k + 1 -- drop the syntactic inner quote
 			inq = not inq
 		elseif ch == "$" and txt:sub(k + 1, k + 1) == '"' then
-			if inq then -- (`"${u-"$"}"`: inside the inner "…" a `$` before its close is literal)
+			-- (`"${u-"$"}"`: inside the inner "…" a `$` before its close is literal; in a
+			-- here-document's word a `$"` is no locale string at all — the `"` just drops
+			-- and the `$` expands what follows: `${u-$"k"}` is `$k`)
+			if inq or heredoc == "hdoc" then
 				out[#out + 1] = "$"
 			end
 			k = k + 1 -- $"…" (a locale string): its text, as "…"
@@ -2658,6 +2677,72 @@ local function is_blank(ch)
 end
 -- the characters a word scan must look at (anything else just continues the word)
 local LTR_SEEN = false -- a $"…" was read (M.parse: the program's lines translate as read)
+-- A $(…) body's $"…" strings are translated when the OUTER line is read, like the rest of
+-- that line (bash reads the whole body text then): each becomes a plain "…" (translated,
+-- or not — the run-time parse of the body must not translate it again under a later
+-- $TEXTDOMAIN). -> the new body, and how many newlines the translations added (the
+-- outer line count skips them; the body's own numbering keeps them, as bash's does).
+local function ltr_cmdsub(sh, body)
+	if body:find("<<", 1, true) then
+		return body, 0 -- (a here-document's text isn't scanned)
+	end
+	local out, last, k, m, dq, dnl, stack = {}, 1, 1, #body, false, 0, {}
+	while k <= m do
+		local c = body:sub(k, k)
+		local nx = body:sub(k + 1, k + 1)
+		if c == "\\" then
+			k = k + 2
+		elseif c == "'" and not dq then
+			k = (body:find("'", k + 1, true) or m) + 1
+		elseif c == "$" and nx == "'" and not dq then
+			k = k + 2
+			while k <= m and body:sub(k, k) ~= "'" do
+				k = k + (body:sub(k, k) == "\\" and 2 or 1)
+			end
+			k = k + 1
+		elseif c == "$" and nx == "(" then
+			stack[#stack + 1] = dq
+			dq = false
+			k = k + 2
+		elseif c == "(" and not dq then
+			stack[#stack + 1] = false
+			k = k + 1
+		elseif c == ")" and not dq then
+			if #stack > 0 then
+				dq = stack[#stack]
+				stack[#stack] = nil
+			end
+			k = k + 1
+		elseif c == '"' then
+			dq = not dq
+			k = k + 1
+		elseif c == "$" and nx == '"' and not dq then
+			local e = k + 2
+			while e <= m and body:sub(e, e) ~= '"' do
+				e = e + (body:sub(e, e) == "\\" and 2 or 1)
+			end
+			if e > m then
+				break
+			end
+			local txt = body:sub(k + 2, e - 1)
+			local t = require("gettext").translate(sh, txt) or txt
+			out[#out + 1] = body:sub(last, k - 1)
+			out[#out + 1] = '"' .. t .. '"'
+			if t ~= txt then
+				dnl = dnl + select(2, t:gsub("\n", "")) - select(2, txt:gsub("\n", ""))
+			end
+			last = e + 1
+			k = e + 1
+		else
+			k = k + 1
+		end
+	end
+	if last == 1 then
+		return body, 0
+	end
+	out[#out + 1] = body:sub(last)
+	return table.concat(out), dnl
+end
 local WORD_SPECIAL = "[\\()\"'$<>|&`; \t\n?*+@!]"
 -- bash's reserved words (word_token_alist)
 local RESERVED = { ["if"] = true, ["then"] = true, ["else"] = true, ["elif"] = true, ["fi"] = true,
@@ -2671,6 +2756,11 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs, xg, bq
 	if MBX then -- (a multibyte locale with ASCII trail bytes: see mb_hide)
 		local hsrc, map, cls = mb_hide(src)
 		if hsrc then
+			for ph, c in pairs(map) do
+				if c == "\\" then -- (a trail-byte `\`: a here-document body still reads it
+					MB_BSL = ph -- byte-wise, as a line continuation — see collect_heredocs)
+				end
+			end
 			local nextf = make_parser(hsrc, sh, aenv, noalias, posix, line0, lineabs, xg, bq)
 			return function()
 				local lg = nextf()
@@ -2685,6 +2775,8 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs, xg, bq
 		end
 	end
 	local i, n, line = 1, #src, lineabs or 1
+	local hd_bsl = MB_BSL -- (a trail-byte `\`'s placeholder: collect_heredocs' continuation)
+	MB_BSL = nil
 	local firstline = lineabs or line0 or 1 -- (the text's first line: an EOF error counts from it)
 	local orig_src = src -- (alias expansion splices into src; an error echoes the line as written)
 	if line0 then -- a $(…) body numbers from its command's line; leading newlines don't count
@@ -3040,7 +3132,9 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs, xg, bq
 				line = line + 1
 				nread = nread + 1
 				-- unquoted delimiter: `\<newline>` joins lines before the delimiter check (bash)
-				while hd.expand and le <= n and #lstr:match("\\*$") % 2 == 1 do
+				-- (bash reads a body byte by byte: a multibyte char's trail `\` just before the
+				-- newline joins too — though it escapes nothing, so `\xa3\x5c\\` joins as well)
+				while hd.expand and le <= n and (#lstr:match("\\*$") % 2 == 1 or (hd_bsl and lstr:sub(-1) == hd_bsl)) do
 					le = src:find("\n", i, true) or (n + 1)
 					local nxt = src:sub(i, le - 1)
 					if hd.strip then
@@ -3339,7 +3433,21 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs, xg, bq
 							i = i + 2
 							prex_comsub()
 						else
-							i = scan_cmdsub(src, i + 2, hdwarn_for(start, line0)) -- case/quote/nesting-aware boundary
+							local je = scan_cmdsub(src, i + 2, hdwarn_for(start, line0)) -- case/quote/nesting-aware boundary
+							local cbody = src:sub(i + 2, je - 2)
+							if cbody:find('$"', 1, true) then -- ($"…" in it: translated as the line is read)
+								LTR_SEEN = true
+								if sh then
+									local nb, dnl = ltr_cmdsub(sh, cbody)
+									if nb ~= cbody then
+										src = src:sub(1, i + 1) .. nb .. src:sub(je - 1)
+										n = #src
+										je = je + #nb - #cbody
+										lfix = lfix - dnl
+									end
+								end
+							end
+							i = je
 						end
 					elseif d == "$" and src:sub(i + 1, i + 1) == "{" then
 						i = scan_braces(src, i + 1, true) -- ${…}: inner \ ' " and nested {} don't close it
@@ -3367,8 +3475,12 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs, xg, bq
 				if ldq == q0 and sh then
 					-- bash's locale_expand, as the line is READ (the locale and $TEXTDOMAIN
 					-- then in force): the translation replaces the text, still in "…"
-					local t = require("gettext").translate(sh, src:sub(q0 + 1, i - 2))
+					local ot = src:sub(q0 + 1, i - 2)
+					local t = require("gettext").translate(sh, ot)
 					if t then
+						if t:find("\n", 1, true) or ot:find("\n", 1, true) then -- (the line count is the
+							lfix = lfix - select(2, t:gsub("\n", "")) + select(2, ot:gsub("\n", "")) -- text's as read)
+						end
 						src = src:sub(1, q0) .. t .. src:sub(i - 1)
 						n = #src
 						i = q0 + #t + 2
@@ -3419,10 +3531,25 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs, xg, bq
 				else
 					local je, hdp = scan_cmdsub(src, i + 2, hdwarn_for(start, line0)) -- case/quote/nesting-aware boundary (errors if unclosed)
 					local cbody = src:sub(i + 2, je - 2)
+					if cbody:find('$"', 1, true) then -- ($"…" in it: translated as this line is read)
+						LTR_SEEN = true
+						if sh then
+							local nb, dnl = ltr_cmdsub(sh, cbody)
+							if nb ~= cbody then
+								src = src:sub(1, i + 1) .. nb .. src:sub(je - 1)
+								n = #src
+								je = je + #nb - #cbody
+								lfix = lfix - dnl
+								cbody = nb
+							end
+						end
+					end
 					-- (not when the static parse could be wrong: aliases in play, here-documents,
 					-- extglob patterns while the state they're read under is only a guess)
+					-- (a `<<` with no delimiter word at all is an error either way: `$(cat <<)`)
 					if not hdp and src:sub(i + 2, i + 2) ~= "("
-						and not cbody:find("<<", 1, true) and not alias_touch(cbody) then
+						and (not cbody:find("<<", 1, true) or cbody:find("<<%-?[ \t]*$") or cbody:find("<<%-?[ \t]*[\n;&|)]"))
+						and not alias_touch(cbody) then
 						comsub_check(cbody)
 					end
 					if hdp then
@@ -3605,6 +3732,9 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs, xg, bq
 	-- to the whole body on every call.
 	local function funcdef_node(nm, dstart, dline)
 		local body, bline, subbody = func_body()
+		if not subbody then
+			M.mark_fntail(body, nm)
+		end
 		-- capture the definition's exact source text (name/`function` through the
 		-- closing `}`) so `declare -f`/`type`/`command -V` can recover it verbatim,
 		-- no deparser needed. `src` here is the whole script or the -c/stdin string.
@@ -4965,8 +5095,16 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs, xg, bq
 		local ln = line
 		local assigns = {}
 		local redirs = {}
+		-- cline: the line a simple command runs "at", which its $(…) bodies number from —
+		-- where bash's yacc reduced its first element: past a leading assignment/redirect
+		-- (a default reduction), but only once the SECOND token is read after a leading
+		-- WORD (the lookahead that rules out `WORD ( )`, a funcdef)
+		local cline
 		while true do
 			ws()
+			if not cline and #assigns + #redirs >= 1 then
+				cline = line
+			end
 			local r = parse_redir()
 			if r then
 				redirs[#redirs + 1] = r
@@ -5021,9 +5159,6 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs, xg, bq
 		-- simple command: WORD WORD ...
 		local words = {}
 		local arrayargs = nil -- `NAME=(...)` args to a declaration builtin
-		-- cline: the line once the SECOND element is read (bash's yacc lookahead: the line a
-		-- simple command runs "at", which its $(…) bodies number from)
-		local cline
 		while i <= n do
 			if not cline and #words + #assigns + #redirs >= 2 then
 				cline = line
@@ -5134,7 +5269,13 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs, xg, bq
 				end
 				return a
 			end
-			return { t = "assignlist", line = ln, list = assigns }
+			cline = cline or line
+			if cline ~= ln then -- (each binding runs at the list's line: its bodies number from it)
+				for k = 1, #assigns do
+					assigns[k].cline = cline
+				end
+			end
+			return { t = "assignlist", line = ln, cline = cline ~= ln and cline or nil, list = assigns }
 		end
 		-- a command follows: any leading assignments are its temporary (exported) env.
 		-- Arguments of a command that is NOT a declaration builtin are `plainarg`: in posix
@@ -5151,6 +5292,11 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs, xg, bq
 			end
 		end
 		cline = cline or line
+		if cline ~= ln then -- (its prefix bindings run at that line too)
+			for k = 1, #assigns do
+				assigns[k].cline = cline
+			end
+		end
 		local node = {
 			t = "simple",
 			line = ln,

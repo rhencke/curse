@@ -152,6 +152,9 @@ function M.compile_fragment(code, line1, mode, atab, pst)
 	if not pok or type(ast) ~= "table" then
 		return nil
 	end
+	if ast.ltrans then -- (a $"…" is translated as the text is read, under the live locale and
+		return nil -- $TEXTDOMAIN: the interpreter's reader does that each time)
+	end
 	if mode and mode:find("C", 1, true) then
 		P.mark_tail(ast.stmts)
 	end

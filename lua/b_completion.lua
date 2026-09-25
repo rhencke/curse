@@ -662,9 +662,8 @@ local function gen_wordlist(sh, words, text, ret)
 		isd[ifs:sub(k, k)] = true
 	end
 	local fields = {}
-	local nf = sh.opt_f
-	sh.opt_f = true -- (expand_words_shellexp: no pathname expansion)
-	local ok, err = pcall(function()
+	local nx = sh.xnoglob -- (expand_words_shellexp: no pathname expansion of these words —
+	local ok, err = pcall(function() -- though a $(…) in one runs with globbing as usual)
 		for _, piece in ipairs(split_wordlist(words, isd)) do
 			if piece ~= "" then
 				local ws = {}
@@ -681,6 +680,7 @@ local function gen_wordlist(sh, words, text, ret)
 					error({ __curse_exit = 1, __curse_experr = true, __curse_lineabort = true })
 				end
 				for _, w in ipairs(ws) do
+					sh.xnoglob = w
 					for _, f in ipairs(IM.expand_to_fields(sh, w)) do
 						fields[#fields + 1] = f
 					end
@@ -688,7 +688,7 @@ local function gen_wordlist(sh, words, text, ret)
 			end
 		end
 	end)
-	sh.opt_f = nf
+	sh.xnoglob = nx
 	if not ok then
 		error(err, 0)
 	end

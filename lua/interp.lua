@@ -972,7 +972,15 @@ local function arith_cur(sh, name, iv)
 	if iv then
 		return arith_resolve(sh, sh:array_get(name, iv))
 	end
-	local b = sh.vars[sh:deref(name)]
+	local dn = sh:deref(name)
+	if dn ~= name then -- (through a nameref: a circular one warns; one to an element
+		rt.arith_ref_circ(sh, name, 1) -- reads that element)
+		local ev = M.arith_ref_elem(sh, name)
+		if ev then
+			return ev
+		end
+	end
+	local b = sh.vars[dn]
 	if b and b.n ~= nil and b.s == nil and not b.arr then
 		return b.n
 	end
@@ -1083,7 +1091,15 @@ eval = function(sh, e)
 		-- an arithmetic loop. Return b.n directly. Safe: b.n is only ever a non-integer
 		-- (aget caching arith_num of a recursive expression) while b.s is still set, so
 		-- the b.s==nil guard excludes that case and falls through to arith_resolve.
-		local b = sh.vars[sh:deref(e.name)]
+		local dn = sh:deref(e.name)
+		if dn ~= e.name then -- (through a nameref: a circular one warns; one to an element
+			rt.arith_ref_circ(sh, e.name, 1) -- reads that element)
+			local ev = M.arith_ref_elem(sh, e.name)
+			if ev then
+				return ev
+			end
+		end
+		local b = sh.vars[dn]
 		if b and b.n ~= nil and b.s == nil and not b.arr then
 			return b.n
 		end
@@ -1378,6 +1394,28 @@ function M.arith_read(sh, name)
 		error({ __curse_lineabort = true })
 	end
 	error(v)
+end
+
+-- Arithmetic through a nameref to an ELEMENT (`declare -n v='a[2]'`): bash's lookup
+-- lands on that element, for the read and the store alike; `a[@]`/`a[*]` there is a
+-- bad subscript (reported; the read is 0, the store dropped). store: the value to write.
+-- Returns nil for a reference without a subscript (the caller's own path).
+function M.arith_ref_elem(sh, name, store)
+	local et = sh:deref_elem(name)
+	local base, sub = (et or ""):match("^([%a_][%w_]*)%[(.*)%]$")
+	if not base then
+		return nil
+	end
+	if sub == "@" or sub == "*" then
+		io.stderr:write("curse: " .. et .. ": bad array subscript\n")
+		return store or i64(0)
+	end
+	local k = array_key(sh, base, sub)
+	if store then
+		sh:array_set(base, k, rt.i64_to_str(store))
+		return store
+	end
+	return arith_resolve(sh, sh:array_get(base, k))
 end
 
 -- Compiled-tier helpers for `$name` arithmetic (the emit fast-xpand path):
@@ -2860,7 +2898,9 @@ expand_fields_full = function(sh, w, pre1) -- pre1: part 1 already expanded (a $
 			gipats[#gipats + 1] = table.concat(cur)
 		end
 	end
-	local noglob = sh.opt_f -- set -f: pathname expansion disabled; globs stay literal
+	-- set -f: pathname expansion disabled; globs stay literal (xnoglob: just this word's —
+	-- compgen -W's, whose $(…) bodies still glob)
+	local noglob = sh.opt_f or sh.xnoglob == w
 	local GLOBSPECIAL = {
 		["*"] = 1,
 		["?"] = 1,
@@ -3727,6 +3767,9 @@ end
 local function do_arrayassign(sh, st)
 	-- through a nameref (`local -n r=arr; r+=(x)`) the literal lands in the referenced array
 	local name = sh:deref(st.name)
+	if name == "" then -- (a nameref cycle: the ref itself becomes the array)
+		name = st.name
+	end
 	rt.noassign_arr_check(sh, name)
 	rt.ref_to_array(sh, name)
 	local isassoc = sh:is_assoc(name)
@@ -4724,6 +4767,15 @@ local function run_function(sh, cmd, fn, args, hook, tenv_base)
 	-- (an error out of compiled code called from here skips ITS frames' epilogues: the
 	-- depth, frames and stacks are unwound to these marks below)
 	local cd0, pd0, fs0, ne0 = sh.calldepth, sh.pd, sh.funcstack and #sh.funcstack or 0, sh.noerr
+	-- a $( … ) body's tail command calling this function: its own last command is a tail
+	-- too (parser.mark_fntail — fntail_arm names the function), else no tail inside
+	local arm0, armk0 = sh.fntail_arm, sh.fntail_kind
+	local tl = sh.shlvl_tail
+	if tl and sh.shlvl_cs and (tl < 0 and -1 - tl or tl) == pd0 then
+		sh.fntail_arm, sh.fntail_kind = cmd, tl < 0 and 1 or 2
+	elseif arm0 then
+		sh.fntail_arm = nil
+	end
 	sh.calldepth = sh.calldepth + 1 -- OSR gate: no handoff inside a call
 	sh:pushCall(unpack(args, 2))
 	-- Tempenv bindings applied as THIS call's prefix (`x=v func`) belong to this new
@@ -4844,6 +4896,7 @@ local function run_function(sh, cmd, fn, args, hook, tenv_base)
 	sh.cur_source = saved_src
 	sh:popCall()
 	sh.calldepth = sh.calldepth - 1
+	sh.fntail_arm, sh.fntail_kind = arm0, armk0
 	sh.cur_line = savedline -- back in the caller: $LINENO (e.g. for a top-level ERR trap) is the call site
 	if not ok then
 		if type(err) == "table" and err.__curse_return then
@@ -5965,7 +6018,7 @@ exec_stmt = function(sh, st, hook)
 	if st.line and t ~= "funcdef" and not (sh.in_trap and sh.in_trap > 0 and (sh.calldepth or 0) == sh.trap_calldepth) then
 		-- a simple command's line is where its SECOND token ended (bash's yacc lookahead:
 		-- `nope "x<NL>y"` errors on line 2); cline records that
-		sh.cur_line = (t == "simple" or t == "assign") and st.cline or st.line
+		sh.cur_line = (t == "simple" or t == "assign" or t == "assignlist") and st.cline or st.line
 		sh.cur_cline = st.cline or st.line -- (where its $(…) bodies number from)
 	end -- $LINENO: frozen at the trapped line for the trap's own commands (not in a
 	-- function the trap calls, whose lines count as usual — bash)
@@ -6007,9 +6060,14 @@ exec_stmt = function(sh, st, hook)
 						rt.assign_discard(sh) -- (a chain past NAMEREF_MAX: a silent assignment error)
 					end
 					io.stderr:write("curse: warning: " .. st.name .. ": circular name reference\n")
-					sh.status = 1
-					sh.assign_err = true -- (the rest of an assignment list is abandoned)
-					return
+					sh.status = 1 -- (an assignment error, as a readonly one: a prefix binding is just
+					if sh.opt_posix then -- skipped, a standalone one aborts the rest of the line)
+						error({ __curse_exit = 1 })
+					end
+					if sh.applying_prefix then
+						return
+					end
+					error({ __curse_exit = 1, __curse_lineabort = true })
 				elseif nb.outer and nb.s:find("[", 1, true) then -- (`local -n a='a[0]'`: bash
 					io.stderr:write("curse: `" .. nb.s .. "': not a valid identifier\n") -- rejects it)
 					error({ __curse_exit = 1, __curse_lineabort = true })
@@ -6256,6 +6314,10 @@ exec_stmt = function(sh, st, hook)
 	elseif t == "simple" then
 		if st.shtail then -- (the last command of a ( … ) / $( … ): rt.exec_tail_lvl)
 			sh.shlvl_tail = st.shtail == 2 and sh.pd or -1 - sh.pd
+			sh.shlvl_cs = st.cstail
+		elseif st.fntail and sh.fntail_arm == st.fntail then -- (see run_function)
+			sh.shlvl_tail = sh.fntail_kind == 2 and sh.pd or -1 - sh.pd
+			sh.shlvl_cs = true
 		end
 		if sh.opt_k and st.words then
 			-- set -k (keyword): an assignment-shaped word ANYWHERE is an assignment for the
@@ -6593,6 +6655,9 @@ exec_stmt = function(sh, st, hook)
 					-- make_variable_value appends arithmetically first)
 					local iapp = b and b.int and a.append and not b.arr and not b.ref and not a.raw
 					if b and not iapp and (b.ref or (not b.ro and (b.arr or b.int or b.lower or b.upper or b.cap))) then
+						if b.ref and rt.arith_ref_circ(sh, a.name, 0) == true then -- (a cycle: bash warns,
+							io.stderr:write("curse: warning: " .. a.name .. ": circular name reference\n") -- then binds)
+						end
 						sh.vars[a.name] = {}
 					end
 					if a.raw then -- NAME=(…) as a command prefix is a literal string, not an array (bash)
