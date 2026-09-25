@@ -9710,6 +9710,15 @@ function M.array_elem(sh, name, raw, expanded)
 	return sh:expand_param({ name = name, index = raw }, nil, nil, key)
 end
 
+-- An element's key for a compiled ${a[i]OP}: a negative subscript past the start says
+-- "bad array subscript" (the read then goes on), as interp's expand_pexp does.
+function M.array_key_rc(sh, name, raw, expanded)
+	local key = M.array_key(sh, name, raw, expanded)
+	if type(key) == "number" and key < 0 then
+		M.elem_read_check(sh, name, key)
+	end
+	return key
+end
 -- ${#a[i]} / ${#a[@]} in compiled code: under set -u only a variable that doesn't exist
 -- at all is unbound (named bare, as array_length_reference does); an unset element of an
 -- existing array is length 0 — expand_param's exact rule.

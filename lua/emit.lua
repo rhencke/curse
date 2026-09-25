@@ -2265,7 +2265,11 @@ local function substr_native(txt, lifted)
 	if not ok or type(ast) ~= "table" or not_compilable(ast) or arith_side_effect(ast) or not substr_safe(ast) then
 		return nil
 	end
-	return ("tonumber(%s)"):format(emit_value(ast, lifted))
+	local saved = arith_varread
+	arith_varread = "rt.arith_read(sh, %q)" -- (set -u: an unset name in ${s:u} is unbound)
+	local code = emit_value(ast, lifted)
+	arith_varread = saved
+	return ("tonumber(%s)"):format(code)
 end
 function pexp_scalar(pe, lifted)
 	-- ${x@a} / ${x[i]@a}: the variable's attribute letters, read straight from its binding
@@ -2297,7 +2301,7 @@ function pexp_scalar(pe, lifted)
 			local defthunk = ("function() return %s end"):format(
 				emit_word(require("parser").parse_word(pe.arg or ""), lifted)
 			)
-			return ('sh:expand_param({["name"]=%q,["index"]=%q,["op"]=%q}, %s, nil, rt.array_key(sh, %q, %q, %s))'):format(
+			return ('sh:expand_param({["name"]=%q,["index"]=%q,["op"]=%q}, %s, nil, rt.array_key_rc(sh, %q, %q, %s))'):format(
 				pe.name,
 				pe.index,
 				pe.op,
@@ -2311,7 +2315,7 @@ function pexp_scalar(pe, lifted)
 			-- ${a[i]@Q}/@U/@L/…: route via expand_param so ELEMENT set-ness (is_elem_set) decides —
 			-- an unset element yields "" (rt.at_transform would test the BASE var's set-ness instead).
 			-- The transform letter is the 3rd (arg) PARAMETER, exactly as interp calls expand_param.
-			return ('sh:expand_param({["name"]=%q,["index"]=%q,["op"]="@"}, %q, nil, rt.array_key(sh, %q, %q, %s))'):format(
+			return ('sh:expand_param({["name"]=%q,["index"]=%q,["op"]="@"}, %q, nil, rt.array_key_rc(sh, %q, %q, %s))'):format(
 				pe.name,
 				pe.index,
 				pe.arg,
