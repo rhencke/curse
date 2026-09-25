@@ -12530,10 +12530,32 @@ end
 
 -- `command -v NAME…` / `command -V NAME…`: a lookup query (is NAME an alias/keyword/
 -- builtin/function/PATH file?) — no execution, so compile it to this rt.* dispatch instead
--- of delegating: interp's command_describe (bash's describe_command), the argv already
--- expanded by the field engine. Combined/other flags stay with the interpreter.
+-- of delegating. argv is already expanded by the field engine; argv[2] is -v or -V. The
+-- option scan (more flags / `--` after it) and the answer are interp's own command.def
+-- branch (command_describe), so both tiers describe identically — posix wording, absolute
+-- paths, alias requoting, invalid options.
 function M.command_query(sh, argv)
-	require("interp")._int.command_describe(sh, argv, argv[3] == "--" and 4 or 3, argv[2] == "-V", false)
+	local I = require("interp")._int
+	local j, usep, vflag = 2, false, nil
+	while argv[j] and argv[j]:match("^%-.") and argv[j] ~= "--" do
+		for k = 2, #argv[j] do
+			local f = argv[j]:sub(k, k)
+			if f == "p" then
+				usep = true
+			elseif f == "v" or f == "V" then
+				vflag = f
+			else
+				io.stderr:write("curse: command: -" .. f .. ": invalid option\n" .. M.usage("command"))
+				sh.status = 2
+				return
+			end
+		end
+		j = j + 1
+	end
+	if argv[j] == "--" then -- (end of options)
+		j = j + 1
+	end
+	I.command_describe(sh, argv, j, vflag == "V", usep)
 end
 
 -- `source FILE [args]` / `. FILE [args]`: run FILE in the CURRENT shell, COMPILED as a
@@ -12626,7 +12648,9 @@ function M.source_run(sh, argv, line)
 	end
 	local code = f:read("*a")
 	f:close()
-	-- (a DEBUG/ERR trap reaching into the file: tier compiles its hooks in — trap_mode)
+	-- (a DEBUG/ERR trap reaching into the file: tier compiles its hooks in — trap_mode;
+	-- what its text reads joins the program's: tier.note_text)
+	require("tier").note_text(sh, code)
 	local mod = not M.source_empty(code) and require("tier").try_fragment(code, nil, sh)
 	if not mod then -- alias / syntax error / uncompilable / empty: b_source runs the text it was handed
 		-- (never re-opening the file — a FIFO or /dev/stdin can only be read once)
