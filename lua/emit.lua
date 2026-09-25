@@ -4627,7 +4627,30 @@ H.simple = function(cx, st, after)
 	if not c then
 		return p
 	end
-	local dp = cx.delegate(st, after, { callee = "I.exec_stmt", callargs = ("sh, %s, __noop"):format(ser(st)) })
+	-- the names changed at run time: the same statement with its command word resolved LIVE
+	-- (function → builtin → external, rt.exec_dynamic — the dynamic-command-word path), argv
+	-- built as interp's expand_args would for that literal name. A prefix env, an array value,
+	-- `exec` (statement-level) or an `unset a[…]` word keep interp's statement handling.
+	local dp
+	local dynok = not st.assigns and not st.arrayargs and c ~= "exec"
+	if dynok and c == "unset" then
+		for j = 2, #st.words do
+			local p1 = st.words[j].parts[1]
+			if p1 and p1.lit and not p1.q and p1.lit:match("^[%a_][%w_]*%[") then
+				dynok = false
+			end
+		end
+	end
+	if dynok then
+		local dst = {}
+		for k, v in pairs(st) do
+			dst[k] = v
+		end
+		dst.dynname = c
+		dp = simple_compiled(cx, dst, after)
+	else
+		dp = cx.delegate(st, after, { callee = "I.exec_stmt", callargs = ("sh, %s, __noop"):format(ser(st)) })
+	end
 	local g = cx.newpc()
 	cx.blocks[g] = ("if %s then pc = %d else pc = %d end"):format(names_guard({ c }), p, dp)
 	return g
@@ -4635,6 +4658,9 @@ end
 simple_compiled = function(cx, st, after)
 	local t = st.t
 	local cmd = st.words[1] and full_lit(st.words[1]) -- full literal → \-escaped builtins (\exit, \echo) dispatch
+	if st.dynname then -- (H.simple's live-dispatch variant: take the dynamic-command-word path)
+		cmd = nil
+	end
 	-- `var=x return` / `var=x :` …: under set -o posix a special builtin's prefix
 	-- assignments PERSIST — interp decides that at run time (opt_posix)
 	if cmd and st.assigns and #st.assigns > 0 and require("interp")._int.SPECIAL_BUILTIN[cmd] then
@@ -4755,7 +4781,10 @@ simple_compiled = function(cx, st, after)
 	-- reusing delegate's control-flow-signal wrapper. A prefix assign (tempenv) still needs
 	-- exec_stmt's fuller handling; a redirect is applied around the dispatch (opts.redir).
 	if cmd == nil and st.words[1] and not st.assigns then
-		local argvbody, argvbody_g = field_argv(st.words, 1, cx.lifted, nil, nil, true)
+		-- (a live-dispatched literal declaration name keeps its assignment words: expand_args)
+		local dn = st.dynname
+		local asg = dn == "export" or dn == "declare" or dn == "typeset" or dn == "readonly" or dn == "local"
+		local argvbody, argvbody_g = field_argv(st.words, 1, cx.lifted, nil, nil, true, asg)
 		local dyn_redir = nil
 		if argvbody and st.redirs then
 			dyn_redir = cx.redir_conds(st, nil) -- nil => uncompilable redir shape: fall through to full delegate
@@ -6235,7 +6264,6 @@ H.subshell = function(cx, st, after)
 	-- escaping piece of shell state). The fragment RAISES exit/return (caught by
 	-- subshell_run), so subshell_exit_pc is cleared around its build. break/continue can't
 	-- cross into it — the fragment has its own loopstack.
-	local inproc_pc = nil -- in-process branch behind a runtime guard (see below)
 	if not EF.inproc_trap_block and #st.body > 0 then
 		local saved_ssx = EF.subshell_exit_pc
 		EF.subshell_exit_pc = nil
@@ -6268,24 +6296,14 @@ H.subshell = function(cx, st, after)
 			else
 				cx.blocks[p] = ("%ssh:subshell_run(__CS[%d], nil, true)%s%s; pc = %d"):format(swpre, id, swpost, ecs, after)
 			end
-			if not EF.has_dyncode then
-				return p
-			end
-			inproc_pc = p
+			-- (in an eval/source program the body's simple commands guard their own names —
+			-- H.simple's live-dispatch variant — so the fragment stays valid as names change)
+			return p
 		end
 	end
 	-- Otherwise (no fragment, or its guard fails at run time) the interpreter runs the
 	-- subshell — in-process as well (subshell_run): a subshell never forks.
-	local p = cx.delegate(st, after)
-	if inproc_pc then
-		-- eval/source program: compiled only while the body's names are still the static
-		-- ones (else the interpreter, which resolves them live)
-		local cond = dyn_guard(st.body) or "true"
-		local g = cx.newpc()
-		cx.blocks[g] = ("if %s then pc = %d else pc = %d end"):format(cond, inproc_pc, p)
-		return g
-	end
-	return p
+	return cx.delegate(st, after)
 end
 
 -- statement handler: group (split out of flatten_stmt; see H)
@@ -6354,31 +6372,41 @@ H.pipeline = function(cx, st, after)
 	-- Every stage runs IN-PROCESS under the coroutine scheduler. In an eval/source program a
 	-- stage whose command names may have been redefined at run time (dyn_guard) can't trust
 	-- its compiled form: then the whole pipeline goes to the interpreter (in-process too).
-	local inproc, guards = {}, {}
+	-- (the stages' own simple commands guard their names — H.simple's live-dispatch variant —
+	-- so the fragments stay valid; only a stage's KIND may not: a name that became a function
+	-- can't run "flat". Then the same stages run with the kinds every name being a function
+	-- gives — the general, never-flat shapes.)
+	local inproc, dinproc, guards = {}, {}, {}
+	local function kq(kind)
+		return kind == true and "true" or ('"' .. kind .. '"')
+	end
 	for i = 1, n do
 		local kind = require("runtime").stage_kind(st.cmds[i], function(c)
 			return cx.funcflags[c] or (cx.inlinefns and cx.inlinefns[c])
 		end)
-		inproc[i] = kind == true and "true" or ('"' .. kind .. '"')
+		inproc[i] = kq(kind)
+		dinproc[i] = kq(require("runtime").stage_kind(st.cmds[i], function()
+			return true
+		end))
 		local g = dyn_guard({ st.cmds[i] })
 		if g then
 			guards[#guards + 1] = "(" .. g .. ")"
 		end
 	end
-	local gpre, gpost = "", ""
+	local kinds = ("{%s}"):format(table.concat(inproc, ", "))
 	if #guards > 0 then
-		local pd = cx.delegate(st, after)
-		gpre = ("if not (%s) then pc = %d else "):format(table.concat(guards, " and "), pd)
-		gpost = " end"
+		kinds = ("((%s) and %s or %s)"):format(table.concat(guards, " and "), EF.konst(inproc),
+			EF.konst(dinproc))
 	end
+	local gpre, gpost = "", ""
 	-- (`! cmd` ignores its OWN special-builtin failure: rt.spb_run)
 	local negspb = n == 1 and st.negate and st.cmds[1].t == "simple" and st.cmds[1].words
 		and st.cmds[1].words[1] and require("runtime").SPECIAL_BUILTIN[full_lit(st.cmds[1].words[1]) or ""]
 	cx.blocks[p] = gpre .. dbg(st)
 		.. lifted_flush(cx.lifted)
 		.. (negspb and "sh.spb_neg = true; " or "")
-		.. ("sh:run_pipeline({%s}, %s, {%s}%s)"):format(
-			table.concat(frags, ", "), st.negate and "true" or "false", table.concat(inproc, ", "),
+		.. ("sh:run_pipeline({%s}, %s, %s%s)"):format(
+			table.concat(frags, ", "), st.negate and "true" or "false", kinds,
 			(EF.lifted_names and #EF.lifted_names > 0) and ", __upv_get, __upv_set" or "")
 		.. (negspb and "; sh.spb_neg = nil" or "")
 		.. post
