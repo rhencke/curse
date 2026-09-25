@@ -7875,6 +7875,7 @@ M._int = {
 	exec_stmt = exec_stmt,
 	apply_redirs = apply_redirs,
 	restore_redirs = restore_redirs,
+	drain_procsub = drain_procsub,
 	redirs_touch_stdout = redirs_touch_stdout,
 	describe = describe,
 	statbuf = statbuf,

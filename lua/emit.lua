@@ -4582,6 +4582,18 @@ end
 -- still static (rt.names_static) -> the compiled code; else the interpreter's live dispatch.
 local simple_compiled
 H.simple = function(cx, st, after)
+	-- a command that creates <(…)/>(…): mark before it, drain (close the shell's pipe ends,
+	-- reap the children) after it — interp's procsub_mark/drain_procsub around exec_simple
+	if not cx.ps_guarded[st] and cx.has_procsub(st) then
+		cx.ps_guarded[st] = true
+		local v = cx.newloopvar()
+		local post = cx.newpc()
+		cx.blocks[post] = ("rt.procsub_drain(sh, %s); pc = %d"):format(v, after)
+		local body = cx.flatten_stmt(st, post)
+		local pre = cx.newpc()
+		cx.blocks[pre] = ("%s = rt.procsub_mark(sh); pc = %d"):format(v, body)
+		return pre
+	end
 	local ua = false -- a word with an unquoted $((…)), else one field (arith_guard)
 	for _, w in ipairs(st.words or {}) do
 		if arith_guard(w) then
@@ -5255,18 +5267,24 @@ simple_compiled = function(cx, st, after)
 			local d = dbg(st)
 			local lastarg = "if #__a > 0 then sh:set_str('_', __a[#__a]) end"
 			local run = px_builtin and "rt.builtin(sh, __a, __noop)" or "sh:exec(unpack(__a))"
+			-- the prefix bindings run the command: rt.run_prefix
+			local prun = ("rt.run_prefix(sh, { %s }, __pv, function() %s%s end, __a)"):format(
+				table.concat(pnames, ", "), run, (px_builtin and redir_apply) and "; io.flush()" or "")
+			-- The redirections apply OUTSIDE the prefix bindings — they don't see them (bash: `a=2
+			-- cmd >&$a` uses the outer a; `IFS=/ read < <(…)` doesn't split /dev/fd/63), as
+			-- interp unshadows the tempenv while they expand.
 			local dispatch
 			if not redir_apply then
-				dispatch = run
+				dispatch = prun
 			elseif px_builtin then -- a builtin's buffered output must reach the target fd before restore
-				dispatch = ("do local __rs = {}; if %s then sh.write_err = nil; %s; io.flush() else sh.status = 1 end; rt.redir_restore(__rs); if sh.write_err then rt.chkwrite_late(sh, __a[1]) end end"):format(
+				dispatch = ("do local __rs = {}; if %s then sh.write_err = nil; %s else sh.status = 1 end; rt.redir_restore(__rs); if sh.write_err then rt.chkwrite_late(sh, __a[1]) end end"):format(
 					redir_apply,
-					run
+					prun
 				)
 			else -- external: it runs with its own fds, a failed redirect is $?=1
 				dispatch = ("do local __rs = {}; if %s then %s else sh.status = 1 end; rt.redir_restore(__rs) end"):format(
 					cx.redir_ext(nil, redir_apply),
-					run
+					prun
 				)
 			end
 			-- __pv (prefix values) FIRST, then __a (argv) — both in the pre-prefix env,
@@ -5275,10 +5293,7 @@ simple_compiled = function(cx, st, after)
 				.. ("local __pv = { %s }; "):format(table.concat(pvals, ", "))
 				.. builder
 				.. (bg and "; if __a then" or "")
-				.. ("; rt.run_prefix(sh, { %s }, __pv, function() %s end, __a); "):format(
-					table.concat(pnames, ", "),
-					dispatch
-				)
+				.. ("; %s; "):format(dispatch)
 				.. lastarg
 				.. ecs
 				.. (bg and " end" or "")
@@ -6692,6 +6707,34 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
 	-- DONE, which in the forked child would return PAST the subshell.
 	cx.subexit = {}
 	cx.bx_guarded = {} -- (statements already given their `set +B` guard)
+	cx.ps_guarded = {} -- (simple commands already given their <()/>() drain)
+	-- Does a simple command create a process substitution — a <(…)/>(…) word, prefix value
+	-- or redirection target? Its pipes are closed and its children reaped after the command.
+	function cx.has_procsub(st)
+		local function inw(w)
+			for _, p in ipairs(w and w.parts or {}) do
+				if p.procsub then
+					return true
+				end
+			end
+		end
+		for _, w in ipairs(st.words or {}) do
+			if inw(w) then
+				return true
+			end
+		end
+		for _, a in ipairs(st.assigns or {}) do
+			if inw(a.rhs) then
+				return true
+			end
+		end
+		for _, r in ipairs(st.redirs or {}) do
+			if ((r.src or r.target or "") .. (r.word or "")):find("[<>]%(") then
+				return true
+			end
+		end
+		return false
+	end
 
 
 
@@ -6918,6 +6961,28 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
 	-- directly; an EXPANDABLE one ($/glob/~ etc.) hands mask-aware segments to redir_apply_expand
 	-- (field expansion + the ambiguous-redirect check at runtime).
 	function cx.redir_apply_expr(r)
+		local e = cx.redir_native_expr(r)
+		if e then
+			return e
+		end
+		-- Any other shape — a `{var}>` named fd, a fd MOVE (`>&5-`), a dup to an expanded fd
+		-- (`>&$fd`), a brace/cmdsub/arith target, an expanding heredoc emit_word can't render:
+		-- apply that ONE redirection with the shared redirection applier (interp's apply_redirs
+		-- on a one-element list — the redirect analogue of rt.word_fields), its fd saves joining
+		-- __rs so the compiled restore undoes them. Lifted locals are flushed to sh around it
+		-- (the target may read them, `{v}` / `${x:=f}` may write them).
+		local call = ("rt.redir_apply_one(sh, %s[1], __rs)"):format(EF.konst({ ser(r) }))
+		local si, so = {}, {}
+		for n in spairs(cx.lifted) do
+			si[#si + 1] = ("sh:aset(%q, %s); "):format(n, lname(n))
+			so[#so + 1] = ("%s = sh:aget(%q); "):format(lname(n), n)
+		end
+		if #si == 0 then
+			return call
+		end
+		return ("(function() %slocal __ok = %s; %sreturn __ok end)()"):format(table.concat(si), call, table.concat(so))
+	end
+	function cx.redir_native_expr(r)
 		if r.fdvar then
 			return nil
 		end
@@ -7075,6 +7140,13 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
 		-- command before it — a compound doesn't move the line itself)
 		local sl = EF.cur_line
 		EF.cur_line = st.top and st.redirs[1].line or cx.prev_line or sl
+		local ps, psv -- (a >(…) target: drained after the whole compound, as interp does)
+		if cx.has_procsub({ redirs = st.redirs }) then
+			psv = cx.newloopvar()
+			ps = cx.newpc()
+			cx.blocks[ps] = ("rt.procsub_drain(sh, %s); pc = %d"):format(psv, after)
+			after = ps
+		end
 		local p = cx.delegate(st, after, {
 			callee = "__CS[" .. id .. "]",
 			callargs = "sh",
@@ -7087,6 +7159,11 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
 			},
 		})
 		EF.cur_line = sl
+		if ps then
+			local pre = cx.newpc()
+			cx.blocks[pre] = ("%s = rt.procsub_mark(sh); pc = %d"):format(psv, p)
+			return pre
+		end
 		return p
 	end
 

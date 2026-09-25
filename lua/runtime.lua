@@ -1633,6 +1633,37 @@ function M.redir_apply(sh, op, fd, target, saves)
 end
 -- `exec REDIRS`: the redirections persist, so the saved originals are just dropped (a kept
 -- copy of a pipe's write end would hold its reader's EOF off forever)
+-- One redirection the compiled tier has no native form for (a `{var}>` named fd, a fd move,
+-- a dup to an expanded fd, a brace/cmdsub target, …): applied by the shared redirection
+-- applier (interp's apply_redirs on a one-element list — its own messages, ambiguity and
+-- noclobber rules), its fd saves appended to the compiled `saves` so redir_restore undoes
+-- them. Returns the applier's ok.
+function M.redir_apply_one(sh, r, saves)
+	local I = require("interp")._int
+	if not saves.out_sh and CO_OUTS[sh.out] and I.redirs_touch_stdout({ r }) then
+		saves.out_sh, saves.out = sh, sh.out -- (a pipeline stage: builtins write fd 1 directly)
+		sh.out = io.write
+	end
+	local sv, ok = I.apply_redirs(sh, { r })
+	for i = 1, #sv do
+		saves[#saves + 1] = sv[i]
+	end
+	if sv.e2o then -- (`2>&1` inside a capture: the routing is undone at restore)
+		saves.e2o, saves._sh = (saves.e2o or 0) + sv.e2o, sv._sh
+	end
+	return ok
+end
+-- <(…)/>(…) bookkeeping around a compiled simple command (interp's procsub_mark /
+-- drain_procsub): the count of registered process substitutions before it, and after it
+-- close the shell's ends of those it added and reap their children.
+function M.procsub_mark(sh)
+	return sh.procsub_files and #sh.procsub_files or 0
+end
+function M.procsub_drain(sh, nf)
+	if sh.procsub_files then
+		require("interp")._int.drain_procsub(sh, 0, nf)
+	end
+end
 function M.redir_discard(saves)
 	if saves.out_sh then
 		io.flush()
@@ -1647,6 +1678,10 @@ function M.redir_discard(saves)
 end
 function M.redir_restore(saves)
 	io.flush()
+	if saves.e2o then
+		saves._sh.err2out = (saves._sh.err2out or 0) - saves.e2o
+		saves.e2o = nil
+	end
 	if saves.out_sh then
 		saves.out_sh.out, saves.out_sh = saves.out, nil
 	end
