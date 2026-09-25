@@ -1125,7 +1125,9 @@ end
 emit_value = function(e, lifted)
 	local k = e.k
 	if k == "num" then
-		if e.v:match("^%d+$") and (e.v == "0" or e.v:sub(1, 1) ~= "0") then
+		-- (19+ digits may not fit a Lua LL literal — `18446744073709551617LL` is malformed —
+		-- so bash's wrapping of a huge constant goes through rt.arith_num)
+		if e.v:match("^%d+$") and (e.v == "0" or e.v:sub(1, 1) ~= "0") and #e.v <= 18 then
 			return e.v .. "LL"
 		end
 		return ("rt.arith_num(%q)"):format(e.v) -- 0x.. / 010 octal / N#.. bases
@@ -1361,7 +1363,9 @@ local emit_avalue
 emit_avalue = function(e)
 	local k = e.k
 	if k == "num" then
-		if e.v:match("^%d+$") and (e.v == "0" or e.v:sub(1, 1) ~= "0") then
+		-- (19+ digits may not fit a Lua LL literal — `18446744073709551617LL` is malformed —
+		-- so bash's wrapping of a huge constant goes through rt.arith_num)
+		if e.v:match("^%d+$") and (e.v == "0" or e.v:sub(1, 1) ~= "0") and #e.v <= 18 then
 			return e.v .. "LL"
 		end
 		return ("rt.arith_num(%q)"):format(e.v) -- 0x.. / 010 / N#.. bases
@@ -2900,10 +2904,17 @@ local function arrayassign_ok(st, lifted, allow_nameref)
 	if st.index or (EF.has_nameref and not allow_nameref) then
 		return false
 	end
+	-- An assoc literal's FIRST word picks its form (kvpair_assignment_p): after a keyed first
+	-- word a bare word is an error reported unexpanded, so only a plain literal (its text is
+	-- its value) compiles. (After a bare first word a `[k]=v` is one plain word: rt.arrayassign.)
+	local kvfirst = st.elems[1] and st.elems[1].key == nil
 	for _, e in ipairs(st.elems) do
 		if e.brace_bare then
 			return false
 		end -- `[k]=` value brace-expands (de-keyed): interp
+		if e.key == nil and not kvfirst and not e.word.src:match("^[%w_./,:@%%+=-]+$") then
+			return false
+		end
 		if e.key ~= nil then
 			if static_key(e.key) == nil then
 				return false
@@ -3345,6 +3356,7 @@ local function numeric_word(w)
 		and w.parts[1].lit
 		and w.parts[1].lit:match("^[+-]?%d+$")
 		and not w.parts[1].lit:match("^[+-]?0%d")
+		and #w.parts[1].lit <= 18 -- (see emit_value's num: a Lua LL literal must fit)
 	then
 		return w.parts[1].lit
 	end
@@ -4351,9 +4363,9 @@ H.assign = function(cx, st, after)
 		local kmode, kstr = EF.elem_keyexpr(st, iw, cx.lifted)
 		if kmode == "native" then -- a[i]/a[i+1]/a[3]: native key (reads lifted); assoc uses the raw subscript
 			cx.blocks[p] = d
-				.. ("do local v_ = %s; if sh:is_assoc(%q) then local k_ = %s; %srt.assign_element(sh, %q, %q, k_, v_, %s) else local k_ = %s; %srt.assign_element_i(sh, %q, k_, v_, %s) end end%s; pc = %d"):format(
+				.. ("do local v_ = %s; if sh:is_assoc(%q) then local k_ = %s; %srt.assign_element(sh, %q, %q, k_, v_, %s) else local k_ = %s; %srt.assign_element_i(sh, %q, k_, v_, %s, %q) end end%s; pc = %d"):format(
 					rhsval(), st.name, expw, st0, st.name, st.index, append,
-					kstr, st0, st.name, append, ecs, after)
+					kstr, st0, st.name, append, st.index, ecs, after)
 		elseif kmode == "xexp" then -- a[$i]: arith the natively-expanded (lifted-aware) VALUE
 			cx.blocks[p] = d
 				.. ("do local v_ = %s; local k_ = %s; %srt.assign_element_x(sh, %q, k_, v_, %s) end%s; pc = %d"):format(
@@ -4537,13 +4549,13 @@ simple_compiled = function(cx, st, after)
 				elseif not empty_word(e.word) then
 					-- an assoc's key/value words don't split or glob (see H.arrayassign)
 					if isassoc then
-						parts[#parts + 1] = ("__it[#__it+1] = {val=%s}"):format(emit_word(e.word, cx.lifted))
+						parts[#parts + 1] = ("__it[#__it+1] = {val=%s, decl=true}"):format(emit_word(e.word, cx.lifted))
 					else
 						if not parts.asq then -- (asked once per statement)
 							parts.asq = true
 							parts[#parts + 1] = ("local __as = sh:is_assoc(%q)"):format(a1.name)
 						end
-						parts[#parts + 1] = ("if __as then __it[#__it+1] = {val=%s} else %s end"):format(
+						parts[#parts + 1] = ("if __as then __it[#__it+1] = {val=%s, decl=true} else %s end"):format(
 							emit_word(e.word, cx.lifted),
 							emit_fields_into("__it", e.word, cx.lifted, "{val=%s}")
 						)
@@ -6277,18 +6289,22 @@ H.arrayassign = function(cx, st, after)
 				parts[#parts + 1] = ("__it[#__it+1] = {key=%q, op=%q, val=%s, src=%q, rawkey=%q}"):format(EF.static_key(e.key), e.op, valx, e.word and e.word.src or "", e.key)
 			elseif not empty_word(e.word) then
 				-- a bare word field-splits and globs for an INDEXED target, but is one plain word
-				-- in an ASSOCIATIVE key/value list (bash) — which one is only known at run time
-				local fields = emit_fields_into("__it", e.word, cx.lifted, "{val=%s}")
-				if unq_full_lit(e.word) and not unq_full_lit(e.word):find("[%*%?%[]") then
-					parts[#parts + 1] = fields -- (a plain literal is the same either way)
+				-- in an ASSOCIATIVE key/value list (bash) — which one is only known at run time.
+				-- (src: the word as written, for an assoc's empty-key report)
+				local fl = unq_full_lit(e.word)
+				local srcf = ((", src=%q"):format(e.word.src):gsub("%%", "%%%%"))
+				if fl and not fl:find("[%*%?%[]") then -- (a plain literal is the same either way)
+					parts[#parts + 1] = emit_fields_into("__it", e.word, cx.lifted,
+						fl == e.word.src and "{val=%s}" or ("{val=%s" .. srcf .. "}"))
 				else
 					if not parts.asq then -- (asked once per statement)
 						parts.asq = true
 						parts[#parts + 1] = ("local __as = sh:is_assoc(%q)"):format(st.name)
 					end
-					parts[#parts + 1] = ("if __as then __it[#__it+1] = {val=%s} else %s end"):format(
+					parts[#parts + 1] = ("if __as then __it[#__it+1] = {val=%s%s} else %s end"):format(
 						emit_word(e.word, cx.lifted),
-						fields
+						srcf,
+						emit_fields_into("__it", e.word, cx.lifted, "{val=%s}")
 					)
 				end
 			end
