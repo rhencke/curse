@@ -24,6 +24,13 @@ local function bind_name(sh, name, value)
 		io.stderr:write("curse: getopts: `" .. name .. "': not a valid identifier\n")
 		return 1
 	end
+	local b = sh.vars[name]
+	if b and b.ref and (b.s == nil or b.s == "") then -- a valueless nameref: the value becomes its
+		rt.assign_ctx = "getopts" -- target, and a bad one (`?`) fails the bind (getopts_bind_variable:
+		local ok = sh:set_str(name, value) ~= false -- `getopts: `?': not a valid identifier', status 1)
+		rt.assign_ctx = nil
+		return ok and 0 or 1
+	end
 	return rt.assign_ref(sh, "getopts", name, value) and 0 or 2
 end
 local function bind_optarg(sh, value) -- value nil: OPTARG declared with no value (bash: NULL)
@@ -196,9 +203,7 @@ return function(sh, cmd, args, hook, tcb)
 			end
 		else
 			bind_optarg(sh, res.arg)
-			rt.assign_ctx = "getopts"
 			sh.status = bind_name(sh, vname, res.opt)
-			rt.assign_ctx = nil
 		end
 	end
 end

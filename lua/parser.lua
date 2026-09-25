@@ -17,6 +17,14 @@ local COMSUB_PREX = false
 -- Posix mode for the line being parsed: inside a double-quoted ${…}, a `'` is an ordinary
 -- character (bash: `set -o posix; echo "${IFS+'bar} baz"` prints 'bar baz).
 local POSIX_DQ = false
+-- The live LC_CTYPE is a multibyte charset whose TRAIL bytes can be ASCII (Big5, GBK,
+-- Shift-JIS: U+03B1 is Big5 a3 5c). bash's shell_getc marks each byte of a multibyte
+-- character (shell_input_line_property) and its lexer's MBTEST only treats a lone byte
+-- as `\`, `|`, `{`…, so a trail byte is never a metacharacter. The scanners here are
+-- byte-based: in such a locale the text is parsed with those trail bytes swapped for
+-- unused high bytes, and the tree gets them back (mb_hide / mb_restore). UTF-8 (every
+-- byte of a multibyte char >= 0x80) and single-byte locales never pay for it.
+local MBX = false
 
 -- ---- arithmetic expression parser (precedence climbing over a string) ----
 -- AST: {k="num",v}, {k="var",name}, {k="bin",op,l,r}, {k="un",op,e},
@@ -645,16 +653,25 @@ local comsub_eof = false
 -- whole enclosing line, reported with the OUTER line: the body's first real syntax error
 -- (a premature end means its `)` came too soon), or nil. Cached by body text.
 local comsub_err_cache, comsub_err_n = {}, 0
-local function comsub_syntax(body)
-	local hit = comsub_err_cache[body]
+-- xg: the extglob state the body is read under, when known. A second result true: the
+-- body's parse had to GUESS that state (an extglob-looking `X(` in it), so no error is
+-- trusted — the caller's program then runs a line at a time (xg_guess).
+local function comsub_syntax(body, xg)
+	local key = xg == nil and body or body .. (xg and "\0x" or "\0-")
+	local hit = comsub_err_cache[key]
 	if hit ~= nil then
-		return hit or nil
+		if hit == "?" then
+			return nil, true
+		end
+		return hit or nil, false
 	end
-	local err = false
-	local ok, ast = pcall(M.parse, body)
+	local err, guessed = false, false
+	local ok, ast = pcall(M.parse, body, nil, nil, nil, nil, nil, nil, xg)
 	if not ok then
 		err = type(ast) == "table" and (ast.msg or "syntax error") or tostring(ast)
+		guessed = xg == nil and body:find("[@!+*?]%(") ~= nil
 	elseif ast and ast.stmts then
+		guessed = ast.xg_guess and true or false
 		for _, st in ipairs(ast.stmts) do
 			if st.t == "parse_error" and not st.recoverable then
 				err = tostring(st.msg or "syntax error")
@@ -675,9 +692,12 @@ local function comsub_syntax(body)
 	if comsub_err_n >= 512 then
 		comsub_err_cache, comsub_err_n = {}, 0
 	end
-	comsub_err_cache[body] = err
+	comsub_err_cache[key] = guessed and "?" or err
 	comsub_err_n = comsub_err_n + 1
-	return err or nil
+	if guessed then
+		return nil, true
+	end
+	return err or nil, false
 end
 local dparen_is_arith -- forward (defined below)
 -- (scan_braces: skip to just past the closing quote `q`, honoring \ when `esc`; running off
@@ -1685,6 +1705,82 @@ M.grab_dparen = grab_dparen
 -- ~5x slower than bash because it re-lexed the subscript + arith text every pass.
 -- Bounded so a script with unboundedly many distinct expressions can't leak.
 local MEMO_CAP = 8192
+local mb_hide, mb_restore
+do
+	-- the ASCII bytes a Big5/GBK/SJIS trail byte (0x40-0x7e) can be that a scanner reads
+	-- as syntax (letters, digits and `_` just continue a word either way)
+	local MB_SPECIAL = { [64] = true, [91] = true, [92] = true, [93] = true, [94] = true, [96] = true,
+		[123] = true, [124] = true, [125] = true, [126] = true }
+	-- -> the text with each such trail byte replaced by a high byte `src` doesn't use,
+	-- the placeholder -> original map and its pattern class; nil when there's nothing to hide
+	function mb_hide(src)
+		if not src:find("[\128-\255]") then
+			return nil
+		end
+		local charlen = package.loaded.runtime.mb_charlen
+		local used, rev, map, cls = {}, {}, nil, nil
+		for c in src:gmatch("[\128-\255]") do
+			used[c:byte()] = true
+		end
+		local out, last, i, n = {}, 1, 1, #src
+		while i <= n do
+			if src:byte(i) >= 0x80 then
+				local len = charlen(src, i)
+				for k = i + 1, i + len - 1 do
+					local t = src:byte(k)
+					if MB_SPECIAL[t] then
+						local ph = rev[t]
+						if not ph then
+							for c = 0x80, 0xff do
+								if not used[c] then
+									ph = c
+									break
+								end
+							end
+							if not ph then
+								return nil -- (every high byte in use: parse it byte-wise)
+							end
+							used[ph], rev[t] = true, ph
+							map = map or {}
+							map[string.char(ph)] = string.char(t)
+							cls = (cls or "") .. string.char(ph)
+						end
+						out[#out + 1] = src:sub(last, k - 1)
+						out[#out + 1] = string.char(ph)
+						last = k + 1
+					end
+				end
+				i = i + len
+			else
+				i = i + 1
+			end
+		end
+		if not map then
+			return nil
+		end
+		out[#out + 1] = src:sub(last)
+		return table.concat(out), map, "[" .. cls .. "]"
+	end
+	-- put the hidden trail bytes back in every string of a parsed tree (same lengths, so
+	-- recorded positions stay valid)
+	function mb_restore(v, map, cls, seen)
+		seen[v] = true
+		for k, x in pairs(v) do
+			local tx = type(x)
+			if tx == "string" then
+				if x:find(cls) then
+					v[k] = (x:gsub(cls, map))
+				end
+			elseif tx == "table" and not seen[x] then
+				mb_restore(x, map, cls, seen)
+			end
+		end
+		return v
+	end
+end
+function M.mb_locale(on) -- (runtime: the locale changed)
+	MBX = on or false
+end
 do
 	local acache, an = {}, 0
 	local aimpl = arith
@@ -1713,7 +1809,7 @@ do
 	parse_word = function(src)
 		-- (a $(…)/`…` part records the static alias state it was parsed under: memoize only
 		-- where that can't differ — no alias state, or no substitution in the word)
-		if type(src) == "string" and not COMSUB_PREX and not POSIX_DQ
+		if type(src) == "string" and not COMSUB_PREX and not POSIX_DQ and not MBX
 			and (ALIAS_ENV == nil or not src:find("[$`]")) then
 			local hit = wcache[src]
 			if hit ~= nil then
@@ -1731,6 +1827,12 @@ do
 			wcache[src] = w
 			wn = wn + 1
 			return w
+		end
+		if MBX and type(src) == "string" then
+			local hsrc, map, cls = mb_hide(src)
+			if hsrc then
+				return mb_restore(wimpl(hsrc), map, cls, {})
+			end
 		end
 		return wimpl(src)
 	end
@@ -2565,7 +2667,23 @@ local RESERVED = { ["if"] = true, ["then"] = true, ["else"] = true, ["elif"] = t
 -- reserved words that open a compound command usable as a function body
 local FBODY_KW = { ["if"] = true, ["for"] = true, ["while"] = true, ["until"] = true, ["case"] = true, ["select"] = true }
 
-local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs, xg)
+local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs, xg, bq)
+	if MBX then -- (a multibyte locale with ASCII trail bytes: see mb_hide)
+		local hsrc, map, cls = mb_hide(src)
+		if hsrc then
+			local nextf = make_parser(hsrc, sh, aenv, noalias, posix, line0, lineabs, xg, bq)
+			return function()
+				local lg = nextf()
+				if lg then
+					local s = lg.src
+					lg.src = nil
+					mb_restore(lg, map, cls, {})
+					lg.src = s == hsrc and src or s and (s:gsub(cls, map))
+				end
+				return lg
+			end
+		end
+	end
 	local i, n, line = 1, #src, lineabs or 1
 	local firstline = lineabs or line0 or 1 -- (the text's first line: an EOF error counts from it)
 	local orig_src = src -- (alias expansion splices into src; an error echoes the line as written)
@@ -2921,8 +3039,9 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs, xg)
 					found = true
 					break
 				end
-				-- a $(…) body's final `DELIM )` line reached here as `DELIM ` (see scan_cmdsub)
-				if le > n and line0 and lstr:match("^(.-)[ \t]+$") == hd.delim then
+				-- a $(…) body's final `DELIM )` line reached here as `DELIM ` (see scan_cmdsub);
+				-- a backtick body has no such form: its last `DELIM ` line is body text
+				if le > n and line0 and not bq and lstr:match("^(.-)[ \t]+$") == hd.delim then
 					found = true
 					break
 				end
@@ -3059,6 +3178,18 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs, xg)
 		end
 		return xg == false and not extglob_on -- (the live state the text started from, if given)
 	end
+	-- the extglob state a $(…) body is read under (bash's parse_comsub: the state when the
+	-- enclosing line is read) for its read-time syntax check, or nil when only a guess
+	local function xg_body()
+		if sh then
+			return sh.shopt ~= nil and sh.shopt.extglob or false
+		elseif extglob_on then
+			return true
+		elseif xg == false then
+			return false
+		end
+		return nil
+	end
 	-- the parse-time options (posix, extglob) a loop / function definition was read under,
 	-- in tier.compile_fragment's pst form: its hot-path recompile from its source text
 	-- (tier loop_fragment / fn_hot) must parse it the same way, whatever is live by then.
@@ -3121,6 +3252,19 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs, xg)
 	end
 	local function comsub_err(cerr)
 		error({ __curse_perr = true, msg = cerr, line = cerr:find("near `", 1, true) and line or nil, forceeof = true }, 0)
+	end
+	-- the read-time syntax check of a $(…) body (a guessed extglob state: line mode)
+	local function comsub_check(cbody)
+		local bxg = nil
+		if cbody:find("[@!+*?]%(") then
+			bxg = xg_body()
+		end
+		local cerr, guessed = comsub_syntax(cbody, bxg)
+		if guessed then
+			xg_guess = true
+		elseif cerr then
+			comsub_err(cerr)
+		end
 	end
 	local function word(stop_paren, stop_cmp) -- read one shell word, keeping quotes and $(( )) / ${ } / $( ) balanced
 		ws()
@@ -3241,14 +3385,11 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs, xg)
 				else
 					local je, hdp = scan_cmdsub(src, i + 2, hdwarn_for(start, line0)) -- case/quote/nesting-aware boundary (errors if unclosed)
 					local cbody = src:sub(i + 2, je - 2)
-					-- (not when the static parse could be wrong: aliases in play, extglob
-					-- patterns, here-documents)
-					if not hdp and src:sub(i + 2, i + 2) ~= "(" and not cbody:find("[@!+*?]%(")
+					-- (not when the static parse could be wrong: aliases in play, here-documents,
+					-- extglob patterns while the state they're read under is only a guess)
+					if not hdp and src:sub(i + 2, i + 2) ~= "("
 						and not cbody:find("<<", 1, true) and not alias_touch(cbody) then
-						local cerr = comsub_syntax(cbody)
-						if cerr then
-							comsub_err(cerr)
-						end
+						comsub_check(cbody)
 					end
 					if hdp then
 						-- `$(cat <<EOF)` then the body on the following lines (bash): move those
@@ -3972,8 +4113,10 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs, xg)
 			-- (`func-name=ext () { … }`), as long as the name doesn't END in `=` — that
 			-- is an array/scalar assignment (`a=()`, `x=`), which the assignment path
 			-- handles instead (and `a=(` is caught there before we get here anyway).
-			local s, e = src:find("^[%w_:%.+@/%%%^~,][%w_%.%-:+@/!#=%%%^~,]*", i)
-			if s and src:sub(e, e) ~= "=" then
+			local s, e = src:find("^[%w_:%.+@/%%%^~,][%w_%.%-:+@/!#=%%%^~,%[%]]*", i)
+			-- (`a[1]()` names a function too; an unbalanced `f[x` is left to the word reader)
+			if s and src:sub(e, e) ~= "=" and (not src:find("^[^][]*[][]", s) or src:find("[][]", s) > e
+				or src:sub(s, e):find("^[^][]*%b[][^][]*$")) then
 				local j = e + 1
 				while is_blank(src:sub(j, j)) do
 					j = j + 1
@@ -3993,6 +4136,11 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs, xg)
 							["else"] = "else", ["elif"] = "elif", ["fi"] = "fi", ["esac"] = "esac" }
 						if RW[nm] then
 							error("syntax error near `" .. RW[nm] .. "'")
+						end
+						-- (an assignment word — `c=d`, `a[1]+=x` — is ASSIGNMENT_WORD, never a
+						-- function name: bash's grammar rejects the `(` after it)
+						if nm:find("^[%a_][%w_]*%+?=") or nm:find("^[%a_][%w_]*%b[]%+?=") then
+							error("syntax error near `('")
 						end
 						i = k + 1
 						return funcdef_node(nm, dstart, dline)
@@ -4677,11 +4825,8 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs, xg)
 						-- parse_comsub — which doesn't inherit the case-pattern state)
 						local je = scan_cmdsub(src, i + 2)
 						local cbody = src:sub(i + 2, je - 2)
-						if not alias_on and not cbody:find("[@!+*?]%(") and not cbody:find("<<", 1, true) then
-							local cerr = comsub_syntax(cbody)
-							if cerr then
-								comsub_err(cerr)
-							end
+						if not alias_on and not cbody:find("<<", 1, true) then
+							comsub_check(cbody)
 						end
 						patstr[#patstr + 1] = src:sub(i, je - 1)
 						i = je
@@ -4943,7 +5088,13 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs, xg)
 				return nil
 			end
 			if #assigns == 1 then
-				return assigns[1]
+				-- (a lone assignment runs at the line it ENDED: bash's lookahead was the
+				-- newline after it — its $(…)/`…` bodies number from there)
+				local a = assigns[1]
+				if line ~= (a.line or ln) then
+					a.cline = line
+				end
+				return a
 			end
 			return { t = "assignlist", line = ln, list = assigns }
 		end
@@ -5444,10 +5595,11 @@ end
 -- program, and by callers that want the AST). An optional `sh` makes alias
 -- expansion consult the live runtime table (for eval/source/$() at runtime); the
 -- compiler passes none, so it tracks aliases deterministically from source.
-function M.parse(src, sh, aenv, noalias, posix, line0, line1, xg)
+-- (bq: `src` is a `…` body)
+function M.parse(src, sh, aenv, noalias, posix, line0, line1, xg, bq)
 	local saved_env, sprex, spdq, sltr = ALIAS_ENV, COMSUB_PREX, POSIX_DQ, LTR_SEEN
 	LTR_SEEN = false
-	local nextf = make_parser(src, sh, aenv, noalias, posix, line0, line1, xg) -- yields logical-line groups { stmts, perr }
+	local nextf = make_parser(src, sh, aenv, noalias, posix, line0, line1, xg, bq) -- yields logical-line groups { stmts, perr }
 	local stmts, lines, xgg = {}, {}, nil
 	while true do
 		local lg = nextf()
@@ -5487,6 +5639,11 @@ end
 -- numbers eval'd code, and functions it defines, from there)
 function M.open(src, sh, line1)
 	return make_parser(src, sh, nil, nil, nil, nil, line1)
+end
+
+do -- (loaded after the locale was set: runtime's lc_commit keeps it current from here)
+	local rt = package.loaded.runtime
+	MBX = rt and rt.lc_mb_cur_max() > 1 and not rt.lc_utf8() or false
 end
 
 return M

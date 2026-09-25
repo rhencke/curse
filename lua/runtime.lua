@@ -1207,6 +1207,10 @@ do
 			re_locale_changed()
 		end
 		lc_mb_cur_max = tonumber(C.__ctype_get_mb_cur_max()) or 1
+		local P = package.loaded.parser -- (Big5/GBK/SJIS lexing: parser.lua's MBX)
+		if P then
+			P.mb_locale(lc_mb_cur_max > 1 and not M.lc_utf8())
+		end
 	end
 	function M.reset_locale(sh, var)
 		if var == "LC_MONETARY" or (var and sh.importing_env) then
@@ -1799,13 +1803,13 @@ end
 -- applier (interp's apply_redirs on a one-element list — its own messages, ambiguity and
 -- noclobber rules), its fd saves appended to the compiled `saves` so redir_restore undoes
 -- them. Returns the applier's ok.
-function M.redir_apply_one(sh, r, saves)
+function M.redir_apply_one(sh, r, saves, ctx) -- (ctx: the command, naming a {v} error)
 	local I = require("interp")._int
 	if not saves.out_sh and CO_OUTS[sh.out] and I.redirs_touch_stdout({ r }) then
 		saves.out_sh, saves.out = sh, sh.out -- (a pipeline stage: builtins write fd 1 directly)
 		sh.out = io.write
 	end
-	local sv, ok = I.apply_redirs(sh, { r })
+	local sv, ok = I.apply_redirs(sh, { r }, nil, ctx)
 	for i = 1, #sv do
 		saves[#saves + 1] = sv[i]
 	end
@@ -2573,7 +2577,8 @@ function Shell:capture_src(src, backtick, noalias, line0)
 	-- expansion time, so a throw here (e.g. an unterminated quote) is contained.
 	-- self: $()/`` expand aliases from the live table (unless already expanded as read)
 	-- (line0: compiled code's command line — its sh.cur_line isn't kept per command)
-	local pok, parsed = pcall(P.parse, src, self, nil, noalias, nil, line0 or self.cur_cline or self.cur_line)
+	local pok, parsed = pcall(P.parse, src, self, nil, noalias, nil, line0 or self.cur_cline or self.cur_line,
+		nil, nil, backtick)
 	if pok and type(parsed) == "table" then
 		P.mark_tail(parsed.stmts)
 	end
@@ -7951,7 +7956,7 @@ function Shell:aset(name, n)
 		error({ __curse_exit = 1, __curse_matherr = true, __curse_lineabort = true })
 	end
 	if b.ref then -- a number is never a nameref target (`declare -n r; ((r=0))`)
-		M.bad_ref_target(i64_to_str(i64(n)), require("parser").arith_cmd)
+		M.bad_ref_target(i64_to_str(i64(n)), require("parser").arith_cmd or (self.in_arithcmd and "((" or nil))
 		error({ __curse_exit = 1, __curse_matherr = true })
 	end
 	if dn == "OPTIND" and self.getopts_state then
@@ -14685,7 +14690,7 @@ end
 -- (its AST: `declare -f` prints it, a def redirect applies per call), `fn` the body.
 function M.def_function(sh, st, fn)
 	local name = st.name
-	local badname = not name:match("^[%w_:%.+@/%%%^~,!][%w_%.%-:+@/!#=%%%^~,]*$")
+	local badname = not name:match("^[%w_:%.+@/%%%^~,!][%w_%.%-:+@/!#=%%%^~,%[%]]*$")
 	if badname or (sh.opt_posix and not name:match("^[%a_][%w_]*$")) then
 		M.err_at(sh, st.top and st.eline, "curse: `" .. name .. "': not a valid identifier\n")
 		sh.status = 1
