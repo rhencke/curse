@@ -2584,6 +2584,11 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs, xg)
 	local alias_on = false -- shopt expand_aliases state (from source)
 	local posix_on = posix or false -- set -o posix state (from source; sh.opt_posix when interpreting)
 	local extglob_on = xg or false -- shopt extglob state (from source; the live sh.shopt when interpreting)
+	-- a static parse (no sh, extglob not known off) read `X(…)` / `!(` by a GUESS at the
+	-- extglob state the tracking says is off: the program's parse may depend on a live
+	-- state (shopt in a function, a syntax error bash would report) — the compiler runs it
+	-- in line mode, where each line is parsed by the live reader (xg_guess on the line group)
+	local xg_guess = false
 	local aliases = {} -- name -> value (from parsed `alias` commands)
 	if aenv then -- a nested body ($(…)) starts from its enclosing line's static state
 		alias_on = true
@@ -2709,6 +2714,23 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs, xg)
 			return
 		end
 		alias_pending[#alias_pending + 1] = node
+		-- a $(…) later on THIS line expands with the table as it is when it RUNS (bash):
+		-- after an alias/unalias/shopt/set here the line-start snapshot is stale — `dirty`
+		-- sends that body to the run-time capture (emit compile_cmdsub_inner)
+		local w1 = node.words[1].parts
+		local c = #w1 == 1 and not w1[1].q and w1[1].lit
+		local dirty = c == "alias" or c == "unalias"
+		if c == "shopt" or c == "set" then -- (expand_aliases / posix mode, or a dynamic word)
+			for k = 2, #node.words do
+				local a = static_word(node.words[k])
+				if not a or a == "expand_aliases" or a == "posix" then
+					dirty = true
+				end
+			end
+		end
+		if dirty then
+			ALIAS_ENV = { tab = ALIAS_ENV and ALIAS_ENV.tab or {}, dirty = true }
+		end
 	end
 	-- Line boundary (sh-less): apply the previous line's alias changes, then publish the
 	-- static state for this line's $(…) parts.
@@ -3036,6 +3058,22 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs, xg)
 		end
 		return xg == false and not extglob_on -- (the live state the text started from, if given)
 	end
+	-- the parse-time options (posix, extglob) a loop / function definition was read under,
+	-- in tier.compile_fragment's pst form: its hot-path recompile from its source text
+	-- (tier loop_fragment / fn_hot) must parse it the same way, whatever is live by then.
+	-- nil: a static parse from the defaults (the recompile's own default reproduces it).
+	local function pst_now()
+		local p, x
+		if sh then
+			p, x = sh.opt_posix, sh.shopt ~= nil and sh.shopt.extglob
+		else
+			p, x = posix_on, extglob_on
+			if not (p or x) then
+				return nil
+			end
+		end
+		return (p and "p" or "") .. (x and "x" or "-")
+	end
 	-- from just past an extglob `X(`, to just past its matching `)`
 	local function scan_extglob(k)
 		local d = 1
@@ -3235,6 +3273,9 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs, xg)
 				i = scan_cmdsub(src, i + 2)
 			elseif (c == "?" or c == "*" or c == "+" or c == "@" or c == "!") and src:sub(i + 1, i + 1) == "("
 				and (stop_cmp or not xg_off()) then
+				if not (sh or stop_cmp or extglob_on or xg == false) then
+					xg_guess = true
+				end
 				-- extglob ?(..) *(..) +(..) @(..) !(..): part of the word, not a subshell —
 				-- decided when the line is PARSED (bash's lexer checks extended_glob; a [[ ]]
 				-- pattern always allows it). Quotes and `\` inside don't count toward the
@@ -3392,6 +3433,7 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs, xg)
 			name = nm,
 			body = body,
 			deftext = deftext,
+			_pst = deftext and pst_now(),
 			line = dline,
 			bline = bline,
 			eline = line, -- (where it ends: a readonly function's redefinition is reported there)
@@ -4067,6 +4109,7 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs, xg)
 					body = body_stmts,
 					redirs = tail_redirs(),
 					_srcs = src,
+					_pst = pst_now(),
 					_h1 = h1,
 					_s1 = s1,
 				}
@@ -4152,6 +4195,7 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs, xg)
 				body = body_stmts,
 				redirs = tail_redirs(),
 				_srcs = src,
+				_pst = pst_now(),
 				_s0 = s0,
 				_s1 = s1,
 			}
@@ -4190,6 +4234,7 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs, xg)
 				negate = (kind == "until"),
 				redirs = tail_redirs(),
 				_srcs = src,
+				_pst = pst_now(),
 				_s0 = s0,
 				_s1 = s1,
 			}
@@ -4365,6 +4410,9 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs, xg)
 					-- pattern, and bash matches extglob patterns in [[ ]] regardless)
 					-- without extglob, `[[ !(…) ]]` is the `!` operator applied to a ( … ) group
 					toks[#toks + 1] = "!"
+					if not (sh or xg == false) then
+						xg_guess = true
+					end
 					quoted[#toks] = false
 					i = i + 1
 				else
@@ -4561,6 +4609,9 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs, xg)
 						-- `(` is a group only after an extglob prefix, when extglob is on
 						if c == "(" and not (patstr[#patstr] and patstr[#patstr]:match("^[?*+@!]$") and not xg_off()) then
 							error("syntax error near `('")
+						end
+						if c == "(" and not (sh or extglob_on or xg == false) then
+							xg_guess = true
 						end
 					end
 					if c == ")" and depth == 0 then
@@ -4970,6 +5021,9 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs, xg)
 		if src:sub(i, i + 1) == "!(" and not (sh and sh.shopt and sh.shopt.extglob or (not sh and extglob_on)) then
 			-- without extglob, `!(cmds)` is `!` negating a ( … ) subshell, not a pattern word
 			negate = not negate
+			if not (sh or xg == false) then
+				xg_guess = true
+			end
 			i = i + 1
 		end
 		local first = parse_command()
@@ -5316,6 +5370,9 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs, xg)
 	-- a syntax error also reports the offending input line (bash's second message line)
 	return function()
 		local lg = next_line()
+		if lg and xg_guess then
+			lg.xg_guess, xg_guess = true, false
+		end
 		if lg and lg.perr and #warns > 0 then -- (warnings read before the error still show)
 			lg.perr.warns = warns
 			warns = {}
@@ -5361,13 +5418,14 @@ end
 function M.parse(src, sh, aenv, noalias, posix, line0, line1, xg)
 	local saved_env, sprex, spdq = ALIAS_ENV, COMSUB_PREX, POSIX_DQ
 	local nextf = make_parser(src, sh, aenv, noalias, posix, line0, line1, xg) -- yields logical-line groups { stmts, perr }
-	local stmts, lines = {}, {}
+	local stmts, lines, xgg = {}, {}, nil
 	while true do
 		local lg = nextf()
 		if not lg then
 			break
 		end
 		lines[#lines + 1] = lg
+		xgg = xgg or lg.xg_guess
 		-- A syntax error on a line means the WHOLE line runs nothing (bash parses the
 		-- line before executing any of it), so the parse_error goes BEFORE the line's
 		-- own statements: a non-recoverable error then aborts (exit 2) before they run,
@@ -5385,7 +5443,7 @@ function M.parse(src, sh, aenv, noalias, posix, line0, line1, xg)
 		end
 	end
 	ALIAS_ENV, COMSUB_PREX, POSIX_DQ = saved_env, sprex, spdq
-	return { stmts = stmts, lines = lines }
+	return { stmts = stmts, lines = lines, xg_guess = xgg }
 end
 
 -- Lazy/incremental parse: returns an iterator yielding one top-level statement

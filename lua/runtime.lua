@@ -12243,45 +12243,32 @@ end
 
 -- `command -v NAME…` / `command -V NAME…`: a lookup query (is NAME an alias/keyword/
 -- builtin/function/PATH file?) — no execution, so compile it to this rt.* dispatch instead
--- of delegating. name_type is the runtime resolver interp uses; the argv is already expanded
--- by the field engine. Mirrors interp's command -v/-V branch exactly (status 0 if ANY name
--- resolved). Combined/other flags stay with the interpreter.
+-- of delegating. argv is already expanded by the field engine; argv[2] is -v or -V. The
+-- option scan (more flags / `--` after it) and the answer are interp's own command.def
+-- branch (command_describe), so both tiers describe identically — posix wording, absolute
+-- paths, alias requoting, invalid options.
 function M.command_query(sh, argv)
 	local I = require("interp")._int
-	local verbose = argv[2] == "-V"
-	local anyfound = false
-	for j = 3, #argv do
-		local k, p, hashed = I.name_type(sh, argv[j])
-		if not k then
-			if verbose then
-				io.stderr:write("curse: command: " .. argv[j] .. ": not found\n")
-			end
-		else
-			anyfound = true
-			if verbose then
-				if k == "alias" then
-					sh:echo(argv[j] .. " is aliased to `" .. sh.aliases[argv[j]] .. "'")
-				elseif k == "file" then
-					sh:echo(argv[j] .. (hashed and " is hashed (" .. p .. ")" or " is " .. p))
-				elseif k == "function" then
-					sh:echo(argv[j] .. " is a function")
-					local d = I.func_body_text(sh, argv[j])
-					if d then
-						sh:echo(d)
-					end
-				elseif k == "keyword" then
-					sh:echo(argv[j] .. " is a shell keyword")
-				else
-					sh:echo(argv[j] .. " is a shell builtin")
-				end
-			elseif k == "alias" then
-				sh:echo("alias " .. argv[j] .. "='" .. sh.aliases[argv[j]] .. "'")
+	local j, usep, vflag = 2, false, nil
+	while argv[j] and argv[j]:match("^%-.") and argv[j] ~= "--" do
+		for k = 2, #argv[j] do
+			local f = argv[j]:sub(k, k)
+			if f == "p" then
+				usep = true
+			elseif f == "v" or f == "V" then
+				vflag = f
 			else
-				sh:echo(k == "file" and p or argv[j])
+				io.stderr:write("curse: command: -" .. f .. ": invalid option\n" .. M.usage("command"))
+				sh.status = 2
+				return
 			end
 		end
+		j = j + 1
 	end
-	sh.status = anyfound and 0 or 1
+	if argv[j] == "--" then -- (end of options)
+		j = j + 1
+	end
+	I.command_describe(sh, argv, j, vflag == "V", usep)
 end
 
 -- `source FILE [args]` / `. FILE [args]`: run FILE in the CURRENT shell, COMPILED as a
@@ -12374,7 +12361,9 @@ function M.source_run(sh, argv, line)
 	end
 	local code = f:read("*a")
 	f:close()
-	-- (a DEBUG/ERR trap reaching into the file: tier compiles its hooks in — trap_mode)
+	-- (a DEBUG/ERR trap reaching into the file: tier compiles its hooks in — trap_mode;
+	-- what its text reads joins the program's: tier.note_text)
+	require("tier").note_text(sh, code)
 	local mod = not M.source_empty(code) and require("tier").try_fragment(code, nil, sh)
 	if not mod then -- alias / syntax error / uncompilable / empty: b_source runs the text it was handed
 		-- (never re-opening the file — a FIFO or /dev/stdin can only be read once)

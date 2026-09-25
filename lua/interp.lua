@@ -7242,6 +7242,9 @@ run_trap = function(sh, code)
 	sh.in_trap = (sh.in_trap or 0) + 1
 	local sxd = sh.xdepth -- (a handler's commands trace one level deeper: `++ cmd`, bash)
 	sh.xdepth = (sxd or 0) + 1
+	-- (bash's save_pipestatus_array: the handler's own commands leave $PIPESTATUS as it was)
+	local psb = sh.vars.PIPESTATUS
+	local psa = psb and psb.arr
 	-- A handler that runs again is compiled (tier fragment, keyed by its text and the trap
 	-- state): the first run interprets it, so a one-shot EXIT trap never loads the compiler.
 	local seen = trap_seen[code]
@@ -7256,7 +7259,7 @@ run_trap = function(sh, code)
 		end
 		trap_seen[code] = true
 	end
-	local stmts, k = mod and {} or P.parse(code).stmts, 0
+	local stmts, k = mod and {} or P.parse(code, sh).stmts, 0 -- (sh: aliases expand, bash)
 	local function body()
 		if mod then -- (a line abort is contained by run_compiled: the rest of that line is skipped)
 			return run_trap_mod(mod, sh)
@@ -7297,6 +7300,9 @@ run_trap = function(sh, code)
 	end
 	sh.in_trap = sh.in_trap - 1
 	sh.xdepth = sxd
+	if psa and sh.vars.PIPESTATUS == psb then
+		psb.arr = psa
+	end
 	sh.trap_calldepth, sh.trap_saved = saved_tcd, saved_ts
 	sh.cur_line = savedline
 	if not ok then
@@ -8009,6 +8015,7 @@ M._int = {
 	dbracket_pattern = dbracket_pattern,
 	redirs_touch_stdout = redirs_touch_stdout,
 	describe = describe,
+	command_describe = command_describe,
 	statbuf = statbuf,
 	statbuf2 = statbuf2,
 	run_trap = run_trap,

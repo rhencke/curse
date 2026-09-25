@@ -72,6 +72,9 @@ return function(sh, cmd, args, hook, tcb)
 			else
 				local src = f:read("*a")
 				f:close()
+				if not pre then -- (rt.source noted it already)
+					require("tier").note_text(sh, src) -- (what it reads joins the program's)
+				end
 				do
 					local savep, savenp = sh.params, sh.nparams
 					if #args > j then

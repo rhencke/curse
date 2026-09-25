@@ -129,6 +129,11 @@ return function(sh, cmd, args, hook, tcb)
 						sh.traps[canon] = nil
 					else
 						sh.traps[canon] = action
+						if action:find("BASH_COMMAND", 1, true) then
+							-- (sticky: code compiled from now on records each command's text —
+							-- tier.trap_mode "B" keys the fragments that do)
+							sh.trap_bcmd = true
+						end
 					end
 					if canon == "ERR" then -- (it fires where it was set: see interp's fire_err_trap)
 						sh.err_trap_sp = sh.in_subprogram or 0

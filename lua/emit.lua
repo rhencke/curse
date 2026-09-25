@@ -976,6 +976,9 @@ EF.trap_loopctl = false -- a trap handler may break/continue → loops check sh.
 EF.LC_LOOP = { forc = true, whilec = true, forin = true, select = true }
 EF.has_return = false -- program may set a RETURN trap → compiled calls fire it (fnwrap)
 EF.bash_command = false -- program reads $BASH_COMMAND → each command records its text (dbg)
+EF.trap_bcmd = false -- a fragment compiled after a trap reading $BASH_COMMAND was set (tier "B")
+EF.pflags = "" -- tier.note_text letters a fragment compiled under (EF.fnmode)
+EF.lm_aenv = nil -- line mode: the alias table its $(…) bodies parse with (false: capture_src)
 EF.extdebug = false -- program may `shopt -s extdebug` → a DEBUG trap can skip a command (dbg)
 EF.dbg_after_of = {} -- (extdebug) statement -> its continuation pc, for the skip
 EF.DBG_SKIP = { simple = true, arithcmd = true, dbracket = true, assign = true, assignlist = true, case = true }
@@ -1026,8 +1029,9 @@ local function dbg(st, head)
 	-- (shopt -s extdebug: a non-zero DEBUG status SKIPS the command — rt.debug_x raises
 	-- the statement's continuation pc for this CFG's catcher: run_compiled, rt.catch_dbgskip)
 	local skip = EF.has_debug and EF.extdebug and (EF.frag_depth == 0 or EF.cur_cfg ~= "run") and EF.dbg_after_of[st]
-	if skip then
-		return ("rt.debug_x(sh, %d, %d, %q) "):format(st.line or 0, skip, EF.cur_cfg)
+	if skip then -- (a handler's commands: the interrupted line, as below)
+		return ("rt.debug_x(sh, %s, %d, %q) "):format((EF.trapline and not EF.cur_infunc) and "sh.cur_line"
+			or tostring(st.line or 0), skip, EF.cur_cfg)
 	end
 	if EF.has_debug then
 		if EF.trapline and not EF.cur_infunc then -- (a handler's commands: the interrupted line)
@@ -1845,6 +1849,15 @@ end
 function compile_cmdsub_inner(src, backtick, lifted, aenv, noalias, posix)
 	local fallback = ("sh:capture_src(%q, %s, %s, %d)"):format(src, tostring(backtick or false),
 		tostring(noalias or false), EF.cur_cline or EF.cur_line or 0)
+	if aenv and aenv.dirty and not noalias then -- (its line changed the alias state first)
+		return fallback
+	end
+	if aenv == nil and not noalias and EF.lm_aenv ~= nil then -- (line mode: the live aliases)
+		if EF.lm_aenv == false then
+			return fallback
+		end
+		aenv = EF.lm_aenv
+	end
 	local pok, ast = pcall(require("parser").parse, src, nil, aenv, noalias, posix, EF.cur_cline or EF.cur_line)
 	if not pok or type(ast) ~= "table" or ast.stmts == nil then
 		return fallback
@@ -5431,6 +5444,7 @@ end
 function EF.fnmode(name, defk)
 	if EF.fragment and defk then
 		local m = (EF.has_err and "E" or "") .. (EF.has_debug and (EF.functrace and "T" or "D") or "")
+			.. (EF.trap_bcmd and "B" or "") .. EF.pflags
 		return ("rt.fn_mode(sh, %q, %q, %s); "):format(name, m, defk)
 	end
 	return ("if sh.func_mode then sh.func_mode[%q] = nil end; "):format(name)
@@ -6333,6 +6347,10 @@ simple_compiled = function(cx, st, after)
 					ei[#ei + 1] = ("sh:aset(%q, %s)"):format(n, lname(n))
 					eo[#eo + 1] = ("%s = sh:aget(%q)"):format(lname(n), n)
 				end
+				-- (the call's line: run_function pushes it on BASH_LINENO — EF.funcstack)
+				if EF.funcstack and st.line and not EF.trapline then
+					table.insert(ei, 1, "sh.cur_line = " .. st.line)
+				end
 				call = ("if sh.functions[%q] then %srt.call_dynamic_fn(sh, __a)%s else sh:exec_t(__a) end"):format(
 					cmd,
 					#ei > 0 and (table.concat(ei, "; ") .. "; ") or "",
@@ -6660,6 +6678,9 @@ simple_compiled = function(cx, st, after)
 		local eo = {}
 		for n in spairs(cx.lifted) do
 			eo[#eo + 1] = ("%s = sh:aget(%q)"):format(lname(n), n)
+		end
+		if EF.funcstack and st.line and not EF.trapline then -- (the call's line: run_function pushes it on BASH_LINENO)
+			table.insert(ei, 1, "sh.cur_line = " .. st.line)
 		end
 		local si = #ei > 0 and (table.concat(ei, "; ") .. "; ") or ""
 		local so = #eo > 0 and ("; " .. table.concat(eo, "; ")) or ""
@@ -8034,6 +8055,13 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
 			if d ~= "" then
 				prelude = d .. (prelude or "")
 			end
+			if EF.pipestatus and (callee == "rt.eval_u" or callee == "rt.source_u") then -- (a simple
+				-- command: PIPESTATUS=($?) after it — an eval'd pipeline's statuses don't survive
+				-- the eval, bash)
+				local post = cx.newpc()
+				cx.blocks[post] = ('sh:array_assign("PIPESTATUS", {tostring(sh.status)}, false); pc = %d'):format(after)
+				after = post
+			end
 		end
 		local callargs = (opts and opts.callargs) or ("sh, %s, __noop"):format(ser(st))
 		local sync_in, sync_out = {}, {}
@@ -8299,7 +8327,7 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
 				-- ($var/$(cmd)/arith, no split/glob): parse it in heredoc mode and render with emit_word,
 				-- exactly interp's expand_word(parse_heredoc(body, true)). A part emit_word can't render
 				-- (procsub/nameref/$LINENO/…) fails emitable_word -> delegate.
-				local ok, w = pcall(cx.P.parse_heredoc, r.body or "", true, r.aenv)
+				local ok, w = pcall(cx.P.parse_heredoc, r.body or "", true, r.aenv or EF.lm_aenv or nil)
 				if not (ok and emitable_word(w)) then
 					return nil
 				end
@@ -9297,17 +9325,25 @@ function M.emit(ast, opts)
 	-- carries per-command trace hooks (`if sh.opt_x then rt.xtrace…`); other machinery the
 	-- compiled tier lacks keeps the program interpreted (the reason names it)
 	local xwhy, xt, xlex, fnest, bcmd, enable, kw, restr, extdbg = scan_xtrace(ast.stmts)
-	EF.extdebug = extdbg or false
+	EF.extdebug = extdbg or (opts and opts.extdebug) or false -- (opts: tier.note_text "X")
 	EF.dbg_after_of = setmetatable({}, { __mode = "k" })
 	EF.cur_cfg = "run"
-	EF.keyword = kw or false
-	EF.bash_command = bcmd or false
+	-- (a fragment — a script line in line mode, eval/source code, a hot loop — may run with
+	-- `set -k` turned on by code it can't see, even after it was compiled: a function it
+	-- defines is called later. Both readings, picked by sh.opt_k at run time)
+	EF.keyword = kw or EF.fragment
+	EF.trap_bcmd = opts and opts.bash_command or false -- (tier.trap_mode "B": EF.fnmode)
+	EF.pflags = opts and ((opts.pipestatus and "P" or "") .. (opts.funcstack and "F" or "")
+		.. (opts.extdebug and "X" or "")) or "" -- (tier.note_text's letters, in its order)
+	EF.bash_command = bcmd or EF.trap_bcmd
 	-- (`enable -n NAME` here, or maybe in eval/source code or around a fragment: a native
 	-- builtin call first checks the name is still a builtin)
 	EF.enable = enable or EF.fragment or scan_dyncode(ast.stmts)
 	if xwhy then
 		error("curse-nocompile: " .. xwhy)
 	end
+	-- (an extglob-dependent parse made by a guess at the extglob state: parser xg_guess)
+	xlex = xlex or (ast.xg_guess and "extglob state")
 	if xlex and not EF.lm then -- (the whole program can't: the tier runs it line by line)
 		error("curse-nocompile: line-mode: " .. xlex)
 	end
@@ -9350,8 +9386,10 @@ function M.emit(ast, opts)
 	EF.functrace = fo.functrace or false
 	EF.has_err = fo.trap_err or scan_trap(ast.stmts, { ERR = 1 }) -- gate compiled ERR-trap firing
 	EF.has_debug = fo.trap_debug or scan_trap(ast.stmts, { DEBUG = 1 }) -- gate compiled DEBUG-trap firing
-	EF.funcstack = reads_debugstack(ast.stmts) -- gate FUNCNAME/BASH_SOURCE/BASH_LINENO stacks
-	EF.pipestatus = reads_var(ast.stmts, "PIPESTATUS") -- gate $PIPESTATUS after simple cmds
+	-- (a fragment: also when the program around it reads them — tier.note_text "F"/"P")
+	EF.funcstack = reads_debugstack(ast.stmts) or fo.funcstack or false -- gate FUNCNAME/BASH_SOURCE/BASH_LINENO stacks
+	EF.pipestatus = reads_var(ast.stmts, "PIPESTATUS") or fo.pipestatus or false -- gate $PIPESTATUS after simple cmds
+	EF.lm_aenv = fo.lm_aenv -- (line mode: the alias table $(…) bodies parse with; false: capture_src)
 	EF.has_trap = scan_any_trap(ast.stmts) -- gate compiled `&`/pipeline (forked child resets signal traps)
 	-- in-process subshell/$(…)/pipeline-stage gate: only a REAL-signal trap (or DEBUG under
 	-- functrace, which reaches into subshells) keeps them forked/delegated
