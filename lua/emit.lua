@@ -997,6 +997,13 @@ local function emitable_word(w)
 	end
 	return true
 end
+-- (the call-stack / current-command specials: the interpreter maintains them per statement,
+-- the compiled tier does not keep them in sh — a word reading one keeps delegating)
+local function fb_unsafe(w)
+	local src = w.src or ""
+	return src:find("BASH_COMMAND", 1, true) or src:find("FUNCNAME", 1, true)
+		or src:find("BASH_SOURCE", 1, true) or src:find("BASH_LINENO", 1, true)
+end
 -- A word that a compiled command can use directly: emit_word-able AND with no
 -- unquoted expansion (would word-split) or unquoted glob char (would path-expand)
 -- — those need the interpreter's field engine, so the command is delegated.
@@ -1913,6 +1920,36 @@ end
 local ARITH_CMP = { ["-eq"] = "==", ["-ne"] = "~=", ["-lt"] = "<", ["-le"] = "<=", ["-gt"] = ">", ["-ge"] = ">=" }
 -- (an arithmetic comparison leaf: an operand's arith error makes THAT primary false —
 -- bash's arithcomp; `||`/`!` go on — rt.db_arith flags it, the leaf's rt.db_ok reads it)
+-- A [[ ]] operand emit_word can't render (an element read with a $(…) subscript, a
+-- ${…} operator emit refuses, …) that holds no CFG-unreproducible special: its value from
+-- the shared one-word expander (interp's dbracket_word — or dbracket_pattern for a glob
+-- RHS), lifted locals flushed to sh around it. nil when the word reads such a special.
+local function db_fallback(w, lifted, fn, arg)
+	for _, p in ipairs(w.parts) do
+		if p.var and (COMPILE_UNSAFE_VAR[p.var] and p.var ~= "LINENO") then
+			return nil
+		end
+	end
+	if fb_unsafe(w) then
+		return nil
+	end
+	local call = ("%s(sh, %s)"):format(fn, arg or (EF.konst({ ser(w) }) .. "[1]"))
+	local si, so = {}, {}
+	for n in spairs(lifted) do
+		si[#si + 1] = ("sh:aset(%q, %s); "):format(n, lname(n))
+		so[#so + 1] = ("%s = sh:aget(%q); "):format(lname(n), n)
+	end
+	if #si == 0 then
+		return call
+	end
+	return ("(function() %slocal __v = %s; %sreturn __v end)()"):format(table.concat(si), call, table.concat(so))
+end
+local function db_operand(w, lifted)
+	if db_word_ok(w) then
+		return emit_word(w, lifted)
+	end
+	return db_fallback(w, lifted, "rt.db_word")
+end
 local function emit_dbracket_node(node, lifted)
 	local k = node.kind
 	if k == "and" or k == "or" then
@@ -1932,15 +1969,16 @@ local function emit_dbracket_node(node, lifted)
 		end
 		return "(not " .. e .. ")"
 	elseif k == "str" then -- [[ $x ]] : true when non-empty
-		if not db_word_ok(node.word) then
+		local v = db_operand(node.word, lifted)
+		if not v then
 			return nil
 		end
-		return "(" .. emit_word(node.word, lifted) .. ' ~= "")'
+		return "(" .. v .. ' ~= "")'
 	elseif k == "unary" then
-		if not db_word_ok(node.word) then
+		local op, val = node.op, db_operand(node.word, lifted)
+		if not val then
 			return nil
 		end
-		local op, val = node.op, emit_word(node.word, lifted)
 		if op == "-z" then
 			return "(" .. val .. ' == "")'
 		end
@@ -1961,13 +1999,61 @@ local function emit_dbracket_node(node, lifted)
 		end
 		return ("rt.file_test(%q, %s)"):format(op, val)
 	elseif k == "binary" then
-		if not db_word_ok(node.l) or not db_word_ok(node.r) then
+		local op = node.op
+		if ARITH_CMP[op] and not (db_word_ok(node.l) and db_word_ok(node.r)) then
+			-- an operand emit can't render: bash 5.2 expands an arithmetic operator's operand
+			-- like $((…)) text (no process substitution, subscripts kept) unless it's quoted —
+			-- interp's arith_expand_text + dbracket_arith (rt.db_arith_text); a quoted one is a
+			-- plain word value (rt.db_word) read as arithmetic
+			local function side(w)
+				if db_word_ok(w) then
+					return ("rt.db_arith(sh, %s)"):format(emit_word(w, lifted))
+				end
+				if w.src and not w.src:find("['\"\\]") then
+					return db_fallback(w, lifted, "rt.db_arith_text", ("%q"):format(w.src))
+				end
+				local v = db_fallback(w, lifted, "rt.db_word")
+				return v and ("rt.db_arith(sh, %s)"):format(v)
+			end
+			local a, b = side(node.l), side(node.r)
+			if not (a and b) then
+				return nil
+			end
+			return ("rt.db_ok(sh, %s %s %s)"):format(a, ARITH_CMP[op], b)
+		end
+		local l = db_operand(node.l, lifted)
+		if not l then
 			return nil
 		end
-		local op, l = node.op, emit_word(node.l, lifted)
 		if op == "=~" then
-			return nil
-		end -- BASH_REMATCH side effect + status-2 -> interp
+			-- a nested =~ leaf: rt.db_regex sets BASH_REMATCH and answers the match; an invalid
+			-- regex raises __curse_regexerr, which the statement turns into status 2 (interp)
+			if not db_word_ok(node.l) then
+				return nil
+			end
+			local re = EF.emit_regex_glob(node.r, lifted)
+			if not re then
+				return nil
+			end
+			EF.db_regex = true
+			return ("rt.db_regex(sh, %s, %s)"):format(l, re)
+		end
+		if (op == "==" or op == "=" or op == "!=") and not node.rq and not db_word_ok(node.r) then
+			local g = db_fallback(node.r, lifted, "rt.db_pattern") -- (an unquoted RHS: a glob)
+			if not g then
+				return nil
+			end
+			local m = ("rt.glob_match(%s, %s, (sh.shopt.nocasematch and true or nil))"):format(l, g)
+			return op == "!=" and ("(not " .. m .. ")") or m
+		end
+		if not db_word_ok(node.r) then
+			local r = db_fallback(node.r, lifted, "rt.db_word")
+			if not r then
+				return nil
+			end
+			-- (a rendered operand: the common leaf code below reads emit_word(node.r))
+			node = setmetatable({ r = { parts = { { raw = r } } } }, { __index = node })
+		end
 		if op == "==" or op == "=" or op == "!=" then
 			if not node.rq then
 				-- an unquoted RHS is a glob; a MIXED-quoted RHS (`a\?b`, `a"*"b`) needs a mask-aware
@@ -2261,7 +2347,7 @@ end
 -- array re-reads the raw text arithmetically). One with a $(…)/$((…))/`…` side effect is passed
 -- as a thunk, so `${d[$((c++))]}` on an indexed array increments once, not twice.
 function subscript_word(raw, lifted)
-	local w = emit_word(require("parser").parse_word(raw), lifted)
+	local w = EF.sub_lsync(raw, lifted, emit_word(require("parser").parse_word(raw), lifted))
 	if raw:find("$(", 1, true) or raw:find("`", 1, true) then
 		return "function() return " .. w .. " end"
 	end
@@ -2507,6 +2593,23 @@ local function field_word(w, lifted)
 	return nil
 end
 
+-- An element subscript is evaluated by the runtime (rt.array_key: arith on the text for an
+-- indexed array), which reads variables from sh — so a LIFTED variable the subscript names
+-- (`a[i]` with i a native local) is flushed to sh first, in argument position: the
+-- `expanded` operand becomes rt.lsync(sh, <expanded>, "i", v_i, …), which stores and returns.
+function EF.sub_lsync(raw, lifted, expanded)
+	local pairs_, seen = {}, {}
+	for n in raw:gmatch("[%a_][%w_]*") do
+		if lifted[n] and not seen[n] then
+			seen[n] = true
+			pairs_[#pairs_ + 1] = ("%q, %s"):format(n, lname(n))
+		end
+	end
+	if #pairs_ == 0 then
+		return expanded
+	end
+	return ("rt.lsync(sh, %s, %s)"):format(expanded, table.concat(pairs_, ", "))
+end
 -- Forward: mixed_expandable and seg_native are defined just below, but the mixed
 -- branch of emit_fields_into (above them) needs to see them.
 local mixed_expandable, seg_native
@@ -3061,13 +3164,6 @@ end
 -- bash contains (exec_simple's expand_args pcall) fails the command with $?=1, leaving
 -- `__a = false`, and the words after it are skipped. Callers that pass `guard_ok` get
 -- that shape (second result true) and must dispatch only `if __a`; others get nil.
--- (the call-stack / current-command specials: the interpreter maintains them per statement,
--- the compiled tier does not keep them in sh — a word reading one keeps delegating)
-local function fb_unsafe(w)
-	local src = w.src or ""
-	return src:find("BASH_COMMAND", 1, true) or src:find("FUNCNAME", 1, true)
-		or src:find("BASH_SOURCE", 1, true) or src:find("BASH_LINENO", 1, true)
-end
 -- The guarded one-word-expander step for field_argv: flush the lifted locals to sh (a $(…)
 -- body may read any of them), run `call` (rt.word_fields / rt.assign_word on the serialized
 -- word), reload them (`${x:=v}`, `$((x=1))` write), then `push` the result into __a — or
@@ -3227,7 +3323,8 @@ emit_arith_into = function(dst, e, lifted)
 	-- once and store through rt.arith_elem_write/_incr; the operator arithmetic stays in emit_value
 	-- via a compute closure over the OLD element value (__o).
 	local function elem_args(ee)
-		return ("%q, %q, %s"):format(ee.name, ee.idxraw, emit_word(require("parser").parse_word(ee.idxraw), lifted))
+		return ("%q, %q, %s"):format(ee.name, ee.idxraw,
+			EF.sub_lsync(ee.idxraw, lifted, emit_word(require("parser").parse_word(ee.idxraw), lifted)))
 	end
 	if (k == "asgn" or k == "pre" or k == "post") and e.idxraw then
 		if k == "asgn" and e.op == "=" then -- a[i] = e: no read
@@ -5885,14 +5982,31 @@ H.arithcmd = function(cx, st, after)
 			return cx.delegate(st, after)
 		end
 	end
+	local sbody
 	if not arith_stmt_ok(st.expr) then
-		return cx.delegate(st, after)
+		-- an expression the arith codegen doesn't render (a subscripted write, a nested side
+		-- effect, an embedded ${…}, a malformed one): the shared arith EVALUATOR runs it
+		-- (rt.arithcmd: interp's eval on the parsed tree, with (( ))'s status and error rules),
+		-- lifted locals flushed to sh before and reloaded after
+		local se = ser(st.expr)
+		if fb_unsafe({ src = se }) or se:find('"_"', 1, true) then -- ($FUNCNAME/$_…: interp keeps them)
+			return cx.delegate(st, after)
+		end
+		local si, so = {}, {}
+		for n in spairs(cx.lifted) do
+			si[#si + 1] = ("sh:aset(%q, %s); "):format(n, lname(n))
+			so[#so + 1] = ("; %s = sh:aget(%q)"):format(lname(n), n)
+		end
+		if se:find("LINENO", 1, true) then -- (the evaluator reads $LINENO from sh.cur_line)
+			si[#si + 1] = ("sh.cur_line = %d; "):format(EF.cur_line or 0)
+		end
+		sbody = ("%srt.arithcmd(sh, %s[1])%s"):format(table.concat(si), EF.konst({ se }), table.concat(so))
 	end
 	local p = cx.newpc()
 	local ec = errchk(st)
 	local ecs = ec ~= "" and ("; " .. ec) or ""
 	local d = dbg(st) -- DEBUG fires before the (( )) command (bash: DEBUG_FIRE.arithcmd)
-	local sbody = EF.arith_status(st.expr, cx.lifted) -- the status-setting body (redirect-wrapped below when present)
+	sbody = sbody or EF.arith_status(st.expr, cx.lifted) -- the status-setting body (redirect-wrapped below when present)
 	if ac_redir then -- install redirs, run, restore; a failed redirect is $?=1 (bash)
 		sbody = ("do local __rs = {}; if %s then %s else sh.status = 1 end; rt.redir_restore(__rs) end"):format(
 			ac_redir,
@@ -7497,6 +7611,7 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
 					return p
 				end
 			end
+			EF.db_regex = nil
 			local cond = emit_dbracket_node(st.expr, cx.lifted)
 			if not cond then
 				return cx.delegate(st, after)
@@ -7505,8 +7620,13 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
 			local d = dbg(st)
 			local ec = errchk(st)
 			local ecs = ec ~= "" and ("; " .. ec) or ""
+			local sbody = ("sh.status = (%s) and 0 or 1"):format(cond)
+			if EF.db_regex then -- (a nested =~ with an invalid regex: the whole [[ ]] is status 2)
+				sbody = ("do local __ok, __r = pcall(function() return %s end); if __ok then sh.status = __r and 0 or 1 elseif type(__r) == \"table\" and __r.__curse_regexerr then sh.status = 2 elseif type(__r) == \"table\" and __r.__curse_matherr and not __r.__curse_subscript then sh.status = 1 else error(__r, 0) end end"):format(cond)
+				EF.db_regex = nil
+			end
 			cx.blocks[p] = d
-				.. db_wrap(("sh.status = (%s) and 0 or 1"):format(cond))
+				.. db_wrap(sbody)
 				.. ecs
 				.. ("; pc = %d"):format(after)
 			return p

@@ -5391,6 +5391,56 @@ end
 local function db_glob_escape(s)
 	return (s:gsub("[%*%?%[%]\\]", "\\%0"))
 end
+-- A nested `[[ … =~ RE … ]]` leaf (interp's eval_dbracket =~ branch): set BASH_REMATCH and
+-- answer the match; an invalid regex aborts the [[ ]] (status 2, caught by the statement).
+function M.db_regex(sh, l, ere)
+	local caps, bad = M.regex_captures(l, ere, sh.shopt.nocasematch and true or nil)
+	if bad then
+		error({ __curse_regexerr = true })
+	end
+	sh:array_assign("BASH_REMATCH", caps or {}, false)
+	return caps ~= nil
+end
+-- A [[ ]] operand / glob RHS the compiled tier can't render: interp's dbracket_word /
+-- dbracket_pattern on that one word.
+function M.db_word(sh, w)
+	return require("interp")._int.dbracket_word(sh, w)
+end
+function M.db_pattern(sh, w)
+	return require("interp")._int.dbracket_pattern(sh, w)
+end
+-- `(( expr ))` whose tree the arith codegen doesn't render: the shared arith evaluator
+-- (interp's eval) on it, with the arith command's rules — $? 0/1 by truth, an arith error
+-- is status 1 and not fatal (a subscript error still is) — exactly interp's arithcmd.
+function M.arithcmd(sh, expr)
+	local P = require("parser")
+	local sv = P.arith_cmd
+	P.arith_cmd = "((" -- (bash's this_command_name in its error messages)
+	local ok, v = pcall(require("interp").eval, sh, expr)
+	P.arith_cmd = sv
+	if ok then
+		sh.status = v ~= 0 and 0 or 1
+	elseif type(v) == "table" and v.__curse_matherr and not v.__curse_subscript then
+		sh.status = 1
+	else
+		error(v, 0)
+	end
+end
+-- Store lifted locals' values into sh (name, value pairs) and pass `v` through: the compiled
+-- tier flushes the natives an element subscript names right before the runtime evaluates it.
+function M.lsync(sh, v, n1, v1, n2, v2, ...)
+	sh:aset(n1, v1)
+	if n2 then
+		sh:aset(n2, v2)
+		if ... then
+			local t = { ... }
+			for i = 1, #t, 2 do
+				sh:aset(t[i], t[i + 1])
+			end
+		end
+	end
+	return v
+end
 function M.dbracket_eq(sh, l, r, rq)
 	local ic = sh.shopt.nocasematch and true or nil
 	if rq and not ic then
@@ -11689,6 +11739,27 @@ end
 -- [[ … -eq … ]] operands (compiled): arith_str, but an arith error flags sh.db_err (the
 -- comparison's enclosing rt.db_ok turns THAT primary false) instead of unwinding — no pcall
 -- on the fast path. Once flagged, the right operand is not evaluated (bash's arithcomp).
+-- A [[ ]] arithmetic operand as WRITTEN (unquoted, not renderable by emit): interp's textual
+-- path — arith_expand_text (like $((…)): no process substitution) then dbracket_arith —
+-- with db_arith's error rule (an arith error makes this primary false).
+function M.db_arith_text(sh, src)
+	if sh.db_err then
+		return i64(0)
+	end
+	local I = require("interp")
+	local ok, v = pcall(I._int.arith_expand_text, sh, src)
+	if ok then
+		ok, v = pcall(I.dbracket_arith, sh, v, true)
+	end
+	if ok then
+		return v
+	end
+	if type(v) == "table" and v.__curse_matherr and not v.__curse_subscript then
+		sh.db_err = true
+		return i64(0)
+	end
+	error(v, 0)
+end
 function M.db_arith(sh, s)
 	if sh.db_err then
 		return i64(0)
