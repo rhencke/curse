@@ -11035,7 +11035,7 @@ function M.arith_read_slow(sh, name, s)
 				local ok2, r = pcall(fn, sh)
 				sh.arith_depth = sh.arith_depth - 1
 				if not ok2 then
-					if type(r) == "table" and (r.__curse_experr or r.__curse_matherr) then
+					if type(r) == "table" and (r.__curse_experr or r.__curse_matherr or r.__curse_unbound) then
 						error(r)
 					end
 					return i64(0) -- a nested bad value stays swallowed as 0 (matches arith_resolve)

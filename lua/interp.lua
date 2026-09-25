@@ -828,7 +828,7 @@ arith_resolve = function(sh, s)
 	sh.arith_depth = depth - 1
 	in_expanded_text = sv
 	if not ok2 then
-		if type(v) == "table" and (v.__curse_experr or v.__curse_matherr) then
+		if type(v) == "table" and (v.__curse_experr or v.__curse_matherr or v.__curse_unbound) then
 			error(v)
 		end
 		return i64(0)
@@ -849,10 +849,16 @@ end
 -- Reading an unset variable in arithmetic under `set -u` is a fatal unbound-
 -- variable error (bash), just like `$var`. Applies to plain reads and to the
 -- read side of `+=`/`++`/`--`, but NOT to a pure `=` assignment (which defines).
+-- (bash's expr_streval: a variable that doesn't exist or is INVISIBLE — declared, never
+-- assigned: `declare x`, `declare -A h` — even for an element read `h[k]`)
 local function arith_nounset(sh, name)
-	if sh.opt_u and sh.vars[sh:deref(name)] == nil and sh:special_get(name) == "" then
-		io.stderr:write("curse: " .. name .. ": unbound variable\n")
-		error({ __curse_exit = sh.opt_c and 127 or 1, __curse_lineabort = sh.opt_i or nil })
+	if sh.opt_u then
+		local b = sh.vars[sh:deref(name)]
+		if (b == nil or (b.arr == nil and b.s == nil and b.n == nil) or (b.empty_decl and b.arr and next(b.arr) == nil))
+			and sh:special_get(name) == "" then
+			io.stderr:write("curse: " .. name .. ": unbound variable\n")
+			error({ __curse_exit = sh.opt_c and 127 or 1, __curse_lineabort = sh.opt_i or nil, __curse_unbound = true })
+		end
 	end
 end
 
