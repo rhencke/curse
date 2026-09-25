@@ -7124,7 +7124,8 @@ run_trap = function(sh, code)
 	-- state): the first run interprets it, so a one-shot EXIT trap never loads the compiler.
 	local seen = trap_seen[code]
 	local mod
-	if seen then
+	M.v_echo(sh, code, nil, {}) -- (set -v: the handler's text as it's read)
+	if seen and not sh.opt_x then -- (xtrace: the compiled tier has no trace hooks yet)
 		mod = require("tier").try_fragment(code, false, sh, true)
 	else
 		trap_seen_n = trap_seen_n + 1
