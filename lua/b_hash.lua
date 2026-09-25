@@ -22,6 +22,13 @@ return function(sh, cmd, args, hook, tcb)
 		-- and cache; -r = forget all. (bash keeps a cached path until -r, ignoring a
 		-- later PATH change — see Shell:resolve_cmd.)
 		sh.hashcache = sh.hashcache or {}
+		do -- (the table belongs to the $PATH it was built for: assigning PATH empties it)
+			local cur = sh:get("PATH")
+			if sh.hashpath ~= nil and sh.hashpath ~= cur then
+				sh.hashcache = {}
+			end
+			sh.hashpath = cur
+		end
 		local rflag, names, j = false, {}, 2
 		local ppath
 		local dflag, tflag, lflag = false, false, false
@@ -69,6 +76,11 @@ return function(sh, cmd, args, hook, tcb)
 			if not rt.restricted_hash_ok(sh, "hash: ", ppath) then
 				return
 			end
+			if file_test("-d", ppath) then -- (bash: EISDIR, status 1)
+				io.stderr:write("curse: hash: " .. ppath .. ": Is a directory\n")
+				sh.status = 1
+				return
+			end
 			local cur = sh:get("PATH")
 			if sh.hashpath ~= cur then -- (the table belongs to the current $PATH)
 				sh.hashcache = {}
@@ -97,23 +109,32 @@ return function(sh, cmd, args, hook, tcb)
 			for _, nm in ipairs(names) do
 				local e = sh.hashcache[nm]
 				if e and tflag then
-					e.hits = e.hits + 1 -- (a lookup counts, as phash_search does)
+					e = rt.hash_hit(sh.hashcache, nm) -- (a lookup counts, as phash_search does)
 				end
 				if not e then
 					io.stderr:write("curse: hash: " .. nm .. ": not found\n")
 					sh.status = 1
 				elseif dflag then
 					sh.hashcache[nm] = nil
+				elseif lflag then -- -lt: as reusable input
+					sh:echo("builtin hash -p " .. e.path .. " " .. nm)
 				else -- -t: the remembered path (NAME<TAB>PATH for several — bash)
 					sh:echo((#names > 1 and (nm .. "\t") or "") .. e.path)
 				end
 			end
 		elseif #names > 0 then
 			sh.status = 0
-			for _, nm in ipairs(names) do
-				if not nm:find("/", 1, true) and not sh:resolve_cmd(nm) then
-					io.stderr:write("curse: hash: " .. nm .. ": not found\n")
-					sh.status = 1
+			for _, nm in ipairs(names) do -- (add_hashed_command: a function or builtin is skipped;
+				-- a name is looked up afresh, its count starting over at 0)
+				if not nm:find("/", 1, true) and not sh.functions[nm]
+					and not (BUILTINS[nm] and not (sh.disabled_builtins and sh.disabled_builtins[nm])) then
+					sh.hashcache[nm] = nil
+					if sh:resolve_cmd(nm) then
+						rt.hash_hit(sh.hashcache, nm).hits = 0
+					else
+						io.stderr:write("curse: hash: " .. nm .. ": not found\n")
+						sh.status = 1
+					end
 				end
 			end
 		elseif not rflag then -- bare `hash`: print the cache (bash format)
@@ -139,7 +160,7 @@ return function(sh, cmd, args, hook, tcb)
 				for _, k in ipairs(ks) do
 					sh:echo(("%4d\t%s"):format(sh.hashcache[k].hits, sh.hashcache[k].path))
 				end
-			else
+			elseif not sh.opt_posix then
 				sh:echo("hash: hash table empty") -- (bash says so on stdout)
 			end
 			sh.status = 0

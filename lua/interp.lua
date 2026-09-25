@@ -3135,7 +3135,7 @@ local function name_type(sh, name, nofunc)
 	-- (bash: `type` reports it "hashed"); the table empties when $PATH changes
 	local hc = not name:find("/", 1, true) and sh.hashcache and sh.hashcache[name]
 	if hc and sh.hashpath == sh:get("PATH") then
-		hc.hits = hc.hits + 1
+		rt.hash_hit(sh.hashcache, name)
 		return "file", hc.path, true
 	end
 	local p = find_in_path(name)
@@ -4496,7 +4496,7 @@ local function describe(sh, nm, fl)
 	if not fl.all or fl.force then -- the hash table (bash's phash_search: a relative entry as ./…)
 		local hc = not nm:find("/", 1, true) and sh.hashcache and sh.hashcache[nm]
 		if hc and sh.hashpath == sh:get("PATH") then
-			hc.hits = hc.hits + 1
+			rt.hash_hit(sh.hashcache, nm)
 			local p = hc.path
 			if p:sub(1, 1) ~= "/" and p:sub(1, 2) ~= "./" and d_execable("./" .. p) then
 				p = "./" .. p

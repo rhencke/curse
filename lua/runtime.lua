@@ -5283,6 +5283,19 @@ function M.spawn_errmsg(self, name, execpath, rc)
 	end
 	return pre .. M.err_name(tostring(name)) .. (rc == 2 and (self.exec_builtin and ": not found\n" or ": command not found\n") or ": Permission denied\n")
 end
+-- A lookup that found NAME in the hash table HC counts a hit (bash's hash_search). An
+-- in-process subshell's table is a shallow copy of its parent's, sharing the entries:
+-- an entry is copied into HC (its owner) before its first change there, so the count
+-- — like everything else a subshell does — stays in the subshell.
+function M.hash_hit(hc, name)
+	local e = hc[name]
+	if e.owner ~= hc then
+		e = { path = e.path, hits = e.hits, seq = e.seq, owner = hc }
+		hc[name] = e
+	end
+	e.hits = e.hits + 1
+	return e
+end
 -- PATHSTR's elements as bash's extract_colon_unit yields them ("" = the current directory):
 -- a leading `:` and each `::` give one empty element, a trailing `:` one more
 -- (`d1::` is d1 and "", `d1:::` d1, "" and "").
@@ -5332,8 +5345,7 @@ function Shell:resolve_cmd(name)
 	self.hashpath = curpath
 	local c = self.hashcache and self.hashcache[name]
 	if c then
-		c.hits = c.hits + 1
-		return c.path
+		return M.hash_hit(self.hashcache, name).path
 	end
 	local pc = path_cache(curpath)
 	local cand = pc and pc.map[name]
