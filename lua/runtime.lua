@@ -2177,6 +2177,25 @@ function Shell:capture_src(src, backtick, noalias)
 			iso = true
 		end
 	end
+	-- Text that recurs runs compiled (tier fragment keyed by text, line, trap state) — the
+	-- guarded slow path of a compiled $(…) and the backticks parsed at expansion time. (Not
+	-- while aliases are live: a fragment parses without the alias table.)
+	local mod
+	if noalias or not (self.shopt.expand_aliases and self.aliases and next(self.aliases)) then
+		local ln = self.cur_cline or self.cur_line
+		mod = require("tier").try_fragment(src, ln and ln > 0 and ln or nil, self)
+	end
+	if mod then
+		local run_compiled = require("tier").run_compiled
+		if iso and not has_perr then
+			return self:capture_compiled_iso(function(self)
+				return run_compiled(mod, self, nil, true)
+			end, backtick)
+		end
+		return self:capture_inproc(backtick, function(self)
+			return run_compiled(mod, self, nil, true)
+		end)
+	end
 	-- (a SYNTAX error in the body is fatal to the CONTAINING command — bash — which the
 	-- light path propagates via __curse_parseerr)
 	if iso and not has_perr then
