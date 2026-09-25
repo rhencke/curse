@@ -4343,7 +4343,16 @@ H.assign = function(cx, st, after)
 			end
 		end
 	end
-	local st0 = hascmd and "" or "sh.status = 0; "
+	-- a $(…) nested in a ${…} (`x=${u:-$(exit 5)}`) may or may not run: decide at runtime by
+	-- the substitution counter sh.ncs (n_, captured after the DEBUG trap; see the wrap below)
+	local src = not hascmd and st.rhs and st.rhs.src
+	local dyncs = src and (src:find("$(", 1, true) or src:find("`", 1, true)) and true
+	local st0 = hascmd and "" or dyncs and "sh.status = sh.ncs ~= n_ and sh.last_cmdsub_status or 0; " or "sh.status = 0; "
+	local function wrapcs() -- (declare n_ for a dyncs block: `do <DEBUG> local n_ = sh.ncs; … end`)
+		if dyncs then
+			cx.blocks[p] = "do " .. d .. "local n_ = sh.ncs; " .. cx.blocks[p]:sub(#d + 1) .. " end"
+		end
+	end
 	if st.index then -- a[i]=v / a[i]+=v (assign_element leaves status unless it fails)
 		local ec = errchk(st)
 		local ecs = ec ~= "" and ("; " .. ec) or ""
@@ -4367,6 +4376,7 @@ H.assign = function(cx, st, after)
 				.. ("do local v_ = %s; local k_ = %s; %srt.assign_element(sh, %q, %q, k_, v_, %s) end%s; pc = %d"):format(
 					rhsval(), expw, st0, st.name, st.index, append, ecs, after)
 		end
+		wrapcs()
 		return p
 	end
 	if st.append and not st.arith then -- scalar name+=value: rt.append_scalar picks concat /
@@ -4382,6 +4392,7 @@ H.assign = function(cx, st, after)
 				ua,
 				after
 			)
+		wrapcs()
 		return p
 	end
 	if st.arith then
@@ -4423,8 +4434,9 @@ H.assign = function(cx, st, after)
 		-- only when the RHS has no cmdsub; then errchk fires ERR/errexit (`x=$(false)`).
 		local ec = errchk(st)
 		local ecs = ec ~= "" and ("; " .. ec) or ""
-		cx.blocks[p] = d .. ("sh:set_str(%q, %s)%s%s%s; pc = %d"):format(st.name, rhsval(), hascmd and "" or "; sh.status = 0", ecs, ua, after)
+		cx.blocks[p] = d .. ("sh:set_str(%q, %s)%s%s%s; pc = %d"):format(st.name, rhsval(), hascmd and "" or ("; " .. st0:sub(1, -3)), ecs, ua, after)
 	end
+	wrapcs()
 	return p
 end
 
@@ -4603,7 +4615,8 @@ simple_compiled = function(cx, st, after)
 		end
 		if argvbody and not (st.redirs and not dyn_redir) then
 			-- hadcs (compile-time): a word contains a command sub, so an empty argv keeps its status.
-			local hadcs = false
+			-- One only nested in a ${…} (`${u:-$(exit 5)}`) may not run: count at runtime (sh.ncs).
+			local hadcs, dyncs = false, false
 			for _, w in ipairs(st.words) do
 				for _, pp in ipairs(w.parts) do
 					if pp.cmdsub then
@@ -4614,14 +4627,15 @@ simple_compiled = function(cx, st, after)
 				if hadcs then
 					break
 				end
+				dyncs = dyncs or (w.src and (w.src:find("$(", 1, true) or w.src:find("`", 1, true))) and true
 			end
 			return cx.delegate(
 				st,
 				after,
 				{
-					prelude = argvbody,
+					prelude = (not hadcs and dyncs) and ("sh.ncs0 = sh.ncs; " .. argvbody) or argvbody,
 					callee = "rt.exec_dynamic",
-					callargs = ("sh, __a, __noop, %s"):format(tostring(hadcs)),
+					callargs = ("sh, __a, __noop, %s"):format((not hadcs and dyncs) and "sh.ncs ~= sh.ncs0" or tostring(hadcs)),
 					redir = dyn_redir and cx.redir_ext(nil, dyn_redir),
 				}
 			)
@@ -6299,10 +6313,13 @@ H.arrayassign = function(cx, st, after)
 		end
 		local ec = errchk(st)
 		local ecs = ec ~= "" and ("; " .. ec) or ""
+		-- $?: the last command substitution's status (`a=( $(exit 3) )`), else as arrayassign left it
+		local cs = st.raw and (st.raw:find("$(", 1, true) or st.raw:find("`", 1, true))
 		cx.blocks[p] = dbg(st)
-			.. "do "
+			.. (cs and "do local n_ = sh.ncs; " or "do ")
 			.. table.concat(parts, "; ")
-			.. ("; rt.arrayassign(sh, %q, __it, %s) end"):format(st.name, tostring(st.append and true or false))
+			.. ("; rt.arrayassign(sh, %q, __it, %s)"):format(st.name, tostring(st.append and true or false))
+			.. (cs and "; if sh.status == 0 and sh.ncs ~= n_ then sh.status = sh.last_cmdsub_status end end" or " end")
 			.. ecs
 			.. ("; pc = %d"):format(after)
 		return p

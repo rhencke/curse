@@ -5649,11 +5649,14 @@ local function assign_body(sh, st, nref_base, nref_sub)
 			st.append
 		)
 	elseif st.index then
+		-- the VALUE expands before the subscript (bash assign_array_element: `a[$((i=5))]=$i`
+		-- stores the old $i; `a[$(exit 2)1]=$(exit 4)` leaves $? 2)
+		local v = assign_rhs_a(sh, st)
 		local key = array_key(sh, st.name, st.index)
 		if key == "" and sh:is_assoc(st.name) then -- (an associative array has no "" key)
 			error({ __curse_badsub = true })
 		end
-		if not sh:array_set(st.name, key, assign_rhs_a(sh, st), st.append) then
+		if not sh:array_set(st.name, key, v, st.append) then
 			error({ __curse_badsub = true })
 		end
 	elseif st.arith then
@@ -5785,6 +5788,7 @@ exec_stmt = function(sh, st, hook)
 	end -- $LINENO: frozen at the trapped line for the trap's own commands (not in a
 	-- function the trap calls, whose lines count as usual — bash)
 	if t == "assign" then
+		local ncs0 = sh.ncs
 		if st.name == "SHELLOPTS" or st.name == "BASHOPTS" then -- readonly specials (bash)
 			io.stderr:write("curse: " .. st.name .. ": readonly variable\n")
 			sh.status = 1
@@ -5940,19 +5944,9 @@ exec_stmt = function(sh, st, hook)
 		end
 		-- exit status of an assignment = the last command substitution's, else 0
 		-- (skip when it was a rejected readonly assignment, which already set status 1)
+		-- (sh.ncs counts substitutions performed — also ones nested in ${…}, a subscript)
 		if not (rb and rb.ro) then
-			local hascs = false
-			if st.rhs then
-				for _, p in ipairs(st.rhs.parts) do
-					if p.cmdsub then
-						hascs = true
-						break
-					end
-				end
-			end
-			if not hascs then
-				sh.status = 0
-			end
+			sh.status = sh.ncs ~= ncs0 and sh.last_cmdsub_status or 0
 		end
 		sh:set_str("_", "") -- a bare assignment resets $_ to empty (bash)
 	elseif t == "arrayassign" then
@@ -5976,9 +5970,10 @@ exec_stmt = function(sh, st, hook)
 			error({ __curse_exit = 1, __curse_lineabort = not (sh.opt_c or sh.opt_posix) or nil })
 		else
 			-- a failglob no-match inside `a=(*.ZZ)` fails the assignment non-fatally (bash)
+			local ncs0 = sh.ncs
 			local aok, aerr = pcall(do_arrayassign, sh, st)
 			if aok then
-				sh.status = 0
+				sh.status = sh.ncs ~= ncs0 and sh.last_cmdsub_status or 0 -- (`a=( $(exit 3) )`: 3)
 				sh:set_str("_", "")
 			elseif type(aerr) == "table" and aerr.__curse_experr and not aerr.__curse_lineabort then
 				sh.status = 1
@@ -6033,6 +6028,7 @@ exec_stmt = function(sh, st, hook)
 	elseif t == "assignlist" then
 		-- a bad array subscript / bad-subst in one binding aborts the REST of the list
 		-- (bash: `a=x b[0+]=y c=z` sets only a), keeping the error status.
+		local ncs0 = sh.ncs
 		for _, a in ipairs(st.list) do
 			sh.assign_err = nil
 			exec_stmt(sh, a, hook)
@@ -6040,7 +6036,8 @@ exec_stmt = function(sh, st, hook)
 				return
 			end
 		end
-		sh.status = 0
+		-- status: the LAST command substitution's, else 0 (execute_null_command)
+		sh.status = sh.ncs ~= ncs0 and sh.last_cmdsub_status or 0
 	elseif t == "simple" then
 		if sh.opt_k and st.words then
 			-- set -k (keyword): an assignment-shaped word ANYWHERE is an assignment for the
@@ -6096,6 +6093,7 @@ exec_stmt = function(sh, st, hook)
 			or nil
 		local is_assign = cw1lit ~= nil and ASSIGN_CMD[cw1lit] ~= nil or (cw1lit == "unset" and "unset")
 		local args = {}
+		local ncs0 = sh.ncs -- (a command substitution performed while expanding: see below)
 		-- A word-expansion error (bad substitution, invalid indirect name) aborts the
 		-- WHOLE simple command with status 1 but is non-fatal: the script continues.
 		local eok, eerr = pcall(expand_args, sh, st, args, is_assign)
@@ -6123,17 +6121,11 @@ exec_stmt = function(sh, st, hook)
 					-- expansion (`a=(1 2) 2>/dev/null`, `a=(x) $empty`) it's an array assignment
 					exec_stmt(sh, a, hook)
 				end
-			else -- a bare $(...) / redirection: status is the last cmdsub's, else 0
-				local hadcs = false
-				for _, w in ipairs(st.words) do
-					for _, p in ipairs(w.parts) do
-						if p.cmdsub then
-							hadcs = true
-							break
-						end
-					end
+				if sh.status == 0 and sh.ncs ~= ncs0 then -- (`x=1 $(exit 5)`: 5)
+					sh.status = sh.last_cmdsub_status
 				end
-				sh.status = hadcs and (sh.last_cmdsub_status or 0) or 0
+			else -- a bare $(...) / redirection: status is the last cmdsub's, else 0
+				sh.status = sh.ncs ~= ncs0 and sh.last_cmdsub_status or 0
 			end
 			-- a redirection with no command still opens/truncates its target (`> file`)
 			if st.redirs then

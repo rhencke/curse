@@ -2119,15 +2119,16 @@ function Shell:capture_src(src, backtick, noalias)
 		then
 			-- (the file word expands like a redirection target: globbed, except in posix
 			-- mode, and it must name exactly one file)
+			self.ncs = (self.ncs or 0) + 1 -- (a substitution performed: see capture_inproc)
 			local raw = st.redirs[1].src or st.redirs[1].target or "" -- (as written: quotes kept)
 			local eok, fs = M.redir_noglob(self, I.expand_to_fields, self, P.parse_word(raw))
 			if not eok then
-				self.status = 1
+				self.status, self.last_cmdsub_status = 1, 1
 				return ""
 			end
 			if #fs ~= 1 then
 				io.stderr:write("curse: " .. raw .. ": ambiguous redirect\n")
-				self.status = 1
+				self.status, self.last_cmdsub_status = 1, 1
 				return ""
 			end
 			local path = fs[1]
@@ -2135,11 +2136,11 @@ function Shell:capture_src(src, backtick, noalias)
 			if f then
 				local c = f:read("*a") or ""
 				f:close()
-				self.status = 0
+				self.status, self.last_cmdsub_status = 0, 0
 				return (c:gsub("%z", ""):gsub("\n+$", ""))
 			end
 			io.stderr:write("curse: " .. path .. ": No such file or directory\n")
-			self.status = 1
+			self.status, self.last_cmdsub_status = 1, 1
 			return ""
 		end
 	end
@@ -2303,6 +2304,7 @@ function Shell:capture_inproc(backtick, runner, capfd, ctx)
 		end
 	end
 	self.last_cmdsub_status = self.status -- for a command whose argv is empty after expansion
+	self.ncs = (self.ncs or 0) + 1 -- (substitutions performed: an assignment's status is the last one's)
 	-- bash strips NUL bytes from command-substitution output ("ignored null byte")
 	local r = readcap():gsub("%z", ""):gsub("\n+$", "")
 	flush_deferred(self)
@@ -3153,10 +3155,12 @@ function Shell:capture_file(path)
 		local c = f:read("*a") or ""
 		f:close()
 		self.status = 0
+		self.last_cmdsub_status, self.ncs = 0, (self.ncs or 0) + 1
 		return (c:gsub("%z", ""):gsub("\n+$", ""))
 	end
 	io.stderr:write("curse: " .. path .. ": No such file or directory\n")
 	self.status = 1
+	self.last_cmdsub_status, self.ncs = 1, (self.ncs or 0) + 1
 	return ""
 end
 
