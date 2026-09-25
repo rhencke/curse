@@ -6519,9 +6519,6 @@ H.background = function(cx, st, after)
 	-- (which reads sh) sees current values; no reload (the parent's copy is unaffected).
 	-- a REAL-signal trap must be reset in the child (interp's signal machinery); pseudo
 	-- traps don't reach it (no EXIT on _exit, ERR/DEBUG scoped out by in_subprogram)
-	if EF.bg_trap_block then
-		return cx.delegate(st, after)
-	end
 	-- bash doesn't run ERR (even under errtrace) for the async job's OWN top command —
 	-- only for commands nested in a job that's a group/subshell/… — so a simple/pipeline
 	-- job compiles with its direct command errexit/ERR-exempt (as `! cmd` does).
