@@ -2222,7 +2222,13 @@ function Shell:capture_src(src, backtick, noalias)
 	end
 	if mod then
 		local run_compiled = require("tier").run_compiled
-		if iso and not has_perr then
+		-- (a redirected command — `echo x >&2` — must reach the real fds: only the isolated
+		-- fd-level capture sends a compiled builtin's redirected output where it belongs)
+		local rd = false
+		for _, st in ipairs(ast.stmts) do
+			rd = rd or st.redirs ~= nil
+		end
+		if (iso or rd) and not has_perr then
 			return self:capture_compiled_iso(function(self)
 				return run_compiled(mod, self, nil, true)
 			end, backtick)

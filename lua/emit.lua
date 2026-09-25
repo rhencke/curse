@@ -2835,12 +2835,23 @@ local function emit_pattern_glob_word(w, lifted)
 	end
 	local out = {}
 	for i, p in ipairs(w.parts) do
-		if p.lenof or p.cmdsub or p.arith or p.arithast or p.pexp or p.procsub then
+		if p.lenof or p.procsub then
 			return nil
 		end
-		if p.special == "@" or p.special == "*" then
+		-- a pattern is expanded as ONE word: a quoted "$@"/"${a[@]}" contributes only its first
+		-- element (interp's case_pattern) — that stays with the shared matcher; $@ unquoted and
+		-- $* join like any scalar expansion
+		if p.q and (p.special == "@" or (p.pexp and (p.pexp.name == "@" or p.pexp.index == "@"))) then
 			return nil
-		end -- multi-element in a pattern
+		end
+		-- a ${…} operator renders via pexp_scalar (its default word gated free of quoting, so
+		-- its value's metachars are rightly active unquoted); not through a nameref
+		if p.pexp and (EF.has_nameref or not pexp_compilable(p.pexp, p.q)) then
+			return nil
+		end
+		if (p.arith and not emitable_word({ parts = { p } })) or (p.arithast and arith_side_effect(p.arithast)) then
+			return nil
+		end
 		if p.var and (COMPILE_UNSAFE_VAR[p.var] and p.var ~= "LINENO") then
 			return nil
 		end
@@ -2850,8 +2861,10 @@ local function emit_pattern_glob_word(w, lifted)
 				s = s:gsub(CASE_GLOBSPECIAL, "\\%0")
 			end -- quoted metachars -> literal
 			out[#out + 1] = ("%q"):format(s)
-		else -- var / param / raw / scalar special ($#/$?/$$/$!): value; escape if quoted
-			local v = emit_scalar_val(p, i, lifted, false)
+		else -- an expansion's value (var/param/special, $(…), $((…)), ${…}); escape it if quoted
+			local v = (p.cmdsub or p.arith or p.arithast or p.pexp or p.special == "@" or p.special == "*")
+					and emit_word({ parts = { p } }, lifted)
+				or emit_scalar_val(p, i, lifted, false)
 			out[#out + 1] = p.q and ("rt.glob_quote(%s)"):format(v) or v
 		end
 	end
