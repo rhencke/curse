@@ -2645,7 +2645,8 @@ expand_fields_full = function(sh, w, pre1) -- pre1: part 1 already expanded (a $
 			if pn then
 				hasval = pn == 0 or pn <= sh.nparams
 			end
-			local nonnull = sh:get(pe.name) ~= ""
+			local pval = pn and sh:param(pn) or sh:get(pe.name) -- ($1 is not a variable)
+			local nonnull = pval ~= ""
 			local useword
 			if pe.op == ":-" then
 				useword = not nonnull
@@ -2724,7 +2725,7 @@ expand_fields_full = function(sh, w, pre1) -- pre1: part 1 already expanded (a $
 					end
 				end
 			elseif pe.op == ":-" or pe.op == "-" then
-				feed_split(sh:get(pe.name))
+				feed_split(pval)
 			end
 		else
 			local s
@@ -5242,6 +5243,26 @@ local function dbracket_trace(sh, text)
 	xtrace_line(sh, "[[ " .. (sh.dbneg and "! " or "") .. text .. " ]]")
 	sh.dbneg = nil
 end
+-- The ERE text of a `=~` RHS word: bash tilde-expands a word-initial ~ and matches THAT
+-- expansion literally (a tilde prefix isn't part of the regex), the rest via expand_regex.
+local function regex_rhs(sh, rnode)
+	if word_initial_tilde(rnode) then
+		local p1 = rnode.parts[1]
+		local tok, restlit = p1.lit:match("^(~[^/:]*)(.*)$")
+		local exp = tok and tilde_prefix(sh, tok)
+		if exp and exp ~= tok then
+			local rw = { k = "word", parts = { { lit = exp, q = true } } }
+			if restlit ~= "" then
+				rw.parts[#rw.parts + 1] = { lit = restlit, q = p1.q }
+			end
+			for i = 2, #rnode.parts do
+				rw.parts[#rw.parts + 1] = rnode.parts[i]
+			end
+			rnode = rw
+		end
+	end
+	return expand_regex(sh, rnode)
+end
 local DB_ARITH_OP = { ["-eq"] = 1, ["-ne"] = 1, ["-lt"] = 1, ["-le"] = 1, ["-gt"] = 1, ["-ge"] = 1 }
 local function eval_dbracket(sh, node)
 	local k = node.kind
@@ -5252,7 +5273,7 @@ local function eval_dbracket(sh, node)
 		return eval_dbracket(sh, node.l) or eval_dbracket(sh, node.r)
 	end
 	if k == "not" then
-		if sh.opt_x and node.e.kind ~= "and" and node.e.kind ~= "or" and node.e.kind ~= "not" then
+		if sh.opt_x and node.e.kind ~= "and" and node.e.kind ~= "or" and node.e.kind ~= "not" and not node.e.paren then
 			sh.dbneg = true -- (xtrace: a negated test prints as `[[ ! … ]]`)
 		end
 		return not eval_dbracket(sh, node.e)
@@ -5313,23 +5334,7 @@ local function eval_dbracket(sh, node)
 			-- bash also tilde-expands a word-initial ~ on the =~ RHS and matches THAT
 			-- expansion literally (a tilde prefix isn't part of the regex): split off the
 			-- ~-token, expand it, and re-expand it as a quoted (regex-escaped) segment.
-			local rnode = node.r
-			if word_initial_tilde(rnode) then
-				local p1 = rnode.parts[1]
-				local tok, restlit = p1.lit:match("^(~[^/:]*)(.*)$")
-				local exp = tok and tilde_prefix(sh, tok)
-				if exp and exp ~= tok then
-					local rw = { k = "word", parts = { { lit = exp, q = true } } }
-					if restlit ~= "" then
-						rw.parts[#rw.parts + 1] = { lit = restlit, q = p1.q }
-					end
-					for i = 2, #rnode.parts do
-						rw.parts[#rw.parts + 1] = rnode.parts[i]
-					end
-					rnode = rw
-				end
-			end
-			local caps, bad = rt.regex_captures(l, expand_regex(sh, rnode), ic) -- real POSIX ERE + BASH_REMATCH
+			local caps, bad = rt.regex_captures(l, regex_rhs(sh, node.r), ic) -- real POSIX ERE + BASH_REMATCH
 			if bad then
 				error({ __curse_regexerr = true })
 			end -- invalid regex -> [[ ]] status 2
@@ -7084,13 +7089,13 @@ end
 -- result: the CALLER (once it has undone its own state) raises it, so the return ends
 -- that function/source — bash's _run_trap_internal longjmps to return_catch (trap.c).
 -- (Not for the EXIT/RETURN traps: their callers keep the status.)
-local trap_seen, trap_seen_n = {}, 0 -- (handler texts run once: the next run compiles)
+local trap_seen = { [0] = 0 } -- (handler texts run once: the next run compiles; [0]: their count)
 -- (an INTERP_FRAMES runner: the compiled handler's error prefixes read sh.cur_line)
-local function run_trap_mod(mod, sh)
+function M.run_trap_mod(mod, sh)
 	local r = require("tier").run_compiled(mod, sh, nil, true) -- (no tail call: this frame
 	return r -- must stay on the stack for rt.current_line to find)
 end
-rt.INTERP_FRAMES[run_trap_mod] = true
+rt.INTERP_FRAMES[M.run_trap_mod] = true
 run_trap = function(sh, code)
 	local exited, savedline, rret = false, sh.cur_line, nil
 	local saved_tcd, saved_ts = sh.trap_calldepth, sh.trap_saved
@@ -7107,16 +7112,16 @@ run_trap = function(sh, code)
 	if seen then
 		mod = require("tier").try_fragment(code, false, sh, true)
 	else
-		trap_seen_n = trap_seen_n + 1
-		if trap_seen_n > 256 then
-			trap_seen, trap_seen_n = {}, 1
+		trap_seen[0] = trap_seen[0] + 1
+		if trap_seen[0] > 256 then
+			trap_seen = { [0] = 1 }
 		end
 		trap_seen[code] = true
 	end
 	local stmts, k = mod and {} or P.parse(code).stmts, 0
 	local function body()
 		if mod then -- (a line abort is contained by run_compiled: the rest of that line is skipped)
-			return run_trap_mod(mod, sh)
+			return M.run_trap_mod(mod, sh)
 		end
 		while k < #stmts do
 			k = k + 1
@@ -7848,6 +7853,12 @@ M._int = {
 	exec_stmt = exec_stmt,
 	apply_redirs = apply_redirs,
 	restore_redirs = restore_redirs,
+	drain_procsub = drain_procsub,
+	expand_word = expand_word,
+	regex_rhs = regex_rhs,
+	arith_expand_text = arith_expand_text,
+	dbracket_word = dbracket_word,
+	dbracket_pattern = dbracket_pattern,
 	redirs_touch_stdout = redirs_touch_stdout,
 	describe = describe,
 	statbuf = statbuf,

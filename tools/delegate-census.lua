@@ -65,6 +65,10 @@ for _, pr in ipairs(progs) do
         nlm = nlm + 1
       end
     end
+    if ok and err ~= "" and not load(err) then -- (generated Lua that doesn't even load: a codegen bug)
+      local k = "LOADFAIL " .. select(2, load(err)):sub(1, 50)
+      why[k] = (why[k] or 0) + 1; where[k] = where[k] or {}; table.insert(where[k], pr[1])
+    end
     if ok and type(err) == "string" then -- interpreter entry points in the generated code itself
       for ref in err:gmatch("[%w_]*[%.:]?[%w_]+%f[(]") do
         if ref:match("^I%.") or ref == "sh:capture_src" or ref == "rt.run_lazy" then

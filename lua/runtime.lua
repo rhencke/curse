@@ -1638,6 +1638,37 @@ function M.redir_apply(sh, op, fd, target, saves)
 end
 -- `exec REDIRS`: the redirections persist, so the saved originals are just dropped (a kept
 -- copy of a pipe's write end would hold its reader's EOF off forever)
+-- One redirection the compiled tier has no native form for (a `{var}>` named fd, a fd move,
+-- a dup to an expanded fd, a brace/cmdsub target, …): applied by the shared redirection
+-- applier (interp's apply_redirs on a one-element list — its own messages, ambiguity and
+-- noclobber rules), its fd saves appended to the compiled `saves` so redir_restore undoes
+-- them. Returns the applier's ok.
+function M.redir_apply_one(sh, r, saves)
+	local I = require("interp")._int
+	if not saves.out_sh and CO_OUTS[sh.out] and I.redirs_touch_stdout({ r }) then
+		saves.out_sh, saves.out = sh, sh.out -- (a pipeline stage: builtins write fd 1 directly)
+		sh.out = io.write
+	end
+	local sv, ok = I.apply_redirs(sh, { r })
+	for i = 1, #sv do
+		saves[#saves + 1] = sv[i]
+	end
+	if sv.e2o then -- (`2>&1` inside a capture: the routing is undone at restore)
+		saves.e2o, saves._sh = (saves.e2o or 0) + sv.e2o, sv._sh
+	end
+	return ok
+end
+-- <(…)/>(…) bookkeeping around a compiled simple command (interp's procsub_mark /
+-- drain_procsub): the count of registered process substitutions before it, and after it
+-- close the shell's ends of those it added and reap their children.
+function M.procsub_fmark(sh) -- (not M.procsub_mark: the runner's, which also counts pending)
+	return sh.procsub_files and #sh.procsub_files or 0
+end
+function M.procsub_drain(sh, nf)
+	if sh.procsub_files then
+		require("interp")._int.drain_procsub(sh, 0, nf)
+	end
+end
 function M.redir_discard(saves)
 	if saves.out_sh then
 		io.flush()
@@ -1652,6 +1683,10 @@ function M.redir_discard(saves)
 end
 function M.redir_restore(saves)
 	io.flush()
+	if saves.e2o then
+		saves._sh.err2out = (saves._sh.err2out or 0) - saves.e2o
+		saves.e2o = nil
+	end
 	if saves.out_sh then
 		saves.out_sh.out, saves.out_sh = saves.out, nil
 	end
@@ -5354,6 +5389,86 @@ end
 local function db_glob_escape(s)
 	return (s:gsub("[%*%?%[%]\\]", "\\%0"))
 end
+-- A nested `[[ … =~ RE … ]]` leaf (interp's eval_dbracket =~ branch): set BASH_REMATCH and
+-- answer the match; an invalid regex aborts the [[ ]] (status 2, caught by the statement).
+function M.db_regex(sh, l, ere)
+	local caps, bad = M.regex_captures(l, ere, sh.shopt.nocasematch and true or nil)
+	if bad then
+		error({ __curse_regexerr = true })
+	end
+	sh:array_assign("BASH_REMATCH", caps or {}, false)
+	return caps ~= nil
+end
+-- A [[ ]] operand / glob RHS the compiled tier can't render: interp's dbracket_word /
+-- dbracket_pattern on that one word.
+function M.db_regex_rhs(sh, w)
+	return require("interp")._int.regex_rhs(sh, w)
+end
+function M.word_str(sh, w) -- (one word, no split/glob: interp's expand_word)
+	return require("interp")._int.expand_word(sh, w)
+end
+function M.db_word(sh, w)
+	return require("interp")._int.dbracket_word(sh, w)
+end
+function M.db_pattern(sh, w)
+	return require("interp")._int.dbracket_pattern(sh, w)
+end
+-- `(( expr ))` whose tree the arith codegen doesn't render: the shared arith evaluator
+-- (interp's eval) on it, with the arith command's rules — $? 0/1 by truth, an arith error
+-- is status 1 and not fatal (a subscript error still is) — exactly interp's arithcmd.
+function M.arithcmd(sh, expr)
+	local P = require("parser")
+	local sv = P.arith_cmd
+	P.arith_cmd = "((" -- (bash's this_command_name in its error messages)
+	local ok, v = pcall(require("interp").eval, sh, expr)
+	P.arith_cmd = sv
+	if ok then
+		sh.status = v ~= 0 and 0 or 1
+	elseif type(v) == "table" and v.__curse_matherr and not v.__curse_subscript then
+		sh.status = 1
+	else
+		error(v, 0)
+	end
+end
+-- Store lifted locals' values into sh (name, value pairs) and pass `v` through: the compiled
+-- tier flushes the natives an element subscript names right before the runtime evaluates it.
+function M.lsync(sh, v, n1, v1, n2, v2, ...)
+	sh:aset(n1, v1)
+	if n2 then
+		sh:aset(n2, v2)
+		if ... then
+			local t = { ... }
+			for i = 1, #t, 2 do
+				sh:aset(t[i], t[i + 1])
+			end
+		end
+	end
+	return v
+end
+-- One `for (( init; cond; step ))` slot the arith codegen can't render: the shared arith
+-- evaluator (interp's eval) under the slot rules of interp's forc — $LINENO is the `for` line,
+-- errors name `((`, a deferred parse error or a (non-subscript) arith error returns false (the
+-- loop then ends with status 1), anything else propagates. Returns ok, value.
+function M.arith_slot(sh, expr, line)
+	local I, P = require("interp"), require("parser")
+	sh.cur_line = line
+	local sv = P.arith_cmd
+	P.arith_cmd = "(("
+	local ok, v
+	if expr.k == "arith_perr" then
+		local _, perr = pcall(P.arith, expr.raw)
+		I._int.arith_pre(sh, perr)
+		io.stderr:write("curse: " .. P.arith_errmsg(expr.raw, perr) .. "\n")
+		ok = false
+	else
+		ok, v = pcall(I.eval, sh, expr)
+	end
+	P.arith_cmd = sv
+	if not ok and v ~= nil and not (type(v) == "table" and v.__curse_matherr and not v.__curse_subscript) then
+		error(v, 0)
+	end
+	return ok, v
+end
 function M.dbracket_eq(sh, l, r, rq)
 	local ic = sh.shopt.nocasematch and true or nil
 	if rq and not ic then
@@ -6183,6 +6298,43 @@ end
 -- In posix mode an arithmetic EXPANSION error exits a non-interactive shell (bash's
 -- posixly_correct FORCE_EOF) instead of abandoning the line: raise that exit for a
 -- caught line-abort `err`, else return.
+-- One word's final fields through the shared word expander (interp's expand_to_fields: an
+-- expander for ONE word, not statement interpretation) — the compiled argv builder's path
+-- for a word shape it has no native renderer for. A word-expansion error bash contains
+-- (exec_simple's expand_args pcall: status 1, the command doesn't run, the script goes on)
+-- returns nil, and the compiled caller skips the dispatch; anything else propagates.
+function M.word_fields(sh, w)
+	local ok, f = pcall(require("interp").expand_to_fields, sh, w)
+	if ok then
+		return f
+	end
+	if type(f) == "table" and f.__curse_experr and not f.__curse_lineabort then
+		M.posix_arith_fatal(sh, f)
+		sh.status = 1
+		if sh.opt_e then
+			error({ __curse_exit = 1 })
+		end
+		return nil
+	end
+	error(f, 0)
+end
+-- An assignment word's value (`declare NAME=word`: interp's expand_assign_word — no
+-- split/glob, tilde after = and :), with rt.word_fields' error containment.
+function M.assign_word(sh, w)
+	local ok, f = pcall(require("interp").expand_assign_word, sh, w, true)
+	if ok then
+		return f
+	end
+	if type(f) == "table" and f.__curse_experr and not f.__curse_lineabort then
+		M.posix_arith_fatal(sh, f)
+		sh.status = 1
+		if sh.opt_e then
+			error({ __curse_exit = 1 })
+		end
+		return nil
+	end
+	error(f, 0)
+end
 function M.posix_arith_fatal(sh, err)
 	if sh.opt_posix and not sh.opt_i and err.__curse_matherr then
 		error({ __curse_exit = sh.opt_c and 127 or 1 }, 0)
@@ -11632,6 +11784,27 @@ end
 -- [[ … -eq … ]] operands (compiled): arith_str, but an arith error flags sh.db_err (the
 -- comparison's enclosing rt.db_ok turns THAT primary false) instead of unwinding — no pcall
 -- on the fast path. Once flagged, the right operand is not evaluated (bash's arithcomp).
+-- A [[ ]] arithmetic operand as WRITTEN (unquoted, not renderable by emit): interp's textual
+-- path — arith_expand_text (like $((…)): no process substitution) then dbracket_arith —
+-- with db_arith's error rule (an arith error makes this primary false).
+function M.db_arith_text(sh, src)
+	if sh.db_err then
+		return i64(0)
+	end
+	local I = require("interp")
+	local ok, v = pcall(I._int.arith_expand_text, sh, src)
+	if ok then
+		ok, v = pcall(I.dbracket_arith, sh, v, true)
+	end
+	if ok then
+		return v
+	end
+	if type(v) == "table" and v.__curse_matherr and not v.__curse_subscript then
+		sh.db_err = true
+		return i64(0)
+	end
+	error(v, 0)
+end
 function M.db_arith(sh, s)
 	if sh.db_err then
 		return i64(0)
@@ -12661,7 +12834,7 @@ function M.funcnest_over(sh, name)
 end
 -- One word's value in assignment context (no splitting, no globbing) through the shared
 -- word expander — for an array element the compiled renderers can't express natively.
-function M.assign_word(sh, w)
+function M.assign_elem(sh, w)
 	return require("interp").expand_assign_word(sh, w)
 end
 -- shopt -s extdebug: the DEBUG trap before a compiled command; a non-zero status skips
