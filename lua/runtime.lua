@@ -7472,9 +7472,9 @@ local function substr(val, off, len)
 		if o < 0 then
 			o = n + o
 		end
-		if o < 0 then
-			return "" -- (a negative offset past the start: bash yields nothing)
-		end
+		if o < 0 or o > n then
+			return "" -- (an offset before the start or past the end: bash yields nothing;
+		end -- an int64-sized one must not reach string.sub, which wraps it)
 		local last = n
 		if len and len ~= "" then
 			local l = tonumber(len) or 0
@@ -7491,7 +7491,7 @@ local function substr(val, off, len)
 	if o < 0 then
 		o = n + o
 	end
-	if o < 0 then
+	if o < 0 or o > n then
 		return ""
 	end
 	local last = n
@@ -11477,6 +11477,9 @@ function M.array_slice_values(sh, name, els, off, len, ltxt)
 	end
 	if name ~= "@" and name ~= "*" and not sh:is_assoc(name) then
 		local idx = sh:array_indices(name)
+		if off >= 9.2233720368547758e18 then
+			off = 0x7fffffffffffffffLL -- (a double at 2^63 would wrap converting to int64)
+		end
 		if off < 0 then -- (int64: an index can be up to 2^63-1, beyond a double's exactness)
 			off = (idx[#idx] ~= nil and key_i64(idx[#idx]) or i64(-1)) + 1 + off
 		end
@@ -11511,6 +11514,9 @@ function M.array_slice_values(sh, name, els, off, len, ltxt)
 	local last = n
 	if len ~= nil then
 		last = (len < 0) and (n + len) or (off + len)
+	end
+	if last > n then
+		last = n -- (a huge length must not drive the loop past the elements)
 	end
 	local out = {}
 	for i = off, last - 1 do
