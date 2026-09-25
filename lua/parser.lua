@@ -1825,9 +1825,10 @@ end
 -- (raw alternatives, possibly themselves containing braces), or nil (not a brace).
 -- bash zero-pads a numeric range to the widest endpoint iff either endpoint has
 -- a leading zero (e.g. {01..3} -> 01 02 03, {01..003} -> 001 002 003).
+-- The width counts a `-` sign, as C's %0*d does (braces.c: {-05..5..5} -> -05 000 005).
 local function num_pad_width(a, b)
 	if a:match("^%-?0%d") or b:match("^%-?0%d") then
-		return math.max(#(a:gsub("^%-", "")), #(b:gsub("^%-", "")))
+		return math.max(#a, #b)
 	end
 	return nil
 end
@@ -1985,13 +1986,14 @@ local function range_count(r)
 	end
 	return math.floor(math.abs(r.b - r.a) / r.step) + 1
 end
-local function pad_num(v, w) -- zero-pad |v| to width w digits, keeping the sign
+local function pad_num(v, w) -- C's %0*d: zero-pad to a total width w, a sign included
 	if type(v) == "cdata" then
 		return (tostring(v):gsub("LL$", ""))
 	end
 	local d = tostring(math.abs(v))
-	if #d < w then
-		d = string.rep("0", w - #d) .. d
+	local dw = v < 0 and w - 1 or w
+	if #d < dw then
+		d = string.rep("0", dw - #d) .. d
 	end
 	return (v < 0 and "-" or "") .. d
 end
