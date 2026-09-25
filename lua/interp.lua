@@ -156,7 +156,12 @@ for _, n in ipairs({
 }) do
 	SHOPT_DEFAULT[n] = true
 end
+local COMPAT_OPT = { compat31 = 31, compat32 = 32, compat40 = 40, compat41 = 41, compat42 = 42,
+	compat43 = 43, compat44 = 44 }
 local function shopt_on(sh, name)
+	if COMPAT_OPT[name] then -- (derived from the compatibility level, $BASH_COMPAT — bash)
+		return rt.compat_level(sh) == COMPAT_OPT[name]
+	end
 	local v = sh.shopt[name]
 	if v == nil then
 		return SHOPT_DEFAULT[name]

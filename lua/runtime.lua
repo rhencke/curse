@@ -5959,7 +5959,7 @@ function M.compat_level(sh)
 	local v = sh:get("BASH_COMPAT")
 	local a, b = v:match("^(%d)%.(%d)$")
 	local n = a and tonumber(a .. b) or (v:match("^%d%d$") and tonumber(v))
-	return n or 52
+	return (n and n >= 31 and n <= 52) and n or 52 -- (sv_shcompat: out of range → the default)
 end
 -- bash's valid_array_reference: `NAME`, or `NAME[SUB]` whose subscript's brackets balance
 -- exactly to the end (`A[]]` is not one). Returns name, sub (nil for a plain name), or nil.

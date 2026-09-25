@@ -21,19 +21,14 @@ return function(sh, cmd, args, hook, tcb)
 	if cmd == "shopt" then
 		-- shopt [-s|-u|-q|-p|-o] [names]: set/unset/query shell options (subset).
 		local set_, unset_, quiet, oflag, pflag, badopt = false, false, false, false, false, false
+		-- (options up to the first operand or `--`: bash's internal_getopt)
 		local names = {}
-		for k = 2, #args do
-			local a = args[k]
-			if a == "-s" then
-				set_ = true
-			elseif a == "-u" then
-				unset_ = true
-			elseif a == "-q" then
-				quiet = true
-			elseif a == "-p" then
-				pflag = true
-			elseif a == "-o" then
-				oflag = true
+		local k0 = 2
+		while args[k0] and args[k0]:sub(1, 1) == "-" and #args[k0] > 1 and not badopt do
+			local a = args[k0]
+			k0 = k0 + 1
+			if a == "--" then
+				break
 			elseif a:match("^-[suqpo]+$") then
 				if a:find("s") then
 					set_ = true
@@ -50,11 +45,12 @@ return function(sh, cmd, args, hook, tcb)
 				if a:find("p") then
 					pflag = true
 				end
-			elseif a:sub(1, 1) == "-" and #a > 1 then
-				badopt = badopt or a -- (`-z`, and long opts, are invalid options — bash)
 			else
-				names[#names + 1] = a
+				badopt = a -- (`-z`, and long opts, are invalid options — bash)
 			end
+		end
+		for k = k0, #args do
+			names[#names + 1] = args[k]
 		end
 		-- one option in the requested form (-p: a reusable command; else two columns)
 		local function show(nm, on, cmdform)
@@ -130,6 +126,10 @@ return function(sh, cmd, args, hook, tcb)
 				if SHOPT_DEFAULT[nm] == nil then
 					io.stderr:write("curse: shopt: " .. nm .. ": invalid shell option name\n")
 					allok = false
+				elseif nm:match("^compat%d%d$") then -- (set_compatibility_level: $BASH_COMPAT follows)
+					local lvl, cur = tonumber(nm:sub(7)), rt.compat_level(sh)
+					local new = set_ and lvl or ((cur ~= lvl and (cur <= 44 or cur < 52)) and cur or 52)
+					sh:set_str("BASH_COMPAT", tostring(new))
 				else
 					sh.shopt[nm] = set_
 				end
