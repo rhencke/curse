@@ -98,7 +98,12 @@ return function(sh, cmd, args, hook, tcb)
 			local allok = true
 			for k = j, #args do
 				local target = args[k]
-				local pid = target:match("^%s*[+-]?%d+%s*$") and tonumber(target)
+				-- (legal_number, and it must fit a pid_t — bash: `pid_value == (pid_t)pid_value`;
+				-- else a huge number cast to 0 or -1 would signal our group or everything)
+				local pid = rt.legal_number(target)
+				if pid and (pid > 2147483647 or pid < -2147483648) then
+					pid = nil
+				end
 				if pid and (rt.vpid_ctx[pid] or rt.vpid_tasks[pid]) then -- an in-process subshell or job
 					if not rt.vkill(sh, pid, sig) then
 						io.stderr:write("curse: kill: (" .. pid .. ") - No such process\n")
