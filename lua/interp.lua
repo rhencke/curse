@@ -4493,6 +4493,43 @@ function pf.bigint(spec, width, prec, conv, v)
 	end
 	return s
 end
+-- %'d / %'u: printf(3)'s `'` flag — the digits grouped by LC_NUMERIC's thousands separator
+-- (en_US 1,234,567; de_DE 1.234.567; none in C), then padded to the width
+function pf.grouped(spec, width, prec, conv, v)
+	local s = pf.bigint(spec:gsub("[-0]", ""), "", nil, conv, v)
+	local sep, grouping = rt.thousands_grouping()
+	local pre, digits = s:match("^([+%- ]?)(%d+)$")
+	local zeros = digits and prec and (tonumber(prec) or 0) - #digits or 0
+	if digits and sep ~= "" then
+		local parts, i, gi, g = {}, #digits, 1, grouping:byte(1)
+		while g and g > 0 and g < 127 and i > g do
+			table.insert(parts, 1, digits:sub(i - g + 1, i))
+			i = i - g
+			gi = gi + 1
+			local nb = grouping:byte(gi)
+			if nb and nb ~= 0 then -- (the last group size repeats)
+				g = nb
+			end
+		end
+		table.insert(parts, 1, digits:sub(1, i))
+		s = pre .. table.concat(parts, sep)
+	end
+	if zeros > 0 then -- (the precision's zeros pad the grouped digits: %'.9d of 12345 is 000012,345)
+		s = pre .. ("0"):rep(zeros) .. s:sub(#pre + 1)
+	end
+	local w = tonumber(width) or 0
+	if #s < w then
+		if spec:find("-", 1, true) then
+			s = s .. (" "):rep(w - #s)
+		elseif spec:find("0", 1, true) and not prec then
+			local pre, rest = s:match("^([+%- ]?)(.*)$")
+			s = pre .. ("0"):rep(w - #s) .. rest
+		else
+			s = (" "):rep(w - #s) .. s
+		end
+	end
+	return s
+end
 -- %f/%e/%g/%a: bash parses the argument as a LONG double and prints with `L` (0.1 is
 -- exact to 20 places, 1 is 0x8p-3) — except in posix mode without an `L` modifier,
 -- where it's a double. The C helper does the long-double case when the text is a plain
@@ -4583,7 +4620,11 @@ local function sh_printf(fmt, argv, start, nsets, fsh)
 				elseif conv == "d" or conv == "i" or conv == "u" or conv == "o" or conv == "x" or conv == "X" then
 					local v = pf.intarg(ps, pf_next(ps), conv ~= "d" and conv ~= "i")
 					conv = conv == "i" and "d" or conv
-					out[#out + 1] = full and string.format(full .. conv, v) or pf.bigint(spec, width, prec, conv, v)
+					if tk.grp and (conv == "d" or conv == "u") then -- (%'d: LC_NUMERIC's grouping)
+						out[#out + 1] = pf.grouped(spec, width, prec, conv, v)
+					else
+						out[#out + 1] = full and string.format(full .. conv, v) or pf.bigint(spec, width, prec, conv, v)
+					end
 				elseif tk.strftime then
 					-- the argument is getintmax'd; none at all is -1: now (-2: when the shell
 					-- started, bash's shell_start_time)
@@ -4604,7 +4645,9 @@ local function sh_printf(fmt, argv, start, nsets, fsh)
 					out[#out + 1] = pf.str(spec, width, prec, sres)
 				elseif conv == "f" or conv == "F" or conv == "e" or conv == "E" or conv == "g" or conv == "G"
 					or conv == "a" or conv == "A" then
-					out[#out + 1] = pf.float(ps, tk, full, spec, width, prec, conv, pf_next(ps))
+					-- (into a local first: a bad number's diagnostic flushes `out`, moving its end)
+					local r = pf.float(ps, tk, full, spec, width, prec, conv, pf_next(ps))
+					out[#out + 1] = r
 				elseif conv == "n" then -- %n: store the number of bytes written so far in NAME
 					local nm = pf_next(ps)
 					if nm ~= "" then
@@ -6545,7 +6588,11 @@ exec_stmt = function(sh, st, hook)
 						C.setenv(a.name, a.raw, 1)
 					else
 						sh.applying_prefix = true
+						if rt.LOCALE_VARS[a.name] then
+							rt.lc_quiet = rt.prefix_ext(sh, args[1])
+						end
 						exec_stmt(sh, a, hook)
+						rt.lc_quiet = nil
 						sh.applying_prefix = nil
 						if iapp and sh.vars[a.name] == b and not b.ro then
 							sh.vars[a.name] = { s = sh:get(a.name), exported = b.exported }
@@ -6568,7 +6615,6 @@ exec_stmt = function(sh, st, hook)
 			local ok, err = pcall(run_cmd)
 			tenv_base = nil
 			sh.tenv_call_base = nil
-			local relocale = false
 			local keeps = rt.prefix_keeps(sh, args)
 			for k = #sh.tenv, base + 1, -1 do
 				local s = sh.tenv[k]
@@ -6584,14 +6630,13 @@ exec_stmt = function(sh, st, hook)
 					if nv and nv ~= s.tval then -- (a builtin's write reached the variable beneath)
 						sh:set_str(s.name, nv)
 					end
-					relocale = relocale or s.name == "LANG" or s.name:sub(1, 3) == "LC_"
+					if rt.LOCALE_VARS[s.name] then -- (`LANG=C cmd`: the locale follows the variable back)
+						rt.reset_locale(sh, s.name)
+					end
 					if s.name == "GLOBIGNORE" then
 						rt.setup_glob_ignore(sh) -- (the binding going away re-applies sv_globignore)
 					end
 				end
-			end
-			if relocale then -- (`LANG=C cmd`: the locale follows the variable back)
-				rt.reset_locale(sh)
 			end
 			if not ok then
 				error(err)
@@ -7467,7 +7512,8 @@ local function finish(sh, ok, err)
 			sh.traps = sh.traps and shallow_noexit(sh.traps) -- `exec cmd`: the process is gone
 		end
 		if type(err) == "table" and err.__curse_exit then
-			sh.exit_requested = true -- (the REPL stops reading)
+			-- (the REPL stops reading — except an interactive one after a syntax error)
+			sh.exit_requested = not (err.__curse_parseerr and sh.opt_i and sh.defer_exit_trap) or nil
 			sh.status = err.__curse_exit
 		elseif type(err) == "table" and err.__curse_return then
 			sh.status = err.__curse_return
@@ -7730,15 +7776,16 @@ local function run_history_lines(sh, text, line1, hook, k)
 	return k
 end
 
-function M.run_lazy(sh, src, hook)
+-- (`line1`: the line `src` starts on — a script read from stdin a command at a time)
+function M.run_lazy(sh, src, hook, line1)
 	hook = hook or function() end
-	local nextf = P.open(src, sh) -- sh: alias expansion uses the live alias table
+	local nextf = P.open(src, sh, line1) -- sh: alias expansion uses the live alias table
 	finish(
 		sh,
 		pcall(function()
 			local k = 0
 			if sh.opt_v and not sh.opt_i then -- (`bash -v`: read line by line from the start)
-				run_history_lines(sh, src, 1, hook, k)
+				run_history_lines(sh, src, line1 or 1, hook, k)
 				return
 			end
 			while true do

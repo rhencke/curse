@@ -330,6 +330,11 @@ local function open_script(sh, inv, path)
 			sh.status = 126
 			return nil
 		end
+		s = s:gsub("%z", "") -- (shell_getc drops the NUL bytes of a script's text)
+	end
+	-- (shell_getc ends the last line with a newline: a final `\` is a line continuation)
+	if s ~= "" and s:byte(-1) ~= 10 then
+		s = s .. "\n"
 	end
 	return s
 end
@@ -504,6 +509,10 @@ function M.start(sh, inv, istty)
 			end
 			sh.shopt[so[1]] = so[2]
 		end
+	end
+	if sh.lc_startup_warn then -- (set_default_lang's setlocale failure, in shell_initialize)
+		err(name .. ": " .. sh.lc_startup_warn .. "\n")
+		sh.lc_startup_warn = nil
 	end
 	-- the environment's exported functions and $SHELLOPTS (shell_initialize: after the
 	-- command-line options, so --posix gates the function names)

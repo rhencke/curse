@@ -9313,7 +9313,9 @@ function M.emit(ast, opts)
 	-- (a fragment — a script line, eval/source text — may run under an earlier `set -k`
 	-- its own text never shows: compile both readings there too)
 	EF.keyword = kw or EF.fragment or false
-	EF.bash_command = bcmd or false
+	-- (a line-mode line under a DEBUG/ERR trap set by an earlier line: the handler — not in
+	-- this line's text — may read $BASH_COMMAND)
+	EF.bash_command = bcmd or (EF.lm and opts and (opts.trap_debug or opts.trap_err)) or false
 	-- (`enable -n NAME` here, or maybe in eval/source code or around a fragment: a native
 	-- builtin call first checks the name is still a builtin)
 	EF.enable = enable or EF.fragment or scan_dyncode(ast.stmts)
@@ -9322,6 +9324,9 @@ function M.emit(ast, opts)
 	end
 	if xlex and not EF.lm then -- (the whole program can't: the tier runs it line by line)
 		error("curse-nocompile: line-mode: " .. xlex)
+	end
+	if ast.ltrans and not EF.lm and not EF.fragment then -- ($"…" is translated as each line is read)
+		error("curse-nocompile: line-mode: $\"…\" translation")
 	end
 	-- (a fragment — eval/source code, a hot loop — may run under a caller's set -x; so may
 	-- code that runs eval/source, which can turn it on)

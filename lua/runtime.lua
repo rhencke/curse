@@ -491,6 +491,9 @@ function Shell:popCall()
 					ffi.C.unsetenv(name)
 				end
 			end
+			if M.LOCALE_VARS[name] then -- (a local LC_ALL going away takes its locale with it)
+				M.reset_locale(self, name)
+			end
 		end
 		self.savedstack[d] = false
 		if saved.GLOBIGNORE then -- (a local GLOBIGNORE going away re-applies the outer one)
@@ -815,6 +818,8 @@ ffi.cdef([[
   size_t wcrtomb(char *s, int wc, curse_mbstate_t *ps);
   int towupper(int wc);
   int towlower(int wc);
+  int toupper(int c);
+  int tolower(int c);
   int iswprint(int wc);
   int iswctype(int wc, unsigned long desc);
   unsigned long wctype(const char *name);
@@ -1117,60 +1122,157 @@ local lc_mb_cur_max = 1 -- module-global: setlocale is process-wide
 M.lc_mb_cur_max = function()
 	return lc_mb_cur_max
 end
--- Re-apply the shell's locale variables to the C library, honoring bash/POSIX
--- precedence per category: LC_ALL overrides; else LC_<category>; else LANG. An
--- invalid locale name makes setlocale return NULL and leaves the prior locale in
--- place (bash warns and continues) — so we never clobber a good locale.
+-- Re-apply the shell's locale variables to the C library the way bash's locale.c does.
+-- bash is INCREMENTAL: assigning LC_<cat> calls setlocale for that one category with
+-- get_locale_var's pick (LC_ALL > LC_<cat> > LANG); LANG (set_lang) and an unset/empty
+-- LC_ALL go through reset_locale_vars (setlocale(LC_ALL, $LANG), then each category).
+-- An INVALID name makes setlocale return NULL and leaves the prior locale in force
+-- (`LANG=C.UTF-8; LANG=bogus` stays UTF-8), with a warning for LC_ALL/LC_<cat> (not
+-- LANG). reset_locale(sh, var) is sv_locale(var); with no var it is bash's startup
+-- (set_default_lang: LC_ALL, then LANG). LC_MONETARY is not a bash special variable.
+-- lc_state (cat -> the name in force) is replaced, never mutated, on each change, so an
+-- in-process subshell's checkpoint holds it by reference and M.locale_restore puts it back.
 local re_locale_changed = function() end -- (defined with the regex cache below)
 M.locale_gen = 0 -- bumped per reset: an in-process subshell that changed it re-applies on exit
-local re_lockey, lk = "", {}
-function M.reset_locale(sh)
-	M.locale_gen = M.locale_gen + 1
-	local all = sh.vars["LC_ALL"] and sh:get("LC_ALL")
-	local lang = sh.vars["LANG"] and sh:get("LANG")
-	for name, cat in pairs(LC_CATEGORIES) do
-		-- Precedence LC_ALL > LC_<cat> > LANG > "C". An INVALID name makes setlocale
-		-- return NULL; bash then falls through to the next candidate (so LC_CTYPE=invalid
-		-- with LANG=C.UTF-8 still gives a UTF-8 ctype). Take the first that SUCCEEDS.
-		local cands
-		if all and all ~= "" then
-			cands = { all, "C" }
+do
+	local re_lockey = ""
+	M.lc_state = { [0] = "C", "C", "C", "C", "C", "C" }
+	local lc_ns -- (the state being built by one reset)
+	local function lc_try(cat, v) -- setlocale; true when it took
+		if v == "" then
+			v = "C" -- (bash's "" = the environment's pick; with no locale variable set that's C)
+		end
+		ffi.errno(0)
+		if C.setlocale(cat, v) == nil then
+			return false
+		end
+		if not lc_ns then
+			lc_ns = {}
+			for c = 0, 5 do
+				lc_ns[c] = M.lc_state[c]
+			end
+		end
+		if cat == 6 then
+			for c = 0, 5 do
+				lc_ns[c] = v
+			end
 		else
-			local b = sh.vars[name]
-			local lv = b and sh:get(name)
-			cands = {}
-			if lv and lv ~= "" then
-				cands[#cands + 1] = lv
-			end
-			if lang and lang ~= "" then
-				cands[#cands + 1] = lang
-			end
-			cands[#cands + 1] = "C"
+			lc_ns[cat] = v
 		end
-		for _, v in ipairs(cands) do
-			if C.setlocale(cat, v) ~= nil then
-				if cat == 0 or cat == 3 then
-					lk[cat] = v
+		return true
+	end
+	local function lc_warn(var, v) -- (locale.c's internal_warning)
+		if M.lc_quiet then
+			return
+		end
+		local e = ffi.errno()
+		io.stderr:write("curse: warning: setlocale: " .. var .. ": cannot change locale (" .. v .. ")"
+			.. (e ~= 0 and (": " .. ffi.string(C.strerror(e))) or "") .. "\n")
+	end
+	local function lc_get(sh, name) -- (a set, non-empty variable's value, else nil)
+		local v = sh.vars[name] and sh:get(name)
+		return v ~= "" and v or nil
+	end
+	local function lc_pick(sh, all, name, lang) -- bash's get_locale_var
+		return all or lc_get(sh, name) or lang or ""
+	end
+	local LC_ORDER = { "LC_CTYPE", "LC_COLLATE", "LC_MESSAGES", "LC_NUMERIC", "LC_TIME" }
+	local function lc_reset_vars(sh, lang) -- bash's reset_locale_vars
+		if not lc_try(6, lang or "") then
+			return false
+		end
+		for _, n in ipairs(LC_ORDER) do
+			lc_try(LC_CATEGORIES[n], lc_pick(sh, nil, n, lang))
+		end
+		return true
+	end
+	local function lc_commit()
+		M.locale_gen = M.locale_gen + 1
+		if lc_ns then
+			M.lc_state, lc_ns = lc_ns, nil
+		end
+		local st = M.lc_state
+		local k = st[0] .. "\0" .. st[3]
+		if k ~= re_lockey then
+			re_lockey = k
+			re_locale_changed()
+		end
+		lc_mb_cur_max = tonumber(C.__ctype_get_mb_cur_max()) or 1
+	end
+	function M.reset_locale(sh, var)
+		if var == "LC_MONETARY" or (var and sh.importing_env) then
+			return
+		end
+		local all, lang = lc_get(sh, "LC_ALL"), lc_get(sh, "LANG")
+		local ok = true
+		if var == nil then -- startup: from C, LC_ALL (warning), else LANG and the categories
+			lc_try(6, "C")
+			if all then
+				ok = lc_try(6, all)
+				if not ok then -- (reported once the shell's name is known: invoke.start)
+					local e = ffi.errno()
+					sh.lc_startup_warn = "warning: setlocale: LC_ALL: cannot change locale (" .. all .. ")"
+						.. (e ~= 0 and (": " .. ffi.string(C.strerror(e))) or "")
 				end
-				break
+			else
+				lc_reset_vars(sh, lang)
+			end
+		elseif var == "LANG" then
+			if not all then
+				ok = lc_reset_vars(sh, lang)
+			end
+		elseif var == "LC_ALL" then
+			if all then
+				ok = lc_try(6, all)
+				if not ok then
+					lc_warn("LC_ALL", all)
+				end
+			else
+				ok = lc_reset_vars(sh, lang)
+			end
+		elseif not all then -- LC_<cat> (masked entirely by a non-empty LC_ALL)
+			local v = lc_pick(sh, nil, var, lang)
+			ok = lc_try(LC_CATEGORIES[var], v)
+			if not ok then
+				lc_warn(var, v)
 			end
 		end
+		if not ok and sh.opt_posix then
+			sh.status = 1 -- (sv_locale: a failed change is an error in posix mode)
+		end
+		lc_commit()
 	end
-	local k = lk[0] .. "\0" .. lk[3]
-	if k ~= re_lockey then
-		re_lockey = k
-		re_locale_changed()
+	-- `LC_ALL=bogus /bin/true`: an external command's prefix is only its environment (no
+	-- sv_locale, so no warning); a builtin's or function's is a shell variable (it warns).
+	function M.prefix_ext(sh, cmd)
+		return cmd ~= nil and not sh.functions[cmd] and require("interp")._int.BUILTINS[cmd] == nil
 	end
-	lc_mb_cur_max = tonumber(C.__ctype_get_mb_cur_max()) or 1
+	-- An in-process subshell's exit: put back the locale its checkpoint captured.
+	function M.locale_restore(st)
+		for c = 0, 5 do
+			C.setlocale(c, st[c])
+		end
+		M.lc_state = st
+		lc_commit()
+	end
 end
 M.LC_CATEGORIES = LC_CATEGORIES
 -- The LC_NUMERIC decimal point (reset_locale applies the category) — LuaJIT's own number
 -- formatting always writes ".", so printf's float conversions substitute this.
-ffi.cdef("struct curse_lconv { char *decimal_point; }; struct curse_lconv *localeconv(void);")
+ffi.cdef("struct curse_lconv { char *decimal_point, *thousands_sep, *grouping; };"
+	.. "struct curse_lconv *localeconv(void);")
 function M.decimal_point()
 	local lc = C.localeconv()
 	local dp = lc ~= nil and lc.decimal_point ~= nil and ffi.string(lc.decimal_point) or "."
 	return dp ~= "" and dp or "."
+end
+-- LC_NUMERIC's thousands separator and grouping (printf's `'` flag): "" when it has none
+function M.thousands_grouping()
+	local lc = C.localeconv()
+	if lc == nil or lc.thousands_sep == nil or lc.grouping == nil then
+		return "", ""
+	end
+	return ffi.string(lc.thousands_sep), ffi.string(lc.grouping)
 end
 
 -- Count CHARACTERS (codepoints) in a byte string using the current LC_CTYPE, the
@@ -1278,6 +1380,12 @@ M.towupper = function(wc)
 end
 M.towlower = function(wc)
 	return tonumber(C.towlower(wc))
+end
+M.toupper = function(c)
+	return tonumber(C.toupper(c))
+end
+M.tolower = function(c)
+	return tonumber(C.tolower(c))
 end
 M.iswprint = function(wc)
 	return tonumber(C.iswprint(wc))
@@ -2796,7 +2904,7 @@ local function sub_checkpoint(self)
 		orig_vars = orig_vars, copy = copy, exset = exset,
 		params = self.params, nparams = self.nparams,
 		shopt = self.shopt, functions = self.functions,
-		locale_gen = M.locale_gen, dirstack = self.dirstack, hashcache = self.hashcache, hashpath = self.hashpath, getopts = self.getopts_state,
+		locale_gen = M.locale_gen, lc_state = M.lc_state, dirstack = self.dirstack, hashcache = self.hashcache, hashpath = self.hashpath, getopts = self.getopts_state,
 		cwd = self:phys_cwd(), tcwd = self.tcwd, um = C.umask(0), disabled = self.disabled_builtins,
 		fn_ro = self.fn_ro, unset_specials = self.unset_specials, random_plain = self.random_plain,
 		shellopts_exported = self.shellopts_exported, bav = self.bav, argv0 = self.argv0,
@@ -2863,7 +2971,7 @@ end
 local function sub_restore(self, cp)
 	self.vars = cp.orig_vars
 	if cp.locale_gen ~= M.locale_gen then -- (`(LANG=C; …)`: setlocale is process-wide)
-		M.reset_locale(self)
+		M.locale_restore(cp.lc_state)
 	end
 	self.params, self.nparams = cp.params, cp.nparams
 	self.shopt, self.functions = cp.shopt, cp.functions
@@ -7585,7 +7693,7 @@ function Shell:set_str(name, s)
 		end
 	end -- keep the env in sync
 	if LOCALE_VARS[dn] then
-		M.reset_locale(self)
+		M.reset_locale(self, dn)
 	elseif dn == "GLOBIGNORE" then
 		M.setup_glob_ignore(self)
 	end -- track the locale live, like bash
@@ -7618,6 +7726,7 @@ function Shell:import_env()
 		return
 	end
 	local i, env_pwd, env_oldpwd = 0, nil, nil
+	self.importing_env = true -- (the locale is applied once, after: M.reset_locale at startup)
 	while e[i] ~= nil do
 		local s = ffi.string(e[i])
 		local eq = s:find("=", 1, true)
@@ -7652,6 +7761,7 @@ function Shell:import_env()
 		end
 		i = i + 1
 	end
+	self.importing_env = nil
 	-- Initialize $PWD: keep an inherited absolute $PWD only if it still names the
 	-- current directory (so a symlinked path survives); otherwise use getcwd.
 	local phys = self:phys_cwd()
@@ -9724,6 +9834,7 @@ function M.time_text(sh, real, user, sys, posix)
 	-- (print_formatted_time: %% and %P, else %[digit][l] then R/E/U/S; any other
 	-- character is an error that prints nothing else. A lone trailing % is literal.)
 	local out, i, n = {}, 1, #fmt
+	local dp = M.decimal_point() -- (mkfmt writes the locale's radix character: 0,003 in de_DE)
 	while i <= n do
 		local c = fmt:sub(i, i)
 		if c ~= "%" or i == n then
@@ -9735,7 +9846,7 @@ function M.time_text(sh, real, user, sys, posix)
 			if d == "%" then
 				out[#out + 1] = "%"
 			elseif d == "P" then
-				out[#out + 1] = ("%.2f"):format(real > 0 and ((user + sys) * 100 / real) or 0)
+				out[#out + 1] = ("%.2f"):format(real > 0 and ((user + sys) * 100 / real) or 0):gsub("%.", dp)
 			else
 				local prec, long = 3, false
 				if d:match("%d") then
@@ -9754,9 +9865,9 @@ function M.time_text(sh, real, user, sys, posix)
 					return ""
 				end
 				if long then
-					out[#out + 1] = ("%dm%." .. prec .. "fs"):format(math.floor(v / 60), v % 60)
+					out[#out + 1] = ("%dm%." .. prec .. "fs"):format(math.floor(v / 60), v % 60):gsub("%.", dp)
 				else
-					out[#out + 1] = ("%." .. prec .. "f"):format(v)
+					out[#out + 1] = ("%." .. prec .. "f"):format(v):gsub("%.", dp)
 				end
 			end
 			i = j + 1
@@ -11584,11 +11695,11 @@ local function fold_case(val, pat, upper, all)
 	-- so skip the per-char glob_match — it would regcomp once per character (ruinous
 	-- in a loop). Only a real pattern (`${x^[a-z]}`) needs the match test.
 	local any = (pat == "?")
-	-- ASCII/single-byte fast path: with the default `?` (fold every char) in a
-	-- single-byte locale, folding is exactly string.upper/lower (Lua's toupper/tolower
-	-- is the same locale-aware per-byte fold) — no mb_chars char-table, no per-char
-	-- loop, no allocation. This is the common `${x^^}`/`${x,,}` case.
-	if lc_mb_cur_max <= 1 and any and upper ~= "toggle" then
+	-- ASCII fast path: with the default `?` (fold every char) in a single-byte locale and
+	-- no high bytes, folding is exactly string.upper/lower (LuaJIT's are ASCII-only, so a
+	-- Latin-9 é goes the per-char way below) — no mb_chars char-table, no per-char loop,
+	-- no allocation. This is the common `${x^^}`/`${x,,}` case.
+	if lc_mb_cur_max <= 1 and any and upper ~= "toggle" and not val:find("[\128-\255]") then
 		local f = upper and string.upper or string.lower
 		if all then
 			return f(val)
@@ -11603,18 +11714,25 @@ local function fold_case(val, pat, upper, all)
 	-- tr_TR, etc. A bad byte (wc == nil) is left as-is.
 	local chars = M.mb_chars(val)
 	local out, limit = {}, all and #chars or math.min(1, #chars)
+	-- (a single-byte locale folds each byte with toupper/tolower: sh_modcase's non-MB path)
+	local up, low = M.towupper, M.towlower
+	if lc_mb_cur_max <= 1 then
+		up, low = M.toupper, M.tolower
+	end
 	for k = 1, #chars do
 		local ch = chars[k]
 		local s = ch.s
 		if k <= limit and ch.wc and (any or M.glob_match(s, pat)) then
 			local w2
-			if upper == "toggle" then -- ${x~}/${x~~}: swap case (sh_modcase CASE_TOGGLE)
-				w2 = M.towupper(ch.wc)
+			if upper == "toggle" and up == M.toupper and ch.wc >= 128 then
+				w2 = ch.wc -- (bash's TOGGLE sees a high byte as a negative wchar_t: unchanged)
+			elseif upper == "toggle" then -- ${x~}/${x~~}: swap case (sh_modcase CASE_TOGGLE)
+				w2 = up(ch.wc)
 				if w2 == ch.wc then
-					w2 = M.towlower(ch.wc)
+					w2 = low(ch.wc)
 				end
 			else
-				w2 = upper and M.towupper(ch.wc) or M.towlower(ch.wc)
+				w2 = upper and up(ch.wc) or low(ch.wc)
 			end
 			if w2 ~= ch.wc then
 				s = M.wc_to_bytes(w2, ch.s)
@@ -12196,7 +12314,11 @@ function M.run_prefix(sh, names, vals, runfn, argv)
 		if b and (b.ref or (not b.ro and (b.arr or b.int or b.lower or b.upper or b.cap))) then
 			sh.vars[name] = {}
 		end
+		if LOCALE_VARS[name] then
+			M.lc_quiet = M.prefix_ext(sh, argv and argv[1])
+		end
 		sh:set_str(name, vals[i])
+		M.lc_quiet = nil
 		C.setenv(name, sh:get(name), 1)
 		sh.tenv[#sh.tenv].tval = sh:get(name) -- (to see whether the command wrote it: prefix_keeps)
 		local nb = sh.vars[sh:deref(name)] -- (in the environment: `declare -p` shows -x)
@@ -12207,7 +12329,6 @@ function M.run_prefix(sh, names, vals, runfn, argv)
 	sh.tenv_call_base = base -- a DIRECT function call tags these with its frame (local absorption)
 	local ok, err = pcall(runfn)
 	sh.tenv_call_base = nil
-	local relocale = false
 	local keeps = argv and M.prefix_keeps(sh, argv)
 	for k = #sh.tenv, base + 1, -1 do
 		local s = sh.tenv[k]
@@ -12223,14 +12344,13 @@ function M.run_prefix(sh, names, vals, runfn, argv)
 			if nv and nv ~= s.tval then -- (the builtin's write reached the variable beneath)
 				sh:set_str(s.name, nv)
 			end
-			relocale = relocale or LOCALE_VARS[s.name] ~= nil
+			if LOCALE_VARS[s.name] then -- (`LC_CTYPE=C cmd`: the locale follows the variable back)
+				M.reset_locale(sh, s.name)
+			end
 			if s.name == "GLOBIGNORE" then
 				M.setup_glob_ignore(sh) -- (the binding going away re-applies sv_globignore)
 			end
 		end
-	end
-	if relocale then -- (`LC_CTYPE=C cmd`: the locale follows the variable back)
-		M.reset_locale(sh)
 	end
 	if not ok then
 		error(err)
@@ -14064,11 +14184,16 @@ do
 		if b and not iapp and (b.ref or (not b.ro and (b.arr or b.int or b.lower or b.upper or b.cap))) then
 			sh.vars[name] = {}
 		end
+		if LOCALE_VARS[name] then
+			M.lc_quiet = M.prefix_ext(sh, cmd)
+		end
 		if raw then -- NAME=(…) as a command prefix is a literal string, not an array (bash)
 			sh:set_str(name, raw)
+			M.lc_quiet = nil
 			C.setenv(name, raw, 1)
 		else
 			M.sr_pset(sh, name, value, append)
+			M.lc_quiet = nil
 			if iapp and sh.vars[name] == b and not b.ro then
 				sh.vars[name] = { s = sh:get(name), exported = b.exported }
 			end
@@ -14239,7 +14364,6 @@ do
 		end
 	end
 	function M.sr_unbind(sh, base, argv)
-		local relocale = false
 		local keeps = M.prefix_keeps(sh, argv)
 		for k = #sh.tenv, base + 1, -1 do
 			local s = sh.tenv[k]
@@ -14255,14 +14379,13 @@ do
 				if nv and nv ~= s.tval then
 					sh:set_str(s.name, nv)
 				end
-				relocale = relocale or LOCALE_VARS[s.name] ~= nil
+				if LOCALE_VARS[s.name] then -- (`LC_CTYPE=C cmd`: the locale follows the variable back)
+				M.reset_locale(sh, s.name)
+			end
 				if s.name == "GLOBIGNORE" then
 					M.setup_glob_ignore(sh) -- (the binding going away re-applies sv_globignore)
 				end
 			end
-		end
-		if relocale then
-			M.reset_locale(sh)
 		end
 	end
 	-- spec (a per-site constant): aas = the NAME=(…) operand ASTs; names = the prefix

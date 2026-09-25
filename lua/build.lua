@@ -67,6 +67,7 @@ local lazy_mods = {
 	"helpdata", -- bash's help texts: only for `help`
 	"hist", -- command history + `!` expansion: only when a script turns history on
 	"smatch", -- bash's own pattern matcher: only for what a glob's ERE can't express
+	"gettext", -- $"…" message-catalog lookup: only when a script translates a string
 }
 
 -- Wrap each core module's source in a package.preload closure. `require("x")` then
