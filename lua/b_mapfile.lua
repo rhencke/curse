@@ -25,8 +25,13 @@ return function(sh, cmd, args, hook, tcb)
 			io.stderr:write("curse: " .. cmd .. ": " .. msg .. "\n")
 			sh.status = code or 1
 		end
-		local function legal(v)
-			return v and v:match("^%s*[+-]?%d+%s*$") and tonumber(v) or nil
+		-- (legal_number, then mapfile.def's range: an unsigned int, or an int for -u)
+		local function legal(v, max)
+			local n = v and rt.legal_number(v)
+			return n and n <= (max or 4294967295) and n or nil
+		end
+		if args[2] == "--help" then -- (CASE_HELPOPT)
+			return rt.builtin_help(sh, cmd)
 		end
 		local fd, lines, origin, nskip, quantum, callback = 0, 0, 0, 0, 5000, nil
 		local clear, chop, dch = true, false, "\n"
@@ -57,7 +62,7 @@ return function(sh, cmd, args, hook, tcb)
 							return
 						end
 					end
-					local n = legal(v)
+					local n = legal(v, o == "u" and 2147483647 or nil)
 					if o == "d" then
 						dch = v:sub(1, 1)
 						if dch == "" then
@@ -175,11 +180,11 @@ return function(sh, cmd, args, hook, tcb)
 			if chop and l:sub(-1) == dch then
 				l = l:sub(1, -2)
 			end
-			if callback and count % quantum == 0 then
-				rt.eval(sh, { "eval", callback .. " " .. idx .. " " .. sq(l) })
+			if callback and count % quantum == 0 then -- (the index as C's %d of an unsigned int)
+				rt.eval(sh, { "eval", callback .. " " .. (idx >= 2147483648 and idx - 4294967296 or idx) .. " " .. sq(l) })
 			end
 			sh:array_set(arr, idx, l, false)
-			idx = idx + 1
+			idx = (idx + 1) % 4294967296 -- (bash's array_index is an unsigned int: it wraps)
 			count = count + 1
 			if lines ~= 0 and count > lines then
 				break

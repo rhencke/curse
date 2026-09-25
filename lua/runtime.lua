@@ -10432,7 +10432,7 @@ function M.eval(sh, argv)
 	if mod then
 		require("tier").run_compiled(mod, sh, nil, true)
 	else
-		require("b_eval")(sh, "eval", argv, nil, nil)
+		require("b_eval")(sh, "eval", argv, _noop, nil) -- (a hook: a called function asks it)
 	end
 end
 
