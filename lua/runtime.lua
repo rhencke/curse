@@ -11268,7 +11268,7 @@ function M.run_prefix(sh, names, vals, runfn, argv)
 		}
 		-- a NAMEREF's prefix binding is a plain temporary (target untouched), and so is an
 		-- -i/-l/-u/-c var's (bash's tempenv variable is a plain string: `i=1+1 cmd` gets "1+1")
-		if b and (b.ref or ((b.int or b.lower or b.upper or b.cap) and not b.arr and not b.ro)) then
+		if b and (b.ref or (not b.ro and (b.arr or b.int or b.lower or b.upper or b.cap))) then
 			sh.vars[name] = {}
 		end
 		sh:set_str(name, vals[i])
@@ -13090,8 +13090,8 @@ do
 				ro = b.ro, ref = b.ref, int = b.int, lower = b.lower, upper = b.upper, cap = b.cap, trace = b.trace }
 				or false,
 		}
-		-- a nameref's / -i/-l/-u/-c var's prefix binding is a plain temporary string (bash)
-		if b and (b.ref or ((b.int or b.lower or b.upper or b.cap) and not b.arr and not b.ro)) then
+		-- a nameref's / array's / -i/-l/-u/-c var's prefix binding is a plain temporary string (bash)
+		if b and (b.ref or (not b.ro and (b.arr or b.int or b.lower or b.upper or b.cap))) then
 			sh.vars[name] = {}
 		end
 		if raw then -- NAME=(…) as a command prefix is a literal string, not an array (bash)

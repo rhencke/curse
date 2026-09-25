@@ -6428,9 +6428,9 @@ exec_stmt = function(sh, st, hook)
 						} or false,
 					}
 					-- a NAMEREF's prefix binding is a plain temporary of its own (bash: the target
-					-- is untouched; restored below), and so is an -i/-l/-u/-c var's: bash's tempenv
+					-- is untouched; restored below), and so is an array's (shadowed, not element 0) or an -i/-l/-u/-c var's: bash's tempenv
 					-- variable is a plain string (`i=1+1 cmd` passes "1+1")
-					if b and (b.ref or ((b.int or b.lower or b.upper or b.cap) and not b.arr and not b.ro)) then
+					if b and (b.ref or (not b.ro and (b.arr or b.int or b.lower or b.upper or b.cap))) then
 						sh.vars[a.name] = {}
 					end
 					if a.raw then -- NAME=(…) as a command prefix is a literal string, not an array (bash)
