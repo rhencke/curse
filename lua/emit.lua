@@ -6263,7 +6263,7 @@ H.select = function(cx, st, after)
 	end
 	local initp = cx.newpc()
 	local advp = cx.newpc()
-	cx.loopPc[st.id] = advp
+	-- (no OSR resume point: the interpreter's select keeps its menu list to itself)
 	cx.loopstack[#cx.loopstack + 1] = { brk = after, cont = advp }
 	local bodyentry = cx.flatten_list(st.body, advp)
 	cx.loopstack[#cx.loopstack] = nil
