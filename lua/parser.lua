@@ -2197,6 +2197,7 @@ local function add_word(words, w)
 		words[first].bx = { raw = w, n = n }
 	end
 end
+M.add_word = add_word -- (compgen -W brace-expands each of its words the same way)
 -- A word list as parsed with brace expansion OFF (`set +B`, which bash consults at
 -- expansion time): each brace-expanded run collapses back to its one literal word.
 local unbraced = setmetatable({}, { __mode = "k" })
