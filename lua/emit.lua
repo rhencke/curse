@@ -943,6 +943,7 @@ local function errchk(st) -- the guard statement for `st`, or "" when errexit ne
 	end
 	return ERRCHK
 end
+EF.LINE_BUILTINS = { compgen = 1, mapfile = 1, readarray = 1, fc = 1 } -- (see the builtin dispatch)
 EF.has_debug = false -- program installs a DEBUG trap → fire it before each command
 -- set -x: a program that can turn on xtrace (or runs eval/source, which may) carries a
 -- trace hook per command — `if sh.opt_x then rt.xtrace…` — placed where the interpreter
@@ -4058,7 +4059,7 @@ for _, n in ipairs({ "OPTIND", "OPTARG", "OPTERR", "REPLY", "SECONDS", "RANDOM",
 	"LINENO", "HISTCMD", "HISTSIZE", "HISTFILESIZE", "TMOUT", "COLUMNS", "LINES", "FUNCNEST",
 	"BASH_XTRACEFD", "SHLVL", "PPID", "UID", "EUID", "BASHPID", "BASH_SUBSHELL", "EPOCHSECONDS",
 	"EPOCHREALTIME", "BASH_ARGC", "COMP_CWORD", "COMP_POINT", "IFS", "_", "FUNCNAME",
-	"POSIXLY_CORRECT", "IGNOREEOF", "BASH_ARGV0", "GLOBIGNORE" }) do
+	"POSIXLY_CORRECT", "IGNOREEOF", "BASH_ARGV0", "GLOBIGNORE", "HOSTFILE" }) do
 	NO_LIFT[n] = true
 end
 for n in pairs(require("runtime").LOCALE_VARS) do
@@ -6230,6 +6231,12 @@ simple_compiled = function(cx, st, after)
 			local bcall = ((decl_in_fn or decl_gen or cmd == "command" or cmd == "builtin") and not cx.toplevel and not cx.topcode)
 					and "do local __sc = sh.calldepth; if (sh.calldepth or 0) < 1 then sh.calldepth = 1 end; rt.builtin(sh, __a, __noop); sh.calldepth = __sc end"
 				or "rt.builtin(sh, __a, __noop)"
+			-- a builtin that runs shell code at run time (compgen -W/-F/-C, mapfile -C, fc -s)
+			-- runs it at this command's line: $LINENO and the `line N:` of its errors
+			if EF.LINE_BUILTINS[cmd] and not (EF.trapline and not EF.cur_infunc) then
+				local ln = st.cline or st.line or EF.cur_line or 0
+				bcall = ("sh.cur_line = %d; sh.cur_cline = %d; "):format(ln, ln) .. bcall
+			end
 			if redir_apply then
 				-- a REDIRECTED builtin (`printf x > f`, `read v < f`, `type ls > f`): install the
 				-- redirs, run it (its output/input now on the target fd), then io.flush BEFORE

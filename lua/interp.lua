@@ -2889,6 +2889,7 @@ expand_fields_full = function(sh, w, pre1) -- pre1: part 1 already expanded (a $
 	end
 	for _, f in ipairs(fields) do
 		if not noglob and f.unq and glob_active(f) then
+			sh.glob_dots = dotglob -- (glob.c noglob_dot_filenames: compgen -G sees the last shell glob's)
 			-- a set GLOBIGNORE always filters `.`/`..` (overriding globskipdots)
 			local m = rt.glob_expand(
 				glob_pat(f),
