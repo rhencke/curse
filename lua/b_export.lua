@@ -905,7 +905,11 @@ return function(sh, cmd, args, hook, tcb)
 							allok = false
 							goto continue
 						end
-						sh:array_set(anm, array_key(sh, anm, sub), aval, aop == "+=")
+						if not sh:array_set(anm, array_key(sh, anm, sub), aval, aop == "+=") then
+							-- (a negative index before the start: the element isn't bound, status 1)
+							io.stderr:write("curse: " .. anm .. "[" .. sub .. "]: bad array subscript\n")
+							allok = false
+						end
 						local bb = sh.vars[sh:deref(anm)]
 						if roattr and bb then
 							bb.ro = true

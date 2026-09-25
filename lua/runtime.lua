@@ -27,6 +27,25 @@ M.i64 = i64
 -- locale via iswprint) while control/bad bytes are escaped. Byte-identical to bash.
 local ANSIC_ESC = { [27] = "\\E", [7] = "\\a", [11] = "\\v", [8] = "\\b", [12] = "\\f", [10] = "\\n", [13] = "\\r", [9] = "\\t" }
 M.ANSIC_ESC = ANSIC_ESC
+-- bash's ansic_shouldquote: does S hold a byte/character that isn't printable (in the
+-- locale: iswprint over its multibyte characters)? Such a value takes the $'…' form.
+function M.ansic_shouldquote(s)
+	if not s:find("[%z\1-\31\127-\255]") then
+		return false
+	end
+	for _, ch in ipairs(M.mb_chars(s)) do
+		if not ch.wc or ch.wc < 32 or ch.wc == 127 or M.iswprint(ch.wc) == 0 then
+			return true
+		end
+	end
+	return false
+end
+-- bash's sh_contains_shell_metas (shquote.c): a `#` counts only first, a `~` only first or
+-- after `=`/`:` (where it would tilde-expand)
+function M.shell_metas(s)
+	return s:find("[ \t\n'\"\\|&;()<>!{}*%[?%]^$`]") ~= nil or s:byte(1) == 35 or s:byte(1) == 126
+		or s:find("[=:]~") ~= nil
+end
 function M.shell_quote(s)
 	if not s:find("[%z\1-\31\127-\255]") then
 		return "'" .. s:gsub("'", "'\\''") .. "'"
@@ -5103,14 +5122,15 @@ end
 M.i64_to_str = i64_to_str
 
 -- Indexed-array KEYS. LuaJIT's LUA_NUMBER is a double, so a Lua-number key loses
--- precision above 2^53 (distinct huge int64 indices would collide). Key by a plain
--- NUMBER in the exact-double range (the common, fast case — numeric hashing, no
--- string churn) and by the canonical decimal STRING only beyond it (exact). The
--- two key spaces never overlap (t[5] vs t["5"] differ), and a given index always
--- maps to the same key, so writes and reads agree.
-local I64_EXACT = 0x20000000000000LL -- 2^53
+-- precision above 2^53 (distinct huge int64 indices would collide), and tostring
+-- prints one past 1e14 with an exponent. Key by a plain NUMBER below 1e14 (the
+-- common, fast case — numeric hashing, no string churn; tostring prints it as bash
+-- would) and by the canonical decimal STRING beyond (exact). The two key spaces
+-- never overlap (t[5] vs t["5"] differ), and a given index always maps to the same
+-- key, so writes and reads agree.
+local I64_NUMKEY = 100000000000000LL -- 1e14
 local function to_arr_key(v) -- v: int64 -> number|string key
-	if v >= -I64_EXACT and v <= I64_EXACT then
+	if v > -I64_NUMKEY and v < I64_NUMKEY then
 		return tonumber(v)
 	end
 	return i64_to_str(v)
@@ -6700,6 +6720,30 @@ end
 function M.arr_max_drop(arr) -- (an element went: maybe the highest)
 	ARR_MAX[arr] = nil
 end
+-- The key after indexed key K (number|string): int64 arithmetic past 2^53, wrapping at
+-- INT64_MAX like bash's arrayind_t (`c[9223372036854775807]=m; c+=(w)` lands at the min)
+function M.key_next(k)
+	if type(k) == "number" and k < 99999999999999 then
+		return k + 1
+	end
+	return to_arr_key(key_i64(k) + 1)
+end
+-- `a+=(…)`'s first index: one past the highest (a scalar becomes element [0] first)
+function M.arr_next(sh, name)
+	local b = sh.vars[name]
+	if not b then
+		return 0
+	end
+	if b.s ~= nil and not b.arr then
+		b.arr = { [0] = b.s }
+		b.s = nil
+		b.n = nil
+	end
+	if not b.arr or next(b.arr) == nil then
+		return 0
+	end
+	return M.key_next(to_arr_key(arr_max(b.arr)))
+end
 end
 
 -- `declare -A name`: mark as associative (string keys, insertion-order iteration —
@@ -6765,31 +6809,69 @@ end
 -- Negative indexed subscripts count from the highest set index (bash: a[-1] is
 -- the last element). Assoc keys (strings) are used as-is.
 local function norm_key(b, key)
-	if type(key) == "number" and key < 0 and not (b and b.assoc) then
-		local mx = (b and b.arr) and arr_max(b.arr) or i64(-1) -- int64 highest index
-		return to_arr_key(mx + 1 + key) -- resolve from end, then re-key (number|string)
+	if type(key) == "number" then
+		if key < 0 and not (b and b.assoc) then
+			local mx = (b and b.arr) and arr_max(b.arr) or i64(-1) -- int64 highest index
+			return to_arr_key(mx + 1 + key) -- resolve from end, then re-key (number|string)
+		end
+	elseif key:byte(1) == 45 and not (b and b.assoc) and not (b and b.arr and b.arr[key] ~= nil) then
+		-- (a huge negative index: its string key — unless it names the element an auto index
+		-- wrapped to at INT64_MIN)
+		local mx = (b and b.arr) and arr_max(b.arr) or i64(-1)
+		local r = mx + 1 + key_i64(key)
+		return r < 0 and -1 or to_arr_key(r) -- (-1: still past the start — rejected)
 	end
 	return key
 end
 -- A negative subscript past the start of indexed array NAME (`c[-5]` with 2 elements)?
 function M.neg_oob(sh, name, key)
-	if type(key) ~= "number" or key >= 0 then
+	if type(key) == "number" then
+		if key >= 0 then
+			return false
+		end
+	elseif type(key) ~= "string" or key:byte(1) ~= 45 then -- (a huge negative index's string key)
 		return false
 	end
 	local b = sh.vars[sh:deref(name)]
-	if b and b.assoc then
+	if b and (b.assoc or (b.arr and b.arr[key] ~= nil)) then
 		return false
 	end
 	local mx = (b and b.arr) and arr_max(b.arr) or ((b and (b.s or b.n)) and i64(0) or i64(-1))
-	return mx + 1 + key < 0
+	return mx + 1 + key_i64(key) < 0
 end
 -- ${a[-N]} past the start: bash warns (`a: bad array subscript`) and expands to nothing
+-- (an empty associative key too: bash's get_array_value, `${E['']}`)
 function M.elem_read_check(sh, name, key)
-	if M.neg_oob(sh, name, key) then
+	if key == "" then
+		local b = sh.vars[sh:deref(name)]
+		if b and b.assoc then
+			io.stderr:write("curse: " .. name .. ": bad array subscript\n")
+		end
+	elseif M.neg_oob(sh, name, key) then
 		io.stderr:write("curse: " .. name .. ": bad array subscript\n")
 	end
 end
-function Shell:array_set(name, key, val, append)
+-- Does NAME hold a value (bash's !invisible_p: not `declare x` / `declare -A h` unassigned)?
+function M.var_visible(sh, name)
+	local b = sh.vars[sh:deref(name)]
+	return b ~= nil and (b.arr ~= nil or b.s ~= nil or b.n ~= nil) and not (b.empty_decl and b.arr and next(b.arr) == nil)
+end
+-- ${#a[SUB]} of a visible array (subst.c array_length_reference): a negative index before
+-- the start, or an empty associative key, is err_badarraysub on the subscript text and
+-- its `]` — an expansion error that abandons the line
+function M.len_badsub(sh, name, sub, key)
+	if not M.var_visible(sh, name) then
+		return
+	end
+	local b = sh.vars[sh:deref(name)]
+	if (key == "" and b.assoc) or M.neg_oob(sh, name, key) then
+		io.stderr:write("curse: " .. sub .. "]: bad array subscript\n")
+		error({ __curse_exit = 1, __curse_lineabort = true })
+	end
+end
+-- (`raw`: KEY is already an element's own key — an auto index that wrapped past INT64_MAX
+-- is not a count back from the end)
+function Shell:array_set(name, key, val, append, raw)
 	if val:find("\0", 1, true) then
 		val = M.cstr(val)
 	end -- C-string element: cut at NUL
@@ -6821,7 +6903,9 @@ function Shell:array_set(name, key, val, append)
 		b.s = nil
 		b.n = nil
 	end
-	key = norm_key(b, key)
+	if not raw then
+		key = norm_key(b, key)
+	end
 	if type(key) == "number" and key < 0 then
 		return false
 	end -- out-of-range negative: bash errors
@@ -6843,7 +6927,7 @@ function Shell:array_set(name, key, val, append)
 	if not b.assoc then
 		M.arr_max_note(b.arr, key)
 	end
-	return true
+	return key -- (the element's key: a negative index resolved)
 end
 -- FUNCNAME is a virtual array: the call stack innermost-first, then "main"
 -- (empty at the top level). funcstack[1] is the innermost function.
@@ -9398,6 +9482,59 @@ function M.empty_key_src(sh, it)
 	end
 	return "[" .. (it.rawkey or it.key) .. "]" .. (it.op or "=") .. (it.src or it.val)
 end
+-- A compound-literal word as bash reports it: the raw text, with a `$'…'` already
+-- translated to '…' by the parser; a declaration builtin single-quotes it
+function M.compound_word_src(sh, it)
+	local s = it.src or it.val
+	if s:find("$'", 1, true) then
+		local out, i, n, dq = {}, 1, #s, false
+		while i <= n do
+			local c = s:sub(i, i)
+			if c == "\\" then
+				out[#out + 1] = s:sub(i, i + 1)
+				i = i + 2
+			elseif c == '"' then
+				dq = not dq
+				out[#out + 1] = c
+				i = i + 1
+			elseif not dq and c == "'" then
+				local e = s:find("'", i + 1, true) or n
+				out[#out + 1] = s:sub(i, e)
+				i = e + 1
+			elseif not dq and c == "$" and s:sub(i + 1, i + 1) == "'" then
+				local j = i + 2
+				while j <= n and s:sub(j, j) ~= "'" do
+					j = j + (s:sub(j, j) == "\\" and 2 or 1)
+				end
+				out[#out + 1] = "'" .. M.ansi_unescape(s:sub(i + 2, j - 1), true):gsub("\1", "") .. "'"
+				i = j + 1
+			else
+				out[#out + 1] = c
+				i = i + 1
+			end
+		end
+		s = table.concat(out)
+	end
+	if sh.arrayargs_pending or it.decl then
+		return "'" .. s:gsub("'", "'\\''") .. "'"
+	end
+	return s
+end
+-- An associative key/value-pair literal (`A=(k1 v1 k2 v2)`, bash's assign_assoc_from_kvlist):
+-- an empty key is reported (as written; by a declaration builtin, requoted: '') and skipped
+function M.assoc_kvpairs(sh, name, items)
+	for k = 1, #items, 2 do
+		local it, v = items[k], items[k + 1]
+		-- (a compiled literal's `[k]=v` word, rebuilt as the one plain word it is here)
+		local key = it.key and ("[" .. it.key .. "]" .. it.op .. it.val) or it.val
+		if key == "" then
+			io.stderr:write("curse: " .. ((sh.arrayargs_pending or it.decl) and "''" or M.compound_word_src(sh, it))
+				.. ": bad array subscript\n")
+		else
+			sh:array_set(name, key, v and (v.key and ("[" .. v.key .. "]" .. v.op .. v.val) or v.val) or "", false)
+		end
+	end
+end
 function M.array_convert_err(sh, name, isassoc, cmd)
 	if isassoc == nil then -- (neither -a nor -A: the literal takes the array's own kind)
 		return false
@@ -9444,13 +9581,9 @@ arrayassign_body = function(sh, name, items, append)
 		return
 	end
 	local isassoc = sh:is_assoc(name)
-	local anykeyed = false
-	for _, it in ipairs(items) do
-		if it.key ~= nil then
-			anykeyed = true
-			break
-		end
-	end
+	-- (bash's kvpair_assignment_p: the FIRST word decides)
+	local kv = isassoc and items[1] and items[1].key == nil
+		and (sh.arrayargs_pending or items[1].decl or (items[1].src or items[1].val):byte(1) ~= 91)
 	local function keyof(kt)
 		-- (an indexed subscript loses bash's CTLESC bytes, e.g. from a $'\001' in it)
 		return isassoc and kt or M.to_arr_key(M.arith_str(sh, (kt:gsub("\1", ""))))
@@ -9463,6 +9596,9 @@ arrayassign_body = function(sh, name, items, append)
 			auto = (k or auto) + 1
 		end
 		return
+	end
+	if append and rb then
+		rb.empty_decl = nil -- (`a+=()` counts as an assignment: shows =())
 	end
 	local snap
 	if not append then -- plain assignment resets the array (keeps assoc-ness)
@@ -9483,10 +9619,11 @@ arrayassign_body = function(sh, name, items, append)
 		end
 	end
 	if isassoc then
-		if anykeyed then -- keyed elements assigned; a bare one is an error (reported, skipped)
+		if not kv then -- keyed elements assigned; a bare one is an error (reported, skipped)
 			for _, it in ipairs(items) do
 				if it.key == nil then
-					io.stderr:write("curse: " .. name .. ": " .. it.val .. ": must use subscript when assigning associative array\n")
+					io.stderr:write("curse: " .. name .. ": " .. M.compound_word_src(sh, it)
+						.. ": must use subscript when assigning associative array\n")
 				else
 					local idx = keyof(it.key)
 					if idx == "" then -- (an empty key: reported and skipped, like interp's)
@@ -9498,29 +9635,11 @@ arrayassign_body = function(sh, name, items, append)
 					end
 				end
 			end
-		else -- all-bare assoc literal: alternating key value pairs
-			for k = 1, #items, 2 do
-				if items[k].val == "" then -- (an empty key: bash reports it and skips the pair)
-					io.stderr:write('curse: "": bad array subscript\n')
-				else
-					sh:array_set(name, items[k].val, items[k + 1] and items[k + 1].val or "", false)
-				end
-			end
+		else -- key/value pairs: alternating key value words
+			M.assoc_kvpairs(sh, name, items)
 		end
 	else
-		local auto = 0
-		if append then
-			local mx, b = -1, sh.vars[name]
-			if b and b.s ~= nil and not b.arr then
-				b.arr = { [0] = b.s }
-				b.s = nil
-				b.n = nil
-			end -- scalar -> [0]
-			if b and b.arr then
-				mx = tonumber(arr_max(b.arr)) -- (cached: see arr_max)
-			end
-			auto = mx + 1
-		end
+		local auto = append and M.arr_next(sh, name) or 0
 		for _, it in ipairs(items) do
 			if it.key ~= nil then
 				-- a bad element is reported (as written) and skipped (interp's do_arrayassign)
@@ -9530,16 +9649,16 @@ arrayassign_body = function(sh, name, items, append)
 				elseif it.key == "*" or it.key == "@" then
 					io.stderr:write("curse: " .. src .. ": cannot assign to non-numeric index\n")
 				else
-					local idx = keyof(it.key)
-					if sh:array_set(name, idx, it.val, it.op == "+=") then
-						auto = idx + 1 -- indexed += appends to CURRENT
+					local k = sh:array_set(name, keyof(it.key), it.val, it.op == "+=")
+					if k then
+						auto = M.key_next(k) -- (indexed += appends to CURRENT)
 					else
 						io.stderr:write("curse: " .. src .. ": bad array subscript\n")
 					end
 				end
 			else
-				sh:array_set(name, auto, it.val, false)
-				auto = auto + 1
+				sh:array_set(name, auto, it.val, false, true)
+				auto = M.key_next(auto)
 			end
 		end
 	end
@@ -9560,7 +9679,7 @@ end
 -- a negative subscript past the start: `NAME[SUB]: bad array subscript`, the line aborted —
 -- reported before readonly-ness, since bash evaluates the subscript first
 local function neg_oob_abort(sh, name, key, sub)
-	if type(key) == "number" and key < 0 and M.neg_oob(sh, name, key) then
+	if M.neg_oob(sh, name, key) then
 		io.stderr:write("curse: " .. name .. "[" .. sub .. "]: bad array subscript\n")
 		sh.status = 1
 		error({ __curse_exit = 1, __curse_lineabort = true })
@@ -9603,6 +9722,9 @@ function M.assign_element(sh, name, raw, expanded, value, append)
 			return M.to_arr_key(M.arith_str(sh, raw))
 		end)
 		if not ok then
+			if type(v) == "table" and v.__curse_unbound then
+				error(v, 0) -- (set -u: said already, and fatal as it is)
+			end
 			if not (type(v) == "table" and v.__curse_matherr) then -- (arith_str reported it)
 				io.stderr:write("curse: " .. require("parser").arith_errmsg(raw, v) .. "\n")
 			end
@@ -9642,15 +9764,16 @@ end
 -- (from lifted locals, so a loop variable is CURRENT — arith_str(sh, raw) would read the stale
 -- sh.vars copy). `keyi` is the int64 arith value; only reached for a non-assoc array (the emitter
 -- gates on is_assoc). Bug fixed: `a[i]=…` in a `for ((;;))` loop with a lifted `i`.
-function M.assign_element_i(sh, name, keyi, value, append)
+-- (`raw`: the subscript as written, which a bad-subscript report names)
+function M.assign_element_i(sh, name, keyi, value, append, raw)
 	if keyi < 0 then
-		neg_oob_abort(sh, name, to_arr_key(keyi), M.i64_to_str(keyi))
+		neg_oob_abort(sh, name, to_arr_key(keyi), raw or M.i64_to_str(keyi))
 	end
 	if elem_readonly_abort(sh, name) then
 		return
 	end
 	if not sh:array_set(name, to_arr_key(keyi), value, append) then
-		neg_oob_abort(sh, name, to_arr_key(keyi), M.i64_to_str(keyi))
+		neg_oob_abort(sh, name, to_arr_key(keyi), raw or M.i64_to_str(keyi))
 		sh.status = 1
 		sh.assign_err = true
 		return
@@ -9683,6 +9806,9 @@ function M.assign_element_x(sh, name, src, value, append)
 			ok, v = pcall(M.arith_str, sh, src)
 		end
 		if not ok then
+			if type(v) == "table" and v.__curse_unbound then
+				error(v, 0) -- (set -u: said already, and fatal as it is)
+			end
 			if not (type(v) == "table" and v.__curse_matherr) then -- (arith_str reported it)
 				io.stderr:write("curse: " .. require("parser").arith_errmsg(src, v) .. "\n")
 			end
@@ -9826,9 +9952,7 @@ end
 -- the interpreter uses, so the value matches exactly.
 function M.array_elem(sh, name, raw, expanded)
 	local key = M.array_key(sh, name, raw, expanded)
-	if type(key) == "number" and key < 0 then
-		M.elem_read_check(sh, name, key)
-	end
+	M.elem_read_check(sh, name, key)
 	return sh:expand_param({ name = name, index = raw }, nil, nil, key)
 end
 
@@ -9836,19 +9960,14 @@ end
 -- "bad array subscript" (the read then goes on), as interp's expand_pexp does.
 function M.array_key_rc(sh, name, raw, expanded)
 	local key = M.array_key(sh, name, raw, expanded)
-	if type(key) == "number" and key < 0 then
-		M.elem_read_check(sh, name, key)
-	end
+	M.elem_read_check(sh, name, key)
 	return key
 end
 -- ${#a[i]} / ${#a[@]} in compiled code: under set -u only a variable that doesn't exist
 -- at all is unbound (named bare, as array_length_reference does); an unset element of an
 -- existing array is length 0 — expand_param's exact rule.
 function M.elem_len(sh, name, raw, expanded)
-	if sh.opt_u then
-		return sh:expand_param({ name = name, index = raw, op = "len" }, nil, nil, M.array_key(sh, name, raw, expanded))
-	end
-	return tostring(M.mb_strlen(M.array_elem(sh, name, raw, expanded)))
+	return sh:expand_param({ name = name, index = raw, op = "len" }, nil, nil, M.array_key(sh, name, raw, expanded))
 end
 -- Read an array/assoc ELEMENT in ARITHMETIC context (`$(( a[i] ))`), exactly interp's arith
 -- var-with-idx path (interp.lua ~448): a set -u check on the BASE var (arith_nounset — FATAL
@@ -10058,9 +10177,10 @@ function Shell:expand_param(pe, arg, arg2, idxnum)
 		and op ~= ":?"
 		and op ~= "?"
 		and self:special_get(name) == ""
-		-- ${#a[3]} of an unset element of an existing array is just 0; with no such
-		-- variable at all set -u names the bare array (array_length_reference)
-		and not (op == "len" and index and self.vars[self:deref(name)] ~= nil)
+		-- ${#a[3]} of an unset element of a visible array is just 0; with no such
+		-- variable (or an invisible one: `declare -A h`) set -u names the bare array
+		-- (array_length_reference)
+		and not (op == "len" and index and M.var_visible(self, name))
 	then
 		local lbl = pe.uname or (op == "len" and name) or M.pe_label(pe)
 		io.stderr:write("curse: " .. lbl .. ": unbound variable\n")
@@ -10086,6 +10206,9 @@ function Shell:expand_param(pe, arg, arg2, idxnum)
 		return M.assign_default(self, name, v)
 	end
 	if op == "len" then
+		if index then
+			M.len_badsub(self, name, index, idxnum or 0)
+		end
 		return tostring(M.mb_strlen(val))
 	end -- ${#v}: codepoints in the locale
 	if op == ":-" then
@@ -11557,17 +11680,9 @@ function M.var_is_set(sh, nm, expanded)
 		else
 			key = M.to_arr_key(M.arith_str(sh, sub))
 		end
-		if type(key) == "number" and key < 0 and b and b.arr then -- negative: from the end
-			local max = -1
-			for k in pairs(b.arr) do
-				if type(k) == "number" and k > max then
-					max = k
-				end
-			end
-			key = max + 1 + key
-			if key < 0 then
-				return false
-			end
+		if M.neg_oob(sh, base, key) then -- (negative counts from the end; before the start: bash's
+			io.stderr:write("curse: " .. base .. ": bad array subscript\n") -- get_array_value error)
+			return false
 		end
 		return sh:is_elem_set(base, key)
 	end

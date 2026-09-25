@@ -77,7 +77,7 @@ return function(sh, cmd, args, hook, tcb)
 					sh.status = 1
 				else
 					local key = array_key(sh, nm, sub)
-					if type(key) == "number" and key < 0 and rt.neg_oob(sh, nm, key) then
+					if rt.neg_oob(sh, nm, key) then
 						-- (a negative subscript past the start: nothing is bound)
 						io.stderr:write("curse: " .. target .. ": bad array subscript\n")
 						sh.status = 1

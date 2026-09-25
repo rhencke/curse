@@ -67,7 +67,11 @@ return function(sh, cmd, args, hook, tcb)
 		end
 		for j = first, #args do
 			local a = args[j]
-			local isvar = rt.split_array_ref(a, sh) or a:find("^[%a_][%w_]*%[.+%]$")
+			-- (bash's tokenize_array_reference: the subscript's `]` must end the word — a quoted
+			-- "U[a]b]" is no variable, so without -v it names a function — except that an
+			-- unquoted `A[…]` word's associative subscript runs to its final `]` (W_ARRAYREF))
+			local isvar = rt.split_array_ref(a, sh) or (sh.arrayref_args and sh.arrayref_args[a]
+				and a:find("^[%a_][%w_]*%[.+%]$") and sh:is_assoc(a:match("^[%a_][%w_]*")))
 			if fmode or (not vmode and not isvar) then
 				-- -f, or a name that can't be a variable: a function name
 				unset_fn(a)

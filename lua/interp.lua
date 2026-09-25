@@ -1437,10 +1437,13 @@ array_key = function(sh, name, index_raw)
 		return rt.to_arr_key(eval(sh, P.arith(index_raw)))
 	end)
 	if not ok then
+		P.arith_cmd = sv
+		if type(v) == "table" and v.__curse_unbound then
+			error(v, 0) -- (set -u: said already, and fatal as it is — no syntax error on top)
+		end
 		if not (type(v) == "table" and v.__curse_matherr) then -- (an eval error already said so)
 			io.stderr:write("curse: " .. P.arith_errmsg(index_raw, v) .. "\n")
 		end
-		P.arith_cmd = sv
 		-- an expansion error discards the rest of the top-level line (bash jump_to_top_level
 		-- after top_level_cleanup: out of every function/eval/source level — rt.int_value)
 		error({ __curse_exit = 1, __curse_lineabort = true, __curse_discard = true })
@@ -1577,7 +1580,7 @@ local function expand_pexp(sh, p, assign)
 	local subkey
 	if pe.index and pe.index ~= "@" and pe.index ~= "*" then
 		subkey = array_key(sh, pe.name, pe.index)
-		if type(subkey) == "number" and subkey < 0 and pe.op ~= "len" then
+		if pe.op ~= "len" then
 			rt.elem_read_check(sh, pe.name, subkey)
 		end
 	end
@@ -2017,7 +2020,8 @@ local function valueless_part(sh, pe)
 	end
 	return part
 end
-indirect_part = function(sh, pe)
+-- (`quiet`: only probing the shape — is_multi — so a bad subscript isn't reported twice)
+indirect_part = function(sh, pe, quiet)
 	local tname
 	if pe.index == "@" or pe.index == "*" then
 		-- ${!name[@]OP}: the reference name is ${name[@]} space-joined (a single
@@ -2025,6 +2029,9 @@ indirect_part = function(sh, pe)
 		tname = table.concat(sh:array_values(pe.name), " ")
 	elseif pe.index then
 		local key = array_key(sh, pe.name, pe.index)
+		if not quiet then
+			rt.elem_read_check(sh, pe.name, key) -- (`${!b[-9]}`: b: bad array subscript)
+		end
 		tname = sh:array_get(pe.name, key)
 		if tname == "" and not sh:is_elem_set(pe.name, key) then
 			tname = nil -- (an unset element: no value, unlike a set empty one)
@@ -2151,7 +2158,7 @@ is_multi = function(sh, p)
 		return true
 	end -- ${!pfx@} / ${!pfx*}
 	if p.pexp.op == "indirect" then
-		local ip = indirect_part(sh, p.pexp)
+		local ip = indirect_part(sh, p.pexp, true)
 		return ip ~= nil and is_multi(sh, ip)
 	end
 	-- $@/$* live in pexp.name (e.g. ${@:1}); array [@]/[*] live in pexp.index
@@ -3568,21 +3575,45 @@ end
 -- `NAME=(…)` is expanded BEFORE the builtin runs (bash: `local -a arr=("${arr[@]}")`
 -- copies the OUTER arr), so exec_stmt pre-computes them into sh.arrayargs_pre[st].
 local function arrayassign_items(sh, st, isassoc)
-	local items = {}
-	for _, e in ipairs(st.elems) do
+	local items, elems = {}, st.elems
+	local e1 = elems[1]
+	-- bash's kvpair_assignment_p: an associative literal whose FIRST word is not a
+	-- `[k]=v` is a key/value list — every word (even a later `[k]=v`) is one plain word
+	-- (a declaration builtin has requoted a bare `[k]` word, so only a real `[k]=v` counts)
+	if isassoc and e1 and e1.key == nil and (sh.arrayargs_pending or not e1.word.src:find("^%[")) then
+		for _, e in ipairs(elems) do
+			local w = e.word
+			if e.key ~= nil then
+				w = P.parse_word("[" .. e.key .. "]" .. e.op .. w.src)
+			end
+			items[#items + 1] = { key = nil, op = "=", val = expand_assign_word(sh, w), src = w.src }
+		end
+		items.kv = true
+		return items
+	end
+	for _, e in ipairs(elems) do
 		if e.key ~= nil and not (e.brace_bare and not isassoc) then
 			-- keyed: an associative array (always keyed), or an indexed key with no brace.
-			items[#items + 1] = { key = e.key, op = e.op, val = expand_assign_word(sh, e.word), src = e.word.src }
+			-- Each word expands in order, its subscript then its value (arrayfunc.c): an
+			-- assoc key is the expanded text; an indexed subscript's expansions run now,
+			-- its arithmetic later (against the array being built — the item's xkey).
+			local xkey
+			if isassoc then
+				xkey = expand_word(sh, P.parse_word(e.key))
+			elseif e.key:find("[%$`]") then
+				xkey = expand_word(sh, P.parse_word(e.key))
+			end
+			items[#items + 1] = { key = e.key, xkey = xkey, op = e.op, val = expand_assign_word(sh, e.word), src = e.word.src }
+		elseif isassoc then
+			-- a bare word in a keyed assoc literal: an error, reported as written and never
+			-- expanded (bash's assign_compound_array_list)
+			items[#items + 1] = { key = nil, op = "=", src = e.word.src }
 		else
 			-- bare: a genuine bare element, OR an indexed keyed element whose value
 			-- brace-expands (bash de-keys it — `[k]=` becomes literal in each bare word).
 			for _, bw in ipairs(e.brace_bare or { e.word }) do
-				if isassoc then -- (an assoc's key/value words: no splitting or globbing — bash)
-					items[#items + 1] = { key = nil, op = "=", val = expand_assign_word(sh, bw) }
-				else
-					for _, f in ipairs(expand_to_fields(sh, bw)) do
-						items[#items + 1] = { key = nil, op = "=", val = f }
-					end
+				for _, f in ipairs(expand_to_fields(sh, bw)) do
+					items[#items + 1] = { key = nil, op = "=", val = f }
 				end
 			end
 		end
@@ -3629,13 +3660,6 @@ local function do_arrayassign(sh, st)
 	-- through a nameref (`local -n r=arr; r+=(x)`) the literal lands in the referenced array
 	local name = sh:deref(st.name)
 	local isassoc = sh:is_assoc(name)
-	local anykeyed = false
-	for _, e in ipairs(st.elems) do
-		if e.key ~= nil then
-			anykeyed = true
-			break
-		end
-	end
 	local items = sh.arrayargs_pre and sh.arrayargs_pre[st] or arrayassign_items(sh, st, isassoc)
 	if name == "DIRSTACK" and rt.dirstack_dyn(sh) then -- (the dynamic array: each element
 		local auto = st.append and #(sh.dirstack or {}) + 1 or 0 -- through its assign_func)
@@ -3673,12 +3697,13 @@ local function do_arrayassign(sh, st)
 		end
 	end
 	if isassoc then
-		if anykeyed then -- keyed elements assigned; a bare one is an error (reported, skipped)
+		if not items.kv then -- keyed elements assigned; a bare one is an error (reported, skipped)
 			for _, it in ipairs(items) do
 				if it.key == nil then
-					io.stderr:write("curse: " .. name .. ": " .. it.val .. ": must use subscript when assigning associative array\n")
+					io.stderr:write("curse: " .. name .. ": " .. rt.compound_word_src(sh, it)
+						.. ": must use subscript when assigning associative array\n")
 				else
-					local idx = array_key(sh, name, it.key)
+					local idx = it.xkey or array_key(sh, name, it.key)
 					if idx == "" then -- (an empty key: reported as written — by declare, requoted —
 						-- and skipped; the rest still land)
 						io.stderr:write("curse: " .. rt.empty_key_src(sh, it) .. ": bad array subscript\n")
@@ -3689,54 +3714,34 @@ local function do_arrayassign(sh, st)
 					end
 				end
 			end
-		else -- all-bare assoc: alternating key value pairs
-			for k = 1, #items, 2 do
-				if items[k].val == "" then -- (an empty key: bash reports it and skips the pair)
-					io.stderr:write('curse: "": bad array subscript\n')
-				else
-					sh:array_set(name, items[k].val, items[k + 1] and items[k + 1].val or "", false)
-				end
-			end
+		else -- key/value pairs (kvpair_assignment_p): alternating key value words
+			rt.assoc_kvpairs(sh, name, items)
 		end
 	else
-		local auto = 0
-		if st.append then
-			local mx, b = -1, sh.vars[name]
-			if b and b.s ~= nil and not b.arr then
-				b.arr = { [0] = b.s }
-				b.s = nil
-				b.n = nil
-			end -- scalar -> [0]
-			if b and b.arr then
-				for kk in pairs(b.arr) do
-					if kk > mx then
-						mx = kk
-					end
-				end
-			end
-			auto = mx + 1
-		end
+		local auto = st.append and rt.arr_next(sh, name) or 0
 		for _, it in ipairs(items) do
 			if it.key ~= nil then
 				-- a bad element is reported (as written) and skipped; the rest still land
-				local src = "[" .. it.key .. "]" .. (it.op or "=") .. it.val
-				if it.key:match("^%s*$") then
+				local key = it.xkey or it.key
+				local src = "[" .. key .. "]" .. (it.op or "=") .. it.val
+				if key:match("^%s*$") then
 					io.stderr:write("curse: " .. src .. ": bad array subscript\n")
-				elseif it.key == "*" or it.key == "@" then
+				elseif key == "*" or key == "@" then
 					io.stderr:write("curse: " .. src .. ": cannot assign to non-numeric index\n")
 				else
-					local idx = array_key(sh, name, literal_sub(it.key))
+					local idx = array_key(sh, name, it.xkey or literal_sub(key))
 					-- (indexed += appends to CURRENT, unlike assoc; a negative index past the
-					-- start fails)
-					if sh:array_set(name, idx, it.val, it.op == "+=") then
-						auto = idx + 1
+					-- start fails and leaves the running index alone)
+					local k = sh:array_set(name, idx, it.val, it.op == "+=")
+					if k then
+						auto = rt.key_next(k)
 					else
 						io.stderr:write("curse: " .. src .. ": bad array subscript\n")
 					end
 				end
 			else
-				sh:array_set(name, auto, it.val, false)
-				auto = auto + 1
+				sh:array_set(name, auto, it.val, false, true)
+				auto = rt.key_next(auto)
 			end
 		end
 	end
@@ -3784,7 +3789,8 @@ end
 local function decl_quote(s)
 	-- a control char or high byte forces $'…' (bash: `declare -- x=$'a\nb'`);
 	-- otherwise the usual double-quoted form.
-	if s:find("[%z\1-\31\127-\255]") then
+	-- (a printable multibyte character stays double-quoted: bash's ansic_shouldquote)
+	if s:find("[%z\1-\31\127-\255]") and rt.ansic_shouldquote(s) then
 		return rt.shell_quote(s)
 	end
 	s = s:gsub("\\", "\\\\"):gsub('"', '\\"'):gsub("%$", "\\$"):gsub("`", "\\`")
@@ -3796,9 +3802,10 @@ local function decl_elems(sh, name, fmt)
 	local assoc, parts = sh:is_assoc(name), {}
 	for _, k in ipairs(sh:array_indices(name)) do
 		local ks = tostring(k)
-		-- an assoc key with shell metacharacters (or control chars) is quoted like a value
-		-- (and a key that is just `@` or `*`: bash's ALL_ELEMENT_SUB check)
-		if assoc and (ks == "" or ks == "@" or ks == "*" or ks:find("[^%w_%%+,./:@=%-]")) then
+		-- an assoc key with shell metacharacters (or a non-printable char) is quoted like a
+		-- value (and a key that is just `@` or `*`: bash's ALL_ELEMENT_SUB check) — assoc.c
+		if assoc and (ks == "" or ks == "@" or ks == "*" or (ks:find("[^%w_%%+,./:@=%-]")
+			and (rt.shell_metas(ks) or rt.ansic_shouldquote(ks)))) then
 			ks = decl_quote(ks)
 		end
 		parts[#parts + 1] = fmt:format(ks, decl_quote(sh:array_get(name, k)))
@@ -5591,6 +5598,12 @@ local function expand_args(sh, st, args, is_assign)
 				and p1.lit:match("^[%a_][%w_]*%[") then
 				rt.mark_arrayref(sh, fs[1])
 			end
+		end
+		-- (unset's W_ARRAYREF: an unquoted `NAME[…]` word — `unset A[$k]` / `unset A[\]]` —
+		-- names an associative element up to its final `]`; see b_unset)
+		if unset_cmd and wi > 1 and p1 and p1.lit and not p1.q and p1.lit:match("^[%a_][%w_]*%[")
+			and w.src and w.src:sub(-1) == "]" then
+			rt.mark_arrayref(sh, args[#args])
 		end
 	end
 end

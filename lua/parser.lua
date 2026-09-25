@@ -3202,7 +3202,7 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs)
 			if src:sub(q, q + 2) == "<<<" then -- herestring: [N]<<< word
 				i = q + 3
 				ws()
-				return { op = "herestring", fd = fd and tonumber(fd) or 0, word = word(), fdvar = fdvar } -- raw word (expanded at runtime)
+				return { op = "herestring", fd = fd and tonumber(fd) or 0, word = word(true), fdvar = fdvar } -- raw word (expanded at runtime)
 			end
 			if src:sub(q, q + 1) == "<<" then -- heredoc: [N]<<[-] DELIM  (body collected after the line)
 				local strip = false
