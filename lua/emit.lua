@@ -6112,8 +6112,9 @@ H.background = function(cx, st, after)
 			end
 		end
 	end
-	local fork = ("sh:run_background(__CS[%d], %q, %s, %s, %s)"):format(id, cmdstr, ext and "true" or "false",
-		st.cmd.t == "subshell" and "true" or "false", st.cmd.t == "simple" and "true" or "false")
+	local fork = ("sh:run_background(__CS[%d], %q, %s, %s, %s%s)"):format(id, cmdstr, ext and "true" or "false",
+		st.cmd.t == "subshell" and "true" or "false", st.cmd.t == "simple" and "true" or "false",
+		st.cmd.t == "pipeline" and ", true" or "")
 	local body = fork
 	if spawn then
 		body = ("do local __ok, __a = pcall(function() %s; return __a end); if not (__ok and sh:spawn_bg(__a, %q)) then %s end end"):format(
