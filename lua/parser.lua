@@ -5245,6 +5245,7 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs, xg)
 				-- stray keyword) is left to the existing statement-boundary handling.
 				if c == ";" and src:sub(i + 1, i + 1) ~= ";" then
 					i = i + 1
+					st.semi = true -- (`a;⏎b` joins with `;`, not a newline: deparse's comsubs)
 					skip_inline()
 				elseif i > n or c == "\n" or c == "#" then
 					break

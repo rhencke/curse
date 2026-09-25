@@ -1848,14 +1848,24 @@ M.expand_assign_word = expand_assign_word
 -- QUOTED part (so they match literally) while leaving unquoted parts — including
 -- unquoted $var expansions — active. Matches bash's rule that quoting, not the
 -- value, decides literalness. Shared by glob-pattern and =~-regex expansion.
-local function expand_escaped(sh, w, charclass)
-	local buf = {}
+-- `xt` (a table; set -x of a [[ ]] pattern): xt[1] gets the text bash traces, EVERY quoted
+-- character backslashed (quote_string_for_globbing), from the same single expansion.
+local function expand_escaped(sh, w, charclass, xt)
+	local buf, xb = {}, xt and {}
 	for _, p in ipairs(w.parts) do
 		local s = expand_part_str(sh, p)
 		if p.q then
+			if xb then
+				xb[#xb + 1] = s:gsub("[%z\1-\127\194-\244][\128-\191]*", "\\%0")
+			end
 			s = s:gsub(charclass, "\\%0")
+		elseif xb then
+			xb[#xb + 1] = s
 		end
 		buf[#buf + 1] = s
+	end
+	if xb then
+		xt[1] = table.concat(xb)
 	end
 	return table.concat(buf)
 end
@@ -1885,7 +1895,10 @@ expand_repl = function(sh, w)
 end
 -- glob PATTERN context (${v/pat/repl}, case, [[ == ]]): glob metacharacters.
 local PAT_META = "[%*%?%[%]\\%(%)%|%+%@%!%-%^]"
-expand_pattern = function(sh, w)
+expand_pattern = function(sh, w, xt)
+	if xt == true then
+		xt = nil -- (a caller sharing expand_word's signature passes its `true` flag)
+	end
 	-- a word-initial `~` tilde-expands (bash: `case ~ in ~)`), and the directory it
 	-- yields matches literally
 	local p1 = w.parts[1]
@@ -1893,13 +1906,16 @@ expand_pattern = function(sh, w)
 		local s = expand_part_str(sh, p1)
 		local t = tilde_word_initial(sh, s, #w.parts > 1, true)
 		if t ~= s then
-			local rest = expand_escaped(sh, { parts = { unpack(w.parts, 2) } }, PAT_META)
+			local rest = expand_escaped(sh, { parts = { unpack(w.parts, 2) } }, PAT_META, xt)
 			local tail = s:match("^~[^/]*(.*)$") or ""
-			local dir = t:sub(1, #t - #tail)
-			return dir:gsub(PAT_META, "\\%0") .. tail .. rest
+			local dir = t:sub(1, #t - #tail):gsub(PAT_META, "\\%0")
+			if xt then -- (the expanded directory reads as quoted)
+				xt[1] = rt.xglob_quote(t:sub(1, #t - #tail)) .. tail .. xt[1]
+			end
+			return dir .. tail .. rest
 		end
 	end
-	return expand_escaped(sh, w, PAT_META)
+	return expand_escaped(sh, w, PAT_META, xt)
 end
 -- A case-clause pattern: bash expands it as ONE word (execute_case_command:
 -- expand_word_leave_quoted, then es->word->word), so a quoted "$@"/"${a[@]}" contributes
@@ -5238,10 +5254,15 @@ local function dbracket_word(sh, w)
 	end
 	return s
 end
-local function dbracket_pattern(sh, w)
-	local p = expand_pattern(sh, w)
+local function dbracket_pattern(sh, w, xt)
+	local p = expand_pattern(sh, w, xt)
 	if word_initial_tilde(w) and p:sub(1, 1) == "~" then
-		return tilde_prefix(sh, p)
+		local p2 = tilde_prefix(sh, p)
+		if xt and p2 ~= p then -- (the expanded directory reads as quoted)
+			local nt = #(p:match("^~[^/:]*"))
+			xt[1] = rt.xglob_quote(p2:sub(1, #p2 - (#p - nt))) .. xt[1]:sub(nt + 1)
+		end
+		p = p2
 	end
 	return p
 end
@@ -5295,26 +5316,26 @@ local function eval_dbracket(sh, node)
 	if k == "str" then
 		local v = dbracket_word(sh, node.word)
 		if sh.opt_x then
-			dbracket_trace(sh, "-n " .. v)
+			dbracket_trace(sh, "-n " .. (v == "" and "''" or v))
 		end
 		return v ~= ""
 	end
 	if k == "unary" and node.op == "-v" then
 		local v = expand_word(sh, node.word)
 		if sh.opt_x then
-			dbracket_trace(sh, "-v " .. v)
+			dbracket_trace(sh, "-v " .. (v == "" and "''" or v))
 		end
 		return var_is_set(sh, v, true)
 	end
 	if k == "unary" then
 		local v = dbracket_word(sh, node.word)
 		if sh.opt_x then
-			dbracket_trace(sh, node.op .. " " .. v)
+			dbracket_trace(sh, node.op .. " " .. (v == "" and "''" or v))
 		end
 		return unary(sh, node.op, v)
 	end
 	if k == "binary" then
-		local l, r, op, textual, rtextual
+		local l, r, op, textual, rtextual, pat, xr
 		op = node.op
 		if DB_ARITH_OP[op] and node.l.src and node.r.src then
 			-- bash 5.2 expands an arithmetic operator's operands like $((…)): no process
@@ -5323,24 +5344,37 @@ local function eval_dbracket(sh, node)
 			textual, rtextual = not node.l.src:find("['\"\\]"), not node.r.src:find("['\"\\]")
 			l = textual and arith_expand_text(sh, node.l.src) or dbracket_word(sh, node.l)
 			r = rtextual and arith_expand_text(sh, node.r.src) or dbracket_word(sh, node.r)
+		elseif op == "=~" then -- (each operand expanded ONCE; the trace shows the regex text)
+			l = dbracket_word(sh, node.l)
+			pat = M.regex_rhs(sh, node.r)
+			r = pat
+		elseif (op == "==" or op == "=" or op == "!=") and not (node.rq and not sh.shopt.nocasematch) then
+			l = dbracket_word(sh, node.l)
+			xr = sh.opt_x and {} or nil -- (traced as bash's globbing text: quoted chars backslashed)
+			pat = dbracket_pattern(sh, node.r, xr)
+			r = xr and xr[1] or pat
 		else
 			l, r = dbracket_word(sh, node.l), dbracket_word(sh, node.r)
+			if sh.opt_x and (op == "==" or op == "=" or op == "!=") then -- (a wholly quoted rhs)
+				xr = { (r:gsub("[%z\1-\127\194-\244][\128-\191]*", "\\%0")) }
+			end
 		end
-		if sh.opt_x then
-			dbracket_trace(sh, l .. " " .. op .. " " .. r)
+		if sh.opt_x then -- (an empty operand traces as '')
+			r = xr and xr[1] or r
+			dbracket_trace(sh, (l == "" and "''" or l) .. " " .. op .. " " .. (r == "" and "''" or r))
 		end
 		local ic = sh.shopt.nocasematch and true or nil -- shopt -s nocasematch: case-insensitive
 		if op == "==" or op == "=" then
 			if node.rq and not ic then
 				return l == r
 			else
-				return rt.glob_match(l, dbracket_pattern(sh, node.r), ic)
+				return rt.glob_match(l, pat, ic)
 			end
 		elseif op == "!=" then
 			if node.rq and not ic then
 				return l ~= r
 			else
-				return not rt.glob_match(l, dbracket_pattern(sh, node.r), ic)
+				return not rt.glob_match(l, pat, ic)
 			end
 		elseif op == "=~" then
 			-- a quoted part of the regex is matched literally (bash), so re-expand with
@@ -5348,7 +5382,7 @@ local function eval_dbracket(sh, node)
 			-- bash also tilde-expands a word-initial ~ on the =~ RHS and matches THAT
 			-- expansion literally (a tilde prefix isn't part of the regex): split off the
 			-- ~-token, expand it, and re-expand it as a quoted (regex-escaped) segment.
-			local caps, bad = rt.regex_captures(l, M.regex_rhs(sh, node.r), ic) -- real POSIX ERE + BASH_REMATCH
+			local caps, bad = rt.regex_captures(l, pat, ic) -- real POSIX ERE + BASH_REMATCH
 			if bad then
 				error({ __curse_regexerr = true })
 			end -- invalid regex -> [[ ]] status 2
@@ -5628,7 +5662,7 @@ local function head(sh, st, text)
 		local ws = {}
 		for _, w in ipairs(st.words or {}) do
 			if w.src then
-				ws[#ws + 1] = w.src
+				ws[#ws + 1] = rt.srcw(w.src)
 			end
 		end
 		return text .. " " .. st.name .. " in " .. table.concat(ws, " ")
@@ -5786,7 +5820,12 @@ exec_stmt = function(sh, st, hook)
 			if not (sh.in_trap and sh.in_trap > 0) then
 				sh.cur_cmd = st -- $BASH_COMMAND (a trap's own commands don't replace it)
 			end
+			if t == "case" and sh.opt_x and st.subject.src and sh.traps and sh.traps.DEBUG then
+				xtrace_line(sh, "case " .. rt.srcw(st.subject.src) .. " in") -- (before DEBUG: bash)
+				sh.xcase = st
+			end
 			if run_debug(sh, (sh.in_trap and sh.in_trap > 0 and (sh.calldepth or 0) == sh.trap_calldepth) and sh.cur_line or st.line) then
+				sh.xcase = nil
 				return -- extdebug: the DEBUG trap said skip it
 			end
 		end
@@ -6022,7 +6061,7 @@ exec_stmt = function(sh, st, hook)
 		sh:array_assign("PIPESTATUS", { tostring(sh.status) }, false) -- (PIPESTATUS: this null command's status)
 	elseif t == "arrayassign" then
 		if sh.opt_x and st.raw then -- (bash traces an array literal as written: `+ a=(1 "b c")`)
-			xtrace_line(sh, st.name .. (st.append and "+=" or "=") .. st.raw)
+			xtrace_line(sh, st.name .. (st.append and "+=" or "=") .. rt.srcw(st.raw))
 		end
 		local rb = sh.vars[sh:deref(st.name)]
 		local nb = sh.vars[st.name]
@@ -6544,9 +6583,18 @@ exec_stmt = function(sh, st, hook)
 	elseif t == "forc" then
 		-- DEBUG fires (at the `for` line) before the init, before EACH condition
 		-- evaluation, and before EACH step — bash's `[6][6][7]…` per-iteration pattern.
+		-- (a slot as bash stores it: leading blanks dropped, an empty one is `1` — make_cmd.c
+		-- make_arith_for_command; it still fires DEBUG and traces `+ (( 1 ))`)
+		local function stext(slot)
+			local s = (st.src and st.src[slot] or ""):match("^%s*(.-)$")
+			return s == "" and "1" or s
+		end
 		local function fdbg(slot)
+			if sh.opt_x and st.src then -- (traced before its DEBUG: eval_arith_for_expr)
+				arith_trace(sh, stext(slot)) -- (bash keeps a trailing blank)
+			end
 			if sh.traps and sh.traps.DEBUG then
-				head(sh, st, "((" .. (st.src and st.src[slot] or "") .. "))")
+				head(sh, st, "((" .. stext(slot) .. "))")
 			end
 			run_debug(sh, (sh.in_trap and sh.in_trap > 0 and (sh.calldepth or 0) == sh.trap_calldepth) and sh.cur_line or st.line)
 		end
@@ -6556,9 +6604,6 @@ exec_stmt = function(sh, st, hook)
 		local function ev(node, slot)
 			sh.cur_line = st.line -- $LINENO inside the for(( init/cond/step is the `for` line (bash),
 			-- not whatever line the body last ran (the cond re-evals per iteration)
-			if sh.opt_x and st.src then
-				arith_trace(sh, (st.src[slot]:match("^%s*(.-)$"))) -- (bash keeps a trailing blank)
-			end
 			if node.k == "arith_perr" then
 				local sv = P.arith_cmd
 				P.arith_cmd = "(("
@@ -6580,8 +6625,8 @@ exec_stmt = function(sh, st, hook)
 		local ld0 = sh.loopdepth or 0
 		sh.loopdepth = ld0 + 1
 		local cok, cerr = pcall(function()
+			fdbg(1)
 			if st.init then
-				fdbg(1)
 				ev(st.init, 1)
 			end
 			while true do
@@ -6596,8 +6641,8 @@ exec_stmt = function(sh, st, hook)
 				if PREEMPT[0] ~= 0 then
 					rt.preempt()
 				end
+				fdbg(2)
 				if st.cond then
-					fdbg(2)
 					if not truth(ev(st.cond, 2)) then
 						break
 					end
@@ -6607,8 +6652,8 @@ exec_stmt = function(sh, st, hook)
 				if act == "break" then
 					break
 				end
+				fdbg(3)
 				if st.step then
-					fdbg(3)
 					ev(st.step, 3)
 				end -- continue still runs the step
 			end
@@ -6778,8 +6823,10 @@ exec_stmt = function(sh, st, hook)
 			error(v)
 		end
 	elseif t == "case" then
-		if sh.opt_x and st.subject.src then
-			xtrace_line(sh, "case " .. st.subject.src .. " in") -- (as written: bash)
+		if sh.xcase == st then
+			sh.xcase = nil -- (already traced, ahead of its DEBUG trap)
+		elseif sh.opt_x and st.subject.src then
+			xtrace_line(sh, "case " .. rt.srcw(st.subject.src) .. " in") -- (as written: bash)
 		end
 		local subj = expand_word(sh, st.subject)
 		local fall = false -- carrying a `;&` fall-through into the next clause
@@ -6967,13 +7014,13 @@ exec_stmt = function(sh, st, hook)
 			if fs.idx > #fs.list then
 				break
 			end
+			if sh.opt_x then -- the header as written, each iteration (bash; before DEBUG)
+				xtrace_line(sh, head(nil, st, "for"))
+			end
 			if sh.traps and sh.traps.DEBUG then
 				head(sh, st, head(nil, st, "for"))
 			end
 			run_debug(sh, st.line) -- DEBUG fires at the `for` header before each iteration
-			if sh.opt_x then -- the header as written, each iteration (bash)
-				xtrace_line(sh, head(nil, st, "for"))
-			end
 			if not rt.for_assign(sh, st.name, fs.list[fs.idx]) then
 				bodystatus = 1
 				break
@@ -7027,12 +7074,12 @@ exec_stmt = function(sh, st, hook)
 		end
 		local bodystatus = 0
 		sh.loopdepth = (sh.loopdepth or 0) + 1
+		if sh.opt_x then -- (traced before the DEBUG trap runs: execute_select_command)
+			xtrace_line(sh, head(nil, st, "select"))
+		end
 		if sh.traps and sh.traps.DEBUG then -- (once, before the menu: execute_select_command)
 			head(sh, st, head(nil, st, "select"))
 			run_debug(sh, (sh.in_trap and sh.in_trap > 0 and (sh.calldepth or 0) == sh.trap_calldepth) and sh.cur_line or st.line)
-		end
-		if sh.opt_x then
-			xtrace_line(sh, head(nil, st, "select"))
 		end
 		menu()
 		while true do

@@ -6177,7 +6177,7 @@ function Shell:special_get(name)
 			return c
 		end
 		if c and c.t == "case" and c.subject and c.subject.src then -- (just its head, blank and all)
-			return "case " .. c.subject.src .. " in "
+			return "case " .. M.srcw(c.subject.src) .. " in "
 		end
 		return c and require("deparse").command_text(c) or ""
 	end
@@ -13089,7 +13089,12 @@ function M.xtrace_quote(w)
 	if w:match("^[%w_@%%+=:,./%-]+$") then
 		return w
 	end
-	return M.shell_quote(w)
+	-- (print_cmd.c xtrace_print_word_list: shell metas → '…' over the raw bytes, even
+	-- control chars; else a non-printable → $'…'; else as is)
+	if M.shell_metas(w) then
+		return "'" .. w:gsub("'", "'\\''") .. "'"
+	end
+	return M.ansic_shouldquote(w) and M.shell_quote(w) or w
 end
 -- xtrace output goes to fd $BASH_XTRACEFD when that's set to an open fd (bash), else stderr
 function M.xtrace_write(sh, s)
@@ -13102,6 +13107,14 @@ function M.xtrace_write(sh, s)
 	end
 	io.stderr:write(s)
 end
+-- A word's source text as bash stores it after parsing (for/case heads, array literals in
+-- traces and $BASH_COMMAND): $'…' translated to '…', $"…" to "…", $(…) bodies re-printed
+function M.srcw(s)
+	if s:find("$", 1, true) then
+		return require("deparse").norm_word(s)
+	end
+	return s
+end
 -- one xtrace line: $PS4 (its first char repeated per $(…)/eval/source level) + `text`
 function M.xtrace_line(sh, text)
 	local ps4 = sh.xtrace_ps4 or sh:get("PS4")
@@ -13112,10 +13125,7 @@ function M.xtrace_line(sh, text)
 		sh.opt_x, sh.status = sx, st
 		ps4 = ok and v or ps4
 	end
-	if ps4 == "" then
-		ps4 = "+ "
-	end
-	local lead = ps4:sub(1, 1)
+	local lead = ps4:sub(1, 1) -- (an empty/unset PS4: no prefix at all — indirection_level_string)
 	local depth = (sh.xdepth or 0) -- nesting of $(…) (not function calls or subshells)
 	local pre = ps4
 	if lead ~= "" and depth > 0 then
@@ -13144,17 +13154,32 @@ function M.xtrace_assign(sh, lhs, v)
 end
 -- [[ ]] under set -x: a unary primary (`[[ -f x ]]`, `[[ ! -n y ]]`) traces its expanded
 -- operand and hands it back; given `r` (a =~ RHS), `[[ v =~ r ]]`
+-- (an empty operand traces as '': xtrace_print_cond_term)
 function M.xdb1(sh, neg, op, v, r)
 	if sh.opt_x then
-		M.xtrace_line(sh, "[[ " .. (neg and "! " or "") .. (r and (v .. " =~ " .. r) or (op .. " " .. v)) .. " ]]")
+		local xv = v == "" and "''" or v
+		M.xtrace_line(sh, "[[ " .. (neg and "! " or "") .. (r and (xv .. " =~ " .. (r == "" and "''" or r))
+			or (op .. " " .. xv)) .. " ]]")
 	end
 	return v
 end
+-- set -x of a QUOTED [[ == ]] pattern text: every character backslashed, as bash's
+-- quote_string_for_globbing shows it (`"ab"` → \a\b)
+function M.xglob_quote(s)
+	return (s:gsub("[%z\1-\127\194-\244][\128-\191]*", "\\%0"))
+end
+function M.xtilde(sh, tok) -- (a pattern's leading ~prefix, traced: its directory reads as quoted)
+	local d = M.tilde_prefix(sh, tok)
+	return d == tok and tok or M.xglob_quote(d)
+end
 -- a binary primary: trace `[[ l op r ]]`, park the operands for the compare that follows
 M._xl, M._xr = "", ""
-function M.xdb2(sh, neg, op, l, r)
+-- (`xq`: r is a wholly quoted pattern, traced with every character backslashed)
+function M.xdb2(sh, neg, op, l, r, xq)
 	if sh.opt_x then
-		M.xtrace_line(sh, "[[ " .. (neg and "! " or "") .. l .. " " .. op .. " " .. r .. " ]]")
+		local xr = xq and M.xglob_quote(r) or r
+		M.xtrace_line(sh, "[[ " .. (neg and "! " or "") .. (l == "" and "''" or l) .. " " .. op .. " "
+			.. (xr == "" and "''" or xr) .. " ]]")
 	end
 	M._xl, M._xr = l, r
 	return true
