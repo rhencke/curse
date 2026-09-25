@@ -361,6 +361,10 @@ local function scan_xtrace(node)
 	if node.lit and node.lit:find("BASH_COMMAND", 1, true) then
 		return true -- $BASH_COMMAND (often read in a trap string) tracks interp's statements
 	end
+	if node.t == "simple" and node.words and node.words[1] and node.words[1].parts
+		and node.words[1].parts[1] and node.words[1].parts[1].lit == "enable" then
+		return true -- `enable -n` disables builtins the compiled tier calls natively
+	end
 	if node.t == "simple" and node.words and node.words[1] and node.words[1].parts[1]
 		and node.words[1].parts[1].lit == "set"
 	then
