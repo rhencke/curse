@@ -128,13 +128,13 @@ function M.prompt(sh)
 			end
 		end
 		if changed then
-			local msg = f.msg or "You have mail in $_"
+			local msg = f.msg or rt.L("You have mail in $_")
 			sh:set_str("_", f.name)
 			local bigger = z > f.size -- (file_has_grown, before the update)
 			update(f)
 			if f.atime < f.mtime or bigger then
 				if not f.msg and f.atime < f.mtime and bigger then
-					msg = "You have new mail in $_"
+					msg = rt.L("You have new mail in $_")
 				end
 				local I = require("interp")._int
 				local ok, out = pcall(I.expand_word, sh, require("parser").parse_heredoc(msg, false))
@@ -145,7 +145,7 @@ function M.prompt(sh)
 			local a2, _, z2 = mstat(f.name)
 			if a2 and z2 > 0 and f.atime < a2 then
 				update(f)
-				io.write("The mail in ", f.name, " has been read\n")
+				io.write(rt.L("The mail in %s has been read\n", f.name))
 			end
 		end
 	end

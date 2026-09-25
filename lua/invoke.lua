@@ -42,32 +42,36 @@ end
 
 -- show_shell_usage (shell.c); `extra` (--help) adds the version line and the trailer
 function M.usage(name, extra)
+	local L = rt.L -- (each piece bash's _(): the message locale's words)
 	local t = {}
 	if extra then
-		t[#t + 1] = "GNU bash, version 5.2.37(1)-release-(x86_64-pc-linux-gnu)\n"
+		t[#t + 1] = L("GNU bash, version %s-(%s)\n", "5.2.37(1)-release", "x86_64-pc-linux-gnu")
 	end
-	t[#t + 1] = "Usage:\t" .. name .. " [GNU long option] [option] ...\n\t" .. name
-		.. " [GNU long option] [option] script-file ...\nGNU long options:\n"
+	t[#t + 1] = L("Usage:\t%s [GNU long option] [option] ...\n\t%s [GNU long option] [option] script-file ...\n",
+		name, name) .. L("GNU long options:\n")
 	for _, nm in ipairs(LONG) do
 		t[#t + 1] = "\t--" .. nm .. "\n"
 	end
-	t[#t + 1] = "Shell options:\n\t-ilrsD or -c command or -O shopt_option\t\t(invocation only)\n"
-		.. "\t-abefhkmnptuvxBCEHPT or -o option\n"
+	t[#t + 1] = L("Shell options:\n") .. L("\t-ilrsD or -c command or -O shopt_option\t\t(invocation only)\n")
+		.. L("\t-%s or -o option\n", "abefhkmnptuvxBCEHPT")
 	if extra then
-		t[#t + 1] = "Type `" .. name .. " -c \"help set\"' for more information about shell options.\n"
-			.. "Type `" .. name .. " -c help' for more information about shell builtin commands.\n"
-			.. "Use the `bashbug' command to report bugs.\n\n"
-			.. "bash home page: <http://www.gnu.org/software/bash>\n"
-			.. "General help using GNU software: <http://www.gnu.org/gethelp/>\n"
+		t[#t + 1] = L("Type `%s -c \"help set\"' for more information about shell options.\n", name)
+			.. L("Type `%s -c help' for more information about shell builtin commands.\n", name)
+			.. L("Use the `bashbug' command to report bugs.\n") .. "\n"
+			.. L("bash home page: <http://www.gnu.org/software/bash>\n")
+			.. L("General help using GNU software: <http://www.gnu.org/gethelp/>\n")
 	end
 	return table.concat(t)
 end
 
-local VERSION = "GNU bash, version 5.2.37(1)-release (x86_64-pc-linux-gnu)\n"
-	.. "Copyright (C) 2022 Free Software Foundation, Inc.\n"
-	.. "License GPLv3+: GNU GPL version 3 or later <http://gnu.org/licenses/gpl.html>\n\n"
-	.. "This is free software; you are free to change and redistribute it.\n"
-	.. "There is NO WARRANTY, to the extent permitted by law.\n"
+local function version() -- (show_shell_version (1): its _() pieces)
+	local L = rt.L
+	return L("GNU bash, version %s (%s)\n", "5.2.37(1)-release", "x86_64-pc-linux-gnu")
+		.. L("Copyright (C) 2022 Free Software Foundation, Inc.") .. "\n"
+		.. L("License GPLv3+: GNU GPL version 3 or later <http://gnu.org/licenses/gpl.html>\n") .. "\n"
+		.. L("This is free software; you are free to change and redistribute it.") .. "\n"
+		.. L("There is NO WARRANTY, to the extent permitted by law.") .. "\n"
+end
 
 -- (straight to the real stream: no shell is live yet for the "curse: " prefix rewrite)
 local function err(s)
@@ -98,7 +102,7 @@ function M.parse(args)
 		local nm = a:sub(long and 3 or 2)
 		if not LONGSET[nm] then
 			if long then
-				err(name .. ": " .. a .. ": invalid option\n" .. M.usage(name))
+				err(name .. ": " .. rt.L("%s: invalid option", a) .. "\n" .. M.usage(name))
 				return nil, 2
 			end
 			break
@@ -106,7 +110,7 @@ function M.parse(args)
 		if nm == "init-file" or nm == "rcfile" then
 			i = i + 1
 			if args[i] == nil then
-				err(name .. ": " .. nm .. ": option requires an argument\n")
+				err(name .. ": " .. rt.L("%s: option requires an argument", nm) .. "\n")
 				return nil, 2
 			end
 			inv.rcfile = args[i]
@@ -120,7 +124,7 @@ function M.parse(args)
 		io.flush()
 		return nil, 0
 	elseif inv.version then
-		io.write(VERSION)
+		io.write(version())
 		io.flush()
 		return nil, 0
 	end
@@ -159,7 +163,7 @@ function M.parse(args)
 				elseif ch == "o" then
 					local f = rt.SETOPT[o]
 					if not f then
-						err(name .. ": line 0: " .. name .. ": " .. o .. ": invalid option name\n")
+						err(name .. ": " .. rt.L("line %d: ", 0) .. name .. ": " .. rt.L("%s: invalid option name", o) .. "\n")
 						return nil, 2
 					end
 					sets[#sets + 1] = { f, on }
@@ -178,7 +182,7 @@ function M.parse(args)
 					e_on = on
 				end
 			else
-				err(name .. ": " .. string.char(c1) .. ch .. ": invalid option\n")
+				err(name .. ": " .. rt.L("%c%c: invalid option", c1, ch:byte()) .. "\n")
 				if e_on then
 					return nil, 1
 				end
@@ -191,7 +195,7 @@ function M.parse(args)
 	if inv.want_c then
 		inv.code = args[i]
 		if inv.code == nil then
-			err(name .. ": -c: option requires an argument\n")
+			err(name .. ": " .. rt.L("%s: option requires an argument", "-c") .. "\n")
 			return nil, e_on and 1 or 2
 		end
 		i = i + 1
@@ -322,7 +326,7 @@ local function start_debugger(sh)
 	else
 		on = false
 		err(sh.argv0 .. ": " .. DEBUGGER_START_FILE .. ": " .. (emsg:match(": ([^:]*)$") or emsg) .. "\n"
-			.. sh.argv0 .. ": warning: cannot start debugger; debugging mode disabled\n")
+			.. sh.argv0 .. ": " .. rt.L("warning: ") .. rt.L("cannot start debugger; debugging mode disabled") .. "\n")
 	end
 	sh.shopt.extdebug = on
 	sh.opt_functrace, sh.opt_errtrace = on, on
@@ -383,7 +387,7 @@ local function open_script(sh, inv, path)
 			end
 		end
 		if bin then
-			err(path .. ": " .. path .. ": cannot execute binary file\n")
+			err(path .. ": " .. rt.L("%s: cannot execute binary file", path) .. "\n")
 			sh.status = 126
 			return nil
 		end
@@ -569,7 +573,7 @@ function M.start(sh, inv, istty)
 		local valid = I._int.SHOPT_DEFAULT
 		for _, so in ipairs(inv.shopts) do
 			if valid and valid[so[1]] == nil then
-				err(name .. ": line 0: " .. so[1] .. ": invalid shell option name\n")
+				err(name .. ": " .. rt.L("line %d: ", 0) .. rt.L("%s: invalid shell option name", so[1]) .. "\n")
 				sh.status = 2
 				return "exit"
 			end
@@ -666,7 +670,9 @@ function M.start(sh, inv, istty)
 		if not payload then
 			return "exit"
 		end
-		sh.main_source = inv.found -- (found on $PATH: BASH_SOURCE is the full path, $0 the name)
+		-- (found on $PATH: BASH_SOURCE is the full path, $0 the name; either way fixed at
+		-- startup — `BASH_ARGV0=x` changes $0, not BASH_SOURCE or the error prefix)
+		sh.main_source = inv.found or sh.argv0
 	end
 	-- (-c, a script, or non-interactive stdin — not an interactive shell reading its terminal)
 	if (inv.debugger or sh.shopt.extdebug) and kind ~= "repl" then

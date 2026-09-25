@@ -162,9 +162,10 @@ local function current_line(sh)
 	return line or sh.cur_line or 0
 end
 M.current_line = current_line
-function M.err_prefix(sh)
+-- the prefix's parts: the name (with `eval'/`-c' label) and the line (0: none)
+function M.err_where(sh)
 	if sh.opt_i then
-		return (sh.shellname or "bash") .. ": "
+		return (sh.shellname or "bash"), 0
 	end
 	local name = sh.cur_source or sh.main_source or sh.argv0 or sh.shellname or "bash"
 	if name == "" then
@@ -176,15 +177,129 @@ function M.err_prefix(sh)
 	if ff and ff ~= "" then
 		name = ff
 	end
+	if sh.ldrift and ln > 0 and (ff or sh.cur_source or name) == (sh.main_source or name) then
+		ln = M.ldrift_line(sh, ln)
+	end
+	-- (for M.line_drift: the line bash's line_number is left at if this error discards the
+	-- command — a function frame restores the call's line as it unwinds; an eval / source
+	-- / trap one contains the discard itself)
+	M.errframed = (sh.xdepth or 0) > 0
+	M.errln = ln
+	if ((sh.calldepth or 0) > 0 or fnm) and not M.errframed then -- (fnm: a compiled function's)
+		M.errln = M.call_site_line(sh)
+	end
 	if sh.in_perr and sh.perr_label then -- (a syntax error in eval'd text: `NAME: eval: line N:`)
 		name = name .. ": " .. sh.perr_label
 	elseif sh.in_perr and sh.opt_c and not sh.cur_source then
 		name = name .. ": -c"
 	end
+	return name, ln
+end
+function M.err_prefix(sh)
+	local name, ln = M.err_where(sh)
 	if ln > 0 then
 		return name .. ": line " .. ln .. ": "
 	end
 	return name .. ": "
+end
+-- ---- line drift after a discarded command ---------------------------------------------
+-- bash quirk: execute_command_internal sets line_number to a simple command's line and
+-- restores it after — but an error that jumps to the top level (DISCARD: a readonly or
+-- other failed assignment list, an arithmetic error) skips the restore. The parser then
+-- counts on from the error's line, not from where the command ended, so every line READ
+-- after it is numbered lower by the difference, for good (`r=1 a=`…<newline>…`` with r
+-- readonly: the lines after it are one short). A function or eval/source/trap frame
+-- restores line_number as it unwinds (unwind_protect_int), so only an error at the top
+-- level's own depth drifts. sh.ldrift: { {E, D}, … } — a line after E is numbered L - D;
+-- nil (no cost) until such an error happens. (Called from the top level's line-abort
+-- handlers with the aborted command's first and last lines.)
+function M.line_drift(sh, sline, eline)
+	local r = M.errln
+	M.errln = nil
+	if not r or M.errframed or not (sline and eline) or r <= 0 then
+		return
+	end
+	local t = sh.ldrift
+	local d0 = t and t[#t][2] or 0
+	local ro = r + d0 -- (the error's line as the source numbers it)
+	if ro < sline or ro > eline then -- (not this command's diagnostic)
+		return
+	end
+	if eline - r ~= d0 then
+		t = t or {}
+		t[#t + 1] = { eline, eline - r }
+		sh.ldrift = t
+	end
+end
+-- the line of the top-level command whose function call is running (M.line_drift)
+function M.call_site_line(sh)
+	local getinfo, getlocal = debug.getinfo, debug.getlocal
+	local line
+	for level = 3, 400 do -- (the outermost compiled top-level frame: its pc's line)
+		local info = getinfo(level, "f")
+		if not info then
+			break
+		end
+		local t = M.PCLINE[info.func]
+		if t and not M.PCNAME[info.func] then
+			local _, pc = getlocal(level, 2)
+			local ln = t[pc]
+			if ln and ln > 0 then
+				line = ln
+			end
+		end
+	end
+	local ls = sh.linestack -- (else the interpreter's outermost call site)
+	line = line or (ls and ls[#ls]) or 0
+	if sh.ldrift and line > 0 then
+		line = M.ldrift_line(sh, line)
+	end
+	return line
+end
+-- the number bash gives the main script's line L once lines have drifted
+function M.ldrift_line(sh, L)
+	local t, d = sh.ldrift, 0
+	for i = 1, #t do
+		if L > t[i][1] then
+			d = t[i][2]
+		else
+			break
+		end
+	end
+	return L - d
+end
+function M.ldrift_str(sh, L) -- (compiled $LINENO: only once sh.ldrift is set)
+	return tostring(M.ldrift_line(sh, L))
+end
+-- bash's _(): `s` (a printf format, formatted with the arguments) in the message locale's
+-- language — a catalog lookup only when LC_MESSAGES isn't C/POSIX (lua/l10n.lua)
+function M.L(s, ...)
+	local c = M.lc_state[5]
+	if c ~= "C" and c ~= "POSIX" then
+		return require("l10n").fmt(M.cur_shell, s, ...)
+	end
+	if select("#", ...) > 0 then
+		return s:format(...)
+	end
+	return s
+end
+function M.L1(s, ...) -- M.L of a "…\n" message, its newline dropped (for sh:echo)
+	local r = M.L(s, ...)
+	if r:byte(-1) == 10 then
+		return r:sub(1, -2)
+	end
+	return r
+end
+function M.Llibc(s) -- a libc message (strsignal's text): glibc's own catalog
+	local c = M.lc_state[5]
+	if c ~= "C" and c ~= "POSIX" then
+		return require("l10n").libc(M.cur_shell, s)
+	end
+	return s
+end
+function M.l10n_active()
+	local c = M.lc_state[5]
+	return c ~= "C" and c ~= "POSIX" and require("l10n").active(M.cur_shell)
 end
 do
 	local real = io.stderr
@@ -205,9 +320,23 @@ do
 		end
 		local sh = M.cur_shell
 		if sh and type(a) == "string" and a:sub(1, 7) == "curse: " then
-			local ok, pfx = pcall(M.err_prefix, sh)
-			if ok then
-				a = pfx .. a:sub(8)
+			local c, ok, r = M.lc_state[5], false, nil
+			if c ~= "C" and c ~= "POSIX" then -- (a message locale: bash's translations)
+				ok, r = pcall(require("l10n").diag, sh, a)
+			end
+			if ok and r then
+				a = r
+			else
+				local okp, pfx = pcall(M.err_prefix, sh)
+				if okp then
+					a = pfx .. a:sub(8)
+				end
+			end
+		elseif type(a) == "string" and M.lc_state[5] ~= "C" and M.lc_state[5] ~= "POSIX"
+			and a:find(": usage: ", 1, true) then
+			local ok, r = pcall(require("l10n").plain, sh, a)
+			if ok and r then
+				a = r
 			end
 		end
 		-- (what was echoed before a diagnostic reaches a shared fd first, as bash's does —
@@ -2091,9 +2220,9 @@ function M.job_notify(sh, procs, s, fg, defer, jl)
 		local g = bit.band(st, 0x7f)
 		if g == 0 then
 			local x = bit.rshift(bit.band(st, 0xff00), 8)
-			return x == 0 and "Done" or ("Exit " .. x)
+			return x == 0 and M.L("Done") or M.L("Exit %d", x)
 		end
-		return I.SIGDESC[g] or ("Signal " .. g)
+		return I.SIGDESC[g] and M.Llibc(I.SIGDESC[g]) or M.L("Signal %d", g)
 	end
 	local h = sh.traps and sh.traps["SIG" .. (I.NUMSIG[sig] or "")]
 	if sig ~= 15 and sig ~= 13 and not (h and h ~= "") then
@@ -2103,30 +2232,42 @@ function M.job_notify(sh, procs, s, fg, defer, jl)
 			if type(tx) == "table" then
 				tx = require("deparse").command_text(tx)
 			end
-			local core = bit.band(p.st, 0x80) ~= 0 and bit.band(p.st, 0x7f) ~= 0 and "(core dumped) " or ""
+			local core = bit.band(p.st, 0x80) ~= 0 and bit.band(p.st, 0x7f) ~= 0 and M.L("(core dumped) ") or ""
 			if k == 1 then
 				s1 = p.st
-				o[1] = ("%5d %-24s%s%s\n"):format(p.pid, d, core, tx or "")
+				-- (print_pipeline pads to LONGEST_SIGNAL_DESC with "%*s": a longer one — a
+				-- translated description — gets the NEGATIVE width's spaces all the same)
+				o[1] = ("%5d %s%s%s%s\n"):format(p.pid, d, (" "):rep(math.abs(24 - #d)), core, tx or "")
 			else
 				if p.st == s1 then -- (print_pipeline: a status the first shares isn't repeated)
 					d = ""
 				end
-				o[k] = ("     %5d %s%s%s| %s\n"):format(p.pid, d, (" "):rep(24 - (d == "" and 2 or #d)), core, tx or "")
+				o[k] = ("     %5d %s%s%s| %s\n"):format(p.pid, d, (" "):rep(math.abs(24 - (d == "" and 2 or #d))), core, tx or "")
 			end
 		end
-		M.jobnote = "curse: " .. table.concat(o)
+		-- (its prolog is jobs.c's own _("%s: line %d: "): marked for lua/l10n.lua)
+		local l10n = M.l10n_active()
+		M.jobnote = (l10n and "curse: \1" or "curse: ") .. table.concat(o)
 		jl = fg and not sh.opt_i and (jl or M.job_line(sh))
 		if jl then -- (the prefix now, at that line)
 			local fl = sh.force_line
 			sh.force_line = jl
-			local ok, pfx = pcall(M.err_prefix, sh)
-			sh.force_line = fl
-			if ok then
-				M.jobnote = pfx .. M.jobnote:sub(8)
+			local ok, pfx
+			if l10n then
+				ok, pfx = pcall(require("l10n").diag, sh, M.jobnote)
+				if ok and pfx then
+					M.jobnote = pfx
+				end
+			else
+				ok, pfx = pcall(M.err_prefix, sh)
+				if ok then
+					M.jobnote = pfx .. M.jobnote:sub(8)
+				end
 			end
+			sh.force_line = fl
 		end
 	elseif fg and sig ~= 13 then
-		M.jobnote = desc(s) .. (bit.band(s, 0x80) ~= 0 and " (core dumped)" or "") .. "\n"
+		M.jobnote = desc(s) .. (bit.band(s, 0x80) ~= 0 and M.L(" (core dumped)") or "") .. "\n"
 	else
 		return false
 	end
@@ -6725,7 +6866,8 @@ function M.spawn_errmsg(self, name, execpath, rc)
 	end
 	if rc == 13 and execpath and not self.exec_builtin and ffi.C.curse_rt_stat(execpath, stbuf_a) == 0
 		and bit.band(ffi.cast("uint32_t *", stbuf_a + 24)[0], 0xF000) == 0x4000 then
-		return pre .. M.err_name(tostring(name)) .. ": Is a directory\n" -- (shell_execve: EISDIR)
+		-- (shell_execve: EISDIR — its own _("%s: %s"), unlike file_error's)
+		return pre .. M.L("%s: %s", M.err_name(tostring(name)), M.Llibc("Is a directory")) .. "\n"
 	end
 	if rc ~= 2 and execpath and not self.exec_builtin then -- (shell_execve's file_error(command))
 		return pre .. M.err_name(execpath) .. ": Permission denied\n"
@@ -7187,6 +7329,9 @@ function Shell:special_get(name)
 		return tostring(os.time() - (self.start_time or os.time()) + (self.sec_off or 0))
 	end
 	if name == "LINENO" then
+		if self.ldrift and (not self.cur_source or self.cur_source == self.main_source) then
+			return tostring(M.ldrift_line(self, self.cur_line or 0))
+		end
 		return tostring(self.cur_line or 0)
 	end
 	if name == "SRANDOM" then -- 32 random bits from the system (bash's getrandom)
@@ -7697,6 +7842,10 @@ end
 function M.usage(cmd)
 	for _, t in ipairs(require("helpdata")) do
 		if t[1] == cmd then
+			local c = M.lc_state[5]
+			if c ~= "C" and c ~= "POSIX" then -- (builtin_usage: _("%s: usage: "), _(short_doc))
+				return M.L("%s: usage: ", cmd) .. require("l10n").text(M.cur_shell, t[2]) .. "\n"
+			end
 			return cmd .. ": usage: " .. t[2] .. "\n"
 		end
 	end
@@ -7706,9 +7855,18 @@ end
 function M.builtin_help(sh, cmd)
 	for _, t in ipairs(require("helpdata")) do
 		if t[1] == cmd then
-			sh.out(cmd .. ": " .. t[2] .. "\n")
-			for _, l in ipairs(t[3]) do
-				sh.out(l == true and "\n" or "    " .. l .. "\n")
+			local L = M.l10n_active() and require("l10n") -- (the message locale's texts)
+			local ld
+			if L then
+				ld = L.longdoc(sh, t[3])
+			end
+			sh.out(cmd .. ": " .. (L and L.text(sh, t[2]) or t[2]) .. "\n")
+			if ld then
+				sh.out("    " .. ld .. "\n")
+			else
+				for _, l in ipairs(t[3]) do
+					sh.out(l == true and "\n" or "    " .. l .. "\n")
+				end
 			end
 		end
 	end
@@ -7746,7 +7904,7 @@ end
 -- (A script read from stdin has none either: make_function_def's "main".)
 function M.def_source(sh)
 	return sh.cur_source or (sh.opt_c and "environment") or (sh.opt_s and not sh.opt_i and "main")
-		or sh.argv0 or ""
+		or sh.main_source or sh.argv0 or ""
 end
 -- A builtin about to assign NAME: a readonly one is refused with bash's message (true).
 function M.ro_refuse(sh, name)
@@ -8469,7 +8627,7 @@ function Shell:bash_lineno_array()
 	local t = {}
 	local ls = self.linestack or {}
 	for i = 1, #ls do
-		t[i] = tostring(ls[i])
+		t[i] = tostring(self.ldrift and M.ldrift_line(self, ls[i]) or ls[i])
 	end
 	if not (self.opt_c or (self.opt_s and not self.opt_i)) then
 		t[#t + 1] = "0"
@@ -12789,6 +12947,9 @@ function M.report_recoverable(sh, perr)
 		sh.cur_line = perr.line
 	end
 	local msg = tostring(perr.msg or "syntax error"):gsub("^syntax error near `", "syntax error near unexpected token `")
+	if perr.exactmsg then -- (its own msgid: M.report_perr)
+		msg = M.L(msg)
+	end
 	sh.in_perr = true -- (named like the shell's other syntax errors: `NAME: eval: line N:`)
 	io.stderr:write("curse: " .. msg .. "\n")
 	if perr.text then
@@ -12825,7 +12986,7 @@ function M.parse_error_stmt(sh, st, label)
 		local pl = sh.perr_label
 		sh.perr_label = label or pl
 		pcall(M.parse_error_stmt, sh, { line = st.line, msg = st.msg, exact = st.exact, text = st.text,
-			showtext = st.showtext, pre = st.pre, warns = st.warns })
+			showtext = st.showtext, pre = st.pre, warns = st.warns, exactmsg = st.exactmsg })
 		sh.perr_label = pl
 		error({ __curse_exit = 1 })
 	end
@@ -12842,6 +13003,9 @@ function M.parse_error_stmt(sh, st, label)
 	if not msg:find("^syntax error") and not msg:find("^unexpected EOF")
 		and not msg:find("^maximum here%-document count exceeded") then
 		msg = "syntax error: " .. msg
+	end
+	if st.exactmsg then -- (a msgid of its own that a more general one would match: rt.L)
+		msg = M.L(msg)
 	end
 	if st.line then
 		sh.cur_line = st.line

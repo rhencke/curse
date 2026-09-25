@@ -147,8 +147,8 @@ local function resetpwd(sh, who)
 	local p = sh:phys_cwd()
 	if p == "" then
 		local e = ffi.errno()
-		io.stderr:write(who .. ": error retrieving current directory: getcwd: "
-			.. "cannot access parent directories: " .. ffi.string(C.strerror(e)) .. "\n")
+		io.stderr:write(rt.L("%s: error retrieving current directory: %s: %s\n", who,
+			rt.L("getcwd: cannot access parent directories"), ffi.string(C.strerror(e))))
 		return nil
 	end
 	sh.tcwd = p

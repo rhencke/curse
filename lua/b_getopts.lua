@@ -137,7 +137,7 @@ return function(sh, cmd, args, hook, tcb)
 							cur = 1
 						end
 						if not quiet then
-							io.stderr:write((sh.argv0 or "curse") .. ": illegal option -- " .. oc .. "\n")
+							io.stderr:write(rt.L("%s: illegal option -- %c\n", sh.argv0 or "curse", oc:byte()))
 						end
 						res = { kind = "invalid", opt = oc }
 					elseif optstr:sub(pos + 1, pos + 1) == ":" then -- takes an argument
@@ -151,7 +151,7 @@ return function(sh, cmd, args, hook, tcb)
 						else
 							optind, cur = optind + 1, 1
 							if not quiet then
-								io.stderr:write((sh.argv0 or "curse") .. ": option requires an argument -- " .. oc .. "\n")
+								io.stderr:write(rt.L("%s: option requires an argument -- %c\n", sh.argv0 or "curse", oc:byte()))
 							end
 							-- (an optstring still starting with `:` makes sh_getopt return `:`: a
 							-- plain success with an empty OPTARG)

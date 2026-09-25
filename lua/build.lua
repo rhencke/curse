@@ -69,6 +69,7 @@ local lazy_mods = {
 	"smatch", -- bash's own pattern matcher: only for what a glob's ERE can't express
 	"mailcheck", -- mailcheck.c: only an interactive shell checks for mail
 	"gettext", -- $"…" message-catalog lookup: only when a script translates a string
+	"l10n", -- bash's own messages translated: only under a non-C message locale
 }
 
 -- Wrap each core module's source in a package.preload closure. `require("x")` then

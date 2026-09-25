@@ -68,6 +68,8 @@ local function finish(sh)
 	os.exit(sh and sh.status or 0)
 end
 
+-- (the shell first: its startup locale is the one invocation errors and --help speak)
+local sh = rt.Shell.new()
 local inv, st = Invoke.parse(argv)
 if not inv then
 	io.flush()
@@ -81,7 +83,6 @@ do -- (a mode keyword after the script: not a positional parameter)
 		table.remove(argv, si + 1)
 	end
 end
-local sh = rt.Shell.new()
 rt.shlvl_start(sh) -- (a new shell: $SHLVL + 1, exported)
 rt.startup_ignored(sh) -- signals ignored at entry stay ignored (untrappable)
 rt.sig_setup(sh) -- (SIGQUIT ignored; SIGINT's default, not luajit's `interrupted!`)

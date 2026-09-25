@@ -4156,6 +4156,17 @@ local function printf_float(s)
 	if c == "'" or c == '"' then
 		return char_value(s:sub(2)), true
 	end
+	-- (strtold reads the LC_NUMERIC radix: under de_DE `0,1' is 0.1 and `0.1' stops at
+	-- the `.' — 0, not fully consumed)
+	local dp = s:find("[.,]") and rt.decimal_point() or "."
+	if dp ~= "." then
+		local q = s:gsub("%.", "\0"):gsub(dp:gsub("%p", "%%%0"), ".", 1)
+		local v = tonumber(q)
+		if v then
+			return v, true
+		end
+		return tonumber(q:match("^%s*[+-]?%d*%.?%d*")) or 0, false
+	end
 	local v = tonumber(s)
 	if v then
 		return v, true
@@ -5100,7 +5111,7 @@ local function describe(sh, nm, fl)
 	if not fl.force then
 		local av = sh.aliases[nm]
 		if av and (sh.shopt.expand_aliases or sh.opt_i) then
-			say("alias", nm .. " is aliased to `" .. av .. "'",
+			say("alias", rt.L1("%s is aliased to `%s'\n", nm, av),
 				"alias " .. nm .. "=" .. (av == "'" and "\\'" or "'" .. av:gsub("'", "'\\''") .. "'"))
 			if not fl.all then
 				return true
@@ -5108,7 +5119,7 @@ local function describe(sh, nm, fl)
 			found = true
 		end
 		if KEYWORDS[nm] then
-			say("keyword", nm .. " is a shell keyword", nm)
+			say("keyword", rt.L1("%s is a shell keyword\n", nm), nm)
 			if not fl.all then
 				return true
 			end
@@ -5116,7 +5127,7 @@ local function describe(sh, nm, fl)
 		end
 		if not fl.nofunc and sh.functions[nm] then
 			if fl.short then
-				sh:echo(nm .. " is a function")
+				sh:echo(rt.L1("%s is a function\n", nm))
 				local d = func_body_text(sh, nm)
 				if d then
 					sh:echo(d)
@@ -5130,8 +5141,8 @@ local function describe(sh, nm, fl)
 			found = true
 		end
 		if BUILTINS[nm] and not (sh.disabled_builtins and sh.disabled_builtins[nm]) then
-			say("builtin", nm .. ((sh.opt_posix and SPECIAL_BUILTIN[nm]) and " is a special shell builtin"
-				or " is a shell builtin"), nm)
+			say("builtin", rt.L1((sh.opt_posix and SPECIAL_BUILTIN[nm]) and "%s is a special shell builtin\n"
+				or "%s is a shell builtin\n", nm), nm)
 			if not fl.all then
 				return true
 			end
@@ -5139,13 +5150,13 @@ local function describe(sh, nm, fl)
 		end
 	end
 	if nm:find("/", 1, true) and d_execable(nm) then -- (an absolute program: no hash, no $PATH)
-		say("file", nm .. " is " .. nm, nm)
+		say("file", rt.L1("%s is %s\n", nm, nm), nm)
 		return true
 	end
 	if not fl.all or fl.force then -- the hash table (bash's phash_search: a relative entry as ./…)
 		local p = not nm:find("/", 1, true) and sh.hashpath == sh:get("PATH") and rt.phash_search(sh, nm)
 		if p then
-			say("file", nm .. " is hashed (" .. p .. ")", p)
+			say("file", rt.L1("%s is hashed (%s)\n", nm, p), p)
 			return true
 		end
 	end
@@ -5170,7 +5181,7 @@ local function describe(sh, nm, fl)
 		end
 		if p then
 			found = true
-			say("file", nm .. " is " .. p, p)
+			say("file", rt.L1("%s is %s\n", nm, p), p)
 			if not fl.all then
 				break
 			end
@@ -7689,6 +7700,7 @@ local function run_group(sh, lg, hook, k)
 				end
 				rt.posix_arith_fatal(sh, err)
 				sh.status = err.__curse_badusage and not sh.opt_c and 2 or 1 -- (a failed ${x:=w})
+				rt.line_drift(sh, lg.sline, lg.eline) -- (bash's line numbers drift from here)
 				break
 			else
 				error(err)

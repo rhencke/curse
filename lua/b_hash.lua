@@ -176,12 +176,12 @@ return function(sh, cmd, args, hook, tcb)
 					sh:echo("builtin hash -p " .. pfn(sh.hashcache[k].path) .. " " .. pfn(k))
 				end
 			elseif #ks > 0 then
-				sh:echo("hits\tcommand")
+				sh.out(rt.L("hits\tcommand\n"))
 				for _, k in ipairs(ks) do
 					sh:echo(("%4d\t%s"):format(sh.hashcache[k].hits, sh.hashcache[k].path))
 				end
 			elseif not sh.opt_posix then
-				sh:echo("hash: hash table empty") -- (bash says so on stdout)
+				sh.out(rt.L("%s: hash table empty\n", "hash")) -- (bash says so on stdout)
 			end
 			sh.status = 0
 		else

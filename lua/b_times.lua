@@ -25,8 +25,10 @@ return function(sh, cmd, args, hook, tcb)
 			return rt.bad_option(sh, "times", a2:sub(1, 2))
 		end
 		-- Two lines: shell user/sys, then children user/sys, each `%dm%.3fs`.
+		local dp = rt.decimal_point() -- (print_timeval: the locale's radix — 0m0,003s in de_DE)
 		local function ct(s)
-			return ("%dm%.3fs"):format(math.floor(s / 60), s % 60)
+			local t = ("%dm%.3fs"):format(math.floor(s / 60), s % 60)
+			return dp == "." and t or (t:gsub("%.", dp))
 		end
 		local c = os.clock()
 		sh:echo(ct(c) .. " " .. ct(0))

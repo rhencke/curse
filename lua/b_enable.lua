@@ -54,7 +54,7 @@ return function(sh, cmd, args)
 		-- (dlopen's own words; this static binary can't load one at all)
 		local f = io.open(file, "r")
 		local err = f and "only ELF shared objects built for bash can be loaded, and curse loads none"
-			or "cannot open shared object file: No such file or directory"
+			or (rt.Llibc("cannot open shared object file") .. ": " .. rt.Llibc("No such file or directory"))
 		if f then
 			f:close()
 		end
