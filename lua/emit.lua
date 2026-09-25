@@ -412,6 +412,9 @@ local function scan_xtrace(node, acc)
 			if not l or l == "restricted" or (l:match("^%-%a+$") and l:find("r", 2, true)) then
 				acc.r = true
 			end
+			if l and (l == "onecmd" or (l:match("^%-%a+$") and l:find("t", 2, true))) then
+				acc.lex = acc.lex or "set -t" -- (the reader stops after the line it read: run_lazy)
+			end
 			if l and (l == "verbose" or (l:match("^%-%a+$") and l:find("[vH]", 2))) then
 				acc.lex = acc.lex or ("set -" .. (l:match("^%-%a+$") and l:match("[vH]", 2) or "v"))
 			end
@@ -9307,7 +9310,9 @@ function M.emit(ast, opts)
 	EF.extdebug = extdbg or false
 	EF.dbg_after_of = setmetatable({}, { __mode = "k" })
 	EF.cur_cfg = "run"
-	EF.keyword = kw or false
+	-- (a fragment — a script line, eval/source text — may run under an earlier `set -k`
+	-- its own text never shows: compile both readings there too)
+	EF.keyword = kw or EF.fragment or false
 	EF.bash_command = bcmd or false
 	-- (`enable -n NAME` here, or maybe in eval/source code or around a fragment: a native
 	-- builtin call first checks the name is still a builtin)

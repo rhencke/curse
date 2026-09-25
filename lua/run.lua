@@ -91,6 +91,8 @@ if kind == "exit" then
 elseif kind == "repl" or kind == "stdin" then
 	require("repl").run(sh) -- (non-interactive "stdin": line at a time from fd 0, bash)
 	finish(sh)
+elseif sh.opt_t and kind ~= "code" then -- (started -t: one command, read by the interpreter)
+	interp.run_lazy(sh, src)
 elseif kind == "code" or mode == "tiered" then
 	-- interpret, and switch to compiled code where a loop turns hot (compiled into the
 	-- shared cache, so the next run starts compiled) — the daemon's own path

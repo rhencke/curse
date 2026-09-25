@@ -3615,10 +3615,9 @@ local function name_type(sh, name, nofunc)
 	end
 	-- a remembered location (`hash`, `hash -p`, or an earlier run) wins, and counts a hit
 	-- (bash: `type` reports it "hashed"); the table empties when $PATH changes
-	local hc = not name:find("/", 1, true) and sh.hashcache and sh.hashcache[name]
-	if hc and sh.hashpath == sh:get("PATH") then
-		rt.hash_hit(sh.hashcache, name)
-		return "file", hc.path, true
+	local hp = not name:find("/", 1, true) and sh.hashpath == sh:get("PATH") and rt.phash_search(sh, name)
+	if hp then
+		return "file", hp, true
 	end
 	local p = find_in_path(name)
 	if p then
@@ -4961,21 +4960,22 @@ M.xtrace_write = rt.xtrace_write
 local function d_execable(p) -- (file_status FS_EXECABLE: +x and not a directory)
 	return C.access(p, 1) == 0 and not file_test("-d", p)
 end
-local function d_path(pathstr, name, exec_only, all) -- FS_EXEC_PREFERRED / FS_EXEC_ONLY
-	local hits, fallback = {}, nil
-	for _, dir in ipairs(rt.path_units(pathstr)) do
-		local p = (dir == "" and "." or dir) .. "/" .. name
-		if d_execable(p) then
-			hits[#hits + 1] = p
-			if not all then
-				return hits
-			end
-		elseif not exec_only and not fallback and C.access(p, 0) == 0 and not file_test("-d", p) then
-			fallback = p
-		end
+local function d_path(sh, pathstr, name, all) -- find_user_command / user_command_matches (FS_EXEC_ONLY)
+	local ign = rt.exec_ignores(sh)
+	if not all then
+		return { (rt.search_path(sh, name, pathstr, ign)) }
 	end
-	if #hits == 0 and fallback then
-		hits[1] = fallback
+	local hits = {}
+	for _, dir in ipairs(rt.path_units(pathstr)) do
+		if dir == "" then
+			dir = "."
+		elseif dir:byte(1) == 126 and not sh.opt_posix then
+			dir = rt.tilde_prefix(sh, dir)
+		end
+		local p = dir:byte(-1) == 47 and dir .. name or dir .. "/" .. name
+		if rt.cmd_fstatus(p, ign) == 3 then
+			hits[#hits + 1] = p
+		end
 	end
 	return hits
 end
@@ -5036,22 +5036,17 @@ local function describe(sh, nm, fl)
 		return true
 	end
 	if not fl.all or fl.force then -- the hash table (bash's phash_search: a relative entry as ./…)
-		local hc = not nm:find("/", 1, true) and sh.hashcache and sh.hashcache[nm]
-		if hc and sh.hashpath == sh:get("PATH") then
-			rt.hash_hit(sh.hashcache, nm)
-			local p = hc.path
-			if p:sub(1, 1) ~= "/" and p:sub(1, 2) ~= "./" and d_execable("./" .. p) then
-				p = "./" .. p
-			end
+		local p = not nm:find("/", 1, true) and sh.hashpath == sh:get("PATH") and rt.phash_search(sh, nm)
+		if p then
 			say("file", nm .. " is hashed (" .. p .. ")", p)
 			return true
 		end
 	end
 	local hits
 	if fl.stdpath then
-		hits = d_path(std_path(), nm, false, false)
+		hits = d_path(sh, std_path(), nm, false)
 	else
-		hits = d_path(sh:get("PATH"), nm, fl.all, fl.all)
+		hits = d_path(sh, sh:get("PATH"), nm, fl.all)
 	end
 	for _, p in ipairs(hits) do
 		if p == nm or sh.opt_posix then -- (posix: only executables; relative made absolute)
@@ -7660,6 +7655,9 @@ local function run_history_lines(sh, text, line1, hook, k)
 				break
 			end
 			k = run_group(sh, lg, hook, k)
+			if sh.opt_t and not sh.opt_c then -- (set -t: see run_lazy)
+				error({ __curse_exit = sh.status })
+			end
 		end
 	end
 	while pos <= n do
@@ -7749,6 +7747,11 @@ function M.run_lazy(sh, src, hook)
 					break
 				end
 				k = run_group(sh, lg, hook, k)
+				-- set -t (onecmd): the reader's loop ends after the command it read and ran
+				-- (bash's reader_loop: just_one_command) — not a -c string's
+				if sh.opt_t and not sh.opt_c then
+					error({ __curse_exit = sh.status })
+				end
 				-- `set -o history` / `set -H` / `set -v` just took effect: the rest of the
 				-- script is read line by line (recorded, `!`-expanded, echoed) from where
 				-- parsing stopped
@@ -8010,6 +8013,7 @@ M._int = {
 	dbracket_pattern = dbracket_pattern,
 	redirs_touch_stdout = redirs_touch_stdout,
 	describe = describe,
+	command_describe = command_describe,
 	statbuf = statbuf,
 	statbuf2 = statbuf2,
 	run_trap = run_trap,
