@@ -7389,6 +7389,15 @@ local function run_group(sh, lg, hook, k)
 			exec_stmt(sh, lg.perr, hook)
 		end -- raises __curse_exit=2 (bash exits)
 	end
+	-- line mode (a script whose parse depends on run-time state — aliases, history
+	-- expansion, set -v): the reader above hands over one logical line at a time and the
+	-- tier runs it COMPILED (M.lm_exec: false when this line can't compile)
+	if sh.lm and M.lm_exec and #lg.stmts > 0 then
+		local k2 = M.lm_exec(sh, lg, k)
+		if k2 then
+			return k2
+		end
+	end
 	for _, st in ipairs(lg.stmts) do
 		k = k + 1
 		hook("stmt", k)

@@ -4838,6 +4838,7 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs)
 			return { stmts = {}, perr = { t = "parse_error", line = line, msg = "syntax error near `" .. bs .. "'" } }
 		end
 		local stmts = {}
+		local gstart, gline = i, line -- (where this logical line's text begins: its compiled-group key)
 		while true do
 			local start, startline = i, line
 			local ok, st = pcall(parse_stmt)
@@ -4936,7 +4937,7 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs)
 		end
 		-- (pos/pline: where reading stopped — a reader that takes over the rest of the
 		-- input line by line, for command history, resumes there)
-		return { stmts = stmts, pos = i, pline = line, src = src }
+		return { stmts = stmts, pos = i, pline = line, src = src, spos = gstart, sline = gline }
 	end
 	-- a syntax error also reports the offending input line (bash's second message line)
 	return function()

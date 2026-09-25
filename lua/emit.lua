@@ -354,11 +354,14 @@ local function scan_xtrace(node, acc)
 	if node.lit == "extdebug" then
 		return "extdebug" -- extdebug: a DEBUG trap may skip commands (interp's run_debug handles it)
 	end
+	-- (LEXICAL needs — the program's text is read a line at a time by the interpreter's
+	-- reader, which records history, `!`-expands, echoes set -v lines and counts \#: the
+	-- lines then run compiled one by one, tier.lm_exec — acc.lex)
 	if node.lit == "history" or node.lit == "histexpand" or node.lit == "fc" then
-		return "history" -- command history is recorded (and `!` expanded) by interp's line reader
+		acc.lex = acc.lex or "history" -- command history is recorded (and `!` expanded) by the reader
 	end
 	if node.lit and node.lit:find("\\#", 1, true) then
-		return "prompt \\#" -- a prompt's \# (command number) counts interp's top-level commands
+		acc.lex = acc.lex or "prompt \\#" -- a prompt's \# (command number) counts the reader's lines
 	end
 	if node.lit and node.lit:find("BASH_COMMAND", 1, true) then
 		return "BASH_COMMAND" -- $BASH_COMMAND (often read in a trap string) tracks interp's statements
@@ -377,9 +380,11 @@ local function scan_xtrace(node, acc)
 			end
 			-- (restricted mode too: its checks live only on the interpreter's paths)
 			-- (set -k: interp re-reads NAME=value words anywhere as assignments)
-			if l and (l == "verbose" or l == "restricted" or l == "keyword"
-				or (l:match("^%-%a+$") and l:find("[vrkH]", 2))) then
-				return "set -" .. (l:match("^%-%a+$") and l:match("[vrkH]", 2) or l:sub(1, 1))
+			if l and (l == "restricted" or l == "keyword" or (l:match("^%-%a+$") and l:find("[rk]", 2))) then
+				return "set -" .. (l:match("^%-%a+$") and l:match("[rk]", 2) or l:sub(1, 1))
+			end
+			if l and (l == "verbose" or (l:match("^%-%a+$") and l:find("[vH]", 2))) then
+				acc.lex = acc.lex or ("set -" .. (l:match("^%-%a+$") and l:match("[vH]", 2) or "v"))
 			end
 			-- a first non-option word (`set x $i`) or `--` makes the rest positional params
 			if not l or l == "--" or l == "-" or not l:match("^[-+]") then
@@ -395,7 +400,7 @@ local function scan_xtrace(node, acc)
 			end
 		end
 	end
-	return nil, acc.x
+	return nil, acc.x, acc.lex
 end
 -- functrace (set -T / -o functrace) extends DEBUG into subshells, which compiled
 -- fragments don't hook — keep those programs on the delegated path.
@@ -4661,6 +4666,21 @@ H.simple = function(cx, st, after)
 	else
 		p = simple_compiled(cx, st, after)
 	end
+	-- A FRAGMENT (eval/source/trap code, a script line in line mode) can't see the functions
+	-- defined outside it: one shadowing a builtin (`true() {…}`, `echo() {…}`) must win at run
+	-- time — the argv built natively, dispatched through the command runner (rt.exec_dynamic)
+	if EF.fragment and not EF.has_dyncode and st.words and st.words[1] and not st.assigns then
+		local c1 = #st.words[1].parts == 1 and st.words[1].parts[1].lit
+		if c1 and not st.words[1].parts[1].q and require("interp").BUILTINS[c1] and not EF.FRAG_CF[c1]
+			and not cx.funcflags[c1] and not (cx.inlinefns and cx.inlinefns[c1]) then
+			local dp = EF.dyn_dispatch(cx, st, after)
+			if dp then
+				local g = cx.newpc()
+				cx.blocks[g] = ("if sh.functions[%q] then pc = %d else pc = %d end"):format(c1, dp, p)
+				return g
+			end
+		end
+	end
 	local w1 = EF.has_dyncode and st.words and st.words[1]
 	local c = w1 and w1.parts and #w1.parts == 1 and w1.parts[1].lit
 	if not c then
@@ -4670,6 +4690,48 @@ H.simple = function(cx, st, after)
 	local g = cx.newpc()
 	cx.blocks[g] = ("if %s then pc = %d else pc = %d end"):format(names_guard({ c }), p, dp)
 	return g
+end
+-- (control-flow builtins: a function can't usefully shadow them from outside a fragment)
+EF.FRAG_CF = { ["break"] = 1, ["continue"] = 1, ["return"] = 1, ["exit"] = 1 }
+-- A command dispatched by its EXPANDED argv (the first word resolves at run time — a
+-- dynamic `$cmd`, or a builtin name a function may shadow): the words built by the field
+-- engine, run by rt.exec_dynamic (function / builtin / external, as the interpreter's
+-- command runner resolves them) inside delegate's control-flow wrapper; a redirect is
+-- applied around it. nil when a word or redirect can't compile.
+function EF.dyn_dispatch(cx, st, after)
+	local argvbody = field_argv(st.words, 1, cx.lifted, nil, nil)
+	local dyn_redir = nil
+	if argvbody and st.redirs then
+		dyn_redir = cx.redir_conds(st, nil) -- nil => uncompilable redir shape
+	end
+	if not argvbody or (st.redirs and not dyn_redir) then
+		return nil
+	end
+	-- hadcs (compile-time): a word contains a command sub, so an empty argv keeps its status.
+	-- One only nested in a ${…} (`${u:-$(exit 5)}`) may not run: count at runtime (sh.ncs).
+	local hadcs, dyncs = false, false
+	for _, w in ipairs(st.words) do
+		for _, pp in ipairs(w.parts) do
+			if pp.cmdsub then
+				hadcs = true
+				break
+			end
+		end
+		if hadcs then
+			break
+		end
+		dyncs = dyncs or (w.src and (w.src:find("$(", 1, true) or w.src:find("`", 1, true))) and true
+	end
+	return cx.delegate(
+		st,
+		after,
+		{
+			prelude = (not hadcs and dyncs) and ("sh.ncs0 = sh.ncs; " .. argvbody) or argvbody,
+			callee = "rt.exec_dynamic",
+			callargs = ("sh, __a, __noop, %s"):format((not hadcs and dyncs) and "sh.ncs ~= sh.ncs0" or tostring(hadcs)),
+			redir = dyn_redir and cx.redir_ext(nil, dyn_redir),
+		}
+	)
 end
 simple_compiled = function(cx, st, after)
 	local t = st.t
@@ -4802,37 +4864,9 @@ simple_compiled = function(cx, st, after)
 	-- reusing delegate's control-flow-signal wrapper. A prefix assign (tempenv) still needs
 	-- exec_stmt's fuller handling; a redirect is applied around the dispatch (opts.redir).
 	if cmd == nil and st.words[1] and not st.assigns then
-		local argvbody = field_argv(st.words, 1, cx.lifted, nil, nil)
-		local dyn_redir = nil
-		if argvbody and st.redirs then
-			dyn_redir = cx.redir_conds(st, nil) -- nil => uncompilable redir shape: fall through to full delegate
-		end
-		if argvbody and not (st.redirs and not dyn_redir) then
-			-- hadcs (compile-time): a word contains a command sub, so an empty argv keeps its status.
-			-- One only nested in a ${…} (`${u:-$(exit 5)}`) may not run: count at runtime (sh.ncs).
-			local hadcs, dyncs = false, false
-			for _, w in ipairs(st.words) do
-				for _, pp in ipairs(w.parts) do
-					if pp.cmdsub then
-						hadcs = true
-						break
-					end
-				end
-				if hadcs then
-					break
-				end
-				dyncs = dyncs or (w.src and (w.src:find("$(", 1, true) or w.src:find("`", 1, true))) and true
-			end
-			return cx.delegate(
-				st,
-				after,
-				{
-					prelude = (not hadcs and dyncs) and ("sh.ncs0 = sh.ncs; " .. argvbody) or argvbody,
-					callee = "rt.exec_dynamic",
-					callargs = ("sh, __a, __noop, %s"):format((not hadcs and dyncs) and "sh.ncs ~= sh.ncs0" or tostring(hadcs)),
-					redir = dyn_redir and cx.redir_ext(nil, dyn_redir),
-				}
-			)
+		local dp = EF.dyn_dispatch(cx, st, after)
+		if dp then
+			return dp
 		end
 	end
 	-- `command CMD args` (no -p/-v/-V/-- flag): run CMD skipping SHELL FUNCTION lookup
@@ -6403,7 +6437,7 @@ H.pipeline = function(cx, st, after)
 	for i = 1, n do
 		-- a `return` stage at the top level (no function can be running): the interpreter
 		-- reports it (bash: "can only `return' …", status 2) — a stage fragment can't tell
-		if cx.toplevel and not EF.fragment and resolve_cf({ t = "simple", words = st.cmds[i].words or {} }) == "return" then
+		if cx.toplevel and (not EF.fragment or EF.lm) and resolve_cf({ t = "simple", words = st.cmds[i].words or {} }) == "return" then
 			return cx.delegate(st, after)
 		end
 	end
@@ -7233,7 +7267,7 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
 				local p = cx.newpc()
 				local d = dbg(st) .. EF.xtwords(st.words, cx.lifted) -- DEBUG fires before break/continue too (it's a command)
 				if #cx.loopstack == 0 then
-					if ((EF.fragment and cx.toplevel) or (EF.cf_raise and EF.cf_raise.loop)) and #cx.subexit == 0 then
+					if ((EF.fragment and not EF.lm and cx.toplevel) or (EF.cf_raise and EF.cf_raise.loop)) and #cx.subexit == 0 then
 						-- eval/source fragment: break/continue with no enclosing loop IN the fragment
 						-- targets the CALLER's loop -- raise the signal (level) for the enclosing
 						-- delegated cf-wrapper, exactly as interp's break/continue do.
@@ -7250,7 +7284,7 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
 						idx = 1
 					end
 					local tgt = (cf_op == "break") and cx.loopstack[idx].brk or cx.loopstack[idx].cont
-					if EF.fragment and lvl > #cx.loopstack and #cx.subexit == 0 then
+					if EF.fragment and not EF.lm and lvl > #cx.loopstack and #cx.subexit == 0 then
 						-- (an eval / hot-loop fragment inside the caller's loops: the levels past
 						-- its own reach them — bash counts across; with none, it clamps)
 						cx.blocks[p] = d .. ("if sh.loopdepth > 0 then %serror({ __curse_%s = %d }) end; sh.status = 0; pc = %d"):format(
@@ -7266,7 +7300,7 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
 			-- continues) — not a program exit. A compiled top level is always the main
 			-- script (source runs through interp), so delegate and let interp diagnose.
 			-- (`var=x return`: a posix-persistent prefix assignment — interp does that too)
-			if (cx.toplevel and not EF.fragment) or (st.assigns and #st.assigns > 0)
+			if (cx.toplevel and (not EF.fragment or EF.lm)) or (st.assigns and #st.assigns > 0)
 				or (EF.cs_active and not EF.cs_in_func and #cx.subexit == 0) then -- ($(return) at top)
 				return cx.delegate(st, after)
 			end
@@ -7278,7 +7312,7 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
 			-- eval/source fragment top level: `return` propagates to the CALLER (a delegated
 			-- eval's cf-wrapper) as a raised signal, like interp; a return inside a compiled
 			-- subshell (subexit) still jumps locally.
-			local frag_return = ((EF.fragment and cx.toplevel) or (EF.cf_raise and EF.cf_raise.func)) and #cx.subexit == 0
+			local frag_return = ((EF.fragment and not EF.lm and cx.toplevel) or (EF.cf_raise and EF.cf_raise.func)) and #cx.subexit == 0
 			-- (raised, `return N` leaves $? as it was — the RETURN trap of the `.` sees that —
 			-- and carries N: return.def sets only return_catch_value)
 			local retjmp = frag_return
@@ -7863,12 +7897,19 @@ function M.emit(ast, opts)
 	-- execution context, so a top-level return/break/continue must RAISE its signal for
 	-- the enclosing (delegated) cf-wrapper to catch, not jump to this fragment's own DONE.
 	EF.fragment = opts and opts.fragment or false
+	-- Line mode (tier.lm_exec): a fragment that is one logical line of the SCRIPT — its
+	-- parse (aliases, history) was done by the live reader, and its top level is the
+	-- script's own (a break/return there is the script's, not a caller's)
+	EF.lm = opts and opts.lm or false
 	-- a program that can turn on xtrace (`set -x`, `set -o xtrace`, a dynamic `set` word)
 	-- carries per-command trace hooks (`if sh.opt_x then rt.xtrace…`); other machinery the
 	-- compiled tier lacks keeps the program interpreted (the reason names it)
-	local xwhy, xt = scan_xtrace(ast.stmts)
+	local xwhy, xt, xlex = scan_xtrace(ast.stmts)
 	if xwhy then
 		error("curse-nocompile: " .. xwhy)
+	end
+	if xlex and not EF.lm then -- (the whole program can't: the tier runs it line by line)
+		error("curse-nocompile: line-mode: " .. xlex)
 	end
 	-- (a fragment — eval/source code, a hot loop — may run under a caller's set -x; so may
 	-- code that runs eval/source, which can turn it on)
@@ -7882,9 +7923,10 @@ function M.emit(ast, opts)
 	if scan_trap_loopctl(ast.stmts) then
 		error("curse-nocompile: break/continue in a trap")
 	end
-	local alias_kind = scan_alias(ast.stmts)
+	-- (in line mode the live reader already expanded this line's aliases)
+	local alias_kind = EF.lm and "none" or scan_alias(ast.stmts)
 	if alias_kind == "dynamic" or (alias_kind == "static" and scan_dyncode(ast.stmts)) then
-		error("curse-nocompile: alias expansion needs line-at-a-time parse")
+		error("curse-nocompile: line-mode: alias expansion")
 	end
 	EF.alias_static = alias_kind == "static"
 	-- A fragment runs in the CALLER's context, where any var may carry an attribute

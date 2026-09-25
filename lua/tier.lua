@@ -375,10 +375,15 @@ function compile_store(path, ast, sh, later)
 	local ok, code = pcall(E.emit, ast, sh.xt_start and { xtrace = true } or nil)
 	local chunk = ok and load(code, "=curse:compiled")
 	if not chunk then
+		if not ok and M.lm_reason(code) then -- (the next run reads it a line at a time)
+			pending_stores[#pending_stores + 1] = { path, "return { lm = true, run = function() end }" }
+		end
 		return nil
 	end
 	local built, m = pcall(chunk)
-	if not (built and type(m) == "table" and m.run) or alias_mismatch(m, sh) then
+	-- (judged by the state the shell STARTED in — the script enabling aliases itself is
+	-- what a static-alias module already models)
+	if not (built and type(m) == "table" and m.run) or alias_mismatch(m, sh.tier_start or sh) then
 		return nil
 	end
 	local okd, bc = pcall(string.dump, chunk, true)
@@ -390,6 +395,83 @@ function compile_store(path, ast, sh, later)
 	modcache_put(path, m)
 	return m
 end
+-- LINE MODE. A script whose PARSE depends on run-time state — an alias defined as it
+-- runs, history expansion, set -v echo — can't be compiled whole: the interpreter's
+-- reader (run_lazy / run_history_lines) reads it a logical line at a time with the live
+-- alias table, and each line then runs COMPILED (interp run_group -> here), as a line-mode
+-- fragment. Its module is keyed by the line's text as parsed (aliases already spliced
+-- in), its line, and the state the rest of the parse depends on (the alias table for the
+-- $(…) bodies parsed later, expand_aliases, posix, extglob) — memoized in this worker and
+-- stored in the disk cache, so a re-run loads each line's bytecode. nil: the line can't
+-- compile (the interpreter runs it).
+local lm_fail = {}
+local LM_DEBUG = os.getenv("CURSE_LM_DEBUG")
+local function lm_key(sh, lg)
+	if not (lg.src and lg.spos and lg.pos) then
+		return nil
+	end
+	local al = {}
+	for k, v in pairs(sh.aliases or {}) do
+		al[#al + 1] = k .. "=" .. v
+	end
+	table.sort(al)
+	local so = sh.shopt or {}
+	return table.concat({ "curse-line", tostring(lg.sline or 0),
+		(so.expand_aliases and "a" or "-") .. (sh.opt_posix and "p" or "-") .. (so.extglob and "g" or "-"),
+		table.concat(al, "\1"), lg.src:sub(lg.spos, lg.pos - 1) }, "\0")
+end
+function M.lm_exec(sh, lg, k)
+	local key = lm_key(sh, lg)
+	if not key or lm_fail[key] then
+		return nil
+	end
+	local Cache = require("cache")
+	local path = Cache.artifact_path(key)
+	local mod = path and modcache_get(path)
+	if not mod then
+		mod = Cache.load(path)
+		if not mod then
+			-- (a line abort skips the rest of THIS line: all of it is one line group)
+			lg.stmts[1].lgstart = true
+			local ok, code = pcall(E.emit, { stmts = lg.stmts }, { fragment = true, lm = true })
+			local chunk = ok and load(code, "=curse:line")
+			local built, m = false, nil
+			if chunk then
+				built, m = pcall(chunk)
+			end
+			if not (built and type(m) == "table" and m.run) then
+				if LM_DEBUG then
+					io.stderr:write("[line " .. tostring(lg.sline) .. ": interpreted: " .. tostring(m or code) .. "]\n")
+				end
+				lm_fail[key] = true
+				return nil
+			end
+			mod = m
+			if path then
+				local okd, bc = pcall(string.dump, chunk, true)
+				pending_stores[#pending_stores + 1] = { path, okd and bc or code }
+			end
+		end
+		if path then
+			modcache_put(path, mod)
+		end
+	end
+	M.run_compiled(mod, sh, nil)
+	return k + #lg.stmts
+end
+I.lm_exec = M.lm_exec
+-- A program the emitter declined for a LEXICAL reason runs in line mode: its disk-cache
+-- entry is this marker module, so a warm run goes straight to the line reader.
+local LM_MARK = "return { lm = true, run = function() end }"
+local function lm_reason(err)
+	return type(err) == "string" and err:find("curse%-nocompile: line%-mode") ~= nil
+end
+M.lm_reason = lm_reason
+function M.run_lm(sh, src)
+	sh.lm = true
+	I.run_lazy(sh, src)
+end
+
 -- Compile + store the scripts that ran interpreted on a miss (the daemon calls this once
 -- the client has its reply — a worker does it one at a time, while nobody waits).
 function M.has_deferred()
@@ -410,6 +492,8 @@ function M.compile_deferred(one)
 				Cache.store(d.path, okd and bc or code)
 				modcache_put(d.path, m)
 			end
+		elseif lm_reason(code) then -- (runs a line at a time from now on)
+			Cache.store(d.path, LM_MARK)
 		end
 		if one then
 			return
@@ -420,12 +504,18 @@ function M.run_tiered(src, sh)
 	local Cache = require("cache")
 	-- (a shell started under set -x runs a module compiled WITH trace hooks: its own key)
 	sh.xt_start = sh.opt_x or nil
+	sh.tier_start = { opt_x = sh.opt_x, opt_v = sh.opt_v, aliases = next(sh.aliases or {}) and { ["?"] = "" } or {},
+		shopt = { expand_aliases = sh.shopt and sh.shopt.expand_aliases } }
 	local path = Cache.artifact_path(sh.xt_start and (src .. "\0xtrace") or src)
 	if path then
 		local cached = modcache_get(path)
-		if cached and alias_mismatch(cached, sh) then
-			I.run_lazy(sh, src)
-			return sh, "interp"
+		if cached and alias_mismatch(cached, sh) then -- (read a line at a time: each compiled)
+			M.run_lm(sh, src)
+			return sh, "lines"
+		end
+		if cached and cached.lm then
+			M.run_lm(sh, src)
+			return sh, "warm-lines"
 		end
 		if cached then -- in-process hit: no disk read, no module rebuild
 			I.finish_run(sh, function()
@@ -436,8 +526,13 @@ function M.run_tiered(src, sh)
 	end
 	local mod = Cache.load(path)
 	if mod and alias_mismatch(mod, sh) then
-		I.run_lazy(sh, src)
-		return sh, "interp"
+		M.run_lm(sh, src)
+		return sh, "lines"
+	end
+	if mod and mod.lm then
+		if path then modcache_put(path, mod) end
+		M.run_lm(sh, src)
+		return sh, "warm-lines"
 	end
 	if mod then
 		if path then modcache_put(path, mod) end -- memoize the instantiated module
