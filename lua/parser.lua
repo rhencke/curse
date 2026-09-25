@@ -4113,10 +4113,14 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs, xg, bq
 			-- (`func-name=ext () { … }`), as long as the name doesn't END in `=` — that
 			-- is an array/scalar assignment (`a=()`, `x=`), which the assignment path
 			-- handles instead (and `a=(` is caught there before we get here anyway).
-			local s, e = src:find("^[%w_:%.+@/%%%^~,][%w_%.%-:+@/!#=%%%^~,%[%]]*", i)
-			-- (`a[1]()` names a function too; an unbalanced `f[x` is left to the word reader)
-			if s and src:sub(e, e) ~= "=" and (not src:find("^[^][]*[][]", s) or src:find("[][]", s) > e
-				or src:sub(s, e):find("^[^][]*%b[][^][]*$")) then
+			local s, e = src:find("^[%w_:%.+@/%%%^~,][%w_%.%-:+@/!#=%%%^~,]*", i)
+			if s and src:byte(e + 1) == 91 then -- (`a[1]()` names a function too; an unbalanced
+				local _, e2 = src:find("^[%w_%.%-:+@/!#=%%%^~,%[%]]*", e + 1) -- `f[x` is left to the
+				if src:sub(s, e2):find("^[^][]*%b[][^][]*$") then -- word reader)
+					e = e2
+				end
+			end
+			if s and src:byte(e) ~= 61 then
 				local j = e + 1
 				while is_blank(src:sub(j, j)) do
 					j = j + 1
