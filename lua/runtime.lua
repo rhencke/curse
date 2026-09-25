@@ -2147,7 +2147,11 @@ function M.fg_ended(sh, pid, s)
 	if bit.band(s, 0x7f) == 2 then
 		sh.xsigint = true -- (a $(…) whose last command SIGINT killed: capture_inproc)
 	end
-	if sh.xstage then
+	local tx = sh.tail_x
+	if tx and bit.band(s, 0x7f) ~= 0 and tx == M.iso_cur(sh) and not tx.task_fds then
+		sh.tail_x = nil -- (exec'd in place of that subshell: it died by the signal — its
+		tx.tailx = { pid = tonumber(pid), st = s } -- parent reports it, rt.subshell_run)
+	elseif sh.xstage or (tx and tx.task_fds and tx == M.iso_cur(sh)) then -- (a job's process)
 		sh.xproc = { pid = tonumber(pid), st = s }
 	elseif bit.band(s, 0x7f) ~= 0 then
 		local tx, rx = M.cmd_text(sh)
@@ -2332,13 +2336,7 @@ function M.exec_tail_lvl(sh, ...)
 		end
 		return
 	end
-	-- (not in a pipeline stage, nor a $(…) it runs — iso ctx.pipe: bash's drop is only when
-	-- subshell_environment lacks SUBSHELL_PIPE, which a comsub keeps and a ( … ) clears)
 	local ok = (tl < 0 and -1 - tl or tl) == sh.pd and not sh.exec_builtin
-	if ok then
-		local ctx = M.iso_cur(sh)
-		ok = not (ctx and ctx.pipe)
-	end
 	local tr = sh.traps
 	if ok and tl < 0 and tr then
 		local ctx = M.iso_cur(sh)
@@ -2359,10 +2357,20 @@ function M.exec_tail_lvl(sh, ...)
 	if not ok then
 		return sh:exec(...)
 	end
+	-- Exec'd in place, the command's process IS the subshell's: a signal that kills it
+	-- kills the subshell, which its parent reports (M.fg_ended -> ctx.tailx: subshell_run).
+	-- $SHLVL drops unless in a pipeline stage, nor a $(…) it runs — iso ctx.pipe: bash's
+	-- adjust_shell_level is only when subshell_environment lacks SUBSHELL_PIPE, which a
+	-- comsub keeps and a ( … ) clears.
+	local ctx = M.iso_cur(sh)
 	local d = M.shlvl_delta
-	M.shlvl_delta = d - 1
+	if not (ctx and ctx.pipe) then
+		M.shlvl_delta = d - 1
+	end
+	local sx = sh.tail_x
+	sh.tail_x = ctx
 	local eok, err = pcall(sh.exec, sh, ...)
-	M.shlvl_delta = d
+	M.shlvl_delta, sh.tail_x = d, sx
 	if not eok then
 		error(err, 0)
 	end
@@ -3740,7 +3748,7 @@ function M.child_exit(sh, status)
 	C._exit(status or 0)
 end
 
-function Shell:subshell_run(runner, saves, paren)
+function Shell:subshell_run(runner, saves, paren, inplace)
 	if self.jobs_waited then -- (bash's cleanup_dead_jobs, on a fork: the notified dead jobs go)
 		M.jobs_cleanup_waited(self)
 	end
@@ -3786,10 +3794,17 @@ function Shell:subshell_run(runner, saves, paren)
 			status = 1
 		elseif type(err) == "table" and err.__curse_vsig == ctx then
 			status = 128 + err.sig -- killed: reported as bash reports a dead foreground child
-			killed = err.sig -- (once its EXIT trap has run — termsig_handler — and it is gone)
+			killed = err.st or err.sig -- (once its EXIT trap has run — termsig_handler — and it is gone)
+			if err.pid then
+				ctx.vpid = err.pid
+			end
 		else
 			rethrow = err
 		end
+	end
+	local tx = ctx.tailx -- (its last command, exec'd in place, died by a signal: so did it)
+	if tx and not rethrow and status == M.wexit(tx.st) then
+		killed, ctx.vpid = tx.st, tx.pid
 	end
 	if not rethrow and ctx.pid == C.getpid() then
 		status = M.iso_exit_trap(self, ctx, status, err)
@@ -3821,7 +3836,23 @@ function Shell:subshell_run(runner, saves, paren)
 		if not ctx.vpid then
 			ctx.vpid = M.alloc_vpid()
 		end
+		local up = M.iso_cur(self)
+		if inplace and up and not rethrow then
+			-- a `( … )` alone in a `( … )` runs in that one's process (execute_in_subshell's
+			-- CMD_NO_FORK for a cm_subshell tcom): it is the one that died
+			error({ __curse_vsig = up, sig = bit.band(killed, 0x7f), st = killed, pid = ctx.vpid }, 0)
+		end
+		if self.pstage and up and up.task_fds and not rethrow then
+			-- a pipeline stage that is just this `( … )` (or a `( … ) &` job): the stage's own
+			-- process died — a process of that job, which reports it (M.pipeline_notify)
+			self.xproc = { pid = ctx.vpid, st = killed }
+			self.status = status
+			return
+		end
 		local tx = type(paren) ~= "boolean" and paren or ""
+		if type(tx) == "table" and tx.bang then -- (`! ( … )`: its CMD_INVERT_RETURN prints)
+			tx = "! " .. require("deparse").command_text(tx)
+		end
 		-- (an interpreted `( … ) >f`: written once interp's restore_redirs has undone >f)
 		M.job_notify(self, { { pid = ctx.vpid, st = killed, text = tx } }, killed, true,
 			type(paren) == "table" and paren.redirs and #paren.redirs > 0, type(paren) == "table" and paren.jcx and paren.jcx.l)
@@ -4300,7 +4331,10 @@ function M.job_done_g(sh, j)
 	if st > 128 then
 		local t = g.tasks and g.tasks[1]
 		local xp = t and t.sh and t.sh.xproc
-		if g.killed then
+		local pl = t and t.sh and t.sh.bg_pl
+		if pl then -- (a pipeline job: its every process is listed)
+			j.sig, j.procs = st - 128, pl
+		elseif g.killed then
 			j.sig = st - 128
 		elseif xp and bit.band(xp.st, 0x7f) ~= 0 and M.wexit(xp.st) == st then
 			j.sig, j.core = st - 128, bit.band(xp.st, 0x80) ~= 0 or nil
@@ -4319,7 +4353,7 @@ function M.jobs_notify(sh, only)
 			j.notified = true
 			-- (one bash doesn't report — TERM, INT, PIPE — stays listed, as an exited job does,
 			-- until `jobs` or `wait` shows it)
-			if M.job_notify(sh, { { pid = j.pid, st = j.sig + (j.core and 0x80 or 0), text = j.cmd } }, j.sig, false)
+			if M.job_notify(sh, j.procs or { { pid = j.pid, st = j.sig + (j.core and 0x80 or 0), text = j.cmd } }, j.sig, false)
 				and not only then
 				M.job_delete(sh, j)
 			end
@@ -4796,6 +4830,7 @@ local function co_launch(ctx, self, stage_fns, inproc, base, lastpipe, upv)
 			end
 			sh.out = make_out(t)
 			sh.xstage = kind == "sflat" or nil -- (its external is a process of this job: see rt.fg_ended)
+			sh.pstage = kind == "flat" or nil -- (its `( … )` is that process: see subshell_run)
 			t.sh = sh
 			g.tasks[i] = t
 			t.simple = kind == "sflat"
@@ -5048,14 +5083,16 @@ local function co_finish(ctx, self, g)
 	self:array_assign("PIPESTATUS", pstat, false)
 	self.status = self.opt_pipefail and pipe or last
 	self.last_stage_status = last -- (the ERR quirk for a failing `( … )` last stage)
-	if self.status > 128 and g.texts and not g.bg and not self.bg_pipe then
-		M.pipeline_notify(self, g)
+	if self.status > 128 and g.texts and not g.bg then
+		M.pipeline_notify(self, g, self.bg_pipe)
 	end
 end
 -- A foreground pipeline ended with a signal's status: its job's report (M.job_notify), one
 -- process per stage — a stage's own external (its pid and wait status), else the in-process
 -- stage itself (a virtual pid, its exit status).
-function M.pipeline_notify(sh, g)
+-- `keep`: a `a | b &` job's pipeline — its processes are kept for the job's own report
+-- (sh.bg_pl: M.job_done_g).
+function M.pipeline_notify(sh, g, keep)
 	local procs = {}
 	for k = 1, g.n do
 		local t = g.tasks[k]
@@ -5081,6 +5118,10 @@ function M.pipeline_notify(sh, g)
 				break
 			end
 		end
+	end
+	if keep then
+		sh.bg_pl = procs
+		return
 	end
 	M.job_notify(sh, procs, js, true)
 end

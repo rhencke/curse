@@ -1694,6 +1694,36 @@ function M.mark_tail(body, paren)
 		and not (n > 1 and body[n - 1].t == "background") then
 		last.shtail = (alone and paren) and 2 or 1
 		last.cstail = not paren or nil -- (a $( … ) body's: a function it calls passes it on)
+	elseif last and alone and paren and last.t == "subshell" and not last.ttimed then
+		last.inplace = true -- (a `( … )` alone in one: run in its process — rt.subshell_run)
+	elseif last and alone and paren and last.t == "pipeline" and last.negate and #last.cmds == 1 then
+		last.cmds[1].bang = nil
+	end
+end
+-- A `time ( … )` (`time ! ( … )`): execute_in_subshell passes CMD_TIME_PIPELINE on to the
+-- body, so the subshell times it itself, INSIDE its redirections (`time ( … ) 2>f` writes
+-- the report to f) — and no command of it is exec'd in place: the body becomes one timed
+-- group (.tw; `ttimed` keeps the `time` for deparse). A `! ( … )`: the `!` shows in its job
+-- text (.bang) — unless it's alone in a `( … )`, whose execute_in_subshell strips the flag
+-- (mark_tail).
+function M.untail(pipe, sub, timed, timed_p)
+	if not timed then
+		sub.bang = true
+		return
+	end
+	local body = sub.body
+	local last = body[#body]
+	if last and last.t == "andor" then
+		last = last.items[#last.items].cmd
+	end
+	if last then
+		last.shtail, last.cstail, last.inplace = nil, nil, nil
+	end
+	sub.body = { { t = "group", line = body[1] and body[1].line or sub.line, body = body, tw = true,
+		timed = true, timed_p = timed_p or nil } }
+	pipe.timed, pipe.timed_p, pipe.ttimed = nil, nil, timed_p and "p" or true
+	if pipe ~= sub then
+		sub.bang = true
 	end
 end
 -- …and a function called as a $( … ) body's tail passes that on to its own body's last
@@ -1712,6 +1742,7 @@ function M.mark_fntail(body, name)
 end
 M.scan_braces = scan_braces
 M.grab_dparen = grab_dparen
+M.fn_bstart = 1 -- (parse.y's function_bstart, a static: see func_body)
 
 -- Memoize the runtime-facing parsers. The interpreter re-parses the SAME arith
 -- expressions and words on every loop iteration — $(( … )), array subscripts,
@@ -3717,15 +3748,20 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs, xg, bq
 		if (kw and FBODY_KW[kw] and not src:find("^[^ \t\n;&|()<>]", i + #kw))
 			or src:find("^%[%[[ \t\n]", i) or src:sub(i, i + 1) == "((" then
 			local node = parse_command()
+			jcx.l = M.fn_bstart -- (bash's tc->line: see below)
 			if node.t ~= "subshell" then
 				return { node }, bline
 			end
 			-- (`((` that was two nested subshells: the subshell body, as below)
+			node.jcx = { l = M.fn_bstart }
 			return { node }, bline, true
 		end
 		if src:sub(i, i) == "(" then
 			i = i + 1
+			local fjcx = jcx
+			jcx = {}
 			local body, pterm = parse_stmts({ [")"] = true })
+			jcx.l, jcx = line, fjcx -- (bash's subshell->line: where it closes)
 			if pterm ~= ")" then
 				error("syntax error: unexpected end of file") -- unclosed ( )
 			end
@@ -3733,8 +3769,13 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs, xg, bq
 				error("syntax error near `)'") -- (`f() ( )`: bash)
 			end
 			M.mark_tail(body, true)
-			return { { t = "subshell", line = bline, body = body } }, bline, true
+			-- the line its caller reports the subshell's job at: execute_function's
+			-- line_number = tc->line, which make_function_def sets to function_bstart — only
+			-- a `{` body's parse updates that (parse.y's PST_ALLOWOPNBRC), so any other body
+			-- carries the last `{`-bodied function's `{` line (0 -> 1: notify_of_job_status)
+			return { { t = "subshell", line = bline, body = body, jcx = { l = M.fn_bstart } } }, bline, true
 		end
+		M.fn_bstart = bline -- (at its `{`: a function defined inside moves it on)
 		return brace_group(), bline
 	end
 	-- A function definition, with any trailing redirects (`f() { … } >&2`) that apply
@@ -5481,6 +5522,9 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs, xg, bq
 			pipe.timed = true
 			pipe.timed_p = timed_p
 		end -- `time` prefix: measure this pipeline
+		if #cmds == 1 and first.t == "subshell" and (timed or negate) then
+			M.untail(pipe, first, timed, timed_p)
+		end
 		return pipe
 	end
 
