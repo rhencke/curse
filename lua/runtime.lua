@@ -1515,7 +1515,12 @@ function M.fd_number(s)
 	local n = #d < 11 and (tonumber(d) or 0) or -1
 	return n > 2147483647 and -1 or n
 end
+M.RESTRICTED_OUT = { out = true, clobber = true, app = true, rw = true, outboth = true, appboth = true }
 function M.redir_apply(sh, op, fd, target, saves)
+	if sh.opt_r and M.RESTRICTED_OUT[op] then -- a restricted shell writes no files (interp's apply)
+		io.stderr:write("curse: " .. tostring(target) .. ": restricted: cannot redirect output\n")
+		return false
+	end
 	io.flush() -- flush buffered stdout before moving fds (else it lands in the new target)
 	-- In a pipeline stage, builtins write the redirected fd 1 directly while it's moved (as
 	-- the interpreter does): the stage's buffer would reach it only at restore, too late
@@ -11363,6 +11368,9 @@ function M.source_run(sh, argv, line)
 	if not name or (j == 2 and name:match("^%-.")) then
 		return require("b_source")(sh, argv[1], argv, nil, nil) -- usage error: let b_source diagnose
 	end
+	if sh.opt_r and name:find("/", 1, true) then -- (restricted: b_source refuses it)
+		return require("b_source")(sh, argv[1], argv, nil, nil)
+	end
 	local file = M.source_path(sh, name)
 	if Ii.file_test("-d", file) then
 		return require("b_source")(sh, argv[1], argv, nil, nil) -- directory: b_source diagnoses
@@ -12645,6 +12653,11 @@ function M.funcnest_over(sh, name)
 		error({ __curse_exit = 1, __curse_lineabort = true, __curse_discard = true })
 	end
 	return false
+end
+-- One word's value in assignment context (no splitting, no globbing) through the shared
+-- word expander — for an array element the compiled renderers can't express natively.
+function M.assign_word(sh, w)
+	return require("interp").expand_assign_word(sh, w)
 end
 
 return M

@@ -379,10 +379,16 @@ local function scan_xtrace(node, acc)
 			if not l or l == "xtrace" or (l:match("^%-%a+$") and l:find("x", 2, true)) then
 				acc.x = true -- (a non-literal word may be -x)
 			end
-			-- (restricted mode too: its checks live only on the interpreter's paths)
-			-- (set -k: interp re-reads NAME=value words anywhere as assignments)
-			if l and (l == "restricted" or l == "keyword" or (l:match("^%-%a+$") and l:find("[rk]", 2))) then
-				return "set -" .. (l:match("^%-%a+$") and l:match("[rk]", 2) or l:sub(1, 1))
+			-- (set -k: a NAME=value word anywhere is an assignment — H.simple compiles both
+			-- readings of a command that has one, picked by sh.opt_k)
+			if not l or l == "keyword" or (l:match("^%-%a+$") and l:find("k", 2, true)) then
+				acc.k = true
+			end
+			-- (restricted mode: the variables it guards turn readonly — assignments take the
+			-- readonly-checking paths; redirections, `/` in command names, cd/exec/`.` refuse
+			-- in the runtime and builtins)
+			if not l or l == "restricted" or (l:match("^%-%a+$") and l:find("r", 2, true)) then
+				acc.r = true
 			end
 			if l and (l == "verbose" or (l:match("^%-%a+$") and l:find("[vH]", 2))) then
 				acc.lex = acc.lex or ("set -" .. (l:match("^%-%a+$") and l:match("[vH]", 2) or "v"))
@@ -401,7 +407,7 @@ local function scan_xtrace(node, acc)
 			end
 		end
 	end
-	return nil, acc.x, acc.lex, acc.funcnest, acc.bcmd, acc.enable
+	return nil, acc.x, acc.lex, acc.funcnest, acc.bcmd, acc.enable, acc.k, acc.r
 end
 -- functrace (set -T / -o functrace) extends DEBUG into subshells, which compiled
 -- fragments don't hook — keep those programs on the delegated path.
@@ -940,6 +946,7 @@ function EF.xta(lhs, v) -- an assignment `lhs` (`x=`, `a[i]+=`) of the expanded 
 end
 EF.has_return = false -- program may set a RETURN trap → compiled calls fire it (fnwrap)
 EF.bash_command = false -- program reads $BASH_COMMAND → each command records its text (dbg)
+EF.keyword = false -- program may `set -k` → a command with a NAME=value word compiles both ways
 EF.enable = false -- program may run `enable -n` → a native builtin call checks it's still enabled
 EF.funcnest = false -- program may set $FUNCNEST → compiled calls check the call depth (fnwrap)
 EF.funcstack = false -- program reads $FUNCNAME → maintain sh.funcstack around calls
@@ -1898,6 +1905,22 @@ emit_word = function(w, lifted)
 	return "(" .. table.concat(parts, " .. ") .. ")"
 end
 
+-- An array element's value in ASSIGNMENT context (`a=([k]=$v)`, an assoc's bare word):
+-- emit_word when it can render the word; else the word's value comes from the shared
+-- word expander (rt.assign_word — one word, no statement), when it reads no lifted var.
+function EF.assign_word_expr(w, lifted)
+	if emitable_word(w) then
+		return emit_word(w, lifted)
+	end
+	local names = {}
+	EF.collect_word(w, names)
+	for n in pairs(names) do
+		if lifted[n] then
+			error("curse-nocompile: ${..} operator on a lifted variable")
+		end
+	end
+	return ("rt.assign_word(sh, %s[1])"):format(EF.konst({ ser(w) }))
+end
 -- set -x of an arithmetic text ((( )), a for (( )) slot): `+ (( text ))`, the text
 -- expanded like a "…" string first when it holds a $ or ` (bash)
 function EF.xtarith(src, lifted)
@@ -3615,6 +3638,7 @@ local function collect_word(w, set)
 		end
 	end
 end
+EF.collect_word = collect_word -- (EF.assign_word_expr, defined before it)
 -- Every variable a statement list assigns or reads — walking EVERY node shape (&&/||
 -- lists, pipelines, groups, (( )), case bodies, …): a lifted var one of these touches
 -- must stay in sync, so missing one is a wrong answer, not a slow one.
@@ -4714,6 +4738,47 @@ end
 -- still static (rt.names_static) -> the compiled code; else the interpreter's live dispatch.
 local simple_compiled
 H.simple = function(cx, st, after)
+	-- set -k (keyword): an assignment-shaped word anywhere is an assignment for the command
+	-- (interp's exec_stmt): compile that reading too, and pick by sh.opt_k at run time
+	if EF.keyword and st.words and not st._kw then
+		local keep, extra = {}, nil
+		for _, w in ipairs(st.words) do
+			local p1 = w.parts and w.parts[1]
+			local a
+			if p1 and p1.lit and not p1.q and w.src and p1.lit:match("^[%a_][%w_]*%+?=") then
+				local ok, pa = pcall(function()
+					return require("parser").parse(w.src).stmts[1]
+				end)
+				a = ok and pa and pa.t == "assign" and pa or nil
+			end
+			if a then
+				extra = extra or {}
+				extra[#extra + 1] = a
+			else
+				keep[#keep + 1] = w
+			end
+		end
+		if extra then
+			local st1, st2 = { _kw = true }, { _kw = true }
+			for k2, v in pairs(st) do
+				st1[k2], st2[k2] = v, v
+			end
+			st1._kw, st2._kw = true, true
+			local as = {}
+			for _, a in ipairs(st.assigns or {}) do
+				as[#as + 1] = a
+			end
+			for _, a in ipairs(extra) do
+				as[#as + 1] = a
+			end
+			st2.words, st2.assigns = keep, as
+			local pk = #keep > 0 and H.simple(cx, st2, after) or cx.delegate(st2, after)
+			local pn = H.simple(cx, st1, after)
+			local g = cx.newpc()
+			cx.blocks[g] = ("if sh.opt_k then pc = %d else pc = %d end"):format(pk, pn)
+			return g
+		end
+	end
 	local ua = false -- a word with an unquoted $((…)), else one field (arith_guard)
 	for _, w in ipairs(st.words or {}) do
 		if arith_guard(w) then
@@ -4882,19 +4947,19 @@ simple_compiled = function(cx, st, after)
 				if e.key ~= nil then
 					local fl = unq_full_lit(e.word)
 					local valx = (fl and fl:find("~", 1, true)) and ("rt.tilde_assign(sh, %q)"):format(fl)
-						or emit_word(e.word, cx.lifted)
+						or EF.assign_word_expr(e.word, cx.lifted)
 					parts[#parts + 1] = ("__it[#__it+1] = {key=%q, op=%q, val=%s, decl=true}"):format(EF.static_key(e.key), e.op, valx)
 				elseif not empty_word(e.word) then
 					-- an assoc's key/value words don't split or glob (see H.arrayassign)
 					if isassoc then
-						parts[#parts + 1] = ("__it[#__it+1] = {val=%s, decl=true}"):format(emit_word(e.word, cx.lifted))
+						parts[#parts + 1] = ("__it[#__it+1] = {val=%s, decl=true}"):format(EF.assign_word_expr(e.word, cx.lifted))
 					else
 						if not parts.asq then -- (asked once per statement)
 							parts.asq = true
 							parts[#parts + 1] = ("local __as = sh:is_assoc(%q)"):format(a1.name)
 						end
 						parts[#parts + 1] = ("if __as then __it[#__it+1] = {val=%s, decl=true} else %s end"):format(
-							emit_word(e.word, cx.lifted),
+							EF.assign_word_expr(e.word, cx.lifted),
 							emit_fields_into("__it", e.word, cx.lifted, "{val=%s}")
 						)
 					end
@@ -6713,7 +6778,7 @@ H.arrayassign = function(cx, st, after)
 				-- rt.tilde_assign, like scalar `x=~:~`), else the ordinary word value.
 				local fl = unq_full_lit(e.word)
 				local valx = (fl and fl:find("~", 1, true)) and ("rt.tilde_assign(sh, %q)"):format(fl)
-					or emit_word(e.word, cx.lifted)
+					or EF.assign_word_expr(e.word, cx.lifted)
 				local kw = EF.aa_keyword(e.key)
 				local keyx = kw and emit_word(kw, cx.lifted) or ("%q"):format(EF.static_key(e.key))
 				local item = ("do local __k = %s; __it[#__it+1] = {key=__k, op=%q, val=%s, src=%q, rawkey=%q} end"):format(
@@ -6743,7 +6808,7 @@ H.arrayassign = function(cx, st, after)
 				else
 					asq()
 					parts[#parts + 1] = ("if __as then __it[#__it+1] = {val=%s%s} else %s end"):format(
-						emit_word(e.word, cx.lifted),
+						EF.assign_word_expr(e.word, cx.lifted),
 						srcf,
 						emit_fields_into("__it", e.word, cx.lifted, "{val=%s}")
 					)
@@ -8031,7 +8096,8 @@ function M.emit(ast, opts)
 	-- a program that can turn on xtrace (`set -x`, `set -o xtrace`, a dynamic `set` word)
 	-- carries per-command trace hooks (`if sh.opt_x then rt.xtrace…`); other machinery the
 	-- compiled tier lacks keeps the program interpreted (the reason names it)
-	local xwhy, xt, xlex, fnest, bcmd, enable = scan_xtrace(ast.stmts)
+	local xwhy, xt, xlex, fnest, bcmd, enable, kw, restr = scan_xtrace(ast.stmts)
+	EF.keyword = kw or false
 	EF.bash_command = bcmd or false
 	-- (`enable -n NAME` here, or maybe in eval/source code or around a fragment: a native
 	-- builtin call first checks the name is still a builtin)
@@ -8066,7 +8132,7 @@ function M.emit(ast, opts)
 	-- (readonly/integer/case/nameref) the fragment's own code can't see, so force the
 	-- attribute- and nameref-aware assign paths (they do the readonly check, int coercion,
 	-- nameref write-through). Otherwise a compiled `eval "x=v"` would skip readonly, etc.
-	EF.has_attr = EF.fragment or scan_attr(ast.stmts) -- gate compiled attribute-aware scalar assign
+	EF.has_attr = EF.fragment or restr or scan_attr(ast.stmts) -- gate compiled attribute-aware scalar assign
 	EF.has_dyncode = scan_dyncode(ast.stmts) -- eval/source present → a $(…) can't assume its body's names are externals
 	EF.ro_names = nil -- (this program's readonly names: computed on first need — func_locals)
 	EF.frag_nameref = EF.fragment and scan_nameref(ast.stmts) -- (the fragment's own text)
