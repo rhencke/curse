@@ -421,18 +421,17 @@ I.frag_hook = M.frag_hook -- (the interpreter's isolated contexts tier their hot
 -- in a subshell, or redefined (none of those is in the program's own module) — compiles
 -- standalone from its definition's exact text at its own line, and its later calls run
 -- the compiled closure (cached on the definition node, per trap state). Not while aliases
--- are live (the text parses without them), nor under a RETURN trap, functrace'd DEBUG or
--- $FUNCNEST (a compiled body doesn't fire/count those for the calls it makes itself).
+-- are live (the definition parsed with the table as it was then).
 function M.fn_hot(sh, name, def)
 	local n = (def._calls or 0) + 1
 	def._calls = n
 	if n < HOT_LOOP or not def.deftext then
 		return nil
 	end
-	local t = sh.traps
+	-- (its compiled body fires DEBUG under functrace, RETURN and $FUNCNEST for the calls it
+	-- makes — mode "T" keys it; live aliases: the definition parsed with the table AS IT WAS)
 	local mode = trap_mode(sh)
-	if mode:find("T", 1, true)
-		or (sh.shopt.expand_aliases and sh.aliases and next(sh.aliases)) then
+	if sh.shopt.expand_aliases and sh.aliases and next(sh.aliases) then
 		return nil
 	end
 	if def._cfnm == mode then
