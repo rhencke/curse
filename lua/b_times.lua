@@ -18,6 +18,10 @@ local C, P = I.C, I.P
 
 return function(sh, cmd, args, hook, tcb)
 	if cmd == "times" then
+		-- (no options: bash's no_options — `--` is skipped, `-x` a usage error)
+		if args[2] and args[2]:match("^%-.") and args[2] ~= "--" then
+			return rt.bad_option(sh, "times", args[2]:sub(1, 2))
+		end
 		-- Two lines: shell user/sys, then children user/sys, each `%dm%.3fs`.
 		local function ct(s)
 			return ("%dm%.3fs"):format(math.floor(s / 60), s % 60)
