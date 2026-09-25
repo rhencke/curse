@@ -1862,10 +1862,14 @@ function compile_cmdsub_inner(src, backtick, lifted, aenv, noalias, posix)
 		end
 		aenv = EF.lm_aenv
 	end
-	local pok, ast = pcall(require("parser").parse, src, nil, aenv, noalias, posix, EF.cur_cline or EF.cur_line)
+	local pok, ast = pcall(require("parser").parse, src, nil, aenv, noalias, posix, EF.cur_cline or EF.cur_line,
+		nil, nil, backtick)
 	if not pok or type(ast) ~= "table" or ast.stmts == nil then
 		return fallback
 	end -- syntax error
+	if backtick and ast.xg_guess then -- (a `…` body is parsed when it runs, under the live
+		return fallback -- extglob state: its `X(` can't be decided statically)
+	end
 	require("parser").mark_tail(ast.stmts)
 	-- A syntax error inside $(…) is fatal to the containing command (bash, status 2);
 	-- capture_src reproduces that exactly, so route any parse_error body there.
@@ -3335,11 +3339,9 @@ EF.emit_regex_glob = function(w, lifted)
 	end
 	return table.concat(out, " .. ")
 end
--- An `a=(…)` array literal the compiled tier can build: each BARE element's word is
--- field-engine-able (word_safe/field_word/seg_native), and each KEYED element `[k]=v` has
--- a LITERAL subscript (no $/`/quote — so rt.arrayassign resolves it with no word engine:
--- assoc verbatim, indexed via arith_str) and an emit_word-able value. An `a[i]=(…)`
--- list-to-member error, a brace-de-keyed element, or a nameref program keep I.run_arrayassign.
+-- An `a=(…)` array literal is always compiled (H.arrayassign): each BARE element's word
+-- field-split natively (word_safe/field_word/seg_native) or by the shared one-word expander,
+-- each KEYED element's subscript a static literal, an emit_word-able word, or the expander.
 -- A keyed array subscript that resolves to a STATIC literal at compile time: a plain literal,
 -- or a fully-quoted key (`['a+1']`, `["k k"]`) whose quotes we strip now. Returns the unquoted
 -- literal, or nil for a dynamic subscript ($/`/mixed expansion) that must delegate. For an assoc
@@ -3391,34 +3393,26 @@ local function aa_fallback_ok(w, lifted)
 	end
 	return true
 end
-local function arrayassign_ok(st, lifted)
-	-- (a nameref is resolved at run time by rt.arrayassign, as interp's do_arrayassign; an
-	-- `a[i]=(…)` is H.arrayassign's own error path)
-	if st.index then
-		return false
+-- (a fallback word that reads a lifted variable: the shared expander works on `sh`, so the
+-- lifted locals are flushed to it first and reloaded after — a `$((b=…))` may set one)
+function EF.aa_wrap(code, w, lifted)
+	if aa_fallback_ok(w, lifted) then
+		return code
 	end
-	for _, e in ipairs(st.elems) do
-		if e.key ~= nil then
-			local kw = aa_keyword(e.key)
-			if kw == nil then
-				local ok, w = pcall(require("parser").parse_word, e.key)
-				if not ok or not aa_fallback_ok(w, lifted) then
-					return false
-				end
-			end
-			if not emitable_word(e.word) and not aa_fallback_ok(e.word, lifted) then
-				return false
-			end
-			for _, bw in ipairs(e.brace_bare or {}) do -- (an indexed target de-keys it: fields)
-				if not aa_fieldable(bw, lifted) and not aa_fallback_ok(bw, lifted) then
-					return false
-				end
-			end
-		elseif e.op ~= "=" or (not aa_fieldable(e.word, lifted) and not aa_fallback_ok(e.word, lifted)) then
-			return false
-		end
+	local sync, reload = {}, {}
+	for n in spairs(lifted) do
+		sync[#sync + 1] = ("sh:aset(%q, %s)"):format(n, lname(n))
+		reload[#reload + 1] = ("%s = sh:aget(%q)"):format(lname(n), n)
 	end
-	return true
+	return table.concat(sync, "; ") .. "; " .. code .. "; " .. table.concat(reload, "; ")
+end
+-- `local <dst> = <w's value>` as an assignment RHS: rendered natively, else the shared
+-- expander (EF.aa_wrap)
+function EF.aa_value(dst, w, lifted)
+	if emitable_word(w) then
+		return ("local %s = %s"):format(dst, emit_word(w, lifted))
+	end
+	return EF.aa_wrap(("local %s = rt.assign_elem(sh, %s[1])"):format(dst, EF.konst({ ser(w) })), w, lifted)
 end
 -- An array element word's fields appended to `into` as {val=…} items: natively when the
 -- field engine takes it, else through the shared one-word expander (rt.aa_fields)
@@ -3426,7 +3420,7 @@ function EF.aa_fields(into, w, lifted)
 	if aa_fieldable(w, lifted) then
 		return emit_fields_into(into, w, lifted, "{val=%s}")
 	end
-	return ("rt.aa_fields(sh, %s[1], %s)"):format(EF.konst({ ser(w) }), into)
+	return EF.aa_wrap(("rt.aa_fields(sh, %s[1], %s)"):format(EF.konst({ ser(w) }), into), w, lifted)
 end
 -- (the declare/local/typeset literal path keeps the strict gate: literal keys only, no
 -- brace de-keying, no side-effecting arith)
@@ -5133,7 +5127,7 @@ H.funcdef = function(cx, st, after)
 		return p
 	end
 	local p = cx.newpc()
-	if not st.name:match("^[%w_:%.+@/%%%^~,!][%w_%.%-:+@/!#=%%%^~,]*$") then -- name is an expansion (`$foo-bar()`):
+	if not st.name:match("^[%w_:%.+@/%%%^~,!][%w_%.%-:+@/!#=%%%^~,%[%]]*$") then -- name is an expansion (`$foo-bar()`):
 		cx.blocks[p] = ("io.stderr:write(%q); sh.status = 1; pc = %d") -- non-fatal runtime error (bash)
 			:format("curse: `" .. st.name .. "': not a valid identifier\n", after)
 	else
@@ -5881,7 +5875,7 @@ simple_compiled = function(cx, st, after)
 	-- NOT restore (they outlive the statement), status 0 / 1 on failure, exactly interp's
 	-- exec path. `exec cmd…` (process replacement) and an uncompilable redir shape delegate.
 	if cmd == "exec" and #st.words == 1 and st.redirs and not st.assigns then
-		local re = cx.redir_conds(st, nil) -- nil cmd bypasses the exec guard in redir_conds
+		local re = cx.redir_conds(st, nil, "exec") -- nil cmd bypasses the exec guard in redir_conds
 		if re then
 			local p = cx.newpc()
 			-- (a failed one undoes the rest and, exec being a special builtin, is fatal under
@@ -7691,7 +7685,7 @@ H.arrayassign = function(cx, st, after)
 		cx.blocks[p] = dbg(st) .. ("rt.arrayassign_member(sh, %q, %q); pc = %d"):format(st.name, st.index, after)
 		return p
 	end
-	if arrayassign_ok(st, cx.lifted) then
+	do
 		local p = cx.newpc()
 		local parts = { "local __it = {}" }
 		local function asq()
@@ -7708,17 +7702,22 @@ H.arrayassign = function(cx, st, after)
 				-- keyed value: assign-context RHS (an all-literal ~ colon-expands via
 				-- rt.tilde_assign, like scalar `x=~:~`), else the ordinary word value.
 				local fl = unq_full_lit(e.word)
-				local valx = (fl and fl:find("~", 1, true)) and ("rt.tilde_assign(sh, %q)"):format(fl)
-					or EF.assign_word_expr(e.word, cx.lifted)
+				local valc = (fl and fl:find("~", 1, true)) and ("local __v = rt.tilde_assign(sh, %q)"):format(fl)
+					or EF.aa_value("__v", e.word, cx.lifted)
 				local kw = EF.aa_keyword(e.key)
-				local keyx = kw and emit_word(kw, cx.lifted)
+				local keyc
 				if kw == nil then -- (a subscript emit can't render: the shared expander)
-					keyx = ("rt.assign_elem(sh, %s[1])"):format(EF.konst({ ser(require("parser").parse_word(e.key)) }))
+					local pok, kwd = pcall(require("parser").parse_word, e.key)
+					keyc = pok and EF.aa_wrap(("local __k = rt.assign_elem(sh, %s[1])"):format(EF.konst({ ser(kwd) })),
+						kwd, cx.lifted)
+						or ("local __k = rt.assign_elem(sh, require(\"parser\").parse_word(%q))"):format(e.key)
 				elseif not kw then
-					keyx = ("%q"):format(EF.static_key(e.key))
+					keyc = ("local __k = %q"):format(EF.static_key(e.key))
+				else
+					keyc = "local __k = " .. emit_word(kw, cx.lifted)
 				end
-				local item = ("do local __k = %s; __it[#__it+1] = {key=__k, op=%q, val=%s, src=%q, rawkey=%q} end"):format(
-					keyx, e.op, valx, e.word and e.word.src or "", e.key)
+				local item = ("do %s; %s; __it[#__it+1] = {key=__k, op=%q, val=__v, src=%q, rawkey=%q} end"):format(
+					keyc, valc, e.op, e.word and e.word.src or "", e.key)
 				if e.brace_bare then -- an INDEXED target de-keys it: `[k]=` literal in each brace word
 					asq()
 					local bf = {}
@@ -7743,8 +7742,8 @@ H.arrayassign = function(cx, st, after)
 						fl == e.word.src and "{val=%s}" or ("{val=%s" .. srcf .. "}"))
 				else
 					asq()
-					parts[#parts + 1] = ("if __as then __it[#__it+1] = {val=%s%s} else %s end"):format(
-						EF.assign_word_expr(e.word, cx.lifted),
+					parts[#parts + 1] = ("if __as then %s; __it[#__it+1] = {val=__v%s} else %s end"):format(
+						EF.aa_value("__v", e.word, cx.lifted),
 						srcf,
 						EF.aa_fields("__it", e.word, cx.lifted)
 					)
@@ -7792,29 +7791,6 @@ H.arrayassign = function(cx, st, after)
 			.. ("; pc = %d"):format(after)
 		return p
 	end
-	-- a=(…): dispatch to the array-assign runtime primitive (readonly/index checks +
-	-- error-contained do_arrayassign + status/$_), NOT the exec_stmt tree-walker. Flush
-	-- lifted operands to sh first (an elem may read one) and reload after (a `$((b=…))`
-	-- elem may write one).
-	local sync, reload = {}, {}
-	for n in spairs(cx.lifted) do
-		sync[#sync + 1] = ("sh:aset(%q, %s)"):format(n, lname(n))
-	end
-	for n in spairs(cx.lifted) do
-		reload[#reload + 1] = ("%s = sh:aget(%q)"):format(lname(n), n)
-	end
-	local p = cx.newpc()
-	local ec = errchk(st)
-	local ecs = ec ~= "" and ("; " .. ec) or ""
-	local pre = #sync > 0 and (table.concat(sync, "; ") .. "; ") or ""
-	local post = #reload > 0 and ("; " .. table.concat(reload, "; ")) or ""
-	cx.blocks[p] = dbg(st) .. EF.xtarr(st)
-		.. pre
-		.. ("I.run_arrayassign(sh, %s)"):format(ser(st))
-		.. post
-		.. ecs
-		.. ("; pc = %d"):format(after)
-	return p
 end
 
 -- statement handler: case (split out of flatten_stmt; see H)
@@ -8275,7 +8251,7 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
 	-- a brace/cmdsub/procsub/non-seg target). A FILE target that is a static literal path applies
 	-- directly; an EXPANDABLE one ($/glob/~ etc.) hands mask-aware segments to redir_apply_expand
 	-- (field expansion + the ambiguous-redirect check at runtime).
-	function cx.redir_apply_expr(r)
+	function cx.redir_apply_expr(r, cname)
 		local e = cx.redir_native_expr(r)
 		if e then
 			return e
@@ -8286,7 +8262,8 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
 		-- on a one-element list — the redirect analogue of rt.word_fields), its fd saves joining
 		-- __rs so the compiled restore undoes them. Lifted locals are flushed to sh around it
 		-- (the target may read them, `{v}` / `${x:=f}` may write them).
-		local call = ("rt.redir_apply_one(sh, %s[1], __rs)"):format(EF.konst({ ser(r) }))
+		local call = ("rt.redir_apply_one(sh, %s[1], __rs%s)"):format(EF.konst({ ser(r) }),
+			(r.fdvar and cname) and (", %q"):format(cname) or "")
 		local si, so = {}, {}
 		for n in spairs(cx.lifted) do
 			si[#si + 1] = ("sh:aset(%q, %s); "):format(n, lname(n))
@@ -8359,13 +8336,13 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
 	end
 	-- Build the "install all redirs, run, restore" conditions for `st.redirs`, or nil if any redir
 	-- can't be compiled (caller delegates) or the command is `exec` (whose redirs must PERSIST).
-	function cx.redir_conds(st, cmd)
+	function cx.redir_conds(st, cmd, cname)
 		if cmd == "exec" then
 			return nil
 		end
 		local conds = {}
 		for _, r in ipairs(st.redirs) do
-			local e = cx.redir_apply_expr(r)
+			local e = cx.redir_apply_expr(r, cname or cmd)
 			if not e then
 				return nil
 			end
@@ -8490,7 +8467,7 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
 		EF.cur_infunc = not cx.toplevel and not cx.topcode -- … or a function)
 		if st.line then
 			cx.prev_line = EF.cur_line -- (the command before: a redirected compound's errors)
-			EF.cur_line = t == "simple" and st.cline or st.line -- (a simple command: interp's rule)
+			EF.cur_line = (t == "simple" or t == "assign") and st.cline or st.line -- (a simple command: interp's rule)
 			EF.cur_cline = st.cline or st.line
 		end -- for $LINENO (compile-time constant)
 		-- `time [-p] pipeline`: start clocks, run the statement itself, report to stderr.

@@ -3007,7 +3007,8 @@ local function open_out(sh, path, mode)
 	return -1
 end
 local FDVAR_NOASSIGN = { GROUPS = 1, FUNCNAME = 1, BASH_ARGC = 1, BASH_ARGV = 1, BASH_SOURCE = 1, BASH_LINENO = 1 }
-local function apply_redirs(sh, redirs, cname) -- cname: the command (names {v} errors)
+local function apply_redirs(sh, redirs, cname, ctx) -- cname: the command (names {v} errors;
+	-- ctx: only names them — compiled code's rt.redir_apply_one)
 	io.flush() -- flush pending stdout BEFORE moving fds, else buffered output from a
 	-- prior command would be redirected into (and lost to) the new target
 	local save, ok = {}, true
@@ -3091,7 +3092,7 @@ local function apply_redirs(sh, redirs, cname) -- cname: the command (names {v} 
 				sh:array_set(fvn, array_key(sh, fvn, fvs), v, false)
 				return true
 			end
-			rt.assign_ctx = cname
+			rt.assign_ctx = cname or ctx
 			local set = sh:set_str(r.fdvar, v)
 			rt.assign_ctx = nil
 			return set ~= false
@@ -5964,7 +5965,7 @@ exec_stmt = function(sh, st, hook)
 	if st.line and t ~= "funcdef" and not (sh.in_trap and sh.in_trap > 0 and (sh.calldepth or 0) == sh.trap_calldepth) then
 		-- a simple command's line is where its SECOND token ended (bash's yacc lookahead:
 		-- `nope "x<NL>y"` errors on line 2); cline records that
-		sh.cur_line = t == "simple" and st.cline or st.line
+		sh.cur_line = (t == "simple" or t == "assign") and st.cline or st.line
 		sh.cur_cline = st.cline or st.line -- (where its $(…) bodies number from)
 	end -- $LINENO: frozen at the trapped line for the trap's own commands (not in a
 	-- function the trap calls, whose lines count as usual — bash)
@@ -6192,7 +6193,7 @@ exec_stmt = function(sh, st, hook)
 		-- a funcdef whose name is an expansion (`$foo-bar()`) is a NON-fatal runtime
 		-- error (bash: status 1) — the name was captured raw by the parser. bash is
 		-- otherwise lenient (a literal `=` in the name is fine: `func-name=ext`).
-		local badname = not st.name:match("^[%w_:%.+@/%%%^~,!][%w_%.%-:+@/!#=%%%^~,]*$")
+		local badname = not st.name:match("^[%w_:%.+@/%%%^~,!][%w_%.%-:+@/!#=%%%^~,%[%]]*$")
 		if badname or (sh.opt_posix and not st.name:match("^[%a_][%w_]*$")) then
 			rt.err_at(sh, st.top and st.eline, "curse: `" .. st.name .. "': not a valid identifier\n")
 			sh.status = 1
