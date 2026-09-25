@@ -12686,5 +12686,44 @@ function M.catch_dbgskip(f, name)
 		end
 	end
 end
+-- `coproc NAME cmd` (both tiers; `run(ssh)` runs cmd — the interpreter's statement or a
+-- compiled fragment): cmd runs asynchronously as an in-process background task with its
+-- stdin/stdout on two pipes whose other ends the shell keeps as NAME=(read-fd write-fd);
+-- NAME_PID and $! = its pid. Finished, it's reaped (fds closed, NAME unset) as the
+-- scheduler sees it end (on_done) — or by rt.coproc_poll.
+function M.coproc_start(sh, name, run, subshell, simple)
+	sh.coprocs = sh.coprocs or {}
+	for opid, cp in pairs(sh.coprocs) do -- (bash: one at a time is supported; warn, go on)
+		io.stderr:write(("curse: warning: execute_coproc: coproc [%d:%s] still exists\n"):format(opid, cp.name))
+	end
+	local rp, wp = ffi.new("int[2]"), ffi.new("int[2]")
+	M.pipe_hi(rp)
+	M.pipe_hi(wp)
+	local r0, r1 = M.fd_below(rp[0], 64), M.fd_below(rp[1], 64) -- (bash's numbering: 63 60)
+	local w0, w1 = M.fd_below(wp[0], 64), M.fd_below(wp[1], 64)
+	-- F_SETFD FD_CLOEXEC: nothing the shell runs inherits these (a leaked write end keeps the
+	-- coproc from ever seeing EOF). Not the variadic C.fcntl: a Lua number vararg is passed
+	-- as a double, so the flag never arrived.
+	C.curse_co_fcntl3(r0, 2, 1)
+	C.curse_co_fcntl3(w1, 2, 1)
+	local job = sh:bg_launch(function(ssh)
+		ssh.coprocs = nil -- (an older coproc's ends aren't this one's)
+		return run(ssh)
+	end, "coproc " .. name, subshell, simple, nil, nil, { fds = { [0] = w0, [1] = r1 } })
+	C.close(r1)
+	C.close(w0)
+	local pid = job and job.pid or 0
+	M.coproc_setvars(sh, name, r0, w1, pid)
+	sh.coprocs[pid] = { name = name, r = r0, w = w1, g = job and job.g }
+	if job and job.g then
+		job.g.on_done = function(g)
+			job.done, job.status = true, g.status[1] or 0
+			if sh.coprocs and sh.coprocs[pid] then
+				M.coproc_dispose(sh, pid)
+			end
+		end
+	end
+	sh.status = 0
+end
 
 return M

@@ -6684,41 +6684,10 @@ exec_stmt = function(sh, st, hook)
 			sh.status = 1
 			return
 		end
-		sh.coprocs = sh.coprocs or {}
-		for opid, cp in pairs(sh.coprocs) do -- (bash: one at a time is supported; warn, go on)
-			io.stderr:write(("curse: warning: execute_coproc: coproc [%d:%s] still exists\n"):format(opid, cp.name))
-		end
-		-- in-process: a background task (Shell:bg_launch) with its stdin/stdout on the pipes
-		local rp, wp = ffi.new("int[2]"), ffi.new("int[2]")
-		rt.pipe_hi(rp)
-		rt.pipe_hi(wp)
-		local r0, r1 = rt.fd_below(rp[0], 64), rt.fd_below(rp[1], 64) -- (bash's numbering: 63 60)
-		local w0, w1 = rt.fd_below(wp[0], 64), rt.fd_below(wp[1], 64)
-		-- F_SETFD FD_CLOEXEC: nothing the shell runs inherits these (a leaked write end keeps the
-		-- coproc from ever seeing EOF). Not the variadic C.fcntl: a Lua number vararg is passed
-		-- as a double, so the flag never arrived.
-		C.curse_co_fcntl3(r0, 2, 1)
-		C.curse_co_fcntl3(w1, 2, 1)
 		local cmd = st.cmd
-		local job = sh:bg_launch(function(ssh)
-			ssh.coprocs = nil -- (an older coproc's ends aren't this one's)
+		rt.coproc_start(sh, st.name, function(ssh)
 			exec_stmt(ssh, cmd, SUBHOOK)
-		end, "coproc " .. st.name, cmd.t == "subshell", cmd.t == "simple", nil, nil,
-			{ fds = { [0] = w0, [1] = r1 } })
-		C.close(r1)
-		C.close(w0)
-		local pid = job and job.pid or 0
-		rt.coproc_setvars(sh, st.name, r0, w1, pid)
-		sh.coprocs[pid] = { name = st.name, r = r0, w = w1, g = job and job.g }
-		if job and job.g then
-			job.g.on_done = function(g)
-				job.done, job.status = true, g.status[1] or 0
-				if sh.coprocs and sh.coprocs[pid] then
-					rt.coproc_dispose(sh, pid)
-				end
-			end
-		end
-		sh.status = 0
+		end, cmd.t == "subshell", cmd.t == "simple")
 	elseif t == "arithcmd" then
 		-- A `(( expr ))` command (standalone or as an if/while condition) is NOT fatal
 		-- on a division-by-zero — it just yields status 1 and execution continues

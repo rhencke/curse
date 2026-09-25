@@ -345,9 +345,6 @@ local function scan_xtrace(node, acc)
 		return nil
 	end
 	acc = acc or {}
-	if node.t == "coproc" then -- a coproc is reaped asynchronously (bash's SIGCHLD); only the
-		return "coproc" -- interpreter polls for it between commands (rt.coproc_poll)
-	end
 	if node.name == "FUNCNEST" or node.var == "FUNCNEST" or (node.lit and node.lit:find("FUNCNEST", 1, true)) then
 		acc.funcnest = true -- $FUNCNEST limits call depth: compiled calls count it (fnwrap)
 	end
@@ -6774,6 +6771,24 @@ H.background = function(cx, st, after)
 	return p
 end
 
+-- statement handler: coproc — `coproc NAME cmd`: the COMPILED command runs as the
+-- coprocess (rt.coproc_start: the pipes, NAME/NAME_PID/$!, the reap), a background
+-- fragment like `cmd &`'s; a program with a real-signal trap keeps the interpreter's.
+H.coproc = function(cx, st, after)
+	if EF.bg_trap_block or not st.name:match("^[%a_][%w_]*$") then
+		return cx.delegate(st, after) -- (an invalid NAME: interp reports it)
+	end
+	local id = emit_fragment({ st.cmd }, false)
+	if not id then
+		return cx.delegate(st, after)
+	end
+	local p = cx.newpc()
+	cx.blocks[p] = dbg(st) .. lifted_flush(cx.lifted)
+		.. ("rt.coproc_start(sh, %q, __CS[%d], %s, %s); pc = %d"):format(st.name, id,
+			tostring(st.cmd.t == "subshell"), tostring(st.cmd.t == "simple"), after)
+	return p
+end
+
 -- statement handler: arrayassign (split out of flatten_stmt; see H)
 H.arrayassign = function(cx, st, after)
 	local t = st.t
@@ -7686,6 +7701,8 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
 			return H.arrayassign(cx, st, after)
 		elseif t == "case" then
 			return H.case(cx, st, after)
+		elseif t == "coproc" then
+			return H.coproc(cx, st, after)
 		else
 			return cx.delegate(st, after) -- unknown/cold statement: run it via the interpreter
 		end
