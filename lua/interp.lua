@@ -1356,7 +1356,7 @@ local function expand_pexp(sh, p, assign)
 	local pe = p.pexp
 	if pe.op == "badsubst" then -- ${x|html} and other unrecognized ${…} forms
 		if pe.fatal then
-			sherr(sh, "curse: ${" .. (pe.raw or pe.name or "") .. "}: bad substitution\n")
+			sherr(sh, "curse: " .. (pe.wraw or "${" .. (pe.raw or pe.name or "") .. "}") .. ": bad substitution\n")
 			error({ __curse_exit = sh.opt_c and 127 or 1, __curse_lineabort = sh.opt_i or nil })
 		end
 		if pe.xform then -- ${x@Z}: nothing to transform on an unset x; else FATAL (bash)
@@ -1370,10 +1370,10 @@ local function expand_pexp(sh, p, assign)
 			if not set then
 				return ""
 			end
-			sherr(sh, "curse: ${" .. (pe.raw or pe.name or "") .. "}: bad substitution\n")
+			sherr(sh, "curse: " .. (pe.wraw or "${" .. (pe.raw or pe.name or "") .. "}") .. ": bad substitution\n")
 			error({ __curse_exit = sh.opt_c and 127 or 1, __curse_lineabort = sh.opt_i or nil })
 		end
-		sherr(sh, "curse: ${" .. (pe.raw or pe.name or "") .. "}: bad substitution\n")
+		sherr(sh, "curse: " .. (pe.wraw or "${" .. (pe.raw or pe.name or "") .. "}") .. ": bad substitution\n")
 		error({ __curse_exit = 1, __curse_lineabort = true }) -- discards the rest of the line (bash)
 	end
 	if pe.op == "@" and pe.arg == "P" then -- ${x@P}: decode prompt escapes, then expand
@@ -1969,7 +1969,7 @@ multi_elems = function(sh, p) -- returns element list, star?
 			return { expand_word(sh, w, true) }
 		end
 		if pe.op == "badsubst" then -- e.g. ${a[@]:} (empty offset): discards the rest of the line
-			sherr(sh, "curse: ${" .. (pe.raw or pe.name or "") .. "}: bad substitution\n")
+			sherr(sh, "curse: " .. (pe.wraw or "${" .. (pe.raw or pe.name or "") .. "}") .. ": bad substitution\n")
 			error({ __curse_exit = 1, __curse_lineabort = true })
 		end
 		if pe.op == "indirect" then -- ${!ref} where ref names an array / $@ / subscript

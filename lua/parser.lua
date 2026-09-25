@@ -743,15 +743,13 @@ parse_paramexp = function(inner)
 		name, rest = inner:match("^([@*])(.*)$")
 	end
 	if not name then
-		-- a lone invalid parameter char (${%}, ${.}, ${+}) is a bad substitution in
-		-- bash (fails the command, status 1). Multi-char inners are left to the
-		-- lenient var fallback (ksh funsubs `${ …}`/`${| …}`, special-param-plus-op
-		-- like ${?@a} tolerated as empty), to match curse's prior behavior.
-		-- A special `$ ? -` followed by a non-operator (`${$(…)}`, `${?x}`) is one too.
-		if #inner == 1 or inner:match("^[%$?%-]") then
-			return { pexp = { op = "badsubst", raw = (lenpfx and "#" or "") .. inner } } -- (${#/} as written)
+		-- no valid parameter starts the text (${%}, ${%x}, ${.x}, ${#!x}, ${$(…)}, ${?x}):
+		-- a bad substitution in bash (fails the command, status 1). (After `!`, `${!%x}`
+		-- is $! with an operator; that stays the lenient empty read.)
+		if indices then
+			return { var = inner }
 		end
-		return { var = inner }
+		return { pexp = { op = "badsubst", raw = (lenpfx and "#" or "") .. inner } }
 	end
 	-- optional [subscript]
 	local index = nil
@@ -912,7 +910,7 @@ parse_paramexp = function(inner)
 	end
 	-- Any trailing text that is not a recognized modifier is a bad substitution
 	-- (e.g. `${x|html}`, `${1abc}`, `${a b}`) — bash aborts with status 1.
-	return P({ op = "badsubst", raw = name .. rest })
+	return P({ op = "badsubst", raw = name .. (index and "[" .. index .. "]" or "") .. rest })
 end
 M.parse_paramexp = parse_paramexp
 
@@ -1457,6 +1455,12 @@ local function parse_word(w)
 			if #parts == before then
 				parts[#parts + 1] = { lit = "", q = true }
 			end -- empty "" is still a field
+			for k = before + 1, #parts do -- (a bad ${…} in "…" reports the quoted text)
+				local pe = parts[k].pexp
+				if pe and pe.op == "badsubst" then
+					pe.wraw = (w:sub(i + 1, j - 1):gsub('\\"', '"'))
+				end
+			end
 			i = j + 1
 		elseif c == "$" then
 			i = parse_dollar(w, i, add, false)
@@ -1518,6 +1522,12 @@ local function parse_word(w)
 				parts[#parts + 1] = { lit = w:sub(s, e), q = false }
 				i = e + 1
 			end
+		end
+	end
+	for k = 1, #parts do -- a bad ${…} reports the whole word it is in (bash's `string`)
+		local pe = parts[k].pexp
+		if pe and pe.op == "badsubst" and not pe.wraw then
+			pe.wraw = w
 		end
 	end
 	return { k = "word", parts = parts, src = src }
