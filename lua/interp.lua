@@ -4645,7 +4645,7 @@ local function run_function(sh, cmd, fn, args, hook, tenv_base)
 	sh.linestack = sh.linestack or {}
 	table.insert(sh.linestack, 1, sh.cur_line or 0)
 	sh.srcstack = sh.srcstack or {}
-	table.insert(sh.srcstack, 1, sh.cur_source or sh.argv0 or "")
+	table.insert(sh.srcstack, 1, sh.cur_source or sh.main_source or sh.argv0 or "")
 	-- ${BASH_SOURCE[0]} in the body is the file the function was DEFINED in
 	local saved_src = sh.cur_source
 	local deffile = sh.func_file and sh.func_file[cmd]
@@ -5800,7 +5800,7 @@ exec_stmt = function(sh, st, hook)
 	end
 	-- set -n (noexec): a non-interactive shell reads but does not execute. Once on,
 	-- every later statement (including `set +n`) is skipped — matches bash.
-	if sh.opt_n and not sh.opt_i then
+	if sh.opt_n and not sh.opt_i and t ~= "parse_error" then -- (a syntax error is still reported)
 		sh.status = 0
 		return
 	end
