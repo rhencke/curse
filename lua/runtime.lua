@@ -27,6 +27,25 @@ M.i64 = i64
 -- locale via iswprint) while control/bad bytes are escaped. Byte-identical to bash.
 local ANSIC_ESC = { [27] = "\\E", [7] = "\\a", [11] = "\\v", [8] = "\\b", [12] = "\\f", [10] = "\\n", [13] = "\\r", [9] = "\\t" }
 M.ANSIC_ESC = ANSIC_ESC
+-- bash's ansic_shouldquote: does S hold a byte/character that isn't printable (in the
+-- locale: iswprint over its multibyte characters)? Such a value takes the $'…' form.
+function M.ansic_shouldquote(s)
+	if not s:find("[%z\1-\31\127-\255]") then
+		return false
+	end
+	for _, ch in ipairs(M.mb_chars(s)) do
+		if not ch.wc or ch.wc < 32 or ch.wc == 127 or M.iswprint(ch.wc) == 0 then
+			return true
+		end
+	end
+	return false
+end
+-- bash's sh_contains_shell_metas (shquote.c): a `#` counts only first, a `~` only first or
+-- after `=`/`:` (where it would tilde-expand)
+function M.shell_metas(s)
+	return s:find("[ \t\n'\"\\|&;()<>!{}*%[?%]^$`]") ~= nil or s:byte(1) == 35 or s:byte(1) == 126
+		or s:find("[=:]~") ~= nil
+end
 function M.shell_quote(s)
 	if not s:find("[%z\1-\31\127-\255]") then
 		return "'" .. s:gsub("'", "'\\''") .. "'"

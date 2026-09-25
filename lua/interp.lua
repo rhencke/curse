@@ -3728,7 +3728,8 @@ end
 local function decl_quote(s)
 	-- a control char or high byte forces $'…' (bash: `declare -- x=$'a\nb'`);
 	-- otherwise the usual double-quoted form.
-	if s:find("[%z\1-\31\127-\255]") then
+	-- (a printable multibyte character stays double-quoted: bash's ansic_shouldquote)
+	if s:find("[%z\1-\31\127-\255]") and rt.ansic_shouldquote(s) then
 		return rt.shell_quote(s)
 	end
 	s = s:gsub("\\", "\\\\"):gsub('"', '\\"'):gsub("%$", "\\$"):gsub("`", "\\`")
@@ -3740,9 +3741,10 @@ local function decl_elems(sh, name, fmt)
 	local assoc, parts = sh:is_assoc(name), {}
 	for _, k in ipairs(sh:array_indices(name)) do
 		local ks = tostring(k)
-		-- an assoc key with shell metacharacters (or control chars) is quoted like a value
-		-- (and a key that is just `@` or `*`: bash's ALL_ELEMENT_SUB check)
-		if assoc and (ks == "" or ks == "@" or ks == "*" or ks:find("[^%w_%%+,./:@=%-]")) then
+		-- an assoc key with shell metacharacters (or a non-printable char) is quoted like a
+		-- value (and a key that is just `@` or `*`: bash's ALL_ELEMENT_SUB check) — assoc.c
+		if assoc and (ks == "" or ks == "@" or ks == "*" or (ks:find("[^%w_%%+,./:@=%-]")
+			and (rt.shell_metas(ks) or rt.ansic_shouldquote(ks)))) then
 			ks = decl_quote(ks)
 		end
 		parts[#parts + 1] = fmt:format(ks, decl_quote(sh:array_get(name, k)))
