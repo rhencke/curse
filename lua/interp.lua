@@ -1939,6 +1939,7 @@ end
 -- Does `subj` match any of the case-clause pattern strings? The compiled tier's case
 -- codegen dispatches clauses natively but matches through this shared helper (vars in
 -- a pattern expand; quoted metachars stay literal), honoring shopt nocasematch.
+M.case_pattern = case_pattern -- (rt.case_glob)
 function M.case_match(sh, subj, pats)
 	local ic = sh.shopt.nocasematch and true or nil
 	for _, pat in ipairs(pats) do
@@ -5467,10 +5468,12 @@ local function loop_signal(sh, err)
 	error(err, 0) -- exit/return/real error propagates
 end
 local function run_loop_body(sh, body, hook)
+	local ne = sh.noerr
 	local ok, err = pcall(exec_list, sh, body, hook, false)
 	if ok then
 		return nil
 	end
+	sh.noerr = ne -- (a break/continue raised inside an `if`/&& condition: its noerr drops)
 	return loop_signal(sh, err)
 end
 
@@ -6549,7 +6552,8 @@ exec_stmt = function(sh, st, hook)
 			return v
 		end
 		local bodystatus = 0 -- a loop's status is its last body command's (0 if none)
-		sh.loopdepth = (sh.loopdepth or 0) + 1
+		local ld0 = sh.loopdepth or 0
+		sh.loopdepth = ld0 + 1
 		local cok, cerr = pcall(function()
 			if st.init then
 				fdbg(1)
@@ -6584,7 +6588,7 @@ exec_stmt = function(sh, st, hook)
 				end -- continue still runs the step
 			end
 		end)
-		sh.loopdepth = sh.loopdepth - 1
+		sh.loopdepth = ld0 -- (a signal re-raised from the body already gave the level back)
 		if not cok and inslot then -- (an init/cond/step failed)
 			P.arith_cmd = svcmd
 			if type(cerr) == "table" and cerr.__curse_matherr and not cerr.__curse_subscript then
@@ -6883,8 +6887,7 @@ exec_stmt = function(sh, st, hook)
 		-- an invalid loop-variable name (`for i.j`/`for -`) is a NON-fatal runtime
 		-- error (bash: status 1, no iterations), not a parse error.
 		if not st.name:match("^[%a_][%w_]*$") then
-			io.stderr:write("curse: `" .. st.name .. "': not a valid identifier\n")
-			sh.status = 1
+			rt.for_badname(sh, st.name)
 			return
 		end
 		-- expand the word list ONCE (bash semantics) and stash it in sh.forstate so

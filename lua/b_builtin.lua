@@ -29,7 +29,14 @@ return function(sh, cmd, args, hook, tcb)
 			sh.status = 0
 		elseif BUILTINS[args[j]] and not (sh.disabled_builtins and sh.disabled_builtins[args[j]]) then
 			-- (a builtin disabled with `enable -n` isn't one: bash's find_shell_builtin)
-			exec_simple(sh, { unpack(args, j) }, hook, true) -- skip functions
+			-- (not a special builtin through `builtin`: its errors aren't fatal — execute_cmd)
+			local svc = sh.via_command
+			sh.via_command = true
+			local ok, e = pcall(exec_simple, sh, { unpack(args, j) }, hook, true) -- skip functions
+			sh.via_command = svc
+			if not ok then
+				error(e, 0)
+			end
 		else
 			io.stderr:write("curse: builtin: " .. args[j] .. ": not a shell builtin\n")
 			sh.status = 1

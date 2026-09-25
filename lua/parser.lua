@@ -3118,6 +3118,9 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs)
 			if pterm ~= ")" then
 				error("syntax error: unexpected end of file") -- unclosed ( )
 			end
+			if #body == 0 then
+				error("syntax error near `)'") -- (`f() ( )`: bash)
+			end
 			return { { t = "subshell", line = bline, body = body } }, bline, true
 		end
 		return brace_group(), bline
@@ -4163,6 +4166,9 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs)
 			local body, pterm = parse_stmts({ [")"] = true })
 			if pterm ~= ")" then
 				error("syntax error: unexpected end of file") -- unclosed ( )
+			end
+			if #body == 0 then
+				error("syntax error near `)'") -- (`( )`: bash)
 			end
 			local redirs = {}
 			while true do

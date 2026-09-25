@@ -8,4 +8,4 @@ set -- a b c
 false
 echo ${#?} ${##} ${#-} x
 sleep 0 & wait
-echo ${#!} "${##}"
+[ ${#!} -gt 0 ] && echo "bang-len-ok ${##}"

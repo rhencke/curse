@@ -529,31 +529,26 @@ end
 -- as an external command (127). Delegating the def (interp registers it) and the calls
 -- (interp dispatches) makes them work while the enclosing body stays compiled.
 local function collect_nested_funcdefs(stmts, set, top)
+	-- (every node below the top-level list: a group/loop body, a pipeline stage, an &&/||
+	-- operand, a `$( … )` — any funcdef there is nested)
+	local function walk(node)
+		if type(node) ~= "table" then
+			return
+		end
+		if node.t == "funcdef" and node.name then
+			set[node.name] = true
+		end
+		for _, v in pairs(node) do
+			if type(v) == "table" then
+				walk(v)
+			end
+		end
+	end
 	for _, st in ipairs(stmts or {}) do
-		if st.t == "funcdef" then
-			if not top then
-				set[st.name] = true
-			end
-			if st.body then
-				collect_nested_funcdefs(st.body, set, false)
-			end
+		if st.t == "funcdef" and top then
+			walk(st.body)
 		else
-			if st.body then
-				collect_nested_funcdefs(st.body, set, false)
-			end
-			if st.cond then
-				collect_nested_funcdefs(st.cond, set, false)
-			end
-			if st.clauses then
-				for _, cl in ipairs(st.clauses) do
-					if cl.body then
-						collect_nested_funcdefs(cl.body, set, false)
-					end
-					if cl.cond then
-						collect_nested_funcdefs(cl.cond, set, false)
-					end
-				end
-			end
+			walk(st)
 		end
 	end
 end
@@ -959,6 +954,7 @@ EF.bash_command = false -- program reads $BASH_COMMAND → each command records 
 EF.extdebug = false -- program may `shopt -s extdebug` → a DEBUG trap can skip a command (dbg)
 EF.dbg_after_of = {} -- (extdebug) statement -> its continuation pc, for the skip
 EF.DBG_SKIP = { simple = true, arithcmd = true, dbracket = true, assign = true, assignlist = true, case = true }
+EF.DBG_FIRE = EF.DBG_SKIP -- (the nodes DEBUG fires before: interp's DEBUG_FIRE)
 EF.cur_cfg = "run" -- the CFG being built: `run`, or a function's (a skip resumes in its own)
 EF.keyword = false -- program may `set -k` → a command with a NAME=value word compiles both ways
 EF.enable = false -- program may run `enable -n` → a native builtin call checks it's still enabled
@@ -1004,7 +1000,7 @@ local function dbg(st, head)
 	-- under functrace); calldepth is tracked in fnwrap when a DEBUG trap is present.
 	-- (shopt -s extdebug: a non-zero DEBUG status SKIPS the command — rt.debug_x raises
 	-- the statement's continuation pc for this CFG's catcher: run_compiled, rt.catch_dbgskip)
-	local skip = EF.has_debug and EF.extdebug and EF.frag_depth == 0 and EF.dbg_after_of[st]
+	local skip = EF.has_debug and EF.extdebug and (EF.frag_depth == 0 or EF.cur_cfg ~= "run") and EF.dbg_after_of[st]
 	if skip then
 		return ("rt.debug_x(sh, %d, %d, %q) "):format(st.line or 0, skip, EF.cur_cfg)
 	end
@@ -1015,6 +1011,16 @@ local function dbg(st, head)
 		return ("I.run_debug(sh, %d) "):format(st.line or 0)
 	end
 	return ""
+end
+-- DEBUG (and $BASH_COMMAND = text) where no command skip applies — a pipeline stage fired
+-- from the parent, a `select` head: the trap's status is ignored there (interp's run_debug)
+function EF.dbg_plain(text, line)
+	local bc = EF.bash_command and ("if (sh.in_trap or 0) == 0 then sh.cur_cmd = %q end "):format(text) or ""
+	if not EF.has_debug then
+		return bc
+	end
+	return bc .. ((EF.trapline and not EF.cur_infunc) and "I.run_debug(sh, sh.cur_line) "
+		or ("I.run_debug(sh, %d) "):format(line or 0))
 end
 -- Wrap a compiled function call `s` (function `cmd`, called at source `line`) with
 -- call-stack maintenance ($FUNCNAME/BASH_* when read) and, when an ERR/DEBUG trap is
@@ -1100,12 +1106,14 @@ local function emitable_word(w)
 	end
 	return true
 end
--- (the call-stack / current-command specials: the interpreter maintains them per statement,
--- the compiled tier does not keep them in sh — a word reading one keeps delegating)
+-- (the call-stack / current-command specials: the compiled tier keeps them in sh only in a
+-- program that reads them — EF.funcstack: enterFunc/leaveFunc around calls; EF.bash_command:
+-- each command records its text — so the shared expander reads them right exactly then)
+EF.FB_VAR_OK = { FUNCNAME = 1, BASH_SOURCE = 1, BASH_LINENO = 1, BASH_COMMAND = 1, RANDOM = 1, SRANDOM = 1, SECONDS = 1 }
 local function fb_unsafe(w)
 	local src = w.src or ""
-	return src:find("BASH_COMMAND", 1, true) or src:find("FUNCNAME", 1, true)
-		or src:find("BASH_SOURCE", 1, true) or src:find("BASH_LINENO", 1, true)
+	return (not EF.bash_command and src:find("BASH_COMMAND", 1, true)) or (not EF.funcstack
+		and (src:find("FUNCNAME", 1, true) or src:find("BASH_SOURCE", 1, true) or src:find("BASH_LINENO", 1, true)))
 end
 -- A word that a compiled command can use directly: emit_word-able AND with no
 -- unquoted expansion (would word-split) or unquoted glob char (would path-expand)
@@ -1659,7 +1667,16 @@ local function emit_fragment(stmts, neg, liftset, cfraise)
 	-- their copy; a lifted local would neither see nor sync the caller's real sh var).
 	EF.frag_topcode = not EF.cur_infunc -- (read, and cleared, by this build_cfg)
 	EF.frag_depth = EF.frag_depth + 1 -- (a function's `return` in here isn't the call's: EF.retset)
+	-- (extdebug: a DEBUG-skipped command in here resumes in THIS fragment's CFG — its own
+	-- catcher, rt.catch_dbgskip, re-enters it at the pc after the command)
+	local saved_cfg, dskip = EF.cur_cfg, EF.extdebug and EF.has_debug
+	if dskip then
+		EF.dskip_n = (EF.dskip_n or 0) + 1
+		EF.cur_cfg = "cs" .. EF.dskip_n
+	end
+	local mycfg = EF.cur_cfg
 	local bok, cfg = pcall(build_cfg, stmts, liftset or {}, emit_frag_ctx.funcflags, inlfns, false)
+	EF.cur_cfg = saved_cfg
 	EF.frag_depth = EF.frag_depth - 1
 	EF.frag_topcode = nil
 	emit_toplevel, emit_neg_ctx, EF.cur_line = saved_tl, saved_neg, saved_line
@@ -1668,7 +1685,13 @@ local function emit_fragment(stmts, neg, liftset, cfraise)
 		return nil
 	end
 	emit_frag_n = emit_frag_n + 1
-	emit_frags[#emit_frags + 1] = assemble(cfg, ("__CS[%d] = function(sh)"):format(emit_frag_n), { runlocals = ownlocals })
+	if dskip then
+		emit_frags[#emit_frags + 1] = assemble(cfg, ("__CS[%d] = function(sh, pc)"):format(emit_frag_n),
+			{ runlocals = ownlocals, pcparam = true })
+			.. ("\n__CS[%d] = rt.catch_dbgskip(__CS[%d], %q)"):format(emit_frag_n, emit_frag_n, mycfg)
+	else
+		emit_frags[#emit_frags + 1] = assemble(cfg, ("__CS[%d] = function(sh)"):format(emit_frag_n), { runlocals = ownlocals })
+	end
 	return emit_frag_n
 end
 
@@ -2075,7 +2098,9 @@ local ARITH_CMP = { ["-eq"] = "==", ["-ne"] = "~=", ["-lt"] = "<", ["-le"] = "<=
 -- RHS), lifted locals flushed to sh around it. nil when the word reads such a special.
 local function db_fallback(w, lifted, fn, arg)
 	for _, p in ipairs(w.parts) do
-		if p.var and (COMPILE_UNSAFE_VAR[p.var] and p.var ~= "LINENO") then
+		-- ($FUNCNAME/…/$BASH_COMMAND: kept in sh when the program reads them — fb_unsafe;
+		-- $RANDOM/$SECONDS the expander computes itself; $_ the compiled tier doesn't keep)
+		if p.var and (COMPILE_UNSAFE_VAR[p.var] and p.var ~= "LINENO" and not EF.FB_VAR_OK[p.var]) then
 			return nil
 		end
 	end
@@ -3291,6 +3316,19 @@ local function aa_keyword(key)
 	return ok and emitable_word(kw) and kw or nil
 end
 EF.aa_keyword, EF.aa_fieldable = aa_keyword, aa_fieldable
+-- (a word the compiled engine can't render expands through the shared one-word expander:
+-- EF.aa_fields for an element's fields, rt.assign_elem for a keyed value or subscript —
+-- unless it reads a lifted variable, which that expander wouldn't see)
+local function aa_fallback_ok(w, lifted)
+	local names = {}
+	EF.collect_word(w, names)
+	for n in pairs(names) do
+		if lifted[n] then
+			return false
+		end
+	end
+	return true
+end
 local function arrayassign_ok(st, lifted)
 	-- (a nameref is resolved at run time by rt.arrayassign, as interp's do_arrayassign; an
 	-- `a[i]=(…)` is H.arrayassign's own error path)
@@ -3299,19 +3337,34 @@ local function arrayassign_ok(st, lifted)
 	end
 	for _, e in ipairs(st.elems) do
 		if e.key ~= nil then
-			if aa_keyword(e.key) == nil or not emitable_word(e.word) then
-				return false
-			end
-			for _, bw in ipairs(e.brace_bare or {}) do -- (an indexed target de-keys it: fields)
-				if not aa_fieldable(bw, lifted) then
+			local kw = aa_keyword(e.key)
+			if kw == nil then
+				local ok, w = pcall(require("parser").parse_word, e.key)
+				if not ok or not aa_fallback_ok(w, lifted) then
 					return false
 				end
 			end
-		elseif e.op ~= "=" or not aa_fieldable(e.word, lifted) then
+			if not emitable_word(e.word) and not aa_fallback_ok(e.word, lifted) then
+				return false
+			end
+			for _, bw in ipairs(e.brace_bare or {}) do -- (an indexed target de-keys it: fields)
+				if not aa_fieldable(bw, lifted) and not aa_fallback_ok(bw, lifted) then
+					return false
+				end
+			end
+		elseif e.op ~= "=" or (not aa_fieldable(e.word, lifted) and not aa_fallback_ok(e.word, lifted)) then
 			return false
 		end
 	end
 	return true
+end
+-- An array element word's fields appended to `into` as {val=…} items: natively when the
+-- field engine takes it, else through the shared one-word expander (rt.aa_fields)
+function EF.aa_fields(into, w, lifted)
+	if aa_fieldable(w, lifted) then
+		return emit_fields_into(into, w, lifted, "{val=%s}")
+	end
+	return ("rt.aa_fields(sh, %s[1], %s)"):format(EF.konst({ ser(w) }), into)
 end
 -- (the declare/local/typeset literal path keeps the strict gate: literal keys only, no
 -- brace de-keying, no side-effecting arith)
@@ -3384,7 +3437,9 @@ local function fb_step(w, lifted, call, push, tbl)
 		si[#si + 1] = ("sh:aset(%q, %s); "):format(n, lname(n))
 		so[#so + 1] = ("%s = sh:aget(%q); "):format(lname(n), n)
 	end
-	local ln = (w.src or ""):find("LINENO", 1, true) and ("sh.cur_line = %d; "):format(EF.cur_line or 0) or ""
+	-- (a trap handler's commands keep the interrupted line: sh.cur_line as is — EF.trapline)
+	local ln = (w.src or ""):find("LINENO", 1, true) and not (EF.trapline and not EF.cur_infunc)
+		and ("sh.cur_line = %d; "):format(EF.cur_line or 0) or ""
 	return ("do %s%slocal __f = %s(sh, %s[1]); %sif __f then %s else %s = false end end"):format(
 		table.concat(si), ln, call, EF.konst({ ser(w) }), table.concat(so), push, tbl or "__a")
 end
@@ -5170,9 +5225,10 @@ EF.simple_native = function(cx, st, after, cmd)
 		end
 	elseif isexec and st.redirs then
 		spec[#spec + 1] = "eredirs=" .. ser(st.redirs)
-	elseif st.redirs and #st.redirs > 0 and EF.xtrace and st.arrayargs and not bind then
-		-- (set -x: a declaration's NAME=(…) literals trace once expanded, which the runner
-		-- does — so it applies the redirections itself, after the trace: rf)
+	elseif st.redirs and #st.redirs > 0 and EF.xtrace and ((st.arrayargs and not bind) or (bind and not st.arrayargs)) then
+		-- (set -x: a declaration's NAME=(…) literals trace once expanded, and a prefix
+		-- assignment as it binds, which the runner does — so it applies the redirections
+		-- itself, after the trace (bash traces to the stderr from before them): rf)
 		local rc = cx.redir_conds(st, cmd)
 		if not rc then
 			return nil
@@ -5312,8 +5368,7 @@ H.simple = function(cx, st, after)
 		return p
 	end
 	-- (a name shadowed at run time: the native simple-command runner dispatches it)
-	local dp = EF.simple_native(cx, st, after, full_lit(w1))
-		or cx.delegate(st, after, { callee = "I.exec_stmt", callargs = ("sh, %s, __noop"):format(ser(st)) })
+	local dp = assert(EF.simple_native(cx, st, after, full_lit(w1))) -- (it refuses only a wordless one)
 	local g = cx.newpc()
 	cx.blocks[g] = ("if %s then pc = %d else pc = %d end"):format(names_guard({ c }), p, dp)
 	return g
@@ -6710,9 +6765,6 @@ H.forc = function(cx, st, after)
 	if st.redirs then
 		return cx.delegate(st, after)
 	end -- redirs on the loop: interp applies them
-	if hard_cf(st.body) then
-		return cx.delegate(st, after)
-	end -- un-static break/continue
 	-- A slot the arith codegen can't render (an element write, a nested side effect, an
 	-- embedded ${…}, a malformed one, a side-effecting cond, $LINENO/$RANDOM/…) runs through
 	-- the shared arith evaluator (rt.arith_slot: interp's eval with the for (( ))-slot rules —
@@ -6741,7 +6793,7 @@ H.forc = function(cx, st, after)
 	local condp = cx.newpc()
 	cx.loopPc[st.id] = condp
 	local stepp = cx.newpc()
-	cx.loopstack[#cx.loopstack + 1] = { brk = after, cont = stepp } -- break exits, continue steps
+	cx.loopstack[#cx.loopstack + 1] = { brk = after, cont = stepp, nd = cx.nd } -- break exits, continue steps
 	local bodyentry = cx.flatten_list(st.body, stepp)
 	cx.loopstack[#cx.loopstack] = nil
 	-- (with $BASH_COMMAND read, each slot's own DEBUG prefix carries its text: xs)
@@ -6813,11 +6865,8 @@ H.whilec = function(cx, st, after)
 	if st.redirs then
 		return cx.delegate(st, after)
 	end -- redirs on the loop (heredoc/file): interp applies them
-	-- un-static break/continue in the body, or ANY in the command condition (loopstack
-	-- isn't active there) → delegate the whole loop (else the signal is lost → spin).
-	if hard_cf(st.body) or (type(st.cond) == "table" and not st.cond.k and hard_cf(st.cond, true)) then
-		return cx.delegate(st, after)
-	end
+	-- (a break/continue with a run-time level — `break $n` — runs through the native
+	-- command runner, whose raised signal the delegate wrapper turns into the pc jump)
 	local arith = cond_arith(st.cond)
 	if arith and arith_reads_unsafe(arith) then
 		-- a `(( ))` condition reading a special ($LINENO/$RANDOM/…): no native fast path — the
@@ -6833,7 +6882,7 @@ H.whilec = function(cx, st, after)
 		cx.loopPc[st.id] = condp
 		local exitp = cx.newpc()
 		cx.blocks[exitp] = ("sh.status = 0; pc = %d"):format(after)
-		cx.loopstack[#cx.loopstack + 1] = { brk = after, cont = condp }
+		cx.loopstack[#cx.loopstack + 1] = { brk = after, cont = condp, nd = cx.nd }
 		local bodyentry = cx.flatten_list(st.body, condp)
 		cx.loopstack[#cx.loopstack] = nil
 		-- DEBUG fires before each evaluation of the condition command (bash)
@@ -6855,7 +6904,7 @@ H.whilec = function(cx, st, after)
 		cx.loopPc[st.id] = condp
 		local exitp = cx.newpc()
 		cx.blocks[exitp] = ("sh.status = %s; pc = %d"):format(lv, after)
-		cx.loopstack[#cx.loopstack + 1] = { brk = after, cont = condp }
+		cx.loopstack[#cx.loopstack + 1] = { brk = after, cont = condp, nd = cx.nd }
 		local bodysave = cx.newpc()
 		local bodyentry = cx.flatten_list(st.body, bodysave)
 		cx.loopstack[#cx.loopstack] = nil
@@ -6893,7 +6942,7 @@ H.whilec = function(cx, st, after)
 	local donep = cx.newpc()
 	local exitp = cx.newpc()
 	cx.blocks[exitp] = ("sh.status = %s; pc = %d"):format(lv, after)
-	cx.loopstack[#cx.loopstack + 1] = { brk = after, cont = prep } -- break exits (status 0), continue re-tests
+	cx.loopstack[#cx.loopstack + 1] = { brk = after, cont = prep, nd = cx.nd } -- break exits (status 0), continue re-tests
 	local bodysave = cx.newpc()
 	local bodyentry = cx.flatten_list(st.body, bodysave)
 	cx.loopstack[#cx.loopstack] = nil
@@ -6903,7 +6952,13 @@ H.whilec = function(cx, st, after)
 		bodyentry,
 		exitp
 	)
+	-- a break/continue in the CONDITION acts on this loop too (bash): break ends it (the
+	-- status is break's 0), continue re-tests — each leaving the condition's noerr first
+	cx.loopstack[#cx.loopstack + 1] = { brk = after, cont = prep, nd = cx.nd }
+	cx.nd = cx.nd + 1
 	local listentry = cx.flatten_list(st.cond, donep)
+	cx.nd = cx.nd - 1
+	cx.loopstack[#cx.loopstack] = nil
 	cx.blocks[prep] = ("sh.noerr = sh.noerr + 1; pc = %d"):format(listentry)
 	local entry = cx.newpc()
 	cx.blocks[entry] = ("%s = 0; pc = %d"):format(lv, prep) -- status 0 if body never runs
@@ -6916,12 +6971,11 @@ H.forin = function(cx, st, after)
 	if st.redirs then
 		return cx.delegate(st, after)
 	end -- redirs on the loop: interp applies them
-	if hard_cf(st.body) then
-		return cx.delegate(st, after)
-	end -- un-static break/continue
-	if not st.name:match("^[%a_][%w_]*$") then
-		return cx.delegate(st, after)
-	end -- invalid loop var → interp errors
+	if not st.name:match("^[%a_][%w_]*$") then -- an invalid loop variable: reported, no loop
+		local p = cx.newpc()
+		cx.blocks[p] = ("rt.for_badname(sh, %q); pc = %d"):format(st.name, after)
+		return p
+	end
 	local fbw -- words expanded by rt.word_fields (a contained expansion error skips the loop, $?=1)
 	-- Each word expands to for-list fields exactly like a command argument: word_safe (one
 	-- field), a field_word (an unquoted expansion/glob the field engine splits+globs), or a
@@ -6929,14 +6983,6 @@ H.forin = function(cx, st, after)
 	-- ${..} ops). emit_fields_into renders each fully natively (no interp field engine); a
 	-- word only the shared engine could take still delegates the loop (rare, cold).
 	for _, w in ipairs(st.words) do
-		-- $LINENO in a for-in list on a CONTINUATION line is the word's line, not the `for`
-		-- line (st.line) the compile-time constant would use — delegate so interp's per-line
-		-- tracking gives the exact value (rare; the whole loop is cold anyway).
-		for _, p in ipairs(w.parts) do
-			if p.var == "LINENO" then
-				return cx.delegate(st, after)
-			end
-		end
 		if not word_safe(w) and not EF.arith_guard(w) and not field_word(w, cx.lifted) and not EF.seg_native(w, cx.lifted) then
 			-- (else the shared one-word expander, rt.word_fields — unless it reads $FUNCNAME/…)
 			if fb_unsafe(w) then
@@ -6949,7 +6995,7 @@ H.forin = function(cx, st, after)
 	local initp = cx.newpc()
 	local advp = cx.newpc()
 	cx.loopPc[st.id] = advp -- back-edge = resume point
-	cx.loopstack[#cx.loopstack + 1] = { brk = after, cont = advp } -- break exits, continue advances
+	cx.loopstack[#cx.loopstack + 1] = { brk = after, cont = advp, nd = cx.nd } -- break exits, continue advances
 	local bodyentry = cx.flatten_list(st.body, advp)
 	cx.loopstack[#cx.loopstack] = nil
 	-- init: expand the word list ONCE into sh.forstate[id] (so OSR resumes it)
@@ -6969,6 +7015,11 @@ H.forin = function(cx, st, after)
 		run = {}
 	end
 	local opens = 0
+	-- ($LINENO in the list — on a continuation line too — is the `for` line: bash; the
+	-- body flattened above left cur_line at its last command)
+	local sv_line, sv_cline = EF.cur_line, EF.cur_cline
+	EF.cur_line = st.line or sv_line
+	EF.cur_cline = nil
 	for _, w in ipairs(st.words) do
 		if fbw and fbw[w] then
 			flush_run()
@@ -6987,6 +7038,7 @@ H.forin = function(cx, st, after)
 		end
 	end
 	flush_run()
+	EF.cur_line, EF.cur_cline = sv_line, sv_cline
 	if opens > 0 then -- (after a contained expansion error __l is false: no loop, $? is 1)
 		parts[#parts + 1] = "local _ = nil" .. string.rep(" end", opens)
 	end
@@ -7057,7 +7109,7 @@ end
 -- and NAME (false at EOF: status 1, the loop ends); the body is the compiled CFG, break/
 -- continue jump natively.
 H.select = function(cx, st, after)
-	if st.redirs or hard_cf(st.body) then -- (a redirected one: cx.delegate compiles it as a
+	if st.redirs then -- (a redirected one: cx.delegate compiles it as a
 		return cx.delegate(st, after) -- redirected compound around this)
 	end
 	if not st.name:match("^[%a_][%w_]*$") then
@@ -7076,7 +7128,7 @@ H.select = function(cx, st, after)
 	local initp = cx.newpc()
 	local advp = cx.newpc()
 	-- (no OSR resume point: the interpreter's select keeps its menu list to itself)
-	cx.loopstack[#cx.loopstack + 1] = { brk = after, cont = advp }
+	cx.loopstack[#cx.loopstack + 1] = { brk = after, cont = advp, nd = cx.nd }
 	local bodyentry = cx.flatten_list(st.body, advp)
 	cx.loopstack[#cx.loopstack] = nil
 	local parts = { "local __l = {}" }
@@ -7089,16 +7141,17 @@ H.select = function(cx, st, after)
 			end
 		end
 	end
-	-- (set -x: the header as written, once, before the menu)
-	local xh = ""
-	if EF.xtrace then
-		local ws = {}
-		for _, w in ipairs(st.words) do
-			if w.src then
-				ws[#ws + 1] = w.src
-			end
+	-- (DEBUG, then set -x: the header as written, once, before the menu)
+	local ws = {}
+	for _, w in ipairs(st.words) do
+		if w.src then
+			ws[#ws + 1] = w.src
 		end
-		xh = EF.xtl(("%q"):format("select " .. st.name .. " in " .. table.concat(ws, " ")))
+	end
+	local htext = "select " .. st.name .. " in " .. table.concat(ws, " ")
+	local xh = EF.dbg_plain(htext, st.line)
+	if EF.xtrace then
+		xh = xh .. EF.xtl(("%q"):format(htext))
 	end
 	parts[#parts + 1] = ("%sif #__l == 0 then sh.status = 0; pc = %d else sh.forstate[%d] = __l; rt.select_menu(sh, __l); pc = %d end"):format(
 		xh, after, st.id, advp)
@@ -7163,7 +7216,9 @@ H["if"] = function(cx, st, after)
 					bentry[i],
 					nxt
 				)
+				cx.nd = cx.nd + 1
 				local listentry = cx.flatten_list(cl.cond, donep)
+				cx.nd = cx.nd - 1
 				local prep = cx.newpc()
 				cx.blocks[prep] = ("sh.noerr = sh.noerr + 1; pc = %d"):format(listentry)
 				condentry[i] = prep
@@ -7202,7 +7257,9 @@ H.andor = function(cx, st, after)
 	end
 	local runentry = {}
 	for i = 1, nI do
+		cx.nd = cx.nd + (i < nI and 1 or 0) -- (the non-final operands run with noerr raised)
 		runentry[i] = cx.flatten_stmt(items[i].cmd, runafter[i])
+		cx.nd = cx.nd - (i < nI and 1 or 0)
 	end
 	for i = 2, nI do
 		local cmp = (items[i].op == "&&") and "==" or "~=" -- && runs on success, || on failure
@@ -7244,7 +7301,7 @@ H.subshell = function(cx, st, after)
 	-- escaping piece of shell state). The fragment RAISES exit/return (caught by
 	-- subshell_run), so subshell_exit_pc is cleared around its build. break/continue can't
 	-- cross into it — the fragment has its own loopstack.
-	if not EF.inproc_trap_block and #st.body > 0 then
+	if #st.body > 0 then
 		local saved_ssx = EF.subshell_exit_pc
 		EF.subshell_exit_pc = nil
 		-- Compile the body WITH the program lift set so it shares the module's lifted
@@ -7305,19 +7362,8 @@ H.pipeline = function(cx, st, after)
 	-- no trap/DEBUG/ERR (a forked stage otherwise resets signal traps / re-fires
 	-- per-stage traps — interp-side). Flush lifted before (stages read sh) and reload
 	-- after (a lastpipe last stage runs in-process and may write).
-	-- DEBUG fires per pipeline element in bash (interp models it); compiled stages don't hook it
-	if EF.inproc_trap_block or EF.has_debug then
-		return cx.delegate(st, after)
-	end
 	local n = #st.cmds
 	local frags = {}
-	for i = 1, n do
-		-- a `return` stage at the top level (no function can be running): the interpreter
-		-- reports it (bash: "can only `return' …", status 2) — a stage fragment can't tell
-		if cx.toplevel and (not EF.fragment or EF.lm) and resolve_cf({ t = "simple", words = st.cmds[i].words or {} }) == "return" then
-			return cx.delegate(st, after)
-		end
-	end
 	for i = 1, n do
 		-- nst==1 is `! cmd` (a single negated command run in the current shell): compile
 		-- it as a negated fragment so its OWN errexit is exempt; run_pipeline also raises
@@ -7382,7 +7428,25 @@ H.pipeline = function(cx, st, after)
 	-- (`! cmd` ignores its OWN special-builtin failure: rt.spb_run)
 	local negspb = n == 1 and st.negate and st.cmds[1].t == "simple" and st.cmds[1].words
 		and st.cmds[1].words[1] and require("runtime").SPECIAL_BUILTIN[full_lit(st.cmds[1].words[1]) or ""]
-	cx.blocks[p] = gpre .. dbg(st)
+	-- DEBUG (and $BASH_COMMAND) before each STAGE, in the parent, before any runs (bash's
+	-- execute_simple_command fires it before forking) — only for a stage that is a DEBUG-
+	-- firing node (a `{ }`/compound stage fires nothing); a stage itself never re-fires it
+	-- (in_pipestage). A `shopt -s lastpipe` last stage runs in this shell and fires its own.
+	-- (`! cmd`, one stage: that command's fragment fires it, in this shell)
+	local sdbg = {}
+	if n >= 2 and (EF.has_debug or EF.bash_command) then
+		for k = 1, n do
+			local c = st.cmds[k]
+			if EF.DBG_FIRE[c.t] then
+				local one = EF.dbg_plain(require("deparse").command_text(c), c.line or st.line)
+				if k == n then
+					one = ("if not (sh.shopt.lastpipe and not sh.opt_i) then %send "):format(one)
+				end
+				sdbg[#sdbg + 1] = one
+			end
+		end
+	end
+	cx.blocks[p] = gpre .. (n >= 2 and table.concat(sdbg) or "")
 		.. lifted_flush(cx.lifted)
 		.. (negspb and "sh.spb_neg = true; " or "")
 		.. ("sh:run_pipeline({%s}, %s, %s%s)"):format(
@@ -7483,10 +7547,13 @@ end
 
 -- statement handler: coproc — `coproc NAME cmd`: the COMPILED command runs as the
 -- coprocess (rt.coproc_start: the pipes, NAME/NAME_PID/$!, the reap), a background
--- fragment like `cmd &`'s; a program with a real-signal trap keeps the interpreter's.
+-- fragment like `cmd &`'s (in-process, as the interpreter's: a signal trap is no reason to differ).
 H.coproc = function(cx, st, after)
-	if EF.bg_trap_block or not st.name:match("^[%a_][%w_]*$") then
-		return cx.delegate(st, after) -- (an invalid NAME: interp reports it)
+	if not st.name:match("^[%a_][%w_]*$") then -- (`coproc @ {…}`: reported, status 1)
+		local p = cx.newpc()
+		cx.blocks[p] = dbg(st) .. ("io.stderr:write(%q); sh.status = 1; pc = %d"):format(
+			"curse: `" .. st.name .. "': not a valid identifier\n", after)
+		return p
 	end
 	local id = emit_fragment({ st.cmd }, false)
 	if not id then
@@ -7531,14 +7598,19 @@ H.arrayassign = function(cx, st, after)
 				local valx = (fl and fl:find("~", 1, true)) and ("rt.tilde_assign(sh, %q)"):format(fl)
 					or EF.assign_word_expr(e.word, cx.lifted)
 				local kw = EF.aa_keyword(e.key)
-				local keyx = kw and emit_word(kw, cx.lifted) or ("%q"):format(EF.static_key(e.key))
+				local keyx = kw and emit_word(kw, cx.lifted)
+				if kw == nil then -- (a subscript emit can't render: the shared expander)
+					keyx = ("rt.assign_elem(sh, %s[1])"):format(EF.konst({ ser(require("parser").parse_word(e.key)) }))
+				elseif not kw then
+					keyx = ("%q"):format(EF.static_key(e.key))
+				end
 				local item = ("do local __k = %s; __it[#__it+1] = {key=__k, op=%q, val=%s, src=%q, rawkey=%q} end"):format(
 					keyx, e.op, valx, e.word and e.word.src or "", e.key)
 				if e.brace_bare then -- an INDEXED target de-keys it: `[k]=` literal in each brace word
 					asq()
 					local bf = {}
 					for _, bw in ipairs(e.brace_bare) do
-						bf[#bf + 1] = emit_fields_into("__it", bw, cx.lifted, "{val=%s}")
+						bf[#bf + 1] = EF.aa_fields("__it", bw, cx.lifted)
 					end
 					item = ("if __as then %s else %s end"):format(item, table.concat(bf, "; "))
 				end
@@ -7546,7 +7618,7 @@ H.arrayassign = function(cx, st, after)
 			elseif not kvfirst and not empty_word(e.word) then
 				asq()
 				parts[#parts + 1] = ("if __as then __it[#__it+1] = {src=%q} else %s end"):format(
-					e.word.src, emit_fields_into("__it", e.word, cx.lifted, "{val=%s}"))
+					e.word.src, EF.aa_fields("__it", e.word, cx.lifted))
 			elseif not empty_word(e.word) then
 				-- a bare word field-splits and globs for an INDEXED target, but is one plain word
 				-- in an ASSOCIATIVE key/value list (bash) — which one is only known at run time.
@@ -7561,7 +7633,7 @@ H.arrayassign = function(cx, st, after)
 					parts[#parts + 1] = ("if __as then __it[#__it+1] = {val=%s%s} else %s end"):format(
 						EF.assign_word_expr(e.word, cx.lifted),
 						srcf,
-						emit_fields_into("__it", e.word, cx.lifted, "{val=%s}")
+						EF.aa_fields("__it", e.word, cx.lifted)
 					)
 				end
 			end
@@ -7661,9 +7733,26 @@ H.case = function(cx, st, after)
 		local nextmatch = (i < n) and matchentry[i + 1] or nomatch
 		-- Compile each pattern's glob-form and match natively (rt.glob_match); a clause
 		-- with a pattern emit can't render (cmdsub/arith/${…}-op/$@/$*) keeps I.case_match.
+		-- (one the pattern renderer can't take — a quoted "$@", a word-initial ~ — expands
+		-- through the shared pattern expander, rt.case_glob: lifted vars synced around it)
 		local globs, allok = {}, true
 		for _, pat in ipairs(cl.pats) do
 			local g = emit_pattern_glob(pat, cx.lifted)
+			if g == nil then
+				local ok, w = pcall(require("parser").parse_word, pat)
+				local names = {}
+				if ok then
+					EF.collect_word(w, names)
+				end
+				for nm in pairs(names) do
+					if cx.lifted[nm] then
+						ok = false
+					end
+				end
+				if ok then
+					g = ("rt.case_glob(sh, %s[1])"):format(EF.konst({ ser(w) }))
+				end
+			end
 			if g == nil then
 				allok = false
 				break
@@ -7729,6 +7818,14 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
 	})
 	cx.loopPc, cx.stmtPc = {}, {}
 	cx.npc = 0
+	-- cx.nd: how many errexit-exempt CONDITIONS (if/while tests, non-final &&/|| operands:
+	-- each raised sh.noerr) enclose the code being compiled. A break/continue/return that
+	-- jumps out of them lowers noerr by the difference (cx.ndadj) — else it stays raised.
+	cx.nd = 0
+	function cx.ndadj(nd)
+		local k = cx.nd - (nd or 0)
+		return k > 0 and ("sh.noerr = sh.noerr - %d; "):format(k) or ""
+	end
 	function cx.newpc()
 		local p = cx.npc
 		cx.npc = cx.npc + 1
@@ -7931,8 +8028,13 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
 			o[#o + 1] = prelude
 		end
 		o[#o + 1] = "local __sl, __sc = sh.loopdepth, sh.calldepth"
+		-- (in an eval / hot-loop fragment, or a redirected compound's body, the caller's loops
+		-- count too: a run-time level past this CFG's own reaches them — raised on, bash)
+		local outer = inloop and ((EF.fragment and not EF.lm) or (EF.cf_raise and EF.cf_raise.loop))
+			and #cx.subexit == 0 and not cs_ld
 		if inloop then
-			o[#o + 1] = ("sh.loopdepth = %d"):format(#cx.loopstack)
+			o[#o + 1] = outer and ("sh.loopdepth = (__sl or 0) + %d"):format(#cx.loopstack)
+				or ("sh.loopdepth = %d"):format(#cx.loopstack)
 		end
 		if infunc then
 			o[#o + 1] = "if (sh.calldepth or 0) < 1 then sh.calldepth = 1 end"
@@ -7963,27 +8065,32 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
 		o[#o + 1] = 'elseif type(__e) == "table" then'
 		local hs = {}
 		if inloop then
-			local brk, cont = {}, {} -- innermost-first: level 1 = nearest enclosing loop
+			local brk, cont, nds, anynd = {}, {}, {}, false -- innermost-first: level 1 = nearest enclosing loop
 			for i = #cx.loopstack, 1, -1 do
 				brk[#brk + 1] = tostring(cx.loopstack[i].brk)
 				cont[#cont + 1] = tostring(cx.loopstack[i].cont)
+				local k = cx.nd - (cx.loopstack[i].nd or 0)
+				nds[#nds + 1] = tostring(k)
+				anynd = anynd or k > 0
+			end
+			-- (leaving enclosing conditions: their raised noerr drops — cx.ndadj)
+			local ndj = anynd and ("sh.noerr = sh.noerr - ({%s})[__lv]; "):format(table.concat(nds, ", ")) or ""
+			local N = #cx.loopstack
+			local function past(sig)
+				return outer and ("if __lv > %d then %s%serror({ __curse_%s = __lv - %d }) end; "):format(
+					N, EF.cf_flush or "", cx.ndadj(0), sig, N) or ("if __lv > %d then __lv = %d end; "):format(N, N)
 			end
 			-- interp already set sh.status before raising (0 normal, 1/128 on a bad arg);
 			-- leave it — the loop's exit status is the break/continue command's, like bash.
-			hs[#hs + 1] = ("if __e.__curse_break then local __lv = __e.__curse_break; if __lv > %d then __lv = %d end; pc = ({%s})[__lv]"):format(
-				#cx.loopstack,
-				#cx.loopstack,
-				table.concat(brk, ", ")
-			)
-			hs[#hs + 1] = ("elseif __e.__curse_continue then local __lv = __e.__curse_continue; if __lv > %d then __lv = %d end; pc = ({%s})[__lv]"):format(
-				#cx.loopstack,
-				#cx.loopstack,
-				table.concat(cont, ", ")
-			)
+			hs[#hs + 1] = ("if __e.__curse_break then local __lv = __e.__curse_break; %s%spc = ({%s})[__lv]"):format(
+				past("break"), ndj, table.concat(brk, ", "))
+			hs[#hs + 1] = ("elseif __e.__curse_continue then local __lv = __e.__curse_continue; %s%spc = ({%s})[__lv]"):format(
+				past("continue"), ndj, table.concat(cont, ", "))
 		end
 		if infunc then
-			hs[#hs + 1] = ("%s __e.__curse_return ~= nil then sh.status = __e.__curse_return; pc = %d"):format(
+			hs[#hs + 1] = ("%s __e.__curse_return ~= nil then sh.status = __e.__curse_return; %spc = %d"):format(
 				#hs > 0 and "elseif" or "if",
+				#cx.subexit == 0 and cx.ndadj(0) or "",
 				cx.subexit[#cx.subexit] or cx.DONE
 			)
 		end
@@ -8161,18 +8268,12 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
 		return false
 	end
 	function cx.redirected_compound(st, after)
-		-- DEBUG: the body fragment has no per-command DEBUG hooks (dbg is top-level only)
-		if not cx.REDIR_COMPOUND[st.t] or EF.inproc_trap_block or EF.has_debug then
+		-- (under DEBUG the body fragment carries its commands' DEBUG hooks, as any fragment)
+		if not cx.REDIR_COMPOUND[st.t] then
 			return nil
 		end
 		local conds = cx.redir_conds(st, nil)
 		if not conds then
-			return nil
-		end
-		-- hoisted function bodies must not inherit the raise scope; a top-level `return`
-		-- (error + continue in bash) or a return reached via builtin/command/eval keeps
-		-- interp's handling.
-		if cx.has_node(st, cx.is_funcdef) or (cx.toplevel and cx.has_node(st, cx.is_return)) then
 			return nil
 		end
 		local body = {}
@@ -8296,8 +8397,8 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
 						cx.blocks[p] = d .. ((EF.fragment and not EF.lm and cx.toplevel)
 							and ("if (sh.loopdepth or 0) == 0 then if not sh.opt_posix then io.stderr:write(%q) end; sh.status = 0; pc = %d else %s end"):format(
 								"curse: " .. cf_op .. ": only meaningful in a `for', `while', or `until' loop\n", after,
-								(EF.cf_flush or "") .. ("error({ __curse_%s = %d })"):format(cf_op, lvl))
-							or ((EF.cf_flush or "") .. ("error({ __curse_%s = %d })"):format(cf_op, lvl)))
+								(EF.cf_flush or "") .. cx.ndadj(0) .. ("error({ __curse_%s = %d })"):format(cf_op, lvl))
+							or ((EF.cf_flush or "") .. cx.ndadj(0) .. ("error({ __curse_%s = %d })"):format(cf_op, lvl)))
 					elseif EF.cs_in_loop and #cx.subexit == 0 then -- (in a `$( … )` inside a loop: ends it)
 						cx.blocks[p] = d .. ("error({ __curse_%s = %d })"):format(cf_op, lvl)
 					else -- outside any loop: bash says so (status 0) and carries on
@@ -8313,28 +8414,32 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
 					if EF.cf_raise and EF.cf_raise.loop and lvl > #cx.loopstack and #cx.subexit == 0 then
 						-- (the body of a redirected compound inside the caller's loops: the levels
 						-- past its own reach them — raised for the caller's cf-wrapper)
-						cx.blocks[p] = d .. (EF.cf_flush or "") .. ("sh.status = 0; error({ __curse_%s = %d })"):format(
+						cx.blocks[p] = d .. (EF.cf_flush or "") .. cx.ndadj(0) .. ("sh.status = 0; error({ __curse_%s = %d })"):format(
 							cf_op, lvl - #cx.loopstack)
 					elseif EF.fragment and not EF.lm and lvl > #cx.loopstack and #cx.subexit == 0 then
 						-- (an eval / hot-loop fragment inside the caller's loops: the levels past
 						-- its own reach them — bash counts across; with none, it clamps)
-						cx.blocks[p] = d .. ("if sh.loopdepth > 0 then %serror({ __curse_%s = %d }) end; sh.status = 0; pc = %d"):format(
-							EF.cf_flush or "", cf_op, lvl - #cx.loopstack, tgt)
+						cx.blocks[p] = d .. ("if sh.loopdepth > 0 then %s%serror({ __curse_%s = %d }) end; sh.status = 0; %spc = %d"):format(
+							EF.cf_flush or "", cx.ndadj(0), cf_op, lvl - #cx.loopstack, cx.ndadj(cx.loopstack[idx].nd), tgt)
 					else
-						cx.blocks[p] = d .. ("sh.status = 0; pc = %d"):format(tgt)
+						cx.blocks[p] = d .. cx.ndadj(cx.loopstack[idx].nd) .. ("sh.status = 0; pc = %d"):format(tgt)
 					end
 				end
 				return p
 			end
 		elseif cf_op == "return" then
-			-- `return` at the top level is an error (status 2 + diagnostic, but execution
-			-- continues) — not a program exit. A compiled top level is always the main
-			-- script (source runs through interp), so delegate and let interp diagnose.
-			-- (`var=x return`: a posix-persistent prefix assignment — interp does that too)
-			if (cx.toplevel and (not EF.fragment or EF.lm)) or (st.assigns and #st.assigns > 0)
-				or (EF.cs_active and not EF.cs_in_func and #cx.subexit == 0) then -- ($(return) at top)
-				return cx.delegate(st, after)
+			-- (`var=x return`: a posix-persistent prefix assignment — the native simple-command
+			-- runner binds it and runs the builtin, whose raised return the wrapper catches)
+			if st.assigns and #st.assigns > 0 then
+				return EF.simple_native(cx, st, after, cmd) or cx.delegate(st, after)
 			end
+			-- `return` at the top level of the script (or a line of it, or a `$( … )` there) is
+			-- an error (status 2 + diagnostic, but execution continues) — not a program exit:
+			-- rt.return_outside reports it at run time. (Should a function or sourced file be
+			-- running after all, the return is raised for its catcher, or ends the `$( … )`.)
+			local viacmd = cf_arg > 2 and ", true" or "" -- (`command return`: not a special builtin)
+			local cs_top = EF.cs_active and not EF.cs_in_func and #cx.subexit == 0
+			local top_outside = not cs_top and cx.toplevel and (not EF.fragment or EF.lm)
 			-- return [N] (incl. \return / builtin return / command return): set $? and exit
 			-- the CFG. rt.return_status: N%256, or 2 + diagnostic on non-numeric; no arg → $?.
 			-- inside a subshell, `return` exits the subshell (subshell_exit) with the
@@ -8344,15 +8449,21 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
 			-- eval's cf-wrapper) as a raised signal, like interp; a return inside a compiled
 			-- subshell (subexit) still jumps locally.
 			local frag_return = ((EF.fragment and not EF.lm and cx.toplevel) or (EF.cf_raise and EF.cf_raise.func)) and #cx.subexit == 0
+			-- (top-level code run as a fragment — a subshell, a pipeline stage, a redirected
+			-- compound's body: no function is lexically around it, so maybe none is running)
+			local top_frag = not frag_return and not cs_top and not top_outside and cx.topcode and #cx.subexit == 0
+			frag_return = frag_return or top_outside or (top_frag and EF.cf_raise ~= nil)
 			-- (raised, `return N` leaves $? as it was — the RETURN trap of the `.` sees that —
 			-- and carries N: return.def sets only return_catch_value)
 			local retjmp = frag_return
-					and ((EF.cf_flush or "") .. "do local __r = sh.status; sh.status = __ps; error({ __curse_return = __r }) end")
-				or ("pc = %d"):format(retpc)
+					and ((EF.cf_flush or "") .. cx.ndadj(0) .. "do local __r = sh.status; sh.status = __ps; error({ __curse_return = __r }) end")
+				or ((#cx.subexit == 0 and cx.ndadj(0) or "") .. ("pc = %d"):format(retpc))
 			local ps = frag_return and "local __ps = sh.status; " or ""
 			if frag_return and not (EF.cf_raise and EF.cf_raise.func) then -- (a stage/eval fragment
 				-- at top level: maybe no function is running — then bash's diagnostic, status 2)
-				retjmp = ("if rt.return_outside(sh) then pc = %d else %s end"):format(after, retjmp)
+				retjmp = ("if rt.return_outside(sh%s) then pc = %d else %s end"):format(viacmd, after, retjmp)
+			elseif cs_top or top_frag then -- ($(return) at the top: reported; in a function it ends the $( … ))
+				retjmp = ("if rt.return_outside(sh%s) then pc = %d else %s end"):format(viacmd, after, retjmp)
 			end
 			local aw = st.words[cf_arg]
 			if aw and full_lit(aw) == "--" and not aw.parts[1].q then -- (`return -- N`: end of options)
@@ -8671,6 +8782,8 @@ assemble = function(cfg, sig, opts)
 	-- fn_x / cs_N body): rt's error prefix reads it off the stack to find the line
 	if opts.fnresume then -- fn_x(sh, pc): an interpreted call may continue here at a loop
 		o[#o + 1] = "  local __resume = pc ~= nil"
+	elseif opts.pcparam then -- (__CS[n](sh, pc): re-entered after a DEBUG-skipped command)
+		o[#o + 1] = ("  pc = pc or %d"):format(cfg.entry)
 	elseif not opts.toplevel then
 		o[#o + 1] = ("  local pc = %d"):format(cfg.entry)
 	end
@@ -8984,6 +9097,7 @@ end
 function M.emit(ast, opts)
 	EF.konsts = {}
 	EF.frag_depth = 0
+	EF.dskip_n = 0
 	emit_frags, emit_frag_n = {}, 0 -- compiled `$(…)` fragments (cs_N closures) collected during build
 	-- Fragment mode (eval/source, compiled at runtime): the code runs in the CALLER's
 	-- execution context, so a top-level return/break/continue must RAISE its signal for
