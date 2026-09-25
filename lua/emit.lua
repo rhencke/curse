@@ -2138,6 +2138,10 @@ function pexp_compilable(pe, quoted)
 		if not quoted and pe.arg and (pe.arg:find("%$[@*]") or pe.arg:find("%${[@*]") or pe.arg:find("%[[@*]%]")) then
 			return false
 		end
+		-- …and so does a quoted one's $@/${a[@]} ("${x:-$@}" is one field per element)
+		if quoted and pe.arg and (pe.arg:find("%$@") or pe.arg:find("%${[#!]?@") or pe.arg:find("%[@%]")) then
+			return false
+		end
 		local ok, w = pcall(quoted and P.parse_default_quoted or P.parse_word, pe.arg or "", pe.hd)
 		return ok and emitable_word(w) or false
 	end

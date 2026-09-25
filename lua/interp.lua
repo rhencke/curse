@@ -2331,11 +2331,11 @@ expand_fields_full = function(sh, w, pre1) -- pre1: part 1 already expanded (a $
 			end
 		elseif
 			p.pexp
-			and not p.q
 			and (p.pexp.op == ":-" or p.pexp.op == "-" or p.pexp.op == ":+" or p.pexp.op == "+")
 			and not p.pexp.index
 			and p.pexp.name ~= "@"
 			and p.pexp.name ~= "*"
+			and (not p.q or (p.pexp.arg and p.pexp.arg:find("@", 1, true)))
 		then
 			-- unquoted ${x:-word}/-/:+/+: when the WORD branch is taken, the word's OWN quoting
 			-- governs splitting (bash), so expand it field-wise rather than as a flat string —
@@ -2364,7 +2364,34 @@ expand_fields_full = function(sh, w, pre1) -- pre1: part 1 already expanded (a $
 			else
 				useword = hasval
 			end
-			if useword and pe.arg then
+			if p.q then
+				-- "${x:-$@}" / "a${x:+"$@"}b": a $@ (or ${a[@]}) in a used word of a QUOTED
+				-- ${…} still makes one field per element, as "$@" does; the rest of the word
+				-- is quoted text. Never zero fields (bash: "${x:-$@}" with no params is "").
+				add("", false)
+				if useword then
+					for _, sp in ipairs(P.parse_default_quoted(pe.arg, pe.hd).parts) do
+						if is_multi(sh, sp) then
+							sp.q = true
+							local els, star = multi_elems(sh, sp)
+							if star then
+								add(table.concat(els, rt.ifs_sep(sh)), false)
+							else
+								for e = 1, #els do
+									if e > 1 then
+										brk()
+									end
+									add(els[e], false)
+								end
+							end
+						else
+							add(expand_part_str(sh, sp), false)
+						end
+					end
+				else
+					add(expand_part_str(sh, p), false)
+				end
+			elseif useword and pe.arg then
 				-- expand the default's parts: a QUOTED part is one atomic (sub)field, an
 				-- unquoted part word-splits — so 'a b' stays one field but a b splits.
 				for k, sp in ipairs(P.parse_word(pe.arg).parts) do
