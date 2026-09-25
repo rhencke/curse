@@ -719,7 +719,8 @@ local function not_compilable(e)
 	-- arith_perr = a deferred arith PARSE error (`(( i = '3' ))`): only the interpreter
 	-- renders it (prints bash's "syntax error in expression" + aborts the line), so the
 	-- enclosing loop/statement must delegate — else emit_value throws an uncaught error.
-	if e.k == "xpandleaf" or e.k == "arith_perr" or (e.idxraw and not arith_elem_ok(e)) then
+	-- rpow: a short-circuited operand holding `**` still checks its exponent (interp's noeval_pow)
+	if e.k == "xpandleaf" or e.k == "arith_perr" or e.rpow or (e.idxraw and not arith_elem_ok(e)) then
 		return true
 	end -- comma recurses (emit_value / emit_arith_into render the sequence)
 	if e.k == "xpand" then
@@ -762,6 +763,9 @@ local function arith_val_r(e)
 	local k = e.k
 	if k == "num" or k == "param" or k == "raw" then
 		return true
+	end
+	if e.rpow then
+		return false
 	end
 	if k == "var" then
 		return not e.idx and not e.idxraw and not COMPILE_UNSAFE_VAR[e.name]
@@ -2963,6 +2967,9 @@ local function arith_value_ok(e)
 	local k = e.k
 	if k == "num" or k == "param" then
 		return true
+	end
+	if e.rpow then -- (a short-circuit that still checks an exponent: interp's noeval_pow)
+		return false
 	end
 	-- a subscripted READ (a[i]) is a value emit_value renders via rt.arith_read_elem (write
 	-- targets are gated separately by arith_stmt_ok's `not e.idx` on asgn/post/pre).

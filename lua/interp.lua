@@ -786,6 +786,7 @@ local expand_repl -- forward (${v/pat/REPL} replacement expansion)
 local is_multi, multi_elems -- forward (defined with the field expander)
 local indirect_part -- forward (${!ref} target resolution, re-parsed to a part)
 local eval -- arithmetic evaluator (forward decl)
+local noeval_pow -- a short-circuited operand's exponent check (forward decl)
 local arith_resolve -- var-value-as-arith-expression resolver (forward decl)
 local arith_key -- array subscript in arith: string key for assoc, number for indexed
 local xpand_subdepth -- 1 while arith_key evaluates an xpand subscript (see arith_key)
@@ -948,6 +949,74 @@ local function arith_cur(sh, name, iv)
 	end
 	return arith_resolve(sh, sh:get(name))
 end
+-- A short-circuited operand (`0 && …`, a ternary's untaken branch) is still PARSED — and
+-- evaluated with noeval — as bash evaluates while parsing: noeval makes a variable 0 and
+-- skips assignments and division by 0, but exppower has no noeval guard, so a negative
+-- exponent is still an error (`$(( 0 && 2 ** -1 ))`). Only a subtree holding a `**` (the
+-- parser's rpow mark) is walked; this returns its noeval value.
+noeval_pow = function(e)
+	local k = e.k
+	if k == "num" then
+		return rt.arith_num(e.v)
+	elseif k == "asgn" then
+		return noeval_pow(e.e)
+	elseif k == "comma" then
+		noeval_pow(e.l)
+		return noeval_pow(e.r)
+	elseif k == "un" then
+		local v = noeval_pow(e.e)
+		return e.op == "-" and -v or e.op == "!" and b2i(not truth(v)) or bit.bnot(v)
+	elseif k == "tern" then
+		local c = truth(noeval_pow(e.c))
+		local a, b = noeval_pow(e.a), noeval_pow(e.b)
+		return c and a or b
+	elseif k == "bin" then
+		local l, r, op = noeval_pow(e.l), noeval_pow(e.r), e.op
+		if op == "**" then
+			if r < 0 then
+				arith_div0(e, "exponent less than 0")
+			end
+			return rt.ipow_raw(l, r)
+		elseif op == "/" or op == "%" then
+			if r == 0 then
+				r = i64(1)
+			end
+			return op == "/" and l / r or l % r
+		elseif op == "+" then
+			return l + r
+		elseif op == "-" then
+			return l - r
+		elseif op == "*" then
+			return l * r
+		elseif op == "&&" then
+			return b2i(truth(l) and truth(r))
+		elseif op == "||" then
+			return b2i(truth(l) or truth(r))
+		elseif op == "==" then
+			return b2i(l == r)
+		elseif op == "!=" then
+			return b2i(l ~= r)
+		elseif op == "<" then
+			return b2i(l < r)
+		elseif op == "<=" then
+			return b2i(l <= r)
+		elseif op == ">" then
+			return b2i(l > r)
+		elseif op == ">=" then
+			return b2i(l >= r)
+		elseif op == "&" then
+			return bit.band(l, r)
+		elseif op == "|" then
+			return bit.bor(l, r)
+		elseif op == "^" then
+			return bit.bxor(l, r)
+		elseif op == "<<" then
+			return bit.lshift(l, tonumber(r) % 64)
+		end
+		return bit.arshift(l, tonumber(r) % 64) -- >>
+	end
+	return i64(0) -- var / ++ / -- / expansions: noeval reads nothing
+end
 eval = function(sh, e)
 	local k = e.k
 	if k == "matherr" then -- a deferred arith parse error (bad lvalue): non-fatal in (( ))
@@ -1055,18 +1124,36 @@ eval = function(sh, e)
 	end
 	if k == "tern" then
 		if truth(eval(sh, e.c)) then
-			return eval(sh, e.a)
-		else
-			return eval(sh, e.b)
+			local v = eval(sh, e.a)
+			if e.rpow then
+				noeval_pow(e.b)
+			end
+			return v
 		end
+		if e.rpow then
+			noeval_pow(e.a)
+		end
+		return eval(sh, e.b)
 	end
 	if k == "bin" then
 		local op = e.op
 		if op == "&&" then
-			return b2i(truth(eval(sh, e.l)) and truth(eval(sh, e.r)))
+			if not truth(eval(sh, e.l)) then
+				if e.rpow then
+					noeval_pow(e.r)
+				end
+				return i64(0)
+			end
+			return b2i(truth(eval(sh, e.r)))
 		end
 		if op == "||" then
-			return b2i(truth(eval(sh, e.l)) or truth(eval(sh, e.r)))
+			if truth(eval(sh, e.l)) then
+				if e.rpow then
+					noeval_pow(e.r)
+				end
+				return i64(1)
+			end
+			return b2i(truth(eval(sh, e.r)))
 		end
 		local l, r = eval(sh, e.l), eval(sh, e.r)
 		if op == "+" then

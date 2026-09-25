@@ -135,6 +135,7 @@ local function arith(src, nodefer)
 		error({ __curse_arith = true, msg = msg, tok = lasttp and src:sub(lasttp) or "" }, 0)
 	end
 	local ARITHOP = "[%+%-%*/%%<>=!&|%^~%?:,%(%)]"
+	local npow = 0 -- `**` operators parsed so far (an untaken branch with one sets rpow)
 
 	local function ident()
 		skip()
@@ -278,8 +279,9 @@ local function arith(src, nodefer)
 			-- octal, decimal), validated like bash's strlong so its errors match
 			local s0, e = src:find("^%d[%w#@_]*", i)
 			local v = src:sub(s0, e)
-			local function nerr(m)
-				error({ __curse_arith = true, msg = m, tok = v, expr = v }, 0)
+			local function nerr(m) -- (bash's readtok NULs the text after the number: the
+				-- expression shown ends there — `1 + 09: value too great for base`)
+				error({ __curse_arith = true, msg = m, tok = v, expr = src:sub(1, e) }, 0)
 			end
 			local base, foundbase, val, k = 10, false, 0, 1
 			if v:sub(1, 1) == "0" and #v > 1 then
@@ -410,17 +412,27 @@ local function arith(src, nodefer)
 				break
 			end
 			i = i + #op
+			local stp, np = i, npow
+			if op == "**" then
+				npow = npow + 1
+			end
 			local right = parseExpr(op == "**" and prec or prec + 1) -- ** is right-assoc
 			left = { k = "bin", op = op, l = left, r = right }
-			if op == "/" or op == "%" or op == "**" then
+			if op == "**" then
 				-- (for bash's eval-time error text: the expression, and the lookahead token
-				-- after the right operand — `4 / 0 ` -> error token "0 ")
+				-- after the right operand — `2 ** -1 ` -> error token "1 ")
 				skip()
 				left.etxt, left.etok = etxt, lasttp and src:sub(lasttp) or ""
+			elseif op == "/" or op == "%" then
+				-- (a division by 0 names the text from the divisor on: expmuldiv's lasttp = stp)
+				left.etxt, left.etok = etxt, (src:sub(stp):gsub("^%s+", ""))
+			elseif (op == "&&" or op == "||") and npow > np then
+				left.rpow = true -- (a skipped right operand still checks its exponents: see eval)
 			end
 		end
 		-- ternary c ? a : b (lowest precedence, right-assoc) — only at the top level
 		if minprec == 0 and peek() == "?" then
+			local np = npow
 			i = i + 1
 			if peek() == ":" or i > n then
 				aerr("expression expected")
@@ -433,7 +445,7 @@ local function arith(src, nodefer)
 				aerr("expression expected")
 			end
 			local b = parseExpr(0, true) -- (the else-branch is a conditional, not an assignment)
-			left = { k = "tern", c = left, a = a, b = b }
+			left = { k = "tern", c = left, a = a, b = b, rpow = npow > np or nil }
 		end
 		return left
 	end
@@ -455,7 +467,7 @@ local function arith(src, nodefer)
 		if (c == "=" and src:sub(i + 1, i + 1) ~= "=") or src:find("^[%+%-%*/%%&|%^]=", i) or src:find("^<<=", i)
 			or src:find("^>>=", i) then
 			aerr("attempted assignment to non-variable")
-		elseif not c:match(ARITHOP) and not c:match("[%w_$]") then
+		elseif not c:match(ARITHOP) and not c:match("[%w_]") then
 			aerr("syntax error: invalid arithmetic operator") -- (after an operand: `1 @ 2`)
 		end
 		aerr("syntax error in expression")
