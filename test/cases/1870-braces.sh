@@ -20,3 +20,8 @@ set +B; p {a,b} {1..3}; set -B
 p {a..c}{1..2}{x,y}
 p() { printf "[%s]" "$@"; echo; }
 p {-05..5..5} {1..-05} {-01..1} {-1..01} {-010..2..4} {00..-2}
+# a range's backquote is live, as bash expands braces on the raw word: at a
+# word's end it stays literal, and left open it is "bad substitution" (1)
+echo {Z..a}
+echo -{z..A}- 2>&1 | sed 's/^.*line [0-9]*: //'; echo "open st=${PIPESTATUS[0]}"
+echo -{z..A..2}- 2>&1 | sed 's/^.*line [0-9]*: //'

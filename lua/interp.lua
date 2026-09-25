@@ -1469,6 +1469,9 @@ end
 expand_part_str = function(sh, p, assign)
 	if p.lit ~= nil then
 		return p.lit
+	elseif p.bterr then -- (a brace range's unclosed backquote: bq_word in the parser)
+		sherr(sh, 'curse: bad substitution: no closing "`" in ' .. p.bterr .. "\n")
+		error({ __curse_exit = 1, __curse_lineabort = true, __curse_discard = true })
 	elseif p.var then
 		-- a nameref whose target has a subscript (`typeset -n ref='a[2]'`) reads as
 		-- ${a[2]} — deref only yields the base name, so expand the target here.

@@ -1810,17 +1810,58 @@ end
 -- A character from a {x..y} range, as word TEXT (the expansion is re-parsed as a word):
 -- shell-special characters must stay literal (`{Z..a}` yields ` literally), and a `\`
 -- comes out as an empty argument (bash's quote removal of the lone backslash).
+-- A range's backquote (`{_..a}`): bash expands braces on the raw word, so a generated
+-- ` is live — it pairs into a command substitution, stays literal at the word's end, and
+-- left open is an expansion error. It travels as BRACE_BQ until the word is whole (bq_word).
+local BRACE_BQ = "\0bq\0"
 local function brace_char(v)
 	local ch = string.char(v)
 	if ch == "\\" then
 		return "''"
 	end
-	if ch:match("[`'\"$;&|<>() \t]") then
+	if ch == "`" then
+		return BRACE_BQ
+	end
+	if ch:match("['\"$;&|<>() \t]") then
 		return "\\" .. ch
 	end
 	return ch
 end
 
+-- A brace-expanded word's source text, parsed — resolving its BRACE_BQ backquotes the way
+-- bash's expand_word_internal does (subst.c, case '`').
+local function bq_word(x)
+	if not x:find(BRACE_BQ, 1, true) then
+		return parse_word(x)
+	end
+	local out, pos = {}, 1
+	while true do
+		local s = x:find(BRACE_BQ, pos, true)
+		if not s then
+			out[#out + 1] = x:sub(pos)
+			break
+		end
+		out[#out + 1] = x:sub(pos, s - 1)
+		local r0 = s + #BRACE_BQ
+		if r0 > #x then -- a bare ` ending the word passes through
+			out[#out + 1] = "\\`"
+			break
+		end
+		local e = x:find(BRACE_BQ, r0, true)
+		if not e then -- no closing `: "bad substitution" when the word is expanded
+			local w = parse_word(table.concat(out))
+			local parts = {}
+			for i, p in ipairs(w.parts) do
+				parts[i] = p
+			end
+			parts[#parts + 1] = { bterr = "`" .. x:sub(r0) } -- (no BRACE_BQ follows: none closed it)
+			return { k = "word", parts = parts }
+		end
+		out[#out + 1] = "`" .. x:sub(r0, e - 1) .. "`"
+		pos = e + #BRACE_BQ
+	end
+	return parse_word(table.concat(out))
+end
 -- classify the inside of a {…}: a numeric/char range (symbolic) or a comma list
 -- (raw alternatives, possibly themselves containing braces), or nil (not a brace).
 -- bash zero-pads a numeric range to the widest endpoint iff either endpoint has
@@ -2146,7 +2187,7 @@ local function add_word(words, w)
 		if x ~= "" and not x:find("[^%w_%-%.,/+:=@%%]") then -- plain text: the literal word as is
 			words[#words + 1] = { k = "word", parts = { { lit = x, q = false } }, src = n == 0 and w or false }
 		else
-			local pw = parse_word(x)
+			local pw = bq_word(x)
 			words[#words + 1] = { k = pw.k, parts = pw.parts, src = n == 0 and w or false }
 		end
 		n = n + 1
@@ -3253,7 +3294,7 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs)
 					local factors = brace_factors(rhs)
 					if factors then
 						stream_factors(factors, function(x)
-							elems[#elems + 1] = { key = nil, op = "=", word = parse_word(x) }
+							elems[#elems + 1] = { key = nil, op = "=", word = bq_word(x) }
 							return #elems >= BRACE_CAP
 						end)
 					else
@@ -3271,7 +3312,7 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs)
 					if factors then
 						elem.brace_bare = {}
 						stream_factors(factors, function(x)
-							elem.brace_bare[#elem.brace_bare + 1] = parse_word(x)
+							elem.brace_bare[#elem.brace_bare + 1] = bq_word(x)
 							return #elem.brace_bare >= BRACE_CAP
 						end)
 					end
