@@ -411,6 +411,33 @@ function M.loop_osr(sh, st)
 	return true, err
 end
 I.frag_hook = M.frag_hook -- (the interpreter's isolated contexts tier their hot loops)
+-- A hot function whose body is still an interp AST — defined by eval'd or sourced text,
+-- in a subshell, or redefined (none of those is in the program's own module) — compiles
+-- standalone from its definition's exact text at its own line, and its later calls run
+-- the compiled closure (cached on the definition node, per trap state). Not while aliases
+-- are live (the text parses without them), nor under a RETURN trap, functrace'd DEBUG or
+-- $FUNCNEST (a compiled body doesn't fire/count those for the calls it makes itself).
+function M.fn_hot(sh, name, def)
+	local n = (def._calls or 0) + 1
+	def._calls = n
+	if n < HOT_LOOP or not def.deftext then
+		return nil
+	end
+	local t = sh.traps
+	local mode = trap_mode(sh)
+	if (t and t.RETURN) or mode:find("T", 1, true) or sh.vars.FUNCNEST -- (compiled recursion doesn't count it)
+		or (sh.shopt.expand_aliases and sh.aliases and next(sh.aliases)) then
+		return nil
+	end
+	if def._cfnm == mode then
+		return def._cfn or nil
+	end
+	local mod = M.compile_fragment(def.deftext, def.line, mode)
+	local fc = mod and mod.fnCall and mod.fnCall[name]
+	def._cfn, def._cfnm = fc and fc.fn or false, mode
+	return def._cfn or nil
+end
+I.fn_hook = M.fn_hot
 -- emit + load + store (disk cache and this worker's) — nil if the emitter can't. With
 -- `later`, the disk write waits for M.flush_stores (a compile MID-RUN happens under the
 -- script's own limits — `ulimit -f 1` would kill the process with SIGXFSZ).
