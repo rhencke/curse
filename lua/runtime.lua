@@ -1902,8 +1902,25 @@ function M.redir_discard(saves)
 		saves[i] = nil
 	end
 end
+-- A command with prefix assignments AND redirections: a readonly prefix is reported before
+-- the redirections apply (bash's assign_in_env runs as the words expand), so to the stderr
+-- from before them; the binding then just skips it (M.ro_said, until the redirections go).
+function M.prefix_ro(sh, names)
+	local said
+	for _, name in ipairs(names) do
+		local dn = sh:deref(name)
+		local b = sh.vars[dn]
+		if b and b.ro then
+			io.stderr:write("curse: " .. dn .. ": readonly variable\n")
+			said = said or {}
+			said[name] = true
+		end
+	end
+	M.ro_said = said
+end
 function M.redir_restore(saves)
 	io.flush()
+	M.ro_said = nil -- (M.prefix_ro: the command it was said for has bound, or never ran)
 	if saves.e2o then
 		saves._sh.err2out = (saves._sh.err2out or 0) - saves.e2o
 		saves.e2o = nil
@@ -2030,6 +2047,30 @@ function M.cmd_text(sh)
 	end
 	return c or ""
 end
+-- The line a foreground job's report carries (bash's line_number back in the caller of
+-- execute_simple_command: the enclosing context's — parser.lua's jcx): compiled code
+-- registers it per pc (M.pcline's `jl`, where it differs from the pc's own line), the
+-- interpreter reads it off the node. nil: the command's own line (the usual prefix).
+function M.job_line(sh)
+	local getinfo, getlocal = debug.getinfo, debug.getlocal
+	for level = 2, 200 do
+		local info = getinfo(level, "f")
+		if not info then
+			break
+		end
+		local f = info.func
+		if M.INTERP_FRAMES[f] then
+			break
+		end
+		local t = M.PCLINE[f]
+		if t then
+			local _, pc = getlocal(level, 2)
+			return t.jl and t.jl[pc]
+		end
+	end
+	local c = sh.cur_cmd
+	return type(c) == "table" and c.jcx and c.jcx.l or nil
+end
 -- notify_of_job_status (jobs.c) for a job that has ended: `procs` its processes
 -- { pid, st = raw wait status, text = command (a string, or a node to deparse) }, `s` the
 -- job's status word (its last process's, or pipefail's rightmost failure). A script
@@ -2038,8 +2079,9 @@ end
 -- FOREGROUND one killed by TERM or a trapped signal just by the signal's description.
 -- Nothing inside a $(…) (SUBSHELL_COMSUB). Returns true when a line was written. `defer`:
 -- the command's own redirections are still in place — the note waits for their undoing
--- (M.jobnote_flush), as bash's parent writes it where they never applied.
-function M.job_notify(sh, procs, s, fg, defer)
+-- (M.jobnote_flush), as bash's parent writes it where they never applied. A foreground
+-- job's line N is `jl` when the caller knows it, else M.job_line's.
+function M.job_notify(sh, procs, s, fg, defer, jl)
 	local sig = bit.band(s, 0x7f)
 	if sig == 0 or sig == 0x7f or sig == 2 or sh.cap_jobs then
 		return false
@@ -2073,6 +2115,16 @@ function M.job_notify(sh, procs, s, fg, defer)
 			end
 		end
 		M.jobnote = "curse: " .. table.concat(o)
+		jl = fg and not sh.opt_i and (jl or M.job_line(sh))
+		if jl then -- (the prefix now, at that line)
+			local fl = sh.force_line
+			sh.force_line = jl
+			local ok, pfx = pcall(M.err_prefix, sh)
+			sh.force_line = fl
+			if ok then
+				M.jobnote = pfx .. M.jobnote:sub(8)
+			end
+		end
 	elseif fg and sig ~= 13 then
 		M.jobnote = desc(s) .. (bit.band(s, 0x80) ~= 0 and " (core dumped)" or "") .. "\n"
 	else
@@ -2768,6 +2820,7 @@ function Shell:capture_inproc(backtick, runner, capfd, ctx)
 		self.opt_e = false
 	end
 	local saved_line, saved_cc, saved_tl = self.cur_line, self.cur_cmd, self.shlvl_tail -- $LINENO: the sub's internal lines don't leak out
+	local saved_cl = self.cur_cline -- (nor the line a next $(…) of this command numbers from)
 	self.shlvl_tail = nil
 	-- $() is a child: it INHERITS the parent's aliases but its own alias/unalias
 	-- do not leak back out (bash). Give it an independent copy, restored after.
@@ -2824,6 +2877,7 @@ function Shell:capture_inproc(backtick, runner, capfd, ctx)
 	self.aliases = saved_aliases -- discard aliases defined inside $()
 	self.hashcache, self.hashpath = sv_hc, sv_hp
 	self.cur_line, self.cur_cmd, self.shlvl_tail = saved_line, saved_cc, saved_tl -- ($BASH_COMMAND: the child's was its own)
+	self.cur_cline = saved_cl
 	self.opt_e = savede
 	self.loopdepth = saved_ld
 	self.in_subprogram = self.in_subprogram - 1
@@ -3155,7 +3209,7 @@ function M.iso_save_traps(sh)
 	ctx.traps = {
 		owner = sh, -- (whose tables these are: a no-#! script's fresh shell shares our context)
 		traps = sh.traps, sigtraps = sh.sigtraps, inh = M.exit_trap_inherited,
-		esp = sh.err_trap_sp, dsp = sh.dbg_trap_sp, rsp = sh.ret_trap_sp,
+		esp = sh.err_trap_sp, eps = sh.err_trap_ps, dsp = sh.dbg_trap_sp, rsp = sh.ret_trap_sp,
 		run = rawget(_G, "__curse_sigrun"), inexit = sh.in_exit_trap,
 	}
 	sh.traps = shallowcopy(sh.traps) or {}
@@ -3341,7 +3395,7 @@ local function iso_undo(sh, ctx)
 		end
 		o.traps, o.sigtraps = sv.traps, sv.sigtraps
 		M.exit_trap_inherited, o.err_trap_sp, o.in_exit_trap = sv.inh, sv.esp, sv.inexit
-		o.dbg_trap_sp, o.ret_trap_sp = sv.dsp, sv.rsp
+		o.dbg_trap_sp, o.ret_trap_sp, o.err_trap_ps = sv.dsp, sv.rsp, sv.eps
 		_G.__curse_sigrun = sv.run
 	end
 	M.iso_restore_fds(ctx)
@@ -3692,6 +3746,7 @@ function Shell:subshell_run(runner, saves, paren)
 	end
 	local cp = sub_checkpoint(self)
 	local sv_out, sv_line, sv_cc, sv_tl = self.out, self.cur_line, self.cur_cmd, self.shlvl_tail
+	local sv_cl = self.cur_cline
 	self.shlvl_tail = nil
 	local sv_ld, sv_ne, sv_alias = self.loopdepth, self.noerr, self.aliases
 	self.aliases = shallowcopy(self.aliases) or {}
@@ -3755,6 +3810,7 @@ function Shell:subshell_run(runner, saves, paren)
 
 	if saves then M.redir_restore(saves) end
 	self.out, self.cur_line, self.cur_cmd = sv_out, sv_line, sv_cc -- ($BASH_COMMAND: the child's was its own)
+	self.cur_cline = sv_cl
 	self.shlvl_tail = sv_tl
 	self.loopdepth, self.noerr, self.aliases = sv_ld, sv_ne, sv_alias
 	self.in_subprogram = self.in_subprogram - 1
@@ -3768,7 +3824,7 @@ function Shell:subshell_run(runner, saves, paren)
 		local tx = type(paren) ~= "boolean" and paren or ""
 		-- (an interpreted `( … ) >f`: written once interp's restore_redirs has undone >f)
 		M.job_notify(self, { { pid = ctx.vpid, st = killed, text = tx } }, killed, true,
-			type(paren) == "table" and paren.redirs and #paren.redirs > 0)
+			type(paren) == "table" and paren.redirs and #paren.redirs > 0, type(paren) == "table" and paren.jcx and paren.jcx.l)
 	end
 	if rethrow then error(rethrow) end
 	self.status = status
@@ -4261,8 +4317,10 @@ function M.jobs_notify(sh, only)
 	for _, j in ipairs(sh.jobs or {}) do
 		if j.done and j.sig and not j.gone and not j.notified and (not only or j == only) then
 			j.notified = true
-			M.job_notify(sh, { { pid = j.pid, st = j.sig + (j.core and 0x80 or 0), text = j.cmd } }, j.sig, false)
-			if not only then
+			-- (one bash doesn't report — TERM, INT, PIPE — stays listed, as an exited job does,
+			-- until `jobs` or `wait` shows it)
+			if M.job_notify(sh, { { pid = j.pid, st = j.sig + (j.core and 0x80 or 0), text = j.cmd } }, j.sig, false)
+				and not only then
 				M.job_delete(sh, j)
 			end
 		end
@@ -4393,11 +4451,20 @@ function Shell:spawn_bg(args, cmdstr)
 	return true
 end
 
+-- A pipeline job (`a | b &`): `kill %N` reaches its every stage, and the pipeline its task
+-- runs IS the job — not a foreground one there, reported as it ends (co_finish).
+function M.job_mark_pipe(job)
+	job.g.pipe = true
+	local t = job.g.tasks[1]
+	if t and t.sh then
+		t.sh.bg_pipe = true
+	end
+end
 function Shell:run_background(cmd_fn, cmdstr, exec_tail, flat, simple, pipe)
 	-- (in-process: a background task — see Shell:bg_launch)
 	local job = self:bg_launch(cmd_fn, cmdstr, flat, simple)
 	if pipe and job and job.g then
-		job.g.pipe = true -- (a pipeline job: `kill %N` reaches its every stage)
+		M.job_mark_pipe(job)
 	end
 	self.status = 0
 end
@@ -4529,6 +4596,7 @@ function Shell:stage_clone()
 	-- (jobs stays a COPY of the parent's table: bash lets a pipeline stage SEE the
 	-- parent's jobs — `jobs | wc -l` — as a forked stage's copy-on-write view did.)
 	c.in_pipestage = (self.in_pipestage or 0) + 1
+	c.bg_pipe = nil
 	c.paren_sp = nil -- (a stage is a subshell of its own, not the `( … )` it may sit in)
 	c.loopdepth = 0
 	c.capturing = nil
@@ -4980,7 +5048,7 @@ local function co_finish(ctx, self, g)
 	self:array_assign("PIPESTATUS", pstat, false)
 	self.status = self.opt_pipefail and pipe or last
 	self.last_stage_status = last -- (the ERR quirk for a failing `( … )` last stage)
-	if self.status > 128 and g.texts and not g.bg then
+	if self.status > 128 and g.texts and not g.bg and not self.bg_pipe then
 		M.pipeline_notify(self, g)
 	end
 end
@@ -8500,6 +8568,32 @@ function M.noassign_arr_check(sh, name)
 	if M.NOASSIGN_ARR[name] and M.noassign_live(sh, name) then
 		M.assign_discard(sh)
 	end
+end
+-- A plain assignment through a nameref cycle (ref1 -> ref2 -> ref1): bash warns; a cycle of
+-- a function's locals then binds the GLOBAL name, no nameref (variables.c bind_variable's
+-- nameref_maxloop_value) — true, for the caller to do so (Shell:global_swap) — else it is
+-- an assignment error, as a readonly one: a prefix binding is just skipped (false), a
+-- standalone one aborts the rest of the line (fatal in posix mode). A chain past
+-- NAMEREF_MAX is that error silently.
+function M.nameref_circular(sh, name)
+	if M.ref_too_deep(sh, name) then
+		M.assign_discard(sh)
+	end
+	io.stderr:write("curse: warning: " .. name .. ": circular name reference\n")
+	for d = 1, not sh.in_circ and sh.pd or 0 do -- (in_circ: the global is a cycle too)
+		local sv = sh.savedstack[d]
+		if sv and sv[name] ~= nil then
+			return true
+		end
+	end
+	sh.status = 1
+	if sh.opt_posix then
+		error({ __curse_exit = 1 })
+	end
+	if sh.applying_prefix then
+		return false
+	end
+	error({ __curse_exit = 1, __curse_lineabort = true })
 end
 -- bash's jump_to_top_level(DISCARD) after a failed assignment: every function, eval and
 -- source level unwinds, the rest of the top-level command is abandoned, $? is 1
@@ -12547,39 +12641,52 @@ function M.run_prefix(sh, names, vals, runfn, argv)
 	for i = 1, #names do
 		local name = names[i]
 		local rb = sh.vars[name]
-		if rb and rb.ref and rb.s and rb.s:match("^[%a_][%w_]*$") and sh:deref(name) ~= "" then
-			name = sh:deref(name) -- (through a nameref with a target: the target's binding)
-		end
-		local b = sh.vars[name] -- copy the box: set_str below mutates in place
-		sh.vseq = sh.vseq + 1
-		sh.tenv[#sh.tenv + 1] = {
-			name = name,
-			env = os.getenv(name),
-			consumed = false,
-			seq = sh.vseq,
-			box = b
-					and { s = b.s, n = b.n, arr = b.arr, assoc = b.assoc, order = b.order, exported = b.exported, ro = b.ro, ref = b.ref,
-						int = b.int, lower = b.lower, upper = b.upper, cap = b.cap, trace = b.trace }
-				or false,
-		}
-		-- a NAMEREF's prefix binding is a plain temporary (target untouched), and so is an
-		-- -i/-l/-u/-c var's (bash's tempenv variable is a plain string: `i=1+1 cmd` gets "1+1")
-		if b and (b.ref or (not b.ro and (b.arr or b.int or b.lower or b.upper or b.cap))) then
-			if b.ref and M.arith_ref_circ(sh, name, 0) == true then -- (a cycle: bash warns, then
-				io.stderr:write("curse: warning: " .. name .. ": circular name reference\n") -- binds)
+		local ob = sh.vars[sh:deref(name)]
+		if ob and ob.ro then -- (a readonly prefix: reported, not bound — the command still runs)
+			if not (M.ro_said and M.ro_said[name]) then
+				io.stderr:write("curse: " .. sh:deref(name) .. ": readonly variable\n")
 			end
-			sh.vars[name] = {}
+			if sh.opt_c or sh.opt_posix then
+				sh.status = 1
+				error({ __curse_exit = 1 })
+			end
+			name = nil
 		end
-		if LOCALE_VARS[name] then
-			M.lc_quiet = M.prefix_ext(sh, argv and argv[1])
-		end
-		sh:set_str(name, vals[i])
-		M.lc_quiet = nil
-		C.setenv(name, sh:get(name), 1)
-		sh.tenv[#sh.tenv].tval = sh:get(name) -- (to see whether the command wrote it: prefix_keeps)
-		local nb = sh.vars[sh:deref(name)] -- (in the environment: `declare -p` shows -x)
-		if nb then
-			nb.exported = true
+		if name then -- (nil: a readonly one, skipped)
+			if rb and rb.ref and rb.s and rb.s:match("^[%a_][%w_]*$") and sh:deref(name) ~= "" then
+				name = sh:deref(name) -- (through a nameref with a target: the target's binding)
+			end
+			local b = sh.vars[name] -- copy the box: set_str below mutates in place
+			sh.vseq = sh.vseq + 1
+			sh.tenv[#sh.tenv + 1] = {
+				name = name,
+				env = os.getenv(name),
+				consumed = false,
+				seq = sh.vseq,
+				box = b
+						and { s = b.s, n = b.n, arr = b.arr, assoc = b.assoc, order = b.order, exported = b.exported, ro = b.ro, ref = b.ref,
+							int = b.int, lower = b.lower, upper = b.upper, cap = b.cap, trace = b.trace }
+					or false,
+			}
+			-- a NAMEREF's prefix binding is a plain temporary (target untouched), and so is an
+			-- -i/-l/-u/-c var's (bash's tempenv variable is a plain string: `i=1+1 cmd` gets "1+1")
+			if b and (b.ref or (not b.ro and (b.arr or b.int or b.lower or b.upper or b.cap))) then
+				if b.ref and M.arith_ref_circ(sh, name, 0) == true then -- (a cycle: bash warns, then
+					io.stderr:write("curse: warning: " .. name .. ": circular name reference\n") -- binds)
+				end
+				sh.vars[name] = {}
+			end
+			if LOCALE_VARS[name] then
+				M.lc_quiet = M.prefix_ext(sh, argv and argv[1])
+			end
+			sh:set_str(name, vals[i])
+			M.lc_quiet = nil
+			C.setenv(name, sh:get(name), 1)
+			sh.tenv[#sh.tenv].tval = sh:get(name) -- (to see whether the command wrote it: prefix_keeps)
+			local nb = sh.vars[sh:deref(name)] -- (in the environment: `declare -p` shows -x)
+			if nb then
+				nb.exported = true
+			end
 		end
 	end
 	sh.tenv_call_base = base -- a DIRECT function call tags these with its frame (local absorption)
@@ -14006,18 +14113,17 @@ function M.assign_scalar(sh, name, value)
 	end
 	if direct and direct.ref and direct.s and direct.s ~= "" then
 		if sh:deref(name) == "" then
-			if M.ref_too_deep(sh, name) then
-				M.assign_discard(sh) -- (bash: an assignment error, silent)
+			if M.nameref_circular(sh, name) then -- (a function's local cycle: the global, no nameref)
+				local back = sh:global_swap({ name })
+				sh.in_circ = true
+				local ok, e = pcall(M.assign_scalar, sh, name, value)
+				sh.in_circ = nil
+				back()
+				if not ok then
+					error(e, 0)
+				end
 			end
-			io.stderr:write("curse: warning: " .. name .. ": circular name reference\n")
-			sh.status = 1 -- (an assignment error, as a readonly one: a prefix binding is just
-			if sh.opt_posix then -- skipped, a standalone one aborts the rest of the line)
-				error({ __curse_exit = 1 })
-			end
-			if sh.applying_prefix then
-				return
-			end
-			error({ __curse_exit = 1, __curse_lineabort = true })
+			return
 		elseif direct.outer and direct.s:find("[", 1, true) then -- (`local -n a='a[0]'`)
 			io.stderr:write("curse: `" .. direct.s .. "': not a valid identifier\n")
 			error({ __curse_exit = 1, __curse_lineabort = true })
@@ -14396,7 +14502,9 @@ do
 		end
 		local b = sh.vars[sh:deref(name)]
 		if b and b.ro then -- (a readonly prefix: reported, non-fatal — the command still runs)
-			io.stderr:write("curse: " .. sh:deref(name) .. ": readonly variable\n")
+			if not (M.ro_said and M.ro_said[name]) then
+				io.stderr:write("curse: " .. sh:deref(name) .. ": readonly variable\n")
+			end
 			sh.status = 1
 			if sh.opt_c or sh.opt_posix then
 				error({ __curse_exit = 1 })
@@ -14927,18 +15035,17 @@ function M.assign_full(sh, st)
 			nref_base, nref_sub = st.name, selfsub
 		elseif nb and nb.ref and nb.s then
 			if nb.s ~= "" and sh:deref(st.name) == "" then -- (a reference cycle: said on write)
-				if M.ref_too_deep(sh, st.name) then
-					M.assign_discard(sh) -- (a chain past NAMEREF_MAX: a silent assignment error)
+				if M.nameref_circular(sh, st.name) then -- (a function's local cycle: the global, no nameref)
+					local back = sh:global_swap({ st.name })
+					sh.in_circ = true
+					local ok, e = pcall(M.assign_full, sh, st)
+					sh.in_circ = nil
+					back()
+					if not ok then
+						error(e, 0)
+					end
 				end
-				io.stderr:write("curse: warning: " .. st.name .. ": circular name reference\n")
-				sh.status = 1 -- (an assignment error, as a readonly one: a prefix binding is just
-				if sh.opt_posix then -- skipped, a standalone one aborts the rest of the line)
-					error({ __curse_exit = 1 })
-				end
-				if sh.applying_prefix then
-					return
-				end
-				error({ __curse_exit = 1, __curse_lineabort = true })
+				return
 			elseif nb.outer and nb.s:find("[", 1, true) then
 				io.stderr:write("curse: `" .. nb.s .. "': not a valid identifier\n")
 				error({ __curse_exit = 1, __curse_lineabort = true })

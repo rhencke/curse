@@ -73,6 +73,9 @@ return function(sh, cmd, args, hook, tcb)
 				sh.xdepth = (sxd or 0) + 1
 				local badsyntax -- (EX_BADSYNTAX: like EX_USAGE from a special builtin — rt.spb_run)
 				local ran = false -- (a command ran before the error: not fatal — rt.perr_lead)
+				-- (parse_and_execute's restore_lastcom: after the code, $BASH_COMMAND is the eval
+				-- again — an ERR trap the eval's failure fires reads `eval …`)
+				local scc = sh.cur_cmd
 				local ok, err = pcall(function()
 					local ln = rt.current_line(sh)
 					local nextf = eval_groups(sh, code, ln) or P.open(code, sh, ln > 0 and ln or nil)
@@ -120,7 +123,7 @@ return function(sh, cmd, args, hook, tcb)
 						end
 					end
 				end)
-				sh.xdepth = sxd
+				sh.xdepth, sh.cur_cmd = sxd, scc
 				sh.spb_err = badsyntax and 2 or nil -- (a builtin the code ran flagged its own: not eval's)
 				if not ok then
 					error(err)

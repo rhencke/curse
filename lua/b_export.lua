@@ -639,6 +639,14 @@ return function(sh, cmd, args, hook, tcb)
 							sh:set_str(nm, ap and (sh:get(nm) .. val) or val)
 						end
 					else
+						local cb = not localize and sh.vars[nm]
+						if cb and cb.ref and cb.s and cb.s ~= "" and sh:deref(nm) == "" then
+							-- (a reference cycle: bash warns — looking the name up, then binding
+							-- it — and assigns nothing)
+							io.stderr:write("curse: warning: " .. nm .. ": circular name reference\n")
+							io.stderr:write("curse: warning: " .. nm .. ": circular name reference\n")
+							goto continue
+						end
 						local eb = sh.vars[sh:deref(nm)]
 						if ((eb and eb.arr and not eb.assoc) or aattr) and not assoc then
 							-- scalar (+)= on an indexed array (or `declare -a f=x`) -> element 0
