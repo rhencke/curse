@@ -1679,7 +1679,8 @@ function Shell:run_script_inproc(path, args, n, out)
 		f:close()
 	end
 	local child = Shell.new()
-	child.argv0, child.out = args[1], out or io.write
+	-- (`exec`'s script: $0 is its -a NAME, else the full pathname — shell_execve)
+	child.argv0, child.out = self.exec_builtin and (self.exec_script_a0 or path) or args[1], out or io.write
 	child.capturing = out and true or nil
 	child.shopt.globskipdots = self.shopt.globskipdots -- (reset_shopt_options keeps it)
 	M.startup_ignored(child) -- a new shell: what's ignored now stays ignored
@@ -1691,6 +1692,8 @@ function Shell:run_script_inproc(path, args, n, out)
 		child.params[child.nparams] = args[k]
 	end
 	local csh = M.cur_shell
+	local nous = M.env_drop_us -- (`exec`'s: the script's own commands get their `_`)
+	M.env_drop_us = false
 	self:subshell_run(function()
 		child.iso_ctx = self.iso_ctx -- (its process-state saves land in our context)
 		child.subdepth = self.subdepth
@@ -1699,6 +1702,7 @@ function Shell:run_script_inproc(path, args, n, out)
 		M.cur_shell = csh
 		io.flush()
 	end)
+	M.env_drop_us = nous
 	M.cur_shell = csh
 	self.status = child.status or 0
 end
@@ -2927,12 +2931,16 @@ function M.child_exit(sh, status)
 	C._exit(status or 0)
 end
 
-function Shell:subshell_run(runner, saves)
+function Shell:subshell_run(runner, saves, paren)
 	local cp = sub_checkpoint(self)
 	local sv_out, sv_line = self.out, self.cur_line
 	local sv_ld, sv_ne, sv_alias = self.loopdepth, self.noerr, self.aliases
 	self.aliases = shallowcopy(self.aliases) or {}
 	self.in_subprogram = (self.in_subprogram or 0) + 1
+	local sv_psp = self.paren_sp -- (a `( … )`: the subprogram level that is one — exec.def's SUBSHELL_PAREN)
+	if paren then
+		self.paren_sp = self.in_subprogram
+	end
 	self.loopdepth = 0
 	local sv_depth, sv_jobs = self.subdepth, self.jobs
 	self.subdepth = (sv_depth or 0) + 1
@@ -2978,6 +2986,7 @@ function Shell:subshell_run(runner, saves)
 	self.out, self.cur_line = sv_out, sv_line
 	self.loopdepth, self.noerr, self.aliases = sv_ld, sv_ne, sv_alias
 	self.in_subprogram = self.in_subprogram - 1
+	self.paren_sp = sv_psp
 	self.subdepth = sv_depth
 	sub_restore(self, cp)
 	if rethrow then error(rethrow) end
@@ -3573,6 +3582,7 @@ function Shell:stage_clone()
 	-- (jobs stays a COPY of the parent's table: bash lets a pipeline stage SEE the
 	-- parent's jobs — `jobs | wc -l` — as a forked stage's copy-on-write view did.)
 	c.in_pipestage = (self.in_pipestage or 0) + 1
+	c.paren_sp = nil -- (a stage is a subshell of its own, not the `( … )` it may sit in)
 	c.loopdepth = 0
 	c.capturing = nil
 	return c
@@ -6863,6 +6873,7 @@ M.assoc_bucket = assoc_bucket
 -- $SHLVL: a new shell raises it (bash's adjust_shell_level at startup: a non-number is 0,
 -- below 0 is 0, 1000 and up warns and resets to 1), exported.
 M.shlvl_delta = 0
+M.env_drop_us = false
 function M.shlvl_start(sh)
 	local b = sh.vars.SHLVL
 	local v = b and sh:get("SHLVL") or ""
@@ -6895,9 +6906,15 @@ do
 			local empty = ffi.new("char *[1]")
 			return empty
 		end
-		while env[n] ~= nil do
-			local s = ffi.string(env[n])
+		local nous = M.env_drop_us -- (`exec cmd`: no `_` — only a forked command gets one)
+		local j = 0
+		while env[j] ~= nil do
+			local s = ffi.string(env[j])
 			local name = s:match("^[^=]*")
+			j = j + 1
+			if nous and name == "_" then
+				goto continue
+			end
 			local b = bucket_of[name]
 			if not b then
 				b = assoc_bucket(name, 1024)
@@ -6906,8 +6923,9 @@ do
 				end
 				bucket_of[name], nbuckets_cache = b, nbuckets_cache + 1
 			end
-			items[n + 1] = { p = env[n], b = name == "_" and 1e9 or b, i = n }
+			items[n + 1] = { p = env[j - 1], b = name == "_" and 1e9 or b, i = n }
 			n = n + 1
+			::continue::
 		end
 		local d = M.shlvl_delta
 		if d ~= 0 then -- (the command REPLACES this shell — `exec cmd`: bash lowers SHLVL first)
