@@ -106,9 +106,11 @@ local function arith(src, nodefer)
 	-- the text from there on: `4+` -> operand expected (error token is "+").
 	local lasttp
 	local etxt = src:gsub("^%s+", "") -- (the expression as bash's errors print it)
-	local function skip()
-		while i <= n and src:sub(i, i):match("%s") do
+	local function skip() -- (expr.c's cr_whitespace: blank, tab, newline — not \r, \f, \v)
+		local c = src:byte(i)
+		while c == 32 or c == 9 or c == 10 do
 			i = i + 1
+			c = src:byte(i)
 		end
 		if i <= n then
 			lasttp = i
@@ -131,10 +133,56 @@ local function arith(src, nodefer)
 	end
 	local parseExpr
 	-- raise one of bash's expr.c errors (a structured error; M.arith_errmsg renders it)
-	local function aerr(msg)
-		error({ __curse_arith = true, msg = msg, tok = lasttp and src:sub(lasttp) or "" }, 0)
+	-- `pre`: what bash had already EVALUATED when it met the error — it evaluates while it
+	-- parses (expr.c's recursive descent), so side effects before a syntax error stick:
+	-- `let 'b=a++ +'` increments a. An AST of the completed operands, in order, under their
+	-- short-circuit/ternary conditions; the reporter evaluates it before the message.
+	local function aerr(msg, pre)
+		error({ __curse_arith = true, msg = msg, tok = lasttp and src:sub(lasttp) or "", pre = pre }, 0)
+	end
+	local ZERO = { k = "num", v = "0" }
+	local function seq(a, b)
+		if a and b then
+			return { k = "comma", l = a, r = b }
+		end
+		return a or b
+	end
+	-- What had run when bash's LEXER met a bad character: it reads one token ahead, so the
+	-- operations along the right edge — waiting on that token — hadn't happened yet
+	-- (`y = 3 @` assigns nothing, `x++, y=2 #c` increments x), but everything to their left,
+	-- a completed parenthesis, and the last operand (a `x++` included) had.
+	local function spine(e)
+		local k = e.k
+		if e.paren then
+			return e
+		elseif k == "comma" then
+			return seq(e.l, spine(e.r))
+		elseif k == "bin" then
+			if e.op == "&&" or e.op == "||" then
+				return { k = "bin", op = e.op, l = e.l, r = spine(e.r) or ZERO }
+			end
+			return seq(e.l, spine(e.r))
+		elseif k == "asgn" or k == "un" then
+			return spine(e.e)
+		elseif k == "tern" then
+			return { k = "tern", c = e.c, a = e.a, b = spine(e.b) or ZERO }
+		end
+		return e
+	end
+	-- run a sub-parse; a syntax error in it gets `wrap(its pre)` as its pre (the completed
+	-- siblings to its left, in their evaluation context)
+	local function withpre(wrap, f, x, y)
+		local ok, r = pcall(f, x, y)
+		if ok then
+			return r
+		end
+		if type(r) == "table" and r.__curse_arith then
+			r.pre = wrap(r.pre)
+		end
+		error(r, 0)
 	end
 	local ARITHOP = "[%+%-%*/%%<>=!&|%^~%?:,%(%)]"
+	local npow = 0 -- `**` operators parsed so far (an untaken branch with one sets rpow)
 
 	local function ident()
 		skip()
@@ -205,11 +253,12 @@ local function arith(src, nodefer)
 			i = i + 1
 			local e = parseComma()
 			if not eat(")") then
-				aerr("missing `)'")
+				aerr("missing `)'", e)
 			end
+			e.paren = true -- (complete once its `)` is read: see spine)
 			return e
 		end
-		if (starts("++") or starts("--")) and not src:find("^[%+%-][%+%-]%s*[%a_]", i) then
+		if (starts("++") or starts("--")) and not src:find("^[%+%-][%+%-][ \t\n]*[%a_]", i) then
 			-- not a pre-increment (no name follows): two unary signs (bash: `++5` is 5)
 			local sign = src:sub(i, i)
 			i = i + 1
@@ -218,13 +267,16 @@ local function arith(src, nodefer)
 			end
 			return { k = "un", op = "-", e = primary() }
 		end
-		if eat("++") then
+		if starts("++") or starts("--") then
+			local d = src:sub(i, i) == "+" and 1 or -1
+			i = i + 2
 			local nm, idx, ir = nameSub()
-			return { k = "pre", name = nm, idx = idx, idxraw = ir, d = 1 }
-		end
-		if eat("--") then
-			local nm, idx, ir = nameSub()
-			return { k = "pre", name = nm, idx = idx, idxraw = ir, d = -1 }
+			-- (readtok: a `++`/`--` right after `++x` is `--x++` — "++: assignment requires lvalue")
+			local node = { k = "pre", name = nm, idx = idx, idxraw = ir, d = d }
+			if starts("++") or starts("--") then
+				aerr(src:sub(i, i + 1) .. ": assignment requires lvalue", node)
+			end
+			return node
 		end
 		if c == "-" then
 			i = i + 1
@@ -278,8 +330,9 @@ local function arith(src, nodefer)
 			-- octal, decimal), validated like bash's strlong so its errors match
 			local s0, e = src:find("^%d[%w#@_]*", i)
 			local v = src:sub(s0, e)
-			local function nerr(m)
-				error({ __curse_arith = true, msg = m, tok = v, expr = v }, 0)
+			local function nerr(m) -- (bash's readtok NULs the text after the number: the
+				-- expression shown ends there — `1 + 09: value too great for base`)
+				error({ __curse_arith = true, msg = m, tok = v, expr = src:sub(1, e) }, 0)
 			end
 			local base, foundbase, val, k = 10, false, 0, 1
 			if v:sub(1, 1) == "0" and #v > 1 then
@@ -389,6 +442,11 @@ local function arith(src, nodefer)
 		if src:find("^[%+%-%*/%%&|%^]=", i) or src:find("^<<=", i) or src:find("^>>=", i) then
 			return nil
 		end
+		-- `++`/`--` before a name is a pre-increment token (readtok), never `+ +`/`- -`:
+		-- after an operand (`3 --x`) it is a syntax error
+		if src:find("^%+%+[ \t\n]*[%a_]", i) or src:find("^%-%-[ \t\n]*[%a_]", i) then
+			return nil
+		end
 		for _, op in ipairs(OPS) do
 			if src:sub(i, i + #op - 1) == op then
 				-- don't consume assignment "=" as comparison; "=" alone handled in primary
@@ -410,30 +468,50 @@ local function arith(src, nodefer)
 				break
 			end
 			i = i + #op
-			local right = parseExpr(op == "**" and prec or prec + 1) -- ** is right-assoc
+			local stp, np = i, npow
+			if op == "**" then
+				npow = npow + 1
+			end
+			local right = withpre(function(p) -- (`a && <bad>`: the bad side was noeval)
+				if op == "&&" or op == "||" then
+					return { k = "bin", op = op, l = left, r = p or ZERO }
+				end
+				return seq(left, p)
+			end, parseExpr, op == "**" and prec or prec + 1) -- ** is right-assoc
 			left = { k = "bin", op = op, l = left, r = right }
-			if op == "/" or op == "%" or op == "**" then
+			if op == "**" then
 				-- (for bash's eval-time error text: the expression, and the lookahead token
-				-- after the right operand — `4 / 0 ` -> error token "0 ")
+				-- after the right operand — `2 ** -1 ` -> error token "1 ")
 				skip()
 				left.etxt, left.etok = etxt, lasttp and src:sub(lasttp) or ""
+			elseif op == "/" or op == "%" then
+				-- (a division by 0 names the text from the divisor on: expmuldiv's lasttp = stp)
+				left.etxt, left.etok = etxt, (src:sub(stp):gsub("^%s+", ""))
+			elseif (op == "&&" or op == "||") and npow > np then
+				left.rpow = true -- (a skipped right operand still checks its exponents: see eval)
 			end
 		end
 		-- ternary c ? a : b (lowest precedence, right-assoc) — only at the top level
 		if minprec == 0 and peek() == "?" then
+			local np = npow
 			i = i + 1
 			if peek() == ":" or i > n then
-				aerr("expression expected")
+				aerr("expression expected", left)
 			end
-			local a = parseExpr(0)
+			local c = left
+			local a = withpre(function(p)
+				return { k = "tern", c = c, a = p or ZERO, b = ZERO }
+			end, parseExpr, 0)
 			if not eat(":") then
-				aerr("`:' expected for conditional expression")
+				aerr("`:' expected for conditional expression", { k = "tern", c = c, a = a, b = ZERO })
 			end
 			if peek() == "" then
-				aerr("expression expected")
+				aerr("expression expected", { k = "tern", c = c, a = a, b = ZERO })
 			end
-			local b = parseExpr(0, true) -- (the else-branch is a conditional, not an assignment)
-			left = { k = "tern", c = left, a = a, b = b }
+			local b = withpre(function(p) -- (the else-branch is a conditional, not an assignment)
+				return { k = "tern", c = c, a = a, b = p or ZERO }
+			end, parseExpr, 0, true)
+			left = { k = "tern", c = left, a = a, b = b, rpow = npow > np or nil }
 		end
 		return left
 	end
@@ -443,7 +521,10 @@ local function arith(src, nodefer)
 		local e = parseExpr(0)
 		while peek() == "," do
 			i = i + 1
-			e = { k = "comma", l = e, r = parseExpr(0) }
+			local l = e
+			e = { k = "comma", l = l, r = withpre(function(p)
+				return seq(l, p)
+			end, parseExpr, 0) }
 		end
 		return e
 	end
@@ -454,11 +535,15 @@ local function arith(src, nodefer)
 		local c = src:sub(i, i)
 		if (c == "=" and src:sub(i + 1, i + 1) ~= "=") or src:find("^[%+%-%*/%%&|%^]=", i) or src:find("^<<=", i)
 			or src:find("^>>=", i) then
-			aerr("attempted assignment to non-variable")
-		elseif not c:match(ARITHOP) and not c:match("[%w_$]") then
-			aerr("syntax error: invalid arithmetic operator") -- (after an operand: `1 @ 2`)
+			aerr("attempted assignment to non-variable", e)
+		elseif not c:match(ARITHOP) and not c:match("[%w_]") then
+			-- (after an operand: `1 @ 2`; after a `)` — itself an operator token — readtok says
+			-- an operand was expected)
+			local pc = src:sub(1, i - 1):match("(%S)%s*$")
+			aerr(pc == ")" and "syntax error: operand expected" or "syntax error: invalid arithmetic operator",
+				spine(e))
 		end
-		aerr("syntax error in expression")
+		aerr("syntax error in expression", e)
 	end
 	return e
 end
@@ -1239,7 +1324,7 @@ local function parse_dollar(w, i, add, q)
 			end
 			j = j + 1
 		end
-		add({ arith = w:sub(i + 2, j - 1), q = q })
+		add({ arith = w:sub(i + 2, j - 1), q = q, bracket = true })
 		return j + 1
 	elseif nx == "(" then
 		local je = scan_cmdsub(w, i + 2) -- index just past the closing `)` (case/quote/nesting aware)

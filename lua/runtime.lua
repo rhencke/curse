@@ -7229,6 +7229,20 @@ end
 function Shell:array_count(name)
 	return #self:array_indices(name)
 end
+-- ${#a[@]} / ${#a[*]}: the count; under set -u a variable that is unset, never assigned
+-- (`declare -a b`) or not an array (`s=x`) is unbound (array_length_reference), `a=()` is 0
+function M.array_count_u(sh, name, shown)
+	local c = sh:array_count(name)
+	if sh.opt_u and name ~= "BASH_ARGV" and name ~= "BASH_ARGC" then -- (always arrays in bash)
+		local b = sh.vars[sh:deref(name)]
+		if (b == nil and c == 0 and sh:special_get(name) == "") -- (nil but counted: a virtual array)
+			or (b and (not b.arr or (b.empty_decl and next(b.arr) == nil))) then
+			io.stderr:write("curse: " .. (shown or name) .. ": unbound variable\n")
+			error({ __curse_exit = sh.opt_c and 127 or 1, __curse_lineabort = sh.opt_i or nil })
+		end
+	end
+	return c
+end
 
 -- ---- parameter expansion ${var OP arg} ----
 -- Whole-string glob match via the POSIX regex engine (real char classes/extglob).
@@ -9769,22 +9783,72 @@ function M.elem_len(sh, name, raw, expanded)
 	end
 	return tostring(M.mb_strlen(M.array_elem(sh, name, raw, expanded)))
 end
-function M.array_count_u(sh, name)
-	if sh.opt_u then
-		return sh:expand_param({ name = name, index = "@", op = "len" })
-	end
-	return tostring(sh:array_count(name))
-end
 -- Read an array/assoc ELEMENT in ARITHMETIC context (`$(( a[i] ))`), exactly interp's arith
 -- var-with-idx path (interp.lua ~448): a set -u check on the BASE var (arith_nounset — FATAL
 -- for an unset base, but an unset ELEMENT of a set array reads as 0), then arith_resolve the
 -- element value recursively (a[0]="x+1" -> x+1). A non-numeric element ("12 34") is a NON-fatal
 -- syntax error: arith_resolve prints the exact message and raises experr, which is converted to
 -- the tier's lineabort so run_compiled contains it (status 1, abort line, continue).
+-- A bad element reference in arithmetic is NOT fatal (bash): the message is said, a read is
+-- 0 and a write is skipped. `how` = "r" (a read), "w" (a write) or "rw" (`a[i] += e`, `a[i]++`:
+-- both messages). arith_badraw checks the subscript TEXT (before it is evaluated): an empty
+-- one (get_array_value / valid_identifier), `@`/`*` of an indexed array (no AV_ALLOWALL);
+-- arith_badkey the evaluated index: a negative one before the start (a read of a non-array
+-- too), named `NAME` by a read and `NAME[IND]` by a write (expr_bind_array_element).
+function M.arith_badraw(sh, name, raw, how)
+	if raw == "" then
+		if how ~= "w" then
+			io.stderr:write("curse: " .. name .. "[]: bad array subscript\n")
+			io.stderr:write("curse: " .. name .. "[]: bad array subscript\n")
+		end
+		if how ~= "r" then
+			local cmd = require("parser").arith_cmd or (sh.in_arithcmd and "((") -- (compiled `(( ))`)
+			io.stderr:write("curse: " .. (cmd and (cmd .. ": ") or "") .. "`" .. name
+				.. "[]': not a valid identifier\n")
+		end
+		return true
+	end
+	if (raw == "@" or raw == "*") and not sh:is_assoc(name) then
+		for _ = 1, how == "rw" and 2 or 1 do
+			io.stderr:write("curse: " .. name .. "[" .. raw .. "]: bad array subscript\n")
+		end
+		return true
+	end
+	return false
+end
+function M.arith_badkey(sh, name, key, how)
+	if type(key) ~= "number" or key >= 0 then
+		return false
+	end
+	local b = sh.vars[sh:deref(name)]
+	if b and b.assoc then
+		return false
+	end
+	local rbad = not (b and b.arr) or M.neg_oob(sh, name, key)
+	local wbad = M.neg_oob(sh, name, key)
+	if how ~= "w" and rbad then
+		io.stderr:write("curse: " .. name .. ": bad array subscript\n")
+	end
+	if how ~= "r" and wbad then
+		io.stderr:write("curse: " .. name .. "[" .. tostring(key) .. "]: bad array subscript\n")
+	end
+	if how == "r" then
+		return rbad
+	end
+	return wbad
+end
+
 function M.arith_read_elem(sh, name, raw, expanded)
 	local I = require("interp")._int
 	I.arith_nounset(sh, name) -- fatal if the base var is unset under set -u (outside the pcall)
-	local ok, v = pcall(I.arith_resolve, sh, sh:array_get(name, M.array_key(sh, name, raw, expanded)))
+	if M.arith_badraw(sh, name, raw, "r") then
+		return i64(0)
+	end
+	local key = M.array_key(sh, name, raw, expanded)
+	if M.arith_badkey(sh, name, key, "r") then
+		return i64(0)
+	end
+	local ok, v = pcall(I.arith_resolve, sh, sh:array_get(name, key))
 	if ok then
 		return v
 	end
@@ -9803,7 +9867,14 @@ function M.arith_elem_write(sh, name, raw, expanded, read_first, compute)
 	if read_first then
 		require("interp")._int.arith_nounset(sh, name)
 	end
+	local how = read_first and "rw" or "w"
+	if M.arith_badraw(sh, name, raw, how) then
+		return compute(read_first and i64(0) or nil)
+	end
 	local key = M.array_key(sh, name, raw, expanded)
+	if M.arith_badkey(sh, name, key, how) then -- (a bad element: 0 is read, nothing stored)
+		return compute(read_first and i64(0) or nil)
+	end
 	local old = read_first and M.arith_str(sh, sh:array_get(name, key) or "") or nil
 	local v = compute(old)
 	sh:array_set(name, key, M.i64_to_str(v))
@@ -9814,7 +9885,10 @@ end
 -- OLD value for post or the NEW value for pre.
 function M.arith_elem_incr(sh, name, raw, expanded, delta, is_post)
 	require("interp")._int.arith_nounset(sh, name)
-	local key = M.array_key(sh, name, raw, expanded)
+	local key = not M.arith_badraw(sh, name, raw, "rw") and M.array_key(sh, name, raw, expanded)
+	if not key or M.arith_badkey(sh, name, key, "rw") then -- (a bad element: 0 is read, nothing stored)
+		return is_post and i64(0) or i64(delta)
+	end
 	local old = M.arith_str(sh, sh:array_get(name, key) or "")
 	sh:array_set(name, key, M.i64_to_str(old + delta))
 	if is_post then
@@ -9860,13 +9934,9 @@ function Shell:expand_param(pe, arg, arg2, idxnum)
 	end
 	local val, isset
 	if index == "@" or index == "*" then
-		if op == "len" then -- ${#a[@]}: set -u trips only on a variable that doesn't exist
-			if self.opt_u and self.vars[self:deref(name)] == nil and not VIRT_ARR[name] then
-				io.stderr:write("curse: " .. name .. ": unbound variable\n")
-				error({ __curse_exit = self.opt_c and 127 or 1, __curse_lineabort = self.opt_i or nil })
-			end
-			return tostring(self:array_count(name))
-		end
+		if op == "len" then
+			return tostring(M.array_count_u(self, name, pe.uname))
+		end -- ${#a[@]}
 		val = table.concat(self:array_values(name), " ")
 		isset = self:array_count(name) > 0
 	elseif index then
@@ -11135,6 +11205,19 @@ function M.arith_read(sh, name)
 	if s ~= nil and M.looks_numeric(s) then
 		return M.arith_num(s)
 	end -- native fast path
+	local P = require("parser")
+	if sh.in_arithcmd and P.arith_cmd == nil then -- (a compiled `(( ))`: its errors say `((: `)
+		P.arith_cmd = "(("
+		local ok, v = pcall(M.arith_read_slow, sh, name, s)
+		P.arith_cmd = nil
+		if not ok then
+			error(v, 0)
+		end
+		return v
+	end
+	return M.arith_read_slow(sh, name, s)
+end
+function M.arith_read_slow(sh, name, s)
 	-- Non-numeric VALUE (a stored expression like x="1+2"): COMPILE it to native ops and
 	-- run — exactly what interp's arith_read -> arith_resolve -> eval does, but as genuine
 	-- compiled code, not a tree-walk. Only the word-engine-free subset compiles (no
@@ -11160,7 +11243,7 @@ function M.arith_read(sh, name)
 				local ok2, r = pcall(fn, sh)
 				sh.arith_depth = sh.arith_depth - 1
 				if not ok2 then
-					if type(r) == "table" and (r.__curse_experr or r.__curse_matherr) then
+					if type(r) == "table" and (r.__curse_experr or r.__curse_matherr or r.__curse_unbound) then
 						error(r)
 					end
 					return i64(0) -- a nested bad value stays swallowed as 0 (matches arith_resolve)
@@ -11332,6 +11415,16 @@ end
 -- the parameter as bash names it in such errors: `a[@]`, `a[0]`, `HOME`
 function M.pe_label(pe)
 	return pe.index and (pe.name .. "[" .. pe.index .. "]") or pe.name
+end
+-- ${name:off:len} of an UNSET plain variable expands to nothing without evaluating off/len
+-- (parameter_brace_substring returns before verify_substring_values): `${x:1/0}` is silent.
+-- (set -u keeps its unbound error: not skipped then)
+function M.sub_unset(sh, name)
+	if sh.opt_u or not name:match("^[%a_][%w_]*$") then
+		return false
+	end
+	local b = sh.vars[sh:deref(name)]
+	return (b == nil or (b.arr == nil and b.s == nil and b.n == nil)) and sh:special_get(name) == ""
 end
 function M.substr_arith(sh, name, s)
 	if s == nil or s == "" then

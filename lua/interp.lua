@@ -786,6 +786,8 @@ local expand_repl -- forward (${v/pat/REPL} replacement expansion)
 local is_multi, multi_elems -- forward (defined with the field expander)
 local indirect_part -- forward (${!ref} target resolution, re-parsed to a part)
 local eval -- arithmetic evaluator (forward decl)
+local noeval_pow -- a short-circuited operand's exponent check (forward decl)
+local arith_pre -- a syntax error's already-evaluated prefix (forward decl)
 local arith_resolve -- var-value-as-arith-expression resolver (forward decl)
 local arith_key -- array subscript in arith: string key for assoc, number for indexed
 local xpand_subdepth -- 1 while arith_key evaluates an xpand subscript (see arith_key)
@@ -809,6 +811,7 @@ arith_resolve = function(sh, s)
 	local ok, ast = pcall(P.arith, s)
 	if not ok then -- the value is not a valid arith expression (e.g. "12 34", "1+"): an
 		-- arith error — the command fails and (bash) the rest of the line is discarded
+		arith_pre(sh, ast)
 		io.stderr:write("curse: " .. P.arith_errmsg(s, ast) .. "\n")
 		error({ __curse_exit = 1, __curse_matherr = true, __curse_experr = true, __curse_lineabort = true })
 	end
@@ -828,7 +831,7 @@ arith_resolve = function(sh, s)
 	sh.arith_depth = depth - 1
 	in_expanded_text = sv
 	if not ok2 then
-		if type(v) == "table" and (v.__curse_experr or v.__curse_matherr) then
+		if type(v) == "table" and (v.__curse_experr or v.__curse_matherr or v.__curse_unbound) then
 			error(v)
 		end
 		return i64(0)
@@ -849,10 +852,16 @@ end
 -- Reading an unset variable in arithmetic under `set -u` is a fatal unbound-
 -- variable error (bash), just like `$var`. Applies to plain reads and to the
 -- read side of `+=`/`++`/`--`, but NOT to a pure `=` assignment (which defines).
+-- (bash's expr_streval: a variable that doesn't exist or is INVISIBLE — declared, never
+-- assigned: `declare x`, `declare -A h` — even for an element read `h[k]`)
 local function arith_nounset(sh, name)
-	if sh.opt_u and sh.vars[sh:deref(name)] == nil and sh:special_get(name) == "" then
-		io.stderr:write("curse: " .. name .. ": unbound variable\n")
-		error({ __curse_exit = sh.opt_c and 127 or 1, __curse_lineabort = sh.opt_i or nil })
+	if sh.opt_u then
+		local b = sh.vars[sh:deref(name)]
+		if (b == nil or (b.arr == nil and b.s == nil and b.n == nil) or (b.empty_decl and b.arr and next(b.arr) == nil))
+			and sh:special_get(name) == "" then
+			io.stderr:write("curse: " .. name .. ": unbound variable\n")
+			error({ __curse_exit = sh.opt_c and 127 or 1, __curse_lineabort = sh.opt_i or nil, __curse_unbound = true })
+		end
 	end
 end
 
@@ -916,6 +925,7 @@ function M.arith_textual_eval(sh, raw, depth0)
 	local text = arith_expand_text(sh, raw, depth0)
 	local pok, ast = pcall(P.arith, text, "strict")
 	if not pok then -- the EXPANDED text isn't valid arithmetic: an arith error (bash), not a crash
+		arith_pre(sh, ast)
 		io.stderr:write("curse: " .. P.arith_errmsg(text, ast, depth0 ~= nil) .. "\n")
 		error({ __curse_exit = 1, __curse_matherr = true, __curse_lineabort = true })
 	end
@@ -930,9 +940,98 @@ function M.arith_textual_eval(sh, raw, depth0)
 	end
 	return v
 end
+-- The current value an `op=` / `++` / `--` reads: like a `var` node, a value that is an
+-- expression is evaluated recursively (`x="1+2"; (( x *= 2 ))` is 6 — expr.c expr_streval)
+local function arith_cur(sh, name, iv)
+	if iv then
+		return arith_resolve(sh, sh:array_get(name, iv))
+	end
+	local b = sh.vars[sh:deref(name)]
+	if b and b.n ~= nil and b.s == nil and not b.arr then
+		return b.n
+	end
+	return arith_resolve(sh, sh:get(name))
+end
+-- A short-circuited operand (`0 && …`, a ternary's untaken branch) is still PARSED — and
+-- evaluated with noeval — as bash evaluates while parsing: noeval makes a variable 0 and
+-- skips assignments and division by 0, but exppower has no noeval guard, so a negative
+-- exponent is still an error (`$(( 0 && 2 ** -1 ))`). Only a subtree holding a `**` (the
+-- parser's rpow mark) is walked; this returns its noeval value.
+noeval_pow = function(e)
+	local k = e.k
+	if k == "num" then
+		return rt.arith_num(e.v)
+	elseif k == "asgn" then
+		return noeval_pow(e.e)
+	elseif k == "comma" then
+		noeval_pow(e.l)
+		return noeval_pow(e.r)
+	elseif k == "un" then
+		local v = noeval_pow(e.e)
+		return e.op == "-" and -v or e.op == "!" and b2i(not truth(v)) or bit.bnot(v)
+	elseif k == "tern" then
+		local c = truth(noeval_pow(e.c))
+		local a, b = noeval_pow(e.a), noeval_pow(e.b)
+		return c and a or b
+	elseif k == "bin" then
+		local l, r, op = noeval_pow(e.l), noeval_pow(e.r), e.op
+		if op == "**" then
+			if r < 0 then
+				arith_div0(e, "exponent less than 0")
+			end
+			return rt.ipow_raw(l, r)
+		elseif op == "/" or op == "%" then
+			if r == 0 then
+				r = i64(1)
+			end
+			return op == "/" and l / r or l % r
+		elseif op == "+" then
+			return l + r
+		elseif op == "-" then
+			return l - r
+		elseif op == "*" then
+			return l * r
+		elseif op == "&&" then
+			return b2i(truth(l) and truth(r))
+		elseif op == "||" then
+			return b2i(truth(l) or truth(r))
+		elseif op == "==" then
+			return b2i(l == r)
+		elseif op == "!=" then
+			return b2i(l ~= r)
+		elseif op == "<" then
+			return b2i(l < r)
+		elseif op == "<=" then
+			return b2i(l <= r)
+		elseif op == ">" then
+			return b2i(l > r)
+		elseif op == ">=" then
+			return b2i(l >= r)
+		elseif op == "&" then
+			return bit.band(l, r)
+		elseif op == "|" then
+			return bit.bor(l, r)
+		elseif op == "^" then
+			return bit.bxor(l, r)
+		elseif op == "<<" then
+			return bit.lshift(l, tonumber(r) % 64)
+		end
+		return bit.arshift(l, tonumber(r) % 64) -- >>
+	end
+	return i64(0) -- var / ++ / -- / expansions: noeval reads nothing
+end
+-- bash evaluates arithmetic WHILE parsing it, so what came before a syntax error has run:
+-- `let 'b=a++ +'` increments a. The parser hands the completed part as err.pre; evaluate
+-- it before the error is reported (its own error — `1/0 + )` — wins, as in bash).
+arith_pre = function(sh, err)
+	if type(err) == "table" and err.pre then
+		eval(sh, err.pre)
+	end
+end
 eval = function(sh, e)
 	local k = e.k
 	if k == "matherr" then -- a deferred arith parse error (bad lvalue): non-fatal in (( ))
+		arith_pre(sh, e.err)
 		io.stderr:write("curse: " .. P.arith_errmsg(e.raw or "", e.err) .. "\n")
 		error({ __curse_exit = 1, __curse_matherr = true })
 	end
@@ -942,7 +1041,14 @@ eval = function(sh, e)
 	if k == "var" then
 		if e.idxraw then
 			arith_nounset(sh, e.name)
-			return arith_resolve(sh, sh:array_get(e.name, arith_key(sh, e.name, e.idx, e.idxraw)))
+			if rt.arith_badraw(sh, e.name, e.idxraw, "r") then -- (non-fatal: 0)
+				return i64(0)
+			end
+			local iv = arith_key(sh, e.name, e.idx, e.idxraw)
+			if rt.arith_badkey(sh, e.name, iv, "r") then
+				return i64(0)
+			end
+			return arith_resolve(sh, sh:array_get(e.name, iv))
 		end
 		arith_nounset(sh, e.name)
 		-- Numeric-authoritative fast path: a scalar set via aset holds its i64 in b.n
@@ -1030,18 +1136,36 @@ eval = function(sh, e)
 	end
 	if k == "tern" then
 		if truth(eval(sh, e.c)) then
-			return eval(sh, e.a)
-		else
-			return eval(sh, e.b)
+			local v = eval(sh, e.a)
+			if e.rpow then
+				noeval_pow(e.b)
+			end
+			return v
 		end
+		if e.rpow then
+			noeval_pow(e.a)
+		end
+		return eval(sh, e.b)
 	end
 	if k == "bin" then
 		local op = e.op
 		if op == "&&" then
-			return b2i(truth(eval(sh, e.l)) and truth(eval(sh, e.r)))
+			if not truth(eval(sh, e.l)) then
+				if e.rpow then
+					noeval_pow(e.r)
+				end
+				return i64(0)
+			end
+			return b2i(truth(eval(sh, e.r)))
 		end
 		if op == "||" then
-			return b2i(truth(eval(sh, e.l)) or truth(eval(sh, e.r)))
+			if truth(eval(sh, e.l)) then
+				if e.rpow then
+					noeval_pow(e.r)
+				end
+				return i64(1)
+			end
+			return b2i(truth(eval(sh, e.r)))
 		end
 		local l, r = eval(sh, e.l), eval(sh, e.r)
 		if op == "+" then
@@ -1107,10 +1231,21 @@ eval = function(sh, e)
 	end
 	if k == "asgn" then
 		local v = eval(sh, e.e) -- (bash evaluates the value BEFORE the lvalue's subscript)
-		local iv = e.idxraw and arith_key(sh, e.name, e.idx, e.idxraw) or nil
+		local iv, bad
+		if e.idxraw then -- (a bad element reads 0 and stores nothing: rt.arith_badraw)
+			local how = e.op == "=" and "w" or "rw"
+			if e.op ~= "=" then
+				arith_nounset(sh, e.name)
+			end
+			bad = rt.arith_badraw(sh, e.name, e.idxraw, how)
+			if not bad then
+				iv = arith_key(sh, e.name, e.idx, e.idxraw)
+				bad = rt.arith_badkey(sh, e.name, iv, how)
+			end
+		end
 		if e.op ~= "=" then
 			arith_nounset(sh, e.name) -- `x += …` reads x first
-			local cur = iv and rt.arith_num(sh:array_get(e.name, iv)) or sh:aget(e.name)
+			local cur = bad and i64(0) or arith_cur(sh, e.name, iv)
 			local o = e.op:sub(1, #e.op - 1) -- strip the trailing '=' (`<<=` -> `<<`)
 			if o == "+" then
 				v = cur + v
@@ -1140,6 +1275,9 @@ eval = function(sh, e)
 				v = bit.arshift(cur, tonumber(v) % 64)
 			end
 		end
+		if bad then
+			return v
+		end
 		if iv then
 			sh:array_set(e.name, iv, rt.i64_to_str(v))
 			return v
@@ -1149,24 +1287,30 @@ eval = function(sh, e)
 	if k == "post" then
 		arith_nounset(sh, e.name) -- x++ / x-- read x first
 		if e.idxraw then
-			local iv = arith_key(sh, e.name, e.idx, e.idxraw)
-			local cur = rt.arith_num(sh:array_get(e.name, iv))
+			local iv = not rt.arith_badraw(sh, e.name, e.idxraw, "rw") and arith_key(sh, e.name, e.idx, e.idxraw)
+			if not iv or rt.arith_badkey(sh, e.name, iv, "rw") then -- (a bad element: 0, nothing stored)
+				return i64(0)
+			end
+			local cur = arith_cur(sh, e.name, iv)
 			sh:array_set(e.name, iv, rt.i64_to_str(cur + i64(e.d)))
 			return cur
 		end
-		local cur = sh:aget(e.name)
+		local cur = arith_cur(sh, e.name)
 		sh:aset(e.name, cur + i64(e.d))
 		return cur
 	end
 	if k == "pre" then
 		arith_nounset(sh, e.name) -- ++x / --x read x first
 		if e.idxraw then
-			local iv = arith_key(sh, e.name, e.idx, e.idxraw)
-			local v = rt.arith_num(sh:array_get(e.name, iv)) + i64(e.d)
+			local iv = not rt.arith_badraw(sh, e.name, e.idxraw, "rw") and arith_key(sh, e.name, e.idx, e.idxraw)
+			if not iv or rt.arith_badkey(sh, e.name, iv, "rw") then -- (a bad element: 0, nothing stored)
+				return i64(e.d)
+			end
+			local v = arith_cur(sh, e.name, iv) + i64(e.d)
 			sh:array_set(e.name, iv, rt.i64_to_str(v))
 			return v
 		end
-		local v = sh:aget(e.name) + i64(e.d)
+		local v = arith_cur(sh, e.name) + i64(e.d)
 		return sh:aset(e.name, v)
 	end
 	error("interp: bad arith node " .. tostring(k))
@@ -1303,6 +1447,30 @@ array_key = function(sh, name, index_raw)
 	end
 	P.arith_cmd = sv
 	return v
+end
+
+-- Does `$(( TEXT ))` hold a shell comment — an unquoted `#` after a blank,
+-- running to the end (extract_command_subst's SX_COMMAND comment rule)?
+local function arith_comment(t)
+	local k, n, q = 1, #t, nil
+	while k <= n do
+		local c = t:sub(k, k)
+		if q then
+			if c == q then
+				q = nil
+			elseif c == "\\" and q == '"' then
+				k = k + 1
+			end
+		elseif c == "'" or c == '"' then
+			q = c
+		elseif c == "\\" then
+			k = k + 1
+		elseif c == "#" and t:sub(k - 1, k - 1):match("^[ \t\n]$") then
+			return not t:find("\n", k, true)
+		end
+		k = k + 1
+	end
+	return false
 end
 
 -- Expand ONE part to its string value (a multi-element @/* part is joined here;
@@ -1455,7 +1623,9 @@ local function expand_pexp(sh, p, assign)
 		arg = pe.arg and (patmode and expand_pattern or expand_word)(sh, P.parse_word(pe.arg), true) or nil
 	end
 	local arg2 = pe.arg2 and pe.op ~= "sub" and expand_repl(sh, P.parse_word(pe.arg2)) or nil
-	if pe.op == "sub" then -- ${v:off:len}: offset/length are arithmetic expressions,
+	if pe.op == "sub" and not pe.index and rt.sub_unset(sh, pe.name) then
+		return ""
+	elseif pe.op == "sub" then -- ${v:off:len}: offset/length are arithmetic expressions,
 		-- expanded the arithmetic way (bash: `${s:A[$k]}` quotes $k inside the subscript)
 		arg = pe.arg and tostring(rt.substr_arith(sh, rt.pe_label(pe), arith_expand_text(sh, pe.arg)) or 0) or nil
 		arg2 = pe.arg2 and tostring(rt.substr_arith(sh, rt.pe_label(pe), arith_expand_text(sh, pe.arg2)) or 0) or nil
@@ -1534,6 +1704,13 @@ expand_part_str = function(sh, p, assign)
 		if not p.arith_ast then -- same $((…)) shouldn't re-parse it)
 			local ok, ast = pcall(P.arith, p.arith)
 			if not ok then -- a syntax error in $(( )) fails the command, non-fatally (bash)
+				if not p.bracket and arith_comment(p.arith) then
+					-- (bash extracts `$((…))` as a command substitution at expansion time, where
+					-- a blank-preceded `#` starts a comment that hides the closing parens)
+					io.stderr:write("curse: bad substitution: no closing `)' in $((" .. p.arith .. "))\n")
+					error({ __curse_exit = 1, __curse_experr = true, __curse_lineabort = true })
+				end
+				arith_pre(sh, ast) -- (after what was evaluated before it)
 				io.stderr:write("curse: " .. P.arith_errmsg(p.arith, ast) .. "\n")
 				-- (an expansion error: bash discards the rest of the line)
 				error({ __curse_exit = 1, __curse_matherr = true, __curse_experr = true, __curse_lineabort = true })
@@ -5177,6 +5354,7 @@ end
 function M.arith_eval_str(sh, s)
 	local ok, ast = pcall(P.arith, s == "" and "0" or s, sh.arith_expanded and "expanded" or nil)
 	if not ok then
+		arith_pre(sh, ast)
 		io.stderr:write("curse: " .. P.arith_errmsg(s, ast) .. "\n")
 		error({ __curse_exit = 1, __curse_matherr = true, __curse_experr = true })
 	end
@@ -5193,6 +5371,7 @@ function M.dbracket_arith(sh, s, textual)
 		ok, v = pcall(function()
 			local pok, ast = pcall(P.arith, s == "" and "0" or s, "strict")
 			if not pok then
+				arith_pre(sh, ast)
 				io.stderr:write("curse: " .. P.arith_errmsg(s, ast) .. "\n")
 				error({ __curse_exit = 1, __curse_matherr = true, __curse_experr = true })
 			end
@@ -6268,6 +6447,7 @@ exec_stmt = function(sh, st, hook)
 		end
 		-- A slot whose arith failed to parse (`i='3'`) was deferred: bash reports the
 		-- error at RUNTIME and runs the loop zero (or partial) iterations, non-fatally.
+		local inslot, svcmd = false, nil
 		local function ev(node, slot)
 			sh.cur_line = st.line -- $LINENO inside the for(( init/cond/step is the `for` line (bash),
 			-- not whatever line the body last ran (the cond re-evals per iteration)
@@ -6277,11 +6457,19 @@ exec_stmt = function(sh, st, hook)
 			if node.k == "arith_perr" then
 				local sv = P.arith_cmd
 				P.arith_cmd = "(("
-				io.stderr:write("curse: " .. P.arith_errmsg(node.raw, select(2, pcall(P.arith, node.raw))) .. "\n")
+				local _, perr = pcall(P.arith, node.raw)
+				arith_pre(sh, perr)
+				io.stderr:write("curse: " .. P.arith_errmsg(node.raw, perr) .. "\n")
 				P.arith_cmd = sv
 				error({ __curse_exit = 1, __curse_experr = true })
 			end
-			return eval(sh, node)
+			-- (an arithmetic error names `((` and ends the loop with status 1, the shell goes on:
+			-- the loop's handler below sees `inslot` still set)
+			svcmd, inslot = P.arith_cmd, true
+			P.arith_cmd = "(("
+			local v = eval(sh, node)
+			P.arith_cmd, inslot = svcmd, false
+			return v
 		end
 		local bodystatus = 0 -- a loop's status is its last body command's (0 if none)
 		sh.loopdepth = (sh.loopdepth or 0) + 1
@@ -6320,6 +6508,12 @@ exec_stmt = function(sh, st, hook)
 			end
 		end)
 		sh.loopdepth = sh.loopdepth - 1
+		if not cok and inslot then -- (an init/cond/step failed)
+			P.arith_cmd = svcmd
+			if type(cerr) == "table" and cerr.__curse_matherr and not cerr.__curse_subscript then
+				cerr = { __curse_exit = 1, __curse_experr = true }
+			end
+		end
 		if not cok then
 			if type(cerr) == "table" and cerr.__curse_experr then
 				sh.status = 1
@@ -7570,6 +7764,7 @@ end
 -- branch bodies verbatim.
 M.SUBHOOK = SUBHOOK -- ($(…) bodies run from runtime use it too)
 M._int = {
+	arith_pre = arith_pre,
 	SPECIAL_BUILTIN = SPECIAL_BUILTIN,
 	exec_simple = exec_simple,
 	expand_part_str = expand_part_str,
