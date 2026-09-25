@@ -6,5 +6,6 @@ return function(sh, cmd, args)
 		sh.status = 1
 		return
 	end
+	require("runtime").exit_note(sh)
 	error({ __curse_exit = tonumber(args[2]) or sh.status })
 end

@@ -22,7 +22,7 @@ return function(sh, cmd, args, hook, tcb)
 		-- readline introspection + binding via FFI (same library bash links ->
 		-- identical output, no tty needed). Shell-command bindings (-x/-X) are kept
 		-- curse-side, per keymap, in bash's `"keyseq": "cmd"` format.
-		if not sh.opt_i then -- (bash says so first, whatever the arguments)
+		if not rt.line_editing(sh) then -- (no_line_editing: bash says so first, whatever the arguments)
 			io.stderr:write("curse: bind: warning: line editing not enabled\n")
 		end
 		do -- bash's getopt "lvpVPsSXf:q:u:m:r:x:": bad letters and missing arguments

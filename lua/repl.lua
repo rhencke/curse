@@ -4,6 +4,7 @@
 local ffi = require("ffi")
 local parser = require("parser")
 local interp = require("interp")
+local rt = require("runtime")
 
 ffi.cdef([[
   char *readline(const char *prompt);
@@ -26,11 +27,12 @@ for _, name in ipairs({ "readline", "libreadline.so.8", "libreadline.so.7", "lib
 	end
 end
 local istty = ffi.C.isatty(0) == 1
-local stderr_tty = ffi.C.isatty(2) == 1 -- bash prints PS1/PS2 only when stderr is a terminal
 local interactive = istty -- becomes true for `-i` too once run() sees opt_i
 
 -- One line of input. With readline: full editing + history. Otherwise plain read.
-local function read_line(prompt)
+-- (echo: line editing is on but stdin isn't a terminal — bash's readline still echoes
+-- each line it reads after the prompt, on stderr)
+local function read_line(prompt, echo)
 	if RL and istty then -- readline only on a real tty; piped stdin prompts to stderr
 		local c = RL.readline(prompt)
 		if c == nil then
@@ -40,10 +42,8 @@ local function read_line(prompt)
 		ffi.C.free(c)
 		return s
 	end
-	-- The prompt goes to STDERR (bash), and ONLY when stderr is a terminal — a
-	-- `-i` shell with stderr redirected to a file writes no prompt (bash), so a
-	-- script's captured output isn't polluted by PS1/PS2.
-	if interactive and stderr_tty then
+	-- The prompt goes to STDERR (bash), terminal or not
+	if interactive then
 		io.stderr:write(prompt)
 	end
 	if not istty then
@@ -53,11 +53,15 @@ local function read_line(prompt)
 		local buf = {}
 		while true do
 			local ch = interp._int.fd_getc(0)
-			if ch == nil then
-				return #buf > 0 and table.concat(buf) or nil
-			end
-			if ch == "\n" then
-				return table.concat(buf)
+			if ch == nil or ch == "\n" then
+				if ch == nil and #buf == 0 then
+					return nil
+				end
+				local l = table.concat(buf)
+				if echo and (l ~= "" or prompt ~= "") then -- (a blank display line gets no newline)
+					io.stderr:write(l, "\n")
+				end
+				return l
 			end
 			if ch ~= "\0" then -- (shell_getc drops NUL bytes from the input)
 				buf[#buf + 1] = ch
@@ -92,14 +96,13 @@ end
 
 -- Expand PS1/PS2 escapes for the prompt via the shared, full prompt decoder.
 local function prompt_of(sh, var, default)
-	return interp.prompt_string(sh, sh.vars[var] and sh:get(var) or default)
+	return interp.prompt_string(sh, sh.vars[var] and sh:get(var) or default, true)
 end
 
 local M = {}
 function M.run(sh)
 	-- re-probe the tty state per run: a resident daemon worker serves many callers' fds
 	istty = ffi.C.isatty(0) == 1
-	stderr_tty = ffi.C.isatty(2) == 1
 	interactive = istty or (sh and sh.opt_i) or false -- prompts print for `-i` even off a tty
 	-- Persist $HISTFILE across the session (load now, write at exit) — but only when
 	-- it was EXPLICITLY set (env/script), never the ~/.bash_history default, so a
@@ -109,15 +112,18 @@ function M.run(sh)
 	if histfile == "" or sh.histfile_default then
 		histfile = nil
 	end
+	local H = require("hist")
+	-- load_history: HISTSIZE/HISTFILESIZE default to 500, then an explicit $HISTFILE is read
 	if histfile then
-		sh.history = sh.history or {}
-		local f = io.open(histfile, "r")
-		if f then
-			for line in f:lines() do
-				sh.history[#sh.history + 1] = line
-			end
-			f:close()
-		end
+		H.load(sh)
+	else
+		local hf = sh.vars.HISTFILE
+		sh.vars.HISTFILE = nil
+		H.load(sh)
+		sh.vars.HISTFILE = hf
+	end
+	if interactive then -- (shell.c: an interactive shell remembers its mailboxes' dates)
+		require("mailcheck").init(sh)
 	end
 	if RL and istty then
 		RL.using_history()
@@ -129,6 +135,7 @@ function M.run(sh)
 	-- (a script read from stdin: each command runs with its real line numbers — lno is
 	-- the lines read so far, bline the line the command in `buf` starts on)
 	local lno, bline, eofs = 0, 1, 0
+	local hst, hdq = {}, {} -- (history recording state for the command being read)
 	sh.defer_exit_trap = true -- the EXIT trap fires once, when the session ends
 	while true do
 		if buf == "" then -- before each PRIMARY prompt, bash runs $PROMPT_COMMAND
@@ -137,14 +144,14 @@ function M.run(sh)
 				io.flush()
 				break
 			end
+			if sh.mailcheck then -- (then yylex checks the mailboxes)
+				pcall(require("mailcheck").prompt, sh)
+			end
 			io.flush()
 		end
 		local prompt = buf == "" and prompt_of(sh, "PS1", "curse\\$ ") or prompt_of(sh, "PS2", "> ")
-		local line = read_line(prompt)
+		local line = read_line(prompt, interactive and not istty and rt.line_editing(sh))
 		if line == nil then -- EOF
-			if interactive and stderr_tty then
-				io.stderr:write("\n")
-			end -- newline to stderr, like the prompt
 			if buf:match("%S") then -- an unfinished command at EOF: run it so the syntax error shows
 				-- (shell_getc ends the input with a newline: a final `\` is a continuation)
 				pcall(interp.run_lazy, sh, buf .. "\n", nil, not interactive and bline or nil)
@@ -160,30 +167,36 @@ function M.run(sh)
 					goto continue
 				end
 			end
+			if interactive then -- (EOF runs `exit`: exit.def says so)
+				require("runtime").exit_note(sh)
+			end
 			break
 		end
 		eofs = 0
 		lno = lno + 1
 		if buf == "" then
-			bline = lno
+			bline, hst, hdq = lno, {}, {}
+		end
+		-- (history: `!` expansion and recording, one physical line at a time)
+		line = interp.history_line(sh, hst, hdq, line, buf ~= "", lno)
+		if line == nil then
+			if buf == "" then
+				goto continue
+			end
+			line = ""
 		end
 		buf = (buf == "") and line or (buf .. "\n" .. line)
-		if buf:match("%S") and needs_more(buf) then
+		if buf:match("%S") and (#hdq > 0 or needs_more(buf)) then
 		-- keep reading this logical command on the next line (PS2)
 		else
 			if buf:match("%S") then
-				if sh.opt_history ~= false then -- `set +o history` stops recording (bash), not execution
-					sh.history = sh.history or {}
-					sh.history[#sh.history + 1] = buf -- for `history`/`fc`
-					local hsz = tonumber(sh:get("HISTSIZE")) -- bash trims to HISTSIZE on each add
-					if hsz and hsz >= 0 then
-						while #sh.history > hsz do
-							table.remove(sh.history, 1)
-						end
-					end
-					if RL and istty then
-						RL.add_history(buf)
-					end
+				if RL and istty and require("hist").enabled(sh) then
+					RL.add_history(buf)
+				end
+				-- (eval.c: $PS0 after reading a command, before running it)
+				local ps0 = interactive and sh.vars.PS0 and prompt_of(sh, "PS0", "")
+				if ps0 and ps0 ~= "" then
+					io.stderr:write(ps0)
 				end
 				sh.exit_requested = nil
 				-- (a hot loop typed here runs compiled — the tier's fragment hook — and a hot

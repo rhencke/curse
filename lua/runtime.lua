@@ -5725,6 +5725,13 @@ function M.return_default(sh)
 	end
 	return sh.status
 end
+-- exit.def: an interactive shell (not a subshell of one) says "exit" — "logout" for a
+-- login shell — on stderr before exiting
+function M.exit_note(sh)
+	if sh.opt_i and sh:special_get("BASH_SUBSHELL") == "0" then
+		io.stderr:write(sh.login_shell and "logout\n" or "exit\n")
+	end
+end
 function M.exit_default(sh)
 	if sh.in_exit_trap and sh.trap_saved ~= nil then
 		return sh.trap_saved
@@ -6027,14 +6034,24 @@ M.SETFLAG = {
 }
 -- options that default ON (nil field state == off for the rest).
 M.SETDEFAULT = { opt_B = true, opt_h = true, opt_icomments = true }
+-- bash's no_line_editing == 0: an interactive shell without --noediting, or after
+-- `set -o emacs`/`set -o vi` (set_edit_mode); the emacs/vi options show the mode only then
+function M.line_editing(sh)
+	return sh.line_editing == true
+end
 function M.opt_on(sh, field)
+	if field == "opt_emacs" then
+		return sh.line_editing == true and not sh.opt_vi
+	elseif field == "opt_vi" then
+		return sh.line_editing == true and sh.opt_vi == true
+	end
 	local v = sh[field]
 	if v ~= nil then
 		return v
 	end
-	if field == "opt_emacs" or field == "opt_H" or field == "opt_history" then
+	if field == "opt_H" or field == "opt_history" then
 		return sh.opt_i and true or false
-	end -- emacs/histexpand/history are on only when interactive
+	end -- histexpand/history are on only when interactive
 	return M.SETDEFAULT[field] or false
 end
 
@@ -7682,6 +7699,8 @@ function Shell:set_str(name, s)
 		if h then
 			self.hosts = { list = h.list, alloc = h.alloc }
 		end
+	elseif self.mailcheck and (dn == "MAIL" or dn == "MAILPATH" or dn == "MAILCHECK") then
+		require("mailcheck").sv(self, dn) -- (sv_mail, once an interactive shell checks mail)
 	end
 	if self.opt_a and not b.arr then -- (set -a: every scalar assignment exports — bind_variable)
 		b.exported = true
@@ -11604,7 +11623,9 @@ end
 local function pq(sh, v)
 	return M.prompt_expands(sh) and (v:gsub('[$`"\\]', "\\%0")) or v
 end
-function Shell:prompt_escapes(s)
+-- (isprompt: PS0/PS1/PS2 themselves — \# counts the command being read; elsewhere, PS4
+-- and ${x@P}, the one running)
+function Shell:prompt_escapes(s, isprompt)
 	local out, i, n = {}, 1, #s
 	while i <= n do
 		local c = s:sub(i, i)
@@ -11613,7 +11634,6 @@ function Shell:prompt_escapes(s)
 			local simple = ({
 				a = "\7",
 				e = "\27",
-				n = "\n",
 				r = "\r",
 				["\\"] = "\\",
 				-- `\$` decodes to `\$` for a non-root user: the promptvars expansion that
@@ -11629,7 +11649,7 @@ function Shell:prompt_escapes(s)
 				V = "5.2.37",
 				-- \! the history number of this command; \# the command number
 				["!"] = tostring(self.history and #self.history > 0 and (self.hist_base or 1) + #self.history - 1 or 1),
-				["#"] = tostring(self.cmd_number or 1),
+				["#"] = tostring((self.cmd_number or 0) + (isprompt and 1 or 0)),
 				j = (function() -- number of jobs the shell is managing
 					local nj = 0
 					for _, jb in ipairs(self.jobs or {}) do
@@ -11640,8 +11660,14 @@ function Shell:prompt_escapes(s)
 					return tostring(nj)
 				end)(),
 			})[d]
-			if d == "[" or d == "]" then
-				i = i + 2 -- non-printing markers: drop
+			if d == "[" or d == "]" then -- non-printing markers: readline's \001 \002, else dropped
+				if M.line_editing(self) then
+					out[#out + 1] = d == "[" and "\1" or "\2"
+				end
+				i = i + 2
+			elseif d == "n" then -- (with line editing on, readline wants \r\n)
+				out[#out + 1] = M.line_editing(self) and "\r\n" or "\n"
+				i = i + 2
 			elseif d == "l" then -- basename of the controlling tty, or "tty" when none (bash)
 				local tn = C.isatty(0) == 1 and C.ttyname(0) or nil
 				out[#out + 1] = tn ~= nil and (ffi.string(tn):gsub(".*/", "")) or "tty"
@@ -11667,9 +11693,19 @@ function Shell:prompt_escapes(s)
 				out[#out + 1] = simple
 				i = i + 2
 			elseif d:match("[0-7]") then
-				local oct = s:match("^[0-7][0-7]?[0-7]?", i + 1)
-				out[#out + 1] = string.char(tonumber(oct, 8) % 256)
-				i = i + 1 + #oct
+				-- read_octal on (up to) the next 3 chars: all octal or it's a lone `\` and the
+				-- digit is read again as text; a value that wraps to NUL adds nothing
+				local o3 = s:sub(i + 1, i + 3)
+				if o3:find("[^0-7]") then
+					out[#out + 1] = "\\"
+					i = i + 1
+				else
+					local v = tonumber(o3, 8) % 256
+					if v ~= 0 then
+						out[#out + 1] = string.char(v)
+					end
+					i = i + 1 + #o3
+				end
 			else
 				out[#out + 1] = "\\" .. d
 				i = i + 2

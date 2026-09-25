@@ -72,6 +72,12 @@ return function(sh, cmd, args, hook, tcb)
 			-- unquoted `A[…]` word's associative subscript runs to its final `]` (W_ARRAYREF))
 			local isvar = rt.split_array_ref(a, sh) or (sh.arrayref_args and sh.arrayref_args[a]
 				and a:find("^[%a_][%w_]*%[.+%]$") and sh:is_assoc(a:match("^[%a_][%w_]*")))
+			if isvar and not fmode and not nmode then
+				local b = a:find("[", 1, true) -- (unset_builtin cuts the word at `[` in place: $_)
+				if b then
+					args[j] = a:sub(1, b - 1)
+				end
+			end
 			if fmode or (not vmode and not isvar) then
 				-- -f, or a name that can't be a variable: a function name
 				unset_fn(a)
