@@ -2312,6 +2312,9 @@ function Shell:capture_src(src, backtick, noalias, line0)
 	for _, st in ipairs(ast.stmts) do
 		if st.t == "parse_error" then
 			has_perr = true
+			if backtick then -- (read at expansion time: `NAME: command substitution: line N:`)
+				st.plabel = "command substitution"
+			end
 		end
 		if not capture_pure(self, st) then
 			iso = true
@@ -11645,10 +11648,12 @@ function M.report_recoverable(sh, perr)
 		sh.cur_line = perr.line
 	end
 	local msg = tostring(perr.msg or "syntax error"):gsub("^syntax error near `", "syntax error near unexpected token `")
+	sh.in_perr = true -- (named like the shell's other syntax errors: `NAME: eval: line N:`)
 	io.stderr:write("curse: " .. msg .. "\n")
 	if perr.text then
 		io.stderr:write("curse: `" .. perr.text .. "'\n")
 	end
+	sh.in_perr = nil
 	sh.status = 1
 end
 -- A `parse_error` statement: the parser reached text it can't parse (e.g. a makeself binary
@@ -11658,20 +11663,40 @@ end
 -- `label` "eval": an eval'd text's error reads `NAME: eval: line N:`, and even a recoverable
 -- one ends the eval (status 2, like b_eval) — the caller contains __curse_parseerr.
 function M.parse_error_stmt(sh, st, label)
+	label = label or st.plabel
 	for _, w in ipairs(st.warns or {}) do
 		sh.cur_line = w.line
 		io.stderr:write("curse: " .. w.msg .. "\n")
 	end
 	if st.recoverable then
+		local pl = sh.perr_label
+		sh.perr_label = label or pl
 		M.report_recoverable(sh, st)
-		if label then
-			error({ __curse_exit = 2, __curse_parseerr = true })
+		sh.perr_label = pl
+		-- (bash's DISCARD: the eval goes on with its next line, status 1 — but ends a subshell)
+		if (label or pl) == "eval" and (sh.subdepth or 0) + M.fork_depth > 0 then
+			error({ __curse_exit = 1 })
 		end
 		return
+	end
+	if (label or sh.perr_label) == "eval" and (st.forceeof -- (FORCE_EOF: ends the shell, status 1)
+		or (st.discard and (sh.subdepth or 0) + M.fork_depth > 0)) then
+		local pl = sh.perr_label
+		sh.perr_label = label or pl
+		pcall(M.parse_error_stmt, sh, { line = st.line, msg = st.msg, exact = st.exact, text = st.text,
+			showtext = st.showtext, pre = st.pre, warns = st.warns })
+		sh.perr_label = pl
+		error({ __curse_exit = 1 })
 	end
 	local msg = tostring(st.msg or "syntax error"):gsub("^.-:%d+: ", "")
 	if not st.exact then
 		msg = msg:gsub("^syntax error near `", "syntax error near unexpected token `")
+	end
+	-- report_syntax_error: a token holding a non-printable is shown ansic_quote'd — with the
+	-- lexer's CTLESC (\001) before each \001/\177 byte it read
+	local tok = msg:find("[%z\1-\31\127-\255]") and msg:match("^syntax error near [%w ]*`(.*)'$")
+	if tok and M.ansic_shouldquote(tok) then
+		msg = msg:sub(1, #msg - #tok - 1) .. M.shell_quote((tok:gsub("[\1\127]", "\1%0"))) .. "'"
 	end
 	if not msg:find("^syntax error") and not msg:find("^unexpected EOF")
 		and not msg:find("^maximum here%-document count exceeded") then
