@@ -11091,6 +11091,54 @@ function M.call_dynamic_fn(sh, argv)
 	return I.exec_simple(sh, argv, _noop)
 end
 
+-- A parse-time warning statement (heredoc delimited by EOF, …): shown before its line runs.
+function M.warn_stmt(sh, st)
+	sh.cur_line = st.line
+	io.stderr:write("curse: " .. st.msg .. "\n")
+end
+-- A RECOVERABLE parse error (an invalid `NAME=( … )` array-literal element) is reported
+-- but NON-fatal: the assignment is dropped and the script continues (bash).
+function M.report_recoverable(sh, perr)
+	if perr.line then
+		sh.cur_line = perr.line
+	end
+	local msg = tostring(perr.msg or "syntax error"):gsub("^syntax error near `", "syntax error near unexpected token `")
+	io.stderr:write("curse: " .. msg .. "\n")
+	if perr.text then
+		io.stderr:write("curse: `" .. perr.text .. "'\n")
+	end
+	sh.status = 1
+end
+-- A `parse_error` statement: the parser reached text it can't parse (e.g. a makeself binary
+-- payload) after the valid prefix ran — bash reports it there and exits 2. bash's form:
+-- `syntax error near unexpected token `X'` (or `syntax error: unexpected end of file`),
+-- then the offending line as `…'. Shared by both tiers (the compiled one calls it natively).
+function M.parse_error_stmt(sh, st)
+	for _, w in ipairs(st.warns or {}) do
+		sh.cur_line = w.line
+		io.stderr:write("curse: " .. w.msg .. "\n")
+	end
+	if st.recoverable then
+		return M.report_recoverable(sh, st)
+	end
+	local msg = tostring(st.msg or "syntax error"):gsub("^.-:%d+: ", "")
+	msg = msg:gsub("^syntax error near `", "syntax error near unexpected token `")
+	if not msg:find("^syntax error") and not msg:find("^unexpected EOF")
+		and not msg:find("^maximum here%-document count exceeded") then
+		msg = "syntax error: " .. msg
+	end
+	if st.line then
+		sh.cur_line = st.line
+	end
+	sh.in_perr = true -- (a `-c` string's syntax errors name it: `bash: -c: line 1:`)
+	io.stderr:write("curse: " .. msg .. "\n")
+	if st.text and (st.showtext or msg:find("near unexpected token", 1, true)) then
+		io.stderr:write("curse: " .. (st.showtext and "syntax error: " or "") .. "`" .. st.text .. "'\n")
+	end
+	sh.in_perr = nil
+	error({ __curse_exit = 2, __curse_parseerr = true })
+end
+
 -- `eval CODE`: COMPILE the joined code string at runtime (fragment mode — its top-level
 -- return/break/continue/exit RAISE, so they cross back to this eval's delegated cf-wrapper)
 -- and run it in the CURRENT shell (shared sh: assignments, functions, $? all persist). No

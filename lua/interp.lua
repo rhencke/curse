@@ -3814,17 +3814,7 @@ local function decl_elems(sh, name, fmt)
 end
 -- A recoverable parse error (a bad `NAME=( … )` element): bash's syntax-error report — the
 -- token, then the line — but the script goes on (status 1)
-function M.report_recoverable(sh, perr)
-	if perr.line then
-		sh.cur_line = perr.line
-	end
-	local msg = tostring(perr.msg or "syntax error"):gsub("^syntax error near `", "syntax error near unexpected token `")
-	io.stderr:write("curse: " .. msg .. "\n")
-	if perr.text then
-		io.stderr:write("curse: `" .. perr.text .. "'\n")
-	end
-	sh.status = 1
-end
+M.report_recoverable = rt.report_recoverable
 -- the dynamic arrays bash lists among its variables (curse computes them on demand)
 local DYN_ARRAYS = { BASH_ARGC = 1, BASH_ARGV = 1, BASH_LINENO = 1, BASH_SOURCE = 1, DIRSTACK = 1, FUNCNAME = 1, GROUPS = 1 }
 M.DYN_ARRAYS = DYN_ARRAYS
@@ -6626,41 +6616,9 @@ exec_stmt = function(sh, st, hook)
 		sh.loopdepth = sh.loopdepth - 1
 		sh.status = bodystatus
 	elseif t == "warn" then -- a parse-time warning (heredoc at EOF, …), shown before its line runs
-		sh.cur_line = st.line
-		io.stderr:write("curse: " .. st.msg .. "\n")
+		rt.warn_stmt(sh, st)
 	elseif t == "parse_error" then
-		for _, w in ipairs(st.warns or {}) do
-			sh.cur_line = w.line
-			io.stderr:write("curse: " .. w.msg .. "\n")
-		end
-		-- A RECOVERABLE parse error (an invalid `NAME=( … )` array-literal element) is
-		-- reported but NON-fatal: the assignment is dropped and the script continues
-		-- (bash). This matches run_lazy's handling, so the compiled path (which reaches
-		-- a parse_error via delegation) behaves the same as the interpreter.
-		if st.recoverable then
-			M.report_recoverable(sh, st)
-		else
-			-- Reached the unparseable tail (e.g. a makeself binary payload) — bash would
-			-- syntax-error here too. If an earlier exit fired, we never get here.
-			-- bash's form: `syntax error near unexpected token `X'` (or `syntax error:
-			-- unexpected end of file`), then the offending line as `…'
-			local msg = tostring(st.msg or "syntax error"):gsub("^.-:%d+: ", "")
-			msg = msg:gsub("^syntax error near `", "syntax error near unexpected token `")
-			if not msg:find("^syntax error") and not msg:find("^unexpected EOF")
-				and not msg:find("^maximum here%-document count exceeded") then
-				msg = "syntax error: " .. msg
-			end
-			if st.line then
-				sh.cur_line = st.line
-			end
-			sh.in_perr = true -- (a `-c` string's syntax errors name it: `bash: -c: line 1:`)
-			io.stderr:write("curse: " .. msg .. "\n")
-			if st.text and (st.showtext or msg:find("near unexpected token", 1, true)) then
-				io.stderr:write("curse: " .. (st.showtext and "syntax error: " or "") .. "`" .. st.text .. "'\n")
-			end
-			sh.in_perr = nil
-			error({ __curse_exit = 2, __curse_parseerr = true })
-		end
+		rt.parse_error_stmt(sh, st)
 	elseif t == "group" then
 		-- { list; } runs in the current shell. Any trailing redirs are applied by the
 		-- COMPOUND_REDIR wrapper above (which checks open failures + errexit), so here

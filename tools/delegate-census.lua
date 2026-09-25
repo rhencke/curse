@@ -40,7 +40,7 @@ for p in io.popen("ls subprojects/oil/spec/*.test.sh"):lines() do
   end
   if cur then progs[#progs+1] = { p .. "#" .. n, table.concat(cur, "\n") } end
 end
-local why, sites, where = {}, {}, {}
+local why, sites, where, refs = {}, {}, {}, {}
 local nprog, nnoc, ndel = 0, 0, 0
 for _, pr in ipairs(progs) do
   nprog = nprog + 1
@@ -48,6 +48,14 @@ for _, pr in ipairs(progs) do
   if okp then
     E.EF.stats = {}
     local ok, err = pcall(E.emit, ast)
+    if ok then -- interpreter entry points in the generated code itself
+      for ref in err:gmatch("[%w_]*[%.:]?[%w_]+%f[(]") do
+        if ref:match("^I%.") or ref == "sh:capture_src" or ref == "rt.run_lazy" then
+          local k = "emitted " .. ref
+          refs[k] = (refs[k] or 0) + 1; where[k] = where[k] or {}; table.insert(where[k], pr[1])
+        end
+      end
+    end
     if not ok then
       local r = tostring(err):match("curse%-nocompile: ([^\n]*)") or ("ERROR " .. tostring(err):sub(1, 60))
       nnoc = nnoc + 1; why[r] = (why[r] or 0) + 1; where[r] = where[r] or {}; table.insert(where[r], pr[1])
@@ -68,6 +76,7 @@ local function dump(t, title, lim)
 end
 print(("programs %d  nocompile %d  with-delegates %d"):format(nprog, nnoc, ndel))
 dump(why, "nocompile reasons (programs)")
+dump(refs, "interpreter calls in generated code")
 local bl = {} -- aggregate by line only
 for k, v in pairs(sites) do local l = k:match("^[^ ]*"); bl[l] = (bl[l] or 0) + v; where[l] = where[l] or where[k] end
 dump(sites, "delegate sites by key", tonumber(os.getenv("LIMK") or 0))

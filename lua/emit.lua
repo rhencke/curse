@@ -6766,7 +6766,6 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
 
 	-- Statement types with no native compiled form yet -> always delegate.
 	cx.DELEGATE = {
-		parse_error = 1,
 		assignlist = 1,
 	}
 
@@ -7178,6 +7177,13 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
 		end
 		if cx.DELEGATE[t] then
 			return cx.delegate(st, after)
+		end
+		if t == "parse_error" or t == "warn" then -- (the report is data: rt prints it; a
+			-- fatal parse error raises its exit through the wrapper, lifted vars synced for EXIT)
+			return cx.delegate(st, after, {
+				callee = t == "warn" and "rt.warn_stmt" or "rt.parse_error_stmt",
+				callargs = ("sh, %s"):format(ser(st)),
+			})
 		end
 		if t == "assign" then
 			return H.assign(cx, st, after)
