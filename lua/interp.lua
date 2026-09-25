@@ -1630,8 +1630,9 @@ local function expand_pexp(sh, p, assign)
 		arg = pe.arg and tostring(rt.substr_arith(sh, rt.pe_label(pe), arith_expand_text(sh, pe.arg)) or 0) or nil
 		arg2 = pe.arg2 and tostring(rt.substr_arith(sh, rt.pe_label(pe), arith_expand_text(sh, pe.arg2)) or 0) or nil
 	elseif not TESTOP[pe.op] then
-		-- a word-initial ~ in a pattern / replacement expands (${p//~/z}, ${p#~/x})
-		if type(arg) == "string" then
+		-- a word-initial ~ in a pattern / replacement expands (${p//~/z}, ${p#~/x}) — a
+		-- pattern's own (unquoted-only) tilde is expand_pattern's: a quoted `\~`/"~" is literal
+		if type(arg) == "string" and not patmode then
 			arg = tilde_prefix(sh, arg)
 		end
 	end
@@ -2694,7 +2695,13 @@ expand_fields_full = function(sh, w, pre1) -- pre1: part 1 already expanded (a $
 			if pi == 1 and p.lit ~= nil and not p.q then
 				-- (posix: `NAME=` args tilde-expand only for declaration builtins — parser
 				-- marks the other commands' args `plainarg`)
-				s = tilde_word_initial(sh, s, #w.parts > 1, sh.opt_posix and w.plainarg)
+				local s0 = s
+				s = tilde_word_initial(sh, s, #w.parts > 1, w.noassign or (sh.opt_posix and w.plainarg))
+				if s ~= s0 and s0:byte(1) == 126 then -- `~…`: the expansion is quoted text — never globbed
+					local tl = #s0 - (s0:find("[/:]") or #s0 + 1) + 1 -- (the text after the tilde-prefix)
+					add(s:sub(1, #s - tl), false)
+					s = s:sub(#s - tl + 1)
+				end
 			end -- word-initial / NAME= ~
 			if p.dqat and s == "" then
 				dq_null = true

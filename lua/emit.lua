@@ -1760,7 +1760,7 @@ emit_word = function(w, lifted)
 			i == 1
 			and p.lit
 			and not p.q
-			and (p.lit:sub(1, 1) == "~" or (p.lit:find("~", 1, true) and p.lit:match("^[%a_][%w_]*%+?=") ~= nil))
+			and (p.lit:sub(1, 1) == "~" or (p.lit:find("~", 1, true) and (p.lit:match("^[%a_][%w_]*%+?=") or p.lit:match("^[%a_][%w_]*%b[]%+?=")) ~= nil))
 		then
 			-- word-initial unquoted literal tilde (~, ~/…, ~user, ~+/~-) OR a NAME=…~ word
 			-- (`echo x=~`, which bash tilde-expands like an assignment): expanded at runtime
@@ -1768,7 +1768,7 @@ emit_word = function(w, lifted)
 			-- triggers — a tilde from a variable's value never expands (bash), and this part
 			-- is a literal, so no over-expansion. ~ mid-word (not after NAME=) stays literal.
 			parts[#parts + 1] = ("rt.tilde_word_initial(sh, %q, %s, %s)"):format(
-				p.lit, tostring(#w.parts > 1), w.plainarg and "sh.opt_posix" or "false")
+				p.lit, tostring(#w.parts > 1), w.noassign and "true" or w.plainarg and "sh.opt_posix" or "false")
 		elseif p.lit then
 			parts[#parts + 1] = ("%q"):format(p.lit)
 		elseif p.raw then
@@ -2504,10 +2504,10 @@ local function emit_scalar_val(p, i, lifted, tilde, w)
 		if
 			tilde
 			and i == 1
-			and (p.lit:sub(1, 1) == "~" or (p.lit:find("~", 1, true) and p.lit:match("^[%a_][%w_]*%+?=") ~= nil))
+			and (p.lit:sub(1, 1) == "~" or (p.lit:find("~", 1, true) and (p.lit:match("^[%a_][%w_]*%+?=") or p.lit:match("^[%a_][%w_]*%b[]%+?=")) ~= nil))
 		then
 			return ("rt.tilde_word_initial(sh, %q, %s, %s)"):format(p.lit, tostring(w ~= nil and #w.parts > 1),
-				(w and w.plainarg) and "sh.opt_posix" or "false")
+				(w and w.noassign) and "true" or (w and w.plainarg) and "sh.opt_posix" or "false")
 		end
 		return ("%q"):format(p.lit)
 	elseif p.raw then

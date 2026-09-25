@@ -3427,11 +3427,15 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs)
 					local factors = brace_factors(rhs)
 					if factors then
 						stream_factors(factors, function(x)
-							elems[#elems + 1] = { key = nil, op = "=", word = bq_word(x) }
+							local bw = bq_word(x)
+							bw.noassign = true -- (a bare element's `x=~` is not an assignment: no ~ after =)
+							elems[#elems + 1] = { key = nil, op = "=", word = bw }
 							return #elems >= BRACE_CAP
 						end)
 					else
-						elems[#elems + 1] = { key = nil, op = "=", word = parse_word(rhs) }
+						local bw = parse_word(rhs)
+						bw.noassign = true
+						elems[#elems + 1] = { key = nil, op = "=", word = bw }
 					end
 				else
 					-- KEYED element. bash brace-expands the value only for an INDEXED array,
@@ -3445,7 +3449,9 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs)
 					if factors then
 						elem.brace_bare = {}
 						stream_factors(factors, function(x)
-							elem.brace_bare[#elem.brace_bare + 1] = bq_word(x)
+							local bw = bq_word(x)
+							bw.noassign = true
+							elem.brace_bare[#elem.brace_bare + 1] = bw
 							return #elem.brace_bare >= BRACE_CAP
 						end)
 					end

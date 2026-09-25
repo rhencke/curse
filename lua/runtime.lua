@@ -5371,17 +5371,29 @@ function M.tilde_prefix(sh, s)
 		if sh.vars[sh:deref("HOME")] ~= nil then
 			return sh:get("HOME") .. r
 		end
-		return s
+		local pw = M.pw_by_uid(tonumber(ffi.C.getuid())) -- (HOME unset: the user's passwd entry)
+		return pw and pw.dir ~= "" and (pw.dir .. r) or s
 	end
-	if r == "+" or r:sub(1, 2) == "+/" or r:sub(1, 2) == "+:" then
-		return sh:pwd() .. r:sub(2)
+	if r == "+" or r:sub(1, 2) == "+/" or r:sub(1, 2) == "+:" then -- ~+: $PWD's value (unset: literal)
+		if sh.vars[sh:deref("PWD")] == nil then
+			return s
+		end
+		return sh:get("PWD") .. r:sub(2)
 	end
-	-- ~N / ~+N / ~-N: an entry of the directory stack (N from the top, -N from the bottom)
+	-- ~N / ~+N / ~-N: an entry of the directory stack (N from the top, -N from the bottom);
+	-- the current-directory entry is $PWD's value (pushd.def get_dirstack_from_string)
 	local sign, num, tail = r:match("^([+-]?)(%d+)(.*)$")
 	if num and (tail == "" or tail:sub(1, 1) == "/" or tail:sub(1, 1) == ":") then
 		local ds = sh:dirstack_array()
 		local n = tonumber(num)
-		local e = (sign == "-") and ds[#ds - n] or ds[n + 1]
+		local i = (sign == "-") and #ds - n or n + 1
+		if i == 1 then
+			if sh.vars[sh:deref("PWD")] == nil then
+				return s
+			end
+			return sh:get("PWD") .. tail
+		end
+		local e = ds[i]
 		if e then
 			return e .. tail
 		end
@@ -5431,6 +5443,9 @@ end
 -- `noassign`: don't treat `NAME=` specially (posix mode, a non-declaration command).
 function M.tilde_word_initial(sh, s, more, noassign)
 	local pre, rest = s:match("^([%a_][%w_]*%+?=)(.*)$")
+	if not pre and s:find("]", 1, true) then -- (`a[1]=~`: a subscripted assignment word too)
+		pre, rest = s:match("^([%a_][%w_]*%b[]%+?=)(.*)$")
+	end
 	if pre then
 		if noassign then
 			return s
