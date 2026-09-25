@@ -11086,7 +11086,7 @@ end
 function M.call_dynamic_fn(sh, argv)
 	local I = require("interp")
 	if sh.opt_x then
-		I.xtrace(sh, argv)
+		M.xtrace(sh, argv)
 	end
 	return I.exec_simple(sh, argv, _noop)
 end
@@ -11340,8 +11340,8 @@ function M.exec_dynamic(sh, argv, hook, hadcs, no_func)
 	end
 	local I = require("interp")
 	sh.write_err = nil
-	if sh.opt_x then
-		I.xtrace(sh, argv)
+	if sh.opt_x and not no_func then -- (`command CMD`: the caller traced it, `command` included)
+		M.xtrace(sh, argv)
 	end
 	-- a `cmd &` child armed to exec its lone external in place: only if the word resolved
 	-- to an external (a function/builtin runs more than one command — keep the child)
@@ -12376,6 +12376,104 @@ end
 -- the value's TEXT). Dynamic — deferred to the interpreter bootstrap.
 function M.arith_textual(sh, raw)
 	return require("interp").arith_textual(sh, raw)
+end
+
+-- xtrace (`set -x`): before running a command, write `$PS4<cmd words>` to the trace fd,
+-- single-quoting any word that isn't a plain token (bash's xtrace_print_word_list). Shared
+-- by both tiers: the compiled code calls these at the same points the interpreter does
+-- (after a command's words expand, before its redirections), guarded by sh.opt_x.
+function M.xtrace_quote(w)
+	if w == "" then
+		return "''"
+	end
+	if w:match("^[%w_@%%+=:,./%-]+$") then
+		return w
+	end
+	return M.shell_quote(w)
+end
+-- xtrace output goes to fd $BASH_XTRACEFD when that's set to an open fd (bash), else stderr
+function M.xtrace_write(sh, s)
+	local fd = sh.vars.BASH_XTRACEFD and tonumber(sh:get("BASH_XTRACEFD"))
+	if fd and fd ~= 2 and fd >= 0 and fd == math.floor(fd) then
+		io.flush() -- (our buffered stdout first: fd 1 may be the trace fd)
+		if M.fd_write(fd, s) then
+			return
+		end
+	end
+	io.stderr:write(s)
+end
+-- one xtrace line: $PS4 (its first char repeated per $(…)/eval/source level) + `text`
+function M.xtrace_line(sh, text)
+	local ps4 = sh.xtrace_ps4 or sh:get("PS4")
+	if ps4:find("[$`\\]") then -- (PS4 is expanded like a prompt, untraced: `+[$LINENO] `)
+		local sx, st = sh.opt_x, sh.status
+		sh.opt_x = false
+		local ok, v = pcall(require("interp").prompt_string, sh, ps4)
+		sh.opt_x, sh.status = sx, st
+		ps4 = ok and v or ps4
+	end
+	if ps4 == "" then
+		ps4 = "+ "
+	end
+	local lead = ps4:sub(1, 1)
+	local depth = (sh.xdepth or 0) -- nesting of $(…) (not function calls or subshells)
+	local pre = ps4
+	if lead ~= "" and depth > 0 then
+		pre = lead:rep(depth) .. ps4
+	end
+	M.xtrace_write(sh, pre .. text .. "\n")
+end
+function M.xtrace(sh, args, prequoted)
+	local parts = {}
+	for i = 1, #args do
+		parts[i] = prequoted and args[i] or M.xtrace_quote(args[i])
+	end
+	M.xtrace_line(sh, table.concat(parts, " "))
+end
+-- (compiled argv built from word 2 on: the command name rides separately)
+function M.xtrace_cmd(sh, name, args)
+	local parts = { M.xtrace_quote(name) }
+	for i = 1, #args do
+		parts[i + 1] = M.xtrace_quote(args[i])
+	end
+	M.xtrace_line(sh, table.concat(parts, " "))
+end
+-- `+ name=value` for an assignment (the expanded value, as bash prints the word)
+function M.xtrace_assign(sh, lhs, v)
+	M.xtrace_line(sh, lhs .. (v == "" and "" or M.xtrace_quote(v)))
+end
+-- [[ ]] under set -x: a unary primary (`[[ -f x ]]`, `[[ ! -n y ]]`) traces its expanded
+-- operand and hands it back; given `r` (a =~ RHS), `[[ v =~ r ]]`
+function M.xdb1(sh, neg, op, v, r)
+	if sh.opt_x then
+		M.xtrace_line(sh, "[[ " .. (neg and "! " or "") .. (r and (v .. " =~ " .. r) or (op .. " " .. v)) .. " ]]")
+	end
+	return v
+end
+-- a binary primary: trace `[[ l op r ]]`, park the operands for the compare that follows
+M._xl, M._xr = "", ""
+function M.xdb2(sh, neg, op, l, r)
+	if sh.opt_x then
+		M.xtrace_line(sh, "[[ " .. (neg and "! " or "") .. l .. " " .. op .. " " .. r .. " ]]")
+	end
+	M._xl, M._xr = l, r
+	return true
+end
+-- `declare -a NAME=(…)` under set -x: bash traces the compound assignment with every
+-- element single-quoted (`+ q=(['2']='z' 'w')`), then the declaration (`+ declare -a q`)
+function M.xtrace_declarr(sh, name, items, decl)
+	M.xtrace_arrlit(sh, name, items)
+	M.xtrace_line(sh, decl)
+end
+function M.xtrace_arrlit(sh, name, items)
+	local function sq(v)
+		return "'" .. tostring(v):gsub("'", "'\\''") .. "'"
+	end
+	local o = {}
+	for i, it in ipairs(items) do
+		o[i] = (it.key ~= nil and ("[" .. sq(it.key) .. "]=") or "") .. sq(it.val or "")
+	end
+	M.xtrace_line(sh, name .. "=(" .. table.concat(o, " ") .. ")")
 end
 
 return M

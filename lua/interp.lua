@@ -4871,55 +4871,9 @@ local SPECIAL_BUILTIN -- forward decl (assigned below); posix dispatch/funcdef r
 -- single-quoting any word that isn't a plain token (bash). PS4's first char is
 -- repeated by call depth. A plain token is bare; anything else is quoted the way
 -- bash quotes it (shell_quote: `$'…'` for control/non-printable, else `'…'`).
-local function xtrace_quote(w)
-	if w == "" then
-		return "''"
-	end
-	if w:match("^[%w_@%%+=:,./%-]+$") then
-		return w
-	end
-	return rt.shell_quote(w)
-end
--- one xtrace line: $PS4 (its first char repeated per call depth) + `text`
-local function xtrace_line(sh, text)
-	local ps4 = sh:get("PS4")
-	if ps4:find("[$`\\]") then -- (PS4 is expanded like a prompt, untraced: `+[$LINENO] `)
-		local sx, st = sh.opt_x, sh.status
-		sh.opt_x = false
-		local ok, v = pcall(M.prompt_string, sh, ps4)
-		sh.opt_x, sh.status = sx, st
-		ps4 = ok and v or ps4
-	end
-	if ps4 == "" then
-		ps4 = "+ "
-	end
-	local lead = ps4:sub(1, 1)
-	local depth = (sh.xdepth or 0) -- nesting of $(…) (not function calls or subshells)
-	local pre = ps4
-	if lead ~= "" and depth > 0 then
-		pre = lead:rep(depth) .. ps4
-	end
-	M.xtrace_write(sh, pre .. text .. "\n")
-end
+local xtrace_quote, xtrace_line, xtrace = rt.xtrace_quote, rt.xtrace_line, rt.xtrace
 M.xtrace_line = xtrace_line
-local function xtrace(sh, args, prequoted)
-	local parts = {}
-	for i = 1, #args do
-		parts[i] = prequoted and args[i] or xtrace_quote(args[i])
-	end
-	xtrace_line(sh, table.concat(parts, " "))
-end
--- xtrace output goes to fd $BASH_XTRACEFD when that's set to an open fd (bash), else stderr
-M.xtrace_write = function(sh, s)
-	local fd = sh.vars.BASH_XTRACEFD and tonumber(sh:get("BASH_XTRACEFD"))
-	if fd and fd ~= 2 and fd >= 0 and fd == math.floor(fd) then
-		io.flush() -- (our buffered stdout first: fd 1 may be the trace fd)
-		if rt.fd_write(fd, s) then
-			return
-		end
-	end
-	io.stderr:write(s)
-end
+M.xtrace_write = rt.xtrace_write
 
 -- bash's describe_command (type.def), for `type` and `command -v/-V`. FL: all, short (the
 -- sentence), reuse (command -v), type (-t), path_only (-p), force (-P), nofunc (-f),
@@ -5928,7 +5882,11 @@ exec_stmt = function(sh, st, hook)
 			-- like a bad-subst in a command word. Catch it around the RHS expansion.
 			-- (the expanded right-hand side, kept for set -x's `name+=value` trace)
 			sh.x_rhs = nil
+			local xps4 = sh.opt_x and st.name == "PS4" and sh:get("PS4") -- (traced under the old one)
 			local aok, aerr = pcall(assign_body, sh, st, nref_base, nref_sub)
+			if xps4 and aok then
+				sh.xtrace_ps4 = xps4
+			end
 			if not aok then
 				if type(aerr) == "table" and aerr.__curse_badsub then -- (`c[-5]=v`: aborts the line)
 					io.stderr:write("curse: " .. st.name .. "[" .. tostring(st.index) .. "]: bad array subscript\n")
@@ -5950,14 +5908,16 @@ exec_stmt = function(sh, st, hook)
 				.. (sh.x_rhs == "" and "" or xtrace_quote(sh.x_rhs)) }, true)
 		end
 		if sh.opt_x and not st.append then
-			local v
-			if st.index then
+			local v = sh.x_rhs -- (the expanded word, as bash prints it: `n=1+1` for an -i n)
+			if v then
+			elseif st.index then
 				v = sh:get(st.name .. "[" .. st.index .. "]") or ""
 			else
 				v = sh:get(st.name) or ""
 			end
 			xtrace(sh, { (st.index and (st.name .. "[" .. st.index .. "]") or st.name) .. "=" .. (v == "" and "" or xtrace_quote(v)) }, true)
 		end
+		sh.xtrace_ps4 = nil
 		-- set -a (allexport): a plain scalar assignment auto-exports the variable
 		if sh.opt_a and not st.index then
 			local b = sh.vars[sh:deref(st.name)]
@@ -6248,6 +6208,13 @@ exec_stmt = function(sh, st, hook)
 			-- `set -x` trace: BEFORE the command's own redirects, so `cmd 2>file` doesn't
 			-- capture the trace (bash writes it to the shell's stderr).
 			if sh.opt_x and args[1] ~= nil then
+				if st.arrayargs and sh.arrayargs_pre then -- (`+ b=('4' '5 6')` before `+ declare -a b`)
+					for _, aa in ipairs(st.arrayargs) do
+						if sh.arrayargs_pre[aa] then
+							rt.xtrace_arrlit(sh, aa.name, sh.arrayargs_pre[aa])
+						end
+					end
+				end
 				xtrace(sh, args)
 			end
 			-- `exec [redirs] [cmd…]` (b_exec): its redirections PERSIST (not restored) and

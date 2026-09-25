@@ -253,7 +253,10 @@ end
 -- BASH_ENV file), that assumption is off for scripts that define aliases — or for every
 -- script when some are already defined — so interpret instead (always correct).
 local function alias_mismatch(mod, sh)
-	if sh.opt_x or sh.opt_v then -- started tracing (-x, inherited SHELLOPTS): interp traces
+	if sh.opt_v then -- started verbose (-v, inherited SHELLOPTS): the interpreter's line reader echoes
+		return true
+	end
+	if sh.opt_x and not mod.xtrace then -- started tracing (-x, SHELLOPTS): a module without hooks
 		return true
 	end
 	if not (sh.shopt and sh.shopt.expand_aliases) then
@@ -369,7 +372,7 @@ function M.flush_stores()
 	end
 end
 function compile_store(path, ast, sh, later)
-	local ok, code = pcall(E.emit, ast)
+	local ok, code = pcall(E.emit, ast, sh.xt_start and { xtrace = true } or nil)
 	local chunk = ok and load(code, "=curse:compiled")
 	if not chunk then
 		return nil
@@ -397,7 +400,7 @@ function M.compile_deferred(one)
 	while #deferred > 0 do
 		local d = table.remove(deferred)
 		local ok, code = pcall(function()
-			return E.emit(P.parse(d.src))
+			return E.emit(P.parse(d.src), d.xt and { xtrace = true } or nil)
 		end)
 		local chunk = ok and load(code, "=curse:compiled")
 		if chunk then
@@ -415,7 +418,9 @@ function M.compile_deferred(one)
 end
 function M.run_tiered(src, sh)
 	local Cache = require("cache")
-	local path = Cache.artifact_path(src)
+	-- (a shell started under set -x runs a module compiled WITH trace hooks: its own key)
+	sh.xt_start = sh.opt_x or nil
+	local path = Cache.artifact_path(sh.xt_start and (src .. "\0xtrace") or src)
 	if path then
 		local cached = modcache_get(path)
 		if cached and alias_mismatch(cached, sh) then
@@ -445,7 +450,7 @@ function M.run_tiered(src, sh)
 	-- the text) runs in the interpreter right away; it's compiled after the reply
 	-- (M.compile_deferred) so the NEXT run is a warm hit, and no caller waits for it.
 	if path and not may_loop(src) then
-		deferred[#deferred + 1] = { path = path, src = src }
+		deferred[#deferred + 1] = { path = path, src = src, xt = sh.xt_start }
 		I.run_lazy(sh, src)
 		return sh, "interp-deferred"
 	end
@@ -538,7 +543,7 @@ function M.run_tiered(src, sh)
 		local ok, err = pcall(I.run_lazy, sh, src, hook)
 		if ok then
 			if mod == nil then
-				deferred[#deferred + 1] = { path = path, src = src }
+				deferred[#deferred + 1] = { path = path, src = src, xt = sh.xt_start }
 			end
 			return sh, "interp-deferred"
 		end
