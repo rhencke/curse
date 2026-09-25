@@ -6667,8 +6667,11 @@ exec_stmt = function(sh, st, hook)
 		rt.pipe_hi(wp)
 		local r0, r1 = rt.fd_below(rp[0], 64), rt.fd_below(rp[1], 64) -- (bash's numbering: 63 60)
 		local w0, w1 = rt.fd_below(wp[0], 64), rt.fd_below(wp[1], 64)
-		C.fcntl(r0, 2, 1) -- F_SETFD FD_CLOEXEC: nothing the shell runs inherits these
-		C.fcntl(w1, 2, 1)
+		-- F_SETFD FD_CLOEXEC: nothing the shell runs inherits these (a leaked write end keeps the
+		-- coproc from ever seeing EOF). Not the variadic C.fcntl: a Lua number vararg is passed
+		-- as a double, so the flag never arrived.
+		C.curse_co_fcntl3(r0, 2, 1)
+		C.curse_co_fcntl3(w1, 2, 1)
 		local cmd = st.cmd
 		local job = sh:bg_launch(function(ssh)
 			ssh.coprocs = nil -- (an older coproc's ends aren't this one's)

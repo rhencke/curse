@@ -4458,6 +4458,18 @@ function M.sched_drain()
 		for fd = 3, 9 do -- (and whatever else it had open for itself)
 			C.close(fd)
 		end
+		-- …and its ends of the coproc pipes (kept at 10+): an exited bash holds none, so the
+		-- coproc sees EOF and ends — else `coproc cat` waits on us and we on it, forever
+		local sh = M.cur_shell
+		for _, cp in pairs(sh and sh.coprocs or {}) do
+			if cp.r and cp.r >= 0 then
+				C.close(cp.r)
+			end
+			if cp.w and cp.w >= 0 then
+				C.close(cp.w)
+			end
+			cp.r, cp.w = -1, -1
+		end
 	end
 	while sched_live() and not CO do
 		M.sched_pump({ untilf = function()
