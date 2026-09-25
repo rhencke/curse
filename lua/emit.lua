@@ -2028,10 +2028,8 @@ local function emit_dbracket_node(node, lifted)
 		if op == "=~" then
 			-- a nested =~ leaf: rt.db_regex sets BASH_REMATCH and answers the match; an invalid
 			-- regex raises __curse_regexerr, which the statement turns into status 2 (interp)
-			if not db_word_ok(node.l) then
-				return nil
-			end
 			local re = EF.emit_regex_glob(node.r, lifted)
+				or db_fallback(node.r, lifted, "rt.db_regex_rhs") -- (a quoted part in a bracket, a ~, …)
 			if not re then
 				return nil
 			end
@@ -7593,7 +7591,7 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
 			-- rt.regex_captures (real POSIX ERE, exactly interp's path). The RHS is rendered
 			-- mask-aware by emit_regex_glob. A =~ nested inside and/or/not still delegates.
 			if st.expr.kind == "binary" and st.expr.op == "=~" and db_word_ok(st.expr.l) then
-				local re = EF.emit_regex_glob(st.expr.r, cx.lifted)
+				local re = EF.emit_regex_glob(st.expr.r, cx.lifted) -- (else the leaf path below)
 				if re then
 					local p = cx.newpc()
 					local d = dbg(st)

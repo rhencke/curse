@@ -5272,6 +5272,26 @@ local function dbracket_trace(sh, text)
 	xtrace_line(sh, "[[ " .. (sh.dbneg and "! " or "") .. text .. " ]]")
 	sh.dbneg = nil
 end
+-- The ERE text of a `=~` RHS word: bash tilde-expands a word-initial ~ and matches THAT
+-- expansion literally (a tilde prefix isn't part of the regex), the rest via expand_regex.
+local function regex_rhs(sh, rnode)
+	if word_initial_tilde(rnode) then
+		local p1 = rnode.parts[1]
+		local tok, restlit = p1.lit:match("^(~[^/:]*)(.*)$")
+		local exp = tok and tilde_prefix(sh, tok)
+		if exp and exp ~= tok then
+			local rw = { k = "word", parts = { { lit = exp, q = true } } }
+			if restlit ~= "" then
+				rw.parts[#rw.parts + 1] = { lit = restlit, q = p1.q }
+			end
+			for i = 2, #rnode.parts do
+				rw.parts[#rw.parts + 1] = rnode.parts[i]
+			end
+			rnode = rw
+		end
+	end
+	return expand_regex(sh, rnode)
+end
 local DB_ARITH_OP = { ["-eq"] = 1, ["-ne"] = 1, ["-lt"] = 1, ["-le"] = 1, ["-gt"] = 1, ["-ge"] = 1 }
 local function eval_dbracket(sh, node)
 	local k = node.kind
@@ -5343,23 +5363,7 @@ local function eval_dbracket(sh, node)
 			-- bash also tilde-expands a word-initial ~ on the =~ RHS and matches THAT
 			-- expansion literally (a tilde prefix isn't part of the regex): split off the
 			-- ~-token, expand it, and re-expand it as a quoted (regex-escaped) segment.
-			local rnode = node.r
-			if word_initial_tilde(rnode) then
-				local p1 = rnode.parts[1]
-				local tok, restlit = p1.lit:match("^(~[^/:]*)(.*)$")
-				local exp = tok and tilde_prefix(sh, tok)
-				if exp and exp ~= tok then
-					local rw = { k = "word", parts = { { lit = exp, q = true } } }
-					if restlit ~= "" then
-						rw.parts[#rw.parts + 1] = { lit = restlit, q = p1.q }
-					end
-					for i = 2, #rnode.parts do
-						rw.parts[#rw.parts + 1] = rnode.parts[i]
-					end
-					rnode = rw
-				end
-			end
-			local caps, bad = rt.regex_captures(l, expand_regex(sh, rnode), ic) -- real POSIX ERE + BASH_REMATCH
+			local caps, bad = rt.regex_captures(l, regex_rhs(sh, node.r), ic) -- real POSIX ERE + BASH_REMATCH
 			if bad then
 				error({ __curse_regexerr = true })
 			end -- invalid regex -> [[ ]] status 2
@@ -7861,6 +7865,7 @@ M._int = {
 	apply_redirs = apply_redirs,
 	restore_redirs = restore_redirs,
 	drain_procsub = drain_procsub,
+	regex_rhs = regex_rhs,
 	arith_expand_text = arith_expand_text,
 	dbracket_word = dbracket_word,
 	dbracket_pattern = dbracket_pattern,

@@ -5403,6 +5403,9 @@ function M.db_regex(sh, l, ere)
 end
 -- A [[ ]] operand / glob RHS the compiled tier can't render: interp's dbracket_word /
 -- dbracket_pattern on that one word.
+function M.db_regex_rhs(sh, w)
+	return require("interp")._int.regex_rhs(sh, w)
+end
 function M.db_word(sh, w)
 	return require("interp")._int.dbracket_word(sh, w)
 end
