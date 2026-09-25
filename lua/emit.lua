@@ -1244,7 +1244,7 @@ emit_value = function(e, lifted)
 			return ("rt.ipow(%s, %s%s)"):format(l, r, etxt_args(e))
 		end
 	end
-	error("emit: value position not supported for node " .. tostring(k))
+	error(debug.traceback("emit: value position not supported for node " .. tostring(k)))
 end
 
 local function emit_bool(e, lifted)
@@ -3140,7 +3140,11 @@ local function arith_can_div_fault(e)
 	end
 	local k = e.k
 	if k == "bin" and (e.op == "/" or e.op == "%" or e.op == "**") then
-		return true
+		-- (a literal operand can't fault: `i % 2`, `2 ** 3` — `**`'s literal is never < 0)
+		local r = e.r
+		if not (r.k == "num" and (e.op == "**" or (r.v:match("^%d+$") and not r.v:match("^0+$")))) then
+			return true
+		end
 	end
 	if k == "asgn" and (e.op == "/=" or e.op == "%=") then
 		return true
@@ -3639,6 +3643,17 @@ analyze_lift = function(ast)
 		if n.key ~= nil then -- (an array literal's `[k]=` element)
 			disq_text(n.key)
 		end
+		if type(n.idxraw) == "string" then -- (an arith element's subscript: `(( a[i++] = 5 ))`)
+			disq_text(n.idxraw)
+		end
+		if type(n.arith) == "string" and n.arith:find("[", 1, true) then -- (a word's `$(( a[i++] ))`)
+			any_node(safe_arith(n.arith), function(a)
+				if type(a.idxraw) == "string" then
+					disq_text(a.idxraw)
+				end
+				return false
+			end)
+		end
 		return false
 	end)
 	-- A trap's action runs through the interpreter, on sh.vars, at points the compiled code
@@ -4034,7 +4049,7 @@ local function arith_inlinable(e)
 	if type(e) ~= "table" then
 		return true
 	end
-	if e.k == "xpand" then
+	if e.k == "xpand" or e.k == "arith_perr" then -- (arith_perr: a parse error only the interp renders)
 		return false
 	end
 	return arith_inlinable(e.e)
@@ -4043,6 +4058,20 @@ local function arith_inlinable(e)
 		and arith_inlinable(e.c)
 		and arith_inlinable(e.a)
 		and arith_inlinable(e.b)
+end
+
+-- a word with a `$(( … ))` emit can't render (`$(( 1 +/ 2 ))`'s parse error, `$(( 1 $ 2 ))`'s
+-- textual expansion): only the interpreter reports it, so the body can't be spliced
+local function word_arith_perr(w)
+	for _, p in ipairs(w.parts) do
+		if p.arith then
+			local a = safe_arith(p.arith)
+			if not_compilable(a) or (arith_side_effect(a) and not arith_word_ok(a)) then
+				return true
+			end
+		end
+	end
+	return false
 end
 
 local function inlinable_body(body)
@@ -4062,7 +4091,7 @@ local function inlinable_body(body)
 			end
 		end
 		if st.t == "assign" then
-			if st.rhs and word_varargs(st.rhs) then
+			if st.rhs and (word_varargs(st.rhs) or word_arith_perr(st.rhs)) then
 				return false
 			end
 			if st.arith and not arith_inlinable(st.arith) then
@@ -4078,6 +4107,9 @@ local function inlinable_body(body)
 			end
 			for j = 2, #st.words do
 				if word_varargs(st.words[j]) then
+					return false
+				end
+				if word_arith_perr(st.words[j]) then
 					return false
 				end
 			end
@@ -4098,14 +4130,14 @@ local function subst_arith(e, pb)
 	if k == "param" then -- unset positional inside the callee is 0 in arith
 		return pb[e.n] and { k = "raw", code = pb[e.n].int } or { k = "num", v = "0" }
 	end
-	if k == "bin" then
-		return { k = "bin", op = e.op, l = subst_arith(e.l, pb), r = subst_arith(e.r, pb) }
-	end
-	if k == "un" then
-		return { k = "un", op = e.op, e = subst_arith(e.e, pb) }
-	end
-	if k == "asgn" then
-		return { k = "asgn", name = e.name, op = e.op, e = subst_arith(e.e, pb) }
+	if e.e or e.l or e.c then -- (a copy: keeps etxt/etok, idxraw, … — only operands change)
+		local c = {}
+		for f, v in pairs(e) do
+			c[f] = v
+		end
+		c.e, c.l, c.r = subst_arith(e.e, pb), subst_arith(e.l, pb), subst_arith(e.r, pb)
+		c.c, c.a, c.b = subst_arith(e.c, pb), subst_arith(e.a, pb), subst_arith(e.b, pb)
+		return c
 	end
 	return e -- num, var, post, pre, raw
 end
@@ -5438,6 +5470,49 @@ simple_compiled = function(cx, st, after)
 end
 
 -- statement handler: arithcmd (split out of flatten_stmt; see H)
+-- The Lua statement that evaluates a (( )) expression (vetted by arith_stmt_ok) WITH its side
+-- effects and sets sh.status like bash's arith command: 0 if non-zero, else 1; an arithmetic
+-- error ($?=1, the message said) included. Shared by (( )) and the `if`/`while (( ))` fast
+-- conditions. The caller sets EF.acmd so a ÷0 text reads `((: …`.
+EF.arith_status = function(expr, lifted)
+	local saved = arith_varread
+	arith_varread = "rt.arith_read(sh, %q)" -- nounset+recursive-eval reads
+	local code = emit_arith_into("__ar", expr, lifted)
+	arith_varread = saved
+	-- (a write to a READONLY var raises the same matherr — only possible in a program that
+	-- sets attributes, so ordinary `((i++))` loops keep the inline form)
+	if arith_can_div_fault(expr) or (EF.has_attr and arith_side_effect(expr)) then
+		-- ÷0 / mod-0 / negative ** THROW a non-fatal matherr — catch it (and any
+		-- flagged read fault) as $?=1 and continue, like interp; re-raise anything else.
+		return (
+			"do local __ia = sh.in_arithcmd; sh.arithfault = false; sh.in_arithcmd = true; local __ok, __v = pcall(function() local __ar = 0LL; %s; return (__ar ~= 0LL) and 0 or 1 end); sh.in_arithcmd = __ia; "
+			.. "if not __ok then if type(__v) == 'table' and __v.__curse_matherr and not __v.__curse_subscript then sh.status = 1 else error(__v) end "
+			.. "elseif sh.arithfault then sh.status = 1 else sh.status = __v end end"
+		):format(code)
+	elseif arith_can_error(expr, lifted) then
+		-- a non-lifted read may fault; INSIDE the (( )) command arith_read records it in
+		-- sh.arithfault WITHOUT throwing (sh.in_arithcmd gates that), so no per-iteration
+		-- pcall/closure — the accumulator stays JIT-native.
+		return ("do local __ia = sh.in_arithcmd; sh.arithfault = false; sh.in_arithcmd = true; local __ar = 0LL; %s; sh.in_arithcmd = __ia; sh.status = sh.arithfault and 1 or ((__ar ~= 0LL) and 0 or 1) end"):format(
+			code
+		)
+	end -- provably error-free (lifted ints, +-*/comparisons): inline, JIT-native
+	return ("do local __ar = 0LL; %s; sh.status = (__ar ~= 0LL) and 0 or 1 end"):format(code)
+end
+
+-- A `(( expr ))` CONDITION (if/while fast path): set $? like the (( )) command and branch
+-- to `yes` on 0, else `no`. Error-free (all-lifted) arithmetic is a plain native compare.
+EF.arith_branch = function(arith, lifted, yes, no)
+	if not arith_can_error(arith, lifted) then
+		return ("if %s then sh.status = 0; pc = %d else sh.status = 1; pc = %d end"):format(
+			emit_bool(arith, lifted), yes, no)
+	end
+	EF.acmd = "((" -- (bash's this_command_name, baked into its arith error texts)
+	local code = EF.arith_status(arith, lifted)
+	EF.acmd = nil
+	return ("%s; if sh.status == 0 then pc = %d else pc = %d end"):format(code, yes, no)
+end
+
 H.arithcmd = function(cx, st, after)
 	local t = st.t
 	-- (( expr )): evaluate expr WITH side effects natively (assignments, ++/--,
@@ -5460,31 +5535,7 @@ H.arithcmd = function(cx, st, after)
 	local ec = errchk(st)
 	local ecs = ec ~= "" and ("; " .. ec) or ""
 	local d = dbg(st) -- DEBUG fires before the (( )) command (bash: DEBUG_FIRE.arithcmd)
-	local saved = arith_varread
-	arith_varread = "rt.arith_read(sh, %q)" -- nounset+recursive-eval reads
-	local code = emit_arith_into("__ar", st.expr, cx.lifted)
-	arith_varread = saved
-	local sbody -- the status-setting body (redirect-wrapped below when present)
-	-- (a write to a READONLY var raises the same matherr — only possible in a program that
-	-- sets attributes, so ordinary `((i++))` loops keep the inline form)
-	if arith_can_div_fault(st.expr) or (EF.has_attr and arith_side_effect(st.expr)) then
-		-- ÷0 / mod-0 / negative ** THROW a non-fatal matherr — catch it (and any
-		-- flagged read fault) as $?=1 and continue, like interp; re-raise anything else.
-		sbody = (
-			"do local __ia = sh.in_arithcmd; sh.arithfault = false; sh.in_arithcmd = true; local __ok, __v = pcall(function() local __ar = 0LL; %s; return (__ar ~= 0LL) and 0 or 1 end); sh.in_arithcmd = __ia; "
-			.. "if not __ok then if type(__v) == 'table' and __v.__curse_matherr and not __v.__curse_subscript then sh.status = 1 else error(__v) end "
-			.. "elseif sh.arithfault then sh.status = 1 else sh.status = __v end end"
-		):format(code)
-	elseif arith_can_error(st.expr, cx.lifted) then
-		-- a non-lifted read may fault; INSIDE the (( )) command arith_read records it in
-		-- sh.arithfault WITHOUT throwing (sh.in_arithcmd gates that), so no per-iteration
-		-- pcall/closure — the accumulator stays JIT-native.
-		sbody = ("do local __ia = sh.in_arithcmd; sh.arithfault = false; sh.in_arithcmd = true; local __ar = 0LL; %s; sh.in_arithcmd = __ia; sh.status = sh.arithfault and 1 or ((__ar ~= 0LL) and 0 or 1) end"):format(
-			code
-		)
-	else -- provably error-free (lifted ints, +-*/comparisons): inline, JIT-native
-		sbody = ("do local __ar = 0LL; %s; sh.status = (__ar ~= 0LL) and 0 or 1 end"):format(code)
-	end
+	local sbody = EF.arith_status(st.expr, cx.lifted) -- the status-setting body (redirect-wrapped below when present)
 	if ac_redir then -- install redirs, run, restore; a failed redirect is $?=1 (bash)
 		sbody = ("do local __rs = {}; if %s then %s else sh.status = 1 end; rt.redir_restore(__rs) end"):format(
 			ac_redir,
@@ -5575,11 +5626,7 @@ H.whilec = function(cx, st, after)
 		cx.loopstack[#cx.loopstack] = nil
 		-- DEBUG fires before each evaluation of the condition command (bash)
 		local cst = type(st.cond) == "table" and st.cond[1] or nil
-		cx.blocks[condp] = (cst and dbg(cst) or "") .. ("if %s then pc = %d else pc = %d end"):format(
-			emit_bool(arith, cx.lifted),
-			bodyentry,
-			after
-		)
+		cx.blocks[condp] = (cst and dbg(cst) or "") .. EF.arith_branch(arith, cx.lifted, bodyentry, after)
 		return condp
 	end
 	-- fast path: `while/until [ A -op B ]` with integer operands — a native int64
@@ -5797,11 +5844,7 @@ H["if"] = function(cx, st, after)
 			local tarith = not arith and test_as_arith(cl.cond, cx.lifted) -- `[ A -op B ]`, integer operands
 			if arith and not not_compilable(arith) and not arith_side_effect(arith) then
 				local cp = cx.newpc()
-				cx.blocks[cp] = ("if %s then pc = %d else pc = %d end"):format(
-					emit_bool(arith, cx.lifted),
-					bentry[i],
-					nxt
-				)
+				cx.blocks[cp] = EF.arith_branch(arith, cx.lifted, bentry[i], nxt)
 				condentry[i] = cp
 			elseif tarith then -- native int64 compare, and set [ ]'s own $? (0/1)
 				local cp = cx.newpc()

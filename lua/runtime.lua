@@ -10931,6 +10931,19 @@ function M.arith_read(sh, name)
 	if s ~= nil and M.looks_numeric(s) then
 		return M.arith_num(s)
 	end -- native fast path
+	local P = require("parser")
+	if sh.in_arithcmd and P.arith_cmd == nil then -- (a compiled `(( ))`: its errors say `((: `)
+		P.arith_cmd = "(("
+		local ok, v = pcall(M.arith_read_slow, sh, name, s)
+		P.arith_cmd = nil
+		if not ok then
+			error(v, 0)
+		end
+		return v
+	end
+	return M.arith_read_slow(sh, name, s)
+end
+function M.arith_read_slow(sh, name, s)
 	-- Non-numeric VALUE (a stored expression like x="1+2"): COMPILE it to native ops and
 	-- run — exactly what interp's arith_read -> arith_resolve -> eval does, but as genuine
 	-- compiled code, not a tree-walk. Only the word-engine-free subset compiles (no
