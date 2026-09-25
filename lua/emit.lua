@@ -6597,7 +6597,9 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
 			end
 		end
 		if EF.stats and not opts then -- opt-in census of what still delegates (tools/…)
+			local w1 = st.words and st.words[1] and st.words[1].parts and st.words[1].parts[1]
 			EF.stats[#EF.stats + 1] = st.t .. "@" .. debug.getinfo(2, "l").currentline
+				.. (w1 and w1.lit and (" " .. w1.lit) or "")
 		end
 		local p = cx.newpc()
 		local prelude = opts and opts.prelude
