@@ -1489,6 +1489,13 @@ function M.open_fail(sh, path)
 	local msg = (e == 17 and sh.opt_C) and "cannot overwrite existing file" or ffi.string(C.strerror(e))
 	io.stderr:write("curse: " .. path .. ": " .. msg .. "\n")
 end
+-- An all-digit `>&WORD` as a fd: legal_number + (int)lfd == lfd (redir.c), else -1 (EBADF) —
+-- a huge number must not wrap onto a real fd.
+function M.fd_number(s)
+	local d = s:gsub("^0+", "")
+	local n = #d < 11 and (tonumber(d) or 0) or -1
+	return n > 2147483647 and -1 or n
+end
 function M.redir_apply(sh, op, fd, target, saves)
 	io.flush() -- flush buffered stdout before moving fds (else it lands in the new target)
 	-- In a pipeline stage, builtins write the redirected fd 1 directly while it's moved (as
@@ -1509,12 +1516,14 @@ function M.redir_apply(sh, op, fd, target, saves)
 		if h >= 0 then
 			return h
 		end
+		local e = ffi.errno() -- (for open_fail: a dangling symlink's stat miss is still EEXIST)
 		if
 			C.curse_rt_stat(path, _redir_stat) == 0
 			and bit.band(ffi.cast("uint32_t *", _redir_stat + 24)[0], 0xF000) ~= 0x8000
 		then
 			return M.ropen(path, 1, 438) -- existing NON-regular (e.g. /dev/null): plain O_WRONLY
 		end
+		ffi.errno(e)
 		return -1
 	end
 	if op == "out" or op == "clobber" then
@@ -1566,9 +1575,9 @@ function M.redir_apply(sh, op, fd, target, saves)
 			backup(fd)
 			C.close(fd)
 		else
-			local tf = tonumber(target)
-			if not tf then
-				return false
+			local tf = M.fd_number(target) -- (emit hands only all-digit targets here)
+			if tf == fd then -- `N>&N`: nothing to do, even on a closed N (redir.c)
+				return true
 			end
 			if C.fcntl(tf, 1) == -1 then -- F_GETFD: target fd not open -> bash fails
 				io.stderr:write("curse: " .. target .. ": Bad file descriptor\n")
@@ -1649,9 +1658,39 @@ function M.redir_noglob(sh, f, ...)
 	sh.opt_f = false
 	return ok, fs
 end
+-- rt.redir_ext's catch (cx.redir_ext): the redirect conditions' pcall results
+function M.redir_ext(sh, name, ok, res)
+	if ok then
+		return res
+	end
+	if type(res) ~= "table" or not res.__curse_exit or sh.functions[name]
+		or (require("interp").BUILTINS[name] and not (sh.disabled_builtins and sh.disabled_builtins[name])) then
+		error(res, 0) -- (a function or builtin runs in the shell itself: fatal)
+	end
+	return false
+end
 function M.redir_apply_expand(sh, op, fd, segs, raw, saves)
-	local ok, fs = M.redir_noglob(sh, M.expand_fields, sh, segs)
+	local ok, fs
+	if sh.opt_posix and not sh.opt_i then
+		-- posix: no word splitting (redir.c: W_NOSPLIT) nor globbing — one string, $@ joined
+		-- on a space; only an unquoted word expanding to nothing is ambiguous
+		local t, q = {}, false
+		for i, seg in ipairs(segs) do
+			if seg.multi then
+				t[i], q = table.concat(seg.elems, " "), q or seg.q
+			else
+				t[i], q = seg.s, q or not (seg.split or seg.unq)
+			end
+		end
+		local w = table.concat(t)
+		ok, fs = true, (w ~= "" or q) and { w } or {}
+	else
+		ok, fs = M.redir_noglob(sh, M.expand_fields, sh, segs)
+	end
 	if not ok then
+		if type(fs) == "table" and fs.__curse_exit then -- (failglob: fatal like set -u —
+			error(fs, 0) -- unless an external's rt.redir_ext absorbs it)
+		end
 		return false
 	end
 	if #fs ~= 1 then
@@ -10388,8 +10427,20 @@ function M.chkwrite(sh, name)
 	M.chkwrite_report(sh, name, m)
 	return false
 end
+do
+	-- builtins whose output goes out through Shell:echo, then bash's sh_chkwrite
+	local CHKW = { declare = 1, typeset = 1, export = 1, readonly = 1, trap = 1, umask = 1,
+		times = 1, dirs = 1, help = 1, cd = 1 }
+	-- after a builtin flagged a write error: status 1, and the report if nothing made it yet
+	function M.chkwrite_late(sh, name)
+		sh.status = 1
+		if sh.write_errmsg and CHKW[name] then
+			M.chkwrite_report(sh, name, sh.write_errmsg)
+		end
+	end
+end
 function M.chkwrite_report(sh, name, m)
-	sh.write_err = true
+	sh.write_err, sh.write_errmsg = true, nil -- (reported: chkwrite_late's cue)
 	local why = (m or ""):match(":%s*([^:]+)$") or m or "Bad file descriptor"
 	io.stderr:write("curse: " .. name .. ": write error: " .. why .. "\n")
 end

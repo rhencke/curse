@@ -54,8 +54,12 @@ return function(sh, cmd, args, hook, tcb)
 			end
 			sh.tcwd = out
 		end
+		sh.write_err = nil
 		sh:echo(out)
-		sh.status = 0
+		if sh.write_err and sh.out == io.write then -- (sh_chkwrite: `pwd >&-`)
+			rt.chkwrite_report(sh, "pwd", sh.write_errmsg)
+		end
+		sh.status = sh.write_err and 1 or 0
 		-- "This is dumb but posix-mandated": posix `pwd -P` sets PWD
 		if sh.opt_posix and pflag then
 			if rt.ro_refuse(sh, "PWD") then

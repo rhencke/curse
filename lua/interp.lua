@@ -1356,7 +1356,7 @@ local function expand_pexp(sh, p, assign)
 	local pe = p.pexp
 	if pe.op == "badsubst" then -- ${x|html} and other unrecognized ${…} forms
 		if pe.fatal then
-			sherr(sh, "curse: ${" .. (pe.raw or pe.name or "") .. "}: bad substitution\n")
+			sherr(sh, "curse: " .. (sh.bs_word and sh.bs_depth == sh.subdepth and sh.bs_word or ("${" .. (pe.raw or pe.name or "") .. "}")) .. ": bad substitution\n")
 			error({ __curse_exit = sh.opt_c and 127 or 1, __curse_lineabort = sh.opt_i or nil })
 		end
 		if pe.xform then -- ${x@Z}: nothing to transform on an unset x; else FATAL (bash)
@@ -1370,10 +1370,10 @@ local function expand_pexp(sh, p, assign)
 			if not set then
 				return ""
 			end
-			sherr(sh, "curse: ${" .. (pe.raw or pe.name or "") .. "}: bad substitution\n")
+			sherr(sh, "curse: " .. (sh.bs_word and sh.bs_depth == sh.subdepth and sh.bs_word or ("${" .. (pe.raw or pe.name or "") .. "}")) .. ": bad substitution\n")
 			error({ __curse_exit = sh.opt_c and 127 or 1, __curse_lineabort = sh.opt_i or nil })
 		end
-		sherr(sh, "curse: ${" .. (pe.raw or pe.name or "") .. "}: bad substitution\n")
+		sherr(sh, "curse: " .. (sh.bs_word and sh.bs_depth == sh.subdepth and sh.bs_word or ("${" .. (pe.raw or pe.name or "") .. "}")) .. ": bad substitution\n")
 		error({ __curse_exit = 1, __curse_lineabort = true }) -- discards the rest of the line (bash)
 	end
 	if pe.op == "@" and pe.arg == "P" then -- ${x@P}: decode prompt escapes, then expand
@@ -2598,12 +2598,15 @@ local function open_out(sh, path, mode)
 	if f >= 0 then
 		return f
 	end
+	local e = ffi.errno() -- (kept for open_fail: a dangling symlink's stat miss is still EEXIST)
 	local ok, rc = pcall(C.curse_stat, path, statbuf) -- O_EXCL failed: allow non-regular
 	if ok and rc == 0 and bit.band(ffi.cast("uint32_t *", statbuf + 24)[0], 0xF000) ~= 0x8000 then
 		return rt.ropen(path, 1, mode) -- not S_IFREG -> plain O_WRONLY (no truncate)
 	end
+	ffi.errno(e)
 	return -1
 end
+local FDVAR_NOASSIGN = { GROUPS = 1, FUNCNAME = 1, BASH_ARGC = 1, BASH_ARGV = 1, BASH_SOURCE = 1, BASH_LINENO = 1 }
 local function apply_redirs(sh, redirs, cname) -- cname: the command (names {v} errors)
 	io.flush() -- flush pending stdout BEFORE moving fds, else buffered output from a
 	-- prior command would be redirected into (and lost to) the new target
@@ -2612,6 +2615,16 @@ local function apply_redirs(sh, redirs, cname) -- cname: the command (names {v} 
 	-- Named-fd (`{var}>`) targets are NOT restored after the command: bash leaves
 	-- them open (so a later `{var}>` gets the next fd), unlike a numeric redirect.
 	local persist = {}
+	-- A fatal expansion error in a redirection word (set -u, ${v?}, failglob): bash expands
+	-- an external command's redirections in the forked child, where it only fails that
+	-- command (status 1); anywhere else it is raised as usual (redir.c runs in the shell).
+	local ext = cname and not sh.functions[cname]
+		and not (M.BUILTINS[cname] and not (sh.disabled_builtins and sh.disabled_builtins[cname]))
+	local function xerr(e)
+		if not ext and type(e) == "table" and e.__curse_exit then
+			error(e, 0)
+		end
+	end
 	local function backup(fd)
 		if not persist[fd] then
 			save[#save + 1] = { fd = fd, saved = rt.save_fd(fd) }
@@ -2633,8 +2646,19 @@ local function apply_redirs(sh, redirs, cname) -- cname: the command (names {v} 
 		end
 		-- expansion can also fail non-fatally (e.g. failglob no-match): the redirect
 		-- then fails (status 1) rather than aborting the script.
-		local eok, fs = rt.redir_noglob(sh, expand_to_fields, sh, P.parse_word(raw))
+		local eok, fs
+		if sh.opt_posix and not sh.opt_i then
+			-- posix: no word splitting (redir.c: W_NOSPLIT) nor globbing — one string, $@
+			-- joined; only an unquoted word expanding to nothing is ambiguous
+			eok, fs = pcall(expand_word, sh, P.parse_word(raw))
+			if eok then
+				fs = (fs ~= "" or raw:find("[\"']")) and { fs } or {}
+			end
+		else
+			eok, fs = rt.redir_noglob(sh, expand_to_fields, sh, P.parse_word(raw))
+		end
 		if not eok then
+			xerr(fs)
 			return nil
 		end
 		if #fs ~= 1 then
@@ -2673,7 +2697,9 @@ local function apply_redirs(sh, redirs, cname) -- cname: the command (names {v} 
 			return set ~= false
 		end
 		local fdb = r.fdvar and sh.vars[sh:deref(fvn or r.fdvar)]
-		if fdb and fdb.ro and not ((r.op == "dup" or r.op == "dupin") and r.target == "-") then
+		-- bash's noassign dynamic arrays (GROUPS, BASH_ARGV, …) refuse the fd too: redir_varassign
+		local noasg = r.fdvar and FDVAR_NOASSIGN[fvn or r.fdvar] and not (sh.unset_specials and sh.unset_specials[fvn or r.fdvar])
+		if (noasg or fdb and fdb.ro) and not ((r.op == "dup" or r.op == "dupin") and r.target == "-") then
 			-- `{v}>…` with v readonly: bash refuses (no fd is allocated) and the command fails
 			-- — after it opened (so created) an output file
 			if r.op == "out" or r.op == "clobber" or r.op == "app" then
@@ -2683,7 +2709,9 @@ local function apply_redirs(sh, redirs, cname) -- cname: the command (names {v} 
 					C.close(f)
 				end
 			end
-			io.stderr:write("curse: " .. r.fdvar .. ": readonly variable\n")
+			if not noasg then
+				io.stderr:write("curse: " .. r.fdvar .. ": readonly variable\n")
+			end
 			io.stderr:write("curse: " .. r.fdvar .. ": cannot assign fd to variable\n")
 			ok = false
 			break
@@ -2710,7 +2738,13 @@ local function apply_redirs(sh, redirs, cname) -- cname: the command (names {v} 
 					ok = false
 					break
 				end
-				persist[nf] = true
+				-- (shopt varredir_close: closed after the command like a numeric redirect —
+				-- bash's varassign_redir_autoclose undo; `exec`'s discard still keeps it)
+				if sh.shopt.varredir_close then
+					backup(nf)
+				else
+					persist[nf] = true
+				end
 				r = setmetatable({ fd = nf }, { __index = r }) -- shadow r.fd, inherit op/target
 			end
 		end
@@ -2847,7 +2881,19 @@ local function apply_redirs(sh, redirs, cname) -- cname: the command (names {v} 
 				-- an unterminated $( in the body fails the redirection (bash: status 1)
 				local pok, pw = pcall(P.parse_heredoc, body, true)
 				if pok then
-					body = expand_word(sh, pw)
+					-- (a bad substitution names the whole body: bash expands it as one word)
+					sh.bs_word, sh.bs_depth = body, sh.subdepth
+					pok, pw = pcall(expand_word, sh, pw)
+					sh.bs_word = nil
+					if pok then
+						body = pw
+					else
+						xerr(pw)
+						hok, ok = false, false
+					end
+				elseif tostring(pw):find("matching `}'", 1, true) then -- an unterminated `${`:
+					sherr(sh, "curse: " .. body .. ": bad substitution\n") -- (names the body, as above)
+					hok, ok = false, false
 				else
 					-- (bash names it `NAME: command substitution: line N:`, N the line the
 					-- here-document ended on)
@@ -2864,9 +2910,14 @@ local function apply_redirs(sh, redirs, cname) -- cname: the command (names {v} 
 				feed_stdin(r.fd or 0, body)
 			end
 		elseif r.op == "herestring" then
-			local body = expand_word(sh, P.parse_word(r.word or "")) .. "\n"
-			backup(r.fd or 0)
-			feed_stdin(r.fd or 0, body)
+			local eok, body = pcall(expand_word, sh, P.parse_word(r.word or ""))
+			if eok then
+				backup(r.fd or 0)
+				feed_stdin(r.fd or 0, body .. "\n")
+			else
+				xerr(body)
+				ok = false
+			end
 		elseif r.op == "dup" or r.op == "dupin" then
 			-- the `>&`/`<&` target is field-split like a file target: more than one field
 			-- (e.g. `>& "$@"` with several params) is an ambiguous redirect (bash).
@@ -2878,18 +2929,32 @@ local function apply_redirs(sh, redirs, cname) -- cname: the command (names {v} 
 				C.close(r.fd) -- `N>&-` closes fd N
 			else
 				local movesrc = tv:match("^(%d+)%-$") -- `N>&M-`: dup then close the source (move)
-				local m = tonumber(movesrc or tv)
+				-- only an all-digit word is a fd (redir.c: all_digits); one past INT_MAX is
+				-- fd -1 (EBADF), never a wrapped number — anything else (`0x2`, `1.0`) is a file
+				local m = movesrc or (tv:find("^%d+$") and tv)
 				if m then
+					m = rt.fd_number(m)
+				end
+				if m == r.fd then -- `N>&N` / `N<&N-`: nothing to do (redir.c: redir_fd == redirector)
+				elseif m then
 					-- Validate the source fd is open BEFORE backing up the destination: a
 					-- dup-based backup would otherwise reuse a just-closed source fd number,
 					-- making a stale `>&N` spuriously succeed (fd N reopened as the backup).
 					if C.fcntl(m, 1) == -1 then -- F_GETFD on a closed fd returns -1 (EBADF)
 						-- (bash names the target as written: `$v: Bad file descriptor`)
-						io.stderr:write("curse: " .. (r.target or tv) .. ": Bad file descriptor\n")
+						local nm = r.target or tv
+						io.stderr:write("curse: " .. (nm:match("^(%d+)%-$") or nm) .. ": Bad file descriptor\n")
 						ok = false
 					else
+						-- the move's close of the source is undone after the command too (redir.c:
+						-- r_move_* add an undo for redir_fd) — only when the destination was open
+						-- (bash tests fcntl(redirector)); `exec` keeps it closed
+						local undo = movesrc and C.fcntl(r.fd, 1) ~= -1
 						backup(r.fd)
 						C.dup2(m, r.fd)
+						if undo then
+							backup(m)
+						end
 						if movesrc then
 							C.close(m)
 						end
@@ -2916,7 +2981,10 @@ local function apply_redirs(sh, redirs, cname) -- cname: the command (names {v} 
 				elseif r.op == "dup" and tv ~= "" then -- `>&word` (non-number): open the file for
 					backup(r.fd)
 					backup(2)
-					local f = rt.ropen(tv, sh.opt_C and 705 or 577, 438) -- both stdout AND stderr
+					local f = open_out(sh, tv, 438) -- both stdout AND stderr (noclobber: `&>`'s rule)
+					if f < 0 then
+						rt.open_fail(sh, tv)
+					end
 					if f >= 0 then
 						C.dup2(f, r.fd)
 						C.dup2(f, 2)
@@ -2926,6 +2994,9 @@ local function apply_redirs(sh, redirs, cname) -- cname: the command (names {v} 
 					end
 				end
 			end
+		end
+		if not ok then -- (do_redirections stops at the first failure)
+			break
 		end
 	end
 	return save, ok
@@ -2939,10 +3010,7 @@ local function redirs_touch_stdout(rd)
 			and (
 				r.op == "outboth"
 				or r.op == "appboth"
-				or (
-					r.fd == 1
-					and (r.op == "out" or r.op == "app" or r.op == "clobber" or r.op == "dup" or r.op == "rw")
-				)
+				or r.fd == 1 -- (any op: `1<&-` / `1<f` move fd 1 as surely as `>`)
 			)
 		then
 			return true
@@ -5894,7 +5962,7 @@ exec_stmt = function(sh, st, hook)
 					sh.out = savedout
 					restore_redirs(save)
 					if pok and sh.write_err then
-						sh.status = 1
+						rt.chkwrite_late(sh, args[1])
 					end -- builtin hit a write error
 					if not pok then
 						error(err)
@@ -5903,7 +5971,7 @@ exec_stmt = function(sh, st, hook)
 			else
 				exec_simple(sh, args, hook)
 				if sh.write_err then
-					sh.status = 1
+					rt.chkwrite_late(sh, args[1])
 				end -- builtin hit a write error (e.g. full disk)
 			end
 		end
