@@ -5025,7 +5025,7 @@ simple_compiled = function(cx, st, after)
 			cx.blocks[p] = d
 				.. ("local __pv = { %s }; "):format(table.concat(pvals, ", "))
 				.. builder
-				.. ("; rt.run_prefix(sh, { %s }, __pv, function() %s end); "):format(
+				.. ("; rt.run_prefix(sh, { %s }, __pv, function() %s end, __a); "):format(
 					table.concat(pnames, ", "),
 					dispatch
 				)

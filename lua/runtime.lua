@@ -10542,7 +10542,27 @@ end
 -- `local` in a called function absorbs only its own frame's tempenv; a consumed entry is
 -- skipped on restore. Values are evaluated by the caller BEFORE this runs (in the
 -- pre-command environment — bash and interp agree a sibling prefix is NOT visible).
-function M.run_prefix(sh, names, vals, runfn)
+-- Does a builtin's own write to a prefix-assigned variable outlive the command? In bash
+-- (execute_builtin) the tempenv of source/eval/unset/mapfile/fc/read is a scope of its own,
+-- dropped afterwards; any other builtin's bind_variable reaches the variable beneath, so
+-- `x=2 printf -v x 9` leaves x=9 (getopts, let too). declare/local/typeset absorb theirs.
+do
+	local SCOPED = { source = true, ["."] = true, eval = true, unset = true, mapfile = true,
+		readarray = true, fc = true, read = true, declare = true, typeset = true, ["local"] = true }
+	function M.prefix_keeps(sh, argv)
+		local k, cmd = 1, argv and argv[1]
+		while (cmd == "command" or cmd == "builtin") and argv[k + 1] do
+			k = k + 1
+			cmd = argv[k]
+			if cmd:sub(1, 1) == "-" then
+				return false
+			end
+		end
+		return cmd ~= nil and not SCOPED[cmd] and not sh.functions[cmd]
+			and require("interp")._int.BUILTINS[cmd] ~= nil
+	end
+end
+function M.run_prefix(sh, names, vals, runfn, argv)
 	local base = #sh.tenv
 	for i = 1, #names do
 		local name = names[i]
@@ -10569,6 +10589,7 @@ function M.run_prefix(sh, names, vals, runfn)
 		end
 		sh:set_str(name, vals[i])
 		C.setenv(name, sh:get(name), 1)
+		sh.tenv[#sh.tenv].tval = sh:get(name) -- (to see whether the command wrote it: prefix_keeps)
 		local nb = sh.vars[sh:deref(name)] -- (in the environment: `declare -p` shows -x)
 		if nb then
 			nb.exported = true
@@ -10578,15 +10599,20 @@ function M.run_prefix(sh, names, vals, runfn)
 	local ok, err = pcall(runfn)
 	sh.tenv_call_base = nil
 	local relocale = false
+	local keeps = argv and M.prefix_keeps(sh, argv)
 	for k = #sh.tenv, base + 1, -1 do
 		local s = sh.tenv[k]
 		sh.tenv[k] = nil
 		if not s.consumed then -- an `unset` inside the command already revealed it
+			local nv = keeps and sh:get(s.name)
 			sh.vars[s.name] = s.box or nil
 			if s.env then
 				C.setenv(s.name, s.env, 1)
 			else
 				C.unsetenv(s.name)
+			end
+			if nv and nv ~= s.tval then -- (the builtin's write reached the variable beneath)
+				sh:set_str(s.name, nv)
 			end
 			relocale = relocale or LOCALE_VARS[s.name] ~= nil
 		end

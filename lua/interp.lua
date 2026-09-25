@@ -6023,6 +6023,7 @@ exec_stmt = function(sh, st, hook)
 						sh.applying_prefix = nil
 						C.setenv(a.name, sh:get(a.name), 1)
 					end
+					sh.tenv[#sh.tenv].tval = sh:get(a.name) -- (did the command write it? prefix_keeps)
 					do -- (a prefix binding is in the environment: `declare -p` shows -x)
 						local nb = sh.vars[sh:deref(a.name)]
 						if nb then
@@ -6039,15 +6040,20 @@ exec_stmt = function(sh, st, hook)
 			tenv_base = nil
 			sh.tenv_call_base = nil
 			local relocale = false
+			local keeps = rt.prefix_keeps(sh, args)
 			for k = #sh.tenv, base + 1, -1 do
 				local s = sh.tenv[k]
 				sh.tenv[k] = nil
 				if not s.consumed then -- an `unset` inside the command already revealed it
+					local nv = keeps and sh:get(s.name)
 					sh.vars[s.name] = s.box or nil
 					if s.env then
 						C.setenv(s.name, s.env, 1)
 					else
 						C.unsetenv(s.name)
+					end
+					if nv and nv ~= s.tval then -- (a builtin's write reached the variable beneath)
+						sh:set_str(s.name, nv)
 					end
 					relocale = relocale or s.name == "LANG" or s.name:sub(1, 3) == "LC_"
 				end
