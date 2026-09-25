@@ -337,57 +337,74 @@ local function scan_sigtrap(node)
 	end
 	return false
 end
--- Can the program turn on xtrace/verbose? (`set -x`/`-v` in any cluster, `set -o xtrace/
--- verbose`, or a non-literal `set` argument that might.)
-local function scan_xtrace(node)
+-- What in the program needs machinery the compiled tier lacks (a reason string), and
+-- can it turn on xtrace (`set -x`, `set -o xtrace`, or a non-literal `set` argument that
+-- might) — the second result: compiled code then carries per-command trace hooks.
+local function scan_xtrace(node, acc)
 	if type(node) ~= "table" then
-		return false
+		return nil
 	end
-	if node.t == "coproc" then -- a coproc is reaped asynchronously (bash's SIGCHLD); only the
-		return true -- interpreter polls for it between commands (rt.coproc_poll)
-	end
-	if node.name == "FUNCNEST" or node.var == "FUNCNEST" then
-		return true -- $FUNCNEST limits call depth: interp's run_function counts it
+	acc = acc or {}
+	if node.name == "FUNCNEST" or node.var == "FUNCNEST" or (node.lit and node.lit:find("FUNCNEST", 1, true)) then
+		acc.funcnest = true -- $FUNCNEST limits call depth: compiled calls count it (fnwrap)
 	end
 	if node.lit == "extdebug" then
-		return true -- extdebug: a DEBUG trap may skip commands (interp's run_debug handles it)
+		acc.extdebug = true -- extdebug: a DEBUG trap may skip the command (rt.debug_x, dbg)
 	end
+	-- (LEXICAL needs — the program's text is read a line at a time by the interpreter's
+	-- reader, which records history, `!`-expands, echoes set -v lines and counts \#: the
+	-- lines then run compiled one by one, tier.lm_exec — acc.lex)
 	if node.lit == "history" or node.lit == "histexpand" or node.lit == "fc" then
-		return true -- command history is recorded (and `!` expanded) by interp's line reader
+		acc.lex = acc.lex or "history" -- command history is recorded (and `!` expanded) by the reader
 	end
 	if node.lit and node.lit:find("\\#", 1, true) then
-		return true -- a prompt's \# (command number) counts interp's top-level commands
+		acc.lex = acc.lex or "prompt \\#" -- a prompt's \# (command number) counts the reader's lines
 	end
-	if node.lit and node.lit:find("BASH_COMMAND", 1, true) then
-		return true -- $BASH_COMMAND (often read in a trap string) tracks interp's statements
+	if (node.lit and node.lit:find("BASH_COMMAND", 1, true)) or node.var == "BASH_COMMAND"
+		or node.name == "BASH_COMMAND" then
+		acc.bcmd = true -- $BASH_COMMAND (often read in a trap string): each command records its text
 	end
 	if node.t == "simple" and node.words and node.words[1] and node.words[1].parts
 		and node.words[1].parts[1] and node.words[1].parts[1].lit == "enable" then
-		return true -- `enable -n` disables builtins the compiled tier calls natively
+		acc.enable = true -- `enable -n` disables builtins: compiled builtin calls check (H.simple)
 	end
 	if node.t == "simple" and node.words and node.words[1] and node.words[1].parts[1]
 		and node.words[1].parts[1].lit == "set"
 	then
 		for j = 2, #node.words do
 			local l = node.words[j].parts[1] and #node.words[j].parts == 1 and node.words[j].parts[1].lit
-			-- (restricted mode too: its checks live only on the interpreter's paths)
-			-- (set -k: interp re-reads NAME=value words anywhere as assignments)
-			if not l or l == "xtrace" or l == "verbose" or l == "restricted" or l == "keyword"
-				or (l:match("^%-%a+$") and l:find("[xvrkH]", 2)) then
-				return true
+			if not l or l == "xtrace" or (l:match("^%-%a+$") and l:find("x", 2, true)) then
+				acc.x = true -- (a non-literal word may be -x)
+			end
+			-- (set -k: a NAME=value word anywhere is an assignment — H.simple compiles both
+			-- readings of a command that has one, picked by sh.opt_k)
+			if not l or l == "keyword" or (l:match("^%-%a+$") and l:find("k", 2, true)) then
+				acc.k = true
+			end
+			-- (restricted mode: the variables it guards turn readonly — assignments take the
+			-- readonly-checking paths; redirections, `/` in command names, cd/exec/`.` refuse
+			-- in the runtime and builtins)
+			if not l or l == "restricted" or (l:match("^%-%a+$") and l:find("r", 2, true)) then
+				acc.r = true
+			end
+			if l and (l == "verbose" or (l:match("^%-%a+$") and l:find("[vH]", 2))) then
+				acc.lex = acc.lex or ("set -" .. (l:match("^%-%a+$") and l:match("[vH]", 2) or "v"))
 			end
 			-- a first non-option word (`set x $i`) or `--` makes the rest positional params
-			if l == "--" or l == "-" or not l:match("^[-+]") then
+			if not l or l == "--" or l == "-" or not l:match("^[-+]") then
 				break
 			end
 		end
 	end
 	for _, v in pairs(node) do
-		if type(v) == "table" and scan_xtrace(v) then
-			return true
+		if type(v) == "table" then
+			local r = scan_xtrace(v, acc)
+			if r then
+				return r
+			end
 		end
 	end
-	return false
+	return nil, acc.x, acc.lex, acc.funcnest, acc.bcmd, acc.enable, acc.k, acc.r, acc.extdebug
 end
 -- functrace (set -T / -o functrace) extends DEBUG into subshells, which compiled
 -- fragments don't hook — keep those programs on the delegated path.
@@ -907,6 +924,45 @@ local function errchk(st) -- the guard statement for `st`, or "" when errexit ne
 	return ERRCHK
 end
 EF.has_debug = false -- program installs a DEBUG trap → fire it before each command
+-- set -x: a program that can turn on xtrace (or runs eval/source, which may) carries a
+-- trace hook per command — `if sh.opt_x then rt.xtrace…` — placed where the interpreter
+-- traces: after the words expand, before the redirections. Every other program: "".
+EF.xtrace = false
+function EF.xln() -- (a PS4 like `+[$LINENO] ` reads the traced command's line — a trap
+	-- handler's commands keep the interrupted one)
+	return EF.cur_line and not EF.trapline and ("sh.cur_line = %d; "):format(EF.cur_line) or ""
+end
+-- (an argv held in a local — `__a` — is false after a contained word-expansion error in a
+-- guarded field_argv: nothing runs, nothing traces)
+function EF.xok(a)
+	return a:match("^[%w_]+$") and (" and " .. a) or ""
+end
+function EF.xt(a) -- the command's full expanded argv (a Lua table expression)
+	return EF.xtrace and ("if sh.opt_x%s then %srt.xtrace(sh, %s) end "):format(EF.xok(a), EF.xln(), a) or ""
+end
+function EF.xtc(name, a) -- the literal command name + its expanded args (argv from word 2)
+	return EF.xtrace and ("if sh.opt_x%s then %srt.xtrace_cmd(sh, %q, %s) end "):format(EF.xok(a), EF.xln(), name, a) or ""
+end
+function EF.xtl(text) -- a trace line (a Lua string expression), as is
+	return EF.xtrace and ("if sh.opt_x then %srt.xtrace_line(sh, %s) end "):format(EF.xln(), text) or ""
+end
+function EF.xtarr(st) -- an array literal traces as written (`+ a=(1 "b c")`)
+	return st.raw and EF.xtl(("%q"):format(st.name .. (st.append and "+=" or "=") .. st.raw)) or ""
+end
+function EF.xta(lhs, v) -- an assignment `lhs` (`x=`, `a[i]+=`) of the expanded value v
+	return EF.xtrace and ("if sh.opt_x then %srt.xtrace_assign(sh, %q, %s) end "):format(EF.xln(), lhs, v) or ""
+end
+EF.trap_loopctl = false -- a trap handler may break/continue → loops check sh.loopctl (flatten_list)
+EF.LC_LOOP = { forc = true, whilec = true, forin = true, select = true }
+EF.has_return = false -- program may set a RETURN trap → compiled calls fire it (fnwrap)
+EF.bash_command = false -- program reads $BASH_COMMAND → each command records its text (dbg)
+EF.extdebug = false -- program may `shopt -s extdebug` → a DEBUG trap can skip a command (dbg)
+EF.dbg_after_of = {} -- (extdebug) statement -> its continuation pc, for the skip
+EF.DBG_SKIP = { simple = true, arithcmd = true, dbracket = true, assign = true, assignlist = true, case = true }
+EF.cur_cfg = "run" -- the CFG being built: `run`, or a function's (a skip resumes in its own)
+EF.keyword = false -- program may `set -k` → a command with a NAME=value word compiles both ways
+EF.enable = false -- program may run `enable -n` → a native builtin call checks it's still enabled
+EF.funcnest = false -- program may set $FUNCNEST → compiled calls check the call depth (fnwrap)
 EF.funcstack = false -- program reads $FUNCNAME → maintain sh.funcstack around calls
 EF.pipestatus = false -- program reads $PIPESTATUS → set it (=(status)) after each simple cmd
 EF.has_trap = false -- program installs any trap → a forked `&`/pipeline child must reset caught signal traps
@@ -921,14 +977,42 @@ local emit_multidef = {} -- names defined by more than one top-level funcdef: a 
 -- wrongly fire without functrace — bash fires DEBUG once at the CALL site, which is a
 -- top-level command). Delegated commands fire DEBUG via interp's exec_stmt, so this is
 -- prepended ONLY to native blocks (exactly one fires).
-local function dbg(st)
+local function dbg(st, head)
+	-- $BASH_COMMAND: the command about to run, as bash prints it (a string here — the
+	-- interpreter records its node); a trap's own commands don't replace it. A compound's
+	-- HEAD reads as its head: `for j in 1 2`, `((k<2))` per for-(( slot, `case w in `.
+	if EF.bash_command then
+		local text = head
+		if not text and st.t == "forin" then
+			local ws = {}
+			for _, w in ipairs(st.words or {}) do
+				if w.src then
+					ws[#ws + 1] = w.src
+				end
+			end
+			text = "for " .. st.name .. " in " .. table.concat(ws, " ")
+		elseif not text and st.t == "case" and st.subject and st.subject.src then
+			text = "case " .. st.subject.src .. " in "
+		end
+		local bc = ("if (sh.in_trap or 0) == 0 then sh.cur_cmd = %q end "):format(text or require("deparse").command_text(st))
+		EF.bash_command = false
+		local d = dbg(st)
+		EF.bash_command = true
+		return bc .. d
+	end
 	-- run_debug scopes by calldepth/in_subprogram (fires inside a function/subshell only
 	-- under functrace); calldepth is tracked in fnwrap when a DEBUG trap is present.
+	-- (shopt -s extdebug: a non-zero DEBUG status SKIPS the command — rt.debug_x raises
+	-- the statement's continuation pc for this CFG's catcher: run_compiled, rt.catch_dbgskip)
+	local skip = EF.has_debug and EF.extdebug and EF.frag_depth == 0 and EF.dbg_after_of[st]
+	if skip then
+		return ("rt.debug_x(sh, %d, %d, %q) "):format(st.line or 0, skip, EF.cur_cfg)
+	end
 	if EF.has_debug then
 		if EF.trapline and not EF.cur_infunc then -- (a handler's commands: the interrupted line)
 			return "I.run_debug(sh, sh.cur_line); "
 		end
-		return ("I.run_debug(sh, %d); "):format(st.line or 0)
+		return ("I.run_debug(sh, %d) "):format(st.line or 0)
 	end
 	return ""
 end
@@ -939,17 +1023,30 @@ end
 -- neither applies. (Inline is disabled when a trap is present, so all calls come here.)
 local function fnwrap(cmd, line, s)
 	local pre, post = "", ""
+	-- a RETURN trap (set now, or one a function may set): it fires as the callee returns,
+	-- in its frame, and `return N` there parks N in sh.fret so the trap sees the $? from
+	-- before it (rt.fn_return); a top-level one is hidden from the callee (rt.debug_enter)
+	if EF.has_return then
+		post = ("; rt.fn_return(sh, %q)"):format(cmd)
+	end
 	if EF.funcstack then
 		pre = ("sh:enterFunc(%q, %d); "):format(cmd, line or 0)
-		post = "; sh:leaveFunc()"
+		post = post .. "; sh:leaveFunc()"
 	end
-	if EF.has_err or EF.has_debug or EF.trap_ret then
+	if EF.has_err or EF.has_debug or EF.trap_ret or EF.has_return or EF.funcnest then
 		pre = pre .. "sh.calldepth = sh.calldepth + 1; "
 		post = post .. "; sh.calldepth = sh.calldepth - 1"
 	end
-	if EF.has_debug or EF.has_err then -- the callee doesn't inherit DEBUG/ERR (rt.debug_enter)
+	if EF.has_debug or EF.has_err or EF.has_return then -- the callee doesn't inherit DEBUG/ERR/RETURN (rt.debug_enter)
 		pre = pre .. ("local __dbg = rt.debug_enter(sh, %q); "):format(cmd)
 		post = post .. "; rt.debug_leave(sh, __dbg)"
+	end
+	if EF.trap_loopctl then -- (a function starts outside any loop: bash's loop_level)
+		pre = "local __ld, __lc = sh.loopdepth, sh.lc_depth; sh.loopdepth, sh.lc_depth = 0, 0; " .. pre
+		post = post .. "; sh.loopdepth, sh.lc_depth = __ld, __lc"
+	end
+	if EF.funcnest then -- (past $FUNCNEST nested calls the call fails: status 1)
+		return ("if sh.vars.FUNCNEST and rt.funcnest_over(sh, %q) then sh.status = 1 else %s%s%s end"):format(cmd, pre, s, post)
 	end
 	return pre .. s .. post
 end
@@ -1561,7 +1658,9 @@ local function emit_fragment(stmts, neg, liftset, cfraise)
 	-- ($(…)/pipeline/background) pass nil: they keep every var in sh (forked children own
 	-- their copy; a lifted local would neither see nor sync the caller's real sh var).
 	EF.frag_topcode = not EF.cur_infunc -- (read, and cleared, by this build_cfg)
+	EF.frag_depth = EF.frag_depth + 1 -- (a function's `return` in here isn't the call's: EF.retset)
 	local bok, cfg = pcall(build_cfg, stmts, liftset or {}, emit_frag_ctx.funcflags, inlfns, false)
+	EF.frag_depth = EF.frag_depth - 1
 	EF.frag_topcode = nil
 	emit_toplevel, emit_neg_ctx, EF.cur_line = saved_tl, saved_neg, saved_line
 	EF.cf_raise, EF.cf_flush = saved_cf, saved_cff
@@ -1693,8 +1792,8 @@ local function compile_cmdsub(...)
 	return unpack(r)
 end
 function compile_cmdsub_inner(src, backtick, lifted, aenv, noalias, posix)
-	local fallback = ("sh:capture_src(%q%s)"):format(src, noalias and ", " .. tostring(backtick or false) .. ", true"
-		or (backtick and ", true" or ""))
+	local fallback = ("sh:capture_src(%q, %s, %s, %d)"):format(src, tostring(backtick or false),
+		tostring(noalias or false), EF.cur_cline or EF.cur_line or 0)
 	local pok, ast = pcall(require("parser").parse, src, nil, aenv, noalias, posix, EF.cur_cline or EF.cur_line)
 	if not pok or type(ast) ~= "table" or ast.stmts == nil then
 		return fallback
@@ -1850,6 +1949,50 @@ emit_word = function(w, lifted)
 	return "(" .. table.concat(parts, " .. ") .. ")"
 end
 
+-- An array element's value in ASSIGNMENT context (`a=([k]=$v)`, an assoc's bare word):
+-- emit_word when it can render the word; else the word's value comes from the shared
+-- word expander (rt.assign_elem — one word, no statement), when it reads no lifted var.
+function EF.assign_word_expr(w, lifted)
+	if emitable_word(w) then
+		return emit_word(w, lifted)
+	end
+	local names = {}
+	EF.collect_word(w, names)
+	for n in pairs(names) do
+		if lifted[n] then
+			error("curse-nocompile: ${..} operator on a lifted variable")
+		end
+	end
+	return ("rt.assign_elem(sh, %s[1])"):format(EF.konst({ ser(w) }))
+end
+-- set -x of an arithmetic text ((( )), a for (( )) slot): `+ (( text ))`, the text
+-- expanded like a "…" string first when it holds a $ or ` (bash)
+function EF.xtarith(src, lifted)
+	if not EF.xtrace or not src then
+		return ""
+	end
+	if src:find("[$`]") then
+		local ok, w = pcall(require("parser").parse_heredoc, src, false)
+		if ok and w and emitable_word(w) then
+			return EF.xtl('"(( " .. ' .. emit_word(w, lifted) .. ' .. " ))"')
+		end
+	end
+	return EF.xtl(("%q"):format("(( " .. src .. " ))"))
+end
+-- set -x of a command whose words a fast path evaluates natively (`[ $i -lt 5 ]` as a
+-- loop/if condition): its words, expanded (pure: word_safe)
+function EF.xtwords(words, lifted)
+	if not EF.xtrace then
+		return ""
+	end
+	local a = {}
+	for _, w in ipairs(words) do
+		if not empty_word(w) then
+			a[#a + 1] = emit_word(w, lifted)
+		end
+	end
+	return EF.xt("{" .. table.concat(a, ", ") .. "}")
+end
 -- $_ suffix: after a simple command, $_ = its LAST argument (bash). Only when the
 -- program reads $_ and the last word is a single field (word_safe — re-evaluating it
 -- is side-effect-free; a split/cmdsub last arg is left alone). Empty string for no words.
@@ -1956,7 +2099,8 @@ local function db_operand(w, lifted)
 	end
 	return db_fallback(w, lifted, "rt.db_word")
 end
-local function emit_dbracket_node(node, lifted)
+local emit_dbracket_node -- (the set -x layer over this, below)
+local function emit_dbracket_node0(node, lifted)
 	local k = node.kind
 	if k == "and" or k == "or" then
 		local a = emit_dbracket_node(node.l, lifted)
@@ -2102,6 +2246,63 @@ local function emit_dbracket_node(node, lifted)
 	return nil
 end
 
+-- set -x: each primary traces as it is evaluated, operands expanded (`+ [[ -n x ]]`, a
+-- negated one `+ [[ ! -f y ]]` — not a parenthesized one): rt.xdb1 traces and hands back
+-- the operand; rt.xdb2 traces and parks both operands in rt._xl/_xr for the comparison
+-- the plain renderer then builds over them (no closure). `xn`: directly under a `!`.
+emit_dbracket_node = function(node, lifted, xn)
+	if not EF.xtrace then
+		return emit_dbracket_node0(node, lifted)
+	end
+	local k = node.kind
+	if k == "and" or k == "or" then
+		local a = emit_dbracket_node(node.l, lifted)
+		local b = a and emit_dbracket_node(node.r, lifted)
+		return b and ("(" .. a .. (k == "and" and " and " or " or ") .. b .. ")") or nil
+	elseif k == "not" then
+		local e = node.e
+		local c = emit_dbracket_node(e, lifted, e.kind ~= "and" and e.kind ~= "or" and e.kind ~= "not" and not e.paren)
+		return c and ("(not " .. c .. ")") or nil
+	end
+	local neg = tostring(xn or false)
+	local function val(w) -- (the operand's value, for the trace; as written when unrenderable)
+		return db_operand(w, lifted) or ("%q"):format(w.src or "")
+	end
+	local function raw(e)
+		return { parts = { { raw = e } } }
+	end
+	local function plain(n2)
+		EF.xtrace = false
+		local ok, c = pcall(emit_dbracket_node0, setmetatable(n2, { __index = node }), lifted)
+		EF.xtrace = true
+		if not ok then
+			error(c, 0)
+		end
+		return c
+	end
+	if k == "str" or k == "unary" then
+		if not db_operand(node.word, lifted) then
+			return nil
+		end
+		return plain({ word = raw(("rt.xdb1(sh, %s, %q, %s)"):format(neg, k == "str" and "-n" or node.op, val(node.word))) })
+	elseif k == "binary" then
+		if not db_operand(node.l, lifted) then
+			return emit_dbracket_node0(node, lifted) -- (nil: can't compile — or the arith form)
+		end
+		local l, r = val(node.l), val(node.r)
+		if node.op == "=~" then
+			return plain({ l = raw(("rt.xdb1(sh, %s, nil, %s, %s)"):format(neg, l, r)) })
+		end
+		local n2 = { l = raw("rt._xl") }
+		if not ((node.op == "==" or node.op == "=" or node.op == "!=") and not node.rq) then
+			n2.r = raw("rt._xr") -- (a glob RHS keeps rendering its own pattern)
+		end
+		local c = plain(n2)
+		return c and ("(rt.xdb2(sh, %s, %q, %s, %s) and %s)"):format(neg, node.op, l, r, c) or nil
+	end
+	return emit_dbracket_node0(node, lifted)
+end
+EF.emit_dbracket_node = emit_dbracket_node
 -- Parameter-expansion OPERATORS whose per-value transform is a runtime PRIMITIVE
 -- (Shell:apply_str_op) applied to natively-computed operands: pattern strip
 -- (#/##/%/%%), glob substitute (/,//), and case-fold (^/^^/,/,,). The op is known
@@ -3668,6 +3869,7 @@ local function collect_word(w, set)
 		end
 	end
 end
+EF.collect_word = collect_word -- (EF.assign_word_expr, defined before it)
 -- Every variable a statement list assigns or reads — walking EVERY node shape (&&/||
 -- lists, pipelines, groups, (( )), case bodies, …): a lifted var one of these touches
 -- must stay in sync, so missing one is a wrong answer, not a slow one.
@@ -4641,6 +4843,9 @@ H.assign = function(cx, st, after)
 			cx.blocks[p] = "do " .. d .. "local n_ = sh.ncs; " .. cx.blocks[p]:sub(#d + 1) .. " end"
 		end
 	end
+	-- set -x: `+ name=value` / `+ a[sub]+=value` — the expanded value, the subscript as written
+	local xlhs = (st.index and (st.name .. "[" .. st.index .. "]") or st.name) .. (st.append and "+=" or "=")
+	local xa = EF.xta(xlhs, "v_")
 	if st.index then -- a[i]=v / a[i]+=v (assign_element leaves status unless it fails)
 		local ec = errchk(st)
 		local ecs = ec ~= "" and ("; " .. ec) or ""
@@ -4652,17 +4857,17 @@ H.assign = function(cx, st, after)
 		local kmode, kstr = EF.elem_keyexpr(st, iw, cx.lifted)
 		if kmode == "native" then -- a[i]/a[i+1]/a[3]: native key (reads lifted); assoc uses the raw subscript
 			cx.blocks[p] = d
-				.. ("do local v_ = %s; if sh:is_assoc(%q) then local k_ = %s; %srt.assign_element(sh, %q, %q, k_, v_, %s) else local k_ = %s; %srt.assign_element_i(sh, %q, k_, v_, %s, %q) end end%s; pc = %d"):format(
-					rhsval(), st.name, expw, st0, st.name, st.index, append,
+				.. ("do local v_ = %s; %sif sh:is_assoc(%q) then local k_ = %s; %srt.assign_element(sh, %q, %q, k_, v_, %s) else local k_ = %s; %srt.assign_element_i(sh, %q, k_, v_, %s, %q) end end%s; pc = %d"):format(
+					rhsval(), xa, st.name, expw, st0, st.name, st.index, append,
 					kstr, st0, st.name, append, st.index, ecs, after)
 		elseif kmode == "xexp" then -- a[$i]: arith the natively-expanded (lifted-aware) VALUE
 			cx.blocks[p] = d
-				.. ("do local v_ = %s; local k_ = %s; %srt.assign_element_x(sh, %q, k_, v_, %s) end%s; pc = %d"):format(
-					rhsval(), expw, st0, st.name, append, ecs, after)
+				.. ("do local v_ = %s; local k_ = %s; %s%srt.assign_element_x(sh, %q, k_, v_, %s) end%s; pc = %d"):format(
+					rhsval(), expw, xa, st0, st.name, append, ecs, after)
 		else -- literal non-arith (a[\'3\']) / non-lifted: the raw arith_str path (sh.vars authoritative)
 			cx.blocks[p] = d
-				.. ("do local v_ = %s; local k_ = %s; %srt.assign_element(sh, %q, %q, k_, v_, %s) end%s; pc = %d"):format(
-					rhsval(), expw, st0, st.name, st.index, append, ecs, after)
+				.. ("do local v_ = %s; local k_ = %s; %s%srt.assign_element(sh, %q, %q, k_, v_, %s) end%s; pc = %d"):format(
+					rhsval(), expw, xa, st0, st.name, st.index, append, ecs, after)
 		end
 		wrapcs()
 		return p
@@ -4672,8 +4877,9 @@ H.assign = function(cx, st, after)
 		local ec = errchk(st)
 		local ecs = ec ~= "" and ("; " .. ec) or ""
 		cx.blocks[p] = d
-			.. ("do local v_ = %s; %srt.append_scalar(sh, %q, v_) end%s%s; pc = %d"):format(
+			.. ("do local v_ = %s; %s%srt.append_scalar(sh, %q, v_) end%s%s; pc = %d"):format(
 				rhsval(),
+				xa,
 				st0,
 				st.name,
 				ecs,
@@ -4690,6 +4896,11 @@ H.assign = function(cx, st, after)
 		arith_varread = "rt.arith_read(sh, %q)"
 		local rhs = emit_value(st.arith, cx.lifted)
 		arith_varread = saved
+		if EF.xtrace then -- (the value traces as the decimal the $((…)) expanded to)
+			cx.blocks[p] = d .. ("do local __xv = %s; %s; %s end"):format(rhs, emit_set(st.name, "__xv", cx.lifted),
+				EF.xta(xlhs, "rt.i64_to_str(__xv)")) .. "; sh.status = 0" .. ua .. ("; pc = %d"):format(after)
+			return p
+		end
 		cx.blocks[p] = d .. emit_set(st.name, rhs, cx.lifted) .. "; sh.status = 0" .. ua .. ("; pc = %d"):format(after) -- pure arith (side-effecting delegates): $? = 0
 	elseif cx.lifted[st.name] then
 		-- a lifted RHS is a numeric literal (never a cmdsub), so $? resets to 0 like any
@@ -4697,6 +4908,7 @@ H.assign = function(cx, st, after)
 		local ec = errchk(st)
 		local ecs = ec ~= "" and ("; " .. ec) or ""
 		cx.blocks[p] = d
+			.. EF.xta(xlhs, ("%q"):format(numeric_word(st.rhs)))
 			.. emit_set(st.name, numeric_word(st.rhs) .. "LL", cx.lifted)
 			.. "; sh.status = 0"
 			.. ecs
@@ -4708,8 +4920,9 @@ H.assign = function(cx, st, after)
 		local ec = errchk(st)
 		local ecs = ec ~= "" and ("; " .. ec) or ""
 		cx.blocks[p] = d
-			.. ("do local v_ = %s; %srt.assign_scalar_x(sh, %q, v_) end%s%s; pc = %d"):format(
+			.. ("do local v_ = %s; %s%srt.assign_scalar_x(sh, %q, v_) end%s%s; pc = %d"):format(
 				rhsval(),
+				xa,
 				st0,
 				st.name,
 				ecs,
@@ -4722,7 +4935,12 @@ H.assign = function(cx, st, after)
 		-- only when the RHS has no cmdsub; then errchk fires ERR/errexit (`x=$(false)`).
 		local ec = errchk(st)
 		local ecs = ec ~= "" and ("; " .. ec) or ""
-		cx.blocks[p] = d .. ("sh:set_str(%q, %s)%s%s%s; pc = %d"):format(st.name, rhsval(), hascmd and "" or ("; " .. st0:sub(1, -3)), ecs, ua, after)
+		if EF.xtrace then
+			cx.blocks[p] = d .. ("do local v_ = %s; %ssh:set_str(%q, v_) end%s%s%s; pc = %d"):format(rhsval(), xa, st.name,
+				hascmd and "" or ("; " .. st0:sub(1, -3)), ecs, ua, after)
+		else
+			cx.blocks[p] = d .. ("sh:set_str(%q, %s)%s%s%s; pc = %d"):format(st.name, rhsval(), hascmd and "" or ("; " .. st0:sub(1, -3)), ecs, ua, after)
+		end
 	end
 	wrapcs()
 	return p
@@ -4789,8 +5007,9 @@ H.funcdef = function(cx, st, after)
 			return cx.delegate(st, after)
 		end
 		local p = cx.newpc()
-		cx.blocks[p] = ("rt.def_function(sh, %s[1], %s); pc = %d"):format(
-			EF.konst({ ser(st) }), EF.upv_wrapped(("__CS[%d]"):format(id)), after)
+		local k = EF.konst({ ser(st) })
+		cx.blocks[p] = ("rt.def_function(sh, %s[1], %s); %spc = %d"):format(
+			k, EF.upv_wrapped(("__CS[%d]"):format(id)), EF.fnmode(st.name, k .. "[1]"), after)
 		return p
 	end
 	local p = cx.newpc()
@@ -4801,8 +5020,9 @@ H.funcdef = function(cx, st, after)
 		cx.blocks[p] = (st.name:match("^[%a_][%w_]*$") and "" -- (posix: a non-identifier name is fatal)
 			or ("if sh.opt_posix and not sh.opt_i then rt.err_at(sh, %s, %q); error({ __curse_exit = 2 }) end; ")
 				:format(st.top and tostring(st.eline) or "nil", "curse: `" .. st.name .. "': not a valid identifier\n"))
-			.. ("if sh.fn_ro and sh.fn_ro[%q] then rt.err_at(sh, %s, %q); sh.status = 1 else sh.functions[%q] = rt.mark_compiled(%s, %s) end; pc = %d"):format(
-			st.name, st.top and tostring(st.eline) or "nil", "curse: " .. st.name .. ": readonly function\n", st.name, EF.upv_wrapped(fnlname(st.name)), fnlname(st.name), after)
+			.. ("if sh.fn_ro and sh.fn_ro[%q] then rt.err_at(sh, %s, %q); sh.status = 1 else sh.functions[%q] = rt.mark_compiled(%s, %s); %s end; pc = %d"):format(
+			st.name, st.top and tostring(st.eline) or "nil", "curse: " .. st.name .. ": readonly function\n", st.name, EF.upv_wrapped(fnlname(st.name)), fnlname(st.name),
+			EF.fnmode(st.name, EF.fragment and (EF.konst({ ser(st) }) .. "[1]")), after)
 	end
 	return p
 end
@@ -4950,6 +5170,17 @@ EF.simple_native = function(cx, st, after, cmd)
 		end
 	elseif isexec and st.redirs then
 		spec[#spec + 1] = "eredirs=" .. ser(st.redirs)
+	elseif st.redirs and #st.redirs > 0 and EF.xtrace and st.arrayargs and not bind then
+		-- (set -x: a declaration's NAME=(…) literals trace once expanded, which the runner
+		-- does — so it applies the redirections itself, after the trace: rf)
+		local rc = cx.redir_conds(st, cmd)
+		if not rc then
+			return nil
+		end
+		rf = ("function(__rs) return %s end"):format(rc)
+		if require("interp")._int.redirs_touch_stdout(st.redirs) then
+			spec[#spec + 1] = "so=true"
+		end
 	elseif st.redirs and #st.redirs > 0 then
 		redir = cx.redir_conds(st, cmd)
 		if not redir then
@@ -4959,8 +5190,15 @@ EF.simple_native = function(cx, st, after, cmd)
 			spec[#spec + 1] = "so=true"
 		end
 	end
+	-- set -x: a command with no prefix assignment traces here, before its redirections
+	-- (the runner traces one with them, after they're bound)
+	local xt = ""
+	if EF.xtrace and not bind and not st.arrayargs then
+		spec[#spec + 1] = "xt=true"
+		xt = " " .. EF.xt("__a")
+	end
 	return cx.delegate(st, after, {
-		prelude = table.concat(out, "; "),
+		prelude = table.concat(out, "; ") .. xt,
 		callee = "rt.simple_run",
 		callargs = ("sh, __a, %s, %s, __noop, __n0, %s%s"):format(EF.konst(spec), bind or "nil", rf or "nil",
 			anyps and ", __pm1, __pm2" or ""),
@@ -4969,6 +5207,47 @@ EF.simple_native = function(cx, st, after, cmd)
 end
 local simple_compiled
 H.simple = function(cx, st, after)
+	-- set -k (keyword): an assignment-shaped word anywhere is an assignment for the command
+	-- (interp's exec_stmt): compile that reading too, and pick by sh.opt_k at run time
+	if EF.keyword and st.words and not st._kw then
+		local keep, extra = {}, nil
+		for _, w in ipairs(st.words) do
+			local p1 = w.parts and w.parts[1]
+			local a
+			if p1 and p1.lit and not p1.q and w.src and p1.lit:match("^[%a_][%w_]*%+?=") then
+				local ok, pa = pcall(function()
+					return require("parser").parse(w.src).stmts[1]
+				end)
+				a = ok and pa and pa.t == "assign" and pa or nil
+			end
+			if a then
+				extra = extra or {}
+				extra[#extra + 1] = a
+			else
+				keep[#keep + 1] = w
+			end
+		end
+		if extra then
+			local st1, st2 = { _kw = true }, { _kw = true }
+			for k2, v in pairs(st) do
+				st1[k2], st2[k2] = v, v
+			end
+			st1._kw, st2._kw = true, true
+			local as = {}
+			for _, a in ipairs(st.assigns or {}) do
+				as[#as + 1] = a
+			end
+			for _, a in ipairs(extra) do
+				as[#as + 1] = a
+			end
+			st2.words, st2.assigns = keep, as
+			local pk = #keep > 0 and H.simple(cx, st2, after) or cx.delegate(st2, after)
+			local pn = H.simple(cx, st1, after)
+			local g = cx.newpc()
+			cx.blocks[g] = ("if sh.opt_k then pc = %d else pc = %d end"):format(pk, pn)
+			return g
+		end
+	end
 	-- a command that creates <(…)/>(…): mark before it, drain (close the shell's pipe ends,
 	-- reap the children) after it — interp's procsub_mark/drain_procsub around exec_simple
 	if not cx.ps_guarded[st] and cx.has_procsub(st) then
@@ -5009,6 +5288,24 @@ H.simple = function(cx, st, after)
 	else
 		p = simple_compiled(cx, st, after)
 	end
+	-- A FRAGMENT (eval/source/trap code, a script line in line mode) can't see the functions
+	-- defined outside it: one shadowing a builtin (`true() {…}`, `echo() {…}`) must win at run
+	-- time — the argv built natively, dispatched through the command runner (rt.exec_dynamic)
+	-- So must a builtin that `enable -n` may have disabled (then it's looked up on $PATH).
+	if (EF.fragment or EF.enable) and st.words and st.words[1] and not st.assigns then
+		local c1 = #st.words[1].parts == 1 and st.words[1].parts[1].lit
+		if c1 and not st.words[1].parts[1].q and require("interp").BUILTINS[c1] and not EF.FRAG_CF[c1]
+			and not cx.funcflags[c1] and not (cx.inlinefns and cx.inlinefns[c1]) then
+			local dp = EF.dyn_dispatch(cx, st, after)
+			if dp then
+				local g = cx.newpc()
+				local fnchk = (EF.fragment and not EF.has_dyncode) and ("sh.functions[%q] or "):format(c1) or ""
+				cx.blocks[g] = ("if %s(sh.disabled_builtins and sh.disabled_builtins[%q]) then pc = %d else pc = %d end"):format(
+					fnchk, c1, dp, p)
+				p = g -- (an eval/source program's function check still wraps it, below)
+			end
+		end
+	end
 	local w1 = EF.has_dyncode and st.words and st.words[1]
 	local c = w1 and w1.parts and #w1.parts == 1 and w1.parts[1].lit
 	if not c then
@@ -5020,6 +5317,67 @@ H.simple = function(cx, st, after)
 	local g = cx.newpc()
 	cx.blocks[g] = ("if %s then pc = %d else pc = %d end"):format(names_guard({ c }), p, dp)
 	return g
+end
+-- (control-flow builtins: a function can't usefully shadow them from outside a fragment)
+-- where a function body's `return N` puts N: sh.fret when a RETURN trap may see the call
+-- return (fnwrap's rt.fn_return applies it after the trap), else $? directly
+-- A function a FRAGMENT defines is compiled with the hooks of the traps set when the
+-- fragment compiled (tier.trap_mode): record that mode and the definition, so a call under
+-- another trap state recompiles it for that state (interp run_function -> tier.fn_remode).
+-- Any other definition clears a stale record.
+function EF.fnmode(name, defk)
+	if EF.fragment and defk then
+		local m = (EF.has_err and "E" or "") .. (EF.has_debug and (EF.functrace and "T" or "D") or "")
+		return ("rt.fn_mode(sh, %q, %q, %s); "):format(name, m, defk)
+	end
+	return ("if sh.func_mode then sh.func_mode[%q] = nil end; "):format(name)
+end
+function EF.retset(cx, w2)
+	return (w2 and EF.has_return and EF.frag_depth == 0 and #cx.subexit == 0 and not cx.toplevel and not cx.topcode)
+		and "sh.fret" or "sh.status"
+end
+EF.frag_depth = 0
+EF.FRAG_CF = { ["break"] = 1, ["continue"] = 1, ["return"] = 1, ["exit"] = 1 }
+-- A command dispatched by its EXPANDED argv (the first word resolves at run time — a
+-- dynamic `$cmd`, or a builtin name a function may shadow): the words built by the field
+-- engine, run by rt.exec_dynamic (function / builtin / external, as the interpreter's
+-- command runner resolves them) inside delegate's control-flow wrapper; a redirect is
+-- applied around it. nil when a word or redirect can't compile.
+function EF.dyn_dispatch(cx, st, after)
+	local argvbody, argvbody_g = field_argv(st.words, 1, cx.lifted, nil, nil, true)
+	local dyn_redir = nil
+	if argvbody and st.redirs then
+		dyn_redir = cx.redir_conds(st, nil) -- nil => uncompilable redir shape
+	end
+	if not argvbody or (st.redirs and not dyn_redir) then
+		return nil
+	end
+	-- hadcs (compile-time): a word contains a command sub, so an empty argv keeps its status.
+	-- One only nested in a ${…} (`${u:-$(exit 5)}`) may not run: count at runtime (sh.ncs).
+	local hadcs, dyncs = false, false
+	for _, w in ipairs(st.words) do
+		for _, pp in ipairs(w.parts) do
+			if pp.cmdsub then
+				hadcs = true
+				break
+			end
+		end
+		if hadcs then
+			break
+		end
+		dyncs = dyncs or (w.src and (w.src:find("$(", 1, true) or w.src:find("`", 1, true))) and true
+	end
+	return cx.delegate(
+		st,
+		after,
+		{
+			prelude = (not hadcs and dyncs) and ("sh.ncs0 = sh.ncs; " .. argvbody) or argvbody,
+			guard = argvbody_g,
+			callee = "rt.exec_dynamic",
+			callargs = ("sh, __a, __noop, %s"):format((not hadcs and dyncs) and "sh.ncs ~= sh.ncs0" or tostring(hadcs)),
+			redir = dyn_redir and cx.redir_ext(nil, dyn_redir),
+		}
+	)
 end
 simple_compiled = function(cx, st, after)
 	local t = st.t
@@ -5092,19 +5450,19 @@ simple_compiled = function(cx, st, after)
 				if e.key ~= nil then
 					local fl = unq_full_lit(e.word)
 					local valx = (fl and fl:find("~", 1, true)) and ("rt.tilde_assign(sh, %q)"):format(fl)
-						or emit_word(e.word, cx.lifted)
+						or EF.assign_word_expr(e.word, cx.lifted)
 					parts[#parts + 1] = ("__it[#__it+1] = {key=%q, op=%q, val=%s, decl=true}"):format(EF.static_key(e.key), e.op, valx)
 				elseif not empty_word(e.word) then
 					-- an assoc's key/value words don't split or glob (see H.arrayassign)
 					if isassoc then
-						parts[#parts + 1] = ("__it[#__it+1] = {val=%s, decl=true}"):format(emit_word(e.word, cx.lifted))
+						parts[#parts + 1] = ("__it[#__it+1] = {val=%s, decl=true}"):format(EF.assign_word_expr(e.word, cx.lifted))
 					else
 						if not parts.asq then -- (asked once per statement)
 							parts.asq = true
 							parts[#parts + 1] = ("local __as = sh:is_assoc(%q)"):format(a1.name)
 						end
 						parts[#parts + 1] = ("if __as then __it[#__it+1] = {val=%s, decl=true} else %s end"):format(
-							emit_word(e.word, cx.lifted),
+							EF.assign_word_expr(e.word, cx.lifted),
 							emit_fields_into("__it", e.word, cx.lifted, "{val=%s}")
 						)
 					end
@@ -5132,6 +5490,14 @@ simple_compiled = function(cx, st, after)
 				-- (the values are expanded BEFORE localizing: `local -a arr=("${arr[@]}")`)
 				.. table.concat(parts, "; ")
 				.. "; "
+				.. (EF.xtrace and ("if sh.opt_x then %srt.xtrace_declarr(sh, %q, __it, %q) end "):format(EF.xln(), a1.name,
+					(function()
+						local fw = { cmd }
+						for j = 2, #st.words do
+							fw[#fw + 1] = full_lit(st.words[j])
+						end
+						return table.concat(fw, " ") .. " " .. a1.name
+					end)()) or "")
 				.. pre -- (empty, or ends in "; ")
 				.. ("rt.arrayassign(sh, %q, __it, %s)"):format(
 					a1.name,
@@ -5210,7 +5576,7 @@ simple_compiled = function(cx, st, after)
 			end
 			if qbody and not (st.redirs and not q_redir) then
 				return cx.delegate(st, after, {
-					prelude = qbody,
+					prelude = qbody .. " " .. EF.xt("__a"),
 					guard = qbody_g,
 					callee = "rt.command_query",
 					callargs = "sh, __a",
@@ -5242,7 +5608,7 @@ simple_compiled = function(cx, st, after)
 					st,
 					after,
 					{
-						prelude = argvbody,
+						prelude = argvbody .. " " .. EF.xtc("command", "__a"),
 						guard = argvbody_g,
 						callee = "rt.exec_dynamic",
 						callargs = ("sh, __a, __noop, %s, true"):format(tostring(hadcs)),
@@ -5301,7 +5667,7 @@ simple_compiled = function(cx, st, after)
 		end
 		if argvbody and not (st.redirs and not ev_redir) then
 			return cx.delegate(st, after, {
-				prelude = argvbody,
+				prelude = argvbody .. " " .. EF.xt("__a"),
 				guard = argvbody_g,
 				callee = "rt.eval",
 				callargs = "sh, __a",
@@ -5320,7 +5686,7 @@ simple_compiled = function(cx, st, after)
 		end
 		if argvbody and not (st.redirs and not sr_redir) then
 			return cx.delegate(st, after, {
-				prelude = argvbody,
+				prelude = argvbody .. " " .. EF.xt("__a"),
 				guard = argvbody_g,
 				callee = "rt.source",
 				callargs = st.line and ("sh, __a, %d"):format(st.line) or "sh, __a", -- (its line: BASH_LINENO)
@@ -5402,7 +5768,7 @@ simple_compiled = function(cx, st, after)
 			-- goes to the old fd 1 and later builtins write straight to the new one)
 			local co = require("interp")._int.redirs_touch_stdout(st.redirs)
 				and "local __co = rt.CO_OUTS[sh.out]; if __co then rt.flush_stage_out(sh) end; " or "local __co; "
-			cx.blocks[p] = dbg(st)
+			cx.blocks[p] = dbg(st) .. EF.xtl('"exec"')
 				.. ("do rt.iso_save_fds(sh); %slocal __rs = {}; if %s then sh.status = 0; rt.redir_discard(__rs); if __co then sh.out = io.write end else sh.status = 1; rt.redir_restore(__rs) end; if sh.coprocs then rt.coproc_fdcheck(sh) end; if sh.status ~= 0 and sh.opt_posix and not sh.opt_i then error({ __curse_exit = 1 }) end end; pc = %d"):format(co, re, after)
 			return p
 		end
@@ -5620,7 +5986,7 @@ simple_compiled = function(cx, st, after)
 			local d = dbg(st)
 			local lastarg = "if #__a > 0 then sh:set_str('_', __a[#__a]) end"
 			cx.blocks[p] = d
-				.. ("local __a = { %s }; rt.builtin(sh, __a, __noop); "):format(table.concat(items, ", "))
+				.. ("local __a = { %s }; %srt.builtin(sh, __a, __noop); "):format(table.concat(items, ", "), EF.xt("__a"))
 				.. lastarg
 				.. ecs
 				.. ("; pc = %d"):format(after)
@@ -5710,10 +6076,18 @@ simple_compiled = function(cx, st, after)
 			end
 			-- __pv (prefix values) FIRST, then __a (argv) — both in the pre-prefix env,
 			-- in bash's left-to-right order — then apply + run + restore via rt.run_prefix.
+			local xpv = ""
+			if EF.xtrace then
+				for i, a in ipairs(st.assigns) do
+					xpv = xpv .. EF.xta(a.name .. "=", ("__pv[%d]"):format(i))
+				end
+				xpv = xpv .. EF.xt("__a")
+			end
 			cx.blocks[p] = d
 				.. ("local __pv = { %s }; "):format(table.concat(pvals, ", "))
 				.. builder
 				.. (bg and "; if __a then " or "; ") -- (LuaJIT: no empty `then;`)
+				.. xpv
 				.. ("%s; "):format(dispatch)
 				.. lastarg
 				.. ecs
@@ -5761,8 +6135,9 @@ simple_compiled = function(cx, st, after)
 				-- status 1, like bash's sh_chkwrite.
 				cx.blocks[p] = d
 					.. builder
-					.. ("; %sdo local __rs = {}; if %s then sh.write_err = nil; %s; io.flush() else sh.status = 1 end; rt.redir_restore(__rs); if sh.write_err then rt.chkwrite_late(sh, __a[1]) end end; %s%s%s; pc = %d"):format(
+					.. ("; %s%sdo local __rs = {}; if %s then sh.write_err = nil; %s; io.flush() else sh.status = 1 end; rt.redir_restore(__rs); if sh.write_err then rt.chkwrite_late(sh, __a[1]) end end; %s%s%s; pc = %d"):format(
 						bg and "if __a then " or "",
+						EF.xt("__a"),
 						redir_apply,
 						bcall,
 						lastarg,
@@ -5773,7 +6148,7 @@ simple_compiled = function(cx, st, after)
 			else
 				cx.blocks[p] = d
 					.. builder
-					.. ("; %s%s; "):format(bg and "if __a then " or "", bcall)
+					.. ("; %s%s%s; "):format(bg and "if __a then " or "", EF.xt("__a"), bcall)
 					.. lastarg
 					.. ecs
 					.. (bg and " end" or "")
@@ -5872,14 +6247,17 @@ simple_compiled = function(cx, st, after)
 			local ps = EF.pipestatus and '; sh:array_assign("PIPESTATUS", {tostring(sh.status)}, false)' or ""
 			-- $_ = the last argument (the command name when there are none), after the call
 			ps = ("; sh:set_str('_', #__a > 0 and __a[#__a] or %q)"):format(cmd or "") .. ps
+			-- (set -x: argv from word 2 traces with the command name before it)
+			local xtr = (from == 2 and not prefix) and EF.xtc(cmd, "__a") or EF.xt("__a")
 			if redir_apply then
 				-- bash order: expand the words (side-effecting cmdsubs run) BEFORE the
 				-- redirects are applied, so `cmd $(read f) > f` reads f before it's
 				-- truncated. Build argv first, then install redirs around the dispatch.
 				cx.blocks[p] = d
 					.. builder
-					.. ("; %sdo local __rs = {}; if %s then %s else sh.status = 1 end; rt.redir_restore(__rs) end%s%s%s; pc = %d"):format(
+					.. ("; %s%sdo local __rs = {}; if %s then %s else sh.status = 1 end; rt.redir_restore(__rs) end%s%s%s; pc = %d"):format(
 						bg and "if __a then " or "",
+						xtr,
 						cx.redir_ext(cmd, redir_apply),
 						call,
 						ps,
@@ -5888,7 +6266,7 @@ simple_compiled = function(cx, st, after)
 						after
 					)
 			else
-				cx.blocks[p] = d .. builder .. "; " .. (bg and "if __a then " or "") .. call .. ps .. ecs
+				cx.blocks[p] = d .. builder .. "; " .. (bg and "if __a then " or "") .. xtr .. call .. ps .. ecs
 					.. (bg and " end" or "") .. ("; pc = %d"):format(after)
 			end
 			return p
@@ -5954,8 +6332,20 @@ simple_compiled = function(cx, st, after)
 			return EF.simple_native(cx, st, after, cmd) or cx.delegate(st, after)
 		end
 		local p = cx.newpc()
+		if EF.xtrace then -- (the expanded words trace first: `+ return 3`)
+			local xa, xn = {}, {}
+			for j = 2, #st.words do
+				xa[#xa + 1] = emit_word(st.words[j], cx.lifted)
+				xn[#xn + 1] = "__x" .. (j - 1)
+			end
+			local n = w2 and ("rt.return_code(sh, %s)"):format(xn[#xn]) or "sh.status"
+			cx.blocks[p] = ("do %s%s" .. EF.retset(cx, w2) .. " = (%s) or 0 end; pc = %d"):format(
+				#xa > 0 and ("local %s = %s; "):format(table.concat(xn, ", "), table.concat(xa, ", ")) or "",
+				EF.xtc("return", "{" .. table.concat(xn, ", ") .. "}"), n, cx.DONE)
+			return p
+		end
 		local n = w2 and ("rt.return_code(sh, %s)"):format(emit_word(w2, cx.lifted)) or "sh.status"
-		cx.blocks[p] = ("sh.status = (%s) or 0; pc = %d"):format(n, cx.DONE)
+		cx.blocks[p] = (EF.retset(cx, w2) .. " = (%s) or 0; pc = %d"):format(n, cx.DONE)
 		return p
 	end
 	if cx.inlinefns and cx.inlinefns[cmd] and not redir_apply then
@@ -5989,7 +6379,15 @@ simple_compiled = function(cx, st, after)
 		cx.blocks[post] = ('sh:set_str("_", %s); pc = %d'):format(us, after)
 		local bodyentry = cx.flatten_list(subst_list(cx.inlinefns[cmd], pb), post)
 		local pre = cx.newpc()
-		cx.blocks[pre] = ("%s = %s; pc = %d"):format(us, emit_word(lastw, cx.lifted), bodyentry)
+		local xpre = ""
+		if EF.xtrace then
+			local xa = {}
+			for j = 2, #pb + 1 do
+				xa[#xa + 1] = pb[j - 1].str
+			end
+			xpre = EF.xtc(cmd, "{" .. table.concat(xa, ", ") .. "}")
+		end
+		cx.blocks[pre] = ("%s%s = %s; pc = %d"):format(xpre, us, emit_word(lastw, cx.lifted), bodyentry)
 		return pre
 	end
 	local p = cx.newpc()
@@ -6002,6 +6400,31 @@ simple_compiled = function(cx, st, after)
 		end
 	end
 	local body, extcmd -- (extcmd: an external — or a function defined at run time)
+	-- set -x: the args expand ONCE into __xa (before any redirect), trace, then the command
+	-- reads them from there
+	-- (few args: plain locals — no table unless tracing is on; many: one table)
+	local xpre, xargs = "", false
+	if EF.xtrace and not as_local then
+		if #args == 0 then
+			xpre = EF.xtc(cmd, "{}")
+		elseif #args <= 16 then
+			local names = {}
+			for i = 1, #args do
+				names[i] = "__x" .. i
+			end
+			local nl = table.concat(names, ", ")
+			xpre = ("local %s = %s; "):format(nl, table.concat(args, ", ")) .. EF.xtc(cmd, "{" .. nl .. "}")
+			for i = 1, #args do
+				args[i] = names[i]
+			end
+		else
+			xpre = ("local __xa = { %s }; "):format(table.concat(args, ", ")) .. EF.xtc(cmd, "__xa")
+			for i = 1, #args do
+				args[i] = ("__xa[%d]"):format(i)
+			end
+		end
+		xargs = true
+	end
 	if cmd == "echo" then
 		body = "sh:echo_cmd(" .. table.concat(args, ", ") .. ")"
 	elseif cmd == ":" or cmd == "true" or cmd == "false" then
@@ -6046,13 +6469,19 @@ simple_compiled = function(cx, st, after)
 			end
 		end
 		if #calls == 0 then
+			xpre = EF.xtl(("%q"):format(cmd))
 			body = "sh.status = 0"
 			if cmd == "local" then -- (a `local` reached outside any function: interp's error)
 				body = "if not rt.local_nofn(sh) then sh.status = 0 end"
 			end
 		else
+			local xl = {}
+			for i = 1, #tmps do
+				xl[i] = "__lv" .. i
+			end
 			body = table.concat(tmps, "; ")
-				.. (cmd == "local" and "; if not rt.local_nofn(sh) then " or "; do ")
+				.. "; " .. EF.xtc(cmd, "{" .. table.concat(xl, ", ") .. "}")
+				.. (cmd == "local" and "if not rt.local_nofn(sh) then " or "do ")
 				.. "local __lok = true; "
 				.. table.concat(calls, "; ")
 				.. "; sh.status = __lok and 0 or 1 end"
@@ -6076,6 +6505,9 @@ simple_compiled = function(cx, st, after)
 			if not empty_word(st.words[j]) then
 				allargs[#allargs + 1] = ("rt.cstr(%s)"):format(emit_word(st.words[j], cx.lifted))
 			end
+		end
+		if xargs then
+			allargs = { allargs[1], unpack(args) }
 		end
 		body = "rt.do_test(sh, {" .. table.concat(allargs, ", ") .. "})"
 	elseif cx.funcflags[cmd] then
@@ -6102,6 +6534,9 @@ simple_compiled = function(cx, st, after)
 			if not empty_word(st.words[j]) then
 				allargs[#allargs + 1] = ("rt.cstr(%s)"):format(emit_word(st.words[j], cx.lifted))
 			end
+		end
+		if xargs then
+			allargs = { allargs[1], unpack(args) }
 		end
 		-- The name wasn't a funcdef at compile time, but source/eval can install one
 		-- into sh.functions before this runs; bash resolves function → builtin →
@@ -6137,7 +6572,7 @@ simple_compiled = function(cx, st, after)
 	-- PIPESTATUS after a simple command is a one-element array of its status (bash);
 	-- set BEFORE errchk so an ERR trap sees it. Gated on the program reading it.
 	local ps = EF.pipestatus and '; sh:array_assign("PIPESTATUS", {tostring(sh.status)}, false)' or ""
-	local d = dbg(st) -- DEBUG fires before the command
+	local d = dbg(st) .. xpre -- DEBUG fires before the command
 	if redir_apply then
 		-- install the redirs (backing up fds), run the command only if they all
 		-- succeeded (else $?=1, bash), then restore the fds — real syscalls, no AST.
@@ -6190,7 +6625,10 @@ end
 -- A `(( expr ))` CONDITION (if/while fast path): set $? like the (( )) command and branch
 -- to `yes` on 0, else `no`. Error-free (all-lifted) arithmetic is a plain native compare.
 -- `keep`: on false leave $? as it was (a while loop's status is its last body command's).
-EF.arith_branch = function(arith, lifted, yes, no, keep)
+EF.arith_branch = function(arith, lifted, yes, no, keep, xsrc)
+	if xsrc and EF.xtrace then -- (set -x: the condition's `(( … ))` traces first)
+		return EF.xtarith(xsrc, lifted) .. EF.arith_branch(arith, lifted, yes, no, keep)
+	end
 	if not arith_can_error(arith, lifted) then
 		return ("if %s then sh.status = 0; pc = %d else %spc = %d end"):format(
 			emit_bool(arith, lifted), yes, keep and "" or "sh.status = 1; ", no)
@@ -6254,7 +6692,7 @@ H.arithcmd = function(cx, st, after)
 	local p = cx.newpc()
 	local ec = errchk(st)
 	local ecs = ec ~= "" and ("; " .. ec) or ""
-	local d = dbg(st) -- DEBUG fires before the (( )) command (bash: DEBUG_FIRE.arithcmd)
+	local d = dbg(st) .. EF.xtarith(st.src, cx.lifted) -- DEBUG fires before the (( )) command (bash: DEBUG_FIRE.arithcmd)
 	sbody = sbody or EF.arith_status(st.expr, cx.lifted) -- the status-setting body (redirect-wrapped below when present)
 	if ac_redir then -- install redirs, run, restore; a failed redirect is $?=1 (bash)
 		sbody = ("do local __rs = {}; if %s then %s else sh.status = 1 end; rt.redir_restore(__rs) end"):format(
@@ -6306,7 +6744,14 @@ H.forc = function(cx, st, after)
 	cx.loopstack[#cx.loopstack + 1] = { brk = after, cont = stepp } -- break exits, continue steps
 	local bodyentry = cx.flatten_list(st.body, stepp)
 	cx.loopstack[#cx.loopstack] = nil
-	local d = dbg(st) -- DEBUG fires at the for(( header for the init, each cond, and each step (bash)
+	-- (with $BASH_COMMAND read, each slot's own DEBUG prefix carries its text: xs)
+	local d = not EF.bash_command and dbg(st) or "" -- DEBUG fires at the for(( header for the init, each cond, and each step (bash)
+	local function xs(slot) -- (set -x: each slot's `(( … ))` as it's evaluated)
+		local sv = st.src and st.src[slot]
+		-- ($BASH_COMMAND reads the slot: its DEBUG prefix, for a program that reads it)
+		local ds = EF.bash_command and dbg(st, "((" .. (sv or "") .. "))") or ""
+		return ds .. (sv and EF.xtarith(sv:match("^%s*(.-)$"), cx.lifted) or "")
+	end
 	-- An init/cond/step that can fail (÷0, a bad value, …) evaluates like the (( )) command
 	-- (EF.arith_status, `((: ` texts) keeping $?; an error ends the loop with status 1 (bash's
 	-- execute_arith_for_command: expok == 0). Error-free arithmetic stays native.
@@ -6318,11 +6763,11 @@ H.forc = function(cx, st, after)
 			code, after, okgo)
 	end
 	if fbslot[3] then
-		cx.blocks[stepp] = d .. slot(3, ("pc = %d"):format(condp))
+		cx.blocks[stepp] = d .. xs(3) .. slot(3, ("pc = %d"):format(condp))
 	elseif st.step and arith_can_error(st.step, cx.lifted) then
-		cx.blocks[stepp] = d .. guarded(st.step, ("pc = %d"):format(condp))
+		cx.blocks[stepp] = d .. xs(3) .. guarded(st.step, ("pc = %d"):format(condp))
 	else
-		cx.blocks[stepp] = d
+		cx.blocks[stepp] = d .. xs(3)
 			.. (st.step and emit_arith_stmt(st.step, cx.lifted) .. "; " or "")
 			.. ("pc = %d"):format(condp)
 	end
@@ -6334,11 +6779,11 @@ H.forc = function(cx, st, after)
 	cx.blocks[bodyp] = ("%s = 1; pc = %d"):format(ran, bodyentry)
 	cx.blocks[exitp] = ("if %s == 0 then sh.status = 0 end; pc = %d"):format(ran, after)
 	if fbslot[2] then
-		cx.blocks[condp] = d .. slot(2, ("if __v ~= 0 then pc = %d else pc = %d end"):format(bodyp, exitp))
+		cx.blocks[condp] = d .. xs(2) .. slot(2, ("if __v ~= 0 then pc = %d else pc = %d end"):format(bodyp, exitp))
 	elseif st.cond and arith_can_error(st.cond, cx.lifted) then
-		cx.blocks[condp] = d .. guarded(st.cond, ("if __as == 0 then pc = %d else pc = %d end"):format(bodyp, exitp))
+		cx.blocks[condp] = d .. xs(2) .. guarded(st.cond, ("if __as == 0 then pc = %d else pc = %d end"):format(bodyp, exitp))
 	else
-		cx.blocks[condp] = d
+		cx.blocks[condp] = d .. xs(2)
 			.. ("if %s then pc = %d else pc = %d end"):format(
 				st.cond and emit_bool(st.cond, cx.lifted) or "true",
 				bodyp,
@@ -6349,11 +6794,11 @@ H.forc = function(cx, st, after)
 	if st.init then
 		local ip = cx.newpc()
 		if fbslot[1] then
-			cx.blocks[ip] = d .. slot(1, ("pc = %d"):format(condp))
+			cx.blocks[ip] = d .. xs(1) .. slot(1, ("pc = %d"):format(condp))
 		elseif arith_can_error(st.init, cx.lifted) then
-			cx.blocks[ip] = d .. guarded(st.init, ("pc = %d"):format(condp))
+			cx.blocks[ip] = d .. xs(1) .. guarded(st.init, ("pc = %d"):format(condp))
 		else
-			cx.blocks[ip] = d .. emit_arith_stmt(st.init, cx.lifted) .. ("; pc = %d"):format(condp)
+			cx.blocks[ip] = d .. xs(1) .. emit_arith_stmt(st.init, cx.lifted) .. ("; pc = %d"):format(condp)
 		end
 		cx.blocks[ep] = ("%s = 0; pc = %d"):format(ran, ip)
 	else
@@ -6394,16 +6839,16 @@ H.whilec = function(cx, st, after)
 		-- DEBUG fires before each evaluation of the condition command (bash)
 		local cst = type(st.cond) == "table" and st.cond[1] or nil
 		local d = cst and dbg(cst) or ""
-		cx.blocks[condp] = d .. EF.arith_branch(arith, cx.lifted, bodyentry, after, true)
-		cx.blocks[firstp] = d .. EF.arith_branch(arith, cx.lifted, bodyentry, exitp, true)
+		cx.blocks[condp] = d .. EF.arith_branch(arith, cx.lifted, bodyentry, after, true, cst and cst.src)
+		cx.blocks[firstp] = d .. EF.arith_branch(arith, cx.lifted, bodyentry, exitp, true, cst and cst.src)
 		return firstp
 	end
 	-- fast path: `while/until [ A -op B ]` with integer operands — a native int64
 	-- compare instead of building an argv table and running do_test each iteration.
 	-- Keeps [ ]'s own $? (0/1) for the body's first command AND the loop's
 	-- last-body exit status (lv), exactly like the command-condition path below.
-	local tarith = test_as_arith(st.cond, cx.lifted)
-	local tvar = not tarith and test_as_varcmp(st.cond, cx.lifted)
+	local tarith = not EF.enable and test_as_arith(st.cond, cx.lifted)
+	local tvar = not tarith and not EF.enable and test_as_varcmp(st.cond, cx.lifted)
 	if tarith or tvar then
 		local lv = cx.newloopvar()
 		local condp = cx.newpc()
@@ -6425,7 +6870,7 @@ H.whilec = function(cx, st, after)
 		else
 			stexpr = ("rt.test_icmp(sh, %s, %q, %s, %q)"):format(tvar.a, tvar.op, tvar.b, tvar.cmd)
 		end
-		cx.blocks[condp] = (cst and dbg(cst) or "") .. ("%s; if sh.status %s 0 then pc = %d else pc = %d end"):format(
+		cx.blocks[condp] = (cst and dbg(cst) or "") .. EF.xtwords(st.cond[1].words, cx.lifted) .. ("%s; if sh.status %s 0 then pc = %d else pc = %d end"):format(
 			stexpr,
 			st.negate and "~=" or "==",
 			bodyentry,
@@ -6573,19 +7018,32 @@ H.forin = function(cx, st, after)
 	-- (a nameref program: rt.for_assign re-points a nameref loop variable, and a failed
 	-- assignment — a bad target — ends the loop with status 1; an attributed program's
 	-- loop variable binds through declare -i/-l/-u)
+	-- (set -x: the header as written, each iteration: `+ for i in 1 2`)
+	local xh = ""
+	if EF.xtrace then
+		local ws = {}
+		for _, w in ipairs(st.words) do
+			if w.src then
+				ws[#ws + 1] = w.src
+			end
+		end
+		xh = EF.xtl(("%q"):format("for " .. st.name .. " in " .. table.concat(ws, " ")))
+	end
 	if EF.has_nameref or EF.has_attr then
-		cx.blocks[advp] = ("%s; fs.idx = fs.idx + 1; if fs.idx > #fs.list then if fs.idx == 1 then sh.status = 0 end; pc = %d elseif not rt.for_assign(sh, %q, fs.list[fs.idx]) then sh.status = 1; pc = %d else %spc = %d end"):format(
+		cx.blocks[advp] = ("%s; fs.idx = fs.idx + 1; if fs.idx > #fs.list then if fs.idx == 1 then sh.status = 0 end; pc = %d else %sif not rt.for_assign(sh, %q, fs.list[fs.idx]) then sh.status = 1; pc = %d else %spc = %d end end"):format(
 			getfs,
 			after,
+			xh,
 			st.name,
 			after,
 			dbg(st),
 			bodyentry
 		)
 	else
-		cx.blocks[advp] = ("%s; fs.idx = fs.idx + 1; if fs.idx > #fs.list then if fs.idx == 1 then sh.status = 0 end; pc = %d else sh:set_str(%q, fs.list[fs.idx]); %spc = %d end"):format(
+		cx.blocks[advp] = ("%s; fs.idx = fs.idx + 1; if fs.idx > #fs.list then if fs.idx == 1 then sh.status = 0 end; pc = %d else %ssh:set_str(%q, fs.list[fs.idx]); %spc = %d end"):format(
 			getfs,
 			after,
+			xh,
 			st.name,
 			dbg(st),
 			bodyentry
@@ -6631,8 +7089,19 @@ H.select = function(cx, st, after)
 			end
 		end
 	end
-	parts[#parts + 1] = ("if #__l == 0 then sh.status = 0; pc = %d else sh.forstate[%d] = __l; rt.select_menu(sh, __l); pc = %d end"):format(
-		after, st.id, advp)
+	-- (set -x: the header as written, once, before the menu)
+	local xh = ""
+	if EF.xtrace then
+		local ws = {}
+		for _, w in ipairs(st.words) do
+			if w.src then
+				ws[#ws + 1] = w.src
+			end
+		end
+		xh = EF.xtl(("%q"):format("select " .. st.name .. " in " .. table.concat(ws, " ")))
+	end
+	parts[#parts + 1] = ("%sif #__l == 0 then sh.status = 0; pc = %d else sh.forstate[%d] = __l; rt.select_menu(sh, __l); pc = %d end"):format(
+		xh, after, st.id, advp)
 	cx.blocks[initp] = table.concat(parts, "; ")
 	cx.blocks[advp] = ("if rt.select_next(sh, sh.forstate[%d], %q) then pc = %d else pc = %d end"):format(
 		st.id, st.name, bodyentry, after)
@@ -6675,14 +7144,14 @@ H["if"] = function(cx, st, after)
 			condentry[i] = bentry[i] -- an `else` clause: its body runs unconditionally
 		else
 			local arith = cond_arith(cl.cond)
-			local tarith = not arith and test_as_arith(cl.cond, cx.lifted) -- `[ A -op B ]`, integer operands
+			local tarith = not arith and not EF.enable and test_as_arith(cl.cond, cx.lifted) -- `[ A -op B ]`, integer operands
 			if arith and not not_compilable(arith) and not arith_side_effect(arith) then
 				local cp = cx.newpc()
-				cx.blocks[cp] = EF.arith_branch(arith, cx.lifted, bentry[i], nxt)
+				cx.blocks[cp] = EF.arith_branch(arith, cx.lifted, bentry[i], nxt, nil, cl.cond[1] and cl.cond[1].src)
 				condentry[i] = cp
 			elseif tarith then -- native int64 compare, and set [ ]'s own $? (0/1)
 				local cp = cx.newpc()
-				cx.blocks[cp] = ("sh.status = (%s) and 0 or 1; if sh.status == 0 then pc = %d else pc = %d end"):format(
+				cx.blocks[cp] = EF.xtwords(cl.cond[1].words, cx.lifted) .. ("sh.status = (%s) and 0 or 1; if sh.status == 0 then pc = %d else pc = %d end"):format(
 					emit_bool(tarith, cx.lifted),
 					bentry[i],
 					nxt
@@ -6845,7 +7314,7 @@ H.pipeline = function(cx, st, after)
 	for i = 1, n do
 		-- a `return` stage at the top level (no function can be running): the interpreter
 		-- reports it (bash: "can only `return' …", status 2) — a stage fragment can't tell
-		if cx.toplevel and not EF.fragment and resolve_cf({ t = "simple", words = st.cmds[i].words or {} }) == "return" then
+		if cx.toplevel and (not EF.fragment or EF.lm) and resolve_cf({ t = "simple", words = st.cmds[i].words or {} }) == "return" then
 			return cx.delegate(st, after)
 		end
 	end
@@ -7012,6 +7481,24 @@ H.background = function(cx, st, after)
 	return p
 end
 
+-- statement handler: coproc — `coproc NAME cmd`: the COMPILED command runs as the
+-- coprocess (rt.coproc_start: the pipes, NAME/NAME_PID/$!, the reap), a background
+-- fragment like `cmd &`'s; a program with a real-signal trap keeps the interpreter's.
+H.coproc = function(cx, st, after)
+	if EF.bg_trap_block or not st.name:match("^[%a_][%w_]*$") then
+		return cx.delegate(st, after) -- (an invalid NAME: interp reports it)
+	end
+	local id = emit_fragment({ st.cmd }, false)
+	if not id then
+		return cx.delegate(st, after)
+	end
+	local p = cx.newpc()
+	cx.blocks[p] = dbg(st) .. lifted_flush(cx.lifted)
+		.. ("rt.coproc_start(sh, %q, __CS[%d], %s, %s); pc = %d"):format(st.name, id,
+			tostring(st.cmd.t == "subshell"), tostring(st.cmd.t == "simple"), after)
+	return p
+end
+
 -- statement handler: arrayassign (split out of flatten_stmt; see H)
 H.arrayassign = function(cx, st, after)
 	local t = st.t
@@ -7042,7 +7529,7 @@ H.arrayassign = function(cx, st, after)
 				-- rt.tilde_assign, like scalar `x=~:~`), else the ordinary word value.
 				local fl = unq_full_lit(e.word)
 				local valx = (fl and fl:find("~", 1, true)) and ("rt.tilde_assign(sh, %q)"):format(fl)
-					or emit_word(e.word, cx.lifted)
+					or EF.assign_word_expr(e.word, cx.lifted)
 				local kw = EF.aa_keyword(e.key)
 				local keyx = kw and emit_word(kw, cx.lifted) or ("%q"):format(EF.static_key(e.key))
 				local item = ("do local __k = %s; __it[#__it+1] = {key=__k, op=%q, val=%s, src=%q, rawkey=%q} end"):format(
@@ -7072,7 +7559,7 @@ H.arrayassign = function(cx, st, after)
 				else
 					asq()
 					parts[#parts + 1] = ("if __as then __it[#__it+1] = {val=%s%s} else %s end"):format(
-						emit_word(e.word, cx.lifted),
+						EF.assign_word_expr(e.word, cx.lifted),
 						srcf,
 						emit_fields_into("__it", e.word, cx.lifted, "{val=%s}")
 					)
@@ -7083,7 +7570,7 @@ H.arrayassign = function(cx, st, after)
 		local ecs = ec ~= "" and ("; " .. ec) or ""
 		-- $?: the last command substitution's status (`a=( $(exit 3) )`), else as arrayassign left it
 		local cs = st.raw and (st.raw:find("$(", 1, true) or st.raw:find("`", 1, true))
-		cx.blocks[p] = dbg(st)
+		cx.blocks[p] = dbg(st) .. EF.xtarr(st)
 			.. (cs and "do local n_ = sh.ncs; " or "do ")
 			.. table.concat(parts, "; ")
 			.. ("; rt.arrayassign_stmt(sh, %q, __it, %s)"):format(st.name, tostring(st.append and true or false))
@@ -7108,7 +7595,7 @@ H.arrayassign = function(cx, st, after)
 	local ecs = ec ~= "" and ("; " .. ec) or ""
 	local pre = #sync > 0 and (table.concat(sync, "; ") .. "; ") or ""
 	local post = #reload > 0 and ("; " .. table.concat(reload, "; ")) or ""
-	cx.blocks[p] = dbg(st)
+	cx.blocks[p] = dbg(st) .. EF.xtarr(st)
 		.. pre
 		.. ("I.run_arrayassign(sh, %s)"):format(ser(st))
 		.. post
@@ -7213,7 +7700,7 @@ H.case = function(cx, st, after)
 		EF.cur_cline = st.cline or st.line
 	end -- clause flattening moved it; restore for $LINENO in the subject
 	local subjp = cx.newpc()
-	cx.blocks[subjp] = dbg(st)
+	cx.blocks[subjp] = dbg(st) .. (st.subject.src and EF.xtl(("%q"):format("case " .. st.subject.src .. " in")) or "")
 		.. ("%s = %s; %spc = %d"):format(
 			sv,
 			subj,
@@ -7272,6 +7759,7 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
 	-- DONE, which in the forked child would return PAST the subshell.
 	cx.subexit = {}
 	cx.bx_guarded = {} -- (statements already given their `set +B` guard)
+	cx.lc_guarded = {} -- (loops already given their loop-depth marks: EF.trap_loopctl)
 	cx.ps_guarded = {} -- (simple commands already given their <()/>() drain)
 	-- Does a simple command create a process substitution — a <(…)/>(…) word, prefix value
 	-- or redirection target? Its pipes are closed and its children reaped after the command.
@@ -7737,6 +8225,9 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
 		if t == "noop" then
 			return after
 		end
+		if EF.extdebug and EF.DBG_SKIP[t] then
+			EF.dbg_after_of[st] = after -- (where a skipped command resumes: dbg)
+		end
 		EF.cur_loopn = #cx.loopstack -- (compile_cmdsub: is this command inside a loop …
 		EF.cur_infunc = not cx.toplevel and not cx.topcode -- … or a function)
 		if st.line then
@@ -7794,13 +8285,19 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
 			end
 			if ok then
 				local p = cx.newpc()
-				local d = dbg(st) -- DEBUG fires before break/continue too (it's a command)
+				local d = dbg(st) .. EF.xtwords(st.words, cx.lifted) -- DEBUG fires before break/continue too (it's a command)
 				if #cx.loopstack == 0 then
-					if ((EF.fragment and cx.toplevel) or (EF.cf_raise and EF.cf_raise.loop)) and #cx.subexit == 0 then
+					if ((EF.fragment and not EF.lm and cx.toplevel) or (EF.cf_raise and EF.cf_raise.loop)) and #cx.subexit == 0 then
 						-- eval/source fragment: break/continue with no enclosing loop IN the fragment
 						-- targets the CALLER's loop -- raise the signal (level) for the enclosing
 						-- delegated cf-wrapper, exactly as interp's break/continue do.
-						cx.blocks[p] = d .. (EF.cf_flush or "") .. ("error({ __curse_%s = %d })"):format(cf_op, lvl)
+						-- (no loop around the caller either — a trap handler run outside any loop, a
+						-- function's: bash says so, status 0, and goes on)
+						cx.blocks[p] = d .. ((EF.fragment and not EF.lm and cx.toplevel)
+							and ("if (sh.loopdepth or 0) == 0 then if not sh.opt_posix then io.stderr:write(%q) end; sh.status = 0; pc = %d else %s end"):format(
+								"curse: " .. cf_op .. ": only meaningful in a `for', `while', or `until' loop\n", after,
+								(EF.cf_flush or "") .. ("error({ __curse_%s = %d })"):format(cf_op, lvl))
+							or ((EF.cf_flush or "") .. ("error({ __curse_%s = %d })"):format(cf_op, lvl)))
 					elseif EF.cs_in_loop and #cx.subexit == 0 then -- (in a `$( … )` inside a loop: ends it)
 						cx.blocks[p] = d .. ("error({ __curse_%s = %d })"):format(cf_op, lvl)
 					else -- outside any loop: bash says so (status 0) and carries on
@@ -7818,7 +8315,7 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
 						-- past its own reach them — raised for the caller's cf-wrapper)
 						cx.blocks[p] = d .. (EF.cf_flush or "") .. ("sh.status = 0; error({ __curse_%s = %d })"):format(
 							cf_op, lvl - #cx.loopstack)
-					elseif EF.fragment and lvl > #cx.loopstack and #cx.subexit == 0 then
+					elseif EF.fragment and not EF.lm and lvl > #cx.loopstack and #cx.subexit == 0 then
 						-- (an eval / hot-loop fragment inside the caller's loops: the levels past
 						-- its own reach them — bash counts across; with none, it clamps)
 						cx.blocks[p] = d .. ("if sh.loopdepth > 0 then %serror({ __curse_%s = %d }) end; sh.status = 0; pc = %d"):format(
@@ -7834,7 +8331,7 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
 			-- continues) — not a program exit. A compiled top level is always the main
 			-- script (source runs through interp), so delegate and let interp diagnose.
 			-- (`var=x return`: a posix-persistent prefix assignment — interp does that too)
-			if (cx.toplevel and not EF.fragment) or (st.assigns and #st.assigns > 0)
+			if (cx.toplevel and (not EF.fragment or EF.lm)) or (st.assigns and #st.assigns > 0)
 				or (EF.cs_active and not EF.cs_in_func and #cx.subexit == 0) then -- ($(return) at top)
 				return cx.delegate(st, after)
 			end
@@ -7846,7 +8343,7 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
 			-- eval/source fragment top level: `return` propagates to the CALLER (a delegated
 			-- eval's cf-wrapper) as a raised signal, like interp; a return inside a compiled
 			-- subshell (subexit) still jumps locally.
-			local frag_return = ((EF.fragment and cx.toplevel) or (EF.cf_raise and EF.cf_raise.func)) and #cx.subexit == 0
+			local frag_return = ((EF.fragment and not EF.lm and cx.toplevel) or (EF.cf_raise and EF.cf_raise.func)) and #cx.subexit == 0
 			-- (raised, `return N` leaves $? as it was — the RETURN trap of the `.` sees that —
 			-- and carries N: return.def sets only return_catch_value)
 			local retjmp = frag_return
@@ -7863,15 +8360,19 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
 				aw = st.words[cf_arg]
 			end
 			if not st.words[cf_arg + 1] then -- at most one status WORD (pre-split)
-				local d = dbg(st) -- DEBUG fires before return too
+				local d = dbg(st) .. EF.xtwords(st.words, cx.lifted) -- DEBUG fires before return too
 				if not aw then -- `return` with no arg → previous status (in a trap: its entry status)
 					local p = cx.newpc()
 					cx.blocks[p] = d .. ps .. "sh.status = rt.return_default(sh); " .. retjmp
 					return p
 				elseif word_safe(aw) then -- one field (literal/quoted): `return ""` → 2, `return 42` → 42
 					local p = cx.newpc()
+					-- (a function's `return N` under a possible RETURN trap: N waits in sh.fret —
+					-- the trap sees the $? from before it; the call's epilogue applies it)
+					local fret = not frag_return and EF.retset(cx, true) == "sh.fret"
 					cx.blocks[p] = d .. ps
-						.. ("sh.status = rt.return_status(sh, %s); "):format(emit_word(aw, cx.lifted)) .. retjmp
+						.. (fret and "sh.fret = rt.return_status(sh, %s); " or "sh.status = rt.return_status(sh, %s); "):format(
+							emit_word(aw, cx.lifted)) .. retjmp
 					return p
 				elseif field_word(aw, cx.lifted) then -- unquoted expansion: split — 0 fields → $?, else 1st field
 					local fw = field_word(aw, cx.lifted)
@@ -7894,7 +8395,7 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
 			local exitp = #cx.subexit > 0 and cx.subexit[#cx.subexit] or nil
 			local aw = st.words[cf_arg]
 			if not st.words[cf_arg + 1] then
-				local d = dbg(st)
+				local d = dbg(st) .. EF.xtwords(st.words, cx.lifted)
 				local statusexpr = aw
 						and word_safe(aw)
 						and ('rt.return_status(sh, %s, "exit")'):format(emit_word(aw, cx.lifted))
@@ -7941,10 +8442,14 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
 					local d = dbg(st)
 					local ec = errchk(st)
 					local ecs = ec ~= "" and ("; " .. ec) or ""
+					local lx = emit_word(st.expr.l, cx.lifted)
+					if EF.xtrace then
+						lx = ("rt.xdb1(sh, false, nil, %s, %s)"):format(lx, emit_word(st.expr.r, cx.lifted))
+					end
 					cx.blocks[p] = d
 						.. db_wrap(
 							('do local __c, __bad = rt.regex_captures(%s, %s, (sh.shopt.nocasematch and true or nil)); if __bad then sh.status = 2 else sh:array_assign("BASH_REMATCH", __c or {}, false); sh.status = __c and 0 or 1 end end'):format(
-								emit_word(st.expr.l, cx.lifted),
+								lx,
 								re
 							)
 						)
@@ -7992,6 +8497,19 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
 				callargs = ("sh, %s%s"):format(ser(st), EF.perr_label and (", %q"):format(EF.perr_label) or ""),
 			})
 		end
+		-- (a trap handler may break/continue: a loop keeps sh.loopdepth — the handler's
+		-- break raises only inside a loop — and sh.lc_depth, which marks that loop compiled:
+		-- the handler then leaves sh.loopctl for the loop's checks, cx.flatten_list)
+		if EF.trap_loopctl and EF.LC_LOOP[t] and not cx.lc_guarded[st] then
+			cx.lc_guarded[st] = true
+			local D = #cx.loopstack
+			local post = cx.newpc()
+			cx.blocks[post] = ("sh.loopdepth, sh.lc_depth = %d, %d; pc = %d"):format(D, D, after)
+			local entry = cx.flatten_stmt(st, post)
+			local pre = cx.newpc()
+			cx.blocks[pre] = ("sh.loopdepth, sh.lc_depth = %d, %d; pc = %d"):format(D + 1, D + 1, entry)
+			return pre
+		end
 		if t == "assign" then
 			return H.assign(cx, st, after)
 		elseif t == "funcdef" then
@@ -8025,6 +8543,8 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
 			return H.arrayassign(cx, st, after)
 		elseif t == "case" then
 			return H.case(cx, st, after)
+		elseif t == "coproc" then
+			return H.coproc(cx, st, after)
 		elseif t == "select" then
 			return H.select(cx, st, after)
 		else
@@ -8035,7 +8555,19 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
 
 	cx.flatten_list = function(list, after)
 		local nextpc = after
+		local lp = EF.trap_loopctl and cx.loopstack[#cx.loopstack]
 		for k = #list, 1, -1 do
+			if lp then -- (after each command in a loop: a trap handler's break/continue lands)
+				if not lp.lch then
+					lp.lch = cx.newpc()
+					-- (the outermost loop of this CFG clamps a higher level, as bash)
+					cx.blocks[lp.lch] = ("local c = sh.loopctl; if c.n > 1 and %s then c.n = c.n - 1; pc = %d elseif c.kind == 'break' then sh.loopctl = nil; pc = %d else sh.loopctl = nil; pc = %d end"):format(
+						tostring(#cx.loopstack > 1), lp.brk, lp.brk, lp.cont)
+				end
+				local chk = cx.newpc()
+				cx.blocks[chk] = ("if sh.loopctl then pc = %d else pc = %d end"):format(lp.lch, nextpc)
+				nextpc = chk
+			end
 			nextpc = cx.flatten_stmt(list[k], nextpc)
 		end
 		return nextpc
@@ -8451,6 +8983,7 @@ function EF.konst(items)
 end
 function M.emit(ast, opts)
 	EF.konsts = {}
+	EF.frag_depth = 0
 	emit_frags, emit_frag_n = {}, 0 -- compiled `$(…)` fragments (cs_N closures) collected during build
 	-- Fragment mode (eval/source, compiled at runtime): the code runs in the CALLER's
 	-- execution context, so a top-level return/break/continue must RAISE its signal for
@@ -8458,29 +8991,52 @@ function M.emit(ast, opts)
 	EF.fragment = opts and opts.fragment or false
 	EF.trapline = opts and opts.trapline or false
 	EF.perr_label = opts and opts.perr_label or nil -- (an eval fragment's syntax errors: `eval: line N:`)
-	-- xtrace/verbose (`set -x`, `set -o xtrace`, `set -v`) trace per command; the compiled
-	-- tier has no trace hooks, so such a program stays in the interpreter (which traces).
-	if scan_xtrace(ast.stmts) then
-		error("curse-nocompile: xtrace")
+	-- Line mode (tier.lm_exec): a fragment that is one logical line of the SCRIPT — its
+	-- parse (aliases, history) was done by the live reader, and its top level is the
+	-- script's own (a break/return there is the script's, not a caller's)
+	EF.lm = opts and opts.lm or false
+	-- a program that can turn on xtrace (`set -x`, `set -o xtrace`, a dynamic `set` word)
+	-- carries per-command trace hooks (`if sh.opt_x then rt.xtrace…`); other machinery the
+	-- compiled tier lacks keeps the program interpreted (the reason names it)
+	local xwhy, xt, xlex, fnest, bcmd, enable, kw, restr, extdbg = scan_xtrace(ast.stmts)
+	EF.extdebug = extdbg or false
+	EF.dbg_after_of = setmetatable({}, { __mode = "k" })
+	EF.cur_cfg = "run"
+	EF.keyword = kw or false
+	EF.bash_command = bcmd or false
+	-- (`enable -n NAME` here, or maybe in eval/source code or around a fragment: a native
+	-- builtin call first checks the name is still a builtin)
+	EF.enable = enable or EF.fragment or scan_dyncode(ast.stmts)
+	if xwhy then
+		error("curse-nocompile: " .. xwhy)
 	end
+	if xlex and not EF.lm then -- (the whole program can't: the tier runs it line by line)
+		error("curse-nocompile: line-mode: " .. xlex)
+	end
+	-- (a fragment — eval/source code, a hot loop — may run under a caller's set -x; so may
+	-- code that runs eval/source, which can turn it on)
+	-- (or the shell started tracing: `bash -x script`, SHELLOPTS=xtrace — opts.xtrace)
+	EF.xtrace = xt or EF.fragment or scan_dyncode(ast.stmts) or (opts and opts.xtrace) or false
 	-- a RETURN trap fires as each function returns (one set during a call, or inherited
-	-- under functrace): interp's run_function does that; compiled calls don't
-	if scan_trap(ast.stmts, { RETURN = 1 }) then
-		error("curse-nocompile: RETURN trap")
-	end
-	if scan_trap_loopctl(ast.stmts) then
-		error("curse-nocompile: break/continue in a trap")
-	end
-	local alias_kind = scan_alias(ast.stmts)
+	-- under functrace): compiled calls run it (fnwrap) when the program may set one —
+	-- itself, or through eval/source code, or (a fragment) around it
+	EF.has_return = EF.fragment or scan_trap(ast.stmts, { RETURN = 1 }) or scan_dyncode(ast.stmts)
+	-- $FUNCNEST (the program's, or one eval/source code or the caller may set): each
+	-- compiled call checks the depth first, as run_function does
+	EF.funcnest = fnest or EF.fragment or scan_dyncode(ast.stmts)
+	-- a trap handler that may break/continue: loops keep their depth and check for it
+	EF.trap_loopctl = EF.lm or (not EF.fragment and scan_trap_loopctl(ast.stmts))
+	-- (in line mode the live reader already expanded this line's aliases)
+	local alias_kind = EF.lm and "none" or scan_alias(ast.stmts)
 	if alias_kind == "dynamic" or (alias_kind == "static" and scan_dyncode(ast.stmts)) then
-		error("curse-nocompile: alias expansion needs line-at-a-time parse")
+		error("curse-nocompile: line-mode: alias expansion")
 	end
 	EF.alias_static = alias_kind == "static"
 	-- A fragment runs in the CALLER's context, where any var may carry an attribute
 	-- (readonly/integer/case/nameref) the fragment's own code can't see, so force the
 	-- attribute- and nameref-aware assign paths (they do the readonly check, int coercion,
 	-- nameref write-through). Otherwise a compiled `eval "x=v"` would skip readonly, etc.
-	EF.has_attr = EF.fragment or scan_attr(ast.stmts) -- gate compiled attribute-aware scalar assign
+	EF.has_attr = EF.fragment or restr or scan_attr(ast.stmts) -- gate compiled attribute-aware scalar assign
 	EF.has_dyncode = scan_dyncode(ast.stmts) -- eval/source present → a $(…) can't assume its body's names are externals
 	EF.ro_names = nil -- (this program's readonly names: computed on first need — func_locals)
 	EF.frag_nameref = EF.fragment and scan_nameref(ast.stmts) -- (the fragment's own text)
@@ -8488,6 +9044,7 @@ function M.emit(ast, opts)
 	-- (a runtime fragment — eval/source/a hot loop — also gets the hooks for the traps set
 	-- in the shell it compiles in: tier.trap_mode keys its cache by that state)
 	local fo = opts or {}
+	EF.functrace = fo.functrace or false
 	EF.has_err = fo.trap_err or scan_trap(ast.stmts, { ERR = 1 }) -- gate compiled ERR-trap firing
 	EF.has_debug = fo.trap_debug or scan_trap(ast.stmts, { DEBUG = 1 }) -- gate compiled DEBUG-trap firing
 	EF.funcstack = reads_debugstack(ast.stmts) -- gate FUNCNAME/BASH_SOURCE/BASH_LINENO stacks
@@ -8495,7 +9052,7 @@ function M.emit(ast, opts)
 	EF.has_trap = scan_any_trap(ast.stmts) -- gate compiled `&`/pipeline (forked child resets signal traps)
 	-- in-process subshell/$(…)/pipeline-stage gate: only a REAL-signal trap (or DEBUG under
 	-- functrace, which reaches into subshells) keeps them forked/delegated
-	EF.inproc_trap_block = EF.has_debug and (fo.functrace or scan_functrace(ast.stmts))
+	EF.inproc_trap_block = EF.has_debug and (fo.functrace or scan_functrace(ast.stmts) or EF.extdebug) -- (extdebug: functrace too)
 	-- (`&` still forks: a real-signal trap must be reset in its child — interp's machinery)
 	EF.bg_trap_block = scan_sigtrap(ast.stmts) or EF.inproc_trap_block
 	local funcflags, inlinable, inlinefns = {}, {}, {}
@@ -8563,6 +9120,13 @@ function M.emit(ast, opts)
 		end
 	end
 	EF.inlinefns = inlinefns -- (inl_sync: a non-spliced call of one of these)
+	-- extdebug keeps BASH_ARGV/BASH_ARGC: every call's parameters make a frame (pushCall)
+	if EF.extdebug then
+		for name, ff in pairs(funcflags) do
+			ff.locals = true
+			inlinable[name], inlinefns[name] = nil, nil
+		end
+	end
 	-- Lift purely-arith vars to native int64. A var touched by no OUT-OF-LINE
 	-- function becomes a run()-LOCAL (register-allocated — fast in hot loops); a
 	-- direct call to an inlinable function is spliced in, so its var access counts
@@ -8710,10 +9274,15 @@ function M.emit(ast, opts)
 			end
 			local sv_fl = EF.fn_locals
 			EF.fn_locals = #fl > 0 and ls or nil
+			EF.cur_cfg = fnlname(st.name)
 			local cfg = build_cfg(st.body, ls, funcflags, inlinefns)
+			EF.cur_cfg = "run"
 			EF.fn_locals = sv_fl
 			fndefs[#fndefs + 1] = assemble(cfg, fnlname(st.name) .. " = function(sh, pc)",
 				{ shname = st.name, fnlocals = fl, fnresume = true })
+			if EF.extdebug and EF.has_debug then -- (a DEBUG-skipped command resumes after itself)
+				fndefs[#fndefs + 1] = ("%s = rt.catch_dbgskip(%s, %q)"):format(fnlname(st.name), fnlname(st.name), fnlname(st.name))
+			end
 			if EF.trap_ret then -- (a trap handler's `return` raised mid-body ends THIS call)
 				fndefs[#fndefs + 1] = ("%s = rt.catch_return(%s)"):format(fnlname(st.name), fnlname(st.name))
 			end
@@ -8769,8 +9338,11 @@ function M.emit(ast, opts)
 	for name in spairs(fncall) do
 		fc[#fc + 1] = ("[%q] = { src = %q, fn = %s }"):format(name, fnsrc[name], EF.upv_wrapped(fnlname(name)))
 	end
-	o[#o + 1] = ("return { run = run, loopPc = loopPc, stmtPc = stmtPc%s%s%s }"):format(
+	o[#o + 1] = ("return { run = run, loopPc = loopPc, stmtPc = stmtPc%s%s%s%s }"):format(
 		EF.alias_static and ", alias_static = true" or "",
+		(EF.xtrace and ", xtrace = true" or "") -- (it traces: runnable under a starting set -x)
+			-- (its hooks: the tier may switch into it while such a trap is set)
+			.. (EF.has_debug and ", has_debug = true" or "") .. (EF.has_return and ", has_return = true" or ""),
 		#fl > 0 and (", fnLoop = { " .. table.concat(fl, ", ") .. " }") or "",
 		#fc > 0 and (", fnCall = { " .. table.concat(fc, ", ") .. " }") or ""
 	)

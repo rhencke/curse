@@ -4597,11 +4597,14 @@ local function run_function(sh, cmd, fn, args, hook, tenv_base)
 		local lim = tonumber(sh:get("FUNCNEST"))
 		if lim and lim > 0 and (sh.calldepth or 0) >= lim then
 			io.stderr:write("curse: " .. cmd .. ": maximum function nesting level exceeded (" .. lim .. ")\n")
-			sh.status = 1
-			return
+			sh.status = 1 -- (bash: jump_to_top_level DISCARD — the rest of the command line goes)
+			error({ __curse_exit = 1, __curse_lineabort = true, __curse_discard = true })
 		end
 	end
 	local savedline = sh.cur_line -- the call-site line: $LINENO is restored to it on return
+	-- (an error out of compiled code called from here skips ITS frames' epilogues: the
+	-- depth, frames and stacks are unwound to these marks below)
+	local cd0, pd0, fs0, ne0 = sh.calldepth, sh.pd, sh.funcstack and #sh.funcstack or 0, sh.noerr
 	sh.calldepth = sh.calldepth + 1 -- OSR gate: no handoff inside a call
 	sh:pushCall(unpack(args, 2))
 	-- Tempenv bindings applied as THIS call's prefix (`x=v func`) belong to this new
@@ -4643,6 +4646,12 @@ local function run_function(sh, cmd, fn, args, hook, tenv_base)
 	if fr and rok == false then
 		sh.status = 1 -- a failed redirect skips the body (bash)
 	elseif type(fn) == "function" then
+		-- (one a fragment defined, compiled for another trap state: its recompile for this one)
+		local fm = sh.func_mode and sh.func_mode[cmd]
+		local f2 = fm and M.fn_remode and M.fn_remode(sh, cmd, fm)
+		if f2 then
+			fn = f2
+		end
 		ok, err = pcall(fn, sh) -- a COMPILED function closure
 	else
 		-- a hot function in a cold run: its compiled version, once the tier has it
@@ -4671,9 +4680,13 @@ local function run_function(sh, cmd, fn, args, hook, tenv_base)
 	-- `return N` sets the function's status but not $? (return.def: only return_catch_value),
 	-- so the RETURN trap sees the status from before it; N is $? once the trap has run
 	local rret
+	if ok and sh.fret then -- (a compiled body's `return N`, parked for the RETURN trap)
+		rret, sh.fret = sh.fret, nil
+	end
 	if not ok and type(err) == "table" and err.__curse_return then
 		rret = err.__curse_return
 		ok, err = true, nil
+		sh.noerr = ne0 -- (a return raised mid-body — a trap's — skips a condition's noerr--)
 	end
 	-- RETURN trap: fires as the function returns, still in ITS context (FUNCNAME, the
 	-- definition's $LINENO), preserving its exit status. A top-level RETURN trap is NOT
@@ -4693,6 +4706,17 @@ local function run_function(sh, cmd, fn, args, hook, tenv_base)
 	end
 	if rret then
 		sh.status = rret
+	end
+	if not ok then
+		while sh.pd > pd0 + 1 do
+			sh:popCall()
+		end
+		while #sh.funcstack > fs0 + 1 do
+			table.remove(sh.funcstack, 1)
+			table.remove(sh.linestack, 1)
+			table.remove(sh.srcstack, 1)
+		end
+		sh.calldepth = cd0 + 1
 	end
 	rt.debug_leave(sh, dbg_saved)
 	table.remove(sh.funcstack, 1)
@@ -4866,55 +4890,9 @@ local SPECIAL_BUILTIN -- forward decl (assigned below); posix dispatch/funcdef r
 -- single-quoting any word that isn't a plain token (bash). PS4's first char is
 -- repeated by call depth. A plain token is bare; anything else is quoted the way
 -- bash quotes it (shell_quote: `$'…'` for control/non-printable, else `'…'`).
-local function xtrace_quote(w)
-	if w == "" then
-		return "''"
-	end
-	if w:match("^[%w_@%%+=:,./%-]+$") then
-		return w
-	end
-	return rt.shell_quote(w)
-end
--- one xtrace line: $PS4 (its first char repeated per call depth) + `text`
-local function xtrace_line(sh, text)
-	local ps4 = sh:get("PS4")
-	if ps4:find("[$`\\]") then -- (PS4 is expanded like a prompt, untraced: `+[$LINENO] `)
-		local sx, st = sh.opt_x, sh.status
-		sh.opt_x = false
-		local ok, v = pcall(M.prompt_string, sh, ps4)
-		sh.opt_x, sh.status = sx, st
-		ps4 = ok and v or ps4
-	end
-	if ps4 == "" then
-		ps4 = "+ "
-	end
-	local lead = ps4:sub(1, 1)
-	local depth = (sh.xdepth or 0) -- nesting of $(…) (not function calls or subshells)
-	local pre = ps4
-	if lead ~= "" and depth > 0 then
-		pre = lead:rep(depth) .. ps4
-	end
-	M.xtrace_write(sh, pre .. text .. "\n")
-end
+local xtrace_quote, xtrace_line, xtrace = rt.xtrace_quote, rt.xtrace_line, rt.xtrace
 M.xtrace_line = xtrace_line
-local function xtrace(sh, args, prequoted)
-	local parts = {}
-	for i = 1, #args do
-		parts[i] = prequoted and args[i] or xtrace_quote(args[i])
-	end
-	xtrace_line(sh, table.concat(parts, " "))
-end
--- xtrace output goes to fd $BASH_XTRACEFD when that's set to an open fd (bash), else stderr
-M.xtrace_write = function(sh, s)
-	local fd = sh.vars.BASH_XTRACEFD and tonumber(sh:get("BASH_XTRACEFD"))
-	if fd and fd ~= 2 and fd >= 0 and fd == math.floor(fd) then
-		io.flush() -- (our buffered stdout first: fd 1 may be the trace fd)
-		if rt.fd_write(fd, s) then
-			return
-		end
-	end
-	io.stderr:write(s)
-end
+M.xtrace_write = rt.xtrace_write
 
 -- bash's describe_command (type.def), for `type` and `command -v/-V`. FL: all, short (the
 -- sentence), reuse (command -v), type (-t), path_only (-p), force (-P), nofunc (-f),
@@ -5302,7 +5280,7 @@ local function eval_dbracket(sh, node)
 		return eval_dbracket(sh, node.l) or eval_dbracket(sh, node.r)
 	end
 	if k == "not" then
-		if sh.opt_x and node.e.kind ~= "and" and node.e.kind ~= "or" and node.e.kind ~= "not" then
+		if sh.opt_x and node.e.kind ~= "and" and node.e.kind ~= "or" and node.e.kind ~= "not" and not node.e.paren then
 			sh.dbneg = true -- (xtrace: a negated test prints as `[[ ! … ]]`)
 		end
 		return not eval_dbracket(sh, node.e)
@@ -5685,7 +5663,7 @@ local function run_debug(sh, line)
 	-- or sourced file acts as a `return` from it (bash)
 	if trap_status ~= 0 and sh.shopt.extdebug then
 		if trap_status == 2 and ((sh.calldepth or 0) > 0 or (sh.sourcedepth or 0) > 0) then
-			error({ __curse_return = sh.status })
+			error({ __curse_return = trap_status }) -- (the function returns 2: bash)
 		end
 		return true
 	end
@@ -5948,7 +5926,11 @@ exec_stmt = function(sh, st, hook)
 			-- like a bad-subst in a command word. Catch it around the RHS expansion.
 			-- (the expanded right-hand side, kept for set -x's `name+=value` trace)
 			sh.x_rhs = nil
+			local xps4 = sh.opt_x and st.name == "PS4" and sh:get("PS4") -- (traced under the old one)
 			local aok, aerr = pcall(assign_body, sh, st, nref_base, nref_sub)
+			if xps4 and aok then
+				sh.xtrace_ps4 = xps4
+			end
 			if not aok then
 				if type(aerr) == "table" and aerr.__curse_badsub then -- (`c[-5]=v`: aborts the line)
 					io.stderr:write("curse: " .. st.name .. "[" .. tostring(st.index) .. "]: bad array subscript\n")
@@ -5970,14 +5952,16 @@ exec_stmt = function(sh, st, hook)
 				.. (sh.x_rhs == "" and "" or xtrace_quote(sh.x_rhs)) }, true)
 		end
 		if sh.opt_x and not st.append then
-			local v
-			if st.index then
+			local v = sh.x_rhs -- (the expanded word, as bash prints it: `n=1+1` for an -i n)
+			if v then
+			elseif st.index then
 				v = sh:get(st.name .. "[" .. st.index .. "]") or ""
 			else
 				v = sh:get(st.name) or ""
 			end
 			xtrace(sh, { (st.index and (st.name .. "[" .. st.index .. "]") or st.name) .. "=" .. (v == "" and "" or xtrace_quote(v)) }, true)
 		end
+		sh.xtrace_ps4 = nil
 		-- set -a (allexport): a plain scalar assignment auto-exports the variable
 		if sh.opt_a and not st.index then
 			local b = sh.vars[sh:deref(st.name)]
@@ -6270,6 +6254,13 @@ exec_stmt = function(sh, st, hook)
 			-- `set -x` trace: BEFORE the command's own redirects, so `cmd 2>file` doesn't
 			-- capture the trace (bash writes it to the shell's stderr).
 			if sh.opt_x and args[1] ~= nil then
+				if st.arrayargs and sh.arrayargs_pre then -- (`+ b=('4' '5 6')` before `+ declare -a b`)
+					for _, aa in ipairs(st.arrayargs) do
+						if sh.arrayargs_pre[aa] then
+							rt.xtrace_arrlit(sh, aa.name, sh.arrayargs_pre[aa])
+						end
+					end
+				end
 				xtrace(sh, args)
 			end
 			-- `exec [redirs] [cmd…]` (b_exec): its redirections PERSIST (not restored) and
@@ -6711,41 +6702,10 @@ exec_stmt = function(sh, st, hook)
 			sh.status = 1
 			return
 		end
-		sh.coprocs = sh.coprocs or {}
-		for opid, cp in pairs(sh.coprocs) do -- (bash: one at a time is supported; warn, go on)
-			io.stderr:write(("curse: warning: execute_coproc: coproc [%d:%s] still exists\n"):format(opid, cp.name))
-		end
-		-- in-process: a background task (Shell:bg_launch) with its stdin/stdout on the pipes
-		local rp, wp = ffi.new("int[2]"), ffi.new("int[2]")
-		rt.pipe_hi(rp)
-		rt.pipe_hi(wp)
-		local r0, r1 = rt.fd_below(rp[0], 64), rt.fd_below(rp[1], 64) -- (bash's numbering: 63 60)
-		local w0, w1 = rt.fd_below(wp[0], 64), rt.fd_below(wp[1], 64)
-		-- F_SETFD FD_CLOEXEC: nothing the shell runs inherits these (a leaked write end keeps the
-		-- coproc from ever seeing EOF). Not the variadic C.fcntl: a Lua number vararg is passed
-		-- as a double, so the flag never arrived.
-		C.curse_co_fcntl3(r0, 2, 1)
-		C.curse_co_fcntl3(w1, 2, 1)
 		local cmd = st.cmd
-		local job = sh:bg_launch(function(ssh)
-			ssh.coprocs = nil -- (an older coproc's ends aren't this one's)
+		rt.coproc_start(sh, st.name, function(ssh)
 			exec_stmt(ssh, cmd, SUBHOOK)
-		end, "coproc " .. st.name, cmd.t == "subshell", cmd.t == "simple", nil, nil,
-			{ fds = { [0] = w0, [1] = r1 } })
-		C.close(r1)
-		C.close(w0)
-		local pid = job and job.pid or 0
-		rt.coproc_setvars(sh, st.name, r0, w1, pid)
-		sh.coprocs[pid] = { name = st.name, r = r0, w = w1, g = job and job.g }
-		if job and job.g then
-			job.g.on_done = function(g)
-				job.done, job.status = true, g.status[1] or 0
-				if sh.coprocs and sh.coprocs[pid] then
-					rt.coproc_dispose(sh, pid)
-				end
-			end
-		end
-		sh.status = 0
+		end, cmd.t == "subshell", cmd.t == "simple")
 	elseif t == "arithcmd" then
 		-- A `(( expr ))` command (standalone or as an if/while condition) is NOT fatal
 		-- on a division-by-zero — it just yields status 1 and execution continues
@@ -7139,7 +7099,8 @@ end
 local trap_seen, trap_seen_n = {}, 0 -- (handler texts run once: the next run compiles)
 -- (an INTERP_FRAMES runner: the compiled handler's error prefixes read sh.cur_line)
 local function run_trap_mod(mod, sh)
-	return require("tier").run_compiled(mod, sh, nil, true)
+	local r = require("tier").run_compiled(mod, sh, nil, true) -- (no tail call: this frame
+	return r -- must stay on the stack for rt.current_line to find)
 end
 rt.INTERP_FRAMES[run_trap_mod] = true
 run_trap = function(sh, code)
@@ -7155,7 +7116,7 @@ run_trap = function(sh, code)
 	local seen = trap_seen[code]
 	local mod
 	M.v_echo(sh, code, nil, {}) -- (set -v: the handler's text as it's read)
-	if seen and not sh.opt_x then -- (xtrace: the compiled tier has no trace hooks yet)
+	if seen then
 		mod = require("tier").try_fragment(code, false, sh, true)
 	else
 		trap_seen_n = trap_seen_n + 1
@@ -7214,6 +7175,12 @@ run_trap = function(sh, code)
 		elseif type(err) == "table" and err.__curse_exit then
 			sh.status = err.__curse_exit
 			exited = true
+		elseif type(err) == "table" and (err.__curse_break or err.__curse_continue)
+			and sh.lc_depth and sh.lc_depth > 0 and sh.loopdepth == sh.lc_depth then
+			-- the interrupted loop is COMPILED: it acts on the break/continue after the
+			-- command that was running (its sh.loopctl checks), as bash's breaking/continuing
+			sh.status = 0
+			sh.loopctl = { kind = err.__curse_break and "break" or "continue", n = err.__curse_break or err.__curse_continue }
 		elseif type(err) == "table" and err.__curse_return then
 			sh.status = err.__curse_return -- `return N` in a trap sets its status
 			if (sh.calldepth or 0) > 0 or (sh.sourcedepth or 0) > 0 then
@@ -7432,6 +7399,15 @@ local function run_group(sh, lg, hook, k)
 		else
 			exec_stmt(sh, lg.perr, hook)
 		end -- raises __curse_exit=2 (bash exits)
+	end
+	-- line mode (a script whose parse depends on run-time state — aliases, history
+	-- expansion, set -v): the reader above hands over one logical line at a time and the
+	-- tier runs it COMPILED (M.lm_exec: false when this line can't compile)
+	if sh.lm and M.lm_exec and #lg.stmts > 0 then
+		local k2 = M.lm_exec(sh, lg, k)
+		if k2 then
+			return k2
+		end
 	end
 	for _, st in ipairs(lg.stmts) do
 		k = k + 1

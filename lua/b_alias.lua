@@ -68,6 +68,7 @@ return function(sh, cmd, args, hook, tcb)
 						ok = false
 					else
 						sh.aliases[nm] = val
+						sh.alias_gen = (sh.alias_gen or 0) + 1 -- (compiled fragments key on the table)
 					end
 				elseif sh.aliases[args[k]] then
 					show(args[k])

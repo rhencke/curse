@@ -132,6 +132,9 @@ return function(sh, cmd, args, hook, tcb)
 					sh:set_str("BASH_COMPAT", tostring(new))
 				else
 					sh.shopt[nm] = set_
+					if nm == "extdebug" then -- (shopt.c shopt_set_debug_mode: function and error
+						sh.opt_functrace, sh.opt_errtrace = set_, set_ -- tracing follow it)
+					end
 				end
 			end
 			sh.status = allok and 0 or 1

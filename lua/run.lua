@@ -446,7 +446,10 @@ else
 		-- path does on the same signal. Any OTHER compile error still propagates.
 		local ok, mod = pcall(T.compile, require("parser").parse(src))
 		if not ok then
-			if type(mod) == "string" and mod:find("curse%-nocompile") then
+			if T.lm_reason(mod) then -- (a line at a time, each line compiled: aliases, history…)
+				T.run_lm(sh, src)
+				pcall(T.flush_stores)
+			elseif type(mod) == "string" and mod:find("curse%-nocompile") then
 				interp.run_lazy(sh, src)
 			else
 				error(mod)

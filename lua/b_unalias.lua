@@ -31,11 +31,13 @@ return function(sh, cmd, args, hook, tcb)
 			return
 		elseif args[2] == "-a" then
 			sh.aliases = {}
+			sh.alias_gen = (sh.alias_gen or 0) + 1 -- (compiled fragments key on the table)
 		else
 			for k = 2, #args do
 				if args[k] ~= "--" then
 					if sh.aliases[args[k]] then
 						sh.aliases[args[k]] = nil
+						sh.alias_gen = (sh.alias_gen or 0) + 1
 					else
 						io.stderr:write("curse: unalias: " .. args[k] .. ": not found\n")
 						ok = false

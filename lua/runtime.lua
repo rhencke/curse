@@ -1515,7 +1515,12 @@ function M.fd_number(s)
 	local n = #d < 11 and (tonumber(d) or 0) or -1
 	return n > 2147483647 and -1 or n
 end
+M.RESTRICTED_OUT = { out = true, clobber = true, app = true, rw = true, outboth = true, appboth = true }
 function M.redir_apply(sh, op, fd, target, saves)
+	if sh.opt_r and M.RESTRICTED_OUT[op] then -- a restricted shell writes no files (interp's apply)
+		io.stderr:write("curse: " .. tostring(target) .. ": restricted: cannot redirect output\n")
+		return false
+	end
 	io.flush() -- flush buffered stdout before moving fds (else it lands in the new target)
 	-- In a pipeline stage, builtins write the redirected fd 1 directly while it's moved (as
 	-- the interpreter does): the stage's buffer would reach it only at restore, too late
@@ -2140,7 +2145,7 @@ local function capture_pure(sh, st)
 	return false -- if/while/for/case/subshell/group/funcdef/background/arithcmd: fork
 end
 
-function Shell:capture_src(src, backtick, noalias)
+function Shell:capture_src(src, backtick, noalias, line0)
 	local P = require("parser")
 	local I = require("interp")
 	-- A SYNTAX error in the body: bash makes `$(…)` fatal to the whole containing
@@ -2148,7 +2153,8 @@ function Shell:capture_src(src, backtick, noalias)
 	-- `echo A``echo "``B` prints "AB" and exits 0). Backticks are parsed lazily at
 	-- expansion time, so a throw here (e.g. an unterminated quote) is contained.
 	-- self: $()/`` expand aliases from the live table (unless already expanded as read)
-	local pok, parsed = pcall(P.parse, src, self, nil, noalias, nil, self.cur_cline or self.cur_line)
+	-- (line0: compiled code's command line — its sh.cur_line isn't kept per command)
+	local pok, parsed = pcall(P.parse, src, self, nil, noalias, nil, line0 or self.cur_cline or self.cur_line)
 	if not pok then
 		if backtick then
 			io.stderr:write("curse: command substitution: " .. tostring(parsed) .. "\n")
@@ -2210,14 +2216,11 @@ function Shell:capture_src(src, backtick, noalias)
 			iso = true
 		end
 	end
-	-- Text that recurs runs compiled (tier fragment keyed by text, line, trap state) — the
-	-- guarded slow path of a compiled $(…) and the backticks parsed at expansion time. (Not
-	-- while aliases are live: a fragment parses without the alias table.)
-	local mod
-	if noalias or not (self.shopt.expand_aliases and self.aliases and next(self.aliases)) then
-		local ln = self.cur_cline or self.cur_line
-		mod = require("tier").try_fragment(src, ln and ln > 0 and ln or nil, self)
-	end
+	-- Text that recurs runs compiled (tier fragment keyed by text, line, trap state and the
+	-- live alias table it parses with — none when read with aliases already expanded) — the
+	-- guarded slow path of a compiled $(…) and the backticks parsed at expansion time.
+	local ln = line0 or self.cur_cline or self.cur_line
+	local mod = require("tier").try_fragment(src, ln and ln > 0 and ln or nil, self, nil, nil, noalias)
 	if mod then
 		local run_compiled = require("tier").run_compiled
 		if (iso or not mod.nofork) and not has_perr then
@@ -5002,9 +5005,11 @@ end
 -- delegated-statement wrappers catch it the same way). bash: execute_function's return_catch.
 function M.catch_return(f)
 	return function(sh, pc)
+		local ne0 = sh.noerr
 		local ok, e = pcall(f, sh, pc)
 		if not ok then
 			if type(e) == "table" and e.__curse_return ~= nil then
+				sh.noerr = ne0 -- (raised mid-body: a condition's noerr-- was skipped)
 				sh.status = e.__curse_return
 			else
 				error(e, 0)
@@ -5914,7 +5919,10 @@ function Shell:special_get(name)
 		return tostring(os.time())
 	end
 	if name == "BASH_COMMAND" then
-		local c = self.cur_cmd
+		local c = self.cur_cmd -- (compiled code records the text, the interpreter the node)
+		if type(c) == "string" then
+			return c
+		end
 		if c and c.t == "case" and c.subject and c.subject.src then -- (just its head, blank and all)
 			return "case " .. c.subject.src .. " in "
 		end
@@ -7058,6 +7066,7 @@ function Shell:array_set(name, key, val, append, raw)
 		key = tostring(key)
 		if b.virt == "aliases" then
 			self.aliases[key] = append and ((self.aliases[key] or "") .. val) or val
+			self.alias_gen = (self.alias_gen or 0) + 1
 		else
 			if not M.restricted_hash_ok(self, "", val) then
 				return true -- (reported; nothing hashed)
@@ -11286,7 +11295,7 @@ end
 function M.call_dynamic_fn(sh, argv)
 	local I = require("interp")
 	if sh.opt_x then
-		I.xtrace(sh, argv)
+		M.xtrace(sh, argv)
 	end
 	return I.exec_simple(sh, argv, _noop)
 end
@@ -11390,7 +11399,10 @@ function M.eval_run(sh, argv)
 	local ln = current_line(sh)
 	local mod = require("tier").try_fragment(code, ln > 0 and ln or nil, sh, nil, "eval")
 	if mod then
+		local sxd = sh.xdepth -- (eval'd commands trace one level deeper: `++ cmd`, as b_eval)
+		sh.xdepth = (sxd or 0) + 1
 		local ok, err = pcall(require("tier").run_compiled, mod, sh, nil, true)
+		sh.xdepth = sxd
 		sh.spb_err = nil -- (a builtin the code ran flagged its own: not eval's)
 		if not ok then
 			if type(err) == "table" and err.__curse_parseerr then
@@ -11512,6 +11524,9 @@ function M.source_run(sh, argv, line)
 	if not name or (j == 2 and name:match("^%-.")) then
 		return require("b_source")(sh, argv[1], argv, nil, nil) -- usage error: let b_source diagnose
 	end
+	if sh.opt_r and name:find("/", 1, true) then -- (restricted: b_source refuses it)
+		return require("b_source")(sh, argv[1], argv, nil, nil)
+	end
 	local file = M.source_path(sh, name)
 	if Ii.file_test("-d", file) then
 		return require("b_source")(sh, argv[1], argv, nil, nil) -- directory: b_source diagnoses
@@ -11545,7 +11560,10 @@ function M.source_run(sh, argv, line)
 	sh.sourcedepth = (sh.sourcedepth or 0) + 1 -- a `return` is valid while sourcing
 	local fr = M.source_enter(sh, name, line)
 	local dsave, e0 = M.source_debug_hide(sh), sh.traps and sh.traps.ERR
+	local sxd = sh.xdepth -- (a sourced file traces one level deeper, as b_source)
+	sh.xdepth = (sxd or 0) + 1
 	local rok, err = pcall(require("tier").run_compiled, mod, sh, nil, true)
+	sh.xdepth = sxd
 	sh.spb_err = nil -- (a builtin in the file flagged its own: not the source's)
 	if not rok and type(err) == "table" and err.__curse_parseerr then
 		rok = true -- a syntax error in the file: source returns 2, doesn't halt the shell (bash)
@@ -11621,8 +11639,8 @@ function M.exec_dynamic(sh, argv, hook, hadcs, no_func)
 	end
 	local I = require("interp")
 	sh.write_err = nil
-	if sh.opt_x then
-		I.xtrace(sh, argv)
+	if sh.opt_x and not no_func then -- (`command CMD`: the caller traced it, `command` included)
+		M.xtrace(sh, argv)
 	end
 	-- a `cmd &` child armed to exec its lone external in place: only if the word resolved
 	-- to an external (a function/builtin runs more than one command — keep the child)
@@ -12681,6 +12699,207 @@ function M.arith_textual(sh, raw)
 	return require("interp").arith_textual(sh, raw)
 end
 
+-- xtrace (`set -x`): before running a command, write `$PS4<cmd words>` to the trace fd,
+-- single-quoting any word that isn't a plain token (bash's xtrace_print_word_list). Shared
+-- by both tiers: the compiled code calls these at the same points the interpreter does
+-- (after a command's words expand, before its redirections), guarded by sh.opt_x.
+function M.xtrace_quote(w)
+	if w == "" then
+		return "''"
+	end
+	if w:match("^[%w_@%%+=:,./%-]+$") then
+		return w
+	end
+	return M.shell_quote(w)
+end
+-- xtrace output goes to fd $BASH_XTRACEFD when that's set to an open fd (bash), else stderr
+function M.xtrace_write(sh, s)
+	local fd = sh.vars.BASH_XTRACEFD and tonumber(sh:get("BASH_XTRACEFD"))
+	if fd and fd ~= 2 and fd >= 0 and fd == math.floor(fd) then
+		io.flush() -- (our buffered stdout first: fd 1 may be the trace fd)
+		if M.fd_write(fd, s) then
+			return
+		end
+	end
+	io.stderr:write(s)
+end
+-- one xtrace line: $PS4 (its first char repeated per $(…)/eval/source level) + `text`
+function M.xtrace_line(sh, text)
+	local ps4 = sh.xtrace_ps4 or sh:get("PS4")
+	if ps4:find("[$`\\]") then -- (PS4 is expanded like a prompt, untraced: `+[$LINENO] `)
+		local sx, st = sh.opt_x, sh.status
+		sh.opt_x = false
+		local ok, v = pcall(require("interp").prompt_string, sh, ps4)
+		sh.opt_x, sh.status = sx, st
+		ps4 = ok and v or ps4
+	end
+	if ps4 == "" then
+		ps4 = "+ "
+	end
+	local lead = ps4:sub(1, 1)
+	local depth = (sh.xdepth or 0) -- nesting of $(…) (not function calls or subshells)
+	local pre = ps4
+	if lead ~= "" and depth > 0 then
+		pre = lead:rep(depth) .. ps4
+	end
+	M.xtrace_write(sh, pre .. text .. "\n")
+end
+function M.xtrace(sh, args, prequoted)
+	local parts = {}
+	for i = 1, #args do
+		parts[i] = prequoted and args[i] or M.xtrace_quote(args[i])
+	end
+	M.xtrace_line(sh, table.concat(parts, " "))
+end
+-- (compiled argv built from word 2 on: the command name rides separately)
+function M.xtrace_cmd(sh, name, args)
+	local parts = { M.xtrace_quote(name) }
+	for i = 1, #args do
+		parts[i + 1] = M.xtrace_quote(args[i])
+	end
+	M.xtrace_line(sh, table.concat(parts, " "))
+end
+-- `+ name=value` for an assignment (the expanded value, as bash prints the word)
+function M.xtrace_assign(sh, lhs, v)
+	M.xtrace_line(sh, lhs .. (v == "" and "" or M.xtrace_quote(v)))
+end
+-- [[ ]] under set -x: a unary primary (`[[ -f x ]]`, `[[ ! -n y ]]`) traces its expanded
+-- operand and hands it back; given `r` (a =~ RHS), `[[ v =~ r ]]`
+function M.xdb1(sh, neg, op, v, r)
+	if sh.opt_x then
+		M.xtrace_line(sh, "[[ " .. (neg and "! " or "") .. (r and (v .. " =~ " .. r) or (op .. " " .. v)) .. " ]]")
+	end
+	return v
+end
+-- a binary primary: trace `[[ l op r ]]`, park the operands for the compare that follows
+M._xl, M._xr = "", ""
+function M.xdb2(sh, neg, op, l, r)
+	if sh.opt_x then
+		M.xtrace_line(sh, "[[ " .. (neg and "! " or "") .. l .. " " .. op .. " " .. r .. " ]]")
+	end
+	M._xl, M._xr = l, r
+	return true
+end
+-- `declare -a NAME=(…)` under set -x: bash traces the compound assignment with every
+-- element single-quoted (`+ q=(['2']='z' 'w')`), then the declaration (`+ declare -a q`)
+function M.xtrace_declarr(sh, name, items, decl)
+	M.xtrace_arrlit(sh, name, items)
+	M.xtrace_line(sh, decl)
+end
+function M.xtrace_arrlit(sh, name, items)
+	local function sq(v)
+		return "'" .. tostring(v):gsub("'", "'\\''") .. "'"
+	end
+	local o = {}
+	for i, it in ipairs(items) do
+		o[i] = (it.key ~= nil and ("[" .. sq(it.key) .. "]=") or "") .. sq(it.val or "")
+	end
+	M.xtrace_line(sh, name .. "=(" .. table.concat(o, " ") .. ")")
+end
+-- A compiled function call returning (fnwrap, in a program that may set a RETURN trap):
+-- the RETURN trap fires in the callee's frame — one present now was inherited (functrace)
+-- or set during the call — with the $? from before a `return N`, whose N (parked in
+-- sh.fret) is $? once the trap has run. Exactly interp's run_function epilogue.
+function M.fn_return(sh, name)
+	local fret = sh.fret
+	sh.fret = nil
+	local h = sh.traps and sh.traps.RETURN
+	if h and h ~= "" and not sh.in_return_trap and not sh.in_debug
+		and ((sh.in_subprogram or 0) == 0 or M.pseudo_trapped(sh, "RETURN")) then
+		sh.in_return_trap = true
+		local saved, sl = sh.status, sh.cur_line
+		sh.cur_line = sh.func_bline and sh.func_bline[name] or sh.cur_line
+		local ok, err = pcall(require("interp")._int.run_trap, sh, h)
+		sh.status, sh.cur_line = saved, sl
+		sh.in_return_trap = false
+		if not ok then
+			error(err, 0)
+		end
+	end
+	if fret then
+		sh.status = fret
+	end
+end
+-- $FUNCNEST: a compiled call past that many nested calls abandons the whole command
+-- line, status 1, as interp's run_function (bash's execute_function: "maximum function
+-- nesting level exceeded", jump_to_top_level DISCARD)
+function M.funcnest_over(sh, name)
+	local lim = tonumber(sh:get("FUNCNEST"))
+	if lim and lim > 0 and (sh.calldepth or 0) >= lim then
+		io.stderr:write("curse: " .. name .. ": maximum function nesting level exceeded (" .. lim .. ")\n")
+		sh.status = 1
+		error({ __curse_exit = 1, __curse_lineabort = true, __curse_discard = true })
+	end
+	return false
+end
+-- One word's value in assignment context (no splitting, no globbing) through the shared
+-- word expander — for an array element the compiled renderers can't express natively.
+function M.assign_elem(sh, w)
+	return require("interp").expand_assign_word(sh, w)
+end
+-- shopt -s extdebug: the DEBUG trap before a compiled command; a non-zero status skips
+-- the command — raised as the pc it continues at, for the catcher of the CFG `cfg`
+-- (tier.run_compiled for `run`, rt.catch_dbgskip for a function's)
+function M.debug_x(sh, line, after, cfg)
+	if require("interp").run_debug(sh, line) then
+		error({ __curse_dbgskip = after, cfg = cfg }, 0)
+	end
+end
+function M.catch_dbgskip(f, name)
+	return function(sh, pc)
+		while true do
+			local ok, e = pcall(f, sh, pc)
+			if ok then
+				return
+			end
+			if type(e) == "table" and e.__curse_dbgskip and e.cfg == name then
+				pc = e.__curse_dbgskip
+			else
+				error(e, 0)
+			end
+		end
+	end
+end
+-- `coproc NAME cmd` (both tiers; `run(ssh)` runs cmd — the interpreter's statement or a
+-- compiled fragment): cmd runs asynchronously as an in-process background task with its
+-- stdin/stdout on two pipes whose other ends the shell keeps as NAME=(read-fd write-fd);
+-- NAME_PID and $! = its pid. Finished, it's reaped (fds closed, NAME unset) as the
+-- scheduler sees it end (on_done) — or by rt.coproc_poll.
+function M.coproc_start(sh, name, run, subshell, simple)
+	sh.coprocs = sh.coprocs or {}
+	for opid, cp in pairs(sh.coprocs) do -- (bash: one at a time is supported; warn, go on)
+		io.stderr:write(("curse: warning: execute_coproc: coproc [%d:%s] still exists\n"):format(opid, cp.name))
+	end
+	local rp, wp = ffi.new("int[2]"), ffi.new("int[2]")
+	M.pipe_hi(rp)
+	M.pipe_hi(wp)
+	local r0, r1 = M.fd_below(rp[0], 64), M.fd_below(rp[1], 64) -- (bash's numbering: 63 60)
+	local w0, w1 = M.fd_below(wp[0], 64), M.fd_below(wp[1], 64)
+	-- F_SETFD FD_CLOEXEC: nothing the shell runs inherits these (a leaked write end keeps the
+	-- coproc from ever seeing EOF). Not the variadic C.fcntl: a Lua number vararg is passed
+	-- as a double, so the flag never arrived.
+	C.curse_co_fcntl3(r0, 2, 1)
+	C.curse_co_fcntl3(w1, 2, 1)
+	local job = sh:bg_launch(function(ssh)
+		ssh.coprocs = nil -- (an older coproc's ends aren't this one's)
+		return run(ssh)
+	end, "coproc " .. name, subshell, simple, nil, nil, { fds = { [0] = w0, [1] = r1 } })
+	C.close(r1)
+	C.close(w0)
+	local pid = job and job.pid or 0
+	M.coproc_setvars(sh, name, r0, w1, pid)
+	sh.coprocs[pid] = { name = name, r = r0, w = w1, g = job and job.g }
+	if job and job.g then
+		job.g.on_done = function(g)
+			job.done, job.status = true, g.status[1] or 0
+			if sh.coprocs and sh.coprocs[pid] then
+				M.coproc_dispose(sh, pid)
+			end
+		end
+	end
+	sh.status = 0
+end
+
 -- ===== The compiled tier's simple-command runner =====
 -- A simple command whose NAME is a compile-time literal but whose run needs more than a
 -- bare builtin/external dispatch — a declaration builtin (`declare -A m=(…)`, `local -n
@@ -12762,6 +12981,9 @@ do
 	function M.sr_pset(sh, name, value, append)
 		if value == nil then
 			return
+		end
+		if sh.opt_x then -- (each prefix assignment traces before the command: `+ x=1`)
+			M.xtrace_assign(sh, name .. (append and "+=" or "="), value)
 		end
 		local b = sh.vars[sh:deref(name)]
 		if b and b.ro then -- (a readonly prefix: reported, non-fatal — the command still runs)
@@ -12939,7 +13161,22 @@ do
 		end
 		return require("interp").exec_simple(sh, argv, hook)
 	end
-	function M.sr_run_cmd(sh, argv, spec, hook, rf)
+	-- set -x (unless the compiled caller traced it — spec.xt): before the redirections
+	function M.sr_trace(sh, argv, spec)
+		if spec.aas and sh.arrayargs_pre then -- (`+ b=('4' '5 6')` before `+ declare -a b`)
+			for _, aa in ipairs(spec.aas) do
+				if sh.arrayargs_pre[aa] then
+					M.xtrace_arrlit(sh, aa.name, sh.arrayargs_pre[aa])
+				end
+			end
+		end
+		M.xtrace(sh, argv)
+	end
+	function M.sr_run_cmd(sh, argv, spec, hook, rf, traced)
+		if sh.opt_x and not spec.xt and not traced then
+			M.sr_trace(sh, argv, spec)
+			traced = true
+		end
 		if rf then
 			local a1, a2 = argv[1], argv[2]
 			if not (a1 == "exec" or ((a1 == "command" or a1 == "builtin") and a2 == "exec")) then
@@ -12949,7 +13186,7 @@ do
 					sh.status = 1
 					return
 				end
-				local ok, err = pcall(M.sr_run_cmd, sh, argv, spec, hook)
+				local ok, err = pcall(M.sr_run_cmd, sh, argv, spec, hook, nil, traced)
 				io.flush()
 				M.redir_restore(rs)
 				if not ok then
@@ -12960,9 +13197,7 @@ do
 		end
 		sh.write_err = nil
 		local I = require("interp")
-		if sh.opt_x then
-			I.xtrace(sh, argv)
-		end
+
 		if spec.so then -- (a redirect moved stdout: builtins write the real fd 1)
 			local so = sh.out
 			sh.out = io.write
@@ -13411,6 +13646,11 @@ function M.select_next(sh, list, name)
 			return true
 		end
 	end
+end
+-- (a fragment's function: the trap mode its body compiled with, and its definition)
+function M.fn_mode(sh, name, mode, def)
+	sh.func_mode = sh.func_mode or {}
+	sh.func_mode[name] = { mode = mode, def = def }
 end
 
 return M
