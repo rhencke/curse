@@ -244,6 +244,11 @@ end
 -- run_startup_files (shell.c): login files, $BASH_ENV (non-interactive), the rc file
 -- (interactive) or $ENV (interactive posix)
 local function startup_files(sh, inv, sh_like)
+	if inv.by_ssh then -- (see ssh_rc: ONLY the rc files)
+		run_file(sh, "/etc/bash.bashrc")
+		run_file(sh, inv.rcfile or "~/.bashrc")
+		return
+	end
 	local posix = sh.opt_posix
 	local norc = inv.norc
 	if inv.login_shell and not posix then
@@ -273,6 +278,58 @@ local function startup_files(sh, inv, sh_like)
 	elseif not sh.opt_p then
 		env_file(sh, "ENV")
 	end
+end
+
+-- run_startup_files' rshd/sshd case: a non-interactive, non-login, not-sh `-c` shell run
+-- by sshd ($SSH_CLIENT or $SSH2_CLIENT set: Debian builds with SSH_SOURCE_BASHRC) or with
+-- stdin a network connection (isnetconn: getpeername on fd 0 works) reads the system and
+-- user bashrc — and nothing else — when it's a top-level shell ($SHLVL < 2).
+local gpn_sa, gpn_len
+local function isnetconn(fd)
+	if not gpn_sa then
+		pcall(ffi.cdef, "int curse_inv_getpeername(int fd, void *sa, unsigned int *len) asm(\"getpeername\");")
+		gpn_sa, gpn_len = ffi.new("char[128]"), ffi.new("unsigned int[1]")
+	end
+	gpn_len[0] = 128
+	if ffi.C.curse_inv_getpeername(fd, gpn_sa, gpn_len) == 0 then
+		return true
+	end
+	local e = ffi.errno()
+	return not (e == 88 or e == 107 or e == 22 or e == 9) -- (ENOTSOCK ENOTCONN EINVAL EBADF)
+end
+local function ssh_rc(sh)
+	return (tonumber(sh:get("SHLVL")) or 0) < 2
+		and (sh.vars.SSH_CLIENT ~= nil or sh.vars.SSH2_CLIENT ~= nil or isnetconn(0))
+end
+
+-- start_debugger (shell.c): --debugger (or -O extdebug) — bash's debugging_mode IS extdebug —
+-- sources the debugger's start file with errexit off; when that fails (bashdb isn't
+-- installed) it warns and turns debugging mode off, and -E/-T follow it either way.
+local DEBUGGER_START_FILE = "/usr/share/bashdb/bashdb-main.inc" -- (Debian's pathnames.h)
+local function start_debugger(sh)
+	local e = sh.opt_e
+	sh.opt_e = false
+	local on = true
+	local f, emsg = io.open(DEBUGGER_START_FILE, "r")
+	if f then
+		f:close()
+		sh.shopt.extdebug = true
+		local ok, x = pcall(run_file, sh, DEBUGGER_START_FILE)
+		if not ok then
+			sh.opt_e = e
+			error(x, 0)
+		end
+	else
+		on = false
+		err(sh.argv0 .. ": " .. DEBUGGER_START_FILE .. ": " .. (emsg:match(": ([^:]*)$") or emsg) .. "\n"
+			.. sh.argv0 .. ": warning: cannot start debugger; debugging mode disabled\n")
+	end
+	sh.shopt.extdebug = on
+	sh.opt_functrace, sh.opt_errtrace = on, on
+	if on then
+		rt.bav_init(sh)
+	end
+	sh.opt_e = e
 end
 
 -- open_shell_script: find (a name with no `/` that isn't in the cwd is looked for on $PATH:
@@ -571,8 +628,19 @@ function M.start(sh, inv, istty)
 	if kind == "file" then
 		sh.argv0 = payload -- ($0 is the script's name during the startup files too)
 	end
+	-- --debugger sets debugging_mode (extdebug) as it is parsed; bind_args then records the
+	-- positional parameters as BASH_ARGV's bottom frame (push_args)
+	if inv.debugger then
+		sh.shopt.extdebug = true
+	end
+	if sh.shopt.extdebug then
+		rt.bav_init(sh)
+	end
 	-- the startup files, with errexit off; an `exit` in one ends the shell
-	if login or inv.rcfile or sh.opt_i or sh.vars.BASH_ENV then
+	if kind == "code" and not (sh.opt_i or login or sh_like or inv.norc) and ssh_rc(sh) then
+		inv.by_ssh = true
+	end
+	if login or inv.rcfile or sh.opt_i or sh.vars.BASH_ENV or inv.by_ssh then
 		local e = sh.opt_e
 		sh.opt_e = false
 		local ok, x = pcall(startup_files, sh, inv, sh_like)
@@ -599,6 +667,18 @@ function M.start(sh, inv, istty)
 			return "exit"
 		end
 		sh.main_source = inv.found -- (found on $PATH: BASH_SOURCE is the full path, $0 the name)
+	end
+	-- (-c, a script, or non-interactive stdin — not an interactive shell reading its terminal)
+	if (inv.debugger or sh.shopt.extdebug) and kind ~= "repl" then
+		local ok, x = pcall(start_debugger, sh)
+		if not ok then
+			if type(x) == "table" and x.__curse_exit then
+				io.flush()
+				sh.status = x.__curse_exit
+				return "exit"
+			end
+			error(x, 0)
+		end
 	end
 	if inv.dump or inv["dump-strings"] or inv["dump-po-strings"] then
 		if kind == "code" or kind == "file" then
