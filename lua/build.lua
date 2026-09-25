@@ -66,6 +66,7 @@ local lazy_mods = {
 	"deparse", -- function printing (declare -f / type): only when something is printed
 	"helpdata", -- bash's help texts: only for `help`
 	"hist", -- command history + `!` expansion: only when a script turns history on
+	"smatch", -- bash's own pattern matcher: only for what a glob's ERE can't express
 }
 
 -- Wrap each core module's source in a package.preload closure. `require("x")` then

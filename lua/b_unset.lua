@@ -223,6 +223,9 @@ return function(sh, cmd, args, hook, tcb)
 						if dn == "PATH" and sh.hashcache then
 							sh.hashcache = {} -- (sv_path: unsetting PATH flushes the hash table)
 						end
+						if dn == "GLOBIGNORE" then
+							rt.setup_glob_ignore(sh) -- (unset: dotglob off)
+						end
 						if dn == "IGNOREEOF" then
 							sh.opt_ignoreeof = false -- (sv_ignoreeof)
 						end

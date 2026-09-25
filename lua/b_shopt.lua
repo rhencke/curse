@@ -132,6 +132,9 @@ return function(sh, cmd, args, hook, tcb)
 					sh:set_str("BASH_COMPAT", tostring(new))
 				else
 					sh.shopt[nm] = set_
+					if nm == "globasciiranges" then
+						rt.glob_asciirange = set_ -- (the matcher's own copy: bash's glob_asciirange)
+					end
 					if nm == "extdebug" then -- (shopt.c shopt_set_debug_mode: function and error
 						sh.opt_functrace, sh.opt_errtrace = set_, set_ -- tracing follow it)
 						if set_ then

@@ -9,7 +9,7 @@ e() { "$@" 2>&1 | sed 's/^.*line [0-9]*: //'; }
 RANDOM=42; echo "rand: $RANDOM $RANDOM"
 RANDOM=7; (RANDOM=5; echo "subshell-seeded: $RANDOM"); RANDOM=5; echo "seeded: $RANDOM"
 declare -i RANDOM; RANDOM=40+2; echo "int-seed: $RANDOM"
-SECONDS=abc; echo "sec-bad=$SECONDS"
+SECONDS=abc; [ "$SECONDS" -le 1 ] && echo "sec-bad=0ish"  # (0; a second boundary may pass under load)
 BASH_SUBSHELL=3; (echo "sub:$BASH_SUBSHELL"); BASH_SUBSHELL=x; echo "bs:$BASH_SUBSHELL"; (echo "bs2:$BASH_SUBSHELL")
 EPOCHSECONDS=5; [ "$EPOCHSECONDS" -gt 1000 ] && echo epoch-stays-dynamic
 BASHPID=5; [ "$BASHPID" != 5 ] && echo bashpid-stays-dynamic
