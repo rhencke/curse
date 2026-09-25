@@ -657,8 +657,8 @@ end
 -- trailing delimiter not adding a trailing empty.
 function M.ifs_split(ifs, s, nomark) -- (nomark: \1 is not an escape marker — read's skip_ctlesc)
 	local fields, cur = {}, nil
-	local function isws(c)
-		return c == " " or c == "\t" or c == "\n"
+	local function isws(c) -- IFS whitespace (subst.c ifs_whitespace): whitespace NOT in $IFS is ordinary text
+		return (c == " " or c == "\t" or c == "\n") and ifs:find(c, 1, true) ~= nil
 	end
 	local function inifs(c)
 		return c ~= "" and ifs:find(c, 1, true) ~= nil
@@ -8882,8 +8882,8 @@ function M.field_split(sh, value, split)
 			ifsset[ch.s] = true
 		end
 		local mbifs = M.lc_mb_cur_max() > 1 and ifs:find("[\128-\255]") ~= nil
-		local function isws(c)
-			return c == " " or c == "\t" or c == "\n"
+		local function isws(c) -- IFS whitespace only (subst.c ifs_whitespace)
+			return (c == " " or c == "\t" or c == "\n") and ifsset[c]
 		end
 		local function inifs(c)
 			return c ~= "" and ifsset[c]
@@ -9096,8 +9096,8 @@ function M.expand_fields(sh, segs)
 		sh._ifscache = ic
 	end
 	local ifsset, mbifs = ic.set, ic.mbifs
-	local function isws(c)
-		return c == " " or c == "\t" or c == "\n"
+	local function isws(c) -- IFS whitespace only (subst.c ifs_whitespace)
+		return (c == " " or c == "\t" or c == "\n") and ifsset[c]
 	end
 	local function inifs(c)
 		return c ~= "" and ifsset[c]

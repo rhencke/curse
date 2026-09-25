@@ -2446,8 +2446,8 @@ expand_fields_full = function(sh, w, pre1) -- pre1: part 1 already expanded (a $
 		sh._ifscache = ic
 	end
 	local ifsset, mbifs = ic.set, ic.mbifs
-	local function isws(c)
-		return c == " " or c == "\t" or c == "\n"
+	local function isws(c) -- IFS whitespace only (subst.c ifs_whitespace): other whitespace is text
+		return (c == " " or c == "\t" or c == "\n") and ifsset[c]
 	end
 	local function inifs(c)
 		return c ~= "" and ifsset[c]
