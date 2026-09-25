@@ -5019,6 +5019,15 @@ function M.catch_return(f)
 end
 -- `return` where no function or sourced script is running: reported, status 2 (bash) —
 -- also in a trap handler that runs at the top level (return.def: no return_catch_flag)
+-- `for NAME` with an invalid NAME: reported, status 1, no iterations — fatal (status 2) to
+-- a non-interactive posix shell (execute_for_command)
+function M.for_badname(sh, name)
+	io.stderr:write("curse: `" .. name .. "': not a valid identifier\n")
+	sh.status = 1
+	if sh.opt_posix and not sh.opt_i then
+		error({ __curse_exit = 2 })
+	end
+end
 -- (viacmd: run through `command`/`builtin` — not a special builtin then, so not fatal)
 function M.return_outside(sh, viacmd)
 	if (sh.calldepth or 0) == 0 and (sh.sourcedepth or 0) == 0 then
