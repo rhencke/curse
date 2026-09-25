@@ -3092,6 +3092,12 @@ end
 -- recursive-eval parse error / bad array value); /, %, ** and /=, %= can fault
 -- (÷0, negative exponent). If none apply, the (( )) result is emitted inline with
 -- no pcall — keeping the lifted-int64 hot loop native (JIT-compilable).
+-- A `/`, `%` or `**` whose right operand is a literal can't fault: `i % 2`, `2 ** 3` (a
+-- `**` literal is never negative — a minus is a unary node)
+EF.lit_divisor = function(e)
+	local r = e.r
+	return r.k == "num" and (e.op == "**" or (r.v:match("^%d+$") ~= nil and not r.v:match("^0+$")))
+end
 local function arith_can_error(e, lifted)
 	if type(e) ~= "table" then
 		return false
@@ -3100,7 +3106,7 @@ local function arith_can_error(e, lifted)
 	if k == "var" then
 		return not lifted[e.name]
 	end
-	if k == "bin" and (e.op == "/" or e.op == "%" or e.op == "**") then
+	if k == "bin" and (e.op == "/" or e.op == "%" or e.op == "**") and not EF.lit_divisor(e) then
 		return true
 	end
 	if k == "asgn" then
@@ -3153,12 +3159,8 @@ local function arith_can_div_fault(e)
 		return false
 	end
 	local k = e.k
-	if k == "bin" and (e.op == "/" or e.op == "%" or e.op == "**") then
-		-- (a literal operand can't fault: `i % 2`, `2 ** 3` — `**`'s literal is never < 0)
-		local r = e.r
-		if not (r.k == "num" and (e.op == "**" or (r.v:match("^%d+$") and not r.v:match("^0+$")))) then
-			return true
-		end
+	if k == "bin" and (e.op == "/" or e.op == "%" or e.op == "**") and not EF.lit_divisor(e) then
+		return true
 	end
 	if k == "asgn" and (e.op == "/=" or e.op == "%=") then
 		return true
@@ -5516,14 +5518,30 @@ end
 
 -- A `(( expr ))` CONDITION (if/while fast path): set $? like the (( )) command and branch
 -- to `yes` on 0, else `no`. Error-free (all-lifted) arithmetic is a plain native compare.
-EF.arith_branch = function(arith, lifted, yes, no)
+-- `keep`: on false leave $? as it was (a while loop's status is its last body command's).
+EF.arith_branch = function(arith, lifted, yes, no, keep)
 	if not arith_can_error(arith, lifted) then
-		return ("if %s then sh.status = 0; pc = %d else sh.status = 1; pc = %d end"):format(
-			emit_bool(arith, lifted), yes, no)
+		return ("if %s then sh.status = 0; pc = %d else %spc = %d end"):format(
+			emit_bool(arith, lifted), yes, keep and "" or "sh.status = 1; ", no)
 	end
 	EF.acmd = "((" -- (bash's this_command_name, baked into its arith error texts)
+	if not arith_can_div_fault(arith) and not EF.has_attr then
+		-- only a read can fail (flagged in sh.arithfault inside the (( ) context, no throw):
+		-- a native compare, no status round-trip
+		local saved = arith_varread
+		arith_varread = "rt.arith_read(sh, %q)"
+		local b = emit_bool(arith, lifted)
+		arith_varread = saved
+		EF.acmd = nil
+		return ("local __ia = sh.in_arithcmd; sh.arithfault = false; sh.in_arithcmd = true; local __c = %s; sh.in_arithcmd = __ia; if __c and not sh.arithfault then sh.status = 0; pc = %d else %spc = %d end"):format(
+			b, yes, keep and "" or "sh.status = 1; ", no)
+	end
 	local code = EF.arith_status(arith, lifted)
 	EF.acmd = nil
+	if keep then
+		return ("local __st = sh.status; %s; if sh.status == 0 then pc = %d else sh.status = __st; pc = %d end"):format(
+			code, yes, no)
+	end
 	return ("%s; if sh.status == 0 then pc = %d else pc = %d end"):format(code, yes, no)
 end
 
@@ -5655,23 +5673,21 @@ H.whilec = function(cx, st, after)
 	end
 	if arith and not st.negate and not not_compilable(arith) and not arith_side_effect(arith) then
 		-- fast path: a native arith condition `while (( expr ))` — no command run.
-		-- The condition sets $? for the body; the loop's own status is its last body
-		-- command's (lv), 0 when none ran — exactly like the command-condition path.
-		-- (the re-test after the body saves it — a second copy of the test, so a hot loop
-		-- takes no extra dispatch hop; the first test, on entry, starts from 0)
-		local lv = cx.newloopvar()
+		-- The condition sets $? = 0 for the body; the loop's own status is its last body
+		-- command's — a false re-test leaves $? alone — or 0 when none ran (a first test,
+		-- on entry, that fails exits via exitp). Two copies of the test: no extra hop per turn.
 		local condp, firstp = cx.newpc(), cx.newpc()
 		cx.loopPc[st.id] = condp
 		local exitp = cx.newpc()
-		cx.blocks[exitp] = ("sh.status = %s; pc = %d"):format(lv, after)
+		cx.blocks[exitp] = ("sh.status = 0; pc = %d"):format(after)
 		cx.loopstack[#cx.loopstack + 1] = { brk = after, cont = condp }
 		local bodyentry = cx.flatten_list(st.body, condp)
 		cx.loopstack[#cx.loopstack] = nil
 		-- DEBUG fires before each evaluation of the condition command (bash)
 		local cst = type(st.cond) == "table" and st.cond[1] or nil
-		local test = (cst and dbg(cst) or "") .. EF.arith_branch(arith, cx.lifted, bodyentry, exitp)
-		cx.blocks[condp] = ("%s = sh.status; "):format(lv) .. test
-		cx.blocks[firstp] = ("%s = 0; "):format(lv) .. test
+		local d = cst and dbg(cst) or ""
+		cx.blocks[condp] = d .. EF.arith_branch(arith, cx.lifted, bodyentry, after, true)
+		cx.blocks[firstp] = d .. EF.arith_branch(arith, cx.lifted, bodyentry, exitp, true)
 		return firstp
 	end
 	-- fast path: `while/until [ A -op B ]` with integer operands — a native int64
