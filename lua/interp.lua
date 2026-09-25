@@ -1899,13 +1899,47 @@ expand_pattern = function(sh, w)
 	end
 	return expand_escaped(sh, w, PAT_META)
 end
+-- A case-clause pattern: bash expands it as ONE word (execute_case_command:
+-- expand_word_leave_quoted, then es->word->word), so a quoted "$@"/"${a[@]}" contributes
+-- only its first element and ends the pattern there when more follow (`x"$@"y` with
+-- `a b` is `xa`) — except under IFS="", where the elements join with a space.
+local function case_pattern(sh, w)
+	local at = false
+	for _, p in ipairs(w.parts) do
+		if p.q and (p.special == "@" or (p.pexp and (p.pexp.name == "@" or p.pexp.index == "@"))) then
+			at = true
+			break
+		end
+	end
+	if not at or rt.ifs(sh) == "" then
+		return expand_pattern(sh, w)
+	end
+	local buf = {}
+	for _, p in ipairs(w.parts) do
+		if p.q and is_multi(sh, p) then
+			local els, star = multi_elems(sh, p)
+			if star then
+				buf[#buf + 1] = table.concat(els, rt.ifs_sep(sh)):gsub(PAT_META, "\\%0")
+			elseif #els > 0 then
+				buf[#buf + 1] = els[1]:gsub(PAT_META, "\\%0")
+				if #els > 1 then
+					break
+				end
+			end
+		else
+			local s = expand_part_str(sh, p)
+			buf[#buf + 1] = p.q and s:gsub(PAT_META, "\\%0") or s
+		end
+	end
+	return table.concat(buf)
+end
 -- Does `subj` match any of the case-clause pattern strings? The compiled tier's case
 -- codegen dispatches clauses natively but matches through this shared helper (vars in
 -- a pattern expand; quoted metachars stay literal), honoring shopt nocasematch.
 function M.case_match(sh, subj, pats)
 	local ic = sh.shopt.nocasematch and true or nil
 	for _, pat in ipairs(pats) do
-		if rt.glob_match(subj, expand_pattern(sh, P.parse_word(pat)), ic) then
+		if rt.glob_match(subj, case_pattern(sh, P.parse_word(pat)), ic) then
 			return true
 		end
 	end
@@ -6758,7 +6792,7 @@ exec_stmt = function(sh, st, hook)
 			local matched = fall
 			if not matched then
 				for _, pat in ipairs(cl.pats) do
-					local g = expand_pattern(sh, P.parse_word(pat)) -- vars resolved; quoted metachars literal
+					local g = case_pattern(sh, P.parse_word(pat)) -- vars resolved; quoted metachars literal
 					if rt.glob_match(subj, g, sh.shopt.nocasematch and true or nil) then
 						matched = true
 						break
