@@ -9971,8 +9971,12 @@ function Shell:expand_param(pe, arg, arg2, idxnum)
 			return at ~= "" and ("declare -" .. at .. " " .. name) or ""
 		end
 		if arg == "A" then -- declare-able form (with the attributes, when it has any: bash)
-			local at = self:attr_string(name)
-			return (at ~= "" and ("declare -" .. at .. " ") or "") .. name .. "=" .. M.shell_quote(val)
+			if not name:match("^[%a_]") then
+				return "" -- (a positional/special parameter isn't a variable: nothing)
+			end
+			local dn = self:deref(name) -- (through a nameref: its target's assignment)
+			local at = self:attr_string(dn)
+			return (at ~= "" and ("declare -" .. at .. " ") or "") .. dn .. "=" .. M.shell_quote(val)
 		end
 	end
 	if op == "sub" and not isset then -- (an unset value has no substring to check)
