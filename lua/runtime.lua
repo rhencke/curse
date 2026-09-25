@@ -9534,6 +9534,9 @@ function M.compound_word_src(sh, it)
 		end
 		s = table.concat(out)
 	end
+	if s:find("$(", 1, true) then -- (bash re-prints a $(…) body: `>&2` reads `1>&2`)
+		s = require("deparse").norm_word(s)
+	end
 	if sh.arrayargs_pending or it.decl then
 		return "'" .. s:gsub("'", "'\\''") .. "'"
 	end
@@ -9587,6 +9590,29 @@ function M.arrayassign(sh, name, items, append)
 		end
 		error(err, 0)
 	end
+end
+-- The `NAME=(…)` statement (not a declare's): a nameref to an element (or `a[@]`) can't
+-- take a list — `not a valid identifier`, status 1 (interp's run_arrayassign).
+function M.arrayassign_stmt(sh, name, items, append)
+	local nb = sh.vars[name]
+	if nb and nb.ref and nb.s and nb.s:find("[", 1, true) then
+		io.stderr:write("curse: `" .. nb.s .. "': not a valid identifier\n")
+		sh.status = 1
+		return
+	end
+	return M.arrayassign(sh, name, items, append)
+end
+-- `a[i]=(…)`: a list can't be assigned to one member — reported, and the line abandoned (bash).
+function M.arrayassign_member(sh, name, index)
+	local nb = sh.vars[name]
+	if nb and nb.ref and nb.s and nb.s:find("[", 1, true) then
+		io.stderr:write("curse: `" .. nb.s .. "': not a valid identifier\n")
+		sh.status = 1
+		return
+	end
+	io.stderr:write("curse: " .. name .. "[" .. index .. "]: cannot assign list to array member\n")
+	sh.status = 1
+	error({ __curse_exit = 1, __curse_lineabort = true })
 end
 arrayassign_body = function(sh, name, items, append)
 	-- through a nameref (`declare -n r=t; declare -a r=(…)`) the literal lands in the

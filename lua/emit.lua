@@ -2939,7 +2939,46 @@ local function static_key(key)
 	return table.concat(o)
 end
 EF.static_key = static_key -- flatten_stmt references it at the array-literal emit sites (upvalue cap)
-local function arrayassign_ok(st, lifted, allow_nameref)
+-- A word an array literal can field-split natively (a bare element).
+local function aa_fieldable(w, lifted)
+	return word_safe(w) or arith_guard(w) or field_word(w, lifted) or seg_native(w, lifted)
+end
+-- A keyed element's subscript: a static literal (EF.static_key), else an emit_word-able word
+-- expanded in place — in element order, before its value (arrayfunc.c); an indexed one's
+-- arithmetic runs later in rt.arrayassign, as interp's xkey. Nil: not compilable.
+local function aa_keyword(key)
+	if static_key(key) ~= nil then
+		return false
+	end
+	local ok, kw = pcall(require("parser").parse_word, key)
+	return ok and emitable_word(kw) and kw or nil
+end
+EF.aa_keyword, EF.aa_fieldable = aa_keyword, aa_fieldable
+local function arrayassign_ok(st, lifted)
+	-- (a nameref is resolved at run time by rt.arrayassign, as interp's do_arrayassign; an
+	-- `a[i]=(…)` is H.arrayassign's own error path)
+	if st.index then
+		return false
+	end
+	for _, e in ipairs(st.elems) do
+		if e.key ~= nil then
+			if aa_keyword(e.key) == nil or not emitable_word(e.word) then
+				return false
+			end
+			for _, bw in ipairs(e.brace_bare or {}) do -- (an indexed target de-keys it: fields)
+				if not aa_fieldable(bw, lifted) then
+					return false
+				end
+			end
+		elseif e.op ~= "=" or not aa_fieldable(e.word, lifted) then
+			return false
+		end
+	end
+	return true
+end
+-- (the declare/local/typeset literal path keeps the strict gate: literal keys only, no
+-- brace de-keying, no side-effecting arith)
+local function arrayassign_decl_ok(st, lifted, allow_nameref)
 	-- allow_nameref: an explicit `declare -a/-A NAME=(…)` REDECLARES the name as an array — a
 	-- DIRECT write matching interp (which also doesn't write through a nameref for an array
 	-- assign), and rt.array_convert_err now enforces the indexed<->assoc conversion rule the
@@ -4617,7 +4656,7 @@ simple_compiled = function(cx, st, after)
 			and not (st.redirs and #st.redirs > 0) -- (a redirected one takes the general path)
 			and #aa == 1
 			and flagsok
-			and arrayassign_ok({ name = aa[1].name, append = aa[1].append, elems = aa[1].elems }, cx.lifted, true)
+			and arrayassign_decl_ok({ name = aa[1].name, append = aa[1].append, elems = aa[1].elems }, cx.lifted, true)
 		then
 			local a1 = aa[1]
 			local p = cx.newpc()
@@ -6362,9 +6401,23 @@ H.arrayassign = function(cx, st, after)
 	-- items natively — a bare word field-splits via the field engine into {val=field}
 	-- entries, a keyed element renders {key,op,val} — then store via rt.arrayassign. No
 	-- interp: keyed subscripts are gated to literals (resolved by arith_str/verbatim).
+	if st.index then -- `a[i]=(…)`: an error that abandons the line (interp's run_arrayassign)
+		local p = cx.newpc()
+		cx.blocks[p] = dbg(st) .. ("rt.arrayassign_member(sh, %q, %q); pc = %d"):format(st.name, st.index, after)
+		return p
+	end
 	if arrayassign_ok(st, cx.lifted) then
 		local p = cx.newpc()
 		local parts = { "local __it = {}" }
+		local function asq()
+			if not parts.asq then -- (asked once per statement)
+				parts.asq = true
+				parts[#parts + 1] = ("local __as = sh:is_assoc(%q)"):format(st.name)
+			end
+		end
+		-- (bash's kvpair_assignment_p: after a keyed FIRST word, a bare word in an assoc
+		-- literal is an error reported as written, never expanded)
+		local kvfirst = st.elems[1] and st.elems[1].key == nil
 		for _, e in ipairs(st.elems) do
 			if e.key ~= nil then
 				-- keyed value: assign-context RHS (an all-literal ~ colon-expands via
@@ -6372,7 +6425,23 @@ H.arrayassign = function(cx, st, after)
 				local fl = unq_full_lit(e.word)
 				local valx = (fl and fl:find("~", 1, true)) and ("rt.tilde_assign(sh, %q)"):format(fl)
 					or emit_word(e.word, cx.lifted)
-				parts[#parts + 1] = ("__it[#__it+1] = {key=%q, op=%q, val=%s, src=%q, rawkey=%q}"):format(EF.static_key(e.key), e.op, valx, e.word and e.word.src or "", e.key)
+				local kw = EF.aa_keyword(e.key)
+				local keyx = kw and emit_word(kw, cx.lifted) or ("%q"):format(EF.static_key(e.key))
+				local item = ("do local __k = %s; __it[#__it+1] = {key=__k, op=%q, val=%s, src=%q, rawkey=%q} end"):format(
+					keyx, e.op, valx, e.word and e.word.src or "", e.key)
+				if e.brace_bare then -- an INDEXED target de-keys it: `[k]=` literal in each brace word
+					asq()
+					local bf = {}
+					for _, bw in ipairs(e.brace_bare) do
+						bf[#bf + 1] = emit_fields_into("__it", bw, cx.lifted, "{val=%s}")
+					end
+					item = ("if __as then %s else %s end"):format(item, table.concat(bf, "; "))
+				end
+				parts[#parts + 1] = item
+			elseif not kvfirst and not empty_word(e.word) then
+				asq()
+				parts[#parts + 1] = ("if __as then __it[#__it+1] = {src=%q} else %s end"):format(
+					e.word.src, emit_fields_into("__it", e.word, cx.lifted, "{val=%s}"))
 			elseif not empty_word(e.word) then
 				-- a bare word field-splits and globs for an INDEXED target, but is one plain word
 				-- in an ASSOCIATIVE key/value list (bash) — which one is only known at run time.
@@ -6383,10 +6452,7 @@ H.arrayassign = function(cx, st, after)
 					parts[#parts + 1] = emit_fields_into("__it", e.word, cx.lifted,
 						fl == e.word.src and "{val=%s}" or ("{val=%s" .. srcf .. "}"))
 				else
-					if not parts.asq then -- (asked once per statement)
-						parts.asq = true
-						parts[#parts + 1] = ("local __as = sh:is_assoc(%q)"):format(st.name)
-					end
+					asq()
 					parts[#parts + 1] = ("if __as then __it[#__it+1] = {val=%s%s} else %s end"):format(
 						emit_word(e.word, cx.lifted),
 						srcf,
@@ -6402,7 +6468,7 @@ H.arrayassign = function(cx, st, after)
 		cx.blocks[p] = dbg(st)
 			.. (cs and "do local n_ = sh.ncs; " or "do ")
 			.. table.concat(parts, "; ")
-			.. ("; rt.arrayassign(sh, %q, __it, %s)"):format(st.name, tostring(st.append and true or false))
+			.. ("; rt.arrayassign_stmt(sh, %q, __it, %s)"):format(st.name, tostring(st.append and true or false))
 			.. (cs and "; if sh.status == 0 and sh.ncs ~= n_ then sh.status = sh.last_cmdsub_status end end" or " end")
 			.. ecs
 			.. ("; pc = %d"):format(after)
