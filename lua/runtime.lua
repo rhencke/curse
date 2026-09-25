@@ -12747,4 +12747,48 @@ do
 	end
 end
 
+-- A function definition the compiled tier compiled as a closure of its own (a redirected,
+-- redefined, builtin-named or nested `name() { … }`): registered when the DEFINITION runs,
+-- in program order — the twin of interp exec_stmt's funcdef branch. `st` is the definition
+-- (its AST: `declare -f` prints it, a def redirect applies per call), `fn` the body.
+function M.def_function(sh, st, fn)
+	local name = st.name
+	local badname = not name:match("^[%w_:%.+@/%%%^~,!][%w_%.%-:+@/!#=%%%^~,]*$")
+	if badname or (sh.opt_posix and not name:match("^[%a_][%w_]*$")) then
+		M.err_at(sh, st.top and st.eline, "curse: `" .. name .. "': not a valid identifier\n")
+		sh.status = 1
+		if not badname and not sh.opt_i then -- (posix: a fatal error)
+			error({ __curse_exit = 2 })
+		end
+		return
+	end
+	if sh.fn_ro and sh.fn_ro[name] then -- `readonly -f`: can't be redefined
+		M.err_at(sh, st.top and st.eline, "curse: " .. name .. ": readonly function\n")
+		sh.status = 1
+		return
+	end
+	if sh.opt_posix and M.SPECIAL_BUILTIN[name] then -- posix: can't shadow a special builtin
+		io.stderr:write("curse: `" .. name .. "': is a special builtin\n")
+		sh.status = 2
+		error({ __curse_exit = 2 })
+	end
+	sh.functions[name] = M.mark_compiled(fn)
+	sh.func_redirs = sh.func_redirs or {}
+	sh.func_redirs[name] = st.redirs
+	sh.func_src = sh.func_src or {}
+	sh.func_src[name] = nil -- (printed text: deparsed from the definition on demand)
+	sh.func_def = sh.func_def or {}
+	sh.func_def[name] = st
+	if sh.fexport and sh.fexport[name] then
+		M.fexport_sync(sh, name)
+	end
+	sh.func_line = sh.func_line or {}
+	sh.func_line[name] = st.line
+	sh.func_bline = sh.func_bline or {}
+	sh.func_bline[name] = st.bline
+	sh.func_file = sh.func_file or {}
+	sh.func_file[name] = M.def_source(sh)
+	sh.status = 0
+end
+
 return M

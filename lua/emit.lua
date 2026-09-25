@@ -4490,8 +4490,22 @@ H.funcdef = function(cx, st, after)
 	-- pipeline stage …) has no hoisted closure: interp defines it, when it runs.
 	-- def-redirect and redefined funcs: interp registers the def (with func_redirs, or
 	-- in program order for a redefinition) — the compiled fn_x can't represent either.
+	-- Such a definition compiles its body as a closure of its own (an emit_fragment, lifted
+	-- upvalues shared like a fn_x), which rt.def_function registers when the definition runs
+	-- (its calls dispatch through the runner, which applies a def redirect per call).
 	if st.redirs or emit_redir_funcs[st.name] or not cx.funcflags[st.name] then
-		return cx.delegate(st, after)
+		local sv = { EF.cur_infunc, EF.cur_loopn, EF.cs_active, EF.cs_in_func, EF.cs_in_loop, EF.fn_locals }
+		EF.cur_infunc, EF.cur_loopn, EF.cs_active, EF.cs_in_func, EF.cs_in_loop, EF.fn_locals =
+			true, 0, nil, nil, nil, nil
+		local id = emit_fragment(st.body, nil, EF.lifted_set, nil)
+		EF.cur_infunc, EF.cur_loopn, EF.cs_active, EF.cs_in_func, EF.cs_in_loop, EF.fn_locals = unpack(sv, 1, 6)
+		if not id then
+			return cx.delegate(st, after)
+		end
+		local p = cx.newpc()
+		cx.blocks[p] = ("rt.def_function(sh, %s[1], %s); pc = %d"):format(
+			EF.konst({ ser(st) }), EF.upv_wrapped(("__CS[%d]"):format(id)), after)
+		return p
 	end
 	local p = cx.newpc()
 	if not st.name:match("^[%w_:%.+@/%%%^~,!][%w_%.%-:+@/!#=%%%^~,]*$") then -- name is an expansion (`$foo-bar()`):
@@ -4700,11 +4714,19 @@ simple_compiled = function(cx, st, after)
 	if cmd and st.assigns and #st.assigns > 0 and require("interp")._int.SPECIAL_BUILTIN[cmd] then
 		return EF.simple_native(cx, st, after, cmd) or cx.delegate(st, after)
 	end
-	if cmd and emit_redir_funcs[cmd] then
-		return cx.delegate(st, after)
-	end -- call to a def-redirect func
+	if cmd and emit_redir_funcs[cmd] then -- call to a def-redirect/redefined/nested func:
+		return EF.simple_native(cx, st, after, cmd) or cx.delegate(st, after) -- the runner finds it
+	end
 	-- `local a=(…)` / `declare a=(…)`: the array value lives in st.arrayargs, which
 	-- the native builtin paths don't render — interp does the scope-aware array assign.
+	-- (in a nameref program a declaration may declare/assign THROUGH a nameref: the runner's
+	-- declaration builtin does that exactly — rather than the native local/array fast paths)
+	if EF.has_nameref and cmd and (cmd == "declare" or cmd == "typeset" or cmd == "local") then
+		local pn = EF.simple_native(cx, st, after, cmd)
+		if pn then
+			return pn
+		end
+	end
 	if st.arrayargs then
 		-- Native path: `declare`/`typeset`/`local NAME=(…)` whose flags are only -a/-A
 		-- (indexed/assoc) and/or -r (readonly). Reproduces interp's declare array branch
