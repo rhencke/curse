@@ -5801,7 +5801,11 @@ function Shell:special_get(name)
 		return tostring(os.time())
 	end
 	if name == "BASH_COMMAND" then
-		return self.cur_cmd and require("deparse").command_text(self.cur_cmd) or ""
+		local c = self.cur_cmd
+		if c and c.t == "case" and c.subject and c.subject.src then -- (just its head, blank and all)
+			return "case " .. c.subject.src .. " in "
+		end
+		return c and require("deparse").command_text(c) or ""
 	end
 	if name == "EPOCHREALTIME" then
 		local tv = ffi.new("struct curse_rt_timeval")
