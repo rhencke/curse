@@ -4277,6 +4277,17 @@ end
 -- explicitly instead of closing over build_cfg.
 local H = {}
 
+-- An assignment the specialized paths below don't cover (a nameref program's element/append/
+-- arith write, a value or subscript the compiled engine can't render, HISTSIZE/SHELLOPTS…):
+-- rt.assign_full, the runtime twin of interp's assign statement (the value through the shared
+-- one-word expander). The delegate wrapper gives it the lifted-var sync and errexit.
+EF.assign_native = function(cx, st, after)
+	return cx.delegate(st, after, {
+		prelude = dbg(st) ~= "" and dbg(st) or nil,
+		callee = "rt.assign_full",
+		callargs = ("sh, %s[1]"):format(EF.konst({ ser(st) })),
+	})
+end
 -- statement handler: assign (split out of flatten_stmt; see H)
 H.assign = function(cx, st, after)
 	local t = st.t
@@ -4296,26 +4307,26 @@ H.assign = function(cx, st, after)
 			if not ok then
 				error(pn, 0)
 			end
-			local pd = cx.delegate(st, after)
+			local pd = EF.assign_native(cx, st, after)
 			local pg = cx.newpc()
 			cx.blocks[pg] = ("if rt.plain_scalar(sh, %q) then pc = %d else pc = %d end"):format(st.name, pn, pd)
 			return pg
 		end
-		return cx.delegate(st, after)
+		return EF.assign_native(cx, st, after)
 	end
 	-- Assigning these fires a side effect only interp's assign implements (resize
 	-- history / truncate the histfile); a native set_str would skip it. Delegate.
 	if not st.index and (st.name == "HISTSIZE" or st.name == "HISTFILESIZE") then
-		return cx.delegate(st, after)
+		return EF.assign_native(cx, st, after)
 	end
 	-- SHELLOPTS/BASHOPTS are readonly derived specials with no var box, so neither a
 	-- bare native set nor I.assign_scalar rejects them. Always delegate so interp
 	-- reports "readonly variable" (status 1), as bash does.
 	if not st.index and (st.name == "SHELLOPTS" or st.name == "BASHOPTS") then
-		return cx.delegate(st, after)
+		return EF.assign_native(cx, st, after)
 	end
 	if (st.rhs and not emitable_word(st.rhs)) or (st.arith and arith_side_effect(st.arith)) then
-		return cx.delegate(st, after)
+		return EF.assign_native(cx, st, after)
 	end
 	-- a[i]=v / a[i]+=v: compile when the subscript is a non-empty emit_word-able word (rt
 	-- .assign_element resolves it as an assoc key or an indexed arith at runtime). An empty
@@ -4324,18 +4335,18 @@ H.assign = function(cx, st, after)
 	local iw
 	if st.index then
 		if st.index == "" then
-			return cx.delegate(st, after)
+			return EF.assign_native(cx, st, after)
 		end
 		local iok
 		iok, iw = pcall(require("parser").parse_word, st.index)
 		if not (iok and emitable_word(iw)) then
-			return cx.delegate(st, after)
+			return EF.assign_native(cx, st, after)
 		end
 		-- a cmdsub/procsub subscript is expanded once by emit_word AND (for indexed) arith-
 		-- evaluated from the raw — two evals of a side-effecting sub. Delegate those.
 		for _, pp in ipairs(iw.parts) do
 			if pp.cmdsub or pp.procsub then
-				return cx.delegate(st, after)
+				return EF.assign_native(cx, st, after)
 			end
 		end
 	end

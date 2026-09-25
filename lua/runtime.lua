@@ -12823,4 +12823,199 @@ function M.def_function(sh, st, fn)
 	sh.status = 0
 end
 
+-- A variable assignment statement the specialized compiled paths don't cover — a nameref
+-- program's element/append/arith assignment (it may write THROUGH the reference), a value or
+-- subscript the compiled word engine can't render, a side-effecting arith value, HISTSIZE/
+-- HISTFILESIZE (resize the history), the readonly specials SHELLOPTS/BASHOPTS: the twin of
+-- interp exec_stmt's `assign` branch. The value expands through the shared one-word
+-- expander, the arithmetic through the evaluator; `st` is the assignment (a constant).
+function M.assign_body_full(sh, st, nref_base, nref_sub)
+	local I = require("interp")
+	local II = I._int
+	local function rhs_a()
+		sh.x_rhs = I.expand_assign_word(sh, st.rhs)
+		return sh.x_rhs
+	end
+	if nref_base then
+		sh:array_set(nref_base, II.array_key(sh, nref_base, nref_sub), rhs_a(), st.append)
+	elseif st.index then
+		-- the VALUE expands before the subscript (bash assign_array_element)
+		local v = rhs_a()
+		local key = II.array_key(sh, st.name, st.index)
+		if key == "" and sh:is_assoc(st.name) then
+			error({ __curse_badsub = true })
+		end
+		if not sh:array_set(st.name, key, v, st.append) then
+			error({ __curse_badsub = true })
+		end
+	elseif st.arith then
+		sh:aset(st.name, II.eval(sh, st.arith))
+	elseif st.append then
+		local b = sh.vars[sh:deref(st.name)]
+		if b and b.arr then -- (`name+=value` on an array appends to element 0)
+			sh:array_set(st.name, II.array_key(sh, st.name, "0"), rhs_a(), true)
+		elseif b and b.int then
+			local w = II.expand_word(sh, st.rhs)
+			sh.x_rhs = w
+			sh:aset(st.name, M.int_value(sh, sh:get(st.name)) + M.int_value(sh, w, I.arith_eval_str))
+		elseif b and (b.lower or b.upper) then
+			local v = sh:get(st.name) .. rhs_a()
+			sh:set_str(st.name, b.lower and v:lower() or v:upper())
+		else
+			M.append_scalar(sh, st.name, rhs_a())
+		end
+	else
+		local b = sh.vars[sh:deref(st.name)]
+		if b and b.arr then
+			sh:array_set(st.name, II.array_key(sh, st.name, "0"), rhs_a(), false)
+		elseif b and b.int and not b.ref then
+			local w = II.expand_word(sh, st.rhs)
+			sh.x_rhs = w
+			sh:aset(st.name, M.int_value(sh, w, I.arith_eval_str))
+		elseif b and (b.lower or b.upper) then
+			local v = rhs_a()
+			sh:set_str(st.name, b.lower and v:lower() or v:upper())
+		elseif sh:set_str(st.name, rhs_a()) == false then
+			error({ __curse_exit = 1, __curse_lineabort = true }) -- (a bad nameref target)
+		end
+	end
+end
+function M.assign_full(sh, st)
+	local ncs0 = sh.ncs
+	if st.name == "SHELLOPTS" or st.name == "BASHOPTS" then -- readonly specials (bash)
+		io.stderr:write("curse: " .. st.name .. ": readonly variable\n")
+		sh.status = 1
+		if sh.opt_c or sh.opt_posix then
+			error({ __curse_exit = 1 })
+		end
+		error({ __curse_exit = 1, __curse_lineabort = true })
+	end
+	if st.index == "" then -- `a[]=v`: a bad array subscript (status 1, no assignment, the
+		io.stderr:write("curse: " .. st.name .. "[]: bad array subscript\n") -- line abandoned)
+		sh.status = 1
+		error({ __curse_exit = 1, __curse_lineabort = true })
+	end
+	local rb = sh.vars[sh:deref(st.name)]
+	-- a nameref whose target carries a subscript: `ref=v` writes THROUGH to that element
+	local nref_base, nref_sub
+	if not st.index and not st.arith then
+		local nb = sh.vars[st.name]
+		local selfsub = nb and nb.ref and nb.s and sh:self_elem_unref(st.name)
+		if selfsub then
+			nref_base, nref_sub = st.name, selfsub
+		elseif nb and nb.ref and nb.s then
+			if nb.s ~= "" and sh:deref(st.name) == "" then -- (a reference cycle: said on write)
+				io.stderr:write("curse: warning: " .. st.name .. ": circular name reference\n")
+				sh.status = 1
+				return
+			elseif nb.outer and nb.s:find("[", 1, true) then
+				io.stderr:write("curse: `" .. nb.s .. "': not a valid identifier\n")
+				error({ __curse_exit = 1, __curse_lineabort = true })
+			elseif nb.outer then
+				io.stderr:write("curse: warning: " .. st.name .. ": circular name reference\n")
+			end
+			nref_base, nref_sub = (sh:deref_elem(st.name) or ""):match("^([%a_][%w_]*)%[(.+)%]$")
+		end
+	end
+	if st.index then -- `ref[i]=` through a reference to an element: not a valid identifier
+		local nb = sh.vars[st.name]
+		if nb and nb.ref and nb.s and nb.s:match("^[%a_][%w_]*%[.+%]$") then
+			io.stderr:write("curse: `" .. nb.s .. "': not a valid identifier\n")
+			sh.status = 1
+			return
+		end
+		if nb and nb.ref and nb.s == nil and not nb.arr then
+			io.stderr:write("curse: `': not a valid identifier\n")
+			error({ __curse_exit = 1, __curse_lineabort = true })
+		end
+	end
+	-- a negative subscript past the start of a READONLY array: reported before readonly-ness
+	if st.index and not st.arith and rb and rb.ro and rb.arr and not rb.assoc and st.index:find("-", 1, true) then
+		local k = require("interp")._int.array_key(sh, st.name, st.index)
+		if M.neg_oob(sh, st.name, k) then
+			io.stderr:write("curse: " .. st.name .. "[" .. st.index .. "]: bad array subscript\n")
+			sh.status = 1
+			error({ __curse_exit = 1, __curse_lineabort = true })
+		end
+	end
+	if rb and rb.ro then -- readonly: rejected; aborts the rest of the line (fatal: -c/posix)
+		io.stderr:write("curse: " .. sh:deref(st.name) .. ": readonly variable\n")
+		sh.status = 1
+		if sh.opt_c or sh.opt_posix then
+			error({ __curse_exit = 1 })
+		end
+		error({ __curse_exit = 1, __curse_lineabort = true })
+	end
+	sh.x_rhs = nil
+	local aok, aerr = pcall(M.assign_body_full, sh, st, nref_base, nref_sub)
+	if not aok then
+		if type(aerr) == "table" and aerr.__curse_badsub then
+			io.stderr:write("curse: " .. st.name .. "[" .. tostring(st.index) .. "]: bad array subscript\n")
+			sh.status = 1
+			sh.assign_err = true
+			error({ __curse_exit = 1, __curse_lineabort = true })
+		elseif type(aerr) == "table" and aerr.__curse_experr and not aerr.__curse_lineabort then
+			sh.status = 1 -- (a bad substitution in the value: non-fatal)
+			sh.assign_err = true
+			return
+		end
+		error(aerr, 0)
+	end
+	if sh.opt_x then -- (set -x turned on at run time, by eval'd code)
+		local I = require("interp")
+		local lhs = st.index and (st.name .. "[" .. st.index .. "]") or st.name
+		if st.append then
+			if sh.x_rhs then
+				I.xtrace(sh, { lhs .. "+=" .. (sh.x_rhs == "" and "" or I._int.xtrace_quote(sh.x_rhs)) }, true)
+			end
+		else
+			local v = sh:get(lhs) or ""
+			I.xtrace(sh, { lhs .. "=" .. (v == "" and "" or I._int.xtrace_quote(v)) }, true)
+		end
+	end
+	if sh.opt_a and not st.index then -- set -a: a scalar assignment exports it
+		local b = sh.vars[sh:deref(st.name)]
+		if b and not b.arr then
+			b.exported = true
+			C.setenv(st.name, sh:get(st.name), 1)
+		end
+	end
+	if not st.index and (st.name == "HISTSIZE" or st.name == "HISTFILESIZE") then
+		M.hist_resize(sh, st.name)
+	end
+	sh.status = sh.ncs ~= ncs0 and sh.last_cmdsub_status or 0
+	sh:set_str("_", "")
+end
+-- HISTSIZE shrinks the in-memory history; HISTFILESIZE truncates $HISTFILE — both to the
+-- last N entries, on assignment (bash)
+function M.hist_resize(sh, name)
+	local nsz = tonumber(sh:get(name))
+	if not (nsz and nsz >= 0) then
+		return
+	end
+	if name == "HISTSIZE" and sh.history then
+		require("hist").stifle(sh)
+	elseif name == "HISTFILESIZE" then
+		local hf = sh:get("HISTFILE")
+		if hf and hf ~= "" then
+			local lines, f = {}, io.open(hf, "r")
+			if f then
+				for l in f:lines() do
+					lines[#lines + 1] = l
+				end
+				f:close()
+			end
+			if #lines > nsz then
+				local o = io.open(hf, "w")
+				if o then
+					for k = #lines - nsz + 1, #lines do
+						o:write(lines[k], "\n")
+					end
+					o:close()
+				end
+			end
+		end
+	end
+end
+
 return M

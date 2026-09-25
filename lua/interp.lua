@@ -5854,10 +5854,13 @@ exec_stmt = function(sh, st, hook)
 			end
 			error({ __curse_exit = 1, __curse_lineabort = true })
 		end
-		if st.index == "" then -- `a[]=v`: empty subscript is a bad array subscript (bash: status 1, no assign)
-			io.stderr:write("curse: " .. st.name .. "[]: bad array subscript\n")
-			sh.status = 1
-			return
+		if st.index == "" then -- `a[]=v`: empty subscript is a bad array subscript (bash: status 1, no
+			io.stderr:write("curse: " .. st.name .. "[]: bad array subscript\n") -- assign, the rest of
+			sh.status = 1 -- the line abandoned; as a prefix binding it's just skipped)
+			if sh.applying_prefix then
+				return
+			end
+			error({ __curse_exit = 1, __curse_lineabort = true })
 		end
 		local rb = sh.vars[sh:deref(st.name)]
 		-- A nameref whose target carries a subscript (declare -n ref='A[K]'): a plain
@@ -7861,6 +7864,8 @@ M._int = {
 	read_split = read_split,
 	do_arrayassign = do_arrayassign,
 	arrayassign_items = arrayassign_items,
+	expand_word = expand_word,
+	xtrace_quote = xtrace_quote,
 	unset_arrayref = unset_arrayref,
 	eval = eval,
 	fmt_decl = fmt_decl,
