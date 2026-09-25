@@ -1704,6 +1704,38 @@ end
 function M.ps_drain(sh, m)
 	require("interp")._int.drain_procsub(sh, m[1], m[2])
 end
+-- An assignment-only statement (`x=<(…)`, `a=( <(…) )`) is a null command: the <()
+-- it registered (past count nf) closes when it ends — unless it is a command's prefix
+-- binding (closed after that command) or one binding of an assignment list / a null
+-- command's assigns (closed after the whole list: `x=<(…) y=$(cat $x)` reads it).
+function M.assign_drain(sh, st, nf)
+	if #sh.procsub_files <= nf or sh.applying_prefix then
+		return
+	end
+	local al = sh.cur_alist
+	if al == true or al == st then
+		return -- (a compiled assignment statement's own ps_adrain closes them)
+	elseif al then
+		local l = al.list or al.assigns or {}
+		for i = 1, #l do
+			if l[i] == st then
+				return
+			end
+		end
+	end
+	require("interp")._int.drain_procsub(sh, 0, nf)
+end
+-- ps_mark/ps_drain around a compiled assignment-only statement (a delegated binding
+-- sees sh.cur_alist == true: it leaves the draining to ps_adrain)
+function M.ps_amark(sh)
+	local m = M.ps_mark(sh)
+	m[3], sh.cur_alist = sh.cur_alist, true
+	return m
+end
+function M.ps_adrain(sh, m)
+	sh.cur_alist = m[3]
+	require("interp")._int.drain_procsub(sh, m[1], m[2])
+end
 function M.redir_discard(saves)
 	if saves.out_sh then
 		io.flush()
@@ -9703,12 +9735,13 @@ function M.expand_fields(sh, segs)
 	local ifs = (M.ifs(sh) or " \t\n")
 	-- Memoize the IFS char-set parse (shared with expand_to_fields via sh._ifscache).
 	local ic = sh._ifscache
-	if not ic or ic.ifs ~= ifs then
+	if not ic or ic.ifs ~= ifs or ic.lg ~= M.locale_gen then -- (a locale change re-splits `é`)
 		local set = {}
 		for _, ch in ipairs(M.mb_chars(ifs)) do
 			set[ch.s] = true
 		end
-		ic = { ifs = ifs, set = set, mbifs = M.lc_mb_cur_max() > 1 and ifs:find("[\128-\255]") ~= nil }
+		ic = { ifs = ifs, set = set, mbifs = M.lc_mb_cur_max() > 1 and ifs:find("[\128-\255]") ~= nil,
+			lg = M.locale_gen }
 		sh._ifscache = ic
 	end
 	local ifsset, mbifs = ic.set, ic.mbifs
