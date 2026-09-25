@@ -2657,7 +2657,11 @@ local function emit_fields_into(tbl, w, lifted, wrap)
 	if seg_native(w, lifted) then
 		local segs = {}
 		for i, p in ipairs(w.parts) do
-			segs[#segs + 1] = emit_seg(p, i, lifted, w)
+			local sg = emit_seg(p, i, lifted, w)
+			if p.dqat then -- a part of a "…$@…" segment (parser tag): see rt.expand_fields
+				sg = ("rt.dqseg(%s, %s)"):format(sg, tostring(p.dqend or false))
+			end
+			segs[#segs + 1] = sg
 		end
 		return ("do local __f = rt.expand_fields(sh, {%s}); for __i=1,#__f do %s[#%s+1]=%s end end"):format(
 			table.concat(segs, ", "),

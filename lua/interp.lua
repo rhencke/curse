@@ -2529,11 +2529,18 @@ expand_fields_full = function(sh, w, pre1) -- pre1: part 1 already expanded (a $
 			end
 		end
 	end
+	local dq_null, dq_at -- (a "…" segment tagged dqat: an empty part seen / a "$@" gave no words)
 	for pi, p in ipairs(w.parts) do
 		if is_multi(sh, p) then
 			local els, star, qforced = multi_elems(sh, p) -- qforced: a quoted multi alternate
 			if p.q or qforced then
-				if star then -- "$*" / "${a[*]}" join with the first char of IFS
+				if p.dqat and #els == 0 then
+					if star then
+						dq_null = true
+					else
+						dq_at = true
+					end
+				elseif star then -- "$*" / "${a[*]}" join with the first char of IFS
 					local sep = rt.ifs_sep(sh)
 					add(table.concat(els, sep), false)
 				else
@@ -2689,11 +2696,19 @@ expand_fields_full = function(sh, w, pre1) -- pre1: part 1 already expanded (a $
 				-- marks the other commands' args `plainarg`)
 				s = tilde_word_initial(sh, s, #w.parts > 1, sh.opt_posix and w.plainarg)
 			end -- word-initial / NAME= ~
-			if p.q or p.lit ~= nil then
+			if p.dqat and s == "" then
+				dq_null = true
+			elseif p.q or p.lit ~= nil then
 				add(s, not p.q)
 			else
 				feed_split(s)
 			end
+		end
+		if p.dqend then -- end of a "…$@…" segment: its empty parts make a null word unless "$@" was empty
+			if dq_null and not dq_at then
+				add("", false)
+			end
+			dq_null, dq_at = nil, nil
 		end
 	end
 	brk()

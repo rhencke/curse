@@ -9073,6 +9073,12 @@ end
 -- "1"=masked) so `"$x"foo*` globs foo* but not $x's content. $@/$*/array (multi-
 -- element) parts are NOT in this subset — those stay on expand_to_fields. Kept
 -- byte-for-byte in lockstep with expand_to_fields' feed_split/add + glob tail.
+-- Tag a segment as part of a double-quoted "…" that holds "$@" (the parser's dqat/dqend):
+-- if the @ expands to no words and the rest to empty, the segment is no word at all.
+function M.dqseg(seg, dqend)
+	seg.dq, seg.dqend = true, dqend
+	return seg
+end
 function M.expand_fields(sh, segs)
 	local s1 = #segs == 1 and segs[1]
 	if s1 and s1.multi and s1.q and not s1.star then -- a lone "$@" / "${a[@]}": its elements
@@ -9166,8 +9172,15 @@ function M.expand_fields(sh, segs)
 			end
 		end
 	end
+	local dq_null, dq_at -- (a "…$@…" segment's parts, rt.dqseg: as interp's expand_to_fields)
 	for _, seg in ipairs(segs) do
-		if seg.multi then
+		if seg.dq and (seg.multi and #seg.elems == 0 or seg.s == "") then
+			if seg.multi and not seg.star then
+				dq_at = true
+			else
+				dq_null = true
+			end
+		elseif seg.multi then
 			-- a $@ / $* part: multiple elements (seg.elems), joined/split per bash. Quoted
 			-- "$@" is one field PER element (each concatenates with the abutting text — the
 			-- first with what precedes, the last with what follows); quoted "$*" joins on
@@ -9198,6 +9211,12 @@ function M.expand_fields(sh, segs)
 			feed_split(seg.s)
 		else
 			add(seg.s, seg.unq)
+		end
+		if seg.dqend then -- end of a "…$@…" segment: empty parts make a null word unless "$@" was empty
+			if dq_null and not dq_at then
+				add("", false)
+			end
+			dq_null, dq_at = nil, nil
 		end
 	end
 	brk()
