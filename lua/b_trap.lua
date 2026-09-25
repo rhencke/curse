@@ -25,12 +25,14 @@ return function(sh, cmd, args, hook, tcb)
 			if args[j] == "--help" then -- (CASE_HELPOPT: the builtin's help, status 2)
 				require("b_help")(sh, "help", { "help", "trap" })
 				sh.status = 2
+				sh.spb_err = 2 -- (EX_USAGE: rt.spb_run)
 				return
 			end
 			if not args[j]:match("^%-[lp]+$") then
 				io.stderr:write("curse: trap: -" .. args[j]:match("^%-[lp]*(.)") .. ": invalid option\n")
 				io.stderr:write(usage)
 				sh.status = 2
+				sh.spb_err = 2 -- (EX_USAGE: rt.spb_run)
 				return
 			end
 			lflag = lflag or args[j]:find("l", 2, true) ~= nil
@@ -108,6 +110,7 @@ return function(sh, cmd, args, hook, tcb)
 			if sigstart > #args then -- an action with no signal spec is a usage error
 				io.stderr:write(usage)
 				sh.status = 2
+				sh.spb_err = 2 -- (EX_USAGE: rt.spb_run)
 				return
 			end
 			-- a subshell's first set/reset drops the trap strings it inherited — before the

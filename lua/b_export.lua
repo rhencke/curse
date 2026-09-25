@@ -141,9 +141,10 @@ return function(sh, cmd, args, hook, tcb)
 		if opterr then -- an unknown attribute letter: bash prints usage and fails (status 2)
 			io.stderr:write("curse: " .. cmd .. ": -" .. opterr .. ": invalid option\n" .. rt.usage(cmd))
 			sh.status = 2
+			sh.spb_err = 2 -- (EX_USAGE: see rt.spb_run)
 			return
 		end
-		if ro_n and not (funcnames or funcbody or printmode) then -- `readonly -n NAME[=V]`:
+		if ro_n and #rest > 0 and not (funcnames or funcbody or printmode) then -- `readonly -n NAME[=V]`:
 			local st = 0 -- just the assignments, no attribute
 			for _, a in ipairs(rest) do
 				local nm, v = a:match("^([^=]*)=(.*)$")
@@ -251,15 +252,18 @@ return function(sh, cmd, args, hook, tcb)
 			-- set function attributes (nothing printed): -t trace (inherits DEBUG/RETURN),
 			-- -r readonly (can't be redefined or unset), -x export (the function goes into
 			-- the environment as BASH_FUNC_NAME%% — rt.fexport_sync; -n/+x un-exports)
+			-- (setattr.def: export/readonly say why a name fails — not a function, or, unless
+			-- undoing, not an exportable name (exportable_function_name: no `/` or `=`);
+			-- declare -f[rx] fails silently, and exports any function's name)
 			local allok = true
 			for _, nm in ipairs(rest) do
-				if (cmd == "export" or doexport) and (nm:find("=", 1, true) or nm:find("/", 1, true)) then
-					io.stderr:write("curse: " .. cmd .. ": " .. nm .. ": cannot export\n")
-					allok = false
-				elseif not sh.functions[nm] then
-					if cmd == "export" or doexport then
+				if not sh.functions[nm] then
+					if not isdecl then
 						io.stderr:write("curse: " .. cmd .. ": " .. nm .. ": not a function\n")
 					end
+					allok = false
+				elseif cmd == "export" and not unexport and (nm:find("=", 1, true) or nm:find("/", 1, true)) then
+					io.stderr:write("curse: " .. cmd .. ": " .. nm .. ": cannot export\n")
 					allok = false
 				elseif plusr and sh.fn_ro and sh.fn_ro[nm] then
 					io.stderr:write("curse: " .. cmd .. ": " .. nm .. ": readonly function\n")
@@ -297,6 +301,15 @@ return function(sh, cmd, args, hook, tcb)
 					end
 				end
 				table.sort(names)
+				if sh.opt_posix and not isdecl then
+					-- (posix mode: show_var_attributes prints no definitions, and the
+					-- attribute string keeps only a/A/f — `export -f NAME`)
+					for _, nm in ipairs(names) do
+						sh:echo(cmd .. " -f " .. nm)
+					end
+					sh.status = 0
+					return
+				end
 			end
 			local function fdecl(nm) -- `declare -f[r][t][x] NAME`
 				return "declare -f" .. (fro[nm] and "r" or "") .. (ftr[nm] and "t" or "") .. (fx[nm] and "x" or "") .. " " .. nm
@@ -475,6 +488,16 @@ return function(sh, cmd, args, hook, tcb)
 					io.stderr:write("curse: " .. pfx .. nm .. ": readonly variable\n")
 					badassign = true -- (declare.def assign_error: EX_BADASSIGN)
 					allok = false
+					if not isdecl and not nref then -- (setattr.def's set_var_attribute runs anyway)
+						local dn = sh:deref(nm)
+						if unexport then
+							rov.exported = nil
+							sh:env_resync(dn)
+						elseif doexport then
+							rov.exported = true
+							C.setenv(dn, sh:get(dn), 1)
+						end
+					end
 				elseif
 					nm
 					and (
@@ -626,8 +649,9 @@ return function(sh, cmd, args, hook, tcb)
 							sh:env_resync(nm) -- (a shadowed exported global keeps its env value)
 						elseif doexport or sh.opt_a then
 							xb.exported = true
-							C.setenv(nm, xval, 1)
-							if nm == "TZ" then rt.tzset() end
+							local en = nref and nm or sh:deref(nm) -- (through a nameref: the target)
+							C.setenv(en, xval, 1)
+							if en == "TZ" then rt.tzset() end
 						end
 					end
 					if plusn then -- `typeset +n ref=v`: v went THROUGH the ref; then it's plain
@@ -692,7 +716,7 @@ return function(sh, cmd, args, hook, tcb)
 						elseif iattr then -- (`declare -ni ref`: the reference itself takes -i)
 							sh.vars[a].int = true
 						end
-					elseif iattr and not ((assoc or aattr) and cmd ~= "readonly") then
+					elseif iattr and not ((assoc or aattr) and isdecl) then
 						local dn = sh:deref(a) -- (through a nameref: the target, created if need be)
 						sh.vars[dn] = sh.vars[dn] or {}
 						sh.vars[dn].int = true
@@ -700,14 +724,16 @@ return function(sh, cmd, args, hook, tcb)
 							local ib = sh.vars[dn]
 							ib.lower, ib.upper, ib.cap = lattr or nil, uattr or nil, cattr or nil
 						end
-					elseif (lattr or uattr or cattr) and not ((assoc or aattr) and cmd ~= "readonly") then
+					elseif (lattr or uattr or cattr) and not ((assoc or aattr) and isdecl) then
 						local dn = sh:deref(a)
 						sh.vars[dn] = sh.vars[dn] or {}
 						sh.vars[dn].lower = lattr or nil
 						sh.vars[dn].upper = uattr or nil
 						sh.vars[dn].cap = cattr or nil
-					elseif assoc and (cmd ~= "readonly" or (sh.arrayargs_pending and sh.arrayargs_pending[a])) then
-						-- (readonly -A applies the attribute only with a compound value)
+					elseif assoc and (isdecl or (sh.arrayargs_pending and sh.arrayargs_pending[a])) then
+						-- (export/readonly -A apply the attribute only with a compound value:
+						-- setattr.def turns `readonly -A h=(…)` into `declare -grA`, and a bare
+						-- name just gets its export/readonly attribute)
 						-- bash forbids converting an existing indexed array to associative
 						-- (`readonly -A` with NO value does NOT apply the attribute — bash then
 						-- shows just `declare -r`, so let it fall through to the plain-var branch)
@@ -728,7 +754,7 @@ return function(sh, cmd, args, hook, tcb)
 								sh.vars[sh:deref(a)].empty_decl = true
 							end -- declared, never assigned
 						end
-					elseif aattr and cmd ~= "readonly" then -- `declare -a`: mark an (empty) indexed array; convert a scalar to [0]
+					elseif aattr and (isdecl or (sh.arrayargs_pending and sh.arrayargs_pending[a])) then -- `declare -a`: mark an (empty) indexed array; convert a scalar to [0]
 						local b = sh.vars[a] or {}
 						if b.ro and b.assoc then -- (readonly is reported before any conversion)
 							io.stderr:write("curse: " .. a .. ": readonly variable\n")
@@ -757,15 +783,15 @@ return function(sh, cmd, args, hook, tcb)
 								b.empty_decl = true
 							end -- declared, never assigned
 						end
-					else
-						sh.vars[a] = sh.vars[a] or {}
+					elseif not (unexport and not isdecl) then -- (`export -n NAME` binds nothing:
+						sh.vars[a] = sh.vars[a] or {} -- set_var_attribute's undo only finds a var)
 					end -- `declare x` (or `readonly -a/-A` with no value) creates a declared-but-unset var
 					local bb = sh.vars[sh:deref(a)]
-					if not bb and not nref and (roattr or doexport) then -- `readonly ref`: the
+					if not bb and not nref and (roattr or (doexport and not unexport)) then -- `readonly ref`: the
 						bb = {} -- nameref's (unset) target gets the attribute, and so exists
 						sh.vars[sh:deref(a)] = bb
 					end
-					if bb and (assoc or aattr) and cmd ~= "readonly" and not nref then -- (`declare -Ai`: both)
+					if bb and (assoc or aattr) and isdecl and not nref then -- (`declare -Ai`: both)
 						if iattr then
 							bb.int = true
 						end
@@ -893,7 +919,9 @@ return function(sh, cmd, args, hook, tcb)
 					end
 				else -- a token that isn't a valid name (`FOO-BAR`, `1x`, …): bash errors
 					io.stderr:write("curse: " .. cmd .. ": `" .. a .. "': not a valid identifier\n")
-					badassign = true -- (declare.def assign_error: EX_BADASSIGN)
+					-- (declare.def assign_error: EX_BADASSIGN; setattr.def's assignment() doesn't
+					-- take such a word for one — just a failure)
+					badassign = badassign or isdecl
 					allok = false
 				end
 				do
@@ -925,6 +953,8 @@ return function(sh, cmd, args, hook, tcb)
 			rt.assign_ctx = nil
 			if badassign and isdecl then -- (exit status 4 as a pipeline stage: see rt stage_body)
 				sh.badassign = true
+			elseif badassign then -- (setattr.def's EX_BADASSIGN: fatal to a posix shell — rt.spb_run)
+				sh.spb_err = 1
 			end
 			if unswap then
 				if sh.arrayargs_pending then

@@ -139,6 +139,9 @@ return function(sh, st, args, hook, viacmd)
 			restore_redirs(sv)
 		end
 		sh.status = 2
+		if sh.opt_posix and not viacmd and not sh.opt_i then -- (EX_USAGE: rt.spb_run's rule)
+			rt.spb_exit(sh, 2, sh.spb_neg)
+		end
 		return
 	end
 	if type(sv) == "table" then -- the redirections persist: the saved originals are dropped

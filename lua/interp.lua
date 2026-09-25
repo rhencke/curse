@@ -4662,6 +4662,11 @@ local function command_describe(sh, args, j, verbose, usep)
 end
 local function exec_simple(sh, args, hook, no_func)
 	local cmd = args[1]
+	if sh.opt_posix and not no_func and SPECIAL_BUILTIN[cmd] and not sh.opt_i then
+		-- a special builtin's error can end a non-interactive posix shell (rt.spb_run) —
+		-- not when `command`/`builtin` runs it: those dispatch with no_func
+		return rt.spb_run(sh, exec_simple, sh, args, hook, true)
+	end
 	-- Consume any pending tempenv-call marker (set by exec_stmt for `x=v cmd`): only
 	-- the FIRST command dispatched under it may claim those bindings. A direct
 	-- function call tags them with its frame; anything else (a builtin like `eval`,
@@ -5201,24 +5206,7 @@ local ASSIGN_CMD = { export = 1, declare = 1, typeset = 1, readonly = 1, ["local
 -- POSIX "special built-in utilities": under `set -o posix`, a prefix assignment
 -- on one of these persists in the shell (see the prefix-assignment handling).
 -- `exec` is special too but is intercepted earlier with its own env handling.
-SPECIAL_BUILTIN = {
-	[":"] = 1,
-	["."] = 1,
-	source = 1,
-	eval = 1,
-	exec = 1,
-	exit = 1,
-	export = 1,
-	readonly = 1,
-	["set"] = 1,
-	shift = 1,
-	times = 1,
-	trap = 1,
-	unset = 1,
-	["break"] = 1,
-	["continue"] = 1,
-	["return"] = 1,
-}
+SPECIAL_BUILTIN = rt.SPECIAL_BUILTIN
 -- compound commands whose trailing redirs (`done < f`, `fi > f`) apply to the
 -- whole construct; handled generically below (simple/group/subshell do their own).
 local COMPOUND_REDIR = {
@@ -5894,6 +5882,9 @@ exec_stmt = function(sh, st, hook)
 				if not ok then
 					sh.status = 1
 					restore_redirs(save) -- open failed: skip the command
+					if sh.opt_posix and SPECIAL_BUILTIN[args[1]] and not sh.opt_i then
+						error({ __curse_exit = 1 }) -- (EX_REDIRFAIL: a special builtin's is fatal)
+					end
 				else
 					-- Only route builtin/captured output to the real fd 1 when a redirect
 					-- actually targets stdout; a stdin-only redirect (heredoc, `<`) must not
@@ -6454,7 +6445,13 @@ exec_stmt = function(sh, st, hook)
 		-- un-negated (noerr restored however it unwinds), then invert the status.
 		local ign = sh.opt_e and 1 or 0
 		sh.noerr = sh.noerr + ign
+		-- (`! set …` ignores its OWN special-builtin failure — rt.spb_run — not one inside
+		-- a function or group it runs)
+		local c1 = st.cmds and #st.cmds == 1 and st.cmds[1]
+		local w1 = c1 and c1.t == "simple" and c1.words and c1.words[1]
+		sh.spb_neg = w1 and #w1.parts == 1 and SPECIAL_BUILTIN[w1.parts[1].lit or ""] and true or nil
 		local ok, err = pcall(exec_stmt, sh, setmetatable({ negate = false }, { __index = st }), hook)
+		sh.spb_neg = nil
 		sh.noerr = sh.noerr - ign
 		if not ok then
 			error(err, 0)

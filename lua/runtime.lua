@@ -6173,6 +6173,7 @@ function M.builtin_help(sh, cmd)
 		end
 	end
 	sh.status = 2
+	sh.spb_err = 2 -- (EX_USAGE: M.spb_run)
 end
 -- `return N`'s status (bash's get_exitstat): N mod 256, or 2 with a message for a non-number.
 function M.return_code(sh, s)
@@ -6194,6 +6195,7 @@ end
 function M.bad_option(sh, cmd, opt)
 	io.stderr:write("curse: " .. cmd .. ": " .. opt .. ": invalid option\n" .. M.usage(cmd))
 	sh.status = 2
+	sh.spb_err = 2 -- (EX_USAGE: fatal from a special builtin in posix mode — M.spb_run)
 end
 -- The file a function being defined now belongs to (its ${BASH_SOURCE[0]} and error
 -- label): the file being sourced, else the script — but under -c there is none, and bash
@@ -10460,7 +10462,59 @@ M.ISO_BUILTIN = {
 	ulimit = M.iso_save_rlimits,
 	trap = M.iso_save_traps,
 }
+-- POSIX "special built-in utilities" (bash's SPECIAL_BUILTIN flag, `enable -s`): found
+-- before functions under `set -o posix`, a prefix assignment on one persists, and an error
+-- in one ends a non-interactive posix shell (M.spb_run).
+M.SPECIAL_BUILTIN = {
+	[":"] = 1, ["."] = 1, source = 1, eval = 1, exec = 1, exit = 1, export = 1, readonly = 1,
+	["set"] = 1, shift = 1, times = 1, trap = 1, unset = 1, ["break"] = 1, ["continue"] = 1,
+	["return"] = 1,
+}
+-- A special builtin run directly (not through `command`/`builtin`) by a non-interactive
+-- posix shell (execute_cmd.c execute_simple_command / execute_command_internal). A builtin
+-- flags its special failure in sh.spb_err: 1 for bash's EX_BADASSIGN / EX_REDIRFAIL /
+-- EX_EXPFAIL, which exit at once with status 1 whatever the context; 2 for EX_USAGE (and
+-- the other > EX_SHERRBASE codes), which set special_builtin_failed: the shell exits after
+-- the command, status 2 — unless its status is ignored (a condition, a non-final &&/||
+-- operand, or the command itself negated with `!`). A plain failure (status 1) goes on.
+function M.spb_run(sh, run, a1, a2, a3, a4)
+	local neg = sh.spb_neg -- (`! cmd`: consumed by the first special builtin it dispatches)
+	sh.spb_neg = nil
+	sh.spb_err = nil
+	run(a1, a2, a3, a4)
+	local e = sh.spb_err
+	if e then
+		sh.spb_err = nil
+		M.spb_exit(sh, e, neg)
+	end
+end
+-- A special builtin's redirection failed (EX_REDIRFAIL): fatal to a non-interactive posix
+-- shell, else just the failure (false) — the compiled tier's twin of interp's run_cmd check.
+function M.spb_redir(sh, rs)
+	if sh.opt_posix and not sh.opt_i then
+		M.redir_restore(rs)
+		sh.status = 1
+		error({ __curse_exit = 1 })
+	end
+	return false
+end
+-- (eval/source/. clear any flag left by the code they ran: only their own error counts)
+function M.spb_exit(sh, e, neg) -- (also exec's, which interp runs outside exec_simple)
+	if e == 1 then
+		sh.status = 1
+		error({ __curse_exit = 1 })
+	elseif sh.noerr == 0 and not neg then
+		sh.status = 2
+		error({ __curse_exit = 2 })
+	end
+end
 function M.builtin(sh, argv, hook)
+	if sh.opt_posix and M.SPECIAL_BUILTIN[argv[1]] and not sh.opt_i then
+		return M.spb_run(sh, M.builtin_run, sh, argv, hook)
+	end
+	return M.builtin_run(sh, argv, hook)
+end
+function M.builtin_run(sh, argv, hook)
 	local cmd = argv[1]
 	if sh.functions[cmd] then
 		return require("interp").exec_simple(sh, argv, hook or _noop)
@@ -10562,11 +10616,15 @@ end
 -- argv is the already-expanded command words {"eval", …}; run_compiled shares sh and does
 -- NOT finish_run (no EXIT trap), so signals propagate to the caller untouched.
 function M.eval(sh, argv)
+	if sh.opt_posix and not sh.opt_i then -- (a special builtin: M.spb_run)
+		return M.spb_run(sh, M.eval_run, sh, argv)
+	end
+	return M.eval_run(sh, argv)
+end
+function M.eval_run(sh, argv)
 	local a2 = argv[2]
 	if a2 and a2 ~= "-" and a2 ~= "--" and a2:sub(1, 1) == "-" then
-		io.stderr:write("curse: eval: " .. a2 .. ": invalid option\n")
-		sh.status = 2
-		return
+		return require("b_eval")(sh, "eval", argv, _noop, nil) -- (the usage error: b_eval's)
 	end
 	local start = (a2 == "--") and 3 or 2
 	local code = table.concat({ unpack(argv, start) }, " ")
@@ -10578,6 +10636,7 @@ function M.eval(sh, argv)
 	local mod = require("tier").try_fragment(code, ln > 0 and ln or nil)
 	if mod then
 		require("tier").run_compiled(mod, sh, nil, true)
+		sh.spb_err = nil -- (a builtin the code ran flagged its own: not eval's)
 	else
 		require("b_eval")(sh, "eval", argv, _noop, nil) -- (a hook: a called function asks it)
 	end
@@ -10674,6 +10733,12 @@ function M.source_empty(code)
 	return not code:gsub("#[^\n]*", ""):find("%S")
 end
 function M.source(sh, argv, line)
+	if sh.opt_posix and not sh.opt_i then -- (a special builtin: M.spb_run)
+		return M.spb_run(sh, M.source_run, sh, argv, line)
+	end
+	return M.source_run(sh, argv, line)
+end
+function M.source_run(sh, argv, line)
 	local I = require("interp")
 	local Ii = I._int
 	local j = 2
@@ -10720,6 +10785,7 @@ function M.source(sh, argv, line)
 	local fr = M.source_enter(sh, name, line)
 	local dsave, e0 = M.source_debug_hide(sh), sh.traps and sh.traps.ERR
 	local rok, err = pcall(require("tier").run_compiled, mod, sh, nil, true)
+	sh.spb_err = nil -- (a builtin in the file flagged its own: not the source's)
 	M.source_leave(sh, fr)
 	sh.sourcedepth = sh.sourcedepth - 1
 	-- (params the file SET itself stay — but not inside a function: bash's maybe_pop_dollar_vars)

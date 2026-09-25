@@ -101,6 +101,7 @@ return function(sh, cmd, args, hook, tcb)
 					-- `set -?` prints the usage but succeeds (list_optopt == '?')
 					io.stderr:write("curse: set: " .. c1 .. f .. ": invalid option\n" .. USAGE)
 					sh.status = f == "?" and 0 or 2
+					sh.spb_err = f ~= "?" and 2 or nil -- (EX_USAGE: rt.spb_run)
 					return
 				end
 			end
@@ -142,6 +143,7 @@ return function(sh, cmd, args, hook, tcb)
 						if not SETOPT[o] then
 							io.stderr:write("curse: set: " .. o .. ": invalid option name\n")
 							sh.status = 2
+							sh.spb_err = 2 -- (EX_USAGE: rt.spb_run)
 							return
 						end
 						set_opt(sh, SETOPT[o], on)
