@@ -76,6 +76,7 @@ local function disown(sh, args)
 			end
 		end
 		sh.jobs = keep
+		require("runtime").job_reset_current(sh)
 		if sh.bg_pids then -- (and a plain `wait` no longer waits for them)
 			local kp = {}
 			for _, pid in ipairs(sh.bg_pids) do

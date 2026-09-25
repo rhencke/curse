@@ -947,7 +947,9 @@ function M.co_block(fd, ev)
 end
 -- waitpid that yields inside a stage (via a pollable pidfd) instead of stalling
 -- every sibling. `flags` other than 0 (WNOHANG, …) are passed straight through.
-function M.wait_child(pid, stbuf, flags)
+-- `intr` (the shell, from the `wait` builtin): a trapped signal's trap sets intr.wait_sig,
+-- which ends the wait early with -1 (bash's wait_intr_buf) — else an EINTR is retried.
+function M.wait_child(pid, stbuf, flags, intr)
 	flags = flags or 0
 	local t = flags == 0 and co_task() or nil
 	if t or (flags == 0 and sched_live()) then
@@ -958,9 +960,14 @@ function M.wait_child(pid, stbuf, flags)
 		if pfd and pfd >= 0 then
 			if not t then -- the shell itself waits: background jobs run meanwhile
 				if fd_would_block(pfd, POLLIN) then
-					M.sched_pump({ fd = pfd, ev = POLLIN })
+					M.sched_pump({ fd = pfd, ev = POLLIN, untilf = intr and function()
+						return intr.wait_sig ~= nil
+					end })
 				end
 				C.close(pfd)
+				if intr and intr.wait_sig then
+					return -1
+				end
 				return C.waitpid(pid, stbuf, flags)
 			end
 			t.child_pid = pid -- (`kill` of a simple-command job reaches this child: see task_kill)
@@ -986,6 +993,14 @@ function M.wait_child(pid, stbuf, flags)
 				end
 			end
 			return pid
+		end
+	end
+	if intr then
+		while true do
+			local r = C.waitpid(pid, stbuf, flags)
+			if r >= 0 or ffi.errno() ~= 4 or intr.wait_sig then -- (EINTR: the trap has run)
+				return r
+			end
 		end
 	end
 	return C.waitpid(pid, stbuf, flags)
@@ -2782,6 +2797,8 @@ function M.iso_signal(sh, ctx, sig)
 		elseif ctx.traps then -- (the subshell's own trap; an inherited one reads as default)
 			disp = "trap"
 		end
+	elseif sig == 2 and ctx.igint then -- (an async job's, even once reset: its original)
+		disp = "ignore"
 	end
 	if disp == "ignore" or (disp == "default" and (SIG_DEFAULT_IGNORE[sig] or SIG_STOP[sig])) then
 		return
@@ -2944,9 +2961,10 @@ function Shell:subshell_run(runner, saves, paren)
 		self.paren_sp = self.in_subprogram
 	end
 	self.loopdepth = 0
-	local sv_depth, sv_jobs = self.subdepth, self.jobs
+	local sv_depth, sv_jobs, sv_cur, sv_prev = self.subdepth, self.jobs, self.job_cur, self.job_prev
 	self.subdepth = (sv_depth or 0) + 1
 	self.jobs = {} -- (a subshell has no jobs of the parent's; its own are numbered from 1)
+	self.job_cur, self.job_prev = nil, nil
 
 	local ctx = iso_push(self)
 	local ok, err = pcall(runner, self)
@@ -2977,7 +2995,7 @@ function Shell:subshell_run(runner, saves, paren)
 			M.internal_pids[j.pid] = true
 		end
 	end
-	self.jobs = sv_jobs
+	self.jobs, self.job_cur, self.job_prev = sv_jobs, sv_cur, sv_prev
 	if C.getpid() ~= ctx.pid then
 		-- a process forked deeper inside (a nested subshell's child) unwound out to here:
 		-- it ends now, never resuming the script as a copy of the shell
@@ -3348,18 +3366,56 @@ function M.import_functions(sh)
 	end
 end
 
--- Register a background job (for `jobs`/`wait %spec`/`wait -n`) and set $!.
+-- bash's job table (jobs.c): a job holds its slot [N] from `&` until it is DELETED — waited
+-- for, or listed by `jobs` once it has ended (a script is never notified otherwise) — so a
+-- finished job is still %N / %+ and `kill`able. A deleted job is marked j.gone but stays in
+-- sh.jobs: `wait $pid` still answers with its status (bash's bgpids list).
+function M.job_running(j)
+	return not j.done and not (j.g and j.g.done)
+end
+-- reset_current + set_current_job (jobs.c; nothing here is ever stopped): the current job
+-- (%+) is the newest running one, the previous (%-) the newest running one older than it,
+-- else the current one again. Neither changes when a job merely ends — only on `&` and
+-- when the current or previous job is deleted.
+function M.job_reset_current(sh)
+	local cur, prev
+	for _, j in ipairs(sh.jobs or {}) do
+		if not j.gone and M.job_running(j) and (not cur or j.id > cur.id) then
+			cur = j
+		end
+	end
+	if cur then
+		for _, j in ipairs(sh.jobs) do
+			if not j.gone and M.job_running(j) and j.id < cur.id and (not prev or j.id > prev.id) then
+				prev = j
+			end
+		end
+	end
+	sh.job_cur, sh.job_prev = cur, prev or cur
+end
+-- delete_job: the job leaves the table (its slot number is free again)
+function M.job_delete(sh, j)
+	if not j.gone then
+		j.gone = true
+		if j == sh.job_cur or j == sh.job_prev then
+			M.job_reset_current(sh)
+		end
+	end
+end
+-- Register a background job (for `jobs`/`wait %spec`/`wait -n`) and set $!: the slot after
+-- the highest one in use, and it becomes the current job.
 function M.job_add(sh, pid, cmdstr)
 	sh.jobs = sh.jobs or {}
 	local maxid = 0
 	for _, j in ipairs(sh.jobs) do
-		if not j.done and j.id > maxid then
+		if not j.gone and j.id > maxid then
 			maxid = j.id
 		end
 	end
 	local job = { id = maxid + 1, pid = pid, cmd = cmdstr or "", done = false, nojc = not sh.opt_m or nil }
 	sh.jobs[#sh.jobs + 1] = job
 	sh.last_bg_pid = tostring(pid)
+	M.job_reset_current(sh)
 	return job
 end
 
@@ -3465,9 +3521,12 @@ function Shell:spawn_bg(args, cmdstr)
 	return true
 end
 
-function Shell:run_background(cmd_fn, cmdstr, exec_tail, flat, simple)
+function Shell:run_background(cmd_fn, cmdstr, exec_tail, flat, simple, pipe)
 	-- (in-process: a background task — see Shell:bg_launch)
-	self:bg_launch(cmd_fn, cmdstr, flat, simple)
+	local job = self:bg_launch(cmd_fn, cmdstr, flat, simple)
+	if pipe and job and job.g then
+		job.g.pipe = true -- (a pipeline job: `kill %N` reaches its every stage)
+	end
 	self.status = 0
 end
 
@@ -3709,6 +3768,12 @@ local function co_launch(ctx, self, stage_fns, inproc, base, lastpipe, upv)
 			if ctx and g.bg then -- (a background job: $BASHPID = its $!, and `kill $!` finds it)
 				ctx.vpid, ctx.task = g.vpid, t
 				M.vpid_ctx[g.vpid] = ctx
+				-- without job control an async compound command starts with SIGINT ignored
+				-- (execute_in_subshell's setup_async_signals), which `trap` then lists
+				if not (g.simple or g.pipe or sh.opt_m) then
+					M.iso_save_traps(sh)
+					sh.traps.SIGINT, ctx.igint = "", true
+				end
 			end
 			sh.badassign = nil
 			local ok, err = pcall(fn, sh)
@@ -4313,10 +4378,10 @@ function M.sched_pump(w)
 end
 -- Wait until every task group in `gs` has ended: inside a task, by yielding on each (the
 -- scheduler requeues a group's waiter when it ends); from the shell, by pumping.
-function M.wait_groups(gs)
+function M.wait_groups(gs, intr) -- (intr: as wait_child's)
 	local t = co_task()
 	for _, g in ipairs(gs) do
-		while not g.done do
+		while not g.done and not (intr and intr.wait_sig) do
 			if t then
 				g.waiter = t
 				pre_yield(t)
@@ -4325,7 +4390,7 @@ function M.wait_groups(gs)
 				end
 			else
 				M.sched_pump({ untilf = function()
-					return g.done
+					return g.done or (intr and intr.wait_sig ~= nil)
 				end })
 				if not g.done and not sched_live() then
 					break
@@ -4501,6 +4566,25 @@ function M.task_kill(t, sig)
 		end
 	end
 	return true
+end
+
+-- kill_pid for a whole job (`kill %N`, jobs.c): bash signals each of the job's processes —
+-- for a pipeline job, every stage (a simple command stage IS its external command) — so
+-- the stages of the pipeline its task is waiting on get it too, then the task itself.
+function M.task_kill_job(t, sig)
+	local pg = t.g.pipe and type(t.wait) == "table" and t.wait
+	if pg and SCHED and sig ~= 0 then
+		for _, st in pairs(SCHED.bycoro) do
+			if st.g == pg and not st.done then
+				if st.simple and st.child_pid then
+					C.kill(st.child_pid, sig)
+				else
+					M.task_kill(st, sig)
+				end
+			end
+		end
+	end
+	return M.task_kill(t, sig)
 end
 
 local run_pipeline_body

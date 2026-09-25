@@ -39,10 +39,13 @@ local function report(j)
 	end
 end
 
--- The first of `jobs` to end (nil if none can): in-process jobs end in the scheduler, real
--- children through waitpid — whichever comes first.
+-- The first of `jobs` to end (nil if none can, or a trapped signal came): in-process jobs
+-- end in the scheduler, real children through waitpid — whichever comes first.
 local function wait_first(sh, jobs, stbuf)
 	while true do
+		if sh.wait_sig then
+			return nil
+		end
 		local anyg, anyreal = false, false
 		for _, j in ipairs(jobs) do
 			if not j.done then
@@ -60,6 +63,9 @@ local function wait_first(sh, jobs, stbuf)
 		if anyg then
 			rt.sched_pump({
 				untilf = function()
+					if sh.wait_sig then
+						return true
+					end
 					for _, j in ipairs(jobs) do
 						if j.g and j.g.done then
 							return true
@@ -81,14 +87,17 @@ local function wait_first(sh, jobs, stbuf)
 		elseif anyreal then
 			local r = wait_any(stbuf)
 			if r < 0 then
-				return nil
-			end
-			local est = rt.wexit(stbuf[0])
-			for _, j in ipairs(sh.jobs) do
-				if j.pid == r then
-					j.done, j.status = true, est
-					if sh.coprocs then
-						rt.coproc_dispose(sh, r)
+				if ffi.errno() ~= 4 then -- (EINTR: go round — a trap may have ended the wait)
+					return nil
+				end
+			else
+				local est = rt.wexit(stbuf[0])
+				for _, j in ipairs(sh.jobs) do
+					if j.pid == r then
+						j.done, j.status = true, est
+						if sh.coprocs then
+							rt.coproc_dispose(sh, r)
+						end
 					end
 				end
 			end
@@ -99,11 +108,19 @@ local function wait_first(sh, jobs, stbuf)
 end
 local wait_builtin
 local function wait_entry(sh, cmd, args, hook, tcb)
+	-- a trapped signal that arrives meanwhile ends the wait (run_signal sets sh.wait_sig)
+	local sv_in, sv_sig = sh.in_wait, sh.wait_sig
+	sh.in_wait, sh.wait_sig = true, nil
 	-- in a pipeline stage / $(…), the parent's jobs are listed but aren't children: `wait`
 	-- sees only the subshell's own
 	local foreign = cmd == "wait" and sh.foreign_pids
 	if not foreign or not next(foreign) then
-		return wait_builtin(sh, cmd, args, hook, tcb)
+		local ok, err = pcall(wait_builtin, sh, cmd, args, hook, tcb)
+		sh.in_wait, sh.wait_sig = sv_in, sv_sig
+		if not ok then
+			error(err, 0)
+		end
+		return
 	end
 	local all, mine = sh.jobs or {}, {}
 	for _, j in ipairs(all) do
@@ -113,6 +130,7 @@ local function wait_entry(sh, cmd, args, hook, tcb)
 	end
 	sh.jobs = mine
 	local ok, err = pcall(wait_builtin, sh, cmd, args, hook, tcb)
+	sh.in_wait, sh.wait_sig = sv_in, sv_sig
 	local out = {}
 	for _, j in ipairs(all) do
 		if foreign[j.pid] then
@@ -128,13 +146,27 @@ local function wait_entry(sh, cmd, args, hook, tcb)
 	end
 end
 
+-- the jobs still in the table, oldest slot first
+local function table_jobs(sh)
+	local list = {}
+	for _, j in ipairs(sh.jobs) do
+		if not j.gone then
+			list[#list + 1] = j
+		end
+	end
+	table.sort(list, function(a, b)
+		return a.id < b.id
+	end)
+	return list
+end
+
 wait_builtin = function(sh, cmd, args, hook, tcb)
 	if cmd == "wait" then
-		-- wait [-n] [pid…]: reap background jobs. With pids, return the last one's
-		-- status; with none, wait for all (status 0); an invalid arg is status 1.
+		-- wait [-fn] [-p VAR] [id…] (wait.def): reap background jobs. With ids, the last
+		-- one's status; with none, wait for all (status 0). A waited job leaves the table.
 		local stbuf = ffi.new("int[1]")
 		local function reap(pid)
-			if rt.wait_child(pid, stbuf, 0) < 0 then
+			if rt.wait_child(pid, stbuf, 0, sh) < 0 then
 				-- a process substitution already reaped when its command finished
 				return sh.procsub_status and sh.procsub_status[pid] or 127
 			end
@@ -177,84 +209,77 @@ wait_builtin = function(sh, cmd, args, hook, tcb)
 		for j = k, #args do
 			specs[#specs + 1] = args[j]
 		end
-		if pvar then -- (bash unsets VAR first: a readonly one stops it right here)
+		if pvar then -- (a valid name, unset first: a readonly one stops it right here)
+			if not rt.split_array_ref(pvar, sh) then
+				io.stderr:write("curse: wait: `" .. pvar .. "': not a valid identifier\n")
+				sh.status = 1
+				return
+			end
 			local pb = sh.vars[sh:deref(pvar)]
 			if pb and pb.ro then
 				io.stderr:write("curse: wait: " .. sh:deref(pvar) .. ": cannot unset: readonly variable\n")
 				sh.status = 1
 				return
 			end
+			if pvar:find("^[%a_][%w_]*$") then
+				require("b_unset")(sh, "unset", { "unset", pvar })
+			end
 		end
 		sh.jobs = sh.jobs or {}
 		local waited -- the pid whose status we return (for -p)
-		if nflag and #specs > 0 then
-			-- -n with jobs: whichever LISTED job finishes first (others that end are recorded)
-			-- (only jobs not yet waited for count; bash forgets a job once wait returns it)
-			local want = {}
-			for _, sp in ipairs(specs) do
-				local j = sp:sub(1, 1) == "%" and job_resolve(sh, sp)
-				local pid = j and j.pid or tonumber(sp)
-				local live
-				for _, jj in ipairs(sh.jobs) do
-					if jj.pid == pid and not jj.waited then
-						live = jj
+		if nflag then
+			-- -n: the first job to end — one that already has and isn't yet reported first;
+			-- with ids, only among those (127 if none can)
+			local list = table_jobs(sh)
+			if #specs > 0 then
+				local want, sel = {}, {}
+				for _, sp in ipairs(specs) do
+					local j, dup
+					if sp:sub(1, 1) == "%" then
+						j, dup = job_resolve(sh, sp, "wait")
+					else
+						local pid = rt.legal_number(sp)
+						for _, jj in ipairs(list) do
+							if jj.pid == pid then
+								j = jj
+							end
+						end
+					end
+					if j then
+						want[j] = true
+					elseif not dup then
+						io.stderr:write("curse: wait: " .. sp .. ": no such job\n")
 					end
 				end
-				if live then
-					want[pid] = true
-				else
-					io.stderr:write("curse: wait: " .. sp .. ": no such job\n")
-				end
-			end
-			sh.status = 127
-			for _, j in ipairs(sh.jobs) do -- (one already finished answers at once)
-				if want[j.pid] and j.done then
-					sh.status, waited = j.status or 0, j.pid
-					j.waited = true
-					break
-				end
-			end
-			if not waited and next(want) then
-				local list = {}
-				for _, j in ipairs(sh.jobs) do
-					if want[j.pid] then
-						list[#list + 1] = j
+				for _, j in ipairs(list) do
+					if want[j] then
+						sel[#sel + 1] = j
 					end
 				end
-				local j = wait_first(sh, list, stbuf)
-				if j then
-					sh.status, waited = j.status or 0, j.pid
-					j.waited = true
-				end
-			end
-		elseif nflag and #specs == 0 then
-			-- wait for the NEXT job to finish (127 if there are none to wait for)
-			local list = {}
-			for _, j in ipairs(sh.jobs) do
-				if not j.done then
-					list[#list + 1] = j
-				end
+				list = sel
 			end
 			local j = #list > 0 and wait_first(sh, list, stbuf)
-			if not j then
-				sh.status = 127
-			else
+			if j then
 				sh.status, waited = j.status or 0, j.pid
+				rt.job_delete(sh, j)
+			else
+				sh.status = 127
 			end
 		elseif #specs > 0 then
 			local last = 0
 			for _, s in ipairs(specs) do
-				if s:sub(1, 1) == "%" then
-					local j = job_resolve(sh, s)
-					if not j then
-						io.stderr:write("curse: wait: " .. s .. ": no such job\n")
-						last = 127
-					else
-						last, waited = job_reap(sh, j) or 127, j.pid
-						report(j)
+				local pid = nil
+				if s:match("^%d") then -- (a pid: a bad one ends `wait` right here)
+					local n = rt.legal_number(s)
+					if not n or n > 2147483647 then
+						io.stderr:write("curse: wait: `" .. s .. "': not a pid or valid job spec\n")
+						sh.status = 1
+						return
 					end
-				elseif s:match("^%d+$") then
-					local pid, found = tonumber(s), nil
+					pid = n
+				end
+				if pid then
+					local found = nil
 					for _, j in ipairs(sh.jobs) do
 						if j.pid == pid then
 							found = j
@@ -263,7 +288,14 @@ wait_builtin = function(sh, cmd, args, hook, tcb)
 					waited = pid
 					if found then
 						last = job_reap(sh, found) or 127
-						report(found)
+						if found.done then
+							report(found)
+							rt.job_delete(sh, found)
+						end
+					elseif rt.vpid_tasks[pid] and rt.vpid_tasks[pid].g.bg then -- (a disowned in-process job)
+						local g = rt.vpid_tasks[pid].g
+						rt.wait_groups({ g }, sh)
+						last = g.done and (g.status[1] or 0) or 127
 					elseif C.waitpid(pid, stbuf, 1) == 0 or (sh.procsub_status and sh.procsub_status[pid]) then
 						last = reap(pid) -- (a live child we don't list, or a finished procsub)
 					else
@@ -272,29 +304,55 @@ wait_builtin = function(sh, cmd, args, hook, tcb)
 							last = rt.wexit(stbuf[0])
 						else
 							io.stderr:write("curse: wait: pid " .. pid .. " is not a child of this shell\n")
-							last = 127
+							last, waited = 127, nil
 						end
 					end
-				else -- a bare non-pid/non-jobspec word: status 1 alone, 127 under -n
+				elseif s:sub(1, 1) == "%" then
+					local j, dup = job_resolve(sh, s, "wait")
+					if not j then
+						if not dup then
+							io.stderr:write("curse: wait: " .. s .. ": no such job\n")
+						end
+						last, waited = 127, nil
+					else
+						last, waited = job_reap(sh, j) or 127, j.pid
+						if j.done then
+							report(j)
+							rt.job_delete(sh, j)
+						end
+					end
+				else -- a word that's neither: status 1, and on to the next
 					io.stderr:write("curse: wait: `" .. s .. "': not a pid or valid job spec\n")
-					last = nflag and 127 or 1
+					last, waited = 1, nil
+				end
+				if sh.wait_sig then
+					break
 				end
 			end
 			sh.status = last
 		else -- wait for all jobs
-			for _, j in ipairs(sh.jobs) do
+			for _, j in ipairs(table_jobs(sh)) do
 				if not j.done then
 					job_reap(sh, j)
 					report(j)
 				end
+				if sh.wait_sig then
+					break
+				end
+				rt.job_delete(sh, j)
 			end
-			if sh.bg_pids then
+			if sh.bg_pids and not sh.wait_sig then
 				for _, p in ipairs(sh.bg_pids) do
 					pcall(reap, p)
 				end
 				sh.bg_pids = {}
 			end
 			sh.status = 0
+			waited = nil -- (wait with no ids never sets VAR)
+		end
+		if sh.wait_sig then -- a trapped signal ended it (its trap has run)
+			sh.status = 128 + sh.wait_sig
+			return
 		end
 		if pvar and waited then
 			local st = sh.status

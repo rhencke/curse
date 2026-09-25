@@ -4330,7 +4330,7 @@ local function job_reap(sh, job, nohang)
 		if nohang then
 			rt.sched_pump({})
 		else
-			rt.wait_groups({ job.g })
+			rt.wait_groups({ job.g }, sh.in_wait and sh)
 		end
 		if not job.g.done then
 			return nil
@@ -4346,7 +4346,7 @@ local function job_reap(sh, job, nohang)
 		return st
 	end
 	local sb = ffi.new("int[1]")
-	local r = rt.wait_child(job.pid, sb, nohang and WNOHANG or 0) -- (background tasks run meanwhile)
+	local r = rt.wait_child(job.pid, sb, nohang and WNOHANG or 0, not nohang and sh.in_wait and sh or nil) -- (background tasks run meanwhile)
 	if r > 0 then
 		job.done = true
 		job.status = rt.wexit(sb[0])
@@ -4359,45 +4359,112 @@ local function job_reap(sh, job, nohang)
 		end -- killed by a signal
 		return job.status
 	end
-	if r < 0 and not nohang then
+	if r < 0 and not nohang and not sh.wait_sig then
 		job.done = true
 		job.status = 127
 		return 127
 	end -- already gone
 	return nil -- still running (or, in a subshell, not our child to reap — keep it listed)
 end
--- Resolve a `%…` jobspec to a job: %N by id, %+/%% current, %- previous, %str prefix.
-local function job_resolve(sh, spec)
-	local active = {}
-	for _, j in ipairs(sh.jobs or {}) do
-		if not j.done then
-			active[#active + 1] = j
-		end
+-- The commands of a job's processes, as bash keeps one per pipeline member: its text split
+-- at each top-level ` | ` (outside quotes).
+local function job_members(cmd)
+	if not cmd:find(" | ", 1, true) then
+		return { cmd }
 	end
-	if spec == "%%" or spec == "%+" then
-		return active[#active]
-	end
-	if spec == "%-" then
-		return active[#active - 1]
-	end
-	local n = spec:match("^%%(%d+)$")
-	if n then
-		for _, j in ipairs(sh.jobs or {}) do
-			if j.id == tonumber(n) and not j.done then
-				return j
+	local out, start, q, k, n = {}, 1, nil, 1, #cmd
+	while k <= n do
+		local c = cmd:sub(k, k)
+		if q then
+			if c == q then
+				q = nil
+			elseif c == "\\" and q == '"' then
+				k = k + 1
 			end
+		elseif c == "'" or c == '"' then
+			q = c
+		elseif c == "\\" then
+			k = k + 1
+		elseif c == " " and cmd:sub(k, k + 2) == " | " then
+			out[#out + 1] = cmd:sub(start, k - 1)
+			start = k + 3
+			k = k + 2
 		end
-		return nil
+		k = k + 1
 	end
-	local str = spec:match("^%%%%?(.+)$") -- %str / %%str: command-prefix match
-	if str then
-		for _, j in ipairs(active) do
-			if j.cmd:sub(1, #str) == str then
+	out[#out + 1] = cmd:sub(start)
+	return out
+end
+-- A job still in the table (the current/previous job of a table that's been swapped out
+-- — a subshell's, `wait`'s own view — is not one)
+local function job_listed(sh, j)
+	if j and not j.gone then
+		for _, x in ipairs(sh.jobs or {}) do
+			if x == j then
 				return j
 			end
 		end
 	end
 	return nil
+end
+-- Resolve a jobspec to a job, as bash's get_job_spec (builtins/common.c): one leading `%`
+-- is dropped; then digits are the job number, and only the NEXT char decides the rest —
+-- ``/`%`/`+` the current job, `-` the previous one (`%+junk` is `%+`), `?str` a job whose
+-- command contains str in any case, else one whose command starts with the word
+-- (get_job_by_name). A name more than one job matches is "WHO: NAME: ambiguous job spec"
+-- (returns nil, true) — and, bash's quirk, so is one matched by a later pipeline member.
+local function job_resolve(sh, spec, who)
+	if spec == "" then
+		return nil
+	end
+	local w = spec:sub(1, 1) == "%" and spec:sub(2) or spec
+	local jobs = sh.jobs or {}
+	if w:match("^%d+$") then
+		local n = tonumber(w)
+		for _, j in ipairs(jobs) do
+			if j.id == n and not j.gone then
+				return j
+			end
+		end
+		return nil
+	end
+	local c = w:sub(1, 1)
+	if c == "" or c == "%" or c == "+" then
+		return job_listed(sh, sh.job_cur)
+	elseif c == "-" then
+		return job_listed(sh, sh.job_prev)
+	end
+	local sub = c == "?"
+	local name = sub and w:sub(2) or w
+	local lname = name:lower()
+	local found, dup
+	for _, j in ipairs(jobs) do
+		if not j.gone then
+			local mem = job_members(j.cmd or "")
+			for k = 1, #mem do
+				local m = mem[k]
+				local hit
+				if sub then
+					hit = m:lower():find(lname, 1, true)
+				else
+					hit = m:sub(1, #name) == name
+				end
+				if hit then
+					dup = found or k > 1
+					found = j
+					break
+				end
+			end
+			if dup then
+				break
+			end
+		end
+	end
+	if dup then
+		io.stderr:write("curse: " .. (who or "bash") .. ": " .. name .. ": ambiguous job spec\n")
+		return nil, true
+	end
+	return found
 end
 
 local SPECIAL_BUILTIN -- forward decl (assigned below); posix dispatch/funcdef rules
@@ -6225,9 +6292,12 @@ exec_stmt = function(sh, st, hook)
 			or (c1 and c1.words and c1.words[1] and c1.words[1].parts[1] and c1.words[1].parts[1].lit) or "job"
 		local cmd = st.cmd
 		local run = rt.bg_tail_stmt(cmd)
-		sh:bg_launch(function(ssh)
+		local job = sh:bg_launch(function(ssh)
 			exec_stmt(ssh, run, SUBHOOK)
 		end, cmdstr, cmd.t == "subshell", cmd.t == "simple")
+		if cmd.t == "pipeline" and job and job.g then
+			job.g.pipe = true -- (a pipeline job: `kill %N` reaches its every stage)
+		end
 		sh.status = 0
 	elseif t == "coproc" then
 		-- coproc NAME cmd: run cmd asynchronously with its stdin/stdout on two pipes whose
@@ -6819,6 +6889,10 @@ local function run_signal(sh, signum, direct, nested)
 	sh.cur_line = 1
 	local exited, rret = run_trap(sh, h)
 	sh.cur_line = sl
+	-- a trapped signal ends a `wait`: 128+sig (see b_wait) — but SIGCHLD only in posix mode
+	if sh.in_wait and (signum ~= 17 or sh.opt_posix) then
+		sh.wait_sig = signum
+	end
 	if exited then
 		error({ __curse_exit = sh.status })
 	end -- `exit` in the trap exits the shell
