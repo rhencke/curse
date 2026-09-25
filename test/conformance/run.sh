@@ -83,10 +83,40 @@ if [ "${1:-}" = --run-unit ]; then
   # forever. `cat` of a regular file reads the current content and stops at EOF.
   ofile="$workdir/o.$id"
   ucache="$workdir/uc/$id"; mkdir -p "$ucache"   # per-unit compile cache: cold miss, then hot hit
+  # A NONDETERMINISTIC oracle: some tests print a value that differs between any two bash
+  # runs — $RANDOM (seeded from time ^ pid ^ ppid: lib/sh/random.c genseed) or $PPID (the
+  # pid of the fresh `timeout` each run gets) — so no second run, bash's included, can
+  # reproduce the first byte-for-byte. Only when a shell MISMATCHES, re-run bash (up to
+  # 3x); if bash's own output varied, the lines both bash runs agree on must still match
+  # exactly, and a varying line matches when it's equal with every digit run masked.
+  bchecked=""; b2out=""; b2st=""
+  oracle_varies() {
+    if [ -z "$bchecked" ]; then
+      bchecked=1; local k
+      for k in 1 2 3; do
+        prep; one bash >"$ofile.b2" 2>/dev/null; b2st=$?; b2out=$(cat "$ofile.b2" 2>/dev/null)
+        [ "$b2out" != "$bout" ] && break
+      done
+    fi
+    [ "$b2out" != "$bout" ] && [ "$b2st" -eq "$bst" ]
+  }
+  nondet_match() {  # $1 out: equal to bash's up to the digits of lines bash itself varies on
+    local -a A B C; local k
+    mapfile -t A <<<"$bout"; mapfile -t B <<<"$b2out"; mapfile -t C <<<"$1"
+    [ ${#A[@]} -eq ${#B[@]} ] && [ ${#A[@]} -eq ${#C[@]} ] || return 1
+    for ((k = 0; k < ${#A[@]}; k++)); do
+      if [ "${A[k]}" = "${B[k]}" ]; then [ "${C[k]}" = "${A[k]}" ] || return 1
+      else
+        [ "${A[k]//+([0-9])/N}" = "${B[k]//+([0-9])/N}" ] && [ "${C[k]//+([0-9])/N}" = "${A[k]//+([0-9])/N}" ] || return 1
+      fi
+    done
+  }
+  shopt -s extglob
   emit_row() {  # $1 shell  $2 out  $3 status  $4 duration_us  -> verdict row
     local v=FAIL
     if [ "$1" = dash ] && [ "$3" -eq 2 ] && [ "$bst" -ne 2 ]; then v=NA
-    elif [ "$2" = "$bout" ] && [ "$3" -eq "$bst" ]; then v=PASS; fi
+    elif [ "$2" = "$bout" ] && [ "$3" -eq "$bst" ]; then v=PASS
+    elif [ "$3" -eq "$bst" ] && oracle_varies && nondet_match "$2"; then v=PASS; fi
     printf '%s\t%s\t%s\t%s\t%s\n' "$corpus" "$1" "$v" "$4" "$testid" >> "$res"
     # H_DIFF_DIR=dir: keep a failing test's expected (bash) and actual output + statuses
     if [ "$v" = FAIL ] && [ -n "${H_DIFF_DIR:-}" ]; then

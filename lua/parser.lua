@@ -3008,6 +3008,21 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs, xg, bq
 			i = i + 1
 		end -- to end of command line
 		local rline, nread = line, 0 -- (bash's warning lines: where reading began, + lines read)
+		-- A command line ended by a newline from an ALIAS value: bash reads a heredoc body
+		-- with read_secondary_line -> yy_getc, straight from the input source and NOT from
+		-- the pushed alias string (parse.y read_a_line) — so the body is the lines after the
+		-- current PHYSICAL line, and the rest of the alias text is parsed as commands after
+		-- it (`alias c='cat <<EOF<nl>$(echo hi)<nl>EOF<nl>'; c` reads an empty body at EOF,
+		-- then runs `hi` and `EOF`). Read from past the physical newline, splice the bodies
+		-- out of src below, and resume just past the alias newline.
+		local anl = alias_nl and i <= n and alias_nl[i] and i
+		if anl then
+			i = i + 1
+			while i <= n and (src:byte(i) ~= 10 or alias_nl[i]) do
+				i = i + 1
+			end
+		end
+		local pnl = i -- (the physical newline the bodies follow)
 		if i <= n then
 			i = i + 1
 			if not (alias_nl and alias_nl[i - 1]) then line = line + 1 end
@@ -3055,6 +3070,25 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs, xg, bq
 			hd.aenv = ALIAS_ENV -- the compiler re-parses an expanding body later (parse_heredoc)
 		end
 		heredocs_pending = {}
+		if anl then
+			if pnl < n then -- drop the consumed body lines (keep the physical newline)
+				local e = i <= n and i or n + 1
+				src = src:sub(1, pnl) .. src:sub(e)
+				n = #src
+				local d = e - pnl - 1
+				if d > 0 then
+					local moved = {}
+					for x in pairs(alias_nl) do
+						moved[x > pnl and x - d or x] = true
+					end
+					alias_nl = moved
+				end
+			end
+			if pnl <= n then
+				line = line - 1 -- (the physical newline is counted again when parsing reaches it)
+			end
+			i = anl + 1
+		end
 	end
 	local function ws() -- skip spaces/tabs (not newlines) — and `\<newline>` continuations,
 		-- which bash removes from the input before tokenizing (`a | \<nl>(cat)`)

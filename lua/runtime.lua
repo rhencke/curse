@@ -7002,6 +7002,14 @@ function Shell:special_get(name)
 	if name == "FUNCNAME" then
 		return self:in_function() and self.funcstack[1] or ""
 	end
+	-- the other live arrays as scalars: element 0 ($GROUPS is the primary gid, $BASH_ARGV
+	-- the last argument, $DIRSTACK the cwd)
+	if (name == "GROUPS" or name == "BASH_ARGV" or name == "BASH_ARGC" or name == "DIRSTACK")
+		and M.virt_live(self, name) then
+		local a = name == "GROUPS" and self:groups_array() or name == "DIRSTACK" and self:dirstack_array()
+			or name == "BASH_ARGV" and self:bash_argv_array() or self:bash_argc_array()
+		return a[1] or ""
+	end
 	if name == "BASH_SOURCE" then
 		return self:bash_source_array()[1] or ""
 	end -- [0]: current source
