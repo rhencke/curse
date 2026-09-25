@@ -282,6 +282,18 @@ function Shell.new()
 		sh:array_assign("BASH_VERSINFO", { "5", "2", "37", "1", "release", "x86_64-pc-linux-gnu" }, false)
 		sh.vars["BASH_VERSINFO"].ro = true
 	end
+	-- $BASH: the running shell's full pathname (bash's get_bash_name — always its own,
+	-- never inherited); COMP_WORDBREAKS: readline's word break characters
+	local a0 = os.getenv("CURSE_ARGV0") or ""
+	if a0:find("/", 1, true) then
+		a0 = a0:sub(1, 1) == "/" and a0 or (sh:get("PWD") .. "/" .. a0:gsub("^%./", ""))
+	else
+		a0 = "/bin/" .. (a0 ~= "" and a0 or "bash")
+	end
+	sh:set_str("BASH", a0)
+	if sh.vars.COMP_WORDBREAKS == nil then
+		sh:set_str("COMP_WORDBREAKS", " \t\n\"'@><=;|&(:")
+	end
 	sh.vars.BASH_ALIASES = M.virt_assoc(sh, "aliases")
 	sh.vars.BASH_CMDS = M.virt_assoc(sh, "cmds")
 	return sh
@@ -542,7 +554,11 @@ function Shell:localVar(name, has_init)
 		end
 		-- `local -I`: start as a copy of the outer variable — value and attributes, but
 		-- not a nameref (bash)
-		if (self.local_inherit or (self.shopt and self.shopt.localvar_inherit)) and ob and not ob.ref then
+		local inherit = self.local_inherit or (self.shopt and self.shopt.localvar_inherit)
+		if inherit and not ob and M.DYN_ASSIGN[name] and not (self.unset_specials and self.unset_specials[name]) then
+			self.vars[name].dyn = true -- (a copy of a live dynamic variable stays dynamic)
+		end
+		if inherit and ob and not ob.ref then
 			local nb = self.vars[name]
 			for k, v in pairs(ob) do
 				nb[k] = v
@@ -621,6 +637,10 @@ function Shell:localAssign(arg, cmd)
 	-- any 2>&1 capture, exactly like interp.
 	local own = self.savedstack[self.pd]
 	local ob = self.vars[name]
+	if ob == nil and M.noassign_live(self, name) then
+		self:errmsg("curse: " .. (cmd or "local") .. ": " .. name .. ": variable may not be assigned value\n")
+		return false
+	end
 	if self:is_global_ro(name) or (nm and ob and ob.ro and own and own[name] ~= nil) then
 		self:errmsg("curse: " .. (cmd or "local") .. ": " .. name .. ": readonly variable\n")
 		if nm then -- (a value for a readonly var: EX_BADASSIGN — see stage_body)
@@ -2397,6 +2417,7 @@ local function copybox(b)
 	local nb = {
 		s = b.s, n = b.n, assoc = b.assoc, exported = b.exported, ref = b.ref,
 		lower = b.lower, upper = b.upper, cap = b.cap, ro = b.ro, int = b.int, empty_decl = b.empty_decl, trace = b.trace,
+		dyn = b.dyn,
 	}
 	if b.arr then
 		local a = {}
@@ -2474,7 +2495,8 @@ local function sub_checkpoint(self)
 		locale_gen = M.locale_gen, dirstack = self.dirstack, hashcache = self.hashcache, getopts = self.getopts_state,
 		cwd = self:phys_cwd(), tcwd = self.tcwd, um = C.umask(0), disabled = self.disabled_builtins,
 		fn_ro = self.fn_ro, unset_specials = self.unset_specials, random_plain = self.random_plain,
-		shellopts_exported = self.shellopts_exported,
+		shellopts_exported = self.shellopts_exported, argv0 = self.argv0, sec_off = self.sec_off,
+		subsh_off = self.subsh_off,
 	}
 	self.fn_ro, self.unset_specials = shallowcopy(self.fn_ro), shallowcopy(self.unset_specials)
 	self.disabled_builtins = shallowcopy(self.disabled_builtins)
@@ -2531,6 +2553,7 @@ local function sub_restore(self, cp)
 	self.disabled_builtins = cp.disabled
 	self.fn_ro, self.unset_specials, self.random_plain = cp.fn_ro, cp.unset_specials, cp.random_plain
 	self.shellopts_exported = cp.shellopts_exported
+	self.argv0, self.sec_off, self.subsh_off = cp.argv0, cp.sec_off, cp.subsh_off
 	if cp.cwd ~= "" then C.chdir(cp.cwd) end
 	self.tcwd = cp.tcwd
 	C.umask(cp.um)
@@ -3472,8 +3495,11 @@ function M.import_functions(sh)
 		local name, val = f[1], f[2]
 		local src = name .. " " .. val
 		local ok, ast = false, nil
+		if val:sub(1, 4) ~= "() {" then
+			goto nextf -- (not a function definition at all: silently not imported — bash)
+		end
 		-- (a path-like name is never imported: `/bin/echo` must stay the program)
-		if val:sub(1, 4) == "() {" and not name:find("/", 1, true) then
+		if not name:find("/", 1, true) then
 			ok, ast = pcall(P.parse, src)
 		end
 		-- (exactly ONE statement: anything after the definition — `; echo BAD` — is a second
@@ -3492,6 +3518,7 @@ function M.import_functions(sh)
 		else
 			io.stderr:write("curse: error importing function definition for `" .. name .. "'\n")
 		end
+		::nextf::
 	end
 end
 
@@ -4891,9 +4918,46 @@ local function box(name, vars)
 	local b = vars[name]
 	if b == nil then
 		b = {}
+		if M.DYN_ASSIGN[name] then
+			b.dyn = true -- (still dynamic unless unset: readers/writers check sh.unset_specials)
+		end
 		vars[name] = b
 	end
 	return b
+end
+
+-- Is $LINENO an ordinary variable — unset once (its magic gone) or a plain `local LINENO`
+-- shadowing it — rather than the live line number? (compiled $LINENO reads)
+function M.lineno_plain(sh)
+	local b = sh.vars.LINENO
+	return (b ~= nil and not b.dyn) or (sh.unset_specials and sh.unset_specials.LINENO) or false
+end
+-- bash's sv_shcompat / sv_xtracefd value checks, on assignment: a malformed BASH_COMPAT
+-- (not `N.M`/`NM` within 3.1..5.2) or a BASH_XTRACEFD that isn't an open fd is reported
+-- (and then ignored: compat_level / xtrace_write re-validate on use)
+function M.sv_check(sh, dn, s)
+	if s == "" then
+		return
+	end
+	if dn == "BASH_COMPAT" then
+		local t, o = s:match("^(%d)%.(%d)$")
+		if not t then
+			t, o = s:match("^(%d)(%d)$")
+		end
+		local cv = t and tonumber(t) * 10 + tonumber(o)
+		if not cv or cv < 31 or cv > 52 then
+			io.stderr:write("curse: BASH_COMPAT: " .. s .. ": compatibility value out of range\n")
+		end
+	else
+		local fd = s:match("^%s*[+-]?%d+$") and tonumber(s)
+		if not fd or fd < 0 or fd > 2147483647 or C.fcntl(fd, 1) == -1 then
+			io.stderr:write("curse: BASH_XTRACEFD: " .. s .. ": invalid value for trace file descriptor\n")
+		end
+	end
+end
+-- (a variable's box, created if missing — marked `dyn` for a live dynamic variable)
+function M.vbox(sh, name)
+	return box(name, sh.vars)
 end
 
 -- Parse a bash-ish scalar string to int64 (leading integer, else 0). bash's
@@ -5903,6 +5967,52 @@ M.DYN_SPECIAL = { SECONDS = true, LINENO = true, BASHPID = true, EPOCHSECONDS = 
 	EPOCHREALTIME = true, SRANDOM = true, BASH_SUBSHELL = true, HISTCMD = true, BASH_COMMAND = true,
 	BASH_ARGV0 = true, FUNCNAME = true, BASH_SOURCE = true, BASH_LINENO = true, OSTYPE = true,
 	MACHTYPE = true, HOSTTYPE = true, DIRSTACK = true }
+-- The dynamic variables whose ASSIGNMENT bash routes to a hook (variables.c's
+-- init_dynamic_variables assign functions) while they are live — no binding, or a
+-- valueless `dyn` box (`declare -i RANDOM`, a `local -I` copy): M.dyn_assign runs the
+-- hook instead of storing a value. Once unset (sh.unset_specials) they are ordinary.
+-- "null": the assignment is dropped (null_assign / a noassign array's element 0 / a
+-- value regenerated on every read).
+M.DYN_ASSIGN = { RANDOM = "random", SECONDS = "seconds", BASH_SUBSHELL = "subshell",
+	BASH_ARGV0 = "argv0", EPOCHSECONDS = "null", EPOCHREALTIME = "null", BASHPID = "null",
+	BASH_COMMAND = "null", HISTCMD = "null", SRANDOM = "null", FUNCNAME = "null", LINENO = "null",
+	BASH_SOURCE = "null", BASH_LINENO = "null", BASH_ARGC = "null", BASH_ARGV = "null",
+	GROUPS = "null" }
+do
+-- bash's legal_number: optional blanks, sign, decimal digits, blanks — else nil
+local function legal_number(s)
+	local n = s:match("^%s*([+-]?%d+)%s*$")
+	return n and tonumber(n)
+end
+-- Run `dn`'s assign hook with value `s` (b: its dyn box or nil). False when `dn` is no
+-- longer dynamic (unset) — the caller then stores the value like any other variable.
+function M.dyn_assign(sh, dn, s, b)
+	if (sh.unset_specials and sh.unset_specials[dn]) or (dn == "RANDOM" and sh.random_plain) then
+		return false
+	end
+	local k = M.DYN_ASSIGN[dn]
+	if k == "random" then -- (assign_random: RANDOM is an integer variable — evalexp)
+		local ctx = iso_cur(sh) -- (a subshell's own stream: the parent's state kept first)
+		if ctx and not ctx.rand then
+			ctx.rand = { sh.rseed, sh.rlast, sh.rpid }
+		end
+		local ok, v = pcall(M.int_value, sh, s)
+		if not ok then
+			error(v, 0)
+		end
+		M.random_seed(sh, tonumber(v))
+	elseif k == "seconds" then -- (assign_seconds: an integer var's value is evaluated)
+		local n = b and b.int and tonumber(M.int_value(sh, s)) or legal_number(s) or 0
+		sh.sec_off = n - (os.time() - (sh.start_time or os.time()))
+	elseif k == "subshell" then -- (assign_subshell: subshell_environment's level)
+		local n = b and b.int and tonumber(M.int_value(sh, s)) or legal_number(s) or 0
+		sh.subsh_off = n - ((sh.subdepth or 0) + M.fork_depth)
+	elseif k == "argv0" then -- (assign_bash_argv0: sets $0; the variable itself stays)
+		sh.argv0 = s
+	end
+	return true
+end
+end
 function Shell:special_get(name)
 	-- the one-char specials as the BASE of an operator form (${?:-x} ${$:+y} ${-+z} ${!-w});
 	-- the bare $? $$ $- $! go through their own dedicated nodes
@@ -5968,7 +6078,7 @@ function Shell:special_get(name)
 		return tostring(tonumber(ffi.C.geteuid()))
 	end
 	if name == "BASH_SUBSHELL" then
-		return tostring((self.subdepth or 0) + M.fork_depth)
+		return tostring((self.subdepth or 0) + M.fork_depth + (self.subsh_off or 0))
 	end
 	if name == "BASHPID" then
 		return tostring(self:bashpid())
@@ -5998,7 +6108,7 @@ function Shell:special_get(name)
 		return "x86_64"
 	end
 	if name == "SECONDS" then
-		return tostring(os.time() - (self.start_time or os.time()))
+		return tostring(os.time() - (self.start_time or os.time()) + (self.sec_off or 0))
 	end
 	if name == "LINENO" then
 		return tostring(self.cur_line or 0)
@@ -6023,7 +6133,7 @@ end
 -- which is stripped here — element namerefs resolve to the base array).
 function Shell:deref(name)
 	local seen
-	for _ = 1, 100 do
+	for _ = 1, 9 do -- (bash's NAMEREF_MAX: a chain longer than 8 resolves to nothing)
 		local b = self.vars[name]
 		if not b or not b.ref or b.s == nil or b.s == "" then
 			return name
@@ -6049,7 +6159,24 @@ function Shell:deref(name)
 		seen[name] = true
 		name = tname
 	end
-	return name
+	return ""
+end
+-- Did `name`'s nameref chain run past NAMEREF_MAX (8) rather than loop? bash then reads
+-- nothing, without the cycle's warning, and an assignment through it fails fatally.
+function M.ref_too_deep(sh, name)
+	local seen = {}
+	for _ = 1, 9 do
+		local b = sh.vars[name]
+		if not b or not b.ref or b.s == nil or b.s == "" or seen[name] then
+			return false
+		end
+		seen[name] = true
+		name = b.outer or b.s:match("^[%a_][%w_]*")
+		if not name then
+			return false
+		end
+	end
+	return true
 end
 -- A nameref chain that ends at an ELEMENT of the nameref itself (a -> b -> 'a[1]'): bash
 -- warns, drops the nameref attribute and writes that element. Returns the subscript then.
@@ -6309,6 +6436,9 @@ function Shell:get(name)
 	end
 	if b.s == nil then
 		if b.n == nil then
+			if b.dyn then -- (a live dynamic variable's box: `declare -i RANDOM`, `local -I`)
+				return self:special_get(name)
+			end
 			return ""
 		end
 		b.s = i64_to_str(b.n)
@@ -6717,12 +6847,11 @@ function Shell:set_str(name, s)
 		s = M.cstr(s)
 	end -- bash vars are C strings: cut at NUL
 	local dn = self:deref(name)
-	if (dn == "FUNCNAME" or dn == "SRANDOM" or (dn == "LINENO" and not self.vars.LINENO))
-		and not (self.unset_specials and self.unset_specials[dn]) then
-		return -- assignments to these have no effect (bash): the call stack, fresh random
-		-- bits, the line now running
+	local b = self.vars[dn]
+	if (b == nil or b.dyn) and M.DYN_ASSIGN[dn] and M.dyn_assign(self, dn, s, b) then
+		return -- a live dynamic variable: its assign hook took the value (M.dyn_assign)
 	end
-	local b = box(dn, self.vars)
+	b = b or box(dn, self.vars)
 	if b.ref and not ref_target_ok(s) then
 		M.bad_ref_target(s, M.assign_ctx)
 		self.status = 1
@@ -6736,20 +6865,16 @@ function Shell:set_str(name, s)
 	if dn == "OPTIND" and self.getopts_state then
 		self.getopts_state[b] = nil -- assigning OPTIND resets getopts' in-argument position (bash)
 	end
-	if dn == "BASH_ARGV0" and not (self.unset_specials and self.unset_specials.BASH_ARGV0) then
-		self.argv0 = s -- assigning BASH_ARGV0 sets $0 (bash)
+	if dn == "PATH" then
+		if self.hashcache then -- (bash's sv_path: any assignment, even the same value, flushes
+			self.hashcache = {} -- the command hash table)
+		end
+	elseif dn == "BASH_COMPAT" or dn == "BASH_XTRACEFD" then
+		M.sv_check(self, dn, s)
 	elseif dn == "POSIXLY_CORRECT" then
 		self.opt_posix = true -- (bash's sv_strict_posix: setting it enters posix mode)
 	elseif dn == "IGNOREEOF" then
 		self.opt_ignoreeof = true -- (sv_ignoreeof: any value turns ignoreeof on)
-	elseif dn == "RANDOM" and not self.random_plain then
-		-- assigning seeds the generator; RANDOM itself stays dynamic (bash assign_random)
-		local n = s:match("^%s*[+-]?%d+%s*$") and tonumber(s)
-		if n then
-			M.random_seed(self, n)
-		end
-		self.vars.RANDOM = nil
-		return
 	end
 	if b.exported then
 		C.setenv(dn, s, 1)
@@ -6793,8 +6918,13 @@ function Shell:import_env()
 				or k == "EUID"
 				or k == "_" -- (a child's `_` is the program's path, set at each exec — not $_)
 				or k == "PPID" -- shell-computed, not from env
-				or k == "BASHOPTS"
 			then -- readonly, derived live from the option state
+			elseif k == "BASHOPTS" then -- inherited shopt options: each one enabled (bash's
+				for o in s:sub(eq + 1):gmatch("[^:]+") do -- parse_bashopts; readonly, derived live)
+					if o:match("^[%w_]+$") and o ~= "login_shell" and o ~= "restricted_shell" then
+						self.shopt[o] = true
+					end
+				end
 			elseif k == "SHELLOPTS" then -- inherited set -o options: enable them (bash), keep exported
 				self.shellopts_import = s:sub(eq + 1)
 				self.shellopts_exported = true
@@ -6815,13 +6945,19 @@ function Shell:import_env()
 	self:set_str("PWD", pwd)
 	self.vars["PWD"].exported = true
 	self.tcwd = pwd ~= "" and pwd or nil
-	if env_oldpwd then
+	-- OLDPWD: inherited when it names a directory, else an exported variable with no value
+	-- (bash's set_pwd: `declare -x OLDPWD`)
+	if env_oldpwd and M.file_test("-d", env_oldpwd) then
 		self:set_str("OLDPWD", env_oldpwd)
 		self.vars["OLDPWD"].exported = true
+	else
+		self.vars["OLDPWD"] = { exported = true }
+		C.unsetenv("OLDPWD")
 	end
-	-- bash provides a default $PATH when none is inherited (e.g. `unset PATH; sh -c …`).
+	-- bash provides a default $PATH when none is inherited (e.g. `unset PATH; sh -c …`):
+	-- its compiled-in DEFAULT_PATH_VALUE
 	if self.vars["PATH"] == nil then
-		self:set_str("PATH", "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin")
+		self:set_str("PATH", "/usr/local/bin:/usr/local/sbin:/usr/bin:/usr/sbin:/bin:/sbin:.")
 	end
 	-- Shell-maintained vars bash always defines even with `env -i` and no rc file.
 	if self.vars["IFS"] == nil then
@@ -6866,7 +7002,13 @@ function M.plain_scalar(sh, name)
 end
 function Shell:aset(name, n)
 	local dn = self:deref(name)
-	local b = box(dn, self.vars)
+	local b = self.vars[dn]
+	if b == nil or b.dyn then
+		if M.DYN_ASSIGN[dn] and M.dyn_assign(self, dn, i64_to_str(i64(n)), b) then
+			return i64(n) -- (`(( RANDOM = 42 ))` seeds: a live dynamic variable's hook)
+		end
+		b = box(dn, self.vars)
+	end
 	if b.ro then -- an arithmetic write to a readonly var is an arith error (bash): `((x=5))`/let
 		-- fail with status 1, a `$((x++))` expansion discards the rest of the line
 		io.stderr:write("curse: " .. dn .. ": readonly variable\n")
@@ -6945,6 +7087,9 @@ function M.arr_next(sh, name)
 		b.arr = { [0] = b.s }
 		b.s = nil
 		b.n = nil
+		if b.exported then -- (an array is never in the environment — bash)
+			C.unsetenv(name)
+		end
 	end
 	if not b.arr or next(b.arr) == nil then
 		return 0
@@ -6976,9 +7121,7 @@ function Shell:is_assoc(name)
 end
 
 function Shell:array_assign(name, values, append)
-	if self:deref(name) == "FUNCNAME" then
-		return -- (see set_str)
-	end
+	M.noassign_arr_check(self, self:deref(name))
 	local b = box(self:deref(name), self.vars)
 	if b.ref then -- a nameref with no target becomes the array itself (bash warns)
 		io.stderr:write("curse: warning: " .. name .. ": removing nameref attribute\n")
@@ -7110,6 +7253,9 @@ function Shell:array_set(name, key, val, append, raw)
 		end
 		b.s = nil
 		b.n = nil
+		if b.exported then -- (an array is never in the environment — bash)
+			C.unsetenv(self:deref(name))
+		end
 	end
 	if not raw then
 		key = norm_key(b, key)
@@ -7283,6 +7429,39 @@ function Shell:groups_array()
 	end
 	return groups_cache
 end
+-- bash's att_noassign dynamic arrays (GROUPS, FUNCNAME, BASH_SOURCE, …) while still live:
+-- no local copy, no compound assignment. M.NOUNSET_ARR: the ones `unset` refuses too.
+M.NOASSIGN_ARR = { GROUPS = 1, FUNCNAME = 1, BASH_ARGC = 1, BASH_ARGV = 1, BASH_SOURCE = 1,
+	BASH_LINENO = 1 }
+M.NOUNSET_ARR = { BASH_ARGC = 1, BASH_ARGV = 1, BASH_SOURCE = 1, BASH_LINENO = 1 }
+function M.noassign_live(sh, name)
+	if not M.NOASSIGN_ARR[name] then
+		return false
+	end
+	local b = sh.vars[name]
+	return (b == nil or (b.dyn and not b.arr)) and not (sh.unset_specials and sh.unset_specials[name])
+end
+-- A compound assignment to a live noassign array: an assignment error — silent, the
+-- variable being noassign — that discards the whole top-level command, status 1 (bash)
+function M.noassign_arr_check(sh, name)
+	if M.NOASSIGN_ARR[name] and M.noassign_live(sh, name) then
+		M.assign_discard(sh)
+	end
+end
+-- bash's jump_to_top_level(DISCARD) after a failed assignment: every function, eval and
+-- source level unwinds, the rest of the top-level command is abandoned, $? is 1
+function M.assign_discard(sh)
+	sh.status = 1
+	error({ __curse_exit = 1, __curse_lineabort = true, __curse_discard = true }, 0)
+end
+-- Is dynamic array `name` still computed live? (`unset GROUPS` makes it ordinary for good)
+function M.virt_live(sh, name)
+	if name == "DIRSTACK" then
+		return M.dirstack_dyn(sh)
+	end
+	local us = sh.unset_specials
+	return not (us and us[name])
+end
 local VIRT_ARR = {
 	GROUPS = "groups_array",
 	BASH_ARGV = "bash_argv_array",
@@ -7293,7 +7472,7 @@ local VIRT_ARR = {
 	DIRSTACK = "dirstack_array",
 }
 function Shell:array_get(name, key)
-	if VIRT_ARR[name] and (name ~= "DIRSTACK" or M.dirstack_dyn(self)) then
+	if VIRT_ARR[name] and M.virt_live(self, name) then
 		return self[VIRT_ARR[name]](self)[(tonumber(key) or 0) + 1] or ""
 	end
 	local b = self.vars[self:deref(name)]
@@ -7337,12 +7516,8 @@ end
 -- (bash: `unset a[-2]` on a 1-element array is an error).
 function Shell:array_unset(name, key)
 	local b = self.vars[self:deref(name)]
-	if b and rawget(b, "virt") then -- (unset BASH_ALIASES[k]: drop the alias / hash entry)
-		local src = b.virt == "aliases" and self.aliases or self.hashcache
-		if src then
-			src[tostring(key)] = nil
-		end
-		return true
+	if b and rawget(b, "virt") then -- (unset BASH_ALIASES[k] / BASH_CMDS[k]: bash's dynamic
+		return true -- assoc arrays have no unset hook — the alias / hashed path stays)
 	end
 	if not (b and b.arr) then
 		return true
@@ -7463,7 +7638,7 @@ do
 end
 
 function Shell:array_indices(name)
-	if VIRT_ARR[name] and (name ~= "DIRSTACK" or M.dirstack_dyn(self)) then
+	if VIRT_ARR[name] and M.virt_live(self, name) then
 		local a = self[VIRT_ARR[name]](self)
 		local t = {}
 		for i = 1, #a do
@@ -7548,7 +7723,7 @@ function M.assoc_keys(b)
 	end
 end
 function Shell:array_values(name)
-	if VIRT_ARR[name] and (name ~= "DIRSTACK" or M.dirstack_dyn(self)) then
+	if VIRT_ARR[name] and M.virt_live(self, name) then
 		return self[VIRT_ARR[name]](self)
 	end
 	local idx = self:array_indices(name)
@@ -9791,6 +9966,15 @@ function M.arrayassign_stmt(sh, name, items, append)
 	end
 	return M.arrayassign(sh, name, items, append)
 end
+-- `r=(…)` on a nameref with no target: the variable becomes that array, its nameref
+-- attribute dropped with a warning (bash's assign_array_var_from_string)
+function M.ref_to_array(sh, name)
+	local b = sh.vars[name]
+	if b and b.ref and not sh.arrayargs_pending then
+		io.stderr:write("curse: warning: " .. name .. ": removing nameref attribute\n")
+		b.ref, b.s, b.n, b.outer = nil, nil, nil, nil
+	end
+end
 -- `a[i]=(…)`: a list can't be assigned to one member — reported, and the line abandoned (bash).
 function M.arrayassign_member(sh, name, index)
 	local nb = sh.vars[name]
@@ -9808,6 +9992,8 @@ arrayassign_body = function(sh, name, items, append)
 	-- referenced array, as interp's do_arrayassign
 	local dn = sh:deref(name)
 	name = dn ~= "" and dn or name
+	M.noassign_arr_check(sh, name)
+	M.ref_to_array(sh, name)
 	local rb = sh.vars[name]
 	if rb and rb.ro then
 		io.stderr:write("curse: " .. name .. ": readonly variable\n")
@@ -9829,6 +10015,7 @@ arrayassign_body = function(sh, name, items, append)
 			M.dirstack_set(sh, k, it.val, it.op == "+=")
 			auto = (k or auto) + 1
 		end
+		sh.status = 0
 		return
 	end
 	if append and rb then
@@ -10135,7 +10322,7 @@ local APPEND_SPECIAL = { OPTIND = true, BASH_ARGV0 = true, POSIXLY_CORRECT = tru
 	RANDOM = true, SRANDOM = true, LINENO = true, FUNCNAME = true, TZ = true }
 append_lazy = function(sh, dn, b, value)
 	if b.ref or b.arr or b.int or b.lower or b.upper or b.cap or b.exported or rawget(b, "virt")
-		or APPEND_SPECIAL[dn] or LOCALE_VARS[dn] or value:find("\0", 1, true) then
+		or APPEND_SPECIAL[dn] or M.DYN_ASSIGN[dn] or LOCALE_VARS[dn] or value:find("\0", 1, true) then
 		return false
 	end
 	local mt = getmetatable(b)
@@ -12658,6 +12845,9 @@ function M.assign_scalar(sh, name, value)
 	end
 	if direct and direct.ref and direct.s and direct.s ~= "" then
 		if sh:deref(name) == "" then
+			if M.ref_too_deep(sh, name) then
+				M.assign_discard(sh) -- (bash: an assignment error, silent)
+			end
 			io.stderr:write("curse: warning: " .. name .. ": circular name reference\n")
 			sh.status = 1
 			sh.assign_err = true -- (the rest of an assignment list is abandoned)
@@ -13090,8 +13280,10 @@ do
 				ro = b.ro, ref = b.ref, int = b.int, lower = b.lower, upper = b.upper, cap = b.cap, trace = b.trace }
 				or false,
 		}
-		-- a nameref's / array's / -i/-l/-u/-c var's prefix binding is a plain temporary string (bash)
-		if b and (b.ref or (not b.ro and (b.arr or b.int or b.lower or b.upper or b.cap))) then
+		-- a nameref's / array's / -i/-l/-u/-c var's prefix binding is a plain temporary string
+		-- (bash); `n+=3 cmd` on a -i var binds the arithmetic sum as that string
+		local iapp = b and b.int and append and not b.arr and not b.ref and not raw
+		if b and not iapp and (b.ref or (not b.ro and (b.arr or b.int or b.lower or b.upper or b.cap))) then
 			sh.vars[name] = {}
 		end
 		if raw then -- NAME=(…) as a command prefix is a literal string, not an array (bash)
@@ -13099,6 +13291,9 @@ do
 			C.setenv(name, raw, 1)
 		else
 			M.sr_pset(sh, name, value, append)
+			if iapp and sh.vars[name] == b and not b.ro then
+				sh.vars[name] = { s = sh:get(name), exported = b.exported }
+			end
 			C.setenv(name, sh:get(name) or "", 1)
 		end
 		sh.tenv[#sh.tenv].tval = sh:get(name)
@@ -13534,6 +13729,9 @@ function M.assign_full(sh, st)
 			nref_base, nref_sub = st.name, selfsub
 		elseif nb and nb.ref and nb.s then
 			if nb.s ~= "" and sh:deref(st.name) == "" then -- (a reference cycle: said on write)
+				if M.ref_too_deep(sh, st.name) then
+					M.assign_discard(sh) -- (a chain past NAMEREF_MAX: a silent assignment error)
+				end
 				io.stderr:write("curse: warning: " .. st.name .. ": circular name reference\n")
 				sh.status = 1
 				sh.assign_err = true

@@ -416,9 +416,8 @@ local function fmt_set_var(name, b)
 			return name .. "=()"
 		end
 		local parts = {}
-		for _, k in ipairs(keys) do
-			local kq = tostring(k):match("^[%w_]+$") and tostring(k) or ('"' .. tostring(k):gsub('"', '\\"') .. '"')
-			parts[#parts + 1] = ('[%s]="%s"'):format(kq, tostring(b.arr[k]):gsub('"', '\\"'))
+		for _, k in ipairs(keys) do -- (quoted like declare -p's: $'…' for control characters)
+			parts[#parts + 1] = ("[%s]=%s"):format(M.decl_key(tostring(k), true), M.decl_quote(tostring(b.arr[k])))
 		end
 		return ("%s=(%s )"):format(name, table.concat(parts, " ")) -- trailing space, like bash
 	elseif b.arr then
@@ -431,7 +430,7 @@ local function fmt_set_var(name, b)
 		end)
 		local parts = {}
 		for _, i in ipairs(idx) do
-			parts[#parts + 1] = ('[%s]="%s"'):format(rt.i64_to_str(rt.key_i64(i)), tostring(b.arr[i]):gsub('"', '\\"'))
+			parts[#parts + 1] = ("[%s]=%s"):format(rt.i64_to_str(rt.key_i64(i)), M.decl_quote(tostring(b.arr[i])))
 		end
 		return ("%s=(%s)"):format(name, table.concat(parts, " "))
 	else
@@ -1656,7 +1655,7 @@ expand_part_str = function(sh, p, assign)
 			return expand_word(sh, P.parse_word("${" .. et .. "}"))
 		end
 		local dn = sh:deref(p.var)
-		if dn == "" or (rb and rb.outer) then -- a circular ref chain reads as nothing, with bash's
+		if (dn == "" and not rt.ref_too_deep(sh, p.var)) or (rb and rb.outer) then -- a circular ref chain reads as nothing, with bash's
 			io.stderr:write("curse: warning: " .. p.var .. ": circular name reference\n") -- warning
 		end -- (a function's self-named ref warns too, then reads the shadowed var)
 		local b = sh.vars[dn]
@@ -3661,6 +3660,8 @@ end
 local function do_arrayassign(sh, st)
 	-- through a nameref (`local -n r=arr; r+=(x)`) the literal lands in the referenced array
 	local name = sh:deref(st.name)
+	rt.noassign_arr_check(sh, name)
+	rt.ref_to_array(sh, name)
 	local isassoc = sh:is_assoc(name)
 	local items = sh.arrayargs_pre and sh.arrayargs_pre[st] or arrayassign_items(sh, st, isassoc)
 	if name == "DIRSTACK" and rt.dirstack_dyn(sh) then -- (the dynamic array: each element
@@ -3803,17 +3804,20 @@ end
 local function decl_elems(sh, name, fmt)
 	local assoc, parts = sh:is_assoc(name), {}
 	for _, k in ipairs(sh:array_indices(name)) do
-		local ks = tostring(k)
-		-- an assoc key with shell metacharacters (or a non-printable char) is quoted like a
-		-- value (and a key that is just `@` or `*`: bash's ALL_ELEMENT_SUB check) — assoc.c
-		if assoc and (ks == "" or ks == "@" or ks == "*" or (ks:find("[^%w_%%+,./:@=%-]")
-			and (rt.shell_metas(ks) or rt.ansic_shouldquote(ks)))) then
-			ks = decl_quote(ks)
-		end
-		parts[#parts + 1] = fmt:format(ks, decl_quote(sh:array_get(name, k)))
+		parts[#parts + 1] = fmt:format(M.decl_key(tostring(k), assoc), decl_quote(sh:array_get(name, k)))
 	end
 	return parts
 end
+-- an assoc key with shell metacharacters (or a non-printable char) is quoted like a
+-- value (and a key that is just `@` or `*`: bash's ALL_ELEMENT_SUB check) — assoc.c
+function M.decl_key(ks, assoc)
+	if assoc and (ks == "" or ks == "@" or ks == "*" or (ks:find("[^%w_%%+,./:@=%-]")
+		and (rt.shell_metas(ks) or rt.ansic_shouldquote(ks)))) then
+		return decl_quote(ks)
+	end
+	return ks
+end
+M.decl_quote = decl_quote
 -- A recoverable parse error (a bad `NAME=( … )` element): bash's syntax-error report — the
 -- token, then the line — but the script goes on (status 1)
 M.report_recoverable = rt.report_recoverable
@@ -3822,7 +3826,8 @@ local DYN_ARRAYS = { BASH_ARGC = 1, BASH_ARGV = 1, BASH_LINENO = 1, BASH_SOURCE 
 M.DYN_ARRAYS = DYN_ARRAYS
 -- bash's dynamic scalars (computed on read, no var box here) and their attributes
 local DYN_SCALARS = { BASHPID = "i", HISTCMD = "i", RANDOM = "i", SRANDOM = "i", SECONDS = "i", LINENO = "-",
-	EPOCHSECONDS = "-", EPOCHREALTIME = "-", BASH_SUBSHELL = "-", BASH_COMMAND = "-" }
+	EPOCHSECONDS = "-", EPOCHREALTIME = "-", BASH_SUBSHELL = "-", BASH_COMMAND = "-", BASH_ARGV0 = "-",
+	OSTYPE = "-", MACHTYPE = "-", HOSTTYPE = "-" }
 M.DYN_SCALARS = DYN_SCALARS
 -- Format one variable as a `declare -p` line, or nil if it is unset.
 local function fmt_decl(sh, name)
@@ -3845,8 +3850,10 @@ local function fmt_decl(sh, name)
 		end
 		return "declare -a " .. name .. "=(" .. table.concat(parts, " ") .. ")"
 	end
-	if b == nil and DYN_SCALARS[name] then
-		return "declare -" .. DYN_SCALARS[name] .. " " .. name .. "=" .. decl_quote(sh:get(name) or "")
+	if (b == nil or (b.dyn and b.s == nil and b.n == nil)) and DYN_SCALARS[name]
+		and not (sh.unset_specials and sh.unset_specials[name]) then
+		local fl = b and sh:attr_string(name) or DYN_SCALARS[name]
+		return "declare -" .. (fl == "" and "-" or fl) .. " " .. name .. "=" .. decl_quote(sh:get(name) or "")
 	end
 	if b == nil then
 		return nil
@@ -5871,6 +5878,9 @@ exec_stmt = function(sh, st, hook)
 			elseif nb and nb.ref and nb.s then
 				-- a nameref cycle (ref1->ref2->ref1) derefs to "" — bash detects it on write
 				if nb.s ~= "" and sh:deref(st.name) == "" then
+					if rt.ref_too_deep(sh, st.name) then
+						rt.assign_discard(sh) -- (a chain past NAMEREF_MAX: a silent assignment error)
+					end
 					io.stderr:write("curse: warning: " .. st.name .. ": circular name reference\n")
 					sh.status = 1
 					sh.assign_err = true -- (the rest of an assignment list is abandoned)
@@ -6430,7 +6440,10 @@ exec_stmt = function(sh, st, hook)
 					-- a NAMEREF's prefix binding is a plain temporary of its own (bash: the target
 					-- is untouched; restored below), and so is an array's (shadowed, not element 0) or an -i/-l/-u/-c var's: bash's tempenv
 					-- variable is a plain string (`i=1+1 cmd` passes "1+1")
-					if b and (b.ref or (not b.ro and (b.arr or b.int or b.lower or b.upper or b.cap))) then
+					-- (`n+=3 cmd` on a -i var: the sum, 8, bound as a plain string — bash's
+					-- make_variable_value appends arithmetically first)
+					local iapp = b and b.int and a.append and not b.arr and not b.ref and not a.raw
+					if b and not iapp and (b.ref or (not b.ro and (b.arr or b.int or b.lower or b.upper or b.cap))) then
 						sh.vars[a.name] = {}
 					end
 					if a.raw then -- NAME=(…) as a command prefix is a literal string, not an array (bash)
@@ -6440,6 +6453,9 @@ exec_stmt = function(sh, st, hook)
 						sh.applying_prefix = true
 						exec_stmt(sh, a, hook)
 						sh.applying_prefix = nil
+						if iapp and sh.vars[a.name] == b and not b.ro then
+							sh.vars[a.name] = { s = sh:get(a.name), exported = b.exported }
+						end
 						C.setenv(a.name, sh:get(a.name), 1)
 					end
 					sh.tenv[#sh.tenv].tval = sh:get(a.name) -- (did the command write it? prefix_keeps)

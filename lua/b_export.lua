@@ -446,6 +446,16 @@ return function(sh, cmd, args, hook, tcb)
 					end
 				end
 				local localize = localize and not propagated
+				local nan = isdecl and a:match("^([%a_][%w_]*)")
+				if nan and (localize or a:find("=", 1, true)) and rt.noassign_live(sh, nan) then
+					-- (GROUPS, FUNCNAME, …: no local copy, no value — bash's make_local_variable
+					-- reports it; a global declare's value fails silently)
+					if localize then
+						io.stderr:write("curse: " .. cmd .. ": " .. nan .. ": variable may not be assigned value\n")
+					end
+					allok = false
+					goto continue
+				end
 				if a == "SHELLOPTS" and (doexport or roattr) and not unexport and not plusx then
 					-- $SHELLOPTS is a dynamic special (special_get), not a stored var: mark
 					-- it exported and sync the env NOW (set_opt keeps it current after), so
@@ -500,7 +510,9 @@ return function(sh, cmd, args, hook, tcb)
 							sh:env_resync(dn)
 						elseif doexport then
 							rov.exported = true
-							C.setenv(dn, sh:get(dn), 1)
+							if not rov.arr then -- (an array is never in the environment)
+								C.setenv(dn, sh:get(dn), 1)
+							end
 						end
 					end
 				elseif
@@ -609,7 +621,7 @@ return function(sh, cmd, args, hook, tcb)
 							ib.lower, ib.upper, ib.cap = lattr or nil, uattr or nil, cattr or nil
 						end
 					elseif lattr or uattr or cattr then -- declare -l/-u/-c: case attribute (set_str folds)
-						sh.vars[nm] = sh.vars[nm] or {}
+						rt.vbox(sh, nm)
 						sh.vars[nm].lower = lattr or nil
 						sh.vars[nm].upper = uattr or nil
 						sh.vars[nm].cap = cattr or nil
@@ -655,7 +667,11 @@ return function(sh, cmd, args, hook, tcb)
 						elseif doexport or sh.opt_a then
 							xb.exported = true
 							local en = nref and nm or sh:deref(nm) -- (through a nameref: the target)
-							C.setenv(en, xval, 1)
+							if xb.arr and not nref then
+								C.unsetenv(en) -- (an array is never in the environment — bash)
+							else
+								C.setenv(en, xval, 1)
+							end
 							if en == "TZ" then rt.tzset() end
 						end
 					end
@@ -700,7 +716,7 @@ return function(sh, cmd, args, hook, tcb)
 							allok = false
 							goto continue
 						elseif not tb and dn ~= "" then
-							sh.vars[dn] = {}
+							rt.vbox(sh, dn)
 						end
 					end
 					if localize then
@@ -723,7 +739,7 @@ return function(sh, cmd, args, hook, tcb)
 						end
 					elseif iattr and not ((assoc or aattr) and isdecl) then
 						local dn = sh:deref(a) -- (through a nameref: the target, created if need be)
-						sh.vars[dn] = sh.vars[dn] or {}
+						rt.vbox(sh, dn)
 						sh.vars[dn].int = true
 						if lattr or uattr or cattr then
 							local ib = sh.vars[dn]
@@ -731,7 +747,7 @@ return function(sh, cmd, args, hook, tcb)
 						end
 					elseif (lattr or uattr or cattr) and not ((assoc or aattr) and isdecl) then
 						local dn = sh:deref(a)
-						sh.vars[dn] = sh.vars[dn] or {}
+						rt.vbox(sh, dn)
 						sh.vars[dn].lower = lattr or nil
 						sh.vars[dn].upper = uattr or nil
 						sh.vars[dn].cap = cattr or nil
@@ -783,18 +799,20 @@ return function(sh, cmd, args, hook, tcb)
 								b.arr = { [0] = b.s }
 								b.s = nil
 								b.n = nil
+								if b.exported then -- (an array is never in the environment)
+									C.unsetenv(a)
+								end
 							elseif not b.arr then
 								b.arr = {}
 								b.empty_decl = true
 							end -- declared, never assigned
 						end
 					elseif not (unexport and not isdecl) then -- (`export -n NAME` binds nothing:
-						sh.vars[a] = sh.vars[a] or {} -- set_var_attribute's undo only finds a var)
+						rt.vbox(sh, a) -- set_var_attribute's undo only finds a var)
 					end -- `declare x` (or `readonly -a/-A` with no value) creates a declared-but-unset var
 					local bb = sh.vars[sh:deref(a)]
 					if not bb and not nref and (roattr or (doexport and not unexport)) then -- `readonly ref`: the
-						bb = {} -- nameref's (unset) target gets the attribute, and so exists
-						sh.vars[sh:deref(a)] = bb
+						bb = rt.vbox(sh, sh:deref(a)) -- nameref's (unset) target gets the attribute, and so exists
 					end
 					if bb and (assoc or aattr) and isdecl and not nref then -- (`declare -Ai`: both)
 						if iattr then

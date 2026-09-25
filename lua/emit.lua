@@ -468,14 +468,14 @@ end
 -- program. A function whose name is unset must dispatch through sh.functions so the
 -- call AFTER the unset fails (127) — a hoisted fn_x would still be callable.
 -- $LINENO: the current line as a compile-time constant; once `unset LINENO` stripped its
--- magic it is an ordinary variable (bash)
+-- magic it is an ordinary variable (bash), as is a function's plain `local LINENO`
 -- (a trap handler's own commands keep the line of the command it interrupted — interp's
 -- run_trap doesn't advance sh.cur_line at the trap's call depth: EF.trapline)
 local function lineno_expr()
 	if EF.trapline and not EF.cur_infunc then
-		return "(sh.unset_specials and sh.unset_specials.LINENO and sh:get('LINENO') or tostring(sh.cur_line or 0))"
+		return "((sh.vars.LINENO or sh.unset_specials) and rt.lineno_plain(sh) and sh:get('LINENO') or tostring(sh.cur_line or 0))"
 	end
-	return ("(sh.unset_specials and sh.unset_specials.LINENO and sh:get('LINENO') or %q)"):format(
+	return ("((sh.vars.LINENO or sh.unset_specials) and rt.lineno_plain(sh) and sh:get('LINENO') or %q)"):format(
 		tostring(EF.cur_line or 0))
 end
 -- A non-literal command word (`c=unset; $c f`) or an `unset` passed on as an argument
@@ -1276,9 +1276,9 @@ emit_value = function(e, lifted)
 	end
 	if k == "var" and e.name == "LINENO" then -- compile-time line (unless `unset LINENO`)
 		if EF.trapline and not EF.cur_infunc then
-			return "(sh.unset_specials and sh.unset_specials.LINENO and sh:aget('LINENO') or (0LL + (sh.cur_line or 0)))"
+			return "((sh.vars.LINENO or sh.unset_specials) and rt.lineno_plain(sh) and sh:aget('LINENO') or (0LL + (sh.cur_line or 0)))"
 		end
-		return ("(sh.unset_specials and sh.unset_specials.LINENO and sh:aget('LINENO') or %sLL)"):format(
+		return ("((sh.vars.LINENO or sh.unset_specials) and rt.lineno_plain(sh) and sh:aget('LINENO') or %sLL)"):format(
 			tostring(EF.cur_line or 0))
 	end
 	if k == "var" and e.idxraw then -- $(( a[i] )): array/assoc element read (gated by arith_elem_ok)
@@ -4694,7 +4694,7 @@ local function subst_arith(e, pb)
 		return e
 	end
 	local k = e.k
-	if k == "param" then -- unset positional inside the callee is 0 in arith
+	if k == "param" and e.n ~= 0 then -- unset positional inside the callee is 0 in arith
 		return pb[e.n] and { k = "raw", code = pb[e.n].int } or { k = "num", v = "0" }
 	end
 	if e.e or e.l or e.c then -- (a copy: keeps etxt/etok, idxraw, … — only operands change)
@@ -4711,7 +4711,9 @@ end
 local function subst_word(w, pb)
 	local parts = {}
 	for _, p in ipairs(w.parts) do
-		if p.param then
+		if p.param == 0 then -- ($0 is the shell's name, the same at the call site)
+			parts[#parts + 1] = p
+		elseif p.param then
 			parts[#parts + 1] = pb[p.param] and { raw = pb[p.param].str } or { lit = "" } -- unset positional = ""
 		elseif p.arith then
 			parts[#parts + 1] = { arithast = subst_arith(safe_arith(p.arith), pb) }

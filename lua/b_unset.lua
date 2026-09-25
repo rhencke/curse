@@ -135,12 +135,18 @@ return function(sh, cmd, args, hook, tcb)
 						sh.status = 1
 						goto next_arg
 					end
+					if rt.NOUNSET_ARR[dn] and rt.noassign_live(sh, dn) then
+						-- (BASH_SOURCE, BASH_ARGV, …: bash's att_nounset)
+						io.stderr:write("curse: unset: " .. dn .. ": cannot unset\n")
+						sh.status = 1
+						goto next_arg
+					end
 					if nmode and not (b and b.ref) then
 						goto next_arg -- `unset -n` leaves a variable that isn't a nameref alone (bash)
 					end
 					if dn == "RANDOM" then
 						sh.random_plain = true -- (unset RANDOM loses its special meaning — bash)
-					elseif b == nil and rt.DYN_SPECIAL[dn] then
+					elseif (b == nil or b.dyn) and (rt.DYN_SPECIAL[dn] or rt.DYN_ASSIGN[dn]) then
 						-- a dynamic variable unset loses its magic for good (bash)
 						sh.unset_specials = sh.unset_specials or {}
 						sh.unset_specials[dn] = true
@@ -197,10 +203,12 @@ return function(sh, cmd, args, hook, tcb)
 						end
 						local here = inplace or sh.savedstack[sh.pd] and sh.savedstack[sh.pd][dn] ~= nil
 						if not revealed and here and b then
-							-- a local of THIS call stays a (value-less) local, attributes kept:
-							-- `local v=x; unset v; declare -p v` -> `declare -- v` (bash)
-							sh.vars[dn] = { exported = b.exported, int = b.int, lower = b.lower,
-								upper = b.upper, cap = b.cap }
+							-- a local of THIS call stays a (value-less) local — a plain one, its
+							-- attributes gone: `local -i v=3; unset v; v=1+1` stores `1+1`,
+							-- `declare -p v` -> `declare -- v` (bash). One that took over a
+							-- tempenv binding (`v=t f`) stays exported, as that binding was.
+							local rec = sh.savedstack[sh.pd] and sh.savedstack[sh.pd][dn]
+							sh.vars[dn] = { exported = (rec and rec.absorbed and b.exported) or nil }
 							sh:env_resync(dn)
 							env_done = true
 						elseif not revealed then
@@ -212,6 +220,9 @@ return function(sh, cmd, args, hook, tcb)
 						if rt.LOCALE_VARS[dn] then
 							rt.reset_locale(sh)
 						end -- re-apply locale (bash)
+						if dn == "PATH" and sh.hashcache then
+							sh.hashcache = {} -- (sv_path: unsetting PATH flushes the hash table)
+						end
 						if dn == "IGNOREEOF" then
 							sh.opt_ignoreeof = false -- (sv_ignoreeof)
 						end
