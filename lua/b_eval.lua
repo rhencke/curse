@@ -53,6 +53,7 @@ end
 
 return function(sh, cmd, args, hook, tcb)
 	if cmd == "eval" then
+		sh.shlvl_tail = nil -- (a builtin: the code it runs isn't exec'd in place)
 		-- eval [--]: join args, parse, run in the CURRENT shell (return/exit propagate).
 		if args[2] == "--help" then -- (CASE_HELPOPT: the builtin's help, status 2)
 			return rt.builtin_help(sh, "eval")

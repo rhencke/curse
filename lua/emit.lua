@@ -1821,6 +1821,7 @@ function compile_cmdsub_inner(src, backtick, lifted, aenv, noalias, posix)
 	if not pok or type(ast) ~= "table" or ast.stmts == nil then
 		return fallback
 	end -- syntax error
+	require("parser").mark_tail(ast.stmts)
 	-- A syntax error inside $(…) is fatal to the containing command (bash, status 2);
 	-- capture_src reproduces that exactly, so route any parse_error body there.
 	for _, st in ipairs(ast.stmts) do
@@ -5724,7 +5725,7 @@ simple_compiled = function(cx, st, after)
 			return cx.delegate(st, after, {
 				prelude = argvbody .. " " .. EF.xt("__a"),
 				guard = argvbody_g,
-				callee = "rt.eval",
+				callee = "rt.eval_u", -- (then $_ = its last argument)
 				callargs = "sh, __a",
 				redir = ev_redir,
 			})
@@ -5743,7 +5744,7 @@ simple_compiled = function(cx, st, after)
 			return cx.delegate(st, after, {
 				prelude = argvbody .. " " .. EF.xt("__a"),
 				guard = argvbody_g,
-				callee = "rt.source",
+				callee = "rt.source_u",
 				callargs = st.line and ("sh, __a, %d"):format(st.line) or "sh, __a", -- (its line: BASH_LINENO)
 				redir = sr_redir,
 			})
@@ -7316,6 +7317,10 @@ H.subshell = function(cx, st, after)
 			-- restore — so a body/function mutation to a native-int64 var never escapes.
 			-- subshell_run swallows exit/return, so the restore always runs.
 			local swpre, swpost = "", ""
+			if EF.bash_command then -- ($BASH_COMMAND for an ERR trap it fires: the whole `( … )`)
+				swpre = ("if sh.traps and sh.traps.ERR and (sh.in_trap or 0) == 0 then sh.cur_cmd = %q end; "):format(
+					require("deparse").command_text(st))
+			end
 			local ln = EF.lifted_names or {}
 			if #ln > 0 then
 				local sav, vs = {}, {}
@@ -7324,7 +7329,7 @@ H.subshell = function(cx, st, after)
 					vs[i] = lname(n)
 				end
 				local vlist = table.concat(vs, ", ")
-				swpre = ("local %s = %s; "):format(table.concat(sav, ", "), vlist)
+				swpre = swpre .. ("local %s = %s; "):format(table.concat(sav, ", "), vlist)
 				swpost = ("; %s = %s"):format(vlist, table.concat(sav, ", "))
 			end
 			if sub_redir then
@@ -8348,6 +8353,26 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
 			local p0 = cx.newpc()
 			cx.blocks[p0] = ("rt.time_push(sh); pc = %d"):format(cx.flatten_list({ inner }, pe))
 			return p0
+		end
+		-- a null command (assignments / redirections only) sets PIPESTATUS to its status too
+		if EF.pipestatus and (t == "assign" or t == "assignlist" or t == "arrayassign"
+			or (t == "simple" and not (st.words and st.words[1]))) then
+			local post = cx.newpc()
+			cx.blocks[post] = ('sh:array_assign("PIPESTATUS", {tostring(sh.status)}, false); pc = %d'):format(after)
+			after = post
+		end
+		-- the last command of a ( … ) / $( … ) body (parser.mark_tail): rt.exec_tail_lvl
+		-- (not a call of the program's own function: a direct call keeps sh.pd, and its
+		-- commands aren't this one)
+		local tw1 = st.shtail and st.words and st.words[1] and full_lit(st.words[1])
+		if st.shtail and t == "simple" and not (cx.tl_guarded and cx.tl_guarded[st])
+			and not (tw1 and (cx.funcflags[tw1] or (cx.inlinefns and cx.inlinefns[tw1]))) then
+			cx.tl_guarded = cx.tl_guarded or {}
+			cx.tl_guarded[st] = true
+			local body = cx.flatten_stmt(st, after)
+			local pre = cx.newpc()
+			cx.blocks[pre] = (st.shtail == 2 and "sh.shlvl_tail = sh.pd; pc = %d" or "sh.shlvl_tail = -1 - sh.pd; pc = %d"):format(body)
+			return pre
 		end
 		-- a brace-expanded word list: under `set +B` (checked at run time, like bash) the raw
 		-- words stand — compile that shape too (the statement over parser.unbrace_words, as

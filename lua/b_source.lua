@@ -20,6 +20,7 @@ local run_trap = I.run_trap
 
 return function(sh, cmd, args, hook, tcb)
 	if cmd == "source" or cmd == "." then
+		sh.shlvl_tail = nil -- (a builtin: the code it runs isn't exec'd in place)
 		-- source FILE [args]: run FILE in the current shell; a `return` ends the file.
 		-- A name with no slash is looked up in $PATH (files only, dirs skipped), then
 		-- falls back to the bare name; `--` ends options.
@@ -82,7 +83,7 @@ return function(sh, cmd, args, hook, tcb)
 					end
 					local ownp = sh.params -- (a `set --` in the file replaces this table)
 					sh.sourcedepth = (sh.sourcedepth or 0) + 1 -- a `return` is valid while sourcing
-					local sframe = rt.source_enter(sh, name) -- (BASH_SOURCE/BASH_LINENO/FUNCNAME frame)
+					local sframe = rt.source_enter(sh, name, nil, args, j) -- (BASH_SOURCE/BASH_LINENO/FUNCNAME frame)
 					dsave = rt.source_debug_hide(sh)
 					-- Run the file the way the shell runs its own input: LAZILY through the
 					-- sh-aware parser, so aliases defined earlier expand later and a `return`

@@ -97,6 +97,7 @@ return function(sh, cmd, args, hook, tcb)
 			names[#names + 1] = args[k]
 		end
 		if rflag then
+			rt.path_cache_forget()
 			for k in pairs(sh.hashcache) do
 				sh.hashcache[k] = nil
 			end
@@ -129,6 +130,7 @@ return function(sh, cmd, args, hook, tcb)
 				if not nm:find("/", 1, true) and not sh.functions[nm]
 					and not (BUILTINS[nm] and not (sh.disabled_builtins and sh.disabled_builtins[nm])) then
 					sh.hashcache[nm] = nil
+					rt.path_cache_forget(nm)
 					if sh:resolve_cmd(nm) then
 						rt.hash_hit(sh.hashcache, nm).hits = 0
 					else
