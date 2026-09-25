@@ -5245,7 +5245,7 @@ local function dbracket_trace(sh, text)
 end
 -- The ERE text of a `=~` RHS word: bash tilde-expands a word-initial ~ and matches THAT
 -- expansion literally (a tilde prefix isn't part of the regex), the rest via expand_regex.
-local function regex_rhs(sh, rnode)
+function M.regex_rhs(sh, rnode)
 	if word_initial_tilde(rnode) then
 		local p1 = rnode.parts[1]
 		local tok, restlit = p1.lit:match("^(~[^/:]*)(.*)$")
@@ -5334,7 +5334,7 @@ local function eval_dbracket(sh, node)
 			-- bash also tilde-expands a word-initial ~ on the =~ RHS and matches THAT
 			-- expansion literally (a tilde prefix isn't part of the regex): split off the
 			-- ~-token, expand it, and re-expand it as a quoted (regex-escaped) segment.
-			local caps, bad = rt.regex_captures(l, regex_rhs(sh, node.r), ic) -- real POSIX ERE + BASH_REMATCH
+			local caps, bad = rt.regex_captures(l, M.regex_rhs(sh, node.r), ic) -- real POSIX ERE + BASH_REMATCH
 			if bad then
 				error({ __curse_regexerr = true })
 			end -- invalid regex -> [[ ]] status 2
@@ -7089,13 +7089,13 @@ end
 -- result: the CALLER (once it has undone its own state) raises it, so the return ends
 -- that function/source — bash's _run_trap_internal longjmps to return_catch (trap.c).
 -- (Not for the EXIT/RETURN traps: their callers keep the status.)
-local trap_seen = { [0] = 0 } -- (handler texts run once: the next run compiles; [0]: their count)
+local trap_seen, trap_seen_n = {}, 0 -- (handler texts run once: the next run compiles)
 -- (an INTERP_FRAMES runner: the compiled handler's error prefixes read sh.cur_line)
-function M.run_trap_mod(mod, sh)
+local function run_trap_mod(mod, sh)
 	local r = require("tier").run_compiled(mod, sh, nil, true) -- (no tail call: this frame
 	return r -- must stay on the stack for rt.current_line to find)
 end
-rt.INTERP_FRAMES[M.run_trap_mod] = true
+rt.INTERP_FRAMES[run_trap_mod] = true
 run_trap = function(sh, code)
 	local exited, savedline, rret = false, sh.cur_line, nil
 	local saved_tcd, saved_ts = sh.trap_calldepth, sh.trap_saved
@@ -7112,16 +7112,16 @@ run_trap = function(sh, code)
 	if seen then
 		mod = require("tier").try_fragment(code, false, sh, true)
 	else
-		trap_seen[0] = trap_seen[0] + 1
-		if trap_seen[0] > 256 then
-			trap_seen = { [0] = 1 }
+		trap_seen_n = trap_seen_n + 1
+		if trap_seen_n > 256 then
+			trap_seen, trap_seen_n = {}, 1
 		end
 		trap_seen[code] = true
 	end
 	local stmts, k = mod and {} or P.parse(code).stmts, 0
 	local function body()
 		if mod then -- (a line abort is contained by run_compiled: the rest of that line is skipped)
-			return M.run_trap_mod(mod, sh)
+			return run_trap_mod(mod, sh)
 		end
 		while k < #stmts do
 			k = k + 1
@@ -7855,7 +7855,6 @@ M._int = {
 	restore_redirs = restore_redirs,
 	drain_procsub = drain_procsub,
 	expand_word = expand_word,
-	regex_rhs = regex_rhs,
 	arith_expand_text = arith_expand_text,
 	dbracket_word = dbracket_word,
 	dbracket_pattern = dbracket_pattern,

@@ -1658,16 +1658,14 @@ function M.redir_apply_one(sh, r, saves)
 	end
 	return ok
 end
--- <(…)/>(…) bookkeeping around a compiled simple command (interp's procsub_mark /
--- drain_procsub): the count of registered process substitutions before it, and after it
--- close the shell's ends of those it added and reap their children.
-function M.procsub_fmark(sh) -- (not M.procsub_mark: the runner's, which also counts pending)
-	return sh.procsub_files and #sh.procsub_files or 0
+-- <(…)/>(…) bookkeeping around a compiled command statement (interp's procsub_mark /
+-- drain_procsub): the pending/registered counts before it, and after it close the shell's
+-- ends of those it added and reap their children.
+function M.ps_mark(sh)
+	return { sh.procsub_pending and #sh.procsub_pending or 0, sh.procsub_files and #sh.procsub_files or 0 }
 end
-function M.procsub_drain(sh, nf)
-	if sh.procsub_files then
-		require("interp")._int.drain_procsub(sh, 0, nf)
-	end
+function M.ps_drain(sh, m)
+	require("interp")._int.drain_procsub(sh, m[1], m[2])
 end
 function M.redir_discard(saves)
 	if saves.out_sh then
@@ -5402,7 +5400,7 @@ end
 -- A [[ ]] operand / glob RHS the compiled tier can't render: interp's dbracket_word /
 -- dbracket_pattern on that one word.
 function M.db_regex_rhs(sh, w)
-	return require("interp")._int.regex_rhs(sh, w)
+	return require("interp").regex_rhs(sh, w)
 end
 function M.word_str(sh, w) -- (one word, no split/glob: interp's expand_word)
 	return require("interp")._int.expand_word(sh, w)
