@@ -95,6 +95,7 @@ return function(sh, cmd, args, hook, tcb)
 					-- reported as status 2 without halting the shell.
 					local sxd = sh.xdepth -- (a sourced file traces one level deeper, bash)
 					sh.xdepth = (sxd or 0) + 1
+					local scc = sh.cur_cmd -- (parse_and_execute's restore_lastcom: $BASH_COMMAND)
 					local rok, err = pcall(function()
 						local nextf = P.open(src, sh)
 						local vst = {}
@@ -138,6 +139,7 @@ return function(sh, cmd, args, hook, tcb)
 					end)
 					sh.xdepth = sxd
 					sh.spb_err = nil -- (a builtin in the file flagged its own: not the source's)
+					sh.cur_cmd = scc
 					sh.sourcedepth = sh.sourcedepth - 1
 					rt.source_leave(sh, sframe)
 					-- (params the file SET itself stay — but not in a function: maybe_pop_dollar_vars)

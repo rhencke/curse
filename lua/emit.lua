@@ -1845,7 +1845,7 @@ local func_locals
 -- (compiling the body moves the compile-time line: put it back for the enclosing command)
 local function compile_cmdsub(...)
 	local l, cl, ln, cil = EF.cur_line, EF.cur_cline, EF.cur_loopn, EF.cs_in_loop
-	local cif, cia, inf = EF.cs_in_func, EF.cs_active, EF.cur_infunc
+	local cif, cia, inf, jl = EF.cs_in_func, EF.cs_active, EF.cur_infunc, EF.cur_jl
 	-- (a `$( … )` inside a loop knows it: a break/continue in its body ends the substitution;
 	-- inside a function, a `return` there ends it — at the top level that's an error)
 	EF.cs_in_loop = (EF.cur_loopn or 0) > 0 or cil
@@ -1853,7 +1853,7 @@ local function compile_cmdsub(...)
 	EF.cs_active = true
 	local r = { compile_cmdsub_inner(...) }
 	EF.cur_line, EF.cur_cline, EF.cur_loopn, EF.cs_in_loop = l, cl, ln, cil
-	EF.cs_in_func, EF.cs_active, EF.cur_infunc = cif, cia, inf
+	EF.cs_in_func, EF.cs_active, EF.cur_infunc, EF.cur_jl = cif, cia, inf, jl
 	return unpack(r)
 end
 function compile_cmdsub_inner(src, backtick, lifted, aenv, noalias, posix)
@@ -3500,8 +3500,14 @@ local function fb_step(w, lifted, call, push, tbl)
 		so[#so + 1] = ("%s = sh:aget(%q); "):format(lname(n), n)
 	end
 	-- (a trap handler's commands keep the interrupted line: sh.cur_line as is — EF.trapline)
-	local ln = (w.src or ""):find("LINENO", 1, true) and not (EF.trapline and not EF.cur_infunc)
+	local src = w.src or ""
+	local ln = src:find("LINENO", 1, true) and not (EF.trapline and not EF.cur_infunc)
 		and ("sh.cur_line = %d; "):format(EF.cur_line or 0) or ""
+	if (src:find("$(", 1, true) or src:find("`", 1, true)) and not (EF.trapline and not EF.cur_infunc) then
+		-- (a $(…) the expansion parses numbers its body from this command's line — capture_src's
+		-- cur_cline, which an earlier eval'd or interpreted command may have left behind)
+		ln = ln .. ("sh.cur_cline = %d; "):format(EF.cur_cline or EF.cur_line or 0)
+	end
 	return ("do %s%slocal __f = %s(sh, %s[1]); %sif __f then %s else %s = false end end"):format(
 		table.concat(si), ln, call, EF.konst({ ser(w) }), table.concat(so), push, tbl or "__a")
 end
@@ -5232,9 +5238,10 @@ EF.simple_native = function(cx, st, after, cmd)
 		end
 		spec[#spec + 1] = "aas=" .. ser(st.arrayargs)
 	end
-	local bind
+	local bind, pnames
 	if st.assigns and #st.assigns > 0 then
 		local bs, names = {}, {}
+		pnames = names
 		for _, a in ipairs(st.assigns) do
 			if a.index then
 				bs[#bs + 1] = ("rt.pbind_bad(sh, %q, %q)"):format(a.name, tostring(a.index))
@@ -5317,6 +5324,9 @@ EF.simple_native = function(cx, st, after, cmd)
 	if EF.xtrace and not bind and not st.arrayargs then
 		spec[#spec + 1] = "xt=true"
 		xt = " " .. EF.xt("__a")
+	end
+	if bind and redir and #pnames > 0 then -- (a readonly prefix is reported before the redirections)
+		xt = xt .. ("; rt.prefix_ro(sh, { %s })"):format(table.concat(pnames, ", "))
 	end
 	return cx.delegate(st, after, {
 		prelude = table.concat(out, "; ") .. xt,
@@ -6194,6 +6204,9 @@ simple_compiled = function(cx, st, after)
 					cx.redir_ext(nil, redir_apply),
 					prun
 				)
+			end
+			if redir_apply then -- (a readonly prefix is reported before the redirections: rt.prefix_ro)
+				dispatch = ("rt.prefix_ro(sh, { %s }); "):format(table.concat(pnames, ", ")) .. dispatch
 			end
 			-- __pv (prefix values) FIRST, then __a (argv) — both in the pre-prefix env,
 			-- in bash's left-to-right order — then apply + run + restore via rt.run_prefix.
@@ -7431,7 +7444,8 @@ H.subshell = function(cx, st, after)
 				swpost = ("; %s = %s"):format(vlist, table.concat(sav, ", "))
 			end
 			-- (its text: the report if a signal kills it)
-			local stx = ("%q"):format(require("deparse").command_text(st))
+			local stx = ("%q"):format((st.bang and "! " or "") .. require("deparse").command_text(st))
+				.. (st.inplace and ", true" or "") -- (alone in a `( … )`: parser.mark_tail)
 			-- (bash waits for the forked child as a one-process job: setjstatus → PIPESTATUS)
 			if EF.pipestatus then
 				swpost = swpost .. '; sh:array_assign("PIPESTATUS", {tostring(sh.status)}, false)'
@@ -7480,7 +7494,11 @@ H.pipeline = function(cx, st, after)
 		-- function, an eval) is ignored too (bash). Real pipe stages (n>=2) compile normally.
 		-- compiled WITH the upval lift set: a stage and the functions it calls share
 		-- `v_x`; the scheduler swaps those upvalues per stage like its fds.
+		-- (a simple-command stage keeps the loop level — rt.stage_kind — so a break/continue
+		-- that IS the stage just ends it, silently: cx.frag_loop)
+		EF.frag_loop = n > 1 and st.cmds[i].t == "simple" and cx.loop_ctx() or nil
 		local id = emit_fragment({ st.cmds[i] }, n == 1 and st.negate, EF.lifted_set)
+		EF.frag_loop = nil
 		if not id then
 			return cx.delegate(st, after)
 		end
@@ -7597,7 +7615,9 @@ H.background = function(cx, st, after)
 	-- only for commands nested in a job that's a group/subshell/… — so a simple/pipeline
 	-- job compiles with its direct command errexit/ERR-exempt (as `! cmd` does).
 	local topexempt = st.cmd.t == "simple" or st.cmd.t == "pipeline"
+	EF.frag_loop = topexempt and cx.loop_ctx() or nil -- (a simple/pipeline job keeps the loop level)
 	local id = emit_fragment({ require("runtime").bg_tail_stmt(st.cmd) }, topexempt)
+	EF.frag_loop = nil
 	if not id then
 		return cx.delegate(st, after)
 	end
@@ -7940,6 +7960,16 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
 	-- it runs at calldepth 0, so a `local`/`return` there is an error and a declare global
 	cx.topcode = not toplevel and EF.frag_topcode or nil
 	EF.frag_topcode = nil
+	-- frag_loop: a pipeline stage / async job's fragment whose command keeps the loop level
+	-- it runs in (bash): "loop" inside one here, "maybe" when only the run time knows
+	cx.frag_loop = EF.frag_loop
+	EF.frag_loop = nil
+	function cx.loop_ctx()
+		if #cx.loopstack > 0 or EF.cs_in_loop or cx.frag_loop == "loop" then
+			return "loop"
+		end
+		return "maybe"
+	end
 	emit_toplevel = cx.toplevel and true or false -- gates top-level-only ERR firing (see errchk)
 	-- each block remembers the source line being compiled when it was written (cx.pcline)
 	-- and, for a block that runs an external, the simple command's text (pcline.tx: a job
@@ -7950,10 +7980,21 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
 		__newindex = function(t, k, v)
 			rawset(t, k, v)
 			pcline[k] = EF.cur_line
-			if cx.cur_simple and type(v) == "string" and (v:find("sh:exec(", 1, true)
-				or v:find("sh:exec_t(", 1, true) or v:find("rt.exec_dynamic(", 1, true)) then
+			if type(v) ~= "string" then
+				return
+			end
+			local ext = v:find("sh:exec(", 1, true) or v:find("sh:exec_t(", 1, true)
+				or v:find("rt.exec_dynamic(", 1, true)
+			if cx.cur_simple and ext then
 				pcline.tx = pcline.tx or {}
 				pcline.tx[k] = cx.cur_simple
+			end
+			-- (and the line a foreground job it runs is reported at, where not its own: jcx)
+			local jl = EF.cur_jl
+			if jl and jl ~= EF.cur_line and (ext or v:find("sh:run_pipeline(", 1, true)
+				or v:find("sh:subshell_run(", 1, true)) then
+				pcline.jl = pcline.jl or {}
+				pcline.jl[k] = jl
 			end
 		end,
 	})
@@ -8607,8 +8648,11 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
 							or ((EF.cf_flush or "") .. cx.ndadj(0) .. ("error({ __curse_%s = %d })"):format(cf_op, lvl)))
 					elseif EF.cs_in_loop and #cx.subexit == 0 then -- (in a `$( … )` inside a loop: ends it)
 						cx.blocks[p] = d .. ("error({ __curse_%s = %d })"):format(cf_op, lvl)
+					elseif cx.frag_loop == "loop" then -- (the stage/job it is ends: nothing to say)
+						cx.blocks[p] = d .. ("sh.status = 0; pc = %d"):format(after)
 					else -- outside any loop: bash says so (status 0) and carries on
-						cx.blocks[p] = d .. ("if not sh.opt_posix then io.stderr:write(%q) end; sh.status = 0; pc = %d"):format(
+						cx.blocks[p] = d .. ("if %snot sh.opt_posix then io.stderr:write(%q) end; sh.status = 0; pc = %d"):format(
+							cx.frag_loop and "(sh.loopdepth or 0) == 0 and " or "",
 							"curse: " .. cf_op .. ": only meaningful in a `for', `while', or `until' loop\n", after)
 					end
 				else
@@ -8622,6 +8666,10 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
 						-- past its own reach them — raised for the caller's cf-wrapper)
 						cx.blocks[p] = d .. (EF.cf_flush or "") .. cx.ndadj(0) .. ("sh.status = 0; error({ __curse_%s = %d })"):format(
 							cf_op, lvl - #cx.loopstack)
+					elseif EF.cs_in_loop and lvl > #cx.loopstack and #cx.subexit == 0 then
+						-- (a `$( … )` inside a loop keeps the loop level: the levels past its own
+						-- end the substitution, as one with no loop of its own does — no clamp)
+						cx.blocks[p] = d .. cx.ndadj(0) .. ("error({ __curse_%s = %d })"):format(cf_op, lvl - #cx.loopstack)
 					elseif EF.fragment and not EF.lm and lvl > #cx.loopstack and #cx.subexit == 0 then
 						-- (an eval / hot-loop fragment inside the caller's loops: the levels past
 						-- its own reach them — bash counts across; with none, it clamps)
@@ -8869,6 +8917,17 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
 			return H.select(cx, st, after)
 		else
 			return cx.delegate(st, after) -- unknown/cold statement: run it via the interpreter
+		end
+	end
+	do -- (the line a foreground job a statement's blocks run is reported at: cx.blocks — its
+		-- own, not a nested statement's, for the blocks it writes after flattening those)
+		local flatten = cx.flatten_stmt
+		function cx.flatten_stmt(st, after)
+			local sjl = EF.cur_jl
+			EF.cur_jl = st.jcx and st.jcx.l
+			local r = flatten(st, after)
+			EF.cur_jl = sjl
+			return r
 		end
 	end
 
@@ -9164,6 +9223,16 @@ assemble = function(cfg, sig, opts)
 			if #rx > 0 then
 				lt[#lt + 1] = "rx={" .. table.concat(rx, ",") .. "}"
 			end
+		end
+		if cfg.pcline.jl then -- (a foreground job's report line: rt.job_line)
+			local jt = {}
+			for p = 0, cfg.npc - 1 do
+				local l = cfg.pcline.jl[p]
+				if l then
+					jt[#jt + 1] = ("[%d]=%d"):format(p, l)
+				end
+			end
+			lt[#lt + 1] = "jl={" .. table.concat(jt, ",") .. "}"
 		end
 		if #lt > 0 then -- (a function's also names itself: its errors carry its file's label)
 			o[#o + 1] = ("rt.pcline(%s, {%s}%s)"):format(fname, table.concat(lt, ","),

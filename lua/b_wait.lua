@@ -340,15 +340,36 @@ wait_builtin = function(sh, cmd, args, hook, tcb)
 			end
 			sh.status = last
 		else -- wait for all jobs
+			-- (wait_for_background_pids: a job still running when reached is waited for and
+			-- leaves the table; one that had already ended goes too — mark_dead_jobs_as_notified
+			-- — except $!'s: POSIX keeps the last async job's status until reported)
+			-- (a real child has ended if waitpid says so; an in-process job if the shell already
+			-- saw it end — rt.jobs_poll — or a signal killed it while we waited on another, as
+			-- bash's waitchld reaps a child killed alongside; one that just finishes meanwhile
+			-- would, as a bash child, still have been running when reached)
+			local gone, blocked = {}, false
 			for _, j in ipairs(table_jobs(sh)) do
-				if not j.done then
+				local ended = j.done
+				if not ended and j.g then
+					ended = blocked and j.g.done and job_reap(sh, j, true) ~= nil and j.sig ~= nil
+				elseif not ended then
+					ended = job_reap(sh, j, true) ~= nil
+				end
+				if not ended then
+					blocked = blocked or not (j.g and j.g.done)
 					job_reap(sh, j)
 					report(sh, j)
 				end
 				if sh.wait_sig then
 					break
 				end
+				if not ended or tostring(j.pid) ~= sh.last_bg_pid then
+					gone[#gone + 1] = j
+				end
+			end
+			for _, j in ipairs(gone) do -- (deleted after: $!'s job doesn't become current meanwhile)
 				rt.job_delete(sh, j)
+				j.forgot = not sh.wait_sig or nil -- (bgp_clear: a later `wait PID` doesn't know it)
 			end
 			if sh.bg_pids and not sh.wait_sig then
 				for _, p in ipairs(sh.bg_pids) do

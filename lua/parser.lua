@@ -1694,6 +1694,36 @@ function M.mark_tail(body, paren)
 		and not (n > 1 and body[n - 1].t == "background") then
 		last.shtail = (alone and paren) and 2 or 1
 		last.cstail = not paren or nil -- (a $( … ) body's: a function it calls passes it on)
+	elseif last and alone and paren and last.t == "subshell" and not last.ttimed then
+		last.inplace = true -- (a `( … )` alone in one: run in its process — rt.subshell_run)
+	elseif last and alone and paren and last.t == "pipeline" and last.negate and #last.cmds == 1 then
+		last.cmds[1].bang = nil
+	end
+end
+-- A `time ( … )` (`time ! ( … )`): execute_in_subshell passes CMD_TIME_PIPELINE on to the
+-- body, so the subshell times it itself, INSIDE its redirections (`time ( … ) 2>f` writes
+-- the report to f) — and no command of it is exec'd in place: the body becomes one timed
+-- group (.tw; `ttimed` keeps the `time` for deparse). A `! ( … )`: the `!` shows in its job
+-- text (.bang) — unless it's alone in a `( … )`, whose execute_in_subshell strips the flag
+-- (mark_tail).
+function M.untail(pipe, sub, timed, timed_p)
+	if not timed then
+		sub.bang = true
+		return
+	end
+	local body = sub.body
+	local last = body[#body]
+	if last and last.t == "andor" then
+		last = last.items[#last.items].cmd
+	end
+	if last then
+		last.shtail, last.cstail, last.inplace = nil, nil, nil
+	end
+	sub.body = { { t = "group", line = body[1] and body[1].line or sub.line, body = body, tw = true,
+		timed = true, timed_p = timed_p or nil } }
+	pipe.timed, pipe.timed_p, pipe.ttimed = nil, nil, timed_p and "p" or true
+	if pipe ~= sub then
+		sub.bang = true
 	end
 end
 -- …and a function called as a $( … ) body's tail passes that on to its own body's last
@@ -1712,6 +1742,7 @@ function M.mark_fntail(body, name)
 end
 M.scan_braces = scan_braces
 M.grab_dparen = grab_dparen
+M.fn_bstart = 1 -- (parse.y's function_bstart, a static: see func_body)
 
 -- Memoize the runtime-facing parsers. The interpreter re-parses the SAME arith
 -- expressions and words on every loop iteration — $(( … )), array subscripts,
@@ -2783,6 +2814,13 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs, xg, bq
 		line = line0 - #(src:match("^[ \t\n]*"):gsub("[^\n]", ""))
 	end
 	local loopId = 0
+	-- jcx: the line a foreground job killed by a signal is reported at — bash's line_number
+	-- once the command is back from execute_simple_command (restored to the enclosing
+	-- context's): a top-level command's parser line (its line group's last, heredocs and
+	-- all), a function body's `{`, a for/select/case's head, a subshell's `)`. A record
+	-- shared by the commands it encloses (the top-level's and subshell's are filled in at
+	-- their end); a simple command / pipeline / subshell node carries it as .jcx.
+	local jcx = {}
 	local heredocs_pending = {} -- heredoc redirs awaiting their body (filled at line end)
 	local warns = {} -- parse-time warnings, run as `warn` statements ahead of their line
 	-- Alias expansion, done here in the PARSER as a deterministic function of the
@@ -3702,21 +3740,28 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs, xg, bq
 			ws()
 		end -- bash allows newlines before the body
 		local bline = line -- the body's first line (a traced call's entry DEBUG reports it)
+		local sjcx = jcx
+		jcx = { l = bline, up = sjcx } -- (restored by funcdef_node)
 		-- any compound command is a body (bash's function_body: shell_command): `f() if …
 		-- fi`, `f() for …`, `f() [[ … ]]`, `f() (( … ))`, `function f case … esac`
 		local kw = src:match("^[%a]+", i)
 		if (kw and FBODY_KW[kw] and not src:find("^[^ \t\n;&|()<>]", i + #kw))
 			or src:find("^%[%[[ \t\n]", i) or src:sub(i, i + 1) == "((" then
 			local node = parse_command()
+			jcx.l = M.fn_bstart -- (bash's tc->line: see below)
 			if node.t ~= "subshell" then
 				return { node }, bline
 			end
 			-- (`((` that was two nested subshells: the subshell body, as below)
+			node.jcx = { l = M.fn_bstart }
 			return { node }, bline, true
 		end
 		if src:sub(i, i) == "(" then
 			i = i + 1
+			local fjcx = jcx
+			jcx = {}
 			local body, pterm = parse_stmts({ [")"] = true })
+			jcx.l, jcx = line, fjcx -- (bash's subshell->line: where it closes)
 			if pterm ~= ")" then
 				error("syntax error: unexpected end of file") -- unclosed ( )
 			end
@@ -3724,14 +3769,20 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs, xg, bq
 				error("syntax error near `)'") -- (`f() ( )`: bash)
 			end
 			M.mark_tail(body, true)
-			return { { t = "subshell", line = bline, body = body } }, bline, true
+			-- the line its caller reports the subshell's job at: execute_function's
+			-- line_number = tc->line, which make_function_def sets to function_bstart — only
+			-- a `{` body's parse updates that (parse.y's PST_ALLOWOPNBRC), so any other body
+			-- carries the last `{`-bodied function's `{` line (0 -> 1: notify_of_job_status)
+			return { { t = "subshell", line = bline, body = body, jcx = { l = M.fn_bstart } } }, bline, true
 		end
+		M.fn_bstart = bline -- (at its `{`: a function defined inside moves it on)
 		return brace_group(), bline
 	end
 	-- A function definition, with any trailing redirects (`f() { … } >&2`) that apply
 	-- to the whole body on every call.
 	local function funcdef_node(nm, dstart, dline)
 		local body, bline, subbody = func_body()
+		jcx = jcx.up or jcx
 		if not subbody then
 			M.mark_fntail(body, nm)
 		end
@@ -4515,7 +4566,10 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs, xg, bq
 			end
 			loopId = loopId + 1
 			local id = loopId
+			local sjcx = jcx
+			jcx = { l = ln }
 			local body_stmts = loop_body()
+			jcx = sjcx
 			if #body_stmts == 0 then
 				error("syntax error near `done'")
 			end -- bash: empty do/done is invalid
@@ -4801,7 +4855,10 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs, xg, bq
 		end
 		if src:sub(i, i) == "(" then
 			i = i + 1
+			local sjcx = jcx
+			jcx = {}
 			local body, pterm = parse_stmts({ [")"] = true })
+			jcx.l, jcx = line, sjcx -- (bash's subshell->line: where it closes)
 			if pterm ~= ")" then
 				error("syntax error: unexpected end of file") -- unclosed ( )
 			end
@@ -4819,7 +4876,7 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs, xg, bq
 				end
 			end
 			M.mark_tail(body, true)
-			return { t = "subshell", line = line, body = body, redirs = (#redirs > 0 and redirs or nil) }
+			return { t = "subshell", line = line, body = body, redirs = (#redirs > 0 and redirs or nil), jcx = jcx }
 		end
 		-- case WORD in  PAT|PAT) BODY ;;  … esac
 		if peekword() == "case" then
@@ -4843,6 +4900,7 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs, xg, bq
 			end
 			if peekword() == "in" then
 				i = i + 2
+				jcx = { l = ln, up = jcx } -- (its clauses: `up` restores it after — see below)
 			else -- (bash: the token that isn't `in`)
 				if i > n then -- (newlines may come before `in`: the input just ended)
 					error("syntax error: unexpected end of file")
@@ -5088,6 +5146,7 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs, xg, bq
 				cur_stopset = svs
 				clauses[#clauses + 1] = { pats = pats, body = body, term = term }
 			end
+			jcx = jcx.up
 			return { t = "case", line = ln, subject = subject, clauses = clauses, redirs = tail_redirs() }
 		end
 
@@ -5309,6 +5368,7 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs, xg, bq
 			redirs = (#redirs > 0 and redirs or nil),
 			assigns = (#assigns > 0 and assigns or nil),
 			arrayargs = arrayargs,
+			jcx = jcx,
 		}
 		record_alias_state(node) -- note shopt/alias/unalias so later words expand
 		return node
@@ -5461,11 +5521,14 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs, xg, bq
 			end
 		end
 		local pipe = (#cmds == 1 and not negate) and first
-			or { t = "pipeline", cmds = cmds, negate = negate, line = ln }
+			or { t = "pipeline", cmds = cmds, negate = negate, line = ln, jcx = jcx }
 		if timed then
 			pipe.timed = true
 			pipe.timed_p = timed_p
 		end -- `time` prefix: measure this pipeline
+		if #cmds == 1 and first.t == "subshell" and (timed or negate) then
+			M.untail(pipe, first, timed, timed_p)
+		end
 		return pipe
 	end
 
@@ -5626,6 +5689,7 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs, xg, bq
 		end
 		local stmts = {}
 		local gstart, gline = i, line -- (where this logical line's text begins: its compiled-group key)
+		jcx = {}
 		while true do
 			local start, startline = i, line
 			local ok, st = pcall(parse_stmt)
@@ -5724,9 +5788,11 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs, xg, bq
 			end
 		end
 		local eline = line -- (the command's last line: its terminating newline's)
+		jcx.l = line -- (the top-level commands' job-report line: jcx — a heredoc's last)
 		if #heredocs_pending > 0 then
 			collect_heredocs()
 			eline = line - 1 -- (the bodies' last line: the reader is past its newline)
+			jcx.l = line - 1
 		end -- read bodies after the line
 		if #warns > 0 then
 			for k = #warns, 1, -1 do
@@ -5736,7 +5802,8 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs, xg, bq
 		end
 		-- (pos/pline: where reading stopped — a reader that takes over the rest of the
 		-- input line by line, for command history, resumes there)
-		return { stmts = stmts, pos = i, pline = line, src = src, spos = gstart, sline = gline, eline = eline }
+		return { stmts = stmts, pos = i, pline = line, src = src, spos = gstart, sline = gline, eline = eline,
+			jcx = jcx }
 	end
 	-- a syntax error also reports the offending input line (bash's second message line)
 	return function()

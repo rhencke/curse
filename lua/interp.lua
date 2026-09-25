@@ -6067,18 +6067,17 @@ exec_stmt = function(sh, st, hook)
 			elseif nb and nb.ref and nb.s then
 				-- a nameref cycle (ref1->ref2->ref1) derefs to "" — bash detects it on write
 				if nb.s ~= "" and sh:deref(st.name) == "" then
-					if rt.ref_too_deep(sh, st.name) then
-						rt.assign_discard(sh) -- (a chain past NAMEREF_MAX: a silent assignment error)
+					if rt.nameref_circular(sh, st.name) then -- (a function's local cycle: the global, no nameref)
+						local back = sh:global_swap({ st.name })
+						sh.in_circ = true
+						local ok, e = pcall(exec_stmt, sh, st, hook)
+						sh.in_circ = nil
+						back()
+						if not ok then
+							error(e, 0)
+						end
 					end
-					io.stderr:write("curse: warning: " .. st.name .. ": circular name reference\n")
-					sh.status = 1 -- (an assignment error, as a readonly one: a prefix binding is just
-					if sh.opt_posix then -- skipped, a standalone one aborts the rest of the line)
-						error({ __curse_exit = 1 })
-					end
-					if sh.applying_prefix then
-						return
-					end
-					error({ __curse_exit = 1, __curse_lineabort = true })
+					return
 				elseif nb.outer and nb.s:find("[", 1, true) then -- (`local -n a='a[0]'`: bash
 					io.stderr:write("curse: `" .. nb.s .. "': not a valid identifier\n") -- rejects it)
 					error({ __curse_exit = 1, __curse_lineabort = true })
@@ -6927,7 +6926,7 @@ exec_stmt = function(sh, st, hook)
 				end
 			end
 			exec_list(sh, st.body, SUBHOOK, false)
-		end, nil, st) -- (st: its text, for the report if a signal kills it)
+		end, nil, st, st.inplace) -- (st: its text, for the report if a signal kills it)
 		if saves then
 			restore_redirs(saves)
 		end
@@ -6952,7 +6951,7 @@ exec_stmt = function(sh, st, hook)
 			exec_stmt(ssh, run, SUBHOOK)
 		end, cmdstr, cmd.t == "subshell", cmd.t == "simple")
 		if cmd.t == "pipeline" and job and job.g then
-			job.g.pipe = true -- (a pipeline job: `kill %N` reaches its every stage)
+			rt.job_mark_pipe(job) -- (a pipeline job: `kill %N` reaches its every stage)
 		end
 		sh.status = 0
 	elseif t == "coproc" then
@@ -7494,8 +7493,9 @@ fire_err_trap = function(sh)
 	-- (not inherited by functions/subshells — but one SET in a function or subshell
 	-- fires there, as bash's trap is active in the context that set it)
 	-- (functions hide it on entry — rt.debug_enter; a subshell doesn't inherit it either)
-	local sp = sh.in_subprogram or 0
-	local errscope = sh.opt_errtrace or ((sh.in_pipestage or 0) == 0 and (sp == 0 or sp == sh.err_trap_sp))
+	-- (a stage skips only the INHERITED trap: one set inside the stage fires there)
+	local sp, ps = sh.in_subprogram or 0, sh.in_pipestage or 0
+	local errscope = sh.opt_errtrace or ((ps == 0 or ps == sh.err_trap_ps) and (sp == 0 or sp == sh.err_trap_sp))
 	if sh.err_skip then -- (the failing call set the trap itself: bash sampled none before it)
 		sh.err_skip = nil
 		return

@@ -67,7 +67,9 @@ j jobs %1
 # --- Done / Exit N / killed entries in `jobs`, and kill of a finished job
 (exit 3) & p=$!; reaped $p
 true & p=$!; reaped $p
-jobs
+# (whether bash still marks an already-reaped job current (+) races its SIGCHLD handling:
+# the markers here are left out)
+jobs >out; sed 's/^\(\[[0-9]*\]\)[+-]/\1 /' out
 jobs; echo "listed once"
 (exit 4) & p=$!; reaped $p
 kill %1; echo "kill-done=$?"

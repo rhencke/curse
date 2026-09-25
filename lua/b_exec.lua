@@ -205,8 +205,10 @@ return function(sh, st, args, hook, viacmd)
 		rt.shlvl_delta = -1
 	end
 	rt.env_drop_us = true
+	local stx = sh.tail_x -- (the subshell it replaces dies if the command does: rt.fg_ended)
+	sh.tail_x = rt.iso_cur(sh)
 	local eok, eerr = pcall(sh.exec, sh, unpack(rest))
-	rt.shlvl_delta, rt.env_drop_us = sd, snu
+	rt.shlvl_delta, rt.env_drop_us, sh.tail_x = sd, snu, stx
 	sh.exec_argv0, sh.exec_builtin, sh.exec_noenv, sh.exec_script_a0 = sv_a0, sv_eb, sv_ne, sv_sa0
 	if env0 then -- (only a failed exec that the shell survives needs these back)
 		C.clearenv()
