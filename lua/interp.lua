@@ -5139,6 +5139,7 @@ SPECIAL_BUILTIN = {
 	["."] = 1,
 	source = 1,
 	eval = 1,
+	exec = 1,
 	exit = 1,
 	export = 1,
 	readonly = 1,
@@ -5781,107 +5782,12 @@ exec_stmt = function(sh, st, hook)
 		-- `exec [redirs] [cmd…]`: redirections are permanent (not restored). With no
 		-- command it just rewires the shell's own fds (e.g. `exec 3>file`); with a
 		-- command it replaces the shell process with that command.
+		local viacmd -- (`command exec`: a special builtin's posix-mode fatal errors don't apply)
 		while (args[1] == "command" or args[1] == "builtin") and args[2] == "exec" and not sh.functions[args[1]] do
+			viacmd = viacmd or args[1] == "command"
 			table.remove(args, 1) -- `command exec 2>f`: still exec, its redirections persist
 		end
-		if args[1] == "exec" then
-			-- in an in-process subshell/$(…) fds and the environ are process-global: save them
-			-- (restored when it ends); `exec CMD` runs CMD, then ends the subshell
-			rt.iso_save_fds(sh)
-			rt.iso_save_env(sh)
-			io.flush()
-			local ok = true
-			if st.redirs then
-				local sv
-				sv, ok = apply_redirs(sh, st.redirs, "exec")
-				if type(sv) == "table" then -- (they persist: the saved originals are dropped)
-					rt.redir_discard(sv)
-				end
-				if sh.coprocs then
-					rt.coproc_fdcheck(sh) -- a coproc end it closed/moved reads as -1
-				end
-			end
-			-- exec [-cl] [-a name] [--] [cmd…]: -c empty environment, -l login ($0 gets a
-			-- leading -), -a NAME as $0. Another option is a usage error (status 2).
-			local k, argv0, cflag, lflag = 2, nil, false, false
-			while args[k] and args[k]:sub(1, 1) == "-" and args[k] ~= "-" do
-				local a = args[k]
-				k = k + 1
-				if a == "--" then
-					break
-				end
-				local j = 2
-				while j <= #a do
-					local f = a:sub(j, j)
-					if f == "c" then
-						cflag = true
-					elseif f == "l" then
-						lflag = true
-					elseif f == "a" then
-						if j < #a then
-							argv0 = a:sub(j + 1)
-						else
-							argv0 = args[k]
-							k = k + 1
-						end
-						break
-					else
-						io.stderr:write("curse: exec: -" .. f .. ": invalid option\n")
-						io.stderr:write("exec: usage: exec [-cl] [-a name] [command [argument ...]] [redirection ...]\n")
-						sh.status = 2
-						return
-					end
-					j = j + 1
-				end
-			end
-			if k <= #args and rt.restricted(sh, "exec: restricted") then
-				return
-			end
-			if k <= #args then
-				local rest = { unpack(args, k) }
-				if lflag then
-					argv0 = "-" .. (argv0 or rest[1]:match("[^/]*$"))
-				end
-				if argv0 then
-					sh.exec_argv0 = argv0
-				end -- exec -a NAME: override the child's argv[0]
-				if cflag then -- (after the prefix bindings too: `FOO=BAR exec -c cmd` passes nothing)
-					sh.exec_noenv = true -- (not even `_`)
-				end
-				if st.assigns and not cflag then -- prefix bindings become the exec'd command's environment (bash)
-					for _, a in ipairs(st.assigns) do
-						if a.raw then
-							sh:set_str(a.name, a.raw)
-							C.setenv(a.name, a.raw, 1)
-						else
-							exec_stmt(sh, a, hook)
-							if not a.index then
-								C.setenv(a.name, sh:get(a.name), 1)
-							end
-						end
-					end
-				end
-				if cflag then
-					C.clearenv()
-				end
-				sh.exec_builtin = true -- (a lookup failure reads `exec: NAME: not found`, bash)
-				local sd = rt.shlvl_delta
-				rt.shlvl_delta = -1 -- (the command replaces the shell: bash lowers SHLVL for it)
-				local eok, eerr = pcall(exec_simple, sh, rest, hook)
-				rt.shlvl_delta = sd
-				sh.exec_builtin = nil
-				if not eok then
-					error(eerr, 0)
-				end
-				io.flush()
-				-- the command REPLACES the shell: end with its status, no EXIT trap (bash). Not
-				-- os.exit — in the daemon that would kill the worker before it replies.
-				error({ __curse_exit = sh.status or 0, __curse_noexittrap = true })
-			else
-				sh.status = ok and 0 or 1
-			end
-			return
-		end
+		local isexec = args[1] == "exec"
 		local tenv_base -- set while this command's prefix bindings sit on sh.tenv
 		local function run_cmd()
 			sh.write_err = nil -- a builtin sets this on an output write error (e.g. full disk)
@@ -5889,6 +5795,12 @@ exec_stmt = function(sh, st, hook)
 			-- capture the trace (bash writes it to the shell's stderr).
 			if sh.opt_x and args[1] ~= nil then
 				xtrace(sh, args)
+			end
+			-- `exec [redirs] [cmd…]` (b_exec): its redirections PERSIST (not restored) and
+			-- a command replaces the shell. Here, under the prefix bindings (a temporary
+			-- env — posix: they persist, exec being a special builtin)
+			if isexec then
+				return require("b_exec")(sh, st, args, hook, viacmd)
 			end
 			if st.redirs then
 				local save, ok
@@ -5941,7 +5853,7 @@ exec_stmt = function(sh, st, hook)
 				end -- builtin hit a write error (e.g. full disk)
 			end
 		end
-		if st.assigns and sh.opt_posix and args[1] and SPECIAL_BUILTIN[args[1]] then
+		if st.assigns and sh.opt_posix and args[1] and SPECIAL_BUILTIN[args[1]] and not viacmd then
 			-- POSIX (bash under `set -o posix`): a variable assignment prefixed to a
 			-- SPECIAL builtin (`:`, `.`, eval, export, readonly, set, shift, trap,
 			-- unset, …) PERSISTS in the shell — and, being a command prefix, stays
@@ -6294,7 +6206,7 @@ exec_stmt = function(sh, st, hook)
 				end
 			end
 			exec_list(sh, st.body, SUBHOOK, false)
-		end)
+		end, nil, true)
 		if saves then
 			restore_redirs(saves)
 		end
@@ -7465,6 +7377,9 @@ M._int = {
 	exec_list = exec_list,
 	run_history_lines = run_history_lines,
 	exec_stmt = exec_stmt,
+	apply_redirs = apply_redirs,
+	restore_redirs = restore_redirs,
+	redirs_touch_stdout = redirs_touch_stdout,
 	describe = describe,
 	statbuf = statbuf,
 	statbuf2 = statbuf2,

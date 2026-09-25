@@ -58,6 +58,7 @@ local lazy_mods = {
 	"b_builtin",
 	"b_pwd",
 	"b_shift",
+	"b_exec",
 	"b_local",
 	"b_help",
 	"b_logout",

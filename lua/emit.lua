@@ -4758,8 +4758,13 @@ simple_compiled = function(cx, st, after)
 		local re = cx.redir_conds(st, nil) -- nil cmd bypasses the exec guard in redir_conds
 		if re then
 			local p = cx.newpc()
+			-- (a failed one undoes the rest and, exec being a special builtin, is fatal under
+			-- posix; in a pipeline stage whose stdout it moves, the stage's buffered output
+			-- goes to the old fd 1 and later builtins write straight to the new one)
+			local co = require("interp")._int.redirs_touch_stdout(st.redirs)
+				and "local __co = rt.CO_OUTS[sh.out]; if __co then rt.flush_stage_out(sh) end; " or "local __co; "
 			cx.blocks[p] = dbg(st)
-				.. ("do rt.iso_save_fds(sh); local __rs = {}; sh.status = (%s) and 0 or 1; rt.redir_discard(__rs); if sh.coprocs then rt.coproc_fdcheck(sh) end end; pc = %d"):format(re, after)
+				.. ("do rt.iso_save_fds(sh); %slocal __rs = {}; if %s then sh.status = 0; rt.redir_discard(__rs); if __co then sh.out = io.write end else sh.status = 1; rt.redir_restore(__rs) end; if sh.coprocs then rt.coproc_fdcheck(sh) end; if sh.status ~= 0 and sh.opt_posix and not sh.opt_i then error({ __curse_exit = 1 }) end end; pc = %d"):format(co, re, after)
 			return p
 		end
 	end
@@ -5921,10 +5926,10 @@ H.subshell = function(cx, st, after)
 				swpost = ("; %s = %s"):format(vlist, table.concat(sav, ", "))
 			end
 			if sub_redir then
-				cx.blocks[p] = ("%slocal __rs = {}; if %s then sh:subshell_run(__CS[%d], __rs) else rt.redir_restore(__rs); sh.status = 1 end%s%s; pc = %d"):format(
+				cx.blocks[p] = ("%slocal __rs = {}; if %s then sh:subshell_run(__CS[%d], __rs, true) else rt.redir_restore(__rs); sh.status = 1 end%s%s; pc = %d"):format(
 					swpre, sub_redir, id, swpost, ecs, after)
 			else
-				cx.blocks[p] = ("%ssh:subshell_run(__CS[%d])%s%s; pc = %d"):format(swpre, id, swpost, ecs, after)
+				cx.blocks[p] = ("%ssh:subshell_run(__CS[%d], nil, true)%s%s; pc = %d"):format(swpre, id, swpost, ecs, after)
 			end
 			if not EF.has_dyncode then
 				return p
