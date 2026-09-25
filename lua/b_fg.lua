@@ -151,6 +151,6 @@ return function(sh, cmd, args)
 	io.flush()
 	sh.status = job_reap(sh, j) or 127
 	if j.sig and SIGDESC[j.sig] then
-		io.stderr:write(SIGDESC[j.sig] .. "\n")
+		io.stderr:write(require("runtime").Llibc(SIGDESC[j.sig]) .. "\n")
 	end
 end

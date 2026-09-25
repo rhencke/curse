@@ -4079,7 +4079,9 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs, xg, bq
 		if not closed then -- (never closed: bash's error, at the line it began on — status 1,
 			-- and a DISCARD: an eval'd one ends a subshell)
 			comsub_eof = false
-			error({ __curse_perr = true, line = line0, status = 1, discard = true,
+			-- (exactmsg: its own msgid, not the `%c' one the others share — translated as
+			-- such when reported, rt.L)
+			error({ __curse_perr = true, line = line0, status = 1, discard = true, exactmsg = true,
 				msg = "unexpected EOF while looking for matching `)'" }, 0)
 		end
 		return elems
@@ -5101,10 +5103,12 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs, xg, bq
 		-- WORD (the lookahead that rules out `WORD ( )`, a funcdef)
 		local cline
 		while true do
-			ws()
+			-- (the reduction takes no lookahead: the line the first element ENDED on, before
+			-- a `\<newline>` after it is read — `x=1 \<newline>y=$(echo $LINENO)` is line 1)
 			if not cline and #assigns + #redirs >= 1 then
 				cline = line
 			end
+			ws()
 			local r = parse_redir()
 			if r then
 				redirs[#redirs + 1] = r
@@ -5655,6 +5659,7 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs, xg, bq
 						recoverable = recover or nil,
 						discard = type(st) == "table" and st.__curse_perr and st.discard or nil,
 						forceeof = type(st) == "table" and st.__curse_perr and st.forceeof or nil,
+						exactmsg = type(st) == "table" and st.__curse_perr and st.exactmsg or nil, -- (its own msgid)
 					},
 				}
 			end
@@ -5718,8 +5723,10 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs, xg, bq
 				}
 			end
 		end
+		local eline = line -- (the command's last line: its terminating newline's)
 		if #heredocs_pending > 0 then
 			collect_heredocs()
+			eline = line - 1 -- (the bodies' last line: the reader is past its newline)
 		end -- read bodies after the line
 		if #warns > 0 then
 			for k = #warns, 1, -1 do
@@ -5729,7 +5736,7 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs, xg, bq
 		end
 		-- (pos/pline: where reading stopped — a reader that takes over the rest of the
 		-- input line by line, for command history, resumes there)
-		return { stmts = stmts, pos = i, pline = line, src = src, spos = gstart, sline = gline }
+		return { stmts = stmts, pos = i, pline = line, src = src, spos = gstart, sline = gline, eline = eline }
 	end
 	-- a syntax error also reports the offending input line (bash's second message line)
 	return function()
@@ -5806,6 +5813,9 @@ function M.parse(src, sh, aenv, noalias, posix, line0, line1, xg, bq)
 		end
 		if stmts[first] then -- (the first statement of a line group: where a line abort resumes)
 			stmts[first].lgstart = true
+			if lg.eline and lg.sline and lg.eline > lg.sline then -- (its lines: rt.line_drift)
+				stmts[first].lgspan = { lg.sline, lg.eline }
+			end
 		end
 	end
 	ALIAS_ENV, COMSUB_PREX, POSIX_DQ = saved_env, sprex, spdq

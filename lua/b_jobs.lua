@@ -19,13 +19,13 @@ local C, P = I.C, I.P
 -- printable_job_status (jobs.c): Running, Done / Exit N (posix: Done(N)), or the signal
 local function job_state(sh, j)
 	if not j.done then
-		return "Running"
+		return rt.L("Running")
 	elseif j.sig then
-		return I.SIGDESC[j.sig] or ("Signal " .. j.sig)
+		return I.SIGDESC[j.sig] and rt.Llibc(I.SIGDESC[j.sig]) or rt.L("Signal %d", j.sig)
 	elseif (j.status or 0) == 0 then
-		return "Done"
+		return rt.L("Done")
 	end
-	return (sh.opt_posix and "Done(%d)" or "Exit %d"):format(j.status)
+	return rt.L(sh.opt_posix and "Done(%d)" or "Exit %d", j.status)
 end
 
 return function(sh, cmd, args, hook, tcb)
@@ -89,7 +89,7 @@ return function(sh, cmd, args, hook, tcb)
 				local mark = (j == sh.job_cur) and "+" or (j == sh.job_prev and "-" or " ")
 				local amp = j.done and "" or " &"
 				local lead = form == "l" and (" %5d "):format(j.pid) or "  "
-				sh:echo(("[%d]%s%s%-24s%s%s"):format(j.id, mark, lead, st, j.cmd or "", amp))
+				sh:echo(("[%d]%s%s%s%s%s%s"):format(j.id, mark, lead, st, (" "):rep(math.abs(24 - #st)), j.cmd or "", amp))
 			end
 			j.notified = st
 		end

@@ -37,19 +37,28 @@ local function parse_mo(s)
 	if not (n and oo and to) then
 		return nil
 	end
-	local map = {}
+	local map, plural = {}, {}
 	for k = 0, n - 1 do
 		local ol, oof = u32(s, oo + 8 * k, le), u32(s, oo + 8 * k + 4, le)
 		local tl, tof = u32(s, to + 8 * k, le), u32(s, to + 8 * k + 4, le)
 		if not (ol and oof and tl and tof) then
 			break
 		end
-		local id = s:sub(oof + 1, oof + ol):match("^[^%z]*")
+		local raw = s:sub(oof + 1, oof + ol)
+		local id = raw:match("^[^%z]*")
 		if map[id] == nil then
-			map[id] = s:sub(tof + 1, tof + tl):match("^[^%z]*")
+			local tr = s:sub(tof + 1, tof + tl)
+			map[id] = tr:match("^[^%z]*")
+			if #id < #raw then -- (ngettext: every plural form, for l10n.lua)
+				local forms = {}
+				for f in (tr .. "\0"):gmatch("([^%z]*)%z") do
+					forms[#forms + 1] = f
+				end
+				plural[id] = forms
+			end
 		end
 	end
-	return map
+	return map, plural
 end
 local function catalog(path)
 	local f = io.open(path, "rb")
@@ -60,11 +69,13 @@ local function catalog(path)
 	f:close()
 	local c = cats[path]
 	if not (c and c.data == data) then
-		c = { data = data, map = data and parse_mo(data) or false }
+		local map, plural = parse_mo(data or "")
+		c = { data = data, map = map or false, plural = plural }
 		cats[path] = c
 	end
-	return c.map or nil
+	return c.map or nil, c
 end
+M.catalog = catalog
 
 -- glibc's _nl_explode_name + _nl_make_l10nflist: language[_territory][.codeset][@modifier],
 -- most specific first (the codeset as written, or normalized — lowercase alphanumerics,
@@ -95,6 +106,8 @@ local function variants(name, out)
 		end
 	end
 end
+
+M.variants = variants
 
 local function var(sh, name)
 	local v = sh.vars[name] and sh:get(name)

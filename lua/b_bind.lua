@@ -245,7 +245,7 @@ return function(sh, cmd, args, hook, tcb)
 			else
 				local ks = rl.rl_invoking_keyseqs(fn)
 				if ks == nil or ks[0] == nil then
-					sh:echo(name .. " is not bound to any keys.")
+					sh.out(rt.L("%s is not bound to any keys.\n", name))
 					sh.status = 1
 				else
 					local parts, i = {}, 0
@@ -253,7 +253,7 @@ return function(sh, cmd, args, hook, tcb)
 						parts[#parts + 1] = '"' .. ffi.string(ks[i]) .. '"'
 						i = i + 1
 					end
-					sh:echo(name .. " can be invoked via " .. table.concat(parts, ", ") .. ".")
+					sh:echo(rt.L("%s can be invoked via ", name) .. table.concat(parts, ", ") .. ".")
 					sh.status = 0
 				end
 			end

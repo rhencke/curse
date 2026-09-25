@@ -36,7 +36,11 @@ local function exec_refused(path)
 		return nil
 	end
 	local msg = ffi.string(C.strerror(e))
-	io.stderr:write("curse: " .. path .. ": " .. msg .. "\n")
+	if e == 21 then -- (shell_execve's EISDIR: its own _("%s: %s"), unlike file_error's)
+		io.stderr:write("curse: " .. rt.L("%s: %s", path, msg) .. "\n")
+	else
+		io.stderr:write("curse: " .. path .. ": " .. msg .. "\n")
+	end
 	if e == 2 then -- ENOENT: EX_NOTFOUND, "no duplicate error message"
 		return 127
 	end

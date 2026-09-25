@@ -501,10 +501,12 @@ end
 -- run_trap doesn't advance sh.cur_line at the trap's call depth: EF.trapline)
 local function lineno_expr()
 	if EF.trapline and not EF.cur_infunc then
-		return "((sh.vars.LINENO or sh.unset_specials) and rt.lineno_plain(sh) and sh:get('LINENO') or tostring(sh.cur_line or 0))"
+		return "((sh.vars.LINENO or sh.unset_specials) and rt.lineno_plain(sh) and sh:get('LINENO') or "
+			.. "(sh.ldrift and rt.ldrift_str(sh, sh.cur_line or 0)) or tostring(sh.cur_line or 0))"
 	end
-	return ("((sh.vars.LINENO or sh.unset_specials) and rt.lineno_plain(sh) and sh:get('LINENO') or %q)"):format(
-		tostring(EF.cur_line or 0))
+	-- (sh.ldrift: bash's lines drifted after a discarded command — rt.line_drift)
+	return ("((sh.vars.LINENO or sh.unset_specials) and rt.lineno_plain(sh) and sh:get('LINENO') or "
+		.. "(sh.ldrift and rt.ldrift_str(sh, %d)) or %q)"):format(EF.cur_line or 0, tostring(EF.cur_line or 0))
 end
 -- A non-literal command word (`c=unset; $c f`) or an `unset` passed on as an argument
 -- (`run unset f`, to a function that runs "$@") may unset any literal name after it too.
@@ -594,7 +596,8 @@ end
 -- Lua literal, so a cold statement can be baked into the compiled source and run
 -- by the shared interpreter (delegation). No cycles/functions in the AST.
 -- (a loop's source span and its run-time tiering state: never part of the program)
-local SER_SKIP = { _srcs = true, _s0 = true, _s1 = true, _h1 = true, _frag = true, _hits = true, _fid = true }
+local SER_SKIP = { _srcs = true, _s0 = true, _s1 = true, _h1 = true, _frag = true, _hits = true, _fid = true,
+	lgspan = true }
 local function ser(v)
 	local t = type(v)
 	if t == "string" then
@@ -8938,6 +8941,10 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
 					break
 				end
 			end
+			if stmts[k].lgspan then -- (a multi-line group's lines, by the pc a line abort resumes at)
+				cx.lgspan = cx.lgspan or {}
+				cx.lgspan[ff] = stmts[k].lgspan
+			end
 			-- `set -n` (noexec): once set, the shell READS but does not execute the rest of
 			-- a non-interactive script — so every later top-level statement is skipped (which
 			-- also means a later `set +n` never runs). Checked here at the top-level boundary
@@ -8967,6 +8974,7 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
 			entry = mark[1] or cx.DONE,
 			loopPc = cx.loopPc,
 			stmtPc = cx.stmtPc,
+			lgspan = cx.lgspan,
 			loopvars = cx.loopvars,
 			loopinit = cx.loopinit,
 			forlocals = cx.forlocals,
@@ -9708,7 +9716,14 @@ function M.emit(ast, opts)
 	for name in spairs(fncall) do
 		fc[#fc + 1] = ("[%q] = { src = %q, fn = %s }"):format(name, fnsrc[name], EF.upv_wrapped(fnlname(name)))
 	end
-	o[#o + 1] = ("return { run = run, loopPc = loopPc, stmtPc = stmtPc%s%s%s%s }"):format(
+	o[#o + 1] = ("return { run = run, loopPc = loopPc, stmtPc = stmtPc%s%s%s%s%s }"):format(
+		top.lgspan and (", lgspan = {" .. (function()
+			local o2 = {}
+			for ff, sp in spairs(top.lgspan) do
+				o2[#o2 + 1] = ("[%d]={%d,%d}"):format(ff, sp[1], sp[2])
+			end
+			return table.concat(o2, ", ")
+		end)() .. "}") or "",
 		EF.alias_static and ", alias_static = true" or "",
 		(EF.xtrace and ", xtrace = true" or "") -- (it traces: runnable under a starting set -x)
 			-- (its hooks: the tier may switch into it while such a trap is set)

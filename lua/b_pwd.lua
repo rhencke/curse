@@ -78,8 +78,9 @@ return function(sh, cmd, args, hook, tcb)
 			and ffi.cast("uint64_t *", statbuf + 8)[0] == ffi.cast("uint64_t *", statbuf2 + 8)[0])) then
 			sh.tcwd, out = nil, sh:phys_cwd() -- (resetpwd)
 			if out == "" then
-				io.stderr:write("pwd: error retrieving current directory: getcwd: "
-					.. "cannot access parent directories: " .. ffi.string(C.strerror(ffi.errno())) .. "\n")
+				local e = ffi.string(C.strerror(ffi.errno()))
+				io.stderr:write(rt.L("%s: error retrieving current directory: %s: %s\n", "pwd",
+					rt.L("getcwd: cannot access parent directories"), e))
 				sh.status = 1
 				return
 			end
