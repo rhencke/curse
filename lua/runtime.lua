@@ -5019,11 +5019,14 @@ function M.catch_return(f)
 end
 -- `return` where no function or sourced script is running: reported, status 2 (bash) —
 -- also in a trap handler that runs at the top level (return.def: no return_catch_flag)
-function M.return_outside(sh)
+-- (viacmd: run through `command`/`builtin` — not a special builtin then, so not fatal)
+function M.return_outside(sh, viacmd)
 	if (sh.calldepth or 0) == 0 and (sh.sourcedepth or 0) == 0 then
 		io.stderr:write("curse: return: can only `return' from a function or sourced script\n")
 		sh.status = 2
-		if sh.opt_posix and not sh.opt_i then -- a special builtin's error ends a posix shell
+		-- a special builtin's error ends a posix shell — unless its status is tested
+		-- (`return || …`: execute_cmd's ignore_return)
+		if sh.opt_posix and not sh.opt_i and not viacmd and not sh.via_command and (sh.noerr or 0) == 0 then
 			error({ __curse_exit = 2 })
 		end
 		return true

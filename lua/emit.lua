@@ -529,31 +529,26 @@ end
 -- as an external command (127). Delegating the def (interp registers it) and the calls
 -- (interp dispatches) makes them work while the enclosing body stays compiled.
 local function collect_nested_funcdefs(stmts, set, top)
+	-- (every node below the top-level list: a group/loop body, a pipeline stage, an &&/||
+	-- operand, a `$( … )` — any funcdef there is nested)
+	local function walk(node)
+		if type(node) ~= "table" then
+			return
+		end
+		if node.t == "funcdef" and node.name then
+			set[node.name] = true
+		end
+		for _, v in pairs(node) do
+			if type(v) == "table" then
+				walk(v)
+			end
+		end
+	end
 	for _, st in ipairs(stmts or {}) do
-		if st.t == "funcdef" then
-			if not top then
-				set[st.name] = true
-			end
-			if st.body then
-				collect_nested_funcdefs(st.body, set, false)
-			end
+		if st.t == "funcdef" and top then
+			walk(st.body)
 		else
-			if st.body then
-				collect_nested_funcdefs(st.body, set, false)
-			end
-			if st.cond then
-				collect_nested_funcdefs(st.cond, set, false)
-			end
-			if st.clauses then
-				for _, cl in ipairs(st.clauses) do
-					if cl.body then
-						collect_nested_funcdefs(cl.body, set, false)
-					end
-					if cl.cond then
-						collect_nested_funcdefs(cl.cond, set, false)
-					end
-				end
-			end
+			walk(st)
 		end
 	end
 end
@@ -959,6 +954,7 @@ EF.bash_command = false -- program reads $BASH_COMMAND → each command records 
 EF.extdebug = false -- program may `shopt -s extdebug` → a DEBUG trap can skip a command (dbg)
 EF.dbg_after_of = {} -- (extdebug) statement -> its continuation pc, for the skip
 EF.DBG_SKIP = { simple = true, arithcmd = true, dbracket = true, assign = true, assignlist = true, case = true }
+EF.DBG_FIRE = EF.DBG_SKIP -- (the nodes DEBUG fires before: interp's DEBUG_FIRE)
 EF.cur_cfg = "run" -- the CFG being built: `run`, or a function's (a skip resumes in its own)
 EF.keyword = false -- program may `set -k` → a command with a NAME=value word compiles both ways
 EF.enable = false -- program may run `enable -n` → a native builtin call checks it's still enabled
@@ -1004,7 +1000,7 @@ local function dbg(st, head)
 	-- under functrace); calldepth is tracked in fnwrap when a DEBUG trap is present.
 	-- (shopt -s extdebug: a non-zero DEBUG status SKIPS the command — rt.debug_x raises
 	-- the statement's continuation pc for this CFG's catcher: run_compiled, rt.catch_dbgskip)
-	local skip = EF.has_debug and EF.extdebug and EF.frag_depth == 0 and EF.dbg_after_of[st]
+	local skip = EF.has_debug and EF.extdebug and (EF.frag_depth == 0 or EF.cur_cfg ~= "run") and EF.dbg_after_of[st]
 	if skip then
 		return ("rt.debug_x(sh, %d, %d, %q) "):format(st.line or 0, skip, EF.cur_cfg)
 	end
@@ -1659,7 +1655,16 @@ local function emit_fragment(stmts, neg, liftset, cfraise)
 	-- their copy; a lifted local would neither see nor sync the caller's real sh var).
 	EF.frag_topcode = not EF.cur_infunc -- (read, and cleared, by this build_cfg)
 	EF.frag_depth = EF.frag_depth + 1 -- (a function's `return` in here isn't the call's: EF.retset)
+	-- (extdebug: a DEBUG-skipped command in here resumes in THIS fragment's CFG — its own
+	-- catcher, rt.catch_dbgskip, re-enters it at the pc after the command)
+	local saved_cfg, dskip = EF.cur_cfg, EF.extdebug and EF.has_debug
+	if dskip then
+		EF.dskip_n = (EF.dskip_n or 0) + 1
+		EF.cur_cfg = "cs" .. EF.dskip_n
+	end
+	local mycfg = EF.cur_cfg
 	local bok, cfg = pcall(build_cfg, stmts, liftset or {}, emit_frag_ctx.funcflags, inlfns, false)
+	EF.cur_cfg = saved_cfg
 	EF.frag_depth = EF.frag_depth - 1
 	EF.frag_topcode = nil
 	emit_toplevel, emit_neg_ctx, EF.cur_line = saved_tl, saved_neg, saved_line
@@ -1668,7 +1673,13 @@ local function emit_fragment(stmts, neg, liftset, cfraise)
 		return nil
 	end
 	emit_frag_n = emit_frag_n + 1
-	emit_frags[#emit_frags + 1] = assemble(cfg, ("__CS[%d] = function(sh)"):format(emit_frag_n), { runlocals = ownlocals })
+	if dskip then
+		emit_frags[#emit_frags + 1] = assemble(cfg, ("__CS[%d] = function(sh, pc)"):format(emit_frag_n),
+			{ runlocals = ownlocals, pcparam = true })
+			.. ("\n__CS[%d] = rt.catch_dbgskip(__CS[%d], %q)"):format(emit_frag_n, emit_frag_n, mycfg)
+	else
+		emit_frags[#emit_frags + 1] = assemble(cfg, ("__CS[%d] = function(sh)"):format(emit_frag_n), { runlocals = ownlocals })
+	end
 	return emit_frag_n
 end
 
@@ -7244,7 +7255,7 @@ H.subshell = function(cx, st, after)
 	-- escaping piece of shell state). The fragment RAISES exit/return (caught by
 	-- subshell_run), so subshell_exit_pc is cleared around its build. break/continue can't
 	-- cross into it — the fragment has its own loopstack.
-	if not EF.inproc_trap_block and #st.body > 0 then
+	if #st.body > 0 then
 		local saved_ssx = EF.subshell_exit_pc
 		EF.subshell_exit_pc = nil
 		-- Compile the body WITH the program lift set so it shares the module's lifted
@@ -7305,19 +7316,8 @@ H.pipeline = function(cx, st, after)
 	-- no trap/DEBUG/ERR (a forked stage otherwise resets signal traps / re-fires
 	-- per-stage traps — interp-side). Flush lifted before (stages read sh) and reload
 	-- after (a lastpipe last stage runs in-process and may write).
-	-- DEBUG fires per pipeline element in bash (interp models it); compiled stages don't hook it
-	if EF.inproc_trap_block or EF.has_debug then
-		return cx.delegate(st, after)
-	end
 	local n = #st.cmds
 	local frags = {}
-	for i = 1, n do
-		-- a `return` stage at the top level (no function can be running): the interpreter
-		-- reports it (bash: "can only `return' …", status 2) — a stage fragment can't tell
-		if cx.toplevel and (not EF.fragment or EF.lm) and resolve_cf({ t = "simple", words = st.cmds[i].words or {} }) == "return" then
-			return cx.delegate(st, after)
-		end
-	end
 	for i = 1, n do
 		-- nst==1 is `! cmd` (a single negated command run in the current shell): compile
 		-- it as a negated fragment so its OWN errexit is exempt; run_pipeline also raises
@@ -7382,7 +7382,28 @@ H.pipeline = function(cx, st, after)
 	-- (`! cmd` ignores its OWN special-builtin failure: rt.spb_run)
 	local negspb = n == 1 and st.negate and st.cmds[1].t == "simple" and st.cmds[1].words
 		and st.cmds[1].words[1] and require("runtime").SPECIAL_BUILTIN[full_lit(st.cmds[1].words[1]) or ""]
-	cx.blocks[p] = gpre .. dbg(st)
+	-- DEBUG (and $BASH_COMMAND) before each STAGE, in the parent, before any runs (bash's
+	-- execute_simple_command fires it before forking) — only for a stage that is a DEBUG-
+	-- firing node (a `{ }`/compound stage fires nothing); a stage itself never re-fires it
+	-- (in_pipestage). A `shopt -s lastpipe` last stage runs in this shell and fires its own.
+	-- (`! cmd`, one stage: that command's fragment fires it, in this shell)
+	local sdbg = {}
+	if n >= 2 and (EF.has_debug or EF.bash_command) then
+		for k = 1, n do
+			local c = st.cmds[k]
+			if EF.DBG_FIRE[c.t] then
+				local one = (EF.bash_command and ("if (sh.in_trap or 0) == 0 then sh.cur_cmd = %q end "):format(
+					require("deparse").command_text(c)) or "")
+					.. (EF.has_debug and (EF.trapline and not EF.cur_infunc and "I.run_debug(sh, sh.cur_line) "
+						or ("I.run_debug(sh, %d) "):format(c.line or st.line or 0)) or "")
+				if k == n then
+					one = ("if not (sh.shopt.lastpipe and not sh.opt_i) then %send "):format(one)
+				end
+				sdbg[#sdbg + 1] = one
+			end
+		end
+	end
+	cx.blocks[p] = gpre .. (n >= 2 and table.concat(sdbg) or "")
 		.. lifted_flush(cx.lifted)
 		.. (negspb and "sh.spb_neg = true; " or "")
 		.. ("sh:run_pipeline({%s}, %s, %s%s)"):format(
@@ -8169,12 +8190,6 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
 		if not conds then
 			return nil
 		end
-		-- hoisted function bodies must not inherit the raise scope; a top-level `return`
-		-- (error + continue in bash) or a return reached via builtin/command/eval keeps
-		-- interp's handling.
-		if cx.has_node(st, cx.is_funcdef) or (cx.toplevel and cx.has_node(st, cx.is_return)) then
-			return nil
-		end
 		local body = {}
 		for k, v in pairs(st) do
 			body[k] = v
@@ -8327,14 +8342,18 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
 				return p
 			end
 		elseif cf_op == "return" then
-			-- `return` at the top level is an error (status 2 + diagnostic, but execution
-			-- continues) — not a program exit. A compiled top level is always the main
-			-- script (source runs through interp), so delegate and let interp diagnose.
-			-- (`var=x return`: a posix-persistent prefix assignment — interp does that too)
-			if (cx.toplevel and (not EF.fragment or EF.lm)) or (st.assigns and #st.assigns > 0)
-				or (EF.cs_active and not EF.cs_in_func and #cx.subexit == 0) then -- ($(return) at top)
-				return cx.delegate(st, after)
+			-- (`var=x return`: a posix-persistent prefix assignment — the native simple-command
+			-- runner binds it and runs the builtin, whose raised return the wrapper catches)
+			if st.assigns and #st.assigns > 0 then
+				return EF.simple_native(cx, st, after, cmd) or cx.delegate(st, after)
 			end
+			-- `return` at the top level of the script (or a line of it, or a `$( … )` there) is
+			-- an error (status 2 + diagnostic, but execution continues) — not a program exit:
+			-- rt.return_outside reports it at run time. (Should a function or sourced file be
+			-- running after all, the return is raised for its catcher, or ends the `$( … )`.)
+			local viacmd = cf_arg > 2 and ", true" or "" -- (`command return`: not a special builtin)
+			local cs_top = EF.cs_active and not EF.cs_in_func and #cx.subexit == 0
+			local top_outside = not cs_top and cx.toplevel and (not EF.fragment or EF.lm)
 			-- return [N] (incl. \return / builtin return / command return): set $? and exit
 			-- the CFG. rt.return_status: N%256, or 2 + diagnostic on non-numeric; no arg → $?.
 			-- inside a subshell, `return` exits the subshell (subshell_exit) with the
@@ -8344,6 +8363,10 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
 			-- eval's cf-wrapper) as a raised signal, like interp; a return inside a compiled
 			-- subshell (subexit) still jumps locally.
 			local frag_return = ((EF.fragment and not EF.lm and cx.toplevel) or (EF.cf_raise and EF.cf_raise.func)) and #cx.subexit == 0
+			-- (top-level code run as a fragment — a subshell, a pipeline stage, a redirected
+			-- compound's body: no function is lexically around it, so maybe none is running)
+			local top_frag = not frag_return and not cs_top and not top_outside and cx.topcode and #cx.subexit == 0
+			frag_return = frag_return or top_outside or (top_frag and EF.cf_raise ~= nil)
 			-- (raised, `return N` leaves $? as it was — the RETURN trap of the `.` sees that —
 			-- and carries N: return.def sets only return_catch_value)
 			local retjmp = frag_return
@@ -8352,7 +8375,9 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
 			local ps = frag_return and "local __ps = sh.status; " or ""
 			if frag_return and not (EF.cf_raise and EF.cf_raise.func) then -- (a stage/eval fragment
 				-- at top level: maybe no function is running — then bash's diagnostic, status 2)
-				retjmp = ("if rt.return_outside(sh) then pc = %d else %s end"):format(after, retjmp)
+				retjmp = ("if rt.return_outside(sh%s) then pc = %d else %s end"):format(viacmd, after, retjmp)
+			elseif cs_top or top_frag then -- ($(return) at the top: reported; in a function it ends the $( … ))
+				retjmp = ("if rt.return_outside(sh%s) then pc = %d else %s end"):format(viacmd, after, retjmp)
 			end
 			local aw = st.words[cf_arg]
 			if aw and full_lit(aw) == "--" and not aw.parts[1].q then -- (`return -- N`: end of options)
@@ -8671,6 +8696,8 @@ assemble = function(cfg, sig, opts)
 	-- fn_x / cs_N body): rt's error prefix reads it off the stack to find the line
 	if opts.fnresume then -- fn_x(sh, pc): an interpreted call may continue here at a loop
 		o[#o + 1] = "  local __resume = pc ~= nil"
+	elseif opts.pcparam then -- (__CS[n](sh, pc): re-entered after a DEBUG-skipped command)
+		o[#o + 1] = ("  pc = pc or %d"):format(cfg.entry)
 	elseif not opts.toplevel then
 		o[#o + 1] = ("  local pc = %d"):format(cfg.entry)
 	end
@@ -8984,6 +9011,7 @@ end
 function M.emit(ast, opts)
 	EF.konsts = {}
 	EF.frag_depth = 0
+	EF.dskip_n = 0
 	emit_frags, emit_frag_n = {}, 0 -- compiled `$(…)` fragments (cs_N closures) collected during build
 	-- Fragment mode (eval/source, compiled at runtime): the code runs in the CALLER's
 	-- execution context, so a top-level return/break/continue must RAISE its signal for
