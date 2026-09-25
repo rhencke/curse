@@ -3010,7 +3010,9 @@ function Shell:subshell_run(runner, saves, paren)
 	local status = self.status
 	local rethrow
 	if not ok then
-		if type(err) == "table" and (err.__curse_exit or err.__curse_return) then
+		if type(err) == "table" and err.__curse_badusage and paren and not self.opt_e then
+			status = 2 -- (a failed ${x:=w} discards the `( )` child's line: EX_BADUSAGE; a $(…) says 1)
+		elseif type(err) == "table" and (err.__curse_exit or err.__curse_return) then
 			status = err.__curse_exit or err.__curse_return
 		elseif type(err) == "table" and err.__curse_lineabort then
 			status = 1
@@ -6971,11 +6973,17 @@ function Shell:array_get(name, key)
 	end
 	return ""
 end
--- Sorted variable names beginning with `pfx` (for ${!pfx@} / ${!pfx*}).
+-- Sorted variable names beginning with `pfx` (for ${!pfx@} / ${!pfx*}). Only VISIBLE
+-- ones (all_visible_variables): a declared-but-valueless var (`declare v`, `declare -a
+-- a`) is skipped; an assigned empty array (`a=()`) is not.
 function Shell:var_prefix_names(pfx)
 	local t = {}
-	for k in pairs(self.vars) do
-		if k:sub(1, #pfx) == pfx then
+	for k, b in pairs(self.vars) do
+		if
+			k:sub(1, #pfx) == pfx
+			and not (b.s == nil and b.n == nil and b.arr == nil)
+			and not (b.empty_decl and b.arr and next(b.arr) == nil)
+		then
 			t[#t + 1] = k
 		end
 	end
@@ -7505,9 +7513,9 @@ local function substr(val, off, len)
 		if o < 0 then
 			o = n + o
 		end
-		if o < 0 then
-			return "" -- (a negative offset past the start: bash yields nothing)
-		end
+		if o < 0 or o > n then
+			return "" -- (an offset before the start or past the end: bash yields nothing;
+		end -- an int64-sized one must not reach string.sub, which wraps it)
 		local last = n
 		if len and len ~= "" then
 			local l = tonumber(len) or 0
@@ -7524,7 +7532,7 @@ local function substr(val, off, len)
 	if o < 0 then
 		o = n + o
 	end
-	if o < 0 then
+	if o < 0 or o > n then
 		return ""
 	end
 	local last = n
@@ -8111,6 +8119,63 @@ end
 function M.repl_expands(rep)
 	return rep:find("&", 1, true) ~= nil or rep:find("\\\\") ~= nil
 end
+-- With extglob off an `X(` is plain text in a pattern (strmatch without FNM_EXTMATCH):
+-- escape the paren so the converters don't read an extglob group.
+function M.glob_noext(glob)
+	return (glob:gsub("([?*+@!])%(", "%1\\("))
+end
+-- ${v/pat/rep} with a `!(…)` pattern, which the ERE conversion can only approximate:
+-- bash's match_upattern by brute force over whole-substring matches (MATCH_ANY takes
+-- the leftmost start and the longest end there; MATCH_BEG the longest prefix; MATCH_END
+-- the leftmost suffix), looped as pat_subst does.
+function M.subst_ext(val, glob, repl, all, anchor, icase, rx)
+	local n = #val
+	local function find(from)
+		if anchor == "^" then
+			if from > 1 then
+				return nil
+			end
+			for e = n, 0, -1 do
+				if M.ext_match(val:sub(1, e), glob, icase) then
+					return 1, e
+				end
+			end
+		elseif anchor == "$" then
+			for b = from, n + 1 do
+				if M.ext_match(val:sub(b), glob, icase) then
+					return b, n
+				end
+			end
+		else
+			for b = from, n + 1 do
+				for e = n, b - 1, -1 do
+					if M.ext_match(val:sub(b, e), glob, icase) then
+						return b, e
+					end
+				end
+			end
+		end
+	end
+	local out, pos = {}, 1
+	repeat -- (pat_subst: `while (*str)`, but an empty string still gets one try)
+		local b, e = find(pos)
+		if not b then
+			break
+		end
+		out[#out + 1] = val:sub(pos, b - 1)
+		out[#out + 1] = rx and repl_amp(repl, val:sub(b, e)) or repl
+		pos = e + 1
+		if not all or anchor then
+			break
+		end
+		if e < b then -- empty match: copy one char
+			out[#out + 1] = val:sub(pos, pos)
+			pos = pos + 1
+		end
+	until pos > n
+	out[#out + 1] = val:sub(pos)
+	return table.concat(out)
+end
 function M.subst_glob(val, glob, repl, all, icase, rx)
 	local anchor -- (only `${x/#p/r}`/`${x/%p/r}` anchor: after `//` a `#`/`%` is literal)
 	local c1 = not all and glob:sub(1, 1)
@@ -8160,6 +8225,12 @@ function M.subst_glob(val, glob, repl, all, icase, rx)
 		out[#out + 1] = val:sub(i)
 		return table.concat(out)
 	end
+	if val == "" and anchor ~= "$" and glob:byte(1) ~= 42 then
+		return val -- (match_pattern_char: at the end of the string only a `*…` pattern
+	end -- may match, so an empty value takes ${y/?(a)/Z} as no match; `/%` skips that test)
+	if glob:find("!(", 1, true) then
+		return M.subst_ext(val, glob, repl, all, anchor, icase, rx)
+	end
 	local ere = glob_conv(glob, false, true) -- patsub=true: [^]/[!] empty-negated quirk
 	if anchor == "^" then
 		ere = "^(" .. ere .. ")"
@@ -8172,34 +8243,30 @@ function M.subst_glob(val, glob, repl, all, icase, rx)
 	if not rb then
 		return val
 	end
-	local out, pos, n, prev_end = {}, 0, #val, -1
-	while pos <= n do
+	-- pat_subst's loop runs `while (*str)`: matching stops at the END of the value (no
+	-- trailing empty match: `${x//*(z)/Y}` on abc is YaYbYc), yet right after a non-empty
+	-- match an empty one is still tried (`${x//?(b)/-}` is -a--c). An empty value gets
+	-- its one try (`${x//*/Y}` on "" is Y).
+	local out, pos, n = {}, 0, #val
+	repeat
 		local sub = val:sub(pos + 1)
 		if ffi.C.regexec(rb, sub, 1, pmatch, pos > 0 and REG_NOTBOL or 0) ~= 0 then
 			break
 		end
 		local so, eo = pmatch[0].rm_so, pmatch[0].rm_eo
-		if eo == so and pos + so == prev_end then
-			-- an EMPTY match right where the previous match ended (e.g. `.*` matched to
-			-- the end, then matches empty again): don't replace, just carry one char.
-			out[#out + 1] = sub:sub(1, so + 1)
-			pos = pos + so + 1
+		out[#out + 1] = sub:sub(1, so) -- text before the match
+		out[#out + 1] = rx and repl_amp(repl, sub:sub(so + 1, eo)) or repl
+		if eo > so then
+			pos = pos + eo
 		else
-			out[#out + 1] = sub:sub(1, so) -- text before the match
-			out[#out + 1] = rx and repl_amp(repl, sub:sub(so + 1, eo)) or repl
-			prev_end = pos + eo
-			if eo > so then
-				pos = pos + eo
-			else
-				out[#out + 1] = sub:sub(eo + 1, eo + 1)
-				pos = pos + eo + 1
-			end -- empty match: keep one char
-			if not all or anchor then
-				out[#out + 1] = val:sub(pos + 1)
-				return table.concat(out)
-			end
+			out[#out + 1] = sub:sub(eo + 1, eo + 1)
+			pos = pos + eo + 1
+		end -- empty match: keep one char
+		if not all or anchor then
+			out[#out + 1] = val:sub(pos + 1)
+			return table.concat(out)
 		end
-	end
+	until pos >= n
 	out[#out + 1] = val:sub(pos + 1)
 	return table.concat(out)
 end
@@ -9684,6 +9751,30 @@ function M.array_elem(sh, name, raw, expanded)
 	return sh:expand_param({ name = name, index = raw }, nil, nil, key)
 end
 
+-- An element's key for a compiled ${a[i]OP}: a negative subscript past the start says
+-- "bad array subscript" (the read then goes on), as interp's expand_pexp does.
+function M.array_key_rc(sh, name, raw, expanded)
+	local key = M.array_key(sh, name, raw, expanded)
+	if type(key) == "number" and key < 0 then
+		M.elem_read_check(sh, name, key)
+	end
+	return key
+end
+-- ${#a[i]} / ${#a[@]} in compiled code: under set -u only a variable that doesn't exist
+-- at all is unbound (named bare, as array_length_reference does); an unset element of an
+-- existing array is length 0 — expand_param's exact rule.
+function M.elem_len(sh, name, raw, expanded)
+	if sh.opt_u then
+		return sh:expand_param({ name = name, index = raw, op = "len" }, nil, nil, M.array_key(sh, name, raw, expanded))
+	end
+	return tostring(M.mb_strlen(M.array_elem(sh, name, raw, expanded)))
+end
+function M.array_count_u(sh, name)
+	if sh.opt_u then
+		return sh:expand_param({ name = name, index = "@", op = "len" })
+	end
+	return tostring(sh:array_count(name))
+end
 -- Read an array/assoc ELEMENT in ARITHMETIC context (`$(( a[i] ))`), exactly interp's arith
 -- var-with-idx path (interp.lua ~448): a set -u check on the BASE var (arith_nounset — FATAL
 -- for an unset base, but an unset ELEMENT of a set array reads as 0), then arith_resolve the
@@ -9769,9 +9860,13 @@ function Shell:expand_param(pe, arg, arg2, idxnum)
 	end
 	local val, isset
 	if index == "@" or index == "*" then
-		if op == "len" then
+		if op == "len" then -- ${#a[@]}: set -u trips only on a variable that doesn't exist
+			if self.opt_u and self.vars[self:deref(name)] == nil and not VIRT_ARR[name] then
+				io.stderr:write("curse: " .. name .. ": unbound variable\n")
+				error({ __curse_exit = self.opt_c and 127 or 1, __curse_lineabort = self.opt_i or nil })
+			end
 			return tostring(self:array_count(name))
-		end -- ${#a[@]}
+		end
 		val = table.concat(self:array_values(name), " ")
 		isset = self:array_count(name) > 0
 	elseif index then
@@ -9826,8 +9921,12 @@ function Shell:expand_param(pe, arg, arg2, idxnum)
 		and op ~= ":?"
 		and op ~= "?"
 		and self:special_get(name) == ""
+		-- ${#a[3]} of an unset element of an existing array is just 0; with no such
+		-- variable at all set -u names the bare array (array_length_reference)
+		and not (op == "len" and index and self.vars[self:deref(name)] ~= nil)
 	then
-		io.stderr:write("curse: " .. (pe.uname or name) .. ": unbound variable\n")
+		local lbl = pe.uname or (op == "len" and name) or M.pe_label(pe)
+		io.stderr:write("curse: " .. lbl .. ": unbound variable\n")
 		error({ __curse_exit = self.opt_c and 127 or 1, __curse_lineabort = self.opt_i or nil })
 	end
 	-- := / = write back to the SAME target that was read: an array element when
@@ -9838,6 +9937,10 @@ function Shell:expand_param(pe, arg, arg2, idxnum)
 			error({ __curse_exit = 1, __curse_lineabort = true })
 		end
 		if index and index ~= "@" and index ~= "*" then
+			local ab = self.vars[self:deref(name)]
+			if ab and ab.ro then
+				M.assign_default_fail(self, self:deref(name), "readonly variable")
+			end
 			self:array_set(name, idxnum or 0, v)
 			return self:array_get(name, idxnum or 0) or v -- (as stored: -i / -u / -l applied)
 		end
@@ -9874,14 +9977,14 @@ function Shell:expand_param(pe, arg, arg2, idxnum)
 	end
 	if op == ":?" then
 		if val == "" then -- (no word at all: bash's own words)
-			io.stderr:write("curse: " .. name .. ": " .. ((arg == nil or arg == "") and "parameter null or not set" or A()) .. "\n")
+			io.stderr:write("curse: " .. (pe.uname or M.pe_label(pe)) .. ": " .. ((arg == nil or arg == "") and "parameter null or not set" or A()) .. "\n")
 			error({ __curse_exit = self.opt_c and 127 or 1, __curse_lineabort = self.opt_i or nil })
 		end
 		return val
 	end
 	if op == "?" then
 		if not isset then
-			io.stderr:write("curse: " .. name .. ": " .. ((arg == nil or arg == "") and "parameter not set" or A()) .. "\n")
+			io.stderr:write("curse: " .. (pe.uname or M.pe_label(pe)) .. ": " .. ((arg == nil or arg == "") and "parameter not set" or A()) .. "\n")
 			error({ __curse_exit = self.opt_c and 127 or 1, __curse_lineabort = self.opt_i or nil })
 		end
 		return val
@@ -9891,9 +9994,9 @@ function Shell:expand_param(pe, arg, arg2, idxnum)
 		-- under set -u a variable with no value is unbound for every transform, @a included
 		-- (even a declared-but-valueless one: `declare -A m; ${m@a}` fails — bash); @a/@A
 		-- accept an array with any element, the others need its [0]
-		local b = self.opt_u and not isset and (arg == "a" or arg == "A") and self.vars[self:deref(name)]
+		local b = self.opt_u and not isset and (arg == "a" or arg == "A") and not index and self.vars[self:deref(name)]
 		if self.opt_u and not isset and not (b and b.arr and next(b.arr) ~= nil) then
-			io.stderr:write("curse: " .. (pe.uname or name) .. ": unbound variable\n")
+			io.stderr:write("curse: " .. (pe.uname or M.pe_label(pe)) .. ": unbound variable\n")
 			error({ __curse_exit = self.opt_c and 127 or 1, __curse_lineabort = self.opt_i or nil })
 		end
 		-- @a reports the VARIABLE's attributes (e.g. `A` for a declared assoc array),
@@ -9907,8 +10010,12 @@ function Shell:expand_param(pe, arg, arg2, idxnum)
 			return at ~= "" and ("declare -" .. at .. " " .. name) or ""
 		end
 		if arg == "A" then -- declare-able form (with the attributes, when it has any: bash)
-			local at = self:attr_string(name)
-			return (at ~= "" and ("declare -" .. at .. " ") or "") .. name .. "=" .. M.shell_quote(val)
+			if not name:match("^[%a_]") then
+				return "" -- (a positional/special parameter isn't a variable: nothing)
+			end
+			local dn = self:deref(name) -- (through a nameref: its target's assignment)
+			local at = self:attr_string(dn)
+			return (at ~= "" and ("declare -" .. at .. " ") or "") .. dn .. "=" .. M.shell_quote(val)
 		end
 	end
 	if op == "sub" and not isset then -- (an unset value has no substring to check)
@@ -10070,6 +10177,7 @@ end
 -- case, and the ${x@OP} transforms). Factored out so ${a[@]OP} can apply per element.
 -- Case-fold `val` per the ${x^PAT}/${x,,PAT} rules: `upper` picks the direction,
 -- `all` folds every matching char (else only the first). An empty PAT means "any".
+-- `upper` == "toggle" swaps each char's case (${x~}/${x~~}).
 local function fold_case(val, pat, upper, all)
 	if pat == nil or pat == "" then
 		pat = "?"
@@ -10082,7 +10190,7 @@ local function fold_case(val, pat, upper, all)
 	-- single-byte locale, folding is exactly string.upper/lower (Lua's toupper/tolower
 	-- is the same locale-aware per-byte fold) — no mb_chars char-table, no per-char
 	-- loop, no allocation. This is the common `${x^^}`/`${x,,}` case.
-	if lc_mb_cur_max <= 1 and any then
+	if lc_mb_cur_max <= 1 and any and upper ~= "toggle" then
 		local f = upper and string.upper or string.lower
 		if all then
 			return f(val)
@@ -10101,7 +10209,15 @@ local function fold_case(val, pat, upper, all)
 		local ch = chars[k]
 		local s = ch.s
 		if k <= limit and ch.wc and (any or M.glob_match(s, pat)) then
-			local w2 = upper and M.towupper(ch.wc) or M.towlower(ch.wc)
+			local w2
+			if upper == "toggle" then -- ${x~}/${x~~}: swap case (sh_modcase CASE_TOGGLE)
+				w2 = M.towupper(ch.wc)
+				if w2 == ch.wc then
+					w2 = M.towlower(ch.wc)
+				end
+			else
+				w2 = upper and M.towupper(ch.wc) or M.towlower(ch.wc)
+			end
 			if w2 ~= ch.wc then
 				s = M.wc_to_bytes(w2, ch.s)
 			end
@@ -10146,10 +10262,18 @@ function Shell:apply_str_op(op, val, arg, arg2, ltxt)
 		if arg == "L" then
 			return fold_case(val, "?", false, true)
 		end -- downcase all
-		if arg == "E" then
-			return M.ansi_unescape(val)
+		if arg == "E" then -- like $'…' (ansiexpand: ansicstr flags 2), cut at a NUL
+			if not val:find("\\", 1, true) then
+				return val
+			end
+			local r = M.ansi_unescape(val, true)
+			local z = r:find("\0", 1, true)
+			return z and r:sub(1, z - 1) or r
 		end
 		return val
+	end
+	if op ~= "sub" and arg:find("(", 1, true) and not self.shopt.extglob then
+		arg = M.glob_noext(arg) -- (extglob off: `+(b)` is literal text)
 	end
 	if op == "#" then
 		return strip_prefix(val, arg, false)
@@ -10179,6 +10303,9 @@ function Shell:apply_str_op(op, val, arg, arg2, ltxt)
 	end
 	if op == "^" or op == "," then
 		return fold_case(val, arg, op == "^", false)
+	end
+	if op == "~~" or op == "~" then
+		return fold_case(val, arg, "toggle", op == "~~")
 	end
 	return val
 end
@@ -10268,8 +10395,8 @@ function M.ansi_unescape(s, mode)
 			elseif ansi_c and d == "'" then -- (only $'…' knows \' and \"; echo -e / %b keep them)
 				out[#out + 1] = "'"
 				i = i + 2
-			elseif ansi_c and d == '"' then
-				out[#out + 1] = '"'
+			elseif ansi_c and (d == '"' or d == "?") then
+				out[#out + 1] = d
 				i = i + 2
 			elseif d == "a" then
 				out[#out + 1] = "\7"
@@ -11304,7 +11431,23 @@ end
 -- ${x:=word}/${x=word}: assign the default to the variable (bash's assign_default for a
 -- scalar/bare-array name — pexp_compilable never compiles a subscripted target), returning
 -- the value. A bare name that IS an array writes element 0.
+-- A ${x:=w} / ${a[i]=w} whose assignment fails (a readonly target, or a bad array
+-- subscript): parameter_brace_expand_rhs's expansion error — the line is discarded with
+-- $? = 2 (EX_BADUSAGE; parse_and_execute callers — eval, source, -c, $(…) — report 1),
+-- or under posix the shell exits.
+function M.assign_default_fail(sh, what, msg)
+	io.stderr:write("curse: " .. what .. ": " .. msg .. "\n")
+	if sh.opt_posix then
+		error({ __curse_exit = 1 })
+	end
+	error({ __curse_exit = 1, __curse_lineabort = true, __curse_badusage = true })
+end
 function M.assign_default(sh, name, v)
+	local dn = sh:deref(name)
+	local b = sh.vars[dn]
+	if b and b.ro and not (sh.vars[name] or b).ref then
+		M.assign_default_fail(sh, dn, "readonly variable")
+	end
 	-- through the var's attributes (declare -i / -u / -l): the expansion is the STORED value
 	M.assign_scalar(sh, name, v)
 	return sh:get(name)
@@ -11411,6 +11554,9 @@ function M.array_slice_values(sh, name, els, off, len, ltxt)
 	end
 	if name ~= "@" and name ~= "*" and not sh:is_assoc(name) then
 		local idx = sh:array_indices(name)
+		if off >= 9.2233720368547758e18 then
+			off = 0x7fffffffffffffffLL -- (a double at 2^63 would wrap converting to int64)
+		end
 		if off < 0 then -- (int64: an index can be up to 2^63-1, beyond a double's exactness)
 			off = (idx[#idx] ~= nil and key_i64(idx[#idx]) or i64(-1)) + 1 + off
 		end
@@ -11445,6 +11591,9 @@ function M.array_slice_values(sh, name, els, off, len, ltxt)
 	local last = n
 	if len ~= nil then
 		last = (len < 0) and (n + len) or (off + len)
+	end
+	if last > n then
+		last = n -- (a huge length must not drive the loop past the elements)
 	end
 	local out = {}
 	for i = off, last - 1 do

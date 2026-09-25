@@ -1998,6 +1998,8 @@ local PEXP_STROP = {
 	["^^"] = 1,
 	[","] = 1,
 	[",,"] = 1,
+	["~"] = 1,
+	["~~"] = 1,
 }
 -- ${x@OP} transforms compiled natively (bash 5.x): Q/K/k shell-quote, U/u/L case-fold,
 -- E ANSI-unescape (via apply_str_op on the scalar value), and `a` the attribute letters
@@ -2136,6 +2138,10 @@ function pexp_compilable(pe, quoted)
 		if not quoted and pe.arg and (pe.arg:find("%$[@*]") or pe.arg:find("%${[@*]") or pe.arg:find("%[[@*]%]")) then
 			return false
 		end
+		-- …and so does a quoted one's $@/${a[@]} ("${x:-$@}" is one field per element)
+		if quoted and pe.arg and (pe.arg:find("%$@") or pe.arg:find("%${[#!]?@") or pe.arg:find("%[@%]")) then
+			return false
+		end
 		local ok, w = pcall(quoted and P.parse_default_quoted or P.parse_word, pe.arg or "", pe.hd)
 		return ok and emitable_word(w) or false
 	end
@@ -2259,24 +2265,31 @@ local function substr_native(txt, lifted)
 	if not ok or type(ast) ~= "table" or not_compilable(ast) or arith_side_effect(ast) or not substr_safe(ast) then
 		return nil
 	end
-	return ("tonumber(%s)"):format(emit_value(ast, lifted))
+	local saved = arith_varread
+	arith_varread = "rt.arith_read(sh, %q)" -- (set -u: an unset name in ${s:u} is unbound)
+	local code = emit_value(ast, lifted)
+	arith_varread = saved
+	return ("tonumber(%s)"):format(code)
 end
 function pexp_scalar(pe, lifted)
 	-- ${x@a} / ${x[i]@a}: the variable's attribute letters, read straight from its binding
 	-- (attr_string). Independent of value set-ness — a declared valueless assoc still reports
 	-- `A` — and never get_u, which would trip set -u on an unset element. The element and
 	-- scalar forms alike report the whole variable's attributes (bash).
-	if pe.op == "@" and pe.arg == "a" then
+	if pe.op == "@" and pe.arg == "a" and not (pe.index and pe.index ~= "@" and pe.index ~= "*") then
 		return ("sh:attr_string_u(%q)"):format(pe.name)
 	end
 	local val
 	local ename = EF.has_nameref and ("sh:deref(%q)"):format(pe.name) or ("%q"):format(pe.name) -- a nameref array read resolves to its target
 	if pe.index == "@" or pe.index == "*" then -- ${#a[@]}: array element COUNT (op is len, gated)
-		return ("tostring(sh:array_count(%s))"):format(ename)
+		return ("rt.array_count_u(sh, %s)"):format(ename)
 	elseif pe.index then -- ${name[sub]…}: read the element; a read-only op (below) then applies to it.
 		-- Pass BOTH the raw subscript (arith-evaluated for an indexed array) and its word-expanded
 		-- form (the assoc key); rt.array_elem picks per the array's type, matching interp's array_key.
 		local expanded = subscript_word(pe.index, lifted)
+		if pe.op == "len" then
+			return ("rt.elem_len(sh, %s, %q, %s)"):format(ename, pe.index, expanded)
+		end
 		val = ("rt.array_elem(sh, %s, %q, %s)"):format(ename, pe.index, expanded)
 		if pe.op == nil then
 			return val
@@ -2288,7 +2301,7 @@ function pexp_scalar(pe, lifted)
 			local defthunk = ("function() return %s end"):format(
 				emit_word(require("parser").parse_word(pe.arg or ""), lifted)
 			)
-			return ('sh:expand_param({["name"]=%q,["index"]=%q,["op"]=%q}, %s, nil, rt.array_key(sh, %q, %q, %s))'):format(
+			return ('sh:expand_param({["name"]=%q,["index"]=%q,["op"]=%q}, %s, nil, rt.array_key_rc(sh, %q, %q, %s))'):format(
 				pe.name,
 				pe.index,
 				pe.op,
@@ -2302,7 +2315,7 @@ function pexp_scalar(pe, lifted)
 			-- ${a[i]@Q}/@U/@L/…: route via expand_param so ELEMENT set-ness (is_elem_set) decides —
 			-- an unset element yields "" (rt.at_transform would test the BASE var's set-ness instead).
 			-- The transform letter is the 3rd (arg) PARAMETER, exactly as interp calls expand_param.
-			return ('sh:expand_param({["name"]=%q,["index"]=%q,["op"]="@"}, %q, nil, rt.array_key(sh, %q, %q, %s))'):format(
+			return ('sh:expand_param({["name"]=%q,["index"]=%q,["op"]="@"}, %q, nil, rt.array_key_rc(sh, %q, %q, %s))'):format(
 				pe.name,
 				pe.index,
 				pe.arg,
@@ -6055,7 +6068,8 @@ end
 -- ${…} operators with no side effect and no error output (safe to expand in the PARENT
 -- for a spawned `ext args &`): plain, defaults/alternates, trims, replacements, case ops
 local BG_PURE_PEXP = { [""] = 1, ["-"] = 1, [":-"] = 1, ["+"] = 1, [":+"] = 1, ["#"] = 1, ["##"] = 1,
-	["%"] = 1, ["%%"] = 1, ["/"] = 1, ["//"] = 1, ["^"] = 1, ["^^"] = 1, [","] = 1, [",,"] = 1 }
+	["%"] = 1, ["%%"] = 1, ["/"] = 1, ["//"] = 1, ["^"] = 1, ["^^"] = 1, [","] = 1, [",,"] = 1,
+	["~"] = 1, ["~~"] = 1 }
 -- statement handler: background (split out of flatten_stmt; see H)
 H.background = function(cx, st, after)
 	local t = st.t
