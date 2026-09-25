@@ -10209,7 +10209,7 @@ function Shell:apply_str_op(op, val, arg, arg2, ltxt)
 		end
 		return val
 	end
-	if not self.shopt.extglob and arg:find("(", 1, true) then
+	if op ~= "sub" and not self.shopt.extglob and arg:find("(", 1, true) then
 		arg = M.glob_noext(arg) -- (extglob off: `+(b)` is literal text)
 	end
 	if op == "#" then
