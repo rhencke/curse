@@ -1500,6 +1500,7 @@ return {
 		"\t\tthird is the `history comment' character, usually `#'.",
 		"HISTIGNORE\tA colon-separated list of patterns used to decide which",
 		"\t\tcommands should be saved on the history list.",
+		true, -- (bash's text ends with a bare empty line: `true` prints "", not "    ")
 	} },
 	{ "wait", "wait [-fn] [-p var] [id ...]", {
 		"Wait for job completion and return exit status.",

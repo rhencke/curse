@@ -6049,7 +6049,7 @@ function M.builtin_help(sh, cmd)
 		if t[1] == cmd then
 			sh.out(cmd .. ": " .. t[2] .. "\n")
 			for _, l in ipairs(t[3]) do
-				sh.out("    " .. l .. "\n")
+				sh.out(l == true and "\n" or "    " .. l .. "\n")
 			end
 		end
 	end

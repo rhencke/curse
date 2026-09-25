@@ -131,7 +131,7 @@ return function(sh, cmd, args)
 						sh:echo("")
 						sh:echo("DESCRIPTION")
 						for _, l in ipairs(t[3]) do
-							sh:echo("    " .. l)
+							sh:echo(l == true and "" or "    " .. l)
 						end
 						sh:echo("")
 						sh:echo("SEE ALSO")
@@ -146,7 +146,7 @@ return function(sh, cmd, args)
 						sh:echo(name .. ": " .. t[2])
 						if not sflag then
 							for _, l in ipairs(t[3]) do
-								sh:echo("    " .. l)
+								sh:echo(l == true and "" or "    " .. l)
 							end
 						end
 					end
