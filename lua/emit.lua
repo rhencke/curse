@@ -2276,7 +2276,7 @@ function pexp_scalar(pe, lifted)
 	local val
 	local ename = EF.has_nameref and ("sh:deref(%q)"):format(pe.name) or ("%q"):format(pe.name) -- a nameref array read resolves to its target
 	if pe.index == "@" or pe.index == "*" then -- ${#a[@]}: array element COUNT (op is len, gated)
-		return ("tostring(sh:array_count(%s))"):format(ename)
+		return ("tostring(rt.array_count_u(sh, %s, %q))"):format(ename, pe.name)
 	elseif pe.index then -- ${name[sub]…}: read the element; a read-only op (below) then applies to it.
 		-- Pass BOTH the raw subscript (arith-evaluated for an indexed array) and its word-expanded
 		-- form (the assoc key); rt.array_elem picks per the array's type, matching interp's array_key.
@@ -2388,14 +2388,21 @@ function pexp_scalar(pe, lifted)
 	if pe.op == "sub" then -- ${v:off:len}: arith-eval off/len (nil-coerced to 0 for a present
 		-- operand, like interp), then substr by codepoint via apply_str_op("sub").
 		local P = require("parser")
-		local off = substr_native(pe.arg, lifted)
+		local noff, nlen = substr_native(pe.arg, lifted), pe.arg2 and substr_native(pe.arg2, lifted)
+		local off = noff
 			or ("(rt.substr_arith(sh, %q, %s) or 0)"):format(require("runtime").pe_label(pe), emit_word(P.parse_word(pe.arg or ""), lifted))
+		local r
 		if pe.arg2 == nil then
-			return ('sh:apply_str_op("sub", %s, %s)'):format(val, off)
+			r = ('sh:apply_str_op("sub", %s, %s)'):format(val, off)
+		else
+			local len = nlen
+				or ("(rt.substr_arith(sh, %q, %s) or 0)"):format(require("runtime").pe_label(pe), emit_word(P.parse_word(pe.arg2), lifted))
+			r = ('sh:apply_str_op("sub", %s, %s, %s, %q)'):format(val, off, len, pe.arg2)
 		end
-		local len = substr_native(pe.arg2, lifted)
-			or ("(rt.substr_arith(sh, %q, %s) or 0)"):format(require("runtime").pe_label(pe), emit_word(P.parse_word(pe.arg2), lifted))
-		return ('sh:apply_str_op("sub", %s, %s, %s, %q)'):format(val, off, len, pe.arg2)
+		if pe.index or (noff and (pe.arg2 == nil or nlen)) then
+			return r
+		end -- (an unset variable evaluates neither: rt.sub_unset)
+		return ('(rt.sub_unset(sh, %q) and "" or %s)'):format(pe.name, r)
 	end
 	-- strip/subst/case (PEXP_STROP): a plain literal pattern is passed verbatim (apply_str_op
 	-- globs it); a dynamic/quoted pattern is rendered mask-aware via emit_pattern_glob to the
@@ -5648,15 +5655,24 @@ H.whilec = function(cx, st, after)
 	end
 	if arith and not st.negate and not not_compilable(arith) and not arith_side_effect(arith) then
 		-- fast path: a native arith condition `while (( expr ))` — no command run.
-		local condp = cx.newpc()
+		-- The condition sets $? for the body; the loop's own status is its last body
+		-- command's (lv), 0 when none ran — exactly like the command-condition path.
+		-- (the re-test after the body saves it — a second copy of the test, so a hot loop
+		-- takes no extra dispatch hop; the first test, on entry, starts from 0)
+		local lv = cx.newloopvar()
+		local condp, firstp = cx.newpc(), cx.newpc()
 		cx.loopPc[st.id] = condp
+		local exitp = cx.newpc()
+		cx.blocks[exitp] = ("sh.status = %s; pc = %d"):format(lv, after)
 		cx.loopstack[#cx.loopstack + 1] = { brk = after, cont = condp }
 		local bodyentry = cx.flatten_list(st.body, condp)
 		cx.loopstack[#cx.loopstack] = nil
 		-- DEBUG fires before each evaluation of the condition command (bash)
 		local cst = type(st.cond) == "table" and st.cond[1] or nil
-		cx.blocks[condp] = (cst and dbg(cst) or "") .. EF.arith_branch(arith, cx.lifted, bodyentry, after)
-		return condp
+		local test = (cst and dbg(cst) or "") .. EF.arith_branch(arith, cx.lifted, bodyentry, exitp)
+		cx.blocks[condp] = ("%s = sh.status; "):format(lv) .. test
+		cx.blocks[firstp] = ("%s = 0; "):format(lv) .. test
+		return firstp
 	end
 	-- fast path: `while/until [ A -op B ]` with integer operands — a native int64
 	-- compare instead of building an argv table and running do_test each iteration.

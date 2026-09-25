@@ -7182,6 +7182,20 @@ end
 function Shell:array_count(name)
 	return #self:array_indices(name)
 end
+-- ${#a[@]} / ${#a[*]}: the count; under set -u a variable that is unset, never assigned
+-- (`declare -a b`) or not an array (`s=x`) is unbound (array_length_reference), `a=()` is 0
+function M.array_count_u(sh, name, shown)
+	local c = sh:array_count(name)
+	if sh.opt_u and name ~= "BASH_ARGV" and name ~= "BASH_ARGC" then -- (always arrays in bash)
+		local b = sh.vars[sh:deref(name)]
+		if (b == nil and c == 0 and sh:special_get(name) == "") -- (nil but counted: a virtual array)
+			or (b and (not b.arr or (b.empty_decl and next(b.arr) == nil))) then
+			io.stderr:write("curse: " .. (shown or name) .. ": unbound variable\n")
+			error({ __curse_exit = sh.opt_c and 127 or 1, __curse_lineabort = sh.opt_i or nil })
+		end
+	end
+	return c
+end
 
 -- ---- parameter expansion ${var OP arg} ----
 -- Whole-string glob match via the POSIX regex engine (real char classes/extglob).
@@ -9797,7 +9811,7 @@ function Shell:expand_param(pe, arg, arg2, idxnum)
 	local val, isset
 	if index == "@" or index == "*" then
 		if op == "len" then
-			return tostring(self:array_count(name))
+			return tostring(M.array_count_u(self, name, pe.uname))
 		end -- ${#a[@]}
 		val = table.concat(self:array_values(name), " ")
 		isset = self:array_count(name) > 0
@@ -11207,6 +11221,16 @@ end
 -- the parameter as bash names it in such errors: `a[@]`, `a[0]`, `HOME`
 function M.pe_label(pe)
 	return pe.index and (pe.name .. "[" .. pe.index .. "]") or pe.name
+end
+-- ${name:off:len} of an UNSET plain variable expands to nothing without evaluating off/len
+-- (parameter_brace_substring returns before verify_substring_values): `${x:1/0}` is silent.
+-- (set -u keeps its unbound error: not skipped then)
+function M.sub_unset(sh, name)
+	if sh.opt_u or not name:match("^[%a_][%w_]*$") then
+		return false
+	end
+	local b = sh.vars[sh:deref(name)]
+	return (b == nil or (b.arr == nil and b.s == nil and b.n == nil)) and sh:special_get(name) == ""
 end
 function M.substr_arith(sh, name, s)
 	if s == nil or s == "" then

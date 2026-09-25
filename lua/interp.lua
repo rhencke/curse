@@ -1449,6 +1449,30 @@ array_key = function(sh, name, index_raw)
 	return v
 end
 
+-- Does `$(( TEXT ))` hold a shell comment — an unquoted `#` after a blank,
+-- running to the end (extract_command_subst's SX_COMMAND comment rule)?
+local function arith_comment(t)
+	local k, n, q = 1, #t, nil
+	while k <= n do
+		local c = t:sub(k, k)
+		if q then
+			if c == q then
+				q = nil
+			elseif c == "\\" and q == '"' then
+				k = k + 1
+			end
+		elseif c == "'" or c == '"' then
+			q = c
+		elseif c == "\\" then
+			k = k + 1
+		elseif c == "#" and t:sub(k - 1, k - 1):match("^[ \t\n]$") then
+			return not t:find("\n", k, true)
+		end
+		k = k + 1
+	end
+	return false
+end
+
 -- Expand ONE part to its string value (a multi-element @/* part is joined here;
 -- expand_to_fields treats those specially for word-splitting).
 -- (the branches that make closures live in their own functions: a closure capturing
@@ -1594,7 +1618,9 @@ local function expand_pexp(sh, p, assign)
 		arg = pe.arg and (patmode and expand_pattern or expand_word)(sh, P.parse_word(pe.arg), true) or nil
 	end
 	local arg2 = pe.arg2 and pe.op ~= "sub" and expand_repl(sh, P.parse_word(pe.arg2)) or nil
-	if pe.op == "sub" then -- ${v:off:len}: offset/length are arithmetic expressions,
+	if pe.op == "sub" and not pe.index and rt.sub_unset(sh, pe.name) then
+		return ""
+	elseif pe.op == "sub" then -- ${v:off:len}: offset/length are arithmetic expressions,
 		-- expanded the arithmetic way (bash: `${s:A[$k]}` quotes $k inside the subscript)
 		arg = pe.arg and tostring(rt.substr_arith(sh, rt.pe_label(pe), arith_expand_text(sh, pe.arg)) or 0) or nil
 		arg2 = pe.arg2 and tostring(rt.substr_arith(sh, rt.pe_label(pe), arith_expand_text(sh, pe.arg2)) or 0) or nil
@@ -1673,6 +1699,12 @@ expand_part_str = function(sh, p, assign)
 		if not p.arith_ast then -- same $((…)) shouldn't re-parse it)
 			local ok, ast = pcall(P.arith, p.arith)
 			if not ok then -- a syntax error in $(( )) fails the command, non-fatally (bash)
+				if not p.bracket and arith_comment(p.arith) then
+					-- (bash extracts `$((…))` as a command substitution at expansion time, where
+					-- a blank-preceded `#` starts a comment that hides the closing parens)
+					io.stderr:write("curse: bad substitution: no closing `)' in $((" .. p.arith .. "))\n")
+					error({ __curse_exit = 1, __curse_experr = true, __curse_lineabort = true })
+				end
 				arith_pre(sh, ast) -- (after what was evaluated before it)
 				io.stderr:write("curse: " .. P.arith_errmsg(p.arith, ast) .. "\n")
 				-- (an expansion error: bash discards the rest of the line)
@@ -6246,6 +6278,7 @@ exec_stmt = function(sh, st, hook)
 		end
 		-- A slot whose arith failed to parse (`i='3'`) was deferred: bash reports the
 		-- error at RUNTIME and runs the loop zero (or partial) iterations, non-fatally.
+		local inslot, svcmd = false, nil
 		local function ev(node, slot)
 			sh.cur_line = st.line -- $LINENO inside the for(( init/cond/step is the `for` line (bash),
 			-- not whatever line the body last ran (the cond re-evals per iteration)
@@ -6261,17 +6294,12 @@ exec_stmt = function(sh, st, hook)
 				P.arith_cmd = sv
 				error({ __curse_exit = 1, __curse_experr = true })
 			end
-			-- (an arithmetic error names `((` and ends the loop with status 1; the shell goes on)
-			local sv = P.arith_cmd
+			-- (an arithmetic error names `((` and ends the loop with status 1, the shell goes on:
+			-- the loop's handler below sees `inslot` still set)
+			svcmd, inslot = P.arith_cmd, true
 			P.arith_cmd = "(("
-			local ok, v = pcall(eval, sh, node)
-			P.arith_cmd = sv
-			if not ok then
-				if type(v) == "table" and v.__curse_matherr and not v.__curse_subscript then
-					error({ __curse_exit = 1, __curse_experr = true })
-				end
-				error(v, 0)
-			end
+			local v = eval(sh, node)
+			P.arith_cmd, inslot = svcmd, false
 			return v
 		end
 		local bodystatus = 0 -- a loop's status is its last body command's (0 if none)
@@ -6311,6 +6339,12 @@ exec_stmt = function(sh, st, hook)
 			end
 		end)
 		sh.loopdepth = sh.loopdepth - 1
+		if not cok and inslot then -- (an init/cond/step failed)
+			P.arith_cmd = svcmd
+			if type(cerr) == "table" and cerr.__curse_matherr and not cerr.__curse_subscript then
+				cerr = { __curse_exit = 1, __curse_experr = true }
+			end
+		end
 		if not cok then
 			if type(cerr) == "table" and cerr.__curse_experr then
 				sh.status = 1
