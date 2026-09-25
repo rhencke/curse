@@ -19,12 +19,9 @@ local function read_file(file)
 	if not f then
 		return nil
 	end
-	local lines = {}
-	for l in f:lines() do
-		lines[#lines + 1] = l
-	end
+	local text = f:read("*a")
 	f:close()
-	return lines
+	return text
 end
 
 return function(sh, cmd, args)
@@ -83,25 +80,29 @@ return function(sh, cmd, args)
 		for k = #h, 1, -1 do
 			h[k] = nil
 		end
-		sh.hist_base = 1
+		sh.hist_ts = {}
+		sh.hist_base, sh.hist_session = 1, 0
 		if #rest == 0 then
 			return
 		end
 	end
 	if flags.s then
 		if #rest > 0 then
-			-- the `history -s` line itself goes (bash's push_history), then the args as one
-			if H.enabled(sh) and sh.hist_last_added then
+			-- the `history -s` line itself goes (bash's push_history: the line just added,
+			-- or the compound command it's part of, once per line), then the args as one
+			if H.enabled(sh) and not sh.hist_pushed and (sh.hist_last_added
+				or (sh.hist_first_saved and sh.shopt.cmdhist ~= false)) then
 				H.delete_last(sh)
 			end
 			H.check_add(sh, table.concat(rest, " "))
-			sh.hist_last_added = false
+			sh.hist_pushed = true
 		end
 		return
 	elseif flags.p then
-		if H.enabled(sh) and sh.hist_last_added then
+		-- (expand_and_print_history drops the line too, and -p doesn't mark it pushed:
+		-- each `history -p` on the line takes one more entry)
+		if not sh.hist_pushed and sh.hist_last_added then
 			H.delete_last(sh)
-			sh.hist_last_added = false
 		end
 		for _, a in ipairs(rest) do
 			local code, out = H.expand(sh, a)
@@ -140,7 +141,7 @@ return function(sh, cmd, args)
 				return erange(sh, ea)
 			end
 			for k = e + 1, s + 1, -1 do
-				table.remove(h, k)
+				H.delete_histent(sh, k)
 			end
 			return
 		end
@@ -159,7 +160,7 @@ return function(sh, cmd, args)
 		else
 			idx = off - base
 		end
-		table.remove(h, idx + 1)
+		H.delete_histent(sh, idx + 1)
 		return
 	elseif nfile == 0 then -- list (all, or the last N)
 		local limit
@@ -179,27 +180,39 @@ return function(sh, cmd, args)
 		if limit and limit < #h then
 			from = #h - limit + 1
 		end
+		local tf = sh.vars.HISTTIMEFORMAT and sh:get("HISTTIMEFORMAT") or ""
 		for k = from, #h do
-			sh:echo(("%5d  %s"):format(k + sh.hist_base - 1, h[k]))
+			local ts = ""
+			if tf ~= "" then -- (bash's histtime)
+				local t = H.get_time(sh, k)
+				local raw = H.tslist(sh)[k]
+				if t then
+					ts = os.date(tf, t) or ""
+				elseif raw and raw ~= "" and raw:sub(1, 1) ~= "\0" then
+					ts = (raw:sub(1, 1) == "#" and raw:sub(2) or raw) .. ": invalid timestamp"
+				else
+					ts = "??"
+				end
+			end
+			sh:echo(("%5d  %s%s"):format(k + sh.hist_base - 1, ts, h[k]))
 		end
 		return
 	end
-	local file = rest[1] or (sh.vars.HISTFILE and sh:get("HISTFILE")) or ""
-	if flags.a then -- append this session's new lines
+	local file = rest[1] or H.filename(sh)
+	if flags.a then -- append this session's new lines (bash's maybe_append_history)
 		local n = sh.hist_session or 0
 		if n > 0 then
-			local f = io.open(file, "a")
+			n = math.min(n, #h)
+			local f, err = io.open(file, "a")
 			if not f then
-				local _, err = io.open(file, "a")
 				io.stderr:write("curse: history: " .. file .. ": cannot create: "
 					.. ((err or ""):match(": ([^:]+)$") or "Permission denied") .. "\n")
 				sh.status = 1
 				return
 			end
-			for k = math.max(1, #h - n + 1), #h do
-				f:write(h[k], "\n")
-			end
+			f:write(H.file_text(sh, #h - n + 1))
 			f:close()
+			sh.hist_file_lines = (sh.hist_file_lines or 0) + n -- (as if read from it)
 		end
 		sh.hist_session = 0
 	elseif flags.w then
@@ -208,21 +221,14 @@ return function(sh, cmd, args)
 			sh.status = 1
 			return
 		end
-		for _, l in ipairs(h) do
-			f:write(l, "\n")
-		end
+		f:write(H.file_text(sh, 1))
 		f:close()
 	elseif flags.r or flags.n then
-		local lines = read_file(file)
-		if not lines then
+		local text = read_file(file)
+		if not text then
 			sh.status = 1
 			return
 		end
-		local from = flags.n and ((sh.hist_file_lines or 0) + 1) or 1
-		for k = from, #lines do
-			h[#h + 1] = lines[k]
-		end
-		sh.hist_file_lines = #lines
-		H.stifle(sh)
+		sh.hist_file_lines = H.read_text(sh, text, flags.n and (sh.hist_file_lines or 0) or 0)
 	end
 end

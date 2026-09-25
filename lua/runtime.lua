@@ -2219,6 +2219,8 @@ local CAPTURE_IMPURE = {
 	disown = 1,
 	["return"] = 1,
 	["set-o"] = 1,
+	history = 1, -- (`set -o history`: the list is subshell state)
+	fc = 1,
 }
 local function capture_pure(sh, st)
 	local t = st.t
@@ -2247,6 +2249,16 @@ local function capture_pure(sh, st)
 		end -- dynamic/compound command name: be safe, fork
 		if CAPTURE_IMPURE[lit] or sh.functions[lit] then
 			return false
+		end
+		-- (`2>&1` dups fd 1 at the fd level: only the fd-level capture of the isolated
+		-- path sees a builtin's diagnostics there)
+		local rs = st.redirs
+		if rs then
+			for k = 1, #rs do
+				if rs[k].op == "dup" and rs[k].fd == 2 then
+					return false
+				end
+			end
 		end
 		return true
 	end
@@ -2633,6 +2645,11 @@ local function sub_checkpoint(self)
 	self.getopts_state = M.getopts_remap(self.getopts_state, orig_vars, copy)
 	self.dirstack = shallowcopy(self.dirstack)
 	self.hashcache = shallowcopy(self.hashcache)
+	if self.history then -- (`set -o history`: a subshell edits its own copy of the list)
+		cp.hist = { self.history, self.hist_ts, self.hist_base, self.hist_session,
+			self.hist_last_added, self.hist_pushed, self.hist_file_lines, self.hist_first_saved }
+		self.history, self.hist_ts = shallowcopy(self.history), shallowcopy(self.hist_ts)
+	end
 	return cp
 end
 local function sub_restore(self, cp)
@@ -2644,6 +2661,11 @@ local function sub_restore(self, cp)
 	self.shopt, self.functions = cp.shopt, cp.functions
 	M.glob_asciirange = self.shopt.globasciiranges ~= false
 	self.dirstack, self.hashcache, self.getopts_state = cp.dirstack, cp.hashcache, cp.getopts
+	local hc = cp.hist
+	if hc then
+		self.history, self.hist_ts, self.hist_base, self.hist_session = hc[1], hc[2], hc[3], hc[4]
+		self.hist_last_added, self.hist_pushed, self.hist_file_lines, self.hist_first_saved = hc[5], hc[6], hc[7], hc[8]
+	end
 	local of, ov = opt_fields(), cp.opts
 	for i = 1, #of do self[of[i]] = ov[i] end
 	self.savedstack, self.tenv, self.bav = cp.savedstack, cp.tenv, cp.bav

@@ -7644,12 +7644,14 @@ local function run_history_lines(sh, text, line1, hook, k)
 				if code < 0 then
 					io.stderr:write("curse: " .. out .. "\n")
 					keep = false
+					lnum = lnum - 1 -- (a discarded line isn't counted: bash's line numbers lag)
 				elseif code == 2 then -- `:p`: print it and add it to the history, don't run it
 					io.stderr:write(out .. "\n")
 					if H.enabled(sh) and out ~= "" then
 						H.read_line(sh, st, out, false)
 					end
 					keep = false
+					lnum = lnum - 1
 				elseif code == 1 then
 					io.stderr:write(out .. "\n")
 					line = out

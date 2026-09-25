@@ -8,11 +8,49 @@ local rt = require("runtime")
 local M = {}
 
 -- ---- the list ---------------------------------------------------------------------
--- sh.history[k] is entry number sh.hist_base + k - 1 (bash's history_base).
+-- sh.history[k] is entry number sh.hist_base + k - 1 (bash's history_base); sh.hist_ts[k]
+-- its timestamp as readline keeps it: the history comment char, then the epoch ("\0…"
+-- when there was no comment char, as hist_inittime's `ret[0] = history_comment_char`).
 function M.list(sh)
-	sh.history = sh.history or {}
+	local h = sh.history
+	if not h then
+		h = {}
+		sh.history, sh.hist_ts = h, sh.hist_ts or {}
+	end
 	sh.hist_base = sh.hist_base or 1
-	return sh.history
+	return h
+end
+local function tslist(sh)
+	local t = sh.hist_ts
+	if not t then
+		t = {}
+		sh.hist_ts = t
+	end
+	return t
+end
+M.tslist = tslist
+
+-- readline's history_comment_char for timestamps: none in a script until HISTTIMEFORMAT
+-- is set (sv_histtimefmt makes it `#`, for good) or $histchars names one
+function M.tscc(sh)
+	if sh.hist_cc == nil and sh.vars.HISTTIMEFORMAT then
+		sh.hist_cc = "#"
+	end
+	local hc = sh.vars.histchars and sh:get("histchars")
+	if hc and #hc >= 3 then
+		return hc:sub(3, 3)
+	end
+	return sh.hist_cc or "\0"
+end
+
+-- history_get_time: the entry's epoch, or nil (not a timestamp under the comment char)
+function M.get_time(sh, k)
+	local ts = tslist(sh)[k]
+	if not ts or ts:sub(1, 1) ~= M.tscc(sh) then
+		return nil
+	end
+	local t = tonumber(ts:match("^%d+", 2))
+	return t ~= 0 and t or nil
 end
 
 function M.enabled(sh) -- bash's remember_on_history
@@ -36,32 +74,158 @@ function M.chars(sh)
 	return c(1), c(2), c(3)
 end
 
--- HISTSIZE caps the list (stifle): the oldest entries go and the numbering moves on.
+-- $HISTSIZE as the stifle limit (nil: not stifled)
+local function histmax(sh)
+	local hs = sh.vars.HISTSIZE and sh:get("HISTSIZE")
+	return hs and hs:match("^%s*%d+%s*$") and tonumber(hs)
+end
+
+-- remove entry K (and its timestamp)
+function M.remove(sh, k)
+	table.remove(M.list(sh), k)
+	table.remove(tslist(sh), k)
+end
+
+-- readline's stifle_history, on a HISTSIZE assignment: the oldest entries go and
+-- history_base becomes the number removed (not the old base plus it)
 function M.stifle(sh)
 	local h = M.list(sh)
-	local hs = sh.vars.HISTSIZE and sh:get("HISTSIZE")
-	local max = hs and hs:match("^%s*%d+%s*$") and tonumber(hs)
+	local max = histmax(sh)
 	if not max then
 		return
 	end
 	local extra = #h - max
 	if extra > 0 then
+		local t = tslist(sh)
 		table.move(h, extra + 1, #h, 1)
+		table.move(t, extra + 1, #h, 1)
 		for k = #h, #h - extra + 1, -1 do
-			h[k] = nil
+			h[k], t[k] = nil, nil
 		end
-		sh.hist_base = sh.hist_base + extra
+		sh.hist_base = extra
 	end
 end
 
-local function really_add(sh, line)
-	local h = M.list(sh)
+-- readline's add_history (+ add_history_time's TS): a full stifled list drops its oldest
+-- entry and history_base moves on by one
+function M.add_history(sh, line, ts)
+	local h, t = M.list(sh), tslist(sh)
+	local max = histmax(sh)
+	if max and #h >= max then
+		if max == 0 then
+			return
+		end
+		while #h >= max do
+			M.remove(sh, 1)
+			sh.hist_base = sh.hist_base + 1
+		end
+	end
 	h[#h + 1] = line
+	t[#h] = ts or (M.tscc(sh) .. os.time())
+end
+
+local function really_add(sh, line)
+	if histmax(sh) == 0 and #M.list(sh) == 0 then -- (bash_add_history: HISTSIZE=0 keeps none)
+		return
+	end
+	M.add_history(sh, line)
 	sh.hist_session = (sh.hist_session or 0) + 1
 	sh.hist_last_added = true
-	M.stifle(sh)
+	sh.hist_pushed = false
 end
 M.really_add = really_add
+
+-- readline's read_history_range over TEXT (a history file's contents): the entries after
+-- the first FROM lines are added; returns the count of lines read (history_lines_read_from_
+-- file). `#<digit>` lines (under the comment char, or when the file starts with one) are
+-- timestamps for the next entry; with HISTTIMEFORMAT set, once a timestamped file was read
+-- a line without one continues the previous entry (history_multiline_entries); CR-LF ends
+-- are stripped, empty lines skipped, and an unterminated last line isn't read.
+function M.read_text(sh, text, from)
+	local cc = M.tscc(sh)
+	if cc == "\0" and text:match("^#%d") then
+		cc = "#"
+	end
+	local function isstamp(l)
+		return l:sub(1, 1) == cc and l:sub(2, 2):match("%d") ~= nil
+	end
+	if isstamp(text) and sh.vars.HISTTIMEFORMAT then
+		sh.hist_multiline = true
+	end
+	local cur, last_ts = 0, nil
+	local pos, n = 1, #text
+	-- (skip FROM lines, not counting timestamps)
+	while cur < from and pos <= n do
+		local e = text:find("\n", pos, true)
+		if not e then
+			pos = n + 1
+			break
+		end
+		local l = text:sub(pos, e - 1)
+		if isstamp(l) then
+			last_ts = l
+		else
+			cur = cur + 1
+			last_ts = nil
+		end
+		pos = e + 1
+	end
+	while pos <= n do
+		local e = text:find("\n", pos, true)
+		if not e then
+			break
+		end
+		local l = text:sub(pos, e - 1)
+		pos = e + 1
+		if l:sub(-1) == "\r" then
+			l = l:sub(1, -2)
+		end
+		if l ~= "" then
+			if not isstamp(l) then
+				local h = M.list(sh)
+				if last_ts == nil and #h > 0 and sh.hist_multiline then
+					h[#h] = h[#h] .. "\n" .. l
+				else
+					M.add_history(sh, l, cc .. os.time())
+				end
+				if last_ts then
+					tslist(sh)[#h] = last_ts
+					last_ts = nil
+				end
+			else
+				last_ts = l
+				cur = cur - 1
+			end
+		end
+		cur = cur + 1
+	end
+	return cur
+end
+
+-- the history lines as a file holds them (history_do_write): each entry preceded by its
+-- timestamp line when HISTTIMEFORMAT is set; entries FROM..#h
+function M.file_text(sh, from)
+	local h, t, o = M.list(sh), tslist(sh), {}
+	local stamps = sh.vars.HISTTIMEFORMAT ~= nil
+	for k = from or 1, #h do
+		local ts = t[k]
+		if stamps and ts and ts:sub(1, 1) ~= "\0" then
+			o[#o + 1] = ts
+		end
+		o[#o + 1] = h[k]
+	end
+	o[#o + 1] = ""
+	return #h >= (from or 1) and table.concat(o, "\n") or ""
+end
+
+-- the history file `history -a/-w/-r/-n` use: $HISTFILE, or readline's $HOME/.history
+function M.filename(sh)
+	if sh.vars.HISTFILE then
+		return sh:get("HISTFILE") or ""
+	end
+	local home = sh.vars.HOME and sh:get("HOME") or ""
+	return home .. "/.history"
+end
 
 -- HISTCONTROL: ignorespace / ignoredups / ignoreboth / erasedups
 local function control(sh)
@@ -137,12 +301,16 @@ function M.check_add(sh, line)
 	if c.erase then
 		for k = #h, 1, -1 do
 			if h[k] == line then
-				table.remove(h, k)
+				M.remove(sh, k)
 			end
 		end
 	end
 	really_add(sh, line)
 	return true
+end
+
+local function member(c, set)
+	return c ~= "" and set:find(c, 1, true) ~= nil
 end
 
 -- Is LINE a shell comment? 1: the first non-blank is `#`; 2: a `#` comment follows text.
@@ -202,52 +370,146 @@ local function delimiting_chars(prev, line)
 	return "; "
 end
 
+-- The lexer state at the end of a line, carried in STK across a command's lines: bash's
+-- dstack (an open '…', $'…', "…", `…`, $(…), <(…), >(…) or extglob @(…), whose newlines
+-- go into the history literally) and PST_COMPASSIGN (inside `name=(…`, joined with a
+-- space). "A" marks a compound assignment, "(" a paren nested inside one of these.
+local QSTART = { ["'"] = 1, ['"'] = 1, ["`"] = 1 }
+local function lex_scan(line, stk, extglob)
+	local i, n = 1, #line
+	while i <= n do
+		local top, c = stk[#stk], line:sub(i, i)
+		if top == "'" then
+			if c == "'" then
+				stk[#stk] = nil
+			end
+		elseif top == "$'" then
+			if c == "\\" then
+				i = i + 1
+			elseif c == "'" then
+				stk[#stk] = nil
+			end
+		elseif top == '"' or top == "`" then
+			if c == "\\" then
+				i = i + 1
+			elseif c == top then
+				stk[#stk] = nil
+			elseif top == '"' and c == "`" then
+				stk[#stk + 1] = "`"
+			elseif top == '"' and c == "$" and line:sub(i + 1, i + 1) == "(" then
+				stk[#stk + 1] = ")"
+				i = i + 1
+			end
+		else -- (the top level, or inside $(…) / a compound assignment)
+			local nx = line:sub(i + 1, i + 1)
+			if c == "\\" then
+				i = i + 1
+			elseif c == "#" and (i == 1 or member(line:sub(i - 1, i - 1), " \t;&|()<>")) then
+				break
+			elseif QSTART[c] then
+				stk[#stk + 1] = (c == "'" and line:sub(i - 1, i - 1) == "$") and "$'" or c
+			elseif nx == "(" and (c == "$" or c == "<" or c == ">" or (extglob and member(c, "@?*+!"))) then
+				stk[#stk + 1] = ")"
+				i = i + 1
+			elseif c == "(" then
+				if top then
+					stk[#stk + 1] = "("
+				else
+					local p = line:sub(1, i - 1):match("()[%a_][%w_]*%b[]%+?=$")
+						or line:sub(1, i - 1):match("()[%a_][%w_]*%+?=$")
+					if p and (p == 1 or member(line:sub(p - 1, p - 1), " \t;&|(")) then
+						stk[#stk + 1] = "A"
+					end
+				end
+			elseif c == ")" and top then
+				stk[#stk] = nil
+			end
+		end
+		i = i + 1
+	end
+end
+
+-- bash's dstack.delimiter_depth != 0, and PST_COMPASSIGN, for the lexer state STK
+local function lex_state(stk)
+	local comp = false
+	for k = 1, #stk do
+		local e = stk[k]
+		if e == "A" then
+			comp = true
+		elseif e ~= "(" then
+			return true, false
+		end
+	end
+	return false, comp
+end
+
 -- Recording, one physical line at a time (bash's maybe_add_history): ST is the state of
--- the command being read ({ count, first_saved, comment, heredoc_first, prev }), reset
--- by the reader at each new command.
+-- the command being read ({ count, first_saved, comment, heredoc_started, prev, stk }),
+-- reset by the reader at each new command.
 function M.read_line(sh, st, line, in_heredoc)
 	sh.hist_last_added = false
 	local h = M.list(sh)
 	local isc = shell_comment(line)
 	st.count = (st.count or 0) + 1
 	if st.count > 1 then
-		if st.first_saved and (in_heredoc or isc ~= 1) and #h > 0 then
-			local cur = h[#h]
-			local add
-			if in_heredoc then
-				add = st.heredoc_started and "" or "\n"
-				st.heredoc_started = true
-				line = line .. "\n"
-			elseif st.comment == st.count - 1 then
-				add = "\n"
+		local delim, comp = lex_state(st.stk)
+		local lit = sh.shopt.lithist == true
+		if st.first_saved and (in_heredoc or lit or delim or isc ~= 1) and #h > 0 then
+			if sh.shopt.cmdhist == false then -- (each physical line its own entry)
+				really_add(sh, in_heredoc and line .. "\n" or line)
 			else
-				add = delimiting_chars(st.prev or "", line)
+				local cur = h[#h]
+				local add
+				if in_heredoc then
+					add = st.heredoc_started and "" or "\n"
+					st.heredoc_started = true
+					line = line .. "\n"
+				elseif st.comment == st.count - 1 or lit or delim then
+					add = "\n"
+				elseif comp then
+					add = " "
+				else
+					add = delimiting_chars(st.prev or "", line)
+				end
+				if not delim and not in_heredoc and cur:sub(-1) == "\\" and cur:sub(-2, -2) ~= "\\" then
+					cur = cur:sub(1, -2)
+					add = ""
+				end
+				if not delim and cur:sub(-1) == "\n" and add:sub(1, 1) == ";" then
+					add = add:sub(2)
+				end
+				-- (a joined line isn't "added": hist_last_line_added stays 0, so `fc`
+				-- inside a multi-line compound sees the compound itself)
+				h[#h] = cur .. add .. line
 			end
-			if cur:sub(-1) == "\\" and cur:sub(-2, -2) ~= "\\" and not in_heredoc then
-				cur = cur:sub(1, -2)
-				add = ""
-			end
-			if cur:sub(-1) == "\n" and add:sub(1, 1) == ";" then
-				add = add:sub(2)
-			end
-			h[#h] = cur .. add .. line
-			sh.hist_last_added = true
 		end
 		st.comment = isc ~= 0 and st.count or -2
 		if not in_heredoc then
 			st.prev = line
+			lex_scan(line, st.stk, sh.shopt.extglob)
 		end
 		return
 	end
 	st.comment = isc ~= 0 and st.count or -2
 	st.prev = line
+	st.stk = {}
+	lex_scan(line, st.stk, sh.shopt.extglob)
 	st.first_saved = M.check_add(sh, line)
+	sh.hist_first_saved = st.first_saved -- (current_command_first_line_saved)
 end
 
 -- Delete the last entry (`history -s` / `-p` drop the line that ran them, bash).
 function M.delete_last(sh)
 	local h = M.list(sh)
-	h[#h] = nil
+	if #h > 0 then
+		M.delete_histent(sh, #h)
+	end
+end
+
+-- bash_delete_histent: remove entry K, one less line this session
+function M.delete_histent(sh, k)
+	M.remove(sh, k)
+	sh.hist_session = (sh.hist_session or 0) - 1
 end
 
 -- load_history (bash, at `set -o history` before any line was added): default HISTSIZE
@@ -266,13 +528,9 @@ function M.load(sh)
 	if hf ~= "" then
 		local f = io.open(hf, "r")
 		if f then
-			local h = M.list(sh)
-			for l in f:lines() do
-				h[#h + 1] = l
-			end
+			local text = f:read("*a") or ""
 			f:close()
-			M.stifle(sh)
-			sh.hist_file_lines = #h
+			sh.hist_file_lines = M.read_text(sh, text, 0)
 		end
 	end
 end
@@ -280,9 +538,6 @@ end
 -- ---- tokenizing (history_tokenize) ------------------------------------------------
 local WORD_DELIMS = " \t\n;&()|<>"
 local QUOTES = "\"'`"
-local function member(c, set)
-	return c ~= "" and set:find(c, 1, true) ~= nil
-end
 local SLASHIFY = "\\\"$`\n"
 
 local function tokenize_word(s, i) -- 1-based start; returns the index just past the word
@@ -538,6 +793,9 @@ end
 
 -- search the list backwards for STR (anywhere, or as a prefix); returns entry, offset
 local function search(sh, str, anywhere)
+	if str == "" then -- (history_search_internal: an empty string is never found — `!;`)
+		return nil
+	end
 	local h = M.list(sh)
 	for k = #h, 1, -1 do
 		local e = h[k]
