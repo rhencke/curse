@@ -528,9 +528,12 @@ local function split_subst(s)
 		elseif c == "\\" then
 			i = i + 2
 		elseif q then
-			if c == q then
+			if q == "$" and c == "'" or q ~= "$" and c == q then
 				q = nil
 			end
+			i = i + 1
+		elseif c == "'" and s:sub(i - 1, i - 1) == "$" then
+			q = "$" -- $'…': a backslash escapes in it (`${v/$'\''/x}`)
 			i = i + 1
 		elseif c == "'" or c == '"' then
 			q = c
