@@ -1381,8 +1381,11 @@ local function expand_pexp(sh, p, assign)
 	end
 	-- ${ref OP…} through a nameref to an ELEMENT (`declare -n f='a[1]'`) operates on
 	-- that element, not the base's [0]: retarget the expansion at it
-	local rb = not pe.index and pe.op ~= "indirect" and pe.op ~= "len" and type(pe.name) == "string" and sh.vars[pe.name]
+	local rb = not pe.index and pe.op ~= "indirect" and type(pe.name) == "string" and sh.vars[pe.name]
 	local et = rb and rb.ref and sh:deref_elem(pe.name)
+	if et and pe.op == "len" then
+		return "0" -- (bash's ${#ref} to an element-target nameref: its length shortcut sees no value)
+	end
 	if et then
 		local eb, esub = et:match("^([%a_][%w_]*)%[(.+)%]$")
 		if eb then
