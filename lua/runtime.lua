@@ -8072,6 +8072,63 @@ end
 function M.repl_expands(rep)
 	return rep:find("&", 1, true) ~= nil or rep:find("\\\\") ~= nil
 end
+-- With extglob off an `X(` is plain text in a pattern (strmatch without FNM_EXTMATCH):
+-- escape the paren so the converters don't read an extglob group.
+function M.glob_noext(glob)
+	return (glob:gsub("([?*+@!])%(", "%1\\("))
+end
+-- ${v/pat/rep} with a `!(…)` pattern, which the ERE conversion can only approximate:
+-- bash's match_upattern by brute force over whole-substring matches (MATCH_ANY takes
+-- the leftmost start and the longest end there; MATCH_BEG the longest prefix; MATCH_END
+-- the leftmost suffix), looped as pat_subst does.
+function M.subst_ext(val, glob, repl, all, anchor, icase, rx)
+	local n = #val
+	local function find(from)
+		if anchor == "^" then
+			if from > 1 then
+				return nil
+			end
+			for e = n, 0, -1 do
+				if M.ext_match(val:sub(1, e), glob, icase) then
+					return 1, e
+				end
+			end
+		elseif anchor == "$" then
+			for b = from, n + 1 do
+				if M.ext_match(val:sub(b), glob, icase) then
+					return b, n
+				end
+			end
+		else
+			for b = from, n + 1 do
+				for e = n, b - 1, -1 do
+					if M.ext_match(val:sub(b, e), glob, icase) then
+						return b, e
+					end
+				end
+			end
+		end
+	end
+	local out, pos = {}, 1
+	repeat -- (pat_subst: `while (*str)`, but an empty string still gets one try)
+		local b, e = find(pos)
+		if not b then
+			break
+		end
+		out[#out + 1] = val:sub(pos, b - 1)
+		out[#out + 1] = rx and repl_amp(repl, val:sub(b, e)) or repl
+		pos = e + 1
+		if not all or anchor then
+			break
+		end
+		if e < b then -- empty match: copy one char
+			out[#out + 1] = val:sub(pos, pos)
+			pos = pos + 1
+		end
+	until pos > n
+	out[#out + 1] = val:sub(pos)
+	return table.concat(out)
+end
 function M.subst_glob(val, glob, repl, all, icase, rx)
 	local anchor -- (only `${x/#p/r}`/`${x/%p/r}` anchor: after `//` a `#`/`%` is literal)
 	local c1 = not all and glob:sub(1, 1)
@@ -8121,6 +8178,12 @@ function M.subst_glob(val, glob, repl, all, icase, rx)
 		out[#out + 1] = val:sub(i)
 		return table.concat(out)
 	end
+	if val == "" and anchor ~= "$" and glob:byte(1) ~= 42 then
+		return val -- (match_pattern_char: at the end of the string only a `*…` pattern
+	end -- may match, so an empty value takes ${y/?(a)/Z} as no match; `/%` skips that test)
+	if glob:find("!(", 1, true) then
+		return M.subst_ext(val, glob, repl, all, anchor, icase, rx)
+	end
 	local ere = glob_conv(glob, false, true) -- patsub=true: [^]/[!] empty-negated quirk
 	if anchor == "^" then
 		ere = "^(" .. ere .. ")"
@@ -8133,34 +8196,30 @@ function M.subst_glob(val, glob, repl, all, icase, rx)
 	if not rb then
 		return val
 	end
-	local out, pos, n, prev_end = {}, 0, #val, -1
-	while pos <= n do
+	-- pat_subst's loop runs `while (*str)`: matching stops at the END of the value (no
+	-- trailing empty match: `${x//*(z)/Y}` on abc is YaYbYc), yet right after a non-empty
+	-- match an empty one is still tried (`${x//?(b)/-}` is -a--c). An empty value gets
+	-- its one try (`${x//*/Y}` on "" is Y).
+	local out, pos, n = {}, 0, #val
+	repeat
 		local sub = val:sub(pos + 1)
 		if ffi.C.regexec(rb, sub, 1, pmatch, pos > 0 and REG_NOTBOL or 0) ~= 0 then
 			break
 		end
 		local so, eo = pmatch[0].rm_so, pmatch[0].rm_eo
-		if eo == so and pos + so == prev_end then
-			-- an EMPTY match right where the previous match ended (e.g. `.*` matched to
-			-- the end, then matches empty again): don't replace, just carry one char.
-			out[#out + 1] = sub:sub(1, so + 1)
-			pos = pos + so + 1
+		out[#out + 1] = sub:sub(1, so) -- text before the match
+		out[#out + 1] = rx and repl_amp(repl, sub:sub(so + 1, eo)) or repl
+		if eo > so then
+			pos = pos + eo
 		else
-			out[#out + 1] = sub:sub(1, so) -- text before the match
-			out[#out + 1] = rx and repl_amp(repl, sub:sub(so + 1, eo)) or repl
-			prev_end = pos + eo
-			if eo > so then
-				pos = pos + eo
-			else
-				out[#out + 1] = sub:sub(eo + 1, eo + 1)
-				pos = pos + eo + 1
-			end -- empty match: keep one char
-			if not all or anchor then
-				out[#out + 1] = val:sub(pos + 1)
-				return table.concat(out)
-			end
+			out[#out + 1] = sub:sub(eo + 1, eo + 1)
+			pos = pos + eo + 1
+		end -- empty match: keep one char
+		if not all or anchor then
+			out[#out + 1] = val:sub(pos + 1)
+			return table.concat(out)
 		end
-	end
+	until pos >= n
 	out[#out + 1] = val:sub(pos + 1)
 	return table.concat(out)
 end
@@ -10120,6 +10179,9 @@ function Shell:apply_str_op(op, val, arg, arg2, ltxt)
 			return M.ansi_unescape(val)
 		end
 		return val
+	end
+	if not self.shopt.extglob and arg:find("(", 1, true) then
+		arg = M.glob_noext(arg) -- (extglob off: `+(b)` is literal text)
 	end
 	if op == "#" then
 		return strip_prefix(val, arg, false)
