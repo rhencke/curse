@@ -6153,6 +6153,26 @@ end
 -- In posix mode an arithmetic EXPANSION error exits a non-interactive shell (bash's
 -- posixly_correct FORCE_EOF) instead of abandoning the line: raise that exit for a
 -- caught line-abort `err`, else return.
+-- One word's final fields through the shared word expander (interp's expand_to_fields: an
+-- expander for ONE word, not statement interpretation) — the compiled argv builder's path
+-- for a word shape it has no native renderer for. A word-expansion error bash contains
+-- (exec_simple's expand_args pcall: status 1, the command doesn't run, the script goes on)
+-- returns nil, and the compiled caller skips the dispatch; anything else propagates.
+function M.word_fields(sh, w)
+	local ok, f = pcall(require("interp").expand_to_fields, sh, w)
+	if ok then
+		return f
+	end
+	if type(f) == "table" and f.__curse_experr and not f.__curse_lineabort then
+		M.posix_arith_fatal(sh, f)
+		sh.status = 1
+		if sh.opt_e then
+			error({ __curse_exit = 1 })
+		end
+		return nil
+	end
+	error(f, 0)
+end
 function M.posix_arith_fatal(sh, err)
 	if sh.opt_posix and not sh.opt_i and err.__curse_matherr then
 		error({ __curse_exit = sh.opt_c and 127 or 1 }, 0)

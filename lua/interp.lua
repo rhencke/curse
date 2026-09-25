@@ -2645,7 +2645,8 @@ expand_fields_full = function(sh, w, pre1) -- pre1: part 1 already expanded (a $
 			if pn then
 				hasval = pn == 0 or pn <= sh.nparams
 			end
-			local nonnull = sh:get(pe.name) ~= ""
+			local pval = pn and sh:param(pn) or sh:get(pe.name) -- ($1 is not a variable)
+			local nonnull = pval ~= ""
 			local useword
 			if pe.op == ":-" then
 				useword = not nonnull
@@ -2724,7 +2725,7 @@ expand_fields_full = function(sh, w, pre1) -- pre1: part 1 already expanded (a $
 					end
 				end
 			elseif pe.op == ":-" or pe.op == "-" then
-				feed_split(sh:get(pe.name))
+				feed_split(pval)
 			end
 		else
 			local s

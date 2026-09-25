@@ -2634,6 +2634,15 @@ local function emit_seg(p, i, lifted, w)
 			elems
 		)
 	end
+	if p.cmdsub or p.arith or p.arithast then -- $(…) / $((…)): the value compiles (emit_word's
+		-- compile_cmdsub / native arith); quoted it is one literal segment, unquoted it word-splits
+		-- on $IFS then globs, like a bare $x (subst.c: expand_word_internal's comsub/arith cases)
+		local s = emit_word({ parts = { p } }, lifted)
+		if p.q then
+			return ("{s=%s,split=false,unq=false}"):format(s)
+		end
+		return ("{s=%s,split=true,unq=true}"):format(s)
+	end
 	if p.q then
 		return ("{s=%s,split=false,unq=false}"):format(emit_scalar_val(p, i, lifted, false))
 	elseif p.lit ~= nil then
@@ -2775,6 +2784,8 @@ function seg_native(w, lifted)
 		elseif p.param then -- $1..$9 positional: ok
 		elseif p.special == "#" or p.special == "?" or p.special == "$" or p.special == "!" or p.special == "-" then -- scalar specials
 		elseif p.special == "@" or p.special == "*" then -- $@/$*: multi-element (emit_seg renders it)
+		elseif p.cmdsub then -- $(…): compiled capture (compile_cmdsub), a scalar segment
+		elseif (p.arith or p.arithast) and emitable_word({ parts = { p } }) then -- a renderable $((…))
 		elseif
 			p.pexp
 			and (
@@ -2980,9 +2991,21 @@ local function arrayassign_ok(st, lifted, allow_nameref)
 	return true
 end
 -- Build a `local __a = {...}` argv table for words[from..#words] (each field
--- split+globbed), or nil if any word needs the interpreter. `wrap` is applied to
--- each final field. Used for commands whose args word-split/glob.
-local function field_argv(words, from, lifted, wrap, prefix)
+-- split+globbed). `wrap` is applied to each final field. Used for commands whose args
+-- word-split/glob. A word shape no native renderer covers (a ${…} operator whose word
+-- holds "$@", a nested-side-effect or malformed $((…)), …) expands through the shared
+-- one-word expander rt.word_fields — the argv is then GUARDED: a word-expansion error
+-- bash contains (exec_simple's expand_args pcall) fails the command with $?=1, leaving
+-- `__a = false`, and the words after it are skipped. Callers that pass `guard_ok` get
+-- that shape (second result true) and must dispatch only `if __a`; others get nil.
+-- (the call-stack / current-command specials: the interpreter maintains them per statement,
+-- the compiled tier does not keep them in sh — a word reading one keeps delegating)
+local function fb_unsafe(w)
+	local src = w.src or ""
+	return src:find("BASH_COMMAND", 1, true) or src:find("FUNCNAME", 1, true)
+		or src:find("BASH_SOURCE", 1, true) or src:find("BASH_LINENO", 1, true)
+end
+local function field_argv(words, from, lifted, wrap, prefix, guard_ok)
 	local out = { prefix and ("local __a = {" .. prefix .. "}") or "local __a = {}" }
 	-- a long run of plain literal words (`printf x {1..70000}`) becomes ONE constant table:
 	-- one statement per word overflows LuaJIT's jump range (as for-in lists do)
@@ -2998,27 +3021,52 @@ local function field_argv(words, from, lifted, wrap, prefix)
 		end
 		run = {}
 	end
+	local opens = 0
 	for j = from, #words do
 		local w = words[j]
 		local lit = w.plain and w.parts[1].lit
 		if lit and lit ~= "" then -- (a plain unquoted literal — `{1..70000}`'s words: as is)
 			run[#run + 1] = ("%q"):format(lit)
 		elseif not empty_word(w) then -- an empty brace alternative ({X,,Y,}) adds no arg
-			if not word_safe(w) and not arith_guard(w) and not field_word(w, lifted) and not mixed_expandable(w, lifted) then
+			if word_safe(w) or arith_guard(w) or field_word(w, lifted) or seg_native(w, lifted)
+				or (not guard_ok and mixed_expandable(w, lifted)) then
+				local code = emit_fields_into("__a", w, lifted, wrap)
+				local lit = code:match('^__a%[#__a%+1%] = rt%.cstr%((%("[^"\\]*"%))%)$')
+				if lit then
+					run[#run + 1] = lit
+				else
+					flush_run()
+					out[#out + 1] = code
+				end
+			elseif not guard_ok or fb_unsafe(w) then
 				return nil
-			end
-			local code = emit_fields_into("__a", w, lifted, wrap)
-			local lit = code:match('^__a%[#__a%+1%] = rt%.cstr%((%("[^"\\]*"%))%)$')
-			if lit then
-				run[#run + 1] = lit
 			else
 				flush_run()
-				out[#out + 1] = code
+				-- lifted locals are the authoritative values: flush them to sh for the expander
+				-- (a $(…) body may read any of them), reload after (`${x:=v}`, `$((x=1))` write)
+				local si, so = {}, {}
+				for n in spairs(lifted) do
+					si[#si + 1] = ("sh:aset(%q, %s); "):format(n, lname(n))
+					so[#so + 1] = ("%s = sh:aget(%q); "):format(lname(n), n)
+				end
+				local ln = (w.src or ""):find("LINENO", 1, true) and ("sh.cur_line = %d; "):format(EF.cur_line or 0) or ""
+				local W = wrap and wrap:format("__f[__i]") or "__f[__i]"
+				out[#out + 1] = ("do %s%slocal __f = rt.word_fields(sh, %s[1]); %sif __f then for __i=1,#__f do __a[#__a+1]=%s end else __a = false end end"):format(
+					table.concat(si), ln, EF.konst({ ser(w) }), table.concat(so), W)
+				out[#out + 1] = "if __a then"
+				opens = opens + 1
 			end
 		end
 	end
 	flush_run()
-	return table.concat(out, "; ")
+	local o = { out[1] }
+	for i = 2, #out do
+		o[#o + 1] = (out[i - 1] == "if __a then" and " " or "; ") .. out[i]
+	end
+	if out[#out] == "if __a then" then
+		o[#o + 1] = " "
+	end
+	return table.concat(o) .. string.rep(" end", opens), opens > 0
 end
 
 -- Arith usable in a VALUE position (what emit_value renders): pure, no side effect,
@@ -4675,7 +4723,7 @@ simple_compiled = function(cx, st, after)
 	-- reusing delegate's control-flow-signal wrapper. A prefix assign (tempenv) still needs
 	-- exec_stmt's fuller handling; a redirect is applied around the dispatch (opts.redir).
 	if cmd == nil and st.words[1] and not st.assigns then
-		local argvbody = field_argv(st.words, 1, cx.lifted, nil, nil)
+		local argvbody, argvbody_g = field_argv(st.words, 1, cx.lifted, nil, nil, true)
 		local dyn_redir = nil
 		if argvbody and st.redirs then
 			dyn_redir = cx.redir_conds(st, nil) -- nil => uncompilable redir shape: fall through to full delegate
@@ -4701,6 +4749,7 @@ simple_compiled = function(cx, st, after)
 				after,
 				{
 					prelude = (not hadcs and dyncs) and ("sh.ncs0 = sh.ncs; " .. argvbody) or argvbody,
+					guard = argvbody_g,
 					callee = "rt.exec_dynamic",
 					callargs = ("sh, __a, __noop, %s"):format((not hadcs and dyncs) and "sh.ncs ~= sh.ncs0" or tostring(hadcs)),
 					redir = dyn_redir and cx.redir_ext(nil, dyn_redir),
@@ -4717,7 +4766,7 @@ simple_compiled = function(cx, st, after)
 		-- `command -v/-V NAME…`: a pure lookup query (alias/keyword/builtin/function/PATH)
 		-- -> rt.command_query, exactly interp's branch; no execution, so no exec_stmt.
 		if w2 and #st.words[2].parts == 1 and (w2.lit == "-v" or w2.lit == "-V") and st.words[3] then
-			local qbody = field_argv(st.words, 1, cx.lifted, nil, nil)
+			local qbody, qbody_g = field_argv(st.words, 1, cx.lifted, nil, nil, true)
 			local q_redir = nil
 			if qbody and st.redirs then
 				q_redir = cx.redir_conds(st, nil)
@@ -4725,6 +4774,7 @@ simple_compiled = function(cx, st, after)
 			if qbody and not (st.redirs and not q_redir) then
 				return cx.delegate(st, after, {
 					prelude = qbody,
+					guard = qbody_g,
 					callee = "rt.command_query",
 					callargs = "sh, __a",
 					redir = q_redir,
@@ -4733,7 +4783,7 @@ simple_compiled = function(cx, st, after)
 		end
 		-- (`command exec >f`: exec's redirections persist — interp's exec branch handles it)
 		if not (w2 and w2.lit and (w2.lit:sub(1, 1) == "-" or w2.lit == "exec")) then -- not a flag / --
-			local argvbody = field_argv(st.words, 2, cx.lifted, nil, nil)
+			local argvbody, argvbody_g = field_argv(st.words, 2, cx.lifted, nil, nil, true)
 			local cmd_redir = nil
 			if argvbody and st.redirs then
 				cmd_redir = cx.redir_conds(st, nil)
@@ -4756,6 +4806,7 @@ simple_compiled = function(cx, st, after)
 					after,
 					{
 						prelude = argvbody,
+						guard = argvbody_g,
 						callee = "rt.exec_dynamic",
 						callargs = ("sh, __a, __noop, %s, true"):format(tostring(hadcs)),
 						redir = cmd_redir,
@@ -4769,7 +4820,7 @@ simple_compiled = function(cx, st, after)
 	-- resolves "builtin" to the b_builtin builtin, which force-runs the rest as a builtin —
 	-- and reuses delegate's cf-signal wrapper (so `builtin break` in a loop jumps) + opts.redir.
 	if cmd == "builtin" and st.words[2] and not st.assigns then
-		local argvbody = field_argv(st.words, 1, cx.lifted, nil, nil)
+		local argvbody, argvbody_g = field_argv(st.words, 1, cx.lifted, nil, nil, true)
 		local bi_redir = nil
 		if argvbody and st.redirs then
 			bi_redir = cx.redir_conds(st, nil)
@@ -4792,6 +4843,7 @@ simple_compiled = function(cx, st, after)
 				after,
 				{
 					prelude = argvbody,
+					guard = argvbody_g,
 					callee = "rt.exec_dynamic",
 					callargs = ("sh, __a, __noop, %s"):format(tostring(hadcs)),
 					redir = bi_redir,
@@ -4805,7 +4857,7 @@ simple_compiled = function(cx, st, after)
 	-- construct emit still delegates). delegate's cf-wrapper catches a return/break/continue/
 	-- exit the eval'd code raises; opts.redir applies a redirect around the call.
 	if cmd == "eval" and not st.assigns then
-		local argvbody = field_argv(st.words, 1, cx.lifted, nil, nil)
+		local argvbody, argvbody_g = field_argv(st.words, 1, cx.lifted, nil, nil, true)
 		local ev_redir = nil
 		if argvbody and st.redirs then
 			ev_redir = cx.redir_conds(st, nil)
@@ -4813,6 +4865,7 @@ simple_compiled = function(cx, st, after)
 		if argvbody and not (st.redirs and not ev_redir) then
 			return cx.delegate(st, after, {
 				prelude = argvbody,
+				guard = argvbody_g,
 				callee = "rt.eval",
 				callargs = "sh, __a",
 				redir = ev_redir,
@@ -4823,7 +4876,7 @@ simple_compiled = function(cx, st, after)
 	-- same fragment mode as eval, plus positional-param setup and the RETURN trap; it
 	-- falls back to the interpreter for a missing/dir file, aliases, or a syntax error.
 	if (cmd == "source" or cmd == ".") and st.words[2] and not st.assigns then
-		local argvbody = field_argv(st.words, 1, cx.lifted, nil, nil)
+		local argvbody, argvbody_g = field_argv(st.words, 1, cx.lifted, nil, nil, true)
 		local sr_redir = nil
 		if argvbody and st.redirs then
 			sr_redir = cx.redir_conds(st, nil)
@@ -4831,6 +4884,7 @@ simple_compiled = function(cx, st, after)
 		if argvbody and not (st.redirs and not sr_redir) then
 			return cx.delegate(st, after, {
 				prelude = argvbody,
+				guard = argvbody_g,
 				callee = "rt.source",
 				callargs = st.line and ("sh, __a, %d"):format(st.line) or "sh, __a", -- (its line: BASH_LINENO)
 				redir = sr_redir,
@@ -5146,7 +5200,10 @@ simple_compiled = function(cx, st, after)
 			pvals[#pvals + 1] = (fl and fl:find("~", 1, true)) and ("rt.tilde_assign(sh, %q)"):format(fl)
 				or emit_word(a.rhs, cx.lifted)
 		end
-		local builder = pok and field_argv(st.words, 1, cx.lifted, "rt.cstr(%s)")
+		local builder, bg
+		if pok then
+			builder, bg = field_argv(st.words, 1, cx.lifted, "rt.cstr(%s)", nil, true)
+		end
 		if pok and builder then
 			local p = cx.newpc()
 			local ec = errchk(st)
@@ -5173,12 +5230,14 @@ simple_compiled = function(cx, st, after)
 			cx.blocks[p] = d
 				.. ("local __pv = { %s }; "):format(table.concat(pvals, ", "))
 				.. builder
+				.. (bg and "; if __a then" or "")
 				.. ("; rt.run_prefix(sh, { %s }, __pv, function() %s end, __a); "):format(
 					table.concat(pnames, ", "),
 					dispatch
 				)
 				.. lastarg
 				.. ecs
+				.. (bg and " end" or "")
 				.. ("; pc = %d"):format(after)
 			if not px_builtin then
 				-- (an external name — unless a function by that name exists at run time: a
@@ -5200,7 +5259,7 @@ simple_compiled = function(cx, st, after)
 		and (not EXEC_SIMPLE_SKIP[cmd] or decl_native)
 		and require("interp").BUILTINS[cmd]
 	then
-		local builder = field_argv(st.words, 1, cx.lifted, "rt.cstr(%s)") -- argv entries are C strings (cut at NUL, like interp's expand_args)
+		local builder, bg = field_argv(st.words, 1, cx.lifted, "rt.cstr(%s)", nil, true) -- argv entries are C strings (cut at NUL, like interp's expand_args)
 		if builder then
 			local p = cx.newpc()
 			local ec = errchk(st)
@@ -5221,19 +5280,22 @@ simple_compiled = function(cx, st, after)
 				-- status 1, like bash's sh_chkwrite.
 				cx.blocks[p] = d
 					.. builder
-					.. ("; do local __rs = {}; if %s then sh.write_err = nil; %s; io.flush() else sh.status = 1 end; rt.redir_restore(__rs); if sh.write_err then rt.chkwrite_late(sh, __a[1]) end end; %s%s; pc = %d"):format(
+					.. ("; %sdo local __rs = {}; if %s then sh.write_err = nil; %s; io.flush() else sh.status = 1 end; rt.redir_restore(__rs); if sh.write_err then rt.chkwrite_late(sh, __a[1]) end end; %s%s%s; pc = %d"):format(
+						bg and "if __a then " or "",
 						redir_apply,
 						bcall,
 						lastarg,
 						ecs,
+						bg and " end" or "",
 						after
 					)
 			else
 				cx.blocks[p] = d
 					.. builder
-					.. ("; %s; "):format(bcall)
+					.. ("; %s%s; "):format(bg and "if __a then " or "", bcall)
 					.. lastarg
 					.. ecs
+					.. (bg and " end" or "")
 					.. ("; pc = %d"):format(after)
 			end
 			return p
@@ -5266,6 +5328,10 @@ simple_compiled = function(cx, st, after)
 			if cmd == "echo" then
 				from = 2
 				call = "sh:echo_cmd(unpack(__a))"
+			elseif (cmd == ":" or cmd == "true" or cmd == "false") and not isfunc then
+				-- `: ${x:=v}` / `true $(…)`: the args expand for their side effects only
+				from = 2
+				call = cmd == "false" and "sh.status = 1" or "sh.status = 0"
 			elseif cmd == "test" or cmd == "[" then -- the [ / test command word is a literal (dispatched by
 				from = 2
 				wrap = "rt.cstr(%s)"
@@ -5307,7 +5373,7 @@ simple_compiled = function(cx, st, after)
 				return cx.delegate(st, after)
 			end
 			wrap = wrap or "rt.cstr(%s)" -- argv entries are C strings: cut each at NUL (bash/interp)
-			local builder = field_argv(st.words, from, cx.lifted, wrap, prefix)
+			local builder, bg = field_argv(st.words, from, cx.lifted, wrap, prefix, true)
 			if not builder then
 				return cx.delegate(st, after)
 			end
@@ -5326,15 +5392,18 @@ simple_compiled = function(cx, st, after)
 				-- truncated. Build argv first, then install redirs around the dispatch.
 				cx.blocks[p] = d
 					.. builder
-					.. ("; do local __rs = {}; if %s then %s else sh.status = 1 end; rt.redir_restore(__rs) end%s%s; pc = %d"):format(
+					.. ("; %sdo local __rs = {}; if %s then %s else sh.status = 1 end; rt.redir_restore(__rs) end%s%s%s; pc = %d"):format(
+						bg and "if __a then " or "",
 						cx.redir_ext(cmd, redir_apply),
 						call,
 						ps,
 						ecs,
+						bg and " end" or "",
 						after
 					)
 			else
-				cx.blocks[p] = d .. builder .. "; " .. call .. ps .. ecs .. ("; pc = %d"):format(after)
+				cx.blocks[p] = d .. builder .. "; " .. (bg and "if __a then " or "") .. call .. ps .. ecs
+					.. (bg and " end" or "") .. ("; pc = %d"):format(after)
 			end
 			return p
 		end
@@ -6657,7 +6726,8 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
 			.. (rbody and rbody.stdin and "sh.stdin_redir = (sh.stdin_redir or 0) + 1; " or "")
 		local si_out = rbody and rbody.stdin and "sh.stdin_redir = sh.stdin_redir - 1; " or ""
 		local rfail = rbody and rbody.fail and ("; " .. rbody.fail) or ""
-		local function callwrap()
+		local callwrap
+		callwrap = function()
 			if rbody then
 				return ("do local __rs, __so = {}, sh.out; if %s then %slocal __ok, __e = pcall(%s, %s); %ssh.out = __so; rt.redir_restore(__rs); if not __ok then error(__e, 0) end else rt.redir_restore(__rs); sh.status = 1%s end end"):format(
 					redir,
@@ -6676,6 +6746,19 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
 				)
 			end
 			return ("%s(%s)"):format(callee, callargs)
+		end
+		-- opts.guard: the prelude is a GUARDED argv (field_argv): after a contained word-expansion
+		-- error `__a` is false — $? is already 1 — and the command must not run (nor its ERR check)
+		local guard = opts and opts.guard
+		if guard then
+			local cw, gec = callwrap, ec
+			callwrap = function()
+				return ("if __a then %s%s end"):format(cw(), gec ~= "" and ("; " .. gec) or "")
+			end
+			ec = ""
+			if inloop or infunc then -- (the pcall form below: guard the call and the check)
+				ec = gec ~= "" and ("if __a then " .. gec .. " end") or ""
+			end
 		end
 		if not (inloop or infunc) then -- top level, no loop: nothing to catch (interp no-ops)
 			local out = {}
@@ -6714,18 +6797,21 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
 			-- install the redirs, run the dispatch (still under pcall so a break/continue/return
 			-- signal is caught below) only if they succeeded, then restore — regardless of signal.
 			o[#o + 1] = "local __rs, __so, __rf = {}, sh.out, false; local __ok, __e = true, nil"
-			o[#o + 1] = ("if %s then %s__ok, __e = pcall(%s, %s); sh.out = __so else sh.status = 1; __rf = true end"):format(
+			o[#o + 1] = ("%sif %s then %s__ok, __e = pcall(%s, %s); sh.out = __so else sh.status = 1; __rf = true end%s"):format(
+				guard and "if __a then " or "",
 				redir,
 				so_in,
 				callee,
-				callargs
+				callargs,
+				guard and " end" or ""
 			)
 			o[#o + 1] = "rt.redir_restore(__rs)"
 			if rfail ~= "" then -- after the restore: the ERR handler / errexit sees the original fds
 				o[#o + 1] = "if __rf then " .. rfail:sub(3) .. " end"
 			end
 		else
-			o[#o + 1] = ("local __ok, __e = pcall(%s, %s)"):format(callee, callargs)
+			o[#o + 1] = guard and ("local __ok, __e = true, nil; if __a then __ok, __e = pcall(%s, %s) end"):format(callee, callargs)
+				or ("local __ok, __e = pcall(%s, %s)"):format(callee, callargs)
 		end
 		o[#o + 1] = "sh.loopdepth, sh.calldepth = __sl, __sc"
 		o[#o + 1] = table.concat(sync_out, "; ")
