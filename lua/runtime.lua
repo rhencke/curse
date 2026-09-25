@@ -11362,7 +11362,9 @@ function M.parse_error_stmt(sh, st, label)
 		return
 	end
 	local msg = tostring(st.msg or "syntax error"):gsub("^.-:%d+: ", "")
-	msg = msg:gsub("^syntax error near `", "syntax error near unexpected token `")
+	if not st.exact then
+		msg = msg:gsub("^syntax error near `", "syntax error near unexpected token `")
+	end
 	if not msg:find("^syntax error") and not msg:find("^unexpected EOF")
 		and not msg:find("^maximum here%-document count exceeded") then
 		msg = "syntax error: " .. msg
@@ -11373,8 +11375,11 @@ function M.parse_error_stmt(sh, st, label)
 	sh.in_perr = true -- (a `-c` string's syntax errors name it: `bash: -c: line 1:`)
 	local pl = sh.perr_label
 	sh.perr_label = label or pl
+	for _, m in ipairs(st.pre or {}) do -- (e.g. a [[ ]] grammar error's own message)
+		io.stderr:write("curse: " .. m .. "\n")
+	end
 	io.stderr:write("curse: " .. msg .. "\n")
-	if st.text and (st.showtext or msg:find("near unexpected token", 1, true)) then
+	if st.text and (st.showtext or st.exact or msg:find("near unexpected token", 1, true)) then
 		io.stderr:write("curse: " .. (st.showtext and "syntax error: " or "") .. "`" .. st.text .. "'\n")
 	end
 	sh.in_perr, sh.perr_label = nil, pl

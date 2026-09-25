@@ -1782,6 +1782,111 @@ function M.parse_default_quoted(txt, heredoc)
 	return r
 end
 
+-- bash's own [[ ]] grammar check (parse.y cond_term/cond_and/cond_or/cond_error), run
+-- before the AST is built: a malformed conditional is a PARSE-time syntax error — the
+-- line runs nothing — reported with bash's messages, then `syntax error near `TOK'`
+-- (the offending token; `&&`/`||` shows its first character, as bash's reporter does).
+local COND_UNOP, COND_BINOP = {}, {}
+for c in ("abcdefghknoprstuvwxzGLOSNR"):gmatch(".") do
+	COND_UNOP["-" .. c] = true
+end
+for _, b in ipairs({ "=", "==", "!=", "=~", "<", ">", "-nt", "-ot", "-ef", "-eq", "-ne", "-lt", "-le", "-gt", "-ge" }) do
+	COND_BINOP[b] = true
+end
+local COND_OPTOK = { ["&&"] = true, ["||"] = true, ["("] = true, [")"] = true, ["<"] = true, [">"] = true }
+local function cond_check(toks, quoted)
+	local pos, ck, ct = 1, nil, nil -- (ck/ct: bash's cond_token, kind and text)
+	local pre = {}
+	local function nxt()
+		local t = toks[pos]
+		pos = pos + 1
+		if t == nil then
+			ck, ct = "END", "]]"
+		elseif not quoted[pos - 1] and COND_OPTOK[t] then
+			ck, ct = t, t
+		else
+			ck, ct = "WORD", t
+		end
+		return ck, ct
+	end
+	local function fail(near)
+		error({ cond_fail = true, near = near }, 0)
+	end
+	local cond_or
+	local function term()
+		local k, t = nxt()
+		if k == "END" then
+			fail(t)
+		elseif k == "(" then
+			local ok, e = pcall(cond_or)
+			if not ok then
+				if type(e) ~= "table" or not e.cond_fail then
+					error(e, 0)
+				end
+				pre[#pre + 1] = "expected `)'" -- (the inner error left cond_token COND_ERROR)
+				error(e, 0)
+			end
+			if ck ~= ")" then
+				pre[#pre + 1] = ck == "WORD" and "expected `)'" or ("unexpected token `" .. ct .. "', expected `)'")
+				fail(ct)
+			end
+			nxt()
+		elseif k == "WORD" and t == "!" then
+			term()
+		elseif k == "WORD" and COND_UNOP[t] then
+			local k2, t2 = nxt()
+			if k2 ~= "WORD" then
+				pre[#pre + 1] = "unexpected argument `" .. t2 .. "' to conditional unary operator"
+				fail(t2)
+			end
+			nxt()
+		elseif k == "WORD" then
+			local k2, t2 = nxt()
+			if (k2 == "WORD" and COND_BINOP[t2]) or k2 == "<" or k2 == ">" then
+				local k3, t3 = nxt()
+				if k3 ~= "WORD" then
+					pre[#pre + 1] = "unexpected argument `" .. t3 .. "' to conditional binary operator"
+					fail(t3)
+				end
+				nxt()
+			elseif not (k2 == "END" or k2 == "&&" or k2 == "||" or k2 == ")") then
+				pre[#pre + 1] = k2 == "WORD" and "conditional binary operator expected"
+					or ("unexpected token `" .. t2 .. "', conditional binary operator expected")
+				fail(t2)
+			end
+		else
+			pre[#pre + 1] = "unexpected token `" .. t .. "' in conditional command"
+			fail(t)
+		end
+	end
+	local function cond_and()
+		term()
+		if ck == "&&" then
+			cond_and()
+		end
+	end
+	cond_or = function()
+		cond_and()
+		if ck == "||" then
+			cond_or()
+		end
+	end
+	local ok, e = pcall(cond_or)
+	if ok and ck ~= "END" then -- (cond_error: a token left before `]]`)
+		pre[#pre + 1] = ck == "WORD" and "syntax error in conditional expression"
+			or ("syntax error in conditional expression: unexpected token `" .. ct .. "'")
+		ok, e = false, { cond_fail = true, near = ct }
+	end
+	if ok then
+		return
+	end
+	if type(e) ~= "table" or not e.cond_fail then
+		error(e, 0)
+	end
+	local near = (e.near == "&&" or e.near == "||") and e.near:sub(1, 1) or e.near
+	error({ __curse_perr = true, pre = pre, exact = true, msg = "syntax error near `" .. near .. "'" }, 0)
+end
+
 -- Parse a [[ … ]] token list into a boolean-expression AST:
 --   {kind="and"/"or", l, r} | {kind="not", e} | {kind="str", word}
 --   {kind="unary", op, word} | {kind="binary", op, l, r, rq}
@@ -4137,6 +4242,7 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs)
 					quoted[#toks] = (c1 == '"' or c1 == "'")
 				end
 			end
+			cond_check(toks, quoted)
 			return { t = "dbracket", line = line, expr = parse_dbracket(toks, quoted), redirs = tail_redirs() }
 		end
 		-- brace group { list; }  and subshell ( list )  — optional trailing redirs
@@ -4887,6 +4993,8 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs)
 						msg = recover and ("syntax error near `" .. (st.tok or "(") .. "'")
 							or (type(st) == "table" and st.__curse_perr and st.msg) or tostring(st),
 						status = type(st) == "table" and st.__curse_perr and st.status or nil, -- (else 2)
+						pre = type(st) == "table" and st.__curse_perr and st.pre or nil, -- (messages before it)
+						exact = type(st) == "table" and st.__curse_perr and st.exact or nil, -- (msg verbatim)
 						text = type(st) == "table" and st.__curse_perr and st.text or nil,
 						showtext = type(st) == "table" and st.__curse_perr and st.text and true or nil,
 						recoverable = recover or nil,
