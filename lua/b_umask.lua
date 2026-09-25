@@ -19,27 +19,29 @@ local C, P = I.C, I.P
 return function(sh, cmd, args, hook, tcb)
 	if cmd == "umask" then
 		-- umask [-S] [MODE]: print (octal or -S symbolic) or set the file-creation mask.
+		-- (options up to the first operand or `--`, bash's internal_getopt; -p prints a form
+		-- that can be eval'd)
 		local sflag, pflag, badflag, pos = false, false, false, {}
-		for j = 2, #args do
+		local j = 2
+		while args[j] and args[j]:sub(1, 1) == "-" and #args[j] > 1 do
 			local a = args[j]
-			if a == "-S" then
-				sflag = true
-			elseif a == "-p" then
-				pflag = true -- print in a form that can be eval'd
-			elseif a:sub(1, 1) == "-" and #a > 1 then
-				for k = 2, #a do -- (combined flags; the first bad letter is reported)
-					local f = a:sub(k, k)
-					if f == "S" then
-						sflag = true
-					elseif f == "p" then
-						pflag = true
-					elseif not badflag then
-						badflag = "-" .. f
-					end
-				end
-			else
-				pos[#pos + 1] = a
+			j = j + 1
+			if a == "--" then
+				break
 			end
+			for k = 2, #a do -- (combined flags; the first bad letter is reported)
+				local f = a:sub(k, k)
+				if f == "S" then
+					sflag = true
+				elseif f == "p" then
+					pflag = true
+				elseif not badflag then
+					badflag = "-" .. f
+				end
+			end
+		end
+		for k = j, #args do
+			pos[#pos + 1] = args[k]
 		end
 		local cur = tonumber(C.umask(0)) % 512
 		C.umask(cur)
@@ -57,6 +59,9 @@ return function(sh, cmd, args, hook, tcb)
 				sh.status = 1
 			else
 				C.umask(m)
+				if sflag then -- (-S with a mode shows the new mask symbolically)
+					sh:echo(umask_symbolic(m))
+				end
 				sh.status = 0
 			end
 		end
