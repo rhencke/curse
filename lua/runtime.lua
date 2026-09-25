@@ -2520,6 +2520,7 @@ local CAPTURE_IMPURE = {
 	complete = 1, -- (completion specs, and compgen's hostname list / -F functions)
 	compopt = 1,
 	compgen = 1,
+	bind = 1, -- (readline's keymaps/variables: b_bind snapshots them per isolation context)
 }
 local function capture_pure(sh, st)
 	local t = st.t
@@ -3266,6 +3267,9 @@ function M.iso_restore_fds(ctx)
 	end
 end
 local function iso_undo(sh, ctx)
+	if ctx.rl then -- (readline's keymaps/variables a `bind` in it changed: b_bind's snapshot)
+		ctx.rl()
+	end
 	if ctx.traps then
 		local sv = ctx.traps
 		local o = sv.owner or sh
@@ -4142,15 +4146,12 @@ function M.job_delete(sh, j)
 end
 -- A dead job was reported (`wait ID`, a `jobs` listing): bash marks it notified but keeps
 -- it in the table — `jobs %N` still lists it (then it goes) — until cleanup_dead_jobs:
--- a plain `jobs` listing, the next fork or job, or (a script's reader loop) the end of
--- the top-level command. Only a subshell has no reader loop, so only there does the
--- job stay past this command.
+-- a plain `jobs` listing, the next fork or job, or the parser reading its next input line
+-- (parse.y shell_getc's notify_and_cleanup: a script's next top-level line, each line an
+-- eval / source / trap handler reads — the lgstart markers, run_group, b_eval, b_source).
+-- A function body or a multi-line compound is read whole first: no cleanup inside it.
 function M.job_waited(sh, j)
-	if sh.iso_ctx and sh.iso_ctx[1] then
-		j.waited, sh.jobs_waited = true, true
-	else
-		M.job_delete(sh, j)
-	end
+	j.waited, sh.jobs_waited = true, true
 end
 function M.jobs_cleanup_waited(sh)
 	sh.jobs_waited = nil
@@ -4463,6 +4464,7 @@ function Shell:stage_clone()
 		c.iso_vhard_base = next(vb) and vb or nil
 	end
 	c.foreign_pids = M.foreign_jobs(self) -- (`jobs` lists the parent's; `wait` can't wait on them)
+	c.job_cur, c.job_prev = self.job_cur, self.job_prev -- (the jobs themselves, not copies: `jobs` marks %+/%-)
 	local vars = {}
 	for k, b in pairs(self.vars) do
 		vars[k] = copybox(b)
@@ -4674,6 +4676,8 @@ local function co_launch(ctx, self, stage_fns, inproc, base, lastpipe, upv)
 			end
 			if kind == "sflat" or kind == "simple" then
 				sh.loopdepth = self.loopdepth -- (see stage_kind)
+			elseif kind == true and n > 1 then -- (a compound pipeline stage: without_job_control — only a `jobs`
+				sh.jobs, sh.job_cur, sh.job_prev = {}, nil, nil -- command sees the parent's, jobs_hack)
 			end
 			sh.out = make_out(t)
 			sh.xstage = kind == "sflat" or nil -- (its external is a process of this job: see rt.fg_ended)
