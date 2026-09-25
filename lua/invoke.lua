@@ -435,11 +435,13 @@ function M.start(sh, inv, istty)
 	if inv.posix then
 		set_opt(sh, "opt_posix", true)
 	end
+	sh.line_editing = not inv.noediting -- (bash's no_line_editing; -o emacs/vi turn it back on)
 	for _, s in ipairs(inv.sets) do
 		if s[1] ~= "opt_r" then
 			set_opt(sh, s[1], s[2])
 		end
 	end
+	local le0 = sh.line_editing
 	local restricted = inv.restricted or base == "rbash"
 	for _, s in ipairs(inv.sets) do
 		if s[1] == "opt_r" then
@@ -480,6 +482,12 @@ function M.start(sh, inv, istty)
 		if kind == "stdin" then
 			kind = "repl"
 		end
+		sh.shopt.expand_aliases = true -- (init_interactive: expand_aliases = interactive_shell)
+		-- (initialize_shell_variables: an interactive shell's MAILCHECK, an integer)
+		if sh.vars.MAILCHECK == nil then
+			sh:set_str("MAILCHECK", sh.opt_posix and "600" or "60")
+		end
+		sh.vars.MAILCHECK.int = true
 		if sh.vars.PS1 == nil then
 			sh:set_str("PS1", "\\s-\\v\\$ ")
 		end
@@ -491,6 +499,7 @@ function M.start(sh, inv, istty)
 			sh.histfile_default = true
 		end
 	else
+		sh.line_editing = nil -- (init_noninteractive)
 		for _, v in ipairs({ "PS1", "PS2" }) do -- (a non-interactive shell unbinds them)
 			if sh.vars[v] then
 				sh.vars[v] = nil
@@ -527,12 +536,12 @@ function M.start(sh, inv, istty)
 		end
 	end
 	if inv.lists then -- bare -o/+o/-O/+O (the -o listing shows the invocation defaults)
-		local em = sh.opt_emacs
+		local em = sh.line_editing
 		for _, l in ipairs(inv.lists) do
 			if l == "-o" or l == "+o" then
-				sh.opt_emacs = em == nil or em
+				sh.line_editing = le0 -- (listed before init_noninteractive)
 				require(rt.BUILTIN_LAZY.set)(sh, "set", { "set", l })
-				sh.opt_emacs = em
+				sh.line_editing = em
 			else
 				require(rt.BUILTIN_LAZY.shopt)(sh, "shopt", l == "" and { "shopt" } or { "shopt", l })
 			end

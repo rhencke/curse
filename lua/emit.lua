@@ -8702,7 +8702,7 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
 			local exitp = #cx.subexit > 0 and cx.subexit[#cx.subexit] or nil
 			local aw = st.words[cf_arg]
 			if not st.words[cf_arg + 1] then
-				local d = dbg(st) .. EF.xtwords(st.words, cx.lifted)
+				local d = dbg(st) .. EF.xtwords(st.words, cx.lifted) .. "rt.exit_note(sh); "
 				local statusexpr = aw
 						and word_safe(aw)
 						and ('rt.return_status(sh, %s, "exit"%s)'):format(emit_word(aw, cx.lifted), full_lit(aw) and "" or ", true")

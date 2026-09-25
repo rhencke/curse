@@ -60,11 +60,17 @@ local function set_opt(sh, field, on)
 			so.expand_aliases, so.shift_verbose = sh.opt_i and true or false, false
 		end
 	end
-	-- emacs and vi line-editing modes are mutually exclusive.
-	if on and field == "opt_emacs" then
-		sh.opt_vi = false
-	elseif on and field == "opt_vi" then
-		sh.opt_emacs = false
+	-- emacs and vi are readline's editing mode (sh.opt_vi) over bash's no_line_editing
+	-- (set_edit_mode): turning either on enables line editing; turning the CURRENT mode off
+	-- disables it
+	if field == "opt_emacs" or field == "opt_vi" then
+		local vimode = field == "opt_vi" and was == true or field == "opt_emacs" and sh.opt_vi == true
+		sh.opt_emacs = nil
+		if on then
+			sh.opt_vi, sh.line_editing = field == "opt_vi", true
+		elseif (field == "opt_vi") == vimode then
+			sh.opt_vi, sh.line_editing = vimode, false
+		end
 	end
 	-- if $SHELLOPTS is exported, keep the process env in sync so children inherit
 	-- the current option set (bash's cross-process `set -x` etc.).
@@ -5240,6 +5246,7 @@ local function exec_simple(sh, args, hook, no_func)
 		end
 		error({ __curse_return = rcode or rt.return_default(sh) })
 	elseif cmd == "exit" then
+		rt.exit_note(sh)
 		local ea = args[2] == "--" and 3 or 2
 		if args[ea] and not rt.legal_i64(args[ea]) then -- (get_exitstat: the number
 			io.stderr:write("curse: exit: " .. args[ea] .. ": numeric argument required\n")
@@ -7428,8 +7435,8 @@ M.fire_err_trap = fire_err_trap -- compiled tier fires ERR after a failing nativ
 -- A prompt string (PS1/PS2/… and ${x@P}): decode the backslash escapes, then (promptvars)
 -- expand it as if double-quoted — $var/$(…)/`…`, `\` escaping only $ ` " \ (bash's
 -- Q_DOUBLE_QUOTES; a bare `"` is literal, so the heredoc-style body parse).
-M.prompt_string = function(sh, s)
-	local decoded = sh:prompt_escapes(s or "")
+M.prompt_string = function(sh, s, isprompt)
+	local decoded = sh:prompt_escapes(s or "", isprompt)
 	if not decoded:find("[$`\\]") or not rt.prompt_expands(sh) then
 		return decoded
 	end
@@ -7690,8 +7697,60 @@ local function v_echo(sh, text, upto, st)
 end
 M.v_echo = v_echo
 
-local function run_history_lines(sh, text, line1, hook, k)
+-- One physical input line through history (bash's shell_getc → pre_process_line):
+-- a here-document body line is recorded as read; otherwise `!` expansion (echoing the
+-- result; a failed or `:p` expansion discards the line: nil) and recording. ST is the
+-- per-command recording state, HDQ the here-documents still open, MID whether this
+-- line continues a command. Shared by the script reader below and the REPL.
+function M.history_line(sh, st, hdq, line, mid, lno)
 	local H = require("hist")
+	if #hdq > 0 then -- a here-document body line: no expansion, kept as read
+		if H.enabled(sh) then
+			H.read_line(sh, st, line, true)
+		end
+		local d = hdq[1]
+		if (d.strip and (line:gsub("^\t+", "")) or line) == d.word then
+			table.remove(hdq, 1)
+		end
+		return line
+	end
+	local hx = H.expanding(sh) and H.chars(sh)
+	if hx and (line:find(hx, 1, true) or line:sub(1, 1) == select(2, H.chars(sh))) then
+		sh.cur_line = lno or sh.cur_line
+		-- (inside a multi-line command, `!!` is the command before it: the entry
+		-- this command is being recorded into is set aside while expanding)
+		local hl, held = H.list(sh), nil
+		if mid and st.first_saved then
+			held = table.remove(hl)
+		end
+		local code, out = H.expand(sh, line)
+		if held then
+			hl[#hl + 1] = held
+		end
+		if code < 0 then
+			io.stderr:write("curse: " .. out .. "\n")
+			return nil
+		elseif code == 2 then -- `:p`: print it and add it to the history, don't run it
+			io.stderr:write(out .. "\n")
+			if H.enabled(sh) and out ~= "" then
+				H.read_line(sh, st, out, false)
+			end
+			return nil
+		elseif code == 1 then
+			io.stderr:write(out .. "\n")
+			line = out
+		end
+	end
+	if line ~= "" and H.enabled(sh) then
+		H.read_line(sh, st, line, false)
+	end
+	for _, d in ipairs(heredoc_opens(line)) do
+		hdq[#hdq + 1] = d
+	end
+	return line
+end
+
+local function run_history_lines(sh, text, line1, hook, k)
 	local pos, lnum, n = 1, line1, #text
 	local buf, bufline, st, hdq = {}, line1, {}, {}
 	local function flush()
@@ -7724,55 +7783,11 @@ local function run_history_lines(sh, text, line1, hook, k)
 		if #buf == 0 then
 			st, bufline = {}, this
 		end
-		if #hdq > 0 then -- a here-document body line: no expansion, kept as read
-			if H.enabled(sh) then
-				H.read_line(sh, st, line, true)
-			end
+		line = M.history_line(sh, st, hdq, line, #buf > 0, this)
+		if line then
 			buf[#buf + 1] = line
-			local d = hdq[1]
-			if (d.strip and (line:gsub("^\t+", "")) or line) == d.word then
-				table.remove(hdq, 1)
-			end
 		else
-			local keep = true
-			local hx = H.expanding(sh) and H.chars(sh)
-			if hx and (line:find(hx, 1, true) or line:sub(1, 1) == select(2, H.chars(sh))) then
-				sh.cur_line = this
-				-- (inside a multi-line command, `!!` is the command before it: the entry
-				-- this command is being recorded into is set aside while expanding)
-				local hl, held = H.list(sh), nil
-				if #buf > 0 and st.first_saved then
-					held = table.remove(hl)
-				end
-				local code, out = H.expand(sh, line)
-				if held then
-					hl[#hl + 1] = held
-				end
-				if code < 0 then
-					io.stderr:write("curse: " .. out .. "\n")
-					keep = false
-					lnum = lnum - 1 -- (a discarded line isn't counted: bash's line numbers lag)
-				elseif code == 2 then -- `:p`: print it and add it to the history, don't run it
-					io.stderr:write(out .. "\n")
-					if H.enabled(sh) and out ~= "" then
-						H.read_line(sh, st, out, false)
-					end
-					keep = false
-					lnum = lnum - 1
-				elseif code == 1 then
-					io.stderr:write(out .. "\n")
-					line = out
-				end
-			end
-			if keep then
-				if line ~= "" and H.enabled(sh) then
-					H.read_line(sh, st, line, false)
-				end
-				buf[#buf + 1] = line
-				for _, d in ipairs(heredoc_opens(line)) do
-					hdq[#hdq + 1] = d
-				end
-			end
+			lnum = lnum - 1 -- (a discarded line isn't counted: bash's line numbers lag)
 		end
 		if #hdq == 0 and #buf > 0 and not needs_more(table.concat(buf, "\n")) then
 			flush()
@@ -7830,13 +7845,29 @@ end
 -- A parse error, runtime error, or div0/failglob is reported/absorbed and
 -- non-fatal (the REPL keeps going); only a real `exit` propagates. No EXIT trap
 -- (that's not run per-prompt), so this is NOT run_lazy/finish.
+-- An array PROMPT_COMMAND runs each non-empty element in index order, an associative one
+-- nothing (eval.c execute_prompt_command); $_ is put back after each (execute_variable_command).
 function M.run_prompt_command(sh, hook)
-	local pc = sh.vars.PROMPT_COMMAND and sh:get("PROMPT_COMMAND")
-	if not pc or pc == "" then
+	local b = sh.vars.PROMPT_COMMAND
+	if not b or b.assoc then
 		return
 	end
+	if b.arr then
+		for _, pc in ipairs(sh:array_values("PROMPT_COMMAND")) do
+			if pc ~= "" then
+				M.run_variable_command(sh, pc, hook)
+			end
+		end
+		return
+	end
+	local pc = sh:get("PROMPT_COMMAND")
+	if pc ~= "" then
+		M.run_variable_command(sh, pc, hook)
+	end
+end
+function M.run_variable_command(sh, pc, hook)
 	hook = hook or function() end
-	local saved = sh.status
+	local saved, under = sh.status, sh.vars._ and sh:get("_")
 	local ok, err = pcall(function()
 		local nextf = P.open(pc, sh)
 		while true do
@@ -7868,6 +7899,9 @@ function M.run_prompt_command(sh, hook)
 		error(err)
 	end -- a real `exit` in PROMPT_COMMAND
 	sh.status = saved
+	if under then
+		sh:set_str("_", under)
+	end
 end
 
 -- Does `buf` end with an obviously-unterminated construct (unbalanced quotes,

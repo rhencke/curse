@@ -19,6 +19,89 @@ local logical_canon = I.logical_canon
 
 local statbuf = I.statbuf
 
+-- lib/sh/spell.c (cdspell): spdist — 0 identical, 1 two characters transposed, 2 one
+-- character wrong, added or deleted, 3 otherwise
+local function spdist(cur, new)
+	local i = 1
+	while cur:byte(i) == new:byte(i) do
+		if i > #cur then
+			return 0
+		end
+		i = i + 1
+	end
+	cur, new = cur:sub(i), new:sub(i)
+	if cur ~= "" then
+		if new ~= "" then
+			if #cur > 1 and #new > 1 and cur:byte(1) == new:byte(2) and cur:byte(2) == new:byte(1)
+				and cur:sub(3) == new:sub(3) then
+				return 1
+			end
+			if cur:sub(2) == new:sub(2) then
+				return 2
+			end
+		end
+		if cur:sub(2) == new then
+			return 2
+		end
+	end
+	if new ~= "" and cur == new:sub(2) then
+		return 2
+	end
+	return 3
+end
+-- mindist: the entry of DIR nearest GUESS (a later one as near wins; never `.`)
+local function mindist(dir, guess)
+	local d = C.opendir(dir == "" and "." or dir)
+	if d == nil then
+		return 3
+	end
+	local dist, best = 3, nil
+	while true do
+		local e = C.readdir(d)
+		if e == nil then
+			break
+		end
+		local name = ffi.string(ffi.cast("const char *", e) + 19) -- d_name @ 19 (glibc x86-64)
+		local x = spdist(name, guess)
+		if x <= dist and x ~= 3 then
+			best, dist = name, x
+			if x == 0 then
+				break
+			end
+		end
+	end
+	C.closedir(d)
+	if best == "." then
+		dist = 3
+	end
+	return dist, best
+end
+-- spname/dirspell: correct each component of NAME, or nil when one is hopeless
+local function dirspell(name)
+	local out, i, n = {}, 1, #name
+	while true do
+		local s, e = name:find("^/+", i)
+		if s then
+			out[#out + 1] = name:sub(s, e)
+			i = e + 1
+		end
+		if i > n then
+			local new = table.concat(out)
+			if #name == 1 and #new == 1 and name ~= "." and new == "." then
+				return nil
+			end
+			return new
+		end
+		local e2 = (name:find("/", i, true) or (n + 1)) - 1
+		local dist, best = mindist(table.concat(out), name:sub(i, e2))
+		if dist >= 3 then
+			return nil
+		end
+		out[#out + 1] = best
+		i = e2 + 1
+	end
+end
+
 -- lib/sh/pathcanon.c's _path_isdir
 local function isdir(path)
 	return C.curse_stat(path, statbuf) == 0
@@ -260,6 +343,18 @@ return function(sh, cmd, args, hook, tcb, as)
 				if ok then
 					sh:echo(val)
 					sh.status = bindpwd(sh, eflag, cf)
+					return
+				end
+			end
+		end
+		-- cdspell (an interactive shell only): a directory a simple typo away
+		if sh.opt_i and sh.shopt.cdspell then
+			local g = dirspell(dir)
+			if g then
+				local gok, _, gcf = change_to(sh, g, nolinks)
+				if gok then
+					sh:echo(g)
+					sh.status = bindpwd(sh, eflag, gcf)
 					return
 				end
 			end
