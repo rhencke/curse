@@ -175,5 +175,18 @@ int main(int argc, char **argv, char **envp) {
         got += r;
     }
     close(fd);
-    return (got == want) ? (status & 0xff) : 127;
+    if (got != want)
+        return 127;
+    /* The script's shell was killed by a signal (bash: its EXIT trap ran, then it
+     * died by that signal): the worker lives on, so die by it here, as bash would. */
+    if (status & 0x10000) {
+        int sig = (status >> 8) & 0x7f;
+        sigset_t set;
+        signal(sig, SIG_DFL);
+        sigemptyset(&set);
+        sigaddset(&set, sig);
+        sigprocmask(SIG_UNBLOCK, &set, NULL);
+        kill(getpid(), sig);
+    }
+    return status & 0xff;
 }

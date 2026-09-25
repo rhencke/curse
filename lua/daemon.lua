@@ -263,6 +263,7 @@ local function serve_request(cfd, req, fds, ctx)
 		rt.sig_apply_mask(req.sigign)
 	end
 	rt.startup_ignored(sh, req.sigign)
+	rt.sig_setup(sh) -- (SIGQUIT ignored; the terminating signals caught: rt.termsig)
 	-- A Lua error escaping the run is a curse BUG: report it on the request's stderr
 	-- (status 1) instead of failing silently.
 	local ok = xpcall(function()
@@ -300,6 +301,12 @@ local function serve_request(cfd, req, fds, ctx)
 		end })
 		io.flush()
 	end
+	-- (killed by a signal — rt.termsig — the worker lives on: the client dies by it instead,
+	-- told by the 0x10000 bit and the signal in bits 8-14; the low byte stays 128+sig)
+	if sh.termsig then
+		status = 0x10000 + sh.termsig * 256 + 128 + sh.termsig
+	end
+	_G.__curse_sigrun = nil -- (a signal between requests belongs to no script)
 	local sbuf = ffi.new("int32_t[1]", status) -- finish_run maps to $?) becomes status 1
 	C.write(cfd, sbuf, 4)
 	C.close(cfd)

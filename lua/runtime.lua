@@ -1736,6 +1736,9 @@ function M.redir_restore(saves)
 			C.close(s.fd)
 		end
 	end
+	if M.jobnote then
+		M.jobnote_flush()
+	end
 end
 
 -- A FILE redirect whose target is EXPANDABLE (`> $f`, `< $dir/in`, `> *.glob`): the compiled
@@ -1802,6 +1805,7 @@ function M.cstr(s)
 	return z and s:sub(1, z - 1) or s
 end
 
+M.nspawn = 0 -- (real children spawned by Shell:exec: see the CHLD trap of a background job)
 -- Decode a waitpid status word into a bash exit code: 128+signum when killed by
 -- a signal, else the WEXITSTATUS byte. (Shared by Shell:exec, wait, subshell,
 -- pipeline.)
@@ -1811,6 +1815,106 @@ function M.wexit(s)
 		return 128 + sig
 	end
 	return bit.rshift(bit.band(s, 0xff00), 8)
+end
+
+-- The text of the command running now, as bash keeps it per process (make_command_string:
+-- words and redirections, deparsed): the compiled tier registers it per pc next to the
+-- pc -> line table (M.pcline's `tx`), the interpreter keeps the node in sh.cur_cmd. Cold
+-- path (a job report) only. Second result: the command has redirections of its own.
+function M.cmd_text(sh)
+	local getinfo, getlocal = debug.getinfo, debug.getlocal
+	for level = 2, 200 do
+		local info = getinfo(level, "f")
+		if not info then
+			break
+		end
+		local f = info.func
+		if M.INTERP_FRAMES[f] then
+			break
+		end
+		local t = M.PCLINE[f]
+		if t then
+			local _, pc = getlocal(level, 2)
+			return t.tx and t.tx[pc] or "", t.rx and t.rx[pc]
+		end
+	end
+	local c = sh.cur_cmd
+	if type(c) == "table" then
+		return require("deparse").command_text(c), c.redirs and #c.redirs > 0
+	end
+	return c or ""
+end
+-- notify_of_job_status (jobs.c) for a job that has ended: `procs` its processes
+-- { pid, st = raw wait status, text = command (a string, or a node to deparse) }, `s` the
+-- job's status word (its last process's, or pipefail's rightmost failure). A script
+-- reports a job killed by a signal other than INT (and TERM and PIPE: DONT_REPORT_*) that
+-- the shell doesn't trap as `NAME: line N: PID Desc  command`, every process listed; a
+-- FOREGROUND one killed by TERM or a trapped signal just by the signal's description.
+-- Nothing inside a $(…) (SUBSHELL_COMSUB). Returns true when a line was written. `defer`:
+-- the command's own redirections are still in place — the note waits for their undoing
+-- (M.jobnote_flush), as bash's parent writes it where they never applied.
+function M.job_notify(sh, procs, s, fg, defer)
+	local sig = bit.band(s, 0x7f)
+	if sig == 0 or sig == 0x7f or sig == 2 or sh.cap_jobs then
+		return false
+	end
+	local I = require("interp")._int
+	local function desc(st)
+		local g = bit.band(st, 0x7f)
+		if g == 0 then
+			local x = bit.rshift(bit.band(st, 0xff00), 8)
+			return x == 0 and "Done" or ("Exit " .. x)
+		end
+		return I.SIGDESC[g] or ("Signal " .. g)
+	end
+	local h = sh.traps and sh.traps["SIG" .. (I.NUMSIG[sig] or "")]
+	if sig ~= 15 and sig ~= 13 and not (h and h ~= "") then
+		local o, s1 = {}, nil
+		for k, p in ipairs(procs) do
+			local d, tx = desc(p.st), p.text
+			if type(tx) == "table" then
+				tx = require("deparse").command_text(tx)
+			end
+			local core = bit.band(p.st, 0x80) ~= 0 and bit.band(p.st, 0x7f) ~= 0 and "(core dumped) " or ""
+			if k == 1 then
+				s1 = p.st
+				o[1] = ("%5d %-24s%s%s\n"):format(p.pid, d, core, tx or "")
+			else
+				if p.st == s1 then -- (print_pipeline: a status the first shares isn't repeated)
+					d = ""
+				end
+				o[k] = ("     %5d %s%s%s| %s\n"):format(p.pid, d, (" "):rep(24 - (d == "" and 2 or #d)), core, tx or "")
+			end
+		end
+		M.jobnote = "curse: " .. table.concat(o)
+	elseif fg and sig ~= 13 then
+		M.jobnote = desc(s) .. (bit.band(s, 0x80) ~= 0 and " (core dumped)" or "") .. "\n"
+	else
+		return false
+	end
+	if not defer then
+		M.jobnote_flush()
+	end
+	return true
+end
+function M.jobnote_flush()
+	local n = M.jobnote
+	M.jobnote = nil
+	io.stderr:write(n)
+end
+-- A foreground external `pid` ended with wait status `s` (Shell:exec). A pipeline stage's
+-- own command is one process of the pipeline's job, which reports it (co_finish); any other
+-- is a job of its own, reported now if a signal killed it.
+function M.fg_ended(sh, pid, s)
+	if bit.band(s, 0x7f) == 2 then
+		sh.xsigint = true -- (a $(…) whose last command SIGINT killed: capture_inproc)
+	end
+	if sh.xstage then
+		sh.xproc = { pid = tonumber(pid), st = s }
+	elseif bit.band(s, 0x7f) ~= 0 then
+		local tx, rx = M.cmd_text(sh)
+		M.job_notify(sh, { { pid = tonumber(pid), st = s, text = tx } }, s, true, rx)
+	end
 end
 
 
@@ -2023,7 +2127,14 @@ function Shell:exec(...)
 	if self.shlvl_tail then
 		return M.exec_tail_lvl(self, ...)
 	end
-	local args = { ... }
+	return self:exec_t({ ... })
+end
+-- Shell:exec with the argv as a table (a long one — `cmd {1..70000}` — can't be unpacked
+-- into arguments: LuaJIT caps that)
+function Shell:exec_t(args)
+	if self.shlvl_tail then
+		return M.exec_tail_lvl(self, unpack(args))
+	end
 	local n = #args
 	if n == 0 then
 		self.status = 127
@@ -2044,6 +2155,14 @@ function Shell:exec(...)
 	end
 	if not args[1]:find("/", 1, true) then
 		execpath = self:resolve_cmd(args[1])
+		if not execpath and args[1]:byte(1) == 37 and not self.exec_builtin
+			and ((self.in_pipestage or 0) == 0 or self.bg_cd) then
+			-- `%job` as a command is `fg %job` (`bg` when async) — unless already forked, as a
+			-- pipeline stage is (execute_simple_command); without job control, just that
+			self:errmsg("curse: " .. (self.bg_cd and "bg" or "fg") .. ": no job control\n")
+			self.status = 1
+			return
+		end
 		if not execpath then
 			-- bash: a defined command_not_found_handle runs instead, in a separate execution
 			-- environment, with the command and its arguments; its status is the command's
@@ -2106,10 +2225,22 @@ function Shell:exec(...)
 		end
 		local pidp = ffi.new("curse_pid_t[1]")
 		local attr = child_spawnattr(self)
+		-- (an async job's command — not a function's — or one in an async subshell: with
+		-- SIGINT/SIGQUIT ignored, setup_async_signals)
+		local ist = self.iso_ctx
+		local hold = (self.bg_cd and self.bg_cd == self.calldepth)
+			or (ist and ist[1] and ist[#ist].igint and (ist[#ist].igint[2] or ist[#ist].igint[3]) and true)
+		if hold then
+			attr = async_spawn_hold(attr)
+		end
 		local fa = M.foreign_fa(self, nil)
 		M.rd_gen = M.rd_gen + 1 -- (a new process may read our input: see M.pipe_cache)
 		local cenv = M.child_env() -- (bash's order; kept alive across the call)
+		M.nspawn = M.nspawn + 1 -- (a real child: its death is a real SIGCHLD)
 		local rc = C.posix_spawnp(pidp, execpath, fa, attr, ffi.cast("char *const *", argv), cenv)
+		if hold then
+			async_spawn_release()
+		end
 		if fa then
 			C.posix_spawn_file_actions_destroy(fa)
 		end
@@ -2127,6 +2258,13 @@ function Shell:exec(...)
 		local st = ffi.new("int[1]")
 		M.wait_child(pidp[0], st, 0)
 		self.status = M.wexit(st[0])
+		if self.status > 128 or self.xstage then -- (killed by a signal: bash reports the job)
+			M.fg_ended(self, pidp[0], st[0])
+		end
+		if self.jobs and self.jobs[1] then -- (wait_for's notify_of_job_status: the others too)
+			M.jobs_poll(self)
+			M.jobs_notify(self)
+		end
 		return
 	end
 	local fds = ffi.new("int[2]")
@@ -2146,6 +2284,7 @@ function Shell:exec(...)
 	local attr = child_spawnattr(self)
 	M.rd_gen = M.rd_gen + 1 -- (a new process may read our input: see M.pipe_cache)
 	local cenv = M.child_env() -- (bash's order; kept alive across the call)
+	M.nspawn = M.nspawn + 1
 	local rc = C.posix_spawnp(pidp, execpath, fa, attr, ffi.cast("char *const *", argv), cenv)
 	if attr then
 		C.posix_spawnattr_destroy(attr)
@@ -2179,6 +2318,9 @@ function Shell:exec(...)
 	local st = ffi.new("int[1]")
 	M.wait_child(pid, st, 0)
 	self.status = M.wexit(st[0])
+	if self.status > 128 then
+		M.fg_ended(self, pid, st[0])
+	end
 	local out = table.concat(chunks)
 	if out ~= "" then
 		self.out(out)
@@ -2437,10 +2579,15 @@ function Shell:capture_inproc(backtick, runner, capfd, ctx)
 	local sv_xd, sv_depth = self.xdepth, self.subdepth
 	self.xdepth = (sv_xd or 0) + 1 -- xtrace: PS4's first char repeats per $(…) level
 	self.subdepth = (sv_depth or 0) + 1
-	local sv_cj = self.cap_jobs
-	self.cap_jobs = {}
+	local sv_cj, sv_xs = self.cap_jobs, self.xsigint
+	self.cap_jobs, self.xsigint = {}, nil
 	cap_enter()
 	local ok, err = pcall(runner, self)
+	-- killed by SIGINT (itself, or the external it ended with): the shell then sends
+	-- itself SIGINT (subst.c command_substitute) — its trap runs, or it dies
+	local sigint = (ok and self.status == 130 and self.xsigint)
+		or (not ok and type(err) == "table" and err.__curse_vsig == ctx and ctx and err.sig == 2)
+	self.xsigint = sv_xs
 	if #self.cap_jobs > 0 then
 		M.wait_groups(self.cap_jobs)
 	end
@@ -2509,6 +2656,9 @@ function Shell:capture_inproc(backtick, runner, capfd, ctx)
 	self.ncs = (self.ncs or 0) + 1 -- (substitutions performed: an assignment's status is the last one's)
 	-- bash strips NUL bytes from command-substitution output ("ignored null byte")
 	local r = M.cmdsub_nul(readcap()):gsub("\n+$", "")
+	if sigint then
+		C.kill(C.getpid(), 2)
+	end
 	flush_deferred(self)
 	return r
 end
@@ -2706,6 +2856,10 @@ iso_push = function(sh)
 	if not st then
 		st = {}
 		sh.iso_ctx = st
+	end
+	local up = st[#st]
+	if up and up.igint then -- (an async job's SIGINT/SIGQUIT SIG_IGN: its subshells inherit it)
+		ctx.igint = { [2] = up.igint[2], [3] = up.igint[3] }
 	end
 	st[#st + 1] = ctx
 	return ctx
@@ -2991,8 +3145,8 @@ end
 -- after `exec CMD`); `exit N` inside it sets the status. Returns the status.
 function M.iso_exit_trap(sh, ctx, status, err)
 	if not (ctx and ctx.traps) or (ctx.traps.owner or sh) ~= sh or M.exit_trap_inherited
-		or (type(err) == "table" and err.__curse_noexittrap) then
-		return status
+		or (type(err) == "table" and (err.__curse_noexittrap or (err.__curse_vsig and err.sig == 9))) then
+		return status -- (SIGKILL: nothing more runs)
 	end
 	local h = sh.traps and sh.traps.EXIT
 	if not h or h == "" or sh.in_exit_trap then
@@ -3019,7 +3173,11 @@ M.vpid_tasks = setmetatable({}, { __mode = "v" })
 function M.vkill(sh, pid, sig)
 	local ctx = M.vpid_ctx[pid]
 	local bt = (ctx and ctx.task) or M.vpid_tasks[pid]
-	if bt then -- a background job
+	if bt and bt == co_task() and ctx and sig ~= 0 and bt.sh and bt.sh.iso_ctx
+		and bt.sh.iso_ctx[#bt.sh.iso_ctx] == ctx then
+		M.iso_signal(bt.sh, ctx, sig) -- (the running job signals itself: taken at once)
+		return true
+	elseif bt then -- a background job
 		return M.task_kill(bt, sig)
 	end
 	local st = sh.iso_ctx
@@ -3055,7 +3213,7 @@ function M.iso_signal(sh, ctx, sig)
 		elseif ctx.traps then -- (the subshell's own trap; an inherited one reads as default)
 			disp = "trap"
 		end
-	elseif sig == 2 and ctx.igint then -- (an async job's, even once reset: its original)
+	elseif ctx.igint and ctx.igint[sig] then -- (an async job's SIG_IGN, until `trap -`)
 		disp = "ignore"
 	end
 	if disp == "ignore" or (disp == "default" and (SIG_DEFAULT_IGNORE[sig] or SIG_STOP[sig])) then
@@ -3068,6 +3226,82 @@ function M.iso_signal(sh, ctx, sig)
 end
 -- A forked subshell child ends: run an EXIT trap the SUBSHELL set (never the inherited
 -- parent one), with $? = its status, then _exit.
+-- ---- terminating signals (sig.c) --------------------------------------------------
+-- The signals that end a shell (terminating_signals; not VTALRM/PROF — curse's own
+-- preemption tick). A shell with an EXIT trap CATCHES the untrapped ones
+-- (initialize_terminating_signals): termsig_handler runs the EXIT trap, then the shell
+-- dies by the signal. A daemon worker catches them always — the worker must survive; the
+-- request's client dies by the signal instead (M.termsig). SIGQUIT the shell ignores
+-- (initialize_shell_signals) — caught, not SIG_IGN, so the commands it runs get the
+-- default back at exec, as bash's children do.
+M.TERMSIG = { [1] = true, [2] = true, [4] = true, [5] = true, [6] = true, [7] = true, [8] = true,
+	[10] = true, [11] = true, [12] = true, [13] = true, [14] = true, [15] = true, [24] = true,
+	[25] = true, [31] = true }
+-- the disposition of an untrapped signal `num` (trap - SIG, or at startup)
+function M.sig_untrapped(sh, num)
+	local x = sh.traps and sh.traps.EXIT
+	if num == 3 or (M.TERMSIG[num] and (M.daemon_worker or x)) then
+		C.curse_sig_catch(num)
+		if not _G.__curse_sigrun then
+			_G.__curse_sigrun = function(s)
+				require("interp").run_signal(sh, s)
+			end
+		end
+	else
+		C.curse_sig_default(num)
+	end
+end
+-- A new shell's dispositions (run.lua, a daemon request): SIGQUIT ignored, a daemon
+-- worker's terminating signals caught — none a signal ignored at entry. (A direct run's
+-- SIGINT is luajit's `interrupted!` hook until now: the default.)
+function M.sig_setup(sh)
+	local ign = sh.sig_ign_start or {}
+	local NUMSIG = require("interp")._int.NUMSIG
+	_G.__curse_sigrun = function(s)
+		require("interp").run_signal(sh, s)
+	end
+	for n = 1, 31 do
+		if (n == 3 or n == 2 or (M.daemon_worker and M.TERMSIG[n])) and not ign["SIG" .. NUMSIG[n]] then
+			M.sig_untrapped(sh, n)
+		end
+	end
+end
+-- `trap … EXIT` set (on) or reset: the untrapped terminating signals follow.
+function M.sig_exit_trap(sh)
+	local NUMSIG = require("interp")._int.NUMSIG
+	for n in pairs(M.TERMSIG) do
+		local canon = "SIG" .. NUMSIG[n]
+		if not (sh.sigtraps and sh.sigtraps[canon]) and not (sh.sig_ign_start and sh.sig_ign_start[canon]) then
+			M.sig_untrapped(sh, n)
+		end
+	end
+end
+-- An untrapped terminating signal arrived (interp.run_signal): the EXIT trap, then death by
+-- it. A daemon worker unwinds the request instead (__curse_exit, sh.termsig: the client
+-- kills itself with the signal); SIGQUIT does nothing.
+function M.termsig(sh, sig)
+	if sig == 3 or not M.TERMSIG[sig] then
+		return
+	end
+	if not sh.termsig then
+		sh.termsig = sig
+		pcall(require("interp").run_exit_trap, sh)
+		pcall(io.flush)
+	else -- (another one while the EXIT trap runs: kill_shell at once)
+		sig = sh.termsig
+	end
+	if M.daemon_worker then
+		pcall(C.curse_sig_clearpending) -- (a signal the EXIT trap's own writes raised)
+		error({ __curse_exit = 128 + sig, __curse_termsig = sig, __curse_noexittrap = true }, 0)
+	end
+	C.curse_sig_default(sig)
+	local set = ffi.new("uint8_t[128]")
+	C.sigemptyset(set)
+	C.curse_co_sigaddset(set, sig)
+	C.sigprocmask(1, set, nil) -- SIG_UNBLOCK
+	C.kill(C.getpid(), sig)
+	C._exit(128 + sig)
+end
 -- Signals IGNORED when the shell starts can't be trapped or reset (bash), and `trap` lists
 -- them as `trap -- '' SIGx`. `mask` (bit n-1 = signal n) comes from the daemon client (the
 -- caller's dispositions, which a resident worker doesn't share); without it, read this
@@ -3222,13 +3456,22 @@ function Shell:subshell_run(runner, saves, paren)
 	self.loopdepth = 0
 	local sv_depth, sv_jobs, sv_cur, sv_prev = self.subdepth, self.jobs, self.job_cur, self.job_prev
 	self.subdepth = (sv_depth or 0) + 1
-	self.jobs = {} -- (a subshell has no jobs of the parent's; its own are numbered from 1)
+	-- (a subshell has no jobs of the parent's — nor its remembered pids, bgp_clear: `wait`
+	-- says they're not its children; its own are numbered from 1)
+	local sv_bgpc = self.bgp_cleared
+	if sv_jobs and sv_jobs[1] then
+		self.bgp_cleared = M.foreign_jobs(self)
+		for pid in pairs(sv_bgpc or {}) do
+			self.bgp_cleared[pid] = true
+		end
+	end
+	self.jobs = {}
 	self.job_cur, self.job_prev = nil, nil
 
 	local ctx = iso_push(self)
 	local ok, err = pcall(runner, self)
 	local status = self.status
-	local rethrow
+	local rethrow, killed
 	if not ok then
 		if type(err) == "table" and err.__curse_badusage and paren and not self.opt_e then
 			status = 2 -- (a failed ${x:=w} discards the `( )` child's line: EX_BADUSAGE; a $(…) says 1)
@@ -3238,11 +3481,7 @@ function Shell:subshell_run(runner, saves, paren)
 			status = 1
 		elseif type(err) == "table" and err.__curse_vsig == ctx then
 			status = 128 + err.sig -- killed: reported as bash reports a dead foreground child
-			local I = package.loaded.interp
-			local d = err.sig ~= 2 and err.sig ~= 13 and I and I._int.SIGDESC[err.sig]
-			if d then
-				io.stderr:write(d .. "\n")
-			end
+			killed = err.sig -- (once its EXIT trap has run — termsig_handler — and it is gone)
 		else
 			rethrow = err
 		end
@@ -3257,6 +3496,7 @@ function Shell:subshell_run(runner, saves, paren)
 		end
 	end
 	self.jobs, self.job_cur, self.job_prev = sv_jobs, sv_cur, sv_prev
+	self.bgp_cleared = sv_bgpc
 	if C.getpid() ~= ctx.pid then
 		-- a process forked deeper inside (a nested subshell's child) unwound out to here:
 		-- it ends now, never resuming the script as a copy of the shell
@@ -3271,6 +3511,15 @@ function Shell:subshell_run(runner, saves, paren)
 	self.paren_sp = sv_psp
 	self.subdepth = sv_depth
 	sub_restore(self, cp)
+	if killed then -- the parent's report of its child that a signal killed (a `( … )`: its text)
+		if not ctx.vpid then
+			ctx.vpid = M.alloc_vpid()
+		end
+		local tx = type(paren) ~= "boolean" and paren or ""
+		-- (an interpreted `( … ) >f`: written once interp's restore_redirs has undone >f)
+		M.job_notify(self, { { pid = ctx.vpid, st = killed, text = tx } }, killed, true,
+			type(paren) == "table" and paren.redirs and #paren.redirs > 0)
+	end
 	if rethrow then error(rethrow) end
 	self.status = status
 end
@@ -3690,6 +3939,67 @@ function M.job_delete(sh, j)
 		end
 	end
 end
+-- SIGCHLD's reaping (jobs.c waitchld), done where the shell would have noticed: each real
+-- background child that has ended is reaped and its job marked done; an in-process job
+-- (j.g) is done once its task group is. A simple in-process job's external carries the
+-- wait status (its signal: t.sh.xproc).
+function M.jobs_poll(sh)
+	local sb
+	for _, j in ipairs(sh.jobs or {}) do
+		if not j.done and not j.gone and j.pid then
+			if j.g then
+				if j.g.done then
+					M.job_done_g(sh, j)
+				end
+			elseif j.pid > 0 and not (sh.foreign_pids and sh.foreign_pids[j.pid]) then
+				sb = sb or ffi.new("int[1]")
+				if C.waitpid(j.pid, sb, 1) == j.pid then -- WNOHANG
+					j.done, j.status = true, M.wexit(sb[0])
+					local s = bit.band(sb[0], 0x7f)
+					if s ~= 0 and s ~= 0x7f then
+						j.sig = s
+					end
+					if sh.coprocs then
+						M.coproc_dispose(sh, j.pid)
+					end
+				end
+			end
+		end
+	end
+end
+-- An in-process job's group has ended: its status, and the signal that ended it — the
+-- default action of one sent to it, or its external's death (a simple `cmd &`).
+function M.job_done_g(sh, j)
+	local g = j.g
+	local st = g.status[1] or 0
+	j.done, j.status = true, st
+	if st > 128 then
+		local t = g.tasks and g.tasks[1]
+		local xp = t and t.sh and t.sh.xproc
+		if g.killed then
+			j.sig = st - 128
+		elseif xp and bit.band(xp.st, 0x7f) ~= 0 and M.wexit(xp.st) == st then
+			j.sig, j.core = st - 128, bit.band(xp.st, 0x80) ~= 0 or nil
+		end
+	end
+	if sh.coprocs then
+		M.coproc_dispose(sh, j.pid)
+	end
+end
+-- notify_of_job_status for the background jobs (a script: only the ones a signal killed —
+-- reported, unless it was INT/TERM/PIPE or one the shell traps, and deleted from the table;
+-- `wait PID` still answers for them). `only`: just that job (the one `wait` waited for).
+function M.jobs_notify(sh, only)
+	for _, j in ipairs(sh.jobs or {}) do
+		if j.done and j.sig and not j.gone and not j.notified and (not only or j == only) then
+			j.notified = true
+			M.job_notify(sh, { { pid = j.pid, st = j.sig + (j.core and 0x80 or 0), text = j.cmd } }, j.sig, false)
+			if not only then
+				M.job_delete(sh, j)
+			end
+		end
+	end
+end
 -- Register a background job (for `jobs`/`wait %spec`/`wait -n`) and set $!: the slot after
 -- the highest one in use, and it becomes the current job.
 function M.job_add(sh, pid, cmdstr)
@@ -3870,6 +4180,10 @@ task_flush = function(t)
 			if e == 32 then -- EPIPE
 				C.curse_co_sigtimedwait(_co_sigpipe, nil, _co_zero_ts)
 				t.flushing = false
+				if t.sh and t.sh.traps and t.sh.traps.SIGPIPE == "" then
+					t.werr = "Broken pipe" -- (SIGPIPE ignored: a write error, M.chkwrite reports it)
+					return
+				end
 				error({ __curse_sigpipe = true })
 			elseif e ~= 4 and e ~= 11 then -- not EINTR/EAGAIN: drop (like a failed io.write)
 				break
@@ -3996,7 +4310,8 @@ end
 -- task starts from a copy of it; stage i's fd 0/1 are rewired to the stage pipes.
 local function co_launch(ctx, self, stage_fns, inproc, base, lastpipe, upv)
 	local n = #stage_fns
-	local g = { n = n, alive = 0, status = {}, base = base, upv = upv }
+	local g = { n = n, alive = 0, status = {}, base = base, upv = upv, texts = self.pl_texts, tasks = {} }
+	self.pl_texts = nil
 	local ins, outs = { base.fd[0] }, {}
 	local pst = ffi.new("int[2]")
 	local made = {}
@@ -4063,7 +4378,7 @@ local function co_launch(ctx, self, stage_fns, inproc, base, lastpipe, upv)
 				-- (execute_in_subshell's setup_async_signals), which `trap` then lists
 				if not (g.simple or g.pipe or sh.opt_m) then
 					M.iso_save_traps(sh)
-					sh.traps.SIGINT, ctx.igint = "", true
+					sh.traps.SIGINT, ctx.igint = "", { [2] = true, [3] = true }
 				end
 			end
 			sh.badassign = nil
@@ -4137,7 +4452,9 @@ local function co_launch(ctx, self, stage_fns, inproc, base, lastpipe, upv)
 				sh.loopdepth = self.loopdepth -- (see stage_kind)
 			end
 			sh.out = make_out(t)
+			sh.xstage = kind == "sflat" or nil -- (its external is a process of this job: see rt.fg_ended)
 			t.sh = sh
+			g.tasks[i] = t
 			t.simple = kind == "sflat"
 			add(t, stage_body(fn, sh, t))
 		end
@@ -4293,6 +4610,12 @@ local function co_resume(ctx, t)
 			if g.on_done then -- (a coproc: disposed as it dies — bash's SIGCHLD reaping)
 				pcall(g.on_done, g)
 			end
+			-- (a forked job's death is a SIGCHLD: its CHLD trap runs — here, unless a real
+			-- child it ran already sent one)
+			local ow = g.launcher
+			if ow and ow.sigtraps and ow.sigtraps.SIGCHLD and ow.traps.SIGCHLD ~= "" and M.nspawn == g.nspawn0 then
+				C.kill(C.getpid(), 17)
+			end
 		end
 		if g.alive == 0 and g.waiter then -- a stage waiting on this nested pipeline
 			ctx.runnable[#ctx.runnable + 1] = g.waiter
@@ -4350,6 +4673,41 @@ local function co_finish(ctx, self, g)
 	self:array_assign("PIPESTATUS", pstat, false)
 	self.status = self.opt_pipefail and pipe or last
 	self.last_stage_status = last -- (the ERR quirk for a failing `( … )` last stage)
+	if self.status > 128 and g.texts and not g.bg then
+		M.pipeline_notify(self, g)
+	end
+end
+-- A foreground pipeline ended with a signal's status: its job's report (M.job_notify), one
+-- process per stage — a stage's own external (its pid and wait status), else the in-process
+-- stage itself (a virtual pid, its exit status).
+function M.pipeline_notify(sh, g)
+	local procs = {}
+	for k = 1, g.n do
+		local t = g.tasks[k]
+		local est = g.status[k] or 0
+		local xp = t and t.sh and t.sh.xproc
+		local p
+		if xp and M.wexit(xp.st) == est then
+			p = { pid = xp.pid, st = xp.st }
+		else
+			if t and t.sh and not t.sh.vpid then
+				t.sh.vpid = M.alloc_vpid()
+			end
+			p = { pid = t and t.sh and t.sh.vpid or 0, st = bit.lshift(bit.band(est, 0xff), 8) }
+		end
+		p.text = g.texts[k]
+		procs[k] = p
+	end
+	local js = procs[g.n].st -- (the job's status: the last one's, or pipefail's rightmost failure)
+	if sh.opt_pipefail then
+		for k = g.n, 1, -1 do
+			if (g.status[k] or 0) ~= 0 then
+				js = procs[k].st
+				break
+			end
+		end
+	end
+	M.job_notify(sh, procs, js, true)
 end
 
 -- The shell leaves the scheduler: its snapshot's fd copies go; with no task left alive the
@@ -4791,7 +5149,7 @@ function Shell:bg_launch(fn, cmdstr, flat, simple, upv_get, upv_set, opts)
 		end
 		return nil
 	end
-	g.bg, g.vpid, g.simple = true, vpid, simple
+	g.bg, g.vpid, g.simple, g.launcher, g.nspawn0 = true, vpid, simple, self, M.nspawn
 	for _, t in pairs(ctx.bycoro) do
 		if t.g == g then
 			M.vpid_tasks[vpid] = t -- (`kill $!` before it has even run)
@@ -4805,6 +5163,8 @@ function Shell:bg_launch(fn, cmdstr, flat, simple, upv_get, upv_set, opts)
 			t.sh.loopdepth = g.simple and self.loopdepth or 0 -- (a simple job keeps it: stage_kind)
 			if g.simple then -- (bash execs a `cmd &` job's external in place: rt.exec_tail_lvl)
 				t.sh.shlvl_tail = t.sh.pd
+				t.sh.xstage = true -- (its external is the job's process: reported as the job)
+				t.sh.bg_cd = t.sh.calldepth -- (…run with SIGINT/SIGQUIT ignored: Shell:exec)
 			end
 			if bufcap then -- inside a buffered $(…): its output is the substitution's too
 				t.sh.out, t.sh.capturing = self.out, true
@@ -4898,7 +5258,8 @@ local run_pipeline_body
 -- function, an eval, a subshell (bash adds CMD_IGNORE_RETURN, like a condition) — so run
 -- it with noerr raised, restored on unwind. (With errexit OFF bash doesn't: a `set -e`
 -- inside a called function then takes effect.)
-function Shell:run_pipeline(stage_fns, negate, inproc, upv_get, upv_set)
+function Shell:run_pipeline(stage_fns, negate, inproc, upv_get, upv_set, texts)
+	self.pl_texts = texts -- (the stages' command texts, for a job report: co_launch takes them)
 	if not (negate and self.opt_e) then
 		return run_pipeline_body(self, stage_fns, negate, inproc, upv_get, upv_set)
 	end
@@ -11356,6 +11717,13 @@ function Shell:echo(...)
 			werr, self.write_err, self.write_errmsg = true, true, m
 			M.clear_stdout_err()
 		end
+	elseif self.traps.SIGPIPE == "" and CO_OUTS[self.out] then -- (a stage's EPIPE: M.chkwrite)
+		local t = CO_OUTS[self.out]
+		task_flush(t)
+		if t.werr then
+			werr, self.write_err, self.write_errmsg = true, true, t.werr
+			t.werr = nil
+		end
 	end
 	self.status = werr and 1 or 0 -- a write error is status 1, like bash's sh_chkwrite
 end
@@ -11381,7 +11749,7 @@ end
 function Shell:echo_cmd(...)
 	self.write_err = nil
 	self:echo(...)
-	if self.write_err and self.out == io.write then
+	if self.write_err and (self.out == io.write or CO_OUTS[self.out]) then
 		M.chkwrite_report(self, "echo", self.write_errmsg)
 	end
 end
@@ -11395,6 +11763,16 @@ end
 -- reported as `NAME: write error: REASON` and flagged (the command's status becomes 1).
 -- Returns true when the write went through.
 function M.chkwrite(sh, name)
+	local t = sh.out ~= io.write and CO_OUTS[sh.out]
+	if t then -- (a pipeline stage's buffered output, with SIGPIPE ignored: M.chkwrite_stage)
+		task_flush(t)
+		local w = t.werr
+		t.werr = nil
+		if w then
+			M.chkwrite_report(sh, name, w)
+		end
+		return not w
+	end
 	local ok, m = io.flush()
 	if ok then
 		return true
@@ -11418,6 +11796,10 @@ end
 function M.chkwrite_report(sh, name, m)
 	sh.write_err, sh.write_errmsg = true, nil -- (reported: chkwrite_late's cue)
 	local why = (m or ""):match(":%s*([^:]+)$") or m or "Bad file descriptor"
+	if why == "Broken pipe" and not (sh.traps and sh.traps.SIGPIPE) and not CO_OUTS[sh.out]
+		and (M.daemon_worker or sh.termsig or (sh.traps and sh.traps.EXIT)) then
+		M.termsig(sh, 13) -- (the SIGPIPE, caught: bash's handler ends the shell before this)
+	end
 	io.stderr:write("curse: " .. name .. ": write error: " .. why .. "\n")
 end
 

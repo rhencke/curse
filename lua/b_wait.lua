@@ -2,6 +2,7 @@
 -- module -- no grab bags -- so a script loads only the builtin it uses. Internals
 -- aliased to interp's names so the branch body is a verbatim copy.
 local ffi = require("ffi")
+local bit = require("bit")
 local rt = require("runtime")
 local M = require("interp")
 local I = M._int
@@ -30,13 +31,10 @@ local function wait_any(stbuf)
 	end
 end
 
--- a waited job that a signal killed: bash's `PID Desc  command` line (not for the
--- signals a script expects to end things: INT, PIPE, TERM)
-local function report(j)
-	local d = j.sig and j.sig ~= 2 and j.sig ~= 13 and j.sig ~= 15 and SIGDESC[j.sig]
-	if d then
-		io.stderr:write("curse: " .. j.pid .. " " .. ("%-24s"):format(d) .. (j.cmd or "") .. "\n")
-	end
+-- a waited job that a signal killed: bash's `PID Desc  command` line (rt.jobs_notify: not
+-- for the signals a script expects to end things — INT, PIPE, TERM — nor a trapped one)
+local function report(sh, j)
+	rt.jobs_notify(sh, j)
 end
 
 -- The first of `jobs` to end (nil if none can, or a trapped signal came): in-process jobs
@@ -95,6 +93,8 @@ local function wait_first(sh, jobs, stbuf)
 				for _, j in ipairs(sh.jobs) do
 					if j.pid == r then
 						j.done, j.status = true, est
+						local sg = bit.band(stbuf[0], 0x7f)
+						j.sig = sg ~= 0 and sg ~= 0x7f and sg or nil
 						if sh.coprocs then
 							rt.coproc_dispose(sh, r)
 						end
@@ -286,12 +286,21 @@ wait_builtin = function(sh, cmd, args, hook, tcb)
 						end
 					end
 					waited = pid
-					if found then
+					if found and found.forgot then -- (posix mode: a waited pid leaves bgpids too)
+						io.stderr:write("curse: wait: pid " .. pid .. " is not a child of this shell\n")
+						last, waited = 127, nil
+					elseif found then
 						last = job_reap(sh, found) or 127
 						if found.done then
-							report(found)
+							report(sh, found)
 							rt.job_delete(sh, found)
+							found.forgot = sh.opt_posix or nil
 						end
+					elseif sh.disowned and sh.disowned[pid] then
+						last = sh.disowned[pid]
+					elseif sh.bgp_cleared and sh.bgp_cleared[pid] then -- (a `( … )`'s parent's: bgp_clear)
+						io.stderr:write("curse: wait: pid " .. pid .. " is not a child of this shell\n")
+						last, waited = 127, nil
 					elseif rt.vpid_tasks[pid] and rt.vpid_tasks[pid].g.bg then -- (a disowned in-process job)
 						local g = rt.vpid_tasks[pid].g
 						rt.wait_groups({ g }, sh)
@@ -317,7 +326,7 @@ wait_builtin = function(sh, cmd, args, hook, tcb)
 					else
 						last, waited = job_reap(sh, j) or 127, j.pid
 						if j.done then
-							report(j)
+							report(sh, j)
 							rt.job_delete(sh, j)
 						end
 					end
@@ -334,7 +343,7 @@ wait_builtin = function(sh, cmd, args, hook, tcb)
 			for _, j in ipairs(table_jobs(sh)) do
 				if not j.done then
 					job_reap(sh, j)
-					report(j)
+					report(sh, j)
 				end
 				if sh.wait_sig then
 					break

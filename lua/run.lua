@@ -84,6 +84,7 @@ end
 local sh = rt.Shell.new()
 rt.shlvl_start(sh) -- (a new shell: $SHLVL + 1, exported)
 rt.startup_ignored(sh) -- signals ignored at entry stay ignored (untrappable)
+rt.sig_setup(sh) -- (SIGQUIT ignored; SIGINT's default, not luajit's `interrupted!`)
 local kind, src = Invoke.start(sh, inv)
 if kind == "exit" then
 	finish(sh)
