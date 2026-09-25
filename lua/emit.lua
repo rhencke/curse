@@ -992,7 +992,7 @@ end
 -- A word that a compiled command can use directly: emit_word-able AND with no
 -- unquoted expansion (would word-split) or unquoted glob char (would path-expand)
 -- — those need the interpreter's field engine, so the command is delegated.
-local function word_safe(w)
+local function word_safe(w, arith_ok)
 	if not emitable_word(w) then
 		return false
 	end -- pexp / side-effecting arith
@@ -1004,12 +1004,22 @@ local function word_safe(w)
 			if p.var or p.param or p.special or p.cmdsub or p.pexp then
 				return false
 			end -- unquoted -> splits
+			if (p.arith or p.arithast) and not (arith_ok or EF.arith_ok) then
+				return false
+			end -- a $((…)) result splits too when $IFS holds a digit or '-' (see arith_guard)
 			if p.lit and (p.lit:find("[*?%[]") or p.lit:find("[@!+?*]%(")) then
 				return false
 			end -- unquoted glob / extglob
 		end
 	end
 	return true
+end
+
+-- word_safe but for an unquoted $((…)) part: its value is digits and '-', one field unless
+-- $IFS holds one of those (`IFS=1; echo $((10+1))` -> "" ""). emit_fields_into renders it
+-- as the single value behind a runtime rt.ifs_num test, else the segment field engine.
+local function arith_guard(w)
+	return not word_safe(w) and word_safe(w, true)
 end
 
 -- How a NON-lifted arith var read is emitted. Default `sh:aget` parses the value's
@@ -2635,9 +2645,26 @@ local function emit_fields_into(tbl, w, lifted, wrap)
 	local function W(x)
 		return wrap and wrap:format(x) or x
 	end
+	if arith_guard(w) then -- (one field unless $IFS holds a digit or '-': see arith_guard)
+		local segs = {}
+		for i, p in ipairs(w.parts) do
+			local ar = (p.arith or p.arithast) and not p.q
+			segs[i] = ("{s=%s,split=%s,unq=%s}"):format(
+				p.lit ~= nil and emit_scalar_val(p, i, lifted, not p.q, w) or emit_word({ parts = { p } }, lifted),
+				tostring(ar and true or false),
+				tostring(not p.q)
+			)
+		end
+		return ("if rt.ifs_num(sh) then local __f = rt.expand_fields(sh, {%s}); for __i=1,#__f do %s[#%s+1]=%s end else %s[#%s+1] = %s end"):format(
+			table.concat(segs, ", "), tbl, tbl, W("__f[__i]"), tbl, tbl, W(emit_word(w, lifted)))
+	end
 	local fw = not word_safe(w) and field_word(w, lifted)
-	if word_safe(w) or (fw and fw.scalar) then -- one field, no runtime split/glob
-		return ("%s[#%s+1] = %s"):format(tbl, tbl, W(word_safe(w) and emit_word(w, lifted) or fw.expr))
+	if fw and fw.scalar then -- a lone $((…)) / lifted int: one numeric field unless $IFS holds a digit or '-'
+		return ("do local v_ = %s; if rt.ifs_num(sh) then local __f = rt.field_split(sh, v_, true); for __i=1,#__f do %s[#%s+1]=%s end else %s[#%s+1] = %s end end"):format(
+			fw.expr, tbl, tbl, W("__f[__i]"), tbl, tbl, W("v_"))
+	end
+	if word_safe(w) then -- one field, no runtime split/glob
+		return ("%s[#%s+1] = %s"):format(tbl, tbl, W(emit_word(w, lifted)))
 	end
 	if fw then
 		return ("do local __f = rt.field_split(sh, %s, %s); for __i=1,#__f do %s[#%s+1]=%s end end"):format(
@@ -2765,6 +2792,7 @@ end
 -- without taking a fresh upvalue — flatten_stmt is at the 60-upvalue cap (as with cur_line /
 -- emit_regex_glob). Ordinary callers keep using the local seg_native directly.
 EF.seg_native = seg_native
+EF.arith_guard = arith_guard
 -- Render a case-clause pattern to a Lua EXPRESSION for its glob-form, quote-aware exactly
 -- like interp's expand_pattern/expand_escaped: a QUOTED part's glob metachars are
 -- backslash-escaped (literal match), an UNQUOTED expansion's metachars stay active. A
@@ -2933,7 +2961,7 @@ local function arrayassign_ok(st, lifted, allow_nameref)
 			if e.op ~= "=" then
 				return false
 			end
-			if not (word_safe(e.word) or field_word(e.word, lifted) or seg_native(e.word, lifted)) then
+			if not (word_safe(e.word) or arith_guard(e.word) or field_word(e.word, lifted) or seg_native(e.word, lifted)) then
 				return false
 			end
 		end
@@ -2965,7 +2993,7 @@ local function field_argv(words, from, lifted, wrap, prefix)
 		if lit and lit ~= "" then -- (a plain unquoted literal — `{1..70000}`'s words: as is)
 			run[#run + 1] = ("%q"):format(lit)
 		elseif not empty_word(w) then -- an empty brace alternative ({X,,Y,}) adds no arg
-			if not word_safe(w) and not field_word(w, lifted) and not mixed_expandable(w, lifted) then
+			if not word_safe(w) and not arith_guard(w) and not field_word(w, lifted) and not mixed_expandable(w, lifted) then
 				return nil
 			end
 			local code = emit_fields_into("__a", w, lifted, wrap)
@@ -4474,7 +4502,34 @@ end
 -- still static (rt.names_static) -> the compiled code; else the interpreter's live dispatch.
 local simple_compiled
 H.simple = function(cx, st, after)
-	local p = simple_compiled(cx, st, after)
+	local ua = false -- a word with an unquoted $((…)), else one field (arith_guard)
+	for _, w in ipairs(st.words or {}) do
+		if arith_guard(w) then
+			ua = true
+			break
+		end
+	end
+	local p
+	if ua then
+		-- compile it twice: the split-aware shape, and (EF.arith_ok) the fast one taking each
+		-- $((…)) as one field — picked at run time by whether $IFS holds a digit or '-'
+		local slow = simple_compiled(cx, st, after)
+		EF.arith_ok = true
+		local ok, fast = pcall(simple_compiled, cx, st, after)
+		EF.arith_ok = nil
+		if not ok then
+			error(fast, 0)
+		end
+		if type(cx.blocks[fast]) == "string" then -- (the test heads the fast entry block: no extra pc hop)
+			p = fast
+			cx.blocks[p] = ("if rt.ifs_num(sh) then pc = %d else %s end"):format(slow, cx.blocks[p])
+		else
+			p = cx.newpc()
+			cx.blocks[p] = ("if rt.ifs_num(sh) then pc = %d else pc = %d end"):format(slow, fast)
+		end
+	else
+		p = simple_compiled(cx, st, after)
+	end
 	local w1 = EF.has_dyncode and st.words and st.words[1]
 	local c = w1 and w1.parts and #w1.parts == 1 and w1.parts[1].lit
 	if not c then
@@ -5815,7 +5870,7 @@ H.forin = function(cx, st, after)
 				return cx.delegate(st, after)
 			end
 		end
-		if not word_safe(w) and not field_word(w, cx.lifted) and not EF.seg_native(w, cx.lifted) then
+		if not word_safe(w) and not EF.arith_guard(w) and not field_word(w, cx.lifted) and not EF.seg_native(w, cx.lifted) then
 			return cx.delegate(st, after)
 		end
 	end

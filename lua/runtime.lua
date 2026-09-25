@@ -8624,6 +8624,14 @@ function M.ifs(sh)
 	end
 	return nil
 end
+function M.ifs_num(sh) -- does $IFS hold a char of an arith result (a digit or '-')?
+	local b = sh.vars.IFS
+	if not b or b.s == " \t\n" then -- (unset / the default: the common case, no sh:get)
+		return false
+	end
+	local v = M.ifs(sh)
+	return v ~= nil and v:find("[%d%-]") ~= nil
+end
 function M.ifs_sep(sh) -- the "$*" joiner
 	local v = M.ifs(sh)
 	return v and M.ifs_first(v) or " "
