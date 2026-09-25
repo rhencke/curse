@@ -2187,7 +2187,7 @@ function Shell:capture_src(src, backtick, noalias)
 	end
 	if mod then
 		local run_compiled = require("tier").run_compiled
-		if iso and not has_perr then
+		if (iso or not mod.nofork) and not has_perr then
 			return self:capture_compiled_iso(function(self)
 				return run_compiled(mod, self, nil, true)
 			end, backtick)
@@ -2325,11 +2325,12 @@ function Shell:capture_inproc(backtick, runner, capfd, ctx)
 	end
 	if not ok then
 		if type(err) == "table" and err.__curse_parseerr then
-			if backtick then
-				self.status = 1
+			if backtick then -- contained (non-fatal): "", status 2 — an assignment's $?
+				self.status, self.last_cmdsub_status = 2, 2
+				self.ncs = (self.ncs or 0) + 1
 				readcap()
 				return ""
-			end -- backtick: contained (non-fatal)
+			end
 			readcap() -- drop the temp file, then propagate
 			error(err) -- a SYNTAX error inside $(…) is fatal to the whole containing command (bash)
 		elseif type(err) == "table" and (err.__curse_exit or err.__curse_return) then

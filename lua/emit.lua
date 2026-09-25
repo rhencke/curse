@@ -8049,4 +8049,7 @@ function M.emit(ast, opts)
 end
 
 M.EF = EF
+M.cmdsub_nofork_ok = function(stmts) -- (tier: a runtime $(…) fragment picks its capture by it)
+	return cmdsub_nofork_ok(stmts)
+end
 return M
