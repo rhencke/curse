@@ -181,7 +181,7 @@ return function(sh, cmd, args, hook, tcb)
 				l = l:sub(1, -2)
 			end
 			if callback and count % quantum == 0 then -- (the index as C's %d of an unsigned int)
-				rt.eval(sh, { "eval", callback .. " " .. (idx >= 2147483648 and idx - 4294967296 or idx) .. " " .. sq(l) })
+				rt.eval_run(sh, { "eval", callback .. " " .. (idx >= 2147483648 and idx - 4294967296 or idx) .. " " .. sq(l) })
 			end
 			sh:array_set(arr, idx, l, false)
 			idx = (idx + 1) % 4294967296 -- (bash's array_index is an unsigned int: it wraps)

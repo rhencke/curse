@@ -18,6 +18,12 @@ local C, P = I.C, I.P
 
 return function(sh, cmd, args, hook, tcb)
 	if cmd == "times" then
+		local a2 = args[2] -- (bash's no_options: no option letters, `--help` is help)
+		if a2 == "--help" then
+			return rt.builtin_help(sh, "times")
+		elseif a2 and a2 ~= "--" and a2:match("^%-.") then
+			return rt.bad_option(sh, "times", a2:sub(1, 2))
+		end
 		-- Two lines: shell user/sys, then children user/sys, each `%dm%.3fs`.
 		local function ct(s)
 			return ("%dm%.3fs"):format(math.floor(s / 60), s % 60)

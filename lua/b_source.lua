@@ -30,6 +30,7 @@ return function(sh, cmd, args, hook, tcb)
 		elseif args[j] and args[j]:match("^%-.") then -- (bash's no_options: no option letters)
 			io.stderr:write("curse: " .. cmd .. ": " .. args[j]:sub(1, 2) .. ": invalid option\n" .. usage)
 			sh.status = 2
+			sh.spb_err = 2 -- (EX_USAGE: rt.spb_run)
 			return
 		end
 		local name = args[j]
@@ -47,6 +48,7 @@ return function(sh, cmd, args, hook, tcb)
 		if not name then
 			io.stderr:write("curse: " .. cmd .. ": filename argument required\n" .. usage)
 			sh.status = 2
+			sh.spb_err = 2 -- (EX_USAGE: rt.spb_run)
 		elseif file_test("-d", file) then
 			io.stderr:write("curse: " .. cmd .. ": " .. name .. ": is a directory\n")
 			sh.status = 1
@@ -125,6 +127,7 @@ return function(sh, cmd, args, hook, tcb)
 						end
 					end)
 					sh.xdepth = sxd
+					sh.spb_err = nil -- (a builtin in the file flagged its own: not the source's)
 					sh.sourcedepth = sh.sourcedepth - 1
 					rt.source_leave(sh, sframe)
 					-- (params the file SET itself stay — but not in a function: maybe_pop_dollar_vars)
@@ -139,6 +142,7 @@ return function(sh, cmd, args, hook, tcb)
 							rret = err.__curse_return
 						elseif type(err) == "table" and err.__curse_parseerr then
 							sh.status = 2 -- a syntax error in the file: source returns 2, doesn't halt the shell (bash)
+							sh.spb_err = 2 -- (…but EX_BADSYNTAX does halt a posix one: rt.spb_run)
 						else
 							rt.source_debug_restore(sh, dsave)
 							error(err)

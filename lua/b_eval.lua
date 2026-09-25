@@ -54,9 +54,12 @@ end
 return function(sh, cmd, args, hook, tcb)
 	if cmd == "eval" then
 		-- eval [--]: join args, parse, run in the CURRENT shell (return/exit propagate).
-		if args[2] and args[2] ~= "-" and args[2] ~= "--" and args[2]:sub(1, 1) == "-" then
+		if args[2] == "--help" then -- (CASE_HELPOPT: the builtin's help, status 2)
+			return rt.builtin_help(sh, "eval")
+		elseif args[2] and args[2] ~= "-" and args[2] ~= "--" and args[2]:sub(1, 1) == "-" then
 			io.stderr:write("curse: eval: " .. args[2]:sub(1, 2) .. ": invalid option\n" .. rt.usage("eval"))
 			sh.status = 2
+			sh.spb_err = 2 -- (EX_USAGE: rt.spb_run)
 		else
 			local start = (args[2] == "--") and 3 or 2
 			local code = table.concat({ unpack(args, start) }, " ")
@@ -67,6 +70,7 @@ return function(sh, cmd, args, hook, tcb)
 				-- break/continue propagate out. Alias expansion sees the live table (sh).
 				local sxd = sh.xdepth -- (eval'd commands trace one level deeper: `++ cmd`, bash)
 				sh.xdepth = (sxd or 0) + 1
+				local badsyntax -- (EX_BADSYNTAX: like EX_USAGE from a special builtin — rt.spb_run)
 				local ok, err = pcall(function()
 					local ln = rt.current_line(sh)
 					local nextf = eval_groups(sh, code, ln) or P.open(code, sh, ln > 0 and ln or nil)
@@ -89,6 +93,7 @@ return function(sh, cmd, args, hook, tcb)
 								error(perr)
 							end
 							sh.status = 2
+							badsyntax = true
 							return
 						end
 						for _, st in ipairs(lg.stmts) do
@@ -108,6 +113,7 @@ return function(sh, cmd, args, hook, tcb)
 					end
 				end)
 				sh.xdepth = sxd
+				sh.spb_err = badsyntax and 2 or nil -- (a builtin the code ran flagged its own: not eval's)
 				if not ok then
 					error(err)
 				end -- control-flow (exit/return/…) or a real error

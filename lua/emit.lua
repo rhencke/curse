@@ -6034,11 +6034,16 @@ H.pipeline = function(cx, st, after)
 		gpre = ("if not (%s) then pc = %d else "):format(table.concat(guards, " and "), pd)
 		gpost = " end"
 	end
+	-- (`! cmd` ignores its OWN special-builtin failure: rt.spb_run)
+	local negspb = n == 1 and st.negate and st.cmds[1].t == "simple" and st.cmds[1].words
+		and st.cmds[1].words[1] and require("runtime").SPECIAL_BUILTIN[full_lit(st.cmds[1].words[1]) or ""]
 	cx.blocks[p] = gpre .. dbg(st)
 		.. lifted_flush(cx.lifted)
+		.. (negspb and "sh.spb_neg = true; " or "")
 		.. ("sh:run_pipeline({%s}, %s, {%s}%s)"):format(
 			table.concat(frags, ", "), st.negate and "true" or "false", table.concat(inproc, ", "),
 			(EF.lifted_names and #EF.lifted_names > 0) and ", __upv_get, __upv_set" or "")
+		.. (negspb and "; sh.spb_neg = nil" or "")
 		.. post
 		.. ecs
 		.. ("; pc = %d"):format(after)
@@ -6630,6 +6635,9 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
 			end
 			conds[#conds + 1] = e
 		end
+		if cmd and require("runtime").SPECIAL_BUILTIN[cmd] then -- (posix: a special builtin's
+			return ("(%s or rt.spb_redir(sh, __rs))"):format(table.concat(conds, " and ")) -- is fatal)
+		end
 		return table.concat(conds, " and ")
 	end
 
@@ -6774,7 +6782,7 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
 			local lvl, ok = 1, true
 			if st.words[cf_arg] then
 				local wl = full_lit(st.words[cf_arg])
-				if wl and wl:match("^%d+$") and not st.words[cf_arg + 1] then
+				if wl and wl:match("^%d+$") and tonumber(wl) >= 1 and not st.words[cf_arg + 1] then
 					lvl = tonumber(wl)
 				else
 					ok = false
