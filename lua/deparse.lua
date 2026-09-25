@@ -72,11 +72,13 @@ local function norm_word(s)
 			end
 			out[#out + 1] = sq(rt.ansi_unescape(table.concat(buf), true))
 			i = j + 1
+		elseif c == "$" and s:sub(i + 1, i + 1) == '"' and not indq then
+			i = i + 1 -- $"…": the parser drops the $ (the translated text stays double-quoted)
 		elseif c == "$" and s:sub(i + 1, i + 1) == "(" and s:sub(i + 2, i + 2) ~= "(" then
 			local ok, e = pcall(P.scan_cmdsub, s, i + 2)
 			local body = ok and e and deparse_list(s:sub(i + 2, e - 2))
-			if body then
-				out[#out + 1] = "$(" .. body .. ")"
+			if body then -- (parse_comsub: a space keeps `$( (` from reading as `$((`)
+				out[#out + 1] = (body:sub(1, 1) == "(" and "$( " or "$(") .. body .. ")"
 				i = e
 			else
 				out[#out + 1] = c
@@ -131,6 +133,7 @@ end
 
 -- ---- curse AST -> bash's command tree --------------------------------------------
 local conv, conv_list
+local comsub_nl = false -- (a $(…) body: its top-level newlines stay `\n` connectors)
 
 local function assign_text(a)
 	if a.t == "arrayassign" then
@@ -145,7 +148,7 @@ end
 
 -- a statement list: `;` (or `&` after a background job) connections, left-nested
 conv_list = function(stmts)
-	local acc, bg = nil, false
+	local acc, bg, semi = nil, false, false
 	for _, st in ipairs(stmts or {}) do
 		local c, isbg
 		if st.t == "background" then
@@ -155,11 +158,12 @@ conv_list = function(stmts)
 		end
 		if c then
 			if acc then
-				acc = { k = "conn", first = acc, second = c, op = bg and "&" or ";" }
+				acc = { k = "conn", first = acc, second = c,
+					op = bg and "&" or (comsub_nl and st.lgstart and not semi and "\n") or ";" }
 			else
 				acc = c
 			end
-			bg = isbg
+			bg, semi = isbg, st.semi
 		end
 	end
 	if acc and bg then
@@ -358,7 +362,7 @@ local function print_redir(p, r)
 	elseif op == "in" then
 		cprintf(p, redir_fd(r, 0) .. "< " .. tgt)
 	elseif op == "rw" then
-		cprintf(p, redir_fd(r, 0) .. "<> " .. tgt)
+		cprintf(p, redir_fd(r, 1) .. "<> " .. tgt) -- (print_cmd.c: r_input_output omits only fd 1)
 	elseif op == "outboth" then
 		cprintf(p, "&> " .. tgt)
 	elseif op == "appboth" then
@@ -372,8 +376,6 @@ local function print_redir(p, r)
 			cprintf(p, fd .. ">&-") -- (bash prints every close as >&-)
 		elseif tgt:match("^%d+%-?$") then
 			cprintf(p, fd .. arrow .. tgt)
-		elseif op == "dup" and r.fd == 1 and not r.fdvar and not tgt:match("^[-$`]") then
-			cprintf(p, "&> " .. tgt) -- `>&word`: the file form, printed as &>
 		else
 			cprintf(p, (op == "dup" and redir_fd(r, 1) or redir_fd(r, 0)) .. arrow .. tgt)
 		end
@@ -494,10 +496,12 @@ make = function(p, c)
 			if c.second then
 				p.skip = p.skip + 1
 			end
-		else -- `;`
+		else -- `;` or (a comsub body's) `\n`
+			local nl = op == "\n"
+			local was_nl = nl and not p.deferred and not p.was_hd
 			if not p.deferred then
 				if not p.was_hd then
-					cprintf(p, ";")
+					cprintf(p, op)
 				else
 					p.was_hd = false
 				end
@@ -506,8 +510,12 @@ make = function(p, c)
 			end
 			if p.infunc > 0 then
 				cprintf(p, "\n")
+			elseif nl and not was_nl then
+				cprintf(p, "\n") -- (preserve newlines in comsubs but don't double them)
 			else
-				cprintf(p, " ")
+				if not nl then
+					cprintf(p, " ")
+				end
 				if c.second then
 					p.skip = p.skip + 1
 				end
@@ -722,7 +730,7 @@ function M.func(name, body, redirs, subbody)
 	return nil
 end
 
--- A $(…) body, re-printed on one line (bash's comsub printing: `a; b`); nil if it
+-- A $(…) body, re-printed as bash's print_comsub does (`a; b`, newlines kept); nil if it
 -- doesn't parse or holds something unprintable (the caller keeps the text as is).
 deparse_list = function(src)
 	local ok, ast = pcall(P.parse, src)
@@ -731,7 +739,14 @@ deparse_list = function(src)
 	end
 	local pok, r = pcall(function()
 		local p = new_printer()
-		make(p, conv_list(ast.stmts))
+		local sv = comsub_nl
+		comsub_nl = true
+		local cok, c = pcall(conv_list, ast.stmts)
+		comsub_nl = sv
+		if not cok then
+			error(c, 0)
+		end
+		make(p, c)
 		deferred_pending(p, "")
 		return table.concat(p.buf)
 	end)

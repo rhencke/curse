@@ -1977,7 +1977,14 @@ local function parse_dbracket(toks, quoted)
 			pos = pos + 1
 			local r = toks[pos]
 			pos = pos + 1
-			return { kind = "binary", op = op, l = parse_word(t), r = parse_word(r or ""), rq = quoted[pos - 1] }
+			local rw = parse_word(r or "")
+			local rq = quoted[pos - 1] -- (rq: the WHOLE rhs quoted — `"a"*` still globs its `*`)
+			if rq then
+				for _, p in ipairs(rw.parts) do
+					rq = rq and p.q and true or false
+				end
+			end
+			return { kind = "binary", op = op, l = parse_word(t), r = rw, rq = rq }
 		end
 		return { kind = "str", word = parse_word(t or "") }
 	end
@@ -5233,6 +5240,7 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs, xg)
 				-- stray keyword) is left to the existing statement-boundary handling.
 				if c == ";" and src:sub(i + 1, i + 1) ~= ";" then
 					i = i + 1
+					st.semi = true -- (`a;⏎b` joins with `;`, not a newline: deparse's comsubs)
 					skip_inline()
 				elseif i > n or c == "\n" or c == "#" then
 					break
