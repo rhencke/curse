@@ -2212,6 +2212,25 @@ function Shell:capture_src(src, backtick, noalias)
 			iso = true
 		end
 	end
+	-- Text that recurs runs compiled (tier fragment keyed by text, line, trap state) — the
+	-- guarded slow path of a compiled $(…) and the backticks parsed at expansion time. (Not
+	-- while aliases are live: a fragment parses without the alias table.)
+	local mod
+	if noalias or not (self.shopt.expand_aliases and self.aliases and next(self.aliases)) then
+		local ln = self.cur_cline or self.cur_line
+		mod = require("tier").try_fragment(src, ln and ln > 0 and ln or nil, self)
+	end
+	if mod then
+		local run_compiled = require("tier").run_compiled
+		if iso and not has_perr then
+			return self:capture_compiled_iso(function(self)
+				return run_compiled(mod, self, nil, true)
+			end, backtick)
+		end
+		return self:capture_inproc(backtick, function(self)
+			return run_compiled(mod, self, nil, true)
+		end)
+	end
 	-- (a SYNTAX error in the body is fatal to the CONTAINING command — bash — which the
 	-- light path propagates via __curse_parseerr)
 	if iso and not has_perr then
@@ -9587,6 +9606,9 @@ function M.compound_word_src(sh, it)
 		end
 		s = table.concat(out)
 	end
+	if s:find("$(", 1, true) then -- (bash re-prints a $(…) body: `>&2` reads `1>&2`)
+		s = require("deparse").norm_word(s)
+	end
 	if sh.arrayargs_pending or it.decl then
 		return "'" .. s:gsub("'", "'\\''") .. "'"
 	end
@@ -9640,6 +9662,29 @@ function M.arrayassign(sh, name, items, append)
 		end
 		error(err, 0)
 	end
+end
+-- The `NAME=(…)` statement (not a declare's): a nameref to an element (or `a[@]`) can't
+-- take a list — `not a valid identifier`, status 1 (interp's run_arrayassign).
+function M.arrayassign_stmt(sh, name, items, append)
+	local nb = sh.vars[name]
+	if nb and nb.ref and nb.s and nb.s:find("[", 1, true) then
+		io.stderr:write("curse: `" .. nb.s .. "': not a valid identifier\n")
+		sh.status = 1
+		return
+	end
+	return M.arrayassign(sh, name, items, append)
+end
+-- `a[i]=(…)`: a list can't be assigned to one member — reported, and the line abandoned (bash).
+function M.arrayassign_member(sh, name, index)
+	local nb = sh.vars[name]
+	if nb and nb.ref and nb.s and nb.s:find("[", 1, true) then
+		io.stderr:write("curse: `" .. nb.s .. "': not a valid identifier\n")
+		sh.status = 1
+		return
+	end
+	io.stderr:write("curse: " .. name .. "[" .. index .. "]: cannot assign list to array member\n")
+	sh.status = 1
+	error({ __curse_exit = 1, __curse_lineabort = true })
 end
 arrayassign_body = function(sh, name, items, append)
 	-- through a nameref (`declare -n r=t; declare -a r=(…)`) the literal lands in the
@@ -11163,6 +11208,77 @@ function M.call_dynamic_fn(sh, argv)
 	return I.exec_simple(sh, argv, _noop)
 end
 
+-- A parse-time warning statement (heredoc delimited by EOF, …): shown before its line runs.
+function M.warn_stmt(sh, st)
+	sh.cur_line = st.line
+	io.stderr:write("curse: " .. st.msg .. "\n")
+end
+-- A RECOVERABLE parse error (an invalid `NAME=( … )` array-literal element) is reported
+-- but NON-fatal: the assignment is dropped and the script continues (bash).
+function M.report_recoverable(sh, perr)
+	if perr.line then
+		sh.cur_line = perr.line
+	end
+	local msg = tostring(perr.msg or "syntax error"):gsub("^syntax error near `", "syntax error near unexpected token `")
+	io.stderr:write("curse: " .. msg .. "\n")
+	if perr.text then
+		io.stderr:write("curse: `" .. perr.text .. "'\n")
+	end
+	sh.status = 1
+end
+-- A `parse_error` statement: the parser reached text it can't parse (e.g. a makeself binary
+-- payload) after the valid prefix ran — bash reports it there and exits 2. bash's form:
+-- `syntax error near unexpected token `X'` (or `syntax error: unexpected end of file`),
+-- then the offending line as `…'. Shared by both tiers (the compiled one calls it natively).
+-- `label` "eval": an eval'd text's error reads `NAME: eval: line N:`, and even a recoverable
+-- one ends the eval (status 2, like b_eval) — the caller contains __curse_parseerr.
+function M.parse_error_stmt(sh, st, label)
+	for _, w in ipairs(st.warns or {}) do
+		sh.cur_line = w.line
+		io.stderr:write("curse: " .. w.msg .. "\n")
+	end
+	if st.recoverable then
+		M.report_recoverable(sh, st)
+		if label then
+			error({ __curse_exit = 2, __curse_parseerr = true })
+		end
+		return
+	end
+	local msg = tostring(st.msg or "syntax error"):gsub("^.-:%d+: ", "")
+	msg = msg:gsub("^syntax error near `", "syntax error near unexpected token `")
+	if not msg:find("^syntax error") and not msg:find("^unexpected EOF")
+		and not msg:find("^maximum here%-document count exceeded") then
+		msg = "syntax error: " .. msg
+	end
+	if st.line then
+		sh.cur_line = st.line
+	end
+	sh.in_perr = true -- (a `-c` string's syntax errors name it: `bash: -c: line 1:`)
+	local pl = sh.perr_label
+	sh.perr_label = label or pl
+	io.stderr:write("curse: " .. msg .. "\n")
+	if st.text and (st.showtext or msg:find("near unexpected token", 1, true)) then
+		io.stderr:write("curse: " .. (st.showtext and "syntax error: " or "") .. "`" .. st.text .. "'\n")
+	end
+	sh.in_perr, sh.perr_label = nil, pl
+	error({ __curse_exit = 2, __curse_parseerr = true, lead = st.lead })
+end
+-- bash's evalstring.c: an eval'd/sourced text's syntax error ends a posix shell only while
+-- this_shell_builtin is still that eval/source — no command ran in the text before it (a
+-- bare assignment doesn't count). Marks the statement (st.lead) for its caller's spb_err.
+function M.perr_neutral(st)
+	local t = st.t
+	return t == "assign" or t == "assignlist" or t == "parse_error" or t == "warn"
+end
+function M.perr_lead(stmts, k)
+	for i = 1, k - 1 do
+		if not M.perr_neutral(stmts[i]) then
+			return false
+		end
+	end
+	return true
+end
+
 -- `eval CODE`: COMPILE the joined code string at runtime (fragment mode — its top-level
 -- return/break/continue/exit RAISE, so they cross back to this eval's delegated cf-wrapper)
 -- and run it in the CURRENT shell (shared sh: assignments, functions, $? all persist). No
@@ -11189,10 +11305,18 @@ function M.eval_run(sh, argv)
 		return
 	end
 	local ln = current_line(sh)
-	local mod = require("tier").try_fragment(code, ln > 0 and ln or nil)
+	local mod = require("tier").try_fragment(code, ln > 0 and ln or nil, sh, nil, "eval")
 	if mod then
-		require("tier").run_compiled(mod, sh, nil, true)
+		local ok, err = pcall(require("tier").run_compiled, mod, sh, nil, true)
 		sh.spb_err = nil -- (a builtin the code ran flagged its own: not eval's)
+		if not ok then
+			if type(err) == "table" and err.__curse_parseerr then
+				sh.status = 2 -- a syntax error ends the eval, status 2 (EX_BADSYNTAX: rt.spb_run)
+				sh.spb_err = err.lead and 2 or nil
+			else
+				error(err, 0)
+			end
+		end
 	else
 		require("b_eval")(sh, "eval", argv, _noop, nil) -- (a hook: a called function asks it)
 	end
@@ -11315,10 +11439,8 @@ function M.source_run(sh, argv, line)
 	end
 	local code = f:read("*a")
 	f:close()
-	-- (a DEBUG trap that reaches into the file — functrace — needs per-command hooks the
-	-- file's own compile doesn't have: the interpreter runs it then)
-	local dbg_in = sh.opt_functrace and sh.traps and sh.traps.DEBUG and sh.traps.DEBUG ~= ""
-	local mod = not dbg_in and not M.source_empty(code) and require("tier").try_fragment(code)
+	-- (a DEBUG/ERR trap reaching into the file: tier compiles its hooks in — trap_mode)
+	local mod = not M.source_empty(code) and require("tier").try_fragment(code, nil, sh)
 	if not mod then -- alias / syntax error / uncompilable / empty: b_source runs the text it was handed
 		-- (never re-opening the file — a FIFO or /dev/stdin can only be read once)
 		sh.source_preread = { file = file, code = code }
@@ -11342,6 +11464,10 @@ function M.source_run(sh, argv, line)
 	local dsave, e0 = M.source_debug_hide(sh), sh.traps and sh.traps.ERR
 	local rok, err = pcall(require("tier").run_compiled, mod, sh, nil, true)
 	sh.spb_err = nil -- (a builtin in the file flagged its own: not the source's)
+	if not rok and type(err) == "table" and err.__curse_parseerr then
+		rok = true -- a syntax error in the file: source returns 2, doesn't halt the shell (bash)
+		sh.status, sh.spb_err = 2, err.lead and 2 or nil -- (EX_BADSYNTAX halts a posix one: perr_lead)
+	end
 	M.source_leave(sh, fr)
 	sh.sourcedepth = sh.sourcedepth - 1
 	-- (params the file SET itself stay — but not inside a function: bash's maybe_pop_dollar_vars)

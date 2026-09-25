@@ -41,17 +41,34 @@ local function may_repeat(code)
 		or code:find("%f[%w_]for%f[^%w_]") or code:find("%f[%w_]select%f[^%w_]")
 		or code:find("%f[%w_]function%f[^%w_]") or code:find("%(%s*%)")
 end
-function M.try_fragment(code, line1) -- line1: an eval's own line, which its code numbers from
-	local key = line1 and (line1 .. "\0" .. code) or code
+-- A fragment runs inside a shell whose ERR/DEBUG traps (and functrace) its own text may
+-- not mention: compile their hooks in when they're set, keyed so each trap state gets its
+-- own monomorphic compile.
+local function trap_mode(sh)
+	local t = sh and sh.traps
+	if not t then
+		return ""
+	end
+	local e = t.ERR and t.ERR ~= "" and "E" or ""
+	local d = t.DEBUG and t.DEBUG ~= "" and (sh.opt_functrace and "T" or "D") or ""
+	return e .. d
+end
+M.trap_mode = trap_mode
+function M.try_fragment(code, line1, sh, now, label) -- line1: an eval's own line, which its code numbers from
+	-- (now: the caller already saw this code run — compile it on this first call;
+	-- line1 == false: a trap handler, whose commands keep the interrupted line;
+	-- label "eval": its syntax errors read `eval: line N:` and end just the eval)
+	local mode = trap_mode(sh) .. (line1 == false and "H" or "") .. (label == "eval" and "V" or "")
+	local key = mode .. "\0" .. (line1 and (line1 .. "\0" .. code) or code)
 	local hit = frag_cache[key]
 	if hit ~= nil and hit ~= 0 then
 		return hit or nil
 	end
 	local mod = false
-	if hit == nil and not may_repeat(code) then
+	if hit == nil and not now and not may_repeat(code) then
 		mod = 0 -- seen once: interpret now, compile if it recurs
 	else
-		mod = M.compile_fragment(code, line1) or false
+		mod = M.compile_fragment(code, line1, mode) or false
 	end
 	if frag_n >= FRAG_MAX then
 		frag_cache, frag_n = {}, 0
@@ -62,22 +79,22 @@ function M.try_fragment(code, line1) -- line1: an eval's own line, which its cod
 	frag_cache[key] = mod
 	return mod ~= 0 and mod or nil
 end
-function M.compile_fragment(code, line1)
-	local pok, ast = pcall(P.parse, code, nil, nil, nil, nil, nil, line1)
-	-- A syntax error (P.parse sets ast.perr and/or emits a `parse_error` statement, or
-	-- throws): the interpreter is the oracle for it — it runs the valid PREFIX then reports
-	-- the error with bash's status — so bail to the fallback rather than compile a fragment
-	-- that would raise the parse error at runtime and abort the caller.
-	if not pok or type(ast) ~= "table" or ast.perr then
+function M.compile_fragment(code, line1, mode)
+	local pok, ast = pcall(P.parse, code, nil, nil, nil, nil, nil, line1 or nil)
+	-- A syntax error becomes a `parse_error` statement after the valid prefix: compiled, it
+	-- reports and raises __curse_parseerr, which the caller (eval/source/trap) contains.
+	if not pok or type(ast) ~= "table" then
 		return nil
 	end
-	for _, st in ipairs(ast.stmts or {}) do
+	for k, st in ipairs(ast.stmts) do
 		if st.t == "parse_error" then
-			return nil
+			st.lead = rt.perr_lead(ast.stmts, k) or nil
 		end
 	end
 	local ok, chunk = pcall(function()
-		return load(E.emit(ast, { fragment = true }), "=curse:eval")
+		mode = mode or ""
+		return load(E.emit(ast, { fragment = true, perr_label = mode:find("V", 1, true) and "eval", trapline = mode:find("H", 1, true) ~= nil, trap_err = mode:find("E", 1, true) ~= nil,
+			trap_debug = mode:find("[DT]") ~= nil, functrace = mode:find("T", 1, true) ~= nil }), "=curse:eval")
 	end)
 	if ok and chunk then
 		local built, mod = pcall(chunk)
@@ -283,12 +300,13 @@ local HOT_LOOP = tonumber(os.getenv("CURSE_HOT_LOOP") or "") or 100
 -- own source text, and run in place of the rest of the interpreted loop. At the loop head
 -- that is exact: a while/until re-tests its condition, and a (( ; ; )) loop re-states
 -- its header without the init already run. Cached on the node (false: declined).
-local function loop_fragment(st)
+local function loop_fragment(st, sh)
+	local mode = trap_mode(sh)
 	local frag = st._frag
-	if frag ~= nil then
+	if frag ~= nil and st._fragm == mode then
 		return frag
 	end
-	st._frag = false
+	st._frag, st._fragm = false, mode
 	local srcs = st._srcs
 	if not srcs then
 		return false
@@ -301,7 +319,7 @@ local function loop_fragment(st)
 	else
 		return false
 	end
-	local mod = M.compile_fragment(code, st.line)
+	local mod = M.compile_fragment(code, st.line, mode)
 	if mod and st.t == "forin" then
 		-- entered at the loop's resume point, adopting the interpreter's list + position
 		-- (sh.forstate) under the fragment's own id for that loop: its first
@@ -317,7 +335,7 @@ local function loop_fragment(st)
 end
 -- (the interp's SUBHOOK forwards to this: loop fragments only, never a program switch)
 function M.frag_hook(kind, id, st, sh)
-	if kind == "loop" and sh and not (sh.traps and (sh.traps.DEBUG or sh.traps.RETURN)) then
+	if kind == "loop" and sh and not (sh.traps and sh.traps.RETURN) then
 		return M.loop_osr(sh, st)
 	end
 end
@@ -333,7 +351,7 @@ function M.loop_osr(sh, st)
 	if hits < HOT_LOOP then
 		return nil
 	end
-	local mod = loop_fragment(st)
+	local mod = loop_fragment(st, sh)
 	if not mod then
 		return nil
 	end
@@ -357,6 +375,33 @@ function M.loop_osr(sh, st)
 	return true, err
 end
 I.frag_hook = M.frag_hook -- (the interpreter's isolated contexts tier their hot loops)
+-- A hot function whose body is still an interp AST — defined by eval'd or sourced text,
+-- in a subshell, or redefined (none of those is in the program's own module) — compiles
+-- standalone from its definition's exact text at its own line, and its later calls run
+-- the compiled closure (cached on the definition node, per trap state). Not while aliases
+-- are live (the text parses without them), nor under a RETURN trap, functrace'd DEBUG or
+-- $FUNCNEST (a compiled body doesn't fire/count those for the calls it makes itself).
+function M.fn_hot(sh, name, def)
+	local n = (def._calls or 0) + 1
+	def._calls = n
+	if n < HOT_LOOP or not def.deftext then
+		return nil
+	end
+	local t = sh.traps
+	local mode = trap_mode(sh)
+	if (t and t.RETURN) or mode:find("T", 1, true) or sh.vars.FUNCNEST -- (compiled recursion doesn't count it)
+		or (sh.shopt.expand_aliases and sh.aliases and next(sh.aliases)) then
+		return nil
+	end
+	if def._cfnm == mode then
+		return def._cfn or nil
+	end
+	local mod = M.compile_fragment(def.deftext, def.line, mode)
+	local fc = mod and mod.fnCall and mod.fnCall[name]
+	def._cfn, def._cfnm = fc and fc.fn or false, mode
+	return def._cfn or nil
+end
+I.fn_hook = M.fn_hot
 -- emit + load + store (disk cache and this worker's) — nil if the emitter can't. With
 -- `later`, the disk write waits for M.flush_stores (a compile MID-RUN happens under the
 -- script's own limits — `ulimit -f 1` would kill the process with SIGXFSZ).

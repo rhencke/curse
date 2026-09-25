@@ -3815,17 +3815,7 @@ local function decl_elems(sh, name, fmt)
 end
 -- A recoverable parse error (a bad `NAME=( … )` element): bash's syntax-error report — the
 -- token, then the line — but the script goes on (status 1)
-function M.report_recoverable(sh, perr)
-	if perr.line then
-		sh.cur_line = perr.line
-	end
-	local msg = tostring(perr.msg or "syntax error"):gsub("^syntax error near `", "syntax error near unexpected token `")
-	io.stderr:write("curse: " .. msg .. "\n")
-	if perr.text then
-		io.stderr:write("curse: `" .. perr.text .. "'\n")
-	end
-	sh.status = 1
-end
+M.report_recoverable = rt.report_recoverable
 -- the dynamic arrays bash lists among its variables (curse computes them on demand)
 local DYN_ARRAYS = { BASH_ARGC = 1, BASH_ARGV = 1, BASH_LINENO = 1, BASH_SOURCE = 1, DIRSTACK = 1, FUNCNAME = 1, GROUPS = 1 }
 M.DYN_ARRAYS = DYN_ARRAYS
@@ -4656,7 +4646,11 @@ local function run_function(sh, cmd, fn, args, hook, tenv_base)
 		ok, err = pcall(fn, sh) -- a COMPILED function closure
 	else
 		-- a hot function in a cold run: its compiled version, once the tier has it
-		local cfn = hook("call", cmd, sh.func_def and sh.func_def[cmd], sh)
+		local def = sh.func_def and sh.func_def[cmd]
+		local cfn = hook("call", cmd, def, sh)
+		if not cfn and def and M.fn_hook then -- (tier loaded: a hot one compiles standalone)
+			cfn = M.fn_hook(sh, cmd, def)
+		end
 		if cfn then
 			ok, err = pcall(cfn, sh)
 		else
@@ -6627,41 +6621,9 @@ exec_stmt = function(sh, st, hook)
 		sh.loopdepth = sh.loopdepth - 1
 		sh.status = bodystatus
 	elseif t == "warn" then -- a parse-time warning (heredoc at EOF, …), shown before its line runs
-		sh.cur_line = st.line
-		io.stderr:write("curse: " .. st.msg .. "\n")
+		rt.warn_stmt(sh, st)
 	elseif t == "parse_error" then
-		for _, w in ipairs(st.warns or {}) do
-			sh.cur_line = w.line
-			io.stderr:write("curse: " .. w.msg .. "\n")
-		end
-		-- A RECOVERABLE parse error (an invalid `NAME=( … )` array-literal element) is
-		-- reported but NON-fatal: the assignment is dropped and the script continues
-		-- (bash). This matches run_lazy's handling, so the compiled path (which reaches
-		-- a parse_error via delegation) behaves the same as the interpreter.
-		if st.recoverable then
-			M.report_recoverable(sh, st)
-		else
-			-- Reached the unparseable tail (e.g. a makeself binary payload) — bash would
-			-- syntax-error here too. If an earlier exit fired, we never get here.
-			-- bash's form: `syntax error near unexpected token `X'` (or `syntax error:
-			-- unexpected end of file`), then the offending line as `…'
-			local msg = tostring(st.msg or "syntax error"):gsub("^.-:%d+: ", "")
-			msg = msg:gsub("^syntax error near `", "syntax error near unexpected token `")
-			if not msg:find("^syntax error") and not msg:find("^unexpected EOF")
-				and not msg:find("^maximum here%-document count exceeded") then
-				msg = "syntax error: " .. msg
-			end
-			if st.line then
-				sh.cur_line = st.line
-			end
-			sh.in_perr = true -- (a `-c` string's syntax errors name it: `bash: -c: line 1:`)
-			io.stderr:write("curse: " .. msg .. "\n")
-			if st.text and (st.showtext or msg:find("near unexpected token", 1, true)) then
-				io.stderr:write("curse: " .. (st.showtext and "syntax error: " or "") .. "`" .. st.text .. "'\n")
-			end
-			sh.in_perr = nil
-			error({ __curse_exit = 2, __curse_parseerr = true })
-		end
+		rt.parse_error_stmt(sh, st)
 	elseif t == "group" then
 		-- { list; } runs in the current shell. Any trailing redirs are applied by the
 		-- COMPOUND_REDIR wrapper above (which checks open failures + errexit), so here
@@ -7149,6 +7111,12 @@ end
 -- result: the CALLER (once it has undone its own state) raises it, so the return ends
 -- that function/source — bash's _run_trap_internal longjmps to return_catch (trap.c).
 -- (Not for the EXIT/RETURN traps: their callers keep the status.)
+local trap_seen, trap_seen_n = {}, 0 -- (handler texts run once: the next run compiles)
+-- (an INTERP_FRAMES runner: the compiled handler's error prefixes read sh.cur_line)
+local function run_trap_mod(mod, sh)
+	return require("tier").run_compiled(mod, sh, nil, true)
+end
+rt.INTERP_FRAMES[run_trap_mod] = true
 run_trap = function(sh, code)
 	local exited, savedline, rret = false, sh.cur_line, nil
 	local saved_tcd, saved_ts = sh.trap_calldepth, sh.trap_saved
@@ -7157,8 +7125,25 @@ run_trap = function(sh, code)
 	sh.in_trap = (sh.in_trap or 0) + 1
 	local sxd = sh.xdepth -- (a handler's commands trace one level deeper: `++ cmd`, bash)
 	sh.xdepth = (sxd or 0) + 1
-	local stmts, k = P.parse(code).stmts, 0
+	-- A handler that runs again is compiled (tier fragment, keyed by its text and the trap
+	-- state): the first run interprets it, so a one-shot EXIT trap never loads the compiler.
+	local seen = trap_seen[code]
+	local mod
+	M.v_echo(sh, code, nil, {}) -- (set -v: the handler's text as it's read)
+	if seen and not sh.opt_x then -- (xtrace: the compiled tier has no trace hooks yet)
+		mod = require("tier").try_fragment(code, false, sh, true)
+	else
+		trap_seen_n = trap_seen_n + 1
+		if trap_seen_n > 256 then
+			trap_seen, trap_seen_n = {}, 1
+		end
+		trap_seen[code] = true
+	end
+	local stmts, k = mod and {} or P.parse(code).stmts, 0
 	local function body()
+		if mod then -- (a line abort is contained by run_compiled: the rest of that line is skipped)
+			return run_trap_mod(mod, sh)
+		end
 		while k < #stmts do
 			k = k + 1
 			local st = stmts[k]

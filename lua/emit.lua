@@ -452,7 +452,12 @@ end
 -- call AFTER the unset fails (127) — a hoisted fn_x would still be callable.
 -- $LINENO: the current line as a compile-time constant; once `unset LINENO` stripped its
 -- magic it is an ordinary variable (bash)
+-- (a trap handler's own commands keep the line of the command it interrupted — interp's
+-- run_trap doesn't advance sh.cur_line at the trap's call depth: EF.trapline)
 local function lineno_expr()
+	if EF.trapline and not EF.cur_infunc then
+		return "(sh.unset_specials and sh.unset_specials.LINENO and sh:get('LINENO') or tostring(sh.cur_line or 0))"
+	end
 	return ("(sh.unset_specials and sh.unset_specials.LINENO and sh:get('LINENO') or %q)"):format(
 		tostring(EF.cur_line or 0))
 end
@@ -885,8 +890,8 @@ local function errchk(st) -- the guard statement for `st`, or "" when errexit ne
 	if EF.has_err then -- ERR trap fires on the same condition as errexit; set $LINENO to this
 		-- command's line, fire ERR (fire_err_trap scopes by calldepth/in_subprogram — inside a
 		-- function/subshell only under errtrace), THEN errexit (bash order).
-		return ("if sh.noerr == 0 and sh.status ~= 0 then sh.cur_line = %d; I.fire_err_trap(sh); if sh.opt_e then %s end end"):format(
-			st.line or 0,
+		return ("if sh.noerr == 0 and sh.status ~= 0 then %sI.fire_err_trap(sh); if sh.opt_e then %s end end"):format(
+			(EF.trapline and not EF.cur_infunc) and "" or ("sh.cur_line = %d; "):format(st.line or 0),
 			exitfail
 		)
 	end
@@ -914,6 +919,9 @@ local function dbg(st)
 	-- run_debug scopes by calldepth/in_subprogram (fires inside a function/subshell only
 	-- under functrace); calldepth is tracked in fnwrap when a DEBUG trap is present.
 	if EF.has_debug then
+		if EF.trapline and not EF.cur_infunc then -- (a handler's commands: the interrupted line)
+			return "I.run_debug(sh, sh.cur_line); "
+		end
 		return ("I.run_debug(sh, %d); "):format(st.line or 0)
 	end
 	return ""
@@ -1149,6 +1157,9 @@ emit_value = function(e, lifted)
 		return ("(function() local _ = %s; return %s end)()"):format(emit_value(e.l, lifted), emit_value(e.r, lifted))
 	end
 	if k == "var" and e.name == "LINENO" then -- compile-time line (unless `unset LINENO`)
+		if EF.trapline and not EF.cur_infunc then
+			return "(sh.unset_specials and sh.unset_specials.LINENO and sh:aget('LINENO') or (0LL + (sh.cur_line or 0)))"
+		end
 		return ("(sh.unset_specials and sh.unset_specials.LINENO and sh:aget('LINENO') or %sLL)"):format(
 			tostring(EF.cur_line or 0))
 	end
@@ -2939,7 +2950,46 @@ local function static_key(key)
 	return table.concat(o)
 end
 EF.static_key = static_key -- flatten_stmt references it at the array-literal emit sites (upvalue cap)
-local function arrayassign_ok(st, lifted, allow_nameref)
+-- A word an array literal can field-split natively (a bare element).
+local function aa_fieldable(w, lifted)
+	return word_safe(w) or arith_guard(w) or field_word(w, lifted) or seg_native(w, lifted)
+end
+-- A keyed element's subscript: a static literal (EF.static_key), else an emit_word-able word
+-- expanded in place — in element order, before its value (arrayfunc.c); an indexed one's
+-- arithmetic runs later in rt.arrayassign, as interp's xkey. Nil: not compilable.
+local function aa_keyword(key)
+	if static_key(key) ~= nil then
+		return false
+	end
+	local ok, kw = pcall(require("parser").parse_word, key)
+	return ok and emitable_word(kw) and kw or nil
+end
+EF.aa_keyword, EF.aa_fieldable = aa_keyword, aa_fieldable
+local function arrayassign_ok(st, lifted)
+	-- (a nameref is resolved at run time by rt.arrayassign, as interp's do_arrayassign; an
+	-- `a[i]=(…)` is H.arrayassign's own error path)
+	if st.index then
+		return false
+	end
+	for _, e in ipairs(st.elems) do
+		if e.key ~= nil then
+			if aa_keyword(e.key) == nil or not emitable_word(e.word) then
+				return false
+			end
+			for _, bw in ipairs(e.brace_bare or {}) do -- (an indexed target de-keys it: fields)
+				if not aa_fieldable(bw, lifted) then
+					return false
+				end
+			end
+		elseif e.op ~= "=" or not aa_fieldable(e.word, lifted) then
+			return false
+		end
+	end
+	return true
+end
+-- (the declare/local/typeset literal path keeps the strict gate: literal keys only, no
+-- brace de-keying, no side-effecting arith)
+local function arrayassign_decl_ok(st, lifted, allow_nameref)
 	-- allow_nameref: an explicit `declare -a/-A NAME=(…)` REDECLARES the name as an array — a
 	-- DIRECT write matching interp (which also doesn't write through a nameref for an array
 	-- assign), and rt.array_convert_err now enforces the indexed<->assoc conversion rule the
@@ -4712,7 +4762,7 @@ simple_compiled = function(cx, st, after)
 			and not (st.redirs and #st.redirs > 0) -- (a redirected one takes the general path)
 			and #aa == 1
 			and flagsok
-			and arrayassign_ok({ name = aa[1].name, append = aa[1].append, elems = aa[1].elems }, cx.lifted, true)
+			and arrayassign_decl_ok({ name = aa[1].name, append = aa[1].append, elems = aa[1].elems }, cx.lifted, true)
 		then
 			local a1 = aa[1]
 			local p = cx.newpc()
@@ -6511,9 +6561,23 @@ H.arrayassign = function(cx, st, after)
 	-- items natively — a bare word field-splits via the field engine into {val=field}
 	-- entries, a keyed element renders {key,op,val} — then store via rt.arrayassign. No
 	-- interp: keyed subscripts are gated to literals (resolved by arith_str/verbatim).
+	if st.index then -- `a[i]=(…)`: an error that abandons the line (interp's run_arrayassign)
+		local p = cx.newpc()
+		cx.blocks[p] = dbg(st) .. ("rt.arrayassign_member(sh, %q, %q); pc = %d"):format(st.name, st.index, after)
+		return p
+	end
 	if arrayassign_ok(st, cx.lifted) then
 		local p = cx.newpc()
 		local parts = { "local __it = {}" }
+		local function asq()
+			if not parts.asq then -- (asked once per statement)
+				parts.asq = true
+				parts[#parts + 1] = ("local __as = sh:is_assoc(%q)"):format(st.name)
+			end
+		end
+		-- (bash's kvpair_assignment_p: after a keyed FIRST word, a bare word in an assoc
+		-- literal is an error reported as written, never expanded)
+		local kvfirst = st.elems[1] and st.elems[1].key == nil
 		for _, e in ipairs(st.elems) do
 			if e.key ~= nil then
 				-- keyed value: assign-context RHS (an all-literal ~ colon-expands via
@@ -6521,7 +6585,23 @@ H.arrayassign = function(cx, st, after)
 				local fl = unq_full_lit(e.word)
 				local valx = (fl and fl:find("~", 1, true)) and ("rt.tilde_assign(sh, %q)"):format(fl)
 					or emit_word(e.word, cx.lifted)
-				parts[#parts + 1] = ("__it[#__it+1] = {key=%q, op=%q, val=%s, src=%q, rawkey=%q}"):format(EF.static_key(e.key), e.op, valx, e.word and e.word.src or "", e.key)
+				local kw = EF.aa_keyword(e.key)
+				local keyx = kw and emit_word(kw, cx.lifted) or ("%q"):format(EF.static_key(e.key))
+				local item = ("do local __k = %s; __it[#__it+1] = {key=__k, op=%q, val=%s, src=%q, rawkey=%q} end"):format(
+					keyx, e.op, valx, e.word and e.word.src or "", e.key)
+				if e.brace_bare then -- an INDEXED target de-keys it: `[k]=` literal in each brace word
+					asq()
+					local bf = {}
+					for _, bw in ipairs(e.brace_bare) do
+						bf[#bf + 1] = emit_fields_into("__it", bw, cx.lifted, "{val=%s}")
+					end
+					item = ("if __as then %s else %s end"):format(item, table.concat(bf, "; "))
+				end
+				parts[#parts + 1] = item
+			elseif not kvfirst and not empty_word(e.word) then
+				asq()
+				parts[#parts + 1] = ("if __as then __it[#__it+1] = {src=%q} else %s end"):format(
+					e.word.src, emit_fields_into("__it", e.word, cx.lifted, "{val=%s}"))
 			elseif not empty_word(e.word) then
 				-- a bare word field-splits and globs for an INDEXED target, but is one plain word
 				-- in an ASSOCIATIVE key/value list (bash) — which one is only known at run time.
@@ -6532,10 +6612,7 @@ H.arrayassign = function(cx, st, after)
 					parts[#parts + 1] = emit_fields_into("__it", e.word, cx.lifted,
 						fl == e.word.src and "{val=%s}" or ("{val=%s" .. srcf .. "}"))
 				else
-					if not parts.asq then -- (asked once per statement)
-						parts.asq = true
-						parts[#parts + 1] = ("local __as = sh:is_assoc(%q)"):format(st.name)
-					end
+					asq()
 					parts[#parts + 1] = ("if __as then __it[#__it+1] = {val=%s%s} else %s end"):format(
 						emit_word(e.word, cx.lifted),
 						srcf,
@@ -6551,7 +6628,7 @@ H.arrayassign = function(cx, st, after)
 		cx.blocks[p] = dbg(st)
 			.. (cs and "do local n_ = sh.ncs; " or "do ")
 			.. table.concat(parts, "; ")
-			.. ("; rt.arrayassign(sh, %q, __it, %s)"):format(st.name, tostring(st.append and true or false))
+			.. ("; rt.arrayassign_stmt(sh, %q, __it, %s)"):format(st.name, tostring(st.append and true or false))
 			.. (cs and "; if sh.status == 0 and sh.ncs ~= n_ then sh.status = sh.last_cmdsub_status end end" or " end")
 			.. ecs
 			.. ("; pc = %d"):format(after)
@@ -6971,7 +7048,6 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
 
 	-- Statement types with no native compiled form yet -> always delegate.
 	cx.DELEGATE = {
-		parse_error = 1,
 		assignlist = 1,
 	}
 
@@ -7425,6 +7501,13 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
 		if cx.DELEGATE[t] then
 			return cx.delegate(st, after)
 		end
+		if t == "parse_error" or t == "warn" then -- (the report is data: rt prints it; a
+			-- fatal parse error raises its exit through the wrapper, lifted vars synced for EXIT)
+			return cx.delegate(st, after, {
+				callee = t == "warn" and "rt.warn_stmt" or "rt.parse_error_stmt",
+				callargs = ("sh, %s%s"):format(ser(st), EF.perr_label and (", %q"):format(EF.perr_label) or ""),
+			})
+		end
 		if t == "assign" then
 			return H.assign(cx, st, after)
 		elseif t == "funcdef" then
@@ -7698,7 +7781,8 @@ assemble = function(cfg, sig, opts)
 	-- pc -> source line, for error-message prefixes (read only on the error path)
 	local fname = sig:match("^local function ([%w_]+)") or sig:match("^([%w_]+) = function")
 		or sig:match("^(__CS%[%d+%]) = function")
-	if fname and cfg.pcline then
+	if fname and cfg.pcline and not (EF.trapline and fname == "run") then -- (a handler's
+		-- errors carry the interrupted line: sh.cur_line, via the INTERP_FRAMES runner)
 		local lt = {}
 		for p = 0, cfg.npc - 1 do
 			local ln = cfg.pcline[p]
@@ -7886,6 +7970,8 @@ function M.emit(ast, opts)
 	-- execution context, so a top-level return/break/continue must RAISE its signal for
 	-- the enclosing (delegated) cf-wrapper to catch, not jump to this fragment's own DONE.
 	EF.fragment = opts and opts.fragment or false
+	EF.trapline = opts and opts.trapline or false
+	EF.perr_label = opts and opts.perr_label or nil -- (an eval fragment's syntax errors: `eval: line N:`)
 	-- xtrace/verbose (`set -x`, `set -o xtrace`, `set -v`) trace per command; the compiled
 	-- tier has no trace hooks, so such a program stays in the interpreter (which traces).
 	if scan_xtrace(ast.stmts) then
@@ -7913,14 +7999,17 @@ function M.emit(ast, opts)
 	EF.ro_names = nil -- (this program's readonly names: computed on first need — func_locals)
 	EF.frag_nameref = EF.fragment and scan_nameref(ast.stmts) -- (the fragment's own text)
 	EF.has_nameref = EF.fragment or scan_nameref(ast.stmts) -- declare -n present → delegate scalar assigns
-	EF.has_err = scan_trap(ast.stmts, { ERR = 1 }) -- gate compiled ERR-trap firing
-	EF.has_debug = scan_trap(ast.stmts, { DEBUG = 1 }) -- gate compiled DEBUG-trap firing
+	-- (a runtime fragment — eval/source/a hot loop — also gets the hooks for the traps set
+	-- in the shell it compiles in: tier.trap_mode keys its cache by that state)
+	local fo = opts or {}
+	EF.has_err = fo.trap_err or scan_trap(ast.stmts, { ERR = 1 }) -- gate compiled ERR-trap firing
+	EF.has_debug = fo.trap_debug or scan_trap(ast.stmts, { DEBUG = 1 }) -- gate compiled DEBUG-trap firing
 	EF.funcstack = reads_debugstack(ast.stmts) -- gate FUNCNAME/BASH_SOURCE/BASH_LINENO stacks
 	EF.pipestatus = reads_var(ast.stmts, "PIPESTATUS") -- gate $PIPESTATUS after simple cmds
 	EF.has_trap = scan_any_trap(ast.stmts) -- gate compiled `&`/pipeline (forked child resets signal traps)
 	-- in-process subshell/$(…)/pipeline-stage gate: only a REAL-signal trap (or DEBUG under
 	-- functrace, which reaches into subshells) keeps them forked/delegated
-	EF.inproc_trap_block = EF.has_debug and scan_functrace(ast.stmts)
+	EF.inproc_trap_block = EF.has_debug and (fo.functrace or scan_functrace(ast.stmts))
 	-- (`&` still forks: a real-signal trap must be reset in its child — interp's machinery)
 	EF.bg_trap_block = scan_sigtrap(ast.stmts) or EF.inproc_trap_block
 	local funcflags, inlinable, inlinefns = {}, {}, {}
