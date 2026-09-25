@@ -81,7 +81,9 @@ function M.try_fragment(code, line1, sh, now, label, noalias) -- line1: an eval'
 	local mode = trap_mode(sh) .. (line1 == false and "H" or "") .. (label == "eval" and "V" or "")
 		.. (label == "cmdsub" and "C" or "") -- (a $( … ) body: its last command is marked, P.mark_tail)
 	local asig = not noalias and alias_sig(sh) -- (noalias: text read with its aliases expanded)
-	local key = mode .. "\0" .. (asig and ("A" .. asig .. "\0") or "") .. (line1 and (line1 .. "\0" .. code) or code)
+	-- (the live parse-time options the text is read under: posix mode, extglob)
+	local pst = (sh.opt_posix and "p" or "") .. (sh.shopt and sh.shopt.extglob and "x" or "-")
+	local key = mode .. pst .. "\0" .. (asig and ("A" .. asig .. "\0") or "") .. (line1 and (line1 .. "\0" .. code) or code)
 	local hit = frag_cache[key]
 	if hit ~= nil and hit ~= 0 then
 		return hit or nil
@@ -90,7 +92,7 @@ function M.try_fragment(code, line1, sh, now, label, noalias) -- line1: an eval'
 	if hit == nil and not now and not may_repeat(code) then
 		mod = 0 -- seen once: interpret now, compile if it recurs
 	else
-		mod = M.compile_fragment(code, line1, mode, asig and sh.aliases) or false
+		mod = M.compile_fragment(code, line1, mode, asig and sh.aliases, pst) or false
 	end
 	if frag_n >= FRAG_MAX then
 		frag_cache, frag_n = {}, 0
@@ -101,8 +103,9 @@ function M.try_fragment(code, line1, sh, now, label, noalias) -- line1: an eval'
 	frag_cache[key] = mod
 	return mod ~= 0 and mod or nil
 end
-function M.compile_fragment(code, line1, mode, atab)
-	-- (atab: the live alias table, expansion on — the parse starts from it)
+function M.compile_fragment(code, line1, mode, atab, pst)
+	-- (atab: the live alias table, expansion on — the parse starts from it; pst: the live
+	-- posix/extglob state, "p"?("x"|"-"), else the parse tracks them from the text)
 	local aenv = nil
 	if atab then
 		local tab = {}
@@ -111,7 +114,8 @@ function M.compile_fragment(code, line1, mode, atab)
 		end
 		aenv = { tab = tab }
 	end
-	local pok, ast = pcall(P.parse, code, nil, aenv, nil, nil, nil, line1 or nil)
+	local pok, ast = pcall(P.parse, code, nil, aenv, nil, pst and pst:find("p", 1, true) ~= nil or nil, nil,
+		line1 or nil, pst and pst:find("x", 1, true) ~= nil)
 	-- A syntax error becomes a `parse_error` statement after the valid prefix: compiled, it
 	-- reports and raises __curse_parseerr, which the caller (eval/source/trap) contains.
 	if not pok or type(ast) ~= "table" then

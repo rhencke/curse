@@ -94,9 +94,11 @@ return function(sh, cmd, args, hook, tcb)
 							if not pok and not (type(perr) == "table" and perr.__curse_parseerr) then
 								error(perr)
 							end
-							sh.status = lg.perr.status or 2
-							badsyntax = not ran
-							return
+							if not lg.perr.recoverable then
+								sh.status = lg.perr.status or 2
+								badsyntax = not ran
+								return
+							end -- (a recoverable one dropped its line: the eval goes on, status 1)
 						end
 						for _, st in ipairs(lg.stmts) do
 							ran = ran or not rt.perr_neutral(st)

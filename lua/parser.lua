@@ -1404,8 +1404,9 @@ local function parse_dquote(inner, add, heredoc, bt_keep)
 				i = i + 1
 			end
 		elseif c == "$" then
-			-- (a heredoc body's ${x-word} keeps a $'…' in word literal — bash)
-			i = parse_dollar(inner, i, heredoc and function(p)
+			-- (a heredoc body's ${x-word} keeps a $'…' in word literal — bash; so does a
+			-- "…" one in posix mode)
+			i = parse_dollar(inner, i, (heredoc or POSIX_DQ) and function(p)
 				if p.pexp then
 					p.pexp.hd = true
 				end
@@ -1761,6 +1762,8 @@ function M.parse_default_quoted(txt, heredoc)
 			end
 		elseif ch == '"' then
 			k = k + 1 -- drop the syntactic inner quote
+		elseif ch == "$" and txt:sub(k + 1, k + 1) == '"' then
+			k = k + 1 -- $"…" (a locale string): its text, as "…"
 		elseif ch == "$" and (txt:sub(k + 1, k + 1) == "(" or txt:sub(k + 1, k + 1) == "{") then
 			-- a nested $(…)/$((…))/${…} keeps its OWN quoting (`${u:-$(echo "p)q")}`): copy it
 			-- verbatim rather than dropping the quotes inside it
@@ -2499,7 +2502,8 @@ local function dequote_word(w)
 		elseif c == '"' then
 			i = i + 1
 			while i <= len and w:sub(i, i) ~= '"' do
-				if w:sub(i, i) == "\\" then
+				-- (inside "…" a backslash quotes only $ ` " \ and newline: `"E\F"` is E\F)
+				if w:sub(i, i) == "\\" and w:sub(i + 1, i + 1):find('^[$`"\\\n]') then
 					out[#out + 1] = w:sub(i + 1, i + 1)
 					i = i + 2
 				else
@@ -2522,9 +2526,17 @@ local function is_blank(ch)
 end
 -- the characters a word scan must look at (anything else just continues the word)
 local WORD_SPECIAL = "[\\()\"'$<>|&`; \t\n?*+@!]"
-local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs)
+-- bash's reserved words (word_token_alist)
+local RESERVED = { ["if"] = true, ["then"] = true, ["else"] = true, ["elif"] = true, ["fi"] = true,
+	["case"] = true, ["esac"] = true, ["for"] = true, ["select"] = true, ["while"] = true, ["until"] = true,
+	["do"] = true, ["done"] = true, ["in"] = true, ["function"] = true, ["time"] = true, ["{"] = true,
+	["}"] = true, ["!"] = true, ["[["] = true, ["]]"] = true, ["coproc"] = true }
+-- reserved words that open a compound command usable as a function body
+local FBODY_KW = { ["if"] = true, ["for"] = true, ["while"] = true, ["until"] = true, ["case"] = true, ["select"] = true }
+
+local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs, xg)
 	local i, n, line = 1, #src, lineabs or 1
-	local firstline = lineabs or 1 -- (the text's first line: an EOF error counts from it)
+	local firstline = lineabs or line0 or 1 -- (the text's first line: an EOF error counts from it)
 	local orig_src = src -- (alias expansion splices into src; an error echoes the line as written)
 	if line0 then -- a $(…) body numbers from its command's line; leading newlines don't count
 		line = line0 - #(src:match("^[ \t\n]*"):gsub("[^\n]", ""))
@@ -2541,7 +2553,7 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs)
 	-- makes the following word alias-eligible too.
 	local alias_on = false -- shopt expand_aliases state (from source)
 	local posix_on = posix or false -- set -o posix state (from source; sh.opt_posix when interpreting)
-	local extglob_on = false -- shopt extglob state (from source; the live sh.shopt when interpreting)
+	local extglob_on = xg or false -- shopt extglob state (from source; the live sh.shopt when interpreting)
 	local aliases = {} -- name -> value (from parsed `alias` commands)
 	if aenv then -- a nested body ($(…)) starts from its enclosing line's static state
 		alias_on = true
@@ -2749,6 +2761,11 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs)
 			if val == nil or alias_seen[cand] then
 				break
 			end
+			-- posix mode checks for a reserved word BEFORE alias expansion (parse.y's
+			-- read_token_word): one where a command starts is never an alias there
+			if cmdpos and RESERVED[cand] and (sh and sh.opt_posix or (not sh and posix_on)) then
+				break
+			end
 			line = line + nls -- (the spliced-out continuations' newlines)
 			local L = re - rs + 1
 			-- the end of an expansion delimits the token (bash mk_alexpansion adds a space) —
@@ -2852,7 +2869,7 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs)
 					break
 				end
 				-- a $(…) body's final `DELIM )` line reached here as `DELIM ` (see scan_cmdsub)
-				if le > n and lstr:match("^(.-)[ \t]+$") == hd.delim then
+				if le > n and line0 and lstr:match("^(.-)[ \t]+$") == hd.delim then
 					found = true
 					break
 				end
@@ -2980,6 +2997,62 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs)
 				msg = ("warning: here-document at line %d delimited by end-of-file (wanted `%s')"):format(at(rp), d) }
 		end
 	end
+	-- extglob is known to be OFF: the live shell's option when interpreting (the static,
+	-- source-tracked state is only a guess — `shopt -s extglob` in a called function,
+	-- BASHOPTS, `bash -O` — so the sh-less path never rejects a pattern on it)
+	local function xg_off()
+		if sh then
+			return sh.shopt ~= nil and not sh.shopt.extglob
+		end
+		return xg == false and not extglob_on -- (the live state the text started from, if given)
+	end
+	-- from just past an extglob `X(`, to just past its matching `)`
+	local function scan_extglob(k)
+		local d = 1
+		while k <= n do
+			local cc = src:byte(k)
+			if cc == 92 then -- \
+				k = k + 2
+			elseif cc == 39 then -- '
+				k = (src:find("'", k + 1, true) or n) + 1
+			elseif cc == 34 then -- "
+				k = k + 1
+				while k <= n and src:byte(k) ~= 34 do
+					k = k + (src:byte(k) == 92 and 2 or 1)
+				end
+				k = k + 1
+			else
+				if cc == 40 then
+					d = d + 1
+				elseif cc == 41 then
+					d = d - 1
+					if d == 0 then
+						return k + 1
+					end
+				end
+				k = k + 1
+			end
+		end
+		comsub_eof = false -- (reported at the line it began on)
+		error("unexpected EOF while looking for matching `)'")
+	end
+	-- a syntax error in a $( … ) body: parse_comsub's jump_to_top_level(FORCE_EOF) — an eval'd
+	-- text's one ends the (non-interactive) shell, status 1
+	-- could an alias change how this $( … ) body parses? (one of the live names is in it)
+	local function alias_touch(body)
+		local on, tab = alias_state()
+		if on and tab then
+			for k in pairs(tab) do
+				if body:find(k, 1, true) then
+					return true
+				end
+			end
+		end
+		return false
+	end
+	local function comsub_err(cerr)
+		error({ __curse_perr = true, msg = cerr, line = cerr:find("near `", 1, true) and line or nil, forceeof = true }, 0)
+	end
 	local function word(stop_paren, stop_cmp) -- read one shell word, keeping quotes and $(( )) / ${ } / $( ) balanced
 		ws()
 		local start, line0, lfix = i, line, 0
@@ -3026,6 +3099,9 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs)
 							else
 								i = i + 1
 							end
+						end
+						if i > n then
+							error("unexpected EOF while looking for matching ``'")
 						end
 						i = i + 1
 					else
@@ -3083,12 +3159,11 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs)
 					local cbody = src:sub(i + 2, je - 2)
 					-- (not when the static parse could be wrong: aliases in play, extglob
 					-- patterns, here-documents)
-					if not hdp and not alias_on and src:sub(i + 2, i + 2) ~= "(" and not cbody:find("[@!+*?]%(")
-						and not cbody:find("<<", 1, true)
-						and not (sh and sh.shopt and sh.shopt.expand_aliases and sh.aliases and next(sh.aliases)) then
+					if not hdp and src:sub(i + 2, i + 2) ~= "(" and not cbody:find("[@!+*?]%(")
+						and not cbody:find("<<", 1, true) and not alias_touch(cbody) then
 						local cerr = comsub_syntax(cbody)
 						if cerr then
-							error(cerr)
+							comsub_err(cerr)
 						end
 					end
 					if hdp then
@@ -3128,19 +3203,13 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs)
 				-- <(cmd) / >(cmd) process substitution: part of the word — scanned like $(…)
 				-- (its body has its own quoting / case syntax)
 				i = scan_cmdsub(src, i + 2)
-			elseif (c == "?" or c == "*" or c == "+" or c == "@" or c == "!") and src:sub(i + 1, i + 1) == "(" then
-				-- extglob ?(..) *(..) +(..) @(..) !(..): part of the word, not a subshell
-				i = i + 2
-				local d = 1
-				while i <= n and d > 0 do
-					local cc = src:sub(i, i)
-					if cc == "(" then
-						d = d + 1
-					elseif cc == ")" then
-						d = d - 1
-					end
-					i = i + 1
-				end
+			elseif (c == "?" or c == "*" or c == "+" or c == "@" or c == "!") and src:sub(i + 1, i + 1) == "("
+				and (stop_cmp or not xg_off()) then
+				-- extglob ?(..) *(..) +(..) @(..) !(..): part of the word, not a subshell —
+				-- decided when the line is PARSED (bash's lexer checks extended_glob; a [[ ]]
+				-- pattern always allows it). Quotes and `\` inside don't count toward the
+				-- parens (parse_matched_pair).
+				i = scan_extglob(i + 2)
 			elseif c == "<" or c == ">" or c == "|" or c == "&" then
 				break -- metacharacters end a word: redirs (procsub <(/>( handled above), `|`/`&` pipelines/lists & `&&`/`||`/`>&` need no surrounding space
 			elseif c == "$" and src:sub(i + 1, i + 1) == "{" then
@@ -3181,13 +3250,15 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs)
 		local save, l0 = i, line
 		ws()
 		local s, e = src:find("^[%a_][%w_]*", i)
-		local w = s and src:sub(s, e) or nil
+		-- (a reserved word is a whole token: `if=1`, `do.x`, `fi-2` are ordinary words)
+		local w = s and not src:find("^[^%s;&|()<>]", e + 1) and src:sub(s, e) or nil
 		i = save
 		pk_i, pk_src, pk_w, pk_dl = save, src, w, line - l0
 		return w
 	end
 
 	local brace_group
+	local parse_command -- forward (a function body may be any compound command)
 	-- A for/select body: `do … done`, or bash's `{ … }` alternative
 	-- (`for ((i=0; i<3; i++)) { echo $i; }`, `for x in a b; { …; }`).
 	local function loop_body()
@@ -3195,8 +3266,13 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs)
 		if src:sub(i, i) == "{" then
 			return brace_group()
 		end
-		if peekword() == "do" then
+		if peekword() == "do" and not src:sub(i + 2, i + 2):match("[^%s;&|()<>]") then
 			i = i + 2
+		elseif i > n then
+			error("syntax error: unexpected end of file")
+		else -- (bash: the token where `do` or `{` belongs)
+			local tok = src:match("^[^%s;&|()<>]+", i) or src:match("^[;&|]+", i) or src:sub(i, i)
+			error("syntax error near `" .. tok .. "'")
 		end
 		local body, term = parse_stmts({ done = true })
 		if term ~= "done" then
@@ -3206,8 +3282,11 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs)
 	end
 	brace_group = function() -- parse `{ stmts }` (a function body / group)
 		ws()
-		if src:sub(i, i) ~= "{" then -- (bash: the token found instead)
-			local tok = peekword() or src:sub(i, i)
+		if i > n then
+			error("syntax error: unexpected end of file")
+		end
+		if src:sub(i, i) ~= "{" or src:find("^[^%s;&|()<>]", i + 1) then -- (bash: the token found instead)
+			local tok = src:match("^[^%s;&|()<>]+", i) or peekword() or src:sub(i, i)
 			error("syntax error near `" .. (tok ~= "" and tok or "newline") .. "'")
 		end
 		i = i + 1
@@ -3234,6 +3313,18 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs)
 			ws()
 		end -- bash allows newlines before the body
 		local bline = line -- the body's first line (a traced call's entry DEBUG reports it)
+		-- any compound command is a body (bash's function_body: shell_command): `f() if …
+		-- fi`, `f() for …`, `f() [[ … ]]`, `f() (( … ))`, `function f case … esac`
+		local kw = src:match("^[%a]+", i)
+		if (kw and FBODY_KW[kw] and not src:find("^[^%s;&|()<>]", i + #kw))
+			or src:find("^%[%[[ \t\n]", i) or src:sub(i, i + 1) == "((" then
+			local node = parse_command()
+			if node.t ~= "subshell" then
+				return { node }, bline
+			end
+			-- (`((` that was two nested subshells: the subshell body, as below)
+			return { node }, bline, true
+		end
 		if src:sub(i, i) == "(" then
 			i = i + 1
 			local body, pterm = parse_stmts({ [")"] = true })
@@ -3452,20 +3543,9 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs)
 			elseif c == "(" then
 				-- an ELEMENT can't be `(` (a nested `()`, as in `a=( inside=() )`): bash
 				-- reports a syntax error but the assignment is NON-fatal (the var stays
-				-- unset, the script CONTINUES). Resync past the outer `)` that closes the
-				-- array, then raise a RECOVERABLE error the line-parser marks as such.
-				local depth = 0
-				while i <= n do
-					local ch = src:sub(i, i)
-					if ch == "(" then
-						depth = depth + 1
-					elseif ch == ")" then
-						depth = depth - 1
-						if depth < 0 then
-							i = i + 1
-							break
-						end
-					end
+				-- unset, the script CONTINUES). Like an operator above, the error discards
+				-- the rest of the LINE; raise a RECOVERABLE error the line-parser marks so.
+				while i <= n and src:sub(i, i) ~= "\n" do
 					i = i + 1
 				end
 				error({ __curse_arraylit = true })
@@ -3603,10 +3683,11 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs)
 				end
 			end
 		end
-		if not closed then -- (never closed: bash's error, at the line it began on)
-			line = line0
+		if not closed then -- (never closed: bash's error, at the line it began on — status 1,
+			-- and a DISCARD: an eval'd one ends a subshell)
 			comsub_eof = false
-			error("unexpected EOF while looking for matching `)'")
+			error({ __curse_perr = true, line = line0, status = 1, discard = true,
+				msg = "unexpected EOF while looking for matching `)'" }, 0)
 		end
 		return elems
 	end
@@ -3708,7 +3789,7 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs)
 		return { t = "assign", name = name, index = subidx, append = (op == "+="), rhs = parse_word(raw) }
 	end
 
-	local function parse_command()
+	parse_command = function()
 		ws()
 		-- expand a leading alias in place (handles a compound-command alias like LEFT='{'
 		-- before dispatch; the command-word case with leading assignments/redirects re-runs
@@ -3730,7 +3811,16 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs)
 		-- coproc [NAME] compound-command | coproc simple-command: an async command wired to
 		-- the shell by two pipes. A NAME (default COPROC) is only allowed before a COMPOUND
 		-- command — before a simple one, that word is the command (bash).
-		if peekword() == "coproc" and is_blank(src:sub(i + 6, i + 6)) then
+		if peekword() == "coproc" and not src:find("^[^%s;&|()<>]", i + 6) and src:sub(i, i + 5) == "coproc" then
+			local k = i + 6
+			while is_blank(src:sub(k, k)) do
+				k = k + 1
+			end
+			local c = src:sub(k, k)
+			if c == "" or c == "\n" or c == ";" or c == "&" or c == "|" or c == ")" then -- (no command)
+				local tok = c == "" and "newline" or c == "\n" and "newline" or src:match("^[;&|]+", k) or c
+				error("syntax error near `" .. tok .. "'")
+			end
 			ws()
 			i = i + 6
 			ws()
@@ -3746,7 +3836,8 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs)
 			if not compound_at(i) then
 				-- (any word: an invalid NAME — `coproc @ {…}` — is a runtime error, bash)
 				local s, e = src:find("^[^%s;&|()<>]+", i)
-				if s then
+				-- (an assignment word is never the NAME: it starts a simple command)
+				if s and not src:find("^[%a_][%w_]*%+?=", s) and not src:find("^[%a_][%w_]*%b[]%+?=", s) then
 					local k = e + 1
 					while is_blank(src:sub(k, k)) do
 						k = k + 1
@@ -3767,8 +3858,8 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs)
 			ws()
 			local s, e = src:find("^[%w_:%.+@/%%%^~,!][%w_%.%-:+@/!#=%%%^~,]*", i)
 			if not s then
-				if i > n then
-					error("syntax error: unexpected end of file")
+				if i > n then -- (the input's final newline is the token: bash)
+					error("syntax error near `newline'")
 				end
 				local tok = src:match("^[;&|]+", i) or src:sub(i, i)
 				error("syntax error near `" .. (tok == "\n" and "newline" or tok) .. "'")
@@ -3873,7 +3964,18 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs)
 			i = i + (issel and 6 or 3)
 			ws()
 			if not issel and src:sub(i, i + 1) == "((" then
+				if not src:find(")", i + 2, true) then
+					comsub_eof = false
+					error("unexpected EOF while looking for matching `)'")
+				end
 				local body, ni = grab_dparen(src, i + 2)
+				if src:byte(ni - 1) ~= 41 then
+					-- `for ((…)` closed by a lone `)`: bash's parse_dparen fails and its re-read
+					-- as `(` tokens stops at the word after the `)`, else at the header's tail
+					local nx = src:match("^[ \t]*([^%s;&|()<>]+)", ni - 1)
+					error({ __curse_perr = true, exact = true, line = line, msg = "syntax error near `"
+						.. (nx or ((body:match(".*(;.*)$") or ("((" .. body)) .. ")")) .. "'" }, 0)
+				end
 				i = ni
 				-- split the header at its top-level `;`s — not inside quotes, $(…), ${…}
 				local slots, k0, k, bn = {}, 1, 1, #body
@@ -3897,18 +3999,18 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs)
 					end
 				end
 				slots[#slots + 1] = body:sub(k0)
-				if #slots ~= 3 then -- (bash then shows the whole `(( … ))')
+				local a, b, c = slots[1], slots[2], slots[3]
+				loopId = loopId + 1
+				local id = loopId
+				local h1 = i -- (past the header: a hot loop's fragment re-states it without init)
+				local body_stmts = loop_body()
+				if #slots ~= 3 then -- (bash then shows the whole `(( … ))'; only once the body is read)
 					error({
 						__curse_perr = true,
 						msg = #slots < 3 and "syntax error: arithmetic expression required" or "syntax error: `;' unexpected",
 						text = "((" .. body .. "))",
 					})
 				end
-				local a, b, c = slots[1], slots[2], slots[3]
-				loopId = loopId + 1
-				local id = loopId
-				local h1 = i -- (past the header: a hot loop's fragment re-states it without init)
-				local body_stmts = loop_body()
 				local s1 = i - 1
 				-- Parse each arith slot eagerly, but a SYNTAX ERROR in a slot (`i='3'`,
 				-- `++'i'`) is deferred to runtime — bash reports such an error when the loop
@@ -3946,8 +4048,8 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs)
 			try_alias(false)
 			local s, e = src:find("^[^%s;#()]+", i)
 			if not s then -- (bash: the token found instead of a name)
-				if i > n then
-					error("syntax error: unexpected end of file")
+				if i > n then -- (the input's final newline is the token: bash)
+					error("syntax error near `newline'")
 				end
 				local tok = src:match("^[;&|]+", i) or src:sub(i, i)
 				error("syntax error near `" .. (tok == "\n" and "newline" or tok) .. "'")
@@ -3973,7 +4075,7 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs)
 			local words = {}
 			try_alias(false)
 			do -- (after the name: `in`, `do`, or a separator — `for x y` is an error)
-				local pw, c = peekword(), src:sub(i, i)
+				local pw, c = peekword() or src:match("^[^%s;&|()<>]+", i), src:sub(i, i)
 				if pw and pw ~= "" and pw ~= "in" and pw ~= "do" and not c:match("[;\n&|()]") and i <= n then
 					error("syntax error near `" .. pw .. "'")
 				end
@@ -4264,7 +4366,7 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs)
 			return { t = "dbracket", line = line, expr = parse_dbracket(toks, quoted), redirs = tail_redirs() }
 		end
 		-- brace group { list; }  and subshell ( list )  — optional trailing redirs
-		if src:sub(i, i) == "{" and src:sub(i + 1, i + 1):match("[ \t\n]") then
+		if src:sub(i, i) == "{" and (i + 1 > n or src:find("^[%s;&|()<>]", i + 1)) then
 			i = i + 1
 			local body, term = parse_stmts({ ["}"] = true })
 			if term ~= "}" then
@@ -4318,7 +4420,7 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs)
 			local subw = word(true)
 			if subw == "" then
 				local c = src:sub(i, i)
-				error("syntax error near `" .. (c == "\n" and "newline" or (c == "" and "esac" or c)) .. "'")
+				error("syntax error near `" .. ((c == "\n" or c == "") and "newline" or c) .. "'")
 			end
 			local subject = parse_word(subw)
 			while src:sub(i, i):match("[ \t\n]") do
@@ -4330,10 +4432,18 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs)
 			if peekword() == "in" then
 				i = i + 2
 			else -- (bash: the token that isn't `in`)
-				error("syntax error near `" .. (peekword() or src:sub(i, i)) .. "'")
+				if i > n then -- (newlines may come before `in`: the input just ended)
+					error("syntax error: unexpected end of file")
+				end
+				local l0 = line
+				local w = word(true)
+				line = l0
+				error("syntax error near `" .. (w ~= "" and w or src:match("^[;&|<>]+", i) or src:sub(i, i)) .. "'")
 			end -- ysh `case (x) { }` etc. rejected
 			-- separator skipper that STOPS at ;; (so a clause body ends there)
-			local function skip_sep()
+			-- (semi_ok: one `;` may end the statement just read; anywhere else — a clause's
+			-- start, after a newline — a `;` is an empty command, bash's syntax error)
+			local function skip_sep(semi_ok)
 				while i <= n do
 					if src:sub(i, i + 2) == ";;&" then
 						return "dsemi_amp"
@@ -4355,7 +4465,13 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs)
 							if not (alias_nl and alias_nl[i]) then line = line + 1 end
 							i = i + 1
 						end
-					elseif c:match("[ \t;]") then
+					elseif c == " " or c == "\t" then
+						i = i + 1
+					elseif c == ";" then
+						if not semi_ok then
+							error("syntax error near `;'")
+						end
+						semi_ok = false
 						i = i + 1
 					elseif c == "#" then
 						while i <= n and src:sub(i, i) ~= "\n" do
@@ -4363,6 +4479,9 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs)
 						end
 					else
 						return nil
+					end
+					if c == "\n" then
+						semi_ok = false
 					end
 				end
 				return "eof"
@@ -4387,8 +4506,33 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs)
 				-- read to the clause-terminating ), balancing extglob parens @(a|b) and
 				-- copying quoted sections verbatim (their ) / | are not structural).
 				local patstr, depth = {}, 0
-				while i <= n do
+				local wantw = true -- (a pattern word must come first and after each `|`)
+				while true do
 					local c = src:sub(i, i)
+					if c == "" and depth > 0 then
+						comsub_eof = false
+						error("unexpected EOF while looking for matching `)'")
+					end
+					if depth == 0 then
+						if wantw and is_blank(c) then
+							ws()
+							c = src:sub(i, i)
+						end
+						-- an operator where a pattern word belongs, or one ending a word
+						-- (bash's tokens: `a|)`, `|a)`, `)`, `x|(z)`, `a;;esac`, `a&)`)
+						if (wantw and (c == ")" or c == "|" or c == "(")) or c == ";" or c == "&"
+							or (c == "|" and src:find("^[|&]", i + 1))
+							or c == "<" or c == ">" or c == "\n" or c == "" then
+							local tok = (c == "\n" or c == "") and "newline" or src:match("^;;&", i) or src:match("^;[;&]", i)
+								or src:match("^|[|&]", i) or src:match("^&[&>]", i) or c
+							error("syntax error near `" .. tok .. "'")
+						end
+						wantw = c == "|"
+						-- `(` is a group only after an extglob prefix, when extglob is on
+						if c == "(" and not (patstr[#patstr] and patstr[#patstr]:match("^[?*+@!]$") and not xg_off()) then
+							error("syntax error near `('")
+						end
+					end
 					if c == ")" and depth == 0 then
 						break
 					end
@@ -4413,6 +4557,9 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs)
 							patstr[#patstr + 1] = src:sub(i, i)
 							i = i + 1
 						end
+						if i > n then
+							error("unexpected EOF while looking for matching `" .. c .. "'")
+						end
 						patstr[#patstr + 1] = src:sub(i, i)
 						i = i + 1
 					elseif c == "$" and src:sub(i + 1, i + 1) == "(" and src:sub(i + 2, i + 2) ~= "(" then
@@ -4423,11 +4570,26 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs)
 						if not alias_on and not cbody:find("[@!+*?]%(") and not cbody:find("<<", 1, true) then
 							local cerr = comsub_syntax(cbody)
 							if cerr then
-								error(cerr)
+								comsub_err(cerr)
 							end
 						end
 						patstr[#patstr + 1] = src:sub(i, je - 1)
 						i = je
+					elseif c == "$" and src:sub(i + 1, i + 2) == "((" then -- $(( … )): one word part
+						local _, je = grab_dparen(src, i + 3)
+						patstr[#patstr + 1] = src:sub(i, je - 1)
+						i = je
+					elseif c == "$" and src:sub(i + 1, i + 1) == "{" then -- ${ … }
+						local je = scan_braces(src, i + 1)
+						patstr[#patstr + 1] = src:sub(i, je - 1)
+						i = je
+					elseif c == "`" then
+						local je = i + 1
+						while je <= n and src:sub(je, je) ~= "`" do
+							je = je + (src:sub(je, je) == "\\" and 2 or 1)
+						end
+						patstr[#patstr + 1] = src:sub(i, je)
+						i = je + 1
 					else
 						if c == "(" then
 							depth = depth + 1
@@ -4464,8 +4626,9 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs)
 				local body, term = {}, "break"
 				local svs = cur_stopset
 				cur_stopset = { esac = true } -- (a clause body may run straight into `esac`)
+				local semi_ok = false
 				while true do
-					local s = skip_sep()
+					local s = skip_sep(semi_ok)
 					if s == "dsemi" then
 						i = i + 2
 						term = "break"
@@ -4495,6 +4658,7 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs)
 						break -- other no-progress (guard against spinning)
 					end
 					body[#body + 1] = st
+					semi_ok = true
 				end
 				cur_stopset = svs
 				clauses[#clauses + 1] = { pats = pats, body = body, term = term }
@@ -4582,6 +4746,16 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs)
 				-- (the `(` can't be a command word there; `a=(1 2)` with no space is an
 				-- array assignment, parsed earlier). (extglob @(…), $(…), <(…) are consumed
 				-- inside word(); `((` is left to break so `a (( … ))` reaches arith.)
+				if #words == 1 and #assigns == 0 and #redirs == 0 then
+					-- (a lone word then `(` began a `NAME ( )` funcdef: bash wanted the `)`)
+					local k = i + 1
+					while is_blank(src:sub(k, k)) do
+						k = k + 1
+					end
+					local c2 = src:sub(k, k)
+					error("syntax error near `" .. ((c2 == "" or c2 == "\n") and "newline"
+						or src:match("^[^%s;&|()<>]+", k) or src:match("^[;&|<>]+", k) or c2) .. "'")
+				end
 				error("syntax error near `('")
 			elseif c == "\n" or c == ";" or c == "#" or c == "&" or c == "|" or c == "(" or c == ")" then
 				break -- ( ) are metacharacters (subshell bounds)
@@ -4724,11 +4898,17 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs)
 		-- `! time cmd`, `time ! cmd`, `time time cmd`); each `!` toggles the inversion
 		local sawbang = false
 		while true do
+			-- (outside posix mode a reserved word is recognized AFTER alias expansion:
+			-- `alias bang='!'` negates — parse.y's read_token_word)
+			if cmd_prex ~= i then
+				try_alias(true)
+				cmd_prex = i
+			end
 			if time_at(i) then
 				timed = true
 				i = i + 4
 				ws()
-				while src:sub(i, i + 1) == "-p" and src:sub(i + 2, i + 2):match("[ \t\n]") do
+				while src:sub(i, i + 1) == "-p" and not src:find("^[^%s;&|()<>]", i + 2) do
 					timed_p = true
 					i = i + 2
 					ws()
@@ -4820,6 +5000,9 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs)
 					end
 				end
 				operand_check()
+				if bang_at(i) then -- (`!` only starts a pipeline: bash's grammar)
+					error("syntax error near `!'")
+				end
 				cmds[#cmds + 1] = parse_command()
 			else
 				break
@@ -5006,7 +5189,9 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs)
 					done = true
 				end
 				return {
-					stmts = stmts,
+					-- (bash's DISCARD: a recoverable error drops the whole line — what ran
+					-- before it on the line too, as bash parses a line before running it)
+					stmts = recover and {} or stmts,
 					perr = {
 						t = "parse_error",
 						-- (a recoverable one, or a `near TOKEN` one: the token's line)
@@ -5020,6 +5205,8 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs)
 						text = type(st) == "table" and st.__curse_perr and st.text or nil,
 						showtext = type(st) == "table" and st.__curse_perr and st.text and true or nil,
 						recoverable = recover or nil,
+						discard = type(st) == "table" and st.__curse_perr and st.discard or nil,
+						forceeof = type(st) == "table" and st.__curse_perr and st.forceeof or nil,
 					},
 				}
 			end
@@ -5140,9 +5327,9 @@ end
 -- program, and by callers that want the AST). An optional `sh` makes alias
 -- expansion consult the live runtime table (for eval/source/$() at runtime); the
 -- compiler passes none, so it tracks aliases deterministically from source.
-function M.parse(src, sh, aenv, noalias, posix, line0, line1)
+function M.parse(src, sh, aenv, noalias, posix, line0, line1, xg)
 	local saved_env, sprex, spdq = ALIAS_ENV, COMSUB_PREX, POSIX_DQ
-	local nextf = make_parser(src, sh, aenv, noalias, posix, line0, line1) -- yields logical-line groups { stmts, perr }
+	local nextf = make_parser(src, sh, aenv, noalias, posix, line0, line1, xg) -- yields logical-line groups { stmts, perr }
 	local stmts, lines = {}, {}
 	while true do
 		local lg = nextf()
