@@ -3084,8 +3084,7 @@ function M.for_assign(sh, name, v)
 		return true
 	end
 	-- (the loop variable is bound like an assignment: declare -i evaluates, -l/-u fold)
-	local tb = b and sh.vars[sh:deref(name)] or b
-	if tb and (tb.int or tb.lower or tb.upper) and not tb.arr then
+	if b and (b.int or b.lower or b.upper) and not b.arr then
 		M.assign_scalar(sh, name, v)
 		return true
 	end
@@ -10638,9 +10637,9 @@ end
 -- there is top_level_cleanup + jump_to_top_level(DISCARD) (variables.c): the whole
 -- TOP-LEVEL command is abandoned — every function, eval and source level unwinds
 -- (`__curse_discard`: those builtins don't contain it), a subshell exits 1, $? is 1,
--- and neither set -e nor posix mode makes it fatal. A plain number takes no pcall.
+-- and neither set -e nor posix mode makes it fatal. A plain decimal takes no pcall.
 function M.int_value(sh, s, ev)
-	if M.looks_numeric(s) then
+	if short_digits(s) and (s:byte(1) ~= 48 or #s == 1) then -- (010 is octal)
 		return M.arith_num(s)
 	end
 	local ok, v = pcall(ev or M.arith_str, sh, s)
@@ -10656,7 +10655,7 @@ end
 -- int_value inside a builtin (declare/local/export/readonly): its errors name the builtin
 -- (bash's this_command_name: `declare: 3 x: syntax error …`)
 function M.int_value_as(sh, cmd, s, ev)
-	if M.looks_numeric(s) then
+	if short_digits(s) and (s:byte(1) ~= 48 or #s == 1) then
 		return M.arith_num(s)
 	end
 	local P = require("parser")
