@@ -2260,9 +2260,18 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs)
 	-- bash parses a whole line before running any of it, so an alias/unalias/shopt on a
 	-- line takes effect from the NEXT line: queue them, apply at the next line's start.
 	local alias_pending = {}
-	local alias_seen -- names being expanded now (recursion guard)
-	local alias_next = false -- next word is eligible (prev value ended blank)
-	local alias_tail = nil -- byte position just past the current expansion
+	-- bash's pushed_string_list: each expansion in progress is a stack entry { name, end
+	-- position (just past its spliced text), value-ends-blank }. An entry pops once the
+	-- parser reaches a word at/after its end — innermost first — and each pop sets the
+	-- next word's eligibility from ITS value (pop_string's PST_ALEXPNEXT), so the last
+	-- (outermost) finished expansion decides; a word that isn't expanded clears it. A name
+	-- on the stack is AL_BEINGEXPANDED: not expanded again until its text is consumed.
+	local astk, astk_n = {}, 0
+	local alias_seen = {} -- names on astk (recursion guard)
+	local alias_next = false -- the next word is eligible (PST_ALEXPNEXT)
+	-- positions of newlines spliced in from alias values: bash reads those from the pushed
+	-- string, so they don't advance line_number (nil while there are none)
+	local alias_nl = nil
 	-- The static (fully-literal, unquoted) text of a word, or nil if any part is an
 	-- expansion/quoted-out — used to read alias/shopt/unalias operands from source.
 	local function static_word(w)
@@ -2332,7 +2341,8 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs)
 							end
 							rest[#rest + 1] = w.parts[p].lit
 						end
-						if ok and name ~= "" then
+						-- (legal_alias_name: no shellbreak/quote/`$`/`/` char — b_alias.lua)
+						if ok and name ~= "" and not name:find("[ \t\n()<>;&|'\"`\\$/]") then
 							aliases[name] = table.concat(rest)
 						end
 					end
@@ -2352,6 +2362,7 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs)
 				local a, b = static_word(node.words[k]), static_word(node.words[k + 1])
 				if (a == "-o" or a == "+o") and b == "posix" then
 					posix_on = a == "-o"
+					alias_on = posix_on -- (posix_initialize: on sets expand_aliases, off resets it)
 				end
 			end
 		end
@@ -2395,22 +2406,22 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs)
 		POSIX_DQ = posix_on
 	end
 	-- Try to expand an alias at the current position. `cmdpos` = command position
-	-- (always eligible); otherwise eligible only via trailing-blank chaining, and
-	-- only once the parser has consumed past the value that set the flag.
+	-- (always eligible); otherwise eligible only via trailing-blank chaining: the flag the
+	-- expansions finished before this word leave (see astk).
 	local function try_alias(cmdpos)
 		local on, tab = alias_state()
 		if not on then
 			return
 		end
-		if not cmdpos then
-			if not (alias_next and alias_tail and i >= alias_tail) then
-				return
-			end
-			-- Now past the previous value: this is a fresh input word, so the guard
-			-- resets (bash only blocks an alias WITHIN its own value's expansion, not a
-			-- separate later occurrence — `echo-x echo-x` expands both). The word's own
-			-- value recursion below still accumulates into the fresh guard.
-			alias_seen = {}
+		-- pop_string for each expansion whose text is consumed (the word starts past it)
+		while astk_n > 0 and astk[astk_n][2] <= i do
+			local e = astk[astk_n]
+			astk[astk_n], astk_n = nil, astk_n - 1
+			alias_seen[e[1]] = nil
+			alias_next = e[3]
+		end
+		if not (cmdpos or alias_next) then
+			return
 		end
 		-- a `\<newline>` continuation (plus blanks) before the word is just whitespace: skip
 		-- it so a trailing-blank alias chain continues onto the next line
@@ -2428,15 +2439,25 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs)
 				break
 			end
 			local nextch = src:sub(re + 1, re + 1)
+			local cand, nls = nil, 0
+			-- a `\<newline>` is gone before bash tokenizes (shell_getc): the word runs on
+			-- past it (`E\<nl> x` is `E x`, `E\<nl>X` is `EX`)
+			while nextch == "\\" and src:sub(re + 2, re + 2) == "\n" do
+				local more = src:match("^[^ \t\n|&;()<>'\"`\\$]*", re + 3)
+				cand = (cand or src:sub(rs, re)) .. more
+				nls = nls + 1
+				re = re + 2 + #more
+				nextch = src:sub(re + 1, re + 1)
+			end
 			if nextch ~= "" and nextch:match("['\"`\\$]") then
 				break
 			end -- not a pure literal word
-			local cand = src:sub(rs, re)
+			cand = cand or src:sub(rs, re)
 			local val = tab and tab[cand]
 			if val == nil or alias_seen[cand] then
 				break
 			end
-			alias_seen[cand] = true
+			line = line + nls -- (the spliced-out continuations' newlines)
 			local L = re - rs + 1
 			-- the end of an expansion delimits the token (bash mk_alexpansion adds a space) —
 			-- `alias foo='echo 0'; foo>&2` is `echo 0 >&2`, not `echo 0>&2` — except after a
@@ -2466,21 +2487,35 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs)
 			end
 			src = src:sub(1, rs - 1) .. ins .. src:sub(re + 1)
 			n = #src
-			if alias_tail == nil then
-				alias_tail = rs + #ins
-			else
-				alias_tail = alias_tail + (#ins - L)
+			-- the enclosing expansions' texts (and their newlines) grow around the splice
+			local d = #ins - L
+			for k = 1, astk_n do
+				astk[k][2] = astk[k][2] + d
 			end
-			alias_next = val:match("[ \t]$") ~= nil
+			if alias_nl then
+				local moved = {}
+				for p in pairs(alias_nl) do
+					moved[p > re and p + d or p] = true
+				end
+				alias_nl = moved
+			end
+			if ins:find("\n", 1, true) then
+				alias_nl = alias_nl or {}
+				local k = ins:find("\n", 1, true)
+				while k do
+					alias_nl[rs - 1 + k] = true
+					k = ins:find("\n", k + 1, true)
+				end
+			end
+			astk_n = astk_n + 1
+			astk[astk_n] = { cand, rs + #ins, val:match("[ \t]$") ~= nil }
+			alias_seen[cand] = true
 			expanded = true
 			-- recurse: the value's first word (now at i) is itself command-position
 		end
-		-- A chained (argument-position) word that turned out NOT to be an alias ends
-		-- the chain. A command-position miss must NOT clear a chain a prior expansion
-		-- set (the command word is re-checked here after being expanded at dispatch).
-		if not expanded and not cmdpos then
-			alias_next = false
-		end
+		-- the word read isn't an alias (alias_expand_token's NO_EXPANSION): the chain
+		-- ends until a later pop sets it again
+		alias_next = false
 	end
 	-- Collect the bodies of any heredocs opened on the just-parsed line. Called
 	-- after a simple command AND after a compound command's redirs (group,
@@ -2495,7 +2530,7 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs)
 		local rline, nread = line, 0 -- (bash's warning lines: where reading began, + lines read)
 		if i <= n then
 			i = i + 1
-			line = line + 1
+			if not (alias_nl and alias_nl[i - 1]) then line = line + 1 end
 		end
 		for _, hd in ipairs(heredocs_pending) do
 			local blines = {}
@@ -2577,7 +2612,7 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs)
 				if #heredocs_pending > 0 then
 					collect_heredocs() -- consumes the newline + bodies
 				else
-					line = line + 1
+					if not (alias_nl and alias_nl[i]) then line = line + 1 end
 					i = i + 1
 				end
 			elseif c:match("[ \t;]") then
@@ -2601,7 +2636,7 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs)
 				if #heredocs_pending > 0 then
 					collect_heredocs()
 				else
-					line = line + 1
+					if not (alias_nl and alias_nl[i]) then line = line + 1 end
 					i = i + 1
 				end
 			elseif c == " " or c == "\t" then
@@ -2902,7 +2937,7 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs)
 	local function func_body()
 		ws()
 		while src:sub(i, i) == "\n" do
-			line = line + 1
+			if not (alias_nl and alias_nl[i]) then line = line + 1 end
 			i = i + 1
 			ws()
 		end -- bash allows newlines before the body
@@ -3093,7 +3128,7 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs)
 				break
 			end
 			if c == "\n" then
-				line = line + 1
+				if not (alias_nl and alias_nl[i]) then line = line + 1 end
 				i = i + 1
 			elseif c == "#" then
 				-- a comment runs to end of line (words never start here: ws() just ran)
@@ -3349,16 +3384,12 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs)
 
 	local function parse_command()
 		ws()
-		-- reset the per-command alias recursion guard, then expand a leading alias in
-		-- place (handles a compound-command alias like LEFT='{' before dispatch; the
-		-- command-word case with leading assignments/redirects re-runs in the simple
-		-- loop, sharing this guard so a self-referential alias can't loop).
+		-- expand a leading alias in place (handles a compound-command alias like LEFT='{'
+		-- before dispatch; the command-word case with leading assignments/redirects re-runs
+		-- in the simple loop; astk's guard keeps a self-referential alias from looping).
 		if cmd_prex == i then
 			cmd_prex = nil -- parse_stmts already expanded this command word
 		else
-			alias_seen = {}
-			alias_next = false
-			alias_tail = nil
 			try_alias(true)
 		end
 		-- an alias that expanded to a comment (`alias c=#`): the rest of the line is a comment
@@ -3603,7 +3634,7 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs)
 				ws()
 				local c = src:sub(i, i)
 				if c == "\n" then
-					line = line + 1
+					if not (alias_nl and alias_nl[i]) then line = line + 1 end
 					i = i + 1
 				elseif c == "#" then
 					while i <= n and src:sub(i, i) ~= "\n" do
@@ -3800,7 +3831,7 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs)
 			while true do
 				ws()
 				if src:sub(i, i) == "\n" then
-					line = line + 1
+					if not (alias_nl and alias_nl[i]) then line = line + 1 end
 					i = i + 1 -- continuation inside [[ ]]
 				elseif i > n or src:sub(i, i + 1) == "]]" then
 					if src:sub(i, i + 1) == "]]" then
@@ -3961,7 +3992,7 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs)
 			local subject = parse_word(subw)
 			while src:sub(i, i):match("[ \t\n]") do
 				if src:sub(i, i) == "\n" then
-					line = line + 1
+					if not (alias_nl and alias_nl[i]) then line = line + 1 end
 				end
 				i = i + 1
 			end
@@ -3990,7 +4021,7 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs)
 						if #heredocs_pending > 0 then
 							collect_heredocs()
 						else
-							line = line + 1
+							if not (alias_nl and alias_nl[i]) then line = line + 1 end
 							i = i + 1
 						end
 					elseif c:match("[ \t;]") then
@@ -4447,7 +4478,7 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs)
 						if #heredocs_pending > 0 then
 							collect_heredocs()
 						else
-							line = line + 1
+							if not (alias_nl and alias_nl[i]) then line = line + 1 end
 							i = i + 1
 						end
 					else
@@ -4486,7 +4517,7 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs)
 					ws()
 					local c = src:sub(i, i)
 					if c == "\n" then
-						line = line + 1
+						if not (alias_nl and alias_nl[i]) then line = line + 1 end
 						i = i + 1
 					elseif c == "#" then
 						while i <= n and src:sub(i, i) ~= "\n" do
@@ -4536,9 +4567,6 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs)
 			if next(stopset) ~= nil and cmd_prex ~= i then
 				-- the command word may be an alias for the terminator (`alias DONE='}'`):
 				-- expand it before looking for one; parse_command then won't re-expand
-				alias_seen = {}
-				alias_next = false
-				alias_tail = nil
 				try_alias(true)
 				cmd_prex = i
 			end

@@ -49,6 +49,17 @@ local function set_opt(sh, field, on)
 			ffi.C.unsetenv("POSIXLY_CORRECT")
 		end
 	end
+	-- bash's posix_initialize (general.c): posix mode turns expand_aliases, inherit_errexit
+	-- and shift_verbose on; leaving it (nothing saved) resets expand_aliases to
+	-- interactive_shell and shift_verbose off (inherit_errexit stays)
+	if field == "opt_posix" and not on ~= not was and sh.shopt then
+		local so = sh.shopt
+		if on then
+			so.expand_aliases, so.inherit_errexit, so.shift_verbose = true, true, true
+		else
+			so.expand_aliases, so.shift_verbose = sh.opt_i and true or false, false
+		end
+	end
 	-- emacs and vi line-editing modes are mutually exclusive.
 	if on and field == "opt_emacs" then
 		sh.opt_vi = false
