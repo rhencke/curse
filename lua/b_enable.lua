@@ -64,7 +64,9 @@ return function(sh, cmd, args)
 	end
 	if delete and args[j] then
 		for k = j, #args do
-			io.stderr:write("curse: enable: " .. args[k] .. ": not dynamically loaded\n")
+			-- (dyn_unload_builtin: a name that's no builtin at all is sh_notbuiltin)
+			io.stderr:write("curse: enable: " .. args[k]
+				.. (BUILTINS[args[k]] and ": not dynamically loaded\n" or ": not a shell builtin\n"))
 		end
 		sh.status = 1
 		return
@@ -87,6 +89,7 @@ return function(sh, cmd, args)
 			end
 		end
 		sh.status = 0
+		rt.chkwrite_st(sh, "enable")
 		return
 	end
 	sh.status = 0

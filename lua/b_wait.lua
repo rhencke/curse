@@ -147,10 +147,10 @@ local function wait_entry(sh, cmd, args, hook, tcb)
 end
 
 -- the jobs still in the table, oldest slot first
-local function table_jobs(sh)
+local function table_jobs(sh, live) -- (`live`: not the ones a `wait ID` already reported)
 	local list = {}
 	for _, j in ipairs(sh.jobs) do
-		if not j.gone then
+		if not j.gone and not (live and j.waited) then
 			list[#list + 1] = j
 		end
 	end
@@ -230,7 +230,7 @@ wait_builtin = function(sh, cmd, args, hook, tcb)
 		if nflag then
 			-- -n: the first job to end — one that already has and isn't yet reported first;
 			-- with ids, only among those (127 if none can)
-			local list = table_jobs(sh)
+			local list = table_jobs(sh, true)
 			if #specs > 0 then
 				local want, sel = {}, {}
 				for _, sp in ipairs(specs) do
@@ -293,7 +293,7 @@ wait_builtin = function(sh, cmd, args, hook, tcb)
 						last = job_reap(sh, found) or 127
 						if found.done then
 							report(sh, found)
-							rt.job_delete(sh, found)
+							rt.job_waited(sh, found)
 							found.forgot = sh.opt_posix or nil
 						end
 					elseif sh.disowned and sh.disowned[pid] then
@@ -327,7 +327,7 @@ wait_builtin = function(sh, cmd, args, hook, tcb)
 						last, waited = job_reap(sh, j) or 127, j.pid
 						if j.done then
 							report(sh, j)
-							rt.job_delete(sh, j)
+							rt.job_waited(sh, j)
 						end
 					end
 				else -- a word that's neither: status 1, and on to the next

@@ -25,19 +25,25 @@ local function isdir(path)
 		and bit.band(ffi.cast("uint32_t *", statbuf + 24)[0], 0xF000) == 0x4000
 end
 
--- sh_canonpath(PATH, PATH_CHECKDOTDOT|PATH_CHECKEXISTS) for an absolute PATH: collapse
--- `//`, drop `.`, let `..` pop the previous name — textually, but every prefix built
--- must name an existing directory (else nil: canonicalization failed). A leading `//`
--- (exactly two) survives.
+-- sh_canonpath(PATH, PATH_CHECKDOTDOT|PATH_CHECKEXISTS): collapse `//`, drop `.`, let
+-- `..` pop the previous name — textually, but every prefix built must name an existing
+-- directory (else nil: canonicalization failed). A leading `//` (exactly two) survives.
+-- A relative PATH (no internal cwd: getcwd failed) stays relative — a `..` with nothing
+-- to pop is kept, and an empty result is `.`.
 local function canonpath(path)
-	local root = (path:byte(2) == 47 and path:byte(3) ~= 47) and "//" or "/"
-	local parts, n = {}, 0
+	local rooted = path:byte(1) == 47
+	local root = not rooted and "" or (path:byte(2) == 47 and path:byte(3) ~= 47) and "//" or "/"
+	local parts, n, dd = {}, 0, 0 -- (dd: the `..`s kept up front can't be popped)
 	for seg in path:gmatch("[^/]+") do
 		if seg == "." then -- (drop)
 		elseif seg == ".." then
-			if n > 0 then
+			if n > dd then
 				parts[n] = nil
 				n = n - 1
+			elseif not rooted then
+				n = n + 1
+				parts[n] = ".."
+				dd = n
 			end
 		else
 			n = n + 1
@@ -47,7 +53,8 @@ local function canonpath(path)
 			end
 		end
 	end
-	return root .. table.concat(parts, "/")
+	local r = root .. table.concat(parts, "/")
+	return r ~= "" and r or "."
 end
 
 -- resetpwd: forget the internal cwd and ask getcwd (get_working_directory's complaint

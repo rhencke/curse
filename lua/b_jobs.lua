@@ -97,8 +97,12 @@ return function(sh, cmd, args, hook, tcb)
 		if k > #args then
 			local list = {}
 			for _, j in ipairs(sh.jobs or {}) do
-				if not j.gone and (state == nil or (state == "r" and not j.done)) then
-					list[#list + 1] = j
+				if not j.gone then
+					if j.waited and j.done then -- (notified already — by `wait ID` or a listing)
+						rt.job_delete(sh, j)
+					elseif state == nil or (state == "r" and not j.done) then
+						list[#list + 1] = j
+					end
 				end
 			end
 			table.sort(list, function(a, b)
@@ -122,7 +126,11 @@ return function(sh, cmd, args, hook, tcb)
 		end
 		for _, j in ipairs(shown) do -- (listed after it ended: that was its notice)
 			if j.done then
-				rt.job_delete(sh, j)
+				if k > #args then -- (a full listing marks it notified: the next one deletes it)
+					rt.job_waited(sh, j)
+				else
+					rt.job_delete(sh, j)
+				end
 			end
 		end
 		sh.status = status

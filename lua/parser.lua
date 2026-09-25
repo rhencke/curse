@@ -1026,10 +1026,10 @@ scan_cmdsub = function(src, j, onwarn)
 	local wstart = true -- next char begins a word (for `#` comments and keywords)
 	local hdp = {} -- heredocs opened on the current line: { delim, strip }
 	local i = j
-	local function skipq(close) -- skip from a quote at i to just past `close`, honoring `\`
+	local function skipq(close, esc) -- skip from a quote at i to just past `close` (`esc`: honor `\`)
 		local k = i + 1
 		while k <= n and src:sub(k, k) ~= close do
-			if src:sub(k, k) == "\\" then
+			if esc and src:sub(k, k) == "\\" then
 				k = k + 2
 			else
 				k = k + 1
@@ -1119,7 +1119,7 @@ scan_cmdsub = function(src, j, onwarn)
 			patstart = false
 		elseif c == "$" and src:sub(i + 1, i + 1) == "'" then
 			i = i + 1
-			i = skipq("'")
+			i = skipq("'", true) -- only $'…' has backslash escapes
 			wstart = false
 			patstart = false
 		elseif c == '"' then

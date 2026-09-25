@@ -191,7 +191,7 @@ return function(sh, cmd, args, hook, tcb)
 				and not printmode
 				and not (doexport or rattr or iattr or lattr or uattr or aattr or assoc or nref or tattr or cattr)
 			if bare then -- (no attribute: bash's `return set_builtin (NULL)`)
-				return require("b_set")(sh, "set", { "set" }, hook, tcb)
+				return require("b_set")(sh, "set", { "set", as = cmd }, hook, tcb) -- (reported as `declare`)
 			end
 			local names = {}
 			for nm in pairs(sh.vars) do
@@ -240,6 +240,10 @@ return function(sh, cmd, args, hook, tcb)
 				end
 			end
 			sh.bav_nolazy = nil
+			sh.status = 0
+			if isdecl then
+				rt.chkwrite_listed(sh, cmd)
+			end
 		end
 		local fnbad = (funcnames or funcbody) -- (declare.def reports -n, then -i, -A, -a)
 			and (nref and "n" or iattr and "i" or assoc and "A" or aattr and "a")
@@ -359,9 +363,11 @@ return function(sh, cmd, args, hook, tcb)
 				end
 			end
 			sh.status = allok and 0 or 1
+			if not named and isdecl then
+				rt.chkwrite_listed(sh, cmd)
+			end
 		elseif #rest == 0 then -- no operands: list matching declarations (declare -p, or bare)
 			list_decls()
-			sh.status = 0
 		elseif printmode and cmd ~= "readonly" and cmd ~= "export" then
 			-- Only `declare`/`typeset -p NAME` prints a named declaration; `readonly -p
 			-- NAME` and `export -p NAME` (with operands) print nothing and just apply the

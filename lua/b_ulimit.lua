@@ -181,6 +181,7 @@ return function(sh, cmd, args, hook, tcb)
 					sh:echo(#cmds > 1 and line(c.f, v or "unlimited") or (v or "unlimited"))
 				end
 			end
+			sh.write_err, sh.status = nil, 0 -- (ulimit.def: only the -a listing ends in sh_chkwrite)
 		else -- -a: list all (a trailing value is ignored — bash prints all, status 0)
 			for _, fl in ipairs(AORDER) do
 				sh:echo(line(fl, report(fl) or "unlimited"))
