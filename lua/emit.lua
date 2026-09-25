@@ -1583,7 +1583,7 @@ end
 -- isn't a parseable in-subset arith expression (caller keeps the interp bootstrap). The
 -- returned fn reads only sh + rt + bit (same preamble as M.emit's module header).
 function M.compile_arith_value(s)
-	local ok, ast = pcall(require("parser").arith, s) -- deferred form, exactly as arith_resolve
+	local ok, ast = pcall(require("parser").arith, s, "let") -- a VALUE, exactly as arith_resolve
 	if not ok or not arith_native_ok(ast) then
 		return nil
 	end
@@ -5071,6 +5071,7 @@ H.assignlist = function(cx, st, after)
 			c[k] = v
 		end
 		c.negate = true -- (no errexit of its own: the list's status decides)
+		cx.ps_guarded[c] = cx.ps_guarded[list[i]] -- (its <() close with the whole list)
 		local chk = cx.newpc()
 		cx.blocks[chk] = ("if sh.assign_err then pc = %d else pc = %d end"):format(abort, nxt)
 		local ok, pe = pcall(cx.flatten_stmt, c, chk)
@@ -8462,6 +8463,26 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
 			local p0 = cx.newpc()
 			cx.blocks[p0] = ("rt.time_push(sh); pc = %d"):format(cx.flatten_list({ inner }, pe))
 			return p0
+		end
+		-- an assignment-only statement is a null command: the <(…) it creates close when it
+		-- ends (`x=<(…); cat $x` fails) — the whole of an assignment list at once
+		if (t == "assign" or t == "assignlist" or t == "arrayassign") and not cx.ps_guarded[st] then
+			local ps = false
+			for _, a in ipairs(t == "assignlist" and st.list or { st }) do
+				ps = ps or (a.t == "arrayassign" and (a.raw or ""):find("[<>]%(") ~= nil)
+					or (a.rhs and cx.has_procsub({ words = { a.rhs } }))
+				cx.ps_guarded[a] = true
+			end
+			if ps then
+				cx.ps_guarded[st] = true
+				local v = cx.newloopvar()
+				local post = cx.newpc()
+				cx.blocks[post] = ("rt.ps_adrain(sh, %s); pc = %d"):format(v, after)
+				local body = cx.flatten_stmt(st, post)
+				local pre = cx.newpc()
+				cx.blocks[pre] = ("%s = rt.ps_amark(sh); pc = %d"):format(v, body)
+				return pre
+			end
 		end
 		-- a null command (assignments / redirections only) sets PIPESTATUS to its status too
 		if EF.pipestatus and (t == "assign" or t == "assignlist" or t == "arrayassign"

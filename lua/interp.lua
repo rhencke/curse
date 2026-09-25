@@ -807,7 +807,9 @@ arith_resolve = function(sh, s)
 	if looks_numeric(s) then
 		return rt.arith_num(s)
 	end
-	local ok, ast = pcall(P.arith, s)
+	-- (the VALUE is not word-expanded: bash's expr_streval evaluates it as-is, so a `$`,
+	-- backquote or quote in it is a syntax error — "let" mode; only a subscript expands)
+	local ok, ast = pcall(P.arith, s, "let")
 	if not ok then -- the value is not a valid arith expression (e.g. "12 34", "1+"): an
 		-- arith error — the command fails and (bash) the rest of the line is discarded
 		arith_pre(sh, ast)
@@ -896,6 +898,22 @@ local function arith_expand_text(sh, raw, depth0) -- depth0: 1 = the text IS a s
 			elseif nx == "(" then
 				local ok, ni = pcall(P.scan_cmdsub, raw, k + 2)
 				e = ok and ni - 1 or n
+			elseif nx == "[" then -- $[expr]: the legacy $(( )) (bracket-depth matched)
+				local d = 0
+				e = k + 1
+				while e <= n do
+					local b = raw:byte(e)
+					if b == 91 then
+						d = d + 1
+					elseif b == 93 then
+						d = d - 1
+						if d == 0 then
+							break
+						end
+					end
+					e = e + 1
+				end
+				e = math.min(e, n)
 			elseif nx == "{" then
 				local ok, ni = pcall(P.scan_braces, raw, k + 1)
 				e = ok and ni - 1 or n
@@ -1570,11 +1588,31 @@ local function expand_pexp(sh, p, assign)
 		ip.q = p.q
 		return expand_part_str(sh, ip)
 	end
-	if (pe.index == "*" or pe.name == "*") and pe.op ~= "prefix" and pe.op ~= "indices" and pe.op ~= "len" then
+	local op = pe.op
+	if (op == "prefix" or op == "indices") and not pe.hdoc then
+		-- ${!pfx*} / ${!a[*]} in a scalar context (assignment, case word, [[ ]]) join with
+		-- IFS[0] like "$*"; ${!pfx@} too in an assignment (bash); ${!a[@]} with a space.
+		-- (a here-document's are space-joined: the Shell:expand_param default below)
+		if (op == "prefix" and (pe.star or assign)) or (op == "indices" and pe.index == "*") then
+			return table.concat((multi_elems(sh, p)), rt.ifs_sep(sh))
+		end
+	elseif op == "sub" and (pe.index == "@" or pe.name == "@") then
+		-- ${@:n} / ${a[@]:n:m} in a scalar context is the ELEMENT slice, joined with a
+		-- space — IFS[0] for a quoted one in an assignment (`y="${@:2}"`), as bash does
+		return table.concat((multi_elems(sh, p)), (assign and p.q) and rt.ifs_sep(sh) or " ")
+	elseif assign and (pe.index == "@" or pe.name == "@") and op
+		and (" # ## % %% / // ^ ^^ , ,, ~ ~~ @ "):find(" " .. op .. " ", 1, true) then
+		-- an assignment's ${@#pat} / ${a[@]@Q} / ${@/p/r} / ${a[@]^^} work per element,
+		-- joined with IFS[0] — a strip or transform even unquoted, else a space (bash)
+		local sep = (p.q or op == "@" or op:find("^[#%%]")) and rt.ifs_sep(sh) or " "
+		return table.concat((multi_elems(sh, p)), sep)
+	end
+	if (pe.index == "*" or pe.name == "*") and op ~= "prefix" and op ~= "indices" and op ~= "len" then
 		-- ${a[*]OP} / ${*OP} in a scalar context (assignment RHS, case word) joins its
-		-- (per-element transformed) values with IFS[0], like "$*" (bash)
+		-- (per-element transformed) values with IFS[0], like "$*" (bash) — a here-doc's
+		-- positional ${*…} with a space
 		local els = multi_elems(sh, p)
-		return table.concat(els, rt.ifs_sep(sh))
+		return table.concat(els, (pe.hdoc and pe.name == "*") and " " or rt.ifs_sep(sh))
 	end
 	local subkey
 	if pe.index and pe.index ~= "@" and pe.index ~= "*" then
@@ -1685,7 +1723,7 @@ expand_part_str = function(sh, p, assign)
 		if p.special == "#" then
 			v = tostring(sh.nparams)
 		elseif p.special == "*" then -- $* joins on the first IFS char; $@ always on a space
-			v = sh:paramsJoin(rt.ifs_sep(sh))
+			v = sh:paramsJoin(p.hdoc and " " or rt.ifs_sep(sh)) -- (a here-doc's: a space)
 		elseif p.special == "@" then
 			v = sh:paramsJoin(" ")
 		elseif p.special == "?" then
@@ -2495,12 +2533,13 @@ expand_fields_full = function(sh, w, pre1) -- pre1: part 1 already expanded (a $
 	-- Memoize the parse keyed on the IFS string: it changes rarely but this runs per
 	-- word, and rt.mb_chars uses per-char mbrtowc FFI calls — costly in a hot loop.
 	local ic = sh._ifscache
-	if not ic or ic.ifs ~= ifs then
+	if not ic or ic.ifs ~= ifs or ic.lg ~= rt.locale_gen then -- (a locale change re-splits `é`)
 		local set = {}
 		for _, ch in ipairs(rt.mb_chars(ifs)) do
 			set[ch.s] = true
 		end
-		ic = { ifs = ifs, set = set, mbifs = rt.lc_mb_cur_max() > 1 and ifs:find("[\128-\255]") ~= nil } -- any multibyte IFS char?
+		ic = { ifs = ifs, set = set, mbifs = rt.lc_mb_cur_max() > 1 and ifs:find("[\128-\255]") ~= nil,
+			lg = rt.locale_gen } -- any multibyte IFS char?
 		sh._ifscache = ic
 	end
 	local ifsset, mbifs = ic.set, ic.mbifs
@@ -5881,6 +5920,7 @@ exec_stmt = function(sh, st, hook)
 	-- function the trap calls, whose lines count as usual — bash)
 	if t == "assign" then
 		local ncs0 = sh.ncs
+		local pnf = sh.procsub_files and #sh.procsub_files or 0
 		if st.name == "SHELLOPTS" or st.name == "BASHOPTS" then -- readonly specials (bash)
 			io.stderr:write("curse: " .. st.name .. ": readonly variable\n")
 			sh.status = 1
@@ -6055,6 +6095,9 @@ exec_stmt = function(sh, st, hook)
 		end
 		sh:set_str("_", "") -- a bare assignment resets $_ to empty (bash)
 		sh:array_assign("PIPESTATUS", { tostring(sh.status) }, false) -- (PIPESTATUS: this null command's status)
+		if sh.procsub_files then -- (`x=<(…)`: a null command closes its <() when it ends)
+			rt.assign_drain(sh, st, pnf)
+		end
 	elseif t == "arrayassign" then
 		if sh.opt_x and st.raw then -- (bash traces an array literal as written: `+ a=(1 "b c")`)
 			xtrace_line(sh, st.name .. (st.append and "+=" or "=") .. rt.srcw(st.raw))
@@ -6077,11 +6120,15 @@ exec_stmt = function(sh, st, hook)
 		else
 			-- a failglob no-match inside `a=(*.ZZ)` fails the assignment non-fatally (bash)
 			local ncs0 = sh.ncs
+			local pnf = sh.procsub_files and #sh.procsub_files or 0
 			local aok, aerr = pcall(do_arrayassign, sh, st)
 			if aok then
 				sh.status = sh.ncs ~= ncs0 and sh.last_cmdsub_status or 0 -- (`a=( $(exit 3) )`: 3)
 				sh:set_str("_", "")
 				sh:array_assign("PIPESTATUS", { tostring(sh.status) }, false)
+				if sh.procsub_files then -- (`a=( <(…) )`: closed when the assignment ends)
+					rt.assign_drain(sh, st, pnf)
+				end
 			elseif type(aerr) == "table" and aerr.__curse_experr and not aerr.__curse_lineabort then
 				sh.status = 1
 				if sh.opt_e then
@@ -6136,18 +6183,25 @@ exec_stmt = function(sh, st, hook)
 		-- a bad array subscript / bad-subst in one binding aborts the REST of the list
 		-- (bash: `a=x b[0+]=y c=z` sets only a), keeping the error status.
 		local ncs0 = sh.ncs
+		local pnf = sh.procsub_files and #sh.procsub_files or 0
+		sh.cur_alist = st -- (its bindings' <() stay open until the whole list ends)
 		local cc0 = sh.cur_cmd -- (each binding is part of the list: no DEBUG of its own, even
 		for _, a in ipairs(st.list) do -- after a command substitution in an earlier one ran)
 			sh.assign_err = nil
 			sh.cur_cmd = cc0
 			exec_stmt(sh, a, hook)
 			if sh.assign_err then
+				sh.cur_alist = nil
 				return
 			end
 		end
 		-- status: the LAST command substitution's, else 0 (execute_null_command)
 		sh.status = sh.ncs ~= ncs0 and sh.last_cmdsub_status or 0
 		sh:array_assign("PIPESTATUS", { tostring(sh.status) }, false)
+		sh.cur_alist = nil
+		if sh.procsub_files then
+			drain_procsub(sh, 0, pnf)
+		end
 	elseif t == "simple" then
 		if st.shtail then -- (the last command of a ( … ) / $( … ): rt.exec_tail_lvl)
 			sh.shlvl_tail = st.shtail == 2 and sh.pd or -1 - sh.pd
@@ -6229,11 +6283,13 @@ exec_stmt = function(sh, st, hook)
 			-- to scope them to) and take effect even if a following redirect fails —
 			-- bash applies `abc=def > /nonexistent` regardless (only the status is 1).
 			if st.assigns then
+				sh.cur_alist = st -- (its <() close with the null command, below)
 				for _, a in ipairs(st.assigns) do
 					-- NAME=(…) is a literal only as a command PREFIX; with no command left after
 					-- expansion (`a=(1 2) 2>/dev/null`, `a=(x) $empty`) it's an array assignment
 					exec_stmt(sh, a, hook)
 				end
+				sh.cur_alist = nil
 				if sh.status == 0 and sh.ncs ~= ncs0 then -- (`x=1 $(exit 5)`: 5)
 					sh.status = sh.last_cmdsub_status
 				end
@@ -6249,6 +6305,7 @@ exec_stmt = function(sh, st, hook)
 				restore_redirs(save)
 			end
 			sh:array_assign("PIPESTATUS", { tostring(sh.status) }, false) -- (a null command's too)
+			drain_procsub(sh, pnp, pnf) -- (`x=<(…) $empty`: closed as the null command ends)
 			return
 		end
 		if st.arrayargs then -- `declare -A a=(...)` / `local -a b=(...)` array literals

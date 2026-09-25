@@ -46,7 +46,8 @@ local function arith(src, nodefer)
 	-- locale/ANSI-C quote prefix has no meaning there): `$"3"` -> `"3"` (a strippable
 	-- pair below), `$'3'` -> `'3'` (single quotes kept -> the tokenizer errors, as
 	-- bash does). Only when the expression has no ${…}/$(…)/`…` to expand as a whole.
-	if not (src:find("%${") or src:find("%$%(") or src:find("`")) then
+	-- (not in "let" mode — already-expanded text or a variable's value: `$"3"` stays bad)
+	if nodefer ~= "let" and not (src:find("%${") or src:find("%$%(") or src:find("`")) then
 		src = src:gsub("%$([\"'])", "%1")
 	end
 	-- `${…}` no longer forces a whole-expression defer — primary() consumes it as an
@@ -77,6 +78,7 @@ local function arith(src, nodefer)
 	-- tokenizer reports the error bash does. (Single quotes are never stripped.)
 	-- (`let`'s arguments were already expanded and quote-removed: bash strips nothing
 	-- more — `let 'x="1"+2'` is an error and an assoc_expand_once key keeps its quotes)
+	local qtxt -- (the quote-stripped text: what bash's errors show, `1 + '2' `)
 	if nodefer == "let" then
 		nodefer = "strict"
 	elseif src:find('"', 1, true) then
@@ -96,6 +98,7 @@ local function arith(src, nodefer)
 			end
 		end
 		src = table.concat(o)
+		qtxt = src
 		if src:match("^%s*$") then -- (`$(( "" ))`, a quoted blank subscript: 0 too)
 			return { k = "num", v = "0" }
 		end
@@ -138,7 +141,7 @@ local function arith(src, nodefer)
 	-- `let 'b=a++ +'` increments a. An AST of the completed operands, in order, under their
 	-- short-circuit/ternary conditions; the reporter evaluates it before the message.
 	local function aerr(msg, pre)
-		error({ __curse_arith = true, msg = msg, tok = lasttp and src:sub(lasttp) or "", pre = pre }, 0)
+		error({ __curse_arith = true, msg = msg, tok = lasttp and src:sub(lasttp) or "", pre = pre, expr = qtxt }, 0)
 	end
 	local ZERO = { k = "num", v = "0" }
 	local function seq(a, b)
@@ -663,6 +666,10 @@ local function comsub_syntax(body)
 		err = err:gsub("^[%w%._/%-]+:%d+: ", "") -- (a Lua error position isn't part of it)
 		if err:find("unexpected end of file", 1, true) or err:find("unexpected EOF", 1, true) then
 			err = "syntax error near `)'"
+		elseif err == "syntax error near `\n'" then
+			err = "syntax error near `newline'"
+		elseif err == "syntax error near `newline'" and not body:find("\n", 1, true) then
+			err = "syntax error near `)'" -- (`$(<)`: a one-line body's end is the `)` bash reads)
 		end
 	end
 	if comsub_err_n >= 512 then
@@ -1330,6 +1337,10 @@ local function parse_dollar(w, i, add, q)
 		local je = scan_cmdsub(w, i + 2) -- index just past the closing `)` (case/quote/nesting aware)
 		add({ cmdsub = w:sub(i + 2, je - 2), q = q, aenv = ALIAS_ENV, noalias = COMSUB_PREX or nil, posix = POSIX_DQ or nil })
 		return je
+	elseif nx == '"' and q then
+		-- inside "…" (or a here-doc body) the `"` after `$` is no $"…" opener: a literal `$`
+		add({ lit = "$", q = true })
+		return i + 1
 	elseif nx == '"' then
 		-- $"…" locale translation: with no catalog it's just the double-quoted string.
 		return i + 1 -- skip the `$`; the caller parses the following "…" normally
@@ -1413,6 +1424,9 @@ local function parse_dquote(inner, add, heredoc, bt_keep)
 			i = parse_dollar(inner, i, (heredoc or POSIX_DQ) and function(p)
 				if p.pexp then
 					p.pexp.hd = true
+					p.pexp.hdoc = heredoc or nil
+				elseif heredoc and p.special == "*" then
+					p.hdoc = true -- (a here-document's $* joins with a space: bash)
 				end
 				add(p)
 			end or add, true)
@@ -1750,7 +1764,7 @@ end
 -- a syntactic inner " is dropped (`"${x:-"a b"}"` -> `a b`). Shared by the interpreter's
 -- pexp default expansion and the compiled tier so both render such a default identically.
 function M.parse_default_quoted(txt, heredoc)
-	local out, k, m = {}, 1, #txt
+	local out, k, m, inq = {}, 1, #txt, false
 	while k <= m do
 		local ch = txt:sub(k, k)
 		if ch == "\\" then
@@ -1766,7 +1780,11 @@ function M.parse_default_quoted(txt, heredoc)
 			end
 		elseif ch == '"' then
 			k = k + 1 -- drop the syntactic inner quote
+			inq = not inq
 		elseif ch == "$" and txt:sub(k + 1, k + 1) == '"' then
+			if inq then -- (`"${u-"$"}"`: inside the inner "…" a `$` before its close is literal)
+				out[#out + 1] = "$"
+			end
 			k = k + 1 -- $"…" (a locale string): its text, as "…"
 		elseif ch == "$" and (txt:sub(k + 1, k + 1) == "(" or txt:sub(k + 1, k + 1) == "{") then
 			-- a nested $(…)/$((…))/${…} keeps its OWN quoting (`${u:-$(echo "p)q")}`): copy it
