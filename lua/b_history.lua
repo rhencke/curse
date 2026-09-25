@@ -199,6 +199,11 @@ return function(sh, cmd, args)
 		return
 	end
 	local file = rest[1] or H.filename(sh)
+	if sh.opt_r and file and file:find("/", 1, true) then -- (restricted: no `/` in a -anrw file)
+		io.stderr:write("curse: history: " .. file .. ": restricted\n")
+		sh.status = 1
+		return
+	end
 	if flags.a then -- append this session's new lines (bash's maybe_append_history)
 		local n = sh.hist_session or 0
 		if n > 0 then

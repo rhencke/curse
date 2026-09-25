@@ -46,9 +46,17 @@ function M.shell_metas(s)
 	return s:find("[ \t\n'\"\\|&;()<>!{}*%[?%]^$`]") ~= nil or s:byte(1) == 35 or s:byte(1) == 126
 		or s:find("[=:]~") ~= nil
 end
+-- sh_single_quote (shquote.c): '…' with each `'` as '\'' — except a lone `'`, which
+-- bash special-cases to plain \'
+function M.sh_single_quote(s)
+	if s == "'" then
+		return "\\'"
+	end
+	return "'" .. s:gsub("'", "'\\''") .. "'"
+end
 function M.shell_quote(s)
 	if not s:find("[%z\1-\31\127-\255]") then
-		return "'" .. s:gsub("'", "'\\''") .. "'"
+		return M.sh_single_quote(s)
 	end
 	-- there is a high/low byte: decide char-by-char whether $'…' is really needed
 	local chars = M.mb_chars(s)
@@ -838,6 +846,7 @@ ffi.cdef([[
   int curse_co_sigaddset(void *set, int sig) asm("sigaddset");
   int curse_co_sigtimedwait(const void *set, void *info, const struct curse_co_ts *ts) asm("sigtimedwait");
   int curse_co_chdir(const char *path) asm("chdir");
+  int curse_co_fchdir(int fd) asm("fchdir");
   unsigned int curse_co_umask(unsigned int mask) asm("umask");
   char *curse_co_getcwd(char *buf, unsigned long size) asm("getcwd");
   void *curse_co_malloc(unsigned long n) asm("malloc");
@@ -2274,6 +2283,9 @@ end
 -- Shell:exec with the argv as a table (a long one — `cmd {1..70000}` — can't be unpacked
 -- into arguments: LuaJIT caps that)
 function Shell:exec_t(args)
+	if self.jobs_waited then -- (bash's cleanup_dead_jobs, on a fork: the notified dead jobs go)
+		M.jobs_cleanup_waited(self)
+	end
 	if self.shlvl_tail then
 		return M.exec_tail_lvl(self, unpack(args))
 	end
@@ -2675,6 +2687,9 @@ end
 -- pipe) means no self-deadlock when the body out-writes the pipe buffer in one process.
 local deferred_sigs, cap_depth, cap_pid, flush_deferred, cap_enter -- (the signal hold: see M.defer_signal)
 function Shell:capture_inproc(backtick, runner, capfd, ctx)
+	if self.jobs_waited then -- (bash's cleanup_dead_jobs, on a fork: the notified dead jobs go)
+		M.jobs_cleanup_waited(self)
+	end
 	local buf, tmp, save1
 	if capfd then
 		io.flush()
@@ -2966,6 +2981,13 @@ local function sub_checkpoint(self)
 			self.hist_last_added, self.hist_pushed, self.hist_file_lines, self.hist_first_saved }
 		self.history, self.hist_ts = shallowcopy(self.history), shallowcopy(self.hist_ts)
 	end
+	if cp.cwd == "" then -- (a removed cwd — getcwd fails: hold it by an fd, fchdir back to it)
+		local fd = C.open(".", 65536, 0) -- O_RDONLY|O_DIRECTORY
+		if fd >= 0 then
+			cp.cwdfd = dup_hi(fd)
+			C.close(fd)
+		end
+	end
 	return cp
 end
 local function sub_restore(self, cp)
@@ -2991,7 +3013,14 @@ local function sub_restore(self, cp)
 	self.shellopts_exported = cp.shellopts_exported
 	self.argv0, self.sec_off, self.subsh_off = cp.argv0, cp.sec_off, cp.subsh_off
 	self.complete, self.hosts = cp.complete, cp.hosts
-	if cp.cwd ~= "" then C.chdir(cp.cwd) end
+	if cp.cwdfd then
+		if cp.cwdfd >= 0 then
+			C.curse_co_fchdir(cp.cwdfd)
+			C.close(cp.cwdfd)
+		end
+	elseif cp.cwd ~= "" then
+		C.chdir(cp.cwd)
+	end
 	self.tcwd = cp.tcwd
 	C.umask(cp.um)
 	-- Re-sync the process environ: drop names the body newly exported, then restore
@@ -3019,7 +3048,7 @@ end
 iso_push = function(sh)
 	-- the pid that runs this context in-process: a process forked later (a real subshell /
 	-- $(…) / stage / job) inherits the stack but is ALREADY its own process
-	local ctx = { pid = C.getpid() }
+	local ctx = { pid = C.getpid(), mgen = sh.m_gen } -- (mgen: b_fg's job-control check)
 	local st = sh.iso_ctx
 	if not st then
 		st = {}
@@ -3611,6 +3640,9 @@ function M.child_exit(sh, status)
 end
 
 function Shell:subshell_run(runner, saves, paren)
+	if self.jobs_waited then -- (bash's cleanup_dead_jobs, on a fork: the notified dead jobs go)
+		M.jobs_cleanup_waited(self)
+	end
 	local cp = sub_checkpoint(self)
 	local sv_out, sv_line, sv_cc, sv_tl = self.out, self.cur_line, self.cur_cmd, self.shlvl_tail
 	self.shlvl_tail = nil
@@ -3762,6 +3794,7 @@ function Shell:capture_compiled_iso(cs_fn, backtick)
 	self.foreign_pids = M.foreign_jobs(self)
 	local cp = sub_checkpoint(self)
 	local ctx = iso_push(self)
+	ctx.cs = true -- (a $(…): job control stays on — fg/bg in b_fg)
 	local ok, out = pcall(self.capture_inproc, self, backtick, cs_fn, true, ctx) -- fd-level capture
 	if C.getpid() ~= ctx.pid then -- (a forked descendant unwound out: it ends here)
 		M.child_status(self, ok, out)
@@ -4107,6 +4140,26 @@ function M.job_delete(sh, j)
 		end
 	end
 end
+-- A dead job was reported (`wait ID`, a `jobs` listing): bash marks it notified but keeps
+-- it in the table — `jobs %N` still lists it (then it goes) — until cleanup_dead_jobs:
+-- a plain `jobs` listing, the next fork or job, or (a script's reader loop) the end of
+-- the top-level command. Only a subshell has no reader loop, so only there does the
+-- job stay past this command.
+function M.job_waited(sh, j)
+	if sh.iso_ctx and sh.iso_ctx[1] then
+		j.waited, sh.jobs_waited = true, true
+	else
+		M.job_delete(sh, j)
+	end
+end
+function M.jobs_cleanup_waited(sh)
+	sh.jobs_waited = nil
+	for _, j in ipairs(sh.jobs or {}) do
+		if j.waited and j.done and not j.gone then
+			M.job_delete(sh, j)
+		end
+	end
+end
 -- SIGCHLD's reaping (jobs.c waitchld), done where the shell would have noticed: each real
 -- background child that has ended is reaped and its job marked done; an in-process job
 -- (j.g) is done once its task group is. A simple in-process job's external carries the
@@ -4172,6 +4225,9 @@ end
 -- the highest one in use, and it becomes the current job.
 function M.job_add(sh, pid, cmdstr)
 	sh.jobs = sh.jobs or {}
+	if sh.jobs_waited then -- (cleanup_dead_jobs)
+		M.jobs_cleanup_waited(sh)
+	end
 	local maxid = 0
 	for _, j in ipairs(sh.jobs) do
 		if not j.gone and j.id > maxid then
@@ -4659,7 +4715,12 @@ local function co_resume(ctx, t)
 		end
 	end
 	C.environ = t.env
-	if t.cwd ~= ctx.cur_cwd then
+	if t.cwdfd then -- (a directory it changed to: held by an fd)
+		if ctx.cur_cwd ~= t then
+			C.curse_co_fchdir(t.cwdfd)
+			ctx.cur_cwd = t -- (no path: the parent's is restored by chdir below)
+		end
+	elseif t.cwd ~= ctx.cur_cwd then
 		C.curse_co_chdir(t.cwd)
 		ctx.cur_cwd = t.cwd
 	end
@@ -4723,8 +4784,31 @@ local function co_resume(ctx, t)
 	t.env = C.environ
 	t.um = C.curse_co_umask(P.um)
 	C.environ = P.env
-	t.cwd = cwd_str() or ctx.cur_cwd
-	ctx.cur_cwd = t.cwd
+	-- (the parent's directory is resumed by path; one the stage changed to is held by an
+	-- fd — it may be removed before the stage resumes, and getcwd may fail in it already)
+	local cw = cwd_str()
+	if cw and cw == P.cwd then
+		if t.cwdfd then
+			co_cl(ctx, t.cwdfd)
+			t.cwdfd = nil
+		end
+		t.cwd = cw
+		ctx.cur_cwd = cw
+	else
+		if not (t.cwdfd and cw and cw == t.cwd) then
+			if t.cwdfd then
+				co_cl(ctx, t.cwdfd)
+				t.cwdfd = nil
+			end
+			local fd = C.open(".", 65536, 0) -- O_RDONLY|O_DIRECTORY
+			if fd >= 0 then
+				t.cwdfd = co_cx(ctx, fd)
+				C.close(fd)
+			end
+			t.cwd = cw or ctx.cur_cwd
+		end
+		ctx.cur_cwd = t.cwdfd and t or t.cwd
+	end
 	if g.upv then
 		t.upv = { g.upv.get() }
 	end
@@ -4748,6 +4832,10 @@ local function co_resume(ctx, t)
 		ctx.cur_cwd = P.cwd
 	end
 	if dead then
+		if t.cwdfd then
+			co_cl(ctx, t.cwdfd)
+			t.cwdfd = nil
+		end
 		if not rok then -- an internal error escaped the stage's own pcall
 			io.stderr:write("curse: pipeline stage: " .. tostring(a) .. "\n")
 		end
@@ -5427,6 +5515,9 @@ local run_pipeline_body
 -- it with noerr raised, restored on unwind. (With errexit OFF bash doesn't: a `set -e`
 -- inside a called function then takes effect.)
 function Shell:run_pipeline(stage_fns, negate, inproc, upv_get, upv_set, texts)
+	if self.jobs_waited then -- (bash's cleanup_dead_jobs, on a fork: the notified dead jobs go)
+		M.jobs_cleanup_waited(self)
+	end
 	self.pl_texts = texts -- (the stages' command texts, for a job report: co_launch takes them)
 	if not (negate and self.opt_e) then
 		return run_pipeline_body(self, stage_fns, negate, inproc, upv_get, upv_set)
@@ -7465,8 +7556,10 @@ end
 -- The file a function being defined now belongs to (its ${BASH_SOURCE[0]} and error
 -- label): the file being sourced, else the script — but under -c there is none, and bash
 -- calls it "environment".
+-- (A script read from stdin has none either: make_function_def's "main".)
 function M.def_source(sh)
-	return sh.cur_source or (sh.opt_c and "environment") or sh.argv0 or ""
+	return sh.cur_source or (sh.opt_c and "environment") or (sh.opt_s and not sh.opt_i and "main")
+		or sh.argv0 or ""
 end
 -- A builtin about to assign NAME: a readonly one is refused with bash's message (true).
 function M.ro_refuse(sh, name)
@@ -8154,8 +8247,9 @@ function Shell:funcname_array()
 	for i = 1, #fs do
 		t[i] = fs[i]
 	end
-	-- a script (or stdin) has a "main" bottom frame; `sh -c` has none (bash).
-	if not self.opt_c then
+	-- a script has a "main" bottom frame; `sh -c` and a script read from stdin have none
+	-- (bash pushes it only when it opens a script file)
+	if not (self.opt_c or (self.opt_s and not self.opt_i)) then
 		t[#t + 1] = "main"
 	end
 	return t
@@ -8170,7 +8264,7 @@ function Shell:bash_source_array()
 	for i = 1, #ss do
 		t[#t + 1] = ss[i]
 	end
-	if self.opt_c then -- (-c: no script, so no bottom frame — bash)
+	if self.opt_c or (self.opt_s and not self.opt_i) then -- (-c / stdin: no script file, no bottom frame)
 		t[#t] = nil
 	end
 	return t
@@ -8181,7 +8275,7 @@ function Shell:bash_lineno_array()
 	for i = 1, #ls do
 		t[i] = tostring(ls[i])
 	end
-	if not self.opt_c then
+	if not (self.opt_c or (self.opt_s and not self.opt_i)) then
 		t[#t + 1] = "0"
 	end
 	return t
@@ -12138,13 +12232,32 @@ end
 do
 	-- builtins whose output goes out through Shell:echo, then bash's sh_chkwrite
 	local CHKW = { declare = 1, typeset = 1, export = 1, readonly = 1, trap = 1, umask = 1,
-		times = 1, dirs = 1, help = 1, cd = 1 }
+		times = 1, dirs = 1, help = 1, cd = 1, alias = 1, hash = 1, ["local"] = 1, ulimit = 1,
+		bind = 1 }
 	-- after a builtin flagged a write error: status 1, and the report if nothing made it yet
 	function M.chkwrite_late(sh, name)
 		sh.status = 1
 		if sh.write_errmsg and CHKW[name] then
 			M.chkwrite_report(sh, name, sh.write_errmsg)
 		end
+	end
+end
+-- a builtin that wrote through sh.out ends in sh_chkwrite: a failed write is reported,
+-- status 1 (only for the real stdout, or a pipeline stage's with SIGPIPE ignored)
+function M.chkwrite_st(sh, name)
+	if (sh.out == io.write or (sh.traps.SIGPIPE == "" and CO_OUTS[sh.out])) and not M.chkwrite(sh, name) then
+		sh.status = 1
+	end
+end
+-- A declare/typeset/local listing with no operands (setattr.def show_*_attributes): the
+-- per-item sh_chkwrite reports a failed write and clears the error, so the builtin's own
+-- final sh_chkwrite sees a clean stream — reported, but the status stays 0
+function M.chkwrite_listed(sh, name)
+	if sh.write_err then
+		if sh.write_errmsg then
+			M.chkwrite_report(sh, name, sh.write_errmsg)
+		end
+		sh.write_err = nil
 	end
 end
 function M.chkwrite_report(sh, name, m)
@@ -12641,7 +12754,8 @@ function M.source_path(sh, name)
 	if not name:find("/", 1, true) and sh.shopt.sourcepath ~= false then
 		local file_test = require("interp")._int.file_test
 		for dir in (sh:get("PATH") .. ":"):gmatch("([^:]*):") do
-			local cand = (dir == "" and "." or dir) .. "/" .. name
+			-- (make_full_pathname: `.` for an empty entry, no doubled `/`)
+			local cand = (dir == "" and "./" or dir:sub(-1) == "/" and dir or dir .. "/") .. name
 			if file_test("-f", cand) then
 				return cand
 			end
@@ -12707,7 +12821,7 @@ function M.source_run(sh, argv, line)
 	end
 	local ownp = sh.params -- (a `set --` in the file replaces this table)
 	sh.sourcedepth = (sh.sourcedepth or 0) + 1 -- a `return` is valid while sourcing
-	local fr = M.source_enter(sh, name, line, argv, j)
+	local fr = M.source_enter(sh, file, line, argv, j) -- (named as found: `dir/NAME` via $PATH)
 	local dsave, e0 = M.source_debug_hide(sh), sh.traps and sh.traps.ERR
 	local sxd = sh.xdepth -- (a sourced file traces one level deeper, as b_source)
 	sh.xdepth = (sxd or 0) + 1
@@ -13866,7 +13980,7 @@ function M.xtrace_quote(w)
 	-- (print_cmd.c xtrace_print_word_list: shell metas → '…' over the raw bytes, even
 	-- control chars; else a non-printable → $'…'; else as is)
 	if M.shell_metas(w) then
-		return "'" .. w:gsub("'", "'\\''") .. "'"
+		return M.sh_single_quote(w)
 	end
 	return M.ansic_shouldquote(w) and M.shell_quote(w) or w
 end
@@ -13965,12 +14079,10 @@ function M.xtrace_declarr(sh, name, items, decl)
 	M.xtrace_line(sh, decl)
 end
 function M.xtrace_arrlit(sh, name, items)
-	local function sq(v)
-		return "'" .. tostring(v):gsub("'", "'\\''") .. "'"
-	end
+	local sq = M.sh_single_quote
 	local o = {}
 	for i, it in ipairs(items) do
-		o[i] = (it.key ~= nil and ("[" .. sq(it.key) .. "]=") or "") .. sq(it.val or "")
+		o[i] = (it.key ~= nil and ("[" .. sq(tostring(it.xkey or it.key)) .. "]=") or "") .. sq(tostring(it.val or ""))
 	end
 	M.xtrace_line(sh, name .. "=(" .. table.concat(o, " ") .. ")")
 end

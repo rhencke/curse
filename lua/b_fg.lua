@@ -7,7 +7,12 @@ local job_resolve, job_reap, SIGDESC = I.job_resolve, I.job_reap, I.SIGDESC
 -- -h only marks them (nothing here sends SIGHUP), -a all jobs, -r only running ones.
 local function disown(sh, args)
 	local all, running, honly, j = false, false, false, 2
-	while args[j] and args[j]:match("^%-%a+$") do
+	while args[j] and args[j]:match("^%-.") and args[j] ~= "--" do -- (`--Z`: the `-` is the bad option)
+		if args[j] == "--help" then -- (CASE_HELPOPT: the builtin's help, status 2)
+			require("b_help")(sh, "help", { "help", "disown" })
+			sh.status = 2
+			return
+		end
 		for f in args[j]:sub(2):gmatch(".") do
 			if f == "a" then
 				all = true
@@ -104,19 +109,30 @@ return function(sh, cmd, args)
 	end
 	-- fg/bg [jobspec]: the job (default: the current one, %+). Without job control
 	-- (`set -m` off) bash refuses both.
-	if not sh.opt_m then
+	-- (a subshell / pipeline stage starts without job control — a $(…) keeps it — until
+	-- its own `set -m`)
+	local nojc, st = not sh.opt_m, sh.iso_ctx
+	for k = st and #st or 0, 1, -1 do
+		if not st[k].cs then
+			nojc = nojc or st[k].mgen == sh.m_gen
+			break
+		end
+	end
+	if nojc then
 		io.stderr:write("curse: " .. cmd .. ": no job control\n")
 		sh.status = 1
 		return
 	end
 	local spec = args[2] or "%+"
 	local j = job_resolve(sh, spec)
-	if (sh.in_subprogram or 0) > 0 or (sh.iso_ctx and sh.iso_ctx[1]) then
-		j = nil -- (a subshell lists its parent's jobs, but none is ITS current job: bash)
+	if not j or j.done then -- (get_job_spec's NO_JOB: sh_badjob, `current` for no operand)
+		io.stderr:write("curse: " .. cmd .. ": " .. (args[2] or "current") .. ": no such job\n")
+		sh.status = 1
+		return
 	end
-	if not j or j.done then
-		local cur = not args[2] or args[2] == "%%" or args[2] == "%+"
-		io.stderr:write("curse: " .. cmd .. ": " .. (cur and "no current jobs" or (args[2] .. ": no such job")) .. "\n")
+	if (sh.in_subprogram or 0) > 0 or (sh.iso_ctx and sh.iso_ctx[1]) then
+		-- (a subshell lists its parent's jobs, but can't start one: start_job's refusal)
+		io.stderr:write("curse: " .. cmd .. ": no current jobs\n")
 		sh.status = 1
 		return
 	end
@@ -125,8 +141,8 @@ return function(sh, cmd, args)
 		sh.status = 1
 		return
 	end
-	if cmd == "bg" then -- nothing stops our jobs, so it's already running: just report it
-		sh.out(("[%d]+ %s &\n"):format(j.id, j.cmd or ""))
+	if cmd == "bg" then -- nothing stops our jobs, so it's already running (start_job: status 0)
+		io.stderr:write("curse: bg: job " .. j.id .. " already in background\n")
 		sh.status = 0
 		return
 	end

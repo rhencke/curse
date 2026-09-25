@@ -125,6 +125,7 @@ return function(sh, cmd, args, hook, tcb)
 				end
 			end
 			sh.status = 0
+			rt.chkwrite_listed(sh, "local")
 			return
 		end
 		if dash and not opts_local then

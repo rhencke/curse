@@ -60,8 +60,12 @@ return function(sh, cmd, args, hook, tcb)
 				sh.out(("%-15s\t%s\n"):format(nm, on and "on" or "off"))
 			end
 		end
-		if badopt then
-			local bad = badopt:sub(1, 2) == "--" and badopt or ("-" .. (badopt:match("^%-[suqpo]*(.)") or ""))
+		if badopt == "--help" then -- (CASE_HELPOPT: the builtin's help, status 2)
+			require("b_help")(sh, "help", { "help", "shopt" }, hook, tcb)
+			sh.status = 2
+			return
+		elseif badopt then
+			local bad = badopt:sub(1, 2) == "--" and "--" or ("-" .. (badopt:match("^%-[suqpo]*(.)") or ""))
 			io.stderr:write("curse: shopt: " .. bad .. ": invalid option\n")
 			io.stderr:write("shopt: usage: shopt [-pqsu] [-o] [optname ...]\n")
 			sh.status = 2
@@ -173,6 +177,9 @@ return function(sh, cmd, args, hook, tcb)
 				end
 			end
 			sh.status = allok and 0 or 1
+		end
+		if not badopt then
+			rt.chkwrite_st(sh, "shopt")
 		end
 	end
 end

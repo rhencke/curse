@@ -44,8 +44,8 @@ return function(sh, cmd, args, hook, tcb)
 		local reuse = listall or not sh.opt_posix
 		local function show(k)
 			local v = sh.aliases[k]
-			sh:echo((reuse and (k:sub(1, 1) == "-" and "alias -- " or "alias ") or "") .. k .. "='"
-				.. (v:find("'", 1, true) and v:gsub("'", "'\\''") or v) .. "'")
+			sh:echo((reuse and (k:sub(1, 1) == "-" and "alias -- " or "alias ") or "") .. k .. "="
+				.. (v:find("'", 1, true) and rt.sh_single_quote(v) or "'" .. v .. "'"))
 		end
 		if listall or j > #args then -- print all, sorted
 			local ns = {}

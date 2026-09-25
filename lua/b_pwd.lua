@@ -17,6 +17,33 @@ local do_arrayassign, eval, fmt_decl, fmt_set_var = I.do_arrayassign, I.eval, I.
 local C, P = I.C, I.P
 local statbuf, statbuf2 = I.statbuf, I.statbuf2
 
+-- sh_physpath (pathphys.c) of a RELATIVE internal cwd (`.`, `..`: a cd after getcwd
+-- failed): its first char is kept as the root, `.` dropped, `..` pops what follows it
+local function physrel(path)
+	local r, base, i, n = path:sub(1, 1), 1, 2, #path
+	while i <= n do
+		local c = path:byte(i)
+		local e = path:find("/", i, true) or n + 1
+		local seg = path:sub(i, e - 1)
+		if c == 47 or seg == "." then
+			i = c == 47 and i + 1 or e
+		elseif seg == ".." then
+			i = e
+			if #r > base then
+				local k = #r
+				while k > base and r:byte(k) ~= 47 do
+					k = k - 1
+				end
+				r = r:sub(1, k > base and k - 1 or base)
+			end
+		else
+			r = r .. (#r ~= base and "/" or "") .. seg
+			i = e
+		end
+	end
+	return r
+end
+
 return function(sh, cmd, args, hook, tcb)
 	if cmd == "pwd" then
 		local phys, pflag = sh.opt_P or false, false -- (set -P)
@@ -39,7 +66,11 @@ return function(sh, cmd, args, hook, tcb)
 		local tcwd = sh:cwd()
 		local out = tcwd
 		if phys then
-			out = tcwd ~= "" and sh:phys_cwd() ~= "" and rt.phys_under(sh, tcwd) or nil
+			if tcwd:byte(1) ~= 47 and tcwd ~= "" then
+				out = physrel(tcwd)
+			else
+				out = tcwd ~= "" and sh:phys_cwd() ~= "" and rt.phys_under(sh, tcwd) or nil
+			end
 		end
 		if out == nil or out == "" or (sh.opt_posix and not (C.curse_stat(tcwd, statbuf) == 0
 			and C.curse_stat(".", statbuf2) == 0

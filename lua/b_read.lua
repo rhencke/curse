@@ -107,10 +107,16 @@ local function uconvert(s)
 	local v = tonumber(ip ~= "" and ip or "0")
 	return sign == "-" and -v or v
 end
--- The rest of a UTF-8 sequence whose lead byte `c` was just read (-n/-N count chars)
+-- The rest of a UTF-8 sequence whose lead byte `c` was just read (-n/-N count chars):
+-- read_mbchar reads while mbrtowc says "incomplete" — an invalid lead byte (80-C1,
+-- FE, FF) is a char by itself, a non-continuation byte ends the char (it is kept), and
+-- glibc still takes F5-FD as the leads of the old 4- to 6-byte forms
 local function mb_rest(st, c)
 	local b = c:byte()
-	local more = (b >= 0xF0 and 3) or (b >= 0xE0 and 2) or 1
+	if b < 0xC2 or b > 0xFD then
+		return c
+	end
+	local more = (b >= 0xFC and 5) or (b >= 0xF8 and 4) or (b >= 0xF0 and 3) or (b >= 0xE0 and 2) or 1
 	local ch = { c }
 	for _ = 1, more do
 		local d = getc(st)
@@ -118,6 +124,10 @@ local function mb_rest(st, c)
 			break
 		end
 		ch[#ch + 1] = d
+		local db = d:byte()
+		if db < 0x80 or db > 0xBF then
+			break
+		end
 	end
 	return table.concat(ch)
 end

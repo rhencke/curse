@@ -70,7 +70,7 @@ return function(sh, cmd, args, hook, tcb)
 			end
 			sh.status = 0
 			if sh.out == io.write then
-				rt.chkwrite(sh, "set") -- (sh_chkwrite: a closed stdout is status 1)
+				rt.chkwrite(sh, args.as or "set") -- (sh_chkwrite: a closed stdout is status 1)
 			end
 			return
 		end

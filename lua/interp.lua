@@ -22,6 +22,9 @@ local SETOPTS, SETOPT, SETFLAG, SETDEFAULT, opt_on = rt.SETOPTS, rt.SETOPT, rt.S
 local function set_opt(sh, field, on)
 	local was = sh[field]
 	sh[field] = on
+	if field == "opt_m" and on then -- (set -m turns job control back on in a subshell: b_fg)
+		sh.m_gen = (sh.m_gen or 0) + 1
+	end
 	-- `set -o history` in a script: bash's load_history (HISTSIZE/HISTFILESIZE defaults,
 	-- then $HISTFILE) when nothing was recorded yet this session
 	if field == "opt_history" and on and was ~= true and not sh.opt_i then
@@ -4330,8 +4333,9 @@ local function printf_parse(fmt)
 							{ strftime = true, spec = spec, width = width, dynw = dynw, prec = prec, dynp = dynp, tfmt = tfmt }
 						i = close + 2
 					else -- not a %(…)T: bash warns, prints the `%`, and rescans from after it
-						local stop = close and close + 1 or n
-						toks[#toks + 1] = { diag = "warning: `" .. fmt:sub(stop, stop) .. "': invalid time format specification" }
+						-- (no `)`, or nothing after it: the char is the format's NUL terminator)
+						local sc = close and fmt:sub(close + 1, close + 1) or ""
+						toks[#toks + 1] = { diag = "warning: `" .. (sc ~= "" and sc or "\0") .. "': invalid time format specification" }
 						lit[#lit + 1] = "%"
 						i = i + 1
 					end

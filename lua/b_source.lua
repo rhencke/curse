@@ -86,7 +86,8 @@ return function(sh, cmd, args, hook, tcb)
 					end
 					local ownp = sh.params -- (a `set --` in the file replaces this table)
 					sh.sourcedepth = (sh.sourcedepth or 0) + 1 -- a `return` is valid while sourcing
-					local sframe = rt.source_enter(sh, name, nil, args, j) -- (BASH_SOURCE/BASH_LINENO/FUNCNAME frame)
+					local sframe = rt.source_enter(sh, file, nil, args, j) -- (BASH_SOURCE/BASH_LINENO/FUNCNAME frame:
+					-- the file as found — `dir/NAME` for a $PATH hit)
 					dsave = rt.source_debug_hide(sh)
 					-- Run the file the way the shell runs its own input: LAZILY through the
 					-- sh-aware parser, so aliases defined earlier expand later and a `return`

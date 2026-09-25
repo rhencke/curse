@@ -79,7 +79,7 @@ local FUNMAP = {
 
 -- sh_single_quote: always quoted (the -C command's arguments)
 local function sq1(v)
-	return "'" .. v:gsub("'", "'\\''") .. "'"
+	return rt.sh_single_quote(v)
 end
 
 -- bash_dequote_text: the word's quotes and backslashes removed (the item-list and -W
@@ -1346,7 +1346,7 @@ local function complete(sh, args)
 		for _, n in ipairs(wl or names) do
 			if tab[n] then
 				tab[n] = nil
-			else
+			elseif sh.complete_made then -- (progcomp_remove: no table yet is a success)
 				io.stderr:write("curse: complete: " .. n .. ": no completion specification\n")
 				st = 1
 			end
@@ -1366,6 +1366,7 @@ local function complete(sh, args)
 			end
 			tab[n] = cs
 		end
+		sh.complete_made = true -- (bash's progcomp_create: the table exists from now on)
 	end
 	sh.status = st
 end
