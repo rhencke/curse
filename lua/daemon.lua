@@ -34,6 +34,7 @@ end
 local ffi = require("ffi")
 local rt = require("runtime") -- also cdefs waitpid, close, read, environ, pipe
 local Tier = require("tier") -- cold requests tier (interp -> OSR + cache); warm ones load .bc
+local Invoke = require("invoke") -- the invocation: argv options, startup files, what to run
 require("cache") -- for its open/flock/mkdir ffi cdefs (serve()'s instance lock uses C.open/C.flock)
 
 -- Only NEW symbols here (runtime.lua already declared waitpid/close/read/environ/pipe).
@@ -192,99 +193,6 @@ local function apply_env(env)
 	C.environ = ffi.cast("char **", arr)
 end
 
--- Decide what to run from an argv shaped like sh's: `-c CODE [name args…]`, or a
--- script path. Sets positional params. Returns (kind, payload).
--- The invocation's options, as run.lua takes them: `-c CODE [name [args…]]`, set flags
--- (`-e`/`+e`, `-o NAME`/`+o NAME`, `-O shopt`), `-i` (interactive), `-s`/no script (read the
--- program from stdin), `--posix`, rc-file flags (ignored), `--`, then SCRIPT [args…].
--- Returns kind ("code" | "file" | "stdin" | "repl"), payload.
-local LONG_IGNORED = { ["--norc"] = 1, ["--noprofile"] = 1, ["--login"] = 1, ["-l"] = 1, ["--noediting"] = 1 }
-local function dispatch(sh, args)
-	-- args[1] is the program name (argv[0]); real args start at 2.
-	local i, n = 2, #args
-	local base = (args[1] or ""):match("[^/]+$")
-	if base == "sh" or base == "dash" or base == "ash" then
-		sh.opt_posix = true -- (invoked as sh: posix mode, as run.lua's SH_IS_POSIX)
-	end
-	local code, from_stdin = nil, false
-	while i <= n do
-		local a = args[i]
-		if a == "--" then
-			i = i + 1
-			break
-		elseif a == "-c" then
-			code = args[i + 1] or ""
-			i = i + 2
-			break
-		elseif LONG_IGNORED[a] then
-			i = i + 1
-		elseif a == "--posix" then
-			sh.opt_posix = true
-			i = i + 1
-		elseif a == "--rcfile" or a == "--init-file" then
-			i = i + 2
-		elseif (a == "-o" or a == "+o") and args[i + 1] then
-			local f = rt.SETOPT[args[i + 1]]
-			if f then
-				sh[f] = (a == "-o")
-			end
-			i = i + 2
-		elseif (a == "-O" or a == "+O") and args[i + 1] then
-			sh.shopt[args[i + 1]] = (a == "-O")
-			i = i + 2
-		elseif a:match("^[-+]%a+$") then -- clustered single-letter flags (-ex, +u, -i, -s)
-			local on = a:sub(1, 1) == "-"
-			for ch in a:sub(2):gmatch(".") do
-				if ch == "i" then
-					sh.opt_i = on
-				elseif ch == "s" then
-					from_stdin = true
-				elseif ch == "c" then
-					code = args[i + 1] or ""
-				elseif rt.SETFLAG[ch] then
-					sh[rt.SETFLAG[ch]] = on
-				end
-			end
-			i = i + (a:find("c", 2, true) and 2 or 1)
-			if code then
-				break
-			end
-		else
-			break
-		end
-	end
-	if code then
-		-- sh -c CODE [name [args…]]: name is $0, rest are $1..
-		sh.opt_c = true -- (as run.lua: -c's exit statuses, no `main` FUNCNAME frame, …)
-		-- $0 is the name argument, else the shell's own argv[0] (`exec -a NAME sh -c …`)
-		sh.argv0 = args[i] or args[1] or sh.argv0
-		for j = i + 1, n do
-			sh.params[#sh.params + 1] = args[j]
-			sh.nparams = sh.nparams + 1
-		end
-		return "code", code
-	end
-	if args[i] and not from_stdin then
-		local path = args[i]
-		sh.argv0 = path -- $0 is the script path (bash)
-		for j = i + 1, n do
-			sh.params[#sh.params + 1] = args[j]
-			sh.nparams = sh.nparams + 1
-		end
-		return "file", path
-	end
-	-- no script: the program comes from stdin (positional args with -s)
-	for j = i, n do
-		sh.params[#sh.params + 1] = args[j]
-		sh.nparams = sh.nparams + 1
-	end
-	if sh.opt_i or C.isatty(0) == 1 then
-		sh.opt_i = true
-		return "repl", nil
-	end
-	return "stdin", nil
-end
-
 -- Serve ONE request on the caller's fds, reply with the status, and RETURN so the
 -- persistent worker can serve the next (no per-request fork or _exit). Everything a
 -- script can leave in PROCESS state is reset — the fork model got this for free; we
@@ -353,38 +261,20 @@ local function serve_request(cfd, req, fds, ctx)
 	end
 	rt.startup_ignored(sh, req.sigign)
 	rt.sig_setup(sh) -- (SIGQUIT ignored; the terminating signals caught: rt.termsig)
-	if sh.fimports then
-		rt.import_functions(sh) -- exported functions (BASH_FUNC_name%%) from the caller's env
-	end
 	-- A Lua error escaping the run is a curse BUG: report it on the request's stderr
 	-- (status 1) instead of failing silently.
 	local ok = xpcall(function()
-		local kind, payload = dispatch(sh, req.args)
-		if kind == "repl" then
-			if sh.vars.PS1 == nil then
-				sh:set_str("PS1", "\\s-\\v\\$ ")
-			end
-			require("repl").run(sh)
-		elseif kind == "stdin" then
-			require("repl").run(sh) -- non-interactive: line at a time from fd 0 (bash)
-		elseif kind == "code" then
+		-- the invocation (options, $0/params, startup files, the script): shared with run.lua
+		local inv, st = Invoke.parse(req.args)
+		if not inv then
+			sh.status = st
+			return
+		end
+		local kind, payload = Invoke.start(sh, inv)
+		if kind == "repl" or kind == "stdin" then
+			require("repl").run(sh) -- (non-interactive "stdin": line at a time from fd 0, bash)
+		elseif kind ~= "exit" then -- "code" / "file" (the script's text)
 			Tier.run_tiered(payload, sh)
-		else
-			-- (bash: a missing script is `ARGV0: PATH: No such file or directory`, 127; any
-			-- other open failure 126, a directory labeled with the path itself; errexit: 1)
-			local f, err, errno = io.open(payload, "r")
-			local s = f and f:read("*a")
-			if f then
-				f:close()
-			end
-			if s then
-				Tier.run_tiered(s, sh)
-			else
-				local label = f and payload or (req.args[1] or "bash")
-				io.stderr:write(label .. ": " .. payload .. ": "
-					.. (f and "Is a directory" or (err or ""):match(": ([^:]+)$") or "No such file or directory") .. "\n")
-				sh.status = sh.opt_e and 1 or (not f and errno == 2) and 127 or 126
-			end
 		end
 	end, function(e)
 		io.stderr:write("curse: internal error: " .. tostring(e) .. "\n" .. debug.traceback() .. "\n")

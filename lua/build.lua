@@ -15,7 +15,7 @@
 -- the self-contained static binary BE /bin/sh: pmain, when invoked as a shell name,
 -- does require("run"). The dynamic dev binary loads run.lua as a file instead, so this
 -- preload entry just rides along unused there.
-local mods = { "runtime", "parser", "emit", "interp", "tier", "cache", "repl", "run" }
+local mods = { "runtime", "parser", "emit", "interp", "tier", "cache", "repl", "invoke", "run" }
 
 -- FEATURE modules: embedded in the SAME unified bundle but bcread LAZILY — their
 -- bytecode rides along as a string constant (copied, not proto-parsed, at startup)

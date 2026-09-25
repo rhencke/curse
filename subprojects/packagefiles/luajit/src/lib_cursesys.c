@@ -94,6 +94,30 @@ extern char curse_sig_hold[];
 extern char curse_ldfmt[];
 extern char curse_preempt_flagp[];
 extern char curse_preempt_arm[];
+extern char __fpurge[];
+extern char clearenv[];
+extern char clearerr[];
+extern char execve[];
+extern char fstat[];
+extern char sigaction[];
+extern char tee[];
+extern char getrusage[];
+extern char ioctl[];
+extern char iswctype[];
+extern char iswupper[];
+extern char localeconv[];
+extern char lseek[];
+extern char malloc[];
+extern char mmap[];
+extern char pipe2[];
+extern char posix_spawn_file_actions_addopen[];
+extern char stdin[];
+extern char strerror[];
+extern char strxfrm[];
+extern char syscall[];
+extern char wcscoll[];
+extern char wctype[];
+extern char wcwidth[];
 typedef struct { const char *name; void *addr; } curse_sym_t;
 static const curse_sym_t curse_syms[] = {
   { "environ", (void*)&environ },
@@ -187,6 +211,30 @@ static const curse_sym_t curse_syms[] = {
   { "waitpid", (void*)waitpid },
   { "wcrtomb", (void*)wcrtomb },
   { "write", (void*)write },
+  { "__fpurge", (void*)__fpurge },
+  { "clearenv", (void*)clearenv },
+  { "clearerr", (void*)clearerr },
+  { "execve", (void*)execve },
+  { "fstat", (void*)fstat },
+  { "sigaction", (void*)sigaction },
+  { "tee", (void*)tee },
+  { "getrusage", (void*)getrusage },
+  { "ioctl", (void*)ioctl },
+  { "iswctype", (void*)iswctype },
+  { "iswupper", (void*)iswupper },
+  { "localeconv", (void*)localeconv },
+  { "lseek", (void*)lseek },
+  { "malloc", (void*)malloc },
+  { "mmap", (void*)mmap },
+  { "pipe2", (void*)pipe2 },
+  { "posix_spawn_file_actions_addopen", (void*)posix_spawn_file_actions_addopen },
+  { "stdin", (void*)stdin },
+  { "strerror", (void*)strerror },
+  { "strxfrm", (void*)strxfrm },
+  { "syscall", (void*)syscall },
+  { "wcscoll", (void*)wcscoll },
+  { "wctype", (void*)wctype },
+  { "wcwidth", (void*)wcwidth },
   { 0, 0 }
 };
 static int streq(const char *a, const char *b){ while(*a && *a==*b){a++;b++;} return *a==*b; }

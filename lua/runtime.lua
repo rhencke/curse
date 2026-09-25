@@ -158,7 +158,7 @@ function M.err_prefix(sh)
 	if sh.opt_i then
 		return (sh.shellname or "bash") .. ": "
 	end
-	local name = sh.cur_source or sh.argv0 or sh.shellname or "bash"
+	local name = sh.cur_source or sh.main_source or sh.argv0 or sh.shellname or "bash"
 	if name == "" then
 		name = sh.argv0 or "bash"
 	end
@@ -455,7 +455,7 @@ function Shell:enterFunc(name, line)
 		ss = {}
 		self.srcstack = ss
 	end
-	table.insert(ss, 1, self.cur_source or self.argv0 or "")
+	table.insert(ss, 1, self.cur_source or self.main_source or self.argv0 or "")
 end
 function Shell:leaveFunc()
 	if self.funcstack then
@@ -3846,13 +3846,24 @@ function M.import_functions(sh)
 		if val:sub(1, 4) ~= "() {" then
 			goto nextf -- (not a function definition at all: silently not imported — bash)
 		end
-		-- (a path-like name is never imported: `/bin/echo` must stay the program)
-		if not name:find("/", 1, true) then
+		-- (a path-like name is never imported: `/bin/echo` must stay the program; nor, in
+		-- posix mode, one that isn't an identifier)
+		if not name:find("/", 1, true) and not (sh.opt_posix and not name:find("^[%a_][%w_]*$")) then
 			ok, ast = pcall(P.parse, src)
 		end
 		-- (exactly ONE statement: anything after the definition — `; echo BAD` — is a second
 		-- statement, and a word glued after the body is a syntax error)
-		local st = ok and type(ast) == "table" and not ast.perr and #ast.stmts == 1 and ast.stmts[1]
+		local good = ok and type(ast) == "table" and ast.stmts
+		for _, s in ipairs(good or {}) do
+			if s.t == "parse_error" then
+				good = false
+			end
+		end
+		local st = good and #ast.stmts == 1 and ast.stmts[1]
+		if good and not (st and st.t == "funcdef" and st.name == name) then
+			-- parsed, but not (just) that function's definition: bash's SEVAL_FUNCDEF refusal
+			io.stderr:write("curse: warning: " .. name .. ": ignoring function definition attempt\n")
+		end
 		if st and st.t == "funcdef" and st.name == name then
 			sh.functions[name] = st.body
 			sh.func_redirs = sh.func_redirs or {}
@@ -5504,8 +5515,8 @@ end
 -- `return [n]` status: no arg -> current $?; a numeric arg -> n mod 256; a
 -- non-numeric arg -> 2 + diagnostic (bash). A pure runtime primitive the compiled
 -- tier calls directly (no interp).
-function M.return_status(sh, value, name)
-	if value == nil then
+function M.return_status(sh, value, name, first) -- (first: the first word — `--` ends options)
+	if value == nil or first and value == "--" then
 		return name == "exit" and M.exit_default(sh) or M.return_default(sh)
 	end
 	local n = M.legal_i64(value) -- (get_exitstat: legal_number, then & 255)
@@ -7101,7 +7112,10 @@ function M.builtin_help(sh, cmd)
 	sh.spb_err = 2 -- (EX_USAGE: M.spb_run)
 end
 -- `return N`'s status (bash's get_exitstat): N mod 256, or 2 with a message for a non-number.
-function M.return_code(sh, s)
+function M.return_code(sh, s, first) -- (first: the command's first word — `--` ends options)
+	if first and s == "--" then
+		return sh.status
+	end
 	local n = s:match("^%s*[+-]?%d+%s*$") and tonumber(s)
 	if not n then
 		io.stderr:write("curse: return: " .. s .. ": numeric argument required\n")
@@ -7809,7 +7823,7 @@ end
 -- The bottom frame is the main script / line 0. (Single-file scripts: all the
 -- sources are the main script path — curse doesn't track per-function def files.)
 function Shell:bash_source_array()
-	local t = { self.cur_source or self.argv0 or "" }
+	local t = { self.cur_source or self.main_source or self.argv0 or "" }
 	local ss = self.srcstack or {}
 	for i = 1, #ss do
 		t[#t + 1] = ss[i]
@@ -7885,7 +7899,12 @@ function M.bav_init(sh)
 		table.insert(sh.bav, 1, f)
 	end
 end
+-- bash's get_bashargcv: the first top-level (not in a function) reference snapshots the
+-- positional parameters as the bottom frame (init_bash_argv), extdebug or not
 function Shell:bash_argv_array()
+	if not self.bav_init and self.pd == 0 and not self.bav_nolazy then
+		M.bav_init(self)
+	end
 	local t, bv = {}, self.bav or {}
 	for i = #bv, 1, -1 do
 		local f = bv[i]
@@ -7896,6 +7915,9 @@ function Shell:bash_argv_array()
 	return t
 end
 function Shell:bash_argc_array()
+	if not self.bav_init and self.pd == 0 and not self.bav_nolazy then
+		M.bav_init(self)
+	end
 	local t, bv = {}, self.bav or {}
 	for i = #bv, 1, -1 do
 		t[#t + 1] = tostring(bv[i].n)
@@ -11214,6 +11236,9 @@ function Shell:dash_flags()
 	if self.opt_c then
 		t[#t + 1] = "c"
 	end
+	if self.opt_s then -- (reading commands from stdin: -s, or no script — read_from_stdin)
+		t[#t + 1] = "s"
+	end
 	return table.concat(t)
 end
 
@@ -12218,7 +12243,7 @@ function M.source_enter(sh, name, line, args, j) -- line: the `source` command's
 		fr.bav = #args > j and M.bav_push(sh, args, j + 1, #args, -1) or M.bav_push(sh, args, j, j, -1)
 	end
 	sh.srcstack = sh.srcstack or {}
-	table.insert(sh.srcstack, 1, sh.cur_source or sh.argv0 or "")
+	table.insert(sh.srcstack, 1, sh.cur_source or sh.main_source or sh.argv0 or "")
 	sh.linestack = sh.linestack or {}
 	table.insert(sh.linestack, 1, line or (current_line(sh)))
 	sh.funcstack = sh.funcstack or {}

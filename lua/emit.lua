@@ -126,6 +126,23 @@ local function makes_attr(st)
 	end
 	return false
 end
+-- Does the program turn allexport on (`set -a`, `set -o allexport`, a clustered -…a…)?
+local function scan_allexport(stmts)
+	return any_node(stmts, function(n)
+		local w1 = n.t == "simple" and n.words and n.words[1]
+		if not (w1 and #w1.parts == 1 and w1.parts[1].lit == "set") then
+			return false
+		end
+		for j = 2, #n.words do
+			local w = n.words[j]
+			local l = #w.parts == 1 and w.parts[1].lit
+			if not l or l == "allexport" or l:match("^%-%a*a") then
+				return true
+			end
+		end
+		return false
+	end)
+end
 local function scan_attr(stmts)
 	return any_node(stmts, function(n)
 		return n.t ~= nil and makes_attr(n)
@@ -1204,6 +1221,12 @@ local function resolve_cf(st)
 	return nil
 end
 
+-- A literal break/continue level the CFG can jump by: decimal digits, >= 1, and within
+-- legal_number's int64 (`break 99999999999999999999` is the runtime's numeric error)
+function EF.cf_level(wl)
+	return wl and wl:match("^%d+$") and (#wl < 19 or #wl == 19 and wl <= "9223372036854775807")
+		and tonumber(wl) >= 1 or false
+end
 -- Does this statement list contain a break/continue the CFG can't place as a static
 -- jump — a non-literal level (`break $x`), extra args (`continue 1 2 3`), or (in a
 -- loop CONDITION) any break/continue at all (loopstack isn't active while the cond is
@@ -1224,10 +1247,7 @@ local function hard_cf(stmts, in_cond)
 			if
 				lvlw
 				and (
-					not (function()
-						local wl = full_lit(lvlw)
-						return wl and wl:match("^%d+$")
-					end)() or st.words[argoff + 1]
+					not EF.cf_level(full_lit(lvlw)) or st.words[argoff + 1]
 				)
 			then
 				return true
@@ -6411,6 +6431,8 @@ simple_compiled = function(cx, st, after)
 	end
 	if cmd == "return" then -- exit the current CFG (function or top level)
 		local w2 = st.words[2]
+		-- (a first word that EXPANDS to `--` still ends the options: `return "$1"` with $1 --)
+		local rc1 = w2 and not (#w2.parts == 1 and w2.parts[1].lit) and ", true" or ""
 		if w2 and #w2.parts == 1 and w2.parts[1].lit == "--" and not w2.parts[1].q then
 			w2 = st.words[3] -- (`return -- N`)
 			if st.words[4] then
@@ -6426,13 +6448,13 @@ simple_compiled = function(cx, st, after)
 				xa[#xa + 1] = emit_word(st.words[j], cx.lifted)
 				xn[#xn + 1] = "__x" .. (j - 1)
 			end
-			local n = w2 and ("rt.return_code(sh, %s)"):format(xn[#xn]) or "sh.status"
+			local n = w2 and ("rt.return_code(sh, %s%s)"):format(xn[#xn], rc1) or "sh.status"
 			cx.blocks[p] = ("do %s%s" .. EF.retset(cx, w2) .. " = (%s) or 0 end; pc = %d"):format(
 				#xa > 0 and ("local %s = %s; "):format(table.concat(xn, ", "), table.concat(xa, ", ")) or "",
 				EF.xtc("return", "{" .. table.concat(xn, ", ") .. "}"), n, cx.DONE)
 			return p
 		end
-		local n = w2 and ("rt.return_code(sh, %s)"):format(emit_word(w2, cx.lifted)) or "sh.status"
+		local n = w2 and ("rt.return_code(sh, %s%s)"):format(emit_word(w2, cx.lifted), rc1) or "sh.status"
 		cx.blocks[p] = (EF.retset(cx, w2) .. " = (%s) or 0; pc = %d"):format(n, cx.DONE)
 		return p
 	end
@@ -8490,7 +8512,7 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
 			local lvl, ok = 1, true
 			if st.words[cf_arg] then
 				local wl = full_lit(st.words[cf_arg])
-				if wl and wl:match("^%d+$") and tonumber(wl) >= 1 and not st.words[cf_arg + 1] then
+				if wl and EF.cf_level(wl) and not st.words[cf_arg + 1] then
 					lvl = tonumber(wl)
 				else
 					ok = false
@@ -8578,9 +8600,11 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
 				retjmp = ("if rt.return_outside(sh%s) then pc = %d else %s end"):format(viacmd, after, retjmp)
 			end
 			local aw = st.words[cf_arg]
+			local rs1 = ", nil, true" -- (a first word EXPANDING to `--` ends the options too)
 			if aw and full_lit(aw) == "--" and not aw.parts[1].q then -- (`return -- N`: end of options)
 				cf_arg = cf_arg + 1
 				aw = st.words[cf_arg]
+				rs1 = ""
 			end
 			if not st.words[cf_arg + 1] then -- at most one status WORD (pre-split)
 				local d = dbg(st) .. EF.xtwords(st.words, cx.lifted) -- DEBUG fires before return too
@@ -8594,16 +8618,17 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
 					-- the trap sees the $? from before it; the call's epilogue applies it)
 					local fret = not frag_return and EF.retset(cx, true) == "sh.fret"
 					cx.blocks[p] = d .. ps
-						.. (fret and "sh.fret = rt.return_status(sh, %s); " or "sh.status = rt.return_status(sh, %s); "):format(
-							emit_word(aw, cx.lifted)) .. retjmp
+						.. (fret and "sh.fret = rt.return_status(sh, %s%s); " or "sh.status = rt.return_status(sh, %s%s); "):format(
+							emit_word(aw, cx.lifted), full_lit(aw) and "" or rs1) .. retjmp
 					return p
 				elseif field_word(aw, cx.lifted) then -- unquoted expansion: split — 0 fields → $?, else 1st field
 					local fw = field_word(aw, cx.lifted)
 					local p = cx.newpc()
 					cx.blocks[p] = d .. ps
-						.. ("do local __f = rt.field_split(sh, %s, %s); if #__f > 0 then sh.status = rt.return_status(sh, __f[1]) end end; "):format(
+						.. ("do local __f = rt.field_split(sh, %s, %s); if #__f > 0 then sh.status = rt.return_status(sh, __f[1]%s) end end; "):format(
 							fw.expr,
-							tostring(fw.split)
+							tostring(fw.split),
+							rs1
 						) .. retjmp
 					return p
 				end -- else (pexp/${…}): not intercepted — falls through (emit deopts to interp, which is correct)
@@ -8621,7 +8646,7 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
 				local d = dbg(st) .. EF.xtwords(st.words, cx.lifted)
 				local statusexpr = aw
 						and word_safe(aw)
-						and ('rt.return_status(sh, %s, "exit")'):format(emit_word(aw, cx.lifted))
+						and ('rt.return_status(sh, %s, "exit"%s)'):format(emit_word(aw, cx.lifted), full_lit(aw) and "" or ", true")
 					or (not aw and "rt.exit_default(sh)")
 					or nil
 				if statusexpr then
@@ -8832,6 +8857,10 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
 		for k = 1, #stmts do
 			lgs = lgs or stmts[k].lgstart or false
 		end
+		local nxperr = {} -- [k]: the marker of the first syntax error at/after statement k
+		for k = #stmts, 1, -1 do
+			nxperr[k] = stmts[k].t == "parse_error" and mark[k] or nxperr[k + 1]
+		end
 		for k = 1, #stmts do
 			local ff = cx.DONE
 			for j = k + 1, #stmts do
@@ -8844,12 +8873,18 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
 			-- a non-interactive script — so every later top-level statement is skipped (which
 			-- also means a later `set +n` never runs). Checked here at the top-level boundary
 			-- only (never in a hot loop body). opt_n is off until `set -n` actually runs.
-			cx.blocks[mark[k]] = ("if sh.opt_n then pc = %d else sh._ff = %d; %spc = %d end"):format(
-				cx.DONE,
-				ff,
-				wbs,
-				cx.stmtPc[k]
-			)
+			-- (a later syntax error is still reported: noexec reads the input — it resumes there)
+			local nxp = nxperr[k + 1] or cx.DONE
+			if stmts[k].t == "parse_error" then
+				cx.blocks[mark[k]] = ("sh._ff = %d; %spc = %d"):format(ff, wbs, cx.stmtPc[k])
+			else
+				cx.blocks[mark[k]] = ("if sh.opt_n then pc = %d else sh._ff = %d; %spc = %d end"):format(
+					nxp,
+					ff,
+					wbs,
+					cx.stmtPc[k]
+				)
+			end
 			cx.stmtPc[k] = mark[k] -- entry/OSR resume enters at the marker so sh._ff + state are set
 		end
 		return {
@@ -9278,7 +9313,12 @@ function M.emit(ast, opts)
 	-- (readonly/integer/case/nameref) the fragment's own code can't see, so force the
 	-- attribute- and nameref-aware assign paths (they do the readonly check, int coercion,
 	-- nameref write-through). Otherwise a compiled `eval "x=v"` would skip readonly, etc.
-	EF.has_attr = EF.fragment or restr or scan_attr(ast.stmts) -- gate compiled attribute-aware scalar assign
+	-- (opts.startattr: the shell STARTED allexport or restricted — `bash -a`/`-r`, SHELLOPTS,
+	-- a startup file — so any plain assignment may export or be refused: tier keys on it)
+	EF.has_attr = EF.fragment or restr or (opts and opts.startattr) or scan_attr(ast.stmts) -- gate compiled attribute-aware scalar assign
+	-- allexport possible (started so, or the program's own `set -a`): a lifted native var
+	-- would never reach the environment, so nothing lifts
+	EF.no_lift = (opts and opts.startattr) or scan_allexport(ast.stmts)
 	EF.has_dyncode = scan_dyncode(ast.stmts) -- eval/source present → a $(…) can't assume its body's names are externals
 	EF.ro_names = nil -- (this program's readonly names: computed on first need — func_locals)
 	EF.frag_nameref = EF.fragment and scan_nameref(ast.stmts) -- (the fragment's own text)
@@ -9380,7 +9420,7 @@ function M.emit(ast, opts)
 	-- No lifting in a fragment: a lifted native-int64 local would neither see nor sync the
 	-- caller's real sh var (which may be readonly/exported), so keep every var in sh.
 	local lifted, lift_disq, lift_localed = {}, {}, {}
-	if not EF.fragment then
+	if not EF.fragment and not EF.no_lift then
 		lifted, lift_disq, lift_localed = analyze_lift(ast)
 	end
 	local funcTouched = {}
@@ -9390,7 +9430,7 @@ function M.emit(ast, opts)
 	-- register local of the fragment if nothing anywhere makes its value non-numeric
 	-- (disq/local'd) and no function reads it via sh. Off with eval/source/namerefs.
 	EF.frag_lift_ok = nil
-	if not EF.fragment and not EF.has_nameref and not scan_dyncode(ast.stmts) then
+	if not EF.fragment and not EF.no_lift and not EF.has_nameref and not scan_dyncode(ast.stmts) then
 		EF.frag_lift_ok = function(n)
 			return not lift_disq[n] and not lift_localed[n] and not funcTouched[n]
 		end
@@ -9503,7 +9543,7 @@ function M.emit(ast, opts)
 			-- it lifts only the shared upvalues and is sh-direct for the rest.
 			-- its own `local` integers lift into registers of fn_x (func_locals)
 			EF.ro_names = EF.ro_names or EF.readonly_names(ast.stmts)
-			local fl = func_locals(st, funcflags)
+			local fl = EF.no_lift and {} or func_locals(st, funcflags)
 			local ls = upset
 			if #fl > 0 then
 				ls = {}

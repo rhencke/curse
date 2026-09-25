@@ -221,6 +221,7 @@ return function(sh, cmd, args, hook, tcb)
 				end
 			end
 			table.sort(names)
+			sh.bav_nolazy = true -- (a listing isn't a reference: BASH_ARGV/ARGC stay unset — bash)
 			for _, nm in ipairs(names) do
 				local box = sh.vars[nm] or virt[nm]
 				if decl_match(nm, box) then
@@ -238,6 +239,7 @@ return function(sh, cmd, args, hook, tcb)
 					end
 				end
 			end
+			sh.bav_nolazy = nil
 		end
 		local fnbad = (funcnames or funcbody) -- (declare.def reports -n, then -i, -A, -a)
 			and (nref and "n" or iattr and "i" or assoc and "A" or aattr and "a")
