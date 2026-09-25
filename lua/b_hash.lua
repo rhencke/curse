@@ -16,6 +16,11 @@ local array_key, sh_printf, fd_getc, fd_ready, read_split =
 local do_arrayassign, eval, fmt_decl, fmt_set_var = I.do_arrayassign, I.eval, I.fmt_decl, I.fmt_set_var
 local C, P = I.C, I.P
 
+-- bash's printable_filename(S, 1): $'…' for a non-printable, '…' for a shell metachar
+local function pfn(s)
+	return (rt.ansic_shouldquote(s) or rt.shell_metas(s)) and rt.shell_quote(s) or s
+end
+
 return function(sh, cmd, args, hook, tcb)
 	if cmd == "hash" then
 		-- hash [-r] [NAME…] : the command-location cache. bare = list; NAME = look up
@@ -29,43 +34,56 @@ return function(sh, cmd, args, hook, tcb)
 			end
 			sh.hashpath = cur
 		end
+		-- (internal_getopt "dlp:rt": -p takes the rest of its word or the next one)
 		local rflag, names, j = false, {}, 2
 		local ppath
 		local dflag, tflag, lflag = false, false, false
 		while args[j] and args[j]:sub(1, 1) == "-" and #args[j] > 1 do
-			if args[j] == "--" then
-				j = j + 1
+			local w = args[j]
+			j = j + 1
+			if w == "--" then
 				break
 			end
-			local bad = args[j]:sub(2):match("[^lrpdt]")
-			if bad then
-				io.stderr:write("curse: hash: -" .. bad .. ": invalid option\n")
-				io.stderr:write("hash: usage: hash [-lr] [-p pathname] [-dt] [name ...]\n")
-				sh.status = 2
-				return
-			end
-			if args[j]:find("r") then
-				rflag = true
-			end
-			dflag = dflag or args[j]:find("d", 2, true) ~= nil
-			tflag = tflag or args[j]:find("t", 2, true) ~= nil
-			lflag = lflag or args[j]:find("l", 2, true) ~= nil
-			if args[j]:find("p") then -- -p PATH NAME: remember NAME at PATH (unchecked)
-				ppath = args[j + 1]
-				j = j + 1
-				if ppath == nil then
-					io.stderr:write("curse: hash: -p: option requires an argument\n" .. rt.usage("hash"))
+			local k = 2
+			while k <= #w do
+				local f = w:sub(k, k)
+				if f == "r" then
+					rflag = true
+				elseif f == "d" then
+					dflag = true
+				elseif f == "t" then
+					tflag = true
+				elseif f == "l" then
+					lflag = true
+				elseif f == "p" then -- -p PATH NAME: remember NAME at PATH (unchecked)
+					if k < #w then
+						ppath = w:sub(k + 1)
+					else
+						ppath = args[j]
+						j = j + 1
+					end
+					if ppath == nil then
+						io.stderr:write("curse: hash: -p: option requires an argument\n" .. rt.usage("hash"))
+						sh.status = 2
+						return
+					end
+					break
+				else
+					io.stderr:write("curse: hash: -" .. f .. ": invalid option\n")
+					io.stderr:write("hash: usage: hash [-lr] [-p pathname] [-dt] [name ...]\n")
 					sh.status = 2
 					return
 				end
+				k = k + 1
 			end
-			local dt = args[j]:match("[dt]")
-			if dt and args[j + 1] == nil then -- (-d/-t need names)
-				io.stderr:write("curse: hash: -" .. dt .. ": option requires an argument\n")
-				sh.status = 1
-				return
-			end
-			j = j + 1
+		end
+		if args[j] == nil and (dflag or tflag) then -- (-d/-t need names)
+			io.stderr:write("curse: hash: -" .. (dflag and "d" or "t") .. ": option requires an argument\n")
+			sh.status = 1
+			return
+		end
+		if args[j] == nil and not rflag then
+			ppath = nil -- (`hash -p PATH` alone lists the table)
 		end
 		if sh.opt_h == false then -- set +h: no command hashing at all
 			io.stderr:write("curse: hash: hashing disabled\n")
@@ -104,23 +122,23 @@ return function(sh, cmd, args, hook, tcb)
 		end
 		if #names > 0 and (dflag or tflag) then
 			sh.status = 0
-			if dflag and not next(sh.hashcache) then -- (bash: nothing to remove from, quietly)
+			if dflag and not tflag and not next(sh.hashcache) then -- (bash: nothing to remove from, quietly)
 				return
 			end
 			for _, nm in ipairs(names) do
 				local e = sh.hashcache[nm]
-				if e and tflag then
-					e = rt.hash_hit(sh.hashcache, nm) -- (a lookup counts, as phash_search does)
+				if tflag then -- (phash_search: counts a hit; a relative entry shown as ./…)
+					e = rt.phash_search(sh, nm)
 				end
 				if not e then
 					io.stderr:write("curse: hash: " .. nm .. ": not found\n")
 					sh.status = 1
-				elseif dflag then
+				elseif not tflag then
 					sh.hashcache[nm] = nil
 				elseif lflag then -- -lt: as reusable input
-					sh:echo("builtin hash -p " .. e.path .. " " .. nm)
+					sh:echo("builtin hash -p " .. e .. " " .. nm)
 				else -- -t: the remembered path (NAME<TAB>PATH for several — bash)
-					sh:echo((#names > 1 and (nm .. "\t") or "") .. e.path)
+					sh:echo((#names > 1 and (nm .. "\t") or "") .. e)
 				end
 			end
 		elseif #names > 0 then
@@ -155,7 +173,7 @@ return function(sh, cmd, args, hook, tcb)
 			end)
 			if lflag then -- (reusable input; nothing at all for an empty table)
 				for _, k in ipairs(ks) do
-					sh:echo("builtin hash -p " .. sh.hashcache[k].path .. " " .. k)
+					sh:echo("builtin hash -p " .. pfn(sh.hashcache[k].path) .. " " .. pfn(k))
 				end
 			elseif #ks > 0 then
 				sh:echo("hits\tcommand")

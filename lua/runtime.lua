@@ -777,6 +777,8 @@ ffi.cdef([[
   typedef int32_t curse_pid_t;
   int posix_spawnp(curse_pid_t *pid, const char *file, const void *file_actions,
                    const void *attrp, char *const argv[], char *const envp[]);
+  int posix_spawn(curse_pid_t *pid, const char *path, const void *file_actions,
+                  const void *attrp, char *const argv[], char *const envp[]);
   int posix_spawn_file_actions_init(void *fa);
   int posix_spawn_file_actions_destroy(void *fa);
   int posix_spawn_file_actions_adddup2(void *fa, int fd, int newfd);
@@ -2269,7 +2271,7 @@ function Shell:exec_t(args)
 		M.rd_gen = M.rd_gen + 1 -- (a new process may read our input: see M.pipe_cache)
 		local cenv = M.child_env() -- (bash's order; kept alive across the call)
 		M.nspawn = M.nspawn + 1 -- (a real child: its death is a real SIGCHLD)
-		local rc = C.posix_spawnp(pidp, execpath, fa, attr, ffi.cast("char *const *", argv), cenv)
+		local rc = C.posix_spawn(pidp, execpath, fa, attr, ffi.cast("char *const *", argv), cenv)
 		if hold then
 			async_spawn_release()
 		end
@@ -2317,7 +2319,7 @@ function Shell:exec_t(args)
 	M.rd_gen = M.rd_gen + 1 -- (a new process may read our input: see M.pipe_cache)
 	local cenv = M.child_env() -- (bash's order; kept alive across the call)
 	M.nspawn = M.nspawn + 1
-	local rc = C.posix_spawnp(pidp, execpath, fa, attr, ffi.cast("char *const *", argv), cenv)
+	local rc = C.posix_spawn(pidp, execpath, fa, attr, ffi.cast("char *const *", argv), cenv)
 	if attr then
 		C.posix_spawnattr_destroy(attr)
 	end
@@ -2608,6 +2610,15 @@ function Shell:capture_inproc(backtick, runner, capfd, ctx)
 		end
 		self.aliases = c
 	end
+	-- (and its own command hash table: what it hashes, or the hits it counts, stay there)
+	local sv_hc, sv_hp = self.hashcache, self.hashpath
+	if sv_hc then
+		local c = {}
+		for k, v in pairs(sv_hc) do
+			c[k] = v
+		end
+		self.hashcache = c
+	end
 	local sv_xd, sv_depth = self.xdepth, self.subdepth
 	self.xdepth = (sv_xd or 0) + 1 -- xtrace: PS4's first char repeats per $(…) level
 	self.subdepth = (sv_depth or 0) + 1
@@ -2642,6 +2653,7 @@ function Shell:capture_inproc(backtick, runner, capfd, ctx)
 		M.iso_restore_fds(ctx) -- (`exec 4>&1` in the body: undone while fd 1 is still the capture)
 	end
 	self.aliases = saved_aliases -- discard aliases defined inside $()
+	self.hashcache, self.hashpath = sv_hc, sv_hp
 	self.cur_line, self.cur_cmd, self.shlvl_tail = saved_line, saved_cc, saved_tl -- ($BASH_COMMAND: the child's was its own)
 	self.opt_e = savede
 	self.loopdepth = saved_ld
@@ -2781,7 +2793,7 @@ local function sub_checkpoint(self)
 		orig_vars = orig_vars, copy = copy, exset = exset,
 		params = self.params, nparams = self.nparams,
 		shopt = self.shopt, functions = self.functions,
-		locale_gen = M.locale_gen, dirstack = self.dirstack, hashcache = self.hashcache, getopts = self.getopts_state,
+		locale_gen = M.locale_gen, dirstack = self.dirstack, hashcache = self.hashcache, hashpath = self.hashpath, getopts = self.getopts_state,
 		cwd = self:phys_cwd(), tcwd = self.tcwd, um = C.umask(0), disabled = self.disabled_builtins,
 		fn_ro = self.fn_ro, unset_specials = self.unset_specials, random_plain = self.random_plain,
 		shellopts_exported = self.shellopts_exported, bav = self.bav, argv0 = self.argv0,
@@ -2843,6 +2855,7 @@ local function sub_restore(self, cp)
 	self.shopt, self.functions = cp.shopt, cp.functions
 	M.glob_asciirange = self.shopt.globasciiranges ~= false
 	self.dirstack, self.hashcache, self.getopts_state = cp.dirstack, cp.hashcache, cp.getopts
+	self.hashpath = cp.hashpath
 	local hc = cp.hist
 	if hc then
 		self.history, self.hist_ts, self.hist_base, self.hist_session = hc[1], hc[2], hc[3], hc[4]
@@ -4135,7 +4148,7 @@ function Shell:spawn_bg(args, cmdstr)
 	M.shlvl_delta = lvd - 1
 	local cenv = M.child_env() -- (bash's order; kept alive across the call)
 	M.shlvl_delta = lvd
-	local rc = C.posix_spawnp(pidp, execpath, fa, attr, ffi.cast("char *const *", argv), cenv)
+	local rc = C.posix_spawn(pidp, execpath, fa, attr, ffi.cast("char *const *", argv), cenv)
 	if hold then
 		async_spawn_release()
 	end
@@ -6283,7 +6296,7 @@ local function path_sig(curpath)
 	return table.concat(t, ",")
 end
 function path_cache(curpath)
-	if curpath:find("^:") or curpath:find("::", 1, true) or curpath:find(":$") or curpath:find("%f[^:][^/]") then
+	if curpath:byte(1) ~= 47 or curpath:find("::", 1, true) or curpath:find(":$") or curpath:find(":[^/]") then
 		return nil -- (a relative entry)
 	end
 	if PC.key ~= curpath then
@@ -6322,6 +6335,9 @@ function M.spawn_errmsg(self, name, execpath, rc)
 		and bit.band(ffi.cast("uint32_t *", stbuf_a + 24)[0], 0xF000) == 0x4000 then
 		return pre .. M.err_name(tostring(name)) .. ": Is a directory\n" -- (shell_execve: EISDIR)
 	end
+	if rc ~= 2 and execpath and not self.exec_builtin then -- (shell_execve's file_error(command))
+		return pre .. M.err_name(execpath) .. ": Permission denied\n"
+	end
 	return pre .. M.err_name(tostring(name)) .. (rc == 2 and (self.exec_builtin and ": not found\n" or ": command not found\n") or ": Permission denied\n")
 end
 -- A lookup that found NAME in the hash table HC counts a hit (bash's hash_search). An
@@ -6331,7 +6347,7 @@ end
 function M.hash_hit(hc, name)
 	local e = hc[name]
 	if e.owner ~= hc then
-		e = { path = e.path, hits = e.hits, seq = e.seq, owner = hc }
+		e = { path = e.path, hits = e.hits, seq = e.seq, chkdot = e.chkdot, owner = hc }
 		hc[name] = e
 	end
 	e.hits = e.hits + 1
@@ -6363,53 +6379,169 @@ function M.path_units(s)
 	end
 	return out
 end
--- The first executable, non-directory NAME along PATHSTR (no hashing), or nil
-function M.path_find(pathstr, name)
-	for dir in (pathstr .. ":"):gmatch("([^:]*):") do
-		local cd = (dir == "" and "." or dir) .. "/" .. name
-		if ffi.C.access(cd, 1) == 0 and ffi.C.curse_rt_stat(cd, stbuf_a) == 0 -- 1 == X_OK
-			and bit.band(ffi.cast("uint32_t *", stbuf_a + 24)[0], 0xF000) ~= 0x4000 then
-			return cd
+-- EXECIGNORE's patterns (bash's exec_name_should_ignore): colon-separated, matched
+-- case-insensitively (FNM_CASEFOLD, extglob's FNM_EXTMATCH) against the FULL pathname;
+-- a match is never "executable" (file_status) — nil when EXECIGNORE is unset or empty.
+function M.exec_ignores(sh)
+	local v = sh:get("EXECIGNORE")
+	if v == nil or v == "" then
+		return nil
+	end
+	local t = {}
+	for pat in v:gmatch("[^:]+") do
+		t[#t + 1] = pat
+	end
+	return t[1] and t or nil
+end
+-- bash's file_status for a command search: 0 missing, 1 exists (not executable — or
+-- ignored), 2 a directory, 3 executable. IGN: M.exec_ignores' list.
+function M.cmd_fstatus(p, ign)
+	if ffi.C.access(p, 1) ~= 0 then -- (1 == X_OK)
+		if ffi.errno() == 2 then
+			return 0 -- (ENOENT: the common miss, one syscall)
+		end
+		if ffi.C.curse_rt_stat(p, stbuf_a) ~= 0 then
+			return 0
+		end
+		return bit.band(ffi.cast("uint32_t *", stbuf_a + 24)[0], 0xF000) == 0x4000 and 2 or 1
+	end
+	if ffi.C.curse_rt_stat(p, stbuf_a) ~= 0 then
+		return 0
+	end
+	if bit.band(ffi.cast("uint32_t *", stbuf_a + 24)[0], 0xF000) == 0x4000 then
+		return 2
+	end
+	return (ign and M.exec_ignored(p, ign)) and 1 or 3
+end
+function M.exec_ignored(p, ign)
+	for i = 1, #ign do
+		if M.sm_match(p, ign[i], 16 + 32) then -- (FNM_CASEFOLD | FNM_EXTMATCH)
+			return true
 		end
 	end
+	return false
 end
+-- bash's find_user_command_in_path (FS_EXEC_PREFERRED|FS_NODIRS): NAME along PATHSTR —
+-- an empty element is `.`, a `~` element is tilde-expanded (not in posix mode), and the
+-- element and NAME are joined without doubling a trailing slash (sh_makepath). The first
+-- executable wins; failing that, the first existing non-executable "file to lose on"
+-- (unless that first thing was a directory). An unset/empty PATH is NAME itself (the
+-- cwd, by execve). Returns the path, whether it's executable, and dot_found_in_search
+-- (a `.`-form element naming the cwd came first — the hash entry's HASH_CHKDOT).
+function M.search_path(sh, name, pathstr, ign)
+	if pathstr == nil or pathstr == "" then
+		return name, false, false
+	end
+	local lose, lose_st, dotfound
+	local posix = sh.opt_posix
+	for _, dir in ipairs(M.path_units(pathstr)) do
+		if dir == "" then
+			dir = "."
+		elseif dir:byte(1) == 126 and not posix then
+			dir = M.tilde_prefix(sh, dir)
+		end
+		if not dotfound and dir:byte(1) == 46 then
+			dotfound = same_file(".", dir)
+		end
+		local full = dir:byte(-1) == 47 and dir .. name or dir .. "/" .. name
+		local st = M.cmd_fstatus(full, ign)
+		if st == 3 then
+			return full, true, dotfound
+		end
+		if st ~= 0 and not lose then
+			if st == 2 then
+				lose, lose_st = full, 2
+			elseif not (ign and M.exec_ignored(full, ign)) then -- (an ignored file is no fallback)
+				lose, lose_st = full, 1
+			end
+		end
+	end
+	if lose_st == 2 then -- (FS_NODIRS)
+		lose = nil
+	end
+	return lose, false, dotfound
+end
+-- bash's phash_insert: NAME -> PATH (CHKDOT: `.` came before PATH's directory).
+function M.phash_insert(sh, name, path, chkdot, hits)
+	sh.hashcache = sh.hashcache or {}
+	M.hash_seq = M.hash_seq + 1
+	sh.hashcache[name] = { path = path, hits = hits or 1, seq = M.hash_seq, chkdot = chkdot or nil }
+end
+-- bash's phash_search: NAME's hashed path (counting a hit), or nil. An entry hashed
+-- after `.` in $PATH (HASH_CHKDOT) or with a relative path (HASH_RELPATH) is re-checked:
+-- an executable ./NAME (./PATH) wins, shown as such; a `.`-relative path whose directory
+-- is no longer the cwd is no hit at all (the caller searches again).
+function M.phash_search(sh, name)
+	local hc = sh.hashcache
+	if not (hc and hc[name]) then
+		return nil
+	end
+	local e = M.hash_hit(hc, name)
+	local path = e.path
+	local rel = path:byte(1) ~= 47
+	if e.chkdot or rel then
+		local tail = rel and path or name
+		local dotted = (tail:byte(1) == 46 and tail:byte(2) == 47) and tail or "./" .. tail
+		if M.cmd_fstatus(dotted, nil) == 3 then
+			return dotted
+		end
+		if path:byte(1) == 46 then
+			local sl = path:match(".*()/")
+			if sl and same_file(".", path:sub(1, sl - 1)) then
+				return nil
+			end
+		end
+	end
+	return path
+end
+-- search_for_command: NAME's path for execution (argv[0] stays the name as typed) — the
+-- hash table (re-validated under checkhash / posix mode), else a $PATH search whose
+-- result is hashed (a non-executable one not under checkhash / posix; an unset/empty
+-- PATH's cwd match never). `command -p` searches the standard path, still hashing.
 function Shell:resolve_cmd(name)
 	local pl = self.path_lookup
-	if pl then -- (`command -p`: the standard path for this ONE lookup — no hashing, no $PATH change)
-		self.path_lookup = nil
-		return M.path_find(pl, name)
-	end
 	local curpath = self:get("PATH")
 	if self.hashpath and self.hashpath ~= curpath then
 		self.hashcache = {}
 	end -- PATH changed: rehash
 	self.hashpath = curpath
-	local c = self.hashcache and self.hashcache[name]
-	if c then
-		return M.hash_hit(self.hashcache, name).path
-	end
-	local pc = path_cache(curpath)
-	local cand = pc and pc.map[name]
-	if not cand then
-		for dir in (curpath .. ":"):gmatch("([^:]*):") do
-			local cd = (dir == "" and "." or dir) .. "/" .. name
-			if
-				ffi.C.access(cd, 1) == 0
-				and ffi.C.curse_rt_stat(cd, stbuf_a) == 0 -- 1 == X_OK
-				and bit.band(ffi.cast("uint32_t *", stbuf_a + 24)[0], 0xF000) ~= 0x4000
-			then -- not a dir
-				cand = cd
-				break
+	local cand, x, dotfound
+	if pl then -- (CMDSRCH_STDPATH: no hash lookup — for this ONE lookup, no $PATH change)
+		self.path_lookup = nil
+		cand, x, dotfound = M.search_path(self, name, pl, M.exec_ignores(self))
+	else
+		local hc = self.hashcache
+		if hc and hc[name] then
+			local e = hc[name]
+			if not e.chkdot and e.path:byte(1) == 47 and not (self.opt_posix or self.shopt.checkhash) then
+				return M.hash_hit(hc, name).path -- (the common case)
+			end
+			local p = M.phash_search(self, name)
+			if p and (self.opt_posix or self.shopt.checkhash) and M.cmd_fstatus(p, nil) ~= 3 then
+				hc[name], p = nil, nil -- (a vanished / non-executable hashed file: search again)
+				PC.map[name] = nil -- (nor trust the process-wide cache for it)
+			end
+			if p then
+				return p
 			end
 		end
-		if cand and pc then
-			pc.map[name] = cand
+		if curpath == "" then
+			return name -- (an unset/empty PATH: the cwd, by execve — never hashed)
+		end
+		local ign = M.exec_ignores(self)
+		local pc = not ign and path_cache(curpath)
+		cand = pc and pc.map[name]
+		if cand then
+			x = true
+		else
+			cand, x, dotfound = M.search_path(self, name, curpath, ign)
+			if cand and x and pc then
+				pc.map[name] = cand
+			end
 		end
 	end
-	if cand then
-		self.hashcache = self.hashcache or {}
-		M.hash_seq = M.hash_seq + 1
-		self.hashcache[name] = { path = cand, hits = 1, seq = M.hash_seq }
+	if cand and (x or not (self.opt_posix or self.shopt.checkhash)) then
+		M.phash_insert(self, name, cand, dotfound)
 	end
 	return cand
 end
@@ -7423,6 +7555,9 @@ function Shell:set_str(name, s)
 	elseif dn == "IGNOREEOF" then
 		self.opt_ignoreeof = true -- (sv_ignoreeof: any value turns ignoreeof on)
 	end
+	if self.opt_a and not b.arr then -- (set -a: every scalar assignment exports — bind_variable)
+		b.exported = true
+	end
 	if b.exported then
 		C.setenv(dn, s, 1)
 		if dn == "TZ" then -- (bash's sv_tz: an exported TZ takes effect at once)
@@ -7589,6 +7724,10 @@ function Shell:aset(name, n)
 	end -- (( a = n )) hits a[0]
 	b.n = i64(n)
 	b.s = nil
+	if b.exported or self.opt_a then -- (set -a: bind_variable marks it; keep the env in sync)
+		b.exported = true
+		C.setenv(dn, i64_to_str(b.n), 1)
+	end
 	return b.n
 end
 
@@ -12243,45 +12382,10 @@ end
 
 -- `command -v NAME…` / `command -V NAME…`: a lookup query (is NAME an alias/keyword/
 -- builtin/function/PATH file?) — no execution, so compile it to this rt.* dispatch instead
--- of delegating. name_type is the runtime resolver interp uses; the argv is already expanded
--- by the field engine. Mirrors interp's command -v/-V branch exactly (status 0 if ANY name
--- resolved). Combined/other flags stay with the interpreter.
+-- of delegating: interp's command_describe (bash's describe_command), the argv already
+-- expanded by the field engine. Combined/other flags stay with the interpreter.
 function M.command_query(sh, argv)
-	local I = require("interp")._int
-	local verbose = argv[2] == "-V"
-	local anyfound = false
-	for j = 3, #argv do
-		local k, p, hashed = I.name_type(sh, argv[j])
-		if not k then
-			if verbose then
-				io.stderr:write("curse: command: " .. argv[j] .. ": not found\n")
-			end
-		else
-			anyfound = true
-			if verbose then
-				if k == "alias" then
-					sh:echo(argv[j] .. " is aliased to `" .. sh.aliases[argv[j]] .. "'")
-				elseif k == "file" then
-					sh:echo(argv[j] .. (hashed and " is hashed (" .. p .. ")" or " is " .. p))
-				elseif k == "function" then
-					sh:echo(argv[j] .. " is a function")
-					local d = I.func_body_text(sh, argv[j])
-					if d then
-						sh:echo(d)
-					end
-				elseif k == "keyword" then
-					sh:echo(argv[j] .. " is a shell keyword")
-				else
-					sh:echo(argv[j] .. " is a shell builtin")
-				end
-			elseif k == "alias" then
-				sh:echo("alias " .. argv[j] .. "='" .. sh.aliases[argv[j]] .. "'")
-			else
-				sh:echo(k == "file" and p or argv[j])
-			end
-		end
-	end
-	sh.status = anyfound and 0 or 1
+	require("interp")._int.command_describe(sh, argv, argv[3] == "--" and 4 or 3, argv[2] == "-V", false)
 end
 
 -- `source FILE [args]` / `. FILE [args]`: run FILE in the CURRENT shell, COMPILED as a
