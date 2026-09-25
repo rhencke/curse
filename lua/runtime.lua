@@ -5526,7 +5526,7 @@ end
 M.DYN_SPECIAL = { SECONDS = true, LINENO = true, BASHPID = true, EPOCHSECONDS = true,
 	EPOCHREALTIME = true, SRANDOM = true, BASH_SUBSHELL = true, HISTCMD = true, BASH_COMMAND = true,
 	BASH_ARGV0 = true, FUNCNAME = true, BASH_SOURCE = true, BASH_LINENO = true, OSTYPE = true,
-	MACHTYPE = true, HOSTTYPE = true }
+	MACHTYPE = true, HOSTTYPE = true, DIRSTACK = true }
 function Shell:special_get(name)
 	-- the one-char specials as the BASE of an operator form (${?:-x} ${$:+y} ${-+z} ${!-w});
 	-- the bare $? $$ $- $! go through their own dedicated nodes
@@ -6598,14 +6598,8 @@ function Shell:array_set(name, key, val, append)
 	if val:find("\0", 1, true) then
 		val = M.cstr(val)
 	end -- C-string element: cut at NUL
-	if name == "DIRSTACK" and not self.vars.DIRSTACK then -- rewrite an existing stack entry
-		local k = tonumber(key)
-		local ds = self.dirstack or {}
-		local i = k and (#ds - k + 1) -- DIRSTACK[k] (k >= 1) is the k-th entry below the cwd
-		if i and k >= 1 and ds[i] then
-			ds[i] = append and (ds[i] .. val) or val
-			self.dirstack = ds
-		end
+	if name == "DIRSTACK" and M.dirstack_dyn(self) then
+		M.dirstack_set(self, key, val, append)
 		return true
 	end
 	local b = box(self:deref(name), self.vars)
@@ -6712,6 +6706,22 @@ function Shell:bash_lineno_array()
 	end
 	return t
 end
+-- DIRSTACK is bash's dynamic array while no variable of that name shadows it (a
+-- `local DIRSTACK`) and it hasn't been unset (for good).
+function M.dirstack_dyn(sh)
+	return not sh.vars.DIRSTACK and not (sh.unset_specials and sh.unset_specials.DIRSTACK)
+end
+-- pushd.def's set_dirstack_element (DIRSTACK's assign_func): DIRSTACK[k] (k >= 1) rewrites
+-- the k-th entry below the cwd; [0] and indices past the stack are ignored.
+function M.dirstack_set(sh, key, val, append)
+	local k = tonumber(key)
+	local ds = sh.dirstack or {}
+	local i = k and (#ds - k + 1)
+	if i and k >= 1 and ds[i] then
+		ds[i] = append and (ds[i] .. val) or val
+		sh.dirstack = ds
+	end
+end
 -- DIRSTACK: the directory stack, full paths, [0] always the current directory (bash)
 function Shell:dirstack_array() -- (sh.dirstack: the entries below the cwd, bottom first)
 	local ds = self.dirstack or {}
@@ -6796,7 +6806,7 @@ local VIRT_ARR = {
 	DIRSTACK = "dirstack_array",
 }
 function Shell:array_get(name, key)
-	if VIRT_ARR[name] then
+	if VIRT_ARR[name] and (name ~= "DIRSTACK" or M.dirstack_dyn(self)) then
 		return self[VIRT_ARR[name]](self)[(tonumber(key) or 0) + 1] or ""
 	end
 	local b = self.vars[self:deref(name)]
@@ -6952,7 +6962,7 @@ do
 end
 
 function Shell:array_indices(name)
-	if VIRT_ARR[name] then
+	if VIRT_ARR[name] and (name ~= "DIRSTACK" or M.dirstack_dyn(self)) then
 		local a = self[VIRT_ARR[name]](self)
 		local t = {}
 		for i = 1, #a do
@@ -7037,7 +7047,7 @@ function M.assoc_keys(b)
 	end
 end
 function Shell:array_values(name)
-	if VIRT_ARR[name] then
+	if VIRT_ARR[name] and (name ~= "DIRSTACK" or M.dirstack_dyn(self)) then
 		return self[VIRT_ARR[name]](self)
 	end
 	local idx = self:array_indices(name)
@@ -9135,6 +9145,15 @@ arrayassign_body = function(sh, name, items, append)
 	local function keyof(kt)
 		-- (an indexed subscript loses bash's CTLESC bytes, e.g. from a $'\001' in it)
 		return isassoc and kt or M.to_arr_key(M.arith_str(sh, (kt:gsub("\1", ""))))
+	end
+	if name == "DIRSTACK" and M.dirstack_dyn(sh) then -- (each element through its assign_func)
+		local auto = append and #(sh.dirstack or {}) + 1 or 0
+		for _, it in ipairs(items) do
+			local k = it.key ~= nil and tonumber(keyof(it.key)) or auto
+			M.dirstack_set(sh, k, it.val, it.op == "+=")
+			auto = (k or auto) + 1
+		end
+		return
 	end
 	local snap
 	if not append then -- plain assignment resets the array (keeps assoc-ness)

@@ -3237,6 +3237,15 @@ local function do_arrayassign(sh, st)
 		end
 	end
 	local items = sh.arrayargs_pre and sh.arrayargs_pre[st] or arrayassign_items(sh, st, isassoc)
+	if name == "DIRSTACK" and rt.dirstack_dyn(sh) then -- (the dynamic array: each element
+		local auto = st.append and #(sh.dirstack or {}) + 1 or 0 -- through its assign_func)
+		for _, it in ipairs(items) do
+			local k = it.key ~= nil and tonumber(array_key(sh, name, it.key)) or auto
+			rt.dirstack_set(sh, k, it.val, it.op == "+=")
+			auto = (k or auto) + 1
+		end
+		return
+	end
 	if st.append and sh.vars[name] then
 		sh.vars[name].empty_decl = nil -- (`a+=()` counts as an assignment: shows =())
 	end
@@ -3424,7 +3433,7 @@ local function fmt_decl(sh, name)
 		return "declare -r" .. x .. " " .. name .. "=" .. decl_quote(sh:special_get(name))
 	end
 	local b = sh.vars[name]
-	if b == nil and DYN_ARRAYS[name] then -- (bash's dynamic arrays: FUNCNAME, BASH_SOURCE, …)
+	if b == nil and DYN_ARRAYS[name] and not (sh.unset_specials and sh.unset_specials[name]) then -- (bash's dynamic arrays: FUNCNAME, BASH_SOURCE, …)
 		local vals, parts = sh:array_values(name), {}
 		if name == "DIRSTACK" and not (sh.dirstack and #sh.dirstack > 0) then
 			vals = {} -- (bash shows an unused stack as `()`, though ${DIRSTACK[0]} is the cwd)

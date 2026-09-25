@@ -34,7 +34,7 @@ return function(sh, cmd, args, hook, tcb)
 	-- a path with a leading $HOME shown as ~ (bash's polite_directory_format)
 	local function polite(p)
 		local h = sh:get("HOME")
-		if h ~= "" and p:sub(1, #h) == h and (#p == #h or p:sub(#h + 1, #h + 1) == "/") then
+		if #h > 1 and p:sub(1, #h) == h and (#p == #h or p:sub(#h + 1, #h + 1) == "/") then
 			return "~" .. p:sub(#h + 1)
 		end
 		return p
