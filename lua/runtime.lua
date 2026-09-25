@@ -12637,7 +12637,25 @@ do
 		end
 		return require("interp").exec_simple(sh, argv, hook)
 	end
-	function M.sr_run_cmd(sh, argv, spec, hook)
+	function M.sr_run_cmd(sh, argv, spec, hook, rf)
+		if rf then
+			local a1, a2 = argv[1], argv[2]
+			if not (a1 == "exec" or ((a1 == "command" or a1 == "builtin") and a2 == "exec")) then
+				local rs = {}
+				if not rf(rs) then
+					M.redir_restore(rs)
+					sh.status = 1
+					return
+				end
+				local ok, err = pcall(M.sr_run_cmd, sh, argv, spec, hook)
+				io.flush()
+				M.redir_restore(rs)
+				if not ok then
+					error(err, 0)
+				end
+				return
+			end
+		end
 		sh.write_err = nil
 		local I = require("interp")
 		if sh.opt_x then
@@ -12689,18 +12707,19 @@ do
 	function M.procsub_mark(sh) -- (the <(…)/>(…) a command registers: drained after it)
 		return (sh.procsub_pending and #sh.procsub_pending or 0), (sh.procsub_files and #sh.procsub_files or 0)
 	end
-	function M.simple_run(sh, argv, spec, bind, hook, n0, pm1, pm2)
+	-- (rf: a dynamic command name's redirections, applied here unless it's `exec`)
+	function M.simple_run(sh, argv, spec, bind, hook, n0, rf, pm1, pm2)
 		if spec.ps then
-			local ok, err = pcall(M.sr_run, sh, argv, spec, bind, hook, n0)
+			local ok, err = pcall(M.sr_run, sh, argv, spec, bind, hook, n0, rf)
 			require("interp")._int.drain_procsub(sh, pm1, pm2)
 			if not ok then
 				error(err, 0)
 			end
 			return
 		end
-		return M.sr_run(sh, argv, spec, bind, hook, n0)
+		return M.sr_run(sh, argv, spec, bind, hook, n0, rf)
 	end
-	function M.sr_run(sh, argv, spec, bind, hook, n0)
+	function M.sr_run(sh, argv, spec, bind, hook, n0, rf)
 		hook = hook or _noop
 		if sh.xerr then -- a word expansion failed: the command doesn't run (status 1)
 			sh.xerr = nil
@@ -12727,6 +12746,13 @@ do
 			if sh.status == 0 and n0 and sh.ncs ~= n0 then
 				sh.status = sh.last_cmdsub_status or 0
 			end
+			if rf then -- (a redirection with no command still opens/truncates its target)
+				local rs = {}
+				if not rf(rs) then
+					sh.status = 1
+				end
+				M.redir_restore(rs)
+			end
 			return
 		end
 		if aas then
@@ -12750,7 +12776,7 @@ do
 			ok, err = pcall(bind, sh)
 			sh.pb_mode = svm
 			if ok then
-				ok, err = pcall(M.sr_run_cmd, sh, argv, spec, hook)
+				ok, err = pcall(M.sr_run_cmd, sh, argv, spec, hook, rf)
 			end
 			for name, box in pairs(prior) do
 				if sh.vars[name] == nil then
@@ -12765,12 +12791,12 @@ do
 			sh.pb_mode, sh.pb_cmd = svm, svc
 			if ok then
 				sh.tenv_call_base = base
-				ok, err = pcall(M.sr_run_cmd, sh, argv, spec, hook)
+				ok, err = pcall(M.sr_run_cmd, sh, argv, spec, hook, rf)
 				sh.tenv_call_base = nil
 			end
 			M.sr_unbind(sh, base, argv)
 		else
-			ok, err = pcall(M.sr_run_cmd, sh, argv, spec, hook)
+			ok, err = pcall(M.sr_run_cmd, sh, argv, spec, hook, rf)
 		end
 		if ok and aas then
 			ok, err = pcall(M.sr_aa_post, sh, aas)

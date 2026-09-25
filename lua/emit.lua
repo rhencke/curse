@@ -4588,8 +4588,8 @@ end
 -- substitution, an uncompilable redirect) — the caller delegates.
 local SN_ASSIGN_CMD = { export = 1, declare = 1, typeset = 1, readonly = 1, ["local"] = 1 }
 EF.simple_native = function(cx, st, after, cmd)
-	if not st.words[1] or (not cmd and st.redirs) then -- (a dynamic name with redirections:
-		return nil -- it may turn out to be `exec`, whose redirections persist)
+	if not st.words[1] then
+		return nil
 	end
 	local lifted = cx.lifted
 	local w2 = st.words[2] and st.words[2].parts[1]
@@ -4698,8 +4698,20 @@ EF.simple_native = function(cx, st, after, cmd)
 		spec[#spec + 1] = "ps=true"
 		out[1] = "local __pm1, __pm2 = rt.procsub_mark(sh); " .. out[1]
 	end
-	local redir
-	if isexec and st.redirs then
+	local redir, rf
+	if not cmd and st.redirs and #st.redirs > 0 then
+		-- a dynamic name may turn out to be `exec` (whose redirections persist): the runner
+		-- decides, applying them itself (rf) around anything else
+		local rc = cx.redir_conds(st, nil)
+		if not rc then
+			return nil
+		end
+		spec[#spec + 1] = "eredirs=" .. ser(st.redirs)
+		rf = ("function(__rs) return %s end"):format(rc)
+		if require("interp")._int.redirs_touch_stdout(st.redirs) then
+			spec[#spec + 1] = "so=true"
+		end
+	elseif isexec and st.redirs then
 		spec[#spec + 1] = "eredirs=" .. ser(st.redirs)
 	elseif st.redirs and #st.redirs > 0 then
 		redir = cx.redir_conds(st, cmd)
@@ -4713,7 +4725,8 @@ EF.simple_native = function(cx, st, after, cmd)
 	return cx.delegate(st, after, {
 		prelude = table.concat(out, "; "),
 		callee = "rt.simple_run",
-		callargs = ("sh, __a, %s, %s, __noop, __n0%s"):format(EF.konst(spec), bind or "nil", anyps and ", __pm1, __pm2" or ""),
+		callargs = ("sh, __a, %s, %s, __noop, __n0, %s%s"):format(EF.konst(spec), bind or "nil", rf or "nil",
+			anyps and ", __pm1, __pm2" or ""),
 		redir = redir,
 	})
 end
@@ -4890,6 +4903,14 @@ simple_compiled = function(cx, st, after)
 	-- reusing delegate's control-flow-signal wrapper. A prefix assign (tempenv) still needs
 	-- exec_stmt's fuller handling; a redirect is applied around the dispatch (opts.redir).
 	if cmd == nil and st.words[1] and not st.assigns then
+		-- (with redirections the name may turn out to be `exec`, whose redirections persist:
+		-- the native runner applies them itself unless it is)
+		if st.redirs then
+			local pn = EF.simple_native(cx, st, after, nil)
+			if pn then
+				return pn
+			end
+		end
 		local argvbody = field_argv(st.words, 1, cx.lifted, nil, nil)
 		local dyn_redir = nil
 		if argvbody and st.redirs then
