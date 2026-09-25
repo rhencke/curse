@@ -147,6 +147,28 @@ local function arith(src, nodefer)
 		end
 		return a or b
 	end
+	-- What had run when bash's LEXER met a bad character: it reads one token ahead, so the
+	-- operations along the right edge — waiting on that token — hadn't happened yet
+	-- (`y = 3 @` assigns nothing, `x++, y=2 #c` increments x), but everything to their left,
+	-- a completed parenthesis, and the last operand (a `x++` included) had.
+	local function spine(e)
+		local k = e.k
+		if e.paren then
+			return e
+		elseif k == "comma" then
+			return seq(e.l, spine(e.r))
+		elseif k == "bin" then
+			if e.op == "&&" or e.op == "||" then
+				return { k = "bin", op = e.op, l = e.l, r = spine(e.r) or ZERO }
+			end
+			return seq(e.l, spine(e.r))
+		elseif k == "asgn" or k == "un" then
+			return spine(e.e)
+		elseif k == "tern" then
+			return { k = "tern", c = e.c, a = e.a, b = spine(e.b) or ZERO }
+		end
+		return e
+	end
 	-- run a sub-parse; a syntax error in it gets `wrap(its pre)` as its pre (the completed
 	-- siblings to its left, in their evaluation context)
 	local function withpre(wrap, f, x, y)
@@ -233,6 +255,7 @@ local function arith(src, nodefer)
 			if not eat(")") then
 				aerr("missing `)'", e)
 			end
+			e.paren = true -- (complete once its `)` is read: see spine)
 			return e
 		end
 		if (starts("++") or starts("--")) and not src:find("^[%+%-][%+%-][ \t\n]*[%a_]", i) then
@@ -514,7 +537,11 @@ local function arith(src, nodefer)
 			or src:find("^>>=", i) then
 			aerr("attempted assignment to non-variable", e)
 		elseif not c:match(ARITHOP) and not c:match("[%w_]") then
-			aerr("syntax error: invalid arithmetic operator", e) -- (after an operand: `1 @ 2`)
+			-- (after an operand: `1 @ 2`; after a `)` — itself an operator token — readtok says
+			-- an operand was expected)
+			local pc = src:sub(1, i - 1):match("(%S)%s*$")
+			aerr(pc == ")" and "syntax error: operand expected" or "syntax error: invalid arithmetic operator",
+				spine(e))
 		end
 		aerr("syntax error in expression", e)
 	end
@@ -1284,7 +1311,7 @@ local function parse_dollar(w, i, add, q)
 			end
 			j = j + 1
 		end
-		add({ arith = w:sub(i + 2, j - 1), q = q })
+		add({ arith = w:sub(i + 2, j - 1), q = q, bracket = true })
 		return j + 1
 	elseif nx == "(" then
 		local je = scan_cmdsub(w, i + 2) -- index just past the closing `)` (case/quote/nesting aware)
