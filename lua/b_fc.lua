@@ -11,7 +11,8 @@ local HIST_INVALID, HIST_ERANGE, HIST_NOTFOUND = -1000001, -1000002, -1000003 --
 
 -- run CODE in the current shell, as bash's parse_and_execute (a logical line at a time)
 local function exec_string(sh, code, hook)
-	local nextf = P.open(code, sh)
+	-- (its lines count from the fc command's own: errors in it report that line, bash)
+	local nextf = P.open(code, sh, rt.current_line(sh))
 	while true do
 		local lg = nextf()
 		if lg == nil then
@@ -168,7 +169,9 @@ return function(sh, cmd, args, hook)
 			return
 		end
 		for _, r in ipairs(subs) do -- (bash's strsub, global: every occurrence, left to right)
-			if r[1] ~= "" then
+			if r[1] == "" then -- (an empty pattern matches at every character, eating it)
+				command = r[2]:rep(#command)
+			else
 				local parts, p = {}, 1
 				while true do
 					local s = command:find(r[1], p, true)
@@ -321,11 +324,12 @@ return function(sh, cmd, args, hook)
 	os.remove(fn)
 	-- run it as bash's fc_execute_file: each line echoed as it's read (set -v style) and
 	-- recorded in the history
-	local sv, so = sh.opt_v, sh.opt_history
-	sh.opt_v, sh.opt_history = true, true
+	-- (diagnostics are labelled with the temp file's name: `/tmp/bash-fc.N: line 1: …`)
+	local sv, so, ss = sh.opt_v, sh.opt_history, sh.cur_source
+	sh.opt_v, sh.opt_history, sh.cur_source = true, true, fn
 	sh.status = 0
 	local ok, err = pcall(I.run_history_lines, sh, text, 1, hook, 0)
-	sh.opt_v, sh.opt_history = sv, so
+	sh.opt_v, sh.opt_history, sh.cur_source = sv, so, ss
 	if not ok then
 		error(err, 0)
 	end

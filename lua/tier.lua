@@ -79,7 +79,8 @@ function M.try_fragment(code, line1, sh, now, label, noalias) -- line1: an eval'
 	-- line1 == false: a trap handler, whose commands keep the interrupted line;
 	-- label "eval": its syntax errors read `eval: line N:` and end just the eval)
 	local mode = trap_mode(sh) .. (line1 == false and "H" or "") .. (label == "eval" and "V" or "")
-		.. (label == "cmdsub" and "C" or "") -- (a $( … ) body: its last command is marked, P.mark_tail)
+		.. ((label == "cmdsub" or label == "cmdsub-bq") and "C" or "") -- (a $( … ) body: its last command is marked, P.mark_tail)
+		.. (label == "cmdsub-bq" and "Q" or "") -- (a backtick body: its syntax errors read `command substitution:`)
 	local asig = not noalias and alias_sig(sh) -- (noalias: text read with its aliases expanded)
 	-- (the live parse-time options the text is read under: posix mode, extglob)
 	local pst = (sh.opt_posix and "p" or "") .. (sh.shopt and sh.shopt.extglob and "x" or "-")
@@ -127,6 +128,9 @@ function M.compile_fragment(code, line1, mode, atab, pst)
 	for k, st in ipairs(ast.stmts) do
 		if st.t == "parse_error" then
 			st.lead = rt.perr_lead(ast.stmts, k) or nil
+			if mode and mode:find("Q", 1, true) then -- (as capture_src labels the interpreted one)
+				st.plabel = "command substitution"
+			end
 		end
 	end
 	local ok, chunk = pcall(function()

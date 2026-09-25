@@ -242,6 +242,9 @@ local function serve_request(cfd, req, fds, ctx)
 
 	-- A FRESH Shell.new (imports the caller's env exactly), cheap because the pages are
 	-- warm (worker_main pre-faulted once, and a persistent worker never re-forks).
+	-- (process-wide spawn adjustments a previous request may have left set — e.g. a tail
+	-- exec's lowered $SHLVL inside a pipeline-stage coroutine that was never resumed)
+	rt.shlvl_delta, rt.env_drop_us = 0, false
 	local sh = rt.Shell.new()
 	rt.shlvl_start(sh) -- (a new shell: $SHLVL + 1, exported)
 	-- $PPID is the CLIENT's parent (the shell that ran curse), not this worker's
