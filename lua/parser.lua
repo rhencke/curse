@@ -3140,6 +3140,12 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs)
 		end
 		i = q
 		ws()
+		-- after `>&`/`<&` a `-` is a token of its own (parse.y read_token): `>&-1` closes
+		-- stdout and leaves `1` as the next word
+		if (op == "dup" or op == "dupin") and src:byte(i) == 45 then
+			i = i + 1
+			return { fd = tfd, op = op, target = "-", src = "-", fdvar = fdvar, line = line }
+		end
 		-- stop_paren: a redirect target is a metacharacter-terminated word, so `)` ends it
 		-- — `(cmd >&7)` / `(cmd >f)` must read `7`/`f` and leave `)` to close the subshell,
 		-- not swallow it into the target (which unbalanced the parse and dropped the pipe).

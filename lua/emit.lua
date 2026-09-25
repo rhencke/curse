@@ -4557,7 +4557,7 @@ simple_compiled = function(cx, st, after)
 					prelude = argvbody,
 					callee = "rt.exec_dynamic",
 					callargs = ("sh, __a, __noop, %s"):format(tostring(hadcs)),
-					redir = dyn_redir,
+					redir = dyn_redir and cx.redir_ext(nil, dyn_redir),
 				}
 			)
 		end
@@ -5010,13 +5010,13 @@ simple_compiled = function(cx, st, after)
 			if not redir_apply then
 				dispatch = run
 			elseif px_builtin then -- a builtin's buffered output must reach the target fd before restore
-				dispatch = ("do local __rs = {}; if %s then sh.write_err = nil; %s; io.flush() else sh.status = 1 end; rt.redir_restore(__rs); if sh.write_err then sh.status = 1 end end"):format(
+				dispatch = ("do local __rs = {}; if %s then sh.write_err = nil; %s; io.flush() else sh.status = 1 end; rt.redir_restore(__rs); if sh.write_err then rt.chkwrite_late(sh, __a[1]) end end"):format(
 					redir_apply,
 					run
 				)
 			else -- external: it runs with its own fds, a failed redirect is $?=1
 				dispatch = ("do local __rs = {}; if %s then %s else sh.status = 1 end; rt.redir_restore(__rs) end"):format(
-					redir_apply,
+					cx.redir_ext(nil, redir_apply),
 					run
 				)
 			end
@@ -5073,7 +5073,7 @@ simple_compiled = function(cx, st, after)
 				-- status 1, like bash's sh_chkwrite.
 				cx.blocks[p] = d
 					.. builder
-					.. ("; do local __rs = {}; if %s then sh.write_err = nil; %s; io.flush() else sh.status = 1 end; rt.redir_restore(__rs); if sh.write_err then sh.status = 1 end end; %s%s; pc = %d"):format(
+					.. ("; do local __rs = {}; if %s then sh.write_err = nil; %s; io.flush() else sh.status = 1 end; rt.redir_restore(__rs); if sh.write_err then rt.chkwrite_late(sh, __a[1]) end end; %s%s; pc = %d"):format(
 						redir_apply,
 						bcall,
 						lastarg,
@@ -5179,7 +5179,7 @@ simple_compiled = function(cx, st, after)
 				cx.blocks[p] = d
 					.. builder
 					.. ("; do local __rs = {}; if %s then %s else sh.status = 1 end; rt.redir_restore(__rs) end%s%s; pc = %d"):format(
-						redir_apply,
+						cx.redir_ext(cmd, redir_apply),
 						call,
 						ps,
 						ecs,
@@ -5298,7 +5298,7 @@ simple_compiled = function(cx, st, after)
 			args[#args + 1] = ("rt.cstr(%s)"):format(emit_word(st.words[j], cx.lifted))
 		end
 	end
-	local body
+	local body, extcmd -- (extcmd: an external — or a function defined at run time)
 	if cmd == "echo" then
 		body = "sh:echo_cmd(" .. table.concat(args, ", ") .. ")"
 	elseif cmd == ":" or cmd == "true" or cmd == "false" then
@@ -5399,6 +5399,7 @@ simple_compiled = function(cx, st, after)
 		end
 		local si = #ei > 0 and (table.concat(ei, "; ") .. "; ") or ""
 		local so = #eo > 0 and ("; " .. table.concat(eo, "; ")) or ""
+		extcmd = cmd
 		body = ("if sh.functions[%q] then %srt.call_dynamic_fn(sh, {%s})%s else sh:exec(%s) end"):format(
 			cmd,
 			si,
@@ -5424,7 +5425,7 @@ simple_compiled = function(cx, st, after)
 		-- succeeded (else $?=1, bash), then restore the fds — real syscalls, no AST.
 		cx.blocks[p] = d
 			.. ("do local __rs = {}; if %s then %s else sh.status = 1 end; rt.redir_restore(__rs) end%s%s%s; pc = %d"):format(
-				redir_apply,
+				extcmd and cx.redir_ext(extcmd, redir_apply) or redir_apply,
 				body,
 				ps,
 				ecs,
@@ -6622,6 +6623,12 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
 		end
 		return nil
 	end
+	-- An external's redirections: bash expands them in the forked child, so a fatal expansion
+	-- error there (set -u, ${v?}, failglob) only fails the command (status 1) — unless `name`
+	-- turned out to be a function defined at run time (nil: the name is in __a[1]).
+	function cx.redir_ext(name, conds)
+		return ("rt.redir_ext(sh, %s, pcall(function() return %s end))"):format(name and ("%q"):format(name) or "__a[1]", conds)
+	end
 	-- Build the "install all redirs, run, restore" conditions for `st.redirs`, or nil if any redir
 	-- can't be compiled (caller delegates) or the command is `exec` (whose redirs must PERSIST).
 	function cx.redir_conds(st, cmd)
@@ -6680,7 +6687,7 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
 				and (
 					r.op == "outboth"
 					or r.op == "appboth"
-					or (r.fd == 1 and (r.op == "out" or r.op == "app" or r.op == "clobber" or r.op == "dup" or r.op == "rw"))
+					or r.fd == 1 -- (any op: `1<&-` moves fd 1 too)
 				)
 			then
 				return true
