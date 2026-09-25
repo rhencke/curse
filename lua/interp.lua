@@ -954,7 +954,14 @@ eval = function(sh, e)
 	if k == "var" then
 		if e.idxraw then
 			arith_nounset(sh, e.name)
-			return arith_resolve(sh, sh:array_get(e.name, arith_key(sh, e.name, e.idx, e.idxraw)))
+			if rt.arith_badraw(sh, e.name, e.idxraw, "r") then -- (non-fatal: 0)
+				return i64(0)
+			end
+			local iv = arith_key(sh, e.name, e.idx, e.idxraw)
+			if rt.arith_badkey(sh, e.name, iv, "r") then
+				return i64(0)
+			end
+			return arith_resolve(sh, sh:array_get(e.name, iv))
 		end
 		arith_nounset(sh, e.name)
 		-- Numeric-authoritative fast path: a scalar set via aset holds its i64 in b.n
@@ -1119,10 +1126,21 @@ eval = function(sh, e)
 	end
 	if k == "asgn" then
 		local v = eval(sh, e.e) -- (bash evaluates the value BEFORE the lvalue's subscript)
-		local iv = e.idxraw and arith_key(sh, e.name, e.idx, e.idxraw) or nil
+		local iv, bad
+		if e.idxraw then -- (a bad element reads 0 and stores nothing: rt.arith_badraw)
+			local how = e.op == "=" and "w" or "rw"
+			if e.op ~= "=" then
+				arith_nounset(sh, e.name)
+			end
+			bad = rt.arith_badraw(sh, e.name, e.idxraw, how)
+			if not bad then
+				iv = arith_key(sh, e.name, e.idx, e.idxraw)
+				bad = rt.arith_badkey(sh, e.name, iv, how)
+			end
+		end
 		if e.op ~= "=" then
 			arith_nounset(sh, e.name) -- `x += …` reads x first
-			local cur = arith_cur(sh, e.name, iv)
+			local cur = bad and i64(0) or arith_cur(sh, e.name, iv)
 			local o = e.op:sub(1, #e.op - 1) -- strip the trailing '=' (`<<=` -> `<<`)
 			if o == "+" then
 				v = cur + v
@@ -1152,6 +1170,9 @@ eval = function(sh, e)
 				v = bit.arshift(cur, tonumber(v) % 64)
 			end
 		end
+		if bad then
+			return v
+		end
 		if iv then
 			sh:array_set(e.name, iv, rt.i64_to_str(v))
 			return v
@@ -1161,7 +1182,10 @@ eval = function(sh, e)
 	if k == "post" then
 		arith_nounset(sh, e.name) -- x++ / x-- read x first
 		if e.idxraw then
-			local iv = arith_key(sh, e.name, e.idx, e.idxraw)
+			local iv = not rt.arith_badraw(sh, e.name, e.idxraw, "rw") and arith_key(sh, e.name, e.idx, e.idxraw)
+			if not iv or rt.arith_badkey(sh, e.name, iv, "rw") then -- (a bad element: 0, nothing stored)
+				return i64(0)
+			end
 			local cur = arith_cur(sh, e.name, iv)
 			sh:array_set(e.name, iv, rt.i64_to_str(cur + i64(e.d)))
 			return cur
@@ -1173,7 +1197,10 @@ eval = function(sh, e)
 	if k == "pre" then
 		arith_nounset(sh, e.name) -- ++x / --x read x first
 		if e.idxraw then
-			local iv = arith_key(sh, e.name, e.idx, e.idxraw)
+			local iv = not rt.arith_badraw(sh, e.name, e.idxraw, "rw") and arith_key(sh, e.name, e.idx, e.idxraw)
+			if not iv or rt.arith_badkey(sh, e.name, iv, "rw") then -- (a bad element: 0, nothing stored)
+				return i64(e.d)
+			end
 			local v = arith_cur(sh, e.name, iv) + i64(e.d)
 			sh:array_set(e.name, iv, rt.i64_to_str(v))
 			return v
