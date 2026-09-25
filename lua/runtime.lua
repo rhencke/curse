@@ -11190,7 +11190,7 @@ function M.parse_error_stmt(sh, st, label)
 		io.stderr:write("curse: " .. (st.showtext and "syntax error: " or "") .. "`" .. st.text .. "'\n")
 	end
 	sh.in_perr, sh.perr_label = nil, pl
-	error({ __curse_exit = 2, __curse_parseerr = true, lead = st.lead })
+	error({ __curse_exit = st.status or 2, __curse_parseerr = true, lead = st.lead })
 end
 -- bash's evalstring.c: an eval'd/sourced text's syntax error ends a posix shell only while
 -- this_shell_builtin is still that eval/source — no command ran in the text before it (a
@@ -11240,7 +11240,7 @@ function M.eval_run(sh, argv)
 		sh.spb_err = nil -- (a builtin the code ran flagged its own: not eval's)
 		if not ok then
 			if type(err) == "table" and err.__curse_parseerr then
-				sh.status = 2 -- a syntax error ends the eval, status 2 (EX_BADSYNTAX: rt.spb_run)
+				sh.status = err.__curse_exit or 2 -- a syntax error ends the eval, status 2 (EX_BADSYNTAX: rt.spb_run)
 				sh.spb_err = err.lead and 2 or nil
 			else
 				error(err, 0)
@@ -11395,7 +11395,7 @@ function M.source_run(sh, argv, line)
 	sh.spb_err = nil -- (a builtin in the file flagged its own: not the source's)
 	if not rok and type(err) == "table" and err.__curse_parseerr then
 		rok = true -- a syntax error in the file: source returns 2, doesn't halt the shell (bash)
-		sh.status, sh.spb_err = 2, err.lead and 2 or nil -- (EX_BADSYNTAX halts a posix one: perr_lead)
+		sh.status, sh.spb_err = err.__curse_exit or 2, err.lead and 2 or nil -- (EX_BADSYNTAX halts a posix one: perr_lead)
 	end
 	M.source_leave(sh, fr)
 	sh.sourcedepth = sh.sourcedepth - 1
