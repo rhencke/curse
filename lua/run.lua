@@ -318,7 +318,9 @@ if arg[ai] == "-c" or arg[ai] == "+c" then
 		sh.params[sh.nparams] = arg[k]
 	end
 	source_rc(sh) -- interactive: --rcfile is sourced before the command string
-	interp.run_lazy(sh, code)
+	local T = require("tier") -- (tiered like a script: cached compiled, hot loops switch)
+	T.run_tiered(code, sh)
+	pcall(T.flush_stores)
 	io.flush()
 	require("runtime").sched_drain() -- (background jobs finish before the process can)
 	io.flush()
