@@ -2395,6 +2395,9 @@ local CAPTURE_IMPURE = {
 	["set-o"] = 1,
 	history = 1, -- (`set -o history`: the list is subshell state)
 	fc = 1,
+	complete = 1, -- (completion specs, and compgen's hostname list / -F functions)
+	compopt = 1,
+	compgen = 1,
 }
 local function capture_pure(sh, st)
 	local t = st.t
@@ -2785,8 +2788,19 @@ local function sub_checkpoint(self)
 		cwd = self:phys_cwd(), tcwd = self.tcwd, um = C.umask(0), disabled = self.disabled_builtins,
 		fn_ro = self.fn_ro, unset_specials = self.unset_specials, random_plain = self.random_plain,
 		shellopts_exported = self.shellopts_exported, bav = self.bav, argv0 = self.argv0,
-		sec_off = self.sec_off, subsh_off = self.subsh_off,
+		sec_off = self.sec_off, subsh_off = self.subsh_off, complete = self.complete, hosts = self.hosts,
 	}
+	if self.complete then -- (completion specs: the copies share opts as the originals do —
+		local oc, tab = {}, {} -- compopt changes a shared compspec's options in place)
+		for n, cs in pairs(self.complete) do
+			local o = cs.opts
+			if not oc[o] then oc[o] = shallowcopy(o) end
+			local c = shallowcopy(cs)
+			c.opts = oc[o]
+			tab[n] = c
+		end
+		self.complete = tab
+	end
 	self.bav = shallowcopy(self.bav)
 	self.fn_ro, self.unset_specials = shallowcopy(self.fn_ro), shallowcopy(self.unset_specials)
 	self.disabled_builtins = shallowcopy(self.disabled_builtins)
@@ -2855,6 +2869,7 @@ local function sub_restore(self, cp)
 	self.fn_ro, self.unset_specials, self.random_plain = cp.fn_ro, cp.unset_specials, cp.random_plain
 	self.shellopts_exported = cp.shellopts_exported
 	self.argv0, self.sec_off, self.subsh_off = cp.argv0, cp.sec_off, cp.subsh_off
+	self.complete, self.hosts = cp.complete, cp.hosts
 	if cp.cwd ~= "" then C.chdir(cp.cwd) end
 	self.tcwd = cp.tcwd
 	C.umask(cp.um)
@@ -7422,6 +7437,11 @@ function Shell:set_str(name, s)
 		self.opt_posix = true -- (bash's sv_strict_posix: setting it enters posix mode)
 	elseif dn == "IGNOREEOF" then
 		self.opt_ignoreeof = true -- (sv_ignoreeof: any value turns ignoreeof on)
+	elseif dn == "HOSTFILE" then
+		local h = self.hosts -- (sv_hostfile: the hostname list goes stale, the next read appends)
+		if h then
+			self.hosts = { list = h.list, alloc = h.alloc }
+		end
 	end
 	if b.exported then
 		C.setenv(dn, s, 1)
@@ -10072,6 +10092,7 @@ function M.field_split(sh, value, split)
 	end
 	for _, s in ipairs(fields) do
 		if not noglob and glob_active(s) then
+			sh.glob_dots = dotglob -- (glob.c noglob_dot_filenames, synced per shell glob: compgen -G)
 			local m = M.glob_expand(s, { dotglob = dotglob, skipdots = skipdots, globstar = globstar, nocase = sh.shopt.nocaseglob,
 				noext = not sh.shopt.extglob })
 			if m and gipats then
@@ -10335,6 +10356,7 @@ function M.expand_fields(sh, segs)
 	end
 	for _, f in ipairs(fields) do
 		if not noglob and f.unq and glob_active(f) then
+			sh.glob_dots = dotglob -- (glob.c noglob_dot_filenames, synced per shell glob: compgen -G)
 			local m = M.glob_expand(glob_pat(f), { dotglob = dotglob, skipdots = skipdots, globstar = globstar, nocase = sh.shopt.nocaseglob,
 				noext = not sh.shopt.extglob })
 			if m and gipats then
@@ -10510,6 +10532,12 @@ function M.arrayassign_stmt(sh, name, items, append)
 		io.stderr:write("curse: `" .. nb.s .. "': not a valid identifier\n")
 		sh.status = 1
 		return
+	end
+	local rb = sh.vars[sh:deref(name)]
+	if rb and rb.ro then -- (as interp's: a readonly array's `ra=(…)` abandons the line —
+		io.stderr:write("curse: " .. name .. ": readonly variable\n") -- fatal under -c/posix)
+		sh.status = 1
+		error({ __curse_exit = 1, __curse_lineabort = not (sh.opt_c or sh.opt_posix) or nil })
 	end
 	return M.arrayassign(sh, name, items, append)
 end
@@ -10866,7 +10894,7 @@ local LAZY_STR = {
 	end,
 }
 local APPEND_SPECIAL = { OPTIND = true, BASH_ARGV0 = true, POSIXLY_CORRECT = true, IGNOREEOF = true,
-	RANDOM = true, SRANDOM = true, LINENO = true, FUNCNAME = true, TZ = true }
+	RANDOM = true, SRANDOM = true, LINENO = true, FUNCNAME = true, TZ = true, HOSTFILE = true }
 append_lazy = function(sh, dn, b, value)
 	if b.ref or b.arr or b.int or b.lower or b.upper or b.cap or b.exported or rawget(b, "virt")
 		or APPEND_SPECIAL[dn] or M.DYN_ASSIGN[dn] or LOCALE_VARS[dn] or value:find("\0", 1, true) then

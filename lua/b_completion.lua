@@ -204,15 +204,14 @@ local function file_lines(path)
 	f:close()
 	return o
 end
--- the hosts file's names, as snarf_hosts_from_file reads them ($HOSTFILE, else /etc/hosts)
-local function host_list(sh, path, out)
-	out = out or {}
-	for _, l in ipairs(file_lines(path or (sh.vars.HOSTFILE and sh:get("HOSTFILE")) or "/etc/hosts")) do
+-- the hosts file's names, as snarf_hosts_from_file reads them (appended to OUT)
+local function snarf_hosts(path, out)
+	for _, l in ipairs(file_lines(path)) do
 		local s = l:gsub("^[ \t\r\n]+", "")
 		if s ~= "" and s:sub(1, 1) ~= "#" then
 			local inc = s:match("^%$include[ \t]+([^ \t\r\n]*)")
 			if inc then
-				host_list(sh, inc, out)
+				snarf_hosts(inc, out)
 			else
 				if s:find("^%d") then
 					s = s:gsub("^[^ \t\r\n]*", "")
@@ -227,6 +226,30 @@ local function host_list(sh, path, out)
 		end
 	end
 	return out
+end
+-- bash's hostname list (bashline.c get_hostname_list): read once and kept in sh.hosts
+-- ({ list, init, alloc }). Assigning HOSTFILE only marks it stale (sv_hostfile), so the
+-- next read APPENDS the file's names; unsetting it clears an initialized list. The list
+-- counts as initialized once it was ever non-empty (hostname_list allocated). The file:
+-- $HOSTFILE, else $hostname_completion_file, else /etc/hosts. (A new list table per
+-- change: a subshell's checkpoint shares the old one.)
+local function host_list(sh)
+	local h = sh.hosts
+	if h and h.init then
+		return h.list
+	end
+	local path = sh.vars[sh:deref("HOSTFILE")] and sh:get("HOSTFILE")
+	if not path then
+		path = sh.vars[sh:deref("hostname_completion_file")] and sh:get("hostname_completion_file") or "/etc/hosts"
+	end
+	local list = {}
+	for i, x in ipairs(h and h.list or {}) do
+		list[i] = x
+	end
+	snarf_hosts(path, list)
+	local alloc = (h and h.alloc) or #list > 0
+	sh.hosts = { list = list, init = alloc, alloc = alloc }
+	return list
 end
 local function signal_list()
 	local o = { "EXIT" }
@@ -625,12 +648,10 @@ local function split_wordlist(s, isd)
 	return out
 end
 
--- the abort of a whole compgen (bash's jump back to the top level): status 1, no output
-local ABORT = {}
-
 -- gen_wordlist_matches: split at IFS, then each word gets the shell expansions but
 -- pathname expansion (brace, tilde, parameter, command, arithmetic, word splitting,
--- quote removal); the results that start with the dequoted word.
+-- quote removal); the results that start with the dequoted word. An expansion error is
+-- an ordinary one (fatal / the line abandoned), not contained by compgen.
 local function gen_wordlist(sh, words, text, ret)
 	if words == "" then
 		return
@@ -640,15 +661,24 @@ local function gen_wordlist(sh, words, text, ret)
 	for k = 1, #ifs do
 		isd[ifs:sub(k, k)] = true
 	end
-	local ok, res = pcall(function()
-		local fields = {}
+	local fields = {}
+	local nf = sh.opt_f
+	sh.opt_f = true -- (expand_words_shellexp: no pathname expansion)
+	local ok, err = pcall(function()
 		for _, piece in ipairs(split_wordlist(words, isd)) do
 			if piece ~= "" then
 				local ws = {}
-				if sh.opt_B == false then
-					ws[1] = P.parse_word(piece)
-				else
-					P.add_word(ws, piece)
+				local pok = pcall(function()
+					if sh.opt_B == false then
+						ws[1] = P.parse_word(piece)
+					else
+						P.add_word(ws, piece)
+					end
+				end)
+				if not pok then -- (an unterminated `${`: the word is a bad substitution, and
+					-- like any expansion error here it discards the rest of the line)
+					io.stderr:write("curse: " .. piece .. ": bad substitution\n")
+					error({ __curse_exit = 1, __curse_experr = true, __curse_lineabort = true })
 				end
 				for _, w in ipairs(ws) do
 					for _, f in ipairs(IM.expand_to_fields(sh, w)) do
@@ -657,14 +687,14 @@ local function gen_wordlist(sh, words, text, ret)
 				end
 			end
 		end
-		return fields
 	end)
+	sh.opt_f = nf
 	if not ok then
-		error(ABORT, 0) -- (a failed expansion: nothing, status 1)
+		error(err, 0)
 	end
 	local ntxt = dequote_text(text)
 	local tl = #ntxt
-	for _, f in ipairs(res) do
+	for _, f in ipairs(fields) do
 		if tl == 0 or f:sub(1, tl) == ntxt then
 			ret[#ret + 1] = f
 		end
@@ -673,14 +703,48 @@ end
 
 -- the COMP_* variables around a -F function / -C command (bind/unbind_compfunc_variables)
 local COMPVARS = { "COMP_LINE", "COMP_POINT", "COMP_TYPE", "COMP_KEY", "COMP_WORDS", "COMP_CWORD" }
+-- unbind_variable_noref: the variable itself goes, silently — a nameref is not followed
+-- and readonly doesn't protect it
 local function unbind(sh, names)
 	local a = { "unset", "-v" }
 	for _, n in ipairs(names) do
+		local b = sh.vars[n]
+		if b then
+			b.ro, b.ref, b.outer = nil, nil, nil
+		end
 		a[#a + 1] = n
 	end
 	local st = sh.status
 	require("b_unset")(sh, "unset", a)
 	sh.status = st
+end
+-- bind_variable / bind_int_variable: through a nameref; a readonly one is reported and
+-- keeps its value
+local function bindv(sh, name, v, export)
+	local dn = sh:deref(name)
+	if dn == "" then
+		dn = name
+	end
+	local b = sh.vars[dn]
+	if b and b.ro then
+		io.stderr:write("curse: " .. dn .. ": readonly variable\n")
+	elseif export then
+		sh:export_str(dn, v) -- (the variable bound gets the export attribute)
+	else
+		sh:set_str(dn, v)
+	end
+end
+-- bind_comp_words: COMP_WORDS itself (never through a nameref — the attribute is
+-- stripped), made an array; the (empty) word list is assigned over what it holds
+local function bind_comp_words(sh)
+	local b = sh.vars.COMP_WORDS
+	if b and b.ref then
+		b.ref, b.outer = nil, nil
+	end
+	if not (b and b.arr) then
+		local v = b and (b.s ~= nil or b.n ~= nil) and sh:get("COMP_WORDS")
+		sh:array_assign("COMP_WORDS", v and { v } or {}, false)
+	end
 end
 
 -- gen_shell_function_matches: run FUNC compgen WORD '' with the COMP_* variables set;
@@ -691,20 +755,16 @@ local function gen_function(sh, fname, text, hook)
 		io.stderr:write("curse: completion: function `" .. fname .. "' not found\n")
 		return nil, nil
 	end
-	sh:set_str("COMP_LINE", "")
-	sh:set_str("COMP_POINT", "0")
-	sh:set_str("COMP_TYPE", "0")
-	sh:set_str("COMP_KEY", "0")
-	sh:array_assign("COMP_WORDS", {}, false)
-	sh:set_str("COMP_CWORD", "-1")
+	bindv(sh, "COMP_LINE", "")
+	bindv(sh, "COMP_POINT", "0")
+	bindv(sh, "COMP_TYPE", "0")
+	bindv(sh, "COMP_KEY", "0")
+	bind_comp_words(sh)
+	bindv(sh, "COMP_CWORD", "-1")
 	local ok, err = pcall(exec_simple, sh, { fname, "compgen", text, "" }, hook)
 	unbind(sh, COMPVARS)
 	if not ok then
-		if type(err) == "table" and err.__curse_matherr then
-			unbind(sh, { "COMPREPLY" })
-			error(ABORT, 0) -- (a fatal arith error in the function aborts the compgen)
-		end
-		error(err, 0) -- exit/return/real errors propagate
+		error(err, 0) -- (exit/return/errors propagate; a fatal one leaves COMPREPLY set)
 	end
 	local fval = sh.status
 	local found = fval ~= 127 and (fval == 124 and "retry" or true) -- (127: no COMPREPLY taken)
@@ -724,10 +784,10 @@ end
 -- COMP_* variables exported; its output split at newlines (a backslash-newline stays in
 -- the word, runs of newlines are one break).
 local function gen_command(sh, cmd, text)
-	sh:export_str("COMP_LINE", "")
-	sh:export_str("COMP_POINT", "0")
-	sh:export_str("COMP_TYPE", "0")
-	sh:export_str("COMP_KEY", "0")
+	bindv(sh, "COMP_LINE", "", true)
+	bindv(sh, "COMP_POINT", "0", true)
+	bindv(sh, "COMP_TYPE", "0", true)
+	bindv(sh, "COMP_KEY", "0", true)
 	local ok, res = pcall(sh.capture_src, sh, cmd .. " " .. sq1("compgen") .. " " .. sq1(text) .. " " .. sq1(""))
 	unbind(sh, COMPVARS)
 	if not ok then
@@ -811,21 +871,165 @@ local function filter(sh, list, pat, text)
 	return kept
 end
 
+-- glob.c's glob_pattern_p: an unquoted `*`/`?`, a `[` closed by a `]`, or an extglob
+-- operator; a backslash quotes the next char (a backslash-only pattern is not a glob)
+local function glob_pat_p(s)
+	local bopen, i, n = false, 1, #s
+	while i <= n do
+		local c = s:sub(i, i)
+		if c == "*" or c == "?" then
+			return true
+		elseif c == "[" then
+			bopen = true
+		elseif c == "]" then
+			if bopen then
+				return true
+			end
+		elseif c == "+" or c == "@" or c == "!" then
+			if s:sub(i + 1, i + 1) == "(" then
+				return true
+			end
+		elseif c == "\\" then
+			if i == n then
+				return false
+			end
+			i = i + 1
+		end
+		i = i + 1
+	end
+	return false
+end
+local function dequote_path(s) -- dequote_pathname
+	return (s:gsub("\\(.?)", "%1"))
+end
+-- glob_vector: DIR's entries matching PAT, in bash's order — each match is pushed on
+-- the front of a list, so the reverse of readdir's. Not sorted, no GLOBIGNORE; a dot
+-- name needs a leading `.` in PAT unless dotglob was on at the last SHELL glob (bash's
+-- noglob_dot_filenames, only synced by shell_glob_filename: sh.glob_dots). nil: DIR
+-- isn't a directory.
+local function glob_vector(sh, pat, dir)
+	if not file_test("-d", dir) then
+		return nil
+	end
+	if pat == "" then
+		return { "" }
+	end
+	if not glob_pat_p(pat) then -- (just see whether DIR/PAT exists)
+		local np = dequote_path(pat)
+		local f = dir .. "/" .. np
+		return (file_test("-e", f) or file_test("-L", f)) and { np } or {}
+	end
+	local skipdd, dots = sh.shopt.globskipdots ~= false, sh.glob_dots
+	local lead = pat:sub(1, 1) == "." or pat:sub(1, 2) == "\\."
+	local icase, noext = sh.shopt.nocaseglob and true or false, not sh.shopt.extglob
+	local names, out = readdir_all(dir), {}
+	for k = #names, 1, -1 do
+		local e = names[k]
+		local dd = e == "." or e == ".."
+		if not ((dd and (skipdd or (dots and not lead))) or (not dots and not lead and e:sub(1, 1) == "."))
+			and rt.glob_match(e, pat, icase, noext) then
+			out[#out + 1] = e
+		end
+	end
+	return out
+end
+-- glob_vector under GX_ALLDIRS (globstar's `**` as the last component): every entry of
+-- DIR (no pattern test; dot names as above), a directory's own tree (finddirs) ahead of
+-- it, all as paths under DIR — built by prepending like glob_vector, so collected here
+-- in reverse. ADDCUR: DIR itself first.
+local function glob_alldirs(sh, dir, nulldir, addcur)
+	local acc = {}
+	local names = readdir_all(dir)
+	local skipdd, dots = sh.shopt.globskipdots ~= false, sh.glob_dots
+	local base = dir
+	if nulldir and (base == "." or base == "./") then -- (sh_makepath's MP_IGNDOT / MP_RMDOT)
+		base = ""
+	elseif base:sub(1, 2) == "./" then
+		base = base:sub(3)
+	end
+	if base ~= "" and base:sub(-1) ~= "/" then
+		base = base .. "/"
+	end
+	for _, e in ipairs(names) do
+		local dd = e == "." or e == ".."
+		if not ((dd and (skipdd or dots)) or (not dots and e:sub(1, 1) == ".")) then
+			local sub = base .. e
+			if file_test("-d", sub) and not file_test("-L", sub) then
+				-- (finddirs chains the subtree's vector ahead of the rest, reversed)
+				for _, x in ipairs(glob_alldirs(sh, sub, nulldir, false)) do
+					acc[#acc + 1] = x
+				end
+			end
+			acc[#acc + 1] = sub
+		end
+	end
+	if addcur then
+		acc[#acc + 1] = nulldir and "" or dir
+	end
+	local out = {}
+	for k = #acc, 1, -1 do
+		out[#out + 1] = acc[k]
+	end
+	return out
+end
+-- glob_filename: a glob in the directory part globs that first (recursively), then
+-- each directory's glob_vector, joined in order
+local function glob_filename(sh, path)
+	local slash = path:match("^.*()/")
+	local dname, fname = "", path
+	if slash then
+		dname, fname = path:sub(1, slash), path:sub(slash + 1)
+	end
+	if dname ~= "" and glob_pat_p(dname) then
+		local dirs = glob_filename(sh, dname:sub(1, -2))
+		if not dirs or #dirs == 0 then
+			return nil
+		end
+		local out = {}
+		local star2 = fname == "**" and sh.shopt.globstar
+		for _, d in ipairs(dirs) do
+			if star2 then
+				if file_test("-d", d == "" and "." or d) then
+					for _, x in ipairs(glob_alldirs(sh, d == "" and "." or d, d == "", true)) do
+						out[#out + 1] = x
+					end
+				end
+				goto continue
+			end
+			local r = glob_vector(sh, fname, (d == "" and fname ~= "") and "." or d)
+			if r then
+				local pre = (d == "" or d:sub(-1) == "/") and d or d .. "/"
+				for _, x in ipairs(r) do
+					out[#out + 1] = pre .. x
+				end
+			end
+			::continue::
+		end
+		return out
+	end
+	if fname == "" then -- (only a directory name: returned as is)
+		return { dname }
+	end
+	dname = dequote_path(dname)
+	if fname == "**" and sh.shopt.globstar then
+		local dir = dname == "" and "." or dname
+		return file_test("-d", dir) and glob_alldirs(sh, dir, dname == "", dname ~= "") or nil
+	end
+	local r = glob_vector(sh, fname, dname == "" and "." or dname)
+	if r and dname ~= "" then
+		for k, x in ipairs(r) do
+			r[k] = dname .. x
+		end
+	end
+	return r
+end
+
 -- gen_compspec_completions: actions, -G, -W, -F, -C, then -X, -P/-S, and the
 -- dirnames/plusdirs fallbacks. nil when a -F function asked for none (127/124).
 local function gen_compspec(sh, cs, word, hook)
 	local ret = gen_actions(sh, cs.acts, word)
 	if cs.G then -- (glob_filename: just the pattern — the word isn't used)
-		local m = rt.glob_expand(cs.G, {
-			dotglob = sh.shopt.dotglob,
-			skipdots = sh.shopt.globskipdots ~= false,
-			globstar = sh.shopt.globstar,
-			nocase = sh.shopt.nocaseglob,
-		})
-		if not m and not (cs.G:find("[*?%[]") or cs.G:find("[?*+@!]%(")) then
-			m = (file_test("-e", cs.G) or file_test("-L", cs.G)) and { cs.G } or nil
-		end
-		for _, x in ipairs(m or {}) do
+		for _, x in ipairs(glob_filename(sh, cs.G) or {}) do
 			ret[#ret + 1] = x
 		end
 	end
@@ -867,11 +1071,38 @@ local function gen_compspec(sh, cs, word, hook)
 	return ret
 end
 
+-- command_subst_completion_function: past the `$(`, the text after the last blank or
+-- command separator completes as a command name (as a filename after a blank), with
+-- everything before it kept as the prefix
+local function cmdsub_matches(sh, text)
+	local ft = text:sub(3)
+	local k = #ft
+	while k > 1 and not ft:sub(k, k):find("^[ \t;|&{(`]") do
+		k = k - 1
+	end
+	local m, pre
+	if k <= 1 then
+		pre, m = "$(", command_matches(sh, ft)
+	else
+		pre = text:sub(1, 2 + k)
+		local w = ft:sub(k + 1)
+		m = ft:sub(k, k):find("^[ \t]") and filename_matches(sh, w) or command_matches(sh, w)
+	end
+	for i, x in ipairs(m) do
+		m[i] = pre .. x
+	end
+	return m
+end
 -- bash_default_completion (compgen -o bashdefault, outside a command position): $var /
 -- ${var names, ~user, @host
 local function bash_default(sh, text)
 	local c1 = text:sub(1, 1)
-	if c1 == "$" and text:sub(2, 2) ~= "(" then
+	if c1 == "$" and text:sub(2, 2) == "(" then -- (command_subst_completion_function)
+		local out = cmdsub_matches(sh, text)
+		if #out > 0 then
+			return out
+		end
+	elseif c1 == "$" then
 		local loc = text:sub(2, 2) == "{" and 2 or 1
 		local vn = text:sub(loc + 1)
 		local out = {}
@@ -1005,14 +1236,7 @@ local function compgen(sh, args, hook)
 	if cs.C then
 		io.stderr:write("curse: compgen: warning: -C option may not work as you expect\n")
 	end
-	local ok, sl = pcall(gen_compspec, sh, cs, word, hook)
-	if not ok then
-		if sl == ABORT then
-			sh.status = 1
-			return
-		end
-		error(sl, 0)
-	end
+	local sl = gen_compspec(sh, cs, word, hook)
 	if (not sl or #sl == 0) and cs.opts.bashdefault then
 		sl = bash_default(sh, word)
 	end
@@ -1131,6 +1355,8 @@ local function complete(sh, args)
 		io.stderr:write(rt.usage("complete"))
 		st = 2
 	else
+		-- (one compspec for all the names — bash's shared COMPSPEC: each name's entry
+		-- holds the one opts table, which compopt changes in place)
 		for _, n in ipairs(wl or names) do
 			local old = tab[n]
 			rt.complete_seq = (rt.complete_seq or 0) + 1
@@ -1215,17 +1441,15 @@ local function compopt(sh, args)
 			o[#o + 1] = SPECIAL_FLAG[n] or sq(n)
 			sh.out(table.concat(o, " ") .. "\n")
 		else
-			local opts = {}
-			for o in pairs(cs.opts) do
-				opts[o] = true
-			end
+			-- (in place: the names one `complete` registered share one compspec, and
+			-- its options with it)
+			local opts = cs.opts
 			for _, o in ipairs(on) do
 				opts[o] = true
 			end
 			for _, o in ipairs(off) do
 				opts[o] = nil
 			end
-			cs.opts = opts
 		end
 	end
 	sh.status = st

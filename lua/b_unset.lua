@@ -229,6 +229,9 @@ return function(sh, cmd, args, hook, tcb)
 						if dn == "IGNOREEOF" then
 							sh.opt_ignoreeof = false -- (sv_ignoreeof)
 						end
+						if dn == "HOSTFILE" and sh.hosts and sh.hosts.init then
+							sh.hosts = { list = {}, alloc = true } -- (sv_hostfile: clear_hostname_list)
+						end
 						if dn == "POSIXLY_CORRECT" then
 							sh.opt_posix = false -- (sv_strict_posix: unsetting it leaves posix mode)
 						end
