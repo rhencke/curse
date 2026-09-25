@@ -68,6 +68,14 @@ end
 -- variables the shell itself makes readonly (bash): UID=… etc. is an error
 local BUILTIN_RO = { UID = 1, EUID = 1, PPID = 1, BASH_VERSINFO = 1, SHELLOPTS = 1, BASHOPTS = 1 }
 local EF = {} -- emit-time program flags, grouped so a function referencing several stays one upvalue
+-- A literal part's Lua expression: a constant — except $'…' with \u/\U escapes, which bash
+-- encodes in the locale current when its line is parsed (not the compile-time one)
+function EF.lit_expr(p)
+	if p.ansic then
+		return ("(rt.ansi_unescape(%q, true))"):format(p.ansic)
+	end
+	return ("%q"):format(p.lit)
+end
 EF.has_attr = false
 -- Does any node of the tree (every statement, word, arith node — at any depth: &&/||
 -- lists, pipelines, conditions, bodies) satisfy `pred`? The program scanners below gate
@@ -1921,7 +1929,7 @@ emit_word = function(w, lifted)
 			parts[#parts + 1] = ("rt.tilde_word_initial(sh, %q, %s, %s)"):format(
 				p.lit, tostring(#w.parts > 1), w.noassign and "true" or w.plainarg and "sh.opt_posix" or "false")
 		elseif p.lit then
-			parts[#parts + 1] = ("%q"):format(p.lit)
+			parts[#parts + 1] = EF.lit_expr(p)
 		elseif p.raw then
 			parts[#parts + 1] = p.raw -- pre-computed Lua string expr (inlined param)
 		elseif p.var == "LINENO" then -- $LINENO: the current source line, a compile-time constant
@@ -2859,7 +2867,7 @@ local function emit_scalar_val(p, i, lifted, tilde, w)
 			return ("rt.tilde_word_initial(sh, %q, %s, %s)"):format(p.lit, tostring(w ~= nil and #w.parts > 1),
 				(w and w.noassign) and "true" or (w and w.plainarg) and "sh.opt_posix" or "false")
 		end
-		return ("%q"):format(p.lit)
+		return EF.lit_expr(p)
 	elseif p.raw then
 		return p.raw
 	elseif p.var == "LINENO" then -- $LINENO: its value is the current source line, known at compile time
@@ -3164,7 +3172,7 @@ EF.arith_guard = arith_guard
 -- literal part folds to a compile-time constant; a scalar expansion ($x/$1/$?…) reads at
 -- runtime, quoted ones wrapped in rt.glob_quote. Returns nil (→ keep I.case_match) for a
 -- part emit can't render here: cmdsub/arith/${…}-op/$@/$*/length/CFG-unsafe special.
-local CASE_GLOBSPECIAL = "[%*%?%[%]\\%(%)%|%+%@%!]"
+local CASE_GLOBSPECIAL = "[%*%?%[%]\\%(%)%|%+%@%!%-%^]"
 -- Word-based core (shared by the string API below and the [[ == ]] RHS): render an
 -- already-parsed word to its quote-aware glob expression, or nil if a part can't render here.
 local function emit_pattern_glob_word(w, lifted)
@@ -3194,7 +3202,9 @@ local function emit_pattern_glob_word(w, lifted)
 		if p.var and (COMPILE_UNSAFE_VAR[p.var] and p.var ~= "LINENO") then
 			return nil
 		end
-		if p.lit ~= nil then
+		if p.ansic then -- ($'…\u…': encoded in the locale of the moment)
+			out[#out + 1] = ("rt.glob_quote(%s)"):format(EF.lit_expr(p))
+		elseif p.lit ~= nil then
 			local s = p.lit
 			if p.q then
 				s = s:gsub(CASE_GLOBSPECIAL, "\\%0")
@@ -4014,7 +4024,7 @@ for _, n in ipairs({ "OPTIND", "OPTARG", "OPTERR", "REPLY", "SECONDS", "RANDOM",
 	"LINENO", "HISTCMD", "HISTSIZE", "HISTFILESIZE", "TMOUT", "COLUMNS", "LINES", "FUNCNEST",
 	"BASH_XTRACEFD", "SHLVL", "PPID", "UID", "EUID", "BASHPID", "BASH_SUBSHELL", "EPOCHSECONDS",
 	"EPOCHREALTIME", "BASH_ARGC", "COMP_CWORD", "COMP_POINT", "IFS", "_", "FUNCNAME",
-	"POSIXLY_CORRECT", "IGNOREEOF", "BASH_ARGV0" }) do
+	"POSIXLY_CORRECT", "IGNOREEOF", "BASH_ARGV0", "GLOBIGNORE" }) do
 	NO_LIFT[n] = true
 end
 for n in pairs(require("runtime").LOCALE_VARS) do
@@ -7770,9 +7780,10 @@ H.case = function(cx, st, after)
 		if allok and #globs > 0 then
 			local disj = {}
 			for _, g in ipairs(globs) do
-				disj[#disj + 1] = ("rt.glob_match(%s, %s, __ic)"):format(sv, g)
+				disj[#disj + 1] = ("rt.glob_match(%s, %s, __ic, __nx)"):format(sv, g)
 			end
-			cx.blocks[mp] = ("local __ic = sh.shopt.nocasematch and true or nil; if %s then pc = %d else pc = %d end"):format(
+			-- (extglob off: a pattern from an expansion isn't an extglob — [[ ]] always is)
+			cx.blocks[mp] = ("local __ic, __nx = sh.shopt.nocasematch and true or nil, not sh.shopt.extglob; if %s then pc = %d else pc = %d end"):format(
 				table.concat(disj, " or "),
 				bodyentry[i],
 				nextmatch

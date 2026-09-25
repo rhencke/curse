@@ -219,6 +219,7 @@ function Shell.new()
 		math.randomseed(os.time() + tonumber(ffi.C.getpid and ffi.C.getpid() or 0))
 		seeded = true
 	end
+	M.glob_asciirange = true -- (shopt globasciiranges' default; a daemon worker reuses the module)
 	local sh = setmetatable({
 		vars = {}, -- name -> { s = string?, n = int64? }  (lazy: fill on demand)
 		status = 0, -- $?
@@ -336,7 +337,7 @@ end
 -- pattern (the compiled tier's twin of interp's expand_escaped for a QUOTED pattern part:
 -- `case $x in "$p"*)` — "$p"'s metachars are literal, the trailing * is active).
 function M.glob_quote(s)
-	return (s:gsub("[%*%?%[%]\\%(%)%|%+%@%!]", "\\%0"))
+	return (s:gsub("[%*%?%[%]\\%(%)%|%+%@%!%-%^]", "\\%0"))
 end
 -- ERE-escape a QUOTED part of a `[[ =~ ]]` regex (the compiled twin of interp's expand_regex
 -- for a quoted segment): a quoted `"$re"`/`"a.c"` matches literally, so every ERE metachar is
@@ -492,6 +493,9 @@ function Shell:popCall()
 			end
 		end
 		self.savedstack[d] = false
+		if saved.GLOBIGNORE then -- (a local GLOBIGNORE going away re-applies the outer one)
+			M.setup_glob_ignore(self)
+		end
 	end
 	local bv = self.bav
 	if bv and bv[#bv] and bv[#bv].d == d then
@@ -1232,6 +1236,12 @@ function M.mb_charlen(s, i)
 		return 1
 	end
 	return r
+end
+
+-- Is `s` an INCOMPLETE multibyte character (mbrtowc's (size_t)-2) — more bytes needed?
+function M.mb_incomplete(s)
+	ffi.fill(_mb_st, ffi.sizeof(_mb_st))
+	return C.mbrtowc(_mb_wc, s, #s, _mb_st) == ffi.cast("size_t", -2)
 end
 
 -- Re-encode a codepoint to bytes in the current locale (wcrtomb); on failure keep
@@ -2632,6 +2642,7 @@ local function sub_restore(self, cp)
 	end
 	self.params, self.nparams = cp.params, cp.nparams
 	self.shopt, self.functions = cp.shopt, cp.functions
+	M.glob_asciirange = self.shopt.globasciiranges ~= false
 	self.dirstack, self.hashcache, self.getopts_state = cp.dirstack, cp.hashcache, cp.getopts
 	local of, ov = opt_fields(), cp.opts
 	for i = 1, #of do self[of[i]] = ov[i] end
@@ -6991,7 +7002,19 @@ function Shell:set_str(name, s)
 	end -- keep the env in sync
 	if LOCALE_VARS[dn] then
 		M.reset_locale(self)
+	elseif dn == "GLOBIGNORE" then
+		M.setup_glob_ignore(self)
 	end -- track the locale live, like bash
+end
+-- bash's setup_glob_ignore (sv_globignore): a GLOBIGNORE with patterns turns dotglob ON,
+-- an unset one turns it OFF (even if `shopt -s dotglob` set it), an empty one leaves it.
+function M.setup_glob_ignore(sh)
+	local v = sh.vars[sh:deref("GLOBIGNORE")] ~= nil and sh:get("GLOBIGNORE")
+	if v and v:find("[^:]") then
+		sh.shopt.dotglob = true
+	elseif not v then
+		sh.shopt.dotglob = false
+	end
 end
 
 -- Set a variable AND mark it exported (updating the process env). Used for
@@ -7879,10 +7902,11 @@ end
 -- Whole-string glob match via the POSIX regex engine (real char classes/extglob).
 -- Deferred to call time through M so it can be defined textually after this.
 local function full_match(s, glob)
-	if glob:find("!(", 1, true) then
-		return M.ext_match(s, glob)
-	end -- !() needs the split matcher
-	return M.regex_match(s, M.glob_to_ere(glob))
+	local ere, hard = M.glob_to_ere(glob)
+	if hard ~= 0 and M.glob_hard(hard) then
+		return M.ext_match(s, glob) -- (what the ERE can't express: the faithful matcher)
+	end
+	return M.regex_match(s, ere)
 end
 -- Fast path: a glob with no char class / extglob / escape and at most ONE `*` is
 -- `pre * post` (either side possibly empty), matchable with plain byte find/compare —
@@ -7894,6 +7918,38 @@ end
 -- star: prefix "*" suffix), else nil (needs the general regex matcher). Pure
 -- function of `glob` — same pattern always yields the same shape.
 local function simple_glob_uncached(glob)
+	if glob:find("\\", 1, true) and not glob:find("[%?%[%]\128-\255]") then
+		-- backslash-escaped chars are literal (a quoted part: `"--help"` -> \-\-help); an
+		-- escaped-ASCII pattern with at most one active `*` is still pre*post
+		local parts, cur, k, n, star = {}, {}, 1, #glob, false
+		while k <= n do
+			local c = glob:sub(k, k)
+			if c == "\\" then
+				if k == n then
+					return nil -- (a trailing `\`: the matcher's quirks)
+				end
+				cur[#cur + 1] = glob:sub(k + 1, k + 1)
+				k = k + 2
+			elseif c == "*" then
+				if star or glob:sub(k + 1, k + 1) == "(" then
+					return nil -- (a second `*`, or `*(…)`)
+				end
+				star = true
+				parts[1] = table.concat(cur)
+				cur = {}
+				k = k + 1
+			elseif (c == "@" or c == "!" or c == "+") and glob:sub(k + 1, k + 1) == "(" then
+				return nil -- (extglob)
+			else
+				cur[#cur + 1] = c
+				k = k + 1
+			end
+		end
+		if not star then
+			return "", table.concat(cur), ""
+		end
+		return "*", parts[1], table.concat(cur)
+	end
 	if glob:find("[%?%[%]\\]") then
 		return nil
 	end -- ?, [ ], backslash-escape
@@ -8022,7 +8078,8 @@ end
 -- prefix/suffix. (The naive form recompiled per split point — O(n) regcomps per call.)
 -- `!()` extglob needs the split matcher, so it stays on the per-substring path.
 local function strip_regex(val, glob, prefix, longest)
-	if glob:find("!(", 1, true) then
+	local ere, hard = M.glob_to_ere(glob)
+	if hard ~= 0 and M.glob_hard(hard) then
 		if prefix then
 			if longest then
 				for k = #val, 0, -1 do
@@ -8054,7 +8111,7 @@ local function strip_regex(val, glob, prefix, longest)
 		end
 		return val
 	end
-	local rb = M.re_get(M.glob_to_ere(glob), 1 + 8) -- REG_EXTENDED|REG_NOSUB
+	local rb = M.re_get(ere, 1 + 8) -- REG_EXTENDED|REG_NOSUB
 	if not rb then
 		return val
 	end
@@ -8315,15 +8372,29 @@ local POSIX_CLASS = {}
 for c in ("alnum alpha blank cntrl digit graph lower print punct space upper xdigit"):gmatch("%a+") do
 	POSIX_CLASS[c] = true
 end
-local function glob_conv(glob, pn, patsub)
+-- glob_conv also classifies the pattern for its callers (M._gh, bit flags): 1 = only the
+-- bash-faithful matcher (lua/smatch.lua) gets it right — `!(…)` negation, [=c=], a range
+-- with a non-ASCII end, a trailing `\`, a multibyte locale whose trail bytes can be ASCII
+-- (Big5-HKSCS: 0x5c) —; 2 = has a range (code-point order in the ERE, so globasciiranges
+-- off needs the matcher's collation order); 4 = has a [:class:] (regcomp's REG_ICASE
+-- would fold it; bash tests the class on the unfolded char).
+M._gh = 0
+local function glob_conv(glob, pn, patsub, noext)
 	local star = pn and "[^/]*" or ".*"
 	local qmark = pn and "[^/]" or "."
 	local out, i, n = {}, 1, #glob
+	if lc_mb_cur_max > 1 and glob:find("[\128-\255]") and not M.lc_utf8() then
+		M._gh = bit.bor(M._gh, 1)
+	end
+	local starrun = false -- (the pattern so far ends in a run of `*`/`?` holding a `*`)
 	while i <= n do
 		local c = glob:sub(i, i)
+		local wasrun = starrun
+		starrun = c == "*" or (c == "?" and starrun)
 		-- an extglob group must CLOSE: an unterminated `*([` is just `*` + literal `([` (bash)
 		local d, j = 1, i + 2
-		if EXTOP[c] and glob:sub(i + 1, i + 1) == "(" then
+		local isext = not noext and EXTOP[c] and glob:sub(i + 1, i + 1) == "("
+		if isext then
 			while j <= n and d > 0 do
 				local cc = glob:sub(j, j)
 				if cc == "\\" then
@@ -8346,14 +8417,18 @@ local function glob_conv(glob, pn, patsub)
 				j = j + 1
 			end
 		end
-		if EXTOP[c] and glob:sub(i + 1, i + 1) == "(" and d == 0 then
+		if isext and d == 0 then
+			starrun = false
 			local arms = split_arms(glob:sub(i + 2, j - 1))
 			local conv = {}
 			for _, a in ipairs(arms) do
 				conv[#conv + 1] = glob_conv(a, pn, patsub)
 			end
 			local group = "(" .. table.concat(conv, "|") .. ")"
-			-- @ = exactly one; ? = 0/1; * = 0+; + = 1+; ! ≈ group (POSIX ERE can't negate)
+			-- @ = exactly one; ? = 0/1; * = 0+; + = 1+; ! = negation, which an ERE can't say
+			if c == "!" then
+				M._gh = bit.bor(M._gh, 1)
+			end
 			out[#out + 1] = (c == "?" and group .. "?")
 				or (c == "*" and group .. "*")
 				or (c == "+" and group .. "+")
@@ -8367,7 +8442,9 @@ local function glob_conv(glob, pn, patsub)
 			-- already literal in an ERE, so pass it through. Fixes an unquoted `$v` glob like
 			-- `*\'.txt` matching `x'.txt`.
 			if nc == "" then
-				out[#out + 1] = "\\\\"
+				-- a trailing `\` matches a final backslash — but after a `*` run it never
+				-- matches (sm_loop's star code looks for the NUL it escapes)
+				out[#out + 1] = wasrun and "[^\1-\255]" or "\\\\"
 				i = i + 1
 			else
 				out[#out + 1] = (nc:match("[%.%[%]%(%)%{%}%*%+%?%|%^%$\\]") and ("\\" .. nc) or nc)
@@ -8380,8 +8457,7 @@ local function glob_conv(glob, pn, patsub)
 			out[#out + 1] = qmark
 			i = i + 1
 		elseif c == "[" then
-			local j, neg, has_rb, members = i + 1, false, false, {}
-			local never = false -- an invalid collating symbol started a range: matches nothing
+			local j, neg = i + 1, false
 			if glob:sub(j, j) == "!" or glob:sub(j, j) == "^" then
 				neg = true
 				j = j + 1
@@ -8393,84 +8469,103 @@ local function glob_conv(glob, pn, patsub)
 				out[#out + 1] = "[^\1-\255]"
 				i = j + 1
 			else
-				if glob:sub(j, j) == "]" then
-					has_rb = true
-					j = j + 1
-				end -- leading ] is a literal member
-				while j <= n and glob:sub(j, j) ~= "]" do
-					local cj, nx = glob:sub(j, j), glob:sub(j + 1, j + 1)
-					if cj == "\\" then -- inside [...], `\` escapes the next char (bash); `\]` is a literal ]
-						if nx == "]" then
-							has_rb = true
-							j = j + 2
-						elseif nx == "" then
-							members[#members + 1] = "\\"
-							j = j + 1
-						else
-							members[#members + 1] = nx
-							j = j + 2
-						end -- ERE: backslash isn't special in a class
-					elseif cj == "[" and nx == "." and glob:find(".]", j + 2, true) then
-						-- [.name.] collating symbol: a single char, or a POSIX character name;
-						-- an unknown multi-char name matches nothing — as a range START it
-						-- invalidates the whole bracket, as a range END it drops that range
-						local e = glob:find(".]", j + 2, true)
-						local name = glob:sub(j + 2, e - 1)
-						local ch = (#name == 1) and name or COLLSYM[name]
-						j = e + 2
-						if ch then
-							members[#members + 1] = "[." .. ch .. ".]"
-						elseif glob:sub(j, j) == "-" and glob:sub(j + 1, j + 1) ~= "]" then
-							-- invalid range START: drop the range (skip `-` and its end)
-							j = j + 1
-							local ee = glob:sub(j, j + 1) == "[." and glob:find(".]", j + 2, true)
-							j = ee and (ee + 2) or (j + 1)
-						elseif members[#members] == "-" and #members >= 2 then
-							members[#members] = nil -- the `-`
-							members[#members] = nil -- the range start
-						end
-					elseif cj == "[" and (nx == ":" or nx == "." or nx == "=") then
-						-- POSIX [:class:] / [.coll.] / [=equiv=]: copy through its own close
-						local e = glob:find(nx .. "]", j + 2, true)
-						if e then
-							local cls = glob:sub(j, e + 1)
-							if nx == ":" then
-								local cname = glob:sub(j + 2, e - 1)
-								if cname == "ascii" then -- (bash's; not a regcomp class: its range)
-									members[#members + 1] = "\1-\127"
-								elseif cname == "word" then -- (bash's: alnum + _)
-									members[#members + 1] = "[:alnum:]_"
-								elseif POSIX_CLASS[cname] then
-									members[#members + 1] = cls
-								end -- an unknown class name matches nothing; the rest still match
-							else
-								members[#members + 1] = cls
-							end
-							j = e + 2
-						else -- an unterminated `[:`: the `[` drops out, the rest are members
-							-- (bash: `[[:alpha]` matches h, not [ — and a kept `[:` would make
-							-- regcomp reject the whole class)
-							j = j + 1
-						end
-					elseif nx == "-" and glob:sub(j + 2, j + 2) ~= "]" and glob:sub(j + 2, j + 2) ~= ""
-						and glob:sub(j + 2, j + 3) ~= "[." and glob:sub(j + 2, j + 2):byte() < cj:byte()
-					then
-						j = j + 3 -- a reversed range (`a-Z`) matches nothing: drop it (regcomp rejects it)
+				-- bash BRACKMATCH, element by element: a char (`\x` escaped), a [.coll.]
+				-- symbol, a [:class:] / [=equiv=], or a range of two chars/symbols. Members
+				-- are then laid out for the ERE: `]` first, `[`/`^`/`-` last (so an escaped
+				-- or quoted `^`/`-` stays literal); ASCII ranges are spelled out char by char
+				-- (code-point order: globasciiranges — regcomp's own ranges collate).
+				local lits, raws, spec = {}, {}, {}
+				local closed, first = false, true
+				local function addlit(ch)
+					if ch == "]" or ch == "[" or ch == "^" or ch == "-" then
+						spec[ch] = true
 					else
-						members[#members + 1] = cj
-						j = j + 1
+						lits[#lits + 1] = ch
 					end
 				end
-				if glob:sub(j, j) ~= "]" then
+				local function elem(k) -- a range end: its value (false = an invalid symbol), next k
+					local ch = glob:sub(k, k)
+					if ch == "\\" then
+						return glob:sub(k + 1, k + 1), k + 2
+					elseif ch == "[" and glob:sub(k + 1, k + 1) == "." then
+						local e = glob:find(".]", k + 2, true)
+						if e then
+							local name = glob:sub(k + 2, e - 1)
+							return ((#name == 1) and name or COLLSYM[name]) or false, e + 2
+						end
+					end
+					return ch, k + 1
+				end
+				while j <= n do
+					local cj, nx = glob:sub(j, j), glob:sub(j + 1, j + 1)
+					if cj == "]" and not first then
+						closed = true
+						break
+					end
+					first = false
+					local sv
+					if cj == "[" and nx == "=" and glob:sub(j + 3, j + 4) == "=]" then
+						M._gh = bit.bor(M._gh, 1) -- ([=c=]: collation equivalence)
+						raws[#raws + 1] = glob:sub(j, j + 4)
+						j = j + 5
+					elseif cj == "[" and nx == ":" then
+						-- POSIX [:class:]: can't start a range (a `-` after it is literal)
+						local e = glob:find(":]", j + 2, true)
+						if e then
+							local cname = glob:sub(j + 2, e - 1)
+							M._gh = bit.bor(M._gh, 4)
+							if cname == "ascii" then -- (bash's; not a regcomp class: its range)
+								raws[#raws + 1] = "\1-\127"
+							elseif cname == "word" then -- (bash's: alnum + _)
+								raws[#raws + 1] = "[:alnum:]_"
+							elseif POSIX_CLASS[cname] then
+								raws[#raws + 1] = glob:sub(j, e + 1)
+							end -- an unknown class name matches nothing; the rest still match
+							j = e + 2
+						else -- an unterminated `[:`: the `[` drops out, the rest are members
+							-- (bash: `[[:alpha]` matches h, not [)
+							j = j + 1
+						end
+					elseif cj == "\\" and nx == "" then
+						j = 0 -- (`[\`: BRACKMATCH finds no escaped char — never matches)
+						break
+					else
+						-- [.name.] collating symbol: a single char, or a POSIX character name;
+						-- an unknown multi-char name matches nothing (nor does a range using it)
+						sv, j = elem(j)
+						if glob:sub(j, j) == "-" and glob:sub(j + 1, j + 1) ~= "]" and j < n then
+							local ev
+							ev, j = elem(j + 1)
+							if not sv or not ev or ev == "" then -- (an invalid symbol: nothing)
+							elseif sv:byte() >= 128 or ev:byte() >= 128 then
+								M._gh = bit.bor(M._gh, 1) -- (a multibyte end: the matcher's wide chars)
+							elseif sv:byte() <= ev:byte() then
+								M._gh = bit.bor(M._gh, 2)
+								for b = sv:byte(), ev:byte() do
+									addlit(string.char(b))
+								end
+							end -- a reversed range (`z-a`) matches nothing
+						elseif sv then
+							addlit(sv)
+						end
+					end
+				end
+				if j == 0 then
+					out[#out + 1] = "[^\1-\255]" -- (matches nothing)
+					i = n + 1
+				elseif not closed then
 					-- no closing ] : bash treats the `[` as a literal character (not a class)
 					out[#out + 1] = "\\["
 					i = i + 1
 				else
-					-- ERE class: a literal ] must come FIRST (right after [ or [^).
-					if never or (#members == 0 and not has_rb) then
+					local body = table.concat(raws) .. table.concat(lits)
+					if body == "" and not (spec["]"] or spec["["] or spec["^"] or spec["-"]) then
 						out[#out + 1] = "[^\1-\255]" -- matches nothing (no NUL in a shell string)
+					elseif body == "" and not neg and not spec["]"] and not spec["["] and spec["^"] then
+						out[#out + 1] = spec["-"] and "[-^]" or "\\^" -- (`[^` would negate)
 					else
-						out[#out + 1] = "[" .. (neg and "^" or "") .. (has_rb and "]" or "") .. table.concat(members) .. "]"
+						out[#out + 1] = "[" .. (neg and "^" or "") .. (spec["]"] and "]" or "") .. body
+							.. (spec["["] and "[" or "") .. (spec["^"] and "^" or "") .. (spec["-"] and "-" or "") .. "]"
 					end
 					i = j + 1
 				end
@@ -8485,13 +8580,43 @@ local function glob_conv(glob, pn, patsub)
 	end
 	return table.concat(out)
 end
-local function glob_to_ere(glob, pn)
-	return "^" .. glob_conv(glob, pn) .. "$"
+-- A glob's anchored ERE plus its M._gh classification, cached (the pattern of a `case`
+-- or [[ ]] in a loop converts once): keyed by the pattern and the modes/locale width.
+local glob_to_ere
+do
+	local cache, cbits, cn = {}, {}, 0
+	glob_to_ere = function(glob, pn, noext)
+		local key = (pn and "p" or "-") .. (noext and "x" or "-") .. (lc_mb_cur_max > 1 and "m" or "-") .. glob
+		local e = cache[key]
+		if e then
+			return e, cbits[key]
+		end
+		M._gh = 0
+		e = "^" .. glob_conv(glob, pn, nil, noext) .. "$"
+		if cn >= 1024 then
+			cache, cbits, cn = {}, {}, 0
+		end
+		cache[key], cbits[key], cn = e, M._gh, cn + 1
+		return e, M._gh
+	end
 end
 M.glob_to_ere = glob_to_ere -- exposed for strip_prefix/suffix (defined earlier)
--- GLOBIGNORE match: `glob` matched against a whole path with `/`-aware wildcards.
-function M.glob_ignore_match(path, glob)
-	return M.regex_match(path, glob_to_ere(glob, true))
+-- Must a glob with classification `bits` (glob_to_ere's second result) go to the
+-- bash-faithful matcher (M.sm_match) rather than its ERE?
+M.glob_asciirange = true -- (shopt globasciiranges; b_shopt / subshell restore keep it)
+function M.glob_hard(bits, icase)
+	return bits ~= 0 and (bits % 2 == 1 or (bits % 4 >= 2 and not M.glob_asciirange) or (bits >= 4 and icase and true))
+		or false
+end
+-- bash strmatch(pat, str, flags): the faithful matcher (lua/smatch.lua, loaded on first use)
+function M.sm_match(str, pat, flags)
+	return require("smatch").match(str, pat, flags)
+end
+M.COLLSYM = COLLSYM
+-- GLOBIGNORE match (pathexp.c glob_name_is_acceptable): strmatch with FNM_PATHNAME, plus
+-- FNM_EXTMATCH under extglob and FNM_CASEFOLD under nocaseglob.
+function M.glob_ignore_match(path, glob, icase, noext)
+	return M.sm_match(path, glob, 1 + (noext and 0 or 32) + (icase and 16 or 0))
 end
 
 -- Match `s` against a POSIX ERE. `anchored_glob` false = raw ERE (=~), true = a
@@ -8500,167 +8625,14 @@ function M.regex_match(s, ere, icase)
 	local rb = re_get(ere, REG_EXTENDED + REG_NOSUB + (icase and REG_ICASE or 0))
 	return rb and ffi.C.regexec(rb, s, 0, nil, 0) == 0 or false
 end
-local function split_alts(s) -- top-level `|` split (paren/bracket-aware)
-	local alts, depth, cur, i, n = {}, 0, {}, 1, #s
-	while i <= n do
-		local c = s:sub(i, i)
-		if c == "\\" then
-			cur[#cur + 1] = s:sub(i, i + 1)
-			i = i + 2
-		elseif c == "(" or c == "[" then
-			depth = depth + 1
-			cur[#cur + 1] = c
-			i = i + 1
-		elseif c == ")" or c == "]" then
-			depth = depth - 1
-			cur[#cur + 1] = c
-			i = i + 1
-		elseif c == "|" and depth == 0 then
-			alts[#alts + 1] = table.concat(cur)
-			cur = {}
-			i = i + 1
-		else
-			cur[#cur + 1] = c
-			i = i + 1
-		end
-	end
-	alts[#alts + 1] = table.concat(cur)
-	return alts
-end
--- Whole-string extglob match with backtracking. Handles the extended operators
--- `@()/?()/*()/+()/!()` at ANY nesting depth (POSIX ERE can't express `!()`
--- negation, and a `!()` nested inside another group needs a real matcher, not the
--- ERE conversion) — literals / `*` / `?` / `[…]` are matched positionally too so
--- it composes with the operators. Used only for patterns containing `!(`; plain
--- extglob still goes through the faster glob_to_ere path.
+-- Whole-string match by the bash-faithful matcher (lua/smatch.lua), for what the ERE
+-- conversion can't express (M.glob_hard) — `!(…)` negation at any depth first of all.
 -- `fl` (glob only): { period = true } — a leading `.` matches only explicitly (FNM_PERIOD,
 -- dotglob off); { dotdot = true } — `.`/`..` only explicitly (FNM_DOTDOT). Both apply at
--- the START of `str` only, as in bash's sm_loop.
-function M.ext_match(str, pat, icase, fl)
-	local plen, slen = #pat, #str
-	local lead_dot = fl and str:sub(1, 1) == "."
-	local is_dd = fl and fl.dotdot and (str == "." or str == "..")
-	local ceq = icase and function(a, b)
-		return a:lower() == b:lower()
-	end or function(a, b)
-		return a == b
-	end
-	-- index of the `)` closing an extglob group whose op is at `gi` (`(` at gi+1)
-	local function group_end(gi) -- (nil: the group never closes — then it's literal text)
-		local d, j = 1, gi + 2
-		while j <= plen do
-			local cc = pat:sub(j, j)
-			if cc == "\\" then
-				j = j + 2
-			elseif cc == "[" then -- a bracket expression: its `)` doesn't close the group
-				local close = bracket_end(pat, j)
-				if not close then
-					return nil -- an unclosed `[` swallows the rest (bash)
-				end
-				j = close + 1
-			elseif cc == "(" then
-				d = d + 1
-				j = j + 1
-			elseif cc == ")" then
-				d = d - 1
-				if d == 0 then
-					return j
-				end
-				j = j + 1
-			else
-				j = j + 1
-			end
-		end
-		return j
-	end
-	local m -- does pat[pi..] match str[si..slen] EXACTLY?
-	m = function(si, pi)
-		if pi > plen then
-			return si > slen
-		end
-		local c, nc = pat:sub(pi, pi), pat:sub(pi + 1, pi + 1)
-		local ge = EXTOP[c] and nc == "(" and group_end(pi)
-		local atstart = si == 1 and fl -- (flags matter only at the string's start)
-		if ge and ge <= plen then
-			local alts = split_alts(pat:sub(pi + 2, ge - 1))
-			local rest = ge + 1
-			local function altfull(seg, from)
-				for _, a in ipairs(alts) do
-					if M.ext_match(seg, a, icase, from == 1 and fl or nil) then
-						return true
-					end
-				end
-				return false
-			end
-			if c == "@" then
-				for j = si - 1, slen do
-					if altfull(str:sub(si, j), si) and m(j + 1, rest) then
-						return true
-					end
-				end
-			elseif c == "?" then
-				if m(si, rest) then
-					return true
-				end
-				for j = si, slen do
-					if altfull(str:sub(si, j), si) and m(j + 1, rest) then
-						return true
-					end
-				end
-			elseif c == "!" then
-				for j = si - 1, slen do
-					if not altfull(str:sub(si, j), si) then
-						-- no arm matched, yet a leading dot still needs explicit matching
-						if atstart and ((fl.period and lead_dot) or is_dd) then
-							return false
-						end
-						if m(j + 1, rest) then
-							return true
-						end
-					end
-				end
-			else -- `*` (zero or more) or `+` (one or more)
-				local function rep(pos, count)
-					if (c == "*" or count >= 1) and m(pos, rest) then
-						return true
-					end
-					for j = pos, slen do
-						if altfull(str:sub(pos, j), pos) and rep(j + 1, count + 1) then
-							return true
-						end
-					end
-					return false
-				end
-				return rep(si, 0)
-			end
-			return false
-		elseif c == "\\" then
-			return si <= slen and ceq(str:sub(si, si), nc) and m(si + 1, pi + 2)
-		elseif atstart and (c == "*" or c == "?" or c == "[") and ((fl.period and lead_dot) or is_dd) then
-			return false -- `*`/`?`/`[…]` can't match a leading `.` (FNM_PERIOD / FNM_DOTDOT)
-		elseif c == "*" then
-			for j = si - 1, slen do
-				if m(j + 1, pi + 1) then
-					return true
-				end
-			end
-			return false
-		elseif c == "?" then
-			return si <= slen and m(si + 1, pi + 1)
-		elseif c == "[" then
-			local j = bracket_end(pat, pi)
-			if not j then -- unclosed `[` is a literal `[`
-				return si <= slen and str:sub(si, si) == "[" and m(si + 1, pi + 1)
-			end
-			if si <= slen and M.regex_match(str:sub(si, si), "^" .. glob_conv(pat:sub(pi, j)) .. "$", icase) then
-				return m(si + 1, j + 1)
-			end
-			return false
-		else
-			return si <= slen and ceq(str:sub(si, si), c) and m(si + 1, pi + 1)
-		end
-	end
-	return m(1, 1)
+-- the START of `str` only, as in bash's sm_loop. `noext`: extglob off (no FNM_EXTMATCH).
+function M.ext_match(str, pat, icase, fl, noext)
+	return M.sm_match(str, pat, (noext and 0 or 32) + (icase and 16 or 0)
+		+ (fl and ((fl.period and 4 or 0) + (fl.dotdot and 128 or 0)) or 0))
 end
 -- Count capturing groups `(…)` in a POSIX ERE (= regex_t.re_nsub) so BASH_REMATCH
 -- reports one slot per group even when the matched alternative skipped some. A `(`
@@ -8724,7 +8696,8 @@ function M.regex_captures(s, ere, icase)
 end
 
 -- Full (anchored) shell-glob match, for `case` patterns and [[ == ]].
-function M.glob_match(s, glob, icase)
+-- `noext`: extglob off (a `case` pattern; [[ ]] always matches extglob).
+function M.glob_match(s, glob, icase, noext)
 	if not icase then -- simple globs (no ?/[/extglob, ≤1 star) match with plain byte ops
 		local kind, pre, post = simple_glob(glob)
 		if kind == "" then
@@ -8735,12 +8708,13 @@ function M.glob_match(s, glob, icase)
 		end
 	end
 	if lc_mb_cur_max > 1 and (M.mb_invalid(s) or M.mb_invalid(glob)) then
-		return M.bytewise(M.glob_match, s, glob, icase)
+		return M.bytewise(M.glob_match, s, glob, icase, noext)
 	end
-	if glob:find("!(", 1, true) then
-		return M.ext_match(s, glob, icase)
-	end -- !() needs the split matcher
-	return M.regex_match(s, glob_to_ere(glob), icase)
+	local ere, hard = glob_to_ere(glob, false, noext)
+	if hard ~= 0 and M.glob_hard(hard, icase) then
+		return M.ext_match(s, glob, icase, nil, noext) -- (what the ERE can't express)
+	end
+	return M.regex_match(s, ere, icase)
 end
 
 local REG_NOTBOL = 1
@@ -8873,7 +8847,8 @@ function M.subst_glob(val, glob, repl, all, icase, rx)
 	if val == "" and anchor ~= "$" and glob:byte(1) ~= 42 then
 		return val -- (match_pattern_char: at the end of the string only a `*…` pattern
 	end -- may match, so an empty value takes ${y/?(a)/Z} as no match; `/%` skips that test)
-	if glob:find("!(", 1, true) then
+	local _, hard = glob_to_ere(glob)
+	if hard ~= 0 and M.glob_hard(hard, icase) then -- (what the ERE can't express)
 		return M.subst_ext(val, glob, repl, all, anchor, icase, rx)
 	end
 	local ere = glob_conv(glob, false, true) -- patsub=true: [^]/[!] empty-negated quirk
@@ -9028,19 +9003,21 @@ skipname = function(pat, dname, dotglob, skipdots)
 	end
 	return false
 end
-local glob_icase = false -- (shopt -s nocaseglob, for the glob_expand in progress)
+local glob_icase, glob_noext = false, false -- (shopt -s nocaseglob / -u extglob, for the
+-- glob_expand in progress)
 local function scan_seg(dir, seg, dotglob, skipdots)
 	local scan = (dir == "" and ".") or dir
 	local d = ffi.C.opendir(scan)
 	if d == nil then
 		return {}
 	end
-	-- a `!()` segment needs the split matcher (per entry); everything else uses one
-	-- precompiled ERE.
-	local neg = seg:find("!(", 1, true) ~= nil
+	-- a segment the ERE can't express (`!()`, …) goes to the faithful matcher per entry;
+	-- everything else uses one precompiled ERE.
+	local ere, hard = glob_to_ere(seg, false, glob_noext)
+	local neg = hard ~= 0 and M.glob_hard(hard, glob_icase)
 	local rb
 	if not neg then
-		rb = re_get(glob_to_ere(seg), REG_EXTENDED + REG_NOSUB + (glob_icase and REG_ICASE or 0))
+		rb = re_get(ere, REG_EXTENDED + REG_NOSUB + (glob_icase and REG_ICASE or 0))
 		if not rb then
 			ffi.C.closedir(d)
 			return {}
@@ -9050,7 +9027,7 @@ local function scan_seg(dir, seg, dotglob, skipdots)
 	skipdots = skipdots ~= false -- default: skip . and .. (globskipdots on)
 	-- an extglob segment matches like bash's glob_vector: skipname, then strmatch with
 	-- FNM_PERIOD (dotglob off) or FNM_DOTDOT (on)
-	local xseg = seg:find("[?*+@!]%(") ~= nil
+	local xseg = not glob_noext and seg:find("[?*+@!]%(") ~= nil
 	local xfl = xseg and (dotglob and { dotdot = true } or { period = true })
 	local out = {}
 	while true do
@@ -9069,7 +9046,7 @@ local function scan_seg(dir, seg, dotglob, skipdots)
 		elseif (not dotdot or (not skipdots and hidden)) and (name:sub(1, 1) ~= "." or hidden or dotglob) then
 			local m
 			if neg then
-				m = M.ext_match(name, seg, glob_icase) -- (explicit if: a false ext_match must NOT fall to regexec on an uncompiled regbuf)
+				m = M.ext_match(name, seg, glob_icase, nil, glob_noext) -- (explicit if: a false ext_match must NOT fall to regexec on an uncompiled regbuf)
 			else
 				m = ffi.C.regexec(rb, name, 0, nil, 0) == 0
 			end
@@ -9318,18 +9295,22 @@ end
 function M.glob_expand(pattern, opts)
 	opts = opts or {}
 	glob_icase = opts.nocase and true or false
-	if not (pattern:find("[*?%[]") or pattern:find("[?*+@!]%(")) then
+	glob_noext = opts.noext and true or false
+	local noext = glob_noext
+	if not (pattern:find("[*?%[]") or (not noext and pattern:find("[?*+@!]%("))) then
 		return nil
 	end
 	local abs = pattern:sub(1, 1) == "/"
-	local segs = {}
-	for s in pattern:gmatch("[^/]+") do
+	-- segments, each with the run of `/` BEFORE it: a `d1//*` keeps its `//` (bash)
+	local segs, seps = {}, {}
+	for sep, s in pattern:gmatch("(/*)([^/]+)") do
 		segs[#segs + 1] = s
+		seps[#segs] = sep
 	end
 	if #segs == 0 then
 		return nil
 	end
-	local cur = { abs and "/" or "" } -- accumulated path prefixes (dir, "" == cwd)
+	local cur = { abs and seps[1] or "" } -- accumulated path prefixes (dir, "" == cwd)
 	-- the bases came through a pattern segment: a final `**` then lists each base as itself
 	-- (`**/a/**` -> a, …) rather than as `dir/` (`a/**` -> a/, …)
 	local prev_glob = false
@@ -9339,6 +9320,7 @@ function M.glob_expand(pattern, opts)
 		while k <= #segs do
 			if segs[k] == "**" and segs[k - 1] == "**" then
 				table.remove(segs, k)
+				table.remove(seps, k)
 				collapsed[k - 1] = true
 			else
 				k = k + 1
@@ -9346,19 +9328,20 @@ function M.glob_expand(pattern, opts)
 		end
 	end
 	for si, seg in ipairs(segs) do
-		local isglob = seg:find("[*?%[]") or seg:find("[?*+@!]%(")
+		local isglob = seg:find("[*?%[]") or (not noext and seg:find("[?*+@!]%("))
 		local islast = si == #segs
 		if collapsed[si] then -- (the absorbed `**` counts as a pattern before this one)
 			prev_glob = true
 		end
 		local nxt = {}
+		local sep = seps[si]
 		local function joined(base, name)
 			if base == "" then
 				return name
-			elseif base == "/" then
-				return "/" .. name
+			elseif base:byte(-1) == 47 then -- (the root: `/`, `//`)
+				return base .. name
 			else
-				return base .. "/" .. name
+				return base .. sep .. name
 			end
 		end
 		if seg == "**" and opts.globstar and islast then
@@ -9376,7 +9359,7 @@ function M.glob_expand(pattern, opts)
 						add(dir)
 					end
 					for _, name in ipairs(scan_seg(dir, "*", opts.dotglob, opts.skipdots)) do
-						local path = joined(dir, name)
+						local path = dir == "" and name or dir:byte(-1) == 47 and dir .. name or dir .. "/" .. name
 						if not is_dir(path) or is_symlink(path) then -- (a symlinked dir: an entry, not descended)
 							add(path)
 						end
@@ -9585,9 +9568,8 @@ function M.field_split(sh, value, split)
 	-- pathname expansion on each field (all glob-active; nothing quoted).
 	local out = {}
 	local gi = sh:get("GLOBIGNORE")
-	local gi_exists = sh.vars[sh:deref("GLOBIGNORE")] ~= nil
-	local giset = gi_exists and gi ~= ""
-	local dotglob = gi_exists or (sh.shopt.dotglob and true)
+	local giset = gi and gi ~= ""
+	local dotglob = sh.shopt.dotglob and true -- (a GLOBIGNORE assignment sets it: setup_glob_ignore)
 	local nullglob = sh.shopt.nullglob and true
 	local gipats
 	if giset then -- split on ':' but NOT inside [...]
@@ -9653,13 +9635,14 @@ function M.field_split(sh, value, split)
 	end
 	for _, s in ipairs(fields) do
 		if not noglob and glob_active(s) then
-			local m = M.glob_expand(s, { dotglob = dotglob, skipdots = skipdots, globstar = globstar, nocase = sh.shopt.nocaseglob })
+			local m = M.glob_expand(s, { dotglob = dotglob, skipdots = skipdots, globstar = globstar, nocase = sh.shopt.nocaseglob,
+				noext = not sh.shopt.extglob })
 			if m and gipats then
 				local filt = {}
 				for _, x in ipairs(m) do
 					local ig = false
 					for _, gp in ipairs(gipats) do
-						if M.glob_ignore_match(x, gp) then
+						if M.glob_ignore_match(x, gp, sh.shopt.nocaseglob, not sh.shopt.extglob) then
 							ig = true
 							break
 						end
@@ -9850,9 +9833,8 @@ function M.expand_fields(sh, segs)
 	-- pathname expansion on fields with unquoted glob metacharacters (mask-aware)
 	local out = {}
 	local gi = sh:get("GLOBIGNORE")
-	local gi_exists = sh.vars[sh:deref("GLOBIGNORE")] ~= nil
-	local giset = gi_exists and gi ~= ""
-	local dotglob = gi_exists or (sh.shopt.dotglob and true)
+	local giset = gi and gi ~= ""
+	local dotglob = sh.shopt.dotglob and true -- (a GLOBIGNORE assignment sets it: setup_glob_ignore)
 	local nullglob = sh.shopt.nullglob and true
 	local gipats
 	if giset then -- split on ':' but NOT inside [...]
@@ -9896,6 +9878,8 @@ function M.expand_fields(sh, segs)
 		["("] = 1,
 		[")"] = 1,
 		["|"] = 1,
+		["-"] = 1, -- (a quoted `-`/`^` in a bracket expression is literal: `[a"-"c]`)
+		["^"] = 1,
 	}
 	local function glob_active(f) -- glob metachar at a NON-masked (glob-active) position?
 		return M.field_glob_active(f)
@@ -9913,13 +9897,14 @@ function M.expand_fields(sh, segs)
 	end
 	for _, f in ipairs(fields) do
 		if not noglob and f.unq and glob_active(f) then
-			local m = M.glob_expand(glob_pat(f), { dotglob = dotglob, skipdots = skipdots, globstar = globstar, nocase = sh.shopt.nocaseglob })
+			local m = M.glob_expand(glob_pat(f), { dotglob = dotglob, skipdots = skipdots, globstar = globstar, nocase = sh.shopt.nocaseglob,
+				noext = not sh.shopt.extglob })
 			if m and gipats then
 				local filt = {}
 				for _, x in ipairs(m) do
 					local ig = false
 					for _, p in ipairs(gipats) do
-						if M.glob_ignore_match(x, p) then
+						if M.glob_ignore_match(x, p, sh.shopt.nocaseglob, not sh.shopt.extglob) then
 							ig = true
 							break
 						end
@@ -11610,6 +11595,9 @@ function M.run_prefix(sh, names, vals, runfn, argv)
 				sh:set_str(s.name, nv)
 			end
 			relocale = relocale or LOCALE_VARS[s.name] ~= nil
+			if s.name == "GLOBIGNORE" then
+				M.setup_glob_ignore(sh) -- (the binding going away re-applies sv_globignore)
+			end
 		end
 	end
 	if relocale then -- (`LC_CTYPE=C cmd`: the locale follows the variable back)
@@ -13649,6 +13637,9 @@ do
 					sh:set_str(s.name, nv)
 				end
 				relocale = relocale or LOCALE_VARS[s.name] ~= nil
+				if s.name == "GLOBIGNORE" then
+					M.setup_glob_ignore(sh) -- (the binding going away re-applies sv_globignore)
+				end
 			end
 		end
 		if relocale then

@@ -1884,7 +1884,7 @@ expand_repl = function(sh, w)
 	return table.concat(buf)
 end
 -- glob PATTERN context (${v/pat/repl}, case, [[ == ]]): glob metacharacters.
-local PAT_META = "[%*%?%[%]\\%(%)%|%+%@%!]"
+local PAT_META = "[%*%?%[%]\\%(%)%|%+%@%!%-%^]"
 expand_pattern = function(sh, w)
 	-- a word-initial `~` tilde-expands (bash: `case ~ in ~)`), and the directory it
 	-- yields matches literally
@@ -1942,7 +1942,7 @@ M.case_pattern = case_pattern -- (rt.case_glob)
 function M.case_match(sh, subj, pats)
 	local ic = sh.shopt.nocasematch and true or nil
 	for _, pat in ipairs(pats) do
-		if rt.glob_match(subj, case_pattern(sh, P.parse_word(pat)), ic) then
+		if rt.glob_match(subj, case_pattern(sh, P.parse_word(pat)), ic, not sh.shopt.extglob) then
 			return true
 		end
 	end
@@ -2763,15 +2763,11 @@ expand_fields_full = function(sh, w, pre1) -- pre1: part 1 already expanded (a $
 	brk()
 	-- pathname expansion on fields with unquoted glob metacharacters
 	local out = {}
-	-- GLOBIGNORE (set & non-null): filter matches by its `:`-separated patterns and
-	-- enable dotglob (leading-dot names then match); `.`/`..` are always excluded.
+	-- GLOBIGNORE (set & non-null): filter matches by its `:`-separated patterns; `.`/`..`
+	-- are always excluded. (Assigning it also turns dotglob on: rt.setup_glob_ignore.)
 	local gi = sh:get("GLOBIGNORE")
-	-- The dotglob + `.`/`..`-exclusion SIDE EFFECT triggers when GLOBIGNORE merely
-	-- EXISTS (bash: `GLOBIGNORE=` empty still enables it — only `unset` reverts);
-	-- the pattern FILTERING needs it non-empty.
-	local gi_exists = sh.vars[sh:deref("GLOBIGNORE")] ~= nil
-	local giset = gi_exists and gi ~= ""
-	local dotglob = gi_exists or (sh.shopt.dotglob and true)
+	local giset = gi and gi ~= ""
+	local dotglob = sh.shopt.dotglob and true
 	local nullglob = sh.shopt.nullglob and true
 	local gipats
 	if giset then -- split on ':' but NOT inside [...] (a `[[:alnum:]]` class holds colons)
@@ -2813,6 +2809,8 @@ expand_fields_full = function(sh, w, pre1) -- pre1: part 1 already expanded (a $
 		["("] = 1,
 		[")"] = 1,
 		["|"] = 1,
+		["-"] = 1, -- (a quoted `-`/`^` in a bracket expression is literal: `[a"-"c]`)
+		["^"] = 1,
 	} -- `|` protects a
 	-- quoted/escaped extglob alternation bar (`@(a|'b|c')`) from split_arms
 	-- is there a glob metacharacter at a NON-masked (glob-active) position?
@@ -2844,6 +2842,7 @@ expand_fields_full = function(sh, w, pre1) -- pre1: part 1 already expanded (a $
 					skipdots = giset or shopt_on(sh, "globskipdots"),
 					globstar = shopt_on(sh, "globstar"),
 					nocase = shopt_on(sh, "nocaseglob"),
+					noext = not sh.shopt.extglob,
 				}
 			)
 			if m and gipats then
@@ -2851,7 +2850,7 @@ expand_fields_full = function(sh, w, pre1) -- pre1: part 1 already expanded (a $
 				for _, x in ipairs(m) do
 					local ig = false
 					for _, p in ipairs(gipats) do
-						if rt.glob_ignore_match(x, p) then
+						if rt.glob_ignore_match(x, p, sh.shopt.nocaseglob, not sh.shopt.extglob) then
 							ig = true
 							break
 						end
@@ -6498,6 +6497,9 @@ exec_stmt = function(sh, st, hook)
 						sh:set_str(s.name, nv)
 					end
 					relocale = relocale or s.name == "LANG" or s.name:sub(1, 3) == "LC_"
+					if s.name == "GLOBIGNORE" then
+						rt.setup_glob_ignore(sh) -- (the binding going away re-applies sv_globignore)
+					end
 				end
 			end
 			if relocale then -- (`LANG=C cmd`: the locale follows the variable back)
@@ -6789,7 +6791,7 @@ exec_stmt = function(sh, st, hook)
 			if not matched then
 				for _, pat in ipairs(cl.pats) do
 					local g = case_pattern(sh, P.parse_word(pat)) -- vars resolved; quoted metachars literal
-					if rt.glob_match(subj, g, sh.shopt.nocasematch and true or nil) then
+					if rt.glob_match(subj, g, sh.shopt.nocasematch and true or nil, not sh.shopt.extglob) then
 						matched = true
 						break
 					end
