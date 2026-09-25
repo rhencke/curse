@@ -204,7 +204,8 @@ local function compile(id)
 		return nil
 	end
 	pat[#pat + 1] = "$"
-	local e = { pat = table.concat(pat), lits = lits, key = longest, id = id, ncap = ncap, kinds = kinds, nc = nc }
+	local e = { pat = table.concat(pat), lits = lits, key = longest, id = id, ncap = ncap, kinds = kinds, nc = nc,
+		tailcap = id:find("%%[%-+ #0-9%.]*[hlzjtL]*[%a]$") ~= nil } -- (it ends with an argument)
 	-- (evalerror's "%s%s%s: %s (…)": NAME, ": " or both empty, the expression, then the
 	-- message — adjacent %s and an expression's own `: ' can't split by pattern alone)
 	if e.pat:sub(1, 15) == "^(.-)(.-)(.-): " then
@@ -370,6 +371,11 @@ local function xarg(st, v)
 	if is_strerror(v) then
 		return libc(st, v)
 	end
+	local head, se = v:match("^(.*): ([^:]+)$") -- (`FILE: strerror' — dlerror's, file_error's)
+	if se and is_strerror(se) then
+		local t = libc(st, se)
+		return t and (head .. ": " .. t) or nil
+	end
 	if v:find("%a") and not v:find("%", 1, true) then
 		return lookup(st, st.bash, st.memo, v)
 	end
@@ -396,18 +402,10 @@ local function xlate(st, msg)
 			if caps[1] ~= nil and e.evalerror then
 				caps = evalerror_split(st, caps)
 			end
-			-- (a trailing strerror is libc's text: only as a whole argument, not part of
-			-- a longer msgid's literal — `ab: Numerical result out of range')
-			if caps and caps[1] ~= nil and tailerr then
-				local whole = false
-				for _, v in ipairs(caps) do
-					if v == tailerr then
-						whole = true
-					end
-				end
-				if not whole then
-					caps = nil
-				end
+			-- (a trailing strerror is libc's text: inside the last argument, never part of a
+			-- longer msgid's literal — `ab: Numerical result out of range')
+			if caps and caps[1] ~= nil and tailerr and not e.tailcap then
+				caps = nil
 			end
 			if caps and caps[1] ~= nil then
 				if e.ncap == 0 then
