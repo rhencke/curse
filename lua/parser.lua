@@ -133,8 +133,31 @@ local function arith(src, nodefer)
 	end
 	local parseExpr
 	-- raise one of bash's expr.c errors (a structured error; M.arith_errmsg renders it)
-	local function aerr(msg)
-		error({ __curse_arith = true, msg = msg, tok = lasttp and src:sub(lasttp) or "" }, 0)
+	-- `pre`: what bash had already EVALUATED when it met the error — it evaluates while it
+	-- parses (expr.c's recursive descent), so side effects before a syntax error stick:
+	-- `let 'b=a++ +'` increments a. An AST of the completed operands, in order, under their
+	-- short-circuit/ternary conditions; the reporter evaluates it before the message.
+	local function aerr(msg, pre)
+		error({ __curse_arith = true, msg = msg, tok = lasttp and src:sub(lasttp) or "", pre = pre }, 0)
+	end
+	local ZERO = { k = "num", v = "0" }
+	local function seq(a, b)
+		if a and b then
+			return { k = "comma", l = a, r = b }
+		end
+		return a or b
+	end
+	-- run a sub-parse; a syntax error in it gets `wrap(its pre)` as its pre (the completed
+	-- siblings to its left, in their evaluation context)
+	local function withpre(wrap, f, x, y)
+		local ok, r = pcall(f, x, y)
+		if ok then
+			return r
+		end
+		if type(r) == "table" and r.__curse_arith then
+			r.pre = wrap(r.pre)
+		end
+		error(r, 0)
 	end
 	local ARITHOP = "[%+%-%*/%%<>=!&|%^~%?:,%(%)]"
 	local npow = 0 -- `**` operators parsed so far (an untaken branch with one sets rpow)
@@ -208,7 +231,7 @@ local function arith(src, nodefer)
 			i = i + 1
 			local e = parseComma()
 			if not eat(")") then
-				aerr("missing `)'")
+				aerr("missing `)'", e)
 			end
 			return e
 		end
@@ -226,10 +249,11 @@ local function arith(src, nodefer)
 			i = i + 2
 			local nm, idx, ir = nameSub()
 			-- (readtok: a `++`/`--` right after `++x` is `--x++` — "++: assignment requires lvalue")
+			local node = { k = "pre", name = nm, idx = idx, idxraw = ir, d = d }
 			if starts("++") or starts("--") then
-				aerr(src:sub(i, i + 1) .. ": assignment requires lvalue")
+				aerr(src:sub(i, i + 1) .. ": assignment requires lvalue", node)
 			end
-			return { k = "pre", name = nm, idx = idx, idxraw = ir, d = d }
+			return node
 		end
 		if c == "-" then
 			i = i + 1
@@ -425,7 +449,12 @@ local function arith(src, nodefer)
 			if op == "**" then
 				npow = npow + 1
 			end
-			local right = parseExpr(op == "**" and prec or prec + 1) -- ** is right-assoc
+			local right = withpre(function(p) -- (`a && <bad>`: the bad side was noeval)
+				if op == "&&" or op == "||" then
+					return { k = "bin", op = op, l = left, r = p or ZERO }
+				end
+				return seq(left, p)
+			end, parseExpr, op == "**" and prec or prec + 1) -- ** is right-assoc
 			left = { k = "bin", op = op, l = left, r = right }
 			if op == "**" then
 				-- (for bash's eval-time error text: the expression, and the lookahead token
@@ -444,16 +473,21 @@ local function arith(src, nodefer)
 			local np = npow
 			i = i + 1
 			if peek() == ":" or i > n then
-				aerr("expression expected")
+				aerr("expression expected", left)
 			end
-			local a = parseExpr(0)
+			local c = left
+			local a = withpre(function(p)
+				return { k = "tern", c = c, a = p or ZERO, b = ZERO }
+			end, parseExpr, 0)
 			if not eat(":") then
-				aerr("`:' expected for conditional expression")
+				aerr("`:' expected for conditional expression", { k = "tern", c = c, a = a, b = ZERO })
 			end
 			if peek() == "" then
-				aerr("expression expected")
+				aerr("expression expected", { k = "tern", c = c, a = a, b = ZERO })
 			end
-			local b = parseExpr(0, true) -- (the else-branch is a conditional, not an assignment)
+			local b = withpre(function(p) -- (the else-branch is a conditional, not an assignment)
+				return { k = "tern", c = c, a = a, b = p or ZERO }
+			end, parseExpr, 0, true)
 			left = { k = "tern", c = left, a = a, b = b, rpow = npow > np or nil }
 		end
 		return left
@@ -464,7 +498,10 @@ local function arith(src, nodefer)
 		local e = parseExpr(0)
 		while peek() == "," do
 			i = i + 1
-			e = { k = "comma", l = e, r = parseExpr(0) }
+			local l = e
+			e = { k = "comma", l = l, r = withpre(function(p)
+				return seq(l, p)
+			end, parseExpr, 0) }
 		end
 		return e
 	end
@@ -475,11 +512,11 @@ local function arith(src, nodefer)
 		local c = src:sub(i, i)
 		if (c == "=" and src:sub(i + 1, i + 1) ~= "=") or src:find("^[%+%-%*/%%&|%^]=", i) or src:find("^<<=", i)
 			or src:find("^>>=", i) then
-			aerr("attempted assignment to non-variable")
+			aerr("attempted assignment to non-variable", e)
 		elseif not c:match(ARITHOP) and not c:match("[%w_]") then
-			aerr("syntax error: invalid arithmetic operator") -- (after an operand: `1 @ 2`)
+			aerr("syntax error: invalid arithmetic operator", e) -- (after an operand: `1 @ 2`)
 		end
-		aerr("syntax error in expression")
+		aerr("syntax error in expression", e)
 	end
 	return e
 end

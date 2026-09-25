@@ -36,6 +36,7 @@ return function(sh, cmd, args, hook, tcb)
 				local ok, v = pcall(function()
 					local pok, ast = pcall(P.arith, args[k], "let") -- (args are already expanded)
 					if not pok then
+						I.arith_pre(sh, ast) -- (what bash evaluated before the error sticks)
 						io.stderr:write("curse: " .. P.arith_errmsg(args[k], ast) .. "\n")
 						error({ __curse_exit = 1, __curse_matherr = true })
 					end

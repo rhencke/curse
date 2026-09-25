@@ -787,6 +787,7 @@ local is_multi, multi_elems -- forward (defined with the field expander)
 local indirect_part -- forward (${!ref} target resolution, re-parsed to a part)
 local eval -- arithmetic evaluator (forward decl)
 local noeval_pow -- a short-circuited operand's exponent check (forward decl)
+local arith_pre -- a syntax error's already-evaluated prefix (forward decl)
 local arith_resolve -- var-value-as-arith-expression resolver (forward decl)
 local arith_key -- array subscript in arith: string key for assoc, number for indexed
 local xpand_subdepth -- 1 while arith_key evaluates an xpand subscript (see arith_key)
@@ -810,6 +811,7 @@ arith_resolve = function(sh, s)
 	local ok, ast = pcall(P.arith, s)
 	if not ok then -- the value is not a valid arith expression (e.g. "12 34", "1+"): an
 		-- arith error — the command fails and (bash) the rest of the line is discarded
+		arith_pre(sh, ast)
 		io.stderr:write("curse: " .. P.arith_errmsg(s, ast) .. "\n")
 		error({ __curse_exit = 1, __curse_matherr = true, __curse_experr = true, __curse_lineabort = true })
 	end
@@ -923,6 +925,7 @@ function M.arith_textual_eval(sh, raw, depth0)
 	local text = arith_expand_text(sh, raw, depth0)
 	local pok, ast = pcall(P.arith, text, "strict")
 	if not pok then -- the EXPANDED text isn't valid arithmetic: an arith error (bash), not a crash
+		arith_pre(sh, ast)
 		io.stderr:write("curse: " .. P.arith_errmsg(text, ast, depth0 ~= nil) .. "\n")
 		error({ __curse_exit = 1, __curse_matherr = true, __curse_lineabort = true })
 	end
@@ -1017,9 +1020,18 @@ noeval_pow = function(e)
 	end
 	return i64(0) -- var / ++ / -- / expansions: noeval reads nothing
 end
+-- bash evaluates arithmetic WHILE parsing it, so what came before a syntax error has run:
+-- `let 'b=a++ +'` increments a. The parser hands the completed part as err.pre; evaluate
+-- it before the error is reported (its own error — `1/0 + )` — wins, as in bash).
+arith_pre = function(sh, err)
+	if type(err) == "table" and err.pre then
+		eval(sh, err.pre)
+	end
+end
 eval = function(sh, e)
 	local k = e.k
 	if k == "matherr" then -- a deferred arith parse error (bad lvalue): non-fatal in (( ))
+		arith_pre(sh, e.err)
 		io.stderr:write("curse: " .. P.arith_errmsg(e.raw or "", e.err) .. "\n")
 		error({ __curse_exit = 1, __curse_matherr = true })
 	end
@@ -1661,6 +1673,7 @@ expand_part_str = function(sh, p, assign)
 		if not p.arith_ast then -- same $((…)) shouldn't re-parse it)
 			local ok, ast = pcall(P.arith, p.arith)
 			if not ok then -- a syntax error in $(( )) fails the command, non-fatally (bash)
+				arith_pre(sh, ast) -- (after what was evaluated before it)
 				io.stderr:write("curse: " .. P.arith_errmsg(p.arith, ast) .. "\n")
 				-- (an expansion error: bash discards the rest of the line)
 				error({ __curse_exit = 1, __curse_matherr = true, __curse_experr = true, __curse_lineabort = true })
@@ -5146,6 +5159,7 @@ end
 function M.arith_eval_str(sh, s)
 	local ok, ast = pcall(P.arith, s == "" and "0" or s, sh.arith_expanded and "expanded" or nil)
 	if not ok then
+		arith_pre(sh, ast)
 		io.stderr:write("curse: " .. P.arith_errmsg(s, ast) .. "\n")
 		error({ __curse_exit = 1, __curse_matherr = true, __curse_experr = true })
 	end
@@ -5162,6 +5176,7 @@ function M.dbracket_arith(sh, s, textual)
 		ok, v = pcall(function()
 			local pok, ast = pcall(P.arith, s == "" and "0" or s, "strict")
 			if not pok then
+				arith_pre(sh, ast)
 				io.stderr:write("curse: " .. P.arith_errmsg(s, ast) .. "\n")
 				error({ __curse_exit = 1, __curse_matherr = true, __curse_experr = true })
 			end
@@ -6240,7 +6255,9 @@ exec_stmt = function(sh, st, hook)
 			if node.k == "arith_perr" then
 				local sv = P.arith_cmd
 				P.arith_cmd = "(("
-				io.stderr:write("curse: " .. P.arith_errmsg(node.raw, select(2, pcall(P.arith, node.raw))) .. "\n")
+				local _, perr = pcall(P.arith, node.raw)
+				arith_pre(sh, perr)
+				io.stderr:write("curse: " .. P.arith_errmsg(node.raw, perr) .. "\n")
 				P.arith_cmd = sv
 				error({ __curse_exit = 1, __curse_experr = true })
 			end
@@ -7544,6 +7561,7 @@ end
 -- branch bodies verbatim.
 M.SUBHOOK = SUBHOOK -- ($(…) bodies run from runtime use it too)
 M._int = {
+	arith_pre = arith_pre,
 	SPECIAL_BUILTIN = SPECIAL_BUILTIN,
 	exec_simple = exec_simple,
 	expand_part_str = expand_part_str,
