@@ -12467,6 +12467,9 @@ do
 			if sh.opt_c or sh.opt_posix then
 				error({ __curse_exit = 1 })
 			end
+			if sh.pb_mode == "perm" then -- (no command: a plain assignment, which aborts the line)
+				error({ __curse_exit = 1, __curse_lineabort = true })
+			end
 			return
 		end
 		if append then -- (interp's assign_body `name+=value`)
@@ -12494,6 +12497,9 @@ do
 	end
 	function M.pbind(sh, name, value, append, raw)
 		local mode = sh.pb_mode
+		if mode == "perm" then -- (no command after all: a plain assignment)
+			return M.sr_pset(sh, name, value, append)
+		end
 		if mode == "persist" then
 			for _, te in ipairs(sh.tenv) do -- (it propagates through a temporary binding)
 				if te.name == name then
@@ -12609,6 +12615,14 @@ do
 	-- compiled tier's own eval/source statements do — unless a function shadows the name
 	function M.sr_dispatch(sh, argv, spec, hook)
 		local cmd = argv[1]
+		local viacmd
+		while (argv[1] == "command" or argv[1] == "builtin") and argv[2] == "exec" and not sh.functions[argv[1]] do
+			viacmd = viacmd or argv[1] == "command"
+			table.remove(argv, 1) -- `command exec 2>f`: still exec, its redirections persist
+		end
+		if argv[1] == "exec" then -- (statement-level in interp: b_exec, not exec_simple)
+			return require("b_exec")(sh, { redirs = spec.eredirs }, argv, hook, viacmd)
+		end
 		if (cmd == "eval" or cmd == "source" or cmd == ".")
 			and not (sh.functions[cmd] and not (sh.opt_posix and M.SPECIAL_BUILTIN[cmd]))
 			and not (sh.disabled_builtins and sh.disabled_builtins[cmd]) then
@@ -12671,7 +12685,7 @@ do
 	-- spec (a per-site constant): aas = the NAME=(…) operand ASTs; names = the prefix
 	-- assignment names; so = a redirect moves stdout. bind(sh) performs the prefix bindings
 	-- in order (each value expanded after the previous binding: bash's left-to-right).
-	function M.simple_run(sh, argv, spec, bind, hook)
+	function M.simple_run(sh, argv, spec, bind, hook, n0)
 		hook = hook or _noop
 		if sh.xerr then -- a word expansion failed: the command doesn't run (status 1)
 			sh.xerr = nil
@@ -12682,6 +12696,24 @@ do
 			return
 		end
 		local aas = spec.aas
+		if #argv == 0 and not aas then
+			-- every word expanded away: the prefix assignments are PERMANENT (no command to
+			-- scope them to); the status is the last command substitution's, else 0
+			sh.status = 0
+			if bind then
+				local svm = sh.pb_mode
+				sh.pb_mode = "perm"
+				local ok, err = pcall(bind, sh)
+				sh.pb_mode = svm
+				if not ok then
+					error(err, 0)
+				end
+			end
+			if sh.status == 0 and n0 and sh.ncs ~= n0 then
+				sh.status = sh.last_cmdsub_status or 0
+			end
+			return
+		end
 		if aas then
 			M.sr_aa_pre(sh, argv, aas)
 		end

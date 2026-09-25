@@ -4577,14 +4577,14 @@ end
 -- substitution, an uncompilable redirect) — the caller delegates.
 local SN_ASSIGN_CMD = { export = 1, declare = 1, typeset = 1, readonly = 1, ["local"] = 1 }
 EF.simple_native = function(cx, st, after, cmd)
-	if not cmd or not st.words[1] then
-		return nil
+	if not st.words[1] or (not cmd and st.redirs) then -- (a dynamic name with redirections:
+		return nil -- it may turn out to be `exec`, whose redirections persist)
 	end
 	local lifted = cx.lifted
 	local w2 = st.words[2] and st.words[2].parts[1]
-	if cmd == "exec" or ((cmd == "command" or cmd == "builtin") and w2 and w2.lit == "exec") then
-		return nil -- (exec's redirections persist / it replaces the process)
-	end
+	-- `exec CMD…` (b_exec, under the prefix bindings): its redirections PERSIST, so they're
+	-- b_exec's to apply, not opts.redir's
+	local isexec = cmd == "exec" or ((cmd == "command" or cmd == "builtin") and w2 and w2.lit == "exec")
 	local function hasps(w)
 		for _, p in ipairs(w.parts) do
 			if p.procsub then
@@ -4601,7 +4601,7 @@ EF.simple_native = function(cx, st, after, cmd)
 	local cw1lit = #w1.parts == 1 and p1.lit ~= nil and not p1.q and p1.lit or nil
 	local isdecl = cw1lit and SN_ASSIGN_CMD[cw1lit]
 	local isunset = cw1lit == "unset"
-	local out = { isunset and "sh.arrayref_args = nil; local __a = {}" or "local __a = {}" }
+	local out = { isunset and "sh.arrayref_args = nil; local __n0, __a = sh.ncs, {}" or "local __n0, __a = sh.ncs, {}" }
 	for j, w in ipairs(st.words) do
 		if hasps(w) then
 			return nil
@@ -4654,6 +4654,9 @@ EF.simple_native = function(cx, st, after, cmd)
 			if a.index then
 				bs[#bs + 1] = ("rt.pbind_bad(sh, %q, %q)"):format(a.name, tostring(a.index))
 			elseif a.raw then
+				if not cmd then -- (no command left after expansion: an array assignment — interp)
+					return nil
+				end
 				names[#names + 1] = ("%q"):format(a.name)
 				bs[#bs + 1] = ("rt.pbind(sh, %q, nil, false, %q)"):format(a.name, a.raw)
 			elseif a.rhs then
@@ -4686,7 +4689,9 @@ EF.simple_native = function(cx, st, after, cmd)
 		spec[#spec + 1] = "line=" .. st.line
 	end
 	local redir
-	if st.redirs and #st.redirs > 0 then
+	if isexec and st.redirs then
+		spec[#spec + 1] = "eredirs=" .. ser(st.redirs)
+	elseif st.redirs and #st.redirs > 0 then
 		redir = cx.redir_conds(st, cmd)
 		if not redir then
 			return nil
@@ -4698,7 +4703,7 @@ EF.simple_native = function(cx, st, after, cmd)
 	return cx.delegate(st, after, {
 		prelude = table.concat(out, "; "),
 		callee = "rt.simple_run",
-		callargs = ("sh, __a, %s, %s, __noop"):format(EF.konst(spec), bind or "nil"),
+		callargs = ("sh, __a, %s, %s, __noop, __n0"):format(EF.konst(spec), bind or "nil"),
 		redir = redir,
 	})
 end
@@ -5122,8 +5127,8 @@ simple_compiled = function(cx, st, after)
 	local redir_apply = nil
 	if st.redirs then
 		redir_apply = cx.redir_conds(st, cmd)
-		if not redir_apply then
-			return cx.delegate(st, after)
+		if not redir_apply then -- (`exec CMD >f`: the runner's b_exec, whose redirections persist)
+			return EF.simple_native(cx, st, after, cmd) or cx.delegate(st, after)
 		end
 	end
 	-- a redirect-ONLY command (`> file`, `< f`): no command runs; apply the redirs
@@ -5518,6 +5523,8 @@ simple_compiled = function(cx, st, after)
 					cmd,
 					#ei > 0 and (table.concat(ei, "; ") .. "; ") or "",
 					#eo > 0 and ("; " .. table.concat(eo, "; ")) or "")
+			elseif cmd == nil or require("interp").BUILTINS[cmd] then -- (wait/eval/:/…, a dynamic name:
+				return EF.simple_native(cx, st, after, cmd) or cx.delegate(st, after) -- the runner)
 			else
 				return cx.delegate(st, after)
 			end
