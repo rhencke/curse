@@ -520,7 +520,12 @@ local function split_subst(s)
 	local i, n, q = 1, #s, nil
 	while i <= n do
 		local c = s:sub(i, i)
-		if c == "\\" then
+		if q == "'" then -- (a backslash in '…' is literal: `${x/'\'/Z}`)
+			if c == q then
+				q = nil
+			end
+			i = i + 1
+		elseif c == "\\" then
 			i = i + 2
 		elseif q then
 			if c == q then
