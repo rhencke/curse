@@ -1147,9 +1147,36 @@ do
 	local re_lockey = ""
 	M.lc_state = { [0] = "C", "C", "C", "C", "C", "C" }
 	local lc_ns -- (the state being built by one reset)
-	local function lc_try(cat, v) -- setlocale; true when it took
+	local LC_NAME = { [0] = "LC_CTYPE", "LC_NUMERIC", "LC_TIME", "LC_COLLATE", "LC_MONETARY", "LC_MESSAGES" }
+	local lc_try
+	-- bash's "" is setlocale's own pick from the ENVIRONMENT — bash's environ, the export
+	-- env as last rebuilt (maybe_make_export_env: at a command's spawn, or by a locale reset
+	-- with no LANG), not the variables' values now: `unset LC_CTYPE` alone keeps the
+	-- exported LC_CTYPE's locale. M.lc_envsnap: that environment's locale variables.
+	local function lc_envpick(c)
+		local e = M.lc_envsnap or {}
+		local v = e.LC_ALL
+		if not v or v == "" then
+			v = e[LC_NAME[c]]
+		end
+		if not v or v == "" then
+			v = e.LANG
+		end
+		return (v and v ~= "") and v or "C"
+	end
+	lc_try = function(cat, v) -- setlocale; true when it took
 		if v == "" then
-			v = "C" -- (bash's "" = the environment's pick; with no locale variable set that's C)
+			if cat == 6 then -- (each category its own pick; any failing fails the lot)
+				local sv = lc_ns
+				for c = 0, 5 do
+					if not lc_try(c, lc_envpick(c)) then
+						lc_ns = sv
+						return false
+					end
+				end
+				return true
+			end
+			v = lc_envpick(cat)
 		end
 		ffi.errno(0)
 		if C.setlocale(cat, v) == nil then
@@ -1187,6 +1214,9 @@ do
 	end
 	local LC_ORDER = { "LC_CTYPE", "LC_COLLATE", "LC_MESSAGES", "LC_NUMERIC", "LC_TIME" }
 	local function lc_reset_vars(sh, lang) -- bash's reset_locale_vars
+		if not lang then -- (maybe_make_export_env: the environment setlocale reads is rebuilt)
+			M.lc_env_rebuild()
+		end
 		if not lc_try(6, lang or "") then
 			return false
 		end
@@ -1219,6 +1249,7 @@ do
 		local all, lang = lc_get(sh, "LC_ALL"), lc_get(sh, "LANG")
 		local ok = true
 		if var == nil then -- startup: from C, LC_ALL (warning), else LANG and the categories
+			M.lc_env_rebuild() -- (the environment the shell started with)
 			lc_try(6, "C")
 			if all then
 				ok = lc_try(6, all)
@@ -2249,7 +2280,13 @@ function M.exec_tail_lvl(sh, ...)
 		end
 		return
 	end
+	-- (not in a pipeline stage, nor a $(…) it runs — iso ctx.pipe: bash's drop is only when
+	-- subshell_environment lacks SUBSHELL_PIPE, which a comsub keeps and a ( … ) clears)
 	local ok = (tl < 0 and -1 - tl or tl) == sh.pd and not sh.exec_builtin
+	if ok then
+		local ctx = M.iso_cur(sh)
+		ok = not (ctx and ctx.pipe)
+	end
 	local tr = sh.traps
 	if ok and tl < 0 and tr then
 		local ctx = M.iso_cur(sh)
@@ -3061,6 +3098,7 @@ iso_push = function(sh)
 		sh.iso_ctx = st
 	end
 	local up = st[#st]
+	ctx.pipe = up and up.pipe or nil -- (bash's SUBSHELL_PIPE: see exec_tail_lvl)
 	if up and up.igint then -- (an async job's SIGINT/SIGQUIT SIG_IGN: its subshells inherit it)
 		ctx.igint = { [2] = up.igint[2], [3] = up.igint[3] }
 	end
@@ -3678,6 +3716,9 @@ function Shell:subshell_run(runner, saves, paren)
 	self.job_cur, self.job_prev = nil, nil
 
 	local ctx = iso_push(self)
+	if paren then -- (a ( … ) starts SUBSHELL_PAREN afresh: no SUBSHELL_PIPE)
+		ctx.pipe = nil
+	end
 	local ok, err = pcall(runner, self)
 	local status = self.status
 	local rethrow, killed
@@ -4601,6 +4642,7 @@ local function co_launch(ctx, self, stage_fns, inproc, base, lastpipe, upv)
 			local ctx = not islp and iso_push(sh) -- (a stage is an in-process subshell)
 			if ctx then
 				ctx.task_fds = true
+				ctx.pipe = g.n > 1 or nil
 			end
 			if ctx and g.bg then -- (a background job: $BASHPID = its $!, and `kill $!` finds it)
 				ctx.vpid, ctx.task = g.vpid, t
@@ -5427,7 +5469,8 @@ function Shell:bg_launch(fn, cmdstr, flat, simple, upv_get, upv_set, opts)
 			t.sh.in_subprogram = (t.sh.in_subprogram or 0) + 1
 			t.sh.loopdepth = g.simple and self.loopdepth or 0 -- (a simple job keeps it: stage_kind)
 			if g.simple then -- (bash execs a `cmd &` job's external in place: rt.exec_tail_lvl)
-				t.sh.shlvl_tail = t.sh.pd
+				-- (a function it calls: no tail inside; "fn": the emitter's direct call, at this pd)
+				t.sh.shlvl_tail, t.sh.shlvl_cs = g.simple ~= "fn" and t.sh.pd or nil, nil
 				t.sh.xstage = true -- (its external is the job's process: reported as the job)
 				t.sh.bg_cd = t.sh.calldepth -- (…run with SIGINT/SIGQUIT ignored: Shell:exec)
 			end
@@ -7085,6 +7128,24 @@ function Shell:deref(name)
 	end
 	return ""
 end
+-- An ARITHMETIC access through a nameref bash calls circular (a cycle, or a function's
+-- self-named ref): find_variable_nameref warns on every lookup — a read looks up once, a
+-- store twice (bind_int_variable's find, then bind_variable). n: how many warnings.
+-- Returns "outer" for a self-named ref (it then reaches the shadowed var), true for a
+-- cycle (nothing there: reads 0, stores nothing), false for any other name.
+function M.arith_ref_circ(sh, name, n)
+	local b = sh.vars[name]
+	if not (b and b.ref and b.s and b.s ~= "") then
+		return false
+	end
+	local c = b.outer and "outer" or (sh:deref(name) == "" and not M.ref_too_deep(sh, name))
+	if c then
+		for _ = 1, n do
+			io.stderr:write("curse: warning: " .. name .. ": circular name reference\n")
+		end
+	end
+	return c
+end
 -- Did `name`'s nameref chain run past NAMEREF_MAX (8) rather than loop? bash then reads
 -- nothing, without the cycle's warning, and an assignment through it fails fatally.
 function M.ref_too_deep(sh, name)
@@ -7953,8 +8014,16 @@ function M.plain_scalar(sh, name)
 	local b = sh.vars[name]
 	return b == nil or not (b.ref or b.ro or b.arr)
 end
-function Shell:aset(name, n)
+function Shell:aset(name, n, acmd)
 	local dn = self:deref(name)
+	if dn ~= name then
+		if M.arith_ref_circ(self, name, 2) == true then
+			return i64(n) -- (a nameref cycle: bash warns, stores nothing)
+		end
+		if self:deref_elem(name) then -- (a reference to an element: stored there)
+			return require("interp").arith_ref_elem(self, name, i64(n))
+		end
+	end
 	local b = self.vars[dn]
 	if b == nil or b.dyn then
 		if M.DYN_ASSIGN[dn] and M.dyn_assign(self, dn, i64_to_str(i64(n)), b) then
@@ -7967,9 +8036,10 @@ function Shell:aset(name, n)
 		io.stderr:write("curse: " .. dn .. ": readonly variable\n")
 		error({ __curse_exit = 1, __curse_matherr = true, __curse_lineabort = true })
 	end
-	if b.ref then -- a number is never a nameref target (`declare -n r; ((r=0))`)
-		M.bad_ref_target(i64_to_str(i64(n)), require("parser").arith_cmd or (self.in_arithcmd and "((" or nil))
-		error({ __curse_exit = 1, __curse_matherr = true })
+	if b.ref then -- a number is never a nameref target (`declare -n r; ((r=0))`): bash's
+		-- bind fails, reported, but the expression goes on with the value (expr.c ignores it)
+		M.bad_ref_target(i64_to_str(i64(n)), acmd or require("parser").arith_cmd or (self.in_arithcmd and "((" or nil))
+		return i64(n)
 	end
 	if dn == "OPTIND" and self.getopts_state then
 		self.getopts_state[b] = nil
@@ -8559,6 +8629,16 @@ function M.shlvl_start(sh, d) -- (d: an exec'd command's -1 first)
 	end
 	C.setenv("SHLVL", tostring(n), 1)
 end
+-- (the process environment's locale variables, as bash's environ now holds them)
+local LC_ENVNAMES = { LC_ALL = 1, LANG = 1, LC_CTYPE = 1, LC_NUMERIC = 1, LC_TIME = 1, LC_COLLATE = 1,
+	LC_MONETARY = 1, LC_MESSAGES = 1 }
+function M.lc_env_rebuild()
+	local e = {}
+	for n in pairs(LC_ENVNAMES) do
+		e[n] = os.getenv(n)
+	end
+	M.lc_envsnap = e
+end
 -- A child's environment in bash's order: bash builds it by walking its variable hash
 -- table — the same FNV-1 / 1024-bucket order, the newest variable first within a
 -- bucket — and appends `_` last. The process environ is (re)ordered that way at each
@@ -8575,10 +8655,15 @@ do
 		end
 		local nous = M.env_drop_us -- (`exec cmd`: no `_` — only a forked command gets one)
 		local j = 0
+		local lce = {} -- (bash rebuilds its environ for the spawn: what setlocale("") then reads)
+		M.lc_envsnap = lce
 		while env[j] ~= nil do
 			local s = ffi.string(env[j])
 			local name = s:match("^[^=]*")
 			j = j + 1
+			if LC_ENVNAMES[name] then
+				lce[name] = s:sub(#name + 2)
+			end
 			if nous and name == "_" then
 				goto continue
 			end
@@ -10926,7 +11011,9 @@ end
 function M.ref_to_array(sh, name)
 	local b = sh.vars[name]
 	if b and b.ref and not sh.arrayargs_pending then
-		io.stderr:write("curse: warning: " .. name .. ": removing nameref attribute\n")
+		if M.arith_ref_circ(sh, name, 1) ~= true then -- (a cycle's own warning instead)
+			io.stderr:write("curse: warning: " .. name .. ": removing nameref attribute\n")
+		end
 		b.ref, b.s, b.n, b.outer = nil, nil, nil, nil
 	end
 end
@@ -12478,6 +12565,9 @@ function M.run_prefix(sh, names, vals, runfn, argv)
 		-- a NAMEREF's prefix binding is a plain temporary (target untouched), and so is an
 		-- -i/-l/-u/-c var's (bash's tempenv variable is a plain string: `i=1+1 cmd` gets "1+1")
 		if b and (b.ref or (not b.ro and (b.arr or b.int or b.lower or b.upper or b.cap))) then
+			if b.ref and M.arith_ref_circ(sh, name, 0) == true then -- (a cycle: bash warns, then
+				io.stderr:write("curse: warning: " .. name .. ": circular name reference\n") -- binds)
+			end
 			sh.vars[name] = {}
 		end
 		if LOCALE_VARS[name] then
@@ -12981,6 +13071,13 @@ function M.arith_read(sh, name)
 		local bs = b.s
 		if bs and short_digits(bs) and (bs:byte(1) ~= 48 or #bs == 1) then -- (010 is octal)
 			return i64(tonumber(bs))
+		end
+	end
+	if b and b.ref then
+		M.arith_ref_circ(sh, name, 1)
+		local ev = require("interp").arith_ref_elem(sh, name)
+		if ev then
+			return ev
 		end
 	end
 	local s = sh:get(name)
@@ -13913,9 +14010,14 @@ function M.assign_scalar(sh, name, value)
 				M.assign_discard(sh) -- (bash: an assignment error, silent)
 			end
 			io.stderr:write("curse: warning: " .. name .. ": circular name reference\n")
-			sh.status = 1
-			sh.assign_err = true -- (the rest of an assignment list is abandoned)
-			return
+			sh.status = 1 -- (an assignment error, as a readonly one: a prefix binding is just
+			if sh.opt_posix then -- skipped, a standalone one aborts the rest of the line)
+				error({ __curse_exit = 1 })
+			end
+			if sh.applying_prefix then
+				return
+			end
+			error({ __curse_exit = 1, __curse_lineabort = true })
 		elseif direct.outer and direct.s:find("[", 1, true) then -- (`local -n a='a[0]'`)
 			io.stderr:write("curse: `" .. direct.s .. "': not a valid identifier\n")
 			error({ __curse_exit = 1, __curse_lineabort = true })
@@ -14371,6 +14473,9 @@ do
 		-- (bash); `n+=3 cmd` on a -i var binds the arithmetic sum as that string
 		local iapp = b and b.int and append and not b.arr and not b.ref and not raw
 		if b and not iapp and (b.ref or (not b.ro and (b.arr or b.int or b.lower or b.upper or b.cap))) then
+			if b.ref and M.arith_ref_circ(sh, name, 0) == true then -- (a cycle: bash warns, then
+				io.stderr:write("curse: warning: " .. name .. ": circular name reference\n") -- binds)
+			end
 			sh.vars[name] = {}
 		end
 		if LOCALE_VARS[name] then
@@ -14826,9 +14931,14 @@ function M.assign_full(sh, st)
 					M.assign_discard(sh) -- (a chain past NAMEREF_MAX: a silent assignment error)
 				end
 				io.stderr:write("curse: warning: " .. st.name .. ": circular name reference\n")
-				sh.status = 1
-				sh.assign_err = true
-				return
+				sh.status = 1 -- (an assignment error, as a readonly one: a prefix binding is just
+				if sh.opt_posix then -- skipped, a standalone one aborts the rest of the line)
+					error({ __curse_exit = 1 })
+				end
+				if sh.applying_prefix then
+					return
+				end
+				error({ __curse_exit = 1, __curse_lineabort = true })
 			elseif nb.outer and nb.s:find("[", 1, true) then
 				io.stderr:write("curse: `" .. nb.s .. "': not a valid identifier\n")
 				error({ __curse_exit = 1, __curse_lineabort = true })

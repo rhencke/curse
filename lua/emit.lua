@@ -1439,6 +1439,9 @@ local function emit_set(name, valexpr, lifted)
 	if lifted[name] then
 		return lname(name) .. " = " .. valexpr
 	end
+	if EF.acmd then -- (a store in a for (( … )) slot: a bad-reference report says `((: `)
+		return ("sh:aset(%q, %s, %q)"):format(name, valexpr, EF.acmd)
+	end
 	return ("sh:aset(%q, %s)"):format(name, valexpr)
 end
 
@@ -1867,8 +1870,8 @@ function compile_cmdsub_inner(src, backtick, lifted, aenv, noalias, posix)
 	if not pok or type(ast) ~= "table" or ast.stmts == nil then
 		return fallback
 	end -- syntax error
-	if backtick and ast.xg_guess then -- (a `…` body is parsed when it runs, under the live
-		return fallback -- extglob state: its `X(` can't be decided statically)
+	if backtick and (ast.xg_guess or ast.ltrans) then -- (a `…` body is parsed when it runs,
+		return fallback -- under the live extglob state and $TEXTDOMAIN: its `X(` / $"…")
 	end
 	require("parser").mark_tail(ast.stmts)
 	-- A syntax error inside $(…) is fatal to the containing command (bash, status 2);
@@ -6906,9 +6909,11 @@ H.forc = function(cx, st, after)
 	elseif st.step and arith_can_error(st.step, cx.lifted) then
 		cx.blocks[stepp] = xs(3) .. guarded(st.step, ("pc = %d"):format(condp))
 	else
+		EF.acmd = "(("
 		cx.blocks[stepp] = xs(3)
 			.. (st.step and emit_arith_stmt(st.step, cx.lifted) .. "; " or "")
 			.. ("pc = %d"):format(condp)
+		EF.acmd = nil
 	end
 	-- (a loop that runs no iteration has status 0; else its last body command's — `ran`
 	-- says which, reset each time the loop is entered; 1 at an OSR entry, which skips the
@@ -6922,12 +6927,14 @@ H.forc = function(cx, st, after)
 	elseif st.cond and arith_can_error(st.cond, cx.lifted) then
 		cx.blocks[condp] = xs(2) .. guarded(st.cond, ("if __as == 0 then pc = %d else pc = %d end"):format(bodyp, exitp))
 	else
+		EF.acmd = "(("
 		cx.blocks[condp] = xs(2)
 			.. ("if %s then pc = %d else pc = %d end"):format(
 				st.cond and emit_bool(st.cond, cx.lifted) or "true",
 				bodyp,
 				exitp
 			)
+		EF.acmd = nil
 	end
 	local ep = cx.newpc()
 	if st.init then
@@ -6937,7 +6944,9 @@ H.forc = function(cx, st, after)
 		elseif arith_can_error(st.init, cx.lifted) then
 			cx.blocks[ip] = xs(1) .. guarded(st.init, ("pc = %d"):format(condp))
 		else
+			EF.acmd = "(("
 			cx.blocks[ip] = xs(1) .. emit_arith_stmt(st.init, cx.lifted) .. ("; pc = %d"):format(condp)
+			EF.acmd = nil
 		end
 		cx.blocks[ep] = ("%s = 0; pc = %d"):format(ran, ip)
 	else
@@ -7635,8 +7644,12 @@ H.background = function(cx, st, after)
 			end
 		end
 	end
+	-- (simple "fn": a call of the program's own function — a direct call keeps sh.pd, so
+	-- its commands mustn't take the job's in-place exec)
+	local c1 = st.cmd.t == "simple" and sc.words and sc.words[1] and full_lit(sc.words[1])
+	local ownfn = c1 and (cx.funcflags[c1] or (cx.inlinefns and cx.inlinefns[c1]))
 	local fork = ("sh:run_background(__CS[%d], %q, %s, %s, %s%s)"):format(id, cmdstr, ext and "true" or "false",
-		st.cmd.t == "subshell" and "true" or "false", st.cmd.t == "simple" and "true" or "false",
+		st.cmd.t == "subshell" and "true" or "false", st.cmd.t == "simple" and (ownfn and '"fn"' or "true") or "false",
 		st.cmd.t == "pipeline" and ", true" or "")
 	local body = fork
 	if spawn then
@@ -8467,7 +8480,7 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
 		EF.cur_infunc = not cx.toplevel and not cx.topcode -- … or a function)
 		if st.line then
 			cx.prev_line = EF.cur_line -- (the command before: a redirected compound's errors)
-			EF.cur_line = (t == "simple" or t == "assign") and st.cline or st.line -- (a simple command: interp's rule)
+			EF.cur_line = (t == "simple" or t == "assign" or t == "assignlist") and st.cline or st.line -- (a simple command: interp's rule)
 			EF.cur_cline = st.cline or st.line
 		end -- for $LINENO (compile-time constant)
 		-- `time [-p] pipeline`: start clocks, run the statement itself, report to stderr.
@@ -8513,14 +8526,30 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
 		-- the last command of a ( … ) / $( … ) body (parser.mark_tail): rt.exec_tail_lvl
 		-- (not a call of the program's own function: a direct call keeps sh.pd, and its
 		-- commands aren't this one)
-		local tw1 = st.shtail and st.words and st.words[1] and full_lit(st.words[1])
-		if st.shtail and t == "simple" and not (cx.tl_guarded and cx.tl_guarded[st])
-			and not (tw1 and (cx.funcflags[tw1] or (cx.inlinefns and cx.inlinefns[tw1]))) then
+		local tw1 = (st.shtail or st.fntail) and st.words and st.words[1] and full_lit(st.words[1])
+		local ownfn = tw1 and (cx.funcflags[tw1] or (cx.inlinefns and cx.inlinefns[tw1]))
+		if (st.shtail or st.fntail) and t == "simple" and not (cx.tl_guarded and cx.tl_guarded[st])
+			and not (ownfn and st.shtail and not st.cstail) then
 			cx.tl_guarded = cx.tl_guarded or {}
 			cx.tl_guarded[st] = true
-			local body = cx.flatten_stmt(st, after)
 			local pre = cx.newpc()
-			cx.blocks[pre] = (st.shtail == 2 and "sh.shlvl_tail = sh.pd; pc = %d" or "sh.shlvl_tail = -1 - sh.pd; pc = %d"):format(body)
+			if st.shtail and not ownfn then
+				local body = cx.flatten_stmt(st, after)
+				cx.blocks[pre] = (st.shtail == 2 and "sh.shlvl_tail = sh.pd; sh.shlvl_cs = %s; pc = %d"
+					or "sh.shlvl_tail = -1 - sh.pd; sh.shlvl_cs = %s; pc = %d"):format(st.cstail and "true" or "nil", body)
+			elseif st.shtail then -- (a $( … ) tail calling the program's own function: its own
+				local clr = cx.newpc() -- last command is a tail too — interp's run_function)
+				cx.blocks[clr] = ("sh.fntail_arm = nil; pc = %d"):format(after)
+				local body = cx.flatten_stmt(st, clr)
+				cx.blocks[pre] = ("sh.fntail_arm = %q; sh.fntail_kind = 1; pc = %d"):format(tw1, body)
+			elseif ownfn then -- (a function body's last command, called so, passing it on)
+				local body = cx.flatten_stmt(st, after)
+				cx.blocks[pre] = ("if sh.fntail_arm == %q then sh.fntail_arm = %q end; pc = %d"):format(st.fntail, tw1, body)
+			else
+				local body = cx.flatten_stmt(st, after)
+				cx.blocks[pre] = ("if sh.fntail_arm == %q then sh.shlvl_tail = sh.fntail_kind == 2 and sh.pd or -1 - sh.pd; sh.shlvl_cs = true end; pc = %d")
+					:format(st.fntail, body)
+			end
 			return pre
 		end
 		-- a brace-expanded word list: under `set +B` (checked at run time, like bash) the raw
