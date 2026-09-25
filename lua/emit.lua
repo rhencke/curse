@@ -3005,7 +3005,24 @@ local function fb_unsafe(w)
 	return src:find("BASH_COMMAND", 1, true) or src:find("FUNCNAME", 1, true)
 		or src:find("BASH_SOURCE", 1, true) or src:find("BASH_LINENO", 1, true)
 end
-local function field_argv(words, from, lifted, wrap, prefix, guard_ok)
+-- The guarded one-word-expander step for field_argv: flush the lifted locals to sh (a $(…)
+-- body may read any of them), run `call` (rt.word_fields / rt.assign_word on the serialized
+-- word), reload them (`${x:=v}`, `$((x=1))` write), then `push` the result into __a — or
+-- leave `__a = false` after a contained expansion error.
+local function fb_step(w, lifted, call, push)
+	local si, so = {}, {}
+	for n in spairs(lifted) do
+		si[#si + 1] = ("sh:aset(%q, %s); "):format(n, lname(n))
+		so[#so + 1] = ("%s = sh:aget(%q); "):format(lname(n), n)
+	end
+	local ln = (w.src or ""):find("LINENO", 1, true) and ("sh.cur_line = %d; "):format(EF.cur_line or 0) or ""
+	return ("do %s%slocal __f = %s(sh, %s[1]); %sif __f then %s else __a = false end end"):format(
+		table.concat(si), ln, call, EF.konst({ ser(w) }), table.concat(so), push)
+end
+-- `assign`: a declaration builtin's argv (export/declare/typeset/readonly/local): a word
+-- after the first whose leading literal is `NAME=`/`NAME+=` is an ASSIGNMENT word (interp's
+-- expand_args is_assign) — one field, no split/glob, tilde after `=`/`:`.
+local function field_argv(words, from, lifted, wrap, prefix, guard_ok, assign)
 	local out = { prefix and ("local __a = {" .. prefix .. "}") or "local __a = {}" }
 	-- a long run of plain literal words (`printf x {1..70000}`) becomes ONE constant table:
 	-- one statement per word overflows LuaJIT's jump range (as for-in lists do)
@@ -3025,7 +3042,19 @@ local function field_argv(words, from, lifted, wrap, prefix, guard_ok)
 	for j = from, #words do
 		local w = words[j]
 		local lit = w.plain and w.parts[1].lit
-		if lit and lit ~= "" then -- (a plain unquoted literal — `{1..70000}`'s words: as is)
+		local p1 = w.parts[1]
+		if assign and j > 1 and p1 and p1.lit and p1.lit:match("^[%a_][%w_]*%+?=") then
+			flush_run()
+			if emitable_word(w) and not (w.src or ""):find("~", 1, true) then
+				out[#out + 1] = ("__a[#__a+1] = rt.cstr(%s)"):format(emit_word(w, lifted))
+			elseif not guard_ok or fb_unsafe(w) then
+				return nil
+			else
+				out[#out + 1] = fb_step(w, lifted, "rt.assign_word", "__a[#__a+1] = rt.cstr(__f)")
+				out[#out + 1] = "if __a then"
+				opens = opens + 1
+			end
+		elseif lit and lit ~= "" then -- (a plain unquoted literal — `{1..70000}`'s words: as is)
 			run[#run + 1] = ("%q"):format(lit)
 		elseif not empty_word(w) then -- an empty brace alternative ({X,,Y,}) adds no arg
 			if word_safe(w) or arith_guard(w) or field_word(w, lifted) or seg_native(w, lifted)
@@ -3042,17 +3071,8 @@ local function field_argv(words, from, lifted, wrap, prefix, guard_ok)
 				return nil
 			else
 				flush_run()
-				-- lifted locals are the authoritative values: flush them to sh for the expander
-				-- (a $(…) body may read any of them), reload after (`${x:=v}`, `$((x=1))` write)
-				local si, so = {}, {}
-				for n in spairs(lifted) do
-					si[#si + 1] = ("sh:aset(%q, %s); "):format(n, lname(n))
-					so[#so + 1] = ("%s = sh:aget(%q); "):format(lname(n), n)
-				end
-				local ln = (w.src or ""):find("LINENO", 1, true) and ("sh.cur_line = %d; "):format(EF.cur_line or 0) or ""
 				local W = wrap and wrap:format("__f[__i]") or "__f[__i]"
-				out[#out + 1] = ("do %s%slocal __f = rt.word_fields(sh, %s[1]); %sif __f then for __i=1,#__f do __a[#__a+1]=%s end else __a = false end end"):format(
-					table.concat(si), ln, EF.konst({ ser(w) }), table.concat(so), W)
+				out[#out + 1] = fb_step(w, lifted, "rt.word_fields", ("for __i=1,#__f do __a[#__a+1]=%s end"):format(W))
 				out[#out + 1] = "if __a then"
 				opens = opens + 1
 			end
@@ -4904,6 +4924,7 @@ simple_compiled = function(cx, st, after)
 	if cmd == "local" and cx.toplevel then -- (outside a function: interp's error — unless a
 		return cx.delegate(st, after) -- function is sourcing this file)
 	end
+	local local_nonplain = false
 	if as_local then
 		-- (readonly / set -a are handled per-name at runtime by sh:localAssign — a
 		-- readonly operand fails with $?=1, a set -a local is exported — so no
@@ -4933,7 +4954,7 @@ simple_compiled = function(cx, st, after)
 			end
 		end
 		if not plain and not flagsonly then
-			return cx.delegate(st, after)
+			local_nonplain = true -- (the general declaration path below, decl_gen — or delegate)
 		end
 	end
 	-- `unset map["$key"]`: the quoted subscript parts must not be expanded twice — interp's
@@ -5020,7 +5041,7 @@ simple_compiled = function(cx, st, after)
 	-- word-split (export/declare/readonly/local/typeset), code/control-flow builtins
 	-- (eval/source/./command/builtin/exit/return/break/continue). exec_stmt sets $_ to
 	-- the last arg; replicate that. Prefix-env (`x=v cmd`) keeps interp's tempenv binding.
-	-- `wait` needs interp's job-control context, so it still delegates. A REDIRECTED builtin
+	-- (`wait` runs here too: b_wait keeps the job table in sh.) A REDIRECTED builtin
 	-- IS compiled below (install redirs, run, flush-before-restore, honor a flagged write error).
 	local EXEC_SIMPLE_SKIP = {
 		export = 1,
@@ -5038,7 +5059,6 @@ simple_compiled = function(cx, st, after)
 		["break"] = 1,
 		["continue"] = 1,
 		exec = 1,
-		wait = 1,
 	}
 	-- Declaration builtins normally delegate because a LITERAL `name=value` arg must
 	-- expand its value in assignment context (no word-split/glob, tilde after =) —
@@ -5090,6 +5110,30 @@ simple_compiled = function(cx, st, after)
 				break
 			end
 		end
+	end
+	-- decl_gen: the GENERAL declaration-builtin path — any export/declare/typeset/readonly/
+	-- local the specialized paths (the native `local` registers, the top-level literal path
+	-- below, decl_native) don't take: argv built as interp's expand_args does (an assignment
+	-- word expands in assignment context — rt.assign_word when emit_word can't — the rest
+	-- split/glob), then b_export/b_local via rt.builtin, calldepth bumped in a function so
+	-- declare/typeset/local localize exactly as under delegation. An array value
+	-- (st.arrayargs), a prefix env, or a function by that name keep delegating.
+	local decl_gen = false
+	if (DECL_BUILTIN[cmd] or cmd == "local") and st.assigns == nil and not st.arrayargs and not isfunc
+		and not (cmd == "local" and cx.toplevel) and not decl_native then
+		if local_nonplain or not as_local then
+			decl_gen = true
+		else
+			for j = 2, #st.words do
+				if not emitable_word(st.words[j]) then
+					decl_gen = true
+					break
+				end
+			end
+		end
+	end
+	if local_nonplain and not decl_gen then
+		return cx.delegate(st, after)
 	end
 	-- Top-level declaration builtin WITH a literal `name=value` arg (`export FOO=bar`,
 	-- `declare -i n=5`, `export PATH=$PATH:/x`): build argv statically, expanding each
@@ -5254,22 +5298,23 @@ simple_compiled = function(cx, st, after)
 	if
 		cmd
 		and st.assigns == nil
-		and not NATIVE_BUILTIN[cmd]
+		and (not NATIVE_BUILTIN[cmd] or decl_gen)
 		and not isfunc
-		and (not EXEC_SIMPLE_SKIP[cmd] or decl_native)
+		and (not EXEC_SIMPLE_SKIP[cmd] or decl_native or decl_gen)
 		and require("interp").BUILTINS[cmd]
 	then
-		local builder, bg = field_argv(st.words, 1, cx.lifted, "rt.cstr(%s)", nil, true) -- argv entries are C strings (cut at NUL, like interp's expand_args)
+		local builder, bg = field_argv(st.words, 1, cx.lifted, "rt.cstr(%s)", nil, true, decl_gen) -- argv entries are C strings (cut at NUL, like interp's expand_args)
 		if builder then
 			local p = cx.newpc()
 			local ec = errchk(st)
 			local ecs = ec ~= "" and ("; " .. ec) or ""
 			local d = dbg(st) -- DEBUG fires before the command and its expansions
 			local lastarg = "if #__a > 0 then sh:set_str('_', __a[#__a]) end" -- $_ = last arg (bash)
+				.. (EF.pipestatus and '; sh:array_assign("PIPESTATUS", {tostring(sh.status)}, false)' or "")
 			-- In-function declare/typeset: bump calldepth (save/restore) so b_export
 			-- localizes each name, exactly as the delegate's cf-wrapper does. Elsewhere
 			-- (top level, other builtins) this is a plain dispatch.
-			local bcall = (decl_in_fn or (not cx.toplevel and not cx.topcode and (cmd == "command" or cmd == "builtin")))
+			local bcall = ((decl_in_fn or decl_gen or cmd == "command" or cmd == "builtin") and not cx.toplevel and not cx.topcode)
 					and "do local __sc = sh.calldepth; if (sh.calldepth or 0) < 1 then sh.calldepth = 1 end; rt.builtin(sh, __a, __noop); sh.calldepth = __sc end"
 				or "rt.builtin(sh, __a, __noop)"
 			if redir_apply then
@@ -5300,6 +5345,9 @@ simple_compiled = function(cx, st, after)
 			end
 			return p
 		end
+	end
+	if decl_gen then -- (an argv word the builder refused: $FUNCNAME/…)
+		return cx.delegate(st, after)
 	end
 	-- FIELD-ENGINE path: an argument word-splits or globs, so argv is variable
 	-- length. Commands with a STATIC dispatch (echo, test/[, a named external, a

@@ -6173,6 +6173,23 @@ function M.word_fields(sh, w)
 	end
 	error(f, 0)
 end
+-- An assignment word's value (`declare NAME=word`: interp's expand_assign_word — no
+-- split/glob, tilde after = and :), with rt.word_fields' error containment.
+function M.assign_word(sh, w)
+	local ok, f = pcall(require("interp").expand_assign_word, sh, w, true)
+	if ok then
+		return f
+	end
+	if type(f) == "table" and f.__curse_experr and not f.__curse_lineabort then
+		M.posix_arith_fatal(sh, f)
+		sh.status = 1
+		if sh.opt_e then
+			error({ __curse_exit = 1 })
+		end
+		return nil
+	end
+	error(f, 0)
+end
 function M.posix_arith_fatal(sh, err)
 	if sh.opt_posix and not sh.opt_i and err.__curse_matherr then
 		error({ __curse_exit = sh.opt_c and 127 or 1 }, 0)
