@@ -6095,6 +6095,16 @@ end
 -- A builtin assigning to a NAME it was given (read, printf -v, …): a plain name or an array
 -- element; anything else is `cmd: `A[]]': not a valid identifier` (status 1). false = refused.
 function M.assign_ref(sh, cmd, ref, value)
+	-- (the common case, fast — `while read a b`, `printf -v s`, getopts: a plain name whose
+	-- variable, if any, has no attribute, array or nameref — is just a string set)
+	local b = sh.vars[ref]
+	if b == nil then
+		if ref:find("^[%a_][%w_]*$") then
+			return sh:set_str(ref, value) ~= false
+		end
+	elseif not (b.ro or b.ref or b.arr or b.int or b.lower or b.upper or b.cap) then
+		return sh:set_str(ref, value) ~= false
+	end
 	local name, sub = M.split_array_ref(ref, sh)
 	if not name then
 		io.stderr:write("curse: " .. cmd .. ": `" .. ref .. "': not a valid identifier\n")
