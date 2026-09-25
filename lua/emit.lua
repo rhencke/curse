@@ -7420,6 +7420,10 @@ H.subshell = function(cx, st, after)
 			end
 			-- (its text: the report if a signal kills it)
 			local stx = ("%q"):format(require("deparse").command_text(st))
+			-- (bash waits for the forked child as a one-process job: setjstatus → PIPESTATUS)
+			if EF.pipestatus then
+				swpost = swpost .. '; sh:array_assign("PIPESTATUS", {tostring(sh.status)}, false)'
+			end
 			if sub_redir then
 				cx.blocks[p] = ("%slocal __rs = {}; if %s then sh:subshell_run(__CS[%d], __rs, %s) else rt.redir_restore(__rs); sh.status = 1 end%s%s; pc = %d"):format(
 					swpre, sub_redir, id, stx, swpost, ecs, after)
@@ -8911,10 +8915,14 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
 			-- only (never in a hot loop body). opt_n is off until `set -n` actually runs.
 			-- (a later syntax error is still reported: noexec reads the input — it resumes there)
 			local nxp = nxperr[k + 1] or cx.DONE
+			-- (a line group's start: the parser read a new input line — notify_and_cleanup
+			-- deletes the dead jobs `wait`/`jobs` reported: rt.job_waited)
+			local jw = stmts[k].lgstart and "if sh.jobs_waited then rt.jobs_cleanup_waited(sh) end; " or ""
 			if stmts[k].t == "parse_error" then
 				cx.blocks[mark[k]] = ("sh._ff = %d; %spc = %d"):format(ff, wbs, cx.stmtPc[k])
 			else
-				cx.blocks[mark[k]] = ("if sh.opt_n then pc = %d else sh._ff = %d; %spc = %d end"):format(
+				cx.blocks[mark[k]] = ("%sif sh.opt_n then pc = %d else sh._ff = %d; %spc = %d end"):format(
+					jw,
 					nxp,
 					ff,
 					wbs,

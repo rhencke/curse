@@ -17,6 +17,102 @@ local do_arrayassign, eval, fmt_decl, fmt_set_var = I.do_arrayassign, I.eval, I.
 local C, P = I.C, I.P
 local rl_capture, rl_lib = I.rl_capture, I.rl_lib
 
+-- readline's state is PROCESS-global, and `bind` changes it in place; a subshell, $(…) or
+-- pipeline stage runs in-process here, where bash's would be a forked child whose bindings
+-- die with it. So the first change inside such a context snapshots the state — every
+-- keymap reachable from the emacs/vi roots (entries copied; a macro's text re-duplicated,
+-- since readline frees a macro it rebinds), the variables, the current keymap, the
+-- curse-side -x table — and the context's end (rt iso_undo → ctx.rl) puts it back.
+pcall(ffi.cdef, [[
+  typedef struct { char type; void *function; } curse_kment;
+  curse_kment *rl_get_keymap_by_name(const char *);
+  curse_kment *rl_get_keymap(void);
+  void rl_set_keymap(curse_kment *);
+  char *rl_variable_value(const char *);
+  int rl_variable_bind(const char *, const char *);
+  char *strdup(const char *);
+]])
+local function deepcopy(t)
+	if type(t) ~= "table" then
+		return t
+	end
+	local c = {}
+	for k, v in pairs(t) do
+		c[k] = deepcopy(v)
+	end
+	return c
+end
+local function rl_snapshot(sh, rl)
+	local maps, seen = {}, {}
+	local function walk(km)
+		if km == nil then
+			return
+		end
+		local key = tostring(ffi.cast("uintptr_t", km))
+		if seen[key] then
+			return
+		end
+		seen[key] = true
+		local copy, macros = ffi.new("curse_kment[257]"), {}
+		ffi.copy(copy, km, ffi.sizeof("curse_kment") * 257)
+		maps[#maps + 1] = { km = km, copy = copy, macros = macros }
+		for i = 0, 256 do
+			local e = km[i]
+			if e.type == 1 then
+				walk(ffi.cast("curse_kment *", e["function"]))
+			elseif e.type == 2 and e["function"] ~= nil then
+				macros[i] = ffi.string(ffi.cast("const char *", e["function"]))
+			end
+		end
+	end
+	for _, n in ipairs({ "emacs-standard", "vi-move", "vi-insert" }) do
+		walk(rl.rl_get_keymap_by_name(n))
+	end
+	local vars = {}
+	for _, l in ipairs(rl_capture(function(r)
+		r.rl_variable_dumper(1)
+	end) or {}) do
+		local name, val = l:match("^set (%S+) (.*)$")
+		if name then
+			vars[#vars + 1] = { name, val }
+		end
+	end
+	local cur, bx = rl.rl_get_keymap(), sh.bind_x
+	sh.bind_x = deepcopy(bx) -- (the -x table: the context changes its own copy)
+	return function()
+		for _, m in ipairs(maps) do
+			ffi.copy(m.km, m.copy, ffi.sizeof("curse_kment") * 257)
+			for i, txt in pairs(m.macros) do
+				m.km[i]["function"] = C.strdup(txt)
+			end
+		end
+		for _, v in ipairs(vars) do
+			local now = rl.rl_variable_value(v[1])
+			if now == nil or ffi.string(now) ~= v[2] then
+				rl.rl_variable_bind(v[1], v[2])
+			end
+		end
+		rl.rl_set_keymap(cur)
+		sh.bind_x = bx
+	end
+end
+-- (before a change: in an in-process subshell context, snapshot once per context)
+local function rl_touch(sh)
+	local ctx = rt.iso_cur(sh)
+	if ctx and not ctx.rl then
+		local rl = rl_lib()
+		if rl then
+			ctx.rl = rl_snapshot(sh, rl)
+		else
+			local bx = sh.bind_x
+			sh.bind_x = deepcopy(bx)
+			ctx.rl = function()
+				sh.bind_x = bx
+			end
+		end
+	end
+end
+
 return function(sh, cmd, args, hook, tcb)
 	if cmd == "bind" then
 		-- readline introspection + binding via FFI (same library bash links ->
@@ -66,6 +162,9 @@ return function(sh, cmd, args, hook, tcb)
 					sh:echo(l)
 				end
 			end
+		end
+		if a == "-x" or a == "-r" or (a and a:sub(1, 1) ~= "-") then -- (a change)
+			rl_touch(sh)
 		end
 		if a == "-x" then -- bind a key sequence to a shell command: -x '"KEYSEQ": CMD'
 			local seq, command = (args[j + 1] or ""):match('^%s*"(.-)"%s*:%s*(.*)$')

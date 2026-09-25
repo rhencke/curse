@@ -6858,6 +6858,8 @@ exec_stmt = function(sh, st, hook)
 		if not ok then
 			error(err, 0)
 		end
+		-- (bash waits for the forked child as a one-process job: setjstatus → PIPESTATUS)
+		sh:array_assign("PIPESTATUS", { tostring(sh.status) }, false)
 	elseif t == "background" then
 		-- cmd & : runs IN-PROCESS as a background task (rt: Shell:bg_launch) — a subshell
 		-- the scheduler runs whenever the shell waits; $! is its virtual pid, status 0.
@@ -7312,6 +7314,9 @@ run_trap = function(sh, code)
 		end
 		trap_seen[code] = true
 	end
+	if sh.jobs_waited then -- (the handler is parse_and_execute'd: reading it cleans up — rt.job_waited)
+		rt.jobs_cleanup_waited(sh)
+	end
 	local stmts, k = mod and {} or P.parse(code, sh).stmts, 0 -- (sh: aliases expand, bash)
 	local function body()
 		if mod then -- (a line abort is contained by run_compiled: the rest of that line is skipped)
@@ -7581,6 +7586,9 @@ end
 -- Run one logical line (a parser group) the way the shell runs its own input.
 local function run_group(sh, lg, hook, k)
 	sh.cmd_number = (sh.cmd_number or 0) + 1 -- (the prompt's \#)
+	if sh.jobs_waited then -- (reading a line: notify_and_cleanup — rt.job_waited)
+		rt.jobs_cleanup_waited(sh)
+	end
 	-- bash parses a whole LOGICAL LINE (a `simple_list` up to a top-level newline)
 	-- before executing any of it, so a syntax error ANYWHERE on the line means the
 	-- line runs nothing (retroactive). Handle that first.
