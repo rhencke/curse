@@ -363,6 +363,11 @@ local function modcache_put(path, m)
 	if modcache_n >= MODCACHE_CAP then modcache_old, modcache, modcache_n = modcache, {}, 0 end
 	modcache[path] = m; modcache_n = modcache_n + 1
 end
+-- (test hook: forget this worker's modules, so the next run loads from the disk cache —
+-- test_cache checks a warm run really executes the stored artifact)
+function M.drop_modcache()
+	modcache, modcache_old, modcache_n = {}, {}, 0
+end
 
 -- A compiled module bakes in the alias expansion a from-scratch parse would do. If the
 -- shell STARTS with aliases already in play (`-O expand_aliases`, or aliases from an rc/
