@@ -479,7 +479,11 @@ local function rl_capture(dumpfn)
 	if not rl then
 		return nil
 	end
-	local tmp = os.tmpname()
+	local tfd, tmp = rt.mktmpfd() -- (mode 0600 whatever the umask; see rt.mktmpfd)
+	if tfd < 0 then
+		return nil
+	end
+	C.close(tfd)
 	local f = C.fopen(tmp, "w")
 	if f == nil then
 		os.remove(tmp)

@@ -1691,6 +1691,39 @@ function M.ropen(path, flags, mode)
 	end
 	return fd
 end
+ffi.cdef([[
+  int curse_rt_mkstemp(char *tmpl) asm("mkstemp");
+  int curse_rt_fchmod(int fd, unsigned int mode) asm("fchmod");
+  int curse_rt_unlink(const char *path) asm("unlink");
+]])
+-- A private temp file for the shell's own plumbing (a big here-document's body, an
+-- fd-level $(...) capture): mkstemp in $TMPDIR when that's a writable directory (bash's
+-- get_tmpdir with MT_USETMPDIR), else /tmp. Returns the O_RDWR creating fd (moved to
+-- >= FD_BASE, close-on-exec) and the path, or -1 with errno set. The file is mode 0600
+-- whatever the umask (bash fchmods its here-document file the same way): under
+-- `umask 777` mkstemp's file is mode 000, and any reopen by name fails with EACCES.
+-- The CALLER unlinks the path as soon as it no longer needs the name.
+-- (Not os.tmpname: that creates and CLOSES a named /tmp/lua_XXXXXX the caller must
+-- remember to remove on every path, raises on failure, and ignores $TMPDIR — the capture
+-- path leaked one such file per `$(…)` whose reopen hit a restrictive umask.)
+function M.mktmpfd()
+	local dir = os.getenv("TMPDIR")
+	if not dir or dir:sub(1, 1) ~= "/" or #dir > 4000 or C.access(dir, 3) ~= 0 then -- W_OK|X_OK
+		dir = "/tmp"
+	end
+	local tmpl = dir:gsub("/+$", "") .. "/curse-XXXXXX"
+	local buf = ffi.new("char[?]", #tmpl + 1, tmpl)
+	local fd = C.curse_rt_mkstemp(buf)
+	if fd < 0 and dir ~= "/tmp" then
+		buf = ffi.new("char[?]", 18, "/tmp/curse-XXXXXX")
+		fd = C.curse_rt_mkstemp(buf)
+	end
+	if fd < 0 then
+		return -1
+	end
+	C.curse_rt_fchmod(fd, 384) -- 0600
+	return fd_hi(fd), ffi.string(buf)
+end
 local _temp_fd
 do
 local _hd_pipe = ffi.new("int[2]")
@@ -1713,23 +1746,34 @@ _temp_fd = function(content) -- the body on an O_RDONLY fd
 		C.close(w)
 		return r
 	end
-	-- (-1 with errno set on failure, never a raise: os.tmpname raises when mkstemp fails —
-	-- fd exhaustion — and a Lua error would escape the redirection as a traceback)
-	local okt, tmp = pcall(os.tmpname)
-	if not okt then
+	-- bash's here_document_to_fd: create the file (0600 via fchmod, so a restrictive umask
+	-- — `umask 777` makes mkstemp's file mode 000 — can't block the reopen below), write
+	-- the body through the creating fd, reopen it O_RDONLY, unlink it, close the writer.
+	-- (-1 with errno set on failure, never a raise.)
+	local w, path = M.mktmpfd()
+	if w < 0 then
 		return -1
 	end
-	local w, _, e = io.open(tmp, "w")
-	if not w then
-		os.remove(tmp)
-		ffi.errno(e or 0)
-		return -1
+	local e = 0
+	local off, n = 0, #content
+	while off < n do
+		local k = tonumber(C.curse_co_write(w, ffi.cast("const char *", content) + off, n - off))
+		if k < 0 then
+			if ffi.errno() ~= 4 then
+				e = ffi.errno()
+				break
+			end
+		else
+			off = off + k
+		end
 	end
-	w:write(content)
-	w:close()
-	local f = C.open(tmp, 0, 0) -- O_RDONLY
-	e = ffi.errno()
-	os.remove(tmp) -- the open fd keeps the inode alive
+	local f = -1
+	if e == 0 then
+		f = C.open(path, 0, 0) -- O_RDONLY
+		e = f < 0 and ffi.errno() or 0
+	end
+	C.curse_rt_unlink(path) -- the open fd keeps the inode alive
+	C.close(w)
 	ffi.errno(e)
 	return f
 end
@@ -2904,14 +2948,16 @@ function Shell:capture_inproc(backtick, runner, capfd, ctx)
 	local buf, tmp, save1
 	if capfd then
 		io.flush()
-		tmp = os.tmpname()
-		local tfd = C.open(tmp, 577, 384) -- O_WRONLY|O_CREAT|O_TRUNC, 0600
+		-- (the sink is unlinked at once — nothing can be left behind — and read back
+		-- through the creating fd `tmp`, which shares fd 1's file offset: rewind, read)
+		local tfd, tpath = M.mktmpfd()
 		if tfd < 0 then
 			capfd = false
 		else
+			C.curse_rt_unlink(tpath)
+			tmp = tfd
 			save1 = M.save_fd(1)
 			C.dup2(tfd, 1)
-			C.close(tfd)
 		end
 	end
 	local sv_sink = self.cap_sink
@@ -2981,13 +3027,18 @@ function Shell:capture_inproc(backtick, runner, capfd, ctx)
 		if not capfd then
 			return table.concat(buf)
 		end
-		local f = io.open(tmp, "r")
-		local c = f and f:read("*a") or ""
-		if f then
-			f:close()
+		local parts, rb = {}, ffi.new("char[65536]")
+		C.curse_rt_lseek(tmp, 0, 0) -- SEEK_SET
+		while true do
+			local k = tonumber(C.read(tmp, rb, 65536))
+			if k > 0 then
+				parts[#parts + 1] = ffi.string(rb, k)
+			elseif k == 0 or ffi.errno() ~= 4 then
+				break
+			end
 		end
-		os.remove(tmp)
-		return c
+		C.close(tmp)
+		return table.concat(parts)
 	end
 	if not ok then
 		if type(err) == "table" and err.__curse_parseerr then

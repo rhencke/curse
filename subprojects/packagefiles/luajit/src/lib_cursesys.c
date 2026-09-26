@@ -34,6 +34,7 @@ extern char dup2[];
 extern char endpwent[];
 extern char execve[];
 extern char fchdir[];
+extern char fchmod[];
 extern char fclose[];
 extern char fcntl[];
 extern char flock[];
@@ -73,6 +74,7 @@ extern char lstat[];
 extern char malloc[];
 extern char mbrtowc[];
 extern char mkdir[];
+extern char mkstemp[];
 extern char mmap[];
 extern char nl_langinfo[];
 extern char open[];
@@ -166,6 +168,7 @@ static const curse_sym_t curse_syms[] = {
   { "endpwent", (void*)endpwent },
   { "execve", (void*)execve },
   { "fchdir", (void*)fchdir },
+  { "fchmod", (void*)fchmod },
   { "fclose", (void*)fclose },
   { "fcntl", (void*)fcntl },
   { "flock", (void*)flock },
@@ -205,6 +208,7 @@ static const curse_sym_t curse_syms[] = {
   { "malloc", (void*)malloc },
   { "mbrtowc", (void*)mbrtowc },
   { "mkdir", (void*)mkdir },
+  { "mkstemp", (void*)mkstemp },
   { "mmap", (void*)mmap },
   { "nl_langinfo", (void*)nl_langinfo },
   { "open", (void*)open },
