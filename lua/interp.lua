@@ -2503,22 +2503,10 @@ expand_fields_full = function(sh, w, pre1) -- pre1: part 1 already expanded (a $
 	-- while literal/quoted chars are never delimiters. This is what bash does, and
 	-- it handles concatenation ($x-, pre$x) and custom IFS correctly. Fields also
 	-- track `unq` for glob eligibility (quoted glob chars stay literal).
-	local ifs = (rt.ifs(sh) or " \t\n")
-	-- IFS is a SET of characters; a delimiter may be multibyte (`IFS=ç`), so index by
-	-- whole codepoint, not byte (byte-indexing splits ç's two bytes as two delimiters).
-	-- Memoize the parse keyed on the IFS string: it changes rarely but this runs per
-	-- word, and rt.mb_chars uses per-char mbrtowc FFI calls — costly in a hot loop.
-	local ic = sh._ifscache
-	if not ic or ic.ifs ~= ifs or ic.lg ~= rt.locale_gen then -- (a locale change re-splits `é`)
-		local set = {}
-		for _, ch in ipairs(rt.mb_chars(ifs)) do
-			set[ch.s] = true
-		end
-		ic = { ifs = ifs, set = set, mbifs = rt.lc_mb_cur_max() > 1 and ifs:find("[\128-\255]") ~= nil,
-			lg = rt.locale_gen } -- any multibyte IFS char?
-		sh._ifscache = ic
-	end
-	local ifsset, mbifs = ic.set, ic.mbifs
+	-- IFS is a SET of characters; a delimiter may be multibyte (`IFS=ç`), so it is
+	-- indexed by whole codepoint (rt.ifs_charset: memoized per IFS string and locale).
+	local ic = rt.ifs_charset(sh)
+	local ifs, ifsset, mbifs = ic.ifs, ic.set, ic.mbifs
 	local function isws(c) -- IFS whitespace only (subst.c ifs_whitespace): other whitespace is text
 		return (c == " " or c == "\t" or c == "\n") and ifsset[c]
 	end
@@ -5566,7 +5554,8 @@ end
 local procsub_mark = rt.procsub_mark
 -- Process-substitution cleanup, run after the command a <()/>() was attached to: close
 -- the shell's end of each pipe it created (a >(cmd) then sees EOF; an unread <(cmd)
--- writer gets EPIPE) and reap the child. Only entries added since the mark.
+-- writer gets EPIPE) and reap the child. Only entries added since the mark. (np, the
+-- mark's first half, is always 0 and unused: procsub_mark's pair is kept for callers.)
 local function drain_procsub(sh, np, nf)
 	nf = nf or 0
 	local files = sh.procsub_files
@@ -5574,7 +5563,6 @@ local function drain_procsub(sh, np, nf)
 		return
 	end
 	io.flush()
-	local stbuf = ffi.new("int[1]")
 	for i = nf + 1, #files do
 		C.close(files[i].fd)
 		rt.fd_owner[files[i].fd] = nil
@@ -5582,12 +5570,9 @@ local function drain_procsub(sh, np, nf)
 	sh.procsub_status = {} -- (the latest ones, for a later `wait $!`)
 	for i = nf + 1, #files do
 		local g = files[i].g
-		if g then -- (in-process)
+		if g then -- (no g: its launch failed — nothing ran, nothing to reap)
 			rt.wait_groups({ g })
 			sh.procsub_status[files[i].pid] = g.status[1] or 0
-		else
-			rt.wait_child(files[i].pid, stbuf, 0)
-			sh.procsub_status[files[i].pid] = rt.wexit(stbuf[0])
 		end
 	end
 	for i = #files, nf + 1, -1 do
