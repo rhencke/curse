@@ -15244,6 +15244,7 @@ end
 -- or subscript the compiled word engine can't render, a side-effecting arith value, HISTSIZE/
 -- HISTFILESIZE, the readonly specials SHELLOPTS/BASHOPTS). The value expands through the
 -- shared one-word expander, the arithmetic through the evaluator; `st` is the assignment.
+-- True when it assigned (a rejected one returns nothing, or raises).
 -- (M.IX: interp, bound on first use — interp requires this module. Fields, not locals: this
 -- chunk is at LuaJIT's 200-local limit.)
 -- The store (assign_full runs it under pcall): closure-free — every interpreted `x=…` in a
@@ -15311,7 +15312,6 @@ function M.assign_full(sh, st)
 		M.IX = IX
 	end
 	local ncs0 = sh.ncs
-	local pnf = sh.procsub_files and #sh.procsub_files or 0
 	if st.name == "SHELLOPTS" or st.name == "BASHOPTS" then -- readonly specials (bash)
 		io.stderr:write("curse: " .. st.name .. ": readonly variable\n")
 		M.report_exit(sh) -- (err_readonly: report_error)
@@ -15348,6 +15348,7 @@ function M.assign_full(sh, st)
 					if not ok then
 						error(e, 0)
 					end
+					return e
 				end
 				return
 			elseif nb.outer and nb.s:find("[", 1, true) then -- (`local -n a='a[0]'`: bash
@@ -15447,10 +15448,7 @@ function M.assign_full(sh, st)
 	-- (sh.ncs counts substitutions performed — also ones nested in ${…}, a subscript)
 	sh.status = sh.ncs ~= ncs0 and sh.last_cmdsub_status or 0
 	sh:set_str("_", "") -- a bare assignment resets $_ to empty (bash)
-	sh:array_assign("PIPESTATUS", { tostring(sh.status) }, false) -- (PIPESTATUS: this null command's status)
-	if sh.procsub_files then -- (`x=<(…)`: a null command closes its <() when it ends)
-		M.assign_drain(sh, st, pnf)
-	end
+	return true -- (done: the caller's PIPESTATUS and <() drain follow)
 end
 -- HISTSIZE shrinks the in-memory history; HISTFILESIZE truncates $HISTFILE — both to the
 -- last N entries, on assignment (bash)

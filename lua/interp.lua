@@ -5751,7 +5751,13 @@ exec_stmt = function(sh, st, hook)
 	end -- $LINENO: frozen at the trapped line for the trap's own commands (not in a
 	-- function the trap calls, whose lines count as usual — bash)
 	if t == "assign" then
-		rt.assign_full(sh, st)
+		local pnf = sh.procsub_files and #sh.procsub_files or 0
+		if rt.assign_full(sh, st) then
+			sh:array_assign("PIPESTATUS", { tostring(sh.status) }, false) -- (this null command's status)
+			if sh.procsub_files then -- (`x=<(…)`: a null command closes its <() when it ends)
+				rt.assign_drain(sh, st, pnf)
+			end
+		end
 	elseif t == "arrayassign" then
 		if sh.opt_x and st.raw then -- (bash traces an array literal as written: `+ a=(1 "b c")`)
 			xtrace_line(sh, st.name .. (st.append and "+=" or "=") .. rt.srcw(st.raw))
