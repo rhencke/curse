@@ -2663,88 +2663,56 @@ function Shell:exec_t(args)
 	end
 end
 
--- A `$(…)` body is "pure" (no shell-state side effects, so safe to run in-process
--- for speed) when every command is a plain external/non-mutating-builtin call with
--- no assignments, no mutating builtin, no user-function call, and no control flow.
--- Anything else runs fully isolated (capture_compiled_iso). (A file redirect like `>f` is fine — the
--- write happens either way; only `exec` rewires shell fds, and it's listed here.)
-local CAPTURE_IMPURE = {
-	cd = 1,
-	set = 1,
-	shopt = 1,
-	unset = 1,
-	export = 1,
-	declare = 1,
-	typeset = 1,
-	["local"] = 1,
-	readonly = 1,
-	trap = 1,
-	umask = 1,
-	exec = 1,
-	eval = 1,
-	source = 1,
-	["."] = 1,
-	pushd = 1,
-	popd = 1,
-	hash = 1,
-	shift = 1,
-	read = 1,
-	mapfile = 1,
-	readarray = 1,
-	let = 1,
-	getopts = 1,
-	ulimit = 1,
-	disown = 1,
-	["return"] = 1,
-	["set-o"] = 1,
-	history = 1, -- (`set -o history`: the list is subshell state)
-	fc = 1,
-	complete = 1, -- (completion specs, and compgen's hostname list / -F functions)
-	compopt = 1,
-	compgen = 1,
-	bind = 1, -- (readline's keymaps/variables: b_bind snapshots them per isolation context)
-}
-local function capture_pure(sh, st)
+-- Is a `$(…)` body PURE — no shell-state side effect to leak, so it may run with only
+-- capture_inproc's light $() state instead of the full checkpoint (capture_compiled_iso)?
+-- The ONE authority: emit asks it at compile time (fns = the program's funcflags),
+-- capture_src at run time (fns = sh.functions). Pure iff the text never reads the
+-- per-subshell $BASHPID/$RANDOM and every command (through && || and pipelines) is a
+-- simple command with no assignment and no redirection (a builtin's redirected output
+-- needs the fd-level capture), whose literal name is no function and is an external — a
+-- separate process — or a builtin that can't touch the shell (printf without -v).
+-- Anything else (`command cd`, `builtin set`, a function, a compound) is isolated;
+-- missing a builtin here only costs the checkpoint, never correctness.
+local PURE_CMDSUB_BUILTIN = { echo = 1, printf = 1, ["true"] = 1, ["false"] = 1, [":"] = 1, pwd = 1,
+	test = 1, ["["] = 1, exit = 1 }
+local function cmdsub_pure_st(st, fns)
 	local t = st.t
-	if t == "andor" then
-		for _, it in ipairs(st.items) do
-			if not capture_pure(sh, it.cmd) then
+	if t == "andor" or t == "pipeline" then
+		for _, it in ipairs(st.items or st.cmds) do
+			if not cmdsub_pure_st(it.cmd or it, fns) then
 				return false
-			end
-		end
-		return true
-	elseif t == "pipeline" then
-		for _, c in ipairs(st.cmds) do
-			if not capture_pure(sh, c) then
-				return false
-			end
-		end
-		return true
-	elseif t == "simple" then
-		if st.assigns or st.arrayargs then
-			return false
-		end -- prefix/array assignment mutates
-		local w = st.words and st.words[1]
-		local lit = w and w.parts and #w.parts == 1 and w.parts[1].lit
-		if not lit then
-			return false
-		end -- dynamic/compound command name: be safe, isolate
-		if CAPTURE_IMPURE[lit] or sh.functions[lit] then
-			return false
-		end
-		-- (`2>&1` dups fd 1 at the fd level: only the fd-level capture of the isolated
-		-- path sees a builtin's diagnostics there)
-		local rs = st.redirs
-		if rs then
-			for k = 1, #rs do
-				if rs[k].op == "dup" and rs[k].fd == 2 then
-					return false
-				end
 			end
 		end
 		return true
 	end
-	return false -- if/while/for/case/subshell/group/funcdef/background/arithcmd: isolate
+	if t ~= "simple" or st.assigns or st.arrayargs or st.redirs then
+		return false
+	end
+	local w = st.words and st.words[1]
+	local c = w and w.parts and #w.parts == 1 and w.parts[1].lit
+	if not c or fns[c] or not (PURE_CMDSUB_BUILTIN[c] or not M.BUILTINS[c]) then
+		return false
+	end
+	if c == "printf" then
+		for j = 2, #st.words do
+			local p1 = st.words[j].parts[1]
+			if p1 and p1.lit == "-v" then
+				return false -- (printf -v NAME writes a variable)
+			end
+		end
+	end
+	return true
+end
+function M.cmdsub_pure(stmts, fns, src)
+	if src:find("BASHPID", 1, true) or src:find("RANDOM", 1, true) then
+		return false
+	end
+	for _, st in ipairs(stmts) do
+		if not cmdsub_pure_st(st, fns) then
+			return false
+		end
+	end
+	return true
 end
 
 function Shell:capture_src(src, backtick, noalias, line0)
@@ -2809,10 +2777,8 @@ function Shell:capture_src(src, backtick, noalias, line0)
 		end
 	end
 	-- Full subshell isolation (checkpoint/restore, in-process) UNLESS the body is provably
-	-- pure — a pure body has no shell-state side effects to leak, so it runs with just the
-	-- light $() state (the common `$(cmd)`/`$(echo …)` case). $BASHPID/$RANDOM are
-	-- per-subshell, so a body reading them is isolated too.
-	local iso = src:find("BASHPID", 1, true) ~= nil or src:find("RANDOM", 1, true) ~= nil
+	-- pure (M.cmdsub_pure): then just the light $() state (the common `$(cmd)` case).
+	local iso = not M.cmdsub_pure(ast.stmts, self.functions, src)
 	local has_perr = false
 	for _, st in ipairs(ast.stmts) do
 		if st.t == "parse_error" then
@@ -2840,9 +2806,6 @@ function Shell:capture_src(src, backtick, noalias, line0)
 				st.plabel = "command substitution"
 			end
 		end
-		if not capture_pure(self, st) then
-			iso = true
-		end
 	end
 	-- Text that recurs runs compiled (tier fragment keyed by text, line, trap state and the
 	-- live alias table it parses with — none when read with aliases already expanded) — the
@@ -2851,7 +2814,7 @@ function Shell:capture_src(src, backtick, noalias, line0)
 	local mod = require("tier").try_fragment(src, ln and ln > 0 and ln or nil, self, nil, backtick and "cmdsub-bq" or "cmdsub", noalias)
 	if mod then
 		local run_compiled = require("tier").run_compiled
-		if (iso or not mod.nofork) and not has_perr then
+		if iso and not has_perr then
 			return self:capture_compiled_iso(function(self)
 				return run_compiled(mod, self, nil, true)
 			end, backtick)
@@ -4014,7 +3977,7 @@ function M.foreign_jobs(sh)
 	end
 	return f
 end
--- A `$(…)` whose body MUTATES shell state (emit's / tier's cmdsub_nofork_ok says no): run
+-- A `$(…)` whose body MUTATES shell state (M.cmdsub_pure says no): run
 -- it in-process with FULL isolation (sub_checkpoint/restore). capture_inproc supplies the
 -- $()-specific light state (fd-level capture, errexit OFF unless inherit_errexit, aliases,
 -- in_subprogram, cur_line, trailing-newline/NUL strip, exit/return→status); the heavy
@@ -4063,7 +4026,7 @@ function Shell:capture_file(path)
 	return ""
 end
 
--- Compiled-tier command substitution of a provably pure body (emit's cmdsub_nofork_ok):
+-- Compiled-tier command substitution of a provably pure body (M.cmdsub_pure):
 -- the compiled fragment `cs_fn(sh)` runs with only capture_inproc's light isolation (a
 -- mutating body goes through capture_compiled_iso instead).
 function Shell:capture_compiled(cs_fn, _, backtick) -- (2nd arg: a retired fork flag)
