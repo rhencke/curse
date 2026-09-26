@@ -1557,33 +1557,31 @@ local function emit_fragment(stmts, neg, liftset, cfraise)
 end
 
 
--- The rt.names_static guard expression for a set of command names: this module's
--- compiled functions must still be registered as themselves; any other name must not
--- have become a function.
+-- The guard expression for a set of command names: this module's compiled functions
+-- must still be registered as themselves (rt.names_static); any other name must not
+-- have become a function (checked inline: no table built per evaluation).
 local function names_guard(list)
 	local ff = (emit_frag_ctx and emit_frag_ctx.funcflags) or {}
-	local plain, fn, fv = {}, {}, {}
+	local conds, fn, fv = {}, {}, {}
 	for _, c in ipairs(list) do
 		if ff[c] then
 			fn[#fn + 1] = ("%q"):format(c)
 			fv[#fv + 1] = fnlname(c)
 		else
-			plain[#plain + 1] = ("%q"):format(c)
+			conds[#conds + 1] = ("sh.functions[%q] == nil"):format(c)
 		end
 	end
-	if #fn == 0 then
-		return ("rt.names_static(sh, {%s})"):format(table.concat(plain, ", "))
+	if #fn > 0 then
+		conds[#conds + 1] = ("rt.names_static(sh, {}, {%s}, {%s})"):format(
+			table.concat(fn, ", "), table.concat(fv, ", "))
 	end
-	return ("rt.names_static(sh, {%s}, {%s}, {%s})"):format(
-		table.concat(plain, ", "),
-		table.concat(fn, ", "),
-		table.concat(fv, ", ")
-	)
+	return #conds > 0 and "(" .. table.concat(conds, " and ") .. ")" or "true"
 end
 -- The literal command names a body runs (every simple command, at any depth) — what
--- rt.names_static re-checks at runtime in an eval/source program. nil if none needed.
-local function dyn_guard(stmts)
-	if not EF.has_dyncode then
+-- the guard re-checks at runtime in an eval/source program (or always: `always`).
+-- nil if none needed.
+local function dyn_guard(stmts, always)
+	if not EF.has_dyncode and not always then
 		return nil
 	end
 	local names, seen = {}, {}
@@ -1711,8 +1709,11 @@ function compile_cmdsub_inner(src, backtick, lifted, aenv, noalias, posix)
 		call = forked
 	end
 	-- eval/source program: compiled only while the body's names are still the static ones
-	-- (else the interpreter's capture, which resolves them live)
-	local guard = call ~= forked and dyn_guard(ast.stmts)
+	-- (else the interpreter's capture, which resolves them live). A PURE body is always
+	-- guarded: funcflags is not the whole function table (fragments compile with a partial
+	-- one, line mode, env-imported BASH_FUNC_x%%), and a function there would be a
+	-- side effect run without the checkpoint.
+	local guard = call ~= forked and dyn_guard(ast.stmts, pure)
 	if guard then
 		call = ("(%s and %s or %s)"):format(guard, call, forked)
 	end
