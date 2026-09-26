@@ -854,37 +854,12 @@ local function arith_expand_text(sh, raw, depth0) -- depth0: 1 = the text IS a s
 			out[#out + 1] = c
 			k = k + 1
 		elseif c == "$" or c == "`" then
-			local e
 			local nx = raw:sub(k + 1, k + 1)
-			if c == "`" then
-				e = raw:find("`", k + 1, true) or n
-			elseif raw:sub(k + 1, k + 2) == "((" then
-				local _, ni = P.grab_dparen(raw, k + 3)
-				e = ni - 1
-			elseif nx == "(" then
-				local ok, ni = pcall(P.scan_cmdsub, raw, k + 2)
-				e = ok and ni - 1 or n
-			elseif nx == "[" then -- $[expr]: the legacy $(( )) (bracket-depth matched)
-				local d = 0
-				e = k + 1
-				while e <= n do
-					local b = raw:byte(e)
-					if b == 91 then
-						d = d + 1
-					elseif b == 93 then
-						d = d - 1
-						if d == 0 then
-							break
-						end
-					end
-					e = e + 1
-				end
-				e = math.min(e, n)
-			elseif nx == "{" then
-				local ok, ni = pcall(P.scan_braces, raw, k + 1)
-				e = ok and ni - 1 or n
-			else
-				e = select(2, raw:find("^[%a_][%w_]*", k + 1)) or (nx:match("^[%d@*#?$!%-]$") and k + 1) or k
+			-- (to the end of the $name / $special / $( … ) / ${ … } / $(( … )) / $[ … ] / `…`)
+			local e = c == "$" and (select(2, raw:find("^[%a_][%w_]*", k + 1)) or (nx:match("^[%d@*#?$!%-]$") and k + 1))
+			if not e then
+				local ok, x = pcall(P.expansion_end, raw, k, false, true)
+				e = math.min(ok and x or n + 1, n + 1) - 1
 			end
 			local chunk = raw:sub(k, e)
 			local v = e > k and expand_word(sh, P.parse_word('"' .. chunk .. '"')) or chunk
