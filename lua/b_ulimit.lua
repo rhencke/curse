@@ -61,36 +61,16 @@ return function(sh, cmd, args, hook, tcb)
 		-- each resource letter taking an OPTIONAL argument — the rest of its word, or the next
 		-- word unless that looks like an option (bash's `;`). Each (letter, arg) is a command.
 		local cmds, allmode = {}, false
-		local j = 2
-		while args[j] and args[j]:sub(1, 1) == "-" and #args[j] > 1 do
-			local a = args[j]
-			j = j + 1
-			if a == "--" then
-				break
+		local j, sp, f, arg = 2
+		repeat
+			f, arg, j, sp = rt.getopt(sh, "ulimit", args, "HSaR;c;d;e;f;i;l;m;n;p;q;r;s;t;u;v;x;", j, sp)
+			if f == "?" then
+				return
+			elseif RES[f] then
+				cmds[#cmds + 1] = { f = f, arg = arg }
 			end
-			local k = 2
-			while k <= #a do
-				local f = a:sub(k, k)
-				if f == "a" then
-					allmode = true
-				elseif f == "H" then
-					hardflag = true
-				elseif f == "S" then
-					softflag = true
-				elseif RES[f] then
-					local arg
-					if k < #a then
-						arg, k = a:sub(k + 1), #a
-					elseif args[j] and not (args[j]:sub(1, 1) == "-" and #args[j] > 1) then
-						arg, j = args[j], j + 1
-					end
-					cmds[#cmds + 1] = { f = f, arg = arg }
-				else
-					return rt.bad_option(sh, "ulimit", "-" .. f, a)
-				end
-				k = k + 1
-			end
-		end
+			allmode, hardflag, softflag = allmode or f == "a", hardflag or f == "H", softflag or f == "S"
+		until not f
 		if not allmode then
 			if #cmds == 0 then -- (`ulimit N` is `ulimit -f N`)
 				cmds[1] = { f = "f", arg = args[j] }

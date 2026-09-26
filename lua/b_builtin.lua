@@ -9,11 +9,9 @@ local BUILTINS = I.BUILTINS
 return function(sh, cmd, args, hook, tcb)
 	if cmd == "builtin" then
 		-- builtin [--] NAME args: run NAME only if it's an actual shell builtin.
-		local j = 2
-		if args[j] == "--" then
-			j = j + 1
-		elseif args[j] and args[j]:match("^%-.") then -- (no options)
-			return rt.bad_option(sh, "builtin", args[j]:sub(1, 2))
+		local c, _, j = rt.getopt(sh, "builtin", args, "", 2) -- (no options)
+		if c then
+			return
 		end
 		if args[j] == nil then
 			sh.status = 0

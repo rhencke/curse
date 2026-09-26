@@ -4,19 +4,14 @@
 local rt = require("runtime")
 
 return function(sh, cmd, args)
-	local force, j = false, 2
-	while args[j] and args[j]:match("^%-.") do
-		local a = args[j]
-		j = j + 1
-		if a == "--" then
-			break
+	local force, j, sp, f, _ = false, 2
+	repeat
+		f, _, j, sp = rt.getopt(sh, "suspend", args, "f", j, sp)
+		if f == "?" then
+			return
 		end
-		local bad = a:match("[^f]", 2)
-		if bad then
-			return rt.bad_option(sh, "suspend", "-" .. bad, a)
-		end
-		force = true
-	end
+		force = force or f == "f"
+	until not f
 	if args[j] ~= nil then
 		rt.too_many(sh, "suspend")
 	end

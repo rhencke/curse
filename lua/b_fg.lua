@@ -1,36 +1,19 @@
 -- Lazily-loaded builtin feature module (see BUILTIN_LAZY in runtime.lua): `fg` / `bg`.
+local rt = require("runtime")
 local I = require("interp")._int
 local job_resolve, job_reap, SIGDESC = I.job_resolve, I.job_reap, I.SIGDESC
 
 -- disown [-ahr] [jobspec|pid …]: drop jobs from the table (so `jobs`/`wait` forget them);
 -- -h only marks them (nothing here sends SIGHUP), -a all jobs, -r only running ones.
 local function disown(sh, args)
-	local all, running, honly, j = false, false, false, 2
-	while args[j] and args[j]:match("^%-.") and args[j] ~= "--" do -- (`--Z`: the `-` is the bad option)
-		if args[j] == "--help" then -- (CASE_HELPOPT: the builtin's help, status 2)
-			require("b_help")(sh, "help", { "help", "disown" })
-			sh.status = 2
+	local all, running, honly, j, sp, c, _ = false, false, false, 2
+	repeat -- (internal_getopt "ahr")
+		c, _, j, sp = rt.getopt(sh, "disown", args, "ahr", j, sp)
+		if c == "?" then
 			return
 		end
-		for f in args[j]:sub(2):gmatch(".") do
-			if f == "a" then
-				all = true
-			elseif f == "r" then
-				running = true
-			elseif f == "h" then
-				honly = true
-			else
-				io.stderr:write("curse: disown: -" .. f .. ": invalid option\n")
-				io.stderr:write("disown: usage: disown [-h] [-ar] [jobspec ... | pid ...]\n")
-				sh.status = 2
-				return
-			end
-		end
-		j = j + 1
-	end
-	if args[j] == "--" then
-		j = j + 1
-	end
+		all, running, honly = all or c == "a", running or c == "r", honly or c == "h"
+	until not c
 	local victims, status = {}, 0
 	if all or running then
 		if not args[j] then

@@ -25,50 +25,18 @@ return function(sh, cmd, args, hook, tcb)
 			sh.hashpath = cur
 		end
 		-- (internal_getopt "dlp:rt": -p takes the rest of its word or the next one)
-		local rflag, names, j = false, {}, 2
-		local ppath
+		local rflag, names, ppath = false, {}
 		local dflag, tflag, lflag = false, false, false
-		while args[j] and args[j]:sub(1, 1) == "-" and #args[j] > 1 do
-			local w = args[j]
-			j = j + 1
-			if w == "--" then
-				break
-			elseif w == "--help" then -- (GETOPT_HELP: the builtin's help, status 2)
-				return rt.builtin_help(sh, "hash")
+		local j, sp, c, a = 2
+		repeat
+			c, a, j, sp = rt.getopt(sh, "hash", args, "dlp:rt", j, sp)
+			if c == "?" then
+				return
+			elseif c == "p" then -- -p PATH NAME: remember NAME at PATH (unchecked)
+				ppath = a
 			end
-			local k = 2
-			while k <= #w do
-				local f = w:sub(k, k)
-				if f == "r" then
-					rflag = true
-				elseif f == "d" then
-					dflag = true
-				elseif f == "t" then
-					tflag = true
-				elseif f == "l" then
-					lflag = true
-				elseif f == "p" then -- -p PATH NAME: remember NAME at PATH (unchecked)
-					if k < #w then
-						ppath = w:sub(k + 1)
-					else
-						ppath = args[j]
-						j = j + 1
-					end
-					if ppath == nil then
-						io.stderr:write("curse: hash: -p: option requires an argument\n" .. rt.usage("hash"))
-						sh.status = 2
-						return
-					end
-					break
-				else
-					io.stderr:write("curse: hash: -" .. f .. ": invalid option\n")
-					io.stderr:write("hash: usage: hash [-lr] [-p pathname] [-dt] [name ...]\n")
-					sh.status = 2
-					return
-				end
-				k = k + 1
-			end
-		end
+			rflag, dflag, tflag, lflag = rflag or c == "r", dflag or c == "d", tflag or c == "t", lflag or c == "l"
+		until not c
 		if args[j] == nil and (dflag or tflag) then -- (-d/-t need names)
 			io.stderr:write("curse: hash: -" .. (dflag and "d" or "t") .. ": option requires an argument\n")
 			sh.status = 1

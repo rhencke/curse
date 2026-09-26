@@ -136,13 +136,8 @@ return function(sh, cmd, args, hook, tcb)
 			plusattr = plusattr or {}
 			plusattr.l, plusattr.u, plusattr.c = true, true, true
 		end
-		if opterr == "--help" then
-			return rt.builtin_help(sh, cmd)
-		elseif opterr then -- an unknown attribute letter: bash prints usage and fails (status 2)
-			io.stderr:write("curse: " .. cmd .. ": -" .. opterr .. ": invalid option\n" .. rt.usage(cmd))
-			sh.status = 2
-			sh.spb_err = 2 -- (EX_USAGE: see rt.spb_run)
-			return
+		if opterr then -- an unknown attribute letter (or `--help`): usage, status 2
+			return rt.bad_option(sh, cmd, "-" .. opterr, opterr)
 		end
 		if ro_n and #rest > 0 and not (funcnames or funcbody or printmode) then -- `readonly -n NAME[=V]`:
 			local st = 0 -- just the assignments, no attribute

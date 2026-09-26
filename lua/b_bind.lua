@@ -111,34 +111,17 @@ return function(sh, cmd, args, hook, tcb)
 		if not rt.line_editing(sh) then -- (no_line_editing: bash says so first, whatever the arguments)
 			io.stderr:write("curse: bind: warning: line editing not enabled\n")
 		end
-		do -- bash's getopt "lvpVPsSXf:q:u:m:r:x:": bad letters and missing arguments
-			local k = 2
-			while args[k] and args[k]:match("^%-.") and args[k] ~= "--" do
-				local a = args[k]
-				k = k + 1
-				for ci = 2, #a do
-					local f = a:sub(ci, ci)
-					if f:match("[fqumrx]") then
-						if ci == #a then
-							if args[k] == nil then
-								io.stderr:write("curse: bind: -" .. f .. ": option requires an argument\n" .. rt.usage("bind"))
-								sh.status = 2
-								return
-							end
-							if f == "x" and not args[k]:match('^%s*"') then
-								io.stderr:write("curse: bind: " .. args[k] .. ": first non-whitespace character is not `\"'\n")
-								sh.status = 1
-								return
-							end
-							k = k + 1
-						end
-						break
-					elseif not f:match("[lvpVPsSX]") then
-						return rt.bad_option(sh, "bind", "-" .. f, a)
-					end
-				end
+		local k, sp, f, v = 2
+		repeat -- (bash's getopt: bad letters and missing arguments; the words are read below)
+			f, v, k, sp = rt.getopt(sh, "bind", args, "lvpVPsSXf:q:u:m:r:x:", k, sp)
+			if f == "?" then
+				return
+			elseif f == "x" and not v:match('^%s*"') then
+				io.stderr:write("curse: bind: " .. v .. ": first non-whitespace character is not `\"'\n")
+				sh.status = 1
+				return
 			end
-		end
+		until not f
 		local j = 2
 		local keymap = "emacs" -- -m KEYMAP selects the keymap for -x/-X (default emacs)
 		if args[j] == "-m" then

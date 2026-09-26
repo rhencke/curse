@@ -15,16 +15,8 @@ return function(sh, cmd, args, hook, tcb)
 		-- source FILE [args]: run FILE in the current shell; a `return` ends the file.
 		-- A name with no slash is looked up in $PATH (files only, dirs skipped), then
 		-- falls back to the bare name; `--` ends options.
-		local j = 2
-		local usage = cmd .. ": usage: " .. cmd .. " filename [arguments]\n"
-		if args[j] == "--" then
-			j = j + 1
-		elseif args[j] == "--help" then -- (no_options: the builtin's help, status 2)
-			return rt.builtin_help(sh, cmd)
-		elseif args[j] and args[j]:match("^%-.") then -- (bash's no_options: no option letters)
-			io.stderr:write("curse: " .. cmd .. ": " .. args[j]:sub(1, 2) .. ": invalid option\n" .. usage)
-			sh.status = 2
-			sh.spb_err = 2 -- (EX_USAGE: rt.spb_run)
+		local c, _, j = rt.getopt(sh, cmd, args, "", 2) -- (bash's no_options)
+		if c then
 			return
 		end
 		local name = args[j]
@@ -40,7 +32,7 @@ return function(sh, cmd, args, hook, tcb)
 		local e0 = sh.traps and sh.traps.ERR -- (the ERR trap before it: rt.source_err_sample)
 		local rret -- (a `return N` ending the file: $? once the RETURN trap has run)
 		if not name then
-			io.stderr:write("curse: " .. cmd .. ": filename argument required\n" .. usage)
+			io.stderr:write("curse: " .. cmd .. ": filename argument required\n" .. rt.usage(cmd))
 			sh.status = 2
 			sh.spb_err = 2 -- (EX_USAGE: rt.spb_run)
 		elseif file_test("-d", file) then

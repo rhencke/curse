@@ -4,9 +4,7 @@
 -- pushd / popd / dirs — a port of bash's builtins/pushd.def. The model is bash's: the
 -- current directory is always the top of the stack (implicit), and sh.dirstack holds the
 -- entries BELOW it, bottom first (bash's pushd_directory_list[0 .. offset-1]).
-local PUSHD_USAGE = "pushd: usage: pushd [-n] [+N | -N | dir]\n"
-local POPD_USAGE = "popd: usage: popd [-n] [+N | -N]\n"
-local DIRS_USAGE = "dirs: usage: dirs [-clpv] [+N] [-N]\n"
+local rt = require("runtime")
 
 local function legal_number(s)
 	return s:match("^%s*[+-]?%d+%s*$") and tonumber(s) or nil
@@ -22,10 +20,6 @@ return function(sh, cmd, args, hook, tcb)
 			return "~" .. p:sub(#h + 1)
 		end
 		return p
-	end
-	local function usage(msg)
-		io.stderr:write(msg)
-		sh.status = 2
 	end
 	local function pushd_error(arg)
 		if #pd == 0 then
@@ -56,8 +50,7 @@ return function(sh, cmd, args, hook, tcb)
 				w = a:sub(2)
 				local n = legal_number(w)
 				if not n then
-					io.stderr:write("curse: dirs: " .. a .. ": invalid number\n")
-					return usage(DIRS_USAGE)
+					return rt.usage_error(sh, "dirs", a .. ": invalid number")
 				end
 				local sign = a:sub(1, 1) == "+" and 1 or -1
 				-- bash's get_dirstack_index
@@ -73,8 +66,7 @@ return function(sh, cmd, args, hook, tcb)
 					desired = -1
 				end
 			else
-				io.stderr:write("curse: dirs: " .. a .. ": invalid option\n")
-				return usage(DIRS_USAGE)
+				return rt.usage_error(sh, "dirs", a .. ": invalid option")
 			end
 		end
 		if clear then
@@ -154,8 +146,7 @@ return function(sh, cmd, args, hook, tcb)
 			elseif w:sub(1, 1) == "+" or w:sub(1, 1) == "-" then
 				local n = legal_number(w:sub(2))
 				if not n then
-					io.stderr:write("curse: pushd: " .. w .. ": invalid number\n")
-					return usage(PUSHD_USAGE)
+					return rt.usage_error(sh, "pushd", w .. ": invalid number")
 				end
 				num = w:sub(1, 1) == "-" and (#pd - n) or n
 				if num > #pd or num < 0 then
@@ -163,8 +154,7 @@ return function(sh, cmd, args, hook, tcb)
 				end
 				rotate = true
 			elseif w:sub(1, 1) == "-" then
-				io.stderr:write("curse: pushd: " .. w .. ": invalid option\n")
-				return usage(PUSHD_USAGE)
+				return rt.usage_error(sh, "pushd", w .. ": invalid option")
 			else
 				break
 			end
@@ -222,16 +212,13 @@ return function(sh, cmd, args, hook, tcb)
 				direction = w:sub(1, 1)
 				local n = legal_number(w:sub(2))
 				if not n then
-					io.stderr:write("curse: popd: " .. w .. ": invalid number\n")
-					return usage(POPD_USAGE)
+					return rt.usage_error(sh, "popd", w .. ": invalid number")
 				end
 				which, which_word = n, w
 			elseif w:sub(1, 1) == "-" then
-				io.stderr:write("curse: popd: " .. w .. ": invalid option\n")
-				return usage(POPD_USAGE)
+				return rt.usage_error(sh, "popd", w .. ": invalid option")
 			elseif w ~= "" then
-				io.stderr:write("curse: popd: " .. w .. ": invalid argument\n")
-				return usage(POPD_USAGE)
+				return rt.usage_error(sh, "popd", w .. ": invalid argument")
 			else
 				break
 			end
