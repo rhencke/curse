@@ -12876,14 +12876,6 @@ function M.builtin_run(sh, argv, hook)
 	return require(BUILTIN_LAZY[cmd])(sh, cmd, argv, hook or _noop)
 end
 
--- `VAR=val … cmd` prefix env for the COMPILED tier: apply each already-expanded scalar
--- prefix value as an EXPORTED tempenv for the duration of `runfn`, then restore — the
--- twin of interp's prefix-assign path (exec_stmt's st.assigns branch). Each binding is
--- pushed onto sh.tenv (LIFO, with the prior box + process-env value saved) so an `unset`
--- inside the command reveals the shadowed value beneath (bash dynamic scope) and a
--- `local` in a called function absorbs only its own frame's tempenv; a consumed entry is
--- skipped on restore. Values are evaluated by the caller BEFORE this runs (in the
--- pre-command environment — bash and interp agree a sibling prefix is NOT visible).
 -- Does a builtin's own write to a prefix-assigned variable outlive the command? In bash
 -- (execute_builtin) the tempenv of source/eval/unset/mapfile/fc/read is a scope of its own,
 -- dropped afterwards; any other builtin's bind_variable reaches the variable beneath, so
@@ -12904,89 +12896,24 @@ do
 			and require("interp")._int.BUILTINS[cmd] ~= nil
 	end
 end
+-- `VAR=val … cmd` prefix env for a compiled builtin/external whose scalar prefix values
+-- the caller expanded (and traced) up front: each binds as an EXPORTED tempenv (M.pbind)
+-- for the duration of `runfn`, then M.sr_unbind restores them.
 function M.run_prefix(sh, names, vals, runfn, argv)
 	local base = #sh.tenv
+	local svm, svc = sh.pb_mode, sh.pb_cmd
+	sh.pb_mode, sh.pb_cmd = "pre", argv and argv[1] -- (the caller traced them)
 	for i = 1, #names do
-		local name = names[i]
-		local rb = sh.vars[name]
-		local ob = sh.vars[sh:deref(name)]
-		if ob and ob.ro then -- (a readonly prefix: reported, not bound — the command still runs)
-			if not (M.ro_said and M.ro_said[name]) then
-				io.stderr:write("curse: " .. sh:deref(name) .. ": readonly variable\n")
-				M.report_exit(sh) -- (err_readonly: report_error)
-			end
-			if sh.opt_c or sh.opt_posix then
-				sh.status = 1
-				error({ __curse_exit = 1 })
-			end
-			name = nil
-		end
-		if name then -- (nil: a readonly one, skipped)
-			if rb and rb.ref and rb.s and rb.s:match("^[%a_][%w_]*$") and sh:deref(name) ~= "" then
-				name = sh:deref(name) -- (through a nameref with a target: the target's binding)
-			end
-			local b = sh.vars[name] -- copy the box: set_str below mutates in place
-			sh.vseq = sh.vseq + 1
-			sh.tenv[#sh.tenv + 1] = {
-				name = name,
-				env = os.getenv(name),
-				consumed = false,
-				seq = sh.vseq,
-				box = b
-						and { s = b.s, n = b.n, arr = b.arr, assoc = b.assoc, order = b.order, exported = b.exported, ro = b.ro, ref = b.ref,
-							int = b.int, lower = b.lower, upper = b.upper, cap = b.cap, trace = b.trace }
-					or false,
-			}
-			-- a NAMEREF's prefix binding is a plain temporary (target untouched), and so is an
-			-- -i/-l/-u/-c var's (bash's tempenv variable is a plain string: `i=1+1 cmd` gets "1+1")
-			if b and (b.ref or (not b.ro and (b.arr or b.int or b.lower or b.upper or b.cap))) then
-				if b.ref and M.arith_ref_circ(sh, name, 0) == true then -- (a cycle: bash warns, then
-					io.stderr:write("curse: warning: " .. name .. ": circular name reference\n") -- binds)
-				end
-				sh.vars[name] = {}
-			end
-			if LOCALE_VARS[name] then
-				M.lc_quiet = M.prefix_ext(sh, argv and argv[1])
-			end
-			sh:set_str(name, vals[i])
-			M.lc_quiet = nil
-			C.setenv(name, sh:get(name), 1)
-			sh.tenv[#sh.tenv].tval = sh:get(name) -- (to see whether the command wrote it: prefix_keeps)
-			local nb = sh.vars[sh:deref(name)] -- (in the environment: `declare -p` shows -x)
-			if nb then
-				nb.exported = true
-			end
-		end
+		M.pbind(sh, names[i], vals[i])
 	end
+	sh.pb_mode, sh.pb_cmd = svm, svc
 	sh.tenv_call_base = base -- a DIRECT function call tags these with its frame (local absorption)
 	local ok, err = pcall(runfn)
 	sh.tenv_call_base = nil
-	local keeps = argv and M.prefix_keeps(sh, argv)
-	for k = #sh.tenv, base + 1, -1 do
-		local s = sh.tenv[k]
-		sh.tenv[k] = nil
-		if not s.consumed then -- an `unset` inside the command already revealed it
-			local nv = keeps and sh:get(s.name)
-			sh.vars[s.name] = s.box or nil
-			if s.env then
-				C.setenv(s.name, s.env, 1)
-			else
-				C.unsetenv(s.name)
-			end
-			if nv and nv ~= s.tval then -- (the builtin's write reached the variable beneath)
-				sh:set_str(s.name, nv)
-			end
-			if LOCALE_VARS[s.name] then -- (`LC_CTYPE=C cmd`: the locale follows the variable back)
-				M.reset_locale(sh, s.name)
-			end
-			if s.name == "GLOBIGNORE" then
-				M.setup_glob_ignore(sh) -- (the binding going away re-applies sv_globignore)
-			end
-		end
-	end
+	M.sr_unbind(sh, base, argv)
 	M.env_rebuilt(sh) -- (dispose_used_env_vars: the environ, without them)
 	if not ok then
-		error(err)
+		error(err, 0)
 	end
 end
 
@@ -14800,32 +14727,43 @@ do
 		return v
 	end
 
-	-- One prefix binding `name=value` (value already expanded, nil = its expansion failed;
-	-- `append` for name+=value), in the mode M.simple_run set: a tempenv binding for the
-	-- command (restored after it), or a persistent exported one (posix special builtin).
+	-- A prefix binding of a readonly variable (or the readonly specials SHELLOPTS/BASHOPTS):
+	-- reported (unless M.prefix_ro said it already), status 1, fatal under -c/posix; true.
+	-- (bash's assign_in_env rejects it before it binds, exports or traces anything; the
+	-- command still runs)
+	function M.prefix_reject(sh, name)
+		local dn = sh:deref(name)
+		local b = sh.vars[dn]
+		if not ((b and b.ro) or dn == "SHELLOPTS" or dn == "BASHOPTS") then
+			return false
+		end
+		if not (M.ro_said and M.ro_said[name]) then
+			io.stderr:write("curse: " .. dn .. ": readonly variable\n")
+			M.report_exit(sh) -- (err_readonly: report_error)
+		end
+		sh.status = 1
+		if sh.opt_c or sh.opt_posix then
+			error({ __curse_exit = 1 })
+		end
+		return true
+	end
+	-- One prefix binding's store `name=value` (value already expanded, nil = its expansion
+	-- failed; `append` for name+=value), in the mode sh.pb_mode: "tenv" a temporary binding
+	-- for the command (restored after it; "pre": one the caller traced), "persist" a
+	-- persistent exported one (posix special builtin), "perm" — no command after all — a
+	-- plain assignment (traced, then a readonly one rejected: it aborts the line).
 	function M.sr_pset(sh, name, value, append)
 		if value == nil then
 			return
 		end
-		if sh.opt_x then -- (each prefix assignment traces before the command: `+ x=1`)
+		if sh.opt_x and sh.pb_mode ~= "pre" then -- (each traces before the command: `+ x=1`)
 			M.xtrace_assign(sh, name .. (append and "+=" or "="), value)
 		end
-		local b = sh.vars[sh:deref(name)]
-		if b and b.ro then -- (a readonly prefix: reported, non-fatal — the command still runs)
-			if not (M.ro_said and M.ro_said[name]) then
-				io.stderr:write("curse: " .. sh:deref(name) .. ": readonly variable\n")
-				M.report_exit(sh) -- (err_readonly: report_error)
-			end
-			sh.status = 1
-			if sh.opt_c or sh.opt_posix then
-				error({ __curse_exit = 1 })
-			end
-			if sh.pb_mode == "perm" then -- (no command: a plain assignment, which aborts the line)
-				error({ __curse_exit = 1, __curse_lineabort = true })
-			end
-			return
+		if sh.pb_mode == "perm" and M.prefix_reject(sh, name) then
+			error({ __curse_exit = 1, __curse_lineabort = true })
 		end
-		if append then -- (interp's assign_body `name+=value`)
+		local b = sh.vars[sh:deref(name)]
+		if append then -- (the assignment's `name+=value`)
 			if b and b.arr then
 				sh:array_set(name, sh:is_assoc(name) and "0" or 0, value, true)
 			elseif b and b.int and not b.ref then
@@ -14836,9 +14774,7 @@ do
 			else
 				M.append_scalar(sh, name, value)
 			end
-			return
-		end
-		if b and b.arr then
+		elseif b and b.arr then
 			sh:array_set(name, sh:is_assoc(name) and "0" or 0, value, false)
 		elseif b and b.int and not b.ref then
 			sh:aset(name, M.int_value(sh, value))
@@ -14847,14 +14783,27 @@ do
 		else
 			sh:set_str(name, value)
 		end
+		if name == "HISTSIZE" or name == "HISTFILESIZE" then -- (the history follows even a
+			M.hist_resize(sh, name) -- temporary binding: sv_histsize)
+		end
 	end
+	-- One prefix binding `name=value` (a NAME=(…) prefix: `raw`, its literal text) — both
+	-- tiers' simple commands (interp's through its bind; a compiled site's bind closure).
 	function M.pbind(sh, name, value, append, raw)
 		local mode = sh.pb_mode
 		if mode == "perm" then -- (no command after all: a plain assignment)
 			return M.sr_pset(sh, name, value, append)
 		end
+		if M.prefix_reject(sh, name) then
+			return
+		end
+		if raw and sh.opt_x then -- (as its literal string: `+ a='(1 2)'`)
+			M.xtrace_assign(sh, name .. "=", raw)
+		end
 		if mode == "persist" then
-			for _, te in ipairs(sh.tenv) do -- (it propagates through a temporary binding)
+			-- it propagates through any temporary binding of the name (`var=30 f` where
+			-- f does `var=20 return`): that binding's end mustn't restore the old value
+			for _, te in ipairs(sh.tenv) do
 				if te.name == name then
 					te.consumed = true
 				end
@@ -14865,15 +14814,20 @@ do
 				M.sr_pset(sh, name, value, append)
 			end
 			local b = sh.vars[sh:deref(name)]
-			if b then
+			if b then -- (a command prefix stays exported — bash)
 				b.exported = true
 			end
 			C.setenv(name, sh:get(name) or "", 1)
 			return
 		end
+		-- a tempenv binding: pushed onto sh.tenv (LIFO) so an `unset` inside the command
+		-- reveals the shadowed value beneath instead of leaving the name unset (bash dynamic
+		-- scope); a consumed entry is skipped on restore (M.sr_unbind)
 		local rb = sh.vars[name]
 		if rb and rb.ref and rb.s and rb.s:match("^[%a_][%w_]*$") and sh:deref(name) ~= "" then
-			name = sh:deref(name) -- (through a nameref with a target: the target's binding)
+			-- through a nameref WITH a target, the binding is the target's (bash: `ref=x cmd`
+			-- exports var=x; ref itself is untouched)
+			name = sh:deref(name)
 		end
 		local b = sh.vars[name] -- copy the box: the binding mutates it in place
 		sh.vseq = sh.vseq + 1
@@ -14883,15 +14837,17 @@ do
 			env = os.getenv(name),
 			consumed = false,
 			seq = sh.vseq,
+			-- (`z=y typeset z` in a function: the local it makes absorbs this binding)
 			decl_pd = (cmd == "local" or cmd == "declare" or cmd == "typeset") and sh.pd or nil,
 			box = b and { s = b.s, n = b.n, arr = b.arr, assoc = b.assoc, order = b.order, exported = b.exported,
 				ro = b.ro, ref = b.ref, int = b.int, lower = b.lower, upper = b.upper, cap = b.cap, trace = b.trace }
 				or false,
 		}
 		-- a nameref's / array's / -i/-l/-u/-c var's prefix binding is a plain temporary string
-		-- (bash); `n+=3 cmd` on a -i var binds the arithmetic sum as that string
+		-- (bash's tempenv variable: `i=1+1 cmd` passes "1+1"); `n+=3 cmd` on a -i var binds
+		-- the arithmetic sum as that string (make_variable_value appends arithmetically first)
 		local iapp = b and b.int and append and not b.arr and not b.ref and not raw
-		if b and not iapp and (b.ref or (not b.ro and (b.arr or b.int or b.lower or b.upper or b.cap))) then
+		if b and not iapp and (b.ref or b.arr or b.int or b.lower or b.upper or b.cap) then
 			if b.ref and M.arith_ref_circ(sh, name, 0) == true then -- (a cycle: bash warns, then
 				io.stderr:write("curse: warning: " .. name .. ": circular name reference\n") -- binds)
 			end
@@ -14902,25 +14858,29 @@ do
 		end
 		if raw then -- NAME=(…) as a command prefix is a literal string, not an array (bash)
 			sh:set_str(name, raw)
-			M.lc_quiet = nil
-			C.setenv(name, raw, 1)
 		else
 			M.sr_pset(sh, name, value, append)
-			M.lc_quiet = nil
-			if iapp and sh.vars[name] == b and not b.ro then
+			if iapp and sh.vars[name] == b then
 				sh.vars[name] = { s = sh:get(name), exported = b.exported }
 			end
-			C.setenv(name, sh:get(name) or "", 1)
 		end
-		sh.tenv[#sh.tenv].tval = sh:get(name)
+		M.lc_quiet = nil
+		local tval = sh:get(name)
+		C.setenv(name, tval or "", 1)
+		sh.tenv[#sh.tenv].tval = tval -- (did the command write it? M.prefix_keeps)
 		local nb = sh.vars[sh:deref(name)]
-		if nb then
+		if nb then -- (a prefix binding is in the environment: `declare -p` shows -x)
 			nb.exported = true
 		end
 	end
-	-- `a[i]=v cmd`: not a valid command-prefix binding — reported, skipped (the command runs)
+	-- `a[i]=v cmd`: not a valid command-prefix binding — reported, skipped (the command runs;
+	-- a posix special builtin's assignment error is fatal instead)
 	function M.pbind_bad(sh, name, index)
 		io.stderr:write("curse: `" .. name .. "[" .. index .. "]': not a valid identifier\n")
+		if sh.pb_mode == "persist" and not sh.opt_i then
+			sh.status = 1
+			error({ __curse_exit = 1 })
+		end
 	end
 
 	-- a declaration builtin's NAME=(…) operands, before it runs: the names join argv (so the
@@ -14979,7 +14939,8 @@ do
 	end
 
 	-- the command runner; eval/source/. COMPILE their code (rt.eval / rt.source), as the
-	-- compiled tier's own eval/source statements do — unless a function shadows the name
+	-- compiled tier's own eval/source statements do — unless a function shadows the name, or
+	-- the interpreter runs this command (spec.ix: exec_simple interprets it)
 	function M.sr_dispatch(sh, argv, spec, hook)
 		local cmd = argv[1]
 		local viacmd
@@ -14990,7 +14951,7 @@ do
 		if argv[1] == "exec" then -- (statement-level in interp: b_exec, not exec_simple)
 			return require("b_exec")(sh, { redirs = spec.eredirs }, argv, hook, viacmd)
 		end
-		if (cmd == "eval" or cmd == "source" or cmd == ".")
+		if (cmd == "eval" or cmd == "source" or cmd == ".") and not spec.ix
 			and not (sh.functions[cmd] and not (sh.opt_posix and M.SPECIAL_BUILTIN[cmd]))
 			and not (sh.disabled_builtins and sh.disabled_builtins[cmd]) then
 			sh.tenv_call_base = nil -- (a function the code calls can't absorb these bindings)
@@ -15019,49 +14980,47 @@ do
 			M.sr_trace(sh, argv, spec)
 			traced = true
 		end
-		if rf then
-			local a1, a2 = argv[1], argv[2]
-			if not (a1 == "exec" or ((a1 == "command" or a1 == "builtin") and a2 == "exec")) then
-				local rs = {}
-				-- (the redirections don't see the command's prefix bindings — bash expands
-				-- them outside its temporary environment: hide those while they're applied)
-				local tb, hid = sh.tenv_call_base, nil
-				if tb and #sh.tenv > tb then
-					hid = {}
-					for k = #sh.tenv, tb + 1, -1 do
-						local te = sh.tenv[k]
-						hid[#hid + 1] = { te.name, sh.vars[te.name] }
-						sh.vars[te.name] = te.box or nil
-					end
+		-- (`exec`'s redirections are b_exec's: they persist, and so does its fd-1 routing)
+		local a1, a2 = argv[1], argv[2]
+		local isexec = a1 == "exec" or ((a1 == "command" or a1 == "builtin") and a2 == "exec")
+		if rf and not isexec then
+			local rs = {}
+			-- (the redirections don't see the command's prefix bindings — bash expands
+			-- them outside its temporary environment: hide those while they're applied)
+			local tb, hid = sh.tenv_call_base, nil
+			if tb and #sh.tenv > tb then
+				hid = {}
+				for k = #sh.tenv, tb + 1, -1 do
+					local te = sh.tenv[k]
+					hid[#hid + 1] = { te.name, sh.vars[te.name] }
+					sh.vars[te.name] = te.box or nil
 				end
-				local rok, rres = pcall(rf, rs)
-				if hid then
-					for k = #hid, 1, -1 do
-						sh.vars[hid[k][1]] = hid[k][2]
-					end
+			end
+			local rok, rres = pcall(rf, rs, sh, argv, spec)
+			if hid then
+				for k = #hid, 1, -1 do
+					sh.vars[hid[k][1]] = hid[k][2]
 				end
-				if not rok then
-					M.redir_restore(rs)
-					error(rres, 0)
-				end
-				if not rres then
-					M.redir_restore(rs)
-					sh.status = 1
-					return
-				end
-				local ok, err = pcall(M.sr_run_cmd, sh, argv, spec, hook, nil, traced)
-				io.flush()
+			end
+			if not rok then
 				M.redir_restore(rs)
-				if not ok then
-					error(err, 0)
-				end
+				error(rres, 0)
+			end
+			if not rres then
+				M.redir_restore(rs)
+				sh.status = 1
 				return
 			end
+			local ok, err = pcall(M.sr_run_cmd, sh, argv, spec, hook, nil, traced)
+			io.flush()
+			M.redir_restore(rs)
+			if not ok then
+				error(err, 0)
+			end
+			return
 		end
 		sh.write_err = nil
-		local I = require("interp")
-
-		if spec.so then -- (a redirect moved stdout: builtins write the real fd 1)
+		if spec.so and not isexec then -- (a redirect moved stdout: builtins write the real fd 1)
 			local so = sh.out
 			sh.out = io.write
 			local ok, err = pcall(M.sr_dispatch, sh, argv, spec, hook)
@@ -15102,15 +15061,19 @@ do
 			end
 		end
 	end
-	-- spec (a per-site constant): aas = the NAME=(…) operand ASTs; names = the prefix
-	-- assignment names; so = a redirect moves stdout. bind(sh) performs the prefix bindings
-	-- in order (each value expanded after the previous binding: bash's left-to-right).
 	-- (the <(…)/>(…) a command registers: drained after it. The first count — a retired
 	-- pending list — is always 0; drain_procsub still takes the pair.)
 	function M.procsub_mark(sh)
 		return 0, (sh.procsub_files and #sh.procsub_files or 0)
 	end
-	-- (rf: a dynamic command name's redirections, applied here unless it's `exec`)
+	-- The simple-command runner both tiers share (interp exec_stmt's `simple` statement; a
+	-- compiled site's). spec (per site/statement, constant): aas = the NAME=(…) operand
+	-- ASTs; names = the prefix assignment names; so = a redirect moves stdout; eredirs =
+	-- the redirections (b_exec's, or rf's); ix = interpreted (eval/source interpret).
+	-- bind(sh, spec) performs the prefix bindings in order (each value expanded after the
+	-- previous binding: bash's left-to-right). rf(rs, sh, argv, spec): the redirections,
+	-- applied here after the bindings unless it's `exec` (a dynamic command name's, a
+	-- traced one's, interp's).
 	function M.simple_run(sh, argv, spec, bind, hook, n0, rf, pm1, pm2)
 		if spec.ps then
 			local ok, err = pcall(M.sr_run, sh, argv, spec, bind, hook, n0, rf)
@@ -15140,7 +15103,7 @@ do
 			if bind then
 				local svm = sh.pb_mode
 				sh.pb_mode = "perm"
-				local ok, err = pcall(bind, sh)
+				local ok, err = pcall(bind, sh, spec)
 				sh.pb_mode = svm
 				if not ok then
 					error(err, 0)
@@ -15176,7 +15139,7 @@ do
 			end
 			local svm = sh.pb_mode
 			sh.pb_mode = "persist"
-			ok, err = pcall(bind, sh)
+			ok, err = pcall(bind, sh, spec)
 			sh.pb_mode = svm
 			if ok then
 				ok, err = pcall(M.sr_run_cmd, sh, argv, spec, hook, rf)
@@ -15190,7 +15153,7 @@ do
 			local base = #sh.tenv
 			local svm, svc = sh.pb_mode, sh.pb_cmd
 			sh.pb_mode, sh.pb_cmd = "tenv", cmd
-			ok, err = pcall(bind, sh)
+			ok, err = pcall(bind, sh, spec)
 			sh.pb_mode, sh.pb_cmd = svm, svc
 			if ok then
 				sh.tenv_call_base = base
@@ -15199,8 +15162,10 @@ do
 			end
 			M.sr_unbind(sh, base, argv)
 			M.env_rebuilt(sh) -- (dispose_used_env_vars: the environ, without them)
-		else
+		elseif aas then
 			ok, err = pcall(M.sr_run_cmd, sh, argv, spec, hook, rf)
+		else -- (nothing to undo after it: no pcall on the common path)
+			M.sr_run_cmd(sh, argv, spec, hook, rf)
 		end
 		if ok and aas then
 			ok, err = pcall(M.sr_aa_post, sh, aas)
@@ -15279,7 +15244,6 @@ end
 -- or subscript the compiled word engine can't render, a side-effecting arith value, HISTSIZE/
 -- HISTFILESIZE, the readonly specials SHELLOPTS/BASHOPTS). The value expands through the
 -- shared one-word expander, the arithmetic through the evaluator; `st` is the assignment.
--- (sh.applying_prefix: it is a command's prefix binding — a rejected one is non-fatal.)
 -- (M.IX: interp, bound on first use — interp requires this module. Fields, not locals: this
 -- chunk is at LuaJIT's 200-local limit.)
 -- The store (assign_full runs it under pcall): closure-free — every interpreted `x=…` in a
@@ -15335,7 +15299,7 @@ function M.assign_body_full(sh, st, nref_base, nref_sub)
 		elseif b and (b.lower or b.upper) then -- declare -l/-u: case-fold on assign
 			local v = assign_rhs_a(sh, st)
 			sh:set_str(st.name, b.lower and v:lower() or v:upper())
-		elseif sh:set_str(st.name, assign_rhs_a(sh, st)) == false and not sh.applying_prefix then
+		elseif sh:set_str(st.name, assign_rhs_a(sh, st)) == false then
 			error({ __curse_exit = 1, __curse_lineabort = true, __curse_noee = true }) -- (a bad nameref target)
 		end
 	end
@@ -15355,18 +15319,12 @@ function M.assign_full(sh, st)
 		if sh.opt_c or sh.opt_posix then
 			error({ __curse_exit = 1 })
 		end
-		if sh.applying_prefix then -- (as any readonly: a prefix is non-fatal, a
-			return -- standalone assignment aborts the rest of the line)
-		end
 		error({ __curse_exit = 1, __curse_lineabort = true })
 	end
 	if st.index == "" then -- `a[]=v`: empty subscript is a bad array subscript (bash: status 1, no
 		io.stderr:write("curse: " .. st.name .. "[]: bad array subscript\n") -- assign, the rest of
 		M.report_exit(sh) -- (err_badarraysub: report_error)
-		sh.status = 1 -- the line abandoned; as a prefix binding it's just skipped)
-		if sh.applying_prefix then
-			return
-		end
+		sh.status = 1 -- the line abandoned)
 		error({ __curse_exit = 1, __curse_lineabort = true })
 	end
 	local rb = sh.vars[sh:deref(st.name)]
@@ -15435,12 +15393,8 @@ function M.assign_full(sh, st)
 		if sh.opt_c or sh.opt_posix then
 			error({ __curse_exit = 1 })
 		end
-		-- A readonly command PREFIX (`abc=def echo one`) is non-fatal: bash still runs
-		-- the command. But a STANDALONE readonly assignment (`readonly x=1; x=2; echo
-		-- hi`) aborts the REST of the line, then the next line runs.
-		if sh.applying_prefix then
-			return
-		end
+		-- A STANDALONE readonly assignment (`readonly x=1; x=2; echo hi`) aborts the REST
+		-- of the line, then the next line runs (a command prefix: M.prefix_reject).
 		error({ __curse_exit = 1, __curse_lineabort = true })
 	end
 	-- A bad substitution / invalid indirect in the RHS fails the assignment but is
