@@ -820,16 +820,6 @@ function Shell:localAssign(arg, cmd)
 	return true
 end
 
--- Split on default-IFS whitespace (no empty fields), for unquoted `$var` in a
--- `for x in $list` word list. (Custom IFS comes with the fuller word engine.)
-function Shell:split(s)
-	local out = {}
-	for w in s:gmatch("%S+") do
-		out[#out + 1] = w
-	end
-	return out
-end
-
 -- Bash-correct standalone IFS split (for `read`): whitespace-IFS runs collapse and
 -- trim edges; each non-whitespace-IFS char delimits (empty fields allowed), with a
 -- trailing delimiter not adding a trailing empty.
@@ -7134,11 +7124,7 @@ M.DYN_ASSIGN = { RANDOM = "random", SECONDS = "seconds", BASH_SUBSHELL = "subshe
 	BASH_SOURCE = "null", BASH_LINENO = "null", BASH_ARGC = "null", BASH_ARGV = "null",
 	GROUPS = "null" }
 do
--- bash's legal_number: optional blanks, sign, decimal digits, blanks — else nil
-local function legal_number(s)
-	local n = s:match("^%s*([+-]?%d+)%s*$")
-	return n and tonumber(n)
-end
+local legal_number = M.legal_number -- (bash: legal_number, else 0)
 -- Run `dn`'s assign hook with value `s` (b: its dyn box or nil). False when `dn` is no
 -- longer dynamic (unset) — the caller then stores the value like any other variable.
 function M.dyn_assign(sh, dn, s, b)

@@ -71,7 +71,7 @@ end
 -- assignment isn't a simple string set: readonly (reject), an array (write [0]), or
 -- declare -i/-l/-u (arith / case-fold)? Detects the attribute BUILTINS and array
 -- assignments. When false, compiled scalar assignments are a bare sh:set_str (zero
--- hot-path cost); when true they route through I.assign_scalar. A var attributed via
+-- hot-path cost); when true they route through rt.assign_scalar. A var attributed via
 -- eval is rare and simply unguarded — no worse than before.
 -- variables the shell itself makes readonly (bash): UID=… etc. is an error
 local BUILTIN_RO = { UID = 1, EUID = 1, PPID = 1, BASH_VERSINFO = 1, SHELLOPTS = 1, BASHOPTS = 1 }
@@ -4718,7 +4718,7 @@ H.assign = function(cx, st, after)
 		return EF.assign_native(cx, st, after)
 	end
 	-- SHELLOPTS/BASHOPTS are readonly derived specials with no var box, so neither a
-	-- bare native set nor I.assign_scalar rejects them. Always delegate so interp
+	-- bare native set nor rt.assign_scalar rejects them. Always delegate so interp
 	-- reports "readonly variable" (status 1), as bash does.
 	if not st.index and (st.name == "SHELLOPTS" or st.name == "BASHOPTS") then
 		return EF.assign_native(cx, st, after)
