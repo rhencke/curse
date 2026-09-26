@@ -8861,12 +8861,6 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
 					return p
 				end
 			end
-			if st.expr and st.expr.kind == "syntaxerr" then -- a malformed [[ ]]: fatal syntax error
-				local p = cx.newpc() -- (bash aborts a non-interactive shell; interp's dbracket)
-				cx.blocks[p] = dbg(st) .. 'io.stderr:write("curse: syntax error in conditional expression\\n"); sh.status = 2; if not sh.opt_i then error({ __curse_exit = 2 }) end'
-					.. ("; pc = %d"):format(after)
-				return p
-			end
 			EF.db_regex = nil
 			local cond = emit_dbracket_node(st.expr, cx.lifted)
 			if not cond then

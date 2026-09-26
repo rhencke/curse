@@ -2098,37 +2098,20 @@ local function cond_check(toks, quoted, nlb, eof, line0, tl)
 	error({ __curse_perr = true, pre = pre, exact = true, msg = "syntax error near `" .. near .. "'", fk = fk }, 0)
 end
 
--- Parse a [[ … ]] token list into a boolean-expression AST:
+-- Build a [[ … ]] token list's boolean-expression AST:
 --   {kind="and"/"or", l, r} | {kind="not", e} | {kind="str", word}
 --   {kind="unary", op, word} | {kind="binary", op, l, r, rq}
 -- `rq` marks the RHS of ==/!= as fully-quoted (literal, not a glob).
+-- The tokens already passed cond_check (bash's grammar), so the list is well formed:
+-- only bash's unary operators (COND_UNOP) are unary — `[[ -Q ]]` is a string test.
 local function parse_dbracket(toks, quoted)
-	local pos, serr = 1, false
+	local pos = 1
 	local function peek()
 		return toks[pos]
-	end
-	-- `<` `>` `&&` `||` can't stand where an operand is expected (`[[ -f < ]]` is a
-	-- parse error). Note `=`/`==`/`!=`/`=~` ARE accepted there as literal strings.
-	local function is_op(tok)
-		return tok == "<" or tok == ">" or tok == "&&" or tok == "||"
 	end
 	local parse_or
 	local function primary()
 		local t = peek()
-		if t == nil then
-			serr = true
-			return { kind = "str", word = parse_word("") }
-		end -- expected an operand
-		if t == "&&" or t == "||" then
-			serr = true
-			pos = pos + 1
-			return { kind = "str", word = parse_word("") }
-		end -- operator with no left operand
-		if t == ")" then
-			serr = true
-			pos = pos + 1
-			return { kind = "str", word = parse_word("") }
-		end -- unmatched `)` (a matched one is consumed after `(`)
 		if t == "!" then
 			pos = pos + 1
 			return { kind = "not", e = primary() }
@@ -2136,39 +2119,19 @@ local function parse_dbracket(toks, quoted)
 		if t == "(" then
 			pos = pos + 1
 			local e = parse_or()
-			if peek() == ")" then
-				pos = pos + 1
-			else
-				serr = true
-			end
+			pos = pos + 1 -- (its `)`)
 			e.paren = (e.paren or 0) + 1 -- (for `declare -f`, which prints the grouping)
 			return e
 		end
-		if t and t:match("^%-[a-zA-Z]$") then -- unary file/string test
-			if toks[pos + 1] == nil or is_op(toks[pos + 1]) then
-				serr = true
-			end -- needs a (non-operator) operand
+		if COND_UNOP[t] then -- unary file/string test
 			pos = pos + 2
-			return { kind = "unary", op = t, word = parse_word(toks[pos - 1] or "") }
+			return { kind = "unary", op = t, word = parse_word(toks[pos - 1]) }
 		end
 		pos = pos + 1 -- consume lhs
 		local op = peek()
-		if
-			op == "=="
-			or op == "!="
-			or op == "=~"
-			or op == "="
-			or op == "<"
-			or op == ">"
-			or (op and op:match("^%-[a-z][a-z]$"))
-		then
-			if toks[pos + 1] == nil then
-				serr = true
-			end -- a binary op needs a rhs
-			pos = pos + 1
-			local r = toks[pos]
-			pos = pos + 1
-			local rw = parse_word(r or "")
+		if COND_BINOP[op] then
+			pos = pos + 2
+			local rw = parse_word(toks[pos - 1])
 			local rq = quoted[pos - 1] -- (fully quoted: `"a"*` starts with a quote yet globs)
 			for _, p in ipairs(rq and rw.parts or {}) do
 				if not p.q then
@@ -2178,7 +2141,7 @@ local function parse_dbracket(toks, quoted)
 			end
 			return { kind = "binary", op = op, l = parse_word(t), r = rw, rq = rq }
 		end
-		return { kind = "str", word = parse_word(t or "") }
+		return { kind = "str", word = parse_word(t) }
 	end
 	local function parse_and()
 		local l = primary()
@@ -2196,14 +2159,8 @@ local function parse_dbracket(toks, quoted)
 		end
 		return l
 	end
-	local ast = parse_or()
-	-- empty `[[ ]]`, a dangling/extra operand, or a leftover token is a syntax error
-	if serr or #toks == 0 or pos <= #toks then
-		return { kind = "syntaxerr" }
-	end
-	return ast
+	return parse_or()
 end
-M.parse_dbracket = parse_dbracket
 
 -- ---- brace expansion ({a,b,c}, {m..n}, {m..n..step}, {a..z}) ----
 -- Textual, before any other expansion; applies to command words and for-in
