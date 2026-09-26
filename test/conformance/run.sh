@@ -38,7 +38,9 @@
 #
 # Usage:
 #   test/conformance/run.sh [--corpus cases|bash|oil|all] [--jobs N] [--timeout S]
-#                           [--shells a,b,c] [--results FILE] [-v|--verbose] [FILTER...]
+#                           [--shells a,b,c] [--results FILE] [--oracle BASH] [-v|--verbose] [FILTER...]
+#   --oracle / H_ORACLE: the oracle bash; default build/test/oracle/bash (meson builds it
+#   from the vendored 5.2.21). Its $BASH_VERSION must be 5.2.21(…), or nothing runs.
 #   FILTER: substrings; only test files whose name matches one are run.
 set -uo pipefail
 
@@ -75,9 +77,11 @@ if [ "${1:-}" = --run-unit ]; then
       # TMP and HOME point into the unit's own cwd, as oil's spec runner provides $TMP:
       # tests that `cd $TMP` or `cd ~` then create and delete files would otherwise
       # race each other (and every shell) in the real home directory.
-      bash)  ( cd "$cwd" && TMP="$cwd" HOME="$cwd" TMPDIR="$tmpd" XDG_RUNTIME_DIR="$H_XDG_RUNTIME" XDG_CACHE_HOME="$ucache" CURSE_FALLBACK="$H_FALLBACK" \
-                 THIS_SH="$(command -v bash)" timeout "$lim" bash "$runscript" </dev/null ) ;;
-      dash)  ( cd "$cwd" && TMP="$cwd" HOME="$cwd" TMPDIR="$tmpd" XDG_RUNTIME_DIR="$H_XDG_RUNTIME" XDG_CACHE_HOME="$ucache" CURSE_FALLBACK="$H_FALLBACK" \
+      # PATH starts with the ORACLE's directory (it holds only `bash`) for every shell:
+      # a test that runs `bash` by name gets the pinned 5.2.21 oracle, never the host's.
+      bash)  ( cd "$cwd" && PATH="$H_ORACLE_DIR:$PATH" TMP="$cwd" HOME="$cwd" TMPDIR="$tmpd" XDG_RUNTIME_DIR="$H_XDG_RUNTIME" XDG_CACHE_HOME="$ucache" CURSE_FALLBACK="$H_FALLBACK" \
+                 THIS_SH="$H_ORACLE" timeout "$lim" "$H_ORACLE" "$runscript" </dev/null ) ;;
+      dash)  ( cd "$cwd" && PATH="$H_ORACLE_DIR:$PATH" TMP="$cwd" HOME="$cwd" TMPDIR="$tmpd" XDG_RUNTIME_DIR="$H_XDG_RUNTIME" XDG_CACHE_HOME="$ucache" CURSE_FALLBACK="$H_FALLBACK" \
                  THIS_SH="$(command -v dash)" timeout "$lim" dash "$runscript" </dev/null ) ;;
       # curse via the resident daemon: the C client hands the script to cursed, which
       # tiers on a cache miss (interp -> OSR + store .bc) or loads the .bc on a hit.
@@ -85,7 +89,7 @@ if [ "${1:-}" = --run-unit ]; then
       # loudly so a dropped daemon can't masquerade as dash. The daemon reads the
       # CLIENT's env per request, so $ucache (per-unit) selects the compile cache:
       # first curse run misses (cold), second hits (hot).
-      curse) ( cd "$cwd" && TMP="$cwd" HOME="$cwd" TMPDIR="$tmpd" XDG_RUNTIME_DIR="$H_XDG_RUNTIME" XDG_CACHE_HOME="$ucache" \
+      curse) ( cd "$cwd" && PATH="$H_ORACLE_DIR:$PATH" TMP="$cwd" HOME="$cwd" TMPDIR="$tmpd" XDG_RUNTIME_DIR="$H_XDG_RUNTIME" XDG_CACHE_HOME="$ucache" \
                  CURSE_FALLBACK="$H_FALLBACK" THIS_SH="$H_THIS_SH" \
                  timeout "$lim" "$H_CLIENT" "$runscript" </dev/null ) ;;
     esac
@@ -281,7 +285,7 @@ fi
 
 # ------------------------------- driver --------------------------------------
 CORPUS=all; JOBS="${JOBS:-}"; H_TIMEOUT="${TIMEOUT:-10}"; VERBOSE=0
-SHELLS_SEL=""; FILTERS=(); BASH_DIR=""; OIL_DIR=""; RESULTS=""
+SHELLS_SEL=""; FILTERS=(); BASH_DIR=""; OIL_DIR=""; RESULTS=""; ORACLE="${H_ORACLE:-}"
 while [ $# -gt 0 ]; do
   case "$1" in
     --corpus)   CORPUS="$2"; shift 2 ;;
@@ -290,6 +294,7 @@ while [ $# -gt 0 ]; do
     --shells)   SHELLS_SEL="$2"; shift 2 ;;
     --bash-dir) BASH_DIR="$2"; shift 2 ;;   # bash suite tests/ dir (Meson subproject)
     --oil-dir)  OIL_DIR="$2"; shift 2 ;;    # oil spec/ dir (Meson subproject)
+    --oracle)   ORACLE="$2"; shift 2 ;;     # the oracle bash (default: the in-tree 5.2.21 build)
     --results)  RESULTS="$2"; shift 2 ;;    # keep the raw per-test rows (corpus\tshell\tverdict\tduration_us\ttestid\twhy)
     -v|--verbose) VERBOSE=1; shift ;;
     -h|--help) sed -n '2,/^set -uo/{/^set -uo/d;p}' "$0"; exit 0 ;;
@@ -300,6 +305,21 @@ while [ $# -gt 0 ]; do
 done
 
 case "$H_TIMEOUT" in ''|*[!0-9]*) echo "error: --timeout/TIMEOUT must be whole seconds: $H_TIMEOUT" >&2; exit 2 ;; esac
+# THE ORACLE: bash 5.2.21 built from the vendored bash subproject (meson builds it at
+# build/test/oracle/bash; --oracle PATH or H_ORACLE to point elsewhere). curse is
+# bug-for-bug compatible with exactly that release, and the bash corpus is its own suite;
+# the host's bash (another 5.2.x, with distro patches) would silently mix two versions.
+# Its version is CHECKED before anything runs — no fallback to any other bash.
+ORACLE_VERSION=5.2.21
+[ -n "$ORACLE" ] || ORACLE="$REPO/build/test/oracle/bash"
+case "$ORACLE" in /*) ;; *) ORACLE="$PWD/$ORACLE" ;; esac
+[ -x "$ORACLE" ] || { echo "error: no oracle bash at $ORACLE — build it: meson compile -C build oracle-bash (or pass --oracle PATH)" >&2; exit 2; }
+ov=$("$ORACLE" -c 'echo "$BASH_VERSION"' </dev/null 2>/dev/null)
+case "$ov" in "$ORACLE_VERSION("*) ;;
+  *) echo "error: oracle $ORACLE is bash '${ov:-?}', not $ORACLE_VERSION — curse is scored against bash $ORACLE_VERSION only" >&2; exit 2 ;;
+esac
+[ "$(basename "$ORACLE")" = bash ] || { echo "error: the oracle must be named 'bash' (its directory goes first on PATH): $ORACLE" >&2; exit 2; }
+H_ORACLE=$ORACLE; H_ORACLE_DIR=$(dirname "$ORACLE")
 LUAJIT="${CURSE_LUAJIT:-$REPO/build/luajit}"
 BUNDLE="$REPO/build/curse.bc"
 [ -x "$LUAJIT" ] || { echo "error: no built luajit at $LUAJIT — run 'meson compile -C build' first." >&2; exit 1; }
@@ -472,9 +492,9 @@ if [ "$total" -eq 0 ]; then
   echo "no tests selected."; exit 0
 fi
 
-echo "harness: $total tests × [${SHELLS//,/ }]  (jobs=$JOBS, timeout=${H_TIMEOUT}s)"
+echo "harness: $total tests × [${SHELLS//,/ }]  (jobs=$JOBS, timeout=${H_TIMEOUT}s, oracle bash $ov)"
 export H_TIMEOUT H_SHELLS="$SHELLS" H_TIMEOUTS="$REPO/test/conformance/timeouts" H_NPROC="$(nproc 2>/dev/null || echo 0)"
-export H_CLIENT H_THIS_SH H_XDG_RUNTIME H_XDG_CACHE H_FALLBACK
+export H_CLIENT H_THIS_SH H_XDG_RUNTIME H_XDG_CACHE H_FALLBACK H_ORACLE H_ORACLE_DIR
 # (in the background + wait, so an interrupt reaches cleanup at once and it can stop them)
 seq 1 "$total" | xargs -P "$JOBS" -I{} "$0" --run-unit "$workdir" {} &
 XARGS_PID=$!

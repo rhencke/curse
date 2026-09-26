@@ -143,29 +143,40 @@ dash_prog = find_program('dash', required: false)
 conf = find_program('test' / 'conformance' / 'run.sh')
 conf_shells = dash_prog.found() ? 'dash,curse-cold,curse-hot' : 'curse-cold,curse-hot'
 
-# `cases` (curse's own scripts) needs no external corpus — always available.
+# `cases` (curse's own scripts) needs no external corpus, but it does need the oracle (below).
 # curse now runs via its daemon, so the tests need the built luajit + the module
 # bundle + the C client; depend on all three so `meson test` builds them itself.
 conf_deps = [vm, bundle, curse_client]
-test('conformance-cases', conf, args: ['--corpus', 'cases', '--shells', conf_shells, '-v'],
-  suite: 'conformance', depends: conf_deps, workdir: repo, is_parallel: false, timeout: 0)
 
 # bash + oil corpora are Meson subprojects (bash: release tarball + checksum; oil:
 # pinned git, whose spec tests ship in no release tarball). Required by default: a
 # fetch failure is a HARD ERROR, not a soft skip. -Dconformance=disabled skips the
 # fetch for a lean/offline build; =auto makes it best-effort (non-fatal offline).
 conf_feat = get_option('conformance')
+# The ORACLE every corpus is scored against is bash built from the bash subproject
+# (5.2.21), never the host's bash: curse is bug-for-bug compatible with that exact
+# release, and the bash corpus is its own test suite. The harness refuses to run
+# against anything else (it checks $BASH_VERSION). So the bash subproject is needed
+# even for the cases corpus.
+bash_found = false
 if not conf_feat.disabled()
   bash_sp = subproject('bash', required: conf_feat)
   oil_sp  = subproject('oil',  required: conf_feat)
-  if bash_sp.found()
-    test('conformance-bash', conf,
-      args: ['--corpus', 'bash', '--bash-dir', bash_sp.get_variable('tests_dir'), '--shells', conf_shells, '-v'],
-      suite: 'conformance', depends: conf_deps, workdir: repo, is_parallel: false, timeout: 0)
-  endif
+  bash_found = bash_sp.found()
+endif
+if bash_found
+  bash_src_dir = bash_sp.get_variable('tests_dir') / '..'
+  subdir('test' / 'oracle')
+  conf_deps += [oracle_bash]
+  oracle_args = ['--oracle', oracle_bash.full_path(), '-v']
+  test('conformance-cases', conf, args: ['--corpus', 'cases', '--shells', conf_shells] + oracle_args,
+    suite: 'conformance', depends: conf_deps, workdir: repo, is_parallel: false, timeout: 0)
+  test('conformance-bash', conf,
+    args: ['--corpus', 'bash', '--bash-dir', bash_sp.get_variable('tests_dir'), '--shells', conf_shells] + oracle_args,
+    suite: 'conformance', depends: conf_deps, workdir: repo, is_parallel: false, timeout: 0)
   if oil_sp.found()
     test('conformance-oil', conf,
-      args: ['--corpus', 'oil', '--oil-dir', oil_sp.get_variable('spec_dir'), '--shells', conf_shells, '-v'],
+      args: ['--corpus', 'oil', '--oil-dir', oil_sp.get_variable('spec_dir'), '--shells', conf_shells] + oracle_args,
       suite: 'conformance', depends: conf_deps, workdir: repo, is_parallel: false, timeout: 0)
   endif
 endif

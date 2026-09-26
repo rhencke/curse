@@ -1,6 +1,7 @@
 [wrap-file]
 # GNU bash's own test suite, from the canonical release tarball (checksummed).
-# Pinned to 5.2.21 to match the host oracle bash; bump both together. The tarball
+# Pinned to 5.2.21: the harness's oracle is BUILT from this tree (test/oracle,
+# tools/build-oracle-bash.sh) and curse follows this exact release, bug for bug. The tarball
 # ships tests/*.tests + *.right; the harness runs the *.tests under each shell.
 # (ftpmirror redirects to a mirror; the bytes are identical across mirrors, so the
 # hash is stable. Use https://ftp.gnu.org/gnu/bash/ if a mirror misbehaves.)
