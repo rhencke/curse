@@ -157,26 +157,22 @@ function M.store(path, code)
 		C.close(lockfd)
 		return false
 	end
-	-- double-checked: someone may have finished between our load() miss and here.
+	-- (no "already published?" double-check: the caller's load missed, so whatever is at
+	-- `path` is corrupt or stale, or a racing twin just published the same bytes —
+	-- replacing it atomically is right either way; skipping left a corrupt one forever)
+	-- temp MUST be in the same dir as `path` (rename is atomic only within a
+	-- filesystem); we hold the exclusive lock, so the fd alone makes it unique.
 	local ok = false
-	local f = io.open(path, "r")
-	if f then
-		f:close()
-		ok = true -- already published; nothing to do
-	else
-		-- temp MUST be in the same dir as `path` (rename is atomic only within a
-		-- filesystem); we hold the exclusive lock, so the fd alone makes it unique.
-		local tmp = path .. ".tmp." .. tostring(lockfd)
-		local o = io.open(tmp, "w")
-		if o then
-			local wrote = o:write(code)
-			o:close()
-			if wrote then
-				ok = os.rename(tmp, path) and true or false
-			end
-			if not ok then
-				os.remove(tmp)
-			end
+	local tmp = path .. ".tmp." .. tostring(lockfd)
+	local o = io.open(tmp, "w")
+	if o then
+		local wrote = o:write(code)
+		o:close()
+		if wrote then
+			ok = os.rename(tmp, path) and true or false
+		end
+		if not ok then
+			os.remove(tmp)
 		end
 	end
 	C.flock(lockfd, 8) -- LOCK_UN (also released on close, but be explicit)
