@@ -117,6 +117,16 @@ foreach t : ['test_cache', 'test_ext', 'test_forin', 'test_funcs', 'test_nested'
     timeout: 120)
 endforeach
 
+# The static self-contained `curse` as a shell (argv[0] sh/bash): its ffi.C resolves
+# through lib_cursesys.c's symbol table, not dlsym, and the corpora only exercise the
+# daemon — so check the table covers every ffi.C symbol and run external commands.
+test('static-shell', files('test' / 'static-shell.sh'),
+  args:    [luajit_bin, curse, repo],
+  workdir: repo,
+  depends: [vm, curse],
+  suite:   'unit',
+  timeout: 120)
+
 run_target('fetch-real', command: [files('test' / 'real' / 'fetch.sh')])
 
 # --- Conformance harness: bash (oracle) vs dash vs curse interp/compiled/tiered.

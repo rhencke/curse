@@ -283,7 +283,7 @@ index 24a1f7e4..bdb806fa 100644
    ExitState *ex = (ExitState *)exptr;
    ExitDataCP exd;
 diff --git a/src/luajit.c b/src/luajit.c
-index 65d55c3c..c717f8d6 100644
+index 65d55c3c..52be1dbf 100644
 --- a/src/luajit.c
 +++ b/src/luajit.c
 @@ -53,6 +53,9 @@ static void signal_set(int sig, void (*h)(int))
@@ -322,7 +322,7 @@ index 65d55c3c..c717f8d6 100644
  static int pmain(lua_State *L)
  {
    struct Smain *s = &smain;
-@@ -532,6 +554,34 @@ static int pmain(lua_State *L)
+@@ -532,6 +554,38 @@ static int pmain(lua_State *L)
    globalL = L;
    LUAJIT_VERSION_SYM();  /* Linker-enforced version check. */
  
@@ -347,9 +347,13 @@ index 65d55c3c..c717f8d6 100644
 +      lua_createtable(L, s->argc, 1);  /* arg[0]=argv[0], arg[1..]=the shell args */
 +      for (i = 0; i < s->argc; i++) { lua_pushstring(L, argv[i]); lua_rawseti(L, -2, i); }
 +      lua_setglobal(L, "arg");
++      lua_pushcfunction(L, traceback);  /* (message handler, under the call) */
 +      lua_getglobal(L, "require");
 +      lua_pushliteral(L, "run");
-+      s->status = lua_pcall(L, 1, 0, 0);  /* run.lua os.exit()s; returns only on error */
++      s->status = lua_pcall(L, 1, 0, -3);  /* run.lua os.exit()s; returns only on error */
++      /* An error escaping the shell is a curse bug: it must NEVER end the process
++       * silently (main()'s report() only sees pmain's own status) -- say what it was. */
++      report(L, s->status);
 +      return 0;
 +    }
 +  }
@@ -357,7 +361,7 @@ index 65d55c3c..c717f8d6 100644
    argn = collectargs(argv, &flags);
    if (argn < 0) {  /* Invalid args? */
      print_usage();
-@@ -547,6 +597,7 @@ static int pmain(lua_State *L)
+@@ -547,6 +601,7 @@ static int pmain(lua_State *L)
    /* Stop collector during library initialization. */
    lua_gc(L, LUA_GCSTOP, 0);
    luaL_openlibs(L);
