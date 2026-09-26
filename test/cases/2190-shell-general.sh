@@ -4,6 +4,11 @@
 # PROMPT_DIRTRIM trimming for \w). The shell under test runs as a child via $THIS_SH;
 # its path is normalized to SH in diagnostics.
 S=${THIS_SH:-bash}
+# HOME is this test's own scratch directory: the startup-file checks write .bash_profile
+# etc. into $PWD for `-l` to find in $HOME, and \w prints the working directory as
+# ~/… only under $HOME. Taking HOME from the caller made the output depend on where the
+# test ran (the full scratch path — a fresh temp dir per run — or a real ~ missing files).
+export HOME=$PWD
 n() { sed "s#$S#SH#g"; }
 t() { echo "--- $*"; "$S" "$@" 2>&1 | n; echo "st=${PIPESTATUS[0]}"; }
 h() { echo "--- $*"; "$S" "$@" 2>&1 | sed -n 1p | n; echo "st=${PIPESTATUS[0]}"; }
