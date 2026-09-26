@@ -870,6 +870,9 @@ end
 -- neither applies. (Inline is disabled when a trap is present, so all calls come here.)
 local function fnwrap(cmd, line, s)
 	local pre, post = "", ""
+	if not s:find("sh:pop", 1, true) then -- (a bare call: pop_context's sv_ifs — rt.ifs_first)
+		post = "; if sh.ifs_fc then rt.ifs_popchk(sh) end"
+	end
 	-- a RETURN trap (set now, or one a function may set): it fires as the callee returns,
 	-- in its frame, and `return N` there parks N in sh.fret so the trap sees the $? from
 	-- before it (rt.fn_return); a top-level one is hidden from the callee (rt.debug_enter)
@@ -984,7 +987,7 @@ end
 
 -- word_safe but for an unquoted $((…)) part: its value is digits and '-', one field unless
 -- $IFS holds one of those (`IFS=1; echo $((10+1))` -> "" ""). emit_fields_into renders it
--- as the single value behind a runtime rt.ifs_num test, else the segment field engine.
+-- as the single value behind a runtime rt.ifs_num(x) test, else the segment field engine.
 local function arith_guard(w)
 	return not word_safe(w) and word_safe(w, true)
 end
@@ -2712,30 +2715,37 @@ local seg_native
 --   unquoted literal  -> add(s, true):  glob-active, no split (word-initial ~)
 --   unquoted $expand  -> feed_split(s): word-split on $IFS, then glob each field
 local function emit_seg(p, i, lifted, w)
+	-- (multi segments carry `h`: bash splits the word as has_dollar_at — interp's multi_hda —
+	-- and `at`: this is a "$@" that, as the whole word outside an array literal, bash
+	-- returns unsplit — see rt.expand_fields)
 	if p.special == "@" or p.special == "*" then -- $@ / $*: a multi-element segment
-		return ("{multi=true,star=%s,q=%s,elems=sh:paramList()}"):format(
+		return ("{multi=true,star=%s,q=%s,elems=sh:paramList(),h=%s,at=%s}"):format(
 			tostring(p.special == "*"),
-			tostring(p.q or false)
+			tostring(p.q or false),
+			tostring(p.special == "@" or not (p.q or p.braced)),
+			tostring(p.special == "@" and not p.braced and not (w and w.aelem))
 		)
 	end
 	if p.pexp and p.pexp.op == "indirect" then -- ${!ref}: runtime-resolved (bootstrap) multi-segment
 		local pe = p.pexp -- q = the outer quoting OR a quoted multi alternate's forced quoting (__qf)
-		return ("(function() local __e, __s, __qf = rt.indirect_elems(sh, %q, %s, %s, %s, %d); return {multi=true,star=__s,q=(%s or __qf),elems=__e} end)()"):format(
+		return ("(function() local __e, __s, __qf = rt.indirect_elems(sh, %q, %s, %s, %s, %d); return {multi=true,star=__s,q=(%s or __qf),elems=__e,h=not (__s and %s)} end)()"):format(
 			pe.name,
 			pe.index and ("%q"):format(pe.index) or "nil",
 			pe.iop and ("%q"):format(pe.iop) or "nil",
 			tostring(p.q or false),
 			EF.cur_line or 0,
+			tostring(p.q or false),
 			tostring(p.q or false)
 		)
 	end
 	if p.pexp and p.pexp.op == "prefix" then -- ${!pre@}/${!pre*}: the set of variable NAMES with the
 		-- prefix, as a multi-element segment (each name its own field) — interp's var_prefix_names.
 		-- The `*` form joins with IFS[0] in a quoted context (rt.expand_fields, like ${a[*]}).
-		return ("{multi=true,star=%s,q=%s,elems=sh:var_prefix_names(%q)}"):format(
+		return ("{multi=true,star=%s,q=%s,elems=sh:var_prefix_names(%q),h=%s}"):format(
 			tostring(p.pexp.star and true or false),
 			tostring(p.q or false),
-			p.pexp.name
+			p.pexp.name,
+			tostring(not p.pexp.star)
 		)
 	end
 	if p.pexp and pexp_compilable(p.pexp) then -- scalar ${..} op: len/subst/strip/default/@Q/substring
@@ -2759,6 +2769,7 @@ local function emit_seg(p, i, lifted, w)
 		-- indexed) or the array's values.
 		local elems = positional and (pe.op == "sub" and "sh:paramListSub()" or "sh:paramList()")
 			or ("sh:array_values(%s)"):format(aname)
+		local hdyn -- (h known only at run time: see ARRAY_DEFAULT)
 		if pe.op == "indices" then -- ${!a[@]}: the keys/indices, not the values
 			elems = ("rt.array_index_strs(sh, %s)"):format(aname)
 		elseif pe.op == "sub" then -- ${a[@]:off:len} / ${@:off:len} slice: arith off/len, then select
@@ -2776,17 +2787,20 @@ local function emit_seg(p, i, lifted, w)
 			local def = emit_word(P.parse_word(pe.arg or ""), lifted)
 			local ne = ((pe.index == "*" or pe.name == "*") and p.q) and "rt.ifs_join_ne(sh, __e)"
 				or '(#__e > 1 or (__e[1] ~= nil and __e[1] ~= ""))'
+			-- (the second value: bash expanded the array itself, so the word is has_dollar_at —
+			-- interp's multi_hda; the gated default word holds no @ form)
 			local body
 			if pe.op == "-" then
-				body = ("if #__e > 0 then return __e else return {%s} end"):format(def)
+				body = ("if #__e > 0 then return __e, true else return {%s} end"):format(def)
 			elseif pe.op == ":-" then
-				body = ("if %s then return __e else return {%s} end"):format(ne, def)
+				body = ("if %s then return __e, true else return {%s} end"):format(ne, def)
 			elseif pe.op == "+" then
-				body = ("if #__e > 0 then return {%s} else return {} end"):format(def)
+				body = ("if #__e > 0 then return {%s} else return {}, true end"):format(def)
 			else
-				body = ("if %s then return {%s} else return {} end"):format(ne, def)
+				body = ("if %s then return {%s} else return {}, true end"):format(ne, def)
 			end -- :+
 			elems = ("(function() local __e = %s; %s end)()"):format(elems, body)
+			hdyn = true
 		elseif pe.op then -- per-element string-op (strip/subst/case/@Q…): map apply_str_op
 			-- a STROP pattern with a quoted/backslash metachar renders mask-aware (emit_pattern_glob),
 			-- exactly like the scalar strop; a verbatim-safe pattern (and every @-transform letter)
@@ -2796,10 +2810,16 @@ local function emit_seg(p, i, lifted, w)
 				or ("%q"):format(pe.arg or "")
 			elems = ("rt.array_op_values(sh, %s, %q, %s, %q)"):format(elems, pe.op, pg, pe.arg2 or "")
 		end
-		return ("{multi=true,star=%s,q=%s,elems=%s}"):format(
+		local h = tostring(pe.index == "@" or (pe.op ~= "indices" and (pe.name == "@" or (pe.index == "*" and not p.q))))
+		if hdyn then
+			return ("(function() local __e, __h = %s; return {multi=true,star=%s,q=%s,elems=__e,h=__h and %s} end)()"):format(
+				elems, tostring(pe.index == "*" or pe.name == "*"), tostring(p.q or false), h)
+		end
+		return ("{multi=true,star=%s,q=%s,elems=%s,h=%s}"):format(
 			tostring(pe.index == "*" or pe.name == "*"),
 			tostring(p.q or false),
-			elems
+			elems,
+			h
 		)
 	end
 	if p.lenof and p.special then -- ${##} ${#?} ${#$} ${#!} ${#-}: the special value's length
@@ -2840,7 +2860,7 @@ local function emit_fields_into(tbl, w, lifted, wrap)
 				tostring(not p.q)
 			)
 		end
-		return ("if rt.ifs_num(sh) then local __f = rt.expand_fields(sh, {%s}); for __i=1,#__f do %s[#%s+1]=%s end else %s[#%s+1] = %s end"):format(
+		return ("if rt.ifs_numx(sh) then local __f = rt.expand_fields(sh, {%s}); for __i=1,#__f do %s[#%s+1]=%s end else %s[#%s+1] = %s end"):format(
 			table.concat(segs, ", "), tbl, tbl, W("__f[__i]"), tbl, tbl, W(emit_word(w, lifted)))
 	end
 	local fw = not word_safe(w) and field_word(w, lifted)
@@ -5058,10 +5078,10 @@ H.simple = function(cx, st, after)
 		local fast = EF.with({ arith_ok = true }, simple_compiled, cx, st, after)
 		if type(cx.blocks[fast]) == "string" then -- (the test heads the fast entry block: no extra pc hop)
 			p = fast
-			cx.blocks[p] = ("if rt.ifs_num(sh) then pc = %d else %s end"):format(slow, cx.blocks[p])
+			cx.blocks[p] = ("if rt.ifs_numx(sh) then pc = %d else %s end"):format(slow, cx.blocks[p])
 		else
 			p = cx.newpc()
-			cx.blocks[p] = ("if rt.ifs_num(sh) then pc = %d else pc = %d end"):format(slow, fast)
+			cx.blocks[p] = ("if rt.ifs_numx(sh) then pc = %d else pc = %d end"):format(slow, fast)
 		end
 	else
 		p = simple_compiled(cx, st, after)
@@ -5995,7 +6015,7 @@ simple_compiled = function(cx, st, after)
 		local us = cx.newloopvar()
 		local lastw = st.words[#st.words]
 		local post = cx.newpc()
-		cx.blocks[post] = ('sh:set_str("_", %s); pc = %d'):format(us, after)
+		cx.blocks[post] = ('sh:set_str("_", %s); if sh.ifs_fc then rt.ifs_popchk(sh) end; pc = %d'):format(us, after) -- (pop_context's sv_ifs: rt.ifs_first)
 		local bodyentry = cx.flatten_list(subst_list(cx.inlinefns[cmd], pb), post)
 		local pre = cx.newpc()
 		local xpre = ""

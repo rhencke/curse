@@ -7,6 +7,7 @@ local array_key, sh_printf = I.array_key, I.sh_printf
 
 return function(sh, cmd, args, hook, tcb)
 	if cmd == "printf" then
+		rt.pf_sh = sh -- (its `'c` arguments' mbtowc state: interp's char_value)
 		-- printf [-v VAR] FMT [ARGS…] — native, bash-compatible.
 		-- options (internal_getopt "v:"): each -v NAME / -vNAME is checked as it comes, and
 		-- the last one wins; `--` ends them
