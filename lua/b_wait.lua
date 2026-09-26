@@ -25,6 +25,7 @@ end
 -- a waited job that a signal killed: bash's `PID Desc  command` line (rt.jobs_notify: not
 -- for the signals a script expects to end things — INT, PIPE, TERM — nor a trapped one)
 local function report(sh, j)
+	rt.jobs_poll(sh) -- (…and every other one that ended meanwhile: wait_for's notify_and_cleanup)
 	rt.jobs_notify(sh, j)
 end
 
@@ -163,7 +164,7 @@ wait_builtin = function(sh, cmd, args, hook, tcb)
 			end
 			return rt.wexit(stbuf[0])
 		end
-		local nflag, specs = false, {}
+		local nflag, fflag, specs = false, false, {}
 		local pvar -- -p VAR: the pid whose status is returned lands in VAR
 		local k, sp, c, a = 2
 		repeat -- (internal_getopt "fnp:"; -f is accepted: we always block until done anyway)
@@ -171,7 +172,7 @@ wait_builtin = function(sh, cmd, args, hook, tcb)
 			if c == "?" then
 				return
 			end
-			nflag, pvar = nflag or c == "n", a or pvar
+			nflag, pvar, fflag = nflag or c == "n", a or pvar, fflag or c == "f"
 		until not c
 		for j = k, #args do
 			specs[#specs + 1] = args[j]
@@ -193,11 +194,35 @@ wait_builtin = function(sh, cmd, args, hook, tcb)
 			end
 		end
 		sh.jobs = sh.jobs or {}
+		rt.jobs_stop_poll(sh)
+		-- a STOPPED job isn't waited for: wait_for returns at once, 128 + the stop signal —
+		-- unless -f, which waits for it to end (it must be continued first)
+		local function stopped(j)
+			local ss = rt.job_state(j) == "stopped" and rt.job_stopsig(j)
+			return ss and 128 + ss or nil
+		end
+		local function reap_job(j)
+			local ss = stopped(j)
+			while ss and fflag and not sh.wait_sig do -- (-f: until it's continued, then its end)
+				rt.sched_pump({ deadline = rt.wall_secs() + 0.01 })
+				rt.jobs_stop_poll(sh)
+				ss = stopped(j)
+			end
+			if ss then
+				return ss
+			end
+			return job_reap(sh, j)
+		end
 		local waited -- the pid whose status we return (for -p)
 		if nflag then
 			-- -n: the first job to end — one that already has and isn't yet reported first;
 			-- with ids, only among those (127 if none can)
-			local list = table_jobs(sh, true)
+			local list = {}
+			for _, j in ipairs(table_jobs(sh, true)) do -- (a stopped one can't end: not waited for)
+				if rt.job_state(j) ~= "stopped" then
+					list[#list + 1] = j
+				end
+			end
 			if #specs > 0 then
 				local want, sel = {}, {}
 				for _, sp in ipairs(specs) do
@@ -257,7 +282,7 @@ wait_builtin = function(sh, cmd, args, hook, tcb)
 						io.stderr:write("curse: wait: pid " .. pid .. " is not a child of this shell\n")
 						last, waited = 127, nil
 					elseif found then
-						last = job_reap(sh, found) or 127
+						last = reap_job(found) or 127
 						if found.done then
 							report(sh, found)
 							rt.job_waited(sh, found)
@@ -291,7 +316,10 @@ wait_builtin = function(sh, cmd, args, hook, tcb)
 						end
 						last, waited = 127, nil
 					else
-						last, waited = job_reap(sh, j) or 127, j.pid
+						if not fflag and rt.job_state(j) == "stopped" then -- (wait_for_job's)
+							io.stderr:write(("curse: warning: wait_for_job: job %d is stopped\n"):format(j.id))
+						end
+						last, waited = reap_job(j) or 127, j.pid
 						if j.done then
 							report(sh, j)
 							rt.job_waited(sh, j)
@@ -314,8 +342,22 @@ wait_builtin = function(sh, cmd, args, hook, tcb)
 			-- saw it end — rt.jobs_poll — or a signal killed it while we waited on another, as
 			-- bash's waitchld reaps a child killed alongside; one that just finishes meanwhile
 			-- would, as a bash child, still have been running when reached)
+			-- (a stopped job isn't waited for, nor forgotten: each scan for the next running
+			-- job warns about it — once per job waited for, and once at the end)
+			local held = {}
+			local function warn_stopped()
+				for _, x in ipairs(table_jobs(sh)) do
+					if rt.job_state(x) == "stopped" then
+						held[x.pid] = true
+						io.stderr:write(("curse: wait: warning: job %d[%d] stopped\n"):format(x.id, x.pid))
+					end
+				end
+			end
 			local gone, blocked = {}, false
 			for _, j in ipairs(table_jobs(sh)) do
+				if rt.job_state(j) == "stopped" then
+					goto nextjob
+				end
 				local ended = j.done
 				if not ended and j.g then
 					ended = blocked and j.g.done and job_reap(sh, j, true) ~= nil and j.sig ~= nil
@@ -323,6 +365,7 @@ wait_builtin = function(sh, cmd, args, hook, tcb)
 					ended = job_reap(sh, j, true) ~= nil
 				end
 				if not ended then
+					warn_stopped()
 					blocked = blocked or not (j.g and j.g.done)
 					job_reap(sh, j)
 					report(sh, j)
@@ -333,16 +376,25 @@ wait_builtin = function(sh, cmd, args, hook, tcb)
 				if not ended or tostring(j.pid) ~= sh.last_bg_pid then
 					gone[#gone + 1] = j
 				end
+				::nextjob::
+			end
+			if not sh.wait_sig then
+				warn_stopped()
 			end
 			for _, j in ipairs(gone) do -- (deleted after: $!'s job doesn't become current meanwhile)
 				rt.job_delete(sh, j)
 				j.forgot = not sh.wait_sig or nil -- (bgp_clear: a later `wait PID` doesn't know it)
 			end
 			if sh.bg_pids and not sh.wait_sig then
+				local kept = {}
 				for _, p in ipairs(sh.bg_pids) do
-					pcall(reap, p)
+					if held[p] then
+						kept[#kept + 1] = p
+					else
+						pcall(reap, p)
+					end
 				end
-				sh.bg_pids = {}
+				sh.bg_pids = kept
 			end
 			sh.status = 0
 			waited = nil -- (wait with no ids never sets VAR)

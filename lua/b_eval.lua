@@ -76,8 +76,8 @@ return function(sh, cmd, args, hook, tcb)
 							require("interp").v_echo(sh, code, nil, vst)
 							break
 						end
-						if sh.jobs_waited then -- (reading a line: notify_and_cleanup — rt.job_waited)
-							rt.jobs_cleanup_waited(sh)
+						if sh.jobs_waited or sh.jobs_pending then -- (reading a line: notify_and_cleanup)
+							rt.jobs_line(sh)
 						end
 						if sh.opt_v and lg.pline then
 							require("interp").v_echo(sh, code, lg.pline - (ln > 0 and ln or 1) + 1, vst)

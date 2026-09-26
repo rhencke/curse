@@ -852,6 +852,7 @@ ffi.cdef([[
   int sigemptyset(void *set);
   int sigprocmask(int how, const void *set, void *oldset);
   int waitpid(int pid, int *wstatus, int options);
+  int curse_rt_waitid(int idtype, int id, void *info, int options) asm("waitid");
   int pipe(int fildes[2]);
   int close(int fd);
   int dup2(int oldfd, int newfd);
@@ -2307,6 +2308,7 @@ end
 -- child — via a spawnattr with SETSIGMASK. Returns the attr (kept alive by the
 -- caller until after the spawn, then destroyed) or nil when no trap is active.
 local SPAWN_SETSIGMASK = 0x08 -- POSIX_SPAWN_SETSIGMASK (glibc)
+M.SPAWN_SETPGROUP = 0x02 -- POSIX_SPAWN_SETPGROUP (process group attr 0: the child's own pid)
 local function child_spawnattr(self)
 	if not (self.sigtraps and next(self.sigtraps)) and not CO then -- CO: SIGPIPE is blocked
 		return nil
@@ -2408,6 +2410,18 @@ local function spawn_argv(self, path, args, n, fa, hold, lvl)
 	local attr = child_spawnattr(self)
 	if hold then
 		attr = async_spawn_hold(attr)
+	end
+	if self.job_pgrp then -- a job-control job's process: a process group of its own (setpgid)
+		if attr then
+			C.posix_spawnattr_setflags(attr, SPAWN_SETSIGMASK + M.SPAWN_SETPGROUP)
+		else
+			attr = ffi.new("uint8_t[1024]")
+			if C.posix_spawnattr_init(attr) == 0 then
+				C.posix_spawnattr_setflags(attr, M.SPAWN_SETPGROUP)
+			else
+				attr = nil
+			end
+		end
 	end
 	M.rd_gen = M.rd_gen + 1 -- (a new process may read our input: see M.pipe_cache)
 	local d = M.shlvl_delta
@@ -2522,11 +2536,10 @@ function Shell:exec_t(args)
 		execpath = self:resolve_cmd(args[1])
 		if not execpath and args[1]:byte(1) == 37 and not self.exec_builtin
 			and ((self.in_pipestage or 0) == 0 or self.bg_cd) then
-			-- `%job` as a command is `fg %job` (`bg` when async) — unless already forked, as a
-			-- pipeline stage is (execute_simple_command); without job control, just that
-			self:errmsg("curse: " .. (self.bg_cd and "bg" or "fg") .. ": no job control\n")
-			self.status = 1
-			return
+			-- `%job` as a command is `fg %job` (`bg` when async), the words its operands —
+			-- unless already forked, as a pipeline stage is (execute_simple_command)
+			local b = self.bg_cd and "bg" or "fg"
+			return require("b_fg")(self, b, { b, unpack(args, 1, n) })
 		end
 		if not execpath then
 			-- bash: a defined command_not_found_handle runs instead, in a separate execution
@@ -4359,25 +4372,153 @@ end
 function M.job_running(j)
 	return not j.done and not (j.g and j.g.done)
 end
--- reset_current + set_current_job (jobs.c; nothing here is ever stopped): the current job
--- (%+) is the newest running one, the previous (%-) the newest running one older than it,
--- else the current one again. Neither changes when a job merely ends — only on `&` and
--- when the current or previous job is deleted.
-function M.job_reset_current(sh)
-	local cur, prev
+do -- (a block of its own: the main chunk is at LuaJIT's 200-local limit)
+-- A job's state as bash's JOBSTATE: "dead" once it has ended, "stopped" while every one of
+-- its processes is stopped (job control: a stop seen by jobs_stop_poll, or its in-process
+-- task suspended), else "running". nil for a deleted one.
+M.STOPSIG = { [19] = true, [20] = true, [21] = true, [22] = true } -- STOP TSTP TTIN TTOU
+function M.job_stopsig(j) -- the signal that stopped it, or nil
+	if j.stopped then
+		return j.stopped
+	end
+	local t = j.g and M.vpid_tasks[j.pid]
+	return t and t.stopped or nil
+end
+local function jstate(j)
+	if j.gone then
+		return nil
+	elseif not M.job_running(j) then
+		return "dead"
+	end
+	return M.job_stopsig(j) and "stopped" or "running"
+end
+M.job_state = jstate
+-- most_recent_job_in_state: the newest job in STATE older than slot `below`
+local function newest_in(sh, below, state)
+	local best
 	for _, j in ipairs(sh.jobs or {}) do
-		if not j.gone and M.job_running(j) and (not cur or j.id > cur.id) then
-			cur = j
+		if j.id < below and jstate(j) == state and (not best or j.id > best.id) then
+			best = j
 		end
 	end
-	if cur then
-		for _, j in ipairs(sh.jobs) do
-			if not j.gone and M.job_running(j) and j.id < cur.id and (not prev or j.id > prev.id) then
-				prev = j
+	return best
+end
+-- set_current_job (jobs.c): JOB becomes %+ (the old one %-, if it's still a useful one); %-
+-- is then a stopped job before a running one — the old current, else the newest stopped job
+-- older than JOB — else the newest running one (older than JOB, when JOB itself runs).
+function M.set_current_job(sh, job)
+	if sh.job_cur ~= job then
+		sh.job_prev, sh.job_cur = sh.job_cur, job
+	end
+	local cur, prev = sh.job_cur, sh.job_prev
+	if prev ~= cur and prev and jstate(prev) == "stopped" then
+		return
+	end
+	local cs = jstate(cur)
+	if cs == "stopped" then
+		local c = newest_in(sh, cur.id, "stopped")
+		if c then
+			sh.job_prev = c
+			return
+		end
+	end
+	sh.job_prev = (cs == "running" and newest_in(sh, cur.id, "running") or newest_in(sh, math.huge, "running")) or cur
+end
+-- reset_current (jobs.c): the newest non-running job is %+ — the current one if stopped, else
+-- the previous one if stopped, else the newest stopped job — or else the newest running job;
+-- none: no current job. Called on `&`, when the current or previous job is deleted, and when
+-- a job stops or starts again (waitchld); a job merely ending changes nothing.
+function M.job_reset_current(sh)
+	local cur, prev, cand = sh.job_cur, sh.job_prev, nil
+	if cur and jstate(cur) == "stopped" then
+		cand = cur
+	else
+		if prev and jstate(prev) == "stopped" then
+			cand = prev
+		end
+		cand = cand or newest_in(sh, math.huge, "stopped") or newest_in(sh, math.huge, "running")
+	end
+	if cand then
+		M.set_current_job(sh, cand)
+	else
+		sh.job_cur, sh.job_prev = nil, nil
+	end
+end
+-- The live real processes of a job: a directly spawned job's own pid; an in-process job's
+-- external that its task is running now (a simple job's IS the job's process), and the
+-- externals of a pipeline job's stages.
+function M.job_procs(j)
+	if not j.g then
+		return (j.pid and j.pid > 0) and { j.pid } or {}
+	end
+	local out, t = {}, M.vpid_tasks[j.pid]
+	if not t or t.done then
+		return out
+	end
+	if t.child_pid then
+		out[1] = t.child_pid
+	end
+	local pg = t.g.pipe and type(t.wait) == "table" and t.wait
+	if pg and SCHED then
+		for _, st in pairs(SCHED.bycoro) do
+			if st.g == pg and not st.done and st.child_pid then
+				out[#out + 1] = st.child_pid
 			end
 		end
 	end
-	sh.job_cur, sh.job_prev = cur, prev or cur
+	return out
+end
+-- waitchld's WUNTRACED|WCONTINUED half: with job control on (bash asks only then — in the
+-- top-level shell), a background job whose process has stopped is Stopped, one continued
+-- runs again. (waitid without WEXITED: a stop/continue report never reaps the process —
+-- its exit stays for whoever waits on it.) A change makes the newest job that stopped
+-- current (else reset_current), as waitchld does.
+local si_buf
+function M.jobs_stop_poll(sh)
+	if not sh.opt_m or not sh.jobs or (sh.iso_ctx and sh.iso_ctx[1]) then
+		return
+	end
+	si_buf = si_buf or ffi.new("int32_t[32]") -- siginfo_t: si_code [2], si_pid [4], si_status [6]
+	local changed, laststop = false, nil
+	for _, j in ipairs(sh.jobs) do
+		if not j.gone and M.job_running(j) then
+			for _, pid in ipairs(M.job_procs(j)) do
+				si_buf[2], si_buf[4], si_buf[6] = 0, 0, 0
+				-- P_PID, WSTOPPED|WCONTINUED|WNOHANG
+				if C.curse_rt_waitid(1, pid, si_buf, 2 + 8 + 1) == 0 and si_buf[4] == pid then
+					local code = si_buf[2]
+					if code == 5 or code == 4 then -- CLD_STOPPED / CLD_TRAPPED
+						if not j.stopped then
+							changed = true
+						end
+						j.stopped = si_buf[6]
+					elseif code == 6 and j.stopped then -- CLD_CONTINUED
+						j.stopped, changed = nil, true
+					end
+				end
+			end
+			if j.stopped then
+				laststop = j
+			end
+		end
+	end
+	if changed then
+		if laststop then
+			M.set_current_job(sh, laststop)
+		else
+			M.job_reset_current(sh)
+		end
+	end
+end
+-- set_job_running: a stopped job the shell itself continues (fg, bg, `kill -CONT %N`) runs
+-- again at once — no waiting for the continue report — its suspended task too.
+function M.job_set_running(sh, j)
+	j.stopped = nil
+	local t = j.g and M.vpid_tasks[j.pid]
+	if t then
+		M.task_resume(t)
+	end
+end
 end
 -- delete_job: the job leaves the table (its slot number is free again)
 function M.job_delete(sh, j)
@@ -4405,14 +4546,41 @@ function M.jobs_cleanup_waited(sh)
 		end
 	end
 end
+-- parse.y shell_getc's notify_and_cleanup, as the parser reads a line (a script's next
+-- top-level line, each line an eval / source / trap handler reads): the jobs that have ended
+-- by now — SIGCHLD would have reaped them: jobs_poll — are notified (a script hears only of
+-- one a signal killed: jobs_notify, which deletes it), and the ones notified before go.
+-- sh.jobs_pending (set by job_add): some job may still end and need that.
+-- LINE: the line the reader is on then (its number in the report); nil: the current one.
+function M.jobs_line(sh, line)
+	if sh.jobs_waited then
+		M.jobs_cleanup_waited(sh)
+	end
+	if sh.jobs_pending then
+		M.jobs_poll(sh)
+		local fl = sh.force_line
+		sh.force_line = line or fl
+		M.jobs_notify(sh)
+		sh.force_line = fl
+		local live = false
+		for _, j in ipairs(sh.jobs or {}) do
+			if not j.gone and not j.done then
+				live = true
+				break
+			end
+		end
+		sh.jobs_pending = live or nil
+	end
+end
 -- SIGCHLD's reaping (jobs.c waitchld), done where the shell would have noticed: each real
 -- background child that has ended is reaped and its job marked done; an in-process job
 -- (j.g) is done once its task group is. A simple in-process job's external carries the
 -- wait status (its signal: t.sh.xproc).
 function M.jobs_poll(sh)
 	local sb
+	local foreign = sh.foreign_pids -- (a subshell's view of its parent's jobs: not its own)
 	for _, j in ipairs(sh.jobs or {}) do
-		if not j.done and not j.gone and j.pid then
+		if not j.done and not j.gone and j.pid and not (foreign and foreign[j.pid]) then
 			if j.g then
 				if j.g.done then
 					M.job_done_g(sh, j)
@@ -4432,6 +4600,7 @@ function M.jobs_poll(sh)
 			end
 		end
 	end
+	M.jobs_stop_poll(sh)
 end
 -- An in-process job's group has ended: its status, and the signal that ended it — the
 -- default action of one sent to it, or its external's death (a simple `cmd &`).
@@ -4457,16 +4626,81 @@ function M.job_done_g(sh, j)
 end
 -- notify_of_job_status for the background jobs (a script: only the ones a signal killed —
 -- reported, unless it was INT/TERM/PIPE or one the shell traps, and deleted from the table;
--- `wait PID` still answers for them). `only`: just that job (the one `wait` waited for).
-function M.jobs_notify(sh, only)
-	for _, j in ipairs(sh.jobs or {}) do
-		if j.done and j.sig and not j.gone and not j.notified and (not only or j == only) then
+-- `wait PID` still answers for them), in slot order. `keep`: the job `wait` waited for —
+-- reported with the rest (wait_for's notify_and_cleanup tells of every job that ended), but
+-- left to `wait` to delete.
+function M.jobs_notify(sh, keep)
+	local foreign = sh.foreign_pids -- (a subshell doesn't report its parent's jobs: it can't
+	for _, j in ipairs(sh.jobs or {}) do -- reap them — bash's child never sees them end)
+		if j.done and j.sig and not j.gone and not j.notified and not (foreign and foreign[j.pid]) then
 			j.notified = true
 			-- (one bash doesn't report — TERM, INT, PIPE — stays listed, as an exited job does,
 			-- until `jobs` or `wait` shows it)
 			if M.job_notify(sh, j.procs or { { pid = j.pid, st = j.sig + (j.core and 0x80 or 0), text = j.cmd } }, j.sig, false)
-				and not only then
+				and j ~= keep then
 				M.job_delete(sh, j)
+			end
+		end
+	end
+end
+-- Job control is on: `set -m`, and not in a subshell unless it ran `set -m` itself (bash
+-- turns it off in every child it forks; an in-process subshell's iso ctx holds the m_gen of
+-- its start — a later `set -m` bumps it).
+function M.job_control_on(sh)
+	if not sh.opt_m then
+		return false
+	end
+	local st = sh.iso_ctx
+	for k = st and #st or 0, 1, -1 do
+		if not st[k].cs then
+			return st[k].mgen ~= sh.m_gen
+		end
+	end
+	return true
+end
+-- The script is over. bash's shell exits, leaving its jobs — and the kernel sends a STOPPED
+-- one SIGHUP then SIGCONT (POSIX: its process group is orphaned by the exit), so it ends,
+-- or runs on if it ignores HUP, rather than staying stopped forever. Here the process may
+-- live on (a daemon worker) or must first drain its in-process jobs, so do that for it:
+-- every stopped real process of a job, and every suspended task (one left parked would
+-- hold the drain forever). With job control the real ones are in their own process groups
+-- too, so the kernel does it even if this process is killed outright.
+do
+	local function proc_stopped(pid)
+		local f = io.open("/proc/" .. pid .. "/stat", "r")
+		local line = f and f:read("*l")
+		if f then
+			f:close()
+		end
+		local st = line and line:match("^.*%) (%a)")
+		return st == "T" or st == "t"
+	end
+	function M.jobs_exit_hangup(sh)
+		for _, j in ipairs(sh and sh.jobs or {}) do
+			if not j.gone and M.job_running(j) then
+				for _, pid in ipairs(M.job_procs(j)) do
+					if j.stopped or proc_stopped(pid) then
+						C.kill(pid, 1)
+						C.kill(pid, 18)
+					end
+				end
+			end
+		end
+		if SCHED then
+			for _, t in pairs(SCHED.bycoro) do
+				if not t.done and t.child_pid and proc_stopped(t.child_pid) then
+					C.kill(t.child_pid, 1)
+					C.kill(t.child_pid, 18)
+				end
+			end
+			M.tasks_hangup_stopped()
+		end
+	end
+	function M.tasks_hangup_stopped()
+		for _, t in pairs(SCHED and SCHED.bycoro or {}) do
+			if t.stopped and not t.done then
+				M.task_kill(t, 1) -- (HUP — taken once it runs — then the CONT)
+				M.task_resume(t)
 			end
 		end
 	end
@@ -4486,6 +4720,7 @@ function M.job_add(sh, pid, cmdstr)
 	end
 	local job = { id = maxid + 1, pid = pid, cmd = cmdstr or "", done = false, nojc = not sh.opt_m or nil }
 	sh.jobs[#sh.jobs + 1] = job
+	sh.jobs_pending = true -- (rt.jobs_line: notified as it ends)
 	sh.last_bg_pid = tostring(pid)
 	M.job_reset_current(sh)
 	return job
@@ -4525,7 +4760,10 @@ function Shell:spawn_bg(args, cmdstr)
 	end
 	-- (SIGINT/SIGQUIT ignored without job control; bash execs the job's command in place of
 	-- its child: SHLVL - 1)
+	local svpg = self.job_pgrp
+	self.job_pgrp = M.job_control_on(self) or nil
 	local rc, pid = spawn_argv(self, execpath, args, n, fa, not self.opt_m, -1)
+	self.job_pgrp = svpg
 	if rc ~= 0 then
 		return false
 	end
@@ -4923,6 +5161,11 @@ end
 -- the process on the top-level parent's (P) — so between resumes no stale copy of any
 -- stage's pipe end is live on fds 0-9, and the parent's view is intact.
 local function co_resume(ctx, t)
+	if t.stopped then -- (suspended by a stop signal: parked until SIGCONT — M.task_resume)
+		ctx.parked = ctx.parked or {}
+		ctx.parked[t] = true
+		return
+	end
 	local P = ctx.P
 	fds_install(t.fd, 0) -- the stage's fds 0-9 (-1: it had closed it)
 	C.environ = t.env
@@ -5199,7 +5442,7 @@ end
 local function co_waiting(ctx)
 	local waiting, tick, nfd = {}, false, 0
 	for _, t in pairs(ctx.bycoro) do
-		if not t.done and t.wait ~= nil and type(t.wait) ~= "table" then
+		if not t.done and not t.stopped and t.wait ~= nil and type(t.wait) ~= "table" then
 			if t.wait == -1 then
 				tick = true
 			else
@@ -5436,7 +5679,8 @@ function M.wait_groups(gs, intr) -- (intr: as wait_child's)
 end
 -- Run every background job to its end (the script is over; bash would leave them
 -- running — in-process they must finish before this process can).
-function M.sched_drain()
+function M.sched_drain(sh)
+	M.jobs_exit_hangup(sh or M.cur_shell)
 	if sched_live() and not CO then
 		-- the shell is done with its stdin/out/err: let go of them first, so a caller
 		-- reading our output sees EOF unless a job itself still holds it (as with bash,
@@ -5466,6 +5710,7 @@ function M.sched_drain()
 		end
 	end
 	while sched_live() and not CO do
+		M.tasks_hangup_stopped() -- (one a job stopped meanwhile)
 		M.sched_pump({ untilf = function()
 			return next(SCHED.bycoro) == nil
 		end })
@@ -5520,6 +5765,7 @@ function Shell:bg_launch(fn, cmdstr, flat, simple, upv_get, upv_set, opts)
 		end
 	end
 	local vpid = M.alloc_vpid()
+	local jc = M.job_control_on(self) or nil
 	local g = co_launch(ctx, self, { fn }, { flat and "flat" or true }, base, false, upv)
 	if not g then
 		fds_release(ctx, base.fd, 0, 9)
@@ -5538,6 +5784,7 @@ function Shell:bg_launch(fn, cmdstr, flat, simple, upv_get, upv_set, opts)
 			t.sh.in_subprogram = (t.sh.in_subprogram or 0) + 1
 			t.sh.loopdepth = g.simple and self.loopdepth or 0 -- (a simple job keeps it: stage_kind)
 			if g.simple then -- (bash execs a `cmd &` job's external in place: rt.exec_tail_lvl)
+				t.sh.job_pgrp = jc -- (…in the job's own process group, with job control)
 				-- (a function it calls: no tail inside; "fn": the emitter's direct call, at this pd)
 				t.sh.shlvl_tail, t.sh.shlvl_cs = g.simple ~= "fn" and t.sh.pd or nil, nil
 				t.sh.xstage = true -- (its external is the job's process: reported as the job)
@@ -5587,6 +5834,39 @@ task_signals = function(t)
 		end
 	end
 end
+do -- (a block of its own: the main chunk is at LuaJIT's 200-local limit)
+-- How the job's own context takes a stop signal: "trap" (its own handler), "ignore", or
+-- "default" — it stops. (SIGSTOP can be neither caught nor ignored; before the task has
+-- run, only an ignored one is inherited — as for any signal, co_resume.)
+local function task_stop_disp(t, sig)
+	local sh = t.sh
+	if sig == 19 or not sh then
+		return "default"
+	end
+	local canon = "SIG" .. (require("interp")._int.NUMSIG[sig] or "")
+	if sh.sigtraps and sh.sigtraps[canon] then
+		if sh.traps[canon] == "" then
+			return "ignore"
+		end
+		local ctx = t.started and sh.iso_ctx and sh.iso_ctx[1]
+		if ctx and ctx.traps then
+			return "trap"
+		end
+	end
+	return "default"
+end
+-- SIGCONT for a task a stop signal suspended: it runs again (back in the run queue if the
+-- scheduler had parked it; one blocked on I/O is polled again)
+function M.task_resume(t)
+	if t.stopped then
+		t.stopped = nil
+		local ctx = SCHED
+		if ctx and ctx.parked and ctx.parked[t] then
+			ctx.parked[t] = nil
+			ctx.runnable[#ctx.runnable + 1] = t
+		end
+	end
+end
 function M.task_kill(t, sig)
 	if t.done then
 		return false
@@ -5597,8 +5877,23 @@ function M.task_kill(t, sig)
 	-- a simple command's job IS its command (bash execs it in the job's process): a
 	-- running external takes the signal itself, and the job ends with its status
 	if t.g.simple and t.child_pid then
-		t.g.killed = true -- (for `wait`'s report, should the command die of it)
+		if not M.STOPSIG[sig] and sig ~= 18 then
+			t.g.killed = true -- (for `wait`'s report, should the command die of it)
+		end
 		return C.kill(t.child_pid, sig) == 0
+	end
+	-- a stop signal it doesn't catch stops the job's process: the task is suspended — the
+	-- scheduler doesn't run it (nor start it: a `cmd &` not yet run) until a SIGCONT
+	if M.STOPSIG[sig] then
+		local d = task_stop_disp(t, sig)
+		if d == "ignore" then
+			return true
+		elseif d == "default" then
+			t.stopped = sig
+			return true
+		end
+	elseif sig == 18 then
+		M.task_resume(t) -- (…and a CONT trap of its own still runs: pending, below)
 	end
 	t.pending = t.pending or {}
 	t.pending[#t.pending + 1] = sig
@@ -5612,10 +5907,14 @@ function M.task_kill(t, sig)
 	return true
 end
 
+end
 -- kill_pid for a whole job (`kill %N`, jobs.c): bash signals each of the job's processes —
 -- for a pipeline job, every stage (a simple command stage IS its external command) — so
 -- the stages of the pipeline its task is waiting on get it too, then the task itself.
 function M.task_kill_job(t, sig)
+	if (M.STOPSIG[sig] or sig == 18) and not t.g.simple and t.child_pid and not t.done then
+		C.kill(t.child_pid, sig) -- (its process group: the external it runs stops with it)
+	end
 	local pg = t.g.pipe and type(t.wait) == "table" and t.wait
 	if pg and SCHED and sig ~= 0 then
 		for _, st in pairs(SCHED.bycoro) do

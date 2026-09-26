@@ -5,9 +5,16 @@ local rt = require("runtime")
 local I = require("interp")._int
 local job_reap = I.job_reap
 
--- printable_job_status (jobs.c): Running, Done / Exit N (posix: Done(N)), or the signal
-local function job_state(sh, j)
-	if not j.done then
+-- printable_job_status (jobs.c): Running, Stopped (posix: Stopped(SIGNAME); `jobs -l`, the
+-- process's own: strsignal), Done / Exit N (posix: Done(N)), or the signal
+local function job_state(sh, j, long)
+	local ss = not j.done and rt.job_stopsig(j)
+	if ss then
+		if long then
+			return rt.Llibc(I.SIGDESC[ss] or "Stopped")
+		end
+		return sh.opt_posix and rt.L("Stopped(%s)", "SIG" .. (I.NUMSIG[ss] or ss)) or rt.L("Stopped")
+	elseif not j.done then
 		return rt.L("Running")
 	elseif j.sig then
 		return I.SIGDESC[j.sig] and rt.Llibc(I.SIGDESC[j.sig]) or rt.L("Signal %d", j.sig)
@@ -22,7 +29,7 @@ return function(sh, cmd, args, hook, tcb)
 		-- jobs [-lnprs] [jobspec…] | jobs -x cmd args (jobs.def): list the job table —
 		-- `[N]± STATE  command`; a job listed once it has ended leaves the table (that is a
 		-- script's only notice of it). -n: only jobs changed since last listed; -r running
-		-- only; -s stopped only (nothing stops here).
+		-- only; -s stopped only.
 		local form, state, execute = nil, nil, false
 		local k, sp, f, _ = 2
 		repeat
@@ -60,17 +67,18 @@ return function(sh, cmd, args, hook, tcb)
 				job_reap(sh, j, true)
 			end
 		end
+		rt.jobs_stop_poll(sh) -- (…and which have stopped or been continued)
 		local function show(j)
-			local st = job_state(sh, j)
+			local st = job_state(sh, j, form == "l")
 			if form == "p" then
 				sh:echo(tostring(j.pid))
-			elseif form ~= "n" or j.notified ~= st then
+			elseif form ~= "n" or j.listed ~= st then
 				local mark = (j == sh.job_cur) and "+" or (j == sh.job_prev and "-" or " ")
-				local amp = j.done and "" or " &"
+				local amp = rt.job_state(j) == "running" and " &" or ""
 				local lead = form == "l" and (" %5d "):format(j.pid) or "  "
 				sh:echo(("[%d]%s%s%s%s%s%s"):format(j.id, mark, lead, st, (" "):rep(math.abs(24 - #st)), j.cmd or "", amp))
 			end
-			j.notified = st
+			j.listed = st -- (for -n: the state it was last listed in)
 		end
 		local shown, status = {}, 0
 		if k > #args then
@@ -79,7 +87,8 @@ return function(sh, cmd, args, hook, tcb)
 				if not j.gone then
 					if j.waited and j.done then -- (notified already — by `wait ID` or a listing)
 						rt.job_delete(sh, j)
-					elseif state == nil or (state == "r" and not j.done) then
+					elseif state == nil or (state == "r" and rt.job_state(j) == "running")
+						or (state == "s" and rt.job_state(j) == "stopped") then
 						list[#list + 1] = j
 					end
 				end

@@ -5109,6 +5109,7 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs, xg, bq
 	-- runs nothing (bash parses the entire line before executing any of it). The
 	-- parser stays statement-lazy (parse_stmt consumes complete multi-line compounds
 	-- and each stmt makes progress or errors), so there is no parse-ahead spin.
+	local prev_end -- (the last line group's last line: the reader goes on at the next)
 	local function next_line()
 		if done then
 			return nil
@@ -5244,8 +5245,12 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs, xg, bq
 		end
 		-- (pos/pline: where reading stopped — a reader that takes over the rest of the
 		-- input line by line, for command history, resumes there)
+		-- (rline: the line bash's reader reads next after the previous group ran — where it
+		-- notifies of jobs that ended meanwhile: rt.jobs_line)
+		local rline = prev_end and prev_end + 1
+		prev_end = eline
 		return { stmts = stmts, pos = i, pline = line, src = src, spos = gstart, sline = gline, eline = eline,
-			jcx = jcx }
+			jcx = jcx, rline = rline }
 	end
 	-- a syntax error also reports the offending input line (bash's second message line)
 	return function()
@@ -5322,6 +5327,7 @@ function M.parse(src, sh, aenv, noalias, posix, line0, line1, xg, bq)
 		end
 		if stmts[first] then -- (the first statement of a line group: where a line abort resumes)
 			stmts[first].lgstart = true
+			stmts[first].lgread = lg.rline -- (rt.jobs_line's line)
 			if lg.eline and lg.sline and lg.eline > lg.sline then -- (its lines: rt.line_drift)
 				stmts[first].lgspan = { lg.sline, lg.eline }
 			end
@@ -5331,7 +5337,9 @@ function M.parse(src, sh, aenv, noalias, posix, line0, line1, xg, bq)
 	-- (ltrans: a $"…" may be translated — by the live reader, as each line is read)
 	local ltrans = LTR_SEEN or nil
 	LTR_SEEN = sltr or LTR_SEEN
-	return { stmts = stmts, lines = lines, ltrans = ltrans, xg_guess = xgg }
+	local last = lines[#lines]
+	return { stmts = stmts, lines = lines, ltrans = ltrans, xg_guess = xgg,
+		eofline = last and last.eline and last.eline + 1 } -- (the reader's line at end of input)
 end
 
 -- Lazy/incremental parse: returns an iterator yielding one top-level statement

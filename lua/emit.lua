@@ -8238,9 +8238,10 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
 			-- only (never in a hot loop body). opt_n is off until `set -n` actually runs.
 			-- (a later syntax error is still reported: noexec reads the input — it resumes there)
 			local nxp = nxperr[k + 1] or cx.DONE
-			-- (a line group's start: the parser read a new input line — notify_and_cleanup
-			-- deletes the dead jobs `wait`/`jobs` reported: rt.job_waited)
-			local jw = stmts[k].lgstart and "if sh.jobs_waited then rt.jobs_cleanup_waited(sh) end; " or ""
+			-- (a line group's start: the parser read a new input line — notify_and_cleanup:
+			-- rt.jobs_line)
+			local jw = stmts[k].lgstart and ("if sh.jobs_waited or sh.jobs_pending then rt.jobs_line(sh, %s) end; "):format(
+				stmts[k].lgread or "nil") or ""
 			if stmts[k].t == "parse_error" then
 				cx.blocks[mark[k]] = ("sh._ff = %d; %spc = %d"):format(ff, wbs, cx.stmtPc[k])
 			else

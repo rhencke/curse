@@ -317,8 +317,9 @@ local function serve_request(cfd, req, fds, ctx)
 	-- them, then RETIRES — its slot reads -1 meanwhile (busy for the pool's saturation
 	-- count, so a replacement is spawned on demand; never "client gone", so not killed)
 	local drained = false
+	pcall(rt.jobs_exit_hangup, sh) -- (its stopped jobs: as the kernel would, were it exiting)
 	if rt.sched_live() then -- (the slot already reads -1: see above)
-		pcall(rt.sched_drain)
+		pcall(rt.sched_drain, sh)
 		drained = true
 	end
 	-- SCRUB per-request process state (the fork boundary used to do this):
