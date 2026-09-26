@@ -300,13 +300,11 @@ local function read_split(ifs, line, nvars, nomark) -- (nomark: \1 is plain — 
 		end
 		return out
 	end
-	local wsset, ifsset = {}, {}
-	for c in ifs:gmatch(".") do
-		ifsset[c] = true
-		if c == " " or c == "\t" or c == "\n" then
-			wsset[c] = true
-		end
-	end
+	-- (a multibyte IFS char — `IFS=é` — delimits as a whole codepoint, so cells are whole
+	-- chars then: the field engine's rt.ifs_charset_of set)
+	local ic = rt.ifs_charset_of(ifs)
+	local ifsset, mbifs = ic.set, ic.mbifs
+	local wsset = { [" "] = ifsset[" "], ["\t"] = ifsset["\t"], ["\n"] = ifsset["\n"] }
 	local cells, p, m = {}, 1, #line
 	while p <= m do
 		local c = line:sub(p, p)
@@ -314,8 +312,9 @@ local function read_split(ifs, line, nvars, nomark) -- (nomark: \1 is plain — 
 			cells[#cells + 1] = { ch = line:sub(p + 1, p + 1), esc = true }
 			p = p + 2
 		else
-			cells[#cells + 1] = { ch = c, esc = false }
-			p = p + 1
+			local cl = (mbifs and c:byte() >= 0x80) and rt.mb_charlen(line, p) or 1
+			cells[#cells + 1] = { ch = line:sub(p, p + cl - 1), esc = false }
+			p = p + cl
 		end
 	end
 	local n = #cells
@@ -2400,45 +2399,7 @@ end
 -- Expand a word to a LIST of fields (command args, for-in lists): unquoted
 -- expansions split on default-IFS whitespace; quoted text never splits; "$@" /
 -- "${a[@]}" yield one field per element.
--- bash glob_pattern_p on a plain (already-expanded) string: `*`/`?` always
--- active, `[` only with a later `]`. Conservative — never reports inactive for a
--- real glob — so the caller may safely skip pathname expansion when it's false.
-local GLOB_CH = { [42] = true, [63] = true, [91] = true, [43] = true, [64] = true, [33] = true } -- * ? [ + @ !
-local function str_glob_active(s)
-	local n = #s
-	if n <= 32 then -- (the common word: no glob character at all — a byte loop the JIT
-		local any = false -- compiles; a pattern it doesn't)
-		for k = 1, n do
-			if GLOB_CH[s:byte(k)] then
-				any = true
-				break
-			end
-		end
-		if not any then
-			return false
-		end
-	elseif not s:find("[*?%[+@!]") then
-		return false
-	end
-	local open = false
-	for i = 1, #s do
-		local c = s:sub(i, i)
-		if c == "*" or c == "?" then
-			return true
-		elseif c == "[" then
-			open = true
-		elseif c == "/" then
-			open = false -- (a bracket expression can't span a `/`)
-		elseif c == "]" then
-			if open then
-				return true
-			end
-		elseif (c == "+" or c == "@" or c == "!") and s:sub(i + 1, i + 1) == "(" then
-			return true
-		end
-	end
-	return false
-end
+local str_glob_active = rt.field_glob_active -- (glob_pattern_p on an all-unquoted string)
 
 local expand_fields_full -- (the general path, below: the fast paths stay in a function
 -- with no closures, so the JIT can compile them — a closure over `sh` would make every
@@ -2498,98 +2459,10 @@ local function expand_to_fields(sh, w)
 	return expand_fields_full(sh, w)
 end
 expand_fields_full = function(sh, w, pre1) -- pre1: part 1 already expanded (a $(…) ran)
-	-- Concatenate-then-split model: build the word left to right, splitting the
-	-- chars that came from UNQUOTED expansions on $IFS (default: space/tab/newline),
-	-- while literal/quoted chars are never delimiters. This is what bash does, and
-	-- it handles concatenation ($x-, pre$x) and custom IFS correctly. Fields also
-	-- track `unq` for glob eligibility (quoted glob chars stay literal).
-	-- IFS is a SET of characters; a delimiter may be multibyte (`IFS=ç`), so it is
-	-- indexed by whole codepoint (rt.ifs_charset: memoized per IFS string and locale).
-	local ic = rt.ifs_charset(sh)
-	local ifs, ifsset, mbifs = ic.ifs, ic.set, ic.mbifs
-	local function isws(c) -- IFS whitespace only (subst.c ifs_whitespace): other whitespace is text
-		return (c == " " or c == "\t" or c == "\n") and ifsset[c]
-	end
-	local function inifs(c)
-		return c ~= "" and ifsset[c]
-	end
-	local function clen(v, i) -- byte length of the char at i (fast for ASCII)
-		if not mbifs or v:byte(i) < 0x80 then
-			return 1
-		end
-		return rt.mb_charlen(v, i)
-	end
-	-- `q` is a per-character literal-mask parallel to the field's string ("1" = the
-	-- char came from QUOTED/escaped text so it's literal in pathname expansion, "0" =
-	-- glob-active). Kept OUT OF BAND (not an escape byte) so it can't collide with a
-	-- real byte in the data — curse is byte-transparent, so `'[bc]'*.mm` matches the
-	-- file [bc]ar.mm while a $'\x01' byte passes through untouched.
-	local fields, cur, cur_unq, cur_q = {}, nil, false, nil
-	local function brk()
-		if cur ~= nil then
-			fields[#fields + 1] = { s = cur, unq = cur_unq, q = cur_q }
-			cur, cur_unq, cur_q = nil, false, nil
-		end
-	end
-	local function add(s, unq)
-		cur = (cur or "") .. s
-		cur_q = (cur_q or "") .. (unq and "0" or "1"):rep(#s)
-		if unq then
-			cur_unq = true
-		end
-	end
-	local function feed_split(v) -- unquoted expansion text: split on $IFS
-		local i, n = 1, #v
-		while i <= n do
-			local cl = clen(v, i)
-			local c = cl == 1 and v:sub(i, i) or v:sub(i, i + cl - 1)
-			if inifs(c) then
-				if isws(c) then -- whitespace IFS chars are always single-byte
-					-- (LEADING whitespace is just ignored: a `:` right after it still ends an
-					-- empty first field — IFS=': ' splits " :" into one empty field)
-					local leading = cur == nil and #fields == 0
-					if cur ~= nil then
-						brk()
-					end
-					i = i + 1
-					while i <= n and isws(v:sub(i, i)) do
-						i = i + 1
-					end
-					if i <= n and not leading then
-						local nl = clen(v, i)
-						local nc = nl == 1 and v:sub(i, i) or v:sub(i, i + nl - 1)
-						if inifs(nc) and not isws(nc) then
-							i = i + nl
-							while i <= n and isws(v:sub(i, i)) do
-								i = i + 1
-							end
-						end
-					end
-				else -- non-whitespace IFS delimiter (may be multibyte)
-					if cur == nil then
-						cur = ""
-					end -- a delimiter always ends a field (empty ok)
-					cur_unq = true
-					brk()
-					i = i + cl
-					while i <= n and isws(v:sub(i, i)) do
-						i = i + 1
-					end
-				end
-			else -- add the whole run of non-IFS chars at once (per-char add is O(n²))
-				local i0 = i
-				i = i + cl
-				while i <= n do
-					cl = clen(v, i)
-					if inifs(cl == 1 and v:sub(i, i) or v:sub(i, i + cl - 1)) then
-						break
-					end
-					i = i + cl
-				end
-				add(v:sub(i0, i - 1), true)
-			end
-		end
-	end
+	-- The word's parts drive the runtime's field builder (rt.fb_new: IFS splitting + glob):
+	-- literal/quoted text is added as is, unquoted expansions split on $IFS; the part-level
+	-- semantics (field-wise ${x:-word}, tilde, "$@" in "…", bug #627) stay here.
+	local fb = rt.fb_new(sh)
 	local dq_null, dq_at -- (a "…" segment tagged dqat: an empty part seen / a "$@" gave no words)
 	for pi, p in ipairs(w.parts) do
 		if is_multi(sh, p) then
@@ -2601,23 +2474,10 @@ expand_fields_full = function(sh, w, pre1) -- pre1: part 1 already expanded (a $
 					else
 						dq_at = true
 					end
-				elseif star then -- "$*" / "${a[*]}" join with the first char of IFS
-					local sep = rt.ifs_sep(sh)
-					add(table.concat(els, sep), false)
 				else
-					for k = 1, #els do
-						if k > 1 then
-							brk()
-						end
-						add(els[k], false)
-					end
-				end -- one field per element
+					fb:multi(els, true, star)
+				end
 			else
-				-- unquoted $@/$*/array: bash joins the elements with IFS[0] (space when IFS
-				-- is whitespace/unset) into ONE string and word-splits that — so empty
-				-- elements survive under a non-whitespace IFS (`=$@=` on empty params gives
-				-- `= '' '' '' =`) and an empty middle element becomes an empty field. With
-				-- IFS='' there is no splitting, so keep the per-element model (empty drops).
 				local pe = p.pexp
 				if star and pe and (pe.op == "prefix" or pe.op == "indices") then
 					-- The INDIRECT `${!pfx*}` / `${!a[*]}` `*` forms join into ONE string
@@ -2628,16 +2488,9 @@ expand_fields_full = function(sh, w, pre1) -- pre1: part 1 already expanded (a $
 					if sep == "" and pe.op == "indices" then
 						sep = " "
 					end
-					feed_split(table.concat(els, sep))
-				elseif ifs == "" then
-					for k = 1, #els do
-						if k > 1 then
-							brk()
-						end
-						feed_split(els[k])
-					end
+					fb:split(table.concat(els, sep))
 				else
-					feed_split(table.concat(els, rt.ifs_first(ifs)))
+					fb:multi(els, false, star)
 				end
 			end
 		elseif
@@ -2680,71 +2533,41 @@ expand_fields_full = function(sh, w, pre1) -- pre1: part 1 already expanded (a $
 				-- "${x:-$@}" / "a${x:+"$@"}b": a $@ (or ${a[@]}) in a used word of a QUOTED
 				-- ${…} still makes one field per element, as "$@" does; the rest of the word
 				-- is quoted text. Never zero fields (bash: "${x:-$@}" with no params is "").
-				add("", false)
+				fb:add("", false)
 				if useword then
 					for _, sp in ipairs(P.parse_default_quoted(pe.arg, pe.hd).parts) do
 						if is_multi(sh, sp) then
 							sp.q = true
 							local els, star = multi_elems(sh, sp)
-							if star then
-								add(table.concat(els, rt.ifs_sep(sh)), false)
-							else
-								for e = 1, #els do
-									if e > 1 then
-										brk()
-									end
-									add(els[e], false)
-								end
-							end
+							fb:multi(els, true, star)
 						else
-							add(expand_part_str(sh, sp), false)
+							fb:add(expand_part_str(sh, sp), false)
 						end
 					end
 				else
-					add(expand_part_str(sh, p), false)
+					fb:add(expand_part_str(sh, p), false)
 				end
 			elseif useword and pe.arg then
 				-- expand the default's parts: a QUOTED part is one atomic (sub)field, an
 				-- unquoted part word-splits — so 'a b' stays one field but a b splits.
 				for k, sp in ipairs(P.parse_word(pe.arg).parts) do
-					if sp.q and is_multi(sh, sp) then
+					if is_multi(sh, sp) then -- $@/$*: as at the top level of a word
 						local els, star = multi_elems(sh, sp)
-						if star then
-							add(table.concat(els, rt.ifs_sep(sh)), false)
-						else
-							for e = 1, #els do
-								if e > 1 then
-									brk()
-								end
-								add(els[e], false)
-							end
-						end
-					elseif is_multi(sh, sp) then -- unquoted $@/$*: as at the top level of a word
-						local els = multi_elems(sh, sp)
-						if ifs == "" then
-							for e = 1, #els do
-								if e > 1 then
-									brk()
-								end
-								feed_split(els[e])
-							end
-						else
-							feed_split(table.concat(els, rt.ifs_first(ifs)))
-						end
+						fb:multi(els, sp.q, star)
 					else
 						local s = expand_part_str(sh, sp)
 						if k == 1 and sp.lit ~= nil and not sp.q then
 							s = tilde_prefix(sh, s)
 						end -- word-initial ~
 						if sp.q then
-							add(s, false)
+							fb:add(s, false)
 						else
-							feed_split(s)
+							fb:split(s)
 						end
 					end
 				end
 			elseif pe.op == ":-" or pe.op == "-" then
-				feed_split(pval)
+				fb:split(pval)
 			end
 		else
 			local s
@@ -2760,147 +2583,28 @@ expand_fields_full = function(sh, w, pre1) -- pre1: part 1 already expanded (a $
 				s = tilde_word_initial(sh, s, #w.parts > 1, w.noassign or (sh.opt_posix and w.plainarg))
 				if s ~= s0 and s0:byte(1) == 126 then -- `~…`: the expansion is quoted text — never globbed
 					local tl = #s0 - (s0:find("[/:]") or #s0 + 1) + 1 -- (the text after the tilde-prefix)
-					add(s:sub(1, #s - tl), false)
+					fb:add(s:sub(1, #s - tl), false)
 					s = s:sub(#s - tl + 1)
 				end
 			end -- word-initial / NAME= ~
 			if p.dqat and s == "" then
 				dq_null = true
 			elseif p.q or p.lit ~= nil then
-				add(s, not p.q)
+				fb:add(s, not p.q)
 			else
-				feed_split(s)
+				fb:split(s)
 			end
 		end
 		if p.dqend then -- end of a "…$@…" segment: its empty parts make a null word unless "$@" was empty
 			if dq_null and not dq_at then
-				add("", false)
+				fb:add("", false)
 			end
 			dq_null, dq_at = nil, nil
 		end
 	end
-	brk()
-	-- pathname expansion on fields with unquoted glob metacharacters
-	local out = {}
-	-- GLOBIGNORE (set & non-null): filter matches by its `:`-separated patterns; `.`/`..`
-	-- are always excluded. (Assigning it also turns dotglob on: rt.setup_glob_ignore.)
-	local gi = sh:get("GLOBIGNORE")
-	local giset = gi and gi ~= ""
-	local dotglob = sh.shopt.dotglob and true
-	local nullglob = sh.shopt.nullglob and true
-	local gipats
-	if giset then -- split on ':' but NOT inside [...] (a `[[:alnum:]]` class holds colons)
-		gipats = {}
-		local depth, cur = 0, {}
-		for k = 1, #gi do
-			local c = gi:sub(k, k)
-			if c == "[" then
-				depth = depth + 1
-				cur[#cur + 1] = c
-			elseif c == "]" then
-				if depth > 0 then
-					depth = depth - 1
-				end
-				cur[#cur + 1] = c
-			elseif c == ":" and depth == 0 then
-				if #cur > 0 then
-					gipats[#gipats + 1] = table.concat(cur)
-					cur = {}
-				end
-			else
-				cur[#cur + 1] = c
-			end
-		end
-		if #cur > 0 then
-			gipats[#gipats + 1] = table.concat(cur)
-		end
-	end
-	-- set -f: pathname expansion disabled; globs stay literal (xnoglob: just this word's —
-	-- compgen -W's, whose $(…) bodies still glob)
-	local noglob = sh.opt_f or sh.xnoglob == w
-	local GLOBSPECIAL = {
-		["*"] = 1,
-		["?"] = 1,
-		["["] = 1,
-		["]"] = 1,
-		["\\"] = 1,
-		["+"] = 1,
-		["@"] = 1,
-		["!"] = 1,
-		["("] = 1,
-		[")"] = 1,
-		["|"] = 1,
-		["-"] = 1, -- (a quoted `-`/`^` in a bracket expression is literal: `[a"-"c]`)
-		["^"] = 1,
-	} -- `|` protects a
-	-- quoted/escaped extglob alternation bar (`@(a|'b|c')`) from split_arms
-	-- is there a glob metacharacter at a NON-masked (glob-active) position?
-	-- bash glob_pattern_p: `*`/`?` are always active; `[` only counts when a later
-	-- (unmasked) `]` closes it — a lone `[` (e.g. the `[` test builtin) is literal,
-	-- so it must NOT trigger a directory scan. Mirrors glob_conv's own "no closing
-	-- ] → literal [" rule; keeping them in sync avoids pointless per-word globbing.
-	local glob_active = rt.field_glob_active
-	-- build the glob pattern: a masked (quoted) glob-special char is backslash-escaped
-	-- so glob_conv treats it literally; the stored value f.s is left byte-for-byte intact.
-	local function glob_pat(f)
-		if not f.q or not f.q:find("1") then
-			return f.s
-		end
-		local o = {}
-		for i = 1, #f.s do
-			local c = f.s:sub(i, i)
-			o[#o + 1] = (f.q:sub(i, i) == "1" and GLOBSPECIAL[c]) and ("\\" .. c) or c
-		end
-		return table.concat(o)
-	end
-	for _, f in ipairs(fields) do
-		if not noglob and f.unq and glob_active(f) then
-			sh.glob_dots = dotglob -- (glob.c noglob_dot_filenames: compgen -G sees the last shell glob's)
-			-- a set GLOBIGNORE always filters `.`/`..` (overriding globskipdots)
-			local m = rt.glob_expand(
-				glob_pat(f),
-				{
-					dotglob = dotglob,
-					skipdots = giset or shopt_on(sh, "globskipdots"),
-					globstar = shopt_on(sh, "globstar"),
-					nocase = shopt_on(sh, "nocaseglob"),
-					noext = not sh.shopt.extglob,
-				}
-			)
-			if m and gipats then
-				local filt = {}
-				for _, x in ipairs(m) do
-					local ig = false
-					for _, p in ipairs(gipats) do
-						if rt.glob_ignore_match(x, p, sh.shopt.nocaseglob, not sh.shopt.extglob) then
-							ig = true
-							break
-						end
-					end
-					if not ig then
-						filt[#filt + 1] = x
-					end
-				end
-				m = (#filt > 0) and filt or nil
-			end
-			if m then
-				for _, x in ipairs(m) do
-					out[#out + 1] = x
-				end
-			elseif sh.shopt.failglob then -- shopt -s failglob: no match aborts the rest of
-				-- the current LINE (bash: like a fatal expansion error), so tag lineabort
-				-- (not experr) — run_lazy fast-forwards past same-line statements.
-				io.stderr:write("curse: no match: " .. f.s .. "\n")
-				error({ __curse_exit = 1, __curse_lineabort = true })
-			elseif nullglob then -- no matches: nullglob drops the field entirely
-			else
-				out[#out + 1] = f.s
-			end
-		else
-			out[#out + 1] = f.s
-		end
-	end
-	return out
+	-- (xnoglob: just this word's pathname expansion is off — compgen -W's, whose $(…)
+	-- bodies still glob)
+	return fb:finish(sh.xnoglob == w)
 end
 M.expand_to_fields = expand_to_fields -- the compiled tier builds argv fields for a word AST
 

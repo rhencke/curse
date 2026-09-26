@@ -422,7 +422,7 @@ return function(sh, cmd, args, hook, tcb)
 				sh.status = 1
 				return
 			elseif arr then
-				sh:array_assign(arr, rt.ifs_split(ifs, line, nomark), false)
+				sh:array_assign(arr, rt.ifs_split(sh, line, nomark), false)
 			elseif ndelim then -- -N: no IFS processing; first var gets everything, rest empty
 				local plain = line:gsub("\1(.)", "%1") -- \1x -> x (unescape); \1\1 -> \1 (literal CTLESC)
 				if #vars == 0 then
