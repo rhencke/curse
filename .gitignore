@@ -22,3 +22,6 @@ core.*
 
 # LuaJIT build output (patched luajit + the shippable static `curse` binary)
 /.bench-lua/
+
+# The static client binary (built from daemon/curse-client.c)
+/daemon/curse
