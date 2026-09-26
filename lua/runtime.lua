@@ -16,15 +16,6 @@ pcall(jit.opt.start, "maxtrace=8000", "maxmcode=8192")
 
 local M = {}
 M.i64 = i64
--- Single-quote a string for reuse as shell input: 'x' with embedded ' -> '\''.
--- (Used by ${x@Q}/@A/@K, declare -p, set, and procsub's inner `sh -c`.)
--- Quote a string so it re-reads as itself. A control char or high byte forces
--- ANSI-C $'…' form (\n \t \r, \NNN octal for other bytes), like bash's ${x@Q}
--- and `set`/`declare` output; otherwise plain single-quoting.
--- Quote a string the way bash's ${x@Q} / printf %q do. A PRINTABLE string (even
--- with multibyte chars) uses a plain single-quote; only a control/non-printable
--- byte forces the $'…' form, and inside it printable codepoints stay raw (per the
--- locale via iswprint) while control/bad bytes are escaped. Byte-identical to bash.
 local ANSIC_ESC = { [27] = "\\E", [7] = "\\a", [11] = "\\v", [8] = "\\b", [12] = "\\f", [10] = "\\n", [13] = "\\r", [9] = "\\t" }
 M.ANSIC_ESC = ANSIC_ESC
 -- bash's ansic_shouldquote: does S hold a byte/character that isn't printable (in the
@@ -54,24 +45,17 @@ function M.sh_single_quote(s)
 	end
 	return "'" .. s:gsub("'", "'\\''") .. "'"
 end
+-- Quote a string so it re-reads as itself, the way bash's ${x@Q} / `set` / `declare`
+-- output do (shell_quote): a PRINTABLE string (even with multibyte chars, `'μ'`) is
+-- single-quoted; only a control/non-printable byte forces the $'…' form, and inside it
+-- printable codepoints stay raw (per the locale via iswprint) while control/bad bytes
+-- are escaped. Byte-identical to bash.
 function M.shell_quote(s)
-	if not s:find("[%z\1-\31\127-\255]") then
+	if not M.ansic_shouldquote(s) then
 		return M.sh_single_quote(s)
 	end
-	-- there is a high/low byte: decide char-by-char whether $'…' is really needed
-	local chars = M.mb_chars(s)
-	local needc = false
-	for _, ch in ipairs(chars) do
-		if not ch.wc or ch.wc < 32 or ch.wc == 127 or M.iswprint(ch.wc) == 0 then
-			needc = true
-			break
-		end
-	end
-	if not needc then
-		return "'" .. s:gsub("'", "'\\''") .. "'"
-	end -- all printable (e.g. `'μ'`)
 	local out = { "$'" }
-	for _, ch in ipairs(chars) do
+	for _, ch in ipairs(M.mb_chars(s)) do
 		if ch.wc and ch.wc >= 32 and ch.wc ~= 127 and M.iswprint(ch.wc) ~= 0 then
 			if ch.s == "'" then
 				out[#out + 1] = "\\'"
@@ -966,7 +950,6 @@ ffi.cdef([[
   unsigned long wctype(const char *name);
   int wcwidth(int wc);
   int strcoll(const char *s1, const char *s2);
-  size_t strxfrm(char *dest, const char *src, size_t n);
   char *ttyname(int fd);
   /* Coroutine pipeline scheduler (asm-aliased so interp's own declarations of the
      same libc symbols never collide — LuaJIT refuses a redefinition). */
@@ -1204,18 +1187,19 @@ function M.wait_child(pid, stbuf, flags, intr)
 	end
 	return C.waitpid(pid, stbuf, flags)
 end
--- fork() for every shell-side fork site. Inside a stage it first flushes that
+-- $$ is the MAIN shell's pid in every subshell: fixed before the first fork, so a child
+-- never computes its own (Shell:pid)
+local pid_cache
+-- $BASH_SUBSHELL = the forks between here and the main shell (M.fork_depth) + the
+-- in-process subshell contexts this shell object is inside (sh.subdepth: subshell_run,
+-- capture_inproc, stage clones)
+M.fork_depth = 0
+-- fork() for the one shell-side fork site left: run_pipeline's fallback when the scheduler
+-- can't take a pipeline (see run_pipeline_body). Inside a stage it first flushes that
 -- stage's stdout (ordering), and the CHILD leaves the scheduler: it drops every
 -- pipe/save fd the scheduler holds (a stray copy of a write end would starve a
 -- reader of EOF), unblocks SIGPIPE, and forgets CO — so it never yields and runs
 -- to its own _exit like any forked child.
--- $$ is the MAIN shell's pid in every subshell: fixed before the first fork, so a child
--- never computes its own (Shell:pid)
-local pid_cache
--- $BASH_SUBSHELL = the forks between here and the main shell (M.fork_depth, a late fork
--- excepted: it continues an already-counted context) + the in-process subshell contexts
--- this shell object is inside (sh.subdepth: subshell_run, capture_inproc, stage clones)
-M.fork_depth = 0
 function M.fork()
 	local t = co_task()
 	if t then
@@ -1705,20 +1689,6 @@ function M.pipe_peek(fd, buf, max)
 	end
 	return ffi.string(buf, n)
 end
--- Consume exactly `n` bytes from `fd` (just peeked, so they're there).
-function M.read_exact(fd, buf, n)
-	while n > 0 do
-		local r = tonumber(C.read(fd, buf, n))
-		if r <= 0 then
-			if not (r < 0 and ffi.errno() == 4) then
-				return false
-			end
-		else
-			n = n - r
-		end
-	end
-	return true
-end
 local _avail = ffi.new("int[1]")
 function M.fd_avail(fd)
 	if C.curse_rt_ioctl_int(fd, 0x541B, _avail) ~= 0 then -- FIONREAD
@@ -1987,9 +1957,10 @@ function M.redir_apply_one(sh, r, saves, ctx) -- (ctx: the command, naming a {v}
 end
 -- <(…)/>(…) bookkeeping around a compiled command statement (interp's procsub_mark /
 -- drain_procsub): the pending/registered counts before it, and after it close the shell's
--- ends of those it added and reap their children.
+-- ends of those it added and reap their children. (M.procsub_mark's pair, boxed: the
+-- statement keeps it in one pc-block variable.)
 function M.ps_mark(sh)
-	return { sh.procsub_pending and #sh.procsub_pending or 0, sh.procsub_files and #sh.procsub_files or 0 }
+	return { M.procsub_mark(sh) }
 end
 function M.ps_drain(sh, m)
 	require("interp")._int.drain_procsub(sh, m[1], m[2])
@@ -2395,8 +2366,6 @@ local function child_spawnattr(self)
 	return attr
 end
 
--- An async command without job control runs with SIGINT/SIGQUIT ignored (bash's
--- setup_async_signals): a forked child just sets that.
 -- `kill -SIG $$` from the shell itself: bash takes the signal after the builtin has
 -- finished (its trap sees kill's status 0), so hold it blocked across the send; release
 -- restores the previous mask, which delivers it. (Only SIG is touched: the scheduler
@@ -2429,13 +2398,8 @@ do
 		end
 	end
 end
-function M.async_child_signals(sh)
-	if not sh.opt_m then
-		C.curse_sig_ignore(2)
-		C.curse_sig_ignore(3)
-	end
-end
--- A spawned one inherits it: the parent ignores both across the spawn, with them blocked
+-- An async command without job control runs with SIGINT/SIGQUIT ignored (bash's
+-- setup_async_signals). A spawned one inherits it: the parent ignores both across the spawn, with them blocked
 -- so none is lost meanwhile (a pending one is delivered to the restored disposition).
 local _aq_set, _aq_old = ffi.new("uint8_t[1024]"), ffi.new("uint8_t[1024]")
 local _aq_sa2, _aq_sa3 = ffi.new("uint8_t[256]"), ffi.new("uint8_t[256]")
@@ -2734,7 +2698,7 @@ end
 -- A `$(…)` body is "pure" (no shell-state side effects, so safe to run in-process
 -- for speed) when every command is a plain external/non-mutating-builtin call with
 -- no assignments, no mutating builtin, no user-function call, and no control flow.
--- Anything else forks for full isolation. (A file redirect like `>f` is fine — the
+-- Anything else runs fully isolated (capture_compiled_iso). (A file redirect like `>f` is fine — the
 -- write happens either way; only `exec` rewires shell fds, and it's listed here.)
 local CAPTURE_IMPURE = {
 	cd = 1,
@@ -2796,7 +2760,7 @@ local function capture_pure(sh, st)
 		local lit = w and w.parts and #w.parts == 1 and w.parts[1].lit
 		if not lit then
 			return false
-		end -- dynamic/compound command name: be safe, fork
+		end -- dynamic/compound command name: be safe, isolate
 		if CAPTURE_IMPURE[lit] or sh.functions[lit] then
 			return false
 		end
@@ -2812,7 +2776,7 @@ local function capture_pure(sh, st)
 		end
 		return true
 	end
-	return false -- if/while/for/case/subshell/group/funcdef/background/arithcmd: fork
+	return false -- if/while/for/case/subshell/group/funcdef/background/arithcmd: isolate
 end
 
 function Shell:capture_src(src, backtick, noalias, line0)
@@ -3312,21 +3276,11 @@ local function sub_restore(self, cp)
 	end
 end
 
--- Run a subshell body `runner(sh)` IN-PROCESS (no fork) — the compiled tier's fork-free
--- `( … )`. sub_checkpoint/restore reproduce a fork's isolation; a subshell keeps errexit
--- (unlike $()), writes to the live stdout, and its own applied redirects (`saves`) are
--- restored here too. exit/return/div0 in the body become the subshell's status. The emit
--- gate keeps genuinely-forking bodies (trap/exec/&/set/ulimit/$BASHPID/…) on the fork path.
--- LATE FORK. An in-process subshell/$(…) runs optimistically in this process; the first
--- operation that genuinely needs its own process (exec, ulimit, trap, enable, wait, `&`,
--- a dynamic $BASHPID/$RANDOM read — see need_process) forks RIGHT THERE: everything so far
--- happened inside the checkpoint, i.e. exactly the state a real subshell has at this point,
--- so the child simply continues (it IS the subshell now) and _exits at the boundary; the
--- parent waits, unwinds to the boundary with the child's status and restores. iso_ctx is
--- the stack of active in-process isolation contexts (innermost last).
+-- sh.iso_ctx is the stack of active in-process isolation contexts (innermost last): a
+-- `( … )`, an isolated $(…), a pipeline stage (task).
 iso_push = function(sh)
-	-- the pid that runs this context in-process: a process forked later (a real subshell /
-	-- $(…) / stage / job) inherits the stack but is ALREADY its own process
+	-- the pid that runs this context in-process: a process forked later (a fallback
+	-- pipeline stage, see M.fork) inherits the stack but is ALREADY its own process
 	local ctx = { pid = C.getpid(), mgen = sh.m_gen } -- (mgen: b_fg's job-control check)
 	local st = sh.iso_ctx
 	if not st then
@@ -3922,6 +3876,12 @@ function M.child_exit(sh, status)
 	C._exit(status or 0)
 end
 
+-- Run a subshell body `runner(sh)` IN-PROCESS (no fork) — `( … )` in both tiers.
+-- sub_checkpoint/restore reproduce a fork's isolation, and the process-global state the
+-- body touches (fds, environ, traps, limits, …) is undone with the context (iso_undo); a
+-- subshell keeps errexit (unlike $()), writes to the live stdout, and its own applied
+-- redirects (`saves`) are restored here too. exit/return/div0 in the body become the
+-- subshell's status.
 function Shell:subshell_run(runner, saves, paren, inplace)
 	if self.jobs_waited then -- (bash's cleanup_dead_jobs, on a fork: the notified dead jobs go)
 		M.jobs_cleanup_waited(self)
@@ -4035,14 +3995,6 @@ function Shell:subshell_run(runner, saves, paren, inplace)
 	self.status = status
 end
 
--- Compiled `$(…)` whose body MUTATES shell state but needs no real child: run it
--- in-process with FULL isolation (sub_checkpoint/restore) instead of forking the fat
--- worker. capture_inproc supplies the $()-specific light state (stdout→buffer, errexit
--- OFF unless inherit_errexit, aliases, in_subprogram, cur_line, trailing-newline/NUL
--- strip, exit/return→status); the heavy checkpoint wraps it. The emit gate keeps a body
--- that forks a real child (exec/&/$BASHPID/set/ulimit/…) or would desync a lifted upvalue
--- (a lifted-touching function — no swap is possible in this expression context) on the
--- fork path. Returns the captured string.
 -- $BASH_SUBSHELL for a pipeline stage (bash): a `( … )` stage counts once (its own
 -- subshell), and a simple command that runs no shell code (not a function, eval, source, …)
 -- expands its words at the pipeline's own level. `isfn(name)`: is it a function?
@@ -4100,6 +4052,11 @@ function M.foreign_jobs(sh)
 	end
 	return f
 end
+-- A `$(…)` whose body MUTATES shell state (emit's / tier's cmdsub_nofork_ok says no): run
+-- it in-process with FULL isolation (sub_checkpoint/restore). capture_inproc supplies the
+-- $()-specific light state (fd-level capture, errexit OFF unless inherit_errexit, aliases,
+-- in_subprogram, cur_line, trailing-newline/NUL strip, exit/return→status); the heavy
+-- checkpoint wraps it. Returns the captured string.
 function Shell:capture_compiled_iso(cs_fn, backtick)
 	M.env_rebuilt(self) -- (command_substitute's maybe_make_export_env)
 	local sv_foreign = self.foreign_pids
@@ -4121,15 +4078,6 @@ function Shell:capture_compiled_iso(cs_fn, backtick)
 	return out
 end
 
--- Compiled-tier command substitution: run a compiled cmdsub fragment `cs_fn(sh)`
--- (the inner program, compiled at emit time). `mustfork` — computed statically by
--- emit: the body mutates shell state, calls a user function, or reads $BASHPID —
--- forks for full subshell isolation; otherwise the (provably pure) body runs
--- in-process for speed. This is the "known at compile time -> compile it" path;
--- emit falls back to capture_src for bodies it can't compile (the tiered path).
--- $(< file) / `< file`: bash reads the file's contents (a faster $(cat file)) — a pure
--- read, no fork. NUL bytes stripped, trailing newlines stripped, status 0; a missing
--- file is status 1 + diagnostic. The compiled tier calls this with the expanded path.
 -- bash drops NUL bytes from a substitution's output, warning once per substitution
 -- (subst.c read_comsub)
 function M.cmdsub_nul(c)
@@ -4139,6 +4087,9 @@ function M.cmdsub_nul(c)
 	end
 	return c
 end
+-- $(< file) / `< file`: bash reads the file's contents (a faster $(cat file)) — a pure
+-- read. NUL bytes stripped, trailing newlines stripped, status 0; a missing file is
+-- status 1 + diagnostic. The compiled tier calls this with the expanded path.
 function Shell:capture_file(path)
 	local f = path ~= "" and M.open_read(path)
 	if f then
@@ -4154,6 +4105,9 @@ function Shell:capture_file(path)
 	return ""
 end
 
+-- Compiled-tier command substitution of a provably pure body (emit's cmdsub_nofork_ok):
+-- the compiled fragment `cs_fn(sh)` runs with only capture_inproc's light isolation (a
+-- mutating body goes through capture_compiled_iso instead).
 function Shell:capture_compiled(cs_fn, _, backtick) -- (2nd arg: a retired fork flag)
 	return self:capture_inproc(backtick, cs_fn)
 end
@@ -4578,15 +4532,6 @@ function M.job_add(sh, pid, cmdstr)
 	return job
 end
 
--- `cmd &`: fork; the child runs the COMPILED command fragment cmd_fn(sh) with stdin
--- redirected to /dev/null (async, can't steal the terminal) as a subprogram (ERR
--- suppressed); the parent records $! + the job and returns status 0. Compiled tier
--- only, gated by emit to trap-free programs (so the child needs no signal reset).
--- `ext args… &` where the args are side-effect-free: the parent already built argv, so
--- SPAWN the job directly (vfork-fast, stdin </dev/null) — no fork of this (large)
--- process at all. Returns false (caller forks instead) when it can't reproduce the
--- forked child exactly: unresolvable name (the child prints the error), a no-shebang
--- script, or xtrace (the child traces).
 -- The shell's OWN helper processes (the tiered driver's background transpiler): spawned
 -- directly (never through /bin/sh), output to /dev/null, and marked so `wait`/`wait -n`
 -- — which reap with waitpid(-1) — skip them rather than mistake one for a job.
@@ -4621,12 +4566,17 @@ function M.reap_internal(pid)
 	end
 end
 
+-- `ext args… &` where the args are side-effect-free: the shell already built argv, so
+-- SPAWN the job directly (vfork-fast, stdin </dev/null) — no background task at all.
+-- Returns false (the caller runs it as a background task instead) when it can't
+-- reproduce bash's child exactly: unresolvable name (the child prints the error), a
+-- no-shebang script, or xtrace (the child traces).
 function Shell:spawn_bg(args, cmdstr)
 	local n = #args
 	if n == 0 or args[1] == "" or self.opt_x or self.exec_argv0 then
 		return false
 	end
-	-- a (dynamic) word that names a function/builtin/alias runs shell code: fork for it
+	-- a (dynamic) word that names a function/builtin/alias runs shell code: a task for it
 	local I = package.loaded.interp
 	if self.functions[args[1]] or (I and I.BUILTINS[args[1]]) or (self.aliases and self.aliases[args[1]]) then
 		return false
@@ -4692,8 +4642,10 @@ function M.job_mark_pipe(job)
 		t.sh.bg_pipe = true
 	end
 end
-function Shell:run_background(cmd_fn, cmdstr, exec_tail, flat, simple, pipe)
-	-- (in-process: a background task — see Shell:bg_launch)
+-- `cmd &`: the COMPILED command fragment cmd_fn(sh) runs in-process as a background task
+-- (Shell:bg_launch); the shell records $! + the job, status 0. (3rd arg: a retired
+-- exec_tail flag emit still passes.)
+function Shell:run_background(cmd_fn, cmdstr, _, flat, simple, pipe)
 	M.env_rebuilt(self) -- (execute_simple_command's, before the fork)
 	local job = self:bg_launch(cmd_fn, cmdstr, flat, simple)
 	if pipe and job and job.g then
@@ -4702,12 +4654,6 @@ function Shell:run_background(cmd_fn, cmdstr, exec_tail, flat, simple, pipe)
 	self.status = 0
 end
 
--- `a | b | c`: fork a child per stage wired by pipes, running each COMPILED stage
--- fragment; the last stage's exit is the pipeline's (or the rightmost non-zero under
--- pipefail). The last stage's stdout goes to fd 1, or the capture buffer inside $(…),
--- or runs in the current shell under `shopt -s lastpipe`. Sets $PIPESTATUS and applies
--- `!` negation. Compiled tier only (gated by emit to no trap/DEBUG/ERR — so no signal
--- reset or per-stage trap firing is needed here). `stage_fns` are cs_N fragments.
 -- ---- Coroutine pipeline scheduler -------------------------------------------
 -- `a | b | c` with NO fork per shell-side stage: each stage is a coroutine running
 -- its compiled fragment on its own cloned shell, externals stay real processes
@@ -5345,9 +5291,8 @@ local function sched_release(ctx, P)
 		SCHED = nil
 	end
 end
--- Run the pipeline under the scheduler. `inproc[i]` (compile time): run stage i
--- in-process; otherwise it forks (a stage that needs a real child — exec, ulimit,
--- set, eval, … see EF.sub_unsafe_fn), scheduled uniformly. `upv_get/upv_set` (when the
+-- Run the pipeline under the scheduler. `inproc[i]`: stage i's kind (M.stage_kind — every
+-- stage runs in-process as a task). `upv_get/upv_set` (when the
 -- module has lifted upvalues) let the scheduler swap them per stage like fds. A
 -- pipeline nested inside a running stage joins the SAME scheduler as a new group and
 -- that stage waits on it. Returns nil (caller falls back to forking) on setup failure.
@@ -5870,6 +5815,11 @@ function M.task_kill_job(t, sig)
 end
 
 local run_pipeline_body
+-- `a | b | c`: run the stage functions `stage_fns` (both tiers) wired by pipes, under the
+-- coroutine scheduler; the last stage's exit is the pipeline's (or the rightmost non-zero
+-- under pipefail). The last stage's stdout goes to fd 1, or the capture buffer inside
+-- $(…), or runs in the current shell under `shopt -s lastpipe`. Sets $PIPESTATUS and
+-- applies `!` negation.
 -- `! pipeline` with errexit ON: errexit is ignored for everything it runs — a called
 -- function, an eval, a subshell (bash adds CMD_IGNORE_RETURN, like a condition) — so run
 -- it with noerr raised, restored on unwind. (With errexit OFF bash doesn't: a `set -e`
@@ -5892,13 +5842,15 @@ function Shell:run_pipeline(stage_fns, negate, inproc, upv_get, upv_set, texts)
 end
 run_pipeline_body = function(self, stage_fns, negate, inproc, upv_get, upv_set)
 	local nst = #stage_fns
-	if nst == 1 then -- defensive: a single stage (emit delegates `! cmd` for exact errexit)
+	if nst == 1 then -- (emit's `! cmd`: a negated one-stage pipeline, no real pipe)
 		stage_fns[1](self)
 	elseif
 		inproc
 		and self:run_pipeline_co(stage_fns, inproc, self.shopt.lastpipe and not self.opt_i, upv_get, upv_set)
 	then -- ran under the coroutine scheduler (status/PIPESTATUS set)
 	else
+		-- The scheduler couldn't take it (no pipe fds, or a trap running while the scheduler
+		-- pumps — CO is live but no task runs): the one place stages still FORK.
 		io.flush() -- flush parent stdio so forked stages don't duplicate buffered output
 		local lastpipe = self.shopt.lastpipe and not self.opt_i and nst >= 2
 		local pids, prev_read, inline_status = {}, -1, nil
@@ -6424,8 +6376,6 @@ ffi.cdef([[
   char *getcwd(char *buf, unsigned long size);
   int curse_rt_stat(const char *path, void *buf) asm("stat");
   int curse_rt_lstat(const char *path, void *buf) asm("lstat");
-  struct curse_pw { char *pw_name; char *pw_passwd; unsigned int pw_uid; unsigned int pw_gid; char *pw_gecos; char *pw_dir; char *pw_shell; };
-  struct curse_pw *getpwuid(unsigned int uid);
 ]])
 local scratch = ffi.new("char[4096]")
 
@@ -7605,11 +7555,6 @@ function Shell:unref(name)
 		b.outer = nil
 	end
 end
-function Shell:is_nameref(name)
-	local b = self.vars[name]
-	return b and b.ref
-end
--- ${var@a}: the variable's attribute flags, in bash's order (aA r x i l u n).
 -- ${x@a} in compiled code: under set -u a variable with NO VALUE is unbound (bash — even
 -- a declared-but-valueless one).
 function Shell:attr_string_u(name)
@@ -7632,6 +7577,7 @@ function Shell:declared_unset(name)
 	end
 	return b.s == nil and b.n == nil
 end
+-- ${var@a}: the variable's attribute flags, in bash's order.
 function Shell:attr_string(name)
 	local b = self.vars[self:deref(name)]
 	if not b then
@@ -9986,8 +9932,8 @@ function M.glob_ignore_match(path, glob, icase, noext)
 	return M.sm_match(path, glob, 1 + (noext and 0 or 32) + (icase and 16 or 0))
 end
 
--- Match `s` against a POSIX ERE. `anchored_glob` false = raw ERE (=~), true = a
--- glob already converted to an anchored ERE. Returns boolean.
+-- Match `s` against a POSIX ERE (=~, or a glob already converted to an anchored ERE);
+-- `icase`: REG_ICASE. Returns boolean.
 function M.regex_match(s, ere, icase)
 	local rb = re_get(ere, REG_EXTENDED + REG_NOSUB + (icase and REG_ICASE or 0))
 	return rb and ffi.C.regexec(rb, s, 0, nil, 0) == 0 or false
@@ -10605,26 +10551,6 @@ function M.ifs_first(ifs)
 	end
 	return ifs:sub(1, 1)
 end
--- Non-dot entry names of directory `path` (what `ls -1` lists), unsorted; {} if unreadable.
-function M.dir_names(path)
-	local out = {}
-	local d = ffi.C.opendir(path)
-	if d == nil then
-		return out
-	end
-	while true do
-		local e = ffi.C.readdir(d)
-		if e == nil then
-			break
-		end
-		local name = ffi.string(ffi.cast("const char *", e) + 19)
-		if name:sub(1, 1) ~= "." then
-			out[#out + 1] = name
-		end
-	end
-	ffi.C.closedir(d)
-	return out
-end
 -- globstar `**`: every directory at or under `base` (recursively), including base
 -- itself (the zero-level case) — the prefixes an intermediate `**/` descends into.
 local _lst = ffi.new("uint8_t[144]")
@@ -10828,6 +10754,23 @@ function M.plain_field(sh, value)
 	end
 	return true
 end
+-- $IFS as a SET of characters (a delimiter may be multibyte, `IFS=ç`: indexed by whole
+-- codepoint) + mbifs (any multibyte one?). Memoized in sh._ifscache (shared with interp's
+-- expand_to_fields) keyed on the IFS text and the locale (a locale change re-splits `é`).
+function M.ifs_charset(sh)
+	local ifs = (M.ifs(sh) or " \t\n")
+	local ic = sh._ifscache
+	if not ic or ic.ifs ~= ifs or ic.lg ~= M.locale_gen then
+		local set = {}
+		for _, ch in ipairs(M.mb_chars(ifs)) do
+			set[ch.s] = true
+		end
+		ic = { ifs = ifs, set = set, mbifs = M.lc_mb_cur_max() > 1 and ifs:find("[\128-\255]") ~= nil,
+			lg = M.locale_gen }
+		sh._ifscache = ic
+	end
+	return ic
+end
 function M.field_split(sh, value, split)
 	local n = #value
 	if n <= 64 then -- the common short word ($i, $name): one field, as is — no IFS/glob setup
@@ -10854,12 +10797,8 @@ function M.field_split(sh, value, split)
 		-- (`IFS=ç`), so index by whole codepoint. Whitespace runs collapse, and a single
 		-- non-whitespace delimiter (optionally surrounded by whitespace) ends a field.
 		fields = {}
-		local ifs = (M.ifs(sh) or " \t\n")
-		local ifsset = {}
-		for _, ch in ipairs(M.mb_chars(ifs)) do
-			ifsset[ch.s] = true
-		end
-		local mbifs = M.lc_mb_cur_max() > 1 and ifs:find("[\128-\255]") ~= nil
+		local ic = M.ifs_charset(sh)
+		local ifsset, mbifs = ic.set, ic.mbifs
 		local function isws(c) -- IFS whitespace only (subst.c ifs_whitespace)
 			return (c == " " or c == "\t" or c == "\n") and ifsset[c]
 		end
@@ -11069,19 +11008,8 @@ function M.expand_fields(sh, segs)
 		end
 		return { s1.s }
 	end
-	local ifs = (M.ifs(sh) or " \t\n")
-	-- Memoize the IFS char-set parse (shared with expand_to_fields via sh._ifscache).
-	local ic = sh._ifscache
-	if not ic or ic.ifs ~= ifs or ic.lg ~= M.locale_gen then -- (a locale change re-splits `é`)
-		local set = {}
-		for _, ch in ipairs(M.mb_chars(ifs)) do
-			set[ch.s] = true
-		end
-		ic = { ifs = ifs, set = set, mbifs = M.lc_mb_cur_max() > 1 and ifs:find("[\128-\255]") ~= nil,
-			lg = M.locale_gen }
-		sh._ifscache = ic
-	end
-	local ifsset, mbifs = ic.set, ic.mbifs
+	local ic = M.ifs_charset(sh)
+	local ifs, ifsset, mbifs = ic.ifs, ic.set, ic.mbifs
 	local function isws(c) -- IFS whitespace only (subst.c ifs_whitespace)
 		return (c == " " or c == "\t" or c == "\n") and ifsset[c]
 	end
@@ -11586,12 +11514,6 @@ arrayassign_body = function(sh, name, items, append)
 	sh:set_str("_", "")
 end
 
--- Single array-element assignment `a[i]=v` / `a[i]+=v` for the compiled tier — mirrors interp's
--- assign path (the st.index branch). `key_expanded` is the subscript already word-expanded
--- (emit_word, == interp's array_key for assoc); for an INDEXED array it is arith-evaluated
--- (to_arr_key(arith_str)). Readonly -> reject (status 1, line-abort like interp); a bad
--- subscript (negative out of range) -> status 1, non-fatal. Gated at emit to non-nameref
--- programs and a non-empty, emit_word-able subscript.
 -- a negative subscript past the start: `NAME[SUB]: bad array subscript`, the line aborted —
 -- reported before readonly-ness, since bash evaluates the subscript first
 local function neg_oob_abort(sh, name, key, sub)
@@ -11602,6 +11524,10 @@ local function neg_oob_abort(sh, name, key, sub)
 		error({ __curse_exit = 1, __curse_lineabort = true })
 	end
 end
+-- Single array-element assignment `a[i]=v` / `a[i]+=v` for the compiled tier — mirrors interp's
+-- assign path (the st.index branch). `raw` is the subscript's source text, `expanded` the same
+-- word-expanded (emit_word, == interp's array_key for assoc). Readonly -> reject (status 1,
+-- line-abort like interp); a bad subscript (negative out of range) -> status 1, non-fatal.
 function M.assign_element(sh, name, raw, expanded, value, append)
 	local rb = sh.vars[sh:deref(name)]
 	if rb and rb.ro and rb.arr and not rb.assoc and raw:find("-", 1, true) then
