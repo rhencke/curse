@@ -12,23 +12,28 @@ local E = require("emit")
 local M = {}
 M.rt, M.parser, M.interp, M.emit = rt, P, I, E
 
--- Compile source to a loaded module { run(sh,pc), loopPc={id->pc}, stmtPc={k->pc} }.
-function M.compile(ast, opts)
-	return assert(load(E.emit(ast, opts), "=curse:compiled"))()
-end
 -- Load emitted Lua and instantiate it (run the chunk: its closures and pc tables): the
--- module and its chunk, or nil when it won't load or builds no module. Every compile path
--- (fragments, line mode, whole programs) goes through here.
-local function build(code, name)
-	local chunk = load(code, name)
-	if not chunk then
-		return nil
+-- module { run(sh,pc), loopPc={id->pc}, stmtPc={k->pc} } and its chunk, or nil when it
+-- won't load or builds no module. Every compile path (fragments, line mode, whole
+-- programs, M.compile) goes through here; `strict` raises the failure instead (compiled
+-- mode's M.compile_start: its caller reports it).
+local function build(code, name, strict)
+	local chunk, err = load(code, name)
+	local ok, m = false, err
+	if chunk then
+		ok, m = pcall(chunk)
 	end
-	local ok, m = pcall(chunk)
 	if ok and type(m) == "table" and m.run then
 		return m, chunk
 	end
+	if strict then
+		error(ok and "curse: compiled chunk built no module" or m, 0)
+	end
 	return nil
+end
+-- Compile an AST to an instantiated module (compiled mode, M.run, unit tests).
+function M.compile(ast, opts)
+	return (build(E.emit(ast, opts), "=curse:compiled", true))
 end
 -- What the disk cache stores for a built chunk: its STRIPPED BYTECODE (a warm hit then
 -- loads without a Lua parse; string.dump of a chunk is valid after it ran), else the source.
@@ -225,7 +230,7 @@ function M.try_fragment(code, line1, sh, now, label, noalias) -- line1: an eval'
 end
 function M.compile_fragment(code, line1, mode, atab, pst)
 	-- (atab: the live alias table, expansion on — the parse starts from it; pst: the live
-	-- posix/extglob state, "p"?("x"|"-"), else the parse tracks them from the text)
+	-- posix/extglob/lexing state, "p"?("x"|"-")"b"?, else the parse tracks them from the text)
 	local pok, ast = pcall(M.parse_start, code, pst, atab and aenv_of(atab) or nil, line1 or nil)
 	-- A syntax error becomes a `parse_error` statement after the valid prefix: compiled, it
 	-- reports and raises __curse_parseerr, which the caller (eval/source/trap) contains.
