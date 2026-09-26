@@ -103,6 +103,28 @@ local function alias_sig(sh)
 	sh._asig_t, sh._asig_g, sh._asig = t, sh.alias_gen or 0, table.concat(al, "\1")
 	return sh._asig
 end
+-- The lexing a text was read under is part of its parse state, like posix/extglob: pst
+-- "b" = a multibyte locale whose trail bytes can be ASCII (Big5/GBK/SJIS: parser MBX, where
+-- `\xa3\x5c` is one character, not a backslash). Its charset (P.mb_on(): the LC_CTYPE name)
+-- keys every compile cache — the disk cache and a daemon worker's in-memory ones outlive
+-- the request, and the next may run the same text in the C locale — and a recompile parses
+-- with or without it as the pst says, not as whatever is live by then. (The characters it
+-- keeps whole are the LIVE locale's: such a text is never compiled after its run — the
+-- deferred compile runs after the request, maybe after the next, in another locale.)
+local function mb_parse(pst, f, ...)
+	local was = P.mb_on()
+	local want = pst ~= nil and pst:find("b", 1, true) ~= nil and (was or "?") or false
+	if want == was then
+		return f(...)
+	end
+	P.mb_locale(want)
+	local ok, r = pcall(f, ...)
+	P.mb_locale(was)
+	if not ok then
+		error(r, 0)
+	end
+	return r
+end
 function M.try_fragment(code, line1, sh, now, label, noalias) -- line1: an eval's own line, which its code numbers from
 	-- (now: the caller already saw this code run — compile it on this first call;
 	-- line1 == false: a trap handler, whose commands keep the interrupted line;
@@ -112,8 +134,10 @@ function M.try_fragment(code, line1, sh, now, label, noalias) -- line1: an eval'
 		.. (label == "cmdsub-bq" and "Q" or "") -- (a backtick body: its syntax errors read `command substitution:`)
 	local asig = not noalias and alias_sig(sh) -- (noalias: text read with its aliases expanded)
 	-- (the live parse-time options the text is read under: posix mode, extglob)
-	local pst = (sh.opt_posix and "p" or "") .. (sh.shopt and sh.shopt.extglob and "x" or "-")
-	local key = mode .. pst .. "\0" .. (asig and ("A" .. asig .. "\0") or "") .. (line1 and (line1 .. "\0" .. code) or code)
+	-- (and a Big5/GBK/SJIS locale's lexing: mb_parse)
+	local mbx = P.mb_on()
+	local pst = (sh.opt_posix and "p" or "") .. (sh.shopt and sh.shopt.extglob and "x" or "-") .. (mbx and "b" or "")
+	local key = mode .. pst .. "\0" .. (mbx and mbx .. "\0" or "") .. (asig and ("A" .. asig .. "\0") or "") .. (line1 and (line1 .. "\0" .. code) or code)
 	local hit = frag_cache[key]
 	if hit ~= nil and hit ~= 0 then
 		return hit or nil
@@ -144,7 +168,7 @@ function M.compile_fragment(code, line1, mode, atab, pst)
 		end
 		aenv = { tab = tab }
 	end
-	local pok, ast = pcall(P.parse, code, nil, aenv, nil, pst and pst:find("p", 1, true) ~= nil or nil, nil,
+	local pok, ast = pcall(mb_parse, pst, P.parse, code, nil, aenv, nil, pst and pst:find("p", 1, true) ~= nil or nil, nil,
 		line1 or nil, pst and pst:find("x", 1, true) ~= nil)
 	-- A syntax error becomes a `parse_error` statement after the valid prefix: compiled, it
 	-- reports and raises __curse_parseerr, which the caller (eval/source/trap) contains.
@@ -516,7 +540,8 @@ local function lm_key(sh, lg)
 	table.sort(al)
 	local so = sh.shopt or {}
 	return table.concat({ "curse-line", tostring(lg.sline or 0), trap_mode(sh),
-		(so.expand_aliases and "a" or "-") .. (sh.opt_posix and "p" or "-") .. (so.extglob and "g" or "-"),
+		(so.expand_aliases and "a" or "-") .. (sh.opt_posix and "p" or "-") .. (so.extglob and "g" or "-")
+			.. (P.mb_on() or "-"), -- (the lexing the line was read under: mb_parse)
 		table.concat(al, "\1"), lg.src:sub(lg.spos, lg.pos - 1) }, "\0")
 end
 function M.lm_exec(sh, lg, k)
@@ -596,13 +621,14 @@ function M.has_deferred()
 	return #deferred > 0
 end
 -- Parse a whole program under the parse options the shell STARTED with (pst: "p" posix
--- mode, "x" extglob — `--posix`, POSIXLY_CORRECT, `-O extglob`, BASHOPTS/SHELLOPTS): the
--- interpreter's first run reads it that way, so the module a warm run loads must too.
+-- mode, "x" extglob — `--posix`, POSIXLY_CORRECT, `-O extglob`, BASHOPTS/SHELLOPTS — "b"
+-- a Big5/GBK/SJIS locale's lexing, mb_parse): the interpreter's first run reads it that
+-- way, so the module a warm run loads must too.
 function M.parse_start(src, pst)
 	if not pst then
-		return P.parse(src)
+		return mb_parse(pst, P.parse, src)
 	end
-	return P.parse(src, nil, nil, nil, pst:find("p", 1, true) ~= nil or nil, nil, nil,
+	return mb_parse(pst, P.parse, src, nil, nil, nil, pst:find("p", 1, true) ~= nil or nil, nil, nil,
 		pst:find("x", 1, true) ~= nil or nil)
 end
 function M.compile_deferred(one)
@@ -644,12 +670,14 @@ function M.run_tiered(src, sh)
 	sh.attr_start = (sh.opt_a or sh.opt_r) or nil
 	sh.tier_start = { opt_x = sh.opt_x, opt_v = sh.opt_v, aliases = next(sh.aliases or {}) and { ["?"] = "" } or {},
 		shopt = { expand_aliases = sh.shopt and sh.shopt.expand_aliases } }
-	-- (started in posix mode / with extglob: the program parses differently — its own key)
-	local pst = (sh.opt_posix and "p" or "") .. (sh.shopt and sh.shopt.extglob and "x" or "")
+	-- (started in posix mode / with extglob / a Big5/GBK/SJIS locale: the program parses
+	-- differently — its own key)
+	local pst = (sh.opt_posix and "p" or "") .. (sh.shopt and sh.shopt.extglob and "x" or "") .. (P.mb_on() and "b" or "")
 	pst = pst ~= "" and pst or nil
+	local mbx = P.mb_on() -- (read in a Big5/GBK/SJIS locale: keyed by it, never deferred)
 	local path = Cache.artifact_path((sh.xt_start or sh.attr_start or pst)
 		and (src .. (sh.xt_start and "\0xtrace" or "") .. (sh.attr_start and "\0attr" or "")
-			.. (pst and "\0pst" .. pst or "")) or src)
+			.. (pst and "\0pst" .. pst or "") .. (mbx and "\0" .. mbx or "")) or src)
 	if path then
 		local cached = modcache_get(path)
 		if cached and alias_mismatch(cached, sh) then -- (read a line at a time: each compiled)
@@ -688,7 +716,9 @@ function M.run_tiered(src, sh)
 	-- the text) runs in the interpreter right away; it's compiled after the reply
 	-- (M.compile_deferred) so the NEXT run is a warm hit, and no caller waits for it.
 	if path and not may_loop(src) then
-		deferred[#deferred + 1] = { path = path, src = src, xt = sh.xt_start, attr = sh.attr_start, pst = pst }
+		if not mbx then
+			deferred[#deferred + 1] = { path = path, src = src, xt = sh.xt_start, attr = sh.attr_start, pst = pst }
+		end
 		I.run_lazy(sh, src)
 		return sh, "interp-deferred"
 	end
@@ -795,7 +825,7 @@ function M.run_tiered(src, sh)
 		end
 		local ok, err = pcall(I.run_lazy, sh, src, hook)
 		if ok then
-			if mod == nil then
+			if mod == nil and not mbx then
 				deferred[#deferred + 1] = { path = path, src = src, xt = sh.xt_start, attr = sh.attr_start, pst = pst }
 			end
 			return sh, "interp-deferred"

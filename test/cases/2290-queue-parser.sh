@@ -18,9 +18,13 @@ if LC_ALL=zh_HK.big5hkscs locale charmap 2>/dev/null | grep -q BIG5; then
 	LC_ALL=zh_HK.big5hkscs $S -c "f() { echo $a; }; f | od -An -tx1"
 	LC_ALL=zh_HK.big5hkscs $S -c "eval '[[ $a == $a ]]' && echo ev"
 	LC_ALL=C $S -c "echo ${a}x" | od -An -tx1 # (a byte-wise locale: the backslash escapes x)
+	# the SAME text in both: a compiled module (disk cache, a worker's memory) read in one
+	# locale's lexing is never the other's
+	for l in C zh_HK.big5hkscs C zh_HK.big5hkscs; do LC_ALL=$l $S -c "echo ${a}y; eval 'echo ${a}z'" | od -An -tx1; done
 else
 	echo ok 7; echo ' a3 5c 78 20 a3 5c 20 a3 5c 20 a3 5c 0a'; echo ' a3 5c 20 a3 5c 0a'
 	echo 1; echo 2; echo ' a3 5c 0a'; echo ev; echo ' a3 78 0a'
+	for l in 1 2; do echo ' a3 79 0a a3 7a 0a'; echo ' a3 5c 79 0a a3 5c 7a 0a'; done
 fi
 
 echo "-- a here-document in backticks: a last 'DELIM  ' line is body text (warned)"

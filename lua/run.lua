@@ -108,7 +108,8 @@ elseif mode == "compiled" then
 	-- tiered behavior — run it in the interpreter, exactly as the daemon/cache path does
 	-- on the same signal. Any OTHER compile error still propagates.
 	local sa = (sh.opt_a or sh.opt_r) or nil -- (started allexport/restricted: tier.run_tiered)
-	local pst = ((sh.opt_posix and "p" or "") .. (sh.shopt.extglob and "x" or "")):match(".+") -- (tier.parse_start)
+	local pst = ((sh.opt_posix and "p" or "") .. (sh.shopt.extglob and "x" or "")
+		.. (require("parser").mb_on() and "b" or "")):match(".+") -- (tier.parse_start)
 	T.note_text(sh, src)
 	sh.main_src = sh.main_src or src
 	local ok, mod = pcall(T.compile, T.parse_start(src, pst), (sh.opt_x or sa) and { xtrace = sh.opt_x, startattr = sa } or nil)
