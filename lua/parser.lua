@@ -1140,10 +1140,8 @@ scan_cmdsub = function(src, j, onwarn)
 			i = expansion_end(src, i, false, false, onwarn)
 			wstart = false
 			patstart = false
-		elseif c == "#" and wstart then
-			while i <= n and src:sub(i, i) ~= "\n" do
-				i = i + 1
-			end -- comment to end of line
+		elseif c == "#" and wstart then -- comment to end of line
+			i = src:find("\n", i, true) or n + 1
 		elseif c == "(" then
 			if cst[#cst] == "pat" then
 				if patstart then
@@ -1251,16 +1249,7 @@ dparen_is_arith = function(w, j0)
 		if c == "\\" then
 			j = j + 2
 		elseif c == "'" or c == '"' then
-			local q = c
-			j = j + 1
-			while j <= n and w:sub(j, j) ~= q do
-				if w:sub(j, j) == "\\" and q == '"' then
-					j = j + 2
-				else
-					j = j + 1
-				end
-			end
-			j = j + 1
+			j = quote_end(w, j, c == '"')
 		elseif c == "(" then
 			depth = depth + 1
 			j = j + 1
@@ -1622,6 +1611,9 @@ local function parse_word(w)
 end
 M.parse_word = parse_word
 M.scan_cmdsub = scan_cmdsub
+M.strip_contin = strip_contin
+M.quote_end = quote_end
+M.expansion_end = expansion_end
 -- bash's fork optimization (execute_in_subshell / optimize_connection_fork /
 -- parse_and_execute's should_suppress_fork): the last command of a ( … ) or $( … ) body —
 -- a plain simple command, the last of a `;`/&&/|| list — is exec'd in place of the
@@ -2595,11 +2587,7 @@ local function ltr_cmdsub(sh, body)
 		elseif c == "'" and not dq then
 			k = (body:find("'", k + 1, true) or m) + 1
 		elseif c == "$" and nx == "'" and not dq then
-			k = k + 2
-			while k <= m and body:sub(k, k) ~= "'" do
-				k = k + (body:sub(k, k) == "\\" and 2 or 1)
-			end
-			k = k + 1
+			k = quote_end(body, k + 1, true)
 		elseif c == "$" and nx == "(" then
 			stack[#stack + 1] = dq
 			dq = false
@@ -2617,10 +2605,7 @@ local function ltr_cmdsub(sh, body)
 			dq = not dq
 			k = k + 1
 		elseif c == "$" and nx == '"' and not dq then
-			local e = k + 2
-			while e <= m and body:sub(e, e) ~= '"' do
-				e = e + (body:sub(e, e) == "\\" and 2 or 1)
-			end
+			local e = quote_end(body, k + 1, true) - 1
 			if e > m then
 				break
 			end
@@ -2650,6 +2635,8 @@ local RESERVED = { ["if"] = true, ["then"] = true, ["else"] = true, ["elif"] = t
 	["case"] = true, ["esac"] = true, ["for"] = true, ["select"] = true, ["while"] = true, ["until"] = true,
 	["do"] = true, ["done"] = true, ["in"] = true, ["function"] = true, ["time"] = true, ["{"] = true,
 	["}"] = true, ["!"] = true, ["[["] = true, ["]]"] = true, ["coproc"] = true }
+-- a case clause's terminators: ;; stop, ;;& test the next patterns, ;& fall through
+local CASE_TERM = { [";;"] = "break", [";;&"] = "test", [";&"] = "fall" }
 -- reserved words that open a compound command usable as a function body
 local FBODY_KW = { ["if"] = true, ["for"] = true, ["while"] = true, ["until"] = true, ["case"] = true, ["select"] = true }
 
@@ -3005,9 +2992,7 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs, xg, bq
 		if #heredocs_pending == 0 then
 			return
 		end
-		while i <= n and src:sub(i, i) ~= "\n" do
-			i = i + 1
-		end -- to end of command line
+		i = src:find("\n", i, true) or n + 1 -- to end of command line
 		local rline, nread = line, 0 -- (bash's warning lines: where reading began, + lines read)
 		-- A command line ended by a newline from an ALIAS value: bash reads a heredoc body
 		-- with read_secondary_line -> yy_getc, straight from the input source and NOT from
@@ -3121,52 +3106,38 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs, xg, bq
 		end
 		return #redirs > 0 and redirs or nil
 	end
-	local function skipsep() -- skip separators: whitespace, newlines, ;, comments
-		while i <= n do
-			local c = src:sub(i, i)
-			if c == "\n" then
-				-- heredoc bodies opened earlier on this logical line follow this newline,
-				-- in the order the `<<` operators appeared — collect them all here.
-				if #heredocs_pending > 0 then
-					collect_heredocs() -- consumes the newline + bodies
-				else
-					if not (alias_nl and alias_nl[i]) then line = line + 1 end
-					i = i + 1
-				end
-			elseif c:match("[ \t;]") then
-				i = i + 1
-			elseif c == "#" then
-				while i <= n and src:sub(i, i) ~= "\n" do
-					i = i + 1
-				end
-			else
-				break
-			end
+	-- Past the newline at i: the bodies of here-documents opened on the line just read follow
+	-- it (collect_heredocs takes them, newline and all); else it's one more line — unless an
+	-- alias value spliced it in (bash reads those from the pushed string: no line_number++).
+	local function newline()
+		if #heredocs_pending > 0 then
+			collect_heredocs()
+		else
+			if not (alias_nl and alias_nl[i]) then line = line + 1 end
+			i = i + 1
 		end
 	end
-	-- Like skipsep but STOPS at a statement separator (; & |) instead of eating it,
-	-- so the statement loops can tell a *trailing* separator (fine) from one in
-	-- command position (a syntax error — see bare_sep_tok).
-	local function skipblank()
+	-- Skip what may separate tokens where a command (list) goes on: blanks, `\<newline>`s,
+	-- newlines (newline()), comments — and `;`s when `semi`. Without it this STOPS at a
+	-- statement separator (; & |), so the statement loops can tell a *trailing* separator
+	-- (fine) from one in command position (a syntax error — see bare_sep_tok).
+	local function skipsep(semi) -- (-> whether a newline was crossed)
+		local nl = false
 		while i <= n do
-			local c = src:sub(i, i)
-			if c == "\n" then
-				if #heredocs_pending > 0 then
-					collect_heredocs()
-				else
-					if not (alias_nl and alias_nl[i]) then line = line + 1 end
-					i = i + 1
-				end
-			elseif c == " " or c == "\t" then
+			ws()
+			local c = src:byte(i)
+			if c == 10 then
+				newline()
+				nl = true
+			elseif c == 35 then -- (a comment, to the end of the line)
+				i = src:find("\n", i, true) or n + 1
+			elseif c == 59 and semi then
 				i = i + 1
-			elseif c == "#" then
-				while i <= n and src:sub(i, i) ~= "\n" do
-					i = i + 1
-				end
 			else
 				break
 			end
 		end
+		return nl
 	end
 	-- At a command-expected position a control operator means an empty command,
 	-- which bash rejects as a syntax error (status 2): a leading/doubled `;`, `;;`,
@@ -3252,14 +3223,8 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs, xg, bq
 			local cc = src:byte(k)
 			if cc == 92 then -- \
 				k = k + 2
-			elseif cc == 39 then -- '
-				k = (src:find("'", k + 1, true) or n) + 1
-			elseif cc == 34 then -- "
-				k = k + 1
-				while k <= n and src:byte(k) ~= 34 do
-					k = k + (src:byte(k) == 92 and 2 or 1)
-				end
-				k = k + 1
+			elseif cc == 39 or cc == 34 then -- ' "
+				k = quote_end(src, k, cc == 34)
 			else
 				if cc == 40 then
 					d = d + 1
@@ -3417,7 +3382,7 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs, xg, bq
 							je = je + 1 + #body
 							lfix = lfix - 1 -- (that inserted newline isn't a source line)
 							warns[#warns + 1] = { t = "warn", line = line,
-								msg = ("warning: command substitution: %d unterminated here-document"):format(#hdp) }
+								msg = ("warning: command substitution: %d unterminated here-document%s"):format(#hdp, #hdp == 1 and "" or "s") }
 						end
 					end
 					i = je
@@ -3480,7 +3445,7 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs, xg, bq
 	-- A for/select body: `do … done`, or bash's `{ … }` alternative
 	-- (`for ((i=0; i<3; i++)) { echo $i; }`, `for x in a b; { …; }`).
 	local function loop_body()
-		skipsep()
+		skipsep(true)
 		if src:sub(i, i) == "{" then
 			return brace_group()
 		end
@@ -3524,12 +3489,7 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs, xg, bq
 	-- (bash: `f() ( ... )`). Return a stmt list either way — the subshell form
 	-- yields a one-statement list holding a subshell node, so it runs isolated.
 	local function func_body()
-		ws()
-		while src:sub(i, i) == "\n" do
-			if not (alias_nl and alias_nl[i]) then line = line + 1 end
-			i = i + 1
-			ws()
-		end -- bash allows newlines before the body
+		skipsep() -- bash allows newlines before the body
 		local bline = line -- the body's first line (a traced call's entry DEBUG reports it)
 		local sjcx = jcx
 		jcx = { l = bline, up = sjcx } -- (restored by funcdef_node)
@@ -3749,22 +3709,14 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs, xg, bq
 		local elems = {}
 		local line0, closed = line, false
 		while i <= n do
-			ws()
+			skipsep() -- (newlines, comments: a word never starts at a `#` here)
 			local c = src:sub(i, i)
 			if c == ")" then
 				i = i + 1
 				closed = true
 				break
 			end
-			if c == "\n" then
-				if not (alias_nl and alias_nl[i]) then line = line + 1 end
-				i = i + 1
-			elseif c == "#" then
-				-- a comment runs to end of line (words never start here: ws() just ran)
-				while i <= n and src:sub(i, i) ~= "\n" do
-					i = i + 1
-				end
-			elseif c == "" then
+			if c == "" then
 				break
 			elseif c == "&" or c == ";" or c == "|" or ((c == "<" or c == ">") and src:sub(i + 1, i + 1) ~= "(") then
 				-- a control operator inside the list (`a=(x & y)`): bash's recoverable
@@ -3772,18 +3724,14 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs, xg, bq
 				-- lines of a multi-line literal then parse as ordinary commands (bash)
 				-- (the token is the whole operator: `<>`, `>>`, `&&`, …)
 				local tok = src:match("^[<>]+", i) or src:match("^[&|;][&|;]?", i) or c
-				while i <= n and src:sub(i, i) ~= "\n" do
-					i = i + 1
-				end
+				i = src:find("\n", i, true) or n + 1
 				error({ __curse_arraylit = true, tok = tok })
 			elseif c == "(" then
 				-- an ELEMENT can't be `(` (a nested `()`, as in `a=( inside=() )`): bash
 				-- reports a syntax error but the assignment is NON-fatal (the var stays
 				-- unset, the script CONTINUES). Like an operator above, the error discards
 				-- the rest of the LINE; raise a RECOVERABLE error the line-parser marks so.
-				while i <= n and src:sub(i, i) ~= "\n" do
-					i = i + 1
-				end
+				i = src:find("\n", i, true) or n + 1
 				error({ __curse_arraylit = true })
 			else
 				-- `[foo bar]=v`: a subscript is read as one unit, blanks and all, when a
@@ -3796,30 +3744,14 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs, xg, bq
 				if c == "[" then
 					local depth, k = 0, i
 					while k <= n do
-						local ch = src:sub(k, k)
-						if ch == "\\" then
-							k = k + 2
-						elseif ch == "'" then
-							k = (src:find("'", k + 1, true) or n) + 1
-						elseif ch == '"' then -- (a \" inside doesn't close it)
-							k = k + 1
-							while k <= n and src:sub(k, k) ~= '"' do
-								k = k + (src:sub(k, k) == "\\" and 2 or 1)
-							end
-							k = k + 1
-						elseif ch == "`" then
-							k = k + 1
-							while k <= n and src:sub(k, k) ~= "`" do
-								k = k + (src:sub(k, k) == "\\" and 2 or 1)
-							end
-							k = k + 1
-						elseif ch == "$" and src:sub(k + 1, k + 1) == "(" then
-							local ok, e = pcall(scan_cmdsub, src, k + 2)
-							k = ok and e or k + 2
+						local e = brace_skip(src, k) -- (quoted text, `…`, $( … ): no brackets)
+						if e then
+							k = e
 						else
-							if ch == "[" then
+							local ch = src:byte(k)
+							if ch == 91 then
 								depth = depth + 1
-							elseif ch == "]" then
+							elseif ch == 93 then
 								depth = depth - 1
 								if depth == 0 then
 									break
@@ -4040,9 +3972,7 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs, xg, bq
 		-- an alias that expanded to a comment (`alias c=#`): the rest of the line is a comment
 		-- and there is NO command ($? unchanged)
 		if src:sub(i, i) == "#" then
-			while i <= n and src:sub(i, i) ~= "\n" do
-				i = i + 1
-			end
+			i = src:find("\n", i, true) or n + 1
 			return { t = "noop", line = line }
 		end
 		local dstart, dline = i, line -- byte offset + line where this command (hence a funcdef) begins
@@ -4288,20 +4218,7 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs, xg, bq
 			i = e + 1
 			-- bash allows blank lines / comments between the loop var and `in` (but a
 			-- `;` terminates the header — `for i;` iterates "$@").
-			while true do
-				ws()
-				local c = src:sub(i, i)
-				if c == "\n" then
-					if not (alias_nl and alias_nl[i]) then line = line + 1 end
-					i = i + 1
-				elseif c == "#" then
-					while i <= n and src:sub(i, i) ~= "\n" do
-						i = i + 1
-					end
-				else
-					break
-				end
-			end
+			skipsep()
 			local words = {}
 			try_alias(false)
 			do -- (after the name: `in`, `do`, or a separator — `for x y` is an error)
@@ -4497,8 +4414,7 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs, xg, bq
 				tp[#toks + 1], tl[#toks + 1] = i, line
 				if src:sub(i, i) == "\n" then
 					nlb[#toks + 1] = nlb[#toks + 1] or { i, line } -- (the first newline before it)
-					if not (alias_nl and alias_nl[i]) then line = line + 1 end
-					i = i + 1 -- continuation inside [[ ]]
+					newline() -- continuation inside [[ ]]
 				elseif i > n or src:sub(i, i + 1) == "]]" then
 					if src:sub(i, i + 1) == "]]" then
 						i = i + 2
@@ -4702,12 +4618,7 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs, xg, bq
 				error("syntax error near `" .. ((c == "\n" or c == "") and "newline" or c) .. "'")
 			end
 			local subject = parse_word(subw)
-			while src:sub(i, i):match("[ \t\n]") do
-				if src:sub(i, i) == "\n" then
-					if not (alias_nl and alias_nl[i]) then line = line + 1 end
-				end
-				i = i + 1
-			end
+			skipsep()
 			if peekword() == "in" then
 				i = i + 2
 				jcx = { l = ln, up = jcx } -- (its clauses: `up` restores it after — see below)
@@ -4720,51 +4631,25 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs, xg, bq
 				line = l0
 				error("syntax error near `" .. (w ~= "" and w or src:match("^[;&|<>]+", i) or src:sub(i, i)) .. "'")
 			end -- ysh `case (x) { }` etc. rejected
-			-- separator skipper that STOPS at ;; (so a clause body ends there)
+			-- separator skipper that STOPS at a clause's ;; / ;;& / ;& (-> it; at EOF "eof")
 			-- (semi_ok: one `;` may end the statement just read; anywhere else — a clause's
 			-- start, after a newline — a `;` is an empty command, bash's syntax error)
 			local function skip_sep(semi_ok)
-				while i <= n do
-					if src:sub(i, i + 2) == ";;&" then
-						return "dsemi_amp"
-					end -- ;;& (test next patterns)
-					if src:sub(i, i + 1) == ";;" then
-						return "dsemi"
-					end -- ;; (stop)
-					if src:sub(i, i + 1) == ";&" then
-						return "semi_amp"
-					end -- ;& (fall through)
-					local c = src:sub(i, i)
-					if c == "\n" then
-						-- a heredoc opened by a command in this arm has its body after the
-						-- newline (like the shared skipsep) — collect it, else it leaks as
-						-- commands (`x) cat <<EOF … EOF ;;`).
-						if #heredocs_pending > 0 then
-							collect_heredocs()
-						else
-							if not (alias_nl and alias_nl[i]) then line = line + 1 end
-							i = i + 1
-						end
-					elseif c == " " or c == "\t" then
-						i = i + 1
-					elseif c == ";" then
-						if not semi_ok then
-							error("syntax error near `;'")
-						end
+				while true do
+					if skipsep() then
 						semi_ok = false
-						i = i + 1
-					elseif c == "#" then
-						while i <= n and src:sub(i, i) ~= "\n" do
-							i = i + 1
-						end
-					else
+					end
+					local t = src:match("^;;&", i) or src:match("^;[;&]", i)
+					if t or i > n then
+						return t or "eof"
+					elseif src:byte(i) ~= 59 then
 						return nil
+					elseif not semi_ok then
+						error("syntax error near `;'")
 					end
-					if c == "\n" then
-						semi_ok = false
-					end
+					semi_ok = false
+					i = i + 1
 				end
-				return "eof"
 			end
 			local clauses = {}
 			while true do
@@ -4810,21 +4695,11 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs, xg, bq
 				local semi_ok = false
 				while true do
 					local s = skip_sep(semi_ok)
-					if s == "dsemi" then
-						i = i + 2
-						term = "break"
+					if CASE_TERM[s] then
+						i = i + #s
+						term = CASE_TERM[s]
 						break
 					end
-					if s == "dsemi_amp" then
-						i = i + 3
-						term = "test"
-						break
-					end -- ;;&
-					if s == "semi_amp" then
-						i = i + 2
-						term = "fall"
-						break
-					end -- ;&
 					if s == "eof" or peekword() == "esac" then
 						break
 					end
@@ -5189,26 +5064,9 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs, xg, bq
 					i = i + 1
 				end
 				-- bash allows spaces, a comment, and newlines after `|` before the next cmd
-				while true do
-					ws()
-					if src:sub(i, i) == "#" then
-						while i <= n and src:sub(i, i) ~= "\n" do
-							i = i + 1
-						end
-					elseif src:sub(i, i) == "\n" then
-						-- a heredoc opened by the stage before this `|` has its body on the
-						-- following lines (`cat <<EOF |` <newline> body EOF <newline> next) —
-						-- consume it here before the next stage, else the body parses as cmds.
-						if #heredocs_pending > 0 then
-							collect_heredocs()
-						else
-							if not (alias_nl and alias_nl[i]) then line = line + 1 end
-							i = i + 1
-						end
-					else
-						break
-					end
-				end
+				-- (a heredoc opened by the stage before this `|` has its body on the following
+				-- lines: `cat <<EOF |` <newline> body EOF <newline> next)
+				skipsep()
 				operand_check()
 				if bang_at(i) then -- (`!` only starts a pipeline: bash's grammar)
 					error("syntax error near `!'")
@@ -5243,20 +5101,7 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs, xg, bq
 				i = i + 2
 				-- `&&`/`||` at end of a line CONTINUE to the next line (bash), so skip any
 				-- newlines / blank lines / comments before the right-hand pipeline.
-				while true do
-					ws()
-					local c = src:sub(i, i)
-					if c == "\n" then
-						if not (alias_nl and alias_nl[i]) then line = line + 1 end
-						i = i + 1
-					elseif c == "#" then
-						while i <= n and src:sub(i, i) ~= "\n" do
-							i = i + 1
-						end
-					else
-						break
-					end
-				end
+				skipsep()
 				items = items or { { op = nil, cmd = head } }
 				operand_check()
 				items[#items + 1] = { op = two, cmd = parse_pipeline() }
@@ -5290,7 +5135,7 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs, xg, bq
 		stopset = stopset or {}
 		local stmts = {}
 		while true do
-			skipblank()
+			skipsep()
 			if i > n then
 				return stmts, nil
 			end
@@ -5331,7 +5176,7 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs, xg, bq
 			end
 			-- consume this statement's single trailing `;` (its terminator), so the next
 			-- iteration lands on a genuine command position; `&`/newlines are handled by
-			-- parse_stmt/skipblank. A following `;` is then a bare separator (error).
+			-- parse_stmt/skipsep. A following `;` is then a bare separator (error).
 			ws()
 			if src:sub(i, i) == ";" and src:sub(i + 1, i + 1) ~= ";" then
 				i = i + 1
@@ -5347,22 +5192,6 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs, xg, bq
 	-- interpreter simply never asks for it if an earlier `exit` fired. (Nested
 	-- lists — function bodies, loops — stay strict: a broken body IS a real error.)
 	local done = false
-	-- Skip within-LINE whitespace: spaces/tabs and `\<newline>` line continuations
-	-- (which bash removes at the lexer level, so they EXTEND the logical line), but
-	-- NOT a real newline — that ends the line.
-	local function skip_inline()
-		while true do
-			local c = src:sub(i, i)
-			if c == " " or c == "\t" then
-				i = i + 1
-			elseif c == "\\" and src:sub(i + 1, i + 1) == "\n" then
-				i = i + 2
-				line = line + 1
-			else
-				break
-			end
-		end
-	end
 	-- Yield one LOGICAL LINE at a time: a complete `simple_list` — all the
 	-- `;`/`&`/`&&`/`||`-joined and-or lists up to a top-level newline or EOF, as
 	-- bash's `inputunit` does. Returns { stmts = {…}, perr = <parse_error>? } or nil.
@@ -5375,7 +5204,7 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs, xg, bq
 			return nil
 		end
 		alias_line_start()
-		skipblank() -- blank lines, comments, and pending heredocs
+		skipsep() -- blank lines, comments, and pending heredocs
 		if i > n then
 			done = true
 			return nil
@@ -5440,7 +5269,7 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs, xg, bq
 				st.top = true -- (not nested in a compound: its errors report its END line)
 			end
 			stmts[#stmts + 1] = st
-			skip_inline()
+			ws()
 			local c = src:sub(i, i)
 			if st.t ~= "background" then
 				-- foreground: a single `;` continues the line; `\n`/EOF/`#` end it cleanly.
@@ -5450,7 +5279,7 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs, xg, bq
 				if c == ";" and src:sub(i + 1, i + 1) ~= ";" then
 					i = i + 1
 					st.semi = true -- (`a;⏎b` joins with `;`, not a newline: deparse's comsubs)
-					skip_inline()
+					ws()
 				elseif i > n or c == "\n" or c == "#" then
 					break
 				else
