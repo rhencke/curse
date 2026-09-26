@@ -9,6 +9,11 @@ S=${THIS_SH:-bash}
 # ~/… only under $HOME. Taking HOME from the caller made the output depend on where the
 # test ran (the full scratch path — a fresh temp dir per run — or a real ~ missing files).
 export HOME=$PWD
+# Nothing here reads the test's own stdin, but child shells started without -c or a script
+# (`$S -o` lists the options and then READS COMMANDS FROM STDIN; `-i` shells touch it too)
+# would wait on whatever the caller's stdin is: the harness gives </dev/null, a terminal or
+# an agent's never-closing socket hung them indefinitely. Make it /dev/null for everyone.
+exec </dev/null
 n() { sed "s#$S#SH#g"; }
 t() { echo "--- $*"; "$S" "$@" 2>&1 | n; echo "st=${PIPESTATUS[0]}"; }
 h() { echo "--- $*"; "$S" "$@" 2>&1 | sed -n 1p | n; echo "st=${PIPESTATUS[0]}"; }
