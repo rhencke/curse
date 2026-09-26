@@ -106,7 +106,7 @@ run_lua  = find_program('tools' / 'run-lua.sh')
 test_env = environment()
 test_env.set('LUA_PATH', repo / 'lua' / '?.lua' + ';;')
 
-foreach t : ['test_cache', 'test_forin', 'test_funcs', 'test_nested', 'test_tier']
+foreach t : ['test_cache', 'test_ext', 'test_forin', 'test_funcs', 'test_nested', 'test_tier']
   test(t, run_lua,
     args:    [luajit_bin, repo / 'lua' / (t + '.lua')],
     workdir: repo,
