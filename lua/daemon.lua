@@ -274,14 +274,7 @@ local function serve_request(cfd, req, fds, ctx)
 			sh.status = st
 			return
 		end
-		local kind, payload = Invoke.start(sh, inv)
-		if kind == "repl" or kind == "stdin" then
-			require("repl").run(sh) -- (non-interactive "stdin": line at a time from fd 0, bash)
-		elseif kind == "file" and sh.opt_t then -- (started -t: one command, read by the interpreter)
-			require("interp").run_lazy(sh, payload)
-		elseif kind ~= "exit" then -- "code" / "file" (the script's text)
-			Tier.run_tiered(payload, sh)
-		end
+		Invoke.run(sh, Invoke.start(sh, inv)) -- (its mid-run compiles are stored after the reply)
 	end, function(e)
 		io.stderr:write("curse: internal error: " .. tostring(e) .. "\n" .. debug.traceback() .. "\n")
 		return e
