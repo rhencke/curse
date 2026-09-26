@@ -9,8 +9,9 @@ local exec_list = I.exec_list
 
 -- Parsed single-line eval strings (a loop's `eval "$x=…"` re-parses the same text
 -- every pass). Keyed on everything the parse depends on: text, line, extglob,
--- posix; skipped while aliases are live (the parse would depend on the table) and
--- for heredocs (the parse may warn). Values: the list of line groups.
+-- posix, a Big5/GBK/SJIS locale's lexing (parser MBX); skipped while aliases are live
+-- (the parse would depend on the table) and for heredocs (the parse may warn). Values:
+-- the list of line groups.
 local eval_cache, eval_n = {}, 0
 local function eval_groups(sh, code, ln)
 	if code:find("\n", 1, true) or code:find("<<", 1, true) or #code > 2048
@@ -18,6 +19,7 @@ local function eval_groups(sh, code, ln)
 		return nil
 	end
 	local key = code .. "\0" .. ln .. (sh.shopt and sh.shopt.extglob and "x" or "-") .. (sh.opt_posix and "p" or "-")
+		.. (P.mb_on() or "-")
 	local lgs = eval_cache[key]
 	if not lgs then
 		lgs = {}

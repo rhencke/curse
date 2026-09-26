@@ -24,7 +24,7 @@ local POSIX_DQ = false
 -- byte-based: in such a locale the text is parsed with those trail bytes swapped for
 -- unused high bytes, and the tree gets them back (mb_hide / mb_restore). UTF-8 (every
 -- byte of a multibyte char >= 0x80) and single-byte locales never pay for it.
-local MBX = false
+local MBX = false -- (else the LC_CTYPE name: the text's lexing depends on its charset)
 local MB_BSL = nil -- (mb_hide's placeholder for a trail byte `\`, handed to the next make_parser)
 
 -- ---- arithmetic expression parser (precedence climbing over a string) ----
@@ -658,7 +658,7 @@ local comsub_err_cache, comsub_err_n = {}, 0
 -- body's parse had to GUESS that state (an extglob-looking `X(` in it), so no error is
 -- trusted — the caller's program then runs a line at a time (xg_guess).
 local function comsub_syntax(body, xg)
-	local key = xg == nil and body or body .. (xg and "\0x" or "\0-")
+	local key = (xg == nil and body or body .. (xg and "\0x" or "\0-")) .. (MBX and "\0b" .. MBX or "")
 	local hit = comsub_err_cache[key]
 	if hit ~= nil then
 		if hit == "?" then
@@ -1827,6 +1827,9 @@ do
 end
 function M.mb_locale(on) -- (runtime: the locale changed)
 	MBX = on or false
+end
+function M.mb_on() -- (tier: the lexing state is part of every compile-cache key): false, or
+	return MBX -- the LC_CTYPE name
 end
 do
 	local acache, an = {}, 0
@@ -3331,17 +3334,19 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs, xg, bq
 	-- in tier.compile_fragment's pst form: its hot-path recompile from its source text
 	-- (tier loop_fragment / fn_hot) must parse it the same way, whatever is live by then.
 	-- nil: a static parse from the defaults (the recompile's own default reproduces it).
+	-- "b": read in a multibyte locale with ASCII trail bytes (MBX), which the recompile
+	-- must lex the same way.
 	local function pst_now()
 		local p, x
 		if sh then
 			p, x = sh.opt_posix, sh.shopt ~= nil and sh.shopt.extglob
 		else
 			p, x = posix_on, extglob_on
-			if not (p or x) then
+			if not (p or x or MBX) then
 				return nil
 			end
 		end
-		return (p and "p" or "") .. (x and "x" or "-")
+		return (p and "p" or "") .. (x and "x" or "-") .. (MBX and "b" or "")
 	end
 	-- from just past an extglob `X(`, to just past its matching `)`
 	local function scan_extglob(k)
@@ -5915,7 +5920,7 @@ end
 
 do -- (loaded after the locale was set: runtime's lc_commit keeps it current from here)
 	local rt = package.loaded.runtime
-	MBX = rt and rt.lc_mb_cur_max() > 1 and not rt.lc_utf8() or false
+	MBX = rt and rt.lc_mb_cur_max() > 1 and not rt.lc_utf8() and (rt.lc_state[0] or "?") or false
 end
 
 return M

@@ -50,6 +50,7 @@ ffi.cdef([[
   int fork(void);
   int dup2(int a, int b);
   long syscall(long number, ...);
+  int curse_d_waitid(int idtype, int id, void *info, int options) asm("waitid");
   typedef struct _IO_FILE curse_d_FILE;
   extern curse_d_FILE *stdin;
   void curse_d_fpurge(curse_d_FILE *fp) asm("__fpurge");
@@ -309,6 +310,13 @@ local function serve_request(cfd, req, fds, ctx)
 		status = 0x10000 + sh.termsig * 256 + 128 + sh.termsig
 	end
 	_G.__curse_sigrun = nil -- (a signal between requests belongs to no script)
+	-- From the reply on, this worker no longer serves THAT client: unbind the slot from its
+	-- pid (still busy, -1) BEFORE the client can read its status and exit. Otherwise the
+	-- parent's dead-client sweep sees the finished client gone while this worker scrubs (or
+	-- drains its background jobs) and SIGKILLs it — and, racing, the kill could land after
+	-- the worker had already accepted the NEXT request, whose client then read EOF: an empty
+	-- run with status 127 under load.
+	ctx.busy[ctx.slot] = -1
 	local sbuf = ffi.new("int32_t[1]", status) -- finish_run maps to $?) becomes status 1
 	C.write(cfd, sbuf, 4)
 	C.close(cfd)
@@ -316,8 +324,7 @@ local function serve_request(cfd, req, fds, ctx)
 	-- them, then RETIRES — its slot reads -1 meanwhile (busy for the pool's saturation
 	-- count, so a replacement is spawned on demand; never "client gone", so not killed)
 	local drained = false
-	if rt.sched_live() then
-		ctx.busy[ctx.slot] = -1
+	if rt.sched_live() then -- (the slot already reads -1: see above)
 		pcall(rt.sched_drain)
 		drained = true
 	end
@@ -701,6 +708,7 @@ local function serve()
 	end
 
 	local st = ffi.new("int[1]")
+	local wsinfo = ffi.new("char[128]") -- (a siginfo_t for waitid)
 	local lp = ffi.new("struct curse_d_pollfd[?]", MAXW + 1)
 	while live > 0 do
 		while true do -- reap exited workers (a worker only exits on idle-timeout or crash)
@@ -747,11 +755,24 @@ local function serve()
 		-- A worker whose CLIENT has died (killed by a timeout, ^C…) is still running an
 		-- abandoned request: kill it (the reap above respawns it) — otherwise it holds its
 		-- slot, and every later request queues behind it.
+		-- The slot is read from shared memory the worker keeps writing, so check-then-kill
+		-- races it: between reading the dead client's pid and the kill, the worker may have
+		-- finished and accepted a NEW request, which the kill would then destroy (its client
+		-- reads EOF -> status 127). So freeze the worker first (SIGSTOP, and wait until it IS
+		-- stopped), re-read its slot, and kill only if it still serves that dead client.
 		for pid, slot in pairs(pidslot) do
 			local cpid = busy[slot]
 			if cpid > 1 and C.kill(cpid, 0) ~= 0 and ffi.errno() == 3 then -- ESRCH
-				busy[slot] = 0
-				C.kill(pid, 9)
+				C.kill(pid, 19) -- SIGSTOP
+				-- P_PID, WSTOPPED|WEXITED|WNOWAIT: returns once it's stopped (or has exited,
+				-- left for the reap above)
+				C.curse_d_waitid(1, pid, wsinfo, 2 + 4 + 0x01000000)
+				if busy[slot] == cpid then
+					busy[slot] = 0
+					C.kill(pid, 9)
+				else
+					C.kill(pid, 18) -- SIGCONT: it moved on; leave it be
+				end
 			end
 		end
 		if pr > 0 and lp[0].revents ~= 0 then -- a connection is pending

@@ -1357,9 +1357,9 @@ do
 			re_locale_changed()
 		end
 		lc_mb_cur_max = tonumber(C.__ctype_get_mb_cur_max()) or 1
-		local P = package.loaded.parser -- (Big5/GBK/SJIS lexing: parser.lua's MBX)
-		if P then
-			P.mb_locale(lc_mb_cur_max > 1 and not M.lc_utf8())
+		local P = package.loaded.parser -- (Big5/GBK/SJIS lexing: parser.lua's MBX, the
+		if P then -- LC_CTYPE name — which charset's characters the lexer keeps whole)
+			P.mb_locale(lc_mb_cur_max > 1 and not M.lc_utf8() and (st[0] or "?"))
 		end
 	end
 	function M.reset_locale(sh, var)
