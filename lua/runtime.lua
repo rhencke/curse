@@ -2851,12 +2851,40 @@ end
 -- for pure bodies (no stderr/2>&1 to worry about); the fd path is for isolated mutating
 -- $() where a builtin may redirect its diagnostics into the capture. A temp file (not a
 -- pipe) means no self-deadlock when the body out-writes the pipe buffer in one process.
+local function shallowcopy(t)
+	if t == nil then return nil end
+	local c = {}
+	for k, v in pairs(t) do c[k] = v end
+	return c
+end
+-- The light state every in-process subprogram — `( … )` (subshell_run), `$(…)`
+-- (capture_inproc) — enters with and gives back: its own copy of the aliases (an alias it
+-- defines doesn't leak out: bash), its lines ($LINENO, $BASH_COMMAND), the loop depth, one
+-- more subprogram and subshell level ($BASH_SUBSHELL — still in force for its EXIT trap),
+-- and no exec-in-place tail. (bash's cleanup_dead_jobs, on a fork: the notified dead jobs go.)
+local function subprog_enter(self)
+	if self.jobs_waited then
+		M.jobs_cleanup_waited(self)
+	end
+	local sv = { self.aliases, self.cur_line, self.cur_cmd, self.shlvl_tail, self.cur_cline, self.loopdepth,
+		self.subdepth }
+	self.aliases = shallowcopy(self.aliases) or {}
+	self.shlvl_tail = nil
+	self.in_subprogram = (self.in_subprogram or 0) + 1
+	self.subdepth = (self.subdepth or 0) + 1
+	return sv
+end
+local function subprog_leave(self, sv)
+	self.aliases, self.cur_line, self.cur_cmd, self.shlvl_tail = sv[1], sv[2], sv[3], sv[4]
+	self.cur_cline, self.loopdepth, self.subdepth = sv[5], sv[6], sv[7]
+	self.in_subprogram = self.in_subprogram - 1
+end
 local deferred_sigs, cap_depth, cap_pid, flush_deferred, cap_enter -- (the signal hold: see M.defer_signal)
 function Shell:capture_inproc(backtick, runner, capfd, ctx)
 	M.env_rebuilt(self) -- (command_substitute's maybe_make_export_env)
-	if self.jobs_waited then -- (bash's cleanup_dead_jobs, on a fork: the notified dead jobs go)
-		M.jobs_cleanup_waited(self)
-	end
+	-- ($(…) inside a loop knows it — a break/continue there ends the substitution, as it
+	-- ends a `( … )` (bash) — so its loopdepth stays)
+	local sp = subprog_enter(self)
 	local buf, tmp, save1
 	if capfd then
 		io.flush()
@@ -2884,38 +2912,15 @@ function Shell:capture_inproc(backtick, runner, capfd, ctx)
 		end
 		self.capturing = true -- last pipeline stage drains into buf
 	end
-	self.in_subprogram = (self.in_subprogram or 0) + 1 -- $(...) is a subprogram: ERR trap suppressed
-	local saved_ld = self.loopdepth -- ($(…) inside a loop knows it: a break/continue there
-	-- ends the substitution, as it ends a `( … )` — bash)
-	local savede = self.opt_e
+	local savede = self.opt_e -- (the ERR trap: suppressed in a subprogram)
 	if not (self.opt_posix or (self.shopt and self.shopt.inherit_errexit)) then
 		self.opt_e = false
 	end
-	local saved_line, saved_cc, saved_tl = self.cur_line, self.cur_cmd, self.shlvl_tail -- $LINENO: the sub's internal lines don't leak out
-	local saved_cl = self.cur_cline -- (nor the line a next $(…) of this command numbers from)
-	self.shlvl_tail = nil
-	-- $() is a child: it INHERITS the parent's aliases but its own alias/unalias
-	-- do not leak back out (bash). Give it an independent copy, restored after.
-	local saved_aliases = self.aliases
-	do
-		local c = {}
-		for k, v in pairs(saved_aliases) do
-			c[k] = v
-		end
-		self.aliases = c
-	end
-	-- (and its own command hash table: what it hashes, or the hits it counts, stay there)
+	-- (its own command hash table: what it hashes, or the hits it counts, stay there)
 	local sv_hc, sv_hp = self.hashcache, self.hashpath
-	if sv_hc then
-		local c = {}
-		for k, v in pairs(sv_hc) do
-			c[k] = v
-		end
-		self.hashcache = c
-	end
-	local sv_xd, sv_depth = self.xdepth, self.subdepth
+	self.hashcache = shallowcopy(sv_hc)
+	local sv_xd = self.xdepth
 	self.xdepth = (sv_xd or 0) + 1 -- xtrace: PS4's first char repeats per $(…) level
-	self.subdepth = (sv_depth or 0) + 1
 	local sv_cj, sv_xs = self.cap_jobs, self.xsigint
 	self.cap_jobs, self.xsigint = {}, nil
 	cap_enter()
@@ -2932,7 +2937,7 @@ function Shell:capture_inproc(backtick, runner, capfd, ctx)
 	if cap_pid == C.getpid() then
 		cap_depth = cap_depth - 1 -- (a held signal is raised once the capture is done, below)
 	end
-	self.xdepth, self.subdepth = sv_xd, sv_depth
+	self.xdepth = sv_xd
 	if ctx and ctx.pid == C.getpid() then
 		if not ok and type(err) == "table" and err.__curse_vsig == ctx then
 			err = { __curse_exit = 128 + err.sig } -- (`kill $BASHPID`: the substitution dies)
@@ -2946,13 +2951,9 @@ function Shell:capture_inproc(backtick, runner, capfd, ctx)
 		end
 		M.iso_restore_fds(ctx) -- (`exec 4>&1` in the body: undone while fd 1 is still the capture)
 	end
-	self.aliases = saved_aliases -- discard aliases defined inside $()
+	subprog_leave(self, sp)
 	self.hashcache, self.hashpath = sv_hc, sv_hp
-	self.cur_line, self.cur_cmd, self.shlvl_tail = saved_line, saved_cc, saved_tl -- ($BASH_COMMAND: the child's was its own)
-	self.cur_cline = saved_cl
 	self.opt_e = savede
-	self.loopdepth = saved_ld
-	self.in_subprogram = self.in_subprogram - 1
 	self.capturing = saved_cap
 	self.out = saved
 	if capfd then
@@ -3041,12 +3042,6 @@ function M.getopts_remap(st, from, to)
 	end
 	return r
 end
-local function shallowcopy(t)
-	if t == nil then return nil end
-	local c = {}
-	for k, v in pairs(t) do c[k] = v end
-	return c
-end
 
 -- CHECKPOINT the process/shell state a forked subprogram (`( … )` or `$(…)`) isolates
 -- for free but an in-process run would leak: variables (DEEP-copied boxes — the copy is
@@ -3073,51 +3068,27 @@ local function opt_fields()
 end
 M.opt_fields = opt_fields
 local iso_push, iso_pop
-local function sub_checkpoint(self)
-	local orig_vars = self.vars
-	local copy = {}
-	for k, b in pairs(orig_vars) do copy[k] = copybox(b) end
-	self.vars = copy
-	local exset = {}
-	for name, b in pairs(orig_vars) do
-		if b.exported then exset[name] = true end
+-- The Shell fields a subshell may change that are plain values or containers it replaces
+-- or mutates in place: SUB_KEEP is saved and put back; SUB_COPY also gets a private
+-- shallow copy for the body. (Deeper state — vars, the dynamic scopes, params, completion
+-- specs, history, cwd — is handled below.)
+local SUB_KEEP = { "hashpath", "tcwd", "random_plain", "shellopts_exported", "argv0", "sec_off",
+	"subsh_off", "hosts", "nparams", "params", "getopts_state", "complete", "savedstack", "tenv" }
+local SUB_COPY = { "shopt", "functions", "dirstack", "hashcache", "bav", "fn_ro", "unset_specials",
+	"disabled_builtins" }
+-- A private copy of the variables and the dynamic-scope layers behind them — `local`
+-- shadow records and tempenv bindings, mutated by `unset` (which REVEALS the next layer:
+-- drops the record / marks the tempenv consumed and installs its box) — records AND the
+-- boxes they hold, so neither escapes. The ORIGINAL boxes stay pristine, so a reference
+-- to one stays valid. Also re-keys getopts' per-OPTIND-box state onto the copies.
+-- Shared by sub_checkpoint and Shell:stage_clone.
+local function scopes_copy(self, into)
+	local orig, vars = self.vars, {}
+	for k, b in pairs(orig) do
+		vars[k] = copybox(b)
 	end
-	local pcopy = {}
-	for i = 1, self.nparams do pcopy[i] = self.params[i] end
-	local cp = {
-		orig_vars = orig_vars, copy = copy, exset = exset,
-		params = self.params, nparams = self.nparams,
-		shopt = self.shopt, functions = self.functions,
-		locale_gen = M.locale_gen, lc_state = M.lc_state, lcsnap = M.lc_envsnap,
-		l10nk = package.loaded.l10n and package.loaded.l10n.known_save(), dirstack = self.dirstack, hashcache = self.hashcache, hashpath = self.hashpath, getopts = self.getopts_state,
-		cwd = self:phys_cwd(), tcwd = self.tcwd, um = C.umask(0), disabled = self.disabled_builtins,
-		fn_ro = self.fn_ro, unset_specials = self.unset_specials, random_plain = self.random_plain,
-		shellopts_exported = self.shellopts_exported, bav = self.bav, argv0 = self.argv0,
-		sec_off = self.sec_off, subsh_off = self.subsh_off, complete = self.complete, hosts = self.hosts,
-	}
-	if self.complete then -- (completion specs: the copies share opts as the originals do —
-		local oc, tab = {}, {} -- compopt changes a shared compspec's options in place)
-		for n, cs in pairs(self.complete) do
-			local o = cs.opts
-			if not oc[o] then oc[o] = shallowcopy(o) end
-			local c = shallowcopy(cs)
-			c.opts = oc[o]
-			tab[n] = c
-		end
-		self.complete = tab
-	end
-	self.bav = shallowcopy(self.bav)
-	self.fn_ro, self.unset_specials = shallowcopy(self.fn_ro), shallowcopy(self.unset_specials)
-	self.disabled_builtins = shallowcopy(self.disabled_builtins)
-	C.umask(cp.um)
-	local of, ov = opt_fields(), {}
-	for i = 1, #of do ov[i] = self[of[i]] end
-	cp.opts = ov
-	-- The dynamic-scope layers behind the visible vars — `local` shadow records and
-	-- tempenv bindings — are mutated by `unset` (which REVEALS the next layer: drops the
-	-- record / marks the tempenv consumed and installs its box). Give the body private
-	-- copies (records AND the shadowed boxes they hold) so neither escapes.
-	cp.savedstack, cp.tenv = self.savedstack, self.tenv
+	into.vars = vars
+	into.getopts_state = M.getopts_remap(self.getopts_state, orig, vars)
 	local ss = {}
 	for d, rec in pairs(self.savedstack) do
 		if rec then
@@ -3132,20 +3103,53 @@ local function sub_checkpoint(self)
 			ss[d] = rec
 		end
 	end
-	self.savedstack = ss
+	into.savedstack = ss
 	local te = {}
 	for k = 1, #self.tenv do
 		local e2 = shallowcopy(self.tenv[k])
 		if e2.box then e2.box = copybox(e2.box) end
 		te[k] = e2
 	end
-	self.tenv = te
+	into.tenv = te
+end
+local function sub_checkpoint(self)
+	local orig_vars = self.vars
+	local exset = {}
+	for name, b in pairs(orig_vars) do
+		if b.exported then exset[name] = true end
+	end
+	local sv = {}
+	for _, f in ipairs(SUB_KEEP) do sv[f] = self[f] end
+	for _, f in ipairs(SUB_COPY) do
+		sv[f] = self[f]
+		self[f] = shallowcopy(self[f])
+	end
+	local cp = {
+		orig_vars = orig_vars, exset = exset, sv = sv,
+		locale_gen = M.locale_gen, lc_state = M.lc_state, lcsnap = M.lc_envsnap,
+		l10nk = package.loaded.l10n and package.loaded.l10n.known_save(),
+		cwd = self:phys_cwd(), um = C.umask(0),
+	}
+	scopes_copy(self, self)
+	cp.copy = self.vars
+	if self.complete then -- (completion specs: the copies share opts as the originals do —
+		local oc, tab = {}, {} -- compopt changes a shared compspec's options in place)
+		for n, cs in pairs(self.complete) do
+			local o = cs.opts
+			if not oc[o] then oc[o] = shallowcopy(o) end
+			local c = shallowcopy(cs)
+			c.opts = oc[o]
+			tab[n] = c
+		end
+		self.complete = tab
+	end
+	C.umask(cp.um)
+	local of, ov = opt_fields(), {}
+	for i = 1, #of do ov[i] = self[of[i]] end
+	cp.opts = ov
+	local pcopy = {}
+	for i = 1, self.nparams do pcopy[i] = self.params[i] end
 	self.params = pcopy
-	self.shopt = shallowcopy(self.shopt) or {}
-	self.functions = shallowcopy(self.functions) or {}
-	self.getopts_state = M.getopts_remap(self.getopts_state, orig_vars, copy)
-	self.dirstack = shallowcopy(self.dirstack)
-	self.hashcache = shallowcopy(self.hashcache)
 	if self.history then -- (`set -o history`: a subshell edits its own copy of the list)
 		cp.hist = { self.history, self.hist_ts, self.hist_base, self.hist_session,
 			self.hist_last_added, self.hist_pushed, self.hist_file_lines, self.hist_first_saved }
@@ -3169,11 +3173,10 @@ local function sub_restore(self, cp)
 	if cp.l10nk then
 		package.loaded.l10n.known_restore(cp.l10nk)
 	end
-	self.params, self.nparams = cp.params, cp.nparams
-	self.shopt, self.functions = cp.shopt, cp.functions
+	local sv = cp.sv
+	for _, f in ipairs(SUB_KEEP) do self[f] = sv[f] end
+	for _, f in ipairs(SUB_COPY) do self[f] = sv[f] end
 	M.glob_asciirange = self.shopt.globasciiranges ~= false
-	self.dirstack, self.hashcache, self.getopts_state = cp.dirstack, cp.hashcache, cp.getopts
-	self.hashpath = cp.hashpath
 	local hc = cp.hist
 	if hc then
 		self.history, self.hist_ts, self.hist_base, self.hist_session = hc[1], hc[2], hc[3], hc[4]
@@ -3181,12 +3184,6 @@ local function sub_restore(self, cp)
 	end
 	local of, ov = opt_fields(), cp.opts
 	for i = 1, #of do self[of[i]] = ov[i] end
-	self.savedstack, self.tenv, self.bav = cp.savedstack, cp.tenv, cp.bav
-	self.disabled_builtins = cp.disabled
-	self.fn_ro, self.unset_specials, self.random_plain = cp.fn_ro, cp.unset_specials, cp.random_plain
-	self.shellopts_exported = cp.shellopts_exported
-	self.argv0, self.sec_off, self.subsh_off = cp.argv0, cp.sec_off, cp.subsh_off
-	self.complete, self.hosts = cp.complete, cp.hosts
 	if cp.cwdfd then
 		if cp.cwdfd >= 0 then
 			C.curse_co_fchdir(cp.cwdfd)
@@ -3195,7 +3192,6 @@ local function sub_restore(self, cp)
 	elseif cp.cwd ~= "" then
 		C.chdir(cp.cwd)
 	end
-	self.tcwd = cp.tcwd
 	C.umask(cp.um)
 	-- Re-sync the process environ: drop names the body newly exported, then restore
 	-- every name exported at entry to its parent value (covers changed + unset-in-sub).
@@ -3814,23 +3810,15 @@ end
 -- redirects (`saves`) are restored here too. exit/return/div0 in the body become the
 -- subshell's status.
 function Shell:subshell_run(runner, saves, paren, inplace)
-	if self.jobs_waited then -- (bash's cleanup_dead_jobs, on a fork: the notified dead jobs go)
-		M.jobs_cleanup_waited(self)
-	end
+	local sp = subprog_enter(self)
 	local cp = sub_checkpoint(self)
-	local sv_out, sv_line, sv_cc, sv_tl = self.out, self.cur_line, self.cur_cmd, self.shlvl_tail
-	local sv_cl = self.cur_cline
-	self.shlvl_tail = nil
-	local sv_ld, sv_ne, sv_alias = self.loopdepth, self.noerr, self.aliases
-	self.aliases = shallowcopy(self.aliases) or {}
-	self.in_subprogram = (self.in_subprogram or 0) + 1
+	local sv_out, sv_ne = self.out, self.noerr
 	local sv_psp = self.paren_sp -- (a `( … )`: the subprogram level that is one — exec.def's SUBSHELL_PAREN)
 	if paren then
 		self.paren_sp = self.in_subprogram
 	end
 	self.loopdepth = 0
-	local sv_depth, sv_jobs, sv_cur, sv_prev = self.subdepth, self.jobs, self.job_cur, self.job_prev
-	self.subdepth = (sv_depth or 0) + 1
+	local sv_jobs, sv_cur, sv_prev = self.jobs, self.job_cur, self.job_prev
 	-- (a subshell has no jobs of the parent's — nor its remembered pids, bgp_clear: `wait`
 	-- says they're not its children; its own are numbered from 1)
 	local sv_bgpc = self.bgp_cleared
@@ -3883,13 +3871,8 @@ function Shell:subshell_run(runner, saves, paren, inplace)
 	self.jobs, self.job_cur, self.job_prev = sv_jobs, sv_cur, sv_prev
 	self.bgp_cleared = sv_bgpc
 	if saves then M.redir_restore(saves) end
-	self.out, self.cur_line, self.cur_cmd = sv_out, sv_line, sv_cc -- ($BASH_COMMAND: the child's was its own)
-	self.cur_cline = sv_cl
-	self.shlvl_tail = sv_tl
-	self.loopdepth, self.noerr, self.aliases = sv_ld, sv_ne, sv_alias
-	self.in_subprogram = self.in_subprogram - 1
-	self.paren_sp = sv_psp
-	self.subdepth = sv_depth
+	self.out, self.noerr, self.paren_sp = sv_out, sv_ne, sv_psp
+	subprog_leave(self, sp)
 	sub_restore(self, cp)
 	if killed then -- the parent's report of its child that a signal killed (a `( … )`: its text)
 		if not ctx.vpid then
@@ -4648,20 +4631,7 @@ function Shell:stage_clone()
 	end
 	c.foreign_pids = M.foreign_jobs(self) -- (`jobs` lists the parent's; `wait` can't wait on them)
 	c.job_cur, c.job_prev = self.job_cur, self.job_prev -- (the jobs themselves, not copies: `jobs` marks %+/%-)
-	local vars = {}
-	for k, b in pairs(self.vars) do
-		vars[k] = copybox(b)
-	end
-	c.vars = vars
-	c.getopts_state = M.getopts_remap(self.getopts_state, self.vars, vars)
-	for d, rec in pairs(c.savedstack) do
-		if type(rec) == "table" then
-			c.savedstack[d] = shallowcopy(rec)
-		end
-	end
-	for k = 1, #c.tenv do
-		c.tenv[k] = shallowcopy(c.tenv[k])
-	end
+	scopes_copy(self, c)
 	c.argpool = {}
 	-- (jobs stays a COPY of the parent's table: bash lets a pipeline stage SEE the
 	-- parent's jobs — `jobs | wc -l` — as a forked stage's copy-on-write view did.)
