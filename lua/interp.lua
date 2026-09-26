@@ -2935,7 +2935,7 @@ local function apply_redirs(sh, redirs, cname, ctx) -- cname: the command (names
 	-- an external command's redirections in the forked child, where it only fails that
 	-- command (status 1); anywhere else it is raised as usual (redir.c runs in the shell).
 	local ext = cname and not sh.functions[cname]
-		and not (M.BUILTINS[cname] and not (sh.disabled_builtins and sh.disabled_builtins[cname]))
+		and not rt.builtin_enabled(sh, cname)
 	local function xerr(e)
 		if not ext and type(e) == "table" and e.__curse_exit then
 			error(e, 0)
@@ -3369,71 +3369,8 @@ end
 -- inline dispatch, so a cold script that never uses them never loads their code.
 local BUILTIN_LAZY = rt.BUILTIN_LAZY -- one source of truth (runtime); shared with the compiled tier
 local ISO_BUILTIN = rt.ISO_BUILTIN
-local BUILTINS = {
-	echo = 1,
-	enable = 1,
-	caller = 1,
-	disown = 1,
-	[":"] = 1,
-	["true"] = 1,
-	["false"] = 1,
-	["["] = 1,
-	test = 1,
-	["return"] = 1,
-	exit = 1,
-	logout = 1,
-	suspend = 1,
-	cd = 1,
-	unset = 1,
-	export = 1,
-	declare = 1,
-	typeset = 1,
-	set = 1,
-	shift = 1,
-	read = 1,
-	getopts = 1,
-	printf = 1,
-	["local"] = 1,
-	command = 1,
-	type = 1,
-	pwd = 1,
-	eval = 1,
-	source = 1,
-	["."] = 1,
-	["break"] = 1,
-	["continue"] = 1,
-	["true"] = 1,
-	exec = 1,
-	readonly = 1,
-	umask = 1,
-	alias = 1,
-	unalias = 1,
-	shopt = 1,
-	wait = 1,
-	fg = 1,
-	bg = 1,
-	trap = 1,
-	mapfile = 1,
-	readarray = 1,
-	compgen = 1,
-	complete = 1,
-	compopt = 1,
-	pushd = 1,
-	popd = 1,
-	dirs = 1,
-	builtin = 1,
-	kill = 1,
-	ulimit = 1,
-	jobs = 1,
-	history = 1,
-	fc = 1,
-	hash = 1,
-	["let"] = 1,
-	times = 1,
-	bind = 1,
-	help = 1,
-}
-M.BUILTINS = BUILTINS -- (the one builtin table: emit and runtime consult it too)
+local BUILTINS = rt.BUILTINS -- (runtime owns the builtin table: rt.builtin_enabled)
+M.BUILTINS = BUILTINS
 local KEYWORDS = {
 	["if"] = 1,
 	["then"] = 1,
@@ -3536,7 +3473,7 @@ local function name_type(sh, name, nofunc)
 	if not nofunc and sh.functions[name] then
 		return "function"
 	end -- `type -f` skips functions
-	if BUILTINS[name] and not (sh.disabled_builtins and sh.disabled_builtins[name]) then
+	if rt.builtin_enabled(sh, name) then
 		return "builtin"
 	end
 	-- a remembered location (`hash`, `hash -p`, or an earlier run) wins, and counts a hit
@@ -4984,7 +4921,7 @@ local function describe(sh, nm, fl)
 			end
 			found = true
 		end
-		if BUILTINS[nm] and not (sh.disabled_builtins and sh.disabled_builtins[nm]) then
+		if rt.builtin_enabled(sh, nm) then
 			say("builtin", rt.L1((sh.opt_posix and SPECIAL_BUILTIN[nm]) and "%s is a special shell builtin\n"
 				or "%s is a shell builtin\n", nm), nm)
 			if not fl.all then

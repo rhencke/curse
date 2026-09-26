@@ -1399,7 +1399,7 @@ do
 	-- `LC_ALL=bogus /bin/true`: an external command's prefix is only its environment (no
 	-- sv_locale, so no warning); a builtin's or function's is a shell variable (it warns).
 	function M.prefix_ext(sh, cmd)
-		return cmd ~= nil and not sh.functions[cmd] and require("interp")._int.BUILTINS[cmd] == nil
+		return cmd ~= nil and not sh.functions[cmd] and M.BUILTINS[cmd] == nil
 	end
 	-- An in-process subshell's exit: put back the locale its checkpoint captured.
 	function M.locale_restore(st)
@@ -2059,7 +2059,7 @@ function M.redir_ext(sh, name, ok, res)
 		return res
 	end
 	if type(res) ~= "table" or not res.__curse_exit or sh.functions[name]
-		or (require("interp").BUILTINS[name] and not (sh.disabled_builtins and sh.disabled_builtins[name])) then
+		or M.builtin_enabled(sh, name) then
 		error(res, 0) -- (a function or builtin runs in the shell itself: fatal)
 	end
 	return false
@@ -4506,8 +4506,7 @@ function Shell:spawn_bg(args, cmdstr)
 		return false
 	end
 	-- a (dynamic) word that names a function/builtin/alias runs shell code: a task for it
-	local I = package.loaded.interp
-	if self.functions[args[1]] or (I and I.BUILTINS[args[1]]) or (self.aliases and self.aliases[args[1]]) then
+	if self.functions[args[1]] or M.BUILTINS[args[1]] or (self.aliases and self.aliases[args[1]]) then
 		return false
 	end
 	local execpath = args[1]
@@ -12684,6 +12683,74 @@ function M.chkwrite_report(sh, name, m)
 	io.stderr:write("curse: " .. name .. ": write error: " .. why .. "\n")
 end
 
+-- Every shell builtin's name: the one table (interp.BUILTINS, emit and the b_* modules
+-- read it too). `enable -n` hides one from lookup: rt.builtin_enabled.
+M.BUILTINS = {
+	echo = 1,
+	enable = 1,
+	caller = 1,
+	disown = 1,
+	[":"] = 1,
+	["true"] = 1,
+	["false"] = 1,
+	["["] = 1,
+	test = 1,
+	["return"] = 1,
+	exit = 1,
+	logout = 1,
+	suspend = 1,
+	cd = 1,
+	unset = 1,
+	export = 1,
+	declare = 1,
+	typeset = 1,
+	set = 1,
+	shift = 1,
+	read = 1,
+	getopts = 1,
+	printf = 1,
+	["local"] = 1,
+	command = 1,
+	type = 1,
+	pwd = 1,
+	eval = 1,
+	source = 1,
+	["."] = 1,
+	["break"] = 1,
+	["continue"] = 1,
+	exec = 1,
+	readonly = 1,
+	umask = 1,
+	alias = 1,
+	unalias = 1,
+	shopt = 1,
+	wait = 1,
+	fg = 1,
+	bg = 1,
+	trap = 1,
+	mapfile = 1,
+	readarray = 1,
+	compgen = 1,
+	complete = 1,
+	compopt = 1,
+	pushd = 1,
+	popd = 1,
+	dirs = 1,
+	builtin = 1,
+	kill = 1,
+	ulimit = 1,
+	jobs = 1,
+	history = 1,
+	fc = 1,
+	hash = 1,
+	["let"] = 1,
+	times = 1,
+	bind = 1,
+	help = 1,
+}
+function M.builtin_enabled(sh, name)
+	return M.BUILTINS[name] ~= nil and not (sh.disabled_builtins and sh.disabled_builtins[name])
+end
 -- Builtin registry (name -> lazily-loaded module). The interpreter shares this
 -- table (interp aliases rt.BUILTIN_LAZY), so there is one source of truth.
 local BUILTIN_LAZY = {
@@ -12852,7 +12919,7 @@ do
 			end
 		end
 		return cmd ~= nil and not SCOPED[cmd] and not sh.functions[cmd]
-			and require("interp")._int.BUILTINS[cmd] ~= nil
+			and M.BUILTINS[cmd] ~= nil
 	end
 end
 function M.run_prefix(sh, names, vals, runfn, argv)
