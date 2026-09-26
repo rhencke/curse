@@ -8877,8 +8877,9 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
 			local ec = errchk(st)
 			local ecs = ec ~= "" and ("; " .. ec) or ""
 			local sbody = ("sh.status = (%s) and 0 or 1"):format(cond)
-			if EF.db_regex then -- (a nested =~ with an invalid regex: the whole [[ ]] is status 2)
-				sbody = ("do local __ok, __r = pcall(function() return %s end); if __ok then sh.status = __r and 0 or 1 elseif type(__r) == \"table\" and __r.__curse_regexerr then sh.status = 2 elseif type(__r) == \"table\" and __r.__curse_matherr and not __r.__curse_subscript then sh.status = 1 else error(__r, 0) end end"):format(cond)
+			if EF.db_regex then -- (a nested =~ with an invalid regex: the whole [[ ]] is status 2;
+				-- an arith error expanding a word abandons the line — DISCARD — as interp's)
+				sbody = ("do local __ok, __r = pcall(function() return %s end); if __ok then sh.status = __r and 0 or 1 elseif type(__r) == \"table\" and __r.__curse_regexerr then sh.status = 2 else error(__r, 0) end end"):format(cond)
 				EF.db_regex = nil
 			end
 			cx.blocks[p] = d

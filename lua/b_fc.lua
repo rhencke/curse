@@ -27,13 +27,14 @@ local function exec_string(sh, code, hook)
 			return
 		end
 		for _, st in ipairs(lg.stmts) do
+			local ne0 = sh.noerr
 			local sok, serr = pcall(I.exec_list, sh, { st }, hook, false)
 			if not sok then
 				if type(serr) == "table" and serr.__curse_lineabort and not serr.__curse_discard then
-					if sh.opt_e then
+					if rt.lineabort_exits(sh, serr) then
 						error(serr)
 					end
-					sh.status = 1
+					sh.status, sh.noerr = 1, ne0
 					break
 				end
 				error(serr)

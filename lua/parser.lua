@@ -1988,14 +1988,24 @@ for _, b in ipairs({ "=", "==", "!=", "=~", "<", ">", "-nt", "-ot", "-ef", "-eq"
 	COND_BINOP[b] = true
 end
 local COND_OPTOK = { ["&&"] = true, ["||"] = true, ["("] = true, [")"] = true, ["<"] = true, [">"] = true }
-local function cond_check(toks, quoted)
-	local pos, ck, ct = 1, nil, nil -- (ck/ct: bash's cond_token, kind and text)
+-- (nlb[k]: a newline came before token k. cond_term skips newlines only where bash's
+-- cond_skip_newlines does — before a term and after one; reading a unary operator's
+-- operand, a binary operator, or its right side (`nonl`) a newline is a `newline' token)
+local function cond_check(toks, quoted, nlb, eof, line0, tl)
+	local pos, ck, ct, fk = 1, nil, nil, nil -- (ck/ct: bash's cond_token, kind and text;
+	-- fk: its index — negative for a newline before that token — where an error is reported)
 	local pre = {}
-	local function nxt()
+	local function nxt(nonl)
+		if nonl and nlb[pos] then
+			ck, ct = "NL", "newline"
+			fk = -pos
+			return ck, ct
+		end
+		fk = pos
 		local t = toks[pos]
 		pos = pos + 1
-		if t == nil then
-			ck, ct = "END", "]]"
+		if t == nil then -- (no `]]` before the input's end: bash's EOF token)
+			ck, ct = eof and "EOF" or "END", eof and "EOF" or "]]"
 		elseif not quoted[pos - 1] and COND_OPTOK[t] then
 			ck, ct = t, t
 		else
@@ -2012,41 +2022,42 @@ local function cond_check(toks, quoted)
 		if k == "END" then
 			fail(t)
 		elseif k == "(" then
+			local pl = tl[pos - 1] -- (its errors are reported at the `(`'s line: {msg, line})
 			local ok, e = pcall(cond_or)
 			if not ok then
 				if type(e) ~= "table" or not e.cond_fail then
 					error(e, 0)
 				end
-				pre[#pre + 1] = "expected `)'" -- (the inner error left cond_token COND_ERROR)
+				pre[#pre + 1] = { "expected `)'", pl } -- (the inner error left cond_token COND_ERROR)
 				error(e, 0)
 			end
 			if ck ~= ")" then
-				pre[#pre + 1] = ck == "WORD" and "expected `)'" or ("unexpected token `" .. ct .. "', expected `)'")
+				pre[#pre + 1] = { ck == "WORD" and "expected `)'" or ("unexpected token `" .. ct .. "', expected `)'"), pl }
 				fail(ct)
 			end
 			nxt()
 		elseif k == "WORD" and t == "!" then
 			term()
 		elseif k == "WORD" and COND_UNOP[t] then
-			local k2, t2 = nxt()
+			local k2, t2 = nxt(true)
 			if k2 ~= "WORD" then
 				pre[#pre + 1] = "unexpected argument `" .. t2 .. "' to conditional unary operator"
-				fail(t2)
+				fail(k2 == "NL" and t or t2) -- (near: the input line's last token)
 			end
 			nxt()
 		elseif k == "WORD" then
-			local k2, t2 = nxt()
+			local k2, t2 = nxt(true)
 			if (k2 == "WORD" and COND_BINOP[t2]) or k2 == "<" or k2 == ">" then
-				local k3, t3 = nxt()
+				local k3, t3 = nxt(true)
 				if k3 ~= "WORD" then
 					pre[#pre + 1] = "unexpected argument `" .. t3 .. "' to conditional binary operator"
-					fail(t3)
+					fail(k3 == "NL" and t2 or t3)
 				end
 				nxt()
 			elseif not (k2 == "END" or k2 == "&&" or k2 == "||" or k2 == ")") then
 				pre[#pre + 1] = k2 == "WORD" and "conditional binary operator expected"
 					or ("unexpected token `" .. t2 .. "', conditional binary operator expected")
-				fail(t2)
+				fail(k2 == "NL" and t or t2)
 			end
 		else
 			pre[#pre + 1] = "unexpected token `" .. t .. "' in conditional command"
@@ -2066,7 +2077,10 @@ local function cond_check(toks, quoted)
 		end
 	end
 	local ok, e = pcall(cond_or)
-	if ok and ck ~= "END" then -- (cond_error: a token left before `]]`)
+	if ok and ck == "EOF" then -- (cond_error at EOF: reported at the `[[`'s line)
+		error({ __curse_perr = true, pre = { "unexpected EOF while looking for `]]'" }, preline = line0,
+			msg = "syntax error: unexpected end of file", eof = true }, 0)
+	elseif ok and ck ~= "END" then -- (cond_error: a token left before `]]`)
 		pre[#pre + 1] = ck == "WORD" and "syntax error in conditional expression"
 			or ("syntax error in conditional expression: unexpected token `" .. ct .. "'")
 		ok, e = false, { cond_fail = true, near = ct }
@@ -2077,8 +2091,11 @@ local function cond_check(toks, quoted)
 	if type(e) ~= "table" or not e.cond_fail then
 		error(e, 0)
 	end
+	if e.near == "EOF" then -- (`[[ a &&` then EOF: the term's error, then the parser's)
+		error({ __curse_perr = true, pre = pre, msg = "syntax error: unexpected end of file", eof = true }, 0)
+	end
 	local near = (e.near == "&&" or e.near == "||") and e.near:sub(1, 1) or e.near
-	error({ __curse_perr = true, pre = pre, exact = true, msg = "syntax error near `" .. near .. "'" }, 0)
+	error({ __curse_perr = true, pre = pre, exact = true, msg = "syntax error near `" .. near .. "'", fk = fk }, 0)
 end
 
 -- Parse a [[ … ]] token list into a boolean-expression AST:
@@ -4718,17 +4735,23 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs, xg, bq
 			-- not arith: fall through to the subshell parser below (i still at the first `(`)
 		end
 		-- [[ EXPR ]] conditional (no word-splitting; == is glob, =~ is regex)
-		if src:sub(i, i + 1) == "[[" and is_blank(src:sub(i + 2, i + 2)) then
+		if src:sub(i, i + 1) == "[[" and (is_blank(src:sub(i + 2, i + 2)) or src:sub(i + 2, i + 2) == "\n" or i + 2 > n) then
 			i = i + 2
-			local toks, quoted = {}, {}
+			local line0, closed = line, false
+			local toks, quoted, nlb, tp, tl = {}, {}, {}, {}, {} -- (tp/tl: each token's position/line)
 			while true do
 				ws()
+				tp[#toks + 1], tl[#toks + 1] = i, line
 				if src:sub(i, i) == "\n" then
+					nlb[#toks + 1] = nlb[#toks + 1] or { i, line } -- (the first newline before it)
 					if not (alias_nl and alias_nl[i]) then line = line + 1 end
 					i = i + 1 -- continuation inside [[ ]]
 				elseif i > n or src:sub(i, i + 1) == "]]" then
 					if src:sub(i, i + 1) == "]]" then
 						i = i + 2
+						closed = true
+					else -- (the input's end reads as a newline first: an eval string's, a file's last line)
+						nlb[#toks + 1] = nlb[#toks + 1] or { n + 1, line }
 					end
 					break
 				elseif toks[#toks] == "=~" then
@@ -4830,7 +4853,20 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs, xg, bq
 					quoted[#toks] = (c1 == '"' or c1 == "'")
 				end
 			end
-			cond_check(toks, quoted)
+			local cok, cerr = pcall(cond_check, toks, quoted, nlb, not closed, line0, tl)
+			if not cok then -- (reported at the failing token: its line, shown as the input line)
+				local k = type(cerr) == "table" and cerr.fk
+				if type(cerr) == "table" and cerr.eof then
+					i = n + 1
+				elseif k then
+					local at = k < 0 and nlb[-k] or (tp[k] and { tp[k], tl[k] })
+					if at then
+						i, line = at[1], at[2]
+						cerr.line = line
+					end
+				end
+				error(cerr, 0)
+			end
 			return { t = "dbracket", line = line, expr = parse_dbracket(toks, quoted), redirs = tail_redirs() }
 		end
 		-- brace group { list; }  and subshell ( list )  — optional trailing redirs
@@ -5719,6 +5755,7 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs, xg, bq
 							or (type(st) == "table" and st.__curse_perr and st.msg) or tostring(st),
 						status = type(st) == "table" and st.__curse_perr and st.status or nil, -- (else 2)
 						pre = type(st) == "table" and st.__curse_perr and st.pre or nil, -- (messages before it)
+						preline = type(st) == "table" and st.__curse_perr and st.preline or nil, -- (their line)
 						exact = type(st) == "table" and st.__curse_perr and st.exact or nil, -- (msg verbatim)
 						text = type(st) == "table" and st.__curse_perr and st.text or nil,
 						showtext = type(st) == "table" and st.__curse_perr and st.text and true or nil,

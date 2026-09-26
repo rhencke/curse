@@ -517,6 +517,9 @@ return function(sh, cmd, args, hook, tcb)
 					local compound = aattr or assoc
 					local pfx = ((cmd == "export" or cmd == "readonly") and not compound) and "" or (cmd .. ": ")
 					io.stderr:write("curse: " .. pfx .. nm .. ": readonly variable\n")
+					if pfx == "" then -- (bind_variable's err_readonly: report_error)
+						rt.report_exit(sh)
+					end
 					badassign = true -- (declare.def assign_error: EX_BADASSIGN)
 					allok = false
 					if not isdecl and not nref then -- (setattr.def's set_var_attribute runs anyway)
@@ -803,6 +806,7 @@ return function(sh, cmd, args, hook, tcb)
 						local b = sh.vars[a] or {}
 						if b.ro and b.assoc then -- (readonly is reported before any conversion)
 							io.stderr:write("curse: " .. a .. ": readonly variable\n")
+							rt.report_exit(sh) -- (err_readonly: report_error)
 							allok = false
 							if sh.arrayargs_pending and sh.arrayargs_pending[a] then
 								sh.arrayargs_pending.skip = sh.arrayargs_pending.skip or {}
@@ -905,6 +909,7 @@ return function(sh, cmd, args, hook, tcb)
 					-- deferred `readonly a[i]=v` / `export a[i]=v` (those fail, status 1).
 					if anm and sub == "" then -- `declare a[]=x`
 						io.stderr:write("curse: " .. anm .. "[]: bad array subscript\n")
+						rt.report_exit(sh) -- (err_badarraysub: report_error)
 						badassign = true -- (declare.def assign_error: EX_BADASSIGN)
 						allok = false
 					elseif anm and isdecl and ro_blocks(sh:deref(anm)) then -- (`declare ra[1]=3`)
@@ -948,6 +953,7 @@ return function(sh, cmd, args, hook, tcb)
 							-- (declare's ASS_ALLOWALLSUB: the element assignment fails, status 1,
 							-- but — unlike a plain `a[@]=x` — the line goes on)
 							io.stderr:write("curse: " .. anm .. "[" .. sub .. "]: bad array subscript\n")
+							rt.report_exit(sh) -- (err_badarraysub: report_error)
 							badassign = true
 							allok = false
 							goto continue
@@ -955,6 +961,7 @@ return function(sh, cmd, args, hook, tcb)
 						if not sh:array_set(anm, array_key(sh, anm, sub), aval, aop == "+=") then
 							-- (a negative index before the start: the element isn't bound, status 1)
 							io.stderr:write("curse: " .. anm .. "[" .. sub .. "]: bad array subscript\n")
+							rt.report_exit(sh) -- (err_badarraysub: report_error)
 							allok = false
 						end
 						local bb = sh.vars[sh:deref(anm)]
