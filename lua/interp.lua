@@ -456,12 +456,11 @@ end
 -- ${…} operators whose default/alternate word is expanded lazily (only when used).
 local TESTOP = { ["-"] = 1, [":-"] = 1, ["+"] = 1, [":+"] = 1, ["="] = 1, [":="] = 1, ["?"] = 1, [":?"] = 1 }
 
--- ---- `test` / `[` builtin ----
+-- libc (and curse's own lib_cursesig) entry points the interpreter and the builtins call
 ffi.cdef([[
   int access(const char *path, int mode);
   int chdir(const char *path);
   int curse_stat(const char *path, void *buf) asm("stat");
-  int curse_lstat(const char *path, void *buf) asm("lstat");
   int isatty(int fd);
   int fork(void);
   int dup2(int oldfd, int newfd);
@@ -476,8 +475,6 @@ ffi.cdef([[
   unsigned long confstr(int name, char *buf, unsigned long len);
   long long strtoll(const char *nptr, char **endptr, int base);
   unsigned long long strtoull(const char *nptr, char **endptr, int base);
-  struct curse_passwd { char *pw_name; char *pw_passwd; unsigned int pw_uid; unsigned int pw_gid; char *pw_gecos; char *pw_dir; char *pw_shell; };
-  struct curse_passwd *getpwnam(const char *name);
   int sigemptyset(void *set);
   int sigprocmask(int how, const void *set, void *oldset);
   /* curse async signal handling (lib_cursesig.c): a real handler installed without
@@ -486,10 +483,6 @@ ffi.cdef([[
   int curse_sig_default(int signum);
   int curse_sig_ignore(int signum);
   void curse_sig_clearpending(void);
-  void curse_sig_hold(int hold);
-  struct curse_passwd *getpwent(void);
-  void setpwent(void);
-  void endpwent(void);
   int kill(int pid, int sig);
   unsigned int geteuid(void);
   unsigned int getegid(void);
@@ -5566,17 +5559,11 @@ local function run_loop_body(sh, body, hook)
 	return loop_signal(sh, err)
 end
 
--- In a forked child (subshell/background/pipeline stage), translate an exit/return
--- thrown as a control table into $? so the child _exits with the right status.
--- (A non-table Lua error is left for the caller; forked children then _exit anyway.)
-local child_status = rt.child_status -- (moved to runtime; shared with the compiled tier)
-
 -- Snapshot the <()/>() counts before a command expands its words/redirs, so its
 -- cleanup drains ONLY the procsubs it registered — not ones an enclosing group's
 -- redirect (`{ …; } > >(tac)`) left pending, which drain after the whole group.
-local function procsub_mark(sh)
-	return (sh.procsub_pending and #sh.procsub_pending or 0), (sh.procsub_files and #sh.procsub_files or 0)
-end
+-- (One implementation, in runtime: the compiled tier marks the same way.)
+local procsub_mark = rt.procsub_mark
 -- Process-substitution cleanup, run after the command a <()/>() was attached to: close
 -- the shell's end of each pipe it created (a >(cmd) then sees EOF; an unread <(cmd)
 -- writer gets EPIPE) and reap the child. Only entries added since the mark.
@@ -7488,10 +7475,6 @@ local function shallow_noexit(t)
 	return c
 end
 local function finish(sh, ok, err)
-	if sh.subshell_child then -- a compiled subshell's forked child: end it here (rt.subshell_fork)
-		child_status(sh, ok, err)
-		rt.child_exit(sh, sh.status or 0)
-	end
 	if not ok then
 		if type(err) == "table" and err.__curse_noexittrap then
 			sh.traps = sh.traps and shallow_noexit(sh.traps) -- `exec cmd`: the process is gone
@@ -7513,7 +7496,7 @@ local function finish(sh, ok, err)
 		return
 	end
 	M.run_exit_trap(sh)
-	if sh.coprocs and next(sh.coprocs) and not sh.subshell_child then
+	if sh.coprocs and next(sh.coprocs) then
 		rt.coproc_exit_dispose(sh, ok)
 	end
 end
