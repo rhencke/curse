@@ -9272,80 +9272,39 @@ end
 -- `!()` extglob needs the split matcher, so it stays on the per-substring path.
 local function strip_regex(val, glob, prefix, longest)
 	local ere, hard = M.glob_to_ere(glob)
+	local m
 	if hard ~= 0 and M.glob_hard(hard) then
-		if prefix then
-			if longest then
-				for k = #val, 0, -1 do
-					if full_match(val:sub(1, k), glob) then
-						return val:sub(k + 1)
-					end
-				end
-			else
-				for k = 0, #val do
-					if full_match(val:sub(1, k), glob) then
-						return val:sub(k + 1)
-					end
-				end
-			end
-		else
-			if longest then
-				for k = 1, #val + 1 do
-					if full_match(val:sub(k), glob) then
-						return val:sub(1, k - 1)
-					end
-				end
-			else
-				for k = #val + 1, 1, -1 do
-					if full_match(val:sub(k), glob) then
-						return val:sub(1, k - 1)
-					end
-				end
-			end
-		end
-		return val
-	end
-	local rb = M.re_get(ere, 1 + 8) -- REG_EXTENDED|REG_NOSUB
-	if not rb then
-		return val
-	end
-	local function m(s)
-		return ffi.C.regexec(rb, s, 0, nil, 0) == 0
-	end
-	local res = val
-	if prefix then
-		if longest then
-			for k = #val, 0, -1 do
-				if m(val:sub(1, k)) then
-					res = val:sub(k + 1)
-					break
-				end
-			end
-		else
-			for k = 0, #val do
-				if m(val:sub(1, k)) then
-					res = val:sub(k + 1)
-					break
-				end
-			end
+		m = function(s)
+			return full_match(s, glob)
 		end
 	else
-		if longest then
-			for k = 1, #val + 1 do
-				if m(val:sub(k)) then
-					res = val:sub(1, k - 1)
-					break
-				end
-			end
-		else
-			for k = #val + 1, 1, -1 do
-				if m(val:sub(k)) then
-					res = val:sub(1, k - 1)
-					break
-				end
-			end
+		local rb = M.re_get(ere, 1 + 8) -- REG_EXTENDED|REG_NOSUB
+		if not rb then
+			return val
+		end
+		m = function(s)
+			return ffi.C.regexec(rb, s, 0, nil, 0) == 0
 		end
 	end
-	return res
+	-- the candidate split points k, in the order that finds the shortest/longest match
+	-- first: a prefix is val[1..k] (k = 0..#val), a suffix val[k..] (k = #val+1..1)
+	local a, b, step = 0, #val, 1
+	if not prefix then
+		a, b = 1, #val + 1
+	end
+	if prefix == longest then
+		a, b, step = b, a, -1
+	end
+	for k = a, b, step do
+		if prefix then
+			if m(val:sub(1, k)) then
+				return val:sub(k + 1)
+			end
+		elseif m(val:sub(k)) then
+			return val:sub(1, k - 1)
+		end
+	end
+	return val
 end
 -- bash matches a pattern BYTE-wise when the string or the pattern isn't valid in the
 -- multibyte locale (xstrmatch's fallback): `case $euro in *$'\202'*)` matches a byte of it.
