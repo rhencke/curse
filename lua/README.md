@@ -1,103 +1,63 @@
-# curse — tiered execution (interpreter + LuaJIT compile) — WORK IN PROGRESS
+# lua/ — curse's shell engine
 
-curse's shell engine, on **LuaJIT**. Motivation for the LuaJIT target, measured
-on the POC (`.bench-lua`, gitignored):
+A bash-compatible shell on **LuaJIT**, with two execution tiers that share one runtime.
+bash 5.2 is the oracle: the conformance corpora (`test/`) compare every behaviour
+byte-for-byte against the system bash.
 
-- LuaJIT **starts in ~1ms** — faster than bash (~2ms). Startup is the one axis
-  a shell can't hide from high-count `make`/`configure` workloads.
-- LuaJIT runs a hot arithmetic loop **~2700× faster than bash**, and **exact
-  64-bit arithmetic is free**: `int64` cdata (FFI) wraps like bash and LuaJIT
-  sinks the boxing in traces, so correctness costs nothing.
-- Lua strings are byte arrays — exactly bash's storage model, so raw-byte
-  fidelity (no Unicode re-encoding) comes for free.
+## Tiers
 
-## Architecture: interpret, then switch (tiered / OSR)
+1. **Interpreter** (`interp.lua`) — a tree-walker that starts instantly. It is the
+   warm-up tier: code runs here the first time, while the compiled form doesn't exist yet.
+2. **Compiled** (`emit.lua` → Lua source → `load()`) — each program becomes a flattened
+   control-flow graph dispatched on a program counter (`run(sh, pc)`), so it can be
+   entered at any loop head or statement: on-stack replacement at any nesting depth.
+   LuaJIT traces the hot pc paths to machine code; variables used only arithmetically
+   are lifted to native int64 locals. Generated code calls only `runtime.lua` — nothing
+   is handed back to the interpreter (`tools/delegate-census.lua` keeps that at zero).
 
-Two tiers share **one `sh` runtime table**, so handoff transfers no state:
+`tier.lua` orchestrates: run interpreted, and when a loop or function gets hot, compile
+and continue in compiled code from exactly where the interpreter was. Code that only
+exists at run time — `eval`/`source` text, `$(…)` bodies, trap handlers, hot functions
+defined by interpreted code — compiles as a **fragment** once it recurs (cached by text
+and by the runtime state it depends on: trap mode, parse options, aliases). A script
+whose parsing depends on run-time state (dynamic aliases, history expansion, `set -v`,
+`$"…"` translation) runs in **line mode**: each logical line is compiled as it is read.
+Compiled modules are cached on disk (`cache.lua`), so a second run starts compiled.
 
-1. **Interpreter** (`interp.lua`) — a tree-walker that starts instantly and runs
-   statement-by-statement like bash. Bash-competitive (~1.8× faster than bash on
-   the arith loop). At every **safepoint** — a top-level statement boundary and
-   every loop back-edge — it calls a hook.
-2. **Compiled** (`emit.lua` → Lua source → `load()`) — transpiled Lua as a
-   **flattened control-flow graph dispatched on a program counter**:
-   `run(sh, pc)` seeds lifted vars then `while true do if pc==N then …; pc=M …`.
-   Because control flow is flattened, run() can be ENTERED AT ANY pc — the cond
-   check of any loop, **at any nesting depth** — and following the pc transitions
-   reconstructs the full continuation (inner loop exits → outer step → outer cond
-   → …). That is general on-stack replacement; it works mid-loop for loops nested
-   in loops and in `if` branches, which scripts-without-functions need. LuaJIT
-   traces the hot pc path to machine code with ~zero dispatch overhead (measured
-   1.01× native nested `while`). Vars used only arithmetically are lifted to
-   native int64 locals, seeded from `sh` on entry / written back on exit.
+## Deployment
 
-`tier.lua` orchestrates: interpret; the safepoint hook reports a loop id or a
-statement index; on handoff the driver maps it to a pc (`mod.loopPc`/`stmtPc`)
-and calls `mod.run(sh, pc)` — OSR into compiled code from exactly where the
-interpreter was. Proven bit-identical for switches before / mid / after a
-top-level loop (`test_tier.lua`), a nested inner loop (`test_nested.lua`), and a
-loop inside an `if`.
+`daemon.lua` is a pool of persistent worker processes behind a Unix socket; the tiny
+static client (`daemon/curse-client.c`) forwards argv, environment, cwd and fds and
+relays the exit status. Workers keep compiled modules and fragments warm across
+requests. `invoke.lua` implements bash's `main()` (options, startup files, script
+handling) for both the daemon and the direct runner (`run.lua`). Subshells, pipelines,
+command substitutions and background jobs all run **in-process** (checkpoint/restore
+isolation, coroutines over real pipes) — only external commands are spawned.
 
-## Status
+## Modules
 
-Subset so far: scalar assignments, `echo`/`:`/`true`/`false`, `for ((;;))`,
-`while (())`, `for NAME in WORDS`, `if/elif/else/fi` (with `(())` conds),
-**functions** (`name(){…}` / `function name`), `return`, `local`, positional
-params (`$1..$9`, `$@`, `$*`, `$#`, `$?`), `$(( … ))`, `$var` / `${var}`, 64-bit
-int arithmetic. Functions gate OSR: the tier hands off only at top-level
-safepoints (calldepth 0), so a hot loop calling a function switches at the loop
-(function runs compiled each call); a hot loop inside a once-called function
-stays on the interpreter (still faster than bash). **Inlining** (do both): a direct call to an INLINABLE function — flat body of
-only assignments + `echo`/`:`/`true`/`false`, no control flow, calls, `return`,
-`local`, or `$@`/`$*`/`$#` — is spliced into the call site: `$n` is bound
-directly to the caller's expression (so `add "$i"` with `i` an int64 skips the
-`tostring → parse` round-trip), and the body's vars collapse into `run()`-locals.
-Every `fn_x` is still emitted so indirect/dynamic dispatch (a name in `$1`,
-`eval`, `$@`/`local`/`return` functions) still works out-of-line via the upvalue
-path. Result: `funcs.sh` (1M `add "$i"` calls) went 574ms → 0.3ms — the call
-collapses to a native `v_sum += v_i` loop, same as the arith benchmark.
-
-Lifting has two forms: a var no OUT-OF-LINE function touches becomes a `run()`-LOCAL
-(register-allocated, ~0.6 ns/iter in hot loops); a var shared with a function
-becomes a module-level Lua UPVALUE that run() and the function closures all see —
-one real native variable, no hash lookup, no interp/compiled desync (seeded from
-`sh` in run(), written back). An upvalue can't be register-held across a tight
-loop, so only shared vars use it; hot-loop vars stay run-locals. Calls are slimmed
-by need: a function using neither positional params nor `local` is called bare
-(`fn_x(sh)`); one using only params swaps `$@`; only `local` needs the full
-frame. Positional args go into per-depth POOL arrays (reused across calls, args
-passed as varargs) so there is no per-call table allocation, and the interpreter
-owns the `calldepth` OSR-gate (compiled code has no OSR). Note: pooling barely
-moved the function-call micro-benchmark — LuaJIT already sinks the short-lived
-args table; the real per-call cost is the sh-direct access to a variable shared
-between the caller and the function (which therefore can't be lifted).
-
-### Done
-- **pc-dispatch CFG + native-locals** — the compiled module is a flattened
-  program-counter dispatch (see above) with arithmetic vars lifted to int64
-  locals. ~1 ns/iter, ~425× the interpreter, matching the hand-written POC.
-  General OSR: resuming mid-loop works at any nesting depth (nested loops, loops
-  inside `if`) with bit-identical results.
-
-- **Background compile** — `tier.run_background(script)` spawns a *detached*
-  `luajit lua/transpile.lua` that writes `out.lua` (temp + atomic rename); the
-  interpreter polls at safepoints and jumps in the instant it lands. On the arith
-  bench it interprets ~2048 iterations (~1ms) while transpiling, then switches
-  mid-loop and finishes compiled — total ~0.003s vs bash 0.811s (~270×), result
-  identical, no functions involved. Demo: `luajit lua/demo_background.lua
-  bench/arith.sh` (set `CURSE_LUAJIT` to the luajit binary).
-
-### Next
-- Grow the grammar toward full bash (functions, `if`, `case`, `for x in`,
-  pipelines, redirections, real commands); `for x in LIST` OSR needs the expanded
-  list + index persisted in `sh`.
-- Wire the conformance harness against real bash (the oracle).
-- Complete the parser to the full bash grammar.
+| File | Role |
+|---|---|
+| `parser.lua` | bash grammar → AST (line-group lexer, heredocs, `[[ ]]`, arithmetic) |
+| `interp.lua` | tree-walking interpreter; word expansion shared with the runtime |
+| `emit.lua` | compiler: AST → pc-dispatch Lua |
+| `runtime.lua` | the `Shell` object and everything compiled code calls (`rt.*`) |
+| `tier.lua` | tiering, OSR, fragments, line mode |
+| `cache.lua` | on-disk compiled-module cache (keyed by content and build stamp) |
+| `b_*.lua` | builtins, each loaded on first use |
+| `deparse.lua` | `declare -f` / `type` / job-text printing (print_cmd.c) |
+| `hist.lua`, `repl.lua` | history and the interactive reader |
+| `smatch.lua` | bash's pattern matcher (sm_loop.c) where a regex can't express it |
+| `l10n.lua`, `gettext.lua` | translated diagnostics (bash.mo) and `$"…"` strings |
+| `mailcheck.lua` | interactive mail checking |
+| `invoke.lua`, `run.lua`, `daemon.lua` | startup, direct runner, daemon |
+| `build.lua` | bundles the modules into `curse.bc` |
 
 ## Running
 
-Build the patched luajit with Meson (`meson setup build && meson compile -C
-build`, see the top-level README), then run the tiered-execution suites:
+Build with Meson (see the top-level README), then:
 
-    meson test -C build            # all of them
-    build/luajit lua/test_tier.lua # or one directly (stock upstream luajit works too)
+    meson test -C build                         # unit tests + conformance corpora
+    test/conformance/run.sh --corpus cases      # one corpus (cases | oil | bash)
+    build/luajit tools/delegate-census.lua      # must report 0 interpreter fallbacks
+    test/bench/run.sh                           # microbenchmarks vs bash and dash
