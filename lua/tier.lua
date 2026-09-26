@@ -293,7 +293,7 @@ function M.run_compiled(mod, sh, pc, nested)
 				error(err, 0)
 			end
 			rt.posix_arith_fatal(sh, err)
-			sh.status = not nested and err.__curse_badusage and not sh.opt_c and 2 or 1 -- (a failed ${x:=w})
+			rt.line_aborted(sh, not nested and err.__curse_badusage and not sh.opt_c and 2 or 1) -- (a failed ${x:=w})
 			local sp = not nested and mod.lgspan and mod.lgspan[sh._ff]
 			if sp then -- (bash's line numbers drift from here: rt.line_drift)
 				rt.line_drift(sh, sp[1], sp[2])

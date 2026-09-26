@@ -4543,8 +4543,8 @@ local H = {}
 
 -- An assignment the specialized paths below don't cover (a nameref program's element/append/
 -- arith write, a value or subscript the compiled engine can't render, HISTSIZE/SHELLOPTS…):
--- rt.assign_full, the runtime twin of interp's assign statement (the value through the shared
--- one-word expander). cx.dispatch's wrapper gives it the lifted-var sync and errexit.
+-- rt.assign_full, the assign statement both tiers run (interp calls it too; the value through
+-- the shared one-word expander). cx.dispatch's wrapper gives it the lifted-var sync and errexit.
 EF.assign_native = function(cx, st, after)
 	return cx.dispatch(st, after, {
 		prelude = dbg(st) ~= "" and dbg(st) or nil,
