@@ -1,4 +1,4 @@
-cd "$(mktemp -d)"
+_tmpd=$(mktemp -d); cd "$_tmpd"
 touch a.txt b.txt c.log a.md
 mkdir sub
 touch sub/one.txt sub/two.txt
@@ -15,3 +15,4 @@ echo "single: "'*'
 for f in *.txt; do echo "loop: $f"; done
 count=(*.txt)
 echo "arraycount: ${#count[@]}"
+cd / && rm -rf "$_tmpd"   # (leave nothing behind in $TMPDIR)

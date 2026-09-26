@@ -1,4 +1,4 @@
-cd "$(mktemp -d)"
+_tmpd=$(mktemp -d); cd "$_tmpd"
 
 echo hello > out.txt
 cat out.txt
@@ -30,3 +30,4 @@ done < lines.txt
 echo "one two three four" > fields.txt
 read a b c < fields.txt
 echo "a=$a b=$b c=$c"
+cd / && rm -rf "$_tmpd"   # (leave nothing behind in $TMPDIR)
