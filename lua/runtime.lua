@@ -4700,6 +4700,8 @@ local function env_same(a, b) -- same entries, pointer for pointer?
 		i = i + 1
 	end
 end
+do -- (the scheduler's private helpers, through Shell:bg_launch: a block of their own,
+-- the main chunk being at LuaJIT's 200-local limit)
 local function co_cx(ctx, fd) -- CLOEXEC dup >= FD_BASE, tracked so a forked child can drop it
 	local d = dup_hi(fd)
 	if d >= 0 then
@@ -4711,6 +4713,38 @@ local function co_cl(ctx, fd)
 	if fd and fd >= 0 and ctx.fds[fd] then
 		ctx.fds[fd] = nil
 		C.close(fd)
+	end
+end
+-- The process state a task runs with, snapshotted from the current process: fds 0-9
+-- (tracked copies; -1 where closed), environ, cwd, umask, lifted upvalues.
+local function proc_snap(ctx, cwd, upv_get)
+	local s = { fd = {}, env = C.environ, cwd = cwd }
+	for k = 0, 9 do
+		s.fd[k] = co_cx(ctx, k)
+	end
+	s.um = C.curse_co_umask(0)
+	C.curse_co_umask(s.um)
+	if upv_get then
+		s.upv = { upv_get() }
+	end
+	return s
+end
+-- Make fds lo..9 the saved copies `fds` (closed where it has -1).
+local function fds_install(fds, lo)
+	for fd = lo, 9 do
+		if fds[fd] >= 0 then
+			C.dup2(fds[fd], fd)
+		else
+			C.close(fd)
+		end
+	end
+end
+-- Release the saved copies lo..hi, marking them gone (so a later release of the same
+-- table can't close an fd number that has since been reused).
+local function fds_release(ctx, fds, lo, hi)
+	for k = lo, hi do
+		co_cl(ctx, fds[k])
+		fds[k] = -1
 	end
 end
 
@@ -4890,13 +4924,7 @@ end
 -- stage's pipe end is live on fds 0-9, and the parent's view is intact.
 local function co_resume(ctx, t)
 	local P = ctx.P
-	for fd = 0, 9 do -- install the stage's fds 0-9 (-1: it had closed it)
-		if t.fd[fd] >= 0 then
-			C.dup2(t.fd[fd], fd)
-		else
-			C.close(fd)
-		end
-	end
+	fds_install(t.fd, 0) -- the stage's fds 0-9 (-1: it had closed it)
 	C.environ = t.env
 	if t.cwdfd then -- (a directory it changed to: held by an fd)
 		if ctx.cur_cwd ~= t then
@@ -4958,10 +4986,7 @@ local function co_resume(ctx, t)
 		-- (a background job's starting copies were only needed to start it: from here its
 		-- own saved state holds what it uses, and no stale copy keeps a pipe open)
 		g.base_closed = true
-		for k = 0, 9 do
-			co_cl(ctx, g.base.fd[k])
-			g.base.fd[k] = -1
-		end
+		fds_release(ctx, g.base.fd, 0, 9)
 	end
 	-- save the stage's process state
 	t.env = C.environ
@@ -5003,13 +5028,7 @@ local function co_resume(ctx, t)
 			t.sv[fd], t.fd[fd] = d, d
 		end
 	end
-	for fd = 0, 9 do -- park on the parent's fds
-		if P.fd[fd] >= 0 then
-			C.dup2(P.fd[fd], fd)
-		else
-			C.close(fd)
-		end
-	end
+	fds_install(P.fd, 0) -- park on the parent's fds
 	if ctx.cur_cwd ~= P.cwd then
 		C.curse_co_chdir(P.cwd)
 		ctx.cur_cwd = P.cwd
@@ -5027,24 +5046,15 @@ local function co_resume(ctx, t)
 		end
 		t.done, t.wait = true, nil
 		ctx.bycoro[t.co] = nil
-		if t ~= g.lp then
-			for fd = 0, 9 do
-				co_cl(ctx, t.sv[fd])
-			end
-		else -- (only its fds 3-9 are adopted: its stdin/out/err go now — `yes | head` with
-			-- lastpipe must EPIPE yes once head is done, not at the pipeline's end)
-			for fd = 0, 2 do
-				co_cl(ctx, t.sv[fd])
-			end
-		end
+		-- (a lastpipe stage's fds 3-9 are adopted: only its stdin/out/err go now — `yes | head`
+		-- with lastpipe must EPIPE yes once head is done, not at the pipeline's end)
+		fds_release(ctx, t.sv, 0, t ~= g.lp and 9 or 2)
 		for _, fd in ipairs(t.own) do -- release its pipe ends: EOF downstream, EPIPE upstream
 			co_cl(ctx, fd)
 		end
 		g.alive = g.alive - 1
 		if g.alive == 0 and g.bg then -- a background job ended: its starting fds go too
-			for k = 0, 9 do
-				co_cl(ctx, g.base.fd[k])
-			end
+			fds_release(ctx, g.base.fd, 0, 9)
 			g.done = true
 			if g.on_done then -- (a coproc: disposed as it dies — bash's SIGCHLD reaping)
 				pcall(g.on_done, g)
@@ -5077,16 +5087,8 @@ local function co_finish(ctx, self, g)
 	local lp = g.lp
 	if lp then
 		self.out = g.lp_out
-		for k = 3, 9 do -- fds the last stage opened/closed persist, like the shell's own
-			if lp.fd[k] >= 0 then
-				C.dup2(lp.fd[k], k)
-			else
-				C.close(k)
-			end
-		end
-		for k = 0, 9 do
-			co_cl(ctx, lp.sv[k])
-		end
+		fds_install(lp.fd, 3) -- fds the last stage opened/closed persist, like the shell's own
+		fds_release(ctx, lp.sv, 0, 9)
 		C.environ = env_same(lp.env, g.base.env) and g.base.env or lp.env
 		local cw = cwd_str()
 		if lp.cwd ~= cw then
@@ -5158,9 +5160,7 @@ end
 -- The shell leaves the scheduler: its snapshot's fd copies go; with no task left alive the
 -- whole context is released (every tracked fd, the environ copies).
 local function sched_release(ctx, P)
-	for k = 0, 9 do
-		co_cl(ctx, P.fd[k])
-	end
+	fds_release(ctx, P.fd, 0, 9)
 	C.curse_co_sigtimedwait(_co_sigpipe, nil, _co_zero_ts) -- drop a SIGPIPE still pending
 	C.sigprocmask(2, ctx.oldmask, nil)
 	if next(ctx.bycoro) == nil and ctx == SCHED then
@@ -5174,6 +5174,87 @@ local function sched_release(ctx, P)
 		end
 		SCHED = nil
 	end
+end
+-- The shell enters the scheduler as its parked state P (M.sched_pump, a top-level
+-- pipeline): SIGPIPE blocked meanwhile, so a dead reader is EPIPE, not our death.
+local function sched_enter(ctx, P)
+	ctx.P, ctx.cur_cwd = P, P.cwd
+	ctx.oldmask = ffi.new("uint8_t[128]")
+	C.sigprocmask(0, _co_sigpipe, ctx.oldmask) -- SIG_BLOCK
+	CO = ctx
+end
+-- …and leaves it: the shell's own fds, environ, umask and cwd back (then sched_release).
+local function sched_leave(ctx, P)
+	CO = nil
+	fds_install(P.fd, 0)
+	C.environ = P.env
+	C.curse_co_umask(P.um)
+	if cwd_str() ~= P.cwd then
+		C.curse_co_chdir(P.cwd)
+	end
+	ctx.cur_cwd = P.cwd
+end
+-- The tasks blocked on an fd or a tick (-1), not on a nested group: the list, whether any
+-- ticks, and how many wait on an fd.
+local function co_waiting(ctx)
+	local waiting, tick, nfd = {}, false, 0
+	for _, t in pairs(ctx.bycoro) do
+		if not t.done and t.wait ~= nil and type(t.wait) ~= "table" then
+			if t.wait == -1 then
+				tick = true
+			else
+				nfd = nfd + 1
+			end
+			waiting[#waiting + 1] = t
+		end
+	end
+	return waiting, tick, nfd
+end
+-- Poll the waiting tasks' fds (a user-range fd is the task's own saved copy) — and the
+-- shell's own `xfd` for `xev` first, if given — for up to `tmo` ms; requeue each task whose
+-- fd is ready, and the tick waiters when `tick`. True (nothing requeued) when xfd is ready.
+local function co_poll(ctx, waiting, tick, tmo, xfd, xev)
+	local pf = ctx.pf
+	if not pf or ctx.pfn < #waiting + 1 then
+		ctx.pfn = (#waiting + 1) * 2
+		pf = ffi.new("struct curse_co_pollfd[?]", ctx.pfn)
+		ctx.pf = pf
+	end
+	local cnt = 0
+	if xfd then
+		pf[0].fd, pf[0].events, pf[0].revents = xfd, xev, 0
+		cnt = 1
+	end
+	local k = cnt
+	for _, t in ipairs(waiting) do
+		if t.wait ~= -1 then
+			local w = t.wait
+			if w <= 9 then
+				w = t.fd[w]
+			end
+			pf[cnt].fd, pf[cnt].events, pf[cnt].revents = w, t.wev, 0
+			cnt = cnt + 1
+		end
+	end
+	local r = C.curse_co_poll(pf, cnt, tmo)
+	if xfd and r > 0 and pf[0].revents ~= 0 then
+		return true
+	end
+	for _, t in ipairs(waiting) do
+		if t.wait == -1 then
+			if tick then
+				t.wait = nil
+				ctx.runnable[#ctx.runnable + 1] = t
+			end
+		else
+			if r > 0 and pf[k].revents ~= 0 then
+				t.wait = nil
+				ctx.runnable[#ctx.runnable + 1] = t
+			end
+			k = k + 1
+		end
+	end
+	return false
 end
 -- Run the pipeline under the scheduler. `inproc[i]`: stage i's kind (M.stage_kind — every
 -- stage runs in-process as a task). `upv_get/upv_set` (when the
@@ -5192,23 +5273,13 @@ function Shell:run_pipeline_co(stage_fns, inproc, lastpipe, upv_get, upv_set)
 		end
 		local ctx = CO
 		pre_yield(T) -- T's buffered output must precede its sub-stages'
-		local base = { fd = {}, env = C.environ, cwd = cwd_str() or ctx.cur_cwd }
-		for k = 0, 9 do
-			base.fd[k] = co_cx(ctx, k)
-		end
-		base.um = C.curse_co_umask(0)
-		C.curse_co_umask(base.um)
-		if upv then
-			base.upv = { upv_get() }
-		end
+		local base = proc_snap(ctx, cwd_str() or ctx.cur_cwd, upv_get)
 		local g = co_launch(ctx, self, stage_fns, inproc, base, lastpipe, upv)
 		if g and g.alive > 0 then
 			g.waiter = T
 			coroutine.yield(g)
 		end
-		for k = 0, 9 do
-			co_cl(ctx, base.fd[k])
-		end
+		fds_release(ctx, base.fd, 0, 9)
 		if not g then
 			return nil
 		end
@@ -5221,26 +5292,14 @@ function Shell:run_pipeline_co(stage_fns, inproc, lastpipe, upv_get, upv_set)
 
 	real_flush()
 	local ctx = sched_get() -- (shared with any live background jobs)
-	local P = { fd = {}, env = C.environ, cwd = self:phys_cwd() }
-	for k = 0, 9 do
-		P.fd[k] = co_cx(ctx, k)
-	end
-	P.um = C.curse_co_umask(0)
-	C.curse_co_umask(P.um)
-	if upv then
-		P.upv = { upv_get() }
-	end
-	ctx.P, ctx.cur_cwd = P, P.cwd
-	ctx.oldmask = ffi.new("uint8_t[128]")
-	C.sigprocmask(0, _co_sigpipe, ctx.oldmask) -- SIG_BLOCK: a dead reader is EPIPE, not our death
-	CO = ctx
+	local P = proc_snap(ctx, self:phys_cwd(), upv_get)
+	sched_enter(ctx, P)
 	local g
 	local ok_all, err_all = pcall(function()
 		g = co_launch(ctx, self, stage_fns, inproc, P, lastpipe, upv)
 		if not g then
 			return
 		end
-		local pf, pfn = nil, 0
 		while g.alive > 0 do
 			local runnable = ctx.runnable
 			ctx.runnable = {}
@@ -5251,63 +5310,12 @@ function Shell:run_pipeline_co(stage_fns, inproc, lastpipe, upv_get, upv_set)
 				break
 			end
 			if #ctx.runnable == 0 then -- nothing ready to run: wait in poll
-				local waiting, tick = {}, false
-				for _, t in pairs(ctx.bycoro) do
-					if not t.done and t.wait ~= nil and type(t.wait) ~= "table" then
-						if t.wait == -1 then
-							tick = true
-						end
-						waiting[#waiting + 1] = t
-					end
-				end
-				if #waiting > pfn then
-					pfn = #waiting * 2
-					pf = ffi.new("struct curse_co_pollfd[?]", pfn)
-				end
-				local cnt = 0
-				for _, t in ipairs(waiting) do
-					if t.wait ~= -1 then
-						local w = t.wait
-						if w <= 9 then
-							w = t.fd[w] -- a user-range fd: poll the stage's own saved copy
-						end
-						pf[cnt].fd, pf[cnt].events, pf[cnt].revents = w, t.wev, 0
-						cnt = cnt + 1
-					end
-				end
-				local r = C.curse_co_poll(pf, cnt, tick and 10 or -1)
-				local k = 0
-				for _, t in ipairs(waiting) do
-					if t.wait == -1 then
-						if tick then
-							t.wait = nil
-							ctx.runnable[#ctx.runnable + 1] = t
-						end
-					else
-						if r > 0 and pf[k].revents ~= 0 then
-							t.wait = nil
-							ctx.runnable[#ctx.runnable + 1] = t
-						end
-						k = k + 1
-					end
-				end
+				local waiting, tick = co_waiting(ctx)
+				co_poll(ctx, waiting, tick, tick and 10 or -1)
 			end
 		end
 	end)
-	CO = nil
-	for fd = 0, 9 do -- the parent's fds back (a lastpipe stage's 3-9 are adopted below)
-		if P.fd[fd] >= 0 then
-			C.dup2(P.fd[fd], fd)
-		else
-			C.close(fd)
-		end
-	end
-	C.environ = P.env
-	C.curse_co_umask(P.um)
-	if cwd_str() ~= P.cwd then
-		C.curse_co_chdir(P.cwd)
-	end
-	ctx.cur_cwd = P.cwd
+	sched_leave(ctx, P) -- (a lastpipe stage's fds 3-9 are adopted below)
 	if ok_all and g then
 		co_finish(ctx, self, g)
 		if g.lp_raise then -- the lastpipe stage exited/returned: so does the shell/function
@@ -5342,19 +5350,10 @@ function M.sched_pump(w)
 		return false
 	end
 	real_flush()
-	local P = { fd = {}, env = C.environ, cwd = cwd_str() or "." }
-	for k = 0, 9 do
-		P.fd[k] = co_cx(ctx, k)
-	end
-	P.um = C.curse_co_umask(0)
-	C.curse_co_umask(P.um)
-	ctx.P, ctx.cur_cwd = P, P.cwd
-	ctx.oldmask = ffi.new("uint8_t[128]")
-	C.sigprocmask(0, _co_sigpipe, ctx.oldmask)
-	CO = ctx
+	local P = proc_snap(ctx, cwd_str() or ".")
+	sched_enter(ctx, P)
 	local ready = false
 	local ok, err = pcall(function()
-		local pf, pfn = nil, 0
 		while true do
 			local runnable = ctx.runnable
 			ctx.runnable = {}
@@ -5370,42 +5369,10 @@ function M.sched_pump(w)
 			local busy = #ctx.runnable > 0
 			if not busy or ctx.npre then
 				ctx.npre = nil
-				local waiting, tick = {}, false
-				for _, t in pairs(ctx.bycoro) do
-					if not t.done and t.wait ~= nil and type(t.wait) ~= "table" then
-						if t.wait == -1 then
-							tick = true
-						end
-						waiting[#waiting + 1] = t
-					end
-				end
+				local waiting, tick, nfd = co_waiting(ctx)
 				local blocking = w.fd or w.untilf or w.deadline
 				if not blocking and (#waiting == 0 or busy) then
 					return -- (a plain pump: only what could run right now)
-				end
-				if #waiting + 1 > pfn then
-					pfn = (#waiting + 1) * 2
-					pf = ffi.new("struct curse_co_pollfd[?]", pfn)
-				end
-				local cnt = 0
-				if w.fd then
-					local f = w.fd
-					if f <= 9 then
-						f = P.fd[f] -- (the shell's own fd, parked meanwhile)
-					end
-					pf[0].fd, pf[0].events, pf[0].revents = f, w.ev or POLLIN, 0
-					cnt = 1
-				end
-				local base = cnt
-				for _, t in ipairs(waiting) do
-					if t.wait ~= -1 then
-						local wf = t.wait
-						if wf <= 9 then
-							wf = t.fd[wf]
-						end
-						pf[cnt].fd, pf[cnt].events, pf[cnt].revents = wf, t.wev, 0
-						cnt = cnt + 1
-					end
 				end
 				local tmo = -1
 				if not blocking or busy then
@@ -5417,28 +5384,16 @@ function M.sched_pump(w)
 					local left = math.max(0, math.ceil((w.deadline - M.wall_secs()) * 1000))
 					tmo = (tmo < 0 or left < tmo) and left or tmo
 				end
-				if cnt == 0 and tmo < 0 then
+				if not w.fd and nfd == 0 and tmo < 0 then
 					return -- (nothing to wait on: never block forever)
 				end
-				local r = C.curse_co_poll(pf, cnt, tmo)
-				if w.fd and r > 0 and pf[0].revents ~= 0 then
+				local f = w.fd
+				if f and f <= 9 then
+					f = P.fd[f] -- (the shell's own fd, parked meanwhile)
+				end
+				if co_poll(ctx, waiting, tick, tmo, f, w.ev or POLLIN) then
 					ready = true
 					return
-				end
-				local k = base
-				for _, t in ipairs(waiting) do
-					if t.wait == -1 then
-						if tick then
-							t.wait = nil
-							ctx.runnable[#ctx.runnable + 1] = t
-						end
-					else
-						if r > 0 and pf[k].revents ~= 0 then
-							t.wait = nil
-							ctx.runnable[#ctx.runnable + 1] = t
-						end
-						k = k + 1
-					end
 				end
 				if w.deadline and M.wall_secs() >= w.deadline then
 					return
@@ -5449,20 +5404,7 @@ function M.sched_pump(w)
 			end
 		end
 	end)
-	CO = nil
-	for fd = 0, 9 do -- the shell's own state back
-		if P.fd[fd] >= 0 then
-			C.dup2(P.fd[fd], fd)
-		else
-			C.close(fd)
-		end
-	end
-	C.environ = P.env
-	C.curse_co_umask(P.um)
-	if cwd_str() ~= P.cwd then
-		C.curse_co_chdir(P.cwd)
-	end
-	ctx.cur_cwd = P.cwd
+	sched_leave(ctx, P)
 	sched_release(ctx, P)
 	if not ok then
 		error(err, 0)
@@ -5561,10 +5503,7 @@ function Shell:bg_launch(fn, cmdstr, flat, simple, upv_get, upv_set, opts)
 		real_flush()
 	end
 	-- its starting state: the launcher's current one (inside a task, fds 0-9 ARE that task's)
-	local base = { fd = {}, env = C.environ, cwd = cwd_str() or "." }
-	for k = 0, 9 do
-		base.fd[k] = co_cx(ctx, k)
-	end
+	local base = proc_snap(ctx, cwd_str() or ".", upv_get)
 	local piped = t0 and t0.i and t0.i > 1 -- (in a later pipeline stage: stdin is that pipe)
 	opts = opts or {}
 	for k, fd in pairs(opts.fds or {}) do
@@ -5580,17 +5519,10 @@ function Shell:bg_launch(fn, cmdstr, flat, simple, upv_get, upv_set, opts)
 			C.close(dn)
 		end
 	end
-	base.um = C.curse_co_umask(0)
-	C.curse_co_umask(base.um)
-	if upv then
-		base.upv = { upv_get() }
-	end
 	local vpid = M.alloc_vpid()
 	local g = co_launch(ctx, self, { fn }, { flat and "flat" or true }, base, false, upv)
 	if not g then
-		for k = 0, 9 do
-			co_cl(ctx, base.fd[k])
-		end
+		fds_release(ctx, base.fd, 0, 9)
 		return nil
 	end
 	g.bg, g.vpid, g.simple, g.launcher, g.nspawn0 = true, vpid, simple, self, M.nspawn
@@ -5640,6 +5572,7 @@ function Shell:bg_launch(fn, cmdstr, flat, simple, upv_get, upv_set, opts)
 	self.status = 0
 	return job
 end
+end -- (the scheduler block)
 
 -- Signals `kill` aimed at a background job's virtual pid: delivered when the task
 -- resumes (its yield returns SIGMARK): its own trap runs, an ignored one does nothing, the
