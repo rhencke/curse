@@ -2,8 +2,7 @@
 # Build the patched LuaJIT VM for curse. This is the ONE encapsulated
 # "build the dependency" step the Meson build drives; everything else (fetching
 # + pinning LuaJIT, generating the module bundle, linking the static `curse`,
-# the C client, tests, install) is Meson's job. It replaces the old sprawling
-# scripts/build-luajit.sh.
+# the C client, tests, install) is Meson's job.
 #
 # Meson has already prepared the source (subprojects/luajit): curse.patch applied
 # and lib_cursesys.c / lib_cursesig.c overlaid into src/ (see subprojects/

@@ -4689,7 +4689,6 @@ EF.assign_native = function(cx, st, after)
 end
 -- statement handler: assign (split out of flatten_stmt; see H)
 H.assign = function(cx, st, after)
-	local t = st.t
 	-- The program declares a nameref: a plain `name=value` may write THROUGH one
 	-- (to a var / array or assoc element / a detected cycle) — only interp's full
 	-- assign does that, so delegate. Gated to nameref programs (rare); ordinary
@@ -4947,7 +4946,6 @@ end
 
 -- statement handler: funcdef (split out of flatten_stmt; see H)
 H.funcdef = function(cx, st, after)
-	local t = st.t
 	-- Register the (hoisted) closure into sh.functions when the DEFINITION runs, not
 	-- at load — so a function doesn't "exist" (declare -f / delegated call / prefix
 	-- assign) before its def line (bash). Direct compiled calls use the hoisted local
@@ -6651,7 +6649,6 @@ EF.arith_branch = function(arith, lifted, yes, no, keep, xsrc)
 end
 
 H.arithcmd = function(cx, st, after)
-	local t = st.t
 	-- (( expr )): evaluate expr WITH side effects natively (assignments, ++/--,
 	-- comma), then $? = (result != 0) ? 0 : 1 — bash's arith-command status. The
 	-- shared arith evaluator takes only the parts the emitter can't render (array
@@ -6702,7 +6699,6 @@ end
 
 -- statement handler: forc (split out of flatten_stmt; see H)
 H.forc = function(cx, st, after)
-	local t = st.t
 	if st.redirs then
 		return cx.refuse(st, after)
 	end -- redirs on the loop: interp applies them
@@ -6814,7 +6810,6 @@ end
 
 -- statement handler: whilec (split out of flatten_stmt; see H)
 H.whilec = function(cx, st, after)
-	local t = st.t
 	if st.redirs then
 		return cx.refuse(st, after)
 	end -- redirs on the loop (heredoc/file): interp applies them
@@ -6920,7 +6915,6 @@ end
 
 -- statement handler: forin (split out of flatten_stmt; see H)
 H.forin = function(cx, st, after)
-	local t = st.t
 	if st.redirs then
 		return cx.refuse(st, after)
 	end -- redirs on the loop: interp applies them
@@ -7116,7 +7110,6 @@ end
 
 -- statement handler: if (split out of flatten_stmt; see H)
 H["if"] = function(cx, st, after)
-	local t = st.t
 	-- Each clause's condition is either a native arith `(( ))` (emit_bool) or a
 	-- COMMAND LIST run for its status. Both compile — the command condition is a
 	-- sub-CFG run with sh.noerr raised (errexit-exempt, like the interpreter),
@@ -7183,7 +7176,6 @@ end
 
 -- statement handler: andor (split out of flatten_stmt; see H)
 H.andor = function(cx, st, after)
-	local t = st.t
 	-- `a && b || c`: run item 1, then each item iff the previous status matches
 	-- its operator (&& on 0, || on non-zero) — pure control flow. Errexit exempts
 	-- every operand EXCEPT the final one that runs (bash), so raise sh.noerr across
@@ -7238,7 +7230,6 @@ end
 
 -- statement handler: subshell (split out of flatten_stmt; see H)
 H.subshell = function(cx, st, after)
-	local t = st.t
 	-- ( body ): runs IN-PROCESS, isolated — a compiled fragment under sh:subshell_run
 	-- (checkpoint/restore of the state a fork would have separated). Redirs on the
 	-- subshell are compiled when the shapes are compilable; else it refuses.
@@ -7302,7 +7293,6 @@ end
 
 -- statement handler: group (split out of flatten_stmt; see H)
 H.group = function(cx, st, after)
-	local t = st.t
 	-- { list; }: not a subshell — just a sequence in the current shell. Flatten the
 	-- body inline (a redirected group: cx.redirected_compound; break/continue flow natively).
 	if st.redirs then
@@ -7313,7 +7303,6 @@ end
 
 -- statement handler: pipeline (split out of flatten_stmt; see H)
 H.pipeline = function(cx, st, after)
-	local t = st.t
 	-- a | b | c: compile each stage to a fragment and let the runtime (sh:run_pipeline)
 	-- run them in-process as coroutines over real pipes and set PIPESTATUS. Flush lifted
 	-- before (stages read sh) and reload after (a lastpipe last stage may write).
@@ -7432,7 +7421,6 @@ local BG_PURE_PEXP = { [""] = 1, ["-"] = 1, [":-"] = 1, ["+"] = 1, [":+"] = 1, [
 	["~"] = 1, ["~~"] = 1 }
 -- statement handler: background (split out of flatten_stmt; see H)
 H.background = function(cx, st, after)
-	local t = st.t
 	-- cmd & : fork, run the COMPILED command in the child; the parent records $! + the
 	-- job and continues with status 0. Reuses the fragment mechanism (the child is a
 	-- subprogram). Gated to trap-free programs — a forked child otherwise resets caught
@@ -7540,7 +7528,6 @@ end
 
 -- statement handler: arrayassign (split out of flatten_stmt; see H)
 H.arrayassign = function(cx, st, after)
-	local t = st.t
 	-- `a=(1 2 3)` / `a=($x)` / `a=([0]=x [k]=v)` / `a+=(…)` / `a=()`: build the element
 	-- items natively — a bare word field-splits via the field engine into {val=field}
 	-- entries, a keyed element renders {key,op,val} — then store via rt.arrayassign. No
@@ -7660,7 +7647,6 @@ end
 
 -- statement handler: case (split out of flatten_stmt; see H)
 H.case = function(cx, st, after)
-	local t = st.t
 	-- case SUBJ in pat) body ;; … esac. Evaluate the subject once (native single string),
 	-- then a chain of match blocks: each tests the subject against its clause's patterns
 	-- via the shared matcher (I.case_match — vars expand, quoted metachars literal,
@@ -8475,7 +8461,7 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
 			-- (`var=x return`: a posix-persistent prefix assignment — the native simple-command
 			-- runner binds it and runs the builtin, whose raised return the wrapper catches)
 			if st.assigns and #st.assigns > 0 then
-				return EF.simple_native(cx, st, after, cmd) or cx.refuse(st, after)
+				return EF.simple_native(cx, st, after, full_lit(st.words[1])) or cx.refuse(st, after)
 			end
 			-- `return` at the top level of the script (or a line of it, or a `$( … )` there) is
 			-- an error (status 2 + diagnostic, but execution continues) — not a program exit:
@@ -8514,7 +8500,7 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
 				aw = st.words[cf_arg]
 				rs1 = ""
 			elseif aw and full_lit(aw) == "--help" then -- (the builtin's help: status 2, no return —
-				return EF.simple_native(cx, st, after, cmd) or cx.refuse(st, after) -- the runner's)
+				return EF.simple_native(cx, st, after, full_lit(st.words[1])) or cx.refuse(st, after) -- the runner's)
 			end
 			-- a first word that EXPANDS to `--help` is the help too (bash's CHECK_HELPOPT)
 			local hv = rs1 ~= "" and aw and not full_lit(aw)
@@ -8563,7 +8549,7 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
 			-- Multi-arg (`exit a b`: too-many, non-fatal) / dynamic arg -> the builtin runner.
 			local aw = st.words[cf_arg]
 			if aw and full_lit(aw) == "--help" then -- (the builtin's help, status 2: no exit — the runner)
-				return EF.simple_native(cx, st, after, cmd) or cx.refuse(st, after)
+				return EF.simple_native(cx, st, after, full_lit(st.words[1])) or cx.refuse(st, after)
 			end
 			if not st.words[cf_arg + 1] then
 				local d = dbg(st) .. EF.xtwords(st.words, cx.lifted)
