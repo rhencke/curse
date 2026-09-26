@@ -3189,110 +3189,9 @@ local function literal_sub(k)
 	end
 	return table.concat(out)
 end
+-- A declaration builtin's NAME=(…) literal, stored after the builtin ran (rt.arrayassign_body)
 local function do_arrayassign(sh, st)
-	-- through a nameref (`local -n r=arr; r+=(x)`) the literal lands in the referenced array
-	local name = sh:deref(st.name)
-	if name == "" then -- (a nameref cycle: the ref itself becomes the array)
-		name = st.name
-	end
-	rt.noassign_arr_check(sh, name)
-	rt.ref_to_array(sh, name)
-	local isassoc = sh:is_assoc(name)
-	local items = sh.arrayargs_pre and sh.arrayargs_pre[st] or arrayassign_items(sh, st, isassoc)
-	if name == "DIRSTACK" and rt.dirstack_dyn(sh) then -- (the dynamic array: each element
-		local auto = st.append and #(sh.dirstack or {}) + 1 or 0 -- through its assign_func)
-		for _, it in ipairs(items) do
-			local k = it.key ~= nil and tonumber(array_key(sh, name, it.key)) or auto
-			rt.dirstack_set(sh, k, it.val, it.op == "+=")
-			auto = (k or auto) + 1
-		end
-		return
-	end
-	if st.append and sh.vars[name] then
-		sh.vars[name].empty_decl = nil -- (`a+=()` counts as an assignment: shows =())
-	end
-	-- bash quirk (ASSOCIATIVE arrays only): inside a `=` (not `+=`) compound literal, a
-	-- `[k]+=v` element appends to the value a[k] had BEFORE the whole statement — NOT the
-	-- (cleared) value nor one set by an earlier element in the same literal. So snapshot
-	-- the old element map before clearing. INDEXED arrays instead append to the current
-	-- (post-clear) value, and `a+=(...)` keeps the normal "append to current" too.
-	local snap
-	if not st.append then -- plain assignment resets the array (keep assoc-ness)
-		local b = sh.vars[name]
-		if isassoc then
-			snap = b and b.arr or nil
-		end
-		if not b then
-			sh:array_assign(name, {}, false)
-			b = sh.vars[name]
-		end
-		b.arr = {}
-		b.s = nil
-		b.n = nil
-		b.empty_decl = nil -- assigned now (even `a=()` -> shows =())
-		if isassoc then
-			b.order = {}
-		end
-	end
-	if isassoc then
-		if not items.kv then -- keyed elements assigned; a bare one is an error (reported, skipped)
-			for _, it in ipairs(items) do
-				if it.key == nil then
-					io.stderr:write("curse: " .. name .. ": " .. rt.compound_word_src(sh, it)
-						.. ": must use subscript when assigning associative array\n")
-				else
-					local idx = it.xkey or array_key(sh, name, it.key)
-					if idx == "" then -- (an empty key: reported as written — by declare, requoted —
-						-- and skipped; the rest still land)
-						io.stderr:write("curse: " .. rt.empty_key_src(sh, it) .. ": bad array subscript\n")
-						rt.report_exit(sh) -- (err_badarraysub: report_error)
-					elseif it.op == "+=" and not st.append then -- append to the pre-statement value (see snap)
-						sh:array_set(name, idx, (snap and snap[idx] or "") .. it.val, false)
-					else
-						sh:array_set(name, idx, it.val, it.op == "+=")
-					end
-				end
-			end
-		else -- key/value pairs (kvpair_assignment_p): alternating key value words
-			rt.assoc_kvpairs(sh, name, items)
-		end
-	else
-		local auto = st.append and rt.arr_next(sh, name) or 0
-		for _, it in ipairs(items) do
-			if it.key ~= nil then
-				-- a bad element is reported (as written) and skipped; the rest still land
-				local key = it.xkey or it.key
-				local src = "[" .. key .. "]" .. (it.op or "=") .. it.val
-				if key:match("^%s*$") then
-					io.stderr:write("curse: " .. src .. ": bad array subscript\n")
-					rt.report_exit(sh) -- (err_badarraysub: report_error)
-				elseif key == "*" or key == "@" then
-					io.stderr:write("curse: " .. src .. ": cannot assign to non-numeric index\n")
-				else
-					local idx = array_key(sh, name, it.xkey or literal_sub(key))
-					-- (indexed += appends to CURRENT, unlike assoc; a negative index past the
-					-- start fails and leaves the running index alone)
-					local k = sh:array_set(name, idx, it.val, it.op == "+=")
-					if k then
-						auto = rt.key_next(k)
-					else
-						io.stderr:write("curse: " .. src .. ": bad array subscript\n")
-						rt.report_exit(sh) -- (err_badarraysub: report_error)
-					end
-				end
-			else
-				sh:array_set(name, auto, it.val, false, true)
-				auto = rt.key_next(auto)
-			end
-		end
-	end
-	-- An array can't live in the process environment: converting a variable to an
-	-- array drops it from the env (so a child sees nothing), though bash keeps the
-	-- export ATTRIBUTE on the shell variable itself.
-	local b = sh.vars[name]
-	if b and b.exported then
-		C.unsetenv(name)
-	end
+	return rt.arrayassign_body(sh, st.name, nil, st.append, st, true)
 end
 M.do_arrayassign = do_arrayassign
 -- Quote a value the way `declare -p` does: double-quoted with \ " $ ` escaped.
@@ -4161,14 +4060,8 @@ end
 -- A function OVERRIDES a builtin of the same name in bash, so this is dispatched
 -- before the builtin table (except via `command`, which passes no_func).
 local function run_function(sh, cmd, fn, args, hook, tenv_base)
-	-- $FUNCNEST: past that many nested calls, the call fails (status 1) — bash
-	if sh.vars.FUNCNEST then
-		local lim = tonumber(sh:get("FUNCNEST"))
-		if lim and lim > 0 and (sh.calldepth or 0) >= lim then
-			io.stderr:write("curse: " .. cmd .. ": maximum function nesting level exceeded (" .. lim .. ")\n")
-			sh.status = 1 -- (bash: jump_to_top_level DISCARD — the rest of the command line goes)
-			error({ __curse_exit = 1, __curse_lineabort = true, __curse_discard = true })
-		end
+	if sh.vars.FUNCNEST then -- ($FUNCNEST: past that many nested calls, the line is abandoned)
+		rt.funcnest_over(sh, cmd)
 	end
 	local savedline = sh.cur_line -- the call-site line: $LINENO is restored to it on return
 	-- (an error out of compiled code called from here skips ITS frames' epilogues: the
@@ -4257,12 +4150,9 @@ local function run_function(sh, cmd, fn, args, hook, tenv_base)
 	sh.loopdepth = saved_ld
 	-- `return N` sets the function's status but not $? (return.def: only return_catch_value),
 	-- so the RETURN trap sees the status from before it; N is $? once the trap has run
-	local rret
-	if ok and sh.fret then -- (a compiled body's `return N`, parked for the RETURN trap)
-		rret, sh.fret = sh.fret, nil
-	end
+	-- (N parked in sh.fret: a compiled body's own, or a `return N` raised mid-body here)
 	if not ok and type(err) == "table" and err.__curse_return then
-		rret = err.__curse_return
+		sh.fret = err.__curse_return
 		ok, err = true, nil
 		sh.noerr = ne0 -- (a return raised mid-body — a trap's — skips a condition's noerr--)
 	end
@@ -4272,18 +4162,8 @@ local function run_function(sh, cmd, fn, args, hook, tenv_base)
 	-- it) — so one present now is inherited or was SET during this call, and fires — a
 	-- sourced script's return fires it regardless (see the `.`/source builtin) — and a
 	-- function run by the DEBUG trap doesn't fire it.
-	local rt_h = sh.traps and sh.traps.RETURN
-	if ok and rt_h and rt_h ~= "" and not sh.in_return_trap and not sh.in_debug
-		and ((sh.in_subprogram or 0) == 0 or rt.pseudo_trapped(sh, "RETURN")) then -- (in a subshell, one it set)
-		sh.in_return_trap = true
-		local saved = sh.status
-		sh.cur_line = sh.func_bline and sh.func_bline[cmd] or sh.cur_line
-		run_trap(sh, rt_h)
-		sh.status = saved
-		sh.in_return_trap = false
-	end
-	if rret then
-		sh.status = rret
+	if ok then
+		rt.fn_return(sh, cmd)
 	end
 	if not ok then
 		while sh.pd > pd0 + 1 do
@@ -4461,7 +4341,7 @@ local SPECIAL_BUILTIN -- forward decl (assigned below); posix dispatch/funcdef r
 -- single-quoting any word that isn't a plain token (bash). PS4's first char is
 -- repeated by call depth. A plain token is bare; anything else is quoted the way
 -- bash quotes it (shell_quote: `$'…'` for control/non-printable, else `'…'`).
-local xtrace_quote, xtrace_line, xtrace = rt.xtrace_quote, rt.xtrace_line, rt.xtrace
+local xtrace_line, xtrace = rt.xtrace_line, rt.xtrace
 
 -- bash's describe_command (type.def), for `type` and `command -v/-V`. FL: all, short (the
 -- sentence), reuse (command -v), type (-t), path_only (-p), force (-P), nofunc (-f),
@@ -4642,55 +4522,31 @@ local function exec_simple(sh, args, hook, no_func)
 		sh.status = 0
 	elseif cmd == "false" then
 		sh.status = 1
-	elseif cmd == "break" then -- outside a loop: a no-op (bash), not a fatal unwind
+	elseif cmd == "break" or cmd == "continue" then -- outside a loop: a no-op (bash), not a fatal unwind
 		if args[2] == "--" then
 			table.remove(args, 2)
 		end
 		if (sh.loopdepth or 0) == 0 then -- (checked first — bash: said, not an error, status 0)
 			if not sh.opt_posix then
-				io.stderr:write("curse: break: only meaningful in a `for', `while', or `until' loop\n")
+				io.stderr:write("curse: " .. cmd .. ": only meaningful in a `for', `while', or `until' loop\n")
 			end
 			sh.status = 0
 		elseif args[2] and not rt.legal_number(args[2]) then -- non-numeric count: FATAL (status 128) in a
-			io.stderr:write("curse: break: " .. args[2] .. ": numeric argument required\n")
+			io.stderr:write("curse: " .. cmd .. ": " .. args[2] .. ": numeric argument required\n")
 			sh.status = 128 -- non-interactive shell (bash exits); interactive just aborts it
 			if not sh.opt_i then
 				error({ __curse_exit = 128 })
 			end
 		elseif args[3] ~= nil then -- (the count is checked first — bash's get_numeric_arg)
-			rt.too_many(sh, "break")
+			rt.too_many(sh, cmd)
 		elseif args[2] and rt.legal_number(args[2]) <= 0 then -- (bash: reported, and ALL the loops end)
-			io.stderr:write("curse: break: " .. args[2] .. ": loop count out of range\n")
+			io.stderr:write("curse: " .. cmd .. ": " .. args[2] .. ": loop count out of range\n")
 			sh.status = 1
 			error({ __curse_break = sh.loopdepth, __curse_status = 1 })
 		else
 			sh.status = 0
-			error({ __curse_break = math.min(rt.legal_number(args[2]) or 1, sh.loopdepth) })
-		end
-	elseif cmd == "continue" then
-		if args[2] == "--" then
-			table.remove(args, 2)
-		end
-		if (sh.loopdepth or 0) == 0 then -- (checked first — bash: said, not an error, status 0)
-			if not sh.opt_posix then
-				io.stderr:write("curse: continue: only meaningful in a `for', `while', or `until' loop\n")
-			end
-			sh.status = 0
-		elseif args[2] and not rt.legal_number(args[2]) then -- non-numeric count: fatal, like break
-			io.stderr:write("curse: continue: " .. args[2] .. ": numeric argument required\n")
-			sh.status = 128
-			if not sh.opt_i then
-				error({ __curse_exit = 128 })
-			end
-		elseif args[3] ~= nil then -- (the count is checked first — bash's get_numeric_arg)
-			rt.too_many(sh, "continue")
-		elseif args[2] and rt.legal_number(args[2]) <= 0 then -- (bash: reported, and ALL the loops end)
-			io.stderr:write("curse: continue: " .. args[2] .. ": loop count out of range\n")
-			sh.status = 1
-			error({ __curse_break = sh.loopdepth, __curse_status = 1 })
-		else
-			sh.status = 0
-			error({ __curse_continue = math.min(rt.legal_number(args[2]) or 1, sh.loopdepth) })
+			local n = math.min(rt.legal_number(args[2]) or 1, sh.loopdepth)
+			error(cmd == "break" and { __curse_break = n } or { __curse_continue = n })
 		end
 	elseif cmd == "[" or cmd == "test" then
 		do_test(sh, args)
@@ -5248,64 +5104,54 @@ local function wall_secs()
 end
 
 local exec_stmt
--- A variable assignment's store (exec_stmt runs it under pcall): module-level, not
--- per-statement closures — closure creation is NYI for the JIT, and every `x=…` in a
--- loop made three. The expanded right-hand side is kept in sh.x_rhs (set -x).
-local function assign_rhs_a(sh, st)
-	sh.x_rhs = expand_assign_word(sh, st.rhs)
-	return sh.x_rhs
-end
-local function assign_rhs_w(sh, st)
-	sh.x_rhs = expand_word(sh, st.rhs)
-	return sh.x_rhs
-end
-local function assign_body(sh, st, nref_base, nref_sub)
-	if nref_base then
-		sh:array_set(
-			nref_base,
-			array_key(sh, nref_base, nref_sub),
-			assign_rhs_a(sh, st),
-			st.append
-		)
-	elseif st.index then
-		-- the VALUE expands before the subscript (bash assign_array_element: `a[$((i=5))]=$i`
-		-- stores the old $i; `a[$(exit 2)1]=$(exit 4)` leaves $? 2)
-		local v = assign_rhs_a(sh, st)
-		local key = array_key(sh, st.name, st.index)
-		if key == "" and sh:is_assoc(st.name) then -- (an associative array has no "" key)
-			error({ __curse_badsub = true })
-		end
-		if not sh:array_set(st.name, key, v, st.append) then
-			error({ __curse_badsub = true })
-		end
-	elseif st.arith then
-		sh:aset(st.name, eval(sh, st.arith))
-	elseif st.append then
-		local b = sh.vars[sh:deref(st.name)]
-		if b and b.arr then -- `name+=value` on an array appends to element 0 (bash)
-			sh:array_set(st.name, array_key(sh, st.name, "0"), assign_rhs_a(sh, st), true)
-		elseif b and b.int then -- integer var: += is arithmetic addition (the old value
-			-- is itself evaluated: `b=4+1; typeset -i b; b+=37` is 42 — bash)
-			sh:aset(st.name, rt.int_value(sh, sh:get(st.name)) + rt.int_value(sh, assign_rhs_w(sh, st), M.arith_eval_str))
-		elseif b and (b.lower or b.upper) then -- declare -l/-u: case-fold the appended result
-			local v = sh:get(st.name) .. assign_rhs_a(sh, st)
-			sh:set_str(st.name, b.lower and v:lower() or v:upper())
-		else
-			rt.append_scalar(sh, st.name, assign_rhs_a(sh, st)) -- (buffered: see rt.append_scalar)
-		end
-	else
-		local b = sh.vars[sh:deref(st.name)]
-		if b and b.arr then -- plain `name=value` on an array var writes element 0 (bash)
-			sh:array_set(st.name, array_key(sh, st.name, "0"), assign_rhs_a(sh, st), false)
-		elseif b and b.int and not b.ref then -- integer var (declare -i): assign arith-evaluates
-			sh:aset(st.name, rt.int_value(sh, assign_rhs_w(sh, st), M.arith_eval_str))
-		elseif b and (b.lower or b.upper) then -- declare -l/-u: case-fold on assign
-			local v = assign_rhs_a(sh, st)
-			sh:set_str(st.name, b.lower and v:lower() or v:upper())
-		elseif sh:set_str(st.name, assign_rhs_a(sh, st)) == false and not sh.applying_prefix then
-			error({ __curse_exit = 1, __curse_lineabort = true, __curse_noee = true }) -- (a bad nameref target)
+-- A simple command's pieces for rt.sr_run (module-level: no per-command closures). spec:
+-- the statement's constant part, cached per AST node (weakly: a set -k rewrite is a fresh
+-- node each run).
+local SIMPLE = { spec = setmetatable({}, { __mode = "k" }) }
+function SIMPLE.new_spec(st)
+	local names
+	if st.assigns then
+		names = {}
+		for _, a in ipairs(st.assigns) do
+			if not a.index then
+				names[#names + 1] = a.name
+			end
 		end
 	end
+	local spec = { aas = st.arrayargs, assigns = st.assigns, names = names, eredirs = st.redirs,
+		so = st.redirs and redirs_touch_stdout(st.redirs) or nil, ix = true }
+	SIMPLE.spec[st] = spec
+	return spec
+end
+-- the prefix bindings (`x=1 y=$x cmd`), in order, each value expanded as it binds
+function SIMPLE.bind(sh, spec)
+	local assigns = spec.assigns
+	for i = 1, #assigns do
+		local a = assigns[i]
+		if a.index then -- (`a[i]=v cmd`: not a valid command-prefix binding)
+			rt.pbind_bad(sh, a.name, tostring(a.index))
+		elseif a.raw then
+			rt.pbind(sh, a.name, nil, false, a.raw)
+		elseif a.arith then -- (`x=$((…))`, parsed as arithmetic)
+			rt.pbind(sh, a.name, rt.i64_to_str(eval(sh, a.arith)), false)
+		else
+			rt.pbind(sh, a.name, rt.xw_rhs(sh, a.rhs), a.append)
+		end
+	end
+end
+-- the redirections, into rt.sr_run_cmd's saves; a failed one on a posix special builtin
+-- is fatal (EX_REDIRFAIL)
+function SIMPLE.redirs(rs, sh, argv, spec)
+	local sv, ok = apply_redirs(sh, spec.eredirs, argv[1], nil, argv)
+	for i = 1, #sv do
+		rs[i] = sv[i]
+	end
+	rs.e2o, rs._sh = sv.e2o, sv._sh
+	if not ok and sh.opt_posix and SPECIAL_BUILTIN[argv[1]] and not sh.opt_i then
+		sh.status = 1
+		error({ __curse_exit = 1 })
+	end
+	return ok
 end
 exec_stmt = function(sh, st, hook)
 	local t = st.t
@@ -5412,277 +5258,38 @@ exec_stmt = function(sh, st, hook)
 	end -- $LINENO: frozen at the trapped line for the trap's own commands (not in a
 	-- function the trap calls, whose lines count as usual — bash)
 	if t == "assign" then
-		local ncs0 = sh.ncs
 		local pnf = sh.procsub_files and #sh.procsub_files or 0
-		if st.name == "SHELLOPTS" or st.name == "BASHOPTS" then -- readonly specials (bash)
-			io.stderr:write("curse: " .. st.name .. ": readonly variable\n")
-			rt.report_exit(sh) -- (err_readonly: report_error)
-			sh.status = 1
-			if sh.opt_c or sh.opt_posix then
-				error({ __curse_exit = 1 })
+		if rt.assign_full(sh, st) then
+			sh:array_assign("PIPESTATUS", { tostring(sh.status) }, false) -- (this null command's status)
+			if sh.procsub_files then -- (`x=<(…)`: a null command closes its <() when it ends)
+				rt.assign_drain(sh, st, pnf)
 			end
-			if sh.applying_prefix then -- (as any readonly: a prefix is non-fatal, a
-				return -- standalone assignment aborts the rest of the line)
-			end
-			error({ __curse_exit = 1, __curse_lineabort = true })
-		end
-		if st.index == "" then -- `a[]=v`: empty subscript is a bad array subscript (bash: status 1, no
-			io.stderr:write("curse: " .. st.name .. "[]: bad array subscript\n") -- assign, the rest of
-			rt.report_exit(sh) -- (err_badarraysub: report_error)
-			sh.status = 1 -- the line abandoned; as a prefix binding it's just skipped)
-			if sh.applying_prefix then
-				return
-			end
-			error({ __curse_exit = 1, __curse_lineabort = true })
-		end
-		local rb = sh.vars[sh:deref(st.name)]
-		-- A nameref whose target carries a subscript (declare -n ref='A[K]'): a plain
-		-- `ref=v` / `ref+=v` writes THROUGH to that element, not the base array's [0].
-		local nref_base, nref_sub
-		if not st.index and not st.arith then
-			local nb = sh.vars[st.name]
-			local selfsub = nb and nb.ref and nb.s and sh:self_elem_unref(st.name)
-			if selfsub then
-				nref_base, nref_sub = st.name, selfsub
-			elseif nb and nb.ref and nb.s then
-				-- a nameref cycle (ref1->ref2->ref1) derefs to "" — bash detects it on write
-				if nb.s ~= "" and sh:deref(st.name) == "" then
-					if rt.nameref_circular(sh, st.name) then -- (a function's local cycle: the global, no nameref)
-						local back = sh:global_swap({ st.name })
-						sh.in_circ = true
-						local ok, e = pcall(exec_stmt, sh, st, hook)
-						sh.in_circ = nil
-						back()
-						if not ok then
-							error(e, 0)
-						end
-					end
-					return
-				elseif nb.outer and nb.s:find("[", 1, true) then -- (`local -n a='a[0]'`: bash
-					io.stderr:write("curse: `" .. nb.s .. "': not a valid identifier\n") -- rejects it)
-					error({ __curse_exit = 1, __curse_lineabort = true })
-				elseif nb.outer then -- (a function's self-named ref: bash warns, then writes)
-					io.stderr:write("curse: warning: " .. st.name .. ": circular name reference\n")
-				end
-				nref_base, nref_sub = (sh:deref_elem(st.name) or ""):match("^([%a_][%w_]*)%[(.+)%]$")
-			end
-		end
-		-- `ref[i]=` where ref is a nameref TO a subscripted element (`a[0]`) would be
-		-- `a[0][i]` — not a valid identifier (bash: status 1, no assign).
-		if st.index then
-			local nb = sh.vars[st.name]
-			if nb and nb.ref and nb.s and nb.s:match("^[%a_][%w_]*%[.+%]$") then
-				io.stderr:write("curse: `" .. nb.s .. "': not a valid identifier\n")
-				sh.status = 1
-				return
-			end
-			if nb and nb.ref and nb.s == nil and not nb.arr then -- (a valueless nameref: no target)
-				io.stderr:write("curse: `': not a valid identifier\n")
-				error({ __curse_exit = 1, __curse_lineabort = true })
-			end
-		end
-		-- a negative subscript past the start is reported before readonly-ness (bash
-		-- evaluates the subscript first): `c[-2]: bad array subscript`, line aborted
-		-- (only for a READONLY array — else the assignment itself evaluates it, once)
-		if st.index and not st.arith and rb and rb.ro and rb.arr and not rb.assoc and st.index:find("-", 1, true) then
-			local k = array_key(sh, st.name, st.index)
-			if rt.neg_oob(sh, st.name, k) then
-				io.stderr:write("curse: " .. st.name .. "[" .. st.index .. "]: bad array subscript\n")
-				rt.report_exit(sh) -- (err_badarraysub: report_error)
-				sh.status = 1
-				error({ __curse_exit = 1, __curse_lineabort = true })
-			end
-		end
-		if rb and rb.ro then -- readonly: reject the assignment (status 1); fatal in `sh -c`
-			-- (or posix mode). Through a nameref bash names the TARGET.
-			io.stderr:write("curse: " .. sh:deref(st.name) .. ": readonly variable\n")
-			rt.report_exit(sh) -- (err_readonly: report_error)
-			sh.status = 1
-			if sh.opt_c or sh.opt_posix then
-				error({ __curse_exit = 1 })
-			end
-			-- A readonly command PREFIX (`abc=def echo one`) is non-fatal: bash still runs
-			-- the command. But a STANDALONE readonly assignment (`readonly x=1; x=2; echo
-			-- hi`) aborts the REST of the line, then the next line runs.
-			if sh.applying_prefix then
-				return
-			end
-			error({ __curse_exit = 1, __curse_lineabort = true })
-		else
-			-- A bad substitution / invalid indirect in the RHS fails the assignment but is
-			-- NON-fatal (bash: `x=${bad|y}` leaves x unset, status 1, script continues) —
-			-- like a bad-subst in a command word. Catch it around the RHS expansion.
-			-- (the expanded right-hand side, kept for set -x's `name+=value` trace)
-			sh.x_rhs = nil
-			local xps4 = sh.opt_x and st.name == "PS4" and sh:get("PS4") -- (traced under the old one)
-			local aok, aerr = pcall(assign_body, sh, st, nref_base, nref_sub)
-			if xps4 and aok then
-				sh.xtrace_ps4 = xps4
-			end
-			if not aok then
-				if type(aerr) == "table" and aerr.__curse_badsub then -- (`c[-5]=v`: aborts the line)
-					io.stderr:write("curse: " .. st.name .. "[" .. tostring(st.index) .. "]: bad array subscript\n")
-					rt.report_exit(sh) -- (err_badarraysub: report_error)
-					sh.status = 1
-					sh.assign_err = true
-					error({ __curse_exit = 1, __curse_lineabort = true })
-				elseif type(aerr) == "table" and aerr.__curse_experr and not aerr.__curse_lineabort then
-					sh.status = 1
-					sh.assign_err = true
-					return -- bad-subst RHS: non-fatal
-				else
-					error(aerr)
-				end -- a real error (exit, nounset, matherr) propagates
-			end
-		end
-		-- set -x: trace the assignment with its expanded value (`+ x=5`, `+ a[1]=v`)
-		if sh.opt_x and st.append and sh.x_rhs then -- `+ foo+=two` (bash traces the appended text)
-			xtrace(sh, { (st.index and (st.name .. "[" .. st.index .. "]") or st.name) .. "+="
-				.. (sh.x_rhs == "" and "" or xtrace_quote(sh.x_rhs)) }, true)
-		end
-		if sh.opt_x and not st.append then
-			local v = sh.x_rhs -- (the expanded word, as bash prints it: `n=1+1` for an -i n)
-			if v then
-			elseif st.index then
-				v = sh:get(st.name .. "[" .. st.index .. "]") or ""
-			else
-				v = sh:get(st.name) or ""
-			end
-			xtrace(sh, { (st.index and (st.name .. "[" .. st.index .. "]") or st.name) .. "=" .. (v == "" and "" or xtrace_quote(v)) }, true)
-		end
-		sh.xtrace_ps4 = nil
-		-- set -a (allexport): a plain scalar assignment auto-exports the variable
-		if sh.opt_a and not st.index then
-			local b = sh.vars[sh:deref(st.name)]
-			if b and not b.arr then
-				b.exported = true
-				C.setenv(st.name, sh:get(st.name), 1)
-			end
-		end
-		-- HISTSIZE shrinks the in-memory history; HISTFILESIZE truncates $HISTFILE —
-		-- both to the last N entries, on assignment (bash).
-		if not st.index and (st.name == "HISTSIZE" or st.name == "HISTFILESIZE") then
-			local nsz = tonumber(sh:get(st.name))
-			if nsz and nsz >= 0 then
-				if st.name == "HISTSIZE" and sh.history then
-					require("hist").stifle(sh) -- (the oldest go; numbering moves on)
-				elseif st.name == "HISTFILESIZE" then
-					local hf = sh:get("HISTFILE")
-					if hf and hf ~= "" then
-						local lines, f = {}, io.open(hf, "r")
-						if f then
-							for l in f:lines() do
-								lines[#lines + 1] = l
-							end
-							f:close()
-						end
-						if #lines > nsz then
-							local o = io.open(hf, "w")
-							if o then
-								for k = #lines - nsz + 1, #lines do
-									o:write(lines[k], "\n")
-								end
-								o:close()
-							end
-						end
-					end
-				end
-			end
-		end
-		-- exit status of an assignment = the last command substitution's, else 0
-		-- (skip when it was a rejected readonly assignment, which already set status 1)
-		-- (sh.ncs counts substitutions performed — also ones nested in ${…}, a subscript)
-		if not (rb and rb.ro) then
-			sh.status = sh.ncs ~= ncs0 and sh.last_cmdsub_status or 0
-		end
-		sh:set_str("_", "") -- a bare assignment resets $_ to empty (bash)
-		sh:array_assign("PIPESTATUS", { tostring(sh.status) }, false) -- (PIPESTATUS: this null command's status)
-		if sh.procsub_files then -- (`x=<(…)`: a null command closes its <() when it ends)
-			rt.assign_drain(sh, st, pnf)
 		end
 	elseif t == "arrayassign" then
 		if sh.opt_x and st.raw then -- (bash traces an array literal as written: `+ a=(1 "b c")`)
 			xtrace_line(sh, st.name .. (st.append and "+=" or "=") .. rt.srcw(st.raw))
 		end
-		local rb = sh.vars[sh:deref(st.name)]
-		local nb = sh.vars[st.name]
-		if nb and nb.ref and nb.s and nb.s:find("[", 1, true) then
-			-- a nameref to an element/`a[@]`: an array literal can't be written through it
-			io.stderr:write("curse: `" .. nb.s .. "': not a valid identifier\n")
-			sh.status = 1
-		elseif st.index then -- `a[0]=(1 2)`: can't assign a list to an array MEMBER (bash)
-			io.stderr:write("curse: " .. st.name .. "[" .. st.index .. "]: cannot assign list to array member\n")
-			sh.status = 1
-			error({ __curse_exit = 1, __curse_lineabort = true }) -- (and abandons the line: bash)
-		elseif rb and rb.ro then -- readonly array: reject the (re)assignment — and, like a
-			-- scalar's, abort the rest of the line (fatal under -c/posix)
-			io.stderr:write("curse: " .. st.name .. ": readonly variable\n")
-			rt.report_exit(sh) -- (err_readonly: report_error)
-			sh.status = 1
-			error({ __curse_exit = 1, __curse_lineabort = not (sh.opt_c or sh.opt_posix) or nil })
+		if st.index then -- `a[0]=(1 2)`: can't assign a list to an array MEMBER (bash)
+			rt.arrayassign_member(sh, st.name, st.index)
 		else
 			-- a failglob no-match inside `a=(*.ZZ)` fails the assignment non-fatally (bash)
 			local ncs0 = sh.ncs
 			local pnf = sh.procsub_files and #sh.procsub_files or 0
-			local aok, aerr = pcall(do_arrayassign, sh, st)
-			if aok then
-				sh.status = sh.ncs ~= ncs0 and sh.last_cmdsub_status or 0 -- (`a=( $(exit 3) )`: 3)
-				sh:set_str("_", "")
+			local stored = rt.arrayassign_stmt(sh, st.name, nil, st.append, st)
+			if stored then
+				if sh.ncs ~= ncs0 then -- (`a=( $(exit 3) )`: 3)
+					sh.status = sh.last_cmdsub_status
+				end
 				sh:array_assign("PIPESTATUS", { tostring(sh.status) }, false)
 				if sh.procsub_files then -- (`a=( <(…) )`: closed when the assignment ends)
 					rt.assign_drain(sh, st, pnf)
 				end
-			elseif type(aerr) == "table" and aerr.__curse_experr and not aerr.__curse_lineabort then
-				sh.status = 1
-				if sh.opt_e then
-					error({ __curse_exit = 1 })
-				end
-			else
-				error(aerr)
+			elseif stored == false and sh.opt_e then
+				error({ __curse_exit = 1 })
 			end
 		end
 	elseif t == "funcdef" then
-		-- a funcdef whose name is an expansion (`$foo-bar()`) is a NON-fatal runtime
-		-- error (bash: status 1) — the name was captured raw by the parser. bash is
-		-- otherwise lenient (a literal `=` in the name is fine: `func-name=ext`).
-		local badname = not st.name:match("^[%w_:%.+@/%%%^~,!][%w_%.%-:+@/!#=%%%^~,%[%]]*$")
-		if badname or (sh.opt_posix and not st.name:match("^[%a_][%w_]*$")) then
-			rt.ierr = true -- (check_identifier's internal_error)
-			rt.err_at(sh, st.top and st.eline, "curse: `" .. st.name .. "': not a valid identifier\n")
-			sh.status = 1
-			if not badname and not sh.opt_i then -- (posix: a fatal error)
-				error({ __curse_exit = 2 })
-			end
-			return
-		end
-		if sh.fn_ro and sh.fn_ro[st.name] then -- `readonly -f`: can't be redefined
-			rt.err_at(sh, st.top and st.eline, "curse: " .. st.name .. ": readonly function\n")
-			sh.status = 1
-			return
-		end
-		if sh.opt_posix and SPECIAL_BUILTIN[st.name] then -- posix: can't shadow a special builtin
-			io.stderr:write("curse: `" .. st.name .. "': is a special builtin\n")
-			sh.status = 2
-			error({ __curse_exit = 2 }) -- fatal (bash aborts)
-		end
-		sh.functions[st.name] = st.body
-		sh.func_redirs = sh.func_redirs or {}
-		sh.func_redirs[st.name] = st.redirs -- `f(){ … } >&2`
-		sh.func_src = sh.func_src or {}
-		sh.func_src[st.name] = nil -- printed text: deparsed from the definition on demand
-		sh.func_def = sh.func_def or {}
-		sh.func_def[st.name] = st
-		if sh.fexport and sh.fexport[st.name] then
-			rt.fexport_sync(sh, st.name) -- a redefinition re-exports the new body
-		end
-		-- definition site for `declare -F` under extdebug (name line file)
-		sh.func_line = sh.func_line or {}
-		sh.func_line[st.name] = st.line
-		sh.func_bline = sh.func_bline or {}
-		sh.func_bline[st.name] = st.bline
-		sh.func_file = sh.func_file or {}
-		sh.func_file[st.name] = rt.def_source(sh)
-		sh.status = 0
+		rt.def_function(sh, st) -- (the one registration, shared with the compiled tier)
 	elseif t == "assignlist" then
 		-- a bad array subscript / bad-subst in one binding aborts the REST of the list
 		-- (bash: `a=x b[0+]=y c=z` sets only a), keeping the error status.
@@ -5816,337 +5423,11 @@ exec_stmt = function(sh, st, hook)
 			drain_procsub(sh, pnp, pnf) -- (`x=<(…) $empty`: closed as the null command ends)
 			return
 		end
-		if st.arrayargs then -- `declare -A a=(...)` / `local -a b=(...)` array literals
-			-- Only append the names now (so `declare -A a=(...)` isn't seen as a bare
-			-- listing and so `local`/`declare` establishes the scope + attributes). The
-			-- actual array assignment happens AFTER the builtin runs (below), so it lands
-			-- in the freshly-declared/local variable.
-			-- A name ALREADY readonly: bash's compound assignment fails as the words expand,
-			-- before the builtin runs — `ra: readonly variable`, the rest of the line
-			-- abandoned — unless the builtin makes a new local (a function's declare/local)
-			local dcl, glob = args[1], false
-			for k = 2, #args do
-				glob = glob or args[k]:match("^%-%a*[gG]") ~= nil
-			end
-			local localize = dcl == "local" or ((dcl == "declare" or dcl == "typeset") and (sh.calldepth or 0) > 0 and not glob)
-			for _, aa in ipairs(st.arrayargs) do
-				args[#args + 1] = aa.name
-				local b = sh.vars[sh:deref(aa.name)]
-				if b and b.ro and not localize then
-					io.stderr:write("curse: " .. aa.name .. ": readonly variable\n")
-					rt.report_exit(sh) -- (err_readonly: report_error)
-					sh.status = 1
-					error({ __curse_exit = 1, __curse_lineabort = true })
-				elseif b and b.ro and sh:is_global_ro(sh:deref(aa.name)) then
-					-- `local ro=(…)`: bash's compound assignment fails first, then local's own error
-					-- (the first under this_command_name — still the calling FUNCTION's name)
-					local fnm = sh.funcstack and sh.funcstack[1]
-					io.stderr:write("curse: " .. (fnm and (fnm .. ": ") or "") .. aa.name .. ": readonly variable\n")
-				end
-			end
-			-- (names with a NAME=(…) literal: declare -g keeps its global view until they're
-			-- assigned, and a failed kind conversion reports/skips them bash's way)
-			sh.arrayargs_pending = {}
-			local wantassoc = false
-			for k = 2, #args do
-				if args[k]:match("^%-%a*A") then
-					wantassoc = true
-				end
-			end
-			sh.arrayargs_pre = {}
-			for _, aa in ipairs(st.arrayargs) do
-				sh.arrayargs_pending[aa.name] = true
-				sh.arrayargs_pre[aa] = arrayassign_items(sh, aa, wantassoc or sh:is_assoc(sh:deref(aa.name)))
-			end
-		end
-		-- `exec [redirs] [cmd…]`: redirections are permanent (not restored). With no
-		-- command it just rewires the shell's own fds (e.g. `exec 3>file`); with a
-		-- command it replaces the shell process with that command.
-		local viacmd -- (`command exec`: a special builtin's posix-mode fatal errors don't apply)
-		while (args[1] == "command" or args[1] == "builtin") and args[2] == "exec" and not sh.functions[args[1]] do
-			viacmd = viacmd or args[1] == "command"
-			table.remove(args, 1) -- `command exec 2>f`: still exec, its redirections persist
-		end
-		local isexec = args[1] == "exec"
-		local tenv_base -- set while this command's prefix bindings sit on sh.tenv
-		local function run_cmd()
-			sh.write_err = nil -- a builtin sets this on an output write error (e.g. full disk)
-			-- `set -x` trace: BEFORE the command's own redirects, so `cmd 2>file` doesn't
-			-- capture the trace (bash writes it to the shell's stderr).
-			if sh.opt_x and args[1] ~= nil then
-				if st.arrayargs and sh.arrayargs_pre then -- (`+ b=('4' '5 6')` before `+ declare -a b`)
-					for _, aa in ipairs(st.arrayargs) do
-						if sh.arrayargs_pre[aa] then
-							rt.xtrace_arrlit(sh, aa.name, sh.arrayargs_pre[aa])
-						end
-					end
-				end
-				xtrace(sh, args)
-			end
-			-- `exec [redirs] [cmd…]` (b_exec): its redirections PERSIST (not restored) and
-			-- a command replaces the shell. Here, under the prefix bindings (a temporary
-			-- env — posix: they persist, exec being a special builtin)
-			if isexec then
-				return require("b_exec")(sh, st, args, hook, viacmd)
-			end
-			if st.redirs then
-				local save, ok
-				if tenv_base and #sh.tenv > tenv_base then
-					-- the redirections don't see the command's own prefix bindings (bash:
-					-- `a=2 cmd >&$a` uses the outer a) — unshadow them while they expand
-					local shadow = {}
-					for k = #sh.tenv, tenv_base + 1, -1 do
-						local te = sh.tenv[k]
-						shadow[#shadow + 1] = { te.name, sh.vars[te.name] }
-						sh.vars[te.name] = te.box or nil
-					end
-					local rok, a1, a2 = pcall(apply_redirs, sh, st.redirs, args[1], nil, args)
-					for i = #shadow, 1, -1 do
-						sh.vars[shadow[i][1]] = shadow[i][2]
-					end
-					if not rok then
-						error(a1)
-					end
-					save, ok = a1, a2
-				else
-					save, ok = apply_redirs(sh, st.redirs, args[1], nil, args)
-				end
-				if not ok then
-					sh.status = 1
-					restore_redirs(save) -- open failed: skip the command
-					if sh.opt_posix and SPECIAL_BUILTIN[args[1]] and not sh.opt_i then
-						error({ __curse_exit = 1 }) -- (EX_REDIRFAIL: a special builtin's is fatal)
-					end
-				else
-					-- Only route builtin/captured output to the real fd 1 when a redirect
-					-- actually targets stdout; a stdin-only redirect (heredoc, `<`) must not
-					-- steal fd-1 output away from a $(...) capture buffer.
-					local savedout = sh.out
-					if redirs_touch_stdout(st.redirs) then
-						sh.out = io.write
-					end
-					local pok, err = pcall(exec_simple, sh, args, hook)
-					io.flush()
-					sh.out = savedout
-					restore_redirs(save)
-					if pok and sh.write_err then
-						rt.chkwrite_late(sh, args[1])
-					end -- builtin hit a write error
-					if not pok then
-						error(err)
-					end
-				end
-			else
-				exec_simple(sh, args, hook)
-				if sh.write_err then
-					rt.chkwrite_late(sh, args[1])
-				end -- builtin hit a write error (e.g. full disk)
-			end
-		end
-		if st.assigns and sh.opt_posix and args[1] and SPECIAL_BUILTIN[args[1]] and not viacmd then
-			-- POSIX (bash under `set -o posix`): a variable assignment prefixed to a
-			-- SPECIAL builtin (`:`, `.`, eval, export, readonly, set, shift, trap,
-			-- unset, …) PERSISTS in the shell — and, being a command prefix, stays
-			-- EXPORTED (`foo=bar readonly …` then `printenv foo` -> bar; `x=tmp :`
-			-- leaves x=tmp in the environment).
-			-- EXCEPTION, per variable: if the builtin is `unset` and it removes a var we
-			-- just assigned, that var REVERTS to its prior value rather than persisting
-			-- (`a=A x=tmp unset x` → a=A, x=<prior>); other assigns still persist.
-			local prior = {}
-			for _, a in ipairs(st.assigns) do
-				if prior[a.name] == nil then
-					local b = sh.vars[a.name]
-					prior[a.name] = b
-							and {
-								s = b.s,
-								n = b.n,
-								arr = b.arr,
-								assoc = b.assoc,
-								order = b.order,
-								exported = b.exported,
-								ro = b.ro,
-								ref = b.ref,
-							}
-						or false
-				end
-			end
-			for _, a in ipairs(st.assigns) do
-				-- it propagates through any temporary binding of the name (`var=30 f` where
-				-- f does `var=20 return`): that binding's end mustn't restore the old value
-				for _, te in ipairs(sh.tenv) do
-					if te.name == a.name then
-						te.consumed = true
-					end
-				end
-				if a.raw then
-					sh:set_str(a.name, a.raw)
-				else
-					sh.applying_prefix = true
-					exec_stmt(sh, a, hook)
-					sh.applying_prefix = nil
-				end
-				if not a.index then -- a scalar command prefix stays exported (bash)
-					local b = sh.vars[sh:deref(a.name)]
-					if b then
-						b.exported = true
-					end
-					C.setenv(a.name, sh:get(a.name), 1)
-				end
-			end
-			run_cmd()
-			for name, box in pairs(prior) do
-				if sh.vars[name] == nil then
-					sh.vars[name] = box or nil
-				end -- unset → revert
-			end
-		elseif st.assigns then
-			-- prefix assignments: apply as a temporary, EXPORTED env for this command
-			-- only, then restore (both the shell var and the process env). Each binding
-			-- is pushed onto sh.tenv (LIFO) so an `unset` inside the command reveals the
-			-- shadowed value beneath instead of leaving the name unset (bash dynamic
-			-- scope); a consumed entry is skipped on restore.
-			local base = #sh.tenv
-			for _, a in ipairs(st.assigns) do
-				if a.index then
-					-- An array-element assignment (`a[i]=v cmd`) is NOT a valid command-prefix
-					-- binding: bash prints "not a valid identifier" and does NOT apply it (the
-					-- command still runs, non-fatal). Skip it entirely — no tenv, no mutation.
-					io.stderr:write("curse: `" .. a.name .. "[" .. tostring(a.index) .. "]': not a valid identifier\n")
-				else
-					local rb = sh.vars[a.name]
-					if rb and rb.ref and rb.s and rb.s:match("^[%a_][%w_]*$") and sh:deref(a.name) ~= "" then
-						-- through a nameref WITH a target, the binding is the target's (bash:
-						-- `ref=x cmd` exports var=x; ref itself is untouched)
-						a = setmetatable({ name = sh:deref(a.name) }, { __index = a })
-					end
-					local b = sh.vars[a.name] -- COPY the box: exec_stmt mutates it in place
-					sh.vseq = sh.vseq + 1
-					sh.tenv[#sh.tenv + 1] = {
-						name = a.name,
-						env = os.getenv(a.name),
-						consumed = false,
-						seq = sh.vseq,
-						-- (`z=y typeset z` in a function: the local it makes absorbs this binding)
-						decl_pd = (args[1] == "local" or args[1] == "declare" or args[1] == "typeset") and sh.pd or nil,
-						box = b and {
-							s = b.s,
-							n = b.n,
-							arr = b.arr,
-							assoc = b.assoc,
-							order = b.order,
-							exported = b.exported,
-							ro = b.ro,
-							ref = b.ref,
-							int = b.int,
-							lower = b.lower,
-							upper = b.upper,
-							cap = b.cap,
-							trace = b.trace,
-						} or false,
-					}
-					-- a NAMEREF's prefix binding is a plain temporary of its own (bash: the target
-					-- is untouched; restored below), and so is an array's (shadowed, not element 0) or an -i/-l/-u/-c var's: bash's tempenv
-					-- variable is a plain string (`i=1+1 cmd` passes "1+1")
-					-- (`n+=3 cmd` on a -i var: the sum, 8, bound as a plain string — bash's
-					-- make_variable_value appends arithmetically first)
-					local iapp = b and b.int and a.append and not b.arr and not b.ref and not a.raw
-					if b and not iapp and (b.ref or (not b.ro and (b.arr or b.int or b.lower or b.upper or b.cap))) then
-						if b.ref and rt.arith_ref_circ(sh, a.name, 0) == true then -- (a cycle: bash warns,
-							io.stderr:write("curse: warning: " .. a.name .. ": circular name reference\n") -- then binds)
-						end
-						sh.vars[a.name] = {}
-					end
-					if a.raw then -- NAME=(…) as a command prefix is a literal string, not an array (bash)
-						sh:set_str(a.name, a.raw)
-						C.setenv(a.name, a.raw, 1)
-					else
-						sh.applying_prefix = true
-						if rt.LOCALE_VARS[a.name] then
-							rt.lc_quiet = rt.prefix_ext(sh, args[1])
-						end
-						exec_stmt(sh, a, hook)
-						rt.lc_quiet = nil
-						sh.applying_prefix = nil
-						if iapp and sh.vars[a.name] == b and not b.ro then
-							sh.vars[a.name] = { s = sh:get(a.name), exported = b.exported }
-						end
-						C.setenv(a.name, sh:get(a.name), 1)
-					end
-					sh.tenv[#sh.tenv].tval = sh:get(a.name) -- (did the command write it? prefix_keeps)
-					do -- (a prefix binding is in the environment: `declare -p` shows -x)
-						local nb = sh.vars[sh:deref(a.name)]
-						if nb then
-							nb.exported = true
-						end
-					end
-				end
-			end
-			-- mark these entries so a DIRECT function call (not `eval`/a builtin) can tag
-			-- them with its frame: `local x` absorbs only its OWN call's tempenv.
-			sh.tenv_call_base = base
-			tenv_base = base
-			local ok, err = pcall(run_cmd)
-			tenv_base = nil
-			sh.tenv_call_base = nil
-			local keeps = rt.prefix_keeps(sh, args)
-			for k = #sh.tenv, base + 1, -1 do
-				local s = sh.tenv[k]
-				sh.tenv[k] = nil
-				if not s.consumed then -- an `unset` inside the command already revealed it
-					local nv = keeps and sh:get(s.name)
-					sh.vars[s.name] = s.box or nil
-					if s.env then
-						C.setenv(s.name, s.env, 1)
-					else
-						C.unsetenv(s.name)
-					end
-					if nv and nv ~= s.tval then -- (a builtin's write reached the variable beneath)
-						sh:set_str(s.name, nv)
-					end
-					if rt.LOCALE_VARS[s.name] then -- (`LANG=C cmd`: the locale follows the variable back)
-						rt.reset_locale(sh, s.name)
-					end
-					if s.name == "GLOBIGNORE" then
-						rt.setup_glob_ignore(sh) -- (the binding going away re-applies sv_globignore)
-					end
-				end
-			end
-			rt.env_rebuilt(sh) -- (dispose_used_env_vars: the environ, without them)
-			if not ok then
-				error(err)
-			end
-		else
-			run_cmd()
-		end
-		-- Array literals for a declaration builtin are assigned AFTER it runs, so a
-		-- `local a=(…)` / `declare -A a=(…)` lands in the now-local/assoc variable.
-		-- Skip when the builtin failed (e.g. a rejected -A/-a type change): the array
-		-- must stay untouched, not be mangled by the literal.
-		local aaskip = sh.arrayargs_pending and sh.arrayargs_pending.skip
-		local aaforce = sh.arrayargs_pending and sh.arrayargs_pending.force -- (assigned even so)
-		if st.arrayargs and (sh.status == 0 or aaforce) then
-			local failed = sh.status ~= 0
-			for _, aa in ipairs(st.arrayargs) do
-				if failed and not aaforce[aa.name] then
-				elseif aaskip and aaskip[aa.name] then -- (a rejected kind conversion: untouched)
-				else
-					do_arrayassign(sh, aa)
-				end
-			end
-		end
-		sh.arrayargs_pending = nil
-		sh.arrayargs_pre = nil
-		if sh.pending_unswap then -- (declare -g: back to the caller's locals)
-			local f = sh.pending_unswap
-			sh.pending_unswap = nil
-			f()
-		end
-		-- $_ : the last argument (after expansion) of the command just run.
-		if #args > 0 then
-			sh:set_str("_", args[#args])
-		end
-		-- PIPESTATUS for a simple command is a one-element array of its exit status.
-		sh:array_assign("PIPESTATUS", { tostring(sh.status) }, false)
+		-- the prefix bindings, a declaration builtin's NAME=(…) literals, the command (its
+		-- set -x trace, its redirections, `exec`), $_ and PIPESTATUS: the simple-command
+		-- runner the compiled tier shares (rt.sr_run)
+		rt.sr_run(sh, args, SIMPLE.spec[st] or SIMPLE.new_spec(st), st.assigns and SIMPLE.bind or nil, hook, nil,
+			st.redirs and SIMPLE.redirs or nil)
 		drain_procsub(sh, pnp, pnf) -- feed >() temps, clean up <()/>() temp files
 	elseif t == "forc" then
 		-- DEBUG fires (at the `for` line) before the init, before EACH condition
@@ -6616,25 +5897,6 @@ exec_stmt = function(sh, st, hook)
 			sh.status = 0
 			return
 		end
-		local function menu()
-			local width = #tostring(#list)
-			for k, item in ipairs(list) do
-				io.stderr:write(("%" .. width .. "d) %s\n"):format(k, item))
-			end
-		end
-		local function readline()
-			local buf = {}
-			while true do
-				local ch = fd_getc(0)
-				if ch == nil then
-					return #buf > 0 and table.concat(buf) or nil
-				end
-				if ch == "\n" then
-					return table.concat(buf)
-				end
-				buf[#buf + 1] = ch
-			end
-		end
 		local bodystatus = 0
 		sh.loopdepth = (sh.loopdepth or 0) + 1
 		if sh.opt_x then -- (traced before the DEBUG trap runs: execute_select_command)
@@ -6644,35 +5906,17 @@ exec_stmt = function(sh, st, hook)
 			head(sh, st, head(nil, st, "select"))
 			run_debug(sh, (sh.in_trap and sh.in_trap > 0 and (sh.calldepth or 0) == sh.trap_calldepth) and sh.cur_line or st.line)
 		end
-		menu()
+		rt.select_menu(sh, list)
 		while true do
 			hook("loop", st.id)
-			if PREEMPT[0] ~= 0 then
-				rt.preempt()
-			end
-			io.flush()
-			io.stderr:write(sh.vars["PS3"] and sh:get("PS3") or "#? ")
-			local line = readline()
-			if line == nil then -- EOF: end the loop (bash prints a newline — to STDOUT — status 1)
-				sh.out("\n")
-				bodystatus = 1
+			if not rt.select_next(sh, list, st.name) then -- (the prompt/read/REPLY/NAME round: EOF
+				bodystatus = 1 -- or a readonly NAME ends the loop, status 1)
 				break
 			end
-			if line == "" then
-				menu()
-			else
-				sh:set_str("REPLY", line)
-				local nsel = line:match("^%s*(%d+)%s*$")
-				nsel = nsel and tonumber(nsel)
-				if rt.for_var_ro(sh, st.name) or sh:set_str(st.name, (nsel and list[nsel]) or "") == false then
-					bodystatus = 1
-					break
-				end
-				local act = run_loop_body(sh, st.body, hook)
-				bodystatus = sh.status
-				if act == "break" then
-					break
-				end
+			local act = run_loop_body(sh, st.body, hook)
+			bodystatus = sh.status
+			if act == "break" then
+				break
 			end
 		end
 		sh.loopdepth = sh.loopdepth - 1
@@ -7520,9 +6764,10 @@ M._int = {
 	read_split = read_split,
 	do_arrayassign = do_arrayassign,
 	arrayassign_items = arrayassign_items,
+	literal_sub = literal_sub,
 	expand_word = expand_word,
 	drain_procsub = drain_procsub,
-	xtrace_quote = xtrace_quote,
+	xtrace_quote = rt.xtrace_quote,
 	unset_arrayref = unset_arrayref,
 	eval = eval,
 	fmt_decl = fmt_decl,
