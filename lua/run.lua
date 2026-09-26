@@ -1,8 +1,8 @@
--- curse LuaJIT-backend entry point.
---   luajit lua/run.lua <script.sh> [tiered|compiled|interp]
--- Modes:
---   tiered   (default) interpret from t=0 while a detached process transpiles,
---            then OSR into the compiled Lua. Needs $CURSE_LUAJIT (or "luajit").
+-- curse LuaJIT-backend entry point (the sh CLI; the static binary runs this).
+--   luajit lua/run.lua <script.sh> [tiered|compiled|interp] [args…]
+-- Modes (dev form: a mode keyword right after the script):
+--   tiered   (default) interpret, switching to compiled code where a loop turns hot
+--            (the daemon's path; -c CODE always runs this way).
 --   compiled transpile + load + run (no interpreter window) — steady-state speed.
 --   interp   pure tree-walking interpreter.
 -- Prefer a precompiled bytecode bundle (one file open, no source parsing —
@@ -11,7 +11,8 @@
 -- The bundle registers all curse modules into package.preload. A self-contained
 -- static binary has it EMBEDDED (curse_load_bundle in luajit.c ran it before us),
 -- so the modules are already preloaded — skip the disk load entirely. Otherwise
--- load dist/curse.bc from disk, falling back to source on the package path.
+-- load $CURSE_BUNDLE (default dist/curse.bc) from disk, falling back to source on the
+-- package path.
 if not package.preload["tier"] then
 	-- Source fallback path, made ABSOLUTE from the startup cwd: modules (incl. the
 	-- lazy b_* builtins) may require() mid-script, after the script has cd'd, so a
@@ -37,8 +38,8 @@ if not package.preload["tier"] then
 end
 -- Require only what the chosen mode needs. runtime + interp (which pulls parser)
 -- cover the interp and interactive paths; the compile/tier machinery (tier -> emit
--- + cache, ~0.18ms of load+init) is pulled in lazily ONLY by the compiled/tiered/
--- cached branches below. A plain `interp` or interactive start never loads emit.
+-- + cache, ~0.18ms of load+init) is pulled in lazily ONLY by the compiled/tiered
+-- branches below. A plain `interp` or interactive start never loads emit.
 local rt = require("runtime")
 local interp = require("interp")
 local Invoke = require("invoke") -- the invocation (options, startup files): shared with the daemon
@@ -57,7 +58,7 @@ end
 
 -- Dev form: `run.lua SCRIPT MODE [args]` — a mode keyword right after the script picks the
 -- execution tier (else it and the rest are the script's positional parameters).
-local MODES = { tiered = true, compiled = true, interp = true, cached = true }
+local MODES = { tiered = true, compiled = true, interp = true }
 
 local function finish(sh)
 	-- Propagate $? as the process exit code (so `exit N`, `false`, etc. are visible to
@@ -100,13 +101,6 @@ elseif kind == "code" or mode == "tiered" then
 	local T = require("tier")
 	T.run_tiered(src, sh)
 	pcall(T.flush_stores)
-elseif mode == "cached" then
-	-- persistent artifact cache: warm hit skips parse+emit; cold compiles+stores; any
-	-- cache failure falls back to running uncached (reported on stderr for visibility)
-	local _, how = require("cache").run(src, sh)
-	if os.getenv("CURSE_CACHE_DEBUG") then
-		io.stderr:write("[cache: " .. how .. "]\n")
-	end
 elseif mode == "compiled" then
 	local T = require("tier") -- pulls emit + cache; only the compiled path needs them
 	-- The compiler THROWS `curse-nocompile:` for a program it can't faithfully compile

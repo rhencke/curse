@@ -3,8 +3,7 @@
 -- command's prefix bindings in effect (a temporary env; posix: they persist).
 local ffi = require("ffi")
 local rt = require("runtime")
-local M = require("interp")
-local I = M._int
+local I = require("interp")._int
 local apply_redirs, restore_redirs, C = I.apply_redirs, I.restore_redirs, I.C
 
 -- bash's full_pathname (general.c): an absolute name as is, else under the (logical) cwd

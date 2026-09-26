@@ -7532,7 +7532,7 @@ H.arrayassign = function(cx, st, after)
 	-- items natively — a bare word field-splits via the field engine into {val=field}
 	-- entries, a keyed element renders {key,op,val} — then store via rt.arrayassign. No
 	-- interp: keyed subscripts are gated to literals (resolved by arith_str/verbatim).
-	if st.index then -- `a[i]=(…)`: an error that abandons the line (interp's run_arrayassign)
+	if st.index then -- `a[i]=(…)`: an error that abandons the line (interp's arrayassign branch)
 		local p = cx.newpc()
 		cx.blocks[p] = dbg(st) .. ("rt.arrayassign_member(sh, %q, %q); pc = %d"):format(st.name, st.index, after)
 		return p

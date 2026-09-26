@@ -14,11 +14,10 @@ local bit = require("bit")
 
 local M = {}
 
--- `set -o NAME` / short-flag maps for the `set` builtin (and shopt -o).
--- Ordered list mirrors bash's `set -o` output order.
--- Shell `set` option machinery lives in runtime now (option state is runtime data);
--- import it back so interp and the set/shopt builtins (via _int) keep using these names.
-local SETOPTS, SETOPT, SETFLAG, SETDEFAULT, opt_on = rt.SETOPTS, rt.SETOPT, rt.SETFLAG, rt.SETDEFAULT, rt.opt_on
+-- `set -o NAME` / short-flag maps for the `set` builtin (and shopt -o). The option
+-- machinery lives in runtime (option state is runtime data); interp and the set/shopt
+-- builtins (via _int) use it under these names.
+local SETOPTS, SETOPT, SETFLAG, opt_on = rt.SETOPTS, rt.SETOPT, rt.SETFLAG, rt.opt_on
 local function set_opt(sh, field, on)
 	local was = sh[field]
 	sh[field] = on
@@ -457,12 +456,11 @@ end
 -- ${…} operators whose default/alternate word is expanded lazily (only when used).
 local TESTOP = { ["-"] = 1, [":-"] = 1, ["+"] = 1, [":+"] = 1, ["="] = 1, [":="] = 1, ["?"] = 1, [":?"] = 1 }
 
--- ---- `test` / `[` builtin ----
+-- libc (and curse's own lib_cursesig) entry points the interpreter and the builtins call
 ffi.cdef([[
   int access(const char *path, int mode);
   int chdir(const char *path);
   int curse_stat(const char *path, void *buf) asm("stat");
-  int curse_lstat(const char *path, void *buf) asm("lstat");
   int isatty(int fd);
   int fork(void);
   int dup2(int oldfd, int newfd);
@@ -477,8 +475,6 @@ ffi.cdef([[
   unsigned long confstr(int name, char *buf, unsigned long len);
   long long strtoll(const char *nptr, char **endptr, int base);
   unsigned long long strtoull(const char *nptr, char **endptr, int base);
-  struct curse_passwd { char *pw_name; char *pw_passwd; unsigned int pw_uid; unsigned int pw_gid; char *pw_gecos; char *pw_dir; char *pw_shell; };
-  struct curse_passwd *getpwnam(const char *name);
   int sigemptyset(void *set);
   int sigprocmask(int how, const void *set, void *oldset);
   /* curse async signal handling (lib_cursesig.c): a real handler installed without
@@ -487,10 +483,6 @@ ffi.cdef([[
   int curse_sig_default(int signum);
   int curse_sig_ignore(int signum);
   void curse_sig_clearpending(void);
-  void curse_sig_hold(int hold);
-  struct curse_passwd *getpwent(void);
-  void setpwent(void);
-  void endpwent(void);
   int kill(int pid, int sig);
   unsigned int geteuid(void);
   unsigned int getegid(void);
@@ -732,15 +724,6 @@ local function sig_order(canon)
 	local nm = canon:gsub("^SIG", "")
 	return SIGNUM[nm] or tonumber(nm) or 99
 end
--- A forked subshell (background `&`, `( )`, a pipeline stage, `>(…)`) resets
--- CAUGHT signal traps to their default DISPOSITION, like bash — the handler no
--- longer fires when the signal arrives (e.g. `kill -URG $!` after `trap … URG`).
--- bash's reset is deferred, though: `trap`/`trap -p` in the subshell still
--- DISPLAYS the inherited handler strings, so keep sh.traps[canon] and only drop
--- the entry from sh.sigtraps (which drives firing) and unblock the signal. A
--- signal set to be ignored (`trap '' SIG`) keeps both its ignore disposition and
--- its display.
-local function NOHOOK() end -- (an OSR hook that never switches)
 -- The hook for an isolated context (subshell, $(…), pipeline stage, background job):
 -- no switch of the whole program (it mustn't unwind past the context's checkpoint), but
 -- a hot loop may still run compiled on its own — tier installs M.frag_hook when loaded.
@@ -750,41 +733,16 @@ local function SUBHOOK(kind, id, st, sh)
 		return f(kind, id, st, sh)
 	end
 end
-local function reset_child_sigtraps(sh)
-	if not sh.sigtraps then
-		return
-	end
-	local kept
-	for canon in pairs(sh.sigtraps) do
-		if sh.traps[canon] == "" then -- ignored: keep ignore disposition and display
-			kept = kept or {}
-			kept[canon] = true
-		else -- caught: revert to default disposition, but keep the string for `trap -p`
-			local num = SIGNUM[canon:match("^SIG(.+)$") or ""]
-			if num then
-				block_sig(num, false)
-			end -- restore default so the default action applies
-		end
-	end
-	sh.sigtraps = kept
-	-- Handlers are now default; discard any trap the child caught in the fork→reset
-	-- window (e.g. `cmd & ; kill -SIG $!`) so it doesn't fire a spurious trap.
-	C.curse_sig_clearpending()
-end
 
--- file predicates + mtime/inode compares moved to runtime (pure stat FFI; shared with
--- the compiled tier and the builtins, which import them via _int -> rt). statbuf stays;
--- it is still used by the O_EXCL redirect check below.
+-- file predicates live in runtime (pure stat FFI; shared with the compiled tier and
+-- the builtins). statbuf2 is the second stat buffer `pwd` compares against statbuf.
 local file_test = rt.file_test
 local statbuf2 = ffi.new("uint8_t[144]")
-local file_bincmp = rt.file_bincmp
-local UNARY_STR = { ["-z"] = true, ["-n"] = true }
 -- `test -v NAME` / `[[ -v NAME ]]`: is the variable (or array element) set?
 local array_key -- forward (defined below)
 -- The test/[ engine + var_is_set moved to runtime (its operand primitives are all
 -- runtime funcs). Import the pieces interp's [[ ]] eval and the test/[ builtin call.
 local var_is_set, unary, binary, do_test = rt.var_is_set, rt.test_unary, rt.test_binary, rt.do_test
-M.do_test = do_test
 
 local tilde_prefix -- forward (word-initial ~ expansion; defined below, used in paramexp)
 local expand_word -- forward (used by eval's $-deferred arith and expand_part_str)
@@ -1419,18 +1377,9 @@ function M.arith_ref_elem(sh, name, store)
 	return arith_resolve(sh, sh:array_get(base, k))
 end
 
--- Compiled-tier helpers for `$name` arithmetic (the emit fast-xpand path):
--- arith_isnum gates the native compiled expression — true when the var's value binds
--- like an atom (a plain number, so native == bash's textual substitution). arith_textual
--- is the fallback for a non-numeric value: expand the raw arithmetic and re-parse it,
--- exactly as bash substitutes the value's TEXT (`x='1 + 2'; $(( $x*3 ))` -> 1 + 2 * 3).
-function M.arith_isnum(sh, name)
-	local s = sh.vars[sh:deref(name)]
-	if s and s.n ~= nil and s.s == nil and not s.arr then
-		return true
-	end -- i64-authoritative
-	return looks_numeric(sh:get(name)) ~= nil
-end
+-- Compiled-tier fallback for `$name` arithmetic on a non-numeric value: expand the raw
+-- arithmetic and re-parse it, exactly as bash substitutes the value's TEXT
+-- (`x='1 + 2'; $(( $x*3 ))` -> 1 + 2 * 3).
 function M.arith_textual(sh, raw)
 	return M.arith_textual_eval(sh, raw)
 end
@@ -1823,34 +1772,11 @@ end
 -- Tilde expansion lives in runtime.lua (pure runtime: HOME/PWD/OLDPWD + passwd db).
 -- interp aliases it locally; both tiers share the runtime version.
 tilde_prefix = rt.tilde_prefix
-M.tilde_prefix = tilde_prefix
-
--- Canonicalize an absolute path string LOGICALLY: resolve `.`/`..` textually,
--- without following symlinks (bash's default -L `cd` semantics — `..` pops the
--- previous name even when it is a symlink). Exactly two leading slashes survive
--- (POSIX leaves `//` implementation-defined; bash keeps it, `///` is `/`).
-local function logical_canon(path)
-	local parts = {}
-	for seg in path:gmatch("[^/]+") do
-		if seg == "." then -- drop
-		elseif seg == ".." then
-			if #parts > 0 then
-				parts[#parts] = nil
-			end
-		else
-			parts[#parts + 1] = seg
-		end
-	end
-	local root = (path:byte(2) == 47 and path:byte(3) ~= 47) and "//" or "/"
-	return root .. table.concat(parts, "/")
-end
 
 -- Assignment-RHS and word-initial tilde expansion also live in runtime.lua; interp
--- aliases them locally so its expansion paths and M.* exports keep working.
+-- aliases them locally for its expansion paths.
 local tilde_assign = rt.tilde_assign
 local tilde_word_initial = rt.tilde_word_initial
-M.tilde_word_initial = tilde_word_initial -- the compiled tier tilde-expands word-initial literals
-M.tilde_assign = tilde_assign -- compiled tier tilde-expands each `:`-segment of an assignment RHS
 
 -- Compiled-tier plain scalar assignment (`name=value`), mirroring interp's assign
 -- handler for an ATTRIBUTED target: reject a readonly var ($?=1 + diagnostic, fatal
@@ -2577,22 +2503,10 @@ expand_fields_full = function(sh, w, pre1) -- pre1: part 1 already expanded (a $
 	-- while literal/quoted chars are never delimiters. This is what bash does, and
 	-- it handles concatenation ($x-, pre$x) and custom IFS correctly. Fields also
 	-- track `unq` for glob eligibility (quoted glob chars stay literal).
-	local ifs = (rt.ifs(sh) or " \t\n")
-	-- IFS is a SET of characters; a delimiter may be multibyte (`IFS=ç`), so index by
-	-- whole codepoint, not byte (byte-indexing splits ç's two bytes as two delimiters).
-	-- Memoize the parse keyed on the IFS string: it changes rarely but this runs per
-	-- word, and rt.mb_chars uses per-char mbrtowc FFI calls — costly in a hot loop.
-	local ic = sh._ifscache
-	if not ic or ic.ifs ~= ifs or ic.lg ~= rt.locale_gen then -- (a locale change re-splits `é`)
-		local set = {}
-		for _, ch in ipairs(rt.mb_chars(ifs)) do
-			set[ch.s] = true
-		end
-		ic = { ifs = ifs, set = set, mbifs = rt.lc_mb_cur_max() > 1 and ifs:find("[\128-\255]") ~= nil,
-			lg = rt.locale_gen } -- any multibyte IFS char?
-		sh._ifscache = ic
-	end
-	local ifsset, mbifs = ic.set, ic.mbifs
+	-- IFS is a SET of characters; a delimiter may be multibyte (`IFS=ç`), so it is
+	-- indexed by whole codepoint (rt.ifs_charset: memoized per IFS string and locale).
+	local ic = rt.ifs_charset(sh)
+	local ifs, ifsset, mbifs = ic.ifs, ic.set, ic.mbifs
 	local function isws(c) -- IFS whitespace only (subst.c ifs_whitespace): other whitespace is text
 		return (c == " " or c == "\t" or c == "\n") and ifsset[c]
 	end
@@ -3561,7 +3475,7 @@ local BUILTINS = {
 	bind = 1,
 	help = 1,
 }
-M.BUILTINS = BUILTINS -- exposed so the compiled backend delegates the same set
+M.BUILTINS = BUILTINS -- (the one builtin table: emit and runtime consult it too)
 local KEYWORDS = {
 	["if"] = 1,
 	["then"] = 1,
@@ -3874,38 +3788,6 @@ local function do_arrayassign(sh, st)
 	end
 end
 M.do_arrayassign = do_arrayassign
--- Whole `a=(…)` statement (readonly/index checks + error-contained assign + status/$_),
--- so the compiled tier runs it as a runtime primitive instead of delegating to exec_stmt.
-function M.run_arrayassign(sh, st)
-	local rb = sh.vars[sh:deref(st.name)]
-	local nb = sh.vars[st.name]
-	if nb and nb.ref and nb.s and nb.s:find("[", 1, true) then -- nameref to an element/`a[@]`
-		io.stderr:write("curse: `" .. nb.s .. "': not a valid identifier\n")
-		sh.status = 1
-	elseif st.index then
-		io.stderr:write("curse: " .. st.name .. "[" .. st.index .. "]: cannot assign list to array member\n")
-		sh.status = 1
-		error({ __curse_exit = 1, __curse_lineabort = true }) -- (and abandons the line: bash)
-	elseif rb and rb.ro then
-		io.stderr:write("curse: " .. st.name .. ": readonly variable\n")
-		rt.report_exit(sh) -- (err_readonly: report_error)
-		sh.status = 1
-	else
-		local aok, aerr = pcall(do_arrayassign, sh, st)
-		if aok then
-			sh.status = 0
-			sh:set_str("_", "")
-		elseif type(aerr) == "table" and aerr.__curse_experr and not aerr.__curse_lineabort then
-			sh.status = 1
-			if sh.opt_e then
-				error({ __curse_exit = 1 })
-			end
-		else
-			error(aerr)
-		end
-	end
-end
-
 -- Quote a value the way `declare -p` does: double-quoted with \ " $ ` escaped.
 local function decl_quote(s)
 	-- a control char or high byte forces $'…' (bash: `declare -- x=$'a\nb'`);
@@ -3946,7 +3828,6 @@ M.DYN_ARRAYS = DYN_ARRAYS
 local DYN_SCALARS = { BASHPID = "i", HISTCMD = "i", RANDOM = "i", SRANDOM = "i", SECONDS = "i", LINENO = "-",
 	EPOCHSECONDS = "-", EPOCHREALTIME = "-", BASH_SUBSHELL = "-", BASH_COMMAND = "-", BASH_ARGV0 = "-",
 	OSTYPE = "-", MACHTYPE = "-", HOSTTYPE = "-" }
-M.DYN_SCALARS = DYN_SCALARS
 -- Format one variable as a `declare -p` line, or nil if it is unset.
 local function fmt_decl(sh, name)
 	-- SHELLOPTS/BASHOPTS are readonly, exported, derived specials with no var box.
@@ -4928,7 +4809,6 @@ end
 
 -- ---- background job table (for `jobs`, `wait -n`, `wait %jobspec`) ----
 local WNOHANG = 1
-local job_add = rt.job_add -- (moved to runtime; the compiled tier's run_background uses it too)
 -- Reap a job (blocking unless nohang); caches its exit status. Returns the status,
 -- or nil if it's still running (nohang) / already gone.
 local function job_reap(sh, job, nohang)
@@ -5075,8 +4955,6 @@ local SPECIAL_BUILTIN -- forward decl (assigned below); posix dispatch/funcdef r
 -- repeated by call depth. A plain token is bare; anything else is quoted the way
 -- bash quotes it (shell_quote: `$'…'` for control/non-printable, else `'…'`).
 local xtrace_quote, xtrace_line, xtrace = rt.xtrace_quote, rt.xtrace_line, rt.xtrace
-M.xtrace_line = xtrace_line
-M.xtrace_write = rt.xtrace_write
 
 -- bash's describe_command (type.def), for `type` and `command -v/-V`. FL: all, short (the
 -- sentence), reuse (command -v), type (-t), path_only (-p), force (-P), nofunc (-f),
@@ -5635,19 +5513,6 @@ end -- -eq/-lt… operand
 function M.dbracket_unary(sh, op, val)
 	return unary(sh, op, val)
 end -- file tests, -o, -v, -z/-n
-function M.dbracket_bincmp(l, op, r)
-	return binary(l, op, r, true)
-end -- -nt/-ot/-ef
-local function glob_escape(s)
-	return (s:gsub("[%*%?%[%]\\]", "\\%0"))
-end
-function M.dbracket_eq(sh, l, r, rq) -- ==/= : quoted rhs is literal, else a glob
-	local ic = sh.shopt.nocasematch and true or nil
-	if rq and not ic then
-		return l == r
-	end
-	return rt.glob_match(l, rq and glob_escape(r) or r, ic)
-end
 
 -- Run a loop body, catching break/continue (decrementing multi-level n and
 -- re-raising when it targets an outer loop). Returns "break", "continue", or nil.
@@ -5682,20 +5547,15 @@ local function run_loop_body(sh, body, hook)
 	return loop_signal(sh, err)
 end
 
--- In a forked child (subshell/background/pipeline stage), translate an exit/return
--- thrown as a control table into $? so the child _exits with the right status.
--- (A non-table Lua error is left for the caller; forked children then _exit anyway.)
-local child_status = rt.child_status -- (moved to runtime; shared with the compiled tier)
-
 -- Snapshot the <()/>() counts before a command expands its words/redirs, so its
 -- cleanup drains ONLY the procsubs it registered — not ones an enclosing group's
 -- redirect (`{ …; } > >(tac)`) left pending, which drain after the whole group.
-local function procsub_mark(sh)
-	return (sh.procsub_pending and #sh.procsub_pending or 0), (sh.procsub_files and #sh.procsub_files or 0)
-end
+-- (One implementation, in runtime: the compiled tier marks the same way.)
+local procsub_mark = rt.procsub_mark
 -- Process-substitution cleanup, run after the command a <()/>() was attached to: close
 -- the shell's end of each pipe it created (a >(cmd) then sees EOF; an unread <(cmd)
--- writer gets EPIPE) and reap the child. Only entries added since the mark.
+-- writer gets EPIPE) and reap the child. Only entries added since the mark. (np, the
+-- mark's first half, is always 0 and unused: procsub_mark's pair is kept for callers.)
 local function drain_procsub(sh, np, nf)
 	nf = nf or 0
 	local files = sh.procsub_files
@@ -5703,7 +5563,6 @@ local function drain_procsub(sh, np, nf)
 		return
 	end
 	io.flush()
-	local stbuf = ffi.new("int[1]")
 	for i = nf + 1, #files do
 		C.close(files[i].fd)
 		rt.fd_owner[files[i].fd] = nil
@@ -5711,12 +5570,9 @@ local function drain_procsub(sh, np, nf)
 	sh.procsub_status = {} -- (the latest ones, for a later `wait $!`)
 	for i = nf + 1, #files do
 		local g = files[i].g
-		if g then -- (in-process)
+		if g then -- (no g: its launch failed — nothing ran, nothing to reap)
 			rt.wait_groups({ g })
 			sh.procsub_status[files[i].pid] = g.status[1] or 0
-		else
-			rt.wait_child(files[i].pid, stbuf, 0)
-			sh.procsub_status[files[i].pid] = rt.wexit(stbuf[0])
 		end
 	end
 	for i = #files, nf + 1, -1 do
@@ -7341,32 +7197,8 @@ exec_stmt = function(sh, st, hook)
 end
 
 M.exec_simple = exec_simple -- the compiled CFG dispatches a natively-built argv (builtins/externals)
-M.exec_stmt = exec_stmt -- exposed so the compiled CFG can delegate cold statements
+M.exec_stmt = exec_stmt -- (runtime and the source/fc/eval builtins run parsed statements through it)
 M.xtrace = xtrace -- set -x trace, for rt.exec_dynamic (compiled dynamic command word)
-do
-	local dlog = os.getenv("CURSE_COUNT_DELEG") -- instrumentation: log compiled->interp delegations
-	if dlog then
-		local raw = exec_stmt
-		M.exec_stmt = function(sh, st, hook)
-			local f = io.open(dlog, "a")
-			if f then
-				local tag = type(st) == "table" and st.t or tostring(st)
-				if type(st) == "table" and st.t == "simple" and st.words and st.words[1] then
-					local p1 = st.words[1].parts and st.words[1].parts[1]
-					tag = "simple:"
-						.. (
-							p1
-								and (p1.lit or (p1.var and "$" .. p1.var) or (p1.pexp and "${}") or (p1.cmdsub and "$()") or "?")
-							or "?"
-						)
-				end
-				f:write(tag .. "\n")
-				f:close()
-			end
-			return raw(sh, st, hook)
-		end
-	end
-end
 
 -- Run a trap handler string; preserves $LINENO (so an ERR/EXIT trap sees the
 -- failing command's line, not the handler's). Returns true if it called exit; and, when
@@ -7620,10 +7452,6 @@ local function shallow_noexit(t)
 	return c
 end
 local function finish(sh, ok, err)
-	if sh.subshell_child then -- a compiled subshell's forked child: end it here (rt.subshell_fork)
-		child_status(sh, ok, err)
-		rt.child_exit(sh, sh.status or 0)
-	end
 	if not ok then
 		if type(err) == "table" and err.__curse_noexittrap then
 			sh.traps = sh.traps and shallow_noexit(sh.traps) -- `exec cmd`: the process is gone
@@ -7645,7 +7473,7 @@ local function finish(sh, ok, err)
 		return
 	end
 	M.run_exit_trap(sh)
-	if sh.coprocs and next(sh.coprocs) and not sh.subshell_child then
+	if sh.coprocs and next(sh.coprocs) then
 		rt.coproc_exit_dispose(sh, ok)
 	end
 end
@@ -7669,7 +7497,7 @@ function M.run(sh, ast, hook)
 end
 
 -- Top-level exit/return/EXIT-trap handling for a compiled run: wrap the compiled
--- module's run() so `exit`, nounset, errexit etc. thrown from compiled/delegated
+-- module's run() so `exit`, nounset, errexit etc. thrown from compiled
 -- code unwind cleanly (setting $?) instead of crashing as an uncaught table.
 function M.finish_run(sh, fn)
 	finish(sh, pcall(fn))
@@ -8162,11 +7990,9 @@ M._int = {
 	SPECIAL_BUILTIN = SPECIAL_BUILTIN,
 	exec_simple = exec_simple,
 	expand_part_str = expand_part_str,
-	tilde_word_initial = tilde_word_initial,
 	file_test = file_test,
 	sq = sq,
 	BUILTINS = BUILTINS,
-	KEYWORDS = KEYWORDS,
 	SETOPTS = SETOPTS,
 	SHOPT_ORDER = SHOPT_ORDER,
 	parse_umask = parse_umask,
@@ -8175,8 +8001,6 @@ M._int = {
 	block_sig = block_sig,
 	canon_sig = canon_sig,
 	sig_order = sig_order,
-	find_all_in_path = find_all_in_path,
-	name_type = name_type,
 	SIGNUM = SIGNUM,
 	NUMSIG = NUMSIG,
 	array_key = array_key,
@@ -8197,7 +8021,6 @@ M._int = {
 	fmt_decl = fmt_decl,
 	decl_elems = decl_elems,
 	fmt_set_var = fmt_set_var,
-	logical_canon = logical_canon,
 	opt_on = opt_on,
 	set_opt = set_opt,
 	SETFLAG = SETFLAG,
@@ -8209,8 +8032,6 @@ M._int = {
 	exec_stmt = exec_stmt,
 	apply_redirs = apply_redirs,
 	restore_redirs = restore_redirs,
-	drain_procsub = drain_procsub,
-	expand_word = expand_word,
 	arith_expand_text = arith_expand_text,
 	dbracket_word = dbracket_word,
 	dbracket_pattern = dbracket_pattern,
@@ -8226,7 +8047,6 @@ M._int = {
 	rl_lib = rl_lib,
 	SHOPT_DEFAULT = SHOPT_DEFAULT,
 	shopt_on = shopt_on,
-	sherr = sherr,
 	C = C,
 	P = P,
 	rt = rt,

@@ -54,7 +54,6 @@ local g3, h3 = run(SRC)
 ck("corrupt artifact", g3, h3, WANT, "cold")
 
 -- no HOME / no XDG -> uncacheable, but still runs (path=nil -> interp/cold works)
-local oldx, oldh = os.getenv("XDG_CACHE_HOME"), os.getenv("HOME")
 -- (can't unset env from Lua portably; instead check artifact_path handles nil)
 if Cache.artifact_path(SRC) == nil then
 	print("  (no home -> nil path)")
