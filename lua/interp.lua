@@ -236,21 +236,27 @@ end
 -- it is part of a field and never a delimiter — and the marker is dropped from
 -- the value.
 local rs_pats = {} -- IFS -> { sep, non, tail } for the fast path (false: not whitespace-only)
-local function read_split(ifs, line, nvars, nomark) -- (nomark: \1 is plain — read's skip_ctlesc)
+local function read_split(ifs, line, nvars, nomark, saw, sh) -- (nomark: \1 is plain — read's
+	-- skip_ctlesc; saw: then a CTLNUL was marked, \1\177)
+	-- (a pending glibc mbtowc state, or a line that may leave one — rt.mbtowc_visit — takes
+	-- the general path, whose scan models it)
+	local st = sh and (sh.mbw ~= nil or (line:byte(-1) or 0) >= 0x80) and ifs ~= "" and rt.lc_mb_cur_max() > 1
+		and rt.lc_utf8()
 	-- the common case: an IFS of whitespace only, no escaped chars — fields are runs of
 	-- non-IFS; the last var gets the rest with trailing IFS stripped (as below)
-	local pat = rs_pats[ifs]
+	local pairs_ = nomark and not ifs:find("\127", 1, true) and line:find("\1\127", 1, true)
+	local pat = not st and rs_pats[ifs]
 	if pat == nil then
 		if ifs ~= "" and not ifs:find("[^ \t\n]") then
 			pat = { "[" .. ifs .. "]", "[^" .. ifs .. "]", "^(.-)[" .. ifs .. "]*$" }
-		elseif ifs ~= "" and not ifs:find("[ \t\n\128-\255%z]") then -- (no whitespace)
+		elseif ifs ~= "" and not ifs:find("[ \t\n\v\f\r\128-\255%z]") then -- (no whitespace)
 			pat = { "[" .. ifs:gsub("%W", "%%%0") .. "]", nows = true }
 		else
 			pat = false
 		end
 		rs_pats[ifs] = pat
 	end
-	if pat and pat.nows and (nomark or not line:find("\1", 1, true)) then
+	if pat and pat.nows and ((nomark and not pairs_) or (not nomark and not line:find("\1", 1, true))) then
 		-- an IFS of non-whitespace delimiters only: each one ends a field (empty fields
 		-- kept); the last var gets the raw rest — minus a lone trailing delimiter when
 		-- that rest is a single field (bash, as below)
@@ -272,7 +278,7 @@ local function read_split(ifs, line, nvars, nomark) -- (nomark: \1 is plain — 
 		end
 		return out
 	end
-	if pat and (nomark or not line:find("\1", 1, true)) then
+	if pat and ((nomark and not pairs_) or (not nomark and not line:find("\1", 1, true))) then
 		if nvars == 1 then -- (one var: the line minus leading/trailing IFS whitespace)
 			local b1, b2 = line:byte(1), line:byte(-1)
 			if not b1 or not (ifs:find(string.char(b1), 1, true) or ifs:find(string.char(b2), 1, true)) then
@@ -301,51 +307,61 @@ local function read_split(ifs, line, nvars, nomark) -- (nomark: \1 is plain — 
 		return out
 	end
 	-- the general case, as bash's read.def over get_word_from_string (subst.c): the field
-	-- engine's delimiter scan (rt.ifs_find: a field ends per character) and step past it
-	-- (rt.ifs_skip: byte-wise), on the raw line — CTLESC markers and all — so a field's
-	-- markers are dropped only once it is cut out
+	-- engine's delimiter scan (rt.ifs_find: a field ends per character) on the raw line —
+	-- CTLESC markers and all — so a field's markers are dropped only once it is cut out.
+	-- Whitespace is two classes here: read.def's initial strip, the step past a delimiter
+	-- (rt.ifs_rskip) and strip_trailing_ifs_whitespace take only space/tab/newline IFS
+	-- bytes (spctabnl), each word's own leading skip and the "whitespace delimiter" test
+	-- every isspace one (\v \f \r too) — so `IFS=$'\v' read x <<< $'\va\v\vb'` keeps x raw.
+	-- Under nomark (IFS holds \1: skip_ctlesc) the only markers are a CTLNUL's (\1\177,
+	-- kept whole by SX_NOESCCTLNUL); `saw` (bash's saw_escape) then dequotes every \1.
 	local ic = rt.ifs_charset_of(ifs)
-	local set, n, esc = ic.set, #line, not nomark and line:find("\1", 1, true)
-	local i = rt.ifs_skip(set, line, 1, n) -- leading IFS whitespace
+	local n, wsb, rwsb = #line, ic.wsb, ic.rwsb
+	-- (under nomark only a \1\177 pair is special — SX_NOESCCTLNUL — unless IFS holds \177;
+	-- a pair of raw input bytes counts too, left undequoted when nothing was marked)
+	local esc = (nomark and pairs_ and 2) or (not nomark and line:find("\1", 1, true) and true)
+	saw = nomark and saw or (not nomark and esc)
+	local skipws, find = rt.ifs_skipws, st and rt.ifs_find_st or rt.ifs_find
+	local i = skipws(rwsb, line, 1, n) -- read.def's leading strip
 	local out = {}
 	for v = 1, nvars do
-		if i > n then
-			out[v] = ""
+		local s = skipws(wsb, line, i, n) -- (get_word_from_string's own leading skip)
+		if s > n then
+			out[v], i = "", n + 1
 		else
-			local e, l = rt.ifs_find(ic, line, i, esc)
+			local e, l = find(ic, line, s, esc, nil, nil, sh)
 			local nx = n + 1
 			if e then
-				local c = line:sub(e, e)
-				nx = rt.ifs_skip(set, line, e + l, n, (c == " " or c == "\t" or c == "\n") and 1 or 2)
+				nx = rt.ifs_rskip(ic, line, e + l, n, wsb[line:byte(e)] and 1 or 2)
 			else
 				e = n + 1
 			end
 			if v < nvars or nx > n then
 				-- a field; for the LAST var only when nothing remains after it and its one
 				-- delimiter (so `IFS=x; read a b <<< axbx` gives b="b", and `xx` gives b="")
-				out[v] = line:sub(i, e - 1)
+				out[v] = line:sub(s, e - 1)
 				i = nx
 			else
-				-- the last var otherwise gets the raw remainder with only trailing IFS
-				-- WHITESPACE stripped (interior/trailing non-ws kept). bash's
-				-- strip_trailing_ifs_whitespace (subst.c) runs on it CTLESC (\1) markers and
-				-- all: scan back while the byte is IFS whitespace, OR it's a \1 whose
-				-- FOLLOWING byte is space/tab/nl — never removing the first byte. That strips
-				-- a \1's escaped space while orphaning the bare \1, so a lone \001 leaks into
-				-- the value (read.def bug; builtin-read "read bash bug"). Mirror it
-				-- byte-for-byte and dequote only afterward.
+				-- the last var otherwise gets the raw remainder (from before its word's
+				-- leading skip) with only trailing IFS spctabnl stripped (interior/trailing
+				-- other IFS kept). bash's strip_trailing_ifs_whitespace (subst.c) runs on it
+				-- CTLESC (\1) markers and all: scan back while the byte is such whitespace,
+				-- OR (saw_escape) it's a \1 whose FOLLOWING byte is space/tab/nl — never
+				-- removing the first byte. That strips a \1's escaped space while orphaning
+				-- the bare \1, so a lone \001 leaks into the value (read.def bug;
+				-- builtin-read "read bash bug"). Mirror it byte-for-byte and dequote only
+				-- afterward.
 				local S = n
 				while S > i do
-					local c = line:sub(S, S)
-					if not ((set[c] and (c == " " or c == "\t" or c == "\n"))
-						or (c == "\1" and line:sub(S + 1, S + 1):find("^[ \t\n]"))) then
+					local b = line:byte(S)
+					if not (rwsb[b] or (saw and b == 1 and line:sub(S + 1, S + 1):find("^[ \t\n]"))) then
 						break
 					end
 					S = S - 1
 				end
 				out[v] = line:sub(i, S)
 			end
-			if esc then -- (dequote_string: \1 escapes the next byte; a trailing lone \1 stays)
+			if saw then -- (dequote_string: \1 escapes the next byte; a trailing lone \1 stays)
 				out[v] = out[v]:gsub("\1(.)", "%1")
 			end
 		end
@@ -690,7 +706,7 @@ local expand_word -- forward (used by eval's $-deferred arith and expand_part_st
 local expand_assign_word -- forward (assignment-RHS expander; ${-default} tilde ctx)
 local expand_pattern -- forward (quote-aware glob-pattern expansion for ${v/…} etc.)
 local expand_repl -- forward (${v/pat/REPL} replacement expansion)
-local is_multi, multi_elems -- forward (defined with the field expander)
+local is_multi, multi_elems, multi_hda -- forward (defined with the field expander)
 local indirect_part -- forward (${!ref} target resolution, re-parsed to a part)
 local eval -- arithmetic evaluator (forward decl)
 local noeval_pow -- a short-circuited operand's exponent check (forward decl)
@@ -2070,6 +2086,123 @@ is_multi = function(sh, p)
 	-- $@/$* live in pexp.name (e.g. ${@:1}); array [@]/[*] live in pexp.index
 	return p.pexp.index == "@" or p.pexp.index == "*" or p.pexp.name == "@" or p.pexp.name == "*"
 end
+-- Does this multi part make bash split its word as has_dollar_at (list_string on the
+-- whole word with quoted=1: leading IFS whitespace is then a delimiter of its own, so
+-- `IFS=': '; x=' :a'; set -- $x"$@"` has no empty first field)? param_expand /
+-- parameter_brace_expand / chk_atstar set contains_dollar_at for every @ form, quoted or
+-- not, for an unquoted $* and ${a[*]} (with any operator) — but not for ${*…}, ${!a[*]},
+-- ${!pfx*} or a quoted * form; ${!ref} as its target.
+local DEFAULT_OPS = { [":-"] = true, ["-"] = true, [":+"] = true, ["+"] = true }
+-- ...and inside a ${x:-word} word bash expands (parameter_brace_expand_rhs): any @ form —
+-- a quoted one only when it has elements — never a * form.
+local function word_hda(sh, w, q)
+	for _, sp in ipairs(w.parts) do
+		if is_multi(sh, sp) then
+			local sq = sp.q or q
+			local pe = sp.pexp
+			local star = sp.special == "*" or (pe and (pe.name == "*" or pe.index == "*" or pe.star))
+			if not star then
+				if not sq then
+					return true
+				end
+				local c = { special = sp.special, pexp = pe, q = true }
+				if #(multi_elems(sh, c)) > 0 then
+					return true
+				end
+			end
+		end
+	end
+	return false
+end
+-- does a (non-multi) ${x:-word}-style part's taken branch have the word — and does that
+-- word make the whole word has_dollar_at (multi_hda)?
+local function default_hda(sh, p)
+	local pe = p.pexp
+	if not (pe and DEFAULT_OPS[pe.op] and pe.arg and pe.arg:find("@", 1, true)) or pe.index then
+		return false
+	end
+	local pn = tonumber(pe.name)
+	local val, set
+	if pn then
+		set, val = pn == 0 or pn <= sh.nparams, sh:param(pn)
+	else
+		local b = sh.vars[sh:deref(pe.name)]
+		if b and b.arr then
+			set = b.arr[0] ~= nil or b.arr["0"] ~= nil
+		else
+			set = b ~= nil and (b.s ~= nil or b.n ~= nil)
+		end
+		val = sh:get(pe.name)
+		set = set or sh:special_get(pe.name) ~= ""
+	end
+	local use
+	if pe.op == ":-" then
+		use = val == ""
+	elseif pe.op == "-" then
+		use = not set
+	elseif pe.op == ":+" then
+		use = val ~= ""
+	else
+		use = set
+	end
+	if not use then
+		return false
+	end
+	if p.q then
+		return word_hda(sh, P.parse_default_quoted(pe.arg, pe.hd), true)
+	end
+	return word_hda(sh, P.parse_word(pe.arg), false)
+end
+multi_hda = function(sh, p)
+	local pe = p.pexp
+	if not pe then
+		return p.braced and p.special == "@" or not p.braced and (p.special == "@" or not p.q)
+	end
+	if DEFAULT_OPS[pe.op] and (pe.name == "@" or pe.index == "@") then
+		-- ${a[@]:-w}: the value branch is an @ expansion; the word branch, its word's
+		local els = pe.name == "@" and sh:paramList() or sh:array_values(sh:deref(pe.name))
+		local set = #els > 0
+		local ne = #els > 1 or (set and els[1] ~= "")
+		local val -- (the value itself is returned)
+		if pe.op == ":-" then
+			val = ne
+		elseif pe.op == "-" then
+			val = set
+		elseif pe.op == ":+" then
+			val = not ne
+		else
+			val = not set
+		end
+		if val then
+			return true
+		end
+		if not pe.arg then
+			return false
+		end
+		if p.q then
+			return word_hda(sh, P.parse_default_quoted(pe.arg, pe.hd), true)
+		end
+		return word_hda(sh, P.parse_word(pe.arg), false)
+	end
+	if pe.op == "indirect" then
+		local ip = indirect_part(sh, pe, true)
+		if not ip then
+			return false
+		end
+		ip.q = p.q
+		return is_multi(sh, ip) and multi_hda(sh, ip)
+	end
+	if pe.op == "prefix" then
+		return not pe.star
+	end
+	if pe.op == "indices" then
+		return pe.index == "@"
+	end
+	if pe.name == "@" or pe.index == "@" then
+		return true
+	end
+	return pe.index == "*" and not p.q
+end
 multi_elems = function(sh, p) -- returns element list, star?
 	if p.pexp then
 		local pe = p.pexp
@@ -2340,6 +2473,19 @@ expand_fields_full = function(sh, w, pre1) -- pre1: part 1 already expanded (a $
 	-- literal/quoted text is added as is, unquoted expansions split on $IFS; the part-level
 	-- semantics (field-wise ${x:-word}, tilde, "$@" in "…", bug #627) stay here.
 	local fb = rt.fb_new(sh)
+	if fb.ic.mixed then -- (a has_dollar_at word splits its start unstripped: see multi_hda)
+		for _, p in ipairs(w.parts) do
+			if is_multi(sh, p) then
+				if multi_hda(sh, p) then
+					fb.dl = 0
+					break
+				end
+			elseif default_hda(sh, p) then
+				fb.dl = 0
+				break
+			end
+		end
+	end
 	local dq_null, dq_at -- (a "…" segment tagged dqat: an empty part seen / a "$@" gave no words)
 	for pi, p in ipairs(w.parts) do
 		if is_multi(sh, p) then
@@ -2349,10 +2495,13 @@ expand_fields_full = function(sh, w, pre1) -- pre1: part 1 already expanded (a $
 					if star then
 						dq_null = true
 					else
-						dq_at = true
+						dq_at, fb.xs = true, true
 					end
 				else
-					fb:multi(els, true, star)
+					-- (lone: the word is exactly "$@" — bash's expand_word_internal shortcut;
+					-- not in an array literal, whose words carry other flags)
+					fb:multi(els, true, star, #w.parts == 1 and p.special == "@" and not p.braced and not w.aelem,
+						not p.dqat)
 				end
 			else
 				local pe = p.pexp
@@ -2382,6 +2531,9 @@ expand_fields_full = function(sh, w, pre1) -- pre1: part 1 already expanded (a $
 			-- governs splitting (bash), so expand it field-wise rather than as a flat string —
 			-- and a quoted "$@"/"${a[@]}" in it keeps its separate words (${1+"$@"})
 			local pe = p.pexp
+			if not p.q then
+				fb.xs = true -- (an unquoted $-expansion: bash word-splits the word)
+			end
 			local b = sh.vars[sh:deref(pe.name)]
 			local hasval -- (an array is "set" by its [0], as expand_param decides)
 			if b and b.arr then
@@ -2416,7 +2568,7 @@ expand_fields_full = function(sh, w, pre1) -- pre1: part 1 already expanded (a $
 						if is_multi(sh, sp) then
 							sp.q = true
 							local els, star = multi_elems(sh, sp)
-							fb:multi(els, true, star)
+							fb:multi(els, true, star, nil, true)
 						else
 							fb:add(expand_part_str(sh, sp), false)
 						end
@@ -2430,7 +2582,7 @@ expand_fields_full = function(sh, w, pre1) -- pre1: part 1 already expanded (a $
 				for k, sp in ipairs(P.parse_word(pe.arg).parts) do
 					if is_multi(sh, sp) then -- $@/$*: as at the top level of a word
 						local els, star = multi_elems(sh, sp)
-						fb:multi(els, sp.q, star)
+						fb:multi(els, sp.q, star, nil, not sp.dqat)
 					else
 						local s = expand_part_str(sh, sp)
 						if k == 1 and sp.lit ~= nil and not sp.q then
@@ -2476,6 +2628,7 @@ expand_fields_full = function(sh, w, pre1) -- pre1: part 1 already expanded (a $
 			if dq_null and not dq_at then
 				fb:add("", false)
 			end
+			fb:dqend()
 			dq_null, dq_at = nil, nil
 		end
 	end
@@ -3198,6 +3351,17 @@ end
 local function char_value(s)
 	if s == "" then
 		return 0
+	end
+	local h = rt.pf_sh
+	if h and rt.lc_mb_cur_max() > 1 and rt.lc_utf8() and (h.mbw or s:byte(1) >= 0x80) then
+		-- (printf.def's asciicode calls mbtowc, whose static state a word split may have
+		-- left pending — rt.mbtowc_visit: `'é` is then invalid (its first byte), `'\xa9`
+		-- completes it)
+		local r, c = rt.mbtowc_visit(h, s, 1, #s)
+		if r > 0 and c then
+			return rt.mb_chars(c)[1].wc
+		end
+		return s:byte(1)
 	end
 	local ch = rt.mb_chars(s)[1]
 	return (ch and ch.wc) or s:byte(1)

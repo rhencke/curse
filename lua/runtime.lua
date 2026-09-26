@@ -493,6 +493,10 @@ function Shell:pushParams(...)
 	self.nparams = n
 end
 function Shell:popParams()
+	local fc = self.ifs_fc
+	if fc and fc[3] ~= M.locale_gen then -- (pop_context's sv_ifs: M.ifs_first)
+		M.ifs_resync(self)
+	end
 	local d = self.pd
 	self.pd = d - 1
 	self.params = self.paramstack[d]
@@ -596,6 +600,10 @@ function Shell:leaveFunc()
 	end
 end
 function Shell:popCall()
+	local fc = self.ifs_fc
+	if fc and fc[3] ~= M.locale_gen then -- (pop_context's sv_ifs: M.ifs_first)
+		M.ifs_resync(self)
+	end
 	local d = self.pd
 	local saved = self.savedstack[d]
 	if saved then
@@ -1986,6 +1994,10 @@ end
 -- set -u) fails the redirect non-fatally, as interp's pcall does.
 -- A posix-mode non-interactive shell doesn't glob a redirection target (bash).
 function M.redir_noglob(sh, f, ...)
+	local fc = sh.ifs_fc
+	if fc and fc[3] ~= M.locale_gen then -- (redirection_expand's sv_ifs: M.ifs_first)
+		M.ifs_resync(sh)
+	end
 	if not (sh.opt_posix and not sh.opt_i) or sh.opt_f then
 		return pcall(f, ...)
 	end
@@ -3178,7 +3190,7 @@ function sub_checkpoint(self)
 	local sv = sub_save(self, shallowcopy)
 	local cp = {
 		orig_vars = orig_vars, exset = exset, sv = sv,
-		locale_gen = M.locale_gen, lc_state = M.lc_state, lcsnap = M.lc_envsnap,
+		locale_gen = M.locale_gen, lc_state = M.lc_state, lcsnap = M.lc_envsnap, mbw = self.mbw, ifs_fc = self.ifs_fc,
 		l10nk = package.loaded.l10n and package.loaded.l10n.known_save(),
 		cwd = self:phys_cwd(), um = C.umask(0),
 	}
@@ -3218,6 +3230,8 @@ function sub_checkpoint(self)
 end
 function sub_restore(self, cp)
 	self.vars = cp.orig_vars
+	self.mbw = cp.mbw -- (a forked child's mbtowc state never reached its parent)
+	self.ifs_fc = cp.ifs_fc
 	if cp.locale_gen ~= M.locale_gen then -- (`(LANG=C; …)`: setlocale is process-wide)
 		M.locale_restore(cp.lc_state)
 	end
@@ -8360,6 +8374,8 @@ function Shell:set_str(name, s)
 	end -- keep the env in sync
 	if LOCALE_VARS[dn] then
 		M.reset_locale(self, dn)
+	elseif dn == "IFS" then -- (sv_ifs: IFS's first char, in this locale — M.ifs_first)
+		M.ifs_resync(self)
 	elseif dn == "GLOBIGNORE" then
 		M.setup_glob_ignore(self)
 	elseif dn == "TEXTDOMAIN" or dn == "TEXTDOMAINDIR" then
@@ -10665,13 +10681,47 @@ function M.ifs_num(sh) -- does $IFS hold a char of an arith result (a digit or '
 	local v = M.ifs(sh)
 	return v ~= nil and v:find("[%d%-]") ~= nil
 end
+-- ifs_num, or an IFS under which quoted multibyte text in the word can split (FB's
+-- exposure: `"é"$((1))`) — an arith word must then take the field engine too
+function M.ifs_numx(sh)
+	local b = sh.vars.IFS
+	if not b or b.s == " \t\n" then
+		return false
+	end
+	local v = M.ifs(sh)
+	return v ~= nil and (v:find("[%d%-]") ~= nil or M.ifs_charset(sh).mbx)
+end
 function M.ifs_sep(sh) -- the "$*" joiner
 	local v = M.ifs(sh)
-	return v and M.ifs_first(v) or " "
+	return v and M.ifs_first(v, sh) or " "
 end
-function M.ifs_first(ifs)
+-- IFS's first character. bash computes it (setifs: ifs_firstc) when IFS is assigned —
+-- and again at sv_ifs's other calls: a function's return (pop_context), a redirection's
+-- expansion — in the locale of THAT moment; a locale change alone leaves it stale.
+-- sh.ifs_fc holds the text, that length and the locale generation (M.ifs_resync), kept
+-- only for an IFS whose first byte is not ASCII (else every locale agrees); any other
+-- text (a local or prefix IFS put back: sv_ifs ran then too) takes the current locale's.
+function M.ifs_resync(sh)
+	local v = M.ifs(sh)
+	if v and (v:byte(1) or 0) >= 0x80 then
+		sh.ifs_fc = { v, #M.ifs_first(v), M.locale_gen }
+	else
+		sh.ifs_fc = nil
+	end
+end
+function M.ifs_popchk(sh)
+	local fc = sh.ifs_fc
+	if fc and fc[3] ~= M.locale_gen then
+		M.ifs_resync(sh)
+	end
+end
+function M.ifs_first(ifs, sh)
 	if ifs == "" then
 		return ""
+	end
+	local fc = sh and sh.ifs_fc
+	if fc and fc[1] == ifs then
+		return ifs:sub(1, fc[2])
 	end
 	if ifs:byte(1) >= 0x80 and M.lc_mb_cur_max() > 1 then
 		return ifs:sub(1, M.mb_charlen(ifs, 1))
@@ -10893,9 +10943,20 @@ end
 -- char in the buffer — so then `wset` is that char alone, if multibyte). `mbifs`: the
 -- locale is multibyte and IFS has a high byte, so a scan must walk the text by character;
 -- `pat` finds the next candidate delimiter byte (`epat`: read's CTLESC \1 too).
+-- IFS whitespace, by byte: `wsb` the IFS bytes bash's ifs_whitespace (ISSPACE: space, tab,
+-- newline AND \v \f \r) counts — word splitting's (list_string's) whitespace, and read's
+-- leading skip; `rwsb` just its space/tab/newline (spctabnl) — what read.def's initial
+-- strip, get_word_from_string's after-delimiter skip and strip_trailing_ifs_whitespace
+-- take. `mixed`: IFS holds both whitespace and other bytes (only then can the start of a
+-- "$@" word, split unstripped, differ: FB's dl 0). `mbx`: a word split here can see bytes
+-- of a QUOTED multibyte char (bash's CTLESC skips one byte, then scans the rest: FB's
+-- exposure) or a char split across word parts — a multibyte locale and an IFS with a high
+-- byte (any IFS in a non-UTF-8 one, whose trail bytes may be ASCII); `fbic`: the sets a
+-- word split walks by character with there (read keeps its byte-wise scan).
 -- ifs_charset_of builds it for a given IFS text (read's own split takes the IFS it was
 -- handed); ifs_charset memoizes $IFS's in sh._ifscache keyed on the IFS text and the
 -- locale (a locale change re-splits `é`).
+local ISSPACE = { [9] = true, [10] = true, [11] = true, [12] = true, [13] = true, [32] = true }
 do
 local ifs_ics = setmetatable({}, { __mode = "v" }) -- (memo: IFS text -> its sets, per locale)
 function M.ifs_charset_of(ifs)
@@ -10903,11 +10964,21 @@ function M.ifs_charset_of(ifs)
 	if ic and ic.lg == M.locale_gen then
 		return ic
 	end
-	local set, wset = {}, nil
+	local set, wset, wsb, rwsb, ws, nws = {}, nil, {}, {}, false, false
 	for k = 1, #ifs do
+		local b = ifs:byte(k)
 		set[ifs:sub(k, k)] = true
+		if ISSPACE[b] then
+			wsb[b], ws = true, true
+			if b == 32 or b == 9 or b == 10 then
+				rwsb[b] = true
+			end
+		else
+			nws = true
+		end
 	end
-	local mbifs = M.lc_mb_cur_max() > 1 and ifs:find("[\128-\255]") ~= nil
+	local mb = M.lc_mb_cur_max() > 1
+	local mbifs = mb and ifs:find("[\128-\255]") ~= nil
 	if mbifs then
 		local chs = M.mb_chars(ifs)
 		for _, ch in ipairs(chs) do
@@ -10923,9 +10994,21 @@ function M.ifs_charset_of(ifs)
 			end
 		end
 	end
-	local cls = ifs:gsub("%W", "%%%0") .. (mbifs and "\128-\255" or "")
-	ic = { ifs = ifs, set = set, wset = wset, mbifs = mbifs, lg = M.locale_gen,
-		pat = cls ~= "" and ("[" .. cls .. "]") or nil, epat = "[\1" .. cls .. "]" }
+	local cls = ifs:gsub("%W", "%%%0")
+	ic = { ifs = ifs, set = set, wset = wset, mbifs = mbifs, lg = M.locale_gen, wsb = wsb, rwsb = rwsb,
+		mixed = ws and nws, mbx = mbifs or (mb and ifs ~= "" and not M.lc_utf8()), cls = cls,
+		u8 = mb and ifs ~= "" and M.lc_utf8(),
+		pat = cls ~= "" and ("[" .. cls .. (mbifs and "\128-\255" or "") .. "]") or nil,
+		epat = "[\1" .. cls .. (mbifs and "\128-\255" or "") .. "]" }
+	ic.fbic = ic
+	if ic.mbx and not mbifs then -- (non-UTF-8: the word split walks chars, read stays byte-wise)
+		local w = {}
+		for k, v in pairs(ic) do
+			w[k] = v
+		end
+		w.mbifs, w.pat = true, "[" .. cls .. "\128-\255]"
+		ic.fbic, w.fbic = w, w
+	end
 	ifs_ics[ifs] = ic
 	return ic
 end
@@ -10939,13 +11022,8 @@ function M.ifs_charset(sh)
 	end
 	return ic
 end
-local IFSWS = { [" "] = true, ["\t"] = true, ["\n"] = true } -- (subst.c ifs_whitespace, when in IFS)
-local function skip_ifsws(set, v, i, n) -- past a run of IFS whitespace (always single-byte)
-	while i <= n do
-		local c = v:sub(i, i)
-		if not (IFSWS[c] and set[c]) then
-			break
-		end
+local function skip_ws(wsb, v, i, n) -- past a run of the IFS whitespace bytes `wsb`
+	while i <= n and wsb[v:byte(i)] do
 		i = i + 1
 	end
 	return i
@@ -10955,7 +11033,8 @@ end
 -- multibyte char delimits only whole (`wset`) and is otherwise stepped over whole; any
 -- other byte delimits if it is an IFS byte — a stray lead/continuation byte of `é`
 -- included. `esc`: read's CTLESC \1 makes the next BYTE literal (bash's i += 2 — so an
--- escaped `é`'s second byte is scanned on its own).
+-- escaped `é`'s second byte is scanned on its own); esc 2 (IFS holds \1: SX_NOCTLESC)
+-- only a CTLNUL's \1\177 pair (SX_NOESCCTLNUL), any other \1 being an IFS byte.
 function M.ifs_find(ic, v, i, esc)
 	local pat = esc and ic.epat or ic.pat
 	if not pat then
@@ -10967,7 +11046,7 @@ function M.ifs_find(ic, v, i, esc)
 			return nil
 		end
 		local b = v:byte(k)
-		if b == 1 and esc then
+		if b == 1 and esc and (esc == true or v:byte(k + 1) == 127) then
 			i = k + 2
 		elseif b < 0x80 or not ic.mbifs then
 			return k, 1
@@ -10984,18 +11063,152 @@ function M.ifs_find(ic, v, i, esc)
 		end
 	end
 end
--- bash's step past a delimiter (list_string / get_word_from_string, subst.c): skip IFS
--- whitespace; a delimiter that BEGAN with whitespace (dl 1) also takes one non-whitespace
--- IFS char and the whitespace after it (POSIX 2.6.5 (3)(b)) — but consumed BYTE-wise
--- (bash's sindex++): of a multibyte `é` only the first byte, its second then delimiting an
--- empty field. Returns the next index and the state (1/2 while still in the delimiter).
-function M.ifs_skip(set, v, i, n, dl)
-	i = skip_ifsws(set, v, i, n)
-	if dl == 1 and i <= n and set[v:sub(i, i)] then
-		return skip_ifsws(set, v, i + 1, n), 2
-	end
-	return i, dl
+-- glibc's mbtowc keeps a STATIC conversion state, and bash's string_extract_verbatim
+-- calls it (subst.c: `mblength = mbtowc (&wc, string + i, slen - i)`) at every non-ASCII
+-- position its scan visits — so a word split whose string ENDS in an incomplete UTF-8
+-- sequence leaves the rest of that sequence pending for every later scan in the process:
+-- a later valid `é` is then an invalid sequence (MEMBER: its lead byte, an IFS byte,
+-- delimits), a later stray continuation byte completes the pending char (and delimits
+-- only if THAT char is in IFS). An invalid sequence leaves the state as it was. sh.mbw is
+-- that state: nil, or the pending bytes (UTF-8 locales only; a subshell restores its
+-- parent's and a pipeline stage has its own copy, as bash's forked child's could not
+-- reach its parent). mbtowc_visit models one call (state holder h: the shell) at v[k]
+-- seeing bytes up to v[e] (`more`: bytes follow that are no continuation): the byte count
+-- consumed (the char, when the call completed one) or -1.
+local U8MIN = { 0, 0x80, 0x800, 0x10000, 0x200000, 0x4000000 }
+local function u8len(b) -- (glibc's UTF-8 still takes the old 5- and 6-byte forms)
+	return (b >= 0xC2 and b <= 0xDF) and 2 or (b >= 0xE0 and b <= 0xEF) and 3 or (b >= 0xF0 and b <= 0xF7) and 4
+		or (b >= 0xF8 and b <= 0xFB) and 5 or (b >= 0xFC and b <= 0xFD) and 6 or nil
 end
+local function u8ok(c) -- (a complete sequence: not overlong, not a surrogate)
+	local b, l = c:byte(1), #c
+	local v = b % (l == 2 and 32 or l == 3 and 16 or l == 4 and 8 or l == 5 and 4 or 2)
+	for j = 2, l do
+		v = v * 64 + c:byte(j) % 64
+	end
+	return v >= U8MIN[l] and not (v >= 0xD800 and v <= 0xDFFF)
+end
+function M.mbtowc_visit(h, v, k, e, more)
+	local p = h.mbw
+	local j, L = k, nil
+	if p then
+		L = u8len(p:byte(1))
+	else
+		local b = v:byte(k)
+		if b < 0x80 then
+			return 1
+		end
+		L = u8len(b)
+		if not L then
+			return -1
+		end
+		p, j = v:sub(k, k), k + 1
+	end
+	while #p < L do
+		if j > e then
+			if more then
+				return -1
+			end
+			h.mbw = p -- (incomplete: the state keeps what it has seen)
+			return -1
+		end
+		local c = v:byte(j)
+		if c < 0x80 or c > 0xBF then
+			return -1
+		end
+		p, j = p .. v:sub(j, j), j + 1
+	end
+	if not u8ok(p) then
+		return -1
+	end
+	h.mbw = nil
+	return j - k, p
+end
+-- ifs_find (h: the shell) where the scan's mbtowc calls matter (a pending state, or a string that may
+-- leave one): every non-ASCII position the scan visits goes through mbtowc_visit — an
+-- invalid result tests the byte (MEMBER), a valid one the char against IFS's own chars
+-- (wcschr), each then stepped over by a fresh ADVANCE_CHAR.
+function M.ifs_find_st(ic, v, i, esc, e, more, h)
+	local pat = esc and ("[\1\128-\255" .. ic.cls .. "]") or ("[\128-\255" .. ic.cls .. "]")
+	local set, wset = ic.set, ic.wset
+	e = e or #v
+	while true do
+		local k = v:find(pat, i)
+		if not k or k > e then
+			return nil
+		end
+		local b = v:byte(k)
+		if b == 1 and esc and (esc == true or v:byte(k + 1) == 127) then
+			i = k + 2
+		elseif b < 0x80 then
+			return k, 1
+		else
+			local r, ch = M.mbtowc_visit(h, v, k, e, more)
+			local l = M.mb_charlen(v, k) -- (list_string's ADVANCE_CHAR past it: fresh)
+			if r < 0 then
+				if set[v:sub(k, k)] then
+					return k, l
+				end
+			elseif wset and wset[ch] then
+				return k, l
+			end
+			i = k + l
+		end
+	end
+end
+-- the state a scan leaves when the string it reaches the END of ends in `v` (the last
+-- few bytes decide: an incomplete sequence there is visited byte by byte)
+function M.mbw_tail(h, v)
+	local n = #v
+	for k = n, math.max(1, n - 4), -1 do
+		local b = v:byte(k)
+		if b < 0x80 then
+			return
+		elseif b >= 0xC0 then -- (the last lead byte: an incomplete sequence from it?)
+			local L = u8len(b)
+			if L and n - k + 1 < L then
+				for j = k, n do
+					M.mbtowc_visit(h, v, j, n)
+				end
+			end
+			return
+		end
+	end
+end
+-- bash's step past a delimiter in word splitting (list_string, subst.c): skip IFS
+-- whitespace (ifs_whitesep: isspace, so \v \f \r too); a delimiter that BEGAN with
+-- whitespace (dl 1) also takes one non-whitespace IFS char and the whitespace after it
+-- (POSIX 2.6.5 (3)(b)) — but consumed BYTE-wise (bash's sindex++): of a multibyte `é` only
+-- the first byte, its second then delimiting an empty field. dl 0 is the start of a word
+-- bash splits UNSTRIPPED (has_dollar_at's list_string(…, quoted=1)): leading whitespace
+-- there is a delimiter of its own, so it takes the (3)(b) char too. Returns the next index
+-- and the state (1/2/3 while still in the delimiter).
+function M.ifs_skip(ic, v, i, n, dl)
+	local wsb = ic.wsb
+	local j = skip_ws(wsb, v, i, n)
+	if dl == 0 then
+		if j == i then
+			return i, 2
+		end
+		dl = 1
+	end
+	if dl == 1 and j <= n and ic.set[v:sub(j, j)] then
+		return skip_ws(wsb, v, j + 1, n), 2
+	end
+	return j, dl
+end
+-- read's step past a delimiter (get_word_from_string, subst.c): skip spctabnl IFS bytes
+-- only (a \v is not skipped here — the next word's leading skip, isspace, takes it); a
+-- whitespace-begun delimiter (dl 1) then takes one IFS byte that is not isspace and the
+-- isspace IFS bytes after it.
+function M.ifs_rskip(ic, v, i, n, dl)
+	i = skip_ws(ic.rwsb, v, i, n)
+	if dl == 1 and i <= n and ic.set[v:sub(i, i)] and not ic.wsb[v:byte(i)] then
+		return skip_ws(ic.wsb, v, i + 1, n)
+	end
+	return i
+end
+M.ifs_skipws = skip_ws
 -- Pathname-expand one glob-active field (pattern `pat`, literal text `lit`) onto `out`:
 -- matches minus GLOBIGNORE's, else failglob's error / nullglob's nothing / the literal.
 local function glob_field(sh, pat, lit, out)
@@ -11081,21 +11294,30 @@ end
 
 local FB = {}
 FB.__index = FB
-function M.fb_new(sh)
+-- A field builder for one word. Where a word split can see bytes of quoted multibyte
+-- chars or a char split across parts (ic.mbx: rare — a multibyte locale and an IFS with a
+-- high byte), the calls are LOGGED and replayed at finish: only then is it known whether
+-- bash word-splits the word at all (`xs`), which decides whether those bytes show.
+-- `nolog`: a caller that reads fb.fields itself (read -a's rt.ifs_split).
+function M.fb_new(sh, nolog)
 	local ic = M.ifs_charset(sh)
-	return setmetatable({ sh = sh, ifs = ic.ifs, set = ic.set, ic = ic, dl = 2,
+	local fb = setmetatable({ sh = sh, ifs = ic.ifs, set = ic.set, ic = nolog and ic or ic.fbic, dl = 2,
 		fields = {}, fu = {}, fq = {}, n = 0, cur = nil, unq = false, q = false }, FB)
+	if (ic.mbx or (sh.mbw and ic.u8)) and not nolog then
+		fb.log = {}
+	end
+	return fb
 end
-function FB:brk()
+local function pbrk(self)
 	if self.cur ~= nil then
 		local n = self.n + 1
 		self.fields[n], self.fu[n], self.fq[n], self.n = self.cur, self.unq, self.q, n
 		self.cur, self.unq, self.q = nil, false, false
 	end
 end
-function FB:add(s, unq)
+local function padd(self, s, unq)
 	local cur = self.cur or ""
-	self.dl = nil -- (text ends any delimiter: see FB:split)
+	self.dl, self.rt = nil, nil -- (text ends any delimiter: see FB:split)
 	if unq then
 		self.unq = true
 		if self.q then
@@ -11109,70 +11331,318 @@ end
 -- Word-split v onto the fields as bash's list_string (subst.c) does. `dl` carries the
 -- delimiter state ACROSS calls (nil: in a field; 1: in a delimiter that began with IFS
 -- whitespace; 2: in one that can take only more whitespace — also before the first field,
--- where leading IFS whitespace is skipped), so splitting a word part by part (`$x$y`) is
--- splitting it whole.
-function FB:split(v)
-	local ic, set, find, skip = self.ic, self.set, M.ifs_find, M.ifs_skip
+-- where leading IFS whitespace is skipped; 3: as 2, right after an exposed byte (see
+-- xadd); 0: the unstripped start of a has_dollar_at word), so splitting a word part by
+-- part (`$x$y`) is splitting it whole.
+local function psplit(self, v)
+	local ic, find, skip = self.ic, M.ifs_find, M.ifs_skip
+	local wsb = ic.wsb
 	local i, n, dl = 1, #v, self.dl
+	local more
+	local h
+	if self.st then -- (the scan's mbtowc calls: M.mbtowc_visit)
+		find, more, h = M.ifs_find_st, not self.tail, self.sh
+	end
 	while i <= n do
 		if dl then
-			i, dl = skip(set, v, i, n, dl)
+			i, dl = skip(ic, v, i, n, dl)
 			if i > n then
 				break
 			end
 			dl = nil
 		end
-		local e, l = find(ic, v, i)
+		local e, l = find(ic, v, i, nil, n, more, h)
 		if not e then
-			self:add(v:sub(i), true)
+			padd(self, v:sub(i), true)
 			break
 		end
 		if e > i then -- (a whole run of non-IFS chars joins the field at once)
-			self:add(v:sub(i, e - 1), true)
+			padd(self, v:sub(i, e - 1), true)
 		end
-		if IFSWS[v:sub(e, e)] then
-			self:brk()
+		if wsb[v:byte(e)] then
+			pbrk(self)
 			dl = 1
 		else -- a non-whitespace IFS delimiter (may be multibyte) always ends a field (empty ok)
 			if self.cur == nil then
 				self.cur = ""
 			end
 			self.unq = true
-			self:brk()
+			pbrk(self)
 			dl = 2
 		end
 		i = e + l
 	end
 	self.dl = dl
+	if n > 0 then
+		self.rt = v -- (the word's raw end, for a scan's mbtowc state: FB:finish)
+	end
+end
+local function flush(self, tail) -- the pending unquoted text (xadd), split as one run
+	local p = self.pend
+	if p then
+		self.pend = nil
+		self.tail = tail
+		psplit(self, p)
+		self.tail = nil
+	end
+end
+-- Quoted text in a word bash splits, where bytes of its multibyte chars show (subst.c):
+-- quote_string / SADD_MBQCHAR_BODY put ONE CTLESC before a whole char, but
+-- string_extract_verbatim skips just CTLESC and the next byte (`i += 2`), then tests
+-- each remaining byte of the char alone — an invalid sequence, so MEMBER(c, charlist):
+-- one that is an IFS byte ends the field there, as a non-whitespace delimiter
+-- (`q=(aéb); IFS=é; "${q[@]}"` -> `a\xc3` `b`). The char's first byte is never tested.
+local function expose(self, s, unq, peek, pend_)
+	local set, i, k, n, st = self.set, 1, 1, #s, self.st
+	while true do
+		k = s:find("[\128-\255]", k)
+		if not k then
+			break
+		end
+		local l = M.mb_charlen(s, k)
+		for j = k + 1, k + l - 1 do
+			local d
+			if st then -- (visited: mbtowc sees the rest of the char, then a CTLESC — or, after
+				-- the text's last char, the raw bytes that follow it in the word: `peek`)
+				local r, ch
+				if k + l - 1 == n and peek then
+					local c = s:sub(j) .. peek
+					r, ch = M.mbtowc_visit(self.sh, c, 1, #c, not pend_)
+				else
+					r, ch = M.mbtowc_visit(self.sh, s, j, k + l - 1, true)
+				end
+				if r < 0 then
+					d = set[s:sub(j, j)]
+				else
+					d = self.ic.wset and self.ic.wset[ch]
+				end
+			else
+				d = set[s:sub(j, j)]
+			end
+			if d then
+				if j > i then
+					padd(self, s:sub(i, j - 1), unq)
+				end
+				if self.cur == nil then
+					self.cur = ""
+				end
+				self.unq = true
+				pbrk(self)
+				self.dl = 3
+				i = j + 1
+			end
+		end
+		k = k + l
+	end
+	if i <= n then
+		padd(self, s:sub(i), unq)
+	end
+end
+-- add in a word bash splits (replay, xs): quoted text shows its chars' later bytes; an
+-- unquoted literal is quoted char by char only where the char's first byte is an IFS
+-- byte (expand_word_internal's add_ifs_character: `isifs (c)`), the rest of it raw — and
+-- raw text joins the unquoted expansion text around it (bash splits the word as ONE
+-- string, so a char split across `$x$y` is whole again): it waits in `pend`.
+local function xadd(self, s, unq)
+	if s == "" then
+		flush(self)
+		return padd(self, s, unq)
+	end
+	if not unq then
+		flush(self)
+		return expose(self, s, false, self.peek, self.peekend)
+	end
+	local set, i, n = self.set, 1, #s
+	while i <= n do
+		local l = M.mb_charlen(s, i)
+		local c = s:sub(i, i + l - 1)
+		if set[s:sub(i, i)] then
+			flush(self)
+			if i + l > n then
+				expose(self, c, true, self.peek, self.peekend)
+			else
+				expose(self, c, true, "", false)
+			end
+		else
+			self.pend = (self.pend or "") .. c
+		end
+		i = i + l
+	end
+end
+function FB:brk()
+	local lg = self.log
+	if lg then
+		lg[#lg + 1] = { 4 }
+		return
+	end
+	if self.pend then
+		flush(self)
+	end
+	pbrk(self)
+end
+function FB:add(s, unq)
+	local lg = self.log
+	if lg then
+		lg[#lg + 1] = { 1, s, unq }
+		return
+	end
+	if self.xp then
+		return xadd(self, s, unq)
+	end
+	padd(self, s, unq)
+end
+function FB:split(v)
+	local lg = self.log
+	if lg then
+		self.xs = true
+		lg[#lg + 1] = { 2, v }
+		return
+	end
+	if self.xp then
+		self.pend = (self.pend or "") .. v
+		return
+	end
+	psplit(self, v)
 end
 -- $@ / $* / array elements, joined/split per bash: quoted "$@" is one field PER element
 -- (each concatenates with the abutting text — the first with what precedes, the last
 -- with what follows); quoted "$*" joins on IFS[0]; unquoted joins on IFS[0] then
 -- word-splits — so empty elements survive under a non-whitespace IFS (`=$@=` on empty
 -- params gives `= '' '' '' =`) — except under IFS='' (no splitting): per element, empty
--- ones dropped.
-function FB:multi(els, quoted, star)
+-- ones dropped. `lone`: the word is exactly "$@" (not in an array literal) — bash's
+-- expand_word_internal shortcut returns its quoted elements unsplit; any other quoted
+-- @-form makes bash word-split the whole word (has_dollar_at: `xs`).
+function FB:multi(els, quoted, star, lone, segend)
+	local lg = self.log
+	if lg then
+		if not (quoted and (star or lone)) then
+			self.xs = true
+		end
+		lg[#lg + 1] = { 3, els, quoted, star, nil, segend }
+		return
+	end
 	if quoted and star then
-		self:add(table.concat(els, M.ifs_first(self.ifs)), false)
+		self:add(table.concat(els, M.ifs_first(self.ifs, self.sh)), false)
 	elseif quoted or self.ifs == "" then
 		for k = 1, #els do
-			if k > 1 then
+			local sep = true
+			if k > 1 and quoted and self.st and self.ifs:byte(1) >= 0x80 then
+				-- (the unquoted IFS[0] between them is visited too: completing a pending
+				-- mbtowc state it is a char, delimiting only if IFS holds it. When IFS is no
+				-- valid text bash tests it against a wcharlist mbstowcs left UNINITIALIZED —
+				-- heap garbage, so bash itself varies; taken as holding nothing)
+				local sp = M.ifs_first(self.ifs, self.sh)
+				local r, ch = M.mbtowc_visit(self.sh, sp, 1, #sp, true)
+				if r > 0 and not (self.ic.wset and self.ic.wset[ch]) then
+					padd(self, sp, true)
+					sep = false
+				end
+			end
+			if k > 1 and sep then
+				-- (bash joins the elements with an unquoted IFS[0] and splits: after an
+				-- exposed byte ended the last field, a non-whitespace IFS[0] delimits an
+				-- empty one)
+				if self.dl == 3 and quoted and not self.ic.wsb[self.ifs:byte(1)] then
+					self.cur = ""
+					pbrk(self)
+				end
 				self:brk()
 			end
 			if quoted then
-				self:add(els[k], false)
+				if self.xp and k < #els then -- (IFS[0], raw, follows each element but the last)
+					local pk, pe = self.peek, self.peekend
+					self.peek, self.peekend = M.ifs_first(self.ifs, self.sh), false
+					self:add(els[k], false)
+					self.peek, self.peekend = pk, pe
+				else
+					self:add(els[k], false)
+				end
 			else
 				self:split(els[k])
 			end
 		end
+		if not quoted and #els > 0 then
+			self.sos = true -- (IFS '': bash splits it on spaces — a scan: FB:finish)
+		end
 	else
-		self:split(table.concat(els, M.ifs_first(self.ifs)))
+		self:split(table.concat(els, M.ifs_first(self.ifs, self.sh)))
+	end
+	if segend and quoted and not star then
+		self:dqend()
+	end
+end
+-- The end of a double-quoted "…" that holds an @ expansion (a lone "${a[@]}" is one): bash
+-- splits that segment by ITSELF first (expand_word_internal's inner call: its list_string,
+-- quoted=1) and joins the words back with IFS[0] into the word — so a byte shown at the
+-- segment's very end (xadd's exposure) delimits no trailing field: what follows the
+-- segment joins the field before it (`set -- é; IFS=é; "$@"b` is `\xc3b`).
+function FB:dqend()
+	local lg = self.log
+	if lg then
+		lg[#lg + 1] = { 5 }
+		return
+	end
+	local n = self.n
+	if self.xp and self.dl == 3 and self.cur == nil and n > 0 then
+		self.cur, self.unq, self.q = self.fields[n], self.fu[n], self.fq[n]
+		self.fields[n], self.n, self.dl = nil, n - 1, nil
+	end
+end
+local function replay(self)
+	local lg = self.log
+	self.log = nil
+	self.xp = self.xs
+	self.st = self.xs and self.ic.u8 -- (the scan's mbtowc calls: see M.mbtowc_visit)
+	local set = self.set
+	for k = 1, #lg do
+		local op = lg[k]
+		local t = op[1]
+		self.last = k == #lg -- (the last op's text ends the word)
+		if self.st then -- (the raw bytes after this op, as mbtowc may read on into them)
+			local acc, j, whole = "", k + 1, true
+			if (lg[j] and lg[j][1] == 5) or (t == 3 and op[6]) then
+				j = nil -- (a "…$@…" segment ends here: bash scanned it alone, to ITS end)
+			end
+			while j and whole and #acc < 6 and lg[j] do
+				local o = lg[j]
+				if o[1] == 2 then
+					acc = acc .. o[2]
+				elseif o[1] == 1 and o[3] and o[2] ~= "" and not set[o[2]:sub(1, 1)] then
+					local q = o[2]:find("[" .. self.ic.cls .. "]")
+					acc, whole = acc .. o[2]:sub(1, (q or 0) - 1), q == nil
+				else
+					whole = false
+				end
+				j = j + 1
+			end
+			self.peek, self.peekend = acc, j == nil or (whole and lg[j] == nil)
+		end
+		if t == 1 then
+			self:add(op[2], op[3])
+		elseif t == 2 then
+			self:split(op[2])
+		elseif t == 3 then
+			self:multi(op[2], op[3], op[4], nil, op[6])
+		elseif t == 5 then
+			self:dqend()
+		else
+			self:brk()
+		end
 	end
 end
 -- The fields, pathname-expanded where a glob metacharacter is glob-active (unless set -f
 -- or `noglob` — compgen -W's word, whose $(…) bodies still glob). The common word globs
 -- nothing: its field list is returned as is.
 function FB:finish(noglob)
+	if self.log then
+		replay(self)
+	end
+	if self.pend then
+		flush(self, true)
+	elseif self.rt and not self.st and self.rt:byte(-1) >= 0x80
+		and (self.ic.u8 or (self.sos and M.lc_mb_cur_max() > 1 and M.lc_utf8())) then
+		M.mbw_tail(self.sh, self.rt) -- (the scan of a word that ends in an incomplete char)
+	end
 	self:brk()
 	local fields, fu, fq = self.fields, self.fu, self.fq
 	local sh = self.sh
@@ -11238,8 +11708,8 @@ function M.dqseg(seg, dqend)
 end
 function M.expand_fields(sh, segs)
 	local s1 = #segs == 1 and segs[1]
-	if s1 and s1.multi and s1.q and not s1.star then -- a lone "$@" / "${a[@]}": its elements
-		return s1.elems
+	if s1 and s1.multi and s1.q and not s1.star and (s1.at or not M.ifs_charset(sh).mbx) then
+		return s1.elems -- a lone "$@" / "${a[@]}": its elements (unless their bytes can show: FB)
 	end
 	if s1 and not s1.multi and s1.s and M.plain_field(sh, s1.s) then -- (one plain word: as is)
 		if s1.s == "" and s1.split then
@@ -11248,16 +11718,24 @@ function M.expand_fields(sh, segs)
 		return { s1.s }
 	end
 	local fb = M.fb_new(sh)
+	if fb.ic.mixed then -- (a has_dollar_at word splits its start unstripped: FB's dl 0)
+		for _, seg in ipairs(segs) do
+			if seg.h then
+				fb.dl = 0
+				break
+			end
+		end
+	end
 	local dq_null, dq_at -- (a "…$@…" segment's parts, rt.dqseg: as interp's expand_to_fields)
 	for _, seg in ipairs(segs) do
 		if seg.dq and (seg.multi and #seg.elems == 0 or seg.s == "") then
 			if seg.multi and not seg.star then
-				dq_at = true
+				dq_at, fb.xs = true, true
 			else
 				dq_null = true
 			end
 		elseif seg.multi then
-			fb:multi(seg.elems, seg.q, seg.star)
+			fb:multi(seg.elems, seg.q, seg.star, s1 and seg.at, not seg.dq)
 		elseif seg.split then
 			fb:split(seg.s)
 		else
@@ -11267,6 +11745,7 @@ function M.expand_fields(sh, segs)
 			if dq_null and not dq_at then
 				fb:add("", false)
 			end
+			fb:dqend()
 			dq_null, dq_at = nil, nil
 		end
 	end
@@ -11281,10 +11760,34 @@ end
 -- Bash-correct standalone IFS split (for `read -a`): the field engine's split, with
 -- read's CTLESC markers (\1 before each backslash-escaped char: that char is literal —
 -- part of a field, never a delimiter; the marker dropped) unless `nomark` (read's
--- skip_ctlesc: $IFS itself holds \1). No pathname expansion.
-function M.ifs_split(sh, s, nomark)
-	local fb = M.fb_new(sh)
+-- skip_ctlesc: $IFS itself holds \1). No pathname expansion. Under skip_ctlesc read.def
+-- still marks a CTLNUL (\177) byte as \1\177 — a pair list_string's
+-- string_extract_verbatim keeps whole (SX_NOESCCTLNUL) though \1 is an IFS char — while
+-- an ESCAPED \177 went in bare (pass_next), and list_string's remove_quoted_nulls drops a
+-- bare one from its field (a field that was only that stays, empty). (With \177 in IFS
+-- too nothing is marked: it is just a delimiter.)
+function M.ifs_split(sh, s, nomark, saw)
+	local fb = M.fb_new(sh, true)
 	local i, n = 1, #s
+	if fb.ic.u8 and (sh.mbw or (s:byte(-1) or 0) >= 0x80) then
+		fb.st = true -- (list_string's scan and glibc's mbtowc state: M.mbtowc_visit)
+	end
+	if nomark and not fb.set["\127"] then
+		while true do
+			local p = s:find("\127", i, true)
+			if not p then
+				break
+			end
+			if p > i and s:byte(p - 1) == 1 then
+				fb:split(s:sub(i, p - 2))
+				fb:add(saw and "\127" or "\1\127", false) -- (dequoted only if read marked one)
+			else
+				fb:split(s:sub(i, p - 1))
+				fb:add("", false)
+			end
+			i = p + 1
+		end
+	end
 	while not nomark do
 		local p = s:find("\1", i, true)
 		if not p or p == n then -- (a trailing lone \1 is plain text)
@@ -11294,6 +11797,7 @@ function M.ifs_split(sh, s, nomark)
 		fb:add(s:sub(p + 1, p + 1), false)
 		i = p + 2
 	end
+	fb.tail = true
 	fb:split(s:sub(i))
 	fb:brk()
 	return fb.fields

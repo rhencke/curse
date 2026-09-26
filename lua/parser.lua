@@ -897,7 +897,7 @@ parse_paramexp = function(inner)
 			return { param = tonumber(name), braced = true } -- (set -u names it `9`, not `$9`)
 		end
 		if name == "@" or name == "*" then
-			return { special = name }
+			return { special = name, braced = true }
 		end
 		return { var = name }
 	end
@@ -1536,6 +1536,44 @@ local function strip_contin(w)
 	return table.concat(o)
 end
 
+-- A bare array-literal element's word: a copy (parse_word memoizes — the cached word is
+-- shared) marked `noassign` (its `x=~` is not an assignment: no ~ after =) and `aelem`
+-- (bash expands it with other word flags: a lone "$@" there splits as "${@}" does).
+local function elem_word(w)
+	local c = {}
+	for k, v in pairs(w) do
+		c[k] = v
+	end
+	c.noassign, c.aelem = true, true
+	return c
+end
+-- The valid UTF-8 sequence starting at w[i] (a lead byte 0xC2-0xF4), as mbrtowc takes
+-- it (no overlong, surrogate or >U+10FFFF form), or nil.
+local function utf8_seq(w, i)
+	local b = w:byte(i)
+	local l = b >= 0xF0 and 4 or b >= 0xE0 and 3 or 2
+	local lo, hi = 0x80, 0xBF
+	if b == 0xE0 then
+		lo = 0xA0
+	elseif b == 0xED then
+		hi = 0x9F
+	elseif b == 0xF0 then
+		lo = 0x90
+	elseif b == 0xF4 then
+		hi = 0x8F
+	end
+	local c = w:byte(i + 1)
+	if not c or c < lo or c > hi then
+		return nil
+	end
+	for k = i + 2, i + l - 1 do
+		c = w:byte(k)
+		if not c or c < 0x80 or c > 0xBF then
+			return nil
+		end
+	end
+	return w:sub(i, i + l - 1)
+end
 local function parse_word(w)
 	local src = w -- as written (`declare -f` prints words so)
 	w = strip_contin(w)
@@ -1598,9 +1636,15 @@ local function parse_word(w)
 			elseif nx == "" then -- a backslash ending the input is itself literal (bash: `a\`)
 				parts[#parts + 1] = { lit = "\\", q = true }
 			else
+				-- (a valid UTF-8 sequence is escaped WHOLE — bash's SCOPY_CHAR_I: one CTLESC
+				-- before the char, so a word split still sees its later bytes)
+				local b = nx:byte()
+				if b >= 0xC2 and b <= 0xF4 then
+					nx = utf8_seq(w, i + 1) or nx
+				end
 				parts[#parts + 1] = { lit = nx, q = true }
 			end
-			i = i + 2
+			i = i + 1 + math.max(#nx, 1)
 		else
 			local s, e = w:find("^[^$'\"`\\<>]+", i)
 			if not s then
@@ -3804,14 +3848,12 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs, xg, bq
 					local factors = brace_factors(rhs)
 					if factors then
 						stream_factors(factors, function(x)
-							local bw = bq_word(x)
-							bw.noassign = true -- (a bare element's `x=~` is not an assignment: no ~ after =)
+							local bw = elem_word(bq_word(x))
 							elems[#elems + 1] = { key = nil, op = "=", word = bw }
 							return #elems >= BRACE_CAP
 						end)
 					else
-						local bw = parse_word(rhs)
-						bw.noassign = true
+						local bw = elem_word(parse_word(rhs))
 						elems[#elems + 1] = { key = nil, op = "=", word = bw }
 					end
 				else
@@ -3826,8 +3868,7 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs, xg, bq
 					if factors then
 						elem.brace_bare = {}
 						stream_factors(factors, function(x)
-							local bw = bq_word(x)
-							bw.noassign = true
+							local bw = elem_word(bq_word(x))
 							elem.brace_bare[#elem.brace_bare + 1] = bw
 							return #elem.brace_bare >= BRACE_CAP
 						end)
