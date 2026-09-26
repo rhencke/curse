@@ -2424,7 +2424,6 @@ local function brace_factors(s)
 	flush()
 	return any and factors or nil
 end
-M.brace_factors = brace_factors
 
 local brace_stream -- forward (mutually recursive with itself over nested alts)
 local function range_count(r)
@@ -2496,8 +2495,6 @@ brace_stream = function(s, emit)
 		stream_factors(f, emit)
 	end
 end
-M.brace_stream = brace_stream
-M.stream_factors = stream_factors
 
 -- Cheap count of a factor list's total expansions, capped (returns >BRACE_CAP as
 -- soon as it's known to exceed, without building anything).
@@ -2530,7 +2527,6 @@ local function count_str(s)
 	return total
 end
 M.brace_count = count_str
-M.BRACE_CAP = BRACE_CAP
 
 -- Append a raw word to a word-list, brace-expanding it. Streams combinations
 -- (ranges symbolic) and STOPS after BRACE_CAP words — so a pathological

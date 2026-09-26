@@ -5,12 +5,11 @@
 -- automatically a new key (no invalidation dance), and `make`'s `sh -c '…'`
 -- (which has no file at all) caches fine.
 --
--- What we cache is the EMITTED LUA SOURCE (emit.lua's output), which is portable
--- and cheap to (re)generate. We deliberately do NOT cache LuaJIT machine-code
--- traces — stock LuaJIT can't persist them — so a one-shot process still pays
--- interpreter speed on the cached Lua; the win there is skipping parse+emit.
--- (The real speed for high-count short invocations comes later from a warm
--- daemon whose forked workers inherit traces via CoW — see README/roadmap.)
+-- What we cache is the compiled module as STRIPPED BYTECODE (string.dump of the
+-- loaded emit.lua output; the Lua source when a dump fails), so a hit skips parse,
+-- emit and the Lua parse. LuaJIT machine-code traces can't be persisted, so a
+-- one-shot process still warms up from scratch; the resident daemon (tier.lua's
+-- in-process module cache) is what keeps traces hot across runs.
 --
 -- HARD INVARIANT: the cache is an optimization. ANY failure in it — no space
 -- (ENOSPC), read-only fs (EROFS, e.g. early boot before /var is rw), no perms,
@@ -44,7 +43,6 @@ local stamp = ("curse%s-%s-%s"):format(
 	(jit and jit.version or _VERSION):gsub("%s+", ""),
 	(jit and jit.arch or "?")
 )
-M.stamp = stamp
 -- ...and the exact curse BUILD: compiled code calls straight into runtime/interp internals,
 -- so an artifact emitted by one build can be wrong under another even at the same version.
 -- The bundle carries its content hash (build.lua -> curse_buildid); from sources, hash the
@@ -190,12 +188,10 @@ function M.store(path, code)
 	return ok
 end
 
--- Run `src` against `sh`, using the cache. Returns (sh, how) where how is one of
--- "warm" (ran a cached artifact), "cold" (compiled fresh, then cached), or
--- "interp" (the compiler couldn't handle it — ran the tree-walker). Never fails
--- for a cache reason.
--- Run a compiled module with the interp's line-abort semantics (see tier.lua):
--- a div0/failglob lineabort re-enters run at sh._ff (next line) with $?=1.
+-- Run a compiled module with the interp's line-abort semantics: a div0/failglob
+-- lineabort re-enters run at sh._ff (next line) with $?=1. (A reduced tier.run_compiled:
+-- no dbgskip, frame unwinding or line drift — the cached mode is a dev path; the daemon
+-- runs tier.)
 local function run_compiled(mod, sh, pc)
 	local ne0 = sh.noerr
 	while true do
@@ -212,6 +208,10 @@ local function run_compiled(mod, sh, pc)
 	end
 end
 
+-- Run `src` against `sh`, using the cache. Returns (sh, how) where how is one of
+-- "warm" (ran a cached artifact), "cold" (compiled fresh, then cached), or
+-- "interp" (the compiler couldn't handle it — ran the tree-walker). Never fails
+-- for a cache reason.
 function M.run(src, sh)
 	local path = M.artifact_path(src)
 

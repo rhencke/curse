@@ -287,12 +287,9 @@ local function reads_var(stmts, name)
 	end)
 end
 
--- Does the program install a `trap … SIG` for one of `sigs` (a set of names)? Used
--- to gate per-command trap hooks (ERR/DEBUG) so a trap-free script pays nothing.
--- Does the program install ANY trap? A forked `&`/pipeline-stage child resets caught
--- SIGNAL traps to default (bash); we compile those constructs only when the program
--- has no traps at all, so the child needs no signal machinery. Recurses broadly
--- (body/clauses/cmd/cmds/items) so a trap anywhere is seen.
+-- Does the program install ANY trap? (A trap handler's `return` returns from the function
+-- it interrupted: EF.trap_ret.) Recurses broadly (body/clauses/cmd/cmds/items) so a trap
+-- anywhere is seen.
 local function scan_any_trap(stmts)
 	return any_node(stmts, function(st)
 		return st.t == "simple" and st.words and st.words[1] and st.words[1].parts[1]
@@ -300,76 +297,14 @@ local function scan_any_trap(stmts)
 	end)
 end
 
--- Does the program trap a REAL signal (or use a trap spec it can't read statically)?
--- Pseudo-signal traps (EXIT/ERR/DEBUG/RETURN) fire synchronously and are already scoped
--- per subshell/stage/$(…) by the runtime (in_subprogram/in_pipestage/calldepth), so they
--- don't stop those running in-process; a real signal can arrive asynchronously while an
--- in-process body runs on a copied state, so any such trap keeps them on the fork path.
-local PSEUDO_SIG = { EXIT = 1, ["0"] = 1, ERR = 1, DEBUG = 1, RETURN = 1, SIGEXIT = 1 }
-local function trap_cmd_sigs_pseudo(st)
-	local words = {}
-	for j = 2, #st.words do
-		local w = st.words[j]
-		local lit = ""
-		for _, p in ipairs(w.parts or {}) do
-			if p.lit == nil then
-				return false -- a dynamic word: can't tell what it traps
-			end
-			lit = lit .. p.lit
-		end
-		words[#words + 1] = lit
-	end
-	local k = 1
-	while words[k] and words[k]:match("^%-") and words[k] ~= "-" do
-		if words[k] ~= "-p" and words[k] ~= "-l" and words[k] ~= "--" then
-			return false
-		end
-		k = k + 1
-	end
-	local rest = {}
-	for j = k, #words do
-		rest[#rest + 1] = words[j]
-	end
-	-- `trap - SIG…` (reset to default) and `trap '' SIG…` (ignore) install no HANDLER — an
-	-- ignored disposition is inherited by real subshells anyway — so only a real action on a
-	-- real signal can deliver asynchronously into an in-process body.
-	if #rest >= 2 and (rest[1] == "-" or rest[1] == "") then
-		return true
-	end
-	-- `trap ACTION SIG…` (first word is the action) or `trap SIG` (reset); check every
-	-- word that could be a signal spec
-	local from = #rest >= 2 and 2 or 1
-	for j = from, #rest do
-		if not PSEUDO_SIG[rest[j]:upper()] then
-			return false
-		end
-	end
-	return true
-end
-local function scan_sigtrap(node)
+-- One walk over the program for the text-level facts the compile keys on, into `acc`:
+-- can it turn on xtrace (acc.x: `set -x`, `set -o xtrace`, or a non-literal `set`
+-- argument that might — compiled code then carries per-command trace hooks), set -k
+-- (acc.k), restricted mode (acc.r), and the others noted below.
+local function scan_program(node, acc)
 	if type(node) ~= "table" then
-		return false
+		return acc
 	end
-	if node.t == "simple" and node.words and node.words[1] and node.words[1].parts[1]
-		and node.words[1].parts[1].lit == "trap" and not trap_cmd_sigs_pseudo(node)
-	then
-		return true
-	end
-	for _, v in pairs(node) do
-		if type(v) == "table" and scan_sigtrap(v) then
-			return true
-		end
-	end
-	return false
-end
--- What in the program needs machinery the compiled tier lacks (a reason string), and
--- can it turn on xtrace (`set -x`, `set -o xtrace`, or a non-literal `set` argument that
--- might) — the second result: compiled code then carries per-command trace hooks.
-local function scan_xtrace(node, acc)
-	if type(node) ~= "table" then
-		return nil
-	end
-	acc = acc or {}
 	if node.name == "FUNCNEST" or node.var == "FUNCNEST" or (node.lit and node.lit:find("FUNCNEST", 1, true)) then
 		acc.funcnest = true -- $FUNCNEST limits call depth: compiled calls count it (fnwrap)
 	end
@@ -426,16 +361,13 @@ local function scan_xtrace(node, acc)
 	end
 	for _, v in pairs(node) do
 		if type(v) == "table" then
-			local r = scan_xtrace(v, acc)
-			if r then
-				return r
-			end
+			scan_program(v, acc)
 		end
 	end
-	return nil, acc.x, acc.lex, acc.funcnest, acc.bcmd, acc.enable, acc.k, acc.r, acc.extdebug
+	return acc
 end
--- functrace (set -T / -o functrace) extends DEBUG into subshells, which compiled
--- fragments don't hook — keep those programs on the delegated path.
+-- functrace (set -T / -o functrace) extends DEBUG into subshells and $(…), which compiled
+-- $(…) fragments don't hook — those bodies keep the interpreter's capture (compile_cmdsub).
 local function scan_functrace(node)
 	if type(node) ~= "table" then
 		return false
@@ -458,6 +390,8 @@ local function scan_functrace(node)
 	return false
 end
 
+-- Does the program install a `trap … SIG` for one of `sigs` (a set of names)? Used
+-- to gate per-command trap hooks (ERR/DEBUG) so a trap-free script pays nothing.
 local function scan_trap(stmts, sigs)
 	return any_node(stmts, function(st)
 		if st.t == "simple" and st.words and st.words[1] and st.words[1].parts[1]
@@ -856,56 +790,6 @@ local function arith_word_ok(e)
 	end
 	return arith_val_r(e) -- a value with a nested side effect fails here (operands must be pure)
 end
--- Does a subshell body statically run `set`? A fork-compiled subshell body is a
--- straight-line sub-CFG; it can't honor an errexit toggle (`set -e`) that turns
--- on partway through, whereas the interpreter checks errexit per command. So a
--- body that runs `set` is delegated WHOLE to the interpreter (still inside a
--- fork), matching interp exactly. (Errexit INHERITED at entry is handled
--- separately by the runtime `sh.opt_e` guard in the subshell branch.)
-local function stmt_runs_set(st)
-	local t = st.t
-	if t == "simple" then
-		local w1 = st.words[1]
-		return (w1 and w1.parts[1] and w1.parts[1].lit) == "set"
-	elseif t == "background" then
-		return stmt_runs_set(st.cmd)
-	elseif t == "pipeline" then
-		for _, c in ipairs(st.cmds) do
-			if stmt_runs_set(c) then
-				return true
-			end
-		end
-	elseif t == "andor" then
-		for _, it in ipairs(st.items) do
-			if stmt_runs_set(it.cmd) then
-				return true
-			end
-		end
-	elseif t == "if" or t == "case" then
-		for _, cl in ipairs(st.clauses) do
-			for _, s in ipairs(cl.body) do
-				if stmt_runs_set(s) then
-					return true
-				end
-			end
-		end
-	elseif st.body then
-		for _, s in ipairs(st.body) do
-			if stmt_runs_set(s) then
-				return true
-			end
-		end
-	end
-	return false
-end
-local function body_runs_set(list)
-	for _, st in ipairs(list) do
-		if stmt_runs_set(st) then
-			return true
-		end
-	end
-	return false
-end
 -- errexit (`set -e`): after a failing command the shell exits — but only for the
 -- statement kinds bash applies it to (a compound's INNER commands fire it; &&/||
 -- have their own final-operand rule handled by the delegated interp; conditions
@@ -996,7 +880,7 @@ EF.enable = false -- program may run `enable -n` → a native builtin call check
 EF.funcnest = false -- program may set $FUNCNEST → compiled calls check the call depth (fnwrap)
 EF.funcstack = false -- program reads $FUNCNAME → maintain sh.funcstack around calls
 EF.pipestatus = false -- program reads $PIPESTATUS → set it (=(status)) after each simple cmd
-EF.has_trap = false -- program installs any trap → a forked `&`/pipeline child must reset caught signal traps
+EF.has_trap = false -- program installs any trap (EF.trap_ret)
 EF.trap_ret = false -- a trap handler's `return` may end a compiled function → fn_x catches it (rt.catch_return)
 local emit_redir_funcs = {} -- funcs with a definition redirect (`f(){…} >&2`): delegate them + their calls
 local emit_multidef = {} -- names defined by more than one top-level funcdef: a single hoisted
@@ -3793,9 +3677,7 @@ end
 -- The CFG compiler only understands ARITHMETIC conditions. A forc cond is
 -- already an arith node; a while/if cond is now a command list, which we compile
 -- only when it's exactly one `(( expr ))` — extract that arith node here (never
--- mutating the shared AST). Returns nil for a cond the compiler can't handle;
--- assert_compilable (below) has already thrown for those, so post-validation this
--- always yields the arith node for the conds that remain.
+-- mutating the shared AST). Returns nil for any other cond.
 local function cond_arith(c)
 	if type(c) ~= "table" then
 		return nil
@@ -8298,11 +8180,6 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
 		return p
 	end
 
-	-- Statement types with no native compiled form yet -> always delegate.
-	cx.DELEGATE = {
-		assignlist = 1,
-	}
-
 	-- Compile one redirect's target to a native Lua expr (op + fd are already
 	-- compile-time constants). Returns the expr, or nil when this redirect isn't
 	-- monomorphic enough to compile — a `{var}>` named fd, a fd MOVE (`>&N-`), an
@@ -8425,31 +8302,6 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
 	-- body raise to delegate()'s cf-wrapper (cfraise), which jumps like the keyword would.
 	-- nil -> caller falls back (uncompilable redir, traps, or a shape the fragment can't carry).
 	cx.REDIR_COMPOUND = { forc = 1, whilec = 1, forin = 1, ["if"] = 1, andor = 1, group = 1, case = 1, ["select"] = 1 }
-	function cx.has_node(node, pred)
-		if type(node) ~= "table" then
-			return false
-		end
-		if pred(node) then
-			return true
-		end
-		for _, v in pairs(node) do
-			if type(v) == "table" and cx.has_node(v, pred) then
-				return true
-			end
-		end
-		return false
-	end
-	function cx.is_funcdef(n)
-		return n.t == "funcdef"
-	end
-	function cx.is_return(n)
-		if n.t ~= "simple" or not n.words then
-			return false
-		end
-		local w1 = n.words[1]
-		local c = w1 and w1.parts and w1.parts[1] and w1.parts[1].lit
-		return c == "return" or c == "builtin" or c == "command" or c == "eval" or c == "source" or c == "."
-	end
 	function cx.stdout_redir(rd)
 		for _, r in ipairs(rd) do
 			if
@@ -8885,9 +8737,6 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
 		if t == "assignlist" then
 			return H.assignlist(cx, st, after)
 		end
-		if cx.DELEGATE[t] then
-			return cx.delegate(st, after)
-		end
 		if t == "parse_error" or t == "warn" then -- (the report is data: rt prints it; a
 			-- fatal parse error raises its exit through the wrapper, lifted vars synced for EXIT)
 			return cx.delegate(st, after, {
@@ -9272,75 +9121,6 @@ assemble = function(cfg, sig, opts)
 	return table.concat(o, "\n")
 end
 
--- The CFG compiler is a subset. Throw for anything it can't faithfully compile,
--- so cache.lua/tier fall back to the interpreter (the semantic oracle) rather
--- than miscompiling. As coverage grows these gates are removed one by one.
-local function assert_compilable(stmts)
-	for _, st in ipairs(stmts) do
-		local t = st.t
-		if t == "parse_error" then
-			error("curse-nocompile: parse_error (deferred)")
-		elseif t == "arithcmd" then
-			error("curse-nocompile: (( )) command")
-		elseif t == "andor" then
-			error("curse-nocompile: && / || list")
-		elseif t == "pipeline" then
-			error("curse-nocompile: pipeline")
-		elseif t == "case" then
-			error("curse-nocompile: case")
-		elseif t == "group" then
-			error("curse-nocompile: group")
-		elseif t == "subshell" then
-			if st.redirs then
-				error("curse-nocompile: subshell with redirs")
-			end
-			assert_compilable(st.body) -- bare ( body ) compiles: fork + bounded sub-CFG
-		elseif t == "dbracket" then
-			error("curse-nocompile: [[ ]]")
-		elseif t == "arrayassign" then
-			error("curse-nocompile: array assign")
-		elseif t == "assign" and (st.index or st.append) then
-			error("curse-nocompile: array/append assign")
-		elseif t == "whilec" then
-			if st.negate or cond_arith(st.cond) == nil then
-				error("curse-nocompile: while/until cond")
-			end
-			assert_compilable(st.body)
-		elseif t == "if" then
-			for _, cl in ipairs(st.clauses) do
-				if cl.cond ~= nil and cond_arith(cl.cond) == nil then
-					error("curse-nocompile: if cond")
-				end
-				assert_compilable(cl.body)
-			end
-		elseif t == "forc" or t == "forin" or t == "funcdef" then
-			assert_compilable(st.body)
-		elseif t == "simple" then
-			if st.redirs then
-				error("curse-nocompile: redirection")
-			end
-			local w1 = st.words[1]
-			local cmd = w1 and w1.parts[1] and w1.parts[1].lit
-			local BUILTIN = {
-				test = 1,
-				["["] = 1,
-				exit = 1,
-				cd = 1,
-				unset = 1,
-				set = 1,
-				shift = 1,
-				read = 1,
-				export = 1,
-				declare = 1,
-				typeset = 1,
-			}
-			if BUILTIN[cmd] then
-				error("curse-nocompile: builtin " .. cmd)
-			end
-		end
-	end
-end
-
 -- Aliases compile when their effect is STATICALLY known. The parser (sh-less) expands
 -- them as a function of the source text: alias/unalias/`shopt ±s expand_aliases` apply from
 -- the NEXT line (bash parses a line before running it), and each $(…) body carries the
@@ -9453,9 +9233,10 @@ function M.emit(ast, opts)
 	-- script's own (a break/return there is the script's, not a caller's)
 	EF.lm = opts and opts.lm or false
 	-- a program that can turn on xtrace (`set -x`, `set -o xtrace`, a dynamic `set` word)
-	-- carries per-command trace hooks (`if sh.opt_x then rt.xtrace…`); other machinery the
-	-- compiled tier lacks keeps the program interpreted (the reason names it)
-	local xwhy, xt, xlex, fnest, bcmd, enable, kw, restr, extdbg = scan_xtrace(ast.stmts)
+	-- carries per-command trace hooks (`if sh.opt_x then rt.xtrace…`)
+	local scan = scan_program(ast.stmts, {})
+	local xt, xlex, fnest, bcmd, enable, kw, restr, extdbg =
+		scan.x, scan.lex, scan.funcnest, scan.bcmd, scan.enable, scan.k, scan.r, scan.extdebug
 	EF.extdebug = extdbg or (opts and opts.extdebug) or false -- (opts: tier.note_text "X")
 	EF.dbg_after_of = setmetatable({}, { __mode = "k" })
 	EF.cur_cfg = "run"
@@ -9472,9 +9253,6 @@ function M.emit(ast, opts)
 	-- (`enable -n NAME` here, or maybe in eval/source code or around a fragment: a native
 	-- builtin call first checks the name is still a builtin)
 	EF.enable = enable or EF.fragment or scan_dyncode(ast.stmts)
-	if xwhy then
-		error("curse-nocompile: " .. xwhy)
-	end
 	-- (an extglob-dependent parse made by a guess at the extglob state: parser xg_guess)
 	xlex = xlex or (ast.xg_guess and "extglob state")
 	if xlex and not EF.lm then -- (the whole program can't: the tier runs it line by line)
@@ -9526,12 +9304,10 @@ function M.emit(ast, opts)
 	EF.funcstack = reads_debugstack(ast.stmts) or fo.funcstack or false -- gate FUNCNAME/BASH_SOURCE/BASH_LINENO stacks
 	EF.pipestatus = reads_var(ast.stmts, "PIPESTATUS") or fo.pipestatus or false -- gate $PIPESTATUS after simple cmds
 	EF.lm_aenv = fo.lm_aenv -- (line mode: the alias table $(…) bodies parse with; false: capture_src)
-	EF.has_trap = scan_any_trap(ast.stmts) -- gate compiled `&`/pipeline (forked child resets signal traps)
-	-- in-process subshell/$(…)/pipeline-stage gate: only a REAL-signal trap (or DEBUG under
-	-- functrace, which reaches into subshells) keeps them forked/delegated
+	EF.has_trap = scan_any_trap(ast.stmts)
+	-- a DEBUG trap under functrace reaches into $(…): a mutating body runs in the
+	-- interpreter's capture (compile_cmdsub), which fires it
 	EF.inproc_trap_block = EF.has_debug and (fo.functrace or scan_functrace(ast.stmts) or EF.extdebug) -- (extdebug: functrace too)
-	-- (`&` still forks: a real-signal trap must be reset in its child — interp's machinery)
-	EF.bg_trap_block = scan_sigtrap(ast.stmts) or EF.inproc_trap_block
 	local funcflags, inlinable, inlinefns = {}, {}, {}
 	-- With a DEBUG/ERR trap, DON'T inline: an inlined body runs at the caller's level,
 	-- where its commands would fire DEBUG/ERR that bash scopes to the (un-entered)
