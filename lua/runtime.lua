@@ -2869,17 +2869,17 @@ local function subprog_enter(self)
 	if self.jobs_waited then
 		M.jobs_cleanup_waited(self)
 	end
-	local sv = { self.aliases, self.cur_line, self.cur_cmd, self.shlvl_tail, self.cur_cline, self.loopdepth,
-		self.subdepth }
-	self.aliases = shallowcopy(self.aliases) or {}
+	local al, ln, cc, tl, cl, ld, sd = self.aliases, self.cur_line, self.cur_cmd, self.shlvl_tail, self.cur_cline,
+		self.loopdepth, self.subdepth
+	self.aliases = shallowcopy(al) or {}
 	self.shlvl_tail = nil
 	self.in_subprogram = (self.in_subprogram or 0) + 1
-	self.subdepth = (self.subdepth or 0) + 1
-	return sv
+	self.subdepth = (sd or 0) + 1
+	return al, ln, cc, tl, cl, ld, sd -- (the saved state as values: no table per subprogram)
 end
-local function subprog_leave(self, sv)
-	self.aliases, self.cur_line, self.cur_cmd, self.shlvl_tail = sv[1], sv[2], sv[3], sv[4]
-	self.cur_cline, self.loopdepth, self.subdepth = sv[5], sv[6], sv[7]
+local function subprog_leave(self, al, ln, cc, tl, cl, ld, sd)
+	self.aliases, self.cur_line, self.cur_cmd, self.shlvl_tail = al, ln, cc, tl
+	self.cur_cline, self.loopdepth, self.subdepth = cl, ld, sd
 	self.in_subprogram = self.in_subprogram - 1
 end
 local deferred_sigs, cap_depth, cap_pid, flush_deferred, cap_enter -- (the signal hold: see M.defer_signal)
@@ -2887,7 +2887,7 @@ function Shell:capture_inproc(backtick, runner, capfd, ctx)
 	M.env_rebuilt(self) -- (command_substitute's maybe_make_export_env)
 	-- ($(…) inside a loop knows it — a break/continue there ends the substitution, as it
 	-- ends a `( … )` (bash) — so its loopdepth stays)
-	local sp = subprog_enter(self)
+	local s1, s2, s3, s4, s5, s6, s7 = subprog_enter(self)
 	local buf, tmp, save1
 	if capfd then
 		io.flush()
@@ -2954,7 +2954,7 @@ function Shell:capture_inproc(backtick, runner, capfd, ctx)
 		end
 		M.iso_restore_fds(ctx) -- (`exec 4>&1` in the body: undone while fd 1 is still the capture)
 	end
-	subprog_leave(self, sp)
+	subprog_leave(self, s1, s2, s3, s4, s5, s6, s7)
 	self.hashcache, self.hashpath = sv_hc, sv_hp
 	self.opt_e = savede
 	self.capturing = saved_cap
@@ -3071,6 +3071,8 @@ local function opt_fields()
 end
 M.opt_fields = opt_fields
 local iso_push, iso_pop
+local sub_checkpoint, sub_restore, scopes_copy
+do -- (a block of its own: the main chunk is at LuaJIT's 200-local limit)
 -- The Shell fields a subshell may change that are plain values or containers it replaces
 -- or mutates in place: SUB_KEEP is saved and put back; SUB_COPY also gets a private
 -- shallow copy for the body. (Deeper state — vars, the dynamic scopes, params, completion
@@ -3079,13 +3081,33 @@ local SUB_KEEP = { "hashpath", "tcwd", "random_plain", "shellopts_exported", "ar
 	"subsh_off", "hosts", "nparams", "params", "getopts_state", "complete", "savedstack", "tenv" }
 local SUB_COPY = { "shopt", "functions", "dirstack", "hashcache", "bav", "fn_ro", "unset_specials",
 	"disabled_builtins" }
+-- sub_save(self, copy) -> the saved values (SUB_COPY's then replaced by copy(v)) and
+-- sub_put(self, saved), compiled from the two lists so each field is a constant-key access
+-- (the JIT's fast path; a subshell per loop iteration is common), not a loop over names.
+local sub_save, sub_put
+do
+	local get, cp, put = {}, {}, {}
+	for _, f in ipairs(SUB_KEEP) do
+		get[#get + 1] = "self." .. f
+	end
+	for _, f in ipairs(SUB_COPY) do
+		get[#get + 1] = "self." .. f
+		cp[#cp + 1] = ("self.%s = copy(self.%s)"):format(f, f)
+	end
+	for i, g in ipairs(get) do
+		put[i] = ("%s = sv[%d]"):format(g, i)
+	end
+	sub_save = load(("return function(self, copy) local sv = { %s }; %s; return sv end")
+		:format(table.concat(get, ", "), table.concat(cp, "; ")), "=sub_save")()
+	sub_put = load(("return function(self, sv) %s end"):format(table.concat(put, "; ")), "=sub_put")()
+end
 -- A private copy of the variables and the dynamic-scope layers behind them — `local`
 -- shadow records and tempenv bindings, mutated by `unset` (which REVEALS the next layer:
 -- drops the record / marks the tempenv consumed and installs its box) — records AND the
 -- boxes they hold, so neither escapes. The ORIGINAL boxes stay pristine, so a reference
 -- to one stays valid. Also re-keys getopts' per-OPTIND-box state onto the copies.
 -- Shared by sub_checkpoint and Shell:stage_clone.
-local function scopes_copy(self, into)
+function scopes_copy(self, into)
 	local orig, vars = self.vars, {}
 	for k, b in pairs(orig) do
 		vars[k] = copybox(b)
@@ -3115,18 +3137,13 @@ local function scopes_copy(self, into)
 	end
 	into.tenv = te
 end
-local function sub_checkpoint(self)
+function sub_checkpoint(self)
 	local orig_vars = self.vars
 	local exset = {}
 	for name, b in pairs(orig_vars) do
 		if b.exported then exset[name] = true end
 	end
-	local sv = {}
-	for _, f in ipairs(SUB_KEEP) do sv[f] = self[f] end
-	for _, f in ipairs(SUB_COPY) do
-		sv[f] = self[f]
-		self[f] = shallowcopy(self[f])
-	end
+	local sv = sub_save(self, shallowcopy)
 	local cp = {
 		orig_vars = orig_vars, exset = exset, sv = sv,
 		locale_gen = M.locale_gen, lc_state = M.lc_state, lcsnap = M.lc_envsnap,
@@ -3167,7 +3184,7 @@ local function sub_checkpoint(self)
 	end
 	return cp
 end
-local function sub_restore(self, cp)
+function sub_restore(self, cp)
 	self.vars = cp.orig_vars
 	if cp.locale_gen ~= M.locale_gen then -- (`(LANG=C; …)`: setlocale is process-wide)
 		M.locale_restore(cp.lc_state)
@@ -3176,9 +3193,7 @@ local function sub_restore(self, cp)
 	if cp.l10nk then
 		package.loaded.l10n.known_restore(cp.l10nk)
 	end
-	local sv = cp.sv
-	for _, f in ipairs(SUB_KEEP) do self[f] = sv[f] end
-	for _, f in ipairs(SUB_COPY) do self[f] = sv[f] end
+	sub_put(self, cp.sv)
 	M.glob_asciirange = self.shopt.globasciiranges ~= false
 	local hc = cp.hist
 	if hc then
@@ -3205,6 +3220,7 @@ local function sub_restore(self, cp)
 		C.setenv(name, self:get(name) or "", 1)
 	end
 end
+end -- (the checkpoint block)
 
 -- sh.iso_ctx is the stack of active in-process isolation contexts (innermost last): a
 -- `( … )`, an isolated $(…), a pipeline stage (task).
@@ -3813,7 +3829,7 @@ end
 -- redirects (`saves`) are restored here too. exit/return/div0 in the body become the
 -- subshell's status.
 function Shell:subshell_run(runner, saves, paren, inplace)
-	local sp = subprog_enter(self)
+	local s1, s2, s3, s4, s5, s6, s7 = subprog_enter(self)
 	local cp = sub_checkpoint(self)
 	local sv_out, sv_ne = self.out, self.noerr
 	local sv_psp = self.paren_sp -- (a `( … )`: the subprogram level that is one — exec.def's SUBSHELL_PAREN)
@@ -3875,7 +3891,7 @@ function Shell:subshell_run(runner, saves, paren, inplace)
 	self.bgp_cleared = sv_bgpc
 	if saves then M.redir_restore(saves) end
 	self.out, self.noerr, self.paren_sp = sv_out, sv_ne, sv_psp
-	subprog_leave(self, sp)
+	subprog_leave(self, s1, s2, s3, s4, s5, s6, s7)
 	sub_restore(self, cp)
 	if killed then -- the parent's report of its child that a signal killed (a `( … )`: its text)
 		if not ctx.vpid then
