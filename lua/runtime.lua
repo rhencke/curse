@@ -3080,11 +3080,16 @@ end
 -- drops the record / marks the tempenv consumed and installs its box) — records AND the
 -- boxes they hold, so neither escapes. The ORIGINAL boxes stay pristine, so a reference
 -- to one stays valid. Also re-keys getopts' per-OPTIND-box state onto the copies.
--- Shared by sub_checkpoint and Shell:stage_clone.
-function scopes_copy(self, into)
-	local orig, vars = self.vars, {}
-	for k, b in pairs(orig) do
-		vars[k] = copybox(b)
+-- Shared by sub_checkpoint and Shell:stage_clone. `vars`: the copied boxes when the caller
+-- made them itself (sub_checkpoint, in its own loop: a trace formed here by a pipeline
+-- stage's clone served the per-subshell calls badly — 17 → 25 µs a subshell).
+function scopes_copy(self, into, vars)
+	local orig = self.vars
+	if not vars then
+		vars = {}
+		for k, b in pairs(orig) do
+			vars[k] = copybox(b)
+		end
 	end
 	into.vars = vars
 	into.getopts_state = M.getopts_remap(self.getopts_state, orig, vars)
@@ -3113,9 +3118,10 @@ function scopes_copy(self, into)
 end
 function sub_checkpoint(self)
 	local orig_vars = self.vars
-	local exset = {}
+	local exset, vars = {}, {}
 	for name, b in pairs(orig_vars) do
 		if b.exported then exset[name] = true end
+		vars[name] = copybox(b)
 	end
 	local sv = sub_save(self, shallowcopy)
 	local cp = {
@@ -3124,8 +3130,8 @@ function sub_checkpoint(self)
 		l10nk = package.loaded.l10n and package.loaded.l10n.known_save(),
 		cwd = self:phys_cwd(), um = C.umask(0),
 	}
-	scopes_copy(self, self)
-	cp.copy = self.vars
+	scopes_copy(self, self, vars)
+	cp.copy = vars
 	if self.complete then -- (completion specs: the copies share opts as the originals do —
 		local oc, tab = {}, {} -- compopt changes a shared compspec's options in place)
 		for n, cs in pairs(self.complete) do
