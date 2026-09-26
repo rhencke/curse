@@ -22,86 +22,53 @@ return function(sh, cmd, args, hook, tcb)
 			local n = v and rt.legal_number(v)
 			return n and n <= (max or 4294967295) and n or nil
 		end
-		if args[2] == "--help" then -- (CASE_HELPOPT)
-			return rt.builtin_help(sh, cmd)
-		end
 		local fd, lines, origin, nskip, quantum, callback = 0, 0, 0, 0, 5000, nil
 		local clear, chop, dch = true, false, "\n"
-		local j = 2
-		while args[j] do
-			local a = args[j]
-			if a == "--" then
-				j = j + 1
-				break
-			elseif a == "--help" then -- (GETOPT_HELP: the builtin's help, status 2)
-				return rt.builtin_help(sh, cmd)
-			end
-			if a:sub(1, 1) ~= "-" or #a < 2 then
-				break
-			end
-			local k = 2
-			while k <= #a do
-				local o = a:sub(k, k)
-				if o == "t" then
-					chop = true
-					k = k + 1
-				elseif o:match("[dunOCcs]") then
-					local v = a:sub(k + 1)
-					if v == "" then
-						j = j + 1
-						v = args[j]
-						if v == nil then
-							berr("-" .. o .. ": option requires an argument", 2)
-							io.stderr:write(cmd .. ": usage: " .. cmd .. " [-d delim] [-n count] [-O origin] [-s count] [-t] [-u fd] [-C callback] [-c quantum] [array]\n")
-							return
-						end
-					end
-					local n = legal(v, o == "u" and 2147483647 or nil)
-					if o == "d" then
-						dch = v:sub(1, 1)
-						if dch == "" then
-							dch = "\0"
-						end
-					elseif o == "u" then
-						if not n or n < 0 then
-							return berr(v .. ": invalid file descriptor specification")
-						end
-						if C.fcntl(n, 1) == -1 then -- F_GETFD
-							return berr(n .. ": invalid file descriptor: Bad file descriptor")
-						end
-						fd = n
-					elseif o == "n" then
-						if not n or n < 0 then
-							return berr(v .. ": invalid line count")
-						end
-						lines = n
-					elseif o == "O" then
-						if not n or n < 0 then
-							return berr(v .. ": invalid array origin")
-						end
-						origin, clear = n, false
-					elseif o == "C" then
-						callback = v
-					elseif o == "c" then
-						if not n or n <= 0 then
-							return berr(v .. ": invalid callback quantum")
-						end
-						quantum = n
-					elseif o == "s" then
-						if not n or n < 0 then
-							return berr(v .. ": invalid line count")
-						end
-						nskip = n
-					end
-					k = #a + 1
-				else
-					berr("-" .. o .. ": invalid option", 2)
-					io.stderr:write(cmd .. ": usage: " .. cmd .. " [-d delim] [-n count] [-O origin] [-s count] [-t] [-u fd] [-C callback] [-c quantum] [array]\n")
-					return
+		local j, sp, o, v = 2
+		repeat
+			o, v, j, sp = rt.getopt(sh, cmd, args, "d:u:n:O:tC:c:s:", j, sp)
+			local n = v and legal(v, o == "u" and 2147483647 or nil)
+			if o == "?" then
+				return
+			elseif o == "t" then
+				chop = true
+			elseif o == "d" then
+				dch = v:sub(1, 1)
+				if dch == "" then
+					dch = "\0"
 				end
+			elseif o == "u" then
+				if not n or n < 0 then
+					return berr(v .. ": invalid file descriptor specification")
+				end
+				if C.fcntl(n, 1) == -1 then -- F_GETFD
+					return berr(n .. ": invalid file descriptor: Bad file descriptor")
+				end
+				fd = n
+			elseif o == "n" then
+				if not n or n < 0 then
+					return berr(v .. ": invalid line count")
+				end
+				lines = n
+			elseif o == "O" then
+				if not n or n < 0 then
+					return berr(v .. ": invalid array origin")
+				end
+				origin, clear = n, false
+			elseif o == "C" then
+				callback = v
+			elseif o == "c" then
+				if not n or n <= 0 then
+					return berr(v .. ": invalid callback quantum")
+				end
+				quantum = n
+			elseif o == "s" then
+				if not n or n < 0 then
+					return berr(v .. ": invalid line count")
+				end
+				nskip = n
 			end
-			j = j + 1
-		end
+		until not o
 		local arr = args[j] or "MAPFILE"
 		if arr == "" then
 			return berr("empty array variable name", 2)

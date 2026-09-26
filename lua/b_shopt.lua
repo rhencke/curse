@@ -9,36 +9,18 @@ local opt_on, set_opt, SETOPT, SHOPT_DEFAULT, shopt_on = I.opt_on, I.set_opt, I.
 return function(sh, cmd, args, hook, tcb)
 	if cmd == "shopt" then
 		-- shopt [-s|-u|-q|-p|-o] [names]: set/unset/query shell options (subset).
-		local set_, unset_, quiet, oflag, pflag, badopt = false, false, false, false, false, false
-		-- (options up to the first operand or `--`: bash's internal_getopt)
-		local names = {}
-		local k0 = 2
-		while args[k0] and args[k0]:sub(1, 1) == "-" and #args[k0] > 1 and not badopt do
-			local a = args[k0]
-			k0 = k0 + 1
-			if a == "--" then
-				break
-			elseif a:match("^-[suqpo]+$") then
-				if a:find("s") then
-					set_ = true
-				end
-				if a:find("u") then
-					unset_ = true
-				end
-				if a:find("q") then
-					quiet = true
-				end
-				if a:find("o") then
-					oflag = true
-				end
-				if a:find("p") then
-					pflag = true
-				end
-			else
-				badopt = a -- (`-z`, and long opts, are invalid options — bash)
+		local set_, unset_, quiet, oflag, pflag = false, false, false, false, false
+		local j, sp, c, _ = 2
+		repeat -- (internal_getopt "psuoq")
+			c, _, j, sp = rt.getopt(sh, "shopt", args, "psuoq", j, sp)
+			if c == "?" then
+				return
 			end
-		end
-		for k = k0, #args do
+			set_, unset_, quiet = set_ or c == "s", unset_ or c == "u", quiet or c == "q"
+			oflag, pflag = oflag or c == "o", pflag or c == "p"
+		until not c
+		local names = {}
+		for k = j, #args do
 			names[#names + 1] = args[k]
 		end
 		-- one option in the requested form (-p: a reusable command; else two columns)
@@ -49,16 +31,7 @@ return function(sh, cmd, args, hook, tcb)
 				sh.out(("%-15s\t%s\n"):format(nm, on and "on" or "off"))
 			end
 		end
-		if badopt == "--help" then -- (CASE_HELPOPT: the builtin's help, status 2)
-			require("b_help")(sh, "help", { "help", "shopt" }, hook, tcb)
-			sh.status = 2
-			return
-		elseif badopt then
-			local bad = badopt:sub(1, 2) == "--" and "--" or ("-" .. (badopt:match("^%-[suqpo]*(.)") or ""))
-			io.stderr:write("curse: shopt: " .. bad .. ": invalid option\n")
-			io.stderr:write("shopt: usage: shopt [-pqsu] [-o] [optname ...]\n")
-			sh.status = 2
-		elseif set_ and unset_ then
+		if set_ and unset_ then
 			io.stderr:write("curse: shopt: cannot set and unset shell options simultaneously\n")
 			sh.status = 1
 		elseif oflag and #names == 0 then -- list the set -o options (-s/-u: only on/off ones)
@@ -167,8 +140,6 @@ return function(sh, cmd, args, hook, tcb)
 			end
 			sh.status = allok and 0 or 1
 		end
-		if not badopt then
-			rt.chkwrite_st(sh, "shopt")
-		end
+		rt.chkwrite_st(sh, "shopt")
 	end
 end

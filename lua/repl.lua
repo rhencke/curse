@@ -218,15 +218,17 @@ function M.run(sh)
 	sh.defer_exit_trap = nil
 	pcall(interp.run_exit_trap, sh)
 	io.flush()
-	if histfile then -- write the session's history back to an explicit $HISTFILE
-		-- `shopt -s histappend` appends the session's list to the file; otherwise it
-		-- overwrites (bash). (HISTSIZE has already trimmed the in-memory list.)
-		local f = io.open(histfile, (sh.shopt and sh.shopt.histappend) and "a" or "w")
+	local n, h = sh.hist_session or 0, H.list(sh)
+	if histfile then
+		-- (bash's maybe_save_shell_history: this session's lines are appended, with their
+		-- timestamps, as `history -a` — or, when HISTSIZE left fewer of them in the list and
+		-- histappend is off, the list rewritten as `history -w` — then cut to HISTFILESIZE)
+		local append = n <= #h or (sh.shopt and sh.shopt.histappend)
+		local f = n > 0 and io.open(histfile, append and "a" or "w")
 		if f then
-			for _, h in ipairs(sh.history or {}) do
-				f:write(h, "\n")
-			end
+			f:write(H.file_text(sh, append and #h - math.min(n, #h) + 1 or 1))
 			f:close()
+			rt.hist_resize(sh, "HISTFILESIZE")
 		end
 	elseif RL and istty then
 		pcall(function()

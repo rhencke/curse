@@ -7805,9 +7805,65 @@ function M.bad_option(sh, cmd, opt, word)
 		sh.status = 2
 		return
 	end
-	io.stderr:write("curse: " .. cmd .. ": " .. opt .. ": invalid option\n" .. M.usage(cmd))
+	M.usage_error(sh, cmd, opt .. ": invalid option")
+end
+-- A builtin's option error: `CMD: MSG` + its usage line, status 2 (bash's builtin_error +
+-- builtin_usage, EX_USAGE — fatal from a special builtin in posix mode: M.spb_run).
+function M.usage_error(sh, cmd, msg)
+	io.stderr:write("curse: " .. cmd .. ": " .. msg .. "\n" .. M.usage(cmd))
 	sh.status = 2
-	sh.spb_err = 2 -- (EX_USAGE: fatal from a special builtin in posix mode — M.spb_run)
+	sh.spb_err = 2
+end
+-- bash's internal_getopt (builtins/bashgetopt.c), one option per call. The caller holds the
+-- cursor — J the word, SP the character in it (nil at a word's start) — so nothing is
+-- allocated and a trap run mid-loop can't clobber shared state. SPEC is bash's opts string:
+-- `x:` takes an argument (the rest of the word, else the next word), `x;` an optional one
+-- (not taken when the next word is an option), a leading `+` accepts +x too.
+-- Returns C, OPTARG, J, SP, SIGN (the option word's `-` or `+`). C is nil at the end, J
+-- then the first operand: a lone `-` or a non-option, or the word after an exact `--`.
+-- C is "?" after the diagnostic — `--help` the builtin's help (GETOPT_HELP), else `-X:
+-- invalid option` or `-X: option requires an argument` with the usage line — status 2.
+function M.getopt(sh, cmd, args, spec, j, sp)
+	local w = args[j]
+	local plus = spec:byte(1) == 43
+	if not sp then
+		if not w or #w < 2 then
+			return nil, nil, j
+		end
+		local b = w:byte(1)
+		if b ~= 45 and not (plus and b == 43) then -- (NOTOPT)
+			return nil, nil, j
+		elseif w == "--help" then
+			M.bad_option(sh, cmd, nil, w)
+			return "?", nil, j
+		elseif w == "--" then
+			return nil, nil, j + 1
+		end
+		sp = 2
+	end
+	local sign, c = w:sub(1, 1), w:sub(sp, sp)
+	local p = c ~= ":" and spec:find(c, plus and 2 or 1, true)
+	if not p then
+		M.bad_option(sh, cmd, sign .. c)
+		return "?", nil, j
+	end
+	local k = spec:byte(p + 1)
+	if k == 58 or k == 59 then -- `:` / `;`: an argument
+		if sp < #w then
+			return c, w:sub(sp + 1), j + 1, nil, sign
+		end
+		local nx = args[j + 1]
+		if nx and (k == 58 or #nx < 2 or not (nx:byte(1) == 45 or plus and nx:byte(1) == 43)) then
+			return c, nx, j + 2, nil, sign
+		elseif k == 59 then
+			return c, nil, j + 1, nil, sign
+		end
+		M.usage_error(sh, cmd, sign .. c .. ": option requires an argument")
+		return "?", nil, j
+	elseif sp < #w then
+		return c, nil, j, sp + 1, sign
+	end
+	return c, nil, j + 1, nil, sign
 end
 -- The file a function being defined now belongs to (its ${BASH_SOURCE[0]} and error
 -- label): the file being sourced, else the script — but under -c there is none, and bash

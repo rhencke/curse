@@ -8,11 +8,6 @@ local fmt_decl = I.fmt_decl
 
 return function(sh, cmd, args, hook, tcb)
 	if cmd == "local" then
-		if args[2] == "--help" then -- (CASE_HELPOPT: before the function check, status 2)
-			require("b_help")(sh, "help", { "help", "local" }, hook, tcb)
-			sh.status = 2
-			return
-		end
 		if sh.pd == 0 and (sh.calldepth or 0) == 0 then -- (no function: checked before anything)
 			io.stderr:write("curse: local: can only be used in a function\n")
 			sh.status = 1
@@ -22,59 +17,39 @@ return function(sh, cmd, args, hook, tcb)
 		-- every operand made local. Validate the options, handle -f/-F, the listing, -p and
 		-- `local -` here; a plain `local NAME[=value]…` takes the localAssign fast path, and
 		-- anything with an attribute goes through declare's code (b_export) as `local`.
-		local attrs, pflag, inherit, dash, rest = false, false, false, false, {}
-		local endopts = false
-		for j = 2, #args do -- (bash's option pass first: a bad letter rejects the lot)
-			local a = args[j]
-			if endopts or a == "--" or not a:match("^[-+].") then
-				break
-			elseif a == "--help" then -- (GETOPT_HELP: the builtin's help, status 2)
-				return rt.builtin_help(sh, "local")
-			end
-			local bad = a:match("[^aAcfFgGiIlnprtux]", 2)
-			if bad then
-				io.stderr:write("curse: local: " .. a:sub(1, 1) .. bad .. ": invalid option\n")
-				io.stderr:write("local: usage: local [option] name[=value] ...\n")
-				sh.status = 2
+		local attrs, pflag, inherit, funcs, j, sp, c, _, sign = false, false, false, false, 2
+		repeat -- (bash's option pass first: a bad letter rejects the lot)
+			c, _, j, sp, sign = rt.getopt(sh, "local", args, "+aAcfFgGiIlnprtux", j, sp)
+			if c == "?" then
 				return
+			elseif c == "p" then -- (+p too: bash's pflag++ ignores the sign)
+				pflag = true
+			elseif sign == "-" and (c == "f" or c == "F") then
+				funcs = true
+			elseif sign == "-" and c == "I" then
+				inherit = true -- (-I: the local starts as a copy of the outer var)
+			elseif c and c:find("[aAcgGilnrtux]") then
+				attrs = true
 			end
-			if a:find("[fF]") and a:sub(1, 1) == "-" then -- (functions: never made, only looked up)
-				local st = 0
-				for k = j + 1, #args do
-					if args[k]:find("=", 1, true) then
-						io.stderr:write("curse: local: cannot use `-f' to make functions\n")
-						st = 1
-						break
-					elseif not sh.functions[args[k]] then
-						st = 1
-					end
+		until not c
+		if funcs then -- (functions: never made, only looked up)
+			local st = 0
+			for k = j, #args do
+				if args[k]:find("=", 1, true) then
+					io.stderr:write("curse: local: cannot use `-f' to make functions\n")
+					st = 1
+					break
+				elseif not sh.functions[args[k]] then
+					st = 1
 				end
-				sh.status = st
-				return
 			end
+			sh.status = st
+			return
 		end
-		for j = 2, #args do
-			local a = args[j]
-			if endopts then
-				rest[#rest + 1] = a
-			elseif a == "--" then
-				endopts = true
-			elseif a:match("^[-+].") then
-				if a:find("p") then -- (+p too: bash's pflag++ ignores the sign)
-					pflag = true
-				end
-				if a:find("I") and a:sub(1, 1) == "-" then
-					inherit = true -- (-I: the local starts as a copy of the outer var)
-				end
-				if a:find("[aAcgGilnrtux]") then
-					attrs = true
-				end
-				endopts = false
-			else
-				endopts = true -- (the first operand ends the options)
-				rest[#rest + 1] = a
-			end
-			dash = dash or (a == "-" and endopts)
+		local rest, dash = {}, false
+		for k = j, #args do
+			rest[#rest + 1] = args[k]
+			dash = dash or args[k] == "-"
 		end
 		local saved = sh.savedstack[sh.pd]
 		local opts_local = sh.local_opts and sh.local_opts[sh.pd]

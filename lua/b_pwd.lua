@@ -37,20 +37,16 @@ end
 return function(sh, cmd, args, hook, tcb)
 	if cmd == "pwd" then
 		local phys, pflag = sh.opt_P or false, false -- (set -P)
-		for j = 2, #args do -- (options until `--` or an operand; the last of -L/-P wins)
-			local a = args[j]
-			if a == "--" or not a:match("^%-.") then
-				break
-			end
-			local bad = a:match("[^LP]", 2)
-			if bad then
-				return rt.bad_option(sh, "pwd", "-" .. bad, a)
-			end
-			for f in a:gmatch("[LP]") do
+		local j, sp, f, _ = 2
+		repeat -- (the last of -L/-P wins)
+			f, _, j, sp = rt.getopt(sh, "pwd", args, "LP", j, sp)
+			if f == "?" then
+				return
+			elseif f then
 				phys = f == "P"
 				pflag = pflag or phys
 			end
-		end
+		until not f
 		-- cd.def: the internal cwd (not $PWD), with -P its physical form; when that can't
 		-- be had -- or, in posix mode, the internal cwd isn't "." any more -- getcwd.
 		local tcwd = sh:cwd()

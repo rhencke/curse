@@ -165,40 +165,14 @@ wait_builtin = function(sh, cmd, args, hook, tcb)
 		end
 		local nflag, specs = false, {}
 		local pvar -- -p VAR: the pid whose status is returned lands in VAR
-		local k = 2
-		while args[k] and args[k]:match("^%-.") do -- (options end at `--` or an operand)
-			local a = args[k]
-			k = k + 1
-			if a == "--" then
-				break
-			elseif a == "--help" then -- (GETOPT_HELP: the builtin's help, status 2)
-				return rt.builtin_help(sh, "wait")
+		local k, sp, c, a = 2
+		repeat -- (internal_getopt "fnp:"; -f is accepted: we always block until done anyway)
+			c, a, k, sp = rt.getopt(sh, "wait", args, "fnp:", k, sp)
+			if c == "?" then
+				return
 			end
-			local ci = 2
-			while ci <= #a do
-				local f = a:sub(ci, ci)
-				ci = ci + 1
-				if f == "n" then
-					nflag = true
-				elseif f == "f" then -- (accepted: we always block until done anyway)
-				elseif f == "p" then
-					pvar = a:sub(ci) ~= "" and a:sub(ci) or args[k]
-					if a:sub(ci) == "" then
-						k = k + 1
-					end
-					if pvar == nil then
-						io.stderr:write("curse: wait: -p: option requires an argument\n" .. rt.usage("wait"))
-						sh.status = 2
-						return
-					end
-					break
-				else
-					io.stderr:write("curse: wait: -" .. f .. ": invalid option\n" .. rt.usage("wait"))
-					sh.status = 2
-					return
-				end
-			end
-		end
+			nflag, pvar = nflag or c == "n", a or pvar
+		until not c
 		for j = k, #args do
 			specs[#specs + 1] = args[j]
 		end

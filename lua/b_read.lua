@@ -19,13 +19,6 @@ local rdbuf = ffi.new("char[?]", RDBUF)
 local function needs_chars(seg, raw)
 	return seg:find("\0", 1, true) or seg:find("\1", 1, true) or (not raw and seg:find("\\", 1, true))
 end
-local function takearg(a, k, args, j, advance)
-	local r = a:sub(k + 1)
-	if r ~= "" then
-		return r, #a + 1, advance
-	end
-	return args[j + 1], #a + 1, 2
-end
 -- One byte of input for `read`, per its state `st` (see the builtin): a regular file
 -- is read in chunks (rewound past the line by unread); a deadline waits for input;
 -- otherwise a byte at a time, without a readiness poll per byte while FIONREAD says
@@ -140,85 +133,47 @@ end
 return function(sh, cmd, args, hook, tcb)
 	if cmd == "read" then
 		-- read [-r] [-a arr] [-p prompt] VAR...  (line from stdin, split on IFS)
-		local raw, arr, j, nchars, ndelim, ufd = false, nil, 2, nil, false, 0
-		local delim, tmout
-		while j <= #args do
-			local a = args[j]
-			if a == "--" then
-				j = j + 1
-				break
-			elseif a:sub(1, 1) == "-" and #a > 1 then
-				-- parse a bundle like -rd, -rN 6; an arg-taking flag takes the attached
-				-- rest of the word or the next word, and ends the bundle.
-				local k, advance = 2, 1
-				while k <= #a do
-					local f = a:sub(k, k)
-					if f:match("[adinNptu]") and k == #a and args[j + 1] == nil then
-						io.stderr:write("curse: read: -" .. f .. ": option requires an argument\n" .. rt.usage("read"))
-						sh.status = 2
-						return
-					end
-					if f == "r" then
-						raw = true
-						k = k + 1
-					elseif f == "d" then
-						local v0
-						v0, k, advance = takearg(a, k, args, j, advance)
-						delim = v0 or "\n"
-					elseif f == "n" or f == "N" then -- char count; a non-numeric arg is an error (not a hang)
-						local v
-						v, k, advance = takearg(a, k, args, j, advance)
-						nchars = int_arg(v)
-						if not nchars then -- (bash: legal_number, not negative, an int; sh_invalidnum)
-							io.stderr:write("curse: read: " .. tostring(v) .. ": " .. rt.invalidnum_msg(v or "") .. "\n")
-							sh.status = 1
-							return
-						end
-						if f == "N" then
-							ndelim = true
-						end
-					elseif f == "a" then
-						arr, k, advance = takearg(a, k, args, j, advance)
-					elseif f == "u" then
-						local v
-						v, k, advance = takearg(a, k, args, j, advance)
-						ufd = int_arg(v)
-						if not ufd then
-							io.stderr:write("curse: read: " .. v .. ": invalid file descriptor specification\n")
-							sh.status = 1
-							return
-						end
-						if C.fcntl(ufd, 1) < 0 then -- F_GETFD: not open
-							io.stderr:write("curse: read: " .. ufd .. ": invalid file descriptor: Bad file descriptor\n")
-							sh.status = 1
-							return
-						end
-					elseif f == "i" then
-						local _
-						_, k, advance = takearg(a, k, args, j, advance) -- (the readline default text: no readline here)
-					elseif f == "p" then
-						local _
-						_, k, advance = takearg(a, k, args, j, advance) -- prompt: consume + ignore (non-interactive)
-					elseif f == "t" then
-						local v
-						v, k, advance = takearg(a, k, args, j, advance)
-						tmout = uconvert(v)
-						if not tmout or tmout < 0 then
-							io.stderr:write("curse: read: " .. v .. ": invalid timeout specification\n")
-							sh.status = 1
-							return
-						end
-					elseif f == "s" or f == "e" then -- (no echo / readline: no terminal editing here)
-						k = k + 1
-					else
-						return rt.bad_option(sh, "read", "-" .. f, a)
-					end
+		local raw, arr, nchars, ndelim, ufd = false, nil, nil, false, 0
+		local delim, tmout, j, sp, f, v = nil, nil, 2
+		repeat -- (internal_getopt "ersa:d:i:n:p:t:u:N:"; -e/-s/-i/-p: no terminal here)
+			f, v, j, sp = rt.getopt(sh, "read", args, "ersa:d:i:n:p:t:u:N:", j, sp)
+			if f == "?" then
+				return
+			elseif f == "r" then
+				raw = true
+			elseif f == "d" then
+				delim = v
+			elseif f == "n" or f == "N" then -- char count; a non-numeric arg is an error (not a hang)
+				nchars = int_arg(v)
+				if not nchars then -- (bash: legal_number, not negative, an int; sh_invalidnum)
+					io.stderr:write("curse: read: " .. v .. ": " .. rt.invalidnum_msg(v) .. "\n")
+					sh.status = 1
+					return
 				end
-				j = j + advance
-			else
-				break
+				ndelim = ndelim or f == "N"
+			elseif f == "a" then
+				arr = v
+			elseif f == "u" then
+				ufd = int_arg(v)
+				if not ufd then
+					io.stderr:write("curse: read: " .. v .. ": invalid file descriptor specification\n")
+					sh.status = 1
+					return
+				end
+				if C.fcntl(ufd, 1) < 0 then -- F_GETFD: not open
+					io.stderr:write("curse: read: " .. ufd .. ": invalid file descriptor: Bad file descriptor\n")
+					sh.status = 1
+					return
+				end
+			elseif f == "t" then
+				tmout = uconvert(v)
+				if not tmout or tmout < 0 then
+					io.stderr:write("curse: read: " .. v .. ": invalid timeout specification\n")
+					sh.status = 1
+					return
+				end
 			end
-		end
+		until not f
 		-- `read -t 0`: don't read anything — just report whether input is available
 		-- on the fd (bash: status 0 if a read wouldn't block, non-zero otherwise).
 		if tmout == 0 then

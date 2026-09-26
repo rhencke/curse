@@ -12,31 +12,14 @@ return function(sh, cmd, args, hook, tcb)
 		-- -n: a nameref ITSELF, not its target
 		sh.status = 0
 		-- the options lead (bash's internal_getopt): a later `-f`/`-v` is just a name
-		local first = 2
-		while first <= #args do
-			local a = args[first]
-			if a:sub(1, 1) ~= "-" or a == "-" then
-				break
-			elseif a == "--help" then
-				return rt.builtin_help(sh, "unset")
+		local first, sp, f, _ = 2
+		repeat
+			f, _, first, sp = rt.getopt(sh, "unset", args, "fnv", first, sp)
+			if f == "?" then
+				return
 			end
-			first = first + 1
-			if a == "--" then
-				break
-			end
-			for k = 2, #a do
-				local f = a:sub(k, k)
-				if f == "f" then
-					fmode = true
-				elseif f == "v" then
-					vmode = true
-				elseif f == "n" then
-					nmode = true
-				else
-					return rt.bad_option(sh, "unset", "-" .. f)
-				end
-			end
-		end
+			fmode, vmode, nmode = fmode or f == "f", vmode or f == "v", nmode or f == "n"
+		until not f
 		if fmode and vmode then
 			io.stderr:write("curse: unset: cannot simultaneously unset a function and a variable\n")
 			sh.status = 1

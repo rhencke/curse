@@ -5,28 +5,14 @@ local rt = require("runtime")
 return function(sh, cmd, args, hook, tcb)
 	if cmd == "alias" then
 		-- alias [name[=value] …]: define or print aliases.
-		local j, ok = 2, true
-		local listall = false
-		-- internal_getopt(list, "p"): only an exact `--` ends the options (`--=v` is `-`-`-`)
-		while args[j] and args[j]:sub(1, 1) == "-" and #args[j] > 1 do
-			local a = args[j]
-			if a == "--" then
-				j = j + 1
-				break
-			elseif a == "--help" then -- (GETOPT_HELP: the builtin's help, status 2)
-				return rt.builtin_help(sh, "alias")
+		local ok, listall, j, sp, c, _ = true, false, 2
+		repeat -- (internal_getopt "p": `-p` lists them all, then any operands are handled)
+			c, _, j, sp = rt.getopt(sh, "alias", args, "p", j, sp)
+			if c == "?" then
+				return
 			end
-			for c = 2, #a do
-				if a:sub(c, c) ~= "p" then -- an unknown option: usage error (status 2)
-					io.stderr:write("curse: alias: -" .. a:sub(c, c) .. ": invalid option\n")
-					io.stderr:write("alias: usage: alias [-p] [name[=value] ... ]\n")
-					sh.status = 2
-					return
-				end
-			end
-			listall = true -- `-p`: list them all (then handle any operands)
-			j = j + 1
-		end
+			listall = listall or c == "p"
+		until not c
 		-- print_alias: always single-quoted (sh_single_quote); the reusable `alias ` prefix
 		-- (plus `-- ` before a name starting with `-`) unless posix mode without -p
 		local reuse = listall or not sh.opt_posix

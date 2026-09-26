@@ -107,7 +107,22 @@ local function variants(name, out)
 	end
 end
 
-M.variants = variants
+-- The catalog names glibc's dcigettext tries for message locale CUR, in order: each of
+-- $LANGUAGE's entries (bash's environ as last rebuilt: where glibc finds it) in place of
+-- the locale's own name when set (guess_category_value), expanded by variants.
+function M.search_names(cur)
+	local names = {}
+	local e = rt.lc_envsnap
+	local language = e and e.LANGUAGE
+	if language and language ~= "" then
+		for l in language:gmatch("[^:]+") do
+			variants(l, names)
+		end
+	else
+		variants(cur, names)
+	end
+	return names
+end
 
 local function var(sh, name)
 	local v = sh.vars[name] and sh:get(name)
@@ -133,16 +148,7 @@ function M.translate(sh, s)
 	if cur == "C" or cur == "POSIX" then
 		return nil
 	end
-	local names = {}
-	local e = rt.lc_envsnap -- (bash's environ as last rebuilt: where glibc finds $LANGUAGE)
-	local language = e and e.LANGUAGE
-	if language and language ~= "" then -- (guess_category_value: the list replaces the locale)
-		for l in language:gmatch("[^:]+") do
-			variants(l, names)
-		end
-	else
-		variants(cur, names)
-	end
+	local names = M.search_names(cur)
 	local dir = var(sh, "TEXTDOMAINDIR") or "/usr/share/locale"
 	for _, nm in ipairs(names) do
 		if nm == "C" then

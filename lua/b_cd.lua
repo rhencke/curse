@@ -246,27 +246,17 @@ return function(sh, cmd, args, hook, tcb, as)
 		end
 		-- options (internal_getopt "eLP": no O_XATTR here, so -@ is invalid), a `--`,
 		-- then the directory operand.
-		local operands, j, nolinks, eflag = {}, 2, sh.opt_P or false, false
-		while args[j] do
-			local a = args[j]
-			if a == "--" then
-				j = j + 1
-				break
-			elseif a:match("^%-[LPe]+$") then
-				for f in a:gmatch("[LPe]") do -- (the last of -L/-P wins)
-					if f == "e" then
-						eflag = true
-					else
-						nolinks = f == "P"
-					end
-				end
-				j = j + 1
-			elseif a:match("^%-.") and who == "cd" then
-				return rt.bad_option(sh, "cd", "-" .. a:match("^%-[LPe]*(.)"), a)
-			else
-				break
+		local operands, nolinks, eflag, j, sp, f, _ = {}, sh.opt_P or false, false, 2
+		repeat -- (the last of -L/-P wins)
+			f, _, j, sp = rt.getopt(sh, "cd", args, "eLP", j, sp)
+			if f == "?" then
+				return
+			elseif f == "e" then
+				eflag = true
+			elseif f then
+				nolinks = f == "P"
 			end
-		end
+		until not f
 		for k = j, #args do
 			operands[#operands + 1] = args[k]
 		end

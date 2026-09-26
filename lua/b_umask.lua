@@ -11,41 +11,23 @@ return function(sh, cmd, args, hook, tcb)
 		-- umask [-S] [MODE]: print (octal or -S symbolic) or set the file-creation mask.
 		-- (options up to the first operand or `--`, bash's internal_getopt; -p prints a form
 		-- that can be eval'd)
-		local sflag, pflag, badflag, pos = false, false, false, {}
-		local j = 2
-		while args[j] and args[j]:sub(1, 1) == "-" and #args[j] > 1 do
-			local a = args[j]
-			j = j + 1
-			if a == "--" then
-				break
-			elseif a == "--help" and not badflag then -- (GETOPT_HELP: the builtin's help)
-				return rt.builtin_help(sh, "umask")
+		local sflag, pflag, j, sp, c, _ = false, false, 2
+		repeat
+			c, _, j, sp = rt.getopt(sh, "umask", args, "Sp", j, sp)
+			if c == "?" then
+				return
 			end
-			for k = 2, #a do -- (combined flags; the first bad letter is reported)
-				local f = a:sub(k, k)
-				if f == "S" then
-					sflag = true
-				elseif f == "p" then
-					pflag = true
-				elseif not badflag then
-					badflag = "-" .. f
-				end
-			end
-		end
-		for k = j, #args do
-			pos[#pos + 1] = args[k]
-		end
+			sflag, pflag = sflag or c == "S", pflag or c == "p"
+		until not c
+		local mode = args[j] -- (bash ignores extra args; it uses only the first MODE)
 		local cur = tonumber(C.umask(0)) % 512
 		C.umask(cur)
-		if badflag then
-			io.stderr:write("curse: umask: " .. badflag .. ": invalid option\numask: usage: umask [-p] [-S] [mode]\n")
-			sh.status = 2 -- a usage error (bash)
-		elseif #pos == 0 then -- bash ignores extra args; it uses only the first MODE
+		if not mode then
 			local body = sflag and umask_symbolic(cur) or string.format("%04o", cur)
 			sh:echo(pflag and ("umask " .. (sflag and "-S " or "") .. body) or body)
 			sh.status = 0
 		else
-			local m, err = parse_umask(pos[1], cur)
+			local m, err = parse_umask(mode, cur)
 			if m == nil then
 				io.stderr:write("curse: umask: " .. err .. "\n")
 				sh.status = 1

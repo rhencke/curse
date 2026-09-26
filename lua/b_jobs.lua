@@ -24,34 +24,24 @@ return function(sh, cmd, args, hook, tcb)
 		-- script's only notice of it). -n: only jobs changed since last listed; -r running
 		-- only; -s stopped only (nothing stops here).
 		local form, state, execute = nil, nil, false
-		local k = 2
-		while args[k] and args[k]:match("^%-.") do
-			local a = args[k]
-			if a == "--" then
-				k = k + 1
-				break
-			elseif a == "--help" then
-				return rt.builtin_help(sh, "jobs")
-			end
-			for ci = 2, #a do
-				local f = a:sub(ci, ci)
-				if f == "l" or f == "p" or f == "n" then
-					form = f
-				elseif f == "x" then
-					if form then
-						io.stderr:write("curse: jobs: no other options allowed with `-x'\n")
-						sh.status = 1
-						return
-					end
-					execute = true
-				elseif f == "r" or f == "s" then
-					state = f
-				else
-					return rt.bad_option(sh, "jobs", "-" .. f)
+		local k, sp, f, _ = 2
+		repeat
+			f, _, k, sp = rt.getopt(sh, "jobs", args, "lpnxrs", k, sp)
+			if f == "?" then
+				return
+			elseif f == "l" or f == "p" or f == "n" then
+				form = f
+			elseif f == "x" then
+				if form then
+					io.stderr:write("curse: jobs: no other options allowed with `-x'\n")
+					sh.status = 1
+					return
 				end
+				execute = true
+			elseif f then -- (r / s)
+				state = f
 			end
-			k = k + 1
-		end
+		until not f
 		if execute then -- jobs -x CMD ARGS: run CMD with each jobspec as its pid
 			local t = {}
 			for i = k, #args do

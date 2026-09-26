@@ -47,14 +47,8 @@ return function(sh, cmd, args, hook, tcb)
 	if cmd == "eval" then
 		sh.shlvl_tail = nil -- (a builtin: the code it runs isn't exec'd in place)
 		-- eval [--]: join args, parse, run in the CURRENT shell (return/exit propagate).
-		if args[2] == "--help" then -- (CASE_HELPOPT: the builtin's help, status 2)
-			return rt.builtin_help(sh, "eval")
-		elseif args[2] and args[2] ~= "-" and args[2] ~= "--" and args[2]:sub(1, 1) == "-" then
-			io.stderr:write("curse: eval: " .. args[2]:sub(1, 2) .. ": invalid option\n" .. rt.usage("eval"))
-			sh.status = 2
-			sh.spb_err = 2 -- (EX_USAGE: rt.spb_run)
-		else
-			local start = (args[2] == "--") and 3 or 2
+		local c, _, start = rt.getopt(sh, "eval", args, "", 2) -- (bash's no_options)
+		if not c then
 			local code = table.concat({ unpack(args, start) }, " ")
 			if code:match("%S") then
 				-- Parse+run in the CURRENT shell, LAZILY (like the shell's own input) so an

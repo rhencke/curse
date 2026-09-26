@@ -29,7 +29,6 @@ for _, o in ipairs(COPTS) do
 	COPT_OK[o] = true
 end
 -- the options taking an argument (internal_getopt's "o:A:G:W:P:S:X:F:C:")
-local ARGOPT = { o = 1, A = 1, G = 1, W = 1, P = 1, S = 1, X = 1, F = 1, C = 1 }
 -- complete/compopt -D/-E/-I store their spec under these names (pcomplete.h)
 local SPECIAL_NAME = { D = "_DefaultCmD_", E = "_EmptycmD_", I = "_InitialWorD_" }
 local SPECIAL_FLAG = { _DefaultCmD_ = "-D", _EmptycmD_ = "-E", _InitialWorD_ = "-I" }
@@ -1139,81 +1138,55 @@ end
 -- already reported an error (status set).
 local function build_actions(sh, cmd, args, forcomplete)
 	local cs = { acts = {}, opts = {} }
-	local given = false
-	local k = 2
-	while true do
-		local a = args[k]
-		if a == nil or a:sub(1, 1) ~= "-" or a == "-" then
-			break
-		end
-		k = k + 1
-		if a == "--" then
-			break
-		end
-		if a == "--help" then
-			rt.builtin_help(sh, cmd)
+	local given, k, sp, f, v = false, 2
+	while true do -- (bash's build_actions: internal_getopt over complete's letters)
+		f, v, k, sp = rt.getopt(sh, cmd, args, "abcdefgjko:prsuvA:G:W:P:S:X:F:C:DEI", k, sp)
+		if not f then
+			return cs, k, given
+		elseif f == "?" then
 			return nil
 		end
-		local i = 2
-		while i <= #a do
-			local f = a:sub(i, i)
-			i = i + 1
-			given = true
-			if ACT_LETTER[f] then
-				cs.acts[ACT_LETTER[f]] = true
-			elseif f == "p" or f == "r" or f == "D" or f == "E" or f == "I" then
-				if not forcomplete then
-					return rt.bad_option(sh, cmd, "-" .. f)
-				end
-				cs[f] = true
-			elseif ARGOPT[f] then
-				local v = a:sub(i)
-				i = #a + 1
-				if v == "" then
-					v = args[k]
-					k = k + 1
-				end
-				if v == nil then
-					io.stderr:write("curse: " .. cmd .. ": -" .. f .. ": option requires an argument\n" .. rt.usage(cmd))
+		given = true
+		if ACT_LETTER[f] then
+			cs.acts[ACT_LETTER[f]] = true
+		elseif f == "p" or f == "r" or f == "D" or f == "E" or f == "I" then
+			if not forcomplete then
+				return rt.bad_option(sh, cmd, "-" .. f)
+			end
+			cs[f] = true
+		elseif v then
+			if f == "o" then
+				if not COPT_OK[v] then
+					io.stderr:write("curse: " .. cmd .. ": " .. v .. ": invalid option name\n")
 					sh.status = 2
 					return nil
 				end
-				if f == "o" then
-					if not COPT_OK[v] then
-						io.stderr:write("curse: " .. cmd .. ": " .. v .. ": invalid option name\n")
-						sh.status = 2
-						return nil
-					end
-					cs.opts[v] = true
-				elseif f == "A" then
-					if not ACTIONS[v] then
-						io.stderr:write("curse: " .. cmd .. ": " .. v .. ": invalid action name\n")
-						sh.status = 2
-						return nil
-					end
-					cs.acts[v] = true
-				elseif f == "F" then
-					-- (check_identifier — a name, in posix mode — and no shell_break_chars)
-					local bad = sh.opt_posix and not v:find("^[%a_][%w_]*$")
-					if bad or v:find("[()<>;&| \t\n]") then
-						if bad then
-							rt.ierr = true -- (check_identifier's internal_error)
-							io.stderr:write("curse: `" .. v .. "': not a valid identifier\n")
-						end
-						io.stderr:write("curse: " .. cmd .. ": `" .. v .. "': not a valid identifier\n")
-						sh.status = 2
-						return nil
-					end
-					cs.F = v
-				else
-					cs[f] = v
+				cs.opts[v] = true
+			elseif f == "A" then
+				if not ACTIONS[v] then
+					io.stderr:write("curse: " .. cmd .. ": " .. v .. ": invalid action name\n")
+					sh.status = 2
+					return nil
 				end
+				cs.acts[v] = true
+			elseif f == "F" then
+				-- (check_identifier — a name, in posix mode — and no shell_break_chars)
+				local bad = sh.opt_posix and not v:find("^[%a_][%w_]*$")
+				if bad or v:find("[()<>;&| \t\n]") then
+					if bad then
+						rt.ierr = true -- (check_identifier's internal_error)
+						io.stderr:write("curse: `" .. v .. "': not a valid identifier\n")
+					end
+					io.stderr:write("curse: " .. cmd .. ": `" .. v .. "': not a valid identifier\n")
+					sh.status = 2
+					return nil
+				end
+				cs.F = v
 			else
-				return rt.bad_option(sh, cmd, "-" .. f)
+				cs[f] = v
 			end
 		end
 	end
-	return cs, k, given
 end
 
 -- compgen [option] [word]: evaluate a compspec built from the options for WORD and
@@ -1378,45 +1351,23 @@ end
 -- -D/-E/-I with a spec (bash's compopt.def).
 local function compopt(sh, args)
 	local on, off, flag = {}, {}, {}
-	local k = 2
-	while args[k] and args[k]:match("^[-+].") do
-		local a = args[k]
-		k = k + 1
-		if a == "--" then
-			break
-		end
-		local i = 2
-		while i <= #a do
-			local f = a:sub(i, i)
-			i = i + 1
-			if f == "o" then
-				local v = a:sub(i) ~= "" and a:sub(i) or args[k]
-				if a:sub(i) == "" then
-					k = k + 1
-				end
-				if v == nil then
-					io.stderr:write("curse: compopt: -o: option requires an argument\n" .. rt.usage("compopt"))
-					sh.status = 2
-					return
-				end
-				if not COPT_OK[v] then
-					io.stderr:write("curse: compopt: " .. v .. ": invalid option name\n")
-					sh.status = 2
-					return
-				end
-				if a:sub(1, 1) == "+" then
-					off[#off + 1] = v
-				else
-					on[#on + 1] = v
-				end
-				break
-			elseif f == "D" or f == "E" or f == "I" then
-				flag[f] = true
-			else
-				return rt.bad_option(sh, "compopt", a:sub(1, 1) .. f, a)
+	local k, sp, f, v, sign = 2
+	repeat
+		f, v, k, sp, sign = rt.getopt(sh, "compopt", args, "+o:DEI", k, sp)
+		if f == "?" then
+			return
+		elseif v then
+			if not COPT_OK[v] then
+				io.stderr:write("curse: compopt: " .. v .. ": invalid option name\n")
+				sh.status = 2
+				return
 			end
+			local t = sign == "+" and off or on
+			t[#t + 1] = v
+		elseif f then
+			flag[f] = true
 		end
-	end
+	until not f
 	local special = flag.D and SPECIAL_NAME.D or flag.E and SPECIAL_NAME.E or flag.I and SPECIAL_NAME.I
 	local names = special and { special } or {}
 	if not special then

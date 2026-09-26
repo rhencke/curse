@@ -14,42 +14,15 @@ local SPECIAL = {
 -- disable (-n) / re-enable NAMEs — a disabled builtin is looked up on $PATH instead.
 return function(sh, cmd, args)
 	local all, disable, special, delete, file = false, false, false, false, nil
-	local j = 2
-	while args[j] and args[j]:match("^%-.") and args[j] ~= "--" do
-		local a = args[j]
-		j = j + 1
-		local ci = 2
-		while ci <= #a do
-			local f = a:sub(ci, ci)
-			ci = ci + 1
-			if f == "a" then
-				all = true
-			elseif f == "n" then
-				disable = true
-			elseif f == "s" then
-				special = true
-			elseif f == "d" then
-				delete = true
-			elseif f == "p" then -- (printing is the default with no names)
-			elseif f == "f" then -- -f FILE: a loadable builtin (curse can't load one)
-				file = a:sub(ci) ~= "" and a:sub(ci) or args[j]
-				if a:sub(ci) == "" then
-					j = j + 1
-				end
-				if file == nil then
-					io.stderr:write("curse: enable: -f: option requires an argument\n" .. rt.usage("enable"))
-					sh.status = 2
-					return
-				end
-				break
-			else
-				return rt.bad_option(sh, "enable", "-" .. f, a)
-			end
+	local j, sp, f, a = 2
+	repeat -- (-p: printing is the default with no names; -f FILE: a loadable builtin)
+		f, a, j, sp = rt.getopt(sh, "enable", args, "adnpsf:", j, sp)
+		if f == "?" then
+			return
 		end
-	end
-	if args[j] == "--" then
-		j = j + 1
-	end
+		all, disable, special, delete = all or f == "a", disable or f == "n", special or f == "s", delete or f == "d"
+		file = a or file
+	until not f
 	if file and args[j] then
 		-- (dlopen's own words; this static binary can't load one at all)
 		local f = io.open(file, "r")

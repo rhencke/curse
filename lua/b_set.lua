@@ -18,7 +18,6 @@ local function list_o(sh, plus)
 	end
 end
 
-local USAGE = "set: usage: set [-abefhkmnptuvxBCEHPT] [-o option-name] [--] [-] [arg ...]\n"
 
 return function(sh, cmd, args, hook, tcb)
 	if cmd == "set" then
@@ -89,7 +88,7 @@ return function(sh, cmd, args, hook, tcb)
 					break
 				elseif f == "i" or not SETFLAG[f] then
 					-- `set -?` prints the usage but succeeds (list_optopt == '?')
-					io.stderr:write("curse: set: " .. c1 .. f .. ": invalid option\n" .. USAGE)
+					io.stderr:write("curse: set: " .. c1 .. f .. ": invalid option\n" .. rt.usage("set"))
 					sh.status = f == "?" and 0 or 2
 					sh.spb_err = f ~= "?" and 2 or nil -- (EX_USAGE: rt.spb_run)
 					return
@@ -141,7 +140,7 @@ return function(sh, cmd, args, hook, tcb)
 				elseif f == "r" then
 					-- a restricted shell can't be unrestricted (change_flag's FLAG_ERROR)
 					if not on and sh.opt_r then
-						io.stderr:write("curse: set: +r: invalid option\n" .. USAGE)
+						io.stderr:write("curse: set: +r: invalid option\n" .. rt.usage("set"))
 						sh.status = 1
 						return
 					elseif on and not sh.opt_r then
