@@ -10588,17 +10588,48 @@ function M.plain_field(sh, value)
 	end
 	return true
 end
--- $IFS as a SET of characters (a delimiter may be multibyte, `IFS=ç`: indexed by whole
--- codepoint) + mbifs (any multibyte one?). ifs_charset_of builds it for a given IFS text
--- (read's own split takes the IFS it was handed); ifs_charset memoizes $IFS's in
--- sh._ifscache keyed on the IFS text and the locale (a locale change re-splits `é`).
+-- $IFS as bash's two delimiter sets (subst.c): `set` holds every BYTE of IFS (ifs_cmap);
+-- `wset` the multibyte characters string_extract_verbatim matches WHOLE (its mbstowcs'd
+-- wcharlist: when IFS holds an invalid sequence mbstowcs fails, leaving only IFS's first
+-- char in the buffer — so then `wset` is that char alone, if multibyte). `mbifs`: the
+-- locale is multibyte and IFS has a high byte, so a scan must walk the text by character;
+-- `pat` finds the next candidate delimiter byte (`epat`: read's CTLESC \1 too).
+-- ifs_charset_of builds it for a given IFS text (read's own split takes the IFS it was
+-- handed); ifs_charset memoizes $IFS's in sh._ifscache keyed on the IFS text and the
+-- locale (a locale change re-splits `é`).
+do
+local ifs_ics = setmetatable({}, { __mode = "v" }) -- (memo: IFS text -> its sets, per locale)
 function M.ifs_charset_of(ifs)
-	local set = {}
-	for _, ch in ipairs(M.mb_chars(ifs)) do
-		set[ch.s] = true
+	local ic = ifs_ics[ifs]
+	if ic and ic.lg == M.locale_gen then
+		return ic
 	end
-	return { ifs = ifs, set = set, mbifs = M.lc_mb_cur_max() > 1 and ifs:find("[\128-\255]") ~= nil,
-		lg = M.locale_gen }
+	local set, wset = {}, nil
+	for k = 1, #ifs do
+		set[ifs:sub(k, k)] = true
+	end
+	local mbifs = M.lc_mb_cur_max() > 1 and ifs:find("[\128-\255]") ~= nil
+	if mbifs then
+		local chs = M.mb_chars(ifs)
+		for _, ch in ipairs(chs) do
+			if not ch.wc then
+				chs = { chs[1] }
+				break
+			end
+		end
+		for _, ch in ipairs(chs) do
+			if ch.wc and #ch.s > 1 then
+				wset = wset or {}
+				wset[ch.s] = true
+			end
+		end
+	end
+	local cls = ifs:gsub("%W", "%%%0") .. (mbifs and "\128-\255" or "")
+	ic = { ifs = ifs, set = set, wset = wset, mbifs = mbifs, lg = M.locale_gen,
+		pat = cls ~= "" and ("[" .. cls .. "]") or nil, epat = "[\1" .. cls .. "]" }
+	ifs_ics[ifs] = ic
+	return ic
+end
 end
 function M.ifs_charset(sh)
 	local ifs = (M.ifs(sh) or " \t\n")
@@ -10620,11 +10651,51 @@ local function skip_ifsws(set, v, i, n) -- past a run of IFS whitespace (always 
 	end
 	return i
 end
-local function char_at(mbifs, v, i) -- the (whole, when IFS is multibyte) char at i
-	if mbifs and v:byte(i) >= 0x80 then
-		return v:sub(i, i + M.mb_charlen(v, i) - 1)
+-- bash's string_extract_verbatim (subst.c): the first IFS delimiter in v from i — its
+-- position and byte length — or nil. A field's END is found per character: a valid
+-- multibyte char delimits only whole (`wset`) and is otherwise stepped over whole; any
+-- other byte delimits if it is an IFS byte — a stray lead/continuation byte of `é`
+-- included. `esc`: read's CTLESC \1 makes the next BYTE literal (bash's i += 2 — so an
+-- escaped `é`'s second byte is scanned on its own).
+function M.ifs_find(ic, v, i, esc)
+	local pat = esc and ic.epat or ic.pat
+	if not pat then
+		return nil
 	end
-	return v:sub(i, i)
+	while true do
+		local k = v:find(pat, i)
+		if not k then
+			return nil
+		end
+		local b = v:byte(k)
+		if b == 1 and esc then
+			i = k + 2
+		elseif b < 0x80 or not ic.mbifs then
+			return k, 1
+		else
+			local l = M.mb_charlen(v, k)
+			if l == 1 then
+				if ic.set[v:sub(k, k)] then
+					return k, 1
+				end
+			elseif ic.wset and ic.wset[v:sub(k, k + l - 1)] then
+				return k, l
+			end
+			i = k + l
+		end
+	end
+end
+-- bash's step past a delimiter (list_string / get_word_from_string, subst.c): skip IFS
+-- whitespace; a delimiter that BEGAN with whitespace (dl 1) also takes one non-whitespace
+-- IFS char and the whitespace after it (POSIX 2.6.5 (3)(b)) — but consumed BYTE-wise
+-- (bash's sindex++): of a multibyte `é` only the first byte, its second then delimiting an
+-- empty field. Returns the next index and the state (1/2 while still in the delimiter).
+function M.ifs_skip(set, v, i, n, dl)
+	i = skip_ifsws(set, v, i, n)
+	if dl == 1 and i <= n and set[v:sub(i, i)] then
+		return skip_ifsws(set, v, i + 1, n), 2
+	end
+	return i, dl
 end
 -- Pathname-expand one glob-active field (pattern `pat`, literal text `lit`) onto `out`:
 -- matches minus GLOBIGNORE's, else failglob's error / nullglob's nothing / the literal.
@@ -10713,7 +10784,7 @@ local FB = {}
 FB.__index = FB
 function M.fb_new(sh)
 	local ic = M.ifs_charset(sh)
-	return setmetatable({ sh = sh, ifs = ic.ifs, set = ic.set, mbifs = ic.mbifs,
+	return setmetatable({ sh = sh, ifs = ic.ifs, set = ic.set, ic = ic, dl = 2,
 		fields = {}, fu = {}, fq = {}, n = 0, cur = nil, unq = false, q = false }, FB)
 end
 function FB:brk()
@@ -10725,6 +10796,7 @@ function FB:brk()
 end
 function FB:add(s, unq)
 	local cur = self.cur or ""
+	self.dl = nil -- (text ends any delimiter: see FB:split)
 	if unq then
 		self.unq = true
 		if self.q then
@@ -10735,43 +10807,44 @@ function FB:add(s, unq)
 	end
 	self.cur = cur .. s
 end
+-- Word-split v onto the fields as bash's list_string (subst.c) does. `dl` carries the
+-- delimiter state ACROSS calls (nil: in a field; 1: in a delimiter that began with IFS
+-- whitespace; 2: in one that can take only more whitespace — also before the first field,
+-- where leading IFS whitespace is skipped), so splitting a word part by part (`$x$y`) is
+-- splitting it whole.
 function FB:split(v)
-	local set, mbifs = self.set, self.mbifs
-	local i, n = 1, #v
+	local ic, set, find, skip = self.ic, self.set, M.ifs_find, M.ifs_skip
+	local i, n, dl = 1, #v, self.dl
 	while i <= n do
-		local c = char_at(mbifs, v, i)
-		if not set[c] then -- a whole run of non-IFS chars joins the field at once (per-char is O(n²))
-			local i0 = i
-			i = i + #c
-			while i <= n do
-				c = char_at(mbifs, v, i)
-				if set[c] then
-					break
-				end
-				i = i + #c
+		if dl then
+			i, dl = skip(set, v, i, n, dl)
+			if i > n then
+				break
 			end
-			self:add(v:sub(i0, i - 1), true)
-		elseif IFSWS[c] then
-			-- (LEADING whitespace is just ignored: a `:` right after it still ends an
-			-- empty first field — IFS=': ' splits " :" into one empty field)
-			local leading = self.cur == nil and self.n == 0
+			dl = nil
+		end
+		local e, l = find(ic, v, i)
+		if not e then
+			self:add(v:sub(i), true)
+			break
+		end
+		if e > i then -- (a whole run of non-IFS chars joins the field at once)
+			self:add(v:sub(i, e - 1), true)
+		end
+		if IFSWS[v:sub(e, e)] then
 			self:brk()
-			i = skip_ifsws(set, v, i + 1, n)
-			if i <= n and not leading then -- (IFS whitespace + one non-whitespace IFS char
-				c = char_at(mbifs, v, i) -- + whitespace is ONE delimiter: POSIX 2.6.5 (3)(b))
-				if set[c] and not IFSWS[c] then
-					i = skip_ifsws(set, v, i + #c, n)
-				end
-			end
+			dl = 1
 		else -- a non-whitespace IFS delimiter (may be multibyte) always ends a field (empty ok)
 			if self.cur == nil then
 				self.cur = ""
 			end
 			self.unq = true
 			self:brk()
-			i = skip_ifsws(set, v, i + #c, n)
+			dl = 2
 		end
+		i = e + l
 	end
+	self.dl = dl
 end
 -- $@ / $* / array elements, joined/split per bash: quoted "$@" is one field PER element
 -- (each concatenates with the abutting text — the first with what precedes, the last

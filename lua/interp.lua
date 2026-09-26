@@ -234,7 +234,7 @@ end
 -- `read` field-splitting. The line may carry CTLESC markers (\1) before each
 -- backslash-escaped character (see the read builtin): a marked char is LITERAL —
 -- it is part of a field and never a delimiter — and the marker is dropped from
--- the value. Split into an array of {ch, esc} cells, then apply IFS to those.
+-- the value.
 local rs_pats = {} -- IFS -> { sep, non, tail } for the fast path (false: not whitespace-only)
 local function read_split(ifs, line, nvars, nomark) -- (nomark: \1 is plain — read's skip_ctlesc)
 	-- the common case: an IFS of whitespace only, no escaped chars — fields are runs of
@@ -300,114 +300,54 @@ local function read_split(ifs, line, nvars, nomark) -- (nomark: \1 is plain — 
 		end
 		return out
 	end
-	-- (a multibyte IFS char — `IFS=é` — delimits as a whole codepoint, so cells are whole
-	-- chars then: the field engine's rt.ifs_charset_of set)
+	-- the general case, as bash's read.def over get_word_from_string (subst.c): the field
+	-- engine's delimiter scan (rt.ifs_find: a field ends per character) and step past it
+	-- (rt.ifs_skip: byte-wise), on the raw line — CTLESC markers and all — so a field's
+	-- markers are dropped only once it is cut out
 	local ic = rt.ifs_charset_of(ifs)
-	local ifsset, mbifs = ic.set, ic.mbifs
-	local wsset = { [" "] = ifsset[" "], ["\t"] = ifsset["\t"], ["\n"] = ifsset["\n"] }
-	local cells, p, m = {}, 1, #line
-	while p <= m do
-		local c = line:sub(p, p)
-		if c == "\1" and p < m and not nomark then
-			cells[#cells + 1] = { ch = line:sub(p + 1, p + 1), esc = true }
-			p = p + 2
-		else
-			local cl = (mbifs and c:byte() >= 0x80) and rt.mb_charlen(line, p) or 1
-			cells[#cells + 1] = { ch = line:sub(p, p + cl - 1), esc = false }
-			p = p + cl
-		end
-	end
-	local n = #cells
-	local function isws(k)
-		local c = cells[k]
-		return c and not c.esc and wsset[c.ch]
-	end
-	local function isifs(k)
-		local c = cells[k]
-		return c and not c.esc and ifsset[c.ch]
-	end
-	local function slice(a, b)
-		local t = {}
-		for k = a, b do
-			t[#t + 1] = cells[k].ch
-		end
-		return table.concat(t)
-	end
-	local i = 1
-	while i <= n and isws(i) do
-		i = i + 1
-	end -- leading IFS whitespace
+	local set, n, esc = ic.set, #line, not nomark and line:find("\1", 1, true)
+	local i = rt.ifs_skip(set, line, 1, n) -- leading IFS whitespace
 	local out = {}
 	for v = 1, nvars do
-		if v == nvars then
-			-- bash (read.def): extract one field from the remainder (consuming it plus its
-			-- single trailing delimiter). If NOTHING remains after that, the value is just
-			-- that field (its trailing delimiter stripped — so `IFS=x; read a b <<< axbx`
-			-- gives b="b", and `xx` gives b=""). Otherwise the value is the raw remainder
-			-- with only trailing IFS WHITESPACE stripped (interior/trailing non-ws kept).
-			local s, j = i, i
-			while j <= n and not isifs(j) do
-				j = j + 1
-			end -- field = s..j-1
-			local fieldend = j - 1
-			while j <= n and isws(j) do
-				j = j + 1
-			end -- delimiter: IFS whitespace
-			if j <= n and isifs(j) then
-				j = j + 1
-				while j <= n and isws(j) do
-					j = j + 1
-				end
-			end -- + one non-ws
-			if j > n then
-				out[v] = slice(s, fieldend) -- single field, delimiter stripped
+		if i > n then
+			out[v] = ""
+		else
+			local e, l = rt.ifs_find(ic, line, i, esc)
+			local nx = n + 1
+			if e then
+				local c = line:sub(e, e)
+				nx = rt.ifs_skip(set, line, e + l, n, (c == " " or c == "\t" or c == "\n") and 1 or 2)
 			else
-				-- bash's strip_trailing_ifs_whitespace (subst.c) runs on the RAW remainder,
-				-- CTLESC (\1) markers and all: scan back while the byte is IFS whitespace, OR
-				-- it's a \1 whose FOLLOWING byte is space/tab/nl — never removing the first
-				-- byte. That strips a \1's escaped space while orphaning the bare \1, so a lone
-				-- \001 leaks into the value (read.def bug; builtin-read "read bash bug"). Mirror
-				-- it byte-for-byte by re-encoding cells[s..n] and dequoting only afterward.
-				local raw = {}
-				for k = s, n do
-					raw[#raw + 1] = cells[k].esc and ("\1" .. cells[k].ch) or cells[k].ch
-				end
-				raw = table.concat(raw)
-				local S = #raw
-				local function sptn(c)
-					return c == " " or c == "\t" or c == "\n"
-				end
-				while S > 1 and (wsset[raw:sub(S, S)] or (raw:sub(S, S) == "\1" and sptn(raw:sub(S + 1, S + 1)))) do
+				e = n + 1
+			end
+			if v < nvars or nx > n then
+				-- a field; for the LAST var only when nothing remains after it and its one
+				-- delimiter (so `IFS=x; read a b <<< axbx` gives b="b", and `xx` gives b="")
+				out[v] = line:sub(i, e - 1)
+				i = nx
+			else
+				-- the last var otherwise gets the raw remainder with only trailing IFS
+				-- WHITESPACE stripped (interior/trailing non-ws kept). bash's
+				-- strip_trailing_ifs_whitespace (subst.c) runs on it CTLESC (\1) markers and
+				-- all: scan back while the byte is IFS whitespace, OR it's a \1 whose
+				-- FOLLOWING byte is space/tab/nl — never removing the first byte. That strips
+				-- a \1's escaped space while orphaning the bare \1, so a lone \001 leaks into
+				-- the value (read.def bug; builtin-read "read bash bug"). Mirror it
+				-- byte-for-byte and dequote only afterward.
+				local S = n
+				while S > i do
+					local c = line:sub(S, S)
+					if not ((set[c] and (c == " " or c == "\t" or c == "\n"))
+						or (c == "\1" and line:sub(S + 1, S + 1):find("^[ \t\n]"))) then
+						break
+					end
 					S = S - 1
 				end
-				raw = raw:sub(1, S)
-				local o, k2 = {}, 1 -- dequote: \1 escapes the next byte; a trailing lone \1 stays
-				while k2 <= #raw do
-					if raw:sub(k2, k2) == "\1" and k2 < #raw then
-						o[#o + 1] = raw:sub(k2 + 1, k2 + 1)
-						k2 = k2 + 2
-					else
-						o[#o + 1] = raw:sub(k2, k2)
-						k2 = k2 + 1
-					end
-				end
-				out[v] = table.concat(o)
+				out[v] = line:sub(i, S)
 			end
-		else
-			local s = i
-			while i <= n and not isifs(i) do
-				i = i + 1
+			if esc then -- (dequote_string: \1 escapes the next byte; a trailing lone \1 stays)
+				out[v] = out[v]:gsub("\1(.)", "%1")
 			end
-			out[v] = slice(s, i - 1)
-			while i <= n and isws(i) do
-				i = i + 1
-			end -- delimiter: IFS whitespace
-			if i <= n and isifs(i) then
-				i = i + 1
-				while i <= n and isws(i) do
-					i = i + 1
-				end
-			end -- + one non-ws
 		end
 	end
 	return out
