@@ -14,11 +14,10 @@ local bit = require("bit")
 
 local M = {}
 
--- `set -o NAME` / short-flag maps for the `set` builtin (and shopt -o).
--- Ordered list mirrors bash's `set -o` output order.
--- Shell `set` option machinery lives in runtime now (option state is runtime data);
--- import it back so interp and the set/shopt builtins (via _int) keep using these names.
-local SETOPTS, SETOPT, SETFLAG, SETDEFAULT, opt_on = rt.SETOPTS, rt.SETOPT, rt.SETFLAG, rt.SETDEFAULT, rt.opt_on
+-- `set -o NAME` / short-flag maps for the `set` builtin (and shopt -o). The option
+-- machinery lives in runtime (option state is runtime data); interp and the set/shopt
+-- builtins (via _int) use it under these names.
+local SETOPTS, SETOPT, SETFLAG, opt_on = rt.SETOPTS, rt.SETOPT, rt.SETFLAG, rt.opt_on
 local function set_opt(sh, field, on)
 	local was = sh[field]
 	sh[field] = on
@@ -732,15 +731,6 @@ local function sig_order(canon)
 	local nm = canon:gsub("^SIG", "")
 	return SIGNUM[nm] or tonumber(nm) or 99
 end
--- A forked subshell (background `&`, `( )`, a pipeline stage, `>(…)`) resets
--- CAUGHT signal traps to their default DISPOSITION, like bash — the handler no
--- longer fires when the signal arrives (e.g. `kill -URG $!` after `trap … URG`).
--- bash's reset is deferred, though: `trap`/`trap -p` in the subshell still
--- DISPLAYS the inherited handler strings, so keep sh.traps[canon] and only drop
--- the entry from sh.sigtraps (which drives firing) and unblock the signal. A
--- signal set to be ignored (`trap '' SIG`) keeps both its ignore disposition and
--- its display.
-local function NOHOOK() end -- (an OSR hook that never switches)
 -- The hook for an isolated context (subshell, $(…), pipeline stage, background job):
 -- no switch of the whole program (it mustn't unwind past the context's checkpoint), but
 -- a hot loop may still run compiled on its own — tier installs M.frag_hook when loaded.
@@ -750,41 +740,16 @@ local function SUBHOOK(kind, id, st, sh)
 		return f(kind, id, st, sh)
 	end
 end
-local function reset_child_sigtraps(sh)
-	if not sh.sigtraps then
-		return
-	end
-	local kept
-	for canon in pairs(sh.sigtraps) do
-		if sh.traps[canon] == "" then -- ignored: keep ignore disposition and display
-			kept = kept or {}
-			kept[canon] = true
-		else -- caught: revert to default disposition, but keep the string for `trap -p`
-			local num = SIGNUM[canon:match("^SIG(.+)$") or ""]
-			if num then
-				block_sig(num, false)
-			end -- restore default so the default action applies
-		end
-	end
-	sh.sigtraps = kept
-	-- Handlers are now default; discard any trap the child caught in the fork→reset
-	-- window (e.g. `cmd & ; kill -SIG $!`) so it doesn't fire a spurious trap.
-	C.curse_sig_clearpending()
-end
 
--- file predicates + mtime/inode compares moved to runtime (pure stat FFI; shared with
--- the compiled tier and the builtins, which import them via _int -> rt). statbuf stays;
--- it is still used by the O_EXCL redirect check below.
+-- file predicates live in runtime (pure stat FFI; shared with the compiled tier and
+-- the builtins). statbuf2 is the second stat buffer `pwd` compares against statbuf.
 local file_test = rt.file_test
 local statbuf2 = ffi.new("uint8_t[144]")
-local file_bincmp = rt.file_bincmp
-local UNARY_STR = { ["-z"] = true, ["-n"] = true }
 -- `test -v NAME` / `[[ -v NAME ]]`: is the variable (or array element) set?
 local array_key -- forward (defined below)
 -- The test/[ engine + var_is_set moved to runtime (its operand primitives are all
 -- runtime funcs). Import the pieces interp's [[ ]] eval and the test/[ builtin call.
 local var_is_set, unary, binary, do_test = rt.var_is_set, rt.test_unary, rt.test_binary, rt.do_test
-M.do_test = do_test
 
 local tilde_prefix -- forward (word-initial ~ expansion; defined below, used in paramexp)
 local expand_word -- forward (used by eval's $-deferred arith and expand_part_str)
@@ -1419,18 +1384,9 @@ function M.arith_ref_elem(sh, name, store)
 	return arith_resolve(sh, sh:array_get(base, k))
 end
 
--- Compiled-tier helpers for `$name` arithmetic (the emit fast-xpand path):
--- arith_isnum gates the native compiled expression — true when the var's value binds
--- like an atom (a plain number, so native == bash's textual substitution). arith_textual
--- is the fallback for a non-numeric value: expand the raw arithmetic and re-parse it,
--- exactly as bash substitutes the value's TEXT (`x='1 + 2'; $(( $x*3 ))` -> 1 + 2 * 3).
-function M.arith_isnum(sh, name)
-	local s = sh.vars[sh:deref(name)]
-	if s and s.n ~= nil and s.s == nil and not s.arr then
-		return true
-	end -- i64-authoritative
-	return looks_numeric(sh:get(name)) ~= nil
-end
+-- Compiled-tier fallback for `$name` arithmetic on a non-numeric value: expand the raw
+-- arithmetic and re-parse it, exactly as bash substitutes the value's TEXT
+-- (`x='1 + 2'; $(( $x*3 ))` -> 1 + 2 * 3).
 function M.arith_textual(sh, raw)
 	return M.arith_textual_eval(sh, raw)
 end
@@ -1823,34 +1779,11 @@ end
 -- Tilde expansion lives in runtime.lua (pure runtime: HOME/PWD/OLDPWD + passwd db).
 -- interp aliases it locally; both tiers share the runtime version.
 tilde_prefix = rt.tilde_prefix
-M.tilde_prefix = tilde_prefix
-
--- Canonicalize an absolute path string LOGICALLY: resolve `.`/`..` textually,
--- without following symlinks (bash's default -L `cd` semantics — `..` pops the
--- previous name even when it is a symlink). Exactly two leading slashes survive
--- (POSIX leaves `//` implementation-defined; bash keeps it, `///` is `/`).
-local function logical_canon(path)
-	local parts = {}
-	for seg in path:gmatch("[^/]+") do
-		if seg == "." then -- drop
-		elseif seg == ".." then
-			if #parts > 0 then
-				parts[#parts] = nil
-			end
-		else
-			parts[#parts + 1] = seg
-		end
-	end
-	local root = (path:byte(2) == 47 and path:byte(3) ~= 47) and "//" or "/"
-	return root .. table.concat(parts, "/")
-end
 
 -- Assignment-RHS and word-initial tilde expansion also live in runtime.lua; interp
--- aliases them locally so its expansion paths and M.* exports keep working.
+-- aliases them locally for its expansion paths.
 local tilde_assign = rt.tilde_assign
 local tilde_word_initial = rt.tilde_word_initial
-M.tilde_word_initial = tilde_word_initial -- the compiled tier tilde-expands word-initial literals
-M.tilde_assign = tilde_assign -- compiled tier tilde-expands each `:`-segment of an assignment RHS
 
 -- Compiled-tier plain scalar assignment (`name=value`), mirroring interp's assign
 -- handler for an ATTRIBUTED target: reject a readonly var ($?=1 + diagnostic, fatal
@@ -3874,38 +3807,6 @@ local function do_arrayassign(sh, st)
 	end
 end
 M.do_arrayassign = do_arrayassign
--- Whole `a=(…)` statement (readonly/index checks + error-contained assign + status/$_),
--- so the compiled tier runs it as a runtime primitive instead of delegating to exec_stmt.
-function M.run_arrayassign(sh, st)
-	local rb = sh.vars[sh:deref(st.name)]
-	local nb = sh.vars[st.name]
-	if nb and nb.ref and nb.s and nb.s:find("[", 1, true) then -- nameref to an element/`a[@]`
-		io.stderr:write("curse: `" .. nb.s .. "': not a valid identifier\n")
-		sh.status = 1
-	elseif st.index then
-		io.stderr:write("curse: " .. st.name .. "[" .. st.index .. "]: cannot assign list to array member\n")
-		sh.status = 1
-		error({ __curse_exit = 1, __curse_lineabort = true }) -- (and abandons the line: bash)
-	elseif rb and rb.ro then
-		io.stderr:write("curse: " .. st.name .. ": readonly variable\n")
-		rt.report_exit(sh) -- (err_readonly: report_error)
-		sh.status = 1
-	else
-		local aok, aerr = pcall(do_arrayassign, sh, st)
-		if aok then
-			sh.status = 0
-			sh:set_str("_", "")
-		elseif type(aerr) == "table" and aerr.__curse_experr and not aerr.__curse_lineabort then
-			sh.status = 1
-			if sh.opt_e then
-				error({ __curse_exit = 1 })
-			end
-		else
-			error(aerr)
-		end
-	end
-end
-
 -- Quote a value the way `declare -p` does: double-quoted with \ " $ ` escaped.
 local function decl_quote(s)
 	-- a control char or high byte forces $'…' (bash: `declare -- x=$'a\nb'`);
@@ -3946,7 +3847,6 @@ M.DYN_ARRAYS = DYN_ARRAYS
 local DYN_SCALARS = { BASHPID = "i", HISTCMD = "i", RANDOM = "i", SRANDOM = "i", SECONDS = "i", LINENO = "-",
 	EPOCHSECONDS = "-", EPOCHREALTIME = "-", BASH_SUBSHELL = "-", BASH_COMMAND = "-", BASH_ARGV0 = "-",
 	OSTYPE = "-", MACHTYPE = "-", HOSTTYPE = "-" }
-M.DYN_SCALARS = DYN_SCALARS
 -- Format one variable as a `declare -p` line, or nil if it is unset.
 local function fmt_decl(sh, name)
 	-- SHELLOPTS/BASHOPTS are readonly, exported, derived specials with no var box.
@@ -4928,7 +4828,6 @@ end
 
 -- ---- background job table (for `jobs`, `wait -n`, `wait %jobspec`) ----
 local WNOHANG = 1
-local job_add = rt.job_add -- (moved to runtime; the compiled tier's run_background uses it too)
 -- Reap a job (blocking unless nohang); caches its exit status. Returns the status,
 -- or nil if it's still running (nohang) / already gone.
 local function job_reap(sh, job, nohang)
@@ -5075,8 +4974,6 @@ local SPECIAL_BUILTIN -- forward decl (assigned below); posix dispatch/funcdef r
 -- repeated by call depth. A plain token is bare; anything else is quoted the way
 -- bash quotes it (shell_quote: `$'…'` for control/non-printable, else `'…'`).
 local xtrace_quote, xtrace_line, xtrace = rt.xtrace_quote, rt.xtrace_line, rt.xtrace
-M.xtrace_line = xtrace_line
-M.xtrace_write = rt.xtrace_write
 
 -- bash's describe_command (type.def), for `type` and `command -v/-V`. FL: all, short (the
 -- sentence), reuse (command -v), type (-t), path_only (-p), force (-P), nofunc (-f),
@@ -5635,19 +5532,6 @@ end -- -eq/-lt… operand
 function M.dbracket_unary(sh, op, val)
 	return unary(sh, op, val)
 end -- file tests, -o, -v, -z/-n
-function M.dbracket_bincmp(l, op, r)
-	return binary(l, op, r, true)
-end -- -nt/-ot/-ef
-local function glob_escape(s)
-	return (s:gsub("[%*%?%[%]\\]", "\\%0"))
-end
-function M.dbracket_eq(sh, l, r, rq) -- ==/= : quoted rhs is literal, else a glob
-	local ic = sh.shopt.nocasematch and true or nil
-	if rq and not ic then
-		return l == r
-	end
-	return rt.glob_match(l, rq and glob_escape(r) or r, ic)
-end
 
 -- Run a loop body, catching break/continue (decrementing multi-level n and
 -- re-raising when it targets an outer loop). Returns "break", "continue", or nil.
@@ -8170,11 +8054,9 @@ M._int = {
 	SPECIAL_BUILTIN = SPECIAL_BUILTIN,
 	exec_simple = exec_simple,
 	expand_part_str = expand_part_str,
-	tilde_word_initial = tilde_word_initial,
 	file_test = file_test,
 	sq = sq,
 	BUILTINS = BUILTINS,
-	KEYWORDS = KEYWORDS,
 	SETOPTS = SETOPTS,
 	SHOPT_ORDER = SHOPT_ORDER,
 	parse_umask = parse_umask,
@@ -8183,8 +8065,6 @@ M._int = {
 	block_sig = block_sig,
 	canon_sig = canon_sig,
 	sig_order = sig_order,
-	find_all_in_path = find_all_in_path,
-	name_type = name_type,
 	SIGNUM = SIGNUM,
 	NUMSIG = NUMSIG,
 	array_key = array_key,
@@ -8205,7 +8085,6 @@ M._int = {
 	fmt_decl = fmt_decl,
 	decl_elems = decl_elems,
 	fmt_set_var = fmt_set_var,
-	logical_canon = logical_canon,
 	opt_on = opt_on,
 	set_opt = set_opt,
 	SETFLAG = SETFLAG,
@@ -8217,8 +8096,6 @@ M._int = {
 	exec_stmt = exec_stmt,
 	apply_redirs = apply_redirs,
 	restore_redirs = restore_redirs,
-	drain_procsub = drain_procsub,
-	expand_word = expand_word,
 	arith_expand_text = arith_expand_text,
 	dbracket_word = dbracket_word,
 	dbracket_pattern = dbracket_pattern,
@@ -8234,7 +8111,6 @@ M._int = {
 	rl_lib = rl_lib,
 	SHOPT_DEFAULT = SHOPT_DEFAULT,
 	shopt_on = shopt_on,
-	sherr = sherr,
 	C = C,
 	P = P,
 	rt = rt,

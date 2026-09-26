@@ -11438,7 +11438,7 @@ function M.arrayassign(sh, name, items, append)
 	end
 end
 -- The `NAME=(…)` statement (not a declare's): a nameref to an element (or `a[@]`) can't
--- take a list — `not a valid identifier`, status 1 (interp's run_arrayassign).
+-- take a list — `not a valid identifier`, status 1 (interp's arrayassign branch).
 function M.arrayassign_stmt(sh, name, items, append)
 	local nb = sh.vars[name]
 	if nb and nb.ref and nb.s and nb.s:find("[", 1, true) then
