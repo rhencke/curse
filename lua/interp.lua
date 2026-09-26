@@ -3494,7 +3494,7 @@ local BUILTINS = {
 	bind = 1,
 	help = 1,
 }
-M.BUILTINS = BUILTINS -- exposed so the compiled backend delegates the same set
+M.BUILTINS = BUILTINS -- (the one builtin table: emit and runtime consult it too)
 local KEYWORDS = {
 	["if"] = 1,
 	["then"] = 1,
@@ -7233,32 +7233,8 @@ exec_stmt = function(sh, st, hook)
 end
 
 M.exec_simple = exec_simple -- the compiled CFG dispatches a natively-built argv (builtins/externals)
-M.exec_stmt = exec_stmt -- exposed so the compiled CFG can delegate cold statements
+M.exec_stmt = exec_stmt -- (runtime and the source/fc/eval builtins run parsed statements through it)
 M.xtrace = xtrace -- set -x trace, for rt.exec_dynamic (compiled dynamic command word)
-do
-	local dlog = os.getenv("CURSE_COUNT_DELEG") -- instrumentation: log compiled->interp delegations
-	if dlog then
-		local raw = exec_stmt
-		M.exec_stmt = function(sh, st, hook)
-			local f = io.open(dlog, "a")
-			if f then
-				local tag = type(st) == "table" and st.t or tostring(st)
-				if type(st) == "table" and st.t == "simple" and st.words and st.words[1] then
-					local p1 = st.words[1].parts and st.words[1].parts[1]
-					tag = "simple:"
-						.. (
-							p1
-								and (p1.lit or (p1.var and "$" .. p1.var) or (p1.pexp and "${}") or (p1.cmdsub and "$()") or "?")
-							or "?"
-						)
-				end
-				f:write(tag .. "\n")
-				f:close()
-			end
-			return raw(sh, st, hook)
-		end
-	end
-end
 
 -- Run a trap handler string; preserves $LINENO (so an ERR/EXIT trap sees the
 -- failing command's line, not the handler's). Returns true if it called exit; and, when
@@ -7561,7 +7537,7 @@ function M.run(sh, ast, hook)
 end
 
 -- Top-level exit/return/EXIT-trap handling for a compiled run: wrap the compiled
--- module's run() so `exit`, nounset, errexit etc. thrown from compiled/delegated
+-- module's run() so `exit`, nounset, errexit etc. thrown from compiled
 -- code unwind cleanly (setting $?) instead of crashing as an uncaught table.
 function M.finish_run(sh, fn)
 	finish(sh, pcall(fn))

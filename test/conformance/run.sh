@@ -6,18 +6,18 @@
 #
 # Corpora (any present are run; pick with --corpus):
 #   cases  test/cases/*.sh              curse's own hand-written conformance scripts
-#   bash   reference/bash/tests/*.tests GNU bash's suite     (ninja -C build fetch-bash)
-#   oil    reference/oil/spec/*.test.sh Oils spec cases that target bash
-#                                        (ninja -C build fetch-oil)
+#   bash   subprojects/bash-*/tests/*.tests GNU bash's suite    (Meson subproject)
+#   oil    subprojects/oil/spec/*.test.sh   Oils spec cases that target bash
+#                                            (Meson subproject)
 #
 # stderr is not compared (error wording is a later-milestone concern), matching
 # curse's historical conformance metric. dash is scored only where it supports the
 # test: a dash parse error (status 2) where bash parsed fine counts N/A, not fail.
 #
 # The harness starts a PRIVATE cursed (its own $XDG_RUNTIME_DIR socket + a persistent
-# $XDG_CACHE_HOME) and runs curse through the C client. Each curse test runs TWICE:
-# a warm-up (populate the compile cache + heat the worker), then a MEASURED run that
-# hits the warm cache — so timing reflects curse's real amortized path, not cold start.
+# $XDG_CACHE_HOME) and runs curse through the C client, scored as two shells: curse-cold
+# (an empty per-test compile cache: interpret, OSR, store the .bc) then curse-hot (the
+# same test again, loading that .bc) — curse's real amortized path, not cold start.
 #
 # PARALLELISM — bounded on purpose. Each test runs its shells SEQUENTIALLY; only
 # --jobs test units run at once (default: min(nproc/2, 4)); the daemon's worker pool
@@ -29,7 +29,7 @@
 #
 # Usage:
 #   test/conformance/run.sh [--corpus cases|bash|oil|all] [--jobs N] [--timeout S]
-#                           [--shells a,b,c] [-v|--verbose] [FILTER...]
+#                           [--shells a,b,c] [--results FILE] [-v|--verbose] [FILTER...]
 #   FILTER: substrings; only test files whose name matches one are run.
 set -uo pipefail
 
@@ -178,7 +178,6 @@ done
 
 LUAJIT="${CURSE_LUAJIT:-$REPO/build/luajit}"
 BUNDLE="$REPO/build/curse.bc"
-RUN="$REPO/lua/run.lua"
 [ -x "$LUAJIT" ] || { echo "error: no built luajit at $LUAJIT — run 'meson compile -C build' first." >&2; exit 1; }
 
 # Corpus dirs: explicit --bash-dir/--oil-dir (Meson passes the subproject trees),
