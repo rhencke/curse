@@ -621,6 +621,10 @@ local SIGDESC = {
 	[13] = "Broken pipe",
 	[14] = "Alarm clock",
 	[15] = "Terminated",
+	[19] = "Stopped (signal)", -- (the stop signals: `jobs -l` of a stopped job)
+	[20] = "Stopped",
+	[21] = "Stopped (tty input)",
+	[22] = "Stopped (tty output)",
 }
 -- A trap's signal spec (bash's decode_signal with DSIG_NOCASE|DSIG_SIGPREFIX, trap.c): a
 -- legal_number 0..64 (blanks/sign/leading zeros ok; 0 = EXIT), [SIG]RTMIN+N for N 0..30,
@@ -5795,8 +5799,8 @@ run_trap = function(sh, code)
 		end
 		trap_seen[code] = true
 	end
-	if sh.jobs_waited then -- (the handler is parse_and_execute'd: reading it cleans up — rt.job_waited)
-		rt.jobs_cleanup_waited(sh)
+	if sh.jobs_waited or sh.jobs_pending then -- (the handler is parse_and_execute'd: reading it notifies and cleans up — rt.jobs_line)
+		rt.jobs_line(sh)
 	end
 	local stmts, k = mod and {} or P.parse(code, sh).stmts, 0 -- (sh: aliases expand, bash)
 	local function body()
@@ -6029,6 +6033,12 @@ local function finish(sh, ok, err)
 	if sh.defer_exit_trap then
 		return
 	end
+	-- (the script ran to its end: the reader reading end of input notifies of the jobs
+	-- that ended meanwhile — rt.jobs_line; not after an `exit`)
+	if ok and (sh.jobs_waited or sh.jobs_pending) and sh.main_src and not sh.opt_c then
+		local okp, ast = pcall(P.parse, sh.main_src)
+		rt.jobs_line(sh, okp and ast.eofline or nil)
+	end
 	M.run_exit_trap(sh)
 	if sh.coprocs and next(sh.coprocs) then
 		rt.coproc_exit_dispose(sh, ok)
@@ -6068,8 +6078,8 @@ end
 -- Run one logical line (a parser group) the way the shell runs its own input.
 local function run_group(sh, lg, hook, k)
 	sh.cmd_number = (sh.cmd_number or 0) + 1 -- (the prompt's \#)
-	if sh.jobs_waited then -- (reading a line: notify_and_cleanup — rt.job_waited)
-		rt.jobs_cleanup_waited(sh)
+	if sh.jobs_waited or sh.jobs_pending then -- (reading a line: notify_and_cleanup — rt.jobs_line)
+		rt.jobs_line(sh, lg.rline)
 	end
 	-- bash parses a whole LOGICAL LINE (a `simple_list` up to a top-level newline)
 	-- before executing any of it, so a syntax error ANYWHERE on the line means the

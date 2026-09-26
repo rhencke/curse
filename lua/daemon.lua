@@ -51,6 +51,8 @@ ffi.cdef([[
   int dup2(int a, int b);
   long syscall(long number, ...);
   int curse_d_waitid(int idtype, int id, void *info, int options) asm("waitid");
+  int curse_d_prctl(int option, unsigned long a2, unsigned long a3, unsigned long a4, unsigned long a5) asm("prctl");
+  int curse_d_setpgid(int pid, int pgid) asm("setpgid");
   typedef struct _IO_FILE curse_d_FILE;
   extern curse_d_FILE *stdin;
   void curse_d_fpurge(curse_d_FILE *fp) asm("__fpurge");
@@ -317,8 +319,9 @@ local function serve_request(cfd, req, fds, ctx)
 	-- them, then RETIRES — its slot reads -1 meanwhile (busy for the pool's saturation
 	-- count, so a replacement is spawned on demand; never "client gone", so not killed)
 	local drained = false
+	pcall(rt.jobs_exit_hangup, sh) -- (its stopped jobs: as the kernel would, were it exiting)
 	if rt.sched_live() then -- (the slot already reads -1: see above)
-		pcall(rt.sched_drain)
+		pcall(rt.sched_drain, sh)
 		drained = true
 	end
 	-- SCRUB per-request process state (the fork boundary used to do this):
@@ -674,8 +677,25 @@ local function serve()
 			return
 		end
 		busy[slot] = 0
+		local parent = tonumber(C.getpid())
 		local pid = C.fork()
 		if pid == 0 then
+			-- A worker never outlives the daemon: killed (SIGTERM, SIGKILL), the parent can't
+			-- reap, replace or sweep its pool, yet orphaned workers would go on accepting on
+			-- the socket (and holding the instance lock, via the inherited OFD) until their
+			-- own idle timeout. PR_SET_PDEATHSIG: the parent's death kills this worker; and
+			-- if it died before that was set, go now.
+			C.curse_d_prctl(1, 9, 0, 0, 0) -- PR_SET_PDEATHSIG, SIGKILL
+			if tonumber(C.getppid()) ~= parent then
+				C._exit(0)
+			end
+			-- …and a process group of its own, as a shell running a script has: its
+			-- non-job-control children share it, so if the worker dies (the dead-client
+			-- sweep's SIGKILL) with one of them STOPPED, the kernel sees the group
+			-- orphaned and sends it SIGHUP + SIGCONT (POSIX) — in the daemon's group it
+			-- was never orphaned and stayed stopped forever. (`kill 0` in a script
+			-- reaches that group, not the whole daemon.)
+			C.curse_d_setpgid(0, 0)
 			for _, pfd in pairs(pidfds) do -- siblings' pidfds are the parent's business
 				C.close(pfd)
 			end

@@ -92,6 +92,7 @@ extern char posix_spawnattr_setflags[];
 extern char posix_spawnattr_setsigmask[];
 extern char posix_spawnp[];
 extern char ppoll[];
+extern char prctl[];
 extern char read[];
 extern char readdir[];
 extern char recvmsg[];
@@ -100,6 +101,7 @@ extern char regexec[];
 extern char regfree[];
 extern char setenv[];
 extern char setlocale[];
+extern char setpgid[];
 extern char setpwent[];
 extern char setrlimit[];
 extern char setsockopt[];
@@ -224,6 +226,7 @@ static const curse_sym_t curse_syms[] = {
   { "posix_spawnattr_setsigmask", (void*)posix_spawnattr_setsigmask },
   { "posix_spawnp", (void*)posix_spawnp },
   { "ppoll", (void*)ppoll },
+  { "prctl", (void*)prctl },
   { "read", (void*)read },
   { "readdir", (void*)readdir },
   { "recvmsg", (void*)recvmsg },
@@ -232,6 +235,7 @@ static const curse_sym_t curse_syms[] = {
   { "regfree", (void*)regfree },
   { "setenv", (void*)setenv },
   { "setlocale", (void*)setlocale },
+  { "setpgid", (void*)setpgid },
   { "setpwent", (void*)setpwent },
   { "setrlimit", (void*)setrlimit },
   { "setsockopt", (void*)setsockopt },
