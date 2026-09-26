@@ -5148,11 +5148,12 @@ exec_stmt = function(sh, st, hook)
 	-- function the trap calls, whose lines count as usual — bash)
 	if t == "assign" then
 		local pnf = sh.procsub_files and #sh.procsub_files or 0
-		if rt.assign_full(sh, st) then
-			sh:array_assign("PIPESTATUS", { tostring(sh.status) }, false) -- (this null command's status)
-			if sh.procsub_files then -- (`x=<(…)`: a null command closes its <() when it ends)
-				rt.assign_drain(sh, st, pnf)
-			end
+		rt.assign_full(sh, st)
+		-- this null command's status, whatever its outcome (bash's execute_null_command;
+		-- a line abort's is set where it is contained: rt.line_aborted)
+		sh:array_assign("PIPESTATUS", { tostring(sh.status) }, false)
+		if sh.procsub_files then -- (`x=<(…)`: a null command closes its <() when it ends)
+			rt.assign_drain(sh, st, pnf)
 		end
 	elseif t == "arrayassign" then
 		if sh.opt_x and st.raw then -- (bash traces an array literal as written: `+ a=(1 "b c")`)
@@ -5161,20 +5162,15 @@ exec_stmt = function(sh, st, hook)
 		if st.index then -- `a[0]=(1 2)`: can't assign a list to an array MEMBER (bash)
 			rt.arrayassign_member(sh, st.name, st.index)
 		else
-			-- a failglob no-match inside `a=(*.ZZ)` fails the assignment non-fatally (bash)
 			local ncs0 = sh.ncs
 			local pnf = sh.procsub_files and #sh.procsub_files or 0
-			local stored = rt.arrayassign_stmt(sh, st.name, nil, st.append, st)
-			if stored then
-				if sh.ncs ~= ncs0 then -- (`a=( $(exit 3) )`: 3)
-					sh.status = sh.last_cmdsub_status
-				end
-				sh:array_assign("PIPESTATUS", { tostring(sh.status) }, false)
-				if sh.procsub_files then -- (`a=( <(…) )`: closed when the assignment ends)
-					rt.assign_drain(sh, st, pnf)
-				end
-			elseif stored == false and sh.opt_e then
-				error({ __curse_exit = 1 })
+			rt.arrayassign_stmt(sh, st.name, nil, st.append, st)
+			if sh.status == 0 and sh.ncs ~= ncs0 then -- (`a=( $(exit 3) )`: 3)
+				sh.status = sh.last_cmdsub_status
+			end
+			sh:array_assign("PIPESTATUS", { tostring(sh.status) }, false)
+			if sh.procsub_files then -- (`a=( <(…) )`: closed when the assignment ends)
+				rt.assign_drain(sh, st, pnf)
 			end
 		end
 	elseif t == "funcdef" then
@@ -6190,7 +6186,7 @@ local function run_group(sh, lg, hook, k)
 				end
 				sh.noerr = ne0 -- (an `if`/`&&` condition it unwound out of: errexit is live again)
 				rt.posix_arith_fatal(sh, err)
-				sh.status = err.__curse_badusage and not sh.opt_c and 2 or 1 -- (a failed ${x:=w})
+				rt.line_aborted(sh, err.__curse_badusage and not sh.opt_c and 2 or 1) -- (a failed ${x:=w})
 				rt.line_drift(sh, lg.sline, lg.eline) -- (bash's line numbers drift from here)
 				break
 			else
@@ -6469,7 +6465,8 @@ function M.run_variable_command(sh, pc, hook)
 						error(serr)
 					elseif type(serr) == "table" and serr.__curse_lineabort then
 						rt.posix_arith_fatal(sh, serr)
-						sh.status, sh.noerr = 1, ne0
+						sh.noerr = ne0
+						rt.line_aborted(sh, 1)
 						break
 					else
 						return
@@ -6610,7 +6607,8 @@ function M.source_file(sh, path, hook)
 						error(serr)
 					end
 					rt.posix_arith_fatal(sh, serr)
-					sh.status, sh.noerr = 1, ne0
+					sh.noerr = ne0
+					rt.line_aborted(sh, 1)
 					break
 				else
 					error(serr)

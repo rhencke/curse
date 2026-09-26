@@ -105,7 +105,8 @@ return function(sh, cmd, args, hook, tcb)
 									if rt.lineabort_exits(sh, serr) then
 										error(serr)
 									end
-									sh.status, sh.noerr = 1, ne0
+									sh.noerr = ne0
+									rt.line_aborted(sh, 1)
 									break -- div0/failglob: abort the rest of this line
 								else
 									error(serr)

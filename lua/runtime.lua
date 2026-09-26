@@ -1879,11 +1879,11 @@ function M.ps_drain(sh, m)
 	require("interp")._int.drain_procsub(sh, m[1], m[2])
 end
 -- An assignment-only statement (`x=<(…)`, `a=( <(…) )`) is a null command: the <()
--- it registered (past count nf) closes when it ends — unless it is a command's prefix
--- binding (closed after that command) or one binding of an assignment list / a null
--- command's assigns (closed after the whole list: `x=<(…) y=$(cat $x)` reads it).
+-- it registered (past count nf) closes when it ends — unless it is one binding of an
+-- assignment list / a null command's assigns (closed after the whole list: `x=<(…)
+-- y=$(cat $x)` reads it). (A command's prefix binding never comes here: rt.pbind.)
 function M.assign_drain(sh, st, nf)
-	if #sh.procsub_files <= nf or sh.applying_prefix then
+	if #sh.procsub_files <= nf then
 		return
 	end
 	local al = sh.cur_alist
@@ -8327,6 +8327,13 @@ function M.lineabort_exits(sh, err)
 	return sh.opt_e and not sh.ign_ee and not err.__curse_discard and not err.__curse_matherr
 		and not err.__curse_noee
 end
+-- A line abort contained (bash's DISCARD caught by reader_loop / parse_and_execute): the
+-- status is the failure's, and so is $PIPESTATUS — exp_jump_to_top_level and set_exit_status
+-- both set_pipestatus_from_exit — whatever statement (an assignment too) was abandoned.
+function M.line_aborted(sh, status)
+	sh.status = status
+	sh:array_assign("PIPESTATUS", { tostring(status) }, false)
+end
 -- ${a[-N]} past the start: bash warns (`a: bad array subscript`) and expands to nothing
 -- (an empty associative key too: bash's get_array_value, `${E['']}`)
 function M.elem_read_check(sh, name, key)
@@ -8618,9 +8625,8 @@ end
 -- A plain assignment through a nameref cycle (ref1 -> ref2 -> ref1): bash warns; a cycle of
 -- a function's locals then binds the GLOBAL name, no nameref (variables.c bind_variable's
 -- nameref_maxloop_value) — true, for the caller to do so (Shell:global_swap) — else it is
--- an assignment error, as a readonly one: a prefix binding is just skipped (false), a
--- standalone one aborts the rest of the line (fatal in posix mode). A chain past
--- NAMEREF_MAX is that error silently.
+-- an assignment error, as a readonly one: the rest of the line is aborted (fatal in posix
+-- mode). A chain past NAMEREF_MAX is that error silently.
 function M.nameref_circular(sh, name)
 	if M.ref_too_deep(sh, name) then
 		M.assign_discard(sh)
@@ -8633,13 +8639,7 @@ function M.nameref_circular(sh, name)
 		end
 	end
 	sh.status = 1
-	if sh.opt_posix then
-		error({ __curse_exit = 1 })
-	end
-	if sh.applying_prefix then
-		return false
-	end
-	error({ __curse_exit = 1, __curse_lineabort = true })
+	error({ __curse_exit = 1, __curse_lineabort = not sh.opt_posix or nil })
 end
 -- bash's jump_to_top_level(DISCARD) after a failed assignment: every function, eval and
 -- source level unwinds, the rest of the top-level command is abandoned, $? is 1
@@ -10954,24 +10954,6 @@ function M.array_convert_err(sh, name, isassoc, cmd)
 	end
 	return false
 end
--- An array literal's store. `items` are the expanded elements ({key?, op, val}) — the
--- compiled tier's, whose keys are resolved literals — or nil with `st`, the interpreter's
--- arrayassign AST: its elements expand HERE (after the nameref/noassign checks, as bash), from
--- sh.arrayargs_pre when a declaration builtin pre-expanded them, and their keys are the
--- source text (an xkey when expanded) that interp's array_key resolves.
--- An expression error in a subscript (`a=([x y]=1)`) fails just this assignment, status 1
--- (errexit is the caller's): false; true once stored.
-function M.arrayassign(sh, name, items, append, st)
-	local ok, err = pcall(M.arrayassign_body, sh, name, items, append, st)
-	if not ok then
-		if type(err) == "table" and err.__curse_experr then
-			sh.status = 1
-			return false
-		end
-		error(err, 0)
-	end
-	return true
-end
 -- The `NAME=(…)` statement (not a declare's; both tiers): a nameref to an element (or `a[@]`)
 -- can't take a list — `not a valid identifier`, status 1 (nil).
 function M.arrayassign_stmt(sh, name, items, append, st)
@@ -10988,7 +10970,7 @@ function M.arrayassign_stmt(sh, name, items, append, st)
 		sh.status = 1
 		error({ __curse_exit = 1, __curse_lineabort = not (sh.opt_c or sh.opt_posix) or nil })
 	end
-	return M.arrayassign(sh, name, items, append, st)
+	return M.arrayassign_body(sh, name, items, append, st)
 end
 -- `r=(…)` on a nameref with no target: the variable becomes that array, its nameref
 -- attribute dropped with a warning (bash's assign_array_var_from_string)
@@ -11013,6 +10995,13 @@ function M.arrayassign_member(sh, name, index)
 	sh.status = 1
 	error({ __curse_exit = 1, __curse_lineabort = true })
 end
+-- An array literal's store. `items` are the expanded elements ({key?, op, val}) — the
+-- compiled tier's, whose keys are resolved literals — or nil with `st`, the interpreter's
+-- arrayassign AST: its elements expand HERE (after the nameref/noassign checks, as bash), from
+-- sh.arrayargs_pre when a declaration builtin pre-expanded them, and their keys are the
+-- source text (an xkey when expanded) that interp's array_key resolves.
+-- An expression error in an indexed subscript (`a=([x y]=1)`) is bash's DISCARD in both
+-- tiers: the line is abandoned (a subshell exits 1) — interp's array_key / M.int_value.
 -- (`decl`: a declaration builtin's NAME=(…), stored after the builtin ran — it made the
 -- variable, maybe readonly already; the status and $_ are the builtin's)
 function M.arrayassign_body(sh, name, items, append, st, decl)
@@ -11046,7 +11035,7 @@ function M.arrayassign_body(sh, name, items, append, st, decl)
 			return II.array_key(sh, name, it.xkey or II.literal_sub(it.key))
 		end
 		-- (an indexed subscript loses bash's CTLESC bytes, e.g. from a $'\001' in it)
-		return isassoc and it.key or M.to_arr_key(M.arith_str(sh, (it.key:gsub("\1", ""))))
+		return isassoc and it.key or M.to_arr_key(M.int_value(sh, (it.key:gsub("\1", ""))))
 	end
 	if name == "DIRSTACK" and M.dirstack_dyn(sh) then -- (each element through its assign_func)
 		local auto = append and #(sh.dirstack or {}) + 1 or 0
@@ -11150,6 +11139,7 @@ function M.arrayassign_body(sh, name, items, append, st, decl)
 		sh:set_str("_", "")
 	end
 end
+M.arrayassign = M.arrayassign_body -- (the name the compiled declaration path calls)
 
 -- a negative subscript past the start: `NAME[SUB]: bad array subscript`, the line aborted —
 -- reported before readonly-ness, since bash evaluates the subscript first
@@ -11161,6 +11151,17 @@ local function neg_oob_abort(sh, name, key, sub)
 		error({ __curse_exit = 1, __curse_lineabort = true })
 	end
 end
+-- The readonly guard of the compiled element-assign paths (assign_element / _i / _x): a
+-- readonly NAME rejects the assignment, status 1, and aborts the rest of the line (fatal
+-- under -c / posix mode) — interp's assign_full. (A prefix binding's is rt.pbind's.)
+local function elem_readonly_abort(sh, rb, name)
+	if rb and rb.ro then
+		io.stderr:write("curse: " .. name .. ": readonly variable\n")
+		M.report_exit(sh) -- (err_readonly: report_error)
+		sh.status = 1
+		error({ __curse_exit = 1, __curse_lineabort = not (sh.opt_c or sh.opt_posix) or nil })
+	end
+end
 -- Single array-element assignment `a[i]=v` / `a[i]+=v` for the compiled tier — mirrors interp's
 -- assign path (the st.index branch). `raw` is the subscript's source text, `expanded` the same
 -- word-expanded (emit_word, == interp's array_key for assoc). Readonly -> reject (status 1,
@@ -11170,18 +11171,7 @@ function M.assign_element(sh, name, raw, expanded, value, append)
 	if rb and rb.ro and rb.arr and not rb.assoc and raw:find("-", 1, true) then
 		neg_oob_abort(sh, name, M.array_key(sh, name, raw, expanded), raw)
 	end
-	if rb and rb.ro then
-		io.stderr:write("curse: " .. name .. ": readonly variable\n")
-		M.report_exit(sh) -- (err_readonly: report_error)
-		sh.status = 1
-		if sh.opt_c or sh.opt_posix then
-			error({ __curse_exit = 1 })
-		end
-		if sh.applying_prefix then
-			return
-		end
-		error({ __curse_exit = 1, __curse_lineabort = true })
-	end
+	elem_readonly_abort(sh, rb, name)
 	-- array_key: an ASSOC uses the word-expanded subscript verbatim; an INDEXED array
 	-- arith-evaluates the RAW subscript (so `a['3']=` is the syntax error bash reports,
 	-- while emit_word would have stripped the quotes), exactly interp's array_key.
@@ -11225,25 +11215,6 @@ function M.assign_element(sh, name, raw, expanded, value, append)
 	sh:set_str("_", "") -- a bare assignment resets $_ (bash); status stays the RHS's (emit set 0 first)
 end
 
--- Shared readonly guard for the compiled element-assign paths (assign_element_i / _x). Returns
--- true if the assignment must be ABORTED (name is readonly) — the caller then returns; raises for
--- the fatal (posix / -c / non-prefix) cases exactly like assign_element.
-local function elem_readonly_abort(sh, name)
-	local rb = sh.vars[sh:deref(name)]
-	if not (rb and rb.ro) then
-		return false
-	end
-	io.stderr:write("curse: " .. name .. ": readonly variable\n")
-	M.report_exit(sh) -- (err_readonly: report_error)
-	sh.status = 1
-	if sh.opt_c or sh.opt_posix then
-		error({ __curse_exit = 1 })
-	end
-	if sh.applying_prefix then
-		return true
-	end
-	error({ __curse_exit = 1, __curse_lineabort = true })
-end
 -- INDEXED element assign with the key ALREADY arith-evaluated NATIVELY by the compiled tier
 -- (from lifted locals, so a loop variable is CURRENT — arith_str(sh, raw) would read the stale
 -- sh.vars copy). `keyi` is the int64 arith value; only reached for a non-assoc array (the emitter
@@ -11253,9 +11224,7 @@ function M.assign_element_i(sh, name, keyi, value, append, raw)
 	if keyi < 0 then
 		neg_oob_abort(sh, name, to_arr_key(keyi), raw or M.i64_to_str(keyi))
 	end
-	if elem_readonly_abort(sh, name) then
-		return
-	end
+	elem_readonly_abort(sh, sh.vars[sh:deref(name)], name)
 	if not sh:array_set(name, to_arr_key(keyi), value, append) then
 		neg_oob_abort(sh, name, to_arr_key(keyi), raw or M.i64_to_str(keyi))
 		sh.status = 1
@@ -11269,9 +11238,7 @@ end
 -- it verbatim as the key; an indexed array arith-evaluates it (with the same error handling as
 -- assign_element) — arith'ing the VALUE, not the raw `$i`, so a lifted loop var is current.
 function M.assign_element_x(sh, name, src, value, append)
-	if elem_readonly_abort(sh, name) then
-		return
-	end
+	elem_readonly_abort(sh, sh.vars[sh:deref(name)], name)
 	local key
 	if sh:is_assoc(name) then
 		key = src
@@ -14395,8 +14362,8 @@ end
 -- bare builtin/external dispatch — a declaration builtin (`declare -A m=(…)`, `local -n
 -- r=x`, `export a=~/b`), a prefix assignment (`x=1 f`, posix `x=1 :`), a function with
 -- redirections — is compiled to: its argv built natively (the field engine; assignment-
--- context words for a declaration builtin), then M.simple_run, the twin of the rest of
--- interp exec_stmt's `simple` branch: the prefix bindings (tempenv, or persistent for a
+-- context words for a declaration builtin), then M.simple_run — M.sr_run, which interp's
+-- `simple` branch calls too, so both tiers share one runner: the prefix bindings (tempenv, or persistent for a
 -- posix special builtin), a declaration builtin's NAME=(…) literals, the command runner
 -- (exec_simple: function / builtin / external), $_ and PIPESTATUS. Statement structure,
 -- control flow and redirections stay compiled (the caller's delegate wrapper / opts.redir).
@@ -14982,24 +14949,29 @@ end
 -- or subscript the compiled word engine can't render, a side-effecting arith value, HISTSIZE/
 -- HISTFILESIZE, the readonly specials SHELLOPTS/BASHOPTS). The value expands through the
 -- shared one-word expander, the arithmetic through the evaluator; `st` is the assignment.
--- True when it assigned (a rejected one returns nothing, or raises).
--- (M.IX: interp, bound on first use — interp requires this module. Fields, not locals: this
--- chunk is at LuaJIT's 200-local limit.)
+-- (A rejected one sets status 1, or raises; the caller's PIPESTATUS and <() drain follow.)
+-- (M.IX: interp, bound on first use by M.ix — interp requires this module, so not at load.
+-- Fields, not locals: this chunk is at LuaJIT's 200-local limit.)
+function M.ix()
+	M.IX = require("interp")
+	return M.IX
+end
 -- The store (assign_full runs it under pcall): closure-free — every interpreted `x=…` in a
 -- loop comes through here, and closure creation is NYI for the JIT. The expanded
 -- right-hand side is kept in sh.x_rhs (set -x).
 function M.assign_rhs_a(sh, st)
-	local v = M.IX.expand_assign_word(sh, st.rhs)
+	local v = (M.IX or M.ix()).expand_assign_word(sh, st.rhs)
 	sh.x_rhs = v
 	return v
 end
 function M.assign_rhs_w(sh, st)
-	local v = M.IX._int.expand_word(sh, st.rhs)
+	local v = (M.IX or M.ix())._int.expand_word(sh, st.rhs)
 	sh.x_rhs = v
 	return v
 end
 function M.assign_body_full(sh, st, nref_base, nref_sub)
-	local II = M.IX._int
+	local IX = M.IX or M.ix()
+	local II = IX._int
 	local assign_rhs_a, assign_rhs_w = M.assign_rhs_a, M.assign_rhs_w
 	if nref_base then
 		sh:array_set(nref_base, II.array_key(sh, nref_base, nref_sub), assign_rhs_a(sh, st), st.append)
@@ -15022,7 +14994,7 @@ function M.assign_body_full(sh, st, nref_base, nref_sub)
 			sh:array_set(st.name, II.array_key(sh, st.name, "0"), assign_rhs_a(sh, st), true)
 		elseif b and b.int then -- integer var: += is arithmetic addition (the old value
 			-- is itself evaluated: `b=4+1; typeset -i b; b+=37` is 42 — bash)
-			sh:aset(st.name, M.int_value(sh, sh:get(st.name)) + M.int_value(sh, assign_rhs_w(sh, st), M.IX.arith_eval_str))
+			sh:aset(st.name, M.int_value(sh, sh:get(st.name)) + M.int_value(sh, assign_rhs_w(sh, st), IX.arith_eval_str))
 		elseif b and (b.lower or b.upper) then -- declare -l/-u: case-fold the appended result
 			local v = sh:get(st.name) .. assign_rhs_a(sh, st)
 			sh:set_str(st.name, b.lower and v:lower() or v:upper())
@@ -15034,7 +15006,7 @@ function M.assign_body_full(sh, st, nref_base, nref_sub)
 		if b and b.arr then -- plain `name=value` on an array var writes element 0 (bash)
 			sh:array_set(st.name, II.array_key(sh, st.name, "0"), assign_rhs_a(sh, st), false)
 		elseif b and b.int and not b.ref then -- integer var (declare -i): assign arith-evaluates
-			sh:aset(st.name, M.int_value(sh, assign_rhs_w(sh, st), M.IX.arith_eval_str))
+			sh:aset(st.name, M.int_value(sh, assign_rhs_w(sh, st), IX.arith_eval_str))
 		elseif b and (b.lower or b.upper) then -- declare -l/-u: case-fold on assign
 			local v = assign_rhs_a(sh, st)
 			sh:set_str(st.name, b.lower and v:lower() or v:upper())
@@ -15044,11 +15016,7 @@ function M.assign_body_full(sh, st, nref_base, nref_sub)
 	end
 end
 function M.assign_full(sh, st)
-	local IX = M.IX
-	if not IX then
-		IX = require("interp")
-		M.IX = IX
-	end
+	local IX = M.IX or M.ix()
 	local ncs0 = sh.ncs
 	if st.name == "SHELLOPTS" or st.name == "BASHOPTS" then -- readonly specials (bash)
 		io.stderr:write("curse: " .. st.name .. ": readonly variable\n")
@@ -15086,7 +15054,6 @@ function M.assign_full(sh, st)
 					if not ok then
 						error(e, 0)
 					end
-					return e
 				end
 				return
 			elseif nb.outer and nb.s:find("[", 1, true) then -- (`local -n a='a[0]'`: bash
@@ -15186,7 +15153,6 @@ function M.assign_full(sh, st)
 	-- (sh.ncs counts substitutions performed — also ones nested in ${…}, a subscript)
 	sh.status = sh.ncs ~= ncs0 and sh.last_cmdsub_status or 0
 	sh:set_str("_", "") -- a bare assignment resets $_ to empty (bash)
-	return true -- (done: the caller's PIPESTATUS and <() drain follow)
 end
 -- HISTSIZE shrinks the in-memory history; HISTFILESIZE truncates $HISTFILE — both to the
 -- last N entries, on assignment (bash)
@@ -15238,20 +15204,15 @@ function M.select_next(sh, list, name)
 		end
 		io.flush()
 		io.stderr:write(sh.vars["PS3"] and sh:get("PS3") or "#? ")
-		local buf, line = {}, nil
-		while true do
-			local ch = getc(0)
-			if ch == nil then
-				line = #buf > 0 and table.concat(buf) or nil
-				break
-			end
-			if ch == "\n" then
-				line = table.concat(buf)
-				break
-			end
+		local buf = {}
+		local ch = getc(0)
+		while ch ~= nil and ch ~= "\n" do
 			buf[#buf + 1] = ch
+			ch = getc(0)
 		end
-		if line == nil then
+		local line = table.concat(buf)
+		if ch == nil then -- EOF, a partial last line too: bash's read fails (REPLY gets the
+			sh:set_str("REPLY", line) -- partial), which ends the loop
 			sh.out("\n")
 			sh.status = 1
 			return false
