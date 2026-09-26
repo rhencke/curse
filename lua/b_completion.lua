@@ -1196,6 +1196,7 @@ local function build_actions(sh, cmd, args, forcomplete)
 					local bad = sh.opt_posix and not v:find("^[%a_][%w_]*$")
 					if bad or v:find("[()<>;&| \t\n]") then
 						if bad then
+							rt.ierr = true -- (check_identifier's internal_error)
 							io.stderr:write("curse: `" .. v .. "': not a valid identifier\n")
 						end
 						io.stderr:write("curse: " .. cmd .. ": `" .. v .. "': not a valid identifier\n")
@@ -1411,7 +1412,7 @@ local function compopt(sh, args)
 			elseif f == "D" or f == "E" or f == "I" then
 				flag[f] = true
 			else
-				return rt.bad_option(sh, "compopt", a:sub(1, 1) .. f)
+				return rt.bad_option(sh, "compopt", a:sub(1, 1) .. f, a)
 			end
 		end
 	end

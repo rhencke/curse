@@ -31,9 +31,10 @@ pcall(ffi.cdef, "const char *strerrordesc_np(int errnum);")
 local LOCALEDIR = "/usr/share/locale" -- (bash's LOCALEDIR: its own messages, never $TEXTDOMAINDIR)
 
 -- ---- the catalogs in force -------------------------------------------------------------
--- dcigettext: $LANGUAGE's list (bash's getenv: an EXPORTED shell variable) unless the
--- LC_MESSAGES locale is C, then that locale; each name as its glibc variants. A message
--- is looked up in each catalog found, in order, until one translates it.
+-- dcigettext: $LANGUAGE's list — from the process environ, which bash rebuilds from its
+-- exported variables only now and then (rt.lc_envsnap) — unless the LC_MESSAGES locale is
+-- C, then that locale; each name as its glibc variants. A message is looked up in each
+-- catalog found, in order, until one translates it.
 local st_key, st_val = nil, nil
 local convs = {} -- "to\0from" -> converter (iconv descriptors are kept for the process)
 
@@ -96,22 +97,20 @@ local function state(sh)
 	if lc == "C" or lc == "POSIX" then
 		return nil
 	end
-	local lang
-	local b = sh and sh.vars.LANGUAGE
-	if b and b.exported then
-		lang = sh:get("LANGUAGE")
-	end
+	local e = rt.lc_envsnap
+	local lang = e and e.LANGUAGE
 	local key = rt.locale_gen .. "\0" .. lc .. "\0" .. (lang or "")
 	if key == st_key then
 		return st_val
 	end
-	local names = {}
+	local names = {} -- (guess_category_value: $LANGUAGE's list replaces the locale's name)
 	if lang and lang ~= "" then
 		for l in lang:gmatch("[^:]+") do
 			gt.variants(l, names)
 		end
+	else
+		gt.variants(lc, names)
 	end
-	gt.variants(lc, names)
 	local bash = load(names, "bash")
 	local val = false
 	if #bash > 0 then
@@ -126,9 +125,49 @@ function M.active(sh)
 	return state(sh) and true or false
 end
 
+-- glibc's known translations (dcigettext.c's tree, keyed by msgid, domain, category and
+-- locale name): a msgid once translated keeps that translation — whatever $LANGUAGE says
+-- later — until _nl_msg_cat_cntr moves (a setlocale: rt.locale_gen; a bindtextdomain:
+-- rt.tdgen). A miss isn't remembered. dom: "b" bash's domain, "l" libc's, "p" ngettext's.
+local known = { gen = -1, td = -1 }
+local function kt(dom)
+	local g, td = rt.locale_gen, rt.tdgen or 0
+	if known.gen ~= g or known.td ~= td then
+		known = { gen = g, td = td, b = {}, l = {}, p = {} }
+	end
+	return known[dom]
+end
+-- (an in-process subshell's lookups are its own: it works on a copy, the parent's comes back)
+local function tcopy(t)
+	local n = {}
+	for k, v in pairs(t) do
+		n[k] = v
+	end
+	return n
+end
+function M.known_save()
+	local k = known
+	if k.b then
+		known = { gen = k.gen, td = k.td, b = tcopy(k.b), l = tcopy(k.l), p = tcopy(k.p) }
+	end
+	return { k = k, gen = rt.locale_gen, td = rt.tdgen or 0 }
+end
+function M.known_restore(r)
+	local k = r.k
+	if k.gen == r.gen and k.td == r.td then -- (current then: a setlocale the subshell made
+		k.gen, k.td = rt.locale_gen, rt.tdgen or 0 -- was its own process's)
+	end
+	known = k
+end
+
 -- the translation of msgid in the catalogs `list` (converted), or nil
-local function lookup(st, list, memo, id)
-	local t = memo[id]
+local function lookup(st, list, memo, id, dom)
+	local kd = kt(dom or "b")
+	local t = kd[id]
+	if t then
+		return t
+	end
+	t = memo[id]
 	if t == nil then
 		t = false
 		for _, c in ipairs(list) do
@@ -142,6 +181,9 @@ local function lookup(st, list, memo, id)
 			end
 		end
 		memo[id] = t
+	end
+	if t then
+		kd[id] = t
 	end
 	return t or nil
 end
@@ -323,7 +365,7 @@ local AMBIGUOUS = { ["unexpected EOF while looking for matching `)'"] = true }
 local evalerror_split
 
 local function libc(st, s)
-	return lookup(st, st.libc, st.lmemo, s)
+	return lookup(st, st.libc, st.lmemo, s, "l")
 end
 
 -- evalerror's captures { "NAME: EXPR" or "EXPR", MSG, TOKEN } split at the `: ' whose
@@ -459,8 +501,14 @@ local function warn_msgid(st, text)
 	return m and true or false
 end
 
--- a = "curse: msg[\nmore]"; returns the whole text localized, or nil (no catalog)
-function M.diag(sh, a)
+local function iwhere(st, name, ln)
+	return name .. ":" .. gettext(st, " line ") .. ln .. ": "
+end
+-- a = "curse: msg[\nmore]"; returns the whole text localized, or nil (no catalog).
+-- ie: the site is one of bash's internal_error ones (rt.ierr) — for a nameless message
+-- that bash's sh_* helpers send through builtin_error elsewhere (`X': not a valid
+-- identifier: check_identifier's for/select/function/coproc names vs sh_invalidid)
+function M.diag(sh, a, ie)
 	local st = state(sh)
 	if not st then
 		return nil
@@ -483,7 +531,9 @@ function M.diag(sh, a)
 		local pre = ln > 0 and subst(gettext(st, "%s: line %d: "), { name, tostring(ln) }) or (name .. ": ")
 		return pre .. body .. tail
 	end
-	local where = ln > 0 and (name .. ":" .. gettext(st, " line ") .. ln .. ": ") or (name .. ": ")
+	-- (error_prolog's _(" line "): looked up only when it's the prolog used — glibc's
+	-- memory of a translation starts at its first lookup)
+	local where = ln > 0 and iwhere or (name .. ": ")
 	-- (internal_warning's _("warning: ") prefix — unless the msgid has it: `warning: -F …',
 	-- printf's `warning: %s: %s')
 	local warn = ""
@@ -491,7 +541,7 @@ function M.diag(sh, a)
 	if msg:sub(1, 9) == "warning: " then
 		local t, m = xlate(st, msg:sub(10))
 		if m or not warn_msgid(st, msg) then
-			return where .. gettext(st, "warning: ") .. (t or msg:sub(10)) .. tail
+			return (where == iwhere and iwhere(st, name, ln) or where) .. gettext(st, "warning: ") .. (t or msg:sub(10)) .. tail
 		end
 	else
 		local b, rest = msg:match("^([^:]+): (.*)$")
@@ -511,7 +561,7 @@ function M.diag(sh, a)
 			t = t or xlate(st, rest)
 			local t2, e2 = xlate(st, msg)
 			if e2 and e2.evalerror then -- (evalerror's own `let: EXPR: …' is internal_error's)
-				return where .. t2 .. tail
+				return (where == iwhere and iwhere(st, name, ln) or where) .. t2 .. tail
 			end
 			if t or not t2 then
 				where = ln > 0 and (name .. ": " .. subst(gettext(st, "line %d: "), { tostring(ln) }))
@@ -520,7 +570,12 @@ function M.diag(sh, a)
 			end
 		end
 	end
-	return where .. warn .. (xlate(st, msg) or msg) .. tail
+	if not ie and msg:byte(1) == 96 and msg:sub(-25) == "': not a valid identifier" then
+		-- (sh_invalidid: builtin_error's prolog, no this_command_name — an assignment's)
+		where = ln > 0 and (name .. ": " .. subst(gettext(st, "line %d: "), { tostring(ln) })) or (name .. ": ")
+	end
+	local t = xlate(st, msg) or msg
+	return (where == iwhere and iwhere(st, name, ln) or where) .. warn .. t .. tail
 end
 
 -- ---- sites outside the proxy ----------------------------------------------------------
@@ -569,14 +624,20 @@ end
 function M.ntext(sh, id1, id2, n)
 	local st = state(sh)
 	if st then
-		for _, c in ipairs(st.bash) do
-			local f = c.plural[id1]
-			if f then
-				local s = f[n == 1 and 1 or math.min(2, #f)]
-				if s and s ~= "" then
-					return st.conv and st.conv(s) or s
+		local kd = kt("p")
+		local f = kd[id1]
+		if not f then
+			for _, c in ipairs(st.bash) do
+				f = c.plural[id1]
+				if f then
+					kd[id1] = f
+					break
 				end
 			end
+		end
+		local s = f and f[n == 1 and 1 or math.min(2, #f)]
+		if s and s ~= "" then
+			return st.conv and st.conv(s) or s
 		end
 	end
 	return n == 1 and id1 or id2

@@ -28,6 +28,8 @@ return function(sh, cmd, args, hook, tcb)
 		local usage = cmd .. ": usage: " .. cmd .. " filename [arguments]\n"
 		if args[j] == "--" then
 			j = j + 1
+		elseif args[j] == "--help" then -- (no_options: the builtin's help, status 2)
+			return rt.builtin_help(sh, cmd)
 		elseif args[j] and args[j]:match("^%-.") then -- (bash's no_options: no option letters)
 			io.stderr:write("curse: " .. cmd .. ": " .. args[j]:sub(1, 2) .. ": invalid option\n" .. usage)
 			sh.status = 2

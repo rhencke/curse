@@ -13,7 +13,7 @@ return function(sh, cmd, args)
 		end
 		local bad = a:match("[^f]", 2)
 		if bad then
-			return rt.bad_option(sh, "suspend", "-" .. bad)
+			return rt.bad_option(sh, "suspend", "-" .. bad, a)
 		end
 		force = true
 	end

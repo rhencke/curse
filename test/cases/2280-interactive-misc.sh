@@ -15,6 +15,8 @@
 # - cd: cdspell corrects typos only when interactive (printing the new dir), CDPATH and
 #   cdable_vars echo; ignoreeof / IGNOREEOF counting
 S=${THIS_SH:-bash}
+# (English diagnostics whatever locale runs this: the filters match bash's C texts)
+if [ -n "${LC_ALL-}" ]; then export LANG=$LC_ALL; unset LC_ALL; fi; export LC_MESSAGES=C
 export HOME=$PWD HISTFILE= INPUTRC=/dev/null
 export T=$PWD
 # the job-control chatter carries a pid: drop it; "bash: cd:" prefixes normalized

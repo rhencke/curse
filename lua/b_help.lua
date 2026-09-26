@@ -124,6 +124,8 @@ return function(sh, cmd, args)
 		j = j + 1
 		if a == "--" then
 			break
+		elseif a == "--help" then -- (GETOPT_HELP: the builtin's help, status 2)
+			return rt.builtin_help(sh, "help")
 		end
 		for k = 2, #a do
 			local f = a:sub(k, k)

@@ -27,6 +27,8 @@ return function(sh, cmd, args, hook, tcb)
 			if a == "--" then
 				j = j + 1
 				break
+			elseif a == "--help" then -- (GETOPT_HELP: the builtin's help, status 2)
+				return rt.builtin_help(sh, "alias")
 			end
 			for c = 2, #a do
 				if a:sub(c, c) ~= "p" then -- an unknown option: usage error (status 2)

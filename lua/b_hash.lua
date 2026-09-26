@@ -43,6 +43,8 @@ return function(sh, cmd, args, hook, tcb)
 			j = j + 1
 			if w == "--" then
 				break
+			elseif w == "--help" then -- (GETOPT_HELP: the builtin's help, status 2)
+				return rt.builtin_help(sh, "hash")
 			end
 			local k = 2
 			while k <= #w do

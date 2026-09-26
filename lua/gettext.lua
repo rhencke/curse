@@ -134,13 +134,15 @@ function M.translate(sh, s)
 		return nil
 	end
 	local names = {}
-	local language = os.getenv("LANGUAGE")
-	if language and language ~= "" then
+	local e = rt.lc_envsnap -- (bash's environ as last rebuilt: where glibc finds $LANGUAGE)
+	local language = e and e.LANGUAGE
+	if language and language ~= "" then -- (guess_category_value: the list replaces the locale)
 		for l in language:gmatch("[^:]+") do
 			variants(l, names)
 		end
+	else
+		variants(cur, names)
 	end
-	variants(cur, names)
 	local dir = var(sh, "TEXTDOMAINDIR") or "/usr/share/locale"
 	for _, nm in ipairs(names) do
 		if nm == "C" then

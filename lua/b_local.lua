@@ -38,6 +38,8 @@ return function(sh, cmd, args, hook, tcb)
 			local a = args[j]
 			if endopts or a == "--" or not a:match("^[-+].") then
 				break
+			elseif a == "--help" then -- (GETOPT_HELP: the builtin's help, status 2)
+				return rt.builtin_help(sh, "local")
 			end
 			local bad = a:match("[^aAcfFgGiIlnprtux]", 2)
 			if bad then

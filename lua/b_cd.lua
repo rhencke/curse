@@ -272,7 +272,7 @@ return function(sh, cmd, args, hook, tcb, as)
 				end
 				j = j + 1
 			elseif a:match("^%-.") and who == "cd" then
-				return rt.bad_option(sh, "cd", "-" .. a:match("^%-[LPe]*(.)"))
+				return rt.bad_option(sh, "cd", "-" .. a:match("^%-[LPe]*(.)"), a)
 			else
 				break
 			end

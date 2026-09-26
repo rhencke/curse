@@ -96,7 +96,7 @@ return function(sh, cmd, args, hook, tcb)
 					end
 					cmds[#cmds + 1] = { f = f, arg = arg }
 				else
-					return rt.bad_option(sh, "ulimit", "-" .. f)
+					return rt.bad_option(sh, "ulimit", "-" .. f, a)
 				end
 				k = k + 1
 			end

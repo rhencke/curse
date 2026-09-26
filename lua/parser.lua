@@ -2811,7 +2811,8 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs, xg, bq
 	local firstline = lineabs or line0 or 1 -- (the text's first line: an EOF error counts from it)
 	local orig_src = src -- (alias expansion splices into src; an error echoes the line as written)
 	if line0 then -- a $(…) body numbers from its command's line; leading newlines don't count
-		line = line0 - #(src:match("^[ \t\n]*"):gsub("[^\n]", ""))
+		-- (a `…` body's do: parse_and_execute reads it line by line from line_number - 1)
+		line = bq and line0 or line0 - #(src:match("^[ \t\n]*"):gsub("[^\n]", ""))
 	end
 	local loopId = 0
 	-- jcx: the line a foreground job killed by a signal is reported at — bash's line_number
@@ -3941,7 +3942,8 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs, xg, bq
 		-- (status 2). A quoted empty target (`> ''`) is a real, empty filename — that's
 		-- a runtime failure, not a parse error — so key on the raw word being absent.
 		if raw == "" then
-			error("syntax error near `" .. (src:sub(i, i) == "" and "newline" or src:sub(i, i)) .. "'")
+			local c = src:sub(i, i)
+			error("syntax error near `" .. ((c == "" or c == "\n") and "newline" or c) .. "'")
 		end
 		return { fd = tfd, op = op, target = unquote(raw), src = raw, fdvar = fdvar, line = line } -- (src: `declare -f`)
 	end

@@ -180,6 +180,8 @@ wait_builtin = function(sh, cmd, args, hook, tcb)
 			k = k + 1
 			if a == "--" then
 				break
+			elseif a == "--help" then -- (GETOPT_HELP: the builtin's help, status 2)
+				return rt.builtin_help(sh, "wait")
 			end
 			local ci = 2
 			while ci <= #a do

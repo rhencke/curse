@@ -5140,11 +5140,11 @@ H.funcdef = function(cx, st, after)
 	end
 	local p = cx.newpc()
 	if not st.name:match("^[%w_:%.+@/%%%^~,!][%w_%.%-:+@/!#=%%%^~,%[%]]*$") then -- name is an expansion (`$foo-bar()`):
-		cx.blocks[p] = ("io.stderr:write(%q); sh.status = 1; pc = %d") -- non-fatal runtime error (bash)
+		cx.blocks[p] = ("rt.ierr = true; io.stderr:write(%q); sh.status = 1; pc = %d") -- non-fatal runtime error (bash)
 			:format("curse: `" .. st.name .. "': not a valid identifier\n", after)
 	else
 		cx.blocks[p] = (st.name:match("^[%a_][%w_]*$") and "" -- (posix: a non-identifier name is fatal)
-			or ("if sh.opt_posix and not sh.opt_i then rt.err_at(sh, %s, %q); error({ __curse_exit = 2 }) end; ")
+			or ("if sh.opt_posix and not sh.opt_i then rt.ierr = true; rt.err_at(sh, %s, %q); error({ __curse_exit = 2 }) end; ")
 				:format(st.top and tostring(st.eline) or "nil", "curse: `" .. st.name .. "': not a valid identifier\n"))
 			.. ("if sh.fn_ro and sh.fn_ro[%q] then rt.err_at(sh, %s, %q); sh.status = 1 else sh.functions[%q] = rt.mark_compiled(%s, %s); %s end; pc = %d"):format(
 			st.name, st.top and tostring(st.eline) or "nil", "curse: " .. st.name .. ": readonly function\n", st.name, EF.upv_wrapped(fnlname(st.name)), fnlname(st.name),
@@ -6480,9 +6480,11 @@ simple_compiled = function(cx, st, after)
 			if st.words[4] then
 				return EF.simple_native(cx, st, after, cmd) or cx.delegate(st, after)
 			end
-		elseif st.words[3] then -- (too many arguments: the runner's return discards the command)
-			return EF.simple_native(cx, st, after, cmd) or cx.delegate(st, after)
-		end
+		elseif st.words[3] or (w2 and full_lit(w2) == "--help") then -- (too many arguments: the
+			return EF.simple_native(cx, st, after, cmd) or cx.delegate(st, after) -- runner's return
+		end -- discards the command; `--help`: the builtin's help, status 2, and no return)
+		-- (a first word that EXPANDS to `--help` is the help too — bash's CHECK_HELPOPT)
+		local hv = w2 == st.words[2] and rc1 ~= "" and ("if %%s == \"--help\" then rt.builtin_help(sh, \"return\"); pc = %d else "):format(after)
 		local p = cx.newpc()
 		if EF.xtrace then -- (the expanded words trace first: `+ return 3`)
 			local xa, xn = {}, {}
@@ -6491,9 +6493,15 @@ simple_compiled = function(cx, st, after)
 				xn[#xn + 1] = "__x" .. (j - 1)
 			end
 			local n = w2 and ("rt.return_code(sh, %s%s)"):format(xn[#xn], rc1) or "sh.status"
-			cx.blocks[p] = ("do %s%s" .. EF.retset(cx, w2) .. " = (%s) or 0 end; pc = %d"):format(
+			cx.blocks[p] = ("do %s%s%s" .. EF.retset(cx, w2) .. " = (%s) or 0; pc = %d%s end"):format(
 				#xa > 0 and ("local %s = %s; "):format(table.concat(xn, ", "), table.concat(xa, ", ")) or "",
-				EF.xtc("return", "{" .. table.concat(xn, ", ") .. "}"), n, cx.DONE)
+				EF.xtc("return", "{" .. table.concat(xn, ", ") .. "}"), hv and hv:format("__x1") or "", n, cx.DONE,
+				hv and " end" or "")
+			return p
+		end
+		if hv then
+			cx.blocks[p] = ("do local __v = %s; " .. hv:format("__v") .. EF.retset(cx, w2) .. " = (rt.return_code(sh, __v%s)) or 0; pc = %d end end")
+				:format(emit_word(w2, cx.lifted), rc1, cx.DONE)
 			return p
 		end
 		local n = w2 and ("rt.return_code(sh, %s%s)"):format(emit_word(w2, cx.lifted), rc1) or "sh.status"
@@ -7226,7 +7234,7 @@ H.select = function(cx, st, after)
 	end
 	if not st.name:match("^[%a_][%w_]*$") then
 		local p = cx.newpc()
-		cx.blocks[p] = ("io.stderr:write(%q); sh.status = 1; pc = %d"):format(
+		cx.blocks[p] = ("rt.ierr = true; io.stderr:write(%q); sh.status = 1; pc = %d"):format(
 			"curse: `" .. st.name .. "': not a valid identifier\n", after)
 		return p
 	end
@@ -7693,7 +7701,7 @@ end
 H.coproc = function(cx, st, after)
 	if not st.name:match("^[%a_][%w_]*$") then -- (`coproc @ {…}`: reported, status 1)
 		local p = cx.newpc()
-		cx.blocks[p] = ("io.stderr:write(%q); sh.status = 1; pc = %d"):format(
+		cx.blocks[p] = ("rt.ierr = true; io.stderr:write(%q); sh.status = 1; pc = %d"):format(
 			"curse: `" .. st.name .. "': not a valid identifier\n", after)
 		return p
 	end
@@ -8725,7 +8733,12 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
 				cf_arg = cf_arg + 1
 				aw = st.words[cf_arg]
 				rs1 = ""
+			elseif aw and full_lit(aw) == "--help" then -- (the builtin's help: status 2, no return —
+				return EF.simple_native(cx, st, after, cmd) or cx.delegate(st, after) -- the runner's)
 			end
+			-- a first word that EXPANDS to `--help` is the help too (bash's CHECK_HELPOPT)
+			local hv = rs1 ~= "" and aw and not full_lit(aw)
+				and ("if %%s == \"--help\" then rt.builtin_help(sh, \"return\"); pc = %d else "):format(after)
 			if not st.words[cf_arg + 1] then -- at most one status WORD (pre-split)
 				local d = dbg(st) .. EF.xtwords(st.words, cx.lifted) -- DEBUG fires before return too
 				if not aw then -- `return` with no arg → previous status (in a trap: its entry status)
@@ -8737,13 +8750,24 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
 					-- (a function's `return N` under a possible RETURN trap: N waits in sh.fret —
 					-- the trap sees the $? from before it; the call's epilogue applies it)
 					local fret = not frag_return and EF.retset(cx, true) == "sh.fret"
+					local rv = emit_word(aw, cx.lifted)
+					if hv then
+						d = d .. ("local __v = %s; "):format(rv) .. hv:format("__v")
+						rv = "__v"
+					end
 					cx.blocks[p] = d .. ps
 						.. (fret and "sh.fret = rt.return_status(sh, %s%s); " or "sh.status = rt.return_status(sh, %s%s); "):format(
-							emit_word(aw, cx.lifted), full_lit(aw) and "" or rs1) .. retjmp
+							rv, full_lit(aw) and "" or rs1) .. retjmp .. (hv and " end" or "")
 					return p
 				elseif field_word(aw, cx.lifted) then -- unquoted expansion: split — 0 fields → $?, else 1st field
 					local fw = field_word(aw, cx.lifted)
 					local p = cx.newpc()
+					if hv then -- (the help: a first FIELD of `--help`)
+						cx.blocks[p] = d .. ("local __f = rt.field_split(sh, %s, %s); "):format(fw.expr, tostring(fw.split))
+							.. hv:format("__f[1]") .. ps
+							.. ("if #__f > 0 then sh.status = rt.return_status(sh, __f[1]%s) end; "):format(rs1) .. retjmp .. " end"
+						return p
+					end
 					cx.blocks[p] = d .. ps
 						.. ("do local __f = rt.field_split(sh, %s, %s); if #__f > 0 then sh.status = rt.return_status(sh, __f[1]%s) end end; "):format(
 							fw.expr,
@@ -8762,20 +8786,31 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
 			-- subshell jump. Multi-arg (`exit a b`: too-many, non-fatal) / dynamic arg -> delegate.
 			local exitp = #cx.subexit > 0 and cx.subexit[#cx.subexit] or nil
 			local aw = st.words[cf_arg]
+			if aw and full_lit(aw) == "--help" then -- (the builtin's help, status 2: no exit — the runner)
+				return EF.simple_native(cx, st, after, cmd) or cx.delegate(st, after)
+			end
 			if not st.words[cf_arg + 1] then
-				local d = dbg(st) .. EF.xtwords(st.words, cx.lifted) .. "rt.exit_note(sh); "
+				local d = dbg(st) .. EF.xtwords(st.words, cx.lifted)
+				-- (a word that EXPANDS to `--help` is the help too: CHECK_HELPOPT, before anything)
+				local hv = aw and word_safe(aw) and not full_lit(aw)
 				local statusexpr = aw
 						and word_safe(aw)
-						and ('rt.return_status(sh, %s, "exit"%s)'):format(emit_word(aw, cx.lifted), full_lit(aw) and "" or ", true")
+						and ('rt.return_status(sh, %s, "exit"%s)'):format(hv and "__v" or emit_word(aw, cx.lifted), full_lit(aw) and "" or ", true")
 					or (not aw and "rt.exit_default(sh)")
 					or nil
 				if statusexpr then
 					local p = cx.newpc()
+					local body
 					if exitp then
-						cx.blocks[p] = d .. ("sh.status = %s; pc = %d"):format(statusexpr, exitp)
+						body = ("rt.exit_note(sh); sh.status = %s; pc = %d"):format(statusexpr, exitp)
 					else
-						cx.blocks[p] = d .. ("error({ __curse_exit = %s })"):format(statusexpr)
+						body = ("rt.exit_note(sh); error({ __curse_exit = %s })"):format(statusexpr)
 					end
+					if hv then
+						body = ("local __v = %s; if __v == \"--help\" then rt.builtin_help(sh, \"exit\"); pc = %d else %s end")
+							:format(emit_word(aw, cx.lifted), after, body)
+					end
+					cx.blocks[p] = d .. body
 					return p
 				end
 			end -- dynamic/multi-arg: fall through to delegate

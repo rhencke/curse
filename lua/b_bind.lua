@@ -144,7 +144,7 @@ return function(sh, cmd, args, hook, tcb)
 						end
 						break
 					elseif not f:match("[lvpVPsSX]") then
-						return rt.bad_option(sh, "bind", "-" .. f)
+						return rt.bad_option(sh, "bind", "-" .. f, a)
 					end
 				end
 			end

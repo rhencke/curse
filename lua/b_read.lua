@@ -220,7 +220,7 @@ return function(sh, cmd, args, hook, tcb)
 					elseif f == "s" or f == "e" then -- (no echo / readline: no terminal editing here)
 						k = k + 1
 					else
-						return rt.bad_option(sh, "read", "-" .. f)
+						return rt.bad_option(sh, "read", "-" .. f, a)
 					end
 				end
 				j = j + advance

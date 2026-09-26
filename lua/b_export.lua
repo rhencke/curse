@@ -39,8 +39,13 @@ return function(sh, cmd, args, hook, tcb)
 		local opterr, endopts, ro_n = nil, false, false
 		for j = 2, #args do
 			local a = args[j]
-			if a == "--" then
+			if endopts then -- (options end at `--` or the first operand: internal_getopt)
+				rest[#rest + 1] = a
+			elseif a == "--" then
 				endopts = true -- end of flags
+			elseif a == "--help" then -- (GETOPT_HELP: the builtin's help)
+				opterr = a
+				break
 			elseif not endopts and a:sub(1, 1) == "-" and #a > 1 then
 				for ci = 2, #a do
 					local ch = a:sub(ci, ci)
@@ -129,6 +134,7 @@ return function(sh, cmd, args, hook, tcb)
 				end
 			else
 				rest[#rest + 1] = a
+				endopts = true
 			end
 		end
 		-- -c/-l/-u each turn the other two off (declare.def's flags_off): two of them cancel
@@ -138,7 +144,9 @@ return function(sh, cmd, args, hook, tcb)
 			plusattr = plusattr or {}
 			plusattr.l, plusattr.u, plusattr.c = true, true, true
 		end
-		if opterr then -- an unknown attribute letter: bash prints usage and fails (status 2)
+		if opterr == "--help" then
+			return rt.builtin_help(sh, cmd)
+		elseif opterr then -- an unknown attribute letter: bash prints usage and fails (status 2)
 			io.stderr:write("curse: " .. cmd .. ": -" .. opterr .. ": invalid option\n" .. rt.usage(cmd))
 			sh.status = 2
 			sh.spb_err = 2 -- (EX_USAGE: see rt.spb_run)
