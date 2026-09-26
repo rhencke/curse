@@ -580,69 +580,11 @@ function M.arith_errmsg(expr, err, subscript)
 end
 
 -- ---- statement parser ----
--- Captures a balanced `((` … `))` starting just after the opening `((`.
--- Grab the body of `$((…))` / `((…))` starting just after the opening `((`.
--- Counts single parens: the closing `))` is the first `)` seen at content-paren
--- depth 0 (its partner is the next char). This correctly handles nested `$( )`
--- command subs and `$(( ))` inside the arithmetic (their inner parens balance).
-local function grab_dparen(src, i)
-	local start, d = i, 0
-	while i <= #src do
-		local c = src:sub(i, i)
-		if c == "(" then
-			d = d + 1
-			i = i + 1
-		elseif c == ")" then
-			if d == 0 then
-				return src:sub(start, i - 1), i + 2
-			end -- the closing `))`
-			d = d - 1
-			i = i + 1
-		else
-			i = i + 1
-		end
-	end
-	error("unterminated ((")
-end
 
 -- Parse the inside of ${ … } into a word part. Plain forms stay {var}/{param}/
 -- {special}; anything with an operator becomes {pexp={name, op, arg, arg2}} which
 -- Shell:expand_param interprets. `arg`/`arg2` are raw text (the caller expands
 -- them before applying the operator, so ${v:-$x} and pattern vars work).
--- Split ${v/pat/repl} into pat, repl. The separator is the first `/` that is
--- NOT at position 1 (bash treats a `/` right after the operator as pattern text,
--- so ${x////c} is pat=`/` repl=`c`), NOT backslash-escaped, and NOT inside
--- single/double quotes. No separator -> the whole thing is the pattern.
-local function split_subst(s)
-	local i, n, q = 1, #s, nil
-	while i <= n do
-		local c = s:sub(i, i)
-		if q == "'" then -- (a backslash in '…' is literal: `${x/'\'/Z}`)
-			if c == q then
-				q = nil
-			end
-			i = i + 1
-		elseif c == "\\" then
-			i = i + 2
-		elseif q then
-			if q == "$" and c == "'" or q ~= "$" and c == q then
-				q = nil
-			end
-			i = i + 1
-		elseif c == "'" and s:sub(i - 1, i - 1) == "$" then
-			q = "$" -- $'…': a backslash escapes in it (`${v/$'\''/x}`)
-			i = i + 1
-		elseif c == "'" or c == '"' then
-			q = c
-			i = i + 1
-		elseif c == "/" and i > 1 then
-			return s:sub(1, i - 1), s:sub(i + 1)
-		else
-			i = i + 1
-		end
-	end
-	return s, ""
-end
 -- Scan a ${…} starting at the `{` (index `bi`) in `s`, returning the index just
 -- past the matching `}`. Respects backslash escapes, '…'/"…" quoting (so a `}`
 -- inside quotes doesn't close), and nested `{…}` — unlike a naive find("}").
@@ -700,14 +642,24 @@ local function comsub_syntax(body, xg)
 	end
 	return err or nil, false
 end
-local dparen_is_arith -- forward (defined below)
+local dparen_is_arith, grab_dparen -- forward (defined below)
 -- ---- the scanning primitives: where does the construct starting at s[i] end? ----
--- (parse.y reads all of these with parse_matched_pair / parse_comsub; every scanner in this
--- file asks them rather than hand-writing the loop.) Each returns the index just PAST the
--- construct; one left open runs past the end (>= #s + 2), or — `err` — raises bash's EOF
--- error naming the quote.
+-- (parse.y reads all of these with parse_matched_pair / parse_comsub; a scanner in this file
+-- that skips a quoted string or an expansion asks them rather than hand-writing the loop —
+-- except where bash's rule differs: brace_skip's "…" (only a $( … ) nests: braces.c), $[ … ]
+-- (brackets merely counted), and dequote_word, which rebuilds the text as it goes.) Each
+-- returns the index just PAST the construct; one left open runs past the end (>= #s + 2),
+-- or — `err` — raises bash's EOF error naming the quote.
 -- A quoted string: s[i] is its opening quote, closed by the same byte. `esc`: a `\` escapes
 -- the next byte ("…" without nesting, `…`, and a $'…' from its `'`); '…' has no escapes.
+-- Every "unexpected EOF while looking for matching `X'" is raised here, noting where the
+-- open construct began: bash reports it at THAT line (parse_matched_pair's start_lineno —
+-- the quote's, not the command's), which next_line derives from the noted position.
+local eof_s, eof_at
+local function eof_error(s, at, close)
+	eof_s, eof_at = s, at
+	error("unexpected EOF while looking for matching `" .. close .. "'")
+end
 local function quote_end(s, i, esc, err)
 	local q, k, n = s:byte(i), i + 1, #s
 	while k <= n do
@@ -718,11 +670,33 @@ local function quote_end(s, i, esc, err)
 		k = k + ((esc and b == 92) and 2 or 1)
 	end
 	if err then
-		error("unexpected EOF while looking for matching `" .. string.char(q) .. "'")
+		eof_error(s, i, string.char(q))
 	end
 	return k + 1
 end
-local dq_end, expansion_end -- forward (defined past scan_cmdsub)
+-- Split ${v/pat/repl} into pat, repl. The separator is the first `/` that is
+-- NOT at position 1 (bash treats a `/` right after the operator as pattern text,
+-- so ${x////c} is pat=`/` repl=`c`), NOT backslash-escaped, and NOT inside
+-- single/double quotes. No separator -> the whole thing is the pattern.
+local function split_subst(s)
+	local i, n = 1, #s
+	while i <= n do
+		local c = s:sub(i, i)
+		if c == "\\" then
+			i = i + 2
+		elseif c == "'" then -- (a backslash in '…' is literal: `${x/'\'/Z}`; in $'…' it
+			i = quote_end(s, i, s:sub(i - 1, i - 1) == "$") -- escapes: `${v/$'\''/x}`)
+		elseif c == '"' then
+			i = quote_end(s, i, true)
+		elseif c == "/" and i > 1 then
+			return s:sub(1, i - 1), s:sub(i + 1)
+		else
+			i = i + 1
+		end
+	end
+	return s, ""
+end
+local dq_end, expansion_end, subscript_close -- forward (defined past scan_cmdsub)
 local function scan_braces(s, bi, dq)
 	local i, ns, depth = bi + 1, #s, 1
 	local sq_lit = dq and POSIX_DQ
@@ -755,7 +729,7 @@ local function scan_braces(s, bi, dq)
 		end
 	end
 	if depth > 0 then
-		error("unexpected EOF while looking for matching `}'")
+		eof_error(s, bi, "}")
 	end
 	return i
 end
@@ -874,30 +848,8 @@ parse_paramexp = function(inner)
 	-- optional [subscript]
 	local index = nil
 	if rest:sub(1, 1) == "[" then
-		-- balance nested brackets so `${a[a[0]]}` takes `a[0]` as the subscript, not `a[0`;
-		-- a quoted or escaped `]` doesn't close it (`${m["a]a"]}`, `${m[\]]}`)
-		local depth, close, k = 0, nil, 1
-		while k <= #rest do
-			local ch = rest:sub(k, k)
-			if ch == "\\" then
-				k = k + 1
-			elseif (ch == "'" or ch == '"') and depth > 0 then
-				local e = rest:find(ch, k + 1, true)
-				while e and ch == '"' and rest:sub(e - 1, e - 1) == "\\" do
-					e = rest:find(ch, e + 1, true)
-				end
-				k = e or #rest
-			elseif ch == "[" then
-				depth = depth + 1
-			elseif ch == "]" then
-				depth = depth - 1
-				if depth == 0 then
-					close = k
-					break
-				end
-			end
-			k = k + 1
-		end
+		-- (`${a[a[0]]}` takes `a[0]` as the subscript, not `a[0`; `${m[\]]}`)
+		local close = subscript_close(rest, 1)
 		if close then
 			index = rest:sub(2, close - 1)
 			rest = rest:sub(close + 1)
@@ -1064,7 +1016,7 @@ scan_cmdsub = function(src, j, onwarn)
 							onwarn(rpos, n, hd.delim)
 						end
 						comsub_eof = true
-						error("unexpected EOF while looking for matching `)'")
+						eof_error(src, j, ")")
 					end
 					local le = src:find("\n", i, true) or (n + 1)
 					local lstr = src:sub(i, le - 1)
@@ -1194,7 +1146,7 @@ scan_cmdsub = function(src, j, onwarn)
 					end
 					k = k + 2
 				elseif ch == "'" or ch == '"' then
-					local e = src:find(ch, k + 1, true) or n
+					local e = quote_end(src, k) - 1 -- (the closing quote; quote removal)
 					d[#d + 1] = src:sub(k + 1, e - 1)
 					k = e + 1
 				elseif ch:match("^[ \t\n;&|()<>]$") then
@@ -1236,34 +1188,58 @@ scan_cmdsub = function(src, j, onwarn)
 		end
 	end
 	comsub_eof = src:sub(j, j) ~= "(" -- (`$((` unclosed: arithmetic, reported where it began)
-	error("unexpected EOF while looking for matching `)'") -- unclosed $(
+	eof_error(src, j, ")") -- unclosed $(
 end
 
--- `$((` is arithmetic ONLY when it's a balanced `$(( expr ))` — the paren balance
--- first returns to 0 at a `)` immediately followed by another `)`. Otherwise the
--- first `(` opened a subshell (`$( (…) )`, #2337). Quote-aware.
-dparen_is_arith = function(w, j0)
-	local depth, j, n = 0, j0, #w
+-- The ONE end rule for a `((`/`$((` body starting at s[j]: the first `)` at paren depth 0
+-- (bash reads it with parse_matched_pair, so parens inside quotes and nested expansions
+-- don't count: `$(( ${x:-")"} + 1 ))`). Returns that index, or nil and the depth still open
+-- when the text ran out.
+local function dparen_close(s, j)
+	local d, n = 0, #s
 	while j <= n do
-		local c = w:sub(j, j)
-		if c == "\\" then
+		local b = s:byte(j)
+		if b == 92 then -- \
 			j = j + 2
-		elseif c == "'" or c == '"' then
-			j = quote_end(w, j, c == '"')
-		elseif c == "(" then
-			depth = depth + 1
+		elseif b == 39 then -- '
+			j = quote_end(s, j, false)
+		elseif b == 34 then -- "
+			j = dq_end(s, j, true)
+		elseif b == 36 and s:byte(j + 1) == 39 then -- $'…'
+			j = quote_end(s, j + 1, true)
+		elseif b == 36 or b == 96 then -- $… `…`
+			j = expansion_end(s, j, false, true)
+		elseif b == 40 then
+			d = d + 1
 			j = j + 1
-		elseif c == ")" then
-			if depth == 0 then
-				return w:sub(j + 1, j + 1) == ")"
+		elseif b == 41 then
+			if d == 0 then
+				return j
 			end
-			depth = depth - 1
+			d = d - 1
 			j = j + 1
 		else
 			j = j + 1
 		end
 	end
-	return false
+	return nil, d
+end
+-- `$((` is arithmetic ONLY when it's a balanced `$(( expr ))` — the body's close is
+-- immediately followed by another `)`. Otherwise the first `(` opened a subshell
+-- (`$( (…) )`, #2337).
+dparen_is_arith = function(w, j0)
+	local c = dparen_close(w, j0)
+	return c ~= nil and w:byte(c + 1) == 41
+end
+-- The body of `$((…))` / `((…))` starting just after the opening `((`, and the index past
+-- its closing `))` (past `)` + 1 when a lone `)` closed it: `for ((…)` checks).
+grab_dparen = function(src, i)
+	local c = dparen_close(src, i)
+	if not c then
+		comsub_eof = false -- (reported at the line it began on)
+		eof_error(src, i - 2, ")")
+	end
+	return src:sub(i, c - 1), c + 2
 end
 
 -- A $( … ) whose body may not parse (a word re-read at run time, a pattern): the scanner's
@@ -1333,7 +1309,7 @@ end
 -- (`"$(echo ")")"`), so its `"` doesn't close this one. (lenient: as expansion_end's, and
 -- an open "…" isn't an error either)
 dq_end = function(s, i, lenient, onwarn)
-	local n = #s
+	local n, q = #s, i
 	i = i + 1
 	while i <= n do
 		local b = s:byte(i)
@@ -1348,9 +1324,39 @@ dq_end = function(s, i, lenient, onwarn)
 		end
 	end
 	if not lenient then
-		error("unexpected EOF while looking for matching `\"'")
+		eof_error(s, q, '"')
 	end
 	return i + 1
+end
+-- The `]` closing the subscript `[` at s[i], or nil: brackets nest (`a[a[0]]`), and a `]`
+-- that is escaped, quoted or inside a $(…)/${…} doesn't close it (`A[']']`, `${m["a]a"]}`,
+-- `a[$(echo ])]`) — bash's skipsubscript. Never raises: the text may be a runtime value.
+subscript_close = function(s, i)
+	local d, n = 0, #s
+	while i <= n do
+		local b = s:byte(i)
+		if b == 92 then -- \
+			i = i + 2
+		elseif b == 39 then -- '
+			i = quote_end(s, i, false)
+		elseif b == 34 then -- "
+			i = dq_end(s, i, true)
+		elseif b == 36 and (s:byte(i + 1) == 40 or s:byte(i + 1) == 123) then -- $( ${
+			local ok, e = pcall(expansion_end, s, i, false, true)
+			i = ok and e or i + 1
+		else
+			if b == 91 then
+				d = d + 1
+			elseif b == 93 then
+				d = d - 1
+				if d == 0 then
+					return i
+				end
+			end
+			i = i + 1
+		end
+	end
+	return nil
 end
 
 -- Parse a $… expansion at position i of string w; add(part) tagging it with the
@@ -1541,7 +1547,7 @@ local function parse_word(w)
 	while i <= #w do
 		local c = w:sub(i, i)
 		if c == "'" then -- single quotes: literal, no expansion
-			local e = w:find("'", i + 1, true) or #w + 1
+			local e = quote_end(w, i) - 1
 			parts[#parts + 1] = { lit = w:sub(i + 1, e - 1), q = true }
 			i = e + 1
 		elseif c == '"' then -- double quotes: expand inside (an unterminated $( … ) body in it
@@ -2590,7 +2596,7 @@ local function ltr_cmdsub(sh, body)
 		if c == "\\" then
 			k = k + 2
 		elseif c == "'" and not dq then
-			k = (body:find("'", k + 1, true) or m) + 1
+			k = quote_end(body, k)
 		elseif c == "$" and nx == "'" and not dq then
 			k = quote_end(body, k + 1, true)
 		elseif c == "$" and nx == "(" then
@@ -2940,21 +2946,17 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs, xg, bq
 			if ins ~= "" and not ins:match("[ \t\n\\|&;()<>]$") then
 				-- …and not when the value ends INSIDE an open quote (`alias foo="echo 'Err:"`):
 				-- the quoted string continues into the following input
-				local q, k = nil, 1
+				local k, open = 1, false
 				while k <= #ins do
-					local ch = ins:sub(k, k)
-					if q == "'" then
-						if ch == "'" then q = nil end
-					elseif q == '"' then
-						if ch == "\\" then k = k + 1 elseif ch == '"' then q = nil end
-					elseif ch == "\\" then
-						k = k + 1
-					elseif ch == "'" or ch == '"' then
-						q = ch
+					local b = ins:byte(k)
+					if b == 39 or b == 34 then -- ' "
+						k = quote_end(ins, k, b == 34)
+						open = k > #ins + 1 -- (ran off the end: left open)
+					else
+						k = k + (b == 92 and 2 or 1)
 					end
-					k = k + 1
 				end
-				if not q then
+				if not open then
 					ins = ins .. " "
 				end
 			end
@@ -3223,7 +3225,7 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs, xg, bq
 	end
 	-- from just past an extglob `X(`, to just past its matching `)`
 	local function scan_extglob(k)
-		local d = 1
+		local d, k0 = 1, k
 		while k <= n do
 			local cc = src:byte(k)
 			if cc == 92 then -- \
@@ -3243,7 +3245,7 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs, xg, bq
 			end
 		end
 		comsub_eof = false -- (reported at the line it began on)
-		error("unexpected EOF while looking for matching `)'")
+		eof_error(src, k0, ")")
 	end
 	-- a syntax error in a $( … ) body: parse_comsub's jump_to_top_level(FORCE_EOF) — an eval'd
 	-- text's one ends the (non-interactive) shell, status 1
@@ -3419,7 +3421,7 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs, xg, bq
 			end
 		end
 		if q0 then
-			error("unexpected EOF while looking for matching `\"'") -- unterminated "
+			eof_error(src, q0, '"') -- unterminated "
 		end
 		-- every newline the word spans ($(…) bodies, quotes, continuations) advances the line
 		local w = src:sub(start, i - 1)
@@ -3783,29 +3785,7 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs, xg, bq
 				end
 				local keyraw, eop, rhs = nil, "=", w
 				if w:sub(1, 1) == "[" then
-					local depth, close, j = 0, nil, 1 -- (brackets inside quotes don't count)
-					while j <= #w do
-						local ch = w:sub(j, j)
-						if ch == "\\" then
-							j = j + 1
-						elseif ch == "'" then
-							j = w:find("'", j + 1, true) or #w
-						elseif ch == '"' then
-							j = j + 1
-							while j <= #w and w:sub(j, j) ~= '"' do
-								j = j + (w:sub(j, j) == "\\" and 2 or 1)
-							end
-						elseif ch == "[" then
-							depth = depth + 1
-						elseif ch == "]" then
-							depth = depth - 1
-							if depth == 0 then
-								close = j
-								break
-							end
-						end
-						j = j + 1
-					end
+					local close = subscript_close(w, 1)
 					if close then
 						local after = w:sub(close + 1)
 						if after:sub(1, 2) == "+=" then
@@ -3875,37 +3855,9 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs, xg, bq
 		local p = i + #name
 		local subidx = nil
 		if src:sub(p, p) == "[" then
-			-- find the MATCHING ] (subscript may contain nested [ ] via ${a[i]}); quoted
-			-- text and escapes don't count (`A[']']=10` has the key `]`)
-			local depth, q = 1, p + 1
-			while q <= n and depth > 0 do
-				local ch = src:sub(q, q)
-				if ch == "\\" then
-					q = q + 1
-				elseif ch == "'" then
-					q = (src:find("'", q + 1, true) or n)
-				elseif ch == '"' then
-					local e = q + 1
-					while e <= n and src:sub(e, e) ~= '"' do
-						e = e + (src:sub(e, e) == "\\" and 2 or 1)
-					end
-					q = e
-				elseif ch == "$" and src:sub(q + 1, q + 1) == "(" then
-					local ok, nq = pcall(scan_cmdsub, src, q + 2)
-					q = ok and nq - 1 or q
-				elseif ch == "$" and src:sub(q + 1, q + 1) == "{" then
-					q = scan_braces(src, q + 1) - 1
-				elseif ch == "[" then
-					depth = depth + 1
-				elseif ch == "]" then
-					depth = depth - 1
-				end
-				if depth == 0 then
-					break
-				end
-				q = q + 1
-			end
-			if depth == 0 and src:sub(q + 1, q + 1):match("[+=]") then
+			-- (the key may nest: `a[${b[i]}]=`, `A[']']=10` has the key `]`)
+			local q = subscript_close(src, p)
+			if q and src:sub(q + 1, q + 1):match("[+=]") then
 				subidx = src:sub(p + 1, q - 1)
 				p = q + 1
 			end
@@ -4148,10 +4100,6 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs, xg, bq
 			i = i + (issel and 6 or 3)
 			ws()
 			if not issel and src:sub(i, i + 1) == "((" then
-				if not src:find(")", i + 2, true) then
-					comsub_eof = false
-					error("unexpected EOF while looking for matching `)'")
-				end
 				local body, ni = grab_dparen(src, i + 2)
 				if src:byte(ni - 1) ~= 41 then
 					-- `for ((…)` closed by a lone `)`: bash's parse_dparen fails and its re-read
@@ -4358,43 +4306,14 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs, xg, bq
 		-- balance first returns to 0 at a `)` that is NOT followed by another `)`, the
 		-- `(` closed a subshell, not the arith — fall through to the subshell parser.
 		if src:sub(i, i + 1) == "((" then
-			local j, d, isarith = i + 2, 0, false
-			while j <= n do
-				local c = src:sub(j, j)
-				if c == "\\" then
-					j = j + 2
-				elseif c == "'" or c == '"' then
-					local q = c
-					j = j + 1
-					while j <= n and src:sub(j, j) ~= q do
-						if src:sub(j, j) == "\\" and q == '"' then
-							j = j + 2
-						else
-							j = j + 1
-						end
-					end
-					j = j + 1
-				elseif c == "(" then
-					d = d + 1
-					j = j + 1
-				elseif c == ")" then
-					if d == 0 then
-						isarith = (src:sub(j + 1, j + 1) == ")")
-						break
-					end
-					d = d - 1
-					j = j + 1
-				else
-					j = j + 1
-				end
-			end
-			if j > n and d == 0 then -- (`(( 1 +` never closed: bash's arithmetic EOF error)
+			local j, d = dparen_close(src, i + 2)
+			if not j and d == 0 then -- (`(( 1 +` never closed: bash's arithmetic EOF error)
 				comsub_eof = false
-				error("unexpected EOF while looking for matching `)'")
+				eof_error(src, i, ")")
 			end
-			if isarith then
-				local body, ni = grab_dparen(src, i + 2)
-				i = ni
+			if j and src:byte(j + 1) == 41 then
+				local body = src:sub(i + 2, j - 1)
+				i = j + 2
 				-- a malformed `(( expr ))` (bad lvalue) is a NON-fatal runtime error in bash,
 				-- so defer the parse failure to eval (caught by the arithcmd handler) rather
 				-- than aborting the whole parse.
@@ -4452,18 +4371,8 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs, xg, bq
 						end
 						if c0 == "\\" then
 							i = i + 2
-						elseif c0 == "'" then
-							i = i + 1
-							while i <= n and src:sub(i, i) ~= "'" do
-								i = i + 1
-							end
-							i = i + 1
-						elseif c0 == '"' then
-							i = i + 1
-							while i <= n and src:sub(i, i) ~= '"' do
-								i = i + (src:sub(i, i) == "\\" and 2 or 1)
-							end
-							i = i + 1
+						elseif c0 == "'" or c0 == '"' then
+							i = quote_end(src, i, c0 == '"')
 						elseif c0 == "(" then
 							pd = pd + 1
 							depth = depth + 1
@@ -4874,11 +4783,7 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs, xg, bq
 							elseif ch == "\\" then
 								i = i + 1
 							elseif ch == "'" or ch == '"' then
-								local close = src:find(ch == "'" and "'" or '[\\"]', i + 1)
-								while close and ch == '"' and src:sub(close, close) == "\\" do
-									close = src:find('[\\"]', close + 2)
-								end
-								i = close or n
+								i = quote_end(src, i, ch == '"') - 1 -- (its closing quote)
 							end
 							i = i + 1
 						until depth == 0 or i > n
@@ -5244,7 +5149,11 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs, xg, bq
 						t = "parse_error",
 						-- (a recoverable one, or a `near TOKEN` one: the token's line)
 						line = (type(st) == "table" and st.__curse_perr and st.line)
-							or (recover or (type(st) == "string" and st:find("near `", 1, true))) and line or startline,
+							or (recover or (type(st) == "string" and st:find("near `", 1, true))) and line
+							or (eof_s == src and eof_at >= start and type(st) == "string"
+								and st:find("EOF while looking for matching", 1, true)) -- (where it opened)
+								and startline + select(2, src:sub(start, eof_at - 1):gsub("\n", ""))
+							or startline,
 						msg = recover and ("syntax error near `" .. (st.tok or "(") .. "'")
 							or (type(st) == "table" and st.__curse_perr and st.msg) or tostring(st),
 						status = type(st) == "table" and st.__curse_perr and st.status or nil, -- (else 2)
