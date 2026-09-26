@@ -528,5 +528,10 @@ fi
 
 if [ "$VERBOSE" -eq 1 ]; then
   echo; echo "failures (shell disagreed with bash):"
-  awk -F'\t' '$3=="FAIL"{print "  "$1"\t"$2"\t"$5"\t("$6")"}' "$workdir/all.tsv" | sort | head -100
+  # every curse failure; dash's (hundreds: it isn't bash) only up to 100
+  awk -F'\t' '$3=="FAIL" && $2!="dash"{print "  "$1"\t"$2"\t"$5"\t("$6")"}' "$workdir/all.tsv" | sort
+  awk -F'\t' '$3=="FAIL" && $2=="dash"{print "  "$1"\t"$2"\t"$5"\t("$6")"}' "$workdir/all.tsv" | sort \
+    | awk 'NR <= 100 { print } END { if (NR > 100) print "  … and " NR - 100 " more dash failures (see --results)" }'
+  # (awk, not head: head exits after 100 lines, sort dies of SIGPIPE, and under pipefail the
+  # harness itself exited 141 — meson reported the whole corpus as FAILED)
 fi
