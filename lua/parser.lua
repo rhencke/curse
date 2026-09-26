@@ -2094,41 +2094,24 @@ local function cond_check(toks, quoted, nlb, eof, line0, tl)
 	if e.near == "EOF" then -- (`[[ a &&` then EOF: the term's error, then the parser's)
 		error({ __curse_perr = true, pre = pre, msg = "syntax error: unexpected end of file", eof = true }, 0)
 	end
-	local near = (e.near == "&&" or e.near == "||") and e.near:sub(1, 1) or e.near
-	error({ __curse_perr = true, pre = pre, exact = true, msg = "syntax error near `" .. near .. "'", fk = fk }, 0)
+	-- (at a real token the caller re-derives `near` from the input text, as bash does)
+	error({ __curse_perr = true, pre = pre, exact = true, msg = "syntax error near `" .. e.near .. "'", fk = fk }, 0)
 end
 
--- Parse a [[ … ]] token list into a boolean-expression AST:
+-- Build a [[ … ]] token list's boolean-expression AST:
 --   {kind="and"/"or", l, r} | {kind="not", e} | {kind="str", word}
 --   {kind="unary", op, word} | {kind="binary", op, l, r, rq}
 -- `rq` marks the RHS of ==/!= as fully-quoted (literal, not a glob).
+-- The tokens already passed cond_check (bash's grammar), so the list is well formed:
+-- only bash's unary operators (COND_UNOP) are unary — `[[ -Q ]]` is a string test.
 local function parse_dbracket(toks, quoted)
-	local pos, serr = 1, false
+	local pos = 1
 	local function peek()
 		return toks[pos]
-	end
-	-- `<` `>` `&&` `||` can't stand where an operand is expected (`[[ -f < ]]` is a
-	-- parse error). Note `=`/`==`/`!=`/`=~` ARE accepted there as literal strings.
-	local function is_op(tok)
-		return tok == "<" or tok == ">" or tok == "&&" or tok == "||"
 	end
 	local parse_or
 	local function primary()
 		local t = peek()
-		if t == nil then
-			serr = true
-			return { kind = "str", word = parse_word("") }
-		end -- expected an operand
-		if t == "&&" or t == "||" then
-			serr = true
-			pos = pos + 1
-			return { kind = "str", word = parse_word("") }
-		end -- operator with no left operand
-		if t == ")" then
-			serr = true
-			pos = pos + 1
-			return { kind = "str", word = parse_word("") }
-		end -- unmatched `)` (a matched one is consumed after `(`)
 		if t == "!" then
 			pos = pos + 1
 			return { kind = "not", e = primary() }
@@ -2136,39 +2119,19 @@ local function parse_dbracket(toks, quoted)
 		if t == "(" then
 			pos = pos + 1
 			local e = parse_or()
-			if peek() == ")" then
-				pos = pos + 1
-			else
-				serr = true
-			end
+			pos = pos + 1 -- (its `)`)
 			e.paren = (e.paren or 0) + 1 -- (for `declare -f`, which prints the grouping)
 			return e
 		end
-		if t and t:match("^%-[a-zA-Z]$") then -- unary file/string test
-			if toks[pos + 1] == nil or is_op(toks[pos + 1]) then
-				serr = true
-			end -- needs a (non-operator) operand
+		if COND_UNOP[t] then -- unary file/string test
 			pos = pos + 2
-			return { kind = "unary", op = t, word = parse_word(toks[pos - 1] or "") }
+			return { kind = "unary", op = t, word = parse_word(toks[pos - 1]) }
 		end
 		pos = pos + 1 -- consume lhs
 		local op = peek()
-		if
-			op == "=="
-			or op == "!="
-			or op == "=~"
-			or op == "="
-			or op == "<"
-			or op == ">"
-			or (op and op:match("^%-[a-z][a-z]$"))
-		then
-			if toks[pos + 1] == nil then
-				serr = true
-			end -- a binary op needs a rhs
-			pos = pos + 1
-			local r = toks[pos]
-			pos = pos + 1
-			local rw = parse_word(r or "")
+		if COND_BINOP[op] then
+			pos = pos + 2
+			local rw = parse_word(toks[pos - 1])
 			local rq = quoted[pos - 1] -- (fully quoted: `"a"*` starts with a quote yet globs)
 			for _, p in ipairs(rq and rw.parts or {}) do
 				if not p.q then
@@ -2178,7 +2141,7 @@ local function parse_dbracket(toks, quoted)
 			end
 			return { kind = "binary", op = op, l = parse_word(t), r = rw, rq = rq }
 		end
-		return { kind = "str", word = parse_word(t or "") }
+		return { kind = "str", word = parse_word(t) }
 	end
 	local function parse_and()
 		local l = primary()
@@ -2196,14 +2159,8 @@ local function parse_dbracket(toks, quoted)
 		end
 		return l
 	end
-	local ast = parse_or()
-	-- empty `[[ ]]`, a dangling/extra operand, or a leftover token is a syntax error
-	if serr or #toks == 0 or pos <= #toks then
-		return { kind = "syntaxerr" }
-	end
-	return ast
+	return parse_or()
 end
-M.parse_dbracket = parse_dbracket
 
 -- ---- brace expansion ({a,b,c}, {m..n}, {m..n..step}, {a..z}) ----
 -- Textual, before any other expansion; applies to command words and for-in
@@ -2467,7 +2424,6 @@ local function brace_factors(s)
 	flush()
 	return any and factors or nil
 end
-M.brace_factors = brace_factors
 
 local brace_stream -- forward (mutually recursive with itself over nested alts)
 local function range_count(r)
@@ -2539,8 +2495,6 @@ brace_stream = function(s, emit)
 		stream_factors(f, emit)
 	end
 end
-M.brace_stream = brace_stream
-M.stream_factors = stream_factors
 
 -- Cheap count of a factor list's total expansions, capped (returns >BRACE_CAP as
 -- soon as it's known to exceed, without building anything).
@@ -2573,7 +2527,6 @@ local function count_str(s)
 	return total
 end
 M.brace_count = count_str
-M.BRACE_CAP = BRACE_CAP
 
 -- Append a raw word to a word-list, brace-expanding it. Streams combinations
 -- (ranges symbolic) and STOPS after BRACE_CAP words — so a pathological
@@ -4863,6 +4816,25 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs, xg, bq
 					if at then
 						i, line = at[1], at[2]
 						cerr.line = line
+					end
+					-- (bash names the offending token from the input TEXT, not the token:
+					-- error_token_from_text reads back from where the lexer stopped — just past
+					-- it — to a blank or one of `;|&`: `]];` reads as `;`, `]]>f` as `]]>`,
+					-- `&&` as `&`)
+					local tk = k > 0 and (toks[k] or (k == #toks + 1 and closed and "]]"))
+					if tk and cerr.exact then
+						local j = tp[k] + #tk - 1 -- (the token's last char…)
+						if not is_blank(src:sub(j + 1, j + 1)) and src:sub(j + 1, j + 1) ~= "\n" and j < n then
+							j = j + 1 -- (…or the metachar the lexer stopped on)
+						end
+						local b = j
+						while b > 1 and not (" \n\t;|&"):find(src:sub(b, b), 1, true) do
+							b = b - 1
+						end
+						if b < j and (" \n\t"):find(src:sub(b, b), 1, true) then
+							b = b + 1
+						end
+						cerr.msg = "syntax error near `" .. src:sub(b, j) .. "'"
 					end
 				end
 				error(cerr, 0)

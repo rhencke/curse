@@ -18,10 +18,10 @@ function M.compile(ast, opts)
 end
 
 -- Compile a runtime code string (eval / source) as a FRAGMENT: emit with fragment=true so a
--- TOP-LEVEL return/break/continue RAISES its signal (the caller's delegated cf-wrapper
--- catches it) instead of jumping to this unit's own DONE. Returns an instantiated module, or
--- nil when the code can't compile — a parse (syntax) error, alias use (needs line-at-a-time
--- expansion), or any construct emit still delegates. The caller then falls back to the
+-- TOP-LEVEL return/break/continue RAISES its signal (the caller's cf-wrapper catches it)
+-- instead of jumping to this unit's own DONE. Returns an instantiated module, or nil when
+-- the code can't compile — a parse (syntax) error, alias use (needs line-at-a-time
+-- expansion), or a construct emit refuses (cx.refuse). The caller then falls back to the
 -- interpreter, which handles those correctly (and incrementally). Memoized by text below.
 -- Compiled eval/source fragments, keyed by their exact text: a resident worker re-running a
 -- script (or a loop re-running the same `eval "$cmd"`) reuses the module instead of paying
@@ -103,7 +103,6 @@ local function alias_sig(sh)
 	sh._asig_t, sh._asig_g, sh._asig = t, sh.alias_gen or 0, table.concat(al, "\1")
 	return sh._asig
 end
-M.alias_sig = alias_sig
 function M.try_fragment(code, line1, sh, now, label, noalias) -- line1: an eval's own line, which its code numbers from
 	-- (now: the caller already saw this code run — compile it on this first call;
 	-- line1 == false: a trap handler, whose commands keep the interrupted line;
@@ -247,26 +246,15 @@ function M.run(src, opts)
 	end
 	local hook = function(kind, id)
 		count = count + 1
-		-- Hand off only where the compiled module has a resume pc for THIS safepoint:
-		-- never inside a function call (calldepth>0), and — crucially — a forked child
-		-- (subshell) resumes into its OWN bounded fragment (whose loops now have pcs),
-		-- NOT the top-level continuation. A still-delegated context has no pc, so
-		-- resume_pc is nil there and the child stays in the interpreter.
+		-- Hand off only where the compiled module has a resume pc for THIS safepoint,
+		-- never inside a function call (calldepth>0). A loop with no resume point (one
+		-- inside a subshell, $(…), …) has no pc: resume_pc is nil and it stays interpreted.
 		if resume ~= nil or sh.calldepth ~= 0 or not ready(kind, id, count) then
 			return
 		end
-		local pc = resume_pc(mod, { kind = kind, id = id })
-		if pc ~= nil then
+		if resume_pc(mod, { kind = kind, id = id }) ~= nil then
 			resume = { kind = kind, id = id }
-			-- carry the OSR itself on the error, so whoever catches it can run it: the
-			-- top level here, OR a forked subshell child (which OSRs into its own
-			-- bounded fragment and _exits, without the parent's finish_run/EXIT trap).
-			error({
-				__curse_switch = true,
-				osr = function()
-					M.run_compiled(mod, sh, pc)
-				end,
-			})
+			error({ __curse_switch = true }) -- (unwind the interpreter; resumed below)
 		end
 	end
 
@@ -281,53 +269,6 @@ function M.run(src, opts)
 	error(err)
 end
 
--- Run a PRE-COMPILED module tiered: interpret (instant start), then OSR into `mod`
--- at the first safepoint past `switch_after` (default 0 -> the first one). Same
--- structure as run_background (the interp self-handles exit; only the OSR->compiled
--- part runs under finish_run, for exit-status + EXIT trap) but with the module
--- already built -- for the daemon cold path, which caches `mod` and needs no
--- detached transpile.
-function M.run_mod(mod, sh, src, switch_after)
-	switch_after = switch_after or 0
-	local count, resume = 0, nil
-	local hook = function(kind, id)
-		count = count + 1
-		local t = sh.traps
-		if t and ((t.DEBUG and not mod.has_debug) or (t.RETURN and not mod.has_return)) then
-			return
-		end
-		if resume ~= nil or sh.calldepth ~= 0 or count <= switch_after then
-			return
-		end
-		local pc = resume_pc(mod, { kind = kind, id = id })
-		if pc ~= nil then
-			resume = { kind = kind, id = id }
-			error({
-				__curse_switch = true,
-				osr = function()
-					M.run_compiled(mod, sh, pc)
-				end,
-			})
-		end
-	end
-	local ok, err = pcall(I.run_lazy, sh, src, hook)
-	if ok then
-		return sh, "interp-only"
-	end
-	if type(err) == "table" and err.__curse_switch then
-		I.finish_run(sh, function()
-			M.run_compiled(mod, sh, resume_pc(mod, resume))
-		end)
-		return sh, "cold"
-	end
-	error(err)
-end
-
--- Daemon cold/hot execution. A warm cache hit loads the dumped bytecode and runs it
--- compiled ("warm"); a miss emits + STORES the bytecode (so the next run is a hit)
--- and runs TIERED (interp, then OSR fall-over into the compiled module) -- "cold".
--- If the emitter can't handle the script, fall back to the interpreter. Mirrors
--- cache.lua's M.run, but the cold path tiers instead of running compiled from pc=0.
 -- In-process module cache for a resident worker (daemon). Keyed by artifact path
 -- (which embeds the content hash + build stamp), it holds the ALREADY-INSTANTIATED
 -- module so a repeat script skips both the disk loadfile AND the module rebuild
@@ -415,7 +356,7 @@ local function loop_fragment(st, sh)
 		-- (sh.forstate) under the fragment's own id for that loop: its first
 		local fid = 1
 		if not (mod.loopPc and mod.loopPc[fid]) then
-			mod = nil -- (the emitter delegated the loop: no resume point)
+			mod = nil -- (the loop has no resume point in the fragment)
 		else
 			st._fid = fid
 		end
@@ -687,6 +628,11 @@ function M.compile_deferred(one)
 		end
 	end
 end
+-- Daemon cold/hot execution. A warm cache hit loads the dumped bytecode and runs it
+-- compiled ("warm"); a miss emits + STORES the bytecode (so the next run is a hit)
+-- and runs TIERED (interp, then OSR fall-over into the compiled module) -- "cold".
+-- If the emitter can't handle the script, fall back to the interpreter. Mirrors
+-- cache.lua's M.run, but the cold path tiers instead of running compiled from pc=0.
 function M.run_tiered(src, sh)
 	sh.main_src = sh.main_src or src -- (the script's text: rt.coproc_exit_dispose's end-of-input line)
 	local Cache = require("cache")
@@ -864,79 +810,6 @@ function M.run_tiered(src, sh)
 	end
 	I.run_lazy(sh, src) -- (no cache path: the interpreter's line-at-a-time parse)
 	return sh, "interp"
-end
-
--- The real thing: transpile in a DETACHED process while interpreting, switch the
--- instant the compiled Lua lands (works mid-loop, any nesting).
-function M.run_background(script_path, opts)
-	opts = opts or {}
-	local luajit = opts.luajit or "luajit"
-	local sh = opts.sh or rt.Shell.new()
-	local f = assert(io.open(script_path, "r"))
-	local src = f:read("*a")
-	f:close()
-	-- No eager parse here: the compile runs in a DETACHED process; the main process
-	-- interprets LAZILY (instant start, parses only as far as it executes).
-
-	local out = os.tmpname() .. ".curse.lua"
-	os.remove(out)
-	local tpid = rt.spawn_internal({ luajit, "lua/transpile.lua", script_path, out })
-
-	local poll_every = opts.poll_every or 4096
-	local count, resume, mod = 0, nil, nil
-	local hook = function(kind, id)
-		count = count + 1
-		-- Don't OSR into compiled code while a DEBUG/RETURN trap is armed: those fire
-		-- per-command, which the native compiled path can't reproduce. Stay in interp.
-		if sh.traps and (sh.traps.DEBUG or sh.traps.RETURN) then
-			return
-		end
-		if sh.calldepth ~= 0 then
-			return
-		end -- inside a function call: not an OSR target
-		if mod == nil then
-			if count % poll_every ~= 0 then
-				return
-			end
-			local cf = io.open(out, "r")
-			if not cf then
-				return
-			end
-			cf:close()
-			mod = assert(loadfile(out))() -- fully written (atomic rename)
-			rt.reap_internal(tpid)
-		end
-		-- OSR only where THIS context has a resume pc: the top level, or a forked child
-		-- (subshell) into its OWN bounded fragment. A delegated context has no pc, so
-		-- it stays in the interpreter. The compiled module (out.lua) is the SAME shared
-		-- artifact for parent and children — each jumps to the entry that matches it.
-		local pc = resume_pc(mod, { kind = kind, id = id })
-		if pc ~= nil then
-			resume = { kind = kind, id = id }
-			-- attach the OSR (see M.run) so a forked subshell child can OSR itself into
-			-- its own bounded fragment (ends in subshell_exit → _exit) when it catches this.
-			error({
-				__curse_switch = true,
-				osr = function()
-					M.run_compiled(mod, sh, pc)
-				end,
-			})
-		end
-	end
-
-	local ok, err = pcall(I.run_lazy, sh, src, hook)
-	os.remove(out)
-	rt.reap_internal(tpid)
-	if ok then
-		return sh, "interp-only", count
-	end
-	if type(err) == "table" and err.__curse_switch then
-		I.finish_run(sh, function()
-			M.run_compiled(mod, sh, resume_pc(mod, resume))
-		end)
-		return sh, "switched-after-" .. count .. "-safepoints", count
-	end
-	error(err)
 end
 
 return M

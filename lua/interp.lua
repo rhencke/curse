@@ -6867,14 +6867,6 @@ exec_stmt = function(sh, st, hook)
 			error(v)
 		end
 	elseif t == "dbracket" then
-		if st.expr and st.expr.kind == "syntaxerr" then -- malformed [[ ]]: fatal syntax error (bash aborts)
-			io.stderr:write("curse: syntax error in conditional expression\n")
-			sh.status = 2
-			if not sh.opt_i then
-				error({ __curse_exit = 2 })
-			end
-			return
-		end
 		-- (an arith error in an -eq operand makes just that primary false — eval_dbracket;
 		-- one expanding a WORD, `[[ a =~ $((1/0)) ]]`, abandons the line: DISCARD, bash)
 		local ok, v = pcall(eval_dbracket, sh, st.expr)

@@ -46,9 +46,9 @@ so the handoff between them transfers no state:
    used only arithmetically are lifted to native `int64` locals. LuaJIT then traces
    the hot pc path to machine code.
 
-[`lua/tier.lua`](lua/tier.lua) orchestrates the switch. Compilation can even run in
-the background: `tier.run_background` spawns a *detached* transpile while the
-interpreter keeps going, then jumps into the compiled module the instant it lands.
+[`lua/tier.lua`](lua/tier.lua) orchestrates the switch: a cold script starts in the
+interpreter, compiles the moment a loop or function gets hot and jumps into the module
+right there — or, if it never does, compiles after the daemon has replied.
 A persistent, content-hashed artifact cache ([`lua/cache.lua`](lua/cache.lua))
 keys compiled bytecode by the script's bytes (not its path), so repeated workloads
 — and pathless `sh -c '…'` — skip recompilation entirely.

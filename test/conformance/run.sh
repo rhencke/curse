@@ -241,7 +241,7 @@ case "$SHELLS" in *curse*)
   [ -x "$H_CLIENT" ] || { echo "error: no curse-client at $H_CLIENT — run 'meson compile -C build'." >&2; exit 1; }
   [ -f "$BUNDLE" ]   || { echo "error: no bundle at $BUNDLE — run 'meson compile -C build'." >&2; exit 1; }
   env XDG_RUNTIME_DIR="$H_XDG_RUNTIME" XDG_CACHE_HOME="$H_XDG_CACHE" CURSE_BUNDLE="$BUNDLE" \
-    CURSE_WORKERS="$JOBS" CURSE_IDLE=3600 "$LUAJIT" "$REPO/lua/daemon.lua" >/dev/null 2>&1 &
+    CURSE_WORKERS="$JOBS" CURSE_IDLE=3600 "$LUAJIT" "$REPO/lua/daemon.lua" >"${H_DAEMON_LOG:-/dev/null}" 2>&1 &
   DAEMON_PID=$!
   disown "$DAEMON_PID" 2>/dev/null || true   # cleanup kills it by pid; keep job-control quiet
   sock="$H_XDG_RUNTIME/curse.sock"
