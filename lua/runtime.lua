@@ -4315,6 +4315,26 @@ function M.coproc_dispose(sh, pid)
 	end
 	sh.vars[cp.name .. "_PID"] = nil
 end
+-- The shell is exiting (after its EXIT trap) with a coproc not yet reaped: bash disposes
+-- it then — closing its fds and unsetting NAME, so a readonly NAME is reported, at the line
+-- bash's reader stands on (the `exit`'s line, or the last line + 1 at end of input).
+function M.coproc_exit_dispose(sh, ok)
+	local line = not ok and sh.exit_line or nil
+	if not line then
+		local src = sh.main_src or ""
+		line = select(2, src:gsub("\n", "")) + 1
+	end
+	sh.cur_line, sh.force_line = line, line
+	local pids = {}
+	for pid in pairs(sh.coprocs) do
+		pids[#pids + 1] = pid
+	end
+	table.sort(pids)
+	for _, pid in ipairs(pids) do
+		M.coproc_dispose(sh, pid)
+	end
+	sh.force_line = nil
+end
 -- bash reaps a finished coproc as soon as SIGCHLD arrives, closing its fds and unsetting
 -- NAME; the interpreter polls for that between commands while any coproc exists.
 function M.coproc_poll(sh)
@@ -6160,6 +6180,9 @@ end
 -- exit.def: an interactive shell (not a subshell of one) says "exit" — "logout" for a
 -- login shell — on stderr before exiting
 function M.exit_note(sh)
+	if sh.coprocs and next(sh.coprocs) then -- (where bash's line counter stands: coproc_exit_dispose)
+		sh.exit_line = M.current_line(sh)
+	end
 	if sh.opt_i and sh:special_get("BASH_SUBSHELL") == "0" then
 		io.stderr:write(sh.login_shell and "logout\n" or "exit\n")
 	end

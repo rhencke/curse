@@ -88,7 +88,8 @@ if [ "${1:-}" = --run-unit ]; then
   # pid of the fresh `timeout` each run gets) — so no second run, bash's included, can
   # reproduce the first byte-for-byte. Only when a shell MISMATCHES, re-run bash (up to
   # 3x); if bash's own output varied, the lines both bash runs agree on must still match
-  # exactly, and a varying line matches when it's equal with every digit run masked.
+  # exactly, and a varying line matches when it's equal with every digit run masked — or
+  # the shell's output equals one of bash's own runs verbatim (a race in bash itself).
   bchecked=""; b2out=""; b2st=""
   oracle_varies() {
     if [ -z "$bchecked" ]; then
@@ -100,6 +101,17 @@ if [ "${1:-}" = --run-unit ]; then
     fi
     [ "$b2out" != "$bout" ] && [ "$b2st" -eq "$bst" ]
   }
+  bash_produces() {  # does bash, rerun (≤8x, only for a mismatch), ever print exactly $1 / exit $2?
+    local k o st
+    for ((k = 0; k < 8; k++)); do
+      if [ -n "${bruns[k]+x}" ]; then o=${bruns[k]}; st=${bsts[k]}
+      else prep; one bash >"$ofile.b3" 2>/dev/null; st=$?; o=$(cat "$ofile.b3" 2>/dev/null)
+        bruns[k]=$o; bsts[k]=$st; fi
+      [ "$o" = "$1" ] && [ "$st" -eq "$2" ] && return 0
+    done
+    return 1
+  }
+  bruns=(); bsts=()
   nondet_match() {  # $1 out: equal to bash's up to the digits of lines bash itself varies on
     local -a A B C; local k
     mapfile -t A <<<"$bout"; mapfile -t B <<<"$b2out"; mapfile -t C <<<"$1"
@@ -116,7 +128,9 @@ if [ "${1:-}" = --run-unit ]; then
     local v=FAIL
     if [ "$1" = dash ] && [ "$3" -eq 2 ] && [ "$bst" -ne 2 ]; then v=NA
     elif [ "$2" = "$bout" ] && [ "$3" -eq "$bst" ]; then v=PASS
-    elif [ "$3" -eq "$bst" ] && oracle_varies && nondet_match "$2"; then v=PASS; fi
+    elif [ "$3" -eq "$bst" ] && oracle_varies && nondet_match "$2"; then v=PASS
+    # (…or bash itself can produce exactly this output: a race in bash, e.g. `a & b`'s order)
+    elif bash_produces "$2" "$3"; then v=PASS; fi
     printf '%s\t%s\t%s\t%s\t%s\n' "$corpus" "$1" "$v" "$4" "$testid" >> "$res"
     # H_DIFF_DIR=dir: keep a failing test's expected (bash) and actual output + statuses
     if [ "$v" = FAIL ] && [ -n "${H_DIFF_DIR:-}" ]; then

@@ -688,6 +688,7 @@ function M.compile_deferred(one)
 	end
 end
 function M.run_tiered(src, sh)
+	sh.main_src = sh.main_src or src -- (the script's text: rt.coproc_exit_dispose's end-of-input line)
 	local Cache = require("cache")
 	M.note_text(sh, src)
 	-- (a shell started under set -x runs a module compiled WITH trace hooks: its own key)

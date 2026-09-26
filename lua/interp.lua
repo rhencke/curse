@@ -7653,6 +7653,9 @@ local function finish(sh, ok, err)
 		return
 	end
 	M.run_exit_trap(sh)
+	if sh.coprocs and next(sh.coprocs) and not sh.subshell_child then
+		rt.coproc_exit_dispose(sh, ok)
+	end
 end
 M.run_exit_trap = function(sh)
 	local h = sh.traps and sh.traps.EXIT
@@ -7917,6 +7920,7 @@ end
 
 -- (`line1`: the line `src` starts on — a script read from stdin a command at a time)
 function M.run_lazy(sh, src, hook, line1)
+	sh.main_src = sh.main_src or src
 	hook = hook or function() end
 	local nextf = P.open(src, sh, line1) -- sh: alias expansion uses the live alias table
 	finish(

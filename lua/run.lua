@@ -116,6 +116,7 @@ elseif mode == "compiled" then
 	local sa = (sh.opt_a or sh.opt_r) or nil -- (started allexport/restricted: tier.run_tiered)
 	local pst = ((sh.opt_posix and "p" or "") .. (sh.shopt.extglob and "x" or "")):match(".+") -- (tier.parse_start)
 	T.note_text(sh, src)
+	sh.main_src = sh.main_src or src
 	local ok, mod = pcall(T.compile, T.parse_start(src, pst), (sh.opt_x or sa) and { xtrace = sh.opt_x, startattr = sa } or nil)
 	if not ok then
 		if T.lm_reason(mod) then -- (a line at a time, each line compiled: aliases, history…)
