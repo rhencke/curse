@@ -74,12 +74,14 @@ return function(sh, cmd, args, hook, tcb)
 			elseif nm then
 				if (sub == "@" or sub == "*") and not sh:is_assoc(nm) then
 					io.stderr:write("curse: " .. target .. ": bad array subscript\n")
+					rt.report_exit(sh) -- (err_badarraysub: report_error)
 					sh.status = 1
 				else
 					local key = array_key(sh, nm, sub)
 					if rt.neg_oob(sh, nm, key) then
 						-- (a negative subscript past the start: nothing is bound)
 						io.stderr:write("curse: " .. target .. ": bad array subscript\n")
+						rt.report_exit(sh) -- (err_badarraysub: report_error)
 						sh.status = 1
 					else
 						sh:array_set(nm, key, res, false)

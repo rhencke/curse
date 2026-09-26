@@ -209,6 +209,7 @@ local function bindvar(sh, name, val)
 	local b = sh.vars[name]
 	if b and b.ro then
 		io.stderr:write("curse: " .. name .. ": readonly variable\n")
+		rt.report_exit(sh) -- (err_readonly: report_error)
 		return false
 	end
 	if val then

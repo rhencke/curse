@@ -197,13 +197,14 @@ end
 -- Run a compiled module with the interp's line-abort semantics (see tier.lua):
 -- a div0/failglob lineabort re-enters run at sh._ff (next line) with $?=1.
 local function run_compiled(mod, sh, pc)
+	local ne0 = sh.noerr
 	while true do
 		local ok, err = pcall(mod.run, sh, pc)
 		if ok then
 			return
 		end
-		if type(err) == "table" and err.__curse_lineabort and (not sh.opt_e or err.__curse_discard) then
-			sh.status = 1
+		if type(err) == "table" and err.__curse_lineabort and not require("runtime").lineabort_exits(sh, err) then
+			sh.status, sh.noerr = 1, ne0
 			pc = sh._ff
 		else
 			error(err)

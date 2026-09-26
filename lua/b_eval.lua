@@ -76,6 +76,10 @@ return function(sh, cmd, args, hook, tcb)
 				-- (parse_and_execute's restore_lastcom: after the code, $BASH_COMMAND is the eval
 				-- again — an ERR trap the eval's failure fires reads `eval …`)
 				local scc = sh.cur_cmd
+				-- (run errexit-exempt — an `if`/`&&`/`!` context — eval clears -e for what it runs:
+				-- execute_builtin's exit_immediately_on_error = 0, so a report_error doesn't exit)
+				local iee = sh.ign_ee
+				sh.ign_ee = iee or sh.noerr > 0
 				local ok, err = pcall(function()
 					local ln = rt.current_line(sh)
 					local nextf = eval_groups(sh, code, ln) or P.open(code, sh, ln > 0 and ln or nil)
@@ -108,13 +112,14 @@ return function(sh, cmd, args, hook, tcb)
 						end
 						for _, st in ipairs(lg.stmts) do
 							ran = ran or not rt.perr_neutral(st)
+							local ne0 = sh.noerr
 							local sok, serr = pcall(exec_list, sh, { st }, hook, false) -- errexit + signals incl.
 							if not sok then
 								if type(serr) == "table" and serr.__curse_lineabort and not serr.__curse_discard then
-									if sh.opt_e then
+									if rt.lineabort_exits(sh, serr) then
 										error(serr)
 									end
-									sh.status = 1
+									sh.status, sh.noerr = 1, ne0
 									break -- div0/failglob: abort the rest of this line
 								else
 									error(serr)
@@ -123,7 +128,7 @@ return function(sh, cmd, args, hook, tcb)
 						end
 					end
 				end)
-				sh.xdepth, sh.cur_cmd = sxd, scc
+				sh.xdepth, sh.cur_cmd, sh.ign_ee = sxd, scc, iee
 				sh.spb_err = badsyntax and 2 or nil -- (a builtin the code ran flagged its own: not eval's)
 				if not ok then
 					error(err)

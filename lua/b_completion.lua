@@ -728,6 +728,7 @@ local function bindv(sh, name, v, export)
 	local b = sh.vars[dn]
 	if b and b.ro then
 		io.stderr:write("curse: " .. dn .. ": readonly variable\n")
+		require("runtime").report_exit(sh) -- (err_readonly: report_error)
 	elseif export then
 		sh:export_str(dn, v) -- (the variable bound gets the export attribute)
 	else

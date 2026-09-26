@@ -44,6 +44,7 @@ local function bind_optarg(sh, value) -- value nil: OPTARG declared with no valu
 	local b = sh.vars[dn]
 	if b and b.ro then
 		io.stderr:write("curse: " .. dn .. ": readonly variable\n")
+		rt.report_exit(sh) -- (err_readonly: report_error)
 	elseif b and not b.arr then
 		b.s, b.n = nil, nil
 	elseif not b then
@@ -173,6 +174,7 @@ return function(sh, cmd, args, hook, tcb)
 		local ob2 = sh.vars[obn]
 		if ob2 and ob2.ro then
 			io.stderr:write("curse: " .. obn .. ": readonly variable\n")
+			rt.report_exit(sh) -- (err_readonly: report_error)
 		else
 			rt.assign_ref(sh, "getopts", "OPTIND", tostring(optind)) -- (resets the state: set after)
 		end

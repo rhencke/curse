@@ -98,6 +98,8 @@ return function(sh, cmd, args, hook, tcb)
 					local sxd = sh.xdepth -- (a sourced file traces one level deeper, bash)
 					sh.xdepth = (sxd or 0) + 1
 					local scc = sh.cur_cmd -- (parse_and_execute's restore_lastcom: $BASH_COMMAND)
+					local iee = sh.ign_ee -- (errexit-exempt: -e cleared for the file, as eval does)
+					sh.ign_ee = iee or sh.noerr > 0
 					local rok, err = pcall(function()
 						local nextf = P.open(src, sh)
 						local vst = {}
@@ -118,19 +120,23 @@ return function(sh, cmd, args, hook, tcb)
 								if lg.perr.recoverable then
 									M.report_recoverable(sh, lg.perr)
 								else
-									pcall(I.exec_stmt, sh, lg.perr, hook) -- (it would exit: the file just ends)
+									local _, pe = pcall(I.exec_stmt, sh, lg.perr, hook) -- (it would exit: the file just ends)
+									if type(pe) == "table" and pe.__curse_perrexit then
+										error(pe, 0) -- (but `set -e`'s parser_error exit stands)
+									end
 									error({ __curse_parseerr = true, lead = not ran, __curse_exit = lg.perr.status })
 								end
 							end
 							for _, st in ipairs(lg.stmts) do
 								ran = ran or not rt.perr_neutral(st)
+								local ne0 = sh.noerr
 								local sok, serr = pcall(exec_list, sh, { st }, hook, false)
 								if not sok then
 									if type(serr) == "table" and serr.__curse_lineabort and not serr.__curse_discard then
-										if sh.opt_e then
+										if rt.lineabort_exits(sh, serr) then
 											error(serr)
 										end
-										sh.status = 1
+										sh.status, sh.noerr = 1, ne0
 										break
 									else
 										error(serr)
@@ -139,7 +145,7 @@ return function(sh, cmd, args, hook, tcb)
 							end
 						end
 					end)
-					sh.xdepth = sxd
+					sh.xdepth, sh.ign_ee = sxd, iee
 					sh.spb_err = nil -- (a builtin in the file flagged its own: not the source's)
 					sh.cur_cmd = scc
 					sh.sourcedepth = sh.sourcedepth - 1

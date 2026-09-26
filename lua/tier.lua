@@ -199,7 +199,7 @@ end
 -- `nested` (an eval/source/hot-loop fragment): a __curse_discard lineabort (bash's
 -- top_level_cleanup + DISCARD) is not contained here but unwinds to the top level.
 function M.run_compiled(mod, sh, pc, nested)
-	local pd0, cd0, fs0 = sh.pd, sh.calldepth, sh.funcstack and #sh.funcstack or 0
+	local pd0, cd0, fs0, ne0 = sh.pd, sh.calldepth, sh.funcstack and #sh.funcstack or 0, sh.noerr
 	while true do
 		local ok, err = pcall(mod.run, sh, pc)
 		if ok then
@@ -207,7 +207,7 @@ function M.run_compiled(mod, sh, pc, nested)
 		end
 		if type(err) == "table" and err.__curse_dbgskip and err.cfg == "run" then
 			pc = err.__curse_dbgskip -- (extdebug: the DEBUG trap skipped a command — go on after it)
-		elseif type(err) == "table" and err.__curse_lineabort and (not sh.opt_e or err.__curse_discard) then
+		elseif type(err) == "table" and err.__curse_lineabort and not rt.lineabort_exits(sh, err) then
 			-- a lineabort from inside a function call unwinds its frames (locals, params,
 			-- FUNCNAME) — the compiled call sites pop them only on a normal return
 			while sh.pd > pd0 do
@@ -216,7 +216,7 @@ function M.run_compiled(mod, sh, pc, nested)
 			while sh.funcstack and #sh.funcstack > fs0 do
 				sh:leaveFunc()
 			end
-			sh.calldepth = cd0
+			sh.calldepth, sh.noerr = cd0, ne0 -- (a condition's noerr it unwound out of, too)
 			if nested and err.__curse_discard then
 				error(err, 0)
 			end

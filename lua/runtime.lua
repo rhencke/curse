@@ -755,6 +755,7 @@ function M.array_ro_abort(sh, name)
 	local b = sh.vars[sh:deref(name)]
 	if b and b.ro then
 		sh:errmsg("curse: " .. name .. ": readonly variable\n")
+		M.report_exit(sh) -- (err_readonly: report_error)
 		sh.status = 1
 		error({ __curse_exit = 1, __curse_lineabort = true })
 	end
@@ -2047,6 +2048,7 @@ function M.prefix_ro(sh, names)
 		local b = sh.vars[dn]
 		if b and b.ro then
 			io.stderr:write("curse: " .. dn .. ": readonly variable\n")
+			M.report_exit(sh) -- (err_readonly: report_error)
 			said = said or {}
 			said[name] = true
 		end
@@ -4235,6 +4237,7 @@ function M.for_var_ro(sh, name)
 	end
 	if b and b.ro then
 		io.stderr:write("curse: " .. name .. ": readonly variable\n")
+		M.report_exit(sh) -- (err_readonly: report_error)
 		sh.status = 1
 		return true
 	end
@@ -4277,6 +4280,7 @@ function M.coproc_setvars(sh, name, r, w, pid)
 	local b = sh.vars[dn]
 	if b and b.ro then
 		io.stderr:write("curse: " .. dn .. ": readonly variable\n")
+		M.report_exit(sh) -- (err_readonly: report_error)
 		return
 	end
 	sh:array_assign(name, { tostring(r), tostring(w) }, false)
@@ -4285,6 +4289,7 @@ function M.coproc_setvars(sh, name, r, w, pid)
 	local pb = sh.vars[pdn]
 	if pb and pb.ro then
 		io.stderr:write("curse: " .. pdn .. ": readonly variable\n")
+		M.report_exit(sh) -- (err_readonly: report_error)
 	else
 		sh:set_str(pn, tostring(pid))
 	end
@@ -7970,6 +7975,7 @@ function M.ro_refuse(sh, name)
 	local b = sh.vars[dn]
 	if b and b.ro then
 		io.stderr:write("curse: " .. dn .. ": readonly variable\n")
+		M.report_exit(sh) -- (err_readonly: report_error)
 		return true
 	end
 	return false
@@ -7998,8 +8004,16 @@ function M.assign_ref(sh, cmd, ref, value)
 		return false
 	end
 	if sub then
-		local key = (sh.shopt.assoc_expand_once and sh:is_assoc(name)) and sub
+		local assoc = sh:is_assoc(name)
+		local key = not assoc and (sub == "@" or sub == "*") and ""
+			or (sh.shopt.assoc_expand_once and assoc) and sub
 			or require("interp")._int.array_key(sh, name, sub)
+		if key == "" and not assoc or M.neg_oob(sh, name, key) then -- (bind_array_variable's
+			io.stderr:write("curse: " .. ref .. ": bad array subscript\n") -- err_badarraysub:
+			M.report_exit(sh) -- nothing is bound, status 1)
+			sh.status = 1
+			return false
+		end
 		sh:array_set(name, key, value, false)
 		return true
 	end
@@ -8361,6 +8375,7 @@ function Shell:aset(name, n, acmd)
 	if b.ro then -- an arithmetic write to a readonly var is an arith error (bash): `((x=5))`/let
 		-- fail with status 1, a `$((x++))` expansion discards the rest of the line
 		io.stderr:write("curse: " .. dn .. ": readonly variable\n")
+		M.report_exit(self) -- (err_readonly: report_error)
 		error({ __curse_exit = 1, __curse_matherr = true, __curse_lineabort = true })
 	end
 	if b.ref then -- a number is never a nameref target (`declare -n r; ((r=0))`): bash's
@@ -8543,6 +8558,26 @@ function M.neg_oob(sh, name, key)
 	local mx = (b and b.arr) and arr_max(b.arr) or ((b and (b.s or b.n)) and i64(0) or i64(-1))
 	return mx + 1 + key_i64(key) < 0
 end
+-- bash's report_error (error.c), the diagnostic most expansion errors use (a bad array
+-- subscript, `no match`, a bad substitution): under `set -e` it exits the shell AT ONCE
+-- with $? (1 if that's 0) — even in an errexit-exempt `if`/`&&`/`!` context, since it
+-- tests exit_immediately_on_error, not the command's status. Only an eval/source/`command`
+-- run in such a context clears that flag (execute_builtin: sh.ign_ee); a $(…) body has
+-- errexit off already. (An arithmetic error is not one: evalerror + DISCARD, no exit.)
+function M.report_exit(sh)
+	if sh.opt_e and not sh.ign_ee then
+		error({ __curse_exit = sh.status ~= 0 and sh.status or 1 })
+	end
+end
+-- Does a caught line-abort ERR exit the shell under `set -e`? Only one standing for a
+-- report_error'd expansion error (failglob's `no match`, a bad substitution …) — not a
+-- DISCARD: an arithmetic error (expand_wdesc_error), bash's contained top_level_cleanup
+-- (__curse_discard), an assignment's DISCARD whose message isn't a report_error (a
+-- nameref's bad target: __curse_noee), or anything inside an errexit-exempt eval/source.
+function M.lineabort_exits(sh, err)
+	return sh.opt_e and not sh.ign_ee and not err.__curse_discard and not err.__curse_matherr
+		and not err.__curse_noee
+end
 -- ${a[-N]} past the start: bash warns (`a: bad array subscript`) and expands to nothing
 -- (an empty associative key too: bash's get_array_value, `${E['']}`)
 function M.elem_read_check(sh, name, key)
@@ -8550,9 +8585,11 @@ function M.elem_read_check(sh, name, key)
 		local b = sh.vars[sh:deref(name)]
 		if b and b.assoc then
 			io.stderr:write("curse: " .. name .. ": bad array subscript\n")
+			M.report_exit(sh)
 		end
 	elseif M.neg_oob(sh, name, key) then
 		io.stderr:write("curse: " .. name .. ": bad array subscript\n")
+		M.report_exit(sh)
 	end
 end
 -- Does NAME hold a value (bash's !invisible_p: not `declare x` / `declare -A h` unassigned)?
@@ -8570,6 +8607,7 @@ function M.len_badsub(sh, name, sub, key)
 	local b = sh.vars[sh:deref(name)]
 	if (key == "" and b.assoc) or M.neg_oob(sh, name, key) then
 		io.stderr:write("curse: " .. sub .. "]: bad array subscript\n")
+		M.report_exit(sh) -- (err_badarraysub: report_error)
 		error({ __curse_exit = 1, __curse_lineabort = true })
 	end
 end
@@ -11335,6 +11373,7 @@ function M.assoc_kvpairs(sh, name, items)
 		if key == "" then
 			io.stderr:write("curse: " .. ((sh.arrayargs_pending or it.decl) and "''" or M.compound_word_src(sh, it))
 				.. ": bad array subscript\n")
+				M.report_exit(sh) -- (err_badarraysub: report_error)
 		else
 			sh:array_set(name, key, v and (v.key and ("[" .. v.key .. "]" .. v.op .. v.val) or v.val) or "", false)
 		end
@@ -11347,6 +11386,7 @@ function M.array_convert_err(sh, name, isassoc, cmd)
 	local b = sh.vars[sh:deref(name)]
 	if b and b.ro and b.arr and (b.assoc and true or false) ~= (isassoc and true or false) then
 		io.stderr:write("curse: " .. name .. ": readonly variable\n") -- (reported before conversion)
+		M.report_exit(sh) -- (err_readonly: report_error)
 		sh.status = 1
 		return true
 	end
@@ -11386,6 +11426,7 @@ function M.arrayassign_stmt(sh, name, items, append)
 	local rb = sh.vars[sh:deref(name)]
 	if rb and rb.ro then -- (as interp's: a readonly array's `ra=(…)` abandons the line —
 		io.stderr:write("curse: " .. name .. ": readonly variable\n") -- fatal under -c/posix)
+		M.report_exit(sh) -- (err_readonly: report_error)
 		sh.status = 1
 		error({ __curse_exit = 1, __curse_lineabort = not (sh.opt_c or sh.opt_posix) or nil })
 	end
@@ -11424,6 +11465,7 @@ arrayassign_body = function(sh, name, items, append)
 	local rb = sh.vars[name]
 	if rb and rb.ro then
 		io.stderr:write("curse: " .. name .. ": readonly variable\n")
+		M.report_exit(sh) -- (err_readonly: report_error)
 		sh.status = 1
 		return
 	end
@@ -11476,6 +11518,7 @@ arrayassign_body = function(sh, name, items, append)
 					local idx = keyof(it.key)
 					if idx == "" then -- (an empty key: reported and skipped, like interp's)
 						io.stderr:write("curse: " .. M.empty_key_src(sh, it) .. ": bad array subscript\n")
+						M.report_exit(sh) -- (err_badarraysub: report_error)
 					elseif it.op == "+=" and not append then
 						sh:array_set(name, idx, (snap and snap[idx] or "") .. it.val, false)
 					else
@@ -11494,6 +11537,7 @@ arrayassign_body = function(sh, name, items, append)
 				local src = "[" .. it.key .. "]" .. (it.op or "=") .. it.val
 				if it.key:match("^%s*$") then
 					io.stderr:write("curse: " .. src .. ": bad array subscript\n")
+					M.report_exit(sh) -- (err_badarraysub: report_error)
 				elseif it.key == "*" or it.key == "@" then
 					io.stderr:write("curse: " .. src .. ": cannot assign to non-numeric index\n")
 				else
@@ -11502,6 +11546,7 @@ arrayassign_body = function(sh, name, items, append)
 						auto = M.key_next(k) -- (indexed += appends to CURRENT)
 					else
 						io.stderr:write("curse: " .. src .. ": bad array subscript\n")
+						M.report_exit(sh) -- (err_badarraysub: report_error)
 					end
 				end
 			else
@@ -11529,6 +11574,7 @@ end
 local function neg_oob_abort(sh, name, key, sub)
 	if M.neg_oob(sh, name, key) then
 		io.stderr:write("curse: " .. name .. "[" .. sub .. "]: bad array subscript\n")
+		M.report_exit(sh) -- (err_badarraysub: report_error)
 		sh.status = 1
 		error({ __curse_exit = 1, __curse_lineabort = true })
 	end
@@ -11540,6 +11586,7 @@ function M.assign_element(sh, name, raw, expanded, value, append)
 	end
 	if rb and rb.ro then
 		io.stderr:write("curse: " .. name .. ": readonly variable\n")
+		M.report_exit(sh) -- (err_readonly: report_error)
 		sh.status = 1
 		if sh.opt_c or sh.opt_posix then
 			error({ __curse_exit = 1 })
@@ -11557,6 +11604,7 @@ function M.assign_element(sh, name, raw, expanded, value, append)
 		key = expanded
 		if key == "" then -- (an associative array has no "" key)
 			io.stderr:write("curse: " .. name .. "[" .. raw .. "]: bad array subscript\n")
+			M.report_exit(sh) -- (err_badarraysub: report_error)
 			sh.status = 1
 			error({ __curse_exit = 1, __curse_lineabort = true })
 		end
@@ -11564,6 +11612,7 @@ function M.assign_element(sh, name, raw, expanded, value, append)
 		key = 0
 	elseif raw == "@" or raw == "*" then -- (`ia[@]=x`: interp's array_key says so too)
 		io.stderr:write("curse: " .. name .. "[" .. raw .. "]: bad array subscript\n")
+		M.report_exit(sh) -- (err_badarraysub: report_error)
 		error({ __curse_exit = 1, __curse_lineabort = true })
 	else
 		local ok, v = pcall(function()
@@ -11599,6 +11648,7 @@ local function elem_readonly_abort(sh, name)
 		return false
 	end
 	io.stderr:write("curse: " .. name .. ": readonly variable\n")
+	M.report_exit(sh) -- (err_readonly: report_error)
 	sh.status = 1
 	if sh.opt_c or sh.opt_posix then
 		error({ __curse_exit = 1 })
@@ -11777,6 +11827,7 @@ function M.append_scalar(sh, name, value)
 	local b = sh.vars[sh:deref(name)]
 	if b and b.ro then
 		io.stderr:write("curse: " .. name .. ": readonly variable\n")
+		M.report_exit(sh) -- (err_readonly: report_error)
 		sh.status = 1
 		if sh.opt_c or sh.opt_posix then
 			error({ __curse_exit = 1 })
@@ -11790,8 +11841,10 @@ function M.append_scalar(sh, name, value)
 	elseif b and (b.lower or b.upper) then -- declare -l/-u: case-fold the appended result
 		local v = sh:get(name) .. value
 		sh:set_str(name, b.lower and v:lower() or v:upper())
-	elseif not (b and append_lazy(sh, sh:deref(name), b, value)) then
-		sh:set_str(name, sh:get(name) .. value)
+	elseif not (b and not b.ref and append_lazy(sh, sh:deref(name), b, value)) then
+		if sh:set_str(name, sh:get(name) .. value) == false then -- (a valueless nameref given
+			error({ __curse_exit = 1, __curse_lineabort = true, __curse_noee = true }) -- a bad target)
+		end
 	end
 end
 
@@ -11833,7 +11886,9 @@ function M.arith_badraw(sh, name, raw, how)
 	if raw == "" then
 		if how ~= "w" then
 			io.stderr:write("curse: " .. name .. "[]: bad array subscript\n")
+			M.report_exit(sh) -- (err_badarraysub: report_error)
 			io.stderr:write("curse: " .. name .. "[]: bad array subscript\n")
+			M.report_exit(sh) -- (err_badarraysub: report_error)
 		end
 		if how ~= "r" then
 			local cmd = require("parser").arith_cmd or (sh.in_arithcmd and "((") -- (compiled `(( ))`)
@@ -11845,6 +11900,7 @@ function M.arith_badraw(sh, name, raw, how)
 	if (raw == "@" or raw == "*") and not sh:is_assoc(name) then
 		for _ = 1, how == "rw" and 2 or 1 do
 			io.stderr:write("curse: " .. name .. "[" .. raw .. "]: bad array subscript\n")
+			M.report_exit(sh) -- (err_badarraysub: report_error)
 		end
 		return true
 	end
@@ -11862,9 +11918,11 @@ function M.arith_badkey(sh, name, key, how)
 	local wbad = M.neg_oob(sh, name, key)
 	if how ~= "w" and rbad then
 		io.stderr:write("curse: " .. name .. ": bad array subscript\n")
+		M.report_exit(sh) -- (err_badarraysub: report_error)
 	end
 	if how ~= "r" and wbad then
 		io.stderr:write("curse: " .. name .. "[" .. tostring(key) .. "]: bad array subscript\n")
+		M.report_exit(sh) -- (err_badarraysub: report_error)
 	end
 	if how == "r" then
 		return rbad
@@ -11887,7 +11945,7 @@ function M.arith_read_elem(sh, name, raw, expanded)
 		return v
 	end
 	if type(v) == "table" and (v.__curse_experr or v.__curse_matherr) and not v.__curse_lineabort then
-		error({ __curse_exit = v.__curse_exit or 1, __curse_lineabort = true })
+		error({ __curse_exit = v.__curse_exit or 1, __curse_lineabort = true, __curse_noee = v.__curse_matherr })
 	end
 	error(v)
 end
@@ -12379,7 +12437,7 @@ local function substr_check(val, off, len, ltxt)
 	end
 	if n + l < o then
 		io.stderr:write("curse: " .. (ltxt or len) .. ": substring expression < 0\n")
-		error({ __curse_exit = 1, __curse_lineabort = true })
+		error({ __curse_exit = 1, __curse_lineabort = true, __curse_noee = true }) -- (DISCARD)
 	end
 end
 function Shell:apply_str_op(op, val, arg, arg2, ltxt)
@@ -12939,6 +12997,7 @@ function M.run_prefix(sh, names, vals, runfn, argv)
 		if ob and ob.ro then -- (a readonly prefix: reported, not bound — the command still runs)
 			if not (M.ro_said and M.ro_said[name]) then
 				io.stderr:write("curse: " .. sh:deref(name) .. ": readonly variable\n")
+				M.report_exit(sh) -- (err_readonly: report_error)
 			end
 			if sh.opt_c or sh.opt_posix then
 				sh.status = 1
@@ -13038,6 +13097,15 @@ function M.warn_stmt(sh, st)
 end
 -- A RECOVERABLE parse error (an invalid `NAME=( … )` array-literal element) is reported
 -- but NON-fatal: the assignment is dropped and the script continues (bash).
+-- bash's parser_error (error.c): under `set -e` (exit_immediately_on_error: see
+-- M.report_exit) each syntax-error line exits the shell, status 2 — so only the FIRST
+-- line of a report is printed (not report_syntax_error's offending-line echo).
+function M.parser_error_exit(sh)
+	if sh.opt_e and not sh.ign_ee then
+		sh.in_perr = nil
+		error({ __curse_exit = 2, __curse_perrexit = true })
+	end
+end
 function M.report_recoverable(sh, perr)
 	if perr.line then
 		sh.cur_line = perr.line
@@ -13048,6 +13116,7 @@ function M.report_recoverable(sh, perr)
 	end
 	sh.in_perr = true -- (named like the shell's other syntax errors: `NAME: eval: line N:`)
 	io.stderr:write("curse: " .. msg .. "\n")
+	M.parser_error_exit(sh)
 	if perr.text then
 		io.stderr:write("curse: `" .. perr.text .. "'\n")
 	end
@@ -13081,10 +13150,10 @@ function M.parse_error_stmt(sh, st, label)
 		or (st.discard and (sh.subdepth or 0) + M.fork_depth > 0)) then
 		local pl = sh.perr_label
 		sh.perr_label = label or pl
-		pcall(M.parse_error_stmt, sh, { line = st.line, msg = st.msg, exact = st.exact, text = st.text,
-			showtext = st.showtext, pre = st.pre, warns = st.warns, exactmsg = st.exactmsg })
+		local _, pe = pcall(M.parse_error_stmt, sh, { line = st.line, msg = st.msg, exact = st.exact, text = st.text,
+			showtext = st.showtext, pre = st.pre, preline = st.preline, warns = st.warns, exactmsg = st.exactmsg })
 		sh.perr_label = pl
-		error({ __curse_exit = 1 })
+		error(type(pe) == "table" and pe.__curse_perrexit and pe or { __curse_exit = 1 })
 	end
 	local msg = tostring(st.msg or "syntax error"):gsub("^.-:%d+: ", "")
 	if not st.exact then
@@ -13109,10 +13178,24 @@ function M.parse_error_stmt(sh, st, label)
 	sh.in_perr = true -- (a `-c` string's syntax errors name it: `bash: -c: line 1:`)
 	local pl = sh.perr_label
 	sh.perr_label = label or pl
+	local fl = sh.force_line
 	for _, m in ipairs(st.pre or {}) do -- (e.g. a [[ ]] grammar error's own message)
+		sh.force_line = st.preline or fl -- (cond_error's: the `[[`'s line — both tiers)
+		if type(m) == "table" then -- ({msg, line}: a `( … )` group's, at the `(`'s line)
+			m, sh.force_line = m[1], m[2]
+		end
 		io.stderr:write("curse: " .. m .. "\n")
+		sh.force_line = fl
+		if sh.opt_e and not sh.ign_ee then
+			sh.perr_label = pl
+			M.parser_error_exit(sh)
+		end
 	end
 	io.stderr:write("curse: " .. msg .. "\n")
+	if sh.opt_e and not sh.ign_ee then
+		sh.perr_label = pl
+		M.parser_error_exit(sh)
+	end
 	if st.text and (st.showtext or st.exact or msg:find("near unexpected token", 1, true)) then
 		io.stderr:write("curse: " .. (st.showtext and "syntax error: " or "") .. "`" .. st.text .. "'\n")
 	end
@@ -13174,10 +13257,11 @@ function M.eval_run(sh, argv)
 	local ln = current_line(sh)
 	local mod = require("tier").try_fragment(code, ln > 0 and ln or nil, sh, nil, "eval")
 	if mod then
-		local sxd = sh.xdepth -- (eval'd commands trace one level deeper: `++ cmd`, as b_eval)
-		sh.xdepth = (sxd or 0) + 1
+		local sxd, iee = sh.xdepth, sh.ign_ee -- (eval'd commands trace one level deeper: `++ cmd`,
+		sh.xdepth = (sxd or 0) + 1 -- as b_eval; errexit-exempt, -e is cleared for them: M.report_exit)
+		sh.ign_ee = iee or sh.noerr > 0
 		local ok, err = pcall(require("tier").run_compiled, mod, sh, nil, true)
-		sh.xdepth = sxd
+		sh.xdepth, sh.ign_ee = sxd, iee
 		sh.spb_err = nil -- (a builtin the code ran flagged its own: not eval's)
 		if not ok then
 			if type(err) == "table" and err.__curse_parseerr then
@@ -13340,10 +13424,11 @@ function M.source_run(sh, argv, line)
 	sh.sourcedepth = (sh.sourcedepth or 0) + 1 -- a `return` is valid while sourcing
 	local fr = M.source_enter(sh, file, line, argv, j) -- (named as found: `dir/NAME` via $PATH)
 	local dsave, e0 = M.source_debug_hide(sh), sh.traps and sh.traps.ERR
-	local sxd = sh.xdepth -- (a sourced file traces one level deeper, as b_source)
-	sh.xdepth = (sxd or 0) + 1
+	local sxd, iee = sh.xdepth, sh.ign_ee -- (a sourced file traces one level deeper, as b_source;
+	sh.xdepth = (sxd or 0) + 1 -- errexit-exempt, -e is cleared for it: M.report_exit)
+	sh.ign_ee = iee or sh.noerr > 0
 	local rok, err = pcall(require("tier").run_compiled, mod, sh, nil, true)
-	sh.xdepth = sxd
+	sh.xdepth, sh.ign_ee = sxd, iee
 	sh.spb_err = nil -- (a builtin in the file flagged its own: not the source's)
 	if not rok and type(err) == "table" and err.__curse_parseerr then
 		rok = true -- a syntax error in the file: source returns 2, doesn't halt the shell (bash)
@@ -13440,10 +13525,11 @@ function M.exec_dynamic(sh, argv, hook, hadcs, no_func)
 	elseif no_func then
 		-- the `command` prefix: run argv skipping SHELL FUNCTION lookup (builtin/external only),
 		-- a special builtin losing its fatal errors (interp's command builtin: via_command)
-		local svc = sh.via_command
+		local svc, iee = sh.via_command, sh.ign_ee
 		sh.via_command = true
+		sh.ign_ee = iee or sh.noerr > 0 -- (errexit-exempt: -e cleared for what it runs, as eval)
 		local ok, err = pcall(I.exec_simple, sh, argv, hook or _noop, no_func)
-		sh.via_command = svc
+		sh.via_command, sh.ign_ee = svc, iee
 		if not ok then
 			error(err, 0)
 		end
@@ -13555,7 +13641,7 @@ function M.arith_read_slow(sh, name, s)
 					sh.arithfault = true
 					return i64(0)
 				end
-				error({ __curse_lineabort = true })
+				error({ __curse_exit = 1, __curse_lineabort = true, __curse_noee = true }) -- (DISCARD)
 			end
 			error(v)
 		end
@@ -13749,8 +13835,8 @@ function M.substr_arith(sh, name, s)
 	local ok, v = pcall(M.arith_str, sh, s)
 	P.arith_cmd = sv
 	if not ok then
-		if type(v) == "table" and v.__curse_matherr then
-			error({ __curse_exit = 1, __curse_lineabort = true })
+		if type(v) == "table" and v.__curse_matherr then -- (an arith error: DISCARD, no errexit)
+			error({ __curse_exit = 1, __curse_lineabort = true, __curse_noee = true })
 		end
 		error(v, 0)
 	end
@@ -13790,6 +13876,7 @@ function M.var_is_set(sh, nm, expanded)
 		end
 		if M.neg_oob(sh, base, key) then -- (negative counts from the end; before the start: bash's
 			io.stderr:write("curse: " .. base .. ": bad array subscript\n") -- get_array_value error)
+			M.report_exit(sh) -- (err_badarraysub: report_error)
 			return false
 		end
 		return sh:is_elem_set(base, key)
@@ -13842,6 +13929,10 @@ function M.assign_default(sh, name, v)
 	local b = sh.vars[dn]
 	if b and b.ro and not (sh.vars[name] or b).ref then
 		M.assign_default_fail(sh, dn, "readonly variable")
+	end
+	if b and b.ref and not ref_target_ok(v) then -- (a valueless nameref: `1` can't be its
+		M.bad_ref_target(v) -- target — the expansion error's DISCARD, $? = 2, not a report_error)
+		error({ __curse_exit = 1, __curse_lineabort = true, __curse_badusage = true, __curse_noee = true })
 	end
 	-- through the var's attributes (declare -i / -u / -l): the expansion is the STORED value
 	M.assign_scalar(sh, name, v)
@@ -13938,7 +14029,7 @@ function M.array_slice_values(sh, name, els, off, len, ltxt)
 			return {}
 		end
 		io.stderr:write("curse: " .. (ltxt or len) .. ": substring expression < 0\n")
-		error({ __curse_exit = 1, __curse_lineabort = true })
+		error({ __curse_exit = 1, __curse_lineabort = true, __curse_noee = true }) -- (DISCARD)
 	end
 	if name ~= "@" and name ~= "*" then
 		-- a SCALAR through [@]/[*] slices its value as a string (`${v[@]:3}` = ${v:3})
@@ -14166,6 +14257,9 @@ end
 -- OPERAND where one is expected.
 -- a test/[ syntax error: bash's `test: a: binary operator expected` (status 2)
 local function test_error(sh, args, e)
+	if type(e) == "table" and e.__curse_exit then -- (not test's own: a report_error's exit,
+		error(e, 0) -- an operand's arith error)
+	end
 	if type(e) == "table" and e.__test_syntax then
 		io.stderr:write("curse: " .. args[1] .. ": " .. e.__test_syntax .. "\n")
 	end
@@ -14438,6 +14532,7 @@ function M.assign_scalar(sh, name, value)
 			local rb = sh.vars[nbase]
 			if rb and rb.ro then -- through a nameref: readonly is non-fatal (bash)
 				io.stderr:write("curse: " .. name .. ": readonly variable\n")
+				M.report_exit(sh) -- (err_readonly: report_error)
 				sh.status = 1
 				if sh.opt_c or sh.opt_posix then
 					error({ __curse_exit = 1 })
@@ -14453,6 +14548,7 @@ function M.assign_scalar(sh, name, value)
 	local b = sh.vars[sh:deref(name)]
 	if b and b.ro then
 		io.stderr:write("curse: " .. sh:deref(name) .. ": readonly variable\n") -- (a ref's target)
+		M.report_exit(sh) -- (err_readonly: report_error)
 		sh.status = 1
 		if direct and direct.ref then
 			return
@@ -14469,7 +14565,7 @@ function M.assign_scalar(sh, name, value)
 	elseif b and (b.lower or b.upper) then
 		sh:set_str(name, b.lower and value:lower() or value:upper())
 	elseif sh:set_str(name, value) == false then -- (a valueless nameref given a bad target)
-		error({ __curse_exit = 1, __curse_lineabort = true })
+		error({ __curse_exit = 1, __curse_lineabort = true, __curse_noee = true })
 	end
 	if sh.opt_a then -- set -a (allexport): a plain scalar assignment auto-exports (bash)
 		local nb = sh.vars[sh:deref(name)]
@@ -14807,6 +14903,7 @@ do
 		if b and b.ro then -- (a readonly prefix: reported, non-fatal — the command still runs)
 			if not (M.ro_said and M.ro_said[name]) then
 				io.stderr:write("curse: " .. sh:deref(name) .. ": readonly variable\n")
+				M.report_exit(sh) -- (err_readonly: report_error)
 			end
 			sh.status = 1
 			if sh.opt_c or sh.opt_posix then
@@ -14930,6 +15027,7 @@ do
 			local b = sh.vars[sh:deref(aa.name)]
 			if b and b.ro and not localize then
 				io.stderr:write("curse: " .. aa.name .. ": readonly variable\n")
+				M.report_exit(sh) -- (err_readonly: report_error)
 				sh.status = 1
 				error({ __curse_exit = 1, __curse_lineabort = true })
 			elseif b and b.ro and sh:is_global_ro(sh:deref(aa.name)) then
@@ -15311,7 +15409,7 @@ function M.assign_body_full(sh, st, nref_base, nref_sub)
 			local v = rhs_a()
 			sh:set_str(st.name, b.lower and v:lower() or v:upper())
 		elseif sh:set_str(st.name, rhs_a()) == false then
-			error({ __curse_exit = 1, __curse_lineabort = true }) -- (a bad nameref target)
+			error({ __curse_exit = 1, __curse_lineabort = true, __curse_noee = true }) -- (a bad nameref target)
 		end
 	end
 end
@@ -15319,6 +15417,7 @@ function M.assign_full(sh, st)
 	local ncs0 = sh.ncs
 	if st.name == "SHELLOPTS" or st.name == "BASHOPTS" then -- readonly specials (bash)
 		io.stderr:write("curse: " .. st.name .. ": readonly variable\n")
+		M.report_exit(sh) -- (err_readonly: report_error)
 		sh.status = 1
 		if sh.opt_c or sh.opt_posix then
 			error({ __curse_exit = 1 })
@@ -15327,6 +15426,7 @@ function M.assign_full(sh, st)
 	end
 	if st.index == "" then -- `a[]=v`: a bad array subscript (status 1, no assignment, the
 		io.stderr:write("curse: " .. st.name .. "[]: bad array subscript\n") -- line abandoned)
+		M.report_exit(sh) -- (err_badarraysub: report_error)
 		sh.status = 1
 		error({ __curse_exit = 1, __curse_lineabort = true })
 	end
@@ -15377,12 +15477,14 @@ function M.assign_full(sh, st)
 		local k = require("interp")._int.array_key(sh, st.name, st.index)
 		if M.neg_oob(sh, st.name, k) then
 			io.stderr:write("curse: " .. st.name .. "[" .. st.index .. "]: bad array subscript\n")
+			M.report_exit(sh) -- (err_badarraysub: report_error)
 			sh.status = 1
 			error({ __curse_exit = 1, __curse_lineabort = true })
 		end
 	end
 	if rb and rb.ro then -- readonly: rejected; aborts the rest of the line (fatal: -c/posix)
 		io.stderr:write("curse: " .. sh:deref(st.name) .. ": readonly variable\n")
+		M.report_exit(sh) -- (err_readonly: report_error)
 		sh.status = 1
 		if sh.opt_c or sh.opt_posix then
 			error({ __curse_exit = 1 })
@@ -15394,6 +15496,7 @@ function M.assign_full(sh, st)
 	if not aok then
 		if type(aerr) == "table" and aerr.__curse_badsub then
 			io.stderr:write("curse: " .. st.name .. "[" .. tostring(st.index) .. "]: bad array subscript\n")
+			M.report_exit(sh) -- (err_badarraysub: report_error)
 			sh.status = 1
 			sh.assign_err = true
 			error({ __curse_exit = 1, __curse_lineabort = true })
@@ -15503,7 +15606,7 @@ function M.select_next(sh, list, name)
 			sh:set_str("REPLY", line)
 			local nsel = line:match("^%s*(%d+)%s*$")
 			nsel = nsel and tonumber(nsel)
-			if sh:set_str(name, (nsel and list[nsel]) or "") == false then
+			if M.for_var_ro(sh, name) or sh:set_str(name, (nsel and list[nsel]) or "") == false then
 				sh.status = 1
 				return false
 			end
