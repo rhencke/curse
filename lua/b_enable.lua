@@ -43,7 +43,7 @@ return function(sh, cmd, args)
 				end
 				break
 			else
-				return rt.bad_option(sh, "enable", "-" .. f)
+				return rt.bad_option(sh, "enable", "-" .. f, a)
 			end
 		end
 	end

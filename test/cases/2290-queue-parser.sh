@@ -2,6 +2,8 @@
 # in backticks, ASSIGNMENT_WORD function names, extglob in command substitution bodies,
 # assignment line numbers, and builtin-named nameref errors.
 S=${THIS_SH:-bash}
+# (English diagnostics whatever locale runs this: the filters match bash's C texts)
+if [ -n "${LC_ALL-}" ]; then export LANG=$LC_ALL; unset LC_ALL; fi; export LC_MESSAGES=C
 e() { sed 's/^.*line [0-9]*: //'; }
 g() { echo "## $1"; (eval "$1") 2>&1 | e; echo "st=${PIPESTATUS[0]}"; }
 t=${TMPDIR:-/tmp}/c2290.$$; mkdir -p "$t"

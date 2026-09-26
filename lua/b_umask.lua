@@ -28,6 +28,8 @@ return function(sh, cmd, args, hook, tcb)
 			j = j + 1
 			if a == "--" then
 				break
+			elseif a == "--help" and not badflag then -- (GETOPT_HELP: the builtin's help)
+				return rt.builtin_help(sh, "umask")
 			end
 			for k = 2, #a do -- (combined flags; the first bad letter is reported)
 				local f = a:sub(k, k)

@@ -54,7 +54,7 @@ return function(sh, cmd, args, hook, tcb)
 			end
 			local bad = a:match("[^LP]", 2)
 			if bad then
-				return rt.bad_option(sh, "pwd", "-" .. bad)
+				return rt.bad_option(sh, "pwd", "-" .. bad, a)
 			end
 			for f in a:gmatch("[LP]") do
 				phys = f == "P"

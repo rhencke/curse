@@ -48,6 +48,8 @@ return function(sh, cmd, args, hook, tcb)
 			j0 = j0 + 1
 			if w == "--" then
 				break
+			elseif w == "--help" then -- (GETOPT_HELP: the builtin's help, status 2)
+				return rt.builtin_help(sh, "type")
 			end
 			for k = 2, #w do
 				local f = w:sub(k, k)

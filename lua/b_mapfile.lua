@@ -41,6 +41,8 @@ return function(sh, cmd, args, hook, tcb)
 			if a == "--" then
 				j = j + 1
 				break
+			elseif a == "--help" then -- (GETOPT_HELP: the builtin's help, status 2)
+				return rt.builtin_help(sh, cmd)
 			end
 			if a:sub(1, 1) ~= "-" or #a < 2 then
 				break

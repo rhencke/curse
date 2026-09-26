@@ -146,7 +146,7 @@ return function(sh, cmd, args, hook)
 				end
 				break
 			else
-				return rt.bad_option(sh, "fc", "-" .. f)
+				return rt.bad_option(sh, "fc", "-" .. f, a)
 			end
 		end
 	end

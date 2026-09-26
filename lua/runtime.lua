@@ -321,8 +321,10 @@ do
 		local sh = M.cur_shell
 		if sh and type(a) == "string" and a:sub(1, 7) == "curse: " then
 			local c, ok, r = M.lc_state[5], false, nil
+			local ie = M.ierr -- (M.ierr: bash reports this one through internal_error)
+			M.ierr = nil
 			if c ~= "C" and c ~= "POSIX" then -- (a message locale: bash's translations)
-				ok, r = pcall(require("l10n").diag, sh, a)
+				ok, r = pcall(require("l10n").diag, sh, a, ie)
 			end
 			if ok and r then
 				a = r
@@ -357,6 +359,7 @@ function Shell.new()
 		seeded = true
 	end
 	M.glob_asciirange = true -- (shopt globasciiranges' default; a daemon worker reuses the module)
+	M.td_binds = nil -- (the process's bindtextdomain()s: M.bind_textdomain)
 	local sh = setmetatable({
 		vars = {}, -- name -> { s = string?, n = int64? }  (lazy: fill on demand)
 		status = 0, -- $?
@@ -1310,6 +1313,9 @@ do
 		ffi.errno(0)
 		if C.setlocale(cat, v) == nil then
 			return false
+		end
+		if cat >= 5 then -- (libc's own texts — strerror, strsignal — stay English: l10n.lua
+			C.setlocale(5, "C") -- translates them as bash's glibc would, $LANGUAGE and all)
 		end
 		if not lc_ns then
 			lc_ns = {}
@@ -2876,6 +2882,25 @@ function Shell:capture_src(src, backtick, noalias, line0)
 	local has_perr = false
 	for _, st in ipairs(ast.stmts) do
 		if st.t == "parse_error" then
+			if backtick and not has_perr and src:find("^[ \t\n]*<") and not src:find("^[ \t\n]*<[<>&]") then
+				-- a `< …` body is parsed first in the shell itself (command_substitute's
+				-- $(< file) check, parse_string_to_command): its syntax error is reported one
+				-- line on (no parse_and_execute line_number - 1) and DISCARDs the command
+				-- (under set -e, parser_error itself ends the shell, status 2, before the
+				-- offending line is shown)
+				local ee = self.opt_e -- (exit_immediately_on_error: set in a condition too)
+				local e = setmetatable({ line = st.line and st.line + 1, text = not ee and st.text }, { __index = st })
+				local fl = self.force_line -- (the line, whichever tier is running)
+				self.force_line = e.line
+				pcall(M.parse_error_stmt, self, e, "command substitution")
+				self.force_line = fl
+				if ee then
+					self.status = 2
+					error({ __curse_exit = 2 }, 0)
+				end
+				self.status = 1 -- (parse_string: no top_level_cleanup inside an eval/source — it
+				error({ __curse_exit = 1, __curse_lineabort = true }, 0) -- contains the DISCARD)
+			end
 			has_perr = true
 			if backtick then -- (read at expansion time: `NAME: command substitution: line N:`)
 				st.plabel = "command substitution"
@@ -2931,6 +2956,7 @@ end
 -- pipe) means no self-deadlock when the body out-writes the pipe buffer in one process.
 local deferred_sigs, cap_depth, cap_pid, flush_deferred, cap_enter -- (the signal hold: see M.defer_signal)
 function Shell:capture_inproc(backtick, runner, capfd, ctx)
+	M.env_rebuilt(self) -- (command_substitute's maybe_make_export_env)
 	if self.jobs_waited then -- (bash's cleanup_dead_jobs, on a fork: the notified dead jobs go)
 		M.jobs_cleanup_waited(self)
 	end
@@ -3165,7 +3191,8 @@ local function sub_checkpoint(self)
 		orig_vars = orig_vars, copy = copy, exset = exset,
 		params = self.params, nparams = self.nparams,
 		shopt = self.shopt, functions = self.functions,
-		locale_gen = M.locale_gen, lc_state = M.lc_state, dirstack = self.dirstack, hashcache = self.hashcache, hashpath = self.hashpath, getopts = self.getopts_state,
+		locale_gen = M.locale_gen, lc_state = M.lc_state, lcsnap = M.lc_envsnap,
+		l10nk = package.loaded.l10n and package.loaded.l10n.known_save(), dirstack = self.dirstack, hashcache = self.hashcache, hashpath = self.hashpath, getopts = self.getopts_state,
 		cwd = self:phys_cwd(), tcwd = self.tcwd, um = C.umask(0), disabled = self.disabled_builtins,
 		fn_ro = self.fn_ro, unset_specials = self.unset_specials, random_plain = self.random_plain,
 		shellopts_exported = self.shellopts_exported, bav = self.bav, argv0 = self.argv0,
@@ -3240,6 +3267,10 @@ local function sub_restore(self, cp)
 	self.vars = cp.orig_vars
 	if cp.locale_gen ~= M.locale_gen then -- (`(LANG=C; …)`: setlocale is process-wide)
 		M.locale_restore(cp.lc_state)
+	end
+	M.lc_envsnap = cp.lcsnap -- (the environ and gettext's memory are the parent's own)
+	if cp.l10nk then
+		package.loaded.l10n.known_restore(cp.l10nk)
 	end
 	self.params, self.nparams = cp.params, cp.nparams
 	self.shopt, self.functions = cp.shopt, cp.functions
@@ -4068,6 +4099,7 @@ function M.foreign_jobs(sh)
 	return f
 end
 function Shell:capture_compiled_iso(cs_fn, backtick)
+	M.env_rebuilt(self) -- (command_substitute's maybe_make_export_env)
 	local sv_foreign = self.foreign_pids
 	self.foreign_pids = M.foreign_jobs(self)
 	local cp = sub_checkpoint(self)
@@ -4637,6 +4669,7 @@ function M.job_mark_pipe(job)
 end
 function Shell:run_background(cmd_fn, cmdstr, exec_tail, flat, simple, pipe)
 	-- (in-process: a background task — see Shell:bg_launch)
+	M.env_rebuilt(self) -- (execute_simple_command's, before the fork)
 	local job = self:bg_launch(cmd_fn, cmdstr, flat, simple)
 	if pipe and job and job.g then
 		M.job_mark_pipe(job)
@@ -5817,6 +5850,7 @@ local run_pipeline_body
 -- it with noerr raised, restored on unwind. (With errexit OFF bash doesn't: a `set -e`
 -- inside a called function then takes effect.)
 function Shell:run_pipeline(stage_fns, negate, inproc, upv_get, upv_set, texts)
+	M.env_rebuilt(self) -- (execute_simple_command's, before a stage's fork)
 	if self.jobs_waited then -- (bash's cleanup_dead_jobs, on a fork: the notified dead jobs go)
 		M.jobs_cleanup_waited(self)
 	end
@@ -6166,6 +6200,7 @@ end
 -- `for NAME` with an invalid NAME: reported, status 1, no iterations — fatal (status 2) to
 -- a non-interactive posix shell (execute_for_command)
 function M.for_badname(sh, name)
+	M.ierr = true -- (check_identifier's internal_error)
 	io.stderr:write("curse: `" .. name .. "': not a valid identifier\n")
 	sh.status = 1
 	if sh.opt_posix and not sh.opt_i then
@@ -7851,6 +7886,19 @@ function M.usage(cmd)
 	end
 	return ""
 end
+-- The builtins whose first argument `--help` is their help (bash's internal_getopt's
+-- GETOPT_HELP -> CASE_HELPOPT, no_options, CHECK_HELPOPT, declare's own check) — the
+-- dispatchers check this only when that argument is exactly `--help`. Not echo, test/[,
+-- :/true/false (an ordinary argument there), nor bind (usage only: b_bind).
+M.HELPOPT = {
+	["."] = 1, alias = 1, bg = 1, ["break"] = 1, builtin = 1, caller = 1, cd = 1, command = 1,
+	compgen = 1, complete = 1, compopt = 1, ["continue"] = 1, declare = 1, dirs = 1, disown = 1,
+	enable = 1, eval = 1, exec = 1, exit = 1, export = 1, fc = 1, fg = 1, getopts = 1, hash = 1,
+	help = 1, history = 1, jobs = 1, kill = 1, let = 1, ["local"] = 1, logout = 1, mapfile = 1,
+	popd = 1, printf = 1, pushd = 1, pwd = 1, read = 1, readarray = 1, readonly = 1,
+	["return"] = 1, set = 1, shift = 1, shopt = 1, source = 1, suspend = 1, times = 1, trap = 1,
+	type = 1, typeset = 1, ulimit = 1, umask = 1, unalias = 1, unset = 1, wait = 1,
+}
 -- bash's builtin_help (`CMD --help`): help's synopsis and long text, status 2 (EX_USAGE).
 function M.builtin_help(sh, cmd)
 	for _, t in ipairs(require("helpdata")) do
@@ -7893,7 +7941,17 @@ function M.too_many(sh, cmd)
 	error({ __curse_exit = 1, __curse_lineabort = not sh.opt_c or nil })
 end
 -- bash's internal_getopt rejection: `CMD: -X: invalid option` + the usage line, status 2.
-function M.bad_option(sh, cmd, opt)
+-- (word: the option word — a `--help` there is internal_getopt's GETOPT_HELP: the builtin's
+-- help, CASE_HELPOPT; bind's `default:` shares its case, so there only the usage line)
+function M.bad_option(sh, cmd, opt, word)
+	if word == "--help" then
+		if cmd ~= "bind" then
+			return M.builtin_help(sh, cmd)
+		end
+		io.stderr:write(M.usage(cmd))
+		sh.status = 2
+		return
+	end
 	io.stderr:write("curse: " .. cmd .. ": " .. opt .. ": invalid option\n" .. M.usage(cmd))
 	sh.status = 2
 	sh.spb_err = 2 -- (EX_USAGE: fatal from a special builtin in posix mode — M.spb_run)
@@ -8153,6 +8211,8 @@ function Shell:set_str(name, s)
 		M.reset_locale(self, dn)
 	elseif dn == "GLOBIGNORE" then
 		M.setup_glob_ignore(self)
+	elseif dn == "TEXTDOMAIN" or dn == "TEXTDOMAINDIR" then
+		M.bind_textdomain(self)
 	end -- track the locale live, like bash
 end
 -- bash's setup_glob_ignore (sv_globignore): a GLOBIGNORE with patterns turns dotglob ON,
@@ -8922,9 +8982,41 @@ function M.shlvl_start(sh, d) -- (d: an exec'd command's -1 first)
 	end
 	C.setenv("SHLVL", tostring(n), 1)
 end
--- (the process environment's locale variables, as bash's environ now holds them)
+-- (the process environment's locale variables, as bash's environ now holds them — and
+-- $LANGUAGE, which glibc's gettext reads from there: l10n.lua)
 local LC_ENVNAMES = { LC_ALL = 1, LANG = 1, LC_CTYPE = 1, LC_NUMERIC = 1, LC_TIME = 1, LC_COLLATE = 1,
-	LC_MONETARY = 1, LC_MESSAGES = 1 }
+	LC_MONETARY = 1, LC_MESSAGES = 1, LANGUAGE = 1 }
+-- bash's maybe_make_export_env in the shell itself — a $(…), a pipeline, an async command
+-- (an external's spawn: M.child_env): its environ, where gettext finds $LANGUAGE, is the
+-- export env as of now. (A new snapshot table: an in-process subshell restores its parent's.)
+function M.env_rebuilt(sh)
+	local e = M.lc_envsnap
+	if e and (e.LANGUAGE or sh.vars.LANGUAGE) then
+		local v = os.getenv("LANGUAGE")
+		if v ~= e.LANGUAGE then
+			local n = {}
+			for k, x in pairs(e) do
+				n[k] = x
+			end
+			n.LANGUAGE = v
+			M.lc_envsnap = n
+		end
+	end
+end
+-- bash's set_locale_var for TEXTDOMAIN / TEXTDOMAINDIR: bindtextdomain(domain, dir) once
+-- both are set — binding the domain anew or elsewhere bumps glibc's _nl_msg_cat_cntr, which
+-- forgets every remembered translation (l10n.lua's glibc cache)
+function M.bind_textdomain(sh)
+	local d, dir = sh:get("TEXTDOMAIN"), sh:get("TEXTDOMAINDIR")
+	if d ~= "" and dir ~= "" then
+		local b = M.td_binds or { bash = "/usr/share/locale" } -- (bash's own, from main)
+		M.td_binds = b
+		if b[d] ~= dir then
+			b[d] = dir
+			M.tdgen = (M.tdgen or 0) + 1
+		end
+	end
+end
 function M.lc_env_rebuild()
 	local e = {}
 	for n in pairs(LC_ENVNAMES) do
@@ -12800,6 +12892,9 @@ function M.builtin_run(sh, argv, hook)
 	if sh.functions[cmd] then
 		return require("interp").exec_simple(sh, argv, hook or _noop)
 	end
+	if argv[2] == "--help" and M.HELPOPT[cmd] then -- (CASE_HELPOPT)
+		return M.builtin_help(sh, cmd)
+	end
 	local prep = M.ISO_BUILTIN[cmd]
 	if prep then
 		prep(sh)
@@ -12914,6 +13009,7 @@ function M.run_prefix(sh, names, vals, runfn, argv)
 			end
 		end
 	end
+	M.env_rebuilt(sh) -- (dispose_used_env_vars: the environ, without them)
 	if not ok then
 		error(err)
 	end
@@ -13112,6 +13208,8 @@ function M.command_query(sh, argv)
 				usep = true
 			elseif f == "v" or f == "V" then
 				vflag = f
+			elseif argv[j] == "--help" then -- (GETOPT_HELP: the builtin's help, status 2)
+				return M.builtin_help(sh, "command")
 			else
 				io.stderr:write("curse: command: -" .. f .. ": invalid option\n" .. M.usage("command"))
 				sh.status = 2
@@ -15089,6 +15187,7 @@ do
 				sh.tenv_call_base = nil
 			end
 			M.sr_unbind(sh, base, argv)
+			M.env_rebuilt(sh) -- (dispose_used_env_vars: the environ, without them)
 		else
 			ok, err = pcall(M.sr_run_cmd, sh, argv, spec, hook, rf)
 		end
@@ -15122,6 +15221,7 @@ function M.def_function(sh, st, fn)
 	local name = st.name
 	local badname = not name:match("^[%w_:%.+@/%%%^~,!][%w_%.%-:+@/!#=%%%^~,%[%]]*$")
 	if badname or (sh.opt_posix and not name:match("^[%a_][%w_]*$")) then
+		M.ierr = true -- (check_identifier's internal_error)
 		M.err_at(sh, st.top and st.eline, "curse: `" .. name .. "': not a valid identifier\n")
 		sh.status = 1
 		if not badname and not sh.opt_i then -- (posix: a fatal error)

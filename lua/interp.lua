@@ -5232,6 +5232,9 @@ local function exec_simple(sh, args, hook, no_func)
 	if cmd ~= nil and sh.disabled_builtins and sh.disabled_builtins[cmd] then
 		return sh:exec_t(args) -- `enable -n NAME`: found on $PATH instead
 	end
+	if args[2] == "--help" and rt.HELPOPT[cmd] then -- (CASE_HELPOPT: the builtin's help, status 2)
+		return rt.builtin_help(sh, cmd)
+	end
 	local prep = ISO_BUILTIN[cmd] -- (in an in-process subshell: save the process state it changes)
 	if prep then
 		prep(sh)
@@ -5345,6 +5348,8 @@ local function exec_simple(sh, args, hook, no_func)
 					usep = true
 				elseif f == "v" or f == "V" then
 					vflag = f
+				elseif args[j] == "--help" then -- (GETOPT_HELP: the builtin's help, status 2)
+					return rt.builtin_help(sh, "command")
 				else
 					io.stderr:write("curse: command: -" .. f .. ": invalid option\n" .. rt.usage("command"))
 					sh.status = 2
@@ -6263,6 +6268,7 @@ exec_stmt = function(sh, st, hook)
 		-- otherwise lenient (a literal `=` in the name is fine: `func-name=ext`).
 		local badname = not st.name:match("^[%w_:%.+@/%%%^~,!][%w_%.%-:+@/!#=%%%^~,%[%]]*$")
 		if badname or (sh.opt_posix and not st.name:match("^[%a_][%w_]*$")) then
+			rt.ierr = true -- (check_identifier's internal_error)
 			rt.err_at(sh, st.top and st.eline, "curse: `" .. st.name .. "': not a valid identifier\n")
 			sh.status = 1
 			if not badname and not sh.opt_i then -- (posix: a fatal error)
@@ -6725,6 +6731,7 @@ exec_stmt = function(sh, st, hook)
 					end
 				end
 			end
+			rt.env_rebuilt(sh) -- (dispose_used_env_vars: the environ, without them)
 			if not ok then
 				error(err)
 			end
@@ -6947,6 +6954,7 @@ exec_stmt = function(sh, st, hook)
 			or (c1 and c1.words and c1.words[1] and c1.words[1].parts[1] and c1.words[1].parts[1].lit) or "job"
 		local cmd = st.cmd
 		local run = rt.bg_tail_stmt(cmd)
+		rt.env_rebuilt(sh) -- (execute_simple_command's, before the fork)
 		local job = sh:bg_launch(function(ssh)
 			exec_stmt(ssh, run, SUBHOOK)
 		end, cmdstr, cmd.t == "subshell", cmd.t == "simple")
@@ -6958,6 +6966,7 @@ exec_stmt = function(sh, st, hook)
 		-- coproc NAME cmd: run cmd asynchronously with its stdin/stdout on two pipes whose
 		-- other ends the shell keeps as NAME=(read-fd write-fd); NAME_PID and $! = its pid.
 		if not st.name:match("^[%a_][%w_]*$") then -- `coproc @ {…}`
+			rt.ierr = true -- (check_identifier's / execute_coproc's internal_error)
 			io.stderr:write("curse: `" .. st.name .. "': not a valid identifier\n")
 			sh.status = 1
 			return
@@ -7221,6 +7230,7 @@ exec_stmt = function(sh, st, hook)
 		-- stdin (EOF ends the loop); an empty line redisplays the menu; otherwise REPLY=line,
 		-- NAME=the chosen item (or empty when it isn't a valid number), run the body.
 		if not st.name:match("^[%a_][%w_]*$") then
+			rt.ierr = true -- (check_identifier's / execute_coproc's internal_error)
 			io.stderr:write("curse: `" .. st.name .. "': not a valid identifier\n")
 			sh.status = 1
 			return

@@ -33,6 +33,8 @@ return function(sh, cmd, args)
 		j = j + 1
 		if a == "--" then
 			break
+		elseif a == "--help" then -- (GETOPT_HELP: the builtin's help, status 2)
+			return require("runtime").builtin_help(sh, "history")
 		end
 		if a:match("^%-%d") then -- (`history -5`: not an option letter)
 			io.stderr:write("curse: history: " .. a:sub(1, 2) .. ": invalid option\n" .. USAGE)

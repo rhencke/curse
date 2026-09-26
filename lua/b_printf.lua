@@ -28,7 +28,7 @@ return function(sh, cmd, args, hook, tcb)
 				fi = fi + 1
 				break
 			elseif a:sub(2, 2) ~= "v" then
-				return rt.bad_option(sh, "printf", a:sub(1, 2))
+				return rt.bad_option(sh, "printf", a:sub(1, 2), a)
 			end
 			local nm = a:sub(3)
 			if nm == "" then

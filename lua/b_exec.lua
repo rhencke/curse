@@ -103,14 +103,17 @@ return function(sh, st, args, hook, viacmd)
 	end
 	-- exec [-cl] [-a name] [--] [cmd…]: -c empty environment, -l login ($0 gets a
 	-- leading -), -a NAME as $0. Another option (or -a without its NAME) is a usage
-	-- error (status 2) — and then the redirections are undone (bash disposes of the
-	-- undo list only after the options parse).
+	-- error (status 2) — the redirections persisting all the same.
 	local k, argv0, cflag, lflag = 2, nil, false, false
 	local bad
 	while not bad and args[k] and args[k]:sub(1, 1) == "-" and args[k] ~= "-" do
 		local a = args[k]
 		k = k + 1
 		if a == "--" then
+			break
+		elseif a == "--help" then -- (CASE_HELPOPT: the help, then as a usage error)
+			rt.builtin_help(sh, "exec")
+			bad = ""
 			break
 		end
 		local j = 2
@@ -138,9 +141,11 @@ return function(sh, st, args, hook, viacmd)
 		end
 	end
 	if bad then
-		io.stderr:write(bad .. rt.usage("exec"))
-		if type(sv) == "table" then
-			restore_redirs(sv)
+		if bad ~= "" then -- ("": `--help`, already shown)
+			io.stderr:write(bad .. rt.usage("exec"))
+		end
+		if type(sv) == "table" then -- (they stay even so: execute_builtin_or_function drops
+			rt.redir_discard(sv) -- exec's undo list before exec_builtin runs at all)
 		end
 		sh.status = 2
 		if sh.opt_posix and not viacmd and not sh.opt_i then -- (EX_USAGE: rt.spb_run's rule)
