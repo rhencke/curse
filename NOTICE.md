@@ -30,8 +30,8 @@ under the same GPLv3+ license. The upstream bash source is kept locally in
 
 ## Conformance corpus from Oils (Oil shell)
 
-The conformance harness (`test/conformance/run.sh`) and the older single-tier
-runner (`lua/spec.lua`) exercise curse against the **Oils** spec tests
+The conformance harness (`test/conformance/run.sh`) exercises curse against the
+**Oils** spec tests
 (<https://oils.pub>, <https://github.com/oilshell/oil>), Copyright the Oils
 authors, licensed under the **Apache License 2.0** — which is compatible for
 inclusion in a GPLv3+ work. The tests themselves are **not** redistributed here;

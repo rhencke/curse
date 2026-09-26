@@ -1,6 +1,5 @@
 -- Lazily-loaded builtin feature module (see BUILTIN_LAZY in runtime.lua): `fg` / `bg`.
-local M = require("interp")
-local I = M._int
+local I = require("interp")._int
 local job_resolve, job_reap, SIGDESC = I.job_resolve, I.job_reap, I.SIGDESC
 
 -- disown [-ahr] [jobspec|pid …]: drop jobs from the table (so `jobs`/`wait` forget them);

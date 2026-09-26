@@ -12,9 +12,7 @@ amortizes it across every invocation, where a freshly-`exec`'d shell never can.
 
 > **History.** curse began as a bash → TypeScript/Node transpiler (hence its
 > GPLv3+ lineage from bash's own sources). That prototype has been retired; the
-> project is now the LuaJIT implementation under [`lua/`](lua/). A few in-tree
-> comments still call "the TS parser" the reference oracle — that's the removed
-> prototype, and those notes are being cleaned up.
+> project is now the LuaJIT implementation under [`lua/`](lua/).
 
 ## Why LuaJIT
 
@@ -89,16 +87,16 @@ and, at `meson setup`, applies curse's C-mods from
 ## The daemon
 
 `cursed` ([`lua/daemon.lua`](lua/daemon.lua)) is a warm, resident LuaJIT process,
-**one per user**, that serves requests over a unix socket in `$XDG_RUNTIME_DIR` and
-**forks a worker per request**. Each worker inherits the warm heap and hot JIT
-traces via copy-on-write `fork()`, so it runs *faster than a freshly-`exec`'d
-shell*. The tiny static client [`daemon/curse-client.c`](daemon/curse-client.c)
+**one per user**, that serves requests over a unix socket in `$XDG_RUNTIME_DIR`
+from a **pool of persistent warm workers** — each runs a request in-process, scrubs
+the per-request state, and takes the next, so it runs *faster than a
+freshly-`exec`'d shell*. The tiny static client [`daemon/curse-client.c`](daemon/curse-client.c)
 hands the daemon its argv, cwd, environ, and its own stdin/stdout/stderr (via
 `SCM_RIGHTS`, so the script's I/O **is** the caller's — no proxying). Per-user (not
 one shared root daemon) makes the whole local-privilege-escalation class *not
 exist*; and the daemon is pure speedup — if the socket is missing or unusable the
-client `execvp`s a fallback (`$CURSE_FALLBACK`, default `dash`), so nothing ever
-breaks when it's absent.
+client `execvp`s the one-shot `curse` binary (`$CURSE_FALLBACK`), so nothing ever
+breaks when it's absent (and, given `$CURSE_DAEMON`, starts the daemon for next time).
 
 Full design, wire protocol, and current limits: [`daemon/README.md`](daemon/README.md).
 
@@ -119,10 +117,12 @@ via [`tools/build-luajit-vm.sh`](tools/build-luajit-vm.sh), then bundles the Lua
 runtime ([`lua/build.lua`](lua/build.lua), run on the just-built luajit) and links
 everything. Outputs land in `build/`:
 
-- **`build/luajit`** — dynamic; loads `dist/curse.bc` from disk. For the daemon,
-  the spec harness, and dev.
+- **`build/luajit`** — dynamic; loads the bundle named by `$CURSE_BUNDLE` (e.g.
+  `build/curse.bc`) from disk, else the `lua/` sources. For the daemon, the
+  conformance harness, and dev.
+- **`build/curse.bc`** — the Lua runtime as one precompiled-bytecode bundle.
 - **`build/curse`** — fully static, module bundle **embedded**. Self-contained
-  (no `dist/` or `lua/` needed) — the shippable one-shot binary; symlink `sh` → it
+  (no bundle file or `lua/` needed) — the shippable one-shot binary; symlink `sh` → it
   for a drop-in `/bin/sh`.
 - **`build/curse-client`** — the tiny static daemon front end.
 
@@ -136,7 +136,8 @@ downloads the real-world diff-test scripts.
 # Self-contained static binary — it's the shell when invoked as `sh` (symlink it):
 ln -s "$PWD/build/curse" /tmp/sh && /tmp/sh -c 'echo hi; echo $((2 + 3))'
 
-# Or drive the CLI directly on the dynamic luajit (picks up dist/curse.bc if present):
+# Or drive the CLI directly on the dynamic luajit (from the lua/ sources, or
+# CURSE_BUNDLE=build/curse.bc to load the bundle):
 build/luajit lua/run.lua script.sh              # run a script
 build/luajit lua/run.lua -c 'for ((i=0;i<3;i++)); do echo $i; done'
 build/luajit lua/run.lua script.sh interp       # force a tier: interp | compiled | tiered (default)
@@ -153,14 +154,15 @@ Leading shell options (`-e`, `-u`, `-x`, `-o NAME`, `-O NAME`, `--rcfile`,
 ## Tests
 
 `meson test -C build --suite unit` runs the fast tiered-execution suites (`test_tier`,
-`test_nested`, `test_funcs`, `test_forin`, `test_cache`) on the built luajit.
+`test_nested`, `test_funcs`, `test_forin`, `test_cache`, `test_ext`) on the built luajit.
 
 **Conformance harness** — [`test/conformance/run.sh`](test/conformance/run.sh)
 runs each test under **bash** (the oracle), **dash** (where it supports the test),
-and curse's three tiers (**interp / compiled / tiered**), scoring each shell's
-agreement with bash on stdout + exit status **and its summed run time** (bash vs
-dash vs curse's tiers). Parallelism is bounded (`--jobs`, default gentle — each
-tier spawns work; use `--jobs 1` for clean timing). Three corpora:
+and curse through a private daemon — **curse-cold** (empty compile cache: interpret,
+switch to compiled code where hot, store it) and **curse-hot** (the same test again,
+loading the stored compiled code) — scoring each shell's agreement with bash on
+stdout + exit status **and its summed run time**. Parallelism is bounded (`--jobs`,
+default gentle; use `--jobs 1` for clean timing). Three corpora:
 
 - **`cases`** — [`test/cases/`](test/cases/), curse's own scripts (no download).
 - **`bash`** — GNU bash's own `tests/*.tests` suite.
@@ -188,8 +190,9 @@ it best-effort (non-fatal offline). For a tight loop, run the harness directly:
 `test/conformance/run.sh --corpus oil --jobs 4 arith`.
 
 - **[`test/real/`](test/real/)** — end-to-end real-world scripts under `docker diff`
-  ([`diff.sh`](test/real/diff.sh)). **[`lua/spec.lua`](lua/spec.lua)** — the older
-  single-tier Oils runner, scored against the recorded golden files.
+  ([`diff.sh`](test/real/diff.sh)).
+- **[`test/bench/`](test/bench/)** — microbenchmarks of common shell patterns
+  ([`run.sh`](test/bench/run.sh)): bash, dash, and curse via its daemon (cold / hot).
 
 ## Layout
 
@@ -209,25 +212,26 @@ lua/              the shell
 daemon/           curse-client.c (the tiny static front end) + design doc
 subprojects/      Meson deps: LuaJIT (luajit.wrap + curse's C-mods in packagefiles/)
                     and the conformance corpora (bash.wrap tarball, oil.wrap git)
-tools/            build-luajit-vm.sh (Meson-driven VM build), run-lua.sh
+tools/            build-luajit-vm.sh (Meson-driven VM build), run-lua.sh,
+                    delegate-census.lua (compiles every corpus program; reports gaps)
 meson.build       the build: fetch LuaJIT -> patched VM -> bundle -> curse + client
 test/
   cases/            curse's own conformance scripts (vs real bash)
-  conformance/      run.sh — the bash/dash/curse×3 harness
+  conformance/      run.sh — the bash/dash/curse harness
   real/             real-world end-to-end scripts (docker diff)
+  bench/            microbenchmarks (run.sh)
 reference/        upstream bash + Oils sources (gitignored) — porting + test source
 build/            Meson build dir (gitignored): luajit, curse, curse-client, curse.bc
 ```
 
 ## Status
 
-Work in progress. The **interpreter** and its builtins target a broad bash surface;
-the **compiled/JIT tier** currently covers the hot subset — scalar assignments,
-`for`/`while`/`if`, functions (with inlining), positional parameters, and 64-bit
-`$(( … ))` arithmetic — and is growing toward the full grammar. Near-term work:
-extend the compiled grammar (real commands, `case`, `for x in LIST`, pipelines,
-redirections), wire the shared conformance harness, and complete the parser port.
-Details and benchmarks live in [`lua/README.md`](lua/README.md).
+Work in progress. The interpreter and its builtins target the full bash surface,
+and the **compiled tier compiles every program in the conformance corpora** with no
+fallback to the interpreter (`build/luajit tools/delegate-census.lua` reports
+`nocompile 0  with-delegates 0`; alias- or history-dependent input compiles a
+line at a time). curse matches bash on all three corpora (`cases`, `oil`, `bash`)
+cold and hot. Details live in [`lua/README.md`](lua/README.md).
 
 ## License
 

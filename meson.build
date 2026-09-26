@@ -12,8 +12,9 @@ project('curse', 'c',
 #      on the luajit produced in step 2 -- a staged bootstrap, no external Lua)
 #   4. links the dynamic `luajit` and the static, self-contained `curse`
 #   5. builds the tiny static C client              (daemon/curse-client.c)
-# `meson test` runs the LuaJIT unit tests; `ninja fetch-spec` / `ninja fetch-real`
-# download the conformance corpora into reference/ (gitignored).
+# `meson test` runs the LuaJIT unit tests + the conformance corpora (bash + oil are
+# Meson subprojects, fetched at setup); `ninja fetch-real` downloads the real-world
+# scripts test/real/diff.sh compares.
 # ---------------------------------------------------------------------------
 
 cc     = meson.get_compiler('c')
@@ -106,7 +107,7 @@ run_lua  = find_program('tools' / 'run-lua.sh')
 test_env = environment()
 test_env.set('LUA_PATH', repo / 'lua' / '?.lua' + ';;')
 
-foreach t : ['test_cache', 'test_forin', 'test_funcs', 'test_nested', 'test_tier']
+foreach t : ['test_cache', 'test_ext', 'test_forin', 'test_funcs', 'test_nested', 'test_tier']
   test(t, run_lua,
     args:    [luajit_bin, repo / 'lua' / (t + '.lua')],
     workdir: repo,
