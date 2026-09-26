@@ -28,7 +28,8 @@ kill -STOP %1; stopped
 wait %1; echo "wait on a stopped job: $?"
 jobs %1
 exec 5>&2 2>/dev/null # (the Killed notices: by `wait`, or as the next line is read)
-kill -9 %1 %2 %3
+kill -CONT %1 # (running again: `wait` waits for it — a stopped one it would skip until its
+kill -9 %1 %2 %3 # death is reaped, which is a race of its own)
 wait
 :
 exec 2>&5 5>&-
