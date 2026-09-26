@@ -147,7 +147,7 @@ conf_shells = dash_prog.found() ? 'dash,curse-cold,curse-hot' : 'curse-cold,curs
 # curse now runs via its daemon, so the tests need the built luajit + the module
 # bundle + the C client; depend on all three so `meson test` builds them itself.
 conf_deps = [vm, bundle, curse_client]
-test('conformance-cases', conf, args: ['--corpus', 'cases', '--shells', conf_shells],
+test('conformance-cases', conf, args: ['--corpus', 'cases', '--shells', conf_shells, '-v'],
   suite: 'conformance', depends: conf_deps, workdir: repo, is_parallel: false, timeout: 0)
 
 # bash + oil corpora are Meson subprojects (bash: release tarball + checksum; oil:
@@ -160,12 +160,12 @@ if not conf_feat.disabled()
   oil_sp  = subproject('oil',  required: conf_feat)
   if bash_sp.found()
     test('conformance-bash', conf,
-      args: ['--corpus', 'bash', '--bash-dir', bash_sp.get_variable('tests_dir'), '--shells', conf_shells],
+      args: ['--corpus', 'bash', '--bash-dir', bash_sp.get_variable('tests_dir'), '--shells', conf_shells, '-v'],
       suite: 'conformance', depends: conf_deps, workdir: repo, is_parallel: false, timeout: 0)
   endif
   if oil_sp.found()
     test('conformance-oil', conf,
-      args: ['--corpus', 'oil', '--oil-dir', oil_sp.get_variable('spec_dir'), '--shells', conf_shells],
+      args: ['--corpus', 'oil', '--oil-dir', oil_sp.get_variable('spec_dir'), '--shells', conf_shells, '-v'],
       suite: 'conformance', depends: conf_deps, workdir: repo, is_parallel: false, timeout: 0)
   endif
 endif
