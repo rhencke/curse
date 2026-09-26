@@ -79,20 +79,35 @@ end
 
 -- kill_pid for a job (jobs.c): each of its processes that's still alive gets the signal; one
 -- that has ended is skipped, and that is success
+-- With job control (the job's own process group, killpg): a stopped job sent TERM or HUP
+-- is continued too, so it can take it, and one continued by `kill -CONT` runs again at once
+-- (bash emulates `bg` there) — without job control only the processes' reports tell.
 local function kill_job(sh, jb, sig)
 	if jb.done then
 		return true
 	end
+	local stopped = rt.job_control_on(sh) and not jb.nojc and rt.job_state(jb) == "stopped"
+	local ok
 	local t = rt.vpid_tasks[jb.pid]
 	if t then -- (an in-process job)
-		return rt.task_kill_job(t, sig) or t.done or false
+		ok = rt.task_kill_job(t, sig) or t.done or false
+		if stopped and (sig == 15 or sig == 1) then
+			rt.task_kill_job(t, 18)
+		end
 	elseif rt.vpid_ctx[jb.pid] then
 		return rt.vkill(sh, jb.pid, sig)
-	end
-	if C.kill(jb.pid, sig) ~= 0 then
+	elseif C.kill(jb.pid, sig) ~= 0 then
 		return ffi.errno() == 3 -- (ESRCH: it ended, just not reaped yet)
+	else
+		ok = true
+		if stopped and (sig == 15 or sig == 1) then
+			C.kill(jb.pid, 18)
+		end
 	end
-	return true
+	if stopped and sig == 18 then
+		rt.job_set_running(sh, jb)
+	end
+	return ok
 end
 
 return function(sh, cmd, args, hook, tcb)
@@ -162,6 +177,12 @@ return function(sh, cmd, args, hook, tcb)
 		end
 		-- CONTINUE_AFTER_KILL_ERROR: every operand is tried; success if any one succeeded
 		local any = false
+		-- (bash's jobs run beside it: one polled with `kill -0 $!` in a loop of builtins does
+		-- end. Ours run only when the shell lets them — so let them now, or that loop spins
+		-- forever on a job that never gets to run)
+		if rt.sched_live() then
+			rt.sched_pump({})
+		end
 		if sh.jobs and sh.jobs[1] then -- (a job that has ended is reaped — SIGCHLD — so no longer there)
 			rt.jobs_poll(sh)
 		end

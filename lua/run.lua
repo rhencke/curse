@@ -64,7 +64,7 @@ local function finish(sh)
 	-- Propagate $? as the process exit code (so `exit N`, `false`, etc. are visible to
 	-- the caller). Background jobs finish before the process can; flush stdout first.
 	io.flush()
-	rt.sched_drain()
+	rt.sched_drain(sh)
 	io.flush()
 	os.exit(sh and sh.status or 0)
 end

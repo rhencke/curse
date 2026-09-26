@@ -25,9 +25,12 @@
 #
 # TIME LIMITS — a guard against hangs, never what a test is scored on: --timeout (10s),
 # raised per test by test/conformance/timeouts (tests that need longer even alone) and
-# scaled by the current load. A run that hits it is reported as a timeout: `oracle-timeout`
-# (bash itself: nothing to score against — never a pass) or `timeout` (the shell), apart
-# from `output`/`status` diffs, in the scoreboard, -v, --results and H_DIFF_DIR.
+# scaled by the current load. A run is TIMED OUT when it exits 124 having used the whole
+# limit (a script's own `exit 124` returns sooner). A timed-out ORACLE scores the test
+# OTIMEOUT for every shell — neither pass nor fail, the shells aren't run — counted as
+# "(oracle N, M t/o)" and listed under ORACLE TIMED OUT; a timed-out shell is a FAIL with
+# reason `timeout`, apart from `output`/`status` diffs, in the scoreboard, -v, --results
+# and H_DIFF_DIR; a timed-out bash RERUN is discarded, never taken as a bash output.
 #
 # The scoreboard reports a per-shell success rate AND summed per-run wall time
 # (bash vs dash vs curse). Under --jobs>1 absolute times inflate from CPU contention
@@ -203,16 +206,20 @@ if [ "${1:-}" = --run-unit ]; then
   }
   shopt -s extglob
   # result row: corpus \t shell \t verdict \t duration_us \t testid \t why
-  # why (for a FAIL — the scoreboard counts them, -v lists them):
-  #   oracle-timeout  bash itself hit the time limit: nothing to score against (never a
-  #                   PASS, even when a shell's output matches bash's truncated output)
-  #   timeout         the shell hit the time limit (bash finished in time)
+  # verdict: PASS | FAIL | NA (dash can't parse it) | OTIMEOUT — the ORACLE hit the time
+  # limit: its output is truncated, so there is nothing to score against. Neither a pass
+  # nor a fail (the shells aren't even run); the scoreboard counts and lists these.
+  # (The oracle's own row is ORACLE, or ORACLE-TIMEOUT.)
+  # why (for a FAIL — the scoreboard counts them, -v lists them; OTIMEOUT's is
+  # oracle-timeout):
+  #   timeout         the shell hit the time limit (bash finished in time): FAIL outright,
+  #                   never matched against bash reruns
   #   status          stdout matched, exit status didn't
   #   output          exit status matched, stdout didn't
   #   output+status   neither
   emit_row() {  # $1 shell  $2 out  $3 status  $4 duration_us  $5 timed-out -> verdict row
     local v=FAIL why=-
-    if [ "$btimeout" -eq 1 ]; then why=oracle-timeout
+    if [ "$btimeout" -eq 1 ]; then v=OTIMEOUT why=oracle-timeout
     elif [ "$5" -eq 1 ]; then why=timeout
     elif [ "$1" = dash ] && [ "$3" -eq 2 ] && [ "$bst" -ne 2 ]; then v=NA
     elif [ "$2" = "$bout" ] && [ "$3" -eq "$bst" ]; then v=PASS
@@ -225,7 +232,7 @@ if [ "${1:-}" = --run-unit ]; then
     printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$corpus" "$1" "$v" "$4" "$testid" "$why" >> "$res"
     # H_DIFF_DIR=dir: keep a failing test's expected (bash) and actual output + statuses
     if [ "$v" = FAIL ] && [ -n "${H_DIFF_DIR:-}" ]; then
-      printf '%s\n[status %s%s]\n' "$bout" "$bst" "$( [ "$btimeout" -eq 1 ] && echo ", TIMED OUT after ${lim}s")" > "$H_DIFF_DIR/$testid.expected"
+      printf '%s\n[status %s]\n' "$bout" "$bst" > "$H_DIFF_DIR/$testid.expected"
       printf '%s\n[status %s%s; %s]\n' "$2" "$3" "$( [ "$5" -eq 1 ] && echo ", TIMED OUT after ${lim}s")" "$why" > "$H_DIFF_DIR/$testid.$1"
     fi
   }
@@ -256,9 +263,11 @@ if [ "${1:-}" = --run-unit ]; then
   # empty per-unit cache and tiers (interp -> OSR + store .bc); hot then loads the .bc.
   for sh in ${H_SHELLS//,/ }; do
     case "$sh" in
-      bash) printf '%s\tbash\tORACLE\t%s\t%s\t%s\n' "$corpus" "$bdur" "$testid" "$( [ "$btimeout" -eq 1 ] && echo timeout || echo -)" >> "$res" ;;
+      bash) printf '%s\tbash\t%s\t%s\t%s\t%s\n' "$corpus" "$( [ "$btimeout" -eq 1 ] && echo ORACLE-TIMEOUT || echo ORACLE)" "$bdur" "$testid" "$( [ "$btimeout" -eq 1 ] && echo "timeout@${lim}s" || echo -)" >> "$res" ;;
       dash|curse-cold|curse-hot)
         run=$sh; [ "$sh" = dash ] || run=curse
+        # (no oracle to score against: don't spend another time limit per shell on it)
+        if [ "$btimeout" -eq 1 ]; then emit_row "$sh" "" 0 0 0; continue; fi
         run_shell "$run"
         emit_row "$sh" "$R_OUT" "$R_ST" "$R_DUR" "$R_TO" ;;
     esac
@@ -477,8 +486,9 @@ cat "$workdir"/res/*.tsv > "$workdir/all.tsv" 2>/dev/null
 [ -n "$RESULTS" ] && cp "$workdir/all.tsv" "$RESULTS" 2>/dev/null   # preserve raw per-test rows for analysis
 awk -F'\t' '
   { seen_corpus[$1]=1; seen_shell[$2]=1; dur[$1,$2]+=$4
-    if($3!="ORACLE"){tot[$1,$2]++; c[$1,$2,$3]++; if($3=="FAIL") why[$1,$2,$6]++}
-    else {oracle[$1]++; if($6=="timeout") otimeout[$1]++} }
+    if($3 ~ /^ORACLE/){oracle[$1]++; if($3!="ORACLE") oto[$1]++}
+    else if($3=="OTIMEOUT"){ot[$1,$2]++}
+    else {tot[$1,$2]++; c[$1,$2,$3]++; if($3=="FAIL") why[$1,$2,$6]++} }
   END {
     ns=split("bash dash curse-cold curse-hot", order, " ")
     printf "%-16s", "corpus"
@@ -487,7 +497,7 @@ awk -F'\t' '
     for(cp in seen_corpus){
       printf "%-16s", cp
       for(i=1;i<=ns;i++){ s=order[i]; if(!seen_shell[s]) continue
-        if(s=="bash"){ printf "%-18s", "(oracle "oracle[cp]")"; continue }
+        if(s=="bash"){ printf "%-18s", "(oracle "oracle[cp] (oto[cp] ? ", "oto[cp]" t/o" : "") ")"; continue }
         p=c[cp,s,"PASS"]+0; t=tot[cp,s]+0; na=c[cp,s,"NA"]+0
         pct = t>0 ? sprintf("%d%%", 100*p/t) : "-"
         printf "%-18s", sprintf("%d/%d %s%s", p, t, pct, na>0?" ("na" n/a)":"")
@@ -506,9 +516,15 @@ awk -F'\t' '
         for(k in why) { split(k, kk, SUBSEP); if(kk[1]==cp && kk[2]==s) line=line sprintf(" %s=%d", kk[3], why[k]) }
         if(line!="") printf "  %s fails:%s\n", s, line
       }
-      if(otimeout[cp]>0) printf "  oracle timeouts: %d (unscorable: counted as failures for every shell)\n", otimeout[cp]
     }
   }' "$workdir/all.tsv"
+
+# An oracle run that timed out scores nothing (OTIMEOUT: its output is truncated) — say so
+# loudly, every time, so a too-short limit can't hide as a pass or a fail.
+if awk -F'\t' '$3=="ORACLE-TIMEOUT"{f=1} END{exit !f}' "$workdir/all.tsv"; then
+  echo; echo "ORACLE TIMED OUT (bash took the whole limit; not scored — raise --timeout, or give the test an entry in test/conformance/timeouts):"
+  awk -F'\t' '$3=="ORACLE-TIMEOUT"{sub(/^timeout@/, "", $6); print "  "$1"\t"$5"\t(limit "$6")"}' "$workdir/all.tsv" | sort
+fi
 
 if [ "$VERBOSE" -eq 1 ]; then
   echo; echo "failures (shell disagreed with bash):"
