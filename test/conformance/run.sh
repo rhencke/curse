@@ -90,22 +90,33 @@ if [ "${1:-}" = --run-unit ]; then
   # 3x); if bash's own output varied, the lines both bash runs agree on must still match
   # exactly, and a varying line matches when it's equal with every digit run masked — or
   # the shell's output equals one of bash's own runs verbatim (a race in bash itself).
+  # A run that `timeout` killed (status 124, and it took the whole H_TIMEOUT — a script's
+  # own `exit 124` returns sooner) is TRUNCATED output, never an oracle: comparing it would
+  # "pass" any shell that got cut off at the same place (jobs.tests, ~62 s of sleeps, once
+  # passed that way under TIMEOUT=30 — both outputs ended mid-test, byte-identical).
+  timed_out() { [ "$1" -eq 124 ] && [ "$2" -ge "$H_TIMEOUT_US" ]; }
+  # one extra oracle run into $1; sets rst (its status; 124 also when it timed out)
+  rerun_bash() {
+    local s; prep; s=$(now_us); one bash >"$1" 2>/dev/null; rst=$?
+    timed_out "$rst" $(( $(now_us) - s )) && rst=-1   # (-1: unusable, matches no status)
+    return 0
+  }
   bchecked=""; b2out=""; b2st=""
   oracle_varies() {
     if [ -z "$bchecked" ]; then
-      bchecked=1; local k
+      bchecked=1; local k rst
       for k in 1 2 3; do
-        prep; one bash >"$ofile.b2" 2>/dev/null; b2st=$?; b2out=$(cat "$ofile.b2" 2>/dev/null)
+        rerun_bash "$ofile.b2"; b2st=$rst; b2out=$(cat "$ofile.b2" 2>/dev/null)
         [ "$b2out" != "$bout" ] && break
       done
     fi
     [ "$b2out" != "$bout" ] && [ "$b2st" -eq "$bst" ]
   }
   bash_produces() {  # does bash, rerun (≤8x, only for a mismatch), ever print exactly $1 / exit $2?
-    local k o st
+    local k o st rst
     for ((k = 0; k < 8; k++)); do
       if [ -n "${bruns[k]+x}" ]; then o=${bruns[k]}; st=${bsts[k]}
-      else prep; one bash >"$ofile.b3" 2>/dev/null; st=$?; o=$(cat "$ofile.b3" 2>/dev/null)
+      else rerun_bash "$ofile.b3"; st=$rst; o=$(cat "$ofile.b3" 2>/dev/null)
         bruns[k]=$o; bsts[k]=$st; fi
       [ "$o" = "$1" ] && [ "$st" -eq "$2" ] && return 0
     done
@@ -126,7 +137,9 @@ if [ "${1:-}" = --run-unit ]; then
   shopt -s extglob
   emit_row() {  # $1 shell  $2 out  $3 status  $4 duration_us  -> verdict row
     local v=FAIL
-    if [ "$1" = dash ] && [ "$3" -eq 2 ] && [ "$bst" -ne 2 ]; then v=NA
+    if [ -n "$otimeout" ]; then v=OTIMEOUT   # (no oracle: neither a pass nor a fail)
+    elif timed_out "$3" "$4"; then v=FAIL    # (cut off: never matches, not even a rerun)
+    elif [ "$1" = dash ] && [ "$3" -eq 2 ] && [ "$bst" -ne 2 ]; then v=NA
     elif [ "$2" = "$bout" ] && [ "$3" -eq "$bst" ]; then v=PASS
     elif [ "$3" -eq "$bst" ] && oracle_varies && nondet_match "$2"; then v=PASS
     # (…or bash itself can produce exactly this output: a race in bash, e.g. `a & b`'s order)
@@ -140,13 +153,16 @@ if [ "${1:-}" = --run-unit ]; then
   }
   # result row: corpus \t shell \t verdict \t duration_us \t testid
   prep; _s=$(now_us); one bash >"$ofile" 2>/dev/null; bst=$?; bdur=$(( $(now_us) - _s )); bout=$(cat "$ofile" 2>/dev/null)
+  otimeout=""; timed_out "$bst" "$bdur" && otimeout=1
   # curse-cold MUST precede curse-hot (SHELLS order guarantees it): cold misses the
   # empty per-unit cache and tiers (interp -> OSR + store .bc); hot then loads the .bc.
   for sh in ${H_SHELLS//,/ }; do
     case "$sh" in
-      bash) printf '%s\tbash\tORACLE\t%s\t%s\n' "$corpus" "$bdur" "$testid" >> "$res" ;;
+      bash) printf '%s\tbash\t%s\t%s\t%s\n' "$corpus" "ORACLE${otimeout:+-TIMEOUT}" "$bdur" "$testid" >> "$res" ;;
       dash|curse-cold|curse-hot)
         run=$sh; [ "$sh" = dash ] || run=curse
+        # (no oracle to score against: don't spend another H_TIMEOUT per shell on it)
+        if [ -n "$otimeout" ]; then emit_row "$sh" "" 0 0; continue; fi
         # stop the clock BEFORE emit_row: its "$(cat …)" argument expands first and
         # would bill a fork+exec of cat to this shell (the bash oracle's time excludes it)
         prep; _s=$(now_us); one "$run" >"$ofile" 2>/dev/null; st=$?; dur=$(( $(now_us) - _s ))
@@ -329,7 +345,9 @@ if [ "$total" -eq 0 ]; then
 fi
 
 echo "harness: $total tests × [${SHELLS//,/ }]  (jobs=$JOBS, timeout=${H_TIMEOUT}s)"
-export H_TIMEOUT H_SHELLS="$SHELLS"
+# (in µs, for spotting a run `timeout` cut off: see timed_out)
+H_TIMEOUT_US=$(awk -v t="$H_TIMEOUT" 'BEGIN { printf "%d", t * 1000000 }')
+export H_TIMEOUT H_TIMEOUT_US H_SHELLS="$SHELLS"
 export H_CLIENT H_THIS_SH H_XDG_RUNTIME H_XDG_CACHE H_FALLBACK
 seq 1 "$total" | xargs -P "$JOBS" -I{} "$0" --run-unit "$workdir" {}
 
@@ -339,7 +357,9 @@ cat "$workdir"/res/*.tsv > "$workdir/all.tsv" 2>/dev/null
 [ -n "$RESULTS" ] && cp "$workdir/all.tsv" "$RESULTS" 2>/dev/null   # preserve raw per-test rows for analysis
 awk -F'\t' '
   { seen_corpus[$1]=1; seen_shell[$2]=1; dur[$1,$2]+=$4
-    if($3!="ORACLE"){tot[$1,$2]++; c[$1,$2,$3]++} else {oracle[$1]++} }
+    if($3 ~ /^ORACLE/){oracle[$1]++; if($3!="ORACLE") oto[$1]++}
+    else if($3=="OTIMEOUT"){ot[$1,$2]++}
+    else {tot[$1,$2]++; c[$1,$2,$3]++} }
   END {
     ns=split("bash dash curse-cold curse-hot", order, " ")
     printf "%-16s", "corpus"
@@ -348,7 +368,7 @@ awk -F'\t' '
     for(cp in seen_corpus){
       printf "%-16s", cp
       for(i=1;i<=ns;i++){ s=order[i]; if(!seen_shell[s]) continue
-        if(s=="bash"){ printf "%-18s", "(oracle "oracle[cp]")"; continue }
+        if(s=="bash"){ printf "%-18s", "(oracle "oracle[cp] (oto[cp] ? ", "oto[cp]" t/o" : "") ")"; continue }
         p=c[cp,s,"PASS"]+0; t=tot[cp,s]+0; na=c[cp,s,"NA"]+0
         pct = t>0 ? sprintf("%d%%", 100*p/t) : "-"
         printf "%-18s", sprintf("%d/%d %s%s", p, t, pct, na>0?" ("na" n/a)":"")
@@ -362,6 +382,13 @@ awk -F'\t' '
       printf "\n"
     }
   }' "$workdir/all.tsv"
+
+# An oracle run that timed out scores nothing (OTIMEOUT: its output is truncated) — say so
+# loudly, every time, so a too-short --timeout can't hide as a pass or a fail.
+if awk -F'\t' '$3=="ORACLE-TIMEOUT"{f=1} END{exit !f}' "$workdir/all.tsv"; then
+  echo; echo "ORACLE TIMED OUT (bash took the whole ${H_TIMEOUT}s; not scored — raise --timeout):"
+  awk -F'\t' '$3=="ORACLE-TIMEOUT"{print "  "$1"\t"$5}' "$workdir/all.tsv" | sort
+fi
 
 if [ "$VERBOSE" -eq 1 ]; then
   echo; echo "failures (shell disagreed with bash):"
