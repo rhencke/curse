@@ -2414,6 +2414,50 @@ local function async_spawn_release()
 	C.curse_rt_sigaction(3, _aq_sa3, nil)
 	C.sigprocmask(2, _aq_old, nil) -- SIG_SETMASK
 end
+-- posix_spawn `args[1..n]` (argv[0]: `exec -a`'s NAME, if any) at `path` as a child of the
+-- shell — the one spawn of an external (Shell:exec_t, straight to fd 1 or into a capture;
+-- Shell:spawn_bg): the program's `_` is its own path (bash; not under `exec`, whose image
+-- has none of its own), file actions `fa` plus closing every fd another in-process shell
+-- owns, the signal mask a bash child starts with, SIGINT/SIGQUIT ignored for an async one
+-- (`hold`), and the child environ with SHLVL moved by `lvl`. Returns rc, pid.
+local function spawn_argv(self, path, args, n, fa, hold, lvl)
+	local argv = ffi.new("const char*[?]", n + 1)
+	local anchor = {} -- keep the Lua strings alive while argv points into them
+	for i = 1, n do
+		anchor[i] = tostring(args[i])
+		argv[i - 1] = anchor[i]
+	end
+	argv[n] = nil
+	if self.exec_argv0 then -- exec -a NAME
+		anchor.a0 = tostring(self.exec_argv0)
+		argv[0] = anchor.a0
+	end
+	if not self.exec_noenv then
+		C.setenv("_", path, 1)
+	end
+	fa = M.foreign_fa(self, fa)
+	local attr = child_spawnattr(self)
+	if hold then
+		attr = async_spawn_hold(attr)
+	end
+	M.rd_gen = M.rd_gen + 1 -- (a new process may read our input: see M.pipe_cache)
+	local d = M.shlvl_delta
+	M.shlvl_delta = d + lvl
+	local cenv = M.child_env() -- (bash's order; kept alive across the call)
+	M.shlvl_delta = d
+	local pidp = ffi.new("curse_pid_t[1]")
+	local rc = C.posix_spawn(pidp, path, fa, attr, ffi.cast("char *const *", argv), cenv)
+	if hold then
+		async_spawn_release()
+	end
+	if fa then
+		C.posix_spawn_file_actions_destroy(fa)
+	end
+	if attr then
+		C.posix_spawnattr_destroy(attr)
+	end
+	return rc, pidp[0]
+end
 -- The last command of a ( … ) / $( … ) body (parser.mark_tail) that turns out to be an
 -- external command is exec'd by bash in place of the subshell's own process (CMD_NO_FORK),
 -- lowering $SHLVL first like `exec` (execute_disk_command's adjust_shell_level(-1)) — the
@@ -2539,50 +2583,19 @@ function Shell:exec_t(args)
 			return
 		end
 	end
-	local argv = ffi.new("const char*[?]", n + 1)
-	local anchor = {} -- keep the Lua strings alive while argv points into them
-	for i = 1, n do
-		anchor[i] = tostring(args[i])
-		argv[i - 1] = anchor[i]
-	end
-	argv[n] = nil
-	if not self.exec_noenv then
-		C.setenv("_", execpath, 1) -- a program sees `_` = its own path (bash), not the shell's $_
-	end
-	if self.exec_argv0 then
-		anchor.a0 = tostring(self.exec_argv0)
-		argv[0] = anchor.a0
-	end -- exec -a NAME
 	-- Not capturing (self.out is the real fd 1, e.g. a top-level command or a
 	-- pipeline stage): let the child write STRAIGHT to fd 1 (inherit fds) instead
 	-- of buffering all its output — so an unbounded producer (`cat /dev/zero | …`)
 	-- streams and SIGPIPE propagates, and there's no 2x-memory capture.
 	if self.out == io.write or CO_OUTS[self.out] then
 		io.flush() -- our own buffered stdout (and a pipeline stage's) must reach fd 1 first
-		local pidp = ffi.new("curse_pid_t[1]")
-		local attr = child_spawnattr(self)
 		-- (an async job's command — not a function's — or one in an async subshell: with
 		-- SIGINT/SIGQUIT ignored, setup_async_signals)
 		local ist = self.iso_ctx
 		local hold = (self.bg_cd and self.bg_cd == self.calldepth)
 			or (ist and ist[1] and ist[#ist].igint and (ist[#ist].igint[2] or ist[#ist].igint[3]) and true)
-		if hold then
-			attr = async_spawn_hold(attr)
-		end
-		local fa = M.foreign_fa(self, nil)
-		M.rd_gen = M.rd_gen + 1 -- (a new process may read our input: see M.pipe_cache)
-		local cenv = M.child_env() -- (bash's order; kept alive across the call)
 		M.nspawn = M.nspawn + 1 -- (a real child: its death is a real SIGCHLD)
-		local rc = C.posix_spawn(pidp, execpath, fa, attr, ffi.cast("char *const *", argv), cenv)
-		if hold then
-			async_spawn_release()
-		end
-		if fa then
-			C.posix_spawn_file_actions_destroy(fa)
-		end
-		if attr then
-			C.posix_spawnattr_destroy(attr)
-		end
+		local rc, pid = spawn_argv(self, execpath, args, n, nil, hold, 0)
 		if rc == 8 then
 			return self:run_noexec(execpath, args, n)
 		end -- no shebang: run as a script
@@ -2592,10 +2605,10 @@ function Shell:exec_t(args)
 			return
 		end
 		local st = ffi.new("int[1]")
-		M.wait_child(pidp[0], st, 0)
+		M.wait_child(pid, st, 0)
 		self.status = M.wexit(st[0])
 		if self.status > 128 or self.xstage then -- (killed by a signal: bash reports the job)
-			M.fg_ended(self, pidp[0], st[0])
+			M.fg_ended(self, pid, st[0])
 		end
 		if self.jobs and self.jobs[1] then -- (wait_for's notify_of_job_status: the others too)
 			M.jobs_poll(self)
@@ -2615,18 +2628,8 @@ function Shell:exec_t(args)
 	C.posix_spawn_file_actions_init(fa)
 	C.posix_spawn_file_actions_adddup2(fa, wfd, 1)
 	C.posix_spawn_file_actions_addclose(fa, rfd)
-	M.foreign_fa(self, fa)
-	local pidp = ffi.new("curse_pid_t[1]")
-	local attr = child_spawnattr(self)
-	M.rd_gen = M.rd_gen + 1 -- (a new process may read our input: see M.pipe_cache)
-	local cenv = M.child_env() -- (bash's order; kept alive across the call)
 	M.nspawn = M.nspawn + 1
-	local rc = C.posix_spawn(pidp, execpath, fa, attr, ffi.cast("char *const *", argv), cenv)
-	if attr then
-		C.posix_spawnattr_destroy(attr)
-	end
-	C.posix_spawn_file_actions_destroy(fa)
-	local pid = pidp[0]
+	local rc, pid = spawn_argv(self, execpath, args, n, fa, false, 0)
 	if rc == 8 then -- ENOEXEC: no-shebang script — our interpreter runs it, into the capture
 		C.close(wfd)
 		C.close(rfd)
@@ -4462,44 +4465,19 @@ function Shell:spawn_bg(args, cmdstr)
 			return false
 		end
 	end
-	local argv = ffi.new("const char*[?]", n + 1)
-	local anchor = {}
-	for i = 1, n do
-		anchor[i] = tostring(args[i])
-		argv[i - 1] = anchor[i]
-	end
-	argv[n] = nil
 	io.flush()
 	local fa = ffi.new("uint8_t[1024]")
 	C.posix_spawn_file_actions_init(fa)
 	if (self.stdin_redir or 0) == 0 then -- async job: stdin </dev/null (unless redirected around it)
 		C.posix_spawn_file_actions_addopen(fa, 0, "/dev/null", 0, 0)
 	end
-	M.foreign_fa(self, fa)
-	C.setenv("_", execpath, 1) -- (the program's `_` is its path, as in Shell:exec)
-	local pidp = ffi.new("curse_pid_t[1]")
-	local attr = child_spawnattr(self)
-	local hold = not self.opt_m
-	if hold then
-		attr = async_spawn_hold(attr)
-	end
-	M.rd_gen = M.rd_gen + 1 -- (a new process may read our input: see M.pipe_cache)
-	local lvd = M.shlvl_delta -- (bash execs the job's command in place of its child: SHLVL - 1)
-	M.shlvl_delta = lvd - 1
-	local cenv = M.child_env() -- (bash's order; kept alive across the call)
-	M.shlvl_delta = lvd
-	local rc = C.posix_spawn(pidp, execpath, fa, attr, ffi.cast("char *const *", argv), cenv)
-	if hold then
-		async_spawn_release()
-	end
-	if attr then
-		C.posix_spawnattr_destroy(attr)
-	end
-	C.posix_spawn_file_actions_destroy(fa)
+	-- (SIGINT/SIGQUIT ignored without job control; bash execs the job's command in place of
+	-- its child: SHLVL - 1)
+	local rc, pid = spawn_argv(self, execpath, args, n, fa, not self.opt_m, -1)
 	if rc ~= 0 then
 		return false
 	end
-	local pid = tonumber(pidp[0])
+	pid = tonumber(pid)
 	M.job_add(self, pid, cmdstr)
 	self.bg_pids = self.bg_pids or {}
 	self.bg_pids[#self.bg_pids + 1] = pid
