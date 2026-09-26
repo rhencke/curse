@@ -8,6 +8,7 @@ abs() { (cd "$(dirname "$1")" && printf "%s/%s" "$(pwd)" "$(basename "$1")"); }
 LJ=$(abs "$1") CURSE=$(abs "$2") REPO=$3
 T=$(mktemp -d) || exit 1
 trap 'rm -rf "$T"' EXIT
+export XDG_CACHE_HOME="$T/cache"   # never the real ~/.cache (shared by every build/suite)
 fail=0
 
 # 1. every ffi.C symbol the dynamic luajit resolves must resolve in the static binary
