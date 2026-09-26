@@ -2094,8 +2094,8 @@ local function cond_check(toks, quoted, nlb, eof, line0, tl)
 	if e.near == "EOF" then -- (`[[ a &&` then EOF: the term's error, then the parser's)
 		error({ __curse_perr = true, pre = pre, msg = "syntax error: unexpected end of file", eof = true }, 0)
 	end
-	local near = (e.near == "&&" or e.near == "||") and e.near:sub(1, 1) or e.near
-	error({ __curse_perr = true, pre = pre, exact = true, msg = "syntax error near `" .. near .. "'", fk = fk }, 0)
+	-- (at a real token the caller re-derives `near` from the input text, as bash does)
+	error({ __curse_perr = true, pre = pre, exact = true, msg = "syntax error near `" .. e.near .. "'", fk = fk }, 0)
 end
 
 -- Build a [[ … ]] token list's boolean-expression AST:
@@ -4816,6 +4816,25 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs, xg, bq
 					if at then
 						i, line = at[1], at[2]
 						cerr.line = line
+					end
+					-- (bash names the offending token from the input TEXT, not the token:
+					-- error_token_from_text reads back from where the lexer stopped — just past
+					-- it — to a blank or one of `;|&`: `]];` reads as `;`, `]]>f` as `]]>`,
+					-- `&&` as `&`)
+					local tk = k > 0 and (toks[k] or (k == #toks + 1 and closed and "]]"))
+					if tk and cerr.exact then
+						local j = tp[k] + #tk - 1 -- (the token's last char…)
+						if not is_blank(src:sub(j + 1, j + 1)) and src:sub(j + 1, j + 1) ~= "\n" and j < n then
+							j = j + 1 -- (…or the metachar the lexer stopped on)
+						end
+						local b = j
+						while b > 1 and not (" \n\t;|&"):find(src:sub(b, b), 1, true) do
+							b = b - 1
+						end
+						if b < j and (" \n\t"):find(src:sub(b, b), 1, true) then
+							b = b + 1
+						end
+						cerr.msg = "syntax error near `" .. src:sub(b, j) .. "'"
 					end
 				end
 				error(cerr, 0)
