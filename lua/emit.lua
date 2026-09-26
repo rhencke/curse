@@ -1557,15 +1557,6 @@ local function emit_fragment(stmts, neg, liftset, cfraise)
 end
 
 
--- Command substitutions that never mutate escaping shell state (no var assignment,
--- cd, set/shopt, unset, trap, read, exec, function def, …) can run IN-PROCESS
--- (capture_inproc) instead of forking a whole warm-worker child — forking the fat
--- LuaJIT heap is the dominant cost of $(…)-heavy scripts. Safe iff the program has
--- no eval/source (else a literal name could be a runtime mutating function) AND every
--- body statement is a simple command whose literal name is a KNOWN-PURE builtin or a
--- plain EXTERNAL (a separate process — cannot touch the parent shell). Anything else
--- (a non-pure builtin, a function, a dynamic/compound/assigning body) keeps forking.
--- Missing a builtin from the pure set only costs a fork (never correctness).
 -- The rt.names_static guard expression for a set of command names: this module's
 -- compiled functions must still be registered as themselves; any other name must not
 -- have become a function.
@@ -1618,33 +1609,6 @@ local function dyn_guard(stmts)
 	table.sort(names)
 	return names_guard(names)
 end
-local PURE_BUILTIN_CMDSUB = { echo = 1, printf = 1, ["true"] = 1, ["false"] = 1,
-	[":"] = 1, pwd = 1, test = 1, ["["] = 1, exit = 1 }
-local function cmdsub_nofork_ok(stmts)
-	if #stmts == 0 then return false end
-	local BUILTINS = require("interp").BUILTINS
-	local ff = (emit_frag_ctx and emit_frag_ctx.funcflags) or {}
-	for _, st in ipairs(stmts) do
-		if st.t ~= "simple" then return false end
-		if st.assigns then return false end -- prefix env / assignment prefix mutates
-		-- a redirect (`echo x 1>&2`) must reach the real fds: only the isolated fd-level capture
-		-- path sends a builtin's redirected output where it belongs
-		if st.redirs then return false end
-		local w1 = st.words and st.words[1]
-		local c = w1 and w1.parts[1] and #w1.parts == 1 and w1.parts[1].lit
-		if not c then return false end -- no/dynamic command word (or assignment-only line)
-		if ff[c] then return false end -- a shell function may mutate the parent shell
-		if not (PURE_BUILTIN_CMDSUB[c] or not BUILTINS[c]) then return false end -- a non-pure builtin
-		if c == "printf" then
-			for j = 2, #st.words do
-				local p1 = st.words[j].parts[1]
-				if p1 and p1.lit == "-v" then return false end -- printf -v NAME writes a variable
-			end
-		end
-	end
-	return true
-end
-
 -- How the interpreter should reach a compiled function: through __upv_wrap when the
 -- module has lifted upvalues (see M.emit), else the closure itself.
 EF.upv_wrapped = function(fname)
@@ -1724,10 +1688,11 @@ function compile_cmdsub_inner(src, backtick, lifted, aenv, noalias, posix)
 	-- (checkpoint/restore + the __iso_cmdsub upvalue swap, no fork); anything else forks a
 	-- real child. The isolated fragment lifts the same upvalues as functions (EF.lifted_set)
 	-- so a called function and the body share `v_x`; __iso_cmdsub swap-saves them.
+	-- (pure: rt.cmdsub_pure, the one authority — with this program's functions)
 	local bt = backtick and "true" or "false"
-	local isolated = not cmdsub_nofork_ok(ast.stmts)
-		and not EF.inproc_trap_block
-		and #ast.stmts > 0
+	local pure = #ast.stmts > 0
+		and require("runtime").cmdsub_pure(ast.stmts, (emit_frag_ctx and emit_frag_ctx.funcflags) or {}, src)
+	local isolated = not pure and not EF.inproc_trap_block and #ast.stmts > 0
 	local id = emit_fragment(ast.stmts, nil, isolated and EF.lifted_set or nil)
 	if not id then
 		return fallback
@@ -1740,7 +1705,7 @@ function compile_cmdsub_inner(src, backtick, lifted, aenv, noalias, posix)
 		call = (EF.lifted_names and #EF.lifted_names > 0)
 				and ("__iso_cmdsub(sh, __CS[%d], %s)"):format(id, bt)
 			or ("sh:capture_compiled_iso(__CS[%d], %s)"):format(id, bt)
-	elseif cmdsub_nofork_ok(ast.stmts) then
+	elseif pure then
 		call = ("sh:capture_compiled(__CS[%d], false, %s)"):format(id, bt)
 	else
 		call = forked
@@ -8984,7 +8949,4 @@ function M.emit(ast, opts)
 end
 
 M.EF = EF
-M.cmdsub_nofork_ok = function(stmts) -- (tier: a runtime $(…) fragment picks its capture by it)
-	return cmdsub_nofork_ok(stmts)
-end
 return M

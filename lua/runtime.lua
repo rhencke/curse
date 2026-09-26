@@ -820,16 +820,6 @@ function Shell:localAssign(arg, cmd)
 	return true
 end
 
--- Split on default-IFS whitespace (no empty fields), for unquoted `$var` in a
--- `for x in $list` word list. (Custom IFS comes with the fuller word engine.)
-function Shell:split(s)
-	local out = {}
-	for w in s:gmatch("%S+") do
-		out[#out + 1] = w
-	end
-	return out
-end
-
 -- Run an external command via posix_spawnp + waitpid (FFI/libc directly — NOT
 -- /bin/sh, which would recurse when curse IS /bin/sh, and would lose signal
 -- info). We use posix_spawn rather than a manual fork+execvp so spawning from a
@@ -1349,7 +1339,7 @@ do
 	-- `LC_ALL=bogus /bin/true`: an external command's prefix is only its environment (no
 	-- sv_locale, so no warning); a builtin's or function's is a shell variable (it warns).
 	function M.prefix_ext(sh, cmd)
-		return cmd ~= nil and not sh.functions[cmd] and require("interp")._int.BUILTINS[cmd] == nil
+		return cmd ~= nil and not sh.functions[cmd] and M.BUILTINS[cmd] == nil
 	end
 	-- An in-process subshell's exit: put back the locale its checkpoint captured.
 	function M.locale_restore(st)
@@ -2354,6 +2344,50 @@ local function async_spawn_release()
 	C.curse_rt_sigaction(3, _aq_sa3, nil)
 	C.sigprocmask(2, _aq_old, nil) -- SIG_SETMASK
 end
+-- posix_spawn `args[1..n]` (argv[0]: `exec -a`'s NAME, if any) at `path` as a child of the
+-- shell — the one spawn of an external (Shell:exec_t, straight to fd 1 or into a capture;
+-- Shell:spawn_bg): the program's `_` is its own path (bash; not under `exec`, whose image
+-- has none of its own), file actions `fa` plus closing every fd another in-process shell
+-- owns, the signal mask a bash child starts with, SIGINT/SIGQUIT ignored for an async one
+-- (`hold`), and the child environ with SHLVL moved by `lvl`. Returns rc, pid.
+local function spawn_argv(self, path, args, n, fa, hold, lvl)
+	local argv = ffi.new("const char*[?]", n + 1)
+	local anchor = {} -- keep the Lua strings alive while argv points into them
+	for i = 1, n do
+		anchor[i] = tostring(args[i])
+		argv[i - 1] = anchor[i]
+	end
+	argv[n] = nil
+	if self.exec_argv0 then -- exec -a NAME
+		anchor.a0 = tostring(self.exec_argv0)
+		argv[0] = anchor.a0
+	end
+	if not self.exec_noenv then
+		C.setenv("_", path, 1)
+	end
+	fa = M.foreign_fa(self, fa)
+	local attr = child_spawnattr(self)
+	if hold then
+		attr = async_spawn_hold(attr)
+	end
+	M.rd_gen = M.rd_gen + 1 -- (a new process may read our input: see M.pipe_cache)
+	local d = M.shlvl_delta
+	M.shlvl_delta = d + lvl
+	local cenv = M.child_env() -- (bash's order; kept alive across the call)
+	M.shlvl_delta = d
+	local pidp = ffi.new("curse_pid_t[1]")
+	local rc = C.posix_spawn(pidp, path, fa, attr, ffi.cast("char *const *", argv), cenv)
+	if hold then
+		async_spawn_release()
+	end
+	if fa then
+		C.posix_spawn_file_actions_destroy(fa)
+	end
+	if attr then
+		C.posix_spawnattr_destroy(attr)
+	end
+	return rc, pidp[0]
+end
 -- The last command of a ( … ) / $( … ) body (parser.mark_tail) that turns out to be an
 -- external command is exec'd by bash in place of the subshell's own process (CMD_NO_FORK),
 -- lowering $SHLVL first like `exec` (execute_disk_command's adjust_shell_level(-1)) — the
@@ -2479,50 +2513,19 @@ function Shell:exec_t(args)
 			return
 		end
 	end
-	local argv = ffi.new("const char*[?]", n + 1)
-	local anchor = {} -- keep the Lua strings alive while argv points into them
-	for i = 1, n do
-		anchor[i] = tostring(args[i])
-		argv[i - 1] = anchor[i]
-	end
-	argv[n] = nil
-	if not self.exec_noenv then
-		C.setenv("_", execpath, 1) -- a program sees `_` = its own path (bash), not the shell's $_
-	end
-	if self.exec_argv0 then
-		anchor.a0 = tostring(self.exec_argv0)
-		argv[0] = anchor.a0
-	end -- exec -a NAME
 	-- Not capturing (self.out is the real fd 1, e.g. a top-level command or a
 	-- pipeline stage): let the child write STRAIGHT to fd 1 (inherit fds) instead
 	-- of buffering all its output — so an unbounded producer (`cat /dev/zero | …`)
 	-- streams and SIGPIPE propagates, and there's no 2x-memory capture.
 	if self.out == io.write or CO_OUTS[self.out] then
 		io.flush() -- our own buffered stdout (and a pipeline stage's) must reach fd 1 first
-		local pidp = ffi.new("curse_pid_t[1]")
-		local attr = child_spawnattr(self)
 		-- (an async job's command — not a function's — or one in an async subshell: with
 		-- SIGINT/SIGQUIT ignored, setup_async_signals)
 		local ist = self.iso_ctx
 		local hold = (self.bg_cd and self.bg_cd == self.calldepth)
 			or (ist and ist[1] and ist[#ist].igint and (ist[#ist].igint[2] or ist[#ist].igint[3]) and true)
-		if hold then
-			attr = async_spawn_hold(attr)
-		end
-		local fa = M.foreign_fa(self, nil)
-		M.rd_gen = M.rd_gen + 1 -- (a new process may read our input: see M.pipe_cache)
-		local cenv = M.child_env() -- (bash's order; kept alive across the call)
 		M.nspawn = M.nspawn + 1 -- (a real child: its death is a real SIGCHLD)
-		local rc = C.posix_spawn(pidp, execpath, fa, attr, ffi.cast("char *const *", argv), cenv)
-		if hold then
-			async_spawn_release()
-		end
-		if fa then
-			C.posix_spawn_file_actions_destroy(fa)
-		end
-		if attr then
-			C.posix_spawnattr_destroy(attr)
-		end
+		local rc, pid = spawn_argv(self, execpath, args, n, nil, hold, 0)
 		if rc == 8 then
 			return self:run_noexec(execpath, args, n)
 		end -- no shebang: run as a script
@@ -2532,10 +2535,10 @@ function Shell:exec_t(args)
 			return
 		end
 		local st = ffi.new("int[1]")
-		M.wait_child(pidp[0], st, 0)
+		M.wait_child(pid, st, 0)
 		self.status = M.wexit(st[0])
 		if self.status > 128 or self.xstage then -- (killed by a signal: bash reports the job)
-			M.fg_ended(self, pidp[0], st[0])
+			M.fg_ended(self, pid, st[0])
 		end
 		if self.jobs and self.jobs[1] then -- (wait_for's notify_of_job_status: the others too)
 			M.jobs_poll(self)
@@ -2555,18 +2558,8 @@ function Shell:exec_t(args)
 	C.posix_spawn_file_actions_init(fa)
 	C.posix_spawn_file_actions_adddup2(fa, wfd, 1)
 	C.posix_spawn_file_actions_addclose(fa, rfd)
-	M.foreign_fa(self, fa)
-	local pidp = ffi.new("curse_pid_t[1]")
-	local attr = child_spawnattr(self)
-	M.rd_gen = M.rd_gen + 1 -- (a new process may read our input: see M.pipe_cache)
-	local cenv = M.child_env() -- (bash's order; kept alive across the call)
 	M.nspawn = M.nspawn + 1
-	local rc = C.posix_spawn(pidp, execpath, fa, attr, ffi.cast("char *const *", argv), cenv)
-	if attr then
-		C.posix_spawnattr_destroy(attr)
-	end
-	C.posix_spawn_file_actions_destroy(fa)
-	local pid = pidp[0]
+	local rc, pid = spawn_argv(self, execpath, args, n, fa, false, 0)
 	if rc == 8 then -- ENOEXEC: no-shebang script — our interpreter runs it, into the capture
 		C.close(wfd)
 		C.close(rfd)
@@ -2603,88 +2596,56 @@ function Shell:exec_t(args)
 	end
 end
 
--- A `$(…)` body is "pure" (no shell-state side effects, so safe to run in-process
--- for speed) when every command is a plain external/non-mutating-builtin call with
--- no assignments, no mutating builtin, no user-function call, and no control flow.
--- Anything else runs fully isolated (capture_compiled_iso). (A file redirect like `>f` is fine — the
--- write happens either way; only `exec` rewires shell fds, and it's listed here.)
-local CAPTURE_IMPURE = {
-	cd = 1,
-	set = 1,
-	shopt = 1,
-	unset = 1,
-	export = 1,
-	declare = 1,
-	typeset = 1,
-	["local"] = 1,
-	readonly = 1,
-	trap = 1,
-	umask = 1,
-	exec = 1,
-	eval = 1,
-	source = 1,
-	["."] = 1,
-	pushd = 1,
-	popd = 1,
-	hash = 1,
-	shift = 1,
-	read = 1,
-	mapfile = 1,
-	readarray = 1,
-	let = 1,
-	getopts = 1,
-	ulimit = 1,
-	disown = 1,
-	["return"] = 1,
-	["set-o"] = 1,
-	history = 1, -- (`set -o history`: the list is subshell state)
-	fc = 1,
-	complete = 1, -- (completion specs, and compgen's hostname list / -F functions)
-	compopt = 1,
-	compgen = 1,
-	bind = 1, -- (readline's keymaps/variables: b_bind snapshots them per isolation context)
-}
-local function capture_pure(sh, st)
+-- Is a `$(…)` body PURE — no shell-state side effect to leak, so it may run with only
+-- capture_inproc's light $() state instead of the full checkpoint (capture_compiled_iso)?
+-- The ONE authority: emit asks it at compile time (fns = the program's funcflags),
+-- capture_src at run time (fns = sh.functions). Pure iff the text never reads the
+-- per-subshell $BASHPID/$RANDOM and every command (through && || and pipelines) is a
+-- simple command with no assignment and no redirection (a builtin's redirected output
+-- needs the fd-level capture), whose literal name is no function and is an external — a
+-- separate process — or a builtin that can't touch the shell (printf without -v).
+-- Anything else (`command cd`, `builtin set`, a function, a compound) is isolated;
+-- missing a builtin here only costs the checkpoint, never correctness.
+local PURE_CMDSUB_BUILTIN = { echo = 1, printf = 1, ["true"] = 1, ["false"] = 1, [":"] = 1, pwd = 1,
+	test = 1, ["["] = 1, exit = 1 }
+local function cmdsub_pure_st(st, fns)
 	local t = st.t
-	if t == "andor" then
-		for _, it in ipairs(st.items) do
-			if not capture_pure(sh, it.cmd) then
+	if t == "andor" or t == "pipeline" then
+		for _, it in ipairs(st.items or st.cmds) do
+			if not cmdsub_pure_st(it.cmd or it, fns) then
 				return false
-			end
-		end
-		return true
-	elseif t == "pipeline" then
-		for _, c in ipairs(st.cmds) do
-			if not capture_pure(sh, c) then
-				return false
-			end
-		end
-		return true
-	elseif t == "simple" then
-		if st.assigns or st.arrayargs then
-			return false
-		end -- prefix/array assignment mutates
-		local w = st.words and st.words[1]
-		local lit = w and w.parts and #w.parts == 1 and w.parts[1].lit
-		if not lit then
-			return false
-		end -- dynamic/compound command name: be safe, isolate
-		if CAPTURE_IMPURE[lit] or sh.functions[lit] then
-			return false
-		end
-		-- (`2>&1` dups fd 1 at the fd level: only the fd-level capture of the isolated
-		-- path sees a builtin's diagnostics there)
-		local rs = st.redirs
-		if rs then
-			for k = 1, #rs do
-				if rs[k].op == "dup" and rs[k].fd == 2 then
-					return false
-				end
 			end
 		end
 		return true
 	end
-	return false -- if/while/for/case/subshell/group/funcdef/background/arithcmd: isolate
+	if t ~= "simple" or st.assigns or st.arrayargs or st.redirs then
+		return false
+	end
+	local w = st.words and st.words[1]
+	local c = w and w.parts and #w.parts == 1 and w.parts[1].lit
+	if not c or fns[c] or not (PURE_CMDSUB_BUILTIN[c] or not M.BUILTINS[c]) then
+		return false
+	end
+	if c == "printf" then
+		for j = 2, #st.words do
+			local p1 = st.words[j].parts[1]
+			if p1 and p1.lit == "-v" then
+				return false -- (printf -v NAME writes a variable)
+			end
+		end
+	end
+	return true
+end
+function M.cmdsub_pure(stmts, fns, src)
+	if src:find("BASHPID", 1, true) or src:find("RANDOM", 1, true) then
+		return false
+	end
+	for _, st in ipairs(stmts) do
+		if not cmdsub_pure_st(st, fns) then
+			return false
+		end
+	end
+	return true
 end
 
 function Shell:capture_src(src, backtick, noalias, line0)
@@ -2749,10 +2710,8 @@ function Shell:capture_src(src, backtick, noalias, line0)
 		end
 	end
 	-- Full subshell isolation (checkpoint/restore, in-process) UNLESS the body is provably
-	-- pure — a pure body has no shell-state side effects to leak, so it runs with just the
-	-- light $() state (the common `$(cmd)`/`$(echo …)` case). $BASHPID/$RANDOM are
-	-- per-subshell, so a body reading them is isolated too.
-	local iso = src:find("BASHPID", 1, true) ~= nil or src:find("RANDOM", 1, true) ~= nil
+	-- pure (M.cmdsub_pure): then just the light $() state (the common `$(cmd)` case).
+	local iso = not M.cmdsub_pure(ast.stmts, self.functions, src)
 	local has_perr = false
 	for _, st in ipairs(ast.stmts) do
 		if st.t == "parse_error" then
@@ -2780,9 +2739,6 @@ function Shell:capture_src(src, backtick, noalias, line0)
 				st.plabel = "command substitution"
 			end
 		end
-		if not capture_pure(self, st) then
-			iso = true
-		end
 	end
 	-- Text that recurs runs compiled (tier fragment keyed by text, line, trap state and the
 	-- live alias table it parses with — none when read with aliases already expanded) — the
@@ -2791,7 +2747,7 @@ function Shell:capture_src(src, backtick, noalias, line0)
 	local mod = require("tier").try_fragment(src, ln and ln > 0 and ln or nil, self, nil, backtick and "cmdsub-bq" or "cmdsub", noalias)
 	if mod then
 		local run_compiled = require("tier").run_compiled
-		if (iso or not mod.nofork) and not has_perr then
+		if iso and not has_perr then
 			return self:capture_compiled_iso(function(self)
 				return run_compiled(mod, self, nil, true)
 			end, backtick)
@@ -2828,12 +2784,40 @@ end
 -- for pure bodies (no stderr/2>&1 to worry about); the fd path is for isolated mutating
 -- $() where a builtin may redirect its diagnostics into the capture. A temp file (not a
 -- pipe) means no self-deadlock when the body out-writes the pipe buffer in one process.
+local function shallowcopy(t)
+	if t == nil then return nil end
+	local c = {}
+	for k, v in pairs(t) do c[k] = v end
+	return c
+end
+-- The light state every in-process subprogram — `( … )` (subshell_run), `$(…)`
+-- (capture_inproc) — enters with and gives back: its own copy of the aliases (an alias it
+-- defines doesn't leak out: bash), its lines ($LINENO, $BASH_COMMAND), the loop depth, one
+-- more subprogram and subshell level ($BASH_SUBSHELL — still in force for its EXIT trap),
+-- and no exec-in-place tail. (bash's cleanup_dead_jobs, on a fork: the notified dead jobs go.)
+local function subprog_enter(self)
+	if self.jobs_waited then
+		M.jobs_cleanup_waited(self)
+	end
+	local al, ln, cc, tl, cl, ld, sd = self.aliases, self.cur_line, self.cur_cmd, self.shlvl_tail, self.cur_cline,
+		self.loopdepth, self.subdepth
+	self.aliases = shallowcopy(al) or {}
+	self.shlvl_tail = nil
+	self.in_subprogram = (self.in_subprogram or 0) + 1
+	self.subdepth = (sd or 0) + 1
+	return al, ln, cc, tl, cl, ld, sd -- (the saved state as values: no table per subprogram)
+end
+local function subprog_leave(self, al, ln, cc, tl, cl, ld, sd)
+	self.aliases, self.cur_line, self.cur_cmd, self.shlvl_tail = al, ln, cc, tl
+	self.cur_cline, self.loopdepth, self.subdepth = cl, ld, sd
+	self.in_subprogram = self.in_subprogram - 1
+end
 local deferred_sigs, cap_depth, cap_pid, flush_deferred, cap_enter -- (the signal hold: see M.defer_signal)
 function Shell:capture_inproc(backtick, runner, capfd, ctx)
 	M.env_rebuilt(self) -- (command_substitute's maybe_make_export_env)
-	if self.jobs_waited then -- (bash's cleanup_dead_jobs, on a fork: the notified dead jobs go)
-		M.jobs_cleanup_waited(self)
-	end
+	-- ($(…) inside a loop knows it — a break/continue there ends the substitution, as it
+	-- ends a `( … )` (bash) — so its loopdepth stays)
+	local s1, s2, s3, s4, s5, s6, s7 = subprog_enter(self)
 	local buf, tmp, save1
 	if capfd then
 		io.flush()
@@ -2861,38 +2845,15 @@ function Shell:capture_inproc(backtick, runner, capfd, ctx)
 		end
 		self.capturing = true -- last pipeline stage drains into buf
 	end
-	self.in_subprogram = (self.in_subprogram or 0) + 1 -- $(...) is a subprogram: ERR trap suppressed
-	local saved_ld = self.loopdepth -- ($(…) inside a loop knows it: a break/continue there
-	-- ends the substitution, as it ends a `( … )` — bash)
-	local savede = self.opt_e
+	local savede = self.opt_e -- (the ERR trap: suppressed in a subprogram)
 	if not (self.opt_posix or (self.shopt and self.shopt.inherit_errexit)) then
 		self.opt_e = false
 	end
-	local saved_line, saved_cc, saved_tl = self.cur_line, self.cur_cmd, self.shlvl_tail -- $LINENO: the sub's internal lines don't leak out
-	local saved_cl = self.cur_cline -- (nor the line a next $(…) of this command numbers from)
-	self.shlvl_tail = nil
-	-- $() is a child: it INHERITS the parent's aliases but its own alias/unalias
-	-- do not leak back out (bash). Give it an independent copy, restored after.
-	local saved_aliases = self.aliases
-	do
-		local c = {}
-		for k, v in pairs(saved_aliases) do
-			c[k] = v
-		end
-		self.aliases = c
-	end
-	-- (and its own command hash table: what it hashes, or the hits it counts, stay there)
+	-- (its own command hash table: what it hashes, or the hits it counts, stay there)
 	local sv_hc, sv_hp = self.hashcache, self.hashpath
-	if sv_hc then
-		local c = {}
-		for k, v in pairs(sv_hc) do
-			c[k] = v
-		end
-		self.hashcache = c
-	end
-	local sv_xd, sv_depth = self.xdepth, self.subdepth
+	self.hashcache = shallowcopy(sv_hc)
+	local sv_xd = self.xdepth
 	self.xdepth = (sv_xd or 0) + 1 -- xtrace: PS4's first char repeats per $(…) level
-	self.subdepth = (sv_depth or 0) + 1
 	local sv_cj, sv_xs = self.cap_jobs, self.xsigint
 	self.cap_jobs, self.xsigint = {}, nil
 	cap_enter()
@@ -2909,7 +2870,7 @@ function Shell:capture_inproc(backtick, runner, capfd, ctx)
 	if cap_pid == C.getpid() then
 		cap_depth = cap_depth - 1 -- (a held signal is raised once the capture is done, below)
 	end
-	self.xdepth, self.subdepth = sv_xd, sv_depth
+	self.xdepth = sv_xd
 	if ctx and ctx.pid == C.getpid() then
 		if not ok and type(err) == "table" and err.__curse_vsig == ctx then
 			err = { __curse_exit = 128 + err.sig } -- (`kill $BASHPID`: the substitution dies)
@@ -2923,13 +2884,9 @@ function Shell:capture_inproc(backtick, runner, capfd, ctx)
 		end
 		M.iso_restore_fds(ctx) -- (`exec 4>&1` in the body: undone while fd 1 is still the capture)
 	end
-	self.aliases = saved_aliases -- discard aliases defined inside $()
+	subprog_leave(self, s1, s2, s3, s4, s5, s6, s7)
 	self.hashcache, self.hashpath = sv_hc, sv_hp
-	self.cur_line, self.cur_cmd, self.shlvl_tail = saved_line, saved_cc, saved_tl -- ($BASH_COMMAND: the child's was its own)
-	self.cur_cline = saved_cl
 	self.opt_e = savede
-	self.loopdepth = saved_ld
-	self.in_subprogram = self.in_subprogram - 1
 	self.capturing = saved_cap
 	self.out = saved
 	if capfd then
@@ -3018,12 +2975,6 @@ function M.getopts_remap(st, from, to)
 	end
 	return r
 end
-local function shallowcopy(t)
-	if t == nil then return nil end
-	local c = {}
-	for k, v in pairs(t) do c[k] = v end
-	return c
-end
 
 -- CHECKPOINT the process/shell state a forked subprogram (`( … )` or `$(…)`) isolates
 -- for free but an in-process run would leak: variables (DEEP-copied boxes — the copy is
@@ -3050,51 +3001,49 @@ local function opt_fields()
 end
 M.opt_fields = opt_fields
 local iso_push, iso_pop
-local function sub_checkpoint(self)
-	local orig_vars = self.vars
-	local copy = {}
-	for k, b in pairs(orig_vars) do copy[k] = copybox(b) end
-	self.vars = copy
-	local exset = {}
-	for name, b in pairs(orig_vars) do
-		if b.exported then exset[name] = true end
+local sub_checkpoint, sub_restore, scopes_copy
+do -- (a block of its own: the main chunk is at LuaJIT's 200-local limit)
+-- The Shell fields a subshell may change that are plain values or containers it replaces
+-- or mutates in place: SUB_KEEP is saved and put back; SUB_COPY also gets a private
+-- shallow copy for the body. (Deeper state — vars, the dynamic scopes, params, completion
+-- specs, history, cwd — is handled below.)
+local SUB_KEEP = { "hashpath", "tcwd", "random_plain", "shellopts_exported", "argv0", "sec_off",
+	"subsh_off", "hosts", "nparams", "params", "getopts_state", "complete", "savedstack", "tenv" }
+local SUB_COPY = { "shopt", "functions", "dirstack", "hashcache", "bav", "fn_ro", "unset_specials",
+	"disabled_builtins" }
+-- sub_save(self, copy) -> the saved values (SUB_COPY's then replaced by copy(v)) and
+-- sub_put(self, saved), compiled from the two lists so each field is a constant-key access
+-- (the JIT's fast path; a subshell per loop iteration is common), not a loop over names.
+local sub_save, sub_put
+do
+	local get, cp, put = {}, {}, {}
+	for _, f in ipairs(SUB_KEEP) do
+		get[#get + 1] = "self." .. f
 	end
-	local pcopy = {}
-	for i = 1, self.nparams do pcopy[i] = self.params[i] end
-	local cp = {
-		orig_vars = orig_vars, copy = copy, exset = exset,
-		params = self.params, nparams = self.nparams,
-		shopt = self.shopt, functions = self.functions,
-		locale_gen = M.locale_gen, lc_state = M.lc_state, lcsnap = M.lc_envsnap,
-		l10nk = package.loaded.l10n and package.loaded.l10n.known_save(), dirstack = self.dirstack, hashcache = self.hashcache, hashpath = self.hashpath, getopts = self.getopts_state,
-		cwd = self:phys_cwd(), tcwd = self.tcwd, um = C.umask(0), disabled = self.disabled_builtins,
-		fn_ro = self.fn_ro, unset_specials = self.unset_specials, random_plain = self.random_plain,
-		shellopts_exported = self.shellopts_exported, bav = self.bav, argv0 = self.argv0,
-		sec_off = self.sec_off, subsh_off = self.subsh_off, complete = self.complete, hosts = self.hosts,
-	}
-	if self.complete then -- (completion specs: the copies share opts as the originals do —
-		local oc, tab = {}, {} -- compopt changes a shared compspec's options in place)
-		for n, cs in pairs(self.complete) do
-			local o = cs.opts
-			if not oc[o] then oc[o] = shallowcopy(o) end
-			local c = shallowcopy(cs)
-			c.opts = oc[o]
-			tab[n] = c
-		end
-		self.complete = tab
+	for _, f in ipairs(SUB_COPY) do
+		get[#get + 1] = "self." .. f
+		cp[#cp + 1] = ("self.%s = copy(self.%s)"):format(f, f)
 	end
-	self.bav = shallowcopy(self.bav)
-	self.fn_ro, self.unset_specials = shallowcopy(self.fn_ro), shallowcopy(self.unset_specials)
-	self.disabled_builtins = shallowcopy(self.disabled_builtins)
-	C.umask(cp.um)
-	local of, ov = opt_fields(), {}
-	for i = 1, #of do ov[i] = self[of[i]] end
-	cp.opts = ov
-	-- The dynamic-scope layers behind the visible vars — `local` shadow records and
-	-- tempenv bindings — are mutated by `unset` (which REVEALS the next layer: drops the
-	-- record / marks the tempenv consumed and installs its box). Give the body private
-	-- copies (records AND the shadowed boxes they hold) so neither escapes.
-	cp.savedstack, cp.tenv = self.savedstack, self.tenv
+	for i, g in ipairs(get) do
+		put[i] = ("%s = sv[%d]"):format(g, i)
+	end
+	sub_save = load(("return function(self, copy) local sv = { %s }; %s; return sv end")
+		:format(table.concat(get, ", "), table.concat(cp, "; ")), "=sub_save")()
+	sub_put = load(("return function(self, sv) %s end"):format(table.concat(put, "; ")), "=sub_put")()
+end
+-- A private copy of the variables and the dynamic-scope layers behind them — `local`
+-- shadow records and tempenv bindings, mutated by `unset` (which REVEALS the next layer:
+-- drops the record / marks the tempenv consumed and installs its box) — records AND the
+-- boxes they hold, so neither escapes. The ORIGINAL boxes stay pristine, so a reference
+-- to one stays valid. Also re-keys getopts' per-OPTIND-box state onto the copies.
+-- Shared by sub_checkpoint and Shell:stage_clone.
+function scopes_copy(self, into)
+	local orig, vars = self.vars, {}
+	for k, b in pairs(orig) do
+		vars[k] = copybox(b)
+	end
+	into.vars = vars
+	into.getopts_state = M.getopts_remap(self.getopts_state, orig, vars)
 	local ss = {}
 	for d, rec in pairs(self.savedstack) do
 		if rec then
@@ -3109,20 +3058,48 @@ local function sub_checkpoint(self)
 			ss[d] = rec
 		end
 	end
-	self.savedstack = ss
+	into.savedstack = ss
 	local te = {}
 	for k = 1, #self.tenv do
 		local e2 = shallowcopy(self.tenv[k])
 		if e2.box then e2.box = copybox(e2.box) end
 		te[k] = e2
 	end
-	self.tenv = te
+	into.tenv = te
+end
+function sub_checkpoint(self)
+	local orig_vars = self.vars
+	local exset = {}
+	for name, b in pairs(orig_vars) do
+		if b.exported then exset[name] = true end
+	end
+	local sv = sub_save(self, shallowcopy)
+	local cp = {
+		orig_vars = orig_vars, exset = exset, sv = sv,
+		locale_gen = M.locale_gen, lc_state = M.lc_state, lcsnap = M.lc_envsnap,
+		l10nk = package.loaded.l10n and package.loaded.l10n.known_save(),
+		cwd = self:phys_cwd(), um = C.umask(0),
+	}
+	scopes_copy(self, self)
+	cp.copy = self.vars
+	if self.complete then -- (completion specs: the copies share opts as the originals do —
+		local oc, tab = {}, {} -- compopt changes a shared compspec's options in place)
+		for n, cs in pairs(self.complete) do
+			local o = cs.opts
+			if not oc[o] then oc[o] = shallowcopy(o) end
+			local c = shallowcopy(cs)
+			c.opts = oc[o]
+			tab[n] = c
+		end
+		self.complete = tab
+	end
+	C.umask(cp.um)
+	local of, ov = opt_fields(), {}
+	for i = 1, #of do ov[i] = self[of[i]] end
+	cp.opts = ov
+	local pcopy = {}
+	for i = 1, self.nparams do pcopy[i] = self.params[i] end
 	self.params = pcopy
-	self.shopt = shallowcopy(self.shopt) or {}
-	self.functions = shallowcopy(self.functions) or {}
-	self.getopts_state = M.getopts_remap(self.getopts_state, orig_vars, copy)
-	self.dirstack = shallowcopy(self.dirstack)
-	self.hashcache = shallowcopy(self.hashcache)
 	if self.history then -- (`set -o history`: a subshell edits its own copy of the list)
 		cp.hist = { self.history, self.hist_ts, self.hist_base, self.hist_session,
 			self.hist_last_added, self.hist_pushed, self.hist_file_lines, self.hist_first_saved }
@@ -3137,7 +3114,7 @@ local function sub_checkpoint(self)
 	end
 	return cp
 end
-local function sub_restore(self, cp)
+function sub_restore(self, cp)
 	self.vars = cp.orig_vars
 	if cp.locale_gen ~= M.locale_gen then -- (`(LANG=C; …)`: setlocale is process-wide)
 		M.locale_restore(cp.lc_state)
@@ -3146,11 +3123,8 @@ local function sub_restore(self, cp)
 	if cp.l10nk then
 		package.loaded.l10n.known_restore(cp.l10nk)
 	end
-	self.params, self.nparams = cp.params, cp.nparams
-	self.shopt, self.functions = cp.shopt, cp.functions
+	sub_put(self, cp.sv)
 	M.glob_asciirange = self.shopt.globasciiranges ~= false
-	self.dirstack, self.hashcache, self.getopts_state = cp.dirstack, cp.hashcache, cp.getopts
-	self.hashpath = cp.hashpath
 	local hc = cp.hist
 	if hc then
 		self.history, self.hist_ts, self.hist_base, self.hist_session = hc[1], hc[2], hc[3], hc[4]
@@ -3158,12 +3132,6 @@ local function sub_restore(self, cp)
 	end
 	local of, ov = opt_fields(), cp.opts
 	for i = 1, #of do self[of[i]] = ov[i] end
-	self.savedstack, self.tenv, self.bav = cp.savedstack, cp.tenv, cp.bav
-	self.disabled_builtins = cp.disabled
-	self.fn_ro, self.unset_specials, self.random_plain = cp.fn_ro, cp.unset_specials, cp.random_plain
-	self.shellopts_exported = cp.shellopts_exported
-	self.argv0, self.sec_off, self.subsh_off = cp.argv0, cp.sec_off, cp.subsh_off
-	self.complete, self.hosts = cp.complete, cp.hosts
 	if cp.cwdfd then
 		if cp.cwdfd >= 0 then
 			C.curse_co_fchdir(cp.cwdfd)
@@ -3172,7 +3140,6 @@ local function sub_restore(self, cp)
 	elseif cp.cwd ~= "" then
 		C.chdir(cp.cwd)
 	end
-	self.tcwd = cp.tcwd
 	C.umask(cp.um)
 	-- Re-sync the process environ: drop names the body newly exported, then restore
 	-- every name exported at entry to its parent value (covers changed + unset-in-sub).
@@ -3183,6 +3150,7 @@ local function sub_restore(self, cp)
 		C.setenv(name, self:get(name) or "", 1)
 	end
 end
+end -- (the checkpoint block)
 
 -- sh.iso_ctx is the stack of active in-process isolation contexts (innermost last): a
 -- `( … )`, an isolated $(…), a pipeline stage (task).
@@ -3791,23 +3759,15 @@ end
 -- redirects (`saves`) are restored here too. exit/return/div0 in the body become the
 -- subshell's status.
 function Shell:subshell_run(runner, saves, paren, inplace)
-	if self.jobs_waited then -- (bash's cleanup_dead_jobs, on a fork: the notified dead jobs go)
-		M.jobs_cleanup_waited(self)
-	end
+	local s1, s2, s3, s4, s5, s6, s7 = subprog_enter(self)
 	local cp = sub_checkpoint(self)
-	local sv_out, sv_line, sv_cc, sv_tl = self.out, self.cur_line, self.cur_cmd, self.shlvl_tail
-	local sv_cl = self.cur_cline
-	self.shlvl_tail = nil
-	local sv_ld, sv_ne, sv_alias = self.loopdepth, self.noerr, self.aliases
-	self.aliases = shallowcopy(self.aliases) or {}
-	self.in_subprogram = (self.in_subprogram or 0) + 1
+	local sv_out, sv_ne = self.out, self.noerr
 	local sv_psp = self.paren_sp -- (a `( … )`: the subprogram level that is one — exec.def's SUBSHELL_PAREN)
 	if paren then
 		self.paren_sp = self.in_subprogram
 	end
 	self.loopdepth = 0
-	local sv_depth, sv_jobs, sv_cur, sv_prev = self.subdepth, self.jobs, self.job_cur, self.job_prev
-	self.subdepth = (sv_depth or 0) + 1
+	local sv_jobs, sv_cur, sv_prev = self.jobs, self.job_cur, self.job_prev
 	-- (a subshell has no jobs of the parent's — nor its remembered pids, bgp_clear: `wait`
 	-- says they're not its children; its own are numbered from 1)
 	local sv_bgpc = self.bgp_cleared
@@ -3860,13 +3820,8 @@ function Shell:subshell_run(runner, saves, paren, inplace)
 	self.jobs, self.job_cur, self.job_prev = sv_jobs, sv_cur, sv_prev
 	self.bgp_cleared = sv_bgpc
 	if saves then M.redir_restore(saves) end
-	self.out, self.cur_line, self.cur_cmd = sv_out, sv_line, sv_cc -- ($BASH_COMMAND: the child's was its own)
-	self.cur_cline = sv_cl
-	self.shlvl_tail = sv_tl
-	self.loopdepth, self.noerr, self.aliases = sv_ld, sv_ne, sv_alias
-	self.in_subprogram = self.in_subprogram - 1
-	self.paren_sp = sv_psp
-	self.subdepth = sv_depth
+	self.out, self.noerr, self.paren_sp = sv_out, sv_ne, sv_psp
+	subprog_leave(self, s1, s2, s3, s4, s5, s6, s7)
 	sub_restore(self, cp)
 	if killed then -- the parent's report of its child that a signal killed (a `( … )`: its text)
 		if not ctx.vpid then
@@ -3954,7 +3909,7 @@ function M.foreign_jobs(sh)
 	end
 	return f
 end
--- A `$(…)` whose body MUTATES shell state (emit's / tier's cmdsub_nofork_ok says no): run
+-- A `$(…)` whose body MUTATES shell state (M.cmdsub_pure says no): run
 -- it in-process with FULL isolation (sub_checkpoint/restore). capture_inproc supplies the
 -- $()-specific light state (fd-level capture, errexit OFF unless inherit_errexit, aliases,
 -- in_subprogram, cur_line, trailing-newline/NUL strip, exit/return→status); the heavy
@@ -4003,7 +3958,7 @@ function Shell:capture_file(path)
 	return ""
 end
 
--- Compiled-tier command substitution of a provably pure body (emit's cmdsub_nofork_ok):
+-- Compiled-tier command substitution of a provably pure body (M.cmdsub_pure):
 -- the compiled fragment `cs_fn(sh)` runs with only capture_inproc's light isolation (a
 -- mutating body goes through capture_compiled_iso instead).
 function Shell:capture_compiled(cs_fn, _, backtick) -- (2nd arg: a retired fork flag)
@@ -4463,8 +4418,7 @@ function Shell:spawn_bg(args, cmdstr)
 		return false
 	end
 	-- a (dynamic) word that names a function/builtin/alias runs shell code: a task for it
-	local I = package.loaded.interp
-	if self.functions[args[1]] or (I and I.BUILTINS[args[1]]) or (self.aliases and self.aliases[args[1]]) then
+	if self.functions[args[1]] or M.BUILTINS[args[1]] or (self.aliases and self.aliases[args[1]]) then
 		return false
 	end
 	local execpath = args[1]
@@ -4474,44 +4428,19 @@ function Shell:spawn_bg(args, cmdstr)
 			return false
 		end
 	end
-	local argv = ffi.new("const char*[?]", n + 1)
-	local anchor = {}
-	for i = 1, n do
-		anchor[i] = tostring(args[i])
-		argv[i - 1] = anchor[i]
-	end
-	argv[n] = nil
 	io.flush()
 	local fa = ffi.new("uint8_t[1024]")
 	C.posix_spawn_file_actions_init(fa)
 	if (self.stdin_redir or 0) == 0 then -- async job: stdin </dev/null (unless redirected around it)
 		C.posix_spawn_file_actions_addopen(fa, 0, "/dev/null", 0, 0)
 	end
-	M.foreign_fa(self, fa)
-	C.setenv("_", execpath, 1) -- (the program's `_` is its path, as in Shell:exec)
-	local pidp = ffi.new("curse_pid_t[1]")
-	local attr = child_spawnattr(self)
-	local hold = not self.opt_m
-	if hold then
-		attr = async_spawn_hold(attr)
-	end
-	M.rd_gen = M.rd_gen + 1 -- (a new process may read our input: see M.pipe_cache)
-	local lvd = M.shlvl_delta -- (bash execs the job's command in place of its child: SHLVL - 1)
-	M.shlvl_delta = lvd - 1
-	local cenv = M.child_env() -- (bash's order; kept alive across the call)
-	M.shlvl_delta = lvd
-	local rc = C.posix_spawn(pidp, execpath, fa, attr, ffi.cast("char *const *", argv), cenv)
-	if hold then
-		async_spawn_release()
-	end
-	if attr then
-		C.posix_spawnattr_destroy(attr)
-	end
-	C.posix_spawn_file_actions_destroy(fa)
+	-- (SIGINT/SIGQUIT ignored without job control; bash execs the job's command in place of
+	-- its child: SHLVL - 1)
+	local rc, pid = spawn_argv(self, execpath, args, n, fa, not self.opt_m, -1)
 	if rc ~= 0 then
 		return false
 	end
-	local pid = tonumber(pidp[0])
+	pid = tonumber(pid)
 	M.job_add(self, pid, cmdstr)
 	self.bg_pids = self.bg_pids or {}
 	self.bg_pids[#self.bg_pids + 1] = pid
@@ -4643,20 +4572,7 @@ function Shell:stage_clone()
 	end
 	c.foreign_pids = M.foreign_jobs(self) -- (`jobs` lists the parent's; `wait` can't wait on them)
 	c.job_cur, c.job_prev = self.job_cur, self.job_prev -- (the jobs themselves, not copies: `jobs` marks %+/%-)
-	local vars = {}
-	for k, b in pairs(self.vars) do
-		vars[k] = copybox(b)
-	end
-	c.vars = vars
-	c.getopts_state = M.getopts_remap(self.getopts_state, self.vars, vars)
-	for d, rec in pairs(c.savedstack) do
-		if type(rec) == "table" then
-			c.savedstack[d] = shallowcopy(rec)
-		end
-	end
-	for k = 1, #c.tenv do
-		c.tenv[k] = shallowcopy(c.tenv[k])
-	end
+	scopes_copy(self, c)
 	c.argpool = {}
 	-- (jobs stays a COPY of the parent's table: bash lets a pipeline stage SEE the
 	-- parent's jobs — `jobs | wc -l` — as a forked stage's copy-on-write view did.)
@@ -4695,6 +4611,8 @@ local function env_same(a, b) -- same entries, pointer for pointer?
 		i = i + 1
 	end
 end
+do -- (the scheduler's private helpers, through Shell:bg_launch: a block of their own,
+-- the main chunk being at LuaJIT's 200-local limit)
 local function co_cx(ctx, fd) -- CLOEXEC dup >= FD_BASE, tracked so a forked child can drop it
 	local d = dup_hi(fd)
 	if d >= 0 then
@@ -4706,6 +4624,38 @@ local function co_cl(ctx, fd)
 	if fd and fd >= 0 and ctx.fds[fd] then
 		ctx.fds[fd] = nil
 		C.close(fd)
+	end
+end
+-- The process state a task runs with, snapshotted from the current process: fds 0-9
+-- (tracked copies; -1 where closed), environ, cwd, umask, lifted upvalues.
+local function proc_snap(ctx, cwd, upv_get)
+	local s = { fd = {}, env = C.environ, cwd = cwd }
+	for k = 0, 9 do
+		s.fd[k] = co_cx(ctx, k)
+	end
+	s.um = C.curse_co_umask(0)
+	C.curse_co_umask(s.um)
+	if upv_get then
+		s.upv = { upv_get() }
+	end
+	return s
+end
+-- Make fds lo..9 the saved copies `fds` (closed where it has -1).
+local function fds_install(fds, lo)
+	for fd = lo, 9 do
+		if fds[fd] >= 0 then
+			C.dup2(fds[fd], fd)
+		else
+			C.close(fd)
+		end
+	end
+end
+-- Release the saved copies lo..hi, marking them gone (so a later release of the same
+-- table can't close an fd number that has since been reused).
+local function fds_release(ctx, fds, lo, hi)
+	for k = lo, hi do
+		co_cl(ctx, fds[k])
+		fds[k] = -1
 	end
 end
 
@@ -4885,13 +4835,7 @@ end
 -- stage's pipe end is live on fds 0-9, and the parent's view is intact.
 local function co_resume(ctx, t)
 	local P = ctx.P
-	for fd = 0, 9 do -- install the stage's fds 0-9 (-1: it had closed it)
-		if t.fd[fd] >= 0 then
-			C.dup2(t.fd[fd], fd)
-		else
-			C.close(fd)
-		end
-	end
+	fds_install(t.fd, 0) -- the stage's fds 0-9 (-1: it had closed it)
 	C.environ = t.env
 	if t.cwdfd then -- (a directory it changed to: held by an fd)
 		if ctx.cur_cwd ~= t then
@@ -4953,10 +4897,7 @@ local function co_resume(ctx, t)
 		-- (a background job's starting copies were only needed to start it: from here its
 		-- own saved state holds what it uses, and no stale copy keeps a pipe open)
 		g.base_closed = true
-		for k = 0, 9 do
-			co_cl(ctx, g.base.fd[k])
-			g.base.fd[k] = -1
-		end
+		fds_release(ctx, g.base.fd, 0, 9)
 	end
 	-- save the stage's process state
 	t.env = C.environ
@@ -4998,13 +4939,7 @@ local function co_resume(ctx, t)
 			t.sv[fd], t.fd[fd] = d, d
 		end
 	end
-	for fd = 0, 9 do -- park on the parent's fds
-		if P.fd[fd] >= 0 then
-			C.dup2(P.fd[fd], fd)
-		else
-			C.close(fd)
-		end
-	end
+	fds_install(P.fd, 0) -- park on the parent's fds
 	if ctx.cur_cwd ~= P.cwd then
 		C.curse_co_chdir(P.cwd)
 		ctx.cur_cwd = P.cwd
@@ -5022,24 +4957,15 @@ local function co_resume(ctx, t)
 		end
 		t.done, t.wait = true, nil
 		ctx.bycoro[t.co] = nil
-		if t ~= g.lp then
-			for fd = 0, 9 do
-				co_cl(ctx, t.sv[fd])
-			end
-		else -- (only its fds 3-9 are adopted: its stdin/out/err go now — `yes | head` with
-			-- lastpipe must EPIPE yes once head is done, not at the pipeline's end)
-			for fd = 0, 2 do
-				co_cl(ctx, t.sv[fd])
-			end
-		end
+		-- (a lastpipe stage's fds 3-9 are adopted: only its stdin/out/err go now — `yes | head`
+		-- with lastpipe must EPIPE yes once head is done, not at the pipeline's end)
+		fds_release(ctx, t.sv, 0, t ~= g.lp and 9 or 2)
 		for _, fd in ipairs(t.own) do -- release its pipe ends: EOF downstream, EPIPE upstream
 			co_cl(ctx, fd)
 		end
 		g.alive = g.alive - 1
 		if g.alive == 0 and g.bg then -- a background job ended: its starting fds go too
-			for k = 0, 9 do
-				co_cl(ctx, g.base.fd[k])
-			end
+			fds_release(ctx, g.base.fd, 0, 9)
 			g.done = true
 			if g.on_done then -- (a coproc: disposed as it dies — bash's SIGCHLD reaping)
 				pcall(g.on_done, g)
@@ -5072,16 +4998,8 @@ local function co_finish(ctx, self, g)
 	local lp = g.lp
 	if lp then
 		self.out = g.lp_out
-		for k = 3, 9 do -- fds the last stage opened/closed persist, like the shell's own
-			if lp.fd[k] >= 0 then
-				C.dup2(lp.fd[k], k)
-			else
-				C.close(k)
-			end
-		end
-		for k = 0, 9 do
-			co_cl(ctx, lp.sv[k])
-		end
+		fds_install(lp.fd, 3) -- fds the last stage opened/closed persist, like the shell's own
+		fds_release(ctx, lp.sv, 0, 9)
 		C.environ = env_same(lp.env, g.base.env) and g.base.env or lp.env
 		local cw = cwd_str()
 		if lp.cwd ~= cw then
@@ -5153,9 +5071,7 @@ end
 -- The shell leaves the scheduler: its snapshot's fd copies go; with no task left alive the
 -- whole context is released (every tracked fd, the environ copies).
 local function sched_release(ctx, P)
-	for k = 0, 9 do
-		co_cl(ctx, P.fd[k])
-	end
+	fds_release(ctx, P.fd, 0, 9)
 	C.curse_co_sigtimedwait(_co_sigpipe, nil, _co_zero_ts) -- drop a SIGPIPE still pending
 	C.sigprocmask(2, ctx.oldmask, nil)
 	if next(ctx.bycoro) == nil and ctx == SCHED then
@@ -5169,6 +5085,87 @@ local function sched_release(ctx, P)
 		end
 		SCHED = nil
 	end
+end
+-- The shell enters the scheduler as its parked state P (M.sched_pump, a top-level
+-- pipeline): SIGPIPE blocked meanwhile, so a dead reader is EPIPE, not our death.
+local function sched_enter(ctx, P)
+	ctx.P, ctx.cur_cwd = P, P.cwd
+	ctx.oldmask = ffi.new("uint8_t[128]")
+	C.sigprocmask(0, _co_sigpipe, ctx.oldmask) -- SIG_BLOCK
+	CO = ctx
+end
+-- …and leaves it: the shell's own fds, environ, umask and cwd back (then sched_release).
+local function sched_leave(ctx, P)
+	CO = nil
+	fds_install(P.fd, 0)
+	C.environ = P.env
+	C.curse_co_umask(P.um)
+	if cwd_str() ~= P.cwd then
+		C.curse_co_chdir(P.cwd)
+	end
+	ctx.cur_cwd = P.cwd
+end
+-- The tasks blocked on an fd or a tick (-1), not on a nested group: the list, whether any
+-- ticks, and how many wait on an fd.
+local function co_waiting(ctx)
+	local waiting, tick, nfd = {}, false, 0
+	for _, t in pairs(ctx.bycoro) do
+		if not t.done and t.wait ~= nil and type(t.wait) ~= "table" then
+			if t.wait == -1 then
+				tick = true
+			else
+				nfd = nfd + 1
+			end
+			waiting[#waiting + 1] = t
+		end
+	end
+	return waiting, tick, nfd
+end
+-- Poll the waiting tasks' fds (a user-range fd is the task's own saved copy) — and the
+-- shell's own `xfd` for `xev` first, if given — for up to `tmo` ms; requeue each task whose
+-- fd is ready, and the tick waiters when `tick`. True (nothing requeued) when xfd is ready.
+local function co_poll(ctx, waiting, tick, tmo, xfd, xev)
+	local pf = ctx.pf
+	if not pf or ctx.pfn < #waiting + 1 then
+		ctx.pfn = (#waiting + 1) * 2
+		pf = ffi.new("struct curse_co_pollfd[?]", ctx.pfn)
+		ctx.pf = pf
+	end
+	local cnt = 0
+	if xfd then
+		pf[0].fd, pf[0].events, pf[0].revents = xfd, xev, 0
+		cnt = 1
+	end
+	local k = cnt
+	for _, t in ipairs(waiting) do
+		if t.wait ~= -1 then
+			local w = t.wait
+			if w <= 9 then
+				w = t.fd[w]
+			end
+			pf[cnt].fd, pf[cnt].events, pf[cnt].revents = w, t.wev, 0
+			cnt = cnt + 1
+		end
+	end
+	local r = C.curse_co_poll(pf, cnt, tmo)
+	if xfd and r > 0 and pf[0].revents ~= 0 then
+		return true
+	end
+	for _, t in ipairs(waiting) do
+		if t.wait == -1 then
+			if tick then
+				t.wait = nil
+				ctx.runnable[#ctx.runnable + 1] = t
+			end
+		else
+			if r > 0 and pf[k].revents ~= 0 then
+				t.wait = nil
+				ctx.runnable[#ctx.runnable + 1] = t
+			end
+			k = k + 1
+		end
+	end
+	return false
 end
 -- Run the pipeline under the scheduler. `inproc[i]`: stage i's kind (M.stage_kind — every
 -- stage runs in-process as a task). `upv_get/upv_set` (when the
@@ -5187,23 +5184,13 @@ function Shell:run_pipeline_co(stage_fns, inproc, lastpipe, upv_get, upv_set)
 		end
 		local ctx = CO
 		pre_yield(T) -- T's buffered output must precede its sub-stages'
-		local base = { fd = {}, env = C.environ, cwd = cwd_str() or ctx.cur_cwd }
-		for k = 0, 9 do
-			base.fd[k] = co_cx(ctx, k)
-		end
-		base.um = C.curse_co_umask(0)
-		C.curse_co_umask(base.um)
-		if upv then
-			base.upv = { upv_get() }
-		end
+		local base = proc_snap(ctx, cwd_str() or ctx.cur_cwd, upv_get)
 		local g = co_launch(ctx, self, stage_fns, inproc, base, lastpipe, upv)
 		if g and g.alive > 0 then
 			g.waiter = T
 			coroutine.yield(g)
 		end
-		for k = 0, 9 do
-			co_cl(ctx, base.fd[k])
-		end
+		fds_release(ctx, base.fd, 0, 9)
 		if not g then
 			return nil
 		end
@@ -5216,26 +5203,14 @@ function Shell:run_pipeline_co(stage_fns, inproc, lastpipe, upv_get, upv_set)
 
 	real_flush()
 	local ctx = sched_get() -- (shared with any live background jobs)
-	local P = { fd = {}, env = C.environ, cwd = self:phys_cwd() }
-	for k = 0, 9 do
-		P.fd[k] = co_cx(ctx, k)
-	end
-	P.um = C.curse_co_umask(0)
-	C.curse_co_umask(P.um)
-	if upv then
-		P.upv = { upv_get() }
-	end
-	ctx.P, ctx.cur_cwd = P, P.cwd
-	ctx.oldmask = ffi.new("uint8_t[128]")
-	C.sigprocmask(0, _co_sigpipe, ctx.oldmask) -- SIG_BLOCK: a dead reader is EPIPE, not our death
-	CO = ctx
+	local P = proc_snap(ctx, self:phys_cwd(), upv_get)
+	sched_enter(ctx, P)
 	local g
 	local ok_all, err_all = pcall(function()
 		g = co_launch(ctx, self, stage_fns, inproc, P, lastpipe, upv)
 		if not g then
 			return
 		end
-		local pf, pfn = nil, 0
 		while g.alive > 0 do
 			local runnable = ctx.runnable
 			ctx.runnable = {}
@@ -5246,63 +5221,12 @@ function Shell:run_pipeline_co(stage_fns, inproc, lastpipe, upv_get, upv_set)
 				break
 			end
 			if #ctx.runnable == 0 then -- nothing ready to run: wait in poll
-				local waiting, tick = {}, false
-				for _, t in pairs(ctx.bycoro) do
-					if not t.done and t.wait ~= nil and type(t.wait) ~= "table" then
-						if t.wait == -1 then
-							tick = true
-						end
-						waiting[#waiting + 1] = t
-					end
-				end
-				if #waiting > pfn then
-					pfn = #waiting * 2
-					pf = ffi.new("struct curse_co_pollfd[?]", pfn)
-				end
-				local cnt = 0
-				for _, t in ipairs(waiting) do
-					if t.wait ~= -1 then
-						local w = t.wait
-						if w <= 9 then
-							w = t.fd[w] -- a user-range fd: poll the stage's own saved copy
-						end
-						pf[cnt].fd, pf[cnt].events, pf[cnt].revents = w, t.wev, 0
-						cnt = cnt + 1
-					end
-				end
-				local r = C.curse_co_poll(pf, cnt, tick and 10 or -1)
-				local k = 0
-				for _, t in ipairs(waiting) do
-					if t.wait == -1 then
-						if tick then
-							t.wait = nil
-							ctx.runnable[#ctx.runnable + 1] = t
-						end
-					else
-						if r > 0 and pf[k].revents ~= 0 then
-							t.wait = nil
-							ctx.runnable[#ctx.runnable + 1] = t
-						end
-						k = k + 1
-					end
-				end
+				local waiting, tick = co_waiting(ctx)
+				co_poll(ctx, waiting, tick, tick and 10 or -1)
 			end
 		end
 	end)
-	CO = nil
-	for fd = 0, 9 do -- the parent's fds back (a lastpipe stage's 3-9 are adopted below)
-		if P.fd[fd] >= 0 then
-			C.dup2(P.fd[fd], fd)
-		else
-			C.close(fd)
-		end
-	end
-	C.environ = P.env
-	C.curse_co_umask(P.um)
-	if cwd_str() ~= P.cwd then
-		C.curse_co_chdir(P.cwd)
-	end
-	ctx.cur_cwd = P.cwd
+	sched_leave(ctx, P) -- (a lastpipe stage's fds 3-9 are adopted below)
 	if ok_all and g then
 		co_finish(ctx, self, g)
 		if g.lp_raise then -- the lastpipe stage exited/returned: so does the shell/function
@@ -5337,19 +5261,10 @@ function M.sched_pump(w)
 		return false
 	end
 	real_flush()
-	local P = { fd = {}, env = C.environ, cwd = cwd_str() or "." }
-	for k = 0, 9 do
-		P.fd[k] = co_cx(ctx, k)
-	end
-	P.um = C.curse_co_umask(0)
-	C.curse_co_umask(P.um)
-	ctx.P, ctx.cur_cwd = P, P.cwd
-	ctx.oldmask = ffi.new("uint8_t[128]")
-	C.sigprocmask(0, _co_sigpipe, ctx.oldmask)
-	CO = ctx
+	local P = proc_snap(ctx, cwd_str() or ".")
+	sched_enter(ctx, P)
 	local ready = false
 	local ok, err = pcall(function()
-		local pf, pfn = nil, 0
 		while true do
 			local runnable = ctx.runnable
 			ctx.runnable = {}
@@ -5365,42 +5280,10 @@ function M.sched_pump(w)
 			local busy = #ctx.runnable > 0
 			if not busy or ctx.npre then
 				ctx.npre = nil
-				local waiting, tick = {}, false
-				for _, t in pairs(ctx.bycoro) do
-					if not t.done and t.wait ~= nil and type(t.wait) ~= "table" then
-						if t.wait == -1 then
-							tick = true
-						end
-						waiting[#waiting + 1] = t
-					end
-				end
+				local waiting, tick, nfd = co_waiting(ctx)
 				local blocking = w.fd or w.untilf or w.deadline
 				if not blocking and (#waiting == 0 or busy) then
 					return -- (a plain pump: only what could run right now)
-				end
-				if #waiting + 1 > pfn then
-					pfn = (#waiting + 1) * 2
-					pf = ffi.new("struct curse_co_pollfd[?]", pfn)
-				end
-				local cnt = 0
-				if w.fd then
-					local f = w.fd
-					if f <= 9 then
-						f = P.fd[f] -- (the shell's own fd, parked meanwhile)
-					end
-					pf[0].fd, pf[0].events, pf[0].revents = f, w.ev or POLLIN, 0
-					cnt = 1
-				end
-				local base = cnt
-				for _, t in ipairs(waiting) do
-					if t.wait ~= -1 then
-						local wf = t.wait
-						if wf <= 9 then
-							wf = t.fd[wf]
-						end
-						pf[cnt].fd, pf[cnt].events, pf[cnt].revents = wf, t.wev, 0
-						cnt = cnt + 1
-					end
 				end
 				local tmo = -1
 				if not blocking or busy then
@@ -5412,28 +5295,16 @@ function M.sched_pump(w)
 					local left = math.max(0, math.ceil((w.deadline - M.wall_secs()) * 1000))
 					tmo = (tmo < 0 or left < tmo) and left or tmo
 				end
-				if cnt == 0 and tmo < 0 then
+				if not w.fd and nfd == 0 and tmo < 0 then
 					return -- (nothing to wait on: never block forever)
 				end
-				local r = C.curse_co_poll(pf, cnt, tmo)
-				if w.fd and r > 0 and pf[0].revents ~= 0 then
+				local f = w.fd
+				if f and f <= 9 then
+					f = P.fd[f] -- (the shell's own fd, parked meanwhile)
+				end
+				if co_poll(ctx, waiting, tick, tmo, f, w.ev or POLLIN) then
 					ready = true
 					return
-				end
-				local k = base
-				for _, t in ipairs(waiting) do
-					if t.wait == -1 then
-						if tick then
-							t.wait = nil
-							ctx.runnable[#ctx.runnable + 1] = t
-						end
-					else
-						if r > 0 and pf[k].revents ~= 0 then
-							t.wait = nil
-							ctx.runnable[#ctx.runnable + 1] = t
-						end
-						k = k + 1
-					end
 				end
 				if w.deadline and M.wall_secs() >= w.deadline then
 					return
@@ -5444,20 +5315,7 @@ function M.sched_pump(w)
 			end
 		end
 	end)
-	CO = nil
-	for fd = 0, 9 do -- the shell's own state back
-		if P.fd[fd] >= 0 then
-			C.dup2(P.fd[fd], fd)
-		else
-			C.close(fd)
-		end
-	end
-	C.environ = P.env
-	C.curse_co_umask(P.um)
-	if cwd_str() ~= P.cwd then
-		C.curse_co_chdir(P.cwd)
-	end
-	ctx.cur_cwd = P.cwd
+	sched_leave(ctx, P)
 	sched_release(ctx, P)
 	if not ok then
 		error(err, 0)
@@ -5556,10 +5414,7 @@ function Shell:bg_launch(fn, cmdstr, flat, simple, upv_get, upv_set, opts)
 		real_flush()
 	end
 	-- its starting state: the launcher's current one (inside a task, fds 0-9 ARE that task's)
-	local base = { fd = {}, env = C.environ, cwd = cwd_str() or "." }
-	for k = 0, 9 do
-		base.fd[k] = co_cx(ctx, k)
-	end
+	local base = proc_snap(ctx, cwd_str() or ".", upv_get)
 	local piped = t0 and t0.i and t0.i > 1 -- (in a later pipeline stage: stdin is that pipe)
 	opts = opts or {}
 	for k, fd in pairs(opts.fds or {}) do
@@ -5575,17 +5430,10 @@ function Shell:bg_launch(fn, cmdstr, flat, simple, upv_get, upv_set, opts)
 			C.close(dn)
 		end
 	end
-	base.um = C.curse_co_umask(0)
-	C.curse_co_umask(base.um)
-	if upv then
-		base.upv = { upv_get() }
-	end
 	local vpid = M.alloc_vpid()
 	local g = co_launch(ctx, self, { fn }, { flat and "flat" or true }, base, false, upv)
 	if not g then
-		for k = 0, 9 do
-			co_cl(ctx, base.fd[k])
-		end
+		fds_release(ctx, base.fd, 0, 9)
 		return nil
 	end
 	g.bg, g.vpid, g.simple, g.launcher, g.nspawn0 = true, vpid, simple, self, M.nspawn
@@ -5635,6 +5483,7 @@ function Shell:bg_launch(fn, cmdstr, flat, simple, upv_get, upv_set, opts)
 	self.status = 0
 	return job
 end
+end -- (the scheduler block)
 
 -- Signals `kill` aimed at a background job's virtual pid: delivered when the task
 -- resumes (its yield returns SIGMARK): its own trap runs, an ignored one does nothing, the
@@ -7081,11 +6930,7 @@ M.DYN_ASSIGN = { RANDOM = "random", SECONDS = "seconds", BASH_SUBSHELL = "subshe
 	BASH_SOURCE = "null", BASH_LINENO = "null", BASH_ARGC = "null", BASH_ARGV = "null",
 	GROUPS = "null" }
 do
--- bash's legal_number: optional blanks, sign, decimal digits, blanks — else nil
-local function legal_number(s)
-	local n = s:match("^%s*([+-]?%d+)%s*$")
-	return n and tonumber(n)
-end
+local legal_number = M.legal_number -- (bash: legal_number, else 0)
 -- Run `dn`'s assign hook with value `s` (b: its dyn box or nil). False when `dn` is no
 -- longer dynamic (unset) — the caller then stores the value like any other variable.
 function M.dyn_assign(sh, dn, s, b)
@@ -9327,80 +9172,39 @@ end
 -- `!()` extglob needs the split matcher, so it stays on the per-substring path.
 local function strip_regex(val, glob, prefix, longest)
 	local ere, hard = M.glob_to_ere(glob)
+	local m
 	if hard ~= 0 and M.glob_hard(hard) then
-		if prefix then
-			if longest then
-				for k = #val, 0, -1 do
-					if full_match(val:sub(1, k), glob) then
-						return val:sub(k + 1)
-					end
-				end
-			else
-				for k = 0, #val do
-					if full_match(val:sub(1, k), glob) then
-						return val:sub(k + 1)
-					end
-				end
-			end
-		else
-			if longest then
-				for k = 1, #val + 1 do
-					if full_match(val:sub(k), glob) then
-						return val:sub(1, k - 1)
-					end
-				end
-			else
-				for k = #val + 1, 1, -1 do
-					if full_match(val:sub(k), glob) then
-						return val:sub(1, k - 1)
-					end
-				end
-			end
-		end
-		return val
-	end
-	local rb = M.re_get(ere, 1 + 8) -- REG_EXTENDED|REG_NOSUB
-	if not rb then
-		return val
-	end
-	local function m(s)
-		return ffi.C.regexec(rb, s, 0, nil, 0) == 0
-	end
-	local res = val
-	if prefix then
-		if longest then
-			for k = #val, 0, -1 do
-				if m(val:sub(1, k)) then
-					res = val:sub(k + 1)
-					break
-				end
-			end
-		else
-			for k = 0, #val do
-				if m(val:sub(1, k)) then
-					res = val:sub(k + 1)
-					break
-				end
-			end
+		m = function(s)
+			return full_match(s, glob)
 		end
 	else
-		if longest then
-			for k = 1, #val + 1 do
-				if m(val:sub(k)) then
-					res = val:sub(1, k - 1)
-					break
-				end
-			end
-		else
-			for k = #val + 1, 1, -1 do
-				if m(val:sub(k)) then
-					res = val:sub(1, k - 1)
-					break
-				end
-			end
+		local rb = M.re_get(ere, 1 + 8) -- REG_EXTENDED|REG_NOSUB
+		if not rb then
+			return val
+		end
+		m = function(s)
+			return ffi.C.regexec(rb, s, 0, nil, 0) == 0
 		end
 	end
-	return res
+	-- the candidate split points k, in the order that finds the shortest/longest match
+	-- first: a prefix is val[1..k] (k = 0..#val), a suffix val[k..] (k = #val+1..1)
+	local a, b, step = 0, #val, 1
+	if not prefix then
+		a, b = 1, #val + 1
+	end
+	if prefix == longest then
+		a, b, step = b, a, -1
+	end
+	for k = a, b, step do
+		if prefix then
+			if m(val:sub(1, k)) then
+				return val:sub(k + 1)
+			end
+		elseif m(val:sub(k)) then
+			return val:sub(1, k - 1)
+		end
+	end
+	return val
 end
 -- bash matches a pattern BYTE-wise when the string or the pattern isn't valid in the
 -- multibyte locale (xstrmatch's fallback): `case $euro in *$'\202'*)` matches a byte of it.
@@ -12599,6 +12403,74 @@ function M.chkwrite_report(sh, name, m)
 	io.stderr:write("curse: " .. name .. ": write error: " .. why .. "\n")
 end
 
+-- Every shell builtin's name: the one table (interp.BUILTINS, emit and the b_* modules
+-- read it too). `enable -n` hides one from lookup: rt.builtin_enabled.
+M.BUILTINS = {
+	echo = 1,
+	enable = 1,
+	caller = 1,
+	disown = 1,
+	[":"] = 1,
+	["true"] = 1,
+	["false"] = 1,
+	["["] = 1,
+	test = 1,
+	["return"] = 1,
+	exit = 1,
+	logout = 1,
+	suspend = 1,
+	cd = 1,
+	unset = 1,
+	export = 1,
+	declare = 1,
+	typeset = 1,
+	set = 1,
+	shift = 1,
+	read = 1,
+	getopts = 1,
+	printf = 1,
+	["local"] = 1,
+	command = 1,
+	type = 1,
+	pwd = 1,
+	eval = 1,
+	source = 1,
+	["."] = 1,
+	["break"] = 1,
+	["continue"] = 1,
+	exec = 1,
+	readonly = 1,
+	umask = 1,
+	alias = 1,
+	unalias = 1,
+	shopt = 1,
+	wait = 1,
+	fg = 1,
+	bg = 1,
+	trap = 1,
+	mapfile = 1,
+	readarray = 1,
+	compgen = 1,
+	complete = 1,
+	compopt = 1,
+	pushd = 1,
+	popd = 1,
+	dirs = 1,
+	builtin = 1,
+	kill = 1,
+	ulimit = 1,
+	jobs = 1,
+	history = 1,
+	fc = 1,
+	hash = 1,
+	["let"] = 1,
+	times = 1,
+	bind = 1,
+	help = 1,
+}
+function M.builtin_enabled(sh, name)
+	return M.BUILTINS[name] ~= nil and not (sh.disabled_builtins and sh.disabled_builtins[name])
+end
 -- Builtin registry (name -> lazily-loaded module). The interpreter shares this
 -- table (interp aliases rt.BUILTIN_LAZY), so there is one source of truth.
 local BUILTIN_LAZY = {
@@ -12759,7 +12631,7 @@ do
 			end
 		end
 		return cmd ~= nil and not SCOPED[cmd] and not sh.functions[cmd]
-			and require("interp")._int.BUILTINS[cmd] ~= nil
+			and M.BUILTINS[cmd] ~= nil
 	end
 end
 -- `VAR=val … cmd` prefix env for a compiled builtin/external whose scalar prefix values
@@ -14184,7 +14056,7 @@ function M.test_icmp(sh, a, op, b, cmd)
 	return sh.status
 end
 
--- Attribute-aware scalar assignment (interp's assign_scalar twin, for the EF.has_attr
+-- Attribute-aware scalar assignment (for the EF.has_attr
 -- compiled path): the RHS `value` is already word-expanded. A readonly target errors
 -- (writing THROUGH a nameref is non-fatal; a direct one aborts the line, or hard-exits
 -- under -c/posix); an array target assigns element [0]; an integer var arith-evaluates

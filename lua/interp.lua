@@ -489,8 +489,6 @@ ffi.cdef([[
   struct curse_rlimit { uint64_t rlim_cur; uint64_t rlim_max; };
   int getrlimit(int resource, struct curse_rlimit *rlim);
   int setrlimit(int resource, const struct curse_rlimit *rlim);
-  struct curse_timeval { long tv_sec; long tv_usec; };
-  int gettimeofday(struct curse_timeval *tv, void *tz);
   struct curse_pollfd { int fd; short events; short revents; };
   int poll(struct curse_pollfd *fds, unsigned long nfds, int timeout);
 ]])
@@ -1752,46 +1750,6 @@ tilde_prefix = rt.tilde_prefix
 local tilde_assign = rt.tilde_assign
 local tilde_word_initial = rt.tilde_word_initial
 
--- Compiled-tier plain scalar assignment (`name=value`), mirroring interp's assign
--- handler for an ATTRIBUTED target: reject a readonly var ($?=1 + diagnostic, fatal
--- in -c/posix); write element [0] of an array var (bash: `a=v` on an array); arith-
--- evaluate for `declare -i`; case-fold for `declare -l/-u`; else a plain set. Only
--- emitted when the program creates such a var (else compiled uses sh:set_str).
-function M.assign_scalar(sh, name, value)
-	local direct = sh.vars[name]
-	local b = sh.vars[sh:deref(name)]
-	if b and b.ro then
-		io.stderr:write("curse: " .. name .. ": readonly variable\n")
-		rt.report_exit(sh) -- (err_readonly: report_error)
-		sh.status = 1
-		-- Writing THROUGH a nameref to a readonly target is NON-fatal (bash: status 1,
-		-- continue). A DIRECT readonly assignment hard-exits in -c/posix, else aborts
-		-- the rest of the line (like interp's assign handler).
-		if direct and direct.ref then
-			return
-		end
-		if sh.opt_c or sh.opt_posix then
-			error({ __curse_exit = 1 })
-		end
-		error({ __curse_exit = 1, __curse_lineabort = true })
-	end
-	if b and b.arr then
-		sh:array_set(name, array_key(sh, name, "0"), value, false)
-	elseif b and b.int and not b.ref then
-		sh:aset(name, rt.int_value(sh, value, M.arith_eval_str))
-	elseif b and (b.lower or b.upper) then
-		sh:set_str(name, b.lower and value:lower() or value:upper())
-	elseif sh:set_str(name, value) == false then -- (a valueless nameref given a bad target)
-		error({ __curse_exit = 1, __curse_lineabort = true, __curse_noee = true })
-	end
-	if sh.opt_a then -- set -a (allexport): a plain scalar assignment auto-exports (bash)
-		local nb = sh.vars[sh:deref(name)]
-		if nb and not nb.arr then
-			nb.exported = true
-			C.setenv(sh:deref(name), sh:get(name), 1)
-		end
-	end
-end
 
 -- `noassign`: a ${…} operand — only a word-initial ~ expands there, never the `NAME=…:~`
 -- assignment form (bash: `${x:=P=~/b}` keeps its tildes)
@@ -2605,9 +2563,7 @@ local function alloc_fd()
 	return -1
 end
 local FDVAR_NOASSIGN = { GROUPS = 1, FUNCNAME = 1, BASH_ARGC = 1, BASH_ARGV = 1, BASH_SOURCE = 1, BASH_LINENO = 1 }
-local function bi(sh, n) -- an enabled builtin
-	return M.BUILTINS[n] and not (sh.disabled_builtins and sh.disabled_builtins[n])
-end
+local bi = rt.builtin_enabled -- an enabled builtin
 -- Does bash run this command in a forked child (an external), where a fatal expansion
 -- error in its redirections fails only it? `command [-p] [--] NAME` is looked through
 -- first, skipping functions (execute_cmd.c: check_command_builtin — a restricted shell's
@@ -2918,71 +2874,8 @@ local restore_redirs = rt.redir_undo
 -- inline dispatch, so a cold script that never uses them never loads their code.
 local BUILTIN_LAZY = rt.BUILTIN_LAZY -- one source of truth (runtime); shared with the compiled tier
 local ISO_BUILTIN = rt.ISO_BUILTIN
-local BUILTINS = {
-	echo = 1,
-	enable = 1,
-	caller = 1,
-	disown = 1,
-	[":"] = 1,
-	["true"] = 1,
-	["false"] = 1,
-	["["] = 1,
-	test = 1,
-	["return"] = 1,
-	exit = 1,
-	logout = 1,
-	suspend = 1,
-	cd = 1,
-	unset = 1,
-	export = 1,
-	declare = 1,
-	typeset = 1,
-	set = 1,
-	shift = 1,
-	read = 1,
-	getopts = 1,
-	printf = 1,
-	["local"] = 1,
-	command = 1,
-	type = 1,
-	pwd = 1,
-	eval = 1,
-	source = 1,
-	["."] = 1,
-	["break"] = 1,
-	["continue"] = 1,
-	["true"] = 1,
-	exec = 1,
-	readonly = 1,
-	umask = 1,
-	alias = 1,
-	unalias = 1,
-	shopt = 1,
-	wait = 1,
-	fg = 1,
-	bg = 1,
-	trap = 1,
-	mapfile = 1,
-	readarray = 1,
-	compgen = 1,
-	complete = 1,
-	compopt = 1,
-	pushd = 1,
-	popd = 1,
-	dirs = 1,
-	builtin = 1,
-	kill = 1,
-	ulimit = 1,
-	jobs = 1,
-	history = 1,
-	fc = 1,
-	hash = 1,
-	["let"] = 1,
-	times = 1,
-	bind = 1,
-	help = 1,
-}
-M.BUILTINS = BUILTINS -- (the one builtin table: emit and runtime consult it too)
+local BUILTINS = rt.BUILTINS -- (runtime owns the builtin table: rt.builtin_enabled)
+M.BUILTINS = BUILTINS
 local KEYWORDS = {
 	["if"] = 1,
 	["then"] = 1,
@@ -3085,7 +2978,7 @@ local function name_type(sh, name, nofunc)
 	if not nofunc and sh.functions[name] then
 		return "function"
 	end -- `type -f` skips functions
-	if BUILTINS[name] and not (sh.disabled_builtins and sh.disabled_builtins[name]) then
+	if rt.builtin_enabled(sh, name) then
 		return "builtin"
 	end
 	-- a remembered location (`hash`, `hash -p`, or an earlier run) wins, and counts a hit
@@ -4413,7 +4306,7 @@ local function describe(sh, nm, fl)
 			end
 			found = true
 		end
-		if BUILTINS[nm] and not (sh.disabled_builtins and sh.disabled_builtins[nm]) then
+		if rt.builtin_enabled(sh, nm) then
 			say("builtin", rt.L1((sh.opt_posix and SPECIAL_BUILTIN[nm]) and "%s is a special shell builtin\n"
 				or "%s is a shell builtin\n", nm), nm)
 			if not fl.all then
@@ -5097,11 +4990,7 @@ local function run_debug(sh, line)
 end
 M.run_debug = run_debug -- compiled tier fires DEBUG before each native command
 
-local tv_now = ffi.new("struct curse_timeval") -- reused buffer for `time`'s wall clock
-local function wall_secs()
-	C.gettimeofday(tv_now, nil)
-	return tonumber(tv_now.tv_sec) + tonumber(tv_now.tv_usec) * 1e-6
-end
+local wall_secs = rt.wall_secs
 
 local exec_stmt
 -- A simple command's pieces for rt.sr_run (module-level: no per-command closures). spec:

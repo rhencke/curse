@@ -250,9 +250,6 @@ function M.compile_fragment(code, line1, mode, atab, pst)
 	local ok, code = pcall(E.emit, ast, emit_opts(mode, { fragment = true }))
 	local mod = ok and build(code, "=curse:eval")
 	if mod then
-		-- (run as a $(…) body: the light buffer capture only when the compiler calls it
-		-- pure — a redirect like `>&2` needs the fd-level capture: rt capture_src)
-		mod.nofork = E.cmdsub_nofork_ok(ast.stmts) and #ast.stmts > 0
 		return mod
 	end
 	return nil
