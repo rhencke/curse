@@ -1124,12 +1124,12 @@ scan_cmdsub = function(src, j, onwarn)
 				i = i + (src:sub(i, i + 1) == "|&" and 2 or 1)
 				wstart = true
 			end
-		elseif c == "'" then
-			i = quote_end(src, i)
+		elseif c == "'" then -- (a quote left open names itself: `$(echo "x` -> matching `"')
+			i = quote_end(src, i, false, true)
 			wstart = false
 			patstart = false
 		elseif c == "$" and src:sub(i + 1, i + 1) == "'" then
-			i = quote_end(src, i + 1, true) -- only $'…' has backslash escapes
+			i = quote_end(src, i + 1, true, true) -- only $'…' has backslash escapes
 			wstart = false
 			patstart = false
 		elseif c == '"' then
@@ -1307,11 +1307,12 @@ local function bracket_close(s, i)
 end
 -- An expansion: s[i] is a `$` or a backquote — $(( )), $( ), ${ }, $[ ], `…`; any other `$`
 -- is just itself (i + 1). dq: inside "…" (scan_braces' posix `'` rule); lenient: an
--- unparsable $( … ) is paren-counted (else its error); onwarn: scan_cmdsub's.
+-- unparsable $( … ) is paren-counted and an open `…` runs to the end (else their errors);
+-- onwarn: scan_cmdsub's.
 expansion_end = function(s, i, dq, lenient, onwarn)
 	local b = s:byte(i + 1)
 	if s:byte(i) == 96 then
-		return quote_end(s, i, true)
+		return quote_end(s, i, true, not lenient)
 	elseif b == 40 then
 		if s:byte(i + 2) == 40 and dparen_is_arith(s, i + 3) then
 			local _, e = grab_dparen(s, i + 3)
@@ -1329,7 +1330,8 @@ expansion_end = function(s, i, dq, lenient, onwarn)
 	return i + 1
 end
 -- A "…": s[i] is its opening quote. `\` escapes; a nested expansion keeps its own quoting
--- (`"$(echo ")")"`), so its `"` doesn't close this one.
+-- (`"$(echo ")")"`), so its `"` doesn't close this one. (lenient: as expansion_end's, and
+-- an open "…" isn't an error either)
 dq_end = function(s, i, lenient, onwarn)
 	local n = #s
 	i = i + 1
@@ -1344,6 +1346,9 @@ dq_end = function(s, i, lenient, onwarn)
 		else
 			i = i + 1
 		end
+	end
+	if not lenient then
+		error("unexpected EOF while looking for matching `\"'")
 	end
 	return i + 1
 end
@@ -1880,7 +1885,7 @@ function M.parse_default_quoted(txt, heredoc)
 		elseif ch == "$" or ch == "`" then
 			-- a nested $(…)/$((…))/${…}/`…` keeps its OWN quoting (`${u:-$(echo "p)q")}`): copy
 			-- it verbatim rather than dropping the quotes inside it
-			local ok, nj = pcall(expansion_end, txt, k)
+			local ok, nj = pcall(expansion_end, txt, k, false, true)
 			nj = ok and nj or k + 1
 			out[#out + 1] = txt:sub(k, nj - 1)
 			k = nj
