@@ -1750,87 +1750,70 @@ function M.fd_number(s)
 	return n > 2147483647 and -1 or n
 end
 M.RESTRICTED_OUT = { out = true, clobber = true, app = true, rw = true, outboth = true, appboth = true }
-function M.redir_apply(sh, op, fd, target, saves)
-	if sh.opt_r and M.RESTRICTED_OUT[op] then -- a restricted shell writes no files (interp's apply)
+do -- (block-scoped: the main chunk is at LuaJIT's 200-local limit)
+-- A file redirection's open(2) flags: O_WRONLY|O_CREAT|O_TRUNC (577), + O_APPEND (1089),
+-- O_RDONLY (0), O_RDWR|O_CREAT (66: `<>` never truncates); mode 0666 & ~umask.
+local REDIR_FLAGS = { out = 577, clobber = 577, app = 1089, ["in"] = 0, rw = 66, outboth = 577, appboth = 1089 }
+M.REDIR_FLAGS = REDIR_FLAGS
+-- noclobber (set -C) `>`/`&>`: must not overwrite an existing REGULAR file, but may still
+-- write a non-regular one (/dev/null, a fifo, a device) — redir.c's noclobber_open.
+local function open_noclobber(path)
+	local h = M.ropen(path, 705, 438) -- + O_EXCL
+	if h >= 0 then
+		return h
+	end
+	local e = ffi.errno() -- (for open_fail: a dangling symlink's stat miss is still EEXIST)
+	if
+		C.curse_rt_stat(path, _redir_stat) == 0
+		and bit.band(ffi.cast("uint32_t *", _redir_stat + 24)[0], 0xF000) ~= 0x8000
+	then
+		return M.ropen(path, 1, 438) -- existing NON-regular: plain O_WRONLY, no truncate
+	end
+	ffi.errno(e)
+	return -1
+end
+local function redir_backup(saves, fd)
+	saves[#saves + 1] = { fd = fd, saved = M.save_fd(fd) }
+end
+-- THE redirection applier of both tiers (compiled code via redir_apply, interp's
+-- apply_redirs for its file/here-doc redirections): install one redirection whose target
+-- is already expanded, backing each touched fd up into `saves` first — `saves` nil: no
+-- backup (a `{v}>` named fd persists after the command: bash). false on failure (message
+-- written), nil for an op it has no form for.
+local function redir_open(sh, op, fd, target, saves)
+	local flags = REDIR_FLAGS[op]
+	if flags and flags ~= 0 and sh.opt_r then -- a restricted shell writes no files (M.RESTRICTED_OUT)
 		io.stderr:write("curse: " .. tostring(target) .. ": restricted: cannot redirect output\n")
 		return false
 	end
 	io.flush() -- flush buffered stdout before moving fds (else it lands in the new target)
-	-- In a pipeline stage, builtins write the redirected fd 1 directly while it's moved (as
-	-- the interpreter does): the stage's buffer would reach it only at restore, too late
-	-- for a write error (`echo x >/dev/full | …`) to be seen and reported by the command.
-	if (fd == 1 or op == "outboth" or op == "appboth") and not saves.out_sh and CO_OUTS[sh.out] then
-		saves.out_sh, saves.out = sh, sh.out
-		sh.out = io.write
-	end
-	local function backup(f)
-		saves[#saves + 1] = { fd = f, saved = M.save_fd(f) }
-	end
-	local function open_out(path) -- honor noclobber (set -C) for a truncating '>'
-		if not sh.opt_C then
-			return M.ropen(path, 577, 438)
-		end -- O_WRONLY|O_CREAT|O_TRUNC
-		local h = M.ropen(path, 705, 438) -- + O_EXCL
-		if h >= 0 then
-			return h
+	if flags then
+		local both = op == "outboth" or op == "appboth" -- &> / &>>: stdout AND stderr
+		if saves then
+			if both then
+				redir_backup(saves, 1)
+				redir_backup(saves, 2)
+			else
+				redir_backup(saves, fd)
+			end
 		end
-		local e = ffi.errno() -- (for open_fail: a dangling symlink's stat miss is still EEXIST)
-		if
-			C.curse_rt_stat(path, _redir_stat) == 0
-			and bit.band(ffi.cast("uint32_t *", _redir_stat + 24)[0], 0xF000) ~= 0x8000
-		then
-			return M.ropen(path, 1, 438) -- existing NON-regular (e.g. /dev/null): plain O_WRONLY
-		end
-		ffi.errno(e)
-		return -1
-	end
-	if op == "out" or op == "clobber" then
-		backup(fd)
-		local h = (op == "out") and open_out(target) or M.ropen(target, 577, 438)
+		local h = (op ~= "clobber" and flags == 577 and sh.opt_C) and open_noclobber(target)
+			or M.ropen(target, flags, 438)
 		if h < 0 then
 			M.open_fail(sh, target)
 			return false
 		end
-		if h ~= fd then
+		if both then
+			C.dup2(h, 1)
+			C.dup2(h, 2)
+			C.close(h)
+		elseif h ~= fd then -- (open() may hand back the very target fd: `3<file`)
 			C.dup2(h, fd)
 			C.close(h)
 		end
-	elseif op == "app" then
-		backup(fd)
-		local h = M.ropen(target, 1089, 438) -- O_WRONLY|O_CREAT|O_APPEND
-		if h < 0 then
-			M.open_fail(sh, target)
-			return false
-		end
-		if h ~= fd then
-			C.dup2(h, fd)
-			C.close(h)
-		end
-	elseif op == "in" then
-		backup(fd)
-		local h = M.ropen(target, 0, 0) -- O_RDONLY
-		if h < 0 then
-			M.open_fail(sh, target)
-			return false
-		end
-		if h ~= fd then
-			C.dup2(h, fd)
-			C.close(h)
-		end
-	elseif op == "rw" then
-		backup(fd)
-		local h = C.open(target, 66, 438) -- O_RDWR|O_CREAT
-		if h < 0 then
-			M.open_fail(sh, target)
-			return false
-		end
-		if h ~= fd then
-			C.dup2(h, fd)
-			C.close(h)
-		end
-	elseif op == "dup" or op == "dupin" then -- N>&M / N<&M / N>&-
+	elseif op == "dup" or op == "dupin" then -- N>&M / N<&M / N>&- (compiled: digit targets)
 		if target == "-" then
-			backup(fd)
+			redir_backup(saves, fd)
 			C.close(fd)
 		else
 			local tf = M.fd_number(target) -- (emit hands only all-digit targets here)
@@ -1841,22 +1824,13 @@ function M.redir_apply(sh, op, fd, target, saves)
 				io.stderr:write("curse: " .. target .. ": Bad file descriptor\n")
 				return false
 			end
-			backup(fd)
+			redir_backup(saves, fd)
 			C.dup2(tf, fd)
 		end
-	elseif op == "outboth" or op == "appboth" then -- &> / &>>
-		backup(1)
-		backup(2)
-		local h = (op == "appboth") and M.ropen(target, 1089, 438) or open_out(target)
-		if h < 0 then
-			M.open_fail(sh, target)
-			return false
-		end
-		C.dup2(h, 1)
-		C.dup2(h, 2)
-		C.close(h)
 	elseif op == "heredoc" or op == "herestring" then
-		backup(fd)
+		if saves then
+			redir_backup(saves, fd)
+		end
 		local h = _temp_fd(target) -- target = the already-built body text
 		if h < 0 then
 			return false
@@ -1869,6 +1843,18 @@ function M.redir_apply(sh, op, fd, target, saves)
 		return nil
 	end -- op the compiler shouldn't have handed us
 	return true
+end
+M.redir_open = redir_open
+function M.redir_apply(sh, op, fd, target, saves)
+	-- In a pipeline stage, builtins write the redirected fd 1 directly while it's moved (as
+	-- the interpreter does): the stage's buffer would reach it only at restore, too late
+	-- for a write error (`echo x >/dev/full | …`) to be seen and reported by the command.
+	if (fd == 1 or op == "outboth" or op == "appboth") and not saves.out_sh and CO_OUTS[sh.out] then
+		saves.out_sh, saves.out = sh, sh.out
+		sh.out = io.write
+	end
+	return redir_open(sh, op, fd, target, saves)
+end
 end
 -- `exec REDIRS`: the redirections persist, so the saved originals are just dropped (a kept
 -- copy of a pipe's write end would hold its reader's EOF off forever)
@@ -1963,9 +1949,11 @@ function M.prefix_ro(sh, names)
 	end
 	M.ro_said = said
 end
-function M.redir_restore(saves)
-	io.flush()
-	M.ro_said = nil -- (M.prefix_ro: the command it was said for has bound, or never ran)
+-- Undo a redirection list's `saves` (both tiers: interp's restore_redirs is this): the
+-- `2>&1` capture routing, a stage's sh.out swap, then each fd, newest first — s.saved >= 0:
+-- the fd was open, restore it; s.saved < 0 (C.dup failed): it was NOT open before, so
+-- CLOSE it rather than dup2(-1), which would leak it.
+function M.redir_undo(saves)
 	if saves.e2o then
 		saves._sh.err2out = (saves._sh.err2out or 0) - saves.e2o
 		saves.e2o = nil
@@ -1973,8 +1961,6 @@ function M.redir_restore(saves)
 	if saves.out_sh then
 		saves.out_sh.out, saves.out_sh = saves.out, nil
 	end
-	-- s.saved >= 0: the fd was open — restore it. s.saved < 0 (C.dup failed): the fd was NOT
-	-- open before, so CLOSE it rather than dup2(-1) which leaks it (matches interp restore_redirs).
 	for i = #saves, 1, -1 do
 		local s = saves[i]
 		if s.saved >= 0 then
@@ -1984,9 +1970,14 @@ function M.redir_restore(saves)
 			C.close(s.fd)
 		end
 	end
-	if M.jobnote then
+	if M.jobnote then -- (a job report waiting for the command's redirections to go)
 		M.jobnote_flush()
 	end
+end
+function M.redir_restore(saves) -- (a compiled command's)
+	io.flush()
+	M.ro_said = nil -- (M.prefix_ro: the command it was said for has bound, or never ran)
+	M.redir_undo(saves)
 end
 
 -- A FILE redirect whose target is EXPANDABLE (`> $f`, `< $dir/in`, `> *.glob`): the compiled
@@ -2008,8 +1999,7 @@ function M.redir_ext(sh, name, ok, res)
 	if ok then
 		return res
 	end
-	if type(res) ~= "table" or not res.__curse_exit or sh.functions[name]
-		or (require("interp").BUILTINS[name] and not (sh.disabled_builtins and sh.disabled_builtins[name])) then
+	if type(res) ~= "table" or not res.__curse_exit or not require("interp")._int.redir_forks(sh, name) then
 		error(res, 0) -- (a function or builtin runs in the shell itself: fatal)
 	end
 	return false

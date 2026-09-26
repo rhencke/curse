@@ -760,7 +760,7 @@ local in_expanded_text -- evaluating arith_textual_eval's expanded text (see the
 local run_trap -- trap-handler runner (forward decl; defined near the bottom)
 local fire_err -- ERR-trap + errexit enforcement (forward decl; defined near exec_list)
 local fire_err_trap -- the ERR-trap half of fire_err WITHOUT errexit-exit (used inside handlers)
-local sherr -- error-message writer, capture-aware for `2>&1` in $() (defined w/ redirs)
+local sherr = rt.Shell.errmsg -- error-message writer, capture-aware for `2>&1` in $()
 -- Resolve a variable's string value in arithmetic. bash treats it as an arith
 -- EXPRESSION: a bare number is its value, but a name (or `3+4`, `bar`) is
 -- recursively parsed and evaluated (so bar=foo; foo=5; $((bar)) == 5). A pure
@@ -2611,25 +2611,6 @@ M.expand_to_fields = expand_to_fields -- the compiled tier builds argv fields fo
 local exec_list -- forward
 
 -- ---- redirections ----
--- Apply a command's redirs, saving fds 0/1/2 for restore. open flags: 577 =
--- O_WRONLY|O_CREAT|O_TRUNC, 1089 = |O_APPEND, 0 = O_RDONLY; mode 0644.
--- Feed a string as a command's stdin (heredoc/herestring): write to a temp file,
--- open it, dup2 onto fd 0, unlink (the open fd keeps the inode alive).
--- Move an opened fd `f` onto target `fd`. If open() already handed us the target
--- (it returns the lowest free fd, e.g. 3 for `3<file`), dup2/close would close the
--- very fd we just set up — so only dup2+close when they differ.
-local function place_fd(f, fd)
-	if f ~= fd then
-		C.dup2(f, fd)
-		C.close(f)
-	end
-end
-local function feed_stdin(fd, body) -- (a pipe for a small body, like bash: rt.body_fd)
-	local f = rt.body_fd(body)
-	if f >= 0 then
-		place_fd(f, fd)
-	end
-end
 -- Apply redirections, backing up each touched fd (any fd, not just 0/1/2) so it
 -- can be restored. Returns (save, ok); ok is false when an open() failed (bash
 -- then skips the command and reports failure).
@@ -2648,28 +2629,38 @@ local function alloc_fd()
 	end
 	return -1
 end
--- Open a `>`/`&>` target honoring noclobber (set -C): with noclobber, `>` must
--- not overwrite an existing REGULAR file, but may still write non-regular files
--- (/dev/null, fifos, devices). Returns the fd, or -1 on a noclobber clobber error.
-local function open_out(sh, path, mode)
-	if not sh.opt_C then
-		return rt.ropen(path, 577, mode)
-	end -- O_WRONLY|O_CREAT|O_TRUNC
-	local f = rt.ropen(path, 705, mode) -- + O_EXCL
-	if f >= 0 then
-		return f
-	end
-	local e = ffi.errno() -- (kept for open_fail: a dangling symlink's stat miss is still EEXIST)
-	local ok, rc = pcall(C.curse_stat, path, statbuf) -- O_EXCL failed: allow non-regular
-	if ok and rc == 0 and bit.band(ffi.cast("uint32_t *", statbuf + 24)[0], 0xF000) ~= 0x8000 then
-		return rt.ropen(path, 1, mode) -- not S_IFREG -> plain O_WRONLY (no truncate)
-	end
-	ffi.errno(e)
-	return -1
-end
 local FDVAR_NOASSIGN = { GROUPS = 1, FUNCNAME = 1, BASH_ARGC = 1, BASH_ARGV = 1, BASH_SOURCE = 1, BASH_LINENO = 1 }
-local function apply_redirs(sh, redirs, cname, ctx) -- cname: the command (names {v} errors;
-	-- ctx: only names them — compiled code's rt.redir_apply_one)
+local function bi(sh, n) -- an enabled builtin
+	return M.BUILTINS[n] and not (sh.disabled_builtins and sh.disabled_builtins[n])
+end
+-- Does bash run this command in a forked child (an external), where a fatal expansion
+-- error in its redirections fails only it? `command [-p] [--] NAME` is looked through
+-- first, skipping functions (execute_cmd.c: check_command_builtin — a restricted shell's
+-- `command -p` and any other option stop it). args: the argv, else just the name c.
+local function redir_forks(sh, c, args)
+	if sh.functions[c] then
+		return false
+	end
+	local i = 1
+	while args and c == "command" and bi(sh, c) do
+		local j = i + 1
+		if args[j] == "-p" and not sh.opt_r then
+			j = j + 1
+		end
+		if args[j] == "--" then
+			j = j + 1
+		elseif args[j] and args[j]:sub(1, 1) == "-" then
+			break
+		end
+		if args[j] == nil then
+			break
+		end
+		i, c = j, args[j]
+	end
+	return not bi(sh, c)
+end
+local function apply_redirs(sh, redirs, cname, ctx, args) -- cname: the command (names {v} errors;
+	-- ctx: only names them — compiled code's rt.redir_apply_one); args: its argv (redir_forks)
 	io.flush() -- flush pending stdout BEFORE moving fds, else buffered output from a
 	-- prior command would be redirected into (and lost to) the new target
 	local save, ok = {}, true
@@ -2680,8 +2671,7 @@ local function apply_redirs(sh, redirs, cname, ctx) -- cname: the command (names
 	-- A fatal expansion error in a redirection word (set -u, ${v?}, failglob): bash expands
 	-- an external command's redirections in the forked child, where it only fails that
 	-- command (status 1); anywhere else it is raised as usual (redir.c runs in the shell).
-	local ext = cname and not sh.functions[cname]
-		and not (M.BUILTINS[cname] and not (sh.disabled_builtins and sh.disabled_builtins[cname]))
+	local ext = cname and redir_forks(sh, cname, args)
 	local function xerr(e)
 		if not ext and type(e) == "table" and e.__curse_exit then
 			error(e, 0)
@@ -2725,11 +2715,6 @@ local function apply_redirs(sh, redirs, cname, ctx) -- cname: the command (names
 		end
 		if #fs ~= 1 then
 			io.stderr:write("curse: " .. raw .. ": ambiguous redirect\n")
-			return nil
-		end
-		if sh.opt_r and r.op ~= "in" and r.op ~= "dup" and r.op ~= "dupin" then
-			-- restricted: no output to files (fd dups still work; `>&file` is refused below)
-			io.stderr:write("curse: " .. fs[1] .. ": restricted: cannot redirect output\n")
 			return nil
 		end
 		return fs[1]
@@ -2818,124 +2803,10 @@ local function apply_redirs(sh, redirs, cname, ctx) -- cname: the command (names
 		then
 			fd1file = true
 		end
-		if r.op == "out" then
-			-- noclobber (set -C): `>` fails on an existing regular file (open_out)
+		if rt.REDIR_FLAGS[r.op] then -- a file: rt.redir_open (flags, noclobber, &>, restricted)
 			local t = ftgt(r)
-			if not t then
+			if not (t and rt.redir_open(sh, r.op, r.fd, t, not persist[r.fd] and save or nil)) then
 				ok = false
-			else
-				backup(r.fd)
-				local f = open_out(sh, t, 438)
-				if f < 0 then
-					rt.open_fail(sh, t)
-				end
-				if f >= 0 then
-					place_fd(f, r.fd)
-				else
-					ok = false
-				end
-			end
-		elseif r.op == "clobber" then -- `>|` truncates regardless of noclobber
-			local t = ftgt(r)
-			if not t then
-				ok = false
-			else
-				backup(r.fd)
-				local f = rt.ropen(t, 577, 438)
-				if f < 0 then
-					rt.open_fail(sh, t)
-				end
-				if f >= 0 then
-					place_fd(f, r.fd)
-				else
-					ok = false
-				end
-			end
-		elseif r.op == "app" then
-			local t = ftgt(r)
-			if not t then
-				ok = false
-			else
-				backup(r.fd)
-				local f = rt.ropen(t, 1089, 438)
-				if f < 0 then
-					rt.open_fail(sh, t)
-				end
-				if f >= 0 then
-					place_fd(f, r.fd)
-				else
-					ok = false
-				end
-			end
-		elseif r.op == "in" then
-			local t = ftgt(r)
-			if not t then
-				ok = false
-			else
-				backup(r.fd)
-				local f = rt.ropen(t, 0, 0)
-				if f < 0 then
-					rt.open_fail(sh, t)
-				end
-				if f >= 0 then
-					place_fd(f, r.fd)
-				else
-					ok = false
-				end
-			end
-		elseif r.op == "rw" then -- `N<>file`: open read+write (O_RDWR|O_CREAT, no truncate)
-			local t = ftgt(r)
-			if not t then
-				ok = false
-			else
-				backup(r.fd)
-				local f = rt.ropen(t, 66, 438)
-				if f < 0 then
-					rt.open_fail(sh, t)
-				end
-				if f >= 0 then
-					place_fd(f, r.fd)
-				else
-					ok = false
-				end
-			end
-		elseif r.op == "outboth" then -- `&>` truncation honors noclobber too
-			local t = ftgt(r)
-			if not t then
-				ok = false
-			else
-				backup(1)
-				backup(2)
-				local f = open_out(sh, t, 438)
-				if f < 0 then
-					rt.open_fail(sh, t)
-				end
-				if f >= 0 then
-					C.dup2(f, 1)
-					C.dup2(f, 2)
-					C.close(f)
-				else
-					ok = false
-				end
-			end
-		elseif r.op == "appboth" then -- `&>>`: append stdout+stderr (append ignores noclobber)
-			local t = ftgt(r)
-			if not t then
-				ok = false
-			else
-				backup(1)
-				backup(2)
-				local f = rt.ropen(t, 1089, 438)
-				if f < 0 then
-					rt.open_fail(sh, t)
-				end
-				if f >= 0 then
-					C.dup2(f, 1)
-					C.dup2(f, 2)
-					C.close(f)
-				else
-					ok = false
-				end
 			end
 		elseif r.op == "heredoc" then
 			local body = r.body or ""
@@ -2968,15 +2839,13 @@ local function apply_redirs(sh, redirs, cname, ctx) -- cname: the command (names
 					hok, ok = false, false
 				end
 			end
-			if hok then
-				backup(r.fd or 0)
-				feed_stdin(r.fd or 0, body)
+			if hok and not rt.redir_open(sh, "heredoc", r.fd or 0, body, not persist[r.fd or 0] and save or nil) then
+				ok = false
 			end
 		elseif r.op == "herestring" then
 			local eok, body = pcall(expand_word, sh, P.parse_word(r.word or ""))
 			if eok then
-				backup(r.fd or 0)
-				feed_stdin(r.fd or 0, body .. "\n")
+				ok = rt.redir_open(sh, "herestring", r.fd or 0, body .. "\n", not persist[r.fd or 0] and save or nil)
 			else
 				xerr(body)
 				ok = false
@@ -3038,23 +2907,8 @@ local function apply_redirs(sh, redirs, cname, ctx) -- cname: the command (names
 				elseif r.op == "dupin" or r.fd ~= 1 then -- (only `>&file` means `&>file`)
 					io.stderr:write("curse: " .. tv .. ": ambiguous redirect\n")
 					ok = false
-				elseif r.op == "dup" and tv ~= "" and sh.opt_r then
-					io.stderr:write("curse: " .. tv .. ": restricted: cannot redirect output\n")
-					ok = false
-				elseif r.op == "dup" and tv ~= "" then -- `>&word` (non-number): open the file for
-					backup(r.fd)
-					backup(2)
-					local f = open_out(sh, tv, 438) -- both stdout AND stderr (noclobber: `&>`'s rule)
-					if f < 0 then
-						rt.open_fail(sh, tv)
-					end
-					if f >= 0 then
-						C.dup2(f, r.fd)
-						C.dup2(f, 2)
-						C.close(f)
-					else
-						ok = false
-					end
+				else -- `>&word` (non-number, r.fd 1): the file gets stdout AND stderr — `&>word`
+					ok = rt.redir_open(sh, "outboth", 1, tv, save)
 				end
 			end
 		end
@@ -3081,33 +2935,7 @@ local function redirs_touch_stdout(rd)
 	end
 	return false
 end
-local function restore_redirs(save)
-	if save.e2o and save._sh then
-		save._sh.err2out = (save._sh.err2out or 0) - save.e2o
-	end -- undo 2>&1 capture routing
-	for k = #save, 1, -1 do
-		local s = save[k]
-		if s.saved >= 0 then
-			C.dup2(s.saved, s.fd)
-			C.close(s.saved)
-		else
-			C.close(s.fd)
-		end
-	end
-	if rt.jobnote then -- (a job report waiting for the command's redirections to go)
-		rt.jobnote_flush()
-	end
-end
--- Write a curse error message. Inside a `$(...)` capture where `2>&1` is active,
--- route it into the capture buffer (sh.out) so it's captured like bash does;
--- otherwise to real stderr.
-sherr = function(sh, msg)
-	if sh.capturing and (sh.err2out or 0) > 0 then
-		sh.out(msg)
-	else
-		io.stderr:write(msg)
-	end
-end
+local restore_redirs = rt.redir_undo
 
 -- name classification for `type` / `command -v`
 -- Builtins whose implementation is extracted into a lazily-loaded feature module
@@ -6097,7 +5925,7 @@ exec_stmt = function(sh, st, hook)
 						shadow[#shadow + 1] = { te.name, sh.vars[te.name] }
 						sh.vars[te.name] = te.box or nil
 					end
-					local rok, a1, a2 = pcall(apply_redirs, sh, st.redirs, args[1])
+					local rok, a1, a2 = pcall(apply_redirs, sh, st.redirs, args[1], nil, args)
 					for i = #shadow, 1, -1 do
 						sh.vars[shadow[i][1]] = shadow[i][2]
 					end
@@ -6106,7 +5934,7 @@ exec_stmt = function(sh, st, hook)
 					end
 					save, ok = a1, a2
 				else
-					save, ok = apply_redirs(sh, st.redirs, args[1])
+					save, ok = apply_redirs(sh, st.redirs, args[1], nil, args)
 				end
 				if not ok then
 					sh.status = 1
@@ -7740,6 +7568,7 @@ M._int = {
 	dbracket_word = dbracket_word,
 	dbracket_pattern = dbracket_pattern,
 	redirs_touch_stdout = redirs_touch_stdout,
+	redir_forks = redir_forks,
 	describe = describe,
 	command_describe = command_describe,
 	statbuf = statbuf,
