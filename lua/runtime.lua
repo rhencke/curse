@@ -308,7 +308,10 @@ do
 			local ie = M.ierr -- (M.ierr: bash reports this one through internal_error)
 			M.ierr = nil
 			if c ~= "C" and c ~= "POSIX" then -- (a message locale: bash's translations)
-				ok, r = pcall(require("l10n").diag, sh, a, ie)
+				local okl, l10n = pcall(require, "l10n") -- (loading it can fail: fds exhausted)
+				if okl then
+					ok, r = pcall(l10n.diag, sh, a, ie)
+				end
 			end
 			if ok and r then
 				a = r
@@ -1710,20 +1713,26 @@ _temp_fd = function(content) -- the body on an O_RDONLY fd
 		C.close(w)
 		return r
 	end
-	local tmp = os.tmpname()
-	local w = io.open(tmp, "w")
+	-- (-1 with errno set on failure, never a raise: os.tmpname raises when mkstemp fails —
+	-- fd exhaustion — and a Lua error would escape the redirection as a traceback)
+	local okt, tmp = pcall(os.tmpname)
+	if not okt then
+		return -1
+	end
+	local w, _, e = io.open(tmp, "w")
 	if not w then
+		os.remove(tmp)
+		ffi.errno(e or 0)
 		return -1
 	end
 	w:write(content)
 	w:close()
 	local f = C.open(tmp, 0, 0) -- O_RDONLY
+	e = ffi.errno()
 	os.remove(tmp) -- the open fd keeps the inode alive
+	ffi.errno(e)
 	return f
 end
-end
-function M.body_fd(content) -- (the interpreter's here-docs too)
-	return _temp_fd(content)
 end
 -- A redirection's open failed: bash's message, from errno (read right after the open).
 -- noclobber's O_EXCL miss on a regular file is "cannot overwrite existing file".
@@ -1739,7 +1748,6 @@ function M.fd_number(s)
 	local n = #d < 11 and (tonumber(d) or 0) or -1
 	return n > 2147483647 and -1 or n
 end
-M.RESTRICTED_OUT = { out = true, clobber = true, app = true, rw = true, outboth = true, appboth = true }
 do -- (block-scoped: the main chunk is at LuaJIT's 200-local limit)
 -- A file redirection's open(2) flags: O_WRONLY|O_CREAT|O_TRUNC (577), + O_APPEND (1089),
 -- O_RDONLY (0), O_RDWR|O_CREAT (66: `<>` never truncates); mode 0666 & ~umask.
@@ -1772,7 +1780,7 @@ end
 -- written), nil for an op it has no form for.
 local function redir_open(sh, op, fd, target, saves)
 	local flags = REDIR_FLAGS[op]
-	if flags and flags ~= 0 and sh.opt_r then -- a restricted shell writes no files (M.RESTRICTED_OUT)
+	if flags and flags ~= 0 and sh.opt_r then -- a restricted shell writes no files
 		io.stderr:write("curse: " .. tostring(target) .. ": restricted: cannot redirect output\n")
 		return false
 	end
@@ -1822,7 +1830,8 @@ local function redir_open(sh, op, fd, target, saves)
 			redir_backup(saves, fd)
 		end
 		local h = _temp_fd(target) -- target = the already-built body text
-		if h < 0 then
+		if h < 0 then -- (redir.c: here_document_to_fd's failure, then the command fails)
+			io.stderr:write("curse: cannot create temp file for here-document: " .. ffi.string(C.strerror(ffi.errno())) .. "\n")
 			return false
 		end
 		if h ~= fd then
@@ -1984,12 +1993,42 @@ function M.redir_noglob(sh, f, ...)
 	sh.opt_f = false
 	return ok, fs
 end
--- rt.redir_ext's catch (cx.redir_ext): the redirect conditions' pcall results
-function M.redir_ext(sh, name, ok, res)
+-- THE policy (interp's apply_redirs and compiled code's rt.redir_ext both ask it): does bash
+-- run this command in a forked child (an external), where a fatal expansion error in its
+-- redirections (set -u, ${v?}, failglob) fails only it? `command [-p] [--] NAME` is looked
+-- through first, skipping functions (execute_cmd.c: check_command_builtin — a restricted
+-- shell's `command -p` and any other option stop it). args: the argv with c at index i
+-- (default 1; 0 when args holds only the words after c), else just the name c.
+function M.redir_forks(sh, c, args, i)
+	if sh.functions[c] then
+		return false
+	end
+	i = i or 1
+	local bi = M.builtin_enabled
+	while args and c == "command" and bi(sh, c) do
+		local j = i + 1
+		if args[j] == "-p" and not sh.opt_r then
+			j = j + 1
+		end
+		if args[j] == "--" then
+			j = j + 1
+		elseif args[j] and args[j]:sub(1, 1) == "-" then
+			break
+		end
+		if args[j] == nil then
+			break
+		end
+		i, c = j, args[j]
+	end
+	return not bi(sh, c)
+end
+-- rt.redir_ext's catch (cx.redir_ext): the redirect conditions' pcall results; name/args/i
+-- as rt.redir_forks takes them
+function M.redir_ext(sh, name, args, i, ok, res)
 	if ok then
 		return res
 	end
-	if type(res) ~= "table" or not res.__curse_exit or not require("interp")._int.redir_forks(sh, name) then
+	if type(res) ~= "table" or not res.__curse_exit or not M.redir_forks(sh, name, args, i) then
 		error(res, 0) -- (a function or builtin runs in the shell itself: fatal)
 	end
 	return false
