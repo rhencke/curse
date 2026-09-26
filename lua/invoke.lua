@@ -700,4 +700,18 @@ function M.start(sh, inv, istty)
 	return kind, payload
 end
 
+-- Run what M.start said to — run.lua's default (tiered) mode and a daemon worker's one
+-- dispatch. true: it ran tiered (its mid-run compiles are pending: tier.flush_stores).
+function M.run(sh, kind, payload)
+	if kind == "repl" or kind == "stdin" then
+		require("repl").run(sh) -- (non-interactive "stdin": line at a time from fd 0, bash)
+	elseif kind == "file" and sh.opt_t then -- (started -t: one command, read by the interpreter)
+		require("interp").run_lazy(sh, payload)
+	elseif kind ~= "exit" then -- "code" / "file" (the script's text): interpret, switching
+		-- to compiled code where a loop turns hot
+		require("tier").run_tiered(payload, sh)
+		return true
+	end
+end
+
 return M

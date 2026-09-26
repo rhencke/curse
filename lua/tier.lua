@@ -16,6 +16,26 @@ M.rt, M.parser, M.interp, M.emit = rt, P, I, E
 function M.compile(ast, opts)
 	return assert(load(E.emit(ast, opts), "=curse:compiled"))()
 end
+-- Load emitted Lua and instantiate it (run the chunk: its closures and pc tables): the
+-- module and its chunk, or nil when it won't load or builds no module. Every compile path
+-- (fragments, line mode, whole programs) goes through here.
+local function build(code, name)
+	local chunk = load(code, name)
+	if not chunk then
+		return nil
+	end
+	local ok, m = pcall(chunk)
+	if ok and type(m) == "table" and m.run then
+		return m, chunk
+	end
+	return nil
+end
+-- What the disk cache stores for a built chunk: its STRIPPED BYTECODE (a warm hit then
+-- loads without a Lua parse; string.dump of a chunk is valid after it ran), else the source.
+local function dump(chunk, code)
+	local ok, bc = pcall(string.dump, chunk, true)
+	return ok and bc or code
+end
 
 -- Compile a runtime code string (eval / source) as a FRAGMENT: emit with fragment=true so a
 -- TOP-LEVEL return/break/continue RAISES its signal (the caller's cf-wrapper catches it)
@@ -34,12 +54,17 @@ end
 -- definition) runs in the interpreter on its FIRST sighting (nil here) and compiles when
 -- the same text comes back — so a loop eval'ing ever-changing strings (`eval "echo
 -- {0..$c}"`) never compiles a thing it won't reuse. The pre-scan is textual (cheap, no
--- second parse); a false positive merely compiles eagerly, as before.
+-- second parse); a false positive merely compiles eagerly, as before. (The same scan
+-- decides whether a whole program's cold run is worth tiering: run_tiered.)
 local frag_cache, frag_n, FRAG_MAX = {}, 0, 512
-local function may_repeat(code)
-	return code:find("%f[%w_]while%f[^%w_]") or code:find("%f[%w_]until%f[^%w_]")
-		or code:find("%f[%w_]for%f[^%w_]") or code:find("%f[%w_]select%f[^%w_]")
-		or code:find("%f[%w_]function%f[^%w_]") or code:find("%(%s*%)")
+local LOOP_WORDS = { "while", "until", "for", "select", "function" }
+local function may_repeat(src)
+	for _, w in ipairs(LOOP_WORDS) do
+		if src:find(w, 1, true) and src:find("%f[%w_]" .. w .. "%f[^%w_]") then -- (plain first: cheap)
+			return true
+		end
+	end
+	return src:find("(", 1, true) ~= nil and src:find("%(%s*%)") ~= nil -- (a `name()` funcdef)
 end
 -- A fragment runs inside a shell whose ERR/DEBUG traps (and functrace) its own text may
 -- not mention: compile their hooks in when they're set, keyed so each trap state gets its
@@ -76,22 +101,28 @@ function M.note_text(sh, src)
 		sh.trap_bcmd = true
 	end
 end
--- (the emit opts a mode string asks for, beyond the trap hooks)
-local function mode_opts(o, mode)
+-- The emit opts a fragment's mode string (trap_mode + try_fragment's letters) asks for:
+-- the ERR/DEBUG hooks and functrace, what note_text found, "V" an eval's syntax-error
+-- label, "H" a trap handler's line numbering. (The one place mode letters become opts.)
+local function emit_opts(mode, o)
+	o.trap_err = mode:find("E", 1, true) ~= nil
+	o.trap_debug = mode:find("[DT]") ~= nil
+	o.functrace = mode:find("T", 1, true) ~= nil
 	o.bash_command = mode:find("B", 1, true) ~= nil
 	o.pipestatus = mode:find("P", 1, true) ~= nil
 	o.funcstack = mode:find("F", 1, true) ~= nil
 	o.extdebug = mode:find("X", 1, true) ~= nil
+	o.perr_label = mode:find("V", 1, true) and "eval" or nil
+	o.trapline = mode:find("H", 1, true) ~= nil
 	return o
 end
 -- With alias expansion on, a fragment's text parses with the live alias table (its own
 -- unconditional alias commands then apply from their next line, as the reader does):
--- the table's signature keys the compile. Memoized per table + change count (alias_gen).
-local function alias_sig(sh)
-	if not (sh and sh.shopt and sh.shopt.expand_aliases) then
-		return nil
-	end
-	local t = sh.aliases or {}
+-- the table's signature keys the compile. Memoized per table + change count (alias_gen),
+-- so line mode (lm_key: every line) doesn't sort the table again each time.
+local NO_ALIASES = {}
+local function alias_join(sh)
+	local t = sh.aliases or NO_ALIASES
 	if sh._asig_t == t and sh._asig_g == (sh.alias_gen or 0) then
 		return sh._asig
 	end
@@ -102,6 +133,17 @@ local function alias_sig(sh)
 	table.sort(al)
 	sh._asig_t, sh._asig_g, sh._asig = t, sh.alias_gen or 0, table.concat(al, "\1")
 	return sh._asig
+end
+local function alias_sig(sh)
+	return sh and sh.shopt and sh.shopt.expand_aliases and alias_join(sh) or nil
+end
+-- (a parse starting from alias table t: its own copy, which the text's alias commands change)
+local function aenv_of(t)
+	local tab = {}
+	for k, v in pairs(t) do
+		tab[k] = v
+	end
+	return { tab = tab }
 end
 -- The lexing a text was read under is part of its parse state, like posix/extglob: pst
 -- "b" = a multibyte locale whose trail bytes can be ASCII (Big5/GBK/SJIS: parser MBX, where
@@ -125,6 +167,31 @@ local function mb_parse(pst, f, ...)
 	end
 	return r
 end
+-- The live parse state as a pst string (the one producer; parser pst_now writes a node's
+-- in the same form): "p" posix mode; "x" extglob on, else "-" (known off: P.parse's xg
+-- false) — for a WHOLE program nothing (xg nil: its parse tracks extglob from the text);
+-- "b" a Big5/GBK/SJIS locale's lexing (mb_parse). A whole program's is nil when empty.
+-- Second result: the live charset itself (P.mb_on()), which keys the caches.
+function M.pst(sh, whole)
+	local mbx = P.mb_on()
+	local pst = (sh.opt_posix and "p" or "") .. (sh.shopt and sh.shopt.extglob and "x" or whole and "" or "-")
+		.. (mbx and "b" or "")
+	return pst ~= "" and pst or nil, mbx
+end
+-- Parse text under the parse state pst records — not whatever is live by the time it
+-- compiles (a whole program: as the shell STARTED — `--posix`, POSIXLY_CORRECT, `-O
+-- extglob`, BASHOPTS/SHELLOPTS — which the interpreter's first run read it under, so the
+-- module a warm run loads must too). aenv: the alias table the parse starts from; line1:
+-- the line the text numbers from.
+function M.parse_start(src, pst, aenv, line1)
+	local xg = nil
+	if pst and pst:find("x", 1, true) then
+		xg = true
+	elseif pst and pst:find("-", 1, true) then
+		xg = false
+	end
+	return mb_parse(pst, P.parse, src, nil, aenv, nil, pst and pst:find("p", 1, true) ~= nil or nil, nil, line1, xg)
+end
 function M.try_fragment(code, line1, sh, now, label, noalias) -- line1: an eval's own line, which its code numbers from
 	-- (now: the caller already saw this code run — compile it on this first call;
 	-- line1 == false: a trap handler, whose commands keep the interrupted line;
@@ -133,10 +200,9 @@ function M.try_fragment(code, line1, sh, now, label, noalias) -- line1: an eval'
 		.. ((label == "cmdsub" or label == "cmdsub-bq") and "C" or "") -- (a $( … ) body: its last command is marked, P.mark_tail)
 		.. (label == "cmdsub-bq" and "Q" or "") -- (a backtick body: its syntax errors read `command substitution:`)
 	local asig = not noalias and alias_sig(sh) -- (noalias: text read with its aliases expanded)
-	-- (the live parse-time options the text is read under: posix mode, extglob)
-	-- (and a Big5/GBK/SJIS locale's lexing: mb_parse)
-	local mbx = P.mb_on()
-	local pst = (sh.opt_posix and "p" or "") .. (sh.shopt and sh.shopt.extglob and "x" or "-") .. (mbx and "b" or "")
+	-- (the live parse-time options the text is read under: posix mode, extglob, and a
+	-- Big5/GBK/SJIS locale's lexing)
+	local pst, mbx = M.pst(sh)
 	local key = mode .. pst .. "\0" .. (mbx and mbx .. "\0" or "") .. (asig and ("A" .. asig .. "\0") or "") .. (line1 and (line1 .. "\0" .. code) or code)
 	local hit = frag_cache[key]
 	if hit ~= nil and hit ~= 0 then
@@ -160,16 +226,7 @@ end
 function M.compile_fragment(code, line1, mode, atab, pst)
 	-- (atab: the live alias table, expansion on — the parse starts from it; pst: the live
 	-- posix/extglob state, "p"?("x"|"-"), else the parse tracks them from the text)
-	local aenv = nil
-	if atab then
-		local tab = {}
-		for k, v in pairs(atab) do
-			tab[k] = v
-		end
-		aenv = { tab = tab }
-	end
-	local pok, ast = pcall(mb_parse, pst, P.parse, code, nil, aenv, nil, pst and pst:find("p", 1, true) ~= nil or nil, nil,
-		line1 or nil, pst and pst:find("x", 1, true) ~= nil)
+	local pok, ast = pcall(M.parse_start, code, pst, atab and aenv_of(atab) or nil, line1 or nil)
 	-- A syntax error becomes a `parse_error` statement after the valid prefix: compiled, it
 	-- reports and raises __curse_parseerr, which the caller (eval/source/trap) contains.
 	if not pok or type(ast) ~= "table" then
@@ -178,40 +235,35 @@ function M.compile_fragment(code, line1, mode, atab, pst)
 	if ast.ltrans then -- (a $"…" is translated as the text is read, under the live locale and
 		return nil -- $TEXTDOMAIN: the interpreter's reader does that each time)
 	end
-	if mode and mode:find("C", 1, true) then
+	mode = mode or ""
+	if mode:find("C", 1, true) then
 		P.mark_tail(ast.stmts)
 	end
 	for k, st in ipairs(ast.stmts) do
 		if st.t == "parse_error" then
 			st.lead = rt.perr_lead(ast.stmts, k) or nil
-			if mode and mode:find("Q", 1, true) then -- (as capture_src labels the interpreted one)
+			if mode:find("Q", 1, true) then -- (as capture_src labels the interpreted one)
 				st.plabel = "command substitution"
 			end
 		end
 	end
-	local ok, chunk = pcall(function()
-		mode = mode or ""
-		return load(E.emit(ast, mode_opts({ fragment = true, perr_label = mode:find("V", 1, true) and "eval", trapline = mode:find("H", 1, true) ~= nil, trap_err = mode:find("E", 1, true) ~= nil,
-			trap_debug = mode:find("[DT]") ~= nil, functrace = mode:find("T", 1, true) ~= nil }, mode)), "=curse:eval")
-	end)
-	if ok and chunk then
-		local built, mod = pcall(chunk)
-		if built and type(mod) == "table" and mod.run then
-			-- (run as a $(…) body: the light buffer capture only when the compiler calls it
-			-- pure — a redirect like `>&2` needs the fd-level capture: rt capture_src)
-			mod.nofork = E.cmdsub_nofork_ok(ast.stmts) and #ast.stmts > 0
-			return mod
-		end
+	local ok, code = pcall(E.emit, ast, emit_opts(mode, { fragment = true }))
+	local mod = ok and build(code, "=curse:eval")
+	if mod then
+		-- (run as a $(…) body: the light buffer capture only when the compiler calls it
+		-- pure — a redirect like `>&2` needs the fd-level capture: rt capture_src)
+		mod.nofork = E.cmdsub_nofork_ok(ast.stmts) and #ast.stmts > 0
+		return mod
 	end
 	return nil
 end
 
--- resume descriptor {kind,id} -> the pc to enter the compiled CFG at.
-local function resume_pc(mod, r)
-	if r.kind == "loop" then
-		return mod.loopPc[r.id] -- (nil: that loop has no resume point — never a statement's)
+-- A safepoint (kind, id) -> the pc to enter the compiled CFG at.
+local function resume_pc(mod, kind, id)
+	if kind == "loop" then
+		return mod.loopPc[id] -- (nil: that loop has no resume point — never a statement's)
 	end
-	return mod.stmtPc[r.id]
+	return mod.stmtPc[id]
 end
 
 -- Run the compiled module with the interp's line-abort semantics: a div0/failglob
@@ -276,7 +328,7 @@ function M.run(src, opts)
 		if resume ~= nil or sh.calldepth ~= 0 or not ready(kind, id, count) then
 			return
 		end
-		if resume_pc(mod, { kind = kind, id = id }) ~= nil then
+		if resume_pc(mod, kind, id) ~= nil then
 			resume = { kind = kind, id = id }
 			error({ __curse_switch = true }) -- (unwind the interpreter; resumed below)
 		end
@@ -287,7 +339,7 @@ function M.run(src, opts)
 		return sh, "interp-only"
 	end
 	if type(err) == "table" and err.__curse_switch then
-		M.run_compiled(mod, sh, resume_pc(mod, resume)) -- OSR into compiled code
+		M.run_compiled(mod, sh, resume_pc(mod, resume.kind, resume.id)) -- OSR into compiled code
 		return sh, "switched@" .. resume.kind .. resume.id
 	end
 	error(err)
@@ -332,18 +384,6 @@ local function alias_mismatch(mod, sh)
 	return mod.alias_static or (sh.aliases and next(sh.aliases) ~= nil)
 end
 
-local compile_store
-
-
-local LOOP_WORDS = { "while", "until", "for", "select", "function" }
-local function may_loop(src)
-	for _, w in ipairs(LOOP_WORDS) do
-		if src:find(w, 1, true) and src:find("%f[%w_]" .. w .. "%f[^%w_]") then -- (plain first: cheap)
-			return true
-		end
-	end
-	return src:find("(", 1, true) ~= nil and src:find("%(%s*%)") ~= nil -- (a `name()` funcdef)
-end
 local deferred = {}
 -- (loop iterations before an interpreted cold run compiles and switches; CURSE_HOT_LOOP
 -- overrides — 1 stress-tests OSR at every top-level loop)
@@ -433,60 +473,70 @@ function M.loop_osr(sh, st)
 	return true, err
 end
 I.frag_hook = M.frag_hook -- (the interpreter's isolated contexts tier their hot loops)
--- A hot function whose body is still an interp AST — defined by eval'd or sourced text,
--- in a subshell, or redefined (none of those is in the program's own module) — compiles
--- standalone from its definition's exact text at its own line, and its later calls run
--- the compiled closure (cached on the definition node, per trap state). Not while aliases
--- are live (the definition parsed with the table as it was then).
-function M.fn_hot(sh, name, def)
-	local n = (def._calls or 0) + 1
-	def._calls = n
-	if n < HOT_LOOP or not def.deftext then
+-- A definition compiled standalone from its exact text at its own line, for trap state
+-- `mode`: its closure (cached on the definition node per mode; its parse-time posix/extglob
+-- state is fixed per node, def._pst). nil: it doesn't compile, or aliases are live (the
+-- definition parsed with the table AS IT WAS).
+local function def_fn(sh, name, def, mode)
+	if not def.deftext or (sh.shopt.expand_aliases and sh.aliases and next(sh.aliases)) then
 		return nil
 	end
-	-- (its compiled body fires DEBUG under functrace, RETURN and $FUNCNEST for the calls it
-	-- makes — mode "T" keys it; live aliases: the definition parsed with the table AS IT WAS)
-	-- (the parse-time posix/extglob state is fixed per definition node, def._pst)
-	local mode = trap_mode(sh)
-	if sh.shopt.expand_aliases and sh.aliases and next(sh.aliases) then
-		return nil
+	local rm = def._rm
+	if not rm then
+		rm = {}
+		def._rm = rm
 	end
-	if def._cfnm == mode then
-		return def._cfn or nil
-	end
-	local mod = M.compile_fragment(def.deftext, def.line, mode, nil, def._pst)
-	local fc = mod and mod.fnCall and mod.fnCall[name]
-	def._cfn, def._cfnm = fc and fc.fn or false, mode
-	return def._cfn or nil
-end
-I.fn_hook = M.fn_hot
--- A function a fragment defined runs under a trap state its compile didn't see (a DEBUG/
--- ERR trap set since, or cleared): compile its definition again for this state (cached on
--- the definition per mode). nil: run it as it is.
-function M.fn_remode(sh, name, fm)
-	local mode = trap_mode(sh)
-	if fm.mode == mode then
-		return nil
-	end
-	local def = fm.def
-	if not (def and def.deftext) or (sh.shopt.expand_aliases and sh.aliases and next(sh.aliases)) then
-		return nil
-	end
-	def._rm = def._rm or {}
-	local f = def._rm[mode]
+	local f = rm[mode]
 	if f == nil then
 		local mod = M.compile_fragment(def.deftext, def.line, mode, nil, def._pst)
 		local fc = mod and mod.fnCall and mod.fnCall[name]
 		f = fc and fc.fn or false
-		def._rm[mode] = f
+		rm[mode] = f
 	end
 	return f or nil
 end
+-- A hot function whose body is still an interp AST — defined by eval'd or sourced text,
+-- in a subshell, or redefined (none of those is in the program's own module) — compiles
+-- standalone, and its later calls run the compiled closure. (Its compiled body fires
+-- DEBUG under functrace, RETURN and $FUNCNEST for the calls it makes — mode "T" keys it.)
+function M.fn_hot(sh, name, def)
+	local n = (def._calls or 0) + 1
+	def._calls = n
+	if n < HOT_LOOP then
+		return nil
+	end
+	return def_fn(sh, name, def, trap_mode(sh))
+end
+I.fn_hook = M.fn_hot
+-- A function a fragment defined runs under a trap state its compile didn't see (a DEBUG/
+-- ERR trap set since, or cleared): compile its definition again for this state. nil: run
+-- it as it is.
+function M.fn_remode(sh, name, fm)
+	local mode = trap_mode(sh)
+	if fm.mode == mode or not fm.def then
+		return nil
+	end
+	return def_fn(sh, name, fm.def, mode)
+end
 I.fn_remode = M.fn_remode
--- emit + load + store (disk cache and this worker's) — nil if the emitter can't. With
--- `later`, the disk write waits for M.flush_stores (a compile MID-RUN happens under the
--- script's own limits — `ulimit -f 1` would kill the process with SIGXFSZ).
+-- A program the emitter declined for a LEXICAL reason runs in line mode: its disk-cache
+-- entry is this marker module, so a warm run goes straight to the line reader.
+local LM_MARK = "return { lm = true, run = function() end }"
+local function lm_reason(err)
+	return type(err) == "string" and err:find("curse%-nocompile: line%-mode") ~= nil
+end
+M.lm_reason = lm_reason
+-- Publish an artifact in the disk cache. With `later`, the write waits for M.flush_stores
+-- (a compile MID-RUN happens under the script's own limits — `ulimit -f 1` would kill the
+-- process with SIGXFSZ).
 local pending_stores = {}
+local function store(path, code, later)
+	if later then
+		pending_stores[#pending_stores + 1] = { path, code }
+	else
+		require("cache").store(path, code)
+	end
+end
 function M.flush_stores()
 	local Cache = require("cache")
 	while #pending_stores > 0 do
@@ -494,28 +544,37 @@ function M.flush_stores()
 		pcall(Cache.store, ps[1], ps[2])
 	end
 end
-function compile_store(path, ast, sh, later)
-	local ok, code = pcall(E.emit, ast, (sh.xt_start or sh.attr_start) and { xtrace = sh.xt_start, startattr = sh.attr_start } or nil)
-	local chunk = ok and load(code, "=curse:compiled")
-	if not chunk then
-		if not ok and M.lm_reason(code) then -- (the next run reads it a line at a time)
-			pending_stores[#pending_stores + 1] = { path, "return { lm = true, run = function() end }" }
+-- (the emit opts of a program started under set -x / allexport / restricted)
+local function start_opts(xt, attr)
+	return (xt or attr) and { xtrace = xt, startattr = attr } or nil
+end
+-- Compile a whole program for the disk cache and this worker's: d = { path, src, pst, xt,
+-- attr }, the inputs its key was made from (run_tiered — also a deferred compile's
+-- record). Parses it as the shell STARTED (parse_start), emits, stores the bytecode
+-- (`later`: store) and memoizes the module. A program emit declines for a lexical reason
+-- stores LM_MARK: the next run reads it a line at a time. `start`: the state the shell
+-- STARTED in — a module it can't use (alias_mismatch: judged by that state, since the
+-- script enabling aliases itself is what a static-alias module already models) is nil,
+-- and not stored.
+local function compile_program(d, later, start)
+	local ok, code = pcall(function()
+		return E.emit(M.parse_start(d.src, d.pst), start_opts(d.xt, d.attr))
+	end)
+	local m, chunk
+	if ok then
+		m, chunk = build(code, "=curse:compiled")
+	end
+	if not m then
+		if not ok and lm_reason(code) then
+			store(d.path, LM_MARK, later)
 		end
 		return nil
 	end
-	local built, m = pcall(chunk)
-	-- (judged by the state the shell STARTED in — the script enabling aliases itself is
-	-- what a static-alias module already models)
-	if not (built and type(m) == "table" and m.run) or alias_mismatch(m, sh.tier_start or sh) then
+	if start and alias_mismatch(m, start) then
 		return nil
 	end
-	local okd, bc = pcall(string.dump, chunk, true)
-	if later then
-		pending_stores[#pending_stores + 1] = { path, okd and bc or code }
-	else
-		require("cache").store(path, okd and bc or code)
-	end
-	modcache_put(path, m)
+	store(d.path, dump(chunk, code), later)
+	modcache_put(d.path, m)
 	return m
 end
 -- LINE MODE. A script whose PARSE depends on run-time state — an alias defined as it
@@ -533,16 +592,11 @@ local function lm_key(sh, lg)
 	if not (lg.src and lg.spos and lg.pos) then
 		return nil
 	end
-	local al = {}
-	for k, v in pairs(sh.aliases or {}) do
-		al[#al + 1] = k .. "=" .. v
-	end
-	table.sort(al)
 	local so = sh.shopt or {}
 	return table.concat({ "curse-line", tostring(lg.sline or 0), trap_mode(sh),
 		(so.expand_aliases and "a" or "-") .. (sh.opt_posix and "p" or "-") .. (so.extglob and "g" or "-")
 			.. (P.mb_on() or "-"), -- (the lexing the line was read under: mb_parse)
-		table.concat(al, "\1"), lg.src:sub(lg.spos, lg.pos - 1) }, "\0")
+		alias_join(sh), lg.src:sub(lg.spos, lg.pos - 1) }, "\0")
 end
 function M.lm_exec(sh, lg, k)
 	local key = lm_key(sh, lg)
@@ -557,39 +611,29 @@ function M.lm_exec(sh, lg, k)
 		if not mod then
 			-- (a line abort skips the rest of THIS line: all of it is one line group)
 			lg.stmts[1].lgstart = true
-			-- (the ERR/DEBUG traps set by earlier lines: their hooks compiled in — trap_mode)
-			local tm = trap_mode(sh)
 			-- ($(…) bodies parse with the live alias table, as the interpreter's expansion
 			-- does — the key has it; a line that changes aliases leaves them to capture_src)
 			local lmae = nil
-			local txt = lg.src:sub(lg.spos, lg.pos - 1)
-			if txt:find("alias", 1, true) then
+			if lg.src:sub(lg.spos, lg.pos - 1):find("alias", 1, true) then
 				lmae = false
 			elseif sh.shopt.expand_aliases and next(sh.aliases or {}) then
-				lmae = { tab = {} }
-				for an, av in pairs(sh.aliases) do
-					lmae.tab[an] = av
-				end
+				lmae = aenv_of(sh.aliases)
 			end
-			local ok, code = pcall(E.emit, { stmts = lg.stmts }, mode_opts({ fragment = true, lm = true,
-				trap_err = tm:find("E", 1, true) ~= nil, trap_debug = tm:find("[DT]") ~= nil,
-				functrace = tm:find("T", 1, true) ~= nil, lm_aenv = lmae }, tm))
-			local chunk = ok and load(code, "=curse:line")
-			local built, m = false, nil
-			if chunk then
-				built, m = pcall(chunk)
+			-- (the ERR/DEBUG traps set by earlier lines: their hooks compiled in — trap_mode)
+			local ok, code = pcall(E.emit, { stmts = lg.stmts }, emit_opts(trap_mode(sh), { fragment = true, lm = true, lm_aenv = lmae }))
+			local chunk
+			if ok then
+				mod, chunk = build(code, "=curse:line")
 			end
-			if not (built and type(m) == "table" and m.run) then
+			if not mod then
 				if LM_DEBUG then
-					io.stderr:write("[line " .. tostring(lg.sline) .. ": interpreted: " .. tostring(m or code) .. "]\n")
+					io.stderr:write("[line " .. tostring(lg.sline) .. ": interpreted: " .. tostring(code) .. "]\n")
 				end
 				lm_fail[key] = true
 				return nil
 			end
-			mod = m
 			if path then
-				local okd, bc = pcall(string.dump, chunk, true)
-				pending_stores[#pending_stores + 1] = { path, okd and bc or code }
+				store(path, dump(chunk, code), true)
 			end
 		end
 		if path then
@@ -603,13 +647,6 @@ function M.lm_exec(sh, lg, k)
 	return k + #lg.stmts
 end
 I.lm_exec = M.lm_exec
--- A program the emitter declined for a LEXICAL reason runs in line mode: its disk-cache
--- entry is this marker module, so a warm run goes straight to the line reader.
-local LM_MARK = "return { lm = true, run = function() end }"
-local function lm_reason(err)
-	return type(err) == "string" and err:find("curse%-nocompile: line%-mode") ~= nil
-end
-M.lm_reason = lm_reason
 function M.run_lm(sh, src)
 	sh.lm = true
 	I.run_lazy(sh, src)
@@ -620,226 +657,170 @@ end
 function M.has_deferred()
 	return #deferred > 0
 end
--- Parse a whole program under the parse options the shell STARTED with (pst: "p" posix
--- mode, "x" extglob — `--posix`, POSIXLY_CORRECT, `-O extglob`, BASHOPTS/SHELLOPTS — "b"
--- a Big5/GBK/SJIS locale's lexing, mb_parse): the interpreter's first run reads it that
--- way, so the module a warm run loads must too.
-function M.parse_start(src, pst)
-	if not pst then
-		return mb_parse(pst, P.parse, src)
-	end
-	return mb_parse(pst, P.parse, src, nil, nil, nil, pst:find("p", 1, true) ~= nil or nil, nil, nil,
-		pst:find("x", 1, true) ~= nil or nil)
-end
 function M.compile_deferred(one)
-	local Cache = require("cache")
 	while #deferred > 0 do
-		local d = table.remove(deferred)
-		local ok, code = pcall(function()
-			return E.emit(M.parse_start(d.src, d.pst), (d.xt or d.attr) and { xtrace = d.xt, startattr = d.attr } or nil)
-		end)
-		local chunk = ok and load(code, "=curse:compiled")
-		if chunk then
-			local built, m = pcall(chunk)
-			if built and type(m) == "table" and m.run then
-				local okd, bc = pcall(string.dump, chunk, true)
-				Cache.store(d.path, okd and bc or code)
-				modcache_put(d.path, m)
-			end
-		elseif lm_reason(code) then -- (runs a line at a time from now on)
-			Cache.store(d.path, LM_MARK)
-		end
+		compile_program(table.remove(deferred))
 		if one then
 			return
 		end
 	end
 end
--- Daemon cold/hot execution. A warm cache hit loads the dumped bytecode and runs it
--- compiled ("warm"); a miss emits + STORES the bytecode (so the next run is a hit)
--- and runs TIERED (interp, then OSR fall-over into the compiled module) -- "cold".
--- If the emitter can't handle the script, fall back to the interpreter. Mirrors
--- cache.lua's M.run, but the cold path tiers instead of running compiled from pc=0.
-function M.run_tiered(src, sh)
+-- The state a whole program compiles for, fixed as the shell STARTED: what its text needs
+-- (note_text), set -x (a module compiled WITH trace hooks), allexport/restricted (plain
+-- assignments may export or be refused), and its parse state (M.pst) — each its own cache
+-- key. Returns the pst and the live multibyte charset.
+local function start_state(sh, src)
 	sh.main_src = sh.main_src or src -- (the script's text: rt.coproc_exit_dispose's end-of-input line)
-	local Cache = require("cache")
 	M.note_text(sh, src)
-	-- (a shell started under set -x runs a module compiled WITH trace hooks: its own key)
 	sh.xt_start = sh.opt_x or nil
-	-- (started allexport/restricted: plain assignments may export or be refused — a module
-	-- compiled for that, under its own key)
 	sh.attr_start = (sh.opt_a or sh.opt_r) or nil
+	return M.pst(sh, true)
+end
+-- Compiled mode (run.lua): the whole program compiled up front, as the shell started. Throws
+-- what emit throws (`curse-nocompile: …`, lm_reason) for the caller to fall back on.
+function M.compile_start(sh, src)
+	local pst = start_state(sh, src)
+	return M.compile(M.parse_start(src, pst), start_opts(sh.xt_start, sh.attr_start))
+end
+-- Daemon cold/hot execution. A warm cache hit (this worker's modules, else the disk's
+-- dumped bytecode) runs compiled; a miss runs TIERED (interp, then OSR fall-over into the
+-- compiled module once a loop turns hot), or — a script that can't get hot — interpreted,
+-- compiling it after the reply (M.compile_deferred) so the NEXT run is a warm hit.
+function M.run_tiered(src, sh)
+	local pst, mbx = start_state(sh, src)
 	sh.tier_start = { opt_x = sh.opt_x, opt_v = sh.opt_v, aliases = next(sh.aliases or {}) and { ["?"] = "" } or {},
 		shopt = { expand_aliases = sh.shopt and sh.shopt.expand_aliases } }
-	-- (started in posix mode / with extglob / a Big5/GBK/SJIS locale: the program parses
-	-- differently — its own key)
-	local pst = (sh.opt_posix and "p" or "") .. (sh.shopt and sh.shopt.extglob and "x" or "") .. (P.mb_on() and "b" or "")
-	pst = pst ~= "" and pst or nil
-	local mbx = P.mb_on() -- (read in a Big5/GBK/SJIS locale: keyed by it, never deferred)
+	-- (read in a Big5/GBK/SJIS locale: keyed by its charset, and never deferred)
+	local Cache = require("cache")
 	local path = Cache.artifact_path((sh.xt_start or sh.attr_start or pst)
 		and (src .. (sh.xt_start and "\0xtrace" or "") .. (sh.attr_start and "\0attr" or "")
 			.. (pst and "\0pst" .. pst or "") .. (mbx and "\0" .. mbx or "")) or src)
-	if path then
-		local cached = modcache_get(path)
-		if cached and alias_mismatch(cached, sh) then -- (read a line at a time: each compiled)
-			M.run_lm(sh, src)
-			return sh, "lines"
+	local mod = path and modcache_get(path) -- (in-process: no disk read, no module rebuild)
+	if path and not mod then
+		mod = Cache.load(path)
+		if mod then
+			modcache_put(path, mod)
 		end
-		if cached and cached.lm then
-			M.run_lm(sh, src)
-			return sh, "warm-lines"
-		end
-		if cached then -- in-process hit: no disk read, no module rebuild
-			I.finish_run(sh, function()
-				M.run_compiled(cached, sh, nil)
-			end)
-			return sh, "warm-mem"
-		end
-	end
-	local mod = Cache.load(path)
-	if mod and alias_mismatch(mod, sh) then
-		M.run_lm(sh, src)
-		return sh, "lines"
-	end
-	if mod and mod.lm then
-		if path then modcache_put(path, mod) end
-		M.run_lm(sh, src)
-		return sh, "warm-lines"
 	end
 	if mod then
-		if path then modcache_put(path, mod) end -- memoize the instantiated module
-		I.finish_run(sh, function()
-			M.run_compiled(mod, sh, nil)
-		end)
-		return sh, "warm"
+		if mod.lm or alias_mismatch(mod, sh) then -- (read a line at a time: each compiled)
+			M.run_lm(sh, src)
+		else
+			I.finish_run(sh, function()
+				M.run_compiled(mod, sh, nil)
+			end)
+		end
+		return
 	end
-	-- A miss on a script that can't get hot (no loop, no function: a conservative scan of
-	-- the text) runs in the interpreter right away; it's compiled after the reply
-	-- (M.compile_deferred) so the NEXT run is a warm hit, and no caller waits for it.
-	if path and not may_loop(src) then
+	if not path then
+		I.run_lazy(sh, src) -- (no cache path: the interpreter's line-at-a-time parse)
+		return
+	end
+	local d = { path = path, src = src, xt = sh.xt_start, attr = sh.attr_start, pst = pst }
+	-- A miss on a script that can't get hot (no loop, no function: may_repeat) runs in the
+	-- interpreter right away, compiled after the reply; no caller waits for it.
+	if not may_repeat(src) then
 		if not mbx then
-			deferred[#deferred + 1] = { path = path, src = src, xt = sh.xt_start, attr = sh.attr_start, pst = pst }
+			deferred[#deferred + 1] = d
 		end
 		I.run_lazy(sh, src)
-		return sh, "interp-deferred"
+		return
 	end
-	local ast -- (parsed for the compile, only if a loop gets hot)
-	if path then
-		-- Run it interpreted; a loop that turns hot compiles the script right then and
-		-- continues compiled from that loop — at the top level (OSR into run), or inside a
-		-- function call (interp run_function continues the call in the compiled function).
-		-- A script that never gets hot is compiled after the reply.
-		local mod, resume, count = nil, nil, 0
-		local fnseen = {} -- (function name -> its switch verdict, checked once)
-		local calls = {} -- (function name -> calls interpreted so far)
-		-- (a DEBUG/RETURN trap now set: switch only into a module compiled with its hooks)
-		local function trap_blocked()
-			local t = sh.traps
-			if not (t and (t.DEBUG or t.RETURN)) then
-				return false
-			end
-			if mod == nil then
-				if not ast then
-					local okp, a = pcall(M.parse_start, src, pst)
-					ast = okp and a or nil
-				end
-				mod = ast and compile_store(path, ast, sh, true) or false
-			end
-			return not mod or (t.DEBUG and not mod.has_debug) or (t.RETURN and not mod.has_return) or false
+	-- Run it interpreted; a loop that turns hot compiles the script right then and
+	-- continues compiled from that loop — at the top level (OSR into run), or inside a
+	-- function call (interp run_function continues the call in the compiled function).
+	-- A script that never gets hot is compiled after the reply.
+	local resume, count = nil, 0 -- (the pc a hot loop switches in at)
+	local fnseen = {} -- (definition node -> its switch verdict, checked once)
+	-- (the running definition of `name` is the one compiled — src: its compiled text)
+	local function same_def(name, def, src)
+		local verdict = fnseen[def]
+		if verdict == nil then
+			verdict = type(sh.functions[name]) == "table" and I.deparse_func(name, def) == src or false
+			fnseen[def] = verdict
 		end
-		local hook = function(kind, id, st, csh)
-			if kind == "call" then
-				-- a hot function (recursion, or called in a loop the switch can't take): the
-				-- compiled version runs its later calls — when the running definition is the
-				-- one compiled (checked once per definition node)
-				local n = (calls[id] or 0) + 1
-				calls[id] = n
-				if n < HOT_LOOP or not st or trap_blocked() then
-					return nil
-				end
-				if mod == nil then
-					if not ast then
-						local okp, a = pcall(M.parse_start, src, pst)
-						ast = okp and a or nil
-					end
-					mod = ast and compile_store(path, ast, sh, true) or false
-				end
-				local fc = mod and mod.fnCall and mod.fnCall[id]
-				if not fc then
-					return nil
-				end
-				local verdict = fnseen[st]
-				if verdict == nil then
-					verdict = type(sh.functions[id]) == "table" and I.deparse_func(id, st) == fc.src or false
-					fnseen[st] = verdict
-				end
-				return verdict and fc.fn or nil
+		return verdict
+	end
+	local calls = {} -- (function name -> calls interpreted so far)
+	-- (the module, compiled on the first hot safepoint; false: none — the emitter declined,
+	-- or aliases now in play)
+	local function compiled()
+		if mod == nil then
+			mod = compile_program(d, true, sh.tier_start) or false
+		end
+		return mod
+	end
+	-- (a DEBUG/RETURN trap now set: switch only into a module compiled with its hooks)
+	local function trap_blocked()
+		local t = sh.traps
+		if not (t and (t.DEBUG or t.RETURN)) then
+			return false
+		end
+		local m = compiled()
+		return not m or (t.DEBUG and not m.has_debug) or (t.RETURN and not m.has_return) or false
+	end
+	local hook = function(kind, id, st, csh)
+		if kind == "call" then
+			-- a hot function (recursion, or called in a loop the switch can't take): the
+			-- compiled version runs its later calls — when the running definition is the
+			-- one compiled (checked once per definition node)
+			local n = (calls[id] or 0) + 1
+			calls[id] = n
+			if n < HOT_LOOP or not st or trap_blocked() then
+				return nil
 			end
-			if kind ~= "loop" then
-				return
+			local m = compiled()
+			local fc = m and m.fnCall and m.fnCall[id]
+			if not fc then
+				return nil
 			end
-			count = count + 1
-			if count < HOT_LOOP or resume or trap_blocked() then
-				return
-			end
-			if sh.calldepth ~= 0 then
-				-- a hot loop inside a function call: compile, and continue THIS call
-				-- compiled from the loop (interp run_function catches the switch) — when the
-				-- running definition is the one compiled (a redefinition isn't)
-				if mod == nil then
-					if not ast then
-						local okp, a = pcall(M.parse_start, src, pst)
-						ast = okp and a or nil
-					end
-					mod = ast and compile_store(path, ast, sh, true) or false
-				end
-				local fname = sh.funcstack and sh.funcstack[1]
-				local fl = mod and mod.fnLoop and fname and mod.fnLoop[fname]
-				if not fl then
-					return M.loop_osr(sh, st)
-				end
-				local def = sh.func_def and sh.func_def[fname]
-				local verdict = def and fnseen[def]
-				if def and verdict == nil then -- (per definition node: a redefinition is re-checked)
-					verdict = type(sh.functions[fname]) == "table" and I.deparse_func(fname, def) == fl.src or false
-					fnseen[def] = verdict
-				end
-				local fpc = verdict and fl.pcs[id]
-				if fpc then
-					error({ __curse_fnswitch = true, fn = fl.fn, pc = fpc, depth = sh.calldepth }, 0)
-				end
+			return same_def(id, st, fc.src) and fc.fn or nil
+		end
+		if kind ~= "loop" then
+			return
+		end
+		count = count + 1
+		if count < HOT_LOOP or resume or trap_blocked() then
+			return
+		end
+		local m = compiled()
+		if sh.calldepth ~= 0 then
+			-- a hot loop inside a function call: compile, and continue THIS call
+			-- compiled from the loop (interp run_function catches the switch) — when the
+			-- running definition is the one compiled (a redefinition isn't)
+			local fname = sh.funcstack and sh.funcstack[1]
+			local fl = m and m.fnLoop and fname and m.fnLoop[fname]
+			if not fl then
 				return M.loop_osr(sh, st)
 			end
-			if mod == nil then
-				if not ast then
-					local okp, a = pcall(M.parse_start, src, pst)
-					ast = okp and a or nil
-				end
-				mod = ast and compile_store(path, ast, sh, true) or false
+			local def = sh.func_def and sh.func_def[fname]
+			-- (per definition node: a redefinition is re-checked)
+			local fpc = def and same_def(fname, def, fl.src) and fl.pcs[id]
+			if fpc then
+				error({ __curse_fnswitch = true, fn = fl.fn, pc = fpc, depth = sh.calldepth }, 0)
 			end
-			local pc = mod and resume_pc(mod, { kind = kind, id = id })
-			if pc then -- (no module — the emitter declined, or aliases now in play: stay put)
-				resume = { kind = kind, id = id }
-				error({ __curse_switch = true })
-			end
-			return M.loop_osr(sh, st) -- (a loop the module can't resume: a subshell's, …)
+			return M.loop_osr(sh, st)
 		end
-		local ok, err = pcall(I.run_lazy, sh, src, hook)
-		if ok then
-			if mod == nil and not mbx then
-				deferred[#deferred + 1] = { path = path, src = src, xt = sh.xt_start, attr = sh.attr_start, pst = pst }
-			end
-			return sh, "interp-deferred"
+		resume = m and resume_pc(m, kind, id)
+		if resume then -- (no module: stay put)
+			error({ __curse_switch = true })
 		end
-		if type(err) == "table" and err.__curse_switch and mod then
-			I.finish_run(sh, function()
-				M.run_compiled(mod, sh, resume_pc(mod, resume))
-			end)
-			return sh, "cold-osr"
-		end
-		error(err)
+		return M.loop_osr(sh, st) -- (a loop the module can't resume: a subshell's, …)
 	end
-	I.run_lazy(sh, src) -- (no cache path: the interpreter's line-at-a-time parse)
-	return sh, "interp"
+	local ok, err = pcall(I.run_lazy, sh, src, hook)
+	if ok then
+		if mod == nil and not mbx then
+			deferred[#deferred + 1] = d
+		end
+		return
+	end
+	if type(err) == "table" and err.__curse_switch and mod then
+		I.finish_run(sh, function()
+			M.run_compiled(mod, sh, resume)
+		end)
+		return
+	end
+	error(err)
 end
 
 return M

@@ -1,27 +1,32 @@
--- Persistent artifact cache: cold miss compiles+stores, warm hit loads+runs,
--- both match, a corrupt artifact degrades gracefully, and cache failures never
--- break execution. Point XDG_CACHE_HOME at a temp dir before running.
+-- Persistent artifact cache, driven the way the daemon drives it (tier.run_tiered): a cold
+-- miss runs interpreted and defers its compile, the deferred compile stores the artifact,
+-- a warm run uses it with nothing left to compile, a corrupt artifact degrades to a miss,
+-- and cache failures never break execution. Point XDG_CACHE_HOME at a temp dir first.
 package.path = "lua/?.lua;" .. package.path
 local Cache = require("cache")
-local rt = require("runtime")
+local T = require("tier")
 
 local function run(src)
-	local sh = rt.Shell.new()
+	local sh = T.rt.Shell.new()
 	local b = {}
 	sh.out = function(s)
 		b[#b + 1] = s
 	end
-	local _, how = Cache.run(src, sh)
-	return (table.concat(b):gsub("\n", "|"):gsub("|$", "")), how
+	T.run_tiered(src, sh)
+	return (table.concat(b):gsub("\n", "|"):gsub("|$", ""))
 end
 
 local ok = true
-local function ck(desc, got, how, want, wanthow)
-	local pass = got == want and how == wanthow
+local function ck(desc, pass)
 	ok = ok and pass
-	print(
-		("  %-26s %-14s [%-7s] %s"):format(desc, got, how, pass and "OK" or ("*** want [" .. want .. "]/" .. wanthow))
-	)
+	print(("  %-34s %s"):format(desc, pass and "OK" or "***"))
+end
+local function exists(path)
+	local f = io.open(path, "r")
+	if f then
+		f:close()
+	end
+	return f ~= nil
 end
 
 local SRC = 'x=$(echo hi)\necho "[$x]"\nfor ((i=0;i<3;i=i+1)); do echo $i; done'
@@ -32,32 +37,20 @@ local path = Cache.artifact_path(SRC)
 os.remove(path)
 os.remove(path .. ".lock")
 
-local g1, h1 = run(SRC)
-ck("first run (cold)", g1, h1, WANT, "cold")
-local g2, h2 = run(SRC)
-ck("second run (warm)", g2, h2, WANT, "warm")
+ck("first run (cold) output", run(SRC) == WANT)
+ck("cold run defers its compile", T.has_deferred() and not exists(path))
+T.compile_deferred()
+ck("deferred compile stores artifact", exists(path) and Cache.load(path) ~= nil)
+ck("second run (warm) output", run(SRC) == WANT)
+ck("warm run compiles nothing", not T.has_deferred())
 
--- artifact really exists on disk
-local f = io.open(path, "r")
-local exists = f ~= nil
-if f then
-	f:close()
-end
-print(("  %-26s %-14s %s"):format("artifact on disk", tostring(exists), exists and "OK" or "***"))
-ok = ok and exists
-
--- corrupt the artifact -> must degrade to a fresh compile, still correct
+-- a corrupt artifact is a clean miss, never an error
 local w = io.open(path, "w")
 w:write("this is not valid lua ][")
 w:close()
-local g3, h3 = run(SRC)
-ck("corrupt artifact", g3, h3, WANT, "cold")
-
--- no HOME / no XDG -> uncacheable, but still runs (path=nil -> interp/cold works)
--- (can't unset env from Lua portably; instead check artifact_path handles nil)
-if Cache.artifact_path(SRC) == nil then
-	print("  (no home -> nil path)")
-end
+ck("corrupt artifact loads as nil", Cache.load(path) == nil)
+-- an unwritable cache location fails the store, quietly
+ck("unwritable store is false", Cache.store("/proc/curse-no-such/x.bc", "return {}") == false)
 
 if not ok then
 	os.exit(1)

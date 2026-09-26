@@ -18,10 +18,6 @@
 local ffi = require("ffi")
 local bit = require("bit")
 
-local P = require("parser")
-local E = require("emit")
-local I = require("interp")
-
 local M = {}
 
 ffi.cdef([[
@@ -186,68 +182,6 @@ function M.store(path, code)
 	C.flock(lockfd, 8) -- LOCK_UN (also released on close, but be explicit)
 	C.close(lockfd)
 	return ok
-end
-
--- Run a compiled module with the interp's line-abort semantics: a div0/failglob
--- lineabort re-enters run at sh._ff (next line) with $?=1. (A reduced tier.run_compiled:
--- no dbgskip, frame unwinding or line drift: M.run is exercised by test_cache only; the
--- daemon runs scripts through tier.)
-local function run_compiled(mod, sh, pc)
-	local ne0 = sh.noerr
-	while true do
-		local ok, err = pcall(mod.run, sh, pc)
-		if ok then
-			return
-		end
-		if type(err) == "table" and err.__curse_lineabort and not require("runtime").lineabort_exits(sh, err) then
-			sh.status, sh.noerr = 1, ne0
-			pc = sh._ff
-		else
-			error(err)
-		end
-	end
-end
-
--- Run `src` against `sh`, using the cache. Returns (sh, how) where how is one of
--- "warm" (ran a cached artifact), "cold" (compiled fresh, then cached), or
--- "interp" (the compiler couldn't handle it — ran the tree-walker). Never fails
--- for a cache reason.
-function M.run(src, sh)
-	local path = M.artifact_path(src)
-
-	local mod = M.load(path) -- warm hit: skip parse AND emit
-	if mod then
-		I.finish_run(sh, function()
-			run_compiled(mod, sh, nil)
-		end) -- exit N -> $?, fire EXIT trap
-		return sh, "warm"
-	end
-
-	-- Cold: parse + emit in-process (cheap — emit is pure string building). If the
-	-- emitter can't handle this script, fall back to the interpreter (the oracle).
-	local ok, code = pcall(function()
-		return E.emit(P.parse(src))
-	end)
-	if ok then
-		local chunk, lerr = load(code, "=curse:compiled")
-		if chunk then
-			local built, m = pcall(chunk)
-			if built and type(m) == "table" and m.run then
-				-- Store DUMPED BYTECODE (strip debug info), not the Lua source: a warm
-				-- hit then loads via the bytecode path (no Lua parse). string.dump of a
-				-- chunk is valid after it has been called.
-				local okd, bc = pcall(string.dump, chunk, true)
-				M.store(path, okd and bc or code) -- populate for next time (best-effort)
-				I.finish_run(sh, function()
-					run_compiled(m, sh, nil)
-				end) -- exit N -> $?, EXIT trap
-				return sh, "cold"
-			end
-		end
-	end
-
-	I.run(sh, P.parse(src)) -- fallback: always correct
-	return sh, "interp"
 end
 
 return M

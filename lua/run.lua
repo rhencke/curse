@@ -88,46 +88,34 @@ rt.shlvl_start(sh) -- (a new shell: $SHLVL + 1, exported)
 rt.startup_ignored(sh) -- signals ignored at entry stay ignored (untrappable)
 rt.sig_setup(sh) -- (SIGQUIT ignored; SIGINT's default, not luajit's `interrupted!`)
 local kind, src = Invoke.start(sh, inv)
-if kind == "exit" then
-	finish(sh)
-elseif kind == "repl" or kind == "stdin" then
-	require("repl").run(sh) -- (non-interactive "stdin": line at a time from fd 0, bash)
-	finish(sh)
-elseif sh.opt_t and kind ~= "code" then -- (started -t: one command, read by the interpreter)
-	interp.run_lazy(sh, src)
-elseif kind == "code" or mode == "tiered" then
-	-- interpret, and switch to compiled code where a loop turns hot (compiled into the
-	-- shared cache, so the next run starts compiled) — the daemon's own path
-	local T = require("tier")
-	T.run_tiered(src, sh)
-	pcall(T.flush_stores)
-elseif mode == "compiled" then
-	local T = require("tier") -- pulls emit + cache; only the compiled path needs them
-	-- The compiler THROWS `curse-nocompile:` for a program it can't faithfully compile
-	-- (e.g. alias expansion, which needs line-at-a-time parsing). That's the honest
-	-- tiered behavior — run it in the interpreter, exactly as the daemon/cache path does
-	-- on the same signal. Any OTHER compile error still propagates.
-	local sa = (sh.opt_a or sh.opt_r) or nil -- (started allexport/restricted: tier.run_tiered)
-	local pst = ((sh.opt_posix and "p" or "") .. (sh.shopt.extglob and "x" or "")
-		.. (require("parser").mb_on() and "b" or "")):match(".+") -- (tier.parse_start)
-	T.note_text(sh, src)
-	sh.main_src = sh.main_src or src
-	local ok, mod = pcall(T.compile, T.parse_start(src, pst), (sh.opt_x or sa) and { xtrace = sh.opt_x, startattr = sa } or nil)
-	if not ok then
-		if T.lm_reason(mod) then -- (a line at a time, each line compiled: aliases, history…)
-			T.run_lm(sh, src)
-			pcall(T.flush_stores)
-		elseif type(mod) == "string" and mod:find("curse%-nocompile") then
-			interp.run_lazy(sh, src)
+if mode ~= "tiered" and kind == "file" and not sh.opt_t then
+	if mode == "interp" then
+		interp.run_lazy(sh, src) -- lazy: instant start, never parses past exit
+	else -- compiled
+		local T = require("tier") -- pulls emit + cache; only the compiled path needs them
+		-- The compiler THROWS `curse-nocompile:` for a program it can't faithfully compile
+		-- (e.g. alias expansion, which needs line-at-a-time parsing). That's the honest
+		-- tiered behavior — run it in the interpreter, exactly as the daemon/cache path does
+		-- on the same signal. Any OTHER compile error still propagates.
+		local ok, mod = pcall(T.compile_start, sh, src)
+		if not ok then
+			if T.lm_reason(mod) then -- (a line at a time, each line compiled: aliases, history…)
+				T.run_lm(sh, src)
+				pcall(T.flush_stores)
+			elseif type(mod) == "string" and mod:find("curse%-nocompile") then
+				interp.run_lazy(sh, src)
+			else
+				error(mod)
+			end
 		else
-			error(mod)
+			interp.finish_run(sh, function()
+				T.run_compiled(mod, sh, nil)
+			end)
 		end
-	else
-		interp.finish_run(sh, function()
-			T.run_compiled(mod, sh, nil)
-		end)
 	end
-else -- interp
-	interp.run_lazy(sh, src) -- lazy: instant start, never parses past exit
+elseif Invoke.run(sh, kind, src) then
+	-- (tiered: compiled into the shared cache, so the next run starts compiled — the
+	-- modules compiled mid-run are written now)
+	pcall(require("tier").flush_stores)
 end
 finish(sh)
