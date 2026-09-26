@@ -1565,9 +1565,6 @@ function M.coll_lt(a, b)
 	end
 	return a < b
 end
-function M.subshell_exit(status, sh)
-	M.child_exit(sh, status)
-end
 
 -- Redirections, GENUINELY COMPILED. The compiler knows each redirect's operator +
 -- fd at compile time and computes its target natively, then calls this with the
@@ -2427,9 +2424,6 @@ local function async_spawn_release()
 	C.curse_rt_sigaction(3, _aq_sa3, nil)
 	C.sigprocmask(2, _aq_old, nil) -- SIG_SETMASK
 end
-ffi.cdef("int curse_rt_execve(const char *path, char *const argv[], char *const envp[]) asm(\"execve\");")
-local _exec_emptyset = ffi.new("uint8_t[1024]")
-C.sigemptyset(_exec_emptyset)
 -- The last command of a ( … ) / $( … ) body (parser.mark_tail) that turns out to be an
 -- external command is exec'd by bash in place of the subshell's own process (CMD_NO_FORK),
 -- lowering $SHLVL first like `exec` (execute_disk_command's adjust_shell_level(-1)) — the
@@ -2575,22 +2569,6 @@ function Shell:exec_t(args)
 	-- streams and SIGPIPE propagates, and there's no 2x-memory capture.
 	if self.out == io.write or CO_OUTS[self.out] then
 		io.flush() -- our own buffered stdout (and a pipeline stage's) must reach fd 1 first
-		-- exec_tail: this external is the LAST thing a forked child does (`cmd &`), so replace
-		-- the child with it — one process, like bash — instead of spawning a grandchild and
-		-- waiting. Same signal state a spawned child gets (clean mask; caught handlers reset
-		-- by execve itself). Returns only on failure.
-		if self.exec_tail and self.exec_tail == C.getpid() then -- armed by THIS process only
-			self.exec_tail = nil
-			C.sigprocmask(2, _exec_emptyset, nil) -- SIG_SETMASK
-			C.curse_rt_execve(execpath, ffi.cast("char *const *", argv), M.child_env())
-			local e = ffi.errno()
-			if e == 8 then -- ENOEXEC: no-shebang script — run it through our interpreter
-				return self:run_noexec(execpath, args, n)
-			end
-			self:errmsg(M.spawn_errmsg(self, args[1], execpath, e))
-			self.status = (e == 2) and 127 or 126
-			return
-		end
 		local pidp = ffi.new("curse_pid_t[1]")
 		local attr = child_spawnattr(self)
 		-- (an async job's command — not a function's — or one in an async subshell: with
@@ -3658,8 +3636,6 @@ function M.iso_signal(sh, ctx, sig)
 	end
 	error({ __curse_vsig = ctx, sig = sig }, 0) -- the default action: the subshell dies
 end
--- A forked subshell child ends: run an EXIT trap the SUBSHELL set (never the inherited
--- parent one), with $? = its status, then _exit.
 -- ---- terminating signals (sig.c) --------------------------------------------------
 -- The signals that end a shell (terminating_signals; not VTALRM/PROF — curse's own
 -- preemption tick). A shell with an EXIT trap CATCHES the untrapped ones
@@ -3859,6 +3835,8 @@ function M.debug_leave(sh, saved)
 		sh.err_skip = true -- (set during this call: no ERR for the call's own failure)
 	end
 end
+-- A forked child (a fallback pipeline stage, see M.fork) ends: run an EXIT trap the
+-- SUBSHELL set (never the inherited parent one), with $? = its status, then _exit.
 function M.child_exit(sh, status)
 	local h = sh and sh.traps and sh.traps.EXIT
 	if h and h ~= "" and not M.exit_trap_inherited and not sh.in_exit_trap then
@@ -3951,12 +3929,6 @@ function Shell:subshell_run(runner, saves, paren, inplace)
 	end
 	self.jobs, self.job_cur, self.job_prev = sv_jobs, sv_cur, sv_prev
 	self.bgp_cleared = sv_bgpc
-	if C.getpid() ~= ctx.pid then
-		-- a process forked deeper inside (a nested subshell's child) unwound out to here:
-		-- it ends now, never resuming the script as a copy of the shell
-		M.child_exit(self, status or 0)
-	end
-
 	if saves then M.redir_restore(saves) end
 	self.out, self.cur_line, self.cur_cmd = sv_out, sv_line, sv_cc -- ($BASH_COMMAND: the child's was its own)
 	self.cur_cline = sv_cl
@@ -4065,10 +4037,6 @@ function Shell:capture_compiled_iso(cs_fn, backtick)
 	local ctx = iso_push(self)
 	ctx.cs = true -- (a $(…): job control stays on — fg/bg in b_fg)
 	local ok, out = pcall(self.capture_inproc, self, backtick, cs_fn, true, ctx) -- fd-level capture
-	if C.getpid() ~= ctx.pid then -- (a forked descendant unwound out: it ends here)
-		M.child_status(self, ok, out)
-		M.child_exit(self, self.status or 0)
-	end
 	iso_pop(self, ctx)
 	sub_restore(self, cp)
 	self.foreign_pids = sv_foreign
@@ -4112,7 +4080,7 @@ function Shell:capture_compiled(cs_fn, _, backtick) -- (2nd arg: a retired fork 
 	return self:capture_inproc(backtick, cs_fn)
 end
 
--- In a forked child (subshell/background/pipeline stage), translate an exit/return
+-- In a forked child (a fallback pipeline stage, see M.fork), translate an exit/return
 -- thrown as a control table into $? so the child _exits with the right status.
 function M.child_status(sh, ok, err)
 	if not ok and type(err) == "table" then
@@ -4885,7 +4853,6 @@ local function co_launch(ctx, self, stage_fns, inproc, base, lastpipe, upv)
 	end
 	local function stage_body(fn, sh, t, islp)
 		return function()
-			local mypid = C.getpid()
 			local ctx = not islp and iso_push(sh) -- (a stage is an in-process subshell)
 			if ctx then
 				ctx.task_fds = true
@@ -4903,12 +4870,6 @@ local function co_launch(ctx, self, stage_fns, inproc, base, lastpipe, upv)
 			end
 			sh.badassign = nil
 			local ok, err = pcall(fn, sh)
-			if C.getpid() ~= mypid then
-				-- a process FORKED inside this stage (a subshell's child, `( exec … )`) unwound
-				-- out of it: it must end here, never resume this pipeline as a copy of the shell
-				M.child_status(sh, ok, err)
-				M.child_exit(sh, sh.status or 0)
-			end
 			if ctx then
 				if not ok and type(err) == "table" and err.__curse_vsig == ctx then
 					err = { __curse_exit = 128 + err.sig }
@@ -6289,12 +6250,9 @@ local function arith_num(s)
 end
 M.arith_num = arith_num
 
--- int64 integer power (** operator) for the compiled backend (interp inlines its
--- own, guarding the negative exponent before it reaches here). bash disallows a
--- negative exponent: throw the same non-fatal matherr div0 does (lineabort so a
--- word-context $(( )) aborts the command; matherr so a (( )) pcall maps it to $?=1).
 -- bash's ipow (expr.c): square-and-multiply on wrapping int64 — `1 ** 3000000000` is
--- instant (a multiply-n-times loop took forever)
+-- instant (a multiply-n-times loop took forever). (interp calls it directly, having
+-- guarded the negative exponent itself.)
 function M.ipow_raw(base, exp)
 	local r, b, e = i64(1), i64(base), i64(exp)
 	while e ~= 0 do
@@ -6306,6 +6264,9 @@ function M.ipow_raw(base, exp)
 	end
 	return r
 end
+-- int64 integer power (** operator) for the compiled backend. bash disallows a
+-- negative exponent: throw the same non-fatal matherr div0 does (lineabort so a
+-- word-context $(( )) aborts the command; matherr so a (( )) pcall maps it to $?=1).
 function M.ipow(base, exp, etxt, etok)
 	if exp < 0 then
 		M.arith_fault(etxt, etok, "exponent less than 0")
@@ -13457,11 +13418,6 @@ function M.exec_dynamic(sh, argv, hook, hadcs, no_func)
 	if sh.opt_x and not no_func then -- (`command CMD`: the caller traced it, `command` included)
 		M.xtrace(sh, argv)
 	end
-	-- a `cmd &` child armed to exec its lone external in place: only if the word resolved
-	-- to an external (a function/builtin runs more than one command — keep the child)
-	if sh.exec_tail and (sh.functions[argv[1]] or I.BUILTINS[argv[1]] or (sh.aliases and sh.aliases[argv[1]])) then
-		sh.exec_tail = nil
-	end
 	-- `exec` is a STATEMENT-level builtin in the interpreter (it rewires/replaces the process),
 	-- which exec_simple doesn't dispatch: run the already-expanded words as a quoted-literal
 	-- statement through exec_stmt (`c=exec; $c cmd`).
@@ -15143,8 +15099,10 @@ do
 	-- spec (a per-site constant): aas = the NAME=(…) operand ASTs; names = the prefix
 	-- assignment names; so = a redirect moves stdout. bind(sh) performs the prefix bindings
 	-- in order (each value expanded after the previous binding: bash's left-to-right).
-	function M.procsub_mark(sh) -- (the <(…)/>(…) a command registers: drained after it)
-		return (sh.procsub_pending and #sh.procsub_pending or 0), (sh.procsub_files and #sh.procsub_files or 0)
+	-- (the <(…)/>(…) a command registers: drained after it. The first count — a retired
+	-- pending list — is always 0; drain_procsub still takes the pair.)
+	function M.procsub_mark(sh)
+		return 0, (sh.procsub_files and #sh.procsub_files or 0)
 	end
 	-- (rf: a dynamic command name's redirections, applied here unless it's `exec`)
 	function M.simple_run(sh, argv, spec, bind, hook, n0, rf, pm1, pm2)
