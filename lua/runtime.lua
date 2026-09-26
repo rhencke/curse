@@ -2598,16 +2598,48 @@ end
 
 -- Is a `$(…)` body PURE — no shell-state side effect to leak, so it may run with only
 -- capture_inproc's light $() state instead of the full checkpoint (capture_compiled_iso)?
--- The ONE authority: emit asks it at compile time (fns = the program's funcflags),
--- capture_src at run time (fns = sh.functions). Pure iff the text never reads the
--- per-subshell $BASHPID/$RANDOM and every command (through && || and pipelines) is a
--- simple command with no assignment and no redirection (a builtin's redirected output
--- needs the fd-level capture), whose literal name is no function and is an external — a
--- separate process — or a builtin that can't touch the shell (printf without -v).
--- Anything else (`command cd`, `builtin set`, a function, a compound) is isolated;
--- missing a builtin here only costs the checkpoint, never correctness.
+-- The ONE authority: capture_src asks it at run time with fns = sh.functions; emit asks
+-- at compile time with the program's funcflags, and because that table is never the
+-- whole truth (eval/trap/source fragments, line mode, env-imported functions) it guards
+-- every pure call site with "none of these names is a function now" (emit pure_guard),
+-- falling back to capture_src. The exact rule — pure iff:
+--  * the text never names $BASHPID/$RANDOM (per-subshell values);
+--  * every command (through && || and pipelines) is a simple command with no
+--    assignment, array argument or redirection (a builtin's redirected output needs the
+--    fd-level capture), whose name is one literal that is no function in `fns` and is
+--    an external (a separate process) or one of PURE_CMDSUB_BUILTIN;
+--  * every word of it expands without side effects (word_pure): only literals, plain
+--    $name/$N/$@…, nested $(…)/<(…) (subshells deciding for themselves), and ${…}
+--    forms whose operator can't assign, evaluate arithmetic, or expand further — no
+--    ${v:=…}, ${!v}, $((…)), non-constant subscript (arithmetic: a[i++]), ${v:o:l},
+--    ${v@P}, and no operator argument containing $ or ` (bash expands it first);
+--  * printf's first argument is a literal not starting with -v (printf -v NAME
+--    assigns; a non-literal could expand to -v); pwd has no arguments (posix pwd -P
+--    sets $PWD, cd.def pwd_builtin).
+-- Anything else is isolated: missing a pure body only costs the checkpoint.
 local PURE_CMDSUB_BUILTIN = { echo = 1, printf = 1, ["true"] = 1, ["false"] = 1, [":"] = 1, pwd = 1,
 	test = 1, ["["] = 1, exit = 1 }
+-- ${…} operators that only read (subst.c parameter_brace_expand: no assign/arith/eval);
+-- their argument is a pattern/default word, pure when it holds no expansion.
+local PURE_PEXP_OP = { len = 1, ["-"] = 1, [":-"] = 1, ["+"] = 1, [":+"] = 1, ["#"] = 1, ["##"] = 1,
+	["%"] = 1, ["%%"] = 1, ["/"] = 1, ["//"] = 1, ["^"] = 1, ["^^"] = 1, [","] = 1, [",,"] = 1 }
+local function noexp(s)
+	return s == nil or not s:find("[$`]")
+end
+local function word_pure(w)
+	for _, p in ipairs(w.parts) do
+		local e = p.pexp
+		if e then
+			if (e.op and not PURE_PEXP_OP[e.op]) or not noexp(e.arg) or not noexp(e.arg2)
+				or (e.index and not e.index:find("^[@*]$") and not e.index:find("^%d+$")) then
+				return false
+			end
+		elseif not (p.lit or p.var or p.param or p.special or p.cmdsub or p.procsub) then
+			return false -- ($((…)) / a pre-parsed arith / anything unknown)
+		end
+	end
+	return true
+end
 local function cmdsub_pure_st(st, fns)
 	local t = st.t
 	if t == "andor" or t == "pipeline" then
@@ -2621,17 +2653,29 @@ local function cmdsub_pure_st(st, fns)
 	if t ~= "simple" or st.assigns or st.arrayargs or st.redirs then
 		return false
 	end
-	local w = st.words and st.words[1]
-	local c = w and w.parts and #w.parts == 1 and w.parts[1].lit
+	local ws = st.words
+	local w = ws and ws[1]
+	local c = w and #w.parts == 1 and w.parts[1].lit
 	if not c or fns[c] or not (PURE_CMDSUB_BUILTIN[c] or not M.BUILTINS[c]) then
 		return false
 	end
-	if c == "printf" then
-		for j = 2, #st.words do
-			local p1 = st.words[j].parts[1]
-			if p1 and p1.lit == "-v" then
-				return false -- (printf -v NAME writes a variable)
+	for j = 2, #ws do
+		if not word_pure(ws[j]) then
+			return false
+		end
+	end
+	if c == "pwd" and ws[2] then
+		return false
+	elseif c == "printf" and ws[2] then
+		local a = ""
+		for _, p in ipairs(ws[2].parts) do
+			if not p.lit or (not p.q and p.lit:find("[*?[]")) then -- (a glob could match -v…)
+				return false
 			end
+			a = a .. p.lit
+		end
+		if a:find("^%-v") then
+			return false
 		end
 	end
 	return true
@@ -3036,11 +3080,16 @@ end
 -- drops the record / marks the tempenv consumed and installs its box) — records AND the
 -- boxes they hold, so neither escapes. The ORIGINAL boxes stay pristine, so a reference
 -- to one stays valid. Also re-keys getopts' per-OPTIND-box state onto the copies.
--- Shared by sub_checkpoint and Shell:stage_clone.
-function scopes_copy(self, into)
-	local orig, vars = self.vars, {}
-	for k, b in pairs(orig) do
-		vars[k] = copybox(b)
+-- Shared by sub_checkpoint and Shell:stage_clone. `vars`: the copied boxes when the caller
+-- made them itself (sub_checkpoint, in its own loop: a trace formed here by a pipeline
+-- stage's clone served the per-subshell calls badly — 17 → 25 µs a subshell).
+function scopes_copy(self, into, vars)
+	local orig = self.vars
+	if not vars then
+		vars = {}
+		for k, b in pairs(orig) do
+			vars[k] = copybox(b)
+		end
 	end
 	into.vars = vars
 	into.getopts_state = M.getopts_remap(self.getopts_state, orig, vars)
@@ -3069,9 +3118,10 @@ function scopes_copy(self, into)
 end
 function sub_checkpoint(self)
 	local orig_vars = self.vars
-	local exset = {}
+	local exset, vars = {}, {}
 	for name, b in pairs(orig_vars) do
 		if b.exported then exset[name] = true end
+		vars[name] = copybox(b)
 	end
 	local sv = sub_save(self, shallowcopy)
 	local cp = {
@@ -3080,8 +3130,8 @@ function sub_checkpoint(self)
 		l10nk = package.loaded.l10n and package.loaded.l10n.known_save(),
 		cwd = self:phys_cwd(), um = C.umask(0),
 	}
-	scopes_copy(self, self)
-	cp.copy = self.vars
+	scopes_copy(self, self, vars)
+	cp.copy = vars
 	if self.complete then -- (completion specs: the copies share opts as the originals do —
 		local oc, tab = {}, {} -- compopt changes a shared compspec's options in place)
 		for n, cs in pairs(self.complete) do
