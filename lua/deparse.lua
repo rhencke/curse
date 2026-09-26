@@ -505,9 +505,10 @@ make = function(p, c)
 			cprintf(p, " ")
 		end
 		cprintf(p, "}")
-	elseif k == "coproc" then -- (print_cmd.c: the command follows unindented; bash 5.2.37 names
-		-- only a compound one — a simple command's coproc is always the default COPROC)
-		cprintf(p, c.body and c.body.k == "simple" and "coproc " or ("coproc " .. c.name .. " "))
+	elseif k == "coproc" then -- (print_cmd.c: the command follows unindented. bash 5.2.21 always
+		-- prints the name — `coproc COPROC cat` for a simple command, which can't be re-read as
+		-- input; patch 5.2-032 later printed it only for a compound one. curse is 5.2.21.)
+		cprintf(p, "coproc " .. c.name .. " ")
 		p.skip = p.skip + 1
 		make(p, c.body)
 	elseif k == "subshell" then

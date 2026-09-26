@@ -1741,6 +1741,7 @@ local function emit_part(p, i, lifted, w, tilde)
 	if p.lit then
 		if
 			tilde
+			and not w.notilde -- (5.2.21: an assoc subscript/compound value: interp's notilde)
 			and i == 1
 			and not p.q
 			and (p.lit:sub(1, 1) == "~" or (p.lit:find("~", 1, true) and (p.lit:match("^[%a_][%w_]*%+?=") or p.lit:match("^[%a_][%w_]*%b[]%+?=")) ~= nil))
@@ -1829,7 +1830,19 @@ end
 -- literal). word: w is a whole `NAME=value` operand of a declaration builtin, whose first
 -- literal carries the NAME= (rt.tilde_word_initial, as emit_word renders it). nil: no
 -- literal ~ to expand, or a word emit_word can't render — the caller's plain value applies.
+-- does the word hold an unquoted literal `~` (a tilde it could expand)?
+function EF.lit_tilde(w)
+	for _, pp in ipairs(w.parts) do
+		if pp.lit and not pp.q and pp.lit:find("~", 1, true) then
+			return true
+		end
+	end
+	return false
+end
 function EF.tilde_value(w, lifted, word)
+	if w.notilde then
+		return nil -- (no tilde expansion at all: emit_word renders it; see interp's notilde)
+	end
 	local fl = unq_full_lit(w)
 	if fl and fl:find("~", 1, true) then
 		return ((word and "rt.tilde_word_initial(sh, %q)" or "rt.tilde_assign(sh, %q)")):format(fl)
@@ -2438,7 +2451,8 @@ end
 -- array re-reads the raw text arithmetically). One with a $(…)/$((…))/`…` side effect is passed
 -- as a thunk, so `${d[$((c++))]}` on an indexed array increments once, not twice.
 function subscript_word(raw, lifted)
-	local w = EF.sub_lsync(raw, lifted, emit_word(require("parser").parse_word(raw), lifted))
+	-- (only ever used as an ASSOC key: 5.2.21 expands it with no tilde — interp's notilde)
+	local w = EF.sub_lsync(raw, lifted, emit_word(require("interp").notilde(require("parser").parse_word(raw)), lifted))
 	if raw:find("$(", 1, true) or raw:find("`", 1, true) then
 		return "function() return " .. w .. " end"
 	end
@@ -4638,7 +4652,7 @@ H.assign = function(cx, st, after)
 	if st.index then -- a[i]=v / a[i]+=v (assign_element leaves status unless it fails)
 		local ecs = errchk_s(st)
 		local append = tostring(st.append and true or false)
-		local expw = emit_word(iw, cx.lifted)
+		local expw = emit_word(require("interp").notilde(iw), cx.lifted) -- (the ASSOC key: no tilde, 5.2.21)
 		-- Compute the INDEXED subscript key from lifted locals (arith_str(sh, raw) reads the STALE
 		-- sh.vars copy, so `a[i]=…` in a `for ((;;))` loop mis-keyed every write). Decision hung on
 		-- EF.elem_keyexpr so build_cfg (at the 60-upvalue cap) takes no new upvalue.
@@ -5240,18 +5254,23 @@ simple_compiled = function(cx, st, after)
 			for _, e in ipairs(a1.elems) do
 				if e.key ~= nil then
 					local valx = EF.tilde_value(e.word, cx.lifted) or EF.assign_word_expr(e.word, cx.lifted)
+					if EF.lit_tilde(e.word) then -- (an ASSOC's compound value: no tilde, 5.2.21)
+						local ntx = EF.assign_word_expr(require("interp").notilde(e.word), cx.lifted)
+						valx = isassoc and ntx or valx -- (only a `-A` declaration: see interp's arrayassign_items)
+					end
 					parts[#parts + 1] = ("__it[#__it+1] = {key=%q, op=%q, val=%s, decl=true}"):format(static_key(e.key), e.op, valx)
 				elseif not empty_word(e.word) then
 					-- an assoc's key/value words don't split or glob (see H.arrayassign)
 					if isassoc then
-						parts[#parts + 1] = ("__it[#__it+1] = {val=%s, decl=true}"):format(EF.assign_word_expr(e.word, cx.lifted))
+						parts[#parts + 1] = ("__it[#__it+1] = {val=%s, decl=true}"):format(
+							EF.assign_word_expr(require("interp").notilde(e.word), cx.lifted))
 					else
 						if not parts.asq then -- (asked once per statement)
 							parts.asq = true
 							parts[#parts + 1] = ("local __as = sh:is_assoc(%q)"):format(a1.name)
 						end
 						parts[#parts + 1] = ("if __as then __it[#__it+1] = {val=%s, decl=true} else %s end"):format(
-							EF.assign_word_expr(e.word, cx.lifted),
+							EF.assign_word_expr(e.word, cx.lifted), -- (no -A: tildes expand, 5.2.21)
 							emit_fields_into("__it", e.word, cx.lifted, "{val=%s}")
 						)
 					end
@@ -7082,6 +7101,10 @@ H.arrayassign = function(cx, st, after)
 				-- else the ordinary word value.
 				local tv = EF.tilde_value(e.word, cx.lifted)
 				local valc = tv and ("local __v = " .. tv) or EF.aa_value("__v", e.word, cx.lifted)
+				if EF.lit_tilde(e.word) then -- (an ASSOC's compound value: no tilde, 5.2.21)
+					valc = ("local __v = sh:is_assoc(%q) and (function() %s; return __v end)() or (function() %s; return __v end)()"):format(
+						st.name, EF.aa_value("__v", require("interp").notilde(e.word), cx.lifted), valc)
+				end
 				local kw = aa_keyword(e.key)
 				local keyc
 				if kw == nil then -- (a subscript emit can't render: the shared expander)
@@ -7091,6 +7114,9 @@ H.arrayassign = function(cx, st, after)
 						or ("local __k = rt.assign_elem(sh, require(\"parser\").parse_word(%q))"):format(e.key)
 				elseif not kw then
 					keyc = ("local __k = %q"):format(static_key(e.key))
+				elseif EF.lit_tilde(kw) then -- (an ASSOC key: no tilde, 5.2.21; an indexed one: arith)
+					keyc = ("local __k = (sh:is_assoc(%q) and %s or %s)"):format(st.name,
+						emit_word(require("interp").notilde(kw), cx.lifted), emit_word(kw, cx.lifted))
 				else
 					keyc = "local __k = " .. emit_word(kw, cx.lifted)
 				end
@@ -7115,13 +7141,14 @@ H.arrayassign = function(cx, st, after)
 				-- (src: the word as written, for an assoc's empty-key report)
 				local fl = unq_full_lit(e.word)
 				local srcf = ((", src=%q"):format(e.word.src):gsub("%%", "%%%%"))
-				if fl and not fl:find("[%*%?%[]") then -- (a plain literal is the same either way)
+				if fl and not fl:find("[%*%?%[~]") then -- (a plain literal is the same either way;
+					-- a ~ is not: an assoc's key/value word doesn't tilde-expand, 5.2.21)
 					parts[#parts + 1] = emit_fields_into("__it", e.word, cx.lifted,
 						fl == e.word.src and "{val=%s}" or ("{val=%s" .. srcf .. "}"))
 				else
 					asq()
 					parts[#parts + 1] = ("if __as then %s; __it[#__it+1] = {val=__v%s} else %s end"):format(
-						EF.aa_value("__v", e.word, cx.lifted),
+						EF.aa_value("__v", require("interp").notilde(e.word), cx.lifted),
 						srcf,
 						EF.aa_fields("__it", e.word, cx.lifted)
 					)
