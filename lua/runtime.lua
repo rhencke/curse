@@ -830,66 +830,6 @@ function Shell:split(s)
 	return out
 end
 
--- Bash-correct standalone IFS split (for `read`): whitespace-IFS runs collapse and
--- trim edges; each non-whitespace-IFS char delimits (empty fields allowed), with a
--- trailing delimiter not adding a trailing empty.
-function M.ifs_split(ifs, s, nomark) -- (nomark: \1 is not an escape marker — read's skip_ctlesc)
-	local fields, cur = {}, nil
-	local function isws(c) -- IFS whitespace (subst.c ifs_whitespace): whitespace NOT in $IFS is ordinary text
-		return (c == " " or c == "\t" or c == "\n") and ifs:find(c, 1, true) ~= nil
-	end
-	local function inifs(c)
-		return c ~= "" and ifs:find(c, 1, true) ~= nil
-	end
-	local function brk()
-		if cur ~= nil then
-			fields[#fields + 1] = cur
-			cur = nil
-		end
-	end
-	local i, n = 1, #s
-	while i <= n do
-		local c = s:sub(i, i)
-		if c == "\1" and i < n and not nomark then -- CTLESC: next char is literal (read backslash-escape)
-			cur = (cur or "") .. s:sub(i + 1, i + 1)
-			i = i + 2
-		elseif inifs(c) then
-			if isws(c) then
-				-- (LEADING whitespace is just ignored: a `:` right after it still ends an
-				-- empty first field — IFS=': ' splits " :" into one empty field)
-				local leading = cur == nil and #fields == 0
-				if cur ~= nil then
-					brk()
-				end
-				i = i + 1
-				while i <= n and isws(s:sub(i, i)) do
-					i = i + 1
-				end
-				if not leading and i <= n and inifs(s:sub(i, i)) and not isws(s:sub(i, i)) then
-					i = i + 1
-					while i <= n and isws(s:sub(i, i)) do
-						i = i + 1
-					end
-				end
-			else
-				if cur == nil then
-					cur = ""
-				end
-				brk()
-				i = i + 1
-				while i <= n and isws(s:sub(i, i)) do
-					i = i + 1
-				end
-			end
-		else
-			cur = (cur or "") .. c
-			i = i + 1
-		end
-	end
-	brk()
-	return fields
-end
-
 -- Run an external command via posix_spawnp + waitpid (FFI/libc directly — NOT
 -- /bin/sh, which would recurse when curse IS /bin/sh, and would lose signal
 -- info). We use posix_spawn rather than a manual fork+execvp so spawning from a
@@ -4088,14 +4028,31 @@ function M.child_status(sh, ok, err)
 	end
 end
 
--- Is a field (value `s`, quote mask `q`: "1" = quoted byte) a pattern — a glob
--- metacharacter at an unquoted position? bash's glob_pattern_p: `*`/`?`/extglob always;
--- `[` only with a closing `]` (and no `/` between); an unquoted `\` from an expansion
--- escapes the next char (bash 5.2: `a\?` from a variable isn't a pattern).
-function M.field_glob_active(f)
-	local s, q = f.s, f.q
+-- Is a field (value `s`, quote mask `q`: "1" = quoted byte; nil/false = none quoted) a
+-- pattern — a glob metacharacter at an unquoted position? bash's glob_pattern_p:
+-- `*`/`?`/extglob always; `[` only with a closing `]` (and no `/` between) — so a lone
+-- `[` (the test builtin) never scans a directory, matching glob_conv's own "no closing ]
+-- → literal [" rule; an unquoted `\` from an expansion escapes the next char (bash 5.2:
+-- `a\?` from a variable isn't a pattern).
+local GLOB_CH = { [42] = true, [63] = true, [91] = true, [43] = true, [64] = true, [33] = true } -- * ? [ + @ !
+function M.field_glob_active(s, q)
+	local n = #s
+	if n <= 32 then -- (the common word: no glob character at all — a byte loop the JIT
+		local any = false -- compiles; a pattern it doesn't)
+		for k = 1, n do
+			if GLOB_CH[s:byte(k)] then
+				any = true
+				break
+			end
+		end
+		if not any then
+			return false
+		end
+	elseif not s:find("[*?%[+@!]") then
+		return false
+	end
 	local open, esc = false, false
-	for i = 1, #s do
+	for i = 1, n do
 		if esc then
 			esc = false
 		elseif not q or q:sub(i, i) == "0" then
@@ -10650,17 +10607,23 @@ function M.glob_expand(pattern, opts)
 	return cur -- (a path reached twice — `**/a/**` — is listed twice, as bash does)
 end
 
--- Field engine, SPLIT path. The compiled tiers call this on the already-computed
--- VALUE of a SINGLE unquoted expansion (`$list`, `$(cmd)`, `$((expr))`, `${a[@]}`),
--- or on an unquoted glob LITERAL (`*.txt`). It is the genuine-compilation twin of
--- interp's expand_to_fields: emitted native code computes the operand string, then
--- this primitive performs the two runtime-dependent steps that CANNOT be decided at
--- compile time — IFS word-splitting and pathname (glob) expansion. `split=true` for
--- an unquoted expansion (split on $IFS, then glob each field); `split=false` for a
--- literal glob (no splitting — a literal is never word-split — just glob). Because
--- the whole value came from ONE unquoted source, every char is split- and
--- glob-active (no per-char quote mask needed). Kept byte-for-byte in lockstep with
--- expand_to_fields' feed_split + glob tail (interp.lua).
+-- ---- The field engine: word splitting + pathname expansion (subst.c list_string /
+-- expand_word_list_internal's glob step) — the ONE implementation behind every tier:
+-- interp's expand_to_fields, the compiled rt.expand_fields / rt.field_split, and read -a's
+-- rt.ifs_split all drive a field builder:
+--   fb:add(text, unq)  text that never splits — quoted (unq=false: literal to the glob) or
+--                      an unquoted literal (unq=true: glob-active)
+--   fb:split(text)     an UNQUOTED expansion's text: split on $IFS (glob-active)
+--   fb:multi(els, quoted, star)   $@ / $* / ${a[@]} elements
+--   fb:brk()           end the current field ("$@"'s element boundaries)
+--   fb:finish(noglob)  the fields, pathname-expanded
+-- Concatenate-then-split: the word is built left to right and only chars that came from
+-- unquoted expansions delimit, so `pre$x`/`$x-` and custom IFS behave as in bash. Fields
+-- are parallel arrays (no table per field): fields[k] the text, fu[k] "has a glob-active
+-- char", fq[k] a per-char quote mask ("1" = quoted, so literal to the glob; "0" = glob-
+-- active) or false when every char is glob-active. The mask is kept OUT OF BAND (not an
+-- escape byte) so it can't collide with a real byte — curse is byte-transparent, so
+-- `'[bc]'*.mm` matches the file [bc]ar.mm while a $'\x01' byte passes through untouched.
 do
 local FS_PLAIN = {} -- (bytes that neither split on the default IFS nor glob)
 for c = 0, 255 do
@@ -10687,133 +10650,58 @@ function M.plain_field(sh, value)
 	return true
 end
 -- $IFS as a SET of characters (a delimiter may be multibyte, `IFS=ç`: indexed by whole
--- codepoint) + mbifs (any multibyte one?). Memoized in sh._ifscache (shared with interp's
--- expand_to_fields) keyed on the IFS text and the locale (a locale change re-splits `é`).
+-- codepoint) + mbifs (any multibyte one?). ifs_charset_of builds it for a given IFS text
+-- (read's own split takes the IFS it was handed); ifs_charset memoizes $IFS's in
+-- sh._ifscache keyed on the IFS text and the locale (a locale change re-splits `é`).
+function M.ifs_charset_of(ifs)
+	local set = {}
+	for _, ch in ipairs(M.mb_chars(ifs)) do
+		set[ch.s] = true
+	end
+	return { ifs = ifs, set = set, mbifs = M.lc_mb_cur_max() > 1 and ifs:find("[\128-\255]") ~= nil,
+		lg = M.locale_gen }
+end
 function M.ifs_charset(sh)
 	local ifs = (M.ifs(sh) or " \t\n")
 	local ic = sh._ifscache
 	if not ic or ic.ifs ~= ifs or ic.lg ~= M.locale_gen then
-		local set = {}
-		for _, ch in ipairs(M.mb_chars(ifs)) do
-			set[ch.s] = true
-		end
-		ic = { ifs = ifs, set = set, mbifs = M.lc_mb_cur_max() > 1 and ifs:find("[\128-\255]") ~= nil,
-			lg = M.locale_gen }
+		ic = M.ifs_charset_of(ifs)
 		sh._ifscache = ic
 	end
 	return ic
 end
-function M.field_split(sh, value, split)
-	local n = #value
-	if n <= 64 then -- the common short word ($i, $name): one field, as is — no IFS/glob setup
-		local ifs0 = M.ifs(sh)
-		if ifs0 == nil or ifs0 == " \t\n" then
-			if n == 0 then
-				return split and {} or { value }
-			end
-			local plain = true
-			for k = 1, n do
-				if not FS_PLAIN[value:byte(k)] then
-					plain = false
-					break
-				end
-			end
-			if plain then
-				return { value }
-			end
+local IFSWS = { [" "] = true, ["\t"] = true, ["\n"] = true } -- (subst.c ifs_whitespace, when in IFS)
+local function skip_ifsws(set, v, i, n) -- past a run of IFS whitespace (always single-byte)
+	while i <= n do
+		local c = v:sub(i, i)
+		if not (IFSWS[c] and set[c]) then
+			break
 		end
+		i = i + 1
 	end
-	local fields
-	if split then
-		-- word-split on $IFS. IFS is a SET of chars; a delimiter may be multibyte
-		-- (`IFS=ç`), so index by whole codepoint. Whitespace runs collapse, and a single
-		-- non-whitespace delimiter (optionally surrounded by whitespace) ends a field.
-		fields = {}
-		local ic = M.ifs_charset(sh)
-		local ifsset, mbifs = ic.set, ic.mbifs
-		local function isws(c) -- IFS whitespace only (subst.c ifs_whitespace)
-			return (c == " " or c == "\t" or c == "\n") and ifsset[c]
-		end
-		local function inifs(c)
-			return c ~= "" and ifsset[c]
-		end
-		local function clen(v, i)
-			if not mbifs or v:byte(i) < 0x80 then
-				return 1
-			end
-			return M.mb_charlen(v, i)
-		end
-		local cur = nil
-		local function brk()
-			if cur ~= nil then
-				fields[#fields + 1] = cur
-				cur = nil
-			end
-		end
-		local v = value
-		local i, n = 1, #v
-		while i <= n do
-			local cl = clen(v, i)
-			local c = cl == 1 and v:sub(i, i) or v:sub(i, i + cl - 1)
-			if inifs(c) then
-				if isws(c) then
-					-- (LEADING whitespace is just ignored: a `:` right after it still ends an
-					-- empty first field — IFS=': ' splits " :" into one empty field)
-					local leading = cur == nil and #fields == 0
-					if cur ~= nil then
-						brk()
-					end
-					i = i + 1
-					while i <= n and isws(v:sub(i, i)) do
-						i = i + 1
-					end
-					if i <= n and not leading then
-						local nl = clen(v, i)
-						local nc = nl == 1 and v:sub(i, i) or v:sub(i, i + nl - 1)
-						if inifs(nc) and not isws(nc) then
-							i = i + nl
-							while i <= n and isws(v:sub(i, i)) do
-								i = i + 1
-							end
-						end
-					end
-				else
-					if cur == nil then
-						cur = ""
-					end
-					brk()
-					i = i + cl
-					while i <= n and isws(v:sub(i, i)) do
-						i = i + 1
-					end
-				end
-			else -- (a run of non-IFS characters joins the field in one piece: linear, not n^2)
-				local j = i + cl
-				while j <= n do
-					local jl = clen(v, j)
-					if inifs(jl == 1 and v:sub(j, j) or v:sub(j, j + jl - 1)) then
-						break
-					end
-					j = j + jl
-				end
-				cur = (cur or "") .. v:sub(i, j - 1)
-				i = j
-			end
-		end
-		brk()
-	else
-		fields = { value }
+	return i
+end
+local function char_at(mbifs, v, i) -- the (whole, when IFS is multibyte) char at i
+	if mbifs and v:byte(i) >= 0x80 then
+		return v:sub(i, i + M.mb_charlen(v, i) - 1)
 	end
-	-- pathname expansion on each field (all glob-active; nothing quoted).
-	local out = {}
+	return v:sub(i, i)
+end
+-- Pathname-expand one glob-active field (pattern `pat`, literal text `lit`) onto `out`:
+-- matches minus GLOBIGNORE's, else failglob's error / nullglob's nothing / the literal.
+local function glob_field(sh, pat, lit, out)
+	local shopt = sh.shopt
+	-- GLOBIGNORE (set & non-null): filter matches by its `:`-separated patterns; `.`/`..`
+	-- are always excluded (overriding globskipdots). (Assigning it also turns dotglob on:
+	-- setup_glob_ignore.) globskipdots defaults ON, globstar OFF (SHOPT_DEFAULT, interp.lua).
 	local gi = sh:get("GLOBIGNORE")
 	local giset = gi and gi ~= ""
-	local dotglob = sh.shopt.dotglob and true -- (a GLOBIGNORE assignment sets it: setup_glob_ignore)
-	local nullglob = sh.shopt.nullglob and true
-	local gipats
-	if giset then -- split on ':' but NOT inside [...]
-		gipats = {}
-		local depth, curp = 0, {}
+	local dotglob = shopt.dotglob and true
+	sh.glob_dots = dotglob -- (glob.c noglob_dot_filenames: compgen -G sees the last shell glob's)
+	local m = M.glob_expand(pat, { dotglob = dotglob, skipdots = giset or (shopt.globskipdots ~= false),
+		globstar = shopt.globstar and true, nocase = shopt.nocaseglob, noext = not shopt.extglob })
+	if m and giset then
+		local gipats, depth, curp = {}, 0, {} -- split on ':' but NOT inside [...] (`[[:alnum:]]`)
 		for k = 1, #gi do
 			local c = gi:sub(k, k)
 			if c == "[" then
@@ -10836,79 +10724,190 @@ function M.field_split(sh, value, split)
 		if #curp > 0 then
 			gipats[#gipats + 1] = table.concat(curp)
 		end
-	end
-	local noglob = sh.opt_f -- set -f: pathname expansion disabled
-	-- globskipdots defaults ON, globstar defaults OFF (SHOPT_DEFAULT, interp.lua).
-	local skipdots = giset or (sh.shopt.globskipdots ~= false)
-	local globstar = sh.shopt.globstar and true
-	-- bash glob_pattern_p: `[` is a metacharacter only when a later `]` closes it
-	-- (a lone `[` stays literal — no directory scan); `\c` escapes the next char.
-	-- Matches glob_conv's own "no closing ] → literal [" so we never scan for a
-	-- pattern that will expand to a literal.
-	local function glob_active(s)
-		local i, n, open = 1, #s, false
-		while i <= n do
-			local c = s:sub(i, i)
-			if c == "\\" then
-				i = i + 2
-			elseif c == "*" or c == "?" then
-				return true
-			elseif c == "[" then
-				open = true
-				i = i + 1
-			elseif c == "/" then
-				open = false -- (a bracket expression can't span a `/`)
-				i = i + 1
-			elseif c == "]" then
-				if open then
-					return true
+		local filt = {}
+		for _, x in ipairs(m) do
+			local ig = false
+			for _, gp in ipairs(gipats) do
+				if M.glob_ignore_match(x, gp, shopt.nocaseglob, not shopt.extglob) then
+					ig = true
+					break
 				end
-				i = i + 1
-			elseif (c == "+" or c == "@" or c == "!") and s:sub(i + 1, i + 1) == "(" then
-				return true
-			else
-				i = i + 1
+			end
+			if not ig then
+				filt[#filt + 1] = x
 			end
 		end
-		return false
+		m = (#filt > 0) and filt or nil
 	end
-	for _, s in ipairs(fields) do
-		if not noglob and glob_active(s) then
-			sh.glob_dots = dotglob -- (glob.c noglob_dot_filenames, synced per shell glob: compgen -G)
-			local m = M.glob_expand(s, { dotglob = dotglob, skipdots = skipdots, globstar = globstar, nocase = sh.shopt.nocaseglob,
-				noext = not sh.shopt.extglob })
-			if m and gipats then
-				local filt = {}
-				for _, x in ipairs(m) do
-					local ig = false
-					for _, gp in ipairs(gipats) do
-						if M.glob_ignore_match(x, gp, sh.shopt.nocaseglob, not sh.shopt.extglob) then
-							ig = true
-							break
-						end
-					end
-					if not ig then
-						filt[#filt + 1] = x
-					end
+	if m then
+		for _, x in ipairs(m) do
+			out[#out + 1] = x
+		end
+	elseif shopt.failglob then -- shopt -s failglob: no match aborts the rest of the current
+		-- LINE (bash: like a fatal expansion error), so tag lineabort (not experr) —
+		-- run_lazy fast-forwards past same-line statements.
+		io.stderr:write("curse: no match: " .. lit .. "\n")
+		error({ __curse_exit = 1, __curse_lineabort = true })
+	elseif not shopt.nullglob then -- (nullglob: no matches drop the field entirely)
+		out[#out + 1] = lit
+	end
+end
+-- the glob pattern of a masked field: a quoted glob-special char is backslash-escaped so
+-- glob_conv treats it literally (the field's text itself stays byte-for-byte intact).
+-- `-`/`^` too (a quoted one in a bracket expression is literal: `[a"-"c]`), and `|` (a
+-- quoted extglob alternation bar, `@(a|'b|c')`, must not split the arms).
+local GLOBSPECIAL = { ["*"] = 1, ["?"] = 1, ["["] = 1, ["]"] = 1, ["\\"] = 1, ["+"] = 1, ["@"] = 1,
+	["!"] = 1, ["("] = 1, [")"] = 1, ["|"] = 1, ["-"] = 1, ["^"] = 1 }
+local function glob_pat(s, q)
+	if not q or not q:find("1", 1, true) then
+		return s
+	end
+	local o = {}
+	for i = 1, #s do
+		local c = s:sub(i, i)
+		o[i] = (q:sub(i, i) == "1" and GLOBSPECIAL[c]) and ("\\" .. c) or c
+	end
+	return table.concat(o)
+end
+
+local FB = {}
+FB.__index = FB
+function M.fb_new(sh)
+	local ic = M.ifs_charset(sh)
+	return setmetatable({ sh = sh, ifs = ic.ifs, set = ic.set, mbifs = ic.mbifs,
+		fields = {}, fu = {}, fq = {}, n = 0, cur = nil, unq = false, q = false }, FB)
+end
+function FB:brk()
+	if self.cur ~= nil then
+		local n = self.n + 1
+		self.fields[n], self.fu[n], self.fq[n], self.n = self.cur, self.unq, self.q, n
+		self.cur, self.unq, self.q = nil, false, false
+	end
+end
+function FB:add(s, unq)
+	local cur = self.cur or ""
+	if unq then
+		self.unq = true
+		if self.q then
+			self.q = self.q .. ("0"):rep(#s)
+		end
+	else -- (the mask materializes at the first quoted char)
+		self.q = (self.q or ("0"):rep(#cur)) .. ("1"):rep(#s)
+	end
+	self.cur = cur .. s
+end
+function FB:split(v)
+	local set, mbifs = self.set, self.mbifs
+	local i, n = 1, #v
+	while i <= n do
+		local c = char_at(mbifs, v, i)
+		if not set[c] then -- a whole run of non-IFS chars joins the field at once (per-char is O(n²))
+			local i0 = i
+			i = i + #c
+			while i <= n do
+				c = char_at(mbifs, v, i)
+				if set[c] then
+					break
 				end
-				m = (#filt > 0) and filt or nil
+				i = i + #c
 			end
-			if m then
-				for _, x in ipairs(m) do
-					out[#out + 1] = x
+			self:add(v:sub(i0, i - 1), true)
+		elseif IFSWS[c] then
+			-- (LEADING whitespace is just ignored: a `:` right after it still ends an
+			-- empty first field — IFS=': ' splits " :" into one empty field)
+			local leading = self.cur == nil and self.n == 0
+			self:brk()
+			i = skip_ifsws(set, v, i + 1, n)
+			if i <= n and not leading then -- (IFS whitespace + one non-whitespace IFS char
+				c = char_at(mbifs, v, i) -- + whitespace is ONE delimiter: POSIX 2.6.5 (3)(b))
+				if set[c] and not IFSWS[c] then
+					i = skip_ifsws(set, v, i + #c, n)
 				end
-			elseif sh.shopt.failglob then
-				io.stderr:write("curse: no match: " .. s .. "\n")
-				error({ __curse_exit = 1, __curse_lineabort = true })
-			elseif nullglob then -- drop
+			end
+		else -- a non-whitespace IFS delimiter (may be multibyte) always ends a field (empty ok)
+			if self.cur == nil then
+				self.cur = ""
+			end
+			self.unq = true
+			self:brk()
+			i = skip_ifsws(set, v, i + #c, n)
+		end
+	end
+end
+-- $@ / $* / array elements, joined/split per bash: quoted "$@" is one field PER element
+-- (each concatenates with the abutting text — the first with what precedes, the last
+-- with what follows); quoted "$*" joins on IFS[0]; unquoted joins on IFS[0] then
+-- word-splits — so empty elements survive under a non-whitespace IFS (`=$@=` on empty
+-- params gives `= '' '' '' =`) — except under IFS='' (no splitting): per element, empty
+-- ones dropped.
+function FB:multi(els, quoted, star)
+	if quoted and star then
+		self:add(table.concat(els, M.ifs_first(self.ifs)), false)
+	elseif quoted or self.ifs == "" then
+		for k = 1, #els do
+			if k > 1 then
+				self:brk()
+			end
+			if quoted then
+				self:add(els[k], false)
 			else
-				out[#out + 1] = s
+				self:split(els[k])
 			end
-		else
+		end
+	else
+		self:split(table.concat(els, M.ifs_first(self.ifs)))
+	end
+end
+-- The fields, pathname-expanded where a glob metacharacter is glob-active (unless set -f
+-- or `noglob` — compgen -W's word, whose $(…) bodies still glob). The common word globs
+-- nothing: its field list is returned as is.
+function FB:finish(noglob)
+	self:brk()
+	local fields, fu, fq = self.fields, self.fu, self.fq
+	local sh = self.sh
+	if noglob or sh.opt_f then
+		return fields
+	end
+	local out
+	for k = 1, self.n do
+		local s = fields[k]
+		if fu[k] and M.field_glob_active(s, fq[k]) then
+			if not out then
+				out = {}
+				for j = 1, k - 1 do
+					out[j] = fields[j]
+				end
+			end
+			glob_field(sh, glob_pat(s, fq[k]), s, out)
+		elseif out then
 			out[#out + 1] = s
 		end
 	end
-	return out
+	return out or fields
+end
+
+-- Field engine, SPLIT path. The compiled tiers call this on the already-computed
+-- VALUE of a SINGLE unquoted expansion (`$list`, `$(cmd)`, `$((expr))`, `${a[@]}`),
+-- or on an unquoted glob LITERAL (`*.txt`): IFS word-splitting and pathname (glob)
+-- expansion are the two runtime-dependent steps that CANNOT be decided at compile
+-- time. `split=true` for an unquoted expansion (split on $IFS, then glob each field);
+-- `split=false` for a literal glob (no splitting — a literal is never word-split —
+-- just glob). The whole value came from ONE unquoted source: every char is split-
+-- and glob-active.
+function M.field_split(sh, value, split)
+	if M.plain_field(sh, value) then -- the common short word ($i, $name): one field, as is
+		if value == "" and split then
+			return {}
+		end
+		return { value }
+	end
+	local fb = M.fb_new(sh)
+	if split then
+		fb:split(value)
+	else
+		fb:add(value, true)
+	end
+	return fb:finish()
 end
 end
 
@@ -10919,10 +10918,7 @@ end
 --                           word-split on $IFS, then glob each field (glob-active).
 --   split=false, unq=true   an UNQUOTED literal (`*.txt`) — no split, but glob-active.
 --   split=false, unq=false  QUOTED/escaped text — literal (no split, no glob).
--- We rebuild the field left to right with a per-char quote mask (`q`: "0"=glob-active,
--- "1"=masked) so `"$x"foo*` globs foo* but not $x's content. $@/$*/array (multi-
--- element) parts are NOT in this subset — those stay on expand_to_fields. Kept
--- byte-for-byte in lockstep with expand_to_fields' feed_split/add + glob tail.
+--   multi=true              $@/$*/array elements (seg.elems; seg.q quoted, seg.star `*`)
 -- Tag a segment as part of a double-quoted "…" that holds "$@" (the parser's dqat/dqend):
 -- if the @ expands to no words and the rest to empty, the segment is no word at all.
 function M.dqseg(seg, dqend)
@@ -10940,78 +10936,7 @@ function M.expand_fields(sh, segs)
 		end
 		return { s1.s }
 	end
-	local ic = M.ifs_charset(sh)
-	local ifs, ifsset, mbifs = ic.ifs, ic.set, ic.mbifs
-	local function isws(c) -- IFS whitespace only (subst.c ifs_whitespace)
-		return (c == " " or c == "\t" or c == "\n") and ifsset[c]
-	end
-	local function inifs(c)
-		return c ~= "" and ifsset[c]
-	end
-	local function clen(v, i)
-		if not mbifs or v:byte(i) < 0x80 then
-			return 1
-		end
-		return M.mb_charlen(v, i)
-	end
-	local fields, cur, cur_unq, cur_q = {}, nil, false, nil
-	local function brk()
-		if cur ~= nil then
-			fields[#fields + 1] = { s = cur, unq = cur_unq, q = cur_q }
-			cur, cur_unq, cur_q = nil, false, nil
-		end
-	end
-	local function add(s, unq)
-		cur = (cur or "") .. s
-		cur_q = (cur_q or "") .. (unq and "0" or "1"):rep(#s)
-		if unq then
-			cur_unq = true
-		end
-	end
-	local function feed_split(v) -- unquoted expansion text: split on $IFS
-		local i, n = 1, #v
-		while i <= n do
-			local cl = clen(v, i)
-			local c = cl == 1 and v:sub(i, i) or v:sub(i, i + cl - 1)
-			if inifs(c) then
-				if isws(c) then
-					-- (LEADING whitespace is just ignored: a `:` right after it still ends an
-					-- empty first field — IFS=': ' splits " :" into one empty field)
-					local leading = cur == nil and #fields == 0
-					if cur ~= nil then
-						brk()
-					end
-					i = i + 1
-					while i <= n and isws(v:sub(i, i)) do
-						i = i + 1
-					end
-					if i <= n and not leading then
-						local nl = clen(v, i)
-						local nc = nl == 1 and v:sub(i, i) or v:sub(i, i + nl - 1)
-						if inifs(nc) and not isws(nc) then
-							i = i + nl
-							while i <= n and isws(v:sub(i, i)) do
-								i = i + 1
-							end
-						end
-					end
-				else
-					if cur == nil then
-						cur = ""
-					end
-					cur_unq = true
-					brk()
-					i = i + cl
-					while i <= n and isws(v:sub(i, i)) do
-						i = i + 1
-					end
-				end
-			else
-				add(c, true)
-				i = i + cl
-			end
-		end
-	end
+	local fb = M.fb_new(sh)
 	local dq_null, dq_at -- (a "…$@…" segment's parts, rt.dqseg: as interp's expand_to_fields)
 	for _, seg in ipairs(segs) do
 		if seg.dq and (seg.multi and #seg.elems == 0 or seg.s == "") then
@@ -11021,151 +10946,46 @@ function M.expand_fields(sh, segs)
 				dq_null = true
 			end
 		elseif seg.multi then
-			-- a $@ / $* part: multiple elements (seg.elems), joined/split per bash. Quoted
-			-- "$@" is one field PER element (each concatenates with the abutting text — the
-			-- first with what precedes, the last with what follows); quoted "$*" joins on
-			-- IFS[0]; unquoted joins on IFS[0] then word-splits (per-element under IFS="").
-			local els = seg.elems
-			if seg.q then
-				if seg.star then
-					add(table.concat(els, M.ifs_first(ifs)), false)
-				else
-					for k = 1, #els do
-						if k > 1 then
-							brk()
-						end
-						add(els[k], false)
-					end
-				end
-			elseif ifs == "" then
-				for k = 1, #els do
-					if k > 1 then
-						brk()
-					end
-					feed_split(els[k])
-				end
-			else
-				feed_split(table.concat(els, M.ifs_first(ifs)))
-			end
+			fb:multi(seg.elems, seg.q, seg.star)
 		elseif seg.split then
-			feed_split(seg.s)
+			fb:split(seg.s)
 		else
-			add(seg.s, seg.unq)
+			fb:add(seg.s, seg.unq)
 		end
 		if seg.dqend then -- end of a "…$@…" segment: empty parts make a null word unless "$@" was empty
 			if dq_null and not dq_at then
-				add("", false)
+				fb:add("", false)
 			end
 			dq_null, dq_at = nil, nil
 		end
 	end
-	brk()
-	-- pathname expansion on fields with unquoted glob metacharacters (mask-aware)
-	local out = {}
-	local gi = sh:get("GLOBIGNORE")
-	local giset = gi and gi ~= ""
-	local dotglob = sh.shopt.dotglob and true -- (a GLOBIGNORE assignment sets it: setup_glob_ignore)
-	local nullglob = sh.shopt.nullglob and true
-	local gipats
-	if giset then -- split on ':' but NOT inside [...]
-		gipats = {}
-		local depth, curp = 0, {}
-		for k = 1, #gi do
-			local c = gi:sub(k, k)
-			if c == "[" then
-				depth = depth + 1
-				curp[#curp + 1] = c
-			elseif c == "]" then
-				if depth > 0 then
-					depth = depth - 1
-				end
-				curp[#curp + 1] = c
-			elseif c == ":" and depth == 0 then
-				if #curp > 0 then
-					gipats[#gipats + 1] = table.concat(curp)
-					curp = {}
-				end
-			else
-				curp[#curp + 1] = c
-			end
-		end
-		if #curp > 0 then
-			gipats[#gipats + 1] = table.concat(curp)
-		end
-	end
-	local noglob = sh.opt_f
-	local skipdots = giset or (sh.shopt.globskipdots ~= false)
-	local globstar = sh.shopt.globstar and true
-	local GLOBSPECIAL = {
-		["*"] = 1,
-		["?"] = 1,
-		["["] = 1,
-		["]"] = 1,
-		["\\"] = 1,
-		["+"] = 1,
-		["@"] = 1,
-		["!"] = 1,
-		["("] = 1,
-		[")"] = 1,
-		["|"] = 1,
-		["-"] = 1, -- (a quoted `-`/`^` in a bracket expression is literal: `[a"-"c]`)
-		["^"] = 1,
-	}
-	local function glob_active(f) -- glob metachar at a NON-masked (glob-active) position?
-		return M.field_glob_active(f)
-	end
-	local function glob_pat(f) -- backslash-escape masked (quoted) glob-special chars
-		if not f.q or not f.q:find("1") then
-			return f.s
-		end
-		local o = {}
-		for i = 1, #f.s do
-			local c = f.s:sub(i, i)
-			o[#o + 1] = (f.q:sub(i, i) == "1" and GLOBSPECIAL[c]) and ("\\" .. c) or c
-		end
-		return table.concat(o)
-	end
-	for _, f in ipairs(fields) do
-		if not noglob and f.unq and glob_active(f) then
-			sh.glob_dots = dotglob -- (glob.c noglob_dot_filenames, synced per shell glob: compgen -G)
-			local m = M.glob_expand(glob_pat(f), { dotglob = dotglob, skipdots = skipdots, globstar = globstar, nocase = sh.shopt.nocaseglob,
-				noext = not sh.shopt.extglob })
-			if m and gipats then
-				local filt = {}
-				for _, x in ipairs(m) do
-					local ig = false
-					for _, p in ipairs(gipats) do
-						if M.glob_ignore_match(x, p, sh.shopt.nocaseglob, not sh.shopt.extglob) then
-							ig = true
-							break
-						end
-					end
-					if not ig then
-						filt[#filt + 1] = x
-					end
-				end
-				m = (#filt > 0) and filt or nil
-			end
-			if m then
-				for _, x in ipairs(m) do
-					out[#out + 1] = x
-				end
-			elseif sh.shopt.failglob then
-				io.stderr:write("curse: no match: " .. f.s .. "\n")
-				error({ __curse_exit = 1, __curse_lineabort = true })
-			elseif nullglob then -- drop
-			else
-				out[#out + 1] = f.s
-			end
-		else
-			out[#out + 1] = f.s
-		end
-	end
+	local out = fb:finish()
 	if #out == 1 and #segs > 1 and sh.shopt.assoc_expand_once and segs[1].unq and not segs[1].split
 		and segs[1].s:match("^[%a_][%w_]*%[") then
 		M.mark_arrayref(sh, out[1]) -- (an unquoted NAME[$k] argument: see mark_arrayref)
 	end
 	return out
+end
+
+-- Bash-correct standalone IFS split (for `read -a`): the field engine's split, with
+-- read's CTLESC markers (\1 before each backslash-escaped char: that char is literal —
+-- part of a field, never a delimiter; the marker dropped) unless `nomark` (read's
+-- skip_ctlesc: $IFS itself holds \1). No pathname expansion.
+function M.ifs_split(sh, s, nomark)
+	local fb = M.fb_new(sh)
+	local i, n = 1, #s
+	while not nomark do
+		local p = s:find("\1", i, true)
+		if not p or p == n then -- (a trailing lone \1 is plain text)
+			break
+		end
+		fb:split(s:sub(i, p - 1))
+		fb:add(s:sub(p + 1, p + 1), false)
+		i = p + 2
+	end
+	fb:split(s:sub(i))
+	fb:brk()
+	return fb.fields
 end
 
 -- Compile-tier array literal (`a=(1 2 3)`, `a=($x)`, `a=([0]=x [k]=v)`, `a+=(…)`, `a=()`):
