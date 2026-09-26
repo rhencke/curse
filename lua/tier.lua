@@ -18,10 +18,10 @@ function M.compile(ast, opts)
 end
 
 -- Compile a runtime code string (eval / source) as a FRAGMENT: emit with fragment=true so a
--- TOP-LEVEL return/break/continue RAISES its signal (the caller's delegated cf-wrapper
--- catches it) instead of jumping to this unit's own DONE. Returns an instantiated module, or
--- nil when the code can't compile — a parse (syntax) error, alias use (needs line-at-a-time
--- expansion), or any construct emit still delegates. The caller then falls back to the
+-- TOP-LEVEL return/break/continue RAISES its signal (the caller's cf-wrapper catches it)
+-- instead of jumping to this unit's own DONE. Returns an instantiated module, or nil when
+-- the code can't compile — a parse (syntax) error, alias use (needs line-at-a-time
+-- expansion), or a construct emit refuses (cx.refuse). The caller then falls back to the
 -- interpreter, which handles those correctly (and incrementally). Memoized by text below.
 -- Compiled eval/source fragments, keyed by their exact text: a resident worker re-running a
 -- script (or a loop re-running the same `eval "$cmd"`) reuses the module instead of paying
@@ -246,26 +246,15 @@ function M.run(src, opts)
 	end
 	local hook = function(kind, id)
 		count = count + 1
-		-- Hand off only where the compiled module has a resume pc for THIS safepoint:
-		-- never inside a function call (calldepth>0), and — crucially — a forked child
-		-- (subshell) resumes into its OWN bounded fragment (whose loops now have pcs),
-		-- NOT the top-level continuation. A still-delegated context has no pc, so
-		-- resume_pc is nil there and the child stays in the interpreter.
+		-- Hand off only where the compiled module has a resume pc for THIS safepoint,
+		-- never inside a function call (calldepth>0). A loop with no resume point (one
+		-- inside a subshell, $(…), …) has no pc: resume_pc is nil and it stays interpreted.
 		if resume ~= nil or sh.calldepth ~= 0 or not ready(kind, id, count) then
 			return
 		end
-		local pc = resume_pc(mod, { kind = kind, id = id })
-		if pc ~= nil then
+		if resume_pc(mod, { kind = kind, id = id }) ~= nil then
 			resume = { kind = kind, id = id }
-			-- carry the OSR itself on the error, so whoever catches it can run it: the
-			-- top level here, OR a forked subshell child (which OSRs into its own
-			-- bounded fragment and _exits, without the parent's finish_run/EXIT trap).
-			error({
-				__curse_switch = true,
-				osr = function()
-					M.run_compiled(mod, sh, pc)
-				end,
-			})
+			error({ __curse_switch = true }) -- (unwind the interpreter; resumed below)
 		end
 	end
 
@@ -367,7 +356,7 @@ local function loop_fragment(st, sh)
 		-- (sh.forstate) under the fragment's own id for that loop: its first
 		local fid = 1
 		if not (mod.loopPc and mod.loopPc[fid]) then
-			mod = nil -- (the emitter delegated the loop: no resume point)
+			mod = nil -- (the loop has no resume point in the fragment)
 		else
 			st._fid = fid
 		end
@@ -863,21 +852,10 @@ function M.run_background(script_path, opts)
 			mod = assert(loadfile(out))() -- fully written (atomic rename)
 			rt.reap_internal(tpid)
 		end
-		-- OSR only where THIS context has a resume pc: the top level, or a forked child
-		-- (subshell) into its OWN bounded fragment. A delegated context has no pc, so
-		-- it stays in the interpreter. The compiled module (out.lua) is the SAME shared
-		-- artifact for parent and children — each jumps to the entry that matches it.
-		local pc = resume_pc(mod, { kind = kind, id = id })
-		if pc ~= nil then
+		-- OSR only where THIS context has a resume pc (as in M.run)
+		if resume_pc(mod, { kind = kind, id = id }) ~= nil then
 			resume = { kind = kind, id = id }
-			-- attach the OSR (see M.run) so a forked subshell child can OSR itself into
-			-- its own bounded fragment (ends in subshell_exit → _exit) when it catches this.
-			error({
-				__curse_switch = true,
-				osr = function()
-					M.run_compiled(mod, sh, pc)
-				end,
-			})
+			error({ __curse_switch = true })
 		end
 	end
 

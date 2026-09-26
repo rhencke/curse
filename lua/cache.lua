@@ -190,8 +190,8 @@ end
 
 -- Run a compiled module with the interp's line-abort semantics: a div0/failglob
 -- lineabort re-enters run at sh._ff (next line) with $?=1. (A reduced tier.run_compiled:
--- no dbgskip, frame unwinding or line drift — the cached mode is a dev path; the daemon
--- runs tier.)
+-- no dbgskip, frame unwinding or line drift: M.run is exercised by test_cache only; the
+-- daemon runs scripts through tier.)
 local function run_compiled(mod, sh, pc)
 	local ne0 = sh.noerr
 	while true do
