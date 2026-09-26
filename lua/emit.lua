@@ -4927,6 +4927,12 @@ EF.simple_native = function(cx, st, after, cmd)
 		out[1] = "local __pm1, __pm2 = rt.procsub_mark(sh); " .. out[1]
 	end
 	local redir, rf
+	-- (a command that may run as an external — `command NAME`, a dynamic name, a non-builtin —
+	-- has its redirections' fatal expansion errors judged by rt.redir_forks: cx.redir_ext)
+	local ext = not isexec and (not cmd or cmd == "command" or not require("interp").BUILTINS[cmd])
+	local function rx(rc)
+		return ext and cx.redir_ext(nil, rc) or rc
+	end
 	if not cmd and st.redirs and #st.redirs > 0 then
 		-- a dynamic name may turn out to be `exec` (whose redirections persist): the runner
 		-- decides, applying them itself (rf) around anything else
@@ -4935,7 +4941,7 @@ EF.simple_native = function(cx, st, after, cmd)
 			return nil
 		end
 		spec[#spec + 1] = "eredirs=" .. ser(st.redirs)
-		rf = ("function(__rs) return %s end"):format(rc)
+		rf = ("function(__rs) return %s end"):format(rx(rc))
 		if require("interp")._int.redirs_touch_stdout(st.redirs) then
 			spec[#spec + 1] = "so=true"
 		end
@@ -4949,7 +4955,7 @@ EF.simple_native = function(cx, st, after, cmd)
 		if not rc then
 			return nil
 		end
-		rf = ("function(__rs) return %s end"):format(rc)
+		rf = ("function(__rs) return %s end"):format(rx(rc))
 		if require("interp")._int.redirs_touch_stdout(st.redirs) then
 			spec[#spec + 1] = "so=true"
 		end
@@ -4958,6 +4964,7 @@ EF.simple_native = function(cx, st, after, cmd)
 		if not redir then
 			return nil
 		end
+		redir = rx(redir)
 		if require("interp")._int.redirs_touch_stdout(st.redirs) then
 			spec[#spec + 1] = "so=true"
 		end
@@ -5134,7 +5141,8 @@ end
 -- none. dyn: the first word resolves at run time (a dynamic `$cmd`, or a builtin name a
 -- function may shadow) — rt.exec_dynamic runs it as the interpreter's command runner would
 -- (function / builtin / external), so its redirect goes through cx.redir_ext and a cmdsub
--- nested in a ${…} is counted at runtime. nil when a word or redirect can't compile.
+-- nested in a ${…} is counted at runtime; so does `command NAME`'s (trace "command": NAME
+-- may be an external). nil when a word or redirect can't compile.
 function EF.argv_dispatch(cx, st, after, from, trace, callee, callargs, dyn)
 	local argvbody, guard = field_argv(st.words, from, cx.lifted, nil, nil, true)
 	local redir = argvbody and st.redirs and cx.redir_conds(st, nil) -- nil: an uncompilable redirect shape
@@ -5149,7 +5157,7 @@ function EF.argv_dispatch(cx, st, after, from, trace, callee, callargs, dyn)
 		guard = guard,
 		callee = callee,
 		callargs = callargs:format(dyncs and "sh.ncs ~= sh.ncs0" or tostring(hadcs)),
-		redir = redir and (dyn and cx.redir_ext(nil, redir) or redir),
+		redir = redir and (dyn and cx.redir_ext(nil, redir) or trace == "command" and cx.redir_ext("command", redir) or redir),
 	})
 end
 function EF.dyn_dispatch(cx, st, after)
@@ -7643,9 +7651,12 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
 	end
 	-- An external's redirections: bash expands them in the forked child, so a fatal expansion
 	-- error there (set -u, ${v?}, failglob) only fails the command (status 1) — unless `name`
-	-- turned out to be a function defined at run time (nil: the name is in __a[1]).
+	-- turned out to be a function defined at run time; rt.redir_forks decides. name: a static
+	-- command name (never `command`, a builtin: its argv isn't needed); nil: the name is
+	-- __a[1] (the argv __a); "command": `command` with __a holding only the words after it.
 	function cx.redir_ext(name, conds)
-		return ("rt.redir_ext(sh, %s, pcall(function() return %s end))"):format(name and ("%q"):format(name) or "__a[1]", conds)
+		local who = name == "command" and '"command", __a, 0' or name and ("%q, nil, nil"):format(name) or "__a[1], __a, 1"
+		return ("rt.redir_ext(sh, %s, pcall(function() return %s end))"):format(who, conds)
 	end
 	-- Build the "install all redirs, run, restore" conditions for `st.redirs`, or nil if any redir
 	-- can't be compiled (caller delegates) or the command is `exec` (whose redirs must PERSIST).

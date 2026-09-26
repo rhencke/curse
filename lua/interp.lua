@@ -2563,35 +2563,8 @@ local function alloc_fd()
 	return -1
 end
 local FDVAR_NOASSIGN = { GROUPS = 1, FUNCNAME = 1, BASH_ARGC = 1, BASH_ARGV = 1, BASH_SOURCE = 1, BASH_LINENO = 1 }
-local bi = rt.builtin_enabled -- an enabled builtin
--- Does bash run this command in a forked child (an external), where a fatal expansion
--- error in its redirections fails only it? `command [-p] [--] NAME` is looked through
--- first, skipping functions (execute_cmd.c: check_command_builtin — a restricted shell's
--- `command -p` and any other option stop it). args: the argv, else just the name c.
-local function redir_forks(sh, c, args)
-	if sh.functions[c] then
-		return false
-	end
-	local i = 1
-	while args and c == "command" and bi(sh, c) do
-		local j = i + 1
-		if args[j] == "-p" and not sh.opt_r then
-			j = j + 1
-		end
-		if args[j] == "--" then
-			j = j + 1
-		elseif args[j] and args[j]:sub(1, 1) == "-" then
-			break
-		end
-		if args[j] == nil then
-			break
-		end
-		i, c = j, args[j]
-	end
-	return not bi(sh, c)
-end
 local function apply_redirs(sh, redirs, cname, ctx, args) -- cname: the command (names {v} errors;
-	-- ctx: only names them — compiled code's rt.redir_apply_one); args: its argv (redir_forks)
+	-- ctx: only names them — compiled code's rt.redir_apply_one); args: its argv (rt.redir_forks)
 	io.flush() -- flush pending stdout BEFORE moving fds, else buffered output from a
 	-- prior command would be redirected into (and lost to) the new target
 	local save, ok = {}, true
@@ -2602,7 +2575,7 @@ local function apply_redirs(sh, redirs, cname, ctx, args) -- cname: the command 
 	-- A fatal expansion error in a redirection word (set -u, ${v?}, failglob): bash expands
 	-- an external command's redirections in the forked child, where it only fails that
 	-- command (status 1); anywhere else it is raised as usual (redir.c runs in the shell).
-	local ext = cname and redir_forks(sh, cname, args)
+	local ext = cname and rt.redir_forks(sh, cname, args)
 	local function xerr(e)
 		if not ext and type(e) == "table" and e.__curse_exit then
 			error(e, 0)
@@ -2677,6 +2650,14 @@ local function apply_redirs(sh, redirs, cname, ctx, args) -- cname: the command 
 		local fdb = r.fdvar and sh.vars[sh:deref(fvn or r.fdvar)]
 		-- bash's noassign dynamic arrays (GROUPS, BASH_ARGV, …) refuse the fd too: redir_varassign
 		local noasg = r.fdvar and FDVAR_NOASSIGN[fvn or r.fdvar] and not (sh.unset_specials and sh.unset_specials[fvn or r.fdvar])
+		local rflags = r.fdvar and rt.REDIR_FLAGS[r.op]
+		if rflags and rflags ~= 0 and sh.opt_r then
+			-- a restricted shell refuses a writing redirect before it opens or assigns
+			-- anything, naming the {var} (redir.c: WRITE_REDIRECT, then redirection_error)
+			io.stderr:write("curse: " .. r.fdvar .. ": restricted: cannot redirect output\n")
+			ok = false
+			break
+		end
 		if (noasg or fdb and fdb.ro) and not ((r.op == "dup" or r.op == "dupin") and r.target == "-") then
 			-- `{v}>…` with v readonly: bash refuses (no fd is allocated) and the command fails
 			-- — after it opened (so created) an output file
@@ -6677,7 +6658,6 @@ M._int = {
 	dbracket_word = dbracket_word,
 	dbracket_pattern = dbracket_pattern,
 	redirs_touch_stdout = redirs_touch_stdout,
-	redir_forks = redir_forks,
 	describe = describe,
 	command_describe = command_describe,
 	statbuf = statbuf,
