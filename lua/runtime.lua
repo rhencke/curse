@@ -14445,7 +14445,7 @@ function M.parse_error_stmt(sh, st, label)
 		error(type(pe) == "table" and pe.__curse_perrexit and pe
 			or { __curse_exit = (st.forceeof and sh.opt_c) and 127 or 1 })
 	end
-	local msg = tostring(st.msg or "syntax error"):gsub("^.-:%d+: ", "")
+	local msg = tostring(st.msg or "syntax error"):gsub("^[^%s`']-:%d+: ", "") -- (a Lua position, if any)
 	if not st.exact then
 		msg = msg:gsub("^syntax error near `", "syntax error near unexpected token `")
 	end
