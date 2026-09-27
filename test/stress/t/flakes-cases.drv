@@ -1,0 +1,16 @@
+#@ guards: past flakes of curse's own corpus, repeated under load in every shell (interp, compiled, tiered, daemon cold+warm) against bash 5.2.21, then through test/conformance/run.sh: 2290-queue-parser (multibyte lexing cache keys), 220-param, 1979-trap-break-continue-compiled, 2200-sig-jobs, 1820-jobs-kill-wait-builtins (these three not yet root-caused: every failing iteration's full outputs + diffs are kept), 2350-final-subshell-kill, 1978-coproc-compiled, 2380-coproc-exit-dispose, 2190-shell-general
+#@ duration: 300
+#@ nested: yes
+drv_main() {
+	local -a cases=(2290-queue-parser 220-param 1979-trap-break-continue-compiled 2200-sig-jobs 1820-jobs-kill-wait-builtins
+		2350-final-subshell-kill 1978-coproc-compiled 2380-coproc-exit-dispose 2190-shell-general)
+	local c keep
+	for c in "${cases[@]}"; do
+		past_deadline && break
+		keep=""; case $c in 1979-* | 2200-* | 1820-*) keep=all ;; esac
+		( O_LABEL=$c O_ITERS=$((ITERS * 2)) O_ORACLE=varies O_TIMEOUT=60 O_KEEP=$keep run_script_test "$REPO/test/cases/$c.sh" )
+	done
+	# …and through the conformance harness's own CLI (its daemon, its nondeterminism rules)
+	local names; names=$(printf '%s.sh\n' "${cases[@]}")
+	KEEPALL=1 CONF_TIMEOUT=60 replay_conformance cases "$ITERS" $names
+}

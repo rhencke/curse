@@ -1,0 +1,41 @@
+#@ guards: several daemons sharing ONE XDG_CACHE_HOME racing to write and read the same compiled modules, cold (empty cache: every daemon compiles and stores at once) then warm: no torn or foreign .bc may ever be loaded — every run must print exactly what bash 5.2.21 prints
+#@ duration: 150
+drv_main() {
+	local x=$TDIR/cr; mkdir -p "$x/cache"
+	local -a cases=(010-echo 040-variables 060-quoting 070-splitting 090-arithmetic 110-while 1010-assoc 1070-brace-escape 1130-test-grammar 1170-patsub-slash)
+	local c f
+	for c in "${cases[@]}"; do
+		f=$REPO/test/cases/$c.sh; [ -e "$f" ] || { fail test-bug "missing case $c"; continue; }
+		mkdir -p "$x/o/$c"; (cd "$x/o/$c" && env -i PATH=/usr/bin:/bin HOME="$x/o/$c" THIS_SH="$BIN/oracle/bash" "$ORACLE" "$f" </dev/null >"$x/exp.$c" 2>/dev/null; echo "[$?]" >>"$x/exp.$c")
+	done
+	local -a dps=() d
+	for d in 1 2 3; do
+		mkdir -p "$x/xdg$d"; chmod 700 "$x/xdg$d"
+		local dp; dp=$(start_daemon "$x/xdg$d" "$x/cache" 2 "$x/log$d") || { fail test-bug "daemon $d did not start" "$x"; return; }
+		echo "$dp" >>"$SCR/extra-daemons"; dps+=("$dp")
+	done
+	local rounds=$((ITERS * 2)) r runs=0
+	for ((r = 0; r < rounds; r++)); do
+		past_deadline && break
+		# every other round starts from an EMPTY shared cache (the cold race)
+		[ $((r % 2)) = 0 ] && rm -rf "$x/cache"/* 2>/dev/null
+		for c in "${cases[@]}"; do
+			for d in 1 2 3; do
+				(
+					w=$x/w/$r.$c.$d; mkdir -p "$w"; cd "$w" || exit
+					env -i PATH=/usr/bin:/bin HOME="$w" XDG_RUNTIME_DIR="$x/xdg$d" XDG_CACHE_HOME="$x/cache" CURSE_FALLBACK="$FALLBACK" \
+						THIS_SH="$BIN/daemon/bash" "$CLIENT" "$REPO/test/cases/$c.sh" </dev/null >"$w/out" 2>"$w/err"
+					echo "[$?]" >>"$w/out"
+					if cmp -s "$w/out" "$x/exp.$c"; then rm -rf "$w"; else diff -u "$x/exp.$c" "$w/out" >"$w/diff"; fi
+				) &
+			done
+		done
+		wait
+		runs=$((runs + ${#cases[@]} * 3))
+	done
+	echo "cache-race $runs" >>"$TDIR/iterations"
+	local bad; bad=$(ls "$x/w" 2>/dev/null | wc -l)
+	[ "$bad" = 0 ] || fail oracle-mismatch "$bad of $runs shared-cache runs differ from bash: $(ls "$x/w" | head -5 | tr '\n' ' ')" "$x"
+	for d in "${dps[@]}"; do "$STH" killsid "$d"; done
+	[ -e "$TDIR/failures" ] || rm -rf "$x"
+}

@@ -1,0 +1,48 @@
+#@ guards: compile-cache keys include the multibyte lexing state (207fd83, test 2290): the SAME script text lexes differently in C and in a charset whose trail bytes are ASCII (GBK here: 0x81 0x5c is one character, in C a byte and a backslash). Requests alternate between LC_ALL=C and LC_ALL=zh_CN.gbk, in parallel, against one daemon (disk cache + worker memory), as files and as -c strings
+#@ duration: 120
+#@ concurrent: yes
+drv_main() {
+	if ! LC_ALL=zh_CN.gbk locale charmap 2>/dev/null | grep -q GBK; then
+		fail test-bug "locale zh_CN.gbk is not installed: cannot run"; return
+	fi
+	local x=$TDIR/loc; mkdir -p "$x"
+	# s1: valid in both locales, different output; s2: a syntax error in C only
+	printf 'echo \x81\x5cx a\x81\x5c\x5cb | od -An -tx1\nf() { echo \x81\x5c; }; f | od -An -tx1\nv=\x81\x5c; echo ${#v}\n' >"$x/s1.sh"
+	printf 'echo "\x81\x5c" ok | od -An -tx1\n' >"$x/s2.sh"
+	local s l
+	for s in s1 s2; do
+		for l in C zh_CN.gbk; do
+			(cd "$x" && env -i PATH=/usr/bin:/bin LC_ALL=$l "$ORACLE" "$s.sh" >"$x/exp.$s.$l" 2>/dev/null; echo "[$?]" >>"$x/exp.$s.$l")
+			(cd "$x" && env -i PATH=/usr/bin:/bin LC_ALL=$l "$ORACLE" -c "$(cat "$s.sh")" >"$x/expc.$s.$l" 2>/dev/null; echo "[$?]" >>"$x/expc.$s.$l")
+		done
+		cmp -s "$x/exp.$s.C" "$x/exp.$s.zh_CN.gbk" && fail test-bug "$s: the oracle gives the same output in both locales (no discrimination)"
+	done
+	local per=$((ITERS * 40)) P=6 p cache=$TDIR/loc-cache
+	mkdir -p "$cache"
+	for ((p = 0; p < P; p++)); do
+		(
+			local i s l got
+			for ((i = 0; i < per; i++)); do
+				[ $((i % 10)) = 0 ] && past_deadline && break
+				s=s$((1 + (i + p) % 2)); l=C; [ $(((i / 2 + p) % 2)) = 1 ] && l=zh_CN.gbk
+				got=$(cd "$x" && env -i PATH=/usr/bin:/bin LC_ALL=$l XDG_RUNTIME_DIR="$XDG" XDG_CACHE_HOME="$cache" \
+					CURSE_FALLBACK="$FALLBACK" "$CLIENT" "$s.sh" 2>/dev/null; echo "[$?]")
+				[ "$got" = "$(cat "$x/exp.$s.$l")" ] || { printf 'file %s %s: %s\n' "$s" "$l" "$(echo "$got" | tr '\n' '|')" >>"$x/bad.$p"; }
+				got=$(cd "$x" && env -i PATH=/usr/bin:/bin LC_ALL=$l XDG_RUNTIME_DIR="$XDG" XDG_CACHE_HOME="$cache" \
+					CURSE_FALLBACK="$FALLBACK" "$CLIENT" -c "$(cat "$x/$s.sh")" 2>/dev/null; echo "[$?]")
+				[ "$got" = "$(cat "$x/expc.$s.$l")" ] || { printf -- '-c %s %s: %s\n' "$s" "$l" "$(echo "$got" | tr '\n' '|')" >>"$x/bad.$p"; }
+			done
+			echo "$i" >"$x/n.$p"
+		) &
+	done
+	wait
+	local n=0; for ((p = 0; p < P; p++)); do n=$((n + $(cat "$x/n.$p" 2>/dev/null || echo 0))); done
+	echo "locale-alt $((n * 2))" >>"$TDIR/iterations"
+	cat "$x"/bad.* >"$x/bad" 2>/dev/null
+	if [ -s "$x/bad" ]; then
+		for s in s1 s2; do for l in C zh_CN.gbk; do echo "expected $s $l: $(tr '\n' '|' <"$x/exp.$s.$l")"; done; done >"$x/expected"
+		fail oracle-mismatch "$(wc -l <"$x/bad") of $((n * 2)) locale-alternating requests got the other locale's (or no) output: $(sort "$x/bad" | uniq -c | sort -rn | head -3 | tr '\n' ';')" "$x"
+	fi
+	rm -rf "$cache"
+	[ -e "$TDIR/failures" ] || rm -rf "$x"
+}

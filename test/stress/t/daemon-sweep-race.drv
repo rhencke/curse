@@ -1,0 +1,44 @@
+#@ guards: the dead-client-sweep race fixed in 207fd83 — a worker SIGKILLed for a client that had just finished, landing after it accepted the NEXT request (whose client then read EOF: status 127, empty output). Before the fix, 8 of 72,000 requests failed. 12 parallel loops × (250×N) `-c 'echo hi'` requests against a 2-worker daemon.
+#@ duration: 240
+drv_main() {
+	local x=$TDIR/daemon; mkdir -p "$x/xdg" "$x/cache"; chmod 700 "$x/xdg"
+	local dp; dp=$(start_daemon "$x/xdg" "$x/cache" 2 "$x/log") || { fail test-bug "private 2-worker daemon did not start" "$x"; return; }
+	echo "$dp" >>"$SCR/extra-daemons"
+	local k; for ((k = 0; k < 100; k++)); do [ "$(workers "$dp")" -ge 2 ] && break; sleep 0.05; done
+	local per=$((ITERS * 250)) P=12 p
+	echo "12 loops x $per requests"
+	for ((p = 0; p < P; p++)); do
+		(
+			local i out st
+			for ((i = 0; i < per; i++)); do
+				[ $((i % 50)) = 0 ] && past_deadline && { echo "$i" >"$x/done.$p"; exit 0; }
+				out=$(env -i PATH=/usr/bin:/bin XDG_RUNTIME_DIR="$x/xdg" XDG_CACHE_HOME="$x/cache" CURSE_FALLBACK="$FALLBACK" \
+					"$CLIENT" -c 'echo hi' 2>&1 </dev/null)
+				st=$?
+				[ "$out" = hi ] && [ $st = 0 ] || printf '%s\t%s\t%s\n' "$p.$i" "$st" "$out" >>"$x/bad.$p"
+			done
+			echo "$per" >"$x/done.$p"
+		) &
+	done
+	wait
+	local total=0 nbad=0
+	for ((p = 0; p < P; p++)); do total=$((total + $(cat "$x/done.$p" 2>/dev/null || echo 0))); done
+	cat "$x"/bad.* >"$x/bad" 2>/dev/null
+	nbad=$(wc -l <"$x/bad" 2>/dev/null || echo 0)
+	echo "requests: $total, failed: $nbad"
+	echo "sweep 1 $total" >>"$TDIR/iterations"
+	if [ "$nbad" -gt 0 ]; then
+		fail crash "$nbad of $total 'echo hi' requests failed (status/output): $(head -3 "$x/bad" | tr '\t\n' ' ;')" "$x"
+	fi
+	# the daemon survived with its pool intact and nothing else in its session
+	sleep 1.5
+	local w; w=$(workers "$dp")
+	# (12 clients at once on a 2-worker pool: it grows overflow workers by design — the
+	# pool must not have SHRUNK below 2)
+	[ "$w" -ge 2 ] || fail invariant "sweep-race daemon: at least 2 workers expected, $w found" "$x"
+	echo "workers after: $w"
+	local extra; extra=$("$STH" scan "$dp" "$dp" $("$STH" children "$dp" | awk '{print $1}'))
+	[ -z "$extra" ] || fail invariant "sweep-race daemon: stray processes in its session: $(echo "$extra" | tr '\n' ';')" "$x"
+	"$STH" killsid "$dp"
+	[ -e "$TDIR/failures" ] || rm -rf "$x"
+}

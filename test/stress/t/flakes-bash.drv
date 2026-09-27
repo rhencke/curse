@@ -1,0 +1,16 @@
+#@ guards: past flakes of GNU bash's own suite, repeated under load: glob, trap, posixexp, ifs-posix, iquote, new-exp, comsub-posix in interp/compiled/tiered (a copy of the tests dir as cwd, THIS_SH = curse) against bash 5.2.21, and all of them plus jobs.tests (its oracle alone takes ~60s) through test/conformance/run.sh (daemon cold+hot)
+#@ duration: 420
+drv_main() {
+	local bd; bd=$(ls -d "$REPO"/subprojects/bash-*/tests 2>/dev/null | head -1)
+	[ -d "$bd" ] || { fail test-bug "bash corpus not fetched (meson subprojects download bash)"; return; }
+	# the harness replay first (jobs.tests' oracle alone takes ~60s): it must fit the cap
+	CONF_TIMEOUT=150 replay_conformance bash 1 glob.tests jobs.tests trap.tests posixexp.tests ifs-posix.tests iquote.tests new-exp.tests comsub-posix.tests
+	local -a tests=(glob trap posixexp ifs-posix iquote new-exp comsub-posix)
+	local t tmo
+	for t in "${tests[@]}"; do
+		past_deadline && break
+		tmo=30; [ $t = trap ] && tmo=90
+		( O_LABEL=$t O_ITERS=$(((ITERS + 3) / 4)) O_ORACLE=varies O_TIMEOUT=$tmo O_CWD="$bd" O_MODES=interp,compiled,tiered \
+			run_script_test "$bd/$t.tests" )
+	done
+}
