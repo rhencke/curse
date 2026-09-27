@@ -3981,6 +3981,13 @@ do
 		M.req_depth = M.req_depth + 1
 		return req_done(pcall(creq, name))
 	end
+	-- (a compile — parse, emit, the chunk's load — holds signals the same way: it runs
+	-- under pcalls that take any error for "doesn't compile", so a trap's `exit` raised
+	-- in it was swallowed and the script ran on: tier)
+	M.defer_call = function(f, ...)
+		M.req_depth = M.req_depth + 1
+		return req_done(pcall(f, ...))
+	end
 end
 function M.defer_loading(sh, sig)
 	if M.req_depth > 0 then

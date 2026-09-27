@@ -630,7 +630,11 @@ local function comsub_syntax(body, xg)
 		for _, st in ipairs(ast.stmts) do
 			if st.t == "parse_error" and not st.recoverable then
 				err = tostring(st.msg or "syntax error")
-				eline = st.line -- (the body's line holding the error: bash reports it there)
+				eline = st.line -- (the body's line holding the error: bash reports it there;
+				local nl = select(2, body:gsub("\n", "")) + 1 -- an error at the body's end
+				if eline and eline > nl then -- is at its closing `)`, on its last line)
+					eline = nl
+				end
 				break
 			end
 		end
@@ -3389,23 +3393,27 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs, xg, bq
 		end
 		return false
 	end
-	local function comsub_err(cerr, eline, cbody) -- (eline: the body's line with the error,
+	local function comsub_err(cerr, eline, cbody, je) -- (eline: the body's line with the error,
 		local near, t = cerr:find("near `", 1, true), nil -- reported there, and shown when it's
 		if near and eline and eline > 1 then -- a whole source line)
-			local k = 0
+			local k, last = 0, true
 			for l in (cbody .. "\n"):gmatch("([^\n]*)\n") do
 				k = k + 1
 				if k == eline then
 					t = l
-					break
+				elseif k > eline then
+					last = false
 				end
+			end
+			if t and last and je then -- (the body's last line: the source line goes on past its `)`)
+				t = t .. (src:match("^[^\n]*", je - 1) or "")
 			end
 		end
 		error({ __curse_perr = true, msg = cerr, line = near and (line + (eline or 1) - 1) or nil, ltext = t,
 			forceeof = true }, 0)
 	end
 	-- the read-time syntax check of a $(…) body (a guessed extglob state: line mode)
-	local function comsub_check(cbody)
+	local function comsub_check(cbody, je)
 		local bxg = nil
 		if cbody:find("[@!+*?]%(") then
 			bxg = xg_body()
@@ -3414,7 +3422,7 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs, xg, bq
 		if guessed then
 			xg_guess = true
 		elseif cerr then
-			comsub_err(cerr, eline, cbody)
+			comsub_err(cerr, eline, cbody, je)
 		end
 	end
 	-- the $( … ) bodies in a ${ … } (src[k..e)) are syntax-checked as the line is read, as
@@ -3435,7 +3443,7 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs, xg, bq
 				local cbody = src:sub(k + 2, je - 2)
 				if src:sub(k + 2, k + 2) ~= "(" and not cbody:find("<<", 1, true) and not cbody:find('$"', 1, true)
 					and not alias_touch(cbody) then
-					comsub_check(cbody)
+					comsub_check(cbody, je)
 				end
 				k = je
 			else
@@ -3525,7 +3533,7 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs, xg, bq
 					if not hdp and src:sub(i + 2, i + 2) ~= "("
 						and (not cbody:find("<<", 1, true) or cbody:find("<<%-?[ \t]*$") or cbody:find("<<%-?[ \t]*[\n;&|)]"))
 						and not alias_touch(cbody) then
-						comsub_check(cbody)
+						comsub_check(cbody, je)
 					end
 					if hdp then
 						-- `$(cat <<EOF)` then the body on the following lines (bash): move those
