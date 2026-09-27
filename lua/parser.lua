@@ -5,6 +5,20 @@
 -- Loops get a stable numeric `id` so the tier layer can name a
 -- resume safepoint.
 local M = {}
+-- A trap's control flow — exit/return/break/continue, or bash's DISCARD — raised by a
+-- trap handler that ran at a safepoint inside a protected call must pass through every
+-- pcall that classifies failures ("not an arith expression", "syntax error in
+-- expression", "doesn't compile"): the one shared test, applied at each such pcall.
+-- (Arith/parse/unbound errors carry their own tags: those stay the caller's to classify.)
+function M.trap_flow(e)
+	if type(e) == "table" and (e.__curse_exit or e.__curse_return or e.__curse_break
+		or e.__curse_continue or e.__curse_discard)
+		and not (e.__curse_matherr or e.__curse_experr or e.__curse_arith or e.__curse_perr
+			or e.__curse_unbound or e.__curse_lineabort) then
+		error(e, 0)
+	end
+end
+local trap_flow = M.trap_flow
 -- The STATIC alias state (sh-less compile parse) in effect for the line being parsed:
 -- { tab = name->value } while expand_aliases is on, else nil. Stamped onto every
 -- $(…)/`…` part (`aenv`) so the compiler's later parse of that body expands the same
@@ -225,6 +239,9 @@ local function arith(src, nodefer)
 				local raw = src:sub(i + 1, close - 1)
 				i = close + 1
 				local ok, idx = pcall(arith, raw, "expanded")
+				if not ok then
+					trap_flow(idx)
+				end
 				return nm, (ok and idx) or nil, raw
 			end
 		end
@@ -251,6 +268,9 @@ local function arith(src, nodefer)
 			local raw = src:sub(rs, j - 1)
 			i = j + 1 -- past the ]
 			local ok, idx = pcall(arith, raw) -- may fail for a quoted/non-arith key
+			if not ok then
+				trap_flow(idx)
+			end
 			return nm, (ok and idx) or nil, raw
 		end
 		return nm, nil, nil
@@ -4122,6 +4142,9 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs, xg, bq
 			-- (a bad expression — or `$((1))$((2))` — takes the word path: its error is a
 			-- runtime one, reported when the assignment runs)
 			local aok, ae = pcall(arith, raw:sub(4, -3))
+			if not aok then
+				trap_flow(ae)
+			end
 			if aok then
 				return { t = "assign", name = name, arith = ae, rhssrc = raw } -- (rhssrc: declare -f)
 			end
@@ -4354,6 +4377,9 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs, xg, bq
 						return nil
 					end
 					local ok, ast = pcall(arith, s)
+					if not ok then
+						trap_flow(ast)
+					end
 					if ok then
 						return ast
 					end
@@ -4542,6 +4568,9 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs, xg, bq
 				-- so defer the parse failure to eval (caught by the arithcmd handler) rather
 				-- than aborting the whole parse.
 				local ok, e = pcall(arith, body)
+				if not ok then
+					trap_flow(e)
+				end
 				return {
 					t = "arithcmd",
 					line = line,

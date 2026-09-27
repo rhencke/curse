@@ -743,6 +743,9 @@ arith_resolve = function(sh, s)
 	-- (the VALUE is not word-expanded: bash's expr_streval evaluates it as-is, so a `$`,
 	-- backquote or quote in it is a syntax error — "let" mode; only a subscript expands)
 	local ok, ast = pcall(P.arith, s, "let")
+	if not ok then
+		P.trap_flow(ast)
+	end
 	if not ok then -- the value is not a valid arith expression (e.g. "12 34", "1+"): an
 		-- arith error — the command fails and (bash) the rest of the line is discarded
 		arith_pre(sh, ast)
@@ -762,6 +765,9 @@ arith_resolve = function(sh, s)
 	in_expanded_text = true -- (a value is expansion output: its subscripts expand unquoted)
 	sh.arith_depth = depth
 	local ok2, v = pcall(eval, sh, ast)
+	if not ok2 then
+		P.trap_flow(v)
+	end
 	sh.arith_depth = depth - 1
 	in_expanded_text = sv
 	if not ok2 then
@@ -826,6 +832,9 @@ local function arith_expand_text(sh, raw, depth0) -- depth0: 1 = the text IS a s
 			local e = c == "$" and (select(2, raw:find("^[%a_][%w_]*", k + 1)) or (nx:match("^[%d@*#?$!%-]$") and k + 1))
 			if not e then
 				local ok, x = pcall(P.expansion_end, raw, k, false, true)
+				if not ok then
+					P.trap_flow(x)
+				end
 				e = math.min(ok and x or n + 1, n + 1) - 1
 			end
 			local chunk = raw:sub(k, e)
@@ -849,6 +858,9 @@ end
 function M.arith_textual_eval(sh, raw, depth0)
 	local text = arith_expand_text(sh, raw, depth0)
 	local pok, ast = pcall(P.arith, text, "strict")
+	if not pok then
+		P.trap_flow(ast)
+	end
 	if not pok then -- the EXPANDED text isn't valid arithmetic: an arith error (bash), not a crash
 		arith_pre(sh, ast)
 		io.stderr:write("curse: " .. P.arith_errmsg(text, ast, depth0 ~= nil) .. "\n")
@@ -859,6 +871,9 @@ function M.arith_textual_eval(sh, raw, depth0)
 	local sv = in_expanded_text
 	in_expanded_text = true
 	local ok, v = pcall(eval, sh, ast)
+	if not ok then
+		P.trap_flow(v)
+	end
 	in_expanded_text = sv
 	if not ok then
 		error(v, 0)
@@ -1037,10 +1052,16 @@ eval = function(sh, e)
 		end
 		if e.fast and e.native == nil then
 			local nok, nat = pcall(P.arith, e.raw, true)
+			if not nok then
+				P.trap_flow(nat)
+			end
 			e.native = nok and nat or false -- (unparseable raw: the textual path reports it)
 		end
 		if e.fast and e.native then
 			local ok, r = pcall(eval, sh, e.native)
+			if not ok then
+				P.trap_flow(r)
+			end
 			if ok then
 				return r
 			end
@@ -1282,6 +1303,9 @@ function M.arith_read(sh, name)
 	-- needs no per-iter pcall. In a WORD/assignment `$((…))` bash instead ABORTS the rest
 	-- of the line (like a div0), so raise a lineabort the tier catches ($?=1, line skipped).
 	local ok, v = pcall(arith_resolve, sh, s)
+	if not ok then
+		P.trap_flow(v)
+	end
 	if ok then
 		return v
 	end
@@ -1355,6 +1379,9 @@ arith_key = function(sh, name, idxexpr, idxraw)
 	local sd = xpand_subdepth
 	xpand_subdepth = idxexpr.k == "xpand" and not in_expanded_text and 1 or nil
 	local ok, v = pcall(eval, sh, idxexpr)
+	if not ok then
+		P.trap_flow(v)
+	end
 	xpand_subdepth = sd
 	P.arith_cmd = sv
 	if not ok then
@@ -1401,6 +1428,9 @@ array_key = function(sh, name, index_raw)
 			-- (a syntax error: what bash evaluated before it ran first — `[x+]` with x holding
 			-- a bad expression reports x's error, not the `+`)
 			local pok, pe = pcall(arith_pre, sh, v)
+			if not pok then
+				P.trap_flow(pe)
+			end
 			if not pok then
 				if type(pe) == "table" and pe.__curse_unbound then
 					error(pe, 0)
@@ -1700,6 +1730,9 @@ expand_part_str = function(sh, p, assign)
 	elseif p.arith then -- cache the parsed AST on the part (a loop re-expanding the
 		if not p.arith_ast then -- same $((…)) shouldn't re-parse it)
 			local ok, ast = pcall(P.arith, p.arith)
+			if not ok then
+				P.trap_flow(ast)
+			end
 			if not ok then -- a syntax error in $(( )) fails the command, non-fatally (bash)
 				if not p.bracket and arith_comment(p.arith) then
 					-- (bash extracts `$((…))` as a command substitution at expansion time, where
@@ -1966,6 +1999,9 @@ local function valueless_part(sh, pe)
 		return nil
 	end
 	local ok, part = pcall(P.parse_paramexp, tostring(sh.nparams + 1) .. pe.iop)
+	if not ok then
+		P.trap_flow(part)
+	end
 	if not ok or not part then
 		return nil
 	end
@@ -2086,6 +2122,9 @@ indirect_part = function(sh, pe, quiet)
 		end
 	end
 	local ok, part = pcall(P.parse_paramexp, tname .. (pe.iop or ""))
+	if not ok then
+		P.trap_flow(part)
+	end
 	-- Mark the reconstructed part as coming through indirection: bash's `:-`/`:+`
 	-- null test on an array reached via `${!ref:-…}` keys on the element COUNT
 	-- (zero = null), unlike the DIRECT `${a[@]:-…}` which treats one empty element
@@ -2849,6 +2888,9 @@ local function apply_redirs(sh, redirs, cname, ctx, args) -- cname: the command 
 			if r.expand then
 				-- an unterminated $( in the body fails the redirection (bash: status 1)
 				local pok, pw = pcall(P.parse_heredoc, body, true)
+				if not pok then
+					P.trap_flow(pw)
+				end
 				if pok then
 					-- (a bad substitution names the whole body: bash expands it as one word)
 					sh.bs_word, sh.bs_depth = body, sh.subdepth
@@ -3039,6 +3081,9 @@ local func_body_text
 local function func_export_text(sh, name)
 	local txt = func_body_text(sh, name)
 	local ok, ast = pcall(P.parse, txt or "")
+	if not ok then
+		P.trap_flow(ast)
+	end
 	local st = ok and type(ast) == "table" and ast.stmts and ast.stmts[1]
 	if not (st and st.t == "funcdef") then
 		return nil
@@ -4893,6 +4938,9 @@ end
 function M.arith_eval_str(sh, s)
 	local ok, ast = pcall(P.arith, s == "" and "0" or s, sh.arith_expanded and "expanded" or nil)
 	if not ok then
+		P.trap_flow(ast)
+	end
+	if not ok then
 		arith_pre(sh, ast)
 		io.stderr:write("curse: " .. P.arith_errmsg(s, ast) .. "\n")
 		error({ __curse_exit = 1, __curse_matherr = true, __curse_experr = true })
@@ -4909,6 +4957,9 @@ function M.dbracket_arith(sh, s, textual)
 	if textual then -- (arith_expand_text output: its subscript escapes need the strict parse)
 		ok, v = pcall(function()
 			local pok, ast = pcall(P.arith, s == "" and "0" or s, "strict")
+			if not pok then
+				P.trap_flow(ast)
+			end
 			if not pok then
 				arith_pre(sh, ast)
 				io.stderr:write("curse: " .. P.arith_errmsg(s, ast) .. "\n")
@@ -5535,6 +5586,9 @@ exec_stmt = function(sh, st, hook)
 				local sv = P.arith_cmd
 				P.arith_cmd = "(("
 				local _, perr = pcall(P.arith, node.raw)
+				if not _ then
+					P.trap_flow(perr)
+				end
 				arith_pre(sh, perr)
 				io.stderr:write("curse: " .. P.arith_errmsg(node.raw, perr) .. "\n")
 				P.arith_cmd = sv
@@ -5724,6 +5778,9 @@ exec_stmt = function(sh, st, hook)
 		local sv = P.arith_cmd
 		P.arith_cmd = "((" -- (bash's this_command_name in its error messages)
 		local ok, v = pcall(eval, sh, st.expr)
+		if not ok then
+			P.trap_flow(v)
+		end
 		P.arith_cmd = sv
 		if ok then
 			sh.status = truth(v) and 0 or 1
@@ -5736,6 +5793,9 @@ exec_stmt = function(sh, st, hook)
 		-- (an arith error in an -eq operand makes just that primary false — eval_dbracket;
 		-- one expanding a WORD, `[[ a =~ $((1/0)) ]]`, abandons the line: DISCARD, bash)
 		local ok, v = pcall(eval_dbracket, sh, st.expr)
+		if not ok then
+			P.trap_flow(v)
+		end
 		if ok then
 			sh.status = v and 0 or 1
 		elseif type(v) == "table" and v.__curse_regexerr then
@@ -6349,6 +6409,9 @@ local function finish(sh, ok, err)
 	sh.eof_read = ok and not sh.opt_c or nil
 	if ok and (sh.jobs_waited or sh.jobs_pending) and sh.main_src and not sh.opt_c then
 		local okp, ast = pcall(P.parse, sh.main_src)
+		if not okp then
+			P.trap_flow(ast)
+		end
 		rt.jobs_line(sh, okp and ast.eofline or nil)
 	end
 	M.run_exit_trap(sh)
@@ -6452,6 +6515,9 @@ local function needs_more(buf)
 		return true
 	end
 	local ok, r = pcall(P.parse, buf)
+	if not ok then
+		P.trap_flow(r)
+	end
 	local perr = (not ok and tostring(r)) or (r and r.stmts and r.stmts[1] and r.stmts[1].t == "parse_error"
 		and tostring(r.stmts[1].msg)) or ""
 	return perr:find("unexpected end of file", 1, true) ~= nil or perr:find("unexpected EOF", 1, true) ~= nil

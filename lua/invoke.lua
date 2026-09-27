@@ -428,6 +428,9 @@ end
 local function pretty_print(sh, src)
 	local P, D = require("parser"), require("deparse")
 	local ok, ast = pcall(P.parse, src)
+	if not ok then
+		P.trap_flow(ast)
+	end
 	local out, lastnl, prev = {}, false, 1
 	local dp = D.posix
 	D.posix = true

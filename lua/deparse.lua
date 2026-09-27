@@ -57,6 +57,9 @@ local function norm_word(s)
 			i = i + 1 -- $"…": the parser drops the $ (the translated text stays double-quoted)
 		elseif c == "$" and s:sub(i + 1, i + 1) == "(" and s:sub(i + 2, i + 2) ~= "(" then
 			local ok, e = pcall(P.scan_cmdsub, s, i + 2)
+			if not ok then
+				P.trap_flow(e)
+			end
 			local body = ok and e and deparse_list(s:sub(i + 2, e - 2))
 			if body then -- (parse_comsub: a space keeps `$( (` from reading as `$((`)
 				out[#out + 1] = (body:sub(1, 1) == "(" and "$( " or "$(") .. body .. ")"
@@ -697,6 +700,9 @@ end
 -- doesn't parse or holds something unprintable (the caller keeps the text as is).
 deparse_list = function(src)
 	local ok, ast = pcall(P.parse, src)
+	if not ok then
+		P.trap_flow(ast)
+	end
 	if not ok or type(ast) ~= "table" or ast.perr then
 		return nil
 	end

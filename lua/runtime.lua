@@ -3128,6 +3128,9 @@ function Shell:capture_src(src, backtick, noalias, line0)
 	-- (line0: compiled code's command line — its sh.cur_line isn't kept per command)
 	local pok, parsed = pcall(P.parse, src, self, nil, noalias, nil, line0 or self.cur_cline or self.cur_line,
 		nil, nil, backtick)
+	if not pok then
+		require("parser").trap_flow(parsed)
+	end
 	if pok and type(parsed) == "table" then
 		P.mark_tail(parsed.stmts)
 	end
@@ -4021,7 +4024,10 @@ do
 	end
 	-- (a compile — parse, emit, the chunk's load — holds signals the same way: it runs
 	-- under pcalls that take any error for "doesn't compile", so a trap's `exit` raised
-	-- in it was swallowed and the script ran on: tier)
+	-- in it was swallowed and the script ran on: tier. A compile is not the only such
+	-- pcall: the RUNTIME classifiers — an arith value's parse/eval (arith_resolve,
+	-- emit.compile_arith_value), `let`, `[[ ]]`, a subscript, … — run outside any hold,
+	-- and each lets a trap's control flow through itself: parser.trap_flow)
 	M.defer_call = function(f, ...)
 		M.req_depth = M.req_depth + 1
 		return req_done(pcall(f, ...))
@@ -7624,6 +7630,9 @@ function M.arith_slot(sh, expr, line)
 	local ok, v
 	if expr.k == "arith_perr" then
 		local _, perr = pcall(P.arith, expr.raw)
+		if not _ then
+			require("parser").trap_flow(perr)
+		end
 		I._int.arith_pre(sh, perr)
 		io.stderr:write("curse: " .. P.arith_errmsg(expr.raw, perr) .. "\n")
 		ok = false
@@ -13180,12 +13189,18 @@ function M.array_key(sh, name, raw, expanded)
 			idx = { k = "xpand", raw = raw }
 		else
 			local pok, ast = pcall(require("parser").arith, raw, true)
+			if not pok then
+				require("parser").trap_flow(ast)
+			end
 			idx = pok and ast or false
 		end
 		SUBSCRIPT_AST[raw] = idx
 	end
 	if not idx then
 		local _, perr = pcall(require("parser").arith, raw)
+		if not _ then
+			require("parser").trap_flow(perr)
+		end
 		local pok, pe = pcall(require("interp")._int.arith_pre, sh, perr) -- (what ran before it)
 		if not pok and type(pe) == "table" and pe.__curse_unbound then
 			error(pe, 0)
