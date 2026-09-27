@@ -1422,19 +1422,28 @@ local collect_names, analyze_lift -- forward: defined with the lift analysis bel
 -- fragment, the shared expander, the command runner), in name order: the flush
 -- "sh:aset(n, v_n); …; ", the reload "v_n = sh:aget(n); …; " (skip: names left alone),
 -- and the reload as a suffix "; v_n = sh:aget(n); …". "" when nothing is lifted.
-local function lsync(lifted, skip)
-	local f, r = {}, {}
+-- The flush also counts the call in sh._sy and the reload uncounts it: while a synced call
+-- is out, sh holds the live values (the callee may have changed them), else the locals do.
+-- A line abort thrown through run() reads that to decide which to keep (tier.run_compiled).
+local function lifted_flush(lifted)
+	local f = {}
 	for n in spairs(lifted) do
 		f[#f + 1] = ("sh:aset(%q, %s); "):format(n, lname(n))
+	end
+	return table.concat(f)
+end
+local function lsync(lifted, skip)
+	local f, r = lifted_flush(lifted), {}
+	if f == "" then
+		return "", "", ""
+	end
+	for n in spairs(lifted) do
 		if not (skip and skip[n]) then
 			r[#r + 1] = ("%s = sh:aget(%q)"):format(lname(n), n)
 		end
 	end
-	return table.concat(f), #r > 0 and (table.concat(r, "; ") .. "; ") or "", #r > 0 and ("; " .. table.concat(r, "; ")) or ""
-end
--- (the flush alone: a fragment, which reads sh, sees the current values)
-local function lifted_flush(lifted)
-	return (lsync(lifted))
+	r[#r + 1] = "sh._sy = sh._sy - 1"
+	return "sh._sy = sh._sy + 1; " .. f, table.concat(r, "; ") .. "; ", "; " .. table.concat(r, "; ")
 end
 -- An expression `call` evaluated with the lifted locals synced around it (value v)
 function EF.lwrap(lifted, call, v)
@@ -7028,7 +7037,7 @@ H.pipeline = function(cx, st, after)
 	end
 	-- (a reload of the run-local lifted vars only: stages keep those in sh (a lastpipe
 	-- stage writes the shell's own); upvalues are swapped/restored by the scheduler)
-	local _, _, post = lsync(cx.lifted, EF.lifted_set)
+	local pflush, _, post = lsync(cx.lifted, EF.lifted_set)
 	local p = cx.newpc()
 	-- errexit/ERR are exempt for a `!`-inverted pipeline (bash: the -e setting is
 	-- ignored when the return value is inverted with !), regardless of the negated status.
@@ -7097,7 +7106,7 @@ H.pipeline = function(cx, st, after)
 		end
 	end
 	cx.blocks[p] = (n >= 2 and table.concat(sdbg) or "")
-		.. lifted_flush(cx.lifted)
+		.. pflush
 		.. (negspb and "sh.spb_neg = true; " or "")
 		.. ("sh:run_pipeline({%s}, %s, %s%s, %s)"):format(
 			table.concat(frags, ", "), st.negate and "true" or "false", kinds,
@@ -8449,7 +8458,7 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
 		-- wrapper can re-enter run at sh._ff with the pre-statement state intact (run
 		-- re-seeds lifted from sh). Once per TOP-LEVEL statement (never in a hot loop body).
 		-- Signal traps are delivered by the async VM hook (lib_cursesig.c), not polled here.
-		local wbs = lsync(cx.lifted)
+		local wbs = lifted_flush(cx.lifted)
 		local nxperr = {} -- [k]: the marker of the first syntax error at/after statement k
 		for k = #stmts, 1, -1 do
 			nxperr[k] = stmts[k].t == "parse_error" and mark[k] or nxperr[k + 1]
@@ -8532,6 +8541,11 @@ assemble = function(cfg, sig, opts)
 	elseif not opts.toplevel then
 		o[#o + 1] = ("  local pc = %d"):format(cfg.entry)
 	end
+	-- the run()-locals FIRST: slots 3.. (after sh, pc), where a line abort's handler reads
+	-- them off the stack (tier.run_compiled — the chunk may be stripped of local names)
+	for _, n in ipairs(opts.runlocals or {}) do
+		o[#o + 1] = ("  local %s = sh:aget(%q)"):format(lname(n), n)
+	end
 	if cfg.forlocals and #cfg.forlocals > 0 then -- (this activation's for-in loop states)
 		o[#o + 1] = "  local " .. table.concat(cfg.forlocals, ", ")
 	end
@@ -8555,9 +8569,6 @@ assemble = function(cfg, sig, opts)
 			o[#o + 1] = ('  sh.func_line[%q] = %d; sh.func_bline[%q] = %d; sh.func_file[%q] = rt.def_source(sh)'):format(
 				n, ln[1], n, ln[2], n)
 		end
-	end
-	for _, n in ipairs(opts.runlocals or {}) do
-		o[#o + 1] = ("  local %s = sh:aget(%q)"):format(lname(n), n)
 	end
 	-- a function's lifted locals: loaded by their `local` statement, never written back (the
 	-- call's local frame is dropped on return; a `local` that failed — readonly — isn't ours)
@@ -9188,7 +9199,17 @@ function M.emit(ast, opts)
 	for name in spairs(fncall) do
 		fc[#fc + 1] = ("[%q] = { src = %q, fn = %s }"):format(name, fnsrc[name], EF.upv_wrapped(fnlname(name)))
 	end
-	o[#o + 1] = ("return { run = run, loopPc = loopPc, stmtPc = stmtPc%s%s%s%s%s%s }"):format(
+	local lnames = {} -- (the lifted vars a line abort writes back: run()'s slots, the upvalues)
+	for _, n in ipairs(runlocals) do
+		lnames[#lnames + 1] = ("%q"):format(n)
+	end
+	local unames = {}
+	for _, n in ipairs(upvals) do
+		unames[#unames + 1] = ("%q"):format(n)
+	end
+	o[#o + 1] = ("return { run = run, loopPc = loopPc, stmtPc = stmtPc%s%s%s%s%s%s%s }"):format(
+		(#lnames > 0 and (", lrun = {" .. table.concat(lnames, ", ") .. "}") or "")
+			.. (#unames > 0 and (", lupv = {" .. table.concat(unames, ", ") .. "}, upvget = __upv_get") or ""),
 		next(top.loopFf or {}) and (", loopFf = " .. serialize(top.loopFf)) or "",
 		top.lgspan and (", lgspan = {" .. (function()
 			local o2 = {}

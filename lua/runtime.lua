@@ -359,6 +359,7 @@ function Shell.new()
 		shellname = "bash", -- the shell we're mimicking, from our invocation basename
 		-- (\s prompt escape, posix-when-sh). Set by the CLI.
 		start_time = os.time(), -- for $SECONDS
+		_sy = 0, -- (compiled code's synced calls out: emit's lsync, tier.run_compiled)
 		opt_e = false, -- set -e (errexit)
 		opt_u = false, -- set -u (nounset)
 		opt_C = false, -- set -C (noclobber)
@@ -3437,7 +3438,7 @@ do -- (a block of its own: the main chunk is at LuaJIT's 200-local limit)
 -- shallow copy for the body. (Deeper state — vars, the dynamic scopes, params, completion
 -- specs, history, cwd — is handled below.)
 local SUB_KEEP = { "hashpath", "tcwd", "random_plain", "shellopts_exported", "argv0", "sec_off",
-	"sec_int", "sec_cell", "start_time",
+	"sec_int", "sec_cell", "start_time", "_sy",
 	"subsh_off", "hosts", "nparams", "params", "getopts_state", "complete", "savedstack", "tenv" }
 local SUB_COPY = { "shopt", "functions", "dirstack", "hashcache", "bav", "fn_ro", "unset_specials",
 	"disabled_builtins" }
