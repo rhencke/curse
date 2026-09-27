@@ -5664,71 +5664,84 @@ end
 -- or a per-process value may move — $(…), `…`, <(…), ${x:=…}/${x:?…}, an assigning
 -- $((…)) or subscript, $RANDOM (the parent's sequence), $BASHPID/$! /$_ — and an operand
 -- word holding an expansion of its own is judged unsafe. Both tiers ask this (emit at
--- compile time, the interpreter per run), so `&` takes the same path everywhere.
-local BG_PURE_PEXP = { [""] = 1, ["-"] = 1, [":-"] = 1, ["+"] = 1, [":+"] = 1, ["#"] = 1, ["##"] = 1,
-	["%"] = 1, ["%%"] = 1, ["/"] = 1, ["//"] = 1, ["^"] = 1, ["^^"] = 1, [","] = 1, [",,"] = 1,
-	["~"] = 1, ["~~"] = 1, len = 1 }
-local BG_IMPURE_VAR = { RANDOM = 1, SRANDOM = 1, BASHPID = 1, ["!"] = 1, _ = 1 }
-local function bg_pure_arith(e)
-	if type(e) ~= "table" then
-		return true
-	end
-	local k = e.k
-	if k == "num" then
-		return true
-	elseif (k == "bin" and e.op ~= "/" and e.op ~= "%" and e.op ~= "**") or k == "un" or k == "tern" then
-		return bg_pure_arith(e.e) and bg_pure_arith(e.l) and bg_pure_arith(e.r)
-			and bg_pure_arith(e.c) and bg_pure_arith(e.a) and bg_pure_arith(e.b)
-	end
-	-- (asgn/pre/post/comma/xpand/parse errors, and anything that can fail — a variable
-	-- whose value isn't a number, / % ** — the child's to evaluate: its error, its line)
-	return false
-end
--- (an operand word: plain text and $name/${name} references only)
-local function bg_pure_operand(s)
-	if s:find("`", 1, true) then
+-- compile time, the interpreter per run — cached per word list), so `&` takes the same
+-- path everywhere.
+do
+	local BG_PURE_PEXP = { [""] = 1, ["-"] = 1, [":-"] = 1, ["+"] = 1, [":+"] = 1, ["#"] = 1, ["##"] = 1,
+		["%"] = 1, ["%%"] = 1, ["/"] = 1, ["//"] = 1, ["^"] = 1, ["^^"] = 1, [","] = 1, [",,"] = 1,
+		["~"] = 1, ["~~"] = 1, len = 1 }
+	local BG_IMPURE_VAR = { RANDOM = 1, SRANDOM = 1, BASHPID = 1, ["!"] = 1, _ = 1 }
+	local function bg_pure_arith(e)
+		if type(e) ~= "table" then
+			return true
+		end
+		local k = e.k
+		if k == "num" then
+			return true
+		elseif (k == "bin" and e.op ~= "/" and e.op ~= "%" and e.op ~= "**") or k == "un" or k == "tern" then
+			return bg_pure_arith(e.e) and bg_pure_arith(e.l) and bg_pure_arith(e.r)
+				and bg_pure_arith(e.c) and bg_pure_arith(e.a) and bg_pure_arith(e.b)
+		end
+		-- (asgn/pre/post/comma/xpand/parse errors, and anything that can fail — a variable
+		-- whose value isn't a number, / % ** — the child's to evaluate: its error, its line)
 		return false
 	end
-	local bad = false
-	s = s:gsub("%$({?)([%a_][%w_]*)(}?)", function(o, name, c)
-		if (o == "{") ~= (c == "}") or BG_IMPURE_VAR[name] then
-			bad = true
+	-- (an operand word: plain text and $name/${name} references only)
+	local function bg_pure_operand(s)
+		if s:find("`", 1, true) then
+			return false
 		end
-		return ""
-	end)
-	return not bad and not s:find("$", 1, true)
-end
--- Second result: the words reference a parameter, which under `set -u` may be unset — an
--- error the child reports, so the caller spawns only when nounset is off.
-function M.bg_pure_words(words)
-	local refs = false
-	for _, w in ipairs(words) do
-		for _, pt in ipairs(w.parts or {}) do
-			if pt.var or pt.param or pt.pexp or pt.special then
-				refs = true
+		local bad = false
+		s = s:gsub("%$({?)([%a_][%w_]*)(}?)", function(o, name, c)
+			if (o == "{") ~= (c == "}") or BG_IMPURE_VAR[name] then
+				bad = true
 			end
-			if pt.cmdsub or pt.procsub or pt.backtick or pt.arithast or pt.special == "!" or pt.special == "_"
-				or (pt.var and BG_IMPURE_VAR[pt.var]) then
-				return false
-			end
-			if pt.arith then
-				local ok, a = pcall(require("parser").arith, pt.arith)
-				if not ok then
-					require("parser").trap_flow(a)
+			return ""
+		end)
+		return not bad and not s:find("$", 1, true)
+	end
+	-- Second result: the words reference a parameter, which under `set -u` may be unset — an
+	-- error the child reports, so the caller spawns only when nounset is off.
+	local bg_pure_memo = setmetatable({}, { __mode = "k" })
+	local function bg_pure_words(words)
+		local refs = false
+		for _, w in ipairs(words) do
+			for _, pt in ipairs(w.parts or {}) do
+				if pt.var or pt.param or pt.pexp or pt.special then
+					refs = true
 				end
-				if not (ok and bg_pure_arith(a)) then
+				if pt.cmdsub or pt.procsub or pt.backtick or pt.arithast or pt.special == "!" or pt.special == "_"
+					or (pt.var and BG_IMPURE_VAR[pt.var]) then
+					return false
+				end
+				if pt.arith then
+					local ok, a = pcall(require("parser").arith, pt.arith)
+					if not ok then
+						require("parser").trap_flow(a)
+					end
+					if not (ok and bg_pure_arith(a)) then
+						return false
+					end
+				end
+				local pe = pt.pexp
+				if pe and (not BG_PURE_PEXP[pe.op or ""] or BG_IMPURE_VAR[pe.name]
+					or (pe.index and not pe.index:match("^[%d@*]*$")) -- (a subscript naming a variable: arith)
+					or (pe.arg and not bg_pure_operand(pe.arg))) then
 					return false
 				end
 			end
-			local pe = pt.pexp
-			if pe and (not BG_PURE_PEXP[pe.op or ""] or BG_IMPURE_VAR[pe.name]
-				or (pe.index and not pe.index:match("^[%d@*]*$")) -- (a subscript naming a variable: arith)
-				or (pe.arg and not bg_pure_operand(pe.arg))) then
-				return false
-			end
 		end
+		return true, refs
 	end
-	return true, refs
+	function M.bg_pure_words(words)
+		local v = bg_pure_memo[words]
+		if v == nil then
+			local pure, refs = bg_pure_words(words)
+			v = pure and (refs and 2 or 1) or 0
+			bg_pure_memo[words] = v
+		end
+		return v ~= 0, v == 2
+	end
 end
 
 -- `ext args… &` where the args are side-effect-free: the shell already built argv, so

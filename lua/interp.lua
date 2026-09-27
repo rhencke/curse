@@ -5278,7 +5278,6 @@ function SIMPLE.redirs(rs, sh, argv, spec)
 	end
 	return ok
 end
-local BG_PURE = setmetatable({}, { __mode = "k" }) -- (the background handler's rt.bg_pure_words, per command)
 exec_stmt = function(sh, st, hook)
 	local t = st.t
 	if t == "noop" then -- (a command that alias-expanded to a comment)
@@ -5758,12 +5757,7 @@ exec_stmt = function(sh, st, hook)
 		-- runtime declines (a function/builtin, xtrace, …) runs it as a task instead.
 		local pure, refs
 		if cmd.t == "simple" and cmd.words and cmd.words[1] and not cmd.redirs and not cmd.assigns then
-			local bp = BG_PURE[cmd] -- (per statement: the words don't change)
-			if not bp then
-				bp = { rt.bg_pure_words(cmd.words) }
-				BG_PURE[cmd] = bp
-			end
-			pure, refs = bp[1], bp[2]
+			pure, refs = rt.bg_pure_words(cmd.words)
 		end
 		if pure and not (refs and sh.opt_u) then
 			local args = {}
