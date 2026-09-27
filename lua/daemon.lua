@@ -326,6 +326,14 @@ local function serve_request(cfd, req, fds, ctx)
 		pcall(rt.sched_drain, sh)
 		drained = true
 	end
+	-- (the script's still-running real-pid jobs — `sleep 9 &` spawned directly — stay this
+	-- worker's children after it: bash's would go to init. Reaped as they end, by this and
+	-- every later request's reap points; never zombies left for another script's `ps` to see)
+	for _, j in ipairs(sh.jobs or {}) do
+		if not j.done and not j.g and j.pid and j.pid > 0 then
+			rt.internal_pids[j.pid] = true
+		end
+	end
 	pcall(rt.reap_orphans) -- (children no job waits for any more: never zombies on the worker)
 	-- SCRUB per-request process state (the fork boundary used to do this):
 	C.umask(ctx.umask) -- a script's `umask` doesn't persist
