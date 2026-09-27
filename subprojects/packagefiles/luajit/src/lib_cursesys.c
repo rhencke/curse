@@ -104,6 +104,7 @@ extern char regcomp[];
 extern char regexec[];
 extern char regfree[];
 extern char setenv[];
+extern char setitimer[];
 extern char setlocale[];
 extern char setpgid[];
 extern char setpwent[];
@@ -242,6 +243,7 @@ static const curse_sym_t curse_syms[] = {
   { "regexec", (void*)regexec },
   { "regfree", (void*)regfree },
   { "setenv", (void*)setenv },
+  { "setitimer", (void*)setitimer },
   { "setlocale", (void*)setlocale },
   { "setpgid", (void*)setpgid },
   { "setpwent", (void*)setpwent },

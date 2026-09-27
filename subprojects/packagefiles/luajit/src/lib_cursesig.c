@@ -43,6 +43,11 @@ static void curse_sig_hook(lua_State *L, lua_Debug *ar)
   int s;
   (void)ar;
   lua_sethook(L, (lua_Hook)0, 0, 0);
+#ifdef CURSE_SIG_DESTRUCTIVE
+  /* Back in the interpreter: undo the preemption patches (a trace reaching the
+   * interpreter through a patched tail jmp's trampoline skips lj_trace_exit). */
+  { extern void curse_sig_unpatch_all(void); curse_sig_unpatch_all(); }
+#endif
   if (getpid() != curse_sig_pid) { curse_sig_num = 0; return; } /* inherited across fork: skip */
   s = (int)curse_sig_num;
   curse_sig_num = 0;
@@ -149,7 +154,10 @@ static void curse_preempt_onsignal(int s)
   (void)s;
   curse_preempt_flag = 1;
 #ifdef CURSE_SIG_DESTRUCTIVE
-  { extern void curse_sig_patch_trace(void); curse_sig_patch_trace(); }
+  /* Only the running loop's back-edge: the flag is re-read at every loop head,
+   * i.e. at every root trace entry, so a side trace linking back to its root
+   * sees it anyway -- and no VM hook is scheduled here to undo a tail-jmp patch. */
+  { extern void curse_sig_patch_trace_mode(int); curse_sig_patch_trace_mode(0); }
 #endif
 }
 
