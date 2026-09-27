@@ -2198,6 +2198,7 @@ local function db_operand(w, lifted)
 	return db_fallback(w, lifted, "rt.db_word")
 end
 local emit_dbracket_node -- (the set -x layer over this, below)
+local db_textsub -- (forward: an arith operand read the textual way, below)
 local function emit_dbracket_node0(node, lifted)
 	local k = node.kind
 	if k == "and" or k == "or" then
@@ -2248,13 +2249,18 @@ local function emit_dbracket_node0(node, lifted)
 		return ("rt.file_test(%q, %s)"):format(op, val)
 	elseif k == "binary" then
 		local op = node.op
-		if ARITH_CMP[op] and not (db_word_ok(node.l) and db_word_ok(node.r)) then
+		local textsub = db_textsub
+		if ARITH_CMP[op] and not (db_word_ok(node.l) and db_word_ok(node.r) and not textsub(node.l) and not textsub(node.r)) then
 			-- an operand emit can't render: bash 5.2 expands an arithmetic operator's operand
 			-- like $((…)) text (no process substitution, subscripts kept) unless it's quoted —
 			-- interp's arith_expand_text + dbracket_arith (rt.db_arith_text); a quoted one is a
 			-- plain word value (rt.db_word) read as arithmetic
 			local function side(w)
-				if db_word_ok(w) then
+				if w.xsub then -- (static text, its subscripts quoted: read as the textual path's)
+					local v = db_word_ok(w) and emit_word(w, lifted) or db_fallback(w, lifted, "rt.db_word")
+					return v and ("rt.db_arith_quoted(sh, %s)"):format(v)
+				end
+				if db_word_ok(w) and not textsub(w) then
 					return ("rt.db_arith(sh, %s)"):format(emit_word(w, lifted))
 				end
 				if w.src and not w.src:find("['\"\\]") then
@@ -2344,6 +2350,12 @@ local function emit_dbracket_node0(node, lifted)
 	return nil
 end
 
+-- An arithmetic operand of [[ ]] read the textual way (interp's): an unquoted one with a `[`
+-- — its subscripts as bash's Q_ARITH expansion reads them (arith_expand_text) — or one whose
+-- subscripts' text the parser quoted (xsub: parser.cond_arith_word)
+db_textsub = function(w)
+	return w.xsub or (w.src and w.src:find("[", 1, true) and not w.src:find("['\"\\]")) or false
+end
 -- set -x: each primary traces as it is evaluated, operands expanded (`+ [[ -n x ]]`, a
 -- negated one `+ [[ ! -f y ]]` — not a parenthesized one): rt.xdb1 traces and hands back
 -- the operand; rt.xdb2 traces and parks both operands in rt._xl/_xr for the comparison
@@ -2391,6 +2403,18 @@ emit_dbracket_node = function(node, lifted, xn)
 		if node.op == "=~" then -- (traced as its regex text: quoted ERE metachars backslashed)
 			r = EF.emit_regex_glob(node.r, lifted) or r
 			return plain({ l = raw(("rt.xdb1(sh, %s, nil, %s, %s)"):format(neg, l, r)) })
+		end
+		if ARITH_CMP[node.op] and (db_textsub(node.l) or db_textsub(node.r)) then
+			-- (a textual operand traces as its $((…))-style expansion, compared as such:
+			-- rt.db_arith_quoted — interp's dbracket_arith of arith_expand_text's output)
+			local function tv(w)
+				return (db_textsub(w) and not w.xsub) and ("rt.arith_text(sh, %q)"):format(w.src) or val(w)
+			end
+			local function cmpv(w, x)
+				return db_textsub(w) and ("rt.db_arith_quoted(sh, %s)"):format(x) or ("rt.db_arith(sh, %s)"):format(x)
+			end
+			return ("(rt.xdb2(sh, %s, %q, %s, %s, nil) and rt.db_ok(sh, %s %s %s))"):format(neg, node.op,
+				tv(node.l), tv(node.r), cmpv(node.l, "rt._xl"), ARITH_CMP[node.op], cmpv(node.r, "rt._xr"))
 		end
 		local n2 = { l = raw("rt._xl") }
 		local pop, xq = node.op == "==" or node.op == "=" or node.op == "!=", "nil"

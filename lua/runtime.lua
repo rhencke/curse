@@ -15870,12 +15870,15 @@ end
 -- A [[ ]] arithmetic operand as WRITTEN (unquoted, not renderable by emit): interp's textual
 -- path — arith_expand_text (like $((…)): no process substitution) then dbracket_arith —
 -- with db_arith's error rule (an arith error makes this primary false).
-function M.db_arith_text(sh, src)
+function M.db_arith_text(sh, src, expanded)
 	if sh.db_err then
 		return i64(0)
 	end
 	local I = require("interp")
-	local ok, v = pcall(I._int.arith_expand_text, sh, src)
+	local ok, v = true, expanded
+	if not expanded then
+		ok, v = pcall(I._int.arith_expand_text, sh, src)
+	end
 	if ok then
 		ok, v = pcall(I.dbracket_arith, sh, v, true)
 	end
@@ -15887,6 +15890,15 @@ function M.db_arith_text(sh, src)
 		return i64(0)
 	end
 	error(v, 0)
+end
+-- …its $((…))-style expansion (interp's arith_expand_text: a traced operand's value)
+function M.arith_text(sh, src)
+	return require("interp")._int.arith_expand_text(sh, src)
+end
+-- …an operand whose subscripts the parser quoted (parser.cond_arith_word: `[[:a:]]` read as
+-- `[\[:a:\]]`), its word value `v` read the same way
+function M.db_arith_quoted(sh, v)
+	return M.db_arith_text(sh, nil, v)
 end
 function M.db_arith(sh, s)
 	if sh.db_err then

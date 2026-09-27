@@ -4972,9 +4972,12 @@ local function eval_dbracket(sh, node)
 			-- bash 5.2 expands an arithmetic operator's operands like $((…)): no process
 			-- substitution, and subscripts quoted (`index[7<(4+2)]` is arithmetic) — but
 			-- quotes are removed first (`[[ '3' -eq 3 ]]`): a quoted operand is a plain word
-			textual, rtextual = not node.l.src:find("['\"\\]"), not node.r.src:find("['\"\\]")
-			l = textual and arith_expand_text(sh, node.l.src) or dbracket_word(sh, node.l)
-			r = rtextual and arith_expand_text(sh, node.r.src) or dbracket_word(sh, node.r)
+			-- (xsub: its subscripts' text quoted — parser.cond_arith_word — the word's static
+			-- value, read as the textual path's)
+			textual = node.l.xsub or not node.l.src:find("['\"\\]")
+			rtextual = node.r.xsub or not node.r.src:find("['\"\\]")
+			l = (textual and not node.l.xsub) and arith_expand_text(sh, node.l.src) or dbracket_word(sh, node.l)
+			r = (rtextual and not node.r.xsub) and arith_expand_text(sh, node.r.src) or dbracket_word(sh, node.r)
 		elseif op == "=~" then -- (each operand expanded ONCE; the trace shows the regex text)
 			l = dbracket_word(sh, node.l)
 			pat = M.regex_rhs(sh, node.r)
