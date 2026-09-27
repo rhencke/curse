@@ -22,7 +22,8 @@ test/stress/run.sh --list                       # every test and what it guards
 | `-t X` | 1.0 | scale every per-run timeout |
 | `-r DIR` | `build/stress-results/<time>` | results dir |
 | `-m LIST` | `interp,compiled,tiered,dcold,dwarm` | the curse shells |
-| `--oracle PATH` | `$H_ORACLE`, `build/oracle/bash`, `/tmp/claude-1000/w4bash/bash` | bash **5.2.21** (any other version is refused) |
+| `--oracle PATH` | `$H_ORACLE`, else the in-tree build: `$STRESS_BUILD/test/oracle/bash`, `build/test/oracle/bash` (then the legacy `…/oracle/bash`) | bash **5.2.21** (any other version is refused) |
+| `STRESS_SCRATCH` (env) | `${TMPDIR:-/tmp}` | where the per-run scratch dir (`stress.XXXXXX`: helper binary, shims, daemon socket + cache) is made |
 
 ## The shells and the comparison
 

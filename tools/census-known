@@ -1,0 +1,68 @@
+# Known census findings (tools/delegate-census.lua --modes --check): a ratchet. Each line is
+# COUNT<TAB>KEY  # the work item that removes it. The meson census tests fail on any key
+# not listed here, on a count that moved (full run), and on a listed key that is gone —
+# update this file in the same commit as the fix. nocompile must stay 0.
+#
+# W8: emit with trap_debug + trapline (DEBUG trap inside a trap handler: modes D+H) emits
+# Lua that does not load ("unexpected symbol near ';'"): 289 programs as fragments, 36
+# line-mode lines. The tier then falls back to the interpreter for them.
+289	LOADFAIL [DHL] unexpected symbol near ';'  # W8 trap_debug+trapline codegen
+289	LOADFAIL [DH] unexpected symbol near ';'  # W8 trap_debug+trapline codegen
+289	LOADFAIL [EDHL] unexpected symbol near ';'  # W8 trap_debug+trapline codegen
+289	LOADFAIL [EDH] unexpected symbol near ';'  # W8 trap_debug+trapline codegen
+36	LOADFAIL lm[DHL] unexpected symbol near ';'  # W8 trap_debug+trapline codegen
+36	LOADFAIL lm[DH] unexpected symbol near ';'  # W8 trap_debug+trapline codegen
+36	LOADFAIL lm[EDHL] unexpected symbol near ';'  # W8 trap_debug+trapline codegen
+36	LOADFAIL lm[EDH] unexpected symbol near ';'  # W8 trap_debug+trapline codegen
+# queue.md "census": a whole program past Lua's 200-locals limit (250 top-level
+# assignments, lifted to locals) LOADFAILs; `run.lua SCRIPT compiled` dies with it
+# (tiered falls back). The fragment form of the same program loads.
+1	LOADFAIL function at line 4532 has more than 200 local vari  # queue: census 200-locals
+1	LOADFAIL function at line 8 has more than 200 local variabl  # queue: census 200-locals
+# queue.md "census": these programs compile whole, but as fragments (eval/trap/OSR/line
+# text) the emitter refuses a `local` / `echo` statement ("no compiled form"): 2530,
+# array-assign#9 and friends, in every mode.
+3	fragment[B] no compiled form: simple local  # queue: census fragment refusals
+3	fragment[DHL] no compiled form: simple local  # queue: census fragment refusals
+3	fragment[DH] no compiled form: simple local  # queue: census fragment refusals
+3	fragment[DL] no compiled form: simple local  # queue: census fragment refusals
+3	fragment[D] no compiled form: simple local  # queue: census fragment refusals
+3	fragment[EDHL] no compiled form: simple local  # queue: census fragment refusals
+3	fragment[EDH] no compiled form: simple local  # queue: census fragment refusals
+3	fragment[EDL] no compiled form: simple local  # queue: census fragment refusals
+3	fragment[ED] no compiled form: simple local  # queue: census fragment refusals
+3	fragment[EHL] no compiled form: simple local  # queue: census fragment refusals
+3	fragment[EH] no compiled form: simple local  # queue: census fragment refusals
+3	fragment[EL] no compiled form: simple local  # queue: census fragment refusals
+3	fragment[E] no compiled form: simple local  # queue: census fragment refusals
+3	fragment[F] no compiled form: simple local  # queue: census fragment refusals
+3	fragment[HL] no compiled form: simple local  # queue: census fragment refusals
+3	fragment[H] no compiled form: simple local  # queue: census fragment refusals
+3	fragment[L] no compiled form: simple local  # queue: census fragment refusals
+3	fragment[P] no compiled form: simple local  # queue: census fragment refusals
+3	fragment[T] no compiled form: simple local  # queue: census fragment refusals
+3	fragment[V] no compiled form: simple local  # queue: census fragment refusals
+3	fragment[X] no compiled form: simple local  # queue: census fragment refusals
+3	fragment[] no compiled form: simple local  # queue: census fragment refusals
+2	fragment[B] no compiled form: simple echo  # queue: census fragment refusals
+2	fragment[DHL] no compiled form: simple echo  # queue: census fragment refusals
+2	fragment[DH] no compiled form: simple echo  # queue: census fragment refusals
+2	fragment[DL] no compiled form: simple echo  # queue: census fragment refusals
+2	fragment[D] no compiled form: simple echo  # queue: census fragment refusals
+2	fragment[EDHL] no compiled form: simple echo  # queue: census fragment refusals
+2	fragment[EDH] no compiled form: simple echo  # queue: census fragment refusals
+2	fragment[EDL] no compiled form: simple echo  # queue: census fragment refusals
+2	fragment[ED] no compiled form: simple echo  # queue: census fragment refusals
+2	fragment[EHL] no compiled form: simple echo  # queue: census fragment refusals
+2	fragment[EH] no compiled form: simple echo  # queue: census fragment refusals
+2	fragment[EL] no compiled form: simple echo  # queue: census fragment refusals
+2	fragment[E] no compiled form: simple echo  # queue: census fragment refusals
+2	fragment[F] no compiled form: simple echo  # queue: census fragment refusals
+2	fragment[HL] no compiled form: simple echo  # queue: census fragment refusals
+2	fragment[H] no compiled form: simple echo  # queue: census fragment refusals
+2	fragment[L] no compiled form: simple echo  # queue: census fragment refusals
+2	fragment[P] no compiled form: simple echo  # queue: census fragment refusals
+2	fragment[T] no compiled form: simple echo  # queue: census fragment refusals
+2	fragment[V] no compiled form: simple echo  # queue: census fragment refusals
+2	fragment[X] no compiled form: simple echo  # queue: census fragment refusals
+2	fragment[] no compiled form: simple echo  # queue: census fragment refusals

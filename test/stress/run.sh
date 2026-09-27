@@ -96,7 +96,8 @@ done
 [ -n "$RESULTS" ] || RESULTS=$BUILD/stress-results/$(date +%Y%m%d-%H%M%S)
 mkdir -p "$RESULTS" || exit 2
 RESULTS=$(cd "$RESULTS" && pwd)
-SCR=$(mktemp -d "${STRESS_SCRATCH:-/tmp/claude-1000}/stress.XXXXXX") || exit 2
+# scratch: STRESS_SCRATCH, else ${TMPDIR:-/tmp} (nothing machine-specific: it runs off this box)
+SCR=$(mktemp -d "${STRESS_SCRATCH:-${TMPDIR:-/tmp}}/stress.XXXXXX") || exit 2
 BIN=$SCR/bin
 mkdir -p "$BIN/oracle" "$BIN/direct" "$BIN/daemon" "$SCR/xdg" "$SCR/dcache"
 chmod 700 "$SCR/xdg"

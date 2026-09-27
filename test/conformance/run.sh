@@ -10,9 +10,26 @@
 #   oil    subprojects/oil/spec/*.test.sh   Oils spec cases that target bash
 #                                            (Meson subproject)
 #
-# stderr is not compared (error wording is a later-milestone concern), matching
-# curse's historical conformance metric. dash is scored only where it supports the
-# test: a dash parse error (status 2) where bash parsed fine counts N/A, not fail.
+# STDERR is compared too, for the cases corpus (curse's own scripts; --stderr CORPORA or
+# H_STDERR picks others, --stderr none turns it off): after the shell's stdout and status
+# match bash's, its stderr must match bash's once both are normalised — the script path
+# and $0, THIS_SH, the unit's cwd/TMPDIR, mktemp names and `time` figures. Numbers that
+# vary between runs (pids — curse's synthetic ones ≥4194305 included —, times) are matched
+# as for stdout: bash is rerun, and a line bash itself varies on matches with its digit runs
+# masked. A difference is a FAIL with reason `stderr`. dash's stderr is never compared (its
+# wording is not bash's), and dash is scored only where it supports the test: a dash parse
+# error (status 2) where bash parsed fine counts N/A, not fail.
+#
+# KNOWN DIFFERENCES: test/conformance/known-diffs lists, one per line with its reason (for a
+# real curse bug, the queue entry that tracks it), `CORPUS TESTID stderr` (that test's
+# stderr differs: not compared as a failure) or `CORPUS TESTID SHELL` (that shell's FAIL is
+# scored KNOWN). The list is a ratchet: an entry that no longer differs is STALE, which
+# fails the run until it is removed.
+#
+# EXIT STATUS: 1 when any curse run FAILs (output, status, stderr or timeout), or when the
+# ORACLE timed out on a `cases` test (curse's own case with no oracle to score it is a
+# broken case, not a pass); otherwise 0. (An oracle timeout in the bash/oil suites is
+# reported, not failed: those tests are upstream's.) Setup errors (no oracle, …) exit 2.
 #
 # The harness starts a PRIVATE cursed (its own $XDG_RUNTIME_DIR socket + a persistent
 # $XDG_CACHE_HOME) and runs curse through the C client, scored as two shells: curse-cold
@@ -38,7 +55,11 @@
 #
 # Usage:
 #   test/conformance/run.sh [--corpus cases|bash|oil|all] [--jobs N] [--timeout S]
-#                           [--shells a,b,c] [--results FILE] [--oracle BASH] [-v|--verbose] [FILTER...]
+#                           [--shells a,b,c] [--results FILE] [--oracle BASH] [--stderr CORPORA|none]
+#                           [-v|--verbose] [FILTER...]
+#   --shells: from dash, curse-cold, curse-hot (the daemon, cold then warm cache) and
+#   curse-interp (lua/run.lua SCRIPT interp: the tree-walking interpreter alone, no OSR —
+#   what OSR would otherwise hide from curse-cold).
 #   --oracle / H_ORACLE: the oracle bash; default build/test/oracle/bash (meson builds it
 #   from the vendored 5.2.21). Its $BASH_VERSION must be 5.2.21(…), or nothing runs.
 #   FILTER: substrings; only test files whose name matches one are run.
@@ -92,6 +113,11 @@ if [ "${1:-}" = --run-unit ]; then
       curse) ( cd "$cwd" && PATH="$H_ORACLE_DIR:$PATH" TMP="$cwd" HOME="$cwd" TMPDIR="$tmpd" XDG_RUNTIME_DIR="$H_XDG_RUNTIME" XDG_CACHE_HOME="$ucache" \
                  CURSE_FALLBACK="$H_FALLBACK" THIS_SH="$H_THIS_SH" \
                  timeout "$lim" "$H_CLIENT" "$runscript" </dev/null ) ;;
+      # curse's interpreter alone (no daemon, no OSR), from the built bundle; a script that
+      # runs $THIS_SH gets curse run directly too (the static build/curse, tiered), not the daemon
+      curse-interp) ( cd "$cwd" && PATH="$H_ORACLE_DIR:$PATH" TMP="$cwd" HOME="$cwd" TMPDIR="$tmpd" XDG_RUNTIME_DIR="$H_XDG_RUNTIME" XDG_CACHE_HOME="$ucache" \
+                 CURSE_FALLBACK="$H_FALLBACK" THIS_SH="$H_THIS_SH_DIRECT" CURSE_BUNDLE="$H_BUNDLE" \
+                 timeout "$lim" "$H_LUAJIT" "$H_REPO_LUA/run.lua" "$runscript" interp </dev/null ) ;;
     esac
   }
 
@@ -154,10 +180,12 @@ if [ "${1:-}" = --run-unit ]; then
   run_shell() {
     nrun=$((nrun + 1)); local f="$ofile.$nrun" s
     # (9>&-: the shared-paths lock below is the harness's, not the test's)
-    prep; s=$(now_us); one "$1" >"$f" 2>/dev/null 9>&-; R_ST=$?; R_DUR=$(( $(now_us) - s ))
+    prep; s=$(now_us); one "$1" >"$f" 2>"$f.err" 9>&-; R_ST=$?; R_DUR=$(( $(now_us) - s ))
     # (stop the clock BEFORE reading the output: that cat is a fork+exec, and the
     # oracle's time excludes it)
-    R_OUT=$(cat "$f" 2>/dev/null)
+    { R_OUT=$(cat "$f" 2>/dev/null); } 2>/dev/null  # (bash drops a NUL byte: quietly)
+    # (a NUL byte is kept, spelled \0: $(…) would drop it, with a warning on OUR stderr)
+    R_ERR=""; [ -n "$cmp_err" ] && R_ERR=$(sed "${norm_sed[@]}" "$f.err" 2>/dev/null | sed "s/\x0/\\\\0/g")
     # timeout(1) exits 124 when it killed the command; a script exiting 124 by itself
     # before the limit is not a timeout
     R_TO=0; [ "$R_ST" -eq 124 ] && [ "$R_DUR" -ge $(( lim * 1000000 )) ] && { R_TO=1; quiesce "$f"; }
@@ -179,7 +207,7 @@ if [ "${1:-}" = --run-unit ]; then
       for k in 0 1 2; do
         run_shell bash
         # (bash_produces reuses these reruns: a slow test isn't rerun more than 8 times)
-        bruns[k]=$R_OUT; bsts[k]=$R_ST; [ "$R_TO" -eq 1 ] && { bsts[k]=timeout; continue; }
+        bruns[k]=$R_OUT; bsts[k]=$R_ST; berrs[k]=$R_ERR; [ "$R_TO" -eq 1 ] && { bsts[k]=timeout; continue; }
         b2st=$R_ST; b2out=$R_OUT
         [ "$b2out" != "$bout" ] && break
       done
@@ -191,15 +219,15 @@ if [ "${1:-}" = --run-unit ]; then
     for ((k = 0; k < 8; k++)); do
       if [ -n "${bruns[k]+x}" ]; then o=${bruns[k]}; st=${bsts[k]}
       else run_shell bash; o=$R_OUT; st=$R_ST; [ "$R_TO" -eq 1 ] && st=timeout
-        bruns[k]=$o; bsts[k]=$st; fi
+        bruns[k]=$o; bsts[k]=$st; berrs[k]=$R_ERR; fi
       [ "$st" != timeout ] && [ "$o" = "$1" ] && [ "$st" -eq "$2" ] && return 0
     done
     return 1
   }
-  bruns=(); bsts=()
-  nondet_match() {  # $1 out: equal to bash's up to the digits of lines bash itself varies on
+  bruns=(); bsts=(); berrs=()
+  nondet_match() {  # $1 out [$2 bash's  $3 bash rerun's]: equal to bash's up to the digits of lines bash itself varies on
     local -a A B C; local k
-    mapfile -t A <<<"$bout"; mapfile -t B <<<"$b2out"; mapfile -t C <<<"$1"
+    mapfile -t A <<<"${2-$bout}"; mapfile -t B <<<"${3-$b2out}"; mapfile -t C <<<"$1"
     [ ${#A[@]} -eq ${#B[@]} ] && [ ${#A[@]} -eq ${#C[@]} ] || return 1
     for ((k = 0; k < ${#A[@]}; k++)); do
       if [ "${A[k]}" = "${B[k]}" ]; then [ "${C[k]}" = "${A[k]}" ] || return 1
@@ -207,6 +235,22 @@ if [ "${1:-}" = --run-unit ]; then
         [ "${A[k]//+([0-9])/N}" = "${B[k]//+([0-9])/N}" ] && [ "${C[k]//+([0-9])/N}" = "${A[k]//+([0-9])/N}" ] || return 1
       fi
     done
+  }
+  # err_matches ERR: the shell's (normalised) stderr is bash's — verbatim, or as one of
+  # bash's reruns (≤8, only on a mismatch; shared with bash_produces), or equal up to the
+  # digit runs of the lines two bash runs differ on (pids, times).
+  err_matches() {
+    [ "$1" = "$berr" ] && return 0
+    local k
+    for ((k = 0; k < 8; k++)); do
+      if [ -z "${bruns[k]+x}" ]; then run_shell bash; bruns[k]=$R_OUT; bsts[k]=$R_ST; berrs[k]=$R_ERR
+        [ "$R_TO" -eq 1 ] && bsts[k]=timeout; fi
+      [ "${bsts[k]}" = timeout ] && continue
+      [ "$1" = "${berrs[k]}" ] && return 0
+      [ "${berrs[k]}" != "$berr" ] && nondet_match "$1" "$berr" "${berrs[k]}" && return 0
+      [ "$k" -ge 2 ] && [ "${berrs[k]}" = "$berr" ] && [ "${berrs[k-1]}" = "$berr" ] && return 1  # bash is stable here
+    done
+    return 1
   }
   shopt -s extglob
   # result row: corpus \t shell \t verdict \t duration_us \t testid \t why
@@ -221,6 +265,7 @@ if [ "${1:-}" = --run-unit ]; then
   #   status          stdout matched, exit status didn't
   #   output          exit status matched, stdout didn't
   #   output+status   neither
+  #   stderr          stdout and status matched, (normalised) stderr didn't
   emit_row() {  # $1 shell  $2 out  $3 status  $4 duration_us  $5 timed-out -> verdict row
     local v=FAIL why=-
     if [ "$btimeout" -eq 1 ]; then v=OTIMEOUT why=oracle-timeout
@@ -233,11 +278,21 @@ if [ "${1:-}" = --run-unit ]; then
     elif [ "$2" = "$bout" ]; then why=status
     elif [ "$3" -eq "$bst" ]; then why=output
     else why=output+status; fi
+    # stderr: only once stdout + status agree, for curse, where the corpus compares it
+    if [ "$v" = PASS ] && [ -n "$cmp_err" ] && [ "$1" != dash ] && ! err_matches "$6"; then
+      if [ -n "$known_err" ]; then why=stderr-known; err_differed=1; else v=FAIL why=stderr; fi
+    fi
+    [ "$v" != PASS ] && [ "$1" != dash ] && any_nonpass=1
+    # a known difference (known-diffs): KNOWN, not FAIL; one that PASSes now is stale
+    case " $known_shells " in *" $1 "*)
+      if [ "$v" = FAIL ]; then v=KNOWN; elif [ "$v" = PASS ]; then echo "$corpus $testid $1" >> "$workdir/stale/$id"; fi ;;
+    esac
     printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$corpus" "$1" "$v" "$4" "$testid" "$why" >> "$res"
     # H_DIFF_DIR=dir: keep a failing test's expected (bash) and actual output + statuses
-    if [ "$v" = FAIL ] && [ -n "${H_DIFF_DIR:-}" ]; then
+    if { [ "$v" = FAIL ] || [ "$v" = KNOWN ] || [ "$why" = stderr-known ]; } && [ -n "${H_DIFF_DIR:-}" ]; then
       printf '%s\n[status %s]\n' "$bout" "$bst" > "$H_DIFF_DIR/$testid.expected"
       printf '%s\n[status %s%s; %s]\n' "$2" "$3" "$( [ "$5" -eq 1 ] && echo ", TIMED OUT after ${lim}s")" "$why" > "$H_DIFF_DIR/$testid.$1"
+      [ -n "$cmp_err" ] && { printf '%s\n' "$berr" > "$H_DIFF_DIR/$testid.expected.err"; printf '%s\n' "$6" > "$H_DIFF_DIR/$testid.$1.err"; }
     fi
   }
   # A test that uses a FIXED path outside its own dirs — /tmp/redir-test (bash redir.tests),
@@ -262,7 +317,22 @@ if [ "${1:-}" = --run-unit ]; then
     exec 9>>/tmp/curse-harness-shared-paths.lock && flock 9
   fi
 
-  run_shell bash; bst=$R_ST; bdur=$R_DUR; bout=$R_OUT; btimeout=$R_TO
+  # Is stderr compared for this unit? (its corpus is in H_STDERR, and it isn't opted out)
+  # (and what is known to differ: test/conformance/known-diffs)
+  known=$( [ -f "$H_KNOWN" ] && awk -v c="$corpus" -v t="$testid" '$1==c && $2==t {print $3}' "$H_KNOWN")
+  known_err=""; known_shells=" "; err_differed=""; any_nonpass=""
+  for k in $known; do [ "$k" = stderr ] && known_err=1 || known_shells+="$k "; done
+  cmp_err=""
+  case ",$H_STDERR," in *",$corpus,"*) cmp_err=1 ;; esac
+  runscript_n=$script; [ "$srcdir" != - ] && runscript_n="$cwd/$(basename "$script")"
+  # norm_err FILE: a run's stderr, normalised (see the header): the paths every shell sees
+  # differently or randomly — the script ($0), THIS_SH, the unit's cwd/TMPDIR/workdir,
+  # mktemp names — and `time`'s figures. (Literal sed patterns: the paths are escaped.)
+  sedq() { printf '%s' "$1" | sed 's/[][\\/.*^$]/\\&/g'; }
+  norm_sed=(-e "s/$(sedq "$runscript_n")/\$0/g" -e "s/$(sedq "$H_ORACLE")/THIS_SH/g" -e "s/$(sedq "$H_THIS_SH")/THIS_SH/g" -e "s/$(sedq "$H_THIS_SH_DIRECT")/THIS_SH/g"
+            -e "s/$(sedq "$tmpd")/TMPDIR/g" -e "s/$(sedq "$cwd")/CWD/g" -e "s/$(sedq "$workdir")/WORKDIR/g"
+            -e 's/tmp\.[A-Za-z0-9]\{10\}/tmp.XXXXXXXXXX/g' -e 's/[0-9][0-9]*m[0-9][0-9]*[.,][0-9][0-9]*s/TIME/g')
+  run_shell bash; bst=$R_ST; bdur=$R_DUR; bout=$R_OUT; btimeout=$R_TO; berr=$R_ERR
   # curse-cold MUST precede curse-hot (SHELLS order guarantees it): cold misses the
   # empty per-unit cache and tiers (interp -> OSR + store .bc); hot then loads the .bc.
   for sh in ${H_SHELLS//,/ }; do
@@ -271,11 +341,17 @@ if [ "${1:-}" = --run-unit ]; then
       dash|curse-cold|curse-hot)
         run=$sh; [ "$sh" = dash ] || run=curse
         # (no oracle to score against: don't spend another time limit per shell on it)
-        if [ "$btimeout" -eq 1 ]; then emit_row "$sh" "" 0 0 0; continue; fi
+        if [ "$btimeout" -eq 1 ]; then emit_row "$sh" "" 0 0 0 ""; continue; fi
         run_shell "$run"
-        emit_row "$sh" "$R_OUT" "$R_ST" "$R_DUR" "$R_TO" ;;
+        emit_row "$sh" "$R_OUT" "$R_ST" "$R_DUR" "$R_TO" "$R_ERR" ;;
+      curse-interp)
+        if [ "$btimeout" -eq 1 ]; then emit_row "$sh" "" 0 0 0 ""; continue; fi
+        run_shell "$sh"
+        emit_row "$sh" "$R_OUT" "$R_ST" "$R_DUR" "$R_TO" "$R_ERR" ;;
     esac
   done
+  # a known stderr difference that no curse shell showed is stale
+  [ -n "$known_err" ] && [ -n "$cmp_err" ] && [ "$btimeout" -eq 0 ] && [ -z "$err_differed" ] && [ -z "$any_nonpass" ] && echo "$corpus $testid stderr" >> "$workdir/stale/$id"
   # Free this unit's files now, not at the end of the whole run: a bash-suite unit's cwd is
   # a full copy of the suite (~3 MB), so a run held ~240 MB of tmpfs until it finished (and
   # forever, when it was killed) — six parallel suites alone took over a gigabyte of /tmp.
@@ -284,7 +360,7 @@ if [ "${1:-}" = --run-unit ]; then
 fi
 
 # ------------------------------- driver --------------------------------------
-CORPUS=all; JOBS="${JOBS:-}"; H_TIMEOUT="${TIMEOUT:-10}"; VERBOSE=0
+CORPUS=all; JOBS="${JOBS:-}"; H_TIMEOUT="${TIMEOUT:-10}"; VERBOSE=0; H_STDERR="${H_STDERR-cases}"
 SHELLS_SEL=""; FILTERS=(); BASH_DIR=""; OIL_DIR=""; RESULTS=""; ORACLE="${H_ORACLE:-}"
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -295,7 +371,8 @@ while [ $# -gt 0 ]; do
     --bash-dir) BASH_DIR="$2"; shift 2 ;;   # bash suite tests/ dir (Meson subproject)
     --oil-dir)  OIL_DIR="$2"; shift 2 ;;    # oil spec/ dir (Meson subproject)
     --oracle)   ORACLE="$2"; shift 2 ;;     # the oracle bash (default: the in-tree 5.2.21 build)
-    --results)  RESULTS="$2"; shift 2 ;;    # keep the raw per-test rows (corpus\tshell\tverdict\tduration_us\ttestid\twhy)
+    --results)  RESULTS="$2"; shift 2 ;;
+    --stderr)   H_STDERR="$2"; [ "$H_STDERR" = none ] && H_STDERR=""; shift 2 ;;  # corpora whose stderr is compared    # keep the raw per-test rows (corpus\tshell\tverdict\tduration_us\ttestid\twhy)
     -v|--verbose) VERBOSE=1; shift ;;
     -h|--help) sed -n '2,/^set -uo/{/^set -uo/d;p}' "$0"; exit 0 ;;
     --) shift; while [ $# -gt 0 ]; do FILTERS+=("$1"); shift; done ;;
@@ -351,7 +428,7 @@ ulimit -f "${H_FSIZE_KB:-262144}" 2>/dev/null || true
 
 workdir="$(mktemp -d "${TMPDIR:-/tmp}/curse-conf.XXXXXX")"
 trap 'rm -rf "$workdir"' EXIT
-mkdir -p "$workdir/units" "$workdir/cwd" "$workdir/res" "$workdir/snip" "$workdir/bin"
+mkdir -p "$workdir/units" "$workdir/cwd" "$workdir/res" "$workdir/snip" "$workdir/bin" "$workdir/stale"
 
 # curse runs through its resident daemon — the real warm path. Start a PRIVATE
 # cursed: own $XDG_RUNTIME_DIR socket, a PERSISTENT $XDG_CACHE_HOME so the
@@ -366,6 +443,10 @@ H_THIS_SH="$workdir/bin/bash"; mkdir -p "$workdir/bin"; ln -sf "$H_CLIENT" "$H_T
 # A fallback that FAILS loudly, so a dropped daemon shows up as curse errors, never a
 # silent dash run masquerading as curse.
 H_FALLBACK="$workdir/bin/no-daemon"
+# THIS_SH for curse-interp: curse run directly, no daemon — the static self-contained
+# build/curse, also named `bash` (a symlink: no /bin/sh launcher in between, which would
+# drop exported functions' BASH_FUNC_f%% variables from the environment)
+H_THIS_SH_DIRECT="$workdir/bin/direct/bash"; mkdir -p "$workdir/bin/direct"; ln -sf "$REPO/build/curse" "$H_THIS_SH_DIRECT"
 printf '#!/bin/sh\necho "curse: daemon unavailable" >&2\nexit 127\n' > "$H_FALLBACK"; chmod +x "$H_FALLBACK"
 DAEMON_PID=""; XARGS_PID=""
 # Kill the daemon's ENTIRE process subtree — not just its direct worker children, but
@@ -390,6 +471,9 @@ trap cleanup EXIT
 trap 'cleanup; exit 130' INT
 trap 'cleanup; exit 143' TERM
 trap 'cleanup; exit 129' HUP
+case "$SHELLS" in *curse-interp*)
+  [ -x "$REPO/build/curse" ] || { echo "error: no static curse at $REPO/build/curse (curse-interp's THIS_SH) — run 'meson compile -C build'." >&2; exit 1; } ;;
+esac
 case "$SHELLS" in *curse*)
   [ -x "$H_CLIENT" ] || { echo "error: no curse-client at $H_CLIENT — run 'meson compile -C build'." >&2; exit 1; }
   [ -f "$BUNDLE" ]   || { echo "error: no bundle at $BUNDLE — run 'meson compile -C build'." >&2; exit 1; }
@@ -494,7 +578,8 @@ fi
 
 echo "harness: $total tests × [${SHELLS//,/ }]  (jobs=$JOBS, timeout=${H_TIMEOUT}s, oracle bash $ORACLE_BASH_VERSION)"
 export H_TIMEOUT H_SHELLS="$SHELLS" H_TIMEOUTS="$REPO/test/conformance/timeouts" H_NPROC="$(nproc 2>/dev/null || echo 0)"
-export H_CLIENT H_THIS_SH H_XDG_RUNTIME H_XDG_CACHE H_FALLBACK H_ORACLE H_ORACLE_DIR
+export H_CLIENT H_THIS_SH H_THIS_SH_DIRECT H_XDG_RUNTIME H_XDG_CACHE H_FALLBACK H_ORACLE H_ORACLE_DIR H_STDERR
+export H_KNOWN="$REPO/test/conformance/known-diffs" H_LUAJIT="$LUAJIT" H_BUNDLE="$BUNDLE" H_REPO_LUA="$REPO/lua"
 # (in the background + wait, so an interrupt reaches cleanup at once and it can stop them)
 seq 1 "$total" | xargs -P "$JOBS" -I{} "$0" --run-unit "$workdir" {} &
 XARGS_PID=$!
@@ -509,8 +594,9 @@ awk -F'\t' '
     if($3 ~ /^ORACLE/){oracle[$1]++; if($3!="ORACLE") oto[$1]++}
     else if($3=="OTIMEOUT"){ot[$1,$2]++}
     else {tot[$1,$2]++; c[$1,$2,$3]++; if($3=="FAIL") why[$1,$2,$6]++} }
+    # (a KNOWN row — test/conformance/known-diffs — counts as not passing, shown apart)
   END {
-    ns=split("bash dash curse-cold curse-hot", order, " ")
+    ns=split("bash dash curse-cold curse-hot curse-interp", order, " ")
     printf "%-16s", "corpus"
     for(i=1;i<=ns;i++) if(seen_shell[order[i]]) printf "%-18s", order[i]
     printf "\n"
@@ -520,7 +606,8 @@ awk -F'\t' '
         if(s=="bash"){ printf "%-18s", "(oracle "oracle[cp] (oto[cp] ? ", "oto[cp]" t/o" : "") ")"; continue }
         p=c[cp,s,"PASS"]+0; t=tot[cp,s]+0; na=c[cp,s,"NA"]+0
         pct = t>0 ? sprintf("%d%%", 100*p/t) : "-"
-        printf "%-18s", sprintf("%d/%d %s%s", p, t, pct, na>0?" ("na" n/a)":"")
+        kn=c[cp,s,"KNOWN"]+0
+        printf "%-18s", sprintf("%d/%d %s%s%s", p, t, pct, na>0?" ("na" n/a)":"", kn>0?" ("kn" known)":"")
       }
       printf "\n"
       # summed per-run wall time across the corpus (bash included) — compare shells
@@ -555,3 +642,25 @@ if [ "$VERBOSE" -eq 1 ]; then
   # (awk, not head: head exits after 100 lines, sort dies of SIGPIPE, and under pipefail the
   # harness itself exited 141 — meson reported the whole corpus as FAILED)
 fi
+
+# ------------------------------ exit status ----------------------------------
+# Any curse FAIL (output, status, stderr, timeout) fails the run; so does an oracle timeout
+# on one of curse's own cases (no score = a broken case). dash never decides it.
+nfail=$(awk -F'\t' '$2 ~ /^curse/ && $3=="FAIL"' "$workdir/all.tsv" | wc -l)
+noto=$(awk -F'\t' '$1=="cases" && $3=="ORACLE-TIMEOUT"' "$workdir/all.tsv" | wc -l)
+if [ "$(awk -F'\t' '$3=="KNOWN"' "$workdir/all.tsv" | wc -l)" -gt 0 ] || [ -n "$(ls "$workdir/stale")" ]; then
+  echo; echo "known differences (test/conformance/known-diffs):"
+  awk -F'\t' '$3=="KNOWN"{print "  "$1"\t"$2"\t"$5"\t("$6")"}' "$workdir/all.tsv" | sort
+  awk -F'\t' '$6=="stderr-known"{print "  "$1"\t"$2"\t"$5"\t(stderr)"}' "$workdir/all.tsv" | sort
+fi
+nstale=$(cat "$workdir"/stale/* 2>/dev/null | wc -l)
+if [ "$nstale" -gt 0 ]; then
+  echo; echo "STALE known differences (they match bash now: remove them from test/conformance/known-diffs):"
+  cat "$workdir"/stale/* | sort | sed 's/^/  /'
+fi
+if [ "$nfail" -gt 0 ] || [ "$noto" -gt 0 ] || [ "$nstale" -gt 0 ]; then
+  echo; echo "FAILED: $nfail curse run(s) failed$( [ "$noto" -gt 0 ] && echo ", $noto cases test(s) the oracle timed out on")$( [ "$nstale" -gt 0 ] && echo ", $nstale stale known difference(s)")"
+  [ "$VERBOSE" -eq 1 ] || awk -F'\t' '$2 ~ /^curse/ && $3=="FAIL"{print "  "$1"\t"$2"\t"$5"\t("$6")"}' "$workdir/all.tsv" | sort
+  exit 1
+fi
+exit 0

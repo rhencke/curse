@@ -133,6 +133,7 @@ local function emit_opts(mode, o)
 	o.trap_lc = mode:find("L", 1, true) ~= nil
 	return o
 end
+M.emit_opts = emit_opts -- (tools/delegate-census.lua sweeps every mode through it)
 -- With alias expansion on, a fragment's text parses with the live alias table (its own
 -- unconditional alias commands then apply from their next line, as the reader does):
 -- the table's signature keys the compile. Memoized per table + change count (alias_gen),
