@@ -1899,19 +1899,9 @@ local function case_pattern(sh, w)
 	end
 	return table.concat(buf)
 end
--- Does `subj` match any of the case-clause pattern strings? The compiled tier's case
--- codegen dispatches clauses natively but matches through this shared helper (vars in
--- a pattern expand; quoted metachars stay literal), honoring shopt nocasematch.
-M.case_pattern = case_pattern -- (rt.case_glob)
-function M.case_match(sh, subj, pats)
-	local ic = sh.shopt.nocasematch and true or nil
-	for _, pat in ipairs(pats) do
-		if rt.glob_match(subj, case_pattern(sh, P.parse_word(pat)), ic, not sh.shopt.extglob) then
-			return true
-		end
-	end
-	return false
-end
+-- A case-clause pattern word's glob form, for rt.case_glob (the compiled tier's case codegen
+-- matches through it: vars in a pattern expand; quoted metachars stay literal).
+M.case_pattern = case_pattern
 -- `=~` regex context: ERE metacharacters.
 -- Quoted text is escaped to match literally — except INSIDE a bracket expression, where
 -- bash inserts it raw (`["."]` is `[.]`, `[\.]` too; `[']']` is `[]]`), so the builder
@@ -2681,7 +2671,9 @@ expand_fields_full = function(sh, w, pre1) -- pre1: part 1 already expanded (a $
 	-- bodies still glob)
 	return fb:finish(sh.xnoglob == w)
 end
-M.expand_to_fields = expand_to_fields -- the compiled tier builds argv fields for a word AST
+-- The one-word field expander, for the runtime's fallbacks on word shapes the compiled tier
+-- can't render (rt.word_fields/xw_fields/aa_fields, `$(< f)`'s target) and compgen -W.
+M.expand_to_fields = expand_to_fields
 
 local exec_list -- forward
 
@@ -4920,9 +4912,6 @@ function M.dbracket_arith(sh, s, textual)
 	end
 	return v
 end -- -eq/-lt… operand
-function M.dbracket_unary(sh, op, val)
-	return unary(sh, op, val)
-end -- file tests, -o, -v, -z/-n
 
 -- Run a loop body, catching break/continue (decrementing multi-level n and
 -- re-raising when it targets an outer loop). Returns "break", "continue", or nil.
@@ -6888,7 +6877,6 @@ M._int = {
 	run_history_lines = run_history_lines,
 	exec_stmt = exec_stmt,
 	apply_redirs = apply_redirs,
-	restore_redirs = restore_redirs,
 	arith_expand_text = arith_expand_text,
 	dbracket_word = dbracket_word,
 	dbracket_pattern = dbracket_pattern,

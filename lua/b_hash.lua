@@ -4,7 +4,6 @@
 local rt = require("runtime")
 local I = require("interp")._int
 local file_test = I.file_test
-local BUILTINS = I.BUILTINS
 
 -- bash's printable_filename(S, 1): $'…' for a non-printable, '…' for a shell metachar
 local function pfn(s)
@@ -110,7 +109,7 @@ return function(sh, cmd, args, hook, tcb)
 			for _, nm in ipairs(names) do -- (add_hashed_command: a function or builtin is skipped;
 				-- a name is looked up afresh, its count starting over at 0)
 				if not nm:find("/", 1, true) and not sh.functions[nm]
-					and not (BUILTINS[nm] and not (sh.disabled_builtins and sh.disabled_builtins[nm])) then
+					and not rt.builtin_enabled(sh, nm) then
 					sh.hashcache[nm] = nil
 					rt.path_cache_forget(nm)
 					if sh:resolve_cmd(nm) then

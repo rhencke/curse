@@ -2764,14 +2764,11 @@ local SEG_LEN_SPECIAL = { ["#"] = 1, ["?"] = 1, ["$"] = 1, ["!"] = 1, ["-"] = 1 
 -- (above it) needs to see it.
 local seg_native
 
--- Render ONE part of a mixed word to its scalar value expression — the same per-part
--- computation as emit_word, restricted to the scalar subset seg_native admits.
--- `tilde` enables word-initial ~ expansion for an unquoted literal at part index 1.
 -- Render one part to a segment literal {s=<value>, split=<bool>, unq=<bool>} for
--- rt.expand_fields, classifying it exactly as expand_to_fields' per-part add/feed_split:
+-- rt.expand_fields, classifying it exactly as expand_to_fields' per-part FB:add/FB:split:
 --   quoted            -> add(s, false): literal, no split, no glob
 --   unquoted literal  -> add(s, true):  glob-active, no split (word-initial ~)
---   unquoted $expand  -> feed_split(s): word-split on $IFS, then glob each field
+--   unquoted $expand  -> split(s): word-split on $IFS, then glob each field
 local function emit_seg(p, i, lifted, w)
 	-- (multi segments carry `h`: bash splits the word as has_dollar_at — interp's multi_hda —
 	-- and `at`: this is a "$@" that, as the whole word outside an array literal, bash
@@ -7629,7 +7626,7 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
 		-- opts.redir_body: the callee is a compound's compiled BODY. Like interp's compound
 		-- redirect: builtins write the (redirected) fd 1 directly while it runs, the fds are
 		-- restored even when the body raises (exit / errexit / a break-continue-return signal),
-		-- and a failed redirect runs opts.redir_fail (ERR/errexit) instead of the body.
+		-- and a failed redirect runs opts.redir_body.fail (ERR/errexit) instead of the body.
 		local rbody = opts.redir_body
 		local so_in = (rbody and rbody.stdout and "sh.out = io.write; " or "")
 			.. (rbody and rbody.stdin and "sh.stdin_redir = (sh.stdin_redir or 0) + 1; " or "")
@@ -8261,7 +8258,7 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
 				end
 				return EF.redir_wrap(db_redir, sbody)
 			end
-			-- `[[ L =~ R ]]` as the SOLE condition: emit_dbracket can't express =~ (it has a
+			-- `[[ L =~ R ]]` as the SOLE condition: emit_dbracket_node can't express =~ (it has a
 			-- BASH_REMATCH side effect AND a tri-state status — 0 match / 1 no-match / 2 bad
 			-- regex — that the boolean leaf model has no slot for), so compile it here via
 			-- rt.regex_captures (real POSIX ERE, exactly interp's path). The RHS is rendered
