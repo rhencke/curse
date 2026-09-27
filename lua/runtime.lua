@@ -6026,7 +6026,17 @@ local function co_launch(ctx, self, stage_fns, inproc, base, lastpipe, upv)
 				if not (g.simple or g.pipe or sh.opt_m) then
 					M.iso_save_traps(sh)
 					sh.traps.SIGINT, ctx.igint = "", { [2] = true, [3] = true }
+					-- (listed as a hard-ignored signal only once initialize_terminating_signals
+					-- has seen it SIG_IGN — the first `trap` this process runs: b_trap)
+					sh.igint_soft = true
 				end
+			end
+			-- a simple command's builtin or function in a forked child of it (an async
+			-- `cmd &`, a pipeline stage) runs after set_sigint_handler: an async SIGINT
+			-- ignore no `trap` has latched is not hard-ignored there, so `trap` lists nothing
+			if ctx and sh.igint_soft and (g.bg and g.simple or not g.bg and t.scmd) then
+				M.iso_save_traps(sh)
+				sh.traps.SIGINT, sh.igint_soft = nil, nil
 			end
 			sh.badassign = nil
 			local ok, err = pcall(fn, sh)
@@ -6100,6 +6110,7 @@ local function co_launch(ctx, self, stage_fns, inproc, base, lastpipe, upv)
 			t.sh = sh
 			g.tasks[i] = t
 			t.simple = kind == "sflat"
+			t.scmd = kind == "sflat" or kind == "simple" -- (a simple command: see stage_body)
 			add(t, stage_body(fn, sh, t))
 		end
 	end
