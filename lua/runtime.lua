@@ -5668,7 +5668,7 @@ end
 local BG_PURE_PEXP = { [""] = 1, ["-"] = 1, [":-"] = 1, ["+"] = 1, [":+"] = 1, ["#"] = 1, ["##"] = 1,
 	["%"] = 1, ["%%"] = 1, ["/"] = 1, ["//"] = 1, ["^"] = 1, ["^^"] = 1, [","] = 1, [",,"] = 1,
 	["~"] = 1, ["~~"] = 1, len = 1 }
-local BG_IMPURE_VAR = { RANDOM = 1, SRANDOM = 1, BASHPID = 1 }
+local BG_IMPURE_VAR = { RANDOM = 1, SRANDOM = 1, BASHPID = 1, ["!"] = 1, _ = 1 }
 local function bg_pure_arith(e)
 	if type(e) ~= "table" then
 		return true
@@ -5722,7 +5722,7 @@ function M.bg_pure_words(words)
 			end
 			local pe = pt.pexp
 			if pe and (not BG_PURE_PEXP[pe.op or ""] or BG_IMPURE_VAR[pe.name]
-				or (pe.index and not pe.index:match("^[%w_@*]*$"))
+				or (pe.index and not pe.index:match("^[%d@*]*$")) -- (a subscript naming a variable: arith)
 				or (pe.arg and not bg_pure_operand(pe.arg))) then
 				return false
 			end
