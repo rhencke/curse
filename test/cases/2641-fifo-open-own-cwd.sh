@@ -8,7 +8,7 @@ d=${TMPDIR:-/tmp}/oc$$; rm -rf "$d"; mkdir -p "$d/a" "$d/b"; mkfifo "$d/a/p"
 echo precious >"$d/b/p"
 cd "$d/a"
 (cd "$d/b"; umask 077; while :; do :; done) &
-busy=$!
+busy=$!; trap 'kill $busy 2>/dev/null' EXIT # (a shell that aborts early mustn't orphan the busy job)
 put() { # WORD: the shell writes WORD into p (relative) while a job reads it
 	{ read -r l <"$d/a/p"; echo "$l" >"$d/got"; } &
 	local r=$!

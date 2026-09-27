@@ -85,6 +85,13 @@ if [ "${1:-}" = --run-unit ]; then
     if [ "$srcdir" != - ]; then cp -a "$srcdir/." "$cwd/"; runscript="$cwd/$(basename "$script")";
     else runscript="$script"; fi
   }
+  # Run "$@" as the leader of a session of its own, and when it ends — normally or killed
+  # by the time limit — kill whatever is left in that session. A test's background jobs
+  # outlive the shell that started them (bash semantics: `( while :; do :; done ) &`
+  # keeps running after the script exits, and dash aborting early skips the test's own
+  # cleanup), so without this every such run leaked a busy orphan for hours. Called from
+  # a background job (not a group leader), setsid(1) doesn't fork: $! is the session id.
+  in_session() { setsid "$@" & local p=$!; wait "$p"; local st=$?; pkill -KILL -s "$p" 2>/dev/null; return $st; }
   one() {  # $1 shell -> prints stdout, returns status (124: killed by the time limit)
     local sh="$1"
     case "$sh" in
@@ -101,9 +108,9 @@ if [ "${1:-}" = --run-unit ]; then
       # PATH starts with the ORACLE's directory (it holds only `bash`) for every shell:
       # a test that runs `bash` by name gets the pinned 5.2.21 oracle, never the host's.
       bash)  ( cd "$cwd" && PATH="$H_ORACLE_DIR:$PATH" TMP="$cwd" HOME="$cwd" TMPDIR="$tmpd" XDG_RUNTIME_DIR="$H_XDG_RUNTIME" XDG_CACHE_HOME="$ucache" CURSE_FALLBACK="$H_FALLBACK" \
-                 THIS_SH="$H_ORACLE" timeout "$lim" "$H_ORACLE" "$runscript" </dev/null ) ;;
+                 THIS_SH="$H_ORACLE" in_session timeout "$lim" "$H_ORACLE" "$runscript" </dev/null ) ;;
       dash)  ( cd "$cwd" && PATH="$H_ORACLE_DIR:$PATH" TMP="$cwd" HOME="$cwd" TMPDIR="$tmpd" XDG_RUNTIME_DIR="$H_XDG_RUNTIME" XDG_CACHE_HOME="$ucache" CURSE_FALLBACK="$H_FALLBACK" \
-                 THIS_SH="$(command -v dash)" timeout "$lim" dash "$runscript" </dev/null ) ;;
+                 THIS_SH="$(command -v dash)" in_session timeout "$lim" dash "$runscript" </dev/null ) ;;
       # curse via the resident daemon: the C client hands the script to cursed, which
       # tiers on a cache miss (interp -> OSR + store .bc) or loads the .bc on a hit.
       # THIS_SH=client so bash-suite self-reinvokes hit the daemon too; fallback fails
@@ -112,12 +119,12 @@ if [ "${1:-}" = --run-unit ]; then
       # first curse run misses (cold), second hits (hot).
       curse) ( cd "$cwd" && PATH="$H_ORACLE_DIR:$PATH" TMP="$cwd" HOME="$cwd" TMPDIR="$tmpd" XDG_RUNTIME_DIR="$H_XDG_RUNTIME" XDG_CACHE_HOME="$ucache" \
                  CURSE_FALLBACK="$H_FALLBACK" THIS_SH="$H_THIS_SH" \
-                 timeout "$lim" "$H_CLIENT" "$runscript" </dev/null ) ;;
+                 in_session timeout "$lim" "$H_CLIENT" "$runscript" </dev/null ) ;;
       # curse's interpreter alone (no daemon, no OSR), from the built bundle; a script that
       # runs $THIS_SH gets curse run directly too (the static build/curse, tiered), not the daemon
       curse-interp) ( cd "$cwd" && PATH="$H_ORACLE_DIR:$PATH" TMP="$cwd" HOME="$cwd" TMPDIR="$tmpd" XDG_RUNTIME_DIR="$H_XDG_RUNTIME" XDG_CACHE_HOME="$ucache" \
                  CURSE_FALLBACK="$H_FALLBACK" THIS_SH="$H_THIS_SH_DIRECT" CURSE_BUNDLE="$H_BUNDLE" \
-                 timeout "$lim" "$H_LUAJIT" "$H_REPO_LUA/run.lua" "$runscript" interp </dev/null ) ;;
+                 in_session timeout "$lim" "$H_LUAJIT" "$H_REPO_LUA/run.lua" "$runscript" interp </dev/null ) ;;
     esac
   }
 
