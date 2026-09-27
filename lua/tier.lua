@@ -240,7 +240,7 @@ function M.try_fragment(code, line1, sh, now, label, noalias) -- line1: an eval'
 	frag_cache[key] = mod
 	return mod ~= 0 and mod or nil
 end
-function M.compile_fragment(code, line1, mode, atab, pst)
+local function compile_fragment0(code, line1, mode, atab, pst)
 	-- (atab: the live alias table, expansion on — the parse starts from it; pst: the live
 	-- posix/extglob/lexing state, "p"?("x"|"-")"b"?, else the parse tracks them from the text)
 	local pok, ast = pcall(M.parse_start, code, pst, atab and aenv_of(atab) or nil, line1 or nil,
@@ -271,6 +271,9 @@ function M.compile_fragment(code, line1, mode, atab, pst)
 		return mod
 	end
 	return nil
+end
+function M.compile_fragment(code, line1, mode, atab, pst)
+	return rt.defer_call(compile_fragment0, code, line1, mode, atab, pst)
 end
 
 -- A safepoint (kind, id) -> the pc to enter the compiled CFG at.
@@ -645,7 +648,7 @@ end
 -- STARTED in — a module it can't use (alias_mismatch: judged by that state, since the
 -- script enabling aliases itself is what a static-alias module already models) is nil,
 -- and not stored.
-local function compile_program(d, later, start)
+local function compile_program0(d, later, start)
 	local ok, code = pcall(function()
 		return E.emit(M.parse_start(d.src, d.pst), start_opts(d.xt, d.attr, d.imp))
 	end)
@@ -665,6 +668,11 @@ local function compile_program(d, later, start)
 	store(d.path, dump(chunk, code), later)
 	modcache_put(d.path, m)
 	return m
+end
+-- (every compile holds signals — rt.defer_call: a trap's exit/return raised in its pcalls
+-- would read as "doesn't compile" and be lost; the held signals run once it's done)
+local function compile_program(d, later, start)
+	return rt.defer_call(compile_program0, d, later, start)
 end
 -- LINE MODE. A script whose PARSE depends on run-time state — an alias defined as it
 -- runs, history expansion, set -v echo — can't be compiled whole: the interpreter's
@@ -696,7 +704,7 @@ function M.lm_exec(sh, lg, k)
 	local path = Cache.artifact_path(key)
 	local mod = path and modcache_get(path)
 	if not mod then
-		mod = Cache.load(path)
+		mod = rt.defer_call(Cache.load, path) -- (its chunk runs under a pcall too)
 		if not mod then
 			-- (a line abort skips the rest of THIS line: all of it is one line group)
 			lg.stmts[1].lgstart = true
@@ -709,11 +717,14 @@ function M.lm_exec(sh, lg, k)
 				lmae = aenv_of(sh.aliases)
 			end
 			-- (the ERR/DEBUG traps set by earlier lines: their hooks compiled in — trap_mode)
-			local ok, code = pcall(E.emit, { stmts = lg.stmts }, emit_opts(trap_mode(sh), { fragment = true, lm = true, lm_aenv = lmae }))
-			local chunk
-			if ok then
-				mod, chunk = build(code, "=curse:line")
-			end
+			local ok, code, chunk = rt.defer_call(function()
+				local eok, ecode = pcall(E.emit, { stmts = lg.stmts },
+					emit_opts(trap_mode(sh), { fragment = true, lm = true, lm_aenv = lmae }))
+				if eok then
+					mod, chunk = build(ecode, "=curse:line")
+				end
+				return eok, ecode, chunk
+			end)
 			if not mod then
 				if LM_DEBUG then
 					io.stderr:write("[line " .. tostring(lg.sline) .. ": interpreted: " .. tostring(code) .. "]\n")
