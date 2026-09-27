@@ -29,6 +29,7 @@ return function(sh, cmd, args, hook, tcb)
 		-- (bash: status 2, or 1 for `local`). export/readonly accept a narrower set.
 		local VALID = (cmd == "export" or cmd == "readonly") and "afnpA" or "aAcfFgGilnprtuxI"
 		local opterr, endopts, ro_n = nil, false, false
+		local opterr_sign = "-"
 		for j = 2, #args do
 			local a = args[j]
 			if endopts then -- (options end at `--` or the first operand: internal_getopt)
@@ -99,7 +100,22 @@ return function(sh, cmd, args, hook, tcb)
 				if a:find("t") then
 					tattr = true
 				end
+			elseif not endopts and a:sub(1, 1) == "+" and #a > 1 and not isdecl then
+				-- export/readonly read options with internal_getopt (list, "aAfnp"): no `+`
+				-- form, so a +word is the first operand (`+x': not a valid identifier)
+				rest[#rest + 1] = a
+				endopts = true
 			elseif not endopts and a:sub(1, 1) == "+" and #a > 1 then
+				for ci = 2, #a do -- (declare's "+acfinprtuxAFGgIl…": any other letter is invalid)
+					local ch = a:sub(ci, ci)
+					if not VALID:find(ch, 1, true) then
+						opterr, opterr_sign = ch, "+"
+						break
+					end
+				end
+				if opterr then
+					break
+				end
 				if a:find("n") then
 					plusn = true
 				end
@@ -137,7 +153,7 @@ return function(sh, cmd, args, hook, tcb)
 			plusattr.l, plusattr.u, plusattr.c = true, true, true
 		end
 		if opterr then -- an unknown attribute letter (or `--help`): usage, status 2
-			return rt.bad_option(sh, cmd, "-" .. opterr, opterr)
+			return rt.bad_option(sh, cmd, opterr_sign .. opterr, opterr)
 		end
 		if ro_n and #rest > 0 and not (funcnames or funcbody or printmode) then -- `readonly -n NAME[=V]`:
 			local st = 0 -- just the assignments, no attribute
