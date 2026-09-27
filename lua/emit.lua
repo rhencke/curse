@@ -5133,7 +5133,11 @@ H.simple = function(cx, st, after)
 		local v = cx.newloopvar()
 		local post = cx.newpc()
 		cx.blocks[post] = ("rt.ps_drain(sh, %s); pc = %d"):format(v, after)
+		-- (a `return` out of it skips post: it drains them itself — bash's execute_function
+		-- closes the function's new fifos/pipes when it returns)
+		cx.ps_push(v)
 		local body = cx.flatten_stmt(st, post)
+		cx.psstack[#cx.psstack] = nil
 		local pre = cx.newpc()
 		cx.blocks[pre] = ("%s = rt.ps_mark(sh); pc = %d"):format(v, body)
 		return pre
@@ -7536,6 +7540,24 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
 	cx.bx_guarded = {} -- (statements already given their `set +B` guard)
 	cx.lc_guarded = {} -- (loops already given their loop-depth marks: EF.trap_loopctl)
 	cx.ps_guarded = {} -- (simple commands already given their <()/>() drain)
+	-- The <()/>() drains a jump out of their statements must run itself (it skips their
+	-- post block): a return (execute_function's close_new_fifos), a break/continue to an
+	-- enclosing loop, a signal raised out of this CFG. Entries: the drain's pair variable
+	-- and the loop depth it was entered at; ps_drains(i): those entered inside loop i.
+	cx.psstack = {}
+	function cx.ps_push(v)
+		cx.psstack[#cx.psstack + 1] = { v = v, d = #cx.loopstack }
+	end
+	function cx.ps_drains(minidx)
+		local o = {}
+		for k = #cx.psstack, 1, -1 do
+			local e = cx.psstack[k]
+			if e.d >= minidx then
+				o[#o + 1] = ("rt.ps_drain(sh, %s); "):format(e.v)
+			end
+		end
+		return table.concat(o)
+	end
 	-- Does a simple command create a process substitution — a <(…)/>(…) word, prefix value
 	-- or redirection target? Its pipes are closed and its children reaped after the command.
 	function cx.has_procsub(st)
@@ -7744,20 +7766,30 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
 			local ndj = anynd and ("sh.noerr = sh.noerr - ({%s})[__lv]; "):format(table.concat(nds, ", ")) or ""
 			local N = #cx.loopstack
 			local function past(sig)
-				return outer and ("if __lv > %d then %s%serror({ __curse_%s = __lv - %d }) end; "):format(
-					N, EF.cf_flush or "", cx.ndadj(0), sig, N) or ("if __lv > %d then __lv = %d end; "):format(N, N)
+				return outer and ("if __lv > %d then %s%s%serror({ __curse_%s = __lv - %d }) end; "):format(
+					N, EF.cf_flush or "", cx.ndadj(0), cx.ps_drains(0), sig, N) or ("if __lv > %d then __lv = %d end; "):format(N, N)
 			end
 			-- interp already set sh.status before raising (0 normal, 1/128 on a bad arg);
 			-- leave it — the loop's exit status is the break/continue command's, like bash.
-			hs[#hs + 1] = ("if __e.__curse_break then local __lv = __e.__curse_break; %s%spc = ({%s})[__lv]"):format(
-				past("break"), ndj, table.concat(brk, ", "))
-			hs[#hs + 1] = ("elseif __e.__curse_continue then local __lv = __e.__curse_continue; %s%spc = ({%s})[__lv]"):format(
-				past("continue"), ndj, table.concat(cont, ", "))
+			-- (the <()/>() of the statements the jump leaves, by level: cx.ps_drains)
+			local dl, anyd = {}, false
+			for lv = 1, N do
+				local dr = cx.ps_drains(N - lv + 1)
+				anyd = anyd or dr ~= ""
+				dl[#dl + 1] = ("%sif __lv == %d then %s"):format(lv > 1 and "else" or "", lv, dr)
+			end
+			local psd = anyd and (table.concat(dl) .. "end; ") or ""
+			hs[#hs + 1] = ("if __e.__curse_break then local __lv = __e.__curse_break; %s%s%spc = ({%s})[__lv]"):format(
+				past("break"), ndj, psd, table.concat(brk, ", "))
+			hs[#hs + 1] = ("elseif __e.__curse_continue then local __lv = __e.__curse_continue; %s%s%spc = ({%s})[__lv]"):format(
+				past("continue"), ndj, psd, table.concat(cont, ", "))
 		end
 		if infunc then
-			hs[#hs + 1] = ("%s __e.__curse_return ~= nil then sh.status = __e.__curse_return; %spc = %d"):format(
+			local drains = cx.ps_drains(0) -- (the <()/>() of the statements a return leaves)
+			hs[#hs + 1] = ("%s __e.__curse_return ~= nil then sh.status = __e.__curse_return; %s%spc = %d"):format(
 				#hs > 0 and "elseif" or "if",
 				cx.ndadj(0),
+				drains,
 				cx.DONE
 			)
 		end
@@ -7930,6 +7962,7 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
 			ps = cx.newpc()
 			cx.blocks[ps] = ("rt.ps_drain(sh, %s); pc = %d"):format(psv, after)
 			after = ps
+			cx.ps_push(psv) -- (a return/break out of the body drains them: dispatch)
 		end
 		local p = cx.dispatch(st, after, {
 			callee = "__CS[" .. id .. "]",
@@ -7944,6 +7977,7 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
 		})
 		EF.cur_line = sl
 		if ps then
+			cx.psstack[#cx.psstack] = nil
 			local pre = cx.newpc()
 			cx.blocks[pre] = ("%s = rt.ps_mark(sh); pc = %d"):format(psv, p)
 			return pre
@@ -8107,8 +8141,8 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
 					if EF.cf_raise and EF.cf_raise.loop and lvl > #cx.loopstack then
 						-- (the body of a redirected compound inside the caller's loops: the levels
 						-- past its own reach them — raised for the caller's cf-wrapper)
-						cx.blocks[p] = d .. (EF.cf_flush or "") .. cx.ndadj(0) .. ("sh.status = 0; error({ __curse_%s = %d })"):format(
-							cf_op, lvl - #cx.loopstack)
+						cx.blocks[p] = d .. (EF.cf_flush or "") .. cx.ndadj(0) .. cx.ps_drains(0)
+							.. ("sh.status = 0; error({ __curse_%s = %d })"):format(cf_op, lvl - #cx.loopstack)
 					elseif EF.cs_in_loop and lvl > #cx.loopstack then
 						-- (a `$( … )` inside a loop keeps the loop level: the levels past its own
 						-- end the substitution, as one with no loop of its own does — no clamp)
@@ -8126,7 +8160,8 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
 						cx.blocks[p] = d .. ("if sh.loopdepth > %d then local __n = math.min(%d, sh.loopdepth - %d); %s%s%serror({ __curse_%s = __n }) end; sh.status = 0; %spc = %d"):format(
 							EF.lc_rel and N or 0, lvl - N, EF.lc_rel and N or 0, EF.cf_flush or "", cx.ndadj(0), back, cf_op, cx.ndadj(cx.loopstack[idx].nd), tgt)
 					else
-						cx.blocks[p] = d .. cx.ndadj(cx.loopstack[idx].nd) .. ("sh.status = 0; pc = %d"):format(tgt)
+						cx.blocks[p] = d .. cx.ndadj(cx.loopstack[idx].nd) .. cx.ps_drains(idx)
+							.. ("sh.status = 0; pc = %d"):format(tgt)
 					end
 				end
 				return p
@@ -8160,6 +8195,7 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
 			local retjmp = frag_return
 					and ((EF.cf_flush or "") .. cx.ndadj(0) .. "do local __r = sh.status; sh.status = __ps; error({ __curse_return = __r }) end")
 				or (cx.ndadj(0) .. ("pc = %d"):format(retpc))
+			retjmp = cx.ps_drains(0) .. retjmp -- (the <()/>() of the statements it leaves)
 			local ps = frag_return and "local __ps = sh.status; " or ""
 			if not frag_return and st.line and EF.has_return and not cx.toplevel and not cx.topcode then
 				ps = ps .. ("sh.fret_line = %d; "):format(st.line) -- (the RETURN trap's $LINENO)
