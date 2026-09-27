@@ -412,12 +412,31 @@ return function(sh, cmd, args, hook, tcb)
 				local own = sh.savedstack[sh.pd]
 				return own ~= nil and own[name] ~= nil
 			end
+			-- `declare NAME[SUB]=v` whose element assignment fails (an empty or @/* subscript):
+			-- bash's declare_internal has made NAME (local, for `local`) an indexed array
+			-- already — a scalar value becomes its [0], an array stays
+			local function mkarr_of(nm)
+				if localize then
+					sh:localVar(nm)
+				end
+				local dn = sh:deref(nm)
+				local pb = sh.vars[dn]
+				if pb and pb.arr then
+					return
+				end
+				pb = pb or {}
+				-- (a local's value is discarded — make_local_array_variable — unless -I inherits)
+				local had = pb.s ~= nil or pb.n ~= nil
+				local v0 = not (localize and not sh.local_inherit) and (pb.s or (pb.n and rt.i64_to_str(pb.n))) or nil
+				pb.arr, pb.s, pb.n, pb.empty_decl = v0 and { [0] = v0 } or {}, nil, nil, not had or nil
+				sh.vars[dn] = pb
+			end
 			for _, a in ipairs(rest) do
 				-- `declare -A c[200]` / `declare x[3]`: an element form with no value declares
 				-- the array itself (bash ignores the subscript)
 				local mkarr = false
 				if isdecl and not a:find("=", 1, true) then
-					local base = a:match("^([%a_][%w_]*)%[.*%]$")
+					local base = a:match("^([%a_][%w_]*)%[.+%]$") -- (`x[]`: not a valid identifier)
 					if base and nref then -- (`declare -n a[3]`)
 						io.stderr:write("curse: " .. cmd .. ": " .. a .. ": reference variable cannot be an array\n")
 						allok = false
@@ -895,6 +914,9 @@ return function(sh, cmd, args, hook, tcb)
 					-- bash creates the element for declare/typeset/local, but NOT via a
 					-- deferred `readonly a[i]=v` / `export a[i]=v` (those fail, status 1).
 					if anm and sub == "" then -- `declare a[]=x`
+						if isdecl then -- (declare_internal made the array before assigning)
+							mkarr_of(anm)
+						end
 						io.stderr:write("curse: " .. anm .. "[]: bad array subscript\n")
 						rt.report_exit(sh) -- (err_badarraysub: report_error)
 						badassign = true -- (declare.def assign_error: EX_BADASSIGN)
@@ -936,9 +958,13 @@ return function(sh, cmd, args, hook, tcb)
 						if assoc and not sh:is_assoc(anm) then -- (`declare -A m[k]=v` makes m assoc)
 							sh:declare_assoc(anm)
 						end
+						if localize and not assoc and not sh:is_assoc(anm) then
+							mkarr_of(anm) -- (make_local_array_variable: a scalar's value is dropped)
+						end
 						if (sub == "@" or sub == "*") and not sh:is_assoc(anm) then
 							-- (declare's ASS_ALLOWALLSUB: the element assignment fails, status 1,
 							-- but — unlike a plain `a[@]=x` — the line goes on)
+							mkarr_of(anm) -- (the array exists: declare_internal made it first)
 							io.stderr:write("curse: " .. anm .. "[" .. sub .. "]: bad array subscript\n")
 							rt.report_exit(sh) -- (err_badarraysub: report_error)
 							badassign = true

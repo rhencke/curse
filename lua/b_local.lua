@@ -124,11 +124,20 @@ return function(sh, cmd, args, hook, tcb)
 		end
 		local lok = true
 		for _, a in ipairs(rest) do
-			local anm, sub, aop, aval = a:match("^([%a_][%w_]*)%[(.-)%](%+?=)(.*)$")
 			if a == "-" then
-			elseif anm then -- local a[i]=v : create the element in a local array
-				sh:localVar(anm)
-				sh:array_set(anm, array_key(sh, anm, sub), aval, aop == "+=")
+			elseif (a:match("^[^=]*") or a):find("[", 1, true) then
+				-- a subscripted NAME (`local a[i]=v`, `local 'a['`, `local 'b[]'=3`) takes
+				-- declare's path, as bash's local_builtin -> declare_internal does: its
+				-- valid-identifier and bad-subscript checks, the element in a local array
+				local st0 = sh.status
+				local ok, err = pcall(require("b_export"), sh, "local", { "local", a }, hook, tcb)
+				if not ok then
+					error(err, 0)
+				end
+				if sh.status ~= 0 then
+					lok = false
+				end
+				sh.status = st0
 			elseif not (a:match("^[%a_][%w_]*$") or a:match("^[%a_][%w_]*%+?=") or a:find("[", 1, true)) then
 				io.stderr:write("curse: local: `" .. a .. "': not a valid identifier\n")
 				lok = false
