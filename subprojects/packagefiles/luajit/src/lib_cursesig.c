@@ -3,9 +3,9 @@
  * LuaJIT forbids running Lua from an async C signal handler, so the handler does
  * only async-signal-safe work: record which signal fired AND schedule a VM debug
  * hook (lua_sethook) — exactly LuaJIT's own Ctrl-C mechanism (laction in luajit.c).
- * The hook fires at the next VM safepoint, in a SAFE Lua context, and runs THAT
- * signal's trap directly (no pending queue, no draining, no polling — the VM
- * delivers the trap).
+ * The hook fires at the next VM safepoint, in a SAFE Lua context, and runs the trap
+ * of every signal recorded meanwhile, lowest signal number first (no polling — the
+ * VM delivers the traps).
  *
  * The handler is installed WITHOUT SA_RESTART, so a blocking syscall (read/waitpid)
  * returns EINTR the instant the signal arrives; control returns to the interpreter,
@@ -25,29 +25,49 @@
 #include <sys/time.h>
 #include <time.h>
 
-static volatile sig_atomic_t curse_sig_num;  /* the signal to deliver at the next safepoint */
+/* The signals delivered and not yet run: one flag per signal, so signals arriving
+ * back to back (HUP, USR1, USR2 before the next safepoint) each run their trap --
+ * a single "last signal" slot lost all but one. Drained in ascending signal number,
+ * as bash's run_pending_traps walks pending_traps[]. */
+#define CURSE_NSIG 65
+static volatile sig_atomic_t curse_sig_pend[CURSE_NSIG];
 static volatile pid_t curse_sig_pid;         /* pid that scheduled the hook (fork guard) */
 
 extern lua_State *curse_globalL(void);  /* luajit.c */
 
-/* Scheduled hook: runs at the next VM safepoint in a safe Lua context. Removes
- * itself (one-shot) BEFORE running Lua, then calls curse's trap runner with the
- * signal number. Errors/exit from the trap propagate normally (Lua's error
- * unwinding), so `trap 'exit' INT` exits — we deliberately do NOT pcall.
- *
- * A forked child inherits both the scheduled hook and curse_sig_num; without a
- * guard it would fire the PARENT's pending trap at its first instruction (before
- * it can reset its dispositions). So the hook is a no-op unless it runs in the
- * process that scheduled it — the child's inherited hook just clears itself. */
-static void curse_sig_hook(lua_State *L, lua_Debug *ar)
+/* Take the lowest pending signal (0: none). Called with all signals blocked. */
+static int curse_sig_take(void)
 {
   int s;
+  for (s = 1; s < CURSE_NSIG; s++) {
+    if (curse_sig_pend[s]) { curse_sig_pend[s] = 0; return s; }
+  }
+  return 0;
+}
+
+static void curse_sig_hook(lua_State *L, lua_Debug *ar);
+
+/* Scheduled hook: runs at the next VM safepoint in a safe Lua context. Removes
+ * itself (one-shot) BEFORE running Lua, then calls curse's trap runner once per
+ * pending signal, lowest first. Errors/exit from a trap propagate (Lua's error
+ * unwinding), so `trap 'exit' INT` exits: the call is protected only to decide what
+ * becomes of the signals still pending -- an `exit` drops them (the shell is ending,
+ * as bash's exit_shell never returns to run_pending_traps); any other unwind
+ * (`return`/`break` out of the trap) leaves them pending and schedules the hook
+ * again, as bash's pending_traps outlive the longjmp.
+ *
+ * A forked child inherits both the scheduled hook and the pending set; without a
+ * guard it would fire the PARENT's pending trap at its first instruction (before
+ * it can reset its dispositions). So the hook is a no-op unless it runs in the
+ * process that scheduled it -- the child's inherited hook just clears itself. */
+static void curse_sig_hook(lua_State *L, lua_Debug *ar)
+{
+  int s, n;
   sigset_t all, old;
   (void)ar;
-  /* Take the signal and remove this hook with signals blocked: a signal arriving in
-   * the middle of it would set the hook again (curse_sig_onsignal) only to have this
-   * removal's read-modify-write of g->hookmask drop it — or be counted here and fire
-   * the hook once more with nothing to run. Blocked, it is delivered once this is
+  /* Remove this hook with signals blocked: a signal arriving in the middle of it
+   * would set the hook again (curse_sig_onsignal) only to have this removal's
+   * read-modify-write of g->hookmask drop it. Blocked, it is delivered once this is
    * done and schedules a fresh hook. */
   sigfillset(&all);
   sigprocmask(SIG_BLOCK, &all, &old);
@@ -57,29 +77,48 @@ static void curse_sig_hook(lua_State *L, lua_Debug *ar)
    * interpreter through a patched tail jmp's trampoline skips lj_trace_exit). */
   { extern void curse_sig_unpatch_all(void); curse_sig_unpatch_all(); }
 #endif
-  s = (int)curse_sig_num;
-  curse_sig_num = 0;
-  sigprocmask(SIG_SETMASK, &old, (sigset_t *)0);
-  if (getpid() != curse_sig_pid || s == 0) return; /* inherited across fork (or none): skip */
-  lua_getglobal(L, "__curse_sigrun");
-  if (lua_isfunction(L, -1)) {
-    lua_pushinteger(L, s);
-    /* The trap runs as ordinary code, not as a hook: a signal arriving while it runs
-     * fires its own hook INSIDE it, nested — as bash's run_pending_traps runs a pending
-     * trap at the running handler's next command. (callhook only skips a hook while
-     * HOOK_ACTIVE; it is set again before returning to callhook, which clears it.) */
-    hook_leave(G(L));
-    lua_call(L, 1, 0);
-    hook_enter(G(L));
-  } else {
-    lua_pop(L, 1);
+  if (getpid() != curse_sig_pid) { /* inherited across fork: drop the parent's */
+    for (s = 1; s < CURSE_NSIG; s++) curse_sig_pend[s] = 0;
+    sigprocmask(SIG_SETMASK, &old, (sigset_t *)0);
+    return;
   }
+  sigprocmask(SIG_SETMASK, &old, (sigset_t *)0);
+  /* The traps run as ordinary code, not as a hook: a signal arriving while one runs
+   * fires its own hook INSIDE it, nested -- as bash's run_pending_traps runs a pending
+   * trap at the running handler's next command. (callhook only skips a hook while
+   * HOOK_ACTIVE; it is set again before returning to callhook, which clears it.) */
+  hook_leave(G(L));
+  for (;;) {
+    sigprocmask(SIG_BLOCK, &all, &old);
+    s = curse_sig_take();
+    sigprocmask(SIG_SETMASK, &old, (sigset_t *)0);
+    if (s == 0) break;
+    lua_getglobal(L, "__curse_sigrun");
+    if (!lua_isfunction(L, -1)) { lua_pop(L, 1); continue; }
+    lua_pushinteger(L, s);
+    if (lua_pcall(L, 1, 0, 0) != 0) {
+      int isexit = 0;
+      if (lua_istable(L, -1)) {
+        lua_getfield(L, -1, "__curse_exit");
+        isexit = !lua_isnil(L, -1);
+        lua_pop(L, 1);
+      }
+      sigprocmask(SIG_BLOCK, &all, &old);
+      for (n = 0, s = 1; s < CURSE_NSIG; s++) {
+        if (curse_sig_pend[s]) { if (isexit) curse_sig_pend[s] = 0; else n = 1; }
+      }
+      if (n) lua_sethook(L, curse_sig_hook, LUA_MASKCALL | LUA_MASKRET | LUA_MASKCOUNT, 1);
+      sigprocmask(SIG_SETMASK, &old, (sigset_t *)0);
+      lua_error(L); /* (hook left, as an unprotected call's error would leave it) */
+    }
+  }
+  hook_enter(G(L));
 }
 
 static void curse_sig_onsignal(int s)
 {
   lua_State *L;
-  curse_sig_num = s;
+  if (s > 0 && s < CURSE_NSIG) curse_sig_pend[s] = 1;
   curse_sig_pid = getpid();
   /* Schedule the trap for the next safepoint (laction pattern). Count=1 fires on
    * the next VM instruction; call/ret masks make blocking-syscall returns fire it
@@ -133,7 +172,8 @@ int curse_sig_ignore(int s)
 void curse_sig_clearpending(void)
 {
   lua_State *L = curse_globalL();
-  curse_sig_num = 0;
+  int s;
+  for (s = 1; s < CURSE_NSIG; s++) curse_sig_pend[s] = 0;
   if (L) lua_sethook(L, (lua_Hook)0, 0, 0);
 }
 
