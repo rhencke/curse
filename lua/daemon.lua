@@ -215,10 +215,9 @@ end
 
 -- The script's children that outlive it, adopted into rt.internal_pids when the request
 -- ends (see serve_request): a job still running, or the foreground external a signal
--- ended the script in the middle of (bash would have died, leaving it to init). This
--- worker stays their parent, so it reaps them — at every later request's reap points,
--- and while it idles (reap_idle), promptly, so none lingers as a zombie. One STOPPED
--- gets SIGHUP + SIGCONT now, as the kernel sends a group its shell's exit orphans.
+-- ended the script in the middle of (bash would have died, leaving it to init). One
+-- STOPPED gets SIGHUP + SIGCONT now, as the kernel sends a group its shell's exit orphans.
+-- The worker then RETIRES, leaving them to init as bash's exit does (see serve_request).
 local function hangup_stopped_orphans()
 	-- (as the kernel does for an orphaned process group with a stopped member: only one of
 	-- its own — one in the worker's group is left stopped, as bash leaves one in its own —
@@ -288,22 +287,6 @@ local function wait_client_close(cfd)
 	end
 	C.close(cfd)
 end
--- Idle with adopted children: wait for a connection in 50ms slices, reaping them as they
--- end, until none is left (then the plain blocking accept).
-local reap_pf = ffi.new("struct curse_d_pollfd[1]")
-local function reap_idle(lfd)
-	while next(rt.internal_pids) do
-		pcall(rt.reap_orphans)
-		if not next(rt.internal_pids) then
-			return
-		end
-		reap_pf[0].fd, reap_pf[0].events, reap_pf[0].revents = lfd, 1, 0
-		if C.curse_d_poll(reap_pf, 1, 50) > 0 then
-			return -- (a connection: serve it; the next idle time goes on reaping)
-		end
-	end
-end
-
 -- Serve ONE request on the caller's fds, reply with the status, and RETURN so the
 -- persistent worker can serve the next (no per-request fork or _exit). Everything a
 -- script can leave in PROCESS state is reset — the fork model got this for free; we
@@ -452,9 +435,9 @@ local function serve_request(cfd, req, fds, ctx)
 		pcall(rt.sched_drain, sh)
 		drained = true
 	end
-	-- (the script's still-running real-pid jobs — `sleep 9 &` spawned directly — stay this
-	-- worker's children after it: bash's would go to init. Reaped as they end, by this and
-	-- every later request's reap points; never zombies left for another script's `ps` to see)
+	-- (the script's still-running real-pid jobs — `sleep 9 &` spawned directly — are this
+	-- worker's children after it: bash's would go to init. Adopted here, then left to init
+	-- when the worker retires below; never zombies left for another script's `ps` to see)
 	for _, j in ipairs(sh.jobs or {}) do
 		if not j.done and not j.g and j.pid and j.pid > 0 then
 			rt.internal_pids[j.pid] = true
@@ -474,7 +457,7 @@ local function serve_request(cfd, req, fds, ctx)
 		end
 	end
 	pcall(rt.reap_orphans) -- (children no job waits for any more: never zombies on the worker)
-	hangup_stopped_orphans() -- (…and the stopped ones don't stay stopped: see reap_idle)
+	hangup_stopped_orphans() -- (…and the stopped ones don't stay stopped: as at bash's exit)
 	-- SCRUB per-request process state (the fork boundary used to do this):
 	C.umask(ctx.umask) -- a script's `umask` doesn't persist
 	C.sigprocmask(2, ctx.empty_sigset, nil) -- SIG_SETMASK: clear any trap-blocked signals
@@ -497,6 +480,14 @@ local function serve_request(cfd, req, fds, ctx)
 	-- SOFT limit is restored; a lowered HARD limit can't be raised again unprivileged, so
 	-- the worker RETIRES after this request and the parent spawns a clean one.
 	local retire = drained -- (a worker that ran leftover jobs retires: its state is theirs)
+	-- A worker left with a live child RETIRES too, leaving it to init — as bash's exit
+	-- does. Kept, it would be reaped only when this worker next got round to it: never
+	-- while blocked in accept() (every idle worker's poll wakes for a connection that ONE
+	-- accept takes; the rest block — for the idle timeout) nor while serving a later
+	-- request between its reap points — a zombie for seconds or more (2526 under load).
+	if next(rt.internal_pids) then
+		retire = true
+	end
 	local cur = ffi.new("struct curse_d_rlimit")
 	for res, orig in pairs(ctx.rlimits) do
 		if C.curse_d_getrlimit(res, cur) == 0 and (cur.cur ~= orig.cur or cur.max ~= orig.max) then
@@ -610,7 +601,6 @@ local function worker_main(lfd, my_uid, ctx, slot)
 			end
 			pcall(Tier.compile_deferred, true)
 		end
-		reap_idle(lfd)
 		local cfd = C.accept(lfd, nil, nil)
 		if cfd < 0 then
 			local e = ffi.errno()
