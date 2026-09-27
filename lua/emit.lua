@@ -5485,7 +5485,7 @@ simple_compiled = function(cx, st, after)
 			local co = require("interp")._int.redirs_touch_stdout(st.redirs)
 				and "local __co = rt.CO_OUTS[sh.out]; if __co then rt.flush_stage_out(sh) end; " or "local __co; "
 			cx.blocks[p] = dbg(st) .. EF.xtl('"exec"')
-				.. ("do rt.iso_save_fds(sh); %slocal __rs = {}; if %s then sh.status = 0; rt.redir_discard(__rs); if __co then sh.out = io.write end else sh.status = 1; rt.redir_restore(__rs) end; if sh.coprocs then rt.coproc_fdcheck(sh) end; if sh.status ~= 0 and sh.opt_posix and not sh.opt_i then error({ __curse_exit = 1 }) end end; pc = %d"):format(co, re, after)
+				.. ("do rt.iso_save_fds(sh); %slocal __rs = {}; if %s then sh.status = 0; rt.redir_discard(__rs, sh); if __co then sh.out = io.write end else sh.status = 1; rt.redir_restore(__rs) end; if sh.coprocs then rt.coproc_fdcheck(sh) end; if sh.status ~= 0 and sh.opt_posix and not sh.opt_i then error({ __curse_exit = 1 }) end end; pc = %d"):format(co, re, after)
 			return p
 		end
 	end

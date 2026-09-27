@@ -110,7 +110,7 @@ return function(sh, st, args, hook, viacmd)
 	until not f or f == "?"
 	if f then -- (reported: `--help` too, then as a usage error)
 		if type(sv) == "table" then -- (they stay even so: execute_builtin_or_function drops
-			rt.redir_discard(sv) -- exec's undo list before exec_builtin runs at all)
+			rt.redir_discard(sv, sh) -- exec's undo list before exec_builtin runs at all)
 		end
 		sh.status = 2
 		if sh.opt_posix and not viacmd and not sh.opt_i then -- (EX_USAGE: rt.spb_run's rule)
@@ -119,7 +119,7 @@ return function(sh, st, args, hook, viacmd)
 		return
 	end
 	if type(sv) == "table" then -- the redirections persist: the saved originals are dropped
-		rt.redir_discard(sv)
+		rt.redir_discard(sv, sh)
 	end
 	if k > #args then
 		sh.status = 0

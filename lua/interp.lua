@@ -2824,6 +2824,7 @@ local function apply_redirs(sh, redirs, cname, ctx, args) -- cname: the command 
 					backup(nf)
 				else
 					persist[nf] = true
+					rt.iso_keep_fd(sh, nf, -1) -- (a subshell's: closed when it ends)
 				end
 				r = setmetatable({ fd = nf }, { __index = r }) -- shadow r.fd, inherit op/target
 			end

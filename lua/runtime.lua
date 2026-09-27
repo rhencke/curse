@@ -1972,14 +1972,17 @@ function M.ps_adrain(sh, m)
 	sh.cur_alist = m[3]
 	require("interp")._int.drain_procsub(sh, m[1], m[2])
 end
-function M.redir_discard(saves)
+function M.redir_discard(saves, sh) -- (sh: in an in-process subshell, a fd >= 10 is kept)
 	if saves.out_sh then
 		io.flush()
 		saves.out_sh.out, saves.out_sh = saves.out, nil
 	end
 	for i = #saves, 1, -1 do
-		if saves[i].saved >= 0 then
-			C.close(saves[i].saved)
+		local s = saves[i]
+		if s.saved >= 0 and not (sh and M.iso_keep_fd(sh, s.fd, s.saved)) then
+			C.close(s.saved)
+		elseif s.saved < 0 and sh then
+			M.iso_keep_fd(sh, s.fd, -1)
 		end
 		saves[i] = nil
 	end
@@ -3525,8 +3528,45 @@ cap_enter = function()
 end
 
 
+-- A fd >= 10 an in-process subshell opens, replaces or closes for good (`exec 13>f`,
+-- `{v}>f`, `exec 13>&-`) is the parent's too — a forked subshell's changes die with it:
+-- its state from before the subshell's first such change (`saved`: a close-on-exec copy
+-- this takes over, or -1: it was closed) goes back when the context ends. (fds 0-9:
+-- iso_save_fds.) True when `saved` was taken.
+function M.iso_keep_fd(sh, fd, saved)
+	if fd < 10 then
+		return false
+	end
+	local ctx = iso_cur(sh) -- (a pipeline stage's too: its fds 0-9 are its task's own, but
+	if not ctx then -- the rest are the process's)
+		return false
+	end
+	local h = ctx.hifds
+	if not h then
+		h = {}
+		ctx.hifds = h
+	end
+	if h[fd] == nil then
+		h[fd] = saved
+		return true
+	end
+	return false
+end
 -- (a $(…) puts its fds back BEFORE its capture restores fd 1 — see capture_inproc)
 function M.iso_restore_fds(ctx)
+	local h = ctx.hifds
+	if h then
+		ctx.hifds = nil
+		io.flush()
+		for fd, d in pairs(h) do
+			if d >= 0 then
+				C.dup2(d, fd)
+				C.close(d)
+			else
+				C.close(fd)
+			end
+		end
+	end
 	local sv = ctx.fds
 	if sv then
 		ctx.fds = nil
