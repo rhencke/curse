@@ -111,6 +111,10 @@ return function(sh, cmd, args, hook, tcb)
 				rt.co_block(fd, 1)
 				rt.rd_gen = rt.rd_gen + 1 -- (see rt.pipe_cache)
 				local nr = tonumber(C.read(fd, rbuf, seekable and 65536 or 1))
+				while nr < 0 and ffi.errno() == 4 do -- (EINTR: zread retries)
+					rt.eintr()
+					nr = tonumber(C.read(fd, rbuf, seekable and 65536 or 1))
+				end
 				if not nr or nr <= 0 then
 					eof = true
 				else

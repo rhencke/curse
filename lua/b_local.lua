@@ -32,19 +32,20 @@ return function(sh, cmd, args, hook, tcb)
 				attrs = true
 			end
 		until not c
-		if funcs then -- (functions: never made, only looked up)
-			local st = 0
-			for k = j, #args do
-				if args[k]:find("=", 1, true) then
-					io.stderr:write("curse: local: cannot use `-f' to make functions\n")
-					st = 1
-					break
-				elseif not sh.functions[args[k]] then
-					st = 1
+		local nodefs = false
+		if funcs then -- (declare_internal with local_var: -f/-F NAME… prints / sets attributes
+			-- on the functions, as declare does; with no NAME it lists this frame's locals,
+			-- -F without their values — show_local_var_attributes(0, nodefs))
+			if j <= #args then
+				local ok, err = pcall(require("b_export"), sh, "local", args, hook, tcb)
+				if not ok then
+					error(err, 0)
 				end
+				return
 			end
-			sh.status = st
-			return
+			for k = 2, j - 1 do
+				nodefs = nodefs or (args[k]:sub(1, 1) == "-" and args[k]:find("F", 2, true) ~= nil)
+			end
 		end
 		local rest, dash = {}, false
 		for k = j, #args do
@@ -88,7 +89,7 @@ return function(sh, cmd, args, hook, tcb)
 			for _, nm in ipairs(names) do
 				local d = fmt_decl(sh, nm)
 				if d then
-					sh:echo(d)
+					sh:echo(nodefs and d:gsub("=.*$", "") or d)
 				end
 			end
 			sh.status = 0
@@ -124,11 +125,20 @@ return function(sh, cmd, args, hook, tcb)
 		end
 		local lok = true
 		for _, a in ipairs(rest) do
-			local anm, sub, aop, aval = a:match("^([%a_][%w_]*)%[(.-)%](%+?=)(.*)$")
 			if a == "-" then
-			elseif anm then -- local a[i]=v : create the element in a local array
-				sh:localVar(anm)
-				sh:array_set(anm, array_key(sh, anm, sub), aval, aop == "+=")
+			elseif (a:match("^[^=]*") or a):find("[", 1, true) then
+				-- a subscripted NAME (`local a[i]=v`, `local 'a['`, `local 'b[]'=3`) takes
+				-- declare's path, as bash's local_builtin -> declare_internal does: its
+				-- valid-identifier and bad-subscript checks, the element in a local array
+				local st0 = sh.status
+				local ok, err = pcall(require("b_export"), sh, "local", { "local", a }, hook, tcb)
+				if not ok then
+					error(err, 0)
+				end
+				if sh.status ~= 0 then
+					lok = false
+				end
+				sh.status = st0
 			elseif not (a:match("^[%a_][%w_]*$") or a:match("^[%a_][%w_]*%+?=") or a:find("[", 1, true)) then
 				io.stderr:write("curse: local: `" .. a .. "': not a valid identifier\n")
 				lok = false

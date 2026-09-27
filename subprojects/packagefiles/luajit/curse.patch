@@ -215,7 +215,7 @@ index 24a1f7e4..bdb806fa 100644
    lj_mcode_free(J);
    memset(J->exitstubgroup, 0, sizeof(J->exitstubgroup));
    lj_vmevent_send(J2G(J), TRACE,
-@@ -883,9 +889,66 @@ static TraceNo trace_exit_find(jit_State *J, MCode *pc)
+@@ -883,9 +889,74 @@ static TraceNo trace_exit_find(jit_State *J, MCode *pc)
  #endif
  
  /* A trace exited. Restore interpreter state. */
@@ -236,6 +236,20 @@ index 24a1f7e4..bdb806fa 100644
 + * inside that operand, so there is no mid-instruction resume hazard, and the
 + * machine state at the back-edge IS the loop snapshot, so exiting there is exact.
 + * lj_trace_exit restores the original target the instant the exit fires. */
++/* Put the patched back-edge's 5 bytes back. The page is made writable again first:
++ * LuaJIT re-protects its whole mcode area read+exec whenever it commits a new trace
++ * (a side trace compiled while the patch was armed), and the write would fault. */
++static void curse_sig_unpatch(void)
++{
++  MCode *bk = curse_patched_back;
++  intptr_t pg = (intptr_t)sysconf(_SC_PAGESIZE);
++  intptr_t a = ((intptr_t)bk) & ~(pg-1);
++  intptr_t b = (((intptr_t)bk + 5 + pg-1) & ~(pg-1));
++  curse_patched_back = NULL;
++  if (mprotect((void *)a, (size_t)(b-a), PROT_READ|PROT_WRITE|PROT_EXEC)) return;
++  memcpy(bk, curse_patched_orig, 5);
++}
++
 +void curse_sig_patch_trace(void)
 +{
 +  lua_State *L = curse_globalL();
@@ -254,10 +268,7 @@ index 24a1f7e4..bdb806fa 100644
 +  if (!T || !T->loopback) return;    /* No patchable loop back-edge. */
 +  bk = T->loopback; ex = T->loopexit;
 +  if (curse_patched_back == bk) return;  /* Already armed on this loop. */
-+  if (curse_patched_back) {  /* A stale patch (its trace never ran again): undo it. */
-+    memcpy(curse_patched_back, curse_patched_orig, 5);
-+    curse_patched_back = NULL;
-+  }
++  if (curse_patched_back) curse_sig_unpatch();  /* A stale patch (its trace never ran again). */
 +  pg = (intptr_t)sysconf(_SC_PAGESIZE);
 +  a = ((intptr_t)bk) & ~(pg-1);
 +  b = (((intptr_t)bk + 5 + pg-1) & ~(pg-1));
@@ -274,10 +285,7 @@ index 24a1f7e4..bdb806fa 100644
  {
    ERRNO_SAVE
 +#ifdef CURSE_SIG_DESTRUCTIVE
-+  if (curse_patched_back) {  /* Restore the back-edge the instant we exit. */
-+    memcpy(curse_patched_back, curse_patched_orig, 5);
-+    curse_patched_back = NULL;
-+  }
++  if (curse_patched_back) curse_sig_unpatch();  /* Restore the back-edge the instant we exit. */
 +#endif
    lua_State *L = J->L;
    ExitState *ex = (ExitState *)exptr;

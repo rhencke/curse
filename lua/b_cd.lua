@@ -50,7 +50,7 @@ local function mindist(dir, guess)
 		if e == nil then
 			break
 		end
-		local name = ffi.string(ffi.cast("const char *", e) + 19) -- d_name @ 19 (glibc x86-64)
+		local name = ffi.string(ffi.cast("const char *", e) + rt.DNAME_OFF)
 		local x = spdist(name, guess)
 		if x <= dist and x ~= 3 then
 			best, dist = name, x
@@ -241,7 +241,7 @@ end
 return function(sh, cmd, args, hook, tcb, as)
 	if cmd == "cd" then
 		local who = as or "cd" -- (pushd/popd run cd under their own name in its errors)
-		if rt.restricted(sh, "cd: restricted") then
+		if rt.restricted(sh, who .. ": restricted") then
 			return
 		end
 		-- options (internal_getopt "eLP": no O_XATTR here, so -@ is invalid), a `--`,

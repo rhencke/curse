@@ -28,6 +28,7 @@ local function exec_string(sh, code, hook)
 		end
 		for _, st in ipairs(lg.stmts) do
 			local ne0 = sh.noerr
+			local pf0 = sh.procsub_files and #sh.procsub_files or 0
 			local sok, serr = pcall(I.exec_list, sh, { st }, hook, false)
 			if not sok then
 				if type(serr) == "table" and serr.__curse_lineabort and not serr.__curse_discard then
@@ -35,7 +36,7 @@ local function exec_string(sh, code, hook)
 						error(serr)
 					end
 					sh.noerr = ne0
-					rt.line_aborted(sh, 1)
+					rt.line_aborted(sh, 1, pf0)
 					break
 				end
 				error(serr)

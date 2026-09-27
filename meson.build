@@ -32,6 +32,13 @@ if get_option('native')
 endif
 
 vm_builder = find_program('tools' / 'build-luajit-vm.sh')
+# Everything under packagefiles/luajit (curse.patch + the added C libs): the VM's
+# real inputs (see the luajit-vm target).
+# (Absolute path strings, not files(): Meson's sandbox refuses files() under
+# subprojects/, which packagefiles/ sits in.)
+lj_overlay = run_command('sh', '-c',
+  'find "$1"/subprojects/packagefiles/luajit -type f ! -name meson.build | LC_ALL=C sort',
+  'sh', repo, check: true).stdout().strip().split('\n')
 
 # 2. Build the patched LuaJIT VM (drives LuaJIT's own Makefile; folds in
 #    lib_cursesys/lib_cursesig; optional 3-stage PGO via -Dpgo=true).
@@ -44,13 +51,11 @@ vm = custom_target('luajit-vm',
     '--out',   '@OUTDIR@',
     '--jobs',  '4',
     get_option('pgo') ? '--pgo' : '--no-pgo'],
-  # (curse's own C additions, and the LuaJIT files curse.patch modifies: editing
-  # them must rebuild the VM)
-  depend_files:     [lj_src / 'src' / 'lib_cursesys.c', lj_src / 'src' / 'lib_cursesig.c',
-                     lj_src / 'src' / 'lj_trace.c', lj_src / 'src' / 'lj_asm.c',
-                     lj_src / 'src' / 'lj_asm_x86.h', lj_src / 'src' / 'lj_clib.c',
-                     lj_src / 'src' / 'lj_jit.h', lj_src / 'src' / 'luajit.c',
-                     lj_src / 'src' / 'lj_ffrecord.c'],
+  # The VM is built from the pristine pinned commit + the LIVE packagefiles
+  # overlay and patch (not Meson's setup-time-prepared copy, which never picks up
+  # later edits): every file under packagefiles/luajit, and the builder itself,
+  # is a build input -- editing any of them rebuilds the VM and so `curse`.
+  depend_files:     lj_overlay + files('tools' / 'build-luajit-vm.sh'),
   console:          true,
   build_by_default: true,
   install:          true,
@@ -107,7 +112,7 @@ run_lua  = find_program('tools' / 'run-lua.sh')
 test_env = environment()
 test_env.set('LUA_PATH', repo / 'lua' / '?.lua' + ';;')
 
-foreach t : ['test_cache', 'test_ext', 'test_forin', 'test_funcs', 'test_nested', 'test_tier']
+foreach t : ['test_cache', 'test_ext', 'test_forin', 'test_funcs', 'test_nested', 'test_sigload', 'test_tier']
   test(t, run_lua,
     args:    [luajit_bin, repo / 'lua' / (t + '.lua')],
     workdir: repo,
