@@ -6971,6 +6971,9 @@ H.subshell = function(cx, st, after)
 				swpre = ("if sh.traps and sh.traps.ERR and (sh.in_trap or 0) == 0 then sh.cur_cmd = %q end; "):format(
 					require("deparse").command_text(st))
 			end
+			-- (a body compiled apart from this CFG's own lifted locals reads them from sh:
+			-- flush them first — `for ((i…)); do (echo "$i"); done` saw a stale $i)
+			swpre = swpre .. lifted_flush(cx.lifted)
 			local ln = EF.lifted_names or {}
 			if #ln > 0 then
 				local sav, vs = {}, {}
