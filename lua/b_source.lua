@@ -120,6 +120,10 @@ local function builtin(sh, cmd, args, hook, tcb)
 										if rt.lineabort_exits(sh, serr) then
 											error(serr)
 										end
+										if rt.in_subshell(sh) then -- (bash's parse_and_execute DISCARD in a subshell: to
+											sh.status = 1 -- its top level, which ends it, status 1)
+											error({ __curse_exit = 1 }, 0)
+										end
 										sh.noerr = ne0
 										rt.line_aborted(sh, 1, pf0)
 										break
