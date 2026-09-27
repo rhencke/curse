@@ -170,6 +170,17 @@ if not conf_feat.disabled()
   endif
 endif
 
+# --- Stress suite (test/stress): signals, daemon concurrency, past flakes under load,
+#     tier agreement. SEPARATE and opt-in: the default setup excludes it, so a plain
+#     `meson test` never runs it; run it with `meson test -C build --suite stress`
+#     (or test/stress/run.sh directly, which takes the knobs: -n -j -l -d …).
+stress_env = environment()
+stress_env.set('STRESS_BUILD', meson.project_build_root())
+test('stress', files('test' / 'stress' / 'run.sh'),
+  suite: 'stress', depends: conf_deps, workdir: repo, env: stress_env,
+  is_parallel: false, timeout: 0)
+add_test_setup('default', exclude_suites: ['stress'], is_default: true)
+
 summary({'dash (extra column)': dash_prog.found(),
          'bash+oil corpora': not conf_feat.disabled()},
         section: 'Conformance', bool_yn: true)
