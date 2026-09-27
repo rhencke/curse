@@ -62,8 +62,9 @@ return function(sh, cmd, args, hook, tcb)
 			end
 			return I.exec_simple(sh, t, hook)
 		end
+		local skip = rt.jobs_skip(sh) -- (a job just killed: not yet seen dead — rt.job_signalled)
 		for _, j in ipairs(sh.jobs or {}) do -- WNOHANG refresh
-			if not j.gone then
+			if not j.gone and not (skip and skip[j.pid]) then
 				job_reap(sh, j, true)
 			end
 		end

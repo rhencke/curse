@@ -161,7 +161,8 @@ return function(sh, cmd, args)
 	if c == "?" then
 		return
 	end
-	rt.jobs_poll(sh) -- (what SIGCHLD would have told bash by now: ended, stopped, continued)
+	rt.jobs_poll(sh, rt.jobs_skip(sh)) -- (what SIGCHLD would have told bash by now: ended, stopped,
+	-- continued — a job just killed not yet: rt.job_signalled)
 	if cmd == "bg" then -- every operand in turn (none: the current job); fails if any did
 		local st = 0
 		repeat

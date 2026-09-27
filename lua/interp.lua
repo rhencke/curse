@@ -4412,6 +4412,9 @@ local function job_reap(sh, job, nohang)
 	end
 	local sb = ffi.new("int[1]")
 	local r = rt.wait_child(job.pid, sb, nohang and WNOHANG or 0, not nohang and sh.in_wait and sh or nil) -- (background tasks run meanwhile)
+	if not nohang and sh.jobs_signalled then -- (waited: time enough for SIGCHLD — rt.job_signalled)
+		rt.jobs_unskip(sh)
+	end
 	if r > 0 then
 		job.done = true
 		job.status = rt.wexit(sb[0])
