@@ -1393,6 +1393,17 @@ array_key = function(sh, name, index_raw)
 		if type(v) == "table" and v.__curse_unbound then
 			error(v, 0) -- (set -u: said already, and fatal as it is — no syntax error on top)
 		end
+		if type(v) == "table" and v.pre and not v.__curse_matherr then
+			-- (a syntax error: what bash evaluated before it ran first — `[x+]` with x holding
+			-- a bad expression reports x's error, not the `+`)
+			local pok, pe = pcall(arith_pre, sh, v)
+			if not pok then
+				if type(pe) == "table" and pe.__curse_unbound then
+					error(pe, 0)
+				end
+				v = pe
+			end
+		end
 		if not (type(v) == "table" and v.__curse_matherr) then -- (an eval error already said so)
 			io.stderr:write("curse: " .. P.arith_errmsg(index_raw, v) .. "\n")
 		end
@@ -5331,6 +5342,9 @@ exec_stmt = function(sh, st, hook)
 			exec_stmt(sh, a, hook)
 			if sh.assign_err then
 				sh.cur_alist = nil
+				if sh.procsub_files then -- (the list's <() close with it)
+					drain_procsub(sh, 0, pnf)
+				end
 				return
 			end
 		end
@@ -6324,7 +6338,7 @@ local function run_group(sh, lg, hook, k)
 	for _, st in ipairs(lg.stmts) do
 		k = k + 1
 		hook("stmt", k)
-		local ne0 = sh.noerr
+		local ne0, pf0 = sh.noerr, sh.procsub_files and #sh.procsub_files or 0
 		local ok, err = pcall(exec_stmt, sh, st, hook)
 		if not ok then
 			-- a fatal WORD-context expansion (div0 in $((…)), failglob no-match) aborts
@@ -6335,7 +6349,7 @@ local function run_group(sh, lg, hook, k)
 				end
 				sh.noerr = ne0 -- (an `if`/`&&` condition it unwound out of: errexit is live again)
 				rt.posix_arith_fatal(sh, err)
-				rt.line_aborted(sh, err.__curse_badusage and not sh.opt_c and 2 or 1) -- (a failed ${x:=w})
+				rt.line_aborted(sh, err.__curse_badusage and not sh.opt_c and 2 or 1, pf0) -- (a failed ${x:=w})
 				rt.line_drift(sh, lg.sline, lg.eline) -- (bash's line numbers drift from here)
 				break
 			else
@@ -6607,7 +6621,7 @@ function M.run_variable_command(sh, pc, hook)
 				return
 			end
 			for _, st in ipairs(lg.stmts) do
-				local ne0 = sh.noerr
+				local ne0, pf0 = sh.noerr, sh.procsub_files and #sh.procsub_files or 0
 				local sok, serr = pcall(exec_stmt, sh, st, hook)
 				if not sok then
 					if type(serr) == "table" and serr.__curse_exit and not serr.__curse_lineabort then
@@ -6615,7 +6629,7 @@ function M.run_variable_command(sh, pc, hook)
 					elseif type(serr) == "table" and serr.__curse_lineabort then
 						rt.posix_arith_fatal(sh, serr)
 						sh.noerr = ne0
-						rt.line_aborted(sh, 1)
+						rt.line_aborted(sh, 1, pf0)
 						break
 					else
 						return
@@ -6748,7 +6762,7 @@ function M.source_file(sh, path, hook)
 			return
 		end
 		for _, st in ipairs(lg.stmts) do
-			local ne0 = sh.noerr
+			local ne0, pf0 = sh.noerr, sh.procsub_files and #sh.procsub_files or 0
 			local sok, serr = pcall(exec_stmt, sh, st, hook)
 			if not sok then
 				if type(serr) == "table" and serr.__curse_lineabort then
@@ -6757,7 +6771,7 @@ function M.source_file(sh, path, hook)
 					end
 					rt.posix_arith_fatal(sh, serr)
 					sh.noerr = ne0
-					rt.line_aborted(sh, 1)
+					rt.line_aborted(sh, 1, pf0)
 					break
 				else
 					error(serr)

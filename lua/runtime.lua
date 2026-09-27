@@ -8954,7 +8954,11 @@ end
 -- A line abort contained (bash's DISCARD caught by reader_loop / parse_and_execute): the
 -- status is the failure's, and so is $PIPESTATUS — exp_jump_to_top_level and set_exit_status
 -- both set_pipestatus_from_exit — whatever statement (an assignment too) was abandoned.
-function M.line_aborted(sh, status)
+function M.line_aborted(sh, status, pf0) -- (pf0: the <()/>() count before the line ran)
+	local pf = sh.procsub_files
+	if pf0 and pf and #pf > pf0 then -- (the aborted line's <() close with it: bash's
+		require("interp")._int.drain_procsub(sh, 0, pf0) -- unlink_fifo_list at top level)
+	end
 	sh.status = status
 	sh:array_assign("PIPESTATUS", { tostring(status) }, false)
 end
@@ -12492,7 +12496,13 @@ function M.array_key(sh, name, raw, expanded)
 	end
 	if not idx then
 		local _, perr = pcall(require("parser").arith, raw)
-		io.stderr:write("curse: " .. require("parser").arith_errmsg(raw, perr) .. "\n")
+		local pok, pe = pcall(require("interp")._int.arith_pre, sh, perr) -- (what ran before it)
+		if not pok and type(pe) == "table" and pe.__curse_unbound then
+			error(pe, 0)
+		end
+		if pok or not (type(pe) == "table" and pe.__curse_matherr) then
+			io.stderr:write("curse: " .. require("parser").arith_errmsg(raw, perr) .. "\n")
+		end
 		error({ __curse_exit = 1, __curse_lineabort = true })
 	end
 	return require("interp")._int.arith_key(sh, name, idx, raw)
