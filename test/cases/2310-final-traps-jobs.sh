@@ -16,9 +16,12 @@ h() { false; echo yes; }; trap 'echo ERR-h' ERR; h | cat
 trap - ERR
 
 echo "-- wait: \$!'s job stays listed when it had already ended"
+# (`/bin/true`: a foreground wait runs notify_of_job_status, which in bash 5.2.21 drops the
+# TERM-killed jobs; without it, whether `dead`'s last `sleep` ran after job 2 died decides
+# if job 2 — $!'s — is still listed: a race in bash itself)
 cat > "$t/w.sh" <<'EOF'
 dead() { while kill -0 "$1" 2>/dev/null; do sleep 0.02; done; }
-sleep 3 & a=$!; sleep 3 & b=$!; kill %1 %2; dead $a; dead $b; wait; jobs; echo ---
+sleep 3 & a=$!; sleep 3 & b=$!; kill %1 %2; dead $a; dead $b; /bin/true; wait; jobs; echo ---
 sleep 3 & kill %1; dead $!
 jobs; echo ---
 (exit 3) & p=$!; sleep 0.1 & wait; wait $p; echo "p=$?"
