@@ -11975,8 +11975,10 @@ end
 -- $IFS as bash's two delimiter sets (subst.c): `set` holds every BYTE of IFS (ifs_cmap);
 -- `wset` the multibyte characters string_extract_verbatim matches WHOLE (its mbstowcs'd
 -- wcharlist: when IFS holds an invalid sequence mbstowcs fails, leaving only IFS's first
--- char in the buffer — so then `wset` is that char alone, if multibyte). `mbifs`: the
--- locale is multibyte and IFS has a high byte, so a scan must walk the text by character;
+-- char in the buffer — so then `wset` is that char alone, if multibyte). `mset`: in a
+-- non-UTF-8 multibyte locale, the bytes MEMBER (general.h) finds in IFS — see M.ifs_find.
+-- `mbifs`: a scan must walk the text by character — a UTF-8 locale and an IFS with a high
+-- byte, or any non-UTF-8 multibyte locale (a trail byte may be ASCII: Big5's `\xa4@`);
 -- `pat` finds the next candidate delimiter byte (`epat`: read's CTLESC \1 too).
 -- IFS whitespace, by byte: `wsb` the IFS bytes bash's ifs_whitespace (ISSPACE: space, tab,
 -- newline AND \v \f \r) counts — word splitting's (list_string's) whitespace, and read's
@@ -11986,8 +11988,7 @@ end
 -- "$@" word, split unstripped, differ: FB's dl 0). `mbx`: a word split here can see bytes
 -- of a QUOTED multibyte char (bash's CTLESC skips one byte, then scans the rest: FB's
 -- exposure) or a char split across word parts — a multibyte locale and an IFS with a high
--- byte (any IFS in a non-UTF-8 one, whose trail bytes may be ASCII); `fbic`: the sets a
--- word split walks by character with there (read keeps its byte-wise scan).
+-- byte (any IFS in a non-UTF-8 one, whose trail bytes may be ASCII).
 -- ifs_charset_of builds it for a given IFS text (read's own split takes the IFS it was
 -- handed); ifs_charset memoizes $IFS's in sh._ifscache keyed on the IFS text and the
 -- locale (a locale change re-splits `é`).
@@ -12013,7 +12014,28 @@ function M.ifs_charset_of(ifs)
 		end
 	end
 	local mb = M.lc_mb_cur_max() > 1
-	local mbifs = mb and ifs:find("[\128-\255]") ~= nil
+	local u8 = mb and M.lc_utf8()
+	local mbifs = mb and (not u8 or ifs:find("[\128-\255]") ~= nil)
+	local mset
+	if mb and not u8 and ifs ~= "" then -- (MEMBER's non-UTF-8 rule: see M.ifs_find)
+		mset = {}
+		if #ifs == 1 then
+			mset[ifs:byte()] = true
+		else
+			for k = 1, #ifs do
+				local b = ifs:byte(k)
+				if b < 0x30 then
+					mset[b] = true
+				end
+			end
+			for _, ch in ipairs(M.mb_chars(ifs)) do
+				local b = ch.s:byte()
+				if #ch.s == 1 and b < 0x80 then
+					mset[b] = true
+				end
+			end
+		end
+	end
 	if mbifs then
 		local chs = M.mb_chars(ifs)
 		for _, ch in ipairs(chs) do
@@ -12030,20 +12052,10 @@ function M.ifs_charset_of(ifs)
 		end
 	end
 	local cls = ifs:gsub("%W", "%%%0")
-	ic = { ifs = ifs, set = set, wset = wset, mbifs = mbifs, lg = M.locale_gen, wsb = wsb, rwsb = rwsb,
-		mixed = ws and nws, mbx = mbifs or (mb and ifs ~= "" and not M.lc_utf8()), cls = cls,
-		u8 = mb and ifs ~= "" and M.lc_utf8(),
+	ic = { ifs = ifs, set = set, wset = wset, mbifs = mbifs, mset = mset, lg = M.locale_gen, wsb = wsb,
+		rwsb = rwsb, mixed = ws and nws, mbx = ifs ~= "" and mbifs, cls = cls, u8 = ifs ~= "" and u8,
 		pat = cls ~= "" and ("[" .. cls .. (mbifs and "\128-\255" or "") .. "]") or nil,
 		epat = "[\1" .. cls .. (mbifs and "\128-\255" or "") .. "]" }
-	ic.fbic = ic
-	if ic.mbx and not mbifs then -- (non-UTF-8: the word split walks chars, read stays byte-wise)
-		local w = {}
-		for k, v in pairs(ic) do
-			w[k] = v
-		end
-		w.mbifs, w.pat = true, "[" .. cls .. "\128-\255]"
-		ic.fbic, w.fbic = w, w
-	end
 	ifs_ics[ifs] = ic
 	return ic
 end
@@ -12062,41 +12074,6 @@ local function skip_ws(wsb, v, i, n) -- past a run of the IFS whitespace bytes `
 		i = i + 1
 	end
 	return i
-end
--- bash's string_extract_verbatim (subst.c): the first IFS delimiter in v from i — its
--- position and byte length — or nil. A field's END is found per character: a valid
--- multibyte char delimits only whole (`wset`) and is otherwise stepped over whole; any
--- other byte delimits if it is an IFS byte — a stray lead/continuation byte of `é`
--- included. `esc`: read's CTLESC \1 makes the next BYTE literal (bash's i += 2 — so an
--- escaped `é`'s second byte is scanned on its own); esc 2 (IFS holds \1: SX_NOCTLESC)
--- only a CTLNUL's \1\177 pair (SX_NOESCCTLNUL), any other \1 being an IFS byte.
-function M.ifs_find(ic, v, i, esc)
-	local pat = esc and ic.epat or ic.pat
-	if not pat then
-		return nil
-	end
-	while true do
-		local k = v:find(pat, i)
-		if not k then
-			return nil
-		end
-		local b = v:byte(k)
-		if b == 1 and esc and (esc == true or v:byte(k + 1) == 127) then
-			i = k + 2
-		elseif b < 0x80 or not ic.mbifs then
-			return k, 1
-		else
-			local l = M.mb_charlen(v, k)
-			if l == 1 then
-				if ic.set[v:sub(k, k)] then
-					return k, 1
-				end
-			elseif ic.wset and ic.wset[v:sub(k, k + l - 1)] then
-				return k, l
-			end
-			i = k + l
-		end
-	end
 end
 -- glibc's mbtowc keeps a STATIC conversion state, and bash's string_extract_verbatim
 -- calls it (subst.c: `mblength = mbtowc (&wc, string + i, slen - i)`) at every non-ASCII
@@ -12159,11 +12136,8 @@ function M.mbtowc_visit(h, v, k, e, more)
 	h.mbw = nil
 	return j - k, p
 end
--- ifs_find (h: the shell) where the scan's mbtowc calls matter (a pending state, or a string that may
--- leave one): every non-ASCII position the scan visits goes through mbtowc_visit — an
--- invalid result tests the byte (MEMBER), a valid one the char against IFS's own chars
--- (wcschr), each then stepped over by a fresh ADVANCE_CHAR.
-function M.ifs_find_st(ic, v, i, esc, e, more, h)
+do
+local function ifs_find_st(ic, v, i, esc, e, more, h)
 	local pat = esc and ("[\1\128-\255" .. ic.cls .. "]") or ("[\128-\255" .. ic.cls .. "]")
 	local set, wset = ic.set, ic.wset
 	e = e or #v
@@ -12190,6 +12164,65 @@ function M.ifs_find_st(ic, v, i, esc, e, more, h)
 			i = k + l
 		end
 	end
+end
+-- bash's string_extract_verbatim (subst.c): the first IFS delimiter in v from i — its
+-- position and byte length — or nil. A field's END is found per character: a valid
+-- multibyte char delimits only whole (`wset`: wcschr) and is otherwise stepped over whole;
+-- any other byte — ASCII, or a byte of an invalid/incomplete sequence (then stepped over
+-- alone) — delimits if MEMBER (general.h) finds it in IFS. MEMBER tests the byte as a
+-- SIGNED char: it matches when IFS is that one byte, else through mbschr — in a UTF-8
+-- locale a plain strchr (any IFS byte: a stray lead byte of `é` delimits under IFS=é);
+-- in another multibyte locale (Big5, GBK, GB18030, SJIS) a byte below '0' by strchr (any
+-- IFS byte), else only if IFS, walked by character, holds it as a single-byte char — so
+-- a high byte never matches (its signed value is no unsigned byte: under IFS=é in Big5
+-- `a\xc3\xa0b` stays whole) and an ASCII trail byte of an IFS char doesn't either
+-- (IFS=$'\xa4@' keeps `a@b` whole). ic.mset holds that rule's bytes. `esc`: read's CTLESC
+-- \1 makes the next BYTE literal (bash's i += 2 — so an escaped `é`'s second byte is
+-- scanned on its own); esc 2 (IFS holds \1: SX_NOCTLESC) only a CTLNUL's \1\177 pair
+-- (SX_NOESCCTLNUL), any other \1 being an IFS byte. With `h` (the state holder: the
+-- shell) the scan's mbtowc calls are modelled (M.mbtowc_visit — UTF-8 only): every
+-- non-ASCII position the scan visits, up to v[e] (`more`: bytes follow), goes through
+-- the static state — an invalid result tests the byte (MEMBER), a valid one the char
+-- against IFS's own chars (wcschr), each then stepped over by a fresh ADVANCE_CHAR.
+function M.ifs_find(ic, v, i, esc, e, more, h)
+	if h then
+		return ifs_find_st(ic, v, i, esc, e, more, h)
+	end
+	local pat = esc and ic.epat or ic.pat
+	if not pat then
+		return nil
+	end
+	local mset = ic.mset
+	while true do
+		local k = v:find(pat, i)
+		if not k then
+			return nil
+		end
+		local b = v:byte(k)
+		if b == 1 and esc and (esc == true or v:byte(k + 1) == 127) then
+			i = k + 2
+		elseif b < 0x80 or not ic.mbifs then
+			if not mset or mset[b] then
+				return k, 1
+			end
+			i = k + 1
+		else
+			local l = M.mb_charlen(v, k)
+			if l == 1 then
+				if mset then
+					if mset[b] then
+						return k, 1
+					end
+				elseif ic.set[v:sub(k, k)] then
+					return k, 1
+				end
+			elseif ic.wset and ic.wset[v:sub(k, k + l - 1)] then
+				return k, l
+			end
+			i = k + l
+		end
+	end
+end
 end
 -- the state a scan leaves when the string it reaches the END of ends in `v` (the last
 -- few bytes decide: an incomplete sequence there is visited byte by byte)
@@ -12336,7 +12369,7 @@ FB.__index = FB
 -- `nolog`: a caller that reads fb.fields itself (read -a's rt.ifs_split).
 function M.fb_new(sh, nolog)
 	local ic = M.ifs_charset(sh)
-	local fb = setmetatable({ sh = sh, ifs = ic.ifs, set = ic.set, ic = nolog and ic or ic.fbic, dl = 2,
+	local fb = setmetatable({ sh = sh, ifs = ic.ifs, set = ic.set, ic = ic, dl = 2,
 		fields = {}, fu = {}, fq = {}, n = 0, cur = nil, unq = false, q = false }, FB)
 	if (ic.mbx or (sh.mbw and ic.u8)) and not nolog then
 		fb.log = {}
@@ -12376,7 +12409,7 @@ local function psplit(self, v)
 	local more
 	local h
 	if self.st then -- (the scan's mbtowc calls: M.mbtowc_visit)
-		find, more, h = M.ifs_find_st, not self.tail, self.sh
+		more, h = not self.tail, self.sh
 	end
 	while i <= n do
 		if dl then
@@ -12429,6 +12462,7 @@ end
 -- (`q=(aéb); IFS=é; "${q[@]}"` -> `a\xc3` `b`). The char's first byte is never tested.
 local function expose(self, s, unq, peek, pend_)
 	local set, i, k, n, st = self.set, 1, 1, #s, self.st
+	local mset = self.ic.mset
 	while true do
 		k = s:find("[\128-\255]", k)
 		if not k then
@@ -12451,6 +12485,8 @@ local function expose(self, s, unq, peek, pend_)
 				else
 					d = self.ic.wset and self.ic.wset[ch]
 				end
+			elseif mset then -- (non-UTF-8: MEMBER's rule, M.ifs_find)
+				d = mset[s:byte(j)]
 			else
 				d = set[s:sub(j, j)]
 			end
@@ -12569,6 +12605,15 @@ function FB:multi(els, quoted, star, lone, segend)
 				local sp = M.ifs_first(self.ifs, self.sh)
 				local r, ch = M.mbtowc_visit(self.sh, sp, 1, #sp, true)
 				if r > 0 and not (self.ic.wset and self.ic.wset[ch]) then
+					padd(self, sp, true)
+					sep = false
+				end
+			elseif k > 1 and quoted and self.xp and self.ic.mset then
+				-- (non-UTF-8: an IFS[0] of one high byte — an invalid sequence or a
+				-- single-byte char — in an IFS of more bytes is no MEMBER (M.ifs_find): the
+				-- elements join on it)
+				local sp = M.ifs_first(self.ifs, self.sh)
+				if #sp == 1 and not self.ic.mset[sp:byte()] then
 					padd(self, sp, true)
 					sep = false
 				end
