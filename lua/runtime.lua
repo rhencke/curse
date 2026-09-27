@@ -3901,13 +3901,43 @@ end
 -- context has ended, so the parent's trap (or default action) handles it — after the
 -- subshell, as a parent waiting on a real child would.
 cap_depth = 0 -- in-process $(…) bodies running (any path), in process cap_pid
+--
+-- The same hold covers the scheduler: a signal whose hook fires while a task runs (a
+-- background job, a pipeline stage, a procsub body — each a coroutine of THIS process)
+-- or while the scheduler itself runs between them (the shell's own fds parked) was sent
+-- to the shell, not to the task: its trap runs in the shell, with the shell's `sh`, so
+-- its exit/return/break act on the shell's control flow (bash: the trap is the parent's;
+-- the child that ran `kill $$` goes on). Held here, it is raised again once the shell is
+-- back in its own coroutine (M.raise_task_held, when the scheduler returns).
 function M.defer_signal(sh, sig)
+	if CO then
+		local h = M.task_held or {}
+		M.task_held, h[sig] = h, true
+		return true
+	end
 	if not (iso_cur(sh) or (cap_depth > 0 and cap_pid == C.getpid())) then
 		return false
 	end
 	deferred_sigs = deferred_sigs or {}
 	deferred_sigs[sig] = true
 	return true
+end
+-- (the held signals, raised again together: blocked while sent, so the hook sees them
+-- all pending at once and runs their traps in ascending order — lib_cursesig.c)
+pcall(ffi.cdef, "void curse_sig_hold(int hold);")
+function M.raise_task_held()
+	local h = M.task_held
+	if h and not CO then
+		M.task_held = nil
+		local me = C.getpid()
+		C.curse_sig_hold(1)
+		for sig = 1, 64 do
+			if h[sig] then
+				C.kill(me, sig)
+			end
+		end
+		C.curse_sig_hold(0)
+	end
 end
 -- A trapped signal arriving while the shell waits for a foreground command — an external,
 -- a pipeline — runs its trap once the command has finished (bash: trap_handler only marks
@@ -6333,6 +6363,8 @@ function Shell:run_pipeline_co(stage_fns, inproc, lastpipe, upv_get, upv_set)
 	if not ok_all then
 		error(err_all)
 	end
+	M.raise_task_held() -- (a signal that came while a stage ran: the shell's — held by
+	-- the caller until the pipeline is done: fg_hold_enter)
 	return g ~= nil or nil
 end
 
@@ -6415,6 +6447,11 @@ function M.sched_pump(w)
 		error(err, 0)
 	end
 	M.fg_arm() -- (the foreground runs on: its slice, while jobs still live)
+	if w.drop_sigs then -- (the shell has ended: a job's `kill $$` finds no one)
+		M.task_held = nil
+	else
+		M.raise_task_held() -- (a signal that came while a job ran: the shell's trap, now)
+	end
 	return ready
 end
 -- Wait until every task group in `gs` has ended: inside a task, by yielding on each (the
@@ -6504,7 +6541,7 @@ function M.sched_drain(sh)
 	end
 	while sched_live() and not CO do
 		M.tasks_hangup_stopped() -- (one a job stopped meanwhile)
-		M.sched_pump({ untilf = function()
+		M.sched_pump({ drop_sigs = true, untilf = function()
 			return next(SCHED.bycoro) == nil
 		end })
 	end

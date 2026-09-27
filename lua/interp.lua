@@ -4949,6 +4949,15 @@ local function loop_signal(sh, err)
 	sh.loopdepth = sh.loopdepth - 1
 	error(err, 0) -- exit/return/real error propagates
 end
+-- A loop head's preemption point (rt.preempt: the jobs' turn) can run a trap — one
+-- that a job's `kill $$` raised meanwhile — and its break/continue act on THIS loop, as
+-- a trap run after the body's last command would (bash). Returns "break" to end it.
+local function loop_preempt(sh)
+	local ok, err = pcall(rt.preempt)
+	if not ok then
+		return loop_signal(sh, err)
+	end
+end
 local function run_loop_body(sh, body, hook)
 	local ne = sh.noerr
 	local ok, err = pcall(exec_list, sh, body, hook, false)
@@ -5556,8 +5565,8 @@ exec_stmt = function(sh, st, hook)
 					bodystatus = sh.status
 					break
 				end
-				if PREEMPT[0] ~= 0 then
-					rt.preempt()
+				if PREEMPT[0] ~= 0 and loop_preempt(sh) == "break" then
+					break
 				end
 				fdbg(2)
 				if st.cond then
@@ -5608,8 +5617,8 @@ exec_stmt = function(sh, st, hook)
 				bodystatus = sh.status
 				break
 			end
-			if PREEMPT[0] ~= 0 then
-				rt.preempt()
+			if PREEMPT[0] ~= 0 and loop_preempt(sh) == "break" then
+				break
 			end
 			-- a break/continue in the CONDITION affects this loop too (bash)
 			sh.noerr = sh.noerr + 1
@@ -5919,8 +5928,8 @@ exec_stmt = function(sh, st, hook)
 				bodystatus = sh.status
 				break
 			end
-			if PREEMPT[0] ~= 0 then
-				rt.preempt()
+			if PREEMPT[0] ~= 0 and loop_preempt(sh) == "break" then
+				break
 			end
 			fs.idx = fs.idx + 1
 			if fs.idx > #fs.list then
@@ -6244,6 +6253,13 @@ local function run_signal(sh, signum, direct, nested)
 	if not direct and not nested and rt.fg_held(signum) then
 		return -- (a foreground command runs: the trap runs once it has finished)
 	end
+	-- a trapped signal ends a `wait`: 128+sig (see b_wait) — but SIGCHLD only in posix
+	-- mode. bash's wait returns first and the trap runs after it: the handler's $? (and
+	-- the status it leaves) is the wait's 128+sig
+	local ends_wait = sh.in_wait and (signum ~= 17 or sh.opt_posix)
+	if ends_wait then
+		sh.status = 128 + signum
+	end
 	-- an asynchronously-delivered signal handler reports $LINENO = 1 (bash).
 	local saved, sl = sh.status, sh.cur_line
 	sh.cur_line = 1
@@ -6265,8 +6281,7 @@ local function run_signal(sh, signum, direct, nested)
 		exited, rret = run_trap(sh, h, "trap")
 	end
 	sh.cur_line = sl
-	-- a trapped signal ends a `wait`: 128+sig (see b_wait) — but SIGCHLD only in posix mode
-	if sh.in_wait and (signum ~= 17 or sh.opt_posix) then
+	if ends_wait then
 		sh.wait_sig = signum
 	end
 	if exited then

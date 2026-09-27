@@ -7526,6 +7526,15 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
 		cx.lc_base = cx.lc_base or { cx.newloopvar("(sh.loopdepth or 0)"), cx.newloopvar("(sh.lc_depth or 0)") }
 		return cx.lc_base[1], cx.lc_base[2]
 	end
+	-- (the loop's head — its OSR resume point, cx.loopPc — sets the marks too: a tier
+	-- switch enters there, past the loop's `pre` block, and a trap's break/continue at
+	-- the head's preemption point must still find the loop marked compiled)
+	function cx.lc_head(st, marks)
+		local hp = cx.loopPc[st.id]
+		if hp and cx.blocks[hp] then
+			cx.blocks[hp] = marks .. cx.blocks[hp]
+		end
+	end
 	function cx.newpc()
 		local p = cx.npc
 		cx.npc = cx.npc + 1
@@ -8392,12 +8401,14 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
 				entry = cx.flatten_stmt(st, post)
 				pre = cx.newpc()
 				cx.blocks[pre] = ("sh.loopdepth = %s + %d; sh.lc_depth = sh.loopdepth; pc = %d"):format(lb, D + 1, entry)
+				cx.lc_head(st, ("sh.loopdepth = %s + %d; sh.lc_depth = sh.loopdepth; "):format(lb, D + 1))
 				return pre
 			end
 			cx.blocks[post] = ("sh.loopdepth, sh.lc_depth = %d, %d; pc = %d"):format(D, D, after)
 			entry = cx.flatten_stmt(st, post)
 			pre = cx.newpc()
 			cx.blocks[pre] = ("sh.loopdepth, sh.lc_depth = %d, %d; pc = %d"):format(D + 1, D + 1, entry)
+			cx.lc_head(st, ("sh.loopdepth, sh.lc_depth = %d, %d; "):format(D + 1, D + 1))
 			return pre
 		end
 		if t == "arithcmd" then -- (bash's this_command_name, baked into its arith error texts)
