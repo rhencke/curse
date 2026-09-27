@@ -9,7 +9,7 @@ f=${TMPDIR:-/tmp}/jc.$$; mkfifo "$f"; exec 3<>"$f"; rm -f "$f"
 # (not `jobs -s %?WORD`: with a job spec bash ignores -s/-r — jobs.def's list_one_job — so
 # that returned at once, before the stop had even landed: a race bash won only because
 # its $(…) forks, and a test bug)
-jstate() { local k l; for ((k = 0; k < 300; k++)); do while read -r l; do [[ $l == *"$2"* ]] && return 0; done < <(jobs $1); /bin/sleep 0.01; done; return 1; }
+jstate() { local k; for ((k = 0; k < 300; k++)); do [[ $(jobs $1) == *"$2"* ]] && return 0; /bin/sleep 0.01; done; return 1; }
 /bin/sleep 5 & p=$!
 echo "\$! of an external job is a real process: $(ps -o pid= -p $p >/dev/null && echo yes || echo no)"
 kill %?5; wait %?5
