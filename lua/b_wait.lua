@@ -322,7 +322,7 @@ wait_builtin = function(sh, cmd, args, hook, tcb)
 						end
 					elseif sh.disowned and sh.disowned[pid] then
 						last = sh.disowned[pid]
-					elseif sh.bgp_cleared and sh.bgp_cleared[pid] then -- (a `( … )`'s parent's: bgp_clear)
+					elseif rt.bgp_foreign(sh, pid) then -- (a `( … )`'s parent's: bgp_clear)
 						io.stderr:write("curse: wait: pid " .. pid .. " is not a child of this shell\n")
 						last, waited = 127, nil
 					elseif rt.vpid_tasks[pid] and rt.vpid_tasks[pid].g.bg then -- (a disowned in-process job)

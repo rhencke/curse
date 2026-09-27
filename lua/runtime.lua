@@ -4502,6 +4502,20 @@ function M.stage_flat(st, isfn)
 		end
 	end
 end
+-- A pid `wait` must call "not a child of this shell": a job of a parent a subshell
+-- (bgp_cleared) or an async child (bgp_parent: its parent's job list, kept as is — no
+-- per-launch copy) inherited.
+function M.bgp_foreign(sh, pid)
+	if sh.bgp_cleared and sh.bgp_cleared[pid] then
+		return true
+	end
+	for _, j in ipairs(sh.bgp_parent or {}) do
+		if j.pid == pid then
+			return true
+		end
+	end
+	return false
+end
 -- The pids of sh's jobs, as seen from a subshell that lists them (a pipeline stage, $(…))
 -- but can't wait on them: they aren't its children.
 function M.foreign_jobs(sh)
@@ -6429,11 +6443,9 @@ function Shell:bg_launch(fn, cmdstr, flat, simple, upv_get, upv_set, opts)
 				-- `jobs` lists none, %1 is no such job, `wait PID` isn't its child; a <()/>()
 				-- child keeps its view of them: process_substitute only turns job control off)
 				local tsh = t.sh
-				local fj = M.foreign_jobs(self)
-				for pid in pairs(tsh.bgp_cleared or {}) do
-					fj[pid] = true
+				if tsh.jobs and tsh.jobs[1] then -- (its copy of the parent's list: rt.bgp_foreign)
+					tsh.bgp_parent = tsh.jobs
 				end
-				tsh.bgp_cleared = next(fj) and fj or tsh.bgp_cleared
 				tsh.jobs, tsh.job_cur, tsh.job_prev = {}, nil, nil
 			end
 			if g.simple then -- (bash execs a `cmd &` job's external in place: rt.exec_tail_lvl)
