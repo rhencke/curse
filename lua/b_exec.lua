@@ -4,7 +4,7 @@
 local ffi = require("ffi")
 local rt = require("runtime")
 local I = require("interp")._int
-local apply_redirs, restore_redirs, C = I.apply_redirs, I.restore_redirs, I.C
+local apply_redirs, C = I.apply_redirs, I.C
 
 -- bash's full_pathname (general.c): an absolute name as is, else under the (logical) cwd
 -- with a leading `./` dropped (sh_makepath's MP_DOCWD|MP_RMDOT)
@@ -91,7 +91,7 @@ return function(sh, st, args, hook, viacmd)
 		if not ok then -- (the builtin never runs; posix: a special builtin's redirection
 			-- error is fatal to a non-interactive shell — `command exec` only fails)
 			if type(sv) == "table" then
-				restore_redirs(sv)
+				rt.redir_undo(sv)
 			end
 			sh.status = 1
 			if sh.opt_posix and not viacmd and not sh.opt_i then

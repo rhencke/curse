@@ -2944,7 +2944,7 @@ end
 -- The ONE authority: capture_src asks it at run time with fns = sh.functions; emit asks
 -- at compile time with the program's funcflags, and because that table is never the
 -- whole truth (eval/trap/source fragments, line mode, env-imported functions) it guards
--- every pure call site with "none of these names is a function now" (emit pure_guard),
+-- every pure call site with "none of these names is a function now" (emit's dyn_guard),
 -- falling back to capture_src. The exact rule — pure iff:
 --  * the text never names $BASHPID/$RANDOM (per-subshell values);
 --  * every command (through && || and pipelines) is a simple command with no
@@ -7376,7 +7376,7 @@ function M.file_bincmp(op, x, y)
 	return ay and (not ax or older(_ft_a, _ft_b)) -- -ot: x older (or x missing)
 end
 
--- [[ l == r ]] / [[ l = r ]] (the compiled tier's twin of interp's dbracket_eq): a QUOTED
+-- [[ l == r ]] / [[ l = r ]] (the compiled tier's; interp's [[ ]] evaluator matches inline): a QUOTED
 -- rhs is a literal string (fast `==` unless nocasematch, else glob its escaped form), an
 -- UNQUOTED rhs is a glob pattern. Honors shopt nocasematch. `rq` = rhs was quoted.
 local function db_glob_escape(s)
@@ -8721,18 +8721,6 @@ function M.builtin_help(sh, cmd)
 	sh.status = 2
 	sh.spb_err = 2 -- (EX_USAGE: M.spb_run)
 end
--- `return N`'s status (bash's get_exitstat): N mod 256, or 2 with a message for a non-number.
-function M.return_code(sh, s, first) -- (first: the command's first word — `--` ends options)
-	if first and s == "--" then
-		return sh.status
-	end
-	local n = s:match("^%s*[+-]?%d+%s*$") and tonumber(s)
-	if not n then
-		io.stderr:write("curse: return: " .. s .. ": numeric argument required\n")
-		return 2
-	end
-	return n % 256
-end
 -- bash's no_args: `CMD: too many arguments`, and the whole current command is discarded
 -- (the rest of the line; all of a -c string).
 function M.too_many(sh, cmd)
@@ -8960,7 +8948,7 @@ function M.nameref_len(sh, name)
 end
 -- Capture-aware error write: inside a `$(...)` capture with `2>&1` active, route
 -- the message into the capture buffer (self.out) so it's captured like bash;
--- otherwise to real stderr. Mirrors interp's sherr for runtime-side messages.
+-- otherwise to real stderr. (interp's sherr is this function.)
 function Shell:errmsg(msg)
 	if self.capturing and (self.err2out or 0) > 0 then
 		if msg:sub(1, 7) == "curse: " then
@@ -14046,7 +14034,7 @@ end
 -- Returns true when the write went through.
 function M.chkwrite(sh, name)
 	local t = sh.out ~= io.write and CO_OUTS[sh.out]
-	if t then -- (a pipeline stage's buffered output, with SIGPIPE ignored: M.chkwrite_stage)
+	if t then -- (a pipeline stage's buffered output, with SIGPIPE ignored)
 		task_flush(t)
 		local w = t.werr
 		t.werr = nil
@@ -14275,7 +14263,7 @@ function M.spb_run(sh, run, a1, a2, a3, a4)
 	end
 end
 -- A special builtin's redirection failed (EX_REDIRFAIL): fatal to a non-interactive posix
--- shell, else just the failure (false) — the compiled tier's twin of interp's run_cmd check.
+-- shell, else just the failure (false) — the compiled tier's form of interp's SIMPLE.redirs check.
 function M.spb_redir(sh, rs)
 	if sh.opt_posix and not sh.opt_i then
 		M.redir_restore(rs)
@@ -14393,7 +14381,7 @@ function M.report_recoverable(sh, perr)
 		sh.cur_line = perr.line
 	end
 	local msg = tostring(perr.msg or "syntax error"):gsub("^syntax error near `", "syntax error near unexpected token `")
-	if perr.exactmsg then -- (its own msgid: M.report_perr)
+	if perr.exactmsg then -- (its own msgid: rt.L)
 		msg = M.L(msg)
 	end
 	sh.in_perr = true -- (named like the shell's other syntax errors: `NAME: eval: line N:`)
@@ -15158,8 +15146,8 @@ function M.substr_arith(sh, name, s)
 	end
 	return tonumber(v)
 end
--- `[[ -v NAME ]]` / `[[ -v a[i] ]]`: is the variable (or array element) set? interp's
--- var_is_set twin. `nm` is already word-expanded, so an array subscript is a plain literal
+-- `[[ -v NAME ]]` / `[[ -v a[i] ]]`: is the variable (or array element) set? (both
+-- tiers). `nm` is already word-expanded, so an array subscript is a plain literal
 -- (no $): an ASSOC key is used verbatim, an INDEXED subscript is arith-evaluated via
 -- rt.arith_str (native; a nested-subscript operand defers through arith_str's seam). A
 -- bare array name tests element 0 (like bash); a digit is a positional parameter.
@@ -16461,7 +16449,7 @@ do
 		end
 		if (cmd == "eval" or cmd == "source" or cmd == ".") and not spec.ix
 			and not (sh.functions[cmd] and not (sh.opt_posix and M.SPECIAL_BUILTIN[cmd]))
-			and not (sh.disabled_builtins and sh.disabled_builtins[cmd]) then
+			and M.builtin_enabled(sh, cmd) then
 			sh.tenv_call_base = nil -- (a function the code calls can't absorb these bindings)
 			if cmd == "eval" then
 				return M.eval(sh, argv)

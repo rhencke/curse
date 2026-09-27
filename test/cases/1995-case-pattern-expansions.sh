@@ -1,5 +1,5 @@
 # case / [[ == ]] patterns with $(…), $((…)), ${…} operators and $*/$@: compiled to
-# their glob form (quoted parts escaped) instead of the shared I.case_match matcher.
+# their glob form (quoted parts escaped) natively (rt.case_glob, not an interpreted matcher).
 # (and a recurring $(…) whose body redirects a builtin: the tier fragment runs under the
 # isolated fd-level capture, so `echo e >&2` reaches stderr)
 set -- "a b" c
