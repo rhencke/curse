@@ -25,10 +25,10 @@ drv_main() {
 			for ((i = 0; i < per; i++)); do
 				[ $((i % 10)) = 0 ] && past_deadline && break
 				s=s$((1 + (i + p) % 2)); l=C; [ $(((i / 2 + p) % 2)) = 1 ] && l=zh_CN.gbk
-				got=$(cd "$x" && env -i PATH=/usr/bin:/bin LC_ALL=$l XDG_RUNTIME_DIR="$SCR/xdg" XDG_CACHE_HOME="$cache" \
+				got=$(cd "$x" && env -i PATH=/usr/bin:/bin LC_ALL=$l XDG_RUNTIME_DIR="$XDG" XDG_CACHE_HOME="$cache" \
 					CURSE_FALLBACK="$FALLBACK" "$CLIENT" "$s.sh" 2>/dev/null; echo "[$?]")
 				[ "$got" = "$(cat "$x/exp.$s.$l")" ] || { printf 'file %s %s: %s\n' "$s" "$l" "$(echo "$got" | tr '\n' '|')" >>"$x/bad.$p"; }
-				got=$(cd "$x" && env -i PATH=/usr/bin:/bin LC_ALL=$l XDG_RUNTIME_DIR="$SCR/xdg" XDG_CACHE_HOME="$cache" \
+				got=$(cd "$x" && env -i PATH=/usr/bin:/bin LC_ALL=$l XDG_RUNTIME_DIR="$XDG" XDG_CACHE_HOME="$cache" \
 					CURSE_FALLBACK="$FALLBACK" "$CLIENT" -c "$(cat "$x/$s.sh")" 2>/dev/null; echo "[$?]")
 				[ "$got" = "$(cat "$x/expc.$s.$l")" ] || { printf -- '-c %s %s: %s\n' "$s" "$l" "$(echo "$got" | tr '\n' '|')" >>"$x/bad.$p"; }
 			done

@@ -138,13 +138,14 @@ start_daemon() {
 	pid=$(env XDG_RUNTIME_DIR="$1" XDG_CACHE_HOME="$2" CURSE_BUNDLE="$BUNDLE" CURSE_WORKERS="$3" \
 		CURSE_IDLE=3600 "$STH" spawn "$4" -- "$LUAJIT" "$REPO/lua/daemon.lua") || return 1
 	until [ -S "$1/curse.sock" ]; do
-		n=$((n + 1)); [ $n -gt 500 ] && { echo "stress: daemon did not start" >&2; cat "$4" >&2; return 1; }
+		n=$((n + 1)); [ $n -gt 1500 ] && { echo "stress: daemon did not start in 30s" >&2; cat "$4" >&2; return 1; }
 		sleep 0.02
 	done
 	echo "$pid"
 }
 DWORKERS=$((JOBS + 1))
-DPID=$(start_daemon "$SCR/xdg" "$SCR/dcache" "$DWORKERS" "$SCR/daemon.log") || exit 2
+XDGN=0 XDG=$SCR/xdg # (the private daemon's runtime dir: a new one on each restart)
+DPID=$(start_daemon "$XDG" "$SCR/dcache" "$DWORKERS" "$SCR/daemon.log") || exit 2
 workers() { "$STH" children "${1:-$DPID}" | wc -l; } # a daemon's workers are its children
 
 # ---- running one shell ------------------------------------------------------------------
@@ -161,7 +162,7 @@ runsh() {
 	local ms; ms=$(awk -v t="$tmo" -v s="$TSCALE" 'BEGIN{printf "%d", t*s*1000}')
 	local -a E=(env -i PATH="/usr/local/bin:/usr/bin:/bin" HOME="$cwd" TMP="$cwd" LANG=C.UTF-8
 		TMPDIR="${R_TMPDIR:-$TT}" STH="$STH" STRESS_PROBE_OUT="$p.probe" STRESS_TDIR="$TDIR"
-		XDG_RUNTIME_DIR="$SCR/xdg" XDG_CACHE_HOME="${R_CACHE:-$SCR/dcache}" CURSE_FALLBACK="$FALLBACK"
+		XDG_RUNTIME_DIR="$XDG" XDG_CACHE_HOME="${R_CACHE:-$SCR/dcache}" CURSE_FALLBACK="$FALLBACK"
 		${R_ENV:-})
 	local -a C
 	local mw=$mode; [ "$script" = -c ] && mw="" # (`-c CODE`: no mode keyword; tiered)
@@ -412,9 +413,11 @@ daemon_check() { # LABEL: the private daemon answers, same workers, nothing else
 		# start the next test on a FRESH daemon: zombies can't be killed, and anything left
 		# would be blamed on the next test too (ours: the daemon's own session)
 		echo "(restarting the private daemon after this test)" >>"$TDIR/log"
+		# (in a NEW runtime dir: the old instance's lock and socket go away only once its
+		# last process is gone, which under load can take a while)
 		"$STH" killsid "$DPID"
-		rm -f "$SCR/xdg/curse.sock"
-		DPID=$(start_daemon "$SCR/xdg" "$SCR/dcache" "$DWORKERS" "$SCR/daemon.log") || { echo "stress: daemon restart failed" >&2; exit 2; }
+		XDGN=$((XDGN + 1)); XDG=$SCR/xdg$XDGN; mkdir -p "$XDG"; chmod 700 "$XDG"
+		DPID=$(start_daemon "$XDG" "$SCR/dcache" "$DWORKERS" "$SCR/daemon.log") || { echo "stress: daemon restart failed" >&2; exit 2; }
 		for ((n = 0; n < 200; n++)); do [ "$(workers)" -ge "$DWORKERS" ] && break; sleep 0.05; done
 		W0=$(workers)
 	fi
