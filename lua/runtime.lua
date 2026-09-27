@@ -1060,6 +1060,20 @@ do
 end
 M.preempt_flag = PREEMPT
 local PREEMPT_USEC = 10000
+-- A job's slice is CPU time, not wall time: the tick is a CLOCK_MONOTONIC timer (1ms
+-- precision, for the foreground's first slice), so on a loaded machine a job descheduled
+-- by the kernel "used up" its slice without running — it yielded at its first check, and
+-- a later job ran (and printed) first: `echo a & echo b &` came out b, a. M.preempt only
+-- yields a job once it has used the slice's CPU time (this thread's), else re-arms for
+-- the rest.
+pcall(ffi.cdef, "int curse_rt_cgt(int clk, struct curse_co_ts *ts) asm(\"clock_gettime\");")
+do
+	local ts = ffi.new("struct curse_co_ts")
+	function M.cpu_usec() -- (CLOCK_THREAD_CPUTIME_ID: the FIFO-open helper thread isn't ours)
+		C.curse_rt_cgt(3, ts)
+		return tonumber(ts.tv_sec) * 1000000 + tonumber(ts.tv_nsec) / 1000
+	end
+end
 -- The FOREGROUND shell is time-sliced too while background jobs live (bash's jobs are
 -- processes the kernel runs alongside it): the same slice is armed for it, and at its
 -- next loop head or function entry (M.preempt) it gives the jobs a round, then re-arms.
@@ -1081,6 +1095,12 @@ function M.preempt()
 		return
 	end
 	if t then
+		if t.cpu0 then -- (a job's slice: yield only once it has had its CPU time)
+			local left = PREEMPT_USEC - (M.cpu_usec() - t.cpu0)
+			if left > 500 and preempt_arm(left) == 0 then
+				return
+			end
+		end
 		pre_yield(t)
 		if coroutine.yield() == SIGMARK then -- (no values: co_resume queues it as runnable again)
 			task_signals(t)
@@ -5769,6 +5789,12 @@ local function co_resume(ctx, t)
 		M.cur_shell = t.sh
 	end
 	local armed = g.bg and preempt_arm(PREEMPT_USEC) == 0
+	if armed then -- (a flag the foreground's slice raised is not this job's: M.preempt)
+		PREEMPT[0] = 0
+		t.cpu0 = M.cpu_usec()
+	else
+		t.cpu0 = nil
+	end
 	if t.pending and t.started then
 		rok, a, b = coroutine.resume(t.co, SIGMARK)
 	else
