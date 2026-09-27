@@ -113,9 +113,10 @@ if [ "${1:-}" = --run-unit ]; then
       curse) ( cd "$cwd" && PATH="$H_ORACLE_DIR:$PATH" TMP="$cwd" HOME="$cwd" TMPDIR="$tmpd" XDG_RUNTIME_DIR="$H_XDG_RUNTIME" XDG_CACHE_HOME="$ucache" \
                  CURSE_FALLBACK="$H_FALLBACK" THIS_SH="$H_THIS_SH" \
                  timeout "$lim" "$H_CLIENT" "$runscript" </dev/null ) ;;
-      # curse's interpreter alone (no daemon, no OSR), from the built bundle
+      # curse's interpreter alone (no daemon, no OSR), from the built bundle; a script that
+      # runs $THIS_SH gets curse run directly too (lua/run.lua, tiered), not the daemon
       curse-interp) ( cd "$cwd" && PATH="$H_ORACLE_DIR:$PATH" TMP="$cwd" HOME="$cwd" TMPDIR="$tmpd" XDG_RUNTIME_DIR="$H_XDG_RUNTIME" XDG_CACHE_HOME="$ucache" \
-                 CURSE_FALLBACK="$H_FALLBACK" THIS_SH="$H_THIS_SH" CURSE_BUNDLE="$H_BUNDLE" \
+                 CURSE_FALLBACK="$H_FALLBACK" THIS_SH="$H_THIS_SH_DIRECT" CURSE_BUNDLE="$H_BUNDLE" \
                  timeout "$lim" "$H_LUAJIT" "$H_REPO_LUA/run.lua" "$runscript" interp </dev/null ) ;;
     esac
   }
@@ -288,7 +289,7 @@ if [ "${1:-}" = --run-unit ]; then
     esac
     printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$corpus" "$1" "$v" "$4" "$testid" "$why" >> "$res"
     # H_DIFF_DIR=dir: keep a failing test's expected (bash) and actual output + statuses
-    if [ "$v" = FAIL ] && [ -n "${H_DIFF_DIR:-}" ]; then
+    if { [ "$v" = FAIL ] || [ "$v" = KNOWN ] || [ "$why" = stderr-known ]; } && [ -n "${H_DIFF_DIR:-}" ]; then
       printf '%s\n[status %s]\n' "$bout" "$bst" > "$H_DIFF_DIR/$testid.expected"
       printf '%s\n[status %s%s; %s]\n' "$2" "$3" "$( [ "$5" -eq 1 ] && echo ", TIMED OUT after ${lim}s")" "$why" > "$H_DIFF_DIR/$testid.$1"
       [ -n "$cmp_err" ] && { printf '%s\n' "$berr" > "$H_DIFF_DIR/$testid.expected.err"; printf '%s\n' "$6" > "$H_DIFF_DIR/$testid.$1.err"; }
@@ -328,7 +329,7 @@ if [ "${1:-}" = --run-unit ]; then
   # differently or randomly — the script ($0), THIS_SH, the unit's cwd/TMPDIR/workdir,
   # mktemp names — and `time`'s figures. (Literal sed patterns: the paths are escaped.)
   sedq() { printf '%s' "$1" | sed 's/[][\\/.*^$]/\\&/g'; }
-  norm_sed=(-e "s/$(sedq "$runscript_n")/\$0/g" -e "s/$(sedq "$H_ORACLE")/THIS_SH/g" -e "s/$(sedq "$H_THIS_SH")/THIS_SH/g"
+  norm_sed=(-e "s/$(sedq "$runscript_n")/\$0/g" -e "s/$(sedq "$H_ORACLE")/THIS_SH/g" -e "s/$(sedq "$H_THIS_SH")/THIS_SH/g" -e "s/$(sedq "$H_THIS_SH_DIRECT")/THIS_SH/g"
             -e "s/$(sedq "$tmpd")/TMPDIR/g" -e "s/$(sedq "$cwd")/CWD/g" -e "s/$(sedq "$workdir")/WORKDIR/g"
             -e 's/tmp\.[A-Za-z0-9]\{10\}/tmp.XXXXXXXXXX/g' -e 's/[0-9][0-9]*m[0-9][0-9]*[.,][0-9][0-9]*s/TIME/g')
   run_shell bash; bst=$R_ST; bdur=$R_DUR; bout=$R_OUT; btimeout=$R_TO; berr=$R_ERR
@@ -442,6 +443,10 @@ H_THIS_SH="$workdir/bin/bash"; mkdir -p "$workdir/bin"; ln -sf "$H_CLIENT" "$H_T
 # A fallback that FAILS loudly, so a dropped daemon shows up as curse errors, never a
 # silent dash run masquerading as curse.
 H_FALLBACK="$workdir/bin/no-daemon"
+# THIS_SH for curse-interp: curse run directly (no daemon), also named `bash`
+H_THIS_SH_DIRECT="$workdir/bin/direct/bash"; mkdir -p "$workdir/bin/direct"
+printf '#!/bin/sh\nCURSE_BUNDLE="%s" CURSE_ARGV0="$0" exec "%s" "%s" "$@"\n' "$BUNDLE" "$LUAJIT" "$REPO/lua/run.lua" > "$H_THIS_SH_DIRECT"
+chmod +x "$H_THIS_SH_DIRECT"
 printf '#!/bin/sh\necho "curse: daemon unavailable" >&2\nexit 127\n' > "$H_FALLBACK"; chmod +x "$H_FALLBACK"
 DAEMON_PID=""; XARGS_PID=""
 # Kill the daemon's ENTIRE process subtree — not just its direct worker children, but
@@ -570,7 +575,7 @@ fi
 
 echo "harness: $total tests × [${SHELLS//,/ }]  (jobs=$JOBS, timeout=${H_TIMEOUT}s, oracle bash $ORACLE_BASH_VERSION)"
 export H_TIMEOUT H_SHELLS="$SHELLS" H_TIMEOUTS="$REPO/test/conformance/timeouts" H_NPROC="$(nproc 2>/dev/null || echo 0)"
-export H_CLIENT H_THIS_SH H_XDG_RUNTIME H_XDG_CACHE H_FALLBACK H_ORACLE H_ORACLE_DIR H_STDERR
+export H_CLIENT H_THIS_SH H_THIS_SH_DIRECT H_XDG_RUNTIME H_XDG_CACHE H_FALLBACK H_ORACLE H_ORACLE_DIR H_STDERR
 export H_KNOWN="$REPO/test/conformance/known-diffs" H_LUAJIT="$LUAJIT" H_BUNDLE="$BUNDLE" H_REPO_LUA="$REPO/lua"
 # (in the background + wait, so an interrupt reaches cleanup at once and it can stop them)
 seq 1 "$total" | xargs -P "$JOBS" -I{} "$0" --run-unit "$workdir" {} &

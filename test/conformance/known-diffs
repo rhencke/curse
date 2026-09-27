@@ -9,11 +9,6 @@
 # notices at lines 16/23 where bash prints them at 15/21. stdout and status match.
 cases 2538-wait-job-stops.sh stderr
 
-# queue.md "stderr gate triage" #2: interp only (OSR hides it from curse-cold): $BASH_COMMAND
-# in an ERR trap after `eval '…'` / `. file` is the failing inner command, not the eval /
-# source command as bash has it.
-cases 2310-final-traps-jobs.sh curse-interp
-
 # queue.md "stderr gate triage" #3: interp only: in a GBK locale, the last line's
 # `( set -x; …; [[ $s == "$s" ]] )` returns 1 (bash: 0) — the traced quoted [[ ]] pattern
 # of a double-byte char with an ASCII trail byte doesn't match itself. Output matches.
