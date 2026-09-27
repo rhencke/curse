@@ -8,11 +8,6 @@
 F1	sig	table index is nil
 F3	sig	attempt to index local '(first|prev)'
 F13	sig	not enough memory
-F19	sig	b_export:[0-9N]+: attempt to index local 'ib'
-F20	sig	attempt to index local 'val'
-F27	sig	value position not supported for node matherr
-F28	sig	value position not supported for node asgn
-F29	sig	too many syntax levels
 UB-recursion	sig	stack overflow
 UB-recursion	src	trap '[^']*kill -[A-Z0-9]+ \$\$[^']*' [A-Z0-9]+
 F1	both	crash signal, no oracle message	set [-+]?-?[A-Za-z]*o[^ \t\n]
@@ -21,19 +16,10 @@ F12	src	"\$\$\(\(
 F15	src	\$\[[^]]*[`"]
 F5	src	\$\{[^}]*'\$\{
 F8	src	\$\{! 
-F24	src	\$\{!\$\}
 F9	src	trap -p *&
 F7	src	;&
-F16	both	^compiled\|	(while|until) .*&& *continue
-F30	both	^compiled\|S: [^l]	\$\{[A-Za-z_]+:
 F6	sig	^compiled\|.*here-document at line
 F14	both	^compiled\|	\(\( *[A-Za-z_][A-Za-z_0-9]*\[[^]]*\](\+\+|--)
-F21	both	.	\$\{[A-Za-z_@*#?-]+(\[[^]]*\])?(#|##|%|%%|/|//|\^|,)[^}]*\$\(
-F17	sig	redirection error: cannot duplicate fd
-F18	both	line L	\$\([^)]*\|[ \t]*$
-F23	both	No such file or directory	[^[:print:][:space:]]
-F25	sig	local: can only be used in a function
-F26	sig	\[\\\[:
 F2	sig	unexpected EOF while looking for matching
 F11	sig	^all\|status N vs N
 F10	sig	near unexpected token `X'.*

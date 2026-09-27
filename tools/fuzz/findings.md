@@ -184,7 +184,9 @@ the same campaign), reduced by hand or afl-tmin, and verified with tools/fuzz/cm
 against the pinned oracle (5.2.21) in the fuzz sandbox. "All tiers" = interp, compiled,
 tiered (harness) and the static build/curse. None of these is in F1-F15.
 
-## F16. Compiled tier: `while`/`until` status after a `continue` keeps an earlier iteration's failure
+## F16. FIXED — Compiled tier: `while`/`until` status after a `continue` keeps an earlier iteration's failure
+
+- FIXED (fix-fuzz2): a continue in while/until now re-tests through the body's status save (emit H.whilec). test/cases/2713.
 
     i=0; while ((i++ < 2)); do [ $i = 2 ] && continue; done; echo $?
 
@@ -193,7 +195,9 @@ tiered (harness) and the static build/curse. None of these is in F1-F15.
   single iteration agrees. Found as `until ((…)); do …; [[ i -gt 105 ]] && continue; done`
   from the hot-loop wrapper (`… && echo True` then printed nothing).
 
-## F17. `>&3-` onto stdout with fd 3 closed: bash's extra "redirection error" line missing
+## F17. FIXED — `>&3-` onto stdout with fd 3 closed: bash's extra "redirection error" line missing
+
+- FIXED (fix-fuzz2): interp apply_redirs says it for a move run in the shell onto an open fd; a stage's / async command's own redirections exempt (rt.redir_top, both tiers). test/cases/2714.
 
     : >&3-
 
@@ -202,7 +206,9 @@ tiered (harness) and the static build/curse. None of these is in F1-F15.
 - curse (all tiers): only the second line. (`: 4>&3-` agrees: the extra line is the
   save-stdout-for-the-builtin step failing.)
 
-## F18. Line numbers inside `$( )` whose first line ends in a pipe
+## F18. FIXED — Line numbers inside `$( )` whose first line ends in a pipe
+
+- FIXED (fix-fuzz2): a $(…)/<(…) body is the text deparse re-prints (parser comsub_text; nested lists keep newline connectors; `$$'x'`). test/cases/2715.
 
     x=$( : |
     (a
@@ -212,7 +218,9 @@ tiered (harness) and the static build/curse. None of these is in F1-F15.
 - bash: `S: line 4: a: command not found`, `S: line 5: b: command not found`.
 - curse (all tiers): lines 5 and 6. (Without the `: |` both agree on 4/5.)
 
-## F19. `declare -i` on a dynamic variable with a value: escaped Lua error
+## F19. FIXED — `declare -i` on a dynamic variable with a value: escaped Lua error
+
+- FIXED (fix-fuzz2): declare -i on a live dynamic variable: attribute, then its assign hook with the value as written (+= evaluates); plain assignments likewise. test/cases/2716.
 
     declare -i LINENO=1
     echo after
@@ -221,7 +229,9 @@ tiered (harness) and the static build/curse. None of these is in F1-F15.
 - curse (all tiers): `b_export:661: attempt to index local 'ib' (a nil value)` escapes,
   nothing after it runs, status 1. (`declare -i FUNCNAME=1` and ordinary names agree.)
 
-## F20. Local `declare var=([]= 0)` over a global assoc array: escaped Lua error
+## F20. FIXED — Local `declare var=([]= 0)` over a global assoc array: escaped Lua error
+
+- FIXED (fix-fuzz2): a declaration's NAME=(…) for a new local is expanded as an indexed array's (rt.sr_aa_pre). test/cases/2717.
 
     declare -A var
     f() { declare var=([]= 0); }
@@ -232,7 +242,9 @@ tiered (harness) and the static build/curse. None of these is in F1-F15.
   (a nil value)` (runtime.lua:9982) escapes; status 1. The compiled tier agrees with bash.
   (byte-level instance, afl-tmin'd.)
 
-## F21. `${v#pat}` / `%` / `/pat/rep` / `^` on an empty or unset v still expands the pattern
+## F21. FIXED — `${v#pat}` / `%` / `/pat/rep` / `^` on an empty or unset v still expands the pattern
+
+- FIXED (fix-fuzz2): rt.pe_nopat: the pattern/replacement expand only when the value takes them (interp thunks, compiled expands after the value). test/cases/2718.
 
     : ${A#$(echo hi >&2)}
 
@@ -241,7 +253,9 @@ tiered (harness) and the static build/curse. None of these is in F1-F15.
 - curse (all tiers): prints `hi`: the pattern's command substitution (any side effect)
   runs.
 
-## F22. Compiled tier with no writable temp dir: `$(cmd >&2)` captures cmd's stderr
+## F22. FIXED — Compiled tier with no writable temp dir: `$(cmd >&2)` captures cmd's stderr
+
+- FIXED (fix-fuzz2): rt.redir_apply / redir_apply_one point builtins at fd 1 whenever sh.out isn't io.write. Proved in lua/test_tier.lua (rt.mktmpfd failing).
 
     x=$(echo hi >&2); echo "[$x]"
     # run with /tmp read-only and no writable $TMPDIR, e.g.
@@ -254,7 +268,9 @@ tiered (harness) and the static build/curse. None of these is in F1-F15.
   environment — read-only / — until this branch gave it a TMPDIR; every compiled-mode
   run of the spike and of this campaign's first half used the fallback.)
 
-## F23. "No such file or directory" for a command path with control bytes: bash doesn't quote it
+## F23. FIXED — "No such file or directory" for a command path with control bytes: bash doesn't quote it
+
+- FIXED (fix-fuzz2): rt.spawn_errmsg names the file raw except for command not found; `exec` of a file with a missing interpreter. test/cases/2719.
 
     $'/x\001y'
 
@@ -262,7 +278,9 @@ tiered (harness) and the static build/curse. None of these is in F1-F15.
 - curse (all tiers): `S: line 1: $'/x\001y': No such file or directory`. (For a name
   without `/`, bash does quote: `$'x\001y': command not found` — curse agrees there.)
 
-## F24. `${!$}` expands instead of a bad substitution
+## F24. FIXED — `${!$}` expands instead of a bad substitution
+
+- FIXED (fix-fuzz2): already fixed on main by e52103c (F8's `$$` scan): not reproducible at 1c505af; pinned by test/cases/2720.
 
     echo ${!$}; echo after $?
 
@@ -270,7 +288,9 @@ tiered (harness) and the static build/curse. None of these is in F1-F15.
 - curse (all tiers): expands the indirection through `$$` (prints a line), `after 0`.
   (Neighbour of F8.)
 
-## F25. `local` of a readonly array outside a function: an extra "can only be used in a function"
+## F25. FIXED — `local` of a readonly array outside a function: an extra "can only be used in a function"
+
+- FIXED (fix-fuzz2): `local` outside a function localizes nothing in rt.sr_aa_pre: the readonly error is the line-fatal assignment's. test/cases/2721.
 
     local UID=(x)
 
@@ -278,14 +298,18 @@ tiered (harness) and the static build/curse. None of these is in F1-F15.
   `local -i UID+=(x)`; `local -a UID=x` agrees).
 - curse (all tiers): the same line, then `S: line 1: local: can only be used in a function`.
 
-## F26. `[[ n -lt [[:class:]] ]]`: bash backslash-escapes the bracket expression in the error token
+## F26. FIXED — `[[ n -lt [[:class:]] ]]`: bash backslash-escapes the bracket expression in the error token
+
+- FIXED (fix-fuzz2): parser cond_arith_word quotes an arith operand's subscript text; compiled [[ ]] reads unquoted `[` operands textually like interp. test/cases/2722.
 
     [[ 1 -lt [[:a:]] ]]
 
 - bash: ``S: line 1: [[: [\[:a:\]]: syntax error: operand expected (error token is "[\[:a:\]]")``, status 1.
 - curse (all tiers): `[[:a:]]` unescaped, both times. (`[[ 1 -lt [a] ]]` agrees.)
 
-## F27. Compiled tier: an arithmetic syntax error as a loop/if condition fails to compile, fatally
+## F27. FIXED — Compiled tier: an arithmetic syntax error as a loop/if condition fails to compile, fatally
+
+- FIXED (fix-fuzz2): cond_arith leaves a matherr (( )) condition to H.arithcmd. test/cases/2723.
 
     while ((0 0)); do :; done; echo after $?
 
@@ -295,7 +319,9 @@ tiered (harness) and the static build/curse. None of these is in F1-F15.
   Found by both compiled-mode instances (byte 42 crash inputs, grammar 2); afl-tmin'd to
   `(0);while((0 0))do 0⏎done`.
 
-## F28. Compiled tier: `$((P=${#x}))` (assignment of a `${#…}` inside `$(( ))`) fails to compile
+## F28. FIXED — Compiled tier: `$((P=${#x}))` (assignment of a `${#…}` inside `$(( ))`) fails to compile
+
+- FIXED (fix-fuzz2): arith_side_effect looks into a fast xpand's native tree. test/cases/2724.
 
     f=$((P=${#x})); echo $f
 
@@ -303,7 +329,9 @@ tiered (harness) and the static build/curse. None of these is in F1-F15.
 - curse compiled tier: `emit: value position not supported for node asgn` escapes, status 1.
   (`$((P=$#))` agrees.)
 
-## F29. Compiled tier: a word of ~200 parts overflows LuaJIT's syntax nesting
+## F29. FIXED — Compiled tier: a word of ~200 parts overflows LuaJIT's syntax nesting
+
+- FIXED (fix-fuzz2): emit cat_exprs groups `..` chains; arith trees deeper than 48 take the shared evaluator; deep constants serialize flat (rt.unflat). test/cases/2725 (the census catches the old LOADFAIL).
 
     echo a\ba\ba\b…   # `a\b` 100 times, one word
     echo after
@@ -313,7 +341,9 @@ tiered (harness) and the static build/curse. None of these is in F1-F15.
   word's parts are emitted as one nested expression). Found as a 300-byte word of `''`
   and `\0` pieces from tok-bytes/wrap mutations.
 
-## F30. Compiled tier: an arithmetic error from a variable's value in `${v:off}` loses `line N:`
+## F30. FIXED — Compiled tier: an arithmetic error from a variable's value in `${v:off}` loses `line N:`
+
+- FIXED (fix-fuzz2): substr_native declines variable-reading operands: rt.substr_arith labels the error. test/cases/2726.
 
     v=x+; echo ${v:v}
 
