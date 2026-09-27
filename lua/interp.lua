@@ -1798,15 +1798,16 @@ M.notilde = notilde
 -- value, decides literalness. Shared by glob-pattern and =~-regex expansion.
 -- `xt` (a table; set -x of a [[ ]] pattern): xt[1] gets the text bash traces, EVERY quoted
 -- character backslashed (quote_string_for_globbing), from the same single expansion.
+local PAT_META = "[%*%?%[%]\\%(%)%|%+%@%!%-%^]"
 local function expand_escaped(sh, w, charclass, xt)
 	local buf, xb = {}, xt and {}
 	for _, p in ipairs(w.parts) do
 		local s = expand_part_str(sh, p)
 		if p.q then
 			if xb then
-				xb[#xb + 1] = s:gsub("[%z\1-\127\194-\244][\128-\191]*", "\\%0")
+				xb[#xb + 1] = rt.xglob_quote(s)
 			end
-			s = s:gsub(charclass, "\\%0")
+			s = charclass == PAT_META and rt.glob_quote(s) or s:gsub(charclass, "\\%0")
 		elseif xb then
 			xb[#xb + 1] = s
 		end
@@ -1842,7 +1843,6 @@ expand_repl = function(sh, w)
 	return table.concat(buf)
 end
 -- glob PATTERN context (${v/pat/repl}, case, [[ == ]]): glob metacharacters.
-local PAT_META = "[%*%?%[%]\\%(%)%|%+%@%!%-%^]"
 expand_pattern = function(sh, w, xt)
 	if xt == true then
 		xt = nil -- (a caller sharing expand_word's signature passes its `true` flag)
@@ -1856,7 +1856,7 @@ expand_pattern = function(sh, w, xt)
 		if t ~= s then
 			local rest = expand_escaped(sh, { parts = { unpack(w.parts, 2) } }, PAT_META, xt)
 			local tail = s:match("^~[^/]*(.*)$") or ""
-			local dir = t:sub(1, #t - #tail):gsub(PAT_META, "\\%0")
+			local dir = rt.glob_quote(t:sub(1, #t - #tail))
 			if xt then -- (the expanded directory reads as quoted)
 				xt[1] = rt.xglob_quote(t:sub(1, #t - #tail)) .. tail .. xt[1]
 			end
@@ -1885,16 +1885,16 @@ local function case_pattern(sh, w)
 		if p.q and is_multi(sh, p) then
 			local els, star = multi_elems(sh, p)
 			if star then
-				buf[#buf + 1] = table.concat(els, rt.ifs_sep(sh)):gsub(PAT_META, "\\%0")
+				buf[#buf + 1] = rt.glob_quote(table.concat(els, rt.ifs_sep(sh)))
 			elseif #els > 0 then
-				buf[#buf + 1] = els[1]:gsub(PAT_META, "\\%0")
+				buf[#buf + 1] = rt.glob_quote(els[1])
 				if #els > 1 then
 					break
 				end
 			end
 		else
 			local s = expand_part_str(sh, p)
-			buf[#buf + 1] = p.q and s:gsub(PAT_META, "\\%0") or s
+			buf[#buf + 1] = p.q and rt.glob_quote(s) or s
 		end
 	end
 	return table.concat(buf)
@@ -4801,7 +4801,7 @@ local function eval_dbracket(sh, node)
 		else
 			l, r = dbracket_word(sh, node.l), dbracket_word(sh, node.r)
 			if sh.opt_x and (op == "==" or op == "=" or op == "!=") then -- (a wholly quoted rhs)
-				xr = { (r:gsub("[%z\1-\127\194-\244][\128-\191]*", "\\%0")) }
+				xr = { rt.xglob_quote(r) }
 			end
 		end
 		if sh.opt_x then -- (an empty operand traces as '')

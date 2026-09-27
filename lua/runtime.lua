@@ -468,7 +468,14 @@ end
 -- Backslash-escape glob metacharacters in a string so it matches literally in a glob
 -- pattern (the compiled tier's twin of interp's expand_escaped for a QUOTED pattern part:
 -- `case $x in "$p"*)` — "$p"'s metachars are literal, the trailing * is active).
+-- In a multibyte locale whose trail bytes can be ASCII (Big5/GBK/SJIS) the escaping walks
+-- CHARACTERS, as bash's quote_string does (COPY_CHAR_P): a trail byte `|`/`\`/`[` of a
+-- double-byte char is part of that char, never a metachar to backslash.
+M.mbx = false -- (the current LC_CTYPE is multibyte, not UTF-8: set by lc_commit)
 function M.glob_quote(s)
+	if M.mbx and s:find("[\128-\255]") then
+		return M.mb_quote(s, "[%*%?%[%]\\%(%)%|%+%@%!%-%^]")
+	end
 	return (s:gsub("[%*%?%[%]\\%(%)%|%+%@%!%-%^]", "\\%0"))
 end
 -- ERE-escape a QUOTED part of a `[[ =~ ]]` regex (the compiled twin of interp's expand_regex
@@ -1416,9 +1423,10 @@ do
 			re_locale_changed()
 		end
 		lc_mb_cur_max = tonumber(C.__ctype_get_mb_cur_max()) or 1
+		M.mbx = lc_mb_cur_max > 1 and not M.lc_utf8()
 		local P = package.loaded.parser -- (Big5/GBK/SJIS lexing: parser.lua's MBX, the
 		if P then -- LC_CTYPE name — which charset's characters the lexer keeps whole)
-			P.mb_locale(lc_mb_cur_max > 1 and not M.lc_utf8() and (st[0] or "?"))
+			P.mb_locale(M.mbx and (st[0] or "?"))
 		end
 	end
 	function M.reset_locale(sh, var)
@@ -1546,6 +1554,24 @@ function M.mb_chars(s)
 		i = i + r
 	end
 	return out
+end
+
+-- Backslash every single-byte character of `s` in the class `cls` (no cls: every character), walking the current
+-- locale's characters: a multibyte char (its trail bytes included) is copied whole.
+function M.mb_quote(s, cls)
+	ffi.fill(_mb_st, ffi.sizeof(_mb_st))
+	local ptr, i, n, out = ffi.cast("const char *", s), 0, #s, {}
+	while i < n do
+		local r = tonumber(C.mbrtowc(_mb_wc, ptr + i, n - i, _mb_st))
+		if r == 0 or r > (n - i) then
+			r = 1
+			ffi.fill(_mb_st, ffi.sizeof(_mb_st))
+		end
+		local c = s:sub(i + 1, i + r)
+		out[#out + 1] = (not cls or (r == 1 and c:find(cls))) and "\\" .. c or c
+		i = i + r
+	end
+	return table.concat(out)
 end
 
 -- Byte length of the character starting at byte index `i` (1-based) of `s`: 1 for
@@ -10320,12 +10346,12 @@ function M.bytewise(fn, ...)
 	local cur = C.setlocale(0, nil)
 	local saved = cur ~= nil and ffi.string(cur) or "C"
 	C.setlocale(0, "C")
-	local smb = lc_mb_cur_max
-	lc_mb_cur_max = 1
+	local smb, smbx = lc_mb_cur_max, M.mbx
+	lc_mb_cur_max, M.mbx = 1, false
 	re_locale_changed()
 	local ok, a, b = pcall(fn, ...)
 	C.setlocale(0, saved)
-	lc_mb_cur_max = smb
+	lc_mb_cur_max, M.mbx = smb, smbx
 	re_locale_changed()
 	if not ok then
 		error(a, 0)
@@ -15988,6 +16014,9 @@ end
 -- set -x of a QUOTED [[ == ]] pattern text: every character backslashed, as bash's
 -- quote_string_for_globbing shows it (`"ab"` → \a\b)
 function M.xglob_quote(s)
+	if M.mbx and s:find("[\128-\255]") then
+		return M.mb_quote(s) -- (Big5/GBK/SJIS: by the locale's characters)
+	end
 	return (s:gsub("[%z\1-\127\194-\244][\128-\191]*", "\\%0"))
 end
 function M.xtilde(sh, tok) -- (a pattern's leading ~prefix, traced: its directory reads as quoted)

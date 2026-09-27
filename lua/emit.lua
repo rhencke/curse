@@ -3083,6 +3083,10 @@ local function emit_pattern_glob_word(w, lifted, xall)
 		end
 		if p.ansic then -- ($'…\u…': encoded in the locale of the moment)
 			out[#out + 1] = ("rt.glob_quote(%s)"):format(EF.lit_expr(p))
+		elseif p.lit ~= nil and p.q and p.lit:find("[\128-\255]") and (xall or p.lit:find(CASE_GLOBSPECIAL)) then
+			-- (non-ASCII: a Big5/GBK/SJIS trail byte may look like a metachar — escaped by the
+			-- locale's characters of the moment)
+			out[#out + 1] = ((xall and "rt.xglob_quote(%q)" or "rt.glob_quote(%q)")):format(p.lit)
 		elseif p.lit ~= nil then
 			local s = p.lit
 			if p.q then
