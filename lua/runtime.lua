@@ -16483,6 +16483,9 @@ do
 		for _, aa in ipairs(aas) do
 			sh.arrayargs_pending[aa.name] = true
 			sh.arrayargs_pre[aa] = I.arrayassign_items(sh, aa, wantassoc or sh:is_assoc(sh:deref(aa.name)), wantassoc)
+			if sh.opt_x then -- (`+ b=('4' '5 6')` as it expands: before a prefix assignment's
+				M.xtrace_arrlit(sh, aa.name, sh.arrayargs_pre[aa]) -- trace, and `+ declare -a b`)
+			end
 		end
 	end
 	-- … and after it: each literal lands in the now-declared (local/assoc) variable, unless
@@ -16532,13 +16535,6 @@ do
 	end
 	-- set -x (unless the compiled caller traced it — spec.xt): before the redirections
 	function M.sr_trace(sh, argv, spec)
-		if spec.aas and sh.arrayargs_pre then -- (`+ b=('4' '5 6')` before `+ declare -a b`)
-			for _, aa in ipairs(spec.aas) do
-				if sh.arrayargs_pre[aa] then
-					M.xtrace_arrlit(sh, aa.name, sh.arrayargs_pre[aa])
-				end
-			end
-		end
 		M.xtrace(sh, argv)
 	end
 	-- The PS4 a prefixed command's own trace line uses: the one outside its temporary
