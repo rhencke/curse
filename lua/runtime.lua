@@ -1053,6 +1053,29 @@ function M.preempt()
 		end
 	end
 end
+-- Give the job groups `gs` (<()/>() children) their first turn: bash forked each at
+-- expansion, so whatever it runs starts while every procsub end made so far is open.
+-- From the shell, a pump runs all that can run; inside a stage, yield until each has run.
+function M.procsub_start(gs)
+	local t = co_task()
+	if not t then
+		M.sched_pump({})
+		return
+	end
+	for _ = 1, 64 do
+		local pending = false
+		for _, g in ipairs(gs) do
+			local gt = g.tasks and g.tasks[1]
+			if gt and not gt.ran and not g.done then
+				pending = true
+			end
+		end
+		if not pending then
+			return
+		end
+		M.preempt()
+	end
+end
 -- Wait until `fd` is ready for `ev` (POLLIN/POLLOUT). A no-op outside a stage.
 function M.co_block(fd, ev)
 	local t = co_task()
@@ -1663,11 +1686,12 @@ function M.open_read(path)
 	M.rd_gen = M.rd_gen + 1 -- (`source /dev/stdin`, `$(< /dev/stdin)`: reads a shared input)
 	if not (CO or sched_live()) or C.curse_rt_stat(path, _ropen_st) ~= 0
 		or bit.band(ffi.cast("uint32_t *", _ropen_st + 24)[0], 0xF000) ~= 0x1000 then
-		return io.open(path, "r")
+		local f, _, en = io.open(path, "r")
+		return f, en -- (nil, errno)
 	end
 	local fd = M.ropen(path, 0, 0)
 	if fd < 0 then
-		return nil
+		return nil, ffi.errno()
 	end
 	local chunks, buf = {}, ffi.new("char[8192]")
 	while true do
@@ -2871,14 +2895,17 @@ function Shell:capture_src(src, backtick, noalias, line0)
 				return ""
 			end
 			local path = fs[1]
-			local f = path ~= "" and M.open_read(path)
+			local f, en
+			if path ~= "" then
+				f, en = M.open_read(path)
+			end
 			if f then
 				local c = f:read("*a") or ""
 				f:close()
 				self.status, self.last_cmdsub_status = 0, 0
 				return (M.cmdsub_nul(c):gsub("\n+$", ""))
 			end
-			io.stderr:write("curse: " .. path .. ": No such file or directory\n")
+			M.read_fail(path, en)
 			self.status, self.last_cmdsub_status = 1, 1
 			return ""
 		end
@@ -4169,8 +4196,15 @@ end
 -- $(< file) / `< file`: bash reads the file's contents (a faster $(cat file)) — a pure
 -- read. NUL bytes stripped, trailing newlines stripped, status 0; a missing file is
 -- status 1 + diagnostic. The compiled tier calls this with the expanded path.
+-- (subst.c: an open failure is file_error — the path and strerror(errno))
+function M.read_fail(path, en)
+	io.stderr:write("curse: " .. path .. ": " .. ffi.string(C.strerror(en or 2)) .. "\n")
+end
 function Shell:capture_file(path)
-	local f = path ~= "" and M.open_read(path)
+	local f, en
+	if path ~= "" then
+		f, en = M.open_read(path)
+	end
 	if f then
 		local c = f:read("*a") or ""
 		f:close()
@@ -4178,7 +4212,7 @@ function Shell:capture_file(path)
 		self.last_cmdsub_status, self.ncs = 0, (self.ncs or 0) + 1
 		return (M.cmdsub_nul(c):gsub("\n+$", ""))
 	end
-	io.stderr:write("curse: " .. path .. ": No such file or directory\n")
+	M.read_fail(path, en)
 	self.status = 1
 	self.last_cmdsub_status, self.ncs = 1, (self.ncs or 0) + 1
 	return ""
@@ -5308,6 +5342,7 @@ local function co_resume(ctx, t)
 		return
 	end
 	local P = ctx.P
+	t.ran = true -- (M.procsub_start: it has had its first turn)
 	fds_install(t.fd, 0) -- the stage's fds 0-9 (-1: it had closed it)
 	C.environ = t.env
 	if t.cwdfd then -- (a directory it changed to: held by an fd)

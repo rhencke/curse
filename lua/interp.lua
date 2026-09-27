@@ -1447,20 +1447,24 @@ local function expand_procsub(sh, p)
 	end
 	local mine, theirs = pfd[p.dir == "<" and 0 or 1], pfd[p.dir == "<" and 1 or 0]
 	local body = p.procsub
+	-- (its body numbers its lines from the command's, as a $(…)'s does: bash parses it in
+	-- place — compiled code's line is found on the stack here, not in the job)
+	local _, l0 = rt.err_where(sh)
 	local job = sh:bg_launch(function(ssh)
-		local stmts = P.parse(body).stmts
+		ssh.cur_line = l0 > 0 and l0 or ssh.cur_line
+		local stmts = P.parse(body, nil, nil, nil, nil, l0 > 0 and l0 or nil).stmts
 		local s1 = #stmts == 1 and stmts[1]
 		if s1 and s1.t == "simple" and #(s1.words or {}) == 0 and s1.redirs and #s1.redirs == 1
 			and s1.redirs[1].op == "in" and not s1.assigns then
 			-- <(< file): the file's contents, like $(< file) (bash 5.2)
 			local path = M.expand_assign_word(ssh, P.parse_word(s1.redirs[1].target or ""))
-			local f = io.open(path, "rb")
+			local f, _, en = io.open(path, "rb")
 			if f then
 				ssh.out(f:read("*a") or "")
 				f:close()
 				ssh.status = 0
 			else
-				io.stderr:write("curse: " .. path .. ": No such file or directory\n")
+				rt.read_fail(path, en)
 				ssh.status = 1
 			end
 			return
@@ -2778,24 +2782,7 @@ local function apply_redirs(sh, redirs, cname, ctx, args) -- cname: the command 
 			ok = false
 			break
 		end
-		if (noasg or fdb and fdb.ro) and not ((r.op == "dup" or r.op == "dupin") and r.target == "-") then
-			-- `{v}>…` with v readonly: bash refuses (no fd is allocated) and the command fails
-			-- — after it opened (so created) an output file
-			if r.op == "out" or r.op == "clobber" or r.op == "app" then
-				local okp, path = pcall(tgt, r)
-				local f = okp and path ~= "" and rt.ropen(path, r.op == "app" and 1089 or 577, 438)
-				if f and f >= 0 then
-					C.close(f)
-				end
-			end
-			if not noasg then
-				io.stderr:write("curse: " .. r.fdvar .. ": readonly variable\n")
-				rt.report_exit(sh) -- (err_readonly: report_error)
-			end
-			io.stderr:write("curse: " .. r.fdvar .. ": cannot assign fd to variable\n")
-			ok = false
-			break
-		end
+		local fdnew -- (a `{v}>…` fd: v is assigned only once its redirection succeeded)
 		if r.fdvar then
 			if (r.op == "dup" or r.op == "dupin") and r.target == "-" then
 				local cur = fdvar_get()
@@ -2806,15 +2793,13 @@ local function apply_redirs(sh, redirs, cname, ctx, args) -- cname: the command 
 				end
 				r = setmetatable({ fd = tonumber(cur) or -1 }, { __index = r })
 			else
+				-- (redir.c: the target is opened/duplicated first — an open failure is the only
+				-- error — then moved to a free fd >= 10, and only then assigned: a readonly v
+				-- or a noassign array is reported after a successful open, the fd closed)
 				local nf = alloc_fd()
 				if nf < 0 then
 					io.stderr:write((rt.err_prefix(sh):gsub("line %d+: $", "")) .. "redirection error: cannot duplicate fd: Invalid argument\n")
 					io.stderr:write("curse: " .. (r.target or "") .. ": Invalid argument\n")
-					ok = false
-					break
-				end
-				if not fdvar_set(tostring(nf)) then -- (nf is only a free number: nothing opened)
-					io.stderr:write("curse: " .. r.fdvar .. ": cannot assign fd to variable\n")
 					ok = false
 					break
 				end
@@ -2826,6 +2811,7 @@ local function apply_redirs(sh, redirs, cname, ctx, args) -- cname: the command 
 					persist[nf] = true
 					rt.iso_keep_fd(sh, nf, -1) -- (a subshell's: closed when it ends)
 				end
+				fdnew = nf
 				r = setmetatable({ fd = nf }, { __index = r }) -- shadow r.fd, inherit op/target
 			end
 		end
@@ -2908,6 +2894,9 @@ local function apply_redirs(sh, redirs, cname, ctx, args) -- cname: the command 
 					if C.fcntl(m, 1) == -1 then -- F_GETFD on a closed fd returns -1 (EBADF)
 						-- (bash names the target as written: `$v: Bad file descriptor`)
 						local nm = r.target or tv
+						if fdnew then -- (redir.c: its fcntl(F_DUPFD) fails first — sys_error, no line)
+							io.stderr:write((rt.err_prefix(sh):gsub("line %d+: $", "")) .. "redirection error: cannot duplicate fd: Bad file descriptor\n")
+						end
 						io.stderr:write("curse: " .. (nm:match("^(%d+)%-$") or nm) .. ": Bad file descriptor\n")
 						ok = false
 					else
@@ -2943,6 +2932,21 @@ local function apply_redirs(sh, redirs, cname, ctx, args) -- cname: the command 
 				else -- `>&word` (non-number, r.fd 1): the file gets stdout AND stderr — `&>word`
 					ok = rt.redir_open(sh, "outboth", 1, tv, save)
 				end
+			end
+		end
+		if fdnew and ok then
+			if noasg or (fdb and fdb.ro) then
+				if not noasg then
+					io.stderr:write("curse: " .. r.fdvar .. ": readonly variable\n")
+					rt.report_exit(sh) -- (err_readonly: report_error)
+				end
+				io.stderr:write("curse: " .. r.fdvar .. ": cannot assign fd to variable\n")
+				C.close(fdnew)
+				ok = false
+			elseif not fdvar_set(tostring(fdnew)) then
+				io.stderr:write("curse: " .. r.fdvar .. ": cannot assign fd to variable\n")
+				C.close(fdnew)
+				ok = false
 			end
 		end
 		if not ok then -- (do_redirections stops at the first failure)
@@ -4947,7 +4951,13 @@ local function drain_procsub(sh, np, nf)
 	-- (bash forks each <()/>() child at once, holding every earlier one's end: `tee >(wc -c)
 	-- >(wc -l)` — wc -c sees EOF only once wc -l exits. Let a child not yet started start
 	-- now, with those ends still open, before the shell closes its own.)
-	rt.sched_pump({})
+	local gs = {}
+	for i = nf + 1, #files do
+		if files[i].g then
+			gs[#gs + 1] = files[i].g
+		end
+	end
+	rt.procsub_start(gs)
 	for i = nf + 1, #files do
 		C.close(files[i].fd)
 		rt.fd_owner[files[i].fd] = nil
