@@ -102,11 +102,14 @@ return function(sh, cmd, args, hook, tcb)
 			end
 		else
 			for i = k, #args do
-				local jb, dup = I.job_resolve(sh, args[i], "jobs")
+				local jb = I.job_resolve(sh, args[i], "jobs")
 				if jb then
 					show(jb)
 					shown[#shown + 1] = jb
-				elseif not dup then -- (an ambiguous one isn't a failure: bash)
+				else
+					-- (an ambiguous spec too: bash's jobs_builtin then tests get_job_by_jid(DUP_JOB),
+					-- a jobs[-2] read — UB, docs/bash-ub.md; curse's pinned choice is the
+					-- "no such job" + status 1 outcome)
 					io.stderr:write("curse: jobs: " .. args[i] .. ": no such job\n")
 					status = 1
 				end

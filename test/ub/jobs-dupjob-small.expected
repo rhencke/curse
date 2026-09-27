@@ -1,4 +1,5 @@
 jobs: sleep: ambiguous job spec
-top=0
-fn=0
+jobs: %sleep: no such job
+top=1
+fn=1
 loop 150 .

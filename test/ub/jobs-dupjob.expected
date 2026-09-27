@@ -1,3 +1,4 @@
-st=0
+st=1
 jobs: sleep: ambiguous job spec
-150 0000
+jobs: %sleep: no such job
+150 .
