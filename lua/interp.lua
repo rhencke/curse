@@ -256,7 +256,9 @@ local function read_split(ifs, line, nvars, nomark, saw, sh) -- (nomark: \1 is p
 		end
 		rs_pats[ifs] = pat
 	end
-	if pat and pat.nows and ((nomark and not pairs_) or (not nomark and not line:find("\1", 1, true))) then
+	-- (non-UTF-8 multibyte text walks by character: a trail byte may be an IFS byte — M.ifs_find)
+	if pat and pat.nows and not (rt.mbx and line:find("[\128-\255]"))
+		and ((nomark and not pairs_) or (not nomark and not line:find("\1", 1, true))) then
 		-- an IFS of non-whitespace delimiters only: each one ends a field (empty fields
 		-- kept); the last var gets the raw rest — minus a lone trailing delimiter when
 		-- that rest is a single field (bash, as below)
@@ -278,7 +280,7 @@ local function read_split(ifs, line, nvars, nomark, saw, sh) -- (nomark: \1 is p
 		end
 		return out
 	end
-	if pat and ((nomark and not pairs_) or (not nomark and not line:find("\1", 1, true))) then
+	if pat and not pat.nows and ((nomark and not pairs_) or (not nomark and not line:find("\1", 1, true))) then
 		if nvars == 1 then -- (one var: the line minus leading/trailing IFS whitespace)
 			local b1, b2 = line:byte(1), line:byte(-1)
 			if not b1 or not (ifs:find(string.char(b1), 1, true) or ifs:find(string.char(b2), 1, true)) then
@@ -320,8 +322,7 @@ local function read_split(ifs, line, nvars, nomark, saw, sh) -- (nomark: \1 is p
 	-- (under nomark only a \1\177 pair is special — SX_NOESCCTLNUL — unless IFS holds \177;
 	-- a pair of raw input bytes counts too, left undequoted when nothing was marked)
 	local esc = (nomark and pairs_ and 2) or (not nomark and line:find("\1", 1, true) and true)
-	saw = nomark and saw or (not nomark and esc)
-	local skipws, find = rt.ifs_skipws, st and rt.ifs_find_st or rt.ifs_find
+	local skipws, find = rt.ifs_skipws, rt.ifs_find
 	local i = skipws(rwsb, line, 1, n) -- read.def's leading strip
 	local out = {}
 	for v = 1, nvars do
@@ -329,7 +330,7 @@ local function read_split(ifs, line, nvars, nomark, saw, sh) -- (nomark: \1 is p
 		if s > n then
 			out[v], i = "", n + 1
 		else
-			local e, l = find(ic, line, s, esc, nil, nil, sh)
+			local e, l = find(ic, line, s, esc, nil, nil, st and sh)
 			local nx = n + 1
 			if e then
 				nx = rt.ifs_rskip(ic, line, e + l, n, wsb[line:byte(e)] and 1 or 2)

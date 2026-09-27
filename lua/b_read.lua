@@ -29,9 +29,22 @@ local function mb_short(seg) -- (an incomplete UTF-8 sequence: read_mbchar reads
 	end
 	return false
 end
-local function needs_chars(seg, raw, nul, u8)
+-- `hi`: the chunk the run is cut from holds a byte >= 0x80 (buf_hi: tested once per chunk
+-- as it is read, in a loop the JIT compiles, so ASCII input never pays mb_short's pattern
+-- scan). In a non-UTF-8 multibyte locale any high byte takes the per-char path:
+-- read_mbchar may take the delimiter as a char's trail.
+local function needs_chars(seg, raw, nul, u8, hi)
 	return seg:find("\0", 1, true) or seg:find("\1", 1, true) or (not raw and seg:find("\\", 1, true))
-		or (nul and seg:find("\127", 1, true)) or (u8 and mb_short(seg))
+		or (nul and seg:find("\127", 1, true)) or (hi and (not u8 or mb_short(seg)))
+end
+local rdbuf_u = ffi.cast("const uint8_t *", rdbuf)
+local function buf_hi(n) -- (do rdbuf's first n bytes hold one >= 0x80?)
+	for k = 0, tonumber(n) - 1 do
+		if rdbuf_u[k] >= 0x80 then
+			return true
+		end
+	end
+	return false
 end
 -- One byte of input for `read`, per its state `st` (see the builtin): a regular file
 -- is read in chunks (rewound past the line by unread); a deadline waits for input;
@@ -61,7 +74,7 @@ local function getc(st)
 				return nil
 			end
 			chunk, ci = ffi.string(rdbuf, n), 1
-			st.chunk = chunk
+			st.chunk, st.hi = chunk, st.mbl and buf_hi(n)
 		end
 		st.ci = ci + 1
 		return chunk:sub(ci, ci)
@@ -239,10 +252,14 @@ return function(sh, cmd, args, hook, tcb)
 		-- char is plain (splittable) input, and a \1 byte is just an IFS character
 		local ifs = rt.ifs(sh) or " \t\n"
 		local nomark = not ndelim and ifs:find("\1", 1, true) ~= nil
-		-- (read.def marks a CTLNUL \177 as \1\177 even then, unless IFS holds \177 too:
-		-- `saw` is its saw_escape — every \1 of the value is then dequoted)
-		local nulmark, saw = nomark and not ifs:find("\127", 1, true), false
-		local u8 = rt.lc_mb_cur_max() > 1 and rt.lc_utf8()
+		-- (read.def marks a CTLNUL \177 as \1\177 — even then — unless IFS holds \177 too.
+		-- `saw` is its saw_escape: a marker went in, so every \1 of the value is dequoted.
+		-- Bytes read_mbchar takes after a lead byte go in raw, unmarked: a \1 there still
+		-- escapes the next byte in the split, but stays in the value when nothing was marked)
+		local nulmark, saw = not ifs:find("\127", 1, true), false
+		local mbl = rt.lc_mb_cur_max() > 1
+		local u8 = mbl and rt.lc_utf8()
+		st.mbl = mbl
 		if nchars == 0 then -- `-n 0`: a zero-byte read, which can still fail (bash)
 			got_zero = C.read(ufd, rdbuf, 0) >= 0
 		end
@@ -257,14 +274,14 @@ return function(sh, cmd, args, hook, tcb)
 						-- whatever is past the line is read again by the next `read`)
 						local n = C.read(ufd, rdbuf, st.chunk == "" and #buf == 0 and 128 or RDBUF)
 						if n > 0 then
-							st.chunk, st.ci = ffi.string(rdbuf, n), 1
+							st.chunk, st.ci, st.hi = ffi.string(rdbuf, n), 1, mbl and buf_hi(n)
 						end
 					end
 					if st.ci <= #st.chunk then
 						local e = st.chunk:find(dch, st.ci, true)
 						local stop = e and e - 1 or #st.chunk
 						local seg = st.chunk:sub(st.ci, stop)
-						if not needs_chars(seg, raw, nulmark, u8) then
+						if not needs_chars(seg, raw, nulmark, u8, st.hi) then
 							bulk = true
 							if #seg > 0 then
 								buf[#buf + 1] = seg
@@ -285,7 +302,7 @@ return function(sh, cmd, args, hook, tcb)
 						if d == false then
 							fifo = false
 						elseif d and d ~= "" then -- (nil: empty for now, "" EOF: the byte path)
-							pc.data, pc.pos = d, 1
+							pc.data, pc.pos, pc.hi = d, 1, buf_hi(#d)
 						end
 					end
 					if fifo and pc.pos <= #pc.data then
@@ -293,7 +310,7 @@ return function(sh, cmd, args, hook, tcb)
 						local e = data:find(dch, p0, true)
 						local stop = e or #data
 						local seg = data:sub(p0, e and e - 1 or stop)
-						if needs_chars(seg, raw, nulmark, u8) then
+						if needs_chars(seg, raw, nulmark, u8, mbl and pc.hi) then
 							fifo = false -- (escapes/NULs on this line: byte at a time)
 							pc.data, pc.pos = "", 1
 						else
@@ -346,6 +363,7 @@ return function(sh, cmd, args, hook, tcb)
 							d = mb_rest(st, d) -- (read_mbchar: see below)
 						end
 						buf[#buf + 1] = nomark and d or "\1" .. d
+						saw = saw or not nomark
 					end
 				elseif not ndelim and c == dch then
 					had_nl = true
@@ -353,7 +371,7 @@ return function(sh, cmd, args, hook, tcb)
 				elseif c == "\0" then -- bash strips NUL bytes from read input (keeps the rest)
 				elseif c == "\1" and not nomark then
 					buf[#buf + 1] = "\1\1" -- DOUBLE a real CTLESC byte so it
-					-- survives the \1-marker unescape below
+					saw = true -- survives the \1-marker unescape below
 				elseif c == "\127" and nulmark then
 					buf[#buf + 1] = "\1\127" -- (read.def: a CTLNUL is marked even under
 					saw = true -- skip_ctlesc — read -a's rt.ifs_split keeps the pair, drops a bare one)
@@ -406,7 +424,8 @@ return function(sh, cmd, args, hook, tcb)
 			elseif arr then
 				sh:array_assign(arr, rt.ifs_split(sh, line, nomark, saw), false)
 			elseif ndelim then -- -N: no IFS processing; first var gets everything, rest empty
-				local plain = line:gsub("\1(.)", "%1") -- \1x -> x (unescape); \1\1 -> \1 (literal CTLESC)
+				-- \1x -> x (unescape); \1\1 -> \1 (literal CTLESC) — when something was marked
+				local plain = saw and line:gsub("\1(.)", "%1") or line
 				if #vars == 0 then
 					if not rt.assign_ref(sh, "read", "REPLY", plain) then
 						return
@@ -419,7 +438,7 @@ return function(sh, cmd, args, hook, tcb)
 					end
 				end
 			elseif #vars == 0 then -- REPLY: the raw line, CTLESC markers unescaped
-				if not rt.assign_ref(sh, "read", "REPLY", (nomark and not saw) and line or (line:gsub("\1(.)", "%1"))) then
+				if not rt.assign_ref(sh, "read", "REPLY", saw and (line:gsub("\1(.)", "%1")) or line) then
 					return
 				end
 			else
