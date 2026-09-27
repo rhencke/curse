@@ -13754,8 +13754,16 @@ function M.parse_error_stmt(sh, st, label)
 		sh.in_perr_force = true
 		local _, pe = pcall(M.parse_error_stmt, sh, st, label)
 		sh.in_perr_force = nil
-		error(type(pe) == "table" and pe.__curse_perrexit and pe or { __curse_exit = 2 })
+		error(type(pe) == "table" and pe.__curse_perrexit and pe or { __curse_exit = sh.opt_c and 127 or 2 })
 	end
+	-- (a sourced file's FORCE_EOF ends the shell as an eval's does, status 1)
+	if st.forceeof and not tl and (sh.sourcedepth or 0) > 0 and not sh.in_perr_force then
+		sh.in_perr_force = true
+		local _, pe = pcall(M.parse_error_stmt, sh, st, label)
+		sh.in_perr_force = nil
+		error(type(pe) == "table" and pe.__curse_perrexit and pe or { __curse_exit = sh.opt_c and 127 or 1, __curse_perrexit = true })
+	end
+	-- (under -c every FORCE_EOF reaches run_one_command's top level: status 127 — shell.c)
 	if (label or sh.perr_label) == "eval" and (st.forceeof -- (FORCE_EOF: ends the shell, status 1)
 		or (st.discard and (sh.subdepth or 0) + M.fork_depth > 0)) then
 		local pl = sh.perr_label
@@ -13763,7 +13771,8 @@ function M.parse_error_stmt(sh, st, label)
 		local _, pe = pcall(M.parse_error_stmt, sh, { line = st.line, msg = st.msg, exact = st.exact, text = st.text,
 			showtext = st.showtext, pre = st.pre, preline = st.preline, warns = st.warns, exactmsg = st.exactmsg })
 		sh.perr_label = pl
-		error(type(pe) == "table" and pe.__curse_perrexit and pe or { __curse_exit = 1 })
+		error(type(pe) == "table" and pe.__curse_perrexit and pe
+			or { __curse_exit = (st.forceeof and sh.opt_c) and 127 or 1 })
 	end
 	local msg = tostring(st.msg or "syntax error"):gsub("^.-:%d+: ", "")
 	if not st.exact then
@@ -13805,7 +13814,9 @@ function M.parse_error_stmt(sh, st, label)
 			M.parser_error_exit(sh)
 		end
 	end
-	io.stderr:write("curse: " .. msg .. "\n")
+	if not st.nomsg then -- (a [[ ]] error on a word that failed to read: its pre lines are all)
+		io.stderr:write("curse: " .. msg .. "\n")
+	end
 	if sh.opt_e and not sh.ign_ee then
 		sh.perr_label = pl
 		M.parser_error_exit(sh)
@@ -13818,9 +13829,10 @@ function M.parse_error_stmt(sh, st, label)
 	-- FORCE_EOF rather than DISCARD — it ends, status 1)
 	if st.discard and st.status == 1 and sh.opt_posix and not sh.opt_i then
 		sh.status = 1
-		error({ __curse_exit = 1, __curse_perrexit = true }) -- (past eval/source's containment)
+		error({ __curse_exit = sh.opt_c and 127 or 1, __curse_perrexit = true }) -- (past eval/source's containment)
 	end
-	error({ __curse_exit = st.status or 2, __curse_parseerr = true, lead = st.lead })
+	error({ __curse_exit = (st.forceeof and sh.opt_c and not tl and not sh.in_perr_force) and 127 or st.status or 2,
+		__curse_parseerr = true, lead = st.lead })
 end
 -- bash's evalstring.c: an eval'd/sourced text's syntax error ends a posix shell only while
 -- this_shell_builtin is still that eval/source — no command ran in the text before it (a

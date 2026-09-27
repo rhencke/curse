@@ -1969,7 +1969,9 @@ local COND_OPTOK = { ["&&"] = true, ["||"] = true, ["("] = true, [")"] = true, [
 -- (nlb[k]: a newline came before token k. cond_term skips newlines only where bash's
 -- cond_skip_newlines does — before a term and after one; reading a unary operator's
 -- operand, a binary operator, or its right side (`nonl`) a newline is a `newline' token)
+local COND_PEND = {} -- (the token slot of a word that ran into the end of input)
 local function cond_check(toks, quoted, nlb, eof, line0, tl)
+	local pend_read = false -- (the grammar read the COND_PEND token)
 	local pos, ck, ct, fk = 1, nil, nil, nil -- (ck/ct: bash's cond_token, kind and text;
 	-- fk: its index — negative for a newline before that token — where an error is reported)
 	local pre = {}
@@ -1982,6 +1984,11 @@ local function cond_check(toks, quoted, nlb, eof, line0, tl)
 		fk = pos
 		local t = toks[pos]
 		pos = pos + 1
+		if t == COND_PEND then -- (a word that failed to read: bash's error token, -1)
+			ck, ct = "ERR", "\255"
+			pend_read = true
+			return ck, ct
+		end
 		if t == nil then -- (no `]]` before the input's end: bash's EOF token)
 			ck, ct = eof and "EOF" or "END", eof and "EOF" or "]]"
 		elseif not quoted[pos - 1] and COND_OPTOK[t] then
@@ -1992,7 +1999,7 @@ local function cond_check(toks, quoted, nlb, eof, line0, tl)
 		return ck, ct
 	end
 	local function fail(near)
-		error({ cond_fail = true, near = near }, 0)
+		error({ cond_fail = true, near = near, pend = pend_read or nil }, 0)
 	end
 	local cond_or
 	local function term()
@@ -2018,7 +2025,10 @@ local function cond_check(toks, quoted, nlb, eof, line0, tl)
 			term()
 		elseif k == "WORD" and COND_UNOP[t] then
 			local k2, t2 = nxt(true)
-			if k2 ~= "WORD" then
+			if k2 == "ERR" then -- (error_token_from_token: none to name)
+				pre[#pre + 1] = "unexpected argument to conditional unary operator"
+				fail(t2)
+			elseif k2 ~= "WORD" then
 				pre[#pre + 1] = "unexpected argument `" .. t2 .. "' to conditional unary operator"
 				fail(k2 == "NL" and t or t2) -- (near: the input line's last token)
 			end
@@ -2027,13 +2037,16 @@ local function cond_check(toks, quoted, nlb, eof, line0, tl)
 			local k2, t2 = nxt(true)
 			if (k2 == "WORD" and COND_BINOP[t2]) or k2 == "<" or k2 == ">" then
 				local k3, t3 = nxt(true)
-				if k3 ~= "WORD" then
+				if k3 == "ERR" then
+					pre[#pre + 1] = "unexpected argument to conditional binary operator"
+					fail(t3)
+				elseif k3 ~= "WORD" then
 					pre[#pre + 1] = "unexpected argument `" .. t3 .. "' to conditional binary operator"
 					fail(k3 == "NL" and t2 or t3)
 				end
 				nxt()
 			elseif not (k2 == "END" or k2 == "&&" or k2 == "||" or k2 == ")") then
-				pre[#pre + 1] = k2 == "WORD" and "conditional binary operator expected"
+				pre[#pre + 1] = (k2 == "WORD" or k2 == "ERR") and "conditional binary operator expected"
 					or ("unexpected token `" .. t2 .. "', conditional binary operator expected")
 				fail(k2 == "NL" and t or t2)
 			end
@@ -2073,7 +2086,8 @@ local function cond_check(toks, quoted, nlb, eof, line0, tl)
 		error({ __curse_perr = true, pre = pre, msg = "syntax error: unexpected end of file", eof = true }, 0)
 	end
 	-- (at a real token the caller re-derives `near` from the input text, as bash does)
-	error({ __curse_perr = true, pre = pre, exact = true, msg = "syntax error near `" .. e.near .. "'", fk = fk }, 0)
+	error({ __curse_perr = true, pre = pre, exact = true, msg = "syntax error near `" .. e.near .. "'", fk = fk,
+		pend = e.pend }, 0)
 end
 
 -- Build a [[ … ]] token list's boolean-expression AST:
@@ -4398,6 +4412,9 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs, xg, bq
 			i = i + 2
 			local line0, closed = line, false
 			local toks, quoted, nlb, tp, tl = {}, {}, {}, {}, {} -- (tp/tl: each token's position/line)
+			-- (a word that runs into the end of input — an unclosed quote — is an error only
+			-- when bash's cond parser READS it: a grammar error on an earlier token wins)
+			local pend_err
 			while true do
 				ws()
 				tp[#toks + 1], tl[#toks + 1] = i, line
@@ -4478,7 +4495,16 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs, xg, bq
 					i = i + 1
 				else
 					local before = i
-					local w = word(true, true) -- split on <,>,(,) operators (no spaces needed in [[ ]])
+					local wok, w = pcall(word, true, true) -- split on <,>,(,) operators (no spaces needed in [[ ]])
+					if not wok then
+						if type(w) == "string" and w:find("unexpected EOF while looking for matching", 1, true) then
+							pend_err = w
+							toks[#toks + 1] = COND_PEND
+							quoted[#toks] = false
+							break
+						end
+						error(w, 0)
+					end
 					if w == "" then
 						-- word() stalled on a self-delimiting metacharacter. `&&`/`||` are
 						-- two-char operator tokens; `(`, `)`, `<`, `>`, `;`, … are one char
@@ -4502,6 +4528,22 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs, xg, bq
 				end
 			end
 			local cok, cerr = pcall(cond_check, toks, quoted, nlb, not closed, line0, tl)
+			if pend_err and (cok or (type(cerr) == "table" and cerr.eof)) then
+				error(pend_err, 0) -- (the grammar took the unclosed word as it was: the quote's error)
+			end
+			if pend_err and not cok and type(cerr) == "table" and cerr.pend then
+				-- the grammar READ the failed word (bash's error token): parse_matched_pair's
+				-- EOF message at the quote's line, then cond_term's own — at the end of input
+				-- (the quote swallowed the rest; a missing final newline is supplied) — and no
+				-- `syntax error near` line
+				local ptl = tl[#toks] -- (the failed word's line)
+				local eofl = ptl + select(2, src:sub(tp[#toks]):gsub("\n", "")) + (src:sub(-1) == "\n" and 0 or 1)
+				local out = { { (pend_err:gsub("^.-:%d+: ", "")), ptl } }
+				for _, m in ipairs(cerr.pre or {}) do
+					out[#out + 1] = type(m) == "table" and m or { m, eofl }
+				end
+				error({ __curse_perr = true, pre = out, nomsg = true, line = eofl, msg = "" }, 0)
+			end
 			if not cok then -- (reported at the failing token: its line, shown as the input line)
 				local k = type(cerr) == "table" and cerr.fk
 				if type(cerr) == "table" and cerr.eof then
@@ -5235,6 +5277,7 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs, xg, bq
 							or (arrlit_eof and type(st) == "string") or nil,
 						forceeof = type(st) == "table" and st.__curse_perr and st.forceeof or nil,
 						exactmsg = type(st) == "table" and st.__curse_perr and st.exactmsg or nil, -- (its own msgid)
+						nomsg = type(st) == "table" and st.__curse_perr and st.nomsg or nil, -- (its `pre` says it all)
 					},
 				}
 			end
