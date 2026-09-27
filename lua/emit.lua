@@ -7239,13 +7239,13 @@ H.background = function(cx, st, after)
 	-- so nothing with a side effect — $(…), ${x:=…}, arith assignment — may move to the
 	-- parent) and no redirects/assignments: build argv here and spawn, no fork at all. A
 	-- raise while expanding (set -u) or a spawn the runtime declines takes the fork path.
-	local spawn = nil
+	local spawn, spawn_refs = nil, false
 	if ext and not sc.redirs and not sc.assigns then
-		local pure = require("runtime").bg_pure_words(sc.words)
+		local pure, refs = require("runtime").bg_pure_words(sc.words)
 		if pure then
 			local builder = field_argv(sc.words, 1, cx.lifted, "rt.cstr(%s)")
 			if builder then
-				spawn = builder
+				spawn, spawn_refs = builder, refs
 			end
 		end
 	end
@@ -7258,7 +7258,9 @@ H.background = function(cx, st, after)
 		st.cmd.t == "pipeline" and ", true" or "")
 	local body = fork
 	if spawn then
-		body = ("do local __ok, __a = pcall(function() %s; return __a end); if not __ok then require(\"parser\").trap_flow(__a) end; if not (__ok and sh:spawn_bg(__a, %q)) then %s end end"):format(
+		-- (under set -u an unset parameter is the child's error: the task path then)
+		body = ("do local __ok, __a = false; if %s then __ok, __a = pcall(function() %s; return __a end); if not __ok then require(\"parser\").trap_flow(__a) end end; if not (__ok and sh:spawn_bg(__a, %q)) then %s end end"):format(
+			spawn_refs and "not sh.opt_u" or "true",
 			spawn,
 			cmdstr,
 			fork

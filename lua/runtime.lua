@@ -5674,15 +5674,15 @@ local function bg_pure_arith(e)
 		return true
 	end
 	local k = e.k
-	if k == "num" or k == "param" then
+	if k == "num" then
 		return true
-	elseif k == "var" then
-		return not BG_IMPURE_VAR[e.name] and (not e.idxraw or e.idxraw:match("^[%w_]*$") ~= nil)
-	elseif k == "bin" or k == "un" or k == "tern" then
+	elseif (k == "bin" and e.op ~= "/" and e.op ~= "%" and e.op ~= "**") or k == "un" or k == "tern" then
 		return bg_pure_arith(e.e) and bg_pure_arith(e.l) and bg_pure_arith(e.r)
 			and bg_pure_arith(e.c) and bg_pure_arith(e.a) and bg_pure_arith(e.b)
 	end
-	return false -- (asgn/pre/post/comma/xpand/parse errors: the child's to evaluate)
+	-- (asgn/pre/post/comma/xpand/parse errors, and anything that can fail — a variable
+	-- whose value isn't a number, / % ** — the child's to evaluate: its error, its line)
+	return false
 end
 -- (an operand word: plain text and $name/${name} references only)
 local function bg_pure_operand(s)
@@ -5698,9 +5698,15 @@ local function bg_pure_operand(s)
 	end)
 	return not bad and not s:find("$", 1, true)
 end
+-- Second result: the words reference a parameter, which under `set -u` may be unset — an
+-- error the child reports, so the caller spawns only when nounset is off.
 function M.bg_pure_words(words)
+	local refs = false
 	for _, w in ipairs(words) do
 		for _, pt in ipairs(w.parts or {}) do
+			if pt.var or pt.param or pt.pexp or pt.special then
+				refs = true
+			end
 			if pt.cmdsub or pt.procsub or pt.backtick or pt.arithast or pt.special == "!" or pt.special == "_"
 				or (pt.var and BG_IMPURE_VAR[pt.var]) then
 				return false
@@ -5722,7 +5728,7 @@ function M.bg_pure_words(words)
 			end
 		end
 	end
-	return true
+	return true, refs
 end
 
 -- `ext args… &` where the args are side-effect-free: the shell already built argv, so

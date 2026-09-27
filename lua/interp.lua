@@ -5755,8 +5755,11 @@ exec_stmt = function(sh, st, hook)
 		-- spawn the program as the job (rt: bg_pure_words, Shell:spawn_bg — the compiled
 		-- tier's path): $! is its real pid. A raise while expanding (set -u) or a spawn the
 		-- runtime declines (a function/builtin, xtrace, …) runs it as a task instead.
-		if cmd.t == "simple" and cmd.words and cmd.words[1] and not cmd.redirs and not cmd.assigns
-			and rt.bg_pure_words(cmd.words) then
+		local pure, refs
+		if cmd.t == "simple" and cmd.words and cmd.words[1] and not cmd.redirs and not cmd.assigns then
+			pure, refs = rt.bg_pure_words(cmd.words)
+		end
+		if pure and not (refs and sh.opt_u) then
 			local args = {}
 			local ok, err = pcall(expand_args, sh, cmd, args, false)
 			if not ok then

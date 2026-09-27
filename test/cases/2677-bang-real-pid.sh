@@ -81,3 +81,18 @@ m=$(ps -o pgid= -p $$); m=${m// /}
 [ "$g" = "$m" ] && echo "nomonitor: shell's pgrp"
 kill $p; wait $p; echo "nomonitor status $?"
 rm -f "$T"
+
+# the job's words are still the job's to expand: an expansion error is reported once, by
+# the job (its line), and the shell carries on; no side effect reaches the shell
+/bin/echo a b &
+wait; echo "_=$_"
+/bin/echo $((1/0)) &
+wait; echo "div status $?"
+x='a  b'; /bin/echo $x "${x}" ${x:-$(echo z)} &
+wait
+unset u; ( set -u; /bin/echo $u & wait; echo "nounset: went on" ); echo "nounset status $?"
+a=(1 2 3); i=0; /bin/echo ${a[i]} ${#a[@]} ${a[i++]} &
+wait; echo "i=$i"
+: ${d:=unset}; /bin/echo ${d:=x} ${e:=y} & wait; echo "e=${e-unset}"
+nosuchcmd_zz arg &
+wait $!; echo "notfound status $?"
