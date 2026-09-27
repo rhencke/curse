@@ -5003,7 +5003,7 @@ end
 -- A loop head's preemption point (rt.preempt: the jobs' turn) can run a trap — one
 -- that a job's `kill $$` raised meanwhile — and its break/continue act on THIS loop, as
 -- a trap run after the body's last command would (bash). Returns "break" to end it.
-local function loop_preempt(sh)
+function M.loop_preempt(sh) -- (a field: the main chunk is at its local limit)
 	local ok, err = pcall(rt.preempt)
 	if not ok then
 		return loop_signal(sh, err)
@@ -5619,7 +5619,7 @@ exec_stmt = function(sh, st, hook)
 					bodystatus = sh.status
 					break
 				end
-				if PREEMPT[0] ~= 0 and loop_preempt(sh) == "break" then
+				if PREEMPT[0] ~= 0 and M.loop_preempt(sh) == "break" then
 					break
 				end
 				fdbg(2)
@@ -5671,7 +5671,7 @@ exec_stmt = function(sh, st, hook)
 				bodystatus = sh.status
 				break
 			end
-			if PREEMPT[0] ~= 0 and loop_preempt(sh) == "break" then
+			if PREEMPT[0] ~= 0 and M.loop_preempt(sh) == "break" then
 				break
 			end
 			-- a break/continue in the CONDITION affects this loop too (bash)
@@ -5988,7 +5988,7 @@ exec_stmt = function(sh, st, hook)
 				bodystatus = sh.status
 				break
 			end
-			if PREEMPT[0] ~= 0 and loop_preempt(sh) == "break" then
+			if PREEMPT[0] ~= 0 and M.loop_preempt(sh) == "break" then
 				break
 			end
 			fs.idx = fs.idx + 1
