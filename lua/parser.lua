@@ -5532,6 +5532,11 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs, xg, bq
 						discard = type(st) == "table" and st.__curse_perr and st.discard
 							or (arrlit_eof and type(st) == "string") or nil,
 						forceeof = type(st) == "table" and st.__curse_perr and st.forceeof or nil,
+						-- (parse_matched_pair's EOF error: parser_error, then the grammar's `error
+						-- yacc_EOF` sets $? to 2 only when it's 0 — an open `$(`'s is reported as a
+						-- syntax error, which always does)
+						keepst = type(st) == "string" and st:find("EOF while looking for matching `", 1, true)
+							and not (comsub_eof and st:find("matching `)'", 1, true)) or nil,
 						exactmsg = type(st) == "table" and st.__curse_perr and st.exactmsg or nil, -- (its own msgid)
 						nomsg = type(st) == "table" and st.__curse_perr and st.nomsg or nil, -- (its `pre` says it all)
 					},

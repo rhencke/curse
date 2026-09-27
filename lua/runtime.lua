@@ -15102,7 +15102,10 @@ function M.parse_error_stmt(sh, st, label)
 		sh.status = 1
 		error({ __curse_exit = sh.opt_c and 127 or 1, __curse_perrexit = true }) -- (past eval/source's containment)
 	end
-	error({ __curse_exit = (st.forceeof and sh.opt_c and not tl and not sh.in_perr_force) and 127 or st.status or 2,
+	-- (the reader's own input — script, stdin, -c — keeps a failed last command's status;
+	-- an eval'd or sourced text's parse returns 2)
+	local keep = st.keepst and not tl and (sh.sourcedepth or 0) == 0 and sh.status ~= 0 and sh.status
+	error({ __curse_exit = (st.forceeof and sh.opt_c and not tl and not sh.in_perr_force) and 127 or st.status or keep or 2,
 		__curse_parseerr = true, lead = st.lead })
 end
 -- bash's evalstring.c: an eval'd/sourced text's syntax error ends a posix shell only while
