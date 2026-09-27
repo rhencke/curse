@@ -1442,7 +1442,7 @@ end
 -- command runner's call path (frame/params/return), lifted vars synced around it
 function EF.ext_or_fn(cx, st, cmd, argv, ext)
 	local si, _, so = lsync(cx.lifted)
-	if EF.funcstack and st.line and not EF.trapline then -- (the call's line: run_function pushes it on BASH_LINENO)
+	if st.line and not EF.trapline then -- (the call's line: run_function pushes it on BASH_LINENO)
 		si = "sh.cur_line = " .. st.line .. "; " .. si
 	end
 	return ("if sh.functions[%q] then %srt.call_dynamic_fn(sh, %s)%s else %s end"):format(cmd, si, argv, so, ext)
@@ -5013,6 +5013,13 @@ EF.simple_native = function(cx, st, after, cmd)
 	end
 	if bind and redir and #pnames > 0 then -- (a readonly prefix is reported before the redirections)
 		xt = xt .. ("; rt.prefix_ro(sh, { %s })"):format(table.concat(pnames, ", "))
+	end
+	-- (a function the runner calls — one this module doesn't own, e.g. the interpreter's
+	-- definition a tiered switch inherited — pushes sh.cur_line on BASH_LINENO: the call's)
+	-- (not gated on EF.funcstack: a standalone-compiled function can't see the text that
+	-- reads BASH_LINENO — the callee may be what reads it)
+	if st.line and not EF.trapline then
+		xt = xt .. "; sh.cur_line = " .. st.line
 	end
 	return cx.dispatch(st, after, {
 		prelude = table.concat(out, "; ") .. xt,

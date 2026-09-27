@@ -4403,7 +4403,9 @@ function M.import_functions(sh)
 		-- (a path-like name is never imported: `/bin/echo` must stay the program; nor, in
 		-- posix mode, one that isn't an identifier)
 		if not name:find("/", 1, true) and not (sh.opt_posix and not name:find("^[%a_][%w_]*$")) then
-			ok, ast = pcall(P.parse, src)
+			-- (numbered from line 0, as bash's initialize_shell_variables parses it: the
+			-- body's first line is 0, which an error prefix omits — `environment: …`)
+			ok, ast = pcall(P.parse, src, nil, nil, nil, nil, nil, 0)
 		end
 		-- (exactly ONE statement: anything after the definition — `; echo BAD` — is a second
 		-- statement, and a word glued after the body is a syntax error)
@@ -4428,6 +4430,18 @@ function M.import_functions(sh)
 			sh.func_def[name] = st
 			sh.fexport = sh.fexport or {}
 			sh.fexport[name] = true
+			-- (its ${BASH_SOURCE[0]} and error label: bash's "environment", line 0)
+			sh.func_file = sh.func_file or {}
+			sh.func_file[name] = "environment"
+			sh.func_line = sh.func_line or {}
+			sh.func_line[name] = 0
+			-- (what its text reads that compiled callers must maintain: tier start_state)
+			local fl = ((val:find("FUNCNAME", 1, true) or val:find("BASH_SOURCE", 1, true)
+				or val:find("BASH_LINENO", 1, true)) and "F" or "") .. (val:find("PIPESTATUS", 1, true) and "P" or "")
+			if fl ~= "" then
+				local all = (sh.imp_flags or "") .. fl
+				sh.imp_flags = (all:find("F", 1, true) and "F" or "") .. (all:find("P", 1, true) and "P" or "")
+			end
 		else
 			io.stderr:write("curse: error importing function definition for `" .. name .. "'\n")
 		end
