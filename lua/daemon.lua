@@ -247,8 +247,6 @@ end
 -- request below, and shell VARIABLE state is a brand-new Shell.new — so nothing bleeds
 -- between requests (torture-tested: 8000 varied requests, zero state/fd leaks).
 local function serve_request(cfd, req, fds, ctx)
-	-- first, our pid (negated): the client forwards the signals sent to it here
-	C.write(cfd, ffi.new("int32_t[1]", -ctx.worker_pid), 4)
 	rt.path_epoch = rt.path_epoch + 1 -- (the command-lookup cache re-checks PATH once per request)
 	if fds[1] then
 		C.dup2(fds[1], 0)
@@ -312,6 +310,10 @@ local function serve_request(cfd, req, fds, ctx)
 	end
 	rt.startup_ignored(sh, req.sigign)
 	rt.sig_setup(sh) -- (SIGQUIT ignored; the terminating signals caught: rt.termsig)
+	-- now our pid (negated): the client forwards the signals sent to it here. Not before
+	-- the script's dispositions are in place: a signal the client holds until then would
+	-- otherwise reach a worker with no script to take it (__curse_sigrun unset), and be lost.
+	C.write(cfd, ffi.new("int32_t[1]", -ctx.worker_pid), 4)
 	-- A Lua error escaping the run is a curse BUG: report it on the request's stderr
 	-- (status 1) instead of failing silently.
 	local ok = xpcall(function()

@@ -110,6 +110,16 @@ int curse_sig_ignore(int s)
   return sigaction(s, &sa, (struct sigaction *)0);
 }
 
+/* The signal whose hook is scheduled but hasn't run (0: none). A compiled trace never
+ * reaches the hook until it exits, and one whose loop can't be repointed (an inverted
+ * back-edge: its last guard jumps back) never exits by itself: code that can loop on
+ * its input for ever (`read` on endless input) reads this each round — after a C call,
+ * so the JIT loads it every time — and leaves the trace when it is set (rt.sig_check). */
+int *curse_sig_pendingp(void)
+{
+  return (int *)&curse_sig_num;
+}
+
 /* Discard a pending scheduled trap: clear the recorded signal and remove the VM
  * hook. A forked child calls this AFTER restoring its default dispositions, so a
  * signal it caught in the fork→reset window (e.g. `cmd & ; kill -SIG $!`) does not

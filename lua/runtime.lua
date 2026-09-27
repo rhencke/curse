@@ -952,6 +952,31 @@ local _co_pfd = ffi.new("struct curse_co_pollfd[1]")
 -- trace would block with the trap still pending: a forwarded TERM never ended a `read`).
 M.eintr = function() end
 jit.off(M.eintr)
+-- A loop that can spin on its input for ever without blocking (`read -r x </dev/zero`)
+-- calls this each round: a signal's hook is scheduled but only fires once the trace
+-- exits, and a trace whose loop is inverted (its last guard is the back-edge) can't be
+-- made to (lib_cursesig.c). The JIT hoists a load of the flag out of a loop unless the
+-- loop makes a C call each round (a CALLXS may write it) — `read` makes one per byte —
+-- so the trace loads it every round; set, the guard fails, the trace exits and the trap
+-- runs (bash's read loop checks for terminating signals per character too). A daemon
+-- worker catches HUP/INT/TERM always: without this the forwarded signal never ended
+-- such a script.
+pcall(ffi.cdef, "int *curse_sig_pendingp(void);")
+do
+	local ok, p = pcall(function()
+		return C.curse_sig_pendingp()
+	end)
+	if not (ok and p ~= nil) then -- (a VM without curse's C additions)
+		p = ffi.new("int[1]")
+		M.sigpend_none = p -- (anchored)
+	end
+	local SIGPEND = ffi.cast("volatile int *", p)
+	function M.sig_check()
+		if SIGPEND[0] ~= 0 then
+			M.eintr()
+		end
+	end
+end
 local function fd_would_block(fd, ev)
 	_co_pfd[0].fd, _co_pfd[0].events, _co_pfd[0].revents = fd, ev, 0
 	local r = C.curse_co_poll(_co_pfd, 1, 0)

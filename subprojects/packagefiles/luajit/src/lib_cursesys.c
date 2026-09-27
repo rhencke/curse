@@ -29,6 +29,7 @@ extern char curse_sig_clearpending[];
 extern char curse_sig_default[];
 extern char curse_sig_hold[];
 extern char curse_sig_ignore[];
+extern char curse_sig_pendingp[];
 extern char dup[];
 extern char dup2[];
 extern char endpwent[];
@@ -167,6 +168,7 @@ static const curse_sym_t curse_syms[] = {
   { "curse_sig_default", (void*)curse_sig_default },
   { "curse_sig_hold", (void*)curse_sig_hold },
   { "curse_sig_ignore", (void*)curse_sig_ignore },
+  { "curse_sig_pendingp", (void*)curse_sig_pendingp },
   { "dup", (void*)dup },
   { "dup2", (void*)dup2 },
   { "endpwent", (void*)endpwent },
