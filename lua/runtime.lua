@@ -12,7 +12,11 @@ local i64 = ffi.typeof("int64_t")
 -- worker) outgrows LuaJIT's default 1000 traces, and hitting the cap FLUSHES EVERY
 -- trace — each request then re-records the hot paths (measured ~0.6ms/request on the
 -- cases corpus). Machine code is allocated as used, so a high cap costs nothing idle.
-pcall(jit.opt.start, "maxtrace=8000", "maxmcode=8192")
+-- instunroll: a compiled loop is a pc-dispatch `while true` (emit.lua) — one block per
+-- iteration, so its trace only closes after unrolling once per block of the cycle; at
+-- LuaJIT's default (4) a loop of more than ~4 blocks never traces (GFAIL, then blacklisted)
+-- and runs in the VM interpreter — bimodally, as hot counters collide (posix.sh 3ms vs 26).
+pcall(jit.opt.start, "maxtrace=8000", "maxmcode=8192", "instunroll=16")
 
 local M = {}
 M.i64 = i64
@@ -7282,7 +7286,12 @@ end
 local function i64_to_str(n)
 	local d = tonumber(n)
 	if d > -1e14 and d < 1e14 then -- (exact as a double, printed without an exponent)
-		return tostring(d)
+		-- (not `return tostring(d)`: a TAIL call to a builtin ends a trace recorded from
+		-- this function's entry at no RET, so every such trace aborts ("leaving loop in root
+		-- trace") until the function is blacklisted — and then every loop calling it, e.g. a
+		-- compiled `$((i+1))` loop, can never trace)
+		local s = tostring(d)
+		return s
 	end
 	return (tostring(n):gsub("LL$", ""))
 end
