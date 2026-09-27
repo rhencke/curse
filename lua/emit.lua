@@ -623,7 +623,16 @@ local function arith_side_effect(e)
 		return true
 	end
 	if e.k == "xpand" then
-		return not xpand_fast(e.raw)
+		if not xpand_fast(e.raw) then
+			return true
+		end
+		-- (a fast one renders as a VALUE: its native tree must not assign — `P=${#x}`,
+		-- `a[$k]=7`, `$x++` — as not_compilable says too)
+		local ok, nat = pcall(require("parser").arith, xpand_lens(e.raw), true)
+		if not ok then
+			require("parser").trap_flow(nat)
+		end
+		return not ok or arith_side_effect(nat)
 	end
 	-- comma falls through: a pure `(a, b)` is side-effect-free (recurse into l/r); a
 	-- side-effecting operand is detected by the recursion below.
@@ -2585,6 +2594,11 @@ local function substr_native(txt, lifted)
 		return nil
 	end
 	local code = EF.with(EF.AREAD, emit_value, ast, lifted) -- (set -u: an unset name in ${s:u} is unbound)
+	if code:find("rt.arith_read(", 1, true) then
+		-- (a variable's value is evaluated as an expression and may fail: its error is labelled
+		-- with the parameter — `v: x+: syntax error…` — which rt.substr_arith does)
+		return nil
+	end
 	return ("tonumber(%s)"):format(code)
 end
 function pexp_scalar(pe, lifted)
@@ -3711,7 +3725,9 @@ local function cond_arith(c)
 		return c
 	end -- an arith node already (forc init/cond/step)
 	if #c == 1 and c[1] and c[1].t == "arithcmd" then
-		return c[1].expr
+		-- (not one whose text is no expression — `((0 0))`: the matherr node only reports
+		-- its error when run, so it stays the command it is — H.arithcmd — as a condition)
+		return c[1].expr.k ~= "matherr" and c[1].expr or nil
 	end
 	return nil
 end
@@ -6696,7 +6712,8 @@ H.whilec = function(cx, st, after)
 		local exitp = cx.newpc()
 		cx.blocks[exitp] = ("sh.status = %s; pc = %d"):format(lv, after)
 		local bodysave = cx.newpc()
-		local bodyentry = cx.loop_list(st.body, bodysave, after, condp)
+		-- (continue re-tests through bodysave: its status 0 is the last body command's)
+		local bodyentry = cx.loop_list(st.body, bodysave, after, bodysave)
 		cx.blocks[bodysave] = ("%s = sh.status; pc = %d"):format(lv, condp)
 		local cst = type(st.cond) == "table" and st.cond[1] or nil
 		local stexpr
@@ -6737,7 +6754,9 @@ H.whilec = function(cx, st, after)
 	local exitp = cx.newpc()
 	cx.blocks[exitp] = ("sh.status = %s; pc = %d"):format(lv, after)
 	local bodysave = cx.newpc()
-	local bodyentry = cx.loop_list(st.body, bodysave, after, prep) -- break exits (status 0), continue re-tests
+	-- break exits (status 0); continue re-tests through bodysave — its 0 is then the last
+	-- body command's status, should the re-test end the loop (bash)
+	local bodyentry = cx.loop_list(st.body, bodysave, after, bodysave)
 	cx.blocks[bodysave] = ("%s = sh.status; pc = %d"):format(lv, prep)
 	-- a break/continue in the CONDITION acts on this loop too (bash): break ends it (the
 	-- status is break's 0), continue re-tests — each leaving the condition's noerr first
