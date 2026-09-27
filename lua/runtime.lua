@@ -13982,7 +13982,7 @@ end
 -- then the offending line as `…'. Shared by both tiers (the compiled one calls it natively).
 -- `label` "eval": an eval'd text's error reads `NAME: eval: line N:`, and even a recoverable
 -- one ends the eval (status 2, like b_eval) — the caller contains __curse_parseerr.
-local TRAP_TAGS = { ["trap"] = true, ["exit trap"] = true, ["debug trap"] = true, ["error trap"] = true,
+M.TRAP_TAGS = { ["trap"] = true, ["exit trap"] = true, ["debug trap"] = true, ["error trap"] = true,
 	["return trap"] = true }
 function M.parse_error_stmt(sh, st, label)
 	label = label or st.plabel
@@ -14004,7 +14004,7 @@ function M.parse_error_stmt(sh, st, label)
 	-- (a trap handler's FORCE_EOF — a $( … ) body's syntax error — ends the shell too, with
 	-- the syntax error's status 2; the EXIT trap's run just ends: the shell is exiting anyway)
 	local tl = label or sh.perr_label
-	if st.forceeof and TRAP_TAGS[tl] and tl ~= "exit trap" and not sh.in_perr_force then
+	if st.forceeof and M.TRAP_TAGS[tl] and tl ~= "exit trap" and not sh.in_perr_force then
 		sh.in_perr_force = true
 		local _, pe = pcall(M.parse_error_stmt, sh, st, label)
 		sh.in_perr_force = nil
@@ -14048,7 +14048,7 @@ function M.parse_error_stmt(sh, st, label)
 	if st.line then
 		sh.cur_line = st.line
 		-- (a trap handler's text: its lines count from the line it runs at — run_trap)
-		if sh.trap_lbase and TRAP_TAGS[label or sh.perr_label] then
+		if sh.trap_lbase and M.TRAP_TAGS[label or sh.perr_label] then
 			sh.cur_line = st.line + sh.trap_lbase - 1
 		end
 	end
