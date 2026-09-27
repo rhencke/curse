@@ -488,6 +488,12 @@ local function serve_request(cfd, req, fds, ctx)
 	if next(rt.internal_pids) then
 		retire = true
 	end
+	-- …and so does one whose script ran `bind` at its top level (rt.rl_dirty): readline's
+	-- keymaps and variables are process-global, and the next script must start with the
+	-- defaults a fresh bash has (2300's bindings leaked into its own warm rerun)
+	if rt.rl_dirty then
+		retire = true
+	end
 	local cur = ffi.new("struct curse_d_rlimit")
 	for res, orig in pairs(ctx.rlimits) do
 		if C.curse_d_getrlimit(res, cur) == 0 and (cur.cur ~= orig.cur or cur.max ~= orig.max) then

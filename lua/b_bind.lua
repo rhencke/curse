@@ -105,6 +105,9 @@ end
 
 return function(sh, cmd, args, hook, tcb)
 	if cmd == "bind" then
+		if not rt.iso_cur(sh) then -- (readline's state is the PROCESS's: a daemon worker whose
+			rt.rl_dirty = true -- script bound keys at its top level retires after it — lua/daemon.lua)
+		end
 		-- readline introspection + binding via FFI (same library bash links ->
 		-- identical output, no tty needed). Shell-command bindings (-x/-X) are kept
 		-- curse-side, per keymap, in bash's `"keyseq": "cmd"` format.
