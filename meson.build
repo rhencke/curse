@@ -245,6 +245,9 @@ test('stress', files('test' / 'stress' / 'run.sh'),
   is_parallel: false, timeout: 0)
 add_test_setup('default', exclude_suites: ['stress'], is_default: true)
 
+# --- Fuzzing (AFL++; opt-in, never part of `meson test`): meson compile -C build fuzz
+subdir('tools' / 'fuzz')
+
 summary({'dash (extra column)': dash_prog.found(),
          'bash+oil corpora': bash_found,
          'cases': bash_found ? 'scored vs the in-tree bash 5.2.21 oracle' : 'skipped (no oracle: needs the bash subproject)'},

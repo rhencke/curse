@@ -6,3 +6,6 @@ option('native', type: 'boolean', value: true,
 
 option('conformance', type: 'feature', value: 'enabled',
   description: 'Fetch the bash + oil conformance corpora (Meson subprojects) and register the bash/oil conformance tests. enabled (default): required — a fetch failure is a hard error, not a silent skip. disabled: skip the fetch for a lean/offline build. auto: best-effort (non-fatal if offline).')
+
+option('fuzz_seconds', type: 'integer', value: 1800, min: 1,
+  description: 'Wall time of one `meson compile -C build fuzz` campaign (FUZZ_SECONDS in the environment overrides it).')
