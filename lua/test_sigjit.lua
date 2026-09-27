@@ -210,7 +210,70 @@ local function state_exact()
 	return bad, hits
 end
 
+-- A signal's trap runs when the signal arrives, never later. lua_sethook runs in the
+-- async handler, and its dispatch-table update could land in the middle of another
+-- one — the hook removing itself, a trace starting or stopping — which then finished
+-- writing its own, stale table: the hook stayed pending, unseen, until some later mode
+-- change ran it in a stray place (test_sigjit's next case: "error object is not a
+-- string", ~8% of runs under load). Timer signals every 30us while fresh functions
+-- get traced (trace starts/stops: dispatch updates), then none: no trap may run after.
+local function no_late_trap()
+	local hits, late = 0, 0
+	_G.__curse_sigrun = function()
+		hits = hits + 1
+	end
+	local function churn(rounds, salt)
+		local acc = 0
+		for k = 1, rounds do
+			local f = loadstring("local n = 0 for i = 1, 300 do n = n + i % " .. (k % 7 + 2) .. " end return n + " .. salt + k)
+			acc = acc + f()
+		end
+		return acc
+	end
+	every(30)
+	for r = 1, 3000 do -- (hot traced loops, preempted: patch, exit, hook, unpatch...)
+		local n, m = 0, 0
+		for i = 1, 20000 do
+			n = n + 1
+		end
+		for i = 1, 3000 do
+			m = bit.bxor(m * 3 + i, n) % 65536
+		end
+		hits = hits + 0 * m
+	end
+	churn(200, 0) -- (…and trace starts/stops)
+	every(0)
+	local function settle() -- (in the interpreter: a hook already scheduled runs here)
+		local n = 0
+		for i = 1, 2000 do
+			n = n + i
+		end
+		return n
+	end
+	jit.off(settle)
+	settle()
+	_G.__curse_sigrun = function()
+		late = late + 1
+	end
+	churn(3000, 1) -- (more dispatch updates: a hook left pending would run now)
+	_G.__curse_sigrun = function(s)
+		error({ sig = s }, 0)
+	end
+	return late, hits
+end
+
 local fails = 0
+if not arg[1] or arg[1] == "no_late_trap" then
+	local worst, hitsum = 0, 0
+	for _ = 1, 5 do
+		local late, hits = no_late_trap()
+		worst, hitsum = math.max(worst, late), hitsum + hits
+	end
+	print("no_late_trap: " .. (worst == 0 and "no trap ran late" or (worst .. " traps ran after the signals stopped")) .. (hitsum > 20 and "" or " (NOT preempted: " .. hitsum .. ")"))
+	if worst ~= 0 or hitsum <= 20 then
+		fails = fails + 1
+	end
+end
 if not arg[1] or arg[1] == "state_exact" then
 	local watchdog = after(60, SIGKILL)
 	local bad, hits = state_exact()
@@ -229,7 +292,7 @@ if not arg[1] or arg[1] == "for_exact" then
 		fails = fails + 1
 	end
 end
-for _, name in ipairs(arg and arg[1] and ((arg[1] == "for_exact" or arg[1] == "state_exact") and {} or { arg[1] }) or { "inverted_short", "inverted_long", "side_exit", "ffi_read" }) do
+for _, name in ipairs(arg and arg[1] and ((arg[1] == "for_exact" or arg[1] == "state_exact" or arg[1] == "no_late_trap") and {} or { arg[1] }) or { "inverted_short", "inverted_long", "side_exit", "ffi_read" }) do
 	local watchdog = after(5, SIGKILL)
 	after(0.05, SIGALRM)
 	local ok, e = pcall(loops[name])

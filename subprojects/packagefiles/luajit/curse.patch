@@ -235,6 +235,70 @@ index 283b6e42..62c231ef 100644
    return p;
  }
  
+diff --git a/src/lj_dispatch.c b/src/lj_dispatch.c
+index 9879a95b..7f9e8cae 100644
+--- a/src/lj_dispatch.c
++++ b/src/lj_dispatch.c
+@@ -102,14 +102,33 @@ void lj_dispatch_init_hotcount(global_State *g)
+ #define DISPMODE_REC	0x20	/* Recording active. */
+ #define DISPMODE_PROF	0x40	/* Profiling active. */
+ 
++#ifdef CURSE_SIG_DESTRUCTIVE
++/* curse: lua_sethook runs from an async signal handler (lib_cursesig.c), and so this
++ * does too, possibly in the middle of another update (a hook removing itself, a trace
++ * starting or stopping). The interrupted update then went on writing the table for the
++ * mode it had computed before, over the handler's: g->dispatchmode said "hooked" while
++ * the table was not, and the signal's hook stayed pending until the next unrelated
++ * mode change (a trap that ran much later, in stray places). Each update takes a
++ * generation number; one that finds another update ran meanwhile does itself over,
++ * rewriting the whole table for the current flags. */
++static volatile int curse_dispgen;
++#endif
++
+ /* Update dispatch table depending on various flags. */
+ void LJ_FASTCALL lj_dispatch_update(global_State *g, int nolock)
+ {
+ #if LJ_HASPROFILE && !LJ_PROFILE_SIGPROF
+   int profile_locked = nolock ? 0 : lj_profile_lock();
+ #endif
+-  uint8_t oldmode = g->dispatchmode;
+-  uint8_t mode = 0;
++  uint8_t oldmode;
++  uint8_t mode;
++#ifdef CURSE_SIG_DESTRUCTIVE
++  int curse_gen, curse_force = 0;
++curse_again:
++  curse_gen = ++curse_dispgen;
++#endif
++  oldmode = g->dispatchmode;
++  mode = 0;
+ #if LJ_HASJIT
+   mode |= (G2J(g)->flags & JIT_F_ON) ? DISPMODE_JIT : 0;
+   mode |= G2J(g)->state != LJ_TRACE_IDLE ?
+@@ -121,6 +140,10 @@ void LJ_FASTCALL lj_dispatch_update(global_State *g, int nolock)
+   mode |= (g->hookmask & (LUA_MASKLINE|LUA_MASKCOUNT)) ? DISPMODE_INS : 0;
+   mode |= (g->hookmask & LUA_MASKCALL) ? DISPMODE_CALL : 0;
+   mode |= (g->hookmask & LUA_MASKRET) ? DISPMODE_RET : 0;
++#ifdef CURSE_SIG_DESTRUCTIVE
++  if (curse_force)  /* (every part of the table differs: all of it is rewritten) */
++    oldmode = (uint8_t)((~mode & ~DISPMODE_JIT) | (mode & DISPMODE_JIT));
++#endif
+   if (oldmode != mode) {  /* Mode changed? */
+     ASMFunction *disp = G2GG(g)->dispatch;
+     ASMFunction f_forl, f_iterl, f_itern, f_loop, f_funcf, f_funcv;
+@@ -211,6 +234,12 @@ void LJ_FASTCALL lj_dispatch_update(global_State *g, int nolock)
+       lj_dispatch_init_hotcount(g);
+ #endif
+   }
++#ifdef CURSE_SIG_DESTRUCTIVE
++  if (curse_gen != curse_dispgen) {  /* Another update ran in the middle of this one. */
++    curse_force = 1;
++    goto curse_again;
++  }
++#endif
+ #if LJ_HASPROFILE && !LJ_PROFILE_SIGPROF
+   if (profile_locked) lj_profile_unlock();
+ #else
 diff --git a/src/lj_ffrecord.c b/src/lj_ffrecord.c
 index 41dee1ca..6874da79 100644
 --- a/src/lj_ffrecord.c

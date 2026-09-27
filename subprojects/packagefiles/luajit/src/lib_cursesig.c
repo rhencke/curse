@@ -42,16 +42,25 @@ extern lua_State *curse_globalL(void);  /* luajit.c */
 static void curse_sig_hook(lua_State *L, lua_Debug *ar)
 {
   int s;
+  sigset_t all, old;
   (void)ar;
+  /* Take the signal and remove this hook with signals blocked: a signal arriving in
+   * the middle of it would set the hook again (curse_sig_onsignal) only to have this
+   * removal's read-modify-write of g->hookmask drop it — or be counted here and fire
+   * the hook once more with nothing to run. Blocked, it is delivered once this is
+   * done and schedules a fresh hook. */
+  sigfillset(&all);
+  sigprocmask(SIG_BLOCK, &all, &old);
   lua_sethook(L, (lua_Hook)0, 0, 0);
 #ifdef CURSE_SIG_DESTRUCTIVE
   /* Back in the interpreter: undo the preemption patches (a trace reaching the
    * interpreter through a patched tail jmp's trampoline skips lj_trace_exit). */
   { extern void curse_sig_unpatch_all(void); curse_sig_unpatch_all(); }
 #endif
-  if (getpid() != curse_sig_pid) { curse_sig_num = 0; return; } /* inherited across fork: skip */
   s = (int)curse_sig_num;
   curse_sig_num = 0;
+  sigprocmask(SIG_SETMASK, &old, (sigset_t *)0);
+  if (getpid() != curse_sig_pid || s == 0) return; /* inherited across fork (or none): skip */
   lua_getglobal(L, "__curse_sigrun");
   if (lua_isfunction(L, -1)) {
     lua_pushinteger(L, s);
