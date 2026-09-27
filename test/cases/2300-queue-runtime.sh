@@ -26,7 +26,7 @@ jobs %- | cat
 echo "procsub:"; cat < <(jobs %+)
 echo "group:"; { jobs; } | cat
 echo "loop:"; while :; do jobs; break; done | cat
-kill %1 %2; wait %1 %2
+kill %1 %2; wait # (not `wait %1 %2`: whether %2 is still a job then races in bash too)
 
 # --- a job `wait`/`jobs` reported stays listed until the parser reads its next line
 sleep 0 & wait %1; jobs %1; echo "r1=$?"
