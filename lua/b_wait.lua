@@ -201,6 +201,38 @@ wait_builtin = function(sh, cmd, args, hook, tcb)
 			local ss = rt.job_state(j) == "stopped" and rt.job_stopsig(j)
 			return ss and 128 + ss or nil
 		end
+		-- a job that STOPS while waited for ends the wait too (job control on: wait_for's
+		-- waitchld runs with WUNTRACED) — 128 + the stop signal. The stop of an in-process job's
+		-- process shows only in a waitid(WSTOPPED) poll, so the wait polls every 10ms.
+		local function stop_or_reap(j)
+			if sh.opt_m and not fflag then
+				while not sh.wait_sig do
+					if j.g then
+						if j.g.done or not rt.sched_live() then
+							break
+						end
+						rt.sched_pump({ deadline = rt.wall_secs() + 0.01, untilf = function()
+							return j.g.done or sh.wait_sig ~= nil
+						end })
+					else -- (a real child: waitpid without WUNTRACED can't see it stop)
+						if j.done or job_reap(sh, j, true) ~= nil then
+							return j.status
+						end
+						if rt.sched_live() then
+							rt.sched_pump({ deadline = rt.wall_secs() + 0.01 })
+						else
+							ffi.C.curse_co_poll(nil, 0, 10) -- (a trapped signal ends it early)
+						end
+					end
+					rt.jobs_stop_poll(sh)
+					local ss = stopped(j)
+					if ss then
+						return ss
+					end
+				end
+			end
+			return job_reap(sh, j)
+		end
 		local function reap_job(j)
 			local ss = stopped(j)
 			while ss and fflag and not sh.wait_sig do -- (-f: until it's continued, then its end)
@@ -211,7 +243,7 @@ wait_builtin = function(sh, cmd, args, hook, tcb)
 			if ss then
 				return ss
 			end
-			return job_reap(sh, j)
+			return stop_or_reap(j)
 		end
 		local waited -- the pid whose status we return (for -p)
 		if nflag then
@@ -367,7 +399,10 @@ wait_builtin = function(sh, cmd, args, hook, tcb)
 				if not ended then
 					warn_stopped()
 					blocked = blocked or not (j.g and j.g.done)
-					job_reap(sh, j)
+					stop_or_reap(j)
+					if rt.job_state(j) == "stopped" then
+						goto nextjob -- (it stopped meanwhile: held, like one stopped before)
+					end
 					report(sh, j)
 				end
 				if sh.wait_sig then

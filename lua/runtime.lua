@@ -6397,6 +6397,17 @@ function Shell:bg_launch(fn, cmdstr, flat, simple, upv_get, upv_set, opts)
 			t.sh.in_subprogram = (t.sh.in_subprogram or 0) + 1
 			t.sh.loopdepth = g.simple and self.loopdepth or 0 -- (a simple job keeps it: stage_kind)
 			t.jc = jc -- (job control: its process group takes every signal — task_kill_job)
+			if not opts.nojob then -- (an async child's without_job_control: delete_all_jobs —
+				-- `jobs` lists none, %1 is no such job, `wait PID` isn't its child; a <()/>()
+				-- child keeps its view of them: process_substitute only turns job control off)
+				local tsh = t.sh
+				local fj = M.foreign_jobs(self)
+				for pid in pairs(tsh.bgp_cleared or {}) do
+					fj[pid] = true
+				end
+				tsh.bgp_cleared = next(fj) and fj or tsh.bgp_cleared
+				tsh.jobs, tsh.job_cur, tsh.job_prev = {}, nil, nil
+			end
 			if g.simple then -- (bash execs a `cmd &` job's external in place: rt.exec_tail_lvl)
 				t.sh.job_pgrp = jc -- (…in the job's own process group, with job control)
 				-- (a function it calls: no tail inside; "fn": the emitter's direct call, at this pd)
