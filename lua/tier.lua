@@ -531,19 +531,26 @@ function M.loop_osr(sh, st)
 	local ld = sh.loopdepth
 	sh.loopdepth = ld - 1
 	local ok, err
+	-- (entered at the loop's resume point, the fragment skipped its statement marker: a line
+	-- abort in it resumes at the loop statement's sh._ff — past the loop — not a stale one,
+	-- or at the fragment's start: that re-ran the aborted iteration)
+	local ff0 = sh._ff
 	if st._fid then -- a `for … in`: continue its list where the interpreter is
 		local fid = st._fid
 		local saved = sh.forstate[fid]
 		sh.forstate[fid] = sh.forstate[st.id]
+		sh._ff = mod.loopFf and mod.loopFf[fid]
 		ok, err = pcall(M.run_compiled, mod, sh, mod.loopPc[fid], true)
 		sh.forstate[fid] = saved
 	elseif st.t == "forc" and mod.loopPc and mod.loopPc[1] then
 		-- a `for ((…))` the interpreter already initialized: resume at its condition (the
 		-- fragment's empty init would trace, and fire DEBUG, as `(( 1 ))`)
+		sh._ff = mod.loopFf and mod.loopFf[1]
 		ok, err = pcall(M.run_compiled, mod, sh, mod.loopPc[1], true)
 	else
 		ok, err = pcall(M.run_compiled, mod, sh, nil, true)
 	end
+	sh._ff = ff0
 	sh.loopdepth = ld
 	if ok then
 		return true
