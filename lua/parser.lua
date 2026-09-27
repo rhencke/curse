@@ -3377,8 +3377,11 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs, xg, bq
 	-- which bash rejects as a syntax error (status 2): a leading/doubled `;`, `;;`,
 	-- `&`, `&&`, `||`, `|`, or `|&`. Returns the offending token, or nil.
 	local function bare_sep_tok()
+		if src:sub(i, i + 2) == ";;&" then -- (the lexer's longest match: `;;&`, `;&` are tokens)
+			return ";;&"
+		end
 		local c2 = src:sub(i, i + 1)
-		if c2 == ";;" or c2 == "&&" or c2 == "||" or c2 == "|&" then
+		if c2 == ";;" or c2 == ";&" or c2 == "&&" or c2 == "||" or c2 == "|&" then
 			return c2
 		end
 		local c = src:sub(i, i)
@@ -5212,13 +5215,9 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs, xg, bq
 		if i > n then
 			error("syntax error: unexpected end of file")
 		end
-		local t2 = src:sub(i, i + 1)
-		if t2 == "&&" or t2 == "||" or t2 == ";;" or t2 == "|&" then
-			error("syntax error near `" .. t2 .. "'")
-		end
-		local c = src:sub(i, i)
-		if c == ";" or c == "|" or c == "&" or c == ")" then
-			error("syntax error near `" .. c .. "'")
+		local t = bare_sep_tok() or src:sub(i, i) == ")" and ")"
+		if t then
+			error("syntax error near `" .. t .. "'")
 		end
 	end
 	local function bang_at(k) -- a `!` word: followed by a blank, a separator, or the end
@@ -5284,6 +5283,14 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs, xg, bq
 				xg_guess = true
 			end
 			i = i + 1
+		end
+		-- a control operator where a command begins: bash's syntax error at that token (a
+		-- case clause's body `x)|0`, `x)&&y` — parse_command would find no command there)
+		do
+			local bs = bare_sep_tok()
+			if bs then
+				error("syntax error near `" .. bs .. "'")
+			end
 		end
 		local first = parse_command()
 		local cmds = { first }
@@ -5436,7 +5443,7 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs, xg, bq
 			-- iteration lands on a genuine command position; `&`/newlines are handled by
 			-- parse_stmt/skipsep. A following `;` is then a bare separator (error).
 			ws()
-			if src:sub(i, i) == ";" and src:sub(i + 1, i + 1) ~= ";" then
+			if src:sub(i, i) == ";" and not src:find("^[;&]", i + 1) then -- (`;;`, `;&`: tokens)
 				i = i + 1
 			end
 		end
@@ -5543,7 +5550,7 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs, xg, bq
 				-- A bare separator here (`;;`, `|`) is a syntax error ON the line — bash runs
 				-- nothing on it (`echo 1 ;; echo 2`). Anything else (`(`, `((`, `)`, `}`, a
 				-- stray keyword) is left to the existing statement-boundary handling.
-				if c == ";" and src:sub(i + 1, i + 1) ~= ";" then
+				if c == ";" and not src:find("^[;&]", i + 1) then -- (`;;`, `;&`: tokens)
 					i = i + 1
 					st.semi = true -- (`a;⏎b` joins with `;`, not a newline: deparse's comsubs)
 					ws()
