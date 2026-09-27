@@ -1,20 +1,20 @@
--- A signal preempts a JIT-compiled loop: the async handler (lib_cursesig.c) schedules a
--- VM hook, which only fires in the interpreter, and repoints the running trace's loop
--- back-edge so the trace exits (curse.patch, curse_sig_patch_trace). A daemon worker is
--- always catching the terminating signals the client forwards, so a loop that doesn't
--- exit never ends the script: `read -r x </dev/zero` outlived HUP/INT/TERM (stress
--- daemon-client-kill). Each loop below spins until a SIGALRM arrives (from a helper
--- process, after 50ms) and its handler raises; a loop that doesn't stop is SIGKILLed by
--- a watchdog after 5s — the test fails.
---   inverted_checked  an inverted loop (its last guard is its back-edge: nothing to
---                     repoint) that calls rt.sig_check each round, as `read` does
---   side_exit         every iteration leaves through a side exit whose side trace links
---                     back to the root trace's head: the back-edge itself is never
---                     reached again (the trace link's hook check)
---   ffi_read          byte-at-a-time C.read of /dev/zero
+-- A signal preempts a JIT-compiled loop, whatever shape its machine code has: the async
+-- handler (lib_cursesig.c) schedules a VM hook, which only fires in the interpreter, and
+-- patches every jump that can close a cycle through the running trace so the trace
+-- exits (curse.patch, curse_sig_patch_trace). A daemon worker is always catching the
+-- terminating signals the client forwards, so a loop that never exits never ends the
+-- script: `read -r x </dev/zero` outlived HUP/INT/TERM (stress daemon-client-kill).
+-- Each loop below spins until a SIGALRM arrives (from a helper process, after 50ms) and
+-- its handler raises; a loop that doesn't stop is SIGKILLed by a watchdog after 5s.
+--   inverted_short/long  the loop's last guard is its back-edge (`jcc loop; jmp exit`),
+--                        the realigned rel8 form and the rel32 one
+--   side_exit            every iteration leaves through a side exit whose side trace
+--                        links back to the root trace's head: the back-edge itself is
+--                        never reached again
+--   ffi_read             byte-at-a-time C.read of /dev/zero, as the `read` builtin does
 package.path = "lua/?.lua;" .. package.path
 local ffi = require("ffi")
-local rt = require("runtime") -- (declares curse_sig_catch/curse_sig_default)
+require("runtime") -- (declares curse_sig_catch/curse_sig_default)
 local C = ffi.C
 pcall(ffi.cdef, "int getpid(void); int kill(int pid, int sig);")
 local SIGALRM, SIGKILL = 14, 9
@@ -32,14 +32,35 @@ _G.__curse_sigrun = function(s)
 end
 
 local loops = {}
-loops.inverted_checked = function() -- (a loop the patch can't break: rt.sig_check)
+loops.inverted_short = function()
 	local i = 0
 	while i < 1e15 do
 		i = i + 1
-		C.getpid() -- (a C call each round, as `read` makes: see rt.sig_check)
-		rt.sig_check()
 	end
 	return i
+end
+loops.inverted_long = function()
+	local i, a, b, c, d = 0, 1, 2, 3, 4
+	while i < 1e15 do
+		i = i + 1
+		a = bit.bxor(a * 3 + b, c)
+		b = bit.bxor(b * 5 + c, d)
+		c = bit.bxor(c * 7 + d, a)
+		d = bit.bxor(d * 11 + a, b)
+		a = bit.band(a + b, 0xffff)
+		b = bit.band(b + c, 0xffff)
+		c = bit.band(c + d, 0xffff)
+		d = bit.band(d + a, 0xffff)
+		a = bit.bxor(a * 13 + b, c)
+		b = bit.bxor(b * 17 + c, d)
+		c = bit.bxor(c * 19 + d, a)
+		d = bit.bxor(d * 23 + a, b)
+		a = bit.band(a + b, 0xffff)
+		b = bit.band(b + c, 0xffff)
+		c = bit.band(c + d, 0xffff)
+		d = bit.band(d + a, 0xffff)
+	end
+	return i + a + b + c + d
 end
 loops.side_exit = function()
 	local n, a, b = 0, 0, 0
@@ -74,7 +95,7 @@ loops.ffi_read = function()
 end
 
 local fails = 0
-for _, name in ipairs(arg and arg[1] and { arg[1] } or { "inverted_checked", "side_exit", "ffi_read" }) do
+for _, name in ipairs(arg and arg[1] and { arg[1] } or { "inverted_short", "inverted_long", "side_exit", "ffi_read" }) do
 	local watchdog = after(5, SIGKILL)
 	after(0.05, SIGALRM)
 	local ok, e = pcall(loops[name])

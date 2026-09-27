@@ -38,7 +38,6 @@ end
 -- otherwise a byte at a time, without a readiness poll per byte while FIONREAD says
 -- bytes are waiting. nil at EOF / timeout / error (st.timed_out / st.rerr say which).
 local function getc(st)
-	rt.sig_check() -- (endless input never blocks: a pending signal must still get through)
 	local pc = st.pc
 	if pc and pc.pb ~= "" then -- (bytes of this pipe we already hold: see rt.pipe_cache)
 		local c = pc.pb:sub(1, 1)
