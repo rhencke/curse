@@ -651,6 +651,26 @@ return function(sh, cmd, args, hook, tcb)
 						end
 						sh:array_set(nm, 0, rt.i64_to_str(v), false)
 						sh.vars[sh:deref(nm)].int = true
+					elseif iattr and rt.DYN_SCALAR[sh:deref(nm)] and rt.dyn_live(sh, sh:deref(nm)) then
+						-- declare -i on a live dynamic variable (LINENO, BASH_SUBSHELL, SECONDS, …):
+						-- the attribute goes on first, then bind_variable_value hands the value to
+						-- its assign function — as written (only += evaluates, make_variable_value:
+						-- the old value plus the new), and the hook takes it as it does (legal_number,
+						-- or evalexp for an integer RANDOM/SECONDS)
+						local dn = sh:deref(nm)
+						local ib = rt.vbox(sh, dn)
+						ib.int = true
+						if lattr or uattr or cattr then
+							ib.lower, ib.upper, ib.cap = lattr or nil, uattr or nil, cattr or nil
+						end
+						local v = val
+						if ap then
+							v = rt.i64_to_str(rt.int_value_as(sh, cmd, sh:get(dn))
+								+ rt.int_value_as(sh, cmd, val, M.arith_eval_str))
+						end
+						if not rt.dyn_assign(sh, dn, v, ib) then
+							sh:set_str(nm, v)
+						end
 					elseif iattr then -- declare -i: arith-evaluate the value, mark integer
 						if ap then -- (the old value is evaluated as an expression too)
 							sh:aset(nm, rt.int_value_as(sh, cmd, sh:get(nm)) + rt.int_value_as(sh, cmd, val, M.arith_eval_str))
@@ -709,7 +729,6 @@ return function(sh, cmd, args, hook, tcb)
 					-- A nameref exports the nameref BOX itself, and its env value is the TARGET
 					-- NAME it points at (`declare -nx ref=x` -> env ref="x"), not the deref value.
 					local xb = nref and sh.vars[nm] or bb
-					local xval = nref and (xb and xb.s or "") or sh:get(nm)
 					if xb then
 						if unexport or plusx then
 							xb.exported = nil
@@ -719,8 +738,8 @@ return function(sh, cmd, args, hook, tcb)
 							local en = nref and nm or sh:deref(nm) -- (through a nameref: the target)
 							if xb.arr and not nref then
 								C.unsetenv(en) -- (an array is never in the environment — bash)
-							else
-								C.setenv(en, xval, 1)
+							else -- (read only here: a read of RANDOM draws a number)
+								C.setenv(en, nref and (xb.s or "") or sh:get(nm), 1)
 							end
 							if en == "TZ" then rt.tzset() end
 						end

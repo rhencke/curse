@@ -8605,6 +8605,16 @@ M.DYN_ASSIGN = { RANDOM = "random", SECONDS = "seconds", BASH_SUBSHELL = "subshe
 	BASH_COMMAND = "null", HISTCMD = "null", SRANDOM = "null", FUNCNAME = "null", LINENO = "null",
 	BASH_SOURCE = "null", BASH_LINENO = "null", BASH_ARGC = "null", BASH_ARGV = "null",
 	GROUPS = "null" }
+-- The scalar ones (the arrays — FUNCNAME, BASH_SOURCE, … — refuse a value: noassign).
+M.DYN_SCALAR = { RANDOM = true, SECONDS = true, BASH_SUBSHELL = true, BASH_ARGV0 = true,
+	EPOCHSECONDS = true, EPOCHREALTIME = true, BASHPID = true, BASH_COMMAND = true, HISTCMD = true,
+	SRANDOM = true, LINENO = true }
+-- Is dynamic variable `dn` still live: never unset, and not shadowed by an ordinary binding?
+function M.dyn_live(sh, dn)
+	local b = sh.vars[dn]
+	return (b == nil or b.dyn == true) and not (sh.unset_specials and sh.unset_specials[dn])
+		and not (dn == "RANDOM" and sh.random_plain)
+end
 do
 local legal_number = M.legal_number -- (bash: legal_number, else 0)
 -- Run `dn`'s assign hook with value `s` (b: its dyn box or nil). False when `dn` is no
@@ -8647,8 +8657,9 @@ function M.dyn_assign(sh, dn, s, b)
 		end
 		sh.sec_off, sh.start_time = i64(n), os.time()
 		sh.sec_cell = i64_to_str(sh.sec_off) -- (set_int_value: value_cell, what += appends to)
-	elseif k == "subshell" then -- (assign_subshell: subshell_environment's level)
-		local n = b and b.int and tonumber(M.int_value(sh, s)) or legal_number(s) or 0
+	elseif k == "subshell" then -- (assign_subshell: subshell_environment's level — legal_number'd,
+		-- an integer BASH_SUBSHELL too: `declare -i BASH_SUBSHELL; BASH_SUBSHELL=2+3` is 0)
+		local n = legal_number(s) or 0
 		sh.subsh_off = n - ((sh.subdepth or 0) + M.fork_depth)
 	elseif k == "argv0" then -- (assign_bash_argv0: sets $0; the variable itself stays)
 		sh.argv0 = s
@@ -16732,8 +16743,10 @@ function M.assign_scalar(sh, name, value, stmt)
 	end
 	if b and b.arr then
 		sh:array_set(name, sh:is_assoc(name) and "0" or 0, value, false) -- a=x on an array -> a[0]
-	elseif b and b.int and not b.ref then
-		sh:aset(name, M.int_value(sh, value)) -- declare -i: RHS is arithmetic
+	elseif b and b.int and not b.ref and not (b.dyn and M.dyn_live(sh, sh:deref(name))) then
+		-- declare -i: RHS is arithmetic (a live dynamic variable's assign function takes the
+		-- value as written: bind_variable — SECONDS/RANDOM evaluate it themselves)
+		sh:aset(name, M.int_value(sh, value))
 	elseif b and (b.lower or b.upper) then
 		sh:set_str(name, b.lower and value:lower() or value:upper())
 	elseif sh:set_str(name, value) == false then -- (a valueless nameref given a bad target)
@@ -17127,7 +17140,7 @@ do
 			end
 		elseif b and b.arr then
 			sh:array_set(name, sh:is_assoc(name) and "0" or 0, value, false)
-		elseif b and b.int and not b.ref then
+		elseif b and b.int and not b.ref and not (b.dyn and M.dyn_live(sh, sh:deref(name))) then
 			sh:aset(name, M.int_value(sh, value))
 		elseif b and (b.lower or b.upper) then
 			sh:set_str(name, b.lower and value:lower() or value:upper())
@@ -17254,7 +17267,9 @@ do
 		for k = 2, #argv do
 			glob = glob or argv[k]:match("^%-%a*[gG]") ~= nil
 		end
-		local localize = dcl == "local" or ((dcl == "declare" or dcl == "typeset") and (sh.calldepth or 0) > 0 and not glob)
+		-- (`local` outside a function makes no local — its builtin then says so — so a readonly
+		-- target is the plain assignment's error, fatal to the line as `UID=(x)` is: bash)
+		local localize = (sh.calldepth or 0) > 0 and (dcl == "local" or ((dcl == "declare" or dcl == "typeset") and not glob))
 		for _, aa in ipairs(aas) do
 			argv[#argv + 1] = aa.name
 			local b = sh.vars[sh:deref(aa.name)]
@@ -17269,16 +17284,27 @@ do
 			end
 		end
 		sh.arrayargs_pending = {}
-		local wantassoc = false
+		local wantassoc, inherit = false, sh.shopt.localvar_inherit
 		for k = 2, #argv do
 			if argv[k]:match("^%-%a*A") then
 				wantassoc = true
 			end
+			if argv[k]:match("^%-%a*I") then
+				inherit = true
+			end
 		end
 		sh.arrayargs_pre = {}
+		local own = localize and sh.savedstack[sh.pd]
 		for _, aa in ipairs(aas) do
 			sh.arrayargs_pending[aa.name] = true
-			sh.arrayargs_pre[aa] = I.arrayassign_items(sh, aa, wantassoc or sh:is_assoc(sh:deref(aa.name)), wantassoc)
+			-- (the literal is for the variable the builtin leaves: a NEW local — not yet one of
+			-- this function's, nor copying the outer one's attributes (-I) — is an indexed
+			-- array unless -A, whatever an outer associative one of that name is)
+			local isassoc = wantassoc
+			if not isassoc and (not localize or inherit or (own and own[aa.name] ~= nil)) then
+				isassoc = sh:is_assoc(sh:deref(aa.name))
+			end
+			sh.arrayargs_pre[aa] = I.arrayassign_items(sh, aa, isassoc, wantassoc)
 			if sh.opt_x then -- (`+ b=('4' '5 6')` as it expands: before a prefix assignment's
 				M.xtrace_arrlit(sh, aa.name, sh.arrayargs_pre[aa]) -- trace, and `+ declare -a b`)
 			end
@@ -17682,7 +17708,9 @@ function M.assign_body_full(sh, st, nref_base, nref_sub)
 		local b = sh.vars[sh:deref(st.name)]
 		if b and b.arr then -- plain `name=value` on an array var writes element 0 (bash)
 			sh:array_set(st.name, II.array_key(sh, st.name, "0"), assign_rhs_a(sh, st), false)
-		elseif b and b.int and not b.ref then -- integer var (declare -i): assign arith-evaluates
+		elseif b and b.int and not b.ref and not (b.dyn and M.dyn_live(sh, sh:deref(st.name))) then
+			-- integer var (declare -i): assign arith-evaluates (not a live dynamic one's: its
+			-- assign function takes the text — assign_scalar)
 			sh:aset(st.name, M.int_value(sh, assign_rhs_w(sh, st), IX.arith_eval_str))
 		elseif b and (b.lower or b.upper) then -- declare -l/-u: case-fold on assign
 			local v = assign_rhs_a(sh, st)
