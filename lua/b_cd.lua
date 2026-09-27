@@ -241,7 +241,7 @@ end
 return function(sh, cmd, args, hook, tcb, as)
 	if cmd == "cd" then
 		local who = as or "cd" -- (pushd/popd run cd under their own name in its errors)
-		if rt.restricted(sh, "cd: restricted") then
+		if rt.restricted(sh, who .. ": restricted") then
 			return
 		end
 		-- options (internal_getopt "eLP": no O_XATTR here, so -@ is invalid), a `--`,

@@ -4628,6 +4628,10 @@ local function exec_simple(sh, args, hook, no_func)
 		if args[j] == "--" then -- (end of options)
 			j = j + 1
 		end
+		-- (command.def: no NAME is success; then a restricted shell refuses -p — -v/-V too)
+		if usep and args[j] ~= nil and rt.restricted(sh, "command: -p: restricted") then
+			return
+		end
 		if vflag then
 			command_describe(sh, args, j, vflag == "V", usep)
 			return
@@ -4636,10 +4640,6 @@ local function exec_simple(sh, args, hook, no_func)
 		local svc, iee = sh.via_command, sh.ign_ee
 		sh.via_command = true
 		sh.ign_ee = iee or sh.noerr > 0 -- (errexit-exempt: -e cleared for what it runs, as eval)
-		if usep and rt.restricted(sh, "command: -p: restricted") then
-			sh.via_command, sh.ign_ee = svc, iee
-			return
-		end
 		if args[j] == nil then
 			sh.status = 0
 		else

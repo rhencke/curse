@@ -13945,6 +13945,9 @@ function M.command_query(sh, argv)
 	if argv[j] == "--" then -- (end of options)
 		j = j + 1
 	end
+	if usep and argv[j] ~= nil and M.restricted(sh, "command: -p: restricted") then
+		return -- (command.def: a restricted shell refuses -p, -v/-V included)
+	end
 	I.command_describe(sh, argv, j, vflag == "V", usep)
 end
 

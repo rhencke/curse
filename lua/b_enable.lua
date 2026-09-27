@@ -23,6 +23,9 @@ return function(sh, cmd, args)
 		all, disable, special, delete = all or f == "a", disable or f == "n", special or f == "s", delete or f == "d"
 		file = a or file
 	until not f
+	if (file or delete) and rt.restricted(sh, "enable: restricted") then
+		return -- (enable.def: a restricted shell loads/unloads nothing — checked before listing)
+	end
 	if file and args[j] then
 		-- (dlopen's own words; this static binary can't load one at all)
 		local f = io.open(file, "r")
@@ -73,6 +76,8 @@ return function(sh, cmd, args)
 			sh.status = 1
 		elseif disable then
 			off[n] = true
+		elseif off[n] and rt.restricted(sh, "enable: restricted") then
+			-- (enable_shell_command: a restricted shell can't turn a disabled builtin back on)
 		else
 			off[n] = nil
 		end
