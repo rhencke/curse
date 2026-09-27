@@ -1635,8 +1635,10 @@ end
 expand_part_str = function(sh, p, assign)
 	if p.lit ~= nil then
 		return p.lit
-	elseif p.bterr then -- (a brace range's unclosed backquote: bq_word in the parser)
-		sherr(sh, 'curse: bad substitution: no closing "`" in ' .. p.bterr .. "\n")
+	elseif p.bterr or p.nulcut then -- (a brace range's unclosed backquote: bq_word in the
+		-- parser; a word cut at a $'…' NUL: parser.dq_nulcut)
+		sherr(sh, p.bterr and ('curse: bad substitution: no closing "`" in ' .. p.bterr .. "\n")
+			or ("curse: bad substitution: no closing `}' in " .. p.nulcut .. "\n"))
 		error({ __curse_exit = 1, __curse_lineabort = true, __curse_discard = true })
 	elseif p.var then
 		-- a nameref whose target has a subscript (`typeset -n ref='a[2]'`) reads as
@@ -1798,15 +1800,16 @@ M.notilde = notilde
 -- value, decides literalness. Shared by glob-pattern and =~-regex expansion.
 -- `xt` (a table; set -x of a [[ ]] pattern): xt[1] gets the text bash traces, EVERY quoted
 -- character backslashed (quote_string_for_globbing), from the same single expansion.
+local PAT_META = "[%*%?%[%]\\%(%)%|%+%@%!%-%^]"
 local function expand_escaped(sh, w, charclass, xt)
 	local buf, xb = {}, xt and {}
 	for _, p in ipairs(w.parts) do
 		local s = expand_part_str(sh, p)
 		if p.q then
 			if xb then
-				xb[#xb + 1] = s:gsub("[%z\1-\127\194-\244][\128-\191]*", "\\%0")
+				xb[#xb + 1] = rt.xglob_quote(s)
 			end
-			s = s:gsub(charclass, "\\%0")
+			s = charclass == PAT_META and rt.glob_quote(s) or s:gsub(charclass, "\\%0")
 		elseif xb then
 			xb[#xb + 1] = s
 		end
@@ -1842,7 +1845,6 @@ expand_repl = function(sh, w)
 	return table.concat(buf)
 end
 -- glob PATTERN context (${v/pat/repl}, case, [[ == ]]): glob metacharacters.
-local PAT_META = "[%*%?%[%]\\%(%)%|%+%@%!%-%^]"
 expand_pattern = function(sh, w, xt)
 	if xt == true then
 		xt = nil -- (a caller sharing expand_word's signature passes its `true` flag)
@@ -1856,7 +1858,7 @@ expand_pattern = function(sh, w, xt)
 		if t ~= s then
 			local rest = expand_escaped(sh, { parts = { unpack(w.parts, 2) } }, PAT_META, xt)
 			local tail = s:match("^~[^/]*(.*)$") or ""
-			local dir = t:sub(1, #t - #tail):gsub(PAT_META, "\\%0")
+			local dir = rt.glob_quote(t:sub(1, #t - #tail))
 			if xt then -- (the expanded directory reads as quoted)
 				xt[1] = rt.xglob_quote(t:sub(1, #t - #tail)) .. tail .. xt[1]
 			end
@@ -1885,16 +1887,16 @@ local function case_pattern(sh, w)
 		if p.q and is_multi(sh, p) then
 			local els, star = multi_elems(sh, p)
 			if star then
-				buf[#buf + 1] = table.concat(els, rt.ifs_sep(sh)):gsub(PAT_META, "\\%0")
+				buf[#buf + 1] = rt.glob_quote(table.concat(els, rt.ifs_sep(sh)))
 			elseif #els > 0 then
-				buf[#buf + 1] = els[1]:gsub(PAT_META, "\\%0")
+				buf[#buf + 1] = rt.glob_quote(els[1])
 				if #els > 1 then
 					break
 				end
 			end
 		else
 			local s = expand_part_str(sh, p)
-			buf[#buf + 1] = p.q and s:gsub(PAT_META, "\\%0") or s
+			buf[#buf + 1] = p.q and rt.glob_quote(s) or s
 		end
 	end
 	return table.concat(buf)
@@ -4801,7 +4803,7 @@ local function eval_dbracket(sh, node)
 		else
 			l, r = dbracket_word(sh, node.l), dbracket_word(sh, node.r)
 			if sh.opt_x and (op == "==" or op == "=" or op == "!=") then -- (a wholly quoted rhs)
-				xr = { (r:gsub("[%z\1-\127\194-\244][\128-\191]*", "\\%0")) }
+				xr = { rt.xglob_quote(r) }
 			end
 		end
 		if sh.opt_x then -- (an empty operand traces as '')
@@ -5491,13 +5493,17 @@ exec_stmt = function(sh, st, hook)
 			return s == "" and "1" or s
 		end
 		local function fdbg(slot)
+			local intrap = sh.in_trap and sh.in_trap > 0 and (sh.calldepth or 0) == sh.trap_calldepth
 			if sh.opt_x and st.src then -- (traced before its DEBUG: eval_arith_for_expr)
+				if not intrap then -- (under the `for` line — the step's too, not the body's last)
+					sh.cur_line = st.line
+				end
 				arith_trace(sh, stext(slot)) -- (bash keeps a trailing blank)
 			end
 			if sh.traps and sh.traps.DEBUG then
 				head(sh, st, "((" .. stext(slot) .. "))")
 			end
-			run_debug(sh, (sh.in_trap and sh.in_trap > 0 and (sh.calldepth or 0) == sh.trap_calldepth) and sh.cur_line or st.line)
+			run_debug(sh, intrap and sh.cur_line or st.line)
 		end
 		-- A slot whose arith failed to parse (`i='3'`) was deferred: bash reports the
 		-- error at RUNTIME and runs the loop zero (or partial) iterations, non-fatally.

@@ -339,6 +339,9 @@ do
 		if M.flush_stage_out then
 			M.flush_stage_out(sh)
 		end
+		if type(a) == "string" and M.co_fdwrite and M.co_fdwrite(2, a) then
+			return self
+		end
 		return real:write(a)
 	end
 	io.stderr = proxy
@@ -468,7 +471,14 @@ end
 -- Backslash-escape glob metacharacters in a string so it matches literally in a glob
 -- pattern (the compiled tier's twin of interp's expand_escaped for a QUOTED pattern part:
 -- `case $x in "$p"*)` — "$p"'s metachars are literal, the trailing * is active).
+-- In a multibyte locale whose trail bytes can be ASCII (Big5/GBK/SJIS) the escaping walks
+-- CHARACTERS, as bash's quote_string does (COPY_CHAR_P): a trail byte `|`/`\`/`[` of a
+-- double-byte char is part of that char, never a metachar to backslash.
+M.mbx = false -- (the current LC_CTYPE is multibyte, not UTF-8: set by lc_commit)
 function M.glob_quote(s)
+	if M.mbx and s:find("[\128-\255]") then
+		return M.mb_quote(s, "[%*%?%[%]\\%(%)%|%+%@%!%-%^]")
+	end
 	return (s:gsub("[%*%?%[%]\\%(%)%|%+%@%!%-%^]", "\\%0"))
 end
 -- ERE-escape a QUOTED part of a `[[ =~ ]]` regex (the compiled twin of interp's expand_regex
@@ -1416,9 +1426,10 @@ do
 			re_locale_changed()
 		end
 		lc_mb_cur_max = tonumber(C.__ctype_get_mb_cur_max()) or 1
+		M.mbx = lc_mb_cur_max > 1 and not M.lc_utf8()
 		local P = package.loaded.parser -- (Big5/GBK/SJIS lexing: parser.lua's MBX, the
 		if P then -- LC_CTYPE name — which charset's characters the lexer keeps whole)
-			P.mb_locale(lc_mb_cur_max > 1 and not M.lc_utf8() and (st[0] or "?"))
+			P.mb_locale(M.mbx and (st[0] or "?"))
 		end
 	end
 	function M.reset_locale(sh, var)
@@ -1546,6 +1557,24 @@ function M.mb_chars(s)
 		i = i + r
 	end
 	return out
+end
+
+-- Backslash every single-byte character of `s` in the class `cls` (no cls: every character), walking the current
+-- locale's characters: a multibyte char (its trail bytes included) is copied whole.
+function M.mb_quote(s, cls)
+	ffi.fill(_mb_st, ffi.sizeof(_mb_st))
+	local ptr, i, n, out = ffi.cast("const char *", s), 0, #s, {}
+	while i < n do
+		local r = tonumber(C.mbrtowc(_mb_wc, ptr + i, n - i, _mb_st))
+		if r == 0 or r > (n - i) then
+			r = 1
+			ffi.fill(_mb_st, ffi.sizeof(_mb_st))
+		end
+		local c = s:sub(i + 1, i + r)
+		out[#out + 1] = (not cls or (r == 1 and c:find(cls))) and "\\" .. c or c
+		i = i + r
+	end
+	return table.concat(out)
 end
 
 -- Byte length of the character starting at byte index `i` (1-based) of `s`: 1 for
@@ -3171,16 +3200,41 @@ function Shell:capture_src(src, backtick, noalias, line0)
 	end
 	-- (a SYNTAX error in the body is fatal to the CONTAINING command — bash — which the
 	-- light path propagates via __curse_parseerr)
+	-- (an `alias`/`shopt` in a body of several lines: bash runs it with parse_and_execute,
+	-- reading each command after the one before ran — an alias it defines, extglob it sets,
+	-- applies to the lines after; the eager parse above only vets the text)
+	local lazy = #ast.lines > 1 and (src:find("alias", 1, true) or src:find("shopt", 1, true))
+	local function body(self, hook)
+		if not lazy then
+			return I.exec_list(self, ast.stmts, hook, true)
+		end
+		local nextf = P.open_full(src, self, nil, noalias, nil, line0 or self.cur_cline or self.cur_line,
+			nil, nil, backtick)
+		local r
+		while true do
+			local lg = nextf()
+			if not lg then
+				return r
+			end
+			local l = { lg.perr }
+			for _, st in ipairs(lg.stmts) do
+				l[#l + 1] = st
+			end
+			if l[1] then
+				l[1].lgstart = true
+				r = I.exec_list(self, l, hook, true)
+			end
+		end
+	end
 	if iso and not has_perr then
 		return self:capture_compiled_iso(function(self)
-			local Iq = require("interp")
-			return Iq.exec_list(self, ast.stmts, Iq.SUBHOOK, true)
+			return body(self, I.SUBHOOK)
 		end, backtick)
 	end
 	-- Run via exec_list (NOT interp.run): an `exit`/`return` inside $() ends only
 	-- the sub (sets its status), and the parent's EXIT trap must NOT fire here.
 	return self:capture_inproc(backtick, function(self)
-		return require("interp").exec_list(self, ast.stmts, function() end, true)
+		return body(self, function() end)
 	end)
 end
 
@@ -5456,6 +5510,41 @@ task_flush = function(t)
 		end
 	end
 	t.flushing = false
+end
+-- A diagnostic / set -x line to fd 2 while pipeline stages run in-process: written after
+-- POLLOUT in PIPE_BUF chunks (yielding, or pumping the stages from the main thread), as
+-- task_flush writes fd 1 — a blocking write to a full pipe whose reader is a later stage
+-- not yet started (`… 2>&1 | sort`) would stall the whole pipeline. false: no scheduler
+-- is live, the caller writes as usual.
+function M.co_fdwrite(fd, data)
+	local t = co_task()
+	if not t and not sched_live() then
+		return false
+	end
+	local p, off, len = ffi.cast("const char *", data), 0, #data
+	while off < len do
+		M.co_block(fd, POLLOUT)
+		local chunk = len - off
+		if chunk > 4096 then
+			chunk = 4096
+		end
+		local w = tonumber(C.curse_co_write(fd, p + off, chunk))
+		if w >= 0 then
+			off = off + w
+		else
+			local e = ffi.errno()
+			if e == 32 then -- EPIPE (SIGPIPE is blocked while the scheduler lives)
+				C.curse_co_sigtimedwait(_co_sigpipe, nil, _co_zero_ts)
+				if t and not (t.sh and t.sh.traps and t.sh.traps.SIGPIPE == "") then
+					error({ __curse_sigpipe = true }) -- (as SIGPIPE ends a forked stage)
+				end
+				return true
+			elseif e ~= 4 and e ~= 11 then -- not EINTR/EAGAIN: dropped, as a failed write
+				return true
+			end
+		end
+	end
+	return true
 end
 local function make_out(t)
 	local f = function(...)
@@ -10320,12 +10409,12 @@ function M.bytewise(fn, ...)
 	local cur = C.setlocale(0, nil)
 	local saved = cur ~= nil and ffi.string(cur) or "C"
 	C.setlocale(0, "C")
-	local smb = lc_mb_cur_max
-	lc_mb_cur_max = 1
+	local smb, smbx = lc_mb_cur_max, M.mbx
+	lc_mb_cur_max, M.mbx = 1, false
 	re_locale_changed()
 	local ok, a, b = pcall(fn, ...)
 	C.setlocale(0, saved)
-	lc_mb_cur_max = smb
+	lc_mb_cur_max, M.mbx = smb, smbx
 	re_locale_changed()
 	if not ok then
 		error(a, 0)
@@ -13810,8 +13899,8 @@ end
 -- default (echo -e) treats \c as "stop output".
 -- mode: true = $'…' (\cX ctrl, \NNN octal); "b" = printf %b (\NNN and \0NNN octal,
 -- \c stops); nil/false = echo -e (\0NNN octal only — bare \NNN stays literal, \c stops).
-function M.ansi_unescape(s, mode)
-	local ansi_c = (mode == true)
+function M.ansi_unescape(s, mode) -- ("z": as $'…', but kept whole past a \0)
+	local ansi_c = (mode == true or mode == "z")
 	local out, i, n = {}, 1, #s
 	while i <= n do
 		local c = s:sub(i, i)
@@ -13918,7 +14007,7 @@ function M.ansi_unescape(s, mode)
 		end
 	end
 	local r = table.concat(out)
-	if ansi_c then -- ($'…' is a C string: it ends at a \0 — `x$'\0'y` is `xy`, $'a\0b' is `a`)
+	if mode == true then -- ($'…' is a C string: it ends at a \0 — `x$'\0'y` is `xy`, $'a\0b' is `a`)
 		local z = r:find("\0", 1, true)
 		if z then
 			return r:sub(1, z - 1)
@@ -13982,6 +14071,9 @@ function Shell:echo(...)
 	-- error (e.g. a full disk) is a write error -> status 1, like bash's sh_chkwrite.
 	local werr = false
 	if self.out == io.write then
+		if CO or sched_live() then -- (a redirected builtin in an in-process stage: no blocking flush
+			M.co_block(1, POLLOUT) -- into a full pipe whose reader hasn't run yet — a
+		end -- line fits the PIPE_BUF a POLLOUT pipe has room for)
 		local ok, m = io.flush()
 		if not ok then
 			werr, self.write_err, self.write_errmsg = true, true, m
@@ -14042,6 +14134,9 @@ function M.chkwrite(sh, name)
 			M.chkwrite_report(sh, name, w)
 		end
 		return not w
+	end
+	if CO or sched_live() then -- (in-process stages: see Shell:echo)
+		M.co_block(1, POLLOUT)
 	end
 	local ok, m = io.flush()
 	if ok then
@@ -14352,11 +14447,8 @@ end
 -- compiles. No statement re-interpretation (no I.exec_stmt): only resolve+call is shared,
 -- the words are compiled. xtrace mirrors the delegated path so `set -x` doesn't regress;
 -- $_ / PIPESTATUS / errexit stay with the emitted wrapper around this call.
-function M.call_dynamic_fn(sh, argv)
+function M.call_dynamic_fn(sh, argv) -- (the call site has traced it: set -x)
 	local I = require("interp")
-	if sh.opt_x then
-		M.xtrace(sh, argv)
-	end
 	return I.exec_simple(sh, argv, _noop)
 end
 
@@ -15988,6 +16080,9 @@ end
 -- set -x of a QUOTED [[ == ]] pattern text: every character backslashed, as bash's
 -- quote_string_for_globbing shows it (`"ab"` → \a\b)
 function M.xglob_quote(s)
+	if M.mbx and s:find("[\128-\255]") then
+		return M.mb_quote(s) -- (Big5/GBK/SJIS: by the locale's characters)
+	end
 	return (s:gsub("[%z\1-\127\194-\244][\128-\191]*", "\\%0"))
 end
 function M.xtilde(sh, tok) -- (a pattern's leading ~prefix, traced: its directory reads as quoted)
@@ -16413,6 +16508,9 @@ do
 		for _, aa in ipairs(aas) do
 			sh.arrayargs_pending[aa.name] = true
 			sh.arrayargs_pre[aa] = I.arrayassign_items(sh, aa, wantassoc or sh:is_assoc(sh:deref(aa.name)), wantassoc)
+			if sh.opt_x then -- (`+ b=('4' '5 6')` as it expands: before a prefix assignment's
+				M.xtrace_arrlit(sh, aa.name, sh.arrayargs_pre[aa]) -- trace, and `+ declare -a b`)
+			end
 		end
 	end
 	-- … and after it: each literal lands in the now-declared (local/assoc) variable, unless
@@ -16462,13 +16560,6 @@ do
 	end
 	-- set -x (unless the compiled caller traced it — spec.xt): before the redirections
 	function M.sr_trace(sh, argv, spec)
-		if spec.aas and sh.arrayargs_pre then -- (`+ b=('4' '5 6')` before `+ declare -a b`)
-			for _, aa in ipairs(spec.aas) do
-				if sh.arrayargs_pre[aa] then
-					M.xtrace_arrlit(sh, aa.name, sh.arrayargs_pre[aa])
-				end
-			end
-		end
 		M.xtrace(sh, argv)
 	end
 	-- The PS4 a prefixed command's own trace line uses: the one outside its temporary
@@ -16718,7 +16809,7 @@ function M.def_function(sh, st, fn)
 	local name = st.name
 	-- a name that is an expansion (`$foo-bar()`, captured raw by the parser) is a NON-fatal
 	-- runtime error (status 1); bash is otherwise lenient (`func-name=ext` is fine)
-	local badname = not name:match("^[%w_:%.+@/%%%^~,!][%w_%.%-:+@/!#=%%%^~,%[%]]*$")
+	local badname = not name:match("^[%w_:%.+@/%%%^~,!%-=][%w_%.%-:+@/!#=%%%^~,%[%]]*$")
 	if badname or (sh.opt_posix and not name:match("^[%a_][%w_]*$")) then
 		M.ierr = true -- (check_identifier's internal_error)
 		M.err_at(sh, st.top and st.eline, "curse: `" .. name .. "': not a valid identifier\n")

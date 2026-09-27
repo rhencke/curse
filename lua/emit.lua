@@ -933,7 +933,7 @@ local function emitable_word(w)
 		if p.pexp and not pexp_compilable(p.pexp, p.q) then
 			return false
 		end
-		if p.procsub or p.bterr then
+		if p.procsub or p.bterr or p.nulcut then
 			return false
 		end -- <(cmd)/>(cmd): needs the interp's temp-file setup; a brace range's open ` errors there
 		if p.special and not RENDERABLE_SPECIAL[p.special] then
@@ -3083,6 +3083,10 @@ local function emit_pattern_glob_word(w, lifted, xall)
 		end
 		if p.ansic then -- ($'…\u…': encoded in the locale of the moment)
 			out[#out + 1] = ("rt.glob_quote(%s)"):format(EF.lit_expr(p))
+		elseif p.lit ~= nil and p.q and p.lit:find("[\128-\255]") and (xall or p.lit:find(CASE_GLOBSPECIAL)) then
+			-- (non-ASCII: a Big5/GBK/SJIS trail byte may look like a metachar — escaped by the
+			-- locale's characters of the moment)
+			out[#out + 1] = ((xall and "rt.xglob_quote(%q)" or "rt.glob_quote(%q)")):format(p.lit)
 		elseif p.lit ~= nil then
 			local s = p.lit
 			if p.q then
@@ -4863,7 +4867,7 @@ H.funcdef = function(cx, st, after)
 		return p
 	end
 	local p = cx.newpc()
-	if not st.name:match("^[%w_:%.+@/%%%^~,!][%w_%.%-:+@/!#=%%%^~,%[%]]*$") then -- name is an expansion (`$foo-bar()`):
+	if not st.name:match("^[%w_:%.+@/%%%^~,!%-=][%w_%.%-:+@/!#=%%%^~,%[%]]*$") then -- name is an expansion (`$foo-bar()`):
 		cx.blocks[p] = EF.bad_ident(st.name, after) -- non-fatal runtime error (bash)
 	else
 		cx.blocks[p] = (st.name:match("^[%a_][%w_]*$") and "" -- (posix: a non-identifier name is fatal)
@@ -6568,8 +6572,11 @@ H.whilec = function(cx, st, after)
 		-- DEBUG fires before each evaluation of the condition command (bash)
 		local cst = type(st.cond) == "table" and st.cond[1] or nil
 		local d = cst and dbg(cst) or ""
+		local svl = EF.cur_line -- (the condition traces under its own line, not the body's last)
+		EF.cur_line = cst and (cst.cline or cst.line) or svl
 		cx.blocks[condp] = d .. EF.arith_branch(arith, cx.lifted, bodyentry, after, true, cst and cst.src)
 		cx.blocks[firstp] = d .. EF.arith_branch(arith, cx.lifted, bodyentry, exitp, true, cst and cst.src)
+		EF.cur_line = svl
 		return firstp
 	end
 	-- fast path: `while/until [ A -op B ]` with integer operands — a native int64
@@ -6598,7 +6605,11 @@ H.whilec = function(cx, st, after)
 		else
 			stexpr = ("rt.test_icmp(sh, %s, %q, %s, %q)"):format(tvar.a, tvar.op, tvar.b, tvar.cmd)
 		end
-		cx.blocks[condp] = (cst and dbg(cst) or "") .. EF.xtwords(st.cond[1].words, cx.lifted) .. ("%s; if sh.status %s 0 then pc = %d else pc = %d end"):format(
+		local svl = EF.cur_line -- (the condition traces under its own line, not the body's last)
+		EF.cur_line = cst and (cst.cline or cst.line) or svl
+		local xtw = EF.xtwords(st.cond[1].words, cx.lifted)
+		EF.cur_line = svl
+		cx.blocks[condp] = (cst and dbg(cst) or "") .. xtw .. ("%s; if sh.status %s 0 then pc = %d else pc = %d end"):format(
 			stexpr,
 			st.negate and "~=" or "==",
 			bodyentry,
@@ -6960,6 +6971,9 @@ H.subshell = function(cx, st, after)
 				swpre = ("if sh.traps and sh.traps.ERR and (sh.in_trap or 0) == 0 then sh.cur_cmd = %q end; "):format(
 					require("deparse").command_text(st))
 			end
+			-- (a body compiled apart from this CFG's own lifted locals reads them from sh:
+			-- flush them first — `for ((i…)); do (echo "$i"); done` saw a stale $i)
+			swpre = swpre .. lifted_flush(cx.lifted)
 			local ln = EF.lifted_names or {}
 			if #ln > 0 then
 				local sav, vs = {}, {}
@@ -8246,6 +8260,11 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
 			-- A redirect (`[[ … ]] 2>/dev/null`) is applied around the evaluation and
 			-- restored after (its only effect is to steer leaf/regex error output).
 			local db_redir = nil
+			-- (set -x: rt.xdb1/xdb2 trace under this command's line — PS4's $LINENO)
+			local xl = EF.xtrace and EF.xln() or ""
+			if xl ~= "" then
+				xl = "if sh.opt_x then " .. xl .. "end "
+			end
 			if st.redirs then
 				db_redir = cx.redir_conds(st, nil)
 				if not db_redir then
@@ -8273,7 +8292,7 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
 					if EF.xtrace then
 						lx = ("rt.xdb1(sh, false, nil, %s, %s)"):format(lx, re)
 					end
-					cx.blocks[p] = d
+					cx.blocks[p] = d .. xl
 						.. db_wrap(
 							('do local __c, __bad = rt.regex_captures(%s, %s, (sh.shopt.nocasematch and true or nil)); if __bad then sh.status = 2 else sh:array_assign("BASH_REMATCH", __c or {}, false); sh.status = __c and 0 or 1 end end'):format(
 								lx,
@@ -8299,7 +8318,7 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
 				sbody = ("do local __ok, __r = pcall(function() return %s end); if __ok then sh.status = __r and 0 or 1 elseif type(__r) == \"table\" and __r.__curse_regexerr then sh.status = 2 else error(__r, 0) end end"):format(cond)
 				EF.db_regex = nil
 			end
-			cx.blocks[p] = d
+			cx.blocks[p] = d .. xl
 				.. db_wrap(sbody)
 				.. ecs
 				.. ("; pc = %d"):format(after)
