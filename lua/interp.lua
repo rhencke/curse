@@ -2719,8 +2719,8 @@ local function apply_redirs(sh, redirs, cname, ctx, args) -- cname: the command 
 		-- (the word as written: r.target has its outer quotes stripped, `"$f"` -> `$f`)
 		local raw = r.src or r.target or ""
 		-- bash brace-expands the target too; more than one word -> ambiguous redirect.
-		if P.brace_count(raw) > 1 then
-			io.stderr:write("curse: " .. raw .. ": ambiguous redirect\n")
+		if P.brace_count(raw) > 1 then -- (a `{v}>…`'s error names v: redirection_error)
+			io.stderr:write("curse: " .. (r.fdvar or raw) .. ": ambiguous redirect\n")
 			return nil
 		end
 		-- expansion can also fail non-fatally (e.g. failglob no-match): the redirect
@@ -2741,7 +2741,7 @@ local function apply_redirs(sh, redirs, cname, ctx, args) -- cname: the command 
 			return nil
 		end
 		if #fs ~= 1 then
-			io.stderr:write("curse: " .. raw .. ": ambiguous redirect\n")
+			io.stderr:write("curse: " .. (r.fdvar or raw) .. ": ambiguous redirect\n")
 			return nil
 		end
 		return fs[1]
@@ -2840,7 +2840,7 @@ local function apply_redirs(sh, redirs, cname, ctx, args) -- cname: the command 
 		end
 		if rt.REDIR_FLAGS[r.op] then -- a file: rt.redir_open (flags, noclobber, &>, restricted)
 			local t = ftgt(r)
-			if not (t and rt.redir_open(sh, r.op, r.fd, t, not persist[r.fd] and save or nil)) then
+			if not (t and rt.redir_open(sh, r.op, r.fd, t, not persist[r.fd] and save or nil, r.fdvar)) then
 				ok = false
 			end
 		elseif r.op == "heredoc" then

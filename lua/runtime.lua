@@ -1789,10 +1789,11 @@ end
 end
 -- A redirection's open failed: bash's message, from errno (read right after the open).
 -- noclobber's O_EXCL miss on a regular file is "cannot overwrite existing file".
-function M.open_fail(sh, path)
+function M.open_fail(sh, path, vname)
 	local e = ffi.errno()
-	local msg = (e == 17 and sh.opt_C) and "cannot overwrite existing file" or ffi.string(C.strerror(e))
-	io.stderr:write("curse: " .. path .. ": " .. msg .. "\n")
+	local nc = e == 17 and sh.opt_C
+	local msg = nc and "cannot overwrite existing file" or ffi.string(C.strerror(e))
+	io.stderr:write("curse: " .. (nc and vname or path) .. ": " .. msg .. "\n")
 end
 -- An all-digit `>&WORD` as a fd: legal_number + (int)lfd == lfd (redir.c), else -1 (EBADF) —
 -- a huge number must not wrap onto a real fd.
@@ -1831,10 +1832,12 @@ end
 -- is already expanded, backing each touched fd up into `saves` first — `saves` nil: no
 -- backup (a `{v}>` named fd persists after the command: bash). false on failure (message
 -- written), nil for an op it has no form for.
-local function redir_open(sh, op, fd, target, saves)
+-- (`vname`: a `{v}>…` redirection's variable — bash's redirection_error names it, not the
+-- file, for its own errors: restricted, noclobber)
+local function redir_open(sh, op, fd, target, saves, vname)
 	local flags = REDIR_FLAGS[op]
 	if flags and flags ~= 0 and sh.opt_r then -- a restricted shell writes no files
-		io.stderr:write("curse: " .. tostring(target) .. ": restricted: cannot redirect output\n")
+		io.stderr:write("curse: " .. tostring(vname or target) .. ": restricted: cannot redirect output\n")
 		return false
 	end
 	io.flush() -- flush buffered stdout before moving fds (else it lands in the new target)
@@ -1851,7 +1854,7 @@ local function redir_open(sh, op, fd, target, saves)
 		local h = (op ~= "clobber" and flags == 577 and sh.opt_C) and open_noclobber(target)
 			or M.ropen(target, flags, 438)
 		if h < 0 then
-			M.open_fail(sh, target)
+			M.open_fail(sh, target, vname)
 			return false
 		end
 		if both then
