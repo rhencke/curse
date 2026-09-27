@@ -1113,7 +1113,7 @@ end
 -- every sibling. `flags` other than 0 (WNOHANG, …) are passed straight through.
 -- `intr` (the shell, from the `wait` builtin): a trapped signal's trap sets intr.wait_sig,
 -- which ends the wait early with -1 (bash's wait_intr_buf) — else an EINTR is retried.
-function M.wait_child(pid, stbuf, flags, intr)
+function M.wait_child(pid, stbuf, flags, intr, inplace)
 	flags = flags or 0
 	local t = flags == 0 and co_task() or nil
 	if t or (flags == 0 and sched_live()) then
@@ -1135,19 +1135,20 @@ function M.wait_child(pid, stbuf, flags, intr)
 							return C.waitpid(pid, stbuf, flags)
 			end
 			t.child_pid = pid -- (`kill` of a simple-command job reaches this child: see task_kill)
+			t.child_inplace = inplace -- (…and of a job whose process it replaced: exec, a tail)
 			while fd_would_block(pfd, POLLIN) do
 				pre_yield(t)
 				if coroutine.yield(pfd, POLLIN) == SIGMARK then
 					local ok, err = pcall(task_signals, t)
 					if not ok then -- (the task dies: its child lives on, reaped as an orphan)
 						C.close(pfd)
-						t.child_pid = nil
+						t.child_pid, t.child_inplace = nil, nil
 						M.internal_pids[pid] = true
 						error(err, 0)
 					end
 				end
 			end
-			t.child_pid = nil
+			t.child_pid, t.child_inplace = nil, nil
 			C.close(pfd)
 		elseif t then -- no pidfd (old kernel): poll WNOHANG on a scheduler tick
 			while C.waitpid(pid, stbuf, 1) == 0 do
@@ -2783,7 +2784,16 @@ function Shell:exec_t(args)
 			return
 		end
 		local st = ffi.new("int[1]")
-		local ok, err = pcall(M.wait_child, pid, st, 0)
+		-- (`exec cmd`, or a subshell's last command exec'd in its place: when that process
+		-- is a background job's own, the job's `kill` signals the command — bash's job
+		-- process IS it now)
+		local inplace = nil
+		if self.exec_builtin or self.tail_x then
+			local cx = self.tail_x or M.iso_cur(self)
+			local t = co_task()
+			inplace = t and cx and (cx.task == t or cx.task_proc == t) or nil
+		end
+		local ok, err = pcall(M.wait_child, pid, st, 0, nil, inplace)
 		if not ok then
 			M.fg_hold_leave(self, held)
 			error(err, 0)
@@ -4296,9 +4306,15 @@ function Shell:subshell_run(runner, saves, paren, inplace)
 	self.jobs = {}
 	self.job_cur, self.job_prev = nil, nil
 
+	local up0 = M.iso_cur(self)
 	local ctx = iso_push(self)
 	if paren then -- (a ( … ) starts SUBSHELL_PAREN afresh: no SUBSHELL_PIPE)
 		ctx.pipe = nil
+	end
+	-- (a `( … ) &` job, or a pipeline stage that is just this `( … )`: it runs in that task's
+	-- own process — a command exec'd in its place is the job's: see Shell:exec)
+	if self.pstage and up0 and up0.task and up0.task == co_task() then
+		ctx.task_proc = up0.task
 	end
 	local ok, err = pcall(runner, self)
 	local status = self.status
@@ -5100,6 +5116,19 @@ function M.jobs_notify(sh, keep)
 			elseif j.sig then
 				j.notified = true
 				local said = M.job_notify(sh, j.procs or { { pid = j.pid, st = j.sig + (j.core and 0x80 or 0), text = j.cmd } }, j.sig, false)
+				if not said and not sh.cap_jobs and M.job_control_on(sh) then
+					-- (notify_of_job_status's `else if (job_control)`: one it doesn't report
+					-- as a script's — INT, TERM, PIPE, a trapped signal — gets the standard
+					-- listing, pretty_print_job JLIST_STANDARD: `[N]+  Terminated  cmd`)
+					local I = require("interp")._int
+					local d = I.SIGDESC[j.sig] and M.Llibc(I.SIGDESC[j.sig]) or M.L("Signal %d", j.sig)
+					if j.core then
+						d = d .. M.L(" (core dumped)")
+					end
+					local mark = (j == sh.job_cur) and "+" or (j == sh.job_prev and "-" or " ")
+					io.stderr:write(("[%d]%s  %s%s%s\n"):format(j.id, mark, d, (" "):rep(math.abs(24 - #d)), j.cmd or ""))
+					said = true
+				end
 				if j ~= keep and (said or not sh.opt_i) then
 					M.job_delete(sh, j)
 				end
@@ -6256,13 +6285,16 @@ function Shell:bg_launch(fn, cmdstr, flat, simple, upv_get, upv_set, opts)
 			t.sh.in_pipestage = (t.sh.in_pipestage or 1) - 1 -- (not a pipeline stage: an async list)
 			t.sh.in_subprogram = (t.sh.in_subprogram or 0) + 1
 			t.sh.loopdepth = g.simple and self.loopdepth or 0 -- (a simple job keeps it: stage_kind)
+			t.jc = jc -- (job control: its process group takes every signal — task_kill_job)
 			if g.simple then -- (bash execs a `cmd &` job's external in place: rt.exec_tail_lvl)
 				t.sh.job_pgrp = jc -- (…in the job's own process group, with job control)
 				-- (a function it calls: no tail inside; "fn": the emitter's direct call, at this pd)
 				t.sh.shlvl_tail, t.sh.shlvl_cs = g.simple ~= "fn" and t.sh.pd or nil, nil
 				t.sh.xstage = true -- (its external is the job's process: reported as the job)
-				if g.simple ~= "fn" then -- (not a function's commands: they get the defaults)
-					t.sh.bg_cd = t.sh.calldepth -- (…run with SIGINT/SIGQUIT ignored: Shell:exec)
+				-- (…run with SIGINT/SIGQUIT ignored: Shell:exec — without job control only,
+				-- setup_async_signals; not a function's commands: they get the defaults)
+				if g.simple ~= "fn" and not jc then
+					t.sh.bg_cd = t.sh.calldepth
 				end
 			end
 			if bufcap then -- inside a buffered $(…): its output is the substitution's too
@@ -6351,7 +6383,7 @@ function M.task_kill(t, sig)
 	end
 	-- a simple command's job IS its command (bash execs it in the job's process): a
 	-- running external takes the signal itself, and the job ends with its status
-	if t.g.simple and t.child_pid then
+	if (t.g.simple or t.child_inplace) and t.child_pid then
 		if not M.STOPSIG[sig] and sig ~= 18 then
 			t.g.killed = true -- (for `wait`'s report, should the command die of it)
 		end
@@ -6387,8 +6419,11 @@ end
 -- for a pipeline job, every stage (a simple command stage IS its external command) — so
 -- the stages of the pipeline its task is waiting on get it too, then the task itself.
 function M.task_kill_job(t, sig)
-	if (M.STOPSIG[sig] or sig == 18) and not t.g.simple and t.child_pid and not t.done then
-		C.kill(t.child_pid, sig) -- (its process group: the external it runs stops with it)
+	-- (its process group: the external it runs stops with it — and, with job control, takes
+	-- every signal: killpg; one it runs in place takes it through task_kill)
+	if not t.g.simple and t.child_pid and not t.done and not t.child_inplace
+		and (M.STOPSIG[sig] or sig == 18 or (sig ~= 0 and t.jc)) then
+		C.kill(t.child_pid, sig)
 	end
 	local pg = t.g.pipe and type(t.wait) == "table" and t.wait
 	if pg and SCHED and sig ~= 0 then

@@ -385,6 +385,14 @@ wait_builtin = function(sh, cmd, args, hook, tcb)
 				rt.job_delete(sh, j)
 				j.forgot = not sh.wait_sig or nil -- (bgp_clear: a later `wait PID` doesn't know it)
 			end
+			if not sh.wait_sig then -- (bgp_clear forgets EVERY saved status — also of the jobs
+				-- notify_of_job_status dropped from the table before this `wait`)
+				for _, x in ipairs(sh.jobs or {}) do
+					if x.gone and x.done then
+						x.forgot = true
+					end
+				end
+			end
 			if sh.bg_pids and not sh.wait_sig then
 				local kept = {}
 				for _, p in ipairs(sh.bg_pids) do

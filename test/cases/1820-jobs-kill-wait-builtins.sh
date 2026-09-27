@@ -58,7 +58,10 @@ j jobs %?6
 j jobs %sleep
 j jobs %1 %9
 j jobs -l -x echo
-kill %1 %2; wait %1; echo "w1=$?"; wait %2; echo "w2=$?"
+# (one at a time: after `kill %1 %2`, whether job 2 has died by the time `wait %1`'s
+# notify_of_job_status runs is a race — bash 5.2.21 then drops the TERM-killed job 2 and
+# `wait %2` says "no such job" (127) instead of 143)
+kill %1; wait %1; echo "w1=$?"; kill %2; wait %2; echo "w2=$?"
 sleep 1 | cat &
 j kill -0 %cat
 kill %1; wait %1; echo "pipe=$?"
