@@ -331,7 +331,8 @@ if [ "${1:-}" = --run-unit ]; then
   sedq() { printf '%s' "$1" | sed 's/[][\\/.*^$]/\\&/g'; }
   norm_sed=(-e "s/$(sedq "$runscript_n")/\$0/g" -e "s/$(sedq "$H_ORACLE")/THIS_SH/g" -e "s/$(sedq "$H_THIS_SH")/THIS_SH/g" -e "s/$(sedq "$H_THIS_SH_DIRECT")/THIS_SH/g"
             -e "s/$(sedq "$tmpd")/TMPDIR/g" -e "s/$(sedq "$cwd")/CWD/g" -e "s/$(sedq "$workdir")/WORKDIR/g"
-            -e 's/tmp\.[A-Za-z0-9]\{10\}/tmp.XXXXXXXXXX/g' -e 's/[0-9][0-9]*m[0-9][0-9]*[.,][0-9][0-9]*s/TIME/g')
+            -e 's/tmp\.[A-Za-z0-9]\{10\}/tmp.XXXXXXXXXX/g' -e 's/[0-9][0-9]*m[0-9][0-9]*[.,][0-9][0-9]*s/TIME/g'
+            -e 's/^\(real\|user\|sys\) [0-9][0-9]*[.,][0-9][0-9]*$/\1 TIME/')  # (`time -p`'s POSIX format)
   run_shell bash; bst=$R_ST; bdur=$R_DUR; bout=$R_OUT; btimeout=$R_TO; berr=$R_ERR
   # curse-cold MUST precede curse-hot (SHELLS order guarantees it): cold misses the
   # empty per-unit cache and tiers (interp -> OSR + store .bc); hot then loads the .bc.
