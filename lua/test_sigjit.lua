@@ -94,8 +94,63 @@ loops.ffi_read = function()
 	return got
 end
 
+-- A counting handler preempts numeric `for` loops (inverted: the loop's last guard is
+-- its FORL check) about every 200us; each must still run every iteration. The exit
+-- taken on a signal must be the LOOP snapshot's: that guard's own exit resumes after
+-- the loop (a FORL is not re-run), so taking it while the loop goes on ends it early —
+-- as preempting via the guard's exit did (sig-hammer: a scheduler `for fd = lo, 9`
+-- cut short left nils behind: "attempt to compare number with nil", double frees).
+pcall(ffi.cdef, [[
+struct curse_tsj_itv { long is, iu, vs, vu; };
+int setitimer(int, const struct curse_tsj_itv *, struct curse_tsj_itv *);
+]])
+local function every(us)
+	C.setitimer(0, ffi.new("struct curse_tsj_itv", 0, us, 0, us), nil)
+end
+local function for_exact()
+	local hits = 0
+	_G.__curse_sigrun = function()
+		hits = hits + 1
+	end
+	every(200)
+	local bad = 0
+	for r = 1, 3000 do
+		local n = 0
+		for i = 1, 20000 do -- (short: a realigned rel8 back-edge)
+			n = n + 1
+		end
+		local m, t = 0, 0
+		for i = 1, 20000 do -- (longer: rel32)
+			m = m + 1
+			t = bit.bxor(t * 3 + i, m) % 65536
+			t = bit.bxor(t * 5 + m, i) % 65536
+			t = bit.bxor(t * 7 + i, m) % 65536
+			t = bit.bxor(t * 11 + m, i) % 65536
+			t = bit.bxor(t * 13 + i, m) % 65536
+			t = bit.bxor(t * 17 + m, i) % 65536
+		end
+		if n ~= 20000 or m ~= 20000 then
+			bad = bad + 1
+		end
+	end
+	every(0)
+	_G.__curse_sigrun = function(s)
+		error({ sig = s }, 0)
+	end
+	return bad, hits
+end
+
 local fails = 0
-for _, name in ipairs(arg and arg[1] and { arg[1] } or { "inverted_short", "inverted_long", "side_exit", "ffi_read" }) do
+if not arg[1] or arg[1] == "for_exact" then
+	local watchdog = after(60, SIGKILL)
+	local bad, hits = for_exact()
+	C.kill(watchdog, SIGKILL)
+	print("for_exact: " .. (bad == 0 and "every iteration ran" or (bad .. " loops cut short")) .. (hits > 20 and "" or " (NOT preempted: " .. hits .. ")"))
+	if bad ~= 0 or hits <= 20 then
+		fails = fails + 1
+	end
+end
+for _, name in ipairs(arg and arg[1] and (arg[1] == "for_exact" and {} or { arg[1] }) or { "inverted_short", "inverted_long", "side_exit", "ffi_read" }) do
 	local watchdog = after(5, SIGKILL)
 	after(0.05, SIGALRM)
 	local ok, e = pcall(loops[name])
