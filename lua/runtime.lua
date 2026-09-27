@@ -1866,8 +1866,12 @@ local function open_noclobber(path)
 	ffi.errno(e)
 	return -1
 end
-local function redir_backup(saves, fd)
-	saves[#saves + 1] = { fd = fd, saved = M.save_fd(fd) }
+local function redir_backup(saves, fd, sh)
+	local e = { fd = fd, saved = M.save_fd(fd) }
+	saves[#saves + 1] = e
+	if sh and sh.iso_ctx and sh.iso_ctx[1] then
+		M.iso_note_save(sh, e)
+	end
 end
 -- THE redirection applier of both tiers (compiled code via redir_apply, interp's
 -- apply_redirs for its file/here-doc redirections): install one redirection whose target
@@ -1885,10 +1889,10 @@ local function redir_open(sh, op, fd, target, saves)
 		local both = op == "outboth" or op == "appboth" -- &> / &>>: stdout AND stderr
 		if saves then
 			if both then
-				redir_backup(saves, 1)
-				redir_backup(saves, 2)
+				redir_backup(saves, 1, sh)
+				redir_backup(saves, 2, sh)
 			else
-				redir_backup(saves, fd)
+				redir_backup(saves, fd, sh)
 			end
 		end
 		local h = (op ~= "clobber" and flags == 577 and sh.opt_C) and open_noclobber(target)
@@ -1907,7 +1911,7 @@ local function redir_open(sh, op, fd, target, saves)
 		end
 	elseif op == "dup" or op == "dupin" then -- N>&M / N<&M / N>&- (compiled: digit targets)
 		if target == "-" then
-			redir_backup(saves, fd)
+			redir_backup(saves, fd, sh)
 			C.close(fd)
 		else
 			local tf = M.fd_number(target) -- (emit hands only all-digit targets here)
@@ -1918,12 +1922,12 @@ local function redir_open(sh, op, fd, target, saves)
 				io.stderr:write("curse: " .. target .. ": Bad file descriptor\n")
 				return false
 			end
-			redir_backup(saves, fd)
+			redir_backup(saves, fd, sh)
 			C.dup2(tf, fd)
 		end
 	elseif op == "heredoc" or op == "herestring" then
 		if saves then
-			redir_backup(saves, fd)
+			redir_backup(saves, fd, sh)
 		end
 		local h = _temp_fd(target) -- target = the already-built body text
 		if h < 0 then -- (redir.c: here_document_to_fd's failure, then the command fails)
@@ -2022,6 +2026,7 @@ function M.redir_discard(saves, sh) -- (sh: in an in-process subshell, a fd >= 1
 	end
 	for i = #saves, 1, -1 do
 		local s = saves[i]
+		s.done = true
 		if s.saved >= 0 and not (sh and M.iso_keep_fd(sh, s.fd, s.saved)) then
 			C.close(s.saved)
 		elseif s.saved < 0 and sh then
@@ -2061,6 +2066,7 @@ function M.redir_undo(saves)
 	end
 	for i = #saves, 1, -1 do
 		local s = saves[i]
+		s.done = true
 		if s.saved >= 0 then
 			C.dup2(s.saved, s.fd)
 			C.close(s.saved)
@@ -3401,6 +3407,48 @@ M.iso_cur = iso_cur
 -- touches it and put back when the context ends (iso_undo): fds 0-9 (`exec` redirections),
 -- the whole environ (`exec -c`, exec's prefix bindings), signal traps + dispositions,
 -- resource limits, the $RANDOM stream.
+-- A context's fds are saved lazily — at its first `exec` — so a redirection the body
+-- has active then (`{ exec 3>f; } 2>&1`) must not be taken for the context's own state:
+-- each save made inside the context is noted (fd -> its saves, oldest first), and the
+-- oldest one still active holds the value the context started with.
+function M.iso_note_save(sh, e)
+	local ctx = iso_cur(sh)
+	if not ctx or ctx.task_fds or (ctx.fds and e.fd <= 9) or (ctx.hifds and ctx.hifds[e.fd]) then
+		return -- (that fd's state is already kept)
+	end
+	local pre = ctx.pre
+	if not pre then
+		pre = {}
+		ctx.pre = pre
+	end
+	local l = pre[e.fd]
+	if not l then
+		l = {}
+		pre[e.fd] = l
+	end
+	local n = 0 -- (only the saves still active matter: drop the undone ones)
+	for i = 1, #l do
+		if not l[i].done then
+			n = n + 1
+			l[n] = l[i]
+		end
+	end
+	for i = #l, n + 1, -1 do
+		l[i] = nil
+	end
+	l[n + 1] = e
+end
+function M.iso_pre(ctx, fd)
+	local l = ctx.pre and ctx.pre[fd]
+	if l then
+		for i = 1, #l do
+			if not l[i].done then
+				return l[i]
+			end
+		end
+		ctx.pre[fd] = nil
+	end
+end
 function M.iso_save_fds(sh)
 	local ctx = iso_cur(sh)
 	if not ctx or ctx.fds or ctx.task_fds then -- (a task's fds are its own: nothing to restore)
@@ -3409,7 +3457,12 @@ function M.iso_save_fds(sh)
 	io.flush()
 	local sv = {}
 	for fd = 0, 9 do
-		sv[fd] = dup_hi(fd) -- (-1: closed)
+		local e = M.iso_pre(ctx, fd)
+		if e then -- (under a redirection made in this context: the value from before it)
+			sv[fd] = e.saved >= 0 and dup_hi(e.saved) or -1
+		else
+			sv[fd] = dup_hi(fd) -- (-1: closed)
+		end
 	end
 	ctx.fds = sv
 end
@@ -3593,6 +3646,11 @@ function M.iso_keep_fd(sh, fd, saved)
 		ctx.hifds = h
 	end
 	if h[fd] == nil then
+		local e = M.iso_pre(ctx, fd)
+		if e then -- (under a redirection made in this context: the value from before it)
+			h[fd] = e.saved >= 0 and dup_hi(e.saved) or -1
+			return false
+		end
 		h[fd] = saved
 		return true
 	end

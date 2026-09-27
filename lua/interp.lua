@@ -2707,7 +2707,11 @@ local function apply_redirs(sh, redirs, cname, ctx, args) -- cname: the command 
 	end
 	local function backup(fd)
 		if not persist[fd] then
-			save[#save + 1] = { fd = fd, saved = rt.save_fd(fd) }
+			local e = { fd = fd, saved = rt.save_fd(fd) }
+			save[#save + 1] = e
+			if sh.iso_ctx and sh.iso_ctx[1] then
+				rt.iso_note_save(sh, e)
+			end
 		end
 	end
 	-- redirect targets are word-expanded at runtime (e.g. `> $TMP/f`, `>& $myfd`).
