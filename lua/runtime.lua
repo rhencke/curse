@@ -129,6 +129,11 @@ local function current_line(sh)
 		if M.INTERP_FRAMES[f] then
 			break -- the interpreter is innermost: its sh.cur_line is current
 		end
+		if line and f == M.source_run then
+			-- a compiled sourced file's line: the file labels it (sh.cur_source), not
+			-- the compiled function that ran the `source` (bash: BASH_SOURCE[0])
+			return line
+		end
 		local t = M.PCLINE[f]
 		if t then
 			if not line then
@@ -4610,7 +4615,9 @@ function M.import_functions(sh)
 		-- (a path-like name is never imported: `/bin/echo` must stay the program; nor, in
 		-- posix mode, one that isn't an identifier)
 		if not name:find("/", 1, true) and not (sh.opt_posix and not name:find("^[%a_][%w_]*$")) then
-			ok, ast = pcall(P.parse, src)
+			-- (numbered from line 0, as bash's initialize_shell_variables parses it: the
+			-- body's first line is 0, which an error prefix omits — `environment: …`)
+			ok, ast = pcall(P.parse, src, nil, nil, nil, nil, nil, 0)
 		end
 		-- (exactly ONE statement: anything after the definition — `; echo BAD` — is a second
 		-- statement, and a word glued after the body is a syntax error)
@@ -4635,6 +4642,18 @@ function M.import_functions(sh)
 			sh.func_def[name] = st
 			sh.fexport = sh.fexport or {}
 			sh.fexport[name] = true
+			-- (its ${BASH_SOURCE[0]} and error label: bash's "environment", line 0)
+			sh.func_file = sh.func_file or {}
+			sh.func_file[name] = "environment"
+			sh.func_line = sh.func_line or {}
+			sh.func_line[name] = 0
+			-- (what its text reads that compiled callers must maintain: tier start_state)
+			local fl = ((val:find("FUNCNAME", 1, true) or val:find("BASH_SOURCE", 1, true)
+				or val:find("BASH_LINENO", 1, true)) and "F" or "") .. (val:find("PIPESTATUS", 1, true) and "P" or "")
+			if fl ~= "" then
+				local all = (sh.imp_flags or "") .. fl
+				sh.imp_flags = (all:find("F", 1, true) and "F" or "") .. (all:find("P", 1, true) and "P" or "")
+			end
 		else
 			io.stderr:write("curse: error importing function definition for `" .. name .. "'\n")
 		end
@@ -13963,6 +13982,8 @@ end
 -- then the offending line as `…'. Shared by both tiers (the compiled one calls it natively).
 -- `label` "eval": an eval'd text's error reads `NAME: eval: line N:`, and even a recoverable
 -- one ends the eval (status 2, like b_eval) — the caller contains __curse_parseerr.
+local TRAP_TAGS = { ["trap"] = true, ["exit trap"] = true, ["debug trap"] = true, ["error trap"] = true,
+	["return trap"] = true }
 function M.parse_error_stmt(sh, st, label)
 	label = label or st.plabel
 	for _, w in ipairs(st.warns or {}) do
@@ -13980,6 +14001,23 @@ function M.parse_error_stmt(sh, st, label)
 		end
 		return
 	end
+	-- (a trap handler's FORCE_EOF — a $( … ) body's syntax error — ends the shell too, with
+	-- the syntax error's status 2; the EXIT trap's run just ends: the shell is exiting anyway)
+	local tl = label or sh.perr_label
+	if st.forceeof and TRAP_TAGS[tl] and tl ~= "exit trap" and not sh.in_perr_force then
+		sh.in_perr_force = true
+		local _, pe = pcall(M.parse_error_stmt, sh, st, label)
+		sh.in_perr_force = nil
+		error(type(pe) == "table" and pe.__curse_perrexit and pe or { __curse_exit = sh.opt_c and 127 or 2 })
+	end
+	-- (a sourced file's FORCE_EOF ends the shell as an eval's does, status 1)
+	if st.forceeof and not tl and (sh.sourcedepth or 0) > 0 and not sh.in_perr_force then
+		sh.in_perr_force = true
+		local _, pe = pcall(M.parse_error_stmt, sh, st, label)
+		sh.in_perr_force = nil
+		error(type(pe) == "table" and pe.__curse_perrexit and pe or { __curse_exit = sh.opt_c and 127 or 1, __curse_perrexit = true })
+	end
+	-- (under -c every FORCE_EOF reaches run_one_command's top level: status 127 — shell.c)
 	if (label or sh.perr_label) == "eval" and (st.forceeof -- (FORCE_EOF: ends the shell, status 1)
 		or (st.discard and (sh.subdepth or 0) + M.fork_depth > 0)) then
 		local pl = sh.perr_label
@@ -13987,7 +14025,8 @@ function M.parse_error_stmt(sh, st, label)
 		local _, pe = pcall(M.parse_error_stmt, sh, { line = st.line, msg = st.msg, exact = st.exact, text = st.text,
 			showtext = st.showtext, pre = st.pre, preline = st.preline, warns = st.warns, exactmsg = st.exactmsg })
 		sh.perr_label = pl
-		error(type(pe) == "table" and pe.__curse_perrexit and pe or { __curse_exit = 1 })
+		error(type(pe) == "table" and pe.__curse_perrexit and pe
+			or { __curse_exit = (st.forceeof and sh.opt_c) and 127 or 1 })
 	end
 	local msg = tostring(st.msg or "syntax error"):gsub("^.-:%d+: ", "")
 	if not st.exact then
@@ -14008,6 +14047,10 @@ function M.parse_error_stmt(sh, st, label)
 	end
 	if st.line then
 		sh.cur_line = st.line
+		-- (a trap handler's text: its lines count from the line it runs at — run_trap)
+		if sh.trap_lbase and TRAP_TAGS[label or sh.perr_label] then
+			sh.cur_line = st.line + sh.trap_lbase - 1
+		end
 	end
 	sh.in_perr = true -- (a `-c` string's syntax errors name it: `bash: -c: line 1:`)
 	local pl = sh.perr_label
@@ -14025,7 +14068,9 @@ function M.parse_error_stmt(sh, st, label)
 			M.parser_error_exit(sh)
 		end
 	end
-	io.stderr:write("curse: " .. msg .. "\n")
+	if not st.nomsg then -- (a [[ ]] error on a word that failed to read: its pre lines are all)
+		io.stderr:write("curse: " .. msg .. "\n")
+	end
 	if sh.opt_e and not sh.ign_ee then
 		sh.perr_label = pl
 		M.parser_error_exit(sh)
@@ -14034,7 +14079,14 @@ function M.parse_error_stmt(sh, st, label)
 		io.stderr:write("curse: " .. (st.showtext and "syntax error: " or "") .. "`" .. st.text .. "'\n")
 	end
 	sh.in_perr, sh.perr_label = nil, pl
-	error({ __curse_exit = st.status or 2, __curse_parseerr = true, lead = st.lead })
+	-- (parse_compound_assignment's parse_string_error: a non-interactive posix shell takes
+	-- FORCE_EOF rather than DISCARD — it ends, status 1)
+	if st.discard and st.status == 1 and sh.opt_posix and not sh.opt_i then
+		sh.status = 1
+		error({ __curse_exit = sh.opt_c and 127 or 1, __curse_perrexit = true }) -- (past eval/source's containment)
+	end
+	error({ __curse_exit = (st.forceeof and sh.opt_c and not tl and not sh.in_perr_force) and 127 or st.status or 2,
+		__curse_parseerr = true, lead = st.lead })
 end
 -- bash's evalstring.c: an eval'd/sourced text's syntax error ends a posix shell only while
 -- this_shell_builtin is still that eval/source — no command ran in the text before it (a
@@ -14154,7 +14206,9 @@ end
 -- `source`'s call frame (bash): ${BASH_SOURCE[0]} is the file as named, BASH_LINENO gets
 -- the `source` line, FUNCNAME gains "source" (shown only inside a function). Shared by both tiers.
 function M.source_enter(sh, name, line, args, j) -- line: the `source` command's (else found on the stack)
-	local fr = { src = sh.cur_source, line = sh.cur_line }
+	-- (the file's syntax errors are its own: no eval/trap label — parse_error_stmt)
+	local fr = { src = sh.cur_source, line = sh.cur_line, pl = sh.perr_label, tlb = sh.trap_lbase }
+	sh.perr_label, sh.trap_lbase = nil, nil
 	if args and sh.shopt.extdebug then -- (BASH_ARGV: its arguments, else the file as named)
 		fr.bav = #args > j and M.bav_push(sh, args, j + 1, #args, -1) or M.bav_push(sh, args, j, j, -1)
 	end
@@ -14184,6 +14238,7 @@ function M.source_leave(sh, fr)
 		table.remove(sh.funcstack, 1)
 	end
 	sh.cur_source, sh.cur_line = fr.src, fr.line
+	sh.perr_label, sh.trap_lbase = fr.pl, fr.tlb
 end
 -- The file `.`/source reads for NAME (bash's source.def): a name with a slash as is;
 -- else, with shopt sourcepath (the default), the first regular file of that name in
@@ -14291,7 +14346,7 @@ function M.source_run(sh, argv, line)
 	if trap and trap ~= "" and not sh.in_return_trap and M.pseudo_trapped(sh, "RETURN") then
 		sh.in_return_trap = true
 		local sv = sh.status
-		Ii.run_trap(sh, trap)
+		Ii.run_trap(sh, trap, "return trap")
 		sh.status = sv
 		sh.in_return_trap = false
 	end
@@ -15561,7 +15616,7 @@ function M.fn_return(sh, name)
 		sh.in_return_trap = true
 		local saved, sl = sh.status, sh.cur_line
 		sh.cur_line = sh.func_bline and sh.func_bline[name] or sh.cur_line
-		local ok, err = pcall(require("interp")._int.run_trap, sh, h)
+		local ok, err = pcall(require("interp")._int.run_trap, sh, h, "return trap")
 		sh.status, sh.cur_line = saved, sl
 		sh.in_return_trap = false
 		if not ok then

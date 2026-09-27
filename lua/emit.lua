@@ -1447,7 +1447,7 @@ end
 -- command runner's call path (frame/params/return), lifted vars synced around it
 function EF.ext_or_fn(cx, st, cmd, argv, ext)
 	local si, _, so = lsync(cx.lifted)
-	if EF.funcstack and st.line and not EF.trapline then -- (the call's line: run_function pushes it on BASH_LINENO)
+	if st.line and not EF.trapline then -- (the call's line: run_function pushes it on BASH_LINENO)
 		si = "sh.cur_line = " .. st.line .. "; " .. si
 	end
 	return ("if sh.functions[%q] then %srt.call_dynamic_fn(sh, %s)%s else %s end"):format(cmd, si, argv, so, ext)
@@ -5005,10 +5005,11 @@ EF.simple_native = function(cx, st, after, cmd)
 		end
 	elseif isexec and st.redirs then
 		spec[#spec + 1] = "eredirs=" .. ser(st.redirs)
-	elseif st.redirs and #st.redirs > 0 and EF.xtrace and ((st.arrayargs and not bind) or (bind and not st.arrayargs)) then
-		-- (set -x: a declaration's NAME=(…) literals trace once expanded, and a prefix
-		-- assignment as it binds, which the runner does — so it applies the redirections
-		-- itself, after the trace (bash traces to the stderr from before them): rf)
+	elseif st.redirs and #st.redirs > 0 and (st.arrayargs or bind) then
+		-- (a declaration's NAME=(…) literals and a prefix assignment's value expand in the
+		-- runner — before the redirections, as bash expands every word first: a $( … ) in
+		-- one writes its errors to the stderr from before them — and under set -x they
+		-- trace there too; so the runner applies the redirections itself, after: rf)
 		local rc = cx.redir_conds(st, cmd)
 		if not rc then
 			return nil
@@ -5039,6 +5040,13 @@ EF.simple_native = function(cx, st, after, cmd)
 	end
 	if bind and redir and #pnames > 0 then -- (a readonly prefix is reported before the redirections)
 		xt = xt .. ("; rt.prefix_ro(sh, { %s }, __a[1])"):format(table.concat(pnames, ", "))
+	end
+	-- (a function the runner calls — one this module doesn't own, e.g. the interpreter's
+	-- definition a tiered switch inherited — pushes sh.cur_line on BASH_LINENO: the call's)
+	-- (not gated on EF.funcstack: a standalone-compiled function can't see the text that
+	-- reads BASH_LINENO — the callee may be what reads it)
+	if st.line and not EF.trapline then
+		xt = xt .. "; sh.cur_line = " .. st.line
 	end
 	return cx.dispatch(st, after, {
 		prelude = table.concat(out, "; ") .. xt,
@@ -6117,6 +6125,35 @@ simple_compiled = function(cx, st, after)
 	-- reads them from there
 	-- (few args: plain locals — no table unless tracing is on; many: one table)
 	local xpre, xargs = "", false
+	-- a REDIRECTED command expands its words BEFORE its redirections apply (bash's
+	-- execute_simple_command: expand, then do_redirections): an argument that runs
+	-- something — a $( … ) whose error goes to stderr, an arith error — must see the
+	-- fds as they were. Hoist such arguments out ahead of the redirection, as set -x does.
+	if redir_apply and not as_local and not EF.xtrace and #args > 0 then
+		local impure = false
+		for i = 1, #args do
+			if not args[i]:match('^rt%.cstr%(%(?"[^"\\]*"%)?%)$') then
+				impure = true
+				break
+			end
+		end
+		if impure then
+			if #args <= 16 then
+				local names = {}
+				for i = 1, #args do
+					names[i] = "__x" .. i
+				end
+				xpre = ("local %s = %s; "):format(table.concat(names, ", "), table.concat(args, ", "))
+				args = names
+			else
+				xpre = ("local __xa = { %s }; "):format(table.concat(args, ", "))
+				for i = 1, #args do
+					args[i] = ("__xa[%d]"):format(i)
+				end
+			end
+			xargs = true
+		end
+	end
 	if EF.xtrace and not as_local then
 		if #args == 0 then
 			xpre = EF.xtc(cmd, "{}")
@@ -6188,8 +6225,14 @@ simple_compiled = function(cx, st, after)
 			for i = 1, #tmps do
 				xl[i] = "__lv" .. i
 			end
-			body = table.concat(tmps, "; ")
-				.. "; " .. EF.xtc(cmd, "{" .. table.concat(xl, ", ") .. "}")
+			-- (the values expand before a redirection applies — see the hoist above)
+			if redir_apply then
+				xpre = xpre .. table.concat(tmps, "; ") .. "; "
+				body = ""
+			else
+				body = table.concat(tmps, "; ") .. "; "
+			end
+			body = body .. EF.xtc(cmd, "{" .. table.concat(xl, ", ") .. "}")
 				.. (cmd == "local" and "if not rt.local_nofn(sh) then " or "do ")
 				.. "local __lok = true; "
 				.. table.concat(calls, "; ")
@@ -6408,13 +6451,17 @@ H.forc = function(cx, st, after)
 	cx.loopff(st.id)
 	local stepp = cx.newpc()
 	local bodyentry = cx.loop_list(st.body, stepp, after, stepp) -- break exits, continue steps
+	-- (the header's blocks, written after the body, run at the `for` line: an error in a
+	-- slot names it — execute_arith_for_command's line_number = arith_lineno)
+	local sv_line = EF.cur_line
+	EF.cur_line = st.line or sv_line
 	-- (with $BASH_COMMAND read, each slot's own DEBUG prefix carries its text: xs)
 	local d = not EF.bash_command and dbg(st) or "" -- DEBUG fires at the for(( header for the init, each cond, and each step (bash)
 	-- (set -x: each slot's `(( … ))` as it's evaluated, then its DEBUG — eval_arith_for_expr;
 	-- a slot as bash stores it: leading blanks dropped, an empty one `1` — make_cmd.c)
 	local function xs(slot)
 		local sv = st.src and st.src[slot]
-		sv = sv and sv:match("^%s*(.-)$")
+		sv = sv and sv:match("^[ \t]*(.-)$")
 		if sv == "" then
 			sv = "1"
 		end
@@ -6472,6 +6519,7 @@ H.forc = function(cx, st, after)
 	else
 		cx.blocks[ep] = ("%s = 0; %spc = %d"):format(ran, xs(1), condp) -- (an empty init: `1`)
 	end
+	EF.cur_line = sv_line
 	return ep
 end
 

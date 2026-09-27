@@ -421,7 +421,8 @@ local function loop_fragment(st, sh)
 	if st.t == "whilec" or st.t == "forin" then
 		code = srcs:sub(st._s0, st._s1)
 	elseif st.t == "forc" and st.src then
-		code = "for ((;" .. (st.src[2] or "") .. ";" .. (st.src[3] or "") .. "))" .. srcs:sub(st._h1, st._s1)
+		-- (the init slot's newlines stay: the body's lines count from the header's)
+		code = "for ((" .. (st.src[1] or ""):gsub("[^\n]", "") .. ";" .. (st.src[2] or "") .. ";" .. (st.src[3] or "") .. "))" .. srcs:sub(st._h1, st._s1)
 	else
 		return false
 	end
@@ -556,8 +557,12 @@ function M.flush_stores()
 	end
 end
 -- (the emit opts of a program started under set -x / allexport / restricted)
-local function start_opts(xt, attr)
-	return (xt or attr) and { xtrace = xt, startattr = attr } or nil
+-- (imp: what the functions imported from the environment read — rt.import_functions'
+-- sh.imp_flags, "F" the call stack, "P" $PIPESTATUS: the program's calls must keep them)
+local function start_opts(xt, attr, imp)
+	return (xt or attr or imp) and { xtrace = xt, startattr = attr,
+		funcstack = imp and imp:find("F", 1, true) and true or nil,
+		pipestatus = imp and imp:find("P", 1, true) and true or nil } or nil
 end
 -- Compile a whole program for the disk cache and this worker's: d = { path, src, pst, xt,
 -- attr }, the inputs its key was made from (run_tiered — also a deferred compile's
@@ -569,7 +574,7 @@ end
 -- and not stored.
 local function compile_program(d, later, start)
 	local ok, code = pcall(function()
-		return E.emit(M.parse_start(d.src, d.pst), start_opts(d.xt, d.attr))
+		return E.emit(M.parse_start(d.src, d.pst), start_opts(d.xt, d.attr, d.imp))
 	end)
 	local m, chunk
 	if ok then
@@ -683,6 +688,9 @@ end
 local function start_state(sh, src)
 	sh.main_src = sh.main_src or src -- (the script's text: rt.coproc_exit_dispose's end-of-input line)
 	M.note_text(sh, src)
+	if sh.imp_flags then -- (an imported function's text joins the program's: fragments too)
+		M.note_text(sh, (sh.imp_flags:find("F", 1, true) and "FUNCNAME " or "") .. (sh.imp_flags:find("P", 1, true) and "PIPESTATUS" or ""))
+	end
 	sh.xt_start = sh.opt_x or nil
 	sh.attr_start = (sh.opt_a or sh.opt_r) or nil
 	return M.pst(sh, true)
@@ -691,7 +699,7 @@ end
 -- what emit throws (`curse-nocompile: …`, lm_reason) for the caller to fall back on.
 function M.compile_start(sh, src)
 	local pst = start_state(sh, src)
-	return M.compile(M.parse_start(src, pst), start_opts(sh.xt_start, sh.attr_start))
+	return M.compile(M.parse_start(src, pst), start_opts(sh.xt_start, sh.attr_start, sh.imp_flags))
 end
 -- Daemon cold/hot execution. A warm cache hit (this worker's modules, else the disk's
 -- dumped bytecode) runs compiled; a miss runs TIERED (interp, then OSR fall-over into the
@@ -703,8 +711,9 @@ function M.run_tiered(src, sh)
 		shopt = { expand_aliases = sh.shopt and sh.shopt.expand_aliases } }
 	-- (read in a Big5/GBK/SJIS locale: keyed by its charset, and never deferred)
 	local Cache = require("cache")
-	local path = Cache.artifact_path((sh.xt_start or sh.attr_start or pst)
+	local path = Cache.artifact_path((sh.xt_start or sh.attr_start or pst or sh.imp_flags)
 		and (src .. (sh.xt_start and "\0xtrace" or "") .. (sh.attr_start and "\0attr" or "")
+			.. (sh.imp_flags and "\0imp" .. sh.imp_flags or "")
 			.. (pst and "\0pst" .. pst or "") .. (mbx and "\0" .. mbx or "")) or src)
 	local mod = path and modcache_get(path) -- (in-process: no disk read, no module rebuild)
 	if path and not mod then
@@ -727,7 +736,7 @@ function M.run_tiered(src, sh)
 		I.run_lazy(sh, src) -- (no cache path: the interpreter's line-at-a-time parse)
 		return
 	end
-	local d = { path = path, src = src, xt = sh.xt_start, attr = sh.attr_start, pst = pst }
+	local d = { path = path, src = src, xt = sh.xt_start, attr = sh.attr_start, pst = pst, imp = sh.imp_flags }
 	-- A miss on a script that can't get hot (no loop, no function: may_repeat) runs in the
 	-- interpreter right away, compiled after the reply; no caller waits for it.
 	if not may_repeat(src) then
@@ -794,6 +803,12 @@ function M.run_tiered(src, sh)
 		count = count + 1
 		if count < HOT_LOOP or resume or trap_blocked() then
 			return
+		end
+		if st and st._srcs ~= src then
+			-- a loop of OTHER text — eval'd, sourced, a trap's: its id numbers that parse,
+			-- not the program's (resuming the program at the program's loop of the same id
+			-- would re-run it); it can only run compiled on its own
+			return M.loop_osr(sh, st)
 		end
 		local m = compiled()
 		if sh.calldepth ~= 0 then
