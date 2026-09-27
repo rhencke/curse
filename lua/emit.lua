@@ -8000,6 +8000,9 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
 					and ((EF.cf_flush or "") .. cx.ndadj(0) .. "do local __r = sh.status; sh.status = __ps; error({ __curse_return = __r }) end")
 				or (cx.ndadj(0) .. ("pc = %d"):format(retpc))
 			local ps = frag_return and "local __ps = sh.status; " or ""
+			if not frag_return and st.line and EF.retset(cx, true) == "sh.fret" then
+				ps = ps .. ("sh.fret_line = %d; "):format(st.line) -- (the RETURN trap's $LINENO)
+			end
 			if frag_return and not (EF.cf_raise and EF.cf_raise.func) then -- (a stage/eval fragment
 				-- at top level: maybe no function is running — then bash's diagnostic, status 2)
 				retjmp = ("if rt.return_outside(sh%s) then pc = %d else %s end"):format(viacmd, after, retjmp)
