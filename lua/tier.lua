@@ -717,13 +717,14 @@ function M.lm_exec(sh, lg, k)
 				lmae = aenv_of(sh.aliases)
 			end
 			-- (the ERR/DEBUG traps set by earlier lines: their hooks compiled in — trap_mode)
-			local ok, code, chunk = rt.defer_call(function()
+			local chunk
+			local ok, code = rt.defer_call(function()
 				local eok, ecode = pcall(E.emit, { stmts = lg.stmts },
 					emit_opts(trap_mode(sh), { fragment = true, lm = true, lm_aenv = lmae }))
 				if eok then
 					mod, chunk = build(ecode, "=curse:line")
 				end
-				return eok, ecode, chunk
+				return eok, ecode
 			end)
 			if not mod then
 				if LM_DEBUG then
