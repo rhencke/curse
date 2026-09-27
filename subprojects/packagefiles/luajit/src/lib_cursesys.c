@@ -21,6 +21,9 @@ extern char clock_gettime[];
 extern char close[];
 extern char closedir[];
 extern char confstr[];
+extern char curse_aopen_abandon[];
+extern char curse_aopen_result[];
+extern char curse_aopen_start[];
 extern char curse_ldfmt[];
 extern char curse_preempt_arm[];
 extern char curse_preempt_flagp[];
@@ -160,6 +163,9 @@ static const curse_sym_t curse_syms[] = {
   { "close", (void*)close },
   { "closedir", (void*)closedir },
   { "confstr", (void*)confstr },
+  { "curse_aopen_abandon", (void*)curse_aopen_abandon },
+  { "curse_aopen_result", (void*)curse_aopen_result },
+  { "curse_aopen_start", (void*)curse_aopen_start },
   { "curse_ldfmt", (void*)curse_ldfmt },
   { "curse_preempt_arm", (void*)curse_preempt_arm },
   { "curse_preempt_flagp", (void*)curse_preempt_flagp },

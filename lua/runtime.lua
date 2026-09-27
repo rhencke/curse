@@ -1060,9 +1060,26 @@ do
 end
 M.preempt_flag = PREEMPT
 local PREEMPT_USEC = 10000
+-- The FOREGROUND shell is time-sliced too while background jobs live (bash's jobs are
+-- processes the kernel runs alongside it): the same slice is armed for it, and at its
+-- next loop head or function entry (M.preempt) it gives the jobs a round, then re-arms.
+-- A job's first slice comes sooner (FG_FIRST_USEC after `&`): bash's forked child starts
+-- at once. Armed only while jobs live: a script without jobs never sees a tick.
+M.FG_FIRST_USEC = 1000
+function M.fg_arm(usec)
+	if not CO and SCHED ~= nil and next(SCHED.bycoro) ~= nil then
+		preempt_arm(usec or PREEMPT_USEC)
+	end
+end
 function M.preempt()
 	PREEMPT[0] = 0
 	local t = co_task()
+	if not t then
+		if not CO and sched_live() then -- the foreground's slice ran out: the jobs' turn
+			M.sched_pump({}) -- (re-arms the foreground's slice when it returns)
+		end
+		return
+	end
 	if t then
 		pre_yield(t)
 		if coroutine.yield() == SIGMARK then -- (no values: co_resume queues it as runnable again)
@@ -1092,6 +1109,35 @@ function M.procsub_start(gs)
 		end
 		M.preempt()
 	end
+end
+-- The shell's own stdout writes while background jobs live: never block on a full pipe
+-- or FIFO whose reader is one of those jobs (it could never run: a deadlock). Each chunk
+-- (<= PIPE_BUF: a pipe with a free slot takes it whole) waits for POLLOUT, the jobs
+-- running meanwhile. Installed as io.write by the first `&` (Shell:bg_launch); with no
+-- job live, or inside a job (whose output is buffered and flushed the same way:
+-- task_flush), it is the plain io.write.
+M.real_write = io.write
+function M.live_write(...)
+	if CO or not sched_live() then
+		return M.real_write(...)
+	end
+	local n = select("#", ...)
+	local s = n == 1 and tostring((...)) or table.concat({ ... })
+	real_flush()
+	local len, off = #s, 0
+	if len == 0 then
+		return io.stdout
+	end
+	while off < len do
+		M.co_block(1, POLLOUT)
+		local r, e = M.real_write(s:sub(off + 1, off + 4096))
+		if not r then
+			return r, e
+		end
+		real_flush()
+		off = off + 4096
+	end
+	return io.stdout
 end
 -- Wait until `fd` is ready for `ev` (POLLIN/POLLOUT). A no-op outside a stage.
 function M.co_block(fd, ev)
@@ -1747,6 +1793,24 @@ function M.open_intr(path, flags, mode)
 		M.eintr()
 	end
 end
+pcall(ffi.cdef, [[
+void *curse_aopen_start(const char *path, int flags, int mode, int minfd, int *efd);
+int curse_aopen_result(void *h);
+void curse_aopen_abandon(void *h);
+]])
+M.aopen_efd = ffi.new("int[1]")
+function M.aopen_wait(efd) -- (until the probe open's eventfd is readable; jobs run meanwhile)
+	while fd_would_block(efd, POLLIN) do
+		if CO or sched_live() then
+			M.co_block(efd, POLLIN)
+		else
+			_co_pfd[0].fd, _co_pfd[0].events, _co_pfd[0].revents = efd, POLLIN, 0
+			if C.curse_co_poll(_co_pfd, 1, -1) < 0 then
+				M.eintr() -- (EINTR: a trap runs, then the wait goes on — redir_open's retry)
+			end
+		end
+	end
+end
 function M.ropen(path, flags, mode)
 	if not (CO or sched_live()) or C.curse_rt_stat(path, _ropen_st) ~= 0
 		or bit.band(ffi.cast("uint32_t *", _ropen_st + 24)[0], 0xF000) ~= 0x1000 then -- S_IFIFO
@@ -1756,37 +1820,23 @@ function M.ropen(path, flags, mode)
 	if acc == 2 then -- O_RDWR never blocks
 		return C.open(path, flags, mode)
 	end
-	local t = co_task()
-	local function tick()
-		if t then
-			pre_yield(t)
-			if coroutine.yield(-1, 0) == SIGMARK then
-				task_signals(t)
-			end
-		else
-			M.sched_pump({ deadline = M.wall_secs() + 0.01 })
-		end
+	-- (a FIFO's other end may be a job of this very shell: the open runs on a helper
+	-- thread — lib_cursesig.c curse_aopen — and returns exactly when bash's open would,
+	-- once the other end is open, while the jobs run meanwhile; a pipe reached by
+	-- /dev/fd/N, a process substitution's, opens at once)
+	if path:find("^/dev/fd/") or path:find("^/dev/std") or path:find("^/proc/self/fd/") then
+		return M.open_intr(path, flags, mode) -- (an fd of this shell: open it as itself)
 	end
-	local fd
-	while true do
-		fd = C.open(path, bit.bor(flags, 2048), mode) -- O_NONBLOCK
-		if fd >= 0 or acc == 0 or ffi.errno() ~= 6 then -- (ENXIO: no reader yet)
-			break
-		end
-		tick()
+	local h = C.curse_aopen_start(path, flags, mode, FD_BASE, M.aopen_efd)
+	if h == nil then
+		return M.open_intr(path, flags, mode)
 	end
-	if fd < 0 then
-		return fd
+	local ok, err = pcall(M.aopen_wait, M.aopen_efd[0])
+	if not ok then
+		C.curse_aopen_abandon(h)
+		error(err, 0)
 	end
-	C.fcntl(fd, 4, ffi.cast("int", bit.band(C.fcntl(fd, 3), bit.bnot(2048)))) -- F_SETFL: blocking again
-	-- (a named FIFO: its first read mustn't be a spurious EOF before any writer — a task
-	-- yields on it, the shell runs the scheduler until it's ready. Not a pipe reached by
-	-- /dev/fd/N, a process substitution's: its writer is there already, and `read -t`
-	-- must time out on it as bash's does)
-	if acc == 0 and not (path:find("^/dev/fd/") or path:find("^/proc/self/fd/")) then
-		M.co_block(fd, POLLIN)
-	end
-	return fd
+	return C.curse_aopen_result(h)
 end
 ffi.cdef([[
   int curse_rt_mkstemp(char *tmpl) asm("mkstemp");
@@ -6154,6 +6204,7 @@ function M.sched_pump(w)
 	if not ok then
 		error(err, 0)
 	end
+	M.fg_arm() -- (the foreground runs on: its slice, while jobs still live)
 	return ready
 end
 -- Wait until every task group in `gs` has ended: inside a task, by yielding on each (the
@@ -6314,6 +6365,13 @@ function Shell:bg_launch(fn, cmdstr, flat, simple, upv_get, upv_set, opts)
 	end
 	if self.cap_jobs and holds then
 		self.cap_jobs[#self.cap_jobs + 1] = g
+	end
+	M.fg_arm(M.FG_FIRST_USEC) -- (the job starts soon, as bash's child would: M.fg_arm)
+	if not CO and io.write ~= M.live_write then -- (the shell's writes yield from now on)
+		io.write = M.live_write
+	end
+	if self.out == M.real_write then
+		self.out = M.live_write
 	end
 	if opts.nojob then
 		self.last_bg_pid = tostring(vpid)
