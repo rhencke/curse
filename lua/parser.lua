@@ -3775,9 +3775,9 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs, xg, bq
 	-- quote, backquote or ${ — is parse_string_error: status 1 and a DISCARD, as the
 	-- literal's own unclosed `)`)
 	local function parse_array_elems()
-		local ok, r = pcall(parse_array_elems0)
+		local ok, r, ltext = pcall(parse_array_elems0) -- (ltext: the literal's text — keep it)
 		if ok then
-			return r
+			return r, ltext
 		end
 		if type(r) == "table" and r.__curse_perr and not r.status
 			and tostring(r.msg or ""):find("^unexpected EOF while looking for matching") then
