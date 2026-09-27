@@ -10,6 +10,9 @@ local C = I.C
 
 return function(sh, cmd, args, hook, tcb)
 	if cmd == "trap" then
+		if not (args[2] or ""):find("^%-l") then -- (not `trap -l`: initialize_terminating_signals
+			sh.igint_soft = nil -- latches an async job's SIG_IGN SIGINT as hard-ignored: rt stage_body)
+		end
 		-- trap [-lp] [[ACTION] SIG…]  (bash builtins/trap.def)
 		local pflag, lflag, j, sp, c, _ = false, false, 2
 		repeat

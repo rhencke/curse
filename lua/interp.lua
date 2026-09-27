@@ -1666,10 +1666,18 @@ end
 expand_part_str = function(sh, p, assign)
 	if p.lit ~= nil then
 		return p.lit
+	elseif p.cserr then -- (an open $( in a word read at expansion time: parse_default_quoted —
+		-- bash's parse error in the substitution, reported a line on, then DISCARD)
+		local fl, ip, pl = sh.force_line, sh.in_perr, sh.perr_label
+		sh.in_perr, sh.perr_label = true, "command substitution"
+		sh.force_line = (fl or rt.current_line(sh)) + 1
+		sherr(sh, "curse: " .. p.cserr .. "\n")
+		sh.in_perr, sh.perr_label, sh.force_line = ip, pl, fl
+		error({ __curse_exit = 1, __curse_lineabort = true })
 	elseif p.bterr or p.nulcut then -- (a brace range's unclosed backquote: bq_word in the
 		-- parser; a word cut at a $'…' NUL: parser.dq_nulcut)
 		sherr(sh, p.bterr and ('curse: bad substitution: no closing "`" in ' .. p.bterr .. "\n")
-			or ("curse: bad substitution: no closing `}' in " .. p.nulcut .. "\n"))
+			or ("curse: bad substitution: no closing `" .. (p.nocl or "}") .. "' in " .. p.nulcut .. "\n"))
 		-- (a plain line abort, as ${x!}: bash's report_error + expand_word_error DISCARD,
 		-- which an eval/source's parse_and_execute contains — the rest of ITS line only)
 		error({ __curse_exit = 1, __curse_lineabort = true })
@@ -3812,6 +3820,55 @@ end
 -- The printf helpers below live in one table (interp.lua's main chunk is near LuaJIT's
 -- local-variable limit); all but pf.str are off the common path.
 local pf = {}
+-- A conversion's text as its pieces — strings and { char, count } runs of padding. A run
+-- too big to build (a `*` width or precision near INT_MAX: bash's printf writes it as it
+-- formats) is streamed to the shell's stdout in chunks, after the output pending before it
+-- (pf.cur: the printf running; not under -v, whose text must be whole). Returns the text,
+-- or "" once streamed.
+pf.BIG, pf.CHUNK = 1048576, 65536 -- (fields: interp.lua's main chunk is at its local-variable limit)
+function pf.seq(parts)
+	local big, ps = false, pf.cur
+	for k = 1, #parts do
+		local q = parts[k]
+		if type(q) == "table" and q[2] >= pf.BIG then
+			big = true
+		end
+	end
+	if not (big and ps and ps.fsh) then
+		for k = 1, #parts do
+			local q = parts[k]
+			if type(q) == "table" then
+				parts[k] = q[2] > 0 and q[1]:rep(q[2]) or ""
+			end
+		end
+		return table.concat(parts)
+	end
+	local out, wr = ps.out, ps.fsh.out
+	local pending = table.concat(out)
+	for k = #out, 1, -1 do
+		out[k] = nil
+	end
+	wr(pending)
+	ps.flushed = ps.flushed + #pending
+	for k = 1, #parts do
+		local q = parts[k]
+		if type(q) == "string" then
+			wr(q)
+			ps.flushed = ps.flushed + #q
+		elseif q[2] > 0 then
+			local n, chunk = q[2], q[1]:rep(pf.CHUNK)
+			ps.flushed = ps.flushed + n
+			while n >= pf.CHUNK do
+				wr(chunk)
+				n = n - pf.CHUNK
+			end
+			if n > 0 then
+				wr(chunk:sub(1, n))
+			end
+		end
+	end
+	return ""
+end
 -- printstr: %s/%b/%q/%c/%(…)T text with a width (space-padded, `-` left-justifies) and a
 -- precision in bytes (`%.s`: a null digit string is zero)
 function pf.str(spec, width, prec, s)
@@ -3824,9 +3881,9 @@ function pf.str(spec, width, prec, s)
 	local w = tonumber(width)
 	if w and w > #s then
 		if spec:find("-", 1, true) then
-			return s .. (" "):rep(w - #s)
+			return pf.seq({ s, { " ", w - #s } })
 		end
-		return (" "):rep(w - #s) .. s
+		return pf.seq({ { " ", w - #s }, s })
 	end
 	return s
 end
@@ -3909,7 +3966,7 @@ end
 function pf.bigint(spec, width, prec, conv, v)
 	local p = tonumber(prec)
 	local fl = spec:gsub("[-0]", "")
-	local s
+	local s, zp, zpre -- (zp zeros after zpre: a precision too wide for string.format)
 	if p and p <= 99 then
 		s = string.format(fl .. "." .. p .. conv, v)
 	else
@@ -3918,22 +3975,34 @@ function pf.bigint(spec, width, prec, conv, v)
 			local pre = s:match("^[+%- ]?") .. ((conv == "x" or conv == "X") and s:match("^[+%- ]?(0[xX])") or "")
 			local digits = s:sub(#pre + 1)
 			if #digits < p then
-				s = pre .. ("0"):rep(p - #digits) .. digits
+				zp, zpre, s = p - #digits, pre, digits
 			end
 		end
 	end
+	local len = #s + (zp and #zpre + zp or 0)
 	local w = tonumber(width) or 0
+	if zp then -- (then any width pad: spaces, the precision given)
+		local body = { zpre, { "0", zp }, s }
+		if len < w then
+			if spec:find("-", 1, true) then
+				body[4] = { " ", w - len }
+			else
+				table.insert(body, 1, { " ", w - len })
+			end
+		end
+		return pf.seq(body)
+	end
 	if #s < w then
 		if spec:find("-", 1, true) then
-			s = s .. (" "):rep(w - #s)
+			s = pf.seq({ s, { " ", w - #s } })
 		elseif spec:find("0", 1, true) and not p then
 			local pre, rest = s:match("^([+%- ]?0?[xX]?)(.*)$")
 			if pre:match("0$") and not (conv == "x" or conv == "X") then -- (octal's `#` 0 is a digit)
 				pre, rest = pre:sub(1, -2), "0" .. rest
 			end
-			s = pre .. ("0"):rep(w - #s) .. rest
+			s = pf.seq({ pre, { "0", w - #s }, rest })
 		else
-			s = (" "):rep(w - #s) .. s
+			s = pf.seq({ { " ", w - #s }, s })
 		end
 	end
 	return s
@@ -3965,12 +4034,12 @@ function pf.grouped(spec, width, prec, conv, v)
 	local w = tonumber(width) or 0
 	if #s < w then
 		if spec:find("-", 1, true) then
-			s = s .. (" "):rep(w - #s)
+			s = pf.seq({ s, { " ", w - #s } })
 		elseif spec:find("0", 1, true) and not prec then
 			local pre, rest = s:match("^([+%- ]?)(.*)$")
-			s = pre .. ("0"):rep(w - #s) .. rest
+			s = pf.seq({ pre, { "0", w - #s }, rest })
 		else
-			s = (" "):rep(w - #s) .. s
+			s = pf.seq({ { " ", w - #s }, s })
 		end
 	end
 	return s
@@ -3982,6 +4051,24 @@ end
 -- partly-numeric argument prints its numeric prefix, and is reported).
 -- (`full`: the spec string.format takes, nil when the width/precision is too wide)
 function pf.float(ps, tk, full, spec, width, prec, conv, arg)
+	local w = tonumber(width) or 0
+	if w >= pf.BIG then -- (a width snprintf can't produce, near INT_MAX: pad the bare text)
+		local r = pf.float(ps, tk, nil, (spec:gsub("[-0]", "")), "", prec, conv, arg)
+		if w <= #r then
+			return r
+		elseif spec:find("-", 1, true) then
+			return pf.seq({ r, { " ", w - #r } })
+		elseif spec:find("0", 1, true) and r:find("^[+%- ]?[%d.,]") or r:find("^[+%- ]?0[xX]") then
+			local pre, rest = r:match("^([+%- ]?0?[xX]?)(.*)$")
+			if not pre:find("[xX]") then
+				pre, rest = r:match("^([+%- ]?)(.*)$")
+			end
+			if spec:find("0", 1, true) then
+				return pf.seq({ pre, { "0", w - #r }, rest })
+			end
+		end
+		return pf.seq({ { " ", w - #r }, r })
+	end
 	local long = full or (spec .. width .. (prec and ("." .. prec) or ""))
 	local cfull = tk.grp and ("%'" .. long:sub(2)) or long
 	local posix = not tk.lmod and rt.cur_shell and rt.cur_shell.opt_posix
@@ -4027,6 +4114,7 @@ local function sh_printf(fmt, argv, start, nsets, fsh)
 	local out = {}
 	-- (the argument cursor, pf_next; the pending output; bytes written ahead of it; status)
 	local ps = { argv = argv, ai = start, out = out, fsh = fsh, flushed = 0, st = 0 }
+	pf.cur = ps -- (pf.seq: where a huge pad streams)
 	local nargs = #argv
 	repeat
 		local pass_start = ps.ai
@@ -4061,14 +4149,17 @@ local function sh_printf(fmt, argv, start, nsets, fsh)
 				local conv = tk.conv
 				if conv == "s" then
 					local a = pf_next(ps)
-					out[#out + 1] = (width == "" and not prec) and a or pf.str(spec, width, prec, a)
+					local pr_ = (width == "" and not prec) and a or pf.str(spec, width, prec, a) -- (a streamed pad empties `out` first)
+					out[#out + 1] = pr_
 				elseif conv == "d" or conv == "i" or conv == "u" or conv == "o" or conv == "x" or conv == "X" then
 					local v = pf.intarg(ps, pf_next(ps), conv ~= "d" and conv ~= "i")
 					conv = conv == "i" and "d" or conv
 					if tk.grp and (conv == "d" or conv == "u") then -- (%'d: LC_NUMERIC's grouping)
-						out[#out + 1] = pf.grouped(spec, width, prec, conv, v)
+						local pr_ = pf.grouped(spec, width, prec, conv, v) -- (a streamed pad empties `out` first)
+						out[#out + 1] = pr_
 					else
-						out[#out + 1] = full and string.format(full .. conv, v) or pf.bigint(spec, width, prec, conv, v)
+						local pr_ = full and string.format(full .. conv, v) or pf.bigint(spec, width, prec, conv, v) -- (a streamed pad empties `out` first)
+						out[#out + 1] = pr_
 					end
 				elseif tk.strftime then
 					-- the argument is getintmax'd; none at all is -1: now (-2: when the shell
@@ -4087,7 +4178,8 @@ local function sh_printf(fmt, argv, start, nsets, fsh)
 					if #sres >= 128 then
 						sres = ""
 					end
-					out[#out + 1] = pf.str(spec, width, prec, sres)
+					local pr_ = pf.str(spec, width, prec, sres) -- (a streamed pad empties `out` first)
+					out[#out + 1] = pr_
 				elseif conv == "f" or conv == "F" or conv == "e" or conv == "E" or conv == "g" or conv == "G"
 					or conv == "a" or conv == "A" then
 					-- (into a local first: a bad number's diagnostic flushes `out`, moving its end)
@@ -4106,7 +4198,8 @@ local function sh_printf(fmt, argv, start, nsets, fsh)
 					end
 				elseif conv == "c" then -- (a missing or empty argument is a NUL byte)
 					local c = pf_next(ps):sub(1, 1)
-					out[#out + 1] = pf.str(spec, width, nil, c == "" and "\0" or c)
+					local pr_ = pf.str(spec, width, nil, c == "" and "\0" or c) -- (a streamed pad empties `out` first)
+					out[#out + 1] = pr_
 				elseif conv == "b" then
 					local a = pf_next(ps)
 					if fsh and a:find("\\[xuU]") then -- (a diagnostic may come: complete lines first)
@@ -4114,18 +4207,21 @@ local function sh_printf(fmt, argv, start, nsets, fsh)
 					end
 					local bs, bstop = rt.ansi_unescape(a, "b")
 					-- (width AND precision apply to the expanded string, like %s)
-					out[#out + 1] = pf.str(spec, width, prec, bs)
+					local pr_ = pf.str(spec, width, prec, bs) -- (a streamed pad empties `out` first)
+					out[#out + 1] = pr_
 					if bstop then
 						return table.concat(out), ps.st
 					end
 				elseif conv == "q" then -- (the precision cuts the QUOTED text)
-					out[#out + 1] = pf.str(spec, width, prec, printf_q(pf_next(ps)))
+					local pr_ = pf.str(spec, width, prec, printf_q(pf_next(ps))) -- (a streamed pad empties `out` first)
+					out[#out + 1] = pr_
 				elseif conv == "Q" then -- (a literal precision cuts the raw text; the quoted is whole)
 					local a = pf_next(ps)
 					if prec and prec ~= "" and not tk.dynp then
 						a = a:sub(1, tonumber(prec))
 					end
-					out[#out + 1] = pf.str(spec, width, nil, printf_q(a))
+					local pr_ = pf.str(spec, width, nil, printf_q(a)) -- (a streamed pad empties `out` first)
+					out[#out + 1] = pr_
 				elseif conv == "" then -- the format ended inside a conversion (`%10`)
 					pf.diag(ps, "`" .. tk.miss .. "': missing format character")
 					return table.concat(out), 1
@@ -6405,6 +6501,7 @@ local function shallow_noexit(t)
 end
 local function finish(sh, ok, err)
 	if not ok then
+		err = rt.lua_overflow(sh, err)
 		if type(err) == "table" and err.__curse_noexittrap then
 			sh.traps = sh.traps and shallow_noexit(sh.traps) -- `exec cmd`: the process is gone
 		end

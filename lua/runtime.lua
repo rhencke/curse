@@ -3442,6 +3442,9 @@ function Shell:capture_inproc(backtick, runner, capfd, ctx)
 	self.cap_jobs, self.xsigint = {}, nil
 	cap_enter()
 	local ok, err = pcall(runner, self)
+	if not ok then
+		err = M.lua_overflow(self, err)
+	end
 	-- killed by SIGINT (itself, or the external it ended with): the shell then sends
 	-- itself SIGINT (subst.c command_substitute) — its trap runs, or it dies
 	local sigint = (ok and self.status == 130 and self.xsigint)
@@ -4574,6 +4577,20 @@ end
 -- subshell keeps errexit (unlike $()), writes to the live stdout, and its own applied
 -- redirects (`saves`) are restored here too. exit/return/div0 in the body become the
 -- subshell's status.
+-- LuaJIT's stack ran out (unbounded function or trap recursion: bash overflows its C
+-- stack — SIGSEGV — or nests without end; bash UB, not copied: docs/bash-ub.md). The shell
+-- running it — the script, or a subshell / $(…) / job running in-process — stops with this
+-- diagnostic, status 1, as a crashed child would stop alone. Any other error: itself.
+function M.lua_overflow(sh, err)
+	if type(err) ~= "string" or not err:find("stack overflow$") then
+		return err
+	end
+	local fl = sh.force_line
+	sh.force_line = 0 -- (no line: where the stack gave out differs by tier)
+	io.stderr:write("curse: stack overflow\n")
+	sh.force_line = fl
+	return { __curse_exit = 1 }
+end
 function Shell:subshell_run(runner, saves, paren, inplace)
 	local s1, s2, s3, s4, s5, s6, s7, s8 = subprog_enter(self)
 	local cp = sub_checkpoint(self)
@@ -4610,6 +4627,7 @@ function Shell:subshell_run(runner, saves, paren, inplace)
 	local status = self.status
 	local rethrow, killed
 	if not ok then
+		err = M.lua_overflow(self, err)
 		if type(err) == "table" and err.__curse_badusage and paren and not self.opt_e then
 			status = 2 -- (a failed ${x:=w} discards the `( )` child's line: EX_BADUSAGE; a $(…) says 1)
 		elseif type(err) == "table" and (err.__curse_exit or err.__curse_return) then
@@ -6125,11 +6143,24 @@ local function co_launch(ctx, self, stage_fns, inproc, base, lastpipe, upv)
 				if not (g.simple or g.pipe or sh.opt_m) then
 					M.iso_save_traps(sh)
 					sh.traps.SIGINT, ctx.igint = "", { [2] = true, [3] = true }
+					-- (listed as a hard-ignored signal only once initialize_terminating_signals
+					-- has seen it SIG_IGN — the first `trap` this process runs: b_trap)
+					sh.igint_soft = true
 				end
+			end
+			-- a simple command's builtin or function in a forked child of it (an async
+			-- `cmd &`, a pipeline stage) runs after set_sigint_handler: an async SIGINT
+			-- ignore no `trap` has latched is not hard-ignored there, so `trap` lists nothing
+			if ctx and sh.igint_soft and (g.bg and g.simple or not g.bg and t.scmd) then
+				M.iso_save_traps(sh)
+				sh.traps.SIGINT, sh.igint_soft = nil, nil
 			end
 			sh.badassign = nil
 			local ok, err = pcall(fn, sh)
 			if ctx then
+				if not ok then
+					err = M.lua_overflow(sh, err)
+				end
 				if not ok and type(err) == "table" and err.__curse_vsig == ctx then
 					err = { __curse_exit = 128 + err.sig }
 					g.killed = true
@@ -6199,6 +6230,7 @@ local function co_launch(ctx, self, stage_fns, inproc, base, lastpipe, upv)
 			t.sh = sh
 			g.tasks[i] = t
 			t.simple = kind == "sflat"
+			t.scmd = kind == "sflat" or kind == "simple" -- (a simple command: see stage_body)
 			add(t, stage_body(fn, sh, t))
 		end
 	end
@@ -8798,9 +8830,7 @@ end
 -- (leaving the var untouched) so the caller can report the error + status 1. A
 -- nil target (`typeset -n ref` converting an existing var) is NOT validated.
 function Shell:make_nameref(name, target, selfok)
-	local function valid(t)
-		return t:match("^[%a_][%w_]*$") or t:match("^[%a_][%w_]*%[.+%]$")
-	end
+	local valid = M.ref_target_ok
 	local ob = self.vars[name]
 	if target ~= nil and target ~= "" and not valid(target) and ob and ob.arr and not ob.ref then
 		return false -- (a bad target is reported before the array conflict: bash)
@@ -9501,8 +9531,15 @@ M.LOCALE_VARS = LOCALE_VARS
 -- A nameref with no (valid) target takes an assigned value AS its target, and bash rejects
 -- one that isn't a variable name — named by the assigning builtin, M.assign_ctx (bash's
 -- this_command_name: "declare", "printf", …; nil for a plain assignment).
+-- bash's valid_nameref_value: an identifier, or NAME[SUB] whose non-empty subscript runs to
+-- the last byte as skipsubscript reads it (valid_array_reference: `A["]` never closes)
 function M.ref_target_ok(s)
-	return s:match("^[%a_][%w_]*$") or s:match("^[%a_][%w_]*%[.+%]$")
+	if s:match("^[%a_][%w_]*$") then
+		return true
+	end
+	local p = s:match("^[%a_][%w_]*()%[")
+	local q = p and require("parser").subscript_close(s, p)
+	return q ~= nil and q == #s and q > p + 1
 end
 local ref_target_ok = M.ref_target_ok
 function M.bad_ref_target(v, ctx)
@@ -13785,7 +13822,43 @@ function M.arith_badkey(sh, name, key, how)
 	return wbad
 end
 
+-- pcall(fn, …) as a compiled `(( ))`'s read: its arithmetic errors say `((: ` (P.arith_cmd,
+-- as interp's own (( )) sets it) — the scalar read's rule (M.arith_read), for elements too
+function M.acmd_pcall(sh, fn, ...)
+	local P = require("parser")
+	if not sh.in_arithcmd or P.arith_cmd ~= nil then
+		return pcall(fn, ...)
+	end
+	P.arith_cmd = "(("
+	local ok, v = pcall(fn, ...)
+	P.arith_cmd = nil
+	return ok, v
+end
+-- An element's VALUE read by an arithmetic write (a[i]++, a[i] += e): arith_str — inside a
+-- compiled (( )) a bad value is that command's failure ($? 1, the message said; a prior
+-- fault in it: 0, nothing said), not an escape (M.arith_read's rule)
+function M.arith_elem_val(sh, s)
+	if not sh.in_arithcmd then
+		return M.arith_str(sh, s)
+	end
+	if sh.arithfault then
+		return i64(0)
+	end
+	local ok, v = M.acmd_pcall(sh, M.arith_str, sh, s)
+	if ok then
+		return v
+	end
+	require("parser").trap_flow(v)
+	if type(v) == "table" and (v.__curse_experr or v.__curse_matherr) and not v.__curse_subscript then
+		sh.arithfault = true
+		return i64(0)
+	end
+	error(v, 0)
+end
 function M.arith_read_elem(sh, name, raw, expanded)
+	if sh.arithfault and sh.in_arithcmd then -- (a prior read in THIS (( )) faulted: bash's
+		return i64(0) -- evaluation stopped there — nothing more is read or said)
+	end
 	local I = require("interp")._int
 	I.arith_nounset(sh, name) -- fatal if the base var is unset under set -u (outside the pcall)
 	if M.arith_badraw(sh, name, raw, "r") then
@@ -13795,9 +13868,13 @@ function M.arith_read_elem(sh, name, raw, expanded)
 	if M.arith_badkey(sh, name, key, "r") then
 		return i64(0)
 	end
-	local ok, v = pcall(I.arith_resolve, sh, sh:array_get(name, key))
+	local ok, v = M.acmd_pcall(sh, I.arith_resolve, sh, sh:array_get(name, key))
 	if ok then
 		return v
+	end
+	if sh.in_arithcmd and type(v) == "table" and (v.__curse_experr or v.__curse_matherr) and not v.__curse_subscript then
+		sh.arithfault = true -- (inside a compiled (( )): the command fails, $? 1 — as arith_read)
+		return i64(0)
 	end
 	if type(v) == "table" and (v.__curse_experr or v.__curse_matherr) and not v.__curse_lineabort then
 		error({ __curse_exit = v.__curse_exit or 1, __curse_lineabort = true, __curse_noee = v.__curse_matherr })
@@ -13822,8 +13899,11 @@ function M.arith_elem_write(sh, name, raw, expanded, read_first, compute)
 	if M.arith_badkey(sh, name, key, how) then -- (a bad element: 0 is read, nothing stored)
 		return compute(read_first and i64(0) or nil)
 	end
-	local old = read_first and M.arith_str(sh, sh:array_get(name, key) or "") or nil
+	local old = read_first and M.arith_elem_val(sh, sh:array_get(name, key) or "") or nil
 	local v = compute(old)
+	if sh.arithfault and sh.in_arithcmd then -- (a read faulted: bash stored nothing)
+		return i64(0)
+	end
 	sh:array_set(name, key, M.i64_to_str(v))
 	return v
 end
@@ -13836,7 +13916,10 @@ function M.arith_elem_incr(sh, name, raw, expanded, delta, is_post)
 	if not key or M.arith_badkey(sh, name, key, "rw") then -- (a bad element: 0 is read, nothing stored)
 		return is_post and i64(0) or i64(delta)
 	end
-	local old = M.arith_str(sh, sh:array_get(name, key) or "")
+	local old = M.arith_elem_val(sh, sh:array_get(name, key) or "")
+	if sh.arithfault and sh.in_arithcmd then -- (the value faulted: bash stored nothing)
+		return i64(0)
+	end
 	sh:array_set(name, key, M.i64_to_str(old + delta))
 	if is_post then
 		return old
@@ -14068,7 +14151,7 @@ function Shell:dash_flags()
 		{ "h", "opt_h" }, { "i", "opt_i" }, { "k", "opt_k" }, { "m", "opt_m" }, { "n", "opt_n" },
 		{ "p", "opt_p" }, { "r", "opt_r" }, { "t", "opt_t" }, { "u", "opt_u" }, { "v", "opt_v" },
 		{ "x", "opt_x" }, { "B", "opt_B" }, { "C", "opt_C" }, { "E", "opt_errtrace" } }) do
-		if on(fl[2]) then
+		if on(fl[2]) or (fl[1] == "i" and self.opt_forced_i) then -- (`set -oi`: forced_interactive)
 			t[#t + 1] = fl[1]
 		end
 	end
@@ -15042,8 +15125,12 @@ end
 
 -- A parse-time warning statement (heredoc delimited by EOF, …): shown before its line runs.
 function M.warn_stmt(sh, st)
-	sh.cur_line = st.line
+	-- (the warning's own line, whichever tier runs it: a compiled statement's pc line — the
+	-- line its command sits on — would otherwise name the line the parse ended on)
+	local fl = sh.force_line
+	sh.cur_line, sh.force_line = st.line, st.line
 	io.stderr:write("curse: " .. st.msg .. "\n")
+	sh.force_line = fl
 end
 -- A RECOVERABLE parse error (an invalid `NAME=( … )` array-literal element) is reported
 -- but NON-fatal: the assignment is dropped and the script continues (bash).
@@ -15084,8 +15171,7 @@ M.TRAP_TAGS = { ["trap"] = true, ["exit trap"] = true, ["debug trap"] = true, ["
 function M.parse_error_stmt(sh, st, label)
 	label = label or st.plabel
 	for _, w in ipairs(st.warns or {}) do
-		sh.cur_line = w.line
-		io.stderr:write("curse: " .. w.msg .. "\n")
+		M.warn_stmt(sh, w)
 	end
 	if st.recoverable then
 		local pl = sh.perr_label
@@ -15182,7 +15268,10 @@ function M.parse_error_stmt(sh, st, label)
 		sh.status = 1
 		error({ __curse_exit = sh.opt_c and 127 or 1, __curse_perrexit = true }) -- (past eval/source's containment)
 	end
-	error({ __curse_exit = (st.forceeof and sh.opt_c and not tl and not sh.in_perr_force) and 127 or st.status or 2,
+	-- (the reader's own input — script, stdin, -c — keeps a failed last command's status;
+	-- an eval'd or sourced text's parse returns 2)
+	local keep = st.keepst and not tl and (sh.sourcedepth or 0) == 0 and sh.status ~= 0 and sh.status
+	error({ __curse_exit = (st.forceeof and sh.opt_c and not tl and not sh.in_perr_force) and 127 or st.status or keep or 2,
 		__curse_parseerr = true, lead = st.lead })
 end
 -- bash's evalstring.c: an eval'd/sourced text's syntax error ends a posix shell only while
