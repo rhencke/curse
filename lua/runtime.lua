@@ -2189,10 +2189,12 @@ local function redir_open(sh, op, fd, target, saves, vname)
 end
 M.redir_open = redir_open
 function M.redir_apply(sh, op, fd, target, saves)
-	-- In a pipeline stage, builtins write the redirected fd 1 directly while it's moved (as
-	-- the interpreter does): the stage's buffer would reach it only at restore, too late
-	-- for a write error (`echo x >/dev/full | …`) to be seen and reported by the command.
-	if (fd == 1 or op == "outboth" or op == "appboth") and not saves.out_sh and CO_OUTS[sh.out] then
+	-- With fd 1 moved, builtins write the redirected fd 1 directly (as the interpreter's
+	-- sr_run_cmd does): a pipeline stage's buffer would reach it only at restore, too late
+	-- for a write error (`echo x >/dev/full | …`) to be seen and reported by the command;
+	-- a buffered `$(…)` capture's (no temp file for an fd-level one: capture_inproc) would
+	-- take what `echo hi >&2` wrote.
+	if (fd == 1 or op == "outboth" or op == "appboth") and not saves.out_sh and sh.out ~= io.write then
 		saves.out_sh, saves.out = sh, sh.out
 		sh.out = io.write
 	end
@@ -2208,8 +2210,9 @@ end
 -- them. Returns the applier's ok.
 function M.redir_apply_one(sh, r, saves, ctx) -- (ctx: the command, naming a {v} error)
 	local I = require("interp")._int
-	if not saves.out_sh and CO_OUTS[sh.out] and I.redirs_touch_stdout({ r }) then
-		saves.out_sh, saves.out = sh, sh.out -- (a pipeline stage: builtins write fd 1 directly)
+	if not saves.out_sh and sh.out ~= io.write and I.redirs_touch_stdout({ r }) then
+		saves.out_sh, saves.out = sh, sh.out -- (a pipeline stage, a buffered capture: builtins
+		-- write fd 1 directly — M.redir_apply)
 		sh.out = io.write
 	end
 	local sv, ok = I.apply_redirs(sh, { r }, nil, ctx)
@@ -2367,6 +2370,28 @@ function M.redir_noglob(sh, f, ...)
 	local ok, fs = pcall(f, ...)
 	sh.opt_f = false
 	return ok, fs
+end
+-- A pipeline stage's / async command's OWN redirections: bash applies them in that command's
+-- own process, not undoably (execute_in_subshell / execute_subshell_builtin_or_function),
+-- so a fd move there `N>&M-` onto an open N from a closed M says only `M: Bad file
+-- descriptor` — undoable (in the shell), add_undo_redirect's failed save of M says
+-- `redirection error: cannot duplicate fd` first. redir_moves: how many moves `redirs`
+-- has (0: nothing to mark); redir_top (both tiers, as the stage/job starts): the next that
+-- many moves apply_redirs makes in this shell are the command's own — `last`: the last
+-- stage, which a lastpipe shell runs itself (undoably).
+function M.redir_moves(redirs)
+	local n = 0
+	for _, r in ipairs(redirs or {}) do
+		if (r.op == "dup" or r.op == "dupin") and not r.fdvar and r.target ~= "-" and (r.target or ""):find("%-$") then
+			n = n + 1
+		end
+	end
+	return n
+end
+function M.redir_top(sh, n, last)
+	if not (last and sh.shopt.lastpipe and not sh.opt_i) then
+		sh.redir_noundo = n
+	end
 end
 -- THE policy (interp's apply_redirs and compiled code's rt.redir_ext both ask it): does bash
 -- run this command in a forked child (an external), where a fatal expansion error in its
@@ -2957,8 +2982,9 @@ function Shell:exec_t(args)
 			end
 			-- (an unset/empty PATH searches only the cwd: bash then tries the bare name
 			-- as a file, which is "No such file or directory")
-			self:errmsg("curse: " .. (self.exec_builtin and "exec: " or "") .. M.err_name(args[1])
-				.. (self.exec_builtin and ": not found\n" or self:get("PATH") == "" and ": No such file or directory\n"
+			local nofile = not self.exec_builtin and self:get("PATH") == "" -- (named as it is)
+			self:errmsg("curse: " .. (self.exec_builtin and "exec: " or "") .. (nofile and args[1] or M.err_name(args[1]))
+				.. (self.exec_builtin and ": not found\n" or nofile and ": No such file or directory\n"
 					or ": command not found\n"))
 			self.status = 127
 			return
@@ -8253,19 +8279,26 @@ end
 function M.spawn_errmsg(self, name, execpath, rc)
 	local pre = "curse: " .. (self.exec_builtin and "exec: " or "")
 	if rc == 2 and not self.exec_builtin and execpath then
-		local shown = tostring(name):find("/", 1, true) and M.err_name(tostring(name)) or execpath
+		-- (shell_execve's file_error / internal_error name the file as it is — only a
+		-- command NOT FOUND is quoted: printable_filename)
+		local shown = tostring(name):find("/", 1, true) and tostring(name) or execpath
 		if ffi.C.access(execpath, 0) == 0 then
 			return pre .. shown .. ": cannot execute: required file not found\n"
 		end
 		return pre .. shown .. ": No such file or directory\n"
 	end
+	if rc == 2 and self.exec_builtin and execpath and ffi.C.access(execpath, 0) == 0 then
+		-- (`exec FILE` whose interpreter is missing: shell_execve's own message, the path
+		-- exec found, no `exec: ` — exec_builtin reports nothing more for ENOENT)
+		return "curse: " .. execpath .. ": cannot execute: required file not found\n"
+	end
 	if rc == 13 and execpath and not self.exec_builtin and ffi.C.curse_rt_stat(execpath, stbuf_a) == 0
 		and bit.band(ffi.cast("uint32_t *", stbuf_a + 24)[0], 0xF000) == 0x4000 then
 		-- (shell_execve: EISDIR — its own _("%s: %s"), unlike file_error's)
-		return pre .. M.L("%s: %s", M.err_name(tostring(name)), M.Llibc("Is a directory")) .. "\n"
+		return pre .. M.L("%s: %s", tostring(name), M.Llibc("Is a directory")) .. "\n"
 	end
 	if rc ~= 2 and execpath and not self.exec_builtin then -- (shell_execve's file_error(command))
-		return pre .. M.err_name(execpath) .. ": Permission denied\n"
+		return pre .. execpath .. ": Permission denied\n"
 	end
 	return pre .. M.err_name(tostring(name)) .. (rc == 2 and (self.exec_builtin and ": not found\n" or ": command not found\n") or ": Permission denied\n")
 end
@@ -8583,6 +8616,16 @@ M.DYN_ASSIGN = { RANDOM = "random", SECONDS = "seconds", BASH_SUBSHELL = "subshe
 	BASH_COMMAND = "null", HISTCMD = "null", SRANDOM = "null", FUNCNAME = "null", LINENO = "null",
 	BASH_SOURCE = "null", BASH_LINENO = "null", BASH_ARGC = "null", BASH_ARGV = "null",
 	GROUPS = "null" }
+-- The scalar ones (the arrays — FUNCNAME, BASH_SOURCE, … — refuse a value: noassign).
+M.DYN_SCALAR = { RANDOM = true, SECONDS = true, BASH_SUBSHELL = true, BASH_ARGV0 = true,
+	EPOCHSECONDS = true, EPOCHREALTIME = true, BASHPID = true, BASH_COMMAND = true, HISTCMD = true,
+	SRANDOM = true, LINENO = true }
+-- Is dynamic variable `dn` still live: never unset, and not shadowed by an ordinary binding?
+function M.dyn_live(sh, dn)
+	local b = sh.vars[dn]
+	return (b == nil or b.dyn == true) and not (sh.unset_specials and sh.unset_specials[dn])
+		and not (dn == "RANDOM" and sh.random_plain)
+end
 do
 local legal_number = M.legal_number -- (bash: legal_number, else 0)
 -- Run `dn`'s assign hook with value `s` (b: its dyn box or nil). False when `dn` is no
@@ -8625,8 +8668,9 @@ function M.dyn_assign(sh, dn, s, b)
 		end
 		sh.sec_off, sh.start_time = i64(n), os.time()
 		sh.sec_cell = i64_to_str(sh.sec_off) -- (set_int_value: value_cell, what += appends to)
-	elseif k == "subshell" then -- (assign_subshell: subshell_environment's level)
-		local n = b and b.int and tonumber(M.int_value(sh, s)) or legal_number(s) or 0
+	elseif k == "subshell" then -- (assign_subshell: subshell_environment's level — legal_number'd,
+		-- an integer BASH_SUBSHELL too: `declare -i BASH_SUBSHELL; BASH_SUBSHELL=2+3` is 0)
+		local n = legal_number(s) or 0
 		sh.subsh_off = n - ((sh.subdepth or 0) + M.fork_depth)
 	elseif k == "argv0" then -- (assign_bash_argv0: sets $0; the variable itself stays)
 		sh.argv0 = s
@@ -13790,6 +13834,24 @@ function M.array_elem(sh, name, raw, expanded)
 	return sh:expand_param({ name = name, index = raw }, nil, nil, key)
 end
 
+-- A compiled module's deeply nested constant (emit's ser_flat): its tables as a list, each
+-- nested one a `{__r=N}` reference — linked up, the first returned.
+function M.unflat(list)
+	for _, t in ipairs(list) do
+		for k, v in pairs(t) do
+			if type(v) == "table" and v.__r then
+				t[k] = list[v.__r]
+			end
+		end
+	end
+	return list[1]
+end
+-- …and whether it is set (a compiled ${a[i]#PAT}: rt.pe_nopat)
+function M.array_elem_set(sh, name, raw, expanded)
+	local key = M.array_key(sh, name, raw, expanded)
+	M.elem_read_check(sh, name, key)
+	return sh:expand_param({ name = name, index = raw }, nil, nil, key), sh:is_elem_set(name, key)
+end
 -- An element's key for a compiled ${a[i]OP}: a negative subscript past the start says
 -- "bad array subscript" (the read then goes on), as interp's expand_pexp does.
 function M.array_key_rc(sh, name, raw, expanded)
@@ -13970,6 +14032,21 @@ end
 
 -- Apply a ${…} operator. `arg`/`arg2` are already word-expanded by the caller;
 -- `idxnum` is the evaluated numeric subscript when pe.index is an expression.
+-- bash's parameter_brace_expand looks at the value before it expands a strip / subst / case
+-- operator's pattern word (and the replacement): #/##/%/%% leave a NULL or empty value
+-- alone, the others (/ // ^ ^^ , ,, ~ ~~) only a NULL (unset) one — the pattern's
+-- expansions (a `$(…)`, `${v=…}`, an error) then never happen. v: the value (an array's
+-- elements joined); isset: whether it is set at all.
+function M.pe_nopat(op, v, isset)
+	if v ~= "" then
+		return false
+	end
+	return op:byte(1) == 35 or op:byte(1) == 37 or not isset -- (# %)
+end
+-- …an array's / $@'s elements: NULL with none, empty with one "" (joined by spaces)
+function M.pe_nopat_elems(op, e)
+	return #e == 0 or (#e == 1 and e[1] == "" and M.pe_nopat(op, "", true))
+end
 function Shell:expand_param(pe, arg, arg2, idxnum)
 	local name, op, index = pe.name, pe.op, pe.index
 	-- ${!a[@]} / ${!a[*]}: the list of set indices
@@ -14133,6 +14210,15 @@ function Shell:expand_param(pe, arg, arg2, idxnum)
 			error({ __curse_exit = self.opt_c and 127 or 1, __curse_lineabort = self.opt_i or nil })
 		end
 		return val
+	end
+	if type(arg) == "function" then -- (a strip/subst/case pattern, lazy: M.pe_nopat)
+		if M.pe_nopat(op, val, isset) then
+			return val
+		end
+		arg = arg()
+		if type(arg2) == "function" then
+			arg2 = arg2()
+		end
 	end
 	arg = arg or ""
 	if op == "@" then -- ${x@OP} transforms
@@ -15784,12 +15870,15 @@ end
 -- A [[ ]] arithmetic operand as WRITTEN (unquoted, not renderable by emit): interp's textual
 -- path — arith_expand_text (like $((…)): no process substitution) then dbracket_arith —
 -- with db_arith's error rule (an arith error makes this primary false).
-function M.db_arith_text(sh, src)
+function M.db_arith_text(sh, src, expanded)
 	if sh.db_err then
 		return i64(0)
 	end
 	local I = require("interp")
-	local ok, v = pcall(I._int.arith_expand_text, sh, src)
+	local ok, v = true, expanded
+	if not expanded then
+		ok, v = pcall(I._int.arith_expand_text, sh, src)
+	end
 	if ok then
 		ok, v = pcall(I.dbracket_arith, sh, v, true)
 	end
@@ -15801,6 +15890,15 @@ function M.db_arith_text(sh, src)
 		return i64(0)
 	end
 	error(v, 0)
+end
+-- …its $((…))-style expansion (interp's arith_expand_text: a traced operand's value)
+function M.arith_text(sh, src)
+	return require("interp")._int.arith_expand_text(sh, src)
+end
+-- …an operand whose subscripts the parser quoted (parser.cond_arith_word: `[[:a:]]` read as
+-- `[\[:a:\]]`), its word value `v` read the same way
+function M.db_arith_quoted(sh, v)
+	return M.db_arith_text(sh, nil, v)
 end
 function M.db_arith(sh, s)
 	if sh.db_err then
@@ -16692,8 +16790,10 @@ function M.assign_scalar(sh, name, value, stmt)
 	end
 	if b and b.arr then
 		sh:array_set(name, sh:is_assoc(name) and "0" or 0, value, false) -- a=x on an array -> a[0]
-	elseif b and b.int and not b.ref then
-		sh:aset(name, M.int_value(sh, value)) -- declare -i: RHS is arithmetic
+	elseif b and b.int and not b.ref and not (b.dyn and M.dyn_live(sh, sh:deref(name))) then
+		-- declare -i: RHS is arithmetic (a live dynamic variable's assign function takes the
+		-- value as written: bind_variable — SECONDS/RANDOM evaluate it themselves)
+		sh:aset(name, M.int_value(sh, value))
 	elseif b and (b.lower or b.upper) then
 		sh:set_str(name, b.lower and value:lower() or value:upper())
 	elseif sh:set_str(name, value) == false then -- (a valueless nameref given a bad target)
@@ -17087,7 +17187,7 @@ do
 			end
 		elseif b and b.arr then
 			sh:array_set(name, sh:is_assoc(name) and "0" or 0, value, false)
-		elseif b and b.int and not b.ref then
+		elseif b and b.int and not b.ref and not (b.dyn and M.dyn_live(sh, sh:deref(name))) then
 			sh:aset(name, M.int_value(sh, value))
 		elseif b and (b.lower or b.upper) then
 			sh:set_str(name, b.lower and value:lower() or value:upper())
@@ -17214,7 +17314,9 @@ do
 		for k = 2, #argv do
 			glob = glob or argv[k]:match("^%-%a*[gG]") ~= nil
 		end
-		local localize = dcl == "local" or ((dcl == "declare" or dcl == "typeset") and (sh.calldepth or 0) > 0 and not glob)
+		-- (`local` outside a function makes no local — its builtin then says so — so a readonly
+		-- target is the plain assignment's error, fatal to the line as `UID=(x)` is: bash)
+		local localize = (sh.calldepth or 0) > 0 and (dcl == "local" or ((dcl == "declare" or dcl == "typeset") and not glob))
 		for _, aa in ipairs(aas) do
 			argv[#argv + 1] = aa.name
 			local b = sh.vars[sh:deref(aa.name)]
@@ -17229,16 +17331,27 @@ do
 			end
 		end
 		sh.arrayargs_pending = {}
-		local wantassoc = false
+		local wantassoc, inherit = false, sh.shopt.localvar_inherit
 		for k = 2, #argv do
 			if argv[k]:match("^%-%a*A") then
 				wantassoc = true
 			end
+			if argv[k]:match("^%-%a*I") then
+				inherit = true
+			end
 		end
 		sh.arrayargs_pre = {}
+		local own = localize and sh.savedstack[sh.pd]
 		for _, aa in ipairs(aas) do
 			sh.arrayargs_pending[aa.name] = true
-			sh.arrayargs_pre[aa] = I.arrayassign_items(sh, aa, wantassoc or sh:is_assoc(sh:deref(aa.name)), wantassoc)
+			-- (the literal is for the variable the builtin leaves: a NEW local — not yet one of
+			-- this function's, nor copying the outer one's attributes (-I) — is an indexed
+			-- array unless -A, whatever an outer associative one of that name is)
+			local isassoc = wantassoc
+			if not isassoc and (not localize or inherit or (own and own[aa.name] ~= nil)) then
+				isassoc = sh:is_assoc(sh:deref(aa.name))
+			end
+			sh.arrayargs_pre[aa] = I.arrayassign_items(sh, aa, isassoc, wantassoc)
 			if sh.opt_x then -- (`+ b=('4' '5 6')` as it expands: before a prefix assignment's
 				M.xtrace_arrlit(sh, aa.name, sh.arrayargs_pre[aa]) -- trace, and `+ declare -a b`)
 			end
@@ -17642,7 +17755,9 @@ function M.assign_body_full(sh, st, nref_base, nref_sub)
 		local b = sh.vars[sh:deref(st.name)]
 		if b and b.arr then -- plain `name=value` on an array var writes element 0 (bash)
 			sh:array_set(st.name, II.array_key(sh, st.name, "0"), assign_rhs_a(sh, st), false)
-		elseif b and b.int and not b.ref then -- integer var (declare -i): assign arith-evaluates
+		elseif b and b.int and not b.ref and not (b.dyn and M.dyn_live(sh, sh:deref(st.name))) then
+			-- integer var (declare -i): assign arith-evaluates (not a live dynamic one's: its
+			-- assign function takes the text — assign_scalar)
 			sh:aset(st.name, M.int_value(sh, assign_rhs_w(sh, st), IX.arith_eval_str))
 		elseif b and (b.lower or b.upper) then -- declare -l/-u: case-fold on assign
 			local v = assign_rhs_a(sh, st)

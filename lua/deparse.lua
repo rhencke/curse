@@ -49,6 +49,9 @@ local function norm_word(s)
 			indq = not indq
 			out[#out + 1] = c
 			i = i + 1
+		elseif c == "$" and s:sub(i + 1, i + 1) == "$" then -- `$$` (read_token_word: one token —
+			out[#out + 1] = "$$" -- `$$'x'` is $$ then 'x', never $'…')
+			i = i + 2
 		elseif c == "$" and s:sub(i + 1, i + 1) == "'" and not indq then
 			local j = P.quote_end(s, i + 1, true)
 			out[#out + 1] = sq(rt.ansi_unescape(s:sub(i + 2, j - 2), true))
@@ -118,7 +121,9 @@ conv_list = function(stmts)
 		if c then
 			if acc then
 				acc = { k = "conn", first = acc, second = c,
-					op = bg and "&" or (comsub_nl and st.lgstart and not semi and "\n") or ";" }
+					-- (a $(…) body's lists, nested ones too, keep their newline connectors:
+					-- parse.y's list1 '\n' under PST_CMDSUBST)
+					op = bg and "&" or (comsub_nl and not semi and "\n") or ";" }
 			else
 				acc = c
 			end
@@ -728,5 +733,6 @@ deparse_list = function(src)
 	return nil
 end
 
+M.comsub = deparse_list -- (parser.comsub_text: the text a $(…) runs)
 M.norm_word = norm_word -- (a compound-literal word in an error: rt.compound_word_src)
 return M

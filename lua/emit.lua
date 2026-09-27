@@ -465,8 +465,63 @@ end
 -- helper (rt.parse_error_stmt, rt.redir_apply_one, rt.assign_elem, …). No cycles/functions.
 -- (a loop's source span and its run-time tiering state: never part of the program)
 local SER_SKIP = { _srcs = true, _s0 = true, _s1 = true, _h1 = true, _frag = true, _hits = true, _fid = true,
-	lgspan = true }
-local function ser(v)
+	lgspan = true, _depth = true }
+local ser
+-- A table nested deeper than SER_NEST (a long arith chain's left-deep tree, a word of many
+-- parts): one table constructor per level would pass LuaJIT's 200 syntax levels, so it
+-- serializes flat — its tables in a list, each nested one a `{__r=N}` reference to its
+-- entry — rebuilt when the module loads (rt.unflat).
+local SER_NEST = 40
+local function tbl_nest(v, d)
+	if d > SER_NEST then
+		return d
+	end
+	local m = d
+	for k, val in pairs(v) do
+		if type(val) == "table" and not SER_SKIP[k] then
+			local x = tbl_nest(val, d + 1)
+			if x > m then
+				m = x
+			end
+		end
+	end
+	return m
+end
+local function ser_flat(v)
+	local ids, list = {}, {}
+	local function reg(t)
+		if ids[t] then
+			return
+		end
+		list[#list + 1] = t
+		ids[t] = #list
+		for k, val in spairs(t) do
+			if type(val) == "table" and not SER_SKIP[k] then
+				reg(val)
+			end
+		end
+	end
+	reg(v)
+	local out = {}
+	for i, t in ipairs(list) do
+		local parts = {}
+		local function one(val)
+			return type(val) == "table" and ("{__r=%d}"):format(ids[val]) or ser(val)
+		end
+		local n = #t
+		for j = 1, n do
+			parts[#parts + 1] = one(t[j])
+		end
+		for k, val in spairs(t) do
+			if (type(k) ~= "number" or k < 1 or k > n or k ~= math.floor(k)) and not SER_SKIP[k] then
+				parts[#parts + 1] = ("[%s]=%s"):format(ser(k), one(val))
+			end
+		end
+		out[i] = "{" .. table.concat(parts, ",") .. "}"
+	end
+	return "rt.unflat({" .. table.concat(out, ",\n") .. "})"
+end
+function ser(v, nested)
 	local t = type(v)
 	if t == "string" then
 		return ("%q"):format(v)
@@ -480,13 +535,16 @@ local function ser(v)
 	if t ~= "table" then
 		return "nil"
 	end
+	if not nested and tbl_nest(v, 1) > SER_NEST then
+		return ser_flat(v)
+	end
 	local parts, n = {}, #v
 	for i = 1, n do
-		parts[#parts + 1] = ser(v[i])
+		parts[#parts + 1] = ser(v[i], true)
 	end
 	for k, val in spairs(v) do
 		if (type(k) ~= "number" or k < 1 or k > n or k ~= math.floor(k)) and not SER_SKIP[k] then
-			parts[#parts + 1] = ("[%s]=%s"):format(ser(k), ser(val))
+			parts[#parts + 1] = ("[%s]=%s"):format(ser(k, true), ser(val, true))
 		end
 	end
 	return "{" .. table.concat(parts, ",") .. "}"
@@ -609,11 +667,28 @@ local function arith_elem_ok(e)
 	end
 	return true
 end
+-- An arith tree too deep for emit_value's nested Lua expression (each level a parenthesized
+-- operation or a call: past LuaJIT's 200 syntax levels the chunk fails to load) is not
+-- rendered natively; its word / statement takes the shared evaluator, as a non-renderable
+-- node's does. (Depth memoized on the node: the predicates below recurse through it.)
+local ARITH_MAXDEPTH = 48
+local function arith_depth(e)
+	if type(e) ~= "table" then
+		return 0
+	end
+	local d = e._depth
+	if d == nil then
+		d = 1 + math.max(arith_depth(e.e), arith_depth(e.l), arith_depth(e.r), arith_depth(e.c),
+			arith_depth(e.a), arith_depth(e.b))
+		e._depth = d
+	end
+	return d
+end
 local function arith_side_effect(e)
 	if type(e) ~= "table" then
 		return false
 	end
-	if e.k == "asgn" or e.k == "post" or e.k == "pre" then
+	if e.k == "asgn" or e.k == "post" or e.k == "pre" or arith_depth(e) > ARITH_MAXDEPTH then
 		return true
 	end
 	-- xpandleaf (${…}), comma, and a NON-compilable array subscript aren't compiled natively —
@@ -623,7 +698,16 @@ local function arith_side_effect(e)
 		return true
 	end
 	if e.k == "xpand" then
-		return not xpand_fast(e.raw)
+		if not xpand_fast(e.raw) then
+			return true
+		end
+		-- (a fast one renders as a VALUE: its native tree must not assign — `P=${#x}`,
+		-- `a[$k]=7`, `$x++` — as not_compilable says too)
+		local ok, nat = pcall(require("parser").arith, xpand_lens(e.raw), true)
+		if not ok then
+			require("parser").trap_flow(nat)
+		end
+		return not ok or arith_side_effect(nat)
 	end
 	-- comma falls through: a pure `(a, b)` is side-effect-free (recurse into l/r); a
 	-- side-effecting operand is detected by the recursion below.
@@ -645,7 +729,9 @@ local function not_compilable(e)
 	-- renders it (prints bash's "syntax error in expression" + aborts the line), so the
 	-- enclosing loop/statement must delegate — else emit_value throws an uncaught error.
 	-- rpow: a short-circuited operand holding `**` still checks its exponent (interp's noeval_pow)
-	if e.k == "xpandleaf" or e.k == "arith_perr" or e.rpow or (e.idxraw and not arith_elem_ok(e)) then
+	if e.k == "xpandleaf" or e.k == "arith_perr" or e.rpow or (e.idxraw and not arith_elem_ok(e))
+		or arith_depth(e) > ARITH_MAXDEPTH
+	then
 		return true
 	end -- comma recurses (emit_value / emit_arith_into render the sequence)
 	if e.k == "xpand" then
@@ -688,7 +774,7 @@ end
 -- word path (emitable_word via not_compilable), used to vet the OPERANDS of a side-effecting
 -- word arith so nothing nested reaches emit_value's unsupported asgn/post/pre/comma cases.
 local function arith_val_r(e)
-	if type(e) ~= "table" then
+	if type(e) ~= "table" or arith_depth(e) > ARITH_MAXDEPTH then
 		return false
 	end
 	local k = e.k
@@ -1501,6 +1587,16 @@ local function inl_sync(cmd, call, cx)
 	local pre, _, post = lsync(rl)
 	return pre .. call .. post
 end
+-- A pipeline stage's / async job's fragment `id` whose command `st` has fd moves of its own:
+-- wrapped (once, at load) to mark them as the new process's own (rt.redir_top). last: the
+-- pipeline's last stage (a lastpipe shell runs it itself).
+local function frag_redir_top(id, st, last)
+	local nmv = require("runtime").redir_moves(st.redirs)
+	if nmv > 0 then
+		emit_frags[#emit_frags + 1] = ("do local __f = __CS[%d]; __CS[%d] = function(sh, ...) rt.redir_top(sh, %d%s); return __f(sh, ...) end end")
+			:format(id, id, nmv, last and ", true" or "")
+	end
+end
 local function emit_fragment(stmts, neg, liftset, cfraise)
 	local saved_neg, saved_line = emit_neg_ctx, EF.cur_line
 	-- `cfraise` ({loop=, func=}): the fragment is the BODY of a compound run in the current
@@ -1880,6 +1976,23 @@ local function emit_part(p, i, lifted, w, tilde)
 	end
 end
 
+-- Lua expressions joined with `..`, as ONE expression whose syntax nesting stays shallow
+-- however many there are: a `a .. b .. c …` chain is right-associative, so LuaJIT's parser
+-- recurses once per operator (LJ_MAX_XLEVEL 200: "chunk has too many syntax levels" — a
+-- word of a few hundred parts). Runs of at most CAT_RUN, parenthesized, are joined the
+-- same way in turn: the depth grows with log(n).
+local CAT_RUN = 32
+local function cat_exprs(list)
+	if #list <= CAT_RUN then
+		return table.concat(list, " .. ")
+	end
+	local runs = {}
+	for i = 1, #list, CAT_RUN do
+		runs[#runs + 1] = "(" .. table.concat(list, " .. ", i, math.min(i + CAT_RUN - 1, #list)) .. ")"
+	end
+	return cat_exprs(runs)
+end
+EF.cat_exprs = cat_exprs
 emit_word = function(w, lifted)
 	local parts = {}
 	for i, p in ipairs(w.parts) do
@@ -1888,7 +2001,7 @@ emit_word = function(w, lifted)
 	if #parts == 0 then
 		return '""'
 	end
-	return "(" .. table.concat(parts, " .. ") .. ")"
+	return "(" .. cat_exprs(parts) .. ")"
 end
 
 -- An array element's value in ASSIGNMENT context (`a=([k]=$v)`, an assoc's bare word):
@@ -1947,7 +2060,7 @@ function EF.tilde_value(w, lifted, word)
 			out[i] = "(" .. emit_word({ parts = { pp } }, lifted) .. ")"
 		end
 	end
-	return table.concat(out, " .. ")
+	return EF.cat_exprs(out)
 end
 -- set -x of an arithmetic text ((( )), a for (( )) slot): `+ (( text ))`, the text
 -- expanded like a "…" string first when it holds a $ or ` (bash)
@@ -2002,6 +2115,11 @@ local function und(st, lifted)
 			-- (likewise a subscript with a side effect: ${d[c++]}, ${d[$((c++))]})
 			local ix = p.pexp and p.pexp.index
 			if ix and (ix:find("[$`]") or ix:find("++", 1, true) or ix:find("--", 1, true) or ix:find("=", 1, true)) then
+				return ""
+			end
+			-- (or an operator's word with one: `"${x:-$(cmd)}"`, `"${A#$(cmd)}"`)
+			local aw = p.pexp and ((p.pexp.arg or "") .. " " .. (p.pexp.arg2 or ""))
+			if aw and (aw:find("$(", 1, true) or aw:find("`", 1, true) or aw:find("$[", 1, true)) then
 				return ""
 			end
 		end
@@ -2080,6 +2198,7 @@ local function db_operand(w, lifted)
 	return db_fallback(w, lifted, "rt.db_word")
 end
 local emit_dbracket_node -- (the set -x layer over this, below)
+local db_textsub -- (forward: an arith operand read the textual way, below)
 local function emit_dbracket_node0(node, lifted)
 	local k = node.kind
 	if k == "and" or k == "or" then
@@ -2130,13 +2249,18 @@ local function emit_dbracket_node0(node, lifted)
 		return ("rt.file_test(%q, %s)"):format(op, val)
 	elseif k == "binary" then
 		local op = node.op
-		if ARITH_CMP[op] and not (db_word_ok(node.l) and db_word_ok(node.r)) then
+		local textsub = db_textsub
+		if ARITH_CMP[op] and not (db_word_ok(node.l) and db_word_ok(node.r) and not textsub(node.l) and not textsub(node.r)) then
 			-- an operand emit can't render: bash 5.2 expands an arithmetic operator's operand
 			-- like $((…)) text (no process substitution, subscripts kept) unless it's quoted —
 			-- interp's arith_expand_text + dbracket_arith (rt.db_arith_text); a quoted one is a
 			-- plain word value (rt.db_word) read as arithmetic
 			local function side(w)
-				if db_word_ok(w) then
+				if w.xsub then -- (static text, its subscripts quoted: read as the textual path's)
+					local v = db_word_ok(w) and emit_word(w, lifted) or db_fallback(w, lifted, "rt.db_word")
+					return v and ("rt.db_arith_quoted(sh, %s)"):format(v)
+				end
+				if db_word_ok(w) and not textsub(w) then
 					return ("rt.db_arith(sh, %s)"):format(emit_word(w, lifted))
 				end
 				if w.src and not w.src:find("['\"\\]") then
@@ -2226,6 +2350,12 @@ local function emit_dbracket_node0(node, lifted)
 	return nil
 end
 
+-- An arithmetic operand of [[ ]] read the textual way (interp's): an unquoted one with a `[`
+-- — its subscripts as bash's Q_ARITH expansion reads them (arith_expand_text) — or one whose
+-- subscripts' text the parser quoted (xsub: parser.cond_arith_word)
+db_textsub = function(w)
+	return w.xsub or (w.src and w.src:find("[", 1, true) and not w.src:find("['\"\\]")) or false
+end
 -- set -x: each primary traces as it is evaluated, operands expanded (`+ [[ -n x ]]`, a
 -- negated one `+ [[ ! -f y ]]` — not a parenthesized one): rt.xdb1 traces and hands back
 -- the operand; rt.xdb2 traces and parks both operands in rt._xl/_xr for the comparison
@@ -2273,6 +2403,18 @@ emit_dbracket_node = function(node, lifted, xn)
 		if node.op == "=~" then -- (traced as its regex text: quoted ERE metachars backslashed)
 			r = EF.emit_regex_glob(node.r, lifted) or r
 			return plain({ l = raw(("rt.xdb1(sh, %s, nil, %s, %s)"):format(neg, l, r)) })
+		end
+		if ARITH_CMP[node.op] and (db_textsub(node.l) or db_textsub(node.r)) then
+			-- (a textual operand traces as its $((…))-style expansion, compared as such:
+			-- rt.db_arith_quoted — interp's dbracket_arith of arith_expand_text's output)
+			local function tv(w)
+				return (db_textsub(w) and not w.xsub) and ("rt.arith_text(sh, %q)"):format(w.src) or val(w)
+			end
+			local function cmpv(w, x)
+				return db_textsub(w) and ("rt.db_arith_quoted(sh, %s)"):format(x) or ("rt.db_arith(sh, %s)"):format(x)
+			end
+			return ("(rt.xdb2(sh, %s, %q, %s, %s, nil) and rt.db_ok(sh, %s %s %s))"):format(neg, node.op,
+				tv(node.l), tv(node.r), cmpv(node.l, "rt._xl"), ARITH_CMP[node.op], cmpv(node.r, "rt._xr"))
 		end
 		local n2 = { l = raw("rt._xl") }
 		local pop, xq = node.op == "==" or node.op == "=" or node.op == "!=", "nil"
@@ -2585,6 +2727,11 @@ local function substr_native(txt, lifted)
 		return nil
 	end
 	local code = EF.with(EF.AREAD, emit_value, ast, lifted) -- (set -u: an unset name in ${s:u} is unbound)
+	if code:find("rt.arith_read(", 1, true) then
+		-- (a variable's value is evaluated as an expression and may fail: its error is labelled
+		-- with the parameter — `v: x+: syntax error…` — which rt.substr_arith does)
+		return nil
+	end
 	return ("tonumber(%s)"):format(code)
 end
 function pexp_scalar(pe, lifted)
@@ -2609,6 +2756,12 @@ function pexp_scalar(pe, lifted)
 		val = ("rt.array_elem(sh, %s, %q, %s)"):format(ename, pe.index, expanded)
 		if pe.op == nil then
 			return val
+		end
+		if PEXP_STROP[pe.op] and not pat_verbatim_ok(pe.arg) then
+			-- (an expanding pattern: only when the element takes one — rt.pe_nopat; its
+			-- set-ness with its value, the subscript evaluated once)
+			return ("(function() local __v, __s = rt.array_elem_set(sh, %s, %q, %s); if rt.pe_nopat(%q, __v, __s) then return __v end; return sh:apply_str_op(%q, __v, %s, %q) end)()")
+				:format(ename, pe.index, expanded, pe.op, pe.op, emit_pattern_glob(pe.arg or "", lifted), pe.arg2 or "")
 		end
 		if PEXP_DEFAULT[pe.op] then
 			-- ${a[i]:-d} / := / ? …: defer to Shell:expand_param with the resolved key and a LAZY
@@ -2733,12 +2886,18 @@ function pexp_scalar(pe, lifted)
 	-- globs it); a dynamic/quoted pattern is rendered mask-aware via emit_pattern_glob to the
 	-- expanded glob string. Replacement (arg2) is literal (pexp_compilable gated it).
 	if not pat_verbatim_ok(pe.arg) then
-		return ("sh:apply_str_op(%q, %s, %s, %q)"):format(
-			pe.op,
-			val,
-			emit_pattern_glob(pe.arg or "", lifted),
-			pe.arg2 or ""
-		)
+		if lifted[pe.name] then -- (a native integer's value: never null, always takes it)
+			return ("sh:apply_str_op(%q, %s, %s, %q)"):format(
+				pe.op,
+				val,
+				emit_pattern_glob(pe.arg or "", lifted),
+				pe.arg2 or ""
+			)
+		end
+		-- an expanding pattern: only when the value takes one (rt.pe_nopat — bash looks at the
+		-- value first: `${A#$(cmd)}` runs no cmd with A null)
+		return ('(function() local __v = %s; if __v == "" and rt.pe_nopat(%q, __v, rt.var_has_value(sh, %q)) then return __v end; return sh:apply_str_op(%q, __v, %s, %q) end)()')
+			:format(val, pe.op, pe.name, pe.op, emit_pattern_glob(pe.arg or "", lifted), pe.arg2 or "")
 	end
 	return ("sh:apply_str_op(%q, %s, %q, %q)"):format(pe.op, val, pe.arg or "", pe.arg2 or "")
 end
@@ -2912,10 +3071,14 @@ local function emit_seg(p, i, lifted, w)
 			-- a STROP pattern with a quoted/backslash metachar renders mask-aware (emit_pattern_glob),
 			-- exactly like the scalar strop; a verbatim-safe pattern (and every @-transform letter)
 			-- passes through literally.
-			local pg = (PEXP_STROP[pe.op] and not pat_verbatim_ok(pe.arg))
-					and emit_pattern_glob(pe.arg or "", lifted)
-				or ("%q"):format(pe.arg or "")
-			elems = ("rt.array_op_values(sh, %s, %q, %s, %q)"):format(elems, pe.op, pg, pe.arg2 or "")
+			local dyn = PEXP_STROP[pe.op] and not pat_verbatim_ok(pe.arg)
+			local pg = dyn and emit_pattern_glob(pe.arg or "", lifted) or ("%q"):format(pe.arg or "")
+			if dyn then -- (an expanding pattern: only when the value takes one — rt.pe_nopat_elems)
+				elems = ("(function() local __e = %s; if rt.pe_nopat_elems(%q, __e) then return __e end; return rt.array_op_values(sh, __e, %q, %s, %q) end)()")
+					:format(elems, pe.op, pe.op, pg, pe.arg2 or "")
+			else
+				elems = ("rt.array_op_values(sh, %s, %q, %s, %q)"):format(elems, pe.op, pg, pe.arg2 or "")
+			end
 		end
 		local h = tostring(pe.index == "@" or (pe.op ~= "indices" and (pe.name == "@" or (pe.index == "*" and not p.q))))
 		if hdyn then
@@ -3155,7 +3318,7 @@ local function emit_pattern_glob_word(w, lifted, xall)
 	if #out == 0 then
 		return '""'
 	end
-	return table.concat(out, " .. ")
+	return EF.cat_exprs(out)
 end
 emit_pattern_glob = function(pat, lifted)
 	local ok, w = pcall(require("parser").parse_word, pat)
@@ -3220,7 +3383,7 @@ EF.emit_regex_glob = function(w, lifted)
 	if #out == 0 then
 		return '""'
 	end
-	return table.concat(out, " .. ")
+	return EF.cat_exprs(out)
 end
 -- An `a=(…)` array literal is always compiled (H.arrayassign): each BARE element's word
 -- field-split natively (word_safe/field_word/seg_native) or by the shared one-word expander,
@@ -3470,7 +3633,7 @@ end
 -- Arith usable in a VALUE position (what emit_value renders): pure, no side effect,
 -- no array subscript / embedded $-expansion / dynamic-special var.
 local function arith_value_ok(e)
-	if type(e) ~= "table" then
+	if type(e) ~= "table" or arith_depth(e) > ARITH_MAXDEPTH then -- (too deep to render)
 		return false
 	end
 	local k = e.k
@@ -3505,7 +3668,7 @@ end
 -- side effect nested in an operand, an array subscript, or a dynamic special var
 -- ($LINENO/$_/…) is not ok (the emitter renders none of those).
 local function arith_stmt_ok(e)
-	if type(e) ~= "table" then
+	if type(e) ~= "table" or arith_depth(e) > ARITH_MAXDEPTH then -- (too deep to render)
 		return false
 	end
 	local k = e.k
@@ -3711,7 +3874,9 @@ local function cond_arith(c)
 		return c
 	end -- an arith node already (forc init/cond/step)
 	if #c == 1 and c[1] and c[1].t == "arithcmd" then
-		return c[1].expr
+		-- (not one whose text is no expression — `((0 0))`: the matherr node only reports
+		-- its error when run, so it stays the command it is — H.arithcmd — as a condition)
+		return c[1].expr.k ~= "matherr" and c[1].expr or nil
 	end
 	return nil
 end
@@ -6696,7 +6861,8 @@ H.whilec = function(cx, st, after)
 		local exitp = cx.newpc()
 		cx.blocks[exitp] = ("sh.status = %s; pc = %d"):format(lv, after)
 		local bodysave = cx.newpc()
-		local bodyentry = cx.loop_list(st.body, bodysave, after, condp)
+		-- (continue re-tests through bodysave: its status 0 is the last body command's)
+		local bodyentry = cx.loop_list(st.body, bodysave, after, bodysave)
 		cx.blocks[bodysave] = ("%s = sh.status; pc = %d"):format(lv, condp)
 		local cst = type(st.cond) == "table" and st.cond[1] or nil
 		local stexpr
@@ -6737,7 +6903,9 @@ H.whilec = function(cx, st, after)
 	local exitp = cx.newpc()
 	cx.blocks[exitp] = ("sh.status = %s; pc = %d"):format(lv, after)
 	local bodysave = cx.newpc()
-	local bodyentry = cx.loop_list(st.body, bodysave, after, prep) -- break exits (status 0), continue re-tests
+	-- break exits (status 0); continue re-tests through bodysave — its 0 is then the last
+	-- body command's status, should the re-test end the loop (bash)
+	local bodyentry = cx.loop_list(st.body, bodysave, after, bodysave)
 	cx.blocks[bodysave] = ("%s = sh.status; pc = %d"):format(lv, prep)
 	-- a break/continue in the CONDITION acts on this loop too (bash): break ends it (the
 	-- status is break's 0), continue re-tests — each leaving the condition's noerr first
@@ -7141,6 +7309,9 @@ H.pipeline = function(cx, st, after)
 		if not id then
 			return cx.refuse(st, after)
 		end
+		if n > 1 then
+			frag_redir_top(id, st.cmds[i], i == n)
+		end
 		frags[i] = "__CS[" .. id .. "]"
 	end
 	-- (a reload of the run-local lifted vars only: stages keep those in sh (a lastpipe
@@ -7246,6 +7417,7 @@ H.background = function(cx, st, after)
 	if not id then
 		return cx.refuse(st, after)
 	end
+	frag_redir_top(id, st.cmd)
 	local c1 = st.cmd -- best-effort command text for the job table
 	while c1 and c1.t == "pipeline" and c1.cmds do
 		c1 = c1.cmds[1]
@@ -7724,6 +7896,12 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
 			if d ~= "" then
 				prelude = d .. (prelude or "")
 			end
+		end
+		if prelude then -- (joined with `; ` below: its own trailing `;` would make an empty
+			prelude = prelude:gsub("[;%s]+$", "") -- statement, a syntax error in Lua 5.1 —
+			prelude = prelude ~= "" and prelude or nil -- a DEBUG hook's dbg() ends with one)
+		end
+		if st.t == "simple" then
 			if EF.pipestatus and (callee == "rt.eval_u" or callee == "rt.source_u") then -- (a simple
 				-- command: PIPESTATUS=($?) after it — an eval'd pipeline's statuses don't survive
 				-- the eval, bash)
@@ -7930,7 +8108,8 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
 		-- __rs so the compiled restore undoes them. Lifted locals are flushed to sh around it
 		-- (the target may read them, `{v}` / `${x:=f}` may write them).
 		return EF.lwrap(cx.lifted, ("rt.redir_apply_one(sh, %s[1], __rs%s)"):format(EF.konst({ ser(r) }),
-			(r.fdvar and cname) and (", %q"):format(cname) or ""), "__ok")
+			cname and (", %q"):format(cname) or ""), "__ok") -- (the command: names a {v} error; a
+		-- move's failure says more when it runs in the shell — not an external's: rt.redir_forks)
 	end
 	function cx.redir_native_expr(r)
 		if r.fdvar then

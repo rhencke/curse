@@ -1444,6 +1444,27 @@ end
 -- ${x:-$'…'} inside "…": bash 5.2 DOES expand ANSI-C quoting in a quoted default word
 -- (parse_default_quoted sets this while parsing it); elsewhere in "…" `$'` is literal.
 local DQ_ANSI = false
+-- A $(…) body as bash runs it: parse_comsub re-prints the parsed body (print_comsub — `a; b`,
+-- `a | b` joined, compound commands laid out, blank lines gone, top-level newlines kept) and
+-- command_substitute parses and runs THAT text, so its commands' line numbers ($LINENO, an
+-- error's `line N:`) count the printed lines. Not a here-document body's (expanded as it
+-- is read), nor one the printer can't take (a syntax error, …: the text as written).
+local IN_HEREDOC = false
+local COMSUB_PRINTED, comsub_printed_n = {}, 0
+local function comsub_text(body)
+	if IN_HEREDOC then
+		return body
+	end
+	local t = COMSUB_PRINTED[body]
+	if t == nil then
+		t = require("deparse").comsub(body) or false
+		if comsub_printed_n >= 4096 then
+			COMSUB_PRINTED, comsub_printed_n = {}, 0
+		end
+		COMSUB_PRINTED[body], comsub_printed_n = t, comsub_printed_n + 1
+	end
+	return t or body
+end
 local function parse_dollar(w, i, add, q)
 	local nx = w:sub(i + 1, i + 1)
 	if w:sub(i + 1, i + 2) == "((" and dparen_is_arith(w, i + 3) then
@@ -1456,7 +1477,7 @@ local function parse_dollar(w, i, add, q)
 		return j + 1
 	elseif nx == "(" then
 		local je = scan_cmdsub(w, i + 2) -- index just past the closing `)` (case/quote/nesting aware)
-		add({ cmdsub = w:sub(i + 2, je - 2), q = q, aenv = ALIAS_ENV, noalias = COMSUB_PREX or nil, posix = POSIX_DQ or nil })
+		add({ cmdsub = comsub_text(w:sub(i + 2, je - 2)), q = q, aenv = ALIAS_ENV, noalias = COMSUB_PREX or nil, posix = POSIX_DQ or nil })
 		return je
 	elseif nx == '"' and q then
 		-- inside "…" (or a here-doc body) the `"` after `$` is no $"…" opener: a literal `$`
@@ -1762,7 +1783,7 @@ local function parse_word(w)
 			-- <(cmd) / >(cmd) process substitution: capture the inner command — its body has
 			-- its own quoting/case syntax, so use the $(…) scanner (plain counting if unclosed)
 			local j = cmdsub_end_lenient(w, i + 2) - 1 -- (the closing `)`)
-			parts[#parts + 1] = { procsub = w:sub(i + 2, j - 1), dir = c, q = false }
+			parts[#parts + 1] = { procsub = comsub_text(w:sub(i + 2, j - 1)), dir = c, q = false }
 			i = j + 1
 		elseif c == "\\" then -- backslash escape: literal next char (newline = continuation)
 			local nx = w:sub(i + 1, i + 1)
@@ -2022,13 +2043,14 @@ end
 -- ${x-default} word), where `\"` escapes to " like inside "…".
 function M.parse_heredoc(body, is_body, aenv, prompt)
 	local parts = {}
-	local saved, sprex = ALIAS_ENV, COMSUB_PREX
+	local saved, sprex, shd = ALIAS_ENV, COMSUB_PREX, IN_HEREDOC
 	ALIAS_ENV = aenv -- its $(…) parts carry the heredoc line's static alias state
 	COMSUB_PREX = false
+	IN_HEREDOC = true
 	local ok, err = pcall(parse_dquote, body, function(p)
 		parts[#parts + 1] = p
 	end, is_body, prompt)
-	ALIAS_ENV, COMSUB_PREX = saved, sprex
+	ALIAS_ENV, COMSUB_PREX, IN_HEREDOC = saved, sprex, shd
 	if not ok then
 		error(err, 0)
 	end
@@ -2145,6 +2167,90 @@ local COND_OPTOK = { ["&&"] = true, ["||"] = true, ["("] = true, [")"] = true, [
 -- cond_skip_newlines does — before a term and after one; reading a unary operator's
 -- operand, a binary operator, or its right side (`nonl`) a newline is a `newline' token)
 local COND_PEND = {} -- (the token slot of a word that ran into the end of input)
+-- An arithmetic operand of [[ ]] (`-lt` …) is expanded with Q_ARITH, where an unquoted `[`
+-- starts a subscript (subst.c expand_array_subscript): to its matching `]` its text is
+-- expanded, then `[ ] $ ` ~ \ ' "` in it backslash-quoted — `[[:a:]]` reaches the
+-- expression (and its error message) as `[\[:a:\]]`. The operand's raw text, rewritten
+-- so (the rewritten brackets single-quoted: their backslashes stay); one with an expansion
+-- anywhere is left as written.
+local ARITH_SUBQ = { ["["] = true, ["]"] = true, ["$"] = true, ["`"] = true, ["~"] = true,
+	["\\"] = true, ["'"] = true, ['"'] = true }
+local function cond_arith_word(raw)
+	if not raw:find("[", 1, true) or raw:find("[$`]") then
+		return raw
+	end
+	local out, i, n, changed = {}, 1, #raw, false
+	local function skipq(k) -- past a quote/escape starting at k
+		local c = raw:sub(k, k)
+		if c == "\\" then
+			return k + 2
+		end
+		local e = raw:find(c, k + 1, true)
+		return e and e + 1 or n + 1
+	end
+	while i <= n do
+		local c = raw:sub(i, i)
+		if c == "\\" or c == "'" or c == '"' then
+			local k = skipq(i)
+			out[#out + 1] = raw:sub(i, k - 1)
+			i = k
+		elseif c == "[" then
+			local k, depth = i + 1, 1 -- (skipsubscript: nested brackets, quotes skipped)
+			while k <= n do
+				local d = raw:sub(k, k)
+				if d == "\\" or d == "'" or d == '"' then
+					k = skipq(k)
+				else
+					if d == "[" then
+						depth = depth + 1
+					elseif d == "]" then
+						depth = depth - 1
+						if depth == 0 then
+							break
+						end
+					end
+					k = k + 1
+				end
+			end
+			local inner = k <= n and k > i + 1 and raw:sub(i + 1, k - 1)
+			local plain, q = {}, {}
+			if inner then
+				local j = 1
+				while j <= #inner do -- (its quote removal)
+					local d = inner:sub(j, j)
+					if d == "\\" then
+						plain[#plain + 1] = inner:sub(j + 1, j + 1)
+						j = j + 2
+					elseif d == "'" or d == '"' then
+						local e = inner:find(d, j + 1, true) or #inner + 1
+						plain[#plain + 1] = inner:sub(j + 1, e - 1)
+						j = e + 1
+					else
+						plain[#plain + 1] = d
+						j = j + 1
+					end
+				end
+				for ch in table.concat(plain):gmatch(".") do
+					q[#q + 1] = ARITH_SUBQ[ch] and ("\\" .. ch) or ch
+				end
+			end
+			local qs = inner and table.concat(q)
+			if inner and qs ~= table.concat(plain) then
+				out[#out + 1] = "'[" .. qs:gsub("'", "'\\''") .. "]'"
+				changed = true
+				i = k + 1
+			else
+				out[#out + 1] = "["
+				i = i + 1
+			end
+		else
+			out[#out + 1] = c
+			i = i + 1
+		end
+	end
+	return changed and table.concat(out) or raw
+end
+local COND_ARITH = { ["-eq"] = true, ["-ne"] = true, ["-lt"] = true, ["-le"] = true, ["-gt"] = true, ["-ge"] = true }
 local function cond_check(toks, quoted, nlb, eof, line0, tl)
 	local pend_read = false -- (the grammar read the COND_PEND token)
 	local pos, ck, ct, fk = 1, nil, nil, nil -- (ck/ct: bash's cond_token, kind and text;
@@ -2298,7 +2404,10 @@ local function parse_dbracket(toks, quoted)
 		local op = peek()
 		if COND_BINOP[op] then
 			pos = pos + 2
-			local rw = parse_word(toks[pos - 1])
+			local rt0 = toks[pos - 1]
+			local rx = COND_ARITH[op] and cond_arith_word(rt0) or rt0
+			local rw = parse_word(rx)
+			rw.src, rw.xsub = rt0, rx ~= rt0 or nil -- (the word as written: `declare -f`)
 			local rq = quoted[pos - 1] -- (fully quoted: `"a"*` starts with a quote yet globs)
 			for _, p in ipairs(rq and rw.parts or {}) do
 				if not p.q then
@@ -2306,7 +2415,10 @@ local function parse_dbracket(toks, quoted)
 					break
 				end
 			end
-			return { kind = "binary", op = op, l = parse_word(t), r = rw, rq = rq }
+			local lx = COND_ARITH[op] and cond_arith_word(t) or t -- (its subscripts: cond_arith_word)
+			local lw = parse_word(lx)
+			lw.src, lw.xsub = t, lx ~= t or nil
+			return { kind = "binary", op = op, l = lw, r = rw, rq = rq }
 		end
 		return { kind = "str", word = parse_word(t) }
 	end
@@ -5453,6 +5565,9 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs, xg, bq
 			ws()
 			if src:sub(i, i) == ";" and not src:find("^[;&]", i + 1) then -- (`;;`, `;&`: tokens)
 				i = i + 1
+				if st then
+					st.semi = true -- (as at the top level: deparse's comsubs keep the newlines)
+				end
 			end
 		end
 	end

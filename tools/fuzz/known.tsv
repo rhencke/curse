@@ -14,11 +14,11 @@
 F1	sig-fixed	table index is nil
 F3	sig-fixed	attempt to index local '(first|prev)'
 F13	sig-fixed	not enough memory
-F19	sig	b_export:[0-9N]+: attempt to index local 'ib'
-F20	sig	attempt to index local 'val'
-F27	sig	value position not supported for node matherr
-F28	sig	value position not supported for node asgn
-F29	sig	too many syntax levels
+F19	sig-fixed	b_export:[0-9N]+: attempt to index local 'ib'
+F20	sig-fixed	attempt to index local 'val'
+F27	sig-fixed	value position not supported for node matherr
+F28	sig-fixed	value position not supported for node asgn
+F29	sig-fixed	too many syntax levels
 UB-recursion	sig	stack overflow
 UB-recursion	src	trap '[^']*kill -[A-Z0-9]+ \$\$[^']*' [A-Z0-9]+
 F1	both-fixed	crash signal, no oracle message	set [-+]?-?[A-Za-z]*o[^ \t\n]
@@ -27,19 +27,19 @@ F12	src-fixed	"\$\$\(\(
 F15	src-fixed	\$\[[^]]*[`"]
 F5	src-fixed	\$\{[^}]*'\$\{
 F8	src-fixed	\$\{! 
-F24	src	\$\{!\$\}
+F24	src-fixed	\$\{!\$\}
 F9	src-fixed	trap -p *&
 F7	src-fixed	;&
-F16	both	^compiled\|	(while|until) .*&& *continue
-F30	both	^compiled\|S: [^l]	\$\{[A-Za-z_]+:
+F16	both-fixed	^compiled\|	(while|until) .*&& *continue
+F30	both-fixed	^compiled\|S: [^l]	\$\{[A-Za-z_]+:
 F6	sig-fixed	^compiled\|.*here-document at line
 F14	both-fixed	^compiled\|	\(\( *[A-Za-z_][A-Za-z_0-9]*\[[^]]*\](\+\+|--)
-F21	both	.	\$\{[A-Za-z_@*#?-]+(\[[^]]*\])?(#|##|%|%%|/|//|\^|,)[^}]*\$\(
-F17	sig	redirection error: cannot duplicate fd
-F18	both	line L	\$\([^)]*\|[ \t]*$
-F23	both	No such file or directory	[^[:print:][:space:]]
-F25	sig	local: can only be used in a function
-F26	sig	\[\\\[:
+F21	both-fixed	.	\$\{[A-Za-z_@*#?-]+(\[[^]]*\])?(#|##|%|%%|/|//|\^|,)[^}]*\$\(
+F17	sig-fixed	redirection error: cannot duplicate fd
+F18	both-fixed	line L	\$\([^)]*\|[ \t]*$
+F23	both-fixed	No such file or directory	[^[:print:][:space:]]
+F25	sig-fixed	local: can only be used in a function
+F26	sig-fixed	\[\\\[:
 F2	sig-fixed	unexpected EOF while looking for matching
 F11	sig-fixed	^all\|status N vs N
 F10	sig-fixed	near unexpected token `X'.*

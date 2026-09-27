@@ -1644,10 +1644,22 @@ local function expand_pexp(sh, p, assign)
 			end
 			return expand_word(sh, pw(pe.arg), true)
 		end or nil
+	elseif patmode then -- (the pattern and replacement expand only if the value takes them:
+		-- expand_param asks rt.pe_nopat first)
+		arg = function()
+			return pe.arg and expand_pattern(sh, P.parse_word(pe.arg), true) or nil
+		end
 	elseif pe.op ~= "sub" then -- (a substring's offset is expanded below — not when the var is unset)
-		arg = pe.arg and (patmode and expand_pattern or expand_word)(sh, P.parse_word(pe.arg), true) or nil
+		arg = pe.arg and expand_word(sh, P.parse_word(pe.arg), true) or nil
 	end
-	local arg2 = pe.arg2 and pe.op ~= "sub" and expand_repl(sh, P.parse_word(pe.arg2)) or nil
+	local arg2
+	if patmode and pe.arg2 then
+		arg2 = function()
+			return expand_repl(sh, P.parse_word(pe.arg2))
+		end
+	else
+		arg2 = pe.arg2 and pe.op ~= "sub" and expand_repl(sh, P.parse_word(pe.arg2)) or nil
+	end
 	if pe.op == "sub" and not pe.index and rt.sub_unset(sh, pe.name) then
 		return ""
 	elseif pe.op == "sub" then -- ${v:off:len}: offset/length are arithmetic expressions,
@@ -2455,13 +2467,16 @@ multi_elems = function(sh, p) -- returns element list, star?
 			-- strip/subst/case per element: the PATTERN is quote-aware (a quoted `'*'` is a literal
 			-- `*`, not a glob) — expand_pattern, like the scalar path (getpattern in bash). Only the
 			-- replacement (arg2) expands via expand_repl (tilde + patsub_replacement marking).
-			local arg = pe.arg and expand_pattern(sh, P.parse_word(pe.arg)) or ""
-			local arg2 = pe.arg2 and expand_repl(sh, P.parse_word(pe.arg2)) or nil
-			local out = {}
-			for i, v in ipairs(els) do
-				out[i] = sh:apply_str_op(pe.op, v, arg, arg2)
+			-- (neither expands when the value takes no pattern: rt.pe_nopat_elems)
+			if not rt.pe_nopat_elems(pe.op, els) then
+				local arg = pe.arg and expand_pattern(sh, P.parse_word(pe.arg)) or ""
+				local arg2 = pe.arg2 and expand_repl(sh, P.parse_word(pe.arg2)) or nil
+				local out = {}
+				for i, v in ipairs(els) do
+					out[i] = sh:apply_str_op(pe.op, v, arg, arg2)
+				end
+				els = out
 			end
-			els = out
 		end
 		return els, star
 	end
@@ -2750,7 +2765,8 @@ local function alloc_fd()
 end
 local FDVAR_NOASSIGN = { GROUPS = 1, FUNCNAME = 1, BASH_ARGC = 1, BASH_ARGV = 1, BASH_SOURCE = 1, BASH_LINENO = 1 }
 local function apply_redirs(sh, redirs, cname, ctx, args) -- cname: the command (names {v} errors;
-	-- ctx: only names them — compiled code's rt.redir_apply_one); args: its argv (rt.redir_forks)
+	-- ctx: only names them, and tells a fd move's run in the shell — compiled code's
+	-- rt.redir_apply_one); args: its argv (rt.redir_forks)
 	io.flush() -- flush pending stdout BEFORE moving fds, else buffered output from a
 	-- prior command would be redirected into (and lost to) the new target
 	local save, ok = {}, true
@@ -2949,6 +2965,10 @@ local function apply_redirs(sh, redirs, cname, ctx, args) -- cname: the command 
 				C.close(r.fd) -- `N>&-` closes fd N
 			else
 				local movesrc = tv:match("^(%d+)%-$") -- `N>&M-`: dup then close the source (move)
+				local topmove = movesrc and sh.redir_noundo -- (a stage's / job's own: rt.redir_top)
+				if topmove then
+					sh.redir_noundo = topmove > 1 and topmove - 1 or nil
+				end
 				-- only an all-digit word is a fd (redir.c: all_digits); one past INT_MAX is
 				-- fd -1 (EBADF), never a wrapped number — anything else (`0x2`, `1.0`) is a file
 				local m = movesrc or (tv:find("^%d+$") and tv)
@@ -2963,7 +2983,13 @@ local function apply_redirs(sh, redirs, cname, ctx, args) -- cname: the command 
 					if C.fcntl(m, 1) == -1 then -- F_GETFD on a closed fd returns -1 (EBADF)
 						-- (bash names the target as written: `$v: Bad file descriptor`)
 						local nm = r.target or tv
-						if fdnew then -- (redir.c: its fcntl(F_DUPFD) fails first — sys_error, no line)
+						if fdnew
+							-- (a move `N>&M-` run in the shell — undoable, not an external's — onto an
+							-- open N: redir.c saves M for the undo of its close first, and that
+							-- add_undo_redirect's fcntl(M, F_DUPFD) fails the same way)
+							or (movesrc and not topmove and not (ext or (ctx and rt.redir_forks(sh, ctx)))
+								and C.fcntl(r.fd, 1) ~= -1)
+						then -- (redir.c: its fcntl(F_DUPFD) fails first — sys_error, no line)
 							io.stderr:write((rt.err_prefix(sh):gsub("line %d+: $", "")) .. "redirection error: cannot duplicate fd: Bad file descriptor\n")
 						end
 						io.stderr:write("curse: " .. (nm:match("^(%d+)%-$") or nm) .. ": Bad file descriptor\n")
@@ -4946,9 +4972,12 @@ local function eval_dbracket(sh, node)
 			-- bash 5.2 expands an arithmetic operator's operands like $((…)): no process
 			-- substitution, and subscripts quoted (`index[7<(4+2)]` is arithmetic) — but
 			-- quotes are removed first (`[[ '3' -eq 3 ]]`): a quoted operand is a plain word
-			textual, rtextual = not node.l.src:find("['\"\\]"), not node.r.src:find("['\"\\]")
-			l = textual and arith_expand_text(sh, node.l.src) or dbracket_word(sh, node.l)
-			r = rtextual and arith_expand_text(sh, node.r.src) or dbracket_word(sh, node.r)
+			-- (xsub: its subscripts' text quoted — parser.cond_arith_word — the word's static
+			-- value, read as the textual path's)
+			textual = node.l.xsub or not node.l.src:find("['\"\\]")
+			rtextual = node.r.xsub or not node.r.src:find("['\"\\]")
+			l = (textual and not node.l.xsub) and arith_expand_text(sh, node.l.src) or dbracket_word(sh, node.l)
+			r = (rtextual and not node.r.xsub) and arith_expand_text(sh, node.r.src) or dbracket_word(sh, node.r)
 		elseif op == "=~" then -- (each operand expanded ONCE; the trace shows the regex text)
 			l = dbracket_word(sh, node.l)
 			pat = M.regex_rhs(sh, node.r)
@@ -5869,7 +5898,11 @@ exec_stmt = function(sh, st, hook)
 		if not spawned then
 			local run = rt.bg_tail_stmt(cmd)
 			rt.env_rebuilt(sh) -- (execute_simple_command's, before the fork)
+			local nmv = rt.redir_moves(cmd.redirs)
 			local job = sh:bg_launch(function(ssh)
+				if nmv > 0 then -- (its own redirections aren't undoable: rt.redir_top)
+					rt.redir_top(ssh, nmv)
+				end
 				exec_stmt(ssh, run, SUBHOOK)
 			end, cmdstr, cmd.t == "subshell", cmd.t == "simple")
 			if cmd.t == "pipeline" and job and job.g then
@@ -6040,9 +6073,13 @@ exec_stmt = function(sh, st, hook)
 					run_debug(sh, (sh.in_trap and sh.in_trap > 0 and (sh.calldepth or 0) == sh.trap_calldepth) and sh.cur_line or (cmds[k].line or st.line))
 				end
 				local stage = cmds[k]
+				local nmv = rt.redir_moves(stage.redirs)
 				fns[k] = function(ssh)
 					if not inshell then -- a stage re-runs neither DEBUG nor ERR
 						ssh.in_pipestage = (ssh.in_pipestage or 0) + 1
+						if nmv > 0 then -- (its own redirections aren't undoable: rt.redir_top)
+							rt.redir_top(ssh, nmv)
+						end
 					end
 					exec_stmt(ssh, stage, SUBHOOK)
 				end
