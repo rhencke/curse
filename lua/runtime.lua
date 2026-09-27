@@ -5004,6 +5004,7 @@ function Shell:stage_clone()
 		c[k] = type(v) == "table" and shallowcopy(v) or v
 	end
 	c.subdepth = (self.subdepth or 0) + 1 -- (a stage is a subshell)
+	c.subenv = true -- (subshell_environment, even where $BASH_SUBSHELL doesn't count it)
 	c.iso_ctx, c.stage_pid, c.vpid, c.rpid = {}, tonumber(C.getpid()), nil, nil
 	if self.iso_ctx and #self.iso_ctx > 0 then -- (a subshell's virtual hard limits stay in force in its stages)
 		local vb = self.iso_vhard_base and shallowcopy(self.iso_vhard_base) or {}
@@ -8425,6 +8426,7 @@ local function case_fold(b, s) -- (declare -l/-u/-c: the locale's folding, per c
 	end
 	return s
 end
+M.case_fold = case_fold
 function Shell:set_str(name, s)
 	if s:find("\0", 1, true) then
 		s = M.cstr(s)
@@ -15544,7 +15546,10 @@ do
 		if value == nil then
 			return
 		end
-		if sh.opt_x and sh.pb_mode ~= "pre" then -- (each traces before the command: `+ x=1`)
+		-- (each traces before the command: `+ x=1`; a command's binding once it's made —
+		-- assign_in_env traces after binding, so `PS4=… cmd` traces it under the new PS4)
+		local post = sh.pb_mode == "tenv" or sh.pb_mode == "persist"
+		if sh.opt_x and sh.pb_mode ~= "pre" and not post then
 			M.xtrace_assign(sh, name .. (append and "+=" or "="), value)
 		end
 		if sh.pb_mode == "perm" and M.prefix_reject(sh, name) then
@@ -15574,6 +15579,9 @@ do
 		if name == "HISTSIZE" or name == "HISTFILESIZE" then -- (the history follows even a
 			M.hist_resize(sh, name) -- temporary binding: sv_histsize)
 		end
+		if post and sh.opt_x then
+			M.xtrace_assign(sh, name .. (append and "+=" or "="), value)
+		end
 	end
 	-- One prefix binding `name=value` (a NAME=(…) prefix: `raw`, its literal text) — both
 	-- tiers' simple commands (interp's through its bind; a compiled site's bind closure).
@@ -15587,6 +15595,18 @@ do
 		end
 		if raw and sh.opt_x then -- (as its literal string: `+ a='(1 2)'`)
 			M.xtrace_assign(sh, name .. "=", raw)
+		end
+		if append and not raw and value ~= nil then
+			-- `n+=v cmd`: the binding is the var's appended value, as a plain assignment
+			-- would make it (assign_in_env: make_variable_value (var, value, ASS_APPEND) —
+			-- declare -i sums, -l/-u/-c fold, an array appends to its [0]); traced so: `+ n=6`
+			local b = sh.vars[sh:deref(name)]
+			if b and b.int and not b.ref then
+				value = M.i64_to_str(M.int_value(sh, sh:get(name) or "") + M.int_value(sh, value))
+			elseif b then
+				value = M.case_fold(b, (sh:get(name) or "") .. value)
+			end
+			append = false
 		end
 		if mode == "persist" then
 			-- it propagates through any temporary binding of the name (`var=30 f` where
@@ -15634,8 +15654,7 @@ do
 		-- a nameref's / array's / -i/-l/-u/-c var's prefix binding is a plain temporary string
 		-- (bash's tempenv variable: `i=1+1 cmd` passes "1+1"); `n+=3 cmd` on a -i var binds
 		-- the arithmetic sum as that string (make_variable_value appends arithmetically first)
-		local iapp = b and b.int and append and not b.arr and not b.ref and not raw
-		if b and not iapp and (b.ref or b.arr or b.int or b.lower or b.upper or b.cap) then
+		if b and (b.ref or b.arr or b.int or b.lower or b.upper or b.cap) then
 			if b.ref and M.arith_ref_circ(sh, name, 0) == true then -- (a cycle: bash warns, then
 				io.stderr:write("curse: warning: " .. name .. ": circular name reference\n") -- binds)
 			end
@@ -15648,9 +15667,6 @@ do
 			sh:set_str(name, raw)
 		else
 			M.sr_pset(sh, name, value, append)
-			if iapp and sh.vars[name] == b then
-				sh.vars[name] = { s = sh:get(name), exported = b.exported }
-			end
 		end
 		M.lc_quiet = nil
 		local tval = sh:get(name)
@@ -15763,9 +15779,33 @@ do
 		end
 		M.xtrace(sh, argv)
 	end
+	-- The PS4 a prefixed command's own trace line uses: the one outside its temporary
+	-- environment (bash traces the words before the tempenv is visible to lookups) — the
+	-- value a `PS4=… cmd` binding at/after tenv index base+1 shadowed; nil: none bound.
+	-- (bash's subshell_environment: a subshell's lookups search the temporary env — so
+	-- there the command traces under the binding's PS4 after all: find_variable_internal)
+	function M.in_subshell(sh)
+		return sh.subenv or (sh.subdepth or 0) + M.fork_depth > 0
+	end
+	function M.outer_ps4(sh, base)
+		for k = base + 1, #sh.tenv do
+			local te = sh.tenv[k]
+			if te.name == "PS4" and not te.consumed then
+				return te.box and (te.box.s or (te.box.n and M.i64_to_str(te.box.n))) or ""
+			end
+		end
+		return nil
+	end
 	function M.sr_run_cmd(sh, argv, spec, hook, rf, traced)
 		if sh.opt_x and not spec.xt and not traced then
+			local tb = sh.tenv_call_base
+			local o = tb and #sh.tenv > tb and not M.in_subshell(sh) and M.outer_ps4(sh, tb)
+			local sv = sh.xtrace_ps4
+			if o then
+				sh.xtrace_ps4 = o
+			end
 			M.sr_trace(sh, argv, spec)
+			sh.xtrace_ps4 = sv
 			traced = true
 		end
 		-- (`exec`'s redirections are b_exec's: they persist, and so does its fd-1 routing)
@@ -16176,6 +16216,20 @@ function M.assign_full(sh, st)
 	end
 	if rb and rb.ro then -- readonly: reject the assignment (status 1); fatal in `sh -c`
 		-- (or posix mode). Through a nameref bash names the TARGET.
+		-- (do_assignment_internal expands the value and traces it first: `+ r=v`, then
+		-- bind_variable refuses it)
+		local v = ""
+		if st.rhs then
+			v = M.xw_rhs(sh, st.rhs)
+			if v == nil then -- (a non-fatal expansion error: the assignment just fails)
+				sh.assign_err = true
+				return
+			end
+		end
+		if sh.opt_x then
+			local lhs = st.index and (st.name .. "[" .. st.index .. "]") or st.name
+			IX.xtrace(sh, { lhs .. (st.append and "+=" or "=") .. (v == "" and "" or IX._int.xtrace_quote(v)) }, true)
+		end
 		io.stderr:write("curse: " .. sh:deref(st.name) .. ": readonly variable\n")
 		M.report_exit(sh) -- (err_readonly: report_error)
 		sh.status = 1

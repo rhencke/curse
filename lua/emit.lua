@@ -5022,6 +5022,9 @@ EF.simple_native = function(cx, st, after, cmd)
 		spec[#spec + 1] = "xt=true"
 		xt = " " .. EF.xt("__a")
 	end
+	if EF.xtrace and bind and EF.xln() ~= "" then -- (the runner traces the bindings and the
+		xt = xt .. (" if sh.opt_x then %send"):format(EF.xln()) -- command: under ITS line)
+	end
 	if bind and redir and #pnames > 0 then -- (a readonly prefix is reported before the redirections)
 		xt = xt .. ("; rt.prefix_ro(sh, { %s }, __a[1])"):format(table.concat(pnames, ", "))
 	end
@@ -5769,10 +5772,18 @@ simple_compiled = function(cx, st, after)
 			-- in bash's left-to-right order — then apply + run + restore via rt.run_prefix.
 			local xpv = ""
 			if EF.xtrace then
+				-- (bash traces each binding once made — a `PS4=…` one, and those after it, under
+				-- the new PS4 — and the command under the PS4 outside the temporary env)
+				local ps4 = false
 				for i, a in ipairs(st.assigns) do
+					if a.name == "PS4" then
+						ps4 = true
+						xpv = xpv .. ("sh.xtrace_ps4 = __pv[%d]; "):format(i)
+					end
 					xpv = xpv .. EF.xta(a.name .. "=", ("__pv[%d]"):format(i))
 				end
-				xpv = xpv .. EF.xt("__a")
+				xpv = xpv .. (ps4 and "if not rt.in_subshell(sh) then sh.xtrace_ps4 = nil end; " or "") .. EF.xt("__a")
+					.. (ps4 and "sh.xtrace_ps4 = nil; " or "")
 			end
 			cx.blocks[p] = d
 				.. ("local __pv = { %s }; "):format(table.concat(pvals, ", "))
@@ -6046,7 +6057,9 @@ simple_compiled = function(cx, st, after)
 		local lastw = st.words[#st.words]
 		local post = cx.newpc()
 		cx.blocks[post] = ('sh:set_str("_", %s); if sh.ifs_fc then rt.ifs_popchk(sh) end; pc = %d'):format(us, after) -- (pop_context's sv_ifs: rt.ifs_first)
+		local cl = EF.cur_line -- (the call traces under ITS line, not the inlined body's)
 		local bodyentry = cx.flatten_list(subst_list(cx.inlinefns[cmd], pb), post)
+		EF.cur_line = cl
 		local pre = cx.newpc()
 		local xpre = ""
 		if EF.xtrace then
@@ -6625,7 +6638,10 @@ H.forin = function(cx, st, after)
 				ws[#ws + 1] = w.src
 			end
 		end
+		local cl = EF.cur_line -- (traced under the header's line: the body moved cur_line)
+		EF.cur_line = st.line or cl
 		xh = EF.xtl(("%q"):format(require("runtime").srcw("for " .. st.name .. " in " .. table.concat(ws, " "))))
+		EF.cur_line = cl
 	end
 	if EF.has_nameref or EF.has_attr then
 		cx.blocks[advp] = ("%s; fs.idx = fs.idx + 1; if fs.idx > #fs.list then if fs.idx == 1 then sh.status = 0 end; pc = %d else %sif not rt.for_assign(sh, %q, fs.list[fs.idx]) then sh.status = 1; pc = %d else %spc = %d end end"):format(
@@ -7837,7 +7853,7 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
 		EF.cur_infunc = not cx.toplevel and not cx.topcode -- … or a function)
 		if st.line then
 			cx.prev_line = EF.cur_line -- (the command before: a redirected compound's errors)
-			EF.cur_line = (t == "simple" or t == "assign" or t == "assignlist") and st.cline or st.line -- (a simple command: interp's rule)
+			EF.cur_line = (t == "simple" or t == "assign" or t == "assignlist" or t == "arrayassign") and st.cline or st.line -- (a simple command: interp's rule)
 			EF.cur_cline = st.cline or st.line
 		end -- for $LINENO (compile-time constant)
 		-- `time [-p] pipeline`: start clocks, run the statement itself, report to stderr.
