@@ -886,10 +886,13 @@ parse_paramexp = function(inner)
 		-- no valid parameter starts the text (${%}, ${%x}, ${.x}, ${#!x}, ${$(…)}, ${?x}):
 		-- a bad substitution in bash (fails the command, status 1). (After `!`, `${!%x}`
 		-- is $! with an operator; that stays the lenient empty read.)
-		if indices then
+		-- After `!` the text up to an operator character is bash's NAME: just `!` ($!, with
+		-- that operator) is the lenient read; anything else there (`${! a}`, `${!.x}`,
+		-- `${!"x"}`) starts no indirect name — valid_brace_expansion_word fails it too.
+		if indices and (inner == "" or inner:find("^[#%%^,~:%-=?+/@]")) then
 			return { var = inner }
 		end
-		return { pexp = { op = "badsubst", raw = (lenpfx and "#" or "") .. inner } }
+		return { pexp = { op = "badsubst", raw = (lenpfx and "#" or indices and "!" or "") .. inner } }
 	end
 	-- optional [subscript]
 	local index = nil
