@@ -2900,7 +2900,7 @@ function Shell:capture_src(src, backtick, noalias, line0)
 	end
 	-- Full subshell isolation (checkpoint/restore, in-process) UNLESS the body is provably
 	-- pure (M.cmdsub_pure): then just the light $() state (the common `$(cmd)` case).
-	local iso = not M.cmdsub_pure(ast.stmts, self.functions, src)
+	local iso = not M.cmdsub_pure(ast.stmts, self.functions, src) or M.cs_traps_inherited(self)
 	local has_perr = false
 	for _, st in ipairs(ast.stmts) do
 		if st.t == "parse_error" then
@@ -4253,7 +4253,21 @@ end
 -- the compiled fragment `cs_fn(sh)` runs with only capture_inproc's light isolation (a
 -- mutating body goes through capture_compiled_iso instead).
 function Shell:capture_compiled(cs_fn, _, backtick) -- (2nd arg: a retired fork flag)
+	if M.cs_traps_inherited(self) then
+		return self:capture_compiled_iso(cs_fn, backtick)
+	end
 	return self:capture_inproc(backtick, cs_fn)
+end
+-- Does a $(…) inherit a trap whose handler may run inside it — DEBUG/RETURN under
+-- functrace, ERR under errtrace? A body pure by itself isn't then: the handler's changes
+-- are the subshell's (bash), so it needs the full isolation.
+function M.cs_traps_inherited(sh)
+	local t = sh.traps
+	if not t then
+		return false
+	end
+	return (sh.opt_functrace and ((t.DEBUG or "") ~= "" or (t.RETURN or "") ~= ""))
+		or (sh.opt_errtrace and (t.ERR or "") ~= "") or false
 end
 
 -- In a forked child (a fallback pipeline stage, see M.fork), translate an exit/return
