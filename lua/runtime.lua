@@ -12919,6 +12919,49 @@ end
 -- `s` ABSENT from the box: reading b.s builds (and caches) the string; ANY write to b.s
 -- (a new value, or nil to unset) drops the buffer first — so every other reader and
 -- writer of the box works unchanged.
+-- An EXPORTED variable appended to keeps its environ entry in a growable buffer of our
+-- own (putenv'd), extended in place — setenv would copy the whole value (and glibc keeps
+-- every old copy), making `export s; for …; do s+=x; done` quadratic in time and memory;
+-- bash builds the environment only when it runs a command. In place only while no task
+-- holds a copy of the environ (the scheduler's per-task environs share its strings), and
+-- only while the entry is still ours (any setenv/unsetenv/clearenv replaces it).
+pcall(ffi.cdef, "int putenv(char *s); char *getenv(const char *name);")
+M.envbuf = {}
+function M.env_append(sh, dn, b, value)
+	if SCHED ~= nil then
+		return false
+	end
+	local e = M.envbuf[dn]
+	if e and C.getenv(dn) == e.v then
+		local need = e.len + #value
+		if need < e.cap then
+			ffi.copy(e.v + e.len, value, #value)
+			e.len = need
+			e.v[need] = 0
+			return true
+		end
+	end
+	local cur = sh:get(dn) or ""
+	local full = #cur + #value
+	local cap = math.max(64, full * 2)
+	local buf = ffi.cast("char *", C.curse_co_malloc(#dn + 1 + cap + 1))
+	if buf == nil then
+		return false
+	end
+	ffi.copy(buf, dn .. "=")
+	ffi.copy(buf + #dn + 1, cur)
+	ffi.copy(buf + #dn + 1 + #cur, value, #value)
+	buf[#dn + 1 + full] = 0
+	if C.putenv(buf) ~= 0 then
+		C.curse_co_free(buf)
+		return false
+	end
+	if e then -- (no environ references it now: putenv replaced it, or it had been dropped)
+		C.curse_co_free(e.buf)
+	end
+	M.envbuf[dn] = { buf = buf, v = buf + #dn + 1, len = full, cap = cap + 1 }
+	return true
+end
 local append_lazy
 do
 local SBUF = require("string.buffer")
@@ -12948,8 +12991,11 @@ local LAZY_STR = {
 local APPEND_SPECIAL = { OPTIND = true, BASH_ARGV0 = true, POSIXLY_CORRECT = true, IGNOREEOF = true,
 	RANDOM = true, SRANDOM = true, LINENO = true, FUNCNAME = true, TZ = true, HOSTFILE = true }
 append_lazy = function(sh, dn, b, value)
-	if b.ref or b.arr or b.int or b.lower or b.upper or b.cap or b.exported or rawget(b, "virt")
+	if b.ref or b.arr or b.int or b.lower or b.upper or b.cap or rawget(b, "virt") or (sh.opt_a and not b.exported)
 		or APPEND_SPECIAL[dn] or M.DYN_ASSIGN[dn] or LOCALE_VARS[dn] or value:find("\0", 1, true) then
+		return false -- (set -a: set_str exports it — bind_variable's auto-export)
+	end
+	if b.exported and not M.env_append(sh, dn, b, value) then
 		return false
 	end
 	local mt = getmetatable(b)
@@ -16850,8 +16896,8 @@ function M.assign_full(sh, st)
 	-- set -a (allexport): a plain scalar assignment auto-exports the variable
 	if sh.opt_a and not st.index then
 		local b = sh.vars[sh:deref(st.name)]
-		if b and not b.arr then
-			b.exported = true
+		if b and not b.arr and not (st.append and b.exported and rawget(b, "_sb")) then
+			b.exported = true -- (an append to an exported buffered var synced its entry: env_append)
 			C.setenv(st.name, sh:get(st.name), 1)
 		end
 	end
