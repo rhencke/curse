@@ -2858,6 +2858,9 @@ function Shell:capture_src(src, backtick, noalias, line0)
 		error(parsed)
 	end
 	local ast = parsed
+	if #ast.stmts == 0 then -- (no command at all — `$()`, `$( )`, `$(# c)`: bash runs no
+		return "" -- subshell, so it's no substitution: $? and an assignment's status stay)
+	end
 	-- $(< file) / `< file`: bash reads the file's contents (a faster $(cat file)) —
 	-- a pure read, no isolation needed, so keep it in-process.
 	if #ast.stmts == 1 then

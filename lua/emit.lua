@@ -5167,13 +5167,32 @@ EF.FRAG_CF = { ["break"] = 1, ["continue"] = 1, ["return"] = 1, ["exit"] = 1 }
 -- Command substitutions in words[from..]: hadcs — a part of its own, so it runs (an empty
 -- argv / a bare assignment keeps its status); else dyncs — one only nested in a ${…}
 -- (`${u:-$(exit 5)}`) may not run, so it is counted at runtime (sh.ncs).
+-- (a body with no command — `$()`, `$( )`, `$(# c)` — is no substitution at all: bash runs
+-- nothing, so whether one ran is left to the runtime counter, as for a nested one)
+local function cs_empty(body)
+	if body:find("^%s*$") then
+		return true
+	end
+	if not body:find("#", 1, true) then
+		return false
+	end
+	local ok, ast = pcall(require("parser").parse, body)
+	return ok and #ast.stmts == 0
+end
 function EF.cmdsubs(words, from)
+	local empty = false
 	for j = from, #words do
 		for _, pp in ipairs(words[j].parts) do
 			if pp.cmdsub then
-				return true, false
+				if not cs_empty(pp.cmdsub) then
+					return true, false
+				end
+				empty = true
 			end
 		end
+	end
+	if empty then
+		return false, true
 	end
 	for j = from, #words do
 		local s = words[j].src
