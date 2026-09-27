@@ -250,7 +250,11 @@ int curse_ldfmt(char *out, int n, const char *fmt, const char *num, int *end_ok)
  * The helper opens in a private copy of the fd table (unshare(CLONE_FILES)), emptied
  * first, so it never holds a pipe end of the shell open and its fd never lands in the
  * shell's table behind the shell's back (a concurrent dup2 of the shell or of a job
- * could collide with it); the fd is passed back over a socketpair (SCM_RIGHTS) and
+ * could collide with it). It also runs with a private cwd and umask
+ * (unshare(CLONE_FS)): the shell's in-process jobs chdir/umask the process whenever
+ * they run, so the path resolves against a directory fd of the REQUESTING shell's cwd
+ * (openat), taken on the main thread at the call -- the same fd the FIFO check used --
+ * and the umask is that shell's too; the fd is passed back over a socketpair (SCM_RIGHTS) and
  * installed by the shell itself, like any open. The helper blocks every signal: the
  * shell's handlers must only ever run on the main thread. A wait the shell abandons
  * (a trap exits) cancels it. */
@@ -261,11 +265,17 @@ int curse_ldfmt(char *out, int n, const char *fmt, const char *num, int *end_ok)
 #include <sys/eventfd.h>
 #include <sys/socket.h>
 #include <sys/syscall.h>
+#include <sys/stat.h>
+#ifndef O_PATH
+#define O_PATH 010000000  /* (Linux; <fcntl.h> hides it without _GNU_SOURCE) */
+#endif
 
 struct curse_aopen {
   pthread_t th;
   char *path;
   int flags, mode, efd, sv[2];
+  int dirfd;         /* the requesting shell's cwd (O_PATH), >= minfd */
+  mode_t um;         /* ... and its umask */
   int err;  /* the open's errno; -1: no private fd table (open directly) */
 };
 
@@ -273,15 +283,22 @@ static void *curse_aopen_run(void *p)
 {
   struct curse_aopen *a = (struct curse_aopen *)p;
   uint64_t one = 1;
-  int fd, old, efd = a->efd, so = a->sv[1];
-  int lo = efd < so ? efd : so, hi = efd < so ? so : efd;
-  if (syscall(SYS_unshare, 0x00000400 /* CLONE_FILES */) != 0) {
+  int fd, old, efd = a->efd, k[3], i, j, t;
+  unsigned from = 0;
+  k[0] = efd; k[1] = a->sv[1]; k[2] = a->dirfd;
+  for (i = 0; i < 3; i++)  /* (the fds kept, in order) */
+    for (j = i + 1; j < 3; j++)
+      if (k[j] < k[i]) { t = k[i]; k[i] = k[j]; k[j] = t; }
+  if (syscall(SYS_unshare, 0x00000400 | 0x00000200 /* CLONE_FILES|CLONE_FS */) != 0) {
     a->err = -1;
   } else {
-    if (lo > 0) syscall(SYS_close_range, 0, (unsigned)lo - 1, 0);
-    if (hi > lo + 1) syscall(SYS_close_range, (unsigned)lo + 1, (unsigned)hi - 1, 0);
-    syscall(SYS_close_range, (unsigned)hi + 1, ~0U, 0);
-    fd = open(a->path, a->flags, a->mode);  /* (a cancellation point: _abandon) */
+    for (i = 0; i < 3; i++) {
+      if ((unsigned)k[i] > from) syscall(SYS_close_range, from, (unsigned)k[i] - 1, 0);
+      from = (unsigned)k[i] + 1;
+    }
+    syscall(SYS_close_range, from, ~0U, 0);
+    umask(a->um);
+    fd = openat(a->dirfd, a->path, a->flags, a->mode);  /* (a cancellation point: _abandon) */
     pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, &old);
     a->err = fd < 0 ? errno : 0;
     if (fd >= 0) {
@@ -297,7 +314,7 @@ static void *curse_aopen_run(void *p)
       CMSG_FIRSTHDR(&m)->cmsg_type = SCM_RIGHTS;
       CMSG_FIRSTHDR(&m)->cmsg_len = CMSG_LEN(sizeof(int));
       memcpy(CMSG_DATA(CMSG_FIRSTHDR(&m)), &fd, sizeof(int));
-      if (sendmsg(so, &m, 0) < 0) a->err = errno;
+      if (sendmsg(a->sv[1], &m, 0) < 0) a->err = errno;
       close(fd);  /* (the one in flight keeps the FIFO open) */
     }
   }
@@ -314,15 +331,29 @@ static int curse_fd_high(int fd, int minfd)
   return h;
 }
 
-/* Start opening `path`; returns a handle and its eventfd (close-on-exec, >= minfd)
- * in *efd, or NULL (then the caller opens directly). */
+/* Start opening `path` -- when it names a FIFO: returns a handle and its eventfd
+ * (close-on-exec, >= minfd) in *efd, or NULL (then the caller opens directly) with
+ * *efd = -2 when `path` is no FIFO (or can't be stat'ed). The FIFO check and the open
+ * both resolve `path` against one fd of the caller's cwd, taken here. */
 void *curse_aopen_start(const char *path, int flags, int mode, int minfd, int *efd)
 {
-  struct curse_aopen *a = (struct curse_aopen *)calloc(1, sizeof *a);
+  struct curse_aopen *a;
   pthread_attr_t at;
   sigset_t all, old;
-  int r, sv[2];
-  if (!a) return 0;
+  struct stat st;
+  int r, sv[2], dfd;
+  *efd = -1;
+  dfd = curse_fd_high(open(".", O_PATH | O_DIRECTORY | O_CLOEXEC), minfd);
+  if (dfd < 0) return 0;
+  if (fstatat(dfd, path, &st, 0) != 0 || !S_ISFIFO(st.st_mode)) {
+    close(dfd);
+    *efd = -2;
+    return 0;
+  }
+  a = (struct curse_aopen *)calloc(1, sizeof *a);
+  if (!a) { close(dfd); return 0; }
+  a->dirfd = dfd;
+  a->um = umask(0); umask(a->um);  /* (the helpers have their own: no race) */
   a->path = strdup(path);
   a->flags = flags; a->mode = mode;
   a->efd = curse_fd_high(eventfd(0, EFD_CLOEXEC), minfd);
@@ -343,6 +374,7 @@ void *curse_aopen_start(const char *path, int flags, int mode, int minfd, int *e
   *efd = a->efd;
   return a;
 fail:
+  close(a->dirfd);
   if (a->efd >= 0) close(a->efd);
   if (a->sv[0] >= 0) close(a->sv[0]);
   if (a->sv[1] >= 0) close(a->sv[1]);
@@ -353,7 +385,7 @@ fail:
 static void curse_aopen_free(struct curse_aopen *a)
 {
   pthread_join(a->th, (void **)0);  /* (it has signalled or been cancelled: ending) */
-  close(a->efd); close(a->sv[0]); close(a->sv[1]);
+  close(a->efd); close(a->sv[0]); close(a->sv[1]); close(a->dirfd);
   free(a->path); free(a);
 }
 
@@ -363,8 +395,8 @@ int curse_aopen_result(void *h)
 {
   struct curse_aopen *a = (struct curse_aopen *)h;
   int fd = -1, e = a->err;
-  if (e < 0) {  /* (no private table: a plain open) */
-    fd = open(a->path, a->flags, a->mode);
+  if (e < 0) {  /* (no private table: a plain open, on the main thread) */
+    fd = openat(a->dirfd, a->path, a->flags, a->mode);
     e = fd < 0 ? errno : 0;
   } else if (e == 0) {
     struct msghdr m;
