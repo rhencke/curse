@@ -1717,8 +1717,12 @@ function M.ropen(path, flags, mode)
 		return fd
 	end
 	C.fcntl(fd, 4, ffi.cast("int", bit.band(C.fcntl(fd, 3), bit.bnot(2048)))) -- F_SETFL: blocking again
-	if acc == 0 then
-		M.co_block(fd, POLLIN) -- (a task yields on it; the shell runs the scheduler until it's ready)
+	-- (a named FIFO: its first read mustn't be a spurious EOF before any writer — a task
+	-- yields on it, the shell runs the scheduler until it's ready. Not a pipe reached by
+	-- /dev/fd/N, a process substitution's: its writer is there already, and `read -t`
+	-- must time out on it as bash's does)
+	if acc == 0 and not (path:find("^/dev/fd/") or path:find("^/proc/self/fd/")) then
+		M.co_block(fd, POLLIN)
 	end
 	return fd
 end
