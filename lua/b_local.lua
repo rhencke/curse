@@ -32,19 +32,20 @@ return function(sh, cmd, args, hook, tcb)
 				attrs = true
 			end
 		until not c
-		if funcs then -- (functions: never made, only looked up)
-			local st = 0
-			for k = j, #args do
-				if args[k]:find("=", 1, true) then
-					io.stderr:write("curse: local: cannot use `-f' to make functions\n")
-					st = 1
-					break
-				elseif not sh.functions[args[k]] then
-					st = 1
+		local nodefs = false
+		if funcs then -- (declare_internal with local_var: -f/-F NAME… prints / sets attributes
+			-- on the functions, as declare does; with no NAME it lists this frame's locals,
+			-- -F without their values — show_local_var_attributes(0, nodefs))
+			if j <= #args then
+				local ok, err = pcall(require("b_export"), sh, "local", args, hook, tcb)
+				if not ok then
+					error(err, 0)
 				end
+				return
 			end
-			sh.status = st
-			return
+			for k = 2, j - 1 do
+				nodefs = nodefs or (args[k]:sub(1, 1) == "-" and args[k]:find("F", 2, true) ~= nil)
+			end
 		end
 		local rest, dash = {}, false
 		for k = j, #args do
@@ -88,7 +89,7 @@ return function(sh, cmd, args, hook, tcb)
 			for _, nm in ipairs(names) do
 				local d = fmt_decl(sh, nm)
 				if d then
-					sh:echo(d)
+					sh:echo(nodefs and d:gsub("=.*$", "") or d)
 				end
 			end
 			sh.status = 0

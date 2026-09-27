@@ -22,6 +22,10 @@ return function(sh, cmd, args, hook, tcb)
 				.. (v:find("'", 1, true) and rt.sh_single_quote(v) or "'" .. v .. "'"))
 		end
 		if listall or j > #args then -- print all, sorted
+			if next(sh.aliases) == nil then -- (alias.def: no aliases at all returns success
+				sh.status = 0 -- at once — `alias -p a=b` defines nothing, operands unseen)
+				return
+			end
 			local ns = {}
 			for k in pairs(sh.aliases) do
 				ns[#ns + 1] = k
