@@ -2695,7 +2695,7 @@ local CASE_TERM = { [";;"] = "break", [";;&"] = "test", [";&"] = "fall" }
 -- reserved words that open a compound command usable as a function body
 local FBODY_KW = { ["if"] = true, ["for"] = true, ["while"] = true, ["until"] = true, ["case"] = true, ["select"] = true }
 
-local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs, xg, bq)
+local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs, xg, bq, cs)
 	if MBX then -- (a multibyte locale with ASCII trail bytes: see mb_hide)
 		local hsrc, map, cls = mb_hide(src)
 		if hsrc then
@@ -2704,7 +2704,7 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs, xg, bq
 					MB_BSL = ph -- byte-wise, as a line continuation — see collect_heredocs)
 				end
 			end
-			local nextf = make_parser(hsrc, sh, aenv, noalias, posix, line0, lineabs, xg, bq)
+			local nextf = make_parser(hsrc, sh, aenv, noalias, posix, line0, lineabs, xg, bq, cs)
 			return function()
 				local lg = nextf()
 				if lg then
@@ -3095,7 +3095,8 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs, xg, bq
 				end
 				-- a $(…) body's final `DELIM )` line reached here as `DELIM ` (see scan_cmdsub);
 				-- a backtick body has no such form: its last `DELIM ` line is body text
-				if le > n and line0 and not bq and lstr:match("^(.-)[ \t]+$") == hd.delim then
+				-- (cs: a $(…) body compiled as a fragment, read without a line0)
+				if le > n and (line0 or cs) and not bq and lstr:match("^(.-)[ \t]+$") == hd.delim then
 					found = true
 					break
 				end
@@ -5341,11 +5342,11 @@ end
 -- program, and by callers that want the AST). An optional `sh` makes alias
 -- expansion consult the live runtime table (for eval/source/$() at runtime); the
 -- compiler passes none, so it tracks aliases deterministically from source.
--- (bq: `src` is a `…` body)
-function M.parse(src, sh, aenv, noalias, posix, line0, line1, xg, bq)
+-- (bq: `src` is a `…` body; cs: a $(…) body)
+function M.parse(src, sh, aenv, noalias, posix, line0, line1, xg, bq, cs)
 	local saved_env, sprex, spdq, sltr = ALIAS_ENV, COMSUB_PREX, POSIX_DQ, LTR_SEEN
 	LTR_SEEN = false
-	local nextf = make_parser(src, sh, aenv, noalias, posix, line0, line1, xg, bq) -- yields logical-line groups { stmts, perr }
+	local nextf = make_parser(src, sh, aenv, noalias, posix, line0, line1, xg, bq, cs) -- yields logical-line groups { stmts, perr }
 	local stmts, lines, xgg = {}, {}, nil
 	while true do
 		local lg = nextf()

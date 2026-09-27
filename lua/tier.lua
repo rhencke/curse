@@ -200,14 +200,14 @@ end
 -- extglob`, BASHOPTS/SHELLOPTS — which the interpreter's first run read it under, so the
 -- module a warm run loads must too). aenv: the alias table the parse starts from; line1:
 -- the line the text numbers from.
-function M.parse_start(src, pst, aenv, line1)
+function M.parse_start(src, pst, aenv, line1, cs) -- (cs: a $(…) body — its last `DELIM )` line)
 	local xg = nil
 	if pst and pst:find("x", 1, true) then
 		xg = true
 	elseif pst and pst:find("-", 1, true) then
 		xg = false
 	end
-	return mb_parse(pst, P.parse, src, nil, aenv, nil, pst and pst:find("p", 1, true) ~= nil or nil, nil, line1, xg)
+	return mb_parse(pst, P.parse, src, nil, aenv, nil, pst and pst:find("p", 1, true) ~= nil or nil, nil, line1, xg, nil, cs)
 end
 function M.try_fragment(code, line1, sh, now, label, noalias) -- line1: an eval's own line, which its code numbers from
 	-- (now: the caller already saw this code run — compile it on this first call;
@@ -243,7 +243,8 @@ end
 function M.compile_fragment(code, line1, mode, atab, pst)
 	-- (atab: the live alias table, expansion on — the parse starts from it; pst: the live
 	-- posix/extglob/lexing state, "p"?("x"|"-")"b"?, else the parse tracks them from the text)
-	local pok, ast = pcall(M.parse_start, code, pst, atab and aenv_of(atab) or nil, line1 or nil)
+	local pok, ast = pcall(M.parse_start, code, pst, atab and aenv_of(atab) or nil, line1 or nil,
+		mode and mode:find("C", 1, true) ~= nil and not mode:find("Q", 1, true) or nil)
 	-- A syntax error becomes a `parse_error` statement after the valid prefix: compiled, it
 	-- reports and raises __curse_parseerr, which the caller (eval/source/trap) contains.
 	if not pok or type(ast) ~= "table" then
