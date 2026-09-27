@@ -1635,8 +1635,10 @@ end
 expand_part_str = function(sh, p, assign)
 	if p.lit ~= nil then
 		return p.lit
-	elseif p.bterr then -- (a brace range's unclosed backquote: bq_word in the parser)
-		sherr(sh, 'curse: bad substitution: no closing "`" in ' .. p.bterr .. "\n")
+	elseif p.bterr or p.nulcut then -- (a brace range's unclosed backquote: bq_word in the
+		-- parser; a word cut at a $'…' NUL: parser.dq_nulcut)
+		sherr(sh, p.bterr and ('curse: bad substitution: no closing "`" in ' .. p.bterr .. "\n")
+			or ("curse: bad substitution: no closing `}' in " .. p.nulcut .. "\n"))
 		error({ __curse_exit = 1, __curse_lineabort = true, __curse_discard = true })
 	elseif p.var then
 		-- a nameref whose target has a subscript (`typeset -n ref='a[2]'`) reads as

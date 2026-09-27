@@ -933,7 +933,7 @@ local function emitable_word(w)
 		if p.pexp and not pexp_compilable(p.pexp, p.q) then
 			return false
 		end
-		if p.procsub or p.bterr then
+		if p.procsub or p.bterr or p.nulcut then
 			return false
 		end -- <(cmd)/>(cmd): needs the interp's temp-file setup; a brace range's open ` errors there
 		if p.special and not RENDERABLE_SPECIAL[p.special] then

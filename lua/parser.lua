@@ -1448,6 +1448,45 @@ local function bq_body(s, i, unesc)
 	end
 	return table.concat(buf), j + 1
 end
+-- A "…" ${NAME-WORD} (also :- = := ? :? + :+) whose WORD holds a $'…' decoding to a NUL:
+-- bash translates that $'…' as it reads the word (parse_matched_pair's ansiexpand), and its
+-- C string ends at the NUL — so the word's text is cut there, and expanding it is `bad
+-- substitution: no closing `}' in "${u-r` (status 1, the line abandoned). Sets M.nulcut
+-- to the cut text of the "…" contents (from inner[1]) and returns true.
+function M.dq_nulcut(inner, i)
+	if not inner:find("$'", i, true) then
+		return false
+	end
+	local ok, e = pcall(scan_braces, inner, i + 1, true)
+	if not ok then
+		return false
+	end
+	local body = inner:sub(i + 2, e - 2)
+	local _, oe = body:find("^[#!]?[%w_@*?$!#-]+%b[]")
+	oe = oe or select(2, body:find("^[#!]?[%w_@*?$!#-][%w_]*"))
+	if not oe or not body:find("^:?[-=?+]", oe + 1) then
+		return false
+	end
+	local k = i + 2 + oe
+	while k < e - 1 do
+		local c = inner:sub(k, k)
+		if c == "\\" then
+			k = k + 2
+		elseif c == "$" and inner:sub(k + 1, k + 1) == "'" then
+			local qe = quote_end(inner, k + 1, true)
+			local d = require("runtime").ansi_unescape(inner:sub(k + 2, qe - 2), "z")
+			local z = d:find("\0", 1, true)
+			if z then
+				M.nulcut = inner:sub(1, k - 1) .. d:sub(1, z - 1)
+				return true
+			end
+			k = qe
+		else
+			k = k + 1
+		end
+	end
+	return false
+end
 local function parse_dquote(inner, add, heredoc, bt_keep)
 	bt_keep = bt_keep or heredoc
 	local i = 1
@@ -1467,6 +1506,9 @@ local function parse_dquote(inner, add, heredoc, bt_keep)
 				i = i + 1
 			end
 		elseif c == "$" then
+			if not (heredoc or POSIX_DQ) and inner:byte(i + 1) == 123 and M.dq_nulcut(inner, i) then
+				return -- (the word's text ends at a NUL: parse_word makes it an error part)
+			end
 			-- (a heredoc body's ${x-word} keeps a $'…' in word literal — bash; so does a
 			-- "…" one in posix mode)
 			i = parse_dollar(inner, i, (heredoc or POSIX_DQ) and function(p)
@@ -1592,6 +1634,11 @@ local function parse_word(w)
 			local j = dq_end(w, i, true) - 1 -- is paren-counted); j: the closing quote
 			local before = #parts
 			parse_dquote(w:sub(i + 1, j - 1), add)
+			if M.nulcut then -- (the text ends at a $'…' NUL: expanding it is an error)
+				local cut = w:sub(1, i) .. M.nulcut
+				M.nulcut = nil
+				return { k = "word", parts = { { nulcut = cut } }, src = src }
+			end
 			if #parts == before then
 				parts[#parts + 1] = { lit = "", q = true }
 			elseif #parts > before + 1 then

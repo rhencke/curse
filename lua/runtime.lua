@@ -13874,8 +13874,8 @@ end
 -- default (echo -e) treats \c as "stop output".
 -- mode: true = $'…' (\cX ctrl, \NNN octal); "b" = printf %b (\NNN and \0NNN octal,
 -- \c stops); nil/false = echo -e (\0NNN octal only — bare \NNN stays literal, \c stops).
-function M.ansi_unescape(s, mode)
-	local ansi_c = (mode == true)
+function M.ansi_unescape(s, mode) -- ("z": as $'…', but kept whole past a \0)
+	local ansi_c = (mode == true or mode == "z")
 	local out, i, n = {}, 1, #s
 	while i <= n do
 		local c = s:sub(i, i)
@@ -13982,7 +13982,7 @@ function M.ansi_unescape(s, mode)
 		end
 	end
 	local r = table.concat(out)
-	if ansi_c then -- ($'…' is a C string: it ends at a \0 — `x$'\0'y` is `xy`, $'a\0b' is `a`)
+	if mode == true then -- ($'…' is a C string: it ends at a \0 — `x$'\0'y` is `xy`, $'a\0b' is `a`)
 		local z = r:find("\0", 1, true)
 		if z then
 			return r:sub(1, z - 1)
