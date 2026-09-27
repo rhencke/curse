@@ -6233,6 +6233,36 @@ function M.wait_groups(gs, intr) -- (intr: as wait_child's)
 		end
 	end
 end
+-- A process substitution's status for `wait PID` (bash's procsub_waitpid): its group
+-- (drain_procsub keeps it, not waited for) is waited for now if still running.
+function M.procsub_wait(sh, pid, intr)
+	local g = sh.procsub_status and sh.procsub_status[pid]
+	if type(g) ~= "table" then
+		return g
+	end
+	if not g.done then
+		M.wait_groups({ g }, intr)
+		if not g.done then
+			return nil
+		end
+	end
+	return g.status[1] or 0
+end
+-- `wait` with no ids waits for every running procsub too (procsub_waitall).
+function M.procsub_waitall(sh, intr)
+	local live = sh.procsub_live
+	if not live then
+		return
+	end
+	M.wait_groups(live, intr)
+	local kept = {}
+	for _, g in ipairs(live) do
+		if not g.done then
+			kept[#kept + 1] = g
+		end
+	end
+	sh.procsub_live = #kept > 0 and kept or nil
+end
 -- Run every background job to its end (the script is over; bash would leave them
 -- running — in-process they must finish before this process can).
 function M.sched_drain(sh)

@@ -160,7 +160,7 @@ wait_builtin = function(sh, cmd, args, hook, tcb)
 		local function reap(pid)
 			if rt.wait_child(pid, stbuf, 0, sh) < 0 then
 				-- a process substitution already reaped when its command finished
-				return sh.procsub_status and sh.procsub_status[pid] or 127
+				return rt.procsub_wait(sh, pid, sh) or 127
 			end
 			return rt.wexit(stbuf[0])
 		end
@@ -403,6 +403,9 @@ wait_builtin = function(sh, cmd, args, hook, tcb)
 					end
 				end
 				sh.bg_pids = kept
+			end
+			if not sh.wait_sig then
+				rt.procsub_waitall(sh, sh)
 			end
 			sh.status = 0
 			waited = nil -- (wait with no ids never sets VAR)
