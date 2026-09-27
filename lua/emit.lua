@@ -7356,6 +7356,12 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
 		local k = cx.nd - (nd or 0)
 		return k > 0 and ("sh.noerr = sh.noerr - %d; "):format(k) or ""
 	end
+	-- (EF.lc_rel: run-level locals holding the caller's loop depth and compiled-loop mark
+	-- as the fragment was entered)
+	function cx.lcbase()
+		cx.lc_base = cx.lc_base or { cx.newloopvar("(sh.loopdepth or 0)"), cx.newloopvar("(sh.lc_depth or 0)") }
+		return cx.lc_base[1], cx.lc_base[2]
+	end
 	function cx.newpc()
 		local p = cx.npc
 		cx.npc = cx.npc + 1
@@ -7931,9 +7937,11 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
 						-- (no loop around the caller either — a trap handler run outside any loop, a
 						-- function's: bash says so, status 0, and goes on)
 						cx.blocks[p] = d .. ((EF.fragment and not EF.lm and cx.toplevel)
+							-- (the level clamps to the loops there are — bash's break_builtin:
+							-- `if (newbreak > loop_level) newbreak = loop_level`)
 							and ("if (sh.loopdepth or 0) == 0 then if not sh.opt_posix then io.stderr:write(%q) end; sh.status = 0; pc = %d else %s end"):format(
 								"curse: " .. cf_op .. ": only meaningful in a `for', `while', or `until' loop\n", after,
-								(EF.cf_flush or "") .. cx.ndadj(0) .. ("error({ __curse_%s = %d })"):format(cf_op, lvl))
+								(EF.cf_flush or "") .. cx.ndadj(0) .. ("error({ __curse_%s = math.min(%d, sh.loopdepth) })"):format(cf_op, lvl))
 							or ((EF.cf_flush or "") .. cx.ndadj(0) .. ("error({ __curse_%s = %d })"):format(cf_op, lvl)))
 					elseif EF.cs_in_loop then -- (in a `$( … )` inside a loop: ends it)
 						cx.blocks[p] = d .. ("error({ __curse_%s = %d })"):format(cf_op, lvl)
@@ -7962,8 +7970,15 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
 					elseif EF.fragment and not EF.lm and lvl > #cx.loopstack then
 						-- (an eval / hot-loop fragment inside the caller's loops: the levels past
 						-- its own reach them — bash counts across; with none, it clamps)
-						cx.blocks[p] = d .. ("if sh.loopdepth > 0 then %s%serror({ __curse_%s = %d }) end; sh.status = 0; %spc = %d"):format(
-							EF.cf_flush or "", cx.ndadj(0), cf_op, lvl - #cx.loopstack, cx.ndadj(cx.loopstack[idx].nd), tgt)
+						-- (the level clamps to the loops there are — its own and the caller's:
+						-- bash's break_builtin; leaving, the caller's depth marks come back)
+						local N = #cx.loopstack
+						local back = ""
+						if EF.lc_rel then
+							back = ("sh.loopdepth, sh.lc_depth = %s, %s; "):format(cx.lcbase())
+						end
+						cx.blocks[p] = d .. ("if sh.loopdepth > %d then local __n = math.min(%d, sh.loopdepth - %d); %s%s%serror({ __curse_%s = __n }) end; sh.status = 0; %spc = %d"):format(
+							EF.lc_rel and N or 0, lvl - N, EF.lc_rel and N or 0, EF.cf_flush or "", cx.ndadj(0), back, cf_op, cx.ndadj(cx.loopstack[idx].nd), tgt)
 					else
 						cx.blocks[p] = d .. cx.ndadj(cx.loopstack[idx].nd) .. ("sh.status = 0; pc = %d"):format(tgt)
 					end
@@ -8164,9 +8179,20 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
 			cx.lc_guarded[st] = true
 			local D = #cx.loopstack
 			local post = cx.newpc()
+			local entry, pre
+			if EF.lc_rel then -- (a fragment inside the caller's loops: its depths count on
+				-- from theirs, and leaving its outermost loop gives the caller's marks back)
+				local lb, lc0 = cx.lcbase()
+				cx.blocks[post] = D == 0 and ("sh.loopdepth, sh.lc_depth = %s, %s; pc = %d"):format(lb, lc0, after)
+					or ("sh.loopdepth = %s + %d; sh.lc_depth = sh.loopdepth; pc = %d"):format(lb, D, after)
+				entry = cx.flatten_stmt(st, post)
+				pre = cx.newpc()
+				cx.blocks[pre] = ("sh.loopdepth = %s + %d; sh.lc_depth = sh.loopdepth; pc = %d"):format(lb, D + 1, entry)
+				return pre
+			end
 			cx.blocks[post] = ("sh.loopdepth, sh.lc_depth = %d, %d; pc = %d"):format(D, D, after)
-			local entry = cx.flatten_stmt(st, post)
-			local pre = cx.newpc()
+			entry = cx.flatten_stmt(st, post)
+			pre = cx.newpc()
 			cx.blocks[pre] = ("sh.loopdepth, sh.lc_depth = %d, %d; pc = %d"):format(D + 1, D + 1, entry)
 			return pre
 		end
@@ -8218,9 +8244,15 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
 			if lp then -- (after each command in a loop: a trap handler's break/continue lands)
 				if not lp.lch then
 					lp.lch = cx.newpc()
-					-- (the outermost loop of this CFG clamps a higher level, as bash)
-					cx.blocks[lp.lch] = ("local c = sh.loopctl; if c.n > 1 and %s then c.n = c.n - 1; pc = %d elseif c.kind == 'break' then sh.loopctl = nil; pc = %d else sh.loopctl = nil; pc = %d end"):format(
-						tostring(#cx.loopstack > 1), lp.brk, lp.brk, lp.cont)
+					-- (the outermost loop of this CFG clamps a higher level, as bash — but a
+					-- fragment's outermost loop passes the rest on to the caller's loops: the
+					-- handler clamped it to the depth they all make)
+					local up = EF.lc_rel and #cx.loopstack == 1 and cx.lc_base
+					cx.blocks[lp.lch] = ("local c = sh.loopctl; if c.n > 1 and %s then c.n = c.n - 1; pc = %d %selseif c.kind == 'break' then sh.loopctl = nil; pc = %d else sh.loopctl = nil; pc = %d end"):format(
+						tostring(#cx.loopstack > 1), lp.brk,
+						up and ("elseif c.n > 1 then sh.loopctl = nil; sh.loopdepth, sh.lc_depth = %s, %s; %s%serror({ [c.kind == 'break' and '__curse_break' or '__curse_continue'] = c.n - 1 }) "):format(
+							up[1], up[2], EF.cf_flush or "", cx.ndadj(0)) or "",
+						lp.brk, lp.cont)
 				end
 				local chk = cx.newpc()
 				cx.blocks[chk] = ("if sh.loopctl then pc = %d else pc = %d end"):format(lp.lch, nextpc)
@@ -8669,7 +8701,12 @@ function M.emit(ast, opts)
 	-- compiled call checks the depth first, as run_function does
 	EF.funcnest = fnest or EF.fragment or scan.dyncode or false
 	-- a trap handler that may break/continue: loops keep their depth and check for it
-	EF.trap_loopctl = EF.lm or (not EF.fragment and scan.trap_lc or false)
+	-- (a fragment — eval/source text, a hot loop — when a trap that may break/continue is
+	-- set as it compiles (tier.trap_mode "L": keyed by it) or its own text sets one: its
+	-- loop depths count on from the caller's, EF.lc_rel)
+	EF.trap_loopctl = EF.lm or (not EF.fragment and scan.trap_lc)
+		or (EF.fragment and (scan.trap_lc or (opts and opts.trap_lc))) or false
+	EF.lc_rel = EF.trap_loopctl and EF.fragment and not EF.lm or false
 	-- (in line mode the live reader already expanded this line's aliases)
 	local alias_kind = EF.lm and "none" or scan_alias(ast.stmts)
 	if alias_kind == "dynamic" or (alias_kind == "static" and scan.dyncode) then

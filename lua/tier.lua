@@ -79,6 +79,17 @@ end
 -- program's text needs of EVERY piece of code compiled for it. A whole module's own scan
 -- decides these for itself, but a fragment — a line in line mode, eval/source text, a
 -- hot loop — can't see the code around it that reads them.
+-- "L": a trap whose action may break/continue is set — a fragment's loops then keep the
+-- loop depth and check after each command for the handler's break/continue (emit
+-- EF.trap_loopctl), bash's loop_level being global. (Textual, as emit's own scan.)
+local function trap_lc(t)
+	for _, a in pairs(t) do
+		if type(a) == "string" and (a:find("%f[%w_]break%f[^%w_]") or a:find("%f[%w_]continue%f[^%w_]")) then
+			return true
+		end
+	end
+	return false
+end
 local function trap_mode(sh)
 	local t = sh and sh.traps
 	if not t then
@@ -86,7 +97,7 @@ local function trap_mode(sh)
 	end
 	local e = t.ERR and t.ERR ~= "" and "E" or ""
 	local d = t.DEBUG and t.DEBUG ~= "" and (sh.opt_functrace and "T" or "D") or ""
-	return e .. d .. (sh.trap_bcmd and "B" or "") .. (sh.pflags or "")
+	return e .. d .. (sh.trap_bcmd and "B" or "") .. (sh.pflags or "") .. (trap_lc(t) and "L" or "")
 end
 M.trap_mode = trap_mode
 -- Note a program's (or a sourced file's) text in sh.pflags, sticky: "P" it reads
@@ -119,6 +130,7 @@ local function emit_opts(mode, o)
 	o.extdebug = mode:find("X", 1, true) ~= nil
 	o.perr_label = mode:find("V", 1, true) and "eval" or nil
 	o.trapline = mode:find("H", 1, true) ~= nil
+	o.trap_lc = mode:find("L", 1, true) ~= nil
 	return o
 end
 -- With alias expansion on, a fragment's text parses with the live alias table (its own
