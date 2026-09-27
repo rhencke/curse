@@ -652,6 +652,14 @@ local dparen_is_arith, grab_dparen -- forward (defined below)
 -- or — `err` — raises bash's EOF error naming the quote.
 -- A quoted string: s[i] is its opening quote, closed by the same byte. `esc`: a `\` escapes
 -- the next byte ("…" without nesting, `…`, and a $'…' from its `'`); '…' has no escapes.
+-- A syntax error raised with error() carries the Lua position of the raise (this chunk's
+-- short_src:line — a checkout path in a dev run): not part of the message, and it would
+-- make compiled code (which embeds the message) depend on where curse was built.
+local POS = "^" .. debug.getinfo(1, "S").short_src:gsub("%p", "%%%0") .. ":%d+: "
+local function unpos(m)
+	return (m:gsub(POS, "", 1))
+end
+
 -- Every "unexpected EOF while looking for matching `X'" is raised here, noting where the
 -- open construct began: bash reports it at THAT line (parse_matched_pair's start_lineno —
 -- the quote's, not the command's), which next_line derives from the noted position.
@@ -5286,7 +5294,7 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs, xg, bq
 								and startline + select(2, src:sub(start, eof_at - 1):gsub("\n", ""))
 							or startline,
 						msg = recover and ("syntax error near `" .. (st.tok or "(") .. "'")
-							or (type(st) == "table" and st.__curse_perr and st.msg) or tostring(st),
+							or (type(st) == "table" and st.__curse_perr and st.msg) or unpos(tostring(st)),
 						status = type(st) == "table" and st.__curse_perr and st.status
 							or (arrlit_eof and type(st) == "string" and 1) or nil, -- (else 2)
 						pre = type(st) == "table" and st.__curse_perr and st.pre or nil, -- (messages before it)

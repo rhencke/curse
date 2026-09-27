@@ -30,15 +30,40 @@ local function tslist(sh)
 end
 M.tslist = tslist
 
--- readline's history_comment_char for timestamps: none in a script until HISTTIMEFORMAT
--- is set (sv_histtimefmt makes it `#`, for good) or $histchars names one
-function M.tscc(sh)
-	if sh.hist_cc == nil and sh.vars.HISTTIMEFORMAT then
-		sh.hist_cc = "#"
-	end
+-- readline's history_comment_char, which starts each timestamp (hist_inittime) and gates
+-- history_get_time. It starts '\0' and changes only through bash's hooks, which this
+-- replays by watching their inputs change (it is consulted wherever bash would use it):
+-- sv_histchars (on any change of $histchars: its 3rd char, kept when a later value has
+-- none; '#' when it's unset), run by bash_initialize_history whenever histexpand turns on
+-- — an interactive shell, `set -H` — and sv_histtimefmt ($HISTTIMEFORMAT appearing: '#'
+-- if still '\0').
+local function sv_histchars(sh)
 	local hc = sh.vars.histchars and sh:get("histchars")
-	if hc and #hc >= 3 then
-		return hc:sub(3, 3)
+	if hc == nil then
+		sh.hist_cc = "#"
+	elseif #hc >= 3 then
+		sh.hist_cc = hc:sub(3, 3)
+	end
+end
+function M.tscc(sh)
+	local hc = sh.vars.histchars and sh:get("histchars") or false
+	if hc ~= (sh.hist_hc_seen or false) then
+		sh.hist_hc_seen = hc
+		sv_histchars(sh)
+	end
+	local H = rt.opt_on(sh, "opt_H") and true or false
+	if H ~= (sh.hist_H_seen or false) then
+		sh.hist_H_seen = H
+		if H then
+			sv_histchars(sh)
+		end
+	end
+	local tf = sh.vars.HISTTIMEFORMAT ~= nil
+	if tf ~= (sh.hist_tf_seen or false) then
+		sh.hist_tf_seen = tf
+		if tf and sh.hist_cc == nil then
+			sh.hist_cc = "#"
+		end
 	end
 	return sh.hist_cc or "\0"
 end
@@ -514,7 +539,7 @@ end
 
 -- load_history (bash, at `set -o history` before any line was added): default HISTSIZE
 -- and HISTFILESIZE, then read $HISTFILE.
-function M.load(sh)
+function M.load(sh, keepfile)
 	if (sh.hist_session or 0) > 0 then
 		return
 	end
@@ -523,6 +548,12 @@ function M.load(sh)
 	end
 	if sh.vars.HISTFILESIZE == nil then
 		sh:set_str("HISTFILESIZE", sh:get("HISTSIZE"))
+	end
+	-- (sv_histsize ("HISTFILESIZE"): the file is truncated to it BEFORE it's read — an
+	-- unset $HISTFILE means ~/.history; KEEPFILE: the REPL's ~/.bash_history default,
+	-- which curse never touches)
+	if not keepfile then
+		rt.hist_resize(sh, "HISTFILESIZE")
 	end
 	local hf = sh.vars.HISTFILE and sh:get("HISTFILE") or ""
 	if hf ~= "" then

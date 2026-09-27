@@ -51,7 +51,7 @@ local function full_stamp()
 	local ok, bid = pcall(require, "curse_buildid")
 	if not ok or type(bid) ~= "string" then
 		local acc = {}
-		for _, m in ipairs({ "emit", "runtime", "interp", "tier", "parser" }) do
+		for _, m in ipairs({ "emit", "runtime", "interp", "tier", "parser", "deparse", "gettext", "cache" }) do
 			local path = package.searchpath(m, package.path)
 			local f = path and io.open(path, "rb")
 			if f then
