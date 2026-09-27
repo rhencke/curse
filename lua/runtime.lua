@@ -2345,6 +2345,26 @@ function M.fg_ended(sh, pid, s)
 end
 
 
+-- check_binary_file (general.c) on a file's first bytes: an ELF magic (a corrupt or
+-- foreign ELF the kernel refused), or a NUL in its first line — first two after `#!`.
+function M.binary_sample(sample)
+	if #sample >= 4 and sample:sub(1, 4) == "\127ELF" then
+		return true
+	end
+	local nl = sample:sub(1, 2) == "#!" and 2 or 1
+	for k = 1, #sample do
+		local b = sample:byte(k)
+		if b == 10 then
+			nl = nl - 1
+			if nl == 0 then
+				return false
+			end
+		elseif b == 0 then
+			return true
+		end
+	end
+	return false
+end
 -- A no-shebang script runs as a FRESH shell would (bash's reinitialized child: only the
 -- exported environment, its own vars/functions/traps) — in-process: a new Shell, run
 -- inside an isolation context of ours (its stack shared) so the process-global state the
@@ -2357,25 +2377,24 @@ function Shell:run_script_inproc(path, args, n, out)
 	if f then
 		f:close()
 	end
-	do -- (check_binary_file: a NUL before the first newline in its first 80 bytes)
-		local z = src:find("\0", 1, true)
-		if z and z <= 80 then
-			local nl = src:find("\n", 1, true)
-			if not nl or nl > z then
-				self:errmsg("curse: " .. path .. ": cannot execute binary file: Exec format error\n")
-				if self.exec_builtin then -- (exec_builtin's file_error then, errno 0)
-					self:errmsg("curse: " .. path .. ": Success\n")
-				end
-				self.status = 126
-				return
-			end
+	if M.binary_sample(src:sub(1, 80)) then -- (shell_execve's READ_SAMPLE_BUF: 80 bytes)
+		self:errmsg("curse: " .. path .. ": cannot execute binary file: Exec format error\n")
+		if self.exec_builtin then -- (exec_builtin's file_error then, errno 0)
+			self:errmsg("curse: " .. path .. ": Success\n")
 		end
+		self.status = 126
+		return
+	end
+	if src:find("\0", 1, true) then
+		src = src:gsub("%z", "") -- (shell_getc drops the NUL bytes of a script's text)
 	end
 	local csh = M.cur_shell -- (before Shell.new, which makes the new shell current)
 	local depth = self.subdepth -- (a fresh shell: $BASH_SUBSHELL as it is here)
 	local child = Shell.new()
 	-- (`exec`'s script: $0 is its -a NAME, else the full pathname — shell_execve)
-	child.argv0, child.out = self.exec_builtin and (self.exec_script_a0 or path) or args[1], out or io.write
+	-- (a command's: the pathname it was run by — found along PATH, the full one; shell_execve
+	-- puts `command` in its argv[0] slot)
+	child.argv0, child.out = self.exec_builtin and (self.exec_script_a0 or path) or path, out or io.write
 	child.capturing = out and true or nil
 	child.shopt.globskipdots = self.shopt.globskipdots -- (reset_shopt_options keeps it)
 	M.startup_ignored(child) -- a new shell: what's ignored now stays ignored
