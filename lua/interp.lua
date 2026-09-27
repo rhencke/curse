@@ -4102,6 +4102,9 @@ end
 -- A function OVERRIDES a builtin of the same name in bash, so this is dispatched
 -- before the builtin table (except via `command`, which passes no_func).
 local function run_function(sh, cmd, fn, args, hook, tenv_base)
+	if PREEMPT[0] ~= 0 then -- (a function's entry is a preemption point, like a loop head:
+		rt.preempt() -- pure recursion has none — rt.preempt)
+	end
 	if sh.vars.FUNCNEST then -- ($FUNCNEST: past that many nested calls, the line is abandoned)
 		rt.funcnest_over(sh, cmd)
 	end

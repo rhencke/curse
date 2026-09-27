@@ -8589,6 +8589,10 @@ assemble = function(cfg, sig, opts)
 	if opts.toplevel then
 		o[#o + 1] = ("  pc = pc or %d"):format(cfg.entry)
 	end
+	if opts.fnresume then -- a function's entry checks for preemption too (pure recursion
+		-- has no loop head: `f() { f; }` must still yield to the jobs: rt.preempt)
+		o[#o + 1] = "  if __pre[0] ~= 0 then rt.preempt() end"
+	end
 	o[#o + 1] = "  while true do"
 	-- a loop's head checks for preemption (a background job whose CPU slice ran out
 	-- yields there: rt.preempt) — in a trace the load is hoisted, ~free
