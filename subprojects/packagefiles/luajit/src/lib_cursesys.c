@@ -39,6 +39,7 @@ extern char fclose[];
 extern char fcntl[];
 extern char flock[];
 extern char fnmatch[];
+extern char fnmatch[];
 extern char fopen[];
 extern char fork[];
 extern char free[];
@@ -175,6 +176,7 @@ static const curse_sym_t curse_syms[] = {
   { "fclose", (void*)fclose },
   { "fcntl", (void*)fcntl },
   { "flock", (void*)flock },
+  { "fnmatch", (void*)fnmatch },
   { "fnmatch", (void*)fnmatch },
   { "fopen", (void*)fopen },
   { "fork", (void*)fork },
