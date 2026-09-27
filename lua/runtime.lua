@@ -13270,7 +13270,14 @@ function M.ansi_unescape(s, mode)
 			i = i + 1
 		end
 	end
-	return table.concat(out)
+	local r = table.concat(out)
+	if ansi_c then -- ($'…' is a C string: it ends at a \0 — `x$'\0'y` is `xy`, $'a\0b' is `a`)
+		local z = r:find("\0", 1, true)
+		if z then
+			return r:sub(1, z - 1)
+		end
+	end
+	return r
 end
 
 function Shell:echo(...)
