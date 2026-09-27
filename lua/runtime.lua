@@ -369,6 +369,10 @@ function Shell.new()
 	end
 	M.glob_asciirange = true -- (shopt globasciiranges' default; a daemon worker reuses the module)
 	M.td_binds = nil -- (the process's bindtextdomain()s: M.bind_textdomain)
+	local P = package.loaded.parser
+	if P then -- (parse.y's function_bstart: a new shell process's static starts at 0)
+		P.fn_bstart = 0
+	end
 	local sh = setmetatable({
 		vars = {}, -- name -> { s = string?, n = int64? }  (lazy: fill on demand)
 		status = 0, -- $?

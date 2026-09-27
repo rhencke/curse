@@ -4146,7 +4146,17 @@ local function run_function(sh, cmd, fn, args, hook, tenv_base)
 	local rsave, rsavedout, rok, pnp, pnf
 	if fr then
 		pnp, pnf = rt.procsub_mark(sh) -- (a >() target there: drained after the body, as on a
-		rsave, rok = apply_redirs(sh, fr) -- compound command — a compiled caller has no drain)
+		-- (compound command — a compiled caller has no drain.) They are applied at the line
+		-- execute_function sets: `line_number = function_line_number = tc->line`, not the call's
+		local sv_cl, sv_fl = sh.cur_line, sh.force_line -- (force_line: whichever tier called)
+		local fd = sh.func_def and sh.func_def[cmd]
+		-- (the parser's: see funcdef_node; 0 — no line at all)
+		local bl = fd and (not sh.eof_read and fd.rline_own or fd.rline)
+		if bl then
+			sh.cur_line, sh.force_line = bl, bl
+		end
+		rsave, rok = apply_redirs(sh, fr)
+		sh.cur_line, sh.force_line = sv_cl, sv_fl
 		rsavedout = sh.out
 		if redirs_touch_stdout(fr) then
 			sh.out = io.write
@@ -6312,6 +6322,10 @@ local function finish(sh, ok, err)
 	end
 	-- (the script ran to its end: the reader reading end of input notifies of the jobs
 	-- that ended meanwhile — rt.jobs_line; not after an `exit`)
+	-- (reader_loop read end of input: bash's `executing` is 0 from here — not after an
+	-- `exit`, nor under -c (ONESHOT) — so executing_line_number stops naming a [[ ]] /
+	-- (( )) / for (( )) command's own line: M.fn_redir_line)
+	sh.eof_read = ok and not sh.opt_c or nil
 	if ok and (sh.jobs_waited or sh.jobs_pending) and sh.main_src and not sh.opt_c then
 		local okp, ast = pcall(P.parse, sh.main_src)
 		rt.jobs_line(sh, okp and ast.eofline or nil)
