@@ -353,7 +353,7 @@ local function readdir_all(path)
 		if e == nil then
 			break
 		end
-		out[#out + 1] = ffi.string(ffi.cast("const char *", e) + 19)
+		out[#out + 1] = ffi.string(ffi.cast("const char *", e) + rt.DNAME_OFF)
 	end
 	ffi.C.closedir(d)
 	return out

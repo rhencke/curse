@@ -1393,6 +1393,17 @@ array_key = function(sh, name, index_raw)
 		if type(v) == "table" and v.__curse_unbound then
 			error(v, 0) -- (set -u: said already, and fatal as it is — no syntax error on top)
 		end
+		if type(v) == "table" and v.pre and not v.__curse_matherr then
+			-- (a syntax error: what bash evaluated before it ran first — `[x+]` with x holding
+			-- a bad expression reports x's error, not the `+`)
+			local pok, pe = pcall(arith_pre, sh, v)
+			if not pok then
+				if type(pe) == "table" and pe.__curse_unbound then
+					error(pe, 0)
+				end
+				v = pe
+			end
+		end
 		if not (type(v) == "table" and v.__curse_matherr) then -- (an eval error already said so)
 			io.stderr:write("curse: " .. P.arith_errmsg(index_raw, v) .. "\n")
 		end
@@ -1447,20 +1458,24 @@ local function expand_procsub(sh, p)
 	end
 	local mine, theirs = pfd[p.dir == "<" and 0 or 1], pfd[p.dir == "<" and 1 or 0]
 	local body = p.procsub
+	-- (its body numbers its lines from the command's, as a $(…)'s does: bash parses it in
+	-- place — compiled code's line is found on the stack here, not in the job)
+	local _, l0 = rt.err_where(sh)
 	local job = sh:bg_launch(function(ssh)
-		local stmts = P.parse(body).stmts
+		ssh.cur_line = l0 > 0 and l0 or ssh.cur_line
+		local stmts = P.parse(body, nil, nil, nil, nil, l0 > 0 and l0 or nil).stmts
 		local s1 = #stmts == 1 and stmts[1]
 		if s1 and s1.t == "simple" and #(s1.words or {}) == 0 and s1.redirs and #s1.redirs == 1
 			and s1.redirs[1].op == "in" and not s1.assigns then
 			-- <(< file): the file's contents, like $(< file) (bash 5.2)
 			local path = M.expand_assign_word(ssh, P.parse_word(s1.redirs[1].target or ""))
-			local f = io.open(path, "rb")
+			local f, _, en = io.open(path, "rb")
 			if f then
 				ssh.out(f:read("*a") or "")
 				f:close()
 				ssh.status = 0
 			else
-				io.stderr:write("curse: " .. path .. ": No such file or directory\n")
+				rt.read_fail(path, en)
 				ssh.status = 1
 			end
 			return
@@ -1470,7 +1485,7 @@ local function expand_procsub(sh, p)
 		{ fds = { [p.dir == "<" and 1 or 0] = theirs }, keepstdin = true, nojob = true })
 	C.close(theirs)
 	local fd = rt.fd_below(mine, 64)
-	rt.fd_owner[fd] = sh -- (only this shell's own spawns inherit it)
+	rt.fd_register(fd, sh) -- (only this shell's own spawns inherit it — and its later clones')
 	sh.procsub_files = sh.procsub_files or {}
 	sh.procsub_files[#sh.procsub_files + 1] = { fd = fd, pid = job and job.pid or 0, g = job and job.g }
 	return "/dev/fd/" .. fd
@@ -2703,7 +2718,11 @@ local function apply_redirs(sh, redirs, cname, ctx, args) -- cname: the command 
 	end
 	local function backup(fd)
 		if not persist[fd] then
-			save[#save + 1] = { fd = fd, saved = rt.save_fd(fd) }
+			local e = { fd = fd, saved = rt.save_fd(fd) }
+			save[#save + 1] = e
+			if sh.iso_ctx and sh.iso_ctx[1] then
+				rt.iso_note_save(sh, e)
+			end
 		end
 	end
 	-- redirect targets are word-expanded at runtime (e.g. `> $TMP/f`, `>& $myfd`).
@@ -2778,24 +2797,7 @@ local function apply_redirs(sh, redirs, cname, ctx, args) -- cname: the command 
 			ok = false
 			break
 		end
-		if (noasg or fdb and fdb.ro) and not ((r.op == "dup" or r.op == "dupin") and r.target == "-") then
-			-- `{v}>…` with v readonly: bash refuses (no fd is allocated) and the command fails
-			-- — after it opened (so created) an output file
-			if r.op == "out" or r.op == "clobber" or r.op == "app" then
-				local okp, path = pcall(tgt, r)
-				local f = okp and path ~= "" and rt.ropen(path, r.op == "app" and 1089 or 577, 438)
-				if f and f >= 0 then
-					C.close(f)
-				end
-			end
-			if not noasg then
-				io.stderr:write("curse: " .. r.fdvar .. ": readonly variable\n")
-				rt.report_exit(sh) -- (err_readonly: report_error)
-			end
-			io.stderr:write("curse: " .. r.fdvar .. ": cannot assign fd to variable\n")
-			ok = false
-			break
-		end
+		local fdnew -- (a `{v}>…` fd: v is assigned only once its redirection succeeded)
 		if r.fdvar then
 			if (r.op == "dup" or r.op == "dupin") and r.target == "-" then
 				local cur = fdvar_get()
@@ -2806,15 +2808,13 @@ local function apply_redirs(sh, redirs, cname, ctx, args) -- cname: the command 
 				end
 				r = setmetatable({ fd = tonumber(cur) or -1 }, { __index = r })
 			else
+				-- (redir.c: the target is opened/duplicated first — an open failure is the only
+				-- error — then moved to a free fd >= 10, and only then assigned: a readonly v
+				-- or a noassign array is reported after a successful open, the fd closed)
 				local nf = alloc_fd()
 				if nf < 0 then
 					io.stderr:write((rt.err_prefix(sh):gsub("line %d+: $", "")) .. "redirection error: cannot duplicate fd: Invalid argument\n")
 					io.stderr:write("curse: " .. (r.target or "") .. ": Invalid argument\n")
-					ok = false
-					break
-				end
-				if not fdvar_set(tostring(nf)) then -- (nf is only a free number: nothing opened)
-					io.stderr:write("curse: " .. r.fdvar .. ": cannot assign fd to variable\n")
 					ok = false
 					break
 				end
@@ -2824,7 +2824,9 @@ local function apply_redirs(sh, redirs, cname, ctx, args) -- cname: the command 
 					backup(nf)
 				else
 					persist[nf] = true
+					rt.iso_keep_fd(sh, nf, -1) -- (a subshell's: closed when it ends)
 				end
+				fdnew = nf
 				r = setmetatable({ fd = nf }, { __index = r }) -- shadow r.fd, inherit op/target
 			end
 		end
@@ -2907,6 +2909,9 @@ local function apply_redirs(sh, redirs, cname, ctx, args) -- cname: the command 
 					if C.fcntl(m, 1) == -1 then -- F_GETFD on a closed fd returns -1 (EBADF)
 						-- (bash names the target as written: `$v: Bad file descriptor`)
 						local nm = r.target or tv
+						if fdnew then -- (redir.c: its fcntl(F_DUPFD) fails first — sys_error, no line)
+							io.stderr:write((rt.err_prefix(sh):gsub("line %d+: $", "")) .. "redirection error: cannot duplicate fd: Bad file descriptor\n")
+						end
 						io.stderr:write("curse: " .. (nm:match("^(%d+)%-$") or nm) .. ": Bad file descriptor\n")
 						ok = false
 					else
@@ -2942,6 +2947,21 @@ local function apply_redirs(sh, redirs, cname, ctx, args) -- cname: the command 
 				else -- `>&word` (non-number, r.fd 1): the file gets stdout AND stderr — `&>word`
 					ok = rt.redir_open(sh, "outboth", 1, tv, save)
 				end
+			end
+		end
+		if fdnew and ok then
+			if noasg or (fdb and fdb.ro) then
+				if not noasg then
+					io.stderr:write("curse: " .. r.fdvar .. ": readonly variable\n")
+					rt.report_exit(sh) -- (err_readonly: report_error)
+				end
+				io.stderr:write("curse: " .. r.fdvar .. ": cannot assign fd to variable\n")
+				C.close(fdnew)
+				ok = false
+			elseif not fdvar_set(tostring(fdnew)) then
+				io.stderr:write("curse: " .. r.fdvar .. ": cannot assign fd to variable\n")
+				C.close(fdnew)
+				ok = false
 			end
 		end
 		if not ok then -- (do_redirections stops at the first failure)
@@ -4120,9 +4140,10 @@ local function run_function(sh, cmd, fn, args, hook, tenv_base)
 	local dbg_saved = rt.debug_enter(sh, cmd)
 	-- Redirects on the definition (`f(){ … } >&2`) apply to the whole body per call.
 	local fr = sh.func_redirs and sh.func_redirs[cmd]
-	local rsave, rsavedout, rok
+	local rsave, rsavedout, rok, pnp, pnf
 	if fr then
-		rsave, rok = apply_redirs(sh, fr)
+		pnp, pnf = rt.procsub_mark(sh) -- (a >() target there: drained after the body, as on a
+		rsave, rok = apply_redirs(sh, fr) -- compound command — a compiled caller has no drain)
 		rsavedout = sh.out
 		if redirs_touch_stdout(fr) then
 			sh.out = io.write
@@ -4161,6 +4182,7 @@ local function run_function(sh, cmd, fn, args, hook, tenv_base)
 		io.flush()
 		sh.out = rsavedout
 		restore_redirs(rsave)
+		M._int.drain_procsub(sh, pnp, pnf)
 	end
 	sh.loopdepth = saved_ld
 	-- `return N` sets the function's status but not $? (return.def: only return_catch_value),
@@ -4625,6 +4647,10 @@ local function exec_simple(sh, args, hook, no_func)
 		if args[j] == "--" then -- (end of options)
 			j = j + 1
 		end
+		-- (command.def: no NAME is success; then a restricted shell refuses -p — -v/-V too)
+		if usep and args[j] ~= nil and rt.restricted(sh, "command: -p: restricted") then
+			return
+		end
 		if vflag then
 			command_describe(sh, args, j, vflag == "V", usep)
 			return
@@ -4633,10 +4659,6 @@ local function exec_simple(sh, args, hook, no_func)
 		local svc, iee = sh.via_command, sh.ign_ee
 		sh.via_command = true
 		sh.ign_ee = iee or sh.noerr > 0 -- (errexit-exempt: -e cleared for what it runs, as eval)
-		if usep and rt.restricted(sh, "command: -p: restricted") then
-			sh.via_command, sh.ign_ee = svc, iee
-			return
-		end
 		if args[j] == nil then
 			sh.status = 0
 		else
@@ -4941,6 +4963,16 @@ local function drain_procsub(sh, np, nf)
 		return
 	end
 	io.flush()
+	-- (bash forks each <()/>() child at once, holding every earlier one's end: `tee >(wc -c)
+	-- >(wc -l)` — wc -c sees EOF only once wc -l exits. Let a child not yet started start
+	-- now, with those ends still open, before the shell closes its own.)
+	local gs = {}
+	for i = nf + 1, #files do
+		if files[i].g then
+			gs[#gs + 1] = files[i].g
+		end
+	end
+	rt.procsub_start(gs)
 	for i = nf + 1, #files do
 		C.close(files[i].fd)
 		rt.fd_owner[files[i].fd] = nil
@@ -5310,6 +5342,9 @@ exec_stmt = function(sh, st, hook)
 			exec_stmt(sh, a, hook)
 			if sh.assign_err then
 				sh.cur_alist = nil
+				if sh.procsub_files then -- (the list's <() close with it)
+					drain_procsub(sh, 0, pnf)
+				end
 				return
 			end
 		end
@@ -6303,7 +6338,7 @@ local function run_group(sh, lg, hook, k)
 	for _, st in ipairs(lg.stmts) do
 		k = k + 1
 		hook("stmt", k)
-		local ne0 = sh.noerr
+		local ne0, pf0 = sh.noerr, sh.procsub_files and #sh.procsub_files or 0
 		local ok, err = pcall(exec_stmt, sh, st, hook)
 		if not ok then
 			-- a fatal WORD-context expansion (div0 in $((…)), failglob no-match) aborts
@@ -6314,7 +6349,7 @@ local function run_group(sh, lg, hook, k)
 				end
 				sh.noerr = ne0 -- (an `if`/`&&` condition it unwound out of: errexit is live again)
 				rt.posix_arith_fatal(sh, err)
-				rt.line_aborted(sh, err.__curse_badusage and not sh.opt_c and 2 or 1) -- (a failed ${x:=w})
+				rt.line_aborted(sh, err.__curse_badusage and not sh.opt_c and 2 or 1, pf0) -- (a failed ${x:=w})
 				rt.line_drift(sh, lg.sline, lg.eline) -- (bash's line numbers drift from here)
 				break
 			else
@@ -6586,7 +6621,7 @@ function M.run_variable_command(sh, pc, hook)
 				return
 			end
 			for _, st in ipairs(lg.stmts) do
-				local ne0 = sh.noerr
+				local ne0, pf0 = sh.noerr, sh.procsub_files and #sh.procsub_files or 0
 				local sok, serr = pcall(exec_stmt, sh, st, hook)
 				if not sok then
 					if type(serr) == "table" and serr.__curse_exit and not serr.__curse_lineabort then
@@ -6594,7 +6629,7 @@ function M.run_variable_command(sh, pc, hook)
 					elseif type(serr) == "table" and serr.__curse_lineabort then
 						rt.posix_arith_fatal(sh, serr)
 						sh.noerr = ne0
-						rt.line_aborted(sh, 1)
+						rt.line_aborted(sh, 1, pf0)
 						break
 					else
 						return
@@ -6727,7 +6762,7 @@ function M.source_file(sh, path, hook)
 			return
 		end
 		for _, st in ipairs(lg.stmts) do
-			local ne0 = sh.noerr
+			local ne0, pf0 = sh.noerr, sh.procsub_files and #sh.procsub_files or 0
 			local sok, serr = pcall(exec_stmt, sh, st, hook)
 			if not sok then
 				if type(serr) == "table" and serr.__curse_lineabort then
@@ -6736,7 +6771,7 @@ function M.source_file(sh, path, hook)
 					end
 					rt.posix_arith_fatal(sh, serr)
 					sh.noerr = ne0
-					rt.line_aborted(sh, 1)
+					rt.line_aborted(sh, 1, pf0)
 					break
 				else
 					error(serr)

@@ -61,15 +61,20 @@ end
 -- may hold -/./=/! etc. (`foo-bar`, `my.helper`), which can't spell a Lua local, so
 -- escape every non-identifier byte as `_XX_`. sh.functions is still keyed by the
 -- original name (the dispatch key); only the generated identifier is mangled.
+local EF -- (forward: fnlname reads EF.fntab)
 local function fnlname(n)
-	return "fn_" .. n:gsub("[^%w_]", function(c)
+	local s = "fn_" .. n:gsub("[^%w_]", function(c)
 		return ("_%02x_"):format(c:byte())
 	end)
+	-- (a program with many functions keeps them in ONE table, FN: every fn_x a separate
+	-- module local would push run() — which registers and calls them — past LuaJIT's 60
+	-- upvalues per function)
+	return EF.fntab and ("FN." .. s) or s
 end
 
 -- variables the shell itself makes readonly (bash): UID=… etc. is an error
 local BUILTIN_RO = { UID = 1, EUID = 1, PPID = 1, BASH_VERSINFO = 1, SHELLOPTS = 1, BASHOPTS = 1 }
-local EF = {} -- emit-time program flags, grouped so a function referencing several stays one upvalue
+EF = {} -- emit-time program flags, grouped so a function referencing several stays one upvalue
 -- A literal part's Lua expression: a constant — except $'…' with \u/\U escapes, which bash
 -- encodes in the locale current when its line is parsed (not the compile-time one)
 function EF.lit_expr(p)
@@ -3955,7 +3960,7 @@ analyze_lift = function(ast)
 				scan(st.body, dq)
 			elseif t == "if" then
 				for _, cl in ipairs(st.clauses) do
-					if dq then
+					if dq and cl.cond then -- (the else clause has none)
 						scan(cl.cond, true)
 					end
 					scan(cl.body, dq)
@@ -5485,7 +5490,7 @@ simple_compiled = function(cx, st, after)
 			local co = require("interp")._int.redirs_touch_stdout(st.redirs)
 				and "local __co = rt.CO_OUTS[sh.out]; if __co then rt.flush_stage_out(sh) end; " or "local __co; "
 			cx.blocks[p] = dbg(st) .. EF.xtl('"exec"')
-				.. ("do rt.iso_save_fds(sh); %slocal __rs = {}; if %s then sh.status = 0; rt.redir_discard(__rs); if __co then sh.out = io.write end else sh.status = 1; rt.redir_restore(__rs) end; if sh.coprocs then rt.coproc_fdcheck(sh) end; if sh.status ~= 0 and sh.opt_posix and not sh.opt_i then error({ __curse_exit = 1 }) end end; pc = %d"):format(co, re, after)
+				.. ("do rt.iso_save_fds(sh); %slocal __rs = {}; if %s then sh.status = 0; rt.redir_discard(__rs, sh); if __co then sh.out = io.write end else sh.status = 1; rt.redir_restore(__rs) end; if sh.coprocs then rt.coproc_fdcheck(sh) end; if sh.status ~= 0 and sh.opt_posix and not sh.opt_i then error({ __curse_exit = 1 }) end end; pc = %d"):format(co, re, after)
 			return p
 		end
 	end
@@ -8614,6 +8619,7 @@ function EF.konst(items)
 	return ("__K[%d]"):format(#k)
 end
 function M.emit(ast, opts)
+	EF.fntab = false
 	EF.konsts = {}
 	EF.frag_depth = 0
 	EF.dskip_n = 0
@@ -8833,6 +8839,13 @@ function M.emit(ast, opts)
 	end
 
 	emit_frag_ctx = { funcflags = funcflags, inlinefns = inlinefns } -- context for compile_cmdsub's build_cfg
+	do
+		local nf = 0
+		for _ in pairs(funcflags) do
+			nf = nf + 1
+		end
+		EF.fntab = nf > 32 -- (see fnlname)
+	end
 
 	local o = {
 		'local rt = require("runtime")',
@@ -8962,7 +8975,9 @@ function M.emit(ast, opts)
 	if emit_frag_n > 0 then
 		o[#o + 1] = "local __CS = {}"
 	end
-	if #decls > 0 then
+	if EF.fntab then
+		o[#o + 1] = "local FN = {}"
+	elseif #decls > 0 then
 		o[#o + 1] = "local " .. table.concat(decls, ", ")
 	end
 	for _, d in ipairs(fndefs) do

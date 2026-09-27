@@ -1053,6 +1053,29 @@ function M.preempt()
 		end
 	end
 end
+-- Give the job groups `gs` (<()/>() children) their first turn: bash forked each at
+-- expansion, so whatever it runs starts while every procsub end made so far is open.
+-- From the shell, a pump runs all that can run; inside a stage, yield until each has run.
+function M.procsub_start(gs)
+	local t = co_task()
+	if not t then
+		M.sched_pump({})
+		return
+	end
+	for _ = 1, 64 do
+		local pending = false
+		for _, g in ipairs(gs) do
+			local gt = g.tasks and g.tasks[1]
+			if gt and not gt.ran and not g.done then
+				pending = true
+			end
+		end
+		if not pending then
+			return
+		end
+		M.preempt()
+	end
+end
 -- Wait until `fd` is ready for `ev` (POLLIN/POLLOUT). A no-op outside a stage.
 function M.co_block(fd, ev)
 	local t = co_task()
@@ -1526,11 +1549,30 @@ local _ropen_st = ffi.new("char[144]")
 -- Low fds the shell hands out by NUMBER (a process substitution's /dev/fd/63) are open in
 -- the one process every in-process subshell shares: an external spawned by a DIFFERENT
 -- shell (a background job, a stage) must not inherit one — `tee >(wc -c)`: wc would hold a
--- writer on its own input. fd -> the shell it belongs to; foreign_fa closes the others'.
+-- writer on its own input. fd -> { owner shell, generation }; foreign_fa closes the fd for
+-- every other shell — except one cloned (a pipeline stage, an async job: Shell:stage_clone),
+-- directly or through its own clones, from the owner AFTER the fd was made: as a process
+-- forked then, it has inherited it (`f > >(cat)` with f running `ls | tr`: ls sees 63).
 M.fd_owner = {}
+M.fd_gen = 0 -- (bumped per registration; a clone records the value it was made at)
+function M.fd_register(fd, sh)
+	M.fd_gen = M.fd_gen + 1
+	M.fd_owner[fd] = { sh = sh, gen = M.fd_gen }
+end
+local function fd_inherits(self, rec)
+	local s = self
+	while s do
+		local p = s.clone_parent
+		if p == rec.sh then
+			return (s.clone_gen or 0) >= rec.gen
+		end
+		s = p
+	end
+	return false
+end
 function M.foreign_fa(self, fa)
-	for fd, owner in pairs(M.fd_owner) do
-		if owner ~= self and C.fcntl(fd, 1) >= 0 then
+	for fd, rec in pairs(M.fd_owner) do
+		if rec.sh ~= self and not fd_inherits(self, rec) and C.fcntl(fd, 1) >= 0 then
 			if not fa then
 				fa = ffi.new("uint8_t[1024]")
 				C.posix_spawn_file_actions_init(fa)
@@ -1644,11 +1686,12 @@ function M.open_read(path)
 	M.rd_gen = M.rd_gen + 1 -- (`source /dev/stdin`, `$(< /dev/stdin)`: reads a shared input)
 	if not (CO or sched_live()) or C.curse_rt_stat(path, _ropen_st) ~= 0
 		or bit.band(ffi.cast("uint32_t *", _ropen_st + 24)[0], 0xF000) ~= 0x1000 then
-		return io.open(path, "r")
+		local f, _, en = io.open(path, "r")
+		return f, en -- (nil, errno)
 	end
 	local fd = M.ropen(path, 0, 0)
 	if fd < 0 then
-		return nil
+		return nil, ffi.errno()
 	end
 	local chunks, buf = {}, ffi.new("char[8192]")
 	while true do
@@ -1823,8 +1866,12 @@ local function open_noclobber(path)
 	ffi.errno(e)
 	return -1
 end
-local function redir_backup(saves, fd)
-	saves[#saves + 1] = { fd = fd, saved = M.save_fd(fd) }
+local function redir_backup(saves, fd, sh)
+	local e = { fd = fd, saved = M.save_fd(fd) }
+	saves[#saves + 1] = e
+	if sh and sh.iso_ctx and sh.iso_ctx[1] then
+		M.iso_note_save(sh, e)
+	end
 end
 -- THE redirection applier of both tiers (compiled code via redir_apply, interp's
 -- apply_redirs for its file/here-doc redirections): install one redirection whose target
@@ -1842,10 +1889,10 @@ local function redir_open(sh, op, fd, target, saves)
 		local both = op == "outboth" or op == "appboth" -- &> / &>>: stdout AND stderr
 		if saves then
 			if both then
-				redir_backup(saves, 1)
-				redir_backup(saves, 2)
+				redir_backup(saves, 1, sh)
+				redir_backup(saves, 2, sh)
 			else
-				redir_backup(saves, fd)
+				redir_backup(saves, fd, sh)
 			end
 		end
 		local h = (op ~= "clobber" and flags == 577 and sh.opt_C) and open_noclobber(target)
@@ -1864,7 +1911,7 @@ local function redir_open(sh, op, fd, target, saves)
 		end
 	elseif op == "dup" or op == "dupin" then -- N>&M / N<&M / N>&- (compiled: digit targets)
 		if target == "-" then
-			redir_backup(saves, fd)
+			redir_backup(saves, fd, sh)
 			C.close(fd)
 		else
 			local tf = M.fd_number(target) -- (emit hands only all-digit targets here)
@@ -1875,12 +1922,12 @@ local function redir_open(sh, op, fd, target, saves)
 				io.stderr:write("curse: " .. target .. ": Bad file descriptor\n")
 				return false
 			end
-			redir_backup(saves, fd)
+			redir_backup(saves, fd, sh)
 			C.dup2(tf, fd)
 		end
 	elseif op == "heredoc" or op == "herestring" then
 		if saves then
-			redir_backup(saves, fd)
+			redir_backup(saves, fd, sh)
 		end
 		local h = _temp_fd(target) -- target = the already-built body text
 		if h < 0 then -- (redir.c: here_document_to_fd's failure, then the command fails)
@@ -1972,14 +2019,18 @@ function M.ps_adrain(sh, m)
 	sh.cur_alist = m[3]
 	require("interp")._int.drain_procsub(sh, m[1], m[2])
 end
-function M.redir_discard(saves)
+function M.redir_discard(saves, sh) -- (sh: in an in-process subshell, a fd >= 10 is kept)
 	if saves.out_sh then
 		io.flush()
 		saves.out_sh.out, saves.out_sh = saves.out, nil
 	end
 	for i = #saves, 1, -1 do
-		if saves[i].saved >= 0 then
-			C.close(saves[i].saved)
+		local s = saves[i]
+		s.done = true
+		if s.saved >= 0 and not (sh and M.iso_keep_fd(sh, s.fd, s.saved)) then
+			C.close(s.saved)
+		elseif s.saved < 0 and sh then
+			M.iso_keep_fd(sh, s.fd, -1)
 		end
 		saves[i] = nil
 	end
@@ -2015,6 +2066,7 @@ function M.redir_undo(saves)
 	end
 	for i = #saves, 1, -1 do
 		local s = saves[i]
+		s.done = true
 		if s.saved >= 0 then
 			C.dup2(s.saved, s.fd)
 			C.close(s.saved)
@@ -2293,6 +2345,26 @@ function M.fg_ended(sh, pid, s)
 end
 
 
+-- check_binary_file (general.c) on a file's first bytes: an ELF magic (a corrupt or
+-- foreign ELF the kernel refused), or a NUL in its first line — first two after `#!`.
+function M.binary_sample(sample)
+	if #sample >= 4 and sample:sub(1, 4) == "\127ELF" then
+		return true
+	end
+	local nl = sample:sub(1, 2) == "#!" and 2 or 1
+	for k = 1, #sample do
+		local b = sample:byte(k)
+		if b == 10 then
+			nl = nl - 1
+			if nl == 0 then
+				return false
+			end
+		elseif b == 0 then
+			return true
+		end
+	end
+	return false
+end
 -- A no-shebang script runs as a FRESH shell would (bash's reinitialized child: only the
 -- exported environment, its own vars/functions/traps) — in-process: a new Shell, run
 -- inside an isolation context of ours (its stack shared) so the process-global state the
@@ -2305,25 +2377,24 @@ function Shell:run_script_inproc(path, args, n, out)
 	if f then
 		f:close()
 	end
-	do -- (check_binary_file: a NUL before the first newline in its first 80 bytes)
-		local z = src:find("\0", 1, true)
-		if z and z <= 80 then
-			local nl = src:find("\n", 1, true)
-			if not nl or nl > z then
-				self:errmsg("curse: " .. path .. ": cannot execute binary file: Exec format error\n")
-				if self.exec_builtin then -- (exec_builtin's file_error then, errno 0)
-					self:errmsg("curse: " .. path .. ": Success\n")
-				end
-				self.status = 126
-				return
-			end
+	if M.binary_sample(src:sub(1, 80)) then -- (shell_execve's READ_SAMPLE_BUF: 80 bytes)
+		self:errmsg("curse: " .. path .. ": cannot execute binary file: Exec format error\n")
+		if self.exec_builtin then -- (exec_builtin's file_error then, errno 0)
+			self:errmsg("curse: " .. path .. ": Success\n")
 		end
+		self.status = 126
+		return
+	end
+	if src:find("\0", 1, true) then
+		src = src:gsub("%z", "") -- (shell_getc drops the NUL bytes of a script's text)
 	end
 	local csh = M.cur_shell -- (before Shell.new, which makes the new shell current)
 	local depth = self.subdepth -- (a fresh shell: $BASH_SUBSHELL as it is here)
 	local child = Shell.new()
 	-- (`exec`'s script: $0 is its -a NAME, else the full pathname — shell_execve)
-	child.argv0, child.out = self.exec_builtin and (self.exec_script_a0 or path) or args[1], out or io.write
+	-- (a command's: the pathname it was run by — found along PATH, the full one; shell_execve
+	-- puts `command` in its argv[0] slot)
+	child.argv0, child.out = self.exec_builtin and (self.exec_script_a0 or path) or path, out or io.write
 	child.capturing = out and true or nil
 	child.shopt.globskipdots = self.shopt.globskipdots -- (reset_shopt_options keeps it)
 	M.startup_ignored(child) -- a new shell: what's ignored now stays ignored
@@ -2849,14 +2920,17 @@ function Shell:capture_src(src, backtick, noalias, line0)
 				return ""
 			end
 			local path = fs[1]
-			local f = path ~= "" and M.open_read(path)
+			local f, en
+			if path ~= "" then
+				f, en = M.open_read(path)
+			end
 			if f then
 				local c = f:read("*a") or ""
 				f:close()
 				self.status, self.last_cmdsub_status = 0, 0
 				return (M.cmdsub_nul(c):gsub("\n+$", ""))
 			end
-			io.stderr:write("curse: " .. path .. ": No such file or directory\n")
+			M.read_fail(path, en)
 			self.status, self.last_cmdsub_status = 1, 1
 			return ""
 		end
@@ -3352,6 +3426,48 @@ M.iso_cur = iso_cur
 -- touches it and put back when the context ends (iso_undo): fds 0-9 (`exec` redirections),
 -- the whole environ (`exec -c`, exec's prefix bindings), signal traps + dispositions,
 -- resource limits, the $RANDOM stream.
+-- A context's fds are saved lazily — at its first `exec` — so a redirection the body
+-- has active then (`{ exec 3>f; } 2>&1`) must not be taken for the context's own state:
+-- each save made inside the context is noted (fd -> its saves, oldest first), and the
+-- oldest one still active holds the value the context started with.
+function M.iso_note_save(sh, e)
+	local ctx = iso_cur(sh)
+	if not ctx or ctx.task_fds or (ctx.fds and e.fd <= 9) or (ctx.hifds and ctx.hifds[e.fd]) then
+		return -- (that fd's state is already kept)
+	end
+	local pre = ctx.pre
+	if not pre then
+		pre = {}
+		ctx.pre = pre
+	end
+	local l = pre[e.fd]
+	if not l then
+		l = {}
+		pre[e.fd] = l
+	end
+	local n = 0 -- (only the saves still active matter: drop the undone ones)
+	for i = 1, #l do
+		if not l[i].done then
+			n = n + 1
+			l[n] = l[i]
+		end
+	end
+	for i = #l, n + 1, -1 do
+		l[i] = nil
+	end
+	l[n + 1] = e
+end
+function M.iso_pre(ctx, fd)
+	local l = ctx.pre and ctx.pre[fd]
+	if l then
+		for i = 1, #l do
+			if not l[i].done then
+				return l[i]
+			end
+		end
+		ctx.pre[fd] = nil
+	end
+end
 function M.iso_save_fds(sh)
 	local ctx = iso_cur(sh)
 	if not ctx or ctx.fds or ctx.task_fds then -- (a task's fds are its own: nothing to restore)
@@ -3360,7 +3476,12 @@ function M.iso_save_fds(sh)
 	io.flush()
 	local sv = {}
 	for fd = 0, 9 do
-		sv[fd] = dup_hi(fd) -- (-1: closed)
+		local e = M.iso_pre(ctx, fd)
+		if e then -- (under a redirection made in this context: the value from before it)
+			sv[fd] = e.saved >= 0 and dup_hi(e.saved) or -1
+		else
+			sv[fd] = dup_hi(fd) -- (-1: closed)
+		end
 	end
 	ctx.fds = sv
 end
@@ -3525,8 +3646,50 @@ cap_enter = function()
 end
 
 
+-- A fd >= 10 an in-process subshell opens, replaces or closes for good (`exec 13>f`,
+-- `{v}>f`, `exec 13>&-`) is the parent's too — a forked subshell's changes die with it:
+-- its state from before the subshell's first such change (`saved`: a close-on-exec copy
+-- this takes over, or -1: it was closed) goes back when the context ends. (fds 0-9:
+-- iso_save_fds.) True when `saved` was taken.
+function M.iso_keep_fd(sh, fd, saved)
+	if fd < 10 then
+		return false
+	end
+	local ctx = iso_cur(sh) -- (a pipeline stage's too: its fds 0-9 are its task's own, but
+	if not ctx then -- the rest are the process's)
+		return false
+	end
+	local h = ctx.hifds
+	if not h then
+		h = {}
+		ctx.hifds = h
+	end
+	if h[fd] == nil then
+		local e = M.iso_pre(ctx, fd)
+		if e then -- (under a redirection made in this context: the value from before it)
+			h[fd] = e.saved >= 0 and dup_hi(e.saved) or -1
+			return false
+		end
+		h[fd] = saved
+		return true
+	end
+	return false
+end
 -- (a $(…) puts its fds back BEFORE its capture restores fd 1 — see capture_inproc)
 function M.iso_restore_fds(ctx)
+	local h = ctx.hifds
+	if h then
+		ctx.hifds = nil
+		io.flush()
+		for fd, d in pairs(h) do
+			if d >= 0 then
+				C.dup2(d, fd)
+				C.close(d)
+			else
+				C.close(fd)
+			end
+		end
+	end
 	local sv = ctx.fds
 	if sv then
 		ctx.fds = nil
@@ -4110,8 +4273,15 @@ end
 -- $(< file) / `< file`: bash reads the file's contents (a faster $(cat file)) — a pure
 -- read. NUL bytes stripped, trailing newlines stripped, status 0; a missing file is
 -- status 1 + diagnostic. The compiled tier calls this with the expanded path.
+-- (subst.c: an open failure is file_error — the path and strerror(errno))
+function M.read_fail(path, en)
+	io.stderr:write("curse: " .. path .. ": " .. ffi.string(C.strerror(en or 2)) .. "\n")
+end
 function Shell:capture_file(path)
-	local f = path ~= "" and M.open_read(path)
+	local f, en
+	if path ~= "" then
+		f, en = M.open_read(path)
+	end
 	if f then
 		local c = f:read("*a") or ""
 		f:close()
@@ -4119,7 +4289,7 @@ function Shell:capture_file(path)
 		self.last_cmdsub_status, self.ncs = 0, (self.ncs or 0) + 1
 		return (M.cmdsub_nul(c):gsub("\n+$", ""))
 	end
-	io.stderr:write("curse: " .. path .. ": No such file or directory\n")
+	M.read_fail(path, en)
 	self.status = 1
 	self.last_cmdsub_status, self.ncs = 1, (self.ncs or 0) + 1
 	return ""
@@ -4968,6 +5138,7 @@ function Shell:stage_clone()
 		c[k] = type(v) == "table" and shallowcopy(v) or v
 	end
 	c.subdepth = (self.subdepth or 0) + 1 -- (a stage is a subshell)
+	c.clone_parent, c.clone_gen = self, M.fd_gen -- (the fds it inherits: M.fd_register)
 	c.iso_ctx, c.stage_pid, c.vpid, c.rpid = {}, tonumber(C.getpid()), nil, nil
 	if self.iso_ctx and #self.iso_ctx > 0 then -- (a subshell's virtual hard limits stay in force in its stages)
 		local vb = self.iso_vhard_base and shallowcopy(self.iso_vhard_base) or {}
@@ -5248,6 +5419,7 @@ local function co_resume(ctx, t)
 		return
 	end
 	local P = ctx.P
+	t.ran = true -- (M.procsub_start: it has had its first turn)
 	fds_install(t.fd, 0) -- the stage's fds 0-9 (-1: it had closed it)
 	C.environ = t.env
 	if t.cwdfd then -- (a directory it changed to: held by an fd)
@@ -8801,7 +8973,11 @@ end
 -- A line abort contained (bash's DISCARD caught by reader_loop / parse_and_execute): the
 -- status is the failure's, and so is $PIPESTATUS — exp_jump_to_top_level and set_exit_status
 -- both set_pipestatus_from_exit — whatever statement (an assignment too) was abandoned.
-function M.line_aborted(sh, status)
+function M.line_aborted(sh, status, pf0) -- (pf0: the <()/>() count before the line ran)
+	local pf = sh.procsub_files
+	if pf0 and pf and #pf > pf0 then -- (the aborted line's <() close with it: bash's
+		require("interp")._int.drain_procsub(sh, 0, pf0) -- unlink_fifo_list at top level)
+	end
 	sh.status = status
 	sh:array_assign("PIPESTATUS", { tostring(status) }, false)
 end
@@ -9784,7 +9960,12 @@ ffi.cdef([[
   void *opendir(const char *name);
   void *readdir(void *dirp);
   int closedir(void *dirp);
+  struct curse_dirent { unsigned long d_ino; long d_off; unsigned short d_reclen;
+    unsigned char d_type; char d_name[256]; };
 ]])
+-- (glibc's struct dirent as readdir returns it: d_name's offset from the ABI's own
+-- layout, not a number baked in for x86-64)
+M.DNAME_OFF = ffi.offsetof("struct curse_dirent", "d_name")
 local REG_EXTENDED, REG_NOSUB, REG_ICASE = 1, 8, 2
 -- Compiled-regex cache: a `case`/[[ ]]/glob pattern in a loop would otherwise
 -- regcomp+regfree per test. regcomp bakes in LC_CTYPE/LC_COLLATE, so the cache is
@@ -10558,7 +10739,7 @@ local function scan_seg(dir, seg, dotglob, skipdots)
 		if e == nil then
 			break
 		end
-		local name = ffi.string(ffi.cast("const char *", e) + 19) -- d_name @ 19 (glibc x86-64)
+		local name = ffi.string(ffi.cast("const char *", e) + M.DNAME_OFF)
 		-- . and .. are matched only by an explicit leading-dot pattern with
 		-- globskipdots off; a leading-dot name otherwise needs `.`-pattern or dotglob.
 		local dotdot = name == "." or name == ".."
@@ -10812,7 +10993,7 @@ local function rec_dirs(base, dotglob)
 		if e == nil then
 			break
 		end
-		local name = ffi.string(ffi.cast("const char *", e) + 19)
+		local name = ffi.string(ffi.cast("const char *", e) + M.DNAME_OFF)
 		if name ~= "." and name ~= ".." and (name:sub(1, 1) ~= "." or dotglob) then
 			local path = base == "" and name or (base == "/" and "/" .. name or base .. "/" .. name)
 			if is_dir(path) and not is_symlink(path) then -- (`**` doesn't follow symlinked dirs)
@@ -12339,7 +12520,13 @@ function M.array_key(sh, name, raw, expanded)
 	end
 	if not idx then
 		local _, perr = pcall(require("parser").arith, raw)
-		io.stderr:write("curse: " .. require("parser").arith_errmsg(raw, perr) .. "\n")
+		local pok, pe = pcall(require("interp")._int.arith_pre, sh, perr) -- (what ran before it)
+		if not pok and type(pe) == "table" and pe.__curse_unbound then
+			error(pe, 0)
+		end
+		if pok or not (type(pe) == "table" and pe.__curse_matherr) then
+			io.stderr:write("curse: " .. require("parser").arith_errmsg(raw, perr) .. "\n")
+		end
 		error({ __curse_exit = 1, __curse_lineabort = true })
 	end
 	return require("interp")._int.arith_key(sh, name, idx, raw)
@@ -13884,6 +14071,9 @@ function M.command_query(sh, argv)
 	end
 	if argv[j] == "--" then -- (end of options)
 		j = j + 1
+	end
+	if usep and argv[j] ~= nil and M.restricted(sh, "command: -p: restricted") then
+		return -- (command.def: a restricted shell refuses -p, -v/-V included)
 	end
 	I.command_describe(sh, argv, j, vflag == "V", usep)
 end

@@ -369,23 +369,7 @@ local function open_script(sh, inv, path)
 	-- check_binary_file (general.c): an ELF header, or a NUL in the first line (the first
 	-- two, after a `#!` line) of the first 80 bytes
 	if s:find("\0", 1, true) or s:sub(1, 4) == "\127ELF" then
-		local sample = s:sub(1, 80)
-		local bin = sample:sub(1, 4) == "\127ELF"
-		if not bin then
-			local nl = sample:sub(1, 2) == "#!" and 2 or 1
-			for k = 1, #sample do
-				local b = sample:byte(k)
-				if b == 10 then
-					nl = nl - 1
-					if nl == 0 then
-						break
-					end
-				elseif b == 0 then
-					bin = true
-					break
-				end
-			end
-		end
+		local bin = rt.binary_sample(s:sub(1, 80))
 		if bin then
 			err(path .. ": " .. rt.L("%s: cannot execute binary file", path) .. "\n")
 			sh.status = 126

@@ -314,9 +314,9 @@ ORACLE_VERSION=5.2.21
 [ -n "$ORACLE" ] || ORACLE="$REPO/build/test/oracle/bash"
 case "$ORACLE" in /*) ;; *) ORACLE="$PWD/$ORACLE" ;; esac
 [ -x "$ORACLE" ] || { echo "error: no oracle bash at $ORACLE — build it: meson compile -C build oracle-bash (or pass --oracle PATH)" >&2; exit 2; }
-ov=$("$ORACLE" -c 'echo "$BASH_VERSION"' </dev/null 2>/dev/null)
-case "$ov" in "$ORACLE_VERSION("*) ;;
-  *) echo "error: oracle $ORACLE is bash '${ov:-?}', not $ORACLE_VERSION — curse is scored against bash $ORACLE_VERSION only" >&2; exit 2 ;;
+ORACLE_BASH_VERSION=$("$ORACLE" -c 'echo "$BASH_VERSION"' </dev/null 2>/dev/null)
+case "$ORACLE_BASH_VERSION" in "$ORACLE_VERSION("*) ;;
+  *) echo "error: oracle $ORACLE is bash '${ORACLE_BASH_VERSION:-?}', not $ORACLE_VERSION — curse is scored against bash $ORACLE_VERSION only" >&2; exit 2 ;;
 esac
 [ "$(basename "$ORACLE")" = bash ] || { echo "error: the oracle must be named 'bash' (its directory goes first on PATH): $ORACLE" >&2; exit 2; }
 H_ORACLE=$ORACLE; H_ORACLE_DIR=$(dirname "$ORACLE")
@@ -492,7 +492,7 @@ if [ "$total" -eq 0 ]; then
   echo "no tests selected."; exit 0
 fi
 
-echo "harness: $total tests × [${SHELLS//,/ }]  (jobs=$JOBS, timeout=${H_TIMEOUT}s, oracle bash $ov)"
+echo "harness: $total tests × [${SHELLS//,/ }]  (jobs=$JOBS, timeout=${H_TIMEOUT}s, oracle bash $ORACLE_BASH_VERSION)"
 export H_TIMEOUT H_SHELLS="$SHELLS" H_TIMEOUTS="$REPO/test/conformance/timeouts" H_NPROC="$(nproc 2>/dev/null || echo 0)"
 export H_CLIENT H_THIS_SH H_XDG_RUNTIME H_XDG_CACHE H_FALLBACK H_ORACLE H_ORACLE_DIR
 # (in the background + wait, so an interrupt reaches cleanup at once and it can stop them)

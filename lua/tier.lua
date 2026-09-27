@@ -278,6 +278,7 @@ end
 function M.run_compiled(mod, sh, pc, nested)
 	local pd0, cd0, fs0, ne0 = sh.pd, sh.calldepth, sh.funcstack and #sh.funcstack or 0, sh.noerr
 	while true do
+		local pf0 = sh.procsub_files and #sh.procsub_files or 0
 		local ok, err = pcall(mod.run, sh, pc)
 		if ok then
 			return
@@ -298,7 +299,7 @@ function M.run_compiled(mod, sh, pc, nested)
 				error(err, 0)
 			end
 			rt.posix_arith_fatal(sh, err)
-			rt.line_aborted(sh, not nested and err.__curse_badusage and not sh.opt_c and 2 or 1) -- (a failed ${x:=w})
+			rt.line_aborted(sh, not nested and err.__curse_badusage and not sh.opt_c and 2 or 1, pf0) -- (a failed ${x:=w})
 			local sp = not nested and mod.lgspan and mod.lgspan[sh._ff]
 			if sp then -- (bash's line numbers drift from here: rt.line_drift)
 				rt.line_drift(sh, sp[1], sp[2])
