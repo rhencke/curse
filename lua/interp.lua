@@ -765,11 +765,11 @@ arith_resolve = function(sh, s)
 	in_expanded_text = true -- (a value is expansion output: its subscripts expand unquoted)
 	sh.arith_depth = depth
 	local ok2, v = pcall(eval, sh, ast)
+	sh.arith_depth = depth - 1
+	in_expanded_text = sv
 	if not ok2 then
 		P.trap_flow(v)
 	end
-	sh.arith_depth = depth - 1
-	in_expanded_text = sv
 	if not ok2 then
 		if type(v) == "table" and (v.__curse_experr or v.__curse_matherr or v.__curse_unbound) then
 			error(v)
@@ -871,10 +871,10 @@ function M.arith_textual_eval(sh, raw, depth0)
 	local sv = in_expanded_text
 	in_expanded_text = true
 	local ok, v = pcall(eval, sh, ast)
+	in_expanded_text = sv
 	if not ok then
 		P.trap_flow(v)
 	end
-	in_expanded_text = sv
 	if not ok then
 		error(v, 0)
 	end
@@ -1379,11 +1379,11 @@ arith_key = function(sh, name, idxexpr, idxraw)
 	local sd = xpand_subdepth
 	xpand_subdepth = idxexpr.k == "xpand" and not in_expanded_text and 1 or nil
 	local ok, v = pcall(eval, sh, idxexpr)
+	xpand_subdepth = sd
+	P.arith_cmd = sv
 	if not ok then
 		P.trap_flow(v)
 	end
-	xpand_subdepth = sd
-	P.arith_cmd = sv
 	if not ok then
 		if type(v) == "table" and v.__curse_matherr and not v.__curse_subscript then
 			-- a subscript's error abandons the whole line, even from (( )) or [[ ]] (bash)
@@ -5589,7 +5589,9 @@ exec_stmt = function(sh, st, hook)
 				P.arith_cmd = "(("
 				local _, perr = pcall(P.arith, node.raw)
 				if not _ then
+					P.arith_cmd = sv
 					P.trap_flow(perr)
+					P.arith_cmd = "(("
 				end
 				arith_pre(sh, perr)
 				io.stderr:write("curse: " .. P.arith_errmsg(node.raw, perr) .. "\n")
@@ -5780,10 +5782,10 @@ exec_stmt = function(sh, st, hook)
 		local sv = P.arith_cmd
 		P.arith_cmd = "((" -- (bash's this_command_name in its error messages)
 		local ok, v = pcall(eval, sh, st.expr)
+		P.arith_cmd = sv
 		if not ok then
 			P.trap_flow(v)
 		end
-		P.arith_cmd = sv
 		if ok then
 			sh.status = truth(v) and 0 or 1
 		elseif type(v) == "table" and v.__curse_matherr and not v.__curse_subscript then
