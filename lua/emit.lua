@@ -1696,8 +1696,9 @@ function compile_cmdsub_inner(src, backtick, lifted, aenv, noalias, posix)
 	-- so a called function and the body share `v_x`; __iso_cmdsub swap-saves them.
 	-- (pure: rt.cmdsub_pure, the one authority — with this program's functions)
 	local bt = backtick and "true" or "false"
+	local vnames = {} -- (the names it reads: guarded at run time, none a nameref — rt.no_refs)
 	local pure = #ast.stmts > 0
-		and require("runtime").cmdsub_pure(ast.stmts, (emit_frag_ctx and emit_frag_ctx.funcflags) or {}, src)
+		and require("runtime").cmdsub_pure(ast.stmts, (emit_frag_ctx and emit_frag_ctx.funcflags) or {}, src, vnames)
 	local isolated = not pure and not EF.inproc_trap_block and #ast.stmts > 0
 	local id = emit_fragment(ast.stmts, nil, isolated and EF.lifted_set or nil)
 	if not id then
@@ -1722,6 +1723,16 @@ function compile_cmdsub_inner(src, backtick, lifted, aenv, noalias, posix)
 	-- one, line mode, env-imported BASH_FUNC_x%%), and a function there would be a
 	-- side effect run without the checkpoint.
 	local guard = call ~= forked and dyn_guard(ast.stmts, pure)
+	if guard and pure and #vnames > 0 then
+		local q, seen = {}, {}
+		for _, n in ipairs(vnames) do
+			if not seen[n] then
+				seen[n] = true
+				q[#q + 1] = ("%q"):format(n)
+			end
+		end
+		guard = ("(%s and rt.no_refs(sh, %s))"):format(guard, EF.konst(q))
+	end
 	if guard then
 		call = ("(%s and %s or %s)"):format(guard, call, forked)
 	end
@@ -1761,6 +1772,13 @@ local function emit_part(p, i, lifted, w, tilde)
 			-- is a literal, so no over-expansion. ~ mid-word (not after NAME=) stays literal.
 			return ("rt.tilde_word_initial(sh, %q, %s, %s)"):format(
 				p.lit, tostring(#w.parts > 1), w.noassign and "true" or w.plainarg and "sh.opt_posix" or "false")
+		end
+		if tilde and i > 1 and not p.q and not w.notilde and not w.noassign and p.lit:find(":~", 1, true)
+			and require("runtime").assignish(w) then
+			-- (a later literal of a NAME=… word: `z=$x:~` — each `:~` expands, as bash's
+			-- expand_word_internal does through the whole word)
+			return ("rt.tilde_argcont(sh, %q, %s, %s)"):format(p.lit, tostring(i < #w.parts),
+				w.plainarg and "sh.opt_posix" or "false")
 		end
 		return EF.lit_expr(p)
 	elseif p.raw then
@@ -5016,8 +5034,11 @@ EF.simple_native = function(cx, st, after, cmd)
 		spec[#spec + 1] = "xt=true"
 		xt = " " .. EF.xt("__a")
 	end
+	if EF.xtrace and bind and EF.xln() ~= "" then -- (the runner traces the bindings and the
+		xt = xt .. (" if sh.opt_x then %send"):format(EF.xln()) -- command: under ITS line)
+	end
 	if bind and redir and #pnames > 0 then -- (a readonly prefix is reported before the redirections)
-		xt = xt .. ("; rt.prefix_ro(sh, { %s })"):format(table.concat(pnames, ", "))
+		xt = xt .. ("; rt.prefix_ro(sh, { %s }, __a[1])"):format(table.concat(pnames, ", "))
 	end
 	return cx.dispatch(st, after, {
 		prelude = table.concat(out, "; ") .. xt,
@@ -5158,13 +5179,32 @@ EF.FRAG_CF = { ["break"] = 1, ["continue"] = 1, ["return"] = 1, ["exit"] = 1 }
 -- Command substitutions in words[from..]: hadcs — a part of its own, so it runs (an empty
 -- argv / a bare assignment keeps its status); else dyncs — one only nested in a ${…}
 -- (`${u:-$(exit 5)}`) may not run, so it is counted at runtime (sh.ncs).
+-- (a body with no command — `$()`, `$( )`, `$(# c)` — is no substitution at all: bash runs
+-- nothing, so whether one ran is left to the runtime counter, as for a nested one)
+local function cs_empty(body)
+	if body:find("^%s*$") then
+		return true
+	end
+	if not body:find("#", 1, true) then
+		return false
+	end
+	local ok, ast = pcall(require("parser").parse, body)
+	return ok and #ast.stmts == 0
+end
 function EF.cmdsubs(words, from)
+	local empty = false
 	for j = from, #words do
 		for _, pp in ipairs(words[j].parts) do
 			if pp.cmdsub then
-				return true, false
+				if not cs_empty(pp.cmdsub) then
+					return true, false
+				end
+				empty = true
 			end
 		end
+	end
+	if empty then
+		return false, true
 	end
 	for j = from, #words do
 		local s = words[j].src
@@ -5757,16 +5797,24 @@ simple_compiled = function(cx, st, after)
 				dispatch = EF.redir_wrap(cx.redir_ext(nil, redir_apply), prun)
 			end
 			if redir_apply then -- (a readonly prefix is reported before the redirections: rt.prefix_ro)
-				dispatch = ("rt.prefix_ro(sh, { %s }); "):format(table.concat(pnames, ", ")) .. dispatch
+				dispatch = ("rt.prefix_ro(sh, { %s }, __a[1]); "):format(table.concat(pnames, ", ")) .. dispatch
 			end
 			-- __pv (prefix values) FIRST, then __a (argv) — both in the pre-prefix env,
 			-- in bash's left-to-right order — then apply + run + restore via rt.run_prefix.
 			local xpv = ""
 			if EF.xtrace then
+				-- (bash traces each binding once made — a `PS4=…` one, and those after it, under
+				-- the new PS4 — and the command under the PS4 outside the temporary env)
+				local ps4 = false
 				for i, a in ipairs(st.assigns) do
+					if a.name == "PS4" then
+						ps4 = true
+						xpv = xpv .. ("sh.xtrace_ps4 = __pv[%d]; "):format(i)
+					end
 					xpv = xpv .. EF.xta(a.name .. "=", ("__pv[%d]"):format(i))
 				end
-				xpv = xpv .. EF.xt("__a")
+				xpv = xpv .. (ps4 and "if not rt.in_subshell(sh) then sh.xtrace_ps4 = nil end; " or "") .. EF.xt("__a")
+					.. (ps4 and "sh.xtrace_ps4 = nil; " or "")
 			end
 			cx.blocks[p] = d
 				.. ("local __pv = { %s }; "):format(table.concat(pvals, ", "))
@@ -6040,7 +6088,9 @@ simple_compiled = function(cx, st, after)
 		local lastw = st.words[#st.words]
 		local post = cx.newpc()
 		cx.blocks[post] = ('sh:set_str("_", %s); if sh.ifs_fc then rt.ifs_popchk(sh) end; pc = %d'):format(us, after) -- (pop_context's sv_ifs: rt.ifs_first)
+		local cl = EF.cur_line -- (the call traces under ITS line, not the inlined body's)
 		local bodyentry = cx.flatten_list(subst_list(cx.inlinefns[cmd], pb), post)
+		EF.cur_line = cl
 		local pre = cx.newpc()
 		local xpre = ""
 		if EF.xtrace then
@@ -6355,6 +6405,7 @@ H.forc = function(cx, st, after)
 	end
 	local condp = cx.newpc()
 	cx.loopPc[st.id] = condp
+	cx.loopff(st.id)
 	local stepp = cx.newpc()
 	local bodyentry = cx.loop_list(st.body, stepp, after, stepp) -- break exits, continue steps
 	-- (with $BASH_COMMAND read, each slot's own DEBUG prefix carries its text: xs)
@@ -6444,6 +6495,7 @@ H.whilec = function(cx, st, after)
 		-- on entry, that fails exits via exitp). Two copies of the test: no extra hop per turn.
 		local condp, firstp = cx.newpc(), cx.newpc()
 		cx.loopPc[st.id] = condp
+		cx.loopff(st.id)
 		local exitp = cx.newpc()
 		cx.blocks[exitp] = ("sh.status = 0; pc = %d"):format(after)
 		local bodyentry = cx.loop_list(st.body, condp, after, condp)
@@ -6464,6 +6516,7 @@ H.whilec = function(cx, st, after)
 		local lv = cx.newloopvar()
 		local condp = cx.newpc()
 		cx.loopPc[st.id] = condp
+		cx.loopff(st.id)
 		local exitp = cx.newpc()
 		cx.blocks[exitp] = ("sh.status = %s; pc = %d"):format(lv, after)
 		local bodysave = cx.newpc()
@@ -6499,6 +6552,7 @@ H.whilec = function(cx, st, after)
 	local lv = cx.newloopvar()
 	local prep = cx.newpc()
 	cx.loopPc[st.id] = prep
+	cx.loopff(st.id)
 	local donep = cx.newpc()
 	local exitp = cx.newpc()
 	cx.blocks[exitp] = ("sh.status = %s; pc = %d"):format(lv, after)
@@ -6544,6 +6598,7 @@ H.forin = function(cx, st, after)
 	local initp = cx.newpc()
 	local advp = cx.newpc()
 	cx.loopPc[st.id] = advp -- back-edge = resume point
+	cx.loopff(st.id)
 	local bodyentry = cx.loop_list(st.body, advp, after, advp) -- break exits, continue advances
 	-- init: expand the word list ONCE into sh.forstate[id] (so OSR resumes it)
 	local parts = { "local __l = {}" }
@@ -6614,7 +6669,10 @@ H.forin = function(cx, st, after)
 				ws[#ws + 1] = w.src
 			end
 		end
+		local cl = EF.cur_line -- (traced under the header's line: the body moved cur_line)
+		EF.cur_line = st.line or cl
 		xh = EF.xtl(("%q"):format(require("runtime").srcw("for " .. st.name .. " in " .. table.concat(ws, " "))))
+		EF.cur_line = cl
 	end
 	if EF.has_nameref or EF.has_attr then
 		cx.blocks[advp] = ("%s; fs.idx = fs.idx + 1; if fs.idx > #fs.list then if fs.idx == 1 then sh.status = 0 end; pc = %d else %sif not rt.for_assign(sh, %q, fs.list[fs.idx]) then sh.status = 1; pc = %d else %spc = %d end end"):format(
@@ -7352,6 +7410,14 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
 		end,
 	})
 	cx.loopPc, cx.stmtPc = {}, {}
+	-- cx.loopFf[id]: a top-level loop's line-abort resume pc (its statement's sh._ff) — an
+	-- OSR entry into the loop never passed that statement's marker, so the tier sets it
+	cx.loopFf, cx.cur_ff = {}, nil
+	function cx.loopff(id)
+		if cx.cur_ff then
+			cx.loopFf[id] = cx.cur_ff
+		end
+	end
 	cx.npc = 0
 	-- cx.nd: how many errexit-exempt CONDITIONS (if/while tests, non-final &&/|| operands:
 	-- each raised sh.noerr) enclose the code being compiled. A break/continue/return that
@@ -7818,7 +7884,7 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
 		EF.cur_infunc = not cx.toplevel and not cx.topcode -- … or a function)
 		if st.line then
 			cx.prev_line = EF.cur_line -- (the command before: a redirected compound's errors)
-			EF.cur_line = (t == "simple" or t == "assign" or t == "assignlist") and st.cline or st.line -- (a simple command: interp's rule)
+			EF.cur_line = (t == "simple" or t == "assign" or t == "assignlist" or t == "arrayassign") and st.cline or st.line -- (a simple command: interp's rule)
 			EF.cur_cline = st.cline or st.line
 		end -- for $LINENO (compile-time constant)
 		-- `time [-p] pipeline`: start clocks, run the statement itself, report to stderr.
@@ -8251,26 +8317,13 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
 			mark[k] = cx.newpc()
 		end
 	end
-	local nextpc = cx.DONE
-	for k = #stmts, 1, -1 do
-		nextpc = cx.flatten_stmt(stmts[k], cx.toplevel and (mark[k + 1] or cx.DONE) or nextpc)
-		cx.stmtPc[k] = nextpc -- the statement's REAL entry
-	end
+	-- (lgs: a line abort resumes at the next LINE GROUP — the parser's complete command:
+	-- `eval "…<newline>…"; echo` is one — else, with no groups recorded, a new line)
+	local lgs = false
+	local ffs = {} -- [k]: the pc a line abort in top-level statement k resumes at
 	if cx.toplevel then
-		-- Sync lifted vars to sh at each marker so, on a lineabort, the tier's retry
-		-- wrapper can re-enter run at sh._ff with the pre-statement state intact (run
-		-- re-seeds lifted from sh). Once per TOP-LEVEL statement (never in a hot loop body).
-		-- Signal traps are delivered by the async VM hook (lib_cursesig.c), not polled here.
-		local wbs = lsync(cx.lifted)
-		-- (a line abort resumes at the next LINE GROUP — the parser's complete command:
-		-- `eval "…<newline>…"; echo` is one — else, with no groups recorded, a new line)
-		local lgs = false
 		for k = 1, #stmts do
 			lgs = lgs or stmts[k].lgstart or false
-		end
-		local nxperr = {} -- [k]: the marker of the first syntax error at/after statement k
-		for k = #stmts, 1, -1 do
-			nxperr[k] = stmts[k].t == "parse_error" and mark[k] or nxperr[k + 1]
 		end
 		for k = 1, #stmts do
 			local ff = cx.DONE
@@ -8280,6 +8333,28 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
 					break
 				end
 			end
+			ffs[k] = ff
+		end
+	end
+	local nextpc = cx.DONE
+	for k = #stmts, 1, -1 do
+		cx.cur_ff = ffs[k]
+		nextpc = cx.flatten_stmt(stmts[k], cx.toplevel and (mark[k + 1] or cx.DONE) or nextpc)
+		cx.stmtPc[k] = nextpc -- the statement's REAL entry
+	end
+	cx.cur_ff = nil
+	if cx.toplevel then
+		-- Sync lifted vars to sh at each marker so, on a lineabort, the tier's retry
+		-- wrapper can re-enter run at sh._ff with the pre-statement state intact (run
+		-- re-seeds lifted from sh). Once per TOP-LEVEL statement (never in a hot loop body).
+		-- Signal traps are delivered by the async VM hook (lib_cursesig.c), not polled here.
+		local wbs = lsync(cx.lifted)
+		local nxperr = {} -- [k]: the marker of the first syntax error at/after statement k
+		for k = #stmts, 1, -1 do
+			nxperr[k] = stmts[k].t == "parse_error" and mark[k] or nxperr[k + 1]
+		end
+		for k = 1, #stmts do
+			local ff = ffs[k]
 			if stmts[k].lgspan then -- (a multi-line group's lines, by the pc a line abort resumes at)
 				cx.lgspan = cx.lgspan or {}
 				cx.lgspan[ff] = stmts[k].lgspan
@@ -8313,6 +8388,7 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
 			npc = cx.npc,
 			entry = mark[1] or cx.DONE,
 			loopPc = cx.loopPc,
+			loopFf = cx.loopFf,
 			stmtPc = cx.stmtPc,
 			lgspan = cx.lgspan,
 			loopvars = cx.loopvars,
@@ -9002,7 +9078,8 @@ function M.emit(ast, opts)
 	for name in spairs(fncall) do
 		fc[#fc + 1] = ("[%q] = { src = %q, fn = %s }"):format(name, fnsrc[name], EF.upv_wrapped(fnlname(name)))
 	end
-	o[#o + 1] = ("return { run = run, loopPc = loopPc, stmtPc = stmtPc%s%s%s%s%s }"):format(
+	o[#o + 1] = ("return { run = run, loopPc = loopPc, stmtPc = stmtPc%s%s%s%s%s%s }"):format(
+		next(top.loopFf or {}) and (", loopFf = " .. serialize(top.loopFf)) or "",
 		top.lgspan and (", lgspan = {" .. (function()
 			local o2 = {}
 			for ff, sp in spairs(top.lgspan) do

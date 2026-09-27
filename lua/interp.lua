@@ -2653,6 +2653,9 @@ expand_fields_full = function(sh, w, pre1) -- pre1: part 1 already expanded (a $
 					fb:add(s:sub(1, #s - tl), false)
 					s = s:sub(#s - tl + 1)
 				end
+			elseif pi > 1 and p.lit ~= nil and not p.q and not w.notilde and not w.noassign
+				and s:find(":~", 1, true) and rt.assignish(w) then
+				s = rt.tilde_argcont(sh, s, pi < #w.parts, sh.opt_posix and w.plainarg)
 			end -- word-initial / NAME= ~
 			if p.dqat and s == "" then
 				dq_null = true
@@ -2735,8 +2738,8 @@ local function apply_redirs(sh, redirs, cname, ctx, args) -- cname: the command 
 		-- (the word as written: r.target has its outer quotes stripped, `"$f"` -> `$f`)
 		local raw = r.src or r.target or ""
 		-- bash brace-expands the target too; more than one word -> ambiguous redirect.
-		if P.brace_count(raw) > 1 then
-			io.stderr:write("curse: " .. raw .. ": ambiguous redirect\n")
+		if P.brace_count(raw) > 1 then -- (a `{v}>…`'s error names v: redirection_error)
+			io.stderr:write("curse: " .. (r.fdvar or raw) .. ": ambiguous redirect\n")
 			return nil
 		end
 		-- expansion can also fail non-fatally (e.g. failglob no-match): the redirect
@@ -2757,7 +2760,7 @@ local function apply_redirs(sh, redirs, cname, ctx, args) -- cname: the command 
 			return nil
 		end
 		if #fs ~= 1 then
-			io.stderr:write("curse: " .. raw .. ": ambiguous redirect\n")
+			io.stderr:write("curse: " .. (r.fdvar or raw) .. ": ambiguous redirect\n")
 			return nil
 		end
 		return fs[1]
@@ -2839,7 +2842,7 @@ local function apply_redirs(sh, redirs, cname, ctx, args) -- cname: the command 
 		end
 		if rt.REDIR_FLAGS[r.op] then -- a file: rt.redir_open (flags, noclobber, &>, restricted)
 			local t = ftgt(r)
-			if not (t and rt.redir_open(sh, r.op, r.fd, t, not persist[r.fd] and save or nil)) then
+			if not (t and rt.redir_open(sh, r.op, r.fd, t, not persist[r.fd] and save or nil, r.fdvar)) then
 				ok = false
 			end
 		elseif r.op == "heredoc" then
@@ -5296,7 +5299,7 @@ exec_stmt = function(sh, st, hook)
 	if st.line and t ~= "funcdef" and not (sh.in_trap and sh.in_trap > 0 and (sh.calldepth or 0) == sh.trap_calldepth) then
 		-- a simple command's line is where its SECOND token ended (bash's yacc lookahead:
 		-- `nope "x<NL>y"` errors on line 2); cline records that
-		sh.cur_line = (t == "simple" or t == "assign" or t == "assignlist") and st.cline or st.line
+		sh.cur_line = (t == "simple" or t == "assign" or t == "assignlist" or t == "arrayassign") and st.cline or st.line
 		sh.cur_cline = st.cline or st.line -- (where its $(…) bodies number from)
 	end -- $LINENO: frozen at the trapped line for the trap's own commands (not in a
 	-- function the trap calls, whose lines count as usual — bash)

@@ -3758,6 +3758,8 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs, xg, bq
 	local function parse_array_elems()
 		i = i + 1
 		local elems = {}
+		local toks = {} -- (each element's token as read: bash's parse_compound_assignment joins
+		-- them with single blanks, comments and newlines dropped — the literal's text)
 		local line0, closed = line, false
 		while i <= n do
 			skipsep() -- (newlines, comments: a word never starts at a `#` here)
@@ -3827,6 +3829,7 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs, xg, bq
 				if w == "" then
 					break
 				end
+				toks[#toks + 1] = w
 				local keyraw, eop, rhs = nil, "=", w
 				if w:sub(1, 1) == "[" then
 					local close = subscript_close(w, 1)
@@ -3885,7 +3888,7 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs, xg, bq
 			error({ __curse_perr = true, line = line0, status = 1, discard = true, exactmsg = true,
 				msg = "unexpected EOF while looking for matching `)'" }, 0)
 		end
-		return elems
+		return elems, "(" .. table.concat(toks, " ") .. ")"
 	end
 
 	local function try_assign()
@@ -3917,7 +3920,7 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs, xg, bq
 		i = p
 		if src:sub(i, i) == "(" then -- array literal
 			local pstart = i
-			local elems = parse_array_elems()
+			local elems, ltext = parse_array_elems()
 			local nx = src:sub(i, i)
 			if nx ~= "" and not nx:match("[%s;&|)<>]") then
 				-- `a=(4*3)/2`: text goes on past the `)` — then it's one ORDINARY word
@@ -3933,7 +3936,7 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs, xg, bq
 				name = name,
 				elems = elems,
 				append = (op == "+="),
-				raw = src:sub(pstart, i - 1),
+				raw = ltext, -- (normalized as bash's parser rebuilds it: `(1 2)` for `( 1\n 2 )`)
 				index = subidx,
 			}
 		end

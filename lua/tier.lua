@@ -342,6 +342,9 @@ function M.run(src, opts)
 		return sh, "interp-only"
 	end
 	if type(err) == "table" and err.__curse_switch then
+		if resume.kind == "loop" and mod.loopFf and mod.loopFf[resume.id] then
+			sh._ff = mod.loopFf[resume.id] -- (the loop's statement marker never ran)
+		end
 		M.run_compiled(mod, sh, resume_pc(mod, resume.kind, resume.id)) -- OSR into compiled code
 		return sh, "switched@" .. resume.kind .. resume.id
 	end
@@ -739,6 +742,7 @@ function M.run_tiered(src, sh)
 	-- function call (interp run_function continues the call in the compiled function).
 	-- A script that never gets hot is compiled after the reply.
 	local resume, count = nil, 0 -- (the pc a hot loop switches in at)
+	local resume_ff -- (its top-level statement's line-abort resume pc: the loop's sh._ff)
 	local fnseen = {} -- (definition node -> its switch verdict, checked once)
 	-- (the running definition of `name` is the one compiled — src: its compiled text)
 	local function same_def(name, def, src)
@@ -810,6 +814,7 @@ function M.run_tiered(src, sh)
 			return M.loop_osr(sh, st)
 		end
 		resume = m and resume_pc(m, kind, id)
+		resume_ff = m and m.loopFf and m.loopFf[id]
 		if resume then -- (no module: stay put)
 			error({ __curse_switch = true })
 		end
@@ -824,6 +829,9 @@ function M.run_tiered(src, sh)
 	end
 	if type(err) == "table" and err.__curse_switch and mod then
 		I.finish_run(sh, function()
+			-- (the OSR skipped the loop's statement marker: a line abort in the loop must
+			-- resume after ITS statement, not at a stale sh._ff — or rerun from the start)
+			sh._ff = resume_ff or sh._ff
 			M.run_compiled(mod, sh, resume)
 		end)
 		return
