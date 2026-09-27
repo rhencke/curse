@@ -3200,16 +3200,41 @@ function Shell:capture_src(src, backtick, noalias, line0)
 	end
 	-- (a SYNTAX error in the body is fatal to the CONTAINING command — bash — which the
 	-- light path propagates via __curse_parseerr)
+	-- (an `alias`/`shopt` in a body of several lines: bash runs it with parse_and_execute,
+	-- reading each command after the one before ran — an alias it defines, extglob it sets,
+	-- applies to the lines after; the eager parse above only vets the text)
+	local lazy = #ast.lines > 1 and (src:find("alias", 1, true) or src:find("shopt", 1, true))
+	local function body(self, hook)
+		if not lazy then
+			return I.exec_list(self, ast.stmts, hook, true)
+		end
+		local nextf = P.open_full(src, self, nil, noalias, nil, line0 or self.cur_cline or self.cur_line,
+			nil, nil, backtick)
+		local r
+		while true do
+			local lg = nextf()
+			if not lg then
+				return r
+			end
+			local l = { lg.perr }
+			for _, st in ipairs(lg.stmts) do
+				l[#l + 1] = st
+			end
+			if l[1] then
+				l[1].lgstart = true
+				r = I.exec_list(self, l, hook, true)
+			end
+		end
+	end
 	if iso and not has_perr then
 		return self:capture_compiled_iso(function(self)
-			local Iq = require("interp")
-			return Iq.exec_list(self, ast.stmts, Iq.SUBHOOK, true)
+			return body(self, I.SUBHOOK)
 		end, backtick)
 	end
 	-- Run via exec_list (NOT interp.run): an `exit`/`return` inside $() ends only
 	-- the sub (sets its status), and the parent's EXIT trap must NOT fire here.
 	return self:capture_inproc(backtick, function(self)
-		return require("interp").exec_list(self, ast.stmts, function() end, true)
+		return body(self, function() end)
 	end)
 end
 

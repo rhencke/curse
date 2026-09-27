@@ -606,10 +606,22 @@ local function comsub_syntax(body, xg)
 		if hit == "?" then
 			return nil, true
 		end
+		if hit then
+			local m, l = hit:match("^(.*)\1(%d+)$")
+			if m then
+				return m, false, tonumber(l)
+			end
+		end
 		return hit or nil, false
 	end
-	local err, guessed = false, false
+	local err, guessed, eline = false, false, nil
+	-- (bash's parse_comsub reads the whole body under the extglob state of the moment: a
+	-- `shopt -s extglob` in it takes effect only when it runs — M.xg_fixed stops the static
+	-- tracking of it for this parse)
+	local sxf = M.xg_fixed
+	M.xg_fixed = true
 	local ok, ast = pcall(M.parse, body, nil, nil, nil, nil, nil, nil, xg)
+	M.xg_fixed = sxf
 	if not ok then
 		err = type(ast) == "table" and (ast.msg or "syntax error") or tostring(ast)
 		guessed = xg == nil and body:find("[@!+*?]%(") ~= nil
@@ -618,6 +630,7 @@ local function comsub_syntax(body, xg)
 		for _, st in ipairs(ast.stmts) do
 			if st.t == "parse_error" and not st.recoverable then
 				err = tostring(st.msg or "syntax error")
+				eline = st.line -- (the body's line holding the error: bash reports it there)
 				break
 			end
 		end
@@ -635,12 +648,12 @@ local function comsub_syntax(body, xg)
 	if comsub_err_n >= 512 then
 		comsub_err_cache, comsub_err_n = {}, 0
 	end
-	comsub_err_cache[key] = guessed and "?" or err
+	comsub_err_cache[key] = guessed and "?" or (err and eline and (err .. "\1" .. eline)) or err
 	comsub_err_n = comsub_err_n + 1
 	if guessed then
 		return nil, true
 	end
-	return err or nil, false
+	return err or nil, false, err and eline
 end
 local dparen_is_arith, grab_dparen -- forward (defined below)
 -- ---- the scanning primitives: where does the construct starting at s[i] end? ----
@@ -2882,7 +2895,7 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs, xg, bq
 				elseif a == "-q" or a == "-p" or a == "-o" then -- flags, ignore
 				elseif a == "expand_aliases" and set ~= nil then
 					alias_on = set
-				elseif a == "extglob" and set ~= nil then
+				elseif a == "extglob" and set ~= nil and not M.xg_fixed then
 					extglob_on = set
 				end
 			end
@@ -3368,8 +3381,20 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs, xg, bq
 		end
 		return false
 	end
-	local function comsub_err(cerr)
-		error({ __curse_perr = true, msg = cerr, line = cerr:find("near `", 1, true) and line or nil, forceeof = true }, 0)
+	local function comsub_err(cerr, eline, cbody) -- (eline: the body's line with the error,
+		local near, t = cerr:find("near `", 1, true), nil -- reported there, and shown when it's
+		if near and eline and eline > 1 then -- a whole source line)
+			local k = 0
+			for l in (cbody .. "\n"):gmatch("([^\n]*)\n") do
+				k = k + 1
+				if k == eline then
+					t = l
+					break
+				end
+			end
+		end
+		error({ __curse_perr = true, msg = cerr, line = near and (line + (eline or 1) - 1) or nil, ltext = t,
+			forceeof = true }, 0)
 	end
 	-- the read-time syntax check of a $(…) body (a guessed extglob state: line mode)
 	local function comsub_check(cbody)
@@ -3377,11 +3402,11 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs, xg, bq
 		if cbody:find("[@!+*?]%(") then
 			bxg = xg_body()
 		end
-		local cerr, guessed = comsub_syntax(cbody, bxg)
+		local cerr, guessed, eline = comsub_syntax(cbody, bxg)
 		if guessed then
 			xg_guess = true
 		elseif cerr then
-			comsub_err(cerr)
+			comsub_err(cerr, eline, cbody)
 		end
 	end
 	-- the $( … ) bodies in a ${ … } (src[k..e)) are syntax-checked as the line is read, as
@@ -5356,7 +5381,7 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs, xg, bq
 						pre = type(st) == "table" and st.__curse_perr and st.pre or nil, -- (messages before it)
 						preline = type(st) == "table" and st.__curse_perr and st.preline or nil, -- (their line)
 						exact = type(st) == "table" and st.__curse_perr and st.exact or nil, -- (msg verbatim)
-						text = type(st) == "table" and st.__curse_perr and st.text or nil,
+						text = type(st) == "table" and st.__curse_perr and (st.text or st.ltext) or nil, -- (ltext: the line shown, plainly)
 						showtext = type(st) == "table" and st.__curse_perr and st.text and true or nil,
 						recoverable = recover or nil,
 						discard = type(st) == "table" and st.__curse_perr and st.discard
@@ -5547,6 +5572,9 @@ end
 -- numbers eval'd code, and functions it defines, from there)
 function M.open(src, sh, line1)
 	return make_parser(src, sh, nil, nil, nil, nil, line1)
+end
+function M.open_full(...) -- (M.parse's arguments, read lazily: rt capture_src)
+	return make_parser(...)
 end
 
 do -- (loaded after the locale was set: runtime's lc_commit keeps it current from here)
