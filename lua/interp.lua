@@ -322,7 +322,6 @@ local function read_split(ifs, line, nvars, nomark, saw, sh) -- (nomark: \1 is p
 	-- (under nomark only a \1\177 pair is special — SX_NOESCCTLNUL — unless IFS holds \177;
 	-- a pair of raw input bytes counts too, left undequoted when nothing was marked)
 	local esc = (nomark and pairs_ and 2) or (not nomark and line:find("\1", 1, true) and true)
-	saw = nomark and saw or (not nomark and esc)
 	local skipws, find = rt.ifs_skipws, rt.ifs_find
 	local i = skipws(rwsb, line, 1, n) -- read.def's leading strip
 	local out = {}

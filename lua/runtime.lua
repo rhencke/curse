@@ -12868,14 +12868,20 @@ function M.ifs_split(sh, s, nomark, saw)
 			i = p + 1
 		end
 	end
-	while not nomark do
-		local p = s:find("\1", i, true)
-		if not p or p == n then -- (a trailing lone \1 is plain text)
+	local mpat = fb.set["\127"] and "\1" or "[\1\127]" -- (\177 in IFS: a delimiter)
+	while not nomark do -- (a bare \177 — read_mbchar's raw byte — is removed too)
+		local p = s:find(mpat, i)
+		if not p or p == n and s:byte(p) == 1 then -- (a trailing lone \1 is plain text)
 			break
 		end
 		fb:split(s:sub(i, p - 1))
-		fb:add(s:sub(p + 1, p + 1), false)
-		i = p + 2
+		if s:byte(p) == 127 then
+			fb:add("", false)
+			i = p + 1
+		else -- (the escaped byte: dequoted only if read marked something — saw_escape)
+			fb:add(saw and s:sub(p + 1, p + 1) or s:sub(p, p + 1), false)
+			i = p + 2
+		end
 	end
 	fb.tail = true
 	fb:split(s:sub(i))
