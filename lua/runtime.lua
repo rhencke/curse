@@ -3191,9 +3191,12 @@ local function subprog_enter(self)
 	self.shlvl_tail = nil
 	self.in_subprogram = (self.in_subprogram or 0) + 1
 	self.subdepth = (sd or 0) + 1
-	return al, ln, cc, tl, cl, ld, sd -- (the saved state as values: no table per subprogram)
+	-- (and $!: a job the subprogram starts is its own — bash's forked child sets its
+	-- own last_asynchronous_pid, the parent's is untouched)
+	return al, ln, cc, tl, cl, ld, sd, self.last_bg_pid -- (the saved state as values: no table)
 end
-local function subprog_leave(self, al, ln, cc, tl, cl, ld, sd)
+local function subprog_leave(self, al, ln, cc, tl, cl, ld, sd, lb)
+	self.last_bg_pid = lb
 	self.aliases, self.cur_line, self.cur_cmd, self.shlvl_tail = al, ln, cc, tl
 	self.cur_cline, self.loopdepth, self.subdepth = cl, ld, sd
 	self.in_subprogram = self.in_subprogram - 1
@@ -3203,7 +3206,7 @@ function Shell:capture_inproc(backtick, runner, capfd, ctx)
 	M.env_rebuilt(self) -- (command_substitute's maybe_make_export_env)
 	-- ($(…) inside a loop knows it — a break/continue there ends the substitution, as it
 	-- ends a `( … )` (bash) — so its loopdepth stays)
-	local s1, s2, s3, s4, s5, s6, s7 = subprog_enter(self)
+	local s1, s2, s3, s4, s5, s6, s7, s8 = subprog_enter(self)
 	local buf, tmp, save1
 	if capfd then
 		io.flush()
@@ -3272,7 +3275,7 @@ function Shell:capture_inproc(backtick, runner, capfd, ctx)
 		end
 		M.iso_restore_fds(ctx) -- (`exec 4>&1` in the body: undone while fd 1 is still the capture)
 	end
-	subprog_leave(self, s1, s2, s3, s4, s5, s6, s7)
+	subprog_leave(self, s1, s2, s3, s4, s5, s6, s7, s8)
 	self.hashcache, self.hashpath = sv_hc, sv_hp
 	self.opt_e = savede
 	self.capturing = saved_cap
@@ -4335,7 +4338,7 @@ end
 -- redirects (`saves`) are restored here too. exit/return/div0 in the body become the
 -- subshell's status.
 function Shell:subshell_run(runner, saves, paren, inplace)
-	local s1, s2, s3, s4, s5, s6, s7 = subprog_enter(self)
+	local s1, s2, s3, s4, s5, s6, s7, s8 = subprog_enter(self)
 	local cp = sub_checkpoint(self)
 	local sv_out, sv_ne = self.out, self.noerr
 	local sv_psp = self.paren_sp -- (a `( … )`: the subprogram level that is one — exec.def's SUBSHELL_PAREN)
@@ -4403,7 +4406,7 @@ function Shell:subshell_run(runner, saves, paren, inplace)
 	self.bgp_cleared = sv_bgpc
 	if saves then M.redir_restore(saves) end
 	self.out, self.noerr, self.paren_sp = sv_out, sv_ne, sv_psp
-	subprog_leave(self, s1, s2, s3, s4, s5, s6, s7)
+	subprog_leave(self, s1, s2, s3, s4, s5, s6, s7, s8)
 	sub_restore(self, cp)
 	flush_deferred(self) -- (the parent's signals: its traps run in its own state)
 	if killed then -- the parent's report of its child that a signal killed (a `( … )`: its text)
