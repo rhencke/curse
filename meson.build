@@ -200,8 +200,9 @@ if bash_found
   subdir('test' / 'oracle')
   conf_deps += [oracle_bash]
   oracle_args = ['--oracle', oracle_bash.full_path(), '-v']
+  # (curse-interp's scripts run $THIS_SH as the static curse: depend on it too)
   test('conformance-cases', conf, args: ['--corpus', 'cases', '--shells', cases_shells] + oracle_args,
-    suite: 'conformance', depends: conf_deps, workdir: repo, is_parallel: false, timeout: 0)
+    suite: 'conformance', depends: conf_deps + [curse], workdir: repo, is_parallel: false, timeout: 0)
   test('conformance-bash', conf,
     args: ['--corpus', 'bash', '--bash-dir', bash_sp.get_variable('tests_dir'), '--shells', conf_shells] + oracle_args,
     suite: 'conformance', depends: conf_deps, workdir: repo, is_parallel: false, timeout: 0)

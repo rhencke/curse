@@ -114,7 +114,7 @@ if [ "${1:-}" = --run-unit ]; then
                  CURSE_FALLBACK="$H_FALLBACK" THIS_SH="$H_THIS_SH" \
                  timeout "$lim" "$H_CLIENT" "$runscript" </dev/null ) ;;
       # curse's interpreter alone (no daemon, no OSR), from the built bundle; a script that
-      # runs $THIS_SH gets curse run directly too (lua/run.lua, tiered), not the daemon
+      # runs $THIS_SH gets curse run directly too (the static build/curse, tiered), not the daemon
       curse-interp) ( cd "$cwd" && PATH="$H_ORACLE_DIR:$PATH" TMP="$cwd" HOME="$cwd" TMPDIR="$tmpd" XDG_RUNTIME_DIR="$H_XDG_RUNTIME" XDG_CACHE_HOME="$ucache" \
                  CURSE_FALLBACK="$H_FALLBACK" THIS_SH="$H_THIS_SH_DIRECT" CURSE_BUNDLE="$H_BUNDLE" \
                  timeout "$lim" "$H_LUAJIT" "$H_REPO_LUA/run.lua" "$runscript" interp </dev/null ) ;;
@@ -443,10 +443,10 @@ H_THIS_SH="$workdir/bin/bash"; mkdir -p "$workdir/bin"; ln -sf "$H_CLIENT" "$H_T
 # A fallback that FAILS loudly, so a dropped daemon shows up as curse errors, never a
 # silent dash run masquerading as curse.
 H_FALLBACK="$workdir/bin/no-daemon"
-# THIS_SH for curse-interp: curse run directly (no daemon), also named `bash`
-H_THIS_SH_DIRECT="$workdir/bin/direct/bash"; mkdir -p "$workdir/bin/direct"
-printf '#!/bin/sh\nCURSE_BUNDLE="%s" CURSE_ARGV0="$0" exec "%s" "%s" "$@"\n' "$BUNDLE" "$LUAJIT" "$REPO/lua/run.lua" > "$H_THIS_SH_DIRECT"
-chmod +x "$H_THIS_SH_DIRECT"
+# THIS_SH for curse-interp: curse run directly, no daemon — the static self-contained
+# build/curse, also named `bash` (a symlink: no /bin/sh launcher in between, which would
+# drop exported functions' BASH_FUNC_f%% variables from the environment)
+H_THIS_SH_DIRECT="$workdir/bin/direct/bash"; mkdir -p "$workdir/bin/direct"; ln -sf "$REPO/build/curse" "$H_THIS_SH_DIRECT"
 printf '#!/bin/sh\necho "curse: daemon unavailable" >&2\nexit 127\n' > "$H_FALLBACK"; chmod +x "$H_FALLBACK"
 DAEMON_PID=""; XARGS_PID=""
 # Kill the daemon's ENTIRE process subtree — not just its direct worker children, but
@@ -471,6 +471,9 @@ trap cleanup EXIT
 trap 'cleanup; exit 130' INT
 trap 'cleanup; exit 143' TERM
 trap 'cleanup; exit 129' HUP
+case "$SHELLS" in *curse-interp*)
+  [ -x "$REPO/build/curse" ] || { echo "error: no static curse at $REPO/build/curse (curse-interp's THIS_SH) — run 'meson compile -C build'." >&2; exit 1; } ;;
+esac
 case "$SHELLS" in *curse*)
   [ -x "$H_CLIENT" ] || { echo "error: no curse-client at $H_CLIENT — run 'meson compile -C build'." >&2; exit 1; }
   [ -f "$BUNDLE" ]   || { echo "error: no bundle at $BUNDLE — run 'meson compile -C build'." >&2; exit 1; }
