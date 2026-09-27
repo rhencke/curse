@@ -66,6 +66,7 @@
 set -uo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+[ -n "${H_DIFF_DIR:-}" ] && mkdir -p "$H_DIFF_DIR"
 
 # ---- internal worker: run ONE unit (all shells) and write its result rows ----
 if [ "${1:-}" = --run-unit ]; then

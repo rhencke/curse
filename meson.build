@@ -209,16 +209,22 @@ if bash_found
   subdir('test' / 'oracle')
   conf_deps += [oracle_bash]
   oracle_args = ['--oracle', oracle_bash.full_path(), '-v']
+  # every failure keeps its evidence: expected/actual per failing test under
+  # build/conformance-diffs/<corpus>/ (an intermittent failure is investigated, never shrugged off)
+  diff_root = meson.current_build_dir() / 'conformance-diffs'
   # (curse-interp's scripts run $THIS_SH as the static curse: depend on it too)
   test('conformance-cases', conf, args: ['--corpus', 'cases', '--shells', cases_shells] + oracle_args,
-    suite: 'conformance', depends: conf_deps + [curse], workdir: repo, is_parallel: false, timeout: 0)
+    suite: 'conformance', depends: conf_deps + [curse], workdir: repo, is_parallel: false, timeout: 0,
+    env: {'H_DIFF_DIR': diff_root / 'cases'})
   test('conformance-bash', conf,
     args: ['--corpus', 'bash', '--bash-dir', bash_sp.get_variable('tests_dir'), '--shells', conf_shells] + oracle_args,
-    suite: 'conformance', depends: conf_deps, workdir: repo, is_parallel: false, timeout: 0)
+    suite: 'conformance', depends: conf_deps, workdir: repo, is_parallel: false, timeout: 0,
+    env: {'H_DIFF_DIR': diff_root / 'bash'})
   if oil_sp.found()
     test('conformance-oil', conf,
       args: ['--corpus', 'oil', '--oil-dir', oil_sp.get_variable('spec_dir'), '--shells', conf_shells] + oracle_args,
-      suite: 'conformance', depends: conf_deps, workdir: repo, is_parallel: false, timeout: 0)
+      suite: 'conformance', depends: conf_deps, workdir: repo, is_parallel: false, timeout: 0,
+    env: {'H_DIFF_DIR': diff_root / 'oil'})
   endif
 else
   # No oracle (-Dconformance=disabled, or =auto offline): conformance-cases is still
