@@ -196,46 +196,39 @@ local function apply_env(env)
 	C.environ = ffi.cast("char **", arr)
 end
 
--- The script's children that nothing waits for any more: a script killed by a signal
--- (sh.termsig) unwinds out of its wait for a foreground command, which runs on — as
--- bash's does when bash dies — but this worker lives on as its parent, so it would stay
--- a zombie once it ends (the kernel's reaper only gets orphans). Reap them all: those
--- already ended, then wait for the rest; a STOPPED one gets SIGHUP + SIGCONT, as the
--- kernel sends a group orphaned by its shell's exit. (Its slot already reads -1, so the
--- dead-client sweep leaves it be; one syscall when there are none.)
-local reap_st = ffi.new("int[1]")
-local function reap_orphans()
-	local r = C.waitpid(-1, reap_st, 1 + 2) -- WNOHANG|WUNTRACED
-	while true do
-		if r < 0 then
-			if ffi.errno() ~= 4 then -- (ECHILD: none left)
-				return
-			end
-		elseif r > 0 and bit.band(reap_st[0], 0xff) == 0x7f then -- stopped
-			C.kill(r, 1)
-			C.kill(r, 18)
+-- The script's children that outlive it, adopted into rt.internal_pids when the request
+-- ends (see serve_request): a job still running, or the foreground external a signal
+-- ended the script in the middle of (bash would have died, leaving it to init). This
+-- worker stays their parent, so it reaps them — at every later request's reap points,
+-- and while it idles (reap_idle), promptly, so none lingers as a zombie. One STOPPED
+-- gets SIGHUP + SIGCONT now, as the kernel sends a group its shell's exit orphans.
+local function hangup_stopped_orphans()
+	for pid in pairs(rt.internal_pids) do
+		local f = io.open("/proc/" .. pid .. "/stat", "r")
+		local st = f and f:read("*l")
+		if f then
+			f:close()
 		end
-		if r == 0 then -- all live: one stopped before now reports no stop again
-			local me = tonumber(C.getpid())
-			local f = io.open("/proc/" .. me .. "/task/" .. me .. "/children", "r")
-			for pid in (f and f:read("*a") or ""):gmatch("%d+") do
-				local sf = io.open("/proc/" .. pid .. "/stat", "r")
-				local s = sf and sf:read("*l")
-				if sf then
-					sf:close()
-				end
-				local state = s and s:match("^.*%) (%a)")
-				if state == "T" or state == "t" then
-					C.kill(tonumber(pid), 1)
-					C.kill(tonumber(pid), 18)
-				end
-			end
-			if f then
-				f:close()
-			end
+		local state = st and st:match("^.*%) (%a)")
+		if state == "T" or state == "t" then
+			C.kill(pid, 1)
+			C.kill(pid, 18)
 		end
-		-- (r == 0: block for the next to end or stop)
-		r = C.waitpid(-1, reap_st, r == 0 and 2 or 1 + 2)
+	end
+end
+-- Idle with adopted children: wait for a connection in 50ms slices, reaping them as they
+-- end, until none is left (then the plain blocking accept).
+local reap_pf = ffi.new("struct curse_d_pollfd[1]")
+local function reap_idle(lfd)
+	while next(rt.internal_pids) do
+		pcall(rt.reap_orphans)
+		if not next(rt.internal_pids) then
+			return
+		end
+		reap_pf[0].fd, reap_pf[0].events, reap_pf[0].revents = lfd, 1, 0
+		if C.curse_d_poll(reap_pf, 1, 50) > 0 then
+			return -- (a connection: serve it; the next idle time goes on reaping)
+		end
 	end
 end
 
@@ -371,7 +364,29 @@ local function serve_request(cfd, req, fds, ctx)
 		pcall(rt.sched_drain, sh)
 		drained = true
 	end
-	reap_orphans()
+	-- (the script's still-running real-pid jobs — `sleep 9 &` spawned directly — stay this
+	-- worker's children after it: bash's would go to init. Reaped as they end, by this and
+	-- every later request's reap points; never zombies left for another script's `ps` to see)
+	for _, j in ipairs(sh.jobs or {}) do
+		if not j.done and not j.g and j.pid and j.pid > 0 then
+			rt.internal_pids[j.pid] = true
+		end
+	end
+	-- (…and ANY child still here: a foreground external the script was waiting for when a
+	-- signal ended it — bash would have died and left it to init — `kill -TERM` of a
+	-- nested `curse -c 'trap … TERM; sleep 1'`. A worker has no children of its own.)
+	do
+		local wp = tonumber(C.getpid())
+		local f = io.open("/proc/" .. wp .. "/task/" .. wp .. "/children", "r")
+		if f then
+			for pid in (f:read("*a") or ""):gmatch("%d+") do
+				rt.internal_pids[tonumber(pid)] = true
+			end
+			f:close()
+		end
+	end
+	pcall(rt.reap_orphans) -- (children no job waits for any more: never zombies on the worker)
+	hangup_stopped_orphans() -- (…and the stopped ones don't stay stopped: see reap_idle)
 	-- SCRUB per-request process state (the fork boundary used to do this):
 	C.umask(ctx.umask) -- a script's `umask` doesn't persist
 	C.sigprocmask(2, ctx.empty_sigset, nil) -- SIG_SETMASK: clear any trap-blocked signals
@@ -506,6 +521,7 @@ local function worker_main(lfd, my_uid, ctx, slot)
 			end
 			pcall(Tier.compile_deferred, true)
 		end
+		reap_idle(lfd)
 		local cfd = C.accept(lfd, nil, nil)
 		if cfd < 0 then
 			local e = ffi.errno()

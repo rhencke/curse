@@ -4987,12 +4987,19 @@ local function drain_procsub(sh, np, nf)
 		C.close(files[i].fd)
 		rt.fd_owner[files[i].fd] = nil
 	end
-	sh.procsub_status = {} -- (the latest ones, for a later `wait $!`)
+	-- NOT waited for: bash reaps a procsub child asynchronously (only `wait` waits:
+	-- procsub_waitpid / procsub_waitall) — a >(cat) whose pipe an `exec 3>` still holds must
+	-- not block the shell, nor `read -t .5 < <(sleep 2)` last 2s. Its group runs on as a
+	-- (jobless) task; a later `wait $!`/`wait` finds it here (rt.procsub_wait).
+	sh.procsub_status = {} -- (the latest ones, for a later `wait $!`: pid -> group)
 	for i = nf + 1, #files do
 		local g = files[i].g
 		if g then -- (no g: its launch failed — nothing ran, nothing to reap)
-			rt.wait_groups({ g })
-			sh.procsub_status[files[i].pid] = g.status[1] or 0
+			sh.procsub_status[files[i].pid] = g
+			if not g.done then
+				sh.procsub_live = sh.procsub_live or {}
+				sh.procsub_live[#sh.procsub_live + 1] = g
+			end
 		end
 	end
 	for i = #files, nf + 1, -1 do

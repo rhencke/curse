@@ -1060,6 +1060,20 @@ do
 end
 M.preempt_flag = PREEMPT
 local PREEMPT_USEC = 10000
+-- A job's slice is CPU time, not wall time: the tick is a CLOCK_MONOTONIC timer (1ms
+-- precision, for the foreground's first slice), so on a loaded machine a job descheduled
+-- by the kernel "used up" its slice without running — it yielded at its first check, and
+-- a later job ran (and printed) first: `echo a & echo b &` came out b, a. M.preempt only
+-- yields a job once it has used the slice's CPU time (this thread's), else re-arms for
+-- the rest.
+pcall(ffi.cdef, "int curse_rt_cgt(int clk, struct curse_co_ts *ts) asm(\"clock_gettime\");")
+do
+	local ts = ffi.new("struct curse_co_ts")
+	function M.cpu_usec() -- (CLOCK_THREAD_CPUTIME_ID: the FIFO-open helper thread isn't ours)
+		C.curse_rt_cgt(3, ts)
+		return tonumber(ts.tv_sec) * 1000000 + tonumber(ts.tv_nsec) / 1000
+	end
+end
 -- The FOREGROUND shell is time-sliced too while background jobs live (bash's jobs are
 -- processes the kernel runs alongside it): the same slice is armed for it, and at its
 -- next loop head or function entry (M.preempt) it gives the jobs a round, then re-arms.
@@ -1081,6 +1095,12 @@ function M.preempt()
 		return
 	end
 	if t then
+		if t.cpu0 then -- (a job's slice: yield only once it has had its CPU time)
+			local left = PREEMPT_USEC - (M.cpu_usec() - t.cpu0)
+			if left > 500 and preempt_arm(left) == 0 then
+				return
+			end
+		end
 		pre_yield(t)
 		if coroutine.yield() == SIGMARK then -- (no values: co_resume queues it as runnable again)
 			task_signals(t)
@@ -1161,6 +1181,9 @@ end
 -- which ends the wait early with -1 (bash's wait_intr_buf) — else an EINTR is retried.
 function M.wait_child(pid, stbuf, flags, intr, inplace)
 	flags = flags or 0
+	if next(M.internal_pids) then -- (orphans that ended meanwhile: rt.reap_orphans)
+		M.reap_orphans()
+	end
 	local t = flags == 0 and co_task() or nil
 	if t or (flags == 0 and sched_live()) then
 		local pfd = tonumber(C.curse_co_syscall(434, pid, 0)) -- pidfd_open
@@ -2174,6 +2197,7 @@ end
 -- the fd was open, restore it; s.saved < 0 (C.dup failed): it was NOT open before, so
 -- CLOSE it rather than dup2(-1), which would leak it.
 function M.redir_undo(saves)
+	io.flush() -- (what a builtin buffered is the redirect target's: `( compgen … ) >/dev/null`)
 	if saves.e2o then
 		saves._sh.err2out = (saves._sh.err2out or 0) - saves.e2o
 		saves.e2o = nil
@@ -2636,6 +2660,9 @@ end
 -- owns, the signal mask a bash child starts with, SIGINT/SIGQUIT ignored for an async one
 -- (`hold`), and the child environ with SHLVL moved by `lvl`. Returns rc, pid.
 local function spawn_argv(self, path, args, n, fa, hold, lvl)
+	if next(M.internal_pids) then -- (a `ps` it runs must not see orphans that have ended)
+		M.reap_orphans()
+	end
 	local argv = ffi.new("const char*[?]", n + 1)
 	local anchor = {} -- keep the Lua strings alive while argv points into them
 	for i = 1, n do
@@ -4481,6 +4508,20 @@ function M.stage_flat(st, isfn)
 		end
 	end
 end
+-- A pid `wait` must call "not a child of this shell": a job of a parent a subshell
+-- (bgp_cleared) or an async child (bgp_parent: its parent's job list, kept as is — no
+-- per-launch copy) inherited.
+function M.bgp_foreign(sh, pid)
+	if sh.bgp_cleared and sh.bgp_cleared[pid] then
+		return true
+	end
+	for _, j in ipairs(sh.bgp_parent or {}) do
+		if j.pid == pid then
+			return true
+		end
+	end
+	return false
+end
 -- The pids of sh's jobs, as seen from a subshell that lists them (a pipeline stage, $(…))
 -- but can't wait on them: they aren't its children.
 function M.foreign_jobs(sh)
@@ -5097,6 +5138,9 @@ end
 -- (j.g) is done once its task group is. A simple in-process job's external carries the
 -- wait status (its signal: t.sh.xproc).
 function M.jobs_poll(sh)
+	if next(M.internal_pids) then
+		M.reap_orphans()
+	end
 	local sb
 	local foreign = sh.foreign_pids -- (a subshell's view of its parent's jobs: not its own)
 	for _, j in ipairs(sh.jobs or {}) do
@@ -5279,6 +5323,19 @@ end
 -- jobs, a killed task's still-running child): `wait`/`wait -n` reap with waitpid(-1) and
 -- skip these rather than mistake one for a job.
 M.internal_pids = {}
+-- Reap the ones that have ended (WNOHANG): nothing else waits for them, and a zombie left
+-- on a daemon worker would stay for the worker's life.
+do
+	local st = ffi.new("int[1]")
+	function M.reap_orphans()
+		for pid in pairs(M.internal_pids) do
+			local r = C.waitpid(pid, st, 1)
+			if r ~= 0 then -- (reaped, or not our child any more)
+				M.internal_pids[pid] = nil
+			end
+		end
+	end
+end
 
 -- `ext args… &` where the args are side-effect-free: the shell already built argv, so
 -- SPAWN the job directly (vfork-fast, stdin </dev/null) — no background task at all.
@@ -5769,6 +5826,12 @@ local function co_resume(ctx, t)
 		M.cur_shell = t.sh
 	end
 	local armed = g.bg and preempt_arm(PREEMPT_USEC) == 0
+	if armed then -- (a flag the foreground's slice raised is not this job's: M.preempt)
+		PREEMPT[0] = 0
+		t.cpu0 = M.cpu_usec()
+	else
+		t.cpu0 = nil
+	end
 	if t.pending and t.started then
 		rok, a, b = coroutine.resume(t.co, SIGMARK)
 	else
@@ -5844,6 +5907,15 @@ local function co_resume(ctx, t)
 		end
 		t.done, t.wait = true, nil
 		ctx.bycoro[t.co] = nil
+		local tsh = t.sh -- (a stage's/job's own `ext &` jobs still running: orphans now, reaped
+		if tsh and t ~= g.lp and tsh.jobs then -- by rt.reap_orphans — as bash's exited child's
+			for _, j in ipairs(tsh.jobs) do -- children go to init)
+				if not j.done and not j.g and j.pid and j.pid > 0
+					and not (tsh.foreign_pids and tsh.foreign_pids[j.pid]) then
+					M.internal_pids[j.pid] = true
+				end
+			end
+		end
 		-- (a lastpipe stage's fds 3-9 are adopted: only its stdin/out/err go now — `yes | head`
 		-- with lastpipe must EPIPE yes once head is done, not at the pipeline's end)
 		fds_release(ctx, t.sv, 0, t ~= g.lp and 9 or 2)
@@ -6143,6 +6215,9 @@ end
 -- w.deadline passed, w.until() true — or, with none given, until nothing can run now.
 -- Returns true when w.fd became ready.
 function M.sched_pump(w)
+	if next(M.internal_pids) then
+		M.reap_orphans()
+	end
 	local ctx = SCHED
 	if CO or not ctx or next(ctx.bycoro) == nil then
 		return false
@@ -6232,6 +6307,36 @@ function M.wait_groups(gs, intr) -- (intr: as wait_child's)
 			end
 		end
 	end
+end
+-- A process substitution's status for `wait PID` (bash's procsub_waitpid): its group
+-- (drain_procsub keeps it, not waited for) is waited for now if still running.
+function M.procsub_wait(sh, pid, intr)
+	local g = sh.procsub_status and sh.procsub_status[pid]
+	if type(g) ~= "table" then
+		return g
+	end
+	if not g.done then
+		M.wait_groups({ g }, intr)
+		if not g.done then
+			return nil
+		end
+	end
+	return g.status[1] or 0
+end
+-- `wait` with no ids waits for every running procsub too (procsub_waitall).
+function M.procsub_waitall(sh, intr)
+	local live = sh.procsub_live
+	if not live then
+		return
+	end
+	M.wait_groups(live, intr)
+	local kept = {}
+	for _, g in ipairs(live) do
+		if not g.done then
+			kept[#kept + 1] = g
+		end
+	end
+	sh.procsub_live = #kept > 0 and kept or nil
 end
 -- Run every background job to its end (the script is over; bash would leave them
 -- running — in-process they must finish before this process can).
@@ -6340,6 +6445,15 @@ function Shell:bg_launch(fn, cmdstr, flat, simple, upv_get, upv_set, opts)
 			t.sh.in_subprogram = (t.sh.in_subprogram or 0) + 1
 			t.sh.loopdepth = g.simple and self.loopdepth or 0 -- (a simple job keeps it: stage_kind)
 			t.jc = jc -- (job control: its process group takes every signal — task_kill_job)
+			if not opts.nojob then -- (an async child's without_job_control: delete_all_jobs —
+				-- `jobs` lists none, %1 is no such job, `wait PID` isn't its child; a <()/>()
+				-- child keeps its view of them: process_substitute only turns job control off)
+				local tsh = t.sh
+				if tsh.jobs and tsh.jobs[1] then -- (its copy of the parent's list: rt.bgp_foreign)
+					tsh.bgp_parent = tsh.jobs
+				end
+				tsh.jobs, tsh.job_cur, tsh.job_prev = {}, nil, nil
+			end
 			if g.simple then -- (bash execs a `cmd &` job's external in place: rt.exec_tail_lvl)
 				t.sh.job_pgrp = jc -- (…in the job's own process group, with job control)
 				-- (a function it calls: no tail inside; "fn": the emitter's direct call, at this pd)
@@ -12889,6 +13003,49 @@ end
 -- `s` ABSENT from the box: reading b.s builds (and caches) the string; ANY write to b.s
 -- (a new value, or nil to unset) drops the buffer first — so every other reader and
 -- writer of the box works unchanged.
+-- An EXPORTED variable appended to keeps its environ entry in a growable buffer of our
+-- own (putenv'd), extended in place — setenv would copy the whole value (and glibc keeps
+-- every old copy), making `export s; for …; do s+=x; done` quadratic in time and memory;
+-- bash builds the environment only when it runs a command. In place only while no task
+-- holds a copy of the environ (the scheduler's per-task environs share its strings), and
+-- only while the entry is still ours (any setenv/unsetenv/clearenv replaces it).
+pcall(ffi.cdef, "int putenv(char *s); char *getenv(const char *name);")
+M.envbuf = {}
+function M.env_append(sh, dn, b, value)
+	if SCHED ~= nil then
+		return false
+	end
+	local e = M.envbuf[dn]
+	if e and C.getenv(dn) == e.v then
+		local need = e.len + #value
+		if need < e.cap then
+			ffi.copy(e.v + e.len, value, #value)
+			e.len = need
+			e.v[need] = 0
+			return true
+		end
+	end
+	local cur = sh:get(dn) or ""
+	local full = #cur + #value
+	local cap = math.max(64, full * 2)
+	local buf = ffi.cast("char *", C.curse_co_malloc(#dn + 1 + cap + 1))
+	if buf == nil then
+		return false
+	end
+	ffi.copy(buf, dn .. "=")
+	ffi.copy(buf + #dn + 1, cur)
+	ffi.copy(buf + #dn + 1 + #cur, value, #value)
+	buf[#dn + 1 + full] = 0
+	if C.putenv(buf) ~= 0 then
+		C.curse_co_free(buf)
+		return false
+	end
+	if e then -- (no environ references it now: putenv replaced it, or it had been dropped)
+		C.curse_co_free(e.buf)
+	end
+	M.envbuf[dn] = { buf = buf, v = buf + #dn + 1, len = full, cap = cap + 1 }
+	return true
+end
 local append_lazy
 do
 local SBUF = require("string.buffer")
@@ -12918,8 +13075,11 @@ local LAZY_STR = {
 local APPEND_SPECIAL = { OPTIND = true, BASH_ARGV0 = true, POSIXLY_CORRECT = true, IGNOREEOF = true,
 	RANDOM = true, SRANDOM = true, LINENO = true, FUNCNAME = true, TZ = true, HOSTFILE = true }
 append_lazy = function(sh, dn, b, value)
-	if b.ref or b.arr or b.int or b.lower or b.upper or b.cap or b.exported or rawget(b, "virt")
+	if b.ref or b.arr or b.int or b.lower or b.upper or b.cap or rawget(b, "virt") or (sh.opt_a and not b.exported)
 		or APPEND_SPECIAL[dn] or M.DYN_ASSIGN[dn] or LOCALE_VARS[dn] or value:find("\0", 1, true) then
+		return false -- (set -a: set_str exports it — bind_variable's auto-export)
+	end
+	if b.exported and not M.env_append(sh, dn, b, value) then
 		return false
 	end
 	local mt = getmetatable(b)
@@ -16820,8 +16980,8 @@ function M.assign_full(sh, st)
 	-- set -a (allexport): a plain scalar assignment auto-exports the variable
 	if sh.opt_a and not st.index then
 		local b = sh.vars[sh:deref(st.name)]
-		if b and not b.arr then
-			b.exported = true
+		if b and not b.arr and not (st.append and b.exported and rawget(b, "_sb")) then
+			b.exported = true -- (an append to an exported buffered var synced its entry: env_append)
 			C.setenv(st.name, sh:get(st.name), 1)
 		end
 	end
