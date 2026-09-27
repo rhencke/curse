@@ -296,8 +296,9 @@ if [ "${1:-}" = --run-unit ]; then
       if [ "$v" = FAIL ]; then v=KNOWN; elif [ "$v" = PASS ]; then echo "$corpus $testid $1" >> "$workdir/stale/$id"; fi ;;
     esac
     printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$corpus" "$1" "$v" "$4" "$testid" "$why" >> "$res"
-    # H_DIFF_DIR=dir: keep a failing test's expected (bash) and actual output + statuses
-    if { [ "$v" = FAIL ] || [ "$v" = KNOWN ] || [ "$why" = stderr-known ]; } && [ -n "${H_DIFF_DIR:-}" ]; then
+    # H_DIFF_DIR=dir: keep a failing curse test's expected (bash) and actual output + statuses
+    # (not dash's: it isn't bash, and its hundreds of expected misses would bury them)
+    if { [ "$v" = FAIL ] || [ "$v" = KNOWN ] || [ "$why" = stderr-known ]; } && [ -n "${H_DIFF_DIR:-}" ] && [ "$1" != dash ]; then
       printf '%s\n[status %s]\n' "$bout" "$bst" > "$H_DIFF_DIR/$testid.expected"
       printf '%s\n[status %s%s; %s]\n' "$2" "$3" "$( [ "$5" -eq 1 ] && echo ", TIMED OUT after ${lim}s")" "$why" > "$H_DIFF_DIR/$testid.$1"
       [ -n "$cmp_err" ] && { printf '%s\n' "$berr" > "$H_DIFF_DIR/$testid.expected.err"; printf '%s\n' "$6" > "$H_DIFF_DIR/$testid.$1.err"; }
