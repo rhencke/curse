@@ -4982,10 +4982,11 @@ EF.simple_native = function(cx, st, after, cmd)
 		end
 	elseif isexec and st.redirs then
 		spec[#spec + 1] = "eredirs=" .. ser(st.redirs)
-	elseif st.redirs and #st.redirs > 0 and EF.xtrace and ((st.arrayargs and not bind) or (bind and not st.arrayargs)) then
-		-- (set -x: a declaration's NAME=(…) literals trace once expanded, and a prefix
-		-- assignment as it binds, which the runner does — so it applies the redirections
-		-- itself, after the trace (bash traces to the stderr from before them): rf)
+	elseif st.redirs and #st.redirs > 0 and (st.arrayargs or bind) then
+		-- (a declaration's NAME=(…) literals and a prefix assignment's value expand in the
+		-- runner — before the redirections, as bash expands every word first: a $( … ) in
+		-- one writes its errors to the stderr from before them — and under set -x they
+		-- trace there too; so the runner applies the redirections itself, after: rf)
 		local rc = cx.redir_conds(st, cmd)
 		if not rc then
 			return nil
@@ -6069,6 +6070,35 @@ simple_compiled = function(cx, st, after)
 	-- reads them from there
 	-- (few args: plain locals — no table unless tracing is on; many: one table)
 	local xpre, xargs = "", false
+	-- a REDIRECTED command expands its words BEFORE its redirections apply (bash's
+	-- execute_simple_command: expand, then do_redirections): an argument that runs
+	-- something — a $( … ) whose error goes to stderr, an arith error — must see the
+	-- fds as they were. Hoist such arguments out ahead of the redirection, as set -x does.
+	if redir_apply and not as_local and not EF.xtrace and #args > 0 then
+		local impure = false
+		for i = 1, #args do
+			if not args[i]:match('^rt%.cstr%(%(?"[^"\\]*"%)?%)$') then
+				impure = true
+				break
+			end
+		end
+		if impure then
+			if #args <= 16 then
+				local names = {}
+				for i = 1, #args do
+					names[i] = "__x" .. i
+				end
+				xpre = ("local %s = %s; "):format(table.concat(names, ", "), table.concat(args, ", "))
+				args = names
+			else
+				xpre = ("local __xa = { %s }; "):format(table.concat(args, ", "))
+				for i = 1, #args do
+					args[i] = ("__xa[%d]"):format(i)
+				end
+			end
+			xargs = true
+		end
+	end
 	if EF.xtrace and not as_local then
 		if #args == 0 then
 			xpre = EF.xtc(cmd, "{}")
@@ -6140,8 +6170,14 @@ simple_compiled = function(cx, st, after)
 			for i = 1, #tmps do
 				xl[i] = "__lv" .. i
 			end
-			body = table.concat(tmps, "; ")
-				.. "; " .. EF.xtc(cmd, "{" .. table.concat(xl, ", ") .. "}")
+			-- (the values expand before a redirection applies — see the hoist above)
+			if redir_apply then
+				xpre = xpre .. table.concat(tmps, "; ") .. "; "
+				body = ""
+			else
+				body = table.concat(tmps, "; ") .. "; "
+			end
+			body = body .. EF.xtc(cmd, "{" .. table.concat(xl, ", ") .. "}")
 				.. (cmd == "local" and "if not rt.local_nofn(sh) then " or "do ")
 				.. "local __lok = true; "
 				.. table.concat(calls, "; ")
