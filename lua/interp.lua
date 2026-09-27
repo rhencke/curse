@@ -5086,7 +5086,7 @@ local function run_debug(sh, line)
 	if line then
 		sh.cur_line = line
 	end
-	local exited, rret = run_trap(sh, h)
+	local exited, rret = run_trap(sh, h, "debug trap")
 	local trap_status = sh.status
 	sh.status = saved
 	sh.in_debug = false
@@ -5971,8 +5971,15 @@ local function run_trap_mod(mod, sh)
 	return r -- must stay on the stack for rt.current_line to find)
 end
 rt.INTERP_FRAMES[run_trap_mod] = true
-run_trap = function(sh, code)
+-- tag: bash's parse_and_execute input name for this kind of trap — "trap" (a signal's),
+-- "exit trap", "debug trap", "error trap", "return trap" (trap.c) — which labels a syntax
+-- error in the handler text (`NAME: debug trap: line N:`); the text's lines count from
+-- the line the handler runs at (the callers set it: 1 unless DEBUG/ERR/RETURN, which
+-- don't reset line_number — SEVAL_RESETLINE).
+run_trap = function(sh, code, tag)
 	local exited, savedline, rret = false, sh.cur_line, nil
+	local spl, slb = sh.perr_label, sh.trap_lbase
+	sh.perr_label, sh.trap_lbase = tag, tag and savedline or nil
 	local saved_tcd, saved_ts = sh.trap_calldepth, sh.trap_saved
 	sh.trap_calldepth = sh.calldepth or 0
 	sh.trap_saved = sh.status -- (bash's trap_saved_exit_value: see rt.return_default)
@@ -6046,6 +6053,7 @@ run_trap = function(sh, code)
 	end
 	sh.trap_calldepth, sh.trap_saved = saved_tcd, saved_ts
 	sh.cur_line = savedline
+	sh.perr_label, sh.trap_lbase = spl, slb
 	if not ok then
 		if type(err) == "table" and err.__curse_discard then -- (bash's DISCARD: unwinds the
 			error(err, 0) -- handler and abandons the interrupted top-level command)
@@ -6111,7 +6119,7 @@ fire_err_trap = function(sh)
 	if h and h ~= "" and not sh.in_err_trap and errscope then
 		sh.in_err_trap = true
 		local saved = sh.status
-		local _, rret = run_trap(sh, h)
+		local _, rret = run_trap(sh, h, "error trap")
 		sh.status = saved
 		sh.in_err_trap = false
 		if rret then -- `trap 'return N' ERR`: the failing command's function returns N
@@ -6137,7 +6145,7 @@ M.prompt_string = function(sh, s, isprompt)
 	return expand_word(sh, P.parse_heredoc(decoded, false, nil, true))
 end
 M.run_trap_str = function(sh, code) -- a late-forked subshell child runs its own EXIT trap
-	return run_trap(sh, code)
+	return run_trap(sh, code, "exit trap")
 end
 
 -- (`return N` status is now rt.return_status — a pure runtime primitive the compiled
@@ -6167,7 +6175,7 @@ local function run_signal(sh, signum, direct, nested)
 	-- an asynchronously-delivered signal handler reports $LINENO = 1 (bash).
 	local saved, sl = sh.status, sh.cur_line
 	sh.cur_line = 1
-	local exited, rret = run_trap(sh, h)
+	local exited, rret = run_trap(sh, h, "trap")
 	sh.cur_line = sl
 	-- a trapped signal ends a `wait`: 128+sig (see b_wait) — but SIGCHLD only in posix mode
 	if sh.in_wait and (signum ~= 17 or sh.opt_posix) then
@@ -6247,7 +6255,7 @@ M.run_exit_trap = function(sh)
 		sh.in_exit_trap = true
 		local saved = sh.status
 		sh.cur_line = 1 -- (bash: the EXIT trap's $LINENO counts from 1)
-		if not run_trap(sh, h) then
+		if not run_trap(sh, h, "exit trap") then
 			sh.status = saved
 		end
 	end

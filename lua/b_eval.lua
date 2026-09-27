@@ -84,9 +84,10 @@ return function(sh, cmd, args, hook, tcb)
 						end
 						if lg.perr then -- syntax error on the line: run nothing on it (bash), status 2
 							-- (reported as the shell's own syntax errors are, labelled `eval:`)
+							local spl = sh.perr_label
 							sh.perr_label = "eval"
 							local pok, perr = pcall(require("interp").exec_stmt, sh, lg.perr, hook)
-							sh.perr_label = nil
+							sh.perr_label = spl
 							if not pok and not (type(perr) == "table" and perr.__curse_parseerr) then
 								error(perr)
 							end

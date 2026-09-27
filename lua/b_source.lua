@@ -160,7 +160,7 @@ return function(sh, cmd, args, hook, tcb)
 			if rh and rh ~= "" and not sh.in_return_trap and rt.pseudo_trapped(sh, "RETURN") then
 				sh.in_return_trap = true
 				local sv = sh.status
-				run_trap(sh, rh)
+				run_trap(sh, rh, "return trap")
 				sh.status = sv
 				sh.in_return_trap = false
 			end
