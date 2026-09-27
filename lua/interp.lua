@@ -5442,7 +5442,7 @@ exec_stmt = function(sh, st, hook)
 		-- (a slot as bash stores it: leading blanks dropped, an empty one is `1` — make_cmd.c
 		-- make_arith_for_command; it still fires DEBUG and traces `+ (( 1 ))`)
 		local function stext(slot)
-			local s = (st.src and st.src[slot] or ""):match("^%s*(.-)$")
+			local s = (st.src and st.src[slot] or ""):match("^[ \t]*(.-)$")
 			return s == "" and "1" or s
 		end
 		local function fdbg(slot)
@@ -5915,7 +5915,7 @@ exec_stmt = function(sh, st, hook)
 		end
 		rt.select_menu(sh, list)
 		while true do
-			hook("loop", st.id)
+			hook("loop", st.id, st, sh) -- (st: the tier hook tells the program's loops from eval'd ones)
 			if not rt.select_next(sh, list, st.name) then -- (the prompt/read/REPLY/NAME round: EOF
 				bodystatus = 1 -- or a readonly NAME ends the loop, status 1)
 				break

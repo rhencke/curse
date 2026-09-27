@@ -6352,13 +6352,17 @@ H.forc = function(cx, st, after)
 	cx.loopPc[st.id] = condp
 	local stepp = cx.newpc()
 	local bodyentry = cx.loop_list(st.body, stepp, after, stepp) -- break exits, continue steps
+	-- (the header's blocks, written after the body, run at the `for` line: an error in a
+	-- slot names it — execute_arith_for_command's line_number = arith_lineno)
+	local sv_line = EF.cur_line
+	EF.cur_line = st.line or sv_line
 	-- (with $BASH_COMMAND read, each slot's own DEBUG prefix carries its text: xs)
 	local d = not EF.bash_command and dbg(st) or "" -- DEBUG fires at the for(( header for the init, each cond, and each step (bash)
 	-- (set -x: each slot's `(( … ))` as it's evaluated, then its DEBUG — eval_arith_for_expr;
 	-- a slot as bash stores it: leading blanks dropped, an empty one `1` — make_cmd.c)
 	local function xs(slot)
 		local sv = st.src and st.src[slot]
-		sv = sv and sv:match("^%s*(.-)$")
+		sv = sv and sv:match("^[ \t]*(.-)$")
 		if sv == "" then
 			sv = "1"
 		end
@@ -6416,6 +6420,7 @@ H.forc = function(cx, st, after)
 	else
 		cx.blocks[ep] = ("%s = 0; %spc = %d"):format(ran, xs(1), condp) -- (an empty init: `1`)
 	end
+	EF.cur_line = sv_line
 	return ep
 end
 

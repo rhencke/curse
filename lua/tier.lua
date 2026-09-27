@@ -417,7 +417,8 @@ local function loop_fragment(st, sh)
 	if st.t == "whilec" or st.t == "forin" then
 		code = srcs:sub(st._s0, st._s1)
 	elseif st.t == "forc" and st.src then
-		code = "for ((;" .. (st.src[2] or "") .. ";" .. (st.src[3] or "") .. "))" .. srcs:sub(st._h1, st._s1)
+		-- (the init slot's newlines stay: the body's lines count from the header's)
+		code = "for ((" .. (st.src[1] or ""):gsub("[^\n]", "") .. ";" .. (st.src[2] or "") .. ";" .. (st.src[3] or "") .. "))" .. srcs:sub(st._h1, st._s1)
 	else
 		return false
 	end
@@ -789,6 +790,12 @@ function M.run_tiered(src, sh)
 		count = count + 1
 		if count < HOT_LOOP or resume or trap_blocked() then
 			return
+		end
+		if st and st._srcs ~= src then
+			-- a loop of OTHER text — eval'd, sourced, a trap's: its id numbers that parse,
+			-- not the program's (resuming the program at the program's loop of the same id
+			-- would re-run it); it can only run compiled on its own
+			return M.loop_osr(sh, st)
 		end
 		local m = compiled()
 		if sh.calldepth ~= 0 then

@@ -117,7 +117,7 @@ local function arith(src, nodefer)
 	-- ahead, and each check here looks at the next token after skip()). An error names
 	-- the text from there on: `4+` -> operand expected (error token is "+").
 	local lasttp
-	local etxt = src:gsub("^%s+", "") -- (the expression as bash's errors print it)
+	local etxt = src:gsub("^[ \t]+", "") -- (the expression as bash's errors print it)
 	local function skip() -- (expr.c's cr_whitespace: blank, tab, newline — not \r, \f, \v)
 		local c = src:byte(i)
 		while c == 32 or c == 9 or c == 10 do
@@ -498,7 +498,7 @@ local function arith(src, nodefer)
 				left.etxt, left.etok = etxt, lasttp and src:sub(lasttp) or ""
 			elseif op == "/" or op == "%" then
 				-- (a division by 0 names the text from the divisor on: expmuldiv's lasttp = stp)
-				left.etxt, left.etok = etxt, (src:sub(stp):gsub("^%s+", ""))
+				left.etxt, left.etok = etxt, (src:sub(stp):gsub("^[ \t]+", ""))
 			elseif (op == "&&" or op == "||") and npow > np then
 				left.rpow = true -- (a skipped right operand still checks its exponents: see eval)
 			end
@@ -571,7 +571,7 @@ local function shown(s, subscript)
 	return subscript and (s:gsub("\\([$`\"'~])", "%1")) or s
 end
 function M.arith_errmsg(expr, err, subscript)
-	local t = shown(tostring(type(err) == "table" and err.expr or expr or ""):gsub("^%s+", ""), subscript)
+	local t = shown(tostring(type(err) == "table" and err.expr or expr or ""):gsub("^[ \t]+", ""), subscript)
 	local pre = M.arith_cmd and (M.arith_cmd .. ": ") or ""
 	if type(err) == "table" and err.msg then
 		return pre .. t .. ": " .. err.msg .. ' (error token is "' .. shown(err.tok or "", subscript) .. '")'
@@ -4149,6 +4149,8 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs, xg, bq
 					error({ __curse_perr = true, exact = true, line = line, msg = "syntax error near `"
 						.. (nx or ((body:match(".*(;.*)$") or ("((" .. body)) .. ")")) .. "'" }, 0)
 				end
+				-- (the header's own newlines: bash's lexer counts them as it reads the `((…))`)
+				line = line + select(2, src:sub(i + 2, ni - 1):gsub("\n", ""))
 				i = ni
 				-- split the header at its top-level `;`s — not inside quotes, $(…), ${…}
 				local slots = split_top(body, ";")
@@ -4170,7 +4172,8 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs, xg, bq
 				-- executes and runs zero iterations non-fatally, rather than failing to parse
 				-- the whole script (same rule as `$((…))`). A clean parse is unchanged.
 				local function parith(s)
-					if not s:match("%S") then
+					if not s:match("[^ \t]") then -- (make_arith_for_expr skips only blanks: a slot of
+						-- just a newline is an expression, evaluating to 0)
 						return nil
 					end
 					local ok, ast = pcall(arith, s)
@@ -4355,6 +4358,9 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs, xg, bq
 			if j and src:byte(j + 1) == 41 then
 				local body = src:sub(i + 2, j - 1)
 				i = j + 2
+				-- bash's make_arith_command stamps the line the `))` closed on (its lexer has
+				-- counted the body's newlines by then): $LINENO and error lines use it
+				line = line + select(2, body:gsub("\n", ""))
 				-- a malformed `(( expr ))` (bad lvalue) is a NON-fatal runtime error in bash,
 				-- so defer the parse failure to eval (caught by the arithcmd handler) rather
 				-- than aborting the whole parse.
