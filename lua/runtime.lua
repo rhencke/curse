@@ -13969,7 +13969,7 @@ function Shell:dash_flags()
 		{ "h", "opt_h" }, { "i", "opt_i" }, { "k", "opt_k" }, { "m", "opt_m" }, { "n", "opt_n" },
 		{ "p", "opt_p" }, { "r", "opt_r" }, { "t", "opt_t" }, { "u", "opt_u" }, { "v", "opt_v" },
 		{ "x", "opt_x" }, { "B", "opt_B" }, { "C", "opt_C" }, { "E", "opt_errtrace" } }) do
-		if on(fl[2]) then
+		if on(fl[2]) or (fl[1] == "i" and self.opt_forced_i) then -- (`set -oi`: forced_interactive)
 			t[#t + 1] = fl[1]
 		end
 	end

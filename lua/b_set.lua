@@ -146,6 +146,18 @@ return function(sh, cmd, args, hook, tcb)
 					elseif on and not sh.opt_r then
 						rt.make_restricted(sh)
 					end
+				elseif f == "?" then -- (only reachable after an `o`, whose word the check skipped)
+					io.stderr:write(rt.usage("set"))
+					sh.status = 0
+					return
+				elseif f == "i" then -- (change_flag: forced_interactive, shown in $- only)
+					sh.opt_forced_i = on
+				elseif not SETFLAG[f] then
+					-- the rest of a word after `o` was its optarg to the validity check, so a
+					-- bad letter there first fails here: change_flag's FLAG_ERROR (`set -o0`)
+					io.stderr:write("curse: set: " .. a:sub(1, 1) .. f .. ": invalid option\n" .. rt.usage("set"))
+					sh.status = 1
+					return
 				else
 					set_opt(sh, SETFLAG[f], on)
 				end
