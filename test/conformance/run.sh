@@ -481,7 +481,7 @@ case "$SHELLS" in *curse*)
     CURSE_WORKERS="$JOBS" CURSE_IDLE=3600 "$LUAJIT" "$REPO/lua/daemon.lua" >"${H_DAEMON_LOG:-/dev/null}" 2>&1 &
   DAEMON_PID=$!
   disown "$DAEMON_PID" 2>/dev/null || true   # cleanup kills it by pid; keep job-control quiet
-  sock="$H_XDG_RUNTIME/curse.sock"
+  sock="$H_XDG_RUNTIME/curse-v2.sock"
   timeout 10 sh -c 'until [ -S "$1" ]; do :; done' _ "$sock" \
     || { echo "error: cursed socket $sock never appeared (daemon failed to start)" >&2; exit 1; }
 ;; esac

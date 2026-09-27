@@ -5393,51 +5393,162 @@ function M.job_control_on(sh)
 	end
 	return true
 end
--- The script is over. bash's shell exits, leaving its jobs — and the kernel sends a STOPPED
--- one SIGHUP then SIGCONT (POSIX: its process group is orphaned by the exit), so it ends,
--- or runs on if it ignores HUP, rather than staying stopped forever. Here the process may
--- live on (a daemon worker) or must first drain its in-process jobs, so do that for it:
--- every stopped real process of a job, and every suspended task (one left parked would
--- hold the drain forever). With job control the real ones are in their own process groups
--- too, so the kernel does it even if this process is killed outright.
+-- The script is over. bash's shell exits, leaving its jobs — but first, with job control on
+-- (`set -m`, still on at the exit: end_job_control), terminate_stopped_jobs sends each
+-- STOPPED job's process group SIGTERM then SIGCONT. Without it, a stopped job in a process
+-- group of its own (started under `set -m`, turned off since) is orphaned by the exit, and
+-- the kernel sends it SIGHUP then SIGCONT (POSIX), so it ends, or runs on if it ignores
+-- HUP. Here the process may live on (a daemon worker) or must first drain its in-process
+-- jobs, so do both for it: for every stopped real process of a job-control job, and every
+-- suspended job-control task. A stopped process in the SHELL's process group gets neither
+-- (its group is not orphaned: it still has the caller): bash leaves it stopped, and so does
+-- this — and the drain does not wait for it, nor for a task stuck behind it
+-- (M.tasks_all_stuck), as bash's exit doesn't.
 do
-	local function proc_stopped(pid)
+	local function proc_stat(pid) -- its state letter and process group, from /proc
 		local f = io.open("/proc/" .. pid .. "/stat", "r")
 		local line = f and f:read("*l")
 		if f then
 			f:close()
 		end
-		local st = line and line:match("^.*%) (%a)")
+		if not line then
+			return nil
+		end
+		local st, pg = line:match("^.*%) (%a) %-?%d+ (%d+)")
+		return st, tonumber(pg)
+	end
+	M.proc_stat = proc_stat
+	local function stopped_st(st)
 		return st == "T" or st == "t"
 	end
+	local function own_pgrp()
+		local _, pg = proc_stat("self")
+		return pg
+	end
+	M.own_pgrp = own_pgrp
+	-- (a task whose running external IS the job's process: bash execs a simple job's
+	-- command in place — not a function's)
+	function M.task_is_external(t)
+		return t.child_pid and t.child_inplace and true or false
+	end
+	local exit_sig = 1 -- (SIGHUP, or SIGTERM when job control is on at the exit)
+	M.exit_signalled = {} -- (pids signalled here: the daemon's orphan sweep leaves them be)
+	local function signal_job(procs, t, sig)
+		for _, pid in ipairs(procs) do
+			M.exit_signalled[pid] = true
+			C.kill(pid, sig)
+			C.kill(pid, 18)
+		end
+		-- (the job's own process, when it isn't its external: a subshell, a function)
+		if t and not (M.task_is_external(t)) then
+			M.task_kill(t, sig) -- (taken once it runs — then the CONT)
+			M.task_resume(t)
+		end
+	end
 	function M.jobs_exit_hangup(sh)
+		local jc = sh and M.job_control_on(sh)
+		exit_sig = jc and 15 or 1
+		local mine, seen = own_pgrp(), {}
 		for _, j in ipairs(sh and sh.jobs or {}) do
 			if not j.gone and M.job_running(j) then
-				for _, pid in ipairs(M.job_procs(j)) do
-					if j.stopped or proc_stopped(pid) then
-						C.kill(pid, 1)
-						C.kill(pid, 18)
+				local t = j.g and M.vpid_tasks[j.pid]
+				local procs = M.job_procs(j)
+				local own = t and t.jc
+				local any = t and t.stopped and true or false
+				local all = not t or t.stopped or M.task_is_external(t)
+				all = all and true or false
+				for _, pid in ipairs(procs) do
+					seen[pid] = true
+					local st, pg = proc_stat(pid)
+					if stopped_st(st) then
+						any = true
+					else
+						all = false
+					end
+					if not t and pg and pg ~= mine then
+						own = true
+					end
+				end
+				if t then
+					seen[t] = true
+				end
+				-- a stopped job-control job: terminate_stopped_jobs's TERM + CONT; one only
+				-- partly stopped (a subshell waiting on its stopped external) is left to the
+				-- kernel, which HUPs + CONTs its whole orphaned process group
+				if own and any then
+					signal_job(procs, t, (jc and all) and 15 or 1)
+				end
+			end
+		end
+		if SCHED then -- (tasks no job holds: their externals, and themselves)
+			for _, t in pairs(SCHED.bycoro) do
+				if not t.done and t.jc and not seen[t] then
+					local procs = {}
+					if t.child_pid and not seen[t.child_pid] then
+						local st = proc_stat(t.child_pid)
+						if stopped_st(st) then
+							procs[1] = t.child_pid
+						end
+					end
+					if procs[1] or t.stopped then
+						signal_job(procs, t, 1)
 					end
 				end
 			end
 		end
-		if SCHED then
-			for _, t in pairs(SCHED.bycoro) do
-				if not t.done and t.child_pid and proc_stopped(t.child_pid) then
-					C.kill(t.child_pid, 1)
-					C.kill(t.child_pid, 18)
-				end
-			end
-			M.tasks_hangup_stopped()
-		end
 	end
-	function M.tasks_hangup_stopped()
+	function M.tasks_hangup_stopped() -- (a job-control task stopped since: bash would be gone)
 		for _, t in pairs(SCHED and SCHED.bycoro or {}) do
-			if t.stopped and not t.done then
-				M.task_kill(t, 1) -- (HUP — taken once it runs — then the CONT)
+			if t.stopped and not t.done and t.jc then
+				M.task_kill(t, exit_sig)
 				M.task_resume(t)
 			end
 		end
+	end
+	-- Every task left is stuck for good — itself suspended without job control, running an
+	-- external stopped in the shell's own process group, or waiting on (or in a pipeline
+	-- with) one that is: bash's exit would leave them all as they are. True also when none.
+	function M.tasks_all_stuck()
+		local ctx = SCHED
+		if not ctx or next(ctx.bycoro) == nil then
+			return true
+		end
+		local stuck, any, mine = {}, false, nil
+		for _, t in pairs(ctx.bycoro) do
+			if not t.done and not t.jc then
+				if t.stopped then
+					stuck[t], any = true, true
+				elseif t.child_pid then
+					mine = mine or own_pgrp()
+					local st, pg = proc_stat(t.child_pid)
+					if stopped_st(st) and pg == mine then
+						stuck[t], any = true, true
+					end
+				end
+			end
+		end
+		if not any then
+			return false
+		end
+		local grew = true
+		while grew do -- (…and whatever waits on a stuck one, or shares its pipeline)
+			grew = false
+			local sg = {}
+			for t in pairs(stuck) do
+				sg[t.g] = true
+			end
+			for _, t in pairs(ctx.bycoro) do
+				if not t.done and not stuck[t] and (sg[t.g] or (type(t.wait) == "table" and sg[t.wait])) then
+					stuck[t], grew = true, true
+				end
+			end
+		end
+		for _, t in pairs(ctx.bycoro) do
+			if not t.done and not stuck[t] then
+				return false
+			end
+		end
+		return true
 	end
 end
 -- Register a background job (for `jobs`/`wait %spec`/`wait -n`) and set $!: the slot after
@@ -6549,9 +6660,11 @@ function M.sched_drain(sh)
 	end
 	while sched_live() and not CO do
 		M.tasks_hangup_stopped() -- (one a job stopped meanwhile)
-		M.sched_pump({ untilf = function()
-			return next(SCHED.bycoro) == nil
-		end })
+		M.sched_pump({ untilf = M.tasks_all_stuck })
+		if M.tasks_all_stuck() then -- (only stopped ones are left: not waited for — see
+			preempt_arm(0) -- M.jobs_exit_hangup; and no slice ticks for them: the pump armed one)
+			break
+		end
 	end
 end
 

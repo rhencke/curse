@@ -138,7 +138,7 @@ start_daemon() {
 	local pid n=0
 	pid=$(env XDG_RUNTIME_DIR="$1" XDG_CACHE_HOME="$2" CURSE_BUNDLE="$BUNDLE" CURSE_WORKERS="$3" \
 		CURSE_IDLE=3600 "$STH" spawn "$4" -- "$LUAJIT" "$REPO/lua/daemon.lua") || return 1
-	until [ -S "$1/curse.sock" ]; do
+	until [ -S "$1/curse-v2.sock" ]; do
 		n=$((n + 1)); [ $n -gt 1500 ] && { echo "stress: daemon did not start in 30s" >&2; cat "$4" >&2; return 1; }
 		sleep 0.02
 	done

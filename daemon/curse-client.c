@@ -28,7 +28,13 @@
 #include <signal.h>
 #include <stdint.h>
 
-#define CURSE_MAGIC 0x43555253u /* "CURS" */
+/* The protocol: its version is in the socket's NAME (curse-v2.sock: a client and a daemon
+ * of different versions never meet — the client finds no daemon and falls back) and in the
+ * request header (a daemon that doesn't speak it closes the connection before its first
+ * reply frame, and the client falls back — the script never started). */
+#define CURSE_MAGIC 0x43555256u /* "CURV": a versioned header follows */
+#define CURSE_PROTO 2u
+#define CURSE_SOCK "curse-v2.sock"
 
 /* Auto-start the resident daemon in the background so FUTURE invocations are warm.
  * $CURSE_DAEMON is the launch command (e.g. "luajit /path/lua/daemon.lua"); unset
@@ -56,7 +62,10 @@ static void spawn_daemon(void) {
  * so we never defer to them; curse always runs its own scripts, warm or cold.
  * $CURSE_FALLBACK overrides the curse binary path/name (default "curse"); argv is
  * passed UNCHANGED, so argv[0]'s shell name (e.g. "sh") puts curse into shell mode. */
+static uint32_t closed_std; /* fds 0-2 closed at entry (bit n): /dev/null holds them meanwhile */
 static void fallback(char **argv) {
+    for (int f = 0; f < 3; f++) /* (closed again: the script sees them as we got them) */
+        if (closed_std & (1u << f)) close(f);
     const char *prog = getenv("CURSE_FALLBACK");
     if (!prog || !*prog) prog = "curse";
     execvp(prog, argv);
@@ -90,6 +99,18 @@ static void fwd_install(uint32_t sigign) {
         sigaction(s, &sa, NULL);
     }
 }
+/* The request never started (the daemon closed before its first frame: a protocol it
+ * doesn't speak, or it failed): undo the forwarding, then run the script directly — a
+ * signal held meanwhile is taken now, as it would have been by the shell. */
+static void fwd_fallback(char **argv) {
+    for (int s = 1; s < 32; s++) {
+        struct sigaction cur;
+        if (sigaction(s, NULL, &cur) == 0 && cur.sa_handler == fwd_signal) signal(s, SIG_DFL);
+    }
+    for (int s = 1; s < 32; s++)
+        if (fwd_held[s]) { fwd_held[s] = 0; raise(s); }
+    fallback(argv);
+}
 static void fwd_release(pid_t worker) {
     fwd_worker = worker;
     for (int s = 1; s < 32; s++)
@@ -112,11 +133,17 @@ static long put_bytes(char *buf, long off, long cap, const char *s, uint32_t n) 
 }
 
 int main(int argc, char **argv, char **envp) {
+    /* A closed fd 0-2 must stay closed for the script (`sh script <&-`: read gets EBADF) —
+     * but socket() would take its number, and the script would read the socket. Hold it
+     * with /dev/null (lowest free: the same number), and tell the daemon to close it. */
+    for (int f = 0; f < 3; f++)
+        if (fcntl(f, F_GETFD) < 0 && errno == EBADF && open("/dev/null", O_RDWR) == f)
+            closed_std |= 1u << f;
     const char *rt = getenv("XDG_RUNTIME_DIR");
     if (!rt || !*rt) fallback(argv); /* no per-user runtime dir -> no daemon */
 
     char path[512];
-    if ((size_t)snprintf(path, sizeof path, "%s/curse.sock", rt) >= sizeof path)
+    if ((size_t)snprintf(path, sizeof path, "%s/" CURSE_SOCK, rt) >= sizeof path)
         fallback(argv);
 
     int fd = socket(AF_UNIX, SOCK_STREAM, 0);
@@ -133,10 +160,12 @@ int main(int argc, char **argv, char **envp) {
         fallback(argv); /* and run THIS request directly (daemon warms in the background) */
     }
 
-    /* Build the request: magic, argv, cwd, environ. */
+    /* Build the request: magic, version, the closed std fds, argv, cwd, environ. */
     static char buf[1 << 16];
     long off = 0, cap = sizeof buf;
     off = put_u32(buf, off, cap, CURSE_MAGIC);
+    off = put_u32(buf, off, cap, CURSE_PROTO);
+    off = put_u32(buf, off, cap, closed_std);
     off = put_u32(buf, off, cap, (uint32_t)argc);
     for (int i = 0; i < argc && off >= 0; i++)
         off = put_bytes(buf, off, cap, argv[i], (uint32_t)strlen(argv[i]));
@@ -196,12 +225,14 @@ int main(int argc, char **argv, char **envp) {
     memcpy(CMSG_DATA(cm), passfds, (3 + nextra) * sizeof(int));
 
     fwd_install(sigign);
-    if (sendmsg(fd, &msg, MSG_NOSIGNAL) < 0) { close(fd); fallback(argv); }
+    if (sendmsg(fd, &msg, MSG_NOSIGNAL) < 0) { close(fd); fwd_fallback(argv); }
 
     /* Read the worker's pid (a negative int32), then the exit status (int32). If the
-     * daemon dies mid-run, treat as 127. */
+     * daemon closes before the pid, the request never started: run it directly. If it
+     * dies mid-run, treat as 127. */
     int32_t status = 127;
     ssize_t got;
+    int started = 0;
     for (;;) {
         got = 0;
         ssize_t want = sizeof status;
@@ -212,9 +243,14 @@ int main(int argc, char **argv, char **envp) {
             if (r <= 0) break;
             got += r;
         }
+        if (got == 0 && !started) { close(fd); fwd_fallback(argv); }
         if (got != want || status >= 0) break;
+        started = 1;
         fwd_release((pid_t)-status);
     }
+    /* Done: forward nothing more — the worker waits for this close before it takes its
+     * next request, so a signal sent to us now can never reach another client's script. */
+    fwd_worker = 0;
     close(fd);
     if (got != (ssize_t)sizeof status)
         return 127;
