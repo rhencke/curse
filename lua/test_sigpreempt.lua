@@ -59,15 +59,19 @@ if mode then
 	elseif mode == "inverted" then
 		-- a loop whose last guard is its own condition: LuaJIT inverts it (the jcc jumps
 		-- back to the loop, a jmp to the exit follows) -- there is no back-edge jmp
+		-- (the chunk arms the timer itself, AFTER installing its handler: armed before,
+		-- a process descheduled for d*0.9ms under load took the signal before the new
+		-- handler was set -- the previous chunk's ran, set ITS lim, and this loop spun on)
 		for d = 1, 20 do
 			local f = assert(loadstring([[
+				local arm, us = ...
 				local lim = 1e15
 				_G.__curse_sigrun = function() lim = 0 end
+				arm(us, 0)
 				local i = 0
 				while i < lim do i = i + 1 end
 				return i]]))
-			arm(d * 900, 0)
-			f()
+			f(arm, d * 900)
 		end
 		print("inverted: ok")
 	elseif mode == "exact" then

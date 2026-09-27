@@ -46,6 +46,7 @@ static int curse_sig_take(void)
 }
 
 static void curse_sig_hook(lua_State *L, lua_Debug *ar);
+static void curse_kick_disarm(int s);
 
 /* Scheduled hook: runs at the next VM safepoint in a safe Lua context. Removes
  * itself (one-shot) BEFORE running Lua, then calls curse's trap runner once per
@@ -91,6 +92,7 @@ static void curse_sig_hook(lua_State *L, lua_Debug *ar)
   for (;;) {
     sigprocmask(SIG_BLOCK, &all, &old);
     s = curse_sig_take();
+    if (s) curse_kick_disarm(s);  /* (taken: no re-kick for it) */
     sigprocmask(SIG_SETMASK, &old, (sigset_t *)0);
     if (s == 0) break;
     lua_getglobal(L, "__curse_sigrun");
@@ -115,15 +117,56 @@ static void curse_sig_hook(lua_State *L, lua_Debug *ar)
   hook_enter(G(L));
 }
 
-static void curse_sig_onsignal(int s)
+/* The re-kick: a signal whose hook has not run CURSE_KICK_US after it arrived is
+ * delivered to the running code again. The handler can land where neither of its
+ * mechanisms reaches the code about to run: during a trace compile (lj_dispatch_ins ->
+ * lj_trace_ins) no trace runs to patch, and the count hook it re-arms (hookcount = 1)
+ * is past its check for this instruction -- which, the compile done, is the JLOOP that
+ * enters the new trace: an inverted loop then never returns to a VM safepoint and the
+ * trap is lost (test_sigpreempt "inverted" under load: pending set, hook installed,
+ * trace running, nothing patched). So each caught signal also arms a one-shot POSIX
+ * timer that raises the SAME signal with a cookie in si_value (SI_TIMER): that
+ * delivery only re-schedules the hook and re-patches the code running now -- and only
+ * while the signal is still pending, never a second trap. It backs off (2ms, 10ms,
+ * 50ms, then every 100ms) while the signal stays pending (a C call that retries EINTR
+ * itself keeps the hook from running meanwhile). A timer is per signal (its number is
+ * fixed at creation) and per process (POSIX timers are not inherited across fork:
+ * curse_sig_catch creates the child's own); the hook disarms the one it takes, and a
+ * signal leaving curse's handler (curse_sig_default/ignore) takes any kick queued. */
+#define CURSE_KICK_COOKIE 0x63727365  /* "crse" */
+static timer_t curse_kick_timer[CURSE_NSIG];
+static pid_t curse_kick_pid[CURSE_NSIG];
+static volatile sig_atomic_t curse_kick_n[CURSE_NSIG];
+
+static void curse_kick_arm(int s)
 {
-  lua_State *L;
-  if (s > 0 && s < CURSE_NSIG) curse_sig_pend[s] = 1;
-  curse_sig_pid = getpid();
+  static const long us[4] = { 2000, 10000, 50000, 100000 };
+  struct itimerspec it;
+  int k = (int)curse_kick_n[s];
+  long u;
+  if (curse_kick_pid[s] != getpid()) return;
+  u = us[k < 3 ? k : 3];
+  if (k < 3) curse_kick_n[s] = k + 1;
+  memset(&it, 0, sizeof it);
+  it.it_value.tv_sec = u / 1000000;
+  it.it_value.tv_nsec = (u % 1000000) * 1000;
+  timer_settime(curse_kick_timer[s], 0, &it, (struct itimerspec *)0);
+}
+
+static void curse_kick_disarm(int s)
+{
+  struct itimerspec it;
+  if (curse_kick_pid[s] != getpid()) return;
+  memset(&it, 0, sizeof it);
+  timer_settime(curse_kick_timer[s], 0, &it, (struct itimerspec *)0);
+}
+
+static void curse_sig_schedule(void)
+{
+  lua_State *L = curse_globalL();
   /* Schedule the trap for the next safepoint (laction pattern). Count=1 fires on
    * the next VM instruction; call/ret masks make blocking-syscall returns fire it
    * promptly. The hook removes itself, so this is a one-shot per signal. */
-  L = curse_globalL();
   if (L) lua_sethook(L, curse_sig_hook,
                      LUA_MASKCALL | LUA_MASKRET | LUA_MASKCOUNT, 1);
 #ifdef CURSE_SIG_DESTRUCTIVE
@@ -135,15 +178,66 @@ static void curse_sig_onsignal(int s)
 #endif
 }
 
+/* Before `s` leaves curse's handler (trap reset or ignored): no re-kick may reach
+ * the new disposition -- disarm, and take a kick already queued (a real `s` queued
+ * with it arrived while trapped: it is recorded as caught). */
+static void curse_kick_quiesce(int s)
+{
+  sigset_t one, old;
+  siginfo_t si;
+  struct timespec zero = { 0, 0 };
+  if (s <= 0 || s >= CURSE_NSIG || curse_kick_pid[s] != getpid()) return;
+  sigemptyset(&one);
+  sigaddset(&one, s);
+  sigprocmask(SIG_BLOCK, &one, &old);
+  curse_kick_disarm(s);
+  while (sigtimedwait(&one, &si, &zero) == s) {
+    if (!(si.si_code == SI_TIMER && si.si_value.sival_int == CURSE_KICK_COOKIE)) {
+      curse_sig_pend[s] = 1;
+      curse_sig_pid = getpid();
+      curse_sig_schedule();
+    }
+  }
+  sigprocmask(SIG_SETMASK, &old, (sigset_t *)0);
+}
+
+static void curse_sig_onsignal(int s, siginfo_t *si, void *uc)
+{
+  (void)uc;
+  if (s <= 0 || s >= CURSE_NSIG) return;
+  if (si && si->si_code == SI_TIMER && si->si_value.sival_int == CURSE_KICK_COOKIE) {
+    /* The re-kick: nothing new arrived. */
+    if (curse_sig_pend[s] && curse_sig_pid == getpid()) {
+      curse_sig_schedule();
+      curse_kick_arm(s);
+    }
+    return;
+  }
+  curse_sig_pend[s] = 1;
+  curse_sig_pid = getpid();
+  curse_sig_schedule();
+  curse_kick_n[s] = 0;
+  curse_kick_arm(s);
+}
+
 /* Install curse's async handler for signal `s` (no SA_RESTART -> blocking syscalls
- * EINTR). */
+ * EINTR), and its re-kick timer. */
 int curse_sig_catch(int s)
 {
   struct sigaction sa;
+  if (s > 0 && s < CURSE_NSIG && curse_kick_pid[s] != getpid()) {
+    struct sigevent ev;
+    memset(&ev, 0, sizeof ev);
+    ev.sigev_notify = SIGEV_SIGNAL;
+    ev.sigev_signo = s;
+    ev.sigev_value.sival_int = CURSE_KICK_COOKIE;
+    if (timer_create(CLOCK_MONOTONIC, &ev, &curse_kick_timer[s]) == 0)
+      curse_kick_pid[s] = getpid();
+  }
   memset(&sa, 0, sizeof sa);
-  sa.sa_handler = curse_sig_onsignal;
+  sa.sa_sigaction = curse_sig_onsignal;
   sigemptyset(&sa.sa_mask);
-  sa.sa_flags = 0;
+  sa.sa_flags = SA_SIGINFO;
   return sigaction(s, &sa, (struct sigaction *)0);
 }
 
@@ -151,6 +245,7 @@ int curse_sig_catch(int s)
 int curse_sig_default(int s)
 {
   struct sigaction sa;
+  curse_kick_quiesce(s);
   memset(&sa, 0, sizeof sa);
   sa.sa_handler = SIG_DFL;
   return sigaction(s, &sa, (struct sigaction *)0);
@@ -160,6 +255,7 @@ int curse_sig_default(int s)
 int curse_sig_ignore(int s)
 {
   struct sigaction sa;
+  curse_kick_quiesce(s);
   memset(&sa, 0, sizeof sa);
   sa.sa_handler = SIG_IGN;
   return sigaction(s, &sa, (struct sigaction *)0);
