@@ -2368,6 +2368,28 @@ function M.redir_noglob(sh, f, ...)
 	sh.opt_f = false
 	return ok, fs
 end
+-- A pipeline stage's / async command's OWN redirections: bash applies them in that command's
+-- own process, not undoably (execute_in_subshell / execute_subshell_builtin_or_function),
+-- so a fd move there `N>&M-` onto an open N from a closed M says only `M: Bad file
+-- descriptor` — undoable (in the shell), add_undo_redirect's failed save of M says
+-- `redirection error: cannot duplicate fd` first. redir_moves: how many moves `redirs`
+-- has (0: nothing to mark); redir_top (both tiers, as the stage/job starts): the next that
+-- many moves apply_redirs makes in this shell are the command's own — `last`: the last
+-- stage, which a lastpipe shell runs itself (undoably).
+function M.redir_moves(redirs)
+	local n = 0
+	for _, r in ipairs(redirs or {}) do
+		if (r.op == "dup" or r.op == "dupin") and not r.fdvar and r.target ~= "-" and (r.target or ""):find("%-$") then
+			n = n + 1
+		end
+	end
+	return n
+end
+function M.redir_top(sh, n, last)
+	if not (last and sh.shopt.lastpipe and not sh.opt_i) then
+		sh.redir_noundo = n
+	end
+end
 -- THE policy (interp's apply_redirs and compiled code's rt.redir_ext both ask it): does bash
 -- run this command in a forked child (an external), where a fatal expansion error in its
 -- redirections (set -u, ${v?}, failglob) fails only it? `command [-p] [--] NAME` is looked

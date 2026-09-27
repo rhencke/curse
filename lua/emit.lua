@@ -1587,6 +1587,16 @@ local function inl_sync(cmd, call, cx)
 	local pre, _, post = lsync(rl)
 	return pre .. call .. post
 end
+-- A pipeline stage's / async job's fragment `id` whose command `st` has fd moves of its own:
+-- wrapped (once, at load) to mark them as the new process's own (rt.redir_top). last: the
+-- pipeline's last stage (a lastpipe shell runs it itself).
+local function frag_redir_top(id, st, last)
+	local nmv = require("runtime").redir_moves(st.redirs)
+	if nmv > 0 then
+		emit_frags[#emit_frags + 1] = ("do local __f = __CS[%d]; __CS[%d] = function(sh, ...) rt.redir_top(sh, %d%s); return __f(sh, ...) end end")
+			:format(id, id, nmv, last and ", true" or "")
+	end
+end
 local function emit_fragment(stmts, neg, liftset, cfraise)
 	local saved_neg, saved_line = emit_neg_ctx, EF.cur_line
 	-- `cfraise` ({loop=, func=}): the fragment is the BODY of a compound run in the current
@@ -7254,6 +7264,9 @@ H.pipeline = function(cx, st, after)
 		if not id then
 			return cx.refuse(st, after)
 		end
+		if n > 1 then
+			frag_redir_top(id, st.cmds[i], i == n)
+		end
 		frags[i] = "__CS[" .. id .. "]"
 	end
 	-- (a reload of the run-local lifted vars only: stages keep those in sh (a lastpipe
@@ -7359,6 +7372,7 @@ H.background = function(cx, st, after)
 	if not id then
 		return cx.refuse(st, after)
 	end
+	frag_redir_top(id, st.cmd)
 	local c1 = st.cmd -- best-effort command text for the job table
 	while c1 and c1.t == "pipeline" and c1.cmds do
 		c1 = c1.cmds[1]
@@ -8049,7 +8063,8 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
 		-- __rs so the compiled restore undoes them. Lifted locals are flushed to sh around it
 		-- (the target may read them, `{v}` / `${x:=f}` may write them).
 		return EF.lwrap(cx.lifted, ("rt.redir_apply_one(sh, %s[1], __rs%s)"):format(EF.konst({ ser(r) }),
-			(r.fdvar and cname) and (", %q"):format(cname) or ""), "__ok")
+			cname and (", %q"):format(cname) or ""), "__ok") -- (the command: names a {v} error; a
+		-- move's failure says more when it runs in the shell — not an external's: rt.redir_forks)
 	end
 	function cx.redir_native_expr(r)
 		if r.fdvar then
