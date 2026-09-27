@@ -13790,6 +13790,24 @@ function M.array_elem(sh, name, raw, expanded)
 	return sh:expand_param({ name = name, index = raw }, nil, nil, key)
 end
 
+-- A compiled module's deeply nested constant (emit's ser_flat): its tables as a list, each
+-- nested one a `{__r=N}` reference — linked up, the first returned.
+function M.unflat(list)
+	for _, t in ipairs(list) do
+		for k, v in pairs(t) do
+			if type(v) == "table" and v.__r then
+				t[k] = list[v.__r]
+			end
+		end
+	end
+	return list[1]
+end
+-- …and whether it is set (a compiled ${a[i]#PAT}: rt.pe_nopat)
+function M.array_elem_set(sh, name, raw, expanded)
+	local key = M.array_key(sh, name, raw, expanded)
+	M.elem_read_check(sh, name, key)
+	return sh:expand_param({ name = name, index = raw }, nil, nil, key), sh:is_elem_set(name, key)
+end
 -- An element's key for a compiled ${a[i]OP}: a negative subscript past the start says
 -- "bad array subscript" (the read then goes on), as interp's expand_pexp does.
 function M.array_key_rc(sh, name, raw, expanded)

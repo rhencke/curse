@@ -465,8 +465,63 @@ end
 -- helper (rt.parse_error_stmt, rt.redir_apply_one, rt.assign_elem, …). No cycles/functions.
 -- (a loop's source span and its run-time tiering state: never part of the program)
 local SER_SKIP = { _srcs = true, _s0 = true, _s1 = true, _h1 = true, _frag = true, _hits = true, _fid = true,
-	lgspan = true }
-local function ser(v)
+	lgspan = true, _depth = true }
+local ser
+-- A table nested deeper than SER_NEST (a long arith chain's left-deep tree, a word of many
+-- parts): one table constructor per level would pass LuaJIT's 200 syntax levels, so it
+-- serializes flat — its tables in a list, each nested one a `{__r=N}` reference to its
+-- entry — rebuilt when the module loads (rt.unflat).
+local SER_NEST = 40
+local function tbl_nest(v, d)
+	if d > SER_NEST then
+		return d
+	end
+	local m = d
+	for k, val in pairs(v) do
+		if type(val) == "table" and not SER_SKIP[k] then
+			local x = tbl_nest(val, d + 1)
+			if x > m then
+				m = x
+			end
+		end
+	end
+	return m
+end
+local function ser_flat(v)
+	local ids, list = {}, {}
+	local function reg(t)
+		if ids[t] then
+			return
+		end
+		list[#list + 1] = t
+		ids[t] = #list
+		for k, val in spairs(t) do
+			if type(val) == "table" and not SER_SKIP[k] then
+				reg(val)
+			end
+		end
+	end
+	reg(v)
+	local out = {}
+	for i, t in ipairs(list) do
+		local parts = {}
+		local function one(val)
+			return type(val) == "table" and ("{__r=%d}"):format(ids[val]) or ser(val)
+		end
+		local n = #t
+		for j = 1, n do
+			parts[#parts + 1] = one(t[j])
+		end
+		for k, val in spairs(t) do
+			if (type(k) ~= "number" or k < 1 or k > n or k ~= math.floor(k)) and not SER_SKIP[k] then
+				parts[#parts + 1] = ("[%s]=%s"):format(ser(k), one(val))
+			end
+		end
+		out[i] = "{" .. table.concat(parts, ",") .. "}"
+	end
+	return "rt.unflat({" .. table.concat(out, ",\n") .. "})"
+end
+function ser(v, nested)
 	local t = type(v)
 	if t == "string" then
 		return ("%q"):format(v)
@@ -480,13 +535,16 @@ local function ser(v)
 	if t ~= "table" then
 		return "nil"
 	end
+	if not nested and tbl_nest(v, 1) > SER_NEST then
+		return ser_flat(v)
+	end
 	local parts, n = {}, #v
 	for i = 1, n do
-		parts[#parts + 1] = ser(v[i])
+		parts[#parts + 1] = ser(v[i], true)
 	end
 	for k, val in spairs(v) do
 		if (type(k) ~= "number" or k < 1 or k > n or k ~= math.floor(k)) and not SER_SKIP[k] then
-			parts[#parts + 1] = ("[%s]=%s"):format(ser(k), ser(val))
+			parts[#parts + 1] = ("[%s]=%s"):format(ser(k, true), ser(val, true))
 		end
 	end
 	return "{" .. table.concat(parts, ",") .. "}"
@@ -609,11 +667,28 @@ local function arith_elem_ok(e)
 	end
 	return true
 end
+-- An arith tree too deep for emit_value's nested Lua expression (each level a parenthesized
+-- operation or a call: past LuaJIT's 200 syntax levels the chunk fails to load) is not
+-- rendered natively; its word / statement takes the shared evaluator, as a non-renderable
+-- node's does. (Depth memoized on the node: the predicates below recurse through it.)
+local ARITH_MAXDEPTH = 48
+local function arith_depth(e)
+	if type(e) ~= "table" then
+		return 0
+	end
+	local d = e._depth
+	if d == nil then
+		d = 1 + math.max(arith_depth(e.e), arith_depth(e.l), arith_depth(e.r), arith_depth(e.c),
+			arith_depth(e.a), arith_depth(e.b))
+		e._depth = d
+	end
+	return d
+end
 local function arith_side_effect(e)
 	if type(e) ~= "table" then
 		return false
 	end
-	if e.k == "asgn" or e.k == "post" or e.k == "pre" then
+	if e.k == "asgn" or e.k == "post" or e.k == "pre" or arith_depth(e) > ARITH_MAXDEPTH then
 		return true
 	end
 	-- xpandleaf (${…}), comma, and a NON-compilable array subscript aren't compiled natively —
@@ -654,7 +729,9 @@ local function not_compilable(e)
 	-- renders it (prints bash's "syntax error in expression" + aborts the line), so the
 	-- enclosing loop/statement must delegate — else emit_value throws an uncaught error.
 	-- rpow: a short-circuited operand holding `**` still checks its exponent (interp's noeval_pow)
-	if e.k == "xpandleaf" or e.k == "arith_perr" or e.rpow or (e.idxraw and not arith_elem_ok(e)) then
+	if e.k == "xpandleaf" or e.k == "arith_perr" or e.rpow or (e.idxraw and not arith_elem_ok(e))
+		or arith_depth(e) > ARITH_MAXDEPTH
+	then
 		return true
 	end -- comma recurses (emit_value / emit_arith_into render the sequence)
 	if e.k == "xpand" then
@@ -697,7 +774,7 @@ end
 -- word path (emitable_word via not_compilable), used to vet the OPERANDS of a side-effecting
 -- word arith so nothing nested reaches emit_value's unsupported asgn/post/pre/comma cases.
 local function arith_val_r(e)
-	if type(e) ~= "table" then
+	if type(e) ~= "table" or arith_depth(e) > ARITH_MAXDEPTH then
 		return false
 	end
 	local k = e.k
@@ -1889,6 +1966,23 @@ local function emit_part(p, i, lifted, w, tilde)
 	end
 end
 
+-- Lua expressions joined with `..`, as ONE expression whose syntax nesting stays shallow
+-- however many there are: a `a .. b .. c …` chain is right-associative, so LuaJIT's parser
+-- recurses once per operator (LJ_MAX_XLEVEL 200: "chunk has too many syntax levels" — a
+-- word of a few hundred parts). Runs of at most CAT_RUN, parenthesized, are joined the
+-- same way in turn: the depth grows with log(n).
+local CAT_RUN = 32
+local function cat_exprs(list)
+	if #list <= CAT_RUN then
+		return table.concat(list, " .. ")
+	end
+	local runs = {}
+	for i = 1, #list, CAT_RUN do
+		runs[#runs + 1] = "(" .. table.concat(list, " .. ", i, math.min(i + CAT_RUN - 1, #list)) .. ")"
+	end
+	return cat_exprs(runs)
+end
+EF.cat_exprs = cat_exprs
 emit_word = function(w, lifted)
 	local parts = {}
 	for i, p in ipairs(w.parts) do
@@ -1897,7 +1991,7 @@ emit_word = function(w, lifted)
 	if #parts == 0 then
 		return '""'
 	end
-	return "(" .. table.concat(parts, " .. ") .. ")"
+	return "(" .. cat_exprs(parts) .. ")"
 end
 
 -- An array element's value in ASSIGNMENT context (`a=([k]=$v)`, an assoc's bare word):
@@ -1956,7 +2050,7 @@ function EF.tilde_value(w, lifted, word)
 			out[i] = "(" .. emit_word({ parts = { pp } }, lifted) .. ")"
 		end
 	end
-	return table.concat(out, " .. ")
+	return EF.cat_exprs(out)
 end
 -- set -x of an arithmetic text ((( )), a for (( )) slot): `+ (( text ))`, the text
 -- expanded like a "…" string first when it holds a $ or ` (bash)
@@ -3169,7 +3263,7 @@ local function emit_pattern_glob_word(w, lifted, xall)
 	if #out == 0 then
 		return '""'
 	end
-	return table.concat(out, " .. ")
+	return EF.cat_exprs(out)
 end
 emit_pattern_glob = function(pat, lifted)
 	local ok, w = pcall(require("parser").parse_word, pat)
@@ -3234,7 +3328,7 @@ EF.emit_regex_glob = function(w, lifted)
 	if #out == 0 then
 		return '""'
 	end
-	return table.concat(out, " .. ")
+	return EF.cat_exprs(out)
 end
 -- An `a=(…)` array literal is always compiled (H.arrayassign): each BARE element's word
 -- field-split natively (word_safe/field_word/seg_native) or by the shared one-word expander,
@@ -3484,7 +3578,7 @@ end
 -- Arith usable in a VALUE position (what emit_value renders): pure, no side effect,
 -- no array subscript / embedded $-expansion / dynamic-special var.
 local function arith_value_ok(e)
-	if type(e) ~= "table" then
+	if type(e) ~= "table" or arith_depth(e) > ARITH_MAXDEPTH then -- (too deep to render)
 		return false
 	end
 	local k = e.k
@@ -3519,7 +3613,7 @@ end
 -- side effect nested in an operand, an array subscript, or a dynamic special var
 -- ($LINENO/$_/…) is not ok (the emitter renders none of those).
 local function arith_stmt_ok(e)
-	if type(e) ~= "table" then
+	if type(e) ~= "table" or arith_depth(e) > ARITH_MAXDEPTH then -- (too deep to render)
 		return false
 	end
 	local k = e.k
@@ -7743,6 +7837,12 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
 			if d ~= "" then
 				prelude = d .. (prelude or "")
 			end
+		end
+		if prelude then -- (joined with `; ` below: its own trailing `;` would make an empty
+			prelude = prelude:gsub("[;%s]+$", "") -- statement, a syntax error in Lua 5.1 —
+			prelude = prelude ~= "" and prelude or nil -- a DEBUG hook's dbg() ends with one)
+		end
+		if st.t == "simple" then
 			if EF.pipestatus and (callee == "rt.eval_u" or callee == "rt.source_u") then -- (a simple
 				-- command: PIPESTATUS=($?) after it — an eval'd pipeline's statuses don't survive
 				-- the eval, bash)
