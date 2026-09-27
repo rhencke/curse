@@ -1036,6 +1036,9 @@ end
 -- $((…)) and (( )); and, for (( )) / for (( )), bash's this_command_name `((` in the texts)
 EF.AREAD = { arith_varread = "rt.arith_read(sh, %q)" }
 EF.ACMD = { acmd = "((" }
+-- (a (( )) command whose reads flag a fault in sh.arithfault instead of raising: bash's
+-- evaluation stops at the fault, so no store may follow it — each write is guarded)
+EF.AGUARD = { agd = true }
 
 -- The whole word as one literal string when every part is literal — sees through a
 -- \-escaped name (`\return` parses as parts "r".."eturn"). nil if any part expands.
@@ -3568,6 +3571,13 @@ emit_arith_into = function(dst, e, lifted)
 			local cur = lifted[e.name] and lname(e.name) or (EF.arith_varread):format(e.name) -- compound reads first
 			rhs = emit_value({ k = "bin", op = e.op:sub(1, #e.op - 1), l = { k = "raw", code = cur }, r = e.e, etxt = e.etxt, etok = e.etok }, lifted)
 		end
+		if EF.agd then -- (the value first; stored only when no read in it faulted)
+			if lifted[e.name] then
+				return ("do local __t = %s; if not sh.arithfault then %s = __t end end; %s = %s"):format(
+					rhs, lname(e.name), dst, lname(e.name))
+			end
+			return ("do local __t = %s; if not sh.arithfault then %s = sh:aset(%q, __t) end end"):format(rhs, dst, e.name)
+		end
 		if lifted[e.name] then
 			return ("%s = %s; %s = %s"):format(lname(e.name), rhs, dst, lname(e.name))
 		end
@@ -3575,13 +3585,29 @@ emit_arith_into = function(dst, e, lifted)
 	end
 	if k == "pre" then -- ++x / --x: update, then result is the new value
 		if lifted[e.name] then
+			if EF.agd then
+				return ("if not sh.arithfault then %s = %s + %dLL end; %s = %s"):format(
+					lname(e.name), lname(e.name), e.d, dst, lname(e.name))
+			end
 			return ("%s = %s + %dLL; %s = %s"):format(lname(e.name), lname(e.name), e.d, dst, lname(e.name))
+		end
+		if EF.agd then
+			return ("do local __t = %s + %dLL; if not sh.arithfault then %s = sh:aset(%q, __t) end end"):format(
+				(EF.arith_varread):format(e.name), e.d, dst, e.name)
 		end
 		return ("%s = sh:aset(%q, %s + %dLL)"):format(dst, e.name, (EF.arith_varread):format(e.name), e.d)
 	end
 	if k == "post" then -- x++ / x--: result is the OLD value, then update
 		if lifted[e.name] then
+			if EF.agd then
+				return ("%s = %s; if not sh.arithfault then %s = %s + %dLL end"):format(
+					dst, lname(e.name), lname(e.name), lname(e.name), e.d)
+			end
 			return ("%s = %s; %s = %s + %dLL"):format(dst, lname(e.name), lname(e.name), lname(e.name), e.d)
+		end
+		if EF.agd then
+			return ("%s = %s; if not sh.arithfault then sh:aset(%q, %s + %dLL) end"):format(
+				dst, (EF.arith_varread):format(e.name), e.name, dst, e.d)
 		end
 		return ("%s = %s; sh:aset(%q, %s + %dLL)"):format(dst, (EF.arith_varread):format(e.name), e.name, dst, e.d)
 	end
@@ -6430,6 +6456,9 @@ EF.arith_status = function(expr, lifted)
 	if arith_can_div_fault(expr) or (EF.has_attr and arith_side_effect(expr)) then
 		-- ÷0 / mod-0 / negative ** THROW a non-fatal matherr — catch it (and any
 		-- flagged read fault) as $?=1 and continue, like interp; re-raise anything else.
+		if arith_side_effect(expr) then -- (a read fault only flags: stores after it are guarded)
+			code = EF.with(EF.AGUARD, EF.with, EF.AREAD, emit_arith_into, "__ar", expr, lifted)
+		end
 		return (
 			"do local __ia = sh.in_arithcmd; sh.arithfault = false; sh.in_arithcmd = true; local __ok, __v = pcall(function() local __ar = 0LL; %s; return (__ar ~= 0LL) and 0 or 1 end); sh.in_arithcmd = __ia; "
 			.. "if not __ok then if type(__v) == 'table' and __v.__curse_matherr and not __v.__curse_subscript then sh.status = 1; sh.arithfault = true else error(__v) end "
@@ -6438,7 +6467,10 @@ EF.arith_status = function(expr, lifted)
 	elseif arith_can_error(expr, lifted) then
 		-- a non-lifted read may fault; INSIDE the (( )) command arith_read records it in
 		-- sh.arithfault WITHOUT throwing (sh.in_arithcmd gates that), so no per-iteration
-		-- pcall/closure — the accumulator stays JIT-native.
+		-- pcall/closure — the accumulator stays JIT-native. (Its writes are guarded: EF.AGUARD.)
+		if arith_side_effect(expr) then
+			code = EF.with(EF.AGUARD, EF.with, EF.AREAD, emit_arith_into, "__ar", expr, lifted)
+		end
 		return ("do local __ia = sh.in_arithcmd; sh.arithfault = false; sh.in_arithcmd = true; local __ar = 0LL; %s; sh.in_arithcmd = __ia; sh.status = sh.arithfault and 1 or ((__ar ~= 0LL) and 0 or 1) end"):format(
 			code
 		)

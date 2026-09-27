@@ -13702,7 +13702,43 @@ function M.arith_badkey(sh, name, key, how)
 	return wbad
 end
 
+-- pcall(fn, …) as a compiled `(( ))`'s read: its arithmetic errors say `((: ` (P.arith_cmd,
+-- as interp's own (( )) sets it) — the scalar read's rule (M.arith_read), for elements too
+function M.acmd_pcall(sh, fn, ...)
+	local P = require("parser")
+	if not sh.in_arithcmd or P.arith_cmd ~= nil then
+		return pcall(fn, ...)
+	end
+	P.arith_cmd = "(("
+	local ok, v = pcall(fn, ...)
+	P.arith_cmd = nil
+	return ok, v
+end
+-- An element's VALUE read by an arithmetic write (a[i]++, a[i] += e): arith_str — inside a
+-- compiled (( )) a bad value is that command's failure ($? 1, the message said; a prior
+-- fault in it: 0, nothing said), not an escape (M.arith_read's rule)
+function M.arith_elem_val(sh, s)
+	if not sh.in_arithcmd then
+		return M.arith_str(sh, s)
+	end
+	if sh.arithfault then
+		return i64(0)
+	end
+	local ok, v = M.acmd_pcall(sh, M.arith_str, sh, s)
+	if ok then
+		return v
+	end
+	require("parser").trap_flow(v)
+	if type(v) == "table" and (v.__curse_experr or v.__curse_matherr) and not v.__curse_subscript then
+		sh.arithfault = true
+		return i64(0)
+	end
+	error(v, 0)
+end
 function M.arith_read_elem(sh, name, raw, expanded)
+	if sh.arithfault and sh.in_arithcmd then -- (a prior read in THIS (( )) faulted: bash's
+		return i64(0) -- evaluation stopped there — nothing more is read or said)
+	end
 	local I = require("interp")._int
 	I.arith_nounset(sh, name) -- fatal if the base var is unset under set -u (outside the pcall)
 	if M.arith_badraw(sh, name, raw, "r") then
@@ -13712,9 +13748,13 @@ function M.arith_read_elem(sh, name, raw, expanded)
 	if M.arith_badkey(sh, name, key, "r") then
 		return i64(0)
 	end
-	local ok, v = pcall(I.arith_resolve, sh, sh:array_get(name, key))
+	local ok, v = M.acmd_pcall(sh, I.arith_resolve, sh, sh:array_get(name, key))
 	if ok then
 		return v
+	end
+	if sh.in_arithcmd and type(v) == "table" and (v.__curse_experr or v.__curse_matherr) and not v.__curse_subscript then
+		sh.arithfault = true -- (inside a compiled (( )): the command fails, $? 1 — as arith_read)
+		return i64(0)
 	end
 	if type(v) == "table" and (v.__curse_experr or v.__curse_matherr) and not v.__curse_lineabort then
 		error({ __curse_exit = v.__curse_exit or 1, __curse_lineabort = true, __curse_noee = v.__curse_matherr })
@@ -13739,8 +13779,11 @@ function M.arith_elem_write(sh, name, raw, expanded, read_first, compute)
 	if M.arith_badkey(sh, name, key, how) then -- (a bad element: 0 is read, nothing stored)
 		return compute(read_first and i64(0) or nil)
 	end
-	local old = read_first and M.arith_str(sh, sh:array_get(name, key) or "") or nil
+	local old = read_first and M.arith_elem_val(sh, sh:array_get(name, key) or "") or nil
 	local v = compute(old)
+	if sh.arithfault and sh.in_arithcmd then -- (a read faulted: bash stored nothing)
+		return i64(0)
+	end
 	sh:array_set(name, key, M.i64_to_str(v))
 	return v
 end
@@ -13753,7 +13796,10 @@ function M.arith_elem_incr(sh, name, raw, expanded, delta, is_post)
 	if not key or M.arith_badkey(sh, name, key, "rw") then -- (a bad element: 0 is read, nothing stored)
 		return is_post and i64(0) or i64(delta)
 	end
-	local old = M.arith_str(sh, sh:array_get(name, key) or "")
+	local old = M.arith_elem_val(sh, sh:array_get(name, key) or "")
+	if sh.arithfault and sh.in_arithcmd then -- (the value faulted: bash stored nothing)
+		return i64(0)
+	end
 	sh:array_set(name, key, M.i64_to_str(old + delta))
 	if is_post then
 		return old
