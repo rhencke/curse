@@ -50,6 +50,7 @@ extern char fstat[];
 extern char get_nprocs[];
 extern char getcwd[];
 extern char getegid[];
+extern char getenv[];
 extern char geteuid[];
 extern char getgid[];
 extern char getgroups[];
@@ -100,6 +101,7 @@ extern char posix_spawnattr_setsigmask[];
 extern char posix_spawnp[];
 extern char ppoll[];
 extern char prctl[];
+extern char putenv[];
 extern char read[];
 extern char readdir[];
 extern char recvmsg[];
@@ -192,6 +194,7 @@ static const curse_sym_t curse_syms[] = {
   { "get_nprocs", (void*)get_nprocs },
   { "getcwd", (void*)getcwd },
   { "getegid", (void*)getegid },
+  { "getenv", (void*)getenv },
   { "geteuid", (void*)geteuid },
   { "getgid", (void*)getgid },
   { "getgroups", (void*)getgroups },
@@ -242,6 +245,7 @@ static const curse_sym_t curse_syms[] = {
   { "posix_spawnp", (void*)posix_spawnp },
   { "ppoll", (void*)ppoll },
   { "prctl", (void*)prctl },
+  { "putenv", (void*)putenv },
   { "read", (void*)read },
   { "readdir", (void*)readdir },
   { "recvmsg", (void*)recvmsg },

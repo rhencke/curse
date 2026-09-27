@@ -326,6 +326,28 @@ local function serve_request(cfd, req, fds, ctx)
 		pcall(rt.sched_drain, sh)
 		drained = true
 	end
+	-- (the script's still-running real-pid jobs — `sleep 9 &` spawned directly — stay this
+	-- worker's children after it: bash's would go to init. Reaped as they end, by this and
+	-- every later request's reap points; never zombies left for another script's `ps` to see)
+	for _, j in ipairs(sh.jobs or {}) do
+		if not j.done and not j.g and j.pid and j.pid > 0 then
+			rt.internal_pids[j.pid] = true
+		end
+	end
+	-- (…and ANY child still here: a foreground external the script was waiting for when a
+	-- signal ended it — bash would have died and left it to init — `kill -TERM` of a
+	-- nested `curse -c 'trap … TERM; sleep 1'`. A worker has no children of its own.)
+	do
+		local wp = tonumber(C.getpid())
+		local f = io.open("/proc/" .. wp .. "/task/" .. wp .. "/children", "r")
+		if f then
+			for pid in (f:read("*a") or ""):gmatch("%d+") do
+				rt.internal_pids[tonumber(pid)] = true
+			end
+			f:close()
+		end
+	end
+	pcall(rt.reap_orphans) -- (children no job waits for any more: never zombies on the worker)
 	-- SCRUB per-request process state (the fork boundary used to do this):
 	C.umask(ctx.umask) -- a script's `umask` doesn't persist
 	C.sigprocmask(2, ctx.empty_sigset, nil) -- SIG_SETMASK: clear any trap-blocked signals
