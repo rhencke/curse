@@ -14021,6 +14021,21 @@ end
 
 -- Apply a ${…} operator. `arg`/`arg2` are already word-expanded by the caller;
 -- `idxnum` is the evaluated numeric subscript when pe.index is an expression.
+-- bash's parameter_brace_expand looks at the value before it expands a strip / subst / case
+-- operator's pattern word (and the replacement): #/##/%/%% leave a NULL or empty value
+-- alone, the others (/ // ^ ^^ , ,, ~ ~~) only a NULL (unset) one — the pattern's
+-- expansions (a `$(…)`, `${v=…}`, an error) then never happen. v: the value (an array's
+-- elements joined); isset: whether it is set at all.
+function M.pe_nopat(op, v, isset)
+	if v ~= "" then
+		return false
+	end
+	return op:byte(1) == 35 or op:byte(1) == 37 or not isset -- (# %)
+end
+-- …an array's / $@'s elements: NULL with none, empty with one "" (joined by spaces)
+function M.pe_nopat_elems(op, e)
+	return #e == 0 or (#e == 1 and e[1] == "" and M.pe_nopat(op, "", true))
+end
 function Shell:expand_param(pe, arg, arg2, idxnum)
 	local name, op, index = pe.name, pe.op, pe.index
 	-- ${!a[@]} / ${!a[*]}: the list of set indices
@@ -14184,6 +14199,15 @@ function Shell:expand_param(pe, arg, arg2, idxnum)
 			error({ __curse_exit = self.opt_c and 127 or 1, __curse_lineabort = self.opt_i or nil })
 		end
 		return val
+	end
+	if type(arg) == "function" then -- (a strip/subst/case pattern, lazy: M.pe_nopat)
+		if M.pe_nopat(op, val, isset) then
+			return val
+		end
+		arg = arg()
+		if type(arg2) == "function" then
+			arg2 = arg2()
+		end
 	end
 	arg = arg or ""
 	if op == "@" then -- ${x@OP} transforms

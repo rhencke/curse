@@ -1644,10 +1644,22 @@ local function expand_pexp(sh, p, assign)
 			end
 			return expand_word(sh, pw(pe.arg), true)
 		end or nil
+	elseif patmode then -- (the pattern and replacement expand only if the value takes them:
+		-- expand_param asks rt.pe_nopat first)
+		arg = function()
+			return pe.arg and expand_pattern(sh, P.parse_word(pe.arg), true) or nil
+		end
 	elseif pe.op ~= "sub" then -- (a substring's offset is expanded below — not when the var is unset)
-		arg = pe.arg and (patmode and expand_pattern or expand_word)(sh, P.parse_word(pe.arg), true) or nil
+		arg = pe.arg and expand_word(sh, P.parse_word(pe.arg), true) or nil
 	end
-	local arg2 = pe.arg2 and pe.op ~= "sub" and expand_repl(sh, P.parse_word(pe.arg2)) or nil
+	local arg2
+	if patmode and pe.arg2 then
+		arg2 = function()
+			return expand_repl(sh, P.parse_word(pe.arg2))
+		end
+	else
+		arg2 = pe.arg2 and pe.op ~= "sub" and expand_repl(sh, P.parse_word(pe.arg2)) or nil
+	end
 	if pe.op == "sub" and not pe.index and rt.sub_unset(sh, pe.name) then
 		return ""
 	elseif pe.op == "sub" then -- ${v:off:len}: offset/length are arithmetic expressions,
@@ -2455,13 +2467,16 @@ multi_elems = function(sh, p) -- returns element list, star?
 			-- strip/subst/case per element: the PATTERN is quote-aware (a quoted `'*'` is a literal
 			-- `*`, not a glob) — expand_pattern, like the scalar path (getpattern in bash). Only the
 			-- replacement (arg2) expands via expand_repl (tilde + patsub_replacement marking).
-			local arg = pe.arg and expand_pattern(sh, P.parse_word(pe.arg)) or ""
-			local arg2 = pe.arg2 and expand_repl(sh, P.parse_word(pe.arg2)) or nil
-			local out = {}
-			for i, v in ipairs(els) do
-				out[i] = sh:apply_str_op(pe.op, v, arg, arg2)
+			-- (neither expands when the value takes no pattern: rt.pe_nopat_elems)
+			if not rt.pe_nopat_elems(pe.op, els) then
+				local arg = pe.arg and expand_pattern(sh, P.parse_word(pe.arg)) or ""
+				local arg2 = pe.arg2 and expand_repl(sh, P.parse_word(pe.arg2)) or nil
+				local out = {}
+				for i, v in ipairs(els) do
+					out[i] = sh:apply_str_op(pe.op, v, arg, arg2)
+				end
+				els = out
 			end
-			els = out
 		end
 		return els, star
 	end

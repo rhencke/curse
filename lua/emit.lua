@@ -2117,6 +2117,11 @@ local function und(st, lifted)
 			if ix and (ix:find("[$`]") or ix:find("++", 1, true) or ix:find("--", 1, true) or ix:find("=", 1, true)) then
 				return ""
 			end
+			-- (or an operator's word with one: `"${x:-$(cmd)}"`, `"${A#$(cmd)}"`)
+			local aw = p.pexp and ((p.pexp.arg or "") .. " " .. (p.pexp.arg2 or ""))
+			if aw and (aw:find("$(", 1, true) or aw:find("`", 1, true) or aw:find("$[", 1, true)) then
+				return ""
+			end
 		end
 	end
 	local v = last and emit_word(last, lifted) or '""'
@@ -2728,6 +2733,12 @@ function pexp_scalar(pe, lifted)
 		if pe.op == nil then
 			return val
 		end
+		if PEXP_STROP[pe.op] and not pat_verbatim_ok(pe.arg) then
+			-- (an expanding pattern: only when the element takes one — rt.pe_nopat; its
+			-- set-ness with its value, the subscript evaluated once)
+			return ("(function() local __v, __s = rt.array_elem_set(sh, %s, %q, %s); if rt.pe_nopat(%q, __v, __s) then return __v end; return sh:apply_str_op(%q, __v, %s, %q) end)()")
+				:format(ename, pe.index, expanded, pe.op, pe.op, emit_pattern_glob(pe.arg or "", lifted), pe.arg2 or "")
+		end
 		if PEXP_DEFAULT[pe.op] then
 			-- ${a[i]:-d} / := / ? …: defer to Shell:expand_param with the resolved key and a LAZY
 			-- default-word thunk (a side-effecting default runs only when its branch is taken, and
@@ -2851,12 +2862,18 @@ function pexp_scalar(pe, lifted)
 	-- globs it); a dynamic/quoted pattern is rendered mask-aware via emit_pattern_glob to the
 	-- expanded glob string. Replacement (arg2) is literal (pexp_compilable gated it).
 	if not pat_verbatim_ok(pe.arg) then
-		return ("sh:apply_str_op(%q, %s, %s, %q)"):format(
-			pe.op,
-			val,
-			emit_pattern_glob(pe.arg or "", lifted),
-			pe.arg2 or ""
-		)
+		if lifted[pe.name] then -- (a native integer's value: never null, always takes it)
+			return ("sh:apply_str_op(%q, %s, %s, %q)"):format(
+				pe.op,
+				val,
+				emit_pattern_glob(pe.arg or "", lifted),
+				pe.arg2 or ""
+			)
+		end
+		-- an expanding pattern: only when the value takes one (rt.pe_nopat — bash looks at the
+		-- value first: `${A#$(cmd)}` runs no cmd with A null)
+		return ('(function() local __v = %s; if __v == "" and rt.pe_nopat(%q, __v, rt.var_has_value(sh, %q)) then return __v end; return sh:apply_str_op(%q, __v, %s, %q) end)()')
+			:format(val, pe.op, pe.name, pe.op, emit_pattern_glob(pe.arg or "", lifted), pe.arg2 or "")
 	end
 	return ("sh:apply_str_op(%q, %s, %q, %q)"):format(pe.op, val, pe.arg or "", pe.arg2 or "")
 end
@@ -3030,10 +3047,14 @@ local function emit_seg(p, i, lifted, w)
 			-- a STROP pattern with a quoted/backslash metachar renders mask-aware (emit_pattern_glob),
 			-- exactly like the scalar strop; a verbatim-safe pattern (and every @-transform letter)
 			-- passes through literally.
-			local pg = (PEXP_STROP[pe.op] and not pat_verbatim_ok(pe.arg))
-					and emit_pattern_glob(pe.arg or "", lifted)
-				or ("%q"):format(pe.arg or "")
-			elems = ("rt.array_op_values(sh, %s, %q, %s, %q)"):format(elems, pe.op, pg, pe.arg2 or "")
+			local dyn = PEXP_STROP[pe.op] and not pat_verbatim_ok(pe.arg)
+			local pg = dyn and emit_pattern_glob(pe.arg or "", lifted) or ("%q"):format(pe.arg or "")
+			if dyn then -- (an expanding pattern: only when the value takes one — rt.pe_nopat_elems)
+				elems = ("(function() local __e = %s; if rt.pe_nopat_elems(%q, __e) then return __e end; return rt.array_op_values(sh, __e, %q, %s, %q) end)()")
+					:format(elems, pe.op, pe.op, pg, pe.arg2 or "")
+			else
+				elems = ("rt.array_op_values(sh, %s, %q, %s, %q)"):format(elems, pe.op, pg, pe.arg2 or "")
+			end
 		end
 		local h = tostring(pe.index == "@" or (pe.op ~= "indices" and (pe.name == "@" or (pe.index == "*" and not p.q))))
 		if hdyn then
