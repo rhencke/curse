@@ -86,6 +86,7 @@ failing test, with unified diffs.
 | test | guards |
 |---|---|
 | `sig-trap-contexts` | INT, TERM, HUP, USR1 and USR2 traps fired while the shell is in `read`, `wait`, a redirection being applied (a blocking FIFO open), `$(…)`, a pipeline stage, a subshell, `eval`, a sourced file, a function and a hot compiled loop. External signals are sent only once the shell sleeps in a syscall (`sthelp sendwhen`), so bash's output is fixed. Guards the preemptive signal delivery (VM hook + EINTR) and the in-process subshells. |
+| `sig-open-eintr` | A trapped signal interrupting the FIFO open of `$(< f)` or `source f` fails it ("Interrupted system call", status 1) with the trap running after the diagnostic, while a redirection's open is retried after the trap — plain, in `eval`, a function and a sourced file. Guards the async FIFO open's no-retry wait (lib_cursesig.c curse_aopen, rt.open_read). |
 | `sig-pseudo-traps` | EXIT, ERR, DEBUG and RETURN traps in the same contexts (compiled-tier DEBUG/RETURN, in-process subshell trap save and restore). |
 | `sig-self-kill` | `kill -SIG $$` from inside pipeline stages, subshells, `$(…)` and background jobs: bash runs the parent's trap exactly once, in the parent's context. Also an external signalling a subshell by `$BASHPID`, and no zombie after a trap interrupts the wait for a `$(…)` child. |
 | `sig-reentrancy` | Traps that signal themselves or each other (bash runs the new trap nested, at the next command inside the handler), and a trap reset, ignored or replaced while its signal is pending. |
