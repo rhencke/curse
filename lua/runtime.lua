@@ -2982,8 +2982,9 @@ function Shell:exec_t(args)
 			end
 			-- (an unset/empty PATH searches only the cwd: bash then tries the bare name
 			-- as a file, which is "No such file or directory")
-			self:errmsg("curse: " .. (self.exec_builtin and "exec: " or "") .. M.err_name(args[1])
-				.. (self.exec_builtin and ": not found\n" or self:get("PATH") == "" and ": No such file or directory\n"
+			local nofile = not self.exec_builtin and self:get("PATH") == "" -- (named as it is)
+			self:errmsg("curse: " .. (self.exec_builtin and "exec: " or "") .. (nofile and args[1] or M.err_name(args[1]))
+				.. (self.exec_builtin and ": not found\n" or nofile and ": No such file or directory\n"
 					or ": command not found\n"))
 			self.status = 127
 			return
@@ -8278,19 +8279,26 @@ end
 function M.spawn_errmsg(self, name, execpath, rc)
 	local pre = "curse: " .. (self.exec_builtin and "exec: " or "")
 	if rc == 2 and not self.exec_builtin and execpath then
-		local shown = tostring(name):find("/", 1, true) and M.err_name(tostring(name)) or execpath
+		-- (shell_execve's file_error / internal_error name the file as it is — only a
+		-- command NOT FOUND is quoted: printable_filename)
+		local shown = tostring(name):find("/", 1, true) and tostring(name) or execpath
 		if ffi.C.access(execpath, 0) == 0 then
 			return pre .. shown .. ": cannot execute: required file not found\n"
 		end
 		return pre .. shown .. ": No such file or directory\n"
 	end
+	if rc == 2 and self.exec_builtin and execpath and ffi.C.access(execpath, 0) == 0 then
+		-- (`exec FILE` whose interpreter is missing: shell_execve's own message, the path
+		-- exec found, no `exec: ` — exec_builtin reports nothing more for ENOENT)
+		return "curse: " .. execpath .. ": cannot execute: required file not found\n"
+	end
 	if rc == 13 and execpath and not self.exec_builtin and ffi.C.curse_rt_stat(execpath, stbuf_a) == 0
 		and bit.band(ffi.cast("uint32_t *", stbuf_a + 24)[0], 0xF000) == 0x4000 then
 		-- (shell_execve: EISDIR — its own _("%s: %s"), unlike file_error's)
-		return pre .. M.L("%s: %s", M.err_name(tostring(name)), M.Llibc("Is a directory")) .. "\n"
+		return pre .. M.L("%s: %s", tostring(name), M.Llibc("Is a directory")) .. "\n"
 	end
 	if rc ~= 2 and execpath and not self.exec_builtin then -- (shell_execve's file_error(command))
-		return pre .. M.err_name(execpath) .. ": Permission denied\n"
+		return pre .. execpath .. ": Permission denied\n"
 	end
 	return pre .. M.err_name(tostring(name)) .. (rc == 2 and (self.exec_builtin and ": not found\n" or ": command not found\n") or ": Permission denied\n")
 end
