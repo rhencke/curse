@@ -75,6 +75,34 @@ check(s1 ~= nil and s2 ~= nil, "no cache stamp")
 check(s1 ~= s2, "dev cache stamp ignores deparse.lua")
 check(stamp_of(d1) == s1, "dev cache stamp not stable")
 
+-- 4. main-chunk local headroom: LuaJIT caps a function at 200 locals, and a module's
+-- top level at the cap can't take one more `local` (every fix that adds one fails to
+-- load). Each core module must still load with HEADROOM extra top-level locals added
+-- before its final `return`.
+local HEADROOM = 10
+local mods = io.popen("ls lua/*.lua")
+for path in mods:lines() do
+	if not path:find("^lua/test_") then
+		local src = slurp(path)
+		-- (before the last top-level `return`, which may span lines: `return function …`)
+		local at = 0
+		for i in src:gmatch("()\nreturn[%s({]") do
+			at = i
+		end
+		local head, tail = src, ""
+		if at > 0 then
+			head, tail = src:sub(1, at), src:sub(at + 1)
+		end
+		local pad = {}
+		for i = 1, HEADROOM do
+			pad[i] = ("local __headroom%d = %d\n"):format(i, i)
+		end
+		local f, err = loadstring(head .. table.concat(pad) .. tail, "=" .. path)
+		check(f ~= nil, ("%s: fewer than %d main-chunk locals of headroom (%s)"):format(path, HEADROOM, tostring(err)))
+	end
+end
+mods:close()
+
 if fails > 0 then
 	os.exit(1)
 end

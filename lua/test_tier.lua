@@ -55,6 +55,30 @@ local tc = best({ switch_after = 1 }) -- switch immediately -> ~all compiled
 print(("  interpreter : %6.3fs  (%.0f ns/iter)"):format(ti, ti / N * 1e9))
 print(("  compiled    : %6.3fs  (%.0f ns/iter)  %.1fx vs interp"):format(tc, tc / N * 1e9, ti / tc))
 
+-- Line mode compiles each line under the running script: it must not write a Lua global
+-- (a leaked one is shared by every shell a daemon worker runs). The script text is unique
+-- per run, so its lines miss the disk cache and really compile.
+print("\n=== line mode writes no Lua globals ===")
+do
+	local sh = T.rt.Shell.new()
+	local buf = {}
+	sh.out = function(s)
+		buf[#buf + 1] = s
+	end
+	local tag = ("%d%s"):format(os.time(), tostring({}):match("0x%x+") or "")
+	local lsrc = "shopt -s expand_aliases\nalias say='echo'\nsay one " .. tag
+		.. "\nfor i in 1 2; do say $i; done\n"
+	setmetatable(_G, { __newindex = function(_, k)
+		error("global write: " .. tostring(k), 2)
+	end })
+	local ok, err = pcall(T.run_lm, sh, lsrc)
+	setmetatable(_G, nil)
+	local got = table.concat(buf)
+	local lok = ok and got == "one " .. tag .. "\n1\n2\n"
+	allok = allok and lok
+	print(("  %s  %s"):format(lok and "OK" or "*** FAIL ***", ok and got:gsub("\n", "|") or tostring(err)))
+end
+
 if not allok then
 	os.exit(1)
 end

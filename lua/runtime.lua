@@ -885,7 +885,6 @@ end
 -- and written to sh.out (so it composes with $(...) capture); $? is the exact
 -- exit status, or 128+signum when killed by a signal — like bash. (stderr is
 -- inherited for now; redirection via file_actions comes with the fd model.)
-local ffi = require("ffi")
 local bit = require("bit")
 ffi.cdef([[
   typedef int32_t curse_pid_t;
@@ -1766,6 +1765,7 @@ end
 -- every external spawn and every other read of an input fd in this shell. A mismatch
 -- (a concurrent reader raced us) leaves what was read in `pb`: ours, delivered first.
 M.rd_gen = 0
+do -- (the pipe read cache, peek pipe and FIONREAD scratch: scoped, not main-chunk locals)
 local PCACHE = { data = "", pos = 1, pb = "" }
 function M.pipe_cache(dev, ino)
 	local c = PCACHE
@@ -1831,6 +1831,7 @@ function M.fd_avail(fd)
 		return 0
 	end
 	return _avail[0]
+end
 end
 function M.fd_rewind(fd, n)
 	return C.curse_rt_lseek(fd, -n, 1) -- SEEK_CUR
@@ -2686,12 +2687,14 @@ end
 -- An async command without job control runs with SIGINT/SIGQUIT ignored (bash's
 -- setup_async_signals). A spawned one inherits it: the parent ignores both across the spawn, with them blocked
 -- so none is lost meanwhile (a pending one is delivered to the restored disposition).
+local async_spawn_hold, async_spawn_release
+do
 local _aq_set, _aq_old = ffi.new("uint8_t[1024]"), ffi.new("uint8_t[1024]")
 local _aq_sa2, _aq_sa3 = ffi.new("uint8_t[256]"), ffi.new("uint8_t[256]")
 C.sigemptyset(_aq_set)
 C.curse_co_sigaddset(_aq_set, 2)
 C.curse_co_sigaddset(_aq_set, 3)
-local function async_spawn_hold(attr)
+function async_spawn_hold(attr)
 	C.sigprocmask(0, _aq_set, _aq_old) -- SIG_BLOCK
 	C.curse_rt_sigaction(2, nil, _aq_sa2)
 	C.curse_rt_sigaction(3, nil, _aq_sa3)
@@ -2707,10 +2710,11 @@ local function async_spawn_hold(attr)
 	end
 	return attr
 end
-local function async_spawn_release()
+function async_spawn_release()
 	C.curse_rt_sigaction(2, _aq_sa2, nil)
 	C.curse_rt_sigaction(3, _aq_sa3, nil)
 	C.sigprocmask(2, _aq_old, nil) -- SIG_SETMASK
+end
 end
 -- posix_spawn `args[1..n]` (argv[0]: `exec -a`'s NAME, if any) at `path` as a child of the
 -- shell — the one spawn of an external (Shell:exec_t, straight to fd 1 or into a capture;
@@ -10000,14 +10004,17 @@ end
 -- first (bash prepends to the chain). Reproduced exactly so ${!m[@]} / ${m[@]}
 -- match bash. int64 keeps the 32-bit multiply
 -- exact (a plain Lua double would lose precision past 2^53).
+local assoc_bucket
+do
 local FNV32_OFFSET, FNV32_PRIME, U32 = i64(2166136261), i64(16777619), i64(4294967296)
-local function assoc_bucket(key, nb)
+function assoc_bucket(key, nb)
 	local h = FNV32_OFFSET
 	for j = 1, #key do
 		h = (h * FNV32_PRIME) % U32 -- FNV-1: multiply first…
 		h = bit.bxor(h, i64(key:byte(j))) -- …then xor the byte
 	end
 	return tonumber(h % i64(nb or 1024))
+end
 end
 M.assoc_bucket = assoc_bucket
 -- $SHLVL: a new shell raises it (bash's adjust_shell_level at startup: a non-number is 0,
@@ -10330,9 +10337,11 @@ end
 -- and re-parsing that constant each call was ~1/4 of curse's compute-path CPU
 -- (profiled). Cache keyed by the pattern string (pure fn), bounded by a flush so a
 -- long-lived daemon can't grow it without bound (distinct literal patterns are few).
+local simple_glob
+do
 local _glob_cache, _glob_n = {}, 0
 local GLOB_NOFAST = {} -- sentinel: this pattern is NOT a fast-path glob
-local function simple_glob(glob)
+function simple_glob(glob)
 	local c = _glob_cache[glob]
 	if c == nil then
 		local k, pre, post = simple_glob_uncached(glob)
@@ -10348,6 +10357,7 @@ local function simple_glob(glob)
 		return nil
 	end
 	return c[1], c[2], c[3]
+end
 end
 local function fast_strip(val, glob, prefix, longest)
 	local kind, pre, post = simple_glob(glob)
@@ -10587,8 +10597,10 @@ local REG_EXTENDED, REG_NOSUB, REG_ICASE = 1, 8, 2
 -- regcomp+regfree per test. regcomp bakes in LC_CTYPE/LC_COLLATE, so the cache is
 -- keyed by the locale (re_lockey, set by reset_locale/bytewise) and dropped when it
 -- changes. Entries are GC-owned (ffi.gc regfree); `false` caches a failed compile.
+local re_get
+do
 local re_cache, re_n = {}, 0
-local function re_get(ere, flags)
+function re_get(ere, flags)
 	local key = flags .. ":" .. ere
 	local rb = re_cache[key]
 	if rb == nil then
@@ -10608,6 +10620,7 @@ end
 M.re_get = re_get
 re_locale_changed = function()
 	re_cache, re_n = {}, 0
+end
 end
 
 -- Convert a shell glob to a POSIX ERE, anchored. Char classes carry over (with
