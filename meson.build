@@ -125,6 +125,15 @@ endforeach
 # The static self-contained `curse` as a shell (argv[0] sh/bash): its ffi.C resolves
 # through lib_cursesys.c's symbol table, not dlsym, and the corpora only exercise the
 # daemon — so check the table covers every ffi.C symbol and run external commands.
+# bash-UB cases (docs/bash-ub.md): curse's documented choice, pinned in every tier —
+# the oracle can't score these (bash itself varies there).
+test('ub-pins', files('test' / 'ub' / 'run.sh'),
+  args:    [luajit_bin, repo],
+  workdir: repo,
+  depends: [vm],
+  suite:   'unit',
+  timeout: 60)
+
 test('static-shell', files('test' / 'static-shell.sh'),
   args:    [luajit_bin, curse, repo],
   workdir: repo,

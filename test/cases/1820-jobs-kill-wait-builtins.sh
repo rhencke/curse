@@ -55,7 +55,7 @@ j kill -0 %2 %1 %3
 j jobs %1
 j jobs %-
 j jobs %?6
-j jobs %sleep
+# (`jobs %sleep`, ambiguous, is bash UB — jobs[-2] — see docs/bash-ub.md; pinned in test/ub)
 j jobs %1 %9
 j jobs -l -x echo
 # (one at a time: after `kill %1 %2`, whether job 2 has died by the time `wait %1`'s

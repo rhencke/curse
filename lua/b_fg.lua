@@ -36,7 +36,7 @@ local function disown(sh, args)
 	for k = j, #args do
 		local spec, jb = args[k], nil
 		if spec:sub(1, 1) == "%" then
-			jb = job_resolve(sh, spec)
+			jb = job_resolve(sh, spec, "disown")
 		elseif spec:match("^%d+$") then
 			for _, x in ipairs(sh.jobs or {}) do
 				if x.pid == tonumber(spec) then

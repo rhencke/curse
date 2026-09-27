@@ -25,7 +25,7 @@
 #   -t, --timeout S      per-shell-run timeout scale (default 1.0; a test sets its own base)
 #   -r, --results DIR    results dir (default build/stress-results/<timestamp>)
 #   -m, --modes LIST     curse shells (default interp,compiled,tiered,dcold,dwarm)
-#       --oracle PATH    bash 5.2.21 (default: $H_ORACLE, build/oracle/bash, /tmp/claude-1000/w4bash/bash)
+#       --oracle PATH    bash 5.2.21 (default: $H_ORACLE, then the in-tree build/test/oracle/bash)
 #       --list           list the tests and what they guard
 #   FILTER: substrings of test names; only matching tests run.
 # Exit status: 0 when every test passed, 1 on any failure, 2 on a usage/setup error.
@@ -79,7 +79,7 @@ fi
 
 # ---- the oracle: bash 5.2.21, never another version ---------------------------------
 if [ -z "$ORACLE" ]; then
-	for c in "$BUILD/oracle/bash" "$REPO/build/oracle/bash" /tmp/claude-1000/w4bash/bash; do
+	for c in "$BUILD/test/oracle/bash" "$REPO/build/test/oracle/bash" "$BUILD/oracle/bash" "$REPO/build/oracle/bash"; do
 		[ -x "$c" ] && { ORACLE=$c; break; }
 	done
 fi
