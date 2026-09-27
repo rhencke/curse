@@ -1182,7 +1182,7 @@ function M.live_write(...)
 	end
 	local n = select("#", ...)
 	local s = n == 1 and tostring((...)) or table.concat({ ... })
-	real_flush()
+	M.live_flush1()
 	local len, off = #s, 0
 	if len == 0 then
 		return io.stdout
@@ -1193,10 +1193,18 @@ function M.live_write(...)
 		if not r then
 			return r, e
 		end
-		real_flush()
+		M.live_flush1()
 		off = off + 4096
 	end
 	return io.stdout
+end
+-- (its flush's failure — a full disk — is kept for the next io.flush: what the builtin's
+-- sh_chkwrite sees in bash, whose stdio holds the error until then)
+function M.live_flush1()
+	local ok, m = real_flush()
+	if not ok then
+		M.live_werr = M.live_werr or m
+	end
 end
 -- Wait until `fd` is ready for `ev` (POLLIN/POLLOUT). A no-op outside a stage.
 function M.co_block(fd, ev)
@@ -1331,7 +1339,15 @@ io.flush = function(...)
 	if t and not t.flushing then
 		task_flush(t)
 	end
-	return real_flush(...)
+	local ok, m = real_flush(...)
+	local w = M.live_werr -- (a write M.live_write flushed itself failed: this flush reports it)
+	if w then
+		M.live_werr = nil
+		if ok then
+			return nil, w
+		end
+	end
+	return ok, m
 end
 
 -- ---- Locale (glibc-delegated, like bash) ----------------------------------
@@ -2322,6 +2338,10 @@ function M.redir_undo(saves)
 end
 function M.redir_restore(saves) -- (a compiled command's)
 	io.flush()
+	if C.curse_rt_ferror(C.curse_rt_stdout) ~= 0 then -- (execute_builtin_or_function: an
+		M.clear_stdout_err() -- unchecked builtin's failed write is dropped with its redirection)
+	end
+	M.live_werr = nil
 	M.ro_said = nil -- (M.prefix_ro: the command it was said for has bound, or never ran)
 	M.redir_undo(saves)
 end
@@ -14325,30 +14345,32 @@ function Shell:echo(...)
 	-- ordering deterministic across a fork — e.g. `echo a & echo b` prints b then a,
 	-- because the parent flushes b before the just-forked child is scheduled. Only
 	-- when writing to the real fd (not into a $()/pipe capture buffer). A flush
-	-- error (e.g. a full disk) is a write error -> status 1, like bash's sh_chkwrite.
-	local werr = false
+	-- error (e.g. a full disk) is flagged as a write error (sh.write_err).
 	if self.out == io.write then
 		if CO or sched_live() then -- (a redirected builtin in an in-process stage: no blocking flush
 			M.co_block(1, POLLOUT) -- into a full pipe whose reader hasn't run yet — a
 		end -- line fits the PIPE_BUF a POLLOUT pipe has room for)
-		local ok, m = io.flush()
+		local ok, m = M.flush_stdout()
 		if not ok then
-			werr, self.write_err, self.write_errmsg = true, true, m
+			self.write_err, self.write_errmsg = true, m
 			M.clear_stdout_err()
 		end
 	elseif self.traps.SIGPIPE == "" and CO_OUTS[self.out] then -- (a stage's EPIPE: M.chkwrite)
 		local t = CO_OUTS[self.out]
 		task_flush(t)
 		if t.werr then
-			werr, self.write_err, self.write_errmsg = true, true, t.werr
+			self.write_err, self.write_errmsg = true, t.werr
 			t.werr = nil
 		end
 	end
-	self.status = werr and 1 or 0 -- a write error is status 1, like bash's sh_chkwrite
+	-- (a write error is flagged, not a status: the echo builtin's sh_chkwrite makes it 1 —
+	-- Shell:echo_cmd — as rt.CHKWRITE does for the builtins printing through here)
+	self.status = 0
 end
 
 pcall(ffi.cdef, [[
   void curse_rt_clearerr(void *fp) asm("clearerr");
+  int curse_rt_ferror(void *fp) asm("ferror");
   extern void *curse_rt_stdout asm("stdout");
 ]])
 pcall(ffi.cdef, "void tzset(void);")
@@ -14363,12 +14385,23 @@ function M.clear_stdout_err()
 		C.curse_rt_clearerr(C.curse_rt_stdout)
 	end)
 end
+-- bash's sh_chkwrite test: fflush, then ferror — a write that failed earlier (a listing
+-- bigger than the stdio buffer overflowed onto a full disk mid-builtin) counts too
+function M.flush_stdout()
+	local ok, m = io.flush()
+	if ok and C.curse_rt_ferror(C.curse_rt_stdout) ~= 0 then
+		local e = ffi.errno()
+		return nil, ffi.string(C.strerror(e ~= 0 and e or 5))
+	end
+	return ok, m
+end
 -- The `echo` BUILTIN (compiled call sites): Shell:echo, then bash's sh_chkwrite report
 -- of a failed write. (Other builtins print through Shell:echo silently.)
 function Shell:echo_cmd(...)
 	self.write_err = nil
 	self:echo(...)
 	if self.write_err and (self.out == io.write or CO_OUTS[self.out]) then
+		self.status = 1
 		M.chkwrite_report(self, "echo", self.write_errmsg)
 	end
 end
@@ -14395,7 +14428,7 @@ function M.chkwrite(sh, name)
 	if CO or sched_live() then -- (in-process stages: see Shell:echo)
 		M.co_block(1, POLLOUT)
 	end
-	local ok, m = io.flush()
+	local ok, m = M.flush_stdout()
 	if ok then
 		return true
 	end
@@ -14404,16 +14437,93 @@ function M.chkwrite(sh, name)
 	return false
 end
 do
-	-- builtins whose output goes out through Shell:echo, then bash's sh_chkwrite
-	local CHKW = { declare = 1, typeset = 1, export = 1, readonly = 1, trap = 1, umask = 1,
-		times = 1, dirs = 1, help = 1, cd = 1, alias = 1, hash = 1, ["local"] = 1, ulimit = 1,
-		bind = 1 }
-	-- after a builtin flagged a write error: status 1, and the report if nothing made it yet
-	function M.chkwrite_late(sh, name)
-		sh.status = 1
-		if sh.write_errmsg and CHKW[name] then
-			M.chkwrite_report(sh, name, sh.write_errmsg)
+	-- bash 5.2's builtins that end in sh_chkwrite (builtins/*.def): a write error there is
+	-- reported (`NAME: write error: REASON`) and the status becomes 1. Every other builtin's
+	-- failed writes are silent and its own status stands (execute_builtin_or_function just
+	-- flushes, fpurges and clearerrs stdout). A value: true (checked), "report" (reported,
+	-- status kept: pushd/popd print through dirs_builtin and ignore its result), or a
+	-- function(argv) returning one of those for the forms that reach sh_chkwrite.
+	local function opts(argv) -- the option letters and the operand count (after `--`)
+		local o, k = "", 2
+		while argv[k] and argv[k]:match("^[-+].") do
+			if argv[k] == "--" then
+				k = k + 1
+				break
+			end
+			o = o .. argv[k]:sub(2)
+			k = k + 1
 		end
+		return o, #argv - k + 1
+	end
+	local CHKWRITE = {
+		echo = true, printf = true, pwd = true, type = true, help = true, times = true,
+		umask = true, bind = true, shopt = true, cd = true, dirs = true, enable = true,
+		declare = true, typeset = true, export = true, readonly = true, ["local"] = true,
+		compopt = true, trap = true,
+		pushd = "report", popd = "report",
+		-- alias.def: only the listing of every alias (no operands)
+		alias = function(argv)
+			local _, n = opts(argv)
+			return n == 0
+		end,
+		-- hash.def: the table listing (no operands, no -r) — even `hash table empty`
+		hash = function(argv)
+			local o, n = opts(argv)
+			return n == 0 and not o:find("r", 1, true)
+		end,
+		-- history.def: -p with no operands, and the display_history listing; `-p WORD`
+		-- (expand_and_print_history) is not checked
+		history = function(argv)
+			local o, n = opts(argv)
+			return not (o:find("p", 1, true) and n > 0)
+		end,
+		-- complete.def: `complete -p NAME…` (print_cmd_completions), not the full listing
+		complete = function(argv)
+			local o, n = opts(argv)
+			return o:find("p", 1, true) ~= nil and n > 0
+		end,
+		ulimit = function(argv) -- ulimit.def: only the -a listing
+			return (opts(argv)):find("a", 1, true) ~= nil
+		end,
+		fc = function(argv) -- fc.def: the -l listing (fc -s/-e run commands: their status)
+			return (opts(argv)):find("l", 1, true) ~= nil
+		end,
+		set = function(argv) -- set.def: the variable listing and `set -o`/`set +o`
+			return argv[2] == nil or argv[#argv] == "-o" or argv[#argv] == "+o"
+		end,
+	}
+	M.CHKWRITE = CHKWRITE
+	-- After builtin argv ran with a write error flagged (or, at its end, `flush`: bash's
+	-- sh_chkwrite flushing what it left buffered): the CHKWRITE policy decides the status.
+	function M.chkwrite_late(sh, argv, flush)
+		local name = argv[1]
+		local c = CHKWRITE[name]
+		if type(c) == "function" then
+			c = c(argv) and true
+		end
+		if not c then
+			return
+		end
+		if flush and not sh.write_err and (sh.out == io.write or (sh.traps.SIGPIPE == "" and CO_OUTS[sh.out])) then
+			M.chkwrite(sh, name)
+		end
+		if sh.write_err then
+			if c == true then
+				sh.status = 1
+			end
+			if sh.write_errmsg then
+				M.chkwrite_report(sh, name, sh.write_errmsg)
+			end
+		end
+	end
+	-- a lazily-loaded builtin module, run under that policy
+	function M.run_builtin_mod(sh, cmd, argv, hook, tcb)
+		if not CHKWRITE[cmd] then
+			return require(M.BUILTIN_LAZY[cmd])(sh, cmd, argv, hook, tcb)
+		end
+		sh.write_err, sh.write_errmsg = nil, nil
+		require(M.BUILTIN_LAZY[cmd])(sh, cmd, argv, hook, tcb)
+		M.chkwrite_late(sh, argv, true)
 	end
 end
 -- a builtin that wrote through sh.out ends in sh_chkwrite: a failed write is reported,
@@ -14652,7 +14762,7 @@ function M.builtin_run(sh, argv, hook)
 	if prep then
 		prep(sh)
 	end
-	return require(BUILTIN_LAZY[cmd])(sh, cmd, argv, hook or _noop)
+	return M.run_builtin_mod(sh, cmd, argv, hook or _noop)
 end
 
 -- Does a builtin's own write to a prefix-assigned variable outlive the command? In bash
@@ -15198,7 +15308,7 @@ function M.exec_dynamic(sh, argv, hook, hadcs, no_func)
 		I.exec_simple(sh, argv, hook or _noop, no_func)
 	end
 	if sh.write_err then
-		sh.status = 1
+		M.chkwrite_late(sh, argv)
 	end
 	sh:set_str("_", argv[n])
 	sh:array_assign("PIPESTATUS", { tostring(sh.status) }, false)
@@ -16910,7 +17020,7 @@ do
 			M.sr_dispatch(sh, argv, spec, hook)
 		end
 		if sh.write_err then
-			M.chkwrite_late(sh, argv[1])
+			M.chkwrite_late(sh, argv)
 		end
 	end
 	function M.sr_unbind(sh, base, argv)

@@ -40,6 +40,7 @@ extern char fchdir[];
 extern char fchmod[];
 extern char fclose[];
 extern char fcntl[];
+extern char ferror[];
 extern char flock[];
 extern char fnmatch[];
 extern char fnmatch[];
@@ -123,6 +124,7 @@ extern char sigtimedwait[];
 extern char socket[];
 extern char stat[];
 extern char stdin[];
+extern char stdout[];
 extern char strcoll[];
 extern char strdup[];
 extern char strerror[];
@@ -184,6 +186,7 @@ static const curse_sym_t curse_syms[] = {
   { "fchmod", (void*)fchmod },
   { "fclose", (void*)fclose },
   { "fcntl", (void*)fcntl },
+  { "ferror", (void*)ferror },
   { "flock", (void*)flock },
   { "fnmatch", (void*)fnmatch },
   { "fnmatch", (void*)fnmatch },
@@ -267,6 +270,7 @@ static const curse_sym_t curse_syms[] = {
   { "socket", (void*)socket },
   { "stat", (void*)stat },
   { "stdin", (void*)stdin },
+  { "stdout", (void*)stdout },
   { "strcoll", (void*)strcoll },
   { "strdup", (void*)strdup },
   { "strerror", (void*)strerror },

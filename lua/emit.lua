@@ -762,10 +762,10 @@ local function errchk_s(st)
 end
 -- A command body run under redirections r (a redir_conds expression): a failed one is
 -- $?=1 and nothing runs; either way the fds are restored after. bi: a builtin's body — a
--- write error it flags (full disk) is status 1 after the restore, like bash's sh_chkwrite.
+-- write error it flags (full disk) is judged by rt.CHKWRITE (bash's sh_chkwrite callers).
 function EF.redir_wrap(r, body, bi)
 	return ("do local __rs = {}; if %s then %s%s else sh.status = 1 end; rt.redir_restore(__rs)%s end"):format(r,
-		bi and "sh.write_err = nil; " or "", body, bi and "; if sh.write_err then rt.chkwrite_late(sh, __a[1]) end" or "")
+		bi and "sh.write_err = nil; " or "", body, bi and "; if sh.write_err then rt.chkwrite_late(sh, __a) end" or "")
 end
 function EF.xln() -- (a PS4 like `+[$LINENO] ` reads the traced command's line — a trap
 	-- handler's commands keep the interrupted one)
