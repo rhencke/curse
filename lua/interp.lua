@@ -4568,7 +4568,7 @@ local function exec_simple(sh, args, hook, no_func)
 	end
 	local lz = BUILTIN_LAZY[cmd]
 	if lz then
-		return require(lz)(sh, cmd, args, hook, tcb)
+		return rt.run_builtin_mod(sh, cmd, args, hook, tcb)
 	end
 	if cmd == nil then
 		sh.status = 0
