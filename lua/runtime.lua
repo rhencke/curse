@@ -9941,7 +9941,12 @@ ffi.cdef([[
   void *opendir(const char *name);
   void *readdir(void *dirp);
   int closedir(void *dirp);
+  struct curse_dirent { unsigned long d_ino; long d_off; unsigned short d_reclen;
+    unsigned char d_type; char d_name[256]; };
 ]])
+-- (glibc's struct dirent as readdir returns it: d_name's offset from the ABI's own
+-- layout, not a number baked in for x86-64)
+M.DNAME_OFF = ffi.offsetof("struct curse_dirent", "d_name")
 local REG_EXTENDED, REG_NOSUB, REG_ICASE = 1, 8, 2
 -- Compiled-regex cache: a `case`/[[ ]]/glob pattern in a loop would otherwise
 -- regcomp+regfree per test. regcomp bakes in LC_CTYPE/LC_COLLATE, so the cache is
@@ -10715,7 +10720,7 @@ local function scan_seg(dir, seg, dotglob, skipdots)
 		if e == nil then
 			break
 		end
-		local name = ffi.string(ffi.cast("const char *", e) + 19) -- d_name @ 19 (glibc x86-64)
+		local name = ffi.string(ffi.cast("const char *", e) + M.DNAME_OFF)
 		-- . and .. are matched only by an explicit leading-dot pattern with
 		-- globskipdots off; a leading-dot name otherwise needs `.`-pattern or dotglob.
 		local dotdot = name == "." or name == ".."
@@ -10969,7 +10974,7 @@ local function rec_dirs(base, dotglob)
 		if e == nil then
 			break
 		end
-		local name = ffi.string(ffi.cast("const char *", e) + 19)
+		local name = ffi.string(ffi.cast("const char *", e) + M.DNAME_OFF)
 		if name ~= "." and name ~= ".." and (name:sub(1, 1) ~= "." or dotglob) then
 			local path = base == "" and name or (base == "/" and "/" .. name or base .. "/" .. name)
 			if is_dir(path) and not is_symlink(path) then -- (`**` doesn't follow symlinked dirs)
