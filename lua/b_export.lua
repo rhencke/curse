@@ -1021,6 +1021,9 @@ return function(sh, cmd, args, hook, tcb)
 						pb.arr, pb.s, pb.n, pb.empty_decl = pb.arr or (v0 and { [0] = v0 }) or {}, nil, nil, v0 == nil or nil
 						sh.vars[sh:deref(pname)] = pb
 					end
+					if plusattr and plusattr.i and pname and sh:deref(pname) == "SECONDS" then
+						sh.sec_int = nil -- (+i drops the attribute get_seconds gave it, till the next read)
+					end
 					if pb and plusattr then
 						pb.int = not plusattr.i and pb.int or nil
 						pb.lower = not plusattr.l and pb.lower or nil

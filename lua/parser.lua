@@ -1801,7 +1801,7 @@ function M.mark_fntail(body, name)
 end
 M.scan_braces = scan_braces
 M.grab_dparen = grab_dparen
-M.fn_bstart = 1 -- (parse.y's function_bstart, a static: see func_body)
+M.fn_bstart = 0 -- (parse.y's function_bstart, a static: see func_body; Shell.new resets it)
 
 -- Memoize the runtime-facing parsers. The interpreter re-parses the SAME arith
 -- expressions and words on every loop iteration — $(( … )), array subscripts,
@@ -3229,7 +3229,7 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs, xg, bq
 	-- Redirections trailing a compound command (loop/if/case): `done < f`,
 	-- `done <<EOF … EOF`. Collect them and any heredoc bodies they open.
 	local function tail_redirs()
-		local redirs = {}
+		local redirs = hoisted or {}
 		while true do
 			ws()
 			local r = parse_redir()
@@ -3676,19 +3676,30 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs, xg, bq
 		if (kw and FBODY_KW[kw] and not src:find("^[^ \t\n;&|()<>]", i + #kw))
 			or src:find("^%[%[[ \t\n]", i) or src:sub(i, i + 1) == "((" then
 			local node = parse_command()
-			jcx.l = M.fn_bstart -- (bash's tc->line: see below)
+			local fb = M.fn_bstart
+			jcx.l = math.max(fb, 1) -- (bash's tc->line: see below)
 			if node.t ~= "subshell" then
-				return { node }, bline
+				-- (its redirections are the definition's — bash's function_body:
+				-- shell_command redirection_list — applied at tc->line: funcdef_node)
+				local hr = node.redirs
+				node.redirs = nil
+				-- ([[ ]] / (( )) / for (( )) name their own line in errors instead:
+				-- executing_line_number's cm_cond / cm_arith / cm_arith_for)
+				-- — while bash is `executing`, not in an EXIT trap after end of input)
+				local own = (node.t == "dbracket" or node.t == "arithcmd" or node.t == "forc") and node.line
+				return { node }, bline, hr and "kw" or nil, fb, hr, own or nil -- (subbody:
+				-- declare -f prints them on the body command, as with a `( … )` body)
 			end
 			-- (`((` that was two nested subshells: the subshell body, as below)
-			node.jcx = { l = M.fn_bstart }
-			return { node }, bline, true
+			node.jcx = { l = math.max(fb, 1) }
+			return { node }, bline, true, node.line
 		end
 		if src:sub(i, i) == "(" then
 			i = i + 1
 			local fjcx = jcx
 			jcx = {}
 			local body, pterm = parse_stmts({ [")"] = true })
+			local close = line
 			jcx.l, jcx = line, fjcx -- (bash's subshell->line: where it closes)
 			if pterm ~= ")" then
 				error("syntax error: unexpected end of file") -- unclosed ( )
@@ -3701,24 +3712,29 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs, xg, bq
 			-- line_number = tc->line, which make_function_def sets to function_bstart — only
 			-- a `{` body's parse updates that (parse.y's PST_ALLOWOPNBRC), so any other body
 			-- carries the last `{`-bodied function's `{` line (0 -> 1: notify_of_job_status)
-			return { { t = "subshell", line = bline, body = body, jcx = { l = M.fn_bstart } } }, bline, true
+			return { { t = "subshell", line = bline, body = body, jcx = { l = math.max(M.fn_bstart, 1) } } }, bline, true,
+				close
 		end
 		M.fn_bstart = bline -- (at its `{`: a function defined inside moves it on)
-		return brace_group(), bline
+		return brace_group(), bline, nil, bline
 	end
 	-- A function definition, with any trailing redirects (`f() { … } >&2`) that apply
 	-- to the whole body on every call.
 	local function funcdef_node(nm, dstart, dline)
-		local body, bline, subbody = func_body()
+		-- rline: the line the definition's redirections are applied at — execute_function's
+		-- line_number = tc->line (make_function_def's function_bstart: the `{` line, or for
+		-- any other body the last `{`-bodied definition's, 0 — no line — before any), and
+		-- for a `( … )` body the subshell's own (execute_in_subshell: where it closes)
+		local body, bline, subbody, rline, hoisted, rline_own = func_body()
 		jcx = jcx.up or jcx
-		if not subbody then
+		if subbody ~= true then -- ("kw": a keyword body, its redirections hoisted)
 			M.mark_fntail(body, nm)
 		end
 		-- capture the definition's exact source text (name/`function` through the
 		-- closing `}`) so `declare -f`/`type`/`command -V` can recover it verbatim,
 		-- no deparser needed. `src` here is the whole script or the -c/stdin string.
 		local deftext = dstart and src:sub(dstart, i - 1) or nil
-		local redirs = {}
+		local redirs = hoisted or {}
 		while true do
 			ws()
 			local r = parse_redir()
@@ -3736,6 +3752,8 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs, xg, bq
 			_pst = deftext and pst_now(),
 			line = dline,
 			bline = bline,
+			rline = rline,
+			rline_own = rline_own,
 			eline = line, -- (where it ends: a readonly function's redefinition is reported there)
 			subbody = subbody, -- `f() ( … )`: redirections belong to that subshell (declare -f)
 			redirs = (#redirs > 0 and redirs or nil),

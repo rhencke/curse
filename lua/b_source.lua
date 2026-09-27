@@ -9,7 +9,7 @@ local P = I.P
 local exec_list = I.exec_list
 local run_trap = I.run_trap
 
-return function(sh, cmd, args, hook, tcb)
+local function builtin(sh, cmd, args, hook, tcb)
 	if cmd == "source" or cmd == "." then
 		sh.shlvl_tail = nil -- (a builtin: the code it runs isn't exec'd in place)
 		-- source FILE [args]: run FILE in the current shell; a `return` ends the file.
@@ -173,3 +173,5 @@ return function(sh, cmd, args, hook, tcb)
 		rt.source_err_sample(sh, e0)
 	end
 end
+rt.SRC_FRAMES[builtin] = true -- (it sets sh.cur_source: the error label stops here)
+return builtin

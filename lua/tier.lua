@@ -288,11 +288,46 @@ end
 -- retry OUT of the generated run() lets pc/lifted stay fast locals (no closure).
 -- `nested` (an eval/source/hot-loop fragment): a __curse_discard lineabort (bash's
 -- top_level_cleanup + DISCARD) is not contained here but unwinds to the top level.
+-- The lifted vars live in run()'s locals / the module's upvalues, written to sh at each
+-- top-level statement's marker, so an abort mid-statement must keep what the statement
+-- did to them (bash's variables are simply where the command left them). The xpcall
+-- handler reads run()'s lifted slots off the still-live stack; after the unwind they are
+-- written back — unless a synced call was out (sh._sy above its entry value: the callee,
+-- which works on sh, may have changed them there, and sh is then the live copy).
+local dgetinfo, dgetlocal = debug.getinfo, debug.getlocal
 function M.run_compiled(mod, sh, pc, nested)
 	local pd0, cd0, fs0, ne0 = sh.pd, sh.calldepth, sh.funcstack and #sh.funcstack or 0, sh.noerr
+	local lrun, lupv, grabbed = mod.lrun, mod.lupv, nil
+	local handler = (lrun or lupv) and function(e)
+		if lrun and type(e) == "table" and e.__curse_lineabort then
+			local run = mod.run
+			for l = 2, 1000 do
+				local f = dgetinfo(l, "f")
+				if not f then
+					break
+				end
+				if f.func == run then -- (its first locals: slots 3.. — emit's assemble)
+					grabbed = {}
+					for k = 1, #lrun do
+						local _, v = dgetlocal(l, 2 + k)
+						grabbed[k] = v
+					end
+					break
+				end
+			end
+		end
+		return e
+	end
 	while true do
 		local pf0 = sh.procsub_files and #sh.procsub_files or 0
-		local ok, err = pcall(mod.run, sh, pc)
+		local sy0 = sh._sy
+		local ok, err
+		if handler then
+			grabbed = nil
+			ok, err = xpcall(mod.run, handler, sh, pc)
+		else
+			ok, err = pcall(mod.run, sh, pc)
+		end
 		if ok then
 			return
 		end
@@ -308,6 +343,20 @@ function M.run_compiled(mod, sh, pc, nested)
 				sh:leaveFunc()
 			end
 			sh.calldepth, sh.noerr = cd0, ne0 -- (a condition's noerr it unwound out of, too)
+			if handler and sh._sy == sy0 then -- (no synced call out: the lifted copies are live)
+				if grabbed then
+					for k, n in ipairs(lrun) do
+						sh:aset(n, grabbed[k])
+					end
+				end
+				if lupv then
+					local vals = { mod.upvget() }
+					for k, n in ipairs(lupv) do
+						sh:aset(n, vals[k])
+					end
+				end
+			end
+			sh._sy, grabbed = sy0, nil
 			if nested and err.__curse_discard then
 				error(err, 0)
 			end
