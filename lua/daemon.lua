@@ -196,6 +196,49 @@ local function apply_env(env)
 	C.environ = ffi.cast("char **", arr)
 end
 
+-- The script's children that nothing waits for any more: a script killed by a signal
+-- (sh.termsig) unwinds out of its wait for a foreground command, which runs on — as
+-- bash's does when bash dies — but this worker lives on as its parent, so it would stay
+-- a zombie once it ends (the kernel's reaper only gets orphans). Reap them all: those
+-- already ended, then wait for the rest; a STOPPED one gets SIGHUP + SIGCONT, as the
+-- kernel sends a group orphaned by its shell's exit. (Its slot already reads -1, so the
+-- dead-client sweep leaves it be; one syscall when there are none.)
+local reap_st = ffi.new("int[1]")
+local function reap_orphans()
+	local r = C.waitpid(-1, reap_st, 1 + 2) -- WNOHANG|WUNTRACED
+	while true do
+		if r < 0 then
+			if ffi.errno() ~= 4 then -- (ECHILD: none left)
+				return
+			end
+		elseif r > 0 and bit.band(reap_st[0], 0xff) == 0x7f then -- stopped
+			C.kill(r, 1)
+			C.kill(r, 18)
+		end
+		if r == 0 then -- all live: one stopped before now reports no stop again
+			local me = tonumber(C.getpid())
+			local f = io.open("/proc/" .. me .. "/task/" .. me .. "/children", "r")
+			for pid in (f and f:read("*a") or ""):gmatch("%d+") do
+				local sf = io.open("/proc/" .. pid .. "/stat", "r")
+				local s = sf and sf:read("*l")
+				if sf then
+					sf:close()
+				end
+				local state = s and s:match("^.*%) (%a)")
+				if state == "T" or state == "t" then
+					C.kill(tonumber(pid), 1)
+					C.kill(tonumber(pid), 18)
+				end
+			end
+			if f then
+				f:close()
+			end
+		end
+		-- (r == 0: block for the next to end or stop)
+		r = C.waitpid(-1, reap_st, r == 0 and 2 or 1 + 2)
+	end
+end
+
 -- Serve ONE request on the caller's fds, reply with the status, and RETURN so the
 -- persistent worker can serve the next (no per-request fork or _exit). Everything a
 -- script can leave in PROCESS state is reset — the fork model got this for free; we
@@ -326,6 +369,7 @@ local function serve_request(cfd, req, fds, ctx)
 		pcall(rt.sched_drain, sh)
 		drained = true
 	end
+	reap_orphans()
 	-- SCRUB per-request process state (the fork boundary used to do this):
 	C.umask(ctx.umask) -- a script's `umask` doesn't persist
 	C.sigprocmask(2, ctx.empty_sigset, nil) -- SIG_SETMASK: clear any trap-blocked signals
