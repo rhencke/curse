@@ -1639,7 +1639,9 @@ expand_part_str = function(sh, p, assign)
 		-- parser; a word cut at a $'…' NUL: parser.dq_nulcut)
 		sherr(sh, p.bterr and ('curse: bad substitution: no closing "`" in ' .. p.bterr .. "\n")
 			or ("curse: bad substitution: no closing `}' in " .. p.nulcut .. "\n"))
-		error({ __curse_exit = 1, __curse_lineabort = true, __curse_discard = true })
+		-- (a plain line abort, as ${x!}: bash's report_error + expand_word_error DISCARD,
+		-- which an eval/source's parse_and_execute contains — the rest of ITS line only)
+		error({ __curse_exit = 1, __curse_lineabort = true })
 	elseif p.var then
 		-- a nameref whose target has a subscript (`typeset -n ref='a[2]'`) reads as
 		-- ${a[2]} — deref only yields the base name, so expand the target here.

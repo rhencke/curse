@@ -16246,15 +16246,16 @@ function M.fn_return(sh, name)
 		sh.status = fret
 	end
 end
--- $FUNCNEST: a call (either tier) past that many nested calls abandons the whole command
+-- $FUNCNEST: a call (either tier) past that many nested calls abandons the current command
 -- line, status 1 (bash's execute_function: "maximum function nesting level exceeded",
--- jump_to_top_level DISCARD)
+-- jump_to_top_level DISCARD — which an eval/source's parse_and_execute contains: the rest
+-- of ITS line only, the eval/source goes on; never an errexit exit)
 function M.funcnest_over(sh, name)
 	local lim = tonumber(sh:get("FUNCNEST"))
 	if lim and lim > 0 and (sh.calldepth or 0) >= lim then
 		io.stderr:write("curse: " .. name .. ": maximum function nesting level exceeded (" .. lim .. ")\n")
 		sh.status = 1
-		error({ __curse_exit = 1, __curse_lineabort = true, __curse_discard = true })
+		error({ __curse_exit = 1, __curse_lineabort = true, __curse_noee = true })
 	end
 	return false
 end
