@@ -539,7 +539,7 @@ end
 
 -- load_history (bash, at `set -o history` before any line was added): default HISTSIZE
 -- and HISTFILESIZE, then read $HISTFILE.
-function M.load(sh)
+function M.load(sh, keepfile)
 	if (sh.hist_session or 0) > 0 then
 		return
 	end
@@ -548,6 +548,12 @@ function M.load(sh)
 	end
 	if sh.vars.HISTFILESIZE == nil then
 		sh:set_str("HISTFILESIZE", sh:get("HISTSIZE"))
+	end
+	-- (sv_histsize ("HISTFILESIZE"): the file is truncated to it BEFORE it's read — an
+	-- unset $HISTFILE means ~/.history; KEEPFILE: the REPL's ~/.bash_history default,
+	-- which curse never touches)
+	if not keepfile then
+		rt.hist_resize(sh, "HISTFILESIZE")
 	end
 	local hf = sh.vars.HISTFILE and sh:get("HISTFILE") or ""
 	if hf ~= "" then

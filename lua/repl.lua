@@ -32,6 +32,8 @@ local interactive = istty -- becomes true for `-i` too once run() sees opt_i
 -- One line of input. With readline: full editing + history. Otherwise plain read.
 -- (echo: line editing is on but stdin isn't a terminal — bash's readline still echoes
 -- each line it reads after the prompt, on stderr)
+local sh_cur -- (the shell read_line serves: M.run's)
+local rl_readline -- (below)
 local function read_line(prompt, echo)
 	if RL and istty then -- readline only on a real tty; piped stdin prompts to stderr
 		local c = RL.readline(prompt)
@@ -45,6 +47,15 @@ local function read_line(prompt, echo)
 	-- The prompt goes to STDERR (bash), terminal or not
 	if interactive then
 		io.stderr:write(prompt)
+	end
+	if not istty and echo and not sh_cur.opt_vi then
+		local l = rl_readline(sh_cur, function()
+			return interp._int.fd_getc(0)
+		end)
+		if l then
+			io.stderr:write(l, "\n")
+		end
+		return l
 	end
 	if not istty then
 		-- piped/redirected program text: read fd 0 RAW, one byte at a time (like bash on a
@@ -71,18 +82,375 @@ local function read_line(prompt, echo)
 	return io.read("*l")
 end
 
+-- bash's readline on a stdin that is NOT a terminal (`bash -i < file`, a pipe): with line
+-- editing on (emacs mode), readline still reads the input byte by byte and runs its
+-- default emacs bindings on it, so control characters in the input are editing commands
+-- (history recall, incremental search, operate-and-get-next, kills and yanks, cursor
+-- motion) — what bash's own tests (history4.sub) feed it. The line is edited here as
+-- readline would; the display readline draws on stderr is reduced to the accepted line.
+-- (Not modelled: completion — TAB inserts nothing, as a completion that finds no unique
+-- match —, undo, keyboard macros, numeric arguments, the mark, vi mode, inputrc/bind.)
+local rl_kill = {} -- the kill ring (most recent last)
+rl_readline = function(sh, getc)
+	local H = require("hist")
+	local hl = H.list(sh)
+	local base = sh.hist_base or 1
+	local mb = rt.lc_mb_cur_max() > 1
+	local line, pt = "", 0 -- the buffer, and the byte count before point
+	local pos = #hl + 1 -- the history entry being edited (#hl + 1: the new line)
+	local newline_text -- the new line's text while browsing the history
+	local last_cmd, eof_seen
+	local edits = {} -- history lines edited while browsing (readline's undo lists)
+	local function cont(b) -- a UTF-8 continuation byte (moves step over whole chars)
+		return mb and b and b >= 0x80 and b < 0xC0
+	end
+	local function left(p)
+		if p <= 0 then
+			return 0
+		end
+		p = p - 1
+		while p > 0 and cont(line:byte(p + 1)) do
+			p = p - 1
+		end
+		return p
+	end
+	local function right(p)
+		if p >= #line then
+			return #line
+		end
+		p = p + 1
+		while p < #line and cont(line:byte(p + 1)) do
+			p = p + 1
+		end
+		return p
+	end
+	local function isword(c) -- rl_alphabetic
+		return c ~= nil and (c:match("%w") ~= nil or c:byte() >= 0x80)
+	end
+	local function fwd_word(p)
+		while p < #line and not isword(line:sub(p + 1, p + 1)) do
+			p = p + 1
+		end
+		while p < #line and isword(line:sub(p + 1, p + 1)) do
+			p = p + 1
+		end
+		return p
+	end
+	local function back_word(p)
+		while p > 0 and not isword(line:sub(p, p)) do
+			p = p - 1
+		end
+		while p > 0 and isword(line:sub(p, p)) do
+			p = p - 1
+		end
+		return p
+	end
+	local function insert(t)
+		line = line:sub(1, pt) .. t .. line:sub(pt + 1)
+		pt = pt + #t
+	end
+	local function kill(a, b, cmd) -- kill line[a+1..b]; consecutive kills accumulate
+		if a >= b then
+			return
+		end
+		local t = line:sub(a + 1, b)
+		if last_cmd == "kill" and #rl_kill > 0 then
+			rl_kill[#rl_kill] = (a < pt) and (t .. rl_kill[#rl_kill]) or (rl_kill[#rl_kill] .. t)
+		else
+			rl_kill[#rl_kill + 1] = t
+		end
+		line = line:sub(1, a) .. line:sub(b + 1)
+		pt = a
+		cmd.kill = true
+	end
+	local function goto_hist(k) -- rl_get_previous/next_history: replace the line
+		if k < 1 or k > #hl + 1 or k == pos then
+			return false
+		end
+		if pos == #hl + 1 then
+			newline_text = line
+		elseif line ~= hl[pos] then -- (an edited history line stays edited until accepted)
+			edits[pos] = line
+		end
+		pos = k
+		line = (k == #hl + 1) and (newline_text or "") or edits[k] or hl[k]
+		pt = #line
+		return true
+	end
+	-- a pending operate-and-get-next: the history entry after the one accepted
+	if sh.rl_next_logical then
+		local k = sh.rl_next_logical - base + 1
+		sh.rl_next_logical = nil
+		if k <= #hl then
+			goto_hist(math.max(k, 1))
+		end
+	end
+	local pushed = {}
+	local function key()
+		if #pushed > 0 then
+			return table.remove(pushed)
+		end
+		return getc()
+	end
+	local search_last = ""
+	-- rl_search_history: incremental search (dir -1: C-r, 1: C-s) over the history lines
+	-- plus the line being edited; returns the key that ended it (to run) or nil
+	local function isearch(dir)
+		local lines = {}
+		for k = 1, #hl do
+			lines[k] = edits[k] or hl[k]
+		end
+		lines[#hl + 1] = pos == #hl + 1 and line or (newline_text or "")
+		local save_pos, save_line, save_pt = pos, line, pt
+		if pos ~= #hl + 1 then
+			lines[pos] = line
+		end
+		local str = ""
+		local hp, idx = pos, dir < 0 and pt or pt -- where the search is (line, byte index 0-based)
+		local found_line, prev_found = pos, nil
+		local function search(again)
+			if again then
+				idx = idx + dir
+			end
+			local sline = lines[hp]
+			while true do
+				local limit = #sline - #str + 1
+				if dir < 0 and idx > #sline - #str then
+					idx = #sline - #str
+				end
+				while (dir < 0 and idx >= 0) or (dir > 0 and idx < limit) do
+					if sline:sub(idx + 1, idx + #str) == str then
+						prev_found, found_line, pt = sline, hp, idx
+						return true
+					end
+					idx = idx + dir
+				end
+				repeat
+					hp = hp + dir
+					if hp < 1 or hp > #lines then
+						hp = found_line
+						return false
+					end
+					sline = lines[hp]
+				until not ((prev_found and prev_found == sline) or #str > #sline)
+				idx = dir < 0 and (#sline - #str) or 0
+			end
+		end
+		local c
+		while true do
+			c = key()
+			if c == nil then
+				break
+			end
+			local b = c:byte()
+			if c == "\18" or c == "\19" then -- C-r / C-s: again (the last string when empty)
+				dir = c == "\18" and -1 or 1
+				if str == "" then
+					str = search_last
+				end
+				if str ~= "" then
+					search(true)
+				end
+			elseif c == "\7" then -- C-g: abort, the line as it was
+				pos, line, pt = save_pos, save_line, save_pt
+				return nil
+			elseif c == "\8" or c == "\127" then
+				if #str > 0 then
+					str = str:sub(1, -2)
+				end
+			elseif c == "\27" or c == "\n" then -- the terminators; ESC is then a prefix
+				if c == "\27" then
+					pushed[#pushed + 1] = c
+				end
+				c = nil
+				break
+			elseif b >= 32 then
+				str = str .. c
+				search(false)
+			else
+				break -- any other key ends the search, then runs
+			end
+		end
+		search_last = str ~= "" and str or search_last
+		-- _rl_isearch_fini: the line found (moving the history there), point at the match
+		local fp = pt
+		line, pos = save_line, save_pos
+		if found_line ~= save_pos then
+			goto_hist(found_line)
+			line = lines[found_line]
+		end
+		pt = math.min(found_line == save_pos and (str ~= "" and fp or save_pt) or fp, #line)
+		return c
+	end
+	while true do
+		local c = key()
+		local cmd = {}
+		if c == nil then -- end of input: a non-blank line is accepted, else EOF
+			if line == "" then
+				return nil
+			end
+			eof_seen = true
+			break
+		end
+		if c == "\18" or c == "\19" then
+			c = isearch(c == "\18" and -1 or 1)
+			if c then
+				pushed[#pushed + 1] = c
+			end
+		elseif c == "\n" or c == "\r" then
+			break
+		elseif c == "\15" then -- C-o operate-and-get-next: accept, then the next entry
+			sh.rl_next_logical = pos + base
+			break
+		elseif c == "\1" then
+			pt = 0
+		elseif c == "\5" then
+			pt = #line
+		elseif c == "\2" then
+			pt = left(pt)
+		elseif c == "\6" then
+			pt = right(pt)
+		elseif c == "\4" then -- C-d: EOF on an empty line, else delete-char
+			if line == "" then
+				return nil
+			end
+			line = line:sub(1, pt) .. line:sub(right(pt) + 1)
+		elseif c == "\8" or c == "\127" then
+			local l = left(pt)
+			line = line:sub(1, l) .. line:sub(pt + 1)
+			pt = l
+		elseif c == "\11" then
+			kill(pt, #line, cmd)
+		elseif c == "\21" then
+			kill(0, pt, cmd)
+		elseif c == "\23" then -- unix-word-rubout: whitespace-delimited
+			local p = pt
+			while p > 0 and line:sub(p, p):match("%s") do
+				p = p - 1
+			end
+			while p > 0 and not line:sub(p, p):match("%s") do
+				p = p - 1
+			end
+			kill(p, pt, cmd)
+		elseif c == "\25" then
+			if #rl_kill > 0 then
+				insert(rl_kill[#rl_kill])
+			end
+		elseif c == "\20" then -- transpose-chars
+			if pt > 0 and #line >= 2 then
+				local p = pt == #line and left(pt) or pt
+				local a = left(p)
+				local e = right(p)
+				line = line:sub(1, a) .. line:sub(p + 1, e) .. line:sub(a + 1, p) .. line:sub(e + 1)
+				pt = e
+			end
+		elseif c == "\16" then
+			goto_hist(pos - 1)
+		elseif c == "\14" then
+			goto_hist(pos + 1)
+		elseif c == "\17" or c == "\22" then -- quoted-insert
+			local q = key()
+			if q then
+				insert(q)
+			end
+		elseif c == "\29" then -- character-search
+			local q = key()
+			local f = q and line:find(q, pt + 2, true)
+			if f then
+				pt = f - 1
+			end
+		elseif c == "\24" then -- C-x prefix: its commands aren't modelled
+			key()
+		elseif c == "\27" then -- ESC: the meta prefix (arrow keys: ESC [ X / ESC O X)
+			local m = key()
+			if m == "[" or m == "O" then
+				local k = key()
+				if k == "A" then
+					goto_hist(pos - 1)
+				elseif k == "B" then
+					goto_hist(pos + 1)
+				elseif k == "C" then
+					pt = right(pt)
+				elseif k == "D" then
+					pt = left(pt)
+				elseif k == "H" then
+					pt = 0
+				elseif k == "F" then
+					pt = #line
+				elseif k and k:match("%d") then
+					local t = key()
+					if k == "3" and t == "~" then
+						line = line:sub(1, pt) .. line:sub(right(pt) + 1)
+					end
+				end
+			elseif m then
+				m = m:lower()
+				if m == "b" then
+					pt = back_word(pt)
+				elseif m == "f" then
+					pt = fwd_word(pt)
+				elseif m == "d" then
+					kill(pt, fwd_word(pt), cmd)
+				elseif m == "\127" or m == "\8" then
+					kill(back_word(pt), pt, cmd)
+				elseif m == "<" then
+					goto_hist(1)
+				elseif m == ">" then
+					goto_hist(#hl + 1)
+				elseif m == "u" or m == "l" or m == "c" then
+					local e = fwd_word(pt)
+					local w = line:sub(pt + 1, e)
+					if m == "u" then
+						w = w:upper()
+					elseif m == "l" then
+						w = w:lower()
+					else
+						w = w:lower():gsub("%w", string.upper, 1)
+					end
+					line = line:sub(1, pt) .. w .. line:sub(e + 1)
+					pt = e
+				elseif m == "\\" then
+					local a, e = pt, pt
+					while a > 0 and line:sub(a, a):match("[ \t]") do
+						a = a - 1
+					end
+					while e < #line and line:sub(e + 1, e + 1):match("[ \t]") do
+						e = e + 1
+					end
+					line = line:sub(1, a) .. line:sub(e + 1)
+					pt = a
+				elseif m == "#" then -- insert-comment: `#` at the start, then accept
+					line = "#" .. line
+					break
+				end
+			end
+		elseif c == "\t" or c == "\0" or c == "\3" or c == "\26" or c == "\28" or c == "\30"
+			or c == "\31" or c == "\12" or c == "\7" then
+			-- complete (nothing unique), set-mark, unbound keys, clear-screen, undo, abort
+		else
+			insert(c)
+		end
+		last_cmd = cmd.kill and "kill" or nil
+	end
+	return line, eof_seen
+end
+
 -- Does `buf` have an obviously-unterminated construct, so the REPL should keep
 -- reading (PS2) instead of running it? Shared with interp.source_file (rc-file
 -- completeness). See interp.incomplete_input.
 local function needs_more(buf)
-	if interp.incomplete_input(buf) then
-		return true
-	end
 	-- the real parser decides the rest (`f() {`, `{ echo`, `echo $(ls`, …)
 	local ok, r = pcall(require("parser").parse, buf)
 	local perr = (not ok and tostring(r)) or (r and r.stmts and r.stmts[1] and r.stmts[1].t == "parse_error"
 		and tostring(r.stmts[1].msg)) or ""
 	if perr:find("unexpected end of file", 1, true) ~= nil or perr:find("unexpected EOF", 1, true) ~= nil then
+		return true
+	end
+	-- (a syntax error before the unterminated part — `right)"` — is reported at once)
+	if perr ~= "" then
+		return false
+	end
+	if interp.incomplete_input(buf) then
 		return true
 	end
 	-- a here-document whose body hasn't all been read yet (`cat <<E` and no `E` line)
@@ -103,6 +471,7 @@ local M = {}
 function M.run(sh)
 	-- re-probe the tty state per run: a resident daemon worker serves many callers' fds
 	istty = ffi.C.isatty(0) == 1
+	sh_cur = sh
 	interactive = istty or (sh and sh.opt_i) or false -- prompts print for `-i` even off a tty
 	-- Persist $HISTFILE across the session (load now, write at exit) — but only when
 	-- it was EXPLICITLY set (env/script), never the ~/.bash_history default, so a
@@ -120,7 +489,7 @@ function M.run(sh)
 	else
 		local hf = sh.vars.HISTFILE
 		sh.vars.HISTFILE = nil
-		H.load(sh)
+		H.load(sh, true)
 		sh.vars.HISTFILE = hf
 	end
 	if interactive then -- (shell.c: an interactive shell remembers its mailboxes' dates)
