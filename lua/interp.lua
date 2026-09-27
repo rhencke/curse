@@ -6483,6 +6483,7 @@ local function shallow_noexit(t)
 end
 local function finish(sh, ok, err)
 	if not ok then
+		err = rt.lua_overflow(sh, err)
 		if type(err) == "table" and err.__curse_noexittrap then
 			sh.traps = sh.traps and shallow_noexit(sh.traps) -- `exec cmd`: the process is gone
 		end

@@ -1,0 +1,9 @@
+stack overflow
+subshell 1
+stack overflow
+cmdsub 1 []
+job 1
+stack overflow
+trap 1
+deep but bounded 0
+exit trap, status 1

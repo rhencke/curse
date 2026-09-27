@@ -3442,6 +3442,9 @@ function Shell:capture_inproc(backtick, runner, capfd, ctx)
 	self.cap_jobs, self.xsigint = {}, nil
 	cap_enter()
 	local ok, err = pcall(runner, self)
+	if not ok then
+		err = M.lua_overflow(self, err)
+	end
 	-- killed by SIGINT (itself, or the external it ended with): the shell then sends
 	-- itself SIGINT (subst.c command_substitute) — its trap runs, or it dies
 	local sigint = (ok and self.status == 130 and self.xsigint)
@@ -4574,6 +4577,20 @@ end
 -- subshell keeps errexit (unlike $()), writes to the live stdout, and its own applied
 -- redirects (`saves`) are restored here too. exit/return/div0 in the body become the
 -- subshell's status.
+-- LuaJIT's stack ran out (unbounded function or trap recursion: bash overflows its C
+-- stack — SIGSEGV — or nests without end; bash UB, not copied: docs/bash-ub.md). The shell
+-- running it — the script, or a subshell / $(…) / job running in-process — stops with this
+-- diagnostic, status 1, as a crashed child would stop alone. Any other error: itself.
+function M.lua_overflow(sh, err)
+	if type(err) ~= "string" or not err:find("stack overflow$") then
+		return err
+	end
+	local fl = sh.force_line
+	sh.force_line = 0 -- (no line: where the stack gave out differs by tier)
+	io.stderr:write("curse: stack overflow\n")
+	sh.force_line = fl
+	return { __curse_exit = 1 }
+end
 function Shell:subshell_run(runner, saves, paren, inplace)
 	local s1, s2, s3, s4, s5, s6, s7, s8 = subprog_enter(self)
 	local cp = sub_checkpoint(self)
@@ -4610,6 +4627,7 @@ function Shell:subshell_run(runner, saves, paren, inplace)
 	local status = self.status
 	local rethrow, killed
 	if not ok then
+		err = M.lua_overflow(self, err)
 		if type(err) == "table" and err.__curse_badusage and paren and not self.opt_e then
 			status = 2 -- (a failed ${x:=w} discards the `( )` child's line: EX_BADUSAGE; a $(…) says 1)
 		elseif type(err) == "table" and (err.__curse_exit or err.__curse_return) then
@@ -6041,6 +6059,9 @@ local function co_launch(ctx, self, stage_fns, inproc, base, lastpipe, upv)
 			sh.badassign = nil
 			local ok, err = pcall(fn, sh)
 			if ctx then
+				if not ok then
+					err = M.lua_overflow(sh, err)
+				end
 				if not ok and type(err) == "table" and err.__curse_vsig == ctx then
 					err = { __curse_exit = 128 + err.sig }
 					g.killed = true
