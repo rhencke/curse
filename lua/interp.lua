@@ -5039,37 +5039,6 @@ local function unset_arrayref(sh, w)
 	end
 	return table.concat(buf)
 end
--- `cmd &` that may be spawned at once (interp's twin of emit's spawn_bg fast path): a
--- literal external name, no redirections/assignments, and words whose expansion has no
--- side effect and reads nothing the child would see differently (bash expands them in the
--- child: not $(…), arithmetic, ${x:=…}, $!, $_, $RANDOM/$SRANDOM, $BASHPID, $BASH_SUBSHELL).
-local BG_CHILD_VARS = { RANDOM = 1, SRANDOM = 1, BASHPID = 1, BASH_SUBSHELL = 1 }
-M.bg_spawnable = function(sh, cmd)
-	if cmd.redirs or cmd.assigns or not cmd.words or not cmd.words[1] or sh.opt_u or sh.opt_x then
-		return false
-	end
-	local w1 = cmd.words[1]
-	if #w1.parts ~= 1 or not w1.parts[1].lit or w1.parts[1].lit:find("[%$`\\'\"*?%[~]") then
-		return false
-	end
-	local c = w1.parts[1].lit
-	if c == "" or sh.functions[c] or BUILTINS[c] or (sh.aliases and sh.aliases[c]) then
-		return false
-	end
-	for _, w in ipairs(cmd.words) do
-		for _, p in ipairs(w.parts) do
-			for k in pairs(p) do
-				if k ~= "q" and k ~= "lit" and k ~= "var" and k ~= "param" and k ~= "special" then
-					return false
-				end
-			end
-			if (p.var and BG_CHILD_VARS[p.var]) or p.special == "!" or p.special == "_" then
-				return false
-			end
-		end
-	end
-	return true
-end
 local function expand_args(sh, st, args, is_assign)
 	if sh.arrayref_args then
 		sh.arrayref_args = nil -- (the previous command's: see rt.mark_arrayref)
@@ -5708,17 +5677,8 @@ exec_stmt = function(sh, st, hook)
 		local cmdstr = (dtext ~= "" and dtext) or st.text
 			or (c1 and c1.words and c1.words[1] and c1.words[1].parts[1] and c1.words[1].parts[1].lit) or "job"
 		local cmd = st.cmd
-		rt.env_rebuilt(sh) -- (execute_simple_command's, before the fork)
-		-- `ext args &` with side-effect-free words: spawn it directly — $! is the external's
-		-- own pid, as bash's (whose child execs it) — like the compiled tier's spawn_bg.
-		if cmd.t == "simple" and M.bg_spawnable(sh, cmd) then
-			local args = {}
-			local ok = pcall(expand_args, sh, cmd, args, false)
-			if ok and sh:spawn_bg(args, cmdstr) then
-				return
-			end
-		end
 		local run = rt.bg_tail_stmt(cmd)
+		rt.env_rebuilt(sh) -- (execute_simple_command's, before the fork)
 		local job = sh:bg_launch(function(ssh)
 			exec_stmt(ssh, run, SUBHOOK)
 		end, cmdstr, cmd.t == "subshell", cmd.t == "simple")
