@@ -18,3 +18,4 @@ r 'printf "%s|" "$(cat <<A; cat <<B)"\n1\nA\n2\nB\necho'
 echo "-- expansions inside \"…\" keep their own quoting"
 echo "$(echo ")")" "$((1+2))" "${u:-"}"}" "`echo \"q\"`"
 echo "$( (echo sub) )" "$(echo "$(echo "deep")")"
+cd / && rm -rf "$t"   # (leave nothing behind in $TMPDIR)

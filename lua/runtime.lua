@@ -403,11 +403,11 @@ function Shell.new()
 	-- feature-detection (`test -n "$BASH_VERSION"`, `[[ $BASH_VERSION == 5* ]]`)
 	-- works. A normal var: scripts can reassign or `unset` it (bash).
 	if sh.vars["BASH_VERSION"] == nil then
-		sh:set_str("BASH_VERSION", "5.2.37(1)-release")
+		sh:set_str("BASH_VERSION", "5.2.21(1)-release")
 	end
 	-- BASH_VERSINFO: the readonly array form (major minor patch build release machtype)
 	if sh.vars["BASH_VERSINFO"] == nil then
-		sh:array_assign("BASH_VERSINFO", { "5", "2", "37", "1", "release", "x86_64-pc-linux-gnu" }, false)
+		sh:array_assign("BASH_VERSINFO", { "5", "2", "21", "1", "release", "x86_64-pc-linux-gnu" }, false)
 		sh.vars["BASH_VERSINFO"].ro = true
 	end
 	-- $BASH: the running shell's full pathname (bash's get_bash_name — always its own,
@@ -1700,6 +1700,39 @@ function M.ropen(path, flags, mode)
 	end
 	return fd
 end
+ffi.cdef([[
+  int curse_rt_mkstemp(char *tmpl) asm("mkstemp");
+  int curse_rt_fchmod(int fd, unsigned int mode) asm("fchmod");
+  int curse_rt_unlink(const char *path) asm("unlink");
+]])
+-- A private temp file for the shell's own plumbing (a big here-document's body, an
+-- fd-level $(...) capture): mkstemp in $TMPDIR when that's a writable directory (bash's
+-- get_tmpdir with MT_USETMPDIR), else /tmp. Returns the O_RDWR creating fd (moved to
+-- >= FD_BASE, close-on-exec) and the path, or -1 with errno set. The file is mode 0600
+-- whatever the umask (bash fchmods its here-document file the same way): under
+-- `umask 777` mkstemp's file is mode 000, and any reopen by name fails with EACCES.
+-- The CALLER unlinks the path as soon as it no longer needs the name.
+-- (Not os.tmpname: that creates and CLOSES a named /tmp/lua_XXXXXX the caller must
+-- remember to remove on every path, raises on failure, and ignores $TMPDIR — the capture
+-- path leaked one such file per `$(…)` whose reopen hit a restrictive umask.)
+function M.mktmpfd()
+	local dir = os.getenv("TMPDIR")
+	if not dir or dir:sub(1, 1) ~= "/" or #dir > 4000 or C.access(dir, 3) ~= 0 then -- W_OK|X_OK
+		dir = "/tmp"
+	end
+	local tmpl = dir:gsub("/+$", "") .. "/curse-XXXXXX"
+	local buf = ffi.new("char[?]", #tmpl + 1, tmpl)
+	local fd = C.curse_rt_mkstemp(buf)
+	if fd < 0 and dir ~= "/tmp" then
+		buf = ffi.new("char[?]", 18, "/tmp/curse-XXXXXX")
+		fd = C.curse_rt_mkstemp(buf)
+	end
+	if fd < 0 then
+		return -1
+	end
+	C.curse_rt_fchmod(fd, 384) -- 0600
+	return fd_hi(fd), ffi.string(buf)
+end
 local _temp_fd
 do
 local _hd_pipe = ffi.new("int[2]")
@@ -1722,23 +1755,34 @@ _temp_fd = function(content) -- the body on an O_RDONLY fd
 		C.close(w)
 		return r
 	end
-	-- (-1 with errno set on failure, never a raise: os.tmpname raises when mkstemp fails —
-	-- fd exhaustion — and a Lua error would escape the redirection as a traceback)
-	local okt, tmp = pcall(os.tmpname)
-	if not okt then
+	-- bash's here_document_to_fd: create the file (0600 via fchmod, so a restrictive umask
+	-- — `umask 777` makes mkstemp's file mode 000 — can't block the reopen below), write
+	-- the body through the creating fd, reopen it O_RDONLY, unlink it, close the writer.
+	-- (-1 with errno set on failure, never a raise.)
+	local w, path = M.mktmpfd()
+	if w < 0 then
 		return -1
 	end
-	local w, _, e = io.open(tmp, "w")
-	if not w then
-		os.remove(tmp)
-		ffi.errno(e or 0)
-		return -1
+	local e = 0
+	local off, n = 0, #content
+	while off < n do
+		local k = tonumber(C.curse_co_write(w, ffi.cast("const char *", content) + off, n - off))
+		if k < 0 then
+			if ffi.errno() ~= 4 then
+				e = ffi.errno()
+				break
+			end
+		else
+			off = off + k
+		end
 	end
-	w:write(content)
-	w:close()
-	local f = C.open(tmp, 0, 0) -- O_RDONLY
-	e = ffi.errno()
-	os.remove(tmp) -- the open fd keeps the inode alive
+	local f = -1
+	if e == 0 then
+		f = C.open(path, 0, 0) -- O_RDONLY
+		e = f < 0 and ffi.errno() or 0
+	end
+	C.curse_rt_unlink(path) -- the open fd keeps the inode alive
+	C.close(w)
 	ffi.errno(e)
 	return f
 end
@@ -2929,14 +2973,16 @@ function Shell:capture_inproc(backtick, runner, capfd, ctx)
 	local buf, tmp, save1
 	if capfd then
 		io.flush()
-		tmp = os.tmpname()
-		local tfd = C.open(tmp, 577, 384) -- O_WRONLY|O_CREAT|O_TRUNC, 0600
+		-- (the sink is unlinked at once — nothing can be left behind — and read back
+		-- through the creating fd `tmp`, which shares fd 1's file offset: rewind, read)
+		local tfd, tpath = M.mktmpfd()
 		if tfd < 0 then
 			capfd = false
 		else
+			C.curse_rt_unlink(tpath)
+			tmp = tfd
 			save1 = M.save_fd(1)
 			C.dup2(tfd, 1)
-			C.close(tfd)
 		end
 	end
 	local sv_sink = self.cap_sink
@@ -3006,13 +3052,18 @@ function Shell:capture_inproc(backtick, runner, capfd, ctx)
 		if not capfd then
 			return table.concat(buf)
 		end
-		local f = io.open(tmp, "r")
-		local c = f and f:read("*a") or ""
-		if f then
-			f:close()
+		local parts, rb = {}, ffi.new("char[65536]")
+		C.curse_rt_lseek(tmp, 0, 0) -- SEEK_SET
+		while true do
+			local k = tonumber(C.read(tmp, rb, 65536))
+			if k > 0 then
+				parts[#parts + 1] = ffi.string(rb, k)
+			elseif k == 0 or ffi.errno() ~= 4 then
+				break
+			end
 		end
-		os.remove(tmp)
-		return c
+		C.close(tmp)
+		return table.concat(parts)
 	end
 	if not ok then
 		if type(err) == "table" and err.__curse_parseerr then
@@ -4643,15 +4694,31 @@ end
 -- `wait PID` still answers for them), in slot order. `keep`: the job `wait` waited for —
 -- reported with the rest (wait_for's notify_and_cleanup tells of every job that ended), but
 -- left to `wait` to delete.
+-- bash 5.2.21's rules (patch 5.2-030 later changed them): a NON-interactive shell marks
+-- every signal-killed background job notified whether or not it printed a line — one it
+-- doesn't report (INT, TERM, PIPE, a trapped signal) vanishes from the table silently —
+-- and a `-c` shell (startup_state 2) does the same with the jobs that simply exited: `jobs`
+-- no longer lists them and `wait %N` says "no such job" (`wait PID` still answers). A
+-- script (startup_state 0) keeps an exited job listed until `jobs`/`wait` shows it. Under
+-- `-c` in posix mode nothing is printed, and only $!'s job is kept.
 function M.jobs_notify(sh, keep)
 	local foreign = sh.foreign_pids -- (a subshell doesn't report its parent's jobs: it can't
-	for _, j in ipairs(sh.jobs or {}) do -- reap them — bash's child never sees them end)
-		if j.done and j.sig and not j.gone and not j.notified and not (foreign and foreign[j.pid]) then
-			j.notified = true
-			-- (one bash doesn't report — TERM, INT, PIPE — stays listed, as an exited job does,
-			-- until `jobs` or `wait` shows it)
-			if M.job_notify(sh, j.procs or { { pid = j.pid, st = j.sig + (j.core and 0x80 or 0), text = j.cmd } }, j.sig, false)
-				and j ~= keep then
+	local cmode = sh.opt_c and not sh.opt_i and not sh.cap_jobs -- reap them — bash's child
+	for _, j in ipairs(sh.jobs or {}) do -- never sees them end)
+		if j.done and not j.gone and not j.notified and not (foreign and foreign[j.pid]) then
+			if cmode and sh.opt_posix then
+				if tostring(j.pid) ~= tostring(sh.last_bg_pid) and j ~= keep then
+					j.notified = true
+					M.job_delete(sh, j)
+				end
+			elseif j.sig then
+				j.notified = true
+				local said = M.job_notify(sh, j.procs or { { pid = j.pid, st = j.sig + (j.core and 0x80 or 0), text = j.cmd } }, j.sig, false)
+				if j ~= keep and (said or not sh.opt_i) then
+					M.job_delete(sh, j)
+				end
+			elseif cmode and j ~= keep then
+				j.notified = true
 				M.job_delete(sh, j)
 			end
 		end
@@ -12805,7 +12872,7 @@ function Shell:prompt_escapes(s, isprompt)
 				d = os.date("%a %b %d"),
 				s = pq(self, self.shellname or "bash"),
 				v = "5.2",
-				V = "5.2.37",
+				V = "5.2.21",
 				-- \! the history number of this command; \# the command number
 				["!"] = tostring(self.history and #self.history > 0 and (self.hist_base or 1) + #self.history - 1 or 1),
 				["#"] = tostring((self.cmd_number or 0) + (isprompt and 1 or 0)),
@@ -15586,7 +15653,7 @@ do
 		sh.arrayargs_pre = {}
 		for _, aa in ipairs(aas) do
 			sh.arrayargs_pending[aa.name] = true
-			sh.arrayargs_pre[aa] = I.arrayassign_items(sh, aa, wantassoc or sh:is_assoc(sh:deref(aa.name)))
+			sh.arrayargs_pre[aa] = I.arrayassign_items(sh, aa, wantassoc or sh:is_assoc(sh:deref(aa.name)), wantassoc)
 		end
 	end
 	-- … and after it: each literal lands in the now-declared (local/assoc) variable, unless

@@ -1,0 +1,11 @@
+# Per-test time limits (seconds) for tests that legitimately run longer than the
+# harness default (--timeout / TIMEOUT, 10s). A limit here only ever RAISES the
+# default; it applies to the oracle and every shell alike. Each entry says why:
+# tests land here because bash itself needs the time (measured unloaded, bash 5.2),
+# never to hide a slow or hung curse.
+#
+# corpus  test          seconds  why
+bash      jobs.tests    120      # ~62s of `sleep`s (wait/fg/bg/kill -STOP sequencing)
+bash      trap.tests    45       # ~15s: several `sleep`-based signal/trap timings
+bash      ifs-posix.tests 30     # ~3.3s of pure CPU (6,800 IFS-splitting checks): the one CPU-bound
+                                 # test within 4x of the default; load scaling alone lags (1-min avg)

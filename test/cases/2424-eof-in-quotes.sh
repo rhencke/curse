@@ -53,3 +53,4 @@ r '((1+\n2'
 printf 'echo a\nx=$(echo b\necho "c\n' > t.sh
 $S -c '. ./t.sh; echo st=$?' 2>&1 | e
 $S -c 'f() { eval "$(cat t.sh)"; }; for i in $(seq 160); do f >/dev/null 2>&1; done; f; echo st=$?' 2>&1 | e
+cd / && rm -rf "$t"   # (leave nothing behind in $TMPDIR)

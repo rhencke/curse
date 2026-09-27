@@ -95,8 +95,11 @@ return function(sh, cmd, args, hook, tcb)
 			rt.chkwrite_listed(sh, "local")
 			return
 		end
-		if dash and not opts_local then
-			-- `local -`: the set options become local to this call (restored by popCall)
+		if dash then
+			-- `local -`: the set options become local to this call (restored by popCall).
+			-- bash 5.2.21 snapshots them AGAIN at every `local -` in the same call, so the
+			-- options restored on return are the ones current at the LAST one (patch 5.2-023
+			-- later kept the first snapshot; curse is 5.2.21).
 			sh.local_opts = sh.local_opts or {}
 			local snap = {}
 			for _, f in ipairs(rt.opt_fields()) do

@@ -495,7 +495,11 @@ local function rl_capture(dumpfn)
 	if not rl then
 		return nil
 	end
-	local tmp = os.tmpname()
+	local tfd, tmp = rt.mktmpfd() -- (mode 0600 whatever the umask; see rt.mktmpfd)
+	if tfd < 0 then
+		return nil
+	end
+	C.close(tfd)
 	local f = C.fopen(tmp, "w")
 	if f == nil then
 		os.remove(tmp)
@@ -704,6 +708,7 @@ local var_is_set, unary, binary, do_test = rt.var_is_set, rt.test_unary, rt.test
 local tilde_prefix -- forward (word-initial ~ expansion; defined below, used in paramexp)
 local expand_word -- forward (used by eval's $-deferred arith and expand_part_str)
 local expand_assign_word -- forward (assignment-RHS expander; ${-default} tilde ctx)
+local notilde -- forward (a word copy that expands with no tilde expansion: 5.2.21 assoc subscripts)
 local expand_pattern -- forward (quote-aware glob-pattern expansion for ${v/…} etc.)
 local expand_repl -- forward (${v/pat/REPL} replacement expansion)
 local is_multi, multi_elems, multi_hda -- forward (defined with the field expander)
@@ -1364,7 +1369,7 @@ end
 -- associative array, else an integer (arith-evaluated) for an indexed one.
 array_key = function(sh, name, index_raw)
 	if sh:is_assoc(name) then
-		return expand_word(sh, P.parse_word(index_raw))
+		return expand_word(sh, notilde(P.parse_word(index_raw))) -- (5.2.21: no tilde; see notilde)
 	end
 	-- indexed: arith-evaluate the subscript. Parse the RAW subscript with arith (its
 	-- defer/xpand handles $()/$vars) rather than word-expanding it first, so bash's
@@ -1717,7 +1722,7 @@ expand_word = function(sh, w, noassign)
 	local buf = {}
 	for k, p in ipairs(w.parts) do
 		local s = expand_part_str(sh, p)
-		if k == 1 and p.lit ~= nil and not p.q then
+		if k == 1 and p.lit ~= nil and not p.q and not w.notilde then
 			s = tilde_word_initial(sh, s, #w.parts > 1, noassign)
 		end
 		buf[#buf + 1] = s
@@ -1734,8 +1739,8 @@ end
 expand_assign_word = function(sh, w, peel_name)
 	local buf = {}
 	for i, p in ipairs(w.parts) do
-		local s = expand_part_str(sh, p, true) -- assignment context: ${-default} tilde after ':'
-		if p.lit ~= nil and not p.q then
+		local s = expand_part_str(sh, p, not w.notilde) -- assignment context: ${-default} tilde after ':'
+		if p.lit ~= nil and not p.q and not w.notilde then
 			local more = i < #w.parts -- a prefix without `/` runs into the next part: literal
 			if peel_name and i == 1 then
 				local pre, rest = s:match("^([%a_][%w_]*%+?=)(.*)$")
@@ -1749,6 +1754,24 @@ expand_assign_word = function(sh, w, peel_name)
 	return table.concat(buf)
 end
 M.expand_assign_word = expand_assign_word
+-- bash 5.2.21's expand_subscript_string (W_NOTILDE): an ASSOCIATIVE array's subscripts —
+-- `a[~]=v`, `${a[~]}`, `unset 'a[~]'`, a compound `([~]=v)` — and its compound-assignment
+-- VALUES (`([k]=~)`, a key/value list `(k ~)`) are expanded with NO tilde expansion.
+-- (bash 5.2 patch 24 turned tildes back on there; curse is 5.2.21, bug for bug.) A word
+-- marked `notilde` (a copy — parse results are shared) expands like that everywhere:
+-- expand_word, expand_assign_word, the compiled tier's emit_word and EF.tilde_value.
+notilde = function(w)
+	if w.notilde then
+		return w
+	end
+	local c = {}
+	for k, v in pairs(w) do
+		c[k] = v
+	end
+	c.notilde = true
+	return c
+end
+M.notilde = notilde
 
 -- Expand a word, backslash-escaping the metacharacters in `charclass` for any
 -- QUOTED part (so they match literally) while leaving unquoted parts — including
@@ -3078,7 +3101,17 @@ end
 -- A compound literal's expanded elements ({key?, op, val}). A declaration builtin's
 -- `NAME=(…)` is expanded BEFORE the builtin runs (bash: `local -a arr=("${arr[@]}")`
 -- copies the OUTER arr), so exec_stmt pre-computes them into sh.arrayargs_pre[st].
-local function arrayassign_items(sh, st, isassoc)
+-- ntilde (default: isassoc): expand the assoc forms with no tilde (5.2.21: see notilde). A
+-- declaration builtin passes whether IT said -A: without -A its compound argument was
+-- expanded as an ordinary (indexed-style) assignment word first, tildes included, even
+-- into an existing associative array (`declare -A d; declare d=([k]=~)` stores $HOME).
+local function arrayassign_items(sh, st, isassoc, ntilde)
+	if ntilde == nil then
+		ntilde = isassoc
+	end
+	local nt = ntilde and notilde or function(w)
+		return w
+	end
 	local items, elems = {}, st.elems
 	local e1 = elems[1]
 	-- bash's kvpair_assignment_p: an associative literal whose FIRST word is not a
@@ -3090,7 +3123,7 @@ local function arrayassign_items(sh, st, isassoc)
 			if e.key ~= nil then
 				w = P.parse_word("[" .. e.key .. "]" .. e.op .. w.src)
 			end
-			items[#items + 1] = { key = nil, op = "=", val = expand_assign_word(sh, w), src = w.src }
+			items[#items + 1] = { key = nil, op = "=", val = expand_assign_word(sh, nt(w)), src = w.src }
 		end
 		items.kv = true
 		return items
@@ -3103,11 +3136,11 @@ local function arrayassign_items(sh, st, isassoc)
 			-- its arithmetic later (against the array being built — the item's xkey).
 			local xkey
 			if isassoc then
-				xkey = expand_word(sh, P.parse_word(e.key))
+				xkey = expand_word(sh, notilde(P.parse_word(e.key))) -- (a subscript: never a tilde)
 			elseif e.key:find("[%$`]") then
 				xkey = expand_word(sh, P.parse_word(e.key))
 			end
-			items[#items + 1] = { key = e.key, xkey = xkey, op = e.op, val = expand_assign_word(sh, e.word), src = e.word.src }
+			items[#items + 1] = { key = e.key, xkey = xkey, op = e.op, val = expand_assign_word(sh, nt(e.word)), src = e.word.src }
 		elseif isassoc then
 			-- a bare word in a keyed assoc literal: an error, reported as written and never
 			-- expanded (bash's assign_compound_array_list)

@@ -43,3 +43,4 @@ r 'case a in a(b)) echo x;; esac'
 r 'case a in a'
 r 'case a in "a'
 r 'echo 1\ncase a in\na\n) echo x;; esac'
+cd / && rm -rf "$t"   # (leave nothing behind in $TMPDIR)

@@ -17,6 +17,7 @@ ffi.cdef([[
 	int curse_sm_iswupper(uint32_t wc) asm("iswupper");
 	uint32_t curse_sm_towlower(uint32_t wc) asm("towlower");
 	int curse_sm_wcscoll(const int32_t *a, const int32_t *b) asm("wcscoll");
+	int curse_sm_fnmatch(const char *pattern, const char *string, int flags) asm("fnmatch");
 ]])
 
 local S = {}
@@ -56,8 +57,33 @@ local function rangecmp(c1, c2, forcecoll)
 	end
 	return c1 - c2 -- (a total ordering)
 end
+-- bash's FNMATCH_EQUIV_FALLBACK (configure: "whether fnmatch can be used to check bracket
+-- equivalence classes" — yes with glibc, so the in-tree 5.2.21 build defines it): chars
+-- that don't collate equal may still share an equivalence class — ask the C library's
+-- fnmatch("[[=EQUIV=]]", "C") (_fnmatch_fallback / _fnmatch_fallback_wc). So under
+-- en_US.UTF-8 `[[=e=]]` matches é. (A Debian 5.2.37 build lacks the fallback: no match.)
+local eqbuf = ffi.new("char[16]")
+local eqstate = ffi.new("curse_mbstate_t")
+local function mbchar(c) -- one character's bytes in the current locale (nil: unencodable)
+	if not mb then
+		return string.char(band(c, 255))
+	end
+	ffi.fill(eqstate, ffi.sizeof(eqstate))
+	local n = tonumber(C.wcrtomb(eqbuf, c, eqstate))
+	if n < 1 or n > 15 then
+		return nil
+	end
+	return ffi.string(eqbuf, n)
+end
 local function collequiv(c, equiv)
-	return charcmp(c, equiv, true) == 0
+	if charcmp(c, equiv, true) == 0 then
+		return true
+	end
+	local s, p = mbchar(c), mbchar(equiv)
+	if not s or not p or s == "\0" or p == "\0" then
+		return false
+	end
+	return C.curse_sm_fnmatch("[[=" .. p .. "=]]", s, 0) == 0
 end
 local function fold(c, flags)
 	if band(flags, CASEFOLD) ~= 0 and c > 0 and C.curse_sm_iswupper(c) ~= 0 then

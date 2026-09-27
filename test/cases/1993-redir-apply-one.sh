@@ -1,7 +1,7 @@
 # Redirections the compiled tier applies through rt.redir_apply_one (a named fd {v}>,
 # fd moves, dups to an expanded fd, cmdsub/arith/brace targets, expanding heredocs),
 # and <()/>() drained after the command (or redirected compound) that made them.
-cd "$(mktemp -d)"
+_tmpd=$(mktemp -d); cd "$_tmpd"
 exec {fd}>out1; echo hi >&$fd; exec {fd}>&-; cat out1
 echo moved 3>&1 4>&3-
 f=o2; echo x > ${f}$((1+1)); cat o22
@@ -20,3 +20,4 @@ for k in 1 2; do exec {w}>>out1; echo k$k >&$w; exec {w}>&-; done; cat out1
 # the redirections don't see the command's prefix bindings
 for i in 1; do IFS=/ read m v k < <(echo a/b/c); echo $m:$v:$k; done
 IFS=: read a b c < <(echo x:y:z); echo $a-$b-$c
+cd / && rm -rf "$_tmpd"   # (leave nothing behind in $TMPDIR)

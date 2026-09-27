@@ -45,7 +45,7 @@ function M.usage(name, extra)
 	local L = rt.L -- (each piece bash's _(): the message locale's words)
 	local t = {}
 	if extra then
-		t[#t + 1] = L("GNU bash, version %s-(%s)\n", "5.2.37(1)-release", "x86_64-pc-linux-gnu")
+		t[#t + 1] = L("GNU bash, version %s-(%s)\n", "5.2.21(1)-release", "x86_64-pc-linux-gnu")
 	end
 	t[#t + 1] = L("Usage:\t%s [GNU long option] [option] ...\n\t%s [GNU long option] [option] script-file ...\n",
 		name, name) .. L("GNU long options:\n")
@@ -66,7 +66,7 @@ end
 
 local function version() -- (show_shell_version (1): its _() pieces)
 	local L = rt.L
-	return L("GNU bash, version %s (%s)\n", "5.2.37(1)-release", "x86_64-pc-linux-gnu")
+	return L("GNU bash, version %s (%s)\n", "5.2.21(1)-release", "x86_64-pc-linux-gnu")
 		.. L("Copyright (C) 2022 Free Software Foundation, Inc.") .. "\n"
 		.. L("License GPLv3+: GNU GPL version 3 or later <http://gnu.org/licenses/gpl.html>\n") .. "\n"
 		.. L("This is free software; you are free to change and redistribute it.") .. "\n"
@@ -248,8 +248,7 @@ end
 -- run_startup_files (shell.c): login files, $BASH_ENV (non-interactive), the rc file
 -- (interactive) or $ENV (interactive posix)
 local function startup_files(sh, inv, sh_like)
-	if inv.by_ssh then -- (see ssh_rc: ONLY the rc files)
-		run_file(sh, "/etc/bash.bashrc")
+	if inv.by_ssh then -- (see ssh_rc: ONLY the rc file)
 		run_file(sh, inv.rcfile or "~/.bashrc")
 		return
 	end
@@ -274,7 +273,8 @@ local function startup_files(sh, inv, sh_like)
 	end
 	if not posix then
 		if not sh_like and not norc then
-			run_file(sh, "/etc/bash.bashrc") -- (Debian's SYS_BASHRC)
+			-- (no /etc/bash.bashrc: SYS_BASHRC is a Debian config-top.h change; bash 5.2.21
+			-- as released leaves it undefined)
 			run_file(sh, inv.rcfile or "~/.bashrc")
 		elseif sh_like and not sh.opt_p then
 			env_file(sh, "ENV")
@@ -284,10 +284,11 @@ local function startup_files(sh, inv, sh_like)
 	end
 end
 
--- run_startup_files' rshd/sshd case: a non-interactive, non-login, not-sh `-c` shell run
--- by sshd ($SSH_CLIENT or $SSH2_CLIENT set: Debian builds with SSH_SOURCE_BASHRC) or with
--- stdin a network connection (isnetconn: getpeername on fd 0 works) reads the system and
--- user bashrc — and nothing else — when it's a top-level shell ($SHLVL < 2).
+-- run_startup_files' rshd case: a non-interactive, non-login, not-sh `-c` shell whose stdin
+-- is a network connection (isnetconn: getpeername on fd 0 works) reads ~/.bashrc (or
+-- --rcfile) — and nothing else — when it's a top-level shell ($SHLVL < 2). bash 5.2.21 as
+-- released leaves SSH_SOURCE_BASHRC (and SYS_BASHRC) undefined, so $SSH_CLIENT alone does
+-- nothing; the host's Debian bash defines both.
 local gpn_sa, gpn_len
 local function isnetconn(fd)
 	if not gpn_sa then
@@ -302,14 +303,13 @@ local function isnetconn(fd)
 	return not (e == 88 or e == 107 or e == 22 or e == 9) -- (ENOTSOCK ENOTCONN EINVAL EBADF)
 end
 local function ssh_rc(sh)
-	return (tonumber(sh:get("SHLVL")) or 0) < 2
-		and (sh.vars.SSH_CLIENT ~= nil or sh.vars.SSH2_CLIENT ~= nil or isnetconn(0))
+	return (tonumber(sh:get("SHLVL")) or 0) < 2 and isnetconn(0)
 end
 
 -- start_debugger (shell.c): --debugger (or -O extdebug) — bash's debugging_mode IS extdebug —
 -- sources the debugger's start file with errexit off; when that fails (bashdb isn't
 -- installed) it warns and turns debugging mode off, and -E/-T follow it either way.
-local DEBUGGER_START_FILE = "/usr/share/bashdb/bashdb-main.inc" -- (Debian's pathnames.h)
+local DEBUGGER_START_FILE = "/usr/share/bashdb/bashdb-main.inc" -- (pathnames.h: $datadir, prefix /usr)
 local function start_debugger(sh)
 	local e = sh.opt_e
 	sh.opt_e = false

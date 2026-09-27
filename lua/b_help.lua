@@ -4,7 +4,7 @@ local ffi = require("ffi")
 local rt = require("runtime")
 
 local function version()
-	return rt.L1("GNU bash, version %s (%s)\n", "5.2.37(1)-release", "x86_64-pc-linux-gnu")
+	return rt.L1("GNU bash, version %s (%s)\n", "5.2.21(1)-release", "x86_64-pc-linux-gnu")
 end
 
 -- bash's _() of a help text (lua/l10n.lua; only under a message locale with a catalog)
