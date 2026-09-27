@@ -3337,6 +3337,32 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs, xg, bq
 			comsub_err(cerr)
 		end
 	end
+	-- the $( … ) bodies in a ${ … } (src[k..e)) are syntax-checked as the line is read, as
+	-- at the word's top level: bash's parse_matched_pair reads a ${ with parse_comsub for
+	-- each `$(`, and nested "…" the same way — but a '…' (even one inside "${…}", where it
+	-- expands as literal quotes) and `…` are read as quoted strings, unchecked
+	local function braces_comsubs(k, e)
+		while k < e do
+			local c = src:sub(k, k)
+			if c == "\\" then
+				k = k + 2
+			elseif c == "'" then
+				k = quote_end(src, k, src:sub(k - 1, k - 1) == "$")
+			elseif c == "`" then
+				k = quote_end(src, k, true)
+			elseif c == "$" and src:sub(k + 1, k + 1) == "(" then
+				local je = scan_cmdsub(src, k + 2)
+				local cbody = src:sub(k + 2, je - 2)
+				if src:sub(k + 2, k + 2) ~= "(" and not cbody:find("<<", 1, true) and not cbody:find('$"', 1, true)
+					and not alias_touch(cbody) then
+					comsub_check(cbody)
+				end
+				k = je
+			else
+				k = k + 1
+			end
+		end
+	end
 	-- Read one shell word, keeping quotes and $(( )) / ${ } / $( ) balanced. One loop reads
 	-- the whole word, inside "…" (q0: its opening quote) and out: an expansion is read the
 	-- same way in both — a $( … ) in "…" is syntax-checked and takes its here-document too.
@@ -3471,7 +3497,11 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs, xg, bq
 			elseif c == "<" or c == ">" or c == "|" or c == "&" then
 				break -- metacharacters end a word: redirs (procsub <(/>( handled above), `|`/`&` pipelines/lists & `&&`/`||`/`>&` need no surrounding space
 			elseif c == "$" and src:sub(i + 1, i + 1) == "{" then
+				local bs = i
 				i = scan_braces(src, i + 1, q0) -- ${…}: match the close, honoring \ ' " and nesting
+				if src:find("$(", bs + 2, true) and src:find("$(", bs + 2, true) < i then
+					braces_comsubs(bs + 2, i - 1)
+				end
 			elseif c == "`" then -- `…` command sub: keep it whole (spaces inside included)
 				i = quote_end(src, i, true, true)
 			elseif c == " " or c == "\t" or c == "\n" or c == ";" then
