@@ -7195,11 +7195,6 @@ H.pipeline = function(cx, st, after)
 	return p
 end
 
--- ${…} operators with no side effect and no error output (safe to expand in the PARENT
--- for a spawned `ext args &`): plain, defaults/alternates, trims, replacements, case ops
-local BG_PURE_PEXP = { [""] = 1, ["-"] = 1, [":-"] = 1, ["+"] = 1, [":+"] = 1, ["#"] = 1, ["##"] = 1,
-	["%"] = 1, ["%%"] = 1, ["/"] = 1, ["//"] = 1, ["^"] = 1, ["^^"] = 1, [","] = 1, [",,"] = 1,
-	["~"] = 1, ["~~"] = 1 }
 -- statement handler: background (split out of flatten_stmt; see H)
 H.background = function(cx, st, after)
 	-- cmd & : fork, run the COMPILED command in the child; the parent records $! + the
@@ -7244,24 +7239,13 @@ H.background = function(cx, st, after)
 	-- so nothing with a side effect — $(…), ${x:=…}, arith assignment — may move to the
 	-- parent) and no redirects/assignments: build argv here and spawn, no fork at all. A
 	-- raise while expanding (set -u) or a spawn the runtime declines takes the fork path.
-	local spawn = nil
+	local spawn, spawn_refs = nil, false
 	if ext and not sc.redirs and not sc.assigns then
-		local pure = true
-		for _, w in ipairs(sc.words) do
-			for _, pt in ipairs(w.parts or {}) do
-				if pt.cmdsub or pt.procsub or pt.backtick or pt.arithast
-					or (pt.arith and (not safe_arith(pt.arith) or arith_side_effect(safe_arith(pt.arith))))
-					or (pt.pexp and not BG_PURE_PEXP[pt.pexp.op or ""])
-					or pt.special == "!" or pt.special == "_"
-				then
-					pure = false
-				end
-			end
-		end
+		local pure, refs = require("runtime").bg_pure_words(sc.words)
 		if pure then
 			local builder = field_argv(sc.words, 1, cx.lifted, "rt.cstr(%s)")
 			if builder then
-				spawn = builder
+				spawn, spawn_refs = builder, refs
 			end
 		end
 	end
@@ -7274,7 +7258,9 @@ H.background = function(cx, st, after)
 		st.cmd.t == "pipeline" and ", true" or "")
 	local body = fork
 	if spawn then
-		body = ("do local __ok, __a = pcall(function() %s; return __a end); if not __ok then require(\"parser\").trap_flow(__a) end; if not (__ok and sh:spawn_bg(__a, %q)) then %s end end"):format(
+		-- (under set -u an unset parameter is the child's error: the task path then)
+		body = ("do local __ok, __a = false; if %s then __ok, __a = pcall(function() %s; return __a end); if not __ok then require(\"parser\").trap_flow(__a) end end; if not (__ok and sh:spawn_bg(__a, %q)) then %s end end"):format(
+			spawn_refs and "not sh.opt_u" or "true",
 			spawn,
 			cmdstr,
 			fork

@@ -5750,14 +5750,32 @@ exec_stmt = function(sh, st, hook)
 		local dtext = require("deparse").command_text(st.cmd) -- (bash prints the job as print_cmd.c does)
 		local cmdstr = (dtext ~= "" and dtext) or st.text
 			or (c1 and c1.words and c1.words[1] and c1.words[1].parts[1] and c1.words[1].parts[1].lit) or "job"
-		local cmd = st.cmd
-		local run = rt.bg_tail_stmt(cmd)
-		rt.env_rebuilt(sh) -- (execute_simple_command's, before the fork)
-		local job = sh:bg_launch(function(ssh)
-			exec_stmt(ssh, run, SUBHOOK)
-		end, cmdstr, cmd.t == "subshell", cmd.t == "simple")
-		if cmd.t == "pipeline" and job and job.g then
-			rt.job_mark_pipe(job) -- (a pipeline job: `kill %N` reaches its every stage)
+		local cmd, spawned = st.cmd, false
+		-- `ext args… &` with PURE words and no redirects/assignments: expand argv here and
+		-- spawn the program as the job (rt: bg_pure_words, Shell:spawn_bg — the compiled
+		-- tier's path): $! is its real pid. A raise while expanding (set -u) or a spawn the
+		-- runtime declines (a function/builtin, xtrace, …) runs it as a task instead.
+		local pure, refs
+		if cmd.t == "simple" and cmd.words and cmd.words[1] and not cmd.redirs and not cmd.assigns then
+			pure, refs = rt.bg_pure_words(cmd.words)
+		end
+		if pure and not (refs and sh.opt_u) then
+			local args = {}
+			local ok, err = pcall(expand_args, sh, cmd, args, false)
+			if not ok then
+				P.trap_flow(err)
+			end
+			spawned = ok and sh:spawn_bg(args, cmdstr)
+		end
+		if not spawned then
+			local run = rt.bg_tail_stmt(cmd)
+			rt.env_rebuilt(sh) -- (execute_simple_command's, before the fork)
+			local job = sh:bg_launch(function(ssh)
+				exec_stmt(ssh, run, SUBHOOK)
+			end, cmdstr, cmd.t == "subshell", cmd.t == "simple")
+			if cmd.t == "pipeline" and job and job.g then
+				rt.job_mark_pipe(job) -- (a pipeline job: `kill %N` reaches its every stage)
+			end
 		end
 		sh.status = 0
 	elseif t == "coproc" then
@@ -6458,8 +6476,8 @@ end
 -- Run one logical line (a parser group) the way the shell runs its own input.
 local function run_group(sh, lg, hook, k)
 	sh.cmd_number = (sh.cmd_number or 0) + 1 -- (the prompt's \#)
-	if sh.jobs_waited or sh.jobs_pending then -- (reading a line: notify_and_cleanup — rt.jobs_line)
-		rt.jobs_line(sh, lg.rline)
+	if not lg.jobs_read and (sh.jobs_waited or sh.jobs_pending) then -- (reading a line:
+		rt.jobs_line(sh, lg.rline) -- notify_and_cleanup — rt.jobs_line; run_lazy's before the parse)
 	end
 	-- bash parses a whole LOGICAL LINE (a `simple_list` up to a top-level newline)
 	-- before executing any of it, so a syntax error ANYWHERE on the line means the
@@ -6701,11 +6719,20 @@ function M.run_lazy(sh, src, hook, line1)
 				run_history_lines(sh, src, line1 or 1, hook, k)
 				return
 			end
+			local eline -- (the previous group's last line)
 			while true do
+				-- bash's shell_getc notifies of (and cleans up) ended jobs as it starts to
+				-- READ the next line, before parsing it: here too — a job the last command
+				-- killed isn't given the time the parse takes to be seen dead (rt.jobs_line)
+				local jr = eline and (sh.jobs_waited or sh.jobs_pending) and true
+				if jr then
+					rt.jobs_line(sh, eline + 1)
+				end
 				local lg = nextf()
 				if lg == nil then
 					break
 				end
+				lg.jobs_read, eline = jr, lg.eline
 				k = run_group(sh, lg, hook, k)
 				-- set -t (onecmd): the reader's loop ends after the command it read and ran
 				-- (bash's reader_loop: just_one_command) — not a -c string's

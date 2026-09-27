@@ -100,6 +100,7 @@ local function kill_job(sh, jb, sig)
 		return ffi.errno() == 3 -- (ESRCH: it ended, just not reaped yet)
 	else
 		ok = true
+		rt.job_signalled(sh, jb.pid, sig)
 		if stopped and (sig == 15 or sig == 1) then
 			C.kill(jb.pid, 18)
 		end
@@ -208,6 +209,7 @@ return function(sh, cmd, args, hook, tcb)
 					io.stderr:write("curse: kill: (" .. pid .. ") - " .. ffi.string(C.strerror(ffi.errno())) .. "\n")
 				else
 					any = true
+					rt.job_signalled(sh, pid < 0 and -pid or pid, sig)
 				end
 			elseif target ~= "" and target:sub(1, 1) ~= "%" then
 				io.stderr:write("curse: kill: " .. target .. ": arguments must be process or job IDs\n")
