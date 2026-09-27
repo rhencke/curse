@@ -1470,7 +1470,7 @@ local function expand_procsub(sh, p)
 		{ fds = { [p.dir == "<" and 1 or 0] = theirs }, keepstdin = true, nojob = true })
 	C.close(theirs)
 	local fd = rt.fd_below(mine, 64)
-	rt.fd_owner[fd] = sh -- (only this shell's own spawns inherit it)
+	rt.fd_register(fd, sh) -- (only this shell's own spawns inherit it — and its later clones')
 	sh.procsub_files = sh.procsub_files or {}
 	sh.procsub_files[#sh.procsub_files + 1] = { fd = fd, pid = job and job.pid or 0, g = job and job.g }
 	return "/dev/fd/" .. fd
@@ -4121,9 +4121,10 @@ local function run_function(sh, cmd, fn, args, hook, tenv_base)
 	local dbg_saved = rt.debug_enter(sh, cmd)
 	-- Redirects on the definition (`f(){ … } >&2`) apply to the whole body per call.
 	local fr = sh.func_redirs and sh.func_redirs[cmd]
-	local rsave, rsavedout, rok
+	local rsave, rsavedout, rok, pnp, pnf
 	if fr then
-		rsave, rok = apply_redirs(sh, fr)
+		pnp, pnf = rt.procsub_mark(sh) -- (a >() target there: drained after the body, as on a
+		rsave, rok = apply_redirs(sh, fr) -- compound command — a compiled caller has no drain)
 		rsavedout = sh.out
 		if redirs_touch_stdout(fr) then
 			sh.out = io.write
@@ -4162,6 +4163,7 @@ local function run_function(sh, cmd, fn, args, hook, tenv_base)
 		io.flush()
 		sh.out = rsavedout
 		restore_redirs(rsave)
+		M._int.drain_procsub(sh, pnp, pnf)
 	end
 	sh.loopdepth = saved_ld
 	-- `return N` sets the function's status but not $? (return.def: only return_catch_value),
@@ -4942,6 +4944,10 @@ local function drain_procsub(sh, np, nf)
 		return
 	end
 	io.flush()
+	-- (bash forks each <()/>() child at once, holding every earlier one's end: `tee >(wc -c)
+	-- >(wc -l)` — wc -c sees EOF only once wc -l exits. Let a child not yet started start
+	-- now, with those ends still open, before the shell closes its own.)
+	rt.sched_pump({})
 	for i = nf + 1, #files do
 		C.close(files[i].fd)
 		rt.fd_owner[files[i].fd] = nil

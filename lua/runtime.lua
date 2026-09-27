@@ -1526,11 +1526,30 @@ local _ropen_st = ffi.new("char[144]")
 -- Low fds the shell hands out by NUMBER (a process substitution's /dev/fd/63) are open in
 -- the one process every in-process subshell shares: an external spawned by a DIFFERENT
 -- shell (a background job, a stage) must not inherit one — `tee >(wc -c)`: wc would hold a
--- writer on its own input. fd -> the shell it belongs to; foreign_fa closes the others'.
+-- writer on its own input. fd -> { owner shell, generation }; foreign_fa closes the fd for
+-- every other shell — except one cloned (a pipeline stage, an async job: Shell:stage_clone),
+-- directly or through its own clones, from the owner AFTER the fd was made: as a process
+-- forked then, it has inherited it (`f > >(cat)` with f running `ls | tr`: ls sees 63).
 M.fd_owner = {}
+M.fd_gen = 0 -- (bumped per registration; a clone records the value it was made at)
+function M.fd_register(fd, sh)
+	M.fd_gen = M.fd_gen + 1
+	M.fd_owner[fd] = { sh = sh, gen = M.fd_gen }
+end
+local function fd_inherits(self, rec)
+	local s = self
+	while s do
+		local p = s.clone_parent
+		if p == rec.sh then
+			return (s.clone_gen or 0) >= rec.gen
+		end
+		s = p
+	end
+	return false
+end
 function M.foreign_fa(self, fa)
-	for fd, owner in pairs(M.fd_owner) do
-		if owner ~= self and C.fcntl(fd, 1) >= 0 then
+	for fd, rec in pairs(M.fd_owner) do
+		if rec.sh ~= self and not fd_inherits(self, rec) and C.fcntl(fd, 1) >= 0 then
 			if not fa then
 				fa = ffi.new("uint8_t[1024]")
 				C.posix_spawn_file_actions_init(fa)
@@ -5008,6 +5027,7 @@ function Shell:stage_clone()
 		c[k] = type(v) == "table" and shallowcopy(v) or v
 	end
 	c.subdepth = (self.subdepth or 0) + 1 -- (a stage is a subshell)
+	c.clone_parent, c.clone_gen = self, M.fd_gen -- (the fds it inherits: M.fd_register)
 	c.iso_ctx, c.stage_pid, c.vpid, c.rpid = {}, tonumber(C.getpid()), nil, nil
 	if self.iso_ctx and #self.iso_ctx > 0 then -- (a subshell's virtual hard limits stay in force in its stages)
 		local vb = self.iso_vhard_base and shallowcopy(self.iso_vhard_base) or {}
