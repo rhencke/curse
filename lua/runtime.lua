@@ -1112,6 +1112,10 @@ do
 		C.curse_rt_cgt(3, ts)
 		return tonumber(ts.tv_sec) * 1000000 + tonumber(ts.tv_nsec) / 1000
 	end
+	function M.mono_usec() -- (CLOCK_MONOTONIC)
+		C.curse_rt_cgt(1, ts)
+		return tonumber(ts.tv_sec) * 1000000 + tonumber(ts.tv_nsec) / 1000
+	end
 end
 -- The FOREGROUND shell is time-sliced too while background jobs live (bash's jobs are
 -- processes the kernel runs alongside it): the same slice is armed for it, and at its
@@ -3004,6 +3008,9 @@ function Shell:exec_t(args)
 			M.fg_ended(self, pid, st[0])
 		end
 		if self.jobs and self.jobs[1] then -- (wait_for's notify_of_job_status: the others too)
+			if self.jobs_signalled then -- (time enough for SIGCHLD from a job just killed)
+				M.jobs_unskip(self)
+			end
 			M.jobs_poll(self)
 			M.jobs_notify(self)
 		end
@@ -5342,24 +5349,58 @@ end
 -- one a signal killed: jobs_notify, which deletes it), and the ones notified before go.
 -- sh.jobs_pending (set by job_add): some job may still end and need that.
 -- LINE: the line the reader is on then (its number in the report); nil: the current one.
--- A job process the shell has just signalled (kill): bash's reader takes the next line
--- before that process can have died and SIGCHLD reaped it — a few µs against its exit — so
--- `kill $!` then `wait $!` on the next line finds the job there to wait for (its death
--- reported by `wait`, not by the reader). The first line read after the kill leaves such a
--- job unpolled; the rest of the time a job that ended is seen as SIGCHLD would.
+-- A job process the shell has just signalled (kill) is still there for a moment: bash sees it
+-- die only when SIGCHLD reaps it, and its kill returns long before the process has run,
+-- taken the signal and exited (tens of µs: an idle CPU to wake, the exit itself) — bash's
+-- builtins on the rest of that line and its reader taking the next one are faster. So
+-- `kill %%; fg` (or `kill %%` then `fg` on the next line) finds the job running — fg prints
+-- its command and waits for it —, `kill %1; jobs` lists it Running, and `kill $!` then
+-- `wait $!` has its death reported by `wait`, not the reader. Measured on the oracle (5.2.21,
+-- 200-300 runs each): fg on the kill's line or the next finds it dead 0-1 in 200, a `jobs`
+-- listing on either 1 in 100. Its race is bash's own, rare either way; ours is decided the
+-- way bash nearly always decides it, not by how fast our dispatch runs: the signalled pids
+-- are left unpolled (jobs_poll's skip, M.jobs_skip) by fg/bg's and `jobs`' polls and the
+-- reader's, through the line after the kill's. What ends that — time in which bash would
+-- have had SIGCHLD — is the second line read after the kill, the shell waiting on a
+-- foreground child or a job (M.jobs_unskip), more than JOB_SIGNALLED_CPU_USEC of our own CPU
+-- spent since (builtin work — a loop — that bash, too, takes long enough over; CPU time is
+-- what a shell merely descheduled by a busy machine hasn't used), or JOB_SIGNALLED_USEC gone
+-- by (a `read -t`, a stall far past any dispatch: bash stalled that long hears SIGCHLD too).
+-- `kill`'s own poll never skips: a `while kill -0 $p; do :; done` must see the process go,
+-- as bash's SIGCHLD reaps it.
 function M.job_signalled(sh, pid, sig)
 	if sig ~= 0 and sh.jobs_pending then
 		local js = sh.jobs_signalled or {}
 		js[pid] = true
-		sh.jobs_signalled = js
+		sh.jobs_signalled, sh.jobs_signalled_read = js, nil
+		sh.jobs_signalled_cpu, sh.jobs_signalled_at = M.cpu_usec(), M.mono_usec()
 	end
+end
+M.JOB_SIGNALLED_CPU_USEC, M.JOB_SIGNALLED_USEC = 5000, 50000
+function M.jobs_skip(sh)
+	local js = sh.jobs_signalled
+	if js and (M.cpu_usec() - sh.jobs_signalled_cpu > M.JOB_SIGNALLED_CPU_USEC
+		or M.mono_usec() - sh.jobs_signalled_at > M.JOB_SIGNALLED_USEC) then
+		M.jobs_unskip(sh)
+		return nil
+	end
+	return js
+end
+function M.jobs_unskip(sh)
+	sh.jobs_signalled, sh.jobs_signalled_read = nil, nil
 end
 function M.jobs_line(sh, line)
 	if sh.jobs_waited then
 		M.jobs_cleanup_waited(sh)
 	end
-	local skip = sh.jobs_signalled
-	sh.jobs_signalled = nil
+	local skip = sh.jobs_signalled and M.jobs_skip(sh)
+	if skip then
+		if sh.jobs_signalled_read then -- (the second line read since the kill)
+			skip, sh.jobs_signalled, sh.jobs_signalled_read = nil, nil, nil
+		else
+			sh.jobs_signalled_read = true
+		end
+	end
 	if sh.jobs_pending then
 		M.jobs_poll(sh, skip)
 		local fl = sh.force_line
