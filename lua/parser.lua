@@ -3549,9 +3549,14 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs, xg, bq
 	-- Read one shell word, keeping quotes and $(( )) / ${ } / $( ) balanced. One loop reads
 	-- the whole word, inside "…" (q0: its opening quote) and out: an expansion is read the
 	-- same way in both — a $( … ) in "…" is syntax-checked and takes its here-document too.
+	local word_sub -- (a command-position NAME[ … ] whose subscript was already scanned: word())
 	local function word(stop_paren, stop_cmp)
 		ws()
 		local start, line0, lfix, ldq, q0 = i, line, 0, nil, nil
+		if word_sub and word_sub.at == i and word_sub.src == src then -- (NAME[ … ]: read whole)
+			i = word_sub.close + 1
+		end
+		word_sub = nil
 		while i <= n do
 			-- (a run of ordinary characters is part of the word: jump to the next one that
 			-- could matter — one find instead of a per-character pattern test)
@@ -5027,31 +5032,14 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs, xg, bq
 			end
 		end
 
-		-- At command position, `NAME[` with an UNCLOSED `[` is a syntax error in bash
-		-- ("unexpected EOF looking for matching `]'") — it began an array-assignment LHS
-		-- that never closed (try_assign already consumed real `NAME[..]=` assignments
-		-- and closed `NAME[..]` commands are left to fall through to the word/glob path).
+		-- At command position (bash's assignment_acceptable), a word that is a NAME so far then
+		-- `[` reads the subscript as parse_matched_pair's P_ARRAYSUB group — blanks, `;`, quotes
+		-- included — whether or not an `=` follows (`a[b c]x` is one word, a command name);
+		-- never closed: bash's "unexpected EOF while looking for matching `]'"
 		do
-			local bs = src:match("^[%a_][%w_]*()%[", i) -- offset of `[` if the word is NAME[
+			local bs = src:match("^[%a_][%w_]*()%[", i)
 			if bs then
-				local depth, j = 0, bs
-				while j <= n do
-					local ch = src:sub(j, j)
-					if ch == "[" then
-						depth = depth + 1
-					elseif ch == "]" then
-						depth = depth - 1
-						if depth == 0 then
-							break
-						end
-					elseif depth >= 1 and ch:match("[\n;&|]") then
-						break
-					end -- terminator before `]`
-					j = j + 1
-				end
-				if depth ~= 0 then
-					error("syntax error near `" .. (src:sub(i):match("^%S+") or "[") .. "'")
-				end
+				word_sub = { src = src, at = i, close = bracket_close(src, bs, false, true) }
 			end
 		end
 
