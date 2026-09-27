@@ -488,6 +488,10 @@ function M.loop_osr(sh, st)
 		sh.forstate[fid] = sh.forstate[st.id]
 		ok, err = pcall(M.run_compiled, mod, sh, mod.loopPc[fid], true)
 		sh.forstate[fid] = saved
+	elseif st.t == "forc" and mod.loopPc and mod.loopPc[1] then
+		-- a `for ((…))` the interpreter already initialized: resume at its condition (the
+		-- fragment's empty init would trace, and fire DEBUG, as `(( 1 ))`)
+		ok, err = pcall(M.run_compiled, mod, sh, mod.loopPc[1], true)
 	else
 		ok, err = pcall(M.run_compiled, mod, sh, nil, true)
 	end

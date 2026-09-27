@@ -339,6 +339,9 @@ do
 		if M.flush_stage_out then
 			M.flush_stage_out(sh)
 		end
+		if type(a) == "string" and M.co_fdwrite and M.co_fdwrite(2, a) then
+			return self
+		end
 		return real:write(a)
 	end
 	io.stderr = proxy
@@ -5482,6 +5485,41 @@ task_flush = function(t)
 		end
 	end
 	t.flushing = false
+end
+-- A diagnostic / set -x line to fd 2 while pipeline stages run in-process: written after
+-- POLLOUT in PIPE_BUF chunks (yielding, or pumping the stages from the main thread), as
+-- task_flush writes fd 1 — a blocking write to a full pipe whose reader is a later stage
+-- not yet started (`… 2>&1 | sort`) would stall the whole pipeline. false: no scheduler
+-- is live, the caller writes as usual.
+function M.co_fdwrite(fd, data)
+	local t = co_task()
+	if not t and not sched_live() then
+		return false
+	end
+	local p, off, len = ffi.cast("const char *", data), 0, #data
+	while off < len do
+		M.co_block(fd, POLLOUT)
+		local chunk = len - off
+		if chunk > 4096 then
+			chunk = 4096
+		end
+		local w = tonumber(C.curse_co_write(fd, p + off, chunk))
+		if w >= 0 then
+			off = off + w
+		else
+			local e = ffi.errno()
+			if e == 32 then -- EPIPE (SIGPIPE is blocked while the scheduler lives)
+				C.curse_co_sigtimedwait(_co_sigpipe, nil, _co_zero_ts)
+				if t and not (t.sh and t.sh.traps and t.sh.traps.SIGPIPE == "") then
+					error({ __curse_sigpipe = true }) -- (as SIGPIPE ends a forked stage)
+				end
+				return true
+			elseif e ~= 4 and e ~= 11 then -- not EINTR/EAGAIN: dropped, as a failed write
+				return true
+			end
+		end
+	end
+	return true
 end
 local function make_out(t)
 	local f = function(...)
@@ -14008,6 +14046,9 @@ function Shell:echo(...)
 	-- error (e.g. a full disk) is a write error -> status 1, like bash's sh_chkwrite.
 	local werr = false
 	if self.out == io.write then
+		if CO or sched_live() then -- (a redirected builtin in an in-process stage: no blocking flush
+			M.co_block(1, POLLOUT) -- into a full pipe whose reader hasn't run yet — a
+		end -- line fits the PIPE_BUF a POLLOUT pipe has room for)
 		local ok, m = io.flush()
 		if not ok then
 			werr, self.write_err, self.write_errmsg = true, true, m
@@ -14068,6 +14109,9 @@ function M.chkwrite(sh, name)
 			M.chkwrite_report(sh, name, w)
 		end
 		return not w
+	end
+	if CO or sched_live() then -- (in-process stages: see Shell:echo)
+		M.co_block(1, POLLOUT)
 	end
 	local ok, m = io.flush()
 	if ok then
@@ -14378,11 +14422,8 @@ end
 -- compiles. No statement re-interpretation (no I.exec_stmt): only resolve+call is shared,
 -- the words are compiled. xtrace mirrors the delegated path so `set -x` doesn't regress;
 -- $_ / PIPESTATUS / errexit stay with the emitted wrapper around this call.
-function M.call_dynamic_fn(sh, argv)
+function M.call_dynamic_fn(sh, argv) -- (the call site has traced it: set -x)
 	local I = require("interp")
-	if sh.opt_x then
-		M.xtrace(sh, argv)
-	end
 	return I.exec_simple(sh, argv, _noop)
 end
 

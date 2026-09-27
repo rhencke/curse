@@ -5491,13 +5491,17 @@ exec_stmt = function(sh, st, hook)
 			return s == "" and "1" or s
 		end
 		local function fdbg(slot)
+			local intrap = sh.in_trap and sh.in_trap > 0 and (sh.calldepth or 0) == sh.trap_calldepth
 			if sh.opt_x and st.src then -- (traced before its DEBUG: eval_arith_for_expr)
+				if not intrap then -- (under the `for` line — the step's too, not the body's last)
+					sh.cur_line = st.line
+				end
 				arith_trace(sh, stext(slot)) -- (bash keeps a trailing blank)
 			end
 			if sh.traps and sh.traps.DEBUG then
 				head(sh, st, "((" .. stext(slot) .. "))")
 			end
-			run_debug(sh, (sh.in_trap and sh.in_trap > 0 and (sh.calldepth or 0) == sh.trap_calldepth) and sh.cur_line or st.line)
+			run_debug(sh, intrap and sh.cur_line or st.line)
 		end
 		-- A slot whose arith failed to parse (`i='3'`) was deferred: bash reports the
 		-- error at RUNTIME and runs the loop zero (or partial) iterations, non-fatally.
