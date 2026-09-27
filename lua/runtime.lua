@@ -129,6 +129,11 @@ local function current_line(sh)
 		if M.INTERP_FRAMES[f] then
 			break -- the interpreter is innermost: its sh.cur_line is current
 		end
+		if line and f == M.source_run then
+			-- a compiled sourced file's line: the file labels it (sh.cur_source), not
+			-- the compiled function that ran the `source` (bash: BASH_SOURCE[0])
+			return line
+		end
 		local t = M.PCLINE[f]
 		if t then
 			if not line then
