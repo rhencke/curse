@@ -203,17 +203,48 @@ end
 -- and while it idles (reap_idle), promptly, so none lingers as a zombie. One STOPPED
 -- gets SIGHUP + SIGCONT now, as the kernel sends a group its shell's exit orphans.
 local function hangup_stopped_orphans()
+	-- (as the kernel does for an orphaned process group with a stopped member: only one of
+	-- its own — one in the worker's group is left stopped, as bash leaves one in its own —
+	-- and not one the script's exit already signalled: rt.jobs_exit_hangup)
+	local mine = rt.own_pgrp()
 	for pid in pairs(rt.internal_pids) do
-		local f = io.open("/proc/" .. pid .. "/stat", "r")
-		local st = f and f:read("*l")
-		if f then
-			f:close()
-		end
-		local state = st and st:match("^.*%) (%a)")
-		if state == "T" or state == "t" then
+		local state, pg = rt.proc_stat(pid)
+		if (state == "T" or state == "t") and pg ~= mine and not rt.exit_signalled[pid] then
 			C.kill(pid, 1)
 			C.kill(pid, 18)
 		end
+	end
+	rt.exit_signalled = {}
+end
+-- A worker about to exit with a STOPPED child in its own process group (a script's job,
+-- not job control: bash leaves it stopped) would orphan that group — and the kernel would
+-- HUP + CONT it. So it stays (its slot reads -1: busy, no client) until none is left.
+local hold_pf = ffi.new("struct curse_d_pollfd[1]")
+local function hold_stopped_children(ctx, slot)
+	local wp = tonumber(C.getpid())
+	local mine = rt.own_pgrp()
+	while true do
+		pcall(rt.reap_orphans)
+		local f = io.open("/proc/" .. wp .. "/task/" .. wp .. "/children", "r")
+		local kids = f and f:read("*a") or ""
+		if f then
+			f:close()
+		end
+		local held = false
+		for pid in kids:gmatch("%d+") do
+			local state, pg = rt.proc_stat(pid)
+			if (state == "T" or state == "t") and pg == mine then
+				held = true
+				break
+			end
+		end
+		if not held then
+			return
+		end
+		if ctx and slot then
+			ctx.busy[slot] = -1
+		end
+		C.curse_d_poll(hold_pf, 0, 100)
 	end
 end
 -- Idle with adopted children: wait for a connection in 50ms slices, reaping them as they
@@ -526,6 +557,7 @@ local function worker_main(lfd, my_uid, ctx, slot)
 		if cfd < 0 then
 			local e = ffi.errno()
 			if e == EAGAIN or e == EWOULDBLOCK then
+				hold_stopped_children(ctx, slot)
 				C._exit(WORKER_IDLE)
 			end
 			if e ~= EINTR then
@@ -585,6 +617,7 @@ local function worker_main(lfd, my_uid, ctx, slot)
 			end
 			ctx.busy[slot] = 0
 			if retire then
+				hold_stopped_children(ctx, slot)
 				C._exit(0) -- not WORKER_IDLE: the parent replenishes the pool
 			end
 			served = served + 1
