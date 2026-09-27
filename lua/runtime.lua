@@ -692,7 +692,11 @@ function Shell:localVar(name, has_init)
 			saved[name] = { box = te.box, seq = self.vseq, absorbed = true, env = te.env }
 			te.consumed = true
 		else
-			saved[name] = { box = self.vars[name] or false, seq = self.vseq }
+			local ob = self.vars[name]
+			if name == "SECONDS" and (ob == nil or ob.dyn) then -- (make_local_variable's
+				self:special_get(name) -- find_variable: get_seconds gives the global its -i)
+			end
+			saved[name] = { box = ob or false, seq = self.vseq }
 		end
 		if te and not has_init then -- inherit the tempenv value
 			local b = self.vars[name]
@@ -2946,7 +2950,8 @@ end
 -- whole truth (eval/trap/source fragments, line mode, env-imported functions) it guards
 -- every pure call site with "none of these names is a function now" (emit's dyn_guard),
 -- falling back to capture_src. The exact rule — pure iff:
---  * the text never names $BASHPID/$RANDOM (per-subshell values);
+--  * the text never names $BASHPID/$RANDOM (per-subshell values) or $SECONDS (a read
+--    gives it -i and a new value_cell: get_seconds);
 --  * every command (through && || and pipelines) is a simple command with no
 --    assignment, array argument or redirection (a builtin's redirected output needs the
 --    fd-level capture), whose name is one literal that is no function in `fns` and is
@@ -3028,7 +3033,7 @@ local function cmdsub_pure_st(st, fns, vnames)
 	return true
 end
 function M.cmdsub_pure(stmts, fns, src, vnames)
-	if src:find("BASHPID", 1, true) or src:find("RANDOM", 1, true) then
+	if src:find("BASHPID", 1, true) or src:find("RANDOM", 1, true) or src:find("SECONDS", 1, true) then
 		return false
 	end
 	for _, st in ipairs(stmts) do
@@ -3432,6 +3437,7 @@ do -- (a block of its own: the main chunk is at LuaJIT's 200-local limit)
 -- shallow copy for the body. (Deeper state — vars, the dynamic scopes, params, completion
 -- specs, history, cwd — is handled below.)
 local SUB_KEEP = { "hashpath", "tcwd", "random_plain", "shellopts_exported", "argv0", "sec_off",
+	"sec_int", "sec_cell", "start_time",
 	"subsh_off", "hosts", "nparams", "params", "getopts_state", "complete", "savedstack", "tenv" }
 local SUB_COPY = { "shopt", "functions", "dirstack", "hashcache", "bav", "fn_ro", "unset_specials",
 	"disabled_builtins" }
@@ -8045,14 +8051,34 @@ function M.dyn_assign(sh, dn, s, b)
 		if ctx and not ctx.rand then
 			ctx.rand = { sh.rseed, sh.rlast, sh.rpid }
 		end
-		local ok, v = pcall(M.int_value, sh, s)
+		local ok, v = pcall(M.arith_str, sh, s)
 		if not ok then
+			if type(v) == "table" and (v.__curse_matherr or v.__curse_experr) then
+				return true -- (evalexp's own longjmp: expok = 0, no reseed; the line goes on)
+			end
 			error(v, 0)
 		end
 		M.random_seed(sh, tonumber(v))
-	elseif k == "seconds" then -- (assign_seconds: an integer var's value is evaluated)
-		local n = b and b.int and tonumber(M.int_value(sh, s)) or legal_number(s) or 0
-		sh.sec_off = n - (os.time() - (sh.start_time or os.time()))
+	elseif k == "seconds" then
+		-- (assign_seconds: SECONDS is an integer variable once it has been READ — get_seconds'
+		-- set_int_value(…, 1) — or given -i, and then the value is evalexp'd: an overflowing
+		-- literal wraps mod 2^64, and an error is reported but only zeroes the base; before
+		-- that it is legal_number'd (ERANGE: 0). The clock restarts at the assignment.)
+		local n
+		if (b and b.int) or sh.sec_int then
+			local ok, v = pcall(M.arith_str, sh, s)
+			if ok then
+				n = v
+			elseif type(v) == "table" and (v.__curse_matherr or v.__curse_experr) then
+				n = 0 -- (evalexp's own longjmp: the message is out, expok = 0)
+			else
+				error(v, 0)
+			end
+		else
+			n = M.legal_i64(s) or 0
+		end
+		sh.sec_off, sh.start_time = i64(n), os.time()
+		sh.sec_cell = i64_to_str(sh.sec_off) -- (set_int_value: value_cell, what += appends to)
 	elseif k == "subshell" then -- (assign_subshell: subshell_environment's level)
 		local n = b and b.int and tonumber(M.int_value(sh, s)) or legal_number(s) or 0
 		sh.subsh_off = n - ((sh.subdepth or 0) + M.fork_depth)
@@ -8164,8 +8190,18 @@ function Shell:special_get(name)
 	if name == "HOSTTYPE" then
 		return "x86_64"
 	end
-	if name == "SECONDS" then
-		return tostring(os.time() - (self.start_time or os.time()) + (self.sec_off or 0))
+	if name == "SECONDS" then -- (get_seconds: the read gives SECONDS the integer attribute)
+		local b = self.vars.SECONDS
+		if b then
+			b.int = true
+		else
+			self.sec_int = true
+		end
+		local d = os.time() - (self.start_time or os.time())
+		local o = self.sec_off
+		local v = o and i64_to_str(o + d) or tostring(d) -- (intmax_t: wraps)
+		self.sec_cell = v
+		return v
 	end
 	if name == "LINENO" then
 		if self.ldrift and (not self.cur_source or self.cur_source == self.main_source) then
@@ -9209,6 +9245,9 @@ function Shell:aset(name, n, acmd)
 	end
 	local b = self.vars[dn]
 	if b == nil or b.dyn then
+		if dn == "SECONDS" then -- (expr.c's readtok read the operand first: get_seconds' -i)
+			self:special_get(dn)
+		end
 		if M.DYN_ASSIGN[dn] and M.dyn_assign(self, dn, i64_to_str(i64(n)), b) then
 			return i64(n) -- (`(( RANDOM = 42 ))` seeds: a live dynamic variable's hook)
 		end
@@ -13102,7 +13141,16 @@ function M.append_scalar(sh, name, value)
 		end
 		error({ __curse_exit = 1, __curse_lineabort = true })
 	end
-	if b and b.arr then
+	if (b == nil or b.dyn) and sh:deref(name) == "SECONDS" and not (sh.unset_specials and sh.unset_specials.SECONDS) then
+		-- (make_variable_value appends to value_cell — the value last assigned or READ, not
+		-- the clock's — evaluating both sides when SECONDS is integer; then assign_seconds)
+		local old = sh.sec_cell or ""
+		if (b and b.int) or sh.sec_int then
+			M.dyn_assign(sh, "SECONDS", i64_to_str(M.int_value(sh, old) + M.int_value(sh, value)), b)
+		else
+			M.dyn_assign(sh, "SECONDS", old .. value, b)
+		end
+	elseif b and b.arr then
 		sh:array_set(name, require("interp")._int.array_key(sh, name, "0"), value, true)
 	elseif b and b.int then -- (the old value is evaluated too, as bash does)
 		sh:aset(name, M.int_value(sh, sh:get(name)) + M.int_value(sh, value))

@@ -3280,8 +3280,9 @@ local function fmt_decl(sh, name)
 	end
 	if (b == nil or (b.dyn and b.s == nil and b.n == nil)) and DYN_SCALARS[name]
 		and not (sh.unset_specials and sh.unset_specials[name]) then
+		local v = sh:get(name) or "" -- (read first: get_seconds gives SECONDS its -i)
 		local fl = b and sh:attr_string(name) or DYN_SCALARS[name]
-		return "declare -" .. (fl == "" and "-" or fl) .. " " .. name .. "=" .. decl_quote(sh:get(name) or "")
+		return "declare -" .. (fl == "" and "-" or fl) .. " " .. name .. "=" .. decl_quote(v)
 	end
 	if b == nil then
 		return nil
