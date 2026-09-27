@@ -5265,13 +5265,17 @@ exec_stmt = function(sh, st, hook)
 		return
 	end
 	-- (a function definition leaves the line alone — bash)
-	if st.line and t ~= "funcdef" and not (sh.in_trap and sh.in_trap > 0 and (sh.calldepth or 0) == sh.trap_calldepth) then
+	if st.line and t ~= "funcdef" then
 		-- a simple command's line is where its SECOND token ended (bash's yacc lookahead:
 		-- `nope "x<NL>y"` errors on line 2); cline records that
-		sh.cur_line = (t == "simple" or t == "assign" or t == "assignlist") and st.cline or st.line
-		sh.cur_cline = st.cline or st.line -- (where its $(…) bodies number from)
-	end -- $LINENO: frozen at the trapped line for the trap's own commands (not in a
-	-- function the trap calls, whose lines count as usual — bash)
+		local ln = (t == "simple" or t == "assign" or t == "assignlist") and st.cline or st.line
+		if not (sh.in_trap and sh.in_trap > 0 and (sh.calldepth or 0) == sh.trap_calldepth) then
+			sh.cur_line = ln
+			sh.cur_cline = st.cline or st.line -- (where its $(…) bodies number from)
+		elseif sh.trap_base then -- a trap's own commands: its handler's line k is the trapped
+			sh.cur_line = sh.trap_base + ln - 1 -- line + k-1 (parse_and_execute counts on from
+		end -- it — not in a function the trap calls, whose lines count as usual — bash)
+	end
 	if t == "assign" then
 		local pnf = sh.procsub_files and #sh.procsub_files or 0
 		rt.assign_full(sh, st)
@@ -5977,7 +5981,8 @@ end
 rt.INTERP_FRAMES[run_trap_mod] = true
 run_trap = function(sh, code)
 	local exited, savedline, rret = false, sh.cur_line, nil
-	local saved_tcd, saved_ts = sh.trap_calldepth, sh.trap_saved
+	local saved_tcd, saved_ts, saved_tb = sh.trap_calldepth, sh.trap_saved, sh.trap_base
+	sh.trap_base = sh.cur_line or 1 -- (the handler's first line: the trapped one)
 	sh.trap_calldepth = sh.calldepth or 0
 	sh.trap_saved = sh.status -- (bash's trap_saved_exit_value: see rt.return_default)
 	sh.in_trap = (sh.in_trap or 0) + 1
@@ -6048,7 +6053,7 @@ run_trap = function(sh, code)
 	if psa and sh.vars.PIPESTATUS == psb then
 		psb.arr = psa
 	end
-	sh.trap_calldepth, sh.trap_saved = saved_tcd, saved_ts
+	sh.trap_calldepth, sh.trap_saved, sh.trap_base = saved_tcd, saved_ts, saved_tb
 	sh.cur_line = savedline
 	if not ok then
 		if type(err) == "table" and err.__curse_discard then -- (bash's DISCARD: unwinds the
@@ -6115,9 +6120,13 @@ fire_err_trap = function(sh)
 	if h and h ~= "" and not sh.in_err_trap and errscope then
 		sh.in_err_trap = true
 		local saved = sh.status
-		local _, rret = run_trap(sh, h)
+		local exited, rret = run_trap(sh, h)
+		local xst = sh.status
 		sh.status = saved
 		sh.in_err_trap = false
+		if exited then -- `exit` in the ERR trap exits the shell (_run_trap_internal)
+			error({ __curse_exit = xst })
+		end
 		if rret then -- `trap 'return N' ERR`: the failing command's function returns N
 			error({ __curse_return = rret })
 		end
