@@ -6899,4 +6899,5 @@ M._int = {
 }
 
 rt.INTERP_FRAMES[exec_stmt] = true -- (error prefixes: sh.cur_line is current under it)
+rt.SRC_FRAMES[run_function], rt.SRC_FRAMES[rt.source_run] = true, true -- (they set sh.cur_source)
 return M

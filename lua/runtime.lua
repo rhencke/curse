@@ -115,6 +115,7 @@ function M.pcline(f, t, name)
 	M.PCNAME[f] = name
 end
 M.INTERP_FRAMES = setmetatable({}, { __mode = "k" }) -- interp functions that keep sh.cur_line
+M.SRC_FRAMES = setmetatable({}, { __mode = "k" }) -- the calls that set sh.cur_source (a function's, source's)
 -- (second result: the innermost compiled shell function running, if any — its file
 -- labels the message, as interp's run_function makes it sh.cur_source)
 local function current_line(sh)
@@ -126,8 +127,24 @@ local function current_line(sh)
 			break
 		end
 		local f = info.func
-		if M.INTERP_FRAMES[f] then
-			break -- the interpreter is innermost: its sh.cur_line is current
+		if M.INTERP_FRAMES[f] then -- the interpreter is innermost: its sh.cur_line is current
+			if line then
+				break
+			end
+			-- ...and the file is the innermost compiled function's it runs under (a compiled
+			-- call doesn't set sh.cur_source: `eval` text interpreted in a compiled function
+			-- is labelled by the function's file, as bash's BASH_SOURCE[0] is) — unless a
+			-- function call or a `source` in between set sh.cur_source itself (SRC_FRAMES)
+			for l2 = level + 1, 200 do
+				local i2 = getinfo(l2, "f")
+				if not i2 or M.SRC_FRAMES[i2.func] then
+					break
+				end
+				if M.PCNAME[i2.func] then
+					return sh.cur_line or 0, M.PCNAME[i2.func]
+				end
+			end
+			break
 		end
 		if line and f == M.source_run then
 			-- a compiled sourced file's line: the file labels it (sh.cur_source), not
