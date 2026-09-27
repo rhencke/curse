@@ -196,6 +196,42 @@ local function apply_env(env)
 	C.environ = ffi.cast("char **", arr)
 end
 
+-- The script's children that outlive it, adopted into rt.internal_pids when the request
+-- ends (see serve_request): a job still running, or the foreground external a signal
+-- ended the script in the middle of (bash would have died, leaving it to init). This
+-- worker stays their parent, so it reaps them — at every later request's reap points,
+-- and while it idles (reap_idle), promptly, so none lingers as a zombie. One STOPPED
+-- gets SIGHUP + SIGCONT now, as the kernel sends a group its shell's exit orphans.
+local function hangup_stopped_orphans()
+	for pid in pairs(rt.internal_pids) do
+		local f = io.open("/proc/" .. pid .. "/stat", "r")
+		local st = f and f:read("*l")
+		if f then
+			f:close()
+		end
+		local state = st and st:match("^.*%) (%a)")
+		if state == "T" or state == "t" then
+			C.kill(pid, 1)
+			C.kill(pid, 18)
+		end
+	end
+end
+-- Idle with adopted children: wait for a connection in 50ms slices, reaping them as they
+-- end, until none is left (then the plain blocking accept).
+local reap_pf = ffi.new("struct curse_d_pollfd[1]")
+local function reap_idle(lfd)
+	while next(rt.internal_pids) do
+		pcall(rt.reap_orphans)
+		if not next(rt.internal_pids) then
+			return
+		end
+		reap_pf[0].fd, reap_pf[0].events, reap_pf[0].revents = lfd, 1, 0
+		if C.curse_d_poll(reap_pf, 1, 50) > 0 then
+			return -- (a connection: serve it; the next idle time goes on reaping)
+		end
+	end
+end
+
 -- Serve ONE request on the caller's fds, reply with the status, and RETURN so the
 -- persistent worker can serve the next (no per-request fork or _exit). Everything a
 -- script can leave in PROCESS state is reset — the fork model got this for free; we
@@ -204,8 +240,6 @@ end
 -- request below, and shell VARIABLE state is a brand-new Shell.new — so nothing bleeds
 -- between requests (torture-tested: 8000 varied requests, zero state/fd leaks).
 local function serve_request(cfd, req, fds, ctx)
-	-- first, our pid (negated): the client forwards the signals sent to it here
-	C.write(cfd, ffi.new("int32_t[1]", -ctx.worker_pid), 4)
 	rt.path_epoch = rt.path_epoch + 1 -- (the command-lookup cache re-checks PATH once per request)
 	if fds[1] then
 		C.dup2(fds[1], 0)
@@ -269,6 +303,10 @@ local function serve_request(cfd, req, fds, ctx)
 	end
 	rt.startup_ignored(sh, req.sigign)
 	rt.sig_setup(sh) -- (SIGQUIT ignored; the terminating signals caught: rt.termsig)
+	-- now our pid (negated): the client forwards the signals sent to it here. Not before
+	-- the script's dispositions are in place: a signal the client holds until then would
+	-- otherwise reach a worker with no script to take it (__curse_sigrun unset), and be lost.
+	C.write(cfd, ffi.new("int32_t[1]", -ctx.worker_pid), 4)
 	-- A Lua error escaping the run is a curse BUG: report it on the request's stderr
 	-- (status 1) instead of failing silently.
 	local ok = xpcall(function()
@@ -348,6 +386,7 @@ local function serve_request(cfd, req, fds, ctx)
 		end
 	end
 	pcall(rt.reap_orphans) -- (children no job waits for any more: never zombies on the worker)
+	hangup_stopped_orphans() -- (…and the stopped ones don't stay stopped: see reap_idle)
 	-- SCRUB per-request process state (the fork boundary used to do this):
 	C.umask(ctx.umask) -- a script's `umask` doesn't persist
 	C.sigprocmask(2, ctx.empty_sigset, nil) -- SIG_SETMASK: clear any trap-blocked signals
@@ -482,6 +521,7 @@ local function worker_main(lfd, my_uid, ctx, slot)
 			end
 			pcall(Tier.compile_deferred, true)
 		end
+		reap_idle(lfd)
 		local cfd = C.accept(lfd, nil, nil)
 		if cfd < 0 then
 			local e = ffi.errno()
