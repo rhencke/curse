@@ -5659,6 +5659,72 @@ do
 	end
 end
 
+-- Words of `ext args… &` that may be expanded in the PARENT (bash expands them in the
+-- child) so the job can be spawned directly (Shell:spawn_bg): nothing with a side effect
+-- or a per-process value may move — $(…), `…`, <(…), ${x:=…}/${x:?…}, an assigning
+-- $((…)) or subscript, $RANDOM (the parent's sequence), $BASHPID/$! /$_ — and an operand
+-- word holding an expansion of its own is judged unsafe. Both tiers ask this (emit at
+-- compile time, the interpreter per run), so `&` takes the same path everywhere.
+local BG_PURE_PEXP = { [""] = 1, ["-"] = 1, [":-"] = 1, ["+"] = 1, [":+"] = 1, ["#"] = 1, ["##"] = 1,
+	["%"] = 1, ["%%"] = 1, ["/"] = 1, ["//"] = 1, ["^"] = 1, ["^^"] = 1, [","] = 1, [",,"] = 1,
+	["~"] = 1, ["~~"] = 1, len = 1 }
+local BG_IMPURE_VAR = { RANDOM = 1, SRANDOM = 1, BASHPID = 1 }
+local function bg_pure_arith(e)
+	if type(e) ~= "table" then
+		return true
+	end
+	local k = e.k
+	if k == "num" or k == "param" then
+		return true
+	elseif k == "var" then
+		return not BG_IMPURE_VAR[e.name] and (not e.idxraw or e.idxraw:match("^[%w_]*$") ~= nil)
+	elseif k == "bin" or k == "un" or k == "tern" then
+		return bg_pure_arith(e.e) and bg_pure_arith(e.l) and bg_pure_arith(e.r)
+			and bg_pure_arith(e.c) and bg_pure_arith(e.a) and bg_pure_arith(e.b)
+	end
+	return false -- (asgn/pre/post/comma/xpand/parse errors: the child's to evaluate)
+end
+-- (an operand word: plain text and $name/${name} references only)
+local function bg_pure_operand(s)
+	if s:find("`", 1, true) then
+		return false
+	end
+	local bad = false
+	s = s:gsub("%$({?)([%a_][%w_]*)(}?)", function(o, name, c)
+		if (o == "{") ~= (c == "}") or BG_IMPURE_VAR[name] then
+			bad = true
+		end
+		return ""
+	end)
+	return not bad and not s:find("$", 1, true)
+end
+function M.bg_pure_words(words)
+	for _, w in ipairs(words) do
+		for _, pt in ipairs(w.parts or {}) do
+			if pt.cmdsub or pt.procsub or pt.backtick or pt.arithast or pt.special == "!" or pt.special == "_"
+				or (pt.var and BG_IMPURE_VAR[pt.var]) then
+				return false
+			end
+			if pt.arith then
+				local ok, a = pcall(require("parser").arith, pt.arith)
+				if not ok then
+					require("parser").trap_flow(a)
+				end
+				if not (ok and bg_pure_arith(a)) then
+					return false
+				end
+			end
+			local pe = pt.pexp
+			if pe and (not BG_PURE_PEXP[pe.op or ""] or BG_IMPURE_VAR[pe.name]
+				or (pe.index and not pe.index:match("^[%w_@*]*$"))
+				or (pe.arg and not bg_pure_operand(pe.arg))) then
+				return false
+			end
+		end
+	end
+	return true
+end
+
 -- `ext args… &` where the args are side-effect-free: the shell already built argv, so
 -- SPAWN the job directly (vfork-fast, stdin </dev/null) — no background task at all.
 -- Returns false (the caller runs it as a background task instead) when it can't

@@ -7195,11 +7195,6 @@ H.pipeline = function(cx, st, after)
 	return p
 end
 
--- ${…} operators with no side effect and no error output (safe to expand in the PARENT
--- for a spawned `ext args &`): plain, defaults/alternates, trims, replacements, case ops
-local BG_PURE_PEXP = { [""] = 1, ["-"] = 1, [":-"] = 1, ["+"] = 1, [":+"] = 1, ["#"] = 1, ["##"] = 1,
-	["%"] = 1, ["%%"] = 1, ["/"] = 1, ["//"] = 1, ["^"] = 1, ["^^"] = 1, [","] = 1, [",,"] = 1,
-	["~"] = 1, ["~~"] = 1 }
 -- statement handler: background (split out of flatten_stmt; see H)
 H.background = function(cx, st, after)
 	-- cmd & : fork, run the COMPILED command in the child; the parent records $! + the
@@ -7246,18 +7241,7 @@ H.background = function(cx, st, after)
 	-- raise while expanding (set -u) or a spawn the runtime declines takes the fork path.
 	local spawn = nil
 	if ext and not sc.redirs and not sc.assigns then
-		local pure = true
-		for _, w in ipairs(sc.words) do
-			for _, pt in ipairs(w.parts or {}) do
-				if pt.cmdsub or pt.procsub or pt.backtick or pt.arithast
-					or (pt.arith and (not safe_arith(pt.arith) or arith_side_effect(safe_arith(pt.arith))))
-					or (pt.pexp and not BG_PURE_PEXP[pt.pexp.op or ""])
-					or pt.special == "!" or pt.special == "_"
-				then
-					pure = false
-				end
-			end
-		end
+		local pure = require("runtime").bg_pure_words(sc.words)
 		if pure then
 			local builder = field_argv(sc.words, 1, cx.lifted, "rt.cstr(%s)")
 			if builder then

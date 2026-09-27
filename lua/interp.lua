@@ -5750,14 +5750,29 @@ exec_stmt = function(sh, st, hook)
 		local dtext = require("deparse").command_text(st.cmd) -- (bash prints the job as print_cmd.c does)
 		local cmdstr = (dtext ~= "" and dtext) or st.text
 			or (c1 and c1.words and c1.words[1] and c1.words[1].parts[1] and c1.words[1].parts[1].lit) or "job"
-		local cmd = st.cmd
-		local run = rt.bg_tail_stmt(cmd)
-		rt.env_rebuilt(sh) -- (execute_simple_command's, before the fork)
-		local job = sh:bg_launch(function(ssh)
-			exec_stmt(ssh, run, SUBHOOK)
-		end, cmdstr, cmd.t == "subshell", cmd.t == "simple")
-		if cmd.t == "pipeline" and job and job.g then
-			rt.job_mark_pipe(job) -- (a pipeline job: `kill %N` reaches its every stage)
+		local cmd, spawned = st.cmd, false
+		-- `ext args… &` with PURE words and no redirects/assignments: expand argv here and
+		-- spawn the program as the job (rt: bg_pure_words, Shell:spawn_bg — the compiled
+		-- tier's path): $! is its real pid. A raise while expanding (set -u) or a spawn the
+		-- runtime declines (a function/builtin, xtrace, …) runs it as a task instead.
+		if cmd.t == "simple" and cmd.words and cmd.words[1] and not cmd.redirs and not cmd.assigns
+			and rt.bg_pure_words(cmd.words) then
+			local args = {}
+			local ok, err = pcall(expand_args, sh, cmd, args, false)
+			if not ok then
+				P.trap_flow(err)
+			end
+			spawned = ok and sh:spawn_bg(args, cmdstr)
+		end
+		if not spawned then
+			local run = rt.bg_tail_stmt(cmd)
+			rt.env_rebuilt(sh) -- (execute_simple_command's, before the fork)
+			local job = sh:bg_launch(function(ssh)
+				exec_stmt(ssh, run, SUBHOOK)
+			end, cmdstr, cmd.t == "subshell", cmd.t == "simple")
+			if cmd.t == "pipeline" and job and job.g then
+				rt.job_mark_pipe(job) -- (a pipeline job: `kill %N` reaches its every stage)
+			end
 		end
 		sh.status = 0
 	elseif t == "coproc" then
