@@ -883,7 +883,7 @@ local function fnwrap(cmd, line, s)
 	-- in its frame, and `return N` there parks N in sh.fret so the trap sees the $? from
 	-- before it (rt.fn_return); a top-level one is hidden from the callee (rt.debug_enter)
 	if EF.has_return then
-		post = ("; rt.fn_return(sh, %q)"):format(cmd)
+		post = ("; rt.fn_return(sh, %q)"):format(cmd) .. post -- (then pop_context's sv_ifs)
 	end
 	if EF.funcstack then
 		pre = ("sh:enterFunc(%q, %d); "):format(cmd, line or 0)
