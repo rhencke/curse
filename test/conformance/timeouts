@@ -12,3 +12,4 @@ bash      ifs-posix.tests 30     # ~3.3s of pure CPU (6,800 IFS-splitting checks
 cases     2536-bg-launch-order.sh 40  # ~3.9s of bash CPU: its busy-work is a quadratic ${x//0/y}, and that
                                  # ~20ms head start per round is what keeps bash's two `&` children in
                                  # order (${x^^} instead made the ORACLE race: "out of order: 24")
+cases     2710-printf-huge-width.sh 30 # ~3.3s: bash writes ~3.5 GiB of `*`-width padding (INT_MAX-clamped widths) to /dev/null
