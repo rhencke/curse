@@ -5324,12 +5324,26 @@ end
 -- one a signal killed: jobs_notify, which deletes it), and the ones notified before go.
 -- sh.jobs_pending (set by job_add): some job may still end and need that.
 -- LINE: the line the reader is on then (its number in the report); nil: the current one.
+-- A job process the shell has just signalled (kill): bash's reader takes the next line
+-- before that process can have died and SIGCHLD reaped it — a few µs against its exit — so
+-- `kill $!` then `wait $!` on the next line finds the job there to wait for (its death
+-- reported by `wait`, not by the reader). The first line read after the kill leaves such a
+-- job unpolled; the rest of the time a job that ended is seen as SIGCHLD would.
+function M.job_signalled(sh, pid, sig)
+	if sig ~= 0 and sh.jobs_pending then
+		local js = sh.jobs_signalled or {}
+		js[pid] = true
+		sh.jobs_signalled = js
+	end
+end
 function M.jobs_line(sh, line)
 	if sh.jobs_waited then
 		M.jobs_cleanup_waited(sh)
 	end
+	local skip = sh.jobs_signalled
+	sh.jobs_signalled = nil
 	if sh.jobs_pending then
-		M.jobs_poll(sh)
+		M.jobs_poll(sh, skip)
 		local fl = sh.force_line
 		sh.force_line = line or fl
 		M.jobs_notify(sh)
@@ -5348,7 +5362,7 @@ end
 -- background child that has ended is reaped and its job marked done; an in-process job
 -- (j.g) is done once its task group is. A simple in-process job's external carries the
 -- wait status (its signal: t.sh.xproc).
-function M.jobs_poll(sh)
+function M.jobs_poll(sh, skip) -- (skip: pids left unpolled — M.job_signalled)
 	if next(M.internal_pids) then
 		M.reap_orphans()
 	end
@@ -5360,7 +5374,7 @@ function M.jobs_poll(sh)
 				if j.g.done then
 					M.job_done_g(sh, j)
 				end
-			elseif j.pid > 0 and not (sh.foreign_pids and sh.foreign_pids[j.pid]) then
+			elseif j.pid > 0 and not (sh.foreign_pids and sh.foreign_pids[j.pid]) and not (skip and skip[j.pid]) then
 				sb = sb or ffi.new("int[1]")
 				if C.waitpid(j.pid, sb, 1) == j.pid then -- WNOHANG
 					j.done, j.status = true, M.wexit(sb[0])

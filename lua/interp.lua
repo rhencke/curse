@@ -6476,8 +6476,8 @@ end
 -- Run one logical line (a parser group) the way the shell runs its own input.
 local function run_group(sh, lg, hook, k)
 	sh.cmd_number = (sh.cmd_number or 0) + 1 -- (the prompt's \#)
-	if sh.jobs_waited or sh.jobs_pending then -- (reading a line: notify_and_cleanup — rt.jobs_line)
-		rt.jobs_line(sh, lg.rline)
+	if not lg.jobs_read and (sh.jobs_waited or sh.jobs_pending) then -- (reading a line:
+		rt.jobs_line(sh, lg.rline) -- notify_and_cleanup — rt.jobs_line; run_lazy's before the parse)
 	end
 	-- bash parses a whole LOGICAL LINE (a `simple_list` up to a top-level newline)
 	-- before executing any of it, so a syntax error ANYWHERE on the line means the
@@ -6719,11 +6719,20 @@ function M.run_lazy(sh, src, hook, line1)
 				run_history_lines(sh, src, line1 or 1, hook, k)
 				return
 			end
+			local eline -- (the previous group's last line)
 			while true do
+				-- bash's shell_getc notifies of (and cleans up) ended jobs as it starts to
+				-- READ the next line, before parsing it: here too — a job the last command
+				-- killed isn't given the time the parse takes to be seen dead (rt.jobs_line)
+				local jr = eline and (sh.jobs_waited or sh.jobs_pending) and true
+				if jr then
+					rt.jobs_line(sh, eline + 1)
+				end
 				local lg = nextf()
 				if lg == nil then
 					break
 				end
+				lg.jobs_read, eline = jr, lg.eline
 				k = run_group(sh, lg, hook, k)
 				-- set -t (onecmd): the reader's loop ends after the command it read and ran
 				-- (bash's reader_loop: just_one_command) — not a -c string's
