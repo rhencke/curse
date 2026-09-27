@@ -133,6 +133,7 @@ local function emit_opts(mode, o)
 	o.trap_lc = mode:find("L", 1, true) ~= nil
 	return o
 end
+M.emit_opts = emit_opts -- (tools/delegate-census.lua sweeps every mode through it)
 -- With alias expansion on, a fragment's text parses with the live alias table (its own
 -- unconditional alias commands then apply from their next line, as the reader does):
 -- the table's signature keys the compile. Memoized per table + change count (alias_gen),
@@ -298,8 +299,16 @@ end
 -- written back — unless a synced call was out (sh._sy above its entry value: the callee,
 -- which works on sh, may have changed them there, and sh is then the live copy).
 local dgetinfo, dgetlocal = debug.getinfo, debug.getlocal
+-- sh._ff belongs to the module running it: a nested fragment's markers write their own
+-- (its retry resumes there), and the outer module's is back when the fragment leaves — by
+-- return or by error — or the outer retry would jump to a pc of the fragment's numbering.
+-- A retry never re-enters without progress: every resume enters through a statement marker,
+-- which moves sh._ff on — an abort with sh._ff still where the last resume went is raised.
+-- In a subshell environment a line abort out of eval/source/trap text isn't contained: bash's
+-- parse_and_execute DISCARD jumps to the subshell's top level, which ends it, status 1.
 function M.run_compiled(mod, sh, pc, nested)
 	local pd0, cd0, fs0, ne0 = sh.pd, sh.calldepth, sh.funcstack and #sh.funcstack or 0, sh.noerr
+	local ffo, lastff = sh._ff, false
 	local lrun, lupv, grabbed = mod.lrun, mod.lupv, nil
 	local handler = (lrun or lupv) and function(e)
 		if lrun and type(e) == "table" and e.__curse_lineabort then
@@ -332,6 +341,9 @@ function M.run_compiled(mod, sh, pc, nested)
 			ok, err = pcall(mod.run, sh, pc)
 		end
 		if ok then
+			if nested then
+				sh._ff = ffo
+			end
 			return
 		end
 		if type(err) == "table" and err.__curse_dbgskip and err.cfg == "run" then
@@ -360,9 +372,17 @@ function M.run_compiled(mod, sh, pc, nested)
 				end
 			end
 			sh._sy, grabbed = sy0, nil
-			if nested and err.__curse_discard then
+			if nested and (err.__curse_discard or rt.in_subshell(sh)) or sh._ff == lastff then
+				if nested then
+					sh._ff = ffo
+				end
+				if nested and not err.__curse_discard and rt.in_subshell(sh) then
+					sh.status = 1
+					error({ __curse_exit = 1 }, 0)
+				end
 				error(err, 0)
 			end
+			lastff = sh._ff
 			rt.posix_arith_fatal(sh, err)
 			rt.line_aborted(sh, not nested and err.__curse_badusage and not sh.opt_c and 2 or 1, pf0) -- (a failed ${x:=w})
 			local sp = not nested and mod.lgspan and mod.lgspan[sh._ff]
@@ -371,6 +391,9 @@ function M.run_compiled(mod, sh, pc, nested)
 			end
 			pc = sh._ff
 		else
+			if nested then
+				sh._ff = ffo
+			end
 			error(err)
 		end
 	end

@@ -1838,17 +1838,36 @@ function M.fd_rewind(fd, n)
 end
 -- A file the shell itself reads whole (`source`, `$(< file)`): like io.open(path, "r"),
 -- but a FIFO whose writer may be in this process is read through M.ropen + M.co_block.
-function M.open_read(path)
+-- Returns the file, or nil + errno + a hold. `retry_eintr` false (`source`, `$(< f)` —
+-- bash's _evalfile / subst.c open without redir_open's retry): a trapped signal that
+-- interrupts the open of the shell itself fails it with EINTR, and its trap is HELD — it
+-- runs once the caller has reported the failure and called M.open_release(sh, hold)
+-- (bash: the handler only marks it pending; the diagnostic comes first). (In a job's
+-- task the open still waits on: its signals arrive as SIGMARK, and run meanwhile.)
+function M.open_read(path, retry_eintr, sh)
 	M.rd_gen = M.rd_gen + 1 -- (`source /dev/stdin`, `$(< /dev/stdin)`: reads a shared input)
+	local held = not retry_eintr and M.fg_hold_enter()
 	if not (CO or sched_live()) or C.curse_rt_stat(path, _ropen_st) ~= 0
 		or bit.band(ffi.cast("uint32_t *", _ropen_st + 24)[0], 0xF000) ~= 0x1000 then
 		local f, _, en = io.open(path, "r")
-		return f, en -- (nil, errno)
+		while not f and en == 4 and retry_eintr do
+			f, _, en = io.open(path, "r")
+		end
+		if f then
+			M.open_release(sh, held)
+			held = nil
+		end
+		return f, en, held -- (nil, errno, hold)
 	end
-	local fd = M.ropen(path, 0, 0)
+	local ok, fd = pcall(M.ropen, path, 0, 0, not retry_eintr)
+	if not ok then
+		M.open_release(sh, held)
+		error(fd, 0)
+	end
 	if fd < 0 then
-		return nil, ffi.errno()
+		return nil, ffi.errno(), held
 	end
+	M.open_release(sh, held)
 	local chunks, buf = {}, ffi.new("char[8192]")
 	while true do
 		M.co_block(fd, POLLIN)
@@ -1865,12 +1884,18 @@ function M.open_read(path)
 	local text = table.concat(chunks)
 	return { read = function() return text end, close = function() end }
 end
+-- (after M.open_read, once its failure is reported: the traps it held run now)
+function M.open_release(sh, held)
+	if held then
+		M.fg_hold_leave(sh, held)
+	end
+end
 -- (redir.c's redir_open: an open a trapped signal interrupts — a FIFO's, waiting for its
--- other end — is retried once the trap has run)
-function M.open_intr(path, flags, mode)
+-- other end — is retried once the trap has run; `noretry`: not — see M.open_read)
+function M.open_intr(path, flags, mode, noretry)
 	while true do
 		local fd = C.open(path, flags, mode)
-		if fd >= 0 or ffi.errno() ~= 4 then
+		if fd >= 0 or ffi.errno() ~= 4 or noretry then
 			return fd
 		end
 		M.eintr()
@@ -1882,42 +1907,58 @@ int curse_aopen_result(void *h);
 void curse_aopen_abandon(void *h);
 ]])
 M.aopen_efd = ffi.new("int[1]")
-function M.aopen_wait(efd) -- (until the probe open's eventfd is readable; jobs run meanwhile)
+M.sig_held_n = 0 -- (trapped signals held so far: M.fg_held, M.defer_signal)
+-- Until the probe open's eventfd is readable (true); jobs run meanwhile. `noretry`: a
+-- trapped signal the shell holds ends the wait instead (false) — see M.open_read.
+function M.aopen_wait(efd, noretry)
+	local n0 = M.sig_held_n
 	while fd_would_block(efd, POLLIN) do
-		if CO or sched_live() then
+		if noretry and M.sig_held_n ~= n0 then
+			return false
+		end
+		if noretry and not CO and sched_live() then
+			M.sched_pump({ fd = efd, ev = POLLIN, untilf = function()
+				return M.sig_held_n ~= n0
+			end })
+		elseif CO or sched_live() then
 			M.co_block(efd, POLLIN)
 		else
 			_co_pfd[0].fd, _co_pfd[0].events, _co_pfd[0].revents = efd, POLLIN, 0
 			if C.curse_co_poll(_co_pfd, 1, -1) < 0 then
+				if noretry then
+					return false
+				end
 				M.eintr() -- (EINTR: a trap runs, then the wait goes on — redir_open's retry)
 			end
 		end
 	end
+	return true
 end
-function M.ropen(path, flags, mode)
-	if not (CO or sched_live()) or C.curse_rt_stat(path, _ropen_st) ~= 0
-		or bit.band(ffi.cast("uint32_t *", _ropen_st + 24)[0], 0xF000) ~= 0x1000 then -- S_IFIFO
-		return M.open_intr(path, flags, mode)
+-- open(2) as a redirection does it (flags/mode as given; `noretry`: M.open_read's).
+-- A FIFO's other end may be a job of this very shell: the open runs on a helper thread
+-- — lib_cursesig.c curse_aopen — and returns exactly when bash's open would, once the
+-- other end is open, while the jobs run meanwhile. The helper resolves the path against
+-- this shell's cwd and umask as of the call (the jobs chdir/umask the process as they
+-- run), through the very directory fd its FIFO check used. A pipe reached by
+-- /dev/fd/N, a process substitution's, opens at once.
+function M.ropen(path, flags, mode, noretry)
+	if not (CO or sched_live()) or bit.band(flags, 3) == 2 -- (O_RDWR never blocks)
+		or path:find("^/dev/fd/") or path:find("^/dev/std") or path:find("^/proc/self/fd/") then
+		return M.open_intr(path, flags, mode, noretry) -- (an fd of this shell: open it as itself)
 	end
-	local acc = bit.band(flags, 3)
-	if acc == 2 then -- O_RDWR never blocks
-		return C.open(path, flags, mode)
+	local efd = M.aopen_efd
+	local h = C.curse_aopen_start(path, flags, mode, FD_BASE, efd)
+	if h == nil then -- (no FIFO — or no helper: open it here)
+		return M.open_intr(path, flags, mode, noretry)
 	end
-	-- (a FIFO's other end may be a job of this very shell: the open runs on a helper
-	-- thread — lib_cursesig.c curse_aopen — and returns exactly when bash's open would,
-	-- once the other end is open, while the jobs run meanwhile; a pipe reached by
-	-- /dev/fd/N, a process substitution's, opens at once)
-	if path:find("^/dev/fd/") or path:find("^/dev/std") or path:find("^/proc/self/fd/") then
-		return M.open_intr(path, flags, mode) -- (an fd of this shell: open it as itself)
-	end
-	local h = C.curse_aopen_start(path, flags, mode, FD_BASE, M.aopen_efd)
-	if h == nil then
-		return M.open_intr(path, flags, mode)
-	end
-	local ok, err = pcall(M.aopen_wait, M.aopen_efd[0])
-	if not ok then
+	local ok, done = pcall(M.aopen_wait, efd[0], noretry)
+	if not ok or not done then
 		C.curse_aopen_abandon(h)
-		error(err, 0)
+		if not ok then
+			error(done, 0)
+		end
+		ffi.errno(4)
+		return -1
 	end
 	return C.curse_aopen_result(h)
 end
@@ -3184,9 +3225,9 @@ function Shell:capture_src(src, backtick, noalias, line0)
 				return ""
 			end
 			local path = fs[1]
-			local f, en
+			local f, en, hold
 			if path ~= "" then
-				f, en = M.open_read(path)
+				f, en, hold = M.open_read(path, false, self)
 			end
 			if f then
 				local c = f:read("*a") or ""
@@ -3195,6 +3236,7 @@ function Shell:capture_src(src, backtick, noalias, line0)
 				return (M.cmdsub_nul(c):gsub("\n+$", ""))
 			end
 			M.read_fail(path, en)
+			M.open_release(self, hold) -- (a trap the failed open held runs after the diagnostic)
 			self.status, self.last_cmdsub_status = 1, 1
 			return ""
 		end
@@ -3928,6 +3970,7 @@ function M.defer_signal(sh, sig)
 	if CO then
 		local h = M.task_held or {}
 		M.task_held, h[sig] = h, true
+		M.sig_held_n = M.sig_held_n + 1
 		return true
 	end
 	if not (iso_cur(sh) or (cap_depth > 0 and cap_pid == C.getpid())) then
@@ -3935,6 +3978,7 @@ function M.defer_signal(sh, sig)
 	end
 	deferred_sigs = deferred_sigs or {}
 	deferred_sigs[sig] = true
+	M.sig_held_n = M.sig_held_n + 1
 	return true
 end
 -- (the held signals, raised again together: blocked while sent, so the hook sees them
@@ -3984,6 +4028,7 @@ function M.fg_held(sig)
 	if M.fg_hold > 0 and M.fg_pid == C.getpid() then
 		deferred_sigs = deferred_sigs or {}
 		deferred_sigs[sig] = true
+		M.sig_held_n = M.sig_held_n + 1
 		return true
 	end
 	return false
@@ -4721,9 +4766,9 @@ function M.read_fail(path, en)
 	io.stderr:write("curse: " .. path .. ": " .. ffi.string(C.strerror(en or 2)) .. "\n")
 end
 function Shell:capture_file(path)
-	local f, en
+	local f, en, hold
 	if path ~= "" then
-		f, en = M.open_read(path)
+		f, en, hold = M.open_read(path, false, self)
 	end
 	if f then
 		local c = f:read("*a") or ""
@@ -4733,6 +4778,7 @@ function Shell:capture_file(path)
 		return (M.cmdsub_nul(c):gsub("\n+$", ""))
 	end
 	M.read_fail(path, en)
+	M.open_release(self, hold) -- (a trap the failed open held runs after the diagnostic)
 	self.status = 1
 	self.last_cmdsub_status, self.ncs = 1, (self.ncs or 0) + 1
 	return ""
@@ -5396,51 +5442,162 @@ function M.job_control_on(sh)
 	end
 	return true
 end
--- The script is over. bash's shell exits, leaving its jobs — and the kernel sends a STOPPED
--- one SIGHUP then SIGCONT (POSIX: its process group is orphaned by the exit), so it ends,
--- or runs on if it ignores HUP, rather than staying stopped forever. Here the process may
--- live on (a daemon worker) or must first drain its in-process jobs, so do that for it:
--- every stopped real process of a job, and every suspended task (one left parked would
--- hold the drain forever). With job control the real ones are in their own process groups
--- too, so the kernel does it even if this process is killed outright.
+-- The script is over. bash's shell exits, leaving its jobs — but first, with job control on
+-- (`set -m`, still on at the exit: end_job_control), terminate_stopped_jobs sends each
+-- STOPPED job's process group SIGTERM then SIGCONT. Without it, a stopped job in a process
+-- group of its own (started under `set -m`, turned off since) is orphaned by the exit, and
+-- the kernel sends it SIGHUP then SIGCONT (POSIX), so it ends, or runs on if it ignores
+-- HUP. Here the process may live on (a daemon worker) or must first drain its in-process
+-- jobs, so do both for it: for every stopped real process of a job-control job, and every
+-- suspended job-control task. A stopped process in the SHELL's process group gets neither
+-- (its group is not orphaned: it still has the caller): bash leaves it stopped, and so does
+-- this — and the drain does not wait for it, nor for a task stuck behind it
+-- (M.tasks_all_stuck), as bash's exit doesn't.
 do
-	local function proc_stopped(pid)
+	local function proc_stat(pid) -- its state letter and process group, from /proc
 		local f = io.open("/proc/" .. pid .. "/stat", "r")
 		local line = f and f:read("*l")
 		if f then
 			f:close()
 		end
-		local st = line and line:match("^.*%) (%a)")
+		if not line then
+			return nil
+		end
+		local st, pg = line:match("^.*%) (%a) %-?%d+ (%d+)")
+		return st, tonumber(pg)
+	end
+	M.proc_stat = proc_stat
+	local function stopped_st(st)
 		return st == "T" or st == "t"
 	end
+	local function own_pgrp()
+		local _, pg = proc_stat("self")
+		return pg
+	end
+	M.own_pgrp = own_pgrp
+	-- (a task whose running external IS the job's process: bash execs a simple job's
+	-- command in place — not a function's)
+	function M.task_is_external(t)
+		return t.child_pid and t.child_inplace and true or false
+	end
+	local exit_sig = 1 -- (SIGHUP, or SIGTERM when job control is on at the exit)
+	M.exit_signalled = {} -- (pids signalled here: the daemon's orphan sweep leaves them be)
+	local function signal_job(procs, t, sig)
+		for _, pid in ipairs(procs) do
+			M.exit_signalled[pid] = true
+			C.kill(pid, sig)
+			C.kill(pid, 18)
+		end
+		-- (the job's own process, when it isn't its external: a subshell, a function)
+		if t and not (M.task_is_external(t)) then
+			M.task_kill(t, sig) -- (taken once it runs — then the CONT)
+			M.task_resume(t)
+		end
+	end
 	function M.jobs_exit_hangup(sh)
+		local jc = sh and M.job_control_on(sh)
+		exit_sig = jc and 15 or 1
+		local mine, seen = own_pgrp(), {}
 		for _, j in ipairs(sh and sh.jobs or {}) do
 			if not j.gone and M.job_running(j) then
-				for _, pid in ipairs(M.job_procs(j)) do
-					if j.stopped or proc_stopped(pid) then
-						C.kill(pid, 1)
-						C.kill(pid, 18)
+				local t = j.g and M.vpid_tasks[j.pid]
+				local procs = M.job_procs(j)
+				local own = t and t.jc
+				local any = t and t.stopped and true or false
+				local all = not t or t.stopped or M.task_is_external(t)
+				all = all and true or false
+				for _, pid in ipairs(procs) do
+					seen[pid] = true
+					local st, pg = proc_stat(pid)
+					if stopped_st(st) then
+						any = true
+					else
+						all = false
+					end
+					if not t and pg and pg ~= mine then
+						own = true
+					end
+				end
+				if t then
+					seen[t] = true
+				end
+				-- a stopped job-control job: terminate_stopped_jobs's TERM + CONT; one only
+				-- partly stopped (a subshell waiting on its stopped external) is left to the
+				-- kernel, which HUPs + CONTs its whole orphaned process group
+				if own and any then
+					signal_job(procs, t, (jc and all) and 15 or 1)
+				end
+			end
+		end
+		if SCHED then -- (tasks no job holds: their externals, and themselves)
+			for _, t in pairs(SCHED.bycoro) do
+				if not t.done and t.jc and not seen[t] then
+					local procs = {}
+					if t.child_pid and not seen[t.child_pid] then
+						local st = proc_stat(t.child_pid)
+						if stopped_st(st) then
+							procs[1] = t.child_pid
+						end
+					end
+					if procs[1] or t.stopped then
+						signal_job(procs, t, 1)
 					end
 				end
 			end
 		end
-		if SCHED then
-			for _, t in pairs(SCHED.bycoro) do
-				if not t.done and t.child_pid and proc_stopped(t.child_pid) then
-					C.kill(t.child_pid, 1)
-					C.kill(t.child_pid, 18)
-				end
-			end
-			M.tasks_hangup_stopped()
-		end
 	end
-	function M.tasks_hangup_stopped()
+	function M.tasks_hangup_stopped() -- (a job-control task stopped since: bash would be gone)
 		for _, t in pairs(SCHED and SCHED.bycoro or {}) do
-			if t.stopped and not t.done then
-				M.task_kill(t, 1) -- (HUP — taken once it runs — then the CONT)
+			if t.stopped and not t.done and t.jc then
+				M.task_kill(t, exit_sig)
 				M.task_resume(t)
 			end
 		end
+	end
+	-- Every task left is stuck for good — itself suspended without job control, running an
+	-- external stopped in the shell's own process group, or waiting on (or in a pipeline
+	-- with) one that is: bash's exit would leave them all as they are. True also when none.
+	function M.tasks_all_stuck()
+		local ctx = SCHED
+		if not ctx or next(ctx.bycoro) == nil then
+			return true
+		end
+		local stuck, any, mine = {}, false, nil
+		for _, t in pairs(ctx.bycoro) do
+			if not t.done and not t.jc then
+				if t.stopped then
+					stuck[t], any = true, true
+				elseif t.child_pid then
+					mine = mine or own_pgrp()
+					local st, pg = proc_stat(t.child_pid)
+					if stopped_st(st) and pg == mine then
+						stuck[t], any = true, true
+					end
+				end
+			end
+		end
+		if not any then
+			return false
+		end
+		local grew = true
+		while grew do -- (…and whatever waits on a stuck one, or shares its pipeline)
+			grew = false
+			local sg = {}
+			for t in pairs(stuck) do
+				sg[t.g] = true
+			end
+			for _, t in pairs(ctx.bycoro) do
+				if not t.done and not stuck[t] and (sg[t.g] or (type(t.wait) == "table" and sg[t.wait])) then
+					stuck[t], grew = true, true
+				end
+			end
+		end
+		for _, t in pairs(ctx.bycoro) do
+			if not t.done and not stuck[t] then
+				return false
+			end
+		end
+		return true
 	end
 end
 -- Register a background job (for `jobs`/`wait %spec`/`wait -n`) and set $!: the slot after
@@ -6565,9 +6722,11 @@ function M.sched_drain(sh)
 	end
 	while sched_live() and not CO do
 		M.tasks_hangup_stopped() -- (one a job stopped meanwhile)
-		M.sched_pump({ drop_sigs = true, untilf = function()
-			return next(SCHED.bycoro) == nil
-		end })
+		M.sched_pump({ drop_sigs = true, untilf = M.tasks_all_stuck })
+		if M.tasks_all_stuck() then -- (only stopped ones are left: not waited for — see
+			preempt_arm(0) -- M.jobs_exit_hangup; and no slice ticks for them: the pump armed one)
+			break
+		end
 	end
 end
 
@@ -14963,9 +15122,17 @@ function M.source_run(sh, argv, line)
 	if Ii.file_test("-d", file) then
 		return require("b_source")(sh, argv[1], argv, nil, nil) -- directory: b_source diagnoses
 	end
-	local f = M.open_read(file)
-	if not f then
-		return require("b_source")(sh, argv[1], argv, nil, nil) -- not found: b_source diagnoses
+	local f, en, hold = M.open_read(file, false, sh)
+	if not f then -- (b_source diagnoses — this errno, and releases the hold after: a FIFO
+		-- isn't opened twice)
+		sh.source_openerr = { file = file, en = en, hold = hold }
+		local r = require("b_source")(sh, argv[1], argv, nil, nil)
+		local oe = sh.source_openerr
+		sh.source_openerr = nil
+		if oe then -- (b_source didn't get to it)
+			M.open_release(sh, oe.hold)
+		end
+		return r
 	end
 	local code = f:read("*a")
 	f:close()
@@ -16320,15 +16487,16 @@ function M.fn_return(sh, name)
 		sh.status = fret
 	end
 end
--- $FUNCNEST: a call (either tier) past that many nested calls abandons the whole command
+-- $FUNCNEST: a call (either tier) past that many nested calls abandons the current command
 -- line, status 1 (bash's execute_function: "maximum function nesting level exceeded",
--- jump_to_top_level DISCARD)
+-- jump_to_top_level DISCARD — which an eval/source's parse_and_execute contains: the rest
+-- of ITS line only, the eval/source goes on; never an errexit exit)
 function M.funcnest_over(sh, name)
 	local lim = tonumber(sh:get("FUNCNEST"))
 	if lim and lim > 0 and (sh.calldepth or 0) >= lim then
 		io.stderr:write("curse: " .. name .. ": maximum function nesting level exceeded (" .. lim .. ")\n")
 		sh.status = 1
-		error({ __curse_exit = 1, __curse_lineabort = true, __curse_discard = true })
+		error({ __curse_exit = 1, __curse_lineabort = true, __curse_noee = true })
 	end
 	return false
 end

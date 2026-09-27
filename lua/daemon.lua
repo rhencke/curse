@@ -121,6 +121,9 @@ local function log(...)
 	io.stderr:write("[cursed] ", table.concat({ ... }, " "), "\n")
 end
 
+-- The protocol's version is in the socket's name — a client of another version finds no
+-- daemon there and runs the script itself — and in the request header (see parse_request).
+local SOCK_NAME = "curse-v2.sock"
 -- Socket path: per-user runtime dir (0700, owned by us). No dir -> refuse to run
 -- (the client will just fall back to one-shot).
 local function socket_path()
@@ -128,7 +131,7 @@ local function socket_path()
 	if not rtd or rtd == "" then
 		return nil
 	end
-	return rtd .. "/curse.sock"
+	return rtd .. "/" .. SOCK_NAME
 end
 
 -- ---- request wire format (little-endian u32 lengths; local socket = same host)
@@ -141,12 +144,26 @@ local function rd_bytes(s, pos)
 	n, pos = rd_u32(s, pos)
 	return s:sub(pos, pos + n - 1), pos + n
 end
-local CURSE_MAGIC = 0x43555253
+-- The header: "CURS" (version 1: argv follows at once), or "CURV", a version, and (v2) the
+-- mask of fds 0-2 the client had closed. Any other version is refused — the connection is
+-- closed before the first reply frame, which the client takes as "never started" and runs
+-- the script itself. (v1 is still served: a v1 client knows only curse.sock, but one that
+-- reaches this daemon anyway gets the right answer, not a refusal it can't fall back from.)
+local MAGIC_V1, MAGIC_V = 0x43555253, 0x43555256
+local PROTO = 2
 local function parse_request(s)
 	local pos = 1
 	local magic
 	magic, pos = rd_u32(s, pos)
-	if magic ~= CURSE_MAGIC then
+	local closed = 0
+	if magic == MAGIC_V then
+		local ver
+		ver, pos = rd_u32(s, pos)
+		if ver ~= PROTO or #s < 12 then
+			return nil
+		end
+		closed, pos = rd_u32(s, pos)
+	elseif magic ~= MAGIC_V1 then
 		return nil
 	end
 	local nargs
@@ -179,7 +196,7 @@ local function parse_request(s)
 			extra[i], pos = rd_u32(s, pos)
 		end
 	end
-	return { args = args, cwd = cwd, env = env, sigign = sigign, extra = extra }
+	return { args = args, cwd = cwd, env = env, sigign = sigign, extra = extra, closed = closed }
 end
 
 -- Replace the worker's environment with the caller's, so os.getenv() (libc
@@ -203,18 +220,73 @@ end
 -- and while it idles (reap_idle), promptly, so none lingers as a zombie. One STOPPED
 -- gets SIGHUP + SIGCONT now, as the kernel sends a group its shell's exit orphans.
 local function hangup_stopped_orphans()
+	-- (as the kernel does for an orphaned process group with a stopped member: only one of
+	-- its own — one in the worker's group is left stopped, as bash leaves one in its own —
+	-- and not one the script's exit already signalled: rt.jobs_exit_hangup)
+	local mine = rt.own_pgrp()
 	for pid in pairs(rt.internal_pids) do
-		local f = io.open("/proc/" .. pid .. "/stat", "r")
-		local st = f and f:read("*l")
-		if f then
-			f:close()
-		end
-		local state = st and st:match("^.*%) (%a)")
-		if state == "T" or state == "t" then
+		local state, pg = rt.proc_stat(pid)
+		if (state == "T" or state == "t") and pg ~= mine and not rt.exit_signalled[pid] then
 			C.kill(pid, 1)
 			C.kill(pid, 18)
 		end
 	end
+	rt.exit_signalled = {}
+end
+-- A worker about to exit with a STOPPED child in its own process group (a script's job,
+-- not job control: bash leaves it stopped) would orphan that group — and the kernel would
+-- HUP + CONT it. So it stays (its slot reads -1: busy, no client) until none is left.
+local hold_pf = ffi.new("struct curse_d_pollfd[1]")
+local function hold_stopped_children(ctx, slot)
+	local wp = tonumber(C.getpid())
+	local mine = rt.own_pgrp()
+	while true do
+		pcall(rt.reap_orphans)
+		local f = io.open("/proc/" .. wp .. "/task/" .. wp .. "/children", "r")
+		local kids = f and f:read("*a") or ""
+		if f then
+			f:close()
+		end
+		local held = false
+		for pid in kids:gmatch("%d+") do
+			local state, pg = rt.proc_stat(pid)
+			if (state == "T" or state == "t") and pg == mine then
+				held = true
+				break
+			end
+		end
+		if not held then
+			return
+		end
+		if ctx and slot then
+			ctx.busy[slot] = -1
+		end
+		C.curse_d_poll(hold_pf, 0, 100)
+	end
+end
+-- The client forwards the signals sent to it here, to this worker, until it has read the
+-- status — so this worker must not take its NEXT request before then, or a signal meant for
+-- the finished script (the client killed just as it ends) would reach another client's.
+-- The client closes the connection once it no longer forwards: wait for that (a client
+-- that never does — stopped — is given up on after a while).
+local close_pf = ffi.new("struct curse_d_pollfd[1]")
+local close_buf = ffi.new("char[16]")
+local function wait_client_close(cfd)
+	local deadline = os.time() + 5
+	while true do
+		close_pf[0].fd, close_pf[0].events, close_pf[0].revents = cfd, 1, 0
+		local r = C.curse_d_poll(close_pf, 1, 1000)
+		if r > 0 then
+			if tonumber(C.read(cfd, close_buf, 16)) <= 0 then
+				break -- (EOF — or an error: the connection is gone either way)
+			end
+		elseif r < 0 and ffi.errno() ~= EINTR then
+			break
+		elseif os.time() >= deadline then
+			break
+		end
+	end
+	C.close(cfd)
 end
 -- Idle with adopted children: wait for a connection in 50ms slices, reaping them as they
 -- end, until none is left (then the plain blocking accept).
@@ -274,6 +346,11 @@ local function serve_request(cfd, req, fds, ctx)
 			C.close(t)
 		end
 	end
+	for fd = 0, 2 do -- (closed at the client: closed for the script — it sent /dev/null)
+		if bit.band(req.closed or 0, bit.lshift(1, fd)) ~= 0 then
+			C.close(fd)
+		end
+	end
 	if req.cwd and req.cwd ~= "" then
 		C.chdir(req.cwd)
 	end
@@ -306,10 +383,12 @@ local function serve_request(cfd, req, fds, ctx)
 	-- now our pid (negated): the client forwards the signals sent to it here. Not before
 	-- the script's dispositions are in place: a signal the client holds until then would
 	-- otherwise reach a worker with no script to take it (__curse_sigrun unset), and be lost.
-	C.write(cfd, ffi.new("int32_t[1]", -ctx.worker_pid), 4)
+	-- (inside the xpcall: a signal the client forwards at once — held until now — unwinds
+	-- the request, rt.termsig, and must be caught there, not kill the worker)
 	-- A Lua error escaping the run is a curse BUG: report it on the request's stderr
 	-- (status 1) instead of failing silently.
-	local ok = xpcall(function()
+	local ok, xerr = xpcall(function()
+		C.write(cfd, ffi.new("int32_t[1]", -ctx.worker_pid), 4)
 		-- the invocation (options, $0/params, startup files, the script): shared with run.lua
 		local inv, st = Invoke.parse(req.args)
 		if not inv then
@@ -318,10 +397,20 @@ local function serve_request(cfd, req, fds, ctx)
 		end
 		Invoke.run(sh, Invoke.start(sh, inv)) -- (its mid-run compiles are stored after the reply)
 	end, function(e)
+		if type(e) == "table" and e.__curse_exit then
+			return e -- (the shell's own end — a terminating signal before the script ran)
+		end
 		io.stderr:write("curse: internal error: " .. tostring(e) .. "\n" .. debug.traceback() .. "\n")
 		return e
 	end)
 	io.flush()
+	if not ok and type(xerr) == "table" and xerr.__curse_exit then -- (…as Invoke.run takes it)
+		ok, sh.status = true, xerr.__curse_exit
+	end
+	-- The script is over: a signal from here on belongs to no script (the client forwards
+	-- until it has read the status). Taken now it would unwind (rt.termsig) out of code no
+	-- pcall guards and kill the worker.
+	_G.__curse_sigrun = nil
 	local status = ok and (sh.status or 0) or 1 -- a Lua error (never a script `exit`, which
 	-- A FORKED DESCENDANT of this worker (a subshell/stage child) must never get here: if
 	-- one unwinds this far (e.g. a failed `exec` in a forked pipeline stage), it would
@@ -344,7 +433,6 @@ local function serve_request(cfd, req, fds, ctx)
 	if sh.termsig then
 		status = 0x10000 + sh.termsig * 256 + 128 + sh.termsig
 	end
-	_G.__curse_sigrun = nil -- (a signal between requests belongs to no script)
 	-- From the reply on, this worker no longer serves THAT client: unbind the slot from its
 	-- pid (still busy, -1) BEFORE the client can read its status and exit. Otherwise the
 	-- parent's dead-client sweep sees the finished client gone while this worker scrubs (or
@@ -354,7 +442,7 @@ local function serve_request(cfd, req, fds, ctx)
 	ctx.busy[ctx.slot] = -1
 	local sbuf = ffi.new("int32_t[1]", status) -- finish_run maps to $?) becomes status 1
 	C.write(cfd, sbuf, 4)
-	C.close(cfd)
+	-- (the connection stays open until the client has closed it: see wait_client_close)
 	-- Background jobs outlive the script (the client has its status): this worker finishes
 	-- them, then RETIRES — its slot reads -1 meanwhile (busy for the pool's saturation
 	-- count, so a replacement is spawned on demand; never "client gone", so not killed)
@@ -420,6 +508,7 @@ local function serve_request(cfd, req, fds, ctx)
 		end
 	end
 	ctx.active[0] = os.time() -- stamp the shared activity clock (drives the parent's idle-drain)
+	wait_client_close(cfd)
 	return retire
 end
 
@@ -526,6 +615,7 @@ local function worker_main(lfd, my_uid, ctx, slot)
 		if cfd < 0 then
 			local e = ffi.errno()
 			if e == EAGAIN or e == EWOULDBLOCK then
+				hold_stopped_children(ctx, slot)
 				C._exit(WORKER_IDLE)
 			end
 			if e ~= EINTR then
@@ -585,6 +675,7 @@ local function worker_main(lfd, my_uid, ctx, slot)
 			end
 			ctx.busy[slot] = 0
 			if retire then
+				hold_stopped_children(ctx, slot)
 				C._exit(0) -- not WORKER_IDLE: the parent replenishes the pool
 			end
 			served = served + 1

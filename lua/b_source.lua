@@ -41,15 +41,27 @@ local function builtin(sh, cmd, args, hook, tcb)
 		else
 			local pre = sh.source_preread -- (the compiled tier's rt.source already read it)
 			sh.source_preread = nil
-			local f = pre and pre.file == file and { read = function() return pre.code end, close = function() end }
-				or rt.open_read(file)
+			local oe = sh.source_openerr -- (the compiled tier's rt.source failed to open it)
+			sh.source_openerr = nil
+			local f, en, hold
+			if pre and pre.file == file then
+				f = { read = function() return pre.code end, close = function() end }
+			elseif oe and oe.file == file then
+				en, hold = oe.en, oe.hold
+			else
+				if oe then
+					rt.open_release(sh, oe.hold)
+				end
+				f, en, hold = rt.open_read(file, false, sh)
+			end
 			if not f then -- (bash names just the file; in posix mode it's fatal — a special
 				-- builtin, unless run through `command` — and a $PATH miss is "file not found")
 				if sh.opt_posix and not name:find("/", 1, true) then
 					io.stderr:write("curse: " .. cmd .. ": " .. name .. ": file not found\n")
 				else
-					io.stderr:write("curse: " .. name .. ": No such file or directory\n")
+					rt.read_fail(name, en) -- (file_error: the name and strerror(errno))
 				end
+				rt.open_release(sh, hold) -- (a trap the failed open held runs after the diagnostic)
 				sh.status = 1
 				if sh.opt_posix and not sh.opt_i and not sh.via_command then
 					error({ __curse_exit = 1 })
@@ -119,6 +131,10 @@ local function builtin(sh, cmd, args, hook, tcb)
 									if type(serr) == "table" and serr.__curse_lineabort and not serr.__curse_discard then
 										if rt.lineabort_exits(sh, serr) then
 											error(serr)
+										end
+										if rt.in_subshell(sh) then -- (bash's parse_and_execute DISCARD in a subshell: to
+											sh.status = 1 -- its top level, which ends it, status 1)
+											error({ __curse_exit = 1 }, 0)
 										end
 										sh.noerr = ne0
 										rt.line_aborted(sh, 1, pf0)

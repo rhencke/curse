@@ -9,3 +9,6 @@ bash      jobs.tests    120      # ~62s of `sleep`s (wait/fg/bg/kill -STOP seque
 bash      trap.tests    45       # ~15s: several `sleep`-based signal/trap timings
 bash      ifs-posix.tests 30     # ~3.3s of pure CPU (6,800 IFS-splitting checks): the one CPU-bound
                                  # test within 4x of the default; load scaling alone lags (1-min avg)
+cases     2536-bg-launch-order.sh 40  # ~3.9s of bash CPU: its busy-work is a quadratic ${x//0/y}, and that
+                                 # ~20ms head start per round is what keeps bash's two `&` children in
+                                 # order (${x^^} instead made the ORACLE race: "out of order: 24")

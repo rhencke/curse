@@ -22,7 +22,8 @@ test/stress/run.sh --list                       # every test and what it guards
 | `-t X` | 1.0 | scale every per-run timeout |
 | `-r DIR` | `build/stress-results/<time>` | results dir |
 | `-m LIST` | `interp,compiled,tiered,dcold,dwarm` | the curse shells |
-| `--oracle PATH` | `$H_ORACLE`, `build/oracle/bash`, `/tmp/claude-1000/w4bash/bash` | bash **5.2.21** (any other version is refused) |
+| `--oracle PATH` | `$H_ORACLE`, else the in-tree build: `$STRESS_BUILD/test/oracle/bash`, `build/test/oracle/bash` (then the legacy `…/oracle/bash`) | bash **5.2.21** (any other version is refused) |
+| `STRESS_SCRATCH` (env) | `${TMPDIR:-/tmp}` | where the per-run scratch dir (`stress.XXXXXX`: helper binary, shims, daemon socket + cache) is made |
 
 ## The shells and the comparison
 
@@ -86,6 +87,7 @@ failing test, with unified diffs.
 | test | guards |
 |---|---|
 | `sig-trap-contexts` | INT, TERM, HUP, USR1 and USR2 traps fired while the shell is in `read`, `wait`, a redirection being applied (a blocking FIFO open), `$(…)`, a pipeline stage, a subshell, `eval`, a sourced file, a function and a hot compiled loop. External signals are sent only once the shell sleeps in a syscall (`sthelp sendwhen`), so bash's output is fixed. Guards the preemptive signal delivery (VM hook + EINTR) and the in-process subshells. |
+| `sig-open-eintr` | A trapped signal interrupting the FIFO open of `$(< f)` or `source f` fails it ("Interrupted system call", status 1) with the trap running after the diagnostic, while a redirection's open is retried after the trap — plain, in `eval`, a function and a sourced file. Guards the async FIFO open's no-retry wait (lib_cursesig.c curse_aopen, rt.open_read). |
 | `sig-pseudo-traps` | EXIT, ERR, DEBUG and RETURN traps in the same contexts (compiled-tier DEBUG/RETURN, in-process subshell trap save and restore). |
 | `sig-self-kill` | `kill -SIG $$` from inside pipeline stages, subshells, `$(…)` and background jobs: bash runs the parent's trap exactly once, in the parent's context. Also an external signalling a subshell by `$BASHPID`, and no zombie after a trap interrupts the wait for a `$(…)` child. |
 | `sig-reentrancy` | Traps that signal themselves or each other (bash runs the new trap nested, at the next command inside the handler), and a trap reset, ignored or replaced while its signal is pending. |
@@ -96,6 +98,7 @@ failing test, with unified diffs.
 | `sig-status` | 128+sig statuses of shells killed by signals, EXIT traps before a trapped signal's exit, a blocked shell killed from outside, and PIPESTATUS of signal-killed stages. Nested shells go through `$THIS_SH`, so the daemon's 0x10000 relay is exercised. |
 | `bg-start` | A background job starts when `&` runs: a script that busy-waits with builtins only for its effect must see it. |
 | `daemon-sweep-race` | The dead-client-sweep race fixed in 207fd83: 12 parallel loops × 250·N `-c 'echo hi'` requests against a 2-worker daemon (before the fix, 8 of 72,000 failed with 127 and no output). |
+| `daemon-signal-crosstalk` | A's USR1 sent just as A's script ends (300 times, the kill at every point of A's life) must never reach B's script on the same worker: the worker takes its next request only once the client has stopped forwarding and closed (protocol v2). Before, B's USR1 trap ran 1-4 times in 300. |
 | `daemon-client-kill` | Clients killed (KILL, TERM, INT, HUP) mid-request while their script runs externals, floods output, blocks in `read`, spins, has background or stopped jobs. The pool must recover, nothing of the abandoned scripts may remain, and the next requests must be served correctly. |
 | `daemon-cache-race` | Three daemons sharing one `XDG_CACHE_HOME`, racing cold (empty cache) and warm on the same scripts. Every run must match bash. |
 | `daemon-locale-alt` | The multibyte-lexing cache-key fix (207fd83; case 2290 guards it too): the same text in `LC_ALL=C` and `zh_CN.gbk` (trail byte 0x5c), alternating in parallel, as files and as `-c`. |

@@ -55,7 +55,9 @@ j kill -0 %2 %1 %3
 j jobs %1
 j jobs %-
 j jobs %?6
-# (`jobs %sleep`, ambiguous, is bash UB — jobs[-2] — see docs/bash-ub.md; pinned in test/ub)
+# (`jobs %sleep`, ambiguous, reads jobs[-2] in bash — UB, docs/bash-ub.md: right here bash
+# 5.2.21 gives status 0 run by hand and status 1 under `meson test`'s environment; pinned in
+# test/ub instead)
 j jobs %1 %9
 j jobs -l -x echo
 # (one at a time: after `kill %1 %2`, whether job 2 has died by the time `wait %1`'s
