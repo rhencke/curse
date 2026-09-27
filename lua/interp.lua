@@ -537,7 +537,8 @@ local function fd_getc(fd)
 	rt.co_block(fd, 1) -- inside a pipeline stage: yield, don't stall the siblings
 	rt.rd_gen = rt.rd_gen + 1 -- (a read `read` didn't peek: see rt.pipe_cache)
 	local n = C.read(fd, rd1, 1)
-	while n < 0 and ffi.errno() == 4 do -- EINTR: the trap has run (zread's retry)
+	while n < 0 and ffi.errno() == 4 do -- EINTR: the trap runs (zread's retry)
+		rt.eintr()
 		n = C.read(fd, rd1, 1)
 	end
 	if n == 1 then

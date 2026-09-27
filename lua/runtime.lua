@@ -941,10 +941,17 @@ local SIGMARK = {} -- (a yield resumed with this: signals are pending for the ta
 local CO_OUTS = setmetatable({}, { __mode = "k" }) -- stage stdout writers (fd-1 backed)
 local POLLIN, POLLOUT = 1, 4
 local _co_pfd = ffi.new("struct curse_co_pollfd[1]")
+-- Called where a system call a signal interrupted (EINTR) is about to be retried: never
+-- JIT-compiled, so a trace reaching it exits to the interpreter, where the signal's
+-- scheduled VM hook fires — its trap runs BEFORE the retry blocks again (a retry inside a
+-- trace would block with the trap still pending: a forwarded TERM never ended a `read`).
+M.eintr = function() end
+jit.off(M.eintr)
 local function fd_would_block(fd, ev)
 	_co_pfd[0].fd, _co_pfd[0].events, _co_pfd[0].revents = fd, ev, 0
 	local r = C.curse_co_poll(_co_pfd, 1, 0)
 	while r < 0 and ffi.errno() == 4 do -- (EINTR — a trapped signal — is not "ready")
+		M.eintr()
 		_co_pfd[0].revents = 0
 		r = C.curse_co_poll(_co_pfd, 1, 0)
 	end
@@ -1130,6 +1137,7 @@ function M.wait_child(pid, stbuf, flags, intr)
 			if r >= 0 or ffi.errno() ~= 4 or intr.wait_sig then -- (EINTR: the trap has run)
 				return r
 			end
+			M.eintr()
 		end
 	end
 	while true do -- (EINTR: a trapped signal, whose trap has run — waitchld goes on waiting)
@@ -1137,6 +1145,7 @@ function M.wait_child(pid, stbuf, flags, intr)
 		if r >= 0 or ffi.errno() ~= 4 then
 			return r
 		end
+		M.eintr()
 	end
 end
 -- $$ is the MAIN shell's pid in every subshell: fixed before the first fork, so a child
@@ -1601,6 +1610,7 @@ function M.read_n(fd, buf, n)
 		elseif ffi.errno() ~= 4 then
 			return ""
 		end
+		M.eintr()
 	end
 end
 -- Peek at what's waiting in pipe `fd` WITHOUT consuming it: tee(2) duplicates up to
@@ -1629,6 +1639,7 @@ function M.pipe_peek(fd, buf, max)
 		local r = tonumber(C.read(peek_r, buf + got, n - got))
 		if r <= 0 then
 			if r < 0 and ffi.errno() == 4 then -- EINTR
+				M.eintr()
 				r = 0
 			else
 				return false
@@ -1665,6 +1676,7 @@ function M.open_read(path)
 		M.co_block(fd, POLLIN)
 		local n = tonumber(C.read(fd, buf, 8192))
 		if n < 0 and ffi.errno() == 4 then
+			M.eintr()
 			n = 0 -- EINTR (a trapped signal: its trap has run): read on
 		elseif n <= 0 then
 			break
@@ -1683,6 +1695,7 @@ function M.open_intr(path, flags, mode)
 		if fd >= 0 or ffi.errno() ~= 4 then
 			return fd
 		end
+		M.eintr()
 	end
 end
 function M.ropen(path, flags, mode)
@@ -1774,6 +1787,7 @@ _temp_fd = function(content) -- the body on an O_RDONLY fd
 				if not (k < 0 and ffi.errno() == 4) then
 					break
 				end
+				M.eintr()
 			else
 				off = off + k
 			end
@@ -1798,6 +1812,7 @@ _temp_fd = function(content) -- the body on an O_RDONLY fd
 				e = ffi.errno()
 				break
 			end
+			M.eintr()
 		else
 			off = off + k
 		end
@@ -2721,6 +2736,7 @@ function Shell:exec_t(args)
 		M.co_block(rfd, POLLIN)
 		local nr = C.read(rfd, buf, 65536)
 		if nr < 0 and ffi.errno() == 4 then
+			M.eintr()
 			nr = 0 -- EINTR (a trapped signal: its trap has run): read on
 		elseif nr <= 0 then
 			break
@@ -3097,6 +3113,7 @@ function Shell:capture_inproc(backtick, runner, capfd, ctx)
 			elseif k == 0 or ffi.errno() ~= 4 then
 				break
 			end
+			M.eintr()
 		end
 		C.close(tmp)
 		return table.concat(parts)
@@ -5365,6 +5382,7 @@ local function co_launch(ctx, self, stage_fns, inproc, base, lastpipe, upv)
 				M.co_block(drain_r, POLLIN)
 				local nr = tonumber(C.read(drain_r, rbuf, 65536))
 				if nr < 0 and ffi.errno() == 4 then
+					M.eintr()
 					nr = 0 -- (EINTR: read on)
 				elseif nr <= 0 then
 					break
@@ -6261,6 +6279,7 @@ run_pipeline_body = function(self, stage_fns, negate, inproc, upv_get, upv_set)
 					M.co_block(cp[0], POLLIN)
 					local n = tonumber(C.read(cp[0], rbuf, 65536))
 					if n < 0 and ffi.errno() == 4 then
+						M.eintr()
 						n = 0 -- (EINTR: read on)
 					elseif n <= 0 then
 						break
