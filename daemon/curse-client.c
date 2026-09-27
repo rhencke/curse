@@ -64,6 +64,38 @@ static void fallback(char **argv) {
     _exit(127);
 }
 
+/* Signals sent to this client are the script's (bash: the shell IS this process): each
+ * catchable one the caller didn't ignore is forwarded to the worker running the script,
+ * whose pid the worker sends first (a negative int32). One arriving before that is held. */
+static volatile sig_atomic_t fwd_worker;
+static volatile sig_atomic_t fwd_held[32];
+static void fwd_signal(int s) {
+    int e = errno;
+    if (fwd_worker > 0) kill((pid_t)fwd_worker, s);
+    else fwd_held[s] = 1;
+    errno = e;
+}
+static void fwd_install(uint32_t sigign) {
+    struct sigaction sa;
+    memset(&sa, 0, sizeof sa);
+    sa.sa_handler = fwd_signal;
+    sa.sa_flags = SA_RESTART;
+    sigemptyset(&sa.sa_mask);
+    for (int s = 1; s < 32; s++) {
+        /* (not the ones a shell leaves at their defaults for its own process: job
+         * control stops/continues, and the ones ignored by default) */
+        if (s == SIGKILL || s == SIGSTOP || s == SIGCHLD || s == SIGCONT || s == SIGTSTP ||
+            s == SIGTTIN || s == SIGTTOU || s == SIGWINCH || s == SIGURG || (sigign & (1u << (s - 1))))
+            continue;
+        sigaction(s, &sa, NULL);
+    }
+}
+static void fwd_release(pid_t worker) {
+    fwd_worker = worker;
+    for (int s = 1; s < 32; s++)
+        if (fwd_held[s]) { fwd_held[s] = 0; kill(worker, s); }
+}
+
 /* Append a length-prefixed byte field to buf; returns new length (or -1 if it
  * wouldn't fit). All integers are host-endian uint32 (client and daemon are the
  * same machine — this is a local socket). */
@@ -163,19 +195,28 @@ int main(int argc, char **argv, char **envp) {
     for (int i = 0; i < nextra; i++) passfds[3 + i] = extra[i];
     memcpy(CMSG_DATA(cm), passfds, (3 + nextra) * sizeof(int));
 
-    if (sendmsg(fd, &msg, 0) < 0) { close(fd); fallback(argv); }
+    fwd_install(sigign);
+    if (sendmsg(fd, &msg, MSG_NOSIGNAL) < 0) { close(fd); fallback(argv); }
 
-    /* Read the exit status (int32). If the daemon dies mid-run, treat as 127. */
+    /* Read the worker's pid (a negative int32), then the exit status (int32). If the
+     * daemon dies mid-run, treat as 127. */
     int32_t status = 127;
-    ssize_t got = 0, want = sizeof status;
-    char *p = (char *)&status;
-    while (got < want) {
-        ssize_t r = read(fd, p + got, want - got);
-        if (r <= 0) break;
-        got += r;
+    ssize_t got;
+    for (;;) {
+        got = 0;
+        ssize_t want = sizeof status;
+        char *p = (char *)&status;
+        while (got < want) {
+            ssize_t r = read(fd, p + got, want - got);
+            if (r < 0 && errno == EINTR) continue;
+            if (r <= 0) break;
+            got += r;
+        }
+        if (got != want || status >= 0) break;
+        fwd_release((pid_t)-status);
     }
     close(fd);
-    if (got != want)
+    if (got != (ssize_t)sizeof status)
         return 127;
     /* The script's shell was killed by a signal (bash: its EXIT trap ran, then it
      * died by that signal): the worker lives on, so die by it here, as bash would. */

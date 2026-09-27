@@ -364,9 +364,10 @@ end
 -- (a trap handler's own commands keep the line of the command it interrupted — interp's
 -- run_trap doesn't advance sh.cur_line at the trap's call depth: EF.trapline)
 local function lineno_expr()
-	if EF.trapline and not EF.cur_infunc then
+	if EF.trapline and not EF.cur_infunc then -- (the handler's line k: the trapped line + k-1)
+		local tl = ("((sh.cur_line or 0) + %d)"):format(math.max((EF.cur_line or 1) - 1, 0))
 		return "((sh.vars.LINENO or sh.unset_specials) and rt.lineno_plain(sh) and sh:get('LINENO') or "
-			.. "(sh.ldrift and rt.ldrift_str(sh, sh.cur_line or 0)) or tostring(sh.cur_line or 0))"
+			.. ("(sh.ldrift and rt.ldrift_str(sh, %s)) or tostring(%s))"):format(tl, tl)
 	end
 	-- (sh.ldrift: bash's lines drifted after a discarded command — rt.line_drift)
 	return ("((sh.vars.LINENO or sh.unset_specials) and rt.lineno_plain(sh) and sh:get('LINENO') or "
@@ -1109,7 +1110,8 @@ emit_value = function(e, lifted)
 	end
 	if k == "var" and e.name == "LINENO" then -- compile-time line (unless `unset LINENO`)
 		if EF.trapline and not EF.cur_infunc then
-			return "((sh.vars.LINENO or sh.unset_specials) and rt.lineno_plain(sh) and sh:aget('LINENO') or (0LL + (sh.cur_line or 0)))"
+			return ("((sh.vars.LINENO or sh.unset_specials) and rt.lineno_plain(sh) and sh:aget('LINENO') or (0LL + (sh.cur_line or 0) + %d))"):format(
+				math.max((EF.cur_line or 1) - 1, 0))
 		end
 		return ("((sh.vars.LINENO or sh.unset_specials) and rt.lineno_plain(sh) and sh:aget('LINENO') or %sLL)"):format(
 			tostring(EF.cur_line or 0))
@@ -8119,6 +8121,9 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
 					and ((EF.cf_flush or "") .. cx.ndadj(0) .. "do local __r = sh.status; sh.status = __ps; error({ __curse_return = __r }) end")
 				or (cx.ndadj(0) .. ("pc = %d"):format(retpc))
 			local ps = frag_return and "local __ps = sh.status; " or ""
+			if not frag_return and st.line and EF.has_return and not cx.toplevel and not cx.topcode then
+				ps = ps .. ("sh.fret_line = %d; "):format(st.line) -- (the RETURN trap's $LINENO)
+			end
 			if frag_return and not (EF.cf_raise and EF.cf_raise.func) then -- (a stage/eval fragment
 				-- at top level: maybe no function is running — then bash's diagnostic, status 2)
 				retjmp = ("if rt.return_outside(sh%s) then pc = %d else %s end"):format(viacmd, after, retjmp)

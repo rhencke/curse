@@ -537,6 +537,10 @@ local function fd_getc(fd)
 	rt.co_block(fd, 1) -- inside a pipeline stage: yield, don't stall the siblings
 	rt.rd_gen = rt.rd_gen + 1 -- (a read `read` didn't peek: see rt.pipe_cache)
 	local n = C.read(fd, rd1, 1)
+	while n < 0 and ffi.errno() == 4 do -- EINTR: the trap runs (zread's retry)
+		rt.eintr()
+		n = C.read(fd, rd1, 1)
+	end
 	if n == 1 then
 		return string.char(rd1[0] % 256)
 	end
@@ -5296,13 +5300,17 @@ exec_stmt = function(sh, st, hook)
 		return
 	end
 	-- (a function definition leaves the line alone — bash)
-	if st.line and t ~= "funcdef" and not (sh.in_trap and sh.in_trap > 0 and (sh.calldepth or 0) == sh.trap_calldepth) then
+	if st.line and t ~= "funcdef" then
 		-- a simple command's line is where its SECOND token ended (bash's yacc lookahead:
 		-- `nope "x<NL>y"` errors on line 2); cline records that
-		sh.cur_line = (t == "simple" or t == "assign" or t == "assignlist" or t == "arrayassign") and st.cline or st.line
-		sh.cur_cline = st.cline or st.line -- (where its $(…) bodies number from)
-	end -- $LINENO: frozen at the trapped line for the trap's own commands (not in a
-	-- function the trap calls, whose lines count as usual — bash)
+		local ln = (t == "simple" or t == "assign" or t == "assignlist" or t == "arrayassign") and st.cline or st.line
+		if not (sh.in_trap and sh.in_trap > 0 and (sh.calldepth or 0) == sh.trap_calldepth) then
+			sh.cur_line = ln
+			sh.cur_cline = st.cline or st.line -- (where its $(…) bodies number from)
+		elseif sh.trap_base then -- a trap's own commands: its handler's line k is the trapped
+			sh.cur_line = sh.trap_base + ln - 1 -- line + k-1 (parse_and_execute counts on from
+		end -- it — not in a function the trap calls, whose lines count as usual — bash)
+	end
 	if t == "assign" then
 		local pnf = sh.procsub_files and #sh.procsub_files or 0
 		rt.assign_full(sh, st)
@@ -6018,7 +6026,8 @@ run_trap = function(sh, code, tag)
 	local exited, savedline, rret = false, sh.cur_line, nil
 	local spl, slb = sh.perr_label, sh.trap_lbase
 	sh.perr_label, sh.trap_lbase = tag, tag and savedline or nil
-	local saved_tcd, saved_ts = sh.trap_calldepth, sh.trap_saved
+	local saved_tcd, saved_ts, saved_tb = sh.trap_calldepth, sh.trap_saved, sh.trap_base
+	sh.trap_base = sh.cur_line or 1 -- (the handler's first line: the trapped one)
 	sh.trap_calldepth = sh.calldepth or 0
 	sh.trap_saved = sh.status -- (bash's trap_saved_exit_value: see rt.return_default)
 	sh.in_trap = (sh.in_trap or 0) + 1
@@ -6089,7 +6098,7 @@ run_trap = function(sh, code, tag)
 	if psa and sh.vars.PIPESTATUS == psb then
 		psb.arr = psa
 	end
-	sh.trap_calldepth, sh.trap_saved = saved_tcd, saved_ts
+	sh.trap_calldepth, sh.trap_saved, sh.trap_base = saved_tcd, saved_ts, saved_tb
 	sh.cur_line = savedline
 	sh.perr_label, sh.trap_lbase = spl, slb
 	if not ok then
@@ -6157,9 +6166,13 @@ fire_err_trap = function(sh)
 	if h and h ~= "" and not sh.in_err_trap and errscope then
 		sh.in_err_trap = true
 		local saved = sh.status
-		local _, rret = run_trap(sh, h, "error trap")
+		local exited, rret = run_trap(sh, h, "error trap")
+		local xst = sh.status
 		sh.status = saved
 		sh.in_err_trap = false
+		if exited then -- `exit` in the ERR trap exits the shell (_run_trap_internal)
+			error({ __curse_exit = xst })
+		end
 		if rret then -- `trap 'return N' ERR`: the failing command's function returns N
 			error({ __curse_return = rret })
 		end
@@ -6191,16 +6204,18 @@ end
 
 -- Run the trap for the signal `signum` that the async handler delivered via the VM
 -- hook (lib_cursesig.c). No pending queue — the hook hands us exactly the signal
--- that fired. run_trap bumps sh.in_trap so a signal arriving DURING the handler is
--- serialized (the hook re-arms and runs it after this returns) — except one the handler
--- sent itself with `kill`, which runs nested, as in bash (rt.self_sig_release). A
+-- that fired. A signal arriving DURING a handler runs nested, inside it, as bash's
+-- run_pending_traps does at the handler's next command (running_trap only warns) — all
+-- but SIGCHLD inside its own trap (SIG_INPROGRESS: it runs again once that one ends). A
 -- signal trap doesn't change $? unless it exits/returns; `exit` in the handler
 -- propagates to exit the shell (bash).
+local chld_running, chld_again
 local function run_signal(sh, signum, direct, nested)
-	if not nested and sh.in_trap and sh.in_trap > 0 then
+	if signum == 17 and chld_running then
+		chld_again = true
 		return
-	end -- don't run a trap inside a trap (unless taken synchronously: rt.self_sig_release)
-	if not direct and rt.defer_signal(sh, signum) then
+	end
+	if not direct and (rt.defer_loading(sh, signum) or rt.defer_signal(sh, signum)) then
 		return -- (the parent's: runs once the in-process subshell has ended)
 	end
 	local h = sh.traps and sh.traps["SIG" .. (NUMSIG[signum] or "")]
@@ -6210,10 +6225,29 @@ local function run_signal(sh, signum, direct, nested)
 		end
 		return
 	end
+	if not direct and not nested and rt.fg_held(signum) then
+		return -- (a foreground command runs: the trap runs once it has finished)
+	end
 	-- an asynchronously-delivered signal handler reports $LINENO = 1 (bash).
 	local saved, sl = sh.status, sh.cur_line
 	sh.cur_line = 1
-	local exited, rret = run_trap(sh, h, "trap")
+	local exited, rret
+	if signum == 17 then
+		chld_running = true
+		local ok, e1, e2 = pcall(run_trap, sh, h, "trap")
+		chld_running = nil
+		if not ok then
+			chld_again = nil
+			error(e1, 0)
+		end
+		exited, rret = e1, e2
+		if chld_again then -- (children reaped meanwhile: the trap runs for them too)
+			chld_again = nil
+			C.kill(C.getpid(), 17)
+		end
+	else
+		exited, rret = run_trap(sh, h, "trap")
+	end
 	sh.cur_line = sl
 	-- a trapped signal ends a `wait`: 128+sig (see b_wait) — but SIGCHLD only in posix mode
 	if sh.in_wait and (signum ~= 17 or sh.opt_posix) then
