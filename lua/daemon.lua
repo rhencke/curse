@@ -326,6 +326,7 @@ local function serve_request(cfd, req, fds, ctx)
 		pcall(rt.sched_drain, sh)
 		drained = true
 	end
+	pcall(rt.reap_orphans) -- (children no job waits for any more: never zombies on the worker)
 	-- SCRUB per-request process state (the fork boundary used to do this):
 	C.umask(ctx.umask) -- a script's `umask` doesn't persist
 	C.sigprocmask(2, ctx.empty_sigset, nil) -- SIG_SETMASK: clear any trap-blocked signals

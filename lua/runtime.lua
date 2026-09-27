@@ -5118,6 +5118,9 @@ end
 -- (j.g) is done once its task group is. A simple in-process job's external carries the
 -- wait status (its signal: t.sh.xproc).
 function M.jobs_poll(sh)
+	if next(M.internal_pids) then
+		M.reap_orphans()
+	end
 	local sb
 	local foreign = sh.foreign_pids -- (a subshell's view of its parent's jobs: not its own)
 	for _, j in ipairs(sh.jobs or {}) do
@@ -5300,6 +5303,19 @@ end
 -- jobs, a killed task's still-running child): `wait`/`wait -n` reap with waitpid(-1) and
 -- skip these rather than mistake one for a job.
 M.internal_pids = {}
+-- Reap the ones that have ended (WNOHANG): nothing else waits for them, and a zombie left
+-- on a daemon worker would stay for the worker's life.
+do
+	local st = ffi.new("int[1]")
+	function M.reap_orphans()
+		for pid in pairs(M.internal_pids) do
+			local r = C.waitpid(pid, st, 1)
+			if r ~= 0 then -- (reaped, or not our child any more)
+				M.internal_pids[pid] = nil
+			end
+		end
+	end
+end
 
 -- `ext args… &` where the args are side-effect-free: the shell already built argv, so
 -- SPAWN the job directly (vfork-fast, stdin </dev/null) — no background task at all.
@@ -5871,6 +5887,15 @@ local function co_resume(ctx, t)
 		end
 		t.done, t.wait = true, nil
 		ctx.bycoro[t.co] = nil
+		local tsh = t.sh -- (a stage's/job's own `ext &` jobs still running: orphans now, reaped
+		if tsh and t ~= g.lp and tsh.jobs then -- by rt.reap_orphans — as bash's exited child's
+			for _, j in ipairs(tsh.jobs) do -- children go to init)
+				if not j.done and not j.g and j.pid and j.pid > 0
+					and not (tsh.foreign_pids and tsh.foreign_pids[j.pid]) then
+					M.internal_pids[j.pid] = true
+				end
+			end
+		end
 		-- (a lastpipe stage's fds 3-9 are adopted: only its stdin/out/err go now — `yes | head`
 		-- with lastpipe must EPIPE yes once head is done, not at the pipeline's end)
 		fds_release(ctx, t.sv, 0, t ~= g.lp and 9 or 2)
@@ -6170,6 +6195,9 @@ end
 -- w.deadline passed, w.until() true — or, with none given, until nothing can run now.
 -- Returns true when w.fd became ready.
 function M.sched_pump(w)
+	if next(M.internal_pids) then
+		M.reap_orphans()
+	end
 	local ctx = SCHED
 	if CO or not ctx or next(ctx.bycoro) == nil then
 		return false
