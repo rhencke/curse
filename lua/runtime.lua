@@ -14948,8 +14948,12 @@ end
 
 -- A parse-time warning statement (heredoc delimited by EOF, …): shown before its line runs.
 function M.warn_stmt(sh, st)
-	sh.cur_line = st.line
+	-- (the warning's own line, whichever tier runs it: a compiled statement's pc line — the
+	-- line its command sits on — would otherwise name the line the parse ended on)
+	local fl = sh.force_line
+	sh.cur_line, sh.force_line = st.line, st.line
 	io.stderr:write("curse: " .. st.msg .. "\n")
+	sh.force_line = fl
 end
 -- A RECOVERABLE parse error (an invalid `NAME=( … )` array-literal element) is reported
 -- but NON-fatal: the assignment is dropped and the script continues (bash).
@@ -14990,8 +14994,7 @@ M.TRAP_TAGS = { ["trap"] = true, ["exit trap"] = true, ["debug trap"] = true, ["
 function M.parse_error_stmt(sh, st, label)
 	label = label or st.plabel
 	for _, w in ipairs(st.warns or {}) do
-		sh.cur_line = w.line
-		io.stderr:write("curse: " .. w.msg .. "\n")
+		M.warn_stmt(sh, w)
 	end
 	if st.recoverable then
 		local pl = sh.perr_label
