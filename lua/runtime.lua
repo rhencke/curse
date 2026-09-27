@@ -2194,6 +2194,7 @@ end
 -- the fd was open, restore it; s.saved < 0 (C.dup failed): it was NOT open before, so
 -- CLOSE it rather than dup2(-1), which would leak it.
 function M.redir_undo(saves)
+	io.flush() -- (what a builtin buffered is the redirect target's: `( compgen … ) >/dev/null`)
 	if saves.e2o then
 		saves._sh.err2out = (saves._sh.err2out or 0) - saves.e2o
 		saves.e2o = nil
