@@ -1987,17 +1987,34 @@ end
 -- A command with prefix assignments AND redirections: a readonly prefix is reported before
 -- the redirections apply (bash's assign_in_env runs as the words expand), so to the stderr
 -- from before them; the binding then just skips it (M.ro_said, until the redirections go).
-function M.prefix_ro(sh, names)
+-- A failed assignment (a readonly target, …) jumps to the top level as bash's
+-- do_assignment_statements does: `force` (an assignment statement or a special builtin's
+-- prefix, in posix mode) is FORCE_EOF in a non-interactive shell — exit 1, 127 for the
+-- -c string (run_one_command) — else DISCARD, the rest of the line abandoned (a script
+-- and a -c string alike).
+function M.assign_jump(sh, force)
+	if force and sh.opt_posix and not sh.opt_i then
+		error({ __curse_exit = sh.opt_c and 127 or 1 })
+	end
+	error({ __curse_exit = 1, __curse_lineabort = true })
+end
+-- (posix mode: the line is abandoned right there, before the redirections — the shell
+-- exits for a special builtin's (`cmd`) or no command's: M.prefix_reject)
+function M.prefix_ro(sh, names, cmd)
 	local said
 	for _, name in ipairs(names) do
 		local dn = sh:deref(name)
 		local b = sh.vars[dn]
 		if b and b.ro then
-			io.stderr:write("curse: " .. dn .. ": readonly variable\n")
+			io.stderr:write("curse: " .. name .. ": readonly variable\n")
 			M.report_exit(sh) -- (err_readonly: report_error)
 			said = said or {}
 			said[name] = true
 		end
+	end
+	if said and sh.opt_posix then
+		sh.status = 1
+		M.assign_jump(sh, cmd == nil or M.SPECIAL_BUILTIN[cmd] ~= nil)
 	end
 	M.ro_said = said
 end
@@ -15064,7 +15081,7 @@ end
 -- A compiled attributed assignment: like interp's assign statement, an expansion/arith
 -- error in it (declare -i x; x='4+') fails just this assignment (status 1), non-fatally.
 function M.assign_scalar_x(sh, name, value)
-	local ok, e = pcall(M.assign_scalar, sh, name, value)
+	local ok, e = pcall(M.assign_scalar, sh, name, value, true)
 	if not ok then
 		if type(e) == "table" and e.__curse_experr and not e.__curse_lineabort then
 			sh.status = 1
@@ -15073,7 +15090,10 @@ function M.assign_scalar_x(sh, name, value)
 		error(e, 0)
 	end
 end
-function M.assign_scalar(sh, name, value)
+-- `stmt`: a standalone assignment statement (`name=value`), where a readonly target —
+-- through a nameref too — aborts the rest of the line as a direct one does (bash's
+-- assignment error: DISCARD); a builtin's store (printf -v, read, local) only fails.
+function M.assign_scalar(sh, name, value, stmt)
 	local direct = sh.vars[name]
 	-- nameref write-through (interp assign path): a cycle (ref -> … -> ref) is a non-fatal
 	-- warning; a nameref whose value carries a SUBSCRIPT (declare -n ref='a[2]') writes to
@@ -15088,7 +15108,7 @@ function M.assign_scalar(sh, name, value)
 			if M.nameref_circular(sh, name) then -- (a function's local cycle: the global, no nameref)
 				local back = sh:global_swap({ name })
 				sh.in_circ = true
-				local ok, e = pcall(M.assign_scalar, sh, name, value)
+				local ok, e = pcall(M.assign_scalar, sh, name, value, stmt)
 				sh.in_circ = nil
 				back()
 				if not ok then
@@ -15105,12 +15125,12 @@ function M.assign_scalar(sh, name, value)
 		local nbase, nsub = (sh:deref_elem(name) or ""):match("^([%a_][%w_]*)%[(.+)%]$")
 		if nbase then
 			local rb = sh.vars[nbase]
-			if rb and rb.ro then -- through a nameref: readonly is non-fatal (bash)
-				io.stderr:write("curse: " .. name .. ": readonly variable\n")
+			if rb and rb.ro then -- (err_readonly names the array; a statement's aborts the line)
+				io.stderr:write("curse: " .. nbase .. ": readonly variable\n")
 				M.report_exit(sh) -- (err_readonly: report_error)
 				sh.status = 1
-				if sh.opt_c or sh.opt_posix then
-					error({ __curse_exit = 1 })
+				if stmt then
+					M.assign_jump(sh, true)
 				end
 				return
 			end
@@ -15125,9 +15145,12 @@ function M.assign_scalar(sh, name, value)
 		io.stderr:write("curse: " .. sh:deref(name) .. ": readonly variable\n") -- (a ref's target)
 		M.report_exit(sh) -- (err_readonly: report_error)
 		sh.status = 1
-		if direct and direct.ref then
+		if direct and direct.ref and not stmt then
 			return
-		end -- through a nameref: non-fatal (bash)
+		end -- through a nameref: a builtin's store only fails
+		if stmt then
+			M.assign_jump(sh, true)
+		end
 		if sh.opt_c or sh.opt_posix then
 			error({ __curse_exit = 1 })
 		end
@@ -15465,7 +15488,9 @@ do
 	end
 
 	-- A prefix binding of a readonly variable (or the readonly specials SHELLOPTS/BASHOPTS):
-	-- reported (unless M.prefix_ro said it already), status 1, fatal under -c/posix; true.
+	-- reported (unless M.prefix_ro said it already), status 1; true. In posix mode the
+	-- line is abandoned (bash's do_assignment_statements), the shell exits for a special
+	-- builtin's; else the command still runs (-c or not).
 	-- (bash's assign_in_env rejects it before it binds, exports or traces anything; the
 	-- command still runs)
 	function M.prefix_reject(sh, name)
@@ -15475,14 +15500,14 @@ do
 			return false
 		end
 		if not (M.ro_said and M.ro_said[name]) then
-			io.stderr:write("curse: " .. dn .. ": readonly variable\n")
+			io.stderr:write("curse: " .. name .. ": readonly variable\n")
 			M.report_exit(sh) -- (err_readonly: report_error)
 		end
 		sh.status = 1
-		if sh.opt_c or sh.opt_posix then
-			error({ __curse_exit = 1 })
+		if sh.opt_posix then -- (a special builtin's, or no command's: FORCE_EOF; else DISCARD)
+			M.assign_jump(sh, sh.pb_mode == "persist" or sh.pb_mode == "perm")
 		end
-		return true
+		return true -- (not posix: tempenv_assign_error — the command still runs)
 	end
 	-- One prefix binding's store `name=value` (value already expanded, nil = its expansion
 	-- failed; `append` for name+=value), in the mode sh.pb_mode: "tenv" a temporary binding
@@ -16128,12 +16153,10 @@ function M.assign_full(sh, st)
 		io.stderr:write("curse: " .. sh:deref(st.name) .. ": readonly variable\n")
 		M.report_exit(sh) -- (err_readonly: report_error)
 		sh.status = 1
-		if sh.opt_c or sh.opt_posix then
-			error({ __curse_exit = 1 })
-		end
 		-- A STANDALONE readonly assignment (`readonly x=1; x=2; echo hi`) aborts the REST
-		-- of the line, then the next line runs (a command prefix: M.prefix_reject).
-		error({ __curse_exit = 1, __curse_lineabort = true })
+		-- of the line, then the next line runs — under -c too; posix mode exits (a command
+		-- prefix: M.prefix_reject).
+		M.assign_jump(sh, true)
 	end
 	-- A bad substitution / invalid indirect in the RHS fails the assignment but is
 	-- NON-fatal (bash: `x=${bad|y}` leaves x unset, status 1, script continues) —

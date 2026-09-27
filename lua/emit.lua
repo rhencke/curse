@@ -5012,7 +5012,7 @@ EF.simple_native = function(cx, st, after, cmd)
 		xt = " " .. EF.xt("__a")
 	end
 	if bind and redir and #pnames > 0 then -- (a readonly prefix is reported before the redirections)
-		xt = xt .. ("; rt.prefix_ro(sh, { %s })"):format(table.concat(pnames, ", "))
+		xt = xt .. ("; rt.prefix_ro(sh, { %s }, __a[1])"):format(table.concat(pnames, ", "))
 	end
 	return cx.dispatch(st, after, {
 		prelude = table.concat(out, "; ") .. xt,
@@ -5752,7 +5752,7 @@ simple_compiled = function(cx, st, after)
 				dispatch = EF.redir_wrap(cx.redir_ext(nil, redir_apply), prun)
 			end
 			if redir_apply then -- (a readonly prefix is reported before the redirections: rt.prefix_ro)
-				dispatch = ("rt.prefix_ro(sh, { %s }); "):format(table.concat(pnames, ", ")) .. dispatch
+				dispatch = ("rt.prefix_ro(sh, { %s }, __a[1]); "):format(table.concat(pnames, ", ")) .. dispatch
 			end
 			-- __pv (prefix values) FIRST, then __a (argv) — both in the pre-prefix env,
 			-- in bash's left-to-right order — then apply + run + restore via rt.run_prefix.
@@ -6350,6 +6350,7 @@ H.forc = function(cx, st, after)
 	end
 	local condp = cx.newpc()
 	cx.loopPc[st.id] = condp
+	cx.loopff(st.id)
 	local stepp = cx.newpc()
 	local bodyentry = cx.loop_list(st.body, stepp, after, stepp) -- break exits, continue steps
 	-- (with $BASH_COMMAND read, each slot's own DEBUG prefix carries its text: xs)
@@ -6439,6 +6440,7 @@ H.whilec = function(cx, st, after)
 		-- on entry, that fails exits via exitp). Two copies of the test: no extra hop per turn.
 		local condp, firstp = cx.newpc(), cx.newpc()
 		cx.loopPc[st.id] = condp
+		cx.loopff(st.id)
 		local exitp = cx.newpc()
 		cx.blocks[exitp] = ("sh.status = 0; pc = %d"):format(after)
 		local bodyentry = cx.loop_list(st.body, condp, after, condp)
@@ -6459,6 +6461,7 @@ H.whilec = function(cx, st, after)
 		local lv = cx.newloopvar()
 		local condp = cx.newpc()
 		cx.loopPc[st.id] = condp
+		cx.loopff(st.id)
 		local exitp = cx.newpc()
 		cx.blocks[exitp] = ("sh.status = %s; pc = %d"):format(lv, after)
 		local bodysave = cx.newpc()
@@ -6494,6 +6497,7 @@ H.whilec = function(cx, st, after)
 	local lv = cx.newloopvar()
 	local prep = cx.newpc()
 	cx.loopPc[st.id] = prep
+	cx.loopff(st.id)
 	local donep = cx.newpc()
 	local exitp = cx.newpc()
 	cx.blocks[exitp] = ("sh.status = %s; pc = %d"):format(lv, after)
@@ -6539,6 +6543,7 @@ H.forin = function(cx, st, after)
 	local initp = cx.newpc()
 	local advp = cx.newpc()
 	cx.loopPc[st.id] = advp -- back-edge = resume point
+	cx.loopff(st.id)
 	local bodyentry = cx.loop_list(st.body, advp, after, advp) -- break exits, continue advances
 	-- init: expand the word list ONCE into sh.forstate[id] (so OSR resumes it)
 	local parts = { "local __l = {}" }
@@ -7347,6 +7352,14 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
 		end,
 	})
 	cx.loopPc, cx.stmtPc = {}, {}
+	-- cx.loopFf[id]: a top-level loop's line-abort resume pc (its statement's sh._ff) — an
+	-- OSR entry into the loop never passed that statement's marker, so the tier sets it
+	cx.loopFf, cx.cur_ff = {}, nil
+	function cx.loopff(id)
+		if cx.cur_ff then
+			cx.loopFf[id] = cx.cur_ff
+		end
+	end
 	cx.npc = 0
 	-- cx.nd: how many errexit-exempt CONDITIONS (if/while tests, non-final &&/|| operands:
 	-- each raised sh.noerr) enclose the code being compiled. A break/continue/return that
@@ -8246,26 +8259,13 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
 			mark[k] = cx.newpc()
 		end
 	end
-	local nextpc = cx.DONE
-	for k = #stmts, 1, -1 do
-		nextpc = cx.flatten_stmt(stmts[k], cx.toplevel and (mark[k + 1] or cx.DONE) or nextpc)
-		cx.stmtPc[k] = nextpc -- the statement's REAL entry
-	end
+	-- (lgs: a line abort resumes at the next LINE GROUP — the parser's complete command:
+	-- `eval "…<newline>…"; echo` is one — else, with no groups recorded, a new line)
+	local lgs = false
+	local ffs = {} -- [k]: the pc a line abort in top-level statement k resumes at
 	if cx.toplevel then
-		-- Sync lifted vars to sh at each marker so, on a lineabort, the tier's retry
-		-- wrapper can re-enter run at sh._ff with the pre-statement state intact (run
-		-- re-seeds lifted from sh). Once per TOP-LEVEL statement (never in a hot loop body).
-		-- Signal traps are delivered by the async VM hook (lib_cursesig.c), not polled here.
-		local wbs = lsync(cx.lifted)
-		-- (a line abort resumes at the next LINE GROUP — the parser's complete command:
-		-- `eval "…<newline>…"; echo` is one — else, with no groups recorded, a new line)
-		local lgs = false
 		for k = 1, #stmts do
 			lgs = lgs or stmts[k].lgstart or false
-		end
-		local nxperr = {} -- [k]: the marker of the first syntax error at/after statement k
-		for k = #stmts, 1, -1 do
-			nxperr[k] = stmts[k].t == "parse_error" and mark[k] or nxperr[k + 1]
 		end
 		for k = 1, #stmts do
 			local ff = cx.DONE
@@ -8275,6 +8275,28 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
 					break
 				end
 			end
+			ffs[k] = ff
+		end
+	end
+	local nextpc = cx.DONE
+	for k = #stmts, 1, -1 do
+		cx.cur_ff = ffs[k]
+		nextpc = cx.flatten_stmt(stmts[k], cx.toplevel and (mark[k + 1] or cx.DONE) or nextpc)
+		cx.stmtPc[k] = nextpc -- the statement's REAL entry
+	end
+	cx.cur_ff = nil
+	if cx.toplevel then
+		-- Sync lifted vars to sh at each marker so, on a lineabort, the tier's retry
+		-- wrapper can re-enter run at sh._ff with the pre-statement state intact (run
+		-- re-seeds lifted from sh). Once per TOP-LEVEL statement (never in a hot loop body).
+		-- Signal traps are delivered by the async VM hook (lib_cursesig.c), not polled here.
+		local wbs = lsync(cx.lifted)
+		local nxperr = {} -- [k]: the marker of the first syntax error at/after statement k
+		for k = #stmts, 1, -1 do
+			nxperr[k] = stmts[k].t == "parse_error" and mark[k] or nxperr[k + 1]
+		end
+		for k = 1, #stmts do
+			local ff = ffs[k]
 			if stmts[k].lgspan then -- (a multi-line group's lines, by the pc a line abort resumes at)
 				cx.lgspan = cx.lgspan or {}
 				cx.lgspan[ff] = stmts[k].lgspan
@@ -8308,6 +8330,7 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
 			npc = cx.npc,
 			entry = mark[1] or cx.DONE,
 			loopPc = cx.loopPc,
+			loopFf = cx.loopFf,
 			stmtPc = cx.stmtPc,
 			lgspan = cx.lgspan,
 			loopvars = cx.loopvars,
@@ -8987,7 +9010,8 @@ function M.emit(ast, opts)
 	for name in spairs(fncall) do
 		fc[#fc + 1] = ("[%q] = { src = %q, fn = %s }"):format(name, fnsrc[name], EF.upv_wrapped(fnlname(name)))
 	end
-	o[#o + 1] = ("return { run = run, loopPc = loopPc, stmtPc = stmtPc%s%s%s%s%s }"):format(
+	o[#o + 1] = ("return { run = run, loopPc = loopPc, stmtPc = stmtPc%s%s%s%s%s%s }"):format(
+		next(top.loopFf or {}) and (", loopFf = " .. serialize(top.loopFf)) or "",
 		top.lgspan and (", lgspan = {" .. (function()
 			local o2 = {}
 			for ff, sp in spairs(top.lgspan) do
