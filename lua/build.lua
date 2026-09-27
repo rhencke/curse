@@ -93,7 +93,7 @@ for _, m in ipairs(lazy_mods) do
 	local f = assert(io.open("lua/" .. m .. ".lua", "r"))
 	local s = f:read("*a")
 	f:close()
-	local mbc = string.dump(assert(loadstring(s, "=" .. m)))
+	local mbc = string.dump(assert(loadstring(s, "=" .. m)), "d") -- (deterministic: see below)
 	parts[#parts + 1] = ('package.preload[%q] = function(...) return assert(loadstring("%s", "=%s"))(...) end\n'):format(
 		m,
 		esc(mbc),
@@ -118,7 +118,10 @@ end
 local bundle_src = table.concat(parts)
 
 local chunk = assert(loadstring(bundle_src, "=curse.bundle"))
-local bc = string.dump(chunk) -- keep debug info: line-accurate tracebacks in our runtime
+-- keep debug info (line-accurate tracebacks in our runtime); "d": DETERMINISTIC bytecode —
+-- LuaJIT seeds its string hash per process, and a template table's hash part is dumped in
+-- node order, so a plain dump (and the build id hashed over it) differed on every rebuild
+local bc = string.dump(chunk, "d")
 
 local dest = arg[1] or "dist/curse.bc"
 local dir = dest:match("^(.*)/[^/]+$")

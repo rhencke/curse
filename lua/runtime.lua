@@ -14445,7 +14445,7 @@ function M.parse_error_stmt(sh, st, label)
 		error(type(pe) == "table" and pe.__curse_perrexit and pe
 			or { __curse_exit = (st.forceeof and sh.opt_c) and 127 or 1 })
 	end
-	local msg = tostring(st.msg or "syntax error"):gsub("^.-:%d+: ", "")
+	local msg = tostring(st.msg or "syntax error"):gsub("^[^%s`']-:%d+: ", "") -- (a Lua position, if any)
 	if not st.exact then
 		msg = msg:gsub("^syntax error near `", "syntax error near unexpected token `")
 	end
@@ -16981,8 +16981,8 @@ function M.assign_full(sh, st)
 	sh.status = sh.ncs ~= ncs0 and sh.last_cmdsub_status or 0
 	sh:set_str("_", "") -- a bare assignment resets $_ to empty (bash)
 end
--- HISTSIZE shrinks the in-memory history; HISTFILESIZE truncates $HISTFILE — both to the
--- last N entries, on assignment (bash)
+-- HISTSIZE shrinks the in-memory history; HISTFILESIZE truncates the history file — both
+-- on assignment (bash's sv_histsize)
 function M.hist_resize(sh, name)
 	local nsz = tonumber(sh:get(name))
 	if not (nsz and nsz >= 0) then
@@ -16991,23 +16991,46 @@ function M.hist_resize(sh, name)
 	if name == "HISTSIZE" and sh.history then
 		require("hist").stifle(sh)
 	elseif name == "HISTFILESIZE" then
-		local hf = sh:get("HISTFILE")
-		if hf and hf ~= "" then
-			local lines, f = {}, io.open(hf, "r")
-			if f then
-				for l in f:lines() do
-					lines[#lines + 1] = l
-				end
-				f:close()
+		-- readline's history_truncate_file (history_filename: an unset $HISTFILE means
+		-- ~/.history). It counts lines back from the end, where a newline counts only
+		-- when the line AFTER it doesn't start a timestamp (the current history comment
+		-- char + a digit) — so a kept entry can lose its own timestamp line and keep the
+		-- one after it — then rewrites the file from that line only if it's not the first.
+		local H = require("hist")
+		local hf = H.filename(sh)
+		local f = hf ~= "" and io.open(hf, "rb")
+		local buf = f and f:read("*a")
+		if f then
+			f:close()
+		end
+		if not buf or #buf == 0 then
+			return
+		end
+		local cc = H.tscc(sh):byte()
+		local function ts_start(i)
+			local d = buf:byte(i + 1)
+			return buf:byte(i) == cc and d ~= nil and d >= 48 and d <= 57
+		end
+		local lines, bp = nsz, #buf
+		local bp1 = bp
+		while lines > 0 and bp > 1 do
+			if buf:byte(bp) == 10 and not ts_start(bp1) then
+				lines = lines - 1
 			end
-			if #lines > nsz then
-				local o = io.open(hf, "w")
-				if o then
-					for k = #lines - nsz + 1, #lines do
-						o:write(lines[k], "\n")
-					end
-					o:close()
-				end
+			bp1, bp = bp, bp - 1
+		end
+		while bp > 1 do
+			if buf:byte(bp) == 10 and not ts_start(bp1) then
+				bp = bp + 1
+				break
+			end
+			bp1, bp = bp, bp - 1
+		end
+		if bp > 1 then
+			local o = io.open(hf, "wb")
+			if o then
+				o:write(buf:sub(bp))
+				o:close()
 			end
 		end
 	end
