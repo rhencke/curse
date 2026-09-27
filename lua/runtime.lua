@@ -943,7 +943,12 @@ local POLLIN, POLLOUT = 1, 4
 local _co_pfd = ffi.new("struct curse_co_pollfd[1]")
 local function fd_would_block(fd, ev)
 	_co_pfd[0].fd, _co_pfd[0].events, _co_pfd[0].revents = fd, ev, 0
-	return C.curse_co_poll(_co_pfd, 1, 0) == 0 -- nothing ready (POLLHUP/POLLERR count as ready)
+	local r = C.curse_co_poll(_co_pfd, 1, 0)
+	while r < 0 and ffi.errno() == 4 do -- (EINTR — a trapped signal — is not "ready")
+		_co_pfd[0].revents = 0
+		r = C.curse_co_poll(_co_pfd, 1, 0)
+	end
+	return r == 0 -- nothing ready (POLLHUP/POLLERR count as ready)
 end
 -- The running stage task, or nil (main thread, a forked child, or no scheduler).
 local function co_task()
@@ -1092,7 +1097,7 @@ function M.wait_child(pid, stbuf, flags, intr)
 				if intr and intr.wait_sig then
 					return -1
 				end
-				return C.waitpid(pid, stbuf, flags)
+							return C.waitpid(pid, stbuf, flags)
 			end
 			t.child_pid = pid -- (`kill` of a simple-command job reaches this child: see task_kill)
 			while fd_would_block(pfd, POLLIN) do
@@ -1127,7 +1132,12 @@ function M.wait_child(pid, stbuf, flags, intr)
 			end
 		end
 	end
-	return C.waitpid(pid, stbuf, flags)
+	while true do -- (EINTR: a trapped signal, whose trap has run — waitchld goes on waiting)
+		local r = C.waitpid(pid, stbuf, flags)
+		if r >= 0 or ffi.errno() ~= 4 then
+			return r
+		end
+	end
 end
 -- $$ is the MAIN shell's pid in every subshell: fixed before the first fork, so a child
 -- never computes its own (Shell:pid)
@@ -1654,7 +1664,9 @@ function M.open_read(path)
 	while true do
 		M.co_block(fd, POLLIN)
 		local n = tonumber(C.read(fd, buf, 8192))
-		if not n or n <= 0 then
+		if n < 0 and ffi.errno() == 4 then
+			n = 0 -- EINTR (a trapped signal: its trap has run): read on
+		elseif n <= 0 then
 			break
 		end
 		chunks[#chunks + 1] = ffi.string(buf, n)
@@ -1663,10 +1675,20 @@ function M.open_read(path)
 	local text = table.concat(chunks)
 	return { read = function() return text end, close = function() end }
 end
+-- (redir.c's redir_open: an open a trapped signal interrupts — a FIFO's, waiting for its
+-- other end — is retried once the trap has run)
+function M.open_intr(path, flags, mode)
+	while true do
+		local fd = C.open(path, flags, mode)
+		if fd >= 0 or ffi.errno() ~= 4 then
+			return fd
+		end
+	end
+end
 function M.ropen(path, flags, mode)
 	if not (CO or sched_live()) or C.curse_rt_stat(path, _ropen_st) ~= 0
 		or bit.band(ffi.cast("uint32_t *", _ropen_st + 24)[0], 0xF000) ~= 0x1000 then -- S_IFIFO
-		return C.open(path, flags, mode)
+		return M.open_intr(path, flags, mode)
 	end
 	local acc = bit.band(flags, 3)
 	if acc == 2 then -- O_RDWR never blocks
@@ -2633,7 +2655,11 @@ function Shell:exec_t(args)
 		local hold = (self.bg_cd and self.bg_cd == self.calldepth)
 			or (ist and ist[1] and ist[#ist].igint and (ist[#ist].igint[2] or ist[#ist].igint[3]) and true)
 		M.nspawn = M.nspawn + 1 -- (a real child: its death is a real SIGCHLD)
+		local held = M.fg_hold_enter() -- (from the fork on: the child may signal us at once)
 		local rc, pid = spawn_argv(self, execpath, args, n, nil, hold, 0)
+		if rc ~= 0 then
+			M.fg_hold_leave(self, held)
+		end
 		if rc == 8 then
 			return self:run_noexec(execpath, args, n)
 		end -- no shebang: run as a script
@@ -2643,7 +2669,11 @@ function Shell:exec_t(args)
 			return
 		end
 		local st = ffi.new("int[1]")
-		M.wait_child(pid, st, 0)
+		local ok, err = pcall(M.wait_child, pid, st, 0)
+		if not ok then
+			M.fg_hold_leave(self, held)
+			error(err, 0)
+		end
 		self.status = M.wexit(st[0])
 		if self.status > 128 or self.xstage then -- (killed by a signal: bash reports the job)
 			M.fg_ended(self, pid, st[0])
@@ -2652,6 +2682,7 @@ function Shell:exec_t(args)
 			M.jobs_poll(self)
 			M.jobs_notify(self)
 		end
+		M.fg_hold_leave(self, held)
 		return
 	end
 	local fds = ffi.new("int[2]")
@@ -2686,7 +2717,9 @@ function Shell:exec_t(args)
 	while true do
 		M.co_block(rfd, POLLIN)
 		local nr = C.read(rfd, buf, 65536)
-		if nr <= 0 then
+		if nr < 0 and ffi.errno() == 4 then
+			nr = 0 -- EINTR (a trapped signal: its trap has run): read on
+		elseif nr <= 0 then
 			break
 		end
 		chunks[#chunks + 1] = ffi.string(buf, nr)
@@ -3507,8 +3540,43 @@ function M.defer_signal(sh, sig)
 	deferred_sigs[sig] = true
 	return true
 end
+-- A trapped signal arriving while the shell waits for a foreground command — an external,
+-- a pipeline — runs its trap once the command has finished (bash: trap_handler only marks
+-- it pending; waitchld doesn't run traps, the next command boundary does). The shell
+-- itself (never a background task) holds: fg_hold_enter returns whether this call did.
+M.fg_hold, M.fg_pid = 0, nil
+function M.fg_hold_enter()
+	if co_task() then
+		return false
+	end
+	local p = C.getpid()
+	if M.fg_pid ~= p then -- (a forked child starts its own count)
+		M.fg_pid, M.fg_hold = p, 0
+	end
+	M.fg_hold = M.fg_hold + 1
+	return true
+end
+function M.fg_hold_leave(sh, held)
+	if held and M.fg_hold > 0 then
+		M.fg_hold = M.fg_hold - 1
+		if M.fg_hold == 0 then
+			flush_deferred(sh)
+		end
+	end
+end
+-- (interp.run_signal: hold this trapped signal? — the handler runs once after, however
+-- many arrived: bash's pending_traps count is run once)
+function M.fg_held(sig)
+	if M.fg_hold > 0 and M.fg_pid == C.getpid() then
+		deferred_sigs = deferred_sigs or {}
+		deferred_sigs[sig] = true
+		return true
+	end
+	return false
+end
 flush_deferred = function(sh)
-	if deferred_sigs and not iso_cur(sh) and not (cap_depth > 0 and cap_pid == C.getpid()) then
+	if deferred_sigs and not iso_cur(sh) and not (cap_depth > 0 and cap_pid == C.getpid())
+		and not (M.fg_hold > 0 and M.fg_pid == C.getpid()) then
 		local d = deferred_sigs
 		deferred_sigs = nil
 		for sig in pairs(d) do
@@ -3607,14 +3675,18 @@ local function iso_undo(sh, ctx)
 	end
 end
 
-iso_pop = function(sh, ctx)
+-- `hold`: the caller raises the held signals itself (flush_deferred) once it has put the
+-- parent's variables back too — a trap run before that would run in the subshell's.
+iso_pop = function(sh, ctx, hold)
 	local st = sh.iso_ctx
 	if st and st[#st] == ctx then
 		st[#st] = nil
 	end
 	if ctx.pid == C.getpid() then
 		iso_undo(sh, ctx)
-		flush_deferred(sh)
+		if not hold then
+			flush_deferred(sh)
+		end
 	end
 end
 
@@ -3978,7 +4050,7 @@ function Shell:subshell_run(runner, saves, paren, inplace)
 	if not rethrow and ctx.pid == C.getpid() then
 		status = M.iso_exit_trap(self, ctx, status, err)
 	end
-	iso_pop(self, ctx)
+	iso_pop(self, ctx, true)
 	for _, j in ipairs(self.jobs) do -- its unfinished jobs are orphans now: never the parent's
 		if not j.done and j.pid and j.pid > 0 then
 			M.internal_pids[j.pid] = true
@@ -3990,6 +4062,7 @@ function Shell:subshell_run(runner, saves, paren, inplace)
 	self.out, self.noerr, self.paren_sp = sv_out, sv_ne, sv_psp
 	subprog_leave(self, s1, s2, s3, s4, s5, s6, s7)
 	sub_restore(self, cp)
+	flush_deferred(self) -- (the parent's signals: its traps run in its own state)
 	if killed then -- the parent's report of its child that a signal killed (a `( … )`: its text)
 		if not ctx.vpid then
 			ctx.vpid = M.alloc_vpid()
@@ -4089,9 +4162,10 @@ function Shell:capture_compiled_iso(cs_fn, backtick)
 	local ctx = iso_push(self)
 	ctx.cs = true -- (a $(…): job control stays on — fg/bg in b_fg)
 	local ok, out = pcall(self.capture_inproc, self, backtick, cs_fn, true, ctx) -- fd-level capture
-	iso_pop(self, ctx)
+	iso_pop(self, ctx, true)
 	sub_restore(self, cp)
 	self.foreign_pids = sv_foreign
+	flush_deferred(self)
 	if not ok then
 		error(out, 0)
 	end
@@ -5227,7 +5301,9 @@ local function co_launch(ctx, self, stage_fns, inproc, base, lastpipe, upv)
 			while true do
 				M.co_block(drain_r, POLLIN)
 				local nr = tonumber(C.read(drain_r, rbuf, 65536))
-				if not nr or nr <= 0 then
+				if nr < 0 and ffi.errno() == 4 then
+					nr = 0 -- (EINTR: read on)
+				elseif nr <= 0 then
 					break
 				end
 				drain_out(ffi.string(rbuf, nr))
@@ -6037,14 +6113,24 @@ function Shell:run_pipeline(stage_fns, negate, inproc, upv_get, upv_set, texts)
 		error(err, 0)
 	end
 end
+-- The parent waits for the whole pipeline: its traps run after (M.fg_hold_enter) — unless
+-- it runs the last stage itself (lastpipe).
+function M.pipeline_co_held(self, stage_fns, inproc, upv_get, upv_set)
+	local lp = self.shopt.lastpipe and not self.opt_i
+	local held = not lp and M.fg_hold_enter()
+	local ok, r = pcall(self.run_pipeline_co, self, stage_fns, inproc, lp, upv_get, upv_set)
+	M.fg_hold_leave(self, held)
+	if not ok then
+		error(r, 0)
+	end
+	return r
+end
 run_pipeline_body = function(self, stage_fns, negate, inproc, upv_get, upv_set)
 	local nst = #stage_fns
 	if nst == 1 then -- (emit's `! cmd`: a negated one-stage pipeline, no real pipe)
 		stage_fns[1](self)
-	elseif
-		inproc
-		and self:run_pipeline_co(stage_fns, inproc, self.shopt.lastpipe and not self.opt_i, upv_get, upv_set)
-	then -- ran under the coroutine scheduler (status/PIPESTATUS set)
+	elseif inproc and M.pipeline_co_held(self, stage_fns, inproc, upv_get, upv_set) then
+		-- ran under the coroutine scheduler (status/PIPESTATUS set)
 	else
 		-- The scheduler couldn't take it (no pipe fds, or a trap running while the scheduler
 		-- pumps — CO is live but no task runs): the one place stages still FORK.
@@ -6109,7 +6195,9 @@ run_pipeline_body = function(self, stage_fns, negate, inproc, upv_get, upv_set)
 				while true do
 					M.co_block(cp[0], POLLIN)
 					local n = tonumber(C.read(cp[0], rbuf, 65536))
-					if n <= 0 then
+					if n < 0 and ffi.errno() == 4 then
+						n = 0 -- (EINTR: read on)
+					elseif n <= 0 then
 						break
 					end
 					chunks[#chunks + 1] = ffi.string(rbuf, n)
