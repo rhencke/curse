@@ -2733,7 +2733,8 @@ end
 --    assignment, array argument or redirection (a builtin's redirected output needs the
 --    fd-level capture), whose name is one literal that is no function in `fns` and is
 --    an external (a separate process) or one of PURE_CMDSUB_BUILTIN;
---  * every word of it expands without side effects (word_pure): only literals, plain
+--  * every word of it expands without side effects (word_pure, and no name it reads is a
+--    nameref at run time: M.no_refs): only literals, plain
 --    $name/$N/$@…, nested $(…)/<(…) (subshells deciding for themselves), and ${…}
 --    forms whose operator can't assign, evaluate arithmetic, or expand further — no
 --    ${v:=…}, ${!v}, $((…)), non-constant subscript (arithmetic: a[i++]), ${v:o:l},
@@ -2751,9 +2752,12 @@ local PURE_PEXP_OP = { len = 1, ["-"] = 1, [":-"] = 1, ["+"] = 1, [":+"] = 1, ["
 local function noexp(s)
 	return s == nil or not s:find("[$`]")
 end
-local function word_pure(w)
+local function word_pure(w, vnames)
 	for _, p in ipairs(w.parts) do
 		local e = p.pexp
+		if vnames and (p.var or (e and e.name)) then
+			vnames[#vnames + 1] = p.var or e.name
+		end
 		if e then
 			if (e.op and not PURE_PEXP_OP[e.op]) or not noexp(e.arg) or not noexp(e.arg2)
 				or (e.index and not e.index:find("^[@*]$") and not e.index:find("^%d+$")) then
@@ -2765,11 +2769,11 @@ local function word_pure(w)
 	end
 	return true
 end
-local function cmdsub_pure_st(st, fns)
+local function cmdsub_pure_st(st, fns, vnames)
 	local t = st.t
 	if t == "andor" or t == "pipeline" then
 		for _, it in ipairs(st.items or st.cmds) do
-			if not cmdsub_pure_st(it.cmd or it, fns) then
+			if not cmdsub_pure_st(it.cmd or it, fns, vnames) then
 				return false
 			end
 		end
@@ -2785,7 +2789,7 @@ local function cmdsub_pure_st(st, fns)
 		return false
 	end
 	for j = 2, #ws do
-		if not word_pure(ws[j]) then
+		if not word_pure(ws[j], vnames) then
 			return false
 		end
 	end
@@ -2805,12 +2809,26 @@ local function cmdsub_pure_st(st, fns)
 	end
 	return true
 end
-function M.cmdsub_pure(stmts, fns, src)
+function M.cmdsub_pure(stmts, fns, src, vnames)
 	if src:find("BASHPID", 1, true) or src:find("RANDOM", 1, true) then
 		return false
 	end
 	for _, st in ipairs(stmts) do
-		if not cmdsub_pure_st(st, fns) then
+		if not cmdsub_pure_st(st, fns, vnames) then
+			return false
+		end
+	end
+	return true
+end
+-- A pure body's variable reads are side-effect free only while none of them is a nameref:
+-- one whose target is an element (`declare -n r='a[i++]'`) evaluates the subscript's
+-- arithmetic on every read — an assignment the subshell must not leak. `vnames` (collected
+-- by M.cmdsub_pure) is checked at run time: capture_src here, the compiled guard (emit).
+function M.no_refs(sh, vnames)
+	local vars = sh.vars
+	for i = 1, #vnames do
+		local b = vars[vnames[i]]
+		if b and b.ref then
 			return false
 		end
 	end
@@ -2880,7 +2898,8 @@ function Shell:capture_src(src, backtick, noalias, line0)
 	end
 	-- Full subshell isolation (checkpoint/restore, in-process) UNLESS the body is provably
 	-- pure (M.cmdsub_pure): then just the light $() state (the common `$(cmd)` case).
-	local iso = not M.cmdsub_pure(ast.stmts, self.functions, src)
+	local vnames = {}
+	local iso = not (M.cmdsub_pure(ast.stmts, self.functions, src, vnames) and M.no_refs(self, vnames))
 	local has_perr = false
 	for _, st in ipairs(ast.stmts) do
 		if st.t == "parse_error" then

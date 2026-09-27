@@ -1691,8 +1691,9 @@ function compile_cmdsub_inner(src, backtick, lifted, aenv, noalias, posix)
 	-- so a called function and the body share `v_x`; __iso_cmdsub swap-saves them.
 	-- (pure: rt.cmdsub_pure, the one authority — with this program's functions)
 	local bt = backtick and "true" or "false"
+	local vnames = {} -- (the names it reads: guarded at run time, none a nameref — rt.no_refs)
 	local pure = #ast.stmts > 0
-		and require("runtime").cmdsub_pure(ast.stmts, (emit_frag_ctx and emit_frag_ctx.funcflags) or {}, src)
+		and require("runtime").cmdsub_pure(ast.stmts, (emit_frag_ctx and emit_frag_ctx.funcflags) or {}, src, vnames)
 	local isolated = not pure and not EF.inproc_trap_block and #ast.stmts > 0
 	local id = emit_fragment(ast.stmts, nil, isolated and EF.lifted_set or nil)
 	if not id then
@@ -1717,6 +1718,16 @@ function compile_cmdsub_inner(src, backtick, lifted, aenv, noalias, posix)
 	-- one, line mode, env-imported BASH_FUNC_x%%), and a function there would be a
 	-- side effect run without the checkpoint.
 	local guard = call ~= forked and dyn_guard(ast.stmts, pure)
+	if guard and pure and #vnames > 0 then
+		local q, seen = {}, {}
+		for _, n in ipairs(vnames) do
+			if not seen[n] then
+				seen[n] = true
+				q[#q + 1] = ("%q"):format(n)
+			end
+		end
+		guard = ("(%s and rt.no_refs(sh, %s))"):format(guard, EF.konst(q))
+	end
 	if guard then
 		call = ("(%s and %s or %s)"):format(guard, call, forked)
 	end
