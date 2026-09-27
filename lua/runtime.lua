@@ -2653,11 +2653,10 @@ function Shell:exec_t(args)
 	-- streams and SIGPIPE propagates, and there's no 2x-memory capture.
 	if self.out == io.write or CO_OUTS[self.out] then
 		io.flush() -- our own buffered stdout (and a pipeline stage's) must reach fd 1 first
-		-- (an async job's command — not a function's — or one in an async subshell: with
-		-- SIGINT/SIGQUIT ignored, setup_async_signals)
-		local ist = self.iso_ctx
-		local hold = (self.bg_cd and self.bg_cd == self.calldepth)
-			or (ist and ist[1] and ist[#ist].igint and (ist[#ist].igint[2] or ist[#ist].igint[3]) and true)
+		-- (an async job's own command — not a function's, nor one inside an async ( … ) or
+		-- { … }: with SIGINT/SIGQUIT ignored — execute_disk_command's child restores the
+		-- original dispositions, then setup_async_signals again only when it is async itself)
+		local hold = self.bg_cd and self.bg_cd == self.calldepth
 		M.nspawn = M.nspawn + 1 -- (a real child: its death is a real SIGCHLD)
 		local held = M.fg_hold_enter() -- (from the fork on: the child may signal us at once)
 		local rc, pid = spawn_argv(self, execpath, args, n, nil, hold, 0)
@@ -6009,7 +6008,9 @@ function Shell:bg_launch(fn, cmdstr, flat, simple, upv_get, upv_set, opts)
 				-- (a function it calls: no tail inside; "fn": the emitter's direct call, at this pd)
 				t.sh.shlvl_tail, t.sh.shlvl_cs = g.simple ~= "fn" and t.sh.pd or nil, nil
 				t.sh.xstage = true -- (its external is the job's process: reported as the job)
-				t.sh.bg_cd = t.sh.calldepth -- (…run with SIGINT/SIGQUIT ignored: Shell:exec)
+				if g.simple ~= "fn" then -- (not a function's commands: they get the defaults)
+					t.sh.bg_cd = t.sh.calldepth -- (…run with SIGINT/SIGQUIT ignored: Shell:exec)
+				end
 			end
 			if bufcap then -- inside a buffered $(…): its output is the substitution's too
 				t.sh.out, t.sh.capturing = self.out, true
