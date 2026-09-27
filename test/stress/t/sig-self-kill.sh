@@ -28,6 +28,13 @@ echo "parent m=$m"
 # an EXTERNAL signalling a subshell by its $BASHPID reaches it (bash: a real process)
 ( trap 'echo "  subshell trap"' USR2; /bin/kill -USR2 $BASHPID 2>/dev/null || echo "  kill failed"; echo "subshell goes on" )
 trap - USR1 USR2
+# a trap's `exit N` ends the SHELL with N — from a stage, a subshell, a $(…), a job (its
+# hook fired while that in-process context ran: the trap is still the shell's)
+for c in '{ kill -TERM $$; echo a; } | cat' '( kill -TERM $$ )' 'x=$(kill -TERM $$; echo v)' \
+	'{ kill -TERM $$; } & wait' '{ kill -TERM $$; } & while (( SECONDS < 5 )); do :; done'; do
+	"$THIS_SH" -c 'trap "exit 9" TERM; eval "$1"; echo "ran on"; exit 3' _ "$c" >/dev/null
+	echo "exit in trap, $c: status $?"
+done
 # a trap interrupting the wait for a $(…) child must not leak a zombie
 trap 'n=$((n+1))' USR1
 for k in 1 2 3 4 5; do x=$("$STH" sendwhen $$ 10 3000 any; echo in); done

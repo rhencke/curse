@@ -2962,7 +2962,13 @@ function Shell:exec_t(args)
 	C.posix_spawn_file_actions_adddup2(fa, wfd, 1)
 	C.posix_spawn_file_actions_addclose(fa, rfd)
 	M.nspawn = M.nspawn + 1
+	-- (its output captured, the shell still waits for it as a foreground command: its
+	-- traps run once it has ended — M.fg_hold_enter, as the inherited-fd path above)
+	local held = M.fg_hold_enter()
 	local rc, pid = spawn_argv(self, execpath, args, n, fa, false, 0)
+	if rc ~= 0 then
+		M.fg_hold_leave(self, held)
+	end
 	if rc == 8 then -- ENOEXEC: no-shebang script — our interpreter runs it, into the capture
 		C.close(wfd)
 		C.close(rfd)
@@ -2978,20 +2984,26 @@ function Shell:exec_t(args)
 	end
 	local buf = ffi.new("char[65536]")
 	local chunks = {}
-	while true do
-		M.co_block(rfd, POLLIN)
-		local nr = C.read(rfd, buf, 65536)
-		if nr < 0 and ffi.errno() == 4 then
-			M.eintr()
-			nr = 0 -- EINTR (a trapped signal: its trap has run): read on
-		elseif nr <= 0 then
-			break
-		end
-		chunks[#chunks + 1] = ffi.string(buf, nr)
-	end
-	C.close(rfd)
 	local st = ffi.new("int[1]")
-	M.wait_child(pid, st, 0)
+	local ok, err = pcall(function()
+		while true do
+			M.co_block(rfd, POLLIN)
+			local nr = C.read(rfd, buf, 65536)
+			if nr < 0 and ffi.errno() == 4 then
+				M.eintr()
+				nr = 0 -- EINTR (a trapped signal: held till the command ends): read on
+			elseif nr <= 0 then
+				break
+			end
+			chunks[#chunks + 1] = ffi.string(buf, nr)
+		end
+		C.close(rfd)
+		M.wait_child(pid, st, 0)
+	end)
+	M.fg_hold_leave(self, held)
+	if not ok then
+		error(err, 0)
+	end
 	self.status = M.wexit(st[0])
 	if self.status > 128 then
 		M.fg_ended(self, pid, st[0])
@@ -6406,6 +6418,9 @@ function M.sched_pump(w)
 			if w.untilf and w.untilf() then
 				return
 			end
+			if M.task_held and not w.drop_sigs then
+				return -- (a trapped signal came: the shell runs its trap now — `wait` ends)
+			end
 			-- a job preempted this round is runnable again at once; still poll (without
 			-- blocking) so the waiter's fd, its deadline, and jobs waiting on I/O get their
 			-- turn — a computing job must not starve them
@@ -6437,6 +6452,9 @@ function M.sched_pump(w)
 				if co_poll(ctx, waiting, tick, tmo, f, w.ev or POLLIN) then
 					ready = true
 					return
+				end
+				if M.task_held and not w.drop_sigs then
+					return -- (the poll's EINTR: a trapped signal, held — the shell's to run)
 				end
 				if w.deadline and M.wall_secs() >= w.deadline then
 					return
@@ -15165,6 +15183,7 @@ function M.arith_read_slow(sh, name, s)
 				local ok2, r = pcall(fn, sh)
 				sh.arith_depth = sh.arith_depth - 1
 				if not ok2 then
+					require("parser").trap_flow(r)
 					if type(r) == "table" and (r.__curse_experr or r.__curse_matherr or r.__curse_unbound) then
 						error(r)
 					end
@@ -15306,6 +15325,9 @@ function M.arith_str(sh, s)
 	local fn = _acache[s]
 	if fn == nil then
 		local cok, f = pcall(require("emit").compile_arith_value, s)
+		if not cok then
+			require("parser").trap_flow(f)
+		end
 		fn = cok and f or false
 		_acache[s] = fn
 	end
