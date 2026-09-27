@@ -227,6 +227,19 @@ static void run_one(const char *sbx, const char *mode)
   close(fd);
   sbx_reset_cwd(sbx);
   if (!persist) sbx_limits();
+  { /* The script must find 3-9 (and beyond) closed, as under a real shell: without this,
+     * an fd some ancestor left open and forgot about -- afl-cmin's own list-file fd is
+     * the one that bit us, inherited across its exec of afl-showmap and then of us,
+     * landing at fd 4/5 -- is visible to the fuzzed script. A generated/mutated script
+     * doing `exec 5>...`, `>&4`, or a dup chain onto one of those numbers then reads or
+     * WRITES the leaked file instead of getting the clean EBADF a real shell's fd 4/5
+     * would give it (observed: afl-cmin's -T parallelism leaks its OWN per-instance
+     * queue-list fds this way, and a leaked "redirect" test then appended stray lines to
+     * the OTHER instance's list -- afl-cmin misread them as paths: "Unable to access
+     * '<content>'"). AFL's own forkserver control fds sit at 198/199, well above this
+     * sweep, and our own savederr/errfd (below) are relocated to >=200/>=210 afterward. */
+    int fd3; for (fd3 = 3; fd3 < 128; fd3++) close(fd3);
+  }
   fd = open("/dev/null", O_RDWR);
   dup2(fd, 0);
   if (!keepout) dup2(fd, 1);
