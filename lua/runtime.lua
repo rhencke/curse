@@ -2189,10 +2189,12 @@ local function redir_open(sh, op, fd, target, saves, vname)
 end
 M.redir_open = redir_open
 function M.redir_apply(sh, op, fd, target, saves)
-	-- In a pipeline stage, builtins write the redirected fd 1 directly while it's moved (as
-	-- the interpreter does): the stage's buffer would reach it only at restore, too late
-	-- for a write error (`echo x >/dev/full | …`) to be seen and reported by the command.
-	if (fd == 1 or op == "outboth" or op == "appboth") and not saves.out_sh and CO_OUTS[sh.out] then
+	-- With fd 1 moved, builtins write the redirected fd 1 directly (as the interpreter's
+	-- sr_run_cmd does): a pipeline stage's buffer would reach it only at restore, too late
+	-- for a write error (`echo x >/dev/full | …`) to be seen and reported by the command;
+	-- a buffered `$(…)` capture's (no temp file for an fd-level one: capture_inproc) would
+	-- take what `echo hi >&2` wrote.
+	if (fd == 1 or op == "outboth" or op == "appboth") and not saves.out_sh and sh.out ~= io.write then
 		saves.out_sh, saves.out = sh, sh.out
 		sh.out = io.write
 	end
@@ -2208,8 +2210,9 @@ end
 -- them. Returns the applier's ok.
 function M.redir_apply_one(sh, r, saves, ctx) -- (ctx: the command, naming a {v} error)
 	local I = require("interp")._int
-	if not saves.out_sh and CO_OUTS[sh.out] and I.redirs_touch_stdout({ r }) then
-		saves.out_sh, saves.out = sh, sh.out -- (a pipeline stage: builtins write fd 1 directly)
+	if not saves.out_sh and sh.out ~= io.write and I.redirs_touch_stdout({ r }) then
+		saves.out_sh, saves.out = sh, sh.out -- (a pipeline stage, a buffered capture: builtins
+		-- write fd 1 directly — M.redir_apply)
 		sh.out = io.write
 	end
 	local sv, ok = I.apply_redirs(sh, { r }, nil, ctx)

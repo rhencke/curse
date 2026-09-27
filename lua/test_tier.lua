@@ -79,6 +79,35 @@ do
 	print(("  %s  %s"):format(lok and "OK" or "*** FAIL ***", ok and got:gsub("\n", "|") or tostring(err)))
 end
 
+-- A compiled `$(…)` whose fd-level sink has no temp file (no writable $TMPDIR or /tmp:
+-- rt.mktmpfd fails) captures into a Lua buffer: a builtin whose stdout is redirected
+-- (`echo hi >&2`) must write the redirected fd, not that buffer (fuzz F22: `[hi]`).
+print("\n=== compiled $(…) without a temp file: redirected builtin output ===")
+do
+	local rt = T.rt
+	local sh = rt.Shell.new()
+	local buf = {}
+	sh.out = function(s)
+		buf[#buf + 1] = s
+	end
+	local src = 'x=$(echo hi 2>/dev/null >&2); echo "[$x]"\n'
+		.. 'f() { echo fn; }; y=$(f 2>/dev/null >&2); echo "[$y]"\n'
+		.. 'z=$(echo a; echo b >/dev/null; echo c); echo "[$z]"\n'
+		.. 'w=$(echo p; { echo q; } >/dev/null); echo "[$w]"\n'
+	local mod = T.compile(require("parser").parse(src))
+	local real = rt.mktmpfd
+	rt.mktmpfd = function()
+		return -1
+	end
+	local ok, err = pcall(T.run_compiled, mod, sh, nil)
+	rt.mktmpfd = real
+	local got = table.concat(buf)
+	local want = "[]\n[]\n[a\nc]\n[p]\n"
+	local cok = ok and got == want
+	allok = allok and cok
+	print(("  %s  %s"):format(cok and "OK" or "*** FAIL ***", ok and got:gsub("\n", "|") or tostring(err)))
+end
+
 if not allok then
 	os.exit(1)
 end
