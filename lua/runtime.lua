@@ -1181,6 +1181,9 @@ end
 -- which ends the wait early with -1 (bash's wait_intr_buf) — else an EINTR is retried.
 function M.wait_child(pid, stbuf, flags, intr, inplace)
 	flags = flags or 0
+	if next(M.internal_pids) then -- (orphans that ended meanwhile: rt.reap_orphans)
+		M.reap_orphans()
+	end
 	local t = flags == 0 and co_task() or nil
 	if t or (flags == 0 and sched_live()) then
 		local pfd = tonumber(C.curse_co_syscall(434, pid, 0)) -- pidfd_open
@@ -2657,6 +2660,9 @@ end
 -- owns, the signal mask a bash child starts with, SIGINT/SIGQUIT ignored for an async one
 -- (`hold`), and the child environ with SHLVL moved by `lvl`. Returns rc, pid.
 local function spawn_argv(self, path, args, n, fa, hold, lvl)
+	if next(M.internal_pids) then -- (a `ps` it runs must not see orphans that have ended)
+		M.reap_orphans()
+	end
 	local argv = ffi.new("const char*[?]", n + 1)
 	local anchor = {} -- keep the Lua strings alive while argv points into them
 	for i = 1, n do
