@@ -4,10 +4,16 @@
 # + pinning LuaJIT, generating the module bundle, linking the static `curse`,
 # the C client, tests, install) is Meson's job.
 #
-# Meson has already prepared the source (subprojects/luajit): curse.patch applied
-# and lib_cursesys.c / lib_cursesig.c overlaid into src/ (see subprojects/
-# luajit.wrap + packagefiles/). This script just:
-#   1. copy that prepared source into a private build tree
+# Meson fetches + pins the source (subprojects/luajit) and, at SUBPROJECT SETUP
+# only, applies curse.patch and overlays lib_cursesys.c / lib_cursesig.c (see
+# subprojects/luajit.wrap + packagefiles/). Meson never re-applies them, so an
+# edit to packagefiles/luajit/{curse.patch,src/*} would leave that prepared tree
+# (and any VM built from it) stale. This script therefore does NOT build from the
+# prepared tree: it builds from the pristine pinned upstream commit (`git
+# archive` of the checkout's HEAD) plus the LIVE packagefiles overlay + patch --
+# which the top-level meson.build lists as depend_files, so editing them rebuilds
+# the VM. Steps:
+#   1. pristine pinned source + live overlay + live curse.patch -> private tree
 #   2. build libluajit.a via LuaJIT's Makefile, fold in the curse C libs (`ar`)
 #   3. (optional) 3-stage PGO: instrument -> train on cold+hot workloads -> rebuild
 #   4. link the dynamic `luajit`
@@ -39,12 +45,17 @@ OUT=$(CDPATH= cd -- "$OUT" && pwd)
 WORK="$OUT/luajit-build"   # private patched build tree (a copy of the pinned src)
 LJ="$WORK/src"
 
-# 1. Fresh copy of the Meson-prepared source (already patched, curse C libs in
-#    src/) into a private, writable build tree (LuaJIT builds in-tree). Drop .git
-#    and the files the packagefiles/luajit overlay dropped in (the subproject
-#    meson.build and curse.patch itself); they play no part in the Makefile build.
+# 1. Private, writable build tree (LuaJIT builds in-tree): the pristine pinned
+#    upstream commit (committed objects only -- immune to whatever the prepared
+#    working tree holds), then the live overlay's C sources, then the live patch.
+#    The overlay's meson.build and curse.patch itself play no part in the build.
+PKG="$REPO/subprojects/packagefiles/luajit"
 rm -rf "$WORK"; mkdir -p "$WORK"
-( cd "$SRC" && tar cf - --exclude=.git --exclude=meson.build --exclude=curse.patch . ) | ( cd "$WORK" && tar xf - )
+git -C "$SRC" archive --format=tar HEAD | ( cd "$WORK" && tar xf - ) || {
+  echo "build-luajit-vm: cannot read the pinned LuaJIT commit from $SRC (git archive HEAD)" >&2; exit 1; }
+( cd "$PKG" && tar cf - --exclude=meson.build --exclude=curse.patch . ) | ( cd "$WORK" && tar xf - )
+patch -d "$WORK" -p1 --quiet --forward --no-backup-if-mismatch < "$PKG/curse.patch" || {
+  echo "build-luajit-vm: $PKG/curse.patch does not apply to the pinned LuaJIT" >&2; exit 1; }
 
 # 3. Build libluajit.a via LuaJIT's Makefile, then fold in the curse C libs.
 # LuaJIT's own final `luajit` link fails (it can't see the curse shim) — expected,

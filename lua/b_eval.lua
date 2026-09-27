@@ -84,9 +84,10 @@ return function(sh, cmd, args, hook, tcb)
 						end
 						if lg.perr then -- syntax error on the line: run nothing on it (bash), status 2
 							-- (reported as the shell's own syntax errors are, labelled `eval:`)
+							local spl = sh.perr_label
 							sh.perr_label = "eval"
 							local pok, perr = pcall(require("interp").exec_stmt, sh, lg.perr, hook)
-							sh.perr_label = nil
+							sh.perr_label = spl
 							if not pok and not (type(perr) == "table" and perr.__curse_parseerr) then
 								error(perr)
 							end
@@ -99,6 +100,7 @@ return function(sh, cmd, args, hook, tcb)
 						for _, st in ipairs(lg.stmts) do
 							ran = ran or not rt.perr_neutral(st)
 							local ne0 = sh.noerr
+							local pf0 = sh.procsub_files and #sh.procsub_files or 0
 							local sok, serr = pcall(exec_list, sh, { st }, hook, false) -- errexit + signals incl.
 							if not sok then
 								if type(serr) == "table" and serr.__curse_lineabort and not serr.__curse_discard then
@@ -106,7 +108,7 @@ return function(sh, cmd, args, hook, tcb)
 										error(serr)
 									end
 									sh.noerr = ne0
-									rt.line_aborted(sh, 1)
+									rt.line_aborted(sh, 1, pf0)
 									break -- div0/failglob: abort the rest of this line
 								else
 									error(serr)

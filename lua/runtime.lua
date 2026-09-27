@@ -129,6 +129,11 @@ local function current_line(sh)
 		if M.INTERP_FRAMES[f] then
 			break -- the interpreter is innermost: its sh.cur_line is current
 		end
+		if line and f == M.source_run then
+			-- a compiled sourced file's line: the file labels it (sh.cur_source), not
+			-- the compiled function that ran the `source` (bash: BASH_SOURCE[0])
+			return line
+		end
 		local t = M.PCLINE[f]
 		if t then
 			if not line then
@@ -1065,6 +1070,29 @@ function M.preempt()
 		end
 	end
 end
+-- Give the job groups `gs` (<()/>() children) their first turn: bash forked each at
+-- expansion, so whatever it runs starts while every procsub end made so far is open.
+-- From the shell, a pump runs all that can run; inside a stage, yield until each has run.
+function M.procsub_start(gs)
+	local t = co_task()
+	if not t then
+		M.sched_pump({})
+		return
+	end
+	for _ = 1, 64 do
+		local pending = false
+		for _, g in ipairs(gs) do
+			local gt = g.tasks and g.tasks[1]
+			if gt and not gt.ran and not g.done then
+				pending = true
+			end
+		end
+		if not pending then
+			return
+		end
+		M.preempt()
+	end
+end
 -- Wait until `fd` is ready for `ev` (POLLIN/POLLOUT). A no-op outside a stage.
 function M.co_block(fd, ev)
 	local t = co_task()
@@ -1545,11 +1573,30 @@ local _ropen_st = ffi.new("char[144]")
 -- Low fds the shell hands out by NUMBER (a process substitution's /dev/fd/63) are open in
 -- the one process every in-process subshell shares: an external spawned by a DIFFERENT
 -- shell (a background job, a stage) must not inherit one — `tee >(wc -c)`: wc would hold a
--- writer on its own input. fd -> the shell it belongs to; foreign_fa closes the others'.
+-- writer on its own input. fd -> { owner shell, generation }; foreign_fa closes the fd for
+-- every other shell — except one cloned (a pipeline stage, an async job: Shell:stage_clone),
+-- directly or through its own clones, from the owner AFTER the fd was made: as a process
+-- forked then, it has inherited it (`f > >(cat)` with f running `ls | tr`: ls sees 63).
 M.fd_owner = {}
+M.fd_gen = 0 -- (bumped per registration; a clone records the value it was made at)
+function M.fd_register(fd, sh)
+	M.fd_gen = M.fd_gen + 1
+	M.fd_owner[fd] = { sh = sh, gen = M.fd_gen }
+end
+local function fd_inherits(self, rec)
+	local s = self
+	while s do
+		local p = s.clone_parent
+		if p == rec.sh then
+			return (s.clone_gen or 0) >= rec.gen
+		end
+		s = p
+	end
+	return false
+end
 function M.foreign_fa(self, fa)
-	for fd, owner in pairs(M.fd_owner) do
-		if owner ~= self and C.fcntl(fd, 1) >= 0 then
+	for fd, rec in pairs(M.fd_owner) do
+		if rec.sh ~= self and not fd_inherits(self, rec) and C.fcntl(fd, 1) >= 0 then
 			if not fa then
 				fa = ffi.new("uint8_t[1024]")
 				C.posix_spawn_file_actions_init(fa)
@@ -1665,11 +1712,12 @@ function M.open_read(path)
 	M.rd_gen = M.rd_gen + 1 -- (`source /dev/stdin`, `$(< /dev/stdin)`: reads a shared input)
 	if not (CO or sched_live()) or C.curse_rt_stat(path, _ropen_st) ~= 0
 		or bit.band(ffi.cast("uint32_t *", _ropen_st + 24)[0], 0xF000) ~= 0x1000 then
-		return io.open(path, "r")
+		local f, _, en = io.open(path, "r")
+		return f, en -- (nil, errno)
 	end
 	local fd = M.ropen(path, 0, 0)
 	if fd < 0 then
-		return nil
+		return nil, ffi.errno()
 	end
 	local chunks, buf = {}, ffi.new("char[8192]")
 	while true do
@@ -1830,10 +1878,11 @@ end
 end
 -- A redirection's open failed: bash's message, from errno (read right after the open).
 -- noclobber's O_EXCL miss on a regular file is "cannot overwrite existing file".
-function M.open_fail(sh, path)
+function M.open_fail(sh, path, vname)
 	local e = ffi.errno()
-	local msg = (e == 17 and sh.opt_C) and "cannot overwrite existing file" or ffi.string(C.strerror(e))
-	io.stderr:write("curse: " .. path .. ": " .. msg .. "\n")
+	local nc = e == 17 and sh.opt_C
+	local msg = nc and "cannot overwrite existing file" or ffi.string(C.strerror(e))
+	io.stderr:write("curse: " .. (nc and vname or path) .. ": " .. msg .. "\n")
 end
 -- An all-digit `>&WORD` as a fd: legal_number + (int)lfd == lfd (redir.c), else -1 (EBADF) —
 -- a huge number must not wrap onto a real fd.
@@ -1864,18 +1913,24 @@ local function open_noclobber(path)
 	ffi.errno(e)
 	return -1
 end
-local function redir_backup(saves, fd)
-	saves[#saves + 1] = { fd = fd, saved = M.save_fd(fd) }
+local function redir_backup(saves, fd, sh)
+	local e = { fd = fd, saved = M.save_fd(fd) }
+	saves[#saves + 1] = e
+	if sh and sh.iso_ctx and sh.iso_ctx[1] then
+		M.iso_note_save(sh, e)
+	end
 end
 -- THE redirection applier of both tiers (compiled code via redir_apply, interp's
 -- apply_redirs for its file/here-doc redirections): install one redirection whose target
 -- is already expanded, backing each touched fd up into `saves` first — `saves` nil: no
 -- backup (a `{v}>` named fd persists after the command: bash). false on failure (message
 -- written), nil for an op it has no form for.
-local function redir_open(sh, op, fd, target, saves)
+-- (`vname`: a `{v}>…` redirection's variable — bash's redirection_error names it, not the
+-- file, for its own errors: restricted, noclobber)
+local function redir_open(sh, op, fd, target, saves, vname)
 	local flags = REDIR_FLAGS[op]
 	if flags and flags ~= 0 and sh.opt_r then -- a restricted shell writes no files
-		io.stderr:write("curse: " .. tostring(target) .. ": restricted: cannot redirect output\n")
+		io.stderr:write("curse: " .. tostring(vname or target) .. ": restricted: cannot redirect output\n")
 		return false
 	end
 	io.flush() -- flush buffered stdout before moving fds (else it lands in the new target)
@@ -1883,16 +1938,16 @@ local function redir_open(sh, op, fd, target, saves)
 		local both = op == "outboth" or op == "appboth" -- &> / &>>: stdout AND stderr
 		if saves then
 			if both then
-				redir_backup(saves, 1)
-				redir_backup(saves, 2)
+				redir_backup(saves, 1, sh)
+				redir_backup(saves, 2, sh)
 			else
-				redir_backup(saves, fd)
+				redir_backup(saves, fd, sh)
 			end
 		end
 		local h = (op ~= "clobber" and flags == 577 and sh.opt_C) and open_noclobber(target)
 			or M.ropen(target, flags, 438)
 		if h < 0 then
-			M.open_fail(sh, target)
+			M.open_fail(sh, target, vname)
 			return false
 		end
 		if both then
@@ -1905,7 +1960,7 @@ local function redir_open(sh, op, fd, target, saves)
 		end
 	elseif op == "dup" or op == "dupin" then -- N>&M / N<&M / N>&- (compiled: digit targets)
 		if target == "-" then
-			redir_backup(saves, fd)
+			redir_backup(saves, fd, sh)
 			C.close(fd)
 		else
 			local tf = M.fd_number(target) -- (emit hands only all-digit targets here)
@@ -1916,12 +1971,12 @@ local function redir_open(sh, op, fd, target, saves)
 				io.stderr:write("curse: " .. target .. ": Bad file descriptor\n")
 				return false
 			end
-			redir_backup(saves, fd)
+			redir_backup(saves, fd, sh)
 			C.dup2(tf, fd)
 		end
 	elseif op == "heredoc" or op == "herestring" then
 		if saves then
-			redir_backup(saves, fd)
+			redir_backup(saves, fd, sh)
 		end
 		local h = _temp_fd(target) -- target = the already-built body text
 		if h < 0 then -- (redir.c: here_document_to_fd's failure, then the command fails)
@@ -2013,14 +2068,18 @@ function M.ps_adrain(sh, m)
 	sh.cur_alist = m[3]
 	require("interp")._int.drain_procsub(sh, m[1], m[2])
 end
-function M.redir_discard(saves)
+function M.redir_discard(saves, sh) -- (sh: in an in-process subshell, a fd >= 10 is kept)
 	if saves.out_sh then
 		io.flush()
 		saves.out_sh.out, saves.out_sh = saves.out, nil
 	end
 	for i = #saves, 1, -1 do
-		if saves[i].saved >= 0 then
-			C.close(saves[i].saved)
+		local s = saves[i]
+		s.done = true
+		if s.saved >= 0 and not (sh and M.iso_keep_fd(sh, s.fd, s.saved)) then
+			C.close(s.saved)
+		elseif s.saved < 0 and sh then
+			M.iso_keep_fd(sh, s.fd, -1)
 		end
 		saves[i] = nil
 	end
@@ -2028,17 +2087,34 @@ end
 -- A command with prefix assignments AND redirections: a readonly prefix is reported before
 -- the redirections apply (bash's assign_in_env runs as the words expand), so to the stderr
 -- from before them; the binding then just skips it (M.ro_said, until the redirections go).
-function M.prefix_ro(sh, names)
+-- A failed assignment (a readonly target, …) jumps to the top level as bash's
+-- do_assignment_statements does: `force` (an assignment statement or a special builtin's
+-- prefix, in posix mode) is FORCE_EOF in a non-interactive shell — exit 1, 127 for the
+-- -c string (run_one_command) — else DISCARD, the rest of the line abandoned (a script
+-- and a -c string alike).
+function M.assign_jump(sh, force)
+	if force and sh.opt_posix and not sh.opt_i then
+		error({ __curse_exit = sh.opt_c and 127 or 1 })
+	end
+	error({ __curse_exit = 1, __curse_lineabort = true })
+end
+-- (posix mode: the line is abandoned right there, before the redirections — the shell
+-- exits for a special builtin's (`cmd`) or no command's: M.prefix_reject)
+function M.prefix_ro(sh, names, cmd)
 	local said
 	for _, name in ipairs(names) do
 		local dn = sh:deref(name)
 		local b = sh.vars[dn]
 		if b and b.ro then
-			io.stderr:write("curse: " .. dn .. ": readonly variable\n")
+			io.stderr:write("curse: " .. name .. ": readonly variable\n")
 			M.report_exit(sh) -- (err_readonly: report_error)
 			said = said or {}
 			said[name] = true
 		end
+	end
+	if said and sh.opt_posix then
+		sh.status = 1
+		M.assign_jump(sh, cmd == nil or M.SPECIAL_BUILTIN[cmd] ~= nil)
 	end
 	M.ro_said = said
 end
@@ -2056,6 +2132,7 @@ function M.redir_undo(saves)
 	end
 	for i = #saves, 1, -1 do
 		local s = saves[i]
+		s.done = true
 		if s.saved >= 0 then
 			C.dup2(s.saved, s.fd)
 			C.close(s.saved)
@@ -2334,6 +2411,26 @@ function M.fg_ended(sh, pid, s)
 end
 
 
+-- check_binary_file (general.c) on a file's first bytes: an ELF magic (a corrupt or
+-- foreign ELF the kernel refused), or a NUL in its first line — first two after `#!`.
+function M.binary_sample(sample)
+	if #sample >= 4 and sample:sub(1, 4) == "\127ELF" then
+		return true
+	end
+	local nl = sample:sub(1, 2) == "#!" and 2 or 1
+	for k = 1, #sample do
+		local b = sample:byte(k)
+		if b == 10 then
+			nl = nl - 1
+			if nl == 0 then
+				return false
+			end
+		elseif b == 0 then
+			return true
+		end
+	end
+	return false
+end
 -- A no-shebang script runs as a FRESH shell would (bash's reinitialized child: only the
 -- exported environment, its own vars/functions/traps) — in-process: a new Shell, run
 -- inside an isolation context of ours (its stack shared) so the process-global state the
@@ -2346,25 +2443,24 @@ function Shell:run_script_inproc(path, args, n, out)
 	if f then
 		f:close()
 	end
-	do -- (check_binary_file: a NUL before the first newline in its first 80 bytes)
-		local z = src:find("\0", 1, true)
-		if z and z <= 80 then
-			local nl = src:find("\n", 1, true)
-			if not nl or nl > z then
-				self:errmsg("curse: " .. path .. ": cannot execute binary file: Exec format error\n")
-				if self.exec_builtin then -- (exec_builtin's file_error then, errno 0)
-					self:errmsg("curse: " .. path .. ": Success\n")
-				end
-				self.status = 126
-				return
-			end
+	if M.binary_sample(src:sub(1, 80)) then -- (shell_execve's READ_SAMPLE_BUF: 80 bytes)
+		self:errmsg("curse: " .. path .. ": cannot execute binary file: Exec format error\n")
+		if self.exec_builtin then -- (exec_builtin's file_error then, errno 0)
+			self:errmsg("curse: " .. path .. ": Success\n")
 		end
+		self.status = 126
+		return
+	end
+	if src:find("\0", 1, true) then
+		src = src:gsub("%z", "") -- (shell_getc drops the NUL bytes of a script's text)
 	end
 	local csh = M.cur_shell -- (before Shell.new, which makes the new shell current)
 	local depth = self.subdepth -- (a fresh shell: $BASH_SUBSHELL as it is here)
 	local child = Shell.new()
 	-- (`exec`'s script: $0 is its -a NAME, else the full pathname — shell_execve)
-	child.argv0, child.out = self.exec_builtin and (self.exec_script_a0 or path) or args[1], out or io.write
+	-- (a command's: the pathname it was run by — found along PATH, the full one; shell_execve
+	-- puts `command` in its argv[0] slot)
+	child.argv0, child.out = self.exec_builtin and (self.exec_script_a0 or path) or path, out or io.write
 	child.capturing = out and true or nil
 	child.shopt.globskipdots = self.shopt.globskipdots -- (reset_shopt_options keeps it)
 	M.startup_ignored(child) -- a new shell: what's ignored now stays ignored
@@ -2768,7 +2864,8 @@ end
 --    assignment, array argument or redirection (a builtin's redirected output needs the
 --    fd-level capture), whose name is one literal that is no function in `fns` and is
 --    an external (a separate process) or one of PURE_CMDSUB_BUILTIN;
---  * every word of it expands without side effects (word_pure): only literals, plain
+--  * every word of it expands without side effects (word_pure, and no name it reads is a
+--    nameref at run time: M.no_refs): only literals, plain
 --    $name/$N/$@…, nested $(…)/<(…) (subshells deciding for themselves), and ${…}
 --    forms whose operator can't assign, evaluate arithmetic, or expand further — no
 --    ${v:=…}, ${!v}, $((…)), non-constant subscript (arithmetic: a[i++]), ${v:o:l},
@@ -2786,9 +2883,12 @@ local PURE_PEXP_OP = { len = 1, ["-"] = 1, [":-"] = 1, ["+"] = 1, [":+"] = 1, ["
 local function noexp(s)
 	return s == nil or not s:find("[$`]")
 end
-local function word_pure(w)
+local function word_pure(w, vnames)
 	for _, p in ipairs(w.parts) do
 		local e = p.pexp
+		if vnames and (p.var or (e and e.name)) then
+			vnames[#vnames + 1] = p.var or e.name
+		end
 		if e then
 			if (e.op and not PURE_PEXP_OP[e.op]) or not noexp(e.arg) or not noexp(e.arg2)
 				or (e.index and not e.index:find("^[@*]$") and not e.index:find("^%d+$")) then
@@ -2800,11 +2900,11 @@ local function word_pure(w)
 	end
 	return true
 end
-local function cmdsub_pure_st(st, fns)
+local function cmdsub_pure_st(st, fns, vnames)
 	local t = st.t
 	if t == "andor" or t == "pipeline" then
 		for _, it in ipairs(st.items or st.cmds) do
-			if not cmdsub_pure_st(it.cmd or it, fns) then
+			if not cmdsub_pure_st(it.cmd or it, fns, vnames) then
 				return false
 			end
 		end
@@ -2820,7 +2920,7 @@ local function cmdsub_pure_st(st, fns)
 		return false
 	end
 	for j = 2, #ws do
-		if not word_pure(ws[j]) then
+		if not word_pure(ws[j], vnames) then
 			return false
 		end
 	end
@@ -2840,12 +2940,26 @@ local function cmdsub_pure_st(st, fns)
 	end
 	return true
 end
-function M.cmdsub_pure(stmts, fns, src)
+function M.cmdsub_pure(stmts, fns, src, vnames)
 	if src:find("BASHPID", 1, true) or src:find("RANDOM", 1, true) then
 		return false
 	end
 	for _, st in ipairs(stmts) do
-		if not cmdsub_pure_st(st, fns) then
+		if not cmdsub_pure_st(st, fns, vnames) then
+			return false
+		end
+	end
+	return true
+end
+-- A pure body's variable reads are side-effect free only while none of them is a nameref:
+-- one whose target is an element (`declare -n r='a[i++]'`) evaluates the subscript's
+-- arithmetic on every read — an assignment the subshell must not leak. `vnames` (collected
+-- by M.cmdsub_pure) is checked at run time: capture_src here, the compiled guard (emit).
+function M.no_refs(sh, vnames)
+	local vars = sh.vars
+	for i = 1, #vnames do
+		local b = vars[vnames[i]]
+		if b and b.ref then
 			return false
 		end
 	end
@@ -2875,6 +2989,9 @@ function Shell:capture_src(src, backtick, noalias, line0)
 		error(parsed)
 	end
 	local ast = parsed
+	if #ast.stmts == 0 then -- (no command at all — `$()`, `$( )`, `$(# c)`: bash runs no
+		return "" -- subshell, so it's no substitution: $? and an assignment's status stay)
+	end
 	-- $(< file) / `< file`: bash reads the file's contents (a faster $(cat file)) —
 	-- a pure read, no isolation needed, so keep it in-process.
 	if #ast.stmts == 1 then
@@ -2901,21 +3018,26 @@ function Shell:capture_src(src, backtick, noalias, line0)
 				return ""
 			end
 			local path = fs[1]
-			local f = path ~= "" and M.open_read(path)
+			local f, en
+			if path ~= "" then
+				f, en = M.open_read(path)
+			end
 			if f then
 				local c = f:read("*a") or ""
 				f:close()
 				self.status, self.last_cmdsub_status = 0, 0
 				return (M.cmdsub_nul(c):gsub("\n+$", ""))
 			end
-			io.stderr:write("curse: " .. path .. ": No such file or directory\n")
+			M.read_fail(path, en)
 			self.status, self.last_cmdsub_status = 1, 1
 			return ""
 		end
 	end
 	-- Full subshell isolation (checkpoint/restore, in-process) UNLESS the body is provably
 	-- pure (M.cmdsub_pure): then just the light $() state (the common `$(cmd)` case).
-	local iso = not M.cmdsub_pure(ast.stmts, self.functions, src) or M.cs_traps_inherited(self)
+	local vnames = {}
+	local iso = not (M.cmdsub_pure(ast.stmts, self.functions, src, vnames) and M.no_refs(self, vnames))
+		or M.cs_traps_inherited(self)
 	local has_perr = false
 	for _, st in ipairs(ast.stmts) do
 		if st.t == "parse_error" then
@@ -3405,6 +3527,48 @@ M.iso_cur = iso_cur
 -- touches it and put back when the context ends (iso_undo): fds 0-9 (`exec` redirections),
 -- the whole environ (`exec -c`, exec's prefix bindings), signal traps + dispositions,
 -- resource limits, the $RANDOM stream.
+-- A context's fds are saved lazily — at its first `exec` — so a redirection the body
+-- has active then (`{ exec 3>f; } 2>&1`) must not be taken for the context's own state:
+-- each save made inside the context is noted (fd -> its saves, oldest first), and the
+-- oldest one still active holds the value the context started with.
+function M.iso_note_save(sh, e)
+	local ctx = iso_cur(sh)
+	if not ctx or ctx.task_fds or (ctx.fds and e.fd <= 9) or (ctx.hifds and ctx.hifds[e.fd]) then
+		return -- (that fd's state is already kept)
+	end
+	local pre = ctx.pre
+	if not pre then
+		pre = {}
+		ctx.pre = pre
+	end
+	local l = pre[e.fd]
+	if not l then
+		l = {}
+		pre[e.fd] = l
+	end
+	local n = 0 -- (only the saves still active matter: drop the undone ones)
+	for i = 1, #l do
+		if not l[i].done then
+			n = n + 1
+			l[n] = l[i]
+		end
+	end
+	for i = #l, n + 1, -1 do
+		l[i] = nil
+	end
+	l[n + 1] = e
+end
+function M.iso_pre(ctx, fd)
+	local l = ctx.pre and ctx.pre[fd]
+	if l then
+		for i = 1, #l do
+			if not l[i].done then
+				return l[i]
+			end
+		end
+		ctx.pre[fd] = nil
+	end
+end
 function M.iso_save_fds(sh)
 	local ctx = iso_cur(sh)
 	if not ctx or ctx.fds or ctx.task_fds then -- (a task's fds are its own: nothing to restore)
@@ -3413,7 +3577,12 @@ function M.iso_save_fds(sh)
 	io.flush()
 	local sv = {}
 	for fd = 0, 9 do
-		sv[fd] = dup_hi(fd) -- (-1: closed)
+		local e = M.iso_pre(ctx, fd)
+		if e then -- (under a redirection made in this context: the value from before it)
+			sv[fd] = e.saved >= 0 and dup_hi(e.saved) or -1
+		else
+			sv[fd] = dup_hi(fd) -- (-1: closed)
+		end
 	end
 	ctx.fds = sv
 end
@@ -3659,8 +3828,50 @@ cap_enter = function()
 end
 
 
+-- A fd >= 10 an in-process subshell opens, replaces or closes for good (`exec 13>f`,
+-- `{v}>f`, `exec 13>&-`) is the parent's too — a forked subshell's changes die with it:
+-- its state from before the subshell's first such change (`saved`: a close-on-exec copy
+-- this takes over, or -1: it was closed) goes back when the context ends. (fds 0-9:
+-- iso_save_fds.) True when `saved` was taken.
+function M.iso_keep_fd(sh, fd, saved)
+	if fd < 10 then
+		return false
+	end
+	local ctx = iso_cur(sh) -- (a pipeline stage's too: its fds 0-9 are its task's own, but
+	if not ctx then -- the rest are the process's)
+		return false
+	end
+	local h = ctx.hifds
+	if not h then
+		h = {}
+		ctx.hifds = h
+	end
+	if h[fd] == nil then
+		local e = M.iso_pre(ctx, fd)
+		if e then -- (under a redirection made in this context: the value from before it)
+			h[fd] = e.saved >= 0 and dup_hi(e.saved) or -1
+			return false
+		end
+		h[fd] = saved
+		return true
+	end
+	return false
+end
 -- (a $(…) puts its fds back BEFORE its capture restores fd 1 — see capture_inproc)
 function M.iso_restore_fds(ctx)
+	local h = ctx.hifds
+	if h then
+		ctx.hifds = nil
+		io.flush()
+		for fd, d in pairs(h) do
+			if d >= 0 then
+				C.dup2(d, fd)
+				C.close(d)
+			else
+				C.close(fd)
+			end
+		end
+	end
 	local sv = ctx.fds
 	if sv then
 		ctx.fds = nil
@@ -4250,8 +4461,15 @@ end
 -- $(< file) / `< file`: bash reads the file's contents (a faster $(cat file)) — a pure
 -- read. NUL bytes stripped, trailing newlines stripped, status 0; a missing file is
 -- status 1 + diagnostic. The compiled tier calls this with the expanded path.
+-- (subst.c: an open failure is file_error — the path and strerror(errno))
+function M.read_fail(path, en)
+	io.stderr:write("curse: " .. path .. ": " .. ffi.string(C.strerror(en or 2)) .. "\n")
+end
 function Shell:capture_file(path)
-	local f = path ~= "" and M.open_read(path)
+	local f, en
+	if path ~= "" then
+		f, en = M.open_read(path)
+	end
 	if f then
 		local c = f:read("*a") or ""
 		f:close()
@@ -4259,7 +4477,7 @@ function Shell:capture_file(path)
 		self.last_cmdsub_status, self.ncs = 0, (self.ncs or 0) + 1
 		return (M.cmdsub_nul(c):gsub("\n+$", ""))
 	end
-	io.stderr:write("curse: " .. path .. ": No such file or directory\n")
+	M.read_fail(path, en)
 	self.status = 1
 	self.last_cmdsub_status, self.ncs = 1, (self.ncs or 0) + 1
 	return ""
@@ -4552,7 +4770,9 @@ function M.import_functions(sh)
 		-- (a path-like name is never imported: `/bin/echo` must stay the program; nor, in
 		-- posix mode, one that isn't an identifier)
 		if not name:find("/", 1, true) and not (sh.opt_posix and not name:find("^[%a_][%w_]*$")) then
-			ok, ast = pcall(P.parse, src)
+			-- (numbered from line 0, as bash's initialize_shell_variables parses it: the
+			-- body's first line is 0, which an error prefix omits — `environment: …`)
+			ok, ast = pcall(P.parse, src, nil, nil, nil, nil, nil, 0)
 		end
 		-- (exactly ONE statement: anything after the definition — `; echo BAD` — is a second
 		-- statement, and a word glued after the body is a syntax error)
@@ -4577,6 +4797,18 @@ function M.import_functions(sh)
 			sh.func_def[name] = st
 			sh.fexport = sh.fexport or {}
 			sh.fexport[name] = true
+			-- (its ${BASH_SOURCE[0]} and error label: bash's "environment", line 0)
+			sh.func_file = sh.func_file or {}
+			sh.func_file[name] = "environment"
+			sh.func_line = sh.func_line or {}
+			sh.func_line[name] = 0
+			-- (what its text reads that compiled callers must maintain: tier start_state)
+			local fl = ((val:find("FUNCNAME", 1, true) or val:find("BASH_SOURCE", 1, true)
+				or val:find("BASH_LINENO", 1, true)) and "F" or "") .. (val:find("PIPESTATUS", 1, true) and "P" or "")
+			if fl ~= "" then
+				local all = (sh.imp_flags or "") .. fl
+				sh.imp_flags = (all:find("F", 1, true) and "F" or "") .. (all:find("P", 1, true) and "P" or "")
+			end
 		else
 			io.stderr:write("curse: error importing function definition for `" .. name .. "'\n")
 		end
@@ -5122,6 +5354,8 @@ function Shell:stage_clone()
 		c[k] = type(v) == "table" and shallowcopy(v) or v
 	end
 	c.subdepth = (self.subdepth or 0) + 1 -- (a stage is a subshell)
+	c.clone_parent, c.clone_gen = self, M.fd_gen -- (the fds it inherits: M.fd_register)
+	c.subenv = true -- (subshell_environment, even where $BASH_SUBSHELL doesn't count it)
 	c.iso_ctx, c.stage_pid, c.vpid, c.rpid = {}, tonumber(C.getpid()), nil, nil
 	if self.iso_ctx and #self.iso_ctx > 0 then -- (a subshell's virtual hard limits stay in force in its stages)
 		local vb = self.iso_vhard_base and shallowcopy(self.iso_vhard_base) or {}
@@ -5405,6 +5639,7 @@ local function co_resume(ctx, t)
 		return
 	end
 	local P = ctx.P
+	t.ran = true -- (M.procsub_start: it has had its first turn)
 	fds_install(t.fd, 0) -- the stage's fds 0-9 (-1: it had closed it)
 	C.environ = t.env
 	if t.cwdfd then -- (a directory it changed to: held by an fd)
@@ -7156,6 +7391,22 @@ end
 -- `more`: other parts follow this literal in the word (see tilde_assign) — a prefix with
 -- no `/` then includes quoted/expanded text (`~""`, `~$USER`) and stays literal (bash).
 -- `noassign`: don't treat `NAME=` specially (posix mode, a non-declaration command).
+-- Is word w shaped like an assignment — its first part an unquoted literal `NAME=` /
+-- `NAME[…]=` (/+=)? Then bash tilde-expands after every `:` in it, not only in that first
+-- literal: `echo z=$x:~` (M.tilde_argcont, both tiers).
+function M.assignish(w)
+	local p1 = w.parts[1]
+	local l = p1 and not p1.q and p1.lit
+	return l and (l:match("^[%a_][%w_]*%+?=") or l:match("^[%a_][%w_]*%b[]%+?=")) ~= nil or false
+end
+-- A LATER unquoted literal of such a word: its text continues the value before it, so
+-- only a `~` after one of its own `:` expands (`noassign`: posix mode's plain argument)
+function M.tilde_argcont(sh, s, more, noassign)
+	if noassign then
+		return s
+	end
+	return M.tilde_assign(sh, s, more, true)
+end
 function M.tilde_word_initial(sh, s, more, noassign)
 	local pre, rest = s:match("^([%a_][%w_]*%+?=)(.*)$")
 	if not pre and s:find("]", 1, true) then -- (`a[1]=~`: a subscripted assignment word too)
@@ -8561,6 +8812,7 @@ local function case_fold(b, s) -- (declare -l/-u/-c: the locale's folding, per c
 	end
 	return s
 end
+M.case_fold = case_fold
 function Shell:set_str(name, s)
 	if s:find("\0", 1, true) then
 		s = M.cstr(s)
@@ -8973,7 +9225,11 @@ end
 -- A line abort contained (bash's DISCARD caught by reader_loop / parse_and_execute): the
 -- status is the failure's, and so is $PIPESTATUS — exp_jump_to_top_level and set_exit_status
 -- both set_pipestatus_from_exit — whatever statement (an assignment too) was abandoned.
-function M.line_aborted(sh, status)
+function M.line_aborted(sh, status, pf0) -- (pf0: the <()/>() count before the line ran)
+	local pf = sh.procsub_files
+	if pf0 and pf and #pf > pf0 then -- (the aborted line's <() close with it: bash's
+		require("interp")._int.drain_procsub(sh, 0, pf0) -- unlink_fifo_list at top level)
+	end
 	sh.status = status
 	sh:array_assign("PIPESTATUS", { tostring(status) }, false)
 end
@@ -9956,7 +10212,12 @@ ffi.cdef([[
   void *opendir(const char *name);
   void *readdir(void *dirp);
   int closedir(void *dirp);
+  struct curse_dirent { unsigned long d_ino; long d_off; unsigned short d_reclen;
+    unsigned char d_type; char d_name[256]; };
 ]])
+-- (glibc's struct dirent as readdir returns it: d_name's offset from the ABI's own
+-- layout, not a number baked in for x86-64)
+M.DNAME_OFF = ffi.offsetof("struct curse_dirent", "d_name")
 local REG_EXTENDED, REG_NOSUB, REG_ICASE = 1, 8, 2
 -- Compiled-regex cache: a `case`/[[ ]]/glob pattern in a loop would otherwise
 -- regcomp+regfree per test. regcomp bakes in LC_CTYPE/LC_COLLATE, so the cache is
@@ -10730,7 +10991,7 @@ local function scan_seg(dir, seg, dotglob, skipdots)
 		if e == nil then
 			break
 		end
-		local name = ffi.string(ffi.cast("const char *", e) + 19) -- d_name @ 19 (glibc x86-64)
+		local name = ffi.string(ffi.cast("const char *", e) + M.DNAME_OFF)
 		-- . and .. are matched only by an explicit leading-dot pattern with
 		-- globskipdots off; a leading-dot name otherwise needs `.`-pattern or dotglob.
 		local dotdot = name == "." or name == ".."
@@ -10984,7 +11245,7 @@ local function rec_dirs(base, dotglob)
 		if e == nil then
 			break
 		end
-		local name = ffi.string(ffi.cast("const char *", e) + 19)
+		local name = ffi.string(ffi.cast("const char *", e) + M.DNAME_OFF)
 		if name ~= "." and name ~= ".." and (name:sub(1, 1) ~= "." or dotglob) then
 			local path = base == "" and name or (base == "/" and "/" .. name or base .. "/" .. name)
 			if is_dir(path) and not is_symlink(path) then -- (`**` doesn't follow symlinked dirs)
@@ -12511,7 +12772,13 @@ function M.array_key(sh, name, raw, expanded)
 	end
 	if not idx then
 		local _, perr = pcall(require("parser").arith, raw)
-		io.stderr:write("curse: " .. require("parser").arith_errmsg(raw, perr) .. "\n")
+		local pok, pe = pcall(require("interp")._int.arith_pre, sh, perr) -- (what ran before it)
+		if not pok and type(pe) == "table" and pe.__curse_unbound then
+			error(pe, 0)
+		end
+		if pok or not (type(pe) == "table" and pe.__curse_matherr) then
+			io.stderr:write("curse: " .. require("parser").arith_errmsg(raw, perr) .. "\n")
+		end
 		error({ __curse_exit = 1, __curse_lineabort = true })
 	end
 	return require("interp")._int.arith_key(sh, name, idx, raw)
@@ -13406,7 +13673,14 @@ function M.ansi_unescape(s, mode)
 			i = i + 1
 		end
 	end
-	return table.concat(out)
+	local r = table.concat(out)
+	if ansi_c then -- ($'…' is a C string: it ends at a \0 — `x$'\0'y` is `xy`, $'a\0b' is `a`)
+		local z = r:find("\0", 1, true)
+		if z then
+			return r:sub(1, z - 1)
+		end
+	end
+	return r
 end
 
 function Shell:echo(...)
@@ -13881,6 +14155,8 @@ end
 -- then the offending line as `…'. Shared by both tiers (the compiled one calls it natively).
 -- `label` "eval": an eval'd text's error reads `NAME: eval: line N:`, and even a recoverable
 -- one ends the eval (status 2, like b_eval) — the caller contains __curse_parseerr.
+M.TRAP_TAGS = { ["trap"] = true, ["exit trap"] = true, ["debug trap"] = true, ["error trap"] = true,
+	["return trap"] = true }
 function M.parse_error_stmt(sh, st, label)
 	label = label or st.plabel
 	for _, w in ipairs(st.warns or {}) do
@@ -13898,6 +14174,23 @@ function M.parse_error_stmt(sh, st, label)
 		end
 		return
 	end
+	-- (a trap handler's FORCE_EOF — a $( … ) body's syntax error — ends the shell too, with
+	-- the syntax error's status 2; the EXIT trap's run just ends: the shell is exiting anyway)
+	local tl = label or sh.perr_label
+	if st.forceeof and M.TRAP_TAGS[tl] and tl ~= "exit trap" and not sh.in_perr_force then
+		sh.in_perr_force = true
+		local _, pe = pcall(M.parse_error_stmt, sh, st, label)
+		sh.in_perr_force = nil
+		error(type(pe) == "table" and pe.__curse_perrexit and pe or { __curse_exit = sh.opt_c and 127 or 2 })
+	end
+	-- (a sourced file's FORCE_EOF ends the shell as an eval's does, status 1)
+	if st.forceeof and not tl and (sh.sourcedepth or 0) > 0 and not sh.in_perr_force then
+		sh.in_perr_force = true
+		local _, pe = pcall(M.parse_error_stmt, sh, st, label)
+		sh.in_perr_force = nil
+		error(type(pe) == "table" and pe.__curse_perrexit and pe or { __curse_exit = sh.opt_c and 127 or 1, __curse_perrexit = true })
+	end
+	-- (under -c every FORCE_EOF reaches run_one_command's top level: status 127 — shell.c)
 	if (label or sh.perr_label) == "eval" and (st.forceeof -- (FORCE_EOF: ends the shell, status 1)
 		or (st.discard and (sh.subdepth or 0) + M.fork_depth > 0)) then
 		local pl = sh.perr_label
@@ -13905,7 +14198,8 @@ function M.parse_error_stmt(sh, st, label)
 		local _, pe = pcall(M.parse_error_stmt, sh, { line = st.line, msg = st.msg, exact = st.exact, text = st.text,
 			showtext = st.showtext, pre = st.pre, preline = st.preline, warns = st.warns, exactmsg = st.exactmsg })
 		sh.perr_label = pl
-		error(type(pe) == "table" and pe.__curse_perrexit and pe or { __curse_exit = 1 })
+		error(type(pe) == "table" and pe.__curse_perrexit and pe
+			or { __curse_exit = (st.forceeof and sh.opt_c) and 127 or 1 })
 	end
 	local msg = tostring(st.msg or "syntax error"):gsub("^.-:%d+: ", "")
 	if not st.exact then
@@ -13926,6 +14220,10 @@ function M.parse_error_stmt(sh, st, label)
 	end
 	if st.line then
 		sh.cur_line = st.line
+		-- (a trap handler's text: its lines count from the line it runs at — run_trap)
+		if sh.trap_lbase and M.TRAP_TAGS[label or sh.perr_label] then
+			sh.cur_line = st.line + sh.trap_lbase - 1
+		end
 	end
 	sh.in_perr = true -- (a `-c` string's syntax errors name it: `bash: -c: line 1:`)
 	local pl = sh.perr_label
@@ -13943,7 +14241,9 @@ function M.parse_error_stmt(sh, st, label)
 			M.parser_error_exit(sh)
 		end
 	end
-	io.stderr:write("curse: " .. msg .. "\n")
+	if not st.nomsg then -- (a [[ ]] error on a word that failed to read: its pre lines are all)
+		io.stderr:write("curse: " .. msg .. "\n")
+	end
 	if sh.opt_e and not sh.ign_ee then
 		sh.perr_label = pl
 		M.parser_error_exit(sh)
@@ -13952,7 +14252,14 @@ function M.parse_error_stmt(sh, st, label)
 		io.stderr:write("curse: " .. (st.showtext and "syntax error: " or "") .. "`" .. st.text .. "'\n")
 	end
 	sh.in_perr, sh.perr_label = nil, pl
-	error({ __curse_exit = st.status or 2, __curse_parseerr = true, lead = st.lead })
+	-- (parse_compound_assignment's parse_string_error: a non-interactive posix shell takes
+	-- FORCE_EOF rather than DISCARD — it ends, status 1)
+	if st.discard and st.status == 1 and sh.opt_posix and not sh.opt_i then
+		sh.status = 1
+		error({ __curse_exit = sh.opt_c and 127 or 1, __curse_perrexit = true }) -- (past eval/source's containment)
+	end
+	error({ __curse_exit = (st.forceeof and sh.opt_c and not tl and not sh.in_perr_force) and 127 or st.status or 2,
+		__curse_parseerr = true, lead = st.lead })
 end
 -- bash's evalstring.c: an eval'd/sourced text's syntax error ends a posix shell only while
 -- this_shell_builtin is still that eval/source — no command ran in the text before it (a
@@ -14057,6 +14364,9 @@ function M.command_query(sh, argv)
 	if argv[j] == "--" then -- (end of options)
 		j = j + 1
 	end
+	if usep and argv[j] ~= nil and M.restricted(sh, "command: -p: restricted") then
+		return -- (command.def: a restricted shell refuses -p, -v/-V included)
+	end
 	I.command_describe(sh, argv, j, vflag == "V", usep)
 end
 
@@ -14069,7 +14379,9 @@ end
 -- `source`'s call frame (bash): ${BASH_SOURCE[0]} is the file as named, BASH_LINENO gets
 -- the `source` line, FUNCNAME gains "source" (shown only inside a function). Shared by both tiers.
 function M.source_enter(sh, name, line, args, j) -- line: the `source` command's (else found on the stack)
-	local fr = { src = sh.cur_source, line = sh.cur_line }
+	-- (the file's syntax errors are its own: no eval/trap label — parse_error_stmt)
+	local fr = { src = sh.cur_source, line = sh.cur_line, pl = sh.perr_label, tlb = sh.trap_lbase }
+	sh.perr_label, sh.trap_lbase = nil, nil
 	if args and sh.shopt.extdebug then -- (BASH_ARGV: its arguments, else the file as named)
 		fr.bav = #args > j and M.bav_push(sh, args, j + 1, #args, -1) or M.bav_push(sh, args, j, j, -1)
 	end
@@ -14099,6 +14411,7 @@ function M.source_leave(sh, fr)
 		table.remove(sh.funcstack, 1)
 	end
 	sh.cur_source, sh.cur_line = fr.src, fr.line
+	sh.perr_label, sh.trap_lbase = fr.pl, fr.tlb
 end
 -- The file `.`/source reads for NAME (bash's source.def): a name with a slash as is;
 -- else, with shopt sourcepath (the default), the first regular file of that name in
@@ -14206,7 +14519,7 @@ function M.source_run(sh, argv, line)
 	if trap and trap ~= "" and not sh.in_return_trap and M.pseudo_trapped(sh, "RETURN") then
 		sh.in_return_trap = true
 		local sv = sh.status
-		Ii.run_trap(sh, trap)
+		Ii.run_trap(sh, trap, "return trap")
 		sh.status = sv
 		sh.in_return_trap = false
 	end
@@ -15236,7 +15549,7 @@ end
 -- A compiled attributed assignment: like interp's assign statement, an expansion/arith
 -- error in it (declare -i x; x='4+') fails just this assignment (status 1), non-fatally.
 function M.assign_scalar_x(sh, name, value)
-	local ok, e = pcall(M.assign_scalar, sh, name, value)
+	local ok, e = pcall(M.assign_scalar, sh, name, value, true)
 	if not ok then
 		if type(e) == "table" and e.__curse_experr and not e.__curse_lineabort then
 			sh.status = 1
@@ -15245,7 +15558,10 @@ function M.assign_scalar_x(sh, name, value)
 		error(e, 0)
 	end
 end
-function M.assign_scalar(sh, name, value)
+-- `stmt`: a standalone assignment statement (`name=value`), where a readonly target —
+-- through a nameref too — aborts the rest of the line as a direct one does (bash's
+-- assignment error: DISCARD); a builtin's store (printf -v, read, local) only fails.
+function M.assign_scalar(sh, name, value, stmt)
 	local direct = sh.vars[name]
 	-- nameref write-through (interp assign path): a cycle (ref -> … -> ref) is a non-fatal
 	-- warning; a nameref whose value carries a SUBSCRIPT (declare -n ref='a[2]') writes to
@@ -15260,7 +15576,7 @@ function M.assign_scalar(sh, name, value)
 			if M.nameref_circular(sh, name) then -- (a function's local cycle: the global, no nameref)
 				local back = sh:global_swap({ name })
 				sh.in_circ = true
-				local ok, e = pcall(M.assign_scalar, sh, name, value)
+				local ok, e = pcall(M.assign_scalar, sh, name, value, stmt)
 				sh.in_circ = nil
 				back()
 				if not ok then
@@ -15277,12 +15593,12 @@ function M.assign_scalar(sh, name, value)
 		local nbase, nsub = (sh:deref_elem(name) or ""):match("^([%a_][%w_]*)%[(.+)%]$")
 		if nbase then
 			local rb = sh.vars[nbase]
-			if rb and rb.ro then -- through a nameref: readonly is non-fatal (bash)
-				io.stderr:write("curse: " .. name .. ": readonly variable\n")
+			if rb and rb.ro then -- (err_readonly names the array; a statement's aborts the line)
+				io.stderr:write("curse: " .. nbase .. ": readonly variable\n")
 				M.report_exit(sh) -- (err_readonly: report_error)
 				sh.status = 1
-				if sh.opt_c or sh.opt_posix then
-					error({ __curse_exit = 1 })
+				if stmt then
+					M.assign_jump(sh, true)
 				end
 				return
 			end
@@ -15297,9 +15613,12 @@ function M.assign_scalar(sh, name, value)
 		io.stderr:write("curse: " .. sh:deref(name) .. ": readonly variable\n") -- (a ref's target)
 		M.report_exit(sh) -- (err_readonly: report_error)
 		sh.status = 1
-		if direct and direct.ref then
+		if direct and direct.ref and not stmt then
 			return
-		end -- through a nameref: non-fatal (bash)
+		end -- through a nameref: a builtin's store only fails
+		if stmt then
+			M.assign_jump(sh, true)
+		end
 		if sh.opt_c or sh.opt_posix then
 			error({ __curse_exit = 1 })
 		end
@@ -15475,7 +15794,7 @@ function M.fn_return(sh, name)
 		elseif not fret then
 			sh.cur_line = sh.func_bline and sh.func_bline[name] or sh.cur_line
 		end
-		local ok, err = pcall(require("interp")._int.run_trap, sh, h)
+		local ok, err = pcall(require("interp")._int.run_trap, sh, h, "return trap")
 		local xst = sh.status
 		sh.status, sh.cur_line = saved, sl
 		sh.in_return_trap = false
@@ -15645,7 +15964,9 @@ do
 	end
 
 	-- A prefix binding of a readonly variable (or the readonly specials SHELLOPTS/BASHOPTS):
-	-- reported (unless M.prefix_ro said it already), status 1, fatal under -c/posix; true.
+	-- reported (unless M.prefix_ro said it already), status 1; true. In posix mode the
+	-- line is abandoned (bash's do_assignment_statements), the shell exits for a special
+	-- builtin's; else the command still runs (-c or not).
 	-- (bash's assign_in_env rejects it before it binds, exports or traces anything; the
 	-- command still runs)
 	function M.prefix_reject(sh, name)
@@ -15655,14 +15976,14 @@ do
 			return false
 		end
 		if not (M.ro_said and M.ro_said[name]) then
-			io.stderr:write("curse: " .. dn .. ": readonly variable\n")
+			io.stderr:write("curse: " .. name .. ": readonly variable\n")
 			M.report_exit(sh) -- (err_readonly: report_error)
 		end
 		sh.status = 1
-		if sh.opt_c or sh.opt_posix then
-			error({ __curse_exit = 1 })
+		if sh.opt_posix then -- (a special builtin's, or no command's: FORCE_EOF; else DISCARD)
+			M.assign_jump(sh, sh.pb_mode == "persist" or sh.pb_mode == "perm")
 		end
-		return true
+		return true -- (not posix: tempenv_assign_error — the command still runs)
 	end
 	-- One prefix binding's store `name=value` (value already expanded, nil = its expansion
 	-- failed; `append` for name+=value), in the mode sh.pb_mode: "tenv" a temporary binding
@@ -15673,7 +15994,10 @@ do
 		if value == nil then
 			return
 		end
-		if sh.opt_x and sh.pb_mode ~= "pre" then -- (each traces before the command: `+ x=1`)
+		-- (each traces before the command: `+ x=1`; a command's binding once it's made —
+		-- assign_in_env traces after binding, so `PS4=… cmd` traces it under the new PS4)
+		local post = sh.pb_mode == "tenv" or sh.pb_mode == "persist"
+		if sh.opt_x and sh.pb_mode ~= "pre" and not post then
 			M.xtrace_assign(sh, name .. (append and "+=" or "="), value)
 		end
 		if sh.pb_mode == "perm" and M.prefix_reject(sh, name) then
@@ -15703,6 +16027,9 @@ do
 		if name == "HISTSIZE" or name == "HISTFILESIZE" then -- (the history follows even a
 			M.hist_resize(sh, name) -- temporary binding: sv_histsize)
 		end
+		if post and sh.opt_x then
+			M.xtrace_assign(sh, name .. (append and "+=" or "="), value)
+		end
 	end
 	-- One prefix binding `name=value` (a NAME=(…) prefix: `raw`, its literal text) — both
 	-- tiers' simple commands (interp's through its bind; a compiled site's bind closure).
@@ -15716,6 +16043,18 @@ do
 		end
 		if raw and sh.opt_x then -- (as its literal string: `+ a='(1 2)'`)
 			M.xtrace_assign(sh, name .. "=", raw)
+		end
+		if append and not raw and value ~= nil then
+			-- `n+=v cmd`: the binding is the var's appended value, as a plain assignment
+			-- would make it (assign_in_env: make_variable_value (var, value, ASS_APPEND) —
+			-- declare -i sums, -l/-u/-c fold, an array appends to its [0]); traced so: `+ n=6`
+			local b = sh.vars[sh:deref(name)]
+			if b and b.int and not b.ref then
+				value = M.i64_to_str(M.int_value(sh, sh:get(name) or "") + M.int_value(sh, value))
+			elseif b then
+				value = M.case_fold(b, (sh:get(name) or "") .. value)
+			end
+			append = false
 		end
 		if mode == "persist" then
 			-- it propagates through any temporary binding of the name (`var=30 f` where
@@ -15763,8 +16102,7 @@ do
 		-- a nameref's / array's / -i/-l/-u/-c var's prefix binding is a plain temporary string
 		-- (bash's tempenv variable: `i=1+1 cmd` passes "1+1"); `n+=3 cmd` on a -i var binds
 		-- the arithmetic sum as that string (make_variable_value appends arithmetically first)
-		local iapp = b and b.int and append and not b.arr and not b.ref and not raw
-		if b and not iapp and (b.ref or b.arr or b.int or b.lower or b.upper or b.cap) then
+		if b and (b.ref or b.arr or b.int or b.lower or b.upper or b.cap) then
 			if b.ref and M.arith_ref_circ(sh, name, 0) == true then -- (a cycle: bash warns, then
 				io.stderr:write("curse: warning: " .. name .. ": circular name reference\n") -- binds)
 			end
@@ -15777,9 +16115,6 @@ do
 			sh:set_str(name, raw)
 		else
 			M.sr_pset(sh, name, value, append)
-			if iapp and sh.vars[name] == b then
-				sh.vars[name] = { s = sh:get(name), exported = b.exported }
-			end
 		end
 		M.lc_quiet = nil
 		local tval = sh:get(name)
@@ -15892,9 +16227,33 @@ do
 		end
 		M.xtrace(sh, argv)
 	end
+	-- The PS4 a prefixed command's own trace line uses: the one outside its temporary
+	-- environment (bash traces the words before the tempenv is visible to lookups) — the
+	-- value a `PS4=… cmd` binding at/after tenv index base+1 shadowed; nil: none bound.
+	-- (bash's subshell_environment: a subshell's lookups search the temporary env — so
+	-- there the command traces under the binding's PS4 after all: find_variable_internal)
+	function M.in_subshell(sh)
+		return sh.subenv or (sh.subdepth or 0) + M.fork_depth > 0
+	end
+	function M.outer_ps4(sh, base)
+		for k = base + 1, #sh.tenv do
+			local te = sh.tenv[k]
+			if te.name == "PS4" and not te.consumed then
+				return te.box and (te.box.s or (te.box.n and M.i64_to_str(te.box.n))) or ""
+			end
+		end
+		return nil
+	end
 	function M.sr_run_cmd(sh, argv, spec, hook, rf, traced)
 		if sh.opt_x and not spec.xt and not traced then
+			local tb = sh.tenv_call_base
+			local o = tb and #sh.tenv > tb and not M.in_subshell(sh) and M.outer_ps4(sh, tb)
+			local sv = sh.xtrace_ps4
+			if o then
+				sh.xtrace_ps4 = o
+			end
 			M.sr_trace(sh, argv, spec)
+			sh.xtrace_ps4 = sv
 			traced = true
 		end
 		-- (`exec`'s redirections are b_exec's: they persist, and so does its fd-1 routing)
@@ -16305,15 +16664,27 @@ function M.assign_full(sh, st)
 	end
 	if rb and rb.ro then -- readonly: reject the assignment (status 1); fatal in `sh -c`
 		-- (or posix mode). Through a nameref bash names the TARGET.
+		-- (do_assignment_internal expands the value and traces it first: `+ r=v`, then
+		-- bind_variable refuses it)
+		local v = ""
+		if st.rhs then
+			v = M.xw_rhs(sh, st.rhs)
+			if v == nil then -- (a non-fatal expansion error: the assignment just fails)
+				sh.assign_err = true
+				return
+			end
+		end
+		if sh.opt_x then
+			local lhs = st.index and (st.name .. "[" .. st.index .. "]") or st.name
+			IX.xtrace(sh, { lhs .. (st.append and "+=" or "=") .. (v == "" and "" or IX._int.xtrace_quote(v)) }, true)
+		end
 		io.stderr:write("curse: " .. sh:deref(st.name) .. ": readonly variable\n")
 		M.report_exit(sh) -- (err_readonly: report_error)
 		sh.status = 1
-		if sh.opt_c or sh.opt_posix then
-			error({ __curse_exit = 1 })
-		end
 		-- A STANDALONE readonly assignment (`readonly x=1; x=2; echo hi`) aborts the REST
-		-- of the line, then the next line runs (a command prefix: M.prefix_reject).
-		error({ __curse_exit = 1, __curse_lineabort = true })
+		-- of the line, then the next line runs — under -c too; posix mode exits (a command
+		-- prefix: M.prefix_reject).
+		M.assign_jump(sh, true)
 	end
 	-- A bad substitution / invalid indirect in the RHS fails the assignment but is
 	-- NON-fatal (bash: `x=${bad|y}` leaves x unset, status 1, script continues) —

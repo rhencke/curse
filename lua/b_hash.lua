@@ -85,6 +85,7 @@ return function(sh, cmd, args, hook, tcb)
 			if dflag and not tflag and not next(sh.hashcache) then -- (bash: nothing to remove from, quietly)
 				return
 			end
+			local missed = false -- (list_hashed_filename_targets: all_found, whatever printed after)
 			for _, nm in ipairs(names) do
 				local e = sh.hashcache[nm]
 				if tflag then -- (phash_search: counts a hit; a relative entry shown as ./…)
@@ -92,7 +93,7 @@ return function(sh, cmd, args, hook, tcb)
 				end
 				if not e then
 					io.stderr:write("curse: hash: " .. nm .. ": not found\n")
-					sh.status = 1
+					missed = true
 				elseif not tflag then
 					sh.hashcache[nm] = nil
 				elseif lflag then -- -lt: as reusable input
@@ -100,6 +101,9 @@ return function(sh, cmd, args, hook, tcb)
 				else -- -t: the remembered path (NAME<TAB>PATH for several — bash)
 					sh:echo((#names > 1 and (nm .. "\t") or "") .. e)
 				end
+			end
+			if missed then
+				sh.status = 1
 			end
 		elseif #names > 0 then
 			sh.status = 0

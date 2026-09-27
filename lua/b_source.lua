@@ -113,6 +113,7 @@ return function(sh, cmd, args, hook, tcb)
 							for _, st in ipairs(lg.stmts) do
 								ran = ran or not rt.perr_neutral(st)
 								local ne0 = sh.noerr
+								local pf0 = sh.procsub_files and #sh.procsub_files or 0
 								local sok, serr = pcall(exec_list, sh, { st }, hook, false)
 								if not sok then
 									if type(serr) == "table" and serr.__curse_lineabort and not serr.__curse_discard then
@@ -120,7 +121,7 @@ return function(sh, cmd, args, hook, tcb)
 											error(serr)
 										end
 										sh.noerr = ne0
-										rt.line_aborted(sh, 1)
+										rt.line_aborted(sh, 1, pf0)
 										break
 									else
 										error(serr)
@@ -160,7 +161,7 @@ return function(sh, cmd, args, hook, tcb)
 			if rh and rh ~= "" and not sh.in_return_trap and rt.pseudo_trapped(sh, "RETURN") then
 				sh.in_return_trap = true
 				local sv = sh.status
-				run_trap(sh, rh)
+				run_trap(sh, rh, "return trap")
 				sh.status = sv
 				sh.in_return_trap = false
 			end
