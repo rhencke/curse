@@ -9,22 +9,14 @@ local P = I.P
 local exec_list = I.exec_list
 local run_trap = I.run_trap
 
-return function(sh, cmd, args, hook, tcb)
+local function builtin(sh, cmd, args, hook, tcb)
 	if cmd == "source" or cmd == "." then
 		sh.shlvl_tail = nil -- (a builtin: the code it runs isn't exec'd in place)
 		-- source FILE [args]: run FILE in the current shell; a `return` ends the file.
 		-- A name with no slash is looked up in $PATH (files only, dirs skipped), then
 		-- falls back to the bare name; `--` ends options.
-		local j = 2
-		local usage = cmd .. ": usage: " .. cmd .. " filename [arguments]\n"
-		if args[j] == "--" then
-			j = j + 1
-		elseif args[j] == "--help" then -- (no_options: the builtin's help, status 2)
-			return rt.builtin_help(sh, cmd)
-		elseif args[j] and args[j]:match("^%-.") then -- (bash's no_options: no option letters)
-			io.stderr:write("curse: " .. cmd .. ": " .. args[j]:sub(1, 2) .. ": invalid option\n" .. usage)
-			sh.status = 2
-			sh.spb_err = 2 -- (EX_USAGE: rt.spb_run)
+		local c, _, j = rt.getopt(sh, cmd, args, "", 2) -- (bash's no_options)
+		if c then
 			return
 		end
 		local name = args[j]
@@ -40,7 +32,7 @@ return function(sh, cmd, args, hook, tcb)
 		local e0 = sh.traps and sh.traps.ERR -- (the ERR trap before it: rt.source_err_sample)
 		local rret -- (a `return N` ending the file: $? once the RETURN trap has run)
 		if not name then
-			io.stderr:write("curse: " .. cmd .. ": filename argument required\n" .. usage)
+			io.stderr:write("curse: " .. cmd .. ": filename argument required\n" .. rt.usage(cmd))
 			sh.status = 2
 			sh.spb_err = 2 -- (EX_USAGE: rt.spb_run)
 		elseif file_test("-d", file) then
@@ -101,8 +93,8 @@ return function(sh, cmd, args, hook, tcb)
 								M.v_echo(sh, src, nil, vst)
 								break
 							end
-							if sh.jobs_waited then -- (reading a line: notify_and_cleanup — rt.job_waited)
-								rt.jobs_cleanup_waited(sh)
+							if sh.jobs_waited or sh.jobs_pending then -- (reading a line: notify_and_cleanup)
+								rt.jobs_line(sh)
 							end
 							if sh.opt_v and lg.pline then
 								M.v_echo(sh, src, lg.pline, vst)
@@ -121,13 +113,15 @@ return function(sh, cmd, args, hook, tcb)
 							for _, st in ipairs(lg.stmts) do
 								ran = ran or not rt.perr_neutral(st)
 								local ne0 = sh.noerr
+								local pf0 = sh.procsub_files and #sh.procsub_files or 0
 								local sok, serr = pcall(exec_list, sh, { st }, hook, false)
 								if not sok then
 									if type(serr) == "table" and serr.__curse_lineabort and not serr.__curse_discard then
 										if rt.lineabort_exits(sh, serr) then
 											error(serr)
 										end
-										sh.status, sh.noerr = 1, ne0
+										sh.noerr = ne0
+										rt.line_aborted(sh, 1, pf0)
 										break
 									else
 										error(serr)
@@ -167,7 +161,7 @@ return function(sh, cmd, args, hook, tcb)
 			if rh and rh ~= "" and not sh.in_return_trap and rt.pseudo_trapped(sh, "RETURN") then
 				sh.in_return_trap = true
 				local sv = sh.status
-				run_trap(sh, rh)
+				run_trap(sh, rh, "return trap")
 				sh.status = sv
 				sh.in_return_trap = false
 			end
@@ -179,3 +173,5 @@ return function(sh, cmd, args, hook, tcb)
 		rt.source_err_sample(sh, e0)
 	end
 end
+rt.SRC_FRAMES[builtin] = true -- (it sets sh.cur_source: the error label stops here)
+return builtin

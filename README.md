@@ -189,6 +189,12 @@ meson test -C build --suite conformance -v    # just the conformance scoreboards
 it best-effort (non-fatal offline). For a tight loop, run the harness directly:
 `test/conformance/run.sh --corpus oil --jobs 4 arith`.
 
+- **[`test/stress/`](test/stress/)** — the stress suite: signal handling, daemon
+  concurrency, past flakes repeated under load, and agreement between the tiers, with
+  process/fd/temp-file invariants checked after every test. It is a separate suite, not
+  run by a plain `meson test`: `meson test -C build --suite stress`, or
+  [`test/stress/run.sh`](test/stress/run.sh) with its knobs (see its
+  [README](test/stress/README.md)).
 - **[`test/real/`](test/real/)** — end-to-end real-world scripts under `docker diff`
   ([`diff.sh`](test/real/diff.sh)).
 - **[`test/bench/`](test/bench/)** — microbenchmarks of common shell patterns

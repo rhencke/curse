@@ -1,8 +1,7 @@
 -- Lazily-loaded builtin feature module (see BUILTIN_LAZY in interp.lua): `history`, as
 -- bash's history.def over the history list kept by hist.lua.
 local H = require("hist")
-
-local USAGE = "history: usage: history [-c] [-d offset] [n] or history -anrw [filename] or history -ps arg [arg...]\n"
+local rt = require("runtime")
 
 local function erange(sh, arg)
 	io.stderr:write("curse: history: " .. arg .. ": history position out of range\n")
@@ -26,47 +25,16 @@ end
 
 return function(sh, cmd, args)
 	local h = H.list(sh)
-	local flags, delete_arg = {}, nil
-	local j = 2
-	while args[j] and args[j]:sub(1, 1) == "-" and args[j] ~= "-" do
-		local a = args[j]
-		j = j + 1
-		if a == "--" then
-			break
-		elseif a == "--help" then -- (GETOPT_HELP: the builtin's help, status 2)
-			return require("runtime").builtin_help(sh, "history")
-		end
-		if a:match("^%-%d") then -- (`history -5`: not an option letter)
-			io.stderr:write("curse: history: " .. a:sub(1, 2) .. ": invalid option\n" .. USAGE)
-			sh.status = 2
+	local flags, delete_arg, j, sp, c, a = {}, nil, 2
+	repeat -- (internal_getopt "acd:npsrw": `history -5` is an invalid option too)
+		c, a, j, sp = rt.getopt(sh, "history", args, "acd:npsrw", j, sp)
+		if c == "?" then
 			return
+		elseif c then
+			flags[c] = true
+			delete_arg = a or delete_arg
 		end
-		local k = 2
-		while k <= #a do
-			local f = a:sub(k, k)
-			k = k + 1
-			if f == "d" then
-				flags.d = true
-				delete_arg = a:sub(k)
-				if delete_arg == "" then
-					delete_arg = args[j]
-					j = j + 1
-				end
-				k = #a + 1
-				if delete_arg == nil then
-					io.stderr:write("curse: history: -d: option requires an argument\n" .. USAGE)
-					sh.status = 2
-					return
-				end
-			elseif f:match("[acnpsrw]") then
-				flags[f] = true
-			else
-				io.stderr:write("curse: history: -" .. f .. ": invalid option\n" .. USAGE)
-				sh.status = 2
-				return
-			end
-		end
-	end
+	until not c
 	local rest = {}
 	for k = j, #args do
 		rest[#rest + 1] = args[k]
@@ -174,7 +142,7 @@ return function(sh, cmd, args)
 				return
 			end
 			if rest[2] then
-				require("runtime").too_many(sh, "history") -- (the command is discarded)
+				rt.too_many(sh, "history") -- (the command is discarded)
 			end
 			limit = math.abs(limit)
 		end

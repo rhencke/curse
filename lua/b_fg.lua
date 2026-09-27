@@ -1,36 +1,19 @@
 -- Lazily-loaded builtin feature module (see BUILTIN_LAZY in runtime.lua): `fg` / `bg`.
+local rt = require("runtime")
 local I = require("interp")._int
 local job_resolve, job_reap, SIGDESC = I.job_resolve, I.job_reap, I.SIGDESC
 
 -- disown [-ahr] [jobspec|pid …]: drop jobs from the table (so `jobs`/`wait` forget them);
 -- -h only marks them (nothing here sends SIGHUP), -a all jobs, -r only running ones.
 local function disown(sh, args)
-	local all, running, honly, j = false, false, false, 2
-	while args[j] and args[j]:match("^%-.") and args[j] ~= "--" do -- (`--Z`: the `-` is the bad option)
-		if args[j] == "--help" then -- (CASE_HELPOPT: the builtin's help, status 2)
-			require("b_help")(sh, "help", { "help", "disown" })
-			sh.status = 2
+	local all, running, honly, j, sp, c, _ = false, false, false, 2
+	repeat -- (internal_getopt "ahr")
+		c, _, j, sp = rt.getopt(sh, "disown", args, "ahr", j, sp)
+		if c == "?" then
 			return
 		end
-		for f in args[j]:sub(2):gmatch(".") do
-			if f == "a" then
-				all = true
-			elseif f == "r" then
-				running = true
-			elseif f == "h" then
-				honly = true
-			else
-				io.stderr:write("curse: disown: -" .. f .. ": invalid option\n")
-				io.stderr:write("disown: usage: disown [-h] [-ar] [jobspec ... | pid ...]\n")
-				sh.status = 2
-				return
-			end
-		end
-		j = j + 1
-	end
-	if args[j] == "--" then
-		j = j + 1
-	end
+		all, running, honly = all or c == "a", running or c == "r", honly or c == "h"
+	until not c
 	local victims, status = {}, 0
 	if all or running then
 		if not args[j] then
@@ -53,7 +36,7 @@ local function disown(sh, args)
 	for k = j, #args do
 		local spec, jb = args[k], nil
 		if spec:sub(1, 1) == "%" then
-			jb = job_resolve(sh, spec)
+			jb = job_resolve(sh, spec, "disown")
 		elseif spec:match("^%d+$") then
 			for _, x in ipairs(sh.jobs or {}) do
 				if x.pid == tonumber(spec) then
@@ -72,7 +55,7 @@ local function disown(sh, args)
 		local gone = {}
 		sh.disowned = sh.disowned or {}
 		for _, jb in ipairs(victims) do
-			gone[jb] = true
+			gone[jb], jb.gone = true, true
 			-- (delete_job's bgp_add: `wait PID` answers from bgpids with the status it had
 			-- when disowned — 0 while it was still running — and doesn't wait)
 			sh.disowned[jb.pid] = jb.done and jb.status or 0
@@ -102,54 +85,93 @@ local function disown(sh, args)
 	sh.status = status
 end
 
-return function(sh, cmd, args)
-	if cmd == "disown" then
-		return disown(sh, args)
-	end
-	-- fg/bg [jobspec]: the job (default: the current one, %+). Without job control
-	-- (`set -m` off) bash refuses both.
-	-- (a subshell / pipeline stage starts without job control — a $(…) keeps it — until
-	-- its own `set -m`)
-	local nojc, st = not sh.opt_m, sh.iso_ctx
-	for k = st and #st or 0, 1, -1 do
-		if not st[k].cs then
-			nojc = nojc or st[k].mgen == sh.m_gen
-			break
+-- fg_bg + start_job (jobs.c): SPEC's job to the foreground (print its command, continue it
+-- if stopped, wait for it: its status) or the background (a stopped one: print `[N]+ cmd &`,
+-- continue it; a running one is "already in background", status 0). Returns the status.
+local function fg_bg(sh, cmd, spec, fore)
+	local j, dup = job_resolve(sh, spec or "%+")
+	if not j then -- (get_job_spec's NO_JOB: sh_badjob, `current` for no operand; DUP_JOB said so)
+		if not dup then
+			io.stderr:write("curse: " .. cmd .. ": " .. (spec or "current") .. ": no such job\n")
 		end
+		return 1
 	end
-	if nojc then
-		io.stderr:write("curse: " .. cmd .. ": no job control\n")
-		sh.status = 1
-		return
-	end
-	local spec = args[2] or "%+"
-	local j = job_resolve(sh, spec)
-	if not j or j.done then -- (get_job_spec's NO_JOB: sh_badjob, `current` for no operand)
-		io.stderr:write("curse: " .. cmd .. ": " .. (args[2] or "current") .. ": no such job\n")
-		sh.status = 1
-		return
+	if j.nojc then -- (started while `set -m` was off: bash won't foreground/background it)
+		io.stderr:write("curse: " .. cmd .. ": job " .. j.id .. " started without job control\n")
+		return 1
 	end
 	if (sh.in_subprogram or 0) > 0 or (sh.iso_ctx and sh.iso_ctx[1]) then
 		-- (a subshell lists its parent's jobs, but can't start one: start_job's refusal)
 		io.stderr:write("curse: " .. cmd .. ": no current jobs\n")
-		sh.status = 1
-		return
+		return 1
 	end
-	if j.nojc then -- (started while `set -m` was off: bash won't foreground/background it)
-		io.stderr:write("curse: " .. cmd .. ": job " .. j.id .. " started without job control\n")
-		sh.status = 1
-		return
+	local state = rt.job_state(j)
+	if state == "dead" then
+		io.stderr:write("curse: " .. cmd .. ": job has terminated\n")
+		return 1
 	end
-	if cmd == "bg" then -- nothing stops our jobs, so it's already running (start_job: status 0)
-		io.stderr:write("curse: bg: job " .. j.id .. " already in background\n")
-		sh.status = 0
-		return
+	if not fore then
+		sh.last_bg_pid = tostring(j.pid) -- (last_asynchronous_pid = the job's process group)
+		if state == "running" then -- (XPG6: not an error)
+			io.stderr:write("curse: bg: job " .. j.id .. " already in background\n")
+			return 0
+		end
+		-- (POSIX: bg doesn't mark the current/previous job)
+		local mark = sh.opt_posix and " " or (j == sh.job_cur and "+ " or (j == sh.job_prev and "- " or " "))
+		sh.out(("[%d]%s%s &\n"):format(j.id, mark, j.cmd or ""))
+	else
+		rt.set_current_job(sh, j)
+		sh.out((j.cmd or "") .. "\n")
 	end
-	-- fg: print the job's command line, then wait for it; its status is fg's
-	sh.out((j.cmd or "") .. "\n")
 	io.flush()
-	sh.status = job_reap(sh, j) or 127
-	if j.sig and SIGDESC[j.sig] then
-		io.stderr:write(require("runtime").Llibc(SIGDESC[j.sig]) .. "\n")
+	if state == "stopped" then -- continue it: its processes, and a suspended task
+		for _, pid in ipairs(rt.job_procs(j)) do
+			require("ffi").C.kill(pid, 18)
+		end
+		rt.job_set_running(sh, j)
 	end
+	if not fore then
+		rt.job_reset_current(sh)
+		return 0
+	end
+	local st = job_reap(sh, j) or 127
+	if j.sig and SIGDESC[j.sig] then
+		io.stderr:write(rt.Llibc(SIGDESC[j.sig]) .. "\n")
+	end
+	if j.done then -- (a foreground job that has ended is notified: it leaves the table)
+		rt.job_delete(sh, j)
+	end
+	return st
+end
+
+return function(sh, cmd, args)
+	if cmd == "disown" then
+		return disown(sh, args)
+	end
+	-- fg/bg [jobspec] (fg_bg.def): the job (default: the current one, %+). Without job
+	-- control (`set -m` off) bash refuses both; then neither takes an option (no_options).
+	-- (a subshell / pipeline stage starts without job control — a $(…) keeps it — until
+	-- its own `set -m`: rt.job_control_on)
+	if not rt.job_control_on(sh) then
+		io.stderr:write("curse: " .. cmd .. ": no job control\n")
+		sh.status = 1
+		return
+	end
+	local c, _, k = rt.getopt(sh, cmd, args, "", 2)
+	if c == "?" then
+		return
+	end
+	rt.jobs_poll(sh) -- (what SIGCHLD would have told bash by now: ended, stopped, continued)
+	if cmd == "bg" then -- every operand in turn (none: the current job); fails if any did
+		local st = 0
+		repeat
+			if fg_bg(sh, cmd, args[k], false) ~= 0 then
+				st = 1
+			end
+			k = k + 1
+		until args[k] == nil
+		sh.status = st
+		return
+	end
+	sh.status = fg_bg(sh, cmd, args[k], true)
 end

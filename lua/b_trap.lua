@@ -11,29 +11,14 @@ local C = I.C
 return function(sh, cmd, args, hook, tcb)
 	if cmd == "trap" then
 		-- trap [-lp] [[ACTION] SIG…]  (bash builtins/trap.def)
-		local j, pflag, lflag = 2, false, false
-		local usage = "trap: usage: trap [-lp] [[arg] signal_spec ...]\n"
-		while args[j] and args[j]:match("^%-.") and args[j] ~= "--" do -- (getopt "lp")
-			if args[j] == "--help" then -- (CASE_HELPOPT: the builtin's help, status 2)
-				require("b_help")(sh, "help", { "help", "trap" })
-				sh.status = 2
-				sh.spb_err = 2 -- (EX_USAGE: rt.spb_run)
+		local pflag, lflag, j, sp, c, _ = false, false, 2
+		repeat
+			c, _, j, sp = rt.getopt(sh, "trap", args, "lp", j, sp)
+			if c == "?" then
 				return
 			end
-			if not args[j]:match("^%-[lp]+$") then
-				io.stderr:write("curse: trap: -" .. args[j]:match("^%-[lp]*(.)") .. ": invalid option\n")
-				io.stderr:write(usage)
-				sh.status = 2
-				sh.spb_err = 2 -- (EX_USAGE: rt.spb_run)
-				return
-			end
-			lflag = lflag or args[j]:find("l", 2, true) ~= nil
-			pflag = pflag or args[j]:find("p", 2, true) ~= nil
-			j = j + 1
-		end
-		if args[j] == "--" then
-			j = j + 1
-		end
+			lflag, pflag = lflag or c == "l", pflag or c == "p"
+		until not c
 		if lflag then -- list signal names (NN) SIGNAME)
 			sh.out(rt.signal_list(NUMSIG))
 			sh.status = 0
@@ -100,7 +85,7 @@ return function(sh, cmd, args, hook, tcb)
 				action, sigstart = first, j + 1
 			end
 			if sigstart > #args then -- an action with no signal spec is a usage error
-				io.stderr:write(usage)
+				io.stderr:write(rt.usage("trap"))
 				sh.status = 2
 				sh.spb_err = 2 -- (EX_USAGE: rt.spb_run)
 				return

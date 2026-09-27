@@ -51,6 +51,8 @@ ffi.cdef([[
   int dup2(int a, int b);
   long syscall(long number, ...);
   int curse_d_waitid(int idtype, int id, void *info, int options) asm("waitid");
+  int curse_d_prctl(int option, unsigned long a2, unsigned long a3, unsigned long a4, unsigned long a5) asm("prctl");
+  int curse_d_setpgid(int pid, int pgid) asm("setpgid");
   typedef struct _IO_FILE curse_d_FILE;
   extern curse_d_FILE *stdin;
   void curse_d_fpurge(curse_d_FILE *fp) asm("__fpurge");
@@ -194,6 +196,42 @@ local function apply_env(env)
 	C.environ = ffi.cast("char **", arr)
 end
 
+-- The script's children that outlive it, adopted into rt.internal_pids when the request
+-- ends (see serve_request): a job still running, or the foreground external a signal
+-- ended the script in the middle of (bash would have died, leaving it to init). This
+-- worker stays their parent, so it reaps them — at every later request's reap points,
+-- and while it idles (reap_idle), promptly, so none lingers as a zombie. One STOPPED
+-- gets SIGHUP + SIGCONT now, as the kernel sends a group its shell's exit orphans.
+local function hangup_stopped_orphans()
+	for pid in pairs(rt.internal_pids) do
+		local f = io.open("/proc/" .. pid .. "/stat", "r")
+		local st = f and f:read("*l")
+		if f then
+			f:close()
+		end
+		local state = st and st:match("^.*%) (%a)")
+		if state == "T" or state == "t" then
+			C.kill(pid, 1)
+			C.kill(pid, 18)
+		end
+	end
+end
+-- Idle with adopted children: wait for a connection in 50ms slices, reaping them as they
+-- end, until none is left (then the plain blocking accept).
+local reap_pf = ffi.new("struct curse_d_pollfd[1]")
+local function reap_idle(lfd)
+	while next(rt.internal_pids) do
+		pcall(rt.reap_orphans)
+		if not next(rt.internal_pids) then
+			return
+		end
+		reap_pf[0].fd, reap_pf[0].events, reap_pf[0].revents = lfd, 1, 0
+		if C.curse_d_poll(reap_pf, 1, 50) > 0 then
+			return -- (a connection: serve it; the next idle time goes on reaping)
+		end
+	end
+end
+
 -- Serve ONE request on the caller's fds, reply with the status, and RETURN so the
 -- persistent worker can serve the next (no per-request fork or _exit). Everything a
 -- script can leave in PROCESS state is reset — the fork model got this for free; we
@@ -265,6 +303,10 @@ local function serve_request(cfd, req, fds, ctx)
 	end
 	rt.startup_ignored(sh, req.sigign)
 	rt.sig_setup(sh) -- (SIGQUIT ignored; the terminating signals caught: rt.termsig)
+	-- now our pid (negated): the client forwards the signals sent to it here. Not before
+	-- the script's dispositions are in place: a signal the client holds until then would
+	-- otherwise reach a worker with no script to take it (__curse_sigrun unset), and be lost.
+	C.write(cfd, ffi.new("int32_t[1]", -ctx.worker_pid), 4)
 	-- A Lua error escaping the run is a curse BUG: report it on the request's stderr
 	-- (status 1) instead of failing silently.
 	local ok = xpcall(function()
@@ -274,14 +316,7 @@ local function serve_request(cfd, req, fds, ctx)
 			sh.status = st
 			return
 		end
-		local kind, payload = Invoke.start(sh, inv)
-		if kind == "repl" or kind == "stdin" then
-			require("repl").run(sh) -- (non-interactive "stdin": line at a time from fd 0, bash)
-		elseif kind == "file" and sh.opt_t then -- (started -t: one command, read by the interpreter)
-			require("interp").run_lazy(sh, payload)
-		elseif kind ~= "exit" then -- "code" / "file" (the script's text)
-			Tier.run_tiered(payload, sh)
-		end
+		Invoke.run(sh, Invoke.start(sh, inv)) -- (its mid-run compiles are stored after the reply)
 	end, function(e)
 		io.stderr:write("curse: internal error: " .. tostring(e) .. "\n" .. debug.traceback() .. "\n")
 		return e
@@ -324,10 +359,34 @@ local function serve_request(cfd, req, fds, ctx)
 	-- them, then RETIRES — its slot reads -1 meanwhile (busy for the pool's saturation
 	-- count, so a replacement is spawned on demand; never "client gone", so not killed)
 	local drained = false
+	pcall(rt.jobs_exit_hangup, sh) -- (its stopped jobs: as the kernel would, were it exiting)
 	if rt.sched_live() then -- (the slot already reads -1: see above)
-		pcall(rt.sched_drain)
+		pcall(rt.sched_drain, sh)
 		drained = true
 	end
+	-- (the script's still-running real-pid jobs — `sleep 9 &` spawned directly — stay this
+	-- worker's children after it: bash's would go to init. Reaped as they end, by this and
+	-- every later request's reap points; never zombies left for another script's `ps` to see)
+	for _, j in ipairs(sh.jobs or {}) do
+		if not j.done and not j.g and j.pid and j.pid > 0 then
+			rt.internal_pids[j.pid] = true
+		end
+	end
+	-- (…and ANY child still here: a foreground external the script was waiting for when a
+	-- signal ended it — bash would have died and left it to init — `kill -TERM` of a
+	-- nested `curse -c 'trap … TERM; sleep 1'`. A worker has no children of its own.)
+	do
+		local wp = tonumber(C.getpid())
+		local f = io.open("/proc/" .. wp .. "/task/" .. wp .. "/children", "r")
+		if f then
+			for pid in (f:read("*a") or ""):gmatch("%d+") do
+				rt.internal_pids[tonumber(pid)] = true
+			end
+			f:close()
+		end
+	end
+	pcall(rt.reap_orphans) -- (children no job waits for any more: never zombies on the worker)
+	hangup_stopped_orphans() -- (…and the stopped ones don't stay stopped: see reap_idle)
 	-- SCRUB per-request process state (the fork boundary used to do this):
 	C.umask(ctx.umask) -- a script's `umask` doesn't persist
 	C.sigprocmask(2, ctx.empty_sigset, nil) -- SIG_SETMASK: clear any trap-blocked signals
@@ -462,6 +521,7 @@ local function worker_main(lfd, my_uid, ctx, slot)
 			end
 			pcall(Tier.compile_deferred, true)
 		end
+		reap_idle(lfd)
 		local cfd = C.accept(lfd, nil, nil)
 		if cfd < 0 then
 			local e = ffi.errno()
@@ -681,8 +741,25 @@ local function serve()
 			return
 		end
 		busy[slot] = 0
+		local parent = tonumber(C.getpid())
 		local pid = C.fork()
 		if pid == 0 then
+			-- A worker never outlives the daemon: killed (SIGTERM, SIGKILL), the parent can't
+			-- reap, replace or sweep its pool, yet orphaned workers would go on accepting on
+			-- the socket (and holding the instance lock, via the inherited OFD) until their
+			-- own idle timeout. PR_SET_PDEATHSIG: the parent's death kills this worker; and
+			-- if it died before that was set, go now.
+			C.curse_d_prctl(1, 9, 0, 0, 0) -- PR_SET_PDEATHSIG, SIGKILL
+			if tonumber(C.getppid()) ~= parent then
+				C._exit(0)
+			end
+			-- …and a process group of its own, as a shell running a script has: its
+			-- non-job-control children share it, so if the worker dies (the dead-client
+			-- sweep's SIGKILL) with one of them STOPPED, the kernel sees the group
+			-- orphaned and sends it SIGHUP + SIGCONT (POSIX) — in the daemon's group it
+			-- was never orphaned and stayed stopped forever. (`kill 0` in a script
+			-- reaches that group, not the whole daemon.)
+			C.curse_d_setpgid(0, 0)
 			for _, pfd in pairs(pidfds) do -- siblings' pidfds are the parent's business
 				C.close(pfd)
 			end

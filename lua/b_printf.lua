@@ -7,38 +7,23 @@ local array_key, sh_printf = I.array_key, I.sh_printf
 
 return function(sh, cmd, args, hook, tcb)
 	if cmd == "printf" then
+		rt.pf_sh = sh -- (its `'c` arguments' mbtowc state: interp's char_value)
 		-- printf [-v VAR] FMT [ARGS…] — native, bash-compatible.
 		-- options (internal_getopt "v:"): each -v NAME / -vNAME is checked as it comes, and
 		-- the last one wins; `--` ends them
-		local target, fi = nil, 2
-		while args[fi] and args[fi]:match("^%-.") do
-			local a = args[fi]
-			if a == "--" then
-				fi = fi + 1
-				break
-			elseif a:sub(2, 2) ~= "v" then
-				return rt.bad_option(sh, "printf", a:sub(1, 2), a)
-			end
-			local nm = a:sub(3)
-			if nm == "" then
-				nm = args[fi + 1]
-				fi = fi + 1
-			end
-			if nm == nil then
-				io.stderr:write("curse: printf: -v: option requires an argument\n")
-				io.stderr:write(rt.usage("printf"))
-				sh.status = 2
+		local target, fi, sp, f, nm = nil, 2
+		repeat
+			f, nm, fi, sp = rt.getopt(sh, "printf", args, "v:", fi, sp)
+			if f == "?" then
 				return
-			end
-			if not (nm:match("^[%a_][%w_]*$") or nm:match("^[%a_][%w_]*%[.+%]$") and (rt.split_array_ref(nm)
-				or rt.split_array_ref(nm, sh))) then
+			elseif nm and not (nm:match("^[%a_][%w_]*$") or nm:match("^[%a_][%w_]*%[.+%]$")
+				and (rt.split_array_ref(nm) or rt.split_array_ref(nm, sh))) then
 				io.stderr:write("curse: printf: `" .. nm .. "': not a valid identifier\n")
 				sh.status = 2
 				return
 			end
-			target = nm
-			fi = fi + 1
-		end
+			target = nm or target
+		until not f
 		if args[fi] == nil then
 			io.stderr:write(rt.usage("printf"))
 			sh.status = 2

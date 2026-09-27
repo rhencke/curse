@@ -103,14 +103,7 @@ local function state(sh)
 	if key == st_key then
 		return st_val
 	end
-	local names = {} -- (guess_category_value: $LANGUAGE's list replaces the locale's name)
-	if lang and lang ~= "" then
-		for l in lang:gmatch("[^:]+") do
-			gt.variants(l, names)
-		end
-	else
-		gt.variants(lc, names)
-	end
+	local names = gt.search_names(lc)
 	local bash = load(names, "bash")
 	local val = false
 	if #bash > 0 then

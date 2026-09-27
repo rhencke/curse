@@ -7,6 +7,10 @@
 # command itself. Also: `( ( … ) )` runs the inner in the outer's process, `! ( … )`
 # shows its `!`, `( exec cmd )`, pipeline stages and background pipeline jobs list every
 # process, and `time ( … ) 2>f` times inside the subshell's redirections.
+# (A background job's report is deterministic only when bash knows for certain whether it
+# ended before `wait` looked: `wait $!` waits for it either way, reporting at its line; a job
+# that `kill -0` has seen gone — reaped — is $!, so a plain `wait` keeps it, and the report
+# comes as the NEXT line is read. A bare `JOB & wait` races: either line, by who runs first.)
 S=${THIS_SH:-bash}
 t=${TMPDIR:-/tmp}/c2350.$$; mkdir -p "$t"
 r() { $S "$t/$1" 2>&1 | sed -e 's/ *[0-9]\{4,\}/ N/g' -e "s#^.*/$1: #$1: #"; echo "st=${PIPESTATUS[0]}"; }
@@ -121,11 +125,13 @@ cat > "$t/e.sh" <<'EOF'
 : | sh -c 'kill -KILL $$'; echo "s=$?"
 ( sh -c 'kill -KILL $$' ) &
 wait $!; echo "w=$?"
-: | sh -c 'kill -KILL $$' & wait
-: | ( kill -KILL $BASHPID ) & wait
-( kill -KILL $BASHPID ) & wait
-( sh -c 'kill -KILL $$' ) | cat & wait
-: | ( sh -c 'kill -KILL $$' ) & wait
+: | sh -c 'kill -KILL $$' & wait $!
+: | ( kill -KILL $BASHPID ) & wait $!
+( kill -KILL $BASHPID ) & wait $!
+( sh -c 'kill -KILL $$' ) | cat & wait $!
+: | ( sh -c 'kill -KILL $$' ) & wait $!
+( kill -KILL $BASHPID ) & while kill -0 $! 2>/dev/null; do :; done; wait
+echo "after"
 EOF
 r e.sh
 rm -rf "$t"

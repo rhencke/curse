@@ -41,37 +41,18 @@ local function norm_word(s)
 		if c == "\\" then
 			out[#out + 1] = s:sub(i, i + 1)
 			i = i + 2
-		elseif c == "'" and not indq then
-			local j = s:find("'", i + 1, true) or n
-			out[#out + 1] = s:sub(i, j)
-			i = j + 1
+		elseif c == "`" or c == "'" and not indq then
+			local j = P.quote_end(s, i, c == "`")
+			out[#out + 1] = s:sub(i, j - 1)
+			i = j
 		elseif c == '"' then
 			indq = not indq
 			out[#out + 1] = c
 			i = i + 1
-		elseif c == "`" then
-			local j = i + 1
-			while j <= n and s:sub(j, j) ~= "`" do
-				j = j + (s:sub(j, j) == "\\" and 2 or 1)
-			end
-			out[#out + 1] = s:sub(i, j)
-			i = j + 1
 		elseif c == "$" and s:sub(i + 1, i + 1) == "'" and not indq then
-			local j, buf = i + 2, {}
-			while j <= n do
-				local c2 = s:sub(j, j)
-				if c2 == "\\" then
-					buf[#buf + 1] = s:sub(j, j + 1)
-					j = j + 2
-				elseif c2 == "'" then
-					break
-				else
-					buf[#buf + 1] = c2
-					j = j + 1
-				end
-			end
-			out[#out + 1] = sq(rt.ansi_unescape(table.concat(buf), true))
-			i = j + 1
+			local j = P.quote_end(s, i + 1, true)
+			out[#out + 1] = sq(rt.ansi_unescape(s:sub(i + 2, j - 2), true))
+			i = j
 		elseif c == "$" and s:sub(i + 1, i + 1) == '"' and not indq then
 			i = i + 1 -- $"…": the parser drops the $ (the translated text stays double-quoted)
 		elseif c == "$" and s:sub(i + 1, i + 1) == "(" and s:sub(i + 2, i + 2) ~= "(" then
@@ -92,31 +73,6 @@ local function norm_word(s)
 	return table.concat(out)
 end
 
--- drop \<newline> line continuations (the lexer removes them; not inside '…')
-local function strip_contin(s)
-	if not s:find("\\\n") then
-		return s
-	end
-	local out, i, n = {}, 1, #s
-	while i <= n do
-		local c = s:sub(i, i)
-		if c == "'" then
-			local j = s:find("'", i + 1, true) or n
-			out[#out + 1] = s:sub(i, j)
-			i = j + 1
-		elseif c == "\\" then
-			if s:sub(i + 1, i + 1) ~= "\n" then
-				out[#out + 1] = s:sub(i, i + 1)
-			end
-			i = i + 2
-		else
-			out[#out + 1] = c
-			i = i + 1
-		end
-	end
-	return table.concat(out)
-end
-
 local function wtext(w)
 	if w.src == false then
 		return nil -- a brace expansion's 2nd+ word: the 1st printed the whole `{a,b}`
@@ -124,7 +80,7 @@ local function wtext(w)
 	if type(w.src) ~= "string" then
 		unsupported()
 	end
-	local s = strip_contin(w.src)
+	local s = P.strip_contin(w.src) -- (the lexer removes \<newline>s; not inside '…')
 	if s == "" then
 		return nil -- only a line continuation
 	end
@@ -549,9 +505,10 @@ make = function(p, c)
 			cprintf(p, " ")
 		end
 		cprintf(p, "}")
-	elseif k == "coproc" then -- (print_cmd.c: the command follows unindented; bash 5.2.37 names
-		-- only a compound one — a simple command's coproc is always the default COPROC)
-		cprintf(p, c.body and c.body.k == "simple" and "coproc " or ("coproc " .. c.name .. " "))
+	elseif k == "coproc" then -- (print_cmd.c: the command follows unindented. bash 5.2.21 always
+		-- prints the name — `coproc COPROC cat` for a simple command, which can't be re-read as
+		-- input; patch 5.2-032 later printed it only for a compound one. curse is 5.2.21.)
+		cprintf(p, "coproc " .. c.name .. " ")
 		p.skip = p.skip + 1
 		make(p, c.body)
 	elseif k == "subshell" then

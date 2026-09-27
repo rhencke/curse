@@ -28,13 +28,15 @@ local function exec_string(sh, code, hook)
 		end
 		for _, st in ipairs(lg.stmts) do
 			local ne0 = sh.noerr
+			local pf0 = sh.procsub_files and #sh.procsub_files or 0
 			local sok, serr = pcall(I.exec_list, sh, { st }, hook, false)
 			if not sok then
 				if type(serr) == "table" and serr.__curse_lineabort and not serr.__curse_discard then
 					if rt.lineabort_exits(sh, serr) then
 						error(serr)
 					end
-					sh.status, sh.noerr = 1, ne0
+					sh.noerr = ne0
+					rt.line_aborted(sh, 1, pf0)
 					break
 				end
 				error(serr)
@@ -116,40 +118,16 @@ end
 return function(sh, cmd, args, hook)
 	local h = H.list(sh)
 	local numbering, reverse, listing, execute, ename = true, false, false, false, nil
-	local j = 2
-	while args[j] and not fc_number(args[j]) and args[j]:match("^%-.") do
-		local a = args[j]
-		j = j + 1
-		if a == "--" then
+	local j, sp, f, v = 2
+	while sp or not fc_number(args[j]) do -- (a -N word is a history number: the options end)
+		f, v, j, sp = rt.getopt(sh, "fc", args, ":e:lnrs", j, sp)
+		if f == "?" then
+			return
+		elseif not f then
 			break
 		end
-		local k = 2
-		while k <= #a do
-			local f = a:sub(k, k)
-			k = k + 1
-			if f == "n" then
-				numbering = false
-			elseif f == "l" then
-				listing = true
-			elseif f == "r" then
-				reverse = true
-			elseif f == "s" then
-				execute = true
-			elseif f == "e" then
-				ename = a:sub(k) ~= "" and a:sub(k) or args[j]
-				if a:sub(k) == "" then
-					j = j + 1
-				end
-				if ename == nil then
-					io.stderr:write("curse: fc: -e: option requires an argument\n" .. rt.usage("fc"))
-					sh.status = 2
-					return
-				end
-				break
-			else
-				return rt.bad_option(sh, "fc", "-" .. f, a)
-			end
-		end
+		numbering, listing = numbering and f ~= "n", listing or f == "l"
+		reverse, execute, ename = reverse or f == "r", execute or f == "s", v or ename
 	end
 	if ename == "-" then
 		execute = true

@@ -4,7 +4,6 @@
 local rt = require("runtime")
 local I = require("interp")._int
 local file_test = I.file_test
-local BUILTINS = I.BUILTINS
 
 -- bash's printable_filename(S, 1): $'…' for a non-printable, '…' for a shell metachar
 local function pfn(s)
@@ -25,50 +24,18 @@ return function(sh, cmd, args, hook, tcb)
 			sh.hashpath = cur
 		end
 		-- (internal_getopt "dlp:rt": -p takes the rest of its word or the next one)
-		local rflag, names, j = false, {}, 2
-		local ppath
+		local rflag, names, ppath = false, {}
 		local dflag, tflag, lflag = false, false, false
-		while args[j] and args[j]:sub(1, 1) == "-" and #args[j] > 1 do
-			local w = args[j]
-			j = j + 1
-			if w == "--" then
-				break
-			elseif w == "--help" then -- (GETOPT_HELP: the builtin's help, status 2)
-				return rt.builtin_help(sh, "hash")
+		local j, sp, c, a = 2
+		repeat
+			c, a, j, sp = rt.getopt(sh, "hash", args, "dlp:rt", j, sp)
+			if c == "?" then
+				return
+			elseif c == "p" then -- -p PATH NAME: remember NAME at PATH (unchecked)
+				ppath = a
 			end
-			local k = 2
-			while k <= #w do
-				local f = w:sub(k, k)
-				if f == "r" then
-					rflag = true
-				elseif f == "d" then
-					dflag = true
-				elseif f == "t" then
-					tflag = true
-				elseif f == "l" then
-					lflag = true
-				elseif f == "p" then -- -p PATH NAME: remember NAME at PATH (unchecked)
-					if k < #w then
-						ppath = w:sub(k + 1)
-					else
-						ppath = args[j]
-						j = j + 1
-					end
-					if ppath == nil then
-						io.stderr:write("curse: hash: -p: option requires an argument\n" .. rt.usage("hash"))
-						sh.status = 2
-						return
-					end
-					break
-				else
-					io.stderr:write("curse: hash: -" .. f .. ": invalid option\n")
-					io.stderr:write("hash: usage: hash [-lr] [-p pathname] [-dt] [name ...]\n")
-					sh.status = 2
-					return
-				end
-				k = k + 1
-			end
-		end
+			rflag, dflag, tflag, lflag = rflag or c == "r", dflag or c == "d", tflag or c == "t", lflag or c == "l"
+		until not c
 		if args[j] == nil and (dflag or tflag) then -- (-d/-t need names)
 			io.stderr:write("curse: hash: -" .. (dflag and "d" or "t") .. ": option requires an argument\n")
 			sh.status = 1
@@ -117,6 +84,7 @@ return function(sh, cmd, args, hook, tcb)
 			if dflag and not tflag and not next(sh.hashcache) then -- (bash: nothing to remove from, quietly)
 				return
 			end
+			local missed = false -- (list_hashed_filename_targets: all_found, whatever printed after)
 			for _, nm in ipairs(names) do
 				local e = sh.hashcache[nm]
 				if tflag then -- (phash_search: counts a hit; a relative entry shown as ./…)
@@ -124,7 +92,7 @@ return function(sh, cmd, args, hook, tcb)
 				end
 				if not e then
 					io.stderr:write("curse: hash: " .. nm .. ": not found\n")
-					sh.status = 1
+					missed = true
 				elseif not tflag then
 					sh.hashcache[nm] = nil
 				elseif lflag then -- -lt: as reusable input
@@ -133,12 +101,15 @@ return function(sh, cmd, args, hook, tcb)
 					sh:echo((#names > 1 and (nm .. "\t") or "") .. e)
 				end
 			end
+			if missed then
+				sh.status = 1
+			end
 		elseif #names > 0 then
 			sh.status = 0
 			for _, nm in ipairs(names) do -- (add_hashed_command: a function or builtin is skipped;
 				-- a name is looked up afresh, its count starting over at 0)
 				if not nm:find("/", 1, true) and not sh.functions[nm]
-					and not (BUILTINS[nm] and not (sh.disabled_builtins and sh.disabled_builtins[nm])) then
+					and not rt.builtin_enabled(sh, nm) then
 					sh.hashcache[nm] = nil
 					rt.path_cache_forget(nm)
 					if sh:resolve_cmd(nm) then

@@ -1,0 +1,80 @@
+#@ guards: clients killed mid-request (SIGKILL/TERM/INT/HUP at a random moment) while their script runs externals, floods output, blocks in read, spins in a hot loop or has background jobs: the daemon must sweep each abandoned worker, keep its pool, leave no process of the abandoned scripts behind (stopped or running), and serve the next requests correctly (the dead-client sweep, 207fd83; workers in their own process group, 38892a8)
+#@ duration: 150
+drv_main() {
+	local x=$TDIR/ck; mkdir -p "$x/xdg" "$x/cache" "$x/s"; chmod 700 "$x/xdg"
+	local dp; dp=$(start_daemon "$x/xdg" "$x/cache" 3 "$x/log") || { fail test-bug "private daemon did not start" "$x"; return; }
+	echo "$dp" >>"$SCR/extra-daemons"
+	local k; for ((k = 0; k < 100; k++)); do [ "$(workers "$dp")" -ge 3 ] && break; sleep 0.05; done
+	cat >"$x/s/ext.sh" <<'S'
+for i in 1 2 3 4 5 6 7 8 9 10; do /bin/sleep 0.1; echo $i; done
+S
+	cat >"$x/s/flood.sh" <<'S'
+i=0; while [ $i -lt 200000 ]; do echo "line $i"; i=$((i+1)); done
+S
+	cat >"$x/s/read.sh" <<'S'
+read -r x; echo "got $x"
+S
+	cat >"$x/s/hot.sh" <<'S'
+i=0; while :; do i=$((i+1)); done
+S
+	cat >"$x/s/bg.sh" <<'S'
+/bin/sleep 3 & /bin/sleep 3 & ( /bin/sleep 3 ) & wait
+S
+	cat >"$x/s/pipe.sh" <<'S'
+yes | while read -r l; do :; done
+S
+	cat >"$x/s/stop.sh" <<'S'
+set -m; /bin/sleep 3 & kill -STOP %1; read -r x
+S
+	local -a scripts=(ext flood read hot bg pipe stop) sigs=(KILL TERM INT HUP)
+	local n=$((ITERS * 12)) i
+	for ((i = 0; i < n; i++)); do
+		past_deadline && break
+		local s=${scripts[RANDOM % ${#scripts[@]}]} g=${sigs[RANDOM % ${#sigs[@]}]}
+		local delay; delay=$(awk -v r=$RANDOM 'BEGIN{printf "%.3f", 0.02 + (r % 400) / 1000}')
+		(
+			cd "$x/s" || exit
+			# stdin: a fifo nobody writes (read.sh blocks), held open by us
+			# (sthelp exec: default dispositions — a bash `&` job would ignore INT)
+			env -i PATH=/usr/bin:/bin XDG_RUNTIME_DIR="$x/xdg" XDG_CACHE_HOME="$x/cache" CURSE_FALLBACK="$FALLBACK" \
+				"$STH" exec "$CLIENT" "$s.sh" </dev/zero >/dev/null 2>&1 &
+			local c=$! k
+			sleep "$delay"
+			kill -"$g" "$c" 2>/dev/null
+			for ((k = 0; k < 100; k++)); do kill -0 "$c" 2>/dev/null || break; sleep 0.05; done
+			if kill -0 "$c" 2>/dev/null; then
+				echo "$s $g: the client outlived SIG$g by 5s" >>"$x/survivors"; kill -9 "$c"
+			fi
+			wait "$c" 2>/dev/null
+		) &
+		[ $((i % 4)) = 3 ] && wait
+		echo "$s $g" >>"$x/kills"
+	done
+	wait
+	echo "client-kill $i" >>"$TDIR/iterations"
+	[ -s "$x/survivors" ] && fail hang "clients that survived their signal: $(sort "$x/survivors" | uniq -c | tr '\n' ';')" "$x"
+	# The sweep polls once a second: after 2.5s no process of an abandoned script may be
+	# STOPPED (a stopped job's group is orphaned when its worker dies: the kernel must
+	# HUP+CONT it). Running leftovers are what bash leaves too when it is SIGKILLed with
+	# jobs running (bg.sh's `sleep 3`s), so those only have to be gone once they end (5s).
+	sleep 2.5
+	local extra; extra=$("$STH" scan "$dp" "$dp" $("$STH" children "$dp" | awk '{print $1}'))
+	echo "$extra" | awk '$2 == "T"' | grep -q . &&
+		fail invariant "abandoned requests left STOPPED processes behind: $(echo "$extra" | awk '$2 == "T"' | head -8 | tr '\n' ';') (kills: $(sort "$x/kills" | uniq -c | tr '\n' ' '))" "$x"
+	[ -n "$extra" ] && echo "running leftovers at 2.5s: $(echo "$extra" | tr '\n' ';')"
+	sleep 3
+	extra=$("$STH" scan "$dp" "$dp" $("$STH" children "$dp" | awk '{print $1}'))
+	[ -n "$extra" ] && fail invariant "abandoned requests left processes behind for 5.5s: $(echo "$extra" | head -8 | tr '\n' ';') (kills: $(sort "$x/kills" | uniq -c | tr '\n' ' '))" "$x"
+	# the pool is back to 3 and serves correctly
+	for ((k = 0; k < 100; k++)); do [ "$(workers "$dp")" -ge 3 ] && break; sleep 0.05; done
+	[ "$(workers "$dp")" -ge 3 ] || fail invariant "client-kill daemon: at least 3 workers expected, $(workers "$dp") found" "$x"
+	local bad=0 out
+	for ((k = 0; k < 30; k++)); do
+		out=$(env -i PATH=/usr/bin:/bin XDG_RUNTIME_DIR="$x/xdg" XDG_CACHE_HOME="$x/cache" CURSE_FALLBACK="$FALLBACK" \
+			"$CLIENT" -c 'echo ok $((6*7))' 2>&1 </dev/null)
+		[ "$out" = "ok 42" ] || { bad=$((bad + 1)); echo "$out" >>"$x/after"; }
+	done
+	[ $bad = 0 ] || fail crash "after the killed clients, $bad of 30 requests failed: $(head -2 "$x/after" | tr '\n' ';')" "$x"
+	"$STH" killsid "$dp"
+	[ -e "$TDIR/failures" ] || rm -rf "$x"
+}

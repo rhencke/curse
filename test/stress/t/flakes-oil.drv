@@ -1,0 +1,32 @@
+#@ guards: past flakes of the Oils spec corpus, repeated under load through test/conformance/run.sh (daemon cold+hot vs bash 5.2.21): background (#8, #13, #18: background echo races), builtin-set, builtin-echo, builtin-getopts, shell-grammar (#4: bg launch-order bug, fixed), prompt (#28) and builtin-kill (#16, #17): job-control notification races with overrides — a recurrence keeps full diffs; and those numbered cases in interp/compiled/tiered too, with full diffs kept on failure
+#@ duration: 240
+# (the snippet extraction is test/conformance/run.sh's awk, copied: that file is not ours)
+oil_extract() { # FILE BASE OUTDIR -> OUTDIR/BASE__N.sh per bash-targeting case
+	awk -v OUT="$3" -v B="$2" '
+      /^## compare_shells:/ { if ($0 ~ /bash/) targets=1 }
+      /^#### / { flush(); n++; code=""; skip=0; incase=1; inblock=0; next }
+      !incase { next }
+      /^## .*(STDOUT|STDERR):[ \t]*$/ { if ($0 ~ /^## N-I bash/) skip=1; inblock=1; next }
+      /^## (END|OK|BUG|N-I)/ { if ($0 ~ /^## N-I bash/) skip=1; inblock=0; next }
+      inblock { next }
+      /^## / { next }
+      { code = code $0 "\n" }
+      END { flush() }
+      function flush(   p) {
+        if (incase && !skip && targets && code != "") { p = OUT "/" B "__" n ".sh"; printf "%s", code > p; close(p) }
+      }' "$1"
+}
+drv_main() {
+	local od=$REPO/subprojects/oil/spec
+	[ -d "$od" ] || { fail test-bug "oil corpus not fetched (meson subprojects download oil)"; return; }
+	local sn=$TDIR/snippets; mkdir -p "$sn"
+	oil_extract "$od/background.test.sh" background "$sn"
+	oil_extract "$od/shell-grammar.test.sh" shell-grammar "$sn"
+	local s
+	for s in background__8 background__13 background__18 shell-grammar__4; do
+		past_deadline && break
+		[ -e "$sn/$s.sh" ] || { fail test-bug "oil case $s not found"; continue; }
+		( O_LABEL=$s O_ITERS=$((ITERS * 3)) O_ORACLE=varies O_TIMEOUT=20 O_KEEP=all run_script_test "$sn/$s.sh" )
+	done
+	KEEPALL=1 CONF_TIMEOUT=20 replay_conformance oil "$ITERS" background builtin-set builtin-echo builtin-getopts shell-grammar prompt builtin-kill
+}

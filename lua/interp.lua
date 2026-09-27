@@ -234,23 +234,29 @@ end
 -- `read` field-splitting. The line may carry CTLESC markers (\1) before each
 -- backslash-escaped character (see the read builtin): a marked char is LITERAL —
 -- it is part of a field and never a delimiter — and the marker is dropped from
--- the value. Split into an array of {ch, esc} cells, then apply IFS to those.
+-- the value.
 local rs_pats = {} -- IFS -> { sep, non, tail } for the fast path (false: not whitespace-only)
-local function read_split(ifs, line, nvars, nomark) -- (nomark: \1 is plain — read's skip_ctlesc)
+local function read_split(ifs, line, nvars, nomark, saw, sh) -- (nomark: \1 is plain — read's
+	-- skip_ctlesc; saw: then a CTLNUL was marked, \1\177)
+	-- (a pending glibc mbtowc state, or a line that may leave one — rt.mbtowc_visit — takes
+	-- the general path, whose scan models it)
+	local st = sh and (sh.mbw ~= nil or (line:byte(-1) or 0) >= 0x80) and ifs ~= "" and rt.lc_mb_cur_max() > 1
+		and rt.lc_utf8()
 	-- the common case: an IFS of whitespace only, no escaped chars — fields are runs of
 	-- non-IFS; the last var gets the rest with trailing IFS stripped (as below)
-	local pat = rs_pats[ifs]
+	local pairs_ = nomark and not ifs:find("\127", 1, true) and line:find("\1\127", 1, true)
+	local pat = not st and rs_pats[ifs]
 	if pat == nil then
 		if ifs ~= "" and not ifs:find("[^ \t\n]") then
 			pat = { "[" .. ifs .. "]", "[^" .. ifs .. "]", "^(.-)[" .. ifs .. "]*$" }
-		elseif ifs ~= "" and not ifs:find("[ \t\n\128-\255%z]") then -- (no whitespace)
+		elseif ifs ~= "" and not ifs:find("[ \t\n\v\f\r\128-\255%z]") then -- (no whitespace)
 			pat = { "[" .. ifs:gsub("%W", "%%%0") .. "]", nows = true }
 		else
 			pat = false
 		end
 		rs_pats[ifs] = pat
 	end
-	if pat and pat.nows and (nomark or not line:find("\1", 1, true)) then
+	if pat and pat.nows and ((nomark and not pairs_) or (not nomark and not line:find("\1", 1, true))) then
 		-- an IFS of non-whitespace delimiters only: each one ends a field (empty fields
 		-- kept); the last var gets the raw rest — minus a lone trailing delimiter when
 		-- that rest is a single field (bash, as below)
@@ -272,7 +278,7 @@ local function read_split(ifs, line, nvars, nomark) -- (nomark: \1 is plain — 
 		end
 		return out
 	end
-	if pat and (nomark or not line:find("\1", 1, true)) then
+	if pat and ((nomark and not pairs_) or (not nomark and not line:find("\1", 1, true))) then
 		if nvars == 1 then -- (one var: the line minus leading/trailing IFS whitespace)
 			local b1, b2 = line:byte(1), line:byte(-1)
 			if not b1 or not (ifs:find(string.char(b1), 1, true) or ifs:find(string.char(b2), 1, true)) then
@@ -300,115 +306,64 @@ local function read_split(ifs, line, nvars, nomark) -- (nomark: \1 is plain — 
 		end
 		return out
 	end
-	local wsset, ifsset = {}, {}
-	for c in ifs:gmatch(".") do
-		ifsset[c] = true
-		if c == " " or c == "\t" or c == "\n" then
-			wsset[c] = true
-		end
-	end
-	local cells, p, m = {}, 1, #line
-	while p <= m do
-		local c = line:sub(p, p)
-		if c == "\1" and p < m and not nomark then
-			cells[#cells + 1] = { ch = line:sub(p + 1, p + 1), esc = true }
-			p = p + 2
-		else
-			cells[#cells + 1] = { ch = c, esc = false }
-			p = p + 1
-		end
-	end
-	local n = #cells
-	local function isws(k)
-		local c = cells[k]
-		return c and not c.esc and wsset[c.ch]
-	end
-	local function isifs(k)
-		local c = cells[k]
-		return c and not c.esc and ifsset[c.ch]
-	end
-	local function slice(a, b)
-		local t = {}
-		for k = a, b do
-			t[#t + 1] = cells[k].ch
-		end
-		return table.concat(t)
-	end
-	local i = 1
-	while i <= n and isws(i) do
-		i = i + 1
-	end -- leading IFS whitespace
+	-- the general case, as bash's read.def over get_word_from_string (subst.c): the field
+	-- engine's delimiter scan (rt.ifs_find: a field ends per character) on the raw line —
+	-- CTLESC markers and all — so a field's markers are dropped only once it is cut out.
+	-- Whitespace is two classes here: read.def's initial strip, the step past a delimiter
+	-- (rt.ifs_rskip) and strip_trailing_ifs_whitespace take only space/tab/newline IFS
+	-- bytes (spctabnl), each word's own leading skip and the "whitespace delimiter" test
+	-- every isspace one (\v \f \r too) — so `IFS=$'\v' read x <<< $'\va\v\vb'` keeps x raw.
+	-- Under nomark (IFS holds \1: skip_ctlesc) the only markers are a CTLNUL's (\1\177,
+	-- kept whole by SX_NOESCCTLNUL); `saw` (bash's saw_escape) then dequotes every \1.
+	local ic = rt.ifs_charset_of(ifs)
+	local n, wsb, rwsb = #line, ic.wsb, ic.rwsb
+	-- (under nomark only a \1\177 pair is special — SX_NOESCCTLNUL — unless IFS holds \177;
+	-- a pair of raw input bytes counts too, left undequoted when nothing was marked)
+	local esc = (nomark and pairs_ and 2) or (not nomark and line:find("\1", 1, true) and true)
+	saw = nomark and saw or (not nomark and esc)
+	local skipws, find = rt.ifs_skipws, st and rt.ifs_find_st or rt.ifs_find
+	local i = skipws(rwsb, line, 1, n) -- read.def's leading strip
 	local out = {}
 	for v = 1, nvars do
-		if v == nvars then
-			-- bash (read.def): extract one field from the remainder (consuming it plus its
-			-- single trailing delimiter). If NOTHING remains after that, the value is just
-			-- that field (its trailing delimiter stripped — so `IFS=x; read a b <<< axbx`
-			-- gives b="b", and `xx` gives b=""). Otherwise the value is the raw remainder
-			-- with only trailing IFS WHITESPACE stripped (interior/trailing non-ws kept).
-			local s, j = i, i
-			while j <= n and not isifs(j) do
-				j = j + 1
-			end -- field = s..j-1
-			local fieldend = j - 1
-			while j <= n and isws(j) do
-				j = j + 1
-			end -- delimiter: IFS whitespace
-			if j <= n and isifs(j) then
-				j = j + 1
-				while j <= n and isws(j) do
-					j = j + 1
-				end
-			end -- + one non-ws
-			if j > n then
-				out[v] = slice(s, fieldend) -- single field, delimiter stripped
+		local s = skipws(wsb, line, i, n) -- (get_word_from_string's own leading skip)
+		if s > n then
+			out[v], i = "", n + 1
+		else
+			local e, l = find(ic, line, s, esc, nil, nil, sh)
+			local nx = n + 1
+			if e then
+				nx = rt.ifs_rskip(ic, line, e + l, n, wsb[line:byte(e)] and 1 or 2)
 			else
-				-- bash's strip_trailing_ifs_whitespace (subst.c) runs on the RAW remainder,
-				-- CTLESC (\1) markers and all: scan back while the byte is IFS whitespace, OR
-				-- it's a \1 whose FOLLOWING byte is space/tab/nl — never removing the first
-				-- byte. That strips a \1's escaped space while orphaning the bare \1, so a lone
-				-- \001 leaks into the value (read.def bug; builtin-read "read bash bug"). Mirror
-				-- it byte-for-byte by re-encoding cells[s..n] and dequoting only afterward.
-				local raw = {}
-				for k = s, n do
-					raw[#raw + 1] = cells[k].esc and ("\1" .. cells[k].ch) or cells[k].ch
-				end
-				raw = table.concat(raw)
-				local S = #raw
-				local function sptn(c)
-					return c == " " or c == "\t" or c == "\n"
-				end
-				while S > 1 and (wsset[raw:sub(S, S)] or (raw:sub(S, S) == "\1" and sptn(raw:sub(S + 1, S + 1)))) do
+				e = n + 1
+			end
+			if v < nvars or nx > n then
+				-- a field; for the LAST var only when nothing remains after it and its one
+				-- delimiter (so `IFS=x; read a b <<< axbx` gives b="b", and `xx` gives b="")
+				out[v] = line:sub(s, e - 1)
+				i = nx
+			else
+				-- the last var otherwise gets the raw remainder (from before its word's
+				-- leading skip) with only trailing IFS spctabnl stripped (interior/trailing
+				-- other IFS kept). bash's strip_trailing_ifs_whitespace (subst.c) runs on it
+				-- CTLESC (\1) markers and all: scan back while the byte is such whitespace,
+				-- OR (saw_escape) it's a \1 whose FOLLOWING byte is space/tab/nl — never
+				-- removing the first byte. That strips a \1's escaped space while orphaning
+				-- the bare \1, so a lone \001 leaks into the value (read.def bug;
+				-- builtin-read "read bash bug"). Mirror it byte-for-byte and dequote only
+				-- afterward.
+				local S = n
+				while S > i do
+					local b = line:byte(S)
+					if not (rwsb[b] or (saw and b == 1 and line:sub(S + 1, S + 1):find("^[ \t\n]"))) then
+						break
+					end
 					S = S - 1
 				end
-				raw = raw:sub(1, S)
-				local o, k2 = {}, 1 -- dequote: \1 escapes the next byte; a trailing lone \1 stays
-				while k2 <= #raw do
-					if raw:sub(k2, k2) == "\1" and k2 < #raw then
-						o[#o + 1] = raw:sub(k2 + 1, k2 + 1)
-						k2 = k2 + 2
-					else
-						o[#o + 1] = raw:sub(k2, k2)
-						k2 = k2 + 1
-					end
-				end
-				out[v] = table.concat(o)
+				out[v] = line:sub(i, S)
 			end
-		else
-			local s = i
-			while i <= n and not isifs(i) do
-				i = i + 1
+			if saw then -- (dequote_string: \1 escapes the next byte; a trailing lone \1 stays)
+				out[v] = out[v]:gsub("\1(.)", "%1")
 			end
-			out[v] = slice(s, i - 1)
-			while i <= n and isws(i) do
-				i = i + 1
-			end -- delimiter: IFS whitespace
-			if i <= n and isifs(i) then
-				i = i + 1
-				while i <= n and isws(i) do
-					i = i + 1
-				end
-			end -- + one non-ws
 		end
 	end
 	return out
@@ -490,8 +445,6 @@ ffi.cdef([[
   struct curse_rlimit { uint64_t rlim_cur; uint64_t rlim_max; };
   int getrlimit(int resource, struct curse_rlimit *rlim);
   int setrlimit(int resource, const struct curse_rlimit *rlim);
-  struct curse_timeval { long tv_sec; long tv_usec; };
-  int gettimeofday(struct curse_timeval *tv, void *tz);
   struct curse_pollfd { int fd; short events; short revents; };
   int poll(struct curse_pollfd *fds, unsigned long nfds, int timeout);
 ]])
@@ -542,7 +495,11 @@ local function rl_capture(dumpfn)
 	if not rl then
 		return nil
 	end
-	local tmp = os.tmpname()
+	local tfd, tmp = rt.mktmpfd() -- (mode 0600 whatever the umask; see rt.mktmpfd)
+	if tfd < 0 then
+		return nil
+	end
+	C.close(tfd)
 	local f = C.fopen(tmp, "w")
 	if f == nil then
 		os.remove(tmp)
@@ -580,6 +537,10 @@ local function fd_getc(fd)
 	rt.co_block(fd, 1) -- inside a pipeline stage: yield, don't stall the siblings
 	rt.rd_gen = rt.rd_gen + 1 -- (a read `read` didn't peek: see rt.pipe_cache)
 	local n = C.read(fd, rd1, 1)
+	while n < 0 and ffi.errno() == 4 do -- EINTR: the trap runs (zread's retry)
+		rt.eintr()
+		n = C.read(fd, rd1, 1)
+	end
 	if n == 1 then
 		return string.char(rd1[0] % 256)
 	end
@@ -684,6 +645,10 @@ local SIGDESC = {
 	[13] = "Broken pipe",
 	[14] = "Alarm clock",
 	[15] = "Terminated",
+	[19] = "Stopped (signal)", -- (the stop signals: `jobs -l` of a stopped job)
+	[20] = "Stopped",
+	[21] = "Stopped (tty input)",
+	[22] = "Stopped (tty output)",
 }
 -- A trap's signal spec (bash's decode_signal with DSIG_NOCASE|DSIG_SIGPREFIX, trap.c): a
 -- legal_number 0..64 (blanks/sign/leading zeros ok; 0 = EXIT), [SIG]RTMIN+N for N 0..30,
@@ -747,9 +712,10 @@ local var_is_set, unary, binary, do_test = rt.var_is_set, rt.test_unary, rt.test
 local tilde_prefix -- forward (word-initial ~ expansion; defined below, used in paramexp)
 local expand_word -- forward (used by eval's $-deferred arith and expand_part_str)
 local expand_assign_word -- forward (assignment-RHS expander; ${-default} tilde ctx)
+local notilde -- forward (a word copy that expands with no tilde expansion: 5.2.21 assoc subscripts)
 local expand_pattern -- forward (quote-aware glob-pattern expansion for ${v/…} etc.)
 local expand_repl -- forward (${v/pat/REPL} replacement expansion)
-local is_multi, multi_elems -- forward (defined with the field expander)
+local is_multi, multi_elems, multi_hda -- forward (defined with the field expander)
 local indirect_part -- forward (${!ref} target resolution, re-parsed to a part)
 local eval -- arithmetic evaluator (forward decl)
 local noeval_pow -- a short-circuited operand's exponent check (forward decl)
@@ -761,7 +727,7 @@ local in_expanded_text -- evaluating arith_textual_eval's expanded text (see the
 local run_trap -- trap-handler runner (forward decl; defined near the bottom)
 local fire_err -- ERR-trap + errexit enforcement (forward decl; defined near exec_list)
 local fire_err_trap -- the ERR-trap half of fire_err WITHOUT errexit-exit (used inside handlers)
-local sherr -- error-message writer, capture-aware for `2>&1` in $() (defined w/ redirs)
+local sherr = rt.Shell.errmsg -- error-message writer, capture-aware for `2>&1` in $()
 -- Resolve a variable's string value in arithmetic. bash treats it as an arith
 -- EXPRESSION: a bare number is its value, but a name (or `3+4`, `bar`) is
 -- recursively parsed and evaluated (so bar=foo; foo=5; $((bar)) == 5). A pure
@@ -855,37 +821,12 @@ local function arith_expand_text(sh, raw, depth0) -- depth0: 1 = the text IS a s
 			out[#out + 1] = c
 			k = k + 1
 		elseif c == "$" or c == "`" then
-			local e
 			local nx = raw:sub(k + 1, k + 1)
-			if c == "`" then
-				e = raw:find("`", k + 1, true) or n
-			elseif raw:sub(k + 1, k + 2) == "((" then
-				local _, ni = P.grab_dparen(raw, k + 3)
-				e = ni - 1
-			elseif nx == "(" then
-				local ok, ni = pcall(P.scan_cmdsub, raw, k + 2)
-				e = ok and ni - 1 or n
-			elseif nx == "[" then -- $[expr]: the legacy $(( )) (bracket-depth matched)
-				local d = 0
-				e = k + 1
-				while e <= n do
-					local b = raw:byte(e)
-					if b == 91 then
-						d = d + 1
-					elseif b == 93 then
-						d = d - 1
-						if d == 0 then
-							break
-						end
-					end
-					e = e + 1
-				end
-				e = math.min(e, n)
-			elseif nx == "{" then
-				local ok, ni = pcall(P.scan_braces, raw, k + 1)
-				e = ok and ni - 1 or n
-			else
-				e = select(2, raw:find("^[%a_][%w_]*", k + 1)) or (nx:match("^[%d@*#?$!%-]$") and k + 1) or k
+			-- (to the end of the $name / $special / $( … ) / ${ … } / $(( … )) / $[ … ] / `…`)
+			local e = c == "$" and (select(2, raw:find("^[%a_][%w_]*", k + 1)) or (nx:match("^[%d@*#?$!%-]$") and k + 1))
+			if not e then
+				local ok, x = pcall(P.expansion_end, raw, k, false, true)
+				e = math.min(ok and x or n + 1, n + 1) - 1
 			end
 			local chunk = raw:sub(k, e)
 			local v = e > k and expand_word(sh, P.parse_word('"' .. chunk .. '"')) or chunk
@@ -1432,7 +1373,7 @@ end
 -- associative array, else an integer (arith-evaluated) for an indexed one.
 array_key = function(sh, name, index_raw)
 	if sh:is_assoc(name) then
-		return expand_word(sh, P.parse_word(index_raw))
+		return expand_word(sh, notilde(P.parse_word(index_raw))) -- (5.2.21: no tilde; see notilde)
 	end
 	-- indexed: arith-evaluate the subscript. Parse the RAW subscript with arith (its
 	-- defer/xpand handles $()/$vars) rather than word-expanding it first, so bash's
@@ -1455,6 +1396,17 @@ array_key = function(sh, name, index_raw)
 		P.arith_cmd = sv
 		if type(v) == "table" and v.__curse_unbound then
 			error(v, 0) -- (set -u: said already, and fatal as it is — no syntax error on top)
+		end
+		if type(v) == "table" and v.pre and not v.__curse_matherr then
+			-- (a syntax error: what bash evaluated before it ran first — `[x+]` with x holding
+			-- a bad expression reports x's error, not the `+`)
+			local pok, pe = pcall(arith_pre, sh, v)
+			if not pok then
+				if type(pe) == "table" and pe.__curse_unbound then
+					error(pe, 0)
+				end
+				v = pe
+			end
 		end
 		if not (type(v) == "table" and v.__curse_matherr) then -- (an eval error already said so)
 			io.stderr:write("curse: " .. P.arith_errmsg(index_raw, v) .. "\n")
@@ -1510,20 +1462,24 @@ local function expand_procsub(sh, p)
 	end
 	local mine, theirs = pfd[p.dir == "<" and 0 or 1], pfd[p.dir == "<" and 1 or 0]
 	local body = p.procsub
+	-- (its body numbers its lines from the command's, as a $(…)'s does: bash parses it in
+	-- place — compiled code's line is found on the stack here, not in the job)
+	local _, l0 = rt.err_where(sh)
 	local job = sh:bg_launch(function(ssh)
-		local stmts = P.parse(body).stmts
+		ssh.cur_line = l0 > 0 and l0 or ssh.cur_line
+		local stmts = P.parse(body, nil, nil, nil, nil, l0 > 0 and l0 or nil).stmts
 		local s1 = #stmts == 1 and stmts[1]
 		if s1 and s1.t == "simple" and #(s1.words or {}) == 0 and s1.redirs and #s1.redirs == 1
 			and s1.redirs[1].op == "in" and not s1.assigns then
 			-- <(< file): the file's contents, like $(< file) (bash 5.2)
 			local path = M.expand_assign_word(ssh, P.parse_word(s1.redirs[1].target or ""))
-			local f = io.open(path, "rb")
+			local f, _, en = io.open(path, "rb")
 			if f then
 				ssh.out(f:read("*a") or "")
 				f:close()
 				ssh.status = 0
 			else
-				io.stderr:write("curse: " .. path .. ": No such file or directory\n")
+				rt.read_fail(path, en)
 				ssh.status = 1
 			end
 			return
@@ -1533,7 +1489,7 @@ local function expand_procsub(sh, p)
 		{ fds = { [p.dir == "<" and 1 or 0] = theirs }, keepstdin = true, nojob = true })
 	C.close(theirs)
 	local fd = rt.fd_below(mine, 64)
-	rt.fd_owner[fd] = sh -- (only this shell's own spawns inherit it)
+	rt.fd_register(fd, sh) -- (only this shell's own spawns inherit it — and its later clones')
 	sh.procsub_files = sh.procsub_files or {}
 	sh.procsub_files[#sh.procsub_files + 1] = { fd = fd, pid = job and job.pid or 0, g = job and job.g }
 	return "/dev/fd/" .. fd
@@ -1679,8 +1635,10 @@ end
 expand_part_str = function(sh, p, assign)
 	if p.lit ~= nil then
 		return p.lit
-	elseif p.bterr then -- (a brace range's unclosed backquote: bq_word in the parser)
-		sherr(sh, 'curse: bad substitution: no closing "`" in ' .. p.bterr .. "\n")
+	elseif p.bterr or p.nulcut then -- (a brace range's unclosed backquote: bq_word in the
+		-- parser; a word cut at a $'…' NUL: parser.dq_nulcut)
+		sherr(sh, p.bterr and ('curse: bad substitution: no closing "`" in ' .. p.bterr .. "\n")
+			or ("curse: bad substitution: no closing `}' in " .. p.nulcut .. "\n"))
 		error({ __curse_exit = 1, __curse_lineabort = true, __curse_discard = true })
 	elseif p.var then
 		-- a nameref whose target has a subscript (`typeset -n ref='a[2]'`) reads as
@@ -1778,46 +1736,6 @@ tilde_prefix = rt.tilde_prefix
 local tilde_assign = rt.tilde_assign
 local tilde_word_initial = rt.tilde_word_initial
 
--- Compiled-tier plain scalar assignment (`name=value`), mirroring interp's assign
--- handler for an ATTRIBUTED target: reject a readonly var ($?=1 + diagnostic, fatal
--- in -c/posix); write element [0] of an array var (bash: `a=v` on an array); arith-
--- evaluate for `declare -i`; case-fold for `declare -l/-u`; else a plain set. Only
--- emitted when the program creates such a var (else compiled uses sh:set_str).
-function M.assign_scalar(sh, name, value)
-	local direct = sh.vars[name]
-	local b = sh.vars[sh:deref(name)]
-	if b and b.ro then
-		io.stderr:write("curse: " .. name .. ": readonly variable\n")
-		rt.report_exit(sh) -- (err_readonly: report_error)
-		sh.status = 1
-		-- Writing THROUGH a nameref to a readonly target is NON-fatal (bash: status 1,
-		-- continue). A DIRECT readonly assignment hard-exits in -c/posix, else aborts
-		-- the rest of the line (like interp's assign handler).
-		if direct and direct.ref then
-			return
-		end
-		if sh.opt_c or sh.opt_posix then
-			error({ __curse_exit = 1 })
-		end
-		error({ __curse_exit = 1, __curse_lineabort = true })
-	end
-	if b and b.arr then
-		sh:array_set(name, array_key(sh, name, "0"), value, false)
-	elseif b and b.int and not b.ref then
-		sh:aset(name, rt.int_value(sh, value, M.arith_eval_str))
-	elseif b and (b.lower or b.upper) then
-		sh:set_str(name, b.lower and value:lower() or value:upper())
-	elseif sh:set_str(name, value) == false then -- (a valueless nameref given a bad target)
-		error({ __curse_exit = 1, __curse_lineabort = true, __curse_noee = true })
-	end
-	if sh.opt_a then -- set -a (allexport): a plain scalar assignment auto-exports (bash)
-		local nb = sh.vars[sh:deref(name)]
-		if nb and not nb.arr then
-			nb.exported = true
-			C.setenv(sh:deref(name), sh:get(name), 1)
-		end
-	end
-end
 
 -- `noassign`: a ${…} operand — only a word-initial ~ expands there, never the `NAME=…:~`
 -- assignment form (bash: `${x:=P=~/b}` keeps its tildes)
@@ -1825,7 +1743,7 @@ expand_word = function(sh, w, noassign)
 	local buf = {}
 	for k, p in ipairs(w.parts) do
 		local s = expand_part_str(sh, p)
-		if k == 1 and p.lit ~= nil and not p.q then
+		if k == 1 and p.lit ~= nil and not p.q and not w.notilde then
 			s = tilde_word_initial(sh, s, #w.parts > 1, noassign)
 		end
 		buf[#buf + 1] = s
@@ -1842,8 +1760,8 @@ end
 expand_assign_word = function(sh, w, peel_name)
 	local buf = {}
 	for i, p in ipairs(w.parts) do
-		local s = expand_part_str(sh, p, true) -- assignment context: ${-default} tilde after ':'
-		if p.lit ~= nil and not p.q then
+		local s = expand_part_str(sh, p, not w.notilde) -- assignment context: ${-default} tilde after ':'
+		if p.lit ~= nil and not p.q and not w.notilde then
 			local more = i < #w.parts -- a prefix without `/` runs into the next part: literal
 			if peel_name and i == 1 then
 				local pre, rest = s:match("^([%a_][%w_]*%+?=)(.*)$")
@@ -1857,6 +1775,24 @@ expand_assign_word = function(sh, w, peel_name)
 	return table.concat(buf)
 end
 M.expand_assign_word = expand_assign_word
+-- bash 5.2.21's expand_subscript_string (W_NOTILDE): an ASSOCIATIVE array's subscripts —
+-- `a[~]=v`, `${a[~]}`, `unset 'a[~]'`, a compound `([~]=v)` — and its compound-assignment
+-- VALUES (`([k]=~)`, a key/value list `(k ~)`) are expanded with NO tilde expansion.
+-- (bash 5.2 patch 24 turned tildes back on there; curse is 5.2.21, bug for bug.) A word
+-- marked `notilde` (a copy — parse results are shared) expands like that everywhere:
+-- expand_word, expand_assign_word, the compiled tier's emit_word and EF.tilde_value.
+notilde = function(w)
+	if w.notilde then
+		return w
+	end
+	local c = {}
+	for k, v in pairs(w) do
+		c[k] = v
+	end
+	c.notilde = true
+	return c
+end
+M.notilde = notilde
 
 -- Expand a word, backslash-escaping the metacharacters in `charclass` for any
 -- QUOTED part (so they match literally) while leaving unquoted parts — including
@@ -1864,15 +1800,16 @@ M.expand_assign_word = expand_assign_word
 -- value, decides literalness. Shared by glob-pattern and =~-regex expansion.
 -- `xt` (a table; set -x of a [[ ]] pattern): xt[1] gets the text bash traces, EVERY quoted
 -- character backslashed (quote_string_for_globbing), from the same single expansion.
+local PAT_META = "[%*%?%[%]\\%(%)%|%+%@%!%-%^]"
 local function expand_escaped(sh, w, charclass, xt)
 	local buf, xb = {}, xt and {}
 	for _, p in ipairs(w.parts) do
 		local s = expand_part_str(sh, p)
 		if p.q then
 			if xb then
-				xb[#xb + 1] = s:gsub("[%z\1-\127\194-\244][\128-\191]*", "\\%0")
+				xb[#xb + 1] = rt.xglob_quote(s)
 			end
-			s = s:gsub(charclass, "\\%0")
+			s = charclass == PAT_META and rt.glob_quote(s) or s:gsub(charclass, "\\%0")
 		elseif xb then
 			xb[#xb + 1] = s
 		end
@@ -1908,7 +1845,6 @@ expand_repl = function(sh, w)
 	return table.concat(buf)
 end
 -- glob PATTERN context (${v/pat/repl}, case, [[ == ]]): glob metacharacters.
-local PAT_META = "[%*%?%[%]\\%(%)%|%+%@%!%-%^]"
 expand_pattern = function(sh, w, xt)
 	if xt == true then
 		xt = nil -- (a caller sharing expand_word's signature passes its `true` flag)
@@ -1922,7 +1858,7 @@ expand_pattern = function(sh, w, xt)
 		if t ~= s then
 			local rest = expand_escaped(sh, { parts = { unpack(w.parts, 2) } }, PAT_META, xt)
 			local tail = s:match("^~[^/]*(.*)$") or ""
-			local dir = t:sub(1, #t - #tail):gsub(PAT_META, "\\%0")
+			local dir = rt.glob_quote(t:sub(1, #t - #tail))
 			if xt then -- (the expanded directory reads as quoted)
 				xt[1] = rt.xglob_quote(t:sub(1, #t - #tail)) .. tail .. xt[1]
 			end
@@ -1951,33 +1887,23 @@ local function case_pattern(sh, w)
 		if p.q and is_multi(sh, p) then
 			local els, star = multi_elems(sh, p)
 			if star then
-				buf[#buf + 1] = table.concat(els, rt.ifs_sep(sh)):gsub(PAT_META, "\\%0")
+				buf[#buf + 1] = rt.glob_quote(table.concat(els, rt.ifs_sep(sh)))
 			elseif #els > 0 then
-				buf[#buf + 1] = els[1]:gsub(PAT_META, "\\%0")
+				buf[#buf + 1] = rt.glob_quote(els[1])
 				if #els > 1 then
 					break
 				end
 			end
 		else
 			local s = expand_part_str(sh, p)
-			buf[#buf + 1] = p.q and s:gsub(PAT_META, "\\%0") or s
+			buf[#buf + 1] = p.q and rt.glob_quote(s) or s
 		end
 	end
 	return table.concat(buf)
 end
--- Does `subj` match any of the case-clause pattern strings? The compiled tier's case
--- codegen dispatches clauses natively but matches through this shared helper (vars in
--- a pattern expand; quoted metachars stay literal), honoring shopt nocasematch.
-M.case_pattern = case_pattern -- (rt.case_glob)
-function M.case_match(sh, subj, pats)
-	local ic = sh.shopt.nocasematch and true or nil
-	for _, pat in ipairs(pats) do
-		if rt.glob_match(subj, case_pattern(sh, P.parse_word(pat)), ic, not sh.shopt.extglob) then
-			return true
-		end
-	end
-	return false
-end
+-- A case-clause pattern word's glob form, for rt.case_glob (the compiled tier's case codegen
+-- matches through it: vars in a pattern expand; quoted metachars stay literal).
+M.case_pattern = case_pattern
 -- `=~` regex context: ERE metacharacters.
 -- Quoted text is escaped to match literally — except INSIDE a bracket expression, where
 -- bash inserts it raw (`["."]` is `[.]`, `[\.]` too; `[']']` is `[]]`), so the builder
@@ -2194,6 +2120,123 @@ is_multi = function(sh, p)
 	-- $@/$* live in pexp.name (e.g. ${@:1}); array [@]/[*] live in pexp.index
 	return p.pexp.index == "@" or p.pexp.index == "*" or p.pexp.name == "@" or p.pexp.name == "*"
 end
+-- Does this multi part make bash split its word as has_dollar_at (list_string on the
+-- whole word with quoted=1: leading IFS whitespace is then a delimiter of its own, so
+-- `IFS=': '; x=' :a'; set -- $x"$@"` has no empty first field)? param_expand /
+-- parameter_brace_expand / chk_atstar set contains_dollar_at for every @ form, quoted or
+-- not, for an unquoted $* and ${a[*]} (with any operator) — but not for ${*…}, ${!a[*]},
+-- ${!pfx*} or a quoted * form; ${!ref} as its target.
+local DEFAULT_OPS = { [":-"] = true, ["-"] = true, [":+"] = true, ["+"] = true }
+-- ...and inside a ${x:-word} word bash expands (parameter_brace_expand_rhs): any @ form —
+-- a quoted one only when it has elements — never a * form.
+local function word_hda(sh, w, q)
+	for _, sp in ipairs(w.parts) do
+		if is_multi(sh, sp) then
+			local sq = sp.q or q
+			local pe = sp.pexp
+			local star = sp.special == "*" or (pe and (pe.name == "*" or pe.index == "*" or pe.star))
+			if not star then
+				if not sq then
+					return true
+				end
+				local c = { special = sp.special, pexp = pe, q = true }
+				if #(multi_elems(sh, c)) > 0 then
+					return true
+				end
+			end
+		end
+	end
+	return false
+end
+-- does a (non-multi) ${x:-word}-style part's taken branch have the word — and does that
+-- word make the whole word has_dollar_at (multi_hda)?
+local function default_hda(sh, p)
+	local pe = p.pexp
+	if not (pe and DEFAULT_OPS[pe.op] and pe.arg and pe.arg:find("@", 1, true)) or pe.index then
+		return false
+	end
+	local pn = tonumber(pe.name)
+	local val, set
+	if pn then
+		set, val = pn == 0 or pn <= sh.nparams, sh:param(pn)
+	else
+		local b = sh.vars[sh:deref(pe.name)]
+		if b and b.arr then
+			set = b.arr[0] ~= nil or b.arr["0"] ~= nil
+		else
+			set = b ~= nil and (b.s ~= nil or b.n ~= nil)
+		end
+		val = sh:get(pe.name)
+		set = set or sh:special_get(pe.name) ~= ""
+	end
+	local use
+	if pe.op == ":-" then
+		use = val == ""
+	elseif pe.op == "-" then
+		use = not set
+	elseif pe.op == ":+" then
+		use = val ~= ""
+	else
+		use = set
+	end
+	if not use then
+		return false
+	end
+	if p.q then
+		return word_hda(sh, P.parse_default_quoted(pe.arg, pe.hd), true)
+	end
+	return word_hda(sh, P.parse_word(pe.arg), false)
+end
+multi_hda = function(sh, p)
+	local pe = p.pexp
+	if not pe then
+		return p.braced and p.special == "@" or not p.braced and (p.special == "@" or not p.q)
+	end
+	if DEFAULT_OPS[pe.op] and (pe.name == "@" or pe.index == "@") then
+		-- ${a[@]:-w}: the value branch is an @ expansion; the word branch, its word's
+		local els = pe.name == "@" and sh:paramList() or sh:array_values(sh:deref(pe.name))
+		local set = #els > 0
+		local ne = #els > 1 or (set and els[1] ~= "")
+		local val -- (the value itself is returned)
+		if pe.op == ":-" then
+			val = ne
+		elseif pe.op == "-" then
+			val = set
+		elseif pe.op == ":+" then
+			val = not ne
+		else
+			val = not set
+		end
+		if val then
+			return true
+		end
+		if not pe.arg then
+			return false
+		end
+		if p.q then
+			return word_hda(sh, P.parse_default_quoted(pe.arg, pe.hd), true)
+		end
+		return word_hda(sh, P.parse_word(pe.arg), false)
+	end
+	if pe.op == "indirect" then
+		local ip = indirect_part(sh, pe, true)
+		if not ip then
+			return false
+		end
+		ip.q = p.q
+		return is_multi(sh, ip) and multi_hda(sh, ip)
+	end
+	if pe.op == "prefix" then
+		return not pe.star
+	end
+	if pe.op == "indices" then
+		return pe.index == "@"
+	end
+	if pe.name == "@" or pe.index == "@" then
+		return true
+	end
+	return pe.index == "*" and not p.q
+end
 multi_elems = function(sh, p) -- returns element list, star?
 	if p.pexp then
 		local pe = p.pexp
@@ -2400,45 +2443,7 @@ end
 -- Expand a word to a LIST of fields (command args, for-in lists): unquoted
 -- expansions split on default-IFS whitespace; quoted text never splits; "$@" /
 -- "${a[@]}" yield one field per element.
--- bash glob_pattern_p on a plain (already-expanded) string: `*`/`?` always
--- active, `[` only with a later `]`. Conservative — never reports inactive for a
--- real glob — so the caller may safely skip pathname expansion when it's false.
-local GLOB_CH = { [42] = true, [63] = true, [91] = true, [43] = true, [64] = true, [33] = true } -- * ? [ + @ !
-local function str_glob_active(s)
-	local n = #s
-	if n <= 32 then -- (the common word: no glob character at all — a byte loop the JIT
-		local any = false -- compiles; a pattern it doesn't)
-		for k = 1, n do
-			if GLOB_CH[s:byte(k)] then
-				any = true
-				break
-			end
-		end
-		if not any then
-			return false
-		end
-	elseif not s:find("[*?%[+@!]") then
-		return false
-	end
-	local open = false
-	for i = 1, #s do
-		local c = s:sub(i, i)
-		if c == "*" or c == "?" then
-			return true
-		elseif c == "[" then
-			open = true
-		elseif c == "/" then
-			open = false -- (a bracket expression can't span a `/`)
-		elseif c == "]" then
-			if open then
-				return true
-			end
-		elseif (c == "+" or c == "@" or c == "!") and s:sub(i + 1, i + 1) == "(" then
-			return true
-		end
-	end
-	return false
-end
+local str_glob_active = rt.field_glob_active -- (glob_pattern_p on an all-unquoted string)
 
 local expand_fields_full -- (the general path, below: the fast paths stay in a function
 -- with no closures, so the JIT can compile them — a closure over `sh` would make every
@@ -2498,95 +2503,20 @@ local function expand_to_fields(sh, w)
 	return expand_fields_full(sh, w)
 end
 expand_fields_full = function(sh, w, pre1) -- pre1: part 1 already expanded (a $(…) ran)
-	-- Concatenate-then-split model: build the word left to right, splitting the
-	-- chars that came from UNQUOTED expansions on $IFS (default: space/tab/newline),
-	-- while literal/quoted chars are never delimiters. This is what bash does, and
-	-- it handles concatenation ($x-, pre$x) and custom IFS correctly. Fields also
-	-- track `unq` for glob eligibility (quoted glob chars stay literal).
-	-- IFS is a SET of characters; a delimiter may be multibyte (`IFS=ç`), so it is
-	-- indexed by whole codepoint (rt.ifs_charset: memoized per IFS string and locale).
-	local ic = rt.ifs_charset(sh)
-	local ifs, ifsset, mbifs = ic.ifs, ic.set, ic.mbifs
-	local function isws(c) -- IFS whitespace only (subst.c ifs_whitespace): other whitespace is text
-		return (c == " " or c == "\t" or c == "\n") and ifsset[c]
-	end
-	local function inifs(c)
-		return c ~= "" and ifsset[c]
-	end
-	local function clen(v, i) -- byte length of the char at i (fast for ASCII)
-		if not mbifs or v:byte(i) < 0x80 then
-			return 1
-		end
-		return rt.mb_charlen(v, i)
-	end
-	-- `q` is a per-character literal-mask parallel to the field's string ("1" = the
-	-- char came from QUOTED/escaped text so it's literal in pathname expansion, "0" =
-	-- glob-active). Kept OUT OF BAND (not an escape byte) so it can't collide with a
-	-- real byte in the data — curse is byte-transparent, so `'[bc]'*.mm` matches the
-	-- file [bc]ar.mm while a $'\x01' byte passes through untouched.
-	local fields, cur, cur_unq, cur_q = {}, nil, false, nil
-	local function brk()
-		if cur ~= nil then
-			fields[#fields + 1] = { s = cur, unq = cur_unq, q = cur_q }
-			cur, cur_unq, cur_q = nil, false, nil
-		end
-	end
-	local function add(s, unq)
-		cur = (cur or "") .. s
-		cur_q = (cur_q or "") .. (unq and "0" or "1"):rep(#s)
-		if unq then
-			cur_unq = true
-		end
-	end
-	local function feed_split(v) -- unquoted expansion text: split on $IFS
-		local i, n = 1, #v
-		while i <= n do
-			local cl = clen(v, i)
-			local c = cl == 1 and v:sub(i, i) or v:sub(i, i + cl - 1)
-			if inifs(c) then
-				if isws(c) then -- whitespace IFS chars are always single-byte
-					-- (LEADING whitespace is just ignored: a `:` right after it still ends an
-					-- empty first field — IFS=': ' splits " :" into one empty field)
-					local leading = cur == nil and #fields == 0
-					if cur ~= nil then
-						brk()
-					end
-					i = i + 1
-					while i <= n and isws(v:sub(i, i)) do
-						i = i + 1
-					end
-					if i <= n and not leading then
-						local nl = clen(v, i)
-						local nc = nl == 1 and v:sub(i, i) or v:sub(i, i + nl - 1)
-						if inifs(nc) and not isws(nc) then
-							i = i + nl
-							while i <= n and isws(v:sub(i, i)) do
-								i = i + 1
-							end
-						end
-					end
-				else -- non-whitespace IFS delimiter (may be multibyte)
-					if cur == nil then
-						cur = ""
-					end -- a delimiter always ends a field (empty ok)
-					cur_unq = true
-					brk()
-					i = i + cl
-					while i <= n and isws(v:sub(i, i)) do
-						i = i + 1
-					end
+	-- The word's parts drive the runtime's field builder (rt.fb_new: IFS splitting + glob):
+	-- literal/quoted text is added as is, unquoted expansions split on $IFS; the part-level
+	-- semantics (field-wise ${x:-word}, tilde, "$@" in "…", bug #627) stay here.
+	local fb = rt.fb_new(sh)
+	if fb.ic.mixed then -- (a has_dollar_at word splits its start unstripped: see multi_hda)
+		for _, p in ipairs(w.parts) do
+			if is_multi(sh, p) then
+				if multi_hda(sh, p) then
+					fb.dl = 0
+					break
 				end
-			else -- add the whole run of non-IFS chars at once (per-char add is O(n²))
-				local i0 = i
-				i = i + cl
-				while i <= n do
-					cl = clen(v, i)
-					if inifs(cl == 1 and v:sub(i, i) or v:sub(i, i + cl - 1)) then
-						break
-					end
-					i = i + cl
-				end
-				add(v:sub(i0, i - 1), true)
+			elseif default_hda(sh, p) then
+				fb.dl = 0
+				break
 			end
 		end
 	end
@@ -2599,25 +2529,15 @@ expand_fields_full = function(sh, w, pre1) -- pre1: part 1 already expanded (a $
 					if star then
 						dq_null = true
 					else
-						dq_at = true
+						dq_at, fb.xs = true, true
 					end
-				elseif star then -- "$*" / "${a[*]}" join with the first char of IFS
-					local sep = rt.ifs_sep(sh)
-					add(table.concat(els, sep), false)
 				else
-					for k = 1, #els do
-						if k > 1 then
-							brk()
-						end
-						add(els[k], false)
-					end
-				end -- one field per element
+					-- (lone: the word is exactly "$@" — bash's expand_word_internal shortcut;
+					-- not in an array literal, whose words carry other flags)
+					fb:multi(els, true, star, #w.parts == 1 and p.special == "@" and not p.braced and not w.aelem,
+						not p.dqat)
+				end
 			else
-				-- unquoted $@/$*/array: bash joins the elements with IFS[0] (space when IFS
-				-- is whitespace/unset) into ONE string and word-splits that — so empty
-				-- elements survive under a non-whitespace IFS (`=$@=` on empty params gives
-				-- `= '' '' '' =`) and an empty middle element becomes an empty field. With
-				-- IFS='' there is no splitting, so keep the per-element model (empty drops).
 				local pe = p.pexp
 				if star and pe and (pe.op == "prefix" or pe.op == "indices") then
 					-- The INDIRECT `${!pfx*}` / `${!a[*]}` `*` forms join into ONE string
@@ -2628,16 +2548,9 @@ expand_fields_full = function(sh, w, pre1) -- pre1: part 1 already expanded (a $
 					if sep == "" and pe.op == "indices" then
 						sep = " "
 					end
-					feed_split(table.concat(els, sep))
-				elseif ifs == "" then
-					for k = 1, #els do
-						if k > 1 then
-							brk()
-						end
-						feed_split(els[k])
-					end
+					fb:split(table.concat(els, sep))
 				else
-					feed_split(table.concat(els, rt.ifs_first(ifs)))
+					fb:multi(els, false, star)
 				end
 			end
 		elseif
@@ -2652,6 +2565,9 @@ expand_fields_full = function(sh, w, pre1) -- pre1: part 1 already expanded (a $
 			-- governs splitting (bash), so expand it field-wise rather than as a flat string —
 			-- and a quoted "$@"/"${a[@]}" in it keeps its separate words (${1+"$@"})
 			local pe = p.pexp
+			if not p.q then
+				fb.xs = true -- (an unquoted $-expansion: bash word-splits the word)
+			end
 			local b = sh.vars[sh:deref(pe.name)]
 			local hasval -- (an array is "set" by its [0], as expand_param decides)
 			if b and b.arr then
@@ -2680,71 +2596,41 @@ expand_fields_full = function(sh, w, pre1) -- pre1: part 1 already expanded (a $
 				-- "${x:-$@}" / "a${x:+"$@"}b": a $@ (or ${a[@]}) in a used word of a QUOTED
 				-- ${…} still makes one field per element, as "$@" does; the rest of the word
 				-- is quoted text. Never zero fields (bash: "${x:-$@}" with no params is "").
-				add("", false)
+				fb:add("", false)
 				if useword then
 					for _, sp in ipairs(P.parse_default_quoted(pe.arg, pe.hd).parts) do
 						if is_multi(sh, sp) then
 							sp.q = true
 							local els, star = multi_elems(sh, sp)
-							if star then
-								add(table.concat(els, rt.ifs_sep(sh)), false)
-							else
-								for e = 1, #els do
-									if e > 1 then
-										brk()
-									end
-									add(els[e], false)
-								end
-							end
+							fb:multi(els, true, star, nil, true)
 						else
-							add(expand_part_str(sh, sp), false)
+							fb:add(expand_part_str(sh, sp), false)
 						end
 					end
 				else
-					add(expand_part_str(sh, p), false)
+					fb:add(expand_part_str(sh, p), false)
 				end
 			elseif useword and pe.arg then
 				-- expand the default's parts: a QUOTED part is one atomic (sub)field, an
 				-- unquoted part word-splits — so 'a b' stays one field but a b splits.
 				for k, sp in ipairs(P.parse_word(pe.arg).parts) do
-					if sp.q and is_multi(sh, sp) then
+					if is_multi(sh, sp) then -- $@/$*: as at the top level of a word
 						local els, star = multi_elems(sh, sp)
-						if star then
-							add(table.concat(els, rt.ifs_sep(sh)), false)
-						else
-							for e = 1, #els do
-								if e > 1 then
-									brk()
-								end
-								add(els[e], false)
-							end
-						end
-					elseif is_multi(sh, sp) then -- unquoted $@/$*: as at the top level of a word
-						local els = multi_elems(sh, sp)
-						if ifs == "" then
-							for e = 1, #els do
-								if e > 1 then
-									brk()
-								end
-								feed_split(els[e])
-							end
-						else
-							feed_split(table.concat(els, rt.ifs_first(ifs)))
-						end
+						fb:multi(els, sp.q, star, nil, not sp.dqat)
 					else
 						local s = expand_part_str(sh, sp)
 						if k == 1 and sp.lit ~= nil and not sp.q then
 							s = tilde_prefix(sh, s)
 						end -- word-initial ~
 						if sp.q then
-							add(s, false)
+							fb:add(s, false)
 						else
-							feed_split(s)
+							fb:split(s)
 						end
 					end
 				end
 			elseif pe.op == ":-" or pe.op == "-" then
-				feed_split(pval)
+				fb:split(pval)
 			end
 		else
 			local s
@@ -2760,172 +2646,40 @@ expand_fields_full = function(sh, w, pre1) -- pre1: part 1 already expanded (a $
 				s = tilde_word_initial(sh, s, #w.parts > 1, w.noassign or (sh.opt_posix and w.plainarg))
 				if s ~= s0 and s0:byte(1) == 126 then -- `~…`: the expansion is quoted text — never globbed
 					local tl = #s0 - (s0:find("[/:]") or #s0 + 1) + 1 -- (the text after the tilde-prefix)
-					add(s:sub(1, #s - tl), false)
+					fb:add(s:sub(1, #s - tl), false)
 					s = s:sub(#s - tl + 1)
 				end
+			elseif pi > 1 and p.lit ~= nil and not p.q and not w.notilde and not w.noassign
+				and s:find(":~", 1, true) and rt.assignish(w) then
+				s = rt.tilde_argcont(sh, s, pi < #w.parts, sh.opt_posix and w.plainarg)
 			end -- word-initial / NAME= ~
 			if p.dqat and s == "" then
 				dq_null = true
 			elseif p.q or p.lit ~= nil then
-				add(s, not p.q)
+				fb:add(s, not p.q)
 			else
-				feed_split(s)
+				fb:split(s)
 			end
 		end
 		if p.dqend then -- end of a "…$@…" segment: its empty parts make a null word unless "$@" was empty
 			if dq_null and not dq_at then
-				add("", false)
+				fb:add("", false)
 			end
+			fb:dqend()
 			dq_null, dq_at = nil, nil
 		end
 	end
-	brk()
-	-- pathname expansion on fields with unquoted glob metacharacters
-	local out = {}
-	-- GLOBIGNORE (set & non-null): filter matches by its `:`-separated patterns; `.`/`..`
-	-- are always excluded. (Assigning it also turns dotglob on: rt.setup_glob_ignore.)
-	local gi = sh:get("GLOBIGNORE")
-	local giset = gi and gi ~= ""
-	local dotglob = sh.shopt.dotglob and true
-	local nullglob = sh.shopt.nullglob and true
-	local gipats
-	if giset then -- split on ':' but NOT inside [...] (a `[[:alnum:]]` class holds colons)
-		gipats = {}
-		local depth, cur = 0, {}
-		for k = 1, #gi do
-			local c = gi:sub(k, k)
-			if c == "[" then
-				depth = depth + 1
-				cur[#cur + 1] = c
-			elseif c == "]" then
-				if depth > 0 then
-					depth = depth - 1
-				end
-				cur[#cur + 1] = c
-			elseif c == ":" and depth == 0 then
-				if #cur > 0 then
-					gipats[#gipats + 1] = table.concat(cur)
-					cur = {}
-				end
-			else
-				cur[#cur + 1] = c
-			end
-		end
-		if #cur > 0 then
-			gipats[#gipats + 1] = table.concat(cur)
-		end
-	end
-	-- set -f: pathname expansion disabled; globs stay literal (xnoglob: just this word's —
-	-- compgen -W's, whose $(…) bodies still glob)
-	local noglob = sh.opt_f or sh.xnoglob == w
-	local GLOBSPECIAL = {
-		["*"] = 1,
-		["?"] = 1,
-		["["] = 1,
-		["]"] = 1,
-		["\\"] = 1,
-		["+"] = 1,
-		["@"] = 1,
-		["!"] = 1,
-		["("] = 1,
-		[")"] = 1,
-		["|"] = 1,
-		["-"] = 1, -- (a quoted `-`/`^` in a bracket expression is literal: `[a"-"c]`)
-		["^"] = 1,
-	} -- `|` protects a
-	-- quoted/escaped extglob alternation bar (`@(a|'b|c')`) from split_arms
-	-- is there a glob metacharacter at a NON-masked (glob-active) position?
-	-- bash glob_pattern_p: `*`/`?` are always active; `[` only counts when a later
-	-- (unmasked) `]` closes it — a lone `[` (e.g. the `[` test builtin) is literal,
-	-- so it must NOT trigger a directory scan. Mirrors glob_conv's own "no closing
-	-- ] → literal [" rule; keeping them in sync avoids pointless per-word globbing.
-	local glob_active = rt.field_glob_active
-	-- build the glob pattern: a masked (quoted) glob-special char is backslash-escaped
-	-- so glob_conv treats it literally; the stored value f.s is left byte-for-byte intact.
-	local function glob_pat(f)
-		if not f.q or not f.q:find("1") then
-			return f.s
-		end
-		local o = {}
-		for i = 1, #f.s do
-			local c = f.s:sub(i, i)
-			o[#o + 1] = (f.q:sub(i, i) == "1" and GLOBSPECIAL[c]) and ("\\" .. c) or c
-		end
-		return table.concat(o)
-	end
-	for _, f in ipairs(fields) do
-		if not noglob and f.unq and glob_active(f) then
-			sh.glob_dots = dotglob -- (glob.c noglob_dot_filenames: compgen -G sees the last shell glob's)
-			-- a set GLOBIGNORE always filters `.`/`..` (overriding globskipdots)
-			local m = rt.glob_expand(
-				glob_pat(f),
-				{
-					dotglob = dotglob,
-					skipdots = giset or shopt_on(sh, "globskipdots"),
-					globstar = shopt_on(sh, "globstar"),
-					nocase = shopt_on(sh, "nocaseglob"),
-					noext = not sh.shopt.extglob,
-				}
-			)
-			if m and gipats then
-				local filt = {}
-				for _, x in ipairs(m) do
-					local ig = false
-					for _, p in ipairs(gipats) do
-						if rt.glob_ignore_match(x, p, sh.shopt.nocaseglob, not sh.shopt.extglob) then
-							ig = true
-							break
-						end
-					end
-					if not ig then
-						filt[#filt + 1] = x
-					end
-				end
-				m = (#filt > 0) and filt or nil
-			end
-			if m then
-				for _, x in ipairs(m) do
-					out[#out + 1] = x
-				end
-			elseif sh.shopt.failglob then -- shopt -s failglob: no match aborts the rest of
-				-- the current LINE (bash: like a fatal expansion error), so tag lineabort
-				-- (not experr) — run_lazy fast-forwards past same-line statements.
-				io.stderr:write("curse: no match: " .. f.s .. "\n")
-				error({ __curse_exit = 1, __curse_lineabort = true })
-			elseif nullglob then -- no matches: nullglob drops the field entirely
-			else
-				out[#out + 1] = f.s
-			end
-		else
-			out[#out + 1] = f.s
-		end
-	end
-	return out
+	-- (xnoglob: just this word's pathname expansion is off — compgen -W's, whose $(…)
+	-- bodies still glob)
+	return fb:finish(sh.xnoglob == w)
 end
-M.expand_to_fields = expand_to_fields -- the compiled tier builds argv fields for a word AST
+-- The one-word field expander, for the runtime's fallbacks on word shapes the compiled tier
+-- can't render (rt.word_fields/xw_fields/aa_fields, `$(< f)`'s target) and compgen -W.
+M.expand_to_fields = expand_to_fields
 
 local exec_list -- forward
 
 -- ---- redirections ----
--- Apply a command's redirs, saving fds 0/1/2 for restore. open flags: 577 =
--- O_WRONLY|O_CREAT|O_TRUNC, 1089 = |O_APPEND, 0 = O_RDONLY; mode 0644.
--- Feed a string as a command's stdin (heredoc/herestring): write to a temp file,
--- open it, dup2 onto fd 0, unlink (the open fd keeps the inode alive).
--- Move an opened fd `f` onto target `fd`. If open() already handed us the target
--- (it returns the lowest free fd, e.g. 3 for `3<file`), dup2/close would close the
--- very fd we just set up — so only dup2+close when they differ.
-local function place_fd(f, fd)
-	if f ~= fd then
-		C.dup2(f, fd)
-		C.close(f)
-	end
-end
-local function feed_stdin(fd, body) -- (a pipe for a small body, like bash: rt.body_fd)
-	local f = rt.body_fd(body)
-	if f >= 0 then
-		place_fd(f, fd)
-	end
-end
 -- Apply redirections, backing up each touched fd (any fd, not just 0/1/2) so it
 -- can be restored. Returns (save, ok); ok is false when an open() failed (bash
 -- then skips the command and reports failure).
@@ -2944,28 +2698,9 @@ local function alloc_fd()
 	end
 	return -1
 end
--- Open a `>`/`&>` target honoring noclobber (set -C): with noclobber, `>` must
--- not overwrite an existing REGULAR file, but may still write non-regular files
--- (/dev/null, fifos, devices). Returns the fd, or -1 on a noclobber clobber error.
-local function open_out(sh, path, mode)
-	if not sh.opt_C then
-		return rt.ropen(path, 577, mode)
-	end -- O_WRONLY|O_CREAT|O_TRUNC
-	local f = rt.ropen(path, 705, mode) -- + O_EXCL
-	if f >= 0 then
-		return f
-	end
-	local e = ffi.errno() -- (kept for open_fail: a dangling symlink's stat miss is still EEXIST)
-	local ok, rc = pcall(C.curse_stat, path, statbuf) -- O_EXCL failed: allow non-regular
-	if ok and rc == 0 and bit.band(ffi.cast("uint32_t *", statbuf + 24)[0], 0xF000) ~= 0x8000 then
-		return rt.ropen(path, 1, mode) -- not S_IFREG -> plain O_WRONLY (no truncate)
-	end
-	ffi.errno(e)
-	return -1
-end
 local FDVAR_NOASSIGN = { GROUPS = 1, FUNCNAME = 1, BASH_ARGC = 1, BASH_ARGV = 1, BASH_SOURCE = 1, BASH_LINENO = 1 }
-local function apply_redirs(sh, redirs, cname, ctx) -- cname: the command (names {v} errors;
-	-- ctx: only names them — compiled code's rt.redir_apply_one)
+local function apply_redirs(sh, redirs, cname, ctx, args) -- cname: the command (names {v} errors;
+	-- ctx: only names them — compiled code's rt.redir_apply_one); args: its argv (rt.redir_forks)
 	io.flush() -- flush pending stdout BEFORE moving fds, else buffered output from a
 	-- prior command would be redirected into (and lost to) the new target
 	local save, ok = {}, true
@@ -2976,8 +2711,7 @@ local function apply_redirs(sh, redirs, cname, ctx) -- cname: the command (names
 	-- A fatal expansion error in a redirection word (set -u, ${v?}, failglob): bash expands
 	-- an external command's redirections in the forked child, where it only fails that
 	-- command (status 1); anywhere else it is raised as usual (redir.c runs in the shell).
-	local ext = cname and not sh.functions[cname]
-		and not (M.BUILTINS[cname] and not (sh.disabled_builtins and sh.disabled_builtins[cname]))
+	local ext = cname and rt.redir_forks(sh, cname, args)
 	local function xerr(e)
 		if not ext and type(e) == "table" and e.__curse_exit then
 			error(e, 0)
@@ -2985,7 +2719,11 @@ local function apply_redirs(sh, redirs, cname, ctx) -- cname: the command (names
 	end
 	local function backup(fd)
 		if not persist[fd] then
-			save[#save + 1] = { fd = fd, saved = rt.save_fd(fd) }
+			local e = { fd = fd, saved = rt.save_fd(fd) }
+			save[#save + 1] = e
+			if sh.iso_ctx and sh.iso_ctx[1] then
+				rt.iso_note_save(sh, e)
+			end
 		end
 	end
 	-- redirect targets are word-expanded at runtime (e.g. `> $TMP/f`, `>& $myfd`).
@@ -2998,8 +2736,8 @@ local function apply_redirs(sh, redirs, cname, ctx) -- cname: the command (names
 		-- (the word as written: r.target has its outer quotes stripped, `"$f"` -> `$f`)
 		local raw = r.src or r.target or ""
 		-- bash brace-expands the target too; more than one word -> ambiguous redirect.
-		if P.brace_count(raw) > 1 then
-			io.stderr:write("curse: " .. raw .. ": ambiguous redirect\n")
+		if P.brace_count(raw) > 1 then -- (a `{v}>…`'s error names v: redirection_error)
+			io.stderr:write("curse: " .. (r.fdvar or raw) .. ": ambiguous redirect\n")
 			return nil
 		end
 		-- expansion can also fail non-fatally (e.g. failglob no-match): the redirect
@@ -3020,12 +2758,7 @@ local function apply_redirs(sh, redirs, cname, ctx) -- cname: the command (names
 			return nil
 		end
 		if #fs ~= 1 then
-			io.stderr:write("curse: " .. raw .. ": ambiguous redirect\n")
-			return nil
-		end
-		if sh.opt_r and r.op ~= "in" and r.op ~= "dup" and r.op ~= "dupin" then
-			-- restricted: no output to files (fd dups still work; `>&file` is refused below)
-			io.stderr:write("curse: " .. fs[1] .. ": restricted: cannot redirect output\n")
+			io.stderr:write("curse: " .. (r.fdvar or raw) .. ": ambiguous redirect\n")
 			return nil
 		end
 		return fs[1]
@@ -3057,24 +2790,15 @@ local function apply_redirs(sh, redirs, cname, ctx) -- cname: the command (names
 		local fdb = r.fdvar and sh.vars[sh:deref(fvn or r.fdvar)]
 		-- bash's noassign dynamic arrays (GROUPS, BASH_ARGV, …) refuse the fd too: redir_varassign
 		local noasg = r.fdvar and FDVAR_NOASSIGN[fvn or r.fdvar] and not (sh.unset_specials and sh.unset_specials[fvn or r.fdvar])
-		if (noasg or fdb and fdb.ro) and not ((r.op == "dup" or r.op == "dupin") and r.target == "-") then
-			-- `{v}>…` with v readonly: bash refuses (no fd is allocated) and the command fails
-			-- — after it opened (so created) an output file
-			if r.op == "out" or r.op == "clobber" or r.op == "app" then
-				local okp, path = pcall(tgt, r)
-				local f = okp and path ~= "" and rt.ropen(path, r.op == "app" and 1089 or 577, 438)
-				if f and f >= 0 then
-					C.close(f)
-				end
-			end
-			if not noasg then
-				io.stderr:write("curse: " .. r.fdvar .. ": readonly variable\n")
-				rt.report_exit(sh) -- (err_readonly: report_error)
-			end
-			io.stderr:write("curse: " .. r.fdvar .. ": cannot assign fd to variable\n")
+		local rflags = r.fdvar and rt.REDIR_FLAGS[r.op]
+		if rflags and rflags ~= 0 and sh.opt_r then
+			-- a restricted shell refuses a writing redirect before it opens or assigns
+			-- anything, naming the {var} (redir.c: WRITE_REDIRECT, then redirection_error)
+			io.stderr:write("curse: " .. r.fdvar .. ": restricted: cannot redirect output\n")
 			ok = false
 			break
 		end
+		local fdnew -- (a `{v}>…` fd: v is assigned only once its redirection succeeded)
 		if r.fdvar then
 			if (r.op == "dup" or r.op == "dupin") and r.target == "-" then
 				local cur = fdvar_get()
@@ -3085,15 +2809,13 @@ local function apply_redirs(sh, redirs, cname, ctx) -- cname: the command (names
 				end
 				r = setmetatable({ fd = tonumber(cur) or -1 }, { __index = r })
 			else
+				-- (redir.c: the target is opened/duplicated first — an open failure is the only
+				-- error — then moved to a free fd >= 10, and only then assigned: a readonly v
+				-- or a noassign array is reported after a successful open, the fd closed)
 				local nf = alloc_fd()
 				if nf < 0 then
 					io.stderr:write((rt.err_prefix(sh):gsub("line %d+: $", "")) .. "redirection error: cannot duplicate fd: Invalid argument\n")
 					io.stderr:write("curse: " .. (r.target or "") .. ": Invalid argument\n")
-					ok = false
-					break
-				end
-				if not fdvar_set(tostring(nf)) then -- (nf is only a free number: nothing opened)
-					io.stderr:write("curse: " .. r.fdvar .. ": cannot assign fd to variable\n")
 					ok = false
 					break
 				end
@@ -3103,7 +2825,9 @@ local function apply_redirs(sh, redirs, cname, ctx) -- cname: the command (names
 					backup(nf)
 				else
 					persist[nf] = true
+					rt.iso_keep_fd(sh, nf, -1) -- (a subshell's: closed when it ends)
 				end
+				fdnew = nf
 				r = setmetatable({ fd = nf }, { __index = r }) -- shadow r.fd, inherit op/target
 			end
 		end
@@ -3114,124 +2838,10 @@ local function apply_redirs(sh, redirs, cname, ctx) -- cname: the command (names
 		then
 			fd1file = true
 		end
-		if r.op == "out" then
-			-- noclobber (set -C): `>` fails on an existing regular file (open_out)
+		if rt.REDIR_FLAGS[r.op] then -- a file: rt.redir_open (flags, noclobber, &>, restricted)
 			local t = ftgt(r)
-			if not t then
+			if not (t and rt.redir_open(sh, r.op, r.fd, t, not persist[r.fd] and save or nil, r.fdvar)) then
 				ok = false
-			else
-				backup(r.fd)
-				local f = open_out(sh, t, 438)
-				if f < 0 then
-					rt.open_fail(sh, t)
-				end
-				if f >= 0 then
-					place_fd(f, r.fd)
-				else
-					ok = false
-				end
-			end
-		elseif r.op == "clobber" then -- `>|` truncates regardless of noclobber
-			local t = ftgt(r)
-			if not t then
-				ok = false
-			else
-				backup(r.fd)
-				local f = rt.ropen(t, 577, 438)
-				if f < 0 then
-					rt.open_fail(sh, t)
-				end
-				if f >= 0 then
-					place_fd(f, r.fd)
-				else
-					ok = false
-				end
-			end
-		elseif r.op == "app" then
-			local t = ftgt(r)
-			if not t then
-				ok = false
-			else
-				backup(r.fd)
-				local f = rt.ropen(t, 1089, 438)
-				if f < 0 then
-					rt.open_fail(sh, t)
-				end
-				if f >= 0 then
-					place_fd(f, r.fd)
-				else
-					ok = false
-				end
-			end
-		elseif r.op == "in" then
-			local t = ftgt(r)
-			if not t then
-				ok = false
-			else
-				backup(r.fd)
-				local f = rt.ropen(t, 0, 0)
-				if f < 0 then
-					rt.open_fail(sh, t)
-				end
-				if f >= 0 then
-					place_fd(f, r.fd)
-				else
-					ok = false
-				end
-			end
-		elseif r.op == "rw" then -- `N<>file`: open read+write (O_RDWR|O_CREAT, no truncate)
-			local t = ftgt(r)
-			if not t then
-				ok = false
-			else
-				backup(r.fd)
-				local f = rt.ropen(t, 66, 438)
-				if f < 0 then
-					rt.open_fail(sh, t)
-				end
-				if f >= 0 then
-					place_fd(f, r.fd)
-				else
-					ok = false
-				end
-			end
-		elseif r.op == "outboth" then -- `&>` truncation honors noclobber too
-			local t = ftgt(r)
-			if not t then
-				ok = false
-			else
-				backup(1)
-				backup(2)
-				local f = open_out(sh, t, 438)
-				if f < 0 then
-					rt.open_fail(sh, t)
-				end
-				if f >= 0 then
-					C.dup2(f, 1)
-					C.dup2(f, 2)
-					C.close(f)
-				else
-					ok = false
-				end
-			end
-		elseif r.op == "appboth" then -- `&>>`: append stdout+stderr (append ignores noclobber)
-			local t = ftgt(r)
-			if not t then
-				ok = false
-			else
-				backup(1)
-				backup(2)
-				local f = rt.ropen(t, 1089, 438)
-				if f < 0 then
-					rt.open_fail(sh, t)
-				end
-				if f >= 0 then
-					C.dup2(f, 1)
-					C.dup2(f, 2)
-					C.close(f)
-				else
-					ok = false
-				end
 			end
 		elseif r.op == "heredoc" then
 			local body = r.body or ""
@@ -3264,15 +2874,13 @@ local function apply_redirs(sh, redirs, cname, ctx) -- cname: the command (names
 					hok, ok = false, false
 				end
 			end
-			if hok then
-				backup(r.fd or 0)
-				feed_stdin(r.fd or 0, body)
+			if hok and not rt.redir_open(sh, "heredoc", r.fd or 0, body, not persist[r.fd or 0] and save or nil) then
+				ok = false
 			end
 		elseif r.op == "herestring" then
 			local eok, body = pcall(expand_word, sh, P.parse_word(r.word or ""))
 			if eok then
-				backup(r.fd or 0)
-				feed_stdin(r.fd or 0, body .. "\n")
+				ok = rt.redir_open(sh, "herestring", r.fd or 0, body .. "\n", not persist[r.fd or 0] and save or nil)
 			else
 				xerr(body)
 				ok = false
@@ -3302,6 +2910,9 @@ local function apply_redirs(sh, redirs, cname, ctx) -- cname: the command (names
 					if C.fcntl(m, 1) == -1 then -- F_GETFD on a closed fd returns -1 (EBADF)
 						-- (bash names the target as written: `$v: Bad file descriptor`)
 						local nm = r.target or tv
+						if fdnew then -- (redir.c: its fcntl(F_DUPFD) fails first — sys_error, no line)
+							io.stderr:write((rt.err_prefix(sh):gsub("line %d+: $", "")) .. "redirection error: cannot duplicate fd: Bad file descriptor\n")
+						end
 						io.stderr:write("curse: " .. (nm:match("^(%d+)%-$") or nm) .. ": Bad file descriptor\n")
 						ok = false
 					else
@@ -3334,24 +2945,24 @@ local function apply_redirs(sh, redirs, cname, ctx) -- cname: the command (names
 				elseif r.op == "dupin" or r.fd ~= 1 then -- (only `>&file` means `&>file`)
 					io.stderr:write("curse: " .. tv .. ": ambiguous redirect\n")
 					ok = false
-				elseif r.op == "dup" and tv ~= "" and sh.opt_r then
-					io.stderr:write("curse: " .. tv .. ": restricted: cannot redirect output\n")
-					ok = false
-				elseif r.op == "dup" and tv ~= "" then -- `>&word` (non-number): open the file for
-					backup(r.fd)
-					backup(2)
-					local f = open_out(sh, tv, 438) -- both stdout AND stderr (noclobber: `&>`'s rule)
-					if f < 0 then
-						rt.open_fail(sh, tv)
-					end
-					if f >= 0 then
-						C.dup2(f, r.fd)
-						C.dup2(f, 2)
-						C.close(f)
-					else
-						ok = false
-					end
+				else -- `>&word` (non-number, r.fd 1): the file gets stdout AND stderr — `&>word`
+					ok = rt.redir_open(sh, "outboth", 1, tv, save)
 				end
+			end
+		end
+		if fdnew and ok then
+			if noasg or (fdb and fdb.ro) then
+				if not noasg then
+					io.stderr:write("curse: " .. r.fdvar .. ": readonly variable\n")
+					rt.report_exit(sh) -- (err_readonly: report_error)
+				end
+				io.stderr:write("curse: " .. r.fdvar .. ": cannot assign fd to variable\n")
+				C.close(fdnew)
+				ok = false
+			elseif not fdvar_set(tostring(fdnew)) then
+				io.stderr:write("curse: " .. r.fdvar .. ": cannot assign fd to variable\n")
+				C.close(fdnew)
+				ok = false
 			end
 		end
 		if not ok then -- (do_redirections stops at the first failure)
@@ -3377,33 +2988,7 @@ local function redirs_touch_stdout(rd)
 	end
 	return false
 end
-local function restore_redirs(save)
-	if save.e2o and save._sh then
-		save._sh.err2out = (save._sh.err2out or 0) - save.e2o
-	end -- undo 2>&1 capture routing
-	for k = #save, 1, -1 do
-		local s = save[k]
-		if s.saved >= 0 then
-			C.dup2(s.saved, s.fd)
-			C.close(s.saved)
-		else
-			C.close(s.fd)
-		end
-	end
-	if rt.jobnote then -- (a job report waiting for the command's redirections to go)
-		rt.jobnote_flush()
-	end
-end
--- Write a curse error message. Inside a `$(...)` capture where `2>&1` is active,
--- route it into the capture buffer (sh.out) so it's captured like bash does;
--- otherwise to real stderr.
-sherr = function(sh, msg)
-	if sh.capturing and (sh.err2out or 0) > 0 then
-		sh.out(msg)
-	else
-		io.stderr:write(msg)
-	end
-end
+local restore_redirs = rt.redir_undo
 
 -- name classification for `type` / `command -v`
 -- Builtins whose implementation is extracted into a lazily-loaded feature module
@@ -3411,71 +2996,8 @@ end
 -- inline dispatch, so a cold script that never uses them never loads their code.
 local BUILTIN_LAZY = rt.BUILTIN_LAZY -- one source of truth (runtime); shared with the compiled tier
 local ISO_BUILTIN = rt.ISO_BUILTIN
-local BUILTINS = {
-	echo = 1,
-	enable = 1,
-	caller = 1,
-	disown = 1,
-	[":"] = 1,
-	["true"] = 1,
-	["false"] = 1,
-	["["] = 1,
-	test = 1,
-	["return"] = 1,
-	exit = 1,
-	logout = 1,
-	suspend = 1,
-	cd = 1,
-	unset = 1,
-	export = 1,
-	declare = 1,
-	typeset = 1,
-	set = 1,
-	shift = 1,
-	read = 1,
-	getopts = 1,
-	printf = 1,
-	["local"] = 1,
-	command = 1,
-	type = 1,
-	pwd = 1,
-	eval = 1,
-	source = 1,
-	["."] = 1,
-	["break"] = 1,
-	["continue"] = 1,
-	["true"] = 1,
-	exec = 1,
-	readonly = 1,
-	umask = 1,
-	alias = 1,
-	unalias = 1,
-	shopt = 1,
-	wait = 1,
-	fg = 1,
-	bg = 1,
-	trap = 1,
-	mapfile = 1,
-	readarray = 1,
-	compgen = 1,
-	complete = 1,
-	compopt = 1,
-	pushd = 1,
-	popd = 1,
-	dirs = 1,
-	builtin = 1,
-	kill = 1,
-	ulimit = 1,
-	jobs = 1,
-	history = 1,
-	fc = 1,
-	hash = 1,
-	["let"] = 1,
-	times = 1,
-	bind = 1,
-	help = 1,
-}
-M.BUILTINS = BUILTINS -- (the one builtin table: emit and runtime consult it too)
+local BUILTINS = rt.BUILTINS -- (runtime owns the builtin table: rt.builtin_enabled)
+M.BUILTINS = BUILTINS
 local KEYWORDS = {
 	["if"] = 1,
 	["then"] = 1,
@@ -3578,7 +3100,7 @@ local function name_type(sh, name, nofunc)
 	if not nofunc and sh.functions[name] then
 		return "function"
 	end -- `type -f` skips functions
-	if BUILTINS[name] and not (sh.disabled_builtins and sh.disabled_builtins[name]) then
+	if rt.builtin_enabled(sh, name) then
 		return "builtin"
 	end
 	-- a remembered location (`hash`, `hash -p`, or an earlier run) wins, and counts a hit
@@ -3600,7 +3122,17 @@ end
 -- A compound literal's expanded elements ({key?, op, val}). A declaration builtin's
 -- `NAME=(…)` is expanded BEFORE the builtin runs (bash: `local -a arr=("${arr[@]}")`
 -- copies the OUTER arr), so exec_stmt pre-computes them into sh.arrayargs_pre[st].
-local function arrayassign_items(sh, st, isassoc)
+-- ntilde (default: isassoc): expand the assoc forms with no tilde (5.2.21: see notilde). A
+-- declaration builtin passes whether IT said -A: without -A its compound argument was
+-- expanded as an ordinary (indexed-style) assignment word first, tildes included, even
+-- into an existing associative array (`declare -A d; declare d=([k]=~)` stores $HOME).
+local function arrayassign_items(sh, st, isassoc, ntilde)
+	if ntilde == nil then
+		ntilde = isassoc
+	end
+	local nt = ntilde and notilde or function(w)
+		return w
+	end
 	local items, elems = {}, st.elems
 	local e1 = elems[1]
 	-- bash's kvpair_assignment_p: an associative literal whose FIRST word is not a
@@ -3612,7 +3144,7 @@ local function arrayassign_items(sh, st, isassoc)
 			if e.key ~= nil then
 				w = P.parse_word("[" .. e.key .. "]" .. e.op .. w.src)
 			end
-			items[#items + 1] = { key = nil, op = "=", val = expand_assign_word(sh, w), src = w.src }
+			items[#items + 1] = { key = nil, op = "=", val = expand_assign_word(sh, nt(w)), src = w.src }
 		end
 		items.kv = true
 		return items
@@ -3625,11 +3157,11 @@ local function arrayassign_items(sh, st, isassoc)
 			-- its arithmetic later (against the array being built — the item's xkey).
 			local xkey
 			if isassoc then
-				xkey = expand_word(sh, P.parse_word(e.key))
+				xkey = expand_word(sh, notilde(P.parse_word(e.key))) -- (a subscript: never a tilde)
 			elseif e.key:find("[%$`]") then
 				xkey = expand_word(sh, P.parse_word(e.key))
 			end
-			items[#items + 1] = { key = e.key, xkey = xkey, op = e.op, val = expand_assign_word(sh, e.word), src = e.word.src }
+			items[#items + 1] = { key = e.key, xkey = xkey, op = e.op, val = expand_assign_word(sh, nt(e.word)), src = e.word.src }
 		elseif isassoc then
 			-- a bare word in a keyed assoc literal: an error, reported as written and never
 			-- expanded (bash's assign_compound_array_list)
@@ -3682,110 +3214,9 @@ local function literal_sub(k)
 	end
 	return table.concat(out)
 end
+-- A declaration builtin's NAME=(…) literal, stored after the builtin ran (rt.arrayassign_body)
 local function do_arrayassign(sh, st)
-	-- through a nameref (`local -n r=arr; r+=(x)`) the literal lands in the referenced array
-	local name = sh:deref(st.name)
-	if name == "" then -- (a nameref cycle: the ref itself becomes the array)
-		name = st.name
-	end
-	rt.noassign_arr_check(sh, name)
-	rt.ref_to_array(sh, name)
-	local isassoc = sh:is_assoc(name)
-	local items = sh.arrayargs_pre and sh.arrayargs_pre[st] or arrayassign_items(sh, st, isassoc)
-	if name == "DIRSTACK" and rt.dirstack_dyn(sh) then -- (the dynamic array: each element
-		local auto = st.append and #(sh.dirstack or {}) + 1 or 0 -- through its assign_func)
-		for _, it in ipairs(items) do
-			local k = it.key ~= nil and tonumber(array_key(sh, name, it.key)) or auto
-			rt.dirstack_set(sh, k, it.val, it.op == "+=")
-			auto = (k or auto) + 1
-		end
-		return
-	end
-	if st.append and sh.vars[name] then
-		sh.vars[name].empty_decl = nil -- (`a+=()` counts as an assignment: shows =())
-	end
-	-- bash quirk (ASSOCIATIVE arrays only): inside a `=` (not `+=`) compound literal, a
-	-- `[k]+=v` element appends to the value a[k] had BEFORE the whole statement — NOT the
-	-- (cleared) value nor one set by an earlier element in the same literal. So snapshot
-	-- the old element map before clearing. INDEXED arrays instead append to the current
-	-- (post-clear) value, and `a+=(...)` keeps the normal "append to current" too.
-	local snap
-	if not st.append then -- plain assignment resets the array (keep assoc-ness)
-		local b = sh.vars[name]
-		if isassoc then
-			snap = b and b.arr or nil
-		end
-		if not b then
-			sh:array_assign(name, {}, false)
-			b = sh.vars[name]
-		end
-		b.arr = {}
-		b.s = nil
-		b.n = nil
-		b.empty_decl = nil -- assigned now (even `a=()` -> shows =())
-		if isassoc then
-			b.order = {}
-		end
-	end
-	if isassoc then
-		if not items.kv then -- keyed elements assigned; a bare one is an error (reported, skipped)
-			for _, it in ipairs(items) do
-				if it.key == nil then
-					io.stderr:write("curse: " .. name .. ": " .. rt.compound_word_src(sh, it)
-						.. ": must use subscript when assigning associative array\n")
-				else
-					local idx = it.xkey or array_key(sh, name, it.key)
-					if idx == "" then -- (an empty key: reported as written — by declare, requoted —
-						-- and skipped; the rest still land)
-						io.stderr:write("curse: " .. rt.empty_key_src(sh, it) .. ": bad array subscript\n")
-						rt.report_exit(sh) -- (err_badarraysub: report_error)
-					elseif it.op == "+=" and not st.append then -- append to the pre-statement value (see snap)
-						sh:array_set(name, idx, (snap and snap[idx] or "") .. it.val, false)
-					else
-						sh:array_set(name, idx, it.val, it.op == "+=")
-					end
-				end
-			end
-		else -- key/value pairs (kvpair_assignment_p): alternating key value words
-			rt.assoc_kvpairs(sh, name, items)
-		end
-	else
-		local auto = st.append and rt.arr_next(sh, name) or 0
-		for _, it in ipairs(items) do
-			if it.key ~= nil then
-				-- a bad element is reported (as written) and skipped; the rest still land
-				local key = it.xkey or it.key
-				local src = "[" .. key .. "]" .. (it.op or "=") .. it.val
-				if key:match("^%s*$") then
-					io.stderr:write("curse: " .. src .. ": bad array subscript\n")
-					rt.report_exit(sh) -- (err_badarraysub: report_error)
-				elseif key == "*" or key == "@" then
-					io.stderr:write("curse: " .. src .. ": cannot assign to non-numeric index\n")
-				else
-					local idx = array_key(sh, name, it.xkey or literal_sub(key))
-					-- (indexed += appends to CURRENT, unlike assoc; a negative index past the
-					-- start fails and leaves the running index alone)
-					local k = sh:array_set(name, idx, it.val, it.op == "+=")
-					if k then
-						auto = rt.key_next(k)
-					else
-						io.stderr:write("curse: " .. src .. ": bad array subscript\n")
-						rt.report_exit(sh) -- (err_badarraysub: report_error)
-					end
-				end
-			else
-				sh:array_set(name, auto, it.val, false, true)
-				auto = rt.key_next(auto)
-			end
-		end
-	end
-	-- An array can't live in the process environment: converting a variable to an
-	-- array drops it from the env (so a child sees nothing), though bash keeps the
-	-- export ATTRIBUTE on the shell variable itself.
-	local b = sh.vars[name]
-	if b and b.exported then
-		C.unsetenv(name)
-	end
+	return rt.arrayassign_body(sh, st.name, nil, st.append, st, true)
 end
 M.do_arrayassign = do_arrayassign
 -- Quote a value the way `declare -p` does: double-quoted with \ " $ ` escaped.
@@ -3851,8 +3282,9 @@ local function fmt_decl(sh, name)
 	end
 	if (b == nil or (b.dyn and b.s == nil and b.n == nil)) and DYN_SCALARS[name]
 		and not (sh.unset_specials and sh.unset_specials[name]) then
+		local v = sh:get(name) or "" -- (read first: get_seconds gives SECONDS its -i)
 		local fl = b and sh:attr_string(name) or DYN_SCALARS[name]
-		return "declare -" .. (fl == "" and "-" or fl) .. " " .. name .. "=" .. decl_quote(sh:get(name) or "")
+		return "declare -" .. (fl == "" and "-" or fl) .. " " .. name .. "=" .. decl_quote(v)
 	end
 	if b == nil then
 		return nil
@@ -3974,6 +3406,17 @@ end
 local function char_value(s)
 	if s == "" then
 		return 0
+	end
+	local h = rt.pf_sh
+	if h and rt.lc_mb_cur_max() > 1 and rt.lc_utf8() and (h.mbw or s:byte(1) >= 0x80) then
+		-- (printf.def's asciicode calls mbtowc, whose static state a word split may have
+		-- left pending — rt.mbtowc_visit: `'é` is then invalid (its first byte), `'\xa9`
+		-- completes it)
+		local r, c = rt.mbtowc_visit(h, s, 1, #s)
+		if r > 0 and c then
+			return rt.mb_chars(c)[1].wc
+		end
+		return s:byte(1)
 	end
 	local ch = rt.mb_chars(s)[1]
 	return (ch and ch.wc) or s:byte(1)
@@ -4654,14 +4097,11 @@ end
 -- A function OVERRIDES a builtin of the same name in bash, so this is dispatched
 -- before the builtin table (except via `command`, which passes no_func).
 local function run_function(sh, cmd, fn, args, hook, tenv_base)
-	-- $FUNCNEST: past that many nested calls, the call fails (status 1) — bash
-	if sh.vars.FUNCNEST then
-		local lim = tonumber(sh:get("FUNCNEST"))
-		if lim and lim > 0 and (sh.calldepth or 0) >= lim then
-			io.stderr:write("curse: " .. cmd .. ": maximum function nesting level exceeded (" .. lim .. ")\n")
-			sh.status = 1 -- (bash: jump_to_top_level DISCARD — the rest of the command line goes)
-			error({ __curse_exit = 1, __curse_lineabort = true, __curse_discard = true })
-		end
+	if PREEMPT[0] ~= 0 then -- (a function's entry is a preemption point, like a loop head:
+		rt.preempt() -- pure recursion has none — rt.preempt)
+	end
+	if sh.vars.FUNCNEST then -- ($FUNCNEST: past that many nested calls, the line is abandoned)
+		rt.funcnest_over(sh, cmd)
 	end
 	local savedline = sh.cur_line -- the call-site line: $LINENO is restored to it on return
 	-- (an error out of compiled code called from here skips ITS frames' epilogues: the
@@ -4705,9 +4145,20 @@ local function run_function(sh, cmd, fn, args, hook, tenv_base)
 	local dbg_saved = rt.debug_enter(sh, cmd)
 	-- Redirects on the definition (`f(){ … } >&2`) apply to the whole body per call.
 	local fr = sh.func_redirs and sh.func_redirs[cmd]
-	local rsave, rsavedout, rok
+	local rsave, rsavedout, rok, pnp, pnf
 	if fr then
+		pnp, pnf = rt.procsub_mark(sh) -- (a >() target there: drained after the body, as on a
+		-- (compound command — a compiled caller has no drain.) They are applied at the line
+		-- execute_function sets: `line_number = function_line_number = tc->line`, not the call's
+		local sv_cl, sv_fl = sh.cur_line, sh.force_line -- (force_line: whichever tier called)
+		local fd = sh.func_def and sh.func_def[cmd]
+		-- (the parser's: see funcdef_node; 0 — no line at all)
+		local bl = fd and (not sh.eof_read and fd.rline_own or fd.rline)
+		if bl then
+			sh.cur_line, sh.force_line = bl, bl
+		end
 		rsave, rok = apply_redirs(sh, fr)
+		sh.cur_line, sh.force_line = sv_cl, sv_fl
 		rsavedout = sh.out
 		if redirs_touch_stdout(fr) then
 			sh.out = io.write
@@ -4746,16 +4197,14 @@ local function run_function(sh, cmd, fn, args, hook, tenv_base)
 		io.flush()
 		sh.out = rsavedout
 		restore_redirs(rsave)
+		M._int.drain_procsub(sh, pnp, pnf)
 	end
 	sh.loopdepth = saved_ld
 	-- `return N` sets the function's status but not $? (return.def: only return_catch_value),
 	-- so the RETURN trap sees the status from before it; N is $? once the trap has run
-	local rret
-	if ok and sh.fret then -- (a compiled body's `return N`, parked for the RETURN trap)
-		rret, sh.fret = sh.fret, nil
-	end
+	-- (N parked in sh.fret: a compiled body's own, or a `return N` raised mid-body here)
 	if not ok and type(err) == "table" and err.__curse_return then
-		rret = err.__curse_return
+		sh.fret = err.__curse_return
 		ok, err = true, nil
 		sh.noerr = ne0 -- (a return raised mid-body — a trap's — skips a condition's noerr--)
 	end
@@ -4765,18 +4214,8 @@ local function run_function(sh, cmd, fn, args, hook, tenv_base)
 	-- it) — so one present now is inherited or was SET during this call, and fires — a
 	-- sourced script's return fires it regardless (see the `.`/source builtin) — and a
 	-- function run by the DEBUG trap doesn't fire it.
-	local rt_h = sh.traps and sh.traps.RETURN
-	if ok and rt_h and rt_h ~= "" and not sh.in_return_trap and not sh.in_debug
-		and ((sh.in_subprogram or 0) == 0 or rt.pseudo_trapped(sh, "RETURN")) then -- (in a subshell, one it set)
-		sh.in_return_trap = true
-		local saved = sh.status
-		sh.cur_line = sh.func_bline and sh.func_bline[cmd] or sh.cur_line
-		run_trap(sh, rt_h)
-		sh.status = saved
-		sh.in_return_trap = false
-	end
-	if rret then
-		sh.status = rret
+	if ok then
+		rt.fn_return(sh, cmd)
 	end
 	if not ok then
 		while sh.pd > pd0 + 1 do
@@ -4954,7 +4393,7 @@ local SPECIAL_BUILTIN -- forward decl (assigned below); posix dispatch/funcdef r
 -- single-quoting any word that isn't a plain token (bash). PS4's first char is
 -- repeated by call depth. A plain token is bare; anything else is quoted the way
 -- bash quotes it (shell_quote: `$'…'` for control/non-printable, else `'…'`).
-local xtrace_quote, xtrace_line, xtrace = rt.xtrace_quote, rt.xtrace_line, rt.xtrace
+local xtrace_line, xtrace = rt.xtrace_line, rt.xtrace
 
 -- bash's describe_command (type.def), for `type` and `command -v/-V`. FL: all, short (the
 -- sentence), reuse (command -v), type (-t), path_only (-p), force (-P), nofunc (-f),
@@ -5026,7 +4465,7 @@ local function describe(sh, nm, fl)
 			end
 			found = true
 		end
-		if BUILTINS[nm] and not (sh.disabled_builtins and sh.disabled_builtins[nm]) then
+		if rt.builtin_enabled(sh, nm) then
 			say("builtin", rt.L1((sh.opt_posix and SPECIAL_BUILTIN[nm]) and "%s is a special shell builtin\n"
 				or "%s is a shell builtin\n", nm), nm)
 			if not fl.all then
@@ -5135,55 +4574,31 @@ local function exec_simple(sh, args, hook, no_func)
 		sh.status = 0
 	elseif cmd == "false" then
 		sh.status = 1
-	elseif cmd == "break" then -- outside a loop: a no-op (bash), not a fatal unwind
+	elseif cmd == "break" or cmd == "continue" then -- outside a loop: a no-op (bash), not a fatal unwind
 		if args[2] == "--" then
 			table.remove(args, 2)
 		end
 		if (sh.loopdepth or 0) == 0 then -- (checked first — bash: said, not an error, status 0)
 			if not sh.opt_posix then
-				io.stderr:write("curse: break: only meaningful in a `for', `while', or `until' loop\n")
+				io.stderr:write("curse: " .. cmd .. ": only meaningful in a `for', `while', or `until' loop\n")
 			end
 			sh.status = 0
 		elseif args[2] and not rt.legal_number(args[2]) then -- non-numeric count: FATAL (status 128) in a
-			io.stderr:write("curse: break: " .. args[2] .. ": numeric argument required\n")
+			io.stderr:write("curse: " .. cmd .. ": " .. args[2] .. ": numeric argument required\n")
 			sh.status = 128 -- non-interactive shell (bash exits); interactive just aborts it
 			if not sh.opt_i then
 				error({ __curse_exit = 128 })
 			end
 		elseif args[3] ~= nil then -- (the count is checked first — bash's get_numeric_arg)
-			rt.too_many(sh, "break")
+			rt.too_many(sh, cmd)
 		elseif args[2] and rt.legal_number(args[2]) <= 0 then -- (bash: reported, and ALL the loops end)
-			io.stderr:write("curse: break: " .. args[2] .. ": loop count out of range\n")
+			io.stderr:write("curse: " .. cmd .. ": " .. args[2] .. ": loop count out of range\n")
 			sh.status = 1
 			error({ __curse_break = sh.loopdepth, __curse_status = 1 })
 		else
 			sh.status = 0
-			error({ __curse_break = math.min(rt.legal_number(args[2]) or 1, sh.loopdepth) })
-		end
-	elseif cmd == "continue" then
-		if args[2] == "--" then
-			table.remove(args, 2)
-		end
-		if (sh.loopdepth or 0) == 0 then -- (checked first — bash: said, not an error, status 0)
-			if not sh.opt_posix then
-				io.stderr:write("curse: continue: only meaningful in a `for', `while', or `until' loop\n")
-			end
-			sh.status = 0
-		elseif args[2] and not rt.legal_number(args[2]) then -- non-numeric count: fatal, like break
-			io.stderr:write("curse: continue: " .. args[2] .. ": numeric argument required\n")
-			sh.status = 128
-			if not sh.opt_i then
-				error({ __curse_exit = 128 })
-			end
-		elseif args[3] ~= nil then -- (the count is checked first — bash's get_numeric_arg)
-			rt.too_many(sh, "continue")
-		elseif args[2] and rt.legal_number(args[2]) <= 0 then -- (bash: reported, and ALL the loops end)
-			io.stderr:write("curse: continue: " .. args[2] .. ": loop count out of range\n")
-			sh.status = 1
-			error({ __curse_break = sh.loopdepth, __curse_status = 1 })
-		else
-			sh.status = 0
-			error({ __curse_continue = math.min(rt.legal_number(args[2]) or 1, sh.loopdepth) })
+			local n = math.min(rt.legal_number(args[2]) or 1, sh.loopdepth)
+			error(cmd == "break" and { __curse_break = n } or { __curse_continue = n })
 		end
 	elseif cmd == "[" or cmd == "test" then
 		do_test(sh, args)
@@ -5247,6 +4662,10 @@ local function exec_simple(sh, args, hook, no_func)
 		if args[j] == "--" then -- (end of options)
 			j = j + 1
 		end
+		-- (command.def: no NAME is success; then a restricted shell refuses -p — -v/-V too)
+		if usep and args[j] ~= nil and rt.restricted(sh, "command: -p: restricted") then
+			return
+		end
 		if vflag then
 			command_describe(sh, args, j, vflag == "V", usep)
 			return
@@ -5255,10 +4674,6 @@ local function exec_simple(sh, args, hook, no_func)
 		local svc, iee = sh.via_command, sh.ign_ee
 		sh.via_command = true
 		sh.ign_ee = iee or sh.noerr > 0 -- (errexit-exempt: -e cleared for what it runs, as eval)
-		if usep and rt.restricted(sh, "command: -p: restricted") then
-			sh.via_command, sh.ign_ee = svc, iee
-			return
-		end
 		if args[j] == nil then
 			sh.status = 0
 		else
@@ -5399,7 +4814,7 @@ local function eval_dbracket(sh, node)
 		else
 			l, r = dbracket_word(sh, node.l), dbracket_word(sh, node.r)
 			if sh.opt_x and (op == "==" or op == "=" or op == "!=") then -- (a wholly quoted rhs)
-				xr = { (r:gsub("[%z\1-\127\194-\244][\128-\191]*", "\\%0")) }
+				xr = { rt.xglob_quote(r) }
 			end
 		end
 		if sh.opt_x then -- (an empty operand traces as '')
@@ -5510,9 +4925,6 @@ function M.dbracket_arith(sh, s, textual)
 	end
 	return v
 end -- -eq/-lt… operand
-function M.dbracket_unary(sh, op, val)
-	return unary(sh, op, val)
-end -- file tests, -o, -v, -z/-n
 
 -- Run a loop body, catching break/continue (decrementing multi-level n and
 -- re-raising when it targets an outer loop). Returns "break", "continue", or nil.
@@ -5563,16 +4975,33 @@ local function drain_procsub(sh, np, nf)
 		return
 	end
 	io.flush()
+	-- (bash forks each <()/>() child at once, holding every earlier one's end: `tee >(wc -c)
+	-- >(wc -l)` — wc -c sees EOF only once wc -l exits. Let a child not yet started start
+	-- now, with those ends still open, before the shell closes its own.)
+	local gs = {}
+	for i = nf + 1, #files do
+		if files[i].g then
+			gs[#gs + 1] = files[i].g
+		end
+	end
+	rt.procsub_start(gs)
 	for i = nf + 1, #files do
 		C.close(files[i].fd)
 		rt.fd_owner[files[i].fd] = nil
 	end
-	sh.procsub_status = {} -- (the latest ones, for a later `wait $!`)
+	-- NOT waited for: bash reaps a procsub child asynchronously (only `wait` waits:
+	-- procsub_waitpid / procsub_waitall) — a >(cat) whose pipe an `exec 3>` still holds must
+	-- not block the shell, nor `read -t .5 < <(sleep 2)` last 2s. Its group runs on as a
+	-- (jobless) task; a later `wait $!`/`wait` finds it here (rt.procsub_wait).
+	sh.procsub_status = {} -- (the latest ones, for a later `wait $!`: pid -> group)
 	for i = nf + 1, #files do
 		local g = files[i].g
 		if g then -- (no g: its launch failed — nothing ran, nothing to reap)
-			rt.wait_groups({ g })
-			sh.procsub_status[files[i].pid] = g.status[1] or 0
+			sh.procsub_status[files[i].pid] = g
+			if not g.done then
+				sh.procsub_live = sh.procsub_live or {}
+				sh.procsub_live[#sh.procsub_live + 1] = g
+			end
 		end
 	end
 	for i = #files, nf + 1, -1 do
@@ -5708,7 +5137,7 @@ local function run_debug(sh, line)
 	if line then
 		sh.cur_line = line
 	end
-	local exited, rret = run_trap(sh, h)
+	local exited, rret = run_trap(sh, h, "debug trap")
 	local trap_status = sh.status
 	sh.status = saved
 	sh.in_debug = false
@@ -5734,71 +5163,57 @@ local function run_debug(sh, line)
 end
 M.run_debug = run_debug -- compiled tier fires DEBUG before each native command
 
-local tv_now = ffi.new("struct curse_timeval") -- reused buffer for `time`'s wall clock
-local function wall_secs()
-	C.gettimeofday(tv_now, nil)
-	return tonumber(tv_now.tv_sec) + tonumber(tv_now.tv_usec) * 1e-6
-end
+local wall_secs = rt.wall_secs
 
 local exec_stmt
--- A variable assignment's store (exec_stmt runs it under pcall): module-level, not
--- per-statement closures — closure creation is NYI for the JIT, and every `x=…` in a
--- loop made three. The expanded right-hand side is kept in sh.x_rhs (set -x).
-local function assign_rhs_a(sh, st)
-	sh.x_rhs = expand_assign_word(sh, st.rhs)
-	return sh.x_rhs
-end
-local function assign_rhs_w(sh, st)
-	sh.x_rhs = expand_word(sh, st.rhs)
-	return sh.x_rhs
-end
-local function assign_body(sh, st, nref_base, nref_sub)
-	if nref_base then
-		sh:array_set(
-			nref_base,
-			array_key(sh, nref_base, nref_sub),
-			assign_rhs_a(sh, st),
-			st.append
-		)
-	elseif st.index then
-		-- the VALUE expands before the subscript (bash assign_array_element: `a[$((i=5))]=$i`
-		-- stores the old $i; `a[$(exit 2)1]=$(exit 4)` leaves $? 2)
-		local v = assign_rhs_a(sh, st)
-		local key = array_key(sh, st.name, st.index)
-		if key == "" and sh:is_assoc(st.name) then -- (an associative array has no "" key)
-			error({ __curse_badsub = true })
-		end
-		if not sh:array_set(st.name, key, v, st.append) then
-			error({ __curse_badsub = true })
-		end
-	elseif st.arith then
-		sh:aset(st.name, eval(sh, st.arith))
-	elseif st.append then
-		local b = sh.vars[sh:deref(st.name)]
-		if b and b.arr then -- `name+=value` on an array appends to element 0 (bash)
-			sh:array_set(st.name, array_key(sh, st.name, "0"), assign_rhs_a(sh, st), true)
-		elseif b and b.int then -- integer var: += is arithmetic addition (the old value
-			-- is itself evaluated: `b=4+1; typeset -i b; b+=37` is 42 — bash)
-			sh:aset(st.name, rt.int_value(sh, sh:get(st.name)) + rt.int_value(sh, assign_rhs_w(sh, st), M.arith_eval_str))
-		elseif b and (b.lower or b.upper) then -- declare -l/-u: case-fold the appended result
-			local v = sh:get(st.name) .. assign_rhs_a(sh, st)
-			sh:set_str(st.name, b.lower and v:lower() or v:upper())
-		else
-			rt.append_scalar(sh, st.name, assign_rhs_a(sh, st)) -- (buffered: see rt.append_scalar)
-		end
-	else
-		local b = sh.vars[sh:deref(st.name)]
-		if b and b.arr then -- plain `name=value` on an array var writes element 0 (bash)
-			sh:array_set(st.name, array_key(sh, st.name, "0"), assign_rhs_a(sh, st), false)
-		elseif b and b.int and not b.ref then -- integer var (declare -i): assign arith-evaluates
-			sh:aset(st.name, rt.int_value(sh, assign_rhs_w(sh, st), M.arith_eval_str))
-		elseif b and (b.lower or b.upper) then -- declare -l/-u: case-fold on assign
-			local v = assign_rhs_a(sh, st)
-			sh:set_str(st.name, b.lower and v:lower() or v:upper())
-		elseif sh:set_str(st.name, assign_rhs_a(sh, st)) == false and not sh.applying_prefix then
-			error({ __curse_exit = 1, __curse_lineabort = true, __curse_noee = true }) -- (a bad nameref target)
+-- A simple command's pieces for rt.sr_run (module-level: no per-command closures). spec:
+-- the statement's constant part, cached per AST node (weakly: a set -k rewrite is a fresh
+-- node each run).
+local SIMPLE = { spec = setmetatable({}, { __mode = "k" }) }
+function SIMPLE.new_spec(st)
+	local names
+	if st.assigns then
+		names = {}
+		for _, a in ipairs(st.assigns) do
+			if not a.index then
+				names[#names + 1] = a.name
+			end
 		end
 	end
+	local spec = { aas = st.arrayargs, assigns = st.assigns, names = names, eredirs = st.redirs,
+		so = st.redirs and redirs_touch_stdout(st.redirs) or nil, ix = true }
+	SIMPLE.spec[st] = spec
+	return spec
+end
+-- the prefix bindings (`x=1 y=$x cmd`), in order, each value expanded as it binds
+function SIMPLE.bind(sh, spec)
+	local assigns = spec.assigns
+	for i = 1, #assigns do
+		local a = assigns[i]
+		if a.index then -- (`a[i]=v cmd`: not a valid command-prefix binding)
+			rt.pbind_bad(sh, a.name, tostring(a.index))
+		elseif a.raw then
+			rt.pbind(sh, a.name, nil, false, a.raw)
+		elseif a.arith then -- (`x=$((…))`, parsed as arithmetic)
+			rt.pbind(sh, a.name, rt.i64_to_str(eval(sh, a.arith)), false)
+		else
+			rt.pbind(sh, a.name, rt.xw_rhs(sh, a.rhs), a.append)
+		end
+	end
+end
+-- the redirections, into rt.sr_run_cmd's saves; a failed one on a posix special builtin
+-- is fatal (EX_REDIRFAIL)
+function SIMPLE.redirs(rs, sh, argv, spec)
+	local sv, ok = apply_redirs(sh, spec.eredirs, argv[1], nil, argv)
+	for i = 1, #sv do
+		rs[i] = sv[i]
+	end
+	rs.e2o, rs._sh = sv.e2o, sv._sh
+	if not ok and sh.opt_posix and SPECIAL_BUILTIN[argv[1]] and not sh.opt_i then
+		sh.status = 1
+		error({ __curse_exit = 1 })
+	end
+	return ok
 end
 exec_stmt = function(sh, st, hook)
 	local t = st.t
@@ -5897,199 +5312,23 @@ exec_stmt = function(sh, st, hook)
 		return
 	end
 	-- (a function definition leaves the line alone — bash)
-	if st.line and t ~= "funcdef" and not (sh.in_trap and sh.in_trap > 0 and (sh.calldepth or 0) == sh.trap_calldepth) then
+	if st.line and t ~= "funcdef" then
 		-- a simple command's line is where its SECOND token ended (bash's yacc lookahead:
 		-- `nope "x<NL>y"` errors on line 2); cline records that
-		sh.cur_line = (t == "simple" or t == "assign" or t == "assignlist") and st.cline or st.line
-		sh.cur_cline = st.cline or st.line -- (where its $(…) bodies number from)
-	end -- $LINENO: frozen at the trapped line for the trap's own commands (not in a
-	-- function the trap calls, whose lines count as usual — bash)
+		local ln = (t == "simple" or t == "assign" or t == "assignlist" or t == "arrayassign") and st.cline or st.line
+		if not (sh.in_trap and sh.in_trap > 0 and (sh.calldepth or 0) == sh.trap_calldepth) then
+			sh.cur_line = ln
+			sh.cur_cline = st.cline or st.line -- (where its $(…) bodies number from)
+		elseif sh.trap_base then -- a trap's own commands: its handler's line k is the trapped
+			sh.cur_line = sh.trap_base + ln - 1 -- line + k-1 (parse_and_execute counts on from
+		end -- it — not in a function the trap calls, whose lines count as usual — bash)
+	end
 	if t == "assign" then
-		local ncs0 = sh.ncs
 		local pnf = sh.procsub_files and #sh.procsub_files or 0
-		if st.name == "SHELLOPTS" or st.name == "BASHOPTS" then -- readonly specials (bash)
-			io.stderr:write("curse: " .. st.name .. ": readonly variable\n")
-			rt.report_exit(sh) -- (err_readonly: report_error)
-			sh.status = 1
-			if sh.opt_c or sh.opt_posix then
-				error({ __curse_exit = 1 })
-			end
-			if sh.applying_prefix then -- (as any readonly: a prefix is non-fatal, a
-				return -- standalone assignment aborts the rest of the line)
-			end
-			error({ __curse_exit = 1, __curse_lineabort = true })
-		end
-		if st.index == "" then -- `a[]=v`: empty subscript is a bad array subscript (bash: status 1, no
-			io.stderr:write("curse: " .. st.name .. "[]: bad array subscript\n") -- assign, the rest of
-			rt.report_exit(sh) -- (err_badarraysub: report_error)
-			sh.status = 1 -- the line abandoned; as a prefix binding it's just skipped)
-			if sh.applying_prefix then
-				return
-			end
-			error({ __curse_exit = 1, __curse_lineabort = true })
-		end
-		local rb = sh.vars[sh:deref(st.name)]
-		-- A nameref whose target carries a subscript (declare -n ref='A[K]'): a plain
-		-- `ref=v` / `ref+=v` writes THROUGH to that element, not the base array's [0].
-		local nref_base, nref_sub
-		if not st.index and not st.arith then
-			local nb = sh.vars[st.name]
-			local selfsub = nb and nb.ref and nb.s and sh:self_elem_unref(st.name)
-			if selfsub then
-				nref_base, nref_sub = st.name, selfsub
-			elseif nb and nb.ref and nb.s then
-				-- a nameref cycle (ref1->ref2->ref1) derefs to "" — bash detects it on write
-				if nb.s ~= "" and sh:deref(st.name) == "" then
-					if rt.nameref_circular(sh, st.name) then -- (a function's local cycle: the global, no nameref)
-						local back = sh:global_swap({ st.name })
-						sh.in_circ = true
-						local ok, e = pcall(exec_stmt, sh, st, hook)
-						sh.in_circ = nil
-						back()
-						if not ok then
-							error(e, 0)
-						end
-					end
-					return
-				elseif nb.outer and nb.s:find("[", 1, true) then -- (`local -n a='a[0]'`: bash
-					io.stderr:write("curse: `" .. nb.s .. "': not a valid identifier\n") -- rejects it)
-					error({ __curse_exit = 1, __curse_lineabort = true })
-				elseif nb.outer then -- (a function's self-named ref: bash warns, then writes)
-					io.stderr:write("curse: warning: " .. st.name .. ": circular name reference\n")
-				end
-				nref_base, nref_sub = (sh:deref_elem(st.name) or ""):match("^([%a_][%w_]*)%[(.+)%]$")
-			end
-		end
-		-- `ref[i]=` where ref is a nameref TO a subscripted element (`a[0]`) would be
-		-- `a[0][i]` — not a valid identifier (bash: status 1, no assign).
-		if st.index then
-			local nb = sh.vars[st.name]
-			if nb and nb.ref and nb.s and nb.s:match("^[%a_][%w_]*%[.+%]$") then
-				io.stderr:write("curse: `" .. nb.s .. "': not a valid identifier\n")
-				sh.status = 1
-				return
-			end
-			if nb and nb.ref and nb.s == nil and not nb.arr then -- (a valueless nameref: no target)
-				io.stderr:write("curse: `': not a valid identifier\n")
-				error({ __curse_exit = 1, __curse_lineabort = true })
-			end
-		end
-		-- a negative subscript past the start is reported before readonly-ness (bash
-		-- evaluates the subscript first): `c[-2]: bad array subscript`, line aborted
-		-- (only for a READONLY array — else the assignment itself evaluates it, once)
-		if st.index and not st.arith and rb and rb.ro and rb.arr and not rb.assoc and st.index:find("-", 1, true) then
-			local k = array_key(sh, st.name, st.index)
-			if rt.neg_oob(sh, st.name, k) then
-				io.stderr:write("curse: " .. st.name .. "[" .. st.index .. "]: bad array subscript\n")
-				rt.report_exit(sh) -- (err_badarraysub: report_error)
-				sh.status = 1
-				error({ __curse_exit = 1, __curse_lineabort = true })
-			end
-		end
-		if rb and rb.ro then -- readonly: reject the assignment (status 1); fatal in `sh -c`
-			-- (or posix mode). Through a nameref bash names the TARGET.
-			io.stderr:write("curse: " .. sh:deref(st.name) .. ": readonly variable\n")
-			rt.report_exit(sh) -- (err_readonly: report_error)
-			sh.status = 1
-			if sh.opt_c or sh.opt_posix then
-				error({ __curse_exit = 1 })
-			end
-			-- A readonly command PREFIX (`abc=def echo one`) is non-fatal: bash still runs
-			-- the command. But a STANDALONE readonly assignment (`readonly x=1; x=2; echo
-			-- hi`) aborts the REST of the line, then the next line runs.
-			if sh.applying_prefix then
-				return
-			end
-			error({ __curse_exit = 1, __curse_lineabort = true })
-		else
-			-- A bad substitution / invalid indirect in the RHS fails the assignment but is
-			-- NON-fatal (bash: `x=${bad|y}` leaves x unset, status 1, script continues) —
-			-- like a bad-subst in a command word. Catch it around the RHS expansion.
-			-- (the expanded right-hand side, kept for set -x's `name+=value` trace)
-			sh.x_rhs = nil
-			local xps4 = sh.opt_x and st.name == "PS4" and sh:get("PS4") -- (traced under the old one)
-			local aok, aerr = pcall(assign_body, sh, st, nref_base, nref_sub)
-			if xps4 and aok then
-				sh.xtrace_ps4 = xps4
-			end
-			if not aok then
-				if type(aerr) == "table" and aerr.__curse_badsub then -- (`c[-5]=v`: aborts the line)
-					io.stderr:write("curse: " .. st.name .. "[" .. tostring(st.index) .. "]: bad array subscript\n")
-					rt.report_exit(sh) -- (err_badarraysub: report_error)
-					sh.status = 1
-					sh.assign_err = true
-					error({ __curse_exit = 1, __curse_lineabort = true })
-				elseif type(aerr) == "table" and aerr.__curse_experr and not aerr.__curse_lineabort then
-					sh.status = 1
-					sh.assign_err = true
-					return -- bad-subst RHS: non-fatal
-				else
-					error(aerr)
-				end -- a real error (exit, nounset, matherr) propagates
-			end
-		end
-		-- set -x: trace the assignment with its expanded value (`+ x=5`, `+ a[1]=v`)
-		if sh.opt_x and st.append and sh.x_rhs then -- `+ foo+=two` (bash traces the appended text)
-			xtrace(sh, { (st.index and (st.name .. "[" .. st.index .. "]") or st.name) .. "+="
-				.. (sh.x_rhs == "" and "" or xtrace_quote(sh.x_rhs)) }, true)
-		end
-		if sh.opt_x and not st.append then
-			local v = sh.x_rhs -- (the expanded word, as bash prints it: `n=1+1` for an -i n)
-			if v then
-			elseif st.index then
-				v = sh:get(st.name .. "[" .. st.index .. "]") or ""
-			else
-				v = sh:get(st.name) or ""
-			end
-			xtrace(sh, { (st.index and (st.name .. "[" .. st.index .. "]") or st.name) .. "=" .. (v == "" and "" or xtrace_quote(v)) }, true)
-		end
-		sh.xtrace_ps4 = nil
-		-- set -a (allexport): a plain scalar assignment auto-exports the variable
-		if sh.opt_a and not st.index then
-			local b = sh.vars[sh:deref(st.name)]
-			if b and not b.arr then
-				b.exported = true
-				C.setenv(st.name, sh:get(st.name), 1)
-			end
-		end
-		-- HISTSIZE shrinks the in-memory history; HISTFILESIZE truncates $HISTFILE —
-		-- both to the last N entries, on assignment (bash).
-		if not st.index and (st.name == "HISTSIZE" or st.name == "HISTFILESIZE") then
-			local nsz = tonumber(sh:get(st.name))
-			if nsz and nsz >= 0 then
-				if st.name == "HISTSIZE" and sh.history then
-					require("hist").stifle(sh) -- (the oldest go; numbering moves on)
-				elseif st.name == "HISTFILESIZE" then
-					local hf = sh:get("HISTFILE")
-					if hf and hf ~= "" then
-						local lines, f = {}, io.open(hf, "r")
-						if f then
-							for l in f:lines() do
-								lines[#lines + 1] = l
-							end
-							f:close()
-						end
-						if #lines > nsz then
-							local o = io.open(hf, "w")
-							if o then
-								for k = #lines - nsz + 1, #lines do
-									o:write(lines[k], "\n")
-								end
-								o:close()
-							end
-						end
-					end
-				end
-			end
-		end
-		-- exit status of an assignment = the last command substitution's, else 0
-		-- (skip when it was a rejected readonly assignment, which already set status 1)
-		-- (sh.ncs counts substitutions performed — also ones nested in ${…}, a subscript)
-		if not (rb and rb.ro) then
-			sh.status = sh.ncs ~= ncs0 and sh.last_cmdsub_status or 0
-		end
-		sh:set_str("_", "") -- a bare assignment resets $_ to empty (bash)
-		sh:array_assign("PIPESTATUS", { tostring(sh.status) }, false) -- (PIPESTATUS: this null command's status)
+		rt.assign_full(sh, st)
+		-- this null command's status, whatever its outcome (bash's execute_null_command;
+		-- a line abort's is set where it is contained: rt.line_aborted)
+		sh:array_assign("PIPESTATUS", { tostring(sh.status) }, false)
 		if sh.procsub_files then -- (`x=<(…)`: a null command closes its <() when it ends)
 			rt.assign_drain(sh, st, pnf)
 		end
@@ -6097,85 +5336,22 @@ exec_stmt = function(sh, st, hook)
 		if sh.opt_x and st.raw then -- (bash traces an array literal as written: `+ a=(1 "b c")`)
 			xtrace_line(sh, st.name .. (st.append and "+=" or "=") .. rt.srcw(st.raw))
 		end
-		local rb = sh.vars[sh:deref(st.name)]
-		local nb = sh.vars[st.name]
-		if nb and nb.ref and nb.s and nb.s:find("[", 1, true) then
-			-- a nameref to an element/`a[@]`: an array literal can't be written through it
-			io.stderr:write("curse: `" .. nb.s .. "': not a valid identifier\n")
-			sh.status = 1
-		elseif st.index then -- `a[0]=(1 2)`: can't assign a list to an array MEMBER (bash)
-			io.stderr:write("curse: " .. st.name .. "[" .. st.index .. "]: cannot assign list to array member\n")
-			sh.status = 1
-			error({ __curse_exit = 1, __curse_lineabort = true }) -- (and abandons the line: bash)
-		elseif rb and rb.ro then -- readonly array: reject the (re)assignment — and, like a
-			-- scalar's, abort the rest of the line (fatal under -c/posix)
-			io.stderr:write("curse: " .. st.name .. ": readonly variable\n")
-			rt.report_exit(sh) -- (err_readonly: report_error)
-			sh.status = 1
-			error({ __curse_exit = 1, __curse_lineabort = not (sh.opt_c or sh.opt_posix) or nil })
+		if st.index then -- `a[0]=(1 2)`: can't assign a list to an array MEMBER (bash)
+			rt.arrayassign_member(sh, st.name, st.index)
 		else
-			-- a failglob no-match inside `a=(*.ZZ)` fails the assignment non-fatally (bash)
 			local ncs0 = sh.ncs
 			local pnf = sh.procsub_files and #sh.procsub_files or 0
-			local aok, aerr = pcall(do_arrayassign, sh, st)
-			if aok then
-				sh.status = sh.ncs ~= ncs0 and sh.last_cmdsub_status or 0 -- (`a=( $(exit 3) )`: 3)
-				sh:set_str("_", "")
-				sh:array_assign("PIPESTATUS", { tostring(sh.status) }, false)
-				if sh.procsub_files then -- (`a=( <(…) )`: closed when the assignment ends)
-					rt.assign_drain(sh, st, pnf)
-				end
-			elseif type(aerr) == "table" and aerr.__curse_experr and not aerr.__curse_lineabort then
-				sh.status = 1
-				if sh.opt_e then
-					error({ __curse_exit = 1 })
-				end
-			else
-				error(aerr)
+			rt.arrayassign_stmt(sh, st.name, nil, st.append, st)
+			if sh.status == 0 and sh.ncs ~= ncs0 then -- (`a=( $(exit 3) )`: 3)
+				sh.status = sh.last_cmdsub_status
+			end
+			sh:array_assign("PIPESTATUS", { tostring(sh.status) }, false)
+			if sh.procsub_files then -- (`a=( <(…) )`: closed when the assignment ends)
+				rt.assign_drain(sh, st, pnf)
 			end
 		end
 	elseif t == "funcdef" then
-		-- a funcdef whose name is an expansion (`$foo-bar()`) is a NON-fatal runtime
-		-- error (bash: status 1) — the name was captured raw by the parser. bash is
-		-- otherwise lenient (a literal `=` in the name is fine: `func-name=ext`).
-		local badname = not st.name:match("^[%w_:%.+@/%%%^~,!][%w_%.%-:+@/!#=%%%^~,%[%]]*$")
-		if badname or (sh.opt_posix and not st.name:match("^[%a_][%w_]*$")) then
-			rt.ierr = true -- (check_identifier's internal_error)
-			rt.err_at(sh, st.top and st.eline, "curse: `" .. st.name .. "': not a valid identifier\n")
-			sh.status = 1
-			if not badname and not sh.opt_i then -- (posix: a fatal error)
-				error({ __curse_exit = 2 })
-			end
-			return
-		end
-		if sh.fn_ro and sh.fn_ro[st.name] then -- `readonly -f`: can't be redefined
-			rt.err_at(sh, st.top and st.eline, "curse: " .. st.name .. ": readonly function\n")
-			sh.status = 1
-			return
-		end
-		if sh.opt_posix and SPECIAL_BUILTIN[st.name] then -- posix: can't shadow a special builtin
-			io.stderr:write("curse: `" .. st.name .. "': is a special builtin\n")
-			sh.status = 2
-			error({ __curse_exit = 2 }) -- fatal (bash aborts)
-		end
-		sh.functions[st.name] = st.body
-		sh.func_redirs = sh.func_redirs or {}
-		sh.func_redirs[st.name] = st.redirs -- `f(){ … } >&2`
-		sh.func_src = sh.func_src or {}
-		sh.func_src[st.name] = nil -- printed text: deparsed from the definition on demand
-		sh.func_def = sh.func_def or {}
-		sh.func_def[st.name] = st
-		if sh.fexport and sh.fexport[st.name] then
-			rt.fexport_sync(sh, st.name) -- a redefinition re-exports the new body
-		end
-		-- definition site for `declare -F` under extdebug (name line file)
-		sh.func_line = sh.func_line or {}
-		sh.func_line[st.name] = st.line
-		sh.func_bline = sh.func_bline or {}
-		sh.func_bline[st.name] = st.bline
-		sh.func_file = sh.func_file or {}
-		sh.func_file[st.name] = rt.def_source(sh)
-		sh.status = 0
+		rt.def_function(sh, st) -- (the one registration, shared with the compiled tier)
 	elseif t == "assignlist" then
 		-- a bad array subscript / bad-subst in one binding aborts the REST of the list
 		-- (bash: `a=x b[0+]=y c=z` sets only a), keeping the error status.
@@ -6189,6 +5365,9 @@ exec_stmt = function(sh, st, hook)
 			exec_stmt(sh, a, hook)
 			if sh.assign_err then
 				sh.cur_alist = nil
+				if sh.procsub_files then -- (the list's <() close with it)
+					drain_procsub(sh, 0, pnf)
+				end
 				return
 			end
 		end
@@ -6309,337 +5488,11 @@ exec_stmt = function(sh, st, hook)
 			drain_procsub(sh, pnp, pnf) -- (`x=<(…) $empty`: closed as the null command ends)
 			return
 		end
-		if st.arrayargs then -- `declare -A a=(...)` / `local -a b=(...)` array literals
-			-- Only append the names now (so `declare -A a=(...)` isn't seen as a bare
-			-- listing and so `local`/`declare` establishes the scope + attributes). The
-			-- actual array assignment happens AFTER the builtin runs (below), so it lands
-			-- in the freshly-declared/local variable.
-			-- A name ALREADY readonly: bash's compound assignment fails as the words expand,
-			-- before the builtin runs — `ra: readonly variable`, the rest of the line
-			-- abandoned — unless the builtin makes a new local (a function's declare/local)
-			local dcl, glob = args[1], false
-			for k = 2, #args do
-				glob = glob or args[k]:match("^%-%a*[gG]") ~= nil
-			end
-			local localize = dcl == "local" or ((dcl == "declare" or dcl == "typeset") and (sh.calldepth or 0) > 0 and not glob)
-			for _, aa in ipairs(st.arrayargs) do
-				args[#args + 1] = aa.name
-				local b = sh.vars[sh:deref(aa.name)]
-				if b and b.ro and not localize then
-					io.stderr:write("curse: " .. aa.name .. ": readonly variable\n")
-					rt.report_exit(sh) -- (err_readonly: report_error)
-					sh.status = 1
-					error({ __curse_exit = 1, __curse_lineabort = true })
-				elseif b and b.ro and sh:is_global_ro(sh:deref(aa.name)) then
-					-- `local ro=(…)`: bash's compound assignment fails first, then local's own error
-					-- (the first under this_command_name — still the calling FUNCTION's name)
-					local fnm = sh.funcstack and sh.funcstack[1]
-					io.stderr:write("curse: " .. (fnm and (fnm .. ": ") or "") .. aa.name .. ": readonly variable\n")
-				end
-			end
-			-- (names with a NAME=(…) literal: declare -g keeps its global view until they're
-			-- assigned, and a failed kind conversion reports/skips them bash's way)
-			sh.arrayargs_pending = {}
-			local wantassoc = false
-			for k = 2, #args do
-				if args[k]:match("^%-%a*A") then
-					wantassoc = true
-				end
-			end
-			sh.arrayargs_pre = {}
-			for _, aa in ipairs(st.arrayargs) do
-				sh.arrayargs_pending[aa.name] = true
-				sh.arrayargs_pre[aa] = arrayassign_items(sh, aa, wantassoc or sh:is_assoc(sh:deref(aa.name)))
-			end
-		end
-		-- `exec [redirs] [cmd…]`: redirections are permanent (not restored). With no
-		-- command it just rewires the shell's own fds (e.g. `exec 3>file`); with a
-		-- command it replaces the shell process with that command.
-		local viacmd -- (`command exec`: a special builtin's posix-mode fatal errors don't apply)
-		while (args[1] == "command" or args[1] == "builtin") and args[2] == "exec" and not sh.functions[args[1]] do
-			viacmd = viacmd or args[1] == "command"
-			table.remove(args, 1) -- `command exec 2>f`: still exec, its redirections persist
-		end
-		local isexec = args[1] == "exec"
-		local tenv_base -- set while this command's prefix bindings sit on sh.tenv
-		local function run_cmd()
-			sh.write_err = nil -- a builtin sets this on an output write error (e.g. full disk)
-			-- `set -x` trace: BEFORE the command's own redirects, so `cmd 2>file` doesn't
-			-- capture the trace (bash writes it to the shell's stderr).
-			if sh.opt_x and args[1] ~= nil then
-				if st.arrayargs and sh.arrayargs_pre then -- (`+ b=('4' '5 6')` before `+ declare -a b`)
-					for _, aa in ipairs(st.arrayargs) do
-						if sh.arrayargs_pre[aa] then
-							rt.xtrace_arrlit(sh, aa.name, sh.arrayargs_pre[aa])
-						end
-					end
-				end
-				xtrace(sh, args)
-			end
-			-- `exec [redirs] [cmd…]` (b_exec): its redirections PERSIST (not restored) and
-			-- a command replaces the shell. Here, under the prefix bindings (a temporary
-			-- env — posix: they persist, exec being a special builtin)
-			if isexec then
-				return require("b_exec")(sh, st, args, hook, viacmd)
-			end
-			if st.redirs then
-				local save, ok
-				if tenv_base and #sh.tenv > tenv_base then
-					-- the redirections don't see the command's own prefix bindings (bash:
-					-- `a=2 cmd >&$a` uses the outer a) — unshadow them while they expand
-					local shadow = {}
-					for k = #sh.tenv, tenv_base + 1, -1 do
-						local te = sh.tenv[k]
-						shadow[#shadow + 1] = { te.name, sh.vars[te.name] }
-						sh.vars[te.name] = te.box or nil
-					end
-					local rok, a1, a2 = pcall(apply_redirs, sh, st.redirs, args[1])
-					for i = #shadow, 1, -1 do
-						sh.vars[shadow[i][1]] = shadow[i][2]
-					end
-					if not rok then
-						error(a1)
-					end
-					save, ok = a1, a2
-				else
-					save, ok = apply_redirs(sh, st.redirs, args[1])
-				end
-				if not ok then
-					sh.status = 1
-					restore_redirs(save) -- open failed: skip the command
-					if sh.opt_posix and SPECIAL_BUILTIN[args[1]] and not sh.opt_i then
-						error({ __curse_exit = 1 }) -- (EX_REDIRFAIL: a special builtin's is fatal)
-					end
-				else
-					-- Only route builtin/captured output to the real fd 1 when a redirect
-					-- actually targets stdout; a stdin-only redirect (heredoc, `<`) must not
-					-- steal fd-1 output away from a $(...) capture buffer.
-					local savedout = sh.out
-					if redirs_touch_stdout(st.redirs) then
-						sh.out = io.write
-					end
-					local pok, err = pcall(exec_simple, sh, args, hook)
-					io.flush()
-					sh.out = savedout
-					restore_redirs(save)
-					if pok and sh.write_err then
-						rt.chkwrite_late(sh, args[1])
-					end -- builtin hit a write error
-					if not pok then
-						error(err)
-					end
-				end
-			else
-				exec_simple(sh, args, hook)
-				if sh.write_err then
-					rt.chkwrite_late(sh, args[1])
-				end -- builtin hit a write error (e.g. full disk)
-			end
-		end
-		if st.assigns and sh.opt_posix and args[1] and SPECIAL_BUILTIN[args[1]] and not viacmd then
-			-- POSIX (bash under `set -o posix`): a variable assignment prefixed to a
-			-- SPECIAL builtin (`:`, `.`, eval, export, readonly, set, shift, trap,
-			-- unset, …) PERSISTS in the shell — and, being a command prefix, stays
-			-- EXPORTED (`foo=bar readonly …` then `printenv foo` -> bar; `x=tmp :`
-			-- leaves x=tmp in the environment).
-			-- EXCEPTION, per variable: if the builtin is `unset` and it removes a var we
-			-- just assigned, that var REVERTS to its prior value rather than persisting
-			-- (`a=A x=tmp unset x` → a=A, x=<prior>); other assigns still persist.
-			local prior = {}
-			for _, a in ipairs(st.assigns) do
-				if prior[a.name] == nil then
-					local b = sh.vars[a.name]
-					prior[a.name] = b
-							and {
-								s = b.s,
-								n = b.n,
-								arr = b.arr,
-								assoc = b.assoc,
-								order = b.order,
-								exported = b.exported,
-								ro = b.ro,
-								ref = b.ref,
-							}
-						or false
-				end
-			end
-			for _, a in ipairs(st.assigns) do
-				-- it propagates through any temporary binding of the name (`var=30 f` where
-				-- f does `var=20 return`): that binding's end mustn't restore the old value
-				for _, te in ipairs(sh.tenv) do
-					if te.name == a.name then
-						te.consumed = true
-					end
-				end
-				if a.raw then
-					sh:set_str(a.name, a.raw)
-				else
-					sh.applying_prefix = true
-					exec_stmt(sh, a, hook)
-					sh.applying_prefix = nil
-				end
-				if not a.index then -- a scalar command prefix stays exported (bash)
-					local b = sh.vars[sh:deref(a.name)]
-					if b then
-						b.exported = true
-					end
-					C.setenv(a.name, sh:get(a.name), 1)
-				end
-			end
-			run_cmd()
-			for name, box in pairs(prior) do
-				if sh.vars[name] == nil then
-					sh.vars[name] = box or nil
-				end -- unset → revert
-			end
-		elseif st.assigns then
-			-- prefix assignments: apply as a temporary, EXPORTED env for this command
-			-- only, then restore (both the shell var and the process env). Each binding
-			-- is pushed onto sh.tenv (LIFO) so an `unset` inside the command reveals the
-			-- shadowed value beneath instead of leaving the name unset (bash dynamic
-			-- scope); a consumed entry is skipped on restore.
-			local base = #sh.tenv
-			for _, a in ipairs(st.assigns) do
-				if a.index then
-					-- An array-element assignment (`a[i]=v cmd`) is NOT a valid command-prefix
-					-- binding: bash prints "not a valid identifier" and does NOT apply it (the
-					-- command still runs, non-fatal). Skip it entirely — no tenv, no mutation.
-					io.stderr:write("curse: `" .. a.name .. "[" .. tostring(a.index) .. "]': not a valid identifier\n")
-				else
-					local rb = sh.vars[a.name]
-					if rb and rb.ref and rb.s and rb.s:match("^[%a_][%w_]*$") and sh:deref(a.name) ~= "" then
-						-- through a nameref WITH a target, the binding is the target's (bash:
-						-- `ref=x cmd` exports var=x; ref itself is untouched)
-						a = setmetatable({ name = sh:deref(a.name) }, { __index = a })
-					end
-					local b = sh.vars[a.name] -- COPY the box: exec_stmt mutates it in place
-					sh.vseq = sh.vseq + 1
-					sh.tenv[#sh.tenv + 1] = {
-						name = a.name,
-						env = os.getenv(a.name),
-						consumed = false,
-						seq = sh.vseq,
-						-- (`z=y typeset z` in a function: the local it makes absorbs this binding)
-						decl_pd = (args[1] == "local" or args[1] == "declare" or args[1] == "typeset") and sh.pd or nil,
-						box = b and {
-							s = b.s,
-							n = b.n,
-							arr = b.arr,
-							assoc = b.assoc,
-							order = b.order,
-							exported = b.exported,
-							ro = b.ro,
-							ref = b.ref,
-							int = b.int,
-							lower = b.lower,
-							upper = b.upper,
-							cap = b.cap,
-							trace = b.trace,
-						} or false,
-					}
-					-- a NAMEREF's prefix binding is a plain temporary of its own (bash: the target
-					-- is untouched; restored below), and so is an array's (shadowed, not element 0) or an -i/-l/-u/-c var's: bash's tempenv
-					-- variable is a plain string (`i=1+1 cmd` passes "1+1")
-					-- (`n+=3 cmd` on a -i var: the sum, 8, bound as a plain string — bash's
-					-- make_variable_value appends arithmetically first)
-					local iapp = b and b.int and a.append and not b.arr and not b.ref and not a.raw
-					if b and not iapp and (b.ref or (not b.ro and (b.arr or b.int or b.lower or b.upper or b.cap))) then
-						if b.ref and rt.arith_ref_circ(sh, a.name, 0) == true then -- (a cycle: bash warns,
-							io.stderr:write("curse: warning: " .. a.name .. ": circular name reference\n") -- then binds)
-						end
-						sh.vars[a.name] = {}
-					end
-					if a.raw then -- NAME=(…) as a command prefix is a literal string, not an array (bash)
-						sh:set_str(a.name, a.raw)
-						C.setenv(a.name, a.raw, 1)
-					else
-						sh.applying_prefix = true
-						if rt.LOCALE_VARS[a.name] then
-							rt.lc_quiet = rt.prefix_ext(sh, args[1])
-						end
-						exec_stmt(sh, a, hook)
-						rt.lc_quiet = nil
-						sh.applying_prefix = nil
-						if iapp and sh.vars[a.name] == b and not b.ro then
-							sh.vars[a.name] = { s = sh:get(a.name), exported = b.exported }
-						end
-						C.setenv(a.name, sh:get(a.name), 1)
-					end
-					sh.tenv[#sh.tenv].tval = sh:get(a.name) -- (did the command write it? prefix_keeps)
-					do -- (a prefix binding is in the environment: `declare -p` shows -x)
-						local nb = sh.vars[sh:deref(a.name)]
-						if nb then
-							nb.exported = true
-						end
-					end
-				end
-			end
-			-- mark these entries so a DIRECT function call (not `eval`/a builtin) can tag
-			-- them with its frame: `local x` absorbs only its OWN call's tempenv.
-			sh.tenv_call_base = base
-			tenv_base = base
-			local ok, err = pcall(run_cmd)
-			tenv_base = nil
-			sh.tenv_call_base = nil
-			local keeps = rt.prefix_keeps(sh, args)
-			for k = #sh.tenv, base + 1, -1 do
-				local s = sh.tenv[k]
-				sh.tenv[k] = nil
-				if not s.consumed then -- an `unset` inside the command already revealed it
-					local nv = keeps and sh:get(s.name)
-					sh.vars[s.name] = s.box or nil
-					if s.env then
-						C.setenv(s.name, s.env, 1)
-					else
-						C.unsetenv(s.name)
-					end
-					if nv and nv ~= s.tval then -- (a builtin's write reached the variable beneath)
-						sh:set_str(s.name, nv)
-					end
-					if rt.LOCALE_VARS[s.name] then -- (`LANG=C cmd`: the locale follows the variable back)
-						rt.reset_locale(sh, s.name)
-					end
-					if s.name == "GLOBIGNORE" then
-						rt.setup_glob_ignore(sh) -- (the binding going away re-applies sv_globignore)
-					end
-				end
-			end
-			rt.env_rebuilt(sh) -- (dispose_used_env_vars: the environ, without them)
-			if not ok then
-				error(err)
-			end
-		else
-			run_cmd()
-		end
-		-- Array literals for a declaration builtin are assigned AFTER it runs, so a
-		-- `local a=(…)` / `declare -A a=(…)` lands in the now-local/assoc variable.
-		-- Skip when the builtin failed (e.g. a rejected -A/-a type change): the array
-		-- must stay untouched, not be mangled by the literal.
-		local aaskip = sh.arrayargs_pending and sh.arrayargs_pending.skip
-		local aaforce = sh.arrayargs_pending and sh.arrayargs_pending.force -- (assigned even so)
-		if st.arrayargs and (sh.status == 0 or aaforce) then
-			local failed = sh.status ~= 0
-			for _, aa in ipairs(st.arrayargs) do
-				if failed and not aaforce[aa.name] then
-				elseif aaskip and aaskip[aa.name] then -- (a rejected kind conversion: untouched)
-				else
-					do_arrayassign(sh, aa)
-				end
-			end
-		end
-		sh.arrayargs_pending = nil
-		sh.arrayargs_pre = nil
-		if sh.pending_unswap then -- (declare -g: back to the caller's locals)
-			local f = sh.pending_unswap
-			sh.pending_unswap = nil
-			f()
-		end
-		-- $_ : the last argument (after expansion) of the command just run.
-		if #args > 0 then
-			sh:set_str("_", args[#args])
-		end
-		-- PIPESTATUS for a simple command is a one-element array of its exit status.
-		sh:array_assign("PIPESTATUS", { tostring(sh.status) }, false)
+		-- the prefix bindings, a declaration builtin's NAME=(…) literals, the command (its
+		-- set -x trace, its redirections, `exec`), $_ and PIPESTATUS: the simple-command
+		-- runner the compiled tier shares (rt.sr_run)
+		rt.sr_run(sh, args, SIMPLE.spec[st] or SIMPLE.new_spec(st), st.assigns and SIMPLE.bind or nil, hook, nil,
+			st.redirs and SIMPLE.redirs or nil)
 		drain_procsub(sh, pnp, pnf) -- feed >() temps, clean up <()/>() temp files
 	elseif t == "forc" then
 		-- DEBUG fires (at the `for` line) before the init, before EACH condition
@@ -6647,17 +5500,21 @@ exec_stmt = function(sh, st, hook)
 		-- (a slot as bash stores it: leading blanks dropped, an empty one is `1` — make_cmd.c
 		-- make_arith_for_command; it still fires DEBUG and traces `+ (( 1 ))`)
 		local function stext(slot)
-			local s = (st.src and st.src[slot] or ""):match("^%s*(.-)$")
+			local s = (st.src and st.src[slot] or ""):match("^[ \t]*(.-)$")
 			return s == "" and "1" or s
 		end
 		local function fdbg(slot)
+			local intrap = sh.in_trap and sh.in_trap > 0 and (sh.calldepth or 0) == sh.trap_calldepth
 			if sh.opt_x and st.src then -- (traced before its DEBUG: eval_arith_for_expr)
+				if not intrap then -- (under the `for` line — the step's too, not the body's last)
+					sh.cur_line = st.line
+				end
 				arith_trace(sh, stext(slot)) -- (bash keeps a trailing blank)
 			end
 			if sh.traps and sh.traps.DEBUG then
 				head(sh, st, "((" .. stext(slot) .. "))")
 			end
-			run_debug(sh, (sh.in_trap and sh.in_trap > 0 and (sh.calldepth or 0) == sh.trap_calldepth) and sh.cur_line or st.line)
+			run_debug(sh, intrap and sh.cur_line or st.line)
 		end
 		-- A slot whose arith failed to parse (`i='3'`) was deferred: bash reports the
 		-- error at RUNTIME and runs the loop zero (or partial) iterations, non-fatally.
@@ -7109,25 +5966,6 @@ exec_stmt = function(sh, st, hook)
 			sh.status = 0
 			return
 		end
-		local function menu()
-			local width = #tostring(#list)
-			for k, item in ipairs(list) do
-				io.stderr:write(("%" .. width .. "d) %s\n"):format(k, item))
-			end
-		end
-		local function readline()
-			local buf = {}
-			while true do
-				local ch = fd_getc(0)
-				if ch == nil then
-					return #buf > 0 and table.concat(buf) or nil
-				end
-				if ch == "\n" then
-					return table.concat(buf)
-				end
-				buf[#buf + 1] = ch
-			end
-		end
 		local bodystatus = 0
 		sh.loopdepth = (sh.loopdepth or 0) + 1
 		if sh.opt_x then -- (traced before the DEBUG trap runs: execute_select_command)
@@ -7137,35 +5975,17 @@ exec_stmt = function(sh, st, hook)
 			head(sh, st, head(nil, st, "select"))
 			run_debug(sh, (sh.in_trap and sh.in_trap > 0 and (sh.calldepth or 0) == sh.trap_calldepth) and sh.cur_line or st.line)
 		end
-		menu()
+		rt.select_menu(sh, list)
 		while true do
-			hook("loop", st.id)
-			if PREEMPT[0] ~= 0 then
-				rt.preempt()
-			end
-			io.flush()
-			io.stderr:write(sh.vars["PS3"] and sh:get("PS3") or "#? ")
-			local line = readline()
-			if line == nil then -- EOF: end the loop (bash prints a newline — to STDOUT — status 1)
-				sh.out("\n")
-				bodystatus = 1
+			hook("loop", st.id, st, sh) -- (st: the tier hook tells the program's loops from eval'd ones)
+			if not rt.select_next(sh, list, st.name) then -- (the prompt/read/REPLY/NAME round: EOF
+				bodystatus = 1 -- or a readonly NAME ends the loop, status 1)
 				break
 			end
-			if line == "" then
-				menu()
-			else
-				sh:set_str("REPLY", line)
-				local nsel = line:match("^%s*(%d+)%s*$")
-				nsel = nsel and tonumber(nsel)
-				if rt.for_var_ro(sh, st.name) or sh:set_str(st.name, (nsel and list[nsel]) or "") == false then
-					bodystatus = 1
-					break
-				end
-				local act = run_loop_body(sh, st.body, hook)
-				bodystatus = sh.status
-				if act == "break" then
-					break
-				end
+			local act = run_loop_body(sh, st.body, hook)
+			bodystatus = sh.status
+			if act == "break" then
+				break
 			end
 		end
 		sh.loopdepth = sh.loopdepth - 1
@@ -7213,9 +6033,17 @@ local function run_trap_mod(mod, sh)
 	return r -- must stay on the stack for rt.current_line to find)
 end
 rt.INTERP_FRAMES[run_trap_mod] = true
-run_trap = function(sh, code)
+-- tag: bash's parse_and_execute input name for this kind of trap — "trap" (a signal's),
+-- "exit trap", "debug trap", "error trap", "return trap" (trap.c) — which labels a syntax
+-- error in the handler text (`NAME: debug trap: line N:`); the text's lines count from
+-- the line the handler runs at (the callers set it: 1 unless DEBUG/ERR/RETURN, which
+-- don't reset line_number — SEVAL_RESETLINE).
+run_trap = function(sh, code, tag)
 	local exited, savedline, rret = false, sh.cur_line, nil
-	local saved_tcd, saved_ts = sh.trap_calldepth, sh.trap_saved
+	local spl, slb = sh.perr_label, sh.trap_lbase
+	sh.perr_label, sh.trap_lbase = tag, tag and savedline or nil
+	local saved_tcd, saved_ts, saved_tb = sh.trap_calldepth, sh.trap_saved, sh.trap_base
+	sh.trap_base = sh.cur_line or 1 -- (the handler's first line: the trapped one)
 	sh.trap_calldepth = sh.calldepth or 0
 	sh.trap_saved = sh.status -- (bash's trap_saved_exit_value: see rt.return_default)
 	sh.in_trap = (sh.in_trap or 0) + 1
@@ -7238,8 +6066,8 @@ run_trap = function(sh, code)
 		end
 		trap_seen[code] = true
 	end
-	if sh.jobs_waited then -- (the handler is parse_and_execute'd: reading it cleans up — rt.job_waited)
-		rt.jobs_cleanup_waited(sh)
+	if sh.jobs_waited or sh.jobs_pending then -- (the handler is parse_and_execute'd: reading it notifies and cleans up — rt.jobs_line)
+		rt.jobs_line(sh)
 	end
 	local stmts, k = mod and {} or P.parse(code, sh).stmts, 0 -- (sh: aliases expand, bash)
 	local function body()
@@ -7286,8 +6114,9 @@ run_trap = function(sh, code)
 	if psa and sh.vars.PIPESTATUS == psb then
 		psb.arr = psa
 	end
-	sh.trap_calldepth, sh.trap_saved = saved_tcd, saved_ts
+	sh.trap_calldepth, sh.trap_saved, sh.trap_base = saved_tcd, saved_ts, saved_tb
 	sh.cur_line = savedline
+	sh.perr_label, sh.trap_lbase = spl, slb
 	if not ok then
 		if type(err) == "table" and err.__curse_discard then -- (bash's DISCARD: unwinds the
 			error(err, 0) -- handler and abandons the interrupted top-level command)
@@ -7353,9 +6182,13 @@ fire_err_trap = function(sh)
 	if h and h ~= "" and not sh.in_err_trap and errscope then
 		sh.in_err_trap = true
 		local saved = sh.status
-		local _, rret = run_trap(sh, h)
+		local exited, rret = run_trap(sh, h, "error trap")
+		local xst = sh.status
 		sh.status = saved
 		sh.in_err_trap = false
+		if exited then -- `exit` in the ERR trap exits the shell (_run_trap_internal)
+			error({ __curse_exit = xst })
+		end
 		if rret then -- `trap 'return N' ERR`: the failing command's function returns N
 			error({ __curse_return = rret })
 		end
@@ -7379,7 +6212,7 @@ M.prompt_string = function(sh, s, isprompt)
 	return expand_word(sh, P.parse_heredoc(decoded, false, nil, true))
 end
 M.run_trap_str = function(sh, code) -- a late-forked subshell child runs its own EXIT trap
-	return run_trap(sh, code)
+	return run_trap(sh, code, "exit trap")
 end
 
 -- (`return N` status is now rt.return_status — a pure runtime primitive the compiled
@@ -7387,16 +6220,18 @@ end
 
 -- Run the trap for the signal `signum` that the async handler delivered via the VM
 -- hook (lib_cursesig.c). No pending queue — the hook hands us exactly the signal
--- that fired. run_trap bumps sh.in_trap so a signal arriving DURING the handler is
--- serialized (the hook re-arms and runs it after this returns) — except one the handler
--- sent itself with `kill`, which runs nested, as in bash (rt.self_sig_release). A
+-- that fired. A signal arriving DURING a handler runs nested, inside it, as bash's
+-- run_pending_traps does at the handler's next command (running_trap only warns) — all
+-- but SIGCHLD inside its own trap (SIG_INPROGRESS: it runs again once that one ends). A
 -- signal trap doesn't change $? unless it exits/returns; `exit` in the handler
 -- propagates to exit the shell (bash).
+local chld_running, chld_again
 local function run_signal(sh, signum, direct, nested)
-	if not nested and sh.in_trap and sh.in_trap > 0 then
+	if signum == 17 and chld_running then
+		chld_again = true
 		return
-	end -- don't run a trap inside a trap (unless taken synchronously: rt.self_sig_release)
-	if not direct and rt.defer_signal(sh, signum) then
+	end
+	if not direct and (rt.defer_loading(sh, signum) or rt.defer_signal(sh, signum)) then
 		return -- (the parent's: runs once the in-process subshell has ended)
 	end
 	local h = sh.traps and sh.traps["SIG" .. (NUMSIG[signum] or "")]
@@ -7406,10 +6241,29 @@ local function run_signal(sh, signum, direct, nested)
 		end
 		return
 	end
+	if not direct and not nested and rt.fg_held(signum) then
+		return -- (a foreground command runs: the trap runs once it has finished)
+	end
 	-- an asynchronously-delivered signal handler reports $LINENO = 1 (bash).
 	local saved, sl = sh.status, sh.cur_line
 	sh.cur_line = 1
-	local exited, rret = run_trap(sh, h)
+	local exited, rret
+	if signum == 17 then
+		chld_running = true
+		local ok, e1, e2 = pcall(run_trap, sh, h, "trap")
+		chld_running = nil
+		if not ok then
+			chld_again = nil
+			error(e1, 0)
+		end
+		exited, rret = e1, e2
+		if chld_again then -- (children reaped meanwhile: the trap runs for them too)
+			chld_again = nil
+			C.kill(C.getpid(), 17)
+		end
+	else
+		exited, rret = run_trap(sh, h, "trap")
+	end
 	sh.cur_line = sl
 	-- a trapped signal ends a `wait`: 128+sig (see b_wait) — but SIGCHLD only in posix mode
 	if sh.in_wait and (signum ~= 17 or sh.opt_posix) then
@@ -7472,6 +6326,16 @@ local function finish(sh, ok, err)
 	if sh.defer_exit_trap then
 		return
 	end
+	-- (the script ran to its end: the reader reading end of input notifies of the jobs
+	-- that ended meanwhile — rt.jobs_line; not after an `exit`)
+	-- (reader_loop read end of input: bash's `executing` is 0 from here — not after an
+	-- `exit`, nor under -c (ONESHOT) — so executing_line_number stops naming a [[ ]] /
+	-- (( )) / for (( )) command's own line: M.fn_redir_line)
+	sh.eof_read = ok and not sh.opt_c or nil
+	if ok and (sh.jobs_waited or sh.jobs_pending) and sh.main_src and not sh.opt_c then
+		local okp, ast = pcall(P.parse, sh.main_src)
+		rt.jobs_line(sh, okp and ast.eofline or nil)
+	end
 	M.run_exit_trap(sh)
 	if sh.coprocs and next(sh.coprocs) then
 		rt.coproc_exit_dispose(sh, ok)
@@ -7483,7 +6347,7 @@ M.run_exit_trap = function(sh)
 		sh.in_exit_trap = true
 		local saved = sh.status
 		sh.cur_line = 1 -- (bash: the EXIT trap's $LINENO counts from 1)
-		if not run_trap(sh, h) then
+		if not run_trap(sh, h, "exit trap") then
 			sh.status = saved
 		end
 	end
@@ -7511,8 +6375,8 @@ end
 -- Run one logical line (a parser group) the way the shell runs its own input.
 local function run_group(sh, lg, hook, k)
 	sh.cmd_number = (sh.cmd_number or 0) + 1 -- (the prompt's \#)
-	if sh.jobs_waited then -- (reading a line: notify_and_cleanup — rt.job_waited)
-		rt.jobs_cleanup_waited(sh)
+	if sh.jobs_waited or sh.jobs_pending then -- (reading a line: notify_and_cleanup — rt.jobs_line)
+		rt.jobs_line(sh, lg.rline)
 	end
 	-- bash parses a whole LOGICAL LINE (a `simple_list` up to a top-level newline)
 	-- before executing any of it, so a syntax error ANYWHERE on the line means the
@@ -7539,7 +6403,7 @@ local function run_group(sh, lg, hook, k)
 	for _, st in ipairs(lg.stmts) do
 		k = k + 1
 		hook("stmt", k)
-		local ne0 = sh.noerr
+		local ne0, pf0 = sh.noerr, sh.procsub_files and #sh.procsub_files or 0
 		local ok, err = pcall(exec_stmt, sh, st, hook)
 		if not ok then
 			-- a fatal WORD-context expansion (div0 in $((…)), failglob no-match) aborts
@@ -7550,7 +6414,7 @@ local function run_group(sh, lg, hook, k)
 				end
 				sh.noerr = ne0 -- (an `if`/`&&` condition it unwound out of: errexit is live again)
 				rt.posix_arith_fatal(sh, err)
-				sh.status = err.__curse_badusage and not sh.opt_c and 2 or 1 -- (a failed ${x:=w})
+				rt.line_aborted(sh, err.__curse_badusage and not sh.opt_c and 2 or 1, pf0) -- (a failed ${x:=w})
 				rt.line_drift(sh, lg.sline, lg.eline) -- (bash's line numbers drift from here)
 				break
 			else
@@ -7822,14 +6686,15 @@ function M.run_variable_command(sh, pc, hook)
 				return
 			end
 			for _, st in ipairs(lg.stmts) do
-				local ne0 = sh.noerr
+				local ne0, pf0 = sh.noerr, sh.procsub_files and #sh.procsub_files or 0
 				local sok, serr = pcall(exec_stmt, sh, st, hook)
 				if not sok then
 					if type(serr) == "table" and serr.__curse_exit and not serr.__curse_lineabort then
 						error(serr)
 					elseif type(serr) == "table" and serr.__curse_lineabort then
 						rt.posix_arith_fatal(sh, serr)
-						sh.status, sh.noerr = 1, ne0
+						sh.noerr = ne0
+						rt.line_aborted(sh, 1, pf0)
 						break
 					else
 						return
@@ -7962,7 +6827,7 @@ function M.source_file(sh, path, hook)
 			return
 		end
 		for _, st in ipairs(lg.stmts) do
-			local ne0 = sh.noerr
+			local ne0, pf0 = sh.noerr, sh.procsub_files and #sh.procsub_files or 0
 			local sok, serr = pcall(exec_stmt, sh, st, hook)
 			if not sok then
 				if type(serr) == "table" and serr.__curse_lineabort then
@@ -7970,7 +6835,8 @@ function M.source_file(sh, path, hook)
 						error(serr)
 					end
 					rt.posix_arith_fatal(sh, serr)
-					sh.status, sh.noerr = 1, ne0
+					sh.noerr = ne0
+					rt.line_aborted(sh, 1, pf0)
 					break
 				else
 					error(serr)
@@ -8013,9 +6879,10 @@ M._int = {
 	read_split = read_split,
 	do_arrayassign = do_arrayassign,
 	arrayassign_items = arrayassign_items,
+	literal_sub = literal_sub,
 	expand_word = expand_word,
 	drain_procsub = drain_procsub,
-	xtrace_quote = xtrace_quote,
+	xtrace_quote = rt.xtrace_quote,
 	unset_arrayref = unset_arrayref,
 	eval = eval,
 	fmt_decl = fmt_decl,
@@ -8031,7 +6898,6 @@ M._int = {
 	run_history_lines = run_history_lines,
 	exec_stmt = exec_stmt,
 	apply_redirs = apply_redirs,
-	restore_redirs = restore_redirs,
 	arith_expand_text = arith_expand_text,
 	dbracket_word = dbracket_word,
 	dbracket_pattern = dbracket_pattern,
@@ -8053,4 +6919,5 @@ M._int = {
 }
 
 rt.INTERP_FRAMES[exec_stmt] = true -- (error prefixes: sh.cur_line is current under it)
+rt.SRC_FRAMES[run_function], rt.SRC_FRAMES[rt.source_run] = true, true -- (they set sh.cur_source)
 return M

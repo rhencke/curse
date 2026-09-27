@@ -30,35 +30,23 @@ return function(sh, cmd, args, hook, tcb)
 			end
 		end
 		local fl = { short = true }
-		local j0 = 1
-		while words[j0] and words[j0]:sub(1, 1) == "-" and #words[j0] > 1 do
-			local w = words[j0]
-			j0 = j0 + 1
-			if w == "--" then
-				break
-			elseif w == "--help" then -- (GETOPT_HELP: the builtin's help, status 2)
-				return rt.builtin_help(sh, "type")
+		local j0, sp, c, _ = 1
+		repeat
+			c, _, j0, sp = rt.getopt(sh, "type", words, "afptP", j0, sp)
+			if c == "?" then -- (an unknown option: nothing looked up)
+				return
+			elseif c == "a" then
+				fl.all = true
+			elseif c == "f" then
+				fl.nofunc = true
+			elseif c == "p" then
+				fl.path_only, fl.type, fl.short = true, false, false
+			elseif c == "t" then
+				fl.type, fl.path_only, fl.short = true, false, false
+			elseif c == "P" then
+				fl.path_only, fl.force, fl.type, fl.short = true, true, false, false
 			end
-			for k = 2, #w do
-				local f = w:sub(k, k)
-				if f == "a" then
-					fl.all = true
-				elseif f == "f" then
-					fl.nofunc = true
-				elseif f == "p" then
-					fl.path_only, fl.type, fl.short = true, false, false
-				elseif f == "t" then
-					fl.type, fl.path_only, fl.short = true, false, false
-				elseif f == "P" then
-					fl.path_only, fl.force, fl.type, fl.short = true, true, false, false
-				else -- an unknown option: usage error, nothing looked up (bash)
-					io.stderr:write("curse: type: -" .. f .. ": invalid option\n")
-					io.stderr:write("type: usage: type [-afptP] name [name ...]\n")
-					sh.status = 2
-					return
-				end
-			end
-		end
+		until not c
 		local allok = true
 		sh.write_err = nil
 		for j = j0, #words do

@@ -12,8 +12,12 @@ byte-for-byte against the system bash.
    control-flow graph dispatched on a program counter (`run(sh, pc)`), so it can be
    entered at any loop head or statement: on-stack replacement at any nesting depth.
    LuaJIT traces the hot pc paths to machine code; variables used only arithmetically
-   are lifted to native int64 locals. Generated code calls only `runtime.lua` — nothing
-   is handed back to the interpreter (`tools/delegate-census.lua` keeps that at zero).
+   are lifted to native int64 locals. Generated code calls `runtime.lua` plus two interp
+   trap hooks (`I.fire_err_trap`, `I.run_debug`) — no statement is handed back to the
+   interpreter (`tools/delegate-census.lua` keeps that at zero). The runtime still reaches
+   into `interp.lua` for pieces the two tiers share: the one-word expander for rare word
+   shapes, arithmetic, case-pattern globbing (`rt.case_glob` → `interp.case_pattern`) and
+   trap dispatch.
 
 `tier.lua` orchestrates: run interpreted, and when a loop or function gets hot, compile
 and continue in compiled code from exactly where the interpreter was. Code that only

@@ -47,14 +47,8 @@ return function(sh, cmd, args, hook, tcb)
 	if cmd == "eval" then
 		sh.shlvl_tail = nil -- (a builtin: the code it runs isn't exec'd in place)
 		-- eval [--]: join args, parse, run in the CURRENT shell (return/exit propagate).
-		if args[2] == "--help" then -- (CASE_HELPOPT: the builtin's help, status 2)
-			return rt.builtin_help(sh, "eval")
-		elseif args[2] and args[2] ~= "-" and args[2] ~= "--" and args[2]:sub(1, 1) == "-" then
-			io.stderr:write("curse: eval: " .. args[2]:sub(1, 2) .. ": invalid option\n" .. rt.usage("eval"))
-			sh.status = 2
-			sh.spb_err = 2 -- (EX_USAGE: rt.spb_run)
-		else
-			local start = (args[2] == "--") and 3 or 2
+		local c, _, start = rt.getopt(sh, "eval", args, "", 2) -- (bash's no_options)
+		if not c then
 			local code = table.concat({ unpack(args, start) }, " ")
 			if code:match("%S") then
 				-- Parse+run in the CURRENT shell, LAZILY (like the shell's own input) so an
@@ -82,17 +76,18 @@ return function(sh, cmd, args, hook, tcb)
 							require("interp").v_echo(sh, code, nil, vst)
 							break
 						end
-						if sh.jobs_waited then -- (reading a line: notify_and_cleanup — rt.job_waited)
-							rt.jobs_cleanup_waited(sh)
+						if sh.jobs_waited or sh.jobs_pending then -- (reading a line: notify_and_cleanup)
+							rt.jobs_line(sh)
 						end
 						if sh.opt_v and lg.pline then
 							require("interp").v_echo(sh, code, lg.pline - (ln > 0 and ln or 1) + 1, vst)
 						end
 						if lg.perr then -- syntax error on the line: run nothing on it (bash), status 2
 							-- (reported as the shell's own syntax errors are, labelled `eval:`)
+							local spl = sh.perr_label
 							sh.perr_label = "eval"
 							local pok, perr = pcall(require("interp").exec_stmt, sh, lg.perr, hook)
-							sh.perr_label = nil
+							sh.perr_label = spl
 							if not pok and not (type(perr) == "table" and perr.__curse_parseerr) then
 								error(perr)
 							end
@@ -105,13 +100,15 @@ return function(sh, cmd, args, hook, tcb)
 						for _, st in ipairs(lg.stmts) do
 							ran = ran or not rt.perr_neutral(st)
 							local ne0 = sh.noerr
+							local pf0 = sh.procsub_files and #sh.procsub_files or 0
 							local sok, serr = pcall(exec_list, sh, { st }, hook, false) -- errexit + signals incl.
 							if not sok then
 								if type(serr) == "table" and serr.__curse_lineabort and not serr.__curse_discard then
 									if rt.lineabort_exits(sh, serr) then
 										error(serr)
 									end
-									sh.status, sh.noerr = 1, ne0
+									sh.noerr = ne0
+									rt.line_aborted(sh, 1, pf0)
 									break -- div0/failglob: abort the rest of this line
 								else
 									error(serr)

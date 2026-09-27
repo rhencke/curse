@@ -32,6 +32,13 @@ if get_option('native')
 endif
 
 vm_builder = find_program('tools' / 'build-luajit-vm.sh')
+# Everything under packagefiles/luajit (curse.patch + the added C libs): the VM's
+# real inputs (see the luajit-vm target).
+# (Absolute path strings, not files(): Meson's sandbox refuses files() under
+# subprojects/, which packagefiles/ sits in.)
+lj_overlay = run_command('sh', '-c',
+  'find "$1"/subprojects/packagefiles/luajit -type f ! -name meson.build | LC_ALL=C sort',
+  'sh', repo, check: true).stdout().strip().split('\n')
 
 # 2. Build the patched LuaJIT VM (drives LuaJIT's own Makefile; folds in
 #    lib_cursesys/lib_cursesig; optional 3-stage PGO via -Dpgo=true).
@@ -44,13 +51,11 @@ vm = custom_target('luajit-vm',
     '--out',   '@OUTDIR@',
     '--jobs',  '4',
     get_option('pgo') ? '--pgo' : '--no-pgo'],
-  # (curse's own C additions, and the LuaJIT files curse.patch modifies: editing
-  # them must rebuild the VM)
-  depend_files:     [lj_src / 'src' / 'lib_cursesys.c', lj_src / 'src' / 'lib_cursesig.c',
-                     lj_src / 'src' / 'lj_trace.c', lj_src / 'src' / 'lj_asm.c',
-                     lj_src / 'src' / 'lj_asm_x86.h', lj_src / 'src' / 'lj_clib.c',
-                     lj_src / 'src' / 'lj_jit.h', lj_src / 'src' / 'luajit.c',
-                     lj_src / 'src' / 'lj_ffrecord.c'],
+  # The VM is built from the pristine pinned commit + the LIVE packagefiles
+  # overlay and patch (not Meson's setup-time-prepared copy, which never picks up
+  # later edits): every file under packagefiles/luajit, and the builder itself,
+  # is a build input -- editing any of them rebuilds the VM and so `curse`.
+  depend_files:     lj_overlay + files('tools' / 'build-luajit-vm.sh'),
   console:          true,
   build_by_default: true,
   install:          true,
@@ -107,7 +112,7 @@ run_lua  = find_program('tools' / 'run-lua.sh')
 test_env = environment()
 test_env.set('LUA_PATH', repo / 'lua' / '?.lua' + ';;')
 
-foreach t : ['test_cache', 'test_ext', 'test_forin', 'test_funcs', 'test_nested', 'test_tier']
+foreach t : ['test_build', 'test_cache', 'test_ext', 'test_forin', 'test_funcs', 'test_nested', 'test_sigjit', 'test_sigload', 'test_sigpreempt', 'test_tier']
   test(t, run_lua,
     args:    [luajit_bin, repo / 'lua' / (t + '.lua')],
     workdir: repo,
@@ -120,6 +125,15 @@ endforeach
 # The static self-contained `curse` as a shell (argv[0] sh/bash): its ffi.C resolves
 # through lib_cursesys.c's symbol table, not dlsym, and the corpora only exercise the
 # daemon — so check the table covers every ffi.C symbol and run external commands.
+# bash-UB cases (docs/bash-ub.md): curse's documented choice, pinned in every tier —
+# the oracle can't score these (bash itself varies there).
+test('ub-pins', files('test' / 'ub' / 'run.sh'),
+  args:    [luajit_bin, repo],
+  workdir: repo,
+  depends: [vm],
+  suite:   'unit',
+  timeout: 60)
+
 test('static-shell', files('test' / 'static-shell.sh'),
   args:    [luajit_bin, curse, repo],
   workdir: repo,
@@ -143,32 +157,54 @@ dash_prog = find_program('dash', required: false)
 conf = find_program('test' / 'conformance' / 'run.sh')
 conf_shells = dash_prog.found() ? 'dash,curse-cold,curse-hot' : 'curse-cold,curse-hot'
 
-# `cases` (curse's own scripts) needs no external corpus — always available.
+# `cases` (curse's own scripts) needs no external corpus, but it does need the oracle (below).
 # curse now runs via its daemon, so the tests need the built luajit + the module
 # bundle + the C client; depend on all three so `meson test` builds them itself.
 conf_deps = [vm, bundle, curse_client]
-test('conformance-cases', conf, args: ['--corpus', 'cases', '--shells', conf_shells],
-  suite: 'conformance', depends: conf_deps, workdir: repo, is_parallel: false, timeout: 0)
 
 # bash + oil corpora are Meson subprojects (bash: release tarball + checksum; oil:
 # pinned git, whose spec tests ship in no release tarball). Required by default: a
 # fetch failure is a HARD ERROR, not a soft skip. -Dconformance=disabled skips the
 # fetch for a lean/offline build; =auto makes it best-effort (non-fatal offline).
 conf_feat = get_option('conformance')
+# The ORACLE every corpus is scored against is bash built from the bash subproject
+# (5.2.21), never the host's bash: curse is bug-for-bug compatible with that exact
+# release, and the bash corpus is its own test suite. The harness refuses to run
+# against anything else (it checks $BASH_VERSION). So the bash subproject is needed
+# even for the cases corpus.
+bash_found = false
 if not conf_feat.disabled()
   bash_sp = subproject('bash', required: conf_feat)
   oil_sp  = subproject('oil',  required: conf_feat)
-  if bash_sp.found()
-    test('conformance-bash', conf,
-      args: ['--corpus', 'bash', '--bash-dir', bash_sp.get_variable('tests_dir'), '--shells', conf_shells],
-      suite: 'conformance', depends: conf_deps, workdir: repo, is_parallel: false, timeout: 0)
-  endif
+  bash_found = bash_sp.found()
+endif
+if bash_found
+  bash_src_dir = bash_sp.get_variable('tests_dir') / '..'
+  subdir('test' / 'oracle')
+  conf_deps += [oracle_bash]
+  oracle_args = ['--oracle', oracle_bash.full_path(), '-v']
+  test('conformance-cases', conf, args: ['--corpus', 'cases', '--shells', conf_shells] + oracle_args,
+    suite: 'conformance', depends: conf_deps, workdir: repo, is_parallel: false, timeout: 0)
+  test('conformance-bash', conf,
+    args: ['--corpus', 'bash', '--bash-dir', bash_sp.get_variable('tests_dir'), '--shells', conf_shells] + oracle_args,
+    suite: 'conformance', depends: conf_deps, workdir: repo, is_parallel: false, timeout: 0)
   if oil_sp.found()
     test('conformance-oil', conf,
-      args: ['--corpus', 'oil', '--oil-dir', oil_sp.get_variable('spec_dir'), '--shells', conf_shells],
+      args: ['--corpus', 'oil', '--oil-dir', oil_sp.get_variable('spec_dir'), '--shells', conf_shells] + oracle_args,
       suite: 'conformance', depends: conf_deps, workdir: repo, is_parallel: false, timeout: 0)
   endif
 endif
+
+# --- Stress suite (test/stress): signals, daemon concurrency, past flakes under load,
+#     tier agreement. SEPARATE and opt-in: the default setup excludes it, so a plain
+#     `meson test` never runs it; run it with `meson test -C build --suite stress`
+#     (or test/stress/run.sh directly, which takes the knobs: -n -j -l -d …).
+stress_env = environment()
+stress_env.set('STRESS_BUILD', meson.project_build_root())
+test('stress', files('test' / 'stress' / 'run.sh'),
+  suite: 'stress', depends: conf_deps, workdir: repo, env: stress_env,
+  is_parallel: false, timeout: 0)
+add_test_setup('default', exclude_suites: ['stress'], is_default: true)
 
 summary({'dash (extra column)': dash_prog.found(),
          'bash+oil corpora': not conf_feat.disabled()},

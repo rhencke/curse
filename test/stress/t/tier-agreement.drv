@@ -1,0 +1,43 @@
+#@ guards: tier agreement — random (and mutated) scripts from the corpora must give identical stdout+status in interp, compiled, tiered and the daemon (cold and warm): every disagreement is a curse bug, whatever bash says. Mutations wrap a script in a function, a subshell, $(…), eval, or a loop that runs it 120 times (so tiered switches to compiled code mid-run: OSR). The random seed is printed in the log and kept with any failure
+#@ duration: 240
+drv_main() {
+	local seed=${STRESS_SEED:-$(date +%s)}
+	RANDOM=$seed
+	echo "seed $seed (rerun: STRESS_SEED=$seed)"
+	local od=$REPO/subprojects/oil/spec pool=$TDIR/pool; mkdir -p "$pool/oil" "$TDIR/gen"
+	local f b
+	if [ -d "$od" ]; then
+		source "$HERE/t/flakes-oil.drv" # (for oil_extract)
+		for f in "$od"/*.test.sh; do b=$(basename "$f" .test.sh); oil_extract "$f" "$b" "$pool/oil"; done
+	fi
+	# nondeterministic or environment-dependent snippets can't be compared across shells
+	local -a cand=()
+	for f in "$pool"/oil/*.sh "$REPO"/test/cases/*.sh; do
+		grep -qE 'RANDOM|\$\$|BASHPID|PPID|SECONDS|EPOCH|date|sleep|ps |jobs|wait|&[[:space:]]*($|[^&>])|coproc|trap|kill|ulimit|times|/proc|hostname|THIS_SH|\$0|history|read -t|mktemp|TMPDIR|SHLVL' "$f" && continue
+		cand+=("$f")
+	done
+	echo "${#cand[@]} candidate scripts"
+	local n=$((ITERS * 15)) i
+	local -a muts=(none func subshell comsub eval hot)
+	for ((i = 0; i < n; i++)); do
+		past_deadline && break
+		f=${cand[RANDOM % ${#cand[@]}]}
+		local m=${muts[RANDOM % ${#muts[@]}]}
+		[ $m = hot ] && [[ $f == */test/cases/* ]] && m=func # (whole cases are too slow x120)
+		local g=$TDIR/gen/$i-$m-$(basename "$f")
+		case $m in
+		none) cp "$f" "$g" ;;
+		func) { echo '__stress_f() {'; cat "$f"; echo; echo '}'; echo '__stress_f "$@"'; } >"$g" ;;
+		subshell) { echo '('; cat "$f"; echo; echo ')'; } >"$g" ;;
+		comsub) { echo '__o=$('; cat "$f"; echo; echo '); __s=$?'; echo 'printf "%s\n[comsub status %s]\n" "$__o" "$__s"'; } >"$g" ;;
+		eval) { printf '__src=%q\n' "$(cat "$f")"; echo 'eval "$__src"'; } >"$g" ;;
+		hot) { echo '__stress_f() {'; cat "$f"; echo; echo '}'
+			echo 'for ((__k = 0; __k < 119; __k++)); do ( __stress_f ) >/dev/null 2>&1; done'; echo '( __stress_f )'; } >"$g" ;;
+		esac
+		while [ "$(jobs -rp | wc -l)" -ge "$JOBS" ]; do wait -n; done
+		( JOBS=1 O_LABEL=$i-$m-$(basename "$f" .sh) O_ITERS=1 O_ORACLE=none O_TIMEOUT=30 O_CWD= O_MODES= run_script_test "$g" ) &
+	done
+	wait
+	[ -e "$TDIR/failures" ] && echo "seed $seed" >"$TDIR/seed"
+	[ -e "$TDIR/failures" ] || rm -rf "$pool" "$TDIR/gen"
+}

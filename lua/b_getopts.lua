@@ -45,17 +45,12 @@ return function(sh, cmd, args, hook, tcb)
 	if cmd == "getopts" then
 		-- getopts OPTSTRING NAME [args…] (bash's getopts.def + sh_getopt): one option per call.
 		-- An option to getopts itself is a usage error (status 2); `--` ends them.
-		local a0 = 2
-		if args[2] == "--" then
-			a0 = 3
-		elseif args[2] and args[2]:match("^%-.") then
-			io.stderr:write("curse: getopts: " .. args[2]:sub(1, 2) .. ": invalid option\n")
-			io.stderr:write("getopts: usage: getopts optstring name [arg ...]\n")
-			sh.status = 2
+		local c, _, a0 = rt.getopt(sh, "getopts", args, "", 2)
+		if c then
 			return
 		end
 		if #args < a0 + 1 then
-			io.stderr:write("getopts: usage: getopts optstring name [arg ...]\n")
+			io.stderr:write(rt.usage("getopts"))
 			sh.status = 2
 			return
 		end

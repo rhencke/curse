@@ -4,7 +4,7 @@ local ffi = require("ffi")
 local rt = require("runtime")
 
 local function version()
-	return rt.L1("GNU bash, version %s (%s)\n", "5.2.37(1)-release", "x86_64-pc-linux-gnu")
+	return rt.L1("GNU bash, version %s (%s)\n", "5.2.21(1)-release", "x86_64-pc-linux-gnu")
 end
 
 -- bash's _() of a help text (lua/l10n.lua; only under a message locale with a catalog)
@@ -118,31 +118,14 @@ end
 
 return function(sh, cmd, args)
 	local dflag, mflag, sflag = false, false, false
-	local j = 2
-	while args[j] and args[j]:sub(1, 1) == "-" and args[j] ~= "-" do
-		local a = args[j]
-		j = j + 1
-		if a == "--" then
-			break
-		elseif a == "--help" then -- (GETOPT_HELP: the builtin's help, status 2)
-			return rt.builtin_help(sh, "help")
+	local j, sp, f, _ = 2
+	repeat
+		f, _, j, sp = rt.getopt(sh, "help", args, "dms", j, sp)
+		if f == "?" then
+			return
 		end
-		for k = 2, #a do
-			local f = a:sub(k, k)
-			if f == "d" then
-				dflag = true
-			elseif f == "m" then
-				mflag = true
-			elseif f == "s" then
-				sflag = true
-			else
-				io.stderr:write("curse: help: -" .. f .. ": invalid option\n")
-				io.stderr:write("help: usage: help [-dms] [pattern ...]\n")
-				sh.status = 2
-				return
-			end
-		end
-	end
+		dflag, mflag, sflag = dflag or f == "d", mflag or f == "m", sflag or f == "s"
+	until not f
 	local topics = require("helpdata")
 	loc = rt.l10n_active() and require("l10n") or nil
 	if not args[j] and loc then

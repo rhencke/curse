@@ -29,6 +29,7 @@ return function(sh, cmd, args, hook, tcb)
 		-- (bash: status 2, or 1 for `local`). export/readonly accept a narrower set.
 		local VALID = (cmd == "export" or cmd == "readonly") and "afnpA" or "aAcfFgGilnprtuxI"
 		local opterr, endopts, ro_n = nil, false, false
+		local opterr_sign = "-"
 		for j = 2, #args do
 			local a = args[j]
 			if endopts then -- (options end at `--` or the first operand: internal_getopt)
@@ -99,7 +100,22 @@ return function(sh, cmd, args, hook, tcb)
 				if a:find("t") then
 					tattr = true
 				end
+			elseif not endopts and a:sub(1, 1) == "+" and #a > 1 and not isdecl then
+				-- export/readonly read options with internal_getopt (list, "aAfnp"): no `+`
+				-- form, so a +word is the first operand (`+x': not a valid identifier)
+				rest[#rest + 1] = a
+				endopts = true
 			elseif not endopts and a:sub(1, 1) == "+" and #a > 1 then
+				for ci = 2, #a do -- (declare's "+acfinprtuxAFGgIl…": any other letter is invalid)
+					local ch = a:sub(ci, ci)
+					if not VALID:find(ch, 1, true) then
+						opterr, opterr_sign = ch, "+"
+						break
+					end
+				end
+				if opterr then
+					break
+				end
 				if a:find("n") then
 					plusn = true
 				end
@@ -136,13 +152,8 @@ return function(sh, cmd, args, hook, tcb)
 			plusattr = plusattr or {}
 			plusattr.l, plusattr.u, plusattr.c = true, true, true
 		end
-		if opterr == "--help" then
-			return rt.builtin_help(sh, cmd)
-		elseif opterr then -- an unknown attribute letter: bash prints usage and fails (status 2)
-			io.stderr:write("curse: " .. cmd .. ": -" .. opterr .. ": invalid option\n" .. rt.usage(cmd))
-			sh.status = 2
-			sh.spb_err = 2 -- (EX_USAGE: see rt.spb_run)
-			return
+		if opterr then -- an unknown attribute letter (or `--help`): usage, status 2
+			return rt.bad_option(sh, cmd, opterr_sign .. opterr, opterr)
 		end
 		if ro_n and #rest > 0 and not (funcnames or funcbody or printmode) then -- `readonly -n NAME[=V]`:
 			local st = 0 -- just the assignments, no attribute
@@ -321,7 +332,8 @@ return function(sh, cmd, args, hook, tcb)
 				return "declare -f" .. (fro[nm] and "r" or "") .. (ftr[nm] and "t" or "") .. (fx[nm] and "x" or "") .. " " .. nm
 			end
 			for _, nm in ipairs(names) do
-				if nm:find("=", 1, true) then -- (bash stops right there)
+				if named and (nm:find("^[%a_][%w_]*%+?=") or nm:find("^[%a_][%w_]*%b[]%+?=")) then -- (an assignment
+					-- word, NAME=…: bash stops right there; `a-b=c` is just a name)
 					io.stderr:write("curse: " .. cmd .. ": cannot use `-f' to make functions\n")
 					sh.status = 1
 					return
@@ -417,12 +429,31 @@ return function(sh, cmd, args, hook, tcb)
 				local own = sh.savedstack[sh.pd]
 				return own ~= nil and own[name] ~= nil
 			end
+			-- `declare NAME[SUB]=v` whose element assignment fails (an empty or @/* subscript):
+			-- bash's declare_internal has made NAME (local, for `local`) an indexed array
+			-- already — a scalar value becomes its [0], an array stays
+			local function mkarr_of(nm)
+				if localize then
+					sh:localVar(nm)
+				end
+				local dn = sh:deref(nm)
+				local pb = sh.vars[dn]
+				if pb and pb.arr then
+					return
+				end
+				pb = pb or {}
+				-- (a local's value is discarded — make_local_array_variable — unless -I inherits)
+				local had = pb.s ~= nil or pb.n ~= nil
+				local v0 = not (localize and not sh.local_inherit) and (pb.s or (pb.n and rt.i64_to_str(pb.n))) or nil
+				pb.arr, pb.s, pb.n, pb.empty_decl = v0 and { [0] = v0 } or {}, nil, nil, not had or nil
+				sh.vars[dn] = pb
+			end
 			for _, a in ipairs(rest) do
 				-- `declare -A c[200]` / `declare x[3]`: an element form with no value declares
 				-- the array itself (bash ignores the subscript)
 				local mkarr = false
 				if isdecl and not a:find("=", 1, true) then
-					local base = a:match("^([%a_][%w_]*)%[.*%]$")
+					local base = a:match("^([%a_][%w_]*)%[.+%]$") -- (`x[]`: not a valid identifier)
 					if base and nref then -- (`declare -n a[3]`)
 						io.stderr:write("curse: " .. cmd .. ": " .. a .. ": reference variable cannot be an array\n")
 						allok = false
@@ -900,6 +931,9 @@ return function(sh, cmd, args, hook, tcb)
 					-- bash creates the element for declare/typeset/local, but NOT via a
 					-- deferred `readonly a[i]=v` / `export a[i]=v` (those fail, status 1).
 					if anm and sub == "" then -- `declare a[]=x`
+						if isdecl then -- (declare_internal made the array before assigning)
+							mkarr_of(anm)
+						end
 						io.stderr:write("curse: " .. anm .. "[]: bad array subscript\n")
 						rt.report_exit(sh) -- (err_badarraysub: report_error)
 						badassign = true -- (declare.def assign_error: EX_BADASSIGN)
@@ -941,9 +975,13 @@ return function(sh, cmd, args, hook, tcb)
 						if assoc and not sh:is_assoc(anm) then -- (`declare -A m[k]=v` makes m assoc)
 							sh:declare_assoc(anm)
 						end
+						if localize and not assoc and not sh:is_assoc(anm) then
+							mkarr_of(anm) -- (make_local_array_variable: a scalar's value is dropped)
+						end
 						if (sub == "@" or sub == "*") and not sh:is_assoc(anm) then
 							-- (declare's ASS_ALLOWALLSUB: the element assignment fails, status 1,
 							-- but — unlike a plain `a[@]=x` — the line goes on)
+							mkarr_of(anm) -- (the array exists: declare_internal made it first)
 							io.stderr:write("curse: " .. anm .. "[" .. sub .. "]: bad array subscript\n")
 							rt.report_exit(sh) -- (err_badarraysub: report_error)
 							badassign = true
@@ -982,6 +1020,9 @@ return function(sh, cmd, args, hook, tcb)
 						local v0 = pb.s or (pb.n and rt.i64_to_str(pb.n)) -- (a scalar becomes [0]: bash)
 						pb.arr, pb.s, pb.n, pb.empty_decl = pb.arr or (v0 and { [0] = v0 }) or {}, nil, nil, v0 == nil or nil
 						sh.vars[sh:deref(pname)] = pb
+					end
+					if plusattr and plusattr.i and pname and sh:deref(pname) == "SECONDS" then
+						sh.sec_int = nil -- (+i drops the attribute get_seconds gave it, till the next read)
 					end
 					if pb and plusattr then
 						pb.int = not plusattr.i and pb.int or nil

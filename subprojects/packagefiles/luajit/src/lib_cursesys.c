@@ -21,6 +21,9 @@ extern char clock_gettime[];
 extern char close[];
 extern char closedir[];
 extern char confstr[];
+extern char curse_aopen_abandon[];
+extern char curse_aopen_result[];
+extern char curse_aopen_start[];
 extern char curse_ldfmt[];
 extern char curse_preempt_arm[];
 extern char curse_preempt_flagp[];
@@ -34,9 +37,12 @@ extern char dup2[];
 extern char endpwent[];
 extern char execve[];
 extern char fchdir[];
+extern char fchmod[];
 extern char fclose[];
 extern char fcntl[];
 extern char flock[];
+extern char fnmatch[];
+extern char fnmatch[];
 extern char fopen[];
 extern char fork[];
 extern char free[];
@@ -44,6 +50,7 @@ extern char fstat[];
 extern char get_nprocs[];
 extern char getcwd[];
 extern char getegid[];
+extern char getenv[];
 extern char geteuid[];
 extern char getgid[];
 extern char getgroups[];
@@ -73,6 +80,7 @@ extern char lstat[];
 extern char malloc[];
 extern char mbrtowc[];
 extern char mkdir[];
+extern char mkstemp[];
 extern char mmap[];
 extern char nl_langinfo[];
 extern char open[];
@@ -92,6 +100,8 @@ extern char posix_spawnattr_setflags[];
 extern char posix_spawnattr_setsigmask[];
 extern char posix_spawnp[];
 extern char ppoll[];
+extern char prctl[];
+extern char putenv[];
 extern char read[];
 extern char readdir[];
 extern char recvmsg[];
@@ -99,7 +109,9 @@ extern char regcomp[];
 extern char regexec[];
 extern char regfree[];
 extern char setenv[];
+extern char setitimer[];
 extern char setlocale[];
+extern char setpgid[];
 extern char setpwent[];
 extern char setrlimit[];
 extern char setsockopt[];
@@ -153,6 +165,9 @@ static const curse_sym_t curse_syms[] = {
   { "close", (void*)close },
   { "closedir", (void*)closedir },
   { "confstr", (void*)confstr },
+  { "curse_aopen_abandon", (void*)curse_aopen_abandon },
+  { "curse_aopen_result", (void*)curse_aopen_result },
+  { "curse_aopen_start", (void*)curse_aopen_start },
   { "curse_ldfmt", (void*)curse_ldfmt },
   { "curse_preempt_arm", (void*)curse_preempt_arm },
   { "curse_preempt_flagp", (void*)curse_preempt_flagp },
@@ -166,9 +181,12 @@ static const curse_sym_t curse_syms[] = {
   { "endpwent", (void*)endpwent },
   { "execve", (void*)execve },
   { "fchdir", (void*)fchdir },
+  { "fchmod", (void*)fchmod },
   { "fclose", (void*)fclose },
   { "fcntl", (void*)fcntl },
   { "flock", (void*)flock },
+  { "fnmatch", (void*)fnmatch },
+  { "fnmatch", (void*)fnmatch },
   { "fopen", (void*)fopen },
   { "fork", (void*)fork },
   { "free", (void*)free },
@@ -176,6 +194,7 @@ static const curse_sym_t curse_syms[] = {
   { "get_nprocs", (void*)get_nprocs },
   { "getcwd", (void*)getcwd },
   { "getegid", (void*)getegid },
+  { "getenv", (void*)getenv },
   { "geteuid", (void*)geteuid },
   { "getgid", (void*)getgid },
   { "getgroups", (void*)getgroups },
@@ -205,6 +224,7 @@ static const curse_sym_t curse_syms[] = {
   { "malloc", (void*)malloc },
   { "mbrtowc", (void*)mbrtowc },
   { "mkdir", (void*)mkdir },
+  { "mkstemp", (void*)mkstemp },
   { "mmap", (void*)mmap },
   { "nl_langinfo", (void*)nl_langinfo },
   { "open", (void*)open },
@@ -224,6 +244,8 @@ static const curse_sym_t curse_syms[] = {
   { "posix_spawnattr_setsigmask", (void*)posix_spawnattr_setsigmask },
   { "posix_spawnp", (void*)posix_spawnp },
   { "ppoll", (void*)ppoll },
+  { "prctl", (void*)prctl },
+  { "putenv", (void*)putenv },
   { "read", (void*)read },
   { "readdir", (void*)readdir },
   { "recvmsg", (void*)recvmsg },
@@ -231,7 +253,9 @@ static const curse_sym_t curse_syms[] = {
   { "regexec", (void*)regexec },
   { "regfree", (void*)regfree },
   { "setenv", (void*)setenv },
+  { "setitimer", (void*)setitimer },
   { "setlocale", (void*)setlocale },
+  { "setpgid", (void*)setpgid },
   { "setpwent", (void*)setpwent },
   { "setrlimit", (void*)setrlimit },
   { "setsockopt", (void*)setsockopt },

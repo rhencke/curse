@@ -4,7 +4,7 @@
 local ffi = require("ffi")
 local rt = require("runtime")
 local I = require("interp")._int
-local apply_redirs, restore_redirs, C = I.apply_redirs, I.restore_redirs, I.C
+local apply_redirs, C = I.apply_redirs, I.C
 
 -- bash's full_pathname (general.c): an absolute name as is, else under the (logical) cwd
 -- with a leading `./` dropped (sh_makepath's MP_DOCWD|MP_RMDOT)
@@ -91,7 +91,7 @@ return function(sh, st, args, hook, viacmd)
 		if not ok then -- (the builtin never runs; posix: a special builtin's redirection
 			-- error is fatal to a non-interactive shell — `command exec` only fails)
 			if type(sv) == "table" then
-				restore_redirs(sv)
+				rt.redir_undo(sv)
 			end
 			sh.status = 1
 			if sh.opt_posix and not viacmd and not sh.opt_i then
@@ -103,48 +103,14 @@ return function(sh, st, args, hook, viacmd)
 	-- exec [-cl] [-a name] [--] [cmd…]: -c empty environment, -l login ($0 gets a
 	-- leading -), -a NAME as $0. Another option (or -a without its NAME) is a usage
 	-- error (status 2) — the redirections persisting all the same.
-	local k, argv0, cflag, lflag = 2, nil, false, false
-	local bad
-	while not bad and args[k] and args[k]:sub(1, 1) == "-" and args[k] ~= "-" do
-		local a = args[k]
-		k = k + 1
-		if a == "--" then
-			break
-		elseif a == "--help" then -- (CASE_HELPOPT: the help, then as a usage error)
-			rt.builtin_help(sh, "exec")
-			bad = ""
-			break
-		end
-		local j = 2
-		while j <= #a do
-			local f = a:sub(j, j)
-			if f == "c" then
-				cflag = true
-			elseif f == "l" then
-				lflag = true
-			elseif f == "a" then
-				if j < #a then
-					argv0 = a:sub(j + 1)
-				elseif args[k] ~= nil then
-					argv0 = args[k]
-					k = k + 1
-				else
-					bad = "curse: exec: -a: option requires an argument\n"
-				end
-				break
-			else
-				bad = "curse: exec: -" .. f .. ": invalid option\n"
-				break
-			end
-			j = j + 1
-		end
-	end
-	if bad then
-		if bad ~= "" then -- ("": `--help`, already shown)
-			io.stderr:write(bad .. rt.usage("exec"))
-		end
+	local argv0, cflag, lflag, k, sp, f, v = nil, false, false, 2
+	repeat
+		f, v, k, sp = rt.getopt(sh, "exec", args, "cla:", k, sp)
+		cflag, lflag, argv0 = cflag or f == "c", lflag or f == "l", v or argv0
+	until not f or f == "?"
+	if f then -- (reported: `--help` too, then as a usage error)
 		if type(sv) == "table" then -- (they stay even so: execute_builtin_or_function drops
-			rt.redir_discard(sv) -- exec's undo list before exec_builtin runs at all)
+			rt.redir_discard(sv, sh) -- exec's undo list before exec_builtin runs at all)
 		end
 		sh.status = 2
 		if sh.opt_posix and not viacmd and not sh.opt_i then -- (EX_USAGE: rt.spb_run's rule)
@@ -153,7 +119,7 @@ return function(sh, st, args, hook, viacmd)
 		return
 	end
 	if type(sv) == "table" then -- the redirections persist: the saved originals are dropped
-		rt.redir_discard(sv)
+		rt.redir_discard(sv, sh)
 	end
 	if k > #args then
 		sh.status = 0

@@ -1,4 +1,4 @@
--- Lazily-loaded feature: the `echo` builtin. Its own tiny module (not b_rare) so a
+-- Lazily-loaded feature: the `echo` builtin. Its own tiny module so a
 -- cold `echo` script loads only these ~15 lines, nothing else. See BUILTIN_LAZY.
 local rt = require("runtime")
 

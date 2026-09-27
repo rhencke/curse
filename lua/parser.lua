@@ -117,7 +117,7 @@ local function arith(src, nodefer)
 	-- ahead, and each check here looks at the next token after skip()). An error names
 	-- the text from there on: `4+` -> operand expected (error token is "+").
 	local lasttp
-	local etxt = src:gsub("^%s+", "") -- (the expression as bash's errors print it)
+	local etxt = src:gsub("^[ \t]+", "") -- (the expression as bash's errors print it)
 	local function skip() -- (expr.c's cr_whitespace: blank, tab, newline — not \r, \f, \v)
 		local c = src:byte(i)
 		while c == 32 or c == 9 or c == 10 do
@@ -498,7 +498,7 @@ local function arith(src, nodefer)
 				left.etxt, left.etok = etxt, lasttp and src:sub(lasttp) or ""
 			elseif op == "/" or op == "%" then
 				-- (a division by 0 names the text from the divisor on: expmuldiv's lasttp = stp)
-				left.etxt, left.etok = etxt, (src:sub(stp):gsub("^%s+", ""))
+				left.etxt, left.etok = etxt, (src:sub(stp):gsub("^[ \t]+", ""))
 			elseif (op == "&&" or op == "||") and npow > np then
 				left.rpow = true -- (a skipped right operand still checks its exponents: see eval)
 			end
@@ -571,7 +571,7 @@ local function shown(s, subscript)
 	return subscript and (s:gsub("\\([$`\"'~])", "%1")) or s
 end
 function M.arith_errmsg(expr, err, subscript)
-	local t = shown(tostring(type(err) == "table" and err.expr or expr or ""):gsub("^%s+", ""), subscript)
+	local t = shown(tostring(type(err) == "table" and err.expr or expr or ""):gsub("^[ \t]+", ""), subscript)
 	local pre = M.arith_cmd and (M.arith_cmd .. ": ") or ""
 	if type(err) == "table" and err.msg then
 		return pre .. t .. ": " .. err.msg .. ' (error token is "' .. shown(err.tok or "", subscript) .. '")'
@@ -580,69 +580,11 @@ function M.arith_errmsg(expr, err, subscript)
 end
 
 -- ---- statement parser ----
--- Captures a balanced `((` … `))` starting just after the opening `((`.
--- Grab the body of `$((…))` / `((…))` starting just after the opening `((`.
--- Counts single parens: the closing `))` is the first `)` seen at content-paren
--- depth 0 (its partner is the next char). This correctly handles nested `$( )`
--- command subs and `$(( ))` inside the arithmetic (their inner parens balance).
-local function grab_dparen(src, i)
-	local start, d = i, 0
-	while i <= #src do
-		local c = src:sub(i, i)
-		if c == "(" then
-			d = d + 1
-			i = i + 1
-		elseif c == ")" then
-			if d == 0 then
-				return src:sub(start, i - 1), i + 2
-			end -- the closing `))`
-			d = d - 1
-			i = i + 1
-		else
-			i = i + 1
-		end
-	end
-	error("unterminated ((")
-end
 
 -- Parse the inside of ${ … } into a word part. Plain forms stay {var}/{param}/
 -- {special}; anything with an operator becomes {pexp={name, op, arg, arg2}} which
 -- Shell:expand_param interprets. `arg`/`arg2` are raw text (the caller expands
 -- them before applying the operator, so ${v:-$x} and pattern vars work).
--- Split ${v/pat/repl} into pat, repl. The separator is the first `/` that is
--- NOT at position 1 (bash treats a `/` right after the operator as pattern text,
--- so ${x////c} is pat=`/` repl=`c`), NOT backslash-escaped, and NOT inside
--- single/double quotes. No separator -> the whole thing is the pattern.
-local function split_subst(s)
-	local i, n, q = 1, #s, nil
-	while i <= n do
-		local c = s:sub(i, i)
-		if q == "'" then -- (a backslash in '…' is literal: `${x/'\'/Z}`)
-			if c == q then
-				q = nil
-			end
-			i = i + 1
-		elseif c == "\\" then
-			i = i + 2
-		elseif q then
-			if q == "$" and c == "'" or q ~= "$" and c == q then
-				q = nil
-			end
-			i = i + 1
-		elseif c == "'" and s:sub(i - 1, i - 1) == "$" then
-			q = "$" -- $'…': a backslash escapes in it (`${v/$'\''/x}`)
-			i = i + 1
-		elseif c == "'" or c == '"' then
-			q = c
-			i = i + 1
-		elseif c == "/" and i > 1 then
-			return s:sub(1, i - 1), s:sub(i + 1)
-		else
-			i = i + 1
-		end
-	end
-	return s, ""
-end
 -- Scan a ${…} starting at the `{` (index `bi`) in `s`, returning the index just
 -- past the matching `}`. Respects backslash escapes, '…'/"…" quoting (so a `}`
 -- inside quotes doesn't close), and nested `{…}` — unlike a naive find("}").
@@ -664,10 +606,22 @@ local function comsub_syntax(body, xg)
 		if hit == "?" then
 			return nil, true
 		end
+		if hit then
+			local m, l = hit:match("^(.*)\1(%d+)$")
+			if m then
+				return m, false, tonumber(l)
+			end
+		end
 		return hit or nil, false
 	end
-	local err, guessed = false, false
+	local err, guessed, eline = false, false, nil
+	-- (bash's parse_comsub reads the whole body under the extglob state of the moment: a
+	-- `shopt -s extglob` in it takes effect only when it runs — M.xg_fixed stops the static
+	-- tracking of it for this parse)
+	local sxf = M.xg_fixed
+	M.xg_fixed = true
 	local ok, ast = pcall(M.parse, body, nil, nil, nil, nil, nil, nil, xg)
+	M.xg_fixed = sxf
 	if not ok then
 		err = type(ast) == "table" and (ast.msg or "syntax error") or tostring(ast)
 		guessed = xg == nil and body:find("[@!+*?]%(") ~= nil
@@ -676,6 +630,11 @@ local function comsub_syntax(body, xg)
 		for _, st in ipairs(ast.stmts) do
 			if st.t == "parse_error" and not st.recoverable then
 				err = tostring(st.msg or "syntax error")
+				eline = st.line -- (the body's line holding the error: bash reports it there;
+				local nl = select(2, body:gsub("\n", "")) + 1 -- an error at the body's end
+				if eline and eline > nl then -- is at its closing `)`, on its last line)
+					eline = nl
+				end
 				break
 			end
 		end
@@ -693,25 +652,76 @@ local function comsub_syntax(body, xg)
 	if comsub_err_n >= 512 then
 		comsub_err_cache, comsub_err_n = {}, 0
 	end
-	comsub_err_cache[key] = guessed and "?" or err
+	comsub_err_cache[key] = guessed and "?" or (err and eline and (err .. "\1" .. eline)) or err
 	comsub_err_n = comsub_err_n + 1
 	if guessed then
 		return nil, true
 	end
-	return err or nil, false
+	return err or nil, false, err and eline
 end
-local dparen_is_arith -- forward (defined below)
--- (scan_braces: skip to just past the closing quote `q`, honoring \ when `esc`; running off
--- the end inside a quote names that quote)
-local function skip_to(s, i, ns, q, esc)
-	while i <= ns and s:sub(i, i) ~= q do
-		i = i + ((esc and s:sub(i, i) == "\\") and 2 or 1)
-	end
-	if i > ns then
-		error("unexpected EOF while looking for matching `" .. q .. "'")
-	end
-	return i + 1
+local dparen_is_arith, grab_dparen -- forward (defined below)
+-- ---- the scanning primitives: where does the construct starting at s[i] end? ----
+-- (parse.y reads all of these with parse_matched_pair / parse_comsub; a scanner in this file
+-- that skips a quoted string or an expansion asks them rather than hand-writing the loop —
+-- except where bash's rule differs: brace_skip's "…" (only a $( … ) nests: braces.c), $[ … ]
+-- (brackets merely counted), and dequote_word, which rebuilds the text as it goes.) Each
+-- returns the index just PAST the construct; one left open runs past the end (>= #s + 2),
+-- or — `err` — raises bash's EOF error naming the quote.
+-- A quoted string: s[i] is its opening quote, closed by the same byte. `esc`: a `\` escapes
+-- the next byte ("…" without nesting, `…`, and a $'…' from its `'`); '…' has no escapes.
+-- A syntax error raised with error() carries the Lua position of the raise (this chunk's
+-- short_src:line — a checkout path in a dev run): not part of the message, and it would
+-- make compiled code (which embeds the message) depend on where curse was built.
+local POS = "^" .. debug.getinfo(1, "S").short_src:gsub("%p", "%%%0") .. ":%d+: "
+local function unpos(m)
+	return (m:gsub(POS, "", 1))
 end
+
+-- Every "unexpected EOF while looking for matching `X'" is raised here, noting where the
+-- open construct began: bash reports it at THAT line (parse_matched_pair's start_lineno —
+-- the quote's, not the command's), which next_line derives from the noted position.
+local eof_s, eof_at
+local function eof_error(s, at, close)
+	eof_s, eof_at = s, at
+	error("unexpected EOF while looking for matching `" .. close .. "'")
+end
+local function quote_end(s, i, esc, err)
+	local q, k, n = s:byte(i), i + 1, #s
+	while k <= n do
+		local b = s:byte(k)
+		if b == q then
+			return k + 1
+		end
+		k = k + ((esc and b == 92) and 2 or 1)
+	end
+	if err then
+		eof_error(s, i, string.char(q))
+	end
+	return k + 1
+end
+-- Split ${v/pat/repl} into pat, repl. The separator is the first `/` that is
+-- NOT at position 1 (bash treats a `/` right after the operator as pattern text,
+-- so ${x////c} is pat=`/` repl=`c`), NOT backslash-escaped, and NOT inside
+-- single/double quotes. No separator -> the whole thing is the pattern.
+local function split_subst(s)
+	local i, n = 1, #s
+	while i <= n do
+		local c = s:sub(i, i)
+		if c == "\\" then
+			i = i + 2
+		elseif c == "'" then -- (a backslash in '…' is literal: `${x/'\'/Z}`; in $'…' it
+			i = quote_end(s, i, s:sub(i - 1, i - 1) == "$") -- escapes: `${v/$'\''/x}`)
+		elseif c == '"' then
+			i = quote_end(s, i, true)
+		elseif c == "/" and i > 1 then
+			return s:sub(1, i - 1), s:sub(i + 1)
+		else
+			i = i + 1
+		end
+	end
+	return s, ""
+end
+local dq_end, expansion_end, subscript_close -- forward (defined past scan_cmdsub)
 local function scan_braces(s, bi, dq)
 	local i, ns, depth = bi + 1, #s, 1
 	local sq_lit = dq and POSIX_DQ
@@ -720,14 +730,11 @@ local function scan_braces(s, bi, dq)
 		if c == "\\" then
 			i = i + 2
 		elseif c == "$" and s:sub(i + 1, i + 1) == "'" then -- $'…': a \' inside doesn't close it
-			i = i + 2
-			i = skip_to(s, i, ns, "'", true)
+			i = quote_end(s, i + 1, true, true)
 		elseif c == "'" and not sq_lit then
-			i = i + 1
-			i = skip_to(s, i, ns, "'", false)
+			i = quote_end(s, i, false, true)
 		elseif c == '"' then
-			i = i + 1
-			i = skip_to(s, i, ns, '"', true)
+			i = quote_end(s, i, true, true)
 		elseif c == "{" then
 			-- only a nested `${` opens a level; a bare `{` is an ordinary char, so
 			-- `${X//a/{x,y,z}}` ends at the FIRST `}` (bash: replacement `{x,y,z`, then `}`)
@@ -738,8 +745,7 @@ local function scan_braces(s, bi, dq)
 		elseif c == "$" and s:sub(i + 1, i + 1) == "(" then
 			i = scan_cmdsub(s, i + 2) -- a `}` inside $(…) doesn't close (unclosed: its error)
 		elseif c == "`" then -- …nor one inside `…`
-			i = i + 1
-			i = skip_to(s, i, ns, "`", true)
+			i = quote_end(s, i, true, true)
 		elseif c == "}" then
 			depth = depth - 1
 			i = i + 1
@@ -748,7 +754,7 @@ local function scan_braces(s, bi, dq)
 		end
 	end
 	if depth > 0 then
-		error("unexpected EOF while looking for matching `}'")
+		eof_error(s, bi, "}")
 	end
 	return i
 end
@@ -772,12 +778,9 @@ parse_paramexp = function(inner)
 		end
 		-- a $'…' name is quote-removed first (bash: `${$'x1'%t}` is `${x1%t}`)
 		if inner:sub(1, 2) == "$'" then
-			local k = 3
-			while k <= #inner and inner:sub(k, k) ~= "'" do
-				k = k + (inner:sub(k, k) == "\\" and 2 or 1)
-			end
-			if k <= #inner then
-				return parse_paramexp(require("runtime").ansi_unescape(inner:sub(3, k - 1), true) .. inner:sub(k + 1))
+			local e = quote_end(inner, 2, true)
+			if e <= #inner + 1 then
+				return parse_paramexp(require("runtime").ansi_unescape(inner:sub(3, e - 2), true) .. inner:sub(e))
 			end
 		end
 	end
@@ -870,30 +873,8 @@ parse_paramexp = function(inner)
 	-- optional [subscript]
 	local index = nil
 	if rest:sub(1, 1) == "[" then
-		-- balance nested brackets so `${a[a[0]]}` takes `a[0]` as the subscript, not `a[0`;
-		-- a quoted or escaped `]` doesn't close it (`${m["a]a"]}`, `${m[\]]}`)
-		local depth, close, k = 0, nil, 1
-		while k <= #rest do
-			local ch = rest:sub(k, k)
-			if ch == "\\" then
-				k = k + 1
-			elseif (ch == "'" or ch == '"') and depth > 0 then
-				local e = rest:find(ch, k + 1, true)
-				while e and ch == '"' and rest:sub(e - 1, e - 1) == "\\" do
-					e = rest:find(ch, e + 1, true)
-				end
-				k = e or #rest
-			elseif ch == "[" then
-				depth = depth + 1
-			elseif ch == "]" then
-				depth = depth - 1
-				if depth == 0 then
-					close = k
-					break
-				end
-			end
-			k = k + 1
-		end
+		-- (`${a[a[0]]}` takes `a[0]` as the subscript, not `a[0`; `${m[\]]}`)
+		local close = subscript_close(rest, 1)
 		if close then
 			index = rest:sub(2, close - 1)
 			rest = rest:sub(close + 1)
@@ -941,7 +922,7 @@ parse_paramexp = function(inner)
 			return { param = tonumber(name), braced = true } -- (set -u names it `9`, not `$9`)
 		end
 		if name == "@" or name == "*" then
-			return { special = name }
+			return { special = name, braced = true }
 		end
 		return { var = name }
 	end
@@ -1001,11 +982,8 @@ parse_paramexp = function(inner)
 			local ch = body:sub(k, k)
 			if ch == "\\" then
 				k = k + 2
-			elseif ch == "$" and body:sub(k + 1, k + 1) == "{" then
-				k = scan_braces(body, k + 1) -- a nested ${…}'s `:` isn't the separator
-			elseif ch == "$" and body:sub(k + 1, k + 1) == "(" then
-				local ok, nk = pcall(scan_cmdsub, body, k + 2)
-				k = ok and nk or k + 1
+			elseif ch == "$" then -- (a nested ${…}/$(…)'s `:` isn't the separator)
+				k = expansion_end(body, k, false, true)
 			elseif ch == "?" then
 				skipcol = skipcol + 1
 				k = k + 1
@@ -1047,17 +1025,6 @@ scan_cmdsub = function(src, j, onwarn)
 	local wstart = true -- next char begins a word (for `#` comments and keywords)
 	local hdp = {} -- heredocs opened on the current line: { delim, strip }
 	local i = j
-	local function skipq(close, esc) -- skip from a quote at i to just past `close` (`esc`: honor `\`)
-		local k = i + 1
-		while k <= n and src:sub(k, k) ~= close do
-			if esc and src:sub(k, k) == "\\" then
-				k = k + 2
-			else
-				k = k + 1
-			end
-		end
-		return k + 1
-	end
 	while i <= n do
 		local c = src:sub(i, i)
 		if c == "\n" and #hdp > 0 then
@@ -1074,7 +1041,7 @@ scan_cmdsub = function(src, j, onwarn)
 							onwarn(rpos, n, hd.delim)
 						end
 						comsub_eof = true
-						error("unexpected EOF while looking for matching `)'")
+						eof_error(src, j, ")")
 					end
 					local le = src:find("\n", i, true) or (n + 1)
 					local lstr = src:sub(i, le - 1)
@@ -1134,66 +1101,24 @@ scan_cmdsub = function(src, j, onwarn)
 				i = i + (src:sub(i, i + 1) == "|&" and 2 or 1)
 				wstart = true
 			end
-		elseif c == "'" then
-			i = skipq("'")
+		elseif c == "'" then -- (a quote left open names itself: `$(echo "x` -> matching `"')
+			i = quote_end(src, i, false, true)
 			wstart = false
 			patstart = false
 		elseif c == "$" and src:sub(i + 1, i + 1) == "'" then
-			i = i + 1
-			i = skipq("'", true) -- only $'…' has backslash escapes
+			i = quote_end(src, i + 1, true, true) -- only $'…' has backslash escapes
 			wstart = false
 			patstart = false
 		elseif c == '"' then
-			i = i + 1
-			while i <= n and src:sub(i, i) ~= '"' do
-				local d = src:sub(i, i)
-				if d == "\\" then
-					i = i + 2
-				elseif d == "$" and src:sub(i + 1, i + 2) == "((" then
-					local _, ni = grab_dparen(src, i + 3)
-					i = ni
-				elseif d == "$" and src:sub(i + 1, i + 1) == "(" then
-					i = scan_cmdsub(src, i + 2, onwarn)
-				elseif d == "$" and src:sub(i + 1, i + 1) == "{" then
-					i = scan_braces(src, i + 1, true)
-				elseif d == "`" then
-					i = i + 1
-					while i <= n and src:sub(i, i) ~= "`" do
-						i = i + (src:sub(i, i) == "\\" and 2 or 1)
-					end
-					i = i + 1
-				else
-					i = i + 1
-				end
-			end
-			i = i + 1
+			i = dq_end(src, i, false, onwarn)
 			wstart = false
 			patstart = false
-		elseif c == "`" then
-			i = i + 1
-			while i <= n and src:sub(i, i) ~= "`" do
-				i = i + (src:sub(i, i) == "\\" and 2 or 1)
-			end
-			i = i + 1
+		elseif c == "`" or c == "$" and src:find("^[({]", i + 1) then
+			i = expansion_end(src, i, false, false, onwarn)
 			wstart = false
 			patstart = false
-		elseif c == "$" and src:sub(i + 1, i + 2) == "((" then
-			local _, ni = grab_dparen(src, i + 3)
-			i = ni
-			wstart = false
-			patstart = false
-		elseif c == "$" and src:sub(i + 1, i + 1) == "(" then
-			i = scan_cmdsub(src, i + 2, onwarn)
-			wstart = false
-			patstart = false
-		elseif c == "$" and src:sub(i + 1, i + 1) == "{" then
-			i = scan_braces(src, i + 1)
-			wstart = false
-			patstart = false
-		elseif c == "#" and wstart then
-			while i <= n and src:sub(i, i) ~= "\n" do
-				i = i + 1
-			end -- comment to end of line
+		elseif c == "#" and wstart then -- comment to end of line
+			i = src:find("\n", i, true) or n + 1
 		elseif c == "(" then
 			if cst[#cst] == "pat" then
 				if patstart then
@@ -1246,7 +1171,7 @@ scan_cmdsub = function(src, j, onwarn)
 					end
 					k = k + 2
 				elseif ch == "'" or ch == '"' then
-					local e = src:find(ch, k + 1, true) or n
+					local e = quote_end(src, k) - 1 -- (the closing quote; quote removal)
 					d[#d + 1] = src:sub(k + 1, e - 1)
 					k = e + 1
 				elseif ch:match("^[ \t\n;&|()<>]$") then
@@ -1288,43 +1213,175 @@ scan_cmdsub = function(src, j, onwarn)
 		end
 	end
 	comsub_eof = src:sub(j, j) ~= "(" -- (`$((` unclosed: arithmetic, reported where it began)
-	error("unexpected EOF while looking for matching `)'") -- unclosed $(
+	eof_error(src, j, ")") -- unclosed $(
 end
 
--- `$((` is arithmetic ONLY when it's a balanced `$(( expr ))` — the paren balance
--- first returns to 0 at a `)` immediately followed by another `)`. Otherwise the
--- first `(` opened a subshell (`$( (…) )`, #2337). Quote-aware.
-dparen_is_arith = function(w, j0)
-	local depth, j, n = 0, j0, #w
+-- The ONE end rule for a `((`/`$((` body starting at s[j]: the first `)` at paren depth 0
+-- (bash reads it with parse_matched_pair, so parens inside quotes and nested expansions
+-- don't count: `$(( ${x:-")"} + 1 ))`). Returns that index, or nil and the depth still open
+-- when the text ran out.
+local function dparen_close(s, j)
+	local d, n = 0, #s
 	while j <= n do
-		local c = w:sub(j, j)
-		if c == "\\" then
+		local b = s:byte(j)
+		if b == 92 then -- \
 			j = j + 2
-		elseif c == "'" or c == '"' then
-			local q = c
+		elseif b == 39 then -- '
+			j = quote_end(s, j, false)
+		elseif b == 34 then -- "
+			j = dq_end(s, j, true)
+		elseif b == 36 and s:byte(j + 1) == 39 then -- $'…'
+			j = quote_end(s, j + 1, true)
+		elseif b == 36 or b == 96 then -- $… `…`
+			j = expansion_end(s, j, false, true)
+		elseif b == 40 then
+			d = d + 1
 			j = j + 1
-			while j <= n and w:sub(j, j) ~= q do
-				if w:sub(j, j) == "\\" and q == '"' then
-					j = j + 2
-				else
-					j = j + 1
-				end
+		elseif b == 41 then
+			if d == 0 then
+				return j
 			end
-			j = j + 1
-		elseif c == "(" then
-			depth = depth + 1
-			j = j + 1
-		elseif c == ")" then
-			if depth == 0 then
-				return w:sub(j + 1, j + 1) == ")"
-			end
-			depth = depth - 1
+			d = d - 1
 			j = j + 1
 		else
 			j = j + 1
 		end
 	end
-	return false
+	return nil, d
+end
+-- `$((` is arithmetic ONLY when it's a balanced `$(( expr ))` — the body's close is
+-- immediately followed by another `)`. Otherwise the first `(` opened a subshell
+-- (`$( (…) )`, #2337).
+dparen_is_arith = function(w, j0)
+	local c = dparen_close(w, j0)
+	return c ~= nil and w:byte(c + 1) == 41
+end
+-- The body of `$((…))` / `((…))` starting just after the opening `((`, and the index past
+-- its closing `))` (past `)` + 1 when a lone `)` closed it: `for ((…)` checks).
+grab_dparen = function(src, i)
+	local c = dparen_close(src, i)
+	if not c then
+		comsub_eof = false -- (reported at the line it began on)
+		eof_error(src, i - 2, ")")
+	end
+	return src:sub(i, c - 1), c + 2
+end
+
+-- A $( … ) whose body may not parse (a word re-read at run time, a pattern): the scanner's
+-- end, else the parens merely counted (j: just past the `$(`)
+local function cmdsub_end_lenient(s, j)
+	local ok, e = pcall(scan_cmdsub, s, j)
+	if ok then
+		return e
+	end
+	local d, n = 1, #s
+	while j <= n do
+		local b = s:byte(j)
+		if b == 40 then
+			d = d + 1
+		elseif b == 41 then
+			d = d - 1
+			if d == 0 then
+				return j + 1
+			end
+		end
+		j = j + 1
+	end
+	return n + 2
+end
+-- The `]` matching the `[` at s[i] (a $[ … ] legacy arithmetic: brackets merely counted), or #s + 1
+local function bracket_close(s, i)
+	local d, n = 0, #s
+	while i <= n do
+		local b = s:byte(i)
+		if b == 91 then
+			d = d + 1
+		elseif b == 93 then
+			d = d - 1
+			if d == 0 then
+				return i
+			end
+		end
+		i = i + 1
+	end
+	return n + 1
+end
+-- An expansion: s[i] is a `$` or a backquote — $(( )), $( ), ${ }, $[ ], `…`; any other `$`
+-- is just itself (i + 1). dq: inside "…" (scan_braces' posix `'` rule); lenient: an
+-- unparsable $( … ) is paren-counted and an open `…` runs to the end (else their errors);
+-- onwarn: scan_cmdsub's.
+expansion_end = function(s, i, dq, lenient, onwarn)
+	local b = s:byte(i + 1)
+	if s:byte(i) == 96 then
+		return quote_end(s, i, true, not lenient)
+	elseif b == 40 then
+		if s:byte(i + 2) == 40 and dparen_is_arith(s, i + 3) then
+			local _, e = grab_dparen(s, i + 3)
+			return e
+		end
+		if lenient then
+			return cmdsub_end_lenient(s, i + 2)
+		end
+		return scan_cmdsub(s, i + 2, onwarn)
+	elseif b == 123 then
+		return scan_braces(s, i + 1, dq)
+	elseif b == 91 then
+		return bracket_close(s, i + 1) + 1
+	end
+	return i + 1
+end
+-- A "…": s[i] is its opening quote. `\` escapes; a nested expansion keeps its own quoting
+-- (`"$(echo ")")"`), so its `"` doesn't close this one. (lenient: as expansion_end's, and
+-- an open "…" isn't an error either)
+dq_end = function(s, i, lenient, onwarn)
+	local n, q = #s, i
+	i = i + 1
+	while i <= n do
+		local b = s:byte(i)
+		if b == 34 then
+			return i + 1
+		elseif b == 92 then
+			i = i + 2
+		elseif b == 36 or b == 96 then
+			i = expansion_end(s, i, true, lenient, onwarn)
+		else
+			i = i + 1
+		end
+	end
+	if not lenient then
+		eof_error(s, q, '"')
+	end
+	return i + 1
+end
+-- The `]` closing the subscript `[` at s[i], or nil: brackets nest (`a[a[0]]`), and a `]`
+-- that is escaped, quoted or inside a $(…)/${…} doesn't close it (`A[']']`, `${m["a]a"]}`,
+-- `a[$(echo ])]`) — bash's skipsubscript. Never raises: the text may be a runtime value.
+subscript_close = function(s, i)
+	local d, n = 0, #s
+	while i <= n do
+		local b = s:byte(i)
+		if b == 92 then -- \
+			i = i + 2
+		elseif b == 39 then -- '
+			i = quote_end(s, i, false)
+		elseif b == 34 then -- "
+			i = dq_end(s, i, true)
+		elseif b == 36 and (s:byte(i + 1) == 40 or s:byte(i + 1) == 123) then -- $( ${
+			local ok, e = pcall(expansion_end, s, i, false, true)
+			i = ok and e or i + 1
+		else
+			if b == 91 then
+				d = d + 1
+			elseif b == 93 then
+				d = d - 1
+				if d == 0 then
+					return i
+				end
+			end
+			i = i + 1
+		end
+	end
+	return nil
 end
 
 -- Parse a $… expansion at position i of string w; add(part) tagging it with the
@@ -1339,19 +1396,7 @@ local function parse_dollar(w, i, add, q)
 		add({ arith = body, q = q })
 		return ni
 	elseif nx == "[" then -- $[expr]: deprecated arithmetic, an alias of $(( ))
-		local depth, j = 1, i + 2
-		while j <= #w do
-			local c2 = w:sub(j, j)
-			if c2 == "[" then
-				depth = depth + 1
-			elseif c2 == "]" then
-				depth = depth - 1
-				if depth == 0 then
-					break
-				end
-			end
-			j = j + 1
-		end
+		local j = bracket_close(w, i + 1)
 		add({ arith = w:sub(i + 2, j - 1), q = q, bracket = true })
 		return j + 1
 	elseif nx == "(" then
@@ -1371,25 +1416,13 @@ local function parse_dollar(w, i, add, q)
 		return i + 1
 	elseif nx == "'" then
 		-- $'…' ANSI-C quoting: a literal string with backslash escapes, no expansion.
-		local j, buf = i + 2, {}
-		while j <= #w do
-			local c2 = w:sub(j, j)
-			if c2 == "\\" then
-				buf[#buf + 1] = w:sub(j, j + 1)
-				j = j + 2
-			elseif c2 == "'" then
-				break
-			else
-				buf[#buf + 1] = c2
-				j = j + 1
-			end
-		end
-		local raw = table.concat(buf)
+		local j = quote_end(w, i + 1, true)
+		local raw = w:sub(i + 2, j - 2)
 		-- (a \u/\U code point is encoded in the locale current when the line is parsed —
 		-- `ansic` keeps the source so the compiled tier encodes it when the line runs)
 		add({ lit = require("runtime").ansi_unescape(raw, true), q = true,
 			ansic = raw:find("\\[uU]%x") and raw or nil })
-		return j + 1
+		return j
 	elseif nx == "{" then
 		-- find the MATCHING } — honoring \-escapes, '…'/"…" quoting, and nested ${…}
 		-- so `${var#\}}`, `${var-'}'}`, `${a:-${b}}` take the right inner text.
@@ -1421,6 +1454,64 @@ end
 -- heredoc: a heredoc body (`"` is ordinary, `\"` stays). bt_keep: a `\"` inside a
 -- `…` stays too — true for a heredoc body AND for a prompt string (bash expands both
 -- with Q_DOUBLE_QUOTES, which unwraps `\"` only in a real "…" word's backquotes).
+-- A `…` command substitution's body, from its opening backquote at s[i], and the index just
+-- past it: a `\` before a char of the class `unesc` is removed, a \<newline> is dropped
+-- (even inside its '…' — POSIX), any other `\` stays.
+local function bq_body(s, i, unesc)
+	local j, buf, n = i + 1, {}, #s
+	while j <= n and s:byte(j) ~= 96 do
+		local nx = s:sub(j + 1, j + 1)
+		if s:byte(j) == 92 and nx == "\n" then
+			j = j + 2
+		elseif s:byte(j) == 92 and nx:match(unesc) then
+			buf[#buf + 1] = nx
+			j = j + 2
+		else
+			buf[#buf + 1] = s:sub(j, j)
+			j = j + 1
+		end
+	end
+	return table.concat(buf), j + 1
+end
+-- A "…" ${NAME-WORD} (also :- = := ? :? + :+) whose WORD holds a $'…' decoding to a NUL:
+-- bash translates that $'…' as it reads the word (parse_matched_pair's ansiexpand), and its
+-- C string ends at the NUL — so the word's text is cut there, and expanding it is `bad
+-- substitution: no closing `}' in "${u-r` (status 1, the line abandoned). Sets M.nulcut
+-- to the cut text of the "…" contents (from inner[1]) and returns true.
+function M.dq_nulcut(inner, i)
+	if not inner:find("$'", i, true) then
+		return false
+	end
+	local ok, e = pcall(scan_braces, inner, i + 1, true)
+	if not ok then
+		return false
+	end
+	local body = inner:sub(i + 2, e - 2)
+	local _, oe = body:find("^[#!]?[%w_@*?$!#-]+%b[]")
+	oe = oe or select(2, body:find("^[#!]?[%w_@*?$!#-][%w_]*"))
+	if not oe or not body:find("^:?[-=?+]", oe + 1) then
+		return false
+	end
+	local k = i + 2 + oe
+	while k < e - 1 do
+		local c = inner:sub(k, k)
+		if c == "\\" then
+			k = k + 2
+		elseif c == "$" and inner:sub(k + 1, k + 1) == "'" then
+			local qe = quote_end(inner, k + 1, true)
+			local d = require("runtime").ansi_unescape(inner:sub(k + 2, qe - 2), "z")
+			local z = d:find("\0", 1, true)
+			if z then
+				M.nulcut = inner:sub(1, k - 1) .. d:sub(1, z - 1)
+				return true
+			end
+			k = qe
+		else
+			k = k + 1
+		end
+	end
+	return false
+end
 local function parse_dquote(inner, add, heredoc, bt_keep)
 	bt_keep = bt_keep or heredoc
 	local i = 1
@@ -1440,6 +1531,9 @@ local function parse_dquote(inner, add, heredoc, bt_keep)
 				i = i + 1
 			end
 		elseif c == "$" then
+			if not (heredoc or POSIX_DQ) and inner:byte(i + 1) == 123 and M.dq_nulcut(inner, i) then
+				return -- (the word's text ends at a NUL: parse_word makes it an error part)
+			end
 			-- (a heredoc body's ${x-word} keeps a $'…' in word literal — bash; so does a
 			-- "…" one in posix mode)
 			i = parse_dollar(inner, i, (heredoc or POSIX_DQ) and function(p)
@@ -1455,20 +1549,9 @@ local function parse_dquote(inner, add, heredoc, bt_keep)
 			-- within a backtick INSIDE double quotes, `\` also escapes `"` (unlike the
 			-- `$()` form) — bash unwraps `\"`→`"`, so `"`echo \"hi\"`"` runs `echo "hi"`
 			-- (not in a heredoc body or a prompt: `\"` reaches the command as is).
-			local j, buf = i + 1, {}
-			while j <= #inner and inner:sub(j, j) ~= "`" do
-				if inner:sub(j, j) == "\\" and inner:sub(j + 1, j + 1) == "\n" then
-					j = j + 2 -- (backquotes drop a \<newline> too, even inside its '…' — POSIX)
-				elseif inner:sub(j, j) == "\\" and inner:sub(j + 1, j + 1):match(bt_keep and "[`$\\]" or '[`$\\"]') then
-					buf[#buf + 1] = inner:sub(j + 1, j + 1)
-					j = j + 2
-				else
-					buf[#buf + 1] = inner:sub(j, j)
-					j = j + 1
-				end
-			end
-			add({ cmdsub = table.concat(buf), q = true, backtick = true, aenv = ALIAS_ENV })
-			i = j + 1
+			local body
+			body, i = bq_body(inner, i, bt_keep and "[`$\\]" or '[`$\\"]')
+			add({ cmdsub = body, q = true, backtick = true, aenv = ALIAS_ENV })
 		else
 			local s, e = inner:find("^[^$\\`]+", i)
 			add({ lit = inner:sub(s, e), q = true })
@@ -1491,9 +1574,9 @@ local function strip_contin(w)
 	while i <= n do
 		local c = w:sub(i, i)
 		if c == "'" then -- single quotes: literal, keep verbatim (incl. any \<nl>)
-			local e = w:find("'", i + 1, true) or n
-			o[#o + 1] = w:sub(i, e)
-			i = e + 1
+			local e = quote_end(w, i)
+			o[#o + 1] = w:sub(i, e - 1)
+			i = e
 		elseif c == "$" and w:sub(i + 1, i + 1) == "(" and w:sub(i + 2, i + 2) ~= "(" then
 			-- a $(…) body is its own program: the inner parse handles its continuations
 			-- (a quoted heredoc in it keeps a literal \<newline>)
@@ -1520,6 +1603,44 @@ local function strip_contin(w)
 	return table.concat(o)
 end
 
+-- A bare array-literal element's word: a copy (parse_word memoizes — the cached word is
+-- shared) marked `noassign` (its `x=~` is not an assignment: no ~ after =) and `aelem`
+-- (bash expands it with other word flags: a lone "$@" there splits as "${@}" does).
+local function elem_word(w)
+	local c = {}
+	for k, v in pairs(w) do
+		c[k] = v
+	end
+	c.noassign, c.aelem = true, true
+	return c
+end
+-- The valid UTF-8 sequence starting at w[i] (a lead byte 0xC2-0xF4), as mbrtowc takes
+-- it (no overlong, surrogate or >U+10FFFF form), or nil.
+local function utf8_seq(w, i)
+	local b = w:byte(i)
+	local l = b >= 0xF0 and 4 or b >= 0xE0 and 3 or 2
+	local lo, hi = 0x80, 0xBF
+	if b == 0xE0 then
+		lo = 0xA0
+	elseif b == 0xED then
+		hi = 0x9F
+	elseif b == 0xF0 then
+		lo = 0x90
+	elseif b == 0xF4 then
+		hi = 0x8F
+	end
+	local c = w:byte(i + 1)
+	if not c or c < lo or c > hi then
+		return nil
+	end
+	for k = i + 2, i + l - 1 do
+		c = w:byte(k)
+		if not c or c < 0x80 or c > 0xBF then
+			return nil
+		end
+	end
+	return w:sub(i, i + l - 1)
+end
 local function parse_word(w)
 	local src = w -- as written (`declare -f` prints words so)
 	w = strip_contin(w)
@@ -1531,55 +1652,18 @@ local function parse_word(w)
 	while i <= #w do
 		local c = w:sub(i, i)
 		if c == "'" then -- single quotes: literal, no expansion
-			local e = w:find("'", i + 1, true) or #w + 1
+			local e = quote_end(w, i) - 1
 			parts[#parts + 1] = { lit = w:sub(i + 1, e - 1), q = true }
 			i = e + 1
-		elseif c == '"' then -- double quotes: expand inside; skip $(..)/$((..))/${..}/`..`
-			local j = i + 1 -- so their inner " isn't the close
-			while j <= #w and w:sub(j, j) ~= '"' do
-				local d = w:sub(j, j)
-				if d == "\\" then
-					j = j + 2
-				elseif d == "$" and w:sub(j + 1, j + 2) == "((" then
-					local _, nj = grab_dparen(w, j + 3)
-					j = nj
-				elseif d == "$" and w:sub(j + 1, j + 1) == "(" then
-					-- the $(…) body has its OWN quoting (`"$(echo ")")"`): use the quote/case-
-					-- aware scanner; an unterminated body falls back to plain paren counting
-					local ok, nj = pcall(scan_cmdsub, w, j + 2)
-					if ok and nj then
-						j = nj
-					else
-						j = j + 2
-						local dep = 1
-						while j <= #w and dep > 0 do
-							local cc = w:sub(j, j)
-							if cc == "(" then
-								dep = dep + 1
-							elseif cc == ")" then
-								dep = dep - 1
-							end
-							j = j + 1
-						end
-					end
-				elseif d == "$" and w:sub(j + 1, j + 1) == "{" then -- ${...}: inner \ ' " and {} nesting
-					j = scan_braces(w, j + 1, true)
-				elseif d == "`" then
-					j = j + 1
-					while j <= #w and w:sub(j, j) ~= "`" do
-						if w:sub(j, j) == "\\" then
-							j = j + 2
-						else
-							j = j + 1
-						end
-					end
-					j = j + 1
-				else
-					j = j + 1
-				end
-			end
+		elseif c == '"' then -- double quotes: expand inside (an unterminated $( … ) body in it
+			local j = dq_end(w, i, true) - 1 -- is paren-counted); j: the closing quote
 			local before = #parts
 			parse_dquote(w:sub(i + 1, j - 1), add)
+			if M.nulcut then -- (the text ends at a $'…' NUL: expanding it is an error)
+				local cut = w:sub(1, i) .. M.nulcut
+				M.nulcut = nil
+				return { k = "word", parts = { { nulcut = cut } }, src = src }
+			end
 			if #parts == before then
 				parts[#parts + 1] = { lit = "", q = true }
 			elseif #parts > before + 1 then
@@ -1609,43 +1693,13 @@ local function parse_word(w)
 		elseif c == "$" then
 			i = parse_dollar(w, i, add, false)
 		elseif c == "`" then -- `cmd` command substitution
-			local j, buf = i + 1, {}
-			while j <= #w and w:sub(j, j) ~= "`" do
-				if w:sub(j, j) == "\\" and w:sub(j + 1, j + 1) == "\n" then
-					j = j + 2 -- (backquotes drop a \<newline> too, even inside its '…' — POSIX)
-				elseif w:sub(j, j) == "\\" and w:sub(j + 1, j + 1):match("[`$\\]") then
-					buf[#buf + 1] = w:sub(j + 1, j + 1)
-					j = j + 2
-				else
-					buf[#buf + 1] = w:sub(j, j)
-					j = j + 1
-				end
-			end
-			parts[#parts + 1] = { cmdsub = table.concat(buf), q = false, backtick = true, aenv = ALIAS_ENV }
-			i = j + 1
+			local body
+			body, i = bq_body(w, i, "[`$\\]")
+			parts[#parts + 1] = { cmdsub = body, q = false, backtick = true, aenv = ALIAS_ENV }
 		elseif (c == "<" or c == ">") and w:sub(i + 1, i + 1) == "(" then
 			-- <(cmd) / >(cmd) process substitution: capture the inner command — its body has
 			-- its own quoting/case syntax, so use the $(…) scanner (plain counting if unclosed)
-			local j
-			local ok, nj = pcall(scan_cmdsub, w, i + 2)
-			if ok and nj then
-				j = nj - 1 -- index of the closing `)`
-			else
-				local d
-				j, d = i + 2, 1
-				while j <= #w and d > 0 do
-					local cc = w:sub(j, j)
-					if cc == "(" then
-						d = d + 1
-					elseif cc == ")" then
-						d = d - 1
-						if d == 0 then
-							break
-						end
-					end
-					j = j + 1
-				end
-			end
+			local j = cmdsub_end_lenient(w, i + 2) - 1 -- (the closing `)`)
 			parts[#parts + 1] = { procsub = w:sub(i + 2, j - 1), dir = c, q = false }
 			i = j + 1
 		elseif c == "\\" then -- backslash escape: literal next char (newline = continuation)
@@ -1654,9 +1708,15 @@ local function parse_word(w)
 			elseif nx == "" then -- a backslash ending the input is itself literal (bash: `a\`)
 				parts[#parts + 1] = { lit = "\\", q = true }
 			else
+				-- (a valid UTF-8 sequence is escaped WHOLE — bash's SCOPY_CHAR_I: one CTLESC
+				-- before the char, so a word split still sees its later bytes)
+				local b = nx:byte()
+				if b >= 0xC2 and b <= 0xF4 then
+					nx = utf8_seq(w, i + 1) or nx
+				end
 				parts[#parts + 1] = { lit = nx, q = true }
 			end
-			i = i + 2
+			i = i + 1 + math.max(#nx, 1)
 		else
 			local s, e = w:find("^[^$'\"`\\<>]+", i)
 			if not s then
@@ -1678,6 +1738,9 @@ local function parse_word(w)
 end
 M.parse_word = parse_word
 M.scan_cmdsub = scan_cmdsub
+M.strip_contin = strip_contin
+M.quote_end = quote_end
+M.expansion_end = expansion_end
 -- bash's fork optimization (execute_in_subshell / optimize_connection_fork /
 -- parse_and_execute's should_suppress_fork): the last command of a ( … ) or $( … ) body —
 -- a plain simple command, the last of a `;`/&&/|| list — is exec'd in place of the
@@ -1742,7 +1805,7 @@ function M.mark_fntail(body, name)
 end
 M.scan_braces = scan_braces
 M.grab_dparen = grab_dparen
-M.fn_bstart = 1 -- (parse.y's function_bstart, a static: see func_body)
+M.fn_bstart = 0 -- (parse.y's function_bstart, a static: see func_body; Shell.new resets it)
 
 -- Memoize the runtime-facing parsers. The interpreter re-parses the SAME arith
 -- expressions and words on every loop iteration — $(( … )), array subscripts,
@@ -1941,29 +2004,13 @@ function M.parse_default_quoted(txt, heredoc)
 				out[#out + 1] = "$"
 			end
 			k = k + 1 -- $"…" (a locale string): its text, as "…"
-		elseif ch == "$" and (txt:sub(k + 1, k + 1) == "(" or txt:sub(k + 1, k + 1) == "{") then
-			-- a nested $(…)/$((…))/${…} keeps its OWN quoting (`${u:-$(echo "p)q")}`): copy it
-			-- verbatim rather than dropping the quotes inside it
-			local ok, nj
-			if txt:sub(k + 1, k + 1) == "(" then
-				ok, nj = pcall(scan_cmdsub, txt, k + 2)
-			else
-				ok, nj = pcall(scan_braces, txt, k + 1)
-			end
-			if ok and nj and nj > k then
-				out[#out + 1] = txt:sub(k, nj - 1)
-				k = nj
-			else
-				out[#out + 1] = ch
-				k = k + 1
-			end
-		elseif ch == "`" then
-			local e = k + 1
-			while e <= m and txt:sub(e, e) ~= "`" do
-				e = e + (txt:sub(e, e) == "\\" and 2 or 1)
-			end
-			out[#out + 1] = txt:sub(k, e)
-			k = e + 1
+		elseif ch == "$" or ch == "`" then
+			-- a nested $(…)/$((…))/${…}/`…` keeps its OWN quoting (`${u:-$(echo "p)q")}`): copy
+			-- it verbatim rather than dropping the quotes inside it
+			local ok, nj = pcall(expansion_end, txt, k, false, true)
+			nj = ok and nj or k + 1
+			out[#out + 1] = txt:sub(k, nj - 1)
+			k = nj
 		else
 			out[#out + 1] = ch
 			k = k + 1
@@ -1994,7 +2041,9 @@ local COND_OPTOK = { ["&&"] = true, ["||"] = true, ["("] = true, [")"] = true, [
 -- (nlb[k]: a newline came before token k. cond_term skips newlines only where bash's
 -- cond_skip_newlines does — before a term and after one; reading a unary operator's
 -- operand, a binary operator, or its right side (`nonl`) a newline is a `newline' token)
+local COND_PEND = {} -- (the token slot of a word that ran into the end of input)
 local function cond_check(toks, quoted, nlb, eof, line0, tl)
+	local pend_read = false -- (the grammar read the COND_PEND token)
 	local pos, ck, ct, fk = 1, nil, nil, nil -- (ck/ct: bash's cond_token, kind and text;
 	-- fk: its index — negative for a newline before that token — where an error is reported)
 	local pre = {}
@@ -2007,6 +2056,11 @@ local function cond_check(toks, quoted, nlb, eof, line0, tl)
 		fk = pos
 		local t = toks[pos]
 		pos = pos + 1
+		if t == COND_PEND then -- (a word that failed to read: bash's error token, -1)
+			ck, ct = "ERR", "\255"
+			pend_read = true
+			return ck, ct
+		end
 		if t == nil then -- (no `]]` before the input's end: bash's EOF token)
 			ck, ct = eof and "EOF" or "END", eof and "EOF" or "]]"
 		elseif not quoted[pos - 1] and COND_OPTOK[t] then
@@ -2017,7 +2071,7 @@ local function cond_check(toks, quoted, nlb, eof, line0, tl)
 		return ck, ct
 	end
 	local function fail(near)
-		error({ cond_fail = true, near = near }, 0)
+		error({ cond_fail = true, near = near, pend = pend_read or nil }, 0)
 	end
 	local cond_or
 	local function term()
@@ -2043,7 +2097,10 @@ local function cond_check(toks, quoted, nlb, eof, line0, tl)
 			term()
 		elseif k == "WORD" and COND_UNOP[t] then
 			local k2, t2 = nxt(true)
-			if k2 ~= "WORD" then
+			if k2 == "ERR" then -- (error_token_from_token: none to name)
+				pre[#pre + 1] = "unexpected argument to conditional unary operator"
+				fail(t2)
+			elseif k2 ~= "WORD" then
 				pre[#pre + 1] = "unexpected argument `" .. t2 .. "' to conditional unary operator"
 				fail(k2 == "NL" and t or t2) -- (near: the input line's last token)
 			end
@@ -2052,13 +2109,16 @@ local function cond_check(toks, quoted, nlb, eof, line0, tl)
 			local k2, t2 = nxt(true)
 			if (k2 == "WORD" and COND_BINOP[t2]) or k2 == "<" or k2 == ">" then
 				local k3, t3 = nxt(true)
-				if k3 ~= "WORD" then
+				if k3 == "ERR" then
+					pre[#pre + 1] = "unexpected argument to conditional binary operator"
+					fail(t3)
+				elseif k3 ~= "WORD" then
 					pre[#pre + 1] = "unexpected argument `" .. t3 .. "' to conditional binary operator"
 					fail(k3 == "NL" and t2 or t3)
 				end
 				nxt()
 			elseif not (k2 == "END" or k2 == "&&" or k2 == "||" or k2 == ")") then
-				pre[#pre + 1] = k2 == "WORD" and "conditional binary operator expected"
+				pre[#pre + 1] = (k2 == "WORD" or k2 == "ERR") and "conditional binary operator expected"
 					or ("unexpected token `" .. t2 .. "', conditional binary operator expected")
 				fail(k2 == "NL" and t or t2)
 			end
@@ -2098,7 +2158,8 @@ local function cond_check(toks, quoted, nlb, eof, line0, tl)
 		error({ __curse_perr = true, pre = pre, msg = "syntax error: unexpected end of file", eof = true }, 0)
 	end
 	-- (at a real token the caller re-derives `near` from the input text, as bash does)
-	error({ __curse_perr = true, pre = pre, exact = true, msg = "syntax error near `" .. e.near .. "'", fk = fk }, 0)
+	error({ __curse_perr = true, pre = pre, exact = true, msg = "syntax error near `" .. e.near .. "'", fk = fk,
+		pend = e.pend }, 0)
 end
 
 -- Build a [[ … ]] token list's boolean-expression AST:
@@ -2179,42 +2240,52 @@ end
 -- to literal — the expansion always happens, just lazily when it's large.
 local BRACE_CAP = 100000
 
--- Skip a quoted string or a backslash escape at `i` in `s` (brace syntax is inert inside
--- them: `{abc\,def}`, `{x,\{a}`, `{"a,b",c}`); returns the index after it, or nil.
-local function brace_skip_quoted(s, i)
-	local c = s:sub(i, i)
+-- The unit at `i` in `s` that brace syntax is inert inside, copied whole (braces.c
+-- brace_gobbler): a backslash escape (`{abc\,def}`, `{x,\{a}`), a quoted string (`{"a,b",c}`,
+-- `"x\"{a,b}"`), a `…`, a ${…}, a $(…)/<(…)/>(…) (`$(echo ")")x{a,b}`). -> the index just
+-- past it, or nil.
+local function brace_skip(s, i)
+	local c, c2 = s:sub(i, i), s:sub(i + 1, i + 1)
 	if c == "\\" then
 		return i + 2
-	elseif c == "'" or c == '"' or c == "`" then
-		local j = i + 1
-		while j <= #s and s:sub(j, j) ~= c do
-			j = j + ((c ~= "'" and s:sub(j, j) == "\\") and 2 or 1)
+	elseif c == "'" then
+		return quote_end(s, i)
+	elseif c == '"' then -- (only a $( … ) nests in it here: `"${u:-"a{b,c}"}"` is ab ac)
+		local k, n = i + 1, #s
+		while k <= n and s:byte(k) ~= 34 do
+			k = s:find("^%$%(", k) and cmdsub_end_lenient(s, k + 2) or k + (s:byte(k) == 92 and 2 or 1)
 		end
-		return j + 1
+		return k + 1
+	elseif c == "`" or c == "$" and (c2 == "(" or c2 == "{") then
+		local ok, e = pcall(expansion_end, s, i, false, true)
+		return ok and e or i + 1
+	elseif (c == "<" or c == ">") and c2 == "(" then
+		return cmdsub_end_lenient(s, i + 2)
 	end
 	return nil
 end
-local function split_top_comma(inner)
+-- Split `s` at each `delim` outside quotes, expansions (brace_skip) and — `braces` — {…}
+local function split_top(s, delim, braces)
 	local parts, depth, start = {}, 0, 1
 	local i = 1
-	while i <= #inner do
-		local c = inner:sub(i, i)
-		local skip = brace_skip_quoted(inner, i)
+	while i <= #s do
+		local c = s:sub(i, i)
+		local skip = brace_skip(s, i)
 		if skip then
 			i = skip
 		else
-			if c == "{" then
+			if braces and c == "{" then
 				depth = depth + 1
-			elseif c == "}" then
+			elseif braces and c == "}" then
 				depth = depth - 1
-			elseif c == "," and depth == 0 then
-				parts[#parts + 1] = inner:sub(start, i - 1)
+			elseif c == delim and depth == 0 then
+				parts[#parts + 1] = s:sub(start, i - 1)
 				start = i + 1
 			end
 			i = i + 1
 		end
 	end
-	parts[#parts + 1] = inner:sub(start)
+	parts[#parts + 1] = s:sub(start)
 	return parts
 end
 -- A character from a {x..y} range, as word TEXT (the expansion is re-parsed as a word):
@@ -2316,7 +2387,7 @@ local function classify_brace(inner)
 	if ca then
 		return { range = { a = ca:byte(), b = cb:byte(), step = 1, char = true } }
 	end
-	local parts = split_top_comma(inner)
+	local parts = split_top(inner, ",", true)
 	if #parts > 1 then
 		return { list = parts }
 	end
@@ -2337,57 +2408,15 @@ local function brace_factors(s)
 	local i = 1
 	while i <= #s do
 		local c = s:sub(i, i)
-		if c == "\\" then -- a backslash escapes the next char, so `\{` isn't a brace open
-			litbuf[#litbuf + 1] = c
-			if i + 1 <= #s then
-				litbuf[#litbuf + 1] = s:sub(i + 1, i + 1)
-			end
-			i = i + 2
-		elseif c == "'" or c == '"' then
-			litbuf[#litbuf + 1] = c
-			i = i + 1
-			while i <= #s and s:sub(i, i) ~= c do
-				litbuf[#litbuf + 1] = s:sub(i, i)
-				i = i + 1
-			end
-			if i <= #s then
-				litbuf[#litbuf + 1] = c
-				i = i + 1
-			end
-		elseif c == "`" then -- a `…` command substitution is copied whole (its braces are its own)
-			local j = i + 1
-			while j <= #s and s:sub(j, j) ~= "`" do
-				j = j + (s:sub(j, j) == "\\" and 2 or 1)
-			end
-			litbuf[#litbuf + 1] = s:sub(i, j)
-			i = j + 1
-		elseif c == "$" and s:sub(i + 1, i + 1) == "{" then
-			-- ${…} is a parameter expansion, NOT brace expansion — copy it verbatim.
-			local e = s:find("}", i + 2, true) or #s
-			litbuf[#litbuf + 1] = s:sub(i, e)
-			i = e + 1
-		elseif c == "$" and s:sub(i + 1, i + 1) == "(" then
-			-- $(…) / $((…)): copy verbatim (balancing parens).
-			local d, j = 0, i + 1
-			while j <= #s do
-				local cc = s:sub(j, j)
-				if cc == "(" then
-					d = d + 1
-				elseif cc == ")" then
-					d = d - 1
-					if d == 0 then
-						break
-					end
-				end
-				j = j + 1
-			end
-			litbuf[#litbuf + 1] = s:sub(i, j)
-			i = j + 1
+		local skip = brace_skip(s, i)
+		if skip then -- (a backslash escapes the next char, so `\{` isn't a brace open)
+			litbuf[#litbuf + 1] = s:sub(i, skip - 1)
+			i = skip
 		elseif c == "{" then
 			local d, j = 1, i + 1
 			while j <= #s and d > 0 do
 				local cc = s:sub(j, j)
-				local skip = brace_skip_quoted(s, j)
+				local skip = brace_skip(s, j)
 				if skip then
 					j = skip
 				else
@@ -2697,13 +2726,9 @@ local function ltr_cmdsub(sh, body)
 		if c == "\\" then
 			k = k + 2
 		elseif c == "'" and not dq then
-			k = (body:find("'", k + 1, true) or m) + 1
+			k = quote_end(body, k)
 		elseif c == "$" and nx == "'" and not dq then
-			k = k + 2
-			while k <= m and body:sub(k, k) ~= "'" do
-				k = k + (body:sub(k, k) == "\\" and 2 or 1)
-			end
-			k = k + 1
+			k = quote_end(body, k + 1, true)
 		elseif c == "$" and nx == "(" then
 			stack[#stack + 1] = dq
 			dq = false
@@ -2721,10 +2746,7 @@ local function ltr_cmdsub(sh, body)
 			dq = not dq
 			k = k + 1
 		elseif c == "$" and nx == '"' and not dq then
-			local e = k + 2
-			while e <= m and body:sub(e, e) ~= '"' do
-				e = e + (body:sub(e, e) == "\\" and 2 or 1)
-			end
+			local e = quote_end(body, k + 1, true) - 1
 			if e > m then
 				break
 			end
@@ -2748,15 +2770,18 @@ local function ltr_cmdsub(sh, body)
 	return table.concat(out), dnl
 end
 local WORD_SPECIAL = "[\\()\"'$<>|&`; \t\n?*+@!]"
+local DQ_SPECIAL = '[\\"$`]' -- (…and inside "…")
 -- bash's reserved words (word_token_alist)
 local RESERVED = { ["if"] = true, ["then"] = true, ["else"] = true, ["elif"] = true, ["fi"] = true,
 	["case"] = true, ["esac"] = true, ["for"] = true, ["select"] = true, ["while"] = true, ["until"] = true,
 	["do"] = true, ["done"] = true, ["in"] = true, ["function"] = true, ["time"] = true, ["{"] = true,
 	["}"] = true, ["!"] = true, ["[["] = true, ["]]"] = true, ["coproc"] = true }
+-- a case clause's terminators: ;; stop, ;;& test the next patterns, ;& fall through
+local CASE_TERM = { [";;"] = "break", [";;&"] = "test", [";&"] = "fall" }
 -- reserved words that open a compound command usable as a function body
 local FBODY_KW = { ["if"] = true, ["for"] = true, ["while"] = true, ["until"] = true, ["case"] = true, ["select"] = true }
 
-local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs, xg, bq)
+local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs, xg, bq, cs)
 	if MBX then -- (a multibyte locale with ASCII trail bytes: see mb_hide)
 		local hsrc, map, cls = mb_hide(src)
 		if hsrc then
@@ -2765,7 +2790,7 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs, xg, bq
 					MB_BSL = ph -- byte-wise, as a line continuation — see collect_heredocs)
 				end
 			end
-			local nextf = make_parser(hsrc, sh, aenv, noalias, posix, line0, lineabs, xg, bq)
+			local nextf = make_parser(hsrc, sh, aenv, noalias, posix, line0, lineabs, xg, bq, cs)
 			return function()
 				local lg = nextf()
 				if lg then
@@ -2788,6 +2813,7 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs, xg, bq
 		line = bq and line0 or line0 - #(src:match("^[ \t\n]*"):gsub("[^\n]", ""))
 	end
 	local loopId = 0
+	local arrlit_eof = false -- (an EOF error read inside a NAME=( … ) literal: status 1)
 	-- jcx: the line a foreground job killed by a signal is reported at — bash's line_number
 	-- once the command is back from execute_simple_command (restored to the enclosing
 	-- context's): a top-level command's parser line (its line group's last, heredocs and
@@ -2881,7 +2907,7 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs, xg, bq
 				elseif a == "-q" or a == "-p" or a == "-o" then -- flags, ignore
 				elseif a == "expand_aliases" and set ~= nil then
 					alias_on = set
-				elseif a == "extglob" and set ~= nil then
+				elseif a == "extglob" and set ~= nil and not M.xg_fixed then
 					extglob_on = set
 				end
 			end
@@ -3051,21 +3077,17 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs, xg, bq
 			if ins ~= "" and not ins:match("[ \t\n\\|&;()<>]$") then
 				-- …and not when the value ends INSIDE an open quote (`alias foo="echo 'Err:"`):
 				-- the quoted string continues into the following input
-				local q, k = nil, 1
+				local k, open = 1, false
 				while k <= #ins do
-					local ch = ins:sub(k, k)
-					if q == "'" then
-						if ch == "'" then q = nil end
-					elseif q == '"' then
-						if ch == "\\" then k = k + 1 elseif ch == '"' then q = nil end
-					elseif ch == "\\" then
-						k = k + 1
-					elseif ch == "'" or ch == '"' then
-						q = ch
+					local b = ins:byte(k)
+					if b == 39 or b == 34 then -- ' "
+						k = quote_end(ins, k, b == 34)
+						open = k > #ins + 1 -- (ran off the end: left open)
+					else
+						k = k + (b == 92 and 2 or 1)
 					end
-					k = k + 1
 				end
-				if not q then
+				if not open then
 					ins = ins .. " "
 				end
 			end
@@ -3108,9 +3130,7 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs, xg, bq
 		if #heredocs_pending == 0 then
 			return
 		end
-		while i <= n and src:sub(i, i) ~= "\n" do
-			i = i + 1
-		end -- to end of command line
+		i = src:find("\n", i, true) or n + 1 -- to end of command line
 		local rline, nread = line, 0 -- (bash's warning lines: where reading began, + lines read)
 		-- A command line ended by a newline from an ALIAS value: bash reads a heredoc body
 		-- with read_secondary_line -> yy_getc, straight from the input source and NOT from
@@ -3162,7 +3182,8 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs, xg, bq
 				end
 				-- a $(…) body's final `DELIM )` line reached here as `DELIM ` (see scan_cmdsub);
 				-- a backtick body has no such form: its last `DELIM ` line is body text
-				if le > n and line0 and not bq and lstr:match("^(.-)[ \t]+$") == hd.delim then
+				-- (cs: a $(…) body compiled as a fragment, read without a line0)
+				if le > n and (line0 or cs) and not bq and lstr:match("^(.-)[ \t]+$") == hd.delim then
 					found = true
 					break
 				end
@@ -3212,7 +3233,7 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs, xg, bq
 	-- Redirections trailing a compound command (loop/if/case): `done < f`,
 	-- `done <<EOF … EOF`. Collect them and any heredoc bodies they open.
 	local function tail_redirs()
-		local redirs = {}
+		local redirs = hoisted or {}
 		while true do
 			ws()
 			local r = parse_redir()
@@ -3224,52 +3245,38 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs, xg, bq
 		end
 		return #redirs > 0 and redirs or nil
 	end
-	local function skipsep() -- skip separators: whitespace, newlines, ;, comments
-		while i <= n do
-			local c = src:sub(i, i)
-			if c == "\n" then
-				-- heredoc bodies opened earlier on this logical line follow this newline,
-				-- in the order the `<<` operators appeared — collect them all here.
-				if #heredocs_pending > 0 then
-					collect_heredocs() -- consumes the newline + bodies
-				else
-					if not (alias_nl and alias_nl[i]) then line = line + 1 end
-					i = i + 1
-				end
-			elseif c:match("[ \t;]") then
-				i = i + 1
-			elseif c == "#" then
-				while i <= n and src:sub(i, i) ~= "\n" do
-					i = i + 1
-				end
-			else
-				break
-			end
+	-- Past the newline at i: the bodies of here-documents opened on the line just read follow
+	-- it (collect_heredocs takes them, newline and all); else it's one more line — unless an
+	-- alias value spliced it in (bash reads those from the pushed string: no line_number++).
+	local function newline()
+		if #heredocs_pending > 0 then
+			collect_heredocs()
+		else
+			if not (alias_nl and alias_nl[i]) then line = line + 1 end
+			i = i + 1
 		end
 	end
-	-- Like skipsep but STOPS at a statement separator (; & |) instead of eating it,
-	-- so the statement loops can tell a *trailing* separator (fine) from one in
-	-- command position (a syntax error — see bare_sep_tok).
-	local function skipblank()
+	-- Skip what may separate tokens where a command (list) goes on: blanks, `\<newline>`s,
+	-- newlines (newline()), comments — and `;`s when `semi`. Without it this STOPS at a
+	-- statement separator (; & |), so the statement loops can tell a *trailing* separator
+	-- (fine) from one in command position (a syntax error — see bare_sep_tok).
+	local function skipsep(semi) -- (-> whether a newline was crossed)
+		local nl = false
 		while i <= n do
-			local c = src:sub(i, i)
-			if c == "\n" then
-				if #heredocs_pending > 0 then
-					collect_heredocs()
-				else
-					if not (alias_nl and alias_nl[i]) then line = line + 1 end
-					i = i + 1
-				end
-			elseif c == " " or c == "\t" then
+			ws()
+			local c = src:byte(i)
+			if c == 10 then
+				newline()
+				nl = true
+			elseif c == 35 then -- (a comment, to the end of the line)
+				i = src:find("\n", i, true) or n + 1
+			elseif c == 59 and semi then
 				i = i + 1
-			elseif c == "#" then
-				while i <= n and src:sub(i, i) ~= "\n" do
-					i = i + 1
-				end
 			else
 				break
 			end
 		end
+		return nl
 	end
 	-- At a command-expected position a control operator means an empty command,
 	-- which bash rejects as a syntax error (status 2): a leading/doubled `;`, `;;`,
@@ -3350,19 +3357,13 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs, xg, bq
 	end
 	-- from just past an extglob `X(`, to just past its matching `)`
 	local function scan_extglob(k)
-		local d = 1
+		local d, k0 = 1, k
 		while k <= n do
 			local cc = src:byte(k)
 			if cc == 92 then -- \
 				k = k + 2
-			elseif cc == 39 then -- '
-				k = (src:find("'", k + 1, true) or n) + 1
-			elseif cc == 34 then -- "
-				k = k + 1
-				while k <= n and src:byte(k) ~= 34 do
-					k = k + (src:byte(k) == 92 and 2 or 1)
-				end
-				k = k + 1
+			elseif cc == 39 or cc == 34 then -- ' "
+				k = quote_end(src, k, cc == 34)
 			else
 				if cc == 40 then
 					d = d + 1
@@ -3376,7 +3377,7 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs, xg, bq
 			end
 		end
 		comsub_eof = false -- (reported at the line it began on)
-		error("unexpected EOF while looking for matching `)'")
+		eof_error(src, k0, ")")
 	end
 	-- a syntax error in a $( … ) body: parse_comsub's jump_to_top_level(FORCE_EOF) — an eval'd
 	-- text's one ends the (non-interactive) shell, status 1
@@ -3392,29 +3393,74 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs, xg, bq
 		end
 		return false
 	end
-	local function comsub_err(cerr)
-		error({ __curse_perr = true, msg = cerr, line = cerr:find("near `", 1, true) and line or nil, forceeof = true }, 0)
+	local function comsub_err(cerr, eline, cbody, je) -- (eline: the body's line with the error,
+		local near, t = cerr:find("near `", 1, true), nil -- reported there, and shown when it's
+		if near and eline and eline > 1 then -- a whole source line)
+			local k, last = 0, true
+			for l in (cbody .. "\n"):gmatch("([^\n]*)\n") do
+				k = k + 1
+				if k == eline then
+					t = l
+				elseif k > eline then
+					last = false
+				end
+			end
+			if t and last and je then -- (the body's last line: the source line goes on past its `)`)
+				t = t .. (src:match("^[^\n]*", je - 1) or "")
+			end
+		end
+		error({ __curse_perr = true, msg = cerr, line = near and (line + (eline or 1) - 1) or nil, ltext = t,
+			forceeof = true }, 0)
 	end
 	-- the read-time syntax check of a $(…) body (a guessed extglob state: line mode)
-	local function comsub_check(cbody)
+	local function comsub_check(cbody, je)
 		local bxg = nil
 		if cbody:find("[@!+*?]%(") then
 			bxg = xg_body()
 		end
-		local cerr, guessed = comsub_syntax(cbody, bxg)
+		local cerr, guessed, eline = comsub_syntax(cbody, bxg)
 		if guessed then
 			xg_guess = true
 		elseif cerr then
-			comsub_err(cerr)
+			comsub_err(cerr, eline, cbody, je)
 		end
 	end
-	local function word(stop_paren, stop_cmp) -- read one shell word, keeping quotes and $(( )) / ${ } / $( ) balanced
+	-- the $( … ) bodies in a ${ … } (src[k..e)) are syntax-checked as the line is read, as
+	-- at the word's top level: bash's parse_matched_pair reads a ${ with parse_comsub for
+	-- each `$(`, and nested "…" the same way — but a '…' (even one inside "${…}", where it
+	-- expands as literal quotes) and `…` are read as quoted strings, unchecked
+	local function braces_comsubs(k, e)
+		while k < e do
+			local c = src:sub(k, k)
+			if c == "\\" then
+				k = k + 2
+			elseif c == "'" then
+				k = quote_end(src, k, src:sub(k - 1, k - 1) == "$")
+			elseif c == "`" then
+				k = quote_end(src, k, true)
+			elseif c == "$" and src:sub(k + 1, k + 1) == "(" then
+				local je = scan_cmdsub(src, k + 2)
+				local cbody = src:sub(k + 2, je - 2)
+				if src:sub(k + 2, k + 2) ~= "(" and not cbody:find("<<", 1, true) and not cbody:find('$"', 1, true)
+					and not alias_touch(cbody) then
+					comsub_check(cbody, je)
+				end
+				k = je
+			else
+				k = k + 1
+			end
+		end
+	end
+	-- Read one shell word, keeping quotes and $(( )) / ${ } / $( ) balanced. One loop reads
+	-- the whole word, inside "…" (q0: its opening quote) and out: an expansion is read the
+	-- same way in both — a $( … ) in "…" is syntax-checked and takes its here-document too.
+	local function word(stop_paren, stop_cmp)
 		ws()
-		local start, line0, lfix, ldq = i, line, 0, nil
+		local start, line0, lfix, ldq, q0 = i, line, 0, nil, nil
 		while i <= n do
 			-- (a run of ordinary characters is part of the word: jump to the next one that
 			-- could matter — one find instead of a per-character pattern test)
-			local j = src:find(WORD_SPECIAL, i)
+			local j = src:find(q0 and DQ_SPECIAL or WORD_SPECIAL, i)
 			if not j then
 				i = n + 1
 				break
@@ -3428,63 +3474,14 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs, xg, bq
 				i = i + 2
 			elseif stop_paren and (c == ")" or c == "(") then
 				break
-			elseif c == "$" and src:byte(i + 1) == 34 then
+			elseif c == "$" and src:byte(i + 1) == 34 and not q0 then
 				i = i + 1
 				ldq = i -- (a $"…": its text is translated once the close is found)
 				LTR_SEEN = true
-			elseif c == '"' then -- double quotes: honor \" and skip $(..)/$((..))/`..`
-				local q0 = i
-				i = i + 1 -- (their inner " are not the close)
-				while i <= n and src:sub(i, i) ~= '"' do
-					local d = src:sub(i, i)
-					if d == "\\" then
-						i = i + 2
-					elseif d == "$" and src:sub(i + 1, i + 2) == "((" then
-						local _, ni = grab_dparen(src, i + 3)
-						i = ni
-					elseif d == "$" and src:sub(i + 1, i + 1) == "(" then
-						if COMSUB_PREX and not noalias then
-							i = i + 2
-							prex_comsub()
-						else
-							local je = scan_cmdsub(src, i + 2, hdwarn_for(start, line0)) -- case/quote/nesting-aware boundary
-							local cbody = src:sub(i + 2, je - 2)
-							if cbody:find('$"', 1, true) then -- ($"…" in it: translated as the line is read)
-								LTR_SEEN = true
-								if sh then
-									local nb, dnl = ltr_cmdsub(sh, cbody)
-									if nb ~= cbody then
-										src = src:sub(1, i + 1) .. nb .. src:sub(je - 1)
-										n = #src
-										je = je + #nb - #cbody
-										lfix = lfix - dnl
-									end
-								end
-							end
-							i = je
-						end
-					elseif d == "$" and src:sub(i + 1, i + 1) == "{" then
-						i = scan_braces(src, i + 1, true) -- ${…}: inner \ ' " and nested {} don't close it
-					elseif d == "`" then
-						i = i + 1
-						while i <= n and src:sub(i, i) ~= "`" do
-							if src:sub(i, i) == "\\" then
-								i = i + 2
-							else
-								i = i + 1
-							end
-						end
-						if i > n then
-							error("unexpected EOF while looking for matching ``'")
-						end
-						i = i + 1
-					else
-						i = i + 1
-					end
-				end
-				if i > n then
-					error("unexpected EOF while looking for matching `\"'")
-				end -- unterminated "
+			elseif c == '"' and not q0 then
+				q0 = i
+				i = i + 1
+			elseif c == '"' then
 				i = i + 1 -- past closing quote
 				if ldq == q0 and sh then
 					-- bash's locale_expand, as the line is READ (the locale and $TEXTDOMAIN
@@ -3500,44 +3497,16 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs, xg, bq
 						i = q0 + #t + 2
 					end
 				end
+				q0 = nil
 			elseif c == "'" then -- single quotes: everything literal, no escapes
-				i = i + 1
-				while i <= n and src:sub(i, i) ~= "'" do
-					i = i + 1
-				end
-				if i > n then
-					error("unexpected EOF while looking for matching `''")
-				end -- unterminated '
-				i = i + 1 -- past closing quote
-			elseif c == "$" and src:sub(i + 1, i + 1) == "'" then
-				-- $'…' ANSI-C quote: scan to the close honoring \' \\
-				i = i + 2
-				while i <= n and src:sub(i, i) ~= "'" do
-					if src:sub(i, i) == "\\" then
-						i = i + 2
-					else
-						i = i + 1
-					end
-				end
-				if i > n then
-					error("unexpected EOF while looking for matching `''")
-				end -- unterminated $'
-				i = i + 1
+				i = quote_end(src, i, false, true)
+			elseif c == "$" and src:sub(i + 1, i + 1) == "'" and not q0 then
+				i = quote_end(src, i + 1, true, true) -- $'…' ANSI-C quote: \' \\ don't close it
 			elseif c == "$" and src:sub(i + 1, i + 2) == "((" and dparen_is_arith(src, i + 3) then
 				local _, ni = grab_dparen(src, i + 3)
 				i = ni
 			elseif c == "$" and src:sub(i + 1, i + 1) == "[" then -- $[expr]: keep whole (spaces inside)
-				i = i + 2
-				local d = 1
-				while i <= n and d > 0 do
-					local cc = src:sub(i, i)
-					if cc == "[" then
-						d = d + 1
-					elseif cc == "]" then
-						d = d - 1
-					end
-					i = i + 1
-				end
+				i = bracket_close(src, i + 1) + 1
 			elseif c == "$" and src:sub(i + 1, i + 1) == "(" then
 				if COMSUB_PREX and not noalias then
 					i = i + 2
@@ -3564,7 +3533,7 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs, xg, bq
 					if not hdp and src:sub(i + 2, i + 2) ~= "("
 						and (not cbody:find("<<", 1, true) or cbody:find("<<%-?[ \t]*$") or cbody:find("<<%-?[ \t]*[\n;&|)]"))
 						and not alias_touch(cbody) then
-						comsub_check(cbody)
+						comsub_check(cbody, je)
 					end
 					if hdp then
 						-- `$(cat <<EOF)` then the body on the following lines (bash): move those
@@ -3594,7 +3563,7 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs, xg, bq
 							je = je + 1 + #body
 							lfix = lfix - 1 -- (that inserted newline isn't a source line)
 							warns[#warns + 1] = { t = "warn", line = line,
-								msg = ("warning: command substitution: %d unterminated here-document"):format(#hdp) }
+								msg = ("warning: command substitution: %d unterminated here-document%s"):format(#hdp, #hdp == 1 and "" or "s") }
 						end
 					end
 					i = je
@@ -3616,25 +3585,21 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs, xg, bq
 			elseif c == "<" or c == ">" or c == "|" or c == "&" then
 				break -- metacharacters end a word: redirs (procsub <(/>( handled above), `|`/`&` pipelines/lists & `&&`/`||`/`>&` need no surrounding space
 			elseif c == "$" and src:sub(i + 1, i + 1) == "{" then
-				i = scan_braces(src, i + 1) -- ${…}: match the close, honoring \ ' " and nesting
-			elseif c == "`" then -- `…` command sub: keep it whole (spaces inside included)
-				i = i + 1
-				while i <= n and src:sub(i, i) ~= "`" do
-					if src:sub(i, i) == "\\" then
-						i = i + 2
-					else
-						i = i + 1
-					end
+				local bs = i
+				i = scan_braces(src, i + 1, q0) -- ${…}: match the close, honoring \ ' " and nesting
+				if src:find("$(", bs + 2, true) and src:find("$(", bs + 2, true) < i then
+					braces_comsubs(bs + 2, i - 1)
 				end
-				if i > n then
-					error("unexpected EOF while looking for matching ``'")
-				end -- unclosed backtick
-				i = i + 1
+			elseif c == "`" then -- `…` command sub: keep it whole (spaces inside included)
+				i = quote_end(src, i, true, true)
 			elseif c == " " or c == "\t" or c == "\n" or c == ";" then
 				break
 			else
 				i = i + 1
 			end
+		end
+		if q0 then
+			eof_error(src, q0, '"') -- unterminated "
 		end
 		-- every newline the word spans ($(…) bodies, quotes, continuations) advances the line
 		local w = src:sub(start, i - 1)
@@ -3665,7 +3630,7 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs, xg, bq
 	-- A for/select body: `do … done`, or bash's `{ … }` alternative
 	-- (`for ((i=0; i<3; i++)) { echo $i; }`, `for x in a b; { …; }`).
 	local function loop_body()
-		skipsep()
+		skipsep(true)
 		if src:sub(i, i) == "{" then
 			return brace_group()
 		end
@@ -3709,12 +3674,7 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs, xg, bq
 	-- (bash: `f() ( ... )`). Return a stmt list either way — the subshell form
 	-- yields a one-statement list holding a subshell node, so it runs isolated.
 	local function func_body()
-		ws()
-		while src:sub(i, i) == "\n" do
-			if not (alias_nl and alias_nl[i]) then line = line + 1 end
-			i = i + 1
-			ws()
-		end -- bash allows newlines before the body
+		skipsep() -- bash allows newlines before the body
 		local bline = line -- the body's first line (a traced call's entry DEBUG reports it)
 		local sjcx = jcx
 		jcx = { l = bline, up = sjcx } -- (restored by funcdef_node)
@@ -3724,19 +3684,30 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs, xg, bq
 		if (kw and FBODY_KW[kw] and not src:find("^[^ \t\n;&|()<>]", i + #kw))
 			or src:find("^%[%[[ \t\n]", i) or src:sub(i, i + 1) == "((" then
 			local node = parse_command()
-			jcx.l = M.fn_bstart -- (bash's tc->line: see below)
+			local fb = M.fn_bstart
+			jcx.l = math.max(fb, 1) -- (bash's tc->line: see below)
 			if node.t ~= "subshell" then
-				return { node }, bline
+				-- (its redirections are the definition's — bash's function_body:
+				-- shell_command redirection_list — applied at tc->line: funcdef_node)
+				local hr = node.redirs
+				node.redirs = nil
+				-- ([[ ]] / (( )) / for (( )) name their own line in errors instead:
+				-- executing_line_number's cm_cond / cm_arith / cm_arith_for)
+				-- — while bash is `executing`, not in an EXIT trap after end of input)
+				local own = (node.t == "dbracket" or node.t == "arithcmd" or node.t == "forc") and node.line
+				return { node }, bline, hr and "kw" or nil, fb, hr, own or nil -- (subbody:
+				-- declare -f prints them on the body command, as with a `( … )` body)
 			end
 			-- (`((` that was two nested subshells: the subshell body, as below)
-			node.jcx = { l = M.fn_bstart }
-			return { node }, bline, true
+			node.jcx = { l = math.max(fb, 1) }
+			return { node }, bline, true, node.line
 		end
 		if src:sub(i, i) == "(" then
 			i = i + 1
 			local fjcx = jcx
 			jcx = {}
 			local body, pterm = parse_stmts({ [")"] = true })
+			local close = line
 			jcx.l, jcx = line, fjcx -- (bash's subshell->line: where it closes)
 			if pterm ~= ")" then
 				error("syntax error: unexpected end of file") -- unclosed ( )
@@ -3749,24 +3720,29 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs, xg, bq
 			-- line_number = tc->line, which make_function_def sets to function_bstart — only
 			-- a `{` body's parse updates that (parse.y's PST_ALLOWOPNBRC), so any other body
 			-- carries the last `{`-bodied function's `{` line (0 -> 1: notify_of_job_status)
-			return { { t = "subshell", line = bline, body = body, jcx = { l = M.fn_bstart } } }, bline, true
+			return { { t = "subshell", line = bline, body = body, jcx = { l = math.max(M.fn_bstart, 1) } } }, bline, true,
+				close
 		end
 		M.fn_bstart = bline -- (at its `{`: a function defined inside moves it on)
-		return brace_group(), bline
+		return brace_group(), bline, nil, bline
 	end
 	-- A function definition, with any trailing redirects (`f() { … } >&2`) that apply
 	-- to the whole body on every call.
 	local function funcdef_node(nm, dstart, dline)
-		local body, bline, subbody = func_body()
+		-- rline: the line the definition's redirections are applied at — execute_function's
+		-- line_number = tc->line (make_function_def's function_bstart: the `{` line, or for
+		-- any other body the last `{`-bodied definition's, 0 — no line — before any), and
+		-- for a `( … )` body the subshell's own (execute_in_subshell: where it closes)
+		local body, bline, subbody, rline, hoisted, rline_own = func_body()
 		jcx = jcx.up or jcx
-		if not subbody then
+		if subbody ~= true then -- ("kw": a keyword body, its redirections hoisted)
 			M.mark_fntail(body, nm)
 		end
 		-- capture the definition's exact source text (name/`function` through the
 		-- closing `}`) so `declare -f`/`type`/`command -V` can recover it verbatim,
 		-- no deparser needed. `src` here is the whole script or the -c/stdin string.
 		local deftext = dstart and src:sub(dstart, i - 1) or nil
-		local redirs = {}
+		local redirs = hoisted or {}
 		while true do
 			ws()
 			local r = parse_redir()
@@ -3784,6 +3760,8 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs, xg, bq
 			_pst = deftext and pst_now(),
 			line = dline,
 			bline = bline,
+			rline = rline,
+			rline_own = rline_own,
 			eline = line, -- (where it ends: a readonly function's redefinition is reported there)
 			subbody = subbody, -- `f() ( … )`: redirections belong to that subshell (declare -f)
 			redirs = (#redirs > 0 and redirs or nil),
@@ -3929,27 +3907,38 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs, xg, bq
 	-- Parse an array literal `( elem elem … )` with `i` positioned ON the `(`.
 	-- Each element is `value` or `[sub]=value` / `[sub]+=value`; the subscript may
 	-- nest brackets (`[a[0]]=x`). Consumes through the closing `)`.
+	local parse_array_elems0
+	-- (bash's parse_compound_assignment: a word inside that fails to read — an unclosed
+	-- quote, backquote or ${ — is parse_string_error: status 1 and a DISCARD, as the
+	-- literal's own unclosed `)`)
 	local function parse_array_elems()
+		local ok, r, ltext = pcall(parse_array_elems0) -- (ltext: the literal's text — keep it)
+		if ok then
+			return r, ltext
+		end
+		if type(r) == "table" and r.__curse_perr and not r.status
+			and tostring(r.msg or ""):find("^unexpected EOF while looking for matching") then
+			r.status, r.discard = 1, true
+		elseif type(r) == "string" and r:find("unexpected EOF while looking for matching", 1, true) then
+			arrlit_eof = true -- (the line's parse_error takes status 1 + DISCARD: next_line)
+		end
+		error(r, 0)
+	end
+	parse_array_elems0 = function()
 		i = i + 1
 		local elems = {}
+		local toks = {} -- (each element's token as read: bash's parse_compound_assignment joins
+		-- them with single blanks, comments and newlines dropped — the literal's text)
 		local line0, closed = line, false
 		while i <= n do
-			ws()
+			skipsep() -- (newlines, comments: a word never starts at a `#` here)
 			local c = src:sub(i, i)
 			if c == ")" then
 				i = i + 1
 				closed = true
 				break
 			end
-			if c == "\n" then
-				if not (alias_nl and alias_nl[i]) then line = line + 1 end
-				i = i + 1
-			elseif c == "#" then
-				-- a comment runs to end of line (words never start here: ws() just ran)
-				while i <= n and src:sub(i, i) ~= "\n" do
-					i = i + 1
-				end
-			elseif c == "" then
+			if c == "" then
 				break
 			elseif c == "&" or c == ";" or c == "|" or ((c == "<" or c == ">") and src:sub(i + 1, i + 1) ~= "(") then
 				-- a control operator inside the list (`a=(x & y)`): bash's recoverable
@@ -3957,18 +3946,14 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs, xg, bq
 				-- lines of a multi-line literal then parse as ordinary commands (bash)
 				-- (the token is the whole operator: `<>`, `>>`, `&&`, …)
 				local tok = src:match("^[<>]+", i) or src:match("^[&|;][&|;]?", i) or c
-				while i <= n and src:sub(i, i) ~= "\n" do
-					i = i + 1
-				end
+				i = src:find("\n", i, true) or n + 1
 				error({ __curse_arraylit = true, tok = tok })
 			elseif c == "(" then
 				-- an ELEMENT can't be `(` (a nested `()`, as in `a=( inside=() )`): bash
 				-- reports a syntax error but the assignment is NON-fatal (the var stays
 				-- unset, the script CONTINUES). Like an operator above, the error discards
 				-- the rest of the LINE; raise a RECOVERABLE error the line-parser marks so.
-				while i <= n and src:sub(i, i) ~= "\n" do
-					i = i + 1
-				end
+				i = src:find("\n", i, true) or n + 1
 				error({ __curse_arraylit = true })
 			else
 				-- `[foo bar]=v`: a subscript is read as one unit, blanks and all, when a
@@ -3981,30 +3966,14 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs, xg, bq
 				if c == "[" then
 					local depth, k = 0, i
 					while k <= n do
-						local ch = src:sub(k, k)
-						if ch == "\\" then
-							k = k + 2
-						elseif ch == "'" then
-							k = (src:find("'", k + 1, true) or n) + 1
-						elseif ch == '"' then -- (a \" inside doesn't close it)
-							k = k + 1
-							while k <= n and src:sub(k, k) ~= '"' do
-								k = k + (src:sub(k, k) == "\\" and 2 or 1)
-							end
-							k = k + 1
-						elseif ch == "`" then
-							k = k + 1
-							while k <= n and src:sub(k, k) ~= "`" do
-								k = k + (src:sub(k, k) == "\\" and 2 or 1)
-							end
-							k = k + 1
-						elseif ch == "$" and src:sub(k + 1, k + 1) == "(" then
-							local ok, e = pcall(scan_cmdsub, src, k + 2)
-							k = ok and e or k + 2
+						local e = brace_skip(src, k) -- (quoted text, `…`, $( … ): no brackets)
+						if e then
+							k = e
 						else
-							if ch == "[" then
+							local ch = src:byte(k)
+							if ch == 91 then
 								depth = depth + 1
-							elseif ch == "]" then
+							elseif ch == 93 then
 								depth = depth - 1
 								if depth == 0 then
 									break
@@ -4029,31 +3998,10 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs, xg, bq
 				if w == "" then
 					break
 				end
+				toks[#toks + 1] = w
 				local keyraw, eop, rhs = nil, "=", w
 				if w:sub(1, 1) == "[" then
-					local depth, close, j = 0, nil, 1 -- (brackets inside quotes don't count)
-					while j <= #w do
-						local ch = w:sub(j, j)
-						if ch == "\\" then
-							j = j + 1
-						elseif ch == "'" then
-							j = w:find("'", j + 1, true) or #w
-						elseif ch == '"' then
-							j = j + 1
-							while j <= #w and w:sub(j, j) ~= '"' do
-								j = j + (w:sub(j, j) == "\\" and 2 or 1)
-							end
-						elseif ch == "[" then
-							depth = depth + 1
-						elseif ch == "]" then
-							depth = depth - 1
-							if depth == 0 then
-								close = j
-								break
-							end
-						end
-						j = j + 1
-					end
+					local close = subscript_close(w, 1)
 					if close then
 						local after = w:sub(close + 1)
 						if after:sub(1, 2) == "+=" then
@@ -4072,14 +4020,12 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs, xg, bq
 					local factors = brace_factors(rhs)
 					if factors then
 						stream_factors(factors, function(x)
-							local bw = bq_word(x)
-							bw.noassign = true -- (a bare element's `x=~` is not an assignment: no ~ after =)
+							local bw = elem_word(bq_word(x))
 							elems[#elems + 1] = { key = nil, op = "=", word = bw }
 							return #elems >= BRACE_CAP
 						end)
 					else
-						local bw = parse_word(rhs)
-						bw.noassign = true
+						local bw = elem_word(parse_word(rhs))
 						elems[#elems + 1] = { key = nil, op = "=", word = bw }
 					end
 				else
@@ -4094,8 +4040,7 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs, xg, bq
 					if factors then
 						elem.brace_bare = {}
 						stream_factors(factors, function(x)
-							local bw = bq_word(x)
-							bw.noassign = true
+							local bw = elem_word(bq_word(x))
 							elem.brace_bare[#elem.brace_bare + 1] = bw
 							return #elem.brace_bare >= BRACE_CAP
 						end)
@@ -4112,7 +4057,7 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs, xg, bq
 			error({ __curse_perr = true, line = line0, status = 1, discard = true, exactmsg = true,
 				msg = "unexpected EOF while looking for matching `)'" }, 0)
 		end
-		return elems
+		return elems, "(" .. table.concat(toks, " ") .. ")"
 	end
 
 	local function try_assign()
@@ -4123,37 +4068,9 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs, xg, bq
 		local p = i + #name
 		local subidx = nil
 		if src:sub(p, p) == "[" then
-			-- find the MATCHING ] (subscript may contain nested [ ] via ${a[i]}); quoted
-			-- text and escapes don't count (`A[']']=10` has the key `]`)
-			local depth, q = 1, p + 1
-			while q <= n and depth > 0 do
-				local ch = src:sub(q, q)
-				if ch == "\\" then
-					q = q + 1
-				elseif ch == "'" then
-					q = (src:find("'", q + 1, true) or n)
-				elseif ch == '"' then
-					local e = q + 1
-					while e <= n and src:sub(e, e) ~= '"' do
-						e = e + (src:sub(e, e) == "\\" and 2 or 1)
-					end
-					q = e
-				elseif ch == "$" and src:sub(q + 1, q + 1) == "(" then
-					local ok, nq = pcall(scan_cmdsub, src, q + 2)
-					q = ok and nq - 1 or q
-				elseif ch == "$" and src:sub(q + 1, q + 1) == "{" then
-					q = scan_braces(src, q + 1) - 1
-				elseif ch == "[" then
-					depth = depth + 1
-				elseif ch == "]" then
-					depth = depth - 1
-				end
-				if depth == 0 then
-					break
-				end
-				q = q + 1
-			end
-			if depth == 0 and src:sub(q + 1, q + 1):match("[+=]") then
+			-- (the key may nest: `a[${b[i]}]=`, `A[']']=10` has the key `]`)
+			local q = subscript_close(src, p)
+			if q and src:sub(q + 1, q + 1):match("[+=]") then
 				subidx = src:sub(p + 1, q - 1)
 				p = q + 1
 			end
@@ -4172,7 +4089,7 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs, xg, bq
 		i = p
 		if src:sub(i, i) == "(" then -- array literal
 			local pstart = i
-			local elems = parse_array_elems()
+			local elems, ltext = parse_array_elems()
 			local nx = src:sub(i, i)
 			if nx ~= "" and not nx:match("[%s;&|)<>]") then
 				-- `a=(4*3)/2`: text goes on past the `)` — then it's one ORDINARY word
@@ -4188,7 +4105,7 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs, xg, bq
 				name = name,
 				elems = elems,
 				append = (op == "+="),
-				raw = src:sub(pstart, i - 1),
+				raw = ltext, -- (normalized as bash's parser rebuilds it: `(1 2)` for `( 1\n 2 )`)
 				index = subidx,
 			}
 		end
@@ -4225,9 +4142,7 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs, xg, bq
 		-- an alias that expanded to a comment (`alias c=#`): the rest of the line is a comment
 		-- and there is NO command ($? unchanged)
 		if src:sub(i, i) == "#" then
-			while i <= n and src:sub(i, i) ~= "\n" do
-				i = i + 1
-			end
+			i = src:find("\n", i, true) or n + 1
 			return { t = "noop", line = line }
 		end
 		local dstart, dline = i, line -- byte offset + line where this command (hence a funcdef) begins
@@ -4303,18 +4218,23 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs, xg, bq
 			return funcdef_node(nm, dstart, dline)
 		end
 		do
-			-- bash is lenient about funcdef names: `=` is allowed in the middle
-			-- (`func-name=ext () { … }`), as long as the name doesn't END in `=` — that
-			-- is an array/scalar assignment (`a=()`, `x=`), which the assignment path
-			-- handles instead (and `a=(` is caught there before we get here anyway).
-			local s, e = src:find("^[%w_:%.+@/%%%^~,][%w_%.%-:+@/!#=%%%^~,]*", i)
+			-- bash is lenient about funcdef names: `=` is allowed (`func-name=ext () { … }`,
+			-- `==x=()`), unless the name is an assignment word ending in `=` — an array/scalar
+			-- assignment (`a=()`, `x=`), which the assignment path handles instead (and `a=(`
+			-- is caught there before we get here anyway).
+			-- (a leading `!` or `-` too — `!x() { …; }` names `!x`: a `!` only negates as a word
+			-- of its own; `!()` is no name)
+			local s, e = src:find("^[%w_:%.+@/%%%^~,!%-=][%w_%.%-:+@/!#=%%%^~,]*", i)
+			if s == e and src:byte(s) == 33 then
+				s = nil
+			end
 			if s and src:byte(e + 1) == 91 then -- (`a[1]()` names a function too; an unbalanced
 				local _, e2 = src:find("^[%w_%.%-:+@/!#=%%%^~,%[%]]*", e + 1) -- `f[x` is left to the
 				if src:sub(s, e2):find("^[^][]*%b[][^][]*$") then -- word reader)
 					e = e2
 				end
 			end
-			if s and src:byte(e) ~= 61 then
+			if s and not (src:byte(e) == 61 and (src:find("^[%a_][%w_]*%+?=", s) or src:find("^[%a_][%w_]*%b[]%+?=", s))) then
 				local j = e + 1
 				while is_blank(src:sub(j, j)) do
 					j = j + 1
@@ -4398,10 +4318,6 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs, xg, bq
 			i = i + (issel and 6 or 3)
 			ws()
 			if not issel and src:sub(i, i + 1) == "((" then
-				if not src:find(")", i + 2, true) then
-					comsub_eof = false
-					error("unexpected EOF while looking for matching `)'")
-				end
 				local body, ni = grab_dparen(src, i + 2)
 				if src:byte(ni - 1) ~= 41 then
 					-- `for ((…)` closed by a lone `)`: bash's parse_dparen fails and its re-read
@@ -4410,29 +4326,11 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs, xg, bq
 					error({ __curse_perr = true, exact = true, line = line, msg = "syntax error near `"
 						.. (nx or ((body:match(".*(;.*)$") or ("((" .. body)) .. ")")) .. "'" }, 0)
 				end
+				-- (the header's own newlines: bash's lexer counts them as it reads the `((…))`)
+				line = line + select(2, src:sub(i + 2, ni - 1):gsub("\n", ""))
 				i = ni
 				-- split the header at its top-level `;`s — not inside quotes, $(…), ${…}
-				local slots, k0, k, bn = {}, 1, 1, #body
-				while k <= bn do
-					local ch = body:sub(k, k)
-					if ch == "\\" then
-						k = k + 2
-					elseif ch == "'" or ch == '"' or ch == "`" then
-						local e = body:find(ch, k + 1, true)
-						k = (e or bn) + 1
-					elseif ch == "$" and body:sub(k + 1, k + 1) == "(" then
-						k = scan_cmdsub(body, k + 2)
-					elseif ch == "$" and body:sub(k + 1, k + 1) == "{" then
-						k = scan_braces(body, k + 1)
-					elseif ch == ";" then
-						slots[#slots + 1] = body:sub(k0, k - 1)
-						k0 = k + 1
-						k = k + 1
-					else
-						k = k + 1
-					end
-				end
-				slots[#slots + 1] = body:sub(k0)
+				local slots = split_top(body, ";")
 				local a, b, c = slots[1], slots[2], slots[3]
 				loopId = loopId + 1
 				local id = loopId
@@ -4451,7 +4349,8 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs, xg, bq
 				-- executes and runs zero iterations non-fatally, rather than failing to parse
 				-- the whole script (same rule as `$((…))`). A clean parse is unchanged.
 				local function parith(s)
-					if not s:match("%S") then
+					if not s:match("[^ \t]") then -- (make_arith_for_expr skips only blanks: a slot of
+						-- just a newline is an expression, evaluating to 0)
 						return nil
 					end
 					local ok, ast = pcall(arith, s)
@@ -4493,20 +4392,7 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs, xg, bq
 			i = e + 1
 			-- bash allows blank lines / comments between the loop var and `in` (but a
 			-- `;` terminates the header — `for i;` iterates "$@").
-			while true do
-				ws()
-				local c = src:sub(i, i)
-				if c == "\n" then
-					if not (alias_nl and alias_nl[i]) then line = line + 1 end
-					i = i + 1
-				elseif c == "#" then
-					while i <= n and src:sub(i, i) ~= "\n" do
-						i = i + 1
-					end
-				else
-					break
-				end
-			end
+			skipsep()
 			local words = {}
 			try_alias(false)
 			do -- (after the name: `in`, `do`, or a separator — `for x y` is an error)
@@ -4641,43 +4527,17 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs, xg, bq
 		-- balance first returns to 0 at a `)` that is NOT followed by another `)`, the
 		-- `(` closed a subshell, not the arith — fall through to the subshell parser.
 		if src:sub(i, i + 1) == "((" then
-			local j, d, isarith = i + 2, 0, false
-			while j <= n do
-				local c = src:sub(j, j)
-				if c == "\\" then
-					j = j + 2
-				elseif c == "'" or c == '"' then
-					local q = c
-					j = j + 1
-					while j <= n and src:sub(j, j) ~= q do
-						if src:sub(j, j) == "\\" and q == '"' then
-							j = j + 2
-						else
-							j = j + 1
-						end
-					end
-					j = j + 1
-				elseif c == "(" then
-					d = d + 1
-					j = j + 1
-				elseif c == ")" then
-					if d == 0 then
-						isarith = (src:sub(j + 1, j + 1) == ")")
-						break
-					end
-					d = d - 1
-					j = j + 1
-				else
-					j = j + 1
-				end
-			end
-			if j > n and d == 0 then -- (`(( 1 +` never closed: bash's arithmetic EOF error)
+			local j, d = dparen_close(src, i + 2)
+			if not j and d == 0 then -- (`(( 1 +` never closed: bash's arithmetic EOF error)
 				comsub_eof = false
-				error("unexpected EOF while looking for matching `)'")
+				eof_error(src, i, ")")
 			end
-			if isarith then
-				local body, ni = grab_dparen(src, i + 2)
-				i = ni
+			if j and src:byte(j + 1) == 41 then
+				local body = src:sub(i + 2, j - 1)
+				i = j + 2
+				-- bash's make_arith_command stamps the line the `))` closed on (its lexer has
+				-- counted the body's newlines by then): $LINENO and error lines use it
+				line = line + select(2, body:gsub("\n", ""))
 				-- a malformed `(( expr ))` (bad lvalue) is a NON-fatal runtime error in bash,
 				-- so defer the parse failure to eval (caught by the arithcmd handler) rather
 				-- than aborting the whole parse.
@@ -4697,13 +4557,15 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs, xg, bq
 			i = i + 2
 			local line0, closed = line, false
 			local toks, quoted, nlb, tp, tl = {}, {}, {}, {}, {} -- (tp/tl: each token's position/line)
+			-- (a word that runs into the end of input — an unclosed quote — is an error only
+			-- when bash's cond parser READS it: a grammar error on an earlier token wins)
+			local pend_err
 			while true do
 				ws()
 				tp[#toks + 1], tl[#toks + 1] = i, line
 				if src:sub(i, i) == "\n" then
 					nlb[#toks + 1] = nlb[#toks + 1] or { i, line } -- (the first newline before it)
-					if not (alias_nl and alias_nl[i]) then line = line + 1 end
-					i = i + 1 -- continuation inside [[ ]]
+					newline() -- continuation inside [[ ]]
 				elseif i > n or src:sub(i, i + 1) == "]]" then
 					if src:sub(i, i + 1) == "]]" then
 						i = i + 2
@@ -4736,18 +4598,8 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs, xg, bq
 						end
 						if c0 == "\\" then
 							i = i + 2
-						elseif c0 == "'" then
-							i = i + 1
-							while i <= n and src:sub(i, i) ~= "'" do
-								i = i + 1
-							end
-							i = i + 1
-						elseif c0 == '"' then
-							i = i + 1
-							while i <= n and src:sub(i, i) ~= '"' do
-								i = i + (src:sub(i, i) == "\\" and 2 or 1)
-							end
-							i = i + 1
+						elseif c0 == "'" or c0 == '"' then
+							i = quote_end(src, i, c0 == '"')
 						elseif c0 == "(" then
 							pd = pd + 1
 							depth = depth + 1
@@ -4788,7 +4640,16 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs, xg, bq
 					i = i + 1
 				else
 					local before = i
-					local w = word(true, true) -- split on <,>,(,) operators (no spaces needed in [[ ]])
+					local wok, w = pcall(word, true, true) -- split on <,>,(,) operators (no spaces needed in [[ ]])
+					if not wok then
+						if type(w) == "string" and w:find("unexpected EOF while looking for matching", 1, true) then
+							pend_err = w
+							toks[#toks + 1] = COND_PEND
+							quoted[#toks] = false
+							break
+						end
+						error(w, 0)
+					end
 					if w == "" then
 						-- word() stalled on a self-delimiting metacharacter. `&&`/`||` are
 						-- two-char operator tokens; `(`, `)`, `<`, `>`, `;`, … are one char
@@ -4812,6 +4673,22 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs, xg, bq
 				end
 			end
 			local cok, cerr = pcall(cond_check, toks, quoted, nlb, not closed, line0, tl)
+			if pend_err and (cok or (type(cerr) == "table" and cerr.eof)) then
+				error(pend_err, 0) -- (the grammar took the unclosed word as it was: the quote's error)
+			end
+			if pend_err and not cok and type(cerr) == "table" and cerr.pend then
+				-- the grammar READ the failed word (bash's error token): parse_matched_pair's
+				-- EOF message at the quote's line, then cond_term's own — at the end of input
+				-- (the quote swallowed the rest; a missing final newline is supplied) — and no
+				-- `syntax error near` line
+				local ptl = tl[#toks] -- (the failed word's line)
+				local eofl = ptl + select(2, src:sub(tp[#toks]):gsub("\n", "")) + (src:sub(-1) == "\n" and 0 or 1)
+				local out = { { (pend_err:gsub("^.-:%d+: ", "")), ptl } }
+				for _, m in ipairs(cerr.pre or {}) do
+					out[#out + 1] = type(m) == "table" and m or { m, eofl }
+				end
+				error({ __curse_perr = true, pre = out, nomsg = true, line = eofl, msg = "" }, 0)
+			end
 			if not cok then -- (reported at the failing token: its line, shown as the input line)
 				local k = type(cerr) == "table" and cerr.fk
 				if type(cerr) == "table" and cerr.eof then
@@ -4907,12 +4784,7 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs, xg, bq
 				error("syntax error near `" .. ((c == "\n" or c == "") and "newline" or c) .. "'")
 			end
 			local subject = parse_word(subw)
-			while src:sub(i, i):match("[ \t\n]") do
-				if src:sub(i, i) == "\n" then
-					if not (alias_nl and alias_nl[i]) then line = line + 1 end
-				end
-				i = i + 1
-			end
+			skipsep()
 			if peekword() == "in" then
 				i = i + 2
 				jcx = { l = ln, up = jcx } -- (its clauses: `up` restores it after — see below)
@@ -4925,51 +4797,25 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs, xg, bq
 				line = l0
 				error("syntax error near `" .. (w ~= "" and w or src:match("^[;&|<>]+", i) or src:sub(i, i)) .. "'")
 			end -- ysh `case (x) { }` etc. rejected
-			-- separator skipper that STOPS at ;; (so a clause body ends there)
+			-- separator skipper that STOPS at a clause's ;; / ;;& / ;& (-> it; at EOF "eof")
 			-- (semi_ok: one `;` may end the statement just read; anywhere else — a clause's
 			-- start, after a newline — a `;` is an empty command, bash's syntax error)
 			local function skip_sep(semi_ok)
-				while i <= n do
-					if src:sub(i, i + 2) == ";;&" then
-						return "dsemi_amp"
-					end -- ;;& (test next patterns)
-					if src:sub(i, i + 1) == ";;" then
-						return "dsemi"
-					end -- ;; (stop)
-					if src:sub(i, i + 1) == ";&" then
-						return "semi_amp"
-					end -- ;& (fall through)
-					local c = src:sub(i, i)
-					if c == "\n" then
-						-- a heredoc opened by a command in this arm has its body after the
-						-- newline (like the shared skipsep) — collect it, else it leaks as
-						-- commands (`x) cat <<EOF … EOF ;;`).
-						if #heredocs_pending > 0 then
-							collect_heredocs()
-						else
-							if not (alias_nl and alias_nl[i]) then line = line + 1 end
-							i = i + 1
-						end
-					elseif c == " " or c == "\t" then
-						i = i + 1
-					elseif c == ";" then
-						if not semi_ok then
-							error("syntax error near `;'")
-						end
+				while true do
+					if skipsep() then
 						semi_ok = false
-						i = i + 1
-					elseif c == "#" then
-						while i <= n and src:sub(i, i) ~= "\n" do
-							i = i + 1
-						end
-					else
+					end
+					local t = src:match("^;;&", i) or src:match("^;[;&]", i)
+					if t or i > n then
+						return t or "eof"
+					elseif src:byte(i) ~= 59 then
 						return nil
+					elseif not semi_ok then
+						error("syntax error near `;'")
 					end
-					if c == "\n" then
-						semi_ok = false
-					end
+					semi_ok = false
+					i = i + 1
 				end
-				return "eof"
 			end
 			local clauses = {}
 			while true do
@@ -4988,138 +4834,26 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs, xg, bq
 				if src:sub(i, i) == "(" then
 					i = i + 1
 				end -- optional leading (
-				-- read to the clause-terminating ), balancing extglob parens @(a|b) and
-				-- copying quoted sections verbatim (their ) / | are not structural).
-				local patstr, depth = {}, 0
-				local wantw = true -- (a pattern word must come first and after each `|`)
+				-- the patterns: words (read like any other — quotes, expansions and an extglob
+				-- group are part of one, so their `|` and `)` are too) joined by `|`, up to the
+				-- clause's `)`. Anything else there is bash's syntax error at that token: `a|)`,
+				-- `|a)`, `)`, `x|(z)`, `a;;esac`, `a&)`, `a b)`, a `(` without extglob.
+				local pats = {}
 				while true do
+					local pw = word(true)
+					ws()
 					local c = src:sub(i, i)
-					if c == "" and depth > 0 then
-						comsub_eof = false
-						error("unexpected EOF while looking for matching `)'")
+					if pw == "" or not (c == ")" or c == "|" and not src:find("^[|&]", i + 1)) then
+						local tok = (c == "\n" or c == "") and "newline" or src:match("^;;&", i) or src:match("^;[;&]", i)
+							or src:match("^|[|&]", i) or src:match("^&[&>]", i)
+							or pw ~= "" and src:match("^[^ \t\n;&|()<>]+", i) or c
+						error("syntax error near `" .. tok .. "'")
 					end
-					if depth == 0 then
-						if wantw and is_blank(c) then
-							ws()
-							c = src:sub(i, i)
-						end
-						-- an operator where a pattern word belongs, or one ending a word
-						-- (bash's tokens: `a|)`, `|a)`, `)`, `x|(z)`, `a;;esac`, `a&)`)
-						if (wantw and (c == ")" or c == "|" or c == "(")) or c == ";" or c == "&"
-							or (c == "|" and src:find("^[|&]", i + 1))
-							or c == "<" or c == ">" or c == "\n" or c == "" then
-							local tok = (c == "\n" or c == "") and "newline" or src:match("^;;&", i) or src:match("^;[;&]", i)
-								or src:match("^|[|&]", i) or src:match("^&[&>]", i) or c
-							error("syntax error near `" .. tok .. "'")
-						end
-						wantw = c == "|"
-						-- `(` is a group only after an extglob prefix, when extglob is on
-						if c == "(" and not (patstr[#patstr] and patstr[#patstr]:match("^[?*+@!]$") and not xg_off()) then
-							error("syntax error near `('")
-						end
-						if c == "(" and not (sh or extglob_on or xg == false) then
-							xg_guess = true
-						end
-					end
-					if c == ")" and depth == 0 then
+					pats[#pats + 1] = pw
+					i = i + 1
+					if c == ")" then
 						break
 					end
-					if depth == 0 and is_blank(c) then -- (between words only `|` or `)`)
-						local k = i
-						while is_blank(src:sub(k, k)) do
-							k = k + 1
-						end
-						local prev = table.concat(patstr):match("(%S)%s*$")
-						local nx = src:sub(k, k)
-						if prev and prev ~= "|" and nx ~= "" and nx ~= "|" and nx ~= ")" and nx ~= "\n" then
-							error("syntax error near `" .. (src:match("^[^ \t\n;&|()<>]+", k) or nx) .. "'")
-						end
-					end
-					if c == "\\" then -- a backslash escapes the next char (incl. a quote or `)`):
-						patstr[#patstr + 1] = src:sub(i, i + 1)
-						i = i + 2 -- copy both, don't treat `\'` as a quote
-					elseif c == "'" or c == '"' then
-						local q0, k0 = i, #patstr + 1
-						patstr[#patstr + 1] = c
-						i = i + 1
-						while i <= n and src:sub(i, i) ~= c do
-							patstr[#patstr + 1] = src:sub(i, i)
-							i = i + 1
-						end
-						if i > n then
-							error("unexpected EOF while looking for matching `" .. c .. "'")
-						end
-						if c == '"' and patstr[k0 - 1] == "$" then
-							LTR_SEEN = true
-						end
-						if c == '"' and sh and patstr[k0 - 1] == "$" then -- a $"…" pattern: translated
-							local t = require("gettext").translate(sh, src:sub(q0 + 1, i - 1))
-							if t then
-								for k = #patstr, k0 + 1, -1 do
-									patstr[k] = nil
-								end
-								patstr[k0 + 1] = t
-							end
-						end
-						patstr[#patstr + 1] = src:sub(i, i)
-						i = i + 1
-					elseif c == "$" and src:sub(i + 1, i + 1) == "(" and src:sub(i + 2, i + 2) ~= "(" then
-						-- a $( … ) in a pattern: its body is checked as it's read (bash's
-						-- parse_comsub — which doesn't inherit the case-pattern state)
-						local je = scan_cmdsub(src, i + 2)
-						local cbody = src:sub(i + 2, je - 2)
-						if not alias_on and not cbody:find("<<", 1, true) then
-							comsub_check(cbody)
-						end
-						patstr[#patstr + 1] = src:sub(i, je - 1)
-						i = je
-					elseif c == "$" and src:sub(i + 1, i + 2) == "((" then -- $(( … )): one word part
-						local _, je = grab_dparen(src, i + 3)
-						patstr[#patstr + 1] = src:sub(i, je - 1)
-						i = je
-					elseif c == "$" and src:sub(i + 1, i + 1) == "{" then -- ${ … }
-						local je = scan_braces(src, i + 1)
-						patstr[#patstr + 1] = src:sub(i, je - 1)
-						i = je
-					elseif c == "`" then
-						local je = i + 1
-						while je <= n and src:sub(je, je) ~= "`" do
-							je = je + (src:sub(je, je) == "\\" and 2 or 1)
-						end
-						patstr[#patstr + 1] = src:sub(i, je)
-						i = je + 1
-					else
-						if c == "(" then
-							depth = depth + 1
-						elseif c == ")" then
-							depth = depth - 1
-						end
-						patstr[#patstr + 1] = c
-						i = i + 1
-					end
-				end
-				i = i + 1 -- skip the terminating )
-				-- split on top-level | (extglob's internal | is protected by parens)
-				local pats, d2, cur = {}, 0, {}
-				local full = table.concat(patstr)
-				for k = 1, #full do
-					local ch = full:sub(k, k)
-					if ch == "(" then
-						d2 = d2 + 1
-						cur[#cur + 1] = ch
-					elseif ch == ")" then
-						d2 = d2 - 1
-						cur[#cur + 1] = ch
-					elseif ch == "|" and d2 == 0 then
-						pats[#pats + 1] = table.concat(cur)
-						cur = {}
-					else
-						cur[#cur + 1] = ch
-					end
-				end
-				pats[#pats + 1] = table.concat(cur)
-				for k = 1, #pats do
-					pats[k] = (pats[k]:gsub("^%s+", ""):gsub("%s+$", ""))
 				end
 				local body, term = {}, "break"
 				local svs = cur_stopset
@@ -5127,21 +4861,11 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs, xg, bq
 				local semi_ok = false
 				while true do
 					local s = skip_sep(semi_ok)
-					if s == "dsemi" then
-						i = i + 2
-						term = "break"
+					if CASE_TERM[s] then
+						i = i + #s
+						term = CASE_TERM[s]
 						break
 					end
-					if s == "dsemi_amp" then
-						i = i + 3
-						term = "test"
-						break
-					end -- ;;&
-					if s == "semi_amp" then
-						i = i + 2
-						term = "fall"
-						break
-					end -- ;&
 					if s == "eof" or peekword() == "esac" then
 						break
 					end
@@ -5311,11 +5035,7 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs, xg, bq
 							elseif ch == "\\" then
 								i = i + 1
 							elseif ch == "'" or ch == '"' then
-								local close = src:find(ch == "'" and "'" or '[\\"]', i + 1)
-								while close and ch == '"' and src:sub(close, close) == "\\" do
-									close = src:find('[\\"]', close + 2)
-								end
-								i = close or n
+								i = quote_end(src, i, ch == '"') - 1 -- (its closing quote)
 							end
 							i = i + 1
 						until depth == 0 or i > n
@@ -5506,26 +5226,9 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs, xg, bq
 					i = i + 1
 				end
 				-- bash allows spaces, a comment, and newlines after `|` before the next cmd
-				while true do
-					ws()
-					if src:sub(i, i) == "#" then
-						while i <= n and src:sub(i, i) ~= "\n" do
-							i = i + 1
-						end
-					elseif src:sub(i, i) == "\n" then
-						-- a heredoc opened by the stage before this `|` has its body on the
-						-- following lines (`cat <<EOF |` <newline> body EOF <newline> next) —
-						-- consume it here before the next stage, else the body parses as cmds.
-						if #heredocs_pending > 0 then
-							collect_heredocs()
-						else
-							if not (alias_nl and alias_nl[i]) then line = line + 1 end
-							i = i + 1
-						end
-					else
-						break
-					end
-				end
+				-- (a heredoc opened by the stage before this `|` has its body on the following
+				-- lines: `cat <<EOF |` <newline> body EOF <newline> next)
+				skipsep()
 				operand_check()
 				if bang_at(i) then -- (`!` only starts a pipeline: bash's grammar)
 					error("syntax error near `!'")
@@ -5560,20 +5263,7 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs, xg, bq
 				i = i + 2
 				-- `&&`/`||` at end of a line CONTINUE to the next line (bash), so skip any
 				-- newlines / blank lines / comments before the right-hand pipeline.
-				while true do
-					ws()
-					local c = src:sub(i, i)
-					if c == "\n" then
-						if not (alias_nl and alias_nl[i]) then line = line + 1 end
-						i = i + 1
-					elseif c == "#" then
-						while i <= n and src:sub(i, i) ~= "\n" do
-							i = i + 1
-						end
-					else
-						break
-					end
-				end
+				skipsep()
 				items = items or { { op = nil, cmd = head } }
 				operand_check()
 				items[#items + 1] = { op = two, cmd = parse_pipeline() }
@@ -5607,7 +5297,7 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs, xg, bq
 		stopset = stopset or {}
 		local stmts = {}
 		while true do
-			skipblank()
+			skipsep()
 			if i > n then
 				return stmts, nil
 			end
@@ -5648,7 +5338,7 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs, xg, bq
 			end
 			-- consume this statement's single trailing `;` (its terminator), so the next
 			-- iteration lands on a genuine command position; `&`/newlines are handled by
-			-- parse_stmt/skipblank. A following `;` is then a bare separator (error).
+			-- parse_stmt/skipsep. A following `;` is then a bare separator (error).
 			ws()
 			if src:sub(i, i) == ";" and src:sub(i + 1, i + 1) ~= ";" then
 				i = i + 1
@@ -5664,22 +5354,6 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs, xg, bq
 	-- interpreter simply never asks for it if an earlier `exit` fired. (Nested
 	-- lists — function bodies, loops — stay strict: a broken body IS a real error.)
 	local done = false
-	-- Skip within-LINE whitespace: spaces/tabs and `\<newline>` line continuations
-	-- (which bash removes at the lexer level, so they EXTEND the logical line), but
-	-- NOT a real newline — that ends the line.
-	local function skip_inline()
-		while true do
-			local c = src:sub(i, i)
-			if c == " " or c == "\t" then
-				i = i + 1
-			elseif c == "\\" and src:sub(i + 1, i + 1) == "\n" then
-				i = i + 2
-				line = line + 1
-			else
-				break
-			end
-		end
-	end
 	-- Yield one LOGICAL LINE at a time: a complete `simple_list` — all the
 	-- `;`/`&`/`&&`/`||`-joined and-or lists up to a top-level newline or EOF, as
 	-- bash's `inputunit` does. Returns { stmts = {…}, perr = <parse_error>? } or nil.
@@ -5687,12 +5361,13 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs, xg, bq
 	-- runs nothing (bash parses the entire line before executing any of it). The
 	-- parser stays statement-lazy (parse_stmt consumes complete multi-line compounds
 	-- and each stmt makes progress or errors), so there is no parse-ahead spin.
+	local prev_end -- (the last line group's last line: the reader goes on at the next)
 	local function next_line()
 		if done then
 			return nil
 		end
 		alias_line_start()
-		skipblank() -- blank lines, comments, and pending heredocs
+		skipsep() -- blank lines, comments, and pending heredocs
 		if i > n then
 			done = true
 			return nil
@@ -5707,6 +5382,7 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs, xg, bq
 		jcx = {}
 		while true do
 			local start, startline = i, line
+			arrlit_eof = false
 			local ok, st = pcall(parse_stmt)
 			if not ok then
 				-- A RECOVERABLE parse error (an invalid `NAME=( … )` array-literal element)
@@ -5727,19 +5403,26 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs, xg, bq
 						t = "parse_error",
 						-- (a recoverable one, or a `near TOKEN` one: the token's line)
 						line = (type(st) == "table" and st.__curse_perr and st.line)
-							or (recover or (type(st) == "string" and st:find("near `", 1, true))) and line or startline,
+							or (recover or (type(st) == "string" and st:find("near `", 1, true))) and line
+							or (eof_s == src and eof_at >= start and type(st) == "string"
+								and st:find("EOF while looking for matching", 1, true)) -- (where it opened)
+								and startline + select(2, src:sub(start, eof_at - 1):gsub("\n", ""))
+							or startline,
 						msg = recover and ("syntax error near `" .. (st.tok or "(") .. "'")
-							or (type(st) == "table" and st.__curse_perr and st.msg) or tostring(st),
-						status = type(st) == "table" and st.__curse_perr and st.status or nil, -- (else 2)
+							or (type(st) == "table" and st.__curse_perr and st.msg) or unpos(tostring(st)),
+						status = type(st) == "table" and st.__curse_perr and st.status
+							or (arrlit_eof and type(st) == "string" and 1) or nil, -- (else 2)
 						pre = type(st) == "table" and st.__curse_perr and st.pre or nil, -- (messages before it)
 						preline = type(st) == "table" and st.__curse_perr and st.preline or nil, -- (their line)
 						exact = type(st) == "table" and st.__curse_perr and st.exact or nil, -- (msg verbatim)
-						text = type(st) == "table" and st.__curse_perr and st.text or nil,
+						text = type(st) == "table" and st.__curse_perr and (st.text or st.ltext) or nil, -- (ltext: the line shown, plainly)
 						showtext = type(st) == "table" and st.__curse_perr and st.text and true or nil,
 						recoverable = recover or nil,
-						discard = type(st) == "table" and st.__curse_perr and st.discard or nil,
+						discard = type(st) == "table" and st.__curse_perr and st.discard
+							or (arrlit_eof and type(st) == "string") or nil,
 						forceeof = type(st) == "table" and st.__curse_perr and st.forceeof or nil,
 						exactmsg = type(st) == "table" and st.__curse_perr and st.exactmsg or nil, -- (its own msgid)
+						nomsg = type(st) == "table" and st.__curse_perr and st.nomsg or nil, -- (its `pre` says it all)
 					},
 				}
 			end
@@ -5757,7 +5440,7 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs, xg, bq
 				st.top = true -- (not nested in a compound: its errors report its END line)
 			end
 			stmts[#stmts + 1] = st
-			skip_inline()
+			ws()
 			local c = src:sub(i, i)
 			if st.t ~= "background" then
 				-- foreground: a single `;` continues the line; `\n`/EOF/`#` end it cleanly.
@@ -5767,7 +5450,7 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs, xg, bq
 				if c == ";" and src:sub(i + 1, i + 1) ~= ";" then
 					i = i + 1
 					st.semi = true -- (`a;⏎b` joins with `;`, not a newline: deparse's comsubs)
-					skip_inline()
+					ws()
 				elseif i > n or c == "\n" or c == "#" then
 					break
 				else
@@ -5818,8 +5501,12 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs, xg, bq
 		end
 		-- (pos/pline: where reading stopped — a reader that takes over the rest of the
 		-- input line by line, for command history, resumes there)
+		-- (rline: the line bash's reader reads next after the previous group ran — where it
+		-- notifies of jobs that ended meanwhile: rt.jobs_line)
+		local rline = prev_end and prev_end + 1
+		prev_end = eline
 		return { stmts = stmts, pos = i, pline = line, src = src, spos = gstart, sline = gline, eline = eline,
-			jcx = jcx }
+			jcx = jcx, rline = rline }
 	end
 	-- a syntax error also reports the offending input line (bash's second message line)
 	return function()
@@ -5869,11 +5556,11 @@ end
 -- program, and by callers that want the AST). An optional `sh` makes alias
 -- expansion consult the live runtime table (for eval/source/$() at runtime); the
 -- compiler passes none, so it tracks aliases deterministically from source.
--- (bq: `src` is a `…` body)
-function M.parse(src, sh, aenv, noalias, posix, line0, line1, xg, bq)
+-- (bq: `src` is a `…` body; cs: a $(…) body)
+function M.parse(src, sh, aenv, noalias, posix, line0, line1, xg, bq, cs)
 	local saved_env, sprex, spdq, sltr = ALIAS_ENV, COMSUB_PREX, POSIX_DQ, LTR_SEEN
 	LTR_SEEN = false
-	local nextf = make_parser(src, sh, aenv, noalias, posix, line0, line1, xg, bq) -- yields logical-line groups { stmts, perr }
+	local nextf = make_parser(src, sh, aenv, noalias, posix, line0, line1, xg, bq, cs) -- yields logical-line groups { stmts, perr }
 	local stmts, lines, xgg = {}, {}, nil
 	while true do
 		local lg = nextf()
@@ -5896,6 +5583,7 @@ function M.parse(src, sh, aenv, noalias, posix, line0, line1, xg, bq)
 		end
 		if stmts[first] then -- (the first statement of a line group: where a line abort resumes)
 			stmts[first].lgstart = true
+			stmts[first].lgread = lg.rline -- (rt.jobs_line's line)
 			if lg.eline and lg.sline and lg.eline > lg.sline then -- (its lines: rt.line_drift)
 				stmts[first].lgspan = { lg.sline, lg.eline }
 			end
@@ -5905,7 +5593,9 @@ function M.parse(src, sh, aenv, noalias, posix, line0, line1, xg, bq)
 	-- (ltrans: a $"…" may be translated — by the live reader, as each line is read)
 	local ltrans = LTR_SEEN or nil
 	LTR_SEEN = sltr or LTR_SEEN
-	return { stmts = stmts, lines = lines, ltrans = ltrans, xg_guess = xgg }
+	local last = lines[#lines]
+	return { stmts = stmts, lines = lines, ltrans = ltrans, xg_guess = xgg,
+		eofline = last and last.eline and last.eline + 1 } -- (the reader's line at end of input)
 end
 
 -- Lazy/incremental parse: returns an iterator yielding one top-level statement
@@ -5916,6 +5606,9 @@ end
 -- numbers eval'd code, and functions it defines, from there)
 function M.open(src, sh, line1)
 	return make_parser(src, sh, nil, nil, nil, nil, line1)
+end
+function M.open_full(...) -- (M.parse's arguments, read lazily: rt capture_src)
+	return make_parser(...)
 end
 
 do -- (loaded after the locale was set: runtime's lc_commit keeps it current from here)

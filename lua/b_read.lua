@@ -16,15 +16,22 @@ local rdbuf = ffi.new("char[?]", RDBUF)
 -- (then the option word advances by 2); either way it ends the bundle.
 -- Does a run of input need per-char handling (a NUL, a CTLESC byte, or — without -r — a
 -- backslash)? Plain finds, which the JIT compiles (a pattern it doesn't).
-local function needs_chars(seg, raw)
-	return seg:find("\0", 1, true) or seg:find("\1", 1, true) or (not raw and seg:find("\\", 1, true))
-end
-local function takearg(a, k, args, j, advance)
-	local r = a:sub(k + 1)
-	if r ~= "" then
-		return r, #a + 1, advance
+local function mb_short(seg) -- (an incomplete UTF-8 sequence: read_mbchar reads past it)
+	local k = seg:find("[\194-\253]")
+	while k do
+		local b = seg:byte(k)
+		local need = (b >= 0xFC and 5) or (b >= 0xF8 and 4) or (b >= 0xF0 and 3) or (b >= 0xE0 and 2) or 1
+		local e = seg:find("[^\128-\191]", k + 1) or #seg + 1
+		if e - k - 1 < need then
+			return true
+		end
+		k = seg:find("[\194-\253]", k + 1 + need)
 	end
-	return args[j + 1], #a + 1, 2
+	return false
+end
+local function needs_chars(seg, raw, nul, u8)
+	return seg:find("\0", 1, true) or seg:find("\1", 1, true) or (not raw and seg:find("\\", 1, true))
+		or (nul and seg:find("\127", 1, true)) or (u8 and mb_short(seg))
 end
 -- One byte of input for `read`, per its state `st` (see the builtin): a regular file
 -- is read in chunks (rewound past the line by unread); a deadline waits for input;
@@ -102,7 +109,7 @@ end
 -- read_mbchar reads while mbrtowc says "incomplete" — an invalid lead byte (80-C1,
 -- FE, FF) is a char by itself, a non-continuation byte ends the char (it is kept), and
 -- glibc still takes F5-FD as the leads of the old 4- to 6-byte forms
-local function mb_rest(st, c)
+local function mb_rest(st, c) -- (glibc's UTF-8 takes the old 5- and 6-byte forms too)
 	local b = c:byte()
 	if b < 0xC2 or b > 0xFD then
 		return c
@@ -140,85 +147,47 @@ end
 return function(sh, cmd, args, hook, tcb)
 	if cmd == "read" then
 		-- read [-r] [-a arr] [-p prompt] VAR...  (line from stdin, split on IFS)
-		local raw, arr, j, nchars, ndelim, ufd = false, nil, 2, nil, false, 0
-		local delim, tmout
-		while j <= #args do
-			local a = args[j]
-			if a == "--" then
-				j = j + 1
-				break
-			elseif a:sub(1, 1) == "-" and #a > 1 then
-				-- parse a bundle like -rd, -rN 6; an arg-taking flag takes the attached
-				-- rest of the word or the next word, and ends the bundle.
-				local k, advance = 2, 1
-				while k <= #a do
-					local f = a:sub(k, k)
-					if f:match("[adinNptu]") and k == #a and args[j + 1] == nil then
-						io.stderr:write("curse: read: -" .. f .. ": option requires an argument\n" .. rt.usage("read"))
-						sh.status = 2
-						return
-					end
-					if f == "r" then
-						raw = true
-						k = k + 1
-					elseif f == "d" then
-						local v0
-						v0, k, advance = takearg(a, k, args, j, advance)
-						delim = v0 or "\n"
-					elseif f == "n" or f == "N" then -- char count; a non-numeric arg is an error (not a hang)
-						local v
-						v, k, advance = takearg(a, k, args, j, advance)
-						nchars = int_arg(v)
-						if not nchars then -- (bash: legal_number, not negative, an int; sh_invalidnum)
-							io.stderr:write("curse: read: " .. tostring(v) .. ": " .. rt.invalidnum_msg(v or "") .. "\n")
-							sh.status = 1
-							return
-						end
-						if f == "N" then
-							ndelim = true
-						end
-					elseif f == "a" then
-						arr, k, advance = takearg(a, k, args, j, advance)
-					elseif f == "u" then
-						local v
-						v, k, advance = takearg(a, k, args, j, advance)
-						ufd = int_arg(v)
-						if not ufd then
-							io.stderr:write("curse: read: " .. v .. ": invalid file descriptor specification\n")
-							sh.status = 1
-							return
-						end
-						if C.fcntl(ufd, 1) < 0 then -- F_GETFD: not open
-							io.stderr:write("curse: read: " .. ufd .. ": invalid file descriptor: Bad file descriptor\n")
-							sh.status = 1
-							return
-						end
-					elseif f == "i" then
-						local _
-						_, k, advance = takearg(a, k, args, j, advance) -- (the readline default text: no readline here)
-					elseif f == "p" then
-						local _
-						_, k, advance = takearg(a, k, args, j, advance) -- prompt: consume + ignore (non-interactive)
-					elseif f == "t" then
-						local v
-						v, k, advance = takearg(a, k, args, j, advance)
-						tmout = uconvert(v)
-						if not tmout or tmout < 0 then
-							io.stderr:write("curse: read: " .. v .. ": invalid timeout specification\n")
-							sh.status = 1
-							return
-						end
-					elseif f == "s" or f == "e" then -- (no echo / readline: no terminal editing here)
-						k = k + 1
-					else
-						return rt.bad_option(sh, "read", "-" .. f, a)
-					end
+		local raw, arr, nchars, ndelim, ufd = false, nil, nil, false, 0
+		local delim, tmout, j, sp, f, v = nil, nil, 2
+		repeat -- (internal_getopt "ersa:d:i:n:p:t:u:N:"; -e/-s/-i/-p: no terminal here)
+			f, v, j, sp = rt.getopt(sh, "read", args, "ersa:d:i:n:p:t:u:N:", j, sp)
+			if f == "?" then
+				return
+			elseif f == "r" then
+				raw = true
+			elseif f == "d" then
+				delim = v
+			elseif f == "n" or f == "N" then -- char count; a non-numeric arg is an error (not a hang)
+				nchars = int_arg(v)
+				if not nchars then -- (bash: legal_number, not negative, an int; sh_invalidnum)
+					io.stderr:write("curse: read: " .. v .. ": " .. rt.invalidnum_msg(v) .. "\n")
+					sh.status = 1
+					return
 				end
-				j = j + advance
-			else
-				break
+				ndelim = ndelim or f == "N"
+			elseif f == "a" then
+				arr = v
+			elseif f == "u" then
+				ufd = int_arg(v)
+				if not ufd then
+					io.stderr:write("curse: read: " .. v .. ": invalid file descriptor specification\n")
+					sh.status = 1
+					return
+				end
+				if C.fcntl(ufd, 1) < 0 then -- F_GETFD: not open
+					io.stderr:write("curse: read: " .. ufd .. ": invalid file descriptor: Bad file descriptor\n")
+					sh.status = 1
+					return
+				end
+			elseif f == "t" then
+				tmout = uconvert(v)
+				if not tmout or tmout < 0 then
+					io.stderr:write("curse: read: " .. v .. ": invalid timeout specification\n")
+					sh.status = 1
+					return
+				end
 			end
-		end
+		until not f
 		-- `read -t 0`: don't read anything — just report whether input is available
 		-- on the fd (bash: status 0 if a read wouldn't block, non-zero otherwise).
 		if tmout == 0 then
@@ -270,6 +239,10 @@ return function(sh, cmd, args, hook, tcb)
 		-- char is plain (splittable) input, and a \1 byte is just an IFS character
 		local ifs = rt.ifs(sh) or " \t\n"
 		local nomark = not ndelim and ifs:find("\1", 1, true) ~= nil
+		-- (read.def marks a CTLNUL \177 as \1\177 even then, unless IFS holds \177 too:
+		-- `saw` is its saw_escape — every \1 of the value is then dequoted)
+		local nulmark, saw = nomark and not ifs:find("\127", 1, true), false
+		local u8 = rt.lc_mb_cur_max() > 1 and rt.lc_utf8()
 		if nchars == 0 then -- `-n 0`: a zero-byte read, which can still fail (bash)
 			got_zero = C.read(ufd, rdbuf, 0) >= 0
 		end
@@ -291,7 +264,7 @@ return function(sh, cmd, args, hook, tcb)
 						local e = st.chunk:find(dch, st.ci, true)
 						local stop = e and e - 1 or #st.chunk
 						local seg = st.chunk:sub(st.ci, stop)
-						if not needs_chars(seg, raw) then
+						if not needs_chars(seg, raw, nulmark, u8) then
 							bulk = true
 							if #seg > 0 then
 								buf[#buf + 1] = seg
@@ -320,7 +293,7 @@ return function(sh, cmd, args, hook, tcb)
 						local e = data:find(dch, p0, true)
 						local stop = e or #data
 						local seg = data:sub(p0, e and e - 1 or stop)
-						if needs_chars(seg, raw) then
+						if needs_chars(seg, raw, nulmark, u8) then
 							fifo = false -- (escapes/NULs on this line: byte at a time)
 							pc.data, pc.pos = "", 1
 						else
@@ -369,8 +342,8 @@ return function(sh, cmd, args, hook, tcb)
 					end
 					if d == "\n" then -- swallow both (continuation), unless -N counts raw
 					else
-						if nchars and d:byte() >= 0xC0 and rt.lc_mb_cur_max() > 1 then
-							d = mb_rest(st, d) -- (an escaped multibyte char is one char)
+						if d:byte() >= 0xC0 and u8 then
+							d = mb_rest(st, d) -- (read_mbchar: see below)
 						end
 						buf[#buf + 1] = nomark and d or "\1" .. d
 					end
@@ -381,9 +354,14 @@ return function(sh, cmd, args, hook, tcb)
 				elseif c == "\1" and not nomark then
 					buf[#buf + 1] = "\1\1" -- DOUBLE a real CTLESC byte so it
 					-- survives the \1-marker unescape below
-				elseif nchars and c:byte() >= 0xC0 and rt.lc_mb_cur_max() > 1 and rt.lc_utf8() then
-					-- -n/-N count CHARACTERS in a multibyte locale: take the rest of a UTF-8
-					-- sequence along with its lead byte (one buf entry = one character)
+				elseif c == "\127" and nulmark then
+					buf[#buf + 1] = "\1\127" -- (read.def: a CTLNUL is marked even under
+					saw = true -- skip_ctlesc — read -a's rt.ifs_split keeps the pair, drops a bare one)
+				elseif c:byte() >= 0xC2 and u8 then
+					-- read.def's read_mbchar: after a lead byte, read on while mbrtowc says
+					-- the sequence is incomplete — the byte that makes it invalid is taken too,
+					-- raw, be it the delimiter, a backslash or a NUL (-n/-N count the whole run
+					-- as one CHARACTER: one buf entry)
 					buf[#buf + 1] = mb_rest(st, c)
 				elseif c:byte() >= 0x80 and rt.lc_mb_cur_max() > 1 and not rt.lc_utf8() then
 					-- (read_mbchar: a non-UTF-8 multibyte char — Big5's trail byte can be a `\`
@@ -404,6 +382,10 @@ return function(sh, cmd, args, hook, tcb)
 			end
 			unread(st)
 			line = (got or st.timed_out) and table.concat(buf) or nil
+			local z = u8 and line and line:find("\0", 1, true)
+			if z then -- (a NUL read_mbchar took ends bash's C string there)
+				line = line:sub(1, z - 1)
+			end
 		end
 		do
 			-- EOF with nothing read still assigns (empty values) and returns 1 (bash)
@@ -422,7 +404,7 @@ return function(sh, cmd, args, hook, tcb)
 				sh.status = 1
 				return
 			elseif arr then
-				sh:array_assign(arr, rt.ifs_split(ifs, line, nomark), false)
+				sh:array_assign(arr, rt.ifs_split(sh, line, nomark, saw), false)
 			elseif ndelim then -- -N: no IFS processing; first var gets everything, rest empty
 				local plain = line:gsub("\1(.)", "%1") -- \1x -> x (unescape); \1\1 -> \1 (literal CTLESC)
 				if #vars == 0 then
@@ -437,11 +419,11 @@ return function(sh, cmd, args, hook, tcb)
 					end
 				end
 			elseif #vars == 0 then -- REPLY: the raw line, CTLESC markers unescaped
-				if not rt.assign_ref(sh, "read", "REPLY", nomark and line or (line:gsub("\1(.)", "%1"))) then
+				if not rt.assign_ref(sh, "read", "REPLY", (nomark and not saw) and line or (line:gsub("\1(.)", "%1"))) then
 					return
 				end
 			else
-				local fields = read_split(ifs, line, #vars, nomark)
+				local fields = read_split(ifs, line, #vars, nomark, saw, sh)
 				for k = 1, #vars do -- (the first refused name ends it, status 1 — bash)
 					if not rt.assign_ref(sh, "read", vars[k], fields[k] or "") then
 						return
