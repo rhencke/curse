@@ -4,8 +4,8 @@
 -- curse_sig_patch_trace). A daemon worker is always catching the terminating signals the
 -- client forwards, so a loop the patch can't break never ends the script: `read -r x
 -- </dev/zero` outlived HUP/INT/TERM (stress daemon-client-kill). Each loop below spins
--- until a SIGALRM arrives (ITIMER_REAL, 50ms) and its handler raises; a loop that doesn't
--- stop is killed by SIGPROF (the default action) after 5s of CPU — the test fails.
+-- until a SIGALRM arrives (from a helper process, after 50ms) and its handler raises; a
+-- loop that doesn't stop is SIGKILLed by a watchdog after 5s — the test fails.
 --   inverted     the loop's last guard is its back-edge (`jcc loop; jmp exit`), both the
 --                realigned short form and the rel32 one
 --   side-exit    every iteration leaves through a side exit whose side trace links back
@@ -15,19 +15,15 @@ package.path = "lua/?.lua;" .. package.path
 local ffi = require("ffi")
 require("runtime") -- (declares curse_sig_catch/curse_sig_default)
 local C = ffi.C
-pcall(ffi.cdef, [[
-struct curse_tsj_itv { long is, ius, vs, vus; };
-int setitimer(int which, const struct curse_tsj_itv *nv, struct curse_tsj_itv *old);
-int open(const char *path, int flags, ...);
-long read(int fd, void *buf, unsigned long n);
-int close(int fd);
-]])
-local SIGALRM, ITIMER_REAL, ITIMER_PROF = 14, 0, 2
-local function arm(which, secs)
-	local t = ffi.new("struct curse_tsj_itv")
-	local whole = math.floor(secs)
-	t.vs, t.vus = whole, math.floor((secs - whole) * 1e6)
-	C.setitimer(which, t, nil)
+pcall(ffi.cdef, "int getpid(void); int kill(int pid, int sig);")
+local SIGALRM, SIGKILL = 14, 9
+local me = tonumber(C.getpid())
+-- a helper process that sends us `sig` after `secs`; its pid
+local function after(secs, sig)
+	local h = io.popen(string.format("(sleep %s; kill -%d %d) >/dev/null 2>&1 & echo $!", secs, sig, me))
+	local pid = tonumber(h:read("*l"))
+	h:close()
+	return pid
 end
 C.curse_sig_catch(SIGALRM)
 _G.__curse_sigrun = function(s)
@@ -99,11 +95,10 @@ end
 
 local fails = 0
 for _, name in ipairs(arg and arg[1] and { arg[1] } or { "inverted_short", "inverted_long", "side_exit", "ffi_read" }) do
-	arm(ITIMER_PROF, 5) -- the watchdog
-	arm(ITIMER_REAL, 0.05)
+	local watchdog = after(5, SIGKILL)
+	after(0.05, SIGALRM)
 	local ok, e = pcall(loops[name])
-	arm(ITIMER_REAL, 0)
-	arm(ITIMER_PROF, 0)
+	C.kill(watchdog, SIGKILL)
 	if not ok and type(e) == "table" and e.sig == SIGALRM then
 		print(name .. ": stopped by the signal")
 	else
