@@ -1694,7 +1694,26 @@ function compile_cmdsub_inner(src, backtick, lifted, aenv, noalias, posix)
 	local pure = #ast.stmts > 0
 		and require("runtime").cmdsub_pure(ast.stmts, (emit_frag_ctx and emit_frag_ctx.funcflags) or {}, src)
 	local isolated = not pure and not EF.inproc_trap_block and #ast.stmts > 0
-	local id = emit_fragment(ast.stmts, nil, isolated and EF.lifted_set or nil)
+	-- (a function the body defines — `echo() {…}` — is known only now, its text parsed: its
+	-- calls in the body dispatch through the runner, which finds it, not the builtin; the
+	-- program's own collect_nested_funcdefs never saw inside the text)
+	local defs, added = {}, nil
+	collect_nested_funcdefs(ast.stmts, defs, false)
+	for name in pairs(defs) do
+		if not emit_redir_funcs[name] then
+			emit_redir_funcs[name] = true
+			added = added or {}
+			added[#added + 1] = name
+		end
+	end
+	-- (nor the program's scan: a nameref or an attribute the body declares takes the
+	-- nameref-/attribute-aware paths there, as a program declaring it would)
+	local bs = scan_program(ast.stmts, { sigs = {} })
+	local id = EF.with({ has_nameref = EF.has_nameref or bs.nameref or false, has_attr = EF.has_attr or bs.attr or false },
+		emit_fragment, ast.stmts, nil, isolated and EF.lifted_set or nil)
+	for _, name in ipairs(added or {}) do -- (outside the substitution the definition never ran)
+		emit_redir_funcs[name] = nil
+	end
 	if not id then
 		return fallback
 	end -- compiler gap (curse-nocompile): to be closed upstream
