@@ -13814,6 +13814,12 @@ function M.parse_error_stmt(sh, st, label)
 		io.stderr:write("curse: " .. (st.showtext and "syntax error: " or "") .. "`" .. st.text .. "'\n")
 	end
 	sh.in_perr, sh.perr_label = nil, pl
+	-- (parse_compound_assignment's parse_string_error: a non-interactive posix shell takes
+	-- FORCE_EOF rather than DISCARD — it ends, status 1)
+	if st.discard and st.status == 1 and sh.opt_posix and not sh.opt_i then
+		sh.status = 1
+		error({ __curse_exit = 1, __curse_perrexit = true }) -- (past eval/source's containment)
+	end
 	error({ __curse_exit = st.status or 2, __curse_parseerr = true, lead = st.lead })
 end
 -- bash's evalstring.c: an eval'd/sourced text's syntax error ends a posix shell only while

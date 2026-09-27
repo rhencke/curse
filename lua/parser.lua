@@ -2727,6 +2727,7 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs, xg, bq
 		line = bq and line0 or line0 - #(src:match("^[ \t\n]*"):gsub("[^\n]", ""))
 	end
 	local loopId = 0
+	local arrlit_eof = false -- (an EOF error read inside a NAME=( … ) literal: status 1)
 	-- jcx: the line a foreground job killed by a signal is reported at — bash's line_number
 	-- once the command is back from execute_simple_command (restored to the enclosing
 	-- context's): a top-level command's parser line (its line group's last, heredocs and
@@ -3755,7 +3756,24 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs, xg, bq
 	-- Parse an array literal `( elem elem … )` with `i` positioned ON the `(`.
 	-- Each element is `value` or `[sub]=value` / `[sub]+=value`; the subscript may
 	-- nest brackets (`[a[0]]=x`). Consumes through the closing `)`.
+	local parse_array_elems0
+	-- (bash's parse_compound_assignment: a word inside that fails to read — an unclosed
+	-- quote, backquote or ${ — is parse_string_error: status 1 and a DISCARD, as the
+	-- literal's own unclosed `)`)
 	local function parse_array_elems()
+		local ok, r = pcall(parse_array_elems0)
+		if ok then
+			return r
+		end
+		if type(r) == "table" and r.__curse_perr and not r.status
+			and tostring(r.msg or ""):find("^unexpected EOF while looking for matching") then
+			r.status, r.discard = 1, true
+		elseif type(r) == "string" and r:find("unexpected EOF while looking for matching", 1, true) then
+			arrlit_eof = true -- (the line's parse_error takes status 1 + DISCARD: next_line)
+		end
+		error(r, 0)
+	end
+	parse_array_elems0 = function()
 		i = i + 1
 		local elems = {}
 		local line0, closed = line, false
@@ -5177,6 +5195,7 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs, xg, bq
 		jcx = {}
 		while true do
 			local start, startline = i, line
+			arrlit_eof = false
 			local ok, st = pcall(parse_stmt)
 			if not ok then
 				-- A RECOVERABLE parse error (an invalid `NAME=( … )` array-literal element)
@@ -5204,14 +5223,16 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs, xg, bq
 							or startline,
 						msg = recover and ("syntax error near `" .. (st.tok or "(") .. "'")
 							or (type(st) == "table" and st.__curse_perr and st.msg) or tostring(st),
-						status = type(st) == "table" and st.__curse_perr and st.status or nil, -- (else 2)
+						status = type(st) == "table" and st.__curse_perr and st.status
+							or (arrlit_eof and type(st) == "string" and 1) or nil, -- (else 2)
 						pre = type(st) == "table" and st.__curse_perr and st.pre or nil, -- (messages before it)
 						preline = type(st) == "table" and st.__curse_perr and st.preline or nil, -- (their line)
 						exact = type(st) == "table" and st.__curse_perr and st.exact or nil, -- (msg verbatim)
 						text = type(st) == "table" and st.__curse_perr and st.text or nil,
 						showtext = type(st) == "table" and st.__curse_perr and st.text and true or nil,
 						recoverable = recover or nil,
-						discard = type(st) == "table" and st.__curse_perr and st.discard or nil,
+						discard = type(st) == "table" and st.__curse_perr and st.discard
+							or (arrlit_eof and type(st) == "string") or nil,
 						forceeof = type(st) == "table" and st.__curse_perr and st.forceeof or nil,
 						exactmsg = type(st) == "table" and st.__curse_perr and st.exactmsg or nil, -- (its own msgid)
 					},
