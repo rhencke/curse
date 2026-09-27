@@ -80,8 +80,9 @@ static void curse_sig_onsignal(int s)
                      LUA_MASKCALL | LUA_MASKRET | LUA_MASKCOUNT, 1);
 #ifdef CURSE_SIG_DESTRUCTIVE
   /* A pure-compute JIT loop never reaches a VM safepoint, so the scheduled hook
-   * above won't fire inside it. Destructively patch the running trace's back-edge
-   * to force a side-exit (reverted the instant the exit fires). See lj_trace.c. */
+   * above won't fire inside it. Destructively patch the running code's loop heads
+   * and trace links to force an exit (reverted the instant the interpreter is
+   * reached). See lj_trace.c. */
   { extern void curse_sig_patch_trace(void); curse_sig_patch_trace(); }
 #endif
 }
@@ -147,7 +148,7 @@ void curse_sig_hold(int hold)
  * at every loop head and function entry (interp and compiled code), yielding back to
  * the scheduler.
  * A JIT trace hoists that check out of its loop, so the handler also patches the
- * running trace's back-edge to force the exit (as a trap signal does). SA_RESTART:
+ * running trace's loop head to force the exit (as a trap signal does). SA_RESTART:
  * the tick must not EINTR the job's syscalls. */
 static volatile int curse_preempt_flag;
 
@@ -156,7 +157,7 @@ static void curse_preempt_onsignal(int s)
   (void)s;
   curse_preempt_flag = 1;
 #ifdef CURSE_SIG_DESTRUCTIVE
-  /* Only the running loop's back-edge: the flag is re-read at every loop head,
+  /* Only the running loop's head: the flag is re-read at every loop head,
    * i.e. at every root trace entry, so a side trace linking back to its root
    * sees it anyway -- and no VM hook is scheduled here to undo a tail-jmp patch. */
   { extern void curse_sig_patch_trace_mode(int); curse_sig_patch_trace_mode(0); }

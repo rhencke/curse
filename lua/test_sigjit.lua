@@ -9,8 +9,8 @@
 --   inverted_short/long  the loop's last guard is its back-edge (`jcc loop; jmp exit`),
 --                        the realigned rel8 form and the rel32 one
 --   side_exit            every iteration leaves through a side exit whose side trace
---                        links back to the root trace's head: the back-edge itself is
---                        never reached again
+--                        links back to the root trace's head: the loop is never
+--                        entered again
 --   ffi_read             byte-at-a-time C.read of /dev/zero, as the `read` builtin does
 package.path = "lua/?.lua;" .. package.path
 local ffi = require("ffi")
@@ -140,7 +140,86 @@ local function for_exact()
 	return bad, hits
 end
 
+-- Preempted loops keep exact state: each workload runs once quietly (its traces get
+-- compiled), then again under a counting handler every ~50us; the results must match.
+-- Where the patch leaves a loop matters: at the back-edge, a PHI value the loop head
+-- spills is one iteration stale in its slot, so leaving there through the loop
+-- snapshot restored the previous `k` (wrong results in every run of these).
+local function g(a, b)
+	return (a * 31 + b) % 1000003
+end
+local work = {
+	function(acc, r) -- repeat-until whose body inlines a call (k spilled at the head)
+		local k = r
+		repeat
+			k = math.floor(k / 2)
+			acc = g(acc, k)
+		until k == 0
+		return acc
+	end,
+	function(acc, r) -- a loop ending in plain arithmetic: a `jmp` back-edge
+		local k, x = r, 0
+		while true do
+			k = math.floor(k / 2)
+			acc = g(acc, k)
+			if k == 0 then
+				break
+			end
+			x = x + 1
+		end
+		return acc + x
+	end,
+	function(acc, r) -- string building and an iterator
+		local s = ""
+		for i = 1, 50 do
+			s = s .. string.char(65 + (i + r) % 26)
+		end
+		for w in s:gmatch("[A-M]+") do
+			acc = g(acc, #w)
+		end
+		return acc
+	end,
+}
+local function state_exact()
+	local bad = 0
+	local hits = 0
+	for n, f in ipairs(work) do
+		local function run()
+			local acc = 0
+			for r = 1, 20000 do
+				acc = f(acc, r)
+			end
+			return acc
+		end
+		_G.__curse_sigrun = function() end
+		local want = run()
+		_G.__curse_sigrun = function()
+			hits = hits + 1
+		end
+		every(50)
+		local got = run()
+		every(0)
+		if got ~= want then
+			print(string.format("state_exact: workload %d: %s, want %s", n, got, want))
+			bad = bad + 1
+		end
+	end
+	_G.__curse_sigrun = function(s)
+		error({ sig = s }, 0)
+	end
+	return bad, hits
+end
+
 local fails = 0
+if not arg[1] or arg[1] == "state_exact" then
+	local watchdog = after(60, SIGKILL)
+	local bad, hits = state_exact()
+	C.kill(watchdog, SIGKILL)
+	print("state_exact: " .. (bad == 0 and "preempted loops computed exactly" or (bad .. " workloads wrong")) .. (hits > 20 and "" or " (NOT preempted: " .. hits .. ")"))
+	if bad ~= 0 or hits <= 20 then
+		fails = fails + 1
+	end
+end
 if not arg[1] or arg[1] == "for_exact" then
 	local watchdog = after(60, SIGKILL)
 	local bad, hits = for_exact()
@@ -150,7 +229,7 @@ if not arg[1] or arg[1] == "for_exact" then
 		fails = fails + 1
 	end
 end
-for _, name in ipairs(arg and arg[1] and (arg[1] == "for_exact" and {} or { arg[1] }) or { "inverted_short", "inverted_long", "side_exit", "ffi_read" }) do
+for _, name in ipairs(arg and arg[1] and ((arg[1] == "for_exact" or arg[1] == "state_exact") and {} or { arg[1] }) or { "inverted_short", "inverted_long", "side_exit", "ffi_read" }) do
 	local watchdog = after(5, SIGKILL)
 	after(0.05, SIGALRM)
 	local ok, e = pcall(loops[name])
