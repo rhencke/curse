@@ -5,8 +5,9 @@
 
 # Meson build dir + fetched subprojects (packagefiles/ + *.wrap stay tracked).
 /build/
-/subprojects/*/
+/subprojects/*
 !/subprojects/packagefiles/
+!/subprojects/*.wrap
 
 # Build / scratch output
 /dist/
@@ -25,3 +26,6 @@ core.*
 
 # The static client binary (built from daemon/curse-client.c)
 /daemon/curse
+
+# Agent scratch inside a worktree (dies with it: tools/wt-sweep.sh)
+.scratch/
