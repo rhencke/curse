@@ -70,9 +70,33 @@ def emit(tag, data):
         open(os.path.join(out, f"{tag}-{h}.sh"), "wb").write(data)
 for f in sorted(glob.glob(cases + "/*.sh")):
     emit("tc", open(f, "rb").read())
+# oil spec cases (## STDOUT:/## STDERR:/... metadata, same rules as
+# test/conformance/run.sh's build_oil awk): a block is opened by ANY `## ...STDOUT:` or
+# `## ...STDERR:` header (incl. shell-qualified ones like `## OK bash STDOUT:` or
+# `## N-I zsh STDOUT:`) and closed by `## END`/`## OK`/`## BUG`/`## N-I`; the opener is
+# checked BEFORE the closer since a qualified header matches both (run.sh: matching the
+# closer first would leave the block never opened, leaking its expected-output lines --
+# e.g. `world6` -- into the snippet as CODE). Every other `## ` line (`## status:`,
+# `## stdout-json:`, `## code:`, `## compare_shells:`, ...) is single-line metadata,
+# dropped on its own.
+OIL_OPEN = re.compile(rb"^## .*(STDOUT|STDERR):[ \t]*$")
+OIL_CLOSE = re.compile(rb"^## (END|OK|BUG|N-I)")
+def strip_oil_meta(part):
+    inblock = False
+    code = []
+    for line in part.split(b"\n"):
+        if OIL_OPEN.match(line):
+            inblock = True
+        elif OIL_CLOSE.match(line):
+            inblock = False
+        elif inblock or line.startswith(b"## "):
+            pass
+        else:
+            code.append(line)
+    return b"\n".join(code)
 for f in sorted(glob.glob(oil + "/*.test.sh")):
     for part in re.split(rb"(?m)^#### .*$", open(f, "rb").read())[1:]:
-        body = b"\n".join(l for l in part.split(b"\n") if not l.startswith(b"## "))
+        body = strip_oil_meta(part)
         emit("oil", body.strip(b"\n") + b"\n")
 for f in sorted(glob.glob(btests + "/*.sub")):
     emit("bt", open(f, "rb").read())
@@ -112,15 +136,18 @@ run() { # NAME SECONDS MUTATOR MODE
 }
 
 # ---- triage: crash signatures + differential signatures, bucketed against known.tsv
-bucket() { # SIG FILE -> ID or NEW
-  local sig=$1 f=$2 id field re re2
+bucket() { # SIG FILE -> ID, ID:FIXED (matched a since-fixed finding's *-fixed field: a
+           # likely regression or variant, reported instead of silently bucketed), or NEW
+  local sig=$1 f=$2 id field re re2 base hit
   while IFS=$'\t' read -r id field re re2; do
     case $id in ''|'#'*) continue ;; esac
-    case $field in
-      sig) printf '%s\n' "$sig" | grep -qE -- "$re" && { echo "$id"; return; } ;;
-      src) grep -qaE -- "$re" "$f" && { echo "$id"; return; } ;;
-      both) printf '%s\n' "$sig" | grep -qE -- "$re" && grep -qaE -- "$re2" "$f" && { echo "$id"; return; } ;;
+    base=${field%-fixed}; hit=0
+    case $base in
+      sig) printf '%s\n' "$sig" | grep -qE -- "$re" && hit=1 ;;
+      src) grep -qaE -- "$re" "$f" && hit=1 ;;
+      both) printf '%s\n' "$sig" | grep -qE -- "$re" && grep -qaE -- "$re2" "$f" && hit=1 ;;
     esac
+    [ "$hit" -eq 1 ] && { [ "$base" != "$field" ] && echo "$id:FIXED" || echo "$id"; return; }
   done < "$here/known.tsv"
   echo NEW
 }
@@ -161,8 +188,13 @@ triage() { # [SINCE-FILE]: only entries newer than it
     echo "differential: $total checked, $agree agree with bash, $(awk -F'\t' '$2=="diff"' "$t/buckets.tsv" | wc -l) signatures"
     echo "-- NEW (not in tools/fuzz/known.tsv): kind count signature -> smallest input"
     awk -F'\t' '$1=="NEW" {printf "  %-5s %4d  %s\n        %s\n", $2, $3, $4, $5}' "$t/buckets.tsv"
+    # A *-fixed known.tsv entry still matched: its pattern is usually just a loose bash-
+    # error substring, so this could be the same bug back, or an unrelated NEW one wearing
+    # the same generic wording. Never silently bucketed -- surfaced for a human to check.
+    echo "-- regression or variant of a FIXED finding (known.tsv): kind count signature -> smallest input"
+    awk -F'\t' '$1 ~ /:FIXED$/ {id=$1; sub(/:FIXED$/, "", id); printf "  %-5s %4d  regression or variant of %s (fixed): %s\n        %s\n", $2, $3, id, $4, $5}' "$t/buckets.tsv"
     echo "-- known buckets: id kind signatures inputs"
-    awk -F'\t' '$1!="NEW" {s[$1 " " $2]++; c[$1 " " $2]+=$3} END {for (k in s) printf "  %-14s %4d %5d\n", k, s[k], c[k]}' "$t/buckets.tsv" | sort
+    awk -F'\t' '$1!="NEW" && $1 !~ /:FIXED$/ {s[$1 " " $2]++; c[$1 " " $2]+=$3} END {for (k in s) printf "  %-14s %4d %5d\n", k, s[k], c[k]}' "$t/buckets.tsv" | sort
     if ls "$W/gram-hangs" 2>/dev/null | grep -q .; then
       echo "-- inputs the grammar mutator's parser pass hung or died on: $W/gram-hangs ($(ls "$W/gram-hangs" | wc -l))"
     fi
