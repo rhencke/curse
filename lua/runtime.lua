@@ -8699,9 +8699,7 @@ end
 -- (leaving the var untouched) so the caller can report the error + status 1. A
 -- nil target (`typeset -n ref` converting an existing var) is NOT validated.
 function Shell:make_nameref(name, target, selfok)
-	local function valid(t)
-		return t:match("^[%a_][%w_]*$") or t:match("^[%a_][%w_]*%[.+%]$")
-	end
+	local valid = M.ref_target_ok
 	local ob = self.vars[name]
 	if target ~= nil and target ~= "" and not valid(target) and ob and ob.arr and not ob.ref then
 		return false -- (a bad target is reported before the array conflict: bash)
@@ -9402,8 +9400,15 @@ M.LOCALE_VARS = LOCALE_VARS
 -- A nameref with no (valid) target takes an assigned value AS its target, and bash rejects
 -- one that isn't a variable name — named by the assigning builtin, M.assign_ctx (bash's
 -- this_command_name: "declare", "printf", …; nil for a plain assignment).
+-- bash's valid_nameref_value: an identifier, or NAME[SUB] whose non-empty subscript runs to
+-- the last byte as skipsubscript reads it (valid_array_reference: `A["]` never closes)
 function M.ref_target_ok(s)
-	return s:match("^[%a_][%w_]*$") or s:match("^[%a_][%w_]*%[.+%]$")
+	if s:match("^[%a_][%w_]*$") then
+		return true
+	end
+	local p = s:match("^[%a_][%w_]*()%[")
+	local q = p and require("parser").subscript_close(s, p)
+	return q ~= nil and q == #s and q > p + 1
 end
 local ref_target_ok = M.ref_target_ok
 function M.bad_ref_target(v, ctx)

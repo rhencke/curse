@@ -1028,6 +1028,9 @@ parse_paramexp = function(inner)
 	return P({ op = "badsubst", raw = name .. (index and "[" .. index .. "]" or "") .. rest })
 end
 M.parse_paramexp = parse_paramexp
+function M.subscript_close(s, i) -- (bash's skipsubscript, for the runtime's validity checks)
+	return subscript_close(s, i)
+end
 
 -- Find the `)` that closes a `$( … )` command substitution. `j` is the index of
 -- the first char INSIDE the parens (just past "$("); returns the index just PAST
@@ -1401,7 +1404,7 @@ dq_end = function(s, i, lenient, onwarn)
 	return i + 1
 end
 -- The `]` closing the subscript `[` at s[i], or nil: brackets nest (`a[a[0]]`), and a `]`
--- that is escaped, quoted or inside a $(…)/${…} doesn't close it (`A[']']`, `${m["a]a"]}`,
+-- that is escaped, quoted or inside a $(…)/${…}/`…` doesn't close it (`A[']']`, `${m["a]a"]}`,
 -- `a[$(echo ])]`) — bash's skipsubscript. Never raises: the text may be a runtime value.
 subscript_close = function(s, i)
 	local d, n = 0, #s
@@ -1411,6 +1414,8 @@ subscript_close = function(s, i)
 			i = i + 2
 		elseif b == 39 then -- '
 			i = quote_end(s, i, false)
+		elseif b == 96 then -- ` (skip_matched_pair's backq)
+			i = quote_end(s, i, true)
 		elseif b == 34 then -- "
 			i = dq_end(s, i, true)
 		elseif b == 36 and (s:byte(i + 1) == 40 or s:byte(i + 1) == 123) then -- $( ${
