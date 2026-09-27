@@ -3023,7 +3023,13 @@ function Shell:exec_t(args)
 	C.posix_spawn_file_actions_adddup2(fa, wfd, 1)
 	C.posix_spawn_file_actions_addclose(fa, rfd)
 	M.nspawn = M.nspawn + 1
+	-- (its output captured, the shell still waits for it as a foreground command: its
+	-- traps run once it has ended — M.fg_hold_enter, as the inherited-fd path above)
+	local held = M.fg_hold_enter()
 	local rc, pid = spawn_argv(self, execpath, args, n, fa, false, 0)
+	if rc ~= 0 then
+		M.fg_hold_leave(self, held)
+	end
 	if rc == 8 then -- ENOEXEC: no-shebang script — our interpreter runs it, into the capture
 		C.close(wfd)
 		C.close(rfd)
@@ -3039,20 +3045,26 @@ function Shell:exec_t(args)
 	end
 	local buf = ffi.new("char[65536]")
 	local chunks = {}
-	while true do
-		M.co_block(rfd, POLLIN)
-		local nr = C.read(rfd, buf, 65536)
-		if nr < 0 and ffi.errno() == 4 then
-			M.eintr()
-			nr = 0 -- EINTR (a trapped signal: its trap has run): read on
-		elseif nr <= 0 then
-			break
-		end
-		chunks[#chunks + 1] = ffi.string(buf, nr)
-	end
-	C.close(rfd)
 	local st = ffi.new("int[1]")
-	M.wait_child(pid, st, 0)
+	local ok, err = pcall(function()
+		while true do
+			M.co_block(rfd, POLLIN)
+			local nr = C.read(rfd, buf, 65536)
+			if nr < 0 and ffi.errno() == 4 then
+				M.eintr()
+				nr = 0 -- EINTR (a trapped signal: held till the command ends): read on
+			elseif nr <= 0 then
+				break
+			end
+			chunks[#chunks + 1] = ffi.string(buf, nr)
+		end
+		C.close(rfd)
+		M.wait_child(pid, st, 0)
+	end)
+	M.fg_hold_leave(self, held)
+	if not ok then
+		error(err, 0)
+	end
 	self.status = M.wexit(st[0])
 	if self.status > 128 then
 		M.fg_ended(self, pid, st[0])
@@ -3189,6 +3201,9 @@ function Shell:capture_src(src, backtick, noalias, line0)
 	-- (line0: compiled code's command line — its sh.cur_line isn't kept per command)
 	local pok, parsed = pcall(P.parse, src, self, nil, noalias, nil, line0 or self.cur_cline or self.cur_line,
 		nil, nil, backtick)
+	if not pok then
+		require("parser").trap_flow(parsed)
+	end
 	if pok and type(parsed) == "table" then
 		P.mark_tail(parsed.stmts)
 	end
@@ -3963,7 +3978,21 @@ end
 -- context has ended, so the parent's trap (or default action) handles it — after the
 -- subshell, as a parent waiting on a real child would.
 cap_depth = 0 -- in-process $(…) bodies running (any path), in process cap_pid
+--
+-- The same hold covers the scheduler: a signal whose hook fires while a task runs (a
+-- background job, a pipeline stage, a procsub body — each a coroutine of THIS process)
+-- or while the scheduler itself runs between them (the shell's own fds parked) was sent
+-- to the shell, not to the task: its trap runs in the shell, with the shell's `sh`, so
+-- its exit/return/break act on the shell's control flow (bash: the trap is the parent's;
+-- the child that ran `kill $$` goes on). Held here, it is raised again once the shell is
+-- back in its own coroutine (M.raise_task_held, when the scheduler returns).
 function M.defer_signal(sh, sig)
+	if CO then
+		local h = M.task_held or {}
+		M.task_held, h[sig] = h, true
+		M.sig_held_n = M.sig_held_n + 1
+		return true
+	end
 	if not (iso_cur(sh) or (cap_depth > 0 and cap_pid == C.getpid())) then
 		return false
 	end
@@ -3971,6 +4000,23 @@ function M.defer_signal(sh, sig)
 	deferred_sigs[sig] = true
 	M.sig_held_n = M.sig_held_n + 1
 	return true
+end
+-- (the held signals, raised again together: blocked while sent, so the hook sees them
+-- all pending at once and runs their traps in ascending order — lib_cursesig.c)
+pcall(ffi.cdef, "void curse_sig_hold(int hold);")
+function M.raise_task_held()
+	local h = M.task_held
+	if h and not CO then
+		M.task_held = nil
+		local me = C.getpid()
+		C.curse_sig_hold(1)
+		for sig = 1, 64 do
+			if h[sig] then
+				C.kill(me, sig)
+			end
+		end
+		C.curse_sig_hold(0)
+	end
 end
 -- A trapped signal arriving while the shell waits for a foreground command — an external,
 -- a pipeline — runs its trap once the command has finished (bash: trap_handler only marks
@@ -4055,7 +4101,10 @@ do
 	end
 	-- (a compile — parse, emit, the chunk's load — holds signals the same way: it runs
 	-- under pcalls that take any error for "doesn't compile", so a trap's `exit` raised
-	-- in it was swallowed and the script ran on: tier)
+	-- in it was swallowed and the script ran on: tier. A compile is not the only such
+	-- pcall: the RUNTIME classifiers — an arith value's parse/eval (arith_resolve,
+	-- emit.compile_arith_value), `let`, `[[ ]]`, a subscript, … — run outside any hold,
+	-- and each lets a trap's control flow through itself: parser.trap_flow)
 	M.defer_call = function(f, ...)
 		M.req_depth = M.req_depth + 1
 		return req_done(pcall(f, ...))
@@ -6509,6 +6558,8 @@ function Shell:run_pipeline_co(stage_fns, inproc, lastpipe, upv_get, upv_set)
 	if not ok_all then
 		error(err_all)
 	end
+	M.raise_task_held() -- (a signal that came while a stage ran: the shell's — held by
+	-- the caller until the pipeline is done: fg_hold_enter)
 	return g ~= nil or nil
 end
 
@@ -6544,6 +6595,9 @@ function M.sched_pump(w)
 			if w.untilf and w.untilf() then
 				return
 			end
+			if M.task_held and not w.drop_sigs then
+				return -- (a trapped signal came: the shell runs its trap now — `wait` ends)
+			end
 			-- a job preempted this round is runnable again at once; still poll (without
 			-- blocking) so the waiter's fd, its deadline, and jobs waiting on I/O get their
 			-- turn — a computing job must not starve them
@@ -6576,6 +6630,9 @@ function M.sched_pump(w)
 					ready = true
 					return
 				end
+				if M.task_held and not w.drop_sigs then
+					return -- (the poll's EINTR: a trapped signal, held — the shell's to run)
+				end
 				if w.deadline and M.wall_secs() >= w.deadline then
 					return
 				end
@@ -6591,6 +6648,11 @@ function M.sched_pump(w)
 		error(err, 0)
 	end
 	M.fg_arm() -- (the foreground runs on: its slice, while jobs still live)
+	if w.drop_sigs then -- (the shell has ended: a job's `kill $$` finds no one)
+		M.task_held = nil
+	else
+		M.raise_task_held() -- (a signal that came while a job ran: the shell's trap, now)
+	end
 	return ready
 end
 -- Wait until every task group in `gs` has ended: inside a task, by yielding on each (the
@@ -6680,7 +6742,7 @@ function M.sched_drain(sh)
 	end
 	while sched_live() and not CO do
 		M.tasks_hangup_stopped() -- (one a job stopped meanwhile)
-		M.sched_pump({ untilf = M.tasks_all_stuck })
+		M.sched_pump({ drop_sigs = true, untilf = M.tasks_all_stuck })
 		if M.tasks_all_stuck() then -- (only stopped ones are left: not waited for — see
 			preempt_arm(0) -- M.jobs_exit_hangup; and no slice ticks for them: the pump armed one)
 			break
@@ -7765,6 +7827,9 @@ function M.arith_slot(sh, expr, line)
 	local ok, v
 	if expr.k == "arith_perr" then
 		local _, perr = pcall(P.arith, expr.raw)
+		if not _ then
+			require("parser").trap_flow(perr)
+		end
 		I._int.arith_pre(sh, perr)
 		io.stderr:write("curse: " .. P.arith_errmsg(expr.raw, perr) .. "\n")
 		ok = false
@@ -13372,12 +13437,18 @@ function M.array_key(sh, name, raw, expanded)
 			idx = { k = "xpand", raw = raw }
 		else
 			local pok, ast = pcall(require("parser").arith, raw, true)
+			if not pok then
+				require("parser").trap_flow(ast)
+			end
 			idx = pok and ast or false
 		end
 		SUBSCRIPT_AST[raw] = idx
 	end
 	if not idx then
 		local _, perr = pcall(require("parser").arith, raw)
+		if not _ then
+			require("parser").trap_flow(perr)
+		end
 		local pok, pe = pcall(require("interp")._int.arith_pre, sh, perr) -- (what ran before it)
 		if not pok and type(pe) == "table" and pe.__curse_unbound then
 			error(pe, 0)
@@ -15440,6 +15511,7 @@ function M.arith_read_slow(sh, name, s)
 				local ok2, r = pcall(fn, sh)
 				sh.arith_depth = sh.arith_depth - 1
 				if not ok2 then
+					require("parser").trap_flow(r)
 					if type(r) == "table" and (r.__curse_experr or r.__curse_matherr or r.__curse_unbound) then
 						error(r)
 					end
@@ -15581,6 +15653,9 @@ function M.arith_str(sh, s)
 	local fn = _acache[s]
 	if fn == nil then
 		local cok, f = pcall(require("emit").compile_arith_value, s)
+		if not cok then
+			require("parser").trap_flow(f)
+		end
 		fn = cok and f or false
 		_acache[s] = fn
 	end

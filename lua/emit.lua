@@ -200,6 +200,9 @@ local function word_reads_debugstack(w)
 		-- parse failure just means "no debugstack ref here" (the stmt delegates anyway).
 		if p.arith then
 			local ok, ast = pcall(require("parser").arith, p.arith)
+			if not ok then
+				require("parser").trap_flow(ast)
+			end
 			if ok and arith_reads_debugstack(ast) then
 				return true
 			end
@@ -594,6 +597,9 @@ local function arith_elem_ok(e)
 	end
 	local ok, sw = pcall(require("parser").parse_word, e.idxraw)
 	if not ok then
+		require("parser").trap_flow(sw)
+	end
+	if not ok then
 		return false
 	end
 	for _, p in ipairs(sw.parts) do
@@ -649,6 +655,9 @@ local function not_compilable(e)
 		-- a fast xpand renders as a VALUE: one whose native tree assigns (`a[$k]=7`,
 		-- `$x++`) can't, so the word delegates
 		local ok, nat = pcall(require("parser").arith, xpand_lens(e.raw), true)
+		if not ok then
+			require("parser").trap_flow(nat)
+		end
 		return not ok or arith_side_effect(nat) or not_compilable(nat)
 	end -- a fast $name xpand compiles
 	return not_compilable(e.e)
@@ -666,6 +675,9 @@ end
 -- word/statement then takes the shared evaluator, which reproduces bash's error.
 local function safe_arith(s)
 	local ok, a = pcall(require("parser").arith, s)
+	if not ok then
+		require("parser").trap_flow(a)
+	end
 	if ok then
 		return a
 	end
@@ -1142,6 +1154,9 @@ emit_value = function(e, lifted)
 		-- textual substitution (rt.arith_textual). Only reached for a fast xpand (not_compilable).
 		local ok, native = pcall(require("parser").arith, xpand_lens(e.raw), true)
 		if not ok then
+			require("parser").trap_flow(native)
+		end
+		if not ok then
 			return ("rt.arith_textual(sh, %q)"):format(e.raw)
 		end
 		local nl, lf = {}, {}
@@ -1394,11 +1409,15 @@ end
 -- returned fn reads only sh + rt + bit (same preamble as M.emit's module header).
 function M.compile_arith_value(s)
 	local ok, ast = pcall(require("parser").arith, s, "let") -- a VALUE, exactly as arith_resolve
+	if not ok then
+		require("parser").trap_flow(ast)
+	end
 	if not ok or not arith_native_ok(ast) then
 		return nil
 	end
 	local ok2, expr = pcall(emit_avalue, ast)
 	if not ok2 then
+		require("parser").trap_flow(expr)
 		return nil
 	end
 	local f = load(
@@ -1661,6 +1680,9 @@ function compile_cmdsub_inner(src, backtick, lifted, aenv, noalias, posix)
 	end
 	local pok, ast = pcall(require("parser").parse, src, nil, aenv, noalias, posix, EF.cur_cline or EF.cur_line,
 		nil, nil, backtick)
+	if not pok then
+		require("parser").trap_flow(ast)
+	end
 	if not pok or type(ast) ~= "table" or ast.stmts == nil then
 		return fallback
 	end -- syntax error
@@ -1686,6 +1708,9 @@ function compile_cmdsub_inner(src, backtick, lifted, aenv, noalias, posix)
 		then
 			-- compile the path word and read the file directly — no interp
 			local wok, pw = pcall(require("parser").parse_word, st.redirs[1].src or st.redirs[1].target or "")
+			if not wok then
+				require("parser").trap_flow(pw)
+			end
 			for _, p in ipairs(wok and pw.parts or {}) do -- (a glob in the file word: interp)
 				if p.lit and not p.q and p.lit:find("[*?[]") then
 					wok = false
@@ -1929,6 +1954,9 @@ function EF.xtarith(src, lifted)
 	end
 	if src:find("[$`]") then
 		local ok, w = pcall(require("parser").parse_heredoc, src, false)
+		if not ok then
+			require("parser").trap_flow(w)
+		end
 		if ok and w and emitable_word(w) then
 			return EF.xtl('"(( " .. ' .. emit_word(w, lifted) .. ' .. " ))"')
 		end
@@ -2322,6 +2350,9 @@ local function pexp_word_args_ok(pe)
 			-- arithmetic way (interp's arith_expand_text), not re-expanded after emit_word
 		end
 		local ok, w = pcall(require("parser").parse_word, a)
+		if not ok then
+			require("parser").trap_flow(w)
+		end
 		return ok and emitable_word(w) or false
 	end
 	return wok(pe.arg) and wok(pe.arg2)
@@ -2356,6 +2387,9 @@ function pexp_compilable(pe, quoted)
 		-- ${a[sub]…}: a scalar element (rt.array_elem). The subscript must render with no cmdsub/
 		-- procsub — its indexed-arith vs assoc-word double path would run a subscript side effect twice.
 		local ok, sw = pcall(require("parser").parse_word, pe.index)
+		if not ok then
+			require("parser").trap_flow(sw)
+		end
 		if not (ok and emitable_word(sw)) then
 			return false
 		end
@@ -2385,6 +2419,9 @@ function pexp_compilable(pe, quoted)
 				return false
 			end
 			local wok, w = pcall(require("parser").parse_word, pe.arg or "")
+			if not wok then
+				require("parser").trap_flow(w)
+			end
 			return wok and emitable_word(w) or false
 		end
 		return false
@@ -2538,6 +2575,9 @@ local function substr_native(txt, lifted)
 		return nil
 	end
 	local ok, ast = pcall(require("parser").arith, txt, true)
+	if not ok then
+		require("parser").trap_flow(ast)
+	end
 	if not ok or type(ast) ~= "table" or not_compilable(ast) or arith_side_effect(ast) or not substr_safe(ast) then
 		return nil
 	end
@@ -3117,6 +3157,9 @@ end
 emit_pattern_glob = function(pat, lifted)
 	local ok, w = pcall(require("parser").parse_word, pat)
 	if not ok then
+		require("parser").trap_flow(w)
+	end
+	if not ok then
 		return nil
 	end
 	return emit_pattern_glob_word(w, lifted)
@@ -3190,6 +3233,9 @@ local function static_key(key)
 	end
 	local ok, w = pcall(require("parser").parse_word, key)
 	if not ok then
+		require("parser").trap_flow(w)
+	end
+	if not ok then
 		return nil
 	end
 	local o = {} -- concatenate every part's (quote-removed) literal; nil if any part expands
@@ -3213,6 +3259,9 @@ local function aa_keyword(key)
 		return false
 	end
 	local ok, kw = pcall(require("parser").parse_word, key)
+	if not ok then
+		require("parser").trap_flow(kw)
+	end
 	return ok and emitable_word(kw) and kw or nil
 end
 -- (a word the compiled engine can't render expands through the shared one-word expander:
@@ -3816,6 +3865,9 @@ local function collect_word(w, set)
 			for _, a in ipairs({ pe.arg, pe.arg2 }) do -- (`${x:-$y}`: the word reads y)
 				if type(a) == "string" and a:find("[%$`]") then
 					local ok, aw = pcall(require("parser").parse_word, a)
+					if not ok then
+						require("parser").trap_flow(aw)
+					end
 					if ok and aw then
 						collect_word(aw, set)
 					end
@@ -4096,6 +4148,9 @@ analyze_lift = function(ast)
 				trap_opaque = true
 			elseif act and act ~= "" and act ~= "-" then
 				local ok, tast = pcall(require("parser").parse, act)
+				if not ok then
+					require("parser").trap_flow(tast)
+				end
 				if ok and tast and tast.stmts then
 					local names = {}
 					collect_names(tast.stmts, names)
@@ -5232,6 +5287,9 @@ local function cs_empty(body)
 		return false
 	end
 	local ok, ast = pcall(require("parser").parse, body)
+	if not ok then
+		require("parser").trap_flow(ast)
+	end
 	return ok and #ast.stmts == 0
 end
 function EF.cmdsubs(words, from)
@@ -7216,7 +7274,7 @@ H.background = function(cx, st, after)
 		st.cmd.t == "pipeline" and ", true" or "")
 	local body = fork
 	if spawn then
-		body = ("do local __ok, __a = pcall(function() %s; return __a end); if not (__ok and sh:spawn_bg(__a, %q)) then %s end end"):format(
+		body = ("do local __ok, __a = pcall(function() %s; return __a end); if not __ok then require(\"parser\").trap_flow(__a) end; if not (__ok and sh:spawn_bg(__a, %q)) then %s end end"):format(
 			spawn,
 			cmdstr,
 			fork
@@ -7285,6 +7343,9 @@ H.arrayassign = function(cx, st, after)
 				local keyc
 				if kw == nil then -- (a subscript emit can't render: the shared expander)
 					local pok, kwd = pcall(require("parser").parse_word, e.key)
+					if not pok then
+						require("parser").trap_flow(kwd)
+					end
 					keyc = pok and EF.aa_wrap(("local __k = rt.assign_elem(sh, %s[1])"):format(EF.konst({ ser(kwd) })),
 						kwd, cx.lifted)
 						or ("local __k = rt.assign_elem(sh, require(\"parser\").parse_word(%q))"):format(e.key)
@@ -7427,6 +7488,9 @@ H.case = function(cx, st, after)
 			if g == nil then
 				local ok, w = pcall(require("parser").parse_word, pat)
 				if not ok then
+					require("parser").trap_flow(w)
+				end
+				if not ok then
 					error("curse-nocompile: case pattern")
 				end
 				g = ("rt.case_glob(sh, %s[1])"):format(EF.konst({ ser(w) }))
@@ -7525,6 +7589,15 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
 	function cx.lcbase()
 		cx.lc_base = cx.lc_base or { cx.newloopvar("(sh.loopdepth or 0)"), cx.newloopvar("(sh.lc_depth or 0)") }
 		return cx.lc_base[1], cx.lc_base[2]
+	end
+	-- (the loop's head — its OSR resume point, cx.loopPc — sets the marks too: a tier
+	-- switch enters there, past the loop's `pre` block, and a trap's break/continue at
+	-- the head's preemption point must still find the loop marked compiled)
+	function cx.lc_head(st, marks)
+		local hp = cx.loopPc[st.id]
+		if hp and cx.blocks[hp] then
+			cx.blocks[hp] = marks .. cx.blocks[hp]
+		end
 	end
 	function cx.newpc()
 		local p = cx.npc
@@ -8392,12 +8465,14 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
 				entry = cx.flatten_stmt(st, post)
 				pre = cx.newpc()
 				cx.blocks[pre] = ("sh.loopdepth = %s + %d; sh.lc_depth = sh.loopdepth; pc = %d"):format(lb, D + 1, entry)
+				cx.lc_head(st, ("sh.loopdepth = %s + %d; sh.lc_depth = sh.loopdepth; "):format(lb, D + 1))
 				return pre
 			end
 			cx.blocks[post] = ("sh.loopdepth, sh.lc_depth = %d, %d; pc = %d"):format(D, D, after)
 			entry = cx.flatten_stmt(st, post)
 			pre = cx.newpc()
 			cx.blocks[pre] = ("sh.loopdepth, sh.lc_depth = %d, %d; pc = %d"):format(D + 1, D + 1, entry)
+			cx.lc_head(st, ("sh.loopdepth, sh.lc_depth = %d, %d; "):format(D + 1, D + 1))
 			return pre
 		end
 		if t == "arithcmd" then -- (bash's this_command_name, baked into its arith error texts)

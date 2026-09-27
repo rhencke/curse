@@ -30,6 +30,32 @@ until [ -e "$d/s1" ] && [ -e "$d/s2" ] && [ -e "$d/s3" ]; do
 	for ((j = 0; j < 2000; j++)); do hot=$((hot + j % 3)); done   # a hot (compiled) loop
 done
 s1=$(cat "$d/s1") s2=$(cat "$d/s2") s3=$(cat "$d/s3")
+# three DISTINCT signals back to back, before the shell's next safepoint: each runs its
+# trap exactly once per round (a pending flag per signal), lowest number first (bash's
+# run_pending_traps) — from an external while the shell waits for it, and from a
+# background job (in curse a coroutine of the shell) while the shell spins
+b1=$n1 b2=$n2 b3=$n3 bad=0 badord=0 seq=
+trap 'n1=$((n1+1)); seq=$seq.USR1' USR1
+trap 'n2=$((n2+1)); seq=$seq.USR2' USR2
+trap 'n3=$((n3+1)); seq=$seq.HUP' HUP
+for ((r = 0; r < 40; r++)); do
+	seq=
+	/bin/sh -c 'kill -USR2 $PPID; kill -HUP $PPID; kill -USR1 $PPID'
+	[ $((n1 - b1)) = $((r + 1)) ] && [ $((n2 - b2)) = $((r + 1)) ] && [ $((n3 - b3)) = $((r + 1)) ] || bad=$((bad + 1))
+	[ "$seq" = .HUP.USR1.USR2 ] || { badord=$((badord + 1)); echo "round $r order: $seq" >&2; }
+done
+echo "three signals, external: $([ $bad = 0 ] && echo each once || { echo "$bad bad rounds: $((n1 - b1)) $((n2 - b2)) $((n3 - b3))" >&2; echo WRONG; })"
+echo "three signals, order: $([ $badord = 0 ] && echo ascending || echo WRONG)"
+b1=$n1 b2=$n2 b3=$n3 bad=0
+for ((r = 1; r <= 40; r++)); do
+	{ kill -USR2 $$; kill -HUP $$; kill -USR1 $$; } &
+	SECONDS=0
+	until [ $((n1 - b1)) -ge $r ] && [ $((n2 - b2)) -ge $r ] && [ $((n3 - b3)) -ge $r ] || [ $SECONDS -ge 5 ]; do :; done
+	wait
+	[ $((n1 - b1)) = $r ] && [ $((n2 - b2)) = $r ] && [ $((n3 - b3)) = $r ] || bad=$((bad + 1))
+done
+echo "three signals, from a job: $([ $bad = 0 ] && echo each once || { echo "$bad bad rounds: $((n1 - b1)) $((n2 - b2)) $((n3 - b3))" >&2; echo WRONG; })"
+n1=$((n1 - 80)) n2=$((n2 - 80)) n3=$((n3 - 80)) # (the hammers' verdicts below count theirs)
 # recompute what the rounds must have summed to, with no signals around
 trap - USR1 USR2 HUP
 exp=0 ehot=0
