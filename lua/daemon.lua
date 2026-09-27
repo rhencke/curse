@@ -334,6 +334,19 @@ local function serve_request(cfd, req, fds, ctx)
 			rt.internal_pids[j.pid] = true
 		end
 	end
+	-- (…and ANY child still here: a foreground external the script was waiting for when a
+	-- signal ended it — bash would have died and left it to init — `kill -TERM` of a
+	-- nested `curse -c 'trap … TERM; sleep 1'`. A worker has no children of its own.)
+	do
+		local wp = tonumber(C.getpid())
+		local f = io.open("/proc/" .. wp .. "/task/" .. wp .. "/children", "r")
+		if f then
+			for pid in (f:read("*a") or ""):gmatch("%d+") do
+				rt.internal_pids[tonumber(pid)] = true
+			end
+			f:close()
+		end
+	end
 	pcall(rt.reap_orphans) -- (children no job waits for any more: never zombies on the worker)
 	-- SCRUB per-request process state (the fork boundary used to do this):
 	C.umask(ctx.umask) -- a script's `umask` doesn't persist
