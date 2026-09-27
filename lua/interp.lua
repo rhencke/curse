@@ -2638,6 +2638,9 @@ expand_fields_full = function(sh, w, pre1) -- pre1: part 1 already expanded (a $
 					fb:add(s:sub(1, #s - tl), false)
 					s = s:sub(#s - tl + 1)
 				end
+			elseif pi > 1 and p.lit ~= nil and not p.q and not w.notilde and not w.noassign
+				and s:find(":~", 1, true) and rt.assignish(w) then
+				s = rt.tilde_argcont(sh, s, pi < #w.parts, sh.opt_posix and w.plainarg)
 			end -- word-initial / NAME= ~
 			if p.dqat and s == "" then
 				dq_null = true

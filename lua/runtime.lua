@@ -7024,6 +7024,22 @@ end
 -- `more`: other parts follow this literal in the word (see tilde_assign) — a prefix with
 -- no `/` then includes quoted/expanded text (`~""`, `~$USER`) and stays literal (bash).
 -- `noassign`: don't treat `NAME=` specially (posix mode, a non-declaration command).
+-- Is word w shaped like an assignment — its first part an unquoted literal `NAME=` /
+-- `NAME[…]=` (/+=)? Then bash tilde-expands after every `:` in it, not only in that first
+-- literal: `echo z=$x:~` (M.tilde_argcont, both tiers).
+function M.assignish(w)
+	local p1 = w.parts[1]
+	local l = p1 and not p1.q and p1.lit
+	return l and (l:match("^[%a_][%w_]*%+?=") or l:match("^[%a_][%w_]*%b[]%+?=")) ~= nil or false
+end
+-- A LATER unquoted literal of such a word: its text continues the value before it, so
+-- only a `~` after one of its own `:` expands (`noassign`: posix mode's plain argument)
+function M.tilde_argcont(sh, s, more, noassign)
+	if noassign then
+		return s
+	end
+	return M.tilde_assign(sh, s, more, true)
+end
 function M.tilde_word_initial(sh, s, more, noassign)
 	local pre, rest = s:match("^([%a_][%w_]*%+?=)(.*)$")
 	if not pre and s:find("]", 1, true) then -- (`a[1]=~`: a subscripted assignment word too)

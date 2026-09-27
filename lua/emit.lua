@@ -1768,6 +1768,13 @@ local function emit_part(p, i, lifted, w, tilde)
 			return ("rt.tilde_word_initial(sh, %q, %s, %s)"):format(
 				p.lit, tostring(#w.parts > 1), w.noassign and "true" or w.plainarg and "sh.opt_posix" or "false")
 		end
+		if tilde and i > 1 and not p.q and not w.notilde and not w.noassign and p.lit:find(":~", 1, true)
+			and require("runtime").assignish(w) then
+			-- (a later literal of a NAME=… word: `z=$x:~` — each `:~` expands, as bash's
+			-- expand_word_internal does through the whole word)
+			return ("rt.tilde_argcont(sh, %q, %s, %s)"):format(p.lit, tostring(i < #w.parts),
+				w.plainarg and "sh.opt_posix" or "false")
+		end
 		return EF.lit_expr(p)
 	elseif p.raw then
 		return p.raw -- pre-computed Lua string expr (inlined param)
