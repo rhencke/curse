@@ -57,9 +57,20 @@ are warm; this one still falls back.
 
 ## Wire protocol (local socket, same host → host-endian u32)
 
+The protocol's version is in the socket's name — `$XDG_RUNTIME_DIR/curse-v2.sock` — so a
+client and a daemon of different versions never meet: the client finds no daemon and
+falls back. It is also in the request header: a daemon that doesn't speak the header
+closes the connection before its first reply frame, and the client, never having been
+told a worker pid, knows the script never started and falls back (never a wrong status).
+The daemon still serves v1 framing (`"CURS"`, argv at once) correctly.
+
 Request (client → daemon), with fds 0,1,2 attached as `SCM_RIGHTS`:
 
-    u32 magic = "CURS"
+    u32 magic = "CURV"
+    u32 version = 2
+    u32 closed                                -- fds 0-2 closed at the client (bit n = fd n):
+                                              -- /dev/null is sent in their place, and the
+                                              -- worker closes them for the script
     u32 nargs;  nargs × (u32 len, bytes)      -- argv
     u32 cwdlen, bytes                         -- getcwd()
     u32 nenv;   nenv  × (u32 len, bytes)      -- environ (KEY=VALUE)
@@ -67,9 +78,12 @@ Request (client → daemon), with fds 0,1,2 attached as `SCM_RIGHTS`:
     u32 nextra; nextra × u32                  -- numbers of the other inherited fds (3..63),
                                               -- attached after 0,1,2 in the same SCM_RIGHTS
 
-Response (daemon → client): `int32 status`, then close. Bit `0x10000` set means
-the script's shell died by signal `(status >> 8) & 0x7f`; the client then kills
-itself with that signal, as bash would have died.
+Response (daemon → client): `int32 -pid` (the worker: the client forwards the signals
+sent to it there from now on), then `int32 status`. The client then stops forwarding and
+closes the connection; the worker waits for that close before it takes its next request,
+so a signal sent to a finished client can never reach another client's script. Bit
+`0x10000` of the status means the script's shell died by signal `(status >> 8) & 0x7f`;
+the client then kills itself with that signal, as bash would have died.
 
 ## Gotchas / current limits
 

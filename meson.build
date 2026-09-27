@@ -141,6 +141,15 @@ test('static-shell', files('test' / 'static-shell.sh'),
   suite:   'unit',
   timeout: 120)
 
+# The client/daemon protocol across versions (an old or future peer: fallback, never a
+# wrong status) and the std fds a client had closed.
+test('daemon-protocol', files('test' / 'daemon-protocol.sh'),
+  args:    [luajit_bin, curse_client, curse, repo],
+  workdir: repo,
+  depends: [vm, curse, curse_client],
+  suite:   'unit',
+  timeout: 120)
+
 run_target('fetch-real', command: [files('test' / 'real' / 'fetch.sh')])
 
 # --- Conformance harness: bash (oracle) vs dash vs curse interp/compiled/tiered.
