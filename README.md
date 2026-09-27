@@ -161,10 +161,17 @@ runs each test under **bash** (the oracle), **dash** (where it supports the test
 and curse through a private daemon — **curse-cold** (empty compile cache: interpret,
 switch to compiled code where hot, store it) and **curse-hot** (the same test again,
 loading the stored compiled code) — scoring each shell's agreement with bash on
-stdout + exit status **and its summed run time**. Parallelism is bounded (`--jobs`,
+stdout + exit status **and its summed run time**. For `cases` it also compares
+**stderr** (normalised: script path/`$0`, temp paths, pids, `time` figures) and adds a
+**curse-interp** column (the bare interpreter, which OSR would hide). The harness exits
+non-zero on any curse failure or timeout, or an oracle timeout on a `cases` test;
+differences known and tracked are listed, each with its reason, in
+[`test/conformance/known-diffs`](test/conformance/known-diffs) (a ratchet: an entry that
+matches again fails the run until removed). Parallelism is bounded (`--jobs`,
 default gentle; use `--jobs 1` for clean timing). Three corpora:
 
-- **`cases`** — [`test/cases/`](test/cases/), curse's own scripts (no download).
+- **`cases`** — [`test/cases/`](test/cases/), curse's own scripts (no corpus download,
+  but scored against the oracle, which is built from the bash subproject).
 - **`bash`** — GNU bash's own `tests/*.tests` suite.
 - **`oil`** — the [Oils](https://oils.pub) `spec/*.test.sh` cases that target bash
   (bash listed in `compare_shells`, minus oil-only / `N-I bash` cases).
@@ -185,8 +192,12 @@ meson test -C build --suite unit    # just the fast unit tests
 meson test -C build --suite conformance -v    # just the conformance scoreboards
 ```
 
-`-Dconformance=disabled` skips the corpus fetch (lean/offline build); `=auto` makes
-it best-effort (non-fatal offline). For a tight loop, run the harness directly:
+The oracle is always the in-tree **bash 5.2.21** built from the bash subproject
+(`build/test/oracle/bash`), for every corpus including `cases`. `-Dconformance=disabled`
+skips the corpus fetch (lean/offline build) — and with it the oracle, so
+`conformance-cases` is still registered but **skips** (exit 77, saying why) and the
+setup summary shows `cases: skipped`; `=auto` makes the fetch best-effort (non-fatal
+offline, same skip when it fails). For a tight loop, run the harness directly:
 `test/conformance/run.sh --corpus oil --jobs 4 arith`.
 
 - **[`test/stress/`](test/stress/)** — the stress suite: signal handling, daemon
@@ -235,9 +246,13 @@ build/            Meson build dir (gitignored): luajit, curse, curse-client, cur
 Work in progress. The interpreter and its builtins target the full bash surface,
 and the **compiled tier compiles every program in the conformance corpora** with no
 fallback to the interpreter (`build/luajit tools/delegate-census.lua` reports
-`nocompile 0  with-delegates 0`; alias- or history-dependent input compiles a
-line at a time). curse matches bash on all three corpora (`cases`, `oil`, `bash`)
-cold and hot. Details live in [`lua/README.md`](lua/README.md).
+`nocompile 0`; alias- or history-dependent input compiles a line at a time). With
+`--modes` the census also emits every program as a fragment in each emit mode, plus
+synthetic programs past Lua's local-variable limits; the meson `census-N` tests run that
+and fail on anything not in [`tools/census-known`](tools/census-known) (today: the
+DEBUG-trap-in-handler LOADFAILs and a few fragment refusals, each tracked). curse matches
+bash on stdout + status on all three corpora (`cases`, `oil`, `bash`) cold and hot, and
+on stderr for `cases`, apart from the entries in `test/conformance/known-diffs`. Details live in [`lua/README.md`](lua/README.md).
 
 ## License
 

@@ -134,6 +134,20 @@ test('ub-pins', files('test' / 'ub' / 'run.sh'),
   suite:   'unit',
   timeout: 60)
 
+# The compile census (tools/delegate-census.lua): every corpus program + synthetic ones past
+# Lua's limits, emitted whole and as a fragment in every emit mode — nocompile must be 0
+# and every LOADFAIL/refusal a known one (tools/census-known, a ratchet). Four shards.
+foreach i : ['1', '2', '3', '4']
+  test('census-' + i, run_lua,
+    args:    [luajit_bin, repo / 'tools' / 'delegate-census.lua', '--modes', '--shard', i + '/4',
+              '--check', repo / 'tools' / 'census-known'],
+    workdir: repo,
+    env:     test_env,
+    depends: vm,
+    suite:   'unit',
+    timeout: 600)
+endforeach
+
 test('static-shell', files('test' / 'static-shell.sh'),
   args:    [luajit_bin, curse, repo],
   workdir: repo,
@@ -156,6 +170,9 @@ dash_prog = find_program('dash', required: false)
 
 conf = find_program('test' / 'conformance' / 'run.sh')
 conf_shells = dash_prog.found() ? 'dash,curse-cold,curse-hot' : 'curse-cold,curse-hot'
+# curse's own cases also run in the bare interpreter (no daemon, no OSR): OSR would hide an
+# interp-only difference from curse-cold.
+cases_shells = conf_shells + ',curse-interp'
 
 # `cases` (curse's own scripts) needs no external corpus, but it does need the oracle (below).
 # curse now runs via its daemon, so the tests need the built luajit + the module
@@ -183,7 +200,7 @@ if bash_found
   subdir('test' / 'oracle')
   conf_deps += [oracle_bash]
   oracle_args = ['--oracle', oracle_bash.full_path(), '-v']
-  test('conformance-cases', conf, args: ['--corpus', 'cases', '--shells', conf_shells] + oracle_args,
+  test('conformance-cases', conf, args: ['--corpus', 'cases', '--shells', cases_shells] + oracle_args,
     suite: 'conformance', depends: conf_deps, workdir: repo, is_parallel: false, timeout: 0)
   test('conformance-bash', conf,
     args: ['--corpus', 'bash', '--bash-dir', bash_sp.get_variable('tests_dir'), '--shells', conf_shells] + oracle_args,
@@ -193,6 +210,12 @@ if bash_found
       args: ['--corpus', 'oil', '--oil-dir', oil_sp.get_variable('spec_dir'), '--shells', conf_shells] + oracle_args,
       suite: 'conformance', depends: conf_deps, workdir: repo, is_parallel: false, timeout: 0)
   endif
+else
+  # No oracle (-Dconformance=disabled, or =auto offline): conformance-cases is still
+  # registered, and SKIPS (77) saying why — never silently absent, never a pass.
+  test('conformance-cases', find_program('sh'),
+    args: ['-c', 'echo "SKIP: conformance-cases needs the bash 5.2.21 oracle, built from the bash subproject (not configured: -Dconformance=' + (conf_feat.disabled() ? 'disabled' : 'auto') + ', or its fetch failed)"; exit 77'],
+    suite: 'conformance', is_parallel: false)
 endif
 
 # --- Stress suite (test/stress): signals, daemon concurrency, past flakes under load,
@@ -207,5 +230,6 @@ test('stress', files('test' / 'stress' / 'run.sh'),
 add_test_setup('default', exclude_suites: ['stress'], is_default: true)
 
 summary({'dash (extra column)': dash_prog.found(),
-         'bash+oil corpora': not conf_feat.disabled()},
+         'bash+oil corpora': bash_found,
+         'cases': bash_found ? 'scored vs the in-tree bash 5.2.21 oracle' : 'skipped (no oracle: needs the bash subproject)'},
         section: 'Conformance', bool_yn: true)
