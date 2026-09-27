@@ -1666,10 +1666,18 @@ end
 expand_part_str = function(sh, p, assign)
 	if p.lit ~= nil then
 		return p.lit
+	elseif p.cserr then -- (an open $( in a word read at expansion time: parse_default_quoted —
+		-- bash's parse error in the substitution, reported a line on, then DISCARD)
+		local fl, ip, pl = sh.force_line, sh.in_perr, sh.perr_label
+		sh.in_perr, sh.perr_label = true, "command substitution"
+		sh.force_line = (fl or rt.current_line(sh)) + 1
+		sherr(sh, "curse: " .. p.cserr .. "\n")
+		sh.in_perr, sh.perr_label, sh.force_line = ip, pl, fl
+		error({ __curse_exit = 1, __curse_lineabort = true })
 	elseif p.bterr or p.nulcut then -- (a brace range's unclosed backquote: bq_word in the
 		-- parser; a word cut at a $'…' NUL: parser.dq_nulcut)
 		sherr(sh, p.bterr and ('curse: bad substitution: no closing "`" in ' .. p.bterr .. "\n")
-			or ("curse: bad substitution: no closing `}' in " .. p.nulcut .. "\n"))
+			or ("curse: bad substitution: no closing `" .. (p.nocl or "}") .. "' in " .. p.nulcut .. "\n"))
 		-- (a plain line abort, as ${x!}: bash's report_error + expand_word_error DISCARD,
 		-- which an eval/source's parse_and_execute contains — the rest of ITS line only)
 		error({ __curse_exit = 1, __curse_lineabort = true })

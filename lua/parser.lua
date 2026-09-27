@@ -1998,6 +1998,19 @@ end
 -- except before $ ` " \ (and \} -> a literal }, \<newline> is a line continuation), and
 -- a syntactic inner " is dropped (`"${x:-"a b"}"` -> `a b`). Shared by the interpreter's
 -- pexp default expansion and the compiled tier so both render such a default identically.
+-- The error bash's xparse_dolparen reports for a $( whose `)` never comes (BODY: the text
+-- after it, to the end of the word): the body's own syntax error, else the missing `)'.
+function M.open_comsub_err(body)
+	local ok, ast = pcall(M.parse, body)
+	local err = not ok and (type(ast) == "table" and ast.msg or tostring(ast)) or nil
+	for _, st in ipairs(ok and ast.stmts or {}) do
+		if st.t == "parse_error" and not st.recoverable then
+			err = tostring(st.msg)
+			break
+		end
+	end
+	return err and unpos(err) or "unexpected EOF while looking for matching `)'"
+end
 function M.parse_default_quoted(txt, heredoc)
 	local out, k, m, inq = {}, 1, #txt, false
 	while k <= m do
@@ -2036,12 +2049,40 @@ function M.parse_default_quoted(txt, heredoc)
 			k = k + 1
 		end
 	end
+	local t = table.concat(out)
+	-- a construct in the word left open (`"${u-'${'}"`: in "…" the `'` are literal): bash's
+	-- expansion of the word fails there — after expanding what precedes it — with
+	-- extract_dollar_brace_string's "bad substitution: no closing `}' in WORD" (`$[`: `]'),
+	-- or "no closing "`" in `…" for a backquote; an open $( … ) is a command substitution
+	-- whose body (the rest) fails to parse when it runs
+	local bad, k2 = nil, 1
+	while k2 <= #t do
+		local b = t:byte(k2)
+		if b == 92 then
+			k2 = k2 + 2
+		elseif b == 96 or b == 36 then
+			local ok, e = pcall(expansion_end, t, k2, true, b == 96 or t:byte(k2 + 1) == 40)
+			if not ok or e > #t + 1 then
+				bad = k2
+				break
+			end
+			k2 = e
+		else
+			k2 = k2 + 1
+		end
+	end
 	local saved = DQ_ANSI
 	DQ_ANSI = not heredoc
-	local ok, r = pcall(M.parse_heredoc, table.concat(out))
+	local ok, r = pcall(M.parse_heredoc, bad and t:sub(1, bad - 1) or t)
 	DQ_ANSI = saved
 	if not ok then
 		error(r, 0)
+	end
+	if bad then
+		local c2 = t:sub(bad + 1, bad + 1)
+		r.parts[#r.parts + 1] = t:byte(bad) == 96 and { bterr = t:sub(bad), q = true }
+			or c2 == "(" and { cserr = M.open_comsub_err(t:sub(bad + 2)), q = true }
+			or { nulcut = txt, nocl = c2 == "[" and "]" or nil, q = true }
 	end
 	return r
 end
