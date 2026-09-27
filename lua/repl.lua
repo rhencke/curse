@@ -109,6 +109,7 @@ function M.run(sh)
 	-- piped `-i` run never clobbers the user's real history. On a real tty, readline
 	-- also loads its editing history from the same file.
 	local histfile = sh:get("HISTFILE")
+	local histfile0 = histfile
 	if histfile == "" or sh.histfile_default then
 		histfile = nil
 	end
@@ -219,6 +220,13 @@ function M.run(sh)
 	pcall(interp.run_exit_trap, sh)
 	io.flush()
 	local n, h = sh.hist_session or 0, H.list(sh)
+	-- (shell.c exit_shell: `if (remember_on_history) maybe_save_shell_history ()`, which
+	-- reads $HISTFILE THEN — so `set +o history`, `unset HISTFILE`, `HISTFILE=` or a new
+	-- HISTFILE mid-session all count. The ~/.bash_history default stays unwritten.)
+	histfile = H.enabled(sh) and sh.vars.HISTFILE and sh:get("HISTFILE") or ""
+	if histfile == "" or (sh.histfile_default and histfile == histfile0) then
+		histfile = nil
+	end
 	if histfile then
 		-- (bash's maybe_save_shell_history: this session's lines are appended, with their
 		-- timestamps, as `history -a` — or, when HISTSIZE left fewer of them in the list and
