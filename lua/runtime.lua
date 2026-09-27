@@ -3579,10 +3579,56 @@ flush_deferred = function(sh)
 		and not (M.fg_hold > 0 and M.fg_pid == C.getpid()) then
 		local d = deferred_sigs
 		deferred_sigs = nil
-		for sig in pairs(d) do
-			C.kill(C.getpid(), sig)
+		-- (a trapped one runs here and now, in signal-number order as run_pending_traps
+		-- does — even inside a running trap handler, whose VM hook can't fire again; any
+		-- other is raised again for its disposition)
+		local I = require("interp")
+		for sig = 1, 64 do
+			if d[sig] then
+				local h = sh.traps and sh.traps["SIG" .. (I._int.NUMSIG[sig] or "")]
+				if h and h ~= "" then
+					I.run_signal(sh, sig, false, true)
+				else
+					C.kill(C.getpid(), sig)
+				end
+			end
 		end
 	end
+end
+-- A signal arriving while a Lua module loads (a lazy require: tier, a b_* builtin) waits
+-- until it has loaded: its trap may need that very module, and a nested require of a
+-- module still loading is LuaJIT's "loop or previous error loading module". require is
+-- wrapped to count the loads in progress; the outermost one raises the held signals.
+do
+	local creq, loaded = require, package.loaded
+	M.req_depth = 0
+	local function req_done(ok, ...)
+		M.req_depth = M.req_depth - 1
+		if M.req_depth == 0 and deferred_sigs and M.defer_sh then
+			flush_deferred(M.defer_sh)
+		end
+		if not ok then
+			error((...), 0)
+		end
+		return ...
+	end
+	_G.require = function(name)
+		local m = loaded[name]
+		if m ~= nil and type(m) ~= "userdata" then -- (loaded: the common case)
+			return m
+		end
+		M.req_depth = M.req_depth + 1
+		return req_done(pcall(creq, name))
+	end
+end
+function M.defer_loading(sh, sig)
+	if M.req_depth > 0 then
+		M.defer_sh = sh
+		deferred_sigs = deferred_sigs or {}
+		deferred_sigs[sig] = true
+		return true
+	end
+	return false
 end
 cap_enter = function()
 	local pid = C.getpid()

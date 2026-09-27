@@ -6148,16 +6148,18 @@ end
 
 -- Run the trap for the signal `signum` that the async handler delivered via the VM
 -- hook (lib_cursesig.c). No pending queue — the hook hands us exactly the signal
--- that fired. run_trap bumps sh.in_trap so a signal arriving DURING the handler is
--- serialized (the hook re-arms and runs it after this returns) — except one the handler
--- sent itself with `kill`, which runs nested, as in bash (rt.self_sig_release). A
+-- that fired. A signal arriving DURING a handler runs nested, inside it, as bash's
+-- run_pending_traps does at the handler's next command (running_trap only warns) — all
+-- but SIGCHLD inside its own trap (SIG_INPROGRESS: it runs again once that one ends). A
 -- signal trap doesn't change $? unless it exits/returns; `exit` in the handler
 -- propagates to exit the shell (bash).
+local chld_running, chld_again
 local function run_signal(sh, signum, direct, nested)
-	if not nested and sh.in_trap and sh.in_trap > 0 then
+	if signum == 17 and chld_running then
+		chld_again = true
 		return
-	end -- don't run a trap inside a trap (unless taken synchronously: rt.self_sig_release)
-	if not direct and rt.defer_signal(sh, signum) then
+	end
+	if not direct and (rt.defer_loading(sh, signum) or rt.defer_signal(sh, signum)) then
 		return -- (the parent's: runs once the in-process subshell has ended)
 	end
 	local h = sh.traps and sh.traps["SIG" .. (NUMSIG[signum] or "")]
@@ -6173,7 +6175,23 @@ local function run_signal(sh, signum, direct, nested)
 	-- an asynchronously-delivered signal handler reports $LINENO = 1 (bash).
 	local saved, sl = sh.status, sh.cur_line
 	sh.cur_line = 1
-	local exited, rret = run_trap(sh, h)
+	local exited, rret
+	if signum == 17 then
+		chld_running = true
+		local ok, e1, e2 = pcall(run_trap, sh, h)
+		chld_running = nil
+		if not ok then
+			chld_again = nil
+			error(e1, 0)
+		end
+		exited, rret = e1, e2
+		if chld_again then -- (children reaped meanwhile: the trap runs for them too)
+			chld_again = nil
+			C.kill(C.getpid(), 17)
+		end
+	else
+		exited, rret = run_trap(sh, h)
+	end
 	sh.cur_line = sl
 	-- a trapped signal ends a `wait`: 128+sig (see b_wait) — but SIGCHLD only in posix mode
 	if sh.in_wait and (signum ~= 17 or sh.opt_posix) then

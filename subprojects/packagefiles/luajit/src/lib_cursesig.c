@@ -16,6 +16,7 @@
  * table, so ffi.C resolves them via lj_clib.c's static fallback in both the dynamic
  * and the fully static binary (neither exports internal symbols to dlsym). */
 #include "lua.h"
+#include "lj_obj.h"
 #include <signal.h>
 #include <string.h>
 #include <unistd.h>
@@ -48,7 +49,13 @@ static void curse_sig_hook(lua_State *L, lua_Debug *ar)
   lua_getglobal(L, "__curse_sigrun");
   if (lua_isfunction(L, -1)) {
     lua_pushinteger(L, s);
+    /* The trap runs as ordinary code, not as a hook: a signal arriving while it runs
+     * fires its own hook INSIDE it, nested — as bash's run_pending_traps runs a pending
+     * trap at the running handler's next command. (callhook only skips a hook while
+     * HOOK_ACTIVE; it is set again before returning to callhook, which clears it.) */
+    hook_leave(G(L));
     lua_call(L, 1, 0);
+    hook_enter(G(L));
   } else {
     lua_pop(L, 1);
   }
