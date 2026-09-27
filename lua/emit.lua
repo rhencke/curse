@@ -3955,7 +3955,7 @@ analyze_lift = function(ast)
 				scan(st.body, dq)
 			elseif t == "if" then
 				for _, cl in ipairs(st.clauses) do
-					if dq then
+					if dq and cl.cond then -- (the else clause has none)
 						scan(cl.cond, true)
 					end
 					scan(cl.body, dq)
