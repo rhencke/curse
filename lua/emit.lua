@@ -4867,7 +4867,7 @@ H.funcdef = function(cx, st, after)
 		return p
 	end
 	local p = cx.newpc()
-	if not st.name:match("^[%w_:%.+@/%%%^~,!][%w_%.%-:+@/!#=%%%^~,%[%]]*$") then -- name is an expansion (`$foo-bar()`):
+	if not st.name:match("^[%w_:%.+@/%%%^~,!%-=][%w_%.%-:+@/!#=%%%^~,%[%]]*$") then -- name is an expansion (`$foo-bar()`):
 		cx.blocks[p] = EF.bad_ident(st.name, after) -- non-fatal runtime error (bash)
 	else
 		cx.blocks[p] = (st.name:match("^[%a_][%w_]*$") and "" -- (posix: a non-identifier name is fatal)

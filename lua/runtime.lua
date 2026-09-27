@@ -16747,7 +16747,7 @@ function M.def_function(sh, st, fn)
 	local name = st.name
 	-- a name that is an expansion (`$foo-bar()`, captured raw by the parser) is a NON-fatal
 	-- runtime error (status 1); bash is otherwise lenient (`func-name=ext` is fine)
-	local badname = not name:match("^[%w_:%.+@/%%%^~,!][%w_%.%-:+@/!#=%%%^~,%[%]]*$")
+	local badname = not name:match("^[%w_:%.+@/%%%^~,!%-=][%w_%.%-:+@/!#=%%%^~,%[%]]*$")
 	if badname or (sh.opt_posix and not name:match("^[%a_][%w_]*$")) then
 		M.ierr = true -- (check_identifier's internal_error)
 		M.err_at(sh, st.top and st.eline, "curse: `" .. name .. "': not a valid identifier\n")

@@ -332,7 +332,8 @@ return function(sh, cmd, args, hook, tcb)
 				return "declare -f" .. (fro[nm] and "r" or "") .. (ftr[nm] and "t" or "") .. (fx[nm] and "x" or "") .. " " .. nm
 			end
 			for _, nm in ipairs(names) do
-				if nm:find("=", 1, true) then -- (bash stops right there)
+				if named and (nm:find("^[%a_][%w_]*%+?=") or nm:find("^[%a_][%w_]*%b[]%+?=")) then -- (an assignment
+					-- word, NAME=…: bash stops right there; `a-b=c` is just a name)
 					io.stderr:write("curse: " .. cmd .. ": cannot use `-f' to make functions\n")
 					sh.status = 1
 					return
