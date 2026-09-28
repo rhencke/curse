@@ -7,12 +7,18 @@
 local rt = require("runtime")
 local PREEMPT = rt.preempt_flag -- (raised when a background job's CPU slice runs out: see rt.preempt)
 local P = require("parser") -- parser has no load-time dep on interp, so this is cycle-safe
+local i64 = rt.i64
+local ffi = require("ffi")
+local u64 = ffi.typeof("uint64_t") -- string.format formats int64_t/uint64_t cdata directly
+local bit = require("bit")
+
+local M = {}
 -- A word's text re-read at expansion (a ${…}'s operand word, stored raw at parse time):
 -- the reader already vetted it, but a construct the re-read finds left open must not
 -- escape as a Lua error — it becomes an error part, raised when the word expands after
 -- what precedes it: bash's "bad substitution: no closing `}'" (extract_dollar_brace_string),
 -- else the scanner's own message. (dq: the operand of a ${…} inside "…")
-local function lazy_word(txt, dq, hd)
+function M.lazy_word(txt, dq, hd)
 	local ok, w = pcall(dq and P.parse_default_quoted or P.parse_word, txt, hd)
 	if ok then
 		return w
@@ -25,12 +31,6 @@ local function lazy_word(txt, dq, hd)
 	return { k = "word", src = txt, parts = { close and { nulcut = txt, nocl = close == "]" and "]" or nil, q = true }
 		or { xperr = m, q = true } } }
 end
-local i64 = rt.i64
-local ffi = require("ffi")
-local u64 = ffi.typeof("uint64_t") -- string.format formats int64_t/uint64_t cdata directly
-local bit = require("bit")
-
-local M = {}
 
 -- `set -o NAME` / short-flag maps for the `set` builtin (and shopt -o). The option
 -- machinery lives in runtime (option state is runtime data); interp and the set/shopt
@@ -824,6 +824,31 @@ local function arith_nounset(sh, name)
 	end
 end
 
+-- The $name / $N operands of an $(( )) text — appended to OUT: bash substitutes them all
+-- before it evaluates anything, so one that isn't a number takes the textual path before
+-- any of the expression runs (an operand read natively first would say its errors twice).
+-- False when a branch evaluation may skip (a ternary's arms, the right of && / ||) holds
+-- an opaque ${…}: its expansion can't be vetted apart from running it.
+function M.cond_leaves(e, cond, out)
+	local k = e.k
+	if k == "var" and e.dollar or k == "param" then
+		out[#out + 1] = e
+		return true
+	elseif k == "xpandleaf" then
+		return not cond
+	elseif k == "tern" then
+		return M.cond_leaves(e.c, cond, out) and M.cond_leaves(e.a, true, out) and M.cond_leaves(e.b, true, out)
+	elseif k == "bin" and (e.op == "&&" or e.op == "||") then
+		return M.cond_leaves(e.l, cond, out) and M.cond_leaves(e.r, true, out)
+	end
+	for _, v in pairs(e) do
+		if type(v) == "table" and v.k and not M.cond_leaves(v, cond, out) then
+			return false
+		end
+	end
+	return true
+end
+
 -- bash's textual path for arithmetic with expansions: expand the raw text, then parse
 -- the RESULT as plain arithmetic (a `$` left in it is an error). Shared by both tiers.
 -- bash's expand_arith_string: the text is expanded as if double-quoted, but quote
@@ -876,6 +901,9 @@ local function arith_expand_text(sh, raw, depth0) -- depth0: 1 = the text IS a s
 end
 function M.arith_textual_eval(sh, raw, depth0)
 	local text = arith_expand_text(sh, raw, depth0)
+	if depth0 == 1 and text == "" and not in_expanded_text then -- (a subscript's expansions left
+		error({ __arith_emptysub = true }, 0) -- nothing: arith_key)
+	end
 	local pok, ast = pcall(P.arith, text, "strict")
 	if not pok then
 		P.trap_flow(ast)
@@ -1011,7 +1039,11 @@ eval = function(sh, e)
 			if rt.arith_badraw(sh, e.name, e.idxraw, "r") then -- (non-fatal: 0)
 				return i64(0)
 			end
-			local iv = arith_key(sh, e.name, e.idx, e.idxraw)
+			local iv = arith_key(sh, e.name, e.idx, e.idxraw, true)
+			if iv == rt.EMPTYSUB then -- (`v[$a]`, a empty: the expanded text reads `v[]`)
+				rt.arith_badraw(sh, e.name, "", "r")
+				return i64(0)
+			end
 			if rt.arith_badkey(sh, e.name, iv, "r") then
 				return i64(0)
 			end
@@ -1076,7 +1108,31 @@ eval = function(sh, e)
 			end
 			e.native = nok and nat or false -- (unparseable raw: the textual path reports it)
 		end
-		if e.fast and e.native then
+		if e.fast and e.native and e.cdl == nil then
+			local out = {}
+			e.cdl = M.cond_leaves(e.native, false, out) and out or false
+		end
+		-- (bash expands every $name before evaluating: one in a branch that isn't taken,
+		-- empty or not a number, is still a syntax error — `(( 1 ? 0 : $i ))`)
+		local cdl = e.fast and e.native and e.cdl
+		if cdl then
+			for n = 1, #cdl do
+				local c = cdl[n]
+				local v
+				if c.k == "param" then
+					v = sh:param(c.n)
+				elseif c.name == "RANDOM" or c.name == "SRANDOM" then
+					v = "0" -- (a number, and reading it here would advance the sequence)
+				else
+					v = sh:get(c.name)
+				end
+				if v == nil or not looks_numeric(v) then
+					cdl = false
+					break
+				end
+			end
+		end
+		if cdl then
 			local ok, r = pcall(eval, sh, e.native)
 			if not ok then
 				P.trap_flow(r)
@@ -1220,8 +1276,12 @@ eval = function(sh, e)
 			end
 			bad = rt.arith_badraw(sh, e.name, e.idxraw, how)
 			if not bad then
-				iv = arith_key(sh, e.name, e.idx, e.idxraw)
-				bad = rt.arith_badkey(sh, e.name, iv, how)
+				iv = arith_key(sh, e.name, e.idx, e.idxraw, true)
+				if iv == rt.EMPTYSUB then
+					bad, iv = rt.arith_badraw(sh, e.name, "", how), nil
+				else
+					bad = rt.arith_badkey(sh, e.name, iv, how)
+				end
 			end
 		end
 		if e.op ~= "=" then
@@ -1268,7 +1328,10 @@ eval = function(sh, e)
 	if k == "post" then
 		arith_nounset(sh, e.name) -- x++ / x-- read x first
 		if e.idxraw then
-			local iv = not rt.arith_badraw(sh, e.name, e.idxraw, "rw") and arith_key(sh, e.name, e.idx, e.idxraw)
+			local iv = not rt.arith_badraw(sh, e.name, e.idxraw, "rw") and arith_key(sh, e.name, e.idx, e.idxraw, true)
+			if iv == rt.EMPTYSUB then
+				iv = not rt.arith_badraw(sh, e.name, "", "rw")
+			end
 			if not iv or rt.arith_badkey(sh, e.name, iv, "rw") then -- (a bad element: 0, nothing stored)
 				return i64(0)
 			end
@@ -1283,7 +1346,10 @@ eval = function(sh, e)
 	if k == "pre" then
 		arith_nounset(sh, e.name) -- ++x / --x read x first
 		if e.idxraw then
-			local iv = not rt.arith_badraw(sh, e.name, e.idxraw, "rw") and arith_key(sh, e.name, e.idx, e.idxraw)
+			local iv = not rt.arith_badraw(sh, e.name, e.idxraw, "rw") and arith_key(sh, e.name, e.idx, e.idxraw, true)
+			if iv == rt.EMPTYSUB then
+				iv = not rt.arith_badraw(sh, e.name, "", "rw")
+			end
 			if not iv or rt.arith_badkey(sh, e.name, iv, "rw") then -- (a bad element: 0, nothing stored)
 				return i64(e.d)
 			end
@@ -1370,7 +1436,9 @@ end
 
 -- An array subscript used in arithmetic: an associative array takes the
 -- evaluated-then-stringified value as its key ("5"), an indexed array a number.
-arith_key = function(sh, name, idxexpr, idxraw)
+arith_key = function(sh, name, idxexpr, idxraw, inarith) -- (inarith: the subscript is part of an
+	-- arithmetic expression, whose text bash expands whole first — one that expands to nothing
+	-- leaves `NAME[]`: rt.EMPTYSUB, for the caller's bad-subscript report)
 	-- An associative-array subscript in (( )) is a LITERAL string key (parameter-
 	-- expanded and quote-removed), NOT an arith expression: `A[K]` -> key "K",
 	-- `A[$k]` -> the value of k, `A['x']` -> "x". Reuse the normal key resolver.
@@ -1381,7 +1449,11 @@ arith_key = function(sh, name, idxexpr, idxraw)
 		if sh.arith_let and sh.shopt.assoc_expand_once and not (idxraw or ""):find("[$`]") then
 			return idxraw or "" -- (let's argument was expanded once already: `a[80's]` is literal)
 		end
-		return array_key(sh, name, idxraw or "")
+		local key = array_key(sh, name, idxraw or "")
+		if inarith and key == "" and idxraw:find("[$`]") and not idxraw:find("[\\'\"]") then
+			return rt.EMPTYSUB -- (`A[$k]`, k empty: the expanded text reads `A[]`)
+		end
+		return key
 	end
 	-- (bash evaluates a subscript with this_command_name cleared: no `((: ` in its errors)
 	local sv = P.arith_cmd
@@ -1402,6 +1474,12 @@ arith_key = function(sh, name, idxexpr, idxraw)
 	P.arith_cmd = sv
 	if not ok then
 		P.trap_flow(v)
+	end
+	if not ok and type(v) == "table" and v.__arith_emptysub then
+		if inarith then
+			return rt.EMPTYSUB
+		end
+		ok, v = true, i64(0)
 	end
 	if not ok then
 		if type(v) == "table" and v.__curse_matherr and not v.__curse_subscript then
@@ -1543,11 +1621,21 @@ local function expand_procsub(sh, p)
 	sh.procsub_files[#sh.procsub_files + 1] = { fd = fd, pid = job and job.pid or 0, g = job and job.g }
 	return "/dev/fd/" .. fd
 end
+-- the text a bad substitution names: the word as the parser stored it, where a \001 or
+-- \177 byte is CTLESC-quoted (read_token_word) — printed raw, it shows doubled / as ^A^?
+function M.bs_text(sh, pe, noword)
+	local t = not noword and sh.bs_word and sh.bs_depth == sh.subdepth and sh.bs_word
+		or pe.wraw or ("${" .. (pe.raw or pe.name or "") .. "}")
+	return (t:gsub("[\1\127]", "\1%0"))
+end
 local function expand_pexp(sh, p, assign)
 	local pe = p.pexp
+	if pe.posixalt and sh.opt_posix then -- (`${!?…}`: parse_paramexp)
+		return expand_pexp(sh, { pexp = pe.posixalt, q = p.q }, assign)
+	end
 	if pe.op == "badsubst" then -- ${x|html} and other unrecognized ${…} forms
 		if pe.fatal then
-			sherr(sh, "curse: " .. (sh.bs_word and sh.bs_depth == sh.subdepth and sh.bs_word or pe.wraw or ("${" .. (pe.raw or pe.name or "") .. "}")) .. ": bad substitution\n")
+			sherr(sh, "curse: " .. M.bs_text(sh, pe) .. ": bad substitution\n")
 			error({ __curse_exit = sh.opt_c and 127 or 1, __curse_lineabort = sh.opt_i or nil })
 		end
 		if pe.xform then -- ${x@Z}: nothing to transform on an unset x; else FATAL (bash)
@@ -1561,10 +1649,10 @@ local function expand_pexp(sh, p, assign)
 			if not set then
 				return ""
 			end
-			sherr(sh, "curse: " .. (sh.bs_word and sh.bs_depth == sh.subdepth and sh.bs_word or pe.wraw or ("${" .. (pe.raw or pe.name or "") .. "}")) .. ": bad substitution\n")
+			sherr(sh, "curse: " .. M.bs_text(sh, pe) .. ": bad substitution\n")
 			error({ __curse_exit = sh.opt_c and 127 or 1, __curse_lineabort = sh.opt_i or nil })
 		end
-		sherr(sh, "curse: " .. (sh.bs_word and sh.bs_depth == sh.subdepth and sh.bs_word or pe.wraw or ("${" .. (pe.raw or pe.name or "") .. "}")) .. ": bad substitution\n")
+		sherr(sh, "curse: " .. M.bs_text(sh, pe) .. ": bad substitution\n")
 		error({ __curse_exit = 1, __curse_lineabort = true }) -- discards the rest of the line (bash)
 	end
 	if pe.op == "@" and pe.arg == "P" then -- ${x@P}: decode prompt escapes, then expand
@@ -1648,9 +1736,9 @@ local function expand_pexp(sh, p, assign)
 	-- yields `a b` — strip the unescaped `"` before the heredoc-style parse.
 	local function pw(txt)
 		if not p.q then
-			return lazy_word(txt)
+			return M.lazy_word(txt)
 		end
-		return lazy_word(txt, true, pe.hd)
+		return M.lazy_word(txt, true, pe.hd)
 	end
 	local arg
 	if TESTOP[pe.op] then
@@ -1665,18 +1753,18 @@ local function expand_pexp(sh, p, assign)
 	elseif patmode then -- (the pattern and replacement expand only if the value takes them:
 		-- expand_param asks rt.pe_nopat first)
 		arg = function()
-			return pe.arg and expand_pattern(sh, lazy_word(pe.arg), true) or nil
+			return pe.arg and expand_pattern(sh, M.lazy_word(pe.arg), true) or nil
 		end
 	elseif pe.op ~= "sub" then -- (a substring's offset is expanded below — not when the var is unset)
-		arg = pe.arg and expand_word(sh, lazy_word(pe.arg), true) or nil
+		arg = pe.arg and expand_word(sh, M.lazy_word(pe.arg), true) or nil
 	end
 	local arg2
 	if patmode and pe.arg2 then
 		arg2 = function()
-			return expand_repl(sh, lazy_word(pe.arg2))
+			return expand_repl(sh, M.lazy_word(pe.arg2))
 		end
 	else
-		arg2 = pe.arg2 and pe.op ~= "sub" and expand_repl(sh, lazy_word(pe.arg2)) or nil
+		arg2 = pe.arg2 and pe.op ~= "sub" and expand_repl(sh, M.lazy_word(pe.arg2)) or nil
 	end
 	if pe.op == "sub" and not pe.index and rt.sub_unset(sh, pe.name) then
 		return ""
@@ -1709,8 +1797,9 @@ expand_part_str = function(sh, p, assign)
 		error({ __curse_exit = 1, __curse_lineabort = true })
 	elseif p.bterr or p.nulcut then -- (a brace range's unclosed backquote: bq_word in the
 		-- parser; a word cut at a $'…' NUL: parser.dq_nulcut)
-		sherr(sh, p.bterr and ('curse: bad substitution: no closing "`" in ' .. p.bterr .. "\n")
+		sherr(sh, ((p.bterr and ('curse: bad substitution: no closing "`" in ' .. p.bterr .. "\n")
 			or ("curse: bad substitution: no closing `" .. (p.nocl or "}") .. "' in " .. p.nulcut .. "\n"))
+			:gsub("[\1\127]", "\1%0"))) -- (the word as stored: CTLESC-quoted, bs_text)
 		-- (a plain line abort, as ${x!}: bash's report_error + expand_word_error DISCARD,
 		-- which an eval/source's parse_and_execute contains — the rest of ITS line only)
 		error({ __curse_exit = 1, __curse_lineabort = true })
@@ -2266,9 +2355,9 @@ local function default_hda(sh, p)
 		return false
 	end
 	if p.q then
-		return word_hda(sh, lazy_word(pe.arg, true, pe.hd), true)
+		return word_hda(sh, M.lazy_word(pe.arg, true, pe.hd), true)
 	end
-	return word_hda(sh, lazy_word(pe.arg), false)
+	return word_hda(sh, M.lazy_word(pe.arg), false)
 end
 multi_hda = function(sh, p)
 	local pe = p.pexp
@@ -2297,9 +2386,9 @@ multi_hda = function(sh, p)
 			return false
 		end
 		if p.q then
-			return word_hda(sh, lazy_word(pe.arg, true, pe.hd), true)
+			return word_hda(sh, M.lazy_word(pe.arg, true, pe.hd), true)
 		end
-		return word_hda(sh, lazy_word(pe.arg), false)
+		return word_hda(sh, M.lazy_word(pe.arg), false)
 	end
 	if pe.op == "indirect" then
 		local ip = indirect_part(sh, pe, true)
@@ -2334,7 +2423,7 @@ multi_elems = function(sh, p) -- returns element list, star?
 			if arg == nil then
 				return { "" }
 			end
-			local w = lazy_word(arg)
+			local w = M.lazy_word(arg)
 			if #w.parts == 1 and is_multi(sh, w.parts[1]) then
 				local part = w.parts[1]
 				part.q = p.q or part.q -- inner quoting is significant
@@ -2344,7 +2433,7 @@ multi_elems = function(sh, p) -- returns element list, star?
 			return { expand_word(sh, w, true) }
 		end
 		if pe.op == "badsubst" then -- e.g. ${a[@]:} (empty offset): discards the rest of the line
-			sherr(sh, "curse: " .. (pe.wraw or "${" .. (pe.raw or pe.name or "") .. "}") .. ": bad substitution\n")
+			sherr(sh, "curse: " .. M.bs_text(sh, pe, true) .. ": bad substitution\n")
 			error({ __curse_exit = 1, __curse_lineabort = true })
 		end
 		if pe.op == "indirect" then -- ${!ref} where ref names an array / $@ / subscript
@@ -2390,7 +2479,7 @@ multi_elems = function(sh, p) -- returns element list, star?
 			els = rt.array_slice_values(sh, pe.name, els, off, len, pe.arg2)
 		elseif (pe.op == "?" or pe.op == ":?") and (#els == 0 or (pe.op == ":?" and #els == 1 and els[1] == "")) then
 			-- ${@?} ${a[@]:?msg}: no elements (or, for :?, a lone empty one) is the error
-			local msg = pe.arg and pe.arg ~= "" and expand_word(sh, lazy_word(pe.arg))
+			local msg = pe.arg and pe.arg ~= "" and expand_word(sh, M.lazy_word(pe.arg))
 				or (pe.op == "?" and "parameter not set" or "parameter null or not set")
 			io.stderr:write("curse: " .. rt.pe_label(pe) .. ": " .. msg .. "\n")
 			error({ __curse_exit = sh.opt_c and 127 or 1, __curse_lineabort = sh.opt_i or nil })
@@ -2398,7 +2487,7 @@ multi_elems = function(sh, p) -- returns element list, star?
 			-- ${@=x} / ${a[@]=x}: nothing to assign to — bash aborts the line. An ASSOC
 			-- takes `@`/`*` as a literal key (bash: ${A[@]:=foo} sets A[@])
 			if pe.index and sh:is_assoc(pe.name) then
-				local v = pe.arg and expand_word(sh, lazy_word(pe.arg), true) or ""
+				local v = pe.arg and expand_word(sh, M.lazy_word(pe.arg), true) or ""
 				sh:array_set(pe.name, pe.index, v)
 				return { sh:array_get(pe.name, pe.index) or "" }, star
 			end
@@ -2490,8 +2579,8 @@ multi_elems = function(sh, p) -- returns element list, star?
 			-- replacement (arg2) expands via expand_repl (tilde + patsub_replacement marking).
 			-- (neither expands when the value takes no pattern: rt.pe_nopat_elems)
 			if not rt.pe_nopat_elems(pe.op, els) then
-				local arg = pe.arg and expand_pattern(sh, lazy_word(pe.arg)) or ""
-				local arg2 = pe.arg2 and expand_repl(sh, lazy_word(pe.arg2)) or nil
+				local arg = pe.arg and expand_pattern(sh, M.lazy_word(pe.arg)) or ""
+				local arg2 = pe.arg2 and expand_repl(sh, M.lazy_word(pe.arg2)) or nil
 				local out = {}
 				for i, v in ipairs(els) do
 					out[i] = sh:apply_str_op(pe.op, v, arg, arg2)
@@ -2684,7 +2773,7 @@ expand_fields_full = function(sh, w, pre1) -- pre1: part 1 already expanded (a $
 				-- is quoted text. Never zero fields (bash: "${x:-$@}" with no params is "").
 				fb:add("", false)
 				if useword then
-					for _, sp in ipairs(lazy_word(pe.arg, true, pe.hd).parts) do
+					for _, sp in ipairs(M.lazy_word(pe.arg, true, pe.hd).parts) do
 						if is_multi(sh, sp) then
 							sp.q = true
 							local els, star = multi_elems(sh, sp)
@@ -2699,7 +2788,7 @@ expand_fields_full = function(sh, w, pre1) -- pre1: part 1 already expanded (a $
 			elseif useword and pe.arg then
 				-- expand the default's parts: a QUOTED part is one atomic (sub)field, an
 				-- unquoted part word-splits — so 'a b' stays one field but a b splits.
-				for k, sp in ipairs(lazy_word(pe.arg).parts) do
+				for k, sp in ipairs(M.lazy_word(pe.arg).parts) do
 					if is_multi(sh, sp) then -- $@/$*: as at the top level of a word
 						local els, star = multi_elems(sh, sp)
 						fb:multi(els, sp.q, star, nil, not sp.dqat)
@@ -5532,8 +5621,11 @@ exec_stmt = function(sh, st, hook)
 			sh.cur_line = ln
 			sh.cur_cline = st.cline or st.line -- (where its $(…) bodies number from)
 		elseif sh.trap_base then -- a trap's own commands: its handler's line k is the trapped
-			sh.cur_line = sh.trap_base + ln - 1 -- line + k-1 (parse_and_execute counts on from
-		end -- it — not in a function the trap calls, whose lines count as usual — bash)
+			-- line + k-1 (parse_and_execute counts on from it — not in a function the trap
+			-- calls, whose lines count as usual — bash); the interpreter's parse numbered them
+			-- so already (trap_abs), a compiled handler's delegated commands didn't
+			sh.cur_line = sh.trap_abs and ln or sh.trap_base + ln - 1
+		end
 	end
 	if t == "assign" then
 		local pnf = sh.procsub_files and #sh.procsub_files or 0
@@ -6306,9 +6398,12 @@ run_trap = function(sh, code, tag)
 	local seen = trap_seen[code]
 	local mod
 	M.v_echo(sh, code, nil, {}) -- (set -v: the handler's text as it's read)
-	if seen then
+	-- (a function the handler defines numbers its lines from the handler's first line, as
+	-- the text is parsed — the interpreter's parse, below; the compiled fragment is keyed by
+	-- the text alone)
+	if seen and not (code:find("%(%s*%)") or code:find("%f[%w_]function%f[^%w_]")) then
 		mod = require("tier").try_fragment(code, false, sh, true)
-	else
+	elseif not seen then
 		trap_seen_n = trap_seen_n + 1
 		if trap_seen_n > 256 then
 			trap_seen, trap_seen_n = {}, 1
@@ -6318,7 +6413,10 @@ run_trap = function(sh, code, tag)
 	if sh.jobs_waited or sh.jobs_pending then -- (the handler is parse_and_execute'd: reading it notifies and cleans up — rt.jobs_line)
 		rt.jobs_line(sh)
 	end
-	local stmts, k = mod and {} or P.parse(code, sh).stmts, 0 -- (sh: aliases expand, bash)
+	-- (sh: aliases expand, bash; its lines are numbered from the trapped one — trap_abs)
+	local stmts, k = mod and {} or P.parse(code, sh, nil, nil, nil, nil, sh.trap_base).stmts, 0
+	local sabs = sh.trap_abs
+	sh.trap_abs = not mod
 	local function body()
 		if mod then -- (a line abort is contained by run_compiled: the rest of that line is skipped)
 			return run_trap_mod(mod, sh)
@@ -6364,6 +6462,7 @@ run_trap = function(sh, code, tag)
 		psb.arr = psa
 	end
 	sh.trap_calldepth, sh.trap_saved, sh.trap_base = saved_tcd, saved_ts, saved_tb
+	sh.trap_abs = sabs
 	sh.cur_line = savedline
 	sh.perr_label, sh.trap_lbase = spl, slb
 	if not ok then

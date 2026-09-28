@@ -386,3 +386,48 @@ tiered (harness) and the static build/curse. None of these is in F1-F15.
 - F52 FIXED — lines read while -v was off are behind the reader: a `set -v` in sourced/eval'd
   text doesn't echo its own line; `set -v` in text the program hands to eval/source/a trap
   puts a compiled program in line mode. test/cases/2728-set-v-own-line.sh
+- F31 FIXED — `${!a[@]x}`: after an indirect key list's subscript only an operator may
+  follow; anything else is a bad substitution. test/cases/2730-indirect-keys-junk.sh
+- F32 FIXED — a "…" whose ${…} has a `[` that never closes runs off the word (bash's
+  extract_dollar_brace_string/skipsubscript, ported: parser dq_brace_open): "bad
+  substitution: no closing `}' in WORD"; an unquoted `${!a[@}` is a `${!PREFIX@}`.
+  test/cases/2731-dq-subscript-no-closing.sh
+- F33 FIXED — `${}` is a bad substitution (was the empty string). test/cases/2732-empty-braces.sh
+- F34 FIXED — `${!?}` is indirection through $? (VALID_INDIR_PARAM), an operator after it
+  applies; other text after the `?` is a bad substitution. test/cases/2733-indirect-status.sh
+- F35 FIXED — a subscript on a special/positional parameter is a bad substitution.
+  test/cases/2734-special-param-subscript.sh
+- F36 FIXED — every $name/$N of an arithmetic text is vetted before evaluating (untaken
+  ternary arms / && || right sides too): non-numeric → bash's textual path.
+  test/cases/2735-arith-untaken-branch-expansion.sh
+- F37 FIXED — a subscript whose expansions leave nothing reads `NAME[]` in arithmetic (both
+  tiers: rt.EMPTYSUB). test/cases/2736-arith-empty-subscript.sh
+- F38 FIXED — a `$` inside "…" in arithmetic stays a character (textual path); the text shown
+  in errors has the dropped `$`s dropped. test/cases/2737-arith-quoted-dollar.sh
+- F39 FIXED — a name right after the expression: readtok's peek past a run of names reports
+  a bad character as "invalid arithmetic operator". test/cases/2738-arith-name-peek-error.sh
+- F40 FIXED — ERR/DEBUG/RETURN handler text numbered from the trapped line (interpreted:
+  parsed with that line1, trap_abs; compiled: trap-relative pc lines, rt.pc_line), and a
+  function it defines keeps those lines. test/cases/2739-trap-handler-lines.sh
+- F41 FIXED — a syntax error at a token from an alias's text shows the alias text (its last
+  character overwritten by the ungot delimiter). test/cases/2740-alias-token-syntax-error-line.sh
+- F42 FIXED — a quote inside ${…}/$(…)/`…` doesn't make a here-document delimiter quoted;
+  also a command whose 2nd token is a redirection runs at the operator's line.
+  test/cases/2741-heredoc-delim-expansion-quotes.sh
+- F43 FIXED — (with F36) the substituted text is parsed once: one "bad array subscript",
+  then the syntax error. test/cases/2742-arith-subst-before-eval.sh
+- F44 FIXED — a listing builtin (export, declare, set, readonly, compgen -v) doesn't list its
+  own prefix bindings (rt.tenv_hide). test/cases/2743-prefix-assign-listing.sh
+- F45 FIXED — a `\<newline>` ending the input counts as a line read (EOF syntax error, body
+  warnings, joined body lines); a script's last `\` quotes nothing (body loses it and its
+  newline); a string's (eval/source) stores the EOF as a 0xff byte — deterministic, copied.
+  test/cases/2744-trailing-backslash-newline-eof.sh
+- F46 FIXED — a bad substitution's text shows \001/\177 CTLESC-quoted.
+  test/cases/2745-badsubst-ctlesc-bytes.sh
+- F47 FIXED — a here-document opened in <(…)/>(…) reads its body from the following lines,
+  as in $(…); a second here-document's warning names the line its reading began.
+  test/cases/2746-procsub-heredoc-body.sh
+- F49 FIXED — after an assignment/redirection prefix nothing is a reserved word.
+  test/cases/2747-prefix-then-reserved-word.sh
+- F50 FIXED — a syntax error where the line's list could end gathers the line's
+  here-document bodies first (bash's simple_list reduction). test/cases/2748-syntax-error-pending-heredoc.sh

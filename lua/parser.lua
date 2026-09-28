@@ -70,8 +70,31 @@ local function arith(src, nodefer)
 	-- pair below), `$'3'` -> `'3'` (single quotes kept -> the tokenizer errors, as
 	-- bash does). Only when the expression has no ${…}/$(…)/`…` to expand as a whole.
 	-- (not in "let" mode — already-expanded text or a variable's value: `$"3"` stays bad)
-	if nodefer ~= "let" and not (src:find("%${") or src:find("%$%(") or src:find("`")) then
-		src = src:gsub("%$([\"'])", "%1")
+	local dtxt -- (the text with those `$` dropped: what bash's errors show)
+	if nodefer ~= "let" and not (src:find("%${") or src:find("%$%(") or src:find("`")) and src:find("$", 1, true) then
+		-- (a `$` INSIDE "…" is just a character: `"$"@` is the text `$@`)
+		local out, k, n, indq, qdollar = {}, 1, #src, false, false
+		while k <= n do
+			local c = src:sub(k, k)
+			if c == "\\" then
+				out[#out + 1] = src:sub(k, k + 1)
+				k = k + 2
+			else
+				if c == '"' then
+					indq = not indq
+				end
+				qdollar = qdollar or c == "$" and indq
+				if not (c == "$" and not indq and src:sub(k + 1, k + 1):match("[\"']")) then
+					out[#out + 1] = c
+				end
+				k = k + 1
+			end
+		end
+		if qdollar and not nodefer then -- (its text is bash's: expanded — the quotes removed,
+			return { k = "xpand", raw = src } -- that `$` left as is — then parsed, where it's bad)
+		end
+		local s2 = table.concat(out)
+		dtxt, src = s2 ~= src and s2 or nil, s2
 	end
 	-- `${…}` no longer forces a whole-expression defer — primary() consumes it as an
 	-- opaque operand leaf. A GLUED `${…}` (part of a compound name, `x${y}`) is still
@@ -101,7 +124,7 @@ local function arith(src, nodefer)
 	-- tokenizer reports the error bash does. (Single quotes are never stripped.)
 	-- (`let`'s arguments were already expanded and quote-removed: bash strips nothing
 	-- more — `let 'x="1"+2'` is an error and an assoc_expand_once key keeps its quotes)
-	local qtxt -- (the quote-stripped text: what bash's errors show, `1 + '2' `)
+	local qtxt = dtxt -- (the quote-stripped text: what bash's errors show, `1 + '2' `)
 	if nodefer == "let" then
 		nodefer = "strict"
 	elseif src:find('"', 1, true) then
@@ -574,6 +597,32 @@ local function arith(src, nodefer)
 			local pc = src:sub(1, i - 1):match("(%S)%s*$")
 			aerr(pc == ")" and "syntax error: operand expected" or "syntax error: invalid arithmetic operator",
 				spine(e))
+		elseif c:match("[%a_]") then
+			-- a name right after the expression: bash's readtok, reading a name, reads the
+			-- token after it too (the `=` peek) — past a run of names, a character that
+			-- starts no token is ITS error (`x⏎y@`: invalid arithmetic operator at `@`)
+			local j = i
+			while true do
+				local _, ne = src:find("^[%a_][%w_]*", j)
+				if not ne then
+					break
+				end
+				j = ne + 1
+				if src:sub(j, j) == "[" then
+					local cl = M.subscript_close(src, j)
+					if not cl then
+						break
+					end
+					j = cl + 1
+				end
+				j = src:match("^[ \t\n]*()", j)
+			end
+			local c2 = src:sub(j, j)
+			if c2 ~= "" and not c2:match(ARITHOP) and not c2:match("[%w_]") then
+				i = j
+				skip()
+				aerr("syntax error: invalid arithmetic operator", spine(e))
+			end
 		end
 		aerr("syntax error in expression", e)
 	end
@@ -784,8 +833,8 @@ end
 
 local parse_paramexp
 parse_paramexp = function(inner)
-	if inner == "" then
-		return { lit = "" }
+	if inner == "" then -- ${}: no parameter (bash: a bad substitution)
+		return { pexp = { op = "badsubst", raw = "" } }
 	end
 	-- ${ …}/${\t…}/${|…}/${(…}: whitespace, `|`, or `(` right after `{` is a bad
 	-- substitution in bash 5.2 (ksh93 funsub `${ cmd;}`/`${|cmd;}` and zsh flag
@@ -824,7 +873,7 @@ parse_paramexp = function(inner)
 		-- (`$ ? -` take the other operators too; `${!#}`/`${!@}` keep `!` as the indirect
 		-- prefix; bash rejects case modification on `?`/`-` but not on `$`)
 		if
-			(c1 == "?" or c1 == "$" or c1 == "-" or c1 == "!") and c2 ~= "" and c2:match("[:%-+=?]")
+			(c1 == "?" or c1 == "$" or c1 == "-" or c1 == "!" and c2 ~= "?") and c2 ~= "" and c2:match("[:%-+=?]")
 			or (c1 == "?" or c1 == "$" or c1 == "-") and c2 ~= "" and c2:match("[#%%/@]")
 			or c1 == "$" and c2 ~= "" and c2:match("[%^,]")
 		then
@@ -846,8 +895,46 @@ parse_paramexp = function(inner)
 		if inner:match("^#[:%-=?+#%%/@]") then -- ${!##} ${!#:-z}: an operator on the last
 			return { pexp = { name = "#", op = "indirect", iop = inner:sub(2) } } -- positional
 		end
+		-- ${!?}: indirect through $? (bash's VALID_INDIR_PARAM), an operator after it applied
+		-- to that; any other text after the `?` makes no name (`${!?x]}`: bad substitution)
+		-- (posix mode has no `?` there: `${!?word}` is $! under `?` — posixalt, at run time)
+		if inner:sub(1, 1) == "?" then
+			local alt = { name = "!", op = "?", arg = inner:sub(2) }
+			if inner == "?" then
+				return { pexp = { name = "?", op = "indirect", posixalt = alt } }
+			elseif inner:match("^%?[:%-=?+#%%/@]") then
+				return { pexp = { name = "?", op = "indirect", iop = inner:sub(2), posixalt = alt } }
+			end
+			return { pexp = { op = "badsubst", raw = "!" .. inner, posixalt = alt } }
+		end
 		if inner:sub(1, 1) == "!" or inner:sub(1, 1) == "#" then
 			return { pexp = { op = "badsubst", raw = "!" .. inner } }
+		end
+		-- ${!a[@} ${!a[0]@} ${!a[0]*}: bash reads the name up to an operator character (a
+		-- subscript that closes skipped whole); one that ends at the closing `@}` / `*}` is a
+		-- ${!PREFIX@} whose prefix is that text, `[` and all — matching no variable
+		local last = inner:sub(-1)
+		if (last == "@" or last == "*") and inner:find("[", 1, true) and inner:match("^[%a_]") then
+			local x, k, ok = inner:sub(1, -2), 1, true
+			while k <= #x do
+				local c = x:sub(k, k)
+				if c == "[" then
+					local cl = subscript_close(inner, k)
+					if not cl and last == "*" then
+						ok = false
+						break
+					end
+					k = cl and cl <= #x and cl + 1 or k + 1
+				elseif ("#%^,~:-=?+/@"):find(c, 1, true) then
+					ok = false
+					break
+				else
+					k = k + 1
+				end
+			end
+			if ok then
+				return { pexp = { name = x, op = "prefix", star = last == "*" } }
+			end
 		end
 	elseif inner:match("^#[:%-=?+%%/^,@]") and (#inner > 2 or inner == "#:") then
 		-- ${#-x} ${#:+y} ${#%0} ${#:}: `$#` with an operator (the one-char `${#-}` / `${#?}`
@@ -896,8 +983,11 @@ parse_paramexp = function(inner)
 		end
 		return { pexp = { op = "badsubst", raw = (lenpfx and "#" or indices and "!" or "") .. inner } }
 	end
-	-- optional [subscript]
+	-- optional [subscript] — on a NAME only: `${*[0]}` `${1[0]}` are bad substitutions
 	local index = nil
+	if rest:sub(1, 1) == "[" and not name:match("^[%a_]") and not special_op and not sharp_op then
+		return { pexp = { op = "badsubst", raw = (lenpfx and "#" or indices and "!" or "") .. inner } }
+	end
 	if rest:sub(1, 1) == "[" then
 		-- (`${a[a[0]]}` takes `a[0]` as the subscript, not `a[0`; `${m[\]]}`)
 		local close = subscript_close(rest, 1)
@@ -915,6 +1005,9 @@ parse_paramexp = function(inner)
 		-- ${!a[@]OP}: a suffix operator flips this from "keys" to INDIRECT — bash uses
 		-- ${a[@]} (space-joined) as the reference name, derefs it, then applies OP.
 		if index == "@" or index == "*" then
+			if rest ~= "" and not rest:match("^[:%-=?+#%%/^,~@]") then -- ${!a[@]x}: no operator
+				return { pexp = { op = "badsubst", raw = "!" .. inner } }
+			end
 			if rest ~= "" then
 				return { pexp = { name = name, op = "indirect", index = index, iop = rest } }
 			end
@@ -926,7 +1019,7 @@ parse_paramexp = function(inner)
 			end
 			return { pexp = { name = name, op = "prefix", star = (rest == "*") } }
 		end
-		if rest ~= "" and not rest:match("^[:%-=?+#%%/^,@]") then -- ${!_Q* } ${!a x}
+		if rest ~= "" and not rest:match("^[:%-=?+#%%/^,~@]") then -- ${!_Q* } ${!a x}
 			return { pexp = { op = "badsubst", raw = "!" .. inner } }
 		end
 		-- ${!ref OP arg}: capture the trailing operator to apply to the resolved target
@@ -1318,6 +1411,167 @@ local function cmdsub_end_lenient(s, j)
 		j = j + 1
 	end
 	return n + 2
+end
+-- bash's scan of a "…" when it EXPANDS the word (string_extract_double_quoted): each ${…}
+-- in it is skipped by extract_dollar_brace_string, whose `[` in a parameter name skips a
+-- subscript (skipsubscript) — one that never closes runs off the end of the WORD, and
+-- expanding it fails with "bad substitution: no closing `}' in WORD" (`"${!a[@}"`,
+-- `"${a[x}"`). A port of those scanners (1-based; "past the end" is n + 1): dq_brace_open
+-- tells, for the "…" whose text starts at s[i], whether one of its ${…} runs off.
+local skip_dq_x, dolbrace_x
+local function skip_sq_x(s, i)
+	local e = s:find("'", i, true)
+	return e and e + 1 or #s + 1
+end
+local function cs_close_x(s, i) -- the `)` of the $( at s[i-2] (n + 1 when there's none)
+	return math.min(cmdsub_end_lenient(s, i) - 1, #s + 1)
+end
+local function subscript_x(s, i) -- skip_matched_pair(s, i, '[', ']', 0): the `]`, or n + 1
+	local n, d, backq = #s, 1, false
+	i = i + 1
+	while i <= n do
+		local c = s:byte(i)
+		if c == 92 then
+			i = i + 2
+		elseif backq then
+			backq = c ~= 96
+			i = i + 1
+		elseif c == 96 then
+			backq, i = true, i + 1
+		elseif c == 91 then
+			d, i = d + 1, i + 1
+		elseif c == 93 then
+			d = d - 1
+			if d == 0 then
+				return i
+			end
+			i = i + 1
+		elseif c == 39 then
+			i = skip_sq_x(s, i + 1)
+		elseif c == 34 then
+			i = skip_dq_x(s, i + 1)
+		elseif c == 36 and (s:byte(i + 1) == 40 or s:byte(i + 1) == 123) then
+			local si = s:byte(i + 1) == 40 and cs_close_x(s, i + 2) or dolbrace_x(s, i + 2)
+			if si > n then
+				return n + 1
+			end
+			i = si + 1
+		else
+			i = i + 1
+		end
+	end
+	return n + 1
+end
+local PARAM, QUOTE, QUOTE2, OP, WORD = 1, 2, 3, 4, 5
+dolbrace_x = function(s, i) -- extract_dollar_brace_string(Q_DOUBLE_QUOTES, 0): the `}`, or n + 1
+	local n, st, nest, dbs, start = #s, PARAM, 1, { [0] = PARAM }, i
+	while i <= n do
+		local c = s:byte(i)
+		if c == 92 then
+			i = i + 2
+		elseif c == 36 and s:byte(i + 1) == 123 then
+			dbs[nest], nest, i = st, nest + 1, i + 2
+			if st == QUOTE or st == WORD then
+				st = PARAM
+			end
+		elseif c == 125 then
+			nest = nest - 1
+			if nest == 0 then
+				return i
+			end
+			st, i = dbs[nest] or dbs[0], i + 1
+		elseif c == 96 then
+			local e = s:find("`", i + 1, true)
+			if not e then
+				return n + 1
+			end
+			i = e + 1
+		elseif (c == 36 or c == 60 or c == 62) and s:byte(i + 1) == 40 then
+			local si = cs_close_x(s, i + 2)
+			if si > n then
+				return n + 1
+			end
+			i = si + 1
+		elseif c == 34 then
+			i = skip_dq_x(s, i + 1)
+		elseif c == 39 then
+			i = skip_sq_x(s, i + 1)
+		else
+			if c == 91 and st == PARAM then
+				local si = subscript_x(s, i)
+				if si > n then
+					return n + 1
+				end
+				if s:byte(si) == 93 then
+					c, i = 93, si
+				end
+			end
+			i = i + 1
+			local ch = string.char(c)
+			if st == PARAM and (ch == "%" or ch == "#" or ch == "^" or ch == ",") and i - start > 1 then
+				st = QUOTE
+			elseif st == PARAM and ch == "/" and i - start > 1 then
+				st = QUOTE2
+			elseif st == PARAM and ("#%^,~:-=?+/"):find(ch, 1, true) then
+				st = OP
+			elseif st == OP and not ("#%^,~:-=?+/"):find(ch, 1, true) then
+				st = WORD
+			end
+		end
+	end
+	return n + 1
+end
+skip_dq_x = function(s, i) -- skip_double_quoted: past the closing `"`, or n + 1
+	local n, backq = #s, false
+	while i <= n do
+		local c = s:byte(i)
+		if c == 92 then
+			i = i + 2
+		elseif backq then
+			backq = c ~= 96
+			i = i + 1
+		elseif c == 96 then
+			backq, i = true, i + 1
+		elseif c == 36 and (s:byte(i + 1) == 40 or s:byte(i + 1) == 123) then
+			local si = s:byte(i + 1) == 40 and cs_close_x(s, i + 2) or dolbrace_x(s, i + 2)
+			if si > n then
+				return n + 1
+			end
+			i = si + 1
+		elseif c ~= 34 then
+			i = i + 1
+		else
+			return i + 1
+		end
+	end
+	return n + 1
+end
+local function dq_brace_open(s, i)
+	local n, backq = #s, false
+	while i <= n do
+		local c = s:byte(i)
+		if c == 92 then
+			i = i + 2
+		elseif backq then
+			backq = c ~= 96
+			i = i + 1
+		elseif c == 96 then
+			backq, i = true, i + 1
+		elseif c == 36 and s:byte(i + 1) == 40 then
+			i = cs_close_x(s, i + 2) + 1
+		elseif c == 36 and s:byte(i + 1) == 123 then
+			local si = dolbrace_x(s, i + 2)
+			if si > n then
+				return true
+			end
+			i = si + 1
+		elseif c == 34 then
+			return false
+		else
+			i = i + 1
+		end
+	end
+	return false
 end
 -- The `]` closing the `[` at s[i], as bash's parse_matched_pair('[', ']') reads it — the
 -- $[ … ] legacy arithmetic (P_ARITH), or, `arraysub`, the subscript of a NAME[ … ] word where
@@ -1740,6 +1994,9 @@ local function parse_word(w)
 			local e = quote_end(w, i) - 1
 			parts[#parts + 1] = { lit = w:sub(i + 1, e - 1), q = true }
 			i = e + 1
+		elseif c == '"' and w:find("${", i, true) and w:find("[", i, true) and dq_brace_open(w, i + 1) then
+			parts[#parts + 1] = { nulcut = w, q = true } -- (expanding the word fails here: dq_brace_open)
+			break
 		elseif c == '"' then -- double quotes: expand inside (an unterminated $( … ) body in it
 			local j = dq_end(w, i, true) - 1 -- is paren-counted); j: the closing quote
 			local before = #parts
@@ -3074,6 +3331,24 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs, xg, bq
 	-- on the stack is AL_BEINGEXPANDED: not expanded again until its text is consumed.
 	local astk, astk_n = {}, 0
 	local alias_seen = {} -- names on astk (recursion guard)
+	-- A syntax error at a token read from an alias's text shows bash's shell_input_line —
+	-- that text (the pushed string), not the source line; when the token ends the text, the
+	-- delimiter read_token_word ungets (the END_ALIAS space) overwrites its last character.
+	local function alias_line(pos, tok)
+		for k = astk_n, 1, -1 do
+			local e = astk[k]
+			if e[4] and pos >= e[4] and pos <= e[2] then -- (the parser at/after the token)
+				local v = e[5]
+				if v:sub(-#tok) == tok then -- (the token ends the text: a word's delimiter is
+					if v:match("[ \t\n|&;()<>]$") then -- ungot over it; after an operator the
+						return nil -- text is done — popped, the source line is the input again)
+					end
+					v = v:sub(1, -2) .. " "
+				end
+				return v
+			end
+		end
+	end
 	local alias_next = false -- the next word is eligible (PST_ALEXPNEXT)
 	-- positions of newlines spliced in from alias values: bash reads those from the pushed
 	-- string, so they don't advance line_number (nil while there are none)
@@ -3332,7 +3607,7 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs, xg, bq
 				end
 			end
 			astk_n = astk_n + 1
-			astk[astk_n] = { cand, rs + #ins, val:match("[ \t]$") ~= nil }
+			astk[astk_n] = { cand, rs + #ins, val:match("[ \t]$") ~= nil, rs, val }
 			alias_seen[cand] = true
 			expanded = true
 			-- recurse: the value's first word (now at i) is itself command-position
@@ -3372,6 +3647,7 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs, xg, bq
 		for _, hd in ipairs(heredocs_pending) do
 			local blines = {}
 			local found = false
+			local hline = rline + nread -- (the line its reading began at: after the bodies before it)
 			while i <= n do
 				local le = src:find("\n", i, true) or (n + 1)
 				local lstr = src:sub(i, le - 1)
@@ -3384,7 +3660,8 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs, xg, bq
 				-- unquoted delimiter: `\<newline>` joins lines before the delimiter check (bash)
 				-- (bash reads a body byte by byte: a multibyte char's trail `\` just before the
 				-- newline joins too — though it escapes nothing, so `\xa3\x5c\\` joins as well)
-				while hd.expand and le <= n and (#lstr:match("\\*$") % 2 == 1 or (hd_bsl and lstr:sub(-1) == hd_bsl)) do
+				while hd.expand and le <= n and not (le == n and src == M.synth_eol)
+					and (#lstr:match("\\*$") % 2 == 1 or (hd_bsl and lstr:sub(-1) == hd_bsl)) do
 					le = src:find("\n", i, true) or (n + 1)
 					local nxt = src:sub(i, le - 1)
 					if hd.strip then
@@ -3393,6 +3670,17 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs, xg, bq
 					lstr = lstr:sub(1, -2) .. nxt
 					i = le + 1
 					line = line + 1
+					nread = nread + 1 -- (a joined line is read too: the warning's line counts it)
+				end
+				-- (the input ends in a `\` quoting nothing: bash drops it, and the body's last
+				-- line then has no newline)
+				if hd.expand and #lstr:match("\\*$") % 2 == 1 and (le > n or le == n and src == M.synth_eol) then
+					if le == n then -- (a script file's last line: shell_getc's added newline)
+						lstr, hd.nonl = lstr:sub(1, -2), true
+						i = n + 1
+					else -- (a string's end — eval, source: the EOF shell_getc returned after the
+						lstr = lstr .. "\255" -- `\` is stored as a byte, 0xff, in the line)
+					end
 				end
 				if lstr == hd.delim then
 					found = true
@@ -3409,9 +3697,10 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs, xg, bq
 			end
 			if not found then
 				warns[#warns + 1] = { t = "warn", line = rline + nread,
-					msg = ("warning: here-document at line %d delimited by end-of-file (wanted `%s')"):format(rline, hd.delim) }
+					msg = ("warning: here-document at line %d delimited by end-of-file (wanted `%s')"):format(hline, hd.delim) }
 			end
-			hd.body = #blines > 0 and (table.concat(blines, "\n") .. "\n") or ""
+			hd.body = #blines > 0 and (table.concat(blines, "\n") .. (hd.nonl and not found and "" or "\n")) or ""
+			hd.nonl = nil
 			hd.aenv = ALIAS_ENV -- the compiler re-parses an expanding body later (parse_heredoc)
 		end
 		heredocs_pending = {}
@@ -3525,6 +3814,54 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs, xg, bq
 		if term ~= ")" then
 			error("syntax error: unexpected end of file")
 		end
+	end
+	-- a here-document opened inside a $( … ) / <( … ) / >( … ) that ends on this line:
+	-- its body is on the following lines (bash) — move those lines (through each
+	-- delimiter) inside the substitution's text; returns its new end
+	local function hdp_splice(je, hdp) -- (-> the new end, and the lines it moved in)
+		local dl = 0
+		local nl = src:find("\n", je, true)
+		if nl then
+			local k = nl + 1
+			for _, hd in ipairs(hdp) do
+				while k <= n do
+					local le = src:find("\n", k, true) or (n + 1)
+					local l = src:sub(k, le - 1)
+					if hd.strip then
+						l = l:gsub("^\t+", "")
+					end
+					k = le + 1
+					if l == hd.delim then
+						break
+					end
+				end
+			end
+			local body = src:sub(nl + 1, k - 1)
+			if body:sub(-1) ~= "\n" then
+				body = body .. "\n"
+			end
+			src = src:sub(1, je - 2) .. "\n" .. body .. src:sub(je - 1, nl) .. src:sub(k)
+			n = #src
+			je = je + 1 + #body
+			dl = -1 -- (that inserted newline isn't a source line)
+			warns[#warns + 1] = { t = "warn", line = line,
+				msg = ("warning: command substitution: %d unterminated here-document%s"):format(#hdp, #hdp == 1 and "" or "s") }
+		end
+		return je, dl
+	end
+	-- A syntax error on a line that opened here-documents: bash's error recovery reads on
+	-- through the newline, which gathers their bodies first — their EOF warnings come before
+	-- the error, reported at the last line read; the line shown stays the command's (the
+	-- reader's position is kept). LG: the group being returned; WHEN: the error is one.
+	local function perr_gather(when, lg)
+		if when and #heredocs_pending > 0 then
+			local ei = i
+			if pcall(collect_heredocs) then
+				lg.perr.line = line - 1
+			end
+			i = ei
+		end
+		return lg
 	end
 	-- scan_cmdsub's onwarn for a word starting at `start` on line `line0` (built only where a
 	-- $( ) needs it: a closure per word would keep the word scan out of the JIT)
@@ -3764,42 +4101,23 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs, xg, bq
 						comsub_check(cbody, je)
 					end
 					if hdp then
-						-- `$(cat <<EOF)` then the body on the following lines (bash): move those
-						-- lines (through each delimiter) inside the $( … ) text
-						local nl = src:find("\n", je, true)
-						if nl then
-							local k = nl + 1
-							for _, hd in ipairs(hdp) do
-								while k <= n do
-									local le = src:find("\n", k, true) or (n + 1)
-									local l = src:sub(k, le - 1)
-									if hd.strip then
-										l = l:gsub("^\t+", "")
-									end
-									k = le + 1
-									if l == hd.delim then
-										break
-									end
-								end
-							end
-							local body = src:sub(nl + 1, k - 1)
-							if body:sub(-1) ~= "\n" then
-								body = body .. "\n"
-							end
-							src = src:sub(1, je - 2) .. "\n" .. body .. src:sub(je - 1, nl) .. src:sub(k)
-							n = #src
-							je = je + 1 + #body
-							lfix = lfix - 1 -- (that inserted newline isn't a source line)
-							warns[#warns + 1] = { t = "warn", line = line,
-								msg = ("warning: command substitution: %d unterminated here-document%s"):format(#hdp, #hdp == 1 and "" or "s") }
-						end
+						local dl
+						je, dl = hdp_splice(je, hdp)
+						lfix = lfix + dl
 					end
 					i = je
 				end
 			elseif (c == "<" or c == ">") and src:sub(i + 1, i + 1) == "(" then
 				-- <(cmd) / >(cmd) process substitution: part of the word — scanned like $(…)
-				-- (its body has its own quoting / case syntax)
-				i = scan_cmdsub(src, i + 2)
+				-- (its body has its own quoting / case syntax; a here-document opened in it
+				-- reads its body from the following lines, as a $(…)'s does)
+				local je, hdp = scan_cmdsub(src, i + 2, hdwarn_for(start, line0))
+				if hdp then
+					local dl
+					je, dl = hdp_splice(je, hdp)
+					lfix = lfix + dl
+				end
+				i = je
 			elseif (c == "?" or c == "*" or c == "+" or c == "@" or c == "!") and src:sub(i + 1, i + 1) == "("
 				and (stop_cmp or not xg_off()) then
 				if not (sh or stop_cmp or extglob_on or xg == false) then
@@ -4063,12 +4381,30 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs, xg, bq
 				end
 				-- ANY quoting anywhere in the delimiter word makes the body literal (bash);
 				-- the delimiter itself is the word with all quotes removed.
-				local quoted = draw:find("['\"\\]") ~= nil
+				-- (a quote inside a ${…} / $(…) / $[…] / `…` is that construct's: it doesn't set
+				-- the word's W_QUOTED — `<<${x"y"}` is unquoted, the delimiter kept as written)
+				local quoted = false
+				if draw:find("['\"\\]") then
+					local k, dn = 1, #draw
+					while k <= dn do
+						local b = draw:byte(k)
+						if b == 39 or b == 34 or b == 92 then
+							quoted = true
+							break
+						elseif b == 36 and draw:match("^[{(%[]", k + 1) or b == 96 then
+							local ok, e = pcall(expansion_end, draw, k, false, true)
+							k = ok and e or dn + 1
+						else
+							k = k + 1
+						end
+					end
+				end
+				local dword = quoted and dequote_word(draw) or draw
 				local r = {
 					op = "heredoc",
 					fd = fd and tonumber(fd) or 0,
 					-- (`<<-`: the delimiter's own leading tabs go too, like each line's)
-					delim = strip and (dequote_word(draw):gsub("^\t+", "")) or dequote_word(draw),
+					delim = strip and (dword:gsub("^\t+", "")) or dword,
 					rawdelim = draw, -- as written (`declare -f` prints it so)
 					expand = not quoted,
 					strip = strip,
@@ -5174,8 +5510,11 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs, xg, bq
 		do
 			local MISPLACED =
 				{ ["then"] = 1, ["else"] = 1, ["elif"] = 1, ["fi"] = 1, ["do"] = 1, ["done"] = 1, ["esac"] = 1, ["in"] = 1 }
-			local pwm = peekword()
-			if MISPLACED[pwm] or (src:sub(i, i) == "}" and (i + 1 > n or src:sub(i + 1, i + 1):match("[ \t\n;)]"))) then
+			-- (after an assignment or redirection prefix nothing is a reserved word: `>f }`
+			-- runs a command named `}` — bash)
+			local noprefix = #assigns + #redirs == 0
+			local pwm = noprefix and peekword()
+			if noprefix and (MISPLACED[pwm] or (src:sub(i, i) == "}" and (i + 1 > n or src:sub(i + 1, i + 1):match("[ \t\n;)]")))) then
 				error("syntax error near `" .. (pwm ~= "" and pwm or "}") .. "'")
 			end
 		end
@@ -5187,8 +5526,14 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs, xg, bq
 				cline = line
 			end
 			local c = src:sub(i, i)
+			local rl = line
 			local r = parse_redir() -- also catches &> before the & break below
 			if r then
+				-- (the lookahead after a lone WORD is the redirection's OPERATOR: the line
+				-- it's on, however many lines its word runs on — `cat <<${a⏎b}`)
+				if not cline and #words + #assigns + #redirs == 1 then
+					cline = rl
+				end
 				redirs[#redirs + 1] = r
 			elseif c == "(" and (#words > 0 or #assigns > 0 or #redirs > 0) then
 				-- a bare single `(` after a command word isn't a subshell — `ls foo=(1 2)`,
@@ -5604,7 +5949,7 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs, xg, bq
 		local bs = bare_sep_tok() -- a leading control op (`;`, `&`, `||`, …) is an error
 		if bs then
 			done = true
-			return { stmts = {}, perr = { t = "parse_error", line = line, msg = "syntax error near `" .. bs .. "'" } }
+			return perr_gather(true, { stmts = {}, perr = { t = "parse_error", line = line, msg = "syntax error near `" .. bs .. "'" } })
 		end
 		local stmts = {}
 		local gstart, gline = i, line -- (where this logical line's text begins: its compiled-group key)
@@ -5624,7 +5969,15 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs, xg, bq
 				if not recover then
 					done = true
 				end
-				return {
+				local atext = type(st) == "string" and astk_n > 0 and (st:match("near unexpected token `(.*)'$")
+					or st:match("syntax error near `(.*)'$"))
+				atext = atext and alias_line(i, atext)
+				-- (…only when that token is where the line's list could end — the first of a
+				-- command after complete ones: bash's reduction to simple_list gathers them;
+				-- one inside an unfinished command — `cat <<E && ;` — reports first)
+				local etok = not recover and type(st) == "string" and st:match("near `(.*)'$")
+				local s0 = etok and src:match("^[ \t]*()", start)
+				return perr_gather(etok and src:sub(s0, s0 + #etok - 1) == etok, {
 					-- (bash's DISCARD: a recoverable error drops the whole line — what ran
 					-- before it on the line too, as bash parses a line before running it)
 					stmts = recover and {} or stmts,
@@ -5644,7 +5997,7 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs, xg, bq
 						pre = type(st) == "table" and st.__curse_perr and st.pre or nil, -- (messages before it)
 						preline = type(st) == "table" and st.__curse_perr and st.preline or nil, -- (their line)
 						exact = type(st) == "table" and st.__curse_perr and st.exact or nil, -- (msg verbatim)
-						text = type(st) == "table" and st.__curse_perr and (st.text or st.ltext) or nil, -- (ltext: the line shown, plainly)
+						text = type(st) == "table" and st.__curse_perr and (st.text or st.ltext) or atext or nil, -- (ltext: the line shown, plainly)
 						showtext = type(st) == "table" and st.__curse_perr and st.text and true or nil,
 						recoverable = recover or nil,
 						discard = type(st) == "table" and st.__curse_perr and st.discard
@@ -5658,17 +6011,19 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs, xg, bq
 						exactmsg = type(st) == "table" and st.__curse_perr and st.exactmsg or nil, -- (its own msgid)
 						nomsg = type(st) == "table" and st.__curse_perr and st.nomsg or nil, -- (its `pre` says it all)
 					},
-				}
+				})
 			end
 			-- No progress: a stray metacharacter/keyword in command position (`)`, `}`,
 			-- `done`, `fi`, …). Report a syntax error (and guard against spinning).
 			if i <= start then
 				local tok = peekword() or src:sub(i, i)
 				done = true -- stray keyword/metachar in command position: stop (no-progress guard)
-				return {
+				ws()
+				return perr_gather(true, {
 					stmts = stmts,
-					perr = { t = "parse_error", line = line, msg = "syntax error near `" .. tok .. "'" },
-				}
+					perr = { t = "parse_error", line = line, msg = "syntax error near `" .. tok .. "'",
+						text = alias_line(i, tok) },
+				})
 			end
 			if st.t == "funcdef" or st.redirs then
 				st.top = true -- (not nested in a compound: its errors report its END line)
@@ -5693,10 +6048,10 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs, xg, bq
 					local bsx = bare_sep_tok() or (c == ")" and ")") or nil
 					if bsx then
 						done = true
-						return {
+						return perr_gather(true, {
 							stmts = stmts,
 							perr = { t = "parse_error", line = line, msg = "syntax error near `" .. bsx .. "'" },
-						}
+						})
 					end
 					break
 				end
@@ -5714,10 +6069,10 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs, xg, bq
 			local bs2 = bare_sep_tok() -- `;;`, `&&`, `||`, bare `;`/`&` with no command before them
 			if bs2 then
 				done = true
-				return {
+				return perr_gather(true, {
 					stmts = stmts,
 					perr = { t = "parse_error", line = line, msg = "syntax error near `" .. bs2 .. "'" },
-				}
+				})
 			end
 		end
 		local eline = line -- (the command's last line: its terminating newline's)
@@ -5757,6 +6112,7 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs, xg, bq
 			if m:find("unexpected end of file", 1, true) or (m:find("matching `)'", 1, true) and comsub_eof) then
 				lg.perr.line = firstline - 1 + select(2, src:gsub("\n", "")) + (src:sub(-1) == "\n" and 1 or 2)
 					+ (((src:match("(\\*)$") or ""):len() % 2 == 1) and 1 or 0) -- (a trailing `\` continues)
+					+ (((src:match("(\\*)\n$") or ""):len() % 2 == 1) and 1 or 0) -- (…as does a last `\<newline>`)
 			end
 		end
 		-- (the line is shown for an unexpected token even when that token ended the input)

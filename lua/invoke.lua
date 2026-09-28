@@ -380,6 +380,9 @@ local function open_script(sh, inv, path)
 	-- (shell_getc ends the last line with a newline: a final `\` is a line continuation)
 	if s ~= "" and s:byte(-1) ~= 10 then
 		s = s .. "\n"
+		-- (…yet a here-document body read to the end ends there: a last `\` quotes nothing
+		-- and its line has no newline — the parser treats this text's last one as added)
+		require("parser").synth_eol = s
 	end
 	return s
 end
