@@ -858,7 +858,9 @@ end
 -- A $(…) body, re-printed as bash's print_comsub does (`a; b`, newlines kept); nil if it
 -- doesn't parse or holds something unprintable (the caller keeps the text as is).
 deparse_list = function(src)
-	local ok, ast = pcall(P.parse, src, nil, nil, nil, nil, nil, nil, nil, nil, true) -- (cs: a $(…) body)
+	-- (noalias: parse_comsub only checks the body's syntax — no alias it defines, or turns
+	-- expand_aliases on for, is applied to the printed tree; cs: a $(…) body)
+	local ok, ast = pcall(P.parse, src, nil, nil, true, nil, nil, nil, nil, nil, true)
 	if not ok then
 		P.trap_flow(ast)
 	end
