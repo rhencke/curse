@@ -1777,9 +1777,9 @@ local function compile_cmdsub(...)
 	EF.cs_in_func, EF.cs_active, EF.cur_infunc, EF.cur_jl = cif, cia, inf, jl
 	return unpack(r)
 end
-function compile_cmdsub_inner(src, backtick, lifted, aenv, noalias, posix)
-	local fallback = ("sh:capture_src(%q, %s, %s, %d)"):format(src, tostring(backtick or false),
-		tostring(noalias or false), EF.cur_cline or EF.cur_line or 0)
+function compile_cmdsub_inner(src, backtick, lifted, aenv, noalias, posix, hdtail)
+	local fallback = ("sh:capture_src(%q, %s, %s, %d%s)"):format(src, tostring(backtick or false),
+		tostring(noalias or false), EF.cur_cline or EF.cur_line or 0, hdtail and (", %q"):format(hdtail) or "")
 	if aenv and aenv.dirty and not noalias then -- (its line changed the alias state first)
 		return fallback
 	end
@@ -1979,7 +1979,7 @@ local function emit_part(p, i, lifted, w, tilde)
 	elseif p.arith then -- (name/expr values re-parse as arith)
 		return EF.with(EF.AREAD, emit_arith_word, safe_arith(p.arith), lifted)
 	elseif p.cmdsub then -- $( … ): COMPILE the inner (known at compile time) and run it captured
-		return compile_cmdsub(p.cmdsub, p.backtick, lifted, p.aenv, p.noalias, p.posix)
+		return compile_cmdsub(p.cmdsub, p.backtick, lifted, p.aenv, p.noalias, p.posix, p.hdtail)
 	elseif p.pexp then
 		if not pexp_compilable(p.pexp, p.q) then
 			error("curse-nocompile: ${..} operator")

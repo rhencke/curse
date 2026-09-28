@@ -1547,6 +1547,76 @@ skip_dq_x = function(s, i) -- skip_double_quoted: past the closing `"`, or n + 1
 	end
 	return n + 1
 end
+-- …and the $( … ) / $(( … )) its expansion extracts where the parser saw none: after the
+-- `$` of `$$` (`"$$(("`), or inside a ${…} operand's single quotes (in "…" they don't quote:
+-- `"${u-'$(('}"`). A $(( … )) is skipped as extract_delimited_string does (parens counted,
+-- '…' "…" skipped): one that never closes fails the expansion with "bad substitution: no
+-- closing `)' in WORD" (the whole word) — returns "arith"; an open $( … ) is a command
+-- substitution whose body doesn't parse — returns "cs" and the position of its `(`.
+local function delim_close_x(s, i) -- past `$((` at s[i-3..i-1]: the closing `)`, or n + 1
+	local n, d = #s, 2
+	while i <= n do
+		local c = s:byte(i)
+		if c == 92 then
+			i = i + 2
+		elseif c == 39 then
+			i = skip_sq_x(s, i + 1)
+		elseif c == 34 then
+			i = skip_dq_x(s, i + 1)
+		elseif c == 40 then
+			d, i = d + 1, i + 1
+		elseif c == 41 then
+			d = d - 1
+			if d == 0 then
+				return i
+			end
+			i = i + 1
+		else
+			i = i + 1
+		end
+	end
+	return n + 1
+end
+local function dq_hidden_open(s, i)
+	local n, depth, backq = #s, 0, false
+	while i <= n do
+		local c = s:byte(i)
+		if c == 92 then
+			i = i + 2
+		elseif backq then
+			backq = c ~= 96
+			i = i + 1
+		elseif c == 96 then
+			backq, i = true, i + 1
+		elseif c == 36 and s:byte(i + 1) == 40 then
+			if s:byte(i + 2) == 40 then
+				local e = delim_close_x(s, i + 3)
+				if e > n then
+					return "arith"
+				end
+				i = e + 1
+			else
+				local e = cs_close_x(s, i + 2)
+				if e > n then
+					return depth > 0 and "cs" or nil, i + 1
+				end
+				i = e + 1
+			end
+		elseif c == 36 and s:byte(i + 1) == 123 then
+			depth, i = depth + 1, i + 2
+		elseif c == 125 and depth > 0 then
+			depth, i = depth - 1, i + 1
+		elseif c == 34 then
+			if depth == 0 then
+				return nil
+			end
+			i = skip_dq_x(s, i + 1)
+		else
+			i = i + 1
+		end
+	end
+	return nil
+end
 local function dq_brace_open(s, i)
 	local n, backq = #s, false
 	while i <= n do
@@ -1876,6 +1946,7 @@ local function parse_dquote(inner, add, heredoc, bt_keep)
 			end
 			-- (a heredoc body's ${x-word} keeps a $'…' in word literal — bash; so does a
 			-- "…" one in posix mode)
+			local lastp
 			i = parse_dollar(inner, i, (heredoc or POSIX_DQ) and function(p)
 				if p.pexp then
 					p.pexp.hd = heredoc and "hdoc" or true -- (parse_default_quoted tells them apart)
@@ -1883,14 +1954,25 @@ local function parse_dquote(inner, add, heredoc, bt_keep)
 				elseif heredoc and p.special == "*" then
 					p.hdoc = true -- (a here-document's $* joins with a space: bash)
 				end
+				lastp = p
 				add(p)
 			end or add, true)
+			-- a here-document's $( … ) is parsed as the body expands (xparse_dolparen over the
+			-- rest of the body): its syntax error shows the rest of that line — hdtail
+			if heredoc == true and lastp and lastp.cmdsub and not lastp.backtick then
+				lastp.hdtail = inner:match("^[^\n]*", i)
+			end
 		elseif c == "`" then -- `cmd` command substitution inside "…"
 			-- within a backtick INSIDE double quotes, `\` also escapes `"` (unlike the
 			-- `$()` form) — bash unwraps `\"`→`"`, so `"`echo \"hi\"`"` runs `echo "hi"`
 			-- (not in a heredoc body or a prompt: `\"` reaches the command as is).
-			local body
+			local body, i0 = nil, i
 			body, i = bq_body(inner, i, bt_keep and "[`$\\]" or '[`$\\"]')
+			if heredoc == true and i > #inner + 1 then -- (a here-document body's `…` that never
+				-- closes: expanding the body fails — string_extract's "no closing "`" in `…")
+				add({ bterr = inner:sub(i0), q = true })
+				return
+			end
 			add({ cmdsub = body, q = true, backtick = true, aenv = ALIAS_ENV })
 		else
 			local s, e = inner:find("^[^$\\`]+", i)
@@ -1997,6 +2079,11 @@ local function parse_word(w)
 			i = e + 1
 		elseif c == '"' and w:find("${", i, true) and w:find("[", i, true) and dq_brace_open(w, i + 1) then
 			parts[#parts + 1] = { nulcut = w, q = true } -- (expanding the word fails here: dq_brace_open)
+			break
+		elseif c == '"' and w:find("$(", i, true) and dq_hidden_open(w, i + 1) then
+			local kind, at = dq_hidden_open(w, i + 1)
+			parts[#parts + 1] = kind == "arith" and { nulcut = w, nocl = ")", q = true }
+				or { cserr = M.open_comsub_err(w:sub(at + 1)), q = true }
 			break
 		elseif c == '"' then -- double quotes: expand inside (an unterminated $( … ) body in it
 			local j = dq_end(w, i, true) - 1 -- is paren-counted); j: the closing quote
@@ -2318,6 +2405,22 @@ function M.parse_heredoc(body, is_body, aenv, prompt)
 	return { k = "word", parts = parts }
 end
 
+-- A here-document body that doesn't parse (parse_heredoc failed): the position of the
+-- top-level $( that never closes, or nil. bash reads the substitution from there to the end
+-- of the body (its error is reported at the here-document's line + 1 + the lines it read).
+function M.hd_open_cmdsub(body)
+	local i = 1
+	while true do
+		local p = body:find("$(", i, true)
+		if not p then
+			return nil
+		end
+		if pcall(M.parse_heredoc, body:sub(1, p - 1), true) and not pcall(scan_cmdsub, body, p + 2) then
+			return p
+		end
+		i = p + 2
+	end
+end
 -- The default/alternate word of a ${x-word} / ${x:-word} / … that sits INSIDE DOUBLE
 -- QUOTES follows double-quoted rules: single quotes are literal, a backslash is kept
 -- except before $ ` " \ (and \} -> a literal }, \<newline> is a line continuation), and
@@ -2377,8 +2480,8 @@ function M.parse_default_quoted(txt, heredoc)
 	local t = table.concat(out)
 	-- a construct in the word left open (`"${u-'${'}"`: in "…" the `'` are literal): bash's
 	-- expansion of the word fails there — after expanding what precedes it — with
-	-- extract_dollar_brace_string's "bad substitution: no closing `}' in WORD" (`$[`: `]'),
-	-- or "no closing "`" in `…" for a backquote; an open $( … ) is a command substitution
+	-- extract_dollar_brace_string's "bad substitution: no closing `}' in WORD" (`$[`: `]',
+	-- `$((`: `)'), or "no closing "`" in `…" for a backquote; an open $( … ) is a command substitution
 	-- whose body (the rest) fails to parse when it runs
 	local bad, k2 = nil, 1
 	while k2 <= #t do
@@ -2406,8 +2509,8 @@ function M.parse_default_quoted(txt, heredoc)
 	if bad then
 		local c2 = t:sub(bad + 1, bad + 1)
 		r.parts[#r.parts + 1] = t:byte(bad) == 96 and { bterr = t:sub(bad), q = true }
-			or c2 == "(" and { cserr = M.open_comsub_err(t:sub(bad + 2)), q = true }
-			or { nulcut = txt, nocl = c2 == "[" and "]" or nil, q = true }
+			or c2 == "(" and t:sub(bad + 2, bad + 2) ~= "(" and { cserr = M.open_comsub_err(t:sub(bad + 2)), q = true }
+			or { nulcut = txt, nocl = c2 == "[" and "]" or c2 == "(" and ")" or nil, q = true }
 	end
 	return r
 end

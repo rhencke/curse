@@ -1888,7 +1888,7 @@ expand_part_str = function(sh, p, assign)
 	elseif p.procsub then
 		return expand_procsub(sh, p)
 	elseif p.cmdsub then
-		return sh:capture_src(p.cmdsub, p.backtick, p.noalias)
+		return sh:capture_src(p.cmdsub, p.backtick, p.noalias, nil, p.hdtail)
 	elseif p.pexp then
 		return expand_pexp(sh, p, assign)
 	end
@@ -3047,13 +3047,13 @@ local function apply_redirs(sh, redirs, cname, ctx, args) -- cname: the command 
 					sherr(sh, "curse: " .. body .. ": bad substitution\n") -- (names the body, as above)
 					hok, ok = false, false
 				else
-					-- (bash names it `NAME: command substitution: line N:`, N the line the
-					-- here-document ended on)
-					local sl = sh.cur_line
+					-- (bash names it `NAME: command substitution: line N:`, N the command's
+					-- line + 1 + the body lines the substitution read)
+					local fl, op = sh.force_line, P.hd_open_cmdsub(body)
 					sh.in_perr, sh.perr_label = true, "command substitution"
-					sh.cur_line = (sl or 1) + select(2, body:gsub("\n", "")) + 1
+					sh.force_line = (fl or rt.current_line(sh)) + select(2, body:sub(op or 1):gsub("\n", "")) + 1
 					io.stderr:write("curse: unexpected EOF while looking for matching `)'\n")
-					sh.in_perr, sh.perr_label, sh.cur_line = nil, nil, sl
+					sh.in_perr, sh.perr_label, sh.force_line = nil, nil, fl
 					hok, ok = false, false
 				end
 			end

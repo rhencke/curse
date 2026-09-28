@@ -3233,7 +3233,7 @@ function M.no_refs(sh, vnames)
 	return true
 end
 
-function Shell:capture_src(src, backtick, noalias, line0)
+function Shell:capture_src(src, backtick, noalias, line0, hdtail)
 	local P = require("parser")
 	local I = require("interp")
 	-- A SYNTAX error in the body: bash makes `$(…)` fatal to the whole containing
@@ -3311,7 +3311,35 @@ function Shell:capture_src(src, backtick, noalias, line0)
 		or M.cs_traps_inherited(self)
 	local has_perr = false
 	for _, st in ipairs(ast.stmts) do
-		if st.t == "parse_error" then
+		if st.t == "parse_error" and hdtail then
+			-- a here-document's $( … ): bash parses it as the body expands, over the rest of
+			-- the body (xparse_dolparen) — a syntax error fails the expansion (status 1, the
+			-- command not run), reported a line on, showing that line of the rest of the body
+			local l0 = line0 or M.current_line(self) or 1
+			local k = 1 -- (the error's line within the text, from a parse counting from 1)
+			local rok, rast = pcall(P.parse, src, self, nil, noalias, nil, nil, nil, nil, backtick)
+			for _, rs in ipairs(rok and type(rast) == "table" and rast.stmts or {}) do
+				if rs.t == "parse_error" then
+					k = rs.line or 1
+					break
+				end
+			end
+			local text, kk = nil, k
+			for ln in ((src .. ")" .. hdtail) .. "\n"):gmatch("([^\n]*)\n") do
+				kk = kk - 1
+				if kk == 0 then
+					text = ln
+					break
+				end
+			end
+			local e = setmetatable({ line = l0 + k, text = text or st.text }, { __index = st })
+			local fl = self.force_line
+			self.force_line = e.line
+			pcall(M.parse_error_stmt, self, e, "command substitution")
+			self.force_line = fl
+			self.status = 1
+			error({ __curse_exit = 1, __curse_lineabort = true }, 0)
+		elseif st.t == "parse_error" then
 			if backtick and not has_perr and src:find("^[ \t\n]*<") and not src:find("^[ \t\n]*<[<>&]") then
 				-- a `< …` body is parsed first in the shell itself (command_substitute's
 				-- $(< file) check, parse_string_to_command): its syntax error is reported one
