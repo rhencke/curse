@@ -4730,6 +4730,45 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs, xg, bq
 	-- (memoized by position: the parser peeks the same spot again and again for keywords;
 	-- a hit re-applies ws's line effect so nothing observable changes)
 	local pk_i, pk_src, pk_w, pk_dl
+	-- A `\<newline>` inside a reserved word or right after one (`fi\⏎`, `}\⏎⏎`, `f\⏎i`):
+	-- bash's shell_getc removed it before the lexer saw the word. Take it out of the text
+	-- here (its newline still counts a line), so the word reads as the reserved word it is.
+	local function cont_splice(p)
+		src = src:sub(1, p - 1) .. src:sub(p + 2)
+		n = #src
+		line = line + 1
+		for k = 1, astk_n do
+			if astk[k][2] > p then
+				astk[k][2] = astk[k][2] - 2
+			end
+		end
+		if alias_nl then
+			local moved = {}
+			for x in pairs(alias_nl) do
+				moved[x > p and x - 2 or x] = true
+			end
+			alias_nl = moved
+		end
+	end
+	local function kw_splice(s, e) -- the word src[s..e] runs on through continuations?
+		if not (src:byte(e + 1) == 92 and src:byte(e + 2) == 10) then
+			return
+		end
+		local parts, k, cs = { src:sub(s, e) }, e + 1, {}
+		while src:byte(k) == 92 and src:byte(k + 1) == 10 do
+			cs[#cs + 1] = k
+			local _, e2 = src:find("^[%w_]*", k + 2)
+			parts[#parts + 1] = src:sub(k + 2, e2)
+			k = e2 + 1
+		end
+		local w = table.concat(parts)
+		if not RESERVED[w] or src:find("^[^ \t\n;&|()<>]", k) then
+			return
+		end
+		for j = #cs, 1, -1 do
+			cont_splice(cs[j])
+		end
+	end
 	local function peekword()
 		if pk_i == i and pk_src == src then
 			line = line + pk_dl
@@ -4737,6 +4776,14 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs, xg, bq
 		end
 		local save, l0 = i, line
 		ws()
+		do
+			local s0, e0 = src:find("^[%a_][%w_]*", i)
+			if s0 then
+				local l1 = line
+				kw_splice(s0, e0)
+				l0 = l0 + (line - l1) -- (a splice's line is counted once: not re-applied on a hit)
+			end
+		end
 		local s, e = src:find("^[%a_][%w_]*", i)
 		-- (a reserved word is a whole token: `if=1`, `do.x`, `fi-2` are ordinary words)
 		local w = s and not src:find("^[^ \t\n;&|()<>]", e + 1) and src:sub(s, e) or nil
@@ -6481,6 +6528,9 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs, xg, bq
 				-- expand it before looking for one; parse_command then won't re-expand
 				try_alias(true)
 				cmd_prex = i
+			end
+			if stopset["}"] and src:sub(i, i) == "}" then
+				kw_splice(i, i)
 			end
 			if stopset["}"] and src:sub(i, i) == "}" and not src:find("^[^ \t\n;&|()<>]", i + 1) then
 				i = i + 1 -- (a reserved word is a whole token: `}x`, `}\r` are ordinary words)
