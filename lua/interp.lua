@@ -3174,7 +3174,7 @@ local function apply_redirs(sh, redirs, cname, ctx, args) -- cname: the command 
 					-- Validate the source fd is open BEFORE backing up the destination: a
 					-- dup-based backup would otherwise reuse a just-closed source fd number,
 					-- making a stale `>&N` spuriously succeed (fd N reopened as the backup).
-					if C.fcntl(m, 1) == -1 then -- F_GETFD on a closed fd returns -1 (EBADF)
+					if C.fcntl(m, 1) == -1 and not rt.input_dup_src(sh, m, backup) then -- (closed: EBADF)
 						-- (bash names the target as written: `$v: Bad file descriptor`)
 						local nm = r.target or tv
 						if fdnew

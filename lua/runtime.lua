@@ -2161,6 +2161,66 @@ local function open_noclobber(path)
 	ffi.errno(e)
 	return -1
 end
+-- ---- fd 255: bash's script input ------------------------------------------------------
+-- bash reads a script through fd 255 (read-only, close-on-exec; its offset past the first
+-- buffer it read, at most 8 KiB), and every subshell closes it. curse reads the script
+-- itself, so fd 255 is VIRTUAL (sh.input_fd): opened only when the script's own top level
+-- names it as a dup source (`echo x >&255`: dup'd, then the write fails — `write error:
+-- Bad file descriptor` — where a closed fd would fail the redirection) and closed again
+-- after that command. `exec 255>FILE` while it is the input leaves fd 255 on the script,
+-- read-only (bash moves its input to a new fd, and the saved copy comes back): the file is
+-- created, but writes through 255 fail (stress-attack S19). Any exec of 255 ends the
+-- virtual state.
+local function input_open(sh, fd)
+	local f = M.ropen(sh.input_path, 0, 0)
+	if f < 0 then
+		return false
+	end
+	local size = C.curse_rt_lseek(f, 0, 2)
+	C.curse_rt_lseek(f, size < 8192 and size or 8192, 0)
+	if f ~= fd then
+		C.dup2(f, fd)
+		C.close(f)
+	end
+	C.fcntl(fd, 2, 1) -- F_SETFD FD_CLOEXEC
+	return true
+end
+-- A dup source `m` that is closed: the script input at its top level? then opened for this
+-- command (backed up as closed: its restore closes it again). true when it now is open.
+function M.input_dup_src(sh, m, backup)
+	if not sh.input_fd or m ~= sh.input_fd or M.iso_cur(sh) or M.co_task() or C.fcntl(m, 1) ~= -1 then
+		return false
+	end
+	backup(m)
+	return input_open(sh, m)
+end
+-- `exec` made its redirections permanent (M.redir_discard): one onto the input fd
+function M.input_exec(sh, fd)
+	if not sh.input_fd or fd ~= sh.input_fd or M.iso_cur(sh) or M.co_task() then
+		return
+	end
+	sh.input_fd = nil
+	if C.fcntl(fd, 1) ~= -1 then
+		input_open(sh, fd)
+	end
+end
+-- a path made absolute against the current directory
+function M.abspath(p)
+	if p:sub(1, 1) == "/" then
+		return p
+	end
+	local buf = ffi.new("char[4096]")
+	local c = C.curse_co_getcwd(buf, 4096)
+	return c ~= nil and (ffi.string(c) .. "/" .. p) or p
+end
+-- the soft RLIMIT_NOFILE
+function M.nofile_soft()
+	local r = ffi.new("struct curse_rt_rlimit")
+	if C.curse_rt_getrlimit(7, r) ~= 0 or r.cur > 1048576 then
+		return 1048576
+	end
+	return tonumber(r.cur)
+end
 local function redir_backup(saves, fd, sh)
 	local e = { fd = fd, saved = M.save_fd(fd) }
 	saves[#saves + 1] = e
@@ -2215,7 +2275,9 @@ local function redir_open(sh, op, fd, target, saves, vname)
 			if tf == fd then -- `N>&N`: nothing to do, even on a closed N (redir.c)
 				return true
 			end
-			if C.fcntl(tf, 1) == -1 then -- F_GETFD: target fd not open -> bash fails
+			if C.fcntl(tf, 1) == -1 and not M.input_dup_src(sh, tf, function(f)
+					redir_backup(saves, f, sh)
+				end) then -- F_GETFD: target fd not open -> bash fails
 				io.stderr:write("curse: " .. target .. ": Bad file descriptor\n")
 				return false
 			end
@@ -2329,6 +2391,9 @@ function M.redir_discard(saves, sh) -- (sh: in an in-process subshell, a fd >= 1
 	end
 	for i = #saves, 1, -1 do
 		local s = saves[i]
+		if sh and sh.input_fd == s.fd then
+			M.input_exec(sh, s.fd)
+		end
 		s.done = true
 		if s.saved >= 0 and not (sh and M.iso_keep_fd(sh, s.fd, s.saved)) then
 			C.close(s.saved)
@@ -5233,10 +5298,13 @@ function M.oom(sh)
 	pcall(function()
 		io.stderr:write((ok and name or "bash") .. ": xmalloc: cannot allocate " .. held .. " bytes\n")
 	end)
-	if not M.iso_cur(sh) and not M.daemon_worker then
+	if not M.iso_cur(sh) and not M.co_task() then
 		-- the shell itself: exit(2) now — its variables still fill the heap, and going on
-		-- (the exit path, the EXIT trap) would run out again
+		-- (the exit path, the EXIT trap) would run out again (a daemon worker: the request)
 		pcall(io.flush)
+		if M.daemon_worker and M.daemon_fatal then
+			M.daemon_fatal(2)
+		end
 		C._exit(2)
 	end
 	return { __curse_exit = 2, __curse_noexittrap = true }

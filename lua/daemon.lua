@@ -371,6 +371,15 @@ local function serve_request(cfd, req, fds, ctx)
 	-- the request, rt.termsig, and must be caught there, not kill the worker)
 	-- A Lua error escaping the run is a curse BUG: report it on the request's stderr
 	-- (status 1) instead of failing silently.
+	-- (out of memory in the request's shell itself — rt.oom: its heap is still full, so no
+	-- unwinding: the status goes to the client now, and this worker ends; the parent
+	-- replaces it)
+	rt.daemon_fatal = function(status)
+		pcall(io.flush)
+		ctx.busy[ctx.slot] = -1
+		C.write(cfd, ffi.new("int32_t[1]", status), 4)
+		C._exit(1)
+	end
 	local ok, xerr = xpcall(function()
 		C.write(cfd, ffi.new("int32_t[1]", -ctx.worker_pid), 4)
 		-- the invocation (options, $0/params, startup files, the script): shared with run.lua

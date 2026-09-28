@@ -354,6 +354,7 @@ local function open_script(sh, inv, path)
 	end
 	local s
 	if f then
+		sh.script_open_path = rt.abspath(inv.found or path) -- (fd 255: rt.input_dup_src)
 		s, emsg, errno = f:read("*a")
 		f:close()
 	end
@@ -663,6 +664,8 @@ function M.start(sh, inv, istty)
 		-- (found on $PATH: BASH_SOURCE is the full path, $0 the name; either way fixed at
 		-- startup — `BASH_ARGV0=x` changes $0, not BASH_SOURCE or the error prefix)
 		sh.main_source = inv.found or sh.argv0
+		-- (bash's script input fd: 255, or below a smaller fd limit — rt.input_dup_src)
+		sh.input_fd, sh.input_path = math.min(255, rt.nofile_soft() - 1), inv.found or sh.script_open_path
 	end
 	-- (-c, a script, or non-interactive stdin — not an interactive shell reading its terminal)
 	if (inv.debugger or sh.shopt.extdebug) and kind ~= "repl" then
