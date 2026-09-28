@@ -34,6 +34,10 @@ shopt -s nullglob
 
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 REPO=$(cd "$HERE/../.." && pwd)
+# The whole run lives under ONE memory + task limit (tools/capped: a cgroup scope in the
+# shared curse-work.slice): a runaway test's process tree — not just one process — is
+# killed there, never the host (a recursive-subshell probe once filled 15 GB).
+if [ -z "${CAPPED:-}" ] && [ "${1:-}" != --run-unit ]; then exec "$REPO/tools/capped" "$0" "$@"; fi
 BUILD=${STRESS_BUILD:-$REPO/build}
 
 ITERS=4 JOBS=2 LOAD=1 DURATION=90 TSCALE=1.0 RESULTS="" MODES_SEL="" LIST=0
