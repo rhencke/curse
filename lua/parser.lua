@@ -251,8 +251,8 @@ local function arith(src, nodefer)
 			return spine(e.e, nostr)
 		elseif k == "tern" then
 			return { k = "tern", c = e.c, a = e.a, b = spine(e.b, nostr) or ZERO }
-		elseif nostr and k == "var" and not e.dollar then
-			return nil
+		elseif nostr and ((k == "var" and not e.dollar) or k == "pre") then
+			return nil -- (a `++NAME` too: readtok's peek past NAME failed before the increment)
 		end
 		return e
 	end
