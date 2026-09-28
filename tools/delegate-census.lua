@@ -84,9 +84,22 @@ end
 local why, where, refs = {}, {}, {}
 local nprog, nnoc, nlm, nemit = 0, 0, 0, 0
 local function note(t, k, p) k = k:gsub("%s+$", ""); t[k] = (t[k] or 0) + 1; where[k] = where[k] or {}; table.insert(where[k], p) end
+-- interpreter entry points in the generated code itself: compiled code references ONLY the
+-- runtime (the north star) — any is a census failure under --check
+local function interp_refs(code, p)
+  for ref in code:gmatch("[%w_]*[%.:]?[%w_]+%f[(]") do
+    if ref:match("^I%.") or ref == "sh:capture_src" or ref == "rt.run_lazy" then
+      note(refs, "emitted " .. ref, p)
+    end
+  end
+  if code:find('require%(%s*"interp"%s*%)') or code:find("require%(%s*'interp'%s*%)") then
+    note(refs, 'emitted require("interp")', p)
+  end
+end
 local function loadfail(code, p, tag) -- (generated Lua that doesn't even load: a codegen bug)
   local f, e = load(code)
   if not f then note(why, "LOADFAIL " .. tag .. tostring(e):gsub("^%b[]:%d+: ", ""):sub(1, 50), p) end
+  interp_refs(code, p)
 end
 for idx, pr in ipairs(progs) do
   if (idx - SHARD_I) % SHARD_N == 0 then
@@ -121,13 +134,6 @@ for idx, pr in ipairs(progs) do
         end
       end
       if ok and err ~= "" then loadfail(err, pr[1], "") end
-      if ok and type(err) == "string" then -- interpreter entry points in the generated code itself
-        for ref in err:gmatch("[%w_]*[%.:]?[%w_]+%f[(]") do
-          if ref:match("^I%.") or ref == "sh:capture_src" or ref == "rt.run_lazy" then
-            note(refs, "emitted " .. ref, pr[1])
-          end
-        end
-      end
       if not ok then
         local r = tostring(err):match("curse%-nocompile: ([^\n]*)") or ("ERROR " .. tostring(err):sub(1, 60))
         nnoc = nnoc + 1; note(why, r, pr[1])
@@ -167,6 +173,11 @@ if CHECK then
   -- known entries (a ratchet: each names the work item that removes it); anything new,
   -- or a count that moved, fails — update the file when a fix lands
   local known, bad = {}, nnoc > 0
+  for k in pairs(refs) do -- (the interpreter itself; sh:capture_src / rt.* are the runtime's)
+    if k:match("^emitted I%.") or k:find('"interp"', 1, true) then
+      print("census: generated code references the interpreter: " .. k); bad = true
+    end
+  end
   for line in io.lines(CHECK) do
     local c, k = line:match("^(%d+)\t(.-)%s*$")
     if c then known[(k:gsub("%s*#[^#]*$", ""))] = tonumber(c) end

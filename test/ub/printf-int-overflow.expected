@@ -1,0 +1,7 @@
+2147483649
+xrealloc: cannot allocate 2147483648 bytes
+st 2
+xrealloc: cannot allocate 2147483647 bytes
+st 2
+xrealloc: cannot allocate 2147483650 bytes
+1048602

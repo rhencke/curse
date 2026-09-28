@@ -59,6 +59,9 @@ local function set_opt(sh, field, on)
 	-- bash's posix_initialize (general.c): posix mode turns expand_aliases, inherit_errexit
 	-- and shift_verbose on; leaving it (nothing saved) resets expand_aliases to
 	-- interactive_shell and shift_verbose off (inherit_errexit stays)
+	if field == "opt_v" then -- (set -v / +v: the reader's echo follows it — rt.v_on)
+		sh.vecho = nil
+	end
 	if field == "opt_posix" and not on ~= not was and sh.shopt then
 		local so = sh.shopt
 		if on then
@@ -1122,8 +1125,12 @@ eval = function(sh, e)
 		end
 		return arith_resolve(sh, v, e)
 	end
-	if k == "param" then
-		return rt.str_to_i64(sh:param(e.n))
+	if k == "param" then -- ($n, like $name: a value that isn't a plain number is re-read as text)
+		local v = sh:param(e.n)
+		if not looks_numeric(v) then
+			error({ __arith_textual = true })
+		end
+		return rt.arith_num(v)
 	end
 	if k == "xpand" then -- deferred: expansions inside $(( )) resolved at runtime
 		-- Fast path when the raw only uses $name/${…}/$digit (no $(…)/`…`/$*/glued name):
@@ -1711,7 +1718,7 @@ local function expand_pexp(sh, p, assign)
 	if et then
 		local eb, esub = et:match("^([%a_][%w_]*)%[(.+)%]$")
 		if eb then
-			pe = setmetatable({ name = eb, index = esub }, { __index = pe })
+			pe = setmetatable({ name = eb, index = esub, via_eref = true }, { __index = pe })
 		end
 	end
 	if pe.op == "indirect" then -- ${!ref} / ${!ref OP}: resolve the name, then expand it
@@ -1934,7 +1941,7 @@ expand_part_str = function(sh, p, assign)
 	elseif p.procsub then
 		return expand_procsub(sh, p)
 	elseif p.cmdsub then
-		return sh:capture_src(p.cmdsub, p.backtick, p.noalias)
+		return sh:capture_src(p.cmdsub, p.backtick, p.noalias, nil, p.hdtail)
 	elseif p.pexp then
 		return expand_pexp(sh, p, assign)
 	end
@@ -2281,23 +2288,10 @@ indirect_part = function(sh, pe, quiet)
 	if not (numeric or special) then
 		local bad = not base
 		if not bad and #tname > #base then
-			if tname:sub(#base + 1, #base + 1) ~= "[" or tname:sub(-1) ~= "]" or #tname == #base + 2 then
-				bad = true
-			else -- the `[` must close exactly at the end
-				local depth = 0
-				for k = #base + 1, #tname do
-					local c = tname:byte(k)
-					if c == 91 then
-						depth = depth + 1
-					elseif c == 93 then
-						depth = depth - 1
-						if depth == 0 and k < #tname then
-							bad = true
-							break
-						end
-					end
-				end
-			end
+			-- (the `[` must close exactly at the end, as skipsubscript reads it: quotes nest —
+			-- `A["]` never closes)
+			bad = tname:sub(#base + 1, #base + 1) ~= "[" or #tname == #base + 2
+				or P.subscript_close(tname, #base + 1) ~= #tname
 		end
 		if bad then
 			io.stderr:write("curse: " .. tname .. ": invalid variable name\n")
@@ -2806,6 +2800,14 @@ expand_fields_full = function(sh, w, pre1) -- pre1: part 1 already expanded (a $
 				hasval = pn == 0 or pn <= sh.nparams
 			end
 			local pval = pn and sh:param(pn) or sh:get(pe.name) -- ($1 is not a variable)
+			local rb = not pn and sh.vars[pe.name]
+			local et = rb and rb.ref and sh:deref_elem(pe.name)
+			local eb, esub = (et or ""):match("^([%a_][%w_]*)%[(.+)%]$")
+			if eb then -- (through a nameref to an ELEMENT: that element — its subscript is
+				local k = array_key(sh, eb, esub) -- evaluated, `D[a b]` an arith error)
+				hasval = sh:is_elem_set(eb, k)
+				pval = hasval and (sh:array_get(eb, k) or "") or ""
+			end
 			local nonnull = pval ~= ""
 			local useword
 			if pe.op == ":-" then
@@ -3096,13 +3098,13 @@ local function apply_redirs(sh, redirs, cname, ctx, args) -- cname: the command 
 					sherr(sh, "curse: " .. body .. ": bad substitution\n") -- (names the body, as above)
 					hok, ok = false, false
 				else
-					-- (bash names it `NAME: command substitution: line N:`, N the line the
-					-- here-document ended on)
-					local sl = sh.cur_line
+					-- (bash names it `NAME: command substitution: line N:`, N the command's
+					-- line + 1 + the body lines the substitution read)
+					local fl, op = sh.force_line, P.hd_open_cmdsub(body)
 					sh.in_perr, sh.perr_label = true, "command substitution"
-					sh.cur_line = (sl or 1) + select(2, body:gsub("\n", "")) + 1
+					sh.force_line = (fl or rt.current_line(sh)) + select(2, body:sub(op or 1):gsub("\n", "")) + 1
 					io.stderr:write("curse: unexpected EOF while looking for matching `)'\n")
-					sh.in_perr, sh.perr_label, sh.cur_line = nil, nil, sl
+					sh.in_perr, sh.perr_label, sh.force_line = nil, nil, fl
 					hok, ok = false, false
 				end
 			end
@@ -3502,9 +3504,7 @@ M.report_recoverable = rt.report_recoverable
 local DYN_ARRAYS = { BASH_ARGC = 1, BASH_ARGV = 1, BASH_LINENO = 1, BASH_SOURCE = 1, DIRSTACK = 1, FUNCNAME = 1, GROUPS = 1 }
 M.DYN_ARRAYS = DYN_ARRAYS
 -- bash's dynamic scalars (computed on read, no var box here) and their attributes
-local DYN_SCALARS = { BASHPID = "i", HISTCMD = "i", RANDOM = "i", SRANDOM = "i", SECONDS = "i", LINENO = "-",
-	EPOCHSECONDS = "-", EPOCHREALTIME = "-", BASH_SUBSHELL = "-", BASH_COMMAND = "-", BASH_ARGV0 = "-",
-	OSTYPE = "-", MACHTYPE = "-", HOSTTYPE = "-" }
+local DYN_SCALARS = rt.DYN_SCALAR_ATTR
 -- Format one variable as a `declare -p` line, or nil if it is unset.
 local function fmt_decl(sh, name)
 	-- SHELLOPTS/BASHOPTS are readonly, exported, derived specials with no var box.
@@ -3526,7 +3526,7 @@ local function fmt_decl(sh, name)
 		end
 		return "declare -a " .. name .. "=(" .. table.concat(parts, " ") .. ")"
 	end
-	if (b == nil or (b.dyn and b.s == nil and b.n == nil)) and DYN_SCALARS[name]
+	if (b == nil or (b.dyn and b.s == nil and b.n == nil and not b.arr)) and DYN_SCALARS[name]
 		and not (sh.unset_specials and sh.unset_specials[name]) then
 		local v = sh:get(name) or "" -- (read first: get_seconds gives SECONDS its -i)
 		local fl = b and sh:attr_string(name) or DYN_SCALARS[name]
@@ -4037,6 +4037,30 @@ function pf.seq(parts)
 		end
 	end
 	if not (big and ps and ps.fsh) then
+		if big then -- (printf -v: the text is built whole — bash's vbadd sizes it in an int,
+			-- so past INT_MAX it overflows and xrealloc fails, fatal: docs/bash-ub.md — curse
+			-- reports the true size and exits 2 the same way)
+			local n = 0
+			for k = 1, #parts do
+				local q = parts[k]
+				n = n + (type(q) == "table" and math.max(q[2], 0) or #q)
+			end
+			for _, o in ipairs(ps and ps.out or {}) do
+				n = n + #o
+			end
+			if n > 2147483647 - 64 then
+				local sh = rt.cur_shell
+				local fl = sh and sh.force_line
+				if sh then
+					sh.force_line = 0 -- (fatal_error: no line)
+				end
+				io.stderr:write(("curse: xrealloc: cannot allocate %.0f bytes\n"):format(n))
+				if sh then
+					sh.force_line = fl
+				end
+				error({ __curse_exit = 2 }, 0)
+			end
+		end
 		for k = 1, #parts do
 			local q = parts[k]
 			if type(q) == "table" then
@@ -4254,6 +4278,33 @@ end
 -- (`full`: the spec string.format takes, nil when the width/precision is too wide)
 function pf.float(ps, tk, full, spec, width, prec, conv, arg)
 	local w = tonumber(width) or 0
+	local P = tonumber(prec)
+	if P and P >= pf.BIG then -- (a precision snprintf can't produce, near INT_MAX: a number's
+		-- exact expansion ends long before — a long double's within 20000 digits — so format to
+		-- that and the rest are zeros, streamed: bash writes them all)
+		local M = 20000
+		local r = pf.float(ps, tk, nil, (spec:gsub("[-0]", "")), "", tostring(M), conv, arg)
+		local lc, z = conv:lower(), P - M
+		if not r:find("%d") or (lc == "g" and not spec:find("#", 1, true)) then
+			z = 0 -- (inf/nan take no precision; %g drops the trailing zeros)
+		end
+		local cut = (lc == "e" or lc == "g") and r:find("[eE][+%-]%d+$") or lc == "a" and r:find("[pP][+%-]%d+$")
+		local parts = cut and { r:sub(1, cut - 1), { "0", z }, r:sub(cut) } or { r, { "0", z } }
+		local n = #r + z
+		if w > n then
+			if spec:find("-", 1, true) then
+				parts[#parts + 1] = { " ", w - n }
+			elseif spec:find("0", 1, true) and r:find("%d") then
+				local pre = r:match("^[+%- ]?0?[xX]?") or ""
+				parts[1] = r:sub(#pre + 1, cut and cut - 1 or nil)
+				table.insert(parts, 1, { "0", w - n })
+				table.insert(parts, 1, pre)
+			else
+				table.insert(parts, 1, { " ", w - n })
+			end
+		end
+		return pf.seq(parts)
+	end
 	if w >= pf.BIG then -- (a width snprintf can't produce, near INT_MAX: pad the bare text)
 		local r = pf.float(ps, tk, nil, (spec:gsub("[-0]", "")), "", prec, conv, arg)
 		if w <= #r then
@@ -5277,8 +5328,8 @@ end
 -- computed natively via emit_word — genuine compilation, not an AST re-walk.
 -- Evaluate an expression STRING (a value re-read as arithmetic): a parse error is a shell
 -- arith error (fails the command), never a raw Lua error out of compiled code.
-function M.arith_eval_str(sh, s)
-	local ok, ast = pcall(P.arith, s == "" and "0" or s, sh.arith_expanded and "expanded" or nil)
+function M.arith_eval_str(sh, s, mode)
+	local ok, ast = pcall(P.arith, s == "" and "0" or s, mode or (sh.arith_expanded and "expanded" or nil))
 	if not ok then
 		P.trap_flow(ast)
 	end
@@ -5523,47 +5574,8 @@ local function head(sh, st, text)
 		sh.cur_cmd = { t = "head", text = text }
 	end
 end
-local function run_debug(sh, line)
-	local h = sh.traps and sh.traps.DEBUG
-	if not h or h == "" or sh.in_debug or (sh.in_pipestage or 0) > 0 then
-		return
-	end
-	-- DEBUG doesn't reach into a subshell/command substitution unless functrace extends it.
-	-- (A function call hides it at entry instead — rt.debug_enter — so one the function
-	-- sets itself still fires in its body.)
-	if (sh.in_subprogram or 0) > 0 and not rt.pseudo_trapped(sh, "DEBUG") then
-		return -- (one the subshell set itself is live there)
-	end
-	sh.in_debug = true
-	local saved = sh.status
-	if line then
-		sh.cur_line = line
-	end
-	local exited, rret = run_trap(sh, h, "debug trap")
-	local trap_status = sh.status
-	sh.status = saved
-	sh.in_debug = false
-	if rret then -- `return` in the DEBUG trap returns from the running function
-		error({ __curse_return = rret })
-	end
-	-- `exit` in a DEBUG trap exits the shell; a non-zero DEBUG return under errexit
-	-- also exits (skipping the command), matching bash.
-	if exited then
-		error({ __curse_exit = trap_status })
-	end
-	if sh.opt_e and trap_status ~= 0 then
-		error({ __curse_exit = trap_status })
-	end
-	-- shopt -s extdebug: a non-zero DEBUG status skips the command; 2 inside a function
-	-- or sourced file acts as a `return` from it (bash)
-	if trap_status ~= 0 and sh.shopt.extdebug then
-		if trap_status == 2 and ((sh.calldepth or 0) > 0 or (sh.sourcedepth or 0) > 0) then
-			error({ __curse_return = trap_status }) -- (the function returns 2: bash)
-		end
-		return true
-	end
-end
-M.run_debug = run_debug -- compiled tier fires DEBUG before each native command
+local run_debug = rt.run_debug -- (the one DEBUG-trap runner: runtime, shared with the compiled tier)
+M.run_debug = run_debug
 
 local wall_secs = rt.wall_secs
 
@@ -5729,6 +5741,8 @@ exec_stmt = function(sh, st, hook)
 			-- calls, whose lines count as usual — bash); the interpreter's parse numbered them
 			-- so already (trap_abs), a compiled handler's delegated commands didn't
 			sh.cur_line = sh.trap_abs and ln or sh.trap_base + ln - 1
+			local cl = st.cline or st.line -- (and its $(…) bodies number from there too)
+			sh.cur_cline = sh.trap_abs and cl or sh.trap_base + cl - 1
 		end
 	end
 	if t == "assign" then
@@ -6555,11 +6569,15 @@ run_trap = function(sh, code, tag)
 	-- state): the first run interprets it, so a one-shot EXIT trap never loads the compiler.
 	local seen = trap_seen[code]
 	local mod
-	M.v_echo(sh, code, nil, {}) -- (set -v: the handler's text as it's read)
+	-- (set -v: the handler's lines are echoed as parse_and_execute reads them — a group at a
+	-- time, so a `set -v` in it echoes the rest; the reader's echo state is the parser
+	-- state's, restored when the handler ends — $- keeps the option: rt.v_on)
+	local vst, vsave = {}, rt.v_on(sh)
+	local vtext = rt.v_on(sh) or code:find("%-o%s*verbose") or code:find("%f[%w_]set%f[^%w_][^\n;&|]*%-%a*v")
 	-- (a function the handler defines numbers its lines from the handler's first line, as
 	-- the text is parsed — the interpreter's parse, below; the compiled fragment is keyed by
 	-- the text alone)
-	if seen and not (code:find("%(%s*%)") or code:find("%f[%w_]function%f[^%w_]")) then
+	if seen and not vtext and not (code:find("%(%s*%)") or code:find("%f[%w_]function%f[^%w_]")) then
 		mod = require("tier").try_fragment(code, false, sh, true)
 	elseif not seen then
 		trap_seen_n = trap_seen_n + 1
@@ -6582,6 +6600,14 @@ run_trap = function(sh, code, tag)
 		while k < #stmts do
 			k = k + 1
 			local st = stmts[k]
+			if vtext and st.lgstart and st.line then -- (its group's lines, read before it runs)
+				local nx = k + 1
+				while stmts[nx] and not (stmts[nx].lgstart and stmts[nx].line) do
+					nx = nx + 1
+				end
+				local b0 = sh.trap_base or 1
+				M.v_echo(sh, code, stmts[nx] and (stmts[nx].line - b0) or nil, vst)
+			end
 			exec_stmt(sh, st, function() end)
 			-- a failed eligible command INSIDE a handler fires the ERR trap (bash), but
 			-- NOT the errexit-exit half; in_err_trap keeps the ERR handler from re-firing.
@@ -6613,6 +6639,12 @@ run_trap = function(sh, code, tag)
 			k = k + 1
 		end
 		ok, err = pcall(body)
+	end
+	if vtext and not mod then
+		M.v_echo(sh, code, nil, vst) -- (the rest, read to the end of the text)
+	end
+	if rt.v_on(sh) ~= vsave then
+		sh.vecho = vsave
 	end
 	sh.in_trap = sh.in_trap - 1
 	sh.xdepth = sxd
@@ -6671,42 +6703,14 @@ end
 -- exec_list, run_lazy and the &&/|| handler (which previously drifted apart).
 -- Run just the ERR trap (once, in scope), preserving $?; no errexit-exit. Used
 -- both by fire_err and directly by run_trap (a failed command inside a handler).
-fire_err_trap = function(sh)
-	local h = sh.traps and sh.traps.ERR
-	-- ERR is not re-run inside a forked pipeline stage (bash fires it ONCE for the
-	-- whole pipeline, in the parent); errtrace still extends it to functions/subshells.
-	-- (not inherited by functions/subshells — but one SET in a function or subshell
-	-- fires there, as bash's trap is active in the context that set it)
-	-- (functions hide it on entry — rt.debug_enter; a subshell doesn't inherit it either)
-	-- (a stage skips only the INHERITED trap: one set inside the stage fires there)
-	local sp, ps = sh.in_subprogram or 0, sh.in_pipestage or 0
-	local errscope = sh.opt_errtrace or ((ps == 0 or ps == sh.err_trap_ps) and (sp == 0 or sp == sh.err_trap_sp))
-	if sh.err_skip then -- (the failing call set the trap itself: bash sampled none before it)
-		sh.err_skip = nil
-		return
-	end
-	if h and h ~= "" and not sh.in_err_trap and errscope then
-		sh.in_err_trap = true
-		local saved = sh.status
-		local exited, rret = run_trap(sh, h, "error trap")
-		local xst = sh.status
-		sh.status = saved
-		sh.in_err_trap = false
-		if exited then -- `exit` in the ERR trap exits the shell (_run_trap_internal)
-			error({ __curse_exit = xst })
-		end
-		if rret then -- `trap 'return N' ERR`: the failing command's function returns N
-			error({ __curse_return = rret })
-		end
-	end
-end
+fire_err_trap = rt.fire_err_trap -- (the one ERR-trap runner: runtime, shared with the compiled tier)
 fire_err = function(sh)
 	fire_err_trap(sh)
 	if sh.opt_e then
 		error({ __curse_exit = sh.status })
 	end
 end
-M.fire_err_trap = fire_err_trap -- compiled tier fires ERR after a failing native command
+M.fire_err_trap = fire_err_trap
 -- A prompt string (PS1/PS2/… and ${x@P}): decode the backslash escapes, then (promptvars)
 -- expand it as if double-quoted — $var/$(…)/`…`, `\` escaping only $ ` " \ (bash's
 -- Q_DOUBLE_QUOTES; a bare `"` is literal, so the heredoc-style body parse).
@@ -7021,7 +7025,7 @@ end
 -- once the parser has read into it — through line UPTO (1-based, relative to TEXT; nil =
 -- all of it). `st` carries what's been echoed.
 local function v_echo(sh, text, upto, st)
-	if not sh.opt_v then -- (the lines read while it's off are behind the reader: a `set -v`
+	if not rt.v_on(sh) then -- (the lines read while it's off are behind the reader: a `set -v`
 		if upto and upto > (st.done or 0) then -- among them doesn't echo itself, bash)
 			st.done = upto
 		end
@@ -7035,7 +7039,30 @@ local function v_echo(sh, text, upto, st)
 	end
 	upto = math.min(upto or #st.lines, #st.lines)
 	for k = st.done + 1, upto do
-		io.stderr:write(st.lines[k], "\n")
+		-- (a line a $( … ) body is read from isn't echoed — see run_history_lines; its
+		-- here-document lines are, and each document again at the substitution's end)
+		local line, hdq = st.lines[k], st.hdq or {}
+		st.hdq = hdq
+		if not P.in_open_cmdsub(table.concat(st.lines, "\n", 1, k - 1) .. "\n") then
+			io.stderr:write(line, "\n")
+		elseif #hdq > 0 then
+			io.stderr:write(line, "\n")
+			st.vdocs = st.vdocs or {}
+			st.vdocs[#st.vdocs + 1] = hdq[1].strip and line:gsub("^\t+", "") or line
+		end
+		if #hdq > 0 then
+			if (hdq[1].strip and line:gsub("^\t+", "") or line) == hdq[1].word then
+				table.remove(hdq, 1)
+			end
+		else
+			for _, d in ipairs(heredoc_opens(line)) do
+				hdq[#hdq + 1] = d
+			end
+		end
+		if st.vdocs and #hdq == 0 and not P.in_open_cmdsub(table.concat(st.lines, "\n", 1, k) .. "\n") then
+			io.stderr:write(table.concat(st.vdocs, "\n"), "\n")
+			st.vdocs = nil
+		end
 	end
 	st.done = math.max(st.done, upto)
 end
@@ -7097,6 +7124,7 @@ end
 local function run_history_lines(sh, text, line1, hook, k)
 	local pos, lnum, n = 1, line1, #text
 	local buf, bufline, st, hdq = {}, line1, {}, {}
+	local vdocs -- (set -v: the here-documents read inside a $( … ), echoed again at its end)
 	local function flush()
 		if #buf == 0 then
 			return
@@ -7119,8 +7147,17 @@ local function run_history_lines(sh, text, line1, hook, k)
 		local e = text:find("\n", pos, true) or (n + 1)
 		local line = text:sub(pos, e - 1)
 		pos = e + 1
-		if sh.opt_v then -- set -v: each input line is echoed as it's read (bash)
-			io.stderr:write(line, "\n")
+		if rt.v_on(sh) then -- set -v: each input line is echoed as it's read (bash) — but not
+			-- one a $( … ) body is read from (parse_comsub: shell_getc echoes nothing while
+			-- shell_eof_token is set), except a here-document's lines there: read_secondary_line
+			-- echoes them, and the substitution's end echoes each document again (as stored)
+			if not (#buf > 0 and P.in_open_cmdsub(table.concat(buf, "\n") .. "\n")) then
+				io.stderr:write(line, "\n")
+			elseif #hdq > 0 then
+				io.stderr:write(line, "\n")
+				vdocs = vdocs or {}
+				vdocs[#vdocs + 1] = hdq[1].strip and line:gsub("^\t+", "") or line
+			end
 		end
 		local this = lnum
 		lnum = lnum + 1
@@ -7132,6 +7169,10 @@ local function run_history_lines(sh, text, line1, hook, k)
 			buf[#buf + 1] = line
 		else
 			lnum = lnum - 1 -- (a discarded line isn't counted: bash's line numbers lag)
+		end
+		if vdocs and #hdq == 0 and not P.in_open_cmdsub(table.concat(buf, "\n") .. "\n") then
+			io.stderr:write(table.concat(vdocs, "\n"), "\n")
+			vdocs = nil
 		end
 		if #hdq == 0 and #buf > 0 and not needs_more(table.concat(buf, "\n")) then
 			flush()

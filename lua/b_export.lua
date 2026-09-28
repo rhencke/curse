@@ -452,7 +452,8 @@ return function(sh, cmd, args, hook, tcb)
 				pb = pb or {}
 				-- (a local's value is discarded — make_local_array_variable — unless -I inherits)
 				local had = pb.s ~= nil or pb.n ~= nil
-				local v0 = not (localize and not sh.local_inherit) and (pb.s or (pb.n and rt.i64_to_str(pb.n))) or nil
+				local v0 = not (localize and not sh.local_inherit) and rt.scalar_value0(sh, dn, pb) or nil
+				had = had or v0 ~= nil
 				pb.arr, pb.s, pb.n, pb.empty_decl = v0 and { [0] = v0 } or {}, nil, nil, not had or nil
 				sh.vars[dn] = pb
 			end
@@ -861,7 +862,7 @@ return function(sh, cmd, args, hook, tcb)
 							end -- declared, never assigned
 						end
 					elseif aattr and (isdecl or (sh.arrayargs_pending and sh.arrayargs_pending[a])) then -- `declare -a`: mark an (empty) indexed array; convert a scalar to [0]
-						local b = sh.vars[a] or {}
+						local b = sh.vars[a] or { dyn = rt.DYN_ASSIGN[a] and true or nil } -- (a live dynamic one's value too)
 						if b.ro and b.assoc then -- (readonly is reported before any conversion)
 							io.stderr:write("curse: " .. a .. ": readonly variable\n")
 							rt.report_exit(sh) -- (err_readonly: report_error)
@@ -881,8 +882,9 @@ return function(sh, cmd, args, hook, tcb)
 							end
 						else
 							sh.vars[a] = b
-							if (b.s ~= nil or b.n ~= nil) and not b.arr then
-								b.arr = { [0] = b.s or rt.i64_to_str(b.n) }
+							local v0 = not b.arr and rt.scalar_value0(sh, a, b)
+							if v0 then
+								b.arr = { [0] = v0 }
 								b.s = nil
 								b.n = nil
 								if b.exported then -- (an array is never in the environment)
@@ -933,19 +935,9 @@ return function(sh, cmd, args, hook, tcb)
 					local anm, sub, aop, aval = nil, nil, nil, nil
 					local nm, rest = a:match("^([%a_][%w_]*)%[(.*)$")
 					if nm then
-						local depth, close = 1, nil
-						for j = 1, #rest do
-							local ch = rest:sub(j, j)
-							if ch == "[" then
-								depth = depth + 1
-							elseif ch == "]" then
-								depth = depth - 1
-								if depth == 0 then
-									close = j
-									break
-								end
-							end
-						end
+						-- (to its `]` as skipsubscript reads it: quotes nest — `A["]=1` has none)
+						local close = P.subscript_close(a, #nm + 1)
+						close = close and close - #nm - 1
 						if close then
 							local after = rest:sub(close + 1)
 							if after:sub(1, 2) == "+=" then
@@ -1052,7 +1044,7 @@ return function(sh, cmd, args, hook, tcb)
 					local pb = pname and sh.vars[sh:deref(pname)]
 					if mkarr and pname and not assoc and not (pb and pb.arr) then
 						pb = pb or {}
-						local v0 = pb.s or (pb.n and rt.i64_to_str(pb.n)) -- (a scalar becomes [0]: bash)
+						local v0 = rt.scalar_value0(sh, sh:deref(pname), pb) -- (a scalar becomes [0]: bash)
 						pb.arr, pb.s, pb.n, pb.empty_decl = pb.arr or (v0 and { [0] = v0 }) or {}, nil, nil, v0 == nil or nil
 						sh.vars[sh:deref(pname)] = pb
 					end

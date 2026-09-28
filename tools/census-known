@@ -17,8 +17,8 @@
 # queue.md "census": a whole program past Lua's 200-locals limit (250 top-level
 # assignments, lifted to locals) LOADFAILs; `run.lua SCRIPT compiled` dies with it
 # (tiered falls back). The fragment form of the same program loads.
-1	LOADFAIL function at line 4532 has more than 200 local vari  # queue: census 200-locals
-1	LOADFAIL function at line 8 has more than 200 local variabl  # queue: census 200-locals
+1	LOADFAIL function at line 4531 has more than 200 local vari  # queue: census 200-locals
+1	LOADFAIL function at line 7 has more than 200 local variabl  # queue: census 200-locals
 # queue.md "census": these programs compile whole, but as fragments (eval/trap/OSR/line
 # text) the emitter refuses a `local` / `echo` statement ("no compiled form"): 2530,
 # array-assign#9 and friends, in every mode.

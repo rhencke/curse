@@ -58,8 +58,7 @@ local function arith(src, nodefer)
 	-- Arith bodies may embed expansions the arith grammar can't parse: ${x:-5},
 	-- $(cmd), $((..)), `cmd`. Defer the whole thing — at eval the raw string is
 	-- word-expanded and then re-parsed as pure arithmetic (nodefer). Plain $name and
-	-- $digit ARE handled natively (as var/param nodes), so they aren't deferred —
-	-- this keeps function inlining (which substitutes those params) working.
+	-- $digit defer too, but their xpand is fast-pathed (parsed once natively).
 	-- Also defer when a `$` abuts a name character (`f$x`, `x$foo[5]`, `$x$y`):
 	-- there the expansion forms part of a compound variable NAME, which bash builds
 	-- by expanding first — the arith grammar can't parse the raw `$` mid-token.
@@ -129,14 +128,16 @@ local function arith(src, nodefer)
 			or src:find("%$[^%w_{]")
 			or src:find("}[%w_#]")
 			or src:find("%$[%a_{]")
+			or src:find("%$%d")
 		)
 	then
 		-- `}[%w_#]`: a `${…}` GLUED to following chars (`${base}#a` -> 16#a, `${z}11`,
 		-- `${z}xAB`) forms one compound token that must expand-then-parse whole.
 		-- `%$[%a_{]` — $name / ${…}: bash substitutes the VALUE as TEXT and re-parses. The
 		-- xpand eval fast-paths this (parse once, eval native) and only re-parses textually
-		-- when a value isn't a plain number, so hot `(( $i < n ))` stays native. ($digit
-		-- stays a native param node so function inlining keeps substituting positionals.)
+		-- when a value isn't a plain number, so hot `(( $i < n ))` stays native. `$digit`
+		-- likewise: `set -- 1+2; $(( $1*3 ))` is 1+2*3 (its native tree's param nodes are
+		-- what function inlining substitutes, when the call's argument is a plain number).
 		return { k = "xpand", raw = src }
 	end
 	-- bash strips matched double-quote PAIRS inside arithmetic (`$(( "1+2" * 3 ))`
@@ -224,21 +225,25 @@ local function arith(src, nodefer)
 	-- operations along the right edge — waiting on that token — hadn't happened yet
 	-- (`y = 3 @` assigns nothing, `x++, y=2 #c` increments x), but everything to their left,
 	-- a completed parenthesis, and the last operand (a `x++` included) had.
-	local function spine(e)
+	-- (nostr: the bad character is the token right after the last operand — a NAME, whose
+	-- value readtok reads only after that lookahead: `A[] ]` never reads A[])
+	local function spine(e, nostr)
 		local k = e.k
 		if e.paren then
 			return e
 		elseif k == "comma" then
-			return seq(e.l, spine(e.r))
+			return seq(e.l, spine(e.r, nostr))
 		elseif k == "bin" then
 			if e.op == "&&" or e.op == "||" then
-				return { k = "bin", op = e.op, l = e.l, r = spine(e.r) or ZERO }
+				return { k = "bin", op = e.op, l = e.l, r = spine(e.r, nostr) or ZERO }
 			end
-			return seq(e.l, spine(e.r))
+			return seq(e.l, spine(e.r, nostr))
 		elseif k == "asgn" or k == "un" then
-			return spine(e.e)
+			return spine(e.e, nostr)
 		elseif k == "tern" then
-			return { k = "tern", c = e.c, a = e.a, b = spine(e.b) or ZERO }
+			return { k = "tern", c = e.c, a = e.a, b = spine(e.b, nostr) or ZERO }
+		elseif nostr and k == "var" and not e.dollar then
+			return nil
 		end
 		return e
 	end
@@ -279,10 +284,11 @@ local function arith(src, nodefer)
 		local ns = i
 		local nm = ident()
 		if nodefer == "expanded" and starts("[") then
-			-- already-expanded text (bash's EXP_EXPANDED): the subscript runs to the LAST `]`
-			-- (`assoc[]]`, `assoc[x],b[$(…)]` take the key literally, nothing re-expands)
-			local close = src:match(".*()%]")
-			if close and close > i then
+			-- already-expanded text (bash's EXP_EXPANDED): the subscript runs to its `]` as
+			-- skipsubscript reads it (`A[]]` is A[] then a stray `]`; `a[1]+b[2]` two
+			-- elements) and nothing in it re-expands
+			local close = subscript_close(src, i)
+			if close then
 				local raw = src:sub(i + 1, close - 1)
 				i = close + 1
 				local ok, idx = pcall(arith, raw, "expanded")
@@ -681,7 +687,7 @@ local function arith(src, nodefer)
 			-- an operand was expected)
 			local pc = src:sub(1, i - 1):match("(%S)%s*$")
 			aerr(pc == ")" and "syntax error: operand expected" or "syntax error: invalid arithmetic operator",
-				spine(e))
+				spine(e, pc ~= ")"))
 		elseif c:match("[%a_]") then
 			-- a name right after the expression: bash's readtok, reading a name, reads the
 			-- token after it too (the `=` peek) — past a run of names, a character that
@@ -1666,6 +1672,76 @@ skip_dq_x = function(s, i) -- skip_double_quoted: past the closing `"`, or n + 1
 	end
 	return n + 1
 end
+-- …and the $( … ) / $(( … )) its expansion extracts where the parser saw none: after the
+-- `$` of `$$` (`"$$(("`), or inside a ${…} operand's single quotes (in "…" they don't quote:
+-- `"${u-'$(('}"`). A $(( … )) is skipped as extract_delimited_string does (parens counted,
+-- '…' "…" skipped): one that never closes fails the expansion with "bad substitution: no
+-- closing `)' in WORD" (the whole word) — returns "arith"; an open $( … ) is a command
+-- substitution whose body doesn't parse — returns "cs" and the position of its `(`.
+local function delim_close_x(s, i) -- past `$((` at s[i-3..i-1]: the closing `)`, or n + 1
+	local n, d = #s, 2
+	while i <= n do
+		local c = s:byte(i)
+		if c == 92 then
+			i = i + 2
+		elseif c == 39 then
+			i = skip_sq_x(s, i + 1)
+		elseif c == 34 then
+			i = skip_dq_x(s, i + 1)
+		elseif c == 40 then
+			d, i = d + 1, i + 1
+		elseif c == 41 then
+			d = d - 1
+			if d == 0 then
+				return i
+			end
+			i = i + 1
+		else
+			i = i + 1
+		end
+	end
+	return n + 1
+end
+local function dq_hidden_open(s, i)
+	local n, depth, backq = #s, 0, false
+	while i <= n do
+		local c = s:byte(i)
+		if c == 92 then
+			i = i + 2
+		elseif backq then
+			backq = c ~= 96
+			i = i + 1
+		elseif c == 96 then
+			backq, i = true, i + 1
+		elseif c == 36 and s:byte(i + 1) == 40 then
+			if s:byte(i + 2) == 40 then
+				local e = delim_close_x(s, i + 3)
+				if e > n then
+					return "arith"
+				end
+				i = e + 1
+			else
+				local e = cs_close_x(s, i + 2)
+				if e > n then
+					return depth > 0 and "cs" or nil, i + 1
+				end
+				i = e + 1
+			end
+		elseif c == 36 and s:byte(i + 1) == 123 then
+			depth, i = depth + 1, i + 2
+		elseif c == 125 and depth > 0 then
+			depth, i = depth - 1, i + 1
+		elseif c == 34 then
+			if depth == 0 then
+				return nil
+			end
+			i = skip_dq_x(s, i + 1)
+		else
+			i = i + 1
+		end
+	end
+	return nil
+end
 local function dq_brace_open(s, i)
 	local n, backq = #s, false
 	while i <= n do
@@ -1891,7 +1967,20 @@ local function parse_dollar(w, i, add, q)
 		-- find the MATCHING } — honoring \-escapes, '…'/"…" quoting, and nested ${…}
 		-- so `${var#\}}`, `${var-'}'}`, `${a:-${b}}` take the right inner text.
 		local endp = scan_braces(w, i + 1, q) -- index just past the closing }
-		local part = parse_paramexp(w:sub(i + 2, endp - 2))
+		-- (unquoted, the word's expansion re-extracts it — extract_dollar_brace_string, whose
+		-- subscript in the NAME skips to its `]` past a `}`: `${a[@}]}` is a[@}], and
+		-- `[${!a[@}]` runs to the word's end, the `]` in the subscript)
+		local sb = not q and w:match("^!?[%a_][%w_]*()%[", i + 2)
+		local ce = endp - 2 -- (the text's end)
+		if sb then
+			local ex = dolbrace_x(w, i + 2)
+			if ex <= #w and ex ~= endp - 1 then
+				endp, ce = ex + 1, ex - 1
+			elseif ex > #w and subscript_x(w, sb) <= #w then
+				endp, ce = #w + 1, #w
+			end
+		end
+		local part = parse_paramexp(w:sub(i + 2, ce))
 		part.q = q
 		add(part)
 		return endp
@@ -2015,6 +2104,7 @@ local function parse_dquote(inner, add, heredoc, bt_keep)
 			end
 			-- (a heredoc body's ${x-word} keeps a $'…' in word literal — bash; so does a
 			-- "…" one in posix mode)
+			local lastp
 			i = parse_dollar(inner, i, (heredoc or POSIX_DQ) and function(p)
 				if p.pexp then
 					p.pexp.hd = heredoc and "hdoc" or true -- (parse_default_quoted tells them apart)
@@ -2022,8 +2112,14 @@ local function parse_dquote(inner, add, heredoc, bt_keep)
 				elseif heredoc and p.special == "*" then
 					p.hdoc = true -- (a here-document's $* joins with a space: bash)
 				end
+				lastp = p
 				add(p)
 			end or add, true)
+			-- a here-document's $( … ) is parsed as the body expands (xparse_dolparen over the
+			-- rest of the body): its syntax error shows the rest of that line — hdtail
+			if heredoc == true and lastp and lastp.cmdsub and not lastp.backtick then
+				lastp.hdtail = inner:match("^[^\n]*", i)
+			end
 		elseif c == "`" then -- `cmd` command substitution inside "…"
 			-- within a backtick INSIDE double quotes, `\` also escapes `"` (unlike the
 			-- `$()` form) — bash unwraps `\"`→`"`, so `"`echo \"hi\"`"` runs `echo "hi"`
@@ -2141,6 +2237,11 @@ local function parse_word(w)
 			i = e + 1
 		elseif c == '"' and w:find("${", i, true) and w:find("[", i, true) and dq_brace_open(w, i + 1) then
 			parts[#parts + 1] = { nulcut = w, q = true } -- (expanding the word fails here: dq_brace_open)
+			break
+		elseif c == '"' and w:find("$(", i, true) and dq_hidden_open(w, i + 1) then
+			local kind, at = dq_hidden_open(w, i + 1)
+			parts[#parts + 1] = kind == "arith" and { nulcut = w, nocl = ")", q = true }
+				or { cserr = M.open_comsub_err(w:sub(at + 1)), q = true }
 			break
 		elseif c == '"' then -- double quotes: expand inside (an unterminated $( … ) body in it
 			local j = dq_end(w, i, true) - 1 -- is paren-counted); j: the closing quote
@@ -2464,6 +2565,125 @@ function M.parse_heredoc(body, is_body, aenv, prompt)
 	return { k = "word", parts = parts }
 end
 
+-- set -v: does TEXT (a command being read, through its last complete line) end inside an
+-- open $( … ) / <( … ) / >( … )? bash reads such a body with parse_comsub, whose lines
+-- shell_getc doesn't echo (shell_eof_token set). A quote-aware scan of the top level: '…',
+-- "…", `…`, comments, $(( … )) and here-document bodies are skipped.
+function M.in_open_cmdsub(text)
+	local i, n, hd, wstart = 1, #text, {}, true
+	local function sub_open(k) -- the $( / <( / >( at text[k]: true when it never closes
+		local ok, e = pcall(scan_cmdsub, text, k + 2)
+		if not ok then
+			trap_flow(e)
+			return true, nil
+		end
+		return false, e
+	end
+	while i <= n do
+		local c = text:sub(i, i)
+		local c2 = text:sub(i + 1, i + 1)
+		if c == "\\" then
+			i, wstart = i + 2, false
+		elseif c == "'" then
+			local e = text:find("'", i + 1, true)
+			if not e then
+				return false
+			end
+			i, wstart = e + 1, false
+		elseif c == "`" then
+			local k = i + 1
+			while k <= n and text:sub(k, k) ~= "`" do
+				k = k + (text:sub(k, k) == "\\" and 2 or 1)
+			end
+			if k > n then
+				return false
+			end
+			i, wstart = k + 1, false
+		elseif c == '"' then
+			local k = i + 1
+			while k <= n and text:sub(k, k) ~= '"' do
+				local d = text:sub(k, k)
+				if d == "\\" then
+					k = k + 2
+				elseif d == "$" and text:sub(k + 1, k + 1) == "(" and text:sub(k + 2, k + 2) ~= "(" then
+					local open, e = sub_open(k)
+					if open then
+						return true
+					end
+					k = e
+				else
+					k = k + 1
+				end
+			end
+			if k > n then
+				return false
+			end
+			i, wstart = k + 1, false
+		elseif c == "#" and wstart then
+			i = text:find("\n", i, true) or n + 1
+		elseif c == "\n" then
+			i, wstart = i + 1, true
+			for _, d in ipairs(hd) do -- (the bodies the line opened: text, not syntax)
+				while true do
+					if i > n then
+						return false
+					end
+					local e = text:find("\n", i, true) or n + 1
+					local l = text:sub(i, e - 1)
+					i = e + 1
+					if (d.strip and l:gsub("^\t+", "") or l) == d.word then
+						break
+					end
+				end
+			end
+			hd = {}
+		elseif c == "<" and c2 == "<" and text:sub(i + 2, i + 2) ~= "<" then
+			local k = i + 2
+			local strip = text:sub(k, k) == "-"
+			k = text:match("^[ \t]*()", strip and k + 1 or k)
+			local w = text:match("^[^%s;&|()<>]+", k)
+			if w then
+				hd[#hd + 1] = { word = (w:gsub("[\\'\"]", "")), strip = strip }
+				i = k + #w
+			else
+				i = k
+			end
+			wstart = false
+		elseif c == "$" and c2 == "(" and text:sub(i + 2, i + 2) == "(" then
+			local e = delim_close_x(text, i + 3)
+			if e > n then
+				return false
+			end
+			i, wstart = e + 1, false
+		elseif (c == "$" or c == "<" or c == ">") and c2 == "(" then
+			local open, e = sub_open(i)
+			if open then
+				return true
+			end
+			i, wstart = e, false
+		else
+			wstart = c == " " or c == "\t" or c == ";" or c == "&" or c == "|" or c == "(" or c == ")"
+			i = i + 1
+		end
+	end
+	return false
+end
+-- A here-document body that doesn't parse (parse_heredoc failed): the position of the
+-- top-level $( that never closes, or nil. bash reads the substitution from there to the end
+-- of the body (its error is reported at the here-document's line + 1 + the lines it read).
+function M.hd_open_cmdsub(body)
+	local i = 1
+	while true do
+		local p = body:find("$(", i, true)
+		if not p then
+			return nil
+		end
+		if pcall(M.parse_heredoc, body:sub(1, p - 1), true) and not pcall(scan_cmdsub, body, p + 2) then
+			return p
+		end
+		i = p + 2
+	end
+end
 -- The default/alternate word of a ${x-word} / ${x:-word} / … that sits INSIDE DOUBLE
 -- QUOTES follows double-quoted rules: single quotes are literal, a backslash is kept
 -- except before $ ` " \ (and \} -> a literal }, \<newline> is a line continuation), and
@@ -2480,7 +2700,11 @@ function M.open_comsub_err(body)
 			break
 		end
 	end
-	return err and unpos(err) or "unexpected EOF while looking for matching `)'"
+	err = err and unpos(err)
+	if err == "syntax error: unexpected end of file" then -- (the body ran out inside a
+		err = nil -- construct: parse_comsub's own EOF — the `)' it was looking for)
+	end
+	return err or "unexpected EOF while looking for matching `)'"
 end
 function M.parse_default_quoted(txt, heredoc)
 	local out, k, m, inq = {}, 1, #txt, false
@@ -2523,8 +2747,8 @@ function M.parse_default_quoted(txt, heredoc)
 	local t = table.concat(out)
 	-- a construct in the word left open (`"${u-'${'}"`: in "…" the `'` are literal): bash's
 	-- expansion of the word fails there — after expanding what precedes it — with
-	-- extract_dollar_brace_string's "bad substitution: no closing `}' in WORD" (`$[`: `]'),
-	-- or "no closing "`" in `…" for a backquote; an open $( … ) is a command substitution
+	-- extract_dollar_brace_string's "bad substitution: no closing `}' in WORD" (`$[`: `]',
+	-- `$((`: `)'), or "no closing "`" in `…" for a backquote; an open $( … ) is a command substitution
 	-- whose body (the rest) fails to parse when it runs
 	local bad, k2 = nil, 1
 	while k2 <= #t do
@@ -2552,8 +2776,8 @@ function M.parse_default_quoted(txt, heredoc)
 	if bad then
 		local c2 = t:sub(bad + 1, bad + 1)
 		r.parts[#r.parts + 1] = t:byte(bad) == 96 and { bterr = t:sub(bad), q = true }
-			or c2 == "(" and { cserr = M.open_comsub_err(t:sub(bad + 2)), q = true }
-			or { nulcut = txt, nocl = c2 == "[" and "]" or nil, q = true }
+			or c2 == "(" and t:sub(bad + 2, bad + 2) ~= "(" and { cserr = M.open_comsub_err(t:sub(bad + 2)), q = true }
+			or { nulcut = txt, nocl = c2 == "[" and "]" or c2 == "(" and ")" or nil, q = true }
 	end
 	return r
 end
@@ -6200,7 +6424,8 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs, xg, bq
 						t = "parse_error",
 						-- (a recoverable one, or a `near TOKEN` one: the token's line)
 						line = (type(st) == "table" and st.__curse_perr and st.line)
-							or (recover or (type(st) == "string" and st:find("near `", 1, true))) and line
+							or (recover or (type(st) == "string" and (st:find("near `", 1, true)
+								or st:find("near unexpected token `", 1, true)))) and line
 							or (eof_s == src and eof_at >= start and type(st) == "string"
 								and st:find("EOF while looking for matching", 1, true)) -- (where it opened)
 								and startline + select(2, src:sub(start, eof_at - 1):gsub("\n", ""))

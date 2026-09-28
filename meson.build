@@ -136,7 +136,8 @@ test('ub-pins', files('test' / 'ub' / 'run.sh'),
 
 # The compile census (tools/delegate-census.lua): every corpus program + synthetic ones past
 # Lua's limits, emitted whole and as a fragment in every emit mode — nocompile must be 0
-# and every LOADFAIL/refusal a known one (tools/census-known, a ratchet). Four shards.
+# and every LOADFAIL/refusal a known one (tools/census-known, a ratchet); generated code may
+# reference only the runtime (no require("interp"), no I.*). Four shards.
 foreach i : ['1', '2', '3', '4']
   test('census-' + i, run_lua,
     args:    [luajit_bin, repo / 'tools' / 'delegate-census.lua', '--modes', '--shard', i + '/4',

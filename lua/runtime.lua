@@ -812,6 +812,16 @@ end
 -- local's own error; nothing is created (status 1). True when that happened.
 -- Does `local NAME` hit a readonly it may not shadow? Only a readonly GLOBAL blocks it;
 -- a readonly local of an enclosing function can be shadowed (bash).
+-- Does a function's local hold `name` (it or a caller's local shadows the global)?
+function Shell:is_local_anywhere(name)
+	for d = self.pd or 0, 0, -1 do
+		local sv = self.savedstack[d]
+		if sv and sv[name] ~= nil then
+			return true
+		end
+	end
+	return false
+end
 function Shell:is_global_ro(name)
 	local b = self.vars[name]
 	if not (b and b.ro) then
@@ -3370,7 +3380,7 @@ function M.no_refs(sh, vnames)
 	return true
 end
 
-function Shell:capture_src(src, backtick, noalias, line0)
+function Shell:capture_src(src, backtick, noalias, line0, hdtail)
 	-- (backtick "late": a `$((`'s text that is no arithmetic, read by bash with the P_ARITH
 	-- scan and so only parsed now, at expansion — its syntax errors are reported as a
 	-- backtick's are, but the body reads as a $(…)'s)
@@ -3455,7 +3465,35 @@ function Shell:capture_src(src, backtick, noalias, line0)
 		or M.cs_traps_inherited(self)
 	local has_perr = false
 	for _, st in ipairs(ast.stmts) do
-		if st.t == "parse_error" then
+		if st.t == "parse_error" and hdtail then
+			-- a here-document's $( … ): bash parses it as the body expands, over the rest of
+			-- the body (xparse_dolparen) — a syntax error fails the expansion (status 1, the
+			-- command not run), reported a line on, showing that line of the rest of the body
+			local l0 = line0 or M.current_line(self) or 1
+			local k = 1 -- (the error's line within the text, from a parse counting from 1)
+			local rok, rast = pcall(P.parse, src, self, nil, noalias, nil, nil, nil, nil, backtick)
+			for _, rs in ipairs(rok and type(rast) == "table" and rast.stmts or {}) do
+				if rs.t == "parse_error" then
+					k = rs.line or 1
+					break
+				end
+			end
+			local text, kk = nil, k
+			for ln in ((src .. ")" .. hdtail) .. "\n"):gmatch("([^\n]*)\n") do
+				kk = kk - 1
+				if kk == 0 then
+					text = ln
+					break
+				end
+			end
+			local e = setmetatable({ line = l0 + k, text = text or st.text }, { __index = st })
+			local fl = self.force_line
+			self.force_line = e.line
+			pcall(M.parse_error_stmt, self, e, "command substitution")
+			self.force_line = fl
+			self.status = 1
+			error({ __curse_exit = 1, __curse_lineabort = true }, 0)
+		elseif st.t == "parse_error" then
 			if backtick and not has_perr and src:find("^[ \t\n]*<") and not src:find("^[ \t\n]*<[<>&]") then
 				-- a `< …` body is parsed first in the shell itself (command_substitute's
 				-- $(< file) check, parse_string_to_command): its syntax error is reported one
@@ -4699,7 +4737,7 @@ function M.debug_enter(sh, name)
 	if sh.opt_functrace or (sh.fn_trace and sh.fn_trace[name]) then
 		-- inherited: it also fires once on ENTRY, at the definition's line (bash)
 		if d ~= nil then
-			require("interp").run_debug(sh, sh.func_bline and sh.func_bline[name] or nil)
+			M.run_debug(sh, sh.func_bline and sh.func_bline[name] or nil)
 		end
 		return saved
 	end
@@ -6363,8 +6401,9 @@ local function co_launch(ctx, self, stage_fns, inproc, base, lastpipe, upv)
 				ctx.vpid, ctx.task = g.vpid, t
 				M.vpid_ctx[g.vpid] = ctx
 				-- without job control an async compound command starts with SIGINT ignored
-				-- (execute_in_subshell's setup_async_signals), which `trap` then lists
-				if not (g.simple or g.pipe or sh.opt_m) then
+				-- (execute_in_subshell's setup_async_signals), which `trap` then lists — also a
+				-- compound stage of an async pipeline (`{ trap -p; } | cat &`); a simple one not
+				if not (g.simple or sh.opt_m) and not (g.pipe and t.scmd) then
 					M.iso_save_traps(sh)
 					sh.traps.SIGINT, ctx.igint = "", { [2] = true, [3] = true }
 					-- (listed as a hard-ignored signal only once initialize_terminating_signals
@@ -7547,10 +7586,11 @@ local function box(name, vars)
 end
 
 -- Is $LINENO an ordinary variable — unset once (its magic gone) or a plain `local LINENO`
--- shadowing it — rather than the live line number? (compiled $LINENO reads)
+-- shadowing it, or made an array (`declare -a LINENO`) — rather than the live line number?
+-- (compiled $LINENO reads)
 function M.lineno_plain(sh)
 	local b = sh.vars.LINENO
-	return (b ~= nil and not b.dyn) or (sh.unset_specials and sh.unset_specials.LINENO) or false
+	return (b ~= nil and (not b.dyn or b.arr ~= nil)) or (sh.unset_specials and sh.unset_specials.LINENO) or false
 end
 -- bash's sv_shcompat / sv_xtracefd value checks, on assignment: a malformed BASH_COMPAT
 -- (not `N.M`/`NM` within 3.1..5.2) or a BASH_XTRACEFD that isn't an open fd is reported
@@ -8816,6 +8856,38 @@ function M.dyn_live(sh, dn)
 end
 do
 local legal_number = M.legal_number -- (bash: legal_number, else 0)
+-- set -v's echo of input as it's read (bash's echo_input_at_read): the option, unless a
+-- trap handler changed it — the parser state its end restored (sh.vecho), $- keeping v
+function M.v_on(sh)
+	if sh.vecho ~= nil then
+		return sh.vecho
+	end
+	return sh.opt_v and true or false
+end
+-- The dynamic scalars' own attributes as `declare -p` lists them ("i": an integer variable)
+M.DYN_SCALAR_ATTR = { BASHPID = "i", HISTCMD = "i", RANDOM = "i", SRANDOM = "i", SECONDS = "i", LINENO = "-",
+	EPOCHSECONDS = "-", EPOCHREALTIME = "-", BASH_SUBSHELL = "-", BASH_COMMAND = "-", BASH_ARGV0 = "-",
+	OSTYPE = "-", MACHTYPE = "-", HOSTTYPE = "-" }
+-- The value a scalar keeps as element 0 when it becomes an array (convert_var_to_array):
+-- its string, its int64 — or a live dynamic variable's current value (`declare -a LINENO`
+-- is ([0]=the line); the integer ones — RANDOM, SECONDS, BASHPID, … — stay integer). nil:
+-- no value.
+function M.scalar_value0(sh, dn, b)
+	if b.s ~= nil then
+		return b.s
+	end
+	if b.n ~= nil then
+		return i64_to_str(b.n)
+	end
+	if b.dyn and M.DYN_SCALAR[dn] and M.dyn_live(sh, dn) then
+		local v = sh:special_get(dn)
+		if M.DYN_SCALAR_ATTR[dn] == "i" then -- (an integer variable: SECONDS once read, as here)
+			b.int = true
+		end
+		return v
+	end
+	return nil
+end
 -- Run `dn`'s assign hook with value `s` (b: its dyn box or nil). False when `dn` is no
 -- longer dynamic (unset) — the caller then stores the value like any other variable.
 function M.dyn_assign(sh, dn, s, b)
@@ -10340,10 +10412,9 @@ function Shell:array_set(name, key, val, append, raw)
 	end
 	if not b.arr then
 		b.arr = {}
-		if b.s then
-			b.arr[0] = b.s
-		elseif b.n ~= nil then -- (an integer scalar's value lives in b.n: `declare -i n=3;
-			b.arr[0] = i64_to_str(b.n) -- n[1]=5` keeps [0]="3")
+		local v0 = M.scalar_value0(self, self:deref(name), b)
+		if v0 then
+			b.arr[0] = v0
 		end
 		b.s = nil
 		b.n = nil
@@ -14456,6 +14527,15 @@ function Shell:expand_param(pe, arg, arg2, idxnum)
 				M.assign_default_fail(self, self:deref(name), "readonly variable")
 			end
 			self:array_set(name, idxnum or 0, v)
+			if pe.via_eref then -- (through a nameref to an element: bash binds the NAMEREF,
+				-- which lands on the element, then substitutes the variable's value — the
+				-- base's element 0; with none it reads NULL and crashes: docs/bash-ub.md —
+				-- curse substitutes the stored element)
+				local k0 = self:is_assoc(name) and "0" or 0
+				if self:is_elem_set(name, k0) then
+					return self:array_get(name, k0)
+				end
+			end
 			return self:array_get(name, idxnum or 0) or v -- (as stored: -i / -u / -l applied)
 		end
 		-- a bare name that IS an array writes element 0 (bash), not a scalar shadow; the
@@ -15758,7 +15838,7 @@ function M.eval_run(sh, argv)
 	end
 	local ln = current_line(sh)
 	-- (set -v: the code's lines are echoed as the interpreter's reader reaches them)
-	local mod = not sh.opt_v and require("tier").try_fragment(code, ln > 0 and ln or nil, sh, nil, "eval")
+	local mod = not M.v_on(sh) and require("tier").try_fragment(code, ln > 0 and ln or nil, sh, nil, "eval")
 	if mod then
 		local sxd, iee = sh.xdepth, sh.ign_ee -- (eval'd commands trace one level deeper: `++ cmd`,
 		sh.xdepth = (sxd or 0) + 1 -- as b_eval; errexit-exempt, -e is cleared for them: M.report_exit)
@@ -15920,7 +16000,7 @@ function M.source_run(sh, argv, line)
 	-- what its text reads joins the program's: tier.note_text)
 	require("tier").note_text(sh, code)
 	-- (set -v: the file's lines are echoed as the interpreter's reader reaches them)
-	local mod = not M.source_empty(code) and not sh.opt_v and require("tier").try_fragment(code, nil, sh)
+	local mod = not M.source_empty(code) and not M.v_on(sh) and require("tier").try_fragment(code, nil, sh)
 	if not mod then -- alias / syntax error / uncompilable / empty: b_source runs the text it was handed
 		-- (never re-opening the file — a FIFO or /dev/stdin can only be read once)
 		sh.source_preread = { file = file, code = code }
@@ -16402,6 +16482,12 @@ function M.var_is_nameref(sh, nm)
 end
 function M.var_is_set(sh, nm, expanded)
 	local base, sub = nm:match("^([%a_][%w_]*)%[(.+)%]$")
+	if base and not sh:is_assoc(sh:deref(base)) and require("parser").subscript_close(nm, #base + 1) ~= #nm then
+		-- (not a valid_array_reference — its `[` doesn't close at the end as skipsubscript
+		-- reads it: `A["]` — so no variable by that name. An associative array's key, which
+		-- [[ -v ]]'s expansion quoted for it, is taken to the last `]`)
+		return false
+	end
 	if base then
 		local b = sh.vars[sh:deref(base)]
 		if (sub == "@" or sub == "*") and not sh:is_assoc(base) then -- `-v a[@]`: any element
@@ -16420,7 +16506,21 @@ function M.var_is_set(sh, nm, expanded)
 				key = require("interp")._int.array_key(sh, base, sub)
 			end
 		else
-			key = M.to_arr_key(M.arith_str(sh, sub))
+			-- ([[ -v ]]'s word was expanded already: its quotes are text — `A[\"0\"]` is an
+			-- error; test's subscript still expands)
+			if expanded and not M.looks_numeric(sub) then
+				local ok, v = pcall(require("interp").arith_eval_str, sh, sub, "let")
+				if not ok then -- (an arith error abandons the line, as bash's expression error)
+					require("parser").trap_flow(v)
+					if type(v) == "table" and v.__curse_matherr and not v.__curse_lineabort then
+						error({ __curse_exit = 1, __curse_lineabort = true }, 0)
+					end
+					error(v, 0)
+				end
+				key = M.to_arr_key(v)
+			else
+				key = M.to_arr_key(M.arith_str(sh, sub))
+			end
 		end
 		if M.neg_oob(sh, base, key) then -- (negative counts from the end; before the start: bash's
 			io.stderr:write("curse: " .. M.badsub_name(sh, base) .. ": bad array subscript\n") -- get_array_value error)
@@ -17140,6 +17240,10 @@ function M.arith_isnum(sh, name)
 	end -- i64-authoritative
 	return M.looks_numeric(sh:get(name)) ~= nil
 end
+-- …and for a positional parameter ($n in arithmetic)
+function M.param_isnum(sh, n)
+	return M.looks_numeric(sh:param(n)) ~= nil
+end
 -- Textual substitution of a non-numeric $name value into arithmetic (bash re-parses
 -- the value's TEXT). Dynamic — deferred to the interpreter bootstrap.
 function M.arith_textual(sh, raw)
@@ -17319,6 +17423,80 @@ end
 function M.assign_elem(sh, w)
 	return require("interp").expand_assign_word(sh, w)
 end
+-- The DEBUG and ERR trap runners, shared by both tiers (the compiled code calls rt.run_debug
+-- before a command, rt.fire_err_trap after a failing one; the interpreter binds the same
+-- functions). The handler text itself runs through the trap-handler runner (interp's
+-- run_trap: parse + run, or its compiled fragment).
+function M.run_debug(sh, line)
+	local h = sh.traps and sh.traps.DEBUG
+	if not h or h == "" or sh.in_debug or (sh.in_pipestage or 0) > 0 then
+		return
+	end
+	-- DEBUG doesn't reach into a subshell/command substitution unless functrace extends it.
+	-- (A function call hides it at entry instead — rt.debug_enter — so one the function
+	-- sets itself still fires in its body.)
+	if (sh.in_subprogram or 0) > 0 and not M.pseudo_trapped(sh, "DEBUG") then
+		return -- (one the subshell set itself is live there)
+	end
+	sh.in_debug = true
+	local saved = sh.status
+	if line then
+		sh.cur_line = line
+	end
+	local exited, rret = require("interp")._int.run_trap(sh, h, "debug trap")
+	local trap_status = sh.status
+	sh.status = saved
+	sh.in_debug = false
+	if rret then -- `return` in the DEBUG trap returns from the running function
+		error({ __curse_return = rret })
+	end
+	-- `exit` in a DEBUG trap exits the shell; a non-zero DEBUG return under errexit
+	-- also exits (skipping the command), matching bash.
+	if exited then
+		error({ __curse_exit = trap_status })
+	end
+	if sh.opt_e and trap_status ~= 0 then
+		error({ __curse_exit = trap_status })
+	end
+	-- shopt -s extdebug: a non-zero DEBUG status skips the command; 2 inside a function
+	-- or sourced file acts as a `return` from it (bash)
+	if trap_status ~= 0 and sh.shopt.extdebug then
+		if trap_status == 2 and ((sh.calldepth or 0) > 0 or (sh.sourcedepth or 0) > 0) then
+			error({ __curse_return = trap_status }) -- (the function returns 2: bash)
+		end
+		return true
+	end
+end
+
+function M.fire_err_trap(sh)
+	local h = sh.traps and sh.traps.ERR
+	-- ERR is not re-run inside a forked pipeline stage (bash fires it ONCE for the
+	-- whole pipeline, in the parent); errtrace still extends it to functions/subshells.
+	-- (not inherited by functions/subshells — but one SET in a function or subshell
+	-- fires there, as bash's trap is active in the context that set it)
+	-- (functions hide it on entry — rt.debug_enter; a subshell doesn't inherit it either)
+	-- (a stage skips only the INHERITED trap: one set inside the stage fires there)
+	local sp, ps = sh.in_subprogram or 0, sh.in_pipestage or 0
+	local errscope = sh.opt_errtrace or ((ps == 0 or ps == sh.err_trap_ps) and (sp == 0 or sp == sh.err_trap_sp))
+	if sh.err_skip then -- (the failing call set the trap itself: bash sampled none before it)
+		sh.err_skip = nil
+		return
+	end
+	if h and h ~= "" and not sh.in_err_trap and errscope then
+		sh.in_err_trap = true
+		local saved = sh.status
+		local exited, rret = require("interp")._int.run_trap(sh, h, "error trap")
+		local xst = sh.status
+		sh.status = saved
+		sh.in_err_trap = false
+		if exited then -- `exit` in the ERR trap exits the shell (_run_trap_internal)
+			error({ __curse_exit = xst })
+		end
+		if rret then -- `trap 'return N' ERR`: the failing command's function returns N
+			error({ __curse_return = rret })
+		end
+	end
+end
 function M.assign_elem_raw(sh, raw) -- (a subscript text read at run time: parser.reword)
 	return require("interp").expand_assign_word(sh, require("parser").reword(raw))
 end
@@ -17326,7 +17504,7 @@ end
 -- the command — raised as the pc it continues at, for the catcher of the CFG `cfg`
 -- (tier.run_compiled for `run`, rt.catch_dbgskip for a function's)
 function M.debug_x(sh, line, after, cfg)
-	if require("interp").run_debug(sh, line) then
+	if M.run_debug(sh, line) then
 		error({ __curse_dbgskip = after, cfg = cfg }, 0)
 	end
 end
@@ -17682,10 +17860,13 @@ do
 			end
 		end
 		sh.arrayargs_pending = {}
-		local wantassoc, inherit = false, sh.shopt.localvar_inherit
+		local wantassoc, wantarr, inherit = false, false, sh.shopt.localvar_inherit
 		for k = 2, #argv do
 			if argv[k]:match("^%-%a*A") then
 				wantassoc = true
+			end
+			if argv[k]:match("^%-%a*a") then
+				wantarr = true
 			end
 			if argv[k]:match("^%-%a*I") then
 				inherit = true
@@ -17703,6 +17884,22 @@ do
 				isassoc = sh:is_assoc(sh:deref(aa.name))
 			end
 			sh.arrayargs_pre[aa] = I.arrayassign_items(sh, aa, isassoc, wantassoc)
+			if glob and isassoc and not wantassoc and not wantarr and (sh.calldepth or 0) > 0
+				and (dcl == "declare" or dcl == "typeset") and not sh:is_local_anywhere(aa.name) then
+				-- `declare -g NAME=(…)` in a function over a global associative NAME (bash's
+				-- do_compound_assignment, mkglobal): the words are expanded and quoted for the
+				-- associative array, which is then converted to an INDEXED one
+				-- (convert_var_to_array) that takes them as they are — the quotes stay, and a
+				-- [key]'s quoted text is its arithmetic subscript
+				local q = {}
+				for i, it in ipairs(sh.arrayargs_pre[aa]) do
+					q[i] = { key = it.key ~= nil and "" or nil, xkey = it.key ~= nil and M.sh_single_quote(it.xkey or it.key) or nil,
+						op = it.op, val = it.val and M.sh_single_quote(it.val) or M.sh_single_quote(it.src or "") }
+				end
+				sh.arrayargs_pre[aa] = q
+				sh.arrayargs_pending.gconv = sh.arrayargs_pending.gconv or {}
+				sh.arrayargs_pending.gconv[aa.name] = true
+			end
 			if sh.opt_x then -- (`+ b=('4' '5 6')` as it expands: before a prefix assignment's
 				M.xtrace_arrlit(sh, aa.name, sh.arrayargs_pre[aa]) -- trace, and `+ declare -a b`)
 			end
@@ -17721,6 +17918,12 @@ do
 				if failed and not aaforce[aa.name] then
 				elseif aaskip and aaskip[aa.name] then
 				else
+					if pend.gconv and pend.gconv[aa.name] then -- (see sr_aa_pre: the associative
+						local b = sh.vars[sh:deref(aa.name)] -- array becomes an indexed one — an
+						if b and b.assoc then -- append's element 0 would be its hash table
+							b.assoc, b.order, b.arr = nil, nil, {} -- read as text: bash UB)
+						end
+					end
 					I.do_arrayassign(sh, aa)
 				end
 			end

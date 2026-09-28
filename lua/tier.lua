@@ -496,6 +496,39 @@ local HOT_LOOP = tonumber(os.getenv("CURSE_HOT_LOOP") or "") or 100
 -- own source text, and run in place of the rest of the interpreted loop. At the loop head
 -- that is exact: a while/until re-tests its condition, and a (( ; ; )) loop re-states
 -- its header without the init already run. Cached on the node (false: declined).
+-- A loop whose last line opens here-documents (`… done <<E`, `do cat <<E; done | sort`):
+-- their bodies follow that line, past the loop's own text — the fragment's text takes the
+-- following lines until the re-parse reads them all (no end-of-file warning), else it would
+-- run with the bodies missing.
+local function hd_eof(code)
+	local ok, ast = pcall(require("parser").parse, code)
+	if not ok then
+		require("parser").trap_flow(ast)
+		return false
+	end
+	for _, x in ipairs(ast.stmts or {}) do
+		if x.t == "warn" and tostring(x.msg):find("delimited by end-of-file", 1, true) then
+			return true
+		end
+	end
+	return false
+end
+local function with_bodies(code, srcs, s1)
+	local nl = srcs:find("\n", s1 + 1, true)
+	if not nl or not code:find("<<", 1, true) or not hd_eof(code) then
+		return code
+	end
+	local pos, n = nl + 1, #srcs
+	while pos <= n do
+		local e = srcs:find("\n", pos, true) or n + 1
+		code = code .. "\n" .. srcs:sub(pos, e - 1)
+		pos = e + 1
+		if not hd_eof(code) then
+			return code
+		end
+	end
+	return code
+end
 local function loop_fragment(st, sh)
 	-- (its text re-parses under the posix/extglob state it was READ under, st._pst — not
 	-- whatever is live by the time it's hot)
@@ -518,6 +551,7 @@ local function loop_fragment(st, sh)
 	else
 		return false
 	end
+	code = with_bodies(code, srcs, st._s1)
 	local mod = M.compile_fragment(code, st.line, mode, nil, st._pst)
 	if mod and st.t == "forin" then
 		-- entered at the loop's resume point, adopting the interpreter's list + position
