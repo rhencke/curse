@@ -15432,7 +15432,16 @@ function M.ansi_unescape(s, mode) -- ("z": as $'…', but kept whole past a \0)
 	return r
 end
 
-function Shell:echo(...)
+-- A builtin's output line (declare -p, alias, cd, help, …), printed as is: bash's builtins
+-- print with printf/puts, never through echo — under `shopt -s xpg_echo` a backslash in a
+-- value must not be taken as an escape, nor a leading `-n` as an option (fuzz F123/F124).
+function Shell:echo(s)
+	self.out(s == nil and "" or tostring(s))
+	return self:echo_end(false, false)
+end
+
+-- The `echo` builtin (compiled call sites, through Shell:echo_cmd).
+function Shell:echo_b(...)
 	-- echo [-neE] ARGS: -n suppresses the trailing newline, -e interprets backslash
 	-- escapes, -E disables them (bash). Same flag handling as the interp echo builtin,
 	-- so compiled and interpreted echo agree.
@@ -15477,6 +15486,10 @@ function Shell:echo(...)
 		s, stopped = M.ansi_unescape(s)
 	end -- \c stops all output (incl. the newline)
 	self.out(s)
+	return self:echo_end(nonl, stopped)
+end
+
+function Shell:echo_end(nonl, stopped)
 	if not nonl and not stopped then
 		self.out("\n")
 	end
@@ -15548,7 +15561,7 @@ end
 -- of a failed write. (Other builtins print through Shell:echo silently.)
 function Shell:echo_cmd(...)
 	self.write_err = nil
-	self:echo(...)
+	self:echo_b(...)
 	if self.write_err and (self.out == io.write or CO_OUTS[self.out]) then
 		self.status = 1
 		M.chkwrite_report(self, "echo", self.write_errmsg)
@@ -16749,7 +16762,9 @@ function M.int_value(sh, s, ev)
 	if short_digits(s) and (s:byte(1) ~= 48 or #s == 1) then -- (010 is octal)
 		return M.arith_num(s)
 	end
-	local ok, v = pcall(ev or M.arith_str, sh, s)
+	-- (the value is expansion output: a `$`/`` ` `` in it is a bad token, never expanded
+	-- again — `declare -i n; n='1+${x}'` is bash's `operand expected`)
+	local ok, v = pcall((s:find("[$`]") and require("interp").arith_expanded_eval) or ev or M.arith_str, sh, s)
 	if ok then
 		return v
 	end
@@ -17766,6 +17781,19 @@ function M.funcnest_over(sh, name)
 end
 -- One word's value in assignment context (no splitting, no globbing) through the shared
 -- word expander — for an array element the compiled renderers can't express natively.
+-- run f with a bad substitution naming `text` (the whole word bash expands; false: as is)
+function M.with_bs_word(sh, text, f)
+	if not text then
+		return f()
+	end
+	local sw, sd = sh.bs_word, sh.bs_depth
+	sh.bs_word, sh.bs_depth = text, sh.subdepth
+	local ok, e = pcall(f)
+	sh.bs_word, sh.bs_depth = sw, sd
+	if not ok then
+		error(e, 0)
+	end
+end
 function M.assign_elem(sh, w)
 	return require("interp").expand_assign_word(sh, w)
 end

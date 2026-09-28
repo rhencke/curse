@@ -417,7 +417,7 @@ local function arith(src, nodefer)
 				end
 				local raw = src:sub(i - 1, j - 1) -- "$" … "}"
 				i = j
-				return { k = "xpandleaf", raw = raw }
+				return { k = "xpandleaf", raw = raw, whole = src } -- (whole: a bad substitution names it)
 			end
 			return { k = "var", name = ident(), dollar = true } -- $name: value substituted textually (eval checks)
 		end
@@ -5353,7 +5353,9 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs, xg, bq
 						-- just a newline is an expression, evaluating to 0)
 						return nil
 					end
-					local ok, ast = pcall(arith, s)
+					-- (its leading blanks skipped, as make_arith_for_expr: a bad substitution in
+					-- it names `i = ${} `, not `  i = ${} `)
+					local ok, ast = pcall(arith, (s:gsub("^[ \t]+", "")))
 					if not ok then
 						trap_flow(ast)
 					end

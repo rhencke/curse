@@ -913,7 +913,18 @@ local function arith_expand_text(sh, raw, depth0) -- depth0: 1 = the text IS a s
 			if e > k and (nx == "(" or c == "`") then -- (a body numbers its lines from the
 				sh.cur_cline = rt.compiled_line(sh) or sh.cur_cline -- compiled caller's: rt.compiled_line)
 			end
-			local v = e > k and expand_word(sh, P.reword('"' .. chunk .. '"')) or chunk
+			local v = chunk
+			if e > k then -- (a bad substitution names the whole text, spaces kept: bash
+				-- expands it as ONE word — `(( ${} ))` is ` ${} : bad substitution`, fuzz F120)
+				local sw, sd = sh.bs_word, sh.bs_depth
+				sh.bs_word, sh.bs_depth = raw, sh.subdepth
+				local ok2, x2 = pcall(expand_word, sh, P.reword('"' .. chunk .. '"'))
+				sh.bs_word, sh.bs_depth = sw, sd
+				if not ok2 then
+					error(x2, 0)
+				end
+				v = x2
+			end
 			if e == k and c == "$" and depth > 0 and not depth0 then -- (a lone `$` in such a
 				v = "\\$" -- subscript is a literal character: quoted)
 			end
@@ -1199,7 +1210,15 @@ eval = function(sh, e)
 		return M.arith_textual_eval(sh, e.raw, sd)
 	end
 	if k == "xpandleaf" then -- an opaque ${…} operand: expand it; a non-numeric value must
-		local v = expand_word(sh, P.reword(e.raw)) -- take bash's textual substitution path
+		-- (a bad substitution names the whole expression, spaces kept — bash expands the
+		-- text as ONE word: `(( ${} ))` is ` ${} : bad substitution`, fuzz F120)
+		local sw, sd = sh.bs_word, sh.bs_depth
+		sh.bs_word, sh.bs_depth = e.whole, sh.subdepth
+		local ok, v = pcall(expand_word, sh, P.reword(e.raw)) -- take bash's textual substitution path
+		sh.bs_word, sh.bs_depth = sw, sd
+		if not ok then
+			error(v, 0)
+		end
 		if not looks_numeric(v) then
 			error({ __arith_textual = true })
 		end
@@ -1585,7 +1604,8 @@ array_key = function(sh, name, index_raw)
 				v = pe
 			end
 		end
-		if not (type(v) == "table" and v.__curse_matherr) then -- (an eval error already said so)
+		-- (an eval error, or an expansion's — `a[ ${} ]`'s bad substitution —, said so already)
+		if not (type(v) == "table" and (v.__curse_matherr or v.__curse_exit ~= nil)) then
 			io.stderr:write("curse: " .. P.arith_errmsg(index_raw, v) .. "\n")
 		end
 		-- an expansion error discards the rest of the top-level line (bash jump_to_top_level
@@ -2576,6 +2596,14 @@ multi_elems = function(sh, p) -- returns element list, star?
 			end
 		elseif pe.op == "@" and pe.arg == "A" and pe.name ~= "@" and pe.name ~= "*" then
 			-- ${a[@]@A}: the whole array as the declaration that recreates it (one word)
+			local dn = sh:deref(pe.name)
+			local b = sh.vars[dn]
+			if b and not b.arr and not sh:declared_unset(dn) then
+				-- a scalar (or a nameref's scalar target): bash's get_var_and_type makes w[@]
+				-- the variable itself, so @A is ${w@A}'s `[declare -AT ]w='v'` (fuzz F122)
+				local at = sh:attr_string(dn)
+				return { (at ~= "" and ("declare -" .. at .. " ") or "") .. dn .. "=" .. rt.shell_quote(sh:get(dn) or "") }, star
+			end
 			local d = M._int.fmt_decl(sh, pe.name)
 			if sh:declared_unset(pe.name) and sh:attr_string(pe.name) == "" then
 				d = nil -- (`declare v` alone: nothing to recreate)
@@ -3406,10 +3434,24 @@ local function arrayassign_items(sh, st, isassoc, ntilde)
 			local xkey
 			if isassoc then
 				xkey = expand_word(sh, notilde(P.reword(e.key))) -- (a subscript: never a tilde)
-			elseif e.key:find("[%$`]") then
-				xkey = expand_word(sh, P.reword(e.key))
+				items[#items + 1] = { key = e.key, xkey = xkey, op = e.op, val = expand_assign_word(sh, nt(e.word)), src = e.word.src }
+			else
+				-- (bash expands an indexed `[k]=v` as ONE word, its brackets quoted: a bad
+				-- substitution in it names `\[k\]=v`)
+				local sw, sd = sh.bs_word, sh.bs_depth
+				sh.bs_word, sh.bs_depth = "\\[" .. e.key .. "\\]" .. e.op .. e.word.src, sh.subdepth
+				local ok, v = pcall(function()
+					if e.key:find("[%$`]") then
+						xkey = expand_word(sh, P.reword(e.key))
+					end
+					return expand_assign_word(sh, nt(e.word))
+				end)
+				sh.bs_word, sh.bs_depth = sw, sd
+				if not ok then
+					error(v, 0)
+				end
+				items[#items + 1] = { key = e.key, xkey = xkey, op = e.op, val = v, src = e.word.src }
 			end
-			items[#items + 1] = { key = e.key, xkey = xkey, op = e.op, val = expand_assign_word(sh, nt(e.word)), src = e.word.src }
 		elseif isassoc then
 			-- a bare word in a keyed assoc literal: an error, reported as written and never
 			-- expanded (bash's assign_compound_array_list)
