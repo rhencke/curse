@@ -1425,3 +1425,52 @@ line as `ARG`, then `declare -p __v`.)
   through the echo builtin's code (Shell:echo), which then took `\\` as an escape; they now print
   lines as they are. test/cases/3363-builtin-output-xpg-echo.sh
 
+## Special triage (branch fuzz-hunt): the arith target's overnight backlog of unbucketed
+## "`:' expected for conditional expression" signatures
+
+`gram:arith`'s 2026-09-28 09:15 triage (`~/workspace/curse-wt/fuzz-docker/triage/20260928-091505`)
+left ~40 NEW crash signatures (plus 6 more mis-swept into the unrelated F101 "contains a
+quote" bucket — same root cause, different accidental bucket) all of the shape
+`target:arith:output|< S: line N: … (bash's own, specific message)|> S: line N: … \`:'
+expected for conditional expression (error token is …)`, e.g.:
+
+    target:arith:output|< N#: invalid integer constant (error token is X)|> N# : `:' expected for conditional expression (error token is X)
+    target:arith:output|< S: line N: X: invalid arithmetic operator (error token is X)|> S: line N: N?N/N{#… : `:' expected for conditional expression (error token is X)
+
+## F125. Arithmetic: text left over after a ternary's true branch is never re-lexed, so
+## bash's specific tokenizer error is replaced by a generic "expected ':'"
+
+    echo "$(( 1?2 3# ))"
+
+- bash: `S: line 1: 1?2 3#: invalid integer constant (error token is "3#")` — bash lexes the
+  whole expression before parsing it, so the malformed base-number token `3#` (a base with
+  no digits) is caught immediately, independent of where it falls relative to the `?`.
+- curse (interp, compiled, tiered, and the static `build/curse` binary, all identically):
+  `S: line 1: 1?2 3# : \`:' expected for conditional expression (error token is "3# ")` —
+  `parseExpr`'s ternary arm (`lua/parser.lua` ~line 700) parses the true branch with its own
+  recursive `parseExpr`, which stops cleanly after `2` (the token `3#` doesn't look like a
+  binary operator, so the inner loop just returns); back in the ternary caller, `eat(":")`
+  fails (the cursor sits on `3#`, not `:`), and the code reports the ternary's own generic
+  diagnosis (`aerr("`:' expected for conditional expression", …)`) using the unconsumed
+  tail as `lookahead(a)`'s error token — never re-lexing that tail to see *why* it isn't a
+  colon, so bash's real complaint about `3#` itself is lost. The reported error token also
+  picks up a trailing space that isn't part of the token (`"3# "` vs bash's `"3#"`).
+  Confirmed fresh in the container with `cmp.sh` (interp/compiled/tiered/static all agree
+  with each other and disagree with bash identically):
+  `interp/compiled/tiered/static: S: line 1: 1?2 3# : \`:' expected for conditional expression (error token is "3# ")`.
+  Reduced from the campaign's `gram-arith` crash `id:000270` (original 2-line fuzz input
+  `2**63-ba?c^iranges` / `10#`, i.e. `2**63-ba?c^iranges\n10#` with the embedded newline
+  acting as whitespace) down to the 6-byte expression `1?2 3#`; the `2 ` before the bad
+  token is required — `1?3#` (nothing between `?` and the bad token) does not reproduce,
+  because there the ternary's true-branch `parseExpr` call fails on `3#` immediately as its
+  *first* token instead of stopping cleanly after a prior operand.
+  Not ternary-specific: the same defect (unconsumed trailing text never re-lexed) also
+  fires with no `?` at all — `echo "$(( 2 3# ))"` — curse says `syntax error in expression
+  (error token is "3# ")` where bash says `invalid integer constant (error token is "3#")`;
+  recorded here rather than as a second finding since it's the same root cause, just a
+  different generic fallback message (ternary vs top-level) for the same "leftover token
+  after a clean sub-parse" gap. Other malformed trailing tokens reproduce the same ternary
+  variant with bash's other specific lexer messages in place of "invalid integer constant",
+  e.g. `echo "$(( 1?2 { ))"` -> bash `syntax error: invalid arithmetic operator (error token
+  is "{ ")`, curse still `\`:' expected for conditional expression`.
+
