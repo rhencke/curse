@@ -2190,7 +2190,8 @@ local function parse_dquote(inner, add, heredoc, bt_keep)
 			-- ends on — csnl: the newlines from the `$(` — then DISCARD)
 			if heredoc == true and inner:byte(i + 1) == 40 and not (inner:byte(i + 2) == 40 and dparen_is_arith(inner, i + 3))
 				and not pcall(scan_cmdsub, inner, i + 2) then
-				add({ cserr = M.open_comsub_err(inner:sub(i + 2)), csnl = select(2, inner:sub(i):gsub("\n", "")), q = true })
+				local ce, cl, ct = M.open_comsub_err(inner:sub(i + 2))
+				add({ cserr = ce, csnl = select(2, inner:sub(i):gsub("\n", "")), csline = cl, cstext = ct, q = true })
 				return
 			end
 			-- (a heredoc body's ${x-word} keeps a $'…' in word literal — bash; so does a
@@ -2782,20 +2783,23 @@ end
 -- pexp default expansion and the compiled tier so both render such a default identically.
 -- The error bash's xparse_dolparen reports for a $( whose `)` never comes (BODY: the text
 -- after it, to the end of the word): the body's own syntax error, else the missing `)'.
+-- (2nd, 3rd results: a syntax error's line in the body, 1-based, and the text bash echoes
+-- for it — parse_comsub met it before running out of input: `$( fi` reports the `fi`)
 function M.open_comsub_err(body)
 	local ok, ast = pcall(M.parse, body)
 	local err = not ok and (type(ast) == "table" and ast.msg or tostring(ast)) or nil
+	local eline, etext = nil, nil
 	for _, st in ipairs(ok and ast.stmts or {}) do
 		if st.t == "parse_error" and not st.recoverable then
-			err = tostring(st.msg)
+			err, eline, etext = tostring(st.msg), st.line, st.text
 			break
 		end
 	end
 	err = err and unpos(err)
 	if err == "syntax error: unexpected end of file" then -- (the body ran out inside a
-		err = nil -- construct: parse_comsub's own EOF — the `)' it was looking for)
+		err, eline = nil, nil -- construct: parse_comsub's own EOF — the `)' it was looking for)
 	end
-	return err or "unexpected EOF while looking for matching `)'"
+	return err or "unexpected EOF while looking for matching `)'", eline, etext
 end
 function M.parse_default_quoted(txt, heredoc)
 	local out, k, m, inq = {}, 1, #txt, false

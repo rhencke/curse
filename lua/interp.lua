@@ -1892,7 +1892,17 @@ expand_part_str = function(sh, p, assign)
 		local fl, ip, pl = sh.force_line, sh.in_perr, sh.perr_label
 		sh.in_perr, sh.perr_label = true, "command substitution"
 		sh.force_line = (fl or rt.current_line(sh)) + 1 + (p.csnl or 0)
-		sherr(sh, "curse: " .. p.cserr .. "\n")
+		if p.csline then -- (a here-document's: a syntax error the parser met in the body is
+			-- reported at its line — counted from the line after the command — as the reader's
+			-- are: `near unexpected token`, then the line's text)
+			sh.force_line = sh.force_line - (p.csnl or 0) + p.csline - 1
+			sherr(sh, "curse: " .. p.cserr:gsub("^syntax error near `", "syntax error near unexpected token `") .. "\n")
+			if p.cstext then
+				sherr(sh, "curse: `" .. p.cstext .. "'\n")
+			end
+		else
+			sherr(sh, "curse: " .. p.cserr .. "\n")
+		end
 		sh.in_perr, sh.perr_label, sh.force_line = ip, pl, fl
 		-- (reader_loop's DISCARD: a status already non-zero — the last substitution's — stays)
 		error({ __curse_exit = sh.status ~= 0 and sh.status or 1, __curse_lineabort = true, __curse_keepst = true })
