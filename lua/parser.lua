@@ -72,7 +72,10 @@ local function arith(src, nodefer)
 	-- bash does). Only when the expression has no ${…}/$(…)/`…` to expand as a whole.
 	-- (not in "let" mode — already-expanded text or a variable's value: `$"3"` stays bad)
 	local dtxt -- (the text with those `$` dropped: what bash's errors show)
-	if nodefer ~= "let" and not (src:find("%${") or src:find("%$%(") or src:find("`")) and src:find("$", 1, true) then
+	-- (only in SOURCE text: expansion output — "strict", "expanded" — keeps a `$` before a quote,
+	-- as bash's error shows it: `a[$\"]` evaluates `$"`)
+	if nodefer ~= "let" and nodefer ~= "strict" and nodefer ~= "expanded"
+		and not (src:find("%${") or src:find("%$%(") or src:find("`")) and src:find("$", 1, true) then
 		-- (a `$` INSIDE "…" is just a character: `"$"@` is the text `$@`)
 		local out, k, n, indq, qdollar = {}, 1, #src, false, false
 		while k <= n do
