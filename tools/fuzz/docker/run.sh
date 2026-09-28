@@ -4,7 +4,7 @@
 #   run.sh campaign | triage [SINCE] | exec CMD...   (exec: a command in the same container,
 #                                                  e.g. the containment probes)
 # Env (the fuzz knobs pass through): FUZZ_SECONDS FUZZ_INSTANCES FUZZ_JOBS FUZZ_TRIAGE_MAX
-#   GRAM_COUNT GRAM_TIMEOUT_MS AFL_CUSTOM_MUTATOR_ONLY
+#   GRAM_COUNT GRAM_TIMEOUT_MS AFL_CUSTOM_MUTATOR_ONLY FUZZ_TLOOP
 #   FUZZ_DOCKER_OUT   the ONE writable host directory (default FUZZ_WORK, BUILD/fuzz-work):
 #                     fuzz.sh's state (seeds, queues, triage; /fuzz-work inside) + the lock
 #   FUZZ_DOCKER_SLACK seconds allowed on top of FUZZ_SECONDS for seeds + triage (3600)
@@ -84,7 +84,7 @@ for p in "$FUZZ_BASH_SRC" "$FUZZ_OIL_SPEC" "$FUZZ_BIN" "$FUZZ_LUAJIT" "$FUZZ_CUR
 done
 envs=()
 for v in FUZZ_SECONDS FUZZ_INSTANCES FUZZ_JOBS FUZZ_TRIAGE_MAX FUZZ_DEFAULT_SECONDS \
-         GRAM_COUNT GRAM_TIMEOUT_MS AFL_CUSTOM_MUTATOR_ONLY FUZZ_DOCKER_MAXKB; do
+         GRAM_COUNT GRAM_TIMEOUT_MS AFL_CUSTOM_MUTATOR_ONLY FUZZ_DOCKER_MAXKB FUZZ_TLOOP; do
   [ -n "${!v+x}" ] && envs+=(-e "$v=${!v}")
 done
 
