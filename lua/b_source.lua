@@ -31,6 +31,7 @@ local function builtin(sh, cmd, args, hook, tcb)
 		local dsave -- (the DEBUG trap, hidden while the file runs: rt.source_debug_hide)
 		local e0 = sh.traps and sh.traps.ERR -- (the ERR trap before it: rt.source_err_sample)
 		local rret -- (a `return N` ending the file: $? once the RETURN trap has run)
+		local noexec -- (`set -n` ran in the file: read on to its end, then unwind — b_set)
 		if not name then
 			io.stderr:write("curse: " .. cmd .. ": filename argument required\n" .. rt.usage(cmd))
 			sh.status = 2
@@ -96,7 +97,7 @@ local function builtin(sh, cmd, args, hook, tcb)
 					local iee = sh.ign_ee -- (errexit-exempt: -e cleared for the file, as eval does)
 					sh.ign_ee = iee or sh.noerr > 0
 					local sbl = sh.base_line -- (each line group of the file: rt.compound_line)
-					local rok, err = rt.nest_pcall(sh, function()
+					local rok, err = rt.nest_pcall(sh, function() -- (noexec: `set -n` ran — read on, then unwind)
 						local nextf = P.open(src, sh)
 						local vst = {}
 						local ran = false -- (a command ran before a syntax error: not fatal — rt.perr_lead)
@@ -129,6 +130,9 @@ local function builtin(sh, cmd, args, hook, tcb)
 								local ne0 = sh.noerr
 								local pf0 = sh.procsub_files and #sh.procsub_files or 0
 								local sok, serr = pcall(exec_list, sh, { st }, hook, false)
+								if not sok and type(serr) == "table" and serr.__curse_noexec then
+									sh.status, sh.noerr, noexec, sok = 0, ne0, serr, true
+								end
 								if not sok then
 									if type(serr) == "table" and serr.__curse_lineabort and not serr.__curse_discard then
 										if rt.lineabort_exits(sh, serr) then
@@ -190,6 +194,9 @@ local function builtin(sh, cmd, args, hook, tcb)
 		end
 		rt.source_debug_restore(sh, dsave)
 		rt.source_err_sample(sh, e0)
+		if noexec then
+			error(noexec, 0)
+		end
 	end
 end
 rt.SRC_FRAMES[builtin] = true -- (it sets sh.cur_source: the error label stops here)

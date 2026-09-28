@@ -7009,6 +7009,10 @@ local function run_group(sh, lg, hook, k)
 		hook("stmt", k)
 		local ne0, pf0 = sh.noerr, sh.procsub_files and #sh.procsub_files or 0
 		local ok, err = pcall(exec_stmt, sh, st, hook)
+		if not ok and type(err) == "table" and err.__curse_noexec and not rt.in_subshell(sh) then
+			sh.status, sh.noerr = 0, ne0 -- (`set -n` below the top level: the rest is only read)
+			ok = true
+		end
 		if not ok then
 			-- a fatal WORD-context expansion (div0 in $((…)), failglob no-match) aborts
 			-- the REST of this line; under `set -e` it exits the shell like any failure

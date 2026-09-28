@@ -67,6 +67,7 @@ return function(sh, cmd, args, hook, tcb)
 				local iee = sh.ign_ee
 				sh.ign_ee = iee or sh.noerr > 0
 				local sbl = sh.base_line -- (each line group of the text: rt.compound_line)
+				local noexec -- (`set -n` ran in it: the rest is only read — then it unwinds on)
 				local ok, err = rt.nest_pcall(sh, function()
 					local ln = rt.current_line(sh)
 					local nextf = eval_groups(sh, code, ln) or P.open(code, sh, ln > 0 and ln or nil)
@@ -104,6 +105,9 @@ return function(sh, cmd, args, hook, tcb)
 							local ne0 = sh.noerr
 							local pf0 = sh.procsub_files and #sh.procsub_files or 0
 							local sok, serr = pcall(exec_list, sh, { st }, hook, false) -- errexit + signals incl.
+							if not sok and type(serr) == "table" and serr.__curse_noexec then
+								sh.status, sh.noerr, noexec, sok = 0, ne0, serr, true
+							end
 							if not sok then
 								if type(serr) == "table" and serr.__curse_lineabort and not serr.__curse_discard then
 									if rt.lineabort_exits(sh, serr) then
@@ -129,6 +133,9 @@ return function(sh, cmd, args, hook, tcb)
 				if not ok then
 					error(err)
 				end -- control-flow (exit/return/…) or a real error
+				if noexec then
+					error(noexec, 0)
+				end
 			else
 				sh.status = 0
 			end

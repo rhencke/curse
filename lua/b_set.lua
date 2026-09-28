@@ -22,6 +22,7 @@ end
 return function(sh, cmd, args, hook, tcb)
 	if cmd == "set" then
 		-- set [-e|+e|-o NAME|+o NAME|…] [--] [ARGS…]: options then positional params
+		local n0 = sh.opt_n
 		if #args == 1 then -- bare `set` (and bare `declare`): all shell variables, sorted by
 			-- name, then — outside posix mode — every function's definition (bash's set_builtin)
 			local names, virt = {}, {}
@@ -176,5 +177,14 @@ return function(sh, cmd, args, hook, tcb)
 			sh.nparams = n
 		end
 		sh.status = status
+		if sh.opt_n and not n0 and not sh.opt_i then
+			-- noexec: a non-interactive shell executes nothing more — every later command
+			-- (bash's execute_command_internal: read_but_dont_execute) is skipped, even the
+			-- rest of the function, loop or eval text this `set` ran in. Unwind as an
+			-- `exit 0` would (a subshell ends there, status 0; its EXIT trap's commands are
+			-- skipped too), but the top level catches it and goes on only reading, for its
+			-- syntax errors (interp's run_group, tier.run_compiled).
+			error({ __curse_exit = 0, __curse_noexec = true }, 0)
+		end
 	end
 end
