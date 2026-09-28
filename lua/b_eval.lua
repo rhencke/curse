@@ -79,7 +79,7 @@ return function(sh, cmd, args, hook, tcb)
 						if sh.jobs_waited or sh.jobs_pending then -- (reading a line: notify_and_cleanup)
 							rt.jobs_line(sh)
 						end
-						if sh.opt_v and lg.pline then
+						if lg.pline then
 							require("interp").v_echo(sh, code, lg.pline - (ln > 0 and ln or 1) + 1, vst)
 						end
 						if lg.perr then -- syntax error on the line: run nothing on it (bash), status 2

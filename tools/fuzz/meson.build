@@ -32,6 +32,8 @@ if afl_cc.found() and afl_fuzz.found()
     fuzz_env += {'FUZZ_ORACLE': oracle_bash.full_path()}
   endif
   run_target('fuzz', command: [fuzz_sh, 'campaign'], depends: fuzz_deps, env: fuzz_env)
+  # (the same campaign in a hardened container, one per host: docker/run.sh, README "Docker")
+  run_target('fuzz-docker', command: [files('docker/run.sh'), 'campaign'], depends: fuzz_deps, env: fuzz_env)
   run_target('fuzz-triage', command: [fuzz_sh, 'triage'], depends: fuzz_deps, env: fuzz_env)
 else
   message('afl-cc/afl-fuzz not found: the `fuzz` target only explains how to get them (AFL++)')

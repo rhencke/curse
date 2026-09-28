@@ -54,6 +54,10 @@ static void sbx_limits(void)
   r.rlim_cur = r.rlim_max = 1 << 20;           setrlimit(RLIMIT_FSIZE, &r);
   r.rlim_cur = r.rlim_max = 0;                 setrlimit(RLIMIT_CORE, &r);
   r.rlim_cur = r.rlim_max = (rlim_t)2 << 30;   setrlimit(RLIMIT_AS, &r);
+  /* (per uid per user namespace: every exec's processes, the script's forks included,
+   * plus the few of its fuzz instance / triage run; a fork bomb stops here instead of at
+   * the container's pids limit, where it would starve AFL and the watchdog too) */
+  r.rlim_cur = r.rlim_max = 256;               setrlimit(RLIMIT_NPROC, &r);
 }
 
 /* Empty DIR/w (the previous exec's files) without following symlinks. */

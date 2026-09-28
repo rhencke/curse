@@ -21,7 +21,8 @@ case $mode in
 esac
 # (the crash re-runs in harness-plain: one fork per input, never the persistent loop -- a
 # targeted crash that doesn't reproduce here needed the loop's earlier inputs: no-repro)
-o=$( (ulimit -f 2048; exec unshare -Ur env FUZZ_SBX="$D" "${menv[@]}" timeout -k 2 $tmo "$B/harness-plain") < "$f" 2>&1 >/dev/null); rc=$?
+# (own user+pid namespace: a `kill -9 -1` reaches only this run)
+o=$( (ulimit -f 2048; exec unshare -Urpf --kill-child env FUZZ_SBX="$D" "${menv[@]}" timeout -k 2 $tmo "$B/harness-plain") < "$f" 2>&1 >/dev/null); rc=$?
 if [ $rc = 124 ] || [ $rc = 137 ]; then sig="TIMEOUT(${tmo}s)"
 elif [ $rc != 134 ]; then sig="no-repro(rc=$rc)"
 elif l=$(printf '%s\n' "$o" | grep -a -m1 -E '^FUZZ-ORACLE (tiers:|target )'); [ -n "$l" ]; then

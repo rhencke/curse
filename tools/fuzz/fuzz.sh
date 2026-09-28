@@ -40,8 +40,12 @@ say() { echo "fuzz: $*"; }
 # Run a command as pid 1's child in a fresh user+pid namespace: a stray `kill -1` or an
 # orphaned background job of a fuzzed script stays inside it, and dies with it. The
 # namespace's init reaps orphans and forwards SIGTERM (the deadline) to the command.
+# (FUZZ_NS_PROC=0, set by docker/run.sh: no private /proc -- Docker over-mounts parts of
+# /proc, and the kernel refuses a fresh proc mount in a user namespace while any of it is
+# hidden. The pid namespace itself, what contains `kill -1`, doesn't need one.)
 in_ns() {
-  unshare -Urpf --mount-proc --kill-child=TERM \
+  local proc=--mount-proc; [ "${FUZZ_NS_PROC:-1}" = 0 ] && proc=
+  unshare -Urpf $proc --kill-child=TERM \
     bash -c 'trap "kill -INT \$p 2>/dev/null" TERM; "$@" & p=$!; while kill -0 $p 2>/dev/null; do wait $p; done; wait $p' ns-init "$@"
 }
 
