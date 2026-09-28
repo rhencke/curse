@@ -6756,7 +6756,16 @@ local function run_signal(sh, signum, direct, nested)
 		chld_again = true
 		return
 	end
-	if not direct and (rt.defer_loading(sh, signum) or rt.defer_signal(sh, signum)) then
+	if not direct and rt.defer_loading(sh, signum) then
+		return -- (runs once the module has loaded)
+	end
+	if not direct and rt.sync_signal(sh, signum) then
+		return -- (the running in-process subshell raised it against itself: its own)
+	end
+	if not direct and not nested and rt.termsig_unwind(sh, signum) then
+		return -- (never: it unwinds the in-process contexts, then the shell dies of it)
+	end
+	if not direct and rt.defer_signal(sh, signum) then
 		return -- (the parent's: runs once the in-process subshell has ended)
 	end
 	local h = sh.traps and sh.traps["SIG" .. (NUMSIG[signum] or "")]
@@ -6848,6 +6857,9 @@ local function finish(sh, ok, err)
 			sh.status = err.__curse_exit
 		elseif type(err) == "table" and err.__curse_return then
 			sh.status = err.__curse_return
+		elseif type(err) == "table" and err.__curse_termsig_unwind then
+			rt.termsig(sh, err.__curse_termsig_unwind) -- (every in-process context undone:
+			return -- rt.termsig_unwind; the EXIT trap, then death by it)
 		elseif type(err) == "table" and (err.__curse_break or err.__curse_continue) then
 			-- (a break/continue out past every loop — a level an empty `select` left counted:
 			-- bash's `breaking` then skips each command to the end of the input)

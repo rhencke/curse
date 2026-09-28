@@ -32,6 +32,11 @@
 #define CURSE_NSIG 65
 static volatile sig_atomic_t curse_sig_pend[CURSE_NSIG];
 static volatile pid_t curse_sig_pid;         /* pid that scheduled the hook (fork guard) */
+static volatile sig_atomic_t curse_sig_down; /* the VM is being closed: curse_sig_shutdown */
+/* Did the last delivery of each signal come from this process itself -- the kernel on
+ * its behalf (SI_KERNEL: RLIMIT_CPU's SIGXCPU) or a SI_USER send whose sender is us
+ * (a write's SIGPIPE / SIGXFSZ: send_sig(sig, current))? curse_sig_fromself. */
+static volatile sig_atomic_t curse_sig_self[CURSE_NSIG];
 
 extern lua_State *curse_globalL(void);  /* luajit.c */
 
@@ -191,7 +196,9 @@ static void curse_kick_quiesce(int s)
   sigaddset(&one, s);
   sigprocmask(SIG_BLOCK, &one, &old);
   curse_kick_disarm(s);
-  while (sigtimedwait(&one, &si, &zero) == s) {
+  /* (already blocked: a pending one is its blocker's -- the scheduler keeps SIGPIPE
+   * blocked and takes the EPIPE writes' SIGPIPE itself -- never a trap's) */
+  while (!sigismember(&old, s) && sigtimedwait(&one, &si, &zero) == s) {
     if (!(si.si_code == SI_TIMER && si.si_value.sival_int == CURSE_KICK_COOKIE)) {
       curse_sig_pend[s] = 1;
       curse_sig_pid = getpid();
@@ -204,7 +211,7 @@ static void curse_kick_quiesce(int s)
 static void curse_sig_onsignal(int s, siginfo_t *si, void *uc)
 {
   (void)uc;
-  if (s <= 0 || s >= CURSE_NSIG) return;
+  if (s <= 0 || s >= CURSE_NSIG || curse_sig_down) return;
   if (si && si->si_code == SI_TIMER && si->si_value.sival_int == CURSE_KICK_COOKIE) {
     /* The re-kick: nothing new arrived. */
     if (curse_sig_pend[s] && curse_sig_pid == getpid()) {
@@ -213,12 +220,44 @@ static void curse_sig_onsignal(int s, siginfo_t *si, void *uc)
     }
     return;
   }
+  curse_sig_self[s] = si && (si->si_code == SI_KERNEL
+                              || (si->si_code == SI_USER && si->si_pid == getpid()));
   curse_sig_pend[s] = 1;
   curse_sig_pid = getpid();
   curse_sig_schedule();
   curse_kick_n[s] = 0;
   curse_kick_arm(s);
 }
+
+int curse_sig_fromself(int s)
+{
+  return s > 0 && s < CURSE_NSIG && curse_sig_self[s];
+}
+
+/* Is `s` delivered and its hook not yet run -- and drop it (the shell took it at the
+ * failed write itself: runtime.lua M.sync_write_error, when a JIT trace kept the hook
+ * from running first). */
+int curse_sig_pending(int s)
+{
+  return s > 0 && s < CURSE_NSIG && curse_sig_pend[s] && curse_sig_pid == getpid();
+}
+
+void curse_sig_drop(int s)
+{
+  sigset_t all, old;
+  if (s <= 0 || s >= CURSE_NSIG) return;
+  sigfillset(&all);
+  sigprocmask(SIG_BLOCK, &all, &old);
+  curse_sig_pend[s] = 0;
+  curse_kick_disarm(s);
+  sigprocmask(SIG_SETMASK, &old, (sigset_t *)0);
+}
+
+/* What curse last made of each signal's disposition: 0 not known yet, 1 SIG_DFL,
+ * 2 curse's handler standing in for SIG_DFL (curse_sig_emulate), 3 caught (a trap),
+ * 4 ignored. Every change goes through curse_sig_catch/default/ignore. */
+static signed char curse_disp[CURSE_NSIG];
+
 
 /* Install curse's async handler for signal `s` (no SA_RESTART -> blocking syscalls
  * EINTR), and its re-kick timer. */
@@ -238,7 +277,9 @@ int curse_sig_catch(int s)
   sa.sa_sigaction = curse_sig_onsignal;
   sigemptyset(&sa.sa_mask);
   sa.sa_flags = SA_SIGINFO;
-  return sigaction(s, &sa, (struct sigaction *)0);
+  if (sigaction(s, &sa, (struct sigaction *)0) != 0) return -1;
+  if (s > 0 && s < CURSE_NSIG) curse_disp[s] = 3;
+  return 0;
 }
 
 /* Restore the default disposition for `s`. */
@@ -248,7 +289,9 @@ int curse_sig_default(int s)
   curse_kick_quiesce(s);
   memset(&sa, 0, sizeof sa);
   sa.sa_handler = SIG_DFL;
-  return sigaction(s, &sa, (struct sigaction *)0);
+  if (sigaction(s, &sa, (struct sigaction *)0) != 0) return -1;
+  if (s > 0 && s < CURSE_NSIG) curse_disp[s] = 1;
+  return 0;
 }
 
 /* Ignore `s` (bash `trap '' SIG`). */
@@ -258,7 +301,35 @@ int curse_sig_ignore(int s)
   curse_kick_quiesce(s);
   memset(&sa, 0, sizeof sa);
   sa.sa_handler = SIG_IGN;
-  return sigaction(s, &sa, (struct sigaction *)0);
+  if (sigaction(s, &sa, (struct sigaction *)0) != 0) return -1;
+  if (s > 0 && s < CURSE_NSIG) curse_disp[s] = 4;
+  return 0;
+}
+
+/* The signals a process raises against ITSELF -- a write's SIGPIPE (dead reader) and
+ * SIGXFSZ (past RLIMIT_FSIZE), RLIMIT_CPU's SIGXCPU -- must end only the in-process
+ * subshell that caused them (a forked subshell dies alone; stress-attack S5/S21/S24).
+ * With the default disposition the kernel would kill the whole shell, so while such a
+ * signal's disposition is SIG_DFL curse's handler stands in for it: the shell decides
+ * (runtime.lua M.sync_signal) -- the running in-process subshell dies by it (or runs its
+ * own trap), and outside of one the shell itself dies by it, as SIG_DFL would. A
+ * trapped or ignored signal is left alone. Returns 1 when `s` is (now) emulated.
+ * Costs no syscall once the disposition is known (curse_disp). */
+int curse_sig_emulate(int s)
+{
+  if (s <= 0 || s >= CURSE_NSIG) return 0;
+  if (curse_disp[s] == 0) {
+    struct sigaction cur;
+    if (sigaction(s, (struct sigaction *)0, &cur) != 0) return 0;
+    curse_disp[s] = cur.sa_handler == SIG_DFL ? 1 : cur.sa_handler == SIG_IGN ? 4 : 3;
+  }
+  if (curse_disp[s] == 1 && curse_sig_catch(s) == 0) curse_disp[s] = 2;
+  return curse_disp[s] == 2;
+}
+
+int curse_sig_emulated(int s)
+{
+  return s > 0 && s < CURSE_NSIG && curse_disp[s] == 2;
 }
 
 /* Discard a pending scheduled trap: clear the recorded signal and remove the VM
@@ -300,6 +371,7 @@ static volatile int curse_preempt_flag;
 static void curse_preempt_onsignal(int s)
 {
   (void)s;
+  if (curse_sig_down) return;
   curse_preempt_flag = 1;
 #ifdef CURSE_SIG_DESTRUCTIVE
   /* Only the running loop's head: the flag is re-read at every loop head,
@@ -360,6 +432,95 @@ int curse_preempt_arm(long usec)
     ts.it_value.tv_nsec = (usec % 1000000) * 1000;
     return timer_settime(curse_preempt_timer, 0, &ts, (struct itimerspec *)0);
   }
+}
+
+/* The trapped signals the Lua side HOLDS to raise again later (runtime.lua: one that
+ * arrives while an in-process subshell, a $(...) body, a module load or a foreground
+ * command runs -- set 0 -- or while a scheduler task runs -- set 1). Trap-running code
+ * (inside the VM hook) adds to them; ordinary code takes them -- and the hook can
+ * preempt ordinary code at ANY VM instruction. A Lua read-check-clear of a shared
+ * table (`if held then local d = held; held = nil ...`) was split by a trap that took
+ * the set itself (its own $(...) ended and flushed), leaving the outer taker to index
+ * nil ("attempt to index local 'd'", stress-attack S1) -- or to run a held signal
+ * twice. One C call is one step the hook can't split (it fires only between VM
+ * instructions, and the async handler never touches these), so each operation here is
+ * atomic w.r.t. every trap. Inherited across fork, as the Lua table was. */
+static uint64_t curse_held_set[2];
+
+void curse_held_add(int set, int s)
+{
+  if (set >= 0 && set < 2 && s > 0 && s < CURSE_NSIG)
+    curse_held_set[set] |= (uint64_t)1 << (s - 1);
+}
+
+/* Take (clear and return) the lowest held signal of `set`; 0: none. */
+int curse_held_take(int set)
+{
+  uint64_t m;
+  if (set < 0 || set >= 2 || !(m = curse_held_set[set])) return 0;
+  curse_held_set[set] = m & (m - 1);
+  return __builtin_ctzll(m) + 1;
+}
+
+/* Take the whole set: out[s] = 1 for each held signal s (1..64); returns how many. A
+ * flush takes them all at once, as bash's run_pending_traps walks the pending set: a
+ * trap it runs that flushes in turn (its compile's hold ending) finds nothing left to
+ * run ahead of the others. */
+int curse_held_takeall(int set, unsigned char *out)
+{
+  uint64_t m;
+  int s, n = 0;
+  if (set < 0 || set >= 2) return 0;
+  m = curse_held_set[set];
+  curse_held_set[set] = 0;
+  for (s = 1; s < CURSE_NSIG; s++) {
+    out[s] = (unsigned char)((m >> (s - 1)) & 1);
+    n += out[s];
+  }
+  return n;
+}
+
+/* Take `s` alone out of `set`: 1 when it was held. */
+int curse_held_del(int set, int s)
+{
+  uint64_t bit;
+  if (set < 0 || set >= 2 || s <= 0 || s >= CURSE_NSIG) return 0;
+  bit = (uint64_t)1 << (s - 1);
+  if (!(curse_held_set[set] & bit)) return 0;
+  curse_held_set[set] &= ~bit;
+  return 1;
+}
+
+int curse_held_any(int set)
+{
+  return set >= 0 && set < 2 && curse_held_set[set] != 0;
+}
+
+/* The VM is about to be closed (luajit.c main, once an error escaped the shell or a
+ * Lua program ended): no handler may touch it again. lua_close frees the global state
+ * and unmaps the allocator's arenas and the machine code, while a signal storm keeps
+ * arriving (and each caught signal still pending re-kicks itself, up to every 100ms):
+ * the handler's lua_sethook on the freed globalL (g->hookmask, lj_dispatch_update's
+ * dispatch table) and its trace patching wrote into freed/unmapped memory -- the
+ * SIGSEGV that followed a Lua error escaping the shell (stress-attack S1). Every
+ * signal stays blocked until the process exits (its failure status stands), the
+ * timers are disarmed, and the handlers turn inert. */
+void curse_sig_shutdown(void)
+{
+  sigset_t all;
+  struct itimerval it;
+  int s;
+  sigfillset(&all);
+  sigprocmask(SIG_BLOCK, &all, (sigset_t *)0);
+  curse_sig_down = 1;
+  for (s = 1; s < CURSE_NSIG; s++) curse_kick_disarm(s);
+  if (curse_preempt_tpid == getpid()) {
+    struct itimerspec ts;
+    memset(&ts, 0, sizeof ts);
+    timer_settime(curse_preempt_timer, 0, &ts, (struct itimerspec *)0);
+  }
+  memset(&it, 0, sizeof it);
+  setitimer(ITIMER_VIRTUAL, &it, (struct itimerval *)0);
 }
 
 /* printf's floating conversions the way bash does them: the argument parsed as a long
