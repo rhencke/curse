@@ -1291,3 +1291,22 @@ losing its `line N:` prefix, turned out to already be fixed by that merge's
   spaces) — a narrower case than F33 (`${}` alone): F33's fix only normalizes `${}` with no
   space before the following text, so `${} ` (a trailing space before the closer) still
   disagrees. (gram:tiered queue)
+
+## Campaign 2 (gram:tiers + gram:parse, containerized), branch fuzz-night
+
+## F121. Compiled tier: after an `eval`'d `trap ... ERR` sets a variable to `!`, using it unquoted as a command word runs the rest of the line as a negated pipeline instead of trying to execute a program named `!`
+
+    eval "trap \"v='!'\" ERR"
+    false
+    $v echo hi
+
+- bash, curse interp/tiered/static: `false` fires the ERR trap (`v='!'`); `$v echo hi`
+  expands to the words `!` `echo` `hi`, run as a simple command named `!` (the value came
+  from expansion, so `!`'s reserved-word negation never applies): `S: line 3: !: command
+  not found`, status 127.
+- curse compiled tier only: status 0, stdout `hi` — it executes `echo hi` with its status
+  negated, i.e. it treats the *expanded* word `!` as bash's literal negation operator. The
+  loop the fuzzer wrapped this in (a 120-iteration `for` re-registering the same trap) was
+  incidental — reduces without it; needs the trap set through `eval`, not a literal
+  top-level `trap` statement (a bare `trap "v='!'" ERR` at top level does not trigger it).
+  (gram:tiers queue, the in-loop tier oracle: interp vs compiled vs tiered)
