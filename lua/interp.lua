@@ -6682,7 +6682,10 @@ run_trap = function(sh, code, tag)
 		end
 	end
 	local ne0 = sh.noerr
-	local ok, err = pcall(body)
+	-- (the handler runs with compiled code's live lifted registers in sh around it —
+	-- rt.ltext: a handler whose text the compiler never saw — set by `eval "$s"`, a sourced
+	-- file — may read or assign a variable the interrupted code holds in a register)
+	local ok, err = pcall(rt.ltext, sh, body)
 	-- (the handler is parse_and_execute'd: a line abort in it — a div0 — skips the rest of
 	-- that handler line only)
 	while not ok and type(err) == "table" and err.__curse_lineabort and not err.__curse_discard do
@@ -6690,7 +6693,7 @@ run_trap = function(sh, code, tag)
 		while k < #stmts and not stmts[k + 1].lgstart do
 			k = k + 1
 		end
-		ok, err = pcall(body)
+		ok, err = pcall(rt.ltext, sh, body)
 	end
 	if vtext and not mod then
 		M.v_echo(sh, code, nil, vst) -- (the rest, read to the end of the text)
