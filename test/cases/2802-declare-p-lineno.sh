@@ -18,6 +18,6 @@ done
 echo "$o"
 eval 'declare -p LINENO
 declare -p LINENO'
-printf 'declare -p LINENO\n\ndeclare -p LINENO\n' > s2762.sh; . ./s2762.sh
+printf 'declare -p LINENO\n\ndeclare -p LINENO\n' > s2802.sh; . ./s2802.sh
 trap 'declare -p LINENO' USR1; kill -USR1 $$; trap - USR1
-rm -f s2762.sh
+rm -f s2802.sh

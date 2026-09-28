@@ -32,7 +32,7 @@ eval 'cat <<E
 $(fi) z
 E
 echo "eval $?"'
-printf 'cat <<E\n\n$( if\n\nE\necho "src $?"\n' > s2765.sh; . ./s2765.sh
+printf 'cat <<E\n\n$( if\n\nE\necho "src $?"\n' > s2805.sh; . ./s2805.sh
 trap 'cat <<E
 $(fi)
 E
@@ -40,4 +40,4 @@ echo "trap $?"' USR1; kill -USR1 $$; trap - USR1
 i=0; while [ $i -lt 150 ]; do cat <<E; i=$((i + 1)); done 2>&1 | sort | uniq -c
 $(fi)
 E
-rm -f s2765.sh
+rm -f s2805.sh

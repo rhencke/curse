@@ -20,7 +20,7 @@ eval 'cat <<E
 `x
 E
 echo "eval $?"'
-printf 'cat <<E\n`y\nE\necho "src $?"\n' > s2764.sh; . ./s2764.sh
+printf 'cat <<E\n`y\nE\necho "src $?"\n' > s2804.sh; . ./s2804.sh
 trap 'cat <<E
 `z
 E
@@ -29,4 +29,4 @@ i=0; while [ $i -lt 150 ]; do cat <<E; i=$((i + 1)); done 2>&1 | sort | uniq -c
 `w $i
 E
 echo "loop $i"
-rm -f s2764.sh
+rm -f s2804.sh

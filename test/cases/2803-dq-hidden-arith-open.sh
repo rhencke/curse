@@ -15,8 +15,8 @@ echo "$$(( ( 1 ) ))" | tr -d 0-9
 echo ${u-'$(('} ok
 f() { echo "${u-'$(('}"; echo "f $?"; }; f; echo "st $?"
 eval 'echo "$$((1)"'; echo "eval $?"
-printf 'echo "${u-'"'"'$(('"'"'}"\necho "src $?"\n' > s2763.sh; . ./s2763.sh; echo "st $?"
+printf 'echo "${u-'"'"'$(('"'"'}"\necho "src $?"\n' > s2803.sh; . ./s2803.sh; echo "st $?"
 trap 'echo "$$(("; echo "trap $?"' USR1; kill -USR1 $$; trap - USR1
 i=0; while [ $i -lt 150 ]; do y="$$(( $i"; i=$((i + 1)); done; echo "loop $? $i"
 i=0; while [ $i -lt 150 ]; do eval 'y="$$(( $i"'; i=$((i + 1)); done 2>&1 | sort | uniq -c
-rm -f s2763.sh
+rm -f s2803.sh
