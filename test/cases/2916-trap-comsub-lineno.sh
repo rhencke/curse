@@ -21,4 +21,4 @@ trap - RETURN
 trap 'echo "x $LINENO $(echo $LINENO)"' EXIT
 i=0; trap 'echo "u $LINENO $(echo $LINENO)"' USR2; while [ $i -lt 150 ]; do [ $i = 120 ] && kill -USR2 $$; i=$((i+1)); done
 eval 'trap '"'"'echo "v $LINENO $(echo $LINENO)"'"'"' USR1; kill -USR1 $$'
-printf 'trap '"'"'echo "s $LINENO $(echo $LINENO)"'"'"' USR1\nkill -USR1 $$\n' > s2816.sh; . ./s2816.sh; rm -f s2816.sh
+printf 'trap '"'"'echo "s $LINENO $(echo $LINENO)"'"'"' USR1\nkill -USR1 $$\n' > s2916.sh; . ./s2916.sh; rm -f s2916.sh

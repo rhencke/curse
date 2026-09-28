@@ -17,7 +17,7 @@ declare -A u=([k]=v); h4() { declare -gA u=(a b); }; h4; declare -p u
 k() { declare -A v=([k]=v); k2; declare -p v; }; k2() { declare -g v=(a b); }; v=1; k; declare -p v
 declare -A t=([k]=v); declare -g t=(a b); declare -p t
 declare -A e=([k]=v); eval 'fe() { declare -g e=($1 "$2"); }; fe p "q r"'; declare -p e
-printf 'declare -A s=([k]=v); fs() { declare -g s=(1); }; fs; declare -p s\n' > s2815.sh; . ./s2815.sh
+printf 'declare -A s=([k]=v); fs() { declare -g s=(1); }; fs; declare -p s\n' > s2915.sh; . ./s2915.sh
 trap 'declare -A r=([k]=v); fr() { declare -g r=(x); }; fr; declare -p r' USR1; kill -USR1 $$; trap - USR1
 i=0; while [ $i -lt 150 ]; do declare -A m=([k]=v); fm() { declare -g m=("$i"); }; fm; i=$((i + 1)); done; declare -p m
-rm -f s2815.sh
+rm -f s2915.sh

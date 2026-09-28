@@ -10,7 +10,7 @@ echo x${a[1}y
 echo after
 f() { echo ${a[1}]}; echo "f $?"; }; f; echo "st $?"
 eval 'echo [${!a[@}]'; echo "eval $?"
-printf 'echo ${a[@}]}\necho "src $?"\n' > s2812.sh; . ./s2812.sh
+printf 'echo ${a[@}]}\necho "src $?"\n' > s2912.sh; . ./s2912.sh
 trap 'echo ${a[@}]}; echo no' USR1; kill -USR1 $$; trap - USR1
 i=0; while [ $i -lt 150 ]; do y=${a[@}]}; i=$((i + 1)); done 2>&1 | sort | uniq -c
-rm -f s2812.sh
+rm -f s2912.sh

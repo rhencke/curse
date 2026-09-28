@@ -11,7 +11,7 @@ a=(1 2); i=1; test -v 'a[$i]'; echo $?; [[ -v a[i] ]]; echo $?; test -v "a[i+1]"
 echo next
 f() { [[ -v 'C["]' ]]; echo "f $?"; }; f
 eval '[[ -v "D[\"]" ]]; echo "eval $?"'
-printf '[[ -v '"'"'E["]'"'"' ]]; echo "src $?"\n' > s2809.sh; . ./s2809.sh
+printf '[[ -v '"'"'E["]'"'"' ]]; echo "src $?"\n' > s2909.sh; . ./s2909.sh
 trap '[[ -v "F[\"]" ]]; echo "trap $?"' USR1; kill -USR1 $$; trap - USR1
 n=0; for ((i = 0; i < 150; i++)); do [[ -v 'A["]' ]] || n=$((n + 1)); test -v "a[i%2]" && n=$((n + 1)); done; echo "$n"
-rm -f s2809.sh
+rm -f s2909.sh

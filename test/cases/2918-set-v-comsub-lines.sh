@@ -27,8 +27,8 @@ n")" $(( 1
 eval 'x=$(echo a
 echo b)
 echo "$x"'
-printf 'y=$(echo c\necho d)\necho "$y"\n' > s2818.sh
-. ./s2818.sh
+printf 'y=$(echo c\necho d)\necho "$y"\n' > s2918.sh
+. ./s2918.sh
 f() { z=$(echo e
 echo f); echo "$z"; }
 f
@@ -36,4 +36,4 @@ i=0; while [ $i -lt 150 ]; do w=$(echo $i
 ); i=$((i + 1)); done
 echo "$w"
 set +v
-rm -f s2818.sh
+rm -f s2918.sh

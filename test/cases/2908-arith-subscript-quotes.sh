@@ -9,8 +9,8 @@ let 'y=a[$(]'; echo "st $?"
 let 'y=a["]'; echo "st $?"
 f() { local v='a[$(]'; echo $(( v + 1 )); echo "f $?"; }; f; echo "st $?"
 eval 'x="a[\"]"; (( x )); echo "e $?"'; echo "eval $?"
-printf 'x=a[\\"]; echo $((x))\necho "src $?"\n' > s2808.sh; . ./s2808.sh
+printf 'x=a[\\"]; echo $((x))\necho "src $?"\n' > s2908.sh; . ./s2908.sh
 trap 'x="a[\$(]"; echo $((x)); echo no' USR1; kill -USR1 $$; trap - USR1
 i=0; while [ $i -lt 150 ]; do x='a[$(]'; y=$((x)); i=$((i + 1)); done 2>&1 | sort | uniq -c
 y=0; for i in {1..150}; do x='a[i%3]'; y=$((y + x)); done; echo "$y"
-rm -f s2808.sh
+rm -f s2908.sh

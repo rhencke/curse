@@ -34,12 +34,12 @@ echo end2
 eval "set -v
 echo in eval"
 echo after $-
-printf "set -v\necho src\n" > s2819.sh
+printf "set -v\necho src\n" > s2919.sh
 set +v
-. ./s2819.sh
+. ./s2919.sh
 echo after2 $-
 f() { set -v; }
 set +v
 f
 echo after3
-rm -f s2819.sh
+rm -f s2919.sh

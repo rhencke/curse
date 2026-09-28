@@ -10,7 +10,7 @@ declare -a RANDOM; declare -p RANDOM | sed 's/="[0-9]*"/=N/'
 declare -ai BASH_SUBSHELL=2+3; declare -p BASH_SUBSHELL
 f() { local -a LINENO=9; declare -p LINENO; declare -ai SRANDOM=1+1; declare -p SRANDOM; }; f
 eval 'declare -ai EPOCHSECONDS=4*2; declare -p EPOCHSECONDS'
-printf 'declare -a HISTCMD=7; declare -p HISTCMD\n' > s2814.sh; . ./s2814.sh
+printf 'declare -a HISTCMD=7; declare -p HISTCMD\n' > s2914.sh; . ./s2914.sh
 trap 'declare -a BASHPID=1; declare -p BASHPID' USR1; kill -USR1 $$; trap - USR1
 for ((i = 0; i < 150; i++)); do declare -a BASH_COMMAND=$i; done; declare -p BASH_COMMAND
-rm -f s2814.sh
+rm -f s2914.sh

@@ -24,9 +24,9 @@ e 'f() {
   local x
 }'
 unalias local
-printf 'if :\nthen :\nfi y\necho no\n' > s2820.sh; . ./s2820.sh; echo "src $?"
+printf 'if :\nthen :\nfi y\necho no\n' > s2920.sh; . ./s2920.sh; echo "src $?"
 trap 'e "{
 :; } z"' USR1; kill -USR1 $$; trap - USR1
 i=0; while [ $i -lt 150 ]; do e 'for x in 1
 do :; done w'; i=$((i + 1)); done 2>&1 | sort | uniq -c
-rm -f s2820.sh
+rm -f s2920.sh

@@ -27,5 +27,5 @@ echo --
 { trap -p; } | cat
 echo --
 eval '{ trap -p; } | cat &'; wait
-printf '{ trap -p; } | cat &\nwait\n' > s2817.sh; . ./s2817.sh; rm -f s2817.sh
+printf '{ trap -p; } | cat &\nwait\n' > s2917.sh; . ./s2917.sh; rm -f s2917.sh
 i=0; while [ $i -lt 150 ]; do { trap -p; } | { read -r l; echo "$l"; } & wait; i=$((i + 1)); done | sort | uniq -c

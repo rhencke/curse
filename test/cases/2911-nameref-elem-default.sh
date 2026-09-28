@@ -12,7 +12,7 @@ x=abc; declare -n rx='x[3]'; echo "${rx:=q}"; declare -p x
 declare -i b=(1 2); declare -n t='b[5]'; echo "[${t:=3+4}]"; declare -p b
 f() { local -n lr='a[7]'; echo "${lr-f}" "${lr=g}"; }; f; declare -p a
 eval 'declare -n er="a[8]"; echo ${er:-e}'
-printf 'declare -n sr="a[9]"; echo ${sr+s}${sr-S}\n' > s2811.sh; . ./s2811.sh
+printf 'declare -n sr="a[9]"; echo ${sr+s}${sr-S}\n' > s2911.sh; . ./s2911.sh
 trap 'declare -n tr="a[2]"; echo ${tr:+T}' USR1; kill -USR1 $$; trap - USR1
 c=(1); declare -n cr='c[1]'; for ((i = 0; i < 150; i++)); do unset 'c[1]'; v=${cr:-$i}; done; echo "$v"
-rm -f s2811.sh
+rm -f s2911.sh
