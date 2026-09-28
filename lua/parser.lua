@@ -12,7 +12,7 @@ local M = {}
 -- (Arith/parse/unbound errors carry their own tags: those stay the caller's to classify.)
 function M.trap_flow(e)
 	if type(e) == "table" and (e.__curse_exit or e.__curse_return or e.__curse_break
-		or e.__curse_continue or e.__curse_discard)
+		or e.__curse_continue or e.__curse_discard or e.__curse_termsig_unwind)
 		and not (e.__curse_matherr or e.__curse_experr or e.__curse_arith or e.__curse_perr
 			or e.__curse_unbound or e.__curse_lineabort) then
 		error(e, 0)

@@ -51,7 +51,7 @@ return function(sh, cmd, args, hook, tcb)
 			if C.getrlimit(r[1], rl) ~= 0 then
 				return nil
 			end
-			local v = hardflag and (rt.iso_vhard(sh, r[1]) or rl[0].rlim_max) or rl[0].rlim_cur
+			local v = hardflag and (rt.iso_vhard(sh, r[1]) or rl[0].rlim_max) or rt.iso_vsoft(sh, r[1]) or rl[0].rlim_cur
 			if v == INF then
 				return "unlimited"
 			end
@@ -88,7 +88,7 @@ return function(sh, cmd, args, hook, tcb)
 				if C.getrlimit(r[1], rl) ~= 0 then
 					return false
 				end
-				nv = value == "hard" and (rt.iso_vhard(sh, r[1]) or rl[0].rlim_max) or rl[0].rlim_cur
+				nv = value == "hard" and (rt.iso_vhard(sh, r[1]) or rl[0].rlim_max) or rt.iso_vsoft(sh, r[1]) or rl[0].rlim_cur
 			elseif value == "unlimited" then
 				nv = INF
 			elseif value:match("^%d+$") then
@@ -111,13 +111,15 @@ return function(sh, cmd, args, hook, tcb)
 			local vh = rt.iso_vhard(sh, r[1]) or rl[0].rlim_max
 			local virt = ctx or sh.iso_vhard_base
 			local err
+			local vsoft = rt.iso_vsoft(sh, r[1]) or rl[0].rlim_cur
 			if setsoft then
 				rl[0].rlim_cur = nv
+				vsoft = nv
 			end
 			if sethard and virt then
 				if nv > vh and C.geteuid() ~= 0 then
 					err = 1 -- EPERM
-				elseif not setsoft and rl[0].rlim_cur > nv then
+				elseif not setsoft and vsoft > nv then
 					err = 22 -- EINVAL
 				end
 			elseif sethard then
@@ -126,6 +128,16 @@ return function(sh, cmd, args, hook, tcb)
 			if not err and virt and setsoft and rl[0].rlim_cur > (sethard and nv or vh) then
 				err = 22
 			end
+			-- a subshell's CPU time counts from its start (a forked child's clock starts at
+			-- 0), the process's from the shell's: the real soft limit is shifted by what the
+			-- shell had used (whole seconds, as the kernel checks it — never later than bash's
+			-- child), and passing it is that subshell's SIGXCPU, or at its hard limit its
+			-- SIGKILL (rt.sync_signal); the limit it shows is its own (rt.iso_vsoft)
+			local cpuv = ctx and r[1] == 0 and setsoft and nv ~= INF
+			if cpuv then
+				local real = ffi.cast("uint64_t", math.floor(ctx.cpu0)) + nv
+				rl[0].rlim_cur = real > rl[0].rlim_max and rl[0].rlim_max or real
+			end
 			if not err and C.setrlimit(r[1], rl) ~= 0 then
 				err = ffi.errno()
 			end
@@ -133,8 +145,12 @@ return function(sh, cmd, args, hook, tcb)
 				io.stderr:write("curse: ulimit: " .. r[3] .. ": cannot modify limit: "
 					.. ffi.string(C.strerror(err)) .. "\n")
 				return false
-			elseif ctx and sethard then
+			end
+			if ctx and sethard then
 				ctx.vhard[r[1]] = nv
+			end
+			if ctx and r[1] == 0 and setsoft then
+				ctx.vsoft[0] = cpuv and nv or false
 			end
 			return true
 		end

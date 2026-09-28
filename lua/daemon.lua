@@ -362,6 +362,7 @@ local function serve_request(cfd, req, fds, ctx)
 		rt.sig_apply_mask(req.sigign)
 	end
 	rt.startup_ignored(sh, req.sigign)
+	rt.sig_hold_reset() -- (nothing a previous request abandoned stays held)
 	rt.sig_setup(sh) -- (SIGQUIT ignored; the terminating signals caught: rt.termsig)
 	-- now our pid (negated): the client forwards the signals sent to it here. Not before
 	-- the script's dispositions are in place: a signal the client holds until then would
