@@ -274,17 +274,24 @@ end
 function M.call_site_line(sh)
 	local getinfo, getlocal = debug.getinfo, debug.getlocal
 	local line
-	for level = 3, 400 do -- (the outermost compiled top-level frame: its pc's line)
+	-- (the compiled top-level frame the outermost function was called from: its pc's line —
+	-- the innermost such frame, a redirected group's body, say, whose caller's pc is the
+	-- group's; with no function frame, the outermost)
+	local infn, fixed = false, false
+	for level = 3, 400 do
 		local info = getinfo(level, "f")
 		if not info then
 			break
 		end
 		local t = M.PCLINE[info.func]
-		if t and not M.PCNAME[info.func] then
+		if t and M.PCNAME[info.func] then
+			infn, fixed = true, false
+		elseif t and not fixed then
 			local _, pc = getlocal(level, 2)
 			local ln = pc_line(sh, t, pc)
 			if ln and ln > 0 then
 				line = ln
+				fixed = infn
 			end
 		end
 	end

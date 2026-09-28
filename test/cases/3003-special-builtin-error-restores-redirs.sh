@@ -23,6 +23,7 @@ for i in 1 2; do break 2>/dev/null; done; echo "for=$i"
 h() { shift 1 2 2>/dev/null; }
 i=0; while [ $i -lt 150 ]; do
 	( h; echo not-reached-6 )
+	{ h; } 2>/dev/null # (the discard leaves bash's line number at h's call: the lines drift)
 	i=$((i + 1))
 done
 echo "i=$i" >&2
