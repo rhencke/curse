@@ -743,7 +743,7 @@ local sherr = rt.Shell.errmsg -- error-message writer, capture-aware for `2>&1` 
 -- integer literal short-circuits (the hot path); a recursion guard bounds cycles.
 local looks_numeric = rt.looks_numeric -- shared with the compiled tier (one source in runtime)
 arith_resolve = function(sh, s, e)
-	if s == nil or s:match("^%s*$") then
+	if s == nil or s:match("^[ \t\n]*$") then
 		return i64(0)
 	end -- unset/blank value -> 0 (bash)
 	if looks_numeric(s) then
@@ -824,7 +824,7 @@ local function arith_nounset(sh, name)
 		if (b == nil or (b.arr == nil and b.s == nil and b.n == nil) or (b.empty_decl and b.arr and next(b.arr) == nil))
 			and sh:special_get(name) == "" then
 			io.stderr:write("curse: " .. name .. ": unbound variable\n")
-			error({ __curse_exit = sh.opt_c and 127 or 1, __curse_lineabort = sh.opt_i or nil, __curse_unbound = true })
+			error({ __curse_exit = rt.feof_st(sh), __curse_lineabort = sh.opt_i or nil, __curse_unbound = true })
 		end
 	end
 end
@@ -938,6 +938,11 @@ function M.arith_textual_eval(sh, raw, depth0)
 	if depth0 == 1 and text == "" and not in_expanded_text then -- (a subscript's expansions left
 		error({ __arith_emptysub = true }, 0) -- nothing: arith_key)
 	end
+	return M.arith_expanded_eval(sh, text, depth0)
+end
+-- Evaluate expansion OUTPUT as arithmetic (bash's evalexp on expand_arith_string's result):
+-- a `$`/`` ` `` left in it is no expansion but a bad token; a `$key` subscript still expands
+function M.arith_expanded_eval(sh, text, depth0)
 	local pok, ast = pcall(P.arith, text, "strict")
 	if not pok then
 		P.trap_flow(ast)
@@ -1052,16 +1057,6 @@ end
 -- bash evaluates arithmetic WHILE parsing it, so what came before a syntax error has run:
 -- `let 'b=a++ +'` increments a. The parser hands the completed part as err.pre; evaluate
 -- it before the error is reported (its own error — `1/0 + )` — wins, as in bash).
--- A NAME[…] whose `]` skipsubscript never finds (parser nameSub: badsub): "bad array
--- subscript" — unless NAME is associative and assoc_expand_once holds (VA_NOEXPAND: read to
--- the `]` without quoting, `a[80's]`)
-function M.badsub_chk(sh, e)
-	if e.badsub and not (sh.shopt.assoc_expand_once and sh:is_assoc(e.name)) then
-		io.stderr:write("curse: " .. P.arith_errmsg(e.badsub.expr,
-			{ __curse_arith = true, msg = "bad array subscript", tok = e.badsub.tok }) .. "\n")
-		error({ __curse_exit = 1, __curse_matherr = true, __curse_lineabort = true })
-	end
-end
 arith_pre = function(sh, err)
 	if type(err) == "table" and err.pre then
 		eval(sh, err.pre)
@@ -1079,7 +1074,6 @@ eval = function(sh, e)
 	end
 	if k == "var" then
 		if e.idxraw then
-			M.badsub_chk(sh, e)
 			-- (an indexed element's subscript is itself evaluated — one nesting level: at bash's
 			-- limit that evaluation is what fails, and array_expand_index DISCARDs)
 			if (sh.arith_depth or 0) + 1 >= 1024 and e.esrc and not sh:is_assoc(e.name) then
@@ -1326,7 +1320,6 @@ eval = function(sh, e)
 		local v = eval(sh, e.e) -- (bash evaluates the value BEFORE the lvalue's subscript)
 		local iv, bad
 		if e.idxraw then -- (a bad element reads 0 and stores nothing: rt.arith_badraw)
-			M.badsub_chk(sh, e)
 			local how = e.op == "=" and "w" or "rw"
 			if e.op ~= "=" then
 				arith_nounset(sh, e.name)
@@ -1385,7 +1378,6 @@ eval = function(sh, e)
 	if k == "post" then
 		arith_nounset(sh, e.name) -- x++ / x-- read x first
 		if e.idxraw then
-			M.badsub_chk(sh, e)
 			local iv = not rt.arith_badraw(sh, e.name, e.idxraw, "rw") and arith_key(sh, e.name, e.idx, e.idxraw, true)
 			if iv == rt.EMPTYSUB then
 				iv = not rt.arith_badraw(sh, e.name, "", "rw")
@@ -1404,7 +1396,6 @@ eval = function(sh, e)
 	if k == "pre" then
 		arith_nounset(sh, e.name) -- ++x / --x read x first
 		if e.idxraw then
-			M.badsub_chk(sh, e)
 			local iv = not rt.arith_badraw(sh, e.name, e.idxraw, "rw") and arith_key(sh, e.name, e.idx, e.idxraw, true)
 			if iv == rt.EMPTYSUB then
 				iv = not rt.arith_badraw(sh, e.name, "", "rw")
@@ -1432,7 +1423,7 @@ M.eval = eval
 function M.arith_read(sh, name)
 	arith_nounset(sh, name) -- set -u: unbound in arith is FATAL (throws, aborts — bash)
 	local s = sh:get(name)
-	if s == nil or s:match("^%s*$") then
+	if s == nil or s:match("^[ \t\n]*$") then
 		return i64(0)
 	end
 	if looks_numeric(s) then
@@ -1695,7 +1686,7 @@ local function expand_pexp(sh, p, assign)
 	if pe.op == "badsubst" then -- ${x|html} and other unrecognized ${…} forms
 		if pe.fatal then
 			sherr(sh, "curse: " .. M.bs_text(sh, pe) .. ": bad substitution\n")
-			error({ __curse_exit = sh.opt_c and 127 or 1, __curse_lineabort = sh.opt_i or nil })
+			error({ __curse_exit = rt.feof_st(sh), __curse_lineabort = sh.opt_i or nil })
 		end
 		if pe.xform then -- ${x@Z}: nothing to transform on an unset x; else FATAL (bash)
 			local set
@@ -1709,7 +1700,7 @@ local function expand_pexp(sh, p, assign)
 				return ""
 			end
 			sherr(sh, "curse: " .. M.bs_text(sh, pe) .. ": bad substitution\n")
-			error({ __curse_exit = sh.opt_c and 127 or 1, __curse_lineabort = sh.opt_i or nil })
+			error({ __curse_exit = rt.feof_st(sh), __curse_lineabort = sh.opt_i or nil })
 		end
 		sherr(sh, "curse: " .. M.bs_text(sh, pe) .. ": bad substitution\n")
 		error({ __curse_exit = 1, __curse_lineabort = true }) -- discards the rest of the line (bash)
@@ -1894,13 +1885,13 @@ expand_part_str = function(sh, p, assign)
 		end
 		if sh.opt_u and unset and sh:special_get(p.var) == "" then
 			io.stderr:write("curse: " .. (p.uname or p.var) .. ": unbound variable\n")
-			error({ __curse_exit = sh.opt_c and 127 or 1, __curse_lineabort = sh.opt_i or nil })
+			error({ __curse_exit = rt.feof_st(sh), __curse_lineabort = sh.opt_i or nil })
 		end
 		return sh:get(p.var)
 	elseif p.param then
 		if sh.opt_u and p.param > sh.nparams then
 			io.stderr:write("curse: " .. (p.braced and "" or "$") .. p.param .. ": unbound variable\n")
-			error({ __curse_exit = sh.opt_c and 127 or 1, __curse_lineabort = sh.opt_i or nil })
+			error({ __curse_exit = rt.feof_st(sh), __curse_lineabort = sh.opt_i or nil })
 		end
 		return sh:param(p.param)
 	elseif p.special then
@@ -2275,7 +2266,7 @@ indirect_part = function(sh, pe, quiet)
 		end
 		io.stderr:write("curse: " .. (pe.name and rt.pe_label(pe) or "") .. ": invalid indirect expansion\n")
 		if sh.opt_u then
-			error({ __curse_exit = sh.opt_c and 127 or 1, __curse_lineabort = sh.opt_i or nil })
+			error({ __curse_exit = rt.feof_st(sh), __curse_lineabort = sh.opt_i or nil })
 		end
 		error({ __curse_exit = 1, __curse_lineabort = true })
 	end
@@ -2300,7 +2291,7 @@ indirect_part = function(sh, pe, quiet)
 			-- (the `[` must close exactly at the end, as skipsubscript reads it: quotes nest —
 			-- `A["]` never closes)
 			bad = tname:sub(#base + 1, #base + 1) ~= "[" or #tname == #base + 2
-				or P.subscript_x(tname, #base + 1) ~= #tname
+				or P.subscript_close(tname, #base + 1) ~= #tname
 		end
 		if bad then
 			io.stderr:write("curse: " .. tname .. ": invalid variable name\n")
@@ -2535,7 +2526,7 @@ multi_elems = function(sh, p) -- returns element list, star?
 			local msg = pe.arg and pe.arg ~= "" and expand_word(sh, M.lazy_word(pe.arg))
 				or (pe.op == "?" and "parameter not set" or "parameter null or not set")
 			io.stderr:write("curse: " .. rt.pe_label(pe) .. ": " .. msg .. "\n")
-			error({ __curse_exit = sh.opt_c and 127 or 1, __curse_lineabort = sh.opt_i or nil })
+			error({ __curse_exit = rt.feof_st(sh), __curse_lineabort = sh.opt_i or nil })
 		elseif (pe.op == "=" or pe.op == ":=") and #els == 0 then
 			-- ${@=x} / ${a[@]=x}: nothing to assign to — bash aborts the line. An ASSOC
 			-- takes `@`/`*` as a literal key (bash: ${A[@]:=foo} sets A[@])
@@ -2855,9 +2846,9 @@ expand_fields_full = function(sh, w, pre1) -- pre1: part 1 already expanded (a $
 						fb:multi(els, sp.q, star, nil, not sp.dqat)
 					else
 						local s = expand_part_str(sh, sp)
-						if k == 1 and sp.lit ~= nil and not sp.q then
-							s = tilde_prefix(sh, s)
-						end -- word-initial ~
+						if k == 1 and sp.lit ~= nil and not sp.q then -- word-initial ~
+							s = rt.tilde_split(sh, fb, s)
+						end
 						if sp.q then
 							fb:add(s, false)
 						else
@@ -3933,7 +3924,7 @@ local function printf_parse(fmt)
 						j = j + 1
 					end
 				end
-				local prec, dynp = nil, false
+				local prec, dynp, negp = nil, false, nil
 				if fmt:sub(j, j) == "." then
 					j = j + 1
 					prec = ""
@@ -3941,9 +3932,16 @@ local function printf_parse(fmt)
 						dynp = true
 						j = j + 1
 					else
+						if fmt:sub(j, j) == "-" then -- (a negative precision: bash skips the `-`
+							negp = "" -- and passes the spec on — see pf.negprec)
+							j = j + 1
+						end
 						while fmt:sub(j, j):match("%d") do
 							prec = prec .. fmt:sub(j, j)
 							j = j + 1
+						end
+						if negp then
+							negp, prec = prec, "0" -- (printstr's %b/%q/%s: `.` with no digit is 0)
 						end
 					end
 				end
@@ -3983,7 +3981,8 @@ local function printf_parse(fmt)
 					end
 				else
 					local conv = fmt:sub(j, j)
-					local tk = { conv = conv, spec = spec, width = width, dynw = dynw, prec = prec, dynp = dynp, lmod = lmod, grp = grp }
+					local tk = { conv = conv, spec = spec, width = width, dynw = dynw, prec = prec, dynp = dynp, lmod = lmod, grp = grp,
+						negp = negp }
 					-- (the conversion spec string.format takes: literal width/precision of
 					-- at most two digits; anything else is built per call)
 					if not (dynw or dynp) and #width <= 2 and #(prec or "") <= 2 then
@@ -4019,6 +4018,10 @@ end
 -- The printf helpers below live in one table (interp.lua's main chunk is near LuaJIT's
 -- local-variable limit); all but pf.str are off the common path.
 local pf = {}
+-- the conversions bash passes to printf(3) (a negative precision's glibc text): the
+-- argument kind and so bash's added length modifier (mklong: `l` / `L`)
+pf.NEGP = { d = "i", i = "i", o = "i", u = "i", x = "i", X = "i", e = "f", E = "f", f = "f", F = "f",
+	g = "f", G = "f", a = "f", A = "f", s = "s", c = "s" }
 -- A conversion's text as its pieces — strings and { char, count } runs of padding. A run
 -- too big to build (a `*` width or precision near INT_MAX: bash's printf writes it as it
 -- formats) is streamed to the shell's stdout in chunks, after the output pending before it
@@ -4397,7 +4400,31 @@ local function sh_printf(fmt, argv, start, nsets, fsh)
 					end
 				end
 				local conv = tk.conv
-				if conv == "s" then
+				if tk.negp and pf.NEGP[conv] then
+					-- a C-printf conversion with a negative precision (`%.-1d`): bash hands
+					-- `%.-1ld` to printf(3), and glibc prints an unknown `-` conversion as its
+					-- own spec text — then the rest (`1ld`) as plain text
+					local a = pf_next(ps)
+					local mod = ""
+					if pf.NEGP[conv] == "i" then
+						pf.intarg(ps, a, conv ~= "d" and conv ~= "i")
+						mod = "l"
+					elseif pf.NEGP[conv] == "f" then
+						local c1 = a:sub(1, 1)
+						local posix = not tk.lmod and rt.cur_shell and rt.cur_shell.opt_posix
+						local _, ok = printf_float(a)
+						if not ok and c1 ~= "'" and c1 ~= '"' then
+							pf.badnum(ps, a)
+						end
+						mod = posix and "" or "L"
+					end
+					local w = tonumber(width) or 0
+					local left = spec:find("-", 1, true)
+					out[#out + 1] = "%" .. (spec:find("#", 1, true) and "#" or "") .. (tk.grp and "'" or "")
+						.. (spec:find("+", 1, true) and "+" or spec:find(" ", 1, true) and " " or "")
+						.. (left and "-" or "") .. (not left and spec:find("0", 1, true) and "0" or "")
+						.. (w ~= 0 and tostring(w) or "") .. ".0-" .. tk.negp .. mod .. conv
+				elseif conv == "s" then
 					local a = pf_next(ps)
 					local pr_ = (width == "" and not prec) and a or pf.str(spec, width, prec, a) -- (a streamed pad empties `out` first)
 					out[#out + 1] = pr_
@@ -4467,11 +4494,16 @@ local function sh_printf(fmt, argv, start, nsets, fsh)
 					out[#out + 1] = pr_
 				elseif conv == "Q" then -- (a literal precision cuts the raw text; the quoted is whole)
 					local a = pf_next(ps)
-					if prec and prec ~= "" and not tk.dynp then
+					if tk.negp then -- (`%.-2Q`: printstr's precision is 0 — only the padding)
+						a = nil
+						out[#out + 1] = pf.str(spec, width, "0", "")
+					elseif prec and prec ~= "" and not tk.dynp then
 						a = a:sub(1, tonumber(prec))
 					end
-					local pr_ = pf.str(spec, width, nil, printf_q(a)) -- (a streamed pad empties `out` first)
-					out[#out + 1] = pr_
+					if a then
+						local pr_ = pf.str(spec, width, nil, printf_q(a)) -- (a streamed pad empties `out` first)
+						out[#out + 1] = pr_
+					end
 				elseif conv == "" then -- the format ended inside a conversion (`%10`)
 					pf.diag(ps, "`" .. tk.miss .. "': missing format character")
 					return table.concat(out), 1
@@ -5223,9 +5255,9 @@ local function eval_dbracket(sh, node)
 				xr = { rt.xglob_quote(r) }
 			end
 		end
-		if sh.opt_x then -- (an empty operand traces as '')
-			r = xr and xr[1] or r
-			dbracket_trace(sh, (l == "" and "''" or l) .. " " .. op .. " " .. (r == "" and "''" or r))
+		if sh.opt_x then -- (an empty operand traces as ''; the traced text isn't the operand)
+			local tr = xr and xr[1] or r
+			dbracket_trace(sh, (l == "" and "''" or l) .. " " .. op .. " " .. (tr == "" and "''" or tr))
 		end
 		local ic = sh.shopt.nocasematch and true or nil -- shopt -s nocasematch: case-insensitive
 		if op == "==" or op == "=" then
@@ -5605,7 +5637,7 @@ exec_stmt = function(sh, st, hook)
 	end
 	-- `time [-p] pipeline` reserved word: run the pipeline (with its own type/negate
 	-- preserved for errexit), then report elapsed real/user/sys to STDERR like bash.
-	if st.timed then
+	if st.timed and not (sh.opt_n and not sh.opt_i) then -- (noexec: no report either)
 		st.timed = false
 		local r0, c0 = wall_secs(), os.clock()
 		local ok, err = pcall(exec_stmt, sh, st, hook)
@@ -5619,7 +5651,8 @@ exec_stmt = function(sh, st, hook)
 	end
 	-- set -n (noexec): a non-interactive shell reads but does not execute. Once on,
 	-- every later statement (including `set +n`) is skipped — matches bash.
-	if sh.opt_n and not sh.opt_i and t ~= "parse_error" then -- (a syntax error is still reported)
+	if sh.opt_n and not sh.opt_i and t ~= "parse_error" and t ~= "warn" then -- (a syntax error, a
+		-- parse-time warning — a here-document at EOF — is still reported: noexec reads)
 		sh.status = 0
 		return
 	end
@@ -6438,7 +6471,8 @@ exec_stmt = function(sh, st, hook)
 		if not eok then
 			error(eerr, 0)
 		end
-		if #list == 0 then
+		if #list == 0 then -- (bash 5.2's execute_select_command returns here past its
+			sh.loopdepth = ld0 + 1 -- loop_level++, never undone: the level stays counted — rt.select_leak)
 			sh.status = 0
 			return
 		end
@@ -6810,6 +6844,11 @@ local function finish(sh, ok, err)
 			sh.status = err.__curse_exit
 		elseif type(err) == "table" and err.__curse_return then
 			sh.status = err.__curse_return
+		elseif type(err) == "table" and (err.__curse_break or err.__curse_continue) then
+			-- (a break/continue out past every loop — a level an empty `select` left counted:
+			-- bash's `breaking` then skips each command to the end of the input)
+			sh.status = err.__curse_status or sh.status
+			ok = true
 		else
 			error(err)
 		end

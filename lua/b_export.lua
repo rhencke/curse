@@ -936,10 +936,8 @@ return function(sh, cmd, args, hook, tcb)
 					local nm, rest = a:match("^([%a_][%w_]*)%[(.*)$")
 					if nm then
 						-- (to its `]` as skipsubscript reads it: quotes nest — `A["]=1` has none)
-						local close = P.subscript_x(a, #nm + 1) - #nm - 1
-						if close > #rest then
-							close = nil
-						end
+						local close = P.subscript_close(a, #nm + 1)
+						close = close and close - #nm - 1
 						if close then
 							local after = rest:sub(close + 1)
 							if after:sub(1, 2) == "+=" then

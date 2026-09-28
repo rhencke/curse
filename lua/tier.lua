@@ -90,10 +90,14 @@ local function trap_lc(t)
 	end
 	return false
 end
+local note_main
 local function trap_mode(sh)
 	local t = sh and sh.traps
 	if not t then
 		return ""
+	end
+	if not sh.main_noted and sh.main_src then -- (the tier loaded mid-run — an interpreted
+		note_main(sh) -- program's first fragment: what the program's text reads, as start_state)
 	end
 	local e = t.ERR and t.ERR ~= "" and "E" or ""
 	local d = t.DEBUG and t.DEBUG ~= "" and (sh.opt_functrace and "T" or "D") or ""
@@ -827,12 +831,16 @@ end
 -- (note_text), set -x (a module compiled WITH trace hooks), allexport/restricted (plain
 -- assignments may export or be refused), and its parse state (M.pst) — each its own cache
 -- key. Returns the pst and the live multibyte charset.
-local function start_state(sh, src)
-	sh.main_src = sh.main_src or src -- (the script's text: rt.coproc_exit_dispose's end-of-input line)
-	M.note_text(sh, src)
+note_main = function(sh, src)
+	sh.main_noted = true
+	M.note_text(sh, src or sh.main_src)
 	if sh.imp_flags then -- (an imported function's text joins the program's: fragments too)
 		M.note_text(sh, (sh.imp_flags:find("F", 1, true) and "FUNCNAME " or "") .. (sh.imp_flags:find("P", 1, true) and "PIPESTATUS" or ""))
 	end
+end
+local function start_state(sh, src)
+	sh.main_src = sh.main_src or src -- (the script's text: rt.coproc_exit_dispose's end-of-input line)
+	note_main(sh, src)
 	sh.xt_start = sh.opt_x or nil
 	sh.attr_start = (sh.opt_a or sh.opt_r) or nil
 	return M.pst(sh, true)

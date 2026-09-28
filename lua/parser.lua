@@ -52,7 +52,7 @@ local function arith(src, nodefer)
 	src = src:gsub("\\\n", "")
 	-- An empty (or all-whitespace) arithmetic expression is 0 in bash: `$(( ))` -> 0,
 	-- `(( ))` -> value 0 -> status 1.
-	if src:match("^%s*$") then
+	if src:match("^[ \t\n]*$") then -- (cr_whitespace: \f \v \r are not blank to bash)
 		return { k = "num", v = "0" }
 	end
 	-- Arith bodies may embed expansions the arith grammar can't parse: ${x:-5},
@@ -71,7 +71,10 @@ local function arith(src, nodefer)
 	-- bash does). Only when the expression has no ${…}/$(…)/`…` to expand as a whole.
 	-- (not in "let" mode — already-expanded text or a variable's value: `$"3"` stays bad)
 	local dtxt -- (the text with those `$` dropped: what bash's errors show)
-	if nodefer ~= "let" and not (src:find("%${") or src:find("%$%(") or src:find("`")) and src:find("$", 1, true) then
+	-- (only in SOURCE text: expansion output — "strict", "expanded" — keeps a `$` before a quote,
+	-- as bash's error shows it: `a[$\"]` evaluates `$"`)
+	if nodefer ~= "let" and nodefer ~= "strict" and nodefer ~= "expanded"
+		and not (src:find("%${") or src:find("%$%(") or src:find("`")) and src:find("$", 1, true) then
 		-- (a `$` INSIDE "…" is just a character: `"$"@` is the text `$@`)
 		local out, k, n, indq, qdollar = {}, 1, #src, false, false
 		while k <= n do
@@ -84,10 +87,26 @@ local function arith(src, nodefer)
 					indq = not indq
 				end
 				qdollar = qdollar or c == "$" and indq
-				if not (c == "$" and not indq and src:sub(k + 1, k + 1):match("[\"']")) then
-					out[#out + 1] = c
+				local ce -- (a $'…' in SOURCE arithmetic: its closing quote, past `\'` escapes)
+				if c == "$" and not indq and src:byte(k + 1) == 39 and nodefer ~= "strict" and nodefer ~= "expanded" then
+					local j = k + 2
+					while j <= n and src:byte(j) ~= 39 do
+						j = j + (src:byte(j) == 92 and 2 or 1)
+					end
+					ce = j <= n and j
 				end
-				k = k + 1
+				if ce then
+					-- bash's parse_matched_pair translates it and single-quotes the result:
+					-- `(( $'\f' ))` reads `'<FF>'` (still a bad token, as bash's errors show)
+					local t = require("runtime").ansi_unescape(src:sub(k + 2, ce - 1), true)
+					out[#out + 1] = "'" .. t:gsub("'", "'\\''") .. "'"
+					k = ce + 1
+				else
+					if not (c == "$" and not indq and src:sub(k + 1, k + 1):match("[\"']")) then
+						out[#out + 1] = c
+					end
+					k = k + 1
+				end
 			end
 		end
 		if qdollar and not nodefer then -- (its text is bash's: expanded — the quotes removed,
@@ -127,8 +146,12 @@ local function arith(src, nodefer)
 	-- (`let`'s arguments were already expanded and quote-removed: bash strips nothing
 	-- more — `let 'x="1"+2'` is an error and an assoc_expand_once key keeps its quotes)
 	local qtxt = dtxt -- (the quote-stripped text: what bash's errors show, `1 + '2' `)
+	local noexp = nodefer == "let" and M.let_noexpand -- (see nameSub)
+	-- (nor does any text that is expansion OUTPUT — "strict", "expanded": the quotes a value
+	-- holds are just characters, `e='2**"1"'; $(( $e ))` is an operand-expected error)
 	if nodefer == "let" then
 		nodefer = "strict"
+	elseif nodefer == "strict" or nodefer == "expanded" then -- luacheck: ignore 542
 	elseif src:find('"', 1, true) then
 		local o, open = {}, false
 		for k = 1, #src do
@@ -147,7 +170,7 @@ local function arith(src, nodefer)
 		end
 		src = table.concat(o)
 		qtxt = src
-		if src:match("^%s*$") then -- (`$(( "" ))`, a quoted blank subscript: 0 too)
+		if src:match("^[ \t\n]*$") then -- (`$(( "" ))`, a quoted blank subscript: 0 too)
 			return { k = "num", v = "0" }
 		end
 	end
@@ -264,8 +287,8 @@ local function arith(src, nodefer)
 			-- already-expanded text (bash's EXP_EXPANDED): the subscript runs to its `]` as
 			-- skipsubscript reads it (`A[]]` is A[] then a stray `]`; `a[1]+b[2]` two
 			-- elements) and nothing in it re-expands
-			local close = M.subscript_x(src, i)
-			if close <= n then
+			local close = subscript_close(src, i)
+			if close then
 				local raw = src:sub(i + 1, close - 1)
 				i = close + 1
 				local ok, idx = pcall(arith, raw, "expanded")
@@ -276,33 +299,21 @@ local function arith(src, nodefer)
 			end
 		end
 		if starts("[") then
-			-- (to its `]` as expr.c's skipsubscript reads it: an escaped char, '…' "…" `…`
-			-- $( … ) ${ … } nest — `a["]` never closes)
+			-- the `]` as bash's readtok finds it (expr_skipsubscript -> skipsubscript: quotes,
+			-- `\`, nested `[ ]` and $( ) ${ } skipped); none -> "bad array subscript" naming the
+			-- text from the name on (`p[++${'k]}]`: the unclosed quote runs past every `]`)
 			local rs = i + 1
-			local j, bad = M.subscript_x(src, i), nil
-			if j > n then
-				-- (…unless an associative array's already-expanded key under assoc_expand_once:
-				-- expr_skipsubscript's VA_NOEXPAND reads to the `]` without quoting — `a[80's]`.
-				-- Known only at run time: the balanced `]` then, the error deferred — badsub)
-				local depth, k = 1, i + 1
-				while k <= n do
-					local ch = src:sub(k, k)
-					if ch == "\\" then
-						k = k + 1
-					elseif ch == "[" then
-						depth = depth + 1
-					elseif ch == "]" then
-						depth = depth - 1
-						if depth == 0 then
-							break
-						end
-					end
-					k = k + 1
-				end
-				if k > n then
-					error({ __curse_arith = true, msg = "bad array subscript", tok = src:sub(ns) }, 0)
-				end
-				j, bad = k, { tok = src:sub(ns), expr = src }
+			local j
+			if noexp and noexp(nm) then
+				-- let's already-expanded text, assoc_expand_once on and NAME an associative
+				-- array: expr_skipsubscript's VA_NOEXPAND — the first `]`, quotes and all
+				-- (`let "++a[80's]"` keys `80's`)
+				j = src:find("]", rs, true)
+			else
+				j = subscript_close(src, i)
+			end
+			if not j then
+				error({ __curse_arith = true, msg = "bad array subscript", tok = src:sub(ns) }, 0)
 			end
 			local raw = src:sub(rs, j - 1)
 			i = j + 1 -- past the ]
@@ -310,7 +321,7 @@ local function arith(src, nodefer)
 			if not ok then
 				trap_flow(idx)
 			end
-			return nm, (ok and idx) or nil, raw, bad
+			return nm, (ok and idx) or nil, raw
 		end
 		return nm, nil, nil
 	end
@@ -323,11 +334,17 @@ local function arith(src, nodefer)
 		return (src:sub(i, i) == "=" and src:sub(i + 1, i + 1) ~= "=") or src:find("^[%+%-%*/%%&|%^]=", i) ~= nil
 			or src:find("^<<=", i) ~= nil or src:find("^>>=", i) ~= nil
 	end
+	local lookahead -- (below)
 	-- `asgn`: an assignment may start here — only at the head of a lowest-precedence
 	-- expression (bash: assignment binds loosest, so `0 && B=42` is an error)
 	local function primary(asgn)
 		skip()
 		local c = src:sub(i, i)
+		if (c == "+" or c == "-" or c == "!") and src:byte(i + 1) == 61 then
+			-- `+=`, `-=`, `!=` are single tokens to bash's readtok (an assignment operator, NEQ),
+			-- never a sign or `!` before `=`: where an operand belongs, the error names them whole
+			aerr("syntax error: operand expected")
+		end
 		if c == "(" then
 			i = i + 1
 			local e = parseComma()
@@ -335,7 +352,7 @@ local function arith(src, nodefer)
 				if asgn_next() then
 					aerr("attempted assignment to non-variable", e)
 				end
-				aerr("missing `)'", e)
+				aerr("missing `)'", lookahead(e))
 			end
 			e.paren = true -- (complete once its `)` is read: see spine)
 			return e
@@ -352,9 +369,9 @@ local function arith(src, nodefer)
 		if starts("++") or starts("--") then
 			local d = src:sub(i, i) == "+" and 1 or -1
 			i = i + 2
-			local nm, idx, ir, bad = nameSub()
+			local nm, idx, ir = nameSub()
 			-- (readtok: a `++`/`--` right after `++x` is `--x++` — "++: assignment requires lvalue")
-			local node = { k = "pre", name = nm, idx = idx, idxraw = ir, d = d, badsub = bad }
+			local node = { k = "pre", name = nm, idx = idx, idxraw = ir, d = d }
 			if starts("++") or starts("--") then
 				aerr(src:sub(i, i + 1) .. ": assignment requires lvalue", node)
 			end
@@ -462,21 +479,21 @@ local function arith(src, nodefer)
 		-- a name (optionally subscripted): a var, an assignment, or ++/--
 		skip()
 		local ns0 = i -- (where its token starts: a recursion error names the text from there)
-		local name, idx, ir, bad = nameSub()
+		local name, idx, ir = nameSub()
 		-- post ++/--
 		if starts("++") then
 			i = i + 2
-			return { k = "post", name = name, idx = idx, idxraw = ir, d = 1, badsub = bad }
+			return { k = "post", name = name, idx = idx, idxraw = ir, d = 1 }
 		end
 		if starts("--") then
 			i = i + 2
-			return { k = "post", name = name, idx = idx, idxraw = ir, d = -1, badsub = bad }
+			return { k = "post", name = name, idx = idx, idxraw = ir, d = -1 }
 		end
 		-- assignment operators (3-char shifts before their 2-char prefixes)
 		for _, op in ipairs(asgn and { "<<=", ">>=", "+=", "-=", "*=", "/=", "%=", "&=", "^=", "|=" } or {}) do
 			if starts(op) then
 				i = i + #op
-				local node = { k = "asgn", name = name, idx = idx, idxraw = ir, op = op, e = parseExpr(0), badsub = bad }
+				local node = { k = "asgn", name = name, idx = idx, idxraw = ir, op = op, e = parseExpr(0) }
 				if op == "/=" or op == "%=" then
 					skip()
 					node.etxt, node.etok = etxt, lasttp and src:sub(lasttp) or ""
@@ -486,9 +503,54 @@ local function arith(src, nodefer)
 		end
 		if asgn and starts("=") and src:sub(i + 1, i + 1) ~= "=" then
 			i = i + 1
-			return { k = "asgn", name = name, idx = idx, idxraw = ir, op = "=", e = parseExpr(0), badsub = bad }
+			return { k = "asgn", name = name, idx = idx, idxraw = ir, op = "=", e = parseExpr(0) }
 		end
-		return { k = "var", name = name, idx = idx, idxraw = ir, badsub = bad, esrc = src, ep = ns0 }
+		return { k = "var", name = name, idx = idx, idxraw = ir, esrc = src, ep = ns0 }
+	end
+
+	-- A syntax error where a NAME is the unexpected token: bash's readtok had read that name
+	-- (its one-token lookahead) and — unless an `=` follows it — evaluated it right away
+	-- (expr_streval), in the context of the operand before it (a short-circuited one: noeval),
+	-- so its own error comes first (`p='*o*'; $(( 1 p ))`: operand expected at `*o*`).
+	-- `e`: the pre-error AST; returns it with that read attached at its right edge.
+	lookahead = function(e)
+		skip()
+		if not e or not src:find("^[%a_]", i) then
+			return e
+		end
+		local i0, lt0 = i, lasttp
+		local ok, v = pcall(function()
+			local ns0 = i
+			local name, idx, ir = nameSub()
+			skip()
+			if src:sub(i, i) == "=" and src:sub(i + 1, i + 1) ~= "=" then
+				return nil
+			end
+			return { k = "var", name = name, idx = idx, idxraw = ir, esrc = src, ep = ns0 }
+		end)
+		i, lasttp = i0, lt0
+		if not ok or not v then
+			return e
+		end
+		local function attach(x)
+			local k = x.k
+			if x.paren then
+			elseif k == "comma" or k == "bin" then
+				return { k = k, op = x.op, l = x.l, r = attach(x.r) }
+			elseif k == "tern" then
+				return { k = "tern", c = x.c, a = x.a, b = attach(x.b) }
+			elseif k == "asgn" then
+				local c = {}
+				for f, fv in pairs(x) do
+					c[f] = fv
+				end
+				c.e = attach(x.e)
+				return c
+			end
+			-- (an operand: its value, then the name read — `x + 0*name` keeps both in order)
+			return { k = "bin", op = "+", l = x, r = { k = "bin", op = "*", l = ZERO, r = v } }
+		end
+		return attach(e)
 	end
 
 	-- binary operators by precedence (higher binds tighter), matching bash
@@ -587,7 +649,7 @@ local function arith(src, nodefer)
 				if asgn_next() then
 					aerr("attempted assignment to non-variable", { k = "tern", c = c, a = a, b = ZERO })
 				end
-				aerr("`:' expected for conditional expression", { k = "tern", c = c, a = a, b = ZERO })
+				aerr("`:' expected for conditional expression", { k = "tern", c = c, a = lookahead(a), b = ZERO })
 			end
 			if peek() == "" then
 				aerr("expression expected", { k = "tern", c = c, a = a, b = ZERO })
@@ -632,15 +694,16 @@ local function arith(src, nodefer)
 			-- starts no token is ITS error (`x⏎y@`: invalid arithmetic operator at `@`)
 			local j = i
 			while true do
-				local _, ne = src:find("^[%a_][%w_]*", j)
-				if not ne then
+				local ns, ne = src:find("^[%a_][%w_]*", j)
+				if not ns then
 					break
 				end
 				j = ne + 1
 				if src:sub(j, j) == "[" then
 					local cl = M.subscript_close(src, j)
-					if not cl then
-						break
+					if not cl then -- (readtok's expr_skipsubscript found no `]`: that name is
+						-- the token in error — `y[t]y[|`)
+						error({ __curse_arith = true, msg = "bad array subscript", tok = src:sub(ns) }, 0)
 					end
 					j = cl + 1
 				end
@@ -653,7 +716,7 @@ local function arith(src, nodefer)
 				aerr("syntax error: invalid arithmetic operator", spine(e))
 			end
 		end
-		aerr("syntax error in expression", e)
+		aerr("syntax error in expression", lookahead(e))
 	end
 	return e
 end
@@ -828,7 +891,7 @@ local function split_subst(s)
 	end
 	return s, ""
 end
-local function scan_braces(s, bi, dq)
+local function scan_braces(s, bi, dq, onwarn) -- (onwarn: scan_cmdsub's, for a $(…) in it)
 	local i, ns, depth = bi + 1, #s, 1
 	local sq_lit = dq and POSIX_DQ
 	while i <= ns and depth > 0 do
@@ -849,7 +912,7 @@ local function scan_braces(s, bi, dq)
 			end
 			i = i + 1
 		elseif c == "$" and s:sub(i + 1, i + 1) == "(" then
-			i = scan_cmdsub(s, i + 2) -- a `}` inside $(…) doesn't close (unclosed: its error)
+			i = scan_cmdsub(s, i + 2, onwarn) -- a `}` inside $(…) doesn't close (unclosed: its error)
 		elseif c == "$" and s:byte(i + 1) == 91 then -- …nor one inside $[…] (unclosed: its error)
 			i = expansion_end(s, i, dq)
 		elseif c == "`" then -- …nor one inside `…`
@@ -1371,6 +1434,11 @@ scan_cmdsub = function(src, j, onwarn)
 			end
 		end
 	end
+	if onwarn then -- (a here-document opened on the text's last line — its delimiter word ran
+		for _, hd in ipairs(hdp) do -- to the end: bash warns about it there, then the `)`)
+			onwarn(n, n, hd.delim)
+		end
+	end
 	comsub_eof = src:sub(j, j) ~= "(" -- (`$((` unclosed: arithmetic, reported where it began)
 	eof_error(src, j, ")") -- unclosed $(
 end
@@ -1409,6 +1477,25 @@ local function dparen_close(s, j, strict) -- (strict: a quote or expansion left 
 		end
 	end
 	return nil, d
+end
+-- a `$((` at s[k] that is not arithmetic: the index past its P_ARITH extent (parse_comsub's
+-- parse_matched_pair from the second `(`: a `${` nests nothing there) when that ends BEFORE
+-- the $( … ) scanner's end (or the scanner fails), else nil — bash's token ends there:
+-- `$(( ${x:-)} ))` is the word `$(( ${x:-)} )`, then a `)`
+local function pa_short(s, k)
+	local c1 = dparen_close(s, k + 3)
+	if not c1 or s:byte(c1 + 1) == 41 then
+		return nil
+	end
+	local e = dparen_close(s, c1 + 1)
+	if not e then
+		return nil
+	end
+	local ok, je = pcall(scan_cmdsub, s, k + 2)
+	if ok and je and je <= e + 1 then
+		return nil
+	end
+	return e + 1
 end
 -- `$((` is arithmetic ONLY when it's a balanced `$(( expr ))` — the body's close is
 -- immediately followed by another `)`. Otherwise the first `(` opened a subshell
@@ -1501,7 +1588,6 @@ local function subscript_x(s, i) -- skip_matched_pair(s, i, '[', ']', 0): the `]
 	end
 	return n + 1
 end
-M.subscript_x = subscript_x -- (valid_array_reference's skipsubscript: rt / interp)
 local PARAM, QUOTE, QUOTE2, OP, WORD = 1, 2, 3, 4, 5
 dolbrace_x = function(s, i) -- extract_dollar_brace_string(Q_DOUBLE_QUOTES, 0): the `}`, or n + 1
 	local n, st, nest, dbs, start = #s, PARAM, 1, { [0] = PARAM }, i
@@ -1789,7 +1875,11 @@ subscript_close = function(s, i)
 			i = dq_end(s, i, true)
 		elseif b == 36 and (s:byte(i + 1) == 40 or s:byte(i + 1) == 123) then -- $( ${
 			local ok, e = pcall(expansion_end, s, i, false, true)
-			i = ok and e or i + 1
+			if not ok then -- (one the text never closes runs to its end: skip_matched_pair's
+				trap_flow(e)
+				return nil -- extract_dollar_brace_string / extract_delimited_string — `q[${x]`)
+			end
+			i = e
 		else
 			if b == 91 then
 				d = d + 1
@@ -1847,8 +1937,11 @@ local function parse_dollar(w, i, add, q)
 		add({ arith = w:sub(i + 2, j - 1), q = q, bracket = true })
 		return j + 1
 	elseif nx == "(" then
-		local je = scan_cmdsub(w, i + 2) -- index just past the closing `)` (case/quote/nesting aware)
-		add({ cmdsub = comsub_text(w:sub(i + 2, je - 2)), q = q, aenv = ALIAS_ENV, noalias = COMSUB_PREX or nil, posix = POSIX_DQ or nil })
+		-- index just past the closing `)` (case/quote/nesting aware) — or a `$((`'s P_ARITH end
+		local pa = w:byte(i + 2) == 40 and pa_short(w, i)
+		local je = pa or scan_cmdsub(w, i + 2)
+		add({ cmdsub = pa and w:sub(i + 2, je - 2) or comsub_text(w:sub(i + 2, je - 2)), q = q, aenv = ALIAS_ENV,
+			noalias = COMSUB_PREX or nil, posix = POSIX_DQ or nil, backtick = pa and "late" or nil })
 		return je
 	elseif nx == '"' and q then
 		-- inside "…" (or a here-doc body) the `"` after `$` is no $"…" opener: a literal `$`
@@ -2394,7 +2487,9 @@ do
 	local acache, an = {}, 0
 	local aimpl = arith
 	arith = function(src, nodefer)
-		if type(src) == "string" then
+		-- (not memoized: a let under assoc_expand_once, whose subscripts' extent depends on
+		-- which names are associative arrays — M.let_noexpand)
+		if type(src) == "string" and not (nodefer == "let" and M.let_noexpand) then
 			local key = (nodefer == "expanded" and "\3" or nodefer == "strict" and "\2" or nodefer == "let" and "\4" or nodefer and "\1" or "\0") .. src
 			local hit = acache[key]
 			if hit ~= nil then
@@ -2605,7 +2700,11 @@ function M.open_comsub_err(body)
 			break
 		end
 	end
-	return err and unpos(err) or "unexpected EOF while looking for matching `)'"
+	err = err and unpos(err)
+	if err == "syntax error: unexpected end of file" then -- (the body ran out inside a
+		err = nil -- construct: parse_comsub's own EOF — the `)' it was looking for)
+	end
+	return err or "unexpected EOF while looking for matching `)'"
 end
 function M.parse_default_quoted(txt, heredoc)
 	local out, k, m, inq = {}, 1, #txt, false
@@ -2913,6 +3012,13 @@ end
 -- `rq` marks the RHS of ==/!= as fully-quoted (literal, not a glob).
 -- The tokens already passed cond_check (bash's grammar), so the list is well formed:
 -- only bash's unary operators (COND_UNOP) are unary — `[[ -Q ]]` is a string test.
+local function own_word(w)
+	local c = {}
+	for k, v in pairs(w) do
+		c[k] = v
+	end
+	return c
+end
 local function parse_dbracket(toks, quoted)
 	local pos = 1
 	local function peek()
@@ -2942,7 +3048,7 @@ local function parse_dbracket(toks, quoted)
 			pos = pos + 2
 			local rt0 = toks[pos - 1]
 			local rx = COND_ARITH[op] and cond_arith_word(rt0) or rt0
-			local rw = parse_word(rx)
+			local rw = own_word(parse_word(rx)) -- (a copy: parse_word's result is memoized, shared)
 			rw.src, rw.xsub = rt0, rx ~= rt0 or nil -- (the word as written: `declare -f`)
 			local rq = quoted[pos - 1] -- (fully quoted: `"a"*` starts with a quote yet globs)
 			for _, p in ipairs(rq and rw.parts or {}) do
@@ -2952,7 +3058,7 @@ local function parse_dbracket(toks, quoted)
 				end
 			end
 			local lx = COND_ARITH[op] and cond_arith_word(t) or t -- (its subscripts: cond_arith_word)
-			local lw = parse_word(lx)
+			local lw = own_word(parse_word(lx))
 			lw.src, lw.xsub = t, lx ~= t or nil
 			return { kind = "binary", op = op, l = lw, r = rw, rq = rq }
 		end
@@ -4061,10 +4167,28 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs, xg, bq
 		end
 		return nl
 	end
+	-- the token bash's lexer reads at k when no word starts there (read_token's operators,
+	-- longest match; the end or a newline is `newline`)
+	local OPTOKS = { "<<<", "<<-", ";;&", "&>>", "<<", "<&", "<>", ">>", ">&", ">|", "&>", "&&", "||",
+		"|&", ";;", ";&", "<", ">", "&", "|", ";", "(", ")" }
+	local function op_token(k)
+		if k > n or src:byte(k) == 10 or src:byte(k) == 35 then -- (a comment: to the newline)
+			return "newline"
+		end
+		for _, t in ipairs(OPTOKS) do
+			if src:sub(k, k + #t - 1) == t then
+				return t
+			end
+		end
+		return src:sub(k, k)
+	end
 	-- At a command-expected position a control operator means an empty command,
 	-- which bash rejects as a syntax error (status 2): a leading/doubled `;`, `;;`,
 	-- `&`, `&&`, `||`, `|`, or `|&`. Returns the offending token, or nil.
 	local function bare_sep_tok()
+		if src:sub(i, i + 1) == "&>" then -- (`&>` / `&>>` is a redirection: `&>f cmd`)
+			return nil
+		end
 		if src:sub(i, i + 2) == ";;&" then -- (the lexer's longest match: `;;&`, `;&` are tokens)
 			return ";;&"
 		end
@@ -4342,9 +4466,15 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs, xg, bq
 				i = quote_end(src, i, false, true)
 			elseif c == "$" and src:sub(i + 1, i + 1) == "'" and not q0 then
 				i = quote_end(src, i + 1, true, true) -- $'…' ANSI-C quote: \' \\ don't close it
-			elseif c == "$" and src:sub(i + 1, i + 2) == "((" and dparen_is_arith(src, i + 3) then
-				local _, ni = grab_dparen(src, i + 3)
-				i = ni
+			elseif c == "$" and src:sub(i + 1, i + 2) == "((" and (dparen_is_arith(src, i + 3)
+				or not dparen_close(src, i + 3)) then -- (bash reads a `$((` as arithmetic first
+				local _, ni = grab_dparen(src, i + 3) -- — P_ARITH: a `${` in it nests nothing —
+				i = ni -- so one never closed is ITS EOF error: `$(( ${a` wants `)')
+			elseif c == "$" and src:sub(i + 1, i + 2) == "((" and pa_short(src, i) then
+				-- (a `$((` that is no `$(( … ))`: bash's token still ends where parse_matched_pair
+				-- (P_ARITH) balanced it, before the $( … ) reading would: `$(( ${x:-)} ))` is the
+				-- word `$(( ${x:-)} )`, then a `)`)
+				i = pa_short(src, i)
 			elseif c == "$" and src:sub(i + 1, i + 1) == "[" then -- $[expr]: keep whole (spaces inside)
 				i = bracket_close(src, i + 1) + 1
 			elseif c == "$" and src:byte(i + 1) == 36 then -- `$$` (read_token_word): one token
@@ -4417,7 +4547,7 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs, xg, bq
 				break -- metacharacters end a word: redirs (procsub <(/>( handled above), `|`/`&` pipelines/lists & `&&`/`||`/`>&` need no surrounding space
 			elseif c == "$" and src:sub(i + 1, i + 1) == "{" then
 				local bs = i
-				i = scan_braces(src, i + 1, q0) -- ${…}: match the close, honoring \ ' " and nesting
+				i = scan_braces(src, i + 1, q0, hdwarn_for(start, line0)) -- ${…}: match the close, honoring \ ' " and nesting
 				if src:find("$(", bs + 2, true) and src:find("$(", bs + 2, true) < i then
 					braces_comsubs(bs + 2, i - 1)
 				end
@@ -4675,7 +4805,11 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs, xg, bq
 			if src:sub(q, q + 2) == "<<<" then -- herestring: [N]<<< word
 				i = q + 3
 				ws()
-				return { op = "herestring", fd = fd and tonumber(fd) or 0, word = word(true), fdvar = fdvar } -- raw word (expanded at runtime)
+				local hw = src:byte(i) ~= 35 and word(true) or "" -- (`#`: a comment)
+				if hw == "" then -- (no word: bash's token after `<<<` — `<<<`, `;`, `newline`)
+					error("syntax error near `" .. op_token(i) .. "'")
+				end
+				return { op = "herestring", fd = fd and tonumber(fd) or 0, word = hw, fdvar = fdvar } -- raw word (expanded at runtime)
 			end
 			if src:sub(q, q + 1) == "<<" then -- heredoc: [N]<<[-] DELIM  (body collected after the line)
 				local strip = false
@@ -4686,10 +4820,9 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs, xg, bq
 				end
 				i = q
 				ws()
-				local draw = strip_contin(word()) -- (`<<\EOT\<newline>4` is EOT4)
+				local draw = src:byte(i) ~= 35 and strip_contin(word()) or "" -- (`<<\EOT\<newline>4` is EOT4; `#`: a comment)
 				if draw == "" then -- (no delimiter word: bash's token after `<<`)
-					local tok = i > n and "newline" or (src:match("^[;&|<>]+", i) or src:sub(i, i))
-					error("syntax error near `" .. (tok == "\n" and "newline" or tok) .. "'")
+					error("syntax error near `" .. op_token(i) .. "'")
 				end
 				-- ANY quoting anywhere in the delimiter word makes the body literal (bash);
 				-- the delimiter itself is the word with all quotes removed.
@@ -4766,13 +4899,12 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs, xg, bq
 		-- stop_paren: a redirect target is a metacharacter-terminated word, so `)` ends it
 		-- — `(cmd >&7)` / `(cmd >f)` must read `7`/`f` and leave `)` to close the subshell,
 		-- not swallow it into the target (which unbalanced the parse and dropped the pipe).
-		local raw = word(true)
+		local raw = src:byte(i) ~= 35 and word(true) or "" -- (a `#` there starts a comment: bash)
 		-- a redirection with NO word (`echo >`, `cmd <;`) is a syntax error in bash
 		-- (status 2). A quoted empty target (`> ''`) is a real, empty filename — that's
 		-- a runtime failure, not a parse error — so key on the raw word being absent.
 		if raw == "" then
-			local c = src:sub(i, i)
-			error("syntax error near `" .. ((c == "" or c == "\n") and "newline" or c) .. "'")
+			error("syntax error near `" .. op_token(i) .. "'")
 		end
 		return { fd = tfd, op = op, target = unquote(raw), src = raw, fdvar = fdvar, line = line } -- (src: `declare -f`)
 	end
@@ -5251,13 +5383,13 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs, xg, bq
 			-- invalid name as a non-fatal RUNTIME error (status 1), so the interp checks.
 			-- (each header word can come from a trailing-blank alias chain: `FOR eye IN …`)
 			try_alias(false)
-			local s, e = src:find("^[^%s;#()]+", i)
+			local s, e = src:find("^[^%s;#()&|<>]+", i)
 			if not s then -- (bash: the token found instead of a name)
 				if i > n then -- (the input's final newline is the token: bash)
 					error("syntax error near `newline'")
 				end
-				local tok = src:match("^[;&|]+", i) or src:sub(i, i)
-				error("syntax error near `" .. (tok == "\n" and "newline" or tok) .. "'")
+				-- (a comment runs to the newline, which is the token: `for  #3`)
+				error("syntax error near `" .. op_token(i) .. "'")
 			end
 			local name = src:sub(s, e)
 			i = e + 1
@@ -5458,25 +5590,16 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs, xg, bq
 					end
 					break
 				elseif toks[#toks] == "=~" then
-					-- the =~ operand is ONE regex word. TWO nesting counters, because bash
-					-- treats `()` and `[]` differently here: a `( … )` group SHIELDS inner
-					-- spaces (`([a b])` stays whole) but a `[ … ]` bracket class does NOT —
-					-- bash splits `[[ a =~ [a b] ]]` at the space into two words (a syntax
-					-- error). Yet a `]]` INSIDE a bracket class is not the terminator, so
-					-- `[[:space:]]` reads whole. So: `pd` (parens) gates space/`)` breaks;
-					-- `depth` (parens+brackets) gates the `]]` terminator. Operator metachars
-					-- `;` `&` `<` `>` end the operand outside any group (`|` does not — it is
-					-- an ordinary regex char).
-					local rs, pd, depth = i, 0, 0
+					-- the =~ operand is ONE regex word (read_token_word under PST_REGEXP): it ends
+					-- at a metacharacter — blank, newline, `;` `&` `<` `>` `)` — except inside a
+					-- `( … )` group, read whole as parse_matched_pair does (blanks and metachars
+					-- in it are kept: `([a b])`); `|` is an ordinary character. A `[ … ]` bracket
+					-- class shields nothing (`[a b]` splits, `[^;]` ends at the `;`) and `]]` is
+					-- COND_END only as a word of its own (`[[:space:]]`, `a\ ]]` are one word).
+					local rs, pd, po = i, 0, {}
 					while i <= n do
 						local c0 = src:sub(i, i)
-						if depth == 0 and src:sub(i, i + 1) == "]]" then
-							break
-						end
-						if pd == 0 and (c0 == "\n" or c0 == " " or c0 == "\t" or c0 == ")") then
-							break
-						end
-						if pd == 0 and depth == 0 and (c0 == ";" or c0 == "&" or c0 == "<" or c0 == ">") then
+						if pd == 0 and c0:match("[ \t\n;&<>)]") then
 							break
 						end
 						if c0 == "\\" then
@@ -5485,27 +5608,20 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs, xg, bq
 							i = quote_end(src, i, c0 == '"')
 						elseif c0 == "(" then
 							pd = pd + 1
-							depth = depth + 1
+							po[pd] = i
 							i = i + 1
 						elseif c0 == ")" then
-							if pd > 0 then
-								pd = pd - 1
-							end
-							if depth > 0 then
-								depth = depth - 1
-							end
-							i = i + 1
-						elseif c0 == "[" then
-							depth = depth + 1
-							i = i + 1
-						elseif c0 == "]" then
-							if depth > 0 then
-								depth = depth - 1
-							end
+							pd = pd - 1
 							i = i + 1
 						else
 							i = i + 1
 						end
+					end
+					if pd > 0 then -- (a group never closed: parse_matched_pair's EOF error, read
+						pend_err = select(2, pcall(eof_error, src, po[1], ")")) -- by the grammar)
+						toks[#toks + 1] = COND_PEND
+						quoted[#toks] = false
+						break
 					end
 					toks[#toks + 1] = src:sub(rs, i - 1)
 					quoted[#toks] = false
@@ -5824,8 +5940,13 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs, xg, bq
 			-- runs a command named `}` — bash)
 			local noprefix = #assigns + #redirs == 0
 			local pwm = noprefix and peekword()
-			if noprefix and (MISPLACED[pwm] or (src:sub(i, i) == "}" and (i + 1 > n or src:sub(i + 1, i + 1):match("[ \t\n;)]")))) then
-				error("syntax error near `" .. (pwm ~= "" and pwm or "}") .. "'")
+			-- (`}` and `]]` are whole tokens up to any metacharacter: `}(x`, `]]>f` — bash)
+			local cb = noprefix and not pwm and (src:match("^}()", i) or src:match("^%]%]()", i))
+			if cb and cb <= n and not src:sub(cb, cb):match("[ \t\n;&|()<>]") then
+				cb = nil
+			end
+			if noprefix and (MISPLACED[pwm] or cb) then
+				error("syntax error near `" .. (pwm or src:sub(i, cb - 1)) .. "'")
 			end
 		end
 		-- simple command: WORD WORD ...
@@ -5859,9 +5980,16 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs, xg, bq
 					while is_blank(src:sub(k, k)) do
 						k = k + 1
 					end
-					local c2 = src:sub(k, k)
-					error("syntax error near `" .. ((c2 == "" or c2 == "\n") and "newline"
-						or src:match("^[^ \t\n;&|()<>]+", k) or src:match("^[;&|<>]+", k) or c2) .. "'")
+					-- (a word there is read whole first — an unclosed `$(` in it is ITS error,
+					-- `+($(x` — and named as written: `f ($(x) y)` names `$(x)`)
+					if k <= n and not src:sub(k, k):match("[\n;&|()<>#]") then
+						i = k
+						local w = word(true)
+						if w ~= "" then
+							error("syntax error near `" .. w .. "'")
+						end
+					end
+					error("syntax error near `" .. op_token(k) .. "'")
 				end
 				error("syntax error near `('")
 			elseif c == "\n" or c == ";" or c == "#" or c == "&" or c == "|" or c == "(" or c == ")" then
@@ -5882,10 +6010,11 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs, xg, bq
 					local a0 = i
 					i = i + #an + #ap + 1 -- past NAME (+) = ; now on `(`
 					arrayargs = arrayargs or {}
-					local elems = parse_array_elems()
-					-- (src/pos: the arg as written and where it sat among the words, for `declare -f`)
-					arrayargs[#arrayargs + 1] =
-						{ name = an, elems = elems, append = (ap == "+"), src = src:sub(a0, i - 1), pos = #words + 1 }
+					local elems, ltext = parse_array_elems()
+					-- (src/pos: the arg as bash's parser rebuilds it — `(x y)` for `(  x  y )` — and
+					-- where it sat among the words, for `declare -f`)
+					arrayargs[#arrayargs + 1] = { name = an, elems = elems, append = (ap == "+"),
+						src = ltext and (an .. ap .. "=" .. ltext) or src:sub(a0, i - 1), pos = #words + 1 }
 				elseif
 					cmd1
 					and (cmd1.lit == "let" or cmd1.lit == "eval")

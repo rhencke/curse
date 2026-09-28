@@ -20,9 +20,7 @@ return function(sh, cmd, args, hook, tcb)
 			end
 		end
 		if w ~= nil and args[a + 1] ~= nil then -- (too many: the rest of the line is abandoned)
-			io.stderr:write("curse: shift: too many arguments\n")
-			sh.status = 1
-			error({ __curse_exit = 1, __curse_lineabort = not sh.opt_c or nil })
+			rt.too_many(sh, "shift") -- (bash's no_args: DISCARD)
 		end
 		if nn < 0 or nn > sh.nparams then
 			-- (past $#: silent unless shift_verbose — or posix mode, which sets it too)
