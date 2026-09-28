@@ -11190,6 +11190,13 @@ local function glob_conv(glob, pn, patsub, noext)
 	local star = pn and "[^/]*" or ".*"
 	local qmark = pn and "[^/]" or "."
 	local out, i, n = {}, 1, #glob
+	if n > 1024 then
+		-- (a huge pattern: the regex engine's time and memory grow with it — thousands of
+		-- `?`s, `[…]`s — where bash's matcher (lua/smatch.lua) walks it in one pass: every
+		-- caller takes this bit for "match with that one", so no ERE is made at all)
+		M._gh = bit.bor(M._gh, 1)
+		return ""
+	end
 	if lc_mb_cur_max > 1 and glob:find("[\128-\255]") and not M.lc_utf8() then
 		M._gh = bit.bor(M._gh, 1)
 	end
@@ -11258,7 +11265,12 @@ local function glob_conv(glob, pn, patsub, noext)
 				i = i + 2
 			end
 		elseif c == "*" then
-			out[#out + 1] = star
+			-- a run of `*`s (with any `?`s among them: each still one char) is ONE `*`, as
+			-- bash's matcher collapses it (sm_loop.c): `.*.*` means `.*`, and an ERE of
+			-- thousands of them overflowed regcomp's stack (stress-attack S13)
+			if not wasrun then
+				out[#out + 1] = star
+			end
 			i = i + 1
 		elseif c == "?" then
 			out[#out + 1] = qmark
