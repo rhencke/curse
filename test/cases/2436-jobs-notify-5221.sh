@@ -12,7 +12,9 @@ S=${THIS_SH:-bash}
 # notification done. A `( … ) &` job that ends by itself first waits on the fifo `fq` for
 # the shell's `: >fq`: a child that ends between fork and stop_pipeline makes bash's
 # reset_current find no running job, and the ended job is then not current (`+`) — seen
-# under load. The USR1 trap is set after its job's fork: a USR1 that reaches bash's forked
+# under load. Two jobs killed together are killed and settled one at a time, the later one
+# first: reaping the first while the second still ran made the second current (`[2]+`) —
+# seen under load, in bash's reaping order as in curse's. The USR1 trap is set after its job's fork: a USR1 that reaches bash's forked
 # child before its exec would run the inherited trap there, and `sleep 3` then ends Done.
 body='
 settle() { while kill -0 "$1" 2>/dev/null; do sleep 0.01; done; /bin/true; }
@@ -23,7 +25,7 @@ sleep 3 & p=$!; kill -HUP %1; settle $p; echo "e:"; jobs
 sleep 3 & p=$!; kill %1; settle $p; echo "f:"; jobs; wait $p; echo "f wait=$?"
 (read x <fq; exit 3) & : >fq; settle $!; echo "g:"; jobs; wait %1; echo "g=$?"
 (read x <fq; exit 4) & q=$!; : >fq; settle $q; (read x <fq; exit 5) & : >fq; settle $!; echo "h:"; jobs; wait $q; echo "h=$?"
-sleep 3 & a=$!; sleep 3 & b=$!; kill %1 %2; settle $a; settle $b; wait; jobs; echo "i:"; wait $b; echo "i=$?"
+sleep 3 & a=$!; sleep 3 & b=$!; kill %2; settle $b; kill %1; settle $a; wait; jobs; echo "i:"; wait $b; echo "i=$?"
 '
 n() { sed -e 's/[0-9][0-9][0-9][0-9]*/N/g' -e 's/^[^ ]*: line/SH: line/'; }
 rm -f fq; mkfifo fq

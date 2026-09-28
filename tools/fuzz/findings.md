@@ -352,7 +352,9 @@ tiered (harness) and the static build/curse. None of these is in F1-F15.
   `v=v; echo ${v:v}` (`expression recursion level exceeded`). `echo ${v:1+}` agrees.
   (byte-level instance; a tier-disagreement found by the equal-sample differential.)
 
-## F88. Interp mode: a recursive function that turns hot mid-recursion loses `BASH_LINENO` frames
+## F88. FIXED — Interp mode: a recursive function that turns hot mid-recursion loses `BASH_LINENO` frames
+
+- FIXED (fix-f88): the tier, loaded mid-run by an interpreted program's first fragment, notes the program's text (tier note_main: "reads the call stack") before compiling it; the standalone compile of the hot function then keeps frames. test/cases/3000.
 
     h() { r="${BASH_LINENO[*]}"; }
     x=$(:)
@@ -367,7 +369,9 @@ tiered (harness) and the static build/curse. None of these is in F1-F15.
 - Found by the tier oracle (FUZZ_ORACLE=tiers, interp vs compiled) on test/cases/2492 run
   in the sandbox (no `seq` there: its loops don't run, which leaves the `$(seq …)` alone).
 
-## F89. A process substitution's output leaks into `$( )` when the command isn't found
+## F89. FIXED — A process substitution's output leaks into `$( )` when the command isn't found
+
+- FIXED (fix-f88): a <( ) job launched with a stdout of its own (bg_launch opts.fds[1]) never drains into a buffered $( ) capture (co_launch base.own1). Any command, not only a missing one: `$(: <(echo x))` leaked too. test/cases/3001.
 
     x=$(nosuch <(echo leak)); echo "[$x]"
 
@@ -378,7 +382,9 @@ tiered (harness) and the static build/curse. None of these is in F1-F15.
   at top level (`nosuch <(echo leak)`) nothing leaks. Found (tier-oracle host smoke,
   test/cases/2019 in the sandbox: `declare -a arr=($(cat <(echo 1 2)))` with no `cat`).
 
-## F90. Compiled tier: `command not found` inside `$( )` in an assignment names an earlier line
+## F90. FIXED — Compiled tier: `command not found` inside `$( )` in an assignment names an earlier line
+
+- FIXED (fix-f88): a $( ) the runner expands in a NAME=(…) literal or a prefix value numbers its body from its command's line (compiled sets sh.cur_cline, as fb_step does). test/cases/3002.
 
     eval 'cat' <(echo x) 2>/dev/null; echo "st=$?"
     declare -a arr=($(cat <(echo 1 2)))
@@ -389,7 +395,9 @@ tiered (harness) and the static build/curse. None of these is in F1-F15.
   (the nameref cycle at the end changes how the file compiles). Found by the tier oracle
   (compiled vs interp) on test/cases/2019 in the sandbox (no `cat`).
 
-## F91. Compiled tier: a special builtin's usage error leaves its `2>/dev/null` in place
+## F91. FIXED — Compiled tier: a special builtin's usage error leaves its `2>/dev/null` in place
+
+- FIXED (fix-f88): EF.redir_wrap runs a one-call body under pcall and rt.redir_unwind restores the fds before the error propagates (bash's cleanup_redirects; a plain `exit` keeps them). Also: shift's too-many is no_args' DISCARD (rt.too_many), not contained by eval/source. test/cases/3003.
 
     shift 1 2 2>/dev/null
     ( nosuch )
@@ -399,7 +407,9 @@ tiered (harness) and the static build/curse. None of these is in F1-F15.
   arguments" abandons the line, for the rest of the script. Found by the tier oracle
   (compiled vs interp) on test/cases/1640 in the sandbox.
 
-## F92. Interp / tiered under `set -x`: `[[ $s == "…" ]]` with a quoted high byte fails to match
+## F92. FIXED — Interp / tiered under `set -x`: `[[ $s == "…" ]]` with a quoted high byte fails to match
+
+- FIXED (fix-f88): the traced text of a wholly quoted rhs replaced the operand compared; rt.xglob_quote backslashes each character of the locale (every byte in C). test/cases/3004.
 
     s=$'a\x81b'; set -x; [[ $s == "a<0x81>b" ]]; echo $?
 
@@ -410,7 +420,9 @@ tiered (harness) and the static build/curse. None of these is in F1-F15.
   it). Found by the tier oracle (interp vs compiled status) on test/cases/2560 run in
   LC_ALL=C.
 
-## F93. `bash -c`: an expansion error in a subshell exits it with 127 instead of 1
+## F93. FIXED — `bash -c`: an expansion error in a subshell exits it with 127 instead of 1
+
+- FIXED (fix-f88): rt.feof_st — 127 only at the -c string's own top level; ( … ), $( ), a compound pipeline stage or async list (sh.subtop) exit 1, a forked simple command keeps 127. test/cases/3005.
 
     bash -c '( : ${x?} ); echo "sub=$?"'
 
@@ -528,6 +540,8 @@ curse result shown ("all tiers").
   compiled: the same without `line 1: `. (arith)
 
 ## F106. Arithmetic: a quote-broken `${` inside a subscript of an expanded value escapes as a Lua error
+
+- (fix-f88 re-check) The Lua escape no longer reproduces at bf1c58e in a fresh process: fix-f53's guarded re-read entry (parser.reword, interp's subscript expansion) contains it (it reproduces with the 42338f3 tree — fixed there, not a harness state leak). What remains is the message: bash's `bad array subscript (error token is "p[++${'k]}]2*A[ ")` vs curse's `++${'k: bad substitution` (branch fix-f88-a).
 
     e="p[++\${'k]}]2*A["; echo "$(( $e ))"      # fuzz input: 2*p[++${'k]}]2*A[
 

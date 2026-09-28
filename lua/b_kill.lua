@@ -229,6 +229,6 @@ return function(sh, cmd, args, hook, tcb)
 			end
 		end
 		sh.status = any and 0 or 1
-		rt.self_sig_release(sh)
+		rt.self_sig_release(sh, rt.cmd_redirected(sh))
 	end
 end
