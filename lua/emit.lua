@@ -3047,7 +3047,9 @@ function pexp_scalar(pe, lifted)
 			end
 			return ("rt.elem_len(sh, %s, %q, %s)"):format(ename, pe.index, expanded)
 		end
-		val = ("rt.array_elem(sh, %s, %q, %s)"):format(ename, pe.index, expanded)
+		-- (the reference's own name: its helpers resolve it, and a nameref to an unset
+		-- variable names itself in a bad-subscript error — rt.badsub_name)
+		val = ("rt.array_elem(sh, %q, %q, %s)"):format(pe.name, pe.index, expanded)
 		if pe.op == nil then
 			return val
 		end
