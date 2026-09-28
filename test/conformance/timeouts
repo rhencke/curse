@@ -13,4 +13,4 @@ cases     2536-bg-launch-order.sh 40  # ~3.9s of bash CPU: its busy-work is a qu
                                  # ~20ms head start per round is what keeps bash's two `&` children in
                                  # order (${x^^} instead made the ORACLE race: "out of order: 24")
 cases     2710-printf-huge-width.sh 30 # ~3.3s: bash writes ~3.5 GiB of `*`-width padding (INT_MAX-clamped widths) to /dev/null
-cases     2524-wait-killed-jobs-order.sh 40 # ~4s unloaded (bash and curse alike): 150 hot rounds each poll `ps`+`awk` several times, so it scales with load (timed out at load 7 on 4 cores, 2026-09-28)
+cases     2524-wait-killed-jobs-order.sh 40 # ~4-7s unloaded (18.7s of bash seen at load 9) (bash and curse alike): 150 hot rounds each poll `ps`+`awk` several times, so it scales with load (timed out at load 7 on 4 cores, 2026-09-28)

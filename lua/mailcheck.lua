@@ -137,7 +137,7 @@ function M.prompt(sh)
 					msg = rt.L("You have new mail in $_")
 				end
 				local I = require("interp")._int
-				local ok, out = pcall(I.expand_word, sh, require("parser").parse_heredoc(msg, false))
+				local ok, out = pcall(I.expand_word, sh, require("parser").reword(msg, "hd", false))
 				io.write((ok and out or ""), "\n")
 			end
 		end

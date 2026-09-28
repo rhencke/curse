@@ -95,6 +95,7 @@ local function builtin(sh, cmd, args, hook, tcb)
 					local scc = sh.cur_cmd -- (parse_and_execute's restore_lastcom: $BASH_COMMAND)
 					local iee = sh.ign_ee -- (errexit-exempt: -e cleared for the file, as eval does)
 					sh.ign_ee = iee or sh.noerr > 0
+					local sbl = sh.base_line -- (each line group of the file: rt.compound_line)
 					local rok, err = pcall(function()
 						local nextf = P.open(src, sh)
 						local vst = {}
@@ -105,6 +106,7 @@ local function builtin(sh, cmd, args, hook, tcb)
 								M.v_echo(sh, src, nil, vst)
 								break
 							end
+							sh.base_line = lg.eline
 							if sh.jobs_waited or sh.jobs_pending then -- (reading a line: notify_and_cleanup)
 								rt.jobs_line(sh)
 							end
@@ -137,7 +139,7 @@ local function builtin(sh, cmd, args, hook, tcb)
 											error({ __curse_exit = 1 }, 0)
 										end
 										sh.noerr = ne0
-										rt.line_aborted(sh, 1, pf0)
+										rt.line_aborted(sh, 1, pf0, serr)
 										break
 									else
 										error(serr)
@@ -147,6 +149,7 @@ local function builtin(sh, cmd, args, hook, tcb)
 						end
 					end)
 					sh.xdepth, sh.ign_ee = sxd, iee
+					sh.base_line = sbl
 					sh.spb_err = nil -- (a builtin in the file flagged its own: not the source's)
 					sh.cur_cmd = scc
 					sh.sourcedepth = sh.sourcedepth - 1

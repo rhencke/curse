@@ -181,6 +181,26 @@ local function current_line(sh)
 	return line or sh.cur_line or 0
 end
 M.current_line = current_line
+-- The line of the compiled code running NOW, when it (not the interpreter) is innermost —
+-- else nil. Compiled code keeps no sh.cur_cline per command: a $(…)/`…` an arithmetic text
+-- expands at run time (interp's arith_expand_text, reached from compiled [[ -gt ]], (( )),
+-- $((…))) numbers its body from here, not from a line an earlier command left behind.
+function M.compiled_line(sh)
+	local getinfo, getlocal = debug.getinfo, debug.getlocal
+	for level = 3, 200 do
+		local info = getinfo(level, "f")
+		if not info or M.INTERP_FRAMES[info.func] then
+			return nil
+		end
+		local t = M.PCLINE[info.func]
+		if t then
+			local _, pc = getlocal(level, 2)
+			local ln = pc_line(sh, t, pc)
+			return ln and ln > 0 and ln or nil
+		end
+	end
+	return nil
+end
 -- the prefix's parts: the name (with `eval'/`-c' label) and the line (0: none)
 function M.err_where(sh)
 	if sh.opt_i then
@@ -392,6 +412,8 @@ function Shell.new()
 	local sh = setmetatable({
 		vars = {}, -- name -> { s = string?, n = int64? }  (lazy: fill on demand)
 		status = 0, -- $?
+		loopdepth = 0, -- (the loops around the running command: never nil — compiled
+		-- break/continue compare it: `$(for i in 1; do break 2; done)`)
 		argv0 = "bash", -- $0 (set by the CLI/daemon to the script/shell name)
 		shellname = "bash", -- the shell we're mimicking, from our invocation basename
 		-- (\s prompt escape, posix-when-sh). Set by the CLI.
@@ -2217,8 +2239,11 @@ end
 -- applier (interp's apply_redirs on a one-element list — its own messages, ambiguity and
 -- noclobber rules), its fd saves appended to the compiled `saves` so redir_restore undoes
 -- them. Returns the applier's ok.
-function M.redir_apply_one(sh, r, saves, ctx) -- (ctx: the command, naming a {v} error)
-	local I = require("interp")._int
+function M.redir_apply_one(sh, r, saves, ctx, cline) -- (ctx: the command, naming a {v} error;
+	local I = require("interp")._int -- cline: its line, where a $(…) in it numbers from)
+	if cline then
+		sh.cur_cline = cline
+	end
 	if not saves.out_sh and sh.out ~= io.write and I.redirs_touch_stdout({ r }) then
 		saves.out_sh, saves.out = sh, sh.out -- (a pipeline stage, a buffered capture: builtins
 		-- write fd 1 directly — M.redir_apply)
@@ -2312,7 +2337,7 @@ function M.prefix_ro(sh, names, cmd)
 	for _, name in ipairs(names) do
 		local dn = sh:deref(name)
 		local b = sh.vars[dn]
-		if b and b.ro then
+		if b and b.ro and not (M.pb_said and M.pb_said[name]) then -- (said already: set -x)
 			io.stderr:write("curse: " .. name .. ": readonly variable\n")
 			M.report_exit(sh) -- (err_readonly: report_error)
 			said = said or {}
@@ -2358,7 +2383,7 @@ function M.redir_restore(saves) -- (a compiled command's)
 		M.clear_stdout_err() -- unchecked builtin's failed write is dropped with its redirection)
 	end
 	M.live_werr = nil
-	M.ro_said = nil -- (M.prefix_ro: the command it was said for has bound, or never ran)
+	M.ro_said, M.pb_said = nil, nil -- (M.prefix_ro: the command it was said for has bound, or never ran)
 	M.redir_undo(saves)
 end
 
@@ -2440,7 +2465,65 @@ function M.redir_ext(sh, name, args, i, ok, res)
 	if type(res) ~= "table" or not res.__curse_exit or not M.redir_forks(sh, name, args, i) then
 		error(res, 0) -- (a function or builtin runs in the shell itself: fatal)
 	end
+	-- (a DISCARD that set no status of its own ends the forked child with the one it had:
+	-- the command's status — M.redir_failst)
+	sh.redir_xst = res.__curse_keepst and res.__curse_exit or nil
 	return false
+end
+-- The line a compound command's redirection error names (both tiers' interpreter path):
+-- bash's executing_line_number — a for (( )), [[ ]] or (( )) its own line; a top-level
+-- compound its end (the reader's line); a nested one bash's line_number of the moment, which
+-- only simple commands, for/select/case, subshells and function calls set (sh.base_line:
+-- the enclosing one of those, else the reader's line after the top-level command); nil: as is
+function M.compound_line(sh, st)
+	local t = st.t
+	if t == "forc" or t == "arithcmd" or t == "dbracket" then
+		return st.line
+	end
+	if st.top then
+		return st.redirs and st.redirs[1] and st.redirs[1].line
+	end
+	return sh.base_line
+end
+-- Does a null command (no command word) with these redirections run them in a forked child?
+-- bash's execute_null_command forces the fork for a `{v}` redirection, and for an input
+-- redirection, a word dup/move or a close onto fd 0 (both tiers: the interpreter runs it)
+function M.null_forks(redirs)
+	for _, r in ipairs(redirs or {}) do
+		if r.fdvar then
+			return true
+		end
+		if (r.fd or 0) == 0 and (r.op == "in" or r.op == "rw" or ((r.op == "dup" or r.op == "dupin")
+			and not (r.target or ""):match("^%d+$"))) then
+			return true
+		end
+	end
+	return false
+end
+-- ...and runs them so (both tiers): in a subshell, v never set here; $? the child's — as
+-- it was (the last substitution's), 1 when a redirection failed
+function M.null_redirs_fork(sh, redirs)
+	local I = require("interp")._int
+	local saves
+	local ok, err = pcall(sh.subshell_run, sh, function(sh)
+		local sv, rok = I.apply_redirs(sh, redirs)
+		saves = sv
+		if not rok then
+			sh.status = 1
+		end
+	end)
+	if saves then
+		M.redir_undo(saves)
+	end
+	if not ok then
+		error(err, 0)
+	end
+end
+-- The status of a command whose redirections failed: 1, or what M.redir_ext noted
+function M.redir_failst(sh)
+	local st = sh.redir_xst or 1
+	sh.redir_xst = nil
+	return st
 end
 function M.redir_apply_expand(sh, op, fd, segs, raw, saves)
 	local ok, fs
@@ -3277,7 +3360,7 @@ function Shell:capture_src(src, backtick, noalias, line0)
 			-- mode, and it must name exactly one file)
 			self.ncs = (self.ncs or 0) + 1 -- (a substitution performed: see capture_inproc)
 			local raw = st.redirs[1].src or st.redirs[1].target or "" -- (as written: quotes kept)
-			local eok, fs = M.redir_noglob(self, I.expand_to_fields, self, P.parse_word(raw))
+			local eok, fs = M.redir_noglob(self, I.expand_to_fields, self, P.reword(raw))
 			if not eok then
 				self.status, self.last_cmdsub_status = 1, 1
 				return ""
@@ -7700,9 +7783,9 @@ end
 -- int64 integer power (** operator) for the compiled backend. bash disallows a
 -- negative exponent: throw the same non-fatal matherr div0 does (lineabort so a
 -- word-context $(( )) aborts the command; matherr so a (( )) pcall maps it to $?=1).
-function M.ipow(base, exp, etxt, etok)
+function M.ipow(base, exp, etxt, etok, sh)
 	if exp < 0 then
-		M.arith_fault(etxt, etok, "exponent less than 0")
+		M.arith_fault(etxt, etok, "exponent less than 0", sh)
 	end
 	return M.ipow_raw(base, exp)
 end
@@ -7712,8 +7795,19 @@ end
 -- makes run_lazy fast-forward past the rest of the current input LINE (bash's
 -- line-oriented abort). Shared by both tiers so the compiled path faults alike.
 -- (etxt/etok: the expression + bash's error token, baked in by the compiler when known)
-local function div0(etxt, etok, msg)
+-- (sh: the text has expansions — `${#b}`, `$x`, read natively — and bash's message shows
+-- the text as it expanded it, before evaluating: expanded again here, as bash's textual path
+-- does, with its subscript quoting)
+local function div0(etxt, etok, msg, sh)
 	msg = msg or "division by 0"
+	if etxt and sh and etxt:find("[$`]") then
+		local I = require("interp")._int
+		local ok, t = pcall(I.arith_expand_text, sh, etxt)
+		local ok2, k = pcall(I.arith_expand_text, sh, etok or "")
+		if ok and ok2 then
+			etxt, etok = t, k
+		end
+	end
 	if etxt then
 		msg = require("parser").arith_errmsg(etxt, { msg = msg, tok = etok })
 	end
@@ -7721,15 +7815,15 @@ local function div0(etxt, etok, msg)
 	error({ __curse_exit = 1, __curse_matherr = true, __curse_lineabort = true })
 end
 M.arith_fault = div0
-function M.idiv(l, r, etxt, etok)
+function M.idiv(l, r, etxt, etok, sh)
 	if r == i64(0) then
-		div0(etxt, etok)
+		div0(etxt, etok, nil, sh)
 	end
 	return l / r
 end
-function M.imod(l, r, etxt, etok)
+function M.imod(l, r, etxt, etok, sh)
 	if r == i64(0) then
-		div0(etxt, etok)
+		div0(etxt, etok, nil, sh)
 	end
 	return l % r
 end
@@ -9831,7 +9925,7 @@ function M.var_len(sh, name)
 			return i64(M.mb_strlen(s))
 		end
 	end
-	local w = require("parser").parse_word("${#" .. name .. "}")
+	local w = require("parser").reword("${#" .. name .. "}")
 	return i64(tonumber(require("interp")._int.expand_part_str(sh, w.parts[1])) or 0)
 end
 function M.plain_scalar(sh, name)
@@ -10067,7 +10161,10 @@ end
 -- A line abort contained (bash's DISCARD caught by reader_loop / parse_and_execute): the
 -- status is the failure's, and so is $PIPESTATUS — exp_jump_to_top_level and set_exit_status
 -- both set_pipestatus_from_exit — whatever statement (an assignment too) was abandoned.
-function M.line_aborted(sh, status, pf0) -- (pf0: the <()/>() count before the line ran)
+function M.line_aborted(sh, status, pf0, err) -- (pf0: the <()/>() count before the line ran)
+	if type(err) == "table" and err.__curse_keepst then -- (a DISCARD that set no status of its
+		status = err.__curse_exit -- own: reader_loop keeps a non-zero one — see its raiser)
+	end
 	local pf = sh.procsub_files
 	if pf0 and pf and #pf > pf0 then -- (the aborted line's <() close with it: bash's
 		require("interp")._int.drain_procsub(sh, 0, pf0) -- unlink_fifo_list at top level)
@@ -13691,7 +13788,10 @@ function M.array_key(sh, name, raw, expanded, inarith)
 		if pok or not (type(pe) == "table" and pe.__curse_matherr) then
 			io.stderr:write("curse: " .. require("parser").arith_errmsg(raw, perr) .. "\n")
 		end
-		error({ __curse_exit = 1, __curse_lineabort = true })
+		-- (interp's arith_key: array_expand_index's DISCARD — out of every eval, function and
+		-- trap level; an EXIT trap it ends keeps its saved status)
+		error({ __curse_exit = 1, __curse_matherr = true, __curse_experr = true, __curse_lineabort = true,
+			__curse_subscript = true, __curse_discard = true })
 	end
 	return require("interp")._int.arith_key(sh, name, idx, raw, inarith)
 end
@@ -13877,7 +13977,27 @@ end
 -- at all is unbound (named bare, as array_length_reference does); an unset element of an
 -- existing array is length 0 — expand_param's exact rule.
 function M.elem_len(sh, name, raw, expanded)
+	local z = M.elem_len_pre(sh, name)
+	if z then
+		return z
+	end
 	return sh:expand_param({ name = name, index = raw, op = "len" }, nil, nil, M.array_key(sh, name, raw, expanded))
+end
+-- ${#NAME[SUB]} (SUB not @ or *), both tiers: bash's array_length_reference looks at the
+-- variable BEFORE it evaluates SUB — under set -u one that doesn't exist, is invisible
+-- (`declare -a e`) or isn't an array is the unbound NAME; one that doesn't exist or is
+-- invisible is 0, its subscript never evaluated (`${#v[x y]}`, `${#A[$(cmd)]}`). "0" then,
+-- else nil: evaluate the subscript.
+function M.elem_len_pre(sh, name)
+	local seen = M.var_visible(sh, name) or sh:special_get(name) ~= "" -- (a dynamic variable is
+	-- read as it's found: `${#RANDOM[1]}` steps the generator, as bash's find_variable does)
+	if sh.opt_u and not (seen and (sh.vars[sh:deref(name)] or {}).arr) then
+		io.stderr:write("curse: " .. name .. ": unbound variable\n")
+		error({ __curse_exit = sh.opt_c and 127 or 1, __curse_lineabort = sh.opt_i or nil })
+	end
+	if not seen then
+		return "0"
+	end
 end
 -- Read an array/assoc ELEMENT in ARITHMETIC context (`$(( a[i] ))`), exactly interp's arith
 -- var-with-idx path (interp.lua ~448): a set -u check on the BASE var (arith_nounset — FATAL
@@ -13977,6 +14097,14 @@ function M.arith_read_elem(sh, name, raw, expanded)
 		return i64(0) -- evaluation stopped there — nothing more is read or said)
 	end
 	local I = require("interp")._int
+	if (sh.arith_depth or 0) + 1 >= 1024 and not sh:is_assoc(name) then -- (its subscript's
+		-- evaluation is the nesting level that fails: interp's element read)
+		local et = sh.arith_etxt or (name .. "[" .. raw .. "]")
+		local tp = et:find("%f[%w_]" .. name .. "%[") or 1
+		local err = M.arith_recur_err((et:gsub("^[ \t\n]+", "")), et:sub(tp))
+		err.__curse_subscript, err.__curse_discard = true, true
+		error(err, 0)
+	end
 	I.arith_nounset(sh, name) -- fatal if the base var is unset under set -u (outside the pcall)
 	if M.arith_badraw(sh, name, raw, "r") then
 		return i64(0)
@@ -15251,8 +15379,13 @@ function M.run_prefix(sh, names, vals, runfn, argv)
 	local svm, svc = sh.pb_mode, sh.pb_cmd
 	sh.pb_mode, sh.pb_cmd = "pre", argv and argv[1] -- (the caller traced them)
 	for i = 1, #names do
-		M.pbind(sh, names[i], vals[i])
+		if vals[i] ~= M.PB_SKIP then
+			M.pbind(sh, names[i], vals[i])
+		elseif not (M.pb_said and M.pb_said[names[i]]) then -- (refused before it expanded:
+			M.pbind_skip(sh, names[i]) -- its report, in the binding's turn — M.pbind_skip)
+		end
 	end
+	M.pb_said = nil
 	sh.pb_mode, sh.pb_cmd = svm, svc
 	sh.tenv_call_base = base -- a DIRECT function call tags these with its frame (local absorption)
 	local ok, err = pcall(runfn)
@@ -15830,6 +15963,20 @@ function M.arith_read(sh, name)
 	end
 	return M.arith_read_slow(sh, name, s)
 end
+-- bash's "expression recursion level exceeded" (both tiers): a variable read when the
+-- nesting of evaluated values is at bash's limit — reported in the ENCLOSING expression, at
+-- the variable's token — raised through every level and said once, by the outermost read
+-- (a stack that deep hides the command's line)
+function M.arith_recur_err(etxt, tok)
+	return { __curse_exit = 1, __curse_matherr = true, __curse_experr = true, __curse_lineabort = true,
+		__curse_recmsg = require("parser").arith_errmsg(etxt, { msg = "expression recursion level exceeded", tok = tok }) }
+end
+function M.arith_recur_say(sh, v)
+	if type(v) == "table" and v.__curse_recmsg and (sh.arith_depth or 0) == 0 then
+		io.stderr:write("curse: " .. v.__curse_recmsg .. "\n")
+		v.__curse_recmsg = nil
+	end
+end
 function M.arith_read_slow(sh, name, s)
 	-- Non-numeric VALUE (a stored expression like x="1+2"): COMPILE it to native ops and
 	-- run — exactly what interp's arith_read -> arith_resolve -> eval does, but as genuine
@@ -15848,12 +15995,16 @@ function M.arith_read_slow(sh, name, s)
 			-- a nested bad value swallowed to 0, and a real matherr/experr mapped to a
 			-- non-fatal $?=1 inside (( )) (sh.arithfault flag) or a line-abort in a word $((…)).
 			local ok, v = pcall(function()
-				if (sh.arith_depth or 0) >= 1024 then -- (said by the outermost level, below)
-					error({ __curse_exit = 1, __curse_matherr = true, __curse_experr = true, __curse_lineabort = true,
-						__curse_recur = s })
+				if (sh.arith_depth or 0) >= 1023 then -- (said by the outermost level, below)
+					local et = sh.arith_etxt or s -- (the text reading `name`: its first token)
+					local tp = et:find("%f[%w_]" .. name .. "%f[^%w_]") or 1
+					error(M.arith_recur_err((et:gsub("^[ \t\n]+", "")), et:sub(tp)))
 				end
 				sh.arith_depth = (sh.arith_depth or 0) + 1
+				local se = sh.arith_etxt
+				sh.arith_etxt = s
 				local ok2, r = pcall(fn, sh)
+				sh.arith_etxt = se
 				sh.arith_depth = sh.arith_depth - 1
 				if not ok2 then
 					require("parser").trap_flow(r)
@@ -15868,13 +16019,11 @@ function M.arith_read_slow(sh, name, s)
 				return v
 			end
 			if type(v) == "table" and (v.__curse_matherr or v.__curse_experr) then
-				if v.__curse_recur then
+				if v.__curse_recmsg then
 					if (sh.arith_depth or 0) > 0 then
 						error(v, 0) -- (up to the outermost read, where the line is still known)
 					end
-					io.stderr:write("curse: " .. require("parser").arith_errmsg(v.__curse_recur,
-						{ msg = "expression recursion level exceeded", tok = v.__curse_recur }) .. "\n")
-					v.__curse_recur = nil
+					M.arith_recur_say(sh, v)
 				end
 				if sh.in_arithcmd then
 					sh.arithfault = true
@@ -17025,6 +17174,9 @@ end
 function M.assign_elem(sh, w)
 	return require("interp").expand_assign_word(sh, w)
 end
+function M.assign_elem_raw(sh, raw) -- (a subscript text read at run time: parser.reword)
+	return require("interp").expand_assign_word(sh, require("parser").reword(raw))
+end
 -- shopt -s extdebug: the DEBUG trap before a compiled command; a non-zero status skips
 -- the command — raised as the pc it continues at, for the catcher of the CFG `cfg`
 -- (tier.run_compiled for `run`, rt.catch_dbgskip for a function's)
@@ -17184,6 +17336,30 @@ do
 			M.assign_jump(sh, sh.pb_mode == "persist" or sh.pb_mode == "perm")
 		end
 		return true -- (not posix: tempenv_assign_error — the command still runs)
+	end
+	-- A command's prefix binding of a readonly or noassign variable (BASH_SOURCE, FUNCNAME,
+	-- GROUPS, …) is refused BEFORE its value is expanded — bash's assign_in_env: no command
+	-- substitution in it runs (the readonly one reported). True: skip it. (Not with no command
+	-- after all: a plain assignment expands first.)
+	M.PB_SKIP = setmetatable({}, { __tostring = function() return "" end })
+	function M.pbind_skip_say(sh, name) -- (set -x: the report in the traced bindings' order)
+		M.pb_said = M.pb_said or {}
+		M.pb_said[name] = true
+		M.pbind_skip(sh, name)
+	end
+	function M.pbind_skip(sh, name, quiet) -- (quiet: only say whether; reported at binding)
+		if sh.pb_mode == "perm" then
+			return false
+		end
+		if M.noassign_live(sh, sh:deref(name)) then
+			return true
+		end
+		if quiet then
+			local dn = sh:deref(name)
+			local b = sh.vars[dn]
+			return (b and b.ro) or dn == "SHELLOPTS" or dn == "BASHOPTS" or false
+		end
+		return M.prefix_reject(sh, name)
 	end
 	-- One prefix binding's store `name=value` (value already expanded, nil = its expansion
 	-- failed; `append` for name+=value), in the mode sh.pb_mode: "tenv" a temporary binding
@@ -17516,7 +17692,7 @@ do
 			end
 			if not rres then
 				M.redir_restore(rs)
-				sh.status = 1
+				sh.status = rs.xstatus or 1
 				return
 			end
 			local ok, err = pcall(M.sr_run_cmd, sh, argv, spec, hook, nil, traced)
@@ -18030,11 +18206,97 @@ end
 -- loop): the menu goes to stderr; each round prints $PS3, reads a line from stdin — EOF ends
 -- the loop (a newline to stdout, status 1), an empty line redisplays the menu, anything else
 -- sets REPLY and NAME (the chosen item, or empty) and runs the body.
-function M.select_menu(sh, list)
-	local width = #tostring(#list)
-	for k, item in ipairs(list) do -- (an item is a C string: `$'ab\0cd'` shows `ab` — print_select_list)
-		io.stderr:write(("%" .. width .. "d) %s\n"):format(k, M.cstr(item)))
+-- bash's displen: a string's display width (mbstowcs + wcswidth): 0 when it isn't valid
+-- text in the locale, its byte length when a character in it has no width (a control)
+local _dl_wc, _dl_st = ffi.new("int[1]"), ffi.new("curse_mbstate_t")
+local function displen(s)
+	if not s:find("[%z\1-\31\127-\255]") then
+		return #s
 	end
+	ffi.fill(_dl_st, ffi.sizeof(_dl_st))
+	local ptr, i, n, w = ffi.cast("const char *", s), 0, #s, 0
+	while i < n do
+		local r = tonumber(C.mbrtowc(_dl_wc, ptr + i, n - i, _dl_st))
+		if r == 0 or r > n - i then -- (invalid or incomplete: mbstowcs fails)
+			return 0
+		end
+		local cw = tonumber(C.wcwidth(_dl_wc[0]))
+		if cw < 0 then
+			return #s
+		end
+		w, i = w + cw, i + r
+	end
+	return w
+end
+-- default_columns: $COLUMNS when it's a positive number, else (checkwinsize) the size of
+-- the terminal on stderr — which sets LINES and COLUMNS — else 80
+local _ws = ffi.new("unsigned short[4]")
+local function default_columns(sh)
+	local v = sh.vars["COLUMNS"] and sh:get("COLUMNS")
+	local c = v and tonumber(v:match("^%s*([+-]?%d+)")) or -1
+	if c > 0 then
+		return math.min(c, 2147483647)
+	end
+	if sh.shopt.checkwinsize ~= false and C.curse_rt_ioctl_int(2, 0x5413, ffi.cast("int *", _ws)) == 0
+		and _ws[0] > 0 and _ws[1] > 0 then -- TIOCGWINSZ
+		sh:set_str("LINES", tostring(_ws[0]))
+		sh:set_str("COLUMNS", tostring(_ws[1]))
+		return _ws[1]
+	end
+	return 80
+end
+local function number_len(s)
+	return s < 10 and 1 or s < 100 and 2 or s < 1000 and 3 or s < 10000 and 4 or s < 100000 and 5 or 6
+end
+-- The menu, as print_select_list lays it out: the items in columns across $COLUMNS, numbered
+-- down each column, tabs (every 8) then spaces up to each column. (An item is a C string:
+-- `$'ab\0cd'` shows `ab`.)
+function M.select_menu(sh, list)
+	local n = #list
+	local items, maxlen = {}, 0
+	for k = 1, n do
+		items[k] = M.cstr(list[k])
+		maxlen = math.max(maxlen, displen(items[k]))
+	end
+	local ilen = number_len(n)
+	maxlen = maxlen + ilen + 4 -- (RP_SPACE_LEN + 2)
+	local cols = math.floor(default_columns(sh) / maxlen)
+	if cols == 0 then
+		cols = 1
+	end
+	local rows = math.floor(n / cols) + (n % cols ~= 0 and 1 or 0)
+	cols = math.floor(n / rows) + (n % rows ~= 0 and 1 or 0)
+	if rows == 1 then
+		rows, cols = cols, 1
+	end
+	local first = number_len(rows)
+	local out = {}
+	for row = 0, rows - 1 do
+		local ind, pos = row, 0
+		while true do
+			local il = pos == 0 and first or ilen
+			local item = items[ind + 1]
+			out[#out + 1] = ("%" .. il .. "d) %s"):format(ind + 1, item)
+			local elen = displen(item) + il + 2
+			ind = ind + rows
+			if ind >= n then
+				break
+			end
+			local from, to = pos + elen, pos + maxlen -- (indent: tabs, then spaces)
+			while from < to do
+				if math.floor(to / 8) > math.floor(from / 8) then
+					out[#out + 1] = "\t"
+					from = from + 8 - from % 8
+				else
+					out[#out + 1] = " "
+					from = from + 1
+				end
+			end
+			pos = pos + maxlen
+		end
+		out[#out + 1] = "\n"
+	end
+	io.stderr:write(table.concat(out))
 end
 function M.select_next(sh, list, name)
 	local getc = require("interp")._int.fd_getc
