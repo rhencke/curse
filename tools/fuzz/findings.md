@@ -1268,3 +1268,139 @@ signal race; known.tsv), one is UB (unbounded recursion), one now agrees.
   variable is refused before its value expands (BASH_SOURCE=$(…) p ran nothing in bash).
   test/cases/2774-prefix-noassign-no-expansion.sh
 - F86 FIXED — test/cases/2775-nameref-noassign-array.sh
+
+# Overnight fuzz-night campaign (gram:tiered + gram:compiled, containerized), branch fuzz-night
+
+Both found by campaign 1 (25 min, `gram:tiered`+`gram:compiled` in `fuzz-docker`), reduced by
+hand, checked with `cmp.sh` in the container (bash 5.2.21 vs curse interp / compiled / tiered /
+static) against the current main (bf1c58e, after the fix-f53 merge landed mid-campaign — a
+third candidate from this same batch, an ambiguous-redirect error on a backgrounded compound
+losing its `line N:` prefix, turned out to already be fixed by that merge's
+2766-compound-redirect-error-line.sh and was dropped).
+
+## F119. Compiled tier: a `for`/`select` loop assigning into a readonly special variable bypasses the readonly check and overwrites it
+
+    old=$UID
+    for UID in a b
+    do
+        :
+    done
+    echo "UID=$UID same=$([ "$UID" = "$old" ] && echo yes || echo no)"
+
+- bash, curse interp/tiered/static: `S: line 2: UID: readonly variable` on the first
+  iteration (the loop still runs), `UID=$old same=yes` (UID unchanged), status 0.
+- curse compiled tier only: no error at all, and `UID` is silently overwritten by the loop
+  (`UID=b same=no`) — the compiled tier's `for` loop doesn't check the readonly attribute
+  before storing the iteration variable, so assigning into any readonly variable through a
+  `for`/`select` list (not just a special one) escapes detection entirely and corrupts it.
+  (gram:compiled queue; not touched by the for-loop line-attribution fixes in F62/F69/F79.)
+
+## F120. `(( ${} ))`: bash's bad-substitution message keeps the subexpression's surrounding whitespace, curse trims it
+
+    (( ${} ))
+
+- bash: `S: line 1:  ${} : bad substitution` (the arithmetic subexpression text ` ${} `,
+  spaces included, is echoed verbatim between "line 1:" and the message).
+- curse (all tiers): `S: line 1: ${}: bad substitution` (trimmed to `${}`, no surrounding
+  spaces) — a narrower case than F33 (`${}` alone): F33's fix only normalizes `${}` with no
+  space before the following text, so `${} ` (a trailing space before the closer) still
+  disagrees. (gram:tiered queue)
+
+## Campaign 2 (gram:tiers + gram:parse, containerized), branch fuzz-night
+
+## F121. Compiled tier: after an `eval`'d `trap ... ERR` sets a variable to `!`, using it unquoted as a command word runs the rest of the line as a negated pipeline instead of trying to execute a program named `!`
+
+    eval "trap \"v='!'\" ERR"
+    false
+    $v echo hi
+
+- bash, curse interp/tiered/static: `false` fires the ERR trap (`v='!'`); `$v echo hi`
+  expands to the words `!` `echo` `hi`, run as a simple command named `!` (the value came
+  from expansion, so `!`'s reserved-word negation never applies): `S: line 3: !: command
+  not found`, status 127.
+- curse compiled tier only: status 0, stdout `hi` — it executes `echo hi` with its status
+  negated, i.e. it treats the *expanded* word `!` as bash's literal negation operator. The
+  loop the fuzzer wrapped this in (a 120-iteration `for` re-registering the same trap) was
+  incidental — reduces without it; needs the trap set through `eval`, not a literal
+  top-level `trap` statement (a bare `trap "v='!'" ERR` at top level does not trigger it).
+  (gram:tiers queue, the in-loop tier oracle: interp vs compiled vs tiered)
+
+## Campaign 3 (gram:arith + gram:pexp, containerized), branch fuzz-night
+
+Both targeted fuzzers (persistent AFL loop over curse's own forkserver child, README
+"Targeted in-process fuzzers"); every candidate below was independently re-run through
+`harness-plain` (one process, no loop) with a fresh `unshare` before being recorded, per
+the campaign brief's fork-per-input verification requirement, since `FUZZ_TLOOP=1` isn't
+wired through `docker/run.sh`'s env passthrough.
+
+## F122. `${name[*]@A}` / `${name[@]@A}` on a plain scalar: bash uses the light `${@Q}`-style quoting, curse uses full `declare -p` output
+
+    w='hello world'
+    echo "${w[*]@A}"
+    echo "${w[@]@A}"
+    echo "${w@A}"
+
+- bash: `w='hello world'` for all three (a `[*]`/`[@]` subscript on a non-array name makes
+  `@A` fall back to the same lightweight `name='value'` form as the subscript-less
+  `${w@A}`, not `declare -p`'s output).
+- curse (all tiers): `declare -- w="hello world"` for the first two (the generic
+  `declare -p`-style format, as if `w` were addressed by `declare -p w`), only agreeing
+  with bash on the subscript-less `${w@A}`. Found by `gram:pexp` (this shape — any
+  `${VAR[*]@A}`/`${VAR[@]@A}` on a scalar — was the majority of the campaign's ~140
+  unbucketed pexp signatures, e.g. `${r+${w[*]@A}} ${lo:x}`); confirmed fresh with
+  `harness-plain` before reduction, then reduced and reconfirmed with `cmp.sh` outside the
+  target harness.
+
+## Campaign 4 (gram:glob + gram:regex, containerized), branch fuzz-night
+
+## F123. `BASH_REMATCH`'s `declare -p` drops one level of backslash-escaping for a captured value ending in a literal backslash
+
+    shopt -s nocasematch xpg_echo
+    s=$'x\x5c'
+    re=$'\x5cw\x5b\x5ea\x5d'
+    [[ $s =~ $re ]]
+    declare -p BASH_REMATCH
+
+(i.e. `s='x\'`, `re='\w[^a]'`: `\w` matches `x`, `[^a]` matches the backslash.)
+
+- bash: `declare -a BASH_REMATCH=([0]="x\\")` — the captured value `x\` (2 chars),
+  correctly double-escaped for `declare -p`'s re-parseable double-quoted form.
+- curse (all tiers): `declare -a BASH_REMATCH=([0]="x\")` — only one backslash: not valid
+  shell syntax fed back in (the trailing `\"` would escape the closing quote). Specific to
+  a regex-captured value: a plain array literal with the same value
+  (`a=('x\'); declare -p a`) prints correctly on both sides (`declare -a a=([0]="x\\")`),
+  so the capture path stores/prints the match differently from a normal assignment.
+  Found by `gram:regex`; confirmed fresh with `harness-plain`, then reduced with `cmp.sh`
+  (a same-value simplification with `x\\` written directly, no `\w`/`[^a]` regex classes
+  or `$'...\x..'` escapes, did not reproduce — those pieces matter, not just the value).
+
+## Campaign 5 (gram:read + gram:printf, containerized, 18 min), branch fuzz-night
+
+## F124. `declare -p` of a `read`/`printf -v`-assigned value under-escapes embedded backslashes by one level (same family as F123)
+
+    #@ xpg_echo nopatsub
+    =:,
+    -r -r -r
+    a,b\:xa\:
+
+    #@ posix xpg_echo utf8
+    %s %s
+    1\\a%.3G\x41%#099999999999(%s)T)T
+
+(read target: `IFS=':,' ; read -r __r1 __r2 __r3 <<< "$__d"` on the data line, then
+`declare -p __r1 __r2 __r3`; printf target: `printf -v __v -- '%s %s' ARG` with the data
+line as `ARG`, then `declare -p __v`.)
+
+- bash: `declare -- __rN="a\\\\"` / `declare -- __v="…\\\\a%.NG\\xN…"` — a run of literal
+  backslashes in the captured/assigned value is doubled for `declare -p`'s re-parseable
+  double-quoted form (as F123 for a regex capture: `declare -a BASH_REMATCH=([0]="x\\")`).
+- curse (all tiers): one backslash short — `declare -- __rN="a\\"` /
+  `declare -- __v="…\\a%.NG\xN…"` — not valid re-parseable syntax. The same shape as F123
+  (`x\` -> `"x\"` instead of `"x\\"`) but through `read` and `printf -v`, not `[[ =~ ]]`;
+  likely one shared root cause (a value built by anything other than a literal `NAME=...`
+  assignment loses one level of the internal escaping `declare -p`'s printer expects).
+  Found by `gram:read`/`gram:printf`; the crash re-run (`sig.sh`, `harness-plain`, one
+  process) is the fresh verification — a hand-reduced plain-shell repro (`read -r v <<< $'a\\'`,
+  `printf -v v %s $'a\\'`) did *not* reproduce with only one trailing backslash, so the
+  exact trigger (more than one backslash? a specific `read`/`printf` option combination?)
+  needs a further session; not reduced outside the harness for lack of time.
