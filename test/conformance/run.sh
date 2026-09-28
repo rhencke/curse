@@ -193,7 +193,9 @@ if [ "${1:-}" = --run-unit ]; then
     # oracle's time excludes it)
     { R_OUT=$(cat "$f" 2>/dev/null); } 2>/dev/null  # (bash drops a NUL byte: quietly)
     # (a NUL byte is kept, spelled \0: $(…) would drop it, with a warning on OUR stderr)
-    R_ERR=""; [ -n "$cmp_err" ] && R_ERR=$(sed "${norm_sed[@]}" "$f.err" 2>/dev/null | sed "s/\x0/\\\\0/g")
+    # (read even when stderr isn't compared: a failure's kept evidence includes it — a
+    # bash-corpus run that died silently left nothing to root-cause)
+    R_ERR=$(sed "${norm_sed[@]}" "$f.err" 2>/dev/null | sed "s/\x0/\\\\0/g")
     # timeout(1) exits 124 when it killed the command; a script exiting 124 by itself
     # before the limit is not a timeout
     R_TO=0; [ "$R_ST" -eq 124 ] && [ "$R_DUR" -ge $(( lim * 1000000 )) ] && { R_TO=1; quiesce "$f"; }
@@ -303,7 +305,7 @@ if [ "${1:-}" = --run-unit ]; then
     if { [ "$v" = FAIL ] || [ "$v" = KNOWN ] || [ "$why" = stderr-known ]; } && [ -n "${H_DIFF_DIR:-}" ] && [ "$1" != dash ]; then
       printf '%s\n[status %s]\n' "$bout" "$bst" > "$H_DIFF_DIR/$testid.expected"
       printf '%s\n[status %s%s; %s]\n' "$2" "$3" "$( [ "$5" -eq 1 ] && echo ", TIMED OUT after ${lim}s")" "$why" > "$H_DIFF_DIR/$testid.$1"
-      [ -n "$cmp_err" ] && { printf '%s\n' "$berr" > "$H_DIFF_DIR/$testid.expected.err"; printf '%s\n' "$6" > "$H_DIFF_DIR/$testid.$1.err"; }
+      printf '%s\n' "$berr" > "$H_DIFF_DIR/$testid.expected.err"; printf '%s\n' "$6" > "$H_DIFF_DIR/$testid.$1.err"
     fi
   }
   # A test that uses a FIXED path outside its own dirs — /tmp/redir-test (bash redir.tests),
@@ -437,6 +439,13 @@ if [ -n "$SHELLS_SEL" ]; then SHELLS="bash,$SHELLS_SEL"; else SHELLS="$(IFS=,; e
 # (the daemon launched below, and the xargs-spawned --run-unit workers). 256 MiB is ~256x
 # the largest real spec output; override with H_FSIZE_KB (KiB) if a legit test needs more.
 ulimit -f "${H_FSIZE_KB:-262144}" 2>/dev/null || true
+# Same for memory: a test that grows without end (an uncapped expansion, an emit blow-up)
+# took the whole host into the OOM killer — twice, killing the session that ran the gate.
+# RLIMIT_AS per process (bash, dash, curse, each daemon worker) makes such a test fail by
+# itself. A script runs in 256 MiB of address space, but a daemon worker serves many tests
+# and grows (674 MiB seen over the cases corpus; at 1 GiB one failed mid-test): 2 GiB is 3x
+# that, and a few runaways at once still stay inside the host's RAM. Override: H_VMEM_KB.
+ulimit -v "${H_VMEM_KB:-2097152}" 2>/dev/null || true
 
 workdir="$(mktemp -d "${TMPDIR:-/tmp}/curse-conf.XXXXXX")"
 trap 'rm -rf "$workdir"' EXIT

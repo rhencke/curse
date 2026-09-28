@@ -107,6 +107,10 @@ STH=$SCR/bin/sthelp
 cc -O2 -o "$STH" "$HERE/sthelp.c" &&
 	cc -O2 -DST_WRAPPER -DST_LUAJIT="\"$BUILD/luajit\"" -DST_REPO="\"$REPO\"" -o "$BIN/direct/bash" "$HERE/sthelp.c" ||
 	{ echo "stress: cannot build sthelp" >&2; exit 2; }
+# Every shell this runner starts (and the daemon) gets a memory cap, as in the conformance
+# harness: an unbounded test must fail by itself, never take the host into the OOM killer.
+# (after the compiles: cc wants more address space than a shell). Override: H_VMEM_KB.
+ulimit -v "${H_VMEM_KB:-2097152}" 2>/dev/null || true
 
 # THIS_SH for each family: its basename is `bash`, as the conformance harness does it.
 ln -s "$ORACLE" "$BIN/oracle/bash"
