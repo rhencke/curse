@@ -54,8 +54,15 @@ local function spairs(t)
 end
 
 local CMP = { ["=="] = "==", ["!="] = "~=", ["<"] = "<", ["<="] = "<=", [">"] = ">", [">="] = ">=" }
+-- Where a lifted variable lives: a register `v_n`, unless its frame (LM.frame, the function
+-- being built) or the module (LM.upv) had to spill it — then an element of the frame's
+-- int64_t[] __L or the module's __U (a program past LuaJIT's 200 locals / 60 upvalues keeps
+-- its hottest variables in registers and the rest there: see M.emit's overflow pass).
+local LM = { frame = nil, upv = nil }
 local function lname(n)
-	return "v_" .. n
+	local f = LM.frame
+	local m = f and f[n] or (LM.upv and LM.upv[n])
+	return m or ("v_" .. n)
 end
 -- A valid Lua identifier for the closure of shell function `n`. bash function names
 -- may hold -/./=/! etc. (`foo-bar`, `my.helper`), which can't spell a Lua local, so
@@ -542,6 +549,47 @@ local function ser_flat(v)
 		out[i] = "{" .. table.concat(parts, ",") .. "}"
 	end
 	return "rt.unflat({" .. table.concat(out, ",\n") .. "})"
+end
+-- A node serialized ONCE for the whole module (EF.apool, emitted as __A by M.emit): a
+-- nested definition's AST holds every deeper one, so baking each level's whole tree into
+-- its own constant grew quadratically (199 nested `g(){ …; }`: past 65536 constants).
+-- Shared subtrees are one entry each; the expression is `__A[id]`.
+function EF.pool_ast(v)
+	local P = EF.apool
+	local function reg(t)
+		if P.ids[t] then
+			return
+		end
+		P.list[#P.list + 1] = t
+		P.ids[t] = #P.list
+		for k, val in spairs(t) do
+			if type(val) == "table" and not SER_SKIP[k] then
+				reg(val)
+			end
+		end
+	end
+	reg(v)
+	return ("__A[%d]"):format(P.ids[v])
+end
+function EF.pool_src()
+	local P, out = EF.apool, {}
+	for i, t in ipairs(P.list) do
+		local parts = {}
+		local function one(val)
+			return type(val) == "table" and ("{__r=%d}"):format(P.ids[val]) or ser(val)
+		end
+		local n = #t
+		for j = 1, n do
+			parts[#parts + 1] = one(t[j])
+		end
+		for k, val in spairs(t) do
+			if (type(k) ~= "number" or k < 1 or k > n or k ~= math.floor(k)) and not SER_SKIP[k] then
+				parts[#parts + 1] = ("[%s]=%s"):format(ser(k), one(val))
+			end
+		end
+		out[i] = "{" .. table.concat(parts, ",") .. "}"
+	end
+	return "local __A = rt.unflat_all({" .. table.concat(out, ",\n") .. "})"
 end
 function ser(v, nested)
 	local t = type(v)
@@ -1644,8 +1692,49 @@ local function lsync(lifted, skip)
 			r[#r + 1] = ("%s = sh:aget(%q)"):format(lname(n), n)
 		end
 	end
-	r[#r + 1] = "sh._sy = sh._sy - 1"
-	return "sh._sy = sh._sy + 1; " .. f, table.concat(r, "; ") .. "; ", "; " .. table.concat(r, "; ")
+	r[#r + 1] = "sh._sy = sh._sy - 1; __syo = false"
+	return "sh._sy = sh._sy + 1; " .. EF.so_on(lifted) .. f, table.concat(r, "; ") .. "; ", "; " .. table.concat(r, "; ")
+end
+-- The frame's `__syo` marker while a synced call is out: the names it flushed (sh holds their
+-- live values until the reload) — rt.ltext skips those registers (see runtime's M.pclift).
+function EF.so_on(lifted)
+	local ns = {}
+	for n in spairs(lifted) do
+		ns[#ns + 1] = n
+	end
+	if #ns == 0 then
+		return ""
+	end
+	return ("__syo = %q; "):format(" " .. table.concat(ns, " ") .. " ")
+end
+-- A builtin that evaluates TEXT from its arguments runs under rt.ltext (a lifted register it
+-- names is in sh: runtime M.pclift) when an argument expands — a literal one names nothing
+-- lifted (analyze_lift keeps such names off the lift set): `let`'s every argument is
+-- arithmetic; the others evaluate only a subscript in a NAME argument (`declare "a[$k]=1"`,
+-- `read "a[$k]"`, `printf -v "a[$k]"`, `unset "a[$k]"`) — an integer variable's VALUE goes
+-- through rt.arith_str, which syncs by itself — so they're wrapped only for an expanding
+-- argument with a `[` of its own: a plain `local n=$1` stays a direct call.
+EF.TEXT_BUILTINS = { let = "all", declare = 1, typeset = 1, ["local"] = 1, export = 1, readonly = 1,
+	unset = 1, read = 1, printf = 1, mapfile = 1, readarray = 1 }
+function EF.ltb(st, call)
+	local c = st.words and st.words[1] and full_lit(st.words[1])
+	local kind = c and EF.TEXT_BUILTINS[c]
+	if not kind then
+		return call
+	end
+	for j = 2, #st.words do
+		local w = st.words[j]
+		if not full_lit(w) then
+			local br = kind == "all"
+			for _, p in ipairs(w.parts) do
+				br = br or (p.lit and p.lit:find("[", 1, true) ~= nil)
+			end
+			if br then
+				return (call:gsub("rt%.builtin%(sh, __a, __noop%)", "rt.ltext(sh, rt.builtin, sh, __a, __noop)"))
+			end
+		end
+	end
+	return call
 end
 -- An expression `call` evaluated with the lifted locals synced around it (value v)
 function EF.lwrap(lifted, call, v)
@@ -1691,7 +1780,36 @@ local function frag_redir_top(id, st, last)
 			:format(id, id, nmv, last and ", true" or "")
 	end
 end
+-- Entering the build of one function (run, a fn_x, a fragment) whose lifted registers are
+-- `regs`: under an overflow pass (EF.ov) that found this frame (`key`) too big, its coldest
+-- registers spill to its __L array (LM.frame maps them) and its loop-status holders past a
+-- cap to __T (cx.newloopvar). Returns what frame_end restores.
+EF.LWCAP = 30
+function EF.frame_begin(key, regs)
+	local sv = { LM.frame, EF.cur_ov, EF.cur_fkey }
+	local ov = EF.ov and EF.ov.frames[key]
+	local fm, spill = nil, nil
+	if ov then
+		local budget = ov.huge and 0 or 140 - (ov.F or 0) - math.min(ov.V or 0, EF.LWCAP) - (ov.T or 0)
+		local keep = EF.hottest(regs, EF.hot or {}, math.max(0, budget))
+		for _, n in ipairs(regs) do
+			if not keep[n] then
+				fm, spill = fm or {}, spill or {}
+				spill[#spill + 1] = n
+				fm[n] = ("__L[%d]"):format(#spill - 1)
+			end
+		end
+	end
+	LM.frame, EF.cur_ov, EF.cur_fkey = fm, ov and { spill = spill, lwcap = ov.huge and 0 or EF.LWCAP,
+		fscap = ov.huge and 0 or nil, huge = ov.huge } or nil, key
+	return sv
+end
+function EF.frame_end(sv)
+	LM.frame, EF.cur_ov, EF.cur_fkey = sv[1], sv[2], sv[3]
+end
 local function emit_fragment(stmts, neg, liftset, cfraise)
+	EF.frag_seq = EF.frag_seq + 1
+	local fkey = "cs:" .. EF.frag_seq
 	local saved_neg, saved_line = emit_neg_ctx, EF.cur_line
 	-- `cfraise` ({loop=, func=}): the fragment is the BODY of a compound run in the current
 	-- shell (a redirected `{ …; } >f` / `for … done <f`), so a break/continue with no loop
@@ -1733,6 +1851,7 @@ local function emit_fragment(stmts, neg, liftset, cfraise)
 		end
 	end
 	table.sort(ownlocals)
+	local fsv = EF.frame_begin(fkey, ownlocals)
 	if #ownlocals > 0 then
 		local ls, fl = {}, {}
 		for k in pairs(liftset or {}) do
@@ -1774,16 +1893,19 @@ local function emit_fragment(stmts, neg, liftset, cfraise)
 	emit_neg_ctx, EF.cur_line = saved_neg, saved_line
 	EF.cf_raise, EF.cf_flush = saved_cf, saved_cff
 	if not bok then
+		EF.frame_end(fsv)
 		return nil
 	end
 	emit_frag_n = emit_frag_n + 1
 	if dskip then
 		emit_frags[#emit_frags + 1] = assemble(cfg, ("__CS[%d] = function(sh, pc)"):format(emit_frag_n),
-			{ runlocals = ownlocals, pcparam = true })
+			{ runlocals = ownlocals, pcparam = true, fkey = fkey })
 			.. ("\n__CS[%d] = rt.catch_dbgskip(__CS[%d], %q)"):format(emit_frag_n, emit_frag_n, mycfg)
 	else
-		emit_frags[#emit_frags + 1] = assemble(cfg, ("__CS[%d] = function(sh)"):format(emit_frag_n), { runlocals = ownlocals })
+		emit_frags[#emit_frags + 1] = assemble(cfg, ("__CS[%d] = function(sh)"):format(emit_frag_n),
+			{ runlocals = ownlocals, fkey = fkey })
 	end
+	EF.frame_end(fsv)
 	return emit_frag_n
 end
 
@@ -1840,6 +1962,33 @@ local function dyn_guard(stmts, always)
 end
 -- How the interpreter should reach a compiled function: through __upv_wrap when the
 -- module has lifted upvalues (see M.emit), else the closure itself.
+-- Saving and restoring the module's lifted upvalues around an isolated run (a `( … )`, a
+-- `$( … )`, a pipeline stage): `local P1, P2, … = v_a, v_b, …` and `v_a, v_b, … = P1, P2, …`
+-- — the spilled ones (EF.upv_spill) as ONE copy of their __U array (the last value), so the
+-- save needs at most 31 locals. Returns the save, the restore, and the save names.
+function EF.upv_save(pfx)
+	local names, vals = {}, {}
+	for i, n in ipairs(EF.upv_kept or {}) do
+		names[i], vals[i] = pfx .. i, lname(n)
+	end
+	local sp = EF.upv_spill and #EF.upv_spill > 0
+	if sp then
+		names[#names + 1], vals[#vals + 1] = pfx .. "U", "rt.i64dup(__U)"
+	end
+	local nl = table.concat(names, ", ")
+	local rs = {}
+	if #(EF.upv_kept or {}) > 0 then
+		local kn, kv = {}, {}
+		for i = 1, #EF.upv_kept do
+			kn[i], kv[i] = vals[i], names[i]
+		end
+		rs[#rs + 1] = table.concat(kn, ", ") .. " = " .. table.concat(kv, ", ")
+	end
+	if sp then
+		rs[#rs + 1] = ("rt.i64put(__U, %sU)"):format(pfx)
+	end
+	return ("local %s = %s"):format(nl, table.concat(vals, ", ")), table.concat(rs, "; "), nl
+end
 EF.upv_wrapped = function(fname)
 	return (EF.lifted_names and #EF.lifted_names > 0) and ("__upv_wrap(" .. fname .. ")") or fname
 end
@@ -1986,7 +2135,7 @@ function compile_cmdsub_inner(src, backtick, lifted, aenv, noalias, posix, hdtai
 	end
 	local flush = lifted_flush(lifted)
 	if flush ~= "" then
-		return ("(function() %s return %s end)()"):format(flush, call)
+		return ("(function() %s%s local __o = %s; __syo = false; return __o end)()"):format(EF.so_on(lifted), flush, call)
 	end
 	return call
 end
@@ -2061,7 +2210,20 @@ local function emit_part(p, i, lifted, w, tilde)
 	elseif p.arith then -- (name/expr values re-parse as arith)
 		return EF.with(EF.AREAD, emit_arith_word, safe_arith(p.arith), lifted)
 	elseif p.cmdsub then -- $( … ): COMPILE the inner (known at compile time) and run it captured
-		return compile_cmdsub(p.cmdsub, p.backtick, lifted, p.aenv, p.noalias, p.posix, p.hdtail)
+		-- (once per node and context: a word emitted on two paths — the IFS-split one and the
+		-- plain one — shares the fragment, else nested $(…) doubled per level: 2^depth bodies)
+		local sig = table.concat({ tostring(EF.cur_line), tostring(EF.cur_cline), tostring(EF.cur_loopn),
+			tostring(EF.cs_in_loop), tostring(EF.cur_infunc), tostring(EF.cs_in_func), tostring(EF.cf_raise),
+			tostring(emit_neg_ctx), tostring(EF.frag_depth), tostring(EF.cur_cfg), tostring(EF.has_nameref),
+			tostring(EF.has_attr), tostring(EF.inproc_trap_block), tostring(EF.cf_flush), tostring(EF.lm_aenv),
+			tostring(EF.fn_locals), tostring(EF.cur_jl), tostring(EF.frag_loop) }, "|")
+		local memo = EF.cs_memo[p]
+		if memo and memo.lifted == lifted and memo.sig == sig then
+			return memo.code
+		end
+		local code = compile_cmdsub(p.cmdsub, p.backtick, lifted, p.aenv, p.noalias, p.posix, p.hdtail)
+		EF.cs_memo[p] = { lifted = lifted, sig = sig, code = code }
+		return code
 	elseif p.pexp then
 		if not pexp_compilable(p.pexp, p.q) then
 			error("curse-nocompile: ${..} operator")
@@ -2306,11 +2468,17 @@ local function emit_dbracket_node0(node, lifted)
 		end
 		return "(" .. a .. (k == "and" and " and " or " or ") .. b .. ")"
 	elseif k == "not" then
-		local e = emit_dbracket_node(node.e, lifted)
+		-- (`! ! … x`: a chain of negations is x or its negation — one level of Lua syntax,
+		-- not one per `!`: LuaJIT's parser stops at 200)
+		local n, inner = 1, node.e
+		while inner.kind == "not" do
+			n, inner = n + 1, inner.e
+		end
+		local e = emit_dbracket_node(inner, lifted)
 		if not e then
 			return nil
 		end
-		return "(not " .. e .. ")"
+		return n % 2 == 1 and ("(not " .. e .. ")") or e
 	elseif k == "str" then -- [[ $x ]] : true when non-empty
 		local v = db_operand(node.word, lifted)
 		if not v then
@@ -2464,9 +2632,12 @@ emit_dbracket_node = function(node, lifted, xn)
 		local b = a and emit_dbracket_node(node.r, lifted)
 		return b and ("(" .. a .. (k == "and" and " and " or " or ") .. b .. ")") or nil
 	elseif k == "not" then
-		local e = node.e
-		local c = emit_dbracket_node(e, lifted, e.kind ~= "and" and e.kind ~= "or" and e.kind ~= "not" and not e.paren)
-		return c and ("(not " .. c .. ")") or nil
+		local n, e = 1, node.e -- (a chain of `!`: one level of Lua syntax, as untraced)
+		while e.kind == "not" do
+			n, e = n + 1, e.e
+		end
+		local c = emit_dbracket_node(e, lifted, e.kind ~= "and" and e.kind ~= "or" and not e.paren)
+		return c and (n % 2 == 1 and ("(not " .. c .. ")") or c) or nil
 	end
 	local neg = tostring(xn or false)
 	local function val(w) -- (the operand's value, for the trace; as written when unrenderable)
@@ -4547,20 +4718,37 @@ analyze_lift = function(ast)
 	-- before its first assignment (`if …; then e=1; fi; echo "$e"` would print 0). Lift only
 	-- a var whose FIRST mention in program order is an unconditional top-level numeric
 	-- assignment (or a `for ((v=…` initializer): it is always set before anything reads it.
-	local function mentions(node, nm, seen)
-		if type(node) == "string" then
-			return node:find("%f[%w_]" .. nm .. "%f[^%w_]") ~= nil
+	-- (a node's mentions as one set of its strings' maximal [%w_]+ runs — a name is
+	-- mentioned exactly when it is one of them — built once per node: asking each name of
+	-- a big program separately walked the tree once per name)
+	local tokcache = {}
+	local function tokens(node)
+		local t = tokcache[node]
+		if t then
+			return t
 		end
-		if type(node) ~= "table" or seen[node] then
-			return false
-		end
-		seen[node] = true
-		for _, v in pairs(node) do
-			if mentions(v, nm, seen) then
-				return true
+		t = {}
+		local seen = {}
+		local function walk(x)
+			if type(x) == "string" then
+				for w in x:gmatch("[%w_]+") do
+					t[w] = true
+				end
+			elseif type(x) == "table" and not seen[x] then
+				seen[x] = true
+				for k, v in pairs(x) do
+					if not SER_SKIP[k] then -- (a loop's _srcs: the whole program's text, no mention)
+						walk(v)
+					end
+				end
 			end
 		end
-		return false
+		walk(node)
+		tokcache[node] = t
+		return t
+	end
+	local function mentions(node, nm)
+		return tokens(node)[nm] == true
 	end
 	-- In program order within `stmts`: "set" if nm is unconditionally assigned before any
 	-- other mention, "bad" if mentioned first some other way, nil if not mentioned. A
@@ -4575,10 +4763,10 @@ analyze_lift = function(ast)
 				return "set"
 			end
 			if st.t == "funcdef" then
-				if mentions(st.body, nm, {}) and first_use(st.body, nm) ~= "set" then
+				if mentions(st.body, nm) and first_use(st.body, nm) ~= "set" then
 					return "bad"
 				end
-			elseif mentions(st, nm, {}) then
+			elseif mentions(st, nm) then
 				return "bad"
 			end
 		end
@@ -5306,9 +5494,9 @@ H.funcdef = function(cx, st, after)
 			return cx.refuse(st, after)
 		end
 		local p = cx.newpc()
-		local k = EF.konst({ ser(st) })
-		cx.blocks[p] = ("rt.def_function(sh, %s[1], %s); %spc = %d"):format(
-			k, EF.upv_wrapped(("__CS[%d]"):format(id)), EF.fnmode(st.name, k .. "[1]"), after)
+		local k = EF.pool_ast(st)
+		cx.blocks[p] = ("rt.def_function(sh, %s, %s); %spc = %d"):format(
+			k, EF.upv_wrapped(("__CS[%d]"):format(id)), EF.fnmode(st.name, k), after)
 		return p
 	end
 	local p = cx.newpc()
@@ -6229,7 +6417,7 @@ simple_compiled = function(cx, st, after)
 			local d = dbg(st)
 			local lastarg = "if #__a > 0 then sh:set_str('_', __a[#__a]) end"
 			cx.blocks[p] = d
-				.. ("local __a = { %s }; %srt.builtin(sh, __a, __noop); "):format(table.concat(items, ", "), EF.xt("__a"))
+				.. EF.ltb(st, ("local __a = { %s }; %srt.builtin(sh, __a, __noop); "):format(table.concat(items, ", "), EF.xt("__a")))
 				.. lastarg
 				.. ecs
 				.. ("; pc = %d"):format(after)
@@ -6295,7 +6483,7 @@ simple_compiled = function(cx, st, after)
 			local ecs = errchk_s(st)
 			local d = dbg(st)
 			local lastarg = "if #__a > 0 then sh:set_str('_', __a[#__a]) end"
-			local run = px_builtin and "rt.builtin(sh, __a, __noop)" or "sh:exec_t(__a)"
+			local run = px_builtin and EF.ltb(st, "rt.builtin(sh, __a, __noop)") or "sh:exec_t(__a)"
 			-- the prefix bindings run the command: rt.run_prefix
 			local prun = ("rt.run_prefix(sh, { %s }, __pv, function() %s%s end, __a)"):format(
 				table.concat(pnames, ", "), run, (px_builtin and redir_apply) and "; io.flush()" or "")
@@ -6374,6 +6562,7 @@ simple_compiled = function(cx, st, after)
 			local bcall = ((decl_in_fn or decl_gen or cmd == "command" or cmd == "builtin") and not cx.toplevel and not cx.topcode)
 					and "do local __sc = sh.calldepth; if (sh.calldepth or 0) < 1 then sh.calldepth = 1 end; rt.builtin(sh, __a, __noop); sh.calldepth = __sc end"
 				or "rt.builtin(sh, __a, __noop)"
+			bcall = EF.ltb(st, bcall)
 			-- a builtin that runs shell code at run time (compgen -W/-F/-C, mapfile -C, fc -s)
 			-- runs it at this command's line: $LINENO and the `line N:` of its errors
 			if EF.LINE_BUILTINS[cmd] and not (EF.trapline and not EF.cur_infunc) then
@@ -6446,7 +6635,7 @@ simple_compiled = function(cx, st, after)
 				call = "rt.builtin(sh, __a, __noop)"
 			elseif cmd == "echo" then
 				from = 2
-				call = "sh:echo_cmd(unpack(__a))"
+				call = "sh:echo_cmd_t(__a)"
 			elseif (cmd == ":" or cmd == "true" or cmd == "false") and not isfunc then
 				-- `: ${x:=v}` / `true $(…)`: the args expand for their side effects only
 				from = 2
@@ -6462,8 +6651,8 @@ simple_compiled = function(cx, st, after)
 				call = inl_sync(cmd, fnwrap(
 					cmd,
 					st.line,
-					ff.locals and ("sh:pushCall(unpack(__a)); %s(sh); sh:popCall()"):format(fnlname(cmd))
-						or ("sh:pushParams(unpack(__a)); %s(sh); sh:popParams()"):format(fnlname(cmd))
+					ff.locals and ("sh:pushCallT(__a, 1); %s(sh); sh:popCall()"):format(fnlname(cmd))
+						or ("sh:pushParamsT(__a, 1); %s(sh); sh:popParams()"):format(fnlname(cmd))
 				), cx)
 			elseif cx.funcflags[cmd] then -- bare function (references NO positional params): build argv
 				from = 2 -- to run the args' side effects, then a bare call (params unread)
@@ -7217,7 +7406,7 @@ H.forin = function(cx, st, after)
 	-- sh.forstate[id] for an OSR entry — which adopts it (below). Capped: a function has
 	-- only so many Lua locals.
 	cx.forlocals = cx.forlocals or {}
-	local fsl = #cx.forlocals < 48 and ("__fs" .. st.id) or nil
+	local fsl = #cx.forlocals < (cx.ov and cx.ov.fscap or 48) and ("__fs" .. st.id) or nil
 	if fsl and not cx.forlocals[fsl] then
 		cx.forlocals[#cx.forlocals + 1] = fsl
 		cx.forlocals[fsl] = true
@@ -7495,17 +7684,15 @@ H.subshell = function(cx, st, after)
 			end
 			-- (a body compiled apart from this CFG's own lifted locals reads them from sh:
 			-- flush them first — `for ((i…)); do (echo "$i"); done` saw a stale $i)
-			swpre = swpre .. lifted_flush(cx.lifted)
+			local swf = lifted_flush(cx.lifted)
+			if swf ~= "" then -- (the body may evaluate text naming them: rt.ltext — sh is live)
+				swpre, swpost = swpre .. EF.so_on(cx.lifted) .. swf, "; __syo = false"
+			end
 			local ln = EF.lifted_names or {}
 			if #ln > 0 then
-				local sav, vs = {}, {}
-				for i, n in ipairs(ln) do
-					sav[i] = "__sv" .. i
-					vs[i] = lname(n)
-				end
-				local vlist = table.concat(vs, ", ")
-				swpre = swpre .. ("local %s = %s; "):format(table.concat(sav, ", "), vlist)
-				swpost = ("; %s = %s"):format(vlist, table.concat(sav, ", "))
+				local sv, rs = EF.upv_save("__sv")
+				swpre = swpre .. sv .. "; "
+				swpost = swpost .. "; " .. rs
 			end
 			-- (its text: the report if a signal kills it)
 			local stx = ("%q"):format((st.bang and "! " or "") .. require("deparse").command_text(st))
@@ -7952,12 +8139,26 @@ H.case = function(cx, st, after)
 				g = ("rt.case_glob(sh, %s[1])"):format(EF.konst({ ser(w) }))
 				g = EF.aa_wrap_expr(g, w, cx.lifted)
 			end
-			disj[#disj + 1] = ("rt.glob_match(%s, %s, __ic, __nx)"):format(sv, g)
+			disj[#disj + 1] = ("rt.glob_match(%s, %s, %s)"):format(sv, g,
+				n > 1000 and "(sh.shopt.nocasematch and true or nil), not sh.shopt.extglob" or "__ic, __nx")
 		end
 		local mp = cx.newpc()
+		-- (a huge alternation — `p0|…|p99999)`: groups of 200 in functions of their own, or
+		-- one `or` chain's jumps pass LuaJIT's range)
+		local cond = #disj > 0 and table.concat(disj, " or ") or "false"
+		if #disj > 200 then
+			local grp = {}
+			for g0 = 1, #disj, 200 do
+				grp[#grp + 1] = "(function() return " .. table.concat(disj, " or ", g0, math.min(g0 + 199, #disj)) .. " end)()"
+			end
+			cond = table.concat(grp, " or ")
+		end
 		-- (extglob off: a pattern from an expansion isn't an extglob — [[ ]] always is)
-		cx.blocks[mp] = ("local __ic, __nx = sh.shopt.nocasematch and true or nil, not sh.shopt.extglob; if %s then pc = %d else pc = %d end"):format(
-			#disj > 0 and table.concat(disj, " or ") or "false",
+		-- (a case of very many arms reads the options per pattern: a local pair in each arm's
+		-- block would pass LuaJIT's 65476 locals in one function)
+		cx.blocks[mp] = (n > 1000 and "if %s then pc = %d else pc = %d end"
+			or "local __ic, __nx = sh.shopt.nocasematch and true or nil, not sh.shopt.extglob; if %s then pc = %d else pc = %d end"):format(
+			cond,
 			bodyentry[i],
 			nextmatch
 		)
@@ -7968,13 +8169,40 @@ H.case = function(cx, st, after)
 		EF.cur_line = st.line
 		EF.cur_cline = st.cline or st.line
 	end -- clause flattening moved it; restore for $LINENO in the subject
+	-- A case of many arms whose patterns are all plain words (`0) …;; 1) …;;` — no glob,
+	-- quote, expansion or tilde) goes straight to its first matching arm through a table:
+	-- trying 20000 arms one by one made each case statement quadratic in the dispatch.
+	-- (nocasematch: the chain, which folds case)
+	local first = n > 0 and tostring(matchentry[1]) or tostring(nomatch)
+	if n > 50 then
+		local keys, pcs, seen, lit = {}, {}, {}, true
+		for i, cl in ipairs(st.clauses) do
+			for _, pat in ipairs(cl.pats) do
+				if type(pat) ~= "string" or not pat:match("^[%w_%-%./:,+=@]+$") then
+					lit = false
+					break
+				end
+				if not seen[pat] then
+					seen[pat] = true
+					keys[#keys + 1], pcs[#pcs + 1] = pat, tostring(bodyentry[i])
+				end
+			end
+			if not lit then
+				break
+			end
+		end
+		if lit then
+			first = ("(sh.shopt.nocasematch and %s or %s[1][%s] or %d)"):format(first,
+				EF.konst({ ("rt.case_map(%q, %q)"):format(table.concat(keys, "\n"), table.concat(pcs, ",")) }), sv, nomatch)
+		end
+	end
 	local subjp = cx.newpc()
 	cx.blocks[subjp] = (st.subject.src and EF.xtl(("%q"):format("case " .. require("runtime").srcw(st.subject.src) .. " in")) or "") .. dbg(st) -- (traced before DEBUG)
-		.. ("%s = %s; %spc = %d"):format(
+		.. ("%s = %s; %spc = %s"):format(
 			sv,
 			subj,
 			ran and (ran .. " = false; ") or "",
-			n > 0 and matchentry[1] or nomatch
+			first
 		)
 	return subjp
 end
@@ -8117,7 +8345,14 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
 	-- command-condition while), declared 0 and used to give the loop bash's exit
 	-- status (last body command, or 0). Both are returned for assemble to declare.
 	cx.loopstack, cx.loopvars, cx.loopinit = {}, {}, nil
+	cx.ov = EF.cur_ov -- (this frame's overflow: its holders past the cap live in __T)
 	function cx.newloopvar(init) -- (init: its value on entry to run — else 0)
+		if cx.ov and #cx.loopvars >= cx.ov.lwcap then
+			cx.tloop = cx.tloop or {}
+			local v = ("__T[%d]"):format(#cx.tloop + 1)
+			cx.tloop[#cx.tloop + 1] = { v, init }
+			return v
+		end
 		local v = "__lw" .. #cx.loopvars
 		cx.loopvars[#cx.loopvars + 1] = v
 		if init then
@@ -9110,6 +9345,38 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
 		-- re-seeds lifted from sh). Once per TOP-LEVEL statement (never in a hot loop body).
 		-- Signal traps are delivered by the async VM hook (lib_cursesig.c), not polled here.
 		local wbs = lifted_flush(cx.lifted)
+		-- (a giant program — every marker flushing every lifted variable grew as statements x
+		-- variables: 60000 statements, 300 variables — flushes at each marker only what the
+		-- statement before it may have changed: the lifted names it mentions, or all of them
+		-- when it runs a function, whose body isn't in its tree)
+		local nlift = 0
+		for _ in pairs(cx.lifted) do
+			nlift = nlift + 1
+		end
+		local giant = nlift * #stmts > 20000
+		local function wbs_after(st)
+			if not st then
+				return ""
+			end
+			local calls = any_node(st, function(n2)
+				if n2.t == "simple" and n2.words and n2.words[1] then
+					local c = full_lit(n2.words[1])
+					return not c or cx.funcflags[c] or (cx.inlinefns and cx.inlinefns[c]) or false
+				end
+				return false
+			end)
+			if calls then
+				return wbs
+			end
+			local names, sub = {}, {}
+			collect_names({ st }, names)
+			for nm in pairs(names) do
+				if cx.lifted[nm] then
+					sub[nm] = true
+				end
+			end
+			return lifted_flush(sub)
+		end
 		local nxperr = {} -- [k]: the marker of the first syntax error (or parse-time warning) at/after k
 		for k = #stmts, 1, -1 do
 			nxperr[k] = (stmts[k].t == "parse_error" or stmts[k].t == "warn") and mark[k] or nxperr[k + 1]
@@ -9130,14 +9397,15 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
 			-- rt.jobs_line)
 			local jw = stmts[k].lgstart and ("if sh.jobs_waited or sh.jobs_pending then rt.jobs_line(sh, %s) end; "):format(
 				stmts[k].lgread or "nil") or ""
+			local wk = giant and wbs_after(stmts[k - 1]) or wbs
 			if stmts[k].t == "parse_error" or stmts[k].t == "warn" then -- (reported under noexec too)
-				cx.blocks[mark[k]] = ("sh._ff = %d; %spc = %d"):format(ff, wbs, cx.stmtPc[k])
+				cx.blocks[mark[k]] = ("sh._ff = %d; %spc = %d"):format(ff, wk, cx.stmtPc[k])
 			else
 				cx.blocks[mark[k]] = ("%sif sh.opt_n then pc = %d else sh._ff = %d; %spc = %d end"):format(
 					jw,
 					nxp,
 					ff,
-					wbs,
+					wk,
 					cx.stmtPc[k]
 				)
 			end
@@ -9155,6 +9423,9 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
 			loopvars = cx.loopvars,
 			loopinit = cx.loopinit,
 			forlocals = cx.forlocals,
+			lifted = lifted,
+		ov = cx.ov,
+		tloop = cx.tloop,
 		}
 	end
 	return {
@@ -9167,6 +9438,9 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
 		loopvars = cx.loopvars,
 		loopinit = cx.loopinit,
 		forlocals = cx.forlocals,
+		lifted = lifted,
+		ov = cx.ov,
+		tloop = cx.tloop,
 	}
 end
 
@@ -9180,6 +9454,9 @@ end
 -- through trampolines; a segment keeps every jump well inside LuaJIT's range)
 local DISPATCH_CHAIN_MAX = tonumber(os.getenv("CURSE_DISPATCH_MAX") or "") or 60000
 local DISPATCH_SEG = tonumber(os.getenv("CURSE_DISPATCH_SEG") or "") or 12000
+EF.BLOCK_FN = 40000
+EF.SEG_NPC = tonumber(os.getenv("CURSE_SEG_NPC") or "") or 20000 -- (a frame of more pcs: segmented)
+EF.SEG_PCS = 256
 assemble = function(cfg, sig, opts)
 	opts = opts or {}
 	local o = { sig }
@@ -9194,10 +9471,42 @@ assemble = function(cfg, sig, opts)
 	end
 	-- the run()-locals FIRST: slots 3.. (after sh, pc), where a line abort's handler reads
 	-- them off the stack (tier.run_compiled — the chunk may be stripped of local names)
-	for _, n in ipairs(opts.runlocals or {}) do
+	-- (a register the frame spilled — LM.frame, see frame_begin — is an element of its __L,
+	-- declared after the kept ones)
+	local regs, kept, spilled = opts.runlocals or opts.fnlocals or {}, {}, {}
+	for _, n in ipairs(regs) do
+		if LM.frame and LM.frame[n] then
+			spilled[#spilled + 1] = n
+		else
+			kept[#kept + 1] = n
+		end
+	end
+	local function decl_spill()
+		if #spilled > 0 then
+			o[#o + 1] = ("  local __L = rt.i64arr(%d)"):format(#spilled)
+		end
+	end
+	for _, n in ipairs(opts.runlocals and kept or {}) do
 		o[#o + 1] = ("  local %s = sh:aget(%q)"):format(lname(n), n)
 	end
-	if cfg.forlocals and #cfg.forlocals > 0 then -- (this activation's for-in loop states)
+	-- the frame's synced-call marker (EF.so_on), right after its registers: rt.pclift below
+	local has_so = false
+	for p = 0, cfg.npc - 1 do
+		if cfg.blocks[p]:find("__syo", 1, true) then
+			has_so = true
+			break
+		end
+	end
+	if not opts.fnresume then
+		decl_spill()
+		for _, n in ipairs(opts.runlocals and spilled or {}) do
+			o[#o + 1] = ("  %s = sh:aget(%q)"):format(lname(n), n)
+		end
+	end
+	if has_so and not opts.fnresume then
+		o[#o + 1] = "  local __syo = false"
+	end
+	if cfg.forlocals and #cfg.forlocals > 0 and not opts.fnresume then -- (this activation's for-in loop states)
 		o[#o + 1] = "  local " .. table.concat(cfg.forlocals, ", ")
 	end
 	-- register compiled function closures into sh.functions so the interpreter
@@ -9223,8 +9532,17 @@ assemble = function(cfg, sig, opts)
 	end
 	-- a function's lifted locals: loaded by their `local` statement, never written back (the
 	-- call's local frame is dropped on return; a `local` that failed — readonly — isn't ours)
-	for _, n in ipairs(opts.fnlocals or {}) do
+	for _, n in ipairs(opts.fnlocals and kept or {}) do
 		o[#o + 1] = ("  local %s = 0LL"):format(lname(n))
+	end
+	if opts.fnresume then
+		decl_spill()
+	end
+	if has_so and opts.fnresume then
+		o[#o + 1] = "  local __syo = false"
+	end
+	if cfg.forlocals and #cfg.forlocals > 0 and opts.fnresume then -- (after the registers: rt.pclift)
+		o[#o + 1] = "  local " .. table.concat(cfg.forlocals, ", ")
 	end
 	if opts.fnresume then -- (resumed mid-call: its lifted locals come from sh; else the entry)
 		local seeds = {}
@@ -9240,6 +9558,34 @@ assemble = function(cfg, sig, opts)
 	-- per-loop status holders (while-command loops): plain native locals, init 0.
 	for _, v in ipairs(cfg.loopvars or {}) do
 		o[#o + 1] = ("  local %s = %s"):format(v, cfg.loopinit and cfg.loopinit[v] or 0)
+	end
+	if cfg.tloop then -- (past the cap: one table)
+		local ti = {}
+		for i, e in ipairs(cfg.tloop) do
+			ti[i] = tostring(e[2] or 0)
+		end
+		o[#o + 1] = "  local __T = {" .. table.concat(ti, ", ") .. "}"
+	end
+	-- (the first pass notes a function that may pass LuaJIT's 200 locals: its registers,
+	-- __syo, for-in states, status holders, and the most any one block declares)
+	if not EF.ov and opts.fkey then
+		local T = 0
+		for p = 0, cfg.npc - 1 do
+			local c = select(2, cfg.blocks[p]:gsub("local ", ""))
+			if c > T then
+				T = c
+			end
+		end
+		local F, V = cfg.forlocals and #cfg.forlocals or 0, cfg.loopvars and #cfg.loopvars or 0
+		-- (so many blocks that one function can't hold their pc constants and jumps: the
+		-- frame is split into segment functions, its state in __L/__T — see below)
+		local huge = cfg.npc > EF.SEG_NPC
+		if huge or 4 + #regs + F + V + T > 180 then
+			EF.ov_need.frames[opts.fkey] = { F = F, V = V, T = math.min(T, 60), huge = huge or nil }
+			if huge then
+				EF.ov_need.anyhuge = true
+			end
+		end
 	end
 	-- pc stays a plain LOCAL (register-allocated, fast in hot loops). A div0/failglob
 	-- lineabort thrown from compiled code is caught by the tier's retry wrapper, which
@@ -9267,11 +9613,64 @@ assemble = function(cfg, sig, opts)
 	for _, hp in pairs(cfg.loopPc or {}) do
 		heads[hp] = true
 	end
+	-- A block past LuaJIT's jump range on its own (a 10000-part word, a 10000-element array
+	-- literal) runs as a function of its own: the dispatch then jumps over one call. (A block
+	-- never returns or breaks out of the frame: it sets pc.)
+	for p = 0, cfg.npc - 1 do
+		local b = cfg.blocks[p]
+		if #b > EF.BLOCK_FN and b ~= "break" then
+			cfg.blocks[p] = "(function() " .. b .. " end)()"
+		end
+	end
 	local total, huge = 0, false
 	for p = 0, cfg.npc - 1 do
 		total = total + #cfg.blocks[p]
 	end
-	if total <= DISPATCH_CHAIN_MAX then
+	if cfg.ov and cfg.ov.huge then
+		-- A GIANT frame (60000 statements): its blocks in segment functions of SEG_PCS pcs
+		-- each (closures over the frame's few locals — its registers spilled to __L, its
+		-- status holders in __T), each looping while pc stays in its range; the frame's
+		-- loop picks the segment. One function's constants and jumps then stay small.
+		-- (segments: consecutive pcs, at most SEG_PCS of them and ~30 KB of code — a block
+		-- past 8 KB is a function of its own — so a segment's jumps stay in range; the
+		-- frame finds a pc's segment in __SI, built at entry from the boundaries)
+		local done_pc
+		local segs, cur, bytes, bounds = {}, nil, 0, {}
+		for p = 0, cfg.npc - 1 do
+			local b = cfg.blocks[p]
+			if b == "break" then
+				done_pc = p
+			else
+				if #b > 8000 then
+					b = "(function() " .. b .. " end)()"
+				end
+				if not cur or #cur >= EF.SEG_PCS or bytes + #b > 30000 then
+					cur, bytes = {}, 0
+					segs[#segs + 1] = cur
+					bounds[#bounds + 1] = p
+				end
+				bytes = bytes + #b
+				cur[#cur + 1] = ("      %s pc == %d then %s%s"):format(#cur == 0 and "if" or "elseif", p,
+					heads[p] and "if __pre[0] ~= 0 then rt.preempt() end " or "", b)
+			end
+		end
+		o[#o] = ("  local __G, __SI = {}, rt.seg_index(%q, %d)"):format(table.concat(bounds, ","), cfg.npc)
+		for k, sg in ipairs(segs) do
+			o[#o + 1] = ("  __G[%d] = function() while true do"):format(k)
+			for _, l in ipairs(sg) do
+				o[#o + 1] = l
+			end
+			o[#o + 1] = "      else return end"
+			o[#o + 1] = "  end end"
+		end
+		o[#o + 1] = "  while true do"
+		o[#o + 1] = ("    if pc == %d then break end"):format(done_pc or -1)
+		o[#o + 1] = "    local __g = __G[__SI[pc] or 0]"
+		o[#o + 1] = '    if not __g then error("curse: internal error: no block for pc " .. tostring(pc)) end'
+		o[#o + 1] = "    __g()"
+		o[#o + 1] = "  end"
+		huge = true
+	elseif total <= DISPATCH_CHAIN_MAX then
 		for p = 0, cfg.npc - 1 do
 			o[#o + 1] = ("    %s pc == %d then %s%s"):format(p == 0 and "if" or "elseif", p,
 				heads[p] and "if __pre[0] ~= 0 then rt.preempt() end " or "", cfg.blocks[p])
@@ -9364,6 +9763,34 @@ assemble = function(cfg, sig, opts)
 			o[#o + 1] = ("rt.pcline(%s, {%s}%s)"):format(fname, table.concat(lt, ","),
 				opts.shname and (", %q"):format(opts.shname) or "")
 		end
+	end
+	-- where its lifted registers sit on the stack, for text the runtime evaluates (rt.ltext):
+	-- slots 3.. (run, a fragment) or 4.. (fn_x, after __resume), the marker after them; the
+	-- module's upvalues when this frame works on them (its lift set holds them)
+	local upv = false
+	if EF.lifted_names and #EF.lifted_names > 0 and cfg.lifted then
+		upv = true
+		for _, n in ipairs(EF.lifted_names) do
+			if not cfg.lifted[n] then
+				upv = false
+				break
+			end
+		end
+	end
+	local lfname = fname or sig:match("^(FN%.[%w_]+) = function")
+	if lfname and (#regs > 0 or upv) then
+		local first = opts.fnresume and 4 or 3
+		local q, qs = {}, {}
+		for i, n in ipairs(kept) do
+			q[i] = ("%q"):format(n)
+		end
+		for i, n in ipairs(spilled) do
+			qs[i] = ("%q"):format(n)
+		end
+		local sp = #spilled > 0 and 1 or 0
+		o[#o + 1] = ("rt.pclift(%s, {%s}, %d, %s, %s%s)"):format(lfname, table.concat(q, ", "), first,
+			has_so and tostring(first + #kept + sp) or "nil", upv and "__UPV" or "nil",
+			sp == 1 and (", {%s}, %d"):format(table.concat(qs, ", "), first + #kept) or "")
 	end
 	return table.concat(o, "\n")
 end
@@ -9464,13 +9891,99 @@ function EF.konst(items)
 	k[#k + 1] = "{" .. table.concat(items, ",") .. "}"
 	return ("__K[%d]"):format(#k)
 end
+-- Static hotness of each variable: its mentions, weighted 8x per enclosing loop (a function
+-- body counts as one level: it is called). Where a frame or the module can't hold every
+-- lifted variable in a register, the hottest ones keep theirs.
+function EF.hotness(stmts)
+	local score, seen = {}, {}
+	local function add(n, w)
+		if type(n) == "string" then
+			score[n] = (score[n] or 0) + w
+		end
+	end
+	local LOOP = { forc = true, whilec = true, forin = true, select = true, funcdef = true }
+	local function walk(node, d)
+		if type(node) ~= "table" or seen[node] then
+			return
+		end
+		seen[node] = true
+		local w = 8 ^ math.min(d, 6)
+		if node.k and type(node.name) == "string" then
+			add(node.name, w)
+		end
+		local t = node.t
+		if t == "assign" or t == "arrayassign" then
+			add(node.name, w)
+		end
+		if node.parts and not t then
+			for _, p in ipairs(node.parts) do
+				if p.var then
+					add(p.var, w)
+				elseif p.pexp then
+					add(p.pexp.name, w)
+				elseif type(p.arith) == "string" then
+					walk(safe_arith(p.arith), d)
+				end
+			end
+		end
+		local nd = LOOP[t] and d + 1 or d
+		for k, v in pairs(node) do
+			if type(v) == "table" and k ~= "_srcs" then
+				walk(v, nd)
+			end
+		end
+	end
+	walk(stmts, 0)
+	return score
+end
+-- the `n` hottest of `names` (ties by name), as a set
+function EF.hottest(names, score, n)
+	local l = {}
+	for _, nm in ipairs(names) do
+		l[#l + 1] = nm
+	end
+	table.sort(l, function(a, b)
+		local sa, sb = score[a] or 0, score[b] or 0
+		if sa ~= sb then
+			return sa > sb
+		end
+		return a < b
+	end)
+	local keep = {}
+	for i = 1, math.min(n, #l) do
+		keep[l[i]] = true
+	end
+	return keep
+end
+-- Past LuaJIT's per-function limits (200 locals, 60 upvalues) the chunk won't load. The
+-- first pass emits as always and notes each function that may pass them (assemble:
+-- EF.ov_need) and whether the module has too many lifted upvalues; only then a second
+-- pass emits those with their coldest lifted variables spilled into one int64_t[] (the
+-- frame's __L, the module's __U) and their loop-status holders past a cap into one table
+-- (__T). A program within the limits is emitted exactly as before.
 function M.emit(ast, opts)
+	EF.ov = nil
+	local code = M.emit_pass(ast, opts)
+	local need = EF.ov_need
+	if need and (next(need.frames) or need.upv) then
+		EF.ov = need
+		code = M.emit_pass(ast, opts)
+		EF.ov = nil
+	end
+	return code
+end
+function M.emit_pass(ast, opts)
+	EF.ov_need = { frames = {}, upv = false }
+	EF.frag_seq = 0
+	LM.frame, LM.upv = nil, nil
 	EF.mark_groups(ast.stmts) -- (before any function body compiles: rt.compound_line)
 	EF.fntab = false
 	EF.konsts = {}
+	EF.apool = { list = {}, ids = {} }
 	EF.frag_depth = 0
 	EF.dskip_n = 0
 	emit_frags, emit_frag_n = {}, 0 -- compiled `$(…)` fragments (cs_N closures) collected during build
+	EF.cs_memo = setmetatable({}, { __mode = "k" }) -- (emit_part: a $(…) node's compiled call)
 	-- Fragment mode (eval/source, compiled at runtime): the code runs in the CALLER's
 	-- execution context, so a top-level return/break/continue must RAISE its signal for
 	-- the enclosing (delegated) cf-wrapper to catch, not jump to this fragment's own DONE.
@@ -9648,6 +10161,7 @@ function M.emit(ast, opts)
 	-- indirect/dynamic dispatch).
 	-- No lifting in a fragment: a lifted native-int64 local would neither see nor sync the
 	-- caller's real sh var (which may be readonly/exported), so keep every var in sh.
+	EF.hot = EF.ov and EF.hotness(ast.stmts) or nil
 	local lifted, lift_disq, lift_localed = {}, {}, {}
 	if not EF.fragment and not EF.no_lift then
 		lifted, lift_disq, lift_localed = analyze_lift(ast)
@@ -9689,6 +10203,26 @@ function M.emit(ast, opts)
 	-- and it stays register-allocated in run() — no hot-loop cost for lift-only programs.
 	EF.lifted_set = upset
 	EF.lifted_names = upvals
+	-- (too many module upvalues for LuaJIT's 60 per function / 200 main-chunk locals: the
+	-- overflow pass keeps the hottest in module locals, the rest in one int64_t[] __U)
+	if not EF.ov and #upvals > 40 then
+		EF.ov_need.upv = true
+	end
+	local ukept, uspill = upvals, {}
+	if EF.ov and EF.ov.upv and #upvals > 40 then
+		local keep = EF.hottest(upvals, EF.hot, 30)
+		ukept = {}
+		LM.upv = {}
+		for _, n in ipairs(upvals) do
+			if keep[n] then
+				ukept[#ukept + 1] = n
+			else
+				uspill[#uspill + 1] = n
+				LM.upv[n] = ("__U[%d]"):format(#uspill - 1)
+			end
+		end
+	end
+	EF.upv_kept, EF.upv_spill = ukept, uspill
 	EF.runlocal_set = {}
 	for _, n in ipairs(runlocals) do
 		EF.runlocal_set[n] = true
@@ -9700,7 +10234,8 @@ function M.emit(ast, opts)
 		for _ in pairs(funcflags) do
 			nf = nf + 1
 		end
-		EF.fntab = nf > 32 -- (see fnlname)
+		EF.fntab = nf > 32 or (EF.ov and EF.ov.anyhuge) or false -- (see fnlname; a segmented frame's
+		-- functions share its upvalue budget)
 	end
 
 	local o = {
@@ -9711,24 +10246,34 @@ function M.emit(ast, opts)
 	}
 	if #upvals > 0 then
 		local vs = {}
-		for _, n in ipairs(upvals) do
+		for _, n in ipairs(ukept) do
 			vs[#vs + 1] = lname(n)
 		end
-		o[#o + 1] = "local " .. table.concat(vs, ", ") -- module-level upvalues (shared with non-inlined functions)
+		if #vs > 0 then
+			o[#o + 1] = "local " .. table.concat(vs, ", ") -- module-level upvalues (shared with non-inlined functions)
+		end
+		if #uspill > 0 then
+			o[#o + 1] = ("local __U = rt.i64arr(%d)"):format(#uspill)
+		end
 		-- The swap game for `$()` — the expression form of an in-process subshell. `( … )`
 		-- emits `local __sv = v_x; …; v_x = __sv` inline; a $() runs inside a word EXPRESSION,
 		-- so it can't, and calls this instead: save every lifted upvalue, run the isolated
 		-- capture, restore. One helper for the whole module (all lifted upvals every time).
-		local sav = {}
-		for i = 1, #upvals do
-			sav[i] = "__is" .. i
-		end
-		local vlist, slist = table.concat(vs, ", "), table.concat(sav, ", ")
-		o[#o + 1] = ("local function __iso_cmdsub(sh, cs, bt) local %s = %s; local __o = sh:capture_compiled_iso(cs, bt); %s = %s; return __o end"):format(
-			slist, vlist, vlist, slist)
+		local sv, rs, sl = EF.upv_save("__is")
+		o[#o + 1] = ("local function __iso_cmdsub(sh, cs, bt) %s; local __o = sh:capture_compiled_iso(cs, bt); %s; return __o end"):format(
+			sv, rs)
 		-- ...and for the pipeline scheduler, which swaps them per stage at context switch.
-		o[#o + 1] = ("local function __upv_get() return %s end"):format(vlist)
-		o[#o + 1] = ("local function __upv_set(%s) %s = %s end"):format(slist, vlist, slist)
+		o[#o + 1] = ("local function __upv_get() return %s end"):format(sv:match("= (.*)$"))
+		o[#o + 1] = ("local function __upv_set(%s) %s end"):format(sl, rs)
+		local qn, qs = {}, {}
+		for i, n in ipairs(ukept) do
+			qn[i] = ("%q"):format(n)
+		end
+		for i, n in ipairs(uspill) do
+			qs[i] = ("%q"):format(n)
+		end
+		o[#o + 1] = ("local __UPV = { names = {%s}, get = __upv_get, set = __upv_set%s }"):format(table.concat(qn, ", "),
+			#uspill > 0 and (", anames = {%s}, arr = __U"):format(table.concat(qs, ", ")) or "")
 		-- The INTERPRETER's entry into a compiled function (what sh.functions holds). Lifted
 		-- upvalues are authoritative only while compiled code runs; whenever the interpreter
 		-- is running (a delegated loop/eval/dynamic call — compiled code flushed them to sh
@@ -9794,12 +10339,14 @@ function M.emit(ast, opts)
 			EF.cur_cfg = fnlname(st.name)
 			local sbl = EF.base_line -- (a function's body: execute_function's line — rt.compound_line)
 			EF.base_line = st.rline
+			local fsv = EF.frame_begin("fn:" .. st.name, fl)
 			local cfg = build_cfg(st.body, ls, funcflags, inlinefns)
 			EF.base_line = sbl
 			EF.cur_cfg = "run"
 			EF.fn_locals = sv_fl
 			fndefs[#fndefs + 1] = assemble(cfg, fnlname(st.name) .. " = function(sh, pc)",
-				{ shname = st.name, fnlocals = fl, fnresume = true })
+				{ shname = st.name, fnlocals = fl, fnresume = true, fkey = "fn:" .. st.name })
+			EF.frame_end(fsv)
 			if EF.extdebug and EF.has_debug then -- (a DEBUG-skipped command resumes after itself)
 				fndefs[#fndefs + 1] = ("%s = rt.catch_dbgskip(%s, %q)"):format(fnlname(st.name), fnlname(st.name), fnlname(st.name))
 			end
@@ -9825,6 +10372,7 @@ function M.emit(ast, opts)
 			funcline[st.name] = { st.line, st.bline or st.line }
 		end -- declare -F under extdebug
 	end
+	local rsv = EF.frame_begin("run", runlocals)
 	local top = build_cfg(ast.stmts, lifted, funcflags, inlinefns, true)
 	-- Every compiled `$(…)` / subshell fragment is now registered (from fn_x bodies + the
 	-- top level). They live in ONE table __CS (a function referencing many fragments costs
@@ -9849,8 +10397,15 @@ function M.emit(ast, opts)
 	o[#o + 1] = assemble(
 		top,
 		"local function run(sh, pc)",
-		{ runlocals = runlocals, upvals = upvals, toplevel = true, funcsrc = funcsrc, funcline = funcline }
+		{ runlocals = runlocals, upvals = upvals, toplevel = true, funcsrc = funcsrc, funcline = funcline, fkey = "run" }
 	)
+	local rspill = {} -- (run()'s spilled registers: a line abort reads them from its __L)
+	for _, n in ipairs(runlocals) do
+		if LM.frame and LM.frame[n] then
+			rspill[#rspill + 1] = ("%q"):format(n)
+		end
+	end
+	EF.frame_end(rsv)
 	local fl = {}
 	for name, lp in spairs(fnloop) do
 		fl[#fl + 1] = ("[%q] = { pcs = %s, src = %q, fn = %s }"):format(name, serialize(lp), fnsrc[name],
@@ -9862,15 +10417,26 @@ function M.emit(ast, opts)
 	end
 	local lnames = {} -- (the lifted vars a line abort writes back: run()'s slots, the upvalues)
 	for _, n in ipairs(runlocals) do
-		lnames[#lnames + 1] = ("%q"):format(n)
+		local sp = false
+		for _, q in ipairs(rspill) do
+			sp = sp or q == ("%q"):format(n)
+		end
+		if not sp then
+			lnames[#lnames + 1] = ("%q"):format(n)
+		end
 	end
-	local unames = {}
-	for _, n in ipairs(upvals) do
+	local unames, uanames = {}, {}
+	for _, n in ipairs(ukept) do
 		unames[#unames + 1] = ("%q"):format(n)
+	end
+	for _, n in ipairs(uspill) do
+		uanames[#uanames + 1] = ("%q"):format(n)
 	end
 	o[#o + 1] = ("return { run = run, loopPc = loopPc, stmtPc = stmtPc%s%s%s%s%s%s%s }"):format(
 		(#lnames > 0 and (", lrun = {" .. table.concat(lnames, ", ") .. "}") or "")
-			.. (#unames > 0 and (", lupv = {" .. table.concat(unames, ", ") .. "}, upvget = __upv_get") or ""),
+			.. (#rspill > 0 and (", larr = {" .. table.concat(rspill, ", ") .. "}") or "")
+			.. (#upvals > 0 and (", lupv = {" .. table.concat(unames, ", ") .. "}, upvget = __upv_get") or "")
+			.. (#uanames > 0 and (", lupva = {" .. table.concat(uanames, ", ") .. "}") or ""),
 		next(top.loopFf or {}) and (", loopFf = " .. serialize(top.loopFf)) or "",
 		top.lgspan and (", lgspan = {" .. (function()
 			local o2 = {}
@@ -9888,6 +10454,9 @@ function M.emit(ast, opts)
 	)
 	if #EF.konsts > 0 then -- (after the header, before any function that reads it)
 		table.insert(o, 6, "local __K = {" .. table.concat(EF.konsts, ",\n") .. "}")
+	end
+	if #EF.apool.list > 0 then
+		table.insert(o, 6, EF.pool_src())
 	end
 	return table.concat(o, "\n") .. "\n"
 end

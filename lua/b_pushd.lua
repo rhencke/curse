@@ -115,9 +115,9 @@ return function(sh, cmd, args, hook, tcb)
 	end
 
 	if cmd == "dirs" then
-		return dirs({ unpack(args, 2) })
+		return dirs(rt.tslice(args, 2))
 	elseif cmd == "pushd" then
-		local list, skipopt = { unpack(args, 2) }, false
+		local list, skipopt = rt.tslice(args, 2), false
 		if list[1] == "--" then
 			table.remove(list, 1)
 			skipopt = true
@@ -203,7 +203,7 @@ return function(sh, cmd, args, hook, tcb)
 		sh.status = 1
 	else -- popd
 		local nocd, which, direction, which_word = false, 0, "+", nil
-		for _, w in ipairs({ unpack(args, 2) }) do
+		for _, w in ipairs(rt.tslice(args, 2)) do
 			if w == "-n" then
 				nocd = true
 			elseif w == "--" then

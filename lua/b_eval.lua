@@ -49,7 +49,7 @@ return function(sh, cmd, args, hook, tcb)
 		-- eval [--]: join args, parse, run in the CURRENT shell (return/exit propagate).
 		local c, _, start = rt.getopt(sh, "eval", args, "", 2) -- (bash's no_options)
 		if not c then
-			local code = table.concat({ unpack(args, start) }, " ")
+			local code = table.concat(args, " ", start)
 			if code:match("%S") then
 				-- Parse+run in the CURRENT shell, LAZILY (like the shell's own input) so an
 				-- alias defined by one statement expands in the next; a syntax error stops

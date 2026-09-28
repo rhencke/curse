@@ -599,8 +599,67 @@ local function arith(src, nodefer)
 		return nil
 	end
 
+	-- A LONG chain of one precedence level (`1+1+…` 20000 operands, a sum of 10000 products)
+	-- as a left-deep tree is as deep as it is long: every walk of it — the evaluator, the
+	-- compiler, the Lua it emits (200 nesting levels) — overflows. bash evaluates such a
+	-- chain in a loop. An associative chain is regrouped BALANCED, the operands still in
+	-- their order (evaluation order and value unchanged: + * & | ^ wrap modulo 2^64,
+	-- && || short-circuit alike when grouped, and `a - b` is `a + -b`); short ones keep
+	-- their shape. `made`: the chain's nodes, innermost first.
+	local ASSOC = { ["+"] = true, ["*"] = true, ["&"] = true, ["|"] = true, ["^"] = true,
+		["&&"] = true, ["||"] = true }
+	local function cls(m)
+		if m.etxt or m.paren then
+			return nil
+		end
+		if m.op == "+" or m.op == "-" then
+			return "+"
+		end
+		return ASSOC[m.op] and m.op or nil
+	end
+	local function rebalance(made)
+		local i = 1
+		while i <= #made do
+			local c = cls(made[i])
+			local j = i
+			while c and made[j + 1] and cls(made[j + 1]) == c do
+				j = j + 1
+			end
+			if c and j - i + 1 >= 32 then
+				local ops, rp = { made[i].l }, {}
+				for k = i, j do
+					local m = made[k]
+					ops[#ops + 1] = m.op == "-" and { k = "un", op = "-", e = m.r } or m.r
+					rp[#ops] = m.rpow
+				end
+				local function build(lo, hi)
+					if lo == hi then
+						return ops[lo]
+					end
+					local mid = math.floor((lo + hi) / 2)
+					local n = { k = "bin", op = c, l = build(lo, mid), r = build(mid + 1, hi) }
+					for q = mid + 1, hi do
+						if rp[q] then
+							n.rpow = true
+							break
+						end
+					end
+					return n
+				end
+				local root, top = build(1, #ops), made[j]
+				for f in pairs(top) do -- (in place: the next node's `l` is this table)
+					top[f] = nil
+				end
+				for f, v in pairs(root) do
+					top[f] = v
+				end
+			end
+			i = j + 1
+		end
+	end
 	parseExpr = function(minprec, noasgn)
 		local left = primary(minprec == 0 and not noasgn)
+		local made = {}
 		while true do
 			local op = nextOp()
 			if op == nil then
@@ -622,6 +681,7 @@ local function arith(src, nodefer)
 				return seq(left, p)
 			end, parseExpr, op == "**" and prec or prec + 1) -- ** is right-assoc
 			left = { k = "bin", op = op, l = left, r = right }
+			made[#made + 1] = left
 			if op == "**" then
 				-- (for bash's eval-time error text: the expression, and the lookahead token
 				-- after the right operand — `2 ** -1 ` -> error token "1 ")
@@ -633,6 +693,9 @@ local function arith(src, nodefer)
 			elseif (op == "&&" or op == "||") and npow > np then
 				left.rpow = true -- (a skipped right operand still checks its exponents: see eval)
 			end
+		end
+		if #made >= 32 then
+			rebalance(made)
 		end
 		-- ternary c ? a : b (lowest precedence, right-assoc) — only at the top level
 		if minprec == 0 and peek() == "?" then
@@ -665,12 +728,28 @@ local function arith(src, nodefer)
 	-- comma operator: evaluate left-to-right, value is the last (bash/C semantics)
 	parseComma = function()
 		local e = parseExpr(0)
+		local made = {}
 		while peek() == "," do
 			i = i + 1
 			local l = e
 			e = { k = "comma", l = l, r = withpre(function(p)
 				return seq(l, p)
 			end, parseExpr, 0) }
+			made[#made + 1] = e
+		end
+		if #made >= 32 then -- (a long sequence: balanced, as a long chain in parseExpr)
+			local items = { made[1].l }
+			for _, m in ipairs(made) do
+				items[#items + 1] = m.r
+			end
+			local function build(lo, hi)
+				if lo == hi then
+					return items[lo]
+				end
+				local mid = math.floor((lo + hi) / 2)
+				return { k = "comma", l = build(lo, mid), r = build(mid + 1, hi) }
+			end
+			e = build(1, #items)
 		end
 		return e
 	end
@@ -3064,19 +3143,45 @@ local function parse_dbracket(toks, quoted)
 		end
 		return { kind = "str", word = parse_word(t) }
 	end
+	-- (a long `a && b && …` chain: grouped balanced, its operands in order — short-circuit
+	-- evaluation is the same; a left-deep one as deep as it is long overflows every walk)
+	local function balance(kind, items)
+		local function build(lo, hi)
+			if lo == hi then
+				return items[lo]
+			end
+			local mid = math.floor((lo + hi) / 2)
+			return { kind = kind, l = build(lo, mid), r = build(mid + 1, hi) }
+		end
+		return build(1, #items)
+	end
 	local function parse_and()
-		local l = primary()
+		local items = { primary() }
 		while peek() == "&&" do
 			pos = pos + 1
-			l = { kind = "and", l = l, r = primary() }
+			items[#items + 1] = primary()
+		end
+		if #items >= 32 then
+			return balance("and", items)
+		end
+		local l = items[1]
+		for k = 2, #items do
+			l = { kind = "and", l = l, r = items[k] }
 		end
 		return l
 	end
 	parse_or = function()
-		local l = parse_and()
+		local items = { parse_and() }
 		while peek() == "||" do
 			pos = pos + 1
-			l = { kind = "or", l = l, r = parse_and() }
+			items[#items + 1] = parse_and()
+		end
+		if #items >= 32 then
+			return balance("or", items)
+		end
+		local l = items[1]
+		for k = 2, #items do
+			l = { kind = "or", l = l, r = items[k] }
 		end
 		return l
 	end
